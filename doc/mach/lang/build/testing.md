@@ -27,7 +27,7 @@ pub rec TestScope;
 ## fun collect_scope
 
 ```mach
-pub fun collect_scope(p: *driver.Project, col: testrunner.Collected, sc: *TestScope) err[outcome.Fail];
+pub fun collect_scope(p: *driver.Project, col: testrunner.Collected, sc: *TestScope) err[fail.Fail];
 ```
 
 col is the unit's test declarations in module order; the scope owns it from here
@@ -42,7 +42,7 @@ pub fun free_scope(p: *driver.Project, sc: *TestScope);
 
 ```mach
 pub fun record_tests(p: *driver.Project, sc: *TestScope, exe: *u8, target: str, profile: str,
-bo: *outcome.BuildOutcome, oa: *A.Allocator) err[outcome.Fail];
+bo: *outcome.BuildOutcome, oa: *A.Allocator) err[fail.Fail];
 ```
 
 ## rec DispatchInputs
@@ -57,7 +57,7 @@ the dynamic libraries the artifact names
 ## fun collect_dispatch_inputs
 
 ```mach
-pub fun collect_dispatch_inputs(p: *driver.Project, unit: *build_plan.BuildUnit) res[DispatchInputs, outcome.Fail];
+pub fun collect_dispatch_inputs(p: *driver.Project, unit: *build_plan.BuildUnit) res[DispatchInputs, fail.Fail];
 ```
 
 ## fun free_dispatch_inputs
@@ -70,7 +70,7 @@ pub fun free_dispatch_inputs(p: *driver.Project, di: *DispatchInputs);
 
 ```mach
 pub fun link_dispatcher(p: *driver.Project, sc: *TestScope, di: *DispatchInputs,
-modules: *target_of.ObjectImage, module_len: u32, dispatcher: str, artifact: str) err[outcome.Fail];
+modules: *target_of.ObjectImage, module_len: u32, dispatcher: str, artifact: str) err[fail.Fail];
 ```
 
 synthesize the dispatcher over the selected tests, write it to `dispatcher`, and
@@ -82,6 +82,6 @@ modules: the build's current images: normal and test objects in topological orde
 ## fun fingerprint_scope
 
 ```mach
-pub fun fingerprint_scope(fb: *driver_query.FpBuf, p: *driver.Project, sc: *TestScope) err[outcome.Fail];
+pub fun fingerprint_scope(fb: *driver_query.FpBuf, p: *driver.Project, sc: *TestScope) err[fail.Fail];
 ```
 

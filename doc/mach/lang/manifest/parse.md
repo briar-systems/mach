@@ -3,7 +3,7 @@
 ## fun validate_source_bytes
 
 ```mach
-pub fun validate_source_bytes(src: *u8, n: usize) err[outcome.Fail];
+pub fun validate_source_bytes(src: *u8, n: usize) err[fail.Fail];
 ```
 
 reject manifest text that would carry a NUL byte into the TOML parser
@@ -55,7 +55,7 @@ a string key as the manifest reads it: absent and empty are the same err
 ## fun point_at
 
 ```mach
-pub fun point_at(f: outcome.Fail, sp: toml.Span) outcome.Fail;
+pub fun point_at(f: fail.Fail, sp: toml.Span) fail.Fail;
 ```
 
 the same failure pointing at `sp` in the manifest being parsed; the zero span
@@ -64,7 +64,7 @@ of a value the parser did not write points nowhere
 ## fun fail_at
 
 ```mach
-pub fun fail_at(f: outcome.Fail, sp: toml.Span) err[outcome.Fail];
+pub fun fail_at(f: fail.Fail, sp: toml.Span) err[fail.Fail];
 ```
 
 a failure pointing at `sp`, as `point_at` places it
@@ -85,7 +85,7 @@ pub fun intern_opt_unwrap(itn: *intern.Interner, text: str) intern.StrId;
 
 ```mach
 pub fun parse_str_array(alloc: *A.Allocator, itn: *intern.Interner, arr: *toml.Array,
-label: str, key: str, allow_scalar: bool) res[StrArr, outcome.Fail];
+label: str, key: str, allow_scalar: bool) res[StrArr, fail.Fail];
 ```
 
 ## fun opt_value_text
@@ -97,7 +97,7 @@ pub fun opt_value_text(alloc: *A.Allocator, v: *toml.Value) str;
 ## fun parse_default_flag
 
 ```mach
-pub fun parse_default_flag(alloc: *A.Allocator, table: str, name: str, sub: *toml.Table) res[bool, outcome.Fail];
+pub fun parse_default_flag(alloc: *A.Allocator, table: str, name: str, sub: *toml.Table) res[bool, fail.Fail];
 ```
 
 ## rec DefaultTables
@@ -133,7 +133,7 @@ pub fun duplicate_default_err(alloc: *A.Allocator, kind: str, d: *DefaultTables)
 ## fun check_keys
 
 ```mach
-pub fun check_keys(alloc: *A.Allocator, tab: *toml.Table, label: str, known: fun(str) bool) err[outcome.Fail];
+pub fun check_keys(alloc: *A.Allocator, tab: *toml.Table, label: str, known: fun(str) bool) err[fail.Fail];
 ```
 
 refuse the first key of a table that its section's `known` predicate does
@@ -180,7 +180,7 @@ ret: true when every rule holds
 ## fun check_path
 
 ```mach
-pub fun check_path(alloc: *A.Allocator, value: str, field: str, sp: toml.Span) err[outcome.Fail];
+pub fun check_path(alloc: *A.Allocator, value: str, field: str, sp: toml.Span) err[fail.Fail];
 ```
 
 refuse a path that `is_project_path` does not admit, pointing at `sp`, the
@@ -195,7 +195,7 @@ pub fun free_strarr(alloc: *A.Allocator, items: *intern.StrId, count: u32);
 ## fun span_site
 
 ```mach
-pub fun span_site(sp: toml.Span) outcome.Place;
+pub fun span_site(sp: toml.Span) fail.Place;
 ```
 
 where `sp` is written in the manifest being parsed, as a range whose file
@@ -205,7 +205,7 @@ parser did not write
 ## fun element_sites
 
 ```mach
-pub fun element_sites(alloc: *A.Allocator, arr: *toml.Array) res[*outcome.Place, outcome.Fail];
+pub fun element_sites(alloc: *A.Allocator, arr: *toml.Array) res[*fail.Place, fail.Fail];
 ```
 
 where each element of `arr` is written, in order, as `span_site` places it;
@@ -214,7 +214,7 @@ nil for an empty array. freed with `free_sites`
 ## fun site_of
 
 ```mach
-pub fun site_of(sites: *outcome.Place, i: u32) outcome.Place;
+pub fun site_of(sites: *fail.Place, i: u32) fail.Place;
 ```
 
 the place `i` of a model's per-entry places, the zero place when none were recorded
@@ -222,7 +222,7 @@ the place `i` of a model's per-entry places, the zero place when none were recor
 ## fun free_sites
 
 ```mach
-pub fun free_sites(alloc: *A.Allocator, sites: *outcome.Place, count: u32);
+pub fun free_sites(alloc: *A.Allocator, sites: *fail.Place, count: u32);
 ```
 
 ## rec Sites
@@ -246,13 +246,13 @@ pub fun sites_init(alloc: *A.Allocator) Sites;
 ## fun sites_add
 
 ```mach
-pub fun sites_add(s: *Sites, p: outcome.Place);
+pub fun sites_add(s: *Sites, p: fail.Place);
 ```
 
 ## fun sites_fail
 
 ```mach
-pub fun sites_fail(alloc: *A.Allocator, s: *Sites, f: outcome.Fail) outcome.Fail;
+pub fun sites_fail(alloc: *A.Allocator, s: *Sites, f: fail.Fail) fail.Fail;
 ```
 
 `f` pointing at the first place gathered, naming the others as related; the
@@ -261,7 +261,7 @@ gathered places are released
 ## fun at_sites
 
 ```mach
-pub fun at_sites(alloc: *A.Allocator, f: outcome.Fail, sites: *outcome.Place, n: usize) outcome.Fail;
+pub fun at_sites(alloc: *A.Allocator, f: fail.Fail, sites: *fail.Place, n: usize) fail.Fail;
 ```
 
 `f` pointing at the first spanned place of the `n` at `sites`, naming the
@@ -270,7 +270,7 @@ spanned ones after it as related
 ## fun must_lookup
 
 ```mach
-pub fun must_lookup(itn: *intern.Interner, id: intern.StrId) res[str, outcome.Fail];
+pub fun must_lookup(itn: *intern.Interner, id: intern.StrId) res[str, fail.Fail];
 ```
 
 ## fun is_glob

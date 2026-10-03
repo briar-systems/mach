@@ -138,6 +138,6 @@ pub fun acquire_loaded_parses(p: *project.Project) err[fail.Fail];
 ## fun collect_loaded_parses
 
 ```mach
-pub fun collect_loaded_parses(p: *project.Project, primary: err[outcome.Fail]) err[outcome.Fail];
+pub fun collect_loaded_parses(p: *project.Project, primary: err[fail.Fail]) err[fail.Fail];
 ```
 

@@ -28,7 +28,7 @@ project: a directory holding a mach.toml, or the mach.toml itself
 ## fun classify
 
 ```mach
-pub fun classify(operand: str) res[Operand, outcome.Fail];
+pub fun classify(operand: str) res[Operand, fail.Fail];
 ```
 
 which form the operand takes. `-` is the stream; a directory, or a file named

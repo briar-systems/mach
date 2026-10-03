@@ -136,7 +136,7 @@ pub fun goal_verb(goal: BuildGoal) str;
 ## fun validate
 
 ```mach
-pub fun validate(a: *A.Allocator, r: *BuildRequest) err[outcome.Fail];
+pub fun validate(a: *A.Allocator, r: *BuildRequest) err[fail.Fail];
 ```
 
 ## fun release
@@ -150,7 +150,7 @@ pub fun release(r: *BuildRequest) bool;
 ```mach
 pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
 cli: *CliArgs, root: str, goal: BuildGoal,
-pick: *manifest.Selection) res[BuildRequest, outcome.Fail];
+pick: *manifest.Selection) res[BuildRequest, fail.Fail];
 ```
 
 ## fun for_cell
@@ -169,6 +169,6 @@ pub val HASH_SIZE: usize = 32
 ## fun semantic_hash
 
 ```mach
-pub fun semantic_hash(a: *A.Allocator, r: *BuildRequest, digest: *u8) err[outcome.Fail];
+pub fun semantic_hash(a: *A.Allocator, r: *BuildRequest, digest: *u8) err[fail.Fail];
 ```
 

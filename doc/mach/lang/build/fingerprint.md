@@ -87,13 +87,13 @@ pub val FILE_DIGEST_CHUNK: usize = 8192
 ## fun file_sha256
 
 ```mach
-pub fun file_sha256(path: str, digest: *u8) err[outcome.Fail];
+pub fun file_sha256(path: str, digest: *u8) err[fail.Fail];
 ```
 
 ## fun held_file_sha256
 
 ```mach
-pub fun held_file_sha256(f: fs.File, digest: *u8) err[outcome.Fail];
+pub fun held_file_sha256(f: fs.File, digest: *u8) err[fail.Fail];
 ```
 
 borrows the file and exclusive seek/read access, rewinds first and leaves it at eof

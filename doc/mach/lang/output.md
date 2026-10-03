@@ -19,7 +19,7 @@ pub fun intern_message(itn: *intern.Interner, a: *A.Allocator, buf: *u8, total: 
 ## fun directory
 
 ```mach
-pub fun directory(a: *A.Allocator, root: str, dir: str) err[outcome.Fail];
+pub fun directory(a: *A.Allocator, root: str, dir: str) err[fail.Fail];
 ```
 
 the build owns the layout beneath its output root: `dir` and each missing
@@ -32,7 +32,7 @@ symlink to a directory is used as it stands
 ## fun reserve
 
 ```mach
-pub fun reserve(a: *A.Allocator, root: str, file: str) err[outcome.Fail];
+pub fun reserve(a: *A.Allocator, root: str, file: str) err[fail.Fail];
 ```
 
 ready `file` to be written: its parent is a directory as `directory` makes
@@ -43,7 +43,7 @@ symlink there is left for the write to follow
 
 ```mach
 pub fun bytes(itn: *intern.Interner, a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32,
-op: str, generic: str) err[outcome.Fail];
+op: str, generic: str) err[fail.Fail];
 ```
 
 write `buf` to `path`, whose parent exists
@@ -53,7 +53,7 @@ write `buf` to `path`, whose parent exists
 ```mach
 pub fun writer[W](itn: *intern.Interner, a: *A.Allocator, path: str, ctx: *W,
 write_cb: fun(*W, *io_writer.Writer) err[io_writer.WriteError], mode: i32,
-op: str, generic: str) err[outcome.Fail];
+op: str, generic: str) err[fail.Fail];
 ```
 
 stream `path`, whose parent exists, through `write_cb`
@@ -61,7 +61,7 @@ stream `path`, whose parent exists, through `write_cb`
 ## fun replace
 
 ```mach
-pub fun replace(a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32) err[outcome.Fail];
+pub fun replace(a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32) err[fail.Fail];
 ```
 
 replace a source-tree file through a sibling temporary and rename, so the
@@ -70,7 +70,7 @@ destination is either the old content or the complete new content
 ## fun mirror_fqn
 
 ```mach
-pub fun mirror_fqn(a: *A.Allocator, base: *u8, fqn: str, suffix: str) res[str, outcome.Fail];
+pub fun mirror_fqn(a: *A.Allocator, base: *u8, fqn: str, suffix: str) res[str, fail.Fail];
 ```
 
 the file a module's output takes under `base`: its dotted name as a path,
@@ -80,7 +80,7 @@ with `suffix` as the extension
 
 ```mach
 pub fun through_temporary[C](a: *A.Allocator, destination: str, ctx: *C,
-write: fun(*C, str) err[fail.Fail]) err[outcome.Fail];
+write: fun(*C, str) err[fail.Fail]) err[fail.Fail];
 ```
 
 `write` fills a sibling temporary of `destination`, which is then renamed

@@ -36,7 +36,7 @@ command that prints the rest of the message itself
 ## fun render_fail
 
 ```mach
-pub fun render_fail(f: *outcome.Fail) i64;
+pub fun render_fail(f: *fail.Fail) i64;
 ```
 
 print a Fail to stderr as "error[<key>]: <message>", followed by the
@@ -50,7 +50,7 @@ ret: the exit code `exit.of` maps the failure to
 ## fun refuse
 
 ```mach
-pub fun refuse(f: outcome.Fail) i64;
+pub fun refuse(f: fail.Fail) i64;
 ```
 
 render_fail for a failure built in place
@@ -146,7 +146,7 @@ format: the format the command writes
 ## fun report_fail
 
 ```mach
-pub fun report_fail(r: *Report, f: outcome.Fail, origin: diagnostic.Origin) i64;
+pub fun report_fail(r: *Report, f: fail.Fail, origin: diagnostic.Origin) i64;
 ```
 
 report a failure raised outside a diagnostic store: `error[<key>]: <message>`

@@ -61,7 +61,7 @@ taken in. release exactly once with analysis_dnit, never copy it as a second own
 
 alloc: owns every field below; must outlive the result
 status: the phase's standing, accepted, rejected or internal; diagnostic counts never decide it
-failure: an operational project failure with its outcome.Fail category, absent when the
+failure: an operational project failure with its fail.Fail category, absent when the
                   frontend ran
 target: the target metadata the analysis ran under, read only when target_available
 target_available: false when the requested target context was not acquired; host
@@ -130,7 +130,7 @@ ret: the borrowed product, or the expiry or phase failure
 ## fun analyze
 
 ```mach
-pub fun analyze(es: *EditorSession, req: *AnalysisRequest) res[AnalysisResult, outcome.Fail];
+pub fun analyze(es: *EditorSession, req: *AnalysisRequest) res[AnalysisResult, fail.Fail];
 ```
 
 run the frontend over an open buffer to the requested phase. ok means the owned envelope
@@ -201,7 +201,7 @@ es: the editor session; nil is a no-op
 ## fun fail_dnit
 
 ```mach
-pub fun fail_dnit(es: *EditorSession, f: *outcome.Fail);
+pub fun fail_dnit(es: *EditorSession, f: *fail.Fail);
 ```
 
 release an operational failure returned by analyze or build

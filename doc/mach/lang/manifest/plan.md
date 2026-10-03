@@ -177,7 +177,7 @@ allow: as `ProfileDef`
 
 ```mach
 pub fun resolve_target(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, selector: str,
-art: *ArtifactDef) res[ResolvedTarget, outcome.Fail];
+art: *ArtifactDef) res[ResolvedTarget, fail.Fail];
 ```
 
 the target a selector names: a declared name, `native` for the declared
@@ -187,7 +187,7 @@ otherwise `native`
 ## fun resolve_profile
 
 ```mach
-pub fun resolve_profile(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, pick: str) res[ResolvedProfile, outcome.Fail];
+pub fun resolve_profile(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, pick: str) res[ResolvedProfile, fail.Fail];
 ```
 
 choose the profile a selection names. a named profile must be declared, except
@@ -287,7 +287,7 @@ ret: true when a default library artifact needs it
 pub fun resolve_artifact_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, s: *Scope,
 consumer: *ArtifactDef, consumer_target: intern.StrId, profile: str,
 whole_project: bool,
-out_items: **ArtifactReq, out_count: *u32) err[outcome.Fail];
+out_items: **ArtifactReq, out_count: *u32) err[fail.Fail];
 ```
 
 list the artifacts a consumer requires, each with its output path when that
@@ -308,7 +308,7 @@ ret: ok; err from the output path expansion, with the array freed
 
 ```mach
 pub fun resolve_default_library_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
-s: *Scope, profile: str, out_items: **ArtifactReq, out_count: *u32) err[outcome.Fail];
+s: *Scope, profile: str, out_items: **ArtifactReq, out_count: *u32) err[fail.Fail];
 ```
 
 list the artifacts a dependency's default library artifacts require, the scope
@@ -329,7 +329,7 @@ ret: ok; err from the output path expansion, with the array freed
 pub fun plan_steps(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
 art_names: *intern.StrId, art_count: u32, t: *TargetDef,
 proj_out: str, v: *TmplVars,
-out_order: **u32, out_count: *u32) err[outcome.Fail];
+out_order: **u32, out_count: *u32) err[fail.Fail];
 ```
 
 order the build steps the named artifacts demand: a step producing a local
@@ -354,7 +354,7 @@ ret: ok; err on a step `need` cycle, a step `need` naming an unknown step, or
 ```mach
 pub fun plan_export_steps(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
 t: *TargetDef, proj_out: str, v: *TmplVars,
-out_order: **u32, out_count: *u32) err[outcome.Fail];
+out_order: **u32, out_count: *u32) err[fail.Fail];
 ```
 
 order the build steps that produce an exported local link path matching the
@@ -409,7 +409,7 @@ ret: true when the default selection holds `a`
 
 ```mach
 pub fun select_primary_artifact(alloc: *A.Allocator, itn: *intern.Interner,
-m: *Manifest, pick: *Selection) err[outcome.Fail];
+m: *Manifest, pick: *Selection) err[fail.Fail];
 ```
 
 fill in `pick.artifact` when none was named and several artifacts are declared:
@@ -429,7 +429,7 @@ ret: ok; err from target resolution, when no artifact supports the target,
 
 ```mach
 pub fun select_sole_executable_artifact(alloc: *A.Allocator, itn: *intern.Interner,
-m: *Manifest, pick: *Selection) err[outcome.Fail];
+m: *Manifest, pick: *Selection) err[fail.Fail];
 ```
 
 `select_sole_target_artifact` over `bin` artifacts only, so a bin beside a
@@ -444,7 +444,7 @@ ret: ok unless the artifact name cannot be looked up
 ## fun resolve_build_unit
 
 ```mach
-pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, m: *Manifest, pick: Selection) res[BuildUnit, outcome.Fail];
+pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, m: *Manifest, pick: Selection) res[BuildUnit, fail.Fail];
 ```
 
 resolve a selection into one `BuildUnit`. with no target named, an artifact
@@ -465,7 +465,7 @@ ret: the unit; err from target, profile or artifact resolution, when the
 ## fun resolve_scoped_build_unit
 
 ```mach
-pub fun resolve_scoped_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, s: *Scope, pick: Selection) res[BuildUnit, outcome.Fail];
+pub fun resolve_scoped_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, s: *Scope, pick: Selection) res[BuildUnit, fail.Fail];
 ```
 
 `resolve_build_unit` for a cell of `s`: target, artifact and links resolve in
@@ -482,7 +482,7 @@ ret: as `resolve_build_unit`
 
 ```mach
 pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, m: *Manifest,
-v: *TmplVars) err[outcome.Fail];
+v: *TmplVars) err[fail.Fail];
 ```
 
 reject two artifacts whose `out` expands to the same path under one set of

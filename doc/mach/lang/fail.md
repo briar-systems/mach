@@ -11,16 +11,52 @@ pub tag Fail: u8 {
 }
 ```
 
-the language layer's failure: the phase already recorded it as a diagnostic
-on the session and there is nothing further to say; an internal failure
-whose text must be preserved; or a failure a pass with no diagnostic store
-of its own meets (the linker, an object reader), which is the user's (the
-input is wrong or unsupported) or the environment's (a file could not be
-read or written) and names the diagnostic kind it is reported as.
-`reported` is declared first so a zero outcome is a failure that reports
-nothing new, never one that invents text. an allocation refusal is an
-internal failure; the compiler recovers from none of them at the site that
-met them
+the compiler's failure, one type for every pass, the linker, the query
+engine, the session and the build. the phase already recorded it as a
+diagnostic and there is nothing further to say; an invariant the compiler
+owns was broken, whose text must be preserved; the input was wrong or
+unsupported; or the machine refused rather than the input (a file that could
+not be read or written, a tool that could not be spawned). a user or
+environment failure names the diagnostic kind it is reported as and may
+point at a place; an internal one is always `compiler.internal`. the exit
+code derives from the case: 1 for user, 2 for internal, 3 where a command
+distinguishes the environment. `reported` is declared first so a zero
+failure is one that invents no text. an allocation refusal is internal; the
+compiler recovers from none of them at the site that met them
+
+## rec Related
+
+```mach
+pub rec Related;
+```
+
+the other places a failure names, in order, each in its own file: the other
+edges of a cycle, the other claims a collision is between. the array and
+each resolved place's path share the failure's lifetime as `at`'s path does
+
+items: the places, nil when there are none
+count: how many
+
+## rec Place
+
+```mach
+pub rec Place;
+```
+
+where a failure points: the bytes [start, end) of the file at `path`, and the
+line and column of `start` and of `end`, each from 1 with columns counted in
+UTF-8 bytes. a place whose range is known before its file is `spanned` with a
+nil path until `placed` names the file. the path shares the message's
+lifetime: a copy of the failure that outlives its message copies both
+
+path: the file, nil until the place is resolved
+spanned: whether a range is known; false with a nil path is no place
+start: the byte offset of the first byte
+end: the byte offset just past the last byte
+line: the line of `start`
+col: the column of `start`
+end_line: the line of `end`
+end_col: the column of `end`
 
 ## fun reported
 
@@ -42,8 +78,9 @@ an internal failure: a compiler defect, reported as `compiler.internal`
 pub fun user(k: diagnostic_kind.Kind, text: str) Fail;
 ```
 
-the input is wrong or unsupported; a kind no live row declares makes it
-the compiler defect it is
+the input is wrong or unsupported. a failure names a live row of the
+registry: one that names none, or a retired one, is a compiler defect and
+becomes an internal failure
 
 ## fun environment
 
@@ -51,7 +88,149 @@ the compiler defect it is
 pub fun environment(k: diagnostic_kind.Kind, text: str) Fail;
 ```
 
-the machine refused: a file could not be read or written
+the machine refused: a file could not be read or written, a tool could not
+be spawned
+
+## fun as_user
+
+```mach
+pub fun as_user(k: diagnostic_kind.Kind, f: Fail) Fail;
+```
+
+a failure the user caused met by a phase that cannot classify it (target
+selection, source loading, import libraries): an internal text becomes the
+user class under `k`, a keyed failure keeps its own class and kind, a
+reported failure stays reported
+
+## fun as_internal
+
+```mach
+pub fun as_internal(f: Fail) Fail;
+```
+
+a failure met on input the compiler produced itself (an object it wrote, a
+module it emitted): whatever the check says of the input, it is the
+compiler's defect, an internal failure keeping the text. a reported failure
+stays reported
+
+## fun spanned
+
+```mach
+pub fun spanned(f: Fail, start: usize, end: usize) Fail;
+```
+
+the same failure pointing at the bytes [start, end) of the file that caused
+it, which `placed` names. a failure that already points somewhere keeps its
+place, the innermost site knowing best, and one with no kind points nowhere
+
+## fun placed
+
+```mach
+pub fun placed(a: *A.Allocator, f: Fail, path: str, text: str) Fail;
+```
+
+the same failure with its ranges resolved in `text`, the file at `path`, as
+`located` places them: its own and each related one still without a file. a
+failure without a range, or one already resolved, is returned as it is
+
+## fun placed_bytes
+
+```mach
+pub fun placed_bytes(a: *A.Allocator, f: Fail, path: str, data: *u8, n: usize) Fail;
+```
+
+`placed` over the `n` bytes at `data`, for a file that may hold a NUL
+
+## fun at
+
+```mach
+pub fun at(a: *A.Allocator, f: Fail, p: Place) Fail;
+```
+
+the same failure pointing at `p`, a place a model recorded: one without a
+file is a range `placed` resolves, one with a file is copied as `located`
+copies it. a failure that already points somewhere keeps its place
+
+## fun with_related
+
+```mach
+pub fun with_related(a: *A.Allocator, f: Fail, ps: *Place, n: usize) Fail;
+```
+
+the same failure naming the `n` places at `ps` as its related places, in
+order, each copied through `a` as `at` copies a place; an unspanned place is
+skipped. a failure that already names related places keeps them, and one
+whose copy is refused is that refusal
+
+## fun related_of
+
+```mach
+pub fun related_of(f: Fail) Related;
+```
+
+the related places a failure names, none for one that names no other
+
+## fun located
+
+```mach
+pub fun located(a: *A.Allocator, f: Fail, at: Place) Fail;
+```
+
+the same failure pointing at `at`, its path copied through `a` so the failure
+owns it as it owns its text. a failure with no kind points nowhere, and one
+whose copy is refused is that refusal
+
+## fun place
+
+```mach
+pub fun place(path: str, data: *u8, n: usize, start: usize, end: usize) Place;
+```
+
+the bytes [start, end) of the `n` bytes at `data`, the file at `path`, as a
+place; a range past the end is clamped to it
+
+## rec Lines
+
+```mach
+pub rec Lines;
+```
+
+the offsets the lines of one file start at, for resolving many places in it
+as `place` resolves one, each in time logarithmic in the file's lines
+
+path: the file, which every place resolved here names
+n: the file's length in bytes
+starts: the offset of each line's first byte, the first line's 0
+
+## fun lines_init
+
+```mach
+pub fun lines_init(a: *A.Allocator, path: str, data: *u8, n: usize) res[Lines, A.Error];
+```
+
+the lines of the `n` bytes at `data`, the file at `path`; released with `lines_dnit`
+
+## fun lines_dnit
+
+```mach
+pub fun lines_dnit(l: *Lines);
+```
+
+## fun lines_place
+
+```mach
+pub fun lines_place(l: *Lines, start: usize, end: usize) Place;
+```
+
+the bytes [start, end) of the file `l` indexes as a place, as `place` makes it
+
+## fun place_of
+
+```mach
+pub fun place_of(f: Fail) opt[Place];
+```
+
+where the failure points, when it points at a file
 
 ## fun kind_of
 
@@ -61,58 +240,6 @@ pub fun kind_of(f: Fail) diagnostic_kind.Kind;
 
 the kind the failure is reported as, NONE for a reported one, whose
 diagnostics carry their own
-
-## fun refused
-
-```mach
-pub fun refused(e: A.Error) Fail;
-```
-
-## fun write_refused
-
-```mach
-pub fun write_refused(e: io_writer.WriteError) Fail;
-```
-
-a refused write met by the compiler (an assembly or diagnostic sink): the
-compiler recovers from none of them either, the text names the cause once
-
-## fun str_refused
-
-```mach
-pub fun str_refused(e: StrError) Fail;
-```
-
-a refused string operation: the allocator's refusal or a slice outside its
-string, which is a compiler defect
-
-## fun fs_refused
-
-```mach
-pub fun fs_refused(e: fs.FsError) Fail;
-```
-
-a refused filesystem operation met by the compiler: the step that refused
-names its own cause
-
-## fun fs_environment
-
-```mach
-pub fun fs_environment(k: diagnostic_kind.Kind, e: fs.FsError) Fail;
-```
-
-a filesystem operation on a file the build was handed (an object, an
-archive, a library) that the machine refused: the environment's under `k`,
-save an allocation refusal, which stays internal
-
-## fun format_refused
-
-```mach
-pub fun format_refused(e: std_format.FormatError) Fail;
-```
-
-a refused format: a malformed literal is a compiler defect, the rest is the
-sink's or the allocator's refusal
 
 ## fun is_reported
 
@@ -126,6 +253,14 @@ pub fun is_reported(f: Fail) bool;
 pub fun is_message(f: Fail) bool;
 ```
 
+## fun text
+
+```mach
+pub fun text(f: Fail) opt[str];
+```
+
+the text a failure carries, absent for a reported one
+
 ## val REPORTED_TEXT
 
 ```mach
@@ -135,19 +270,181 @@ pub val REPORTED_TEXT: str = "failure was reported through diagnostics"
 the failure as one line of presentation text; a reported failure has no
 text of its own and is named as such, never as an empty message
 
+## fun describe
+
+```mach
+pub fun describe(f: Fail) str;
+```
+
 ## fun with_text
 
 ```mach
 pub fun with_text(f: Fail, text: str) Fail;
 ```
 
-the same failure carrying `text` instead: the class and the kind are kept
+the same failure carrying `text` instead: the class, the kind and the places
+are kept (a caller that copies the message into storage it owns)
 
-## fun describe
+## fun retain
 
 ```mach
-pub fun describe(f: Fail) str;
+pub fun retain(a: *A.Allocator, f: Fail) res[Fail, A.Error];
 ```
+
+a copy of the failure that owns its text and its places through `a`, for a
+failure that outlives the storage its message was made in; released with
+`dnit`
+
+## fun dnit
+
+```mach
+pub fun dnit(a: *A.Allocator, f: Fail);
+```
+
+release what a retained failure owns through `a`: its text and its places
+
+## fun places_retain
+
+```mach
+pub fun places_retain(a: *A.Allocator, f: Fail) res[Fail, A.Error];
+```
+
+a copy of the failure whose places, its own path and every related place,
+are owned through `a`, its text left as it is; for a holder that keeps the
+text apart. released with `places_dnit`
+
+## fun places_dnit
+
+```mach
+pub fun places_dnit(a: *A.Allocator, f: Fail);
+```
+
+release the places a failure owns through `a`, as `places_retain` made them
+
+## fun without_places
+
+```mach
+pub fun without_places(f: Fail) Fail;
+```
+
+the same failure pointing nowhere and naming no related place, for a holder
+whose places were released or never copied
+
+## fun same_places
+
+```mach
+pub fun same_places(x: Fail, y: Fail) bool;
+```
+
+whether two failures hold the same places: the same path storage and the
+same related array, as a holder that copied them once sees its own copy
+
+## fun unit
+
+```mach
+pub fun unit[V](r: res[V, Fail]) err[Fail];
+```
+
+the unit outcome of an operation whose value is not needed
+
+## fun io_text
+
+```mach
+pub fun io_text(e: io_error.Error) str;
+```
+
+the text each std refusal renders as, one copy each. an operation that meets
+one keeps its own classification (user, internal, environment) and names the
+cause once through these; the allocator's is `alloc.text`
+
+## fun write_text
+
+```mach
+pub fun write_text(e: io_writer.WriteError) str;
+```
+
+## fun fs_text
+
+```mach
+pub fun fs_text(e: fs.FsError) str;
+```
+
+## fun str_text
+
+```mach
+pub fun str_text(e: StrError) str;
+```
+
+## fun format_text
+
+```mach
+pub fun format_text(e: std_format.FormatError) str;
+```
+
+## fun toml_text
+
+```mach
+pub fun toml_text(e: toml.TomlError) str;
+```
+
+## fun env_text
+
+```mach
+pub fun env_text(e: env.EnvError) str;
+```
+
+## fun refused
+
+```mach
+pub fun refused(e: A.Error) Fail;
+```
+
+the refusals the compiler recovers from at no site, each an internal failure
+carrying its text: the allocator's, a write to a sink of its own, a string
+operation, a filesystem step and a format
+
+## fun write_refused
+
+```mach
+pub fun write_refused(e: io_writer.WriteError) Fail;
+```
+
+## fun str_refused
+
+```mach
+pub fun str_refused(e: StrError) Fail;
+```
+
+## fun fs_refused
+
+```mach
+pub fun fs_refused(e: fs.FsError) Fail;
+```
+
+## fun format_refused
+
+```mach
+pub fun format_refused(e: std_format.FormatError) Fail;
+```
+
+## fun fs_environment
+
+```mach
+pub fun fs_environment(k: diagnostic_kind.Kind, e: fs.FsError) Fail;
+```
+
+a filesystem operation on a file the build was handed (an object, an
+archive, a library) that the machine refused: the environment's under `k`,
+save an allocation refusal, which stays internal
+
+## fun toml_refused
+
+```mach
+pub fun toml_refused(e: toml.TomlError) Fail;
+```
+
+a document that does not parse is the user's, pointing at the byte the parser
+refused; one the allocator refused is internal
 
 ## tag PhaseKind
 
@@ -305,4 +602,20 @@ pub fun catalog_message_or(itn: *intern.Interner, a: *A.Allocator, c: Catalog, g
 the interned message when the site owns an interner and an allocator, else
 `generic`: a static text the caller writes to still name the catalog. a
 borrowed view or a test fixture has no owner and still refuses the member
+
+## fun catalog
+
+```mach
+pub fun catalog(a: *A.Allocator, c: Catalog) Fail;
+```
+
+the closed-catalog policy as a failure: an input or capability fault is the
+user's, a compiler-produced member is internal. the message belongs to the
+caller's allocator
+
+## fun unknown_catalog
+
+```mach
+pub fun unknown_catalog(a: *A.Allocator, catalog_name: str, tag: u32) Fail;
+```
 

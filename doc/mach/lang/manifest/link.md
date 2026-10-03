@@ -19,7 +19,7 @@ include_referenced: copied from the link
 ## fun parse_links
 
 ```mach
-pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[outcome.Fail];
+pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[fail.Fail];
 ```
 
 ## fun free_link_claims
@@ -41,7 +41,7 @@ count: how many entries to release
 pub fun finish_link_requirements(alloc: *A.Allocator, items: *LinkRequirement,
 capacity: u32, count: u32,
 out_items: **LinkRequirement,
-out_count: *u32) err[outcome.Fail];
+out_count: *u32) err[fail.Fail];
 ```
 
 turn a partially filled requirement buffer into an exactly sized result, taking
@@ -60,7 +60,7 @@ ret: ok; when `count` is 0 the buffer is freed. on a failed shrink the filled
 
 ```mach
 pub fun merge_link_claims(alloc: *A.Allocator, dst: *LinkRequirement,
-src: *LinkRequirement) err[outcome.Fail];
+src: *LinkRequirement) err[fail.Fail];
 ```
 
 add every symbol of `src` that `dst` lacks to `dst`, keeping `dst` order first
@@ -90,7 +90,7 @@ ret: true when all three axes admit `t`
 
 ```mach
 pub fun link_requirement(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef,
-proj_out: str, v: *TmplVars) res[LinkRequirement, outcome.Fail];
+proj_out: str, v: *TmplVars) res[LinkRequirement, fail.Fail];
 ```
 
 resolve a link entry for one target into a `LinkRequirement`. a local `path`
@@ -108,7 +108,7 @@ ret: the requirement; on error nothing is left allocated
 
 ```mach
 pub fun expand_local_path(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef,
-proj_out: str, v: *TmplVars) res[str, outcome.Fail];
+proj_out: str, v: *TmplVars) res[str, fail.Fail];
 ```
 
 expand a local link's `path` with `v`; a refusal points at the `path` value

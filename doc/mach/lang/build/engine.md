@@ -4,7 +4,7 @@
 
 ```mach
 pub fun execute(bp: *build_plan.BuildPlan, backing: *A.Allocator, oa: *A.Allocator,
-ev: *readout.Progress) res[outcome.BuildOutcome, outcome.Fail];
+ev: *readout.Progress) res[outcome.BuildOutcome, fail.Fail];
 ```
 
 run every planned cell cold: each unit gets its own session and arena over `backing`
@@ -25,7 +25,7 @@ ret: the outcome, released with outcome.outcome_dnit, or an engine failure whose
 
 ```mach
 pub fun execute_warm(bp: *build_plan.BuildPlan, unit_index: usize, s: *session.Session, oa: *A.Allocator,
-ev: *readout.Progress) res[outcome.BuildOutcome, outcome.Fail];
+ev: *readout.Progress) res[outcome.BuildOutcome, fail.Fail];
 ```
 
 run one planned cell through a caller-owned session, reusing its query cache, source
@@ -47,7 +47,7 @@ ret: the outcome of that one unit, released with outcome.outcome_dnit, or an eng
 pub fun set_link_config_input(p: *driver.Project, out_path: *u8, product: *u8, out_kind: u32,
 ext: *target_of.ObjectInput, ext_count: u32,
 dynlibs: *target_of.DynLib, dynlib_count: u32,
-image: *build_emit.LoadedImageOptions) err[outcome.Fail];
+image: *build_emit.LoadedImageOptions) err[fail.Fail];
 ```
 
 publish the link configuration of a project as the Q_LINK_CONFIG query input: the

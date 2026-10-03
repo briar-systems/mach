@@ -10,7 +10,7 @@ pub rec RunArtifact;
 
 ```mach
 pub fun resolve_run_artifact(alloc: *A.Allocator, project_root: str, selectors: *manifest.Selectors,
-output_override: str) res[RunArtifact, outcome.Fail];
+output_override: str) res[RunArtifact, fail.Fail];
 ```
 
 the built executable `mach run` launches: the one (artifact, target, profile)
@@ -27,14 +27,14 @@ ret: the executable; err from the manifest or selection, when the selection
 
 ```mach
 pub fun load_project_config(p: *project.Project, project_root: str, manifest_path: str, pick: *manifest.Selection,
-owner: str, for_union: bool) err[outcome.Fail];
+owner: str, for_union: bool) err[fail.Fail];
 ```
 
 ## fun load_config_manifest
 
 ```mach
 pub fun load_config_manifest(p: *project.Project, project_root: str, m: *manifest.Manifest, pick: *manifest.Selection,
-owner: str, for_union: bool) err[outcome.Fail];
+owner: str, for_union: bool) err[fail.Fail];
 ```
 
 configure a project for one build cell of `m`, or of one of its dependencies
@@ -54,7 +54,7 @@ ret: ok; err from selection, template, step, link or dependency resolution
 ## fun select_target
 
 ```mach
-pub fun select_target(p: *project.Project, t: *project.TargetEntry) err[outcome.Fail];
+pub fun select_target(p: *project.Project, t: *project.TargetEntry) err[fail.Fail];
 ```
 
 ## fun wildcard_match
@@ -72,7 +72,7 @@ pub fun glob_shape_ok(pattern: str) bool;
 ## fun execute_steps
 
 ```mach
-pub fun execute_steps(a: *A.Allocator, p: *project.Project) err[outcome.Fail];
+pub fun execute_steps(a: *A.Allocator, p: *project.Project) err[fail.Fail];
 ```
 
 run the declaring project's prerequisite steps for the configured cell, in its
@@ -82,7 +82,7 @@ in the root's output tree through an absolute `{project.out}`
 ## fun dep_out_home
 
 ```mach
-pub fun dep_out_home(alloc: *A.Allocator, project_root: str, root_out: str) res[str, outcome.Fail];
+pub fun dep_out_home(alloc: *A.Allocator, project_root: str, root_out: str) res[str, fail.Fail];
 ```
 
 ## rec DependencyStep
@@ -99,7 +99,7 @@ step: index into that dependency manifest's `steps`
 ## fun plan_dep_steps
 
 ```mach
-pub fun plan_dep_steps(p: *project.Project, isa: str, os: str, abi: str) res[Vector[DependencyStep], outcome.Fail];
+pub fun plan_dep_steps(p: *project.Project, isa: str, os: str, abi: str) res[Vector[DependencyStep], fail.Fail];
 ```
 
 the exported dependency steps a cell runs, in execution order: each realized
@@ -113,6 +113,6 @@ ret: the ordered steps, owned by the caller; err from the export plan
 ## fun execute_dep_steps
 
 ```mach
-pub fun execute_dep_steps(p: *project.Project, isa: str, os: str, abi: str) err[outcome.Fail];
+pub fun execute_dep_steps(p: *project.Project, isa: str, os: str, abi: str) err[fail.Fail];
 ```
 

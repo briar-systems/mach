@@ -191,13 +191,13 @@ pub fun note_compute(p: *Project, kind: query.QueryKind);
 ## fun begin_query_phase
 
 ```mach
-pub fun begin_query_phase(p: *Project) res[query.Operation, outcome.Fail];
+pub fun begin_query_phase(p: *Project) res[query.Operation, fail.Fail];
 ```
 
 ## fun refresh_diagnostics
 
 ```mach
-pub fun refresh_diagnostics(p: *Project) err[outcome.Fail];
+pub fun refresh_diagnostics(p: *Project) err[fail.Fail];
 ```
 
 the session's store is rebuilt from the project's and the query presentation's,
@@ -210,7 +210,7 @@ fulfilled. a warning replayed from the cache passes through here as a fresh one 
 ```mach
 pub fun finish_query_phase(p: *Project, operation: query.Operation,
 roots: *query.QueryKey, count: usize,
-result: err[outcome.Fail]) err[outcome.Fail];
+result: err[fail.Fail]) err[fail.Fail];
 ```
 
 ## fun span_eq_str

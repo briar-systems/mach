@@ -39,19 +39,19 @@ ret: the formatted tuple
 ## fun parse_project
 
 ```mach
-pub fun parse_project(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[outcome.Fail];
+pub fun parse_project(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
 ```
 
 ## fun parse_targets
 
 ```mach
-pub fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[outcome.Fail];
+pub fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
 ```
 
 ## fun duplicate_profiles
 
 ```mach
-pub fun duplicate_profiles(alloc: *A.Allocator, m: *Manifest, message: str) outcome.Fail;
+pub fun duplicate_profiles(alloc: *A.Allocator, m: *Manifest, message: str) fail.Fail;
 ```
 
 a refusal of more than one `default = true` profile, pointing at the first
@@ -66,7 +66,7 @@ pub val MISSING_PROFILE_MESSAGE: str = "mach.toml: no [profile.<name>] table is 
 ## fun parse_profiles
 
 ```mach
-pub fun parse_profiles(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[outcome.Fail];
+pub fun parse_profiles(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[fail.Fail];
 ```
 
 the `[profile.*]` tables. a root manifest declares at least one; a dependency
@@ -113,6 +113,6 @@ is only ever selected by name
 ## fun make_native_target
 
 ```mach
-pub fun make_native_target(alloc: *A.Allocator, itn: *intern.Interner) res[*TargetDef, outcome.Fail];
+pub fun make_native_target(alloc: *A.Allocator, itn: *intern.Interner) res[*TargetDef, fail.Fail];
 ```
 

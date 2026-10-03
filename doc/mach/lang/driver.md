@@ -203,13 +203,13 @@ forwards [`mach.lang.driver.registry.setup_registry`](driver/registry.md#fun-set
 ## fun append_frontend_roots
 
 ```mach
-pub fun append_frontend_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[outcome.Fail];
+pub fun append_frontend_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[fail.Fail];
 ```
 
 ## fun append_test_roots
 
 ```mach
-pub fun append_test_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[outcome.Fail];
+pub fun append_test_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[fail.Fail];
 ```
 
 the backend's roots and each test object's lowering and codegen
@@ -217,32 +217,32 @@ the backend's roots and each test object's lowering and codegen
 ## fun run_sema_pass
 
 ```mach
-pub fun run_sema_pass(p: *project.Project) err[outcome.Fail];
+pub fun run_sema_pass(p: *project.Project) err[fail.Fail];
 ```
 
 ## fun run_lower_pass
 
 ```mach
-pub fun run_lower_pass(p: *project.Project) err[outcome.Fail];
+pub fun run_lower_pass(p: *project.Project) err[fail.Fail];
 ```
 
 ## fun run_link_pass
 
 ```mach
-pub fun run_link_pass(p: *project.Project) res[bool, outcome.Fail];
+pub fun run_link_pass(p: *project.Project) res[bool, fail.Fail];
 ```
 
 ## fun build_project
 
 ```mach
-pub fun build_project(s: *session.Session, project_root: str, pick: *manifest.Selection) res[project.Project, outcome.Fail];
+pub fun build_project(s: *session.Session, project_root: str, pick: *manifest.Selection) res[project.Project, fail.Fail];
 ```
 
 ## fun verify_dependencies
 
 ```mach
 pub fun verify_dependencies(s: *session.Session, project_root: str, release: bool,
-overrides: *Vector[driver_deps.RootOverride]) err[outcome.Fail];
+overrides: *Vector[driver_deps.RootOverride]) err[fail.Fail];
 ```
 
 check a project's realized dependency closure without changing it
@@ -257,7 +257,7 @@ ret: err naming the first mismatch
 ## fun closure_locate
 
 ```mach
-pub fun closure_locate(s: *session.Session, m: *manifest.Manifest, project_root: str) res[project.Project, outcome.Fail];
+pub fun closure_locate(s: *session.Session, m: *manifest.Manifest, project_root: str) res[project.Project, fail.Fail];
 ```
 
 locate a root manifest's dependency closure with no build cell configured, as a
@@ -273,7 +273,7 @@ ret: the project holding the closure, released with `project.dnit_project`;
 ## fun begin_build
 
 ```mach
-pub fun begin_build(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest, ev: *readout.Progress) res[project.Project, outcome.Fail];
+pub fun begin_build(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest, ev: *readout.Progress) res[project.Project, fail.Fail];
 ```
 
 begin the build the request names: every goal, a test goal included, loads the
@@ -307,7 +307,7 @@ pub val FRONTEND_SEMA:    FrontendPhase = 2
 
 ```mach
 pub fun analyze_project_tolerant(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest,
-roots: project.RootSet, extra_roots: *intern.StrId, extra_root_count: u32, phase: FrontendPhase) res[project.Project, outcome.Fail];
+roots: project.RootSet, extra_roots: *intern.StrId, extra_root_count: u32, phase: FrontendPhase) res[project.Project, fail.Fail];
 ```
 
 frontend analysis for tools: the project comes back whenever the frontend
@@ -334,25 +334,25 @@ ret: the project, released by the caller with project.dnit_project
 ## fun run_steps_phase
 
 ```mach
-pub fun run_steps_phase(p: *project.Project) err[outcome.Fail];
+pub fun run_steps_phase(p: *project.Project) err[fail.Fail];
 ```
 
 ## fun run_dep_steps_phase
 
 ```mach
-pub fun run_dep_steps_phase(p: *project.Project) err[outcome.Fail];
+pub fun run_dep_steps_phase(p: *project.Project) err[fail.Fail];
 ```
 
 ## fun run_load_phase
 
 ```mach
-pub fun run_load_phase(p: *project.Project) err[outcome.Fail];
+pub fun run_load_phase(p: *project.Project) err[fail.Fail];
 ```
 
 ## fun refresh_frontend
 
 ```mach
-pub fun refresh_frontend(p: *project.Project, mid: session.ModuleId, phase: FrontendPhase) res[bool, outcome.Fail];
+pub fun refresh_frontend(p: *project.Project, mid: session.ModuleId, phase: FrontendPhase) res[bool, fail.Fail];
 ```
 
 re-derive a loaded project's frontend after one module's text changed, without
@@ -371,6 +371,6 @@ ret: ok(true) when refreshed, a rejection included since the project's standing 
 ## fun load_manifest
 
 ```mach
-pub fun load_manifest(s: *session.Session, project_root: str) res[manifest.Manifest, outcome.Fail];
+pub fun load_manifest(s: *session.Session, project_root: str) res[manifest.Manifest, fail.Fail];
 ```
 
