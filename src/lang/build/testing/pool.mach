@@ -1,0 +1,648 @@
+# the test process pool: every test of a run is its own process, up to a window
+# of them at once, each bounded by the run's timeout and its output captured to
+# a log beside the dispatcher. a test is classified and reported to the readout
+# the moment it is reaped, and the run closes with its summary
+use std.allocator.page;
+use std.text.string.str_dup;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A:               std.allocator;
+use chrono_duration: std.chrono.duration;
+use std.chrono.time;
+use fs:         std.filesystem;
+use std_format: std.format;
+use io_error:   std.io.error;
+use std.process.env;
+use std.process.events;
+use sync_cancel: std.sync.cancel;
+
+use mach.lang.build.outcome;
+use build_testing: mach.lang.build.testing;
+use mach.lang.diagnostic;
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.fail;
+use mach.lang.output;
+use mach.lang.readout;
+use mach.lang.subprocess;
+use mach.lang.validation;
+
+# the most bytes of a test's output its capture keeps
+val CAPTURE_LIMIT: usize = 65536;
+
+# how a run executes its tests
+# ---
+# runner:  the program each test runs under, or nil to run the test itself
+# jobs:    how many tests run at once, at least one
+# timeout: each test's bound, 0 for none
+# level:   the readout level; a passing test's output is kept only at the items level
+# bytes:   whether a test's captured output is kept for the renderer
+pub rec Config {
+    runner:  *u8;
+    jobs:    u32;
+    timeout: chrono_duration.Duration;
+    level:   u8;
+    bytes:   bool;
+}
+
+# what a finished run decides: how many tests did not pass, and how many of
+# those the run's own machinery failed rather than the test
+pub rec Counts {
+    failed:         u32;
+    infrastructure: u32;
+}
+
+# run one set of tests, each reported to sink as it finishes, and close the run
+# with its summary
+# ---
+# a:      backs the results, the logs' paths and every process
+# sink:   the readout the run reports to
+# arts:   the tests
+# n:      how many there are
+# config: how they run
+# ret:    the run's counts; err when the run could not start, before any test ran
+pub fun run(a: *A.Allocator, sink: *readout.Sink, arts: *outcome.TestArtifact, n: u32, config: *Config) res[Counts, fail.Fail] {
+    val runner: *u8 = config.runner;
+    if (n == 0) {
+        var empty_tally: outcome.GateTally = outcome.gate_tally_init(a);
+        readout.run_start(sink, nil, 0, runner::str);
+        readout.run_end(sink, readout.RunEnd{tests: nil, count: 0, passed: 0, failed: 0, timed_out: 0, wall: 0, tally: ?empty_tally});
+        ret res[Counts, fail.Fail].ok{Counts{failed: 0, infrastructure: 0}};
+    }
+
+    val res_out: res[*readout.TestResult, A.Error] = A.allocate[readout.TestResult](a, n::usize);
+    if (sel res_out.err) { ret res[Counts, fail.Fail].err{fail.refused(res_out.err)}; }
+    val results: *readout.TestResult = res_out.ok;
+
+    val ld_r: res[str, fail.Fail] = capture_log_dir(a, arts[0].exe);
+    if (sel ld_r.err) {
+        val said: res[str, std_format.FormatError] = std_format.sprint(a, "could not derive the test log directory: {}", fail.describe(ld_r.err));
+        if (sel said.err) { ret res[Counts, fail.Fail].err{fail.message("out of memory")}; }
+        ret res[Counts, fail.Fail].err{fail.with_text(ld_r.err, said.ok)};
+    }
+    val log_dir:  str            = ld_r.ok;
+    val prepared: err[fail.Fail] = prepare_logs(a, log_dir, n);
+    if (sel prepared.err) { ret res[Counts, fail.Fail].err{prepared.err}; }
+
+    var i: u32 = 0;
+    for (i < n) {
+        settle(?results[i], ?arts[i], validation.gate_result(validation.RESULT_PASS, validation.CAUSE_PASS, nil));
+        results[i].done = false;
+        results[i].log  = nil;
+        val lp_r: res[str, fail.Fail] = log_path(a, log_dir, i);
+        if (sel lp_r.ok) { results[i].log = lp_r.ok; }
+        i = i + 1;
+    }
+
+    val run_start: readout.Instant = readout.sample();
+    readout.run_start(sink, results, n, runner::str);
+    execute(a, sink, results, n, config);
+    val wall: chrono_duration.Duration = readout.elapsed(run_start);
+
+    val failed: u32               = count_failed(results, n);
+    var tally:  outcome.GateTally = outcome.gate_tally_init(a);
+    build_gate_tally(?tally, a, results, n);
+    readout.run_end(sink, readout.RunEnd{tests: results, count: n, passed: n - failed, failed: failed,
+        timed_out: count_timed_out(results, n), wall: wall, tally: ?tally});
+    val counts: Counts = Counts{failed: failed, infrastructure: tally.infrastructure_failure};
+    ret res[Counts, fail.Fail].ok{counts};
+}
+
+fun count_timed_out(results: *readout.TestResult, len: u32) u32 {
+    var t: u32 = 0;
+    var i: u32 = 0;
+    for (i < len) {
+        if (results[i].result.kind == validation.RESULT_RESOURCE_EXHAUSTION
+            && results[i].result.cause == validation.CAUSE_ORACLE_TIMEOUT) { t = t + 1; }
+        i = i + 1;
+    }
+    ret t;
+}
+
+fun build_gate_tally(gt: *outcome.GateTally, a: *A.Allocator, results: *readout.TestResult, n: u32) {
+    var i: u32 = 0;
+    for (i < n) {
+        outcome.record_gate(gt, a, results[i].result);
+        i = i + 1;
+    }
+}
+
+rec Slot {
+    active: bool;
+    idx:    u32;
+    start:  readout.Instant;
+}
+
+# a test that finished without running: result is why, and its log is kept
+fun settle(t: *readout.TestResult, art: *outcome.TestArtifact, result: validation.ValidationGateResult) {
+    t.art       = art;
+    t.done      = true;
+    t.result    = result;
+    t.code      = 0;
+    t.elapsed   = 0;
+    t.bound     = 0;
+    t.out       = nil;
+    t.out_len   = 0;
+    t.truncated = false;
+}
+
+# every test not yet finished settles as a setup failure when the run's own
+# storage was refused, each reported as it settles
+fun settle_exhausted(sink: *readout.Sink, results: *readout.TestResult, n: u32) {
+    var refused: fail.Fail = fail.message("out of memory");
+    readout.failure(sink, ?refused, diagnostic.ORIGIN_TEST);
+    var i: u32 = 0;
+    for (i < n) {
+        settle(?results[i], results[i].art, build_testing.classify_setup_failure());
+        readout.test_end(sink, results, i);
+        i = i + 1;
+    }
+}
+
+# run every test, up to jobs at once, and report each to sink the moment it is
+# reaped, in the order the tests finish
+fun execute(a: *A.Allocator, sink: *readout.Sink, results: *readout.TestResult, n: u32, config: *Config) {
+    val runner:     *u8                      = config.runner;
+    val level:      u8                       = config.level;
+    val want_bytes: bool                     = config.bytes;
+    val timeout:    chrono_duration.Duration = config.timeout;
+    var window:     u32                      = config.jobs;
+    if (window < 1) { window = 1; }
+    if (window > n) { window = n; }
+
+    val res_processes: res[*subprocess.OwnedSubprocess, A.Error] = A.allocate[subprocess.OwnedSubprocess](a, n::usize);
+    if (sel res_processes.err) {
+        settle_exhausted(sink, results, n);
+        ret;
+    }
+    val processes: *subprocess.OwnedSubprocess = res_processes.ok;
+    val res_slots: res[*Slot, A.Error]         = A.allocate[Slot](a, window::usize);
+    if (sel res_slots.err) {
+        A.deallocate[subprocess.OwnedSubprocess](a, processes, n::usize);
+        settle_exhausted(sink, results, n);
+        ret;
+    }
+    val slots: *Slot = res_slots.ok;
+    var i:     u32   = 0;
+    for (i < n) {
+        subprocess.init(?processes[i]);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < window) {
+        slots[i].active = false;
+        i               = i + 1;
+    }
+
+    var scope: sync_cancel.Scope;
+    sync_cancel.make_root(?scope, opt[time.Instant].none{});
+    var source:           events.Source;
+    val made_source:      err[io_error.Error] = events.make(?source);
+    var has_source:       bool                = sel made_source.ok;
+    var interrupt_source: *events.Source      = nil;
+    if (has_source) { interrupt_source = ?source; }
+
+    var spawned:  u32 = 0;
+    var done:     u32 = 0;
+    var inflight: u32 = 0;
+
+    for (done < n) {
+        for (inflight < window && spawned < n) {
+            val idx: u32 = spawned;
+            spawned = spawned + 1;
+            val spawn_fail: opt[validation.ValidationGateResult] = spawn_one(a, processes, slots, window, ?results[idx], idx, runner,
+                timeout);
+            if (sel spawn_fail.none) {
+                inflight = inflight + 1;
+            }
+            if (sel spawn_fail.some) {
+                settle(?results[idx], results[idx].art, spawn_fail.some);
+                done = done + 1;
+                readout.test_end(sink, results, idx);
+            }
+        }
+
+        if (inflight > 0) {
+            val wr: res[*subprocess.OwnedSubprocess, subprocess.Error] = subprocess.wait_any(a, processes, n, ?scope, interrupt_source);
+            if (sel wr.err) {
+                var waited: fail.Fail = fail.environment(diagnostic_kind.PROCESS_WAIT, "waiting for test children failed");
+                readout.failure(sink, ?waited, diagnostic.ORIGIN_TEST);
+                var sx: u32 = 0;
+                for (sx < window) {
+                    if (slots[sx].active) {
+                        val eidx:    u32                                                  = slots[sx].idx;
+                        var cleaned: bool                                                 = false;
+                        val one:     res[subprocess.SubprocessTerminal, subprocess.Error] = subprocess.wait(a, ?processes[eidx]);
+                        if (sel one.ok) { cleaned = true; }
+                        if (sel one.err) {
+                            val canceled: res[subprocess.SubprocessTerminal, subprocess.Error] = subprocess.cancel(a, ?processes[eidx], 0);
+                            if (sel canceled.ok) { cleaned = true; }
+                        }
+                        if (cleaned) { finalize_slot(a, ?processes[eidx], ?slots[sx], results, level, want_bytes); }
+                        or {
+                            subprocess.abandon_capture(?processes[eidx]);
+                            subprocess.dnit(a, ?processes[eidx]);
+                            settle(?results[eidx], results[eidx].art, build_testing.classify_wait_failure());
+                        }
+                        slots[sx].active = false;
+                        inflight         = inflight - 1;
+                        done             = done + 1;
+                        readout.test_end(sink, results, eidx);
+                    }
+                    sx = sx + 1;
+                }
+            }
+            if (sel wr.ok) {
+                val reaped: *subprocess.OwnedSubprocess = wr.ok;
+                var sx:     u32                         = 0;
+                for (sx < window) {
+                    if (slots[sx].active) {
+                        val fidx: u32 = slots[sx].idx;
+                        if (?processes[fidx] == reaped) {
+                            finalize_slot(a, ?processes[fidx], ?slots[sx], results, level, want_bytes);
+                            slots[sx].active = false;
+                            inflight         = inflight - 1;
+                            done             = done + 1;
+                            readout.test_end(sink, results, fidx);
+                            brk;
+                        }
+                    }
+                    sx = sx + 1;
+                }
+            }
+        }
+    }
+
+    if (has_source) { events.close(?source); }
+    sync_cancel.destroy(?scope);
+}
+
+# spawn the test at position idx into a free slot, its output captured to its log
+# ---
+# ret: none when it is running, otherwise the result it settles with
+fun spawn_one(a: *A.Allocator, processes: *subprocess.OwnedSubprocess, slots: *Slot,
+    window: u32, t: *readout.TestResult, idx: u32, runner: *u8,
+    timeout: chrono_duration.Duration) opt[validation.ValidationGateResult] {
+    var s: u32 = 0;
+    for (s < window && slots[s].active) { s = s + 1; }
+    if (s == window || t.log == nil) { ret opt[validation.ValidationGateResult].some{build_testing.classify_setup_failure()}; }
+    val art: *outcome.TestArtifact = t.art;
+
+    var ibuf: [16]u8;
+    write_index(?ibuf[0], 16, art.idx);
+
+    var child_argv: [4]*u8;
+    if (runner != nil) {
+        child_argv[0] = runner;
+        child_argv[1] = art.exe;
+        child_argv[2] = ?ibuf[0];
+        child_argv[3] = nil;
+    }
+    or {
+        child_argv[0] = art.exe;
+        child_argv[1] = ?ibuf[0];
+        child_argv[2] = nil;
+    }
+
+    var options: subprocess.SpawnOptions = subprocess.spawn_options();
+    options.grouped        = true;
+    options.capture        = t.log;
+    options.capture_stderr = true;
+    options.capture_limit  = CAPTURE_LIMIT;
+    val start: readout.Instant       = readout.sample();
+    val res_c: err[subprocess.Error] = subprocess.spawn(
+        a, ?processes[idx], child_argv[0], ?child_argv[0], env.environ(), options);
+    if (sel res_c.err) {
+        val term:      subprocess.SubprocessTerminal = processes[idx].terminal;
+        var empty_cap: subprocess.CaptureIoResult;
+        empty_cap.bytes        = 0;
+        empty_cap.truncated    = false;
+        empty_cap.short_read   = false;
+        empty_cap.read_failed  = false;
+        empty_cap.write_failed = false;
+        empty_cap.close_failed = false;
+        empty_cap.closed       = false;
+        empty_cap.owned        = false;
+        val result: validation.ValidationGateResult = build_testing.classify_subprocess(?term, false, true, ?empty_cap);
+        subprocess.dnit(a, ?processes[idx]);
+        fs.remove_file(t.log);
+        ret opt[validation.ValidationGateResult].some{result};
+    }
+
+    if (timeout > 0) { subprocess.bound(?processes[idx], timeout); }
+
+    slots[s].active = true;
+    slots[s].idx    = idx;
+    slots[s].start  = start;
+    ret opt[validation.ValidationGateResult].none{};
+}
+
+# fill a reaped test's result from its process; a passing test's log is removed
+fun finalize_slot(a: *A.Allocator, process: *subprocess.OwnedSubprocess, slot: *Slot,
+    results: *readout.TestResult, level: u8, want_bytes: bool) {
+    val t: *readout.TestResult = ?results[slot.idx];
+    t.done      = true;
+    t.code      = 0;
+    t.out       = nil;
+    t.out_len   = 0;
+    t.truncated = false;
+    t.elapsed   = readout.elapsed(slot.start);
+
+    val provisional_pass: bool = process.terminal.kind == subprocess.STATE_EXITED && process.terminal.code == 0;
+    var retain:           bool = want_bytes;
+    if (provisional_pass && level < readout.LEVEL_ITEMS) { retain = false; }
+
+    val capture_r: res[subprocess.CaptureIoResult, subprocess.Error] = subprocess.finish_capture(a, process, retain);
+    var cap_ok:    bool                                              = sel capture_r.ok;
+    var capture:   subprocess.CaptureIoResult;
+    capture.bytes        = 0;
+    capture.truncated    = false;
+    capture.short_read   = false;
+    capture.read_failed  = false;
+    capture.write_failed = false;
+    capture.close_failed = false;
+    capture.closed       = false;
+    capture.owned        = false;
+    if (sel capture_r.ok) {
+        capture = capture_r.ok;
+        if (retain) {
+            t.out       = subprocess.capture_bytes(process, ?t.out_len);
+            t.truncated = capture.truncated;
+        }
+    }
+
+    t.bound = 0;
+    if (subprocess.expired(process)) { t.bound = process.timeout; }
+    t.result = build_testing.classify_subprocess(?process.terminal, subprocess.expired(process), cap_ok, ?capture);
+    if (t.result.kind == validation.RESULT_SEMANTIC_MISMATCH) { t.code = process.terminal.code; }
+
+    subprocess.dnit(a, process);
+    if (t.result.kind == validation.RESULT_PASS && t.log != nil) { fs.remove_file(t.log); }
+}
+
+fun count_failed(results: *readout.TestResult, len: u32) u32 {
+    var f: u32 = 0;
+    var i: u32 = 0;
+    for (i < len) {
+        if (results[i].result.kind != validation.RESULT_PASS) { f = f + 1; }
+        i = i + 1;
+    }
+    ret f;
+}
+
+fun write_index(buf: *u8, cap: usize, n: u32) {
+    var digits: [std_format.DECIMAL_MAX]u8;
+    val t:      usize = std_format.put_u64(?digits[0], n::u64);
+    var k:      usize = 0;
+    for (k < t && k + 1 < cap) {
+        buf[k] = digits[k];
+        k      = k + 1;
+    }
+    buf[k] = 0;
+}
+
+fun capture_log_dir(a: *A.Allocator, exe: *u8) res[str, fail.Fail] {
+    val dir_r: res[str, A.Error] = types_path.parent(a, exe::str);
+    if (sel dir_r.err) { ret res[str, fail.Fail].err{fail.refused(dir_r.err)}; }
+    val join_r: res[types_path.Path, A.Error] = types_path.join(a, dir_r.ok, "log");
+    if (sel join_r.err) { ret res[str, fail.Fail].err{fail.refused(join_r.err)}; }
+    ret res[str, fail.Fail].ok{join_r.ok};
+}
+
+fun log_path(a: *A.Allocator, log_dir: *u8, idx: u32) res[str, fail.Fail] {
+    var leaf: [24]u8;
+    write_index(?leaf[0], 16, idx);
+    var k: usize = str_len(?leaf[0]);
+    leaf[k]     = '.';
+    leaf[k + 1] = 'l';
+    leaf[k + 2] = 'o';
+    leaf[k + 3] = 'g';
+    leaf[k + 4] = 0;
+    val join_r: res[types_path.Path, A.Error] = types_path.join(a, log_dir::str, (?leaf[0])::str);
+    if (sel join_r.err) { ret res[str, fail.Fail].err{fail.refused(join_r.err)}; }
+    ret res[str, fail.Fail].ok{join_r.ok};
+}
+
+# the log directory, which the build owns beside the dispatcher, exists and
+# holds no log from an earlier run
+fun prepare_logs(a: *A.Allocator, log_dir: *u8, total: u32) err[fail.Fail] {
+    val owner_r: res[str, A.Error] = types_path.parent(a, log_dir::str);
+    if (sel owner_r.err) { ret err[fail.Fail].err{fail.refused(owner_r.err)}; }
+    val made: err[fail.Fail] = output.directory(a, owner_r.ok, log_dir::str);
+    str_free(a, owner_r.ok);
+    if (sel made.err) { ret made; }
+    var idx: u32 = 0;
+    for (idx < total) {
+        val lp_r: res[str, fail.Fail] = log_path(a, log_dir, idx);
+        if (sel lp_r.ok) { fs.remove_file(lp_r.ok); }
+        idx = idx + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+#[testing]
+fun t_outcome(kind: validation.ValidationGateResultKind, cause: validation.ValidationCause) readout.TestResult {
+    var o: readout.TestResult;
+    settle(?o, nil, validation.gate_result(kind, cause, nil));
+    o.log = nil;
+    ret o;
+}
+
+test count_failed_and_build_gate_tally__only_pass_counts_as_passing {
+    var a: A.Allocator;
+    page.make(?a);
+
+    var results: [3]readout.TestResult;
+    results[0] = t_outcome(validation.RESULT_PASS, validation.CAUSE_PASS);
+    results[1] = t_outcome(validation.RESULT_SEMANTIC_MISMATCH, validation.CAUSE_ORACLE_EXIT);
+    results[2] = t_outcome(validation.RESULT_TOOL_UNAVAILABLE, validation.CAUSE_TOOL_UNAVAILABLE);
+
+    if (count_failed(?results[0], 3) != 2) { ret 1; }
+
+    var gt: outcome.GateTally = outcome.gate_tally_init(?a);
+    build_gate_tally(?gt, ?a, ?results[0], 3);
+
+    var bad: i32 = 0;
+    if (gt.pass != 1)                       { bad = 1; }
+    or (gt.semantic_mismatch != 1)          { bad = 1; }
+    or (gt.tool_unavailable != 1)           { bad = 1; }
+    or (outcome.gate_tally_total(?gt) != 3) { bad = 1; }
+
+    outcome.gate_tally_dnit(?gt);
+    ret bad;
+}
+
+#[testing]
+fun t_temp_name(a: *A.Allocator) str {
+    val tf_r: res[fs.TempFile, fs.FsError] = fs.temp_create(a, "mach_test_timeout");
+    if (sel tf_r.err) { ret ""; }
+    var tf:    fs.TempFile       = tf_r.ok;
+    val dup_r: res[str, A.Error] = str_dup(a, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (sel dup_r.err) { ret ""; }
+    ret dup_r.ok;
+}
+
+#[testing]
+rec TimeoutProbe {
+    script:  str;
+    log_dir: str;
+    outcome: readout.TestResult;
+}
+
+#[testing]
+fun t_probe_free(a: *A.Allocator, pr: *TimeoutProbe) {
+    if (str_len(pr.script) > 0) {
+        fs.remove_file(pr.script);
+        str_free(a, pr.script);
+    }
+    if (str_len(pr.log_dir) > 0) {
+        fs.remove_all(a, pr.log_dir);
+        str_free(a, pr.log_dir);
+    }
+    pr.script  = "";
+    pr.log_dir = "";
+}
+
+# runs one test process through the real spawn, wait and finalize chain
+#[testing]
+fun t_run_one_bounded(a: *A.Allocator, body: str, timeout: chrono_duration.Duration, pr: *TimeoutProbe) i32 {
+    pr.script  = t_temp_name(a);
+    pr.log_dir = t_temp_name(a);
+    if (str_len(pr.script) == 0 || str_len(pr.log_dir) == 0) { ret 1; }
+    val write_bytes_r: err[fs.FsError] = fs.write_bytes(pr.script, body::*u8, str_len(body), 0o600);
+    if (sel write_bytes_r.err) { ret 2; }
+    val create_dir_r: err[io_error.Error] = fs.create_dir(pr.log_dir, 0o700);
+    if (sel create_dir_r.err) { ret 3; }
+
+    var art: outcome.TestArtifact;
+    art.module = "mach.timeout.probe";
+    art.name   = "probe";
+    art.file   = "probe.mach";
+    art.line   = 1;
+    art.exe    = pr.script::*u8;
+    art.idx    = 0;
+
+    var results: [1]readout.TestResult;
+    settle(?results[0], ?art, validation.gate_result(validation.RESULT_PASS, validation.CAUSE_PASS, nil));
+    results[0].done = false;
+    val lp_r: res[str, fail.Fail] = log_path(a, pr.log_dir::*u8, 0);
+    if (sel lp_r.err) { ret 3; }
+    results[0].log = lp_r.ok;
+
+    var process: subprocess.OwnedSubprocess;
+    subprocess.init(?process);
+    var slot: Slot;
+    slot.active = false;
+
+    val spawn_fail: opt[validation.ValidationGateResult] = spawn_one(a, ?process, ?slot, 1, ?results[0], 0, "/bin/sh"::*u8, timeout);
+    if (sel spawn_fail.some) { ret 4; }
+
+    val wr: res[*subprocess.OwnedSubprocess, subprocess.Error] = subprocess.wait_any(a, ?process, 1, nil, nil);
+    if (sel wr.err) {
+        subprocess.cancel(a, ?process, 0);
+        subprocess.dnit(a, ?process);
+        ret 5;
+    }
+    finalize_slot(a, ?process, ?slot, ?results[0], 0, true);
+    pr.outcome = results[0];
+    ret 0;
+}
+
+test run_one__a_test_past_its_bound_is_timed_out {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+
+    var pr: TimeoutProbe;
+    pr.script  = "";
+    pr.log_dir = "";
+    val setup: i32 = t_run_one_bounded(?a, "sleep 30\n", chrono_duration.SECOND, ?pr);
+    var bad:   i32 = 0;
+    if (setup != 0) { bad = 10 + setup; }
+    or {
+        val o: *readout.TestResult = ?pr.outcome;
+        if (o.result.kind != validation.RESULT_RESOURCE_EXHAUSTION) { bad = 4; }
+        or (o.result.cause != validation.CAUSE_ORACLE_TIMEOUT)      { bad = 5; }
+        or (o.bound != chrono_duration.SECOND)                      { bad = 6; }
+        or {
+            var one: [1]readout.TestResult;
+            one[0] = @o;
+            if (count_timed_out(?one[0], 1) != 1) { bad = 8; }
+            or (count_failed(?one[0], 1) != 1)    { bad = 9; }
+            or {
+                var tally: outcome.GateTally = outcome.gate_tally_init(?a);
+                build_gate_tally(?tally, ?a, ?one[0], 1);
+                if (tally.infrastructure_failure != 0) { bad = 20; }
+                outcome.gate_tally_dnit(?tally);
+            }
+        }
+    }
+    t_probe_free(?a, ?pr);
+    ret bad;
+}
+
+test run_one__an_unbounded_test_that_sleeps_briefly_still_passes {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+
+    var pr: TimeoutProbe;
+    pr.script  = "";
+    pr.log_dir = "";
+    val setup: i32 = t_run_one_bounded(?a, "sleep 1\nexit 0\n", 0, ?pr);
+    var bad:   i32 = 0;
+    if (setup != 0) { bad = 10 + setup; }
+    or {
+        val o: *readout.TestResult = ?pr.outcome;
+        if (o.result.kind != validation.RESULT_PASS) { bad = 2; }
+        or (o.bound != 0)                            { bad = 3; }
+        or {
+            var one: [1]readout.TestResult;
+            one[0] = @o;
+            if (count_timed_out(?one[0], 1) != 0) { bad = 4; }
+            or {
+                var tally: outcome.GateTally = outcome.gate_tally_init(?a);
+                build_gate_tally(?tally, ?a, ?one[0], 1);
+                if (tally.infrastructure_failure != 0 || tally.pass != 1) { bad = 5; }
+                outcome.gate_tally_dnit(?tally);
+            }
+        }
+    }
+    t_probe_free(?a, ?pr);
+    ret bad;
+}
+
+test run_one__a_test_that_beats_its_bound_keeps_its_own_outcome {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+
+    var pr: TimeoutProbe;
+    pr.script  = "";
+    pr.log_dir = "";
+    val setup: i32 = t_run_one_bounded(?a, "exit 4\n", chrono_duration.SECOND * 30, ?pr);
+    var bad:   i32 = 0;
+    if (setup != 0) { bad = 10 + setup; }
+    or {
+        val o: *readout.TestResult = ?pr.outcome;
+        if (o.result.kind != validation.RESULT_SEMANTIC_MISMATCH) { bad = 2; }
+        or (o.result.cause != validation.CAUSE_ORACLE_EXIT)       { bad = 3; }
+        or (o.code != 4)                                          { bad = 4; }
+        or (o.bound != 0)                                         { bad = 5; }
+    }
+    t_probe_free(?a, ?pr);
+    ret bad;
+}

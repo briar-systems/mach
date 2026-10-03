@@ -78,6 +78,14 @@ pub val TEST_CODEGEN: Phase = 10
 
 a test build's test objects, generated
 
+## val STEPS
+
+```mach
+pub val STEPS: Phase = 11
+```
+
+the build steps a project and its dependencies declare
+
 ## rec PhaseSpec
 
 ```mach
