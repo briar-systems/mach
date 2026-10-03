@@ -234,7 +234,7 @@ pub fun mem_width_of(ctx: *LowerCtx, ty: ir_type.IrTypeId) u8;
 ## fun stack_slot_bytes
 
 ```mach
-pub fun stack_slot_bytes(tgt: *binding.Binding, size: u64) i64;
+pub fun stack_slot_bytes(tgt: *binding.Binding, size: u64) res[i64, fail.Fail];
 ```
 
 ## fun lower_value

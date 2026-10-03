@@ -3,7 +3,6 @@ use mach.lang.growth;
 use std.allocator.arena;
 use std.allocator.page;
 use std.collections.sort;
-use std.system.panic.panic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -18,7 +17,8 @@ use T: std.allocator.testing;
 
 use lang_checked: mach.lang.checked;
 use mach.lang.intern;
-use lang_mir:    mach.lang.mir;
+use lang_mir: mach.lang.mir;
+use mach.lang.mir.flow;
 use lang_source: mach.lang.source;
 use lang_target: mach.lang.target;
 use mach.lang.target.abi;
@@ -29,7 +29,6 @@ use isa_riscv: mach.lang.target.isa.riscv;
 use isa_rules: mach.lang.target.isa.rules;
 use mach.lang.target.isa.x64;
 use target_model:   mach.lang.target.model;
-use lang_target_os: mach.lang.target.os;
 use target_testing: mach.lang.target.testing;
 
 pub val REG_CLASS_GP: u32 = 0;
@@ -84,6 +83,9 @@ rec CopyHint {
 }
 
 rec AllocCtx {
+    # the first broken invariant a helper that returns no failure met, nil
+    # while none; the phase that ran the helper returns it as a defect
+    defect:               str;
     alloc:                *A.Allocator;
     interner:             *intern.Interner;
     tgt:                  *lang_target.Binding;
@@ -125,26 +127,27 @@ rec AllocCtx {
     cur_end:              i64;
     reload_scratch:       *target_model.Register;
     reload_scratch_count: i32;
-    block_id_index:       *u32;
-    block_id_index_cap:   u32;
-    block_spans:          *BlockSpan;
-    block_depth:          *u32;
-    vreg_slot_flag:       *bool;
-    hints:                *CopyHint;
-    anchor_until:         *i64;
-    spilled:              *bool;
-    spill_order:          *u32;
-    spill_order_count:    u32;
-    piece_of:             *u32;
-    no_pieces:            *bool;
-    no_remat:             *bool;
-    table_count:          u32;
-    round_count:          u32;
-    tight_pos:            *u32;
-    tight_hold:           *u32;
-    tight_usable:         *u32;
-    tight_count:          u32;
-    borrowed_gp:          u32;
+    # the control-flow graph of the function in scan order, once it is ordered
+    graph:             flow.Graph;
+    graph_built:       bool;
+    block_spans:       *BlockSpan;
+    block_depth:       *u32;
+    vreg_slot_flag:    *bool;
+    hints:             *CopyHint;
+    anchor_until:      *i64;
+    spilled:           *bool;
+    spill_order:       *u32;
+    spill_order_count: u32;
+    piece_of:          *u32;
+    no_pieces:         *bool;
+    no_remat:          *bool;
+    table_count:       u32;
+    round_count:       u32;
+    tight_pos:         *u32;
+    tight_hold:        *u32;
+    tight_usable:      *u32;
+    tight_count:       u32;
+    borrowed_gp:       u32;
 }
 
 # the internal failure `prefix`, the function's name, then `suffix`; `unnamed`
@@ -336,7 +339,7 @@ fun alloc_function(tgt: *lang_target.Binding, m: *lang_mir.MirModule, f: *lang_m
         ret vo;
     }
 
-    val dp: err[fail.Fail] = drop_self_copies_physical(tgt, ?ctx);
+    val dp: err[fail.Fail] = drop_self_copies(tgt, ?ctx, lang_mir.MIR_OP_PREG);
     if (sel dp.err) {
         ctx_dnit(?ctx);
         ret dp;
@@ -368,7 +371,8 @@ fun alloc_round(tgt: *lang_target.Binding, ctx: *AllocCtx) err[fail.Fail] {
     val bd: err[fail.Fail] = build_loop_depth(ctx);
     if (sel bd.err) { ret bd; }
 
-    build_ranges(ctx);
+    val br: err[fail.Fail] = build_ranges(ctx);
+    if (sel br.err) { ret br; }
 
     val lv: err[fail.Fail] = extend_liveness(ctx, ctx.holes);
     if (sel lv.err) { ret lv; }
@@ -383,6 +387,8 @@ fun alloc_round(tgt: *lang_target.Binding, ctx: *AllocCtx) err[fail.Fail] {
 
     val sc: err[fail.Fail] = linear_scan(tgt, ctx);
     if (sel sc.err) { ret sc; }
+    val sd: err[fail.Fail] = defect_check(ctx);
+    if (sel sd.err) { ret sd; }
 
     # checked while the flat index still names the scanned instructions
     if (ctx.holes) {
@@ -394,6 +400,7 @@ fun alloc_round(tgt: *lang_target.Binding, ctx: *AllocCtx) err[fail.Fail] {
 }
 
 fun ctx_init(ctx: *AllocCtx, tgt: *lang_target.Binding, m: *lang_mir.MirModule, f: *lang_mir.MirFunction) err[fail.Fail] {
+    ctx.defect               = nil;
     ctx.alloc                = m.alloc;
     ctx.interner             = m.interner;
     ctx.tgt                  = tgt;
@@ -435,8 +442,7 @@ fun ctx_init(ctx: *AllocCtx, tgt: *lang_target.Binding, m: *lang_mir.MirModule, 
     ctx.cur_end              = 0;
     ctx.reload_scratch       = tgt.arch.reload_scratch_regs;
     ctx.reload_scratch_count = tgt.arch.reload_scratch_count;
-    ctx.block_id_index       = nil;
-    ctx.block_id_index_cap   = 0;
+    ctx.graph_built          = false;
     ctx.block_spans          = nil;
     ctx.block_depth          = nil;
     ctx.vreg_slot_flag       = nil;
@@ -774,9 +780,9 @@ fun ctx_dnit(ctx: *AllocCtx) {
         A.deallocate[i64](ctx.alloc, ctx.fp_pinned_end, ctx.fp_count::usize);
         ctx.fp_pinned_end = nil;
     }
-    if (ctx.block_id_index != nil && ctx.block_id_index_cap > 0) {
-        A.deallocate[u32](ctx.alloc, ctx.block_id_index, ctx.block_id_index_cap::usize);
-        ctx.block_id_index = nil;
+    if (ctx.graph_built) {
+        flow.dnit(?ctx.graph);
+        ctx.graph_built = false;
     }
     if (ctx.table_count > 0) {
         if (ctx.spilled != nil)     { A.deallocate[bool](ctx.alloc, ctx.spilled, ctx.table_count::usize); }
@@ -824,24 +830,10 @@ fun seed_callee_saved(tgt: *lang_target.Binding, ctx: *AllocCtx) {
 }
 
 fun seed_reserved(tgt: *lang_target.Binding, ctx: *AllocCtx) {
-    var i: i32 = 0;
-    for (i < tgt.arch.reserved_reg_count && i < MAX_REG_FILE) {
-        reserve_reg(ctx, tgt.arch.reserved_regs[i].id);
-        i = i + 1;
-    }
-    var j: i32 = 0;
-    for (j < tgt.arch.reload_scratch_count && j < MAX_REG_FILE) {
-        reserve_reg(ctx, tgt.arch.reload_scratch_regs[j].id);
-        j = j + 1;
-    }
-    reserve_reg(ctx, tgt.arch.scratch_reg);
-    reserve_reg(ctx, tgt.arch.scratch_reg2);
-
-    val platform_mask: u32 = lang_target_os.reserved_gp_for(tgt.os, tgt.isa.id);
-    var pr:            i32 = 0;
-    for (pr < 32) {
-        if ((platform_mask & (1::u32 << pr::u32)) != 0) { reserve_reg(ctx, pr); }
-        pr = pr + 1;
+    var r: i32 = 0;
+    for (r < 32) {
+        if ((tgt.reserved_gp & (1::u32 << r::u32)) != 0) { reserve_reg(ctx, r); }
+        r = r + 1;
     }
 }
 
@@ -866,146 +858,25 @@ fun function_has_reg_shift(ctx: *AllocCtx) bool {
     ret false;
 }
 
+# the scan order is the reverse postorder from the entry, then the blocks it
+# does not reach in their own order
 fun build_order(ctx: *AllocCtx) err[fail.Fail] {
-    val f: *lang_mir.MirFunction = ctx.f;
-    val n: u32                   = f.block_count;
-
-    val bx: err[fail.Fail] = fill_block_id_index(ctx);
-    if (sel bx.err) { ret bx; }
-
-    val rv: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, n::usize);
-    if (sel rv.err) { ret err[fail.Fail].err{fail.refused(rv.err)}; }
-    val visited: *bool = rv.ok;
-    var i:       u32   = 0;
-    for (i < n) {
-        visited[i] = false;
-        i          = i + 1;
-    }
-
-    val rs: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, n::usize);
-    if (sel rs.err) {
-        A.deallocate[bool](ctx.alloc, visited, n::usize);
-        ret err[fail.Fail].err{fail.refused(rs.err)};
-    }
-    val stack: *u32               = rs.ok;
-    val re:    res[*u32, A.Error] = A.allocate[u32](ctx.alloc, n::usize);
-    if (sel re.err) {
-        A.deallocate[bool](ctx.alloc, visited, n::usize);
-        A.deallocate[u32](ctx.alloc, stack, n::usize);
-        ret err[fail.Fail].err{fail.refused(re.err)};
-    }
-    val succ_ix: *u32 = re.ok;
-
-    val rp: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, n::usize);
-    if (sel rp.err) {
-        A.deallocate[bool](ctx.alloc, visited, n::usize);
-        A.deallocate[u32](ctx.alloc, stack, n::usize);
-        A.deallocate[u32](ctx.alloc, succ_ix, n::usize);
-        ret err[fail.Fail].err{fail.refused(rp.err)};
-    }
-    val post:       *u32 = rp.ok;
-    var post_count: u32  = 0;
-
-    var sp: u32 = 0;
-    stack[sp]   = 0;
-    succ_ix[sp] = 0;
-    visited[0]  = true;
-    sp          = sp + 1;
-
-    for (sp > 0) {
-        val top:  u32 = sp - 1;
-        val b:    u32 = stack[top];
-        val next: u32 = next_unvisited_succ(ctx, b, ?succ_ix[top], visited);
-        if (next == RANGE_NIL) {
-            post[post_count] = b;
-            post_count       = post_count + 1;
-            sp               = sp - 1;
-        }
-        or {
-            visited[next] = true;
-            stack[sp]     = next;
-            succ_ix[sp]   = 0;
-            sp            = sp + 1;
-        }
-    }
-
-    var oi: u32 = 0;
-    var k:  u32 = post_count;
-    for (k > 0) {
-        k             = k - 1;
-        ctx.order[oi] = post[k];
-        oi            = oi + 1;
-    }
-    var bi: u32 = 0;
-    for (bi < n) {
-        if (!visited[bi]) {
-            ctx.order[oi] = bi;
-            oi            = oi + 1;
-        }
-        bi = bi + 1;
-    }
-
-    A.deallocate[bool](ctx.alloc, visited, n::usize);
-    A.deallocate[u32](ctx.alloc, stack, n::usize);
-    A.deallocate[u32](ctx.alloc, succ_ix, n::usize);
-    A.deallocate[u32](ctx.alloc, post, n::usize);
+    val rg: err[fail.Fail] = graph_rebuild(ctx);
+    if (sel rg.err) { ret rg; }
+    flow.scan_order_fill(?ctx.graph, ctx.order);
     ret err[fail.Fail].ok{};
 }
 
-fun next_unvisited_succ(ctx: *AllocCtx, b: u32, six: *u32, visited: *bool) u32 {
-    val f:   *lang_mir.MirFunction = ctx.f;
-    val blk: *lang_mir.MirBlock    = ?f.blocks[b];
-    if (blk.instr_count == 0) { ret RANGE_NIL; }
-
-    val term: *lang_mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
-    for (@six < term.operand_count) {
-        val op: *lang_mir.MirOperand = ?term.operands[@six];
-        @six = @six + 1;
-        if (op.kind == lang_mir.MIR_OP_BLOCK) {
-            val tgt_idx: u32 = block_index_of(ctx, op.imm::u32);
-            if (tgt_idx != RANGE_NIL && !visited[tgt_idx]) {
-                ret tgt_idx;
-            }
-        }
+fun graph_rebuild(ctx: *AllocCtx) err[fail.Fail] {
+    if (ctx.graph_built) {
+        flow.dnit(?ctx.graph);
+        ctx.graph_built = false;
     }
-    ret RANGE_NIL;
-}
-
-fun fill_block_id_index(ctx: *AllocCtx) err[fail.Fail] {
-    val f: *lang_mir.MirFunction = ctx.f;
-    val n: u32                   = f.block_count;
-    if (n == 0) { ret err[fail.Fail].ok{}; }
-
-    if (ctx.block_id_index == nil) {
-        var max_id: u32 = 0;
-        var i:      u32 = 0;
-        for (i < n) {
-            if (f.blocks[i].id > max_id) { max_id = f.blocks[i].id; }
-            i = i + 1;
-        }
-        val cap: u32                = max_id + 1;
-        val r:   res[*u32, A.Error] = A.allocate[u32](ctx.alloc, cap::usize);
-        if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
-        ctx.block_id_index     = r.ok;
-        ctx.block_id_index_cap = cap;
-    }
-
-    var j: u32 = 0;
-    for (j < ctx.block_id_index_cap) {
-        ctx.block_id_index[j] = RANGE_NIL;
-        j                     = j + 1;
-    }
-    var k: u32 = 0;
-    for (k < n) {
-        ctx.block_id_index[f.blocks[k].id] = k;
-        k                                  = k + 1;
-    }
+    val rg: res[flow.Graph, fail.Fail] = flow.init(ctx.alloc, ctx.f);
+    if (sel rg.err) { ret err[fail.Fail].err{rg.err}; }
+    ctx.graph       = rg.ok;
+    ctx.graph_built = true;
     ret err[fail.Fail].ok{};
-}
-
-fun block_index_of(ctx: *AllocCtx, bid: u32) u32 {
-    if (bid >= ctx.block_id_index_cap) { ret RANGE_NIL; }
-    ret ctx.block_id_index[bid];
 }
 
 fun apply_order(ctx: *AllocCtx) err[fail.Fail] {
@@ -1029,7 +900,7 @@ fun apply_order(ctx: *AllocCtx) err[fail.Fail] {
     }
     A.deallocate[lang_mir.MirBlock](ctx.alloc, tmp, n::usize);
 
-    ret fill_block_id_index(ctx);
+    ret graph_rebuild(ctx);
 }
 
 fun restore_order(ctx: *AllocCtx) err[fail.Fail] {
@@ -1114,9 +985,19 @@ fun use_weight_at(ctx: *AllocCtx, pos: u32) i64 {
     ret (1::i64) << (depth * LOOP_WEIGHT_SHIFT);
 }
 
+fun defect_note(ctx: *AllocCtx, text: str) {
+    if (ctx.defect == nil) { ctx.defect = text; }
+}
+
+fun defect_check(ctx: *AllocCtx) err[fail.Fail] {
+    if (ctx.defect != nil) { ret err[fail.Fail].err{fail.message(ctx.defect)}; }
+    ret err[fail.Fail].ok{};
+}
+
 fun touch(ctx: *AllocCtx, v: lang_mir.VRegId, pos: u32) {
     if (v.n >= ctx.f.vreg_count) {
-        panic("regalloc: out-of-range vreg id in a MIR operand\n");
+        defect_note(ctx, "regalloc: out-of-range vreg id in a MIR operand");
+        ret;
     }
     val lr: *LiveRange = ?ctx.ranges[v.n];
     if (pos::i64 < lr.start)   { lr.start = pos::i64; }
@@ -1125,9 +1006,12 @@ fun touch(ctx: *AllocCtx, v: lang_mir.VRegId, pos: u32) {
     lr.use_weight = lr.use_weight + use_weight_at(ctx, pos);
 }
 
-# loop nesting depth per block from the reverse-postorder layout: a
-# predecessor placed at or after its successor closes a loop, and every block
-# between the header and that latch lies inside it
+# a use's weight by its block's span depth over the scan order, which is the
+# reverse postorder: an edge from a block at or after its target in the scan
+# closes a loop, and every block the scan places from the target through that
+# source counts it, so a block laid out between a loop's header and its latch
+# weighs as inside the loop whether it lies in the loop or not. this is the
+# allocator's own weight, not the loop nesting mir.flow derives
 fun build_loop_depth(ctx: *AllocCtx) err[fail.Fail] {
     val f: *lang_mir.MirFunction = ctx.f;
     val n: u32                   = f.block_count;
@@ -1142,27 +1026,27 @@ fun build_loop_depth(ctx: *AllocCtx) err[fail.Fail] {
         ctx.block_depth[i] = 0;
         i                  = i + 1;
     }
-    var b: u32 = 0;
+    val g: *flow.Graph = ?ctx.graph;
+    var b: u32         = 0;
     for (b < n) {
-        val blk: *lang_mir.MirBlock = ?f.blocks[b];
-        var pi:  u32                = 0;
-        for (pi < blk.pred_count) {
-            val p: u32 = block_index_of(ctx, blk.preds[pi]);
-            if (p != RANGE_NIL && p >= b) {
+        var e: u32 = g.pred_start[b];
+        for (e < g.pred_start[b + 1]) {
+            val p: u32 = g.pred[e];
+            if (p >= b) {
                 var k: u32 = b;
                 for (k <= p) {
                     ctx.block_depth[k] = ctx.block_depth[k] + 1;
                     k                  = k + 1;
                 }
             }
-            pi = pi + 1;
+            e = e + 1;
         }
         b = b + 1;
     }
     ret err[fail.Fail].ok{};
 }
 
-fun build_ranges(ctx: *AllocCtx) {
+fun build_ranges(ctx: *AllocCtx) err[fail.Fail] {
     var pos: u32 = 0;
     for (pos < ctx.flat_count) {
         val mi: *lang_mir.MirInstr = flat_instr(ctx, pos);
@@ -1182,6 +1066,7 @@ fun build_ranges(ctx: *AllocCtx) {
         }
         pos = pos + 1;
     }
+    ret defect_check(ctx);
 }
 
 fun isa_is_reg_move(tgt: *lang_target.Binding, opcode: u32) bool {
@@ -1420,7 +1305,10 @@ fun rename_vregs(ctx: *AllocCtx, parent: *u32, nv: u32) {
     }
 }
 
-fun drop_self_copies(tgt: *lang_target.Binding, ctx: *AllocCtx) err[fail.Fail] {
+# a copy of a register onto itself goes, operands of `kind` alone: virtual
+# ones before allocation, physical ones after the rewrite. a declassifying one
+# leaves its marker
+fun drop_self_copies(tgt: *lang_target.Binding, ctx: *AllocCtx, kind: lang_mir.MirOperandKind) err[fail.Fail] {
     val f:  *lang_mir.MirFunction = ctx.f;
     var bi: u32                   = 0;
     for (bi < f.block_count) {
@@ -1431,9 +1319,7 @@ fun drop_self_copies(tgt: *lang_target.Binding, ctx: *AllocCtx) err[fail.Fail] {
             val mi:   *lang_mir.MirInstr = ?blk.instrs[read];
             var drop: bool               = false;
             if (instr_is_reg_copy(tgt, mi)) {
-                val a: *lang_mir.MirOperand = ?mi.operands[0];
-                val b: *lang_mir.MirOperand = ?mi.operands[1];
-                drop = a.kind == lang_mir.MIR_OP_VREG && b.kind == lang_mir.MIR_OP_VREG && lang_mir.vreg_same(a.vreg, b.vreg);
+                drop = mi.operands[0].kind == kind && lang_mir.operand_same(?mi.operands[0], ?mi.operands[1]);
             }
             if (drop && lang_mir.instr_declassifies(mi)) {
                 val marker: lang_mir.MirInstr = lang_mir.declassify_marker(mi, mi.operands[0].vreg);
@@ -1498,7 +1384,7 @@ fun coalesce_copies(tgt: *lang_target.Binding, ctx: *AllocCtx) err[fail.Fail] {
 
     if (merged) {
         rename_vregs(ctx, parent, nv);
-        val rd: err[fail.Fail] = drop_self_copies(tgt, ctx);
+        val rd: err[fail.Fail] = drop_self_copies(tgt, ctx, lang_mir.MIR_OP_VREG);
         if (sel rd.err) {
             A.deallocate[u32](ctx.alloc, web_defs, nv::usize);
             A.deallocate[u32](ctx.alloc, parent, nv::usize);
@@ -1549,7 +1435,8 @@ fun coalesce_dying_copies(tgt: *lang_target.Binding, ctx: *AllocCtx) err[fail.Fa
     if (sel bs.err) { ret bs; }
     val bd: err[fail.Fail] = build_loop_depth(ctx);
     if (sel bd.err) { ret bd; }
-    build_ranges(ctx);
+    val br: err[fail.Fail] = build_ranges(ctx);
+    if (sel br.err) { ret br; }
     val lv: err[fail.Fail] = extend_liveness(ctx, true);
     if (sel lv.err) { ret lv; }
 
@@ -1616,7 +1503,7 @@ fun coalesce_dying_copies(tgt: *lang_target.Binding, ctx: *AllocCtx) err[fail.Fa
     }
     if (!merged) { ret err[fail.Fail].ok{}; }
     rename_vregs(ctx, parent, nv);
-    ret drop_self_copies(tgt, ctx);
+    ret drop_self_copies(tgt, ctx, lang_mir.MIR_OP_VREG);
 }
 
 # a full-width copy between two values that could share a register, whose
@@ -1859,16 +1746,15 @@ fun defines_by_clobbering(mi: *lang_mir.MirInstr, d: u32, y: u32) bool {
     ret false;
 }
 
-# liveness scratch: per-register use and definition blocks and per-block
-# predecessors, each grouped as offset ranges, so the propagation touches
-# only the blocks a register reaches instead of a block-by-register matrix
+# liveness scratch: per-register use and definition blocks grouped as offset
+# ranges, so the propagation touches only the blocks a register reaches
+# instead of a block-by-register matrix; predecessors come from the graph
 rec LiveScratch {
     alloc:      *A.Allocator;
     nb:         u32;
     nv:         u32;
     use_start:  *u32;
     def_start:  *u32;
-    pred_start: *u32;
     use_mark:   *u32;
     def_mark:   *u32;
     def_of:     *u32;
@@ -1876,10 +1762,8 @@ rec LiveScratch {
     pending:    *u32;
     use_count:  u32;
     def_count:  u32;
-    edge_count: u32;
     use_blocks: *u32;
     def_blocks: *u32;
-    preds:      *u32;
     fill:       bool;
     out_mark:   *u32;
     live_in:    PairList;
@@ -1944,7 +1828,6 @@ fun live_scratch_dnit(l: *LiveScratch) {
     pair_list_dnit(l.alloc, ?l.live_in);
     pair_list_dnit(l.alloc, ?l.live_out);
     live_scratch_release(l, ?l.out_mark, l.nb);
-    live_scratch_release(l, ?l.preds, l.edge_count);
     live_scratch_release(l, ?l.def_blocks, l.def_count);
     live_scratch_release(l, ?l.use_blocks, l.use_count);
     live_scratch_release(l, ?l.pending, l.nb);
@@ -1952,7 +1835,6 @@ fun live_scratch_dnit(l: *LiveScratch) {
     live_scratch_release(l, ?l.def_of, l.nb);
     live_scratch_release(l, ?l.def_mark, l.nv);
     live_scratch_release(l, ?l.use_mark, l.nv);
-    live_scratch_release(l, ?l.pred_start, l.nb + 1);
     live_scratch_release(l, ?l.def_start, l.nv + 1);
     live_scratch_release(l, ?l.use_start, l.nv + 1);
 }
@@ -1963,7 +1845,6 @@ fun live_scratch_init(l: *LiveScratch, alloc: *A.Allocator, nb: u32, nv: u32) er
     l.nv         = nv;
     l.use_start  = nil;
     l.def_start  = nil;
-    l.pred_start = nil;
     l.use_mark   = nil;
     l.def_mark   = nil;
     l.def_of     = nil;
@@ -1971,10 +1852,8 @@ fun live_scratch_init(l: *LiveScratch, alloc: *A.Allocator, nb: u32, nv: u32) er
     l.pending    = nil;
     l.use_count  = 0;
     l.def_count  = 0;
-    l.edge_count = 0;
     l.use_blocks = nil;
     l.def_blocks = nil;
-    l.preds      = nil;
     l.fill       = false;
     l.out_mark   = nil;
     pair_list_init(?l.live_in);
@@ -1990,11 +1869,6 @@ fun live_scratch_init(l: *LiveScratch, alloc: *A.Allocator, nb: u32, nv: u32) er
     if (sel r1.err) {
         live_scratch_dnit(l);
         ret r1;
-    }
-    val r2: err[fail.Fail] = live_scratch_array(l, ?l.pred_start, nb + 1, 0);
-    if (sel r2.err) {
-        live_scratch_dnit(l);
-        ret r2;
     }
     val r3: err[fail.Fail] = live_scratch_array(l, ?l.use_mark, nv, RANGE_NIL);
     if (sel r3.err) {
@@ -2045,14 +1919,6 @@ fun note_def(l: *LiveScratch, reg: u32, block: u32) {
     or { l.def_start[reg + 1] = l.def_start[reg + 1] + 1; }
 }
 
-fun note_edge(l: *LiveScratch, pred: u32, succ: u32) {
-    if (l.fill) {
-        l.preds[l.pred_start[succ]] = pred;
-        l.pred_start[succ]          = l.pred_start[succ] + 1;
-    }
-    or { l.pred_start[succ + 1] = l.pred_start[succ + 1] + 1; }
-}
-
 # the same walk counts on the first pass and fills on the second; the start
 # arrays hold counts per index + 1 after the first pass, prefix sums after
 # exclusive_offsets, and each fill advances its own start, which
@@ -2089,30 +1955,6 @@ fun collect_references(ctx: *AllocCtx, l: *LiveScratch) {
     }
 }
 
-fun collect_edges(ctx: *AllocCtx, l: *LiveScratch) {
-    val f:  *lang_mir.MirFunction = ctx.f;
-    var bi: u32                   = 0;
-    for (bi < f.block_count) {
-        val blk: *lang_mir.MirBlock = ?f.blocks[bi];
-        if (blk.instr_count > 0) {
-            val term: *lang_mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
-            var k:    u32                = 0;
-            for (k < term.operand_count) {
-                val op: *lang_mir.MirOperand = ?term.operands[k];
-                if (op.kind == lang_mir.MIR_OP_BLOCK) {
-                    val si: u32 = block_index_of(ctx, op.imm::u32);
-                    if (si != RANGE_NIL) { note_edge(l, bi, si); }
-                }
-                k = k + 1;
-            }
-        }
-        if (bi + 1 < f.block_count && block_lists_pred(?f.blocks[bi + 1], blk.id)) {
-            note_edge(l, bi, bi + 1);
-        }
-        bi = bi + 1;
-    }
-}
-
 fun exclusive_offsets(start: *u32, n: u32) u32 {
     var i: u32 = 0;
     for (i < n) {
@@ -2143,22 +1985,16 @@ fun extend_liveness(ctx: *AllocCtx, exact: bool) err[fail.Fail] {
     fin { live_scratch_dnit(?l); }
 
     collect_references(ctx, ?l);
-    collect_edges(ctx, ?l);
-    l.use_count  = exclusive_offsets(l.use_start, nv);
-    l.def_count  = exclusive_offsets(l.def_start, nv);
-    l.edge_count = exclusive_offsets(l.pred_start, nb);
+    l.use_count = exclusive_offsets(l.use_start, nv);
+    l.def_count = exclusive_offsets(l.def_start, nv);
     val ru: err[fail.Fail] = live_scratch_array(?l, ?l.use_blocks, l.use_count, RANGE_NIL);
     if (sel ru.err) { ret ru; }
     val rd: err[fail.Fail] = live_scratch_array(?l, ?l.def_blocks, l.def_count, RANGE_NIL);
     if (sel rd.err) { ret rd; }
-    val rp: err[fail.Fail] = live_scratch_array(?l, ?l.preds, l.edge_count, RANGE_NIL);
-    if (sel rp.err) { ret rp; }
     l.fill = true;
     collect_references(ctx, ?l);
-    collect_edges(ctx, ?l);
     restore_offsets(l.use_start, nv);
     restore_offsets(l.def_start, nv);
-    restore_offsets(l.pred_start, nb);
 
     val pl: err[fail.Fail] = propagate_liveness(ctx, ?l);
     if (sel pl.err) {
@@ -2217,9 +2053,9 @@ fun propagate_liveness(ctx: *AllocCtx, l: *LiveScratch) err[fail.Fail] {
         for (count > 0) {
             count = count - 1;
             val b: u32 = l.pending[count];
-            var e: u32 = l.pred_start[b];
-            for (e < l.pred_start[b + 1]) {
-                val p: u32 = l.preds[e];
+            var e: u32 = ctx.graph.pred_start[b];
+            for (e < ctx.graph.pred_start[b + 1]) {
+                val p: u32 = ctx.graph.pred[e];
                 extend_range_for_block(lr, ctx.block_spans[p], false, true);
                 if (l.out_mark[p] != reg) {
                     l.out_mark[p] = reg;
@@ -2745,15 +2581,6 @@ fun instr_defines(mi: *lang_mir.MirInstr) bool {
     ret mi.operands[0].kind == lang_mir.MIR_OP_VREG;
 }
 
-fun block_lists_pred(blk: *lang_mir.MirBlock, pred_id: u32) bool {
-    var i: u32 = 0;
-    for (i < blk.pred_count) {
-        if (blk.preds[i] == pred_id) { ret true; }
-        i = i + 1;
-    }
-    ret false;
-}
-
 fun mark_call_crossing(ctx: *AllocCtx) err[fail.Fail] {
     val n: u32 = ctx.flat_count;
     if (n == 0) { ret err[fail.Fail].ok{}; }
@@ -3277,7 +3104,8 @@ fun can_transfer(ctx: *AllocCtx, lr: *LiveRange, h: *CopyHint) bool {
 # a later segment waits in inactive for it
 fun transfer_source_reg(ctx: *AllocCtx, src: lang_mir.VRegId, rid: lang_mir.PRegId) {
     if (!vreg_in_active(ctx, src) || !lang_mir.preg_same(ctx.f.vregs[src.n].assigned, rid)) {
-        panic("regalloc: copy-hint transfer source is not the live owner of its register\n");
+        defect_note(ctx, "regalloc: copy-hint transfer source is not the live owner of its register");
+        ret;
     }
     remove_active(ctx, src);
     if (ctx.ranges[src.n].end_pos > ctx.cur_start) {
@@ -3509,15 +3337,13 @@ fun pick_fp(ctx: *AllocCtx, crosses_call: bool) i32 {
 
 fun assign(ctx: *AllocCtx, v: lang_mir.VRegId, preg: lang_mir.PRegId, reg_class: u32) {
     val preg_class: i32 = isa_inst.regid_class(lang_mir.preg_regid(preg));
-    if (reg_class == REG_CLASS_GP) {
-        if (preg_class != isa_inst.REG_CLASS_ID_GP) {
-            panic("regalloc: GP vreg assigned a non-GP register\n");
-        }
+    if (reg_class == REG_CLASS_GP && preg_class != isa_inst.REG_CLASS_ID_GP) {
+        defect_note(ctx, "regalloc: GP vreg assigned a non-GP register");
+        ret;
     }
-    or {
-        if (preg_class != isa_inst.REG_CLASS_ID_XMM) {
-            panic("regalloc: float vreg assigned a non-XMM register\n");
-        }
+    if (reg_class != REG_CLASS_GP && preg_class != isa_inst.REG_CLASS_ID_XMM) {
+        defect_note(ctx, "regalloc: float vreg assigned a non-XMM register");
+        ret;
     }
     ctx.f.vregs[v.n].assigned    = preg;
     ctx.active[ctx.active_count] = v.n;
@@ -4394,7 +4220,7 @@ fun rematerialize(tgt: *lang_target.Binding, ctx: *AllocCtx, v: u32, db: u32, di
                 ii = ii + 1;
                 cnt;
             }
-            val pr: res[u32, fail.Fail] = add_vreg_like(ctx.alloc, f, v);
+            val pr: res[u32, fail.Fail] = lang_mir.vreg_add_like(ctx.alloc, f, v);
             if (sel pr.err) { ret err[fail.Fail].err{pr.err}; }
             val p:  u32            = pr.ok;
             val gt: err[fail.Fail] = vreg_tables_reserve(ctx, f.vreg_count);
@@ -4414,7 +4240,7 @@ fun rematerialize(tgt: *lang_target.Binding, ctx: *AllocCtx, v: u32, db: u32, di
             mv.inline_site       = mi.inline_site;
             mv.dbg_bindings      = nil;
             mv.dbg_binding_count = 0;
-            val ri: err[fail.Fail] = insert_instr(ctx.alloc, blk, ii, mv);
+            val ri: err[fail.Fail] = lang_mir.instr_add_at(ctx.alloc, blk, ii, mv);
             if (sel ri.err) {
                 A.deallocate[lang_mir.MirOperand](ctx.alloc, ops, 2::usize);
                 ret ri;
@@ -4441,7 +4267,7 @@ fun rematerialize(tgt: *lang_target.Binding, ctx: *AllocCtx, v: u32, db: u32, di
                 mi.operands      = nil;
                 mi.operand_count = 0;
             }
-            or { remove_instr(home, ii); }
+            or { lang_mir.instr_del(home, ii); }
             brk;
         }
         ii = ii + 1;
@@ -4603,7 +4429,7 @@ fun make_pieces_in_block(tgt: *lang_target.Binding, ctx: *AllocCtx, blk: *lang_m
 
 fun make_piece(ctx: *AllocCtx, blk: *lang_mir.MirBlock, v: u32, first: u32, last: u32) err[fail.Fail] {
     val f:  *lang_mir.MirFunction = ctx.f;
-    val pr: res[u32, fail.Fail]   = add_vreg_like(ctx.alloc, f, v);
+    val pr: res[u32, fail.Fail]   = lang_mir.vreg_add_like(ctx.alloc, f, v);
     if (sel pr.err) { ret err[fail.Fail].err{pr.err}; }
     val p:  u32            = pr.ok;
     val gt: err[fail.Fail] = vreg_tables_reserve(ctx, f.vreg_count);
@@ -4631,7 +4457,7 @@ fun make_piece(ctx: *AllocCtx, blk: *lang_mir.MirBlock, v: u32, first: u32, last
         A.deallocate[lang_mir.MirOperand](ctx.alloc, ops, 2::usize);
         ret cb;
     }
-    ret insert_instr(ctx.alloc, blk, first, mv);
+    ret lang_mir.instr_add_at(ctx.alloc, blk, first, mv);
 }
 
 # the piece's reads go back to the value it carried and its load goes away;
@@ -4652,7 +4478,7 @@ fun discard_piece(ctx: *AllocCtx, p: u32) err[fail.Fail] {
                 && mi.operands[0].kind == lang_mir.MIR_OP_VREG && mi.operands[0].vreg.n == p
                 && mi.operands[1].kind == lang_mir.MIR_OP_VREG && mi.operands[1].vreg.n == v) {
                 A.deallocate[lang_mir.MirOperand](ctx.alloc, mi.operands, 2::usize);
-                remove_instr(blk, ii);
+                lang_mir.instr_del(blk, ii);
                 cnt;
             }
             rename_reads(mi, p, v);
@@ -4663,44 +4489,6 @@ fun discard_piece(ctx: *AllocCtx, p: u32) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
-fun add_vreg_like(alloc: *A.Allocator, f: *lang_mir.MirFunction, like: u32) res[u32, fail.Fail] {
-    if (f.vreg_count >= f.vreg_cap) {
-        val rg: err[A.Error] = growth.reserve[lang_mir.MirVReg](alloc, ?f.vregs, ?f.vreg_cap, f.vreg_count::usize + 1);
-        if (sel rg.err) { ret res[u32, fail.Fail].err{fail.refused(rg.err)}; }
-    }
-    val vid: u32 = f.vreg_count;
-    f.vregs[vid]    = lang_mir.vreg(vid, f.vregs[like].class, f.vregs[like].vec_bytes, f.vregs[like].secret);
-    f.vregs[vid].ty = f.vregs[like].ty;
-    f.vreg_count    = f.vreg_count + 1;
-    ret res[u32, fail.Fail].ok{vid};
-}
-
-fun insert_instr(alloc: *A.Allocator, mb: *lang_mir.MirBlock, at: u32, mi: lang_mir.MirInstr) err[fail.Fail] {
-    if (mb.instr_count >= mb.instr_cap) {
-        val rg: err[A.Error] = growth.reserve[lang_mir.MirInstr](alloc, ?mb.instrs, ?mb.instr_cap, mb.instr_count::usize + 1);
-        if (sel rg.err) { ret err[fail.Fail].err{fail.refused(rg.err)}; }
-    }
-    var ii: u32 = mb.instr_count;
-    for (ii > at) {
-        mb.instrs[ii] = mb.instrs[ii - 1];
-        ii            = ii - 1;
-    }
-    mb.instrs[at]  = mi;
-    mb.instr_count = mb.instr_count + 1;
-    ret err[fail.Fail].ok{};
-}
-
-fun remove_instr(mb: *lang_mir.MirBlock, at: u32) {
-    var ii: u32 = at;
-    for (ii + 1 < mb.instr_count) {
-        mb.instrs[ii] = mb.instrs[ii + 1];
-        ii            = ii + 1;
-    }
-    mb.instr_count = mb.instr_count - 1;
-}
-
-# a float value's slot holds the whole xmm register, and a vector's the
-# register it is realized in, 32 bytes for a ymm value
 fun class_width(ctx: *AllocCtx, lr: *LiveRange) u32 {
     if (lr.reg_class != REG_CLASS_GP) {
         if (lr.vreg < ctx.f.vreg_count && ctx.f.vregs[lr.vreg].vec_bytes > 16) { ret ctx.f.vregs[lr.vreg].vec_bytes::u32; }
@@ -4829,28 +4617,9 @@ fun function_uses_fp_scratch(f: *lang_mir.MirFunction) bool {
     ret false;
 }
 
-fun isa_reserved_gp_mask(tgt: *lang_target.Binding) u32 {
-    var m: u32 = 0;
-    var i: i32 = 0;
-    for (i < tgt.arch.reserved_reg_count && i < MAX_REG_FILE) {
-        val id: i32 = tgt.arch.reserved_regs[i].id;
-        if (id >= 0 && id < 32) { m = m | (1::u32 << id::u32); }
-        i = i + 1;
-    }
-    var j: i32 = 0;
-    for (j < tgt.arch.reload_scratch_count && j < MAX_REG_FILE) {
-        val id: i32 = tgt.arch.reload_scratch_regs[j].id;
-        if (id >= 0 && id < 32) { m = m | (1::u32 << id::u32); }
-        j = j + 1;
-    }
-    val sid: i32 = tgt.arch.scratch_reg;
-    if (sid >= 0 && sid < 32) { m = m | (1::u32 << sid::u32); }
-    ret m;
-}
-
 fun asm_callee_mask(tgt: *lang_target.Binding, f: *lang_mir.MirFunction) u32 {
     val cs:     u32 = abi_callee_saved_gp_mask(tgt);
-    val result: u32 = isa_reserved_gp_mask(tgt);
+    val result: u32 = tgt.reserved_gp;
     var mask:   u32 = 0;
     var bi:     u32 = 0;
     for (bi < f.block_count) {
@@ -4971,20 +4740,12 @@ fun rewritten_preg_ok(tgt: *lang_target.Binding, preg: lang_mir.PRegId) bool {
     ret false;
 }
 
+# a general register outside the allocatable bank that a rewritten operand may
+# still name: the stack and frame pointers and the reserved registers
 fun special_gp_register(tgt: *lang_target.Binding, rid: i32) bool {
     if (rid == tgt.target.model.stack_ptr_reg || rid == tgt.target.model.frame_ptr_reg) { ret true; }
-    if (rid == tgt.arch.scratch_reg || rid == tgt.arch.scratch_reg2)                    { ret true; }
-    var i: i32 = 0;
-    for (i < tgt.arch.reserved_reg_count && i < MAX_REG_FILE) {
-        if (tgt.arch.reserved_regs[i].id == rid) { ret true; }
-        i = i + 1;
-    }
-    var j: i32 = 0;
-    for (j < tgt.arch.reload_scratch_count && j < MAX_REG_FILE) {
-        if (tgt.arch.reload_scratch_regs[j].id == rid) { ret true; }
-        j = j + 1;
-    }
-    ret false;
+    if (rid < 0 || rid >= 32)                                                           { ret false; }
+    ret (tgt.reserved_gp & (1::u32 << rid::u32)) != 0;
 }
 
 fun operand_bank_matches(op: *lang_mir.MirOperand) bool {
@@ -5157,46 +4918,6 @@ fun record_callee_mask(tgt: *lang_target.Binding, ctx: *AllocCtx) {
     ctx.f.callee_mask_fp = fp_mask;
 }
 
-fun drop_self_copies_physical(tgt: *lang_target.Binding, ctx: *AllocCtx) err[fail.Fail] {
-    val f:  *lang_mir.MirFunction = ctx.f;
-    var bi: u32                   = 0;
-    for (bi < f.block_count) {
-        val blk:   *lang_mir.MirBlock = ?f.blocks[bi];
-        var write: u32                = 0;
-        var read:  u32                = 0;
-        for (read < blk.instr_count) {
-            val mi:   *lang_mir.MirInstr = ?blk.instrs[read];
-            var drop: bool               = false;
-            if (instr_is_reg_copy(tgt, mi)) {
-                val a: *lang_mir.MirOperand = ?mi.operands[0];
-                val b: *lang_mir.MirOperand = ?mi.operands[1];
-                drop = a.kind == lang_mir.MIR_OP_PREG && b.kind == lang_mir.MIR_OP_PREG && lang_mir.preg_same(a.preg, b.preg);
-            }
-            if (drop && lang_mir.instr_declassifies(mi)) {
-                val marker: lang_mir.MirInstr = lang_mir.declassify_marker(mi, mi.operands[0].vreg);
-                A.deallocate[lang_mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
-                blk.instrs[write] = marker;
-                write             = write + 1;
-            }
-            or (drop) {
-                if (mi.operands != nil && mi.operand_count > 0) {
-                    A.deallocate[lang_mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
-                }
-                val rd: err[fail.Fail] = pass_dbg_on(ctx, blk, read);
-                if (sel rd.err) { ret rd; }
-            }
-            or {
-                if (write != read) { blk.instrs[write] = blk.instrs[read]; }
-                write = write + 1;
-            }
-            read = read + 1;
-        }
-        blk.instr_count = write;
-        bi              = bi + 1;
-    }
-    ret err[fail.Fail].ok{};
-}
-
 fun rewrite(tgt: *lang_target.Binding, ctx: *AllocCtx) err[fail.Fail] {
     val f:         *lang_mir.MirFunction = ctx.f;
     var bi:        u32                   = 0;
@@ -5209,7 +4930,7 @@ fun rewrite(tgt: *lang_target.Binding, ctx: *AllocCtx) err[fail.Fail] {
         flat_base = flat_base + orig_count;
         bi        = bi + 1;
     }
-    ret err[fail.Fail].ok{};
+    ret defect_check(ctx);
 }
 
 fun rewrite_block(tgt: *lang_target.Binding, ctx: *AllocCtx, blk: *lang_mir.MirBlock, is_entry: bool, flat_base: u32) err[fail.Fail] {
@@ -5788,12 +5509,11 @@ fun preg_of(ctx: *AllocCtx, v: lang_mir.VRegId) lang_mir.MirOperand {
 
 fun assigned_preg(ctx: *AllocCtx, v: lang_mir.VRegId) lang_mir.PRegId {
     if (v.n >= ctx.f.vreg_count) {
-        panic("regalloc: operand vreg id out of range during rewrite\n");
+        defect_note(ctx, "regalloc: operand vreg id out of range during rewrite");
+        ret lang_mir.MIR_PREG_NIL;
     }
     val a: lang_mir.PRegId = ctx.f.vregs[v.n].assigned;
-    if (lang_mir.preg_is_nil(a)) {
-        panic("regalloc: unassigned vreg reached instruction rewrite\n");
-    }
+    if (lang_mir.preg_is_nil(a)) { defect_note(ctx, "regalloc: unassigned vreg reached instruction rewrite"); }
     ret a;
 }
 
@@ -6631,22 +6351,15 @@ fun t_dying_loop_case(isa_name: str, abi_name: str, op: lang_mir.MirOpcode, left
     var f: lang_mir.MirFunction;
     t_vregs(?alloc, ?f, 3);
     var blocks: [3]lang_mir.MirBlock;
-    var preds:  [3]u32;
-    preds[0] = 0;
-    preds[1] = 1;
-    preds[2] = 1;
     t_block(?alloc, ?blocks[0], 3);
-    blocks[0].id         = 0;
-    blocks[0].pred_count = 0;
+    blocks[0].id = 0;
     t_mov(?alloc, ?blocks[0], 0, lang_mir.op_vreg(lang_mir.vreg_id(0)), lang_mir.op_imm(3));
     t_mov(?alloc, ?blocks[0], 1, lang_mir.op_vreg(lang_mir.vreg_id(2)), lang_mir.op_imm(4));
     t_op(?alloc, ?blocks[0], 2, lang_mir.MIR_BR, lang_mir.op_block(1), lang_mir.op_imm(0), lang_mir.op_imm(0), 1);
     var body: u32 = 3;
     if (late_read) { body = 4; }
     t_block(?alloc, ?blocks[1], body);
-    blocks[1].id         = 1;
-    blocks[1].preds      = ?preds[0];
-    blocks[1].pred_count = 2;
+    blocks[1].id = 1;
     t_op(?alloc, ?blocks[1], 0, op, lang_mir.op_vreg(lang_mir.vreg_id(1)), lang_mir.op_vreg(lang_mir.vreg_id(left)), lang_mir.op_vreg(lang_mir.vreg_id(right)), 3);
     var at: u32 = 1;
     if (late_read) {
@@ -6656,9 +6369,7 @@ fun t_dying_loop_case(isa_name: str, abi_name: str, op: lang_mir.MirOpcode, left
     t_mov(?alloc, ?blocks[1], at, lang_mir.op_vreg(lang_mir.vreg_id(0)), lang_mir.op_vreg(lang_mir.vreg_id(1)));
     t_op(?alloc, ?blocks[1], at + 1, lang_mir.MIR_CBR, lang_mir.op_vreg(lang_mir.vreg_id(0)), lang_mir.op_block(1), lang_mir.op_block(2), 3);
     t_block(?alloc, ?blocks[2], 3);
-    blocks[2].id         = 2;
-    blocks[2].preds      = ?preds[2];
-    blocks[2].pred_count = 1;
+    blocks[2].id = 2;
     t_op(?alloc, ?blocks[2], 0, lang_mir.MIR_SEL_ADD, lang_mir.op_vreg(lang_mir.vreg_id(2)), lang_mir.op_vreg(lang_mir.vreg_id(2)), lang_mir.op_vreg(lang_mir.vreg_id(0)), 3);
     t_op(?alloc, ?blocks[2], 1, lang_mir.MIR_STORE, lang_mir.op_mem_value(lang_mir.vreg_id(2), 0), lang_mir.op_imm(0), lang_mir.op_imm(0), 2);
     t_op(?alloc, ?blocks[2], 2, lang_mir.MIR_RET, lang_mir.op_imm(0), lang_mir.op_imm(0), lang_mir.op_imm(0), 0);
@@ -6736,7 +6447,7 @@ fun t_self_copy_is_dropped(t: *lang_target.Binding, width: u8) bool {
     var ctx: AllocCtx;
     t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
 
-    val rd: err[fail.Fail] = drop_self_copies(t, ?ctx);
+    val rd: err[fail.Fail] = drop_self_copies(t, ?ctx, lang_mir.MIR_OP_VREG);
     if (sel rd.err) { ret false; }
 
     if (b.instr_count != 1) { ret false; }
@@ -6816,7 +6527,7 @@ test drop_self_copies__passes_bindings_on {
     slots[2] = false;
     var ctx: AllocCtx;
     t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
-    val rd: err[fail.Fail] = drop_self_copies(?t, ?ctx);
+    val rd: err[fail.Fail] = drop_self_copies(?t, ?ctx, lang_mir.MIR_OP_VREG);
     if (sel rd.err)         { ret 2; }
     if (b.instr_count != 1) { ret 3; }
     val kept: *lang_mir.MirInstr = ?b.instrs[0];
@@ -6832,7 +6543,7 @@ test drop_self_copies__passes_bindings_on {
     t_mov(?alloc, ?b2, 0, lang_mir.op_vreg(lang_mir.vreg_id(1)), lang_mir.op_vreg(lang_mir.vreg_id(1)));
     if (!t_dbg(?alloc, ?b2.instrs[0], 13, 1)) { ret 1; }
     f.blocks = ?b2;
-    val rd2: err[fail.Fail] = drop_self_copies(?t, ?ctx);
+    val rd2: err[fail.Fail] = drop_self_copies(?t, ?ctx, lang_mir.MIR_OP_VREG);
     if (sel rd2.ok) { ret 7; }
     ret 0;
 }
@@ -6874,7 +6585,7 @@ test sweep_dead_movs__passes_bindings_on {
     ret 0;
 }
 
-test drop_self_copies_physical__only_the_same_register {
+test drop_self_copies__physical_only_the_same_register {
     var reg: lang_target.TargetRegistry;
     fin { lang_target.registry_dnit(?reg); }
     var t: lang_target.Binding;
@@ -6898,7 +6609,7 @@ test drop_self_copies_physical__only_the_same_register {
     var ctx: AllocCtx;
     t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
 
-    val rd: err[fail.Fail] = drop_self_copies_physical(?t, ?ctx);
+    val rd: err[fail.Fail] = drop_self_copies(?t, ?ctx, lang_mir.MIR_OP_PREG);
     if (sel rd.err) { ret 1; }
 
     if (b.instr_count != 1) { ret 1; }
@@ -8749,14 +8460,11 @@ fun t_dense_liveness(ctx: *AllocCtx, cov: *bool) err[fail.Fail] {
                 var k:    u32                = 0;
                 for (k < term.operand_count) {
                     if (term.operands[k].kind == lang_mir.MIR_OP_BLOCK) {
-                        val si: u32 = block_index_of(ctx, term.operands[k].imm::u32);
+                        val si: u32 = flow.position_of(?ctx.graph.index, term.operands[k].imm);
                         if (si != RANGE_NIL) { t_or_row(live_out, base, live_in, (si::usize) * (nv::usize), nv); }
                     }
                     k = k + 1;
                 }
-            }
-            if (b + 1 < nb && block_lists_pred(?f.blocks[b + 1], blk.id)) {
-                t_or_row(live_out, base, live_in, ((b + 1)::usize) * (nv::usize), nv);
             }
             v = 0;
             for (v < nv) {
@@ -8843,7 +8551,7 @@ fun t_or_row(dst: *bool, dbase: usize, src: *bool, sbase: usize, nv: u32) {
 }
 
 # eight blocks of four instructions whose uses, definitions, memory operands,
-# fallthroughs, self loops and an empty block vary with the sample bits
+# self loops and an empty block vary with the sample bits
 #[testing]
 fun t_sparse_liveness_case(sample: u32, ordinal: usize, attempts: *usize) i32 {
     var track: T.Testing;
@@ -8853,33 +8561,17 @@ fun t_sparse_liveness_case(sample: u32, ordinal: usize, attempts: *usize) i32 {
     var alloc: A.Allocator;
     val paged: err[A.Error] = page.make(?alloc);
     if (sel paged.err) { ret 2; }
-    var blocks:    [8]lang_mir.MirBlock;
-    var instrs:    [8][4]lang_mir.MirInstr;
-    var operands:  [8][4][3]lang_mir.MirOperand;
-    var preds:     [8]u32;
-    var spans:     [8]BlockSpan;
-    var block_map: [64]u32;
-    var sparse:    [8]LiveRange;
-    var dense:     [8]LiveRange;
-    var bi:        u32 = 0;
-    for (bi < 64) {
-        block_map[bi] = RANGE_NIL;
-        bi            = bi + 1;
-    }
-    bi = 0;
+    var blocks:   [8]lang_mir.MirBlock;
+    var instrs:   [8][4]lang_mir.MirInstr;
+    var operands: [8][4][3]lang_mir.MirOperand;
+    var spans:    [8]BlockSpan;
+    var sparse:   [8]LiveRange;
+    var dense:    [8]LiveRange;
+    var bi:       u32 = 0;
     for (bi < 8) {
-        val bid: u32 = 40 - bi * 3;
-        blocks[bi].id          = bid;
-        block_map[bid]         = bi;
+        blocks[bi].id          = 40 - bi * 3;
         blocks[bi].instrs      = ?instrs[bi][0];
         blocks[bi].instr_count = 4;
-        blocks[bi].preds       = nil;
-        blocks[bi].pred_count  = 0;
-        if (bi > 0 && ((sample + bi) & 1) == 0) {
-            preds[bi]             = 40 - (bi - 1) * 3;
-            blocks[bi].preds      = ?preds[bi];
-            blocks[bi].pred_count = 1;
-        }
         var definition: u32 = 0;
         var use_index:  u32 = 1;
         if ((sample & 2) != 0) {
@@ -8921,14 +8613,17 @@ fun t_sparse_liveness_case(sample: u32, ordinal: usize, attempts: *usize) i32 {
     f.blocks      = ?blocks[0];
     f.block_count = 8;
     f.vreg_count  = 8;
+    val rg: res[flow.Graph, fail.Fail] = flow.init(?alloc, ?f);
+    if (sel rg.err) { ret 2; }
     var ctx: AllocCtx;
-    ctx.alloc              = T.allocator_of(?track);
-    ctx.f                  = ?f;
-    ctx.holes              = true;
-    ctx.block_spans        = ?spans[0];
-    ctx.block_id_index     = ?block_map[0];
-    ctx.block_id_index_cap = 64;
-    ctx.ranges             = ?sparse[0];
+    ctx.graph       = rg.ok;
+    ctx.graph_built = true;
+    fin { flow.dnit(?ctx.graph); }
+    ctx.alloc       = T.allocator_of(?track);
+    ctx.f           = ?f;
+    ctx.holes       = true;
+    ctx.block_spans = ?spans[0];
+    ctx.ranges      = ?sparse[0];
     T.fail_at_ordinal(?track, ordinal);
     val result: err[fail.Fail] = extend_liveness(?ctx, true);
     @attempts = T.attempt_count(?track);
