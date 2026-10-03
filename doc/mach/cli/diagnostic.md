@@ -112,7 +112,7 @@ close a plan's rendering: one summary line under human text closes every
 failure and diagnostic the plan rendered, a failure record printed as its own
 `error:` line (an encoder or rules refusal that reached no store) counted in it
 beside every store's diagnostics, so the tally never reads `0 errors` above a
-nonzero exit (#3617). json closes in report_close
+nonzero exit. json closes in report_close
 
 ## def Format
 
