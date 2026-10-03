@@ -1,16 +1,61 @@
 # mach.lang.me.ir.builder
 
+## def Place
+
+```mach
+pub def Place: u8
+```
+
+where the next instruction goes
+
+## val PLACE_BUILD
+
+```mach
+pub val PLACE_BUILD: Place = 0
+```
+
+appended to the cursor block, which must not be terminated yet: building
+
+## val PLACE_AT
+
+```mach
+pub val PLACE_AT: Place = 1
+```
+
+inserted into the cursor block's list at the cursor position, which then
+moves past it, so a run of instructions lands in order: editing
+
+## val PLACE_NONE
+
+```mach
+pub val PLACE_NONE: Place = 2
+```
+
+made in the function and listed in no block, for the caller to place
+
 ## rec Builder
 
 ```mach
 pub rec Builder;
 ```
 
+the one maker of ir instructions. it holds the insertion point and the
+attributes every instruction it makes carries (flags, secret, location,
+inline site), and in its sticky mode the first failure of a run of emits
+
 ## fun init
 
 ```mach
 pub fun init(m: *me_ir.Module) Builder;
 ```
+
+## fun on
+
+```mach
+pub fun on(m: *me_ir.Module, fn: *me_ir.Function) Builder;
+```
+
+a builder over function `fn` of `m`, its instructions made detached
 
 ## fun set_function
 
@@ -30,11 +75,94 @@ pub fun set_loc(b: *Builder, loc: lang_source.Location);
 pub fun current_loc(b: *Builder) lang_source.Location;
 ```
 
+## fun set_flags
+
+```mach
+pub fun set_flags(b: *Builder, flags: u16);
+```
+
+the flags the next instructions carry
+
+## fun set_secret
+
+```mach
+pub fun set_secret(b: *Builder, secret: bool);
+```
+
+whether the next instructions are secret
+
+## fun set_site
+
+```mach
+pub fun set_site(b: *Builder, site: u32);
+```
+
+the inline site the next instructions belong to, 0 for none
+
+## fun derive
+
+```mach
+pub fun derive(b: *Builder, origin: ir_id.InstructionId);
+```
+
+the next instructions read as `origin`, the instruction they rewrite: its
+location, inline site and secrecy, and no flags
+
+## fun plain
+
+```mach
+pub fun plain(b: *Builder);
+```
+
+the next instructions carry no location, flags, secrecy or inline site
+
 ## fun set_block
 
 ```mach
 pub fun set_block(b: *Builder, blk: ir_id.BlockId);
 ```
+
+build at the end of block `blk`
+
+## fun at
+
+```mach
+pub fun at(b: *Builder, blk: ir_id.BlockId, pos: u32);
+```
+
+insert into block `blk`'s list at `pos`, after its phis whatever `pos`
+
+## fun after_phis
+
+```mach
+pub fun after_phis(b: *Builder, blk: ir_id.BlockId);
+```
+
+insert at the head of block `blk`'s list, right after its phis
+
+## fun at_end
+
+```mach
+pub fun at_end(b: *Builder, blk: ir_id.BlockId);
+```
+
+insert at the end of block `blk`'s list, whether or not it is terminated
+
+## fun detach
+
+```mach
+pub fun detach(b: *Builder);
+```
+
+make instructions listed in no block
+
+## fun position
+
+```mach
+pub fun position(b: *Builder) u32;
+```
+
+where an insertion point has moved to, the position after the last insert
 
 ## fun new_block
 
@@ -409,4 +537,187 @@ ty_sem: type.TypeId, is_param: bool, scope: u32) err[fail.Fail];
 ```mach
 pub fun emit_vcompare(b: *Builder, k: ir_instruction.InstrKind, lhs: value.Value, rhs: value.Value, result_ty: ir_type.IrTypeId) res[value.Value, fail.Fail];
 ```
+
+## fun emit_instr
+
+```mach
+pub fun emit_instr(b: *Builder, k: ir_instruction.InstrKind, ty: ir_type.IrTypeId, aux: ir_type.IrTypeId,
+ops: *value.Value, n: u32) res[ir_id.InstructionId, fail.Fail];
+```
+
+instruction `k` of type `ty` with auxiliary type `aux` over a copy of the
+`n` operands at `ops`, made at the insertion point with the builder's
+attributes
+
+## fun emit_instr_owned
+
+```mach
+pub fun emit_instr_owned(b: *Builder, k: ir_instruction.InstrKind, ty: ir_type.IrTypeId, aux: ir_type.IrTypeId,
+owned: *value.Value, n: u32) res[ir_id.InstructionId, fail.Fail];
+```
+
+as emit_instr, taking ownership of the `n` operands allocated at `owned`,
+which are released when the instruction cannot be made
+
+## fun take
+
+```mach
+pub fun take(b: *Builder, r: res[value.Value, fail.Fail]) value.Value;
+```
+
+the value of an emit in sticky mode: a failure is kept when it is the
+first, and the nil value stands in for the result, never to be used, since
+the caller reads `done` before its result
+
+## fun take_type
+
+```mach
+pub fun take_type(b: *Builder, r: res[ir_type.IrTypeId, fail.Fail]) ir_type.IrTypeId;
+```
+
+a type in sticky mode, the nil type standing in for a failure
+
+## fun fault
+
+```mach
+pub fun fault(b: *Builder, f: fail.Fail);
+```
+
+records `f` unless an earlier failure is already the first
+
+## fun done
+
+```mach
+pub fun done(b: *Builder, v: value.Value) res[value.Value, fail.Fail];
+```
+
+the end of a sticky run: `v`, or the run's first failure, which is cleared
+
+## fun add
+
+```mach
+pub fun add(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun sub
+
+```mach
+pub fun sub(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun mul
+
+```mach
+pub fun mul(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun band
+
+```mach
+pub fun band(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun bor
+
+```mach
+pub fun bor(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun bxor
+
+```mach
+pub fun bxor(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun shl
+
+```mach
+pub fun shl(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun shr_u
+
+```mach
+pub fun shr_u(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun shr_s
+
+```mach
+pub fun shr_s(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun eq
+
+```mach
+pub fun eq(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun ne
+
+```mach
+pub fun ne(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun lt_s
+
+```mach
+pub fun lt_s(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun lt_u
+
+```mach
+pub fun lt_u(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun trunc
+
+```mach
+pub fun trunc(b: *Builder, x: value.Value, to: ir_type.IrTypeId) value.Value;
+```
+
+## fun zext
+
+```mach
+pub fun zext(b: *Builder, x: value.Value, to: ir_type.IrTypeId) value.Value;
+```
+
+## fun sext
+
+```mach
+pub fun sext(b: *Builder, x: value.Value, to: ir_type.IrTypeId) value.Value;
+```
+
+## fun bitcast
+
+```mach
+pub fun bitcast(b: *Builder, x: value.Value, to: ir_type.IrTypeId) value.Value;
+```
+
+## fun fp_ext
+
+```mach
+pub fun fp_ext(b: *Builder, x: value.Value, to: ir_type.IrTypeId) value.Value;
+```
+
+## fun ui_to_fp
+
+```mach
+pub fun ui_to_fp(b: *Builder, x: value.Value, to: ir_type.IrTypeId) value.Value;
+```
+
+## fun fp_to_ui
+
+```mach
+pub fun fp_to_ui(b: *Builder, x: value.Value, to: ir_type.IrTypeId) value.Value;
+```
+
+## fun call
+
+```mach
+pub fun call(b: *Builder, callee: u32, args: *value.Value, count: u32, ret_ty: ir_type.IrTypeId) value.Value;
+```
+
+a direct call of function `callee` of the module
 
