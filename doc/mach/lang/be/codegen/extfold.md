@@ -10,6 +10,6 @@ fill reads the whole register instead
 ## fun run
 
 ```mach
-pub fun run(tgt: *lang_target.Binding, m: *codegen_mir.MirModule) err[fail.Fail];
+pub fun run(tgt: *lang_target.Binding, m: *lang_mir.MirModule) err[fail.Fail];
 ```
 
