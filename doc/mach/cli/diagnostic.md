@@ -64,20 +64,55 @@ ret: the exit code `exit.of` maps the failure to
 pub fun outcome_code(bo: *outcome.BuildOutcome) i64;
 ```
 
-## fun report_outcome
+## fun size_split
 
 ```mach
-pub fun report_outcome(r: *Report, bo: *outcome.BuildOutcome, quiet: bool);
+pub fun size_split(bytes: usize, unit: *str) i64;
 ```
 
-render a build outcome's events to stderr in order. human text renders unit
-banners, failures, diagnostics and the closing tally; json renders each
-diagnostic and each failure as one record
+split a byte count into the binary magnitude it reads best in and its unit
 
+## rec Readout
+
+```mach
+pub rec Readout;
+```
+
+a build's events rendered to the report's stream the moment each arrives.
+human text renders unit banners, phase rows, items, the unit summary,
+failures and diagnostics, and readout_close writes the closing tally; json
+renders each diagnostic and each failure as one record
+
+sink: what the engine is given; its ctx is this record, which must not move
+units: the plan's unit count; a banner prints only when it is more than one
+quiet: `--quiet`, which suppresses the banners
+tally: the human tally, counted as the events pass
+
+## fun readout_init
+
+```mach
+pub fun readout_init(rd: *Readout, r: *Report, units: usize, quiet: bool, level: u8);
+```
+
+start rendering a plan's events to r
+
+rd: the renderer, initialised in place since its sink points at it
 r: the command's report
-bo: the outcome
-quiet: suppress the "building <artifact> (<target>)" banner, which prints only when the
-       outcome has more than one unit
+units: the plan's unit count
+quiet: `--quiet`
+level: the readout level the command asked for, LEVEL_RESULTS to LEVEL_ITEMS
+
+## fun readout_close
+
+```mach
+pub fun readout_close(rd: *Readout);
+```
+
+close a plan's rendering: one summary line under human text closes every
+failure and diagnostic the plan rendered, a failure record printed as its own
+`error:` line (an encoder or rules refusal that reached no store) counted in it
+beside every store's diagnostics, so the tally never reads `0 errors` above a
+nonzero exit (#3617). json closes in report_close
 
 ## def Format
 
