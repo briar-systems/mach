@@ -1,9 +1,9 @@
 # mach.lang.target.os.darwin
 
-## val DARWIN_BASE_ADDR
+## val BASE_ADDR
 
 ```mach
-pub val DARWIN_BASE_ADDR: u64 = 0x100000000
+pub val BASE_ADDR: u64 = 0x100000000
 ```
 
 ## val VTABLE

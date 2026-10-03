@@ -1,15 +1,15 @@
 # mach.lang.target.os.linux
 
-## val LINUX_BASE_ADDR
+## val BASE_ADDR
 
 ```mach
-pub val LINUX_BASE_ADDR: u64 = 0x400000
+pub val BASE_ADDR: u64 = 0x400000
 ```
 
-## val LINUX_PAGE_SIZE
+## val PAGE_SIZE
 
 ```mach
-pub val LINUX_PAGE_SIZE: u64 = 4096
+pub val PAGE_SIZE: u64 = 4096
 ```
 
 ## val VTABLE
