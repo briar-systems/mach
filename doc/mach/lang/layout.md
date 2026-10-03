@@ -104,13 +104,6 @@ pub fun count_mul[Unit](value: CheckedCount[Unit], factor: usize)
 res[CheckedCount[Unit], CheckCause];
 ```
 
-## fun count_grow
-
-```mach
-pub fun count_grow[Unit](current: CheckedCount[Unit], required: CheckedCount[Unit])
-res[CheckedCount[Unit], CheckCause];
-```
-
 ## fun offset_add
 
 ```mach
