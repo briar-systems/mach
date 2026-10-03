@@ -512,6 +512,15 @@ where the calling convention lets the callee take over the frame
 pub rec Instruction;
 ```
 
+## fun init
+
+```mach
+pub fun init(kind: InstrKind, ty: ir_type.IrTypeId, operands: *value.Value, operand_count: u32) Instruction;
+```
+
+the record every instruction starts from: `kind` of type `ty` over
+`operand_count` operands, every other field its empty value
+
 ## fun mark_result_secret
 
 ```mach

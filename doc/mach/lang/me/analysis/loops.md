@@ -83,6 +83,16 @@ whether a header phi is an induction, entered as `init` from the preheader
 and stepped by an invariant `step` on the latch, recognized as the loop's
 own iv is
 
+## fun each_innermost_first
+
+```mach
+pub fun each_innermost_first[T](fn: *me_ir.Function, types: *ir_type.IrTypeTable, alloc: *A.Allocator, ctx: *T,
+per_loop: fun(*T, *LoopAnalysis, u32, *A.Allocator) res[bool, fail.Fail]) res[bool, fail.Fail];
+```
+
+`per_loop` run on each loop of `fn` deepest first, against one analysis of
+the function taken from `alloc`; whether any run changed the function
+
 ## fun innermost_first
 
 ```mach
