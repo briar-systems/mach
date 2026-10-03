@@ -101,7 +101,7 @@ pub rec BuildRequest;
 ```
 
 owner: "" for a cell of the root manifest, or the id of the closure dependency
-       whose default library artifacts require the cell; `target` and
+       whose export library requires the cell; `target` and
        `artifact` then name that dependency's declarations
 
 ## fun defaults
@@ -150,14 +150,13 @@ pub fun release(r: *BuildRequest) bool;
 
 ```mach
 pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
-cli: *CliArgs, root: str, goal: BuildGoal,
-pick: *manifest.Selection) res[BuildRequest, fail.Fail];
+cli: *CliArgs, root: str, goal: BuildGoal, profile: str) res[BuildRequest, fail.Fail];
 ```
 
 ## fun for_cell
 
 ```mach
-pub fun for_cell(base: *BuildRequest, owner: str, target: str, artifact: str, want_lib: bool,
+pub fun for_cell(base: *BuildRequest, owner: str, target: str, artifact: str,
 subsystem: catalog_subsystem.Subsystem, goal: BuildGoal) BuildRequest;
 ```
 

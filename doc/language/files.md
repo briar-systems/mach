@@ -61,7 +61,7 @@ abi = "sysv64"
 [artifact.myproj]
 kind = "bin"
 entry = "main.mach"
-out = "bin/myproj{artifact.suffix}"
+out = "{project.out}/bin/myproj{artifact.suffix}"
 targets = ["*"]
 link = []
 need = []

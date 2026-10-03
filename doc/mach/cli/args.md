@@ -1085,6 +1085,20 @@ inv: the parsed invocation
 argv: the argument vector inv was parsed from
 ret: the selectors; err when a vector cannot grow
 
+## fun selection_hint
+
+```mach
+pub fun selection_hint(a: *A.Allocator, selectors: *manifest.Selectors, f: fail.Fail) fail.Fail;
+```
+
+a selection refusal whose unknown value names a path in the working directory,
+restated as the shell's expansion of an unquoted wildcard it almost always is;
+any other failure is returned as given
+
+a: owns the restated message
+selectors: the patterns the command was given
+f: the failure resolving them
+
 ## fun build_cli_invocation
 
 ```mach

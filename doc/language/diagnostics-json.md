@@ -236,7 +236,7 @@ several units and a `profile <name>:` header only when it has several profiles:
 | Member | Type | Meaning |
 |---|---|---|
 | `verb` | string | what the unit does, `"building"` or `"checking"` |
-| `artifact` | string or `null` | the artifact, or `null` for the whole project |
+| `artifact` | string | the artifact the unit builds |
 | `target` | string | the target, absent when the unit names none |
 | `profile` | string | the profile, absent when the unit names none |
 
