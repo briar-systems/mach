@@ -9,18 +9,18 @@ Visibility (`pub` / `ext`) is separate and unaffected by decorators.
 
 ## Surface
 
-A decorator is written as an attribute:
+A decorator is written as `#[...]`:
 
 ```
 #[name]            # bare flag (e.g. inline)
-#[name(args)]      # directive with comptime-expr arguments
+#[name(args)]      # decorator with comptime-expr arguments
 ```
 
 > `#[...]` is the only decorator surface. A backtick is not a token: one
 > anywhere in source is a lexer error.
 
-> One caveat the attribute form introduces: a line comment that begins `#[`
-> (with no space) opens an attribute. Write such a comment with a separating
+> One caveat the decorator form introduces: a line comment that begins `#[`
+> (with no space) opens a decorator. Write such a comment with a separating
 > space — `# [...]`.
 
 ## Grammar
@@ -75,16 +75,16 @@ fun big(a: i64, b: i64) i64 { ... }
 pub var g_lit64: u8 = 7;
 ```
 
-Each directive is wrapped in its own clause: `#[name]` for a bare flag or
-`#[name(args)]` for a directive that takes arguments. Arguments are comptime
+Each decorator is wrapped in its own clause: `#[name]` for a bare flag or
+`#[name(args)]` for a decorator that takes arguments. Arguments are comptime
 expressions.
 
 ### Constant arguments
 
-Where a directive takes a string or an integer, the argument is a constant
+Where a decorator takes a string or an integer, the argument is a constant
 expression of that type, evaluated at compile time in the declaring module. A
 literal is one. So is a `val`, one an `$if` arm selects, or one imported from
-another module. A directive's argument never depends on the build that
+another module. A decorator's argument never depends on the build that
 evaluates it, only on the constants in scope. `#[symbol]` stays exactly the
 name you give it: the compiler adds no platform decoration of its own, and a
 `val` gated by comptime is how one declaration names its symbol per target.
@@ -104,16 +104,16 @@ pub fun spin() i64 {
 ```
 
 An argument that is not a constant expression, such as a `var` or a call, is
-refused with `decorator.not_constant`, naming the directive. A constant of the
+refused with `decorator.not_constant`, naming the decorator. A constant of the
 wrong type is refused with `decorator.argument`.
 
-## Directives
+## The decorator set
 
 ### `deprecated` / `deprecated(str)` — source-use notice
 
 Marks a declaration deprecated. The optional argument is one constant string
-carrying a message. Repeating the attribute, giving it more than one argument,
-or giving it an argument that is not a constant string is an error. The attribute changes nothing about visibility, type identity, ABI or
+carrying a message. Repeating the decorator, giving it more than one argument,
+or giving it an argument that is not a constant string is an error. The decorator changes nothing about visibility, type identity, ABI or
 codegen.
 
 A use of the deprecated declaration from another source module warns at the
@@ -183,7 +183,7 @@ Notices follow imported symbols and re-exports. A `#[deprecated]` on a `use`
 alias or a `fwd` re-export belongs to the forwarding module and replaces any
 inherited notice for that exported name; a clean alias of the same canonical
 definition keeps no notice. `test` blocks and comptime directives reject the
-attribute because they declare no externally usable name.
+decorator because they declare no externally usable name.
 
 ### `testing` — test-only declaration
 
@@ -352,7 +352,7 @@ Marks a function for inlining at every direct call site, overriding the
 compiler's size and use-count heuristics and exempt from the caller's expansion
 budget. Applies to functions only and takes no arguments. The optimization
 pipeline must enable inlining. Indirect calls and recursive call cycles are not
-expanded by this attribute. Taking a function's address retains its callable
+expanded by this decorator. Taking a function's address retains its callable
 identity even when direct calls are inlined.
 
 Release optimization makes small ordinary helper bodies available across source
@@ -995,7 +995,7 @@ refused. Give the stages one workgroup or put them in separate modules.
 
 A pipeline stage does not receive its inputs or return its results through a call.
 It reads and writes **module-scope variables** that the pipeline binds, and these
-directives say which kind each variable is. They apply only to module-level
+decorators say which kind each variable is. They apply only to module-level
 `val` / `var` bindings, and a variable carries **exactly one** of them — they
 are mutually exclusive. `spec`, described in its own section below, is one of
 them too.
@@ -1441,7 +1441,7 @@ A `#[spec]` var may also size a compute workgroup (see
 
 ### `handle(target, constructor, operands...)` — a type the target mints
 
-A bodyless `def` carrying this directive declares a type whose representation is
+A bodyless `def` carrying this decorator declares a type whose representation is
 **not the program's**: the owning target mints it and the pipeline binds it.
 
 ```mach fragment
@@ -1473,7 +1473,7 @@ combination the target cannot emit is a compile error at the declaration.
 
 ### `abi_type(name)` — a C type whose layout the target declares
 
-A bodyless `def` carrying this directive declares a C type whose size and alignment
+A bodyless `def` carrying this decorator declares a C type whose size and alignment
 come from the **selected target** and whose contents the program never reaches.
 
 ```mach
@@ -1496,7 +1496,7 @@ in either direction are each refused where they are written. See
 ### `op(target, set, name)` — a function that *is* a target instruction
 
 A shader needs `sqrt`, `normalize`, `dot` and `mix`. None of them is an operator,
-and none of them is a call SPIR-V can make: each is one instruction. This directive
+and none of them is a call SPIR-V can make: each is one instruction. This decorator
 says which one a function is, so that on a `spirv` target a call to it becomes that
 instruction, inline, rather than a call.
 
@@ -1513,7 +1513,7 @@ pub fun dot(a: f32x4, b: f32x4) f32;
 
 The first argument names the **target**, the second the instruction set, and the
 third the instruction within it. The target is the ISA name the manifest selects
-with, so nothing about this directive is specific to one back end. The arguments
+with, so nothing about this decorator is specific to one back end. The arguments
 must be strings on every target, but the instruction set and name are checked only
 when the named target is the one selected: a declaration for any other target is
 inert, and that target's table is not consulted. When it is checked, the parameter
@@ -1794,11 +1794,11 @@ Note that `dot` is **core `OpDot`**, not a GLSL.std.450 instruction, even though
 GLSL spells it beside `normalize` and `length`. Check each function against the
 specification rather than against GLSL's surface.
 
-On every target other than `spirv` the directive is inert, and a decorated function
+On every target other than `spirv` the decorator is inert, and a decorated function
 is an ordinary function. A **bodiless** one — which is what the shader-side maths
 library uses — is then an undefined symbol, so a CPU build that calls it fails at
 link time naming the symbol. That is a deliberate design choice on the library's
-part, not a property of the directive: a decorated function may have a body, and if
+part, not a property of the decorator: a decorated function may have a body, and if
 it does, that body is what every non-`spirv` target runs while `spirv` substitutes
 the instruction. A `spirv` build never emits the body at all.
 
@@ -1810,7 +1810,7 @@ the SPIR-V version and extension each needs, are the table in
 
 ## Applicability
 
-| Directive   | `fun` | `ext fun` | `val` / `var` | `rec` / `uni` |
+| Decorator   | `fun` | `ext fun` | `val` / `var` | `rec` / `uni` |
 |-------------|:-----:|:---------:|:-------------:|:-------------:|
 | `deprecated`|  yes  |    yes    |      yes      |      yes      |
 | `testing`   |  yes  |    no     |      yes      |      yes      |
@@ -1847,7 +1847,8 @@ is refused (see [`embed`](#embedstr--compile-time-file-embedding) above).
 tag case, and `testing` to `tag`, `def`, `use` and `fwd` declarations, none of
 which the table columns cover.
 
-The set is closed. New directives require a compiler change.
+The set is closed. New decorators require a compiler change. A name outside it
+is refused with `decorator.unknown`, and the refusal lists every decorator.
 
 ## See also
 

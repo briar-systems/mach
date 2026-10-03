@@ -56,7 +56,7 @@ token ::= IDENT
 
 punctuation ::= "(" | ")" | "{" | "}" | "[" | "]"
               | ";" | ":" | "," | "." | "?" | "@" | "$"
-              | "#["    (* attribute-open: "#" immediately followed by "[" *)
+              | "#["    (* decorator-open: "#" immediately followed by "[" *)
               | "::" | ":~" | ":>" | "..."
 
 operator ::= "+" | "-" | "*" | "/" | "%"
@@ -194,8 +194,8 @@ whitespace ::= " " | "\t" | "\n" | "\r"
 ```
 
 `#` begins a line comment that runs to (but not including) the next
-newline — **unless** it is immediately followed by `[`, which opens an
-attribute decorator (`#[`, `KIND_ATTR_OPEN`; see [Decorators](#decorators)).
+newline — **unless** it is immediately followed by `[`, which opens a
+decorator (`#[`, `KIND_DECORATOR_OPEN`; see [Decorators](#decorators)).
 A literal comment that begins `#[` therefore needs a separating space
 (`# [...]`). There is no block-comment form. Whitespace and comments separate
 tokens and are otherwise discarded.
@@ -208,7 +208,7 @@ records a `LEX_ERR_UNEXPECTED_CHAR`, emits a one-byte `ERROR` token
 (`KIND_ERROR`) for it, and continues.
 
 The backtick `` ` `` is not a token: it is an unexpected character wherever it
-appears. `#[` is the two-byte attribute-open token (`KIND_ATTR_OPEN`) that
+appears. `#[` is the two-byte decorator-open token (`KIND_DECORATOR_OPEN`) that
 opens a decorator (see [Decorators](#decorators) below).
 
 
@@ -224,7 +224,7 @@ module ::= { decl }
 ## Decorators
 
 Zero or more leading `#[...]` decorator clauses may appear before any
-declaration. Each clause is a comptime directive name, optionally followed by a
+declaration. Each clause is a decorator name, optionally followed by a
 parenthesized argument list of comptime expressions.
 
 ```ebnf
@@ -239,10 +239,11 @@ decorated-decl ::= { decorator } decl
 - Arguments are comptime expressions (not types): `$size_of(T)` is a valid
   argument; `T` as a raw type name is not. A layout intrinsic is accepted on both
   a global's `align` and a record/union type's, see [decorators.md](decorators.md).
-- The directive set is closed and enforced by sema, not the parser; the
+- The decorator set is closed: the parser decodes each name to the decorator it
+  names, and sema refuses a name that names none. The
   full list (`symbol`, `library`, `inline`, `noinline`, `align`, `packed`,
   `section`, `oblivious`, `scalar`, `naked`, `embed`, and the shader and
-  target-type directives) is in [decorators.md](decorators.md).
+  target-type decorators) is in [decorators.md](decorators.md).
 - `#[...]` is the only decorator surface; a backtick is an unexpected
   character.
 
@@ -405,7 +406,7 @@ comptime-directive ::= expr-no-assign ";"
 ```
 
 - `comptime-directive` is a bare **comptime intrinsic / directive call**
-  (`$error("msg");`). Per-declaration codegen attributes are written as
+  (`$error("msg");`). Per-declaration codegen properties are written as
   `#[...]` decorators (see [decorators.md](decorators.md)); a directive takes
   no `=`, so a stray one after the target is a parse error at the directive's
   `;`. The target is parsed at a binding power above assignment so that `=`
@@ -807,20 +808,21 @@ disambiguated from a regular member access `v.name` by the `[` lookahead:
 Productions verified directly against the parser source:
 
 - **Lexical grammar** — `lexer.mach` / `token.mach`: token set (incl.
-  `KIND_ATTR_OPEN`), operator maximal-munch,
+  `KIND_DECORATOR_OPEN`), operator maximal-munch,
   number/char/string scanning and escapes, comment and whitespace handling
-  (incl. the `#[` attribute-open exception), the "keywords are `IDENT`s" model.
+  (incl. the `#[` decorator-open exception), the "keywords are `IDENT`s" model.
 - **Precedence ladder** — `token.infix_precedence` / `token.is_right_assoc`
   (the table is a direct transcription; only `=` is right-associative).
 - **Decorators** — `parser/grammar.mach` `parse_decorators` / `parse_one_decorator`:
-  leading `#[name(args)]` clauses (one Decorator node), closed directive set.
+  leading `#[name(args)]` clauses (one Decorator node, carrying the id its name
+  decodes to), closed decorator set.
 - **Declarations** — `parser/grammar.mach`: `use`, `fwd` (incl. `pub fwd`
   rejection), `fun` (generics, params, variadic `...`, named pack `name: ...`,
   comptime `$` params, optional return type, block-or-`;` body), `rec`, `uni`,
   `tag` (mandatory discriminator, cases with an optional payload type),
   `val`/`var` (type annotation required; `val x = 42;` is rejected), `def`, `test`, `flags`
   (`pub`/`ext` any order/count), the decl-scope `$if`/`$or` chain, and the
-  `comptime-directive` (attribute-write vs. bare directive) form.
+  bare `comptime-directive` form.
 - **Statements** — `parser/grammar.mach`: `block`, `if`/`or` chain, `for`
   (optional condition), `ret`/`brk`/`cnt`/`fin`, local `val`/`var`, the
   stmt-scope `$if`/`$or` chain, `$each … in … { }`, and `expr-stmt`.
@@ -851,8 +853,8 @@ Doc-only (intended surface, not a distinct parser production):
   `$is_union`, `$is_pointer`, `$is_secret`, `$holds_secret`,
   `$type_name`, `$error`) — syntactically indistinguishable from any other
   `comptime-ident` call.
-- The closed decorator directive set ([decorators.md](decorators.md)) — the
-  parser accepts any `IDENT` after `#[`; sema enforces the closed set.
+- The closed decorator set ([decorators.md](decorators.md)) — the parser
+  accepts any `IDENT` after `#[`; sema refuses a name outside the set.
 
 Divergences flagged inline:
 

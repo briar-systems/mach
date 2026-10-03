@@ -86,13 +86,13 @@ pub fun gated_imports_check(p: *project.Project) err[fail.Fail];
 
 refuse each imported constant a union build cannot read one value of
 
-## fun attributes_record
+## fun decorators_record
 
 ```mach
-pub fun attributes_record(p: *project.Project, mid: session.ModuleId) err[fail.Fail];
+pub fun decorators_record(p: *project.Project, mid: session.ModuleId) err[fail.Fail];
 ```
 
-record the strings a module's attribute arguments evaluate to
+record the strings a module's decorator arguments evaluate to
 
 ## fun parsed_definition
 
