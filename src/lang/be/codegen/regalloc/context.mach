@@ -1,0 +1,1430 @@
+# the per-function allocation state every phase reads and writes, its tables
+# and their lifetimes, and the register facts the phases share
+use mach.lang.fail;
+use mach.lang.growth;
+use mach.lang.intern;
+use lang_mir: mach.lang.mir;
+use mach.lang.mir.flow;
+use lang_target: mach.lang.target;
+use mach.lang.target.abi;
+use mach.lang.target.isa;
+use isa_inst:       mach.lang.target.isa.inst;
+use isa_rules:      mach.lang.target.isa.rules;
+use target_model:   mach.lang.target.model;
+use target_testing: mach.lang.target.testing;
+use A:              std.allocator;
+use std.allocator.arena;
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+pub val REG_CLASS_GP: u32 = 0;
+
+pub val RANGE_NIL: u32 = 0xFFFFFFFF;
+pub val POS_MAX:   i64 = 0x7FFFFFFFFFFFFFFF;
+
+pub rec FlatInstr {
+    block:   u32;
+    instr:   u32;
+    is_call: bool;
+}
+
+# one live run of a value: inclusive instruction positions
+pub rec Segment {
+    from: i64;
+    to:   i64;
+}
+
+# a value's lifetime is its segments, in position order and never touching;
+# start and end_pos are their hull, live_len the positions they cover, and
+# use_weight over live_len is the density the eviction choice compares.
+# crosses_call says a segment meets a call anywhere, call_inside that one
+# holds a call strictly within it, where a caller-saved register cannot
+# carry the value
+pub rec LiveRange {
+    vreg:         u32;
+    start:        i64;
+    end_pos:      i64;
+    use_count:    u32;
+    use_weight:   i64;
+    reg_class:    u32;
+    crosses_call: bool;
+    call_inside:  bool;
+    seg_start:    u32;
+    seg_count:    u32;
+    live_len:     i64;
+}
+
+pub rec BlockSpan {
+    start: i64;
+    end:   i64;
+}
+
+pub rec CopyHint {
+    src_vreg:     u32;
+    src_preg:     i32;
+    copy_pos:     i64;
+    dst_vreg:     u32;
+    dst_copy_pos: i64;
+    sink_preg:    i32;
+}
+
+pub rec Context {
+    # the first broken invariant a helper that returns no failure met, nil
+    # while none; the phase that ran the helper returns it as a defect
+    defect:               str;
+    alloc:                *A.Allocator;
+    interner:             *intern.Interner;
+    tgt:                  *lang_target.Binding;
+    f:                    *lang_mir.MirFunction;
+    segs:                 *Segment;
+    seg_count:            u32;
+    inactive:             *u32;
+    inactive_count:       u32;
+    cur_vreg:             u32;
+    flat:                 *FlatInstr;
+    flat_count:           u32;
+    order:                *u32;
+    ranges:               *LiveRange;
+    gp_count:             u32;
+    fp_count:             u32;
+    spill_width:          u8;
+    callee_saved:         *bool;
+    fp_callee_saved:      *bool;
+    reserved:             *bool;
+    gp_busy:              *bool;
+    fp_busy:              *bool;
+    fp_pinned_end:        *i64;
+    active:               *u32;
+    active_count:         u32;
+    pinned_end:           *i64;
+    param_reg_end:        *i64;
+    arg_res_reg:          *u32;
+    arg_res_start:        *i64;
+    arg_res_end:          *i64;
+    arg_res_count:        u32;
+    arg_res_cap:          u32;
+    def_res_reg:          *u32;
+    def_res_pos:          *i64;
+    def_res_early:        *bool;
+    def_res_count:        u32;
+    def_res_cap:          u32;
+    cur_start:            i64;
+    cur_end:              i64;
+    reload_scratch:       *target_model.Register;
+    reload_scratch_count: i32;
+    # the control-flow graph of the function in scan order, once it is ordered
+    graph:             flow.Graph;
+    graph_built:       bool;
+    block_spans:       *BlockSpan;
+    block_depth:       *u32;
+    vreg_slot_flag:    *bool;
+    hints:             *CopyHint;
+    spilled:           *bool;
+    spill_order:       *u32;
+    spill_order_count: u32;
+    piece_of:          *u32;
+    no_pieces:         *bool;
+    no_remat:          *bool;
+    table_count:       u32;
+    round_count:       u32;
+    tight_pos:         *u32;
+    tight_hold:        *u32;
+    tight_usable:      *u32;
+    tight_count:       u32;
+    borrowed_gp:       u32;
+}
+
+# the internal failure `prefix`, the function's name, then `suffix`; `unnamed`
+# is the text when the allocation owns no interner or the function no name
+pub fun fail_for(ctx: *Context, prefix: str, suffix: str, unnamed: str) fail.Fail {
+    if (ctx.interner == nil || intern.str_is_nil(ctx.f.name)) { ret fail.message(unnamed); }
+    ret fail.message_of(fail.format_intern(ctx.interner, ctx.alloc, "{}{}{}", prefix, intern.text(ctx.interner, ctx.f.name), suffix));
+}
+
+pub fun fp_class_index(tgt: *lang_target.Binding) u32 {
+    var ci: u32 = 0;
+    for (ci < tgt.target.model.reg_class_len) {
+        if (tgt.target.model.reg_classes[ci].kind == target_model.RC_FLOAT) { ret ci; }
+        ci = ci + 1;
+    }
+    ret RANGE_NIL;
+}
+
+pub fun bank_count(tgt: *lang_target.Binding, class: u32) u32 {
+    if (class >= tgt.target.model.reg_class_len) { ret 0; }
+    ret tgt.target.model.reg_classes[class].len;
+}
+
+pub fun init(ctx: *Context, tgt: *lang_target.Binding, m: *lang_mir.MirModule, f: *lang_mir.MirFunction) err[fail.Fail] {
+    ctx.defect               = nil;
+    ctx.alloc                = m.alloc;
+    ctx.interner             = m.interner;
+    ctx.tgt                  = tgt;
+    ctx.f                    = f;
+    ctx.segs                 = nil;
+    ctx.seg_count            = 0;
+    ctx.inactive             = nil;
+    ctx.inactive_count       = 0;
+    ctx.cur_vreg             = lang_mir.MIR_VREG_NIL.n;
+    ctx.flat                 = nil;
+    ctx.flat_count           = 0;
+    ctx.order                = nil;
+    ctx.ranges               = nil;
+    ctx.gp_count             = bank_count(tgt, REG_CLASS_GP);
+    ctx.fp_count             = bank_count(tgt, fp_class_index(tgt));
+    ctx.spill_width          = tgt.target.model.spill_width::u8;
+    ctx.callee_saved         = nil;
+    ctx.fp_callee_saved      = nil;
+    ctx.reserved             = nil;
+    ctx.gp_busy              = nil;
+    ctx.fp_busy              = nil;
+    ctx.fp_pinned_end        = nil;
+    ctx.active               = nil;
+    ctx.active_count         = 0;
+    ctx.pinned_end           = nil;
+    ctx.param_reg_end        = nil;
+    ctx.arg_res_reg          = nil;
+    ctx.arg_res_start        = nil;
+    ctx.arg_res_end          = nil;
+    ctx.arg_res_count        = 0;
+    ctx.arg_res_cap          = 0;
+    ctx.def_res_reg          = nil;
+    ctx.def_res_pos          = nil;
+    ctx.def_res_early        = nil;
+    ctx.def_res_count        = 0;
+    ctx.def_res_cap          = 0;
+    ctx.cur_start            = 0;
+    ctx.cur_end              = 0;
+    ctx.reload_scratch       = tgt.arch.reload_scratch_regs;
+    ctx.reload_scratch_count = tgt.arch.reload_scratch_count;
+    ctx.graph_built          = false;
+    ctx.block_spans          = nil;
+    ctx.block_depth          = nil;
+    ctx.vreg_slot_flag       = nil;
+    ctx.hints                = nil;
+    ctx.spilled              = nil;
+    ctx.spill_order          = nil;
+    ctx.spill_order_count    = 0;
+    ctx.piece_of             = nil;
+    ctx.no_pieces            = nil;
+    ctx.no_remat             = nil;
+    ctx.table_count          = 0;
+    ctx.round_count          = 0;
+    ctx.tight_pos            = nil;
+    ctx.tight_hold           = nil;
+    ctx.tight_usable         = nil;
+    ctx.tight_count          = 0;
+    ctx.borrowed_gp          = 0;
+
+    val ro: res[*u32, A.Error] = A.allocate[u32](m.alloc, f.block_count::usize);
+    if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+    ctx.order = ro.ok;
+
+    if (ctx.gp_count > 0) {
+        val rcs: res[*bool, A.Error] = A.allocate[bool](m.alloc, ctx.gp_count::usize);
+        if (sel rcs.err) {
+            dnit(ctx);
+            ret err[fail.Fail].err{fail.refused(rcs.err)};
+        }
+        ctx.callee_saved = rcs.ok;
+        val rrv: res[*bool, A.Error] = A.allocate[bool](m.alloc, ctx.gp_count::usize);
+        if (sel rrv.err) {
+            dnit(ctx);
+            ret err[fail.Fail].err{fail.refused(rrv.err)};
+        }
+        ctx.reserved = rrv.ok;
+        val rgb: res[*bool, A.Error] = A.allocate[bool](m.alloc, ctx.gp_count::usize);
+        if (sel rgb.err) {
+            dnit(ctx);
+            ret err[fail.Fail].err{fail.refused(rgb.err)};
+        }
+        ctx.gp_busy = rgb.ok;
+        val rpe: res[*i64, A.Error] = A.allocate[i64](m.alloc, ctx.gp_count::usize);
+        if (sel rpe.err) {
+            dnit(ctx);
+            ret err[fail.Fail].err{fail.refused(rpe.err)};
+        }
+        ctx.pinned_end = rpe.ok;
+        val rpr: res[*i64, A.Error] = A.allocate[i64](m.alloc, ctx.gp_count::usize);
+        if (sel rpr.err) {
+            dnit(ctx);
+            ret err[fail.Fail].err{fail.refused(rpr.err)};
+        }
+        ctx.param_reg_end = rpr.ok;
+
+        var gi: u32 = 0;
+        for (gi < ctx.gp_count) {
+            ctx.callee_saved[gi]  = false;
+            ctx.reserved[gi]      = false;
+            ctx.gp_busy[gi]       = false;
+            ctx.pinned_end[gi]    = -1;
+            ctx.param_reg_end[gi] = -1;
+            gi                    = gi + 1;
+        }
+
+        seed_reserved(tgt, ctx);
+    }
+
+    if (ctx.fp_count > 0) {
+        val rfb: res[*bool, A.Error] = A.allocate[bool](m.alloc, ctx.fp_count::usize);
+        if (sel rfb.err) {
+            dnit(ctx);
+            ret err[fail.Fail].err{fail.refused(rfb.err)};
+        }
+        ctx.fp_busy = rfb.ok;
+        val rfp: res[*i64, A.Error] = A.allocate[i64](m.alloc, ctx.fp_count::usize);
+        if (sel rfp.err) {
+            dnit(ctx);
+            ret err[fail.Fail].err{fail.refused(rfp.err)};
+        }
+        ctx.fp_pinned_end = rfp.ok;
+        val rfc: res[*bool, A.Error] = A.allocate[bool](m.alloc, ctx.fp_count::usize);
+        if (sel rfc.err) {
+            dnit(ctx);
+            ret err[fail.Fail].err{fail.refused(rfc.err)};
+        }
+        ctx.fp_callee_saved = rfc.ok;
+        var fii: u32 = 0;
+        for (fii < ctx.fp_count) {
+            ctx.fp_busy[fii]         = false;
+            ctx.fp_pinned_end[fii]   = -1;
+            ctx.fp_callee_saved[fii] = false;
+            fii                      = fii + 1;
+        }
+    }
+
+    seed_callee_saved(tgt, ctx);
+
+    val gt: err[fail.Fail] = vreg_tables_reserve(ctx, f.vreg_count);
+    if (sel gt.err) {
+        dnit(ctx);
+        ret gt;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the per-vreg tables that outlive a round, sized for every value the
+# function has plus the pieces the rounds add
+pub fun vreg_tables_reserve(ctx: *Context, need: u32) err[fail.Fail] {
+    if (need <= ctx.table_count) { ret err[fail.Fail].ok{}; }
+    var cap:   u32          = ctx.table_count;
+    val first: err[A.Error] = growth.reserve[bool](ctx.alloc, ?ctx.spilled, ?cap, need::usize);
+    if (sel first.err) { ret err[fail.Fail].err{fail.refused(first.err)}; }
+    var spill_order_cap: u32          = ctx.table_count;
+    val rso:             err[A.Error] = growth.resize[u32](ctx.alloc, ?ctx.spill_order, ?spill_order_cap, cap::usize);
+    if (sel rso.err) { ret err[fail.Fail].err{fail.refused(rso.err)}; }
+    var piece_of_cap: u32          = ctx.table_count;
+    val rp:           err[A.Error] = growth.resize[u32](ctx.alloc, ?ctx.piece_of, ?piece_of_cap, cap::usize);
+    if (sel rp.err) { ret err[fail.Fail].err{fail.refused(rp.err)}; }
+    var no_pieces_cap: u32          = ctx.table_count;
+    val rn:            err[A.Error] = growth.resize[bool](ctx.alloc, ?ctx.no_pieces, ?no_pieces_cap, cap::usize);
+    if (sel rn.err) { ret err[fail.Fail].err{fail.refused(rn.err)}; }
+    var no_remat_cap: u32          = ctx.table_count;
+    val rr:           err[A.Error] = growth.resize[bool](ctx.alloc, ?ctx.no_remat, ?no_remat_cap, cap::usize);
+    if (sel rr.err) { ret err[fail.Fail].err{fail.refused(rr.err)}; }
+
+    var i: u32 = ctx.table_count;
+    for (i < cap) {
+        ctx.spilled[i]   = false;
+        ctx.piece_of[i]  = lang_mir.MIR_VREG_NIL.n;
+        ctx.no_pieces[i] = false;
+        ctx.no_remat[i]  = false;
+        i                = i + 1;
+    }
+    ctx.table_count = cap;
+    ret err[fail.Fail].ok{};
+}
+
+# the tables one round builds and the next rebuilds: sized for the values
+# the function has now, with every register free and no interval placed
+pub fun round_tables_init(ctx: *Context) err[fail.Fail] {
+    val f:  *lang_mir.MirFunction = ctx.f;
+    val nv: u32                   = f.vreg_count;
+    ctx.round_count = nv;
+
+    val rr: res[*LiveRange, A.Error] = A.allocate[LiveRange](ctx.alloc, nv::usize);
+    if (sel rr.err) { ret err[fail.Fail].err{fail.refused(rr.err)}; }
+    ctx.ranges = rr.ok;
+    var vi: u32 = 0;
+    for (vi < nv) {
+        ctx.ranges[vi].vreg         = vi;
+        ctx.ranges[vi].start        = POS_MAX;
+        ctx.ranges[vi].end_pos      = -1;
+        ctx.ranges[vi].use_count    = 0;
+        ctx.ranges[vi].use_weight   = 0;
+        ctx.ranges[vi].reg_class    = f.vregs[vi].class;
+        ctx.ranges[vi].crosses_call = false;
+        ctx.ranges[vi].call_inside  = false;
+        ctx.ranges[vi].seg_start    = 0;
+        ctx.ranges[vi].seg_count    = 0;
+        ctx.ranges[vi].live_len     = 0;
+        f.vregs[vi].assigned        = lang_mir.MIR_PREG_NIL;
+        vi                          = vi + 1;
+    }
+
+    val ra: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (sel ra.err) { ret err[fail.Fail].err{fail.refused(ra.err)}; }
+    ctx.active       = ra.ok;
+    ctx.active_count = 0;
+
+    val rin: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (sel rin.err) { ret err[fail.Fail].err{fail.refused(rin.err)}; }
+    ctx.inactive       = rin.ok;
+    ctx.inactive_count = 0;
+
+    val rh: res[*CopyHint, A.Error] = A.allocate[CopyHint](ctx.alloc, nv::usize);
+    if (sel rh.err) { ret err[fail.Fail].err{fail.refused(rh.err)}; }
+    ctx.hints = rh.ok;
+    var hi: u32 = 0;
+    for (hi < nv) {
+        ctx.hints[hi].src_vreg     = lang_mir.MIR_VREG_NIL.n;
+        ctx.hints[hi].src_preg     = -1;
+        ctx.hints[hi].copy_pos     = -1;
+        ctx.hints[hi].dst_vreg     = lang_mir.MIR_VREG_NIL.n;
+        ctx.hints[hi].dst_copy_pos = -1;
+        ctx.hints[hi].sink_preg    = -1;
+        hi                         = hi + 1;
+    }
+
+    if (ctx.vreg_slot_flag == nil) {
+        val vs: err[fail.Fail] = build_vreg_slot_flags(ctx);
+        if (sel vs.err) { ret vs; }
+    }
+
+    var gi: u32 = 0;
+    for (gi < ctx.gp_count) {
+        ctx.gp_busy[gi]       = false;
+        ctx.pinned_end[gi]    = -1;
+        ctx.param_reg_end[gi] = -1;
+        gi                    = gi + 1;
+    }
+    var fi: u32 = 0;
+    for (fi < ctx.fp_count) {
+        ctx.fp_busy[fi]       = false;
+        ctx.fp_pinned_end[fi] = -1;
+        fi                    = fi + 1;
+    }
+    ctx.cur_start = 0;
+    ctx.cur_end   = 0;
+    ctx.cur_vreg  = lang_mir.MIR_VREG_NIL.n;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun round_tables_dnit(ctx: *Context) {
+    if (ctx.flat != nil && ctx.flat_count > 0) {
+        A.deallocate[FlatInstr](ctx.alloc, ctx.flat, ctx.flat_count::usize);
+        ctx.flat = nil;
+    }
+    if (ctx.arg_res_reg != nil && ctx.arg_res_cap > 0) {
+        A.deallocate[u32](ctx.alloc, ctx.arg_res_reg, ctx.arg_res_cap::usize);
+        ctx.arg_res_reg = nil;
+    }
+    if (ctx.arg_res_start != nil && ctx.arg_res_cap > 0) {
+        A.deallocate[i64](ctx.alloc, ctx.arg_res_start, ctx.arg_res_cap::usize);
+        ctx.arg_res_start = nil;
+    }
+    if (ctx.arg_res_end != nil && ctx.arg_res_cap > 0) {
+        A.deallocate[i64](ctx.alloc, ctx.arg_res_end, ctx.arg_res_cap::usize);
+        ctx.arg_res_end = nil;
+    }
+    if (ctx.def_res_reg != nil && ctx.def_res_cap > 0) {
+        A.deallocate[u32](ctx.alloc, ctx.def_res_reg, ctx.def_res_cap::usize);
+        ctx.def_res_reg = nil;
+    }
+    if (ctx.def_res_pos != nil && ctx.def_res_cap > 0) {
+        A.deallocate[i64](ctx.alloc, ctx.def_res_pos, ctx.def_res_cap::usize);
+        ctx.def_res_pos = nil;
+    }
+    if (ctx.def_res_early != nil && ctx.def_res_cap > 0) {
+        A.deallocate[bool](ctx.alloc, ctx.def_res_early, ctx.def_res_cap::usize);
+        ctx.def_res_early = nil;
+    }
+    ctx.flat_count    = 0;
+    ctx.arg_res_count = 0;
+    ctx.arg_res_cap   = 0;
+    ctx.def_res_count = 0;
+    ctx.def_res_cap   = 0;
+    if (ctx.segs != nil && ctx.seg_count > 0) {
+        A.deallocate[Segment](ctx.alloc, ctx.segs, ctx.seg_count::usize);
+        ctx.segs = nil;
+    }
+    ctx.seg_count = 0;
+    if (ctx.block_spans != nil && ctx.f.block_count > 0) {
+        A.deallocate[BlockSpan](ctx.alloc, ctx.block_spans, ctx.f.block_count::usize);
+        ctx.block_spans = nil;
+    }
+    if (ctx.block_depth != nil && ctx.f.block_count > 0) {
+        A.deallocate[u32](ctx.alloc, ctx.block_depth, ctx.f.block_count::usize);
+        ctx.block_depth = nil;
+    }
+    if (ctx.ranges != nil && ctx.round_count > 0) {
+        A.deallocate[LiveRange](ctx.alloc, ctx.ranges, ctx.round_count::usize);
+        ctx.ranges = nil;
+    }
+    if (ctx.active != nil && ctx.round_count > 0) {
+        A.deallocate[u32](ctx.alloc, ctx.active, ctx.round_count::usize);
+        ctx.active = nil;
+    }
+    if (ctx.inactive != nil && ctx.round_count > 0) {
+        A.deallocate[u32](ctx.alloc, ctx.inactive, ctx.round_count::usize);
+        ctx.inactive = nil;
+    }
+    if (ctx.hints != nil && ctx.round_count > 0) {
+        A.deallocate[CopyHint](ctx.alloc, ctx.hints, ctx.round_count::usize);
+        ctx.hints = nil;
+    }
+    if (ctx.vreg_slot_flag != nil && ctx.round_count > 0) {
+        A.deallocate[bool](ctx.alloc, ctx.vreg_slot_flag, ctx.round_count::usize);
+        ctx.vreg_slot_flag = nil;
+    }
+    ctx.round_count    = 0;
+    ctx.active_count   = 0;
+    ctx.inactive_count = 0;
+}
+
+pub fun dnit(ctx: *Context) {
+    tight_tables_dnit(ctx);
+    round_tables_dnit(ctx);
+    if (ctx.order != nil) {
+        A.deallocate[u32](ctx.alloc, ctx.order, ctx.f.block_count::usize);
+        ctx.order = nil;
+    }
+    if (ctx.callee_saved != nil) {
+        A.deallocate[bool](ctx.alloc, ctx.callee_saved, ctx.gp_count::usize);
+        ctx.callee_saved = nil;
+    }
+    if (ctx.fp_callee_saved != nil) {
+        A.deallocate[bool](ctx.alloc, ctx.fp_callee_saved, ctx.fp_count::usize);
+        ctx.fp_callee_saved = nil;
+    }
+    if (ctx.reserved != nil) {
+        A.deallocate[bool](ctx.alloc, ctx.reserved, ctx.gp_count::usize);
+        ctx.reserved = nil;
+    }
+    if (ctx.gp_busy != nil) {
+        A.deallocate[bool](ctx.alloc, ctx.gp_busy, ctx.gp_count::usize);
+        ctx.gp_busy = nil;
+    }
+    if (ctx.pinned_end != nil) {
+        A.deallocate[i64](ctx.alloc, ctx.pinned_end, ctx.gp_count::usize);
+        ctx.pinned_end = nil;
+    }
+    if (ctx.param_reg_end != nil) {
+        A.deallocate[i64](ctx.alloc, ctx.param_reg_end, ctx.gp_count::usize);
+        ctx.param_reg_end = nil;
+    }
+    if (ctx.fp_busy != nil) {
+        A.deallocate[bool](ctx.alloc, ctx.fp_busy, ctx.fp_count::usize);
+        ctx.fp_busy = nil;
+    }
+    if (ctx.fp_pinned_end != nil) {
+        A.deallocate[i64](ctx.alloc, ctx.fp_pinned_end, ctx.fp_count::usize);
+        ctx.fp_pinned_end = nil;
+    }
+    if (ctx.graph_built) {
+        flow.dnit(?ctx.graph);
+        ctx.graph_built = false;
+    }
+    if (ctx.table_count > 0) {
+        if (ctx.spilled != nil)     { A.deallocate[bool](ctx.alloc, ctx.spilled, ctx.table_count::usize); }
+        if (ctx.spill_order != nil) { A.deallocate[u32](ctx.alloc, ctx.spill_order, ctx.table_count::usize); }
+        if (ctx.piece_of != nil)    { A.deallocate[u32](ctx.alloc, ctx.piece_of, ctx.table_count::usize); }
+        if (ctx.no_pieces != nil)   { A.deallocate[bool](ctx.alloc, ctx.no_pieces, ctx.table_count::usize); }
+        if (ctx.no_remat != nil)    { A.deallocate[bool](ctx.alloc, ctx.no_remat, ctx.table_count::usize); }
+        ctx.spilled     = nil;
+        ctx.spill_order = nil;
+        ctx.piece_of    = nil;
+        ctx.no_pieces   = nil;
+        ctx.no_remat    = nil;
+        ctx.table_count = 0;
+    }
+}
+
+pub val MAX_REG_FILE: i32 = 32;
+
+pub fun reserve_reg(ctx: *Context, id: i32) {
+    if (id < 0)                  { ret; }
+    if (id::u32 >= ctx.gp_count) { ret; }
+    ctx.reserved[id::u32] = true;
+}
+
+fun seed_callee_saved(tgt: *lang_target.Binding, ctx: *Context) {
+    val regs: *target_model.Register = tgt.abi.callee_saved.regs;
+    val n:    i32                    = tgt.abi.callee_saved.count;
+    var i:    i32           = 0;
+    for (i < n && i < MAX_REG_FILE) {
+        val id: i32 = regs[i].id;
+        if (isa_inst.regid_class(id) == isa_inst.REG_CLASS_ID_GP) {
+            if (ctx.callee_saved != nil && id >= 0 && id::u32 < ctx.gp_count) {
+                ctx.callee_saved[id::u32] = true;
+            }
+        }
+        or {
+            val idx: i32 = isa_inst.regid_index(id);
+            if (ctx.fp_callee_saved != nil && idx >= 0 && idx::u32 < ctx.fp_count) {
+                ctx.fp_callee_saved[idx::u32] = true;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fun seed_reserved(tgt: *lang_target.Binding, ctx: *Context) {
+    var r: i32 = 0;
+    for (r < 32) {
+        if ((tgt.reserved_gp & (1::u32 << r::u32)) != 0) { reserve_reg(ctx, r); }
+        r = r + 1;
+    }
+}
+
+pub fun function_has_reg_shift(ctx: *Context) bool {
+    val f:  *lang_mir.MirFunction = ctx.f;
+    var bi: u32                   = 0;
+    for (bi < f.block_count) {
+        val blk: *lang_mir.MirBlock = ?f.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            val o:  lang_mir.MirOpcode = mi.opcode;
+            if (lang_mir.has(o, lang_mir.MIRF_SEL_SHIFT)) {
+                if (mi.operand_count >= 3 && mi.operands[2].kind == lang_mir.MIR_OP_PREG) {
+                    ret true;
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+pub fun flat_instr(ctx: *Context, pos: u32) *lang_mir.MirInstr {
+    val fi: *FlatInstr = ?ctx.flat[pos];
+    ret ?ctx.f.blocks[fi.block].instrs[fi.instr];
+}
+
+pub fun defect_note(ctx: *Context, text: str) {
+    if (ctx.defect == nil) { ctx.defect = text; }
+}
+
+pub fun defect_check(ctx: *Context) err[fail.Fail] {
+    if (ctx.defect != nil) { ret err[fail.Fail].err{fail.message(ctx.defect)}; }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun build_vreg_slot_flags(ctx: *Context) err[fail.Fail] {
+    val f:  *lang_mir.MirFunction = ctx.f;
+    val nv: u32                   = f.vreg_count;
+    if (nv == 0) { ret err[fail.Fail].ok{}; }
+
+    val r: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, nv::usize);
+    if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
+    ctx.vreg_slot_flag = r.ok;
+    var i: u32 = 0;
+    for (i < nv) {
+        ctx.vreg_slot_flag[i] = false;
+        i                     = i + 1;
+    }
+
+    val frame: *lang_mir.MirFrame = ?f.frame;
+    var s:     u32                = 0;
+    for (s < frame.slot_count) {
+        val owner: u32 = frame.slots[s].value;
+        if (owner < nv) { ctx.vreg_slot_flag[owner] = true; }
+        s = s + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun vreg_has_slot(ctx: *Context, v: lang_mir.VRegId) bool {
+    if (v.n >= ctx.f.vreg_count) { ret false; }
+    ret ctx.vreg_slot_flag[v.n];
+}
+
+# a spill is a decision the rounds may still revisit; the slot itself is
+# allocated once they settle, in the order the decisions were made
+pub fun spill_vreg(ctx: *Context, v: lang_mir.VRegId) err[fail.Fail] {
+    if (ctx.spilled[v.n]) { ret err[fail.Fail].ok{}; }
+    ctx.f.vregs[v.n].assigned              = lang_mir.MIR_PREG_NIL;
+    ctx.spilled[v.n]                       = true;
+    ctx.spill_order[ctx.spill_order_count] = v.n;
+    ctx.spill_order_count                  = ctx.spill_order_count + 1;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun tight_tables_dnit(ctx: *Context) {
+    if (ctx.tight_count > 0) {
+        A.deallocate[u32](ctx.alloc, ctx.tight_pos, ctx.tight_count::usize);
+        A.deallocate[u32](ctx.alloc, ctx.tight_hold, (ctx.tight_count * tight_width(ctx))::usize);
+        A.deallocate[u32](ctx.alloc, ctx.tight_usable, ctx.tight_count::usize);
+    }
+    ctx.tight_pos    = nil;
+    ctx.tight_hold   = nil;
+    ctx.tight_usable = nil;
+    ctx.tight_count  = 0;
+}
+
+# the general registers a mask can name
+pub fun tight_width(ctx: *Context) u32 {
+    if (ctx.gp_count > 32) { ret 32; }
+    ret ctx.gp_count;
+}
+
+pub fun is_spilled(ctx: *Context, v: lang_mir.VRegId) bool {
+    if (v.n >= ctx.f.vreg_count) { ret false; }
+    ret ctx.spilled[v.n];
+}
+
+pub fun is_fp_vreg(ctx: *Context, v: lang_mir.VRegId) bool {
+    if (v.n >= ctx.f.vreg_count) { ret false; }
+    ret ctx.f.vregs[v.n].class != REG_CLASS_GP;
+}
+
+pub fun is_storage_slot(ctx: *Context, v: lang_mir.VRegId) bool {
+    if (is_spilled(ctx, v)) { ret false; }
+    ret vreg_has_slot(ctx, v);
+}
+
+# the frame, link and veneer scratch registers are reserved everywhere on
+# aarch64, the platform register x18 only on darwin
+test seed_reserved__aarch64 {
+    var reg: lang_target.TargetRegistry = lang_target.registry_init();
+    val rr:  err[fail.Fail]             = lang_target.register_all(?reg, ?target_testing.DEBUG);
+    if (sel rr.err) { ret 1; }
+    var linux: [64]bool;
+    if (!t_seed_reserved(?reg, "linux", ?linux[0]))          { ret 2; }
+    if (!linux[30] || !linux[16] || !linux[17] || linux[18]) { ret 3; }
+    var darwin: [64]bool;
+    if (!t_seed_reserved(?reg, "darwin", ?darwin[0])) { ret 4; }
+    if (!darwin[18])                                  { ret 5; }
+
+    val ts: res[lang_target.Binding, fail.Fail] = lang_target.select(?reg, "aarch64", "linux", "aapcs64");
+    if (sel ts.err) { ret 6; }
+    var t: lang_target.Binding = ts.ok;
+    if (bank_count(?t, fp_class_index(?t)) != 30) { ret 7; }
+    ret 0;
+}
+
+#[testing]
+fun t_seed_reserved(reg: *lang_target.TargetRegistry, os_name: str, reserved: *bool) bool {
+    val ts: res[lang_target.Binding, fail.Fail] = lang_target.select(reg, "aarch64", os_name, "aapcs64");
+    if (sel ts.err) { ret false; }
+    var t: lang_target.Binding = ts.ok;
+    var i: u32                 = 0;
+    for (i < 64) {
+        reserved[i] = false;
+        i           = i + 1;
+    }
+    var ctx: Context;
+    ctx.gp_count = bank_count(?t, REG_CLASS_GP);
+    ctx.reserved = reserved;
+    seed_reserved(?t, ?ctx);
+    ret true;
+}
+
+#[testing]
+pub fun t_mov(alloc: *A.Allocator, b: *lang_mir.MirBlock, ix: u32, dst: lang_mir.MirOperand, src: lang_mir.MirOperand) {
+    val r: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](alloc, 2::usize);
+    if (sel r.err) { ret; }
+    val arr: *lang_mir.MirOperand = r.ok;
+    arr[0]                     = dst;
+    arr[1]                     = src;
+    b.instrs[ix].opcode        = lang_mir.MIR_MOV;
+    b.instrs[ix].operands      = arr;
+    b.instrs[ix].operand_count = 2;
+    b.instrs[ix].width         = 8;
+    b.instrs[ix].src_width     = 8;
+    b.instrs[ix].asm_block     = nil;
+    b.instrs[ix].vec_lane      = lang_mir.VEC_LANE_NONE;
+}
+
+# one segment per range from its hull, for tests that shape ranges by hand
+#[testing]
+pub fun t_hull_segs(ctx: *Context, n: u32) {
+    var i: u32 = 0;
+    for (i < n) {
+        val lr: *LiveRange = ?ctx.ranges[i];
+        lr.seg_start = i;
+        lr.seg_count = 0;
+        lr.live_len  = 0;
+        if (lr.end_pos >= 0 && lr.start <= lr.end_pos) {
+            ctx.segs[i].from = lr.start;
+            ctx.segs[i].to   = lr.end_pos;
+            lr.seg_count     = 1;
+            lr.live_len      = lr.end_pos - lr.start + 1;
+        }
+        i = i + 1;
+    }
+    ctx.seg_count = n;
+}
+
+#[testing]
+pub fun t_ctx(ctx: *Context, alloc: *A.Allocator, f: *lang_mir.MirFunction, slots: *bool) {
+    ctx.alloc          = alloc;
+    ctx.interner       = nil;
+    ctx.f              = f;
+    ctx.spill_width    = 8;
+    ctx.vreg_slot_flag = slots;
+    ctx.tight_pos      = nil;
+    ctx.tight_hold     = nil;
+    ctx.tight_usable   = nil;
+    ctx.tight_count    = 0;
+    ctx.borrowed_gp    = 0;
+}
+
+#[testing]
+pub fun t_target(reg: *lang_target.TargetRegistry, out: *lang_target.Binding) bool {
+    @reg = lang_target.registry_init();
+    val r_3350: err[fail.Fail] = lang_target.register_all(reg, ?target_testing.DEBUG);
+    if (sel r_3350.err) { ret false; }
+    val ts: res[lang_target.Binding, fail.Fail] = lang_target.select(reg, "x86_64", "linux", "sysv64");
+    if (sel ts.err) {
+        ret false;
+    }
+    @out = ts.ok;
+    ret true;
+}
+
+#[testing]
+pub fun t_op(alloc: *A.Allocator, b: *lang_mir.MirBlock, ix: u32, opcode: lang_mir.MirOpcode, x: lang_mir.MirOperand, y: lang_mir.MirOperand, z: lang_mir.MirOperand, n: u32) {
+    val r: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](alloc, 3::usize);
+    if (sel r.err) { ret; }
+    val arr: *lang_mir.MirOperand = r.ok;
+    arr[0]                     = x;
+    arr[1]                     = y;
+    arr[2]                     = z;
+    b.instrs[ix].opcode        = opcode;
+    b.instrs[ix].operands      = arr;
+    b.instrs[ix].operand_count = n;
+    b.instrs[ix].width         = 8;
+    b.instrs[ix].src_width     = 8;
+    b.instrs[ix].asm_block     = nil;
+    b.instrs[ix].vec_lane      = lang_mir.VEC_LANE_NONE;
+    b.instrs[ix].declassified  = lang_mir.MIR_VREG_NIL;
+}
+
+#[testing]
+pub fun t_dbg(alloc: *A.Allocator, mi: *lang_mir.MirInstr, iid: u32, vreg: u32) bool {
+    val r: err[fail.Fail] = lang_mir.instr_attach_dbg(alloc, mi, iid, vreg);
+    ret sel r.ok;
+}
+
+# a scan over hand-shaped intervals on one general register: the smallest
+# machine on which a hole or a density decision shows
+#[testing]
+pub rec TScan {
+    backing:      A.Allocator;
+    reg:          lang_target.TargetRegistry;
+    tgt:          lang_target.Binding;
+    vregs:        [4]lang_mir.MirVReg;
+    ranges:       [4]LiveRange;
+    segs:         [8]Segment;
+    hints:        [4]CopyHint;
+    slots:        [4]bool;
+    spilled:      [4]bool;
+    spill_order:  [4]u32;
+    piece_of:     [4]u32;
+    no_pieces:    [4]bool;
+    active:       [4]u32;
+    inactive:     [4]u32;
+    callee_saved: [2]bool;
+    reserved:     [2]bool;
+    busy:         [2]bool;
+    pinned:       [2]i64;
+    param_end:    [2]i64;
+    f:            lang_mir.MirFunction;
+    ctx:          Context;
+}
+
+#[testing]
+pub fun t_scan_init(t: *TScan) bool {
+    if (!t_target(?t.reg, ?t.tgt)) { ret false; }
+    val mb: err[A.Error] = page.make(?t.backing);
+    if (sel mb.err) { ret false; }
+    var i: u32 = 0;
+    for (i < 4) {
+        t.vregs[i]               = lang_mir.vreg(i, REG_CLASS_GP, 0, false);
+        t.ranges[i].vreg         = i;
+        t.ranges[i].start        = POS_MAX;
+        t.ranges[i].end_pos      = -1;
+        t.ranges[i].use_count    = 0;
+        t.ranges[i].use_weight   = 0;
+        t.ranges[i].reg_class    = REG_CLASS_GP;
+        t.ranges[i].crosses_call = false;
+        t.ranges[i].call_inside  = false;
+        t.ranges[i].seg_start    = 0;
+        t.ranges[i].seg_count    = 0;
+        t.ranges[i].live_len     = 0;
+        t.hints[i].src_vreg      = lang_mir.MIR_VREG_NIL.n;
+        t.hints[i].src_preg      = -1;
+        t.hints[i].copy_pos      = -1;
+        t.hints[i].dst_vreg      = lang_mir.MIR_VREG_NIL.n;
+        t.hints[i].dst_copy_pos  = -1;
+        t.hints[i].sink_preg     = -1;
+        t.slots[i]               = false;
+        t.spilled[i]             = false;
+        t.piece_of[i]            = lang_mir.MIR_VREG_NIL.n;
+        t.no_pieces[i]           = false;
+        i                        = i + 1;
+    }
+    var r: u32 = 0;
+    for (r < 2) {
+        t.callee_saved[r] = false;
+        t.reserved[r]     = false;
+        t.busy[r]         = false;
+        t.pinned[r]       = -1;
+        t.param_end[r]    = -1;
+        r                 = r + 1;
+    }
+    t.f.vregs       = ?t.vregs[0];
+    t.f.vreg_count  = 0;
+    t.f.block_count = 0;
+    t_ctx(?t.ctx, ?t.backing, ?t.f, ?t.slots[0]);
+    t.ctx.tgt           = ?t.tgt;
+    t.ctx.segs          = ?t.segs[0];
+    t.ctx.seg_count     = 0;
+    t.ctx.ranges        = ?t.ranges[0];
+    t.ctx.hints         = ?t.hints[0];
+    t.ctx.active        = ?t.active[0];
+    t.ctx.inactive      = ?t.inactive[0];
+    t.ctx.spilled       = ?t.spilled[0];
+    t.ctx.spill_order   = ?t.spill_order[0];
+    t.ctx.piece_of      = ?t.piece_of[0];
+    t.ctx.no_pieces     = ?t.no_pieces[0];
+    t.ctx.gp_count      = 1;
+    t.ctx.fp_count      = 0;
+    t.ctx.callee_saved  = ?t.callee_saved[0];
+    t.ctx.reserved      = ?t.reserved[0];
+    t.ctx.gp_busy       = ?t.busy[0];
+    t.ctx.pinned_end    = ?t.pinned[0];
+    t.ctx.param_reg_end = ?t.param_end[0];
+    t.ctx.cur_vreg      = lang_mir.MIR_VREG_NIL.n;
+    ret true;
+}
+
+#[testing]
+pub fun t_scan_dnit(t: *TScan) {}
+
+# a value live over [from, to] with the given loop-weighted use
+#[testing]
+pub fun t_scan_value(t: *TScan, from: i64, to: i64, weight: i64) {
+    val v:  u32        = t.f.vreg_count;
+    val lr: *LiveRange = ?t.ranges[v];
+    lr.start                     = from;
+    lr.end_pos                   = to;
+    lr.use_count                 = 2;
+    lr.use_weight                = weight;
+    lr.seg_start                 = t.ctx.seg_count;
+    lr.seg_count                 = 1;
+    lr.live_len                  = to - from + 1;
+    t.segs[t.ctx.seg_count].from = from;
+    t.segs[t.ctx.seg_count].to   = to;
+    t.ctx.seg_count              = t.ctx.seg_count + 1;
+    t.f.vreg_count               = v + 1;
+}
+
+# a second segment for the value just added, leaving a hole before it
+#[testing]
+pub fun t_scan_segment(t: *TScan, from: i64, to: i64) {
+    val lr: *LiveRange = ?t.ranges[t.f.vreg_count - 1];
+    t.segs[t.ctx.seg_count].from = from;
+    t.segs[t.ctx.seg_count].to   = to;
+    t.ctx.seg_count              = t.ctx.seg_count + 1;
+    lr.seg_count                 = lr.seg_count + 1;
+    lr.end_pos                   = to;
+    lr.live_len                  = lr.live_len + (to - from + 1);
+}
+
+#[testing]
+pub fun t_scan_holds_reg0(t: *TScan, v: u32) bool {
+    ret t_scan_holds_reg(t, v, 0);
+}
+
+#[testing]
+pub fun t_scan_holds_reg(t: *TScan, v: u32, idx: i32) bool {
+    if (t.spilled[v]) { ret false; }
+    val a: lang_mir.PRegId = t.vregs[v].assigned;
+    if (lang_mir.preg_is_nil(a)) { ret false; }
+    ret isa_inst.regid_index(lang_mir.preg_regid(a)) == idx;
+}
+
+# a rewrite fixture: vregs 0..3 in general registers 0..3, live past position
+# 0, over the x86_64 target with reload scratch registers 8 and 9
+#[testing]
+pub rec TRewrite {
+    backing: A.Allocator;
+    scratch: arena.Arena;
+    alloc:   A.Allocator;
+    reg:     lang_target.TargetRegistry;
+    tgt:     lang_target.Binding;
+    vregs:   [4]lang_mir.MirVReg;
+    ranges:  [4]LiveRange;
+    segs:    [4]Segment;
+    hints:   [4]CopyHint;
+    slots:   [4]bool;
+    spilled: [4]bool;
+    pool:    [2]target_model.Register;
+    f:       lang_mir.MirFunction;
+    ctx:     Context;
+    dst:     [8]lang_mir.MirInstr;
+    written: u32;
+}
+
+#[testing]
+pub fun t_rewrite_init(t: *TRewrite) bool {
+    if (!t_target(?t.reg, ?t.tgt)) { ret false; }
+    val mb: err[A.Error] = page.make(?t.backing);
+    if (sel mb.err) { ret false; }
+    val ia: err[A.Error] = arena.init(?t.scratch, ?t.backing, 65536);
+    if (sel ia.err) { ret false; }
+    val ma: err[A.Error] = arena.make(?t.alloc, ?t.scratch);
+    if (sel ma.err) { ret false; }
+    var i: u32 = 0;
+    for (i < 4) {
+        t.vregs[i]              = lang_mir.vreg(i, REG_CLASS_GP, 0, false);
+        t.vregs[i].assigned     = lang_mir.preg_id(i::i32);
+        t.ranges[i].vreg        = i;
+        t.ranges[i].start       = 0;
+        t.ranges[i].end_pos     = 5;
+        t.hints[i].src_vreg     = lang_mir.MIR_VREG_NIL.n;
+        t.hints[i].src_preg     = -1;
+        t.hints[i].copy_pos     = -1;
+        t.hints[i].dst_vreg     = lang_mir.MIR_VREG_NIL.n;
+        t.hints[i].dst_copy_pos = -1;
+        t.hints[i].sink_preg    = -1;
+        t.slots[i]              = false;
+        t.spilled[i]            = false;
+        i                       = i + 1;
+    }
+    t.pool[0].id   = 8;
+    t.pool[1].id   = 9;
+    t.f.vregs      = ?t.vregs[0];
+    t.f.vreg_count = 4;
+    t_ctx(?t.ctx, ?t.alloc, ?t.f, ?t.slots[0]);
+    t.ctx.ranges               = ?t.ranges[0];
+    t.ctx.segs                 = ?t.segs[0];
+    t.ctx.spilled              = ?t.spilled[0];
+    t.ctx.hints                = ?t.hints[0];
+    t.ctx.reload_scratch       = ?t.pool[0];
+    t.ctx.reload_scratch_count = 2;
+    t.written                  = 0;
+    ret true;
+}
+
+#[testing]
+pub fun t_rewrite_dnit(t: *TRewrite) {
+    arena.dnit(?t.scratch);
+}
+
+# a fresh fixture in place of a used one
+#[testing]
+pub fun t_rewrite_again(t: *TRewrite) bool {
+    t_rewrite_dnit(t);
+    ret t_rewrite_init(t);
+}
+
+#[testing]
+pub fun t_spill(t: *TRewrite, v: u32) {
+    t.vregs[v].assigned   = lang_mir.MIR_PREG_NIL;
+    t.vregs[v].spill_slot = v::i32;
+    t.spilled[v]          = true;
+}
+
+# a block whose spilled value 0 is read by two loads before a call and by
+# one after it; the pair before the call earns a piece, the single read after
+# it does not, and a write of the value closes a run
+#[testing]
+pub fun t_piece_block(alloc: *A.Allocator, f: *lang_mir.MirFunction, b: *lang_mir.MirBlock, ctx: *Context, slots: *bool) err[fail.Fail] {
+    lang_mir.vregs_gp(alloc, f, 6);
+    f.vreg_cap = 6;
+    lang_mir.instrs_blank(alloc, b, 6);
+    t_mov(alloc, b, 0, lang_mir.op_vreg(lang_mir.vreg_id(1)), lang_mir.op_mem_value(lang_mir.vreg_id(0), 0));
+    t_mov(alloc, b, 1, lang_mir.op_vreg(lang_mir.vreg_id(2)), lang_mir.op_mem_value(lang_mir.vreg_id(0), 8));
+    b.instrs[2].opcode        = lang_mir.MIR_CALL;
+    b.instrs[2].operand_count = 0;
+    b.instrs[2].operands      = nil;
+    t_mov(alloc, b, 3, lang_mir.op_vreg(lang_mir.vreg_id(3)), lang_mir.op_mem_value(lang_mir.vreg_id(0), 16));
+    t_mov(alloc, b, 4, lang_mir.op_vreg(lang_mir.vreg_id(0)), lang_mir.op_vreg(lang_mir.vreg_id(3)));
+    t_mov(alloc, b, 5, lang_mir.op_vreg(lang_mir.vreg_id(4)), lang_mir.op_vreg(lang_mir.vreg_id(0)));
+    f.blocks      = b;
+    f.block_count = 1;
+    f.block_cap   = 1;
+    t_ctx(ctx, alloc, f, slots);
+    val gt: err[fail.Fail] = vreg_tables_reserve(ctx, 6);
+    if (sel gt.err) { ret gt; }
+    ctx.spilled[0] = true;
+    ret err[fail.Fail].ok{};
+}
+
+#[testing]
+pub fun t_reads_base(mi: *lang_mir.MirInstr, v: u32) bool {
+    ret mi.operands[1].kind == lang_mir.MIR_OP_MEM && mi.operands[1].vreg.n == v;
+}
+
+#[testing]
+pub fun tables_dnit(ctx: *Context) {
+    A.deallocate[bool](ctx.alloc, ctx.spilled, ctx.table_count::usize);
+    A.deallocate[u32](ctx.alloc, ctx.spill_order, ctx.table_count::usize);
+    A.deallocate[u32](ctx.alloc, ctx.piece_of, ctx.table_count::usize);
+    A.deallocate[bool](ctx.alloc, ctx.no_pieces, ctx.table_count::usize);
+    A.deallocate[bool](ctx.alloc, ctx.no_remat, ctx.table_count::usize);
+}
+
+#[testing]
+pub fun t_v(v: u32) lang_mir.MirOperand {
+    ret lang_mir.op_vreg(lang_mir.vreg_id(v));
+}
+
+#[testing]
+pub fun t_instr(t: *TRewrite, opcode: lang_mir.MirOpcode, a: lang_mir.MirOperand, b: lang_mir.MirOperand, c: lang_mir.MirOperand, n: u32, out: *lang_mir.MirInstr) bool {
+    val ro: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](?t.alloc, n::usize);
+    if (sel ro.err) { ret false; }
+    val ops: *lang_mir.MirOperand = ro.ok;
+    ops[0] = a;
+    ops[1] = b;
+    if (n == 3) { ops[2] = c; }
+    @out = lang_mir.instr(opcode, ops, n, 8, 8);
+    val cb: err[fail.Fail] = isa_rules.capture_operand_banks(?t.f, out);
+    if (sel cb.err) { ret false; }
+    ret true;
+}
+
+#[testing]
+pub fun t_bind_both(alloc: *A.Allocator, mi: *lang_mir.MirInstr) bool {
+    val bs: err[fail.Fail] = lang_mir.instr_attach_dbg(alloc, mi, 1, 0);
+    if (sel bs.err) { ret false; }
+    val be: err[fail.Fail] = lang_mir.instr_attach_dbg_end(alloc, mi, 2, 0);
+    ret sel be.ok;
+}
+
+# a spilled def's store puts the value in its slot: the def keeps the binding
+# at its start and the store takes the one at its end
+#[testing]
+pub fun t_end_binding_at_store(def: *lang_mir.MirInstr, store: *lang_mir.MirInstr) bool {
+    if (def.dbg_binding_count != 1 || def.dbg_bindings[0].iid != 1 || def.dbg_bindings[0].at_end) { ret false; }
+    ret store.dbg_binding_count == 1 && store.dbg_bindings[0].iid == 2 && store.dbg_bindings[0].at_end;
+}
+
+#[testing]
+pub fun t_is_reg(op: *lang_mir.MirOperand, id: i32) bool {
+    ret op.kind == lang_mir.MIR_OP_PREG && lang_mir.preg_regid(op.preg) == id;
+}
+
+#[testing]
+pub fun t_is_slot(op: *lang_mir.MirOperand, v: u32) bool {
+    ret op.kind == lang_mir.MIR_OP_MEM && op.vreg.n == v && lang_mir.preg_is_nil(op.preg);
+}
+
+# the rewritten op writes register `d` from `l` and, for a binary op, `r`
+#[testing]
+pub fun t_op_is(mi: *lang_mir.MirInstr, opcode: lang_mir.MirOpcode, d: i32, l: i32, r: i32) bool {
+    if (mi.opcode != opcode)           { ret false; }
+    if (!t_is_reg(?mi.operands[0], d)) { ret false; }
+    if (!t_is_reg(?mi.operands[1], l)) { ret false; }
+    if (mi.operand_count == 2)         { ret r < 0; }
+    ret t_is_reg(?mi.operands[2], r);
+}
+
+# a load or store between register `reg` and the slot of `v`
+#[testing]
+pub fun t_transport_is(mi: *lang_mir.MirInstr, load: bool, reg: i32, v: u32) bool {
+    if (mi.opcode != lang_mir.MIR_MOV) { ret false; }
+    if (load)                          { ret t_is_reg(?mi.operands[0], reg) && t_is_slot(?mi.operands[1], v); }
+    ret t_is_slot(?mi.operands[0], v) && t_is_reg(?mi.operands[1], reg);
+}
+
+#[testing]
+pub fun t_or_row(dst: *bool, dbase: usize, src: *bool, sbase: usize, nv: u32) {
+    var v: u32 = 0;
+    for (v < nv) {
+        if (src[sbase + v::usize]) { dst[dbase + v::usize] = true; }
+        v = v + 1;
+    }
+}
+
+# the shifted-pair shape: a two-register call result captured into
+# two values and passed straight as the next call's argument pair one register
+# over, behind a third value in the first argument register. after allocation
+# the moves between the two calls are run symbolically over the register file:
+# the second call must see the first call's low word in its second argument
+# register and the high word in its third, whatever registers the captures
+# took and however the copies were ordered
+#[testing]
+pub rec TPair {
+    alloc:  A.Allocator;
+    reg:    lang_target.TargetRegistry;
+    tgt:    lang_target.Binding;
+    m:      lang_mir.MirModule;
+    f:      lang_mir.MirFunction;
+    blocks: [2]lang_mir.MirBlock;
+    ret_lo: i32;
+    ret_hi: i32;
+    arg:    [3]i32;
+}
+
+#[testing]
+fun t_pair_call(alloc: *A.Allocator, b: *lang_mir.MirBlock, ix: u32, op: lang_mir.MirOpcode) {
+    b.instrs[ix].opcode        = op;
+    b.instrs[ix].operands      = nil;
+    b.instrs[ix].operand_count = 0;
+    b.instrs[ix].width         = 8;
+    b.instrs[ix].src_width     = 8;
+    b.instrs[ix].asm_block     = nil;
+    b.instrs[ix].vec_lane      = lang_mir.VEC_LANE_NONE;
+}
+
+#[testing]
+pub fun t_pair_init(t: *TPair, isa_name: str, os_name: str, abi_name: str) bool {
+    val mk: err[A.Error] = page.make(?t.alloc);
+    if (sel mk.err) { ret false; }
+    t.reg = lang_target.registry_init();
+    val rr: err[fail.Fail] = lang_target.register_all(?t.reg, ?target_testing.DEBUG);
+    if (sel rr.err) { ret false; }
+    val ts: res[lang_target.Binding, fail.Fail] = lang_target.select(?t.reg, isa_name, os_name, abi_name);
+    if (sel ts.err) { ret false; }
+    t.tgt = ts.ok;
+
+    # the convention's 16-byte integer return pair and first three argument registers
+    val slot: abi.ParamSlot = abi.ret_slot_for(t.tgt.abi, abi.ret_query(16, 16, false, 0, false, false, 0, 0, abi.agg_none(), 16));
+    if (slot.piece_count != 2) { ret false; }
+    t.ret_lo = lang_mir.preg_regid(slot.pieces[0].reg);
+    t.ret_hi = lang_mir.preg_regid(slot.pieces[1].reg);
+    val regs: *target_model.Register = t.tgt.abi.gp_arg_regs.regs;
+    val n:    i32                    = t.tgt.abi.gp_arg_regs.count;
+    if (n < 3) { ret false; }
+    t.arg[0] = regs[0].id;
+    t.arg[1] = regs[1].id;
+    t.arg[2] = regs[2].id;
+
+    # the calls sit past the entry block: entry-block parameter pins would
+    # otherwise hold the return registers for reasons of their own
+    val pr: fun(i32) lang_mir.MirOperand = t_pair_preg;
+    lang_mir.vregs_gp(?t.alloc, ?t.f, 3);
+    lang_mir.instrs_blank(?t.alloc, ?t.blocks[0], 1);
+    val rj: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](?t.alloc, 1::usize);
+    if (sel rj.err) { ret false; }
+    rj.ok[0]              = lang_mir.op_block(1);
+    t.blocks[0].instrs[0] = lang_mir.instr(lang_mir.MIR_BR, rj.ok, 1, 0, 0);
+    val b: *lang_mir.MirBlock = ?t.blocks[1];
+    lang_mir.instrs_blank(?t.alloc, b, 9);
+    b.id = 1;
+    t_pair_call(?t.alloc, b, 0, lang_mir.MIR_CALL);
+    t_mov(?t.alloc, b, 1, lang_mir.op_vreg(lang_mir.vreg_id(0)), pr(t.ret_lo));
+    t_mov(?t.alloc, b, 2, lang_mir.op_vreg(lang_mir.vreg_id(1)), pr(t.ret_hi));
+    t_mov(?t.alloc, b, 3, lang_mir.op_vreg(lang_mir.vreg_id(2)), lang_mir.op_imm(7));
+    t_mov(?t.alloc, b, 4, pr(t.arg[0]), lang_mir.op_vreg(lang_mir.vreg_id(2)));
+    t_mov(?t.alloc, b, 5, pr(t.arg[1]), lang_mir.op_vreg(lang_mir.vreg_id(0)));
+    t_mov(?t.alloc, b, 6, pr(t.arg[2]), lang_mir.op_vreg(lang_mir.vreg_id(1)));
+    t_pair_call(?t.alloc, b, 7, lang_mir.MIR_CALL);
+    t_pair_call(?t.alloc, b, 8, lang_mir.MIR_RET);
+    t.f.blocks      = ?t.blocks[0];
+    t.f.block_count = 2;
+    t.f.block_cap   = 2;
+    # the banks the selection pass stamps before allocation
+    var k: u32 = 0;
+    for (k < 9) {
+        val stamped: err[fail.Fail] = isa_rules.capture_operand_banks(?t.f, ?b.instrs[k]);
+        if (sel stamped.err) { ret false; }
+        k = k + 1;
+    }
+    t.m.alloc        = ?t.alloc;
+    t.m.interner     = nil;
+    t.m.functions    = ?t.f;
+    t.m.function_len = 1;
+    t.m.function_cap = 1;
+    ret true;
+}
+
+#[testing]
+fun t_pair_preg(id: i32) lang_mir.MirOperand {
+    ret lang_mir.op_preg(lang_mir.preg_id(id));
+}
+
+#[testing]
+pub fun t_pair_dnit(t: *TPair) {}
+
+# tokens: 0 unknown, 1 the low word, 2 the high word, 3 the third value
+#[testing]
+val T_PAIR_REGS: u32 = 64;
+
+#[testing]
+pub fun t_pair_token_of(regs: *u8, mem: *u8, op: *lang_mir.MirOperand) u8 {
+    if (op.kind == lang_mir.MIR_OP_PREG) {
+        val id: i32 = lang_mir.preg_regid(op.preg);
+        if (id < 0 || id >= T_PAIR_REGS::i32) { ret 0; }
+        ret regs[id];
+    }
+    if (op.kind == lang_mir.MIR_OP_IMM) {
+        if (op.imm == 7) { ret 3; }
+        ret 0;
+    }
+    if (op.kind == lang_mir.MIR_OP_MEM) {
+        val slot: i64 = op.imm / 8;
+        if (slot < -32 || slot >= 32) { ret 0; }
+        ret mem[(slot + 32)::u32];
+    }
+    ret 0;
+}
+
+#[testing]
+pub fun t_pair_store(regs: *u8, mem: *u8, op: *lang_mir.MirOperand, token: u8) bool {
+    if (op.kind == lang_mir.MIR_OP_PREG) {
+        val id: i32 = lang_mir.preg_regid(op.preg);
+        if (id < 0 || id >= T_PAIR_REGS::i32) { ret false; }
+        regs[id] = token;
+        ret true;
+    }
+    if (op.kind == lang_mir.MIR_OP_MEM) {
+        val slot: i64 = op.imm / 8;
+        if (slot < -32 || slot >= 32) { ret false; }
+        mem[(slot + 32)::u32] = token;
+        ret true;
+    }
+    ret false;
+}
+
+# `ret hi(a, b)` on one convention: the parameters captured from their
+# registers, the high multiply, the result sunk into the return register
+#[testing]
+pub rec THigh {
+    alloc:  A.Allocator;
+    reg:    lang_target.TargetRegistry;
+    tgt:    lang_target.Binding;
+    m:      lang_mir.MirModule;
+    f:      lang_mir.MirFunction;
+    blocks: [2]lang_mir.MirBlock;
+    ret_r:  i32;
+    arg:    [3]i32;
+}
+
+#[testing]
+fun t_high_op(alloc: *A.Allocator, b: *lang_mir.MirBlock, ix: u32, op: lang_mir.MirOpcode, ops: *lang_mir.MirOperand, n: u32) {
+    b.instrs[ix].opcode        = op;
+    b.instrs[ix].operands      = ops;
+    b.instrs[ix].operand_count = n;
+    b.instrs[ix].width         = 8;
+    b.instrs[ix].src_width     = 8;
+    b.instrs[ix].asm_block     = nil;
+    b.instrs[ix].vec_lane      = lang_mir.VEC_LANE_NONE;
+}
+
+#[testing]
+fun t_high_target(t: *THigh, isa_name: str, os_name: str, abi_name: str) bool {
+    val mk: err[A.Error] = page.make(?t.alloc);
+    if (sel mk.err) { ret false; }
+    t.reg = lang_target.registry_init();
+    val rr: err[fail.Fail] = lang_target.register_all(?t.reg, ?target_testing.DEBUG);
+    if (sel rr.err) { ret false; }
+    val ts: res[lang_target.Binding, fail.Fail] = lang_target.select(?t.reg, isa_name, os_name, abi_name);
+    if (sel ts.err) { ret false; }
+    t.tgt = ts.ok;
+
+    val slot: abi.ParamSlot = abi.ret_slot_for(t.tgt.abi, abi.ret_query(8, 8, false, 0, false, false, 0, 0, abi.agg_none(), 16));
+    if (lang_mir.preg_is_nil(slot.reg)) { ret false; }
+    t.ret_r = lang_mir.preg_regid(slot.reg);
+    val regs: *target_model.Register = t.tgt.abi.gp_arg_regs.regs;
+    val n:    i32                    = t.tgt.abi.gp_arg_regs.count;
+    if (n < 3) { ret false; }
+    t.arg[0] = regs[0].id;
+    t.arg[1] = regs[1].id;
+    t.arg[2] = regs[2].id;
+    ret true;
+}
+
+#[testing]
+fun t_high_module(t: *THigh, block_count: u32) bool {
+    t.f.blocks      = ?t.blocks[0];
+    t.f.block_count = block_count;
+    t.f.block_cap   = block_count;
+    var bi: u32 = 0;
+    for (bi < block_count) {
+        val b: *lang_mir.MirBlock = ?t.blocks[bi];
+        var k: u32                = 0;
+        for (k < b.instr_count) {
+            val stamped: err[fail.Fail] = isa_rules.capture_operand_banks(?t.f, ?b.instrs[k]);
+            if (sel stamped.err) { ret false; }
+            k = k + 1;
+        }
+        bi = bi + 1;
+    }
+    t.m.alloc        = ?t.alloc;
+    t.m.interner     = nil;
+    t.m.functions    = ?t.f;
+    t.m.function_len = 1;
+    t.m.function_cap = 1;
+    ret true;
+}
+
+#[testing]
+pub fun t_high_dnit(t: *THigh) {}
+
+#[testing]
+pub fun t_high_reg(t: *THigh, v: u32) i32 {
+    val a: lang_mir.PRegId = t.f.vregs[v].assigned;
+    if (lang_mir.preg_is_nil(a)) { ret -1; }
+    ret lang_mir.preg_regid(a);
+}
+
+# the pair op between values that would take its registers on x86-64.
+# across: v3 is captured from rdx (a copy hint to rdx) and v4 is sunk into
+# rax (a sink hint to rax), both live across the multiply, which sits past the
+# entry block so no parameter pin holds either register. clobber: the divisor
+# v1 is captured from rdx and dies at the divide, which writes rdx (xor edx,
+# edx) before it reads the divisor
+#[testing]
+pub fun t_fixed_init(t: *THigh, clobber: bool) bool {
+    if (!t_high_target(t, "x86_64", "linux", "sysv64"))           { ret false; }
+    if (t.arg[2] != isa.fixed_reg(t.tgt.arch, isa.FIXED_PAIR_HI)) { ret false; }
+    val pr:  fun(i32) lang_mir.MirOperand       = t_pair_preg;
+    val acc: lang_mir.MirOperand                = pr(isa.fixed_reg(t.tgt.arch, isa.FIXED_PAIR_LO));
+    val hi:  lang_mir.MirOperand                = pr(isa.fixed_reg(t.tgt.arch, isa.FIXED_PAIR_HI));
+    val b:   *lang_mir.MirBlock                 = ?t.blocks[0];
+    val ro:  res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](?t.alloc, 2::usize);
+    if (sel ro.err) { ret false; }
+    ro.ok[0] = acc;
+    ro.ok[1] = lang_mir.op_vreg(lang_mir.vreg_id(1));
+    if (clobber) {
+        lang_mir.vregs_gp(?t.alloc, ?t.f, 2);
+        lang_mir.instrs_blank(?t.alloc, b, 6);
+        t_mov(?t.alloc, b, 0, lang_mir.op_vreg(lang_mir.vreg_id(0)), pr(t.arg[0]));
+        t_mov(?t.alloc, b, 1, lang_mir.op_vreg(lang_mir.vreg_id(1)), hi);
+        t_mov(?t.alloc, b, 2, acc, lang_mir.op_vreg(lang_mir.vreg_id(0)));
+        t_high_op(?t.alloc, b, 3, lang_mir.MIR_SEL_DIV_U, ro.ok, 2);
+        t_mov(?t.alloc, b, 4, pr(t.ret_r), acc);
+        t_high_op(?t.alloc, b, 5, lang_mir.MIR_RET, nil, 0);
+        ret t_high_module(t, 1);
+    }
+    lang_mir.vregs_gp(?t.alloc, ?t.f, 5);
+    lang_mir.instrs_blank(?t.alloc, b, 4);
+    t_mov(?t.alloc, b, 0, lang_mir.op_vreg(lang_mir.vreg_id(0)), pr(t.arg[0]));
+    t_mov(?t.alloc, b, 1, lang_mir.op_vreg(lang_mir.vreg_id(1)), pr(t.arg[1]));
+    t_mov(?t.alloc, b, 2, lang_mir.op_vreg(lang_mir.vreg_id(3)), pr(t.arg[2]));
+    val rj: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](?t.alloc, 1::usize);
+    if (sel rj.err) { ret false; }
+    rj.ok[0]    = lang_mir.op_block(1);
+    b.instrs[3] = lang_mir.instr(lang_mir.MIR_BR, rj.ok, 1, 0, 0);
+    val c: *lang_mir.MirBlock = ?t.blocks[1];
+    lang_mir.instrs_blank(?t.alloc, c, 8);
+    c.id = 1;
+    t_mov(?t.alloc, c, 0, lang_mir.op_vreg(lang_mir.vreg_id(4)), lang_mir.op_imm(5));
+    t_mov(?t.alloc, c, 1, acc, lang_mir.op_vreg(lang_mir.vreg_id(0)));
+    t_high_op(?t.alloc, c, 2, lang_mir.MIR_SEL_MUL_PAIR_U, ro.ok, 2);
+    t_mov(?t.alloc, c, 3, lang_mir.op_vreg(lang_mir.vreg_id(2)), hi);
+    t_mov(?t.alloc, c, 4, pr(t.arg[0]), lang_mir.op_vreg(lang_mir.vreg_id(3)));
+    t_mov(?t.alloc, c, 5, pr(t.arg[1]), lang_mir.op_vreg(lang_mir.vreg_id(2)));
+    t_mov(?t.alloc, c, 6, pr(t.ret_r), lang_mir.op_vreg(lang_mir.vreg_id(4)));
+    t_high_op(?t.alloc, c, 7, lang_mir.MIR_RET, nil, 0);
+    ret t_high_module(t, 2);
+}
+
+#[testing]
+pub fun t_fixed_in_pair(t: *THigh, v: u32) bool {
+    val r: i32 = t_high_reg(t, v);
+    ret r == isa.fixed_reg(t.tgt.arch, isa.FIXED_PAIR_LO) || r == isa.fixed_reg(t.tgt.arch, isa.FIXED_PAIR_HI);
+}
