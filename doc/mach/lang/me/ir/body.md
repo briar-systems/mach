@@ -41,7 +41,7 @@ constant payloads belong to the destination module arena
 ## fun extract
 
 ```mach
-pub fun extract(dst: *me_ir.Module, src: *me_ir.Module, tgt: *lang_target.Target, scratch: *A.Allocator, recursive: *bool) err[fail.Fail];
+pub fun extract(dst: *me_ir.Module, src: *me_ir.Module, tgt: *resolved.Target, scratch: *A.Allocator, recursive: *bool) err[fail.Fail];
 ```
 
 ## rec Available
@@ -87,7 +87,7 @@ pub fun contains(a: *Available, ix: u32) bool;
 ## fun acquire
 
 ```mach
-pub fun acquire(a: *Available, dst: *me_ir.Module, provider: *me_ir.Module, name: intern.StrId, tgt: *lang_target.Target, scratch: *A.Allocator) err[fail.Fail];
+pub fun acquire(a: *Available, dst: *me_ir.Module, provider: *me_ir.Module, name: intern.StrId, tgt: *resolved.Target, scratch: *A.Allocator) err[fail.Fail];
 ```
 
 ## fun growth_cost

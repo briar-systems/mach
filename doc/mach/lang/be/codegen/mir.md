@@ -484,7 +484,7 @@ the upper bytes of the vector registers above the compute width are
 cleared: a value wider than `vector_bits` a convention carried has left its
 register, and nothing the function holds lives above the compute width.
 emitted only where the model's register-width row says the narrower code
-pays for that state (isa.vector_upper_clear), x86-64's vzeroupper
+pays for that state (target_model.vector_upper_clear), x86-64's vzeroupper
 
 ## val MIR_VEC_INTERLEAVE
 

@@ -3,7 +3,7 @@
 ## fun callee_saved
 
 ```mach
-pub fun callee_saved(out: *isa.Register) i32;
+pub fun callee_saved(out: *target_model.Register) i32;
 ```
 
 ## fun va_model

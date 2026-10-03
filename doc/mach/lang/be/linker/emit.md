@@ -17,7 +17,7 @@ count: *u32) res[*target_of.Section, fail.Fail];
 ## fun entry_vaddr
 
 ```mach
-pub fun entry_vaddr(s: *session.Session, tgt: *lang_target.Target,
+pub fun entry_vaddr(s: *session.Session, tgt: *lang_target.Binding,
 sym_locs: *map.Map[intern.StrId, SymbolLoc]) res[u64, fail.Fail];
 ```
 
@@ -56,7 +56,7 @@ entry_count: *u32) res[*target_of.SymtabEntry, fail.Fail];
 ## fun header_reserve_bytes
 
 ```mach
-pub fun header_reserve_bytes(tgt: *lang_target.Target, pie: bool, shape: *target_of.HeaderShape) res[u64, fail.Fail];
+pub fun header_reserve_bytes(tgt: *lang_target.Binding, pie: bool, shape: *target_of.HeaderShape) res[u64, fail.Fail];
 ```
 
 the bytes reserved ahead of the first segment for the image headers: none

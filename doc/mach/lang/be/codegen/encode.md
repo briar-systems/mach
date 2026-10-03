@@ -111,7 +111,7 @@ pub def ConstEntry: encoding.ConstEntry
 ## fun run
 
 ```mach
-pub fun run(tgt: *resolved.Target, m: *codegen_mir.MirModule,
+pub fun run(tgt: *binding.Binding, m: *codegen_mir.MirModule,
 asm_out: *io_writer.Writer) res[EncoderOutput, fail.Fail];
 ```
 
@@ -419,7 +419,7 @@ hooks: *EncodeHooks, asm_out: *io_writer.Writer) res[EncoderOutput, fail.Fail];
 ## fun entry_align
 
 ```mach
-pub fun entry_align(model: *isa.MachineModel, explicit: u32) u32;
+pub fun entry_align(model: *target_model.Machine, explicit: u32) u32;
 ```
 
 a function's entry alignment: its own `#[align]` or the target's rule,
@@ -561,7 +561,7 @@ locations its def clobbered are ended
 ## fun state_blank
 
 ```mach
-pub fun state_blank(st: *EncodeState, alloc: *A.Allocator, model: *isa.MachineModel);
+pub fun state_blank(st: *EncodeState, alloc: *A.Allocator, model: *target_model.Machine);
 ```
 
 ## fun consts_free

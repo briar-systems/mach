@@ -484,7 +484,7 @@ pub fun set_union_build(c: *ComptimeCtx, v: bool);
 ## fun set_target_defs
 
 ```mach
-pub fun set_target_defs(c: *ComptimeCtx, d: *isa.TargetDefs);
+pub fun set_target_defs(c: *ComptimeCtx, d: *target_definition.Table);
 ```
 
 ## fun set_nan_rule
@@ -502,7 +502,13 @@ pub fun set_ct_mul(c: *ComptimeCtx, mask: ct.CtMulMask);
 ## fun set_extensions
 
 ```mach
-pub fun set_extensions(c: *ComptimeCtx, view: isa.ExtensionView);
+pub fun set_extensions(c: *ComptimeCtx, view: target_model.ExtensionView);
+```
+
+## fun set_vocabulary
+
+```mach
+pub fun set_vocabulary(c: *ComptimeCtx, vocabulary: *extension.Vocabulary);
 ```
 
 ## fun set_va_list
