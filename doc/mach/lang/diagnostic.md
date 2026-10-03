@@ -1,35 +1,5 @@
 # mach.lang.diagnostic
 
-## def Severity
-
-```mach
-pub def Severity: u8
-```
-
-## val SEVERITY_ERROR
-
-```mach
-pub val SEVERITY_ERROR:   Severity = 0
-```
-
-## val SEVERITY_WARNING
-
-```mach
-pub val SEVERITY_WARNING: Severity = 1
-```
-
-## val SEVERITY_INFO
-
-```mach
-pub val SEVERITY_INFO:    Severity = 2
-```
-
-## val SEVERITY_HELP
-
-```mach
-pub val SEVERITY_HELP:    Severity = 3
-```
-
 ## def Origin
 
 ```mach
@@ -173,17 +143,17 @@ pub fun fix_index(f: FixId) usize;
 pub rec Diagnostic;
 ```
 
-## rec DiagnosticId
-
-```mach
-pub rec DiagnosticId;
-```
+one diagnostic; its severity is its kind's, read with `is_error`
 
 ## rec DiagnosticStore
 
 ```mach
 pub rec DiagnosticStore;
 ```
+
+the diagnostics of a build, in the order they were committed. a store never
+holds the same report twice: a commit equal to one it holds, in everything but
+its origin, is dropped
 
 ## rec Expectation
 
@@ -211,11 +181,22 @@ fulfilled: a warning matched it
 pub rec DiagnosticBuilder;
 ```
 
+a diagnostic being assembled: notes, help, related places and fixes attach
+here, and `commit` hands the whole to a store
+
 ## fun store_init
 
 ```mach
 pub fun store_init(a: *A.Allocator) DiagnosticStore;
 ```
+
+## fun is_error
+
+```mach
+pub fun is_error(d: *Diagnostic) bool;
+```
+
+the diagnostic is an error: its kind's row declares it one
 
 ## fun set_origin
 
@@ -261,8 +242,8 @@ pub fun drop_file(store: *DiagnosticStore, file_id: lang_source.FileId);
 ```
 
 drop every diagnostic located in one file, keeping the rest in order. a module refreshed
-in place re-reports its own load diagnostics, so the old ones go; ids issued before the
-drop are stale afterwards, as after a truncate
+in place re-reports its own load diagnostics, so the old ones go; a mark taken before the
+drop is stale afterwards, as after a truncate
 
 store: the store
 file_id: the file whose diagnostics go
@@ -291,8 +272,7 @@ pub fun error_count(store: *DiagnosticStore) usize;
 pub fun builder_init(a: *A.Allocator, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, message: str) res[DiagnosticBuilder, fail.Fail];
 ```
 
-a builder for a diagnostic of kind `k`, raised at the severity its row
-declares
+a builder for a diagnostic of kind `k`
 
 ## fun builder_dnit
 
@@ -318,11 +298,7 @@ pub fun attach_help(b: *DiagnosticBuilder, text: str) err[fail.Fail];
 pub fun attach_related(b: *DiagnosticBuilder, file_id: lang_source.FileId, span: lang_source.Span, label: str) err[fail.Fail];
 ```
 
-## fun attach_related_committed
-
-```mach
-pub fun attach_related_committed(store: *DiagnosticStore, id: DiagnosticId, file_id: lang_source.FileId, span: lang_source.Span, label: str) err[fail.Fail];
-```
+a related place; a nil or empty label shows the place without one
 
 ## fun attach_fix
 
@@ -330,60 +306,59 @@ pub fun attach_related_committed(store: *DiagnosticStore, id: DiagnosticId, file
 pub fun attach_fix(b: *DiagnosticBuilder, label: str, file_id: lang_source.FileId, span: lang_source.Span, replacement: str) res[FixId, fail.Fail];
 ```
 
+a fix of one edit, which `attach_fix_edit` extends
+
 ## fun attach_fix_edit
 
 ```mach
 pub fun attach_fix_edit(b: *DiagnosticBuilder, fix: FixId, file_id: lang_source.FileId, span: lang_source.Span, replacement: str) err[fail.Fail];
 ```
 
-## fun last_id
+a further edit of fix `fix`, which may not overlap one it already makes
+
+## fun withdraw_fix
 
 ```mach
-pub fun last_id(store: *DiagnosticStore) opt[DiagnosticId];
+pub fun withdraw_fix(b: *DiagnosticBuilder, fix: FixId) err[fail.Fail];
 ```
 
-## fun attach_fix_committed
-
-```mach
-pub fun attach_fix_committed(store: *DiagnosticStore, id: DiagnosticId, label: str, file_id: lang_source.FileId, span: lang_source.Span, replacement: str) res[FixId, fail.Fail];
-```
-
-## fun attach_fix_edit_committed
-
-```mach
-pub fun attach_fix_edit_committed(store: *DiagnosticStore, id: DiagnosticId, fix: FixId, file_id: lang_source.FileId, span: lang_source.Span, replacement: str) err[fail.Fail];
-```
-
-## fun remove_fix_committed
-
-```mach
-pub fun remove_fix_committed(store: *DiagnosticStore, id: DiagnosticId, fix: FixId) err[fail.Fail];
-```
+drop the most recently attached fix, as a fix whose later edit could not be
+attached is withdrawn whole
 
 ## fun commit
 
 ```mach
-pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) res[opt[DiagnosticId], fail.Fail];
+pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) err[fail.Fail];
 ```
 
-consumes the builder into the store; absent when the store silences the warning's kind
-or an expectation acknowledges it, which drops it
+hand the builder's diagnostic to the store; the builder is consumed whatever
+the outcome. a warning the store silences or an expectation acknowledges is
+dropped, and so is a report the store already holds
 
-## fun resolve
+## fun report
 
 ```mach
-pub fun resolve(store: *DiagnosticStore, id: DiagnosticId) opt[*Diagnostic];
+pub fun report(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, message: str) err[fail.Fail];
 ```
 
-absent when the store is nil or the id no longer names a live diagnostic
+a diagnostic of kind `k` with no attachments
 
-## fun error
+## fun record
 
 ```mach
-pub fun error(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, message: str) err[fail.Fail];
+pub fun record(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, message: str);
 ```
 
-an error of kind `k`
+a diagnostic of kind `k` reported where the reporter has no failure to
+return: one the store cannot take is counted lost, which fails the build
+
+## fun record_unlocated
+
+```mach
+pub fun record_unlocated(store: *DiagnosticStore, k: diagnostic_kind.Kind, message: str);
+```
+
+a diagnostic about the build as a whole, located at no source
 
 ## fun reject
 
@@ -398,66 +373,6 @@ one list. an append the store refuses is an internal failure; a store wired
 as nil is a compiler defect, and the text then stands as an internal failure
 rather than vanishing
 
-## fun record_warning_at
-
-```mach
-pub fun record_warning_at(store: *DiagnosticStore, k: diagnostic_kind.Kind, loc: lang_source.Location, message: str);
-```
-
-a warning of kind `k` located at `loc`, as `reject` locates an error
-
-## fun warning
-
-```mach
-pub fun warning(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, message: str) err[fail.Fail];
-```
-
-a warning of kind `k`
-
-## fun record_error
-
-```mach
-pub fun record_error(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, message: str);
-```
-
-## fun record_warning
-
-```mach
-pub fun record_warning(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, message: str);
-```
-
-## fun record_unlocated_warning
-
-```mach
-pub fun record_unlocated_warning(store: *DiagnosticStore, k: diagnostic_kind.Kind, message: str);
-```
-
-a warning about the build as a whole, located at no source
-
-## fun record_note_committed
-
-```mach
-pub fun record_note_committed(store: *DiagnosticStore, id: DiagnosticId, text: str);
-```
-
-## fun record_help_committed
-
-```mach
-pub fun record_help_committed(store: *DiagnosticStore, id: DiagnosticId, text: str);
-```
-
-## fun record_related_committed
-
-```mach
-pub fun record_related_committed(store: *DiagnosticStore, id: DiagnosticId, file_id: lang_source.FileId, span: lang_source.Span, label: str);
-```
-
-## fun record_fix_committed
-
-```mach
-pub fun record_fix_committed(store: *DiagnosticStore, id: DiagnosticId, label: str, file_id: lang_source.FileId, span: lang_source.Span, replacement: str);
-```
-
 ## fun note_lost
 
 ```mach
@@ -468,19 +383,6 @@ pub fun note_lost(store: *DiagnosticStore);
 
 ```mach
 pub fun lost_count(store: *DiagnosticStore) usize;
-```
-
-## fun gate_error_named
-
-```mach
-pub fun gate_error_named(
-store: *DiagnosticStore,
-itn: *intern.Interner,
-k: diagnostic_kind.Kind,
-file_id: lang_source.FileId,
-span: lang_source.Span,
-name_id: intern.StrId,
-fallback: str) res[bool, fail.Fail];
 ```
 
 ## fun suggestion_build
@@ -515,24 +417,39 @@ pub fun snapshot_from(src: *DiagnosticStore, from: usize, a: *A.Allocator) res[*
 pub fun replay_into(dst: *DiagnosticStore, src: *DiagnosticStore) err[fail.Fail];
 ```
 
-## fun gate_commit
+## rec SourceTable
 
 ```mach
-pub fun gate_commit(
-store: *DiagnosticStore,
-itn: *intern.Interner,
-b: *DiagnosticBuilder) res[bool, fail.Fail];
+pub rec SourceTable;
 ```
 
-## fun gate_error
+how an encoded store names its files: by path, which outlives the file ids
+of the session that encoded it
+
+ctx:     the table's own state, passed back to each function
+path_of: the path a file was loaded from, nil for one the table does not hold
+file_at: the file the reading session loaded from `path`, FILE_NIL when it
+         loaded none; a refusal when the lookup cannot be made
+
+## fun encode
 
 ```mach
-pub fun gate_error(
-store: *DiagnosticStore,
-itn: *intern.Interner,
-k: diagnostic_kind.Kind,
-file_id: lang_source.FileId,
-span: lang_source.Span,
-message: str) res[bool, fail.Fail];
+pub fun encode(w: *wire.Sink, store: *DiagnosticStore, sources: *SourceTable);
 ```
+
+write the store's diagnostics as bytes: their count, then per diagnostic its
+origin, its kind's key, location and message, then its notes, related places
+and fixes. a location is its file's path (absent as 0xFFFFFFFF), offset and
+length; a text is its length (absent as 0xFFFFFFFF) and bytes; every number
+little endian. a kind travels by its key, which never changes meaning
+
+## fun decode
+
+```mach
+pub fun decode(r: *wire.Source, sources: *SourceTable, into: *DiagnosticStore) res[bool, fail.Fail];
+```
+
+read one store `encode` wrote and commit its diagnostics to `into`: false
+when the bytes are malformed or name a kind this compiler does not raise,
+which ends the read where it stands
 
