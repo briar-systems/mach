@@ -379,7 +379,7 @@ pub val VEC_OP_WIDEN_S: VecOp = 24
 a lane-halving extension: half the operand's integer lanes (its low or high
 half), each extended to twice the width under the operation's signedness. a
 cell names the result lane width and the operand lane width; its scalar row
-is the unfused path, one extension per lane into a rebuilt vector (#3738)
+is the unfused path, one extension per lane into a rebuilt vector
 
 ## val VEC_OP_WIDEN_U
 
@@ -395,10 +395,10 @@ pub val VEC_OP_SHL_U:   VecOp = 26
 
 the lane-wise shifts of integer lanes, keyed by direction, by signedness for
 a right shift, and by the count's form, since the packed answer differs along
-each (#3740): a uniform count (`_U`) is one scalar applied to every lane, the
+each: a uniform count (`_U`) is one scalar applied to every lane, the
 form every baseline set has an instruction for, and a per-lane count (`_V`)
 is a vector of counts, one per lane. a count at or above the lane width
-saturates in every form, as the scalar shift does (#3756)
+saturates in every form, as the scalar shift does
 
 ## val VEC_OP_SHR_U_U
 
@@ -439,7 +439,7 @@ pub val VEC_OP_RANGE: VecOp = 32
 a lane range: the lanes of the operand from a constant first lane on, of the
 same lane type, in a vector of at most as many lanes. a cell names the lane
 kind and width, which the operation keeps; its scalar row is the lane path,
-each lane extracted and the result built or written through memory (#3864)
+each lane extracted and the result built or written through memory
 
 ## val VEC_OP_CONCAT
 
@@ -450,7 +450,7 @@ pub val VEC_OP_CONCAT: VecOp = 33
 a lane join: the lanes of each operand in turn, all of one lane type, in one
 vector of their summed count. it is how a vector wider than the register is
 put back together from its register-width pieces, and how a narrowing
-conversion over those pieces gathers its halves (#3589). a cell names the
+conversion over those pieces gathers its halves. a cell names the
 lane kind and width, which the operation keeps; its scalar row is the lane
 path through memory
 
@@ -463,7 +463,7 @@ pub val VEC_OP_MUL_HIGH_S: VecOp = 34
 the high half of the full product of two integer lanes, in lanes of their
 own width, under the operation's signedness: the upper word of the widening
 multiply, whose lower word is the plain multiply. a cell names the lane width
-twice; its scalar row is each lane's own high multiply (#4119)
+twice; its scalar row is each lane's own high multiply
 
 ## val VEC_OP_MUL_HIGH_U
 
@@ -481,7 +481,7 @@ a lane interleave: lane i of the low operand and lane i of the high operand
 joined into one lane twice as wide, the low operand's lane in its low half.
 it is how a target whose widening multiply is the low and the high multiply
 pairs the two into full products. a cell names the result lane width and the
-operand lane width; its scalar row is each lane joined on its own (#4119)
+operand lane width; its scalar row is each lane joined on its own
 
 ## val VEC_OP_WIDEN_SUM_U
 
@@ -493,7 +493,7 @@ a widening group sum: each result lane the zero-extended sum of the operand
 integer lanes it covers, so the result holds the operand's bits in fewer,
 wider lanes. a cell names the result lane width and the operand lane width;
 its scalar row is the per-lane sum, and only a packed cell is ever formed,
-as the fold of a count accumulated in narrow lanes (#4161)
+as the fold of a count accumulated in narrow lanes
 
 ## val VEC_OP_SIGN_MASK
 
@@ -505,7 +505,7 @@ a lane sign mask: each integer lane all ones when it is negative, else zero,
 in lanes of its own width. it is the high half a signed lane-halving
 extension interleaves its lanes with, so both halves of one extension share
 it; its scalar row is each lane shifted right by its width less one, and
-only a packed cell is ever formed (#4198)
+only a packed cell is ever formed
 
 ## rec PackedForm
 
@@ -568,7 +568,7 @@ pub rec VectorRegisterRow;
 a width the vector register file takes under an extension: with `ext`
 selected a register carries `bytes`, more than the compute width
 `vector_bits` the packed rows run at. a convention that places a vector by
-the register it fits reads the widest selected row (#3751). `upper_clear`
+the register it fits reads the widest selected row. `upper_clear`
 says the narrower code the target emits pays for a register's upper bytes
 while they hold a value, so the upper state is cleared once a value of this
 width has been moved out of its register (x86-64's vzeroupper after a ymm
@@ -585,7 +585,7 @@ with `ext` selected, the rows over float lanes (`is_float`) or integer ones
 of the byte widths `lanes` names (a sum of 1, 2, 4 and 8, as vec_mem_widths)
 run at `bits` rather than the baseline `vector_bits`. a vector of those
 lanes is then realized whole in a register that wide, and type legalization
-splits it only past it (#4128). the kinds widen apart on a target whose
+splits it only past it. the kinds widen apart on a target whose
 extensions do: x86-64's avx computes binary32 and binary64 at 256 bits and
 leaves integers at 128 until avx2
 
@@ -675,7 +675,7 @@ pub val INT_WIDTHS_1_2_4_8: u32 = 1 + 2 + 4 + 8
 
 the scalar integer widths a target realizes, encoded like vec_mem_widths:
 the bit for a width is that width; every ISA declares the 64-bit set today
-and none the 128-bit one (#3511)
+and none the 128-bit one
 
 ## val INT_WIDTHS_1_2_4_8_16
 
@@ -711,7 +711,7 @@ pub def MulWideForm: u8
 
 how a target realizes the full product of two lane-width integers: no
 instruction (the schoolbook over extended operands), a three-address high
-multiply beside the low one, or a fixed register pair (#3511, Q11); a
+multiply beside the low one, or a fixed register pair; a
 declaration, never derived from mul_hi_width
 
 ## val MULW_NONE
@@ -823,7 +823,7 @@ pub fun vector_register_bits(m: *MachineModel) u32;
 ```
 
 the widest vector register the selected extensions give, in bits: the
-layout aligns a vector as wide as one to it (#4128)
+layout aligns a vector as wide as one to it
 
 ## fun vector_upper_clear
 
@@ -915,7 +915,7 @@ pub fun ct_mul_rows_under(m: *MachineModel, cond: ct.CtMulCond) ct.CtMulMask;
 ```
 
 the cells whose rows carry one condition, decided or not: what a DIT_MODE
-multiply would need before it is admitted. a realized cell (#3511) needs the
+multiply would need before it is admitted. a realized cell needs the
 condition when some cell of its realization does, so the set is the rows of
 the condition plus every realized cell admitted with all rows held that is
 not admitted with the condition's rows withheld
@@ -1085,7 +1085,7 @@ pub fun vector_op_bytes(m: *MachineModel, is_float: bool, lane_bits: u32, bytes:
 the bytes of the register that realizes a vector of `bytes` over lanes of
 this kind whole: the narrowest register width the kind computes at that
 holds it, `vector_op_bytes` at the least. a vector wider than every such
-register is not realized in one and keeps the narrowest (#4128)
+register is not realized in one and keeps the narrowest
 
 ## fun moves_unaligned_gp
 
@@ -1121,7 +1121,7 @@ pub fun moves_vector_memory(m: *MachineModel, bytes: u32) bool;
 
 a vector of `bytes` moves between memory and its register in one access:
 a width the target declares, or a register width its extensions give past
-the compute width (#4128)
+the compute width
 
 ## fun reads_slot_operand
 
@@ -2270,7 +2270,7 @@ pub rec IsaRegistry;
 pub val ARCH_CATALOG_VERSION: u8 = 2
 ```
 
-version 2: catalog id 4 is reserved with no row and the tags after it moved up (#3226)
+version 2: catalog id 4 is reserved with no row and the tags after it moved up
 
 ## fun arch_id_for
 

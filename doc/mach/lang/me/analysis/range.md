@@ -1,6 +1,6 @@
 # mach.lang.me.analysis.range
 
-the unsigned range of an integer value where a block reads it (#3885)
+the unsigned range of an integer value where a block reads it
 
 a range comes from what the ir already states: a constant, the operation
 that defines the value (a mask, an extension, a sum or difference of bounded

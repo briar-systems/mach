@@ -8,7 +8,7 @@ pub rec Need;
 
 `who` names the requirer a diagnostic attributes a root need to: the root itself
 ("" reads as the problem's root) or the chain of a dependency that declared the
-range, since every requirer's range takes part in the root's problem (#3702)
+range, since every requirer's range takes part in the root's problem
 
 ## rec ReleaseNeeds
 

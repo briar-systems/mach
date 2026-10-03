@@ -31,7 +31,7 @@ pub fun dit_mode_guaranteed(tgt: *Target) bool;
 ```
 
 whether the target guarantees the data-independent-timing mode a DIT_MODE
-row needs: the os declares it per instruction set (#3508)
+row needs: the os declares it per instruction set
 
 ## fun ct_mul_admitted
 
@@ -51,7 +51,7 @@ pub fun ct_mul_dit_cells(tgt: *Target) ct.CtMulMask;
 the cells the instruction set declares only under PSTATE.DIT, whether or not
 the os guarantees the mode: a secret multiply in one of them is what makes a
 program need DIT at start, and what the refusal names when the os declares
-nothing (#3508)
+nothing
 
 ## fun backend_target
 

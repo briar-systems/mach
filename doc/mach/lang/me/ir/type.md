@@ -93,7 +93,7 @@ pub val IRT_RECREF: IrTypeKind = 11
 a record named by its key rather than by its fields: the pointee of a pointer member
 that closes a cycle of records through pointers, on a target that keeps pointee types.
 it is never an object type of its own, and the record it names is the struct whose
-`key` is the same (#4307)
+`key` is the same
 
 ## val REC_KEY_NONE
 
@@ -111,7 +111,7 @@ pub def IntExt: u8
 
 the extension a caller owes an integer argument narrower than 64 bits where
 its platform asks the caller for one: the declared signedness the signless
-integer type does not carry, as LLVM's zeroext and signext (#3927)
+integer type does not carry, as LLVM's zeroext and signext
 
 ## val EXT_NONE
 
@@ -467,7 +467,7 @@ pub fun natural_align_for_machine(t: *IrTypeTable, id: IrTypeId, machine: layout
 the alignment an aggregate's members give it, before its own #[align] raises
 it: a member's alignment counts whole, #[align] included, and a packed
 aggregate's members are aligned to 1. anything else has its own alignment.
-AAPCS64 places a composite argument by this one (#3929)
+AAPCS64 places a composite argument by this one
 
 ## fun byte_offset_for_machine
 

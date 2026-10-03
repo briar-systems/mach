@@ -31,7 +31,7 @@ pub rec ModuleSema;
 ```
 
 exports are append-only, and `index` maps (origin, canon) to the first export with
-that key over the first `indexed` of them (#3472)
+that key over the first `indexed` of them
 
 ## fun module_sema_init
 
@@ -131,7 +131,7 @@ pub rec SemaDeps;
 ```
 
 the imported surfaces are borrowed: the driver owns each one and shares it
-between every importer in a pass (#3472)
+between every importer in a pass
 
 ## fwd type.FieldEntry
 
@@ -266,7 +266,7 @@ pub rec SemaContext;
 pub fun report_deferred_name(sc: *SemaContext, k: diagnostic_kind.Kind, span: token.Span, prefix: str);
 ```
 
-a name resolve left for the arm sema selects (#3485), reported once at the name itself
+a name resolve left for the arm sema selects, reported once at the name itself
 whichever instantiation walks it, and never for an arm sema discards
 
 ## fun report_deferred_type
@@ -544,7 +544,7 @@ pub fun record_eval_result(sc: *SemaContext, r: res[comptime.CTValue, comptime.E
 pub fun attr_string_arg(sc: *SemaContext, dec: *ast_decl.Decorator, ord: u32, kind: diagnostic_kind.Kind, kind_msg: str) opt[str];
 ```
 
-the string argument `ord` of an attribute evaluates to (#4022). one that is
+the string argument `ord` of an attribute evaluates to. one that is
 not a constant expression is refused with `decorator.not_constant`, naming
 the attribute, and a constant that is no string with `kind` and `kind_msg`
 

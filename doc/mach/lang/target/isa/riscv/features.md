@@ -64,7 +64,7 @@ pub val ZICOND: u64 = 512
 ```
 
 the integer conditional operations czero.eqz and czero.nez, the branch-free
-select (#3346)
+select
 
 ## val ZFHMIN
 
@@ -72,7 +72,7 @@ select (#3346)
 pub val ZFHMIN:    u64 = 1024
 ```
 
-the half-precision float extensions (#3801): Zfhmin moves, loads, stores and
+the half-precision float extensions: Zfhmin moves, loads, stores and
 converts binary16 in the f registers, and Zfh, which brings it, adds the
 arithmetic, comparison and integer conversions. both need F
 

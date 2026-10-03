@@ -316,7 +316,7 @@ the full product of two integer vectors of one lane type, in lanes twice as
 wide: the fused form of a lane-wise extension of both operands followed by a
 multiply, formed only where the target packs it. an optional third operand,
 the constant 0 or n, takes the product of the low or high half of two
-2n-lane operands instead, as the lane-halving extension does (#3589)
+2n-lane operands instead, as the lane-halving extension does
 
 ## val OP_MUL_WIDE_U
 
@@ -331,9 +331,9 @@ pub val OP_MUL_HIGH_S: InstrKind = 52
 ```
 
 the high half of the full product of two integers at their own width
-(#3511), or of each pair of lanes of two integer vectors at their own lane
+, or of each pair of lanes of two integer vectors at their own lane
 width. type legalization forms the vector form where the target realizes a
-widening multiply half as the low and the high product interleaved (#4119)
+widening multiply half as the low and the high product interleaved
 
 ## val OP_MUL_HIGH_U
 
@@ -350,7 +350,7 @@ pub val OP_VEC_WIDEN_S: InstrKind = 54
 half the lanes of an integer vector, each extended to twice its width: a
 half range `v[0, n]` (operand 1 is 0) or `v[n, n]` (operand 1 is the result
 lane count) converted by `::` to lanes twice as wide, formed only where the
-target packs it (#3738, #3779)
+target packs it
 
 ## val OP_VEC_WIDEN_U
 
@@ -367,7 +367,7 @@ pub val OP_VEC_RANGE: InstrKind = 56
 the lanes `start` to `start + n - 1` of a vector (operand 1 is the constant
 `start`, the result has the `n` lanes), of the same lane type: a vector range
 `v[start, n]` other than a widened half, formed only where the target packs
-it (#3864)
+it
 
 ## val OP_MASK_LT_U
 
@@ -377,7 +377,7 @@ pub val OP_MASK_LT_U: InstrKind = 57
 
 all ones at the result's width when operand 0 is below operand 1, unsigned,
 else zero: the branch-free range test a shift by an unproven count is
-saturated with (#3887). both operands share one integer type, the result is
+saturated with. both operands share one integer type, the result is
 an integer of any width
 
 ## val OP_VEC_CONCAT
@@ -387,7 +387,7 @@ pub val OP_VEC_CONCAT: InstrKind = 58
 ```
 
 the lanes of each operand in turn, in one vector of their summed count: every
-operand a vector of the result's lane type (#3589). type legalization joins a
+operand a vector of the result's lane type. type legalization joins a
 vector wider than the register back from its register-width pieces with it,
 and gathers the parts of a narrowing conversion over those pieces
 
@@ -398,7 +398,7 @@ pub val OP_SELECT: InstrKind = 59
 ```
 
 operand 1 when operand 0 is nonzero, else operand 2: the branch-free choice
-if-conversion flattens a small diamond into (#3346). operand 0 is an i8
+if-conversion flattens a small diamond into. operand 0 is an i8
 condition, both choices and the result share one scalar integer or pointer
 type, and every target lowers it without a branch, so a secret condition
 stays constant-time
@@ -411,9 +411,9 @@ pub val OP_CONST: InstrKind = 60
 
 its one operand, an integer or float constant, as a value of its own: the
 materialization of a constant a loop reads, placed ahead of the loop so the
-loop reads a register rather than rebuilding the constant (#3807), or the
+loop reads a register rather than rebuilding the constant, or the
 zero integer vector type legalization materializes once for the halves of
-zero extensions to share (#4198). every pass that reads a constant reads
+zero extensions to share. every pass that reads a constant reads
 through it with `ir.constant_behind`
 
 ## val OP_VEC_INTERLEAVE
@@ -428,7 +428,7 @@ operand 0's lane in its low half. an optional third operand, the constant 0
 or n, joins the low or high half of two 2n-lane operands instead, as the
 widening multiply does. type legalization forms it where the target realizes
 a widening multiply half as the low and the high product interleaved, so the
-two halves of one product share the pair (#4119)
+two halves of one product share the pair
 
 ## val OP_VEC_WIDEN_SUM_U
 
@@ -440,7 +440,7 @@ each result lane the sum of the operand lanes it covers, zero-extended: an
 integer vector of n lanes into n * w / W lanes of the wider width W, lane r
 summing operand lanes r * W / w up to the next result lane's first. formed
 only where the target packs it, the per-block fold of a count accumulated in
-narrow lanes (#4161)
+narrow lanes
 
 ## val OP_VEC_SIGN_MASK
 
@@ -451,7 +451,7 @@ pub val OP_VEC_SIGN_MASK: InstrKind = 63
 each lane of an integer vector all ones when it is negative, else zero, in
 the operand's own type: the high half a signed lane-halving extension
 interleaves its lanes with. formed only where the target packs it, by type
-legalization, so both halves of one extension share it (#4198)
+legalization, so both halves of one extension share it
 
 ## val INSTR_FLAG_NSW
 
@@ -483,7 +483,7 @@ pub val INSTR_FLAG_VOLATILE: u16 = 0x08
 pub val INSTR_FLAG_BORROWED_ARGS: u16 = 0x10
 ```
 
-a call whose aggregate arguments may name their sources rather than private copies (#3460)
+a call whose aggregate arguments may name their sources rather than private copies
 
 ## val INSTR_FLAG_COUNT_BOUNDED
 
@@ -492,8 +492,8 @@ pub val INSTR_FLAG_COUNT_BOUNDED: u16 = 0x20
 ```
 
 a scalar shift whose count is below its operand's width: proven by the range
-analysis, or made so by the saturation shiftbound expands around it (#3885,
-#3887). lowering emits the bare machine shift for it and refuses a variable
+analysis, or made so by the saturation shiftbound expands around it.
+lowering emits the bare machine shift for it and refuses a variable
 count without it
 
 ## val INSTR_FLAG_TAIL
@@ -503,7 +503,7 @@ pub val INSTR_FLAG_TAIL: u16 = 0x40
 ```
 
 a call in tail position of a function whose frame nothing outlives, set by
-the last pass of the release pipeline (#3417). the backend makes it a jump
+the last pass of the release pipeline. the backend makes it a jump
 where the calling convention lets the callee take over the frame
 
 ## rec Instruction

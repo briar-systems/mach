@@ -15,7 +15,7 @@ integer's range converts as the target's own lane conversion does with an
 out-of-range operand, the same contract as every `::` into an integer. a
 signed conversion is the unsigned one on the magnitude with the sign
 restored. the helpers cover a two-lane width, the widest any target here
-realizes (#3511)
+realizes
 
 ## fun run
 

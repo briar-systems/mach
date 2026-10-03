@@ -462,7 +462,7 @@ pub fun constant_behind(fn: *Function, v: value.Value) value.Value;
 ```
 
 the constant a value is: the operand of the `const` that materializes it
-(#3807), read at the use's type and secrecy, and any other value as itself.
+, read at the use's type and secrecy, and any other value as itself.
 a pass that reads constants reads through this, so a materialized constant
 folds and compares as the constant it holds
 
