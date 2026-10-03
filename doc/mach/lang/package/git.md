@@ -35,8 +35,10 @@ a checkout drops the listings.
 ## fun inspector_init
 
 ```mach
-pub fun inspector_init(alloc: *A.Allocator) res[Inspector, fail.Fail];
+pub fun inspector_init(alloc: *A.Allocator, environ: **u8) res[Inspector, fail.Fail];
 ```
+
+an inspector whose git processes inherit `environ`, a session's environment
 
 ## fun inspector_dnit
 
@@ -104,11 +106,21 @@ git_dir: str, git_prefix: str, rel: str) res[str, fail.Fail];
 
 the committed mode of `<prefix><rel>` at HEAD, or "" when HEAD has no such entry
 
+## fun inspector_pending
+
+```mach
+pub fun inspector_pending(environ: **u8) Inspector;
+```
+
+an inspector that resolves git on first use, its processes inheriting `environ`
+
 ## fun inspector_require
 
 ```mach
 pub fun inspector_require(alloc: *A.Allocator, gi: *Inspector) err[fail.Fail];
 ```
+
+start a pending inspector; one already started is left as it is
 
 ## fun query_named
 

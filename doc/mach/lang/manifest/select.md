@@ -92,32 +92,17 @@ target: the `-t` pattern, or empty
 profile: the `-p` pattern, or empty
 ret: the selectors; err when a vector cannot grow
 
-## fun cell_label
+## fun single_selection_fail
 
 ```mach
-pub fun cell_label(alloc: *A.Allocator, c: *Cell) str;
-```
-
-the cell as a person names it: `<artifact> on <target> (<profile>)`
-
-## fun cell_labels
-
-```mach
-pub fun cell_labels(alloc: *A.Allocator, cells: *Vector[Cell]) str;
-```
-
-every cell's label, comma separated, for a refusal that names the selection
-
-## fun single_selection_msg
-
-```mach
-pub fun single_selection_msg(alloc: *A.Allocator, what: str, cells: *Vector[Cell]) str;
+pub fun single_selection_fail(alloc: *A.Allocator, k: diagnostic_kind.Kind, what: str, cells: *Vector[Cell]) fail.Fail;
 ```
 
 the refusal of an option or command that needs one (artifact, target, profile)
 when the selection resolved to several, naming each
 
 alloc: owns the message
+k: the kind the refusal is reported as
 what: what needs one, such as "-o names one output"
 cells: the resolved cells
 

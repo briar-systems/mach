@@ -1,103 +1,16 @@
 # mach.lang.manifest.project
 
-## fun host_isa_name
-
-```mach
-pub fun host_isa_name() str;
-```
-
-## fun host_os_name
-
-```mach
-pub fun host_os_name() str;
-```
-
-## fun host_tuple
-
-```mach
-pub fun host_tuple(alloc: *A.Allocator) str;
-```
-
-the host as `mach info` names it, by `tuple_of`
-
-alloc: owns the returned string
-ret: the formatted tuple
-
-## fun tuple_of
-
-```mach
-pub fun tuple_of(alloc: *A.Allocator, os_name: str, isa_name: str) str;
-```
-
-the one spelling of an (os, isa) pair, "<os>-<isa>", e.g. "linux-x86_64"
-
-alloc: owns the returned string
-os_name: the os name
-isa_name: the isa name
-ret: the formatted tuple
-
 ## fun parse_project
 
 ```mach
 pub fun parse_project(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
 ```
 
-## fun parse_targets
+## fun expand_project_out
 
 ```mach
-pub fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
+pub fun expand_project_out(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, v: *template.Values) res[str, fail.Fail];
 ```
 
-## fun duplicate_profiles
-
-```mach
-pub fun duplicate_profiles(alloc: *A.Allocator, m: *Manifest, message: str) fail.Fail;
-```
-
-a refusal of more than one `default = true` profile, pointing at the first
-`default` value and naming the others as related
-
-## fun parse_profiles
-
-```mach
-pub fun parse_profiles(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
-```
-
-the `[profile.*]` tables; the schema check admits no manifest without one
-
-## fun find_target_by_name
-
-```mach
-pub fun find_target_by_name(itn: *intern.Interner, m: *Manifest, name: str) *TargetDef;
-```
-
-## fun target_matches_host
-
-```mach
-pub fun target_matches_host(itn: *intern.Interner, d: *TargetDef, host_os: u32, host_arch: u32) bool;
-```
-
-whether a target's `os` and `isa` name the given host ids. the abi is not compared
-
-itn: resolves the target's strings
-d: the target
-host_os: an os id from `mach.lang.target.os`
-host_arch: an arch id from `mach.lang.target.isa`
-ret: true when both ids match; false when either string is unknown to `itn`
-
-## fun target_is_hosted
-
-```mach
-pub fun target_is_hosted(itn: *intern.Interner, d: *TargetDef) bool;
-```
-
-whether `native` could ever name the target: its os is one a build host runs. a
-target of any other os (freestanding, or a finished-module target such as spirv)
-is only ever selected by name
-
-## fun make_native_target
-
-```mach
-pub fun make_native_target(alloc: *A.Allocator, itn: *intern.Interner) res[*TargetDef, fail.Fail];
-```
+expand `m`'s `[project].out` with `v`; a refusal points at the `out` value
 

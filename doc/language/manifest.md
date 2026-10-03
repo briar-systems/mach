@@ -1975,13 +1975,17 @@ and local link `path`s are **not** auto-rooted: they name `{project.out}`
 explicitly, which is what homes a dependency's build products into the *consumer's*
 output tree rather than the dependency's checkout.
 
-There are no `{name}`/`{ext}` or bare `{target}`/`{profile}` aliases. An
-unresolvable `{...}` reference, or an unterminated `{`, is refused when the
-template is expanded for a build cell.
+There are no `{name}`/`{ext}` or bare `{target}`/`{profile}` aliases. Where a
+template is written decides what it may name, and every template is checked when
+the manifest is read, the root's and each dependency's alike: an unknown `{...}`
+reference, an unterminated `{`, or a variable its place does not admit is
+refused there, pointing at the template.
 `{project.out}` is not available inside `[project].out` itself (it would be
 self-referential), and `{artifact.<id>.out}` is not available inside an artifact's
 own `out` for the same reason. `{artifact.suffix}` is available nowhere but an
-artifact's own `out`. Two artifacts selected for one target that resolve to the
+artifact's own `out`. In a step's `argv` and `env` values a brace group outside
+the `project`, `target`, `profile` and `artifact` namespaces is text, so
+`{"x":1}` passes through as written. Two artifacts selected for one target that resolve to the
 same `out` path collide and fail at build start.
 
 ## Artifact requirements
@@ -2039,7 +2043,9 @@ These are errors:
 - a name or glob matching no declaration in its named category;
 - an explicit self-requirement, or a glob matching only the declaring item;
 - an artifact requirement in a step's `need` list;
-- artifact cycles and step cycles, including cycles formed by globs.
+- artifact cycles and step cycles, including cycles formed by globs. A cycle is
+  refused at its first `need` entry with the others named as related, and the
+  message spells the chain, as in `'need' cycle: step.a -> step.b -> step.a`.
 
 Globs exclude the declaring item. Matching declarations retain manifest order,
 and transitive prerequisites run before their consumers. Both root and dependency

@@ -207,3 +207,124 @@ pub fun shape_text(shape: Shape) str;
 
 what a value of `shape` is, as a refusal names it
 
+## fun key_text
+
+```mach
+pub fun key_text(t: *toml.Table, key: str) str;
+```
+
+a string key as the manifest reads it: absent and empty are the same err
+(`is missing required key`), so both read as the empty string
+
+## fun flag
+
+```mach
+pub fun flag(t: *toml.Table, key: str) bool;
+```
+
+a boolean key's value, false when it is not written; the schema check has
+refused any other shape
+
+## fun written_value
+
+```mach
+pub fun written_value(t: *toml.Table, key: str) *toml.Value;
+```
+
+the value of a key the schema check has seen written with its row's shape, nil
+when it is not written
+
+## fun key_span
+
+```mach
+pub fun key_span(tab: *toml.Table, i: usize) toml.Span;
+```
+
+the key token of a table's entry `i` as written; the zero span when absent
+
+## fun element_span
+
+```mach
+pub fun element_span(arr: *toml.Array, i: usize) toml.Span;
+```
+
+the literal of an array's element `i`; the zero span when absent
+
+## fun value_span
+
+```mach
+pub fun value_span(tab: *toml.Table, key: str) toml.Span;
+```
+
+the literal of the value `key` names in a table; the zero span when absent
+
+## fun value_text
+
+```mach
+pub fun value_text(alloc: *A.Allocator, v: *toml.Value) res[str, fail.Fail];
+```
+
+a scalar value as a refusal quotes it; a refused allocation is the failure
+
+## fun is_valid_id
+
+```mach
+pub fun is_valid_id(s: str) bool;
+```
+
+whether `s` is a portable identifier: non-empty, only ASCII letters, digits,
+'_' and '-'. the rule for project, target, artifact, profile, dependency,
+link and step names
+
+s: the candidate
+ret: true when every byte is allowed
+
+## fun is_project_path
+
+```mach
+pub fun is_project_path(value: str) bool;
+```
+
+whether `value` is a canonical strict descendant of the project root: non-empty,
+'/'-separated, no '\', not absolute, no drive letter, no empty component, no
+'.' or '..' component
+
+value: the candidate path
+ret: true when every rule holds
+
+## fun check_path
+
+```mach
+pub fun check_path(alloc: *A.Allocator, value: str, field: str, sp: toml.Span) err[fail.Fail];
+```
+
+refuse a path that `is_project_path` does not admit, naming it as `field`
+and pointing at `sp`, the value as written
+
+## rec StrArr
+
+```mach
+pub rec StrArr;
+```
+
+a decoded array of strings, each interned
+
+items: the ids, nil when the array is absent or empty
+count: how many
+present: the key is written
+
+## fun ids_of
+
+```mach
+pub fun ids_of(alloc: *A.Allocator, itn: *intern.Interner, arr: *toml.Array, label: str, key: str) res[StrArr, fail.Fail];
+```
+
+intern every element of an array of strings the schema check has admitted
+
+alloc: owns the id array, freed with `model.free_strarr`
+itn: receives the strings
+arr: the array, nil when the key is absent
+label: the table, as a refusal names it
+key: the key the array is written under
+ret: the ids; err for an array too long to count, or a refused allocation
+
