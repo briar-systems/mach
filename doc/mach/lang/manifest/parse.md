@@ -94,50 +94,23 @@ label: str, key: str, allow_scalar: bool) res[StrArr, fail.Fail];
 pub fun opt_value_text(alloc: *A.Allocator, v: *toml.Value) str;
 ```
 
-## fun parse_default_flag
+## fun flag
 
 ```mach
-pub fun parse_default_flag(alloc: *A.Allocator, table: str, name: str, sub: *toml.Table) res[bool, fail.Fail];
+pub fun flag(t: *toml.Table, key: str) bool;
 ```
 
-## rec DefaultTables
+a boolean key's value, false when it is not written; the schema check has
+refused any other shape
+
+## fun written_value
 
 ```mach
-pub rec DefaultTables;
+pub fun written_value(t: *toml.Table, key: str) *toml.Value;
 ```
 
-## fun default_tables_init
-
-```mach
-pub fun default_tables_init() DefaultTables;
-```
-
-## fun default_tables_note
-
-```mach
-pub fun default_tables_note(alloc: *A.Allocator, d: *DefaultTables, label: str);
-```
-
-## fun default_tables_dnit
-
-```mach
-pub fun default_tables_dnit(alloc: *A.Allocator, d: *DefaultTables);
-```
-
-## fun duplicate_default_err
-
-```mach
-pub fun duplicate_default_err(alloc: *A.Allocator, kind: str, d: *DefaultTables) str;
-```
-
-## fun check_keys
-
-```mach
-pub fun check_keys(alloc: *A.Allocator, tab: *toml.Table, label: str, known: fun(str) bool) err[fail.Fail];
-```
-
-refuse the first key of a table that its section's `known` predicate does
-not admit, pointing at the key as written
+the value of a key the schema check has seen written with its row's shape, nil
+when it is not written
 
 ## fun key_span
 
@@ -154,15 +127,6 @@ pub fun value_span(tab: *toml.Table, key: str) toml.Span;
 ```
 
 the literal of the value `key` names in a table; the zero span when absent
-
-## fun required_span
-
-```mach
-pub fun required_span(tab: *toml.Table, key: str, where: toml.Span) toml.Span;
-```
-
-a required key's value when it is written, otherwise its table (`where`, the
-table's own span): where a refusal of a required key points
 
 ## fun is_project_path
 
