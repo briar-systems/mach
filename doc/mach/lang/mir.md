@@ -1118,7 +1118,8 @@ pub rec VRegId;
 
 register identities are records, not `def` aliases: a vreg number cannot be
 handed where a physical register is meant, and neither indexes a table
-without naming the unwrap. a PRegId carries the class-tagged isa regid.
+without naming the unwrap. a PRegId carries the class-tagged isa regid, whose
+0 is no register
 
 ## rec PRegId
 

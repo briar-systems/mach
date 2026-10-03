@@ -24,15 +24,6 @@ pub rec BackendTarget;
 pub rec AssemblyCapabilities;
 ```
 
-## val REG_NONE
-
-```mach
-pub val REG_NONE: i32 = -1
-```
-
-no register: the place a register fact holds when the instruction set has
-none for it
-
 ## def FixedPlace
 
 ```mach

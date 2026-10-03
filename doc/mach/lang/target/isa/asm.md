@@ -264,11 +264,7 @@ pub fun op_none() Operand;
 pub fun op_reg(reg: i32, size: u8) Operand;
 ```
 
-## fun op_vreg
-
-```mach
-pub fun op_vreg(reg: i32, size: u8) Operand;
-```
+a register operand naming register id `reg`, in the bank of its class
 
 ## fun is_vreg
 
