@@ -1,0 +1,680 @@
+# the one template engine: every path and value template of a manifest, and
+# every `#[embed]` path, expands through it. a template is text in which a
+# `{name}` group names a variable. which variables a template may name is
+# decided by where it is written, its context; the variables are rows of one
+# table, each naming the contexts that admit it. the engine walks a template
+# twice, once to size the result and refuse what the context does not admit,
+# once to write it, and the load-time check is the first walk without values
+use mach.lang.fail;
+use std.text.string.str_dup_range;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_region_equals;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.intern;
+
+use mach.lang.manifest.model.TargetDef;
+use mach.lang.manifest.model.text_of;
+use mach.lang.manifest.refusal.refuse;
+use mach.lang.manifest.schema.is_project_path;
+
+# where a template is written, which decides the variables it may name
+pub def Context: u8;
+
+# `[project].out`
+pub val CONTEXT_PROJECT_OUT: Context = 0;
+# an artifact's own `out`
+pub val CONTEXT_ARTIFACT_OUT: Context = 1;
+# a step's `in` and `out` entries and a local link's `path`
+pub val CONTEXT_PATH: Context = 2;
+# a step's `argv` and `env` values
+pub val CONTEXT_STEP_VALUE: Context = 3;
+# an `#[embed]` path
+pub val CONTEXT_EMBED: Context = 4;
+
+# how a context reads its templates
+# ---
+# where:    the place a refusal names
+# lead:     what every refusal from the context starts with
+# verbatim: a brace group outside the reserved namespaces is text, copied as
+#           written, rather than a variable
+rec ContextRow {
+    where:    str;
+    lead:     str;
+    verbatim: bool;
+}
+
+val CONTEXTS: [5]ContextRow = [5]ContextRow{
+    ContextRow{where: "[project].out", lead: "mach.toml: ", verbatim: false},
+    ContextRow{where: "an artifact's own out", lead: "mach.toml: ", verbatim: false},
+    ContextRow{where: "a path", lead: "mach.toml: ", verbatim: false},
+    ContextRow{where: "a build step value", lead: "mach.toml: ", verbatim: true},
+    ContextRow{where: "an `embed` path", lead: "", verbatim: false},
+};
+
+# the value a variable reads
+def Field: u8;
+val FIELD_PROJECT_OUT:     Field = 0;
+val FIELD_TARGET_NAME:     Field = 1;
+val FIELD_TARGET_ISA:      Field = 2;
+val FIELD_TARGET_OS:       Field = 3;
+val FIELD_TARGET_ABI:      Field = 4;
+val FIELD_PROFILE_NAME:    Field = 5;
+val FIELD_ARTIFACT_SUFFIX: Field = 6;
+val FIELD_ARTIFACT_OUT:    Field = 7;
+
+val IN_PROJECT_OUT:  u8 = 1;
+val IN_ARTIFACT_OUT: u8 = 2;
+val IN_PATH:         u8 = 4;
+val IN_STEP_VALUE:   u8 = 8;
+val IN_EMBED:        u8 = 16;
+# every context that knows its target and profile
+val IN_CELL: u8 = IN_PROJECT_OUT | IN_ARTIFACT_OUT | IN_PATH | IN_STEP_VALUE;
+
+# one template variable
+# ---
+# name:     as written between the braces; the `artifact.<id>.out` row is a
+#           pattern over every artifact id
+# field:    the value it reads
+# contexts: the contexts that admit it, one bit per context
+# note:     added to the refusal of the variable where it is not admitted
+rec Variable {
+    name:     str;
+    field:    Field;
+    contexts: u8;
+    note:     str;
+}
+
+val VARIABLE_COUNT: usize       = 8;
+val VARIABLES:      [8]Variable = [8]Variable{
+    Variable{name: "project.out", field: FIELD_PROJECT_OUT, contexts: IN_ARTIFACT_OUT | IN_PATH | IN_STEP_VALUE, note: ""},
+    Variable{name: "target.name", field: FIELD_TARGET_NAME, contexts: IN_CELL, note: ""},
+    Variable{name: "target.isa", field: FIELD_TARGET_ISA, contexts: IN_CELL, note: ""},
+    Variable{name: "target.os", field: FIELD_TARGET_OS, contexts: IN_CELL, note: ""},
+    Variable{name: "target.abi", field: FIELD_TARGET_ABI, contexts: IN_CELL, note: ""},
+    Variable{name: "profile.name", field: FIELD_PROFILE_NAME, contexts: IN_CELL, note: ""},
+    Variable{name: "artifact.suffix", field: FIELD_ARTIFACT_SUFFIX, contexts: IN_ARTIFACT_OUT, note: "it is available only in an artifact's own out"},
+    Variable{name: "artifact.<id>.out", field: FIELD_ARTIFACT_OUT, contexts: IN_PATH | IN_STEP_VALUE | IN_EMBED, note: ""},
+};
+
+# the namespaces a step value may not use for its own text
+val RESERVED_COUNT: usize  = 4;
+val RESERVED:       [4]str = [4]str{"project", "target", "profile", "artifact"};
+
+val ARTIFACT_PREFIX: str = "artifact.";
+val ARTIFACT_SUFFIX: str = ".out";
+
+# one artifact a template may name as `{artifact.<id>.out}`
+# ---
+# name: the required artifact's name
+# out:  its final output path when it builds for exactly one target here, or ""
+#       when it builds for several, which makes `{artifact.<id>.out}` ambiguous
+pub rec Requirement {
+    name: str;
+    out:  str;
+}
+
+# the artifacts the modules of one project may name as `{artifact.<id>.out}`
+# ---
+# owner:      the id of the project whose modules resolve in this scope
+# dependency: the requirements are a dependency's default library artifacts',
+#             not the requirements of the artifact being built
+# reqs:       the requirements; nil when none
+# req_count:  length of `reqs`
+pub rec Requirements {
+    owner:      intern.StrId;
+    dependency: bool;
+    reqs:       *Requirement;
+    req_count:  u32;
+}
+
+# the values a template expands with
+# ---
+# target:          `{target.name}`
+# isa:             `{target.isa}`
+# os:              `{target.os}`
+# abi:             `{target.abi}`
+# profile:         `{profile.name}`
+# format:          the target's explicit `of` override, "" when the format is derived
+# artifact_suffix: `{artifact.suffix}`, set for the artifact whose output is named
+# reqs:            the artifacts `{artifact.<id>.out}` may name; nil when none
+# req_count:       length of `reqs`
+# dependency:      the id of the dependency whose default library requirements
+#                  `reqs` are, "" for the artifact being built
+pub rec Values {
+    target:          str;
+    isa:             str;
+    os:              str;
+    abi:             str;
+    profile:         str;
+    format:          str;
+    artifact_suffix: str;
+    reqs:            *Requirement;
+    req_count:       u32;
+    dependency:      str;
+}
+
+# the values for one target and profile, with no requirements
+# ---
+# itn: resolves the target's strings
+# t:   the target
+# pn:  the profile name
+pub fun values_of(itn: *intern.Interner, t: *TargetDef, pn: str) Values {
+    var v: Values = values_empty();
+    v.target  = text_of(itn, t.name);
+    v.isa     = text_of(itn, t.isa);
+    v.os      = text_of(itn, t.os);
+    v.abi     = text_of(itn, t.abi);
+    v.profile = pn;
+    if (t.of != intern.STR_NIL) { v.format = text_of(itn, t.of); }
+    ret v;
+}
+
+# `values_of` with the requirements `{artifact.<id>.out}` may name
+pub fun values_with(itn: *intern.Interner, t: *TargetDef, pn: str, reqs: *Requirement, req_count: u32) Values {
+    var v: Values = values_of(itn, t, pn);
+    v.reqs      = reqs;
+    v.req_count = req_count;
+    ret v;
+}
+
+# the values an `#[embed]` path expands with: the requirements of one scope
+# ---
+# reqs:       the requirements
+# req_count:  length of `reqs`
+# dependency: the dependency whose default library requirements they are, "" for
+#             the artifact being built
+pub fun embed_values(reqs: *Requirement, req_count: u32, dependency: str) Values {
+    var v: Values = values_empty();
+    v.reqs       = reqs;
+    v.req_count  = req_count;
+    v.dependency = dependency;
+    ret v;
+}
+
+fun values_empty() Values {
+    ret Values{target: "", isa: "", os: "", abi: "", profile: "", format: "", artifact_suffix: nil,
+        reqs: nil, req_count: 0, dependency: ""};
+}
+
+# expand `tmpl`, written in `ctx`
+# ---
+# alloc:       owns the result and a refusal's text
+# tmpl:        the template
+# ctx:         where it is written
+# project_out: the value of `{project.out}`
+# v:           the other values
+# ret:         the expansion; err for an unterminated group, a variable the
+#              context does not admit or that does not exist, an artifact
+#              outside `v.reqs` or one whose output is ambiguous
+pub fun expand(alloc: *A.Allocator, tmpl: str, ctx: Context, project_out: str, v: *Values) res[str, fail.Fail] {
+    var total: usize          = 0;
+    val sized: err[fail.Fail] = walk(alloc, tmpl, ctx, project_out, v, nil, ?total);
+    if (sel sized.err) { ret res[str, fail.Fail].err{sized.err}; }
+    val br: res[*u8, A.Error] = A.allocate[u8](alloc, total + 1);
+    if (sel br.err) { ret res[str, fail.Fail].err{fail.refused(br.err)}; }
+    var written: usize          = 0;
+    val wrote:   err[fail.Fail] = walk(alloc, tmpl, ctx, project_out, v, br.ok, ?written);
+    if (sel wrote.err) {
+        A.deallocate[u8](alloc, br.ok, total + 1);
+        ret res[str, fail.Fail].err{wrote.err};
+    }
+    br.ok[written] = 0;
+    ret res[str, fail.Fail].ok{br.ok::str};
+}
+
+# `expand`, then require the result to be a canonical strict descendant of the
+# project root
+# ---
+# field: what the template is, for the refusal
+pub fun path_expand(alloc: *A.Allocator, tmpl: str, ctx: Context, project_out: str, v: *Values, field: str) res[str, fail.Fail] {
+    val r: res[str, fail.Fail] = expand(alloc, tmpl, ctx, project_out, v);
+    if (sel r.err) { ret r; }
+    if (!is_project_path(r.ok)) {
+        str_free(alloc, r.ok);
+        ret res[str, fail.Fail].err{refuse(alloc, diagnostic_kind.MANIFEST_PATH,
+            "mach.toml: {} expands to a path that is not a canonical strict descendant of the project root", field)};
+    }
+    ret r;
+}
+
+# refuse what `expand` would refuse in `ctx` before any value is known: an
+# unterminated group, and a variable that does not exist or that the context
+# does not admit
+pub fun check(alloc: *A.Allocator, tmpl: str, ctx: Context) err[fail.Fail] {
+    var total: usize = 0;
+    ret walk(alloc, tmpl, ctx, "", nil, nil, ?total);
+}
+
+# the id the first `{artifact.<id>.out}` group in `tmpl` names, owned by
+# `alloc`; none when the template holds no such group
+pub fun artifact_id(alloc: *A.Allocator, tmpl: str) res[opt[str], fail.Fail] {
+    val n: usize = str_len(tmpl);
+    var i: usize = 0;
+    for (i < n) {
+        if (tmpl[i] != '{') {
+            i = i + 1;
+            cnt;
+        }
+        val end: usize = group_end(tmpl, i, n);
+        if (end >= n) { brk; }
+        if (artifact_group(tmpl, i + 1, end)) {
+            val id: res[str, A.Error] = str_dup_range(alloc, tmpl, i + 1 + str_len(ARTIFACT_PREFIX),
+                end - i - 1 - str_len(ARTIFACT_PREFIX) - str_len(ARTIFACT_SUFFIX));
+            if (sel id.err) { ret res[opt[str], fail.Fail].err{fail.refused(id.err)}; }
+            ret res[opt[str], fail.Fail].ok{opt[str].some{id.ok}};
+        }
+        i = end + 1;
+    }
+    ret res[opt[str], fail.Fail].ok{opt[str].none{}};
+}
+
+# the index of the `}` closing the group opened at `open`, `n` when none does
+fun group_end(tmpl: str, open: usize, n: usize) usize {
+    var i: usize = open + 1;
+    for (i < n && tmpl[i] != '}') { i = i + 1; }
+    ret i;
+}
+
+# whether tmpl[start, end) is `artifact.<id>.out` with a non-empty id
+fun artifact_group(tmpl: str, start: usize, end: usize) bool {
+    val pl: usize = str_len(ARTIFACT_PREFIX);
+    val sl: usize = str_len(ARTIFACT_SUFFIX);
+    if (end - start <= pl + sl) { ret false; }
+    ret str_region_equals(tmpl, start, pl, ARTIFACT_PREFIX) && str_region_equals(tmpl, end - sl, sl, ARTIFACT_SUFFIX);
+}
+
+# the row naming tmpl[start, end), nil when none does
+fun variable_at(tmpl: str, start: usize, end: usize) *Variable {
+    var i: usize = 0;
+    for (i < VARIABLE_COUNT) {
+        val row: *Variable = ?VARIABLES[i];
+        if (row.field == FIELD_ARTIFACT_OUT) {
+            if (artifact_group(tmpl, start, end)) { ret row; }
+        }
+        or (end - start == str_len(row.name) && str_region_equals(tmpl, start, end - start, row.name)) { ret row; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# whether tmpl[start, end) is in a reserved namespace: the namespace itself or
+# a name under it
+fun reserved(tmpl: str, start: usize, end: usize) bool {
+    var i: usize = 0;
+    for (i < RESERVED_COUNT) {
+        val ns: str   = RESERVED[i];
+        val nl: usize = str_len(ns);
+        if (end - start >= nl && str_region_equals(tmpl, start, nl, ns) && (end - start == nl || tmpl[start + nl] == '.')) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# walk `tmpl` once: refuse what `ctx` does not admit and, given values, count
+# the expansion's bytes into `len`, writing them to `buf` when it is not nil.
+# without values the walk only checks
+fun walk(alloc: *A.Allocator, tmpl: str, ctx: Context, project_out: str, v: *Values, buf: *u8, len: *usize) err[fail.Fail] {
+    val row: *ContextRow = ?CONTEXTS[ctx::usize];
+    val n:   usize       = str_len(tmpl);
+    var i:   usize       = 0;
+    for (i < n) {
+        if (tmpl[i] != '{') {
+            val put: err[fail.Fail] = text_put(buf, len, ?tmpl[i], 1);
+            if (sel put.err) { ret put; }
+            i = i + 1;
+            cnt;
+        }
+        val end: usize = group_end(tmpl, i, n);
+        if (end >= n) {
+            if (row.verbatim && !reserved(tmpl, i + 1, n)) {
+                val put: err[fail.Fail] = text_put(buf, len, ?tmpl[i], 1);
+                if (sel put.err) { ret put; }
+                i = i + 1;
+                cnt;
+            }
+            ret err[fail.Fail].err{refuse(alloc, diagnostic_kind.TEMPLATE_UNTERMINATED, "{}unterminated '{{' in {}", row.lead, row.where)};
+        }
+        val var_: *Variable = variable_at(tmpl, i + 1, end);
+        if (var_ == nil && row.verbatim && !reserved(tmpl, i + 1, end)) {
+            val put: err[fail.Fail] = text_put(buf, len, ?tmpl[i], 1);
+            if (sel put.err) { ret put; }
+            i = i + 1;
+            cnt;
+        }
+        if (var_ == nil)                           { ret err[fail.Fail].err{group_refused(alloc, tmpl, i + 1, end, row, nil)}; }
+        if ((var_.contexts & (1::u8 << ctx)) == 0) { ret err[fail.Fail].err{group_refused(alloc, tmpl, i + 1, end, row, var_)}; }
+        if (v != nil) {
+            val value: res[str, fail.Fail] = value_of(alloc, tmpl, i + 1, end, row, var_, project_out, v);
+            if (sel value.err) { ret err[fail.Fail].err{value.err}; }
+            val put: err[fail.Fail] = text_put(buf, len, value.ok, str_len(value.ok));
+            if (sel put.err) { ret put; }
+        }
+        i = end + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# count `n` bytes at `text` into `len`, copying them to `buf` when it is not nil
+fun text_put(buf: *u8, len: *usize, text: *u8, n: usize) err[fail.Fail] {
+    if (@len > 0xffffffffffffffff::usize - n) { ret err[fail.Fail].err{fail.refused(A.Error.overflow{})}; }
+    if (buf != nil) {
+        var i: usize = 0;
+        for (i < n) {
+            buf[@len + i] = text[i];
+            i             = i + 1;
+        }
+    }
+    @len = @len + n;
+    ret err[fail.Fail].ok{};
+}
+
+# the refusal of the group tmpl[start, end): unknown when `var_` is nil, else
+# not admitted in the context
+fun group_refused(alloc: *A.Allocator, tmpl: str, start: usize, end: usize, row: *ContextRow, var_: *Variable) fail.Fail {
+    val name: res[str, A.Error] = str_dup_range(alloc, tmpl, start, end - start);
+    if (sel name.err) { ret fail.refused(name.err); }
+    fin { str_free(alloc, name.ok); }
+    if (var_ == nil) { ret refuse(alloc, diagnostic_kind.TEMPLATE_UNKNOWN_VARIABLE, "{}unknown template variable '{{{}}}'", row.lead, name.ok); }
+    if (str_empty(var_.note)) {
+        ret refuse(alloc, diagnostic_kind.TEMPLATE_UNAVAILABLE, "{}'{{{}}}' is not available in {}", row.lead, name.ok, row.where);
+    }
+    ret refuse(alloc, diagnostic_kind.TEMPLATE_UNAVAILABLE, "{}'{{{}}}' is not available in {}; {}", row.lead, name.ok, row.where, var_.note);
+}
+
+# the value of the variable `var_`, written as tmpl[start, end)
+fun value_of(alloc: *A.Allocator, tmpl: str, start: usize, end: usize, row: *ContextRow, var_: *Variable,
+    project_out: str, v: *Values) res[str, fail.Fail] {
+    val f: Field = var_.field;
+    if (f == FIELD_PROJECT_OUT)  { ret res[str, fail.Fail].ok{project_out}; }
+    if (f == FIELD_TARGET_NAME)  { ret res[str, fail.Fail].ok{v.target}; }
+    if (f == FIELD_TARGET_ISA)   { ret res[str, fail.Fail].ok{v.isa}; }
+    if (f == FIELD_TARGET_OS)    { ret res[str, fail.Fail].ok{v.os}; }
+    if (f == FIELD_TARGET_ABI)   { ret res[str, fail.Fail].ok{v.abi}; }
+    if (f == FIELD_PROFILE_NAME) { ret res[str, fail.Fail].ok{v.profile}; }
+    if (f == FIELD_ARTIFACT_SUFFIX) {
+        if (v.artifact_suffix == nil) { ret res[str, fail.Fail].err{fail.message("internal: an artifact output expanded without its artifact's suffix")}; }
+        ret res[str, fail.Fail].ok{v.artifact_suffix};
+    }
+    ret requirement_out(alloc, tmpl, start + str_len(ARTIFACT_PREFIX), end - str_len(ARTIFACT_SUFFIX), row, v);
+}
+
+# the output of the requirement named tmpl[start, end)
+fun requirement_out(alloc: *A.Allocator, tmpl: str, start: usize, end: usize, row: *ContextRow, v: *Values) res[str, fail.Fail] {
+    var i: u32 = 0;
+    for (i < v.req_count) {
+        val r: *Requirement = ?v.reqs[i];
+        if (end - start == str_len(r.name) && str_region_equals(tmpl, start, end - start, r.name)) {
+            if (str_empty(r.out)) {
+                ret res[str, fail.Fail].err{refuse(alloc, diagnostic_kind.TEMPLATE_AMBIGUOUS_ARTIFACT,
+                    "{}'{{artifact.{}.out}}' is ambiguous: artifact '{}' builds for more than one target here", row.lead, r.name, r.name)};
+            }
+            ret res[str, fail.Fail].ok{r.out};
+        }
+        i = i + 1;
+    }
+    val id: res[str, A.Error] = str_dup_range(alloc, tmpl, start, end - start);
+    if (sel id.err) { ret res[str, fail.Fail].err{fail.refused(id.err)}; }
+    fin { str_free(alloc, id.ok); }
+    if (!str_empty(v.dependency)) {
+        ret res[str, fail.Fail].err{refuse(alloc, diagnostic_kind.TEMPLATE_ARTIFACT_NOT_REQUIRED,
+            "{}'{{artifact.{}.out}}' names an artifact no default library artifact of dependency '{}' requires; add 'artifact.{}' to that artifact's 'need'",
+            row.lead, id.ok, v.dependency, id.ok)};
+    }
+    ret res[str, fail.Fail].err{refuse(alloc, diagnostic_kind.TEMPLATE_ARTIFACT_NOT_REQUIRED,
+        "{}'{{artifact.{}.out}}' names an artifact this artifact does not require; add 'artifact.{}' to its 'need'", row.lead, id.ok, id.ok)};
+}
+
+#[testing]
+pub fun t_values(target: str, isa: str, os: str, abi: str, profile: str) Values {
+    var v: Values = values_empty();
+    v.target  = target;
+    v.isa     = isa;
+    v.os      = os;
+    v.abi     = abi;
+    v.profile = profile;
+    ret v;
+}
+
+# whether `r` was refused with a message holding `needle`
+#[testing]
+fun t_refused(r: res[str, fail.Fail], needle: str) bool {
+    if (sel r.err) { ret str_contains(fail.describe(r.err), needle); }
+    ret false;
+}
+
+#[testing]
+fun t_expanded(r: res[str, fail.Fail], want: str) bool {
+    if (sel r.ok) { ret str_equals(r.ok, want); }
+    ret false;
+}
+
+test expand__an_embed_path_names_only_its_requirements {
+    var t:      T.Testing;
+    val make_r: err[A.Error] = T.make(?t);
+    if (sel make_r.err) { ret 1; }
+    fin { T.dnit(?t); }
+    val alloc: *A.Allocator = T.allocator_of(?t);
+    var items: [1]Requirement;
+    items[0].name = "shader-a";
+    items[0].out  = "out/alt/debug/lib/shader-a.a";
+    var own:  Values = embed_values(?items[0], 1, "");
+    var dep:  Values = embed_values(?items[0], 1, "shlib");
+    var none: Values = embed_values(nil, 0, "");
+    if (!t_expanded(expand(alloc, "{artifact.shader-a.out}", CONTEXT_EMBED, "", ?own), "out/alt/debug/lib/shader-a.a"))                           { ret 2; }
+    if (!t_expanded(expand(alloc, "assets/logo.png", CONTEXT_EMBED, "", ?own), "assets/logo.png"))                                                { ret 3; }
+    if (!t_refused(expand(alloc, "{target.name}/x", CONTEXT_EMBED, "", ?own), "'{target.name}' is not available in an `embed` path"))             { ret 4; }
+    if (!t_refused(expand(alloc, "{artifact.ghost.out}", CONTEXT_EMBED, "", ?own), "does not require"))                                           { ret 5; }
+    if (!t_refused(expand(alloc, "{artifact.shader-a.out}", CONTEXT_EMBED, "", ?none), "does not require"))                                       { ret 6; }
+    if (!t_refused(expand(alloc, "{artifact.ghost.out}", CONTEXT_EMBED, "", ?dep), "no default library artifact of dependency 'shlib' requires")) { ret 7; }
+    if (!t_refused(expand(alloc, "{artifact.shader-a.out", CONTEXT_EMBED, "", ?own), "unterminated"))                                             { ret 8; }
+    ret 0;
+}
+
+test artifact_id__names_the_artifact_a_template_resolves_through {
+    var t:      T.Testing;
+    val make_r: err[A.Error] = T.make(?t);
+    if (sel make_r.err) { ret 1; }
+    fin { T.dnit(?t); }
+    val alloc: *A.Allocator = T.allocator_of(?t);
+    var tmpls: [6]str       = [6]str{"{artifact.shader-a.out}", "prefix/{artifact.shader-b.out}", "assets/logo.png", "{target.name}/x", "{artifact.shader-a.out", "{artifact..out}"};
+    var wants: [6]str       = [6]str{"shader-a", "shader-b", nil, nil, nil, nil};
+    var i:     usize        = 0;
+    for (i < 6) {
+        val r: res[opt[str], fail.Fail] = artifact_id(alloc, tmpls[i]);
+        if (sel r.err) { ret 2; }
+        val id: opt[str] = r.ok;
+        if (wants[i] == nil) {
+            if (sel id.some) { ret 3; }
+        }
+        or {
+            if (sel id.none)                    { ret 4; }
+            if (!str_equals(id.some, wants[i])) { ret 5; }
+            str_free(alloc, id.some);
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test expand__each_context_admits_its_own_variables {
+    var t:      T.Testing;
+    val make_r: err[A.Error] = T.make(?t);
+    if (sel make_r.err) { ret 1; }
+    fin { T.dnit(?t); }
+    val alloc: *A.Allocator = T.allocator_of(?t);
+    var v:     Values       = t_values("linux", "x86_64", "linux", "sysv64", "release");
+    v.artifact_suffix = ".exe";
+    if (!t_expanded(expand(alloc, "{project.out}/obj/x.o", CONTEXT_PATH, "out/linux/release", ?v), "out/linux/release/obj/x.o"))                      { ret 2; }
+    if (!t_expanded(expand(alloc, "{target.isa}-{target.os}-{target.abi}", CONTEXT_PATH, "o", ?v), "x86_64-linux-sysv64"))                            { ret 3; }
+    if (!t_expanded(expand(alloc, "{project.out}/{target.name}/{profile.name}", CONTEXT_PATH, "o", ?v), "o/linux/release"))                           { ret 4; }
+    if (!t_expanded(expand(alloc, "bin/app{artifact.suffix}", CONTEXT_ARTIFACT_OUT, "o", ?v), "bin/app.exe"))                                         { ret 5; }
+    if (!t_refused(expand(alloc, "{bogus}", CONTEXT_PATH, "o", ?v), "unknown template variable '{bogus}'"))                                           { ret 6; }
+    if (!t_refused(expand(alloc, "{project.out}/x", CONTEXT_PROJECT_OUT, "", ?v), "'{project.out}' is not available in [project].out"))               { ret 7; }
+    if (!t_refused(expand(alloc, "x{artifact.suffix}", CONTEXT_PATH, "o", ?v), "available only in an artifact's own out"))                            { ret 8; }
+    if (!t_refused(expand(alloc, "{artifact.a.out}", CONTEXT_ARTIFACT_OUT, "o", ?v), "'{artifact.a.out}' is not available in an artifact's own out")) { ret 9; }
+    if (!t_refused(expand(alloc, "out/{target.name", CONTEXT_PATH, "o", ?v), "unterminated '{' in a path"))                                           { ret 10; }
+    ret 0;
+}
+
+test expand__a_step_value_keeps_braces_outside_the_reserved_namespaces {
+    var t:      T.Testing;
+    val make_r: err[A.Error] = T.make(?t);
+    if (sel make_r.err) { ret 1; }
+    fin { T.dnit(?t); }
+    val alloc: *A.Allocator = T.allocator_of(?t);
+    var v:     Values       = t_values("linux", "x86_64", "linux", "sysv64", "release");
+    val out:   str          = "out/linux/release";
+    if (!t_expanded(expand(alloc, "{\"x\":1}", CONTEXT_STEP_VALUE, out, ?v), "{\"x\":1}"))                                                                        { ret 2; }
+    if (!t_expanded(expand(alloc, "pre{target.name}{\"profile\":\"{profile.name}\"}post", CONTEXT_STEP_VALUE, out, ?v), "prelinux{\"profile\":\"release\"}post")) { ret 3; }
+    if (!t_expanded(expand(alloc, "json={\"x\":1};out={project.out};literal={name};open={;close=}", CONTEXT_STEP_VALUE, out, ?v),
+        "json={\"x\":1};out=out/linux/release;literal={name};open={;close=}")) { ret 4; }
+    if (!t_refused(expand(alloc, "{target.nam}", CONTEXT_STEP_VALUE, out, ?v), "unknown template variable '{target.nam}'")) { ret 5; }
+    if (!t_refused(expand(alloc, "{profile.name", CONTEXT_STEP_VALUE, out, ?v), "unterminated '{' in a build step value"))  { ret 6; }
+    if (!t_refused(expand(alloc, "{project}", CONTEXT_STEP_VALUE, out, ?v), "unknown template variable"))                   { ret 7; }
+    if (!t_refused(expand(alloc, "{target.name.extra}", CONTEXT_STEP_VALUE, out, ?v), "unknown template variable"))         { ret 8; }
+    ret 0;
+}
+
+# the load-time check refuses exactly what an expansion in the same context
+# would, before any value is known
+test check__refuses_what_the_context_does_not_admit {
+    var t:      T.Testing;
+    val make_r: err[A.Error] = T.make(?t);
+    if (sel make_r.err) { ret 1; }
+    fin { T.dnit(?t); }
+    val alloc:    *A.Allocator   = T.allocator_of(?t);
+    val admitted: err[fail.Fail] = check(alloc, "{project.out}/{artifact.gen.out}/{target.name}", CONTEXT_PATH);
+    if (sel admitted.err) { ret 2; }
+    val own_out: err[fail.Fail] = check(alloc, "bin/{artifact.gen.out}", CONTEXT_ARTIFACT_OUT);
+    if (sel own_out.ok)                                                                         { ret 3; }
+    if (fail.kind_of(own_out.err) != diagnostic_kind.TEMPLATE_UNAVAILABLE)                      { ret 4; }
+    if (!str_contains(fail.describe(own_out.err), "is not available in an artifact's own out")) { ret 5; }
+    val unknown: err[fail.Fail] = check(alloc, "out/{nope}", CONTEXT_PROJECT_OUT);
+    if (sel unknown.ok)                                                         { ret 6; }
+    if (fail.kind_of(unknown.err) != diagnostic_kind.TEMPLATE_UNKNOWN_VARIABLE) { ret 6; }
+    val open: err[fail.Fail] = check(alloc, "out/{target.name", CONTEXT_PROJECT_OUT);
+    if (sel open.ok)                                                     { ret 7; }
+    if (fail.kind_of(open.err) != diagnostic_kind.TEMPLATE_UNTERMINATED) { ret 7; }
+    ret 0;
+}
+
+test path_expand__rejects_unsafe_substitutions {
+    var t:      T.Testing;
+    val make_r: err[A.Error] = T.make(?t);
+    if (sel make_r.err) { ret 1; }
+    fin { T.dnit(?t); }
+    val alloc: *A.Allocator = T.allocator_of(?t);
+    var v:     Values       = t_values("linux", "x86_64", "linux", "sysv64", "release");
+    var names: [4]str       = [4]str{"/tmp", "../escape", "linux//debug", "linux/./debug"};
+    var i:     usize        = 0;
+    for (i < 4) {
+        v.target = names[i];
+        if (!t_refused(path_expand(alloc, "out/{target.name}/app", CONTEXT_PATH, "out", ?v, "test path"), "strict descendant")) { ret 2; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# an expansion allocates its result and nothing else, and every allocation
+# refused along the way, the result's or a refusal's, is that refusal
+#[testing]
+fun t_expand_owner(ctx: Context, refuse: bool) i32 {
+    var t:      T.Testing;
+    val make_r: err[A.Error] = T.make(?t);
+    if (sel make_r.err) { ret 1; }
+    fin { T.dnit(?t); }
+    val alloc: *A.Allocator = T.allocator_of(?t);
+    var reqs:  [1]Requirement;
+    reqs[0].name = "payload";
+    reqs[0].out  = "out/payload.bin";
+    var vars:   Values = embed_values(?reqs[0], 1, "");
+    val before: usize  = T.attempt_count(?t);
+    if (refuse) { T.fail_at_ordinal(?t, before + 1); }
+    val result: res[str, fail.Fail] = expand(alloc, "{artifact.payload.out}", ctx, "", ?vars);
+    if (refuse) {
+        if (sel result.ok)                                           { ret 2; }
+        if (!str_equals(fail.describe(result.err), "out of memory")) { ret 3; }
+    }
+    or {
+        if (sel result.err) { ret 4; }
+        val correct: bool  = str_equals(result.ok, reqs[0].out);
+        val live:    usize = T.live_count(?t);
+        str_free(alloc, result.ok);
+        if (!correct || live != 1) { ret 5; }
+    }
+    if (T.attempt_count(?t) != before + 1)                                        { ret 6; }
+    if (T.leaked(?t) || T.double_free_count(?t) != 0 || T.tracking_exhausted(?t)) { ret 7; }
+    ret 0;
+}
+
+test expand__owns_only_its_output_and_keeps_an_allocation_refusal {
+    var ctxs: [3]Context = [3]Context{CONTEXT_PATH, CONTEXT_STEP_VALUE, CONTEXT_EMBED};
+    var i:    usize      = 0;
+    for (i < 3) {
+        val owned: i32 = t_expand_owner(ctxs[i], false);
+        if (owned != 0) { ret owned; }
+        val refused: i32 = t_expand_owner(ctxs[i], true);
+        if (refused != 0) { ret 10 + refused; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# a refusal holds the template's own text, and releases every temporary
+# identifier it made; each allocation it makes, refused in turn, is that refusal
+test expand__refusals_release_temporary_identifiers {
+    var t:      T.Testing;
+    val make_r: err[A.Error] = T.make(?t);
+    if (sel make_r.err) { ret 1; }
+    fin { T.dnit(?t); }
+    val alloc: *A.Allocator = T.allocator_of(?t);
+    var reqs:  [1]Requirement;
+    reqs[0].name = "payload";
+    reqs[0].out  = "";
+    var vars:      Values = embed_values(?reqs[0], 1, "");
+    var templates: [3]str = [3]str{"{artifact.payload.out}", "{artifact.absent.out}", "{absent}"};
+    var i:         u32    = 0;
+    for (i < 3) {
+        val before: usize               = T.attempt_count(?t);
+        val result: res[str, fail.Fail] = expand(alloc, templates[i], CONTEXT_PATH, "", ?vars);
+        if (sel result.ok) { ret 2; }
+        val message:     str   = fail.describe(result.err);
+        val names_input: bool  = str_contains(message, templates[i]);
+        val live:        usize = T.live_count(?t);
+        str_free(alloc, message);
+        if (!names_input || live != 1 || T.leaked(?t)) { ret 3; }
+        val attempts: usize = T.attempt_count(?t) - before;
+        var ordinal:  usize = 1;
+        for (ordinal <= attempts) {
+            T.fail_at_ordinal(?t, T.attempt_count(?t) + ordinal);
+            val refused: res[str, fail.Fail] = expand(alloc, templates[i], CONTEXT_PATH, "", ?vars);
+            if (sel refused.ok) { ret 4; }
+            val reason: str = fail.describe(refused.err);
+            if (!str_equals(reason, "out of memory")) {
+                str_free(alloc, reason);
+                ret 5;
+            }
+            if (T.leaked(?t) || T.double_free_count(?t) != 0 || T.tracking_exhausted(?t)) { ret 6; }
+            ordinal = ordinal + 1;
+        }
+        T.fail_at_ordinal(?t, 0);
+        i = i + 1;
+    }
+    ret 0;
+}
