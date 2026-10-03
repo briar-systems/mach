@@ -501,15 +501,28 @@ pub fun render_bytes_text(out: *io_writer.Writer, bytes: *u8, n: usize) err[fail
     ret err[fail.Fail].ok{};
 }
 
-pub fun render_bytes_directive(buf: *ByteBuf, bytes: *u8, n: usize, start: usize) err[fail.Fail] {
-    if (!sink_active(buf)) { ret err[fail.Fail].ok{}; }
+# a raw-byte directive's note, holding the directive's first bytes for an
+# encoder that renders its listing from the notes once the function is final
+pub fun note_bytes(st: *EncodeState, bytes: *u8, n: usize, start: usize) err[fail.Fail] {
+    if (!sink_active(?st.buf)) { ret err[fail.Fail].ok{}; }
     var note: AsmNote = note_blank();
     note.kind = ASM_NOTE_BYTES;
     note.off  = start::u32;
-    val kept: err[fail.Fail] = note_push(buf, ?note);
-    if (sel kept.err)       { ret kept; }
-    if (!sink_renders(buf)) { ret err[fail.Fail].ok{}; }
-    ret render_bytes_text(buf.asm.out, bytes, n);
+    var j: usize = 0;
+    for (j < n && j < ASM_NOTE_BYTES_WIDTH) {
+        note.bytes[j] = bytes[j];
+        j             = j + 1;
+    }
+    ret note_push(?st.buf, ?note);
+}
+
+# a raw-byte directive's note, rendered at once for an encoder whose listing
+# streams as it encodes
+pub fun render_bytes_directive(st: *EncodeState, bytes: *u8, n: usize, start: usize) err[fail.Fail] {
+    val kept: err[fail.Fail] = note_bytes(st, bytes, n, start);
+    if (sel kept.err)           { ret kept; }
+    if (!sink_renders(?st.buf)) { ret err[fail.Fail].ok{}; }
+    ret render_bytes_text(st.buf.asm.out, bytes, n);
 }
 
 pub fun sink_claims(buf: *ByteBuf) u32 {
@@ -589,6 +602,22 @@ pub fun emit_u32(buf: *ByteBuf, value: u32) {
 pub fun emit_u64(buf: *ByteBuf, value: u64) {
     emit_u32(buf, (value & 0xFFFFFFFF)::u32);
     emit_u32(buf, ((value >> 32) & 0xFFFFFFFF)::u32);
+}
+
+# the little-endian 32-bit word already emitted at pos
+pub fun word_read(buf: *ByteBuf, pos: usize) u32 {
+    ret buf.data[pos]::u32 |
+        (buf.data[pos + 1]::u32 << 8) |
+        (buf.data[pos + 2]::u32 << 16) |
+        (buf.data[pos + 3]::u32 << 24);
+}
+
+# overwrites the 32-bit word at pos, little-endian
+pub fun word_write(buf: *ByteBuf, pos: usize, word: u32) {
+    buf.data[pos]     = (word & 0xFF)::u8;
+    buf.data[pos + 1] = ((word >> 8) & 0xFF)::u8;
+    buf.data[pos + 2] = ((word >> 16) & 0xFF)::u8;
+    buf.data[pos + 3] = ((word >> 24) & 0xFF)::u8;
 }
 
 # the most registers an ABI register-file callback fills, as regalloc bounds it
@@ -707,8 +736,15 @@ def EncodeFunctionFn: fun(*EncodeState, *lang_mir.MirFunction) err[fail.Fail];
 
 def PatchBranchFn: fun(*EncodeState, *BranchFixup, u32) err[fail.Fail];
 
+# one selected instruction's bytes, after instr_encode has taken the
+# instructions every encoder treats alike
+def EncodeInstrFn: fun(*EncodeState, *lang_mir.MirFunction, u32, *lang_mir.MirInstr) err[fail.Fail];
+
 pub rec EncodeHooks {
+    # the instruction set as the listing names it in a refusal
+    isa:             str;
     encode_function: EncodeFunctionFn;
+    encode_instr:    EncodeInstrFn;
     patch_branch:    PatchBranchFn;
     # declared: every emitted byte reaches the sink through one instruction notification
     stream: bool;
@@ -718,11 +754,76 @@ pub rec EncodeHooks {
 
 pub fun hooks_blank() EncodeHooks {
     var h: EncodeHooks;
+    h.isa             = "";
     h.encode_function = nil;
+    h.encode_instr    = nil;
     h.patch_branch    = nil;
     h.stream          = false;
     h.effects         = isa_effect.hooks_none();
     ret h;
+}
+
+# the register a frame slot is addressed from, as the encoder numbers its
+# stack pointer and frame pointer
+pub fun slot_base_reg(f: *lang_mir.MirFunction, sp: i32, fp: i32) i32 {
+    if (lang_mir.slots_from_sp(?f.frame)) { ret sp; }
+    ret fp;
+}
+
+# the byte ranges an encoder emits outside any one instruction, as sink_check
+# names them
+pub val REGION_PROLOGUE: u32 = 0xFFFFFFFF;
+pub val REGION_RELAX:    u32 = 0xFFFFFFFE;
+
+# every byte emitted so far reached the listing through a notification. region
+# is the opcode whose encoding is checked, or a REGION_ value
+pub fun sink_check(st: *EncodeState, isa: str, region: u32) err[fail.Fail] {
+    if (sink_unaccounted(?st.buf) == 0) { ret err[fail.Fail].ok{}; }
+    var what: str = "the prologue";
+    if (region == REGION_RELAX) { what = "branch relaxation"; }
+    or (region != REGION_PROLOGUE) {
+        val named: res[str, fail.Fail] = fail.format(st.alloc, "opcode {}", region::u64);
+        if (sel named.err) { ret err[fail.Fail].err{named.err}; }
+        what = named.ok;
+    }
+    if (st.interner == nil) {
+        ret err[fail.Fail].err{fail.message_of(fail.format(st.alloc,
+            "--emit-asm: {} emitted bytes the {} assembly printer did not render", what, isa))};
+    }
+    ret err[fail.Fail].err{fail.message_of(fail.format_intern(st.interner, st.alloc,
+        "--emit-asm: {} emitted bytes the {} assembly printer did not render", what, isa))};
+}
+
+# one MIR instruction through the encoder: its variable bindings, the
+# instructions no encoder emits bytes for, the refusal of a phi that survived
+# allocation, then the encoder's own hook, the declassify barrier and the
+# listing's accounting of what it emitted
+pub fun instr_encode(st: *EncodeState, f: *lang_mir.MirFunction, fn_base: u32, mi: *lang_mir.MirInstr,
+    hooks: *EncodeHooks) err[fail.Fail] {
+    sink_set_mir(?st.buf, mi);
+    val ei: err[fail.Fail] = instr_dispatch(st, f, fn_base, mi, hooks);
+    val eb: err[fail.Fail] = note_barrier(?st.buf, mi);
+    sink_set_mir(?st.buf, nil);
+    if (sel ei.err) { ret ei; }
+    if (sel eb.err) { ret eb; }
+    ret sink_check(st, hooks.isa, mi.opcode);
+}
+
+fun instr_dispatch(st: *EncodeState, f: *lang_mir.MirFunction, fn_base: u32, mi: *lang_mir.MirInstr,
+    hooks: *EncodeHooks) err[fail.Fail] {
+    val vb: err[fail.Fail] = emit_var_bindings(st, f, mi);
+    if (sel vb.err) { ret vb; }
+    val op: u32 = mi.opcode;
+    if (op == lang_mir.ISA_PCOPY || op == lang_mir.ISA_PCOPY_FENCE || op == lang_mir.ISA_USE || op == lang_mir.ISA_LABEL) {
+        ret err[fail.Fail].ok{};
+    }
+    if (op == lang_mir.MIR_CALL_RES || op == lang_mir.MIR_ARG) { ret err[fail.Fail].ok{}; }
+    if (op == lang_mir.MIR_PHI) {
+        if (st.interner == nil) { ret err[fail.Fail].err{fail.message("internal compiler error: phi survived register allocation")}; }
+        ret err[fail.Fail].err{fail.message_of(fail.format_intern(st.interner, st.alloc,
+            "internal compiler error: phi survived register allocation in '{}'", intern.text(st.interner, f.name)))};
+    }
+    ret hooks.encode_instr(st, f, fn_base, mi);
 }
 
 # a function's entry alignment: its own `#[align]` or the target's rule,
@@ -2080,6 +2181,46 @@ test push_cmp_varloc__homes_digest_and_close {
     if (st.varlocs != nil && st.varloc_cap > 0) { A.deallocate[mir_debug.VarLoc](?alloc, st.varlocs, st.varloc_cap::usize); }
     buf_dnit(?st.buf);
     ret code;
+}
+
+test sink_check__rejects_unrendered_bytes {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var st: EncodeState;
+    st.alloc    = ?alloc;
+    st.buf      = buf_init(?alloc);
+    st.interner = nil;
+
+    var sink: AsmSink = sink_init(nil, nil);
+    st.buf.asm = ?sink;
+
+    var bad: i32 = 0;
+
+    val clean: err[fail.Fail] = sink_check(?st, "test", REGION_PROLOGUE);
+    if (sel clean.err) { bad = 1; }
+
+    emit_u32(?st.buf, 0x13);
+    val gap: err[fail.Fail] = sink_check(?st, "test", 7);
+    if (!sel gap.err) { bad = 1; }
+
+    sink_claim(?st.buf, 0);
+    val claimed: err[fail.Fail] = sink_check(?st, "test", 7);
+    if (sel claimed.err) { bad = 1; }
+
+    emit_u32(?st.buf, 0x13);
+    emit_u32(?st.buf, 0x13);
+    sink_claim(?st.buf, 8);
+    val skipped: err[fail.Fail] = sink_check(?st, "test", REGION_RELAX);
+    if (!sel skipped.err) { bad = 1; }
+
+    st.buf.asm = nil;
+    emit_u32(?st.buf, 0x13);
+    val unlisted: err[fail.Fail] = sink_check(?st, "test", 7);
+    if (sel unlisted.err) { bad = 1; }
+
+    buf_dnit(?st.buf);
+    ret bad;
 }
 
 test sink_claim__refuses_a_claim_that_skips_bytes {

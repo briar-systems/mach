@@ -237,6 +237,15 @@ the front-end parser reports. the statement text rides in the message,
 since a body is comment-stripped and interned and no longer maps to source
 offsets of its own
 
+## def GrammarFn
+
+```mach
+pub def GrammarFn: fun() Grammar
+```
+
+the instruction set's inline-asm grammar for analysing a body apart from any
+function: what returns, clobbers, writes_sp and ct_scan read
+
 ## rec Grammar
 
 ```mach
@@ -372,19 +381,19 @@ pub fun bind_offset(c: *Cursor, lo: usize, hi: usize, off: *i64) res[bool, fail.
 ## fun clobbers
 
 ```mach
-pub fun clobbers(g: *Grammar, body: str, gp_out: *u32, fp_out: *u32);
+pub fun clobbers(grammar: GrammarFn, body: str, gp_out: *u32, fp_out: *u32);
 ```
 
 ## fun writes_sp
 
 ```mach
-pub fun writes_sp(g: *Grammar, body: str) bool;
+pub fun writes_sp(grammar: GrammarFn, body: str) bool;
 ```
 
 ## fun returns
 
 ```mach
-pub fun returns(g: *Grammar, body: str) bool;
+pub fun returns(grammar: GrammarFn, body: str) bool;
 ```
 
 ## rec Labels
@@ -444,7 +453,7 @@ predicate (the same `extension.admits`) keeps from ever firing
 ## fun ct_scan
 
 ```mach
-pub fun ct_scan(g: *Grammar, body: str, secrets: *ct.AsmSecret, n_secret: u32,
+pub fun ct_scan(grammar: GrammarFn, body: str, secrets: *ct.AsmSecret, n_secret: u32,
 mul: ct.CtMulMask, trust_shift: bool) err[ct.AsmRefusal];
 ```
 
