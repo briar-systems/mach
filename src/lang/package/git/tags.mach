@@ -1,0 +1,637 @@
+# tags: the git half of the source contract that lists releases. a release is a
+# `v`-prefixed semver tag at a url, listed with one `ls-remote` each; the manifest of a
+# release is read from a scratch bare repository after a shallow fetch of its tag. offline,
+# both come from a local repository, a realized checkout of the url, and nothing reaches
+# the network
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use fs:         std.filesystem;
+use std_format: std.format;
+use io_error:   std.io.error;
+use std.process.env;
+use std.text.string.str_dup;
+use std.text.string.str_dup_range;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.manifest;
+use manifest_version: mach.lang.manifest.version;
+use mach.lang.session;
+
+use mach.lang.package.git;
+use package_source: mach.lang.package.source;
+
+# a url's tag listing, read once per command
+rec CachedListing {
+    url:  str;
+    text: str;
+}
+
+# offline, each url's releases come from its own local repository
+rec LocalRepo {
+    url: str;
+    dir: str;
+}
+
+pub rec Remotes {
+    s:             *session.Session;
+    gi:            git.Inspector;
+    listings:      Vector[CachedListing];
+    locals:        Vector[LocalRepo];
+    offline:       bool;
+    local:         str;
+    scratch:       str;
+    scratch_ready: bool;
+}
+
+pub fun open(s: *session.Session, offline: bool, local: str) res[Remotes, fail.Fail] {
+    val gi_r: res[git.Inspector, fail.Fail] = git.inspector_init(s.build_alloc);
+    if (sel gi_r.err) { ret res[Remotes, fail.Fail].err{gi_r.err}; }
+    ret res[Remotes, fail.Fail].ok{Remotes{s: s, gi: gi_r.ok, listings: collections_vector.init[CachedListing](s.build_alloc),
+        locals: collections_vector.init[LocalRepo](s.build_alloc), offline: offline, local: local, scratch: "", scratch_ready: false}};
+}
+
+pub fun close(c: *Remotes) {
+    if (c.scratch_ready) {
+        fs.remove_all(c.s.build_alloc, c.scratch);
+        str_free(c.s.build_alloc, c.scratch);
+        c.scratch_ready = false;
+    }
+    var i: usize = 0;
+    for (i < c.listings.len) {
+        str_free(c.s.build_alloc, c.listings.data[i].url);
+        str_free(c.s.build_alloc, c.listings.data[i].text);
+        i = i + 1;
+    }
+    collections_vector.dnit[CachedListing](?c.listings);
+    i = 0;
+    for (i < c.locals.len) {
+        str_free(c.s.build_alloc, c.locals.data[i].url);
+        str_free(c.s.build_alloc, c.locals.data[i].dir);
+        i = i + 1;
+    }
+    collections_vector.dnit[LocalRepo](?c.locals);
+    git.inspector_dnit(c.s.build_alloc, ?c.gi);
+}
+
+# the local repository offline resolution reads `url`'s releases from; the first existing one
+# named wins, so a url with no checkout yet is refused by offline_dir and not by git
+pub fun remember(c: *Remotes, url: str, dir: str) err[fail.Fail] {
+    if (!str_empty(local_dir_for(c, url))) { ret err[fail.Fail].ok{}; }
+    val present: res[bool, io_error.Error] = fs.exists(dir);
+    if (!(sel present.ok && present.ok)) { ret err[fail.Fail].ok{}; }
+    val a:  *A.Allocator      = c.s.build_alloc;
+    val ur: res[str, A.Error] = str_dup_range(a, url, 0, str_len(url));
+    if (sel ur.err) { ret err[fail.Fail].err{fail.refused(ur.err)}; }
+    val dr: res[str, A.Error] = str_dup_range(a, dir, 0, str_len(dir));
+    if (sel dr.err) {
+        str_free(a, ur.ok);
+        ret err[fail.Fail].err{fail.refused(dr.err)};
+    }
+    val pushed: res[usize, A.Error] = collections_vector.push[LocalRepo](?c.locals, LocalRepo{url: ur.ok, dir: dr.ok});
+    if (sel pushed.err) {
+        str_free(a, ur.ok);
+        str_free(a, dr.ok);
+        ret err[fail.Fail].err{fail.refused(pushed.err)};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun local_dir_for(c: *Remotes, url: str) str {
+    var i: usize = 0;
+    for (i < c.locals.len) {
+        if (str_equals(c.locals.data[i].url, url)) { ret c.locals.data[i].dir; }
+        i = i + 1;
+    }
+    ret c.local;
+}
+
+fun offline_dir(c: *Remotes, url: str) res[str, fail.Fail] {
+    val dir: str = local_dir_for(c, url);
+    if (str_empty(dir)) {
+        val msg: res[str, std_format.FormatError] = std_format.sprint(c.s.build_alloc, "offline: no local checkout of {} to read its releases from; run without --offline once", url);
+        if (sel msg.err) { ret res[str, fail.Fail].err{fail.user(diagnostic_kind.DEP_OFFLINE, "offline: a dependency has no local checkout")}; }
+        ret res[str, fail.Fail].err{fail.user(diagnostic_kind.DEP_OFFLINE, msg.ok)};
+    }
+    ret res[str, fail.Fail].ok{dir};
+}
+
+fun is_hex_id(p: *u8, n: usize) bool {
+    if (n != 40 && n != 64) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        val b: u8 = p[i];
+        if (!((b >= '0' && b <= '9') || (b >= 'a' && b <= 'f'))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun release_index(out: *Vector[package_source.Release], tag: *u8, tag_len: usize) i64 {
+    var i: usize = 0;
+    for (i < out.len) {
+        val t: str = out.data[i].tag;
+        if (str_len(t) == tag_len) {
+            var k: usize = 0;
+            for (k < tag_len && t[k] == tag[k]) { k = k + 1; }
+            if (k == tag_len) { ret i::i64; }
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# one listing line, `<object id><space or tab>refs/tags/<tag>[^{}]`; a peeled line gives the
+# commit an annotated tag points at and replaces the tag object's id
+fun take_release_line(a: *A.Allocator, line: *u8, n: usize, out: *Vector[package_source.Release]) err[fail.Fail] {
+    var sp: usize = 0;
+    for (sp < n && line[sp] != ' ' && line[sp] != '\t') { sp = sp + 1; }
+    if (sp == n || !is_hex_id(line, sp)) { ret err[fail.Fail].ok{}; }
+    var ref_at: usize = sp;
+    for (ref_at < n && (line[ref_at] == ' ' || line[ref_at] == '\t')) { ref_at = ref_at + 1; }
+    val prefix: str   = "refs/tags/";
+    var k:      usize = 0;
+    for (k < 10) {
+        if (ref_at + k >= n || line[ref_at + k] != prefix[k]) { ret err[fail.Fail].ok{}; }
+        k = k + 1;
+    }
+    val tag_at:  usize = ref_at + 10;
+    var tag_len: usize = n - tag_at;
+    var peeled:  bool  = false;
+    if (tag_len > 3 && line[n - 3] == '^' && line[n - 2] == '{' && line[n - 1] == '}') {
+        tag_len = tag_len - 3;
+        peeled  = true;
+    }
+    if (tag_len < 6 || line[tag_at] != 'v') { ret err[fail.Fail].ok{}; }
+    val commit_r: res[str, A.Error] = str_dup_range(a, line::str, 0, sp);
+    if (sel commit_r.err) { ret err[fail.Fail].err{fail.refused(commit_r.err)}; }
+    val seen: i64 = release_index(out, ?line[tag_at], tag_len);
+    if (seen >= 0) {
+        if (peeled) {
+            str_free(a, out.data[seen::usize].commit);
+            out.data[seen::usize].commit = commit_r.ok;
+        }
+        or { str_free(a, commit_r.ok); }
+        ret err[fail.Fail].ok{};
+    }
+    val tag_r: res[str, A.Error] = str_dup_range(a, line::str, tag_at, tag_len);
+    if (sel tag_r.err) {
+        str_free(a, commit_r.ok);
+        ret err[fail.Fail].err{fail.refused(tag_r.err)};
+    }
+    val text_r: res[str, A.Error] = str_dup_range(a, line::str, tag_at + 1, tag_len - 1);
+    if (sel text_r.err) {
+        str_free(a, commit_r.ok);
+        str_free(a, tag_r.ok);
+        ret err[fail.Fail].err{fail.refused(text_r.err)};
+    }
+    val parsed: res[manifest_version.Version, str] = manifest_version.parse_version(text_r.ok);
+    if (sel parsed.err) {
+        str_free(a, commit_r.ok);
+        str_free(a, tag_r.ok);
+        str_free(a, text_r.ok);
+        ret err[fail.Fail].ok{};
+    }
+    if (sel parsed.ok) {
+        val pushed: res[usize, A.Error] = collections_vector.push[package_source.Release](out,
+            package_source.Release{version: parsed.ok, text: text_r.ok, tag: tag_r.ok, commit: commit_r.ok});
+        if (sel pushed.err) {
+            str_free(a, commit_r.ok);
+            str_free(a, tag_r.ok);
+            str_free(a, text_r.ok);
+            ret err[fail.Fail].err{fail.refused(pushed.err)};
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun releases(ctx: ptr, url: str, out: *Vector[package_source.Release]) err[fail.Fail] {
+    val c:      *Remotes            = ctx::*Remotes;
+    val a:      *A.Allocator        = c.s.build_alloc;
+    val listed: res[str, fail.Fail] = cached_listing(c, url);
+    if (sel listed.err) { ret err[fail.Fail].err{listed.err}; }
+    val text: str   = listed.ok;
+    val n:    usize = str_len(text);
+    var at:   usize = 0;
+    for (at < n) {
+        var end: usize = at;
+        for (end < n && text[end] != '\n') { end = end + 1; }
+        val taken: err[fail.Fail] = take_release_line(a, ?text[at], end - at, out);
+        if (sel taken.err) { ret taken; }
+        at = end + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the release of `url` whose commit is `commit`, as its version text owned by the
+# caller, or an owned "" when no release tag names that commit: a dependency's committed
+# gitlink is a commit, and resolution deals in releases
+pub fun release_of(c: *Remotes, url: str, commit: str) res[str, fail.Fail] {
+    val a:    *A.Allocator                   = c.s.build_alloc;
+    var rels: Vector[package_source.Release] = collections_vector.init[package_source.Release](a);
+    fin { package_source.releases_free(a, ?rels); }
+    val listed: err[fail.Fail] = releases((c)::ptr, url, ?rels);
+    if (sel listed.err) { ret res[str, fail.Fail].err{listed.err}; }
+    var i: usize = 0;
+    for (i < rels.len) {
+        if (str_equals(rels.data[i].commit, commit)) {
+            val text: res[str, A.Error] = str_dup_range(a, rels.data[i].text, 0, str_len(rels.data[i].text));
+            if (sel text.err) { ret res[str, fail.Fail].err{fail.refused(text.err)}; }
+            ret res[str, fail.Fail].ok{text.ok};
+        }
+        i = i + 1;
+    }
+    val none: res[str, A.Error] = str_dup(a, "");
+    if (sel none.err) { ret res[str, fail.Fail].err{fail.refused(none.err)}; }
+    ret res[str, fail.Fail].ok{none.ok};
+}
+
+# the listing stays owned by the cache
+fun cached_listing(c: *Remotes, url: str) res[str, fail.Fail] {
+    val a: *A.Allocator = c.s.build_alloc;
+    var i: usize        = 0;
+    for (i < c.listings.len) {
+        if (str_equals(c.listings.data[i].url, url)) { ret res[str, fail.Fail].ok{c.listings.data[i].text}; }
+        i = i + 1;
+    }
+    var listed: res[str, fail.Fail] = res[str, fail.Fail].err{fail.message("unset")};
+    if (c.offline) {
+        var args: [3]str;
+        args[0] = "for-each-ref";
+        args[1] = "--format=%(objectname) %(refname)%0a%(*objectname) %(refname)^{}";
+        args[2] = "refs/tags";
+        val dir: res[str, fail.Fail] = offline_dir(c, url);
+        if (sel dir.err) { ret res[str, fail.Fail].err{dir.err}; }
+        listed = git.query_raw(a, ?c.gi, dir.ok, ?args[0], 3);
+    }
+    or {
+        var args: [3]str;
+        args[0] = "ls-remote";
+        args[1] = "--tags";
+        args[2] = url;
+        listed  = git.query_raw(a, ?c.gi, ".", ?args[0], 3);
+    }
+    if (sel listed.err) { ret listed; }
+    val url_r: res[str, A.Error] = str_dup_range(a, url, 0, str_len(url));
+    if (sel url_r.err) {
+        str_free(a, listed.ok);
+        ret res[str, fail.Fail].err{fail.refused(url_r.err)};
+    }
+    val pushed: res[usize, A.Error] = collections_vector.push[CachedListing](?c.listings, CachedListing{url: url_r.ok, text: listed.ok});
+    if (sel pushed.err) {
+        str_free(a, url_r.ok);
+        str_free(a, listed.ok);
+        ret res[str, fail.Fail].err{fail.refused(pushed.err)};
+    }
+    ret listed;
+}
+
+fun ensure_scratch(c: *Remotes) err[fail.Fail] {
+    if (c.scratch_ready) { ret err[fail.Fail].ok{}; }
+    val a:    *A.Allocator                 = c.s.build_alloc;
+    val tf_r: res[fs.TempFile, fs.FsError] = fs.temp_create(a, "mach_candidates");
+    if (sel tf_r.err) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_TEMP, fail.fs_text(tf_r.err))}; }
+    var tf:    fs.TempFile       = tf_r.ok;
+    val dup_r: res[str, A.Error] = str_dup_range(a, fs.temp_path(?tf), 0, str_len(fs.temp_path(?tf)));
+    fs.temp_close_and_remove(?tf);
+    if (sel dup_r.err) { ret err[fail.Fail].err{fail.refused(dup_r.err)}; }
+    val made: err[fs.FsError] = fs.create_dir_all(a, dup_r.ok, 448);
+    if (sel made.err) {
+        str_free(a, dup_r.ok);
+        ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_WRITE, fail.fs_text(made.err))};
+    }
+    c.scratch       = dup_r.ok;
+    c.scratch_ready = true;
+    var args: [3]str;
+    args[0] = "init";
+    args[1] = "--bare";
+    args[2] = "-q";
+    val init_r: res[str, fail.Fail] = git.op(a, ?c.gi, c.scratch, ?args[0], 3, nil);
+    if (sel init_r.err) { ret err[fail.Fail].err{init_r.err}; }
+    str_free(a, init_r.ok);
+    ret err[fail.Fail].ok{};
+}
+
+fun excluded(why: str) res[package_source.Shipped, fail.Fail] {
+    var out: package_source.Shipped;
+    out.excluded = why;
+    ret res[package_source.Shipped, fail.Fail].ok{out};
+}
+
+# why a release whose manifest failed to load is no candidate, from the load's own message
+fun unloadable(a: *A.Allocator, fault: fail.Fail) str {
+    var text: str = fail.describe(fault);
+    if (str_starts_with(text, "mach.toml: ")) { text = (?text[11])::str; }
+    val r: res[str, std_format.FormatError] = std_format.sprint(a, "its mach.toml does not load: {}", text);
+    if (sel r.err) { ret "its mach.toml does not load"; }
+    ret r.ok;
+}
+
+pub fun shipped(ctx: ptr, url: str, rel: *package_source.Release) res[package_source.Shipped, fail.Fail] {
+    val c:   *Remotes     = ctx::*Remotes;
+    val a:   *A.Allocator = c.s.build_alloc;
+    var dir: str          = c.local;
+    if (c.offline) {
+        val od: res[str, fail.Fail] = offline_dir(c, url);
+        if (sel od.err) { ret res[package_source.Shipped, fail.Fail].err{od.err}; }
+        dir = od.ok;
+    }
+    or {
+        val ready: err[fail.Fail] = ensure_scratch(c);
+        if (sel ready.err) { ret res[package_source.Shipped, fail.Fail].err{ready.err}; }
+        dir = c.scratch;
+        val refspec_r: res[str, std_format.FormatError] = std_format.sprint(a, "+refs/tags/{}:refs/tags/{}", rel.tag, rel.tag);
+        if (sel refspec_r.err) { ret res[package_source.Shipped, fail.Fail].err{fail.message(fail.format_text(refspec_r.err))}; }
+        # automatic maintenance, detached after one fetch, rewrites the shallow file the next
+        # fetch has read, so the throwaway scratch never maintains itself
+        var args: [9]str;
+        args[0] = "-c";
+        args[1] = "gc.auto=0";
+        args[2] = "-c";
+        args[3] = "maintenance.auto=false";
+        args[4] = "fetch";
+        args[5] = "-q";
+        args[6] = "--depth=1";
+        args[7] = url;
+        args[8] = refspec_r.ok;
+        val fetched: res[str, fail.Fail] = git.op(a, ?c.gi, dir, ?args[0], 9, nil);
+        str_free(a, refspec_r.ok);
+        if (sel fetched.err) { ret res[package_source.Shipped, fail.Fail].err{fetched.err}; }
+        str_free(a, fetched.ok);
+    }
+    val spec_r: res[str, std_format.FormatError] = std_format.sprint(a, "{}:{}", rel.commit, manifest.MANIFEST_FILE);
+    if (sel spec_r.err) { ret res[package_source.Shipped, fail.Fail].err{fail.message(fail.format_text(spec_r.err))}; }
+    var show: [2]str;
+    show[0] = "show";
+    show[1] = spec_r.ok;
+    val shown: res[str, fail.Fail] = git.query_raw(a, ?c.gi, dir, ?show[0], 2);
+    str_free(a, spec_r.ok);
+    if (sel shown.err) { ret res[package_source.Shipped, fail.Fail].err{shown.err}; }
+    val text: str = shown.ok;
+    fin { str_free(a, text); }
+    val clean: err[fail.Fail] = manifest.validate_source_bytes(text::*u8, str_len(text));
+    if (sel clean.err) { ret excluded(unloadable(a, clean.err)); }
+    val doc_r: res[manifest.Doc, fail.Fail] = manifest.doc_parse(a, manifest.MANIFEST_FILE, text);
+    if (sel doc_r.err) { ret excluded("its mach.toml is not valid TOML"); }
+    var doc: manifest.Doc = doc_r.ok;
+    fin { manifest.doc_dnit(a, ?doc); }
+    val parsed: res[manifest.Manifest, fail.Fail] = manifest.parse(a, ?c.s.interner, ?doc);
+    if (sel parsed.err) { ret excluded(unloadable(a, parsed.err)); }
+    var m:        manifest.Manifest = parsed.ok;
+    val declared: opt[str]          = intern.lookup(?c.s.interner, m.version);
+    var agrees:   bool              = false;
+    if (sel declared.some) { agrees = str_equals(declared.some, rel.text); }
+    if (!agrees) {
+        manifest.dnit(?m, a);
+        ret excluded("its [project].version does not match the tag");
+    }
+    ret res[package_source.Shipped, fail.Fail].ok{package_source.Shipped{manifest: m, excluded: ""}};
+}
+
+# git's automatic maintenance never runs in the candidate scratch, even where the user's
+# configuration asks for it after every fetch: detached, it rewrote the shallow file under the
+# next release fetch. pre-auto-gc runs exactly when automatic gc would, and leaves its
+# marker in the scratch, which is its working directory
+test git_manifest_at__release_fetches_run_no_automatic_maintenance {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    val gi_r: res[git.Inspector, fail.Fail] = git.inspector_init(?alloc);
+    if (sel gi_r.err) { ret 2; }
+    var gi: git.Inspector = gi_r.ok;
+    fin { git.inspector_dnit(?alloc, ?gi); }
+    val repo_r: res[str, fail.Fail] = git.t_scratch_dir(?alloc, "mach_dep_maintenance_repo");
+    if (sel repo_r.err) { ret 3; }
+    val repo: str = repo_r.ok;
+    fin {
+        fs.remove_all(?alloc, repo);
+        str_free(?alloc, repo);
+    }
+    var init_args: [1]str;
+    init_args[0] = "init";
+    val init_r: res[str, fail.Fail] = git.op(?alloc, ?gi, repo, ?init_args[0], 1, nil);
+    if (sel init_r.err) { ret 4; }
+    str_free(?alloc, init_r.ok);
+    if (!git.t_tag_release(?alloc, ?gi, repo, "1.0.0") || !git.t_tag_release(?alloc, ?gi, repo, "1.0.1")) { ret 5; }
+
+    val hooks_r: res[str, fail.Fail] = git.t_scratch_dir(?alloc, "mach_dep_maintenance_hooks");
+    if (sel hooks_r.err) { ret 6; }
+    val hooks: str = hooks_r.ok;
+    fin {
+        fs.remove_all(?alloc, hooks);
+        str_free(?alloc, hooks);
+    }
+    val hook_r: res[str, A.Error] = types_path.join(?alloc, hooks, "pre-auto-gc");
+    if (sel hook_r.err) { ret 6; }
+    val hook_text: str             = "#!/bin/sh\necho ran >> auto-gc-ran\nexit 1\n";
+    val hook_w:    err[fs.FsError] = fs.write_bytes(hook_r.ok, hook_text::*u8, str_len(hook_text), 0o755);
+    str_free(?alloc, hook_r.ok);
+    if (sel hook_w.err) { ret 6; }
+
+    # every fetch keeps its own pack, and a second pack is past the limit that triggers gc
+    val hooks_path_r: res[str, std_format.FormatError] = std_format.sprint(?alloc, "GIT_CONFIG_VALUE_0={}", hooks);
+    if (sel hooks_path_r.err) { ret 7; }
+    fin { str_free(?alloc, hooks_path_r.ok); }
+    var env: [16]*u8;
+    env[0]  = "GIT_CONFIG_COUNT=7";
+    env[1]  = "GIT_CONFIG_KEY_0=core.hooksPath";
+    env[2]  = hooks_path_r.ok::*u8;
+    env[3]  = "GIT_CONFIG_KEY_1=transfer.unpackLimit";
+    env[4]  = "GIT_CONFIG_VALUE_1=1";
+    env[5]  = "GIT_CONFIG_KEY_2=gc.auto";
+    env[6]  = "GIT_CONFIG_VALUE_2=1";
+    env[7]  = "GIT_CONFIG_KEY_3=gc.autoPackLimit";
+    env[8]  = "GIT_CONFIG_VALUE_3=1";
+    env[9]  = "GIT_CONFIG_KEY_4=gc.autoDetach";
+    env[10] = "GIT_CONFIG_VALUE_4=false";
+    env[11] = "GIT_CONFIG_KEY_5=maintenance.autoDetach";
+    env[12] = "GIT_CONFIG_VALUE_5=false";
+    env[13] = "GIT_CONFIG_KEY_6=maintenance.strategy";
+    env[14] = "GIT_CONFIG_VALUE_6=gc";
+    env[15] = nil;
+    git.set_config_env(?env[0]);
+    fin { git.set_config_env(nil); }
+
+    val gc_r: res[Remotes, fail.Fail] = open(?s, false, "");
+    if (sel gc_r.err) { ret 8; }
+    var gc: Remotes = gc_r.ok;
+    fin { close(?gc); }
+    var list: Vector[package_source.Release] = collections_vector.init[package_source.Release](s.build_alloc);
+    fin { package_source.releases_free(s.build_alloc, ?list); }
+    val listed: err[fail.Fail] = releases((?gc)::ptr, repo, ?list);
+    if (sel listed.err) { ret 9; }
+    if (list.len != 2)  { ret 10; }
+    var bad: i32   = 0;
+    var i:   usize = 0;
+    for (i < list.len) {
+        val m: res[package_source.Shipped, fail.Fail] = shipped((?gc)::ptr, repo, ?list.data[i]);
+        if (sel m.err) { bad = bad | 1; }
+        if (sel m.ok) {
+            if (!str_empty(m.ok.excluded)) { bad = bad | 1; }
+            or {
+                var got: manifest.Manifest = m.ok.manifest;
+                manifest.dnit(?got, s.build_alloc);
+            }
+        }
+        i = i + 1;
+    }
+    if (!gc.scratch_ready)                               { bad = bad | 2; }
+    if (git.t_exists(?alloc, gc.scratch, "auto-gc-ran")) { bad = bad | 4; }
+    ret bad;
+}
+
+#[testing]
+fun t_tag(alloc: *A.Allocator, gi: *git.Inspector, dir: str, a1: str, a2: str, a3: str, a4: str, a5: str) bool {
+    # an annotated tag needs an identity, which a runner may not configure
+    var args: [10]str;
+    args[0] = "-c";
+    args[1] = "user.email=t@t";
+    args[2] = "-c";
+    args[3] = "user.name=t";
+    args[4] = "tag";
+    var n:    usize  = 5;
+    var each: [5]str = [5]str{a1, a2, a3, a4, a5};
+    var i:    usize  = 0;
+    for (i < 5) {
+        if (!str_empty(each[i])) {
+            args[n] = each[i];
+            n       = n + 1;
+        }
+        i = i + 1;
+    }
+    val r: res[str, fail.Fail] = git.op(alloc, gi, dir, ?args[0], n, nil);
+    if (sel r.err) { ret false; }
+    str_free(alloc, r.ok);
+    ret true;
+}
+
+#[testing]
+fun t_release_manifest(alloc: *A.Allocator, dir: str, version: str) bool {
+    val text: res[str, std_format.FormatError] = std_format.sprint(alloc, "[project]\nid = \"relib\"\nversion = \"{}\"\nsrc = \"src\"\nout = \"out\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n", version);
+    if (sel text.err) { ret false; }
+    val written: bool = git.t_put(alloc, dir, "mach.toml", text.ok);
+    str_free(alloc, text.ok);
+    ret written;
+}
+
+# a repository with an annotated v1.0.0 and a lightweight v1.0.1 on one commit, a pre-release,
+# a tag that is no release, and a v1.2.0 whose manifest names another version
+#[testing]
+fun t_release_repo(alloc: *A.Allocator, gi: *git.Inspector, dir: str) bool {
+    var init_args: [1]str              = [1]str{"init"};
+    val init_r:    res[str, fail.Fail] = git.op(alloc, gi, dir, ?init_args[0], 1, nil);
+    if (sel init_r.err) { ret false; }
+    str_free(alloc, init_r.ok);
+    if (!t_release_manifest(alloc, dir, "1.0.0") || !git.t_commit_all(alloc, gi, dir, "one"))      { ret false; }
+    if (!t_tag(alloc, gi, dir, "-a", "v1.0.0", "-m", "one", ""))                                   { ret false; }
+    if (!t_tag(alloc, gi, dir, "v1.0.1", "", "", "", ""))                                          { ret false; }
+    if (!t_tag(alloc, gi, dir, "nightly", "", "", "", ""))                                         { ret false; }
+    if (!t_release_manifest(alloc, dir, "2.0.0-rc.1") || !git.t_commit_all(alloc, gi, dir, "rc"))  { ret false; }
+    if (!t_tag(alloc, gi, dir, "v2.0.0-rc.1", "", "", "", ""))                                     { ret false; }
+    if (!t_release_manifest(alloc, dir, "1.2.1") || !git.t_commit_all(alloc, gi, dir, "mismatch")) { ret false; }
+    ret t_tag(alloc, gi, dir, "v1.2.0", "", "", "", "");
+}
+
+#[testing]
+fun t_find_release(list: *Vector[package_source.Release], tag: str) i64 {
+    var i: usize = 0;
+    for (i < list.len) {
+        if (str_equals(list.data[i].tag, tag)) { ret i::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# the version a shipped release names, or "" when it is no candidate
+#[testing]
+fun t_shipped_version(s: *session.Session, rels: *package_source.Releases, url: str, rel: *package_source.Release) str {
+    val shipped_r: res[package_source.Shipped, fail.Fail] = rels.shipped(rels.ctx, url, rel);
+    if (sel shipped_r.err)                 { ret "(unreadable)"; }
+    if (!str_empty(shipped_r.ok.excluded)) { ret ""; }
+    var m:   manifest.Manifest = shipped_r.ok.manifest;
+    var out: str               = "(unnamed)";
+    val v:   opt[str]          = intern.lookup(?s.interner, m.version);
+    if (sel v.some) { out = v.some; }
+    manifest.dnit(?m, s.build_alloc);
+    ret out;
+}
+
+# 0 when the table lists exactly the four release tags and reads the manifest each ships
+#[testing]
+fun t_check_releases(s: *session.Session, rels: *package_source.Releases, url: str) i32 {
+    var list: Vector[package_source.Release] = collections_vector.init[package_source.Release](s.build_alloc);
+    fin { package_source.releases_free(s.build_alloc, ?list); }
+    val listed: err[fail.Fail] = rels.list(rels.ctx, url, ?list);
+    if (sel listed.err) { ret 1; }
+    if (list.len != 4)  { ret 2; }
+    val one:  i64 = t_find_release(?list, "v1.0.0");
+    val oneb: i64 = t_find_release(?list, "v1.0.1");
+    val rc:   i64 = t_find_release(?list, "v2.0.0-rc.1");
+    val bad:  i64 = t_find_release(?list, "v1.2.0");
+    if (one < 0 || oneb < 0 || rc < 0 || bad < 0) { ret 3; }
+    # the annotated tag resolves to its commit, the one the lightweight tag names
+    if (!str_equals(list.data[one::usize].commit, list.data[oneb::usize].commit))              { ret 4; }
+    if (list.data[rc::usize].version.pre_len != 4 || list.data[one::usize].version.major != 1) { ret 5; }
+    if (!str_equals(t_shipped_version(s, rels, url, ?list.data[one::usize]), "1.0.0"))         { ret 6; }
+    if (!str_equals(t_shipped_version(s, rels, url, ?list.data[rc::usize]), "2.0.0-rc.1"))     { ret 7; }
+    # a manifest naming another version is no candidate, and the lightweight tag on the
+    # v1.0.0 commit ships that same manifest
+    if (!str_empty(t_shipped_version(s, rels, url, ?list.data[bad::usize])))  { ret 8; }
+    if (!str_empty(t_shipped_version(s, rels, url, ?list.data[oneb::usize]))) { ret 9; }
+    ret 0;
+}
+
+test releases__list_release_tags_and_read_their_manifests {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val gi_r: res[git.Inspector, fail.Fail] = git.inspector_init(?alloc);
+    if (sel gi_r.err) { ret 2; }
+    var gi: git.Inspector = gi_r.ok;
+    fin { git.inspector_dnit(?alloc, ?gi); }
+    val repo_r: res[str, fail.Fail] = git.t_scratch_dir(?alloc, "mach_release_repo");
+    if (sel repo_r.err) { ret 2; }
+    val repo: str = repo_r.ok;
+    fin { fs.remove_all(?alloc, repo); }
+    if (!t_release_repo(?alloc, ?gi, repo)) { ret 3; }
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 4; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    var code: i32 = 0;
+    var pass: u32 = 0;
+    for (pass < 2) {
+        val offline: bool                    = pass == 1;
+        val opened:  res[Remotes, fail.Fail] = open(?s, offline, repo);
+        if (sel opened.err) { ret 5; }
+        var remotes: Remotes                 = opened.ok;
+        var rels:    package_source.Releases = package_source.Releases{ctx: (?remotes)::ptr, list: releases, shipped: shipped};
+        val r:       i32                     = t_check_releases(?s, ?rels, repo);
+        close(?remotes);
+        if (r != 0) { code = 10 * (pass::i32 + 1) + r; }
+        pass = pass + 1;
+    }
+    ret code;
+}

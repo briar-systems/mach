@@ -1,0 +1,810 @@
+# closure: the walk every dependency command shares. it reads the root's declarations,
+# then the declarations of each realized dependency, whether it was reached by a version
+# range, a git ref or a path; the root's dep/ holds every identity once, and a version range
+# any project in the closure declares is pinned there:
+#
+# - a range's pin is the pin the project records. for a repository root it is the root's own
+#   gitlink at dep/<id>; for a subproject, a project in a subdirectory of a repository, it is
+#   the gitlink the enclosing repository commits under the subproject's prefix. pull realizes
+#   the pin on a fresh clone and restores a checkout that drifted from it, and update records
+#   the moved pin. a subproject with no pin for a dependency gets a plain clone, as a project
+#   outside any repository does
+# - a range a dependency declares resolves with the root's own (mach dep add, mach dep
+#   update), whether the dependency was reached by a ref or a path: when the root holds no
+#   checkout of the identity yet, it is seeded by the dependency's own pin for it, update
+#   --all moves it to the highest release every range admits, and a root declaration of the
+#   same identity overrides it
+# - a range with neither a pin nor a checkout under the root is refused with `run mach dep
+#   update <root> <id>`, which pins it whether the root or a dependency declares it
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.data.toml;
+use fs:         std.filesystem;
+use std_format: std.format;
+use io_error:   std.io.error;
+use std.text.string.str_dup;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use driver_closure:  mach.lang.driver.closure;
+use mach.lang.fail;
+use mach.lang.manifest;
+use mach.lang.session;
+
+use mach.lang.package;
+use git_member:   mach.lang.package.git.member;
+use package_path: mach.lang.package.path;
+use package_pin:  mach.lang.package.pin;
+use mach.lang.package.report;
+use mach.lang.package.resolver;
+use package_source: mach.lang.package.source;
+
+pub val MANIFEST: str = manifest.MANIFEST_FILE;
+
+# one operation on a project's dependencies: the session and storage it works in, the
+# project root, the tables of the source and pin members, and where it reports
+pub rec Operation {
+    s:         *session.Session;
+    a:         *A.Allocator;
+    root:      str;
+    checkouts: package_source.Checkouts;
+    pins:      package_pin.Pin;
+    rep:       *report.Report;
+}
+
+# open an operation on the project at `root`, released with `close`
+pub fun open(s: *session.Session, a: *A.Allocator, root: str, rep: *report.Report) res[Operation, fail.Fail] {
+    val opened: res[package_source.Checkouts, fail.Fail] = git_member.checkouts(s, rep);
+    if (sel opened.err) { ret res[Operation, fail.Fail].err{opened.err}; }
+    ret res[Operation, fail.Fail].ok{Operation{s: s, a: a, root: root, checkouts: opened.ok, pins: git_member.pin(s), rep: rep}};
+}
+
+pub fun close(op: *Operation) {
+    op.checkouts.close(op.checkouts.ctx);
+}
+
+# a further range declared for the identity of a request by another requirer: the closure
+# keeps one request per identity, and every range on it takes part in resolution
+pub rec RangeDecl {
+    range:    str;
+    requirer: str;
+}
+
+# one declared dependency of the closure. `via_release` marks a declaration read from a
+# manifest reached through a release-selected edge, whose requirements the resolver reads
+# itself from the chosen release; every other declaration is the closure's own. `seed` is the
+# revision the declaring dependency's own pin holds for a range it declares, "" when it has
+# none. `decl` is the request's selector as its manifest line spells it; `overrode` holds, on
+# a root declaration by `ref` or `path`, every differing requirement of the same identity it
+# replaced; `copied` is what realizing a path dependency did to its copy
+pub rec Request {
+    id:          str;
+    url:         str;
+    src_path:    str;
+    ref:         str;
+    version:     str;
+    chain:       str;
+    requirer:    str;
+    root_decl:   bool;
+    is_git:      bool;
+    via_release: bool;
+    seed:        str;
+    effect:      str;
+    also:        Vector[RangeDecl];
+    decl:        str;
+    overrode:    Vector[Overridden];
+    copied:      u8;
+}
+
+# a requirement a root declaration replaced: `chain` asked for `asked`
+pub rec Overridden {
+    chain: str;
+    asked: str;
+}
+
+pub val COPY_NONE:      u8 = 0;
+pub val COPY_REFRESHED: u8 = 1;
+pub val COPY_REUSED:    u8 = 2;
+
+# how a closure walk reads a fixed git dependency: at the revision its selector picks,
+# fetching one its checkout lacks unless `offline`. a branch is read at its pin, or at its
+# fetched tip when the walk is an update that moves it: every one under `all`, or the
+# identity `name` names
+pub rec Walk {
+    offline: bool;
+    all:     bool;
+    name:    str;
+}
+
+fun walk_moves(w: *Walk, id: str) bool {
+    ret w.all || (w.name != nil && str_equals(w.name, id));
+}
+
+# a release-selected git dependency: its requirements are the chosen release's
+pub fun selects_release(r: *Request) bool {
+    ret r.is_git && is_ranged(r);
+}
+
+# a manifest reached through `parent` is read through a release when the parent was, or is one
+fun reached_via_release(parent: *Request) bool {
+    ret parent.via_release || selects_release(parent);
+}
+
+pub fun is_ranged(r: *Request) bool {
+    ret r.version != nil && !str_empty(r.version);
+}
+
+# realize the dependency closure of a project: acquire every declared dependency
+# transitively, check each realized manifest's project id against its declared name, and
+# report realized directories under dep/ that are no longer in the closure
+# ---
+# s:     the session; a failure may borrow from it, so the caller shows it before ending it
+# a:     the storage the operation works in
+# root:  the project root directory
+# quiet: report no progress lines
+# rep:   receives progress, notes, and the effects a failure left
+# ret:   err naming the failure
+pub fun pull(s: *session.Session, a: *A.Allocator, root: str, quiet: bool, rep: *report.Report) err[fail.Fail] {
+    val opened: res[Operation, fail.Fail] = open(s, a, root, rep);
+    if (sel opened.err) { ret err[fail.Fail].err{opened.err}; }
+    var op: Operation = opened.ok;
+    fin { close(?op); }
+    var reqs: Vector[Request] = collections_vector.init[Request](a);
+    fin { free_requests(a, ?reqs); }
+    ret realize(?op, ?reqs, quiet, false, false, nil, nil);
+}
+
+# walk and realize the closure into `reqs`, the root's manifest read from `candidate` when
+# it is not nil and otherwise from the project; `verify_only` realizes nothing and refuses a
+# directory under dep/ outside the closure, where a realizing walk notes and retains it
+# ---
+# op:          the operation
+# reqs:        receives the closure, which the caller frees
+# quiet:       report no progress lines
+# offline:     fetch nothing
+# verify_only: change nothing
+# candidate:   the root manifest's table, or nil to read it from the project
+# picks:       the releases resolution chose, or nil
+# ret:         err naming the first failure
+pub fun realize(op: *Operation, reqs: *Vector[Request], quiet: bool, offline: bool, verify_only: bool,
+    candidate: *toml.Table, picks: *Vector[resolver.Choice]) err[fail.Fail] {
+    val a:      *A.Allocator       = op.a;
+    val mode_r: res[u8, fail.Fail] = op.pins.mode(op.pins.ctx, op.root);
+    if (sel mode_r.err) { ret err[fail.Fail].err{mode_r.err}; }
+    val mode: u8 = mode_r.ok;
+
+    val guard_r: res[bool, fail.Fail] = driver_closure.check_dep_root(op.root);
+    if (sel guard_r.err) { ret err[fail.Fail].err{guard_r.err}; }
+
+    var parsed: manifest.Doc;
+    var mt:     *toml.Table = candidate;
+    if (mt == nil) {
+        val mt_path_r: res[str, A.Error] = types_path.join(a, op.root, MANIFEST);
+        if (sel mt_path_r.err) { ret err[fail.Fail].err{oom()}; }
+        val mt_path: str = mt_path_r.ok;
+        fin { str_free(a, mt_path); }
+        val mt_r: res[manifest.Doc, fail.Fail] = parse_file(a, mt_path);
+        if (sel mt_r.err) { ret err[fail.Fail].err{mt_r.err}; }
+        parsed = mt_r.ok;
+        mt     = ?parsed.table;
+    }
+    fin {
+        if (candidate == nil) { manifest.doc_dnit(a, ?parsed); }
+    }
+    var complete: bool = false;
+    fin {
+        if (!complete) { effects(op, reqs); }
+    }
+
+    var root_id: str = key_text(mt, "project.id");
+    if (str_empty(root_id)) { root_id = "(project)"; }
+
+    val seed_r: err[fail.Fail] = enqueue(a, reqs, op.root, mt, root_id, true, false);
+    if (sel seed_r.err) { ret seed_r; }
+    apply_picks(a, reqs, picks);
+    if (reqs.len == 0) {
+        if (!quiet) { report.line(op.rep, "no dependencies"); }
+        complete = true;
+        ret strays(op, reqs, verify_only);
+    }
+
+    var i: usize = 0;
+    for (i < reqs.len) {
+        if (!verify_only) {
+            val realized: err[fail.Fail] = ensure_realized(op, ?reqs.data[i], mode, quiet, offline);
+            if (sel realized.err) { ret realized; }
+        }
+        val dep_full_r: res[str, fail.Fail] = package.dep_full_of(a, op.root, reqs.data[i].id);
+        if (sel dep_full_r.err) { ret err[fail.Fail].err{oom()}; }
+        val dep_full: str = dep_full_r.ok;
+        fin { str_free(a, dep_full); }
+        # a checkout cloned shallow holds none of what its selection is read by
+        if (!verify_only && reqs.data[i].is_git) {
+            val fetched: res[bool, fail.Fail] = op.checkouts.hydrate(op.checkouts.ctx, op.root, reqs.data[i].id, dep_full, reqs.data[i].ref,
+                is_ranged(?reqs.data[i]), offline);
+            if (sel fetched.err)      { ret err[fail.Fail].err{fetched.err}; }
+            if (fetched.ok && !quiet) { report.linef(op.rep, a, "fetched the tags of {}", reqs.data[i].id); }
+        }
+        val is_dir_r: res[bool, io_error.Error] = fs.is_dir(dep_full);
+        if (sel is_dir_r.err) {
+            val msg: res[str, std_format.FormatError] = std_format.sprint(a, "dependency '{}' is not realized at {}: {}", reqs.data[i].id, dep_full, fail.io_text(is_dir_r.err));
+            if (sel msg.err) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, "a dependency is not realized")}; }
+            ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, msg.ok)};
+        }
+        if (!(is_dir_r.ok)) {
+            val msg: res[str, std_format.FormatError] = std_format.sprint(a, "dependency '{}' is not realized at {}", reqs.data[i].id, dep_full);
+            if (sel msg.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_UNREALIZED, "a dependency is not realized")}; }
+            ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_UNREALIZED, msg.ok)};
+        }
+        val sub_path_r: res[str, A.Error] = types_path.join(a, dep_full, MANIFEST);
+        if (sel sub_path_r.err) { ret err[fail.Fail].err{oom()}; }
+        val sub_path: str = sub_path_r.ok;
+        fin { str_free(a, sub_path); }
+        val sub_r: res[manifest.Doc, fail.Fail] = parse_file(a, sub_path);
+        if (sel sub_r.err) { ret err[fail.Fail].err{sub_r.err}; }
+        var sub: manifest.Doc = sub_r.ok;
+        fin { manifest.doc_dnit(a, ?sub); }
+
+        val declared: str            = key_text(?sub.table, "project.id");
+        val ident:    err[fail.Fail] = package.check_dep_identity(op.s, reqs.data[i].id, declared);
+        if (sel ident.err) { ret ident; }
+        val nested: err[fail.Fail] = package.refuse_nested_realization(op.s, reqs.data[i].id, dep_full);
+        if (sel nested.err) { ret nested; }
+
+        val child_r: err[fail.Fail] = enqueue(a, reqs, dep_full, ?sub.table, reqs.data[i].chain, false, reached_via_release(?reqs.data[i]));
+        if (sel child_r.err) { ret child_r; }
+        apply_picks(a, reqs, picks);
+        i = i + 1;
+    }
+    # verify reports the overrides its own resolution finds
+    if (!verify_only) { note_overridden(op, reqs); }
+    val result: err[fail.Fail] = strays(op, reqs, verify_only);
+    complete = sel result.ok;
+    ret result;
+}
+
+# one note per requirement a root declaration overrode, beside the other notes, so neither
+# --quiet nor a log that keeps only standard error drops it
+fun note_overridden(op: *Operation, reqs: *Vector[Request]) {
+    var i: usize = 0;
+    for (i < reqs.len) {
+        val r: *Request = ?reqs.data[i];
+        i = i + 1;
+        var k: usize = 0;
+        for (k < r.overrode.len) {
+            val o:    *Overridden         = ?r.overrode.data[k];
+            val note: res[str, fail.Fail] = package.override_note(op.a, r.id, r.decl, o.chain, o.asked);
+            k = k + 1;
+            if (sel note.err) {
+                report.fault(op.rep, note.err);
+                cnt;
+            }
+            report.note(op.rep, note.ok);
+            str_free(op.a, note.ok);
+        }
+    }
+}
+
+# a directory under dep/ outside the closure: verify refuses each one, and every other walk
+# notes it and leaves it for explicit removal
+fun strays(op: *Operation, reqs: *Vector[Request], verify_only: bool) err[fail.Fail] {
+    val ids_r: res[Vector[str], fail.Fail] = package.realized_ids(op.a, op.root);
+    if (sel ids_r.err) { ret err[fail.Fail].err{ids_r.err}; }
+    var ids:     Vector[str] = ids_r.ok;
+    var i:       usize       = 0;
+    var refused: bool        = false;
+    for (i < ids.len) {
+        if (index(reqs, ids.data[i]) < 0) {
+            if (verify_only) {
+                val msg: res[str, std_format.FormatError] = std_format.sprint(op.a, "dep/{} is not in the dependency closure", ids.data[i]);
+                if (sel msg.ok) { report.fault(op.rep, fail.user(diagnostic_kind.DEP_NOT_IN_CLOSURE, msg.ok)); }
+                or              { report.fault(op.rep, fail.user(diagnostic_kind.DEP_NOT_IN_CLOSURE, "a directory under dep/ is not in the dependency closure")); }
+                refused = true;
+            }
+            or { report.notef(op.rep, op.a, "note: dep/{} is outside the dependency closure; directory retained for explicit removal", ids.data[i]); }
+        }
+        i = i + 1;
+    }
+    if (refused) { ret err[fail.Fail].err{fail.reported()}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the command that pins and realizes a version-selected dependency with no checkout yet;
+# pull's refusal and init's --no-deps hint both name it
+pub fun pin_command(a: *A.Allocator, root: str, id: str) str {
+    val r: res[str, std_format.FormatError] = std_format.sprint(a, "mach dep update {} {}", root, id);
+    if (sel r.err) { ret "mach dep update <path> <id>"; }
+    ret r.ok;
+}
+
+pub fun unpinned_refusal(a: *A.Allocator, root: str, id: str, version: str) str {
+    val r: res[str, std_format.FormatError] = std_format.sprint(a,
+        "dependency '{}' selects releases by `version = \"{}\"` and has no pin yet; run `{}`", id, version, pin_command(a, root, id));
+    if (sel r.err) { ret "a version-selected dependency has no pin yet; run `mach dep update <path> <id>`"; }
+    ret r.ok;
+}
+
+fun ensure_realized(op: *Operation, r: *Request, mode: u8, quiet: bool, offline: bool) err[fail.Fail] {
+    if (r.is_git) {
+        var effect: u8 = package_source.REALIZED_NOTHING;
+        ret acquire(op, r, mode, false, quiet, offline, is_ranged(r) && str_empty(r.ref), ?effect);
+    }
+    val a:          *A.Allocator        = op.a;
+    val dep_full_r: res[str, fail.Fail] = package.dep_full_of(a, op.root, r.id);
+    if (sel dep_full_r.err) { ret err[fail.Fail].err{oom()}; }
+    val dep_full: str = dep_full_r.ok;
+    fin { str_free(a, dep_full); }
+
+    # a path dependency has no pin, so every pull syncs its copy with the declared source
+    val is_symlink_r: res[bool, io_error.Error] = fs.is_symlink(dep_full);
+    if ((sel is_symlink_r.ok && is_symlink_r.ok)) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_DIRECTORY, "dependency checkout is a symlink; existing entry retained")}; }
+    val pr: res[bool, fail.Fail] = package_path.realize(op.s, op.root, r.id, r.src_path, op.rep);
+    if (sel pr.err) { ret err[fail.Fail].err{pr.err}; }
+    var how: str = " (copy reused: it already matched its source)";
+    r.copied = COPY_REUSED;
+    if (pr.ok) {
+        how      = " (copy refreshed from its source)";
+        r.copied = COPY_REFRESHED;
+        r.effect = "copied the local dependency source";
+    }
+    if (!quiet) { report.linef(op.rep, a, "realized {} from {}{}", r.id, r.src_path, how); }
+    ret err[fail.Fail].ok{};
+}
+
+# acquire a git dependency's slot through the source and report what changed; `accept` is
+# add taking an existing checkout, and `pinned_only` a range with no selector, which only a
+# pin or an existing checkout realizes
+pub fun acquire(op: *Operation, r: *Request, mode: u8, accept: bool, quiet: bool, offline: bool,
+    pinned_only: bool, effect: *u8) err[fail.Fail] {
+    var q: package_source.Acquisition = package_source.Acquisition{root: op.root, id: r.id, url: r.url, selector: r.ref, mode: mode,
+        accept: accept, offline: offline, pinned_only: pinned_only};
+    val realized: res[u8, fail.Fail] = op.checkouts.acquire(op.checkouts.ctx, ?q);
+    if (sel realized.err)                                { ret err[fail.Fail].err{realized.err}; }
+    if (realized.ok == package_source.REALIZED_UNPINNED) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_UNPINNED, unpinned_refusal(op.a, op.root, r.id, r.version))}; }
+    @effect = realized.ok;
+    if (realized.ok == package_source.REALIZED_NOTHING) { ret err[fail.Fail].ok{}; }
+
+    val dep_full_r: res[str, fail.Fail] = package.dep_full_of(op.a, op.root, r.id);
+    if (sel dep_full_r.err) { ret err[fail.Fail].err{oom()}; }
+    val dep_full: str = dep_full_r.ok;
+    fin { str_free(op.a, dep_full); }
+    var note: str = "";
+    if (realized.ok == package_source.REALIZED_INITIALIZED) {
+        r.effect = "initialized the recorded gitlink";
+        note     = " (initialized the committed gitlink)";
+    }
+    or (realized.ok == package_source.REALIZED_PINNED) {
+        r.effect = "checked out the recorded pin";
+        note     = " (restored to the recorded pin)";
+    }
+    or (realized.ok == package_source.REALIZED_REGISTERED) {
+        r.effect = "registered the recorded gitlink in .gitmodules";
+        note     = " (registered the recorded gitlink)";
+    }
+    or (realized.ok == package_source.REALIZED_ADOPTED) {
+        r.effect = "registered and staged the existing checkout";
+        note     = " (registered the existing checkout)";
+    }
+    or          { r.effect = "realized the Git dependency"; }
+    if (!quiet) { report.linef(op.rep, op.a, "realized {} @ {}{}", r.id, head_text(op, dep_full), note); }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun head_text(op: *Operation, dep_full: str) str {
+    val r: res[str, fail.Fail] = op.checkouts.revision(op.checkouts.ctx, dep_full);
+    if (sel r.err) { ret "(unknown)"; }
+    ret r.ok;
+}
+
+pub fun index(reqs: *Vector[Request], id: str) i64 {
+    var i: usize = 0;
+    for (i < reqs.len) {
+        if (str_equals(reqs.data[i].id, id)) { ret i::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun free_request(a: *A.Allocator, request: *Request) {
+    str_free(a, request.id);
+    str_free(a, request.url);
+    str_free(a, request.src_path);
+    str_free(a, request.ref);
+    if (request.version != nil) { str_free(a, request.version); }
+    str_free(a, request.chain);
+    str_free(a, request.requirer);
+    if (request.seed != nil) { str_free(a, request.seed); }
+    if (request.decl != nil) { str_free(a, request.decl); }
+    var k: usize = 0;
+    for (k < request.also.len) {
+        str_free(a, request.also.data[k].range);
+        str_free(a, request.also.data[k].requirer);
+        k = k + 1;
+    }
+    collections_vector.dnit[RangeDecl](?request.also);
+    k = 0;
+    for (k < request.overrode.len) {
+        str_free(a, request.overrode.data[k].chain);
+        str_free(a, request.overrode.data[k].asked);
+        k = k + 1;
+    }
+    collections_vector.dnit[Overridden](?request.overrode);
+}
+
+pub fun free_requests(a: *A.Allocator, requests: *Vector[Request]) {
+    var i: usize = 0;
+    for (i < requests.len) {
+        free_request(a, ?requests.data[i]);
+        i = i + 1;
+    }
+    collections_vector.dnit[Request](requests);
+}
+
+# the root's own declarations in the manifest table `mt`, appended to `reqs`
+pub fun declared(a: *A.Allocator, reqs: *Vector[Request], root: str, mt: *toml.Table) err[fail.Fail] {
+    var root_id: str = key_text(mt, "project.id");
+    if (str_empty(root_id)) { root_id = "(project)"; }
+    ret enqueue(a, reqs, root, mt, root_id, true, false);
+}
+
+fun enqueue(a: *A.Allocator, reqs: *Vector[Request], manifest_dir: str, mt: *toml.Table,
+    chain: str, root_decl: bool, via_release: bool) err[fail.Fail] {
+    val deps_t_o: opt[*toml.Table] = toml.get_table(mt, "dep");
+    if (sel deps_t_o.none) { ret err[fail.Fail].ok{}; }
+    val deps_t: *toml.Table = deps_t_o.some;
+    val n:      usize       = toml.table_len(deps_t);
+    var i:      usize       = 0;
+    for (i < n) {
+        val key_o: opt[str] = toml.table_key(deps_t, i);
+        if (sel key_o.none) { brk; }
+        val key:     str              = key_o.some;
+        val value_o: opt[*toml.Value] = toml.table_value(deps_t, i);
+        if (sel value_o.none) { brk; }
+        val value: *toml.Value = value_o.some;
+        i = i + 1;
+        if (value.tag != toml.TYPE_TABLE) {
+            ret err[fail.Fail].err{fail.user(diagnostic_kind.MANIFEST_VALUE_TYPE, concat3(a, "[dep.", key, "] is not a table"))};
+        }
+        if (!manifest.is_valid_id(key)) {
+            ret err[fail.Fail].err{fail.user(diagnostic_kind.MANIFEST_INVALID_NAME, concat3(a, "dependency name '", key, "' must be a portable identifier (letters, digits, '_', '-')"))};
+        }
+        val git_src:  str  = key_text(?value.data.table, "git");
+        val path_src: str  = key_text(?value.data.table, "path");
+        val has_git:  bool = !str_empty(git_src);
+        val has_path: bool = !str_empty(path_src);
+        if (has_git == has_path) {
+            ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_SOURCE_COUNT, concat3(a, "[dep.", key, "] needs exactly one source key: 'git' or 'path'"))};
+        }
+
+        var r:        Request;
+        var retained: bool = false;
+        fin {
+            if (!retained) { free_request(a, ?r); }
+        }
+        r.id = own(a, key);
+        if (r.id == nil) { ret err[fail.Fail].err{oom()}; }
+        r.root_decl   = root_decl;
+        r.is_git      = has_git;
+        r.via_release = via_release;
+        r.seed        = nil;
+        r.also        = collections_vector.init[RangeDecl](a);
+        r.overrode    = collections_vector.init[Overridden](a);
+        r.decl        = nil;
+        r.copied      = COPY_NONE;
+        if (has_git) {
+            r.url     = own(a, git_src);
+            r.ref     = own(a, key_text(?value.data.table, "ref"));
+            r.version = own(a, key_text(?value.data.table, "version"));
+            if (r.url == nil || r.ref == nil || r.version == nil) { ret err[fail.Fail].err{oom()}; }
+        }
+        or {
+            if (types_path.is_abs(path_src)) {
+                r.src_path = own(a, path_src);
+                if (r.src_path == nil) { ret err[fail.Fail].err{oom()}; }
+            }
+            or {
+                val joined: res[str, A.Error] = types_path.join(a, manifest_dir, path_src);
+                if (sel joined.err) { ret err[fail.Fail].err{fail.refused(joined.err)}; }
+                r.src_path = joined.ok;
+            }
+        }
+        val chain_r: res[str, std_format.FormatError] = std_format.sprint(a, "{} -> {}", chain, key);
+        if (sel chain_r.err) { ret err[fail.Fail].err{oom()}; }
+        r.chain    = chain_r.ok;
+        r.requirer = own(a, chain);
+        if (r.requirer == nil) { ret err[fail.Fail].err{oom()}; }
+        var decl_r: res[str, std_format.FormatError];
+        if (!has_git)              { decl_r = std_format.sprint(a, "path = \"{}\"", path_src); }
+        or (!str_empty(r.version)) { decl_r = std_format.sprint(a, "version = \"{}\"", r.version); }
+        or (!str_empty(r.ref))     { decl_r = std_format.sprint(a, "ref = \"{}\"", r.ref); }
+        or                         { decl_r = std_format.sprint(a, "git = \"{}\"", r.url); }
+        if (sel decl_r.err)        { ret err[fail.Fail].err{oom()}; }
+        r.decl = decl_r.ok;
+
+        val existing: i64 = index(reqs, r.id);
+        if (existing >= 0) {
+            val e: *Request = ?reqs.data[existing::usize];
+            # a second range on a release-selected identity is one more need of the
+            # same problem; a fixed root selection overrides every range on it
+            if (both_ranged(e, ?r) && !via_release) {
+                val kept: err[fail.Fail] = keep_range(e, ?r);
+                if (sel kept.err) { ret kept; }
+                cnt;
+            }
+            if (e.root_decl) {
+                val noted: err[fail.Fail] = note_root_override(a, e, ?r);
+                if (sel noted.err) { ret noted; }
+                cnt;
+            }
+            if (selection_agrees(e, ?r)) { cnt; }
+            ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_CONFLICT, conflict_text(a, ?r, e, ?r))};
+        }
+        val pushed: res[usize, A.Error] = collections_vector.push[Request](reqs, r);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        retained = true;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a root declaration by `ref` or `path` replaces a differing requirement of its identity,
+# which it records; a root `version` intersects with the requirers' ranges instead
+fun note_root_override(a: *A.Allocator, e: *Request, r: *Request) err[fail.Fail] {
+    if (is_ranged(e) || selection_agrees(e, r)) { ret err[fail.Fail].ok{}; }
+    # the source is named too when the requirement asks for another one
+    var asked_r: res[str, std_format.FormatError];
+    if (r.is_git && (!e.is_git || !str_equals(e.url, r.url))) { asked_r = std_format.sprint(a, "git = \"{}\", {}", r.url, r.decl); }
+    or                                                        { asked_r = std_format.sprint(a, "{}", r.decl); }
+    if (sel asked_r.err)                                      { ret err[fail.Fail].err{oom()}; }
+    val asked: str = asked_r.ok;
+    val chain: str = own(a, r.chain);
+    if (chain == nil) {
+        str_free(a, asked);
+        ret err[fail.Fail].err{oom()};
+    }
+    val pushed: res[usize, A.Error] = collections_vector.push[Overridden](?e.overrode, Overridden{chain: chain, asked: asked});
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# two release selections of one identity from the same repository
+fun both_ranged(e: *Request, r: *Request) bool {
+    ret selects_release(e) && selects_release(r) && str_equals(e.url, r.url);
+}
+
+# `r` is a further range on the identity `e` holds: its range and requirer move
+# to `e`, so the request it came from is freed without them
+fun keep_range(e: *Request, r: *Request) err[fail.Fail] {
+    val pushed: res[usize, A.Error] = collections_vector.push[RangeDecl](?e.also, RangeDecl{range: r.version, requirer: r.requirer});
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    r.version  = nil;
+    r.requirer = nil;
+    ret err[fail.Fail].ok{};
+}
+
+# a version-selected request realizes the release resolution chose for it
+fun apply_picks(a: *A.Allocator, reqs: *Vector[Request], picks: *Vector[resolver.Choice]) {
+    if (picks == nil) { ret; }
+    var i: usize = 0;
+    for (i < reqs.len) {
+        val r: *Request = ?reqs.data[i];
+        i = i + 1;
+        if (!r.is_git || !is_ranged(r) || !str_empty(r.ref)) { cnt; }
+        var k: usize = 0;
+        for (k < picks.len) {
+            if (str_equals(picks.data[k].id, r.id)) {
+                val tag: res[str, std_format.FormatError] = std_format.sprint(a, "tag/{}", picks.data[k].tag);
+                if (sel tag.ok) {
+                    str_free(a, r.ref);
+                    r.ref = tag.ok;
+                }
+            }
+            k = k + 1;
+        }
+    }
+}
+
+fun selection_agrees(x: *Request, y: *Request) bool {
+    if (x.is_git != y.is_git) { ret false; }
+    # two version ranges are reconciled by resolution, not by equality
+    if (x.is_git && is_ranged(x) && is_ranged(y)) { ret str_equals(x.url, y.url); }
+    if (x.is_git)                                 { ret str_equals(x.url, y.url) && str_equals(x.ref, y.ref); }
+    ret str_equals(x.src_path, y.src_path);
+}
+
+fun selection_text(a: *A.Allocator, r: *Request) str {
+    if (r.is_git) {
+        val t: res[str, std_format.FormatError] = std_format.sprint(a, "git {} @ {}", r.url, r.ref);
+        if (sel t.err) { ret r.url; }
+        ret t.ok;
+    }
+    val t2: res[str, std_format.FormatError] = std_format.sprint(a, "path {}", r.src_path);
+    if (sel t2.err) { ret r.src_path; }
+    ret t2.ok;
+}
+
+# the example table is valid TOML as printed: values are escaped as the
+# manifest writer would write them
+pub fun conflict_text(a: *A.Allocator, subject: *Request, x: *Request, y: *Request) str {
+    var decl: str = "";
+    if (subject.is_git) {
+        val url_r: res[str, fail.Fail] = manifest.toml_escape_value(a, subject.url);
+        val ref_r: res[str, fail.Fail] = manifest.toml_escape_value(a, subject.ref);
+        if (sel url_r.ok) {
+            if (sel ref_r.ok) {
+                val d: res[str, std_format.FormatError] = std_format.sprint(a,
+                    "[dep.{}]\n    git = \"{}\"\n    ref = \"{}\"", subject.id, url_r.ok, ref_r.ok);
+                if (sel d.ok) { decl = d.ok; }
+            }
+        }
+    }
+    or {
+        val path_r: res[str, fail.Fail] = manifest.toml_escape_value(a, subject.src_path);
+        if (sel path_r.ok) {
+            val d: res[str, std_format.FormatError] = std_format.sprint(a,
+                "[dep.{}]\n    path = \"{}\"", subject.id, path_r.ok);
+            if (sel d.ok) { decl = d.ok; }
+        }
+    }
+    val msg: res[str, std_format.FormatError] = std_format.sprint(a,
+        "dependency conflict: project id '{}' is reached with two different selections:\n    {} requires {}\n    {} requires {}\n  the root decides by declaring the identity itself, for example:\n    {}",
+        subject.id, x.chain, selection_text(a, x), y.chain, selection_text(a, y), decl);
+    if (sel msg.err) { ret "dependency conflict: one project id resolves to two different selections"; }
+    ret msg.ok;
+}
+
+# a fixed git dependency's manifest, and the pins it commits for its ranges, are read at the
+# revision its selector picks, never from whatever its checkout holds
+pub fun preflight(op: *Operation, doc: *manifest.Doc, reqs: *Vector[Request], inspect_git: bool, walk: *Walk) err[fail.Fail] {
+    val a:       *A.Allocator                      = op.a;
+    val checked: res[manifest.Manifest, fail.Fail] = manifest.parse(a, ?op.s.interner, doc);
+    if (sel checked.err) { ret err[fail.Fail].err{checked.err}; }
+    var parsed: manifest.Manifest = checked.ok;
+    manifest.dnit(?parsed, a);
+    var root_id: str = key_text(?doc.table, "project.id");
+    if (str_empty(root_id)) { root_id = "(project)"; }
+    val seeded: err[fail.Fail] = enqueue(a, reqs, op.root, ?doc.table, root_id, true, false);
+    if (sel seeded.err) { ret seeded; }
+    var i: usize = 0;
+    for (i < reqs.len) {
+        val request: Request = reqs.data[i];
+        i = i + 1;
+        var source: str = request.src_path;
+        if (request.is_git) {
+            if (!inspect_git) { cnt; }
+            val joined: res[str, fail.Fail] = package.dep_full_of(a, op.root, request.id);
+            if (sel joined.err) { ret err[fail.Fail].err{joined.err}; }
+            source = joined.ok;
+            if (!op.checkouts.holds(op.checkouts.ctx, source)) {
+                str_free(a, source);
+                cnt;
+            }
+        }
+        fin {
+            if (request.is_git) { str_free(a, source); }
+        }
+        var rev: str = nil;
+        fin {
+            if (rev != nil) { str_free(op.s.build_alloc, rev); }
+        }
+        var read: res[manifest.Doc, fail.Fail];
+        if (request.is_git && !is_ranged(?request)) {
+            val at: res[str, fail.Fail] = op.checkouts.selection(op.checkouts.ctx, op.root, request.id, source, request.ref,
+                walk_moves(walk, request.id), walk.offline);
+            if (sel at.err) { ret err[fail.Fail].err{at.err}; }
+            rev  = at.ok;
+            read = op.checkouts.manifest_of(op.checkouts.ctx, a, source, rev);
+        }
+        or {
+            val file_r: res[str, A.Error] = types_path.join(a, source, MANIFEST);
+            if (sel file_r.err) { ret err[fail.Fail].err{fail.refused(file_r.err)}; }
+            read = parse_file(a, file_r.ok);
+            str_free(a, file_r.ok);
+        }
+        if (sel read.err) { ret err[fail.Fail].err{read.err}; }
+        var dependency: manifest.Doc = read.ok;
+        fin { manifest.doc_dnit(a, ?dependency); }
+        val identity: err[fail.Fail] = package.check_dep_identity(op.s, request.id, key_text(?dependency.table, "project.id"));
+        if (sel identity.err) { ret identity; }
+        val first_child: usize          = reqs.len;
+        val more:        err[fail.Fail] = enqueue(a, reqs, source, ?dependency.table, request.chain, false, reached_via_release(?request));
+        if (sel more.err) { ret more; }
+        # a range this dependency declares is seeded by the pin its own project records for it
+        if (!reached_via_release(?request)) {
+            val seeded_children: err[fail.Fail] = seed_from_source(op, source, rev, reqs, first_child);
+            if (sel seeded_children.err) { ret seeded_children; }
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the pin `source`, a dependency's own project, records for each range it declares from
+# `first` on: the one the revision `rev` records, or with no `rev` the one it records now. a
+# source in no place that records pins, or without a pin for the identity, seeds nothing
+fun seed_from_source(op: *Operation, source: str, rev: str, reqs: *Vector[Request], first: usize) err[fail.Fail] {
+    var k:   usize = first;
+    var any: bool  = false;
+    for (k < reqs.len) {
+        if (selects_release(?reqs.data[k]) && str_empty(reqs.data[k].ref)) { any = true; }
+        k = k + 1;
+    }
+    if (!any) { ret err[fail.Fail].ok{}; }
+    if (rev == nil) {
+        val inside: res[bool, fail.Fail] = op.pins.tracked(op.pins.ctx, source);
+        if (sel inside.err) { ret err[fail.Fail].err{inside.err}; }
+        if (!inside.ok)     { ret err[fail.Fail].ok{}; }
+    }
+    k = first;
+    for (k < reqs.len) {
+        val child: *Request = ?reqs.data[k];
+        k = k + 1;
+        if (!selects_release(child) || !str_empty(child.ref)) { cnt; }
+        var link: res[opt[str], fail.Fail];
+        if (rev == nil)   { link = op.pins.read(op.pins.ctx, source, child.id); }
+        or                { link = op.pins.read_at(op.pins.ctx, source, rev, child.id); }
+        if (sel link.err) { ret err[fail.Fail].err{link.err}; }
+        val pin: opt[str] = link.ok;
+        if (sel pin.some) {
+            val kept: str = own(op.a, pin.some);
+            str_free(op.s.build_alloc, pin.some);
+            if (kept == nil) { ret err[fail.Fail].err{oom()}; }
+            child.seed = kept;
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a note for each change made before a failure, which the caller shows after it
+pub fun effects(op: *Operation, reqs: *Vector[Request]) {
+    var i: usize = 0;
+    for (i < reqs.len) {
+        if (!str_empty(reqs.data[i].effect)) {
+            report.effectf(op.rep, "note: dep/{}: {} before this failure; state retained", reqs.data[i].id, reqs.data[i].effect);
+        }
+        i = i + 1;
+    }
+}
+
+# a string key as the dependency commands read it: absent reads as empty
+pub fun key_text(t: *toml.Table, key: str) str {
+    val s: opt[str] = toml.get_str(t, key);
+    if (sel s.some) { ret s.some; }
+    ret "";
+}
+
+pub fun parse_file(a: *A.Allocator, p: str) res[manifest.Doc, fail.Fail] {
+    val doc_r: res[manifest.Doc, fail.Fail] = manifest.doc_read(a, p);
+    if (sel doc_r.ok) { ret doc_r; }
+    val f: fail.Fail = doc_r.err;
+    if (fail.kind_of(f) == diagnostic_kind.FS_READ)        { ret res[manifest.Doc, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, concat3(a, "cannot read ", p, ""))}; }
+    if (fail.kind_of(f) == diagnostic_kind.TOML_MALFORMED) { ret res[manifest.Doc, fail.Fail].err{fail.with_text(f, concat3(a, p, ": ", fail.describe(f)))}; }
+    ret doc_r;
+}
+
+pub fun own(a: *A.Allocator, s: str) str {
+    val res_dup: res[str, A.Error] = str_dup(a, s);
+    if (sel res_dup.err) { ret nil; }
+    ret res_dup.ok;
+}
+
+pub fun concat3(a: *A.Allocator, s1: str, s2: str, s3: str) str {
+    val r: res[str, std_format.FormatError] = std_format.sprint(a, "{}{}{}", s1, s2, s3);
+    if (sel r.err) { ret s2; }
+    ret r.ok;
+}
+
+pub fun oom() fail.Fail {
+    ret fail.message("out of memory");
+}

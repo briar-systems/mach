@@ -1,0 +1,1013 @@
+# closure: how a build finds its dependency closure. every dependency is the directory its
+# key names under dep/, read through its manifest; nothing here fetches, pins or checks a
+# dependency against its source, which is the dependency manager's (package.mach). a stale
+# or missing dependency surfaces as a build error that `mach dep pull` fixes. the located
+# closure then scopes the build: a dependency's own closure, the link requirements each
+# artifact cascades, and the template variables a manifest reads
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use fs: std.filesystem;
+use std.filesystem.native;
+use std_format: std.format;
+use io_error:   std.io.error;
+use system_os:  std.system.os;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.driver.load;
+use mach.lang.driver.project;
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.manifest;
+use manifest_version: mach.lang.manifest.version;
+use mach.lang.output.remove;
+use mach.lang.session;
+use lang_version: mach.lang.version;
+
+fun module_file_present(alloc: *A.Allocator, root: str, src_dir: str, module_rel: str) res[bool, fail.Fail] {
+    val a: res[str, fail.Fail] = load.join_path(alloc, root, src_dir);
+    if (sel a.err) { ret res[bool, fail.Fail].err{a.err}; }
+    val mid: str                 = a.ok;
+    val b:   res[str, fail.Fail] = load.join_path(alloc, mid, module_rel);
+    str_free(alloc, mid);
+    if (sel b.err) { ret res[bool, fail.Fail].err{b.err}; }
+    val full:      str                       = b.ok;
+    val is_file_r: res[bool, io_error.Error] = fs.is_file(full);
+    val ok_:       bool                      = (sel is_file_r.ok && is_file_r.ok);
+    str_free(alloc, full);
+    ret res[bool, fail.Fail].ok{ok_};
+}
+
+fun id_text_or(s: *session.Session, id: intern.StrId, default: str) str {
+    if (id == intern.STR_NIL) { ret default; }
+    val o: opt[str] = intern.lookup(?s.interner, id);
+    if (sel o.some) { ret o.some; }
+    ret default;
+}
+
+fun dep_source_label(s: *session.Session, d: *manifest.DepDef) res[intern.StrId, fail.Fail] {
+    var label_r: res[str, std_format.FormatError];
+    if (d.git != intern.STR_NIL) {
+        val u: opt[str] = intern.lookup(?s.interner, d.git);
+        if (sel u.none) { ret res[intern.StrId, fail.Fail].err{fail.message("dependency Git source is not interned")}; }
+        label_r = std_format.sprint(s.build_alloc, "git {}", u.some);
+    }
+    or (d.path != intern.STR_NIL) {
+        val pth: opt[str] = intern.lookup(?s.interner, d.path);
+        if (sel pth.none) { ret res[intern.StrId, fail.Fail].err{fail.message("dependency path source is not interned")}; }
+        label_r = std_format.sprint(s.build_alloc, "path {}", pth.some);
+    }
+    or                   { ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_NO_SOURCE, "dependency has no source")}; }
+    if (sel label_r.err) { ret res[intern.StrId, fail.Fail].err{fail.message(fail.format_text(label_r.err))}; }
+    val label: str                        = label_r.ok;
+    val ir:    res[intern.StrId, A.Error] = intern.intern(?s.interner, label);
+    str_free(s.build_alloc, label);
+    if (sel ir.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(ir.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{ir.ok};
+}
+
+fun discard_dep_entry(alloc: *A.Allocator, entry: *project.DepEntry) {
+    if (entry.direct != nil && entry.direct_count > 0) {
+        A.deallocate[intern.StrId](alloc, entry.direct, entry.direct_count::usize);
+    }
+    manifest.dnit(?entry.manifest, alloc);
+}
+
+pub fun root_dependency(root_m: *manifest.Manifest, name: intern.StrId) *manifest.DepDef {
+    var i: u32 = 0;
+    for (i < root_m.dep_count) {
+        if (root_m.deps[i].name == name) { ret ?root_m.deps[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# what a caller holds each located edge to beyond locating it, as `mach dep verify` does; a
+# build holds none, so locating never reaches the dependency manager
+# ---
+# located:  check one located dependency (alias, project root, dependency root name, the
+#           selecting declaration, its entry), returning the realized content an exact
+#           selector is checked against
+# release:  hold the manifest a release-selecting edge reached to the release rule (chain,
+#           the selecting declaration, the reached manifest, the root manifest)
+# selector: check a requirer's declaration against the content of the dependency it reaches
+#           (alias, chain, project root, dependency root name, the declaration, the content,
+#           whether the root itself declares it)
+def LocatedFn:  fun(ptr, *session.Session, str, str, str, *manifest.DepDef, *project.DepEntry) res[intern.StrId, fail.Fail];
+def ReleaseFn:  fun(ptr, *session.Session, str, *manifest.DepDef, *manifest.Manifest, *manifest.Manifest) err[fail.Fail];
+def SelectorFn: fun(ptr, *session.Session, str, str, str, str, *manifest.DepDef, intern.StrId, bool) err[fail.Fail];
+
+pub rec Check {
+    ctx:      ptr;
+    located:  LocatedFn;
+    release:  ReleaseFn;
+    selector: SelectorFn;
+}
+
+# whether nothing is realized at `dep_dir`: it is absent, or an empty directory. a symlink or
+# a non-empty directory is something, which locating it then judges
+fun unrealized(alloc: *A.Allocator, dep_dir: str) res[bool, fail.Fail] {
+    val link_r: res[bool, io_error.Error] = fs.is_symlink(dep_dir);
+    if ((sel link_r.ok && link_r.ok)) { ret res[bool, fail.Fail].ok{false}; }
+    val exists_r: res[bool, io_error.Error] = fs.exists(dep_dir);
+    if (sel exists_r.err) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.io_text(exists_r.err))}; }
+    if (!exists_r.ok)     { ret res[bool, fail.Fail].ok{true}; }
+    val dir_r: res[bool, io_error.Error] = fs.is_dir(dep_dir);
+    if (!(sel dir_r.ok && dir_r.ok)) { ret res[bool, fail.Fail].ok{false}; }
+    val marker_r: res[str, fail.Fail] = load.join_path(alloc, dep_dir, ".git");
+    if (sel marker_r.err) { ret res[bool, fail.Fail].err{marker_r.err}; }
+    val marker_there: res[bool, io_error.Error] = fs.exists(marker_r.ok);
+    str_free(alloc, marker_r.ok);
+    if ((sel marker_there.ok && marker_there.ok)) { ret res[bool, fail.Fail].ok{false}; }
+    val names_r: res[Vector[str], fs.FsError] = fs.read_dir(alloc, dep_dir);
+    if (sel names_r.err) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.fs_text(names_r.err))}; }
+    var names: Vector[str] = names_r.ok;
+    val empty: bool        = names.len == 0;
+    var i:     usize       = 0;
+    for (i < names.len) {
+        str_free(alloc, names.data[i]);
+        i = i + 1;
+    }
+    collections_vector.dnit[str](?names);
+    ret res[bool, fail.Fail].ok{empty};
+}
+
+fun locate_edge(p: *project.Project, check: *Check, content_at: *intern.StrId, root_m: *manifest.Manifest, current_root: str, d: *manifest.DepDef,
+    deps: *project.DepEntry, active: *bool, dep_count_ptr: *u32, max_deps: usize,
+    dir_dep: str, requirer_chain: str) res[u32, fail.Fail] {
+    val alias_opt: opt[str] = intern.lookup(?p.s.interner, d.name);
+    if (sel alias_opt.none) { ret res[u32, fail.Fail].err{fail.message("dep alias StrId not interned")}; }
+    val alias:   str                              = alias_opt.some;
+    val chain_r: res[str, std_format.FormatError] = std_format.sprint(p.alloc, "{} -> {}", requirer_chain, alias);
+    if (sel chain_r.err) { ret res[u32, fail.Fail].err{fail.message(fail.format_text(chain_r.err))}; }
+    val chain_here: str = chain_r.ok;
+
+    val root_dep: *manifest.DepDef = root_dependency(root_m, d.name);
+    var selected: *manifest.DepDef = d;
+    if (root_dep != nil) { selected = root_dep; }
+    val rd: res[project.DepEntry, fail.Fail] = locate_dependency(p.s, alias, current_root, dir_dep, selected);
+    if (sel rd.err) {
+        str_free(p.alloc, chain_here);
+        ret res[u32, fail.Fail].err{rd.err};
+    }
+    var entry:   project.DepEntry = rd.ok;
+    var content: intern.StrId     = intern.STR_NIL;
+    if (check != nil) {
+        val checked_r: res[intern.StrId, fail.Fail] = check.located(check.ctx, p.s, alias, current_root, dir_dep, selected, ?entry);
+        if (sel checked_r.err) {
+            discard_dep_entry(p.alloc, ?entry);
+            str_free(p.alloc, chain_here);
+            ret res[u32, fail.Fail].err{checked_r.err};
+        }
+        content = checked_r.ok;
+    }
+    val chain_id_r: res[intern.StrId, A.Error] = intern.intern(?p.s.interner, chain_here);
+    if (sel chain_id_r.err) {
+        discard_dep_entry(p.alloc, ?entry);
+        str_free(p.alloc, chain_here);
+        ret res[u32, fail.Fail].err{fail.refused(chain_id_r.err)};
+    }
+    entry.chain = chain_id_r.ok;
+    # a root `ref` or `path` overrides the requirers' selectors, a root `version` intersects with
+    # them; the root's own selection always holds the pin, so a gitlink outside it is refused
+    val overridden: bool = root_dep != nil && root_dep.version == intern.STR_NIL;
+    val checked:    bool = !overridden || selected == d;
+    entry.root_declared = root_dep != nil;
+    if (check != nil) {
+        val release_r: err[fail.Fail] = check.release(check.ctx, p.s, chain_here, selected, ?entry.manifest, root_m);
+        if (sel release_r.err) {
+            discard_dep_entry(p.alloc, ?entry);
+            str_free(p.alloc, chain_here);
+            ret res[u32, fail.Fail].err{release_r.err};
+        }
+    }
+    var j: u32 = 0;
+    for (j < dep_count_ptr[0]) {
+        if (deps[j].project_id == entry.project_id) {
+            if (check != nil && checked) {
+                val esel_r: err[fail.Fail] = check.selector(check.ctx, p.s, alias, chain_here, current_root, dir_dep, d, content_at[j], root_dep == d);
+                if (sel esel_r.err) {
+                    discard_dep_entry(p.alloc, ?entry);
+                    str_free(p.alloc, chain_here);
+                    ret res[u32, fail.Fail].err{esel_r.err};
+                }
+            }
+            if (active[j]) {
+                val msg_r: res[str, std_format.FormatError] = std_format.sprint(p.alloc,
+                    "dependency cycle: {} reaches project '{}' while it is already being resolved",
+                    chain_here, id_text_or(p.s, entry.project_id, "?"));
+                discard_dep_entry(p.alloc, ?entry);
+                str_free(p.alloc, chain_here);
+                if (sel msg_r.err) { ret res[u32, fail.Fail].err{fail.message(fail.format_text(msg_r.err))}; }
+                ret res[u32, fail.Fail].err{fail.user(diagnostic_kind.DEP_CYCLE, msg_r.ok)};
+            }
+            discard_dep_entry(p.alloc, ?entry);
+            str_free(p.alloc, chain_here);
+            ret res[u32, fail.Fail].ok{j};
+        }
+        j = j + 1;
+    }
+
+    if (dep_count_ptr[0] >= max_deps::u32) {
+        discard_dep_entry(p.alloc, ?entry);
+        str_free(p.alloc, chain_here);
+        ret res[u32, fail.Fail].err{fail.user(diagnostic_kind.DEP_LIMIT, "exceeded maximum dependency limit of 128")};
+    }
+    val idx: u32 = dep_count_ptr[0];
+    if (check != nil) {
+        if (checked) {
+            val add_sel_r: err[fail.Fail] = check.selector(check.ctx, p.s, alias, chain_here, current_root, dir_dep, d, content, root_dep == d);
+            if (sel add_sel_r.err) {
+                discard_dep_entry(p.alloc, ?entry);
+                str_free(p.alloc, chain_here);
+                ret res[u32, fail.Fail].err{add_sel_r.err};
+            }
+        }
+        content_at[idx] = content;
+    }
+    deps[idx]        = entry;
+    active[idx]      = true;
+    dep_count_ptr[0] = dep_count_ptr[0] + 1;
+
+    val child_count: u32 = deps[idx].manifest.dep_count;
+    if (child_count > 0) {
+        val ar: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](p.alloc, child_count::usize);
+        if (sel ar.err) {
+            str_free(p.alloc, chain_here);
+            ret res[u32, fail.Fail].err{fail.refused(ar.err)};
+        }
+        deps[idx].direct       = ar.ok;
+        deps[idx].direct_count = child_count;
+        var k: u32 = 0;
+        for (k < child_count) {
+            val child_r: res[u32, fail.Fail] = locate_edge(p, check, content_at, root_m, current_root,
+                ?deps[idx].manifest.deps[k], deps, active, dep_count_ptr, max_deps, dir_dep, chain_here);
+            if (sel child_r.err) {
+                str_free(p.alloc, chain_here);
+                ret child_r;
+            }
+            deps[idx].direct[k] = deps[child_r.ok].project_id;
+            k                   = k + 1;
+        }
+    }
+    active[idx] = false;
+    str_free(p.alloc, chain_here);
+    ret res[u32, fail.Fail].ok{idx};
+}
+
+# whether the running compiler satisfies `text`; a range that no longer parses counts as unmet
+fun compiler_admitted(text: str) bool {
+    val want: res[manifest_version.Range, manifest_version.RangeError] = manifest_version.parse_range(text);
+    val have: res[manifest_version.Version, str]                       = manifest_version.parse_version(lang_version.MACH_VERSION);
+    if (sel want.ok) {
+        if (sel have.ok) {
+            var r: manifest_version.Range   = want.ok;
+            var v: manifest_version.Version = have.ok;
+            ret manifest_version.satisfies(?r, ?v);
+        }
+    }
+    ret false;
+}
+
+fun append_line(p: *project.Project, acc: str, who: str, text: str) str {
+    val line_r: res[str, std_format.FormatError] = std_format.sprint(p.alloc, "{}\n    {} requires mach {}", acc, who, text);
+    if (sel line_r.err) { ret acc; }
+    ret line_r.ok;
+}
+
+fun root_label(p: *project.Project, m: *manifest.Manifest) str {
+    val rn_o: opt[str] = intern.lookup(?p.s.interner, m.id);
+    if (sel rn_o.some) {
+        if (!str_empty(rn_o.some)) { ret rn_o.some; }
+    }
+    ret "root";
+}
+
+# every manifest in the closure states the compiler range it builds with ([project].mach).
+# all unmet requirements are reported together with who states them, the failure
+# pointing at the first unmet range in the manifest that states it; a root without the key
+# is refused with the line to add, pointing at its [project] table, and a
+# dependency without it states no constraint
+fun check_compiler_requirements(p: *project.Project, m: *manifest.Manifest, deps: *project.DepEntry,
+    dep_count: u32, root_name: str) err[fail.Fail] {
+    if (m.mach == intern.STR_NIL) { ret err[fail.Fail].err{fail.located(p.alloc, missing_compiler_range(p), m.project_at)}; }
+    var unmet: str      = "";
+    var any:   bool     = false;
+    var first: fail.Place;
+    val text:  opt[str] = intern.lookup(?p.s.interner, m.mach);
+    if (sel text.some) {
+        if (!compiler_admitted(text.some)) {
+            val who_r: res[str, std_format.FormatError] = std_format.sprint(p.alloc, "{} (mach.toml)", root_name);
+            var who:   str                              = root_name;
+            if (sel who_r.ok) { who = who_r.ok; }
+            unmet = append_line(p, unmet, who, text.some);
+            any   = true;
+            first = m.mach_at;
+        }
+    }
+    var i: u32 = 0;
+    for (i < dep_count) {
+        val d: *project.DepEntry = ?deps[i];
+        i = i + 1;
+        if (d.manifest.mach == intern.STR_NIL) { cnt; }
+        val text: opt[str] = intern.lookup(?p.s.interner, d.manifest.mach);
+        if (sel text.none)                { cnt; }
+        if (compiler_admitted(text.some)) { cnt; }
+        var who:   str      = "?";
+        val chain: opt[str] = intern.lookup(?p.s.interner, d.chain);
+        if (sel chain.some) { who = chain.some; }
+        unmet = append_line(p, unmet, who, text.some);
+        if (!any) { first = d.manifest.mach_at; }
+        any = true;
+    }
+    if (!any) { ret err[fail.Fail].ok{}; }
+    var refusal: fail.Fail                        = fail.user(diagnostic_kind.MACH_VERSION_UNACCEPTED, "the dependency closure does not accept this compiler");
+    val msg_r:   res[str, std_format.FormatError] = std_format.sprint(p.alloc,
+        "this is mach {}, and the dependency closure does not accept it:{}", lang_version.MACH_VERSION, unmet);
+    if (sel msg_r.ok) { refusal = fail.user(diagnostic_kind.MACH_VERSION_UNACCEPTED, msg_r.ok); }
+    ret err[fail.Fail].err{fail.located(p.alloc, refusal, first)};
+}
+
+# the first release that reads `[project].mach`; an earlier compiler refuses the key as unknown
+val MACH_KEY_SINCE: str = "5.3.0";
+
+# the compiler range a project is told to declare when `running` is the compiler: the oldest
+# release of its major that reads the key, since a caret cannot span majors. it depends only on
+# the running major, so two authors on one project write the same range. owned by `a`
+fun mach_range_floor(a: *A.Allocator, running: str) res[str, std_format.FormatError] {
+    val have:  res[manifest_version.Version, str] = manifest_version.parse_version(running);
+    val since: res[manifest_version.Version, str] = manifest_version.parse_version(MACH_KEY_SINCE);
+    if (sel have.err)  { ret std_format.sprint(a, "={}", running); }
+    if (sel since.err) { ret std_format.sprint(a, "={}", running); }
+    val major: u64 = have.ok.major;
+    val floor: u64 = since.ok.major;
+    if (major > floor) { ret std_format.sprint(a, "^{}.0", major); }
+    ret std_format.sprint(a, "^{}.{}", floor, since.ok.minor);
+}
+
+# mach_range_floor for this compiler
+pub fun running_mach_range_floor(a: *A.Allocator) res[str, std_format.FormatError] {
+    ret mach_range_floor(a, lang_version.MACH_VERSION);
+}
+
+# the refusal of a root manifest that states no compiler range, naming the line to add
+fun missing_compiler_range(p: *project.Project) fail.Fail {
+    val floor_r: res[str, std_format.FormatError] = running_mach_range_floor(p.alloc);
+    if (sel floor_r.err) { ret fail.user(diagnostic_kind.MACH_RANGE_MISSING, "mach.toml: [project] states no compiler range; add `mach = \"<range>\"`"); }
+    val floor: str = floor_r.ok;
+    fin { str_free(p.alloc, floor); }
+    val msg_r: res[str, std_format.FormatError] = std_format.sprint(p.alloc,
+        "mach.toml: [project] states no compiler range; add `mach = \"{}\"`, the oldest release that reads the key, and raise it when the project uses a later feature", floor);
+    if (sel msg_r.err) { ret fail.user(diagnostic_kind.MACH_RANGE_MISSING, "mach.toml: [project] states no compiler range; add `mach = \"<range>\"`"); }
+    ret fail.user(diagnostic_kind.MACH_RANGE_MISSING, msg_r.ok);
+}
+
+# `dep` is the project's reserved dependency root: absent, or a physical directory. a
+# symlink there would resolve the closure from another tree, so every command that reads
+# or realizes the closure refuses it through this one check
+pub val DEP_ROOT_REFUSED: str = "dependency root 'dep' must be a physical directory, not a symlink or another kind of entry";
+
+# whether the dependency root exists; err when it is anything but a physical directory
+pub fun check_dep_root(project_root: str) res[bool, fail.Fail] {
+    var root_fd: usize = system_os.INVALID_HANDLE;
+    val opened:  i64   = remove.open_path(project_root, ?root_fd);
+    if (opened < 0) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, system_os.error_message(opened))}; }
+    fin { system_os.close(root_fd); }
+    var st:     system_os.stat_t;
+    val probed: i64 = system_os.stat_path(root_fd, DEP_DIR, ?st, system_os.AT_SYMLINK_NOFOLLOW);
+    if (system_os.error_kind(probed) == io_error.NOT_FOUND)              { ret res[bool, fail.Fail].ok{false}; }
+    if (probed < 0)                                                      { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, system_os.error_message(probed))}; }
+    if ((native.stat_mode(?st) & system_os.S_IFMT) != system_os.S_IFDIR) { ret res[bool, fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_DIRECTORY, DEP_ROOT_REFUSED)}; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+pub val CLOSURE_MAX: usize = 128;
+
+# locate a root manifest's dependency closure into `p.config.deps`, as a build reads it:
+# every dependency is the directory its key names under dep/, read through its manifest.
+# nothing is checked against git, a pin, a selector or the identity rule; `mach dep pull`
+# realizes what is missing and `mach dep verify` checks what exists
+# ---
+# p:            the project receiving the closure
+# m:            the root manifest
+# project_root: the root project's directory
+# check:        what each located edge is also held to, or nil for a build, which locates only
+# ret:          err naming a missing dependency, an unreadable manifest, a cycle or an
+#               unaccepted compiler range, or the first edge that does not hold to `check`
+pub fun locate(p: *project.Project, m: *manifest.Manifest, project_root: str, check: *Check) err[fail.Fail] {
+    if (check == nil) { ret walk(p, m, project_root, nil, nil); }
+    val held: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](p.alloc, CLOSURE_MAX);
+    if (sel held.err) { ret err[fail.Fail].err{fail.refused(held.err)}; }
+    val r: err[fail.Fail] = walk(p, m, project_root, check, held.ok);
+    A.deallocate[intern.StrId](p.alloc, held.ok, CLOSURE_MAX);
+    ret r;
+}
+
+# `content_at` holds, for a checked walk, the realized content of each located dependency
+fun walk(p: *project.Project, m: *manifest.Manifest, project_root: str, check: *Check, content_at: *intern.StrId) err[fail.Fail] {
+    val root_r: res[bool, fail.Fail] = check_dep_root(project_root);
+    if (sel root_r.err) { ret err[fail.Fail].err{root_r.err}; }
+    if (m.dep_count == 0) {
+        if (p.config.deps != nil && p.config.dep_count > 0) {
+            project.free_dep_entries(p.alloc, p.config.deps, p.config.dep_count, p.config.dep_count::usize);
+        }
+        p.config.deps      = nil;
+        p.config.dep_count = 0;
+        ret check_compiler_requirements(p, m, nil, 0, root_label(p, m));
+    }
+
+    val max_deps: usize                           = CLOSURE_MAX;
+    val r:        res[*project.DepEntry, A.Error] = A.allocate[project.DepEntry](p.alloc, max_deps);
+    if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
+    val deps:      *project.DepEntry = r.ok;
+    var dep_count: u32               = 0;
+
+    val ar: res[*bool, A.Error] = A.allocate[bool](p.alloc, max_deps);
+    if (sel ar.err) {
+        A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
+        ret err[fail.Fail].err{fail.refused(ar.err)};
+    }
+    val active: *bool = ar.ok;
+
+    val dir_dep_opt: opt[str] = intern.lookup(?p.s.interner, p.config.dir_dep);
+    if (sel dir_dep_opt.none) {
+        A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
+        A.deallocate[bool](p.alloc, active, max_deps);
+        ret err[fail.Fail].err{fail.message("dep dir StrId not interned")};
+    }
+    val dir_dep: str = dir_dep_opt.some;
+
+    val root_name: str = root_label(p, m);
+
+    var root_i: u32 = 0;
+    for (root_i < m.dep_count) {
+        val edge_r: res[u32, fail.Fail] = locate_edge(p, check, content_at, m, project_root, ?m.deps[root_i],
+            deps, active, ?dep_count, max_deps, dir_dep, root_name);
+        if (sel edge_r.err) {
+            A.deallocate[bool](p.alloc, active, max_deps);
+            project.free_dep_entries(p.alloc, deps, dep_count, max_deps);
+            ret err[fail.Fail].err{edge_r.err};
+        }
+        root_i = root_i + 1;
+    }
+    A.deallocate[bool](p.alloc, active, max_deps);
+
+    val needs: err[fail.Fail] = check_compiler_requirements(p, m, deps, dep_count, root_name);
+    if (sel needs.err) {
+        project.free_dep_entries(p.alloc, deps, dep_count, max_deps);
+        ret needs;
+    }
+
+    if (dep_count == 0) {
+        A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
+        if (p.config.deps != nil && p.config.dep_count > 0) {
+            project.free_dep_entries(p.alloc, p.config.deps, p.config.dep_count, p.config.dep_count::usize);
+        }
+        p.config.deps      = nil;
+        p.config.dep_count = 0;
+    }
+    or {
+        val r_shrink: res[*project.DepEntry, A.Error] = A.allocate[project.DepEntry](p.alloc, dep_count::usize);
+        if (sel r_shrink.err) {
+            project.free_dep_entries(p.alloc, deps, dep_count, max_deps);
+            ret err[fail.Fail].err{fail.refused(r_shrink.err)};
+        }
+        val shrunk: *project.DepEntry = r_shrink.ok;
+        var idx:    u32               = 0;
+        for (idx < dep_count) {
+            shrunk[idx] = deps[idx];
+            idx         = idx + 1;
+        }
+        A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
+        if (p.config.deps != nil && p.config.dep_count > 0) {
+            project.free_dep_entries(p.alloc, p.config.deps, p.config.dep_count, p.config.dep_count::usize);
+        }
+        p.config.deps      = shrunk;
+        p.config.dep_count = dep_count;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun mark_closure(p: *project.Project, keep: *bool, i: u32) {
+    if (keep[i]) { ret; }
+    keep[i] = true;
+    var k: u32 = 0;
+    for (k < p.config.deps[i].direct_count) {
+        val next: i64 = dep_graph_index(p, p.config.deps[i].direct[k]);
+        if (next >= 0) { mark_closure(p, keep, next::u32); }
+        k = k + 1;
+    }
+}
+
+# make a resolved closure the closure of one of its dependencies: the dependency's
+# entry moves to `p.config.owner` and `p.config.deps` keeps only what it reaches
+# through its own edges, in closure order
+# ---
+# p:     a project whose `p.config.deps` holds the root's resolved closure
+# owner: the dependency's project id
+# ret:   ok; err when the closure holds no such dependency
+pub fun scope_closure_to_dependency(p: *project.Project, owner: str) err[fail.Fail] {
+    val n:     u32 = p.config.dep_count;
+    var found: i64 = -1;
+    var i:     u32 = 0;
+    for (i < n) {
+        if (str_equals(id_text_or(p.s, p.config.deps[i].project_id, ""), owner)) { found = i::i64; }
+        i = i + 1;
+    }
+    if (found < 0) {
+        val msg: res[str, std_format.FormatError] = std_format.sprint(p.alloc,
+            "dependency '{}' is not in the resolved dependency closure", owner);
+        if (sel msg.err) { ret err[fail.Fail].err{fail.message(fail.format_text(msg.err))}; }
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_IN_CLOSURE, msg.ok)};
+    }
+    val oi: u32 = found::u32;
+
+    val kr: res[*bool, A.Error] = A.allocate[bool](p.alloc, n::usize);
+    if (sel kr.err) { ret err[fail.Fail].err{fail.refused(kr.err)}; }
+    val keep: *bool = kr.ok;
+    fin { A.deallocate[bool](p.alloc, keep, n::usize); }
+    i = 0;
+    for (i < n) {
+        keep[i] = false;
+        i       = i + 1;
+    }
+    var k: u32 = 0;
+    for (k < p.config.deps[oi].direct_count) {
+        val next: i64 = dep_graph_index(p, p.config.deps[oi].direct[k]);
+        if (next < 0) { ret err[fail.Fail].err{fail.message("verified dependency graph contains an unresolved direct edge")}; }
+        mark_closure(p, keep, next::u32);
+        k = k + 1;
+    }
+
+    var kept: u32 = 0;
+    i = 0;
+    for (i < n) {
+        if (keep[i]) { kept = kept + 1; }
+        i = i + 1;
+    }
+    var scoped: *project.DepEntry = nil;
+    if (kept > 0) {
+        val sr: res[*project.DepEntry, A.Error] = A.allocate[project.DepEntry](p.alloc, kept::usize);
+        if (sel sr.err) { ret err[fail.Fail].err{fail.refused(sr.err)}; }
+        scoped = sr.ok;
+    }
+    var w: u32 = 0;
+    i = 0;
+    for (i < n) {
+        if (keep[i]) {
+            scoped[w] = p.config.deps[i];
+            w         = w + 1;
+        }
+        or (i == oi) { p.config.owner = p.config.deps[i]; }
+        or           { project.free_dep_entries_in_place(p.alloc, ?p.config.deps[i], 1); }
+        i = i + 1;
+    }
+    A.deallocate[project.DepEntry](p.alloc, p.config.deps, n::usize);
+    p.config.dependency_owned = true;
+    p.config.deps             = scoped;
+    p.config.dep_count        = kept;
+    ret err[fail.Fail].ok{};
+}
+
+# the requirement scope of each project a configured cell compiles: the declaring
+# project's, holding the cell artifact's requirements, then one per closure
+# dependency, holding what its default library artifacts require
+# ---
+# p:       a configured project whose `art_reqs` and `deps` are resolved
+# root:    the root manifest, whose out and profile the dependencies' outputs expand in
+# profile: the resolved profile name
+# ret:     ok with `p.config.req_scopes` set; err from output expansion
+pub fun resolve_requirement_scopes(p: *project.Project, root: *manifest.Manifest, profile: str) err[fail.Fail] {
+    val n:  u32                                      = p.config.dep_count + 1;
+    val sr: res[*manifest.RequirementScope, A.Error] = A.allocate[manifest.RequirementScope](p.alloc, n::usize);
+    if (sel sr.err) { ret err[fail.Fail].err{fail.refused(sr.err)}; }
+    val scopes: *manifest.RequirementScope = sr.ok;
+    scopes[0] = manifest.RequirementScope{owner: p.config.id, dependency: false,
+        reqs: p.config.art_reqs, req_count: p.config.art_req_count};
+    p.config.req_scopes      = scopes;
+    p.config.req_scope_count = 1;
+
+    var i: u32 = 0;
+    for (i < p.config.dep_count) {
+        val dep:   *project.DepEntry     = ?p.config.deps[i];
+        var scope: manifest.Scope        = manifest.dependency_scope(root, ?dep.manifest);
+        var items: *manifest.ArtifactReq = nil;
+        var count: u32                   = 0;
+        val rr:    err[fail.Fail]        = manifest.resolve_default_library_reqs(p.alloc, ?p.s.interner, p.s.registry,
+            ?scope, profile, ?items, ?count);
+        if (sel rr.err) { ret rr; }
+        scopes[i + 1] = manifest.RequirementScope{owner: dep.project_id, dependency: true,
+            reqs: items, req_count: count};
+        p.config.req_scope_count = i + 2;
+        i                        = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun free_cascade_scratch(alloc: *A.Allocator, order: *u32, state: *u8, n: u32) {
+    A.deallocate[u32](alloc, order, n::usize);
+    A.deallocate[u8](alloc, state, n::usize);
+}
+
+fun dep_graph_index(p: *project.Project, id: intern.StrId) i64 {
+    var i: u32 = 0;
+    for (i < p.config.dep_count) {
+        if (p.config.deps[i].project_id == id) { ret i::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun cascade_dfs(p: *project.Project, state: *u8, order: *u32, order_len: *u32, i: u32) err[fail.Fail] {
+    if (state[i] == 2) { ret err[fail.Fail].ok{}; }
+    if (state[i] == 1) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_CYCLE, "dependency graph contains a cycle")}; }
+    state[i] = 1;
+    var k: u32 = 0;
+    for (k < p.config.deps[i].direct_count) {
+        val next: i64 = dep_graph_index(p, p.config.deps[i].direct[k]);
+        if (next < 0) { ret err[fail.Fail].err{fail.message("verified dependency graph contains an unresolved direct edge")}; }
+        val rr: err[fail.Fail] = cascade_dfs(p, state, order, order_len, next::u32);
+        if (sel rr.err) { ret err[fail.Fail].err{rr.err}; }
+        k = k + 1;
+    }
+    state[i]          = 2;
+    order[@order_len] = i;
+    @order_len        = @order_len + 1;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun resolve_cascade_libs(p: *project.Project, isa: str, os: str, abi: str,
+    own_libs: *manifest.LinkRequirement, own_count: u32) err[fail.Fail] {
+    if (p.config.cascade_libs != nil && p.config.cascade_lib_count > 0) {
+        manifest.free_link_claims(p.alloc, p.config.cascade_libs, p.config.cascade_lib_count);
+        A.deallocate[manifest.LinkRequirement](p.alloc, p.config.cascade_libs, p.config.cascade_lib_count::usize);
+    }
+    p.config.cascade_libs      = nil;
+    p.config.cascade_lib_count = 0;
+    val n: u32 = p.config.dep_count;
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+
+    val ov: res[*u32, A.Error] = A.allocate[u32](p.alloc, n::usize);
+    if (sel ov.err) { ret err[fail.Fail].err{fail.refused(ov.err)}; }
+    val order: *u32              = ov.ok;
+    val vv:    res[*u8, A.Error] = A.allocate[u8](p.alloc, n::usize);
+    if (sel vv.err) {
+        A.deallocate[u32](p.alloc, order, n::usize);
+        ret err[fail.Fail].err{fail.refused(vv.err)};
+    }
+    val state: *u8 = vv.ok;
+    var i:     u32 = 0;
+    for (i < n) {
+        state[i] = 0;
+        i        = i + 1;
+    }
+    var order_len: u32 = 0;
+    i = 0;
+    for (i < n) {
+        val dr: err[fail.Fail] = cascade_dfs(p, state, order, ?order_len, i);
+        if (sel dr.err) {
+            free_cascade_scratch(p.alloc, order, state, n);
+            ret dr;
+        }
+        i = i + 1;
+    }
+
+    var tgt:         manifest.TargetDef;
+    val res_tgt_isa: res[intern.StrId, A.Error] = intern.intern(?p.s.interner, isa);
+    if (sel res_tgt_isa.err) {
+        free_cascade_scratch(p.alloc, order, state, n);
+        ret err[fail.Fail].err{fail.refused(res_tgt_isa.err)};
+    }
+    tgt.isa = res_tgt_isa.ok;
+
+    val res_tgt_os: res[intern.StrId, A.Error] = intern.intern(?p.s.interner, os);
+    if (sel res_tgt_os.err) {
+        free_cascade_scratch(p.alloc, order, state, n);
+        ret err[fail.Fail].err{fail.refused(res_tgt_os.err)};
+    }
+    tgt.os = res_tgt_os.ok;
+
+    val res_tgt_abi: res[intern.StrId, A.Error] = intern.intern(?p.s.interner, abi);
+    if (sel res_tgt_abi.err) {
+        free_cascade_scratch(p.alloc, order, state, n);
+        ret err[fail.Fail].err{fail.refused(res_tgt_abi.err)};
+    }
+    tgt.abi = res_tgt_abi.ok;
+
+    var max: u32 = 0;
+    i = 0;
+    for (i < n) {
+        val mfd: *manifest.Manifest = ?p.config.deps[i].manifest;
+        max = max + mfd.link_count;
+        i   = i + 1;
+    }
+
+    if (max == 0) {
+        free_cascade_scratch(p.alloc, order, state, n);
+        ret err[fail.Fail].ok{};
+    }
+
+    val br: res[*manifest.LinkRequirement, A.Error] = A.allocate[manifest.LinkRequirement](p.alloc, max::usize);
+    if (sel br.err) {
+        free_cascade_scratch(p.alloc, order, state, n);
+        ret err[fail.Fail].err{fail.refused(br.err)};
+    }
+    val buf: *manifest.LinkRequirement = br.ok;
+    var w:   u32                       = 0;
+
+    var oi: u32 = 0;
+    for (oi < order_len) {
+        val di:  u32                = order[oi];
+        val mfd: *manifest.Manifest = ?p.config.deps[di].manifest;
+
+        var li: u32 = 0;
+        for (li < mfd.link_count) {
+            val l: *manifest.LinkDef = ?mfd.links[li];
+            if (l.export && manifest.link_matches_target(?p.s.interner, l, ?tgt)) {
+                val root_out_opt: opt[str] = intern.lookup(?p.s.interner, p.config.project_out);
+                if (sel root_out_opt.none) {
+                    free_cascade_scratch(p.alloc, order, state, n);
+                    manifest.free_link_claims(p.alloc, buf, w);
+                    A.deallocate[manifest.LinkRequirement](p.alloc, buf, max::usize);
+                    ret err[fail.Fail].err{fail.message("internal: project output not interned")};
+                }
+                var cv:    manifest.TmplVars                        = cell_tmpl_vars(p);
+                val req_r: res[manifest.LinkRequirement, fail.Fail] = manifest.link_requirement(p.alloc, ?p.s.interner, l, root_out_opt.some, ?cv);
+                if (sel req_r.err) {
+                    free_cascade_scratch(p.alloc, order, state, n);
+                    manifest.free_link_claims(p.alloc, buf, w);
+                    A.deallocate[manifest.LinkRequirement](p.alloc, buf, max::usize);
+                    ret err[fail.Fail].err{req_r.err};
+                }
+                var req:           manifest.LinkRequirement = req_r.ok;
+                val own_duplicate: i64                      = requirement_index(own_libs, own_count, ?req);
+                val dep_duplicate: i64                      = requirement_index(buf, w, ?req);
+                if (own_duplicate < 0 && dep_duplicate < 0) {
+                    buf[w] = req;
+                    w      = w + 1;
+                }
+                or {
+                    var retained: *manifest.LinkRequirement = nil;
+                    if (own_duplicate >= 0) { retained = ?own_libs[own_duplicate::u32]; }
+                    or                      { retained = ?buf[dep_duplicate::u32]; }
+                    val mr: err[fail.Fail] = manifest.merge_link_claims(p.alloc, retained, ?req);
+                    if (sel mr.err) {
+                        manifest.free_link_claims(p.alloc, ?req, 1);
+                        free_cascade_scratch(p.alloc, order, state, n);
+                        manifest.free_link_claims(p.alloc, buf, w);
+                        A.deallocate[manifest.LinkRequirement](p.alloc, buf, max::usize);
+                        ret mr;
+                    }
+                    manifest.free_link_claims(p.alloc, ?req, 1);
+                }
+            }
+            li = li + 1;
+        }
+        oi = oi + 1;
+    }
+
+    free_cascade_scratch(p.alloc, order, state, n);
+    ret manifest.finish_link_requirements(p.alloc, buf, max, w,
+        ?p.config.cascade_libs, ?p.config.cascade_lib_count);
+}
+
+fun requirement_index(arr: *manifest.LinkRequirement, count: u32,
+    req: *manifest.LinkRequirement) i64 {
+    if (arr == nil) { ret -1; }
+    var k: u32 = 0;
+    for (k < count) {
+        if (arr[k].source == req.source && arr[k].text == req.text
+            && arr[k].library == req.library) { ret k::i64; }
+        k = k + 1;
+    }
+    ret -1;
+}
+
+# a build only reads dep/; realizing a missing dependency is `mach dep pull`'s
+fun missing_text(s: *session.Session, alias: str, dep_dir: str, root: str) str {
+    val r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+        "dependency '{}' is missing: nothing is checked out at '{}'; run `mach dep pull {}`", alias, dep_dir, root);
+    if (sel r.err) { ret "a dependency is missing; run `mach dep pull`"; }
+    ret r.ok;
+}
+
+fun diag_dep_manifest_error(s: *session.Session, alias: str, read_err: str) str {
+    val fallback: str                              = "dep manifest unreadable; run `mach dep pull <path>`";
+    val res_msg:  res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "dep '{}': {}", alias, read_err);
+    if (sel res_msg.err) { ret fallback; }
+    val buf: str = res_msg.ok;
+
+    val ir: res[intern.StrId, A.Error] = intern.intern(?s.interner, buf);
+    str_free(s.build_alloc, buf);
+    if (sel ir.err) { ret fallback; }
+
+    val nm: opt[str] = intern.lookup(?s.interner, ir.ok);
+    if (sel nm.some) { ret nm.some; }
+    ret fallback;
+}
+
+fun locate_dependency(s: *session.Session, alias: str, project_root: str,
+    dir_dep: str, d: *manifest.DepDef) res[project.DepEntry, fail.Fail] {
+    val dep_dir_r: res[str, fail.Fail] = build_dep_root(s.build_alloc, project_root, dir_dep, alias);
+    if (sel dep_dir_r.err) { ret res[project.DepEntry, fail.Fail].err{dep_dir_r.err}; }
+    val dep_dir: str = dep_dir_r.ok;
+
+    # absent, or the empty directory a pin leaves for a dependency never realized, as on a fresh clone
+    val unrealized_r: res[bool, fail.Fail] = unrealized(s.build_alloc, dep_dir);
+    if (sel unrealized_r.err) {
+        str_free(s.build_alloc, dep_dir);
+        ret res[project.DepEntry, fail.Fail].err{unrealized_r.err};
+    }
+    if (unrealized_r.ok) {
+        val msg: str = missing_text(s, alias, dep_dir, project_root);
+        str_free(s.build_alloc, dep_dir);
+        ret res[project.DepEntry, fail.Fail].err{fail.user(diagnostic_kind.DEP_UNREALIZED, msg)};
+    }
+    val is_symlink_r: res[bool, io_error.Error] = fs.is_symlink(dep_dir);
+    val is_dir_r:     res[bool, io_error.Error] = fs.is_dir(dep_dir);
+    if ((sel is_symlink_r.ok && is_symlink_r.ok) || !(sel is_dir_r.ok && is_dir_r.ok)) {
+        str_free(s.build_alloc, dep_dir);
+        ret res[project.DepEntry, fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_DIRECTORY, "dependency realization must be a physical directory, not a symlink or other entry")};
+    }
+
+    val toml_path_r: res[str, fail.Fail] = load.join_path(s.build_alloc, dep_dir, manifest.MANIFEST_FILE);
+    if (sel toml_path_r.err) {
+        str_free(s.build_alloc, dep_dir);
+        ret res[project.DepEntry, fail.Fail].err{toml_path_r.err};
+    }
+    val toml_path: str = toml_path_r.ok;
+
+    val tr: res[manifest.Doc, fail.Fail] = manifest.doc_read(s.build_alloc, toml_path);
+    str_free(s.build_alloc, toml_path);
+    if (sel tr.err) {
+        val msg: str = diag_dep_manifest_error(s, alias, fail.describe(tr.err));
+        str_free(s.build_alloc, dep_dir);
+        ret res[project.DepEntry, fail.Fail].err{fail.with_text(tr.err, msg)};
+    }
+    var doc: manifest.Doc = tr.ok;
+
+    val mr: res[manifest.Manifest, fail.Fail] = manifest.parse(s.build_alloc, ?s.interner, ?doc);
+    manifest.doc_dnit(s.build_alloc, ?doc);
+    if (sel mr.err) {
+        val msg_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "dep '{}': {}", alias,
+            fail.describe(mr.err));
+        str_free(s.build_alloc, dep_dir);
+        if (sel msg_r.err) { ret res[project.DepEntry, fail.Fail].err{mr.err}; }
+        ret res[project.DepEntry, fail.Fail].err{fail.with_text(mr.err, msg_r.ok)};
+    }
+    var parsed: manifest.Manifest = mr.ok;
+
+    val declared_opt: opt[str] = intern.lookup(?s.interner, parsed.id);
+    if (sel declared_opt.none) {
+        str_free(s.build_alloc, dep_dir);
+        manifest.dnit(?parsed, s.build_alloc);
+        ret res[project.DepEntry, fail.Fail].err{fail.user(diagnostic_kind.DEP_NO_PROJECT_ID, "dependency manifest declares no readable project id")};
+    }
+    var entry: project.DepEntry;
+    entry.direct          = nil;
+    entry.direct_count    = 0;
+    entry.chain           = intern.STR_NIL;
+    entry.manifest        = parsed;
+    entry.project_id      = parsed.id;
+    entry.project_dir_src = parsed.src;
+    entry.ref             = d.ref;
+
+    val ra: res[intern.StrId, A.Error] = intern.intern(?s.interner, alias);
+    if (sel ra.err) {
+        str_free(s.build_alloc, dep_dir);
+        manifest.dnit(?entry.manifest, s.build_alloc);
+        ret res[project.DepEntry, fail.Fail].err{fail.refused(ra.err)};
+    }
+    entry.alias = ra.ok;
+
+    val source_r: res[intern.StrId, fail.Fail] = dep_source_label(s, d);
+    if (sel source_r.err) {
+        str_free(s.build_alloc, dep_dir);
+        manifest.dnit(?entry.manifest, s.build_alloc);
+        ret res[project.DepEntry, fail.Fail].err{source_r.err};
+    }
+    entry.source = source_r.ok;
+
+    # the public entry is only ever an explicitly defaulted library artifact's
+    entry.project_module = manifest.canonical_module(?parsed);
+
+    val dep_src_opt: opt[str] = intern.lookup(?s.interner, entry.project_dir_src);
+    if (sel dep_src_opt.none) {
+        str_free(s.build_alloc, dep_dir);
+        manifest.dnit(?entry.manifest, s.build_alloc);
+        ret res[project.DepEntry, fail.Fail].err{fail.message("dependency source directory is not interned")};
+    }
+    val dep_src_text: str = dep_src_opt.some;
+    if (entry.project_module != intern.STR_NIL) {
+        val entry_opt: opt[str] = intern.lookup(?s.interner, entry.project_module);
+        if (sel entry_opt.none) {
+            str_free(s.build_alloc, dep_dir);
+            manifest.dnit(?entry.manifest, s.build_alloc);
+            ret res[project.DepEntry, fail.Fail].err{fail.message("dependency canonical module is not interned")};
+        }
+        val dep_entry_file: str                  = entry_opt.some;
+        val present_r:      res[bool, fail.Fail] = module_file_present(s.build_alloc, dep_dir, dep_src_text, dep_entry_file);
+        if (sel present_r.err) {
+            str_free(s.build_alloc, dep_dir);
+            manifest.dnit(?entry.manifest, s.build_alloc);
+            ret res[project.DepEntry, fail.Fail].err{present_r.err};
+        }
+        if (!present_r.ok) {
+            val msg: str = load.diag_join_named(s, "dep '", entry.alias, "' mach.toml: public entry names no file", "dep mach.toml: public entry names no file");
+            str_free(s.build_alloc, dep_dir);
+            manifest.dnit(?entry.manifest, s.build_alloc);
+            ret res[project.DepEntry, fail.Fail].err{fail.user(diagnostic_kind.DEP_ENTRY_MISSING, msg)};
+        }
+    }
+
+    val rvr: res[intern.StrId, A.Error] = intern.intern(?s.interner, dep_dir);
+    if (sel rvr.err) {
+        str_free(s.build_alloc, dep_dir);
+        manifest.dnit(?entry.manifest, s.build_alloc);
+        ret res[project.DepEntry, fail.Fail].err{fail.refused(rvr.err)};
+    }
+    entry.vendor_root = rvr.ok;
+
+    str_free(s.build_alloc, dep_dir);
+    ret res[project.DepEntry, fail.Fail].ok{entry};
+}
+
+pub fun build_dep_root(alloc: *A.Allocator, project_root: str, dir_dep: str, alias: str) res[str, fail.Fail] {
+    val a: res[str, fail.Fail] = load.join_path(alloc, project_root, dir_dep);
+    if (sel a.err) { ret res[str, fail.Fail].err{a.err}; }
+    val mid: str                 = a.ok;
+    val b:   res[str, fail.Fail] = load.join_path(alloc, mid, alias);
+    str_free(alloc, mid);
+    if (sel b.err) { ret res[str, fail.Fail].err{b.err}; }
+    ret res[str, fail.Fail].ok{b.ok};
+}
+
+pub fun cell_tmpl_vars(p: *project.Project) manifest.TmplVars {
+    var v: manifest.TmplVars;
+    v.target  = project.fqn_name(p, p.target_entry.name);
+    v.isa     = project.fqn_name(p, p.target_entry.isa_name);
+    v.os      = project.fqn_name(p, p.target_entry.os_name);
+    v.abi     = project.fqn_name(p, p.target_entry.abi_name);
+    v.profile = project.fqn_name(p, p.config.profile);
+    v.format  = "";
+    val format: opt[str] = intern.lookup(?p.s.interner, p.target_entry.of_name);
+    if (sel format.some) { v.format = format.some; }
+    v.artifact_suffix = nil;
+    v.reqs            = p.config.art_reqs;
+    v.req_count       = p.config.art_req_count;
+    ret v;
+}
+
+# `cell_tmpl_vars` whose `{artifact.<id>.out}` resolves in the requirement scope
+# of the project `owner` names, empty when the cell binds no scope for it
+pub fun owner_tmpl_vars(p: *project.Project, owner: str) manifest.TmplVars {
+    var v: manifest.TmplVars = cell_tmpl_vars(p);
+    v.reqs      = nil;
+    v.req_count = 0;
+    var i: u32 = 0;
+    for (i < p.config.req_scope_count) {
+        if (str_equals(id_text_or(p.s, p.config.req_scopes[i].owner, ""), owner)) {
+            v.reqs      = p.config.req_scopes[i].reqs;
+            v.req_count = p.config.req_scopes[i].req_count;
+        }
+        i = i + 1;
+    }
+    ret v;
+}
+
+pub val DEP_DIR: str = "dep";
+
+#[testing]
+fun t_floor_is(a: *A.Allocator, running: str, want: str) bool {
+    val got: res[str, std_format.FormatError] = mach_range_floor(a, running);
+    if (sel got.err) { ret false; }
+    val same: bool = str_equals(got.ok, want);
+    str_free(a, got.ok);
+    ret same;
+}
+
+# the suggested compiler range is the key's floor within its major, and `^N.0` past it
+test mach_range_floor__depends_only_on_the_running_major {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err)                    { ret 1; }
+    if (!t_floor_is(?a, "5.3.0", "^5.3"))  { ret 2; }
+    if (!t_floor_is(?a, "5.4.0", "^5.3"))  { ret 3; }
+    if (!t_floor_is(?a, "5.99.1", "^5.3")) { ret 4; }
+    if (!t_floor_is(?a, "6.0.0", "^6.0"))  { ret 5; }
+    if (!t_floor_is(?a, "7.2.3", "^7.0"))  { ret 6; }
+    ret 0;
+}

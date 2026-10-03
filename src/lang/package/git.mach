@@ -1,0 +1,1145 @@
+# git: the one outside tool mach runs. a dependency is acquired and pinned through git
+# (package/git holds the source and pin members built on it); nothing else in the
+# toolchain spawns it, and a build never does. every git process starts here, with one
+# environment that keeps the user's configuration and drops whatever would redirect git to
+# another repository, and every failure names the command, how it ended and what git printed
+use std.allocator.page;
+use std.collections.sort;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use fs:         std.filesystem;
+use std_format: std.format;
+use io_error:   std.io.error;
+use std.process.env;
+use std.process.exec;
+use system_os: std.system.os;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use types_string: std.types.string;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_contains;
+use std.types.string.str_copy_slice;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+
+use diagnostic_kind:    mach.lang.diagnostic.kind;
+use driver_environment: mach.lang.driver.environment;
+use mach.lang.driver.load;
+use mach.lang.fail;
+use mach.lang.session;
+use mach.lang.subprocess;
+
+pub rec Entry {
+    path: str;
+    mode: str;
+}
+
+# one checked-out tree's committed entries, as `git ls-tree -r -t --full-tree HEAD` lists
+# them: repository-relative paths with their object modes, sorted by path
+pub rec Tree {
+    dir:     str;
+    entries: Vector[Entry];
+}
+
+# an inspector spawns git with one environment and answers every committed-mode question
+# about a checkout from one tree listing, so verification costs a constant number of git
+# processes per checkout rather than one per walked path. a command that can move
+# a checkout drops the listings.
+pub rec Inspector {
+    program:       str;
+    inherited_env: **u8;
+    alloc:         *A.Allocator;
+    env_ready:     bool;
+    env_config:    **u8;
+    env_inherited: **u8;
+    env:           driver_environment.Strings;
+    trees:         Vector[Tree];
+    trees_ready:   bool;
+}
+
+pub fun inspector_init(alloc: *A.Allocator) res[Inspector, fail.Fail] {
+    val rr: res[str, exec.Error] = exec.resolve(alloc, "git");
+    if (sel rr.err) { ret res[Inspector, fail.Fail].err{fail.environment(diagnostic_kind.GIT_MISSING, "git not found on PATH; dependency verification requires Git")}; }
+    val inherited: **u8 = env.environ();
+    if (inherited == nil) {
+        str_free(alloc, rr.ok);
+        ret res[Inspector, fail.Fail].err{fail.environment(diagnostic_kind.GIT_MISSING, "Git dependency environment unavailable")};
+    }
+    ret res[Inspector, fail.Fail].ok{Inspector{program: rr.ok, inherited_env: inherited, alloc: alloc}};
+}
+
+fun tree_free(alloc: *A.Allocator, t: *Tree) {
+    str_free(alloc, t.dir);
+    var i: usize = 0;
+    for (i < t.entries.len) {
+        str_free(alloc, t.entries.data[i].path);
+        str_free(alloc, t.entries.data[i].mode);
+        i = i + 1;
+    }
+    collections_vector.dnit[Entry](?t.entries);
+}
+
+fun inspector_drop_trees(gi: *Inspector) {
+    if (!gi.trees_ready) { ret; }
+    var i: usize = 0;
+    for (i < gi.trees.len) {
+        tree_free(gi.alloc, ?gi.trees.data[i]);
+        i = i + 1;
+    }
+    collections_vector.dnit[Tree](?gi.trees);
+    gi.trees_ready = false;
+}
+
+pub fun inspector_dnit(alloc: *A.Allocator, gi: *Inspector) {
+    inspector_drop_trees(gi);
+    if (gi.env_ready) { driver_environment.strings_free(gi.alloc, ?gi.env); }
+    gi.env_ready = false;
+    str_free(alloc, gi.program);
+    gi.program       = nil;
+    gi.inherited_env = nil;
+}
+
+pub rec Bytes {
+    data: *u8;
+    len:  usize;
+}
+
+pub fun bytes_free(alloc: *A.Allocator, bytes: *Bytes) {
+    if (bytes.data != nil) { A.deallocate[u8](alloc, bytes.data, bytes.len + 1); }
+    bytes.data = nil;
+    bytes.len  = 0;
+}
+
+fun captured_bytes(alloc: *A.Allocator, p: *subprocess.OwnedSubprocess, trim_line_end: bool) res[Bytes, fail.Fail] {
+    var n:   usize = 0;
+    val src: *u8   = subprocess.capture_bytes(p, ?n);
+    for (trim_line_end && n > 0 && (src[n - 1] == '\n' || src[n - 1] == '\r')) { n = n - 1; }
+    val ar: res[*u8, A.Error] = A.allocate[u8](alloc, n + 1);
+    if (sel ar.err) { ret res[Bytes, fail.Fail].err{fail.refused(ar.err)}; }
+    val out: *u8   = ar.ok;
+    var i:   usize = 0;
+    for (i < n) {
+        out[i] = src[i];
+        i      = i + 1;
+    }
+    out[n] = 0;
+    ret res[Bytes, fail.Fail].ok{Bytes{data: out, len: n}};
+}
+
+fun capture_cleanup(alloc: *A.Allocator, temp: *fs.TempFile, child: *subprocess.OwnedSubprocess, release: bool) {
+    if (release) { subprocess.release_capture(alloc, child); }
+    subprocess.dnit(alloc, child);
+    fs.temp_remove(temp);
+    str_free(alloc, fs.temp_path(temp));
+}
+
+pub fun count_nil_terminated(arr: **u8) usize {
+    if (arr == nil) { ret 0; }
+    var n: usize = 0;
+    for (arr[n] != nil) { n = n + 1; }
+    ret n;
+}
+
+var config_env: **u8 = nil;
+
+#[testing]
+pub fun set_config_env(env: **u8) {
+    config_env = env;
+}
+
+# compare reserved key segments through the host's environment name identity
+pub fun env_prefix(alloc: *A.Allocator, entry: *u8, prefix: str) res[bool, fail.Fail] {
+    val prefix_size: usize = str_len(prefix);
+    val exact:       bool  = prefix[prefix_size - 1] == '=';
+    var wanted:      usize = 0;
+    var i:           usize = 0;
+    for (i < prefix_size) {
+        if (prefix[i] == '_') { wanted = wanted + 1; }
+        i = i + 1;
+    }
+    var size:  usize = 0;
+    var parts: usize = 0;
+    for (entry[size] != 0 && entry[size] != '=') {
+        if (!exact && entry[size] == '_') {
+            parts = parts + 1;
+            if (parts == wanted) {
+                size = size + 1;
+                brk;
+            }
+        }
+        size = size + 1;
+    }
+    var compared: usize = prefix_size;
+    if (exact) {
+        if (entry[size] != '=') { ret res[bool, fail.Fail].ok{false}; }
+        compared = compared - 1;
+    }
+    or (parts != wanted) { ret res[bool, fail.Fail].ok{false}; }
+    val lr: res[str, types_string.StrError] = str_copy_slice(alloc, entry::str, 0, size);
+    if (sel lr.err) { ret res[bool, fail.Fail].err{fail.message(fail.str_text(lr.err))}; }
+    val left: str = lr.ok;
+    fin { str_free(alloc, left); }
+    val rr: res[str, types_string.StrError] = str_copy_slice(alloc, prefix, 0, compared);
+    if (sel rr.err) { ret res[bool, fail.Fail].err{fail.message(fail.str_text(rr.err))}; }
+    val right: str = rr.ok;
+    fin { str_free(alloc, right); }
+    val order: res[i32, env.EnvError] = env.compare_names(left, right);
+    if (sel order.err) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.ENV_READ, fail.env_text(order.err))}; }
+    ret res[bool, fail.Fail].ok{order.ok == 0};
+}
+
+fun env_names_config(alloc: *A.Allocator, entry: *u8) res[bool, fail.Fail] {
+    var prefixes: [3]str = [3]str{"GIT_CONFIG_COUNT=", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"};
+    var i:        usize  = 0;
+    for (i < 3) {
+        val found: res[bool, fail.Fail] = env_prefix(alloc, entry, prefixes[i]);
+        if (sel found.err) { ret found; }
+        if (found.ok)      { ret found; }
+        i = i + 1;
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+fun inherits_env(alloc: *A.Allocator, entry: *u8, config_override: bool) res[bool, fail.Fail] {
+    val family: res[bool, fail.Fail] = env_prefix(alloc, entry, "GIT_");
+    if (sel family.err) { ret res[bool, fail.Fail].err{family.err}; }
+    if (!family.ok)     { ret res[bool, fail.Fail].ok{true}; }
+    val config: res[bool, fail.Fail] = env_names_config(alloc, entry);
+    if (sel config.err) { ret res[bool, fail.Fail].err{config.err}; }
+    if (config.ok)      { ret res[bool, fail.Fail].ok{!config_override}; }
+    var allowed: [5]str = [5]str{"GIT_CONFIG_GLOBAL=", "GIT_CONFIG_SYSTEM=", "GIT_CONFIG_NOSYSTEM=", "GIT_ATTR_NOSYSTEM=", "GIT_CONFIG_PARAMETERS="};
+    var count:   usize  = 5;
+    if (config_override) { count = 4; }
+    var i: usize = 0;
+    for (i < count) {
+        val found: res[bool, fail.Fail] = env_prefix(alloc, entry, allowed[i]);
+        if (sel found.err) { ret found; }
+        if (found.ok)      { ret found; }
+        i = i + 1;
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+fun environment(alloc: *A.Allocator, inherited: **u8, extras: **u8) res[driver_environment.Strings, fail.Fail] {
+    var values: driver_environment.Environment = driver_environment.init(alloc);
+    fin { driver_environment.dnit(?values); }
+    var override: bool  = false;
+    var i:        usize = 0;
+    for (extras != nil && extras[i] != nil) {
+        val config: res[bool, fail.Fail] = env_names_config(alloc, extras[i]);
+        if (sel config.err) { ret res[driver_environment.Strings, fail.Fail].err{config.err}; }
+        if (config.ok)      { override = true; }
+        i = i + 1;
+    }
+    var configured: **u8 = config_env;
+    if (override) { configured = nil; }
+    val inherited_override: bool           = override || count_nil_terminated(configured) != 0;
+    val locks:              err[fail.Fail] = driver_environment.put(?values, "GIT_OPTIONAL_LOCKS", "0", true);
+    if (sel locks.err) { ret res[driver_environment.Strings, fail.Fail].err{locks.err}; }
+    val prompt: err[fail.Fail] = driver_environment.put(?values, "GIT_TERMINAL_PROMPT", "0", true);
+    if (sel prompt.err) { ret res[driver_environment.Strings, fail.Fail].err{prompt.err}; }
+    var layers: [3]**u8 = [3]**u8{inherited, extras, configured};
+    var layer:  usize   = 0;
+    for (layer < 3) {
+        val entries: **u8 = layers[layer];
+        i = 0;
+        for (entries != nil && entries[i] != nil) {
+            val suppress_config: bool                 = layer == 0 && inherited_override;
+            val keep:            res[bool, fail.Fail] = inherits_env(alloc, entries[i], suppress_config);
+            if (sel keep.err) { ret res[driver_environment.Strings, fail.Fail].err{keep.err}; }
+            if (keep.ok) {
+                val added: err[fail.Fail] = driver_environment.put_entry(?values, entries[i]::str, layer != 0);
+                if (sel added.err) { ret res[driver_environment.Strings, fail.Fail].err{added.err}; }
+            }
+            i = i + 1;
+        }
+        layer = layer + 1;
+    }
+    ret driver_environment.to_strings(?values);
+}
+
+fun command_text(alloc: *A.Allocator, args: **u8) res[str, std_format.FormatError] {
+    val first: res[str, std_format.FormatError] = std_format.sprint(alloc, "git");
+    if (sel first.err) { ret first; }
+    var text: str   = first.ok;
+    var i:    usize = 0;
+    for (args[i] != nil) {
+        val longer: res[str, std_format.FormatError] = std_format.sprint(alloc, "{} {}", text, args[i]::str);
+        str_free(alloc, text);
+        if (sel longer.err) { ret longer; }
+        text = longer.ok;
+        i    = i + 1;
+    }
+    ret res[str, std_format.FormatError].ok{text};
+}
+
+# the failure of a git command names the command, how it ended, and what git printed
+fun failure(alloc: *A.Allocator, child: *subprocess.OwnedSubprocess, args: **u8,
+    terminal: subprocess.SubprocessTerminal) fail.Fail {
+    val command: res[str, std_format.FormatError] = command_text(alloc, args);
+    if (sel command.err) { ret fail.environment(diagnostic_kind.GIT_COMMAND, "a Git dependency command failed"); }
+    fin { str_free(alloc, command.ok); }
+    var ended: res[str, std_format.FormatError];
+    if (terminal.kind == subprocess.STATE_EXITED) { ended = std_format.sprint(alloc, "`{}` exited with status {}", command.ok, terminal.code); }
+    or                                            { ended = std_format.sprint(alloc, "`{}` did not exit normally", command.ok); }
+    if (sel ended.err)                            { ret fail.environment(diagnostic_kind.GIT_COMMAND, "a Git dependency command failed"); }
+    val output: res[Bytes, fail.Fail] = captured_bytes(alloc, child, true);
+    if (sel output.err) { ret fail.environment(diagnostic_kind.GIT_COMMAND, ended.ok); }
+    var bytes: Bytes = output.ok;
+    fin { bytes_free(alloc, ?bytes); }
+    var start: usize = 0;
+    for (start < bytes.len && (bytes.data[start] == '\n' || bytes.data[start] == '\r' || bytes.data[start] == ' ')) { start = start + 1; }
+    if (start == bytes.len || str_len(bytes.data::str) != bytes.len) { ret fail.environment(diagnostic_kind.GIT_COMMAND, ended.ok); }
+    val full: res[str, std_format.FormatError] = std_format.sprint(alloc, "{}: {}", ended.ok, (?bytes.data[start])::str);
+    if (sel full.err) { ret fail.environment(diagnostic_kind.GIT_COMMAND, ended.ok); }
+    str_free(alloc, ended.ok);
+    ret fail.environment(diagnostic_kind.GIT_COMMAND, full.ok);
+}
+
+fun run_capture(alloc: *A.Allocator, gi: *Inspector, argv: **u8, shown: **u8, trim_line_end: bool, extra_env: **u8, stdin_fd: usize, capture_stderr: bool) res[Bytes, fail.Fail] {
+    val tr: res[fs.TempFile, fs.FsError] = fs.temp_create(alloc, "mach_dep_verify");
+    if (sel tr.err) { ret res[Bytes, fail.Fail].err{fail.environment(diagnostic_kind.FS_TEMP, fail.fs_text(tr.err))}; }
+    var temp:         fs.TempFile         = tr.ok;
+    val temp_close_r: err[io_error.Error] = fs.temp_close(?temp);
+    if (sel temp_close_r.err) {
+        fs.temp_remove(?temp);
+        str_free(alloc, fs.temp_path(?temp));
+        ret res[Bytes, fail.Fail].err{fail.environment(diagnostic_kind.GIT_COMMAND, "failed to close dependency verification capture")};
+    }
+
+    var child: subprocess.OwnedSubprocess;
+    subprocess.init(?child);
+    if (!argv_reads_only(argv)) { inspector_drop_trees(gi); }
+    var shared: bool = extra_env == nil && gi.alloc != nil;
+    if (shared && gi.env_ready && (gi.env_config != config_env || gi.env_inherited != gi.inherited_env)) {
+        driver_environment.strings_free(gi.alloc, ?gi.env);
+        gi.env_ready = false;
+    }
+    if (shared && !gi.env_ready) {
+        val built: res[driver_environment.Strings, fail.Fail] = environment(gi.alloc, gi.inherited_env, nil);
+        if (sel built.err) {
+            capture_cleanup(alloc, ?temp, ?child, false);
+            ret res[Bytes, fail.Fail].err{built.err};
+        }
+        gi.env           = built.ok;
+        gi.env_config    = config_env;
+        gi.env_inherited = gi.inherited_env;
+        gi.env_ready     = true;
+    }
+    var git_env: driver_environment.Strings;
+    if (shared) { git_env = gi.env; }
+    or {
+        val env_r: res[driver_environment.Strings, fail.Fail] = environment(alloc, gi.inherited_env, extra_env);
+        if (sel env_r.err) {
+            capture_cleanup(alloc, ?temp, ?child, false);
+            ret res[Bytes, fail.Fail].err{env_r.err};
+        }
+        git_env = env_r.ok;
+    }
+    fin {
+        if (!shared) { driver_environment.strings_free(alloc, ?git_env); }
+    }
+    var options: subprocess.SpawnOptions = subprocess.spawn_options();
+    options.stdin          = stdin_fd;
+    options.capture        = fs.temp_path(?temp);
+    options.capture_stderr = capture_stderr;
+    options.capture_limit  = 1048576;
+    val sr: err[subprocess.Error] = subprocess.spawn(alloc, ?child, gi.program, argv, git_env.items, options);
+    if (sel sr.err) {
+        capture_cleanup(alloc, ?temp, ?child, false);
+        ret res[Bytes, fail.Fail].err{fail.environment(diagnostic_kind.GIT_COMMAND, subprocess.text(alloc, sr.err))};
+    }
+    val wr: res[subprocess.SubprocessTerminal, subprocess.Error] = subprocess.wait(alloc, ?child);
+    if (sel wr.err) {
+        subprocess.abandon_capture(?child);
+        capture_cleanup(alloc, ?temp, ?child, false);
+        ret res[Bytes, fail.Fail].err{fail.environment(diagnostic_kind.GIT_COMMAND, subprocess.text(alloc, wr.err))};
+    }
+    val terminal: subprocess.SubprocessTerminal                     = wr.ok;
+    val cr:       res[subprocess.CaptureIoResult, subprocess.Error] = subprocess.finish_capture(alloc, ?child, true);
+    if (sel cr.err) {
+        capture_cleanup(alloc, ?temp, ?child, false);
+        ret res[Bytes, fail.Fail].err{fail.environment(diagnostic_kind.GIT_COMMAND, subprocess.text(alloc, cr.err))};
+    }
+    val cap: subprocess.CaptureIoResult = cr.ok;
+    if (cap.read_failed || cap.write_failed || cap.close_failed || cap.short_read || cap.truncated) {
+        capture_cleanup(alloc, ?temp, ?child, true);
+        ret res[Bytes, fail.Fail].err{fail.environment(diagnostic_kind.GIT_COMMAND, "Git dependency inspection output could not be captured completely")};
+    }
+    if (terminal.kind != subprocess.STATE_EXITED || terminal.code != 0) {
+        val failed: fail.Fail = failure(alloc, ?child, shown, terminal);
+        capture_cleanup(alloc, ?temp, ?child, true);
+        ret res[Bytes, fail.Fail].err{failed};
+    }
+    val out_r: res[Bytes, fail.Fail] = captured_bytes(alloc, ?child, trim_line_end);
+    capture_cleanup(alloc, ?temp, ?child, true);
+    ret out_r;
+}
+
+# the subcommand after git's leading `-c <k=v>` and `-C <dir>` options
+fun argv_subcommand(argv: **u8) str {
+    var i: usize = 1;
+    for (argv[i] != nil && (str_equals(argv[i]::str, "-c") || str_equals(argv[i]::str, "-C"))) {
+        if (argv[i + 1] == nil) { ret ""; }
+        i = i + 2;
+    }
+    if (argv[i] == nil) { ret ""; }
+    ret argv[i]::str;
+}
+
+# whether a git command leaves every checkout's HEAD and tree where they were
+fun argv_reads_only(argv: **u8) bool {
+    val sub: str = argv_subcommand(argv);
+    ret str_equals(sub, "ls-tree") || str_equals(sub, "rev-parse") || str_equals(sub, "status")
+        || str_equals(sub, "ls-files") || str_equals(sub, "cat-file") || str_equals(sub, "config");
+}
+
+pub fun query_capture(alloc: *A.Allocator, gi: *Inspector, dir: str, args: *str, count: usize,
+    trim_line_end: bool, extra_env: **u8, stdin_fd: usize, capture_stderr: bool) res[Bytes, fail.Fail] {
+    val ar: res[**u8, A.Error] = A.allocate[*u8](alloc, count + 8);
+    if (sel ar.err) { ret res[Bytes, fail.Fail].err{fail.refused(ar.err)}; }
+    val argv: **u8 = ar.ok;
+    argv[0] = gi.program::*u8;
+    argv[1] = "-c";
+    argv[2] = "core.fsmonitor=false";
+    argv[3] = "-c";
+    argv[4] = "core.untrackedCache=false";
+    argv[5] = "-C";
+    argv[6] = dir::*u8;
+    var i: usize = 0;
+    for (i < count) {
+        argv[i + 7] = args[i]::*u8;
+        i           = i + 1;
+    }
+    argv[count + 7] = nil;
+    val rr: res[Bytes, fail.Fail] = run_capture(alloc, gi, argv, ?argv[7], trim_line_end, extra_env, stdin_fd, capture_stderr);
+    A.deallocate[*u8](alloc, argv, count + 8);
+    ret rr;
+}
+
+fun query_mode(alloc: *A.Allocator, gi: *Inspector, dir: str, args: *str, count: usize,
+    trim_line_end: bool, extra_env: **u8) res[str, fail.Fail] {
+    val r: res[Bytes, fail.Fail] = query_capture(alloc, gi, dir, args, count, trim_line_end, extra_env, system_os.INVALID_HANDLE, true);
+    if (sel r.err) { ret res[str, fail.Fail].err{r.err}; }
+    var bytes: Bytes = r.ok;
+    if (str_len(bytes.data::str) != bytes.len) {
+        bytes_free(alloc, ?bytes);
+        ret res[str, fail.Fail].err{fail.environment(diagnostic_kind.GIT_OUTPUT_MALFORMED, "Git text output contains an embedded nul byte")};
+    }
+    ret res[str, fail.Fail].ok{bytes.data::str};
+}
+
+pub fun query(alloc: *A.Allocator, gi: *Inspector, dir: str, args: *str, count: usize) res[str, fail.Fail] {
+    ret query_mode(alloc, gi, dir, args, count, true, nil);
+}
+
+pub fun query_raw(alloc: *A.Allocator, gi: *Inspector, dir: str, args: *str, count: usize) res[str, fail.Fail] {
+    ret query_mode(alloc, gi, dir, args, count, false, nil);
+}
+
+pub fun op(alloc: *A.Allocator, gi: *Inspector, dir: str, args: *str, count: usize, extra_env: **u8) res[str, fail.Fail] {
+    ret query_mode(alloc, gi, dir, args, count, true, extra_env);
+}
+
+fun cmp_entry(a: *Entry, b: *Entry) i64 {
+    ret str_compare(a.path, b.path);
+}
+
+# list a checkout's committed tree once: `<mode> <path>` records, nul-terminated
+fun tree_load(s: *session.Session, gi: *Inspector, alias: str, git_dir: str) res[usize, fail.Fail] {
+    var args: [6]str;
+    args[0] = "ls-tree";
+    args[1] = "-r";
+    args[2] = "-t";
+    args[3] = "-z";
+    args[4] = "--full-tree";
+    args[5] = "--format=%(objectmode) %(path)";
+    var argv: [7]str;
+    var k:    usize = 0;
+    for (k < 6) {
+        argv[k] = args[k];
+        k       = k + 1;
+    }
+    argv[6] = "HEAD";
+    val listed: res[Bytes, fail.Fail] = query_capture(gi.alloc, gi, git_dir, ?argv[0], 7, false, nil, system_os.INVALID_HANDLE, true);
+    if (sel listed.err) {
+        val mr: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+            "dependency '{}': cannot verify nested dependency gitlink: {}", alias, fail.describe(listed.err));
+        if (sel mr.err) { ret res[usize, fail.Fail].err{listed.err}; }
+        ret res[usize, fail.Fail].err{fail.with_text(listed.err, mr.ok)};
+    }
+    var bytes: Bytes = listed.ok;
+    fin { bytes_free(gi.alloc, ?bytes); }
+    val dir_r: res[str, types_string.StrError] = str_copy_slice(gi.alloc, git_dir, 0, str_len(git_dir));
+    if (sel dir_r.err) { ret res[usize, fail.Fail].err{fail.message(fail.str_text(dir_r.err))}; }
+    var tree: Tree = Tree{dir: dir_r.ok, entries: collections_vector.init[Entry](gi.alloc)};
+    var ok:   bool = false;
+    fin {
+        if (!ok) { tree_free(gi.alloc, ?tree); }
+    }
+    var at: usize = 0;
+    for (at < bytes.len) {
+        var end: usize = at;
+        for (end < bytes.len && bytes.data[end] != 0) { end = end + 1; }
+        var space: usize = at;
+        for (space < end && bytes.data[space] != ' ') { space = space + 1; }
+        if (space == end) { ret res[usize, fail.Fail].err{fail.environment(diagnostic_kind.GIT_OUTPUT_MALFORMED, "Git tree listing has a malformed record")}; }
+        val mode_r: res[str, types_string.StrError] = str_copy_slice(gi.alloc, (?bytes.data[at])::str, 0, space - at);
+        if (sel mode_r.err) { ret res[usize, fail.Fail].err{fail.message(fail.str_text(mode_r.err))}; }
+        val path_r: res[str, types_string.StrError] = str_copy_slice(gi.alloc, (?bytes.data[space + 1])::str, 0, end - space - 1);
+        if (sel path_r.err) {
+            str_free(gi.alloc, mode_r.ok);
+            ret res[usize, fail.Fail].err{fail.message(fail.str_text(path_r.err))};
+        }
+        val pushed_entry: res[usize, A.Error] = collections_vector.push[Entry](?tree.entries, Entry{path: path_r.ok, mode: mode_r.ok});
+        if (sel pushed_entry.err) {
+            str_free(gi.alloc, mode_r.ok);
+            str_free(gi.alloc, path_r.ok);
+            ret res[usize, fail.Fail].err{fail.refused(pushed_entry.err)};
+        }
+        at = end + 1;
+    }
+    # git orders a tree as if its name ended in a separator, so the listing is re-sorted plainly
+    sort.sort_by[Entry](tree.entries.data, tree.entries.len, cmp_entry);
+    if (!gi.trees_ready) {
+        gi.trees       = collections_vector.init[Tree](gi.alloc);
+        gi.trees_ready = true;
+    }
+    val pushed: res[usize, A.Error] = collections_vector.push[Tree](?gi.trees, tree);
+    if (sel pushed.err) { ret res[usize, fail.Fail].err{fail.refused(pushed.err)}; }
+    ok = true;
+    ret res[usize, fail.Fail].ok{gi.trees.len - 1};
+}
+
+fun tree_for(s: *session.Session, gi: *Inspector, alias: str, git_dir: str) res[usize, fail.Fail] {
+    if (gi.trees_ready) {
+        var i: usize = 0;
+        for (i < gi.trees.len) {
+            if (str_equals(gi.trees.data[i].dir, git_dir)) { ret res[usize, fail.Fail].ok{i}; }
+            i = i + 1;
+        }
+    }
+    ret tree_load(s, gi, alias, git_dir);
+}
+
+# the committed mode of `<prefix><rel>` at HEAD, or "" when HEAD has no such entry
+pub fun path_mode(s: *session.Session, gi: *Inspector, alias: str,
+    git_dir: str, git_prefix: str, rel: str) res[str, fail.Fail] {
+    val tree_r: res[usize, fail.Fail] = tree_for(s, gi, alias, git_dir);
+    if (sel tree_r.err) { ret res[str, fail.Fail].err{tree_r.err}; }
+    val tree:   *Tree                            = ?gi.trees.data[tree_r.ok];
+    val path_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "{}{}", git_prefix, rel);
+    if (sel path_r.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(path_r.err))}; }
+    var want: str = path_r.ok;
+    fin { str_free(s.build_alloc, want); }
+    # a directory is asked for with a trailing separator; the listing names it without one
+    var n: usize = str_len(want);
+    for (n > 0 && want[n - 1] == '/') { n = n - 1; }
+    want[n] = 0;
+    var lo: usize = 0;
+    var hi: usize = tree.entries.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        val c:   i64   = str_compare(tree.entries.data[mid].path, want);
+        if (c == 0) {
+            val mode:   str                             = tree.entries.data[mid].mode;
+            val copied: res[str, types_string.StrError] = str_copy_slice(s.build_alloc, mode, 0, str_len(mode));
+            if (sel copied.err) { ret res[str, fail.Fail].err{fail.message(fail.str_text(copied.err))}; }
+            ret res[str, fail.Fail].ok{copied.ok};
+        }
+        if (c < 0) { lo = mid + 1; }
+        or         { hi = mid; }
+    }
+    val empty: res[str, types_string.StrError] = str_copy_slice(s.build_alloc, "", 0, 0);
+    if (sel empty.err) { ret res[str, fail.Fail].err{fail.message(fail.str_text(empty.err))}; }
+    ret res[str, fail.Fail].ok{empty.ok};
+}
+
+pub fun inspector_require(alloc: *A.Allocator, gi: *Inspector) err[fail.Fail] {
+    if (!str_empty(gi.program)) { ret err[fail.Fail].ok{}; }
+    val ir: res[Inspector, fail.Fail] = inspector_init(alloc);
+    if (sel ir.err) { ret err[fail.Fail].err{ir.err}; }
+    @gi = ir.ok;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun query_named(s: *session.Session, gi: *Inspector, alias: str, dir: str,
+    args: *str, count: usize, fact: str) res[str, fail.Fail] {
+    val qr: res[str, fail.Fail] = query(s.build_alloc, gi, dir, args, count);
+    if (sel qr.ok) { ret qr; }
+    val mr: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+        "dependency '{}': cannot verify {}: {}", alias, fact, fail.describe(qr.err));
+    if (sel mr.err) { ret res[str, fail.Fail].err{qr.err}; }
+    ret res[str, fail.Fail].err{fail.with_text(qr.err, mr.ok)};
+}
+
+pub fun require_root(s: *session.Session, gi: *Inspector, alias: str, dir: str,
+    subject: str) err[fail.Fail] {
+    var inside_args: [2]str;
+    inside_args[0] = "rev-parse";
+    inside_args[1] = "--is-inside-work-tree";
+    val inside_r: res[str, fail.Fail] = query_named(s, gi, alias, dir, ?inside_args[0], 2, subject);
+    if (sel inside_r.err) { ret err[fail.Fail].err{inside_r.err}; }
+    val inside: str = inside_r.ok;
+    if (!str_equals(inside, "true")) {
+        str_free(s.build_alloc, inside);
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_NO_REPOSITORY, "dependency declaring package is not a Git work tree")};
+    }
+    str_free(s.build_alloc, inside);
+
+    ret err[fail.Fail].ok{};
+}
+
+pub val AUTHORITY_REPO:   u8 = 0;
+pub val AUTHORITY_NESTED: u8 = 1;
+
+pub fun project_root_authority(s: *session.Session, gi: *Inspector, alias: str,
+    project_root: str) res[u8, fail.Fail] {
+    val marker_r: res[str, fail.Fail] = load.join_path(s.build_alloc, project_root, ".git");
+    if (sel marker_r.err) { ret res[u8, fail.Fail].err{marker_r.err}; }
+    val marker: str = marker_r.ok;
+    fin { str_free(s.build_alloc, marker); }
+    var st:       system_os.stat_t;
+    val observed: i64 = system_os.stat_path(system_os.working_dir(), marker, ?st, system_os.AT_SYMLINK_NOFOLLOW);
+    if (system_os.error_kind(observed) == io_error.NOT_FOUND) { ret res[u8, fail.Fail].ok{AUTHORITY_NESTED}; }
+    if (observed < 0)                                         { ret res[u8, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, system_os.error_message(observed))}; }
+    val required: err[fail.Fail] = inspector_require(s.build_alloc, gi);
+    if (sel required.err) { ret res[u8, fail.Fail].err{required.err}; }
+    var inside_args: [2]str;
+    inside_args[0] = "rev-parse";
+    inside_args[1] = "--is-inside-work-tree";
+    val inside_r: res[str, fail.Fail] = query(s.build_alloc, gi, project_root, ?inside_args[0], 2);
+    if (sel inside_r.err) {
+        val nr: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+            "dependency '{}': project root '{}' is not inside a Git repository; dependency realization is verified from Git",
+            alias, project_root);
+        if (sel nr.err) { ret res[u8, fail.Fail].err{fail.user(diagnostic_kind.DEP_NO_REPOSITORY, "project root is not inside a Git repository")}; }
+        ret res[u8, fail.Fail].err{fail.user(diagnostic_kind.DEP_NO_REPOSITORY, nr.ok)};
+    }
+    val inside:  str  = inside_r.ok;
+    val is_tree: bool = str_equals(inside, "true");
+    str_free(s.build_alloc, inside);
+    if (!is_tree) {
+        val nr: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+            "dependency '{}': project root '{}' is not inside a Git repository; dependency realization is verified from Git",
+            alias, project_root);
+        if (sel nr.err) { ret res[u8, fail.Fail].err{fail.user(diagnostic_kind.DEP_NO_REPOSITORY, "project root is not inside a Git repository")}; }
+        ret res[u8, fail.Fail].err{fail.user(diagnostic_kind.DEP_NO_REPOSITORY, nr.ok)};
+    }
+    val prefix_r: res[str, fail.Fail] = declaring_prefix(s, gi, alias, project_root);
+    if (sel prefix_r.err) { ret res[u8, fail.Fail].err{prefix_r.err}; }
+    val prefix: str  = prefix_r.ok;
+    val nested: bool = !str_empty(prefix);
+    str_free(s.build_alloc, prefix);
+    if (nested) { ret res[u8, fail.Fail].ok{AUTHORITY_NESTED}; }
+    ret res[u8, fail.Fail].ok{AUTHORITY_REPO};
+}
+
+pub fun declaring_prefix(s: *session.Session, gi: *Inspector, alias: str, dir: str) res[str, fail.Fail] {
+    var args: [2]str;
+    args[0] = "rev-parse";
+    args[1] = "--show-prefix";
+    ret query_named(s, gi, alias, dir, ?args[0], 2, "declaring package identity");
+}
+
+pub fun object_id_valid(id: str) bool {
+    val n: usize = str_len(id);
+    if (n != 40 && n != 64) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        val c: u8 = id[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun index_entry_field(s: *session.Session, gi: *Inspector, alias: str, root: str,
+    rel: str, field: usize, fact: str) res[str, fail.Fail] {
+    var args: [4]str;
+    args[0] = "ls-files";
+    args[1] = "--stage";
+    args[2] = "--";
+    args[3] = rel;
+    val q: res[str, fail.Fail] = query_named(s, gi, alias, root, ?args[0], 4, fact);
+    if (sel q.err) { ret res[str, fail.Fail].err{q.err}; }
+    val line:    str   = q.ok;
+    val n:       usize = str_len(line);
+    var start_i: usize = 0;
+    var f:       usize = 0;
+    for (f < field) {
+        for (start_i < n && line[start_i] != ' ') { start_i = start_i + 1; }
+        if (start_i < n) { start_i = start_i + 1; }
+        f = f + 1;
+    }
+    var end_i: usize = start_i;
+    for (end_i < n && line[end_i] != ' ' && line[end_i] != '\t') { end_i = end_i + 1; }
+    val out: res[str, types_string.StrError] = str_copy_slice(s.build_alloc, line, start_i, end_i - start_i);
+    str_free(s.build_alloc, line);
+    if (sel out.err) { ret res[str, fail.Fail].err{fail.message(fail.str_text(out.err))}; }
+    ret res[str, fail.Fail].ok{out.ok};
+}
+
+fun porcelain_has_worktree_change(text: str) bool {
+    val n: usize = str_len(text);
+    var i: usize = 0;
+    for (i < n) {
+        var j: usize = i;
+        for (j < n && text[j] != '\n') { j = j + 1; }
+        if (j - i >= 2 && text[i + 1] != ' ') { ret true; }
+        i = j + 1;
+    }
+    ret false;
+}
+
+pub fun require_matches_index(s: *session.Session, gi: *Inspector, alias: str, root: str,
+    rel: str, subject: str) err[fail.Fail] {
+    var args: [5]str;
+    args[0] = "status";
+    args[1] = "--porcelain=v1";
+    args[2] = "--untracked-files=all";
+    args[3] = "--";
+    args[4] = rel;
+    val q: res[str, fail.Fail] = query_raw(s.build_alloc, gi, root, ?args[0], 5);
+    if (sel q.err) {
+        val er: res[str, fail.Fail] = query_named(s, gi, alias, root, ?args[0], 5, subject);
+        if (sel er.err) { ret err[fail.Fail].err{er.err}; }
+        str_free(s.build_alloc, er.ok);
+        ret err[fail.Fail].ok{};
+    }
+    val out:   str  = q.ok;
+    val dirty: bool = porcelain_has_worktree_change(out);
+    str_free(s.build_alloc, out);
+    if (!dirty) { ret err[fail.Fail].ok{}; }
+    val msg_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+        "dependency '{}': '{}' in the working tree does not match what is staged", alias, rel);
+    if (sel msg_r.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_UNSTAGED, "a dependency record does not match what is staged")}; }
+    ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_UNSTAGED, msg_r.ok)};
+}
+
+pub fun require_tracked(s: *session.Session, gi: *Inspector, alias: str, root: str,
+    rel: str, subject: str) err[fail.Fail] {
+    var args: [4]str;
+    args[0] = "ls-files";
+    args[1] = "--";
+    args[2] = rel;
+    args[3] = "";
+    val q: res[str, fail.Fail] = query_named(s, gi, alias, root, ?args[0], 3, subject);
+    if (sel q.err) { ret err[fail.Fail].err{q.err}; }
+    val out:     str  = q.ok;
+    val present: bool = !str_empty(out);
+    str_free(s.build_alloc, out);
+    if (present) { ret err[fail.Fail].ok{}; }
+    val msg_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+        "dependency '{}': '{}' is not staged; run `mach dep pull <path>` for project '{}'", alias, rel, root);
+    if (sel msg_r.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_UNSTAGED, "a dependency record is not staged")}; }
+    ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_UNSTAGED, msg_r.ok)};
+}
+
+pub fun is_work_tree(alloc: *A.Allocator, gi: *Inspector, dir: str) bool {
+    var args: [2]str;
+    args[0] = "rev-parse";
+    args[1] = "--is-inside-work-tree";
+    val r: res[str, fail.Fail] = query(alloc, gi, dir, ?args[0], 2);
+    if (sel r.err) { ret false; }
+    val v:  str  = r.ok;
+    val ok: bool = str_equals(v, "true");
+    str_free(alloc, v);
+    ret ok;
+}
+
+#[testing]
+pub fun t_scratch_dir(alloc: *A.Allocator, prefix: str) res[str, fail.Fail] {
+    val tf_r: res[fs.TempFile, fs.FsError] = fs.temp_create(alloc, prefix);
+    if (sel tf_r.err) { ret res[str, fail.Fail].err{fail.user(diagnostic_kind.FS_WRITE, fail.fs_text(tf_r.err))}; }
+    var tf:     fs.TempFile                     = tf_r.ok;
+    val root_r: res[str, types_string.StrError] = str_copy_slice(alloc, fs.temp_path(?tf), 0, str_len(fs.temp_path(?tf)));
+    fs.temp_close_and_remove(?tf);
+    if (sel root_r.err) { ret res[str, fail.Fail].err{fail.user(diagnostic_kind.FS_WRITE, fail.str_text(root_r.err))}; }
+    val root:         str                 = root_r.ok;
+    val create_dir_r: err[io_error.Error] = fs.create_dir(root, 0o755);
+    if (sel create_dir_r.err) { ret res[str, fail.Fail].err{fail.user(diagnostic_kind.FS_WRITE, "cannot create scratch root")}; }
+    ret res[str, fail.Fail].ok{root};
+}
+
+#[testing]
+pub fun t_write_file(alloc: *A.Allocator, dir: str, leaf: str, content: str) err[fail.Fail] {
+    val path_r: res[str, A.Error] = types_path.join(alloc, dir, leaf);
+    if (sel path_r.err) { ret err[fail.Fail].err{fail.refused(path_r.err)}; }
+    val p: str             = path_r.ok;
+    val w: err[fs.FsError] = fs.write_bytes(p, content::*u8, str_len(content), 420);
+    str_free(alloc, p);
+    if (sel w.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.FS_WRITE, fail.fs_text(w.err))}; }
+    ret err[fail.Fail].ok{};
+}
+
+#[testing]
+pub fun t_make_fixture_repo(alloc: *A.Allocator, gi: *Inspector, project_id: str) res[str, fail.Fail] {
+    val dir_r: res[str, fail.Fail] = t_scratch_dir(alloc, "mach_dep_fixture");
+    if (sel dir_r.err) { ret res[str, fail.Fail].err{dir_r.err}; }
+    val dir: str = dir_r.ok;
+
+    var init_args: [3]str;
+    init_args[0] = "init";
+    init_args[1] = "-b";
+    init_args[2] = "main";
+    val init_r: res[str, fail.Fail] = op(alloc, gi, dir, ?init_args[0], 3, nil);
+    if (sel init_r.err) { ret res[str, fail.Fail].err{init_r.err}; }
+    str_free(alloc, init_r.ok);
+
+    val toml_r: res[str, std_format.FormatError] = std_format.sprint(alloc,
+        "[project]\nmach = \">=5\"\nid = \"{}\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out\"\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n[profile.release]\nopt = 2\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n", project_id);
+    if (sel toml_r.err) { ret res[str, fail.Fail].err{fail.user(diagnostic_kind.FS_WRITE, fail.format_text(toml_r.err))}; }
+    val toml_text: str            = toml_r.ok;
+    val wr:        err[fail.Fail] = t_write_file(alloc, dir, "mach.toml", toml_text);
+    str_free(alloc, toml_text);
+    if (sel wr.err) { ret res[str, fail.Fail].err{wr.err}; }
+
+    var add_args: [2]str;
+    add_args[0] = "add";
+    add_args[1] = "-A";
+    val add_r: res[str, fail.Fail] = op(alloc, gi, dir, ?add_args[0], 2, nil);
+    if (sel add_r.err) { ret res[str, fail.Fail].err{add_r.err}; }
+    str_free(alloc, add_r.ok);
+
+    var commit_args: [7]str;
+    commit_args[0] = "-c";
+    commit_args[1] = "user.email=t@t";
+    commit_args[2] = "-c";
+    commit_args[3] = "user.name=t";
+    commit_args[4] = "commit";
+    commit_args[5] = "-m";
+    commit_args[6] = "init";
+    val commit_r: res[str, fail.Fail] = op(alloc, gi, dir, ?commit_args[0], 7, nil);
+    if (sel commit_r.err) { ret res[str, fail.Fail].err{commit_r.err}; }
+    str_free(alloc, commit_r.ok);
+
+    ret res[str, fail.Fail].ok{dir};
+}
+
+#[testing]
+fun t_mode_is(s: *session.Session, gi: *Inspector, dir: str, rel: str, want: str) bool {
+    val r: res[str, fail.Fail] = path_mode(s, gi, "fixture", dir, "", rel);
+    if (sel r.err) { ret false; }
+    val same: bool = str_equals(r.ok, want);
+    str_free(s.build_alloc, r.ok);
+    ret same;
+}
+
+#[testing]
+fun t_write_ok(alloc: *A.Allocator, dir: str, leaf: str, content: str) bool {
+    val w: err[fail.Fail] = t_write_file(alloc, dir, leaf, content);
+    ret sel w.ok;
+}
+
+#[testing]
+pub fun t_commit_all(alloc: *A.Allocator, gi: *Inspector, dir: str, message: str) bool {
+    var add_args: [2]str;
+    add_args[0] = "add";
+    add_args[1] = "-A";
+    val add_r: res[str, fail.Fail] = op(alloc, gi, dir, ?add_args[0], 2, nil);
+    if (sel add_r.err) { ret false; }
+    str_free(alloc, add_r.ok);
+    var commit_args: [7]str;
+    commit_args[0] = "-c";
+    commit_args[1] = "user.email=t@t";
+    commit_args[2] = "-c";
+    commit_args[3] = "user.name=t";
+    commit_args[4] = "commit";
+    commit_args[5] = "-m";
+    commit_args[6] = message;
+    val commit_r: res[str, fail.Fail] = op(alloc, gi, dir, ?commit_args[0], 7, nil);
+    if (sel commit_r.err) { ret false; }
+    str_free(alloc, commit_r.ok);
+    ret true;
+}
+
+# one listing answers every path, in git's tree order and not only in plain byte order,
+# and a command that moves HEAD re-lists
+test git_path_mode__one_listing_per_checkout_until_head_moves {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    val gi_r: res[Inspector, fail.Fail] = inspector_init(?alloc);
+    if (sel gi_r.err) { ret 2; }
+    var gi: Inspector = gi_r.ok;
+    fin { inspector_dnit(?alloc, ?gi); }
+    val fixture_r: res[str, fail.Fail] = t_make_fixture_repo(?alloc, ?gi, "tree");
+    if (sel fixture_r.err) { ret 3; }
+    val dir: str = fixture_r.ok;
+    fin {
+        fs.remove_all(?alloc, dir);
+        str_free(?alloc, dir);
+    }
+    val a_r: res[str, A.Error] = types_path.join(?alloc, dir, "a");
+    if (sel a_r.err) { ret 4; }
+    val made: err[fs.FsError] = fs.create_dir_all(?alloc, a_r.ok, 0o755);
+    str_free(?alloc, a_r.ok);
+    if (sel made.err)                               { ret 4; }
+    if (!t_write_ok(?alloc, dir, "a/inner", "x\n")) { ret 5; }
+    if (!t_write_ok(?alloc, dir, "a-b", "x\n"))     { ret 5; }
+    if (!t_write_ok(?alloc, dir, "a.x", "x\n"))     { ret 5; }
+    if (!t_commit_all(?alloc, ?gi, dir, "tree"))    { ret 6; }
+
+    if (!t_mode_is(?s, ?gi, dir, "a", "040000"))         { ret 7; }
+    if (!t_mode_is(?s, ?gi, dir, "a/", "040000"))        { ret 8; }
+    if (!t_mode_is(?s, ?gi, dir, "a/inner", "100644"))   { ret 9; }
+    if (!t_mode_is(?s, ?gi, dir, "a-b", "100644"))       { ret 10; }
+    if (!t_mode_is(?s, ?gi, dir, "a.x", "100644"))       { ret 11; }
+    if (!t_mode_is(?s, ?gi, dir, "mach.toml", "100644")) { ret 12; }
+    if (!t_mode_is(?s, ?gi, dir, "missing", ""))         { ret 13; }
+    if (!gi.trees_ready || gi.trees.len != 1)            { ret 14; }
+
+    # a lookup answered from the listing spawns nothing: an unrunnable git proves it
+    val program: str = gi.program;
+    gi.program = "/nonexistent/mach-test-git";
+    val cached: bool = t_mode_is(?s, ?gi, dir, "a.x", "100644");
+    gi.program = program;
+    if (!cached) { ret 15; }
+
+    # a new commit moves HEAD, so the listing must not answer for the old tree
+    if (!t_write_ok(?alloc, dir, "later", "x\n"))    { ret 16; }
+    if (!t_commit_all(?alloc, ?gi, dir, "later"))    { ret 17; }
+    if (gi.trees_ready)                              { ret 18; }
+    if (!t_mode_is(?s, ?gi, dir, "later", "100644")) { ret 19; }
+    ret 0;
+}
+
+#[testing]
+pub fun t_env_allow_file_protocol(env: **u8) {
+    env[0] = "GIT_CONFIG_COUNT=1";
+    env[1] = "GIT_CONFIG_KEY_0=protocol.file.allow";
+    env[2] = "GIT_CONFIG_VALUE_0=always";
+    env[3] = nil;
+}
+
+test git_failure__names_the_command_status_and_gits_output {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val gi_r: res[Inspector, fail.Fail] = inspector_init(?alloc);
+    if (sel gi_r.err) { ret 1; }
+    var gi:    Inspector           = gi_r.ok;
+    val dir_r: res[str, fail.Fail] = t_scratch_dir(?alloc, "mach_dep_git_failure");
+    if (sel dir_r.err) {
+        inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    val dir: str = dir_r.ok;
+    var bad: i32 = 0;
+
+    var args:   [3]str              = [3]str{"rev-parse", "--verify", "HEAD"};
+    val merged: res[str, fail.Fail] = query(?alloc, ?gi, dir, ?args[0], 3);
+    if (sel merged.ok) { bad = 2; }
+    if (sel merged.err) {
+        val text: str = fail.describe(merged.err);
+        if (!str_starts_with(text, "`git rev-parse --verify HEAD` exited with status 128: ")) { bad = 3; }
+        if (!str_contains(text, "not a git repository"))                                      { bad = 4; }
+        if (str_contains(text, "\n\n"))                                                       { bad = 5; }
+    }
+
+    # a command whose stderr is not captured still names itself and its status
+    val quiet: res[Bytes, fail.Fail] = query_capture(?alloc, ?gi, dir, ?args[0], 3, true, nil, system_os.INVALID_HANDLE, false);
+    if (sel quiet.ok) { bad = 6; }
+    if (sel quiet.err) {
+        if (!str_equals(fail.describe(quiet.err), "`git rev-parse --verify HEAD` exited with status 128")) { bad = 7; }
+    }
+
+    fs.remove_all(?alloc, dir);
+    str_free(?alloc, dir);
+    inspector_dnit(?alloc, ?gi);
+    ret bad;
+}
+
+#[testing]
+pub fun t_mkdirs(alloc: *A.Allocator, base: str, rel: str) res[str, fail.Fail] {
+    val p_r: res[str, A.Error] = types_path.join(alloc, base, rel);
+    if (sel p_r.err) { ret res[str, fail.Fail].err{fail.refused(p_r.err)}; }
+    val p:                str             = p_r.ok;
+    val create_dir_all_r: err[fs.FsError] = fs.create_dir_all(alloc, p, 0o755);
+    if (sel create_dir_all_r.err) {
+        str_free(alloc, p);
+        ret res[str, fail.Fail].err{fail.user(diagnostic_kind.FS_WRITE, "cannot create directory")};
+    }
+    ret res[str, fail.Fail].ok{p};
+}
+
+test project_root_authority__repo_root_nested_and_absent {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val gi_r: res[Inspector, fail.Fail] = inspector_init(?alloc);
+    if (sel gi_r.err) { ret 1; }
+    var gi: Inspector = gi_r.ok;
+
+    val outer_r: res[str, fail.Fail] = t_make_fixture_repo(?alloc, ?gi, "outer");
+    if (sel outer_r.err) {
+        inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    val outer: str = outer_r.ok;
+
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) {
+        inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    var s: session.Session = sr.ok;
+
+    var bad: i32 = 0;
+
+    val top_r: res[u8, fail.Fail] = project_root_authority(?s, ?gi, "x", outer);
+    if (sel top_r.err)                                 { ret 99; }
+    if (!(sel top_r.ok && top_r.ok == AUTHORITY_REPO)) { bad = 1; }
+
+    val sub_r: res[str, fail.Fail] = t_mkdirs(?alloc, outer, "cases/one");
+    if (sel sub_r.err) { bad = 1; }
+    if (sel sub_r.ok) {
+        val sub:      str                = sub_r.ok;
+        val nested_r: res[u8, fail.Fail] = project_root_authority(?s, ?gi, "x", sub);
+        if (sel nested_r.err)                                      { ret 99; }
+        if (!(sel nested_r.ok && nested_r.ok == AUTHORITY_NESTED)) { bad = 1; }
+        str_free(?alloc, sub);
+    }
+
+    val bare_r: res[str, fail.Fail] = t_scratch_dir(?alloc, "mach_dep_no_repo");
+    if (sel bare_r.err) { bad = 1; }
+    if (sel bare_r.ok) {
+        val bare:     str                = bare_r.ok;
+        val absent_r: res[u8, fail.Fail] = project_root_authority(?s, ?gi, "x", bare);
+        if (sel absent_r.err)                                      { ret 99; }
+        if (!(sel absent_r.ok && absent_r.ok == AUTHORITY_NESTED)) { bad = 1; }
+        fs.remove_all(?alloc, bare);
+        str_free(?alloc, bare);
+    }
+
+    session.dnit(?s);
+    fs.remove_all(?alloc, outer);
+    str_free(?alloc, outer);
+    inspector_dnit(?alloc, ?gi);
+    ret bad;
+}
+
+#[testing]
+fun t_inheritance(alloc: *A.Allocator, entry: *u8, override: bool, expected: bool) bool {
+    val result: res[bool, fail.Fail] = inherits_env(alloc, entry, override);
+    ret sel result.ok && result.ok == expected;
+}
+
+test git_environment__configuration_survives_repository_redirection_does_not {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err)                                                                { ret 20; }
+    if (!t_inheritance(?alloc, "HOME=/checkout-owner", false, true))                   { ret 1; }
+    if (!t_inheritance(?alloc, "XDG_CONFIG_HOME=/checkout-config", false, true))       { ret 2; }
+    if (!t_inheritance(?alloc, "GIT_CONFIG_GLOBAL=/checkout-config/git", false, true)) { ret 3; }
+    if (!t_inheritance(?alloc, "GIT_CONFIG_SYSTEM=/system-config/git", false, true))   { ret 4; }
+    if (!t_inheritance(?alloc, "GIT_CONFIG_NOSYSTEM=1", false, true))                  { ret 5; }
+    if (!t_inheritance(?alloc, "GIT_CONFIG_COUNT=1", false, true))                     { ret 6; }
+    if (!t_inheritance(?alloc, "GIT_CONFIG_COUNT=1", true, false))                     { ret 7; }
+    if (!t_inheritance(?alloc, "GIT_CONFIG_KEY_0=core.autocrlf", true, false))         { ret 8; }
+    if (!t_inheritance(?alloc, "GIT_CONFIG_VALUE_0=true", true, false))                { ret 9; }
+    if (!t_inheritance(?alloc, "GIT_DIR=/another/repo", false, false))                 { ret 10; }
+    if (!t_inheritance(?alloc, "GIT_WORK_TREE=/another/tree", false, false))           { ret 11; }
+    if (!t_inheritance(?alloc, "GIT_INDEX_FILE=/another/index", false, false))         { ret 12; }
+    if (!t_inheritance(?alloc, "GIT_COMMON_DIR=/another/repo", false, false))          { ret 13; }
+    if (!t_inheritance(?alloc, "GIT_OBJECT_DIRECTORY=/another/objects", false, false)) { ret 14; }
+    if (!t_inheritance(?alloc, "GIT_OPTIONAL_LOCKS=1", false, false))                  { ret 15; }
+    if (!t_inheritance(?alloc, "GIT_TERMINAL_PROMPT=1", false, false))                 { ret 16; }
+    $if ($mach.build.os == $mach.os.windows) {
+        if (!t_inheritance(?alloc, "git_dir=C:/another/repo", false, false)) { ret 17; }
+        val ordinal: res[i32, env.EnvError] = env.compare_names("gıt", "GIT");
+        if (sel ordinal.err) { ret 18; }
+        val ordinary: bool = ordinal.ok != 0;
+        if (!t_inheritance(?alloc, "gıt_dir=C:/another/repo", false, ordinary)) { ret 19; }
+    }
+    ret 0;
+}
+
+test git_environment__inherited_configuration_keeps_first_native_name {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var inherited: [7]*u8 = [7]*u8{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_COUNT=0",
+        "GIT_CONFIG_KEY_0=mach.probe", "GIT_CONFIG_VALUE_0=first",
+        "GIT_CONFIG_VALUE_0=ignored", "MACH_PROBE=inherited", nil};
+    $if ($mach.build.os == $mach.os.windows) {
+        inherited[1] = "git_config_count=0";
+        inherited[2] = "git_config_key_0=mach.probe";
+        inherited[3] = "git_config_value_0=first";
+    }
+    val result: res[driver_environment.Strings, fail.Fail] = environment(?alloc, ?inherited[0], nil);
+    if (sel result.err) { ret 2; }
+    var strings: driver_environment.Strings = result.ok;
+    fin { driver_environment.strings_free(?alloc, ?strings); }
+    if (strings.count != 6)                                          { ret 3; }
+    if (!str_equals(strings.items[0]::str, inherited[0]::str))       { ret 4; }
+    if (!str_equals(strings.items[1]::str, inherited[2]::str))       { ret 5; }
+    if (!str_equals(strings.items[2]::str, inherited[3]::str))       { ret 6; }
+    if (!str_equals(strings.items[3]::str, "GIT_OPTIONAL_LOCKS=0"))  { ret 7; }
+    if (!str_equals(strings.items[4]::str, "GIT_TERMINAL_PROMPT=0")) { ret 8; }
+    if (!str_equals(strings.items[5]::str, "MACH_PROBE=inherited"))  { ret 9; }
+    ret 0;
+}
+
+#[testing]
+pub fun t_symlink_commit(alloc: *A.Allocator, gi: *Inspector, root: str, message: str) bool {
+    var add: [2]str              = [2]str{"add", "-A"};
+    val ar:  res[str, fail.Fail] = op(alloc, gi, root, ?add[0], 2, nil);
+    if (sel ar.err) { ret false; }
+    str_free(alloc, ar.ok);
+    var commit: [7]str              = [7]str{"-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", message};
+    val cr:     res[str, fail.Fail] = op(alloc, gi, root, ?commit[0], 7, nil);
+    if (sel cr.err) { ret false; }
+    str_free(alloc, cr.ok);
+    ret true;
+}
+
+#[testing]
+pub fun t_put(a: *A.Allocator, dir: str, leaf: str, content: str) bool {
+    val written: err[fail.Fail] = t_write_file(a, dir, leaf, content);
+    ret sel written.ok;
+}
+
+#[testing]
+pub fun t_exists(alloc: *A.Allocator, root: str, rel: str) bool {
+    val full: res[str, A.Error] = types_path.join(alloc, root, rel);
+    if (sel full.err) { ret false; }
+    val there: res[bool, io_error.Error] = fs.exists(full.ok);
+    str_free(alloc, full.ok);
+    ret sel there.ok && there.ok;
+}
+
+#[testing]
+pub fun t_tag_release(alloc: *A.Allocator, gi: *Inspector, dir: str, version: str) bool {
+    val toml_r: res[str, std_format.FormatError] = std_format.sprint(alloc, "[project]\nid = \"relib\"\nversion = \"{}\"\nsrc = \"src\"\nout = \"out\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n", version);
+    if (sel toml_r.err) { ret false; }
+    val written: bool = t_put(alloc, dir, "mach.toml", toml_r.ok);
+    str_free(alloc, toml_r.ok);
+    if (!written || !t_commit_all(alloc, gi, dir, version)) { ret false; }
+    val tag_r: res[str, std_format.FormatError] = std_format.sprint(alloc, "v{}", version);
+    if (sel tag_r.err) { ret false; }
+    var tag_args: [2]str;
+    tag_args[0] = "tag";
+    tag_args[1] = tag_r.ok;
+    val tagged: res[str, fail.Fail] = op(alloc, gi, dir, ?tag_args[0], 2, nil);
+    str_free(alloc, tag_r.ok);
+    if (sel tagged.err) { ret false; }
+    str_free(alloc, tagged.ok);
+    ret true;
+}
