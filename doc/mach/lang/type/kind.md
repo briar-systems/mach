@@ -1,21 +1,53 @@
 # mach.lang.type.kind
 
-## def TypeId
+## rec TypeId
 
 ```mach
-pub def TypeId: u32
+pub rec TypeId;
 ```
+
+the identity of one type in the type table
 
 ## val TYPE_NIL
 
 ```mach
-pub val TYPE_NIL:   TypeId = 0xFFFFFFFF
+pub val TYPE_NIL:   TypeId = TypeId;
 ```
 
 ## val TYPE_ERROR
 
 ```mach
-pub val TYPE_ERROR: TypeId = 0xFFFFFFFE
+pub val TYPE_ERROR: TypeId = TypeId;
+```
+
+## fun id
+
+```mach
+pub fun id(index: u32) TypeId;
+```
+
+## fun index
+
+```mach
+pub fun index(t: TypeId) u32;
+```
+
+## fun same
+
+```mach
+pub fun same(left: TypeId, right: TypeId) bool;
+```
+
+## fun is_nil
+
+```mach
+pub fun is_nil(t: TypeId) bool;
+```
+
+## fun is_error
+
+```mach
+pub fun is_error(t: TypeId) bool;
 ```
 
 ## val TABLE_INDEX_TEXT

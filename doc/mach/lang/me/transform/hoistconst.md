@@ -1,9 +1,17 @@
 # mach.lang.me.transform.hoistconst
 
+## val PASS
+
+```mach
+pub val PASS: pass.Pass = pass.Pass;
+```
+
+the pass the pipeline schedules
+
 ## fun run_in
 
 ```mach
-pub fun run_in(m: *me_ir.Module, tgt: *resolved.Target, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
 
 the constants a loop rebuilds on every iteration, materialized once in its
@@ -16,6 +24,5 @@ loop. only the operands whose lowering reads any value are rewritten: an
 operand a later pass or the lowering needs as a literal (a shift count, a
 divisor, a power-of-two multiplier, a low-bit mask, an index) keeps it, and a
 debug binding keeps the constant it names. the allocator rematerializes a
-`const` rather than spill it, so the hoist never costs the loop a reload. an
-instruction set without the rule hoists nothing
+`const` rather than spill it, so the hoist never costs the loop a reload
 

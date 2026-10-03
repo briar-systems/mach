@@ -371,19 +371,23 @@ On a two-level dynamic format — PE (Windows) or Mach-O (Darwin) — the `libra
 decorator pins an `ext` import to the dependency that exports it:
 
 ```mach
-#[library("ws2_32.dll")]
+#[library("ws2_32")]
 ext fun WSAStartup(ver: u16, data: *u8) i32;
 ```
 
-- The value names a link dependency's stable logical identity. A `[link.X]`
-  requirement supplies it through `library = "..."`, defaulting to `X`; a bare
-  command-line `-l name` uses `name`. The dependency's exact canonical loader
-  name (`libfoo.so.3`, an `LC_ID_DYLIB` install name, or `foo.dll`) is also
-  accepted for compatibility. The named library **must** be among the link's
-  dependencies; pinning to one that is not is a hard link error
+- The value names a link dependency by its identity: the table key of a
+  `[link.X]` entry, `X`, or the `name` of a command-line `-l name`. A loader
+  name (`libfoo.so.3`, an `LC_ID_DYLIB` install name, or `foo.dll`) does not
+  bind: an import attributed to the loader name of an entry is refused
+  (`import '<sym>' is attributed to '<loader>', the loader name of link entry
+  '<key>'; #[library] names a link entry by its table key, so write
+  #[library("<key>")]`). An import that a linked import library declares is
+  attributed to the key of the entry that links that import library, never to
+  the DLL name the import library records. The named library **must** be
+  among the link's dependencies; pinning to one that is not is a hard link error
   (`import '<sym>' pinned to library '<lib>' not among the link's dependencies`),
-  never a silent fallback. A logical identity that equals a different
-  dependency's loader name is rejected as ambiguous.
+  never a silent fallback. A key that equals a different dependency's loader
+  name is rejected as ambiguous.
 - An `ext` import with no `library` is unattributed. PE and Mach-O require every
   dynamic import to identify its provider, so an unattributed import is a hard
   link error on those targets.
@@ -412,8 +416,8 @@ ext fun WSAStartup(ver: u16, data: *u8) i32;
 under the renamed symbol within the named library.
 
 ```mach
-# imported as `socket` from ws2_32.dll, called as `ws2_socket` in Mach
-#[library("ws2_32.dll")]
+# imported as `socket` from the ws2_32 entry, called as `ws2_socket` in Mach
+#[library("ws2_32")]
 #[symbol("socket")]
 ext fun ws2_socket(af: i32, kind: i32, proto: i32) i64;
 ```
@@ -562,7 +566,6 @@ library path. Filters select the applicable target:
 [link.foo-unix]
 source  = "system"
 name    = "foo"
-library = "foo"
 os      = ["linux", "darwin"]
 isa     = "*"
 abi     = "*"
@@ -571,16 +574,31 @@ export  = false
 [link.foo-win]
 source  = "system"
 name    = "foo.dll"
-library = "foo"
 os      = "windows"
 isa     = "*"
 abi     = "*"
 export  = false
 ```
 
-Both entries expose the logical name `foo`, so `#[library("foo")]` is portable
-across the mutually exclusive target filters. Manifest and command-line inputs
-are both included; a name that cannot be resolved is a hard error.
+The entries are mutually exclusive, so the binding selects the key with a
+constant under `$if` and writes one attribution:
+
+```mach
+use std.types.string.str;
+
+$if ($mach.build.os == $mach.os.windows) {
+    val FOO: str = "foo-win";
+}
+$or {
+    val FOO: str = "foo-unix";
+}
+
+#[library(FOO)]
+ext fun foo_init() i32;
+```
+
+Manifest and command-line inputs are both included; a name that cannot be
+resolved is a hard error.
 
 ### Scope
 

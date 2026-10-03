@@ -1,15 +1,20 @@
 # mach.lang.me.pass.inline
 
+## val PASS
+
+```mach
+pub val PASS: pass.Pass = pass.Pass;
+```
+
+the pass the pipeline schedules
+
 ## fun run_in
 
 ```mach
-pub fun run_in(m: *me_ir.Module, tgt: *resolved.Target, available: *body.Available, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
 
-the analysis (recursion marks, call counts, address-taken facts, duplication
-counts, the per-call remap tables and the peel frontier) is scratch for the
-whole module; the clone itself, its metadata and the peel snapshot are the
-module's
+the bodies `ctx.available` offers are attached to the module for the run
 
 ## fun mark_recursive
 

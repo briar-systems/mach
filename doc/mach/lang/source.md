@@ -1,18 +1,48 @@
 # mach.lang.source
 
-## def FileId
+## rec FileId
 
 ```mach
-pub def FileId: u32
+pub rec FileId;
 ```
+
+a file's slot in the source map
+
+every other id's nil is all ones. a file id's nil is 0, beside the register
+ids the second such exception: a zero-filled location is nowhere, so records
+that carry one are blank when zeroed. slot 0 of the map is never issued.
 
 ## val FILE_NIL
 
 ```mach
-pub val FILE_NIL: FileId = 0
+pub val FILE_NIL: FileId = FileId;
 ```
 
 no source: an unlocated diagnostic, or a node the build synthesized
+
+## fun file_id
+
+```mach
+pub fun file_id(index: u32) FileId;
+```
+
+## fun file_index
+
+```mach
+pub fun file_index(f: FileId) u32;
+```
+
+## fun file_same
+
+```mach
+pub fun file_same(left: FileId, right: FileId) bool;
+```
+
+## fun file_is_nil
+
+```mach
+pub fun file_is_nil(f: FileId) bool;
+```
 
 ## rec Span
 

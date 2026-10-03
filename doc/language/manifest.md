@@ -97,7 +97,7 @@ targets the dependency declares for them. No other `[target.*]` entry is read.
 [project]
 id      = "demo"                       # required: identifier; root of every module path
 version = "0.1.0"                      # required
-mach    = "^5.3"                       # the compiler range; the project being built states it
+mach    = "^5.3"                       # required: the compiler range
 src     = "src"                        # required: source dir, project-root-relative
 out     = "out/{target.name}/{profile.name}"  # required: output-path template root
 
@@ -140,7 +140,7 @@ ref = "branch/main"
 | `version` | string | Project version. Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step `argv`, `in` and `out`, and local link paths. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
-| `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.3"`). The project being built must state it; a dependency that leaves it out states no constraint. See [Compiler range](#compiler-range). |
+| `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.3"`). Required in every manifest, a dependency's included. See [Compiler range](#compiler-range). |
 
 `[project]` is exactly these five keys, and `id`, `version`, `src` and `out` are
 required. Any other key, `name` and `description` included, is an unknown-key
@@ -191,10 +191,9 @@ error[mach.version_unaccepted]: this is mach 5.2.1, and the dependency closure d
  --> mach.toml:2:11
 ```
 
-A root manifest must state `mach`. One without it is refused with the line to
-add (`mach.toml: [project] states no compiler range; add mach = "^5.3", the
-oldest release that reads the key, and raise it when the project uses a later
-feature`), pointing at its `[project]` header. A dependency without it states no constraint. `mach init` writes the same range. It is the oldest
+Every manifest must state `mach`, a dependency's included. One without it is
+refused like any missing required key (`mach.toml: [project] is missing required
+key 'mach'`), and for a dependency the build fails naming it. `mach init` writes the same range. It is the oldest
 release of the running compiler's major that reads the key: `^5.3` for every
 5.x compiler, since 5.3.0 is the first release that accepts `mach`, and `^N.0`
 for a later major N, since a caret cannot span majors. The range depends only on
@@ -1260,7 +1259,6 @@ the same entries, so nothing behaves differently as a dependency.
 | `source`  | yes | `"system"` (a system library resolved by name), `"framework"` (a macOS framework), or `"local"` (a file on disk). |
 | `name`    | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. |
 | `path`    | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
-| `library` | absent: the table name | Stable logical name used by `#[library("...")]`. |
 | `symbols` | absent: none claimed | Array of symbol names this dependency provides, attributing imports that have no `ext` declaration to decorate (see below). Written as **source-level** names; the target's C symbol prefix is applied by Mach. |
 | `os`      | yes | Filter axis: a canonical `os` value, `"*"` (any), an array of values, or `[]` (none). |
 | `isa`     | yes | Filter axis over `isa`, same forms. |
@@ -1285,22 +1283,24 @@ library is validated for the selected target before it is recorded: an ELF
 linker script, a foreign-architecture file) is refused (`'<file>' is not a
 loadable ELF shared object for the selected architecture`).
 
-`library` decouples source attribution from platform loader spelling. Give
-mutually exclusive platform entries the same logical value when they provide the
-same API; one unconditional `#[library("glfw")]` can then bind against
-`libglfw.so.3` on Linux, an `LC_ID_DYLIB` install name on Darwin, and
-`glfw3.dll` on Windows. Exact canonical loader names remain accepted for
-compatibility. Selecting two dependencies that map the same logical name to
-different loader names in one build is an error. A logical name that equals a
-different dependency's canonical loader name is likewise rejected, so
-attribution never depends on requirement order.
+An entry's table key is its identity: `[link.vulkan]` answers to
+`#[library("vulkan")]` and to nothing else. A loader name such as
+`kernel32.dll` does not bind, and an import attributed to one is refused with a
+message naming the entry whose key to write. A `library` key is refused by
+name, since no entry answers to a name other than its key. When
+mutually exclusive platform entries provide the same API, the binding picks the
+key with a constant that `$if` selects, so one binding module serves every
+platform (see the `mach-glfw` example below). Selecting two dependencies whose
+entries share a key but resolve to different loader names in one build is an
+error, as is a key that equals a different entry's loader name, so attribution
+never depends on requirement order.
 
 A `#[library]` resolves against the **effective** link set: the artifact's own
 referenced entries, plus every entry a dependency exports. A binding project
 therefore names its libraries once and a consumer writing its own `ext fun`
 against them adds nothing but a `dep` entry.
 
-A logical name may belong to an entry that resolves to a **static** input, and
+A key may belong to an entry that resolves to a **static** input, and
 that is not something an import can bind to: a static input defines symbols
 rather than importing them, so a pin naming one means the symbol must come out of
 that object or archive. When it does, the pin is inert and the link is normal.
@@ -1318,7 +1318,6 @@ with no declaration to decorate, so the entry that provides them claims them:
 [link.kernel32]
 source  = "system"
 name    = "kernel32.dll"
-library = "kernel32"
 symbols = ["Sleep", "CreateFileW", "CloseHandle"]
 os      = "windows"
 isa     = "*"
@@ -2407,7 +2406,6 @@ out     = "out/{target.name}/{profile.name}"
 [link.glfw]
 source = "system"
 name   = "glfw"
-library = "glfw"
 os     = ["linux", "darwin"]
 isa    = "*"
 abi    = "*"
@@ -2416,7 +2414,6 @@ export = true
 [link.glfw-win]
 source = "system"
 name   = "glfw3.dll"
-library = "glfw"
 os     = ["windows"]
 isa    = "*"
 abi    = "*"
@@ -2431,11 +2428,20 @@ abi    = "*"
 export = true
 ```
 
-Both GLFW entries expose the logical name `glfw`, so the binding can use the
-same attribution on every target:
+The binding module selects the entry's key once with `$if`, so every
+declaration carries the same attribution on every target:
 
 ```mach
-#[library("glfw")]
+use std.types.string.str;
+
+$if ($mach.build.os == $mach.os.windows) {
+    val GLFW: str = "glfw-win";
+}
+$or {
+    val GLFW: str = "glfw";
+}
+
+#[library(GLFW)]
 pub ext fun glfwInit() i32;
 ```
 

@@ -17,9 +17,17 @@ signed conversion is the unsigned one on the magnitude with the sign
 restored. the helpers cover a two-lane width, the widest any target here
 realizes
 
-## fun run
+## val PASS
 
 ```mach
-pub fun run(m: *me_ir.Module, tgt: *resolved.Target, itn: *intern.Interner) res[bool, fail.Fail];
+pub val PASS: pass.Pass = pass.Pass;
+```
+
+the pass the pipeline schedules
+
+## fun run_in
+
+```mach
+pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
 

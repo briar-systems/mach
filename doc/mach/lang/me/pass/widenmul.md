@@ -1,9 +1,17 @@
 # mach.lang.me.pass.widenmul
 
-## fun run
+## val PASS
 
 ```mach
-pub fun run(m: *me_ir.Module, tgt: *resolved.Target) res[bool, fail.Fail];
+pub val PASS: pass.Pass = pass.Pass;
+```
+
+the pass the pipeline schedules
+
+## fun run_in
+
+```mach
+pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
 
 rewrites a multiply of two same-kind extensions of one type into the
