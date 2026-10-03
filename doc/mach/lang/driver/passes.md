@@ -1,5 +1,14 @@
 # mach.lang.driver.passes
 
+## fun lower_scope_of
+
+```mach
+pub fun lower_scope_of(m: *project.ModuleEntry) res[*comptime.ComptimeCtx, fail.Fail];
+```
+
+the scope lowering binds a module's constants in, over what the load, resolve and sema bound
+over it; made on first use, it keeps what lowering bound for as long as the module's syntax stands
+
 ## fun prepare_resolve_pass
 
 ```mach
