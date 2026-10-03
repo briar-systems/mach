@@ -1,340 +1,981 @@
 # mach.lang.fe.comptime
 
-## def CTKind
+the comptime evaluator: an expression's value under the capabilities of the phase that
+asks, over the scope it runs in
+
+## fwd comptime_failure.EVAL_FAIL_INTERNAL
 
 ```mach
-pub def CTKind: u8
+fwd comptime_failure.EVAL_FAIL_INTERNAL
 ```
 
-## val CT_KIND_INT
+forwards [`mach.lang.fe.comptime.failure.EVAL_FAIL_INTERNAL`](comptime/failure.md#val-eval_fail_internal)
+
+## fwd comptime_failure.EVAL_FAIL_NEEDS_INSTANCE
 
 ```mach
-pub val CT_KIND_INT:   CTKind = 0
+fwd comptime_failure.EVAL_FAIL_NEEDS_INSTANCE
 ```
 
-## val CT_KIND_FLOAT
+forwards [`mach.lang.fe.comptime.failure.EVAL_FAIL_NEEDS_INSTANCE`](comptime/failure.md#val-eval_fail_needs_instance)
+
+## fwd comptime_failure.EVAL_FAIL_NEEDS_LAYOUT
 
 ```mach
-pub val CT_KIND_FLOAT: CTKind = 1
+fwd comptime_failure.EVAL_FAIL_NEEDS_LAYOUT
 ```
 
-## val CT_KIND_STR
+forwards [`mach.lang.fe.comptime.failure.EVAL_FAIL_NEEDS_LAYOUT`](comptime/failure.md#val-eval_fail_needs_layout)
+
+## fwd comptime_failure.EVAL_FAIL_NEEDS_MEMBER
 
 ```mach
-pub val CT_KIND_STR:   CTKind = 2
+fwd comptime_failure.EVAL_FAIL_NEEDS_MEMBER
 ```
 
-## val CT_KIND_TYPE
+forwards [`mach.lang.fe.comptime.failure.EVAL_FAIL_NEEDS_MEMBER`](comptime/failure.md#val-eval_fail_needs_member)
+
+## fwd comptime_failure.EVAL_FAIL_NEEDS_TYPES
 
 ```mach
-pub val CT_KIND_TYPE: CTKind = 3
+fwd comptime_failure.EVAL_FAIL_NEEDS_TYPES
 ```
 
-## val CT_KIND_FIELD
+forwards [`mach.lang.fe.comptime.failure.EVAL_FAIL_NEEDS_TYPES`](comptime/failure.md#val-eval_fail_needs_types)
+
+## fwd comptime_failure.EVAL_FAIL_REJECTED
 
 ```mach
-pub val CT_KIND_FIELD: CTKind = 4
+fwd comptime_failure.EVAL_FAIL_REJECTED
 ```
 
-## rec FieldRef
+forwards [`mach.lang.fe.comptime.failure.EVAL_FAIL_REJECTED`](comptime/failure.md#val-eval_fail_rejected)
+
+## fwd comptime_failure.EVAL_FAIL_UNBOUND
 
 ```mach
-pub rec FieldRef;
+fwd comptime_failure.EVAL_FAIL_UNBOUND
 ```
 
-## val CT_KIND_PACK_ELEM
+forwards [`mach.lang.fe.comptime.failure.EVAL_FAIL_UNBOUND`](comptime/failure.md#val-eval_fail_unbound)
+
+## fwd comptime_failure.EvalFail
 
 ```mach
-pub val CT_KIND_PACK_ELEM: CTKind = 5
+fwd comptime_failure.EvalFail
 ```
 
-## val CT_KIND_CONST_ELEM
+forwards [`mach.lang.fe.comptime.failure.EvalFail`](comptime/failure.md#rec-evalfail)
+
+## fwd comptime_failure.EvalFailKind
 
 ```mach
-pub val CT_KIND_CONST_ELEM: CTKind = 6
+fwd comptime_failure.EvalFailKind
 ```
 
-## val CT_KIND_CASE
+forwards [`mach.lang.fe.comptime.failure.EvalFailKind`](comptime/failure.md#def-evalfailkind)
+
+## fwd comptime_failure.eval_error
 
 ```mach
-pub val CT_KIND_CASE: CTKind = 7
+fwd comptime_failure.eval_error
 ```
 
-a tag case descriptor from `$cases(T)`: the same owner/index shape as a field descriptor
+forwards [`mach.lang.fe.comptime.failure.eval_error`](comptime/failure.md#fun-eval_error)
 
-## val CT_KIND_NON_INTEGER
+## fwd comptime_failure.eval_from_fail
 
 ```mach
-pub val CT_KIND_NON_INTEGER: CTKind = 8
+fwd comptime_failure.eval_from_fail
 ```
 
-an integer constant whose declared type is a def chain ending outside the integers;
-data.s is the interned refusal naming the chain, and reading it fails with that refusal
+forwards [`mach.lang.fe.comptime.failure.eval_from_fail`](comptime/failure.md#fun-eval_from_fail)
 
-## def GateState
+## fwd comptime_value.CTKind
 
 ```mach
-pub def GateState: u8
+fwd comptime_value.CTKind
 ```
 
-## val GATE_STATE_UNKNOWN
+forwards [`mach.lang.fe.comptime.value.CTKind`](comptime/value.md#def-ctkind)
+
+## fwd comptime_value.CTValue
 
 ```mach
-pub val GATE_STATE_UNKNOWN:  GateState = 0
+fwd comptime_value.CTValue
 ```
 
-## val GATE_STATE_TRUE
+forwards [`mach.lang.fe.comptime.value.CTValue`](comptime/value.md#rec-ctvalue)
+
+## fwd comptime_value.CT_KIND_CASE
 
 ```mach
-pub val GATE_STATE_TRUE:     GateState = 1
+fwd comptime_value.CT_KIND_CASE
 ```
 
-## val GATE_STATE_FALSE
+forwards [`mach.lang.fe.comptime.value.CT_KIND_CASE`](comptime/value.md#val-ct_kind_case)
+
+## fwd comptime_value.CT_KIND_CONST_ELEM
 
 ```mach
-pub val GATE_STATE_FALSE:    GateState = 2
+fwd comptime_value.CT_KIND_CONST_ELEM
 ```
 
-## val GATE_STATE_REJECTED
+forwards [`mach.lang.fe.comptime.value.CT_KIND_CONST_ELEM`](comptime/value.md#val-ct_kind_const_elem)
+
+## fwd comptime_value.CT_KIND_FIELD
 
 ```mach
-pub val GATE_STATE_REJECTED: GateState = 3
+fwd comptime_value.CT_KIND_FIELD
 ```
 
-## def GateOutcome
+forwards [`mach.lang.fe.comptime.value.CT_KIND_FIELD`](comptime/value.md#val-ct_kind_field)
+
+## fwd comptime_value.CT_KIND_FLOAT
 
 ```mach
-pub def GateOutcome: u8
+fwd comptime_value.CT_KIND_FLOAT
 ```
 
-## val GATE_INACTIVE
+forwards [`mach.lang.fe.comptime.value.CT_KIND_FLOAT`](comptime/value.md#val-ct_kind_float)
+
+## fwd comptime_value.CT_KIND_INT
 
 ```mach
-pub val GATE_INACTIVE:          GateOutcome = 0
+fwd comptime_value.CT_KIND_INT
 ```
 
-## val GATE_ACTIVE
+forwards [`mach.lang.fe.comptime.value.CT_KIND_INT`](comptime/value.md#val-ct_kind_int)
+
+## fwd comptime_value.CT_KIND_NON_INTEGER
 
 ```mach
-pub val GATE_ACTIVE:            GateOutcome = 1
+fwd comptime_value.CT_KIND_NON_INTEGER
 ```
 
-## val GATE_REJECTED
+forwards [`mach.lang.fe.comptime.value.CT_KIND_NON_INTEGER`](comptime/value.md#val-ct_kind_non_integer)
+
+## fwd comptime_value.CT_KIND_PACK_ELEM
 
 ```mach
-pub val GATE_REJECTED:          GateOutcome = 2
+fwd comptime_value.CT_KIND_PACK_ELEM
 ```
 
-## val GATE_FAILED
+forwards [`mach.lang.fe.comptime.value.CT_KIND_PACK_ELEM`](comptime/value.md#val-ct_kind_pack_elem)
+
+## fwd comptime_value.CT_KIND_STR
 
 ```mach
-pub val GATE_FAILED:            GateOutcome = 3
+fwd comptime_value.CT_KIND_STR
 ```
 
-## val GATE_AWAITING_PHASE
+forwards [`mach.lang.fe.comptime.value.CT_KIND_STR`](comptime/value.md#val-ct_kind_str)
+
+## fwd comptime_value.CT_KIND_TYPE
 
 ```mach
-pub val GATE_AWAITING_PHASE:    GateOutcome = 4
+fwd comptime_value.CT_KIND_TYPE
 ```
 
-## val GATE_AWAITING_INSTANCE
+forwards [`mach.lang.fe.comptime.value.CT_KIND_TYPE`](comptime/value.md#val-ct_kind_type)
+
+## fwd comptime_value.apply_declared_int_type
 
 ```mach
-pub val GATE_AWAITING_INSTANCE: GateOutcome = 5
+fwd comptime_value.apply_declared_int_type
 ```
 
-## rec CTValue
+forwards [`mach.lang.fe.comptime.value.apply_declared_int_type`](comptime/value.md#fun-apply_declared_int_type)
+
+## fwd comptime_value.case_value
 
 ```mach
-pub rec CTValue;
+fwd comptime_value.case_value
 ```
 
-an integer value is 128 bits in data.w; data.i is its low limb, and a signed
-value sign-fills the high limb so every reader of a value that fits 64 bits
-sees the same i64 it always did
+forwards [`mach.lang.fe.comptime.value.case_value`](comptime/value.md#fun-case_value)
 
-## rec NamedConst
+## fwd comptime_value.cast_scalar
 
 ```mach
-pub rec NamedConst;
+fwd comptime_value.cast_scalar
 ```
+
+forwards [`mach.lang.fe.comptime.value.cast_scalar`](comptime/value.md#fun-cast_scalar)
+
+## fwd comptime_value.cast_to_int
+
+```mach
+fwd comptime_value.cast_to_int
+```
+
+forwards [`mach.lang.fe.comptime.value.cast_to_int`](comptime/value.md#fun-cast_to_int)
+
+## fwd comptime_value.const_elem_untyped
+
+```mach
+fwd comptime_value.const_elem_untyped
+```
+
+forwards [`mach.lang.fe.comptime.value.const_elem_untyped`](comptime/value.md#fun-const_elem_untyped)
+
+## fwd comptime_value.const_elem_value
+
+```mach
+fwd comptime_value.const_elem_value
+```
+
+forwards [`mach.lang.fe.comptime.value.const_elem_value`](comptime/value.md#fun-const_elem_value)
+
+## fwd comptime_value.ct_float
+
+```mach
+fwd comptime_value.ct_float
+```
+
+forwards [`mach.lang.fe.comptime.value.ct_float`](comptime/value.md#fun-ct_float)
+
+## fwd comptime_value.ct_int_text
+
+```mach
+fwd comptime_value.ct_int_text
+```
+
+forwards [`mach.lang.fe.comptime.value.ct_int_text`](comptime/value.md#fun-ct_int_text)
+
+## fwd comptime_value.ct_int_u64
+
+```mach
+fwd comptime_value.ct_int_u64
+```
+
+forwards [`mach.lang.fe.comptime.value.ct_int_u64`](comptime/value.md#fun-ct_int_u64)
+
+## fwd comptime_value.ct_is_negative
+
+```mach
+fwd comptime_value.ct_is_negative
+```
+
+forwards [`mach.lang.fe.comptime.value.ct_is_negative`](comptime/value.md#fun-ct_is_negative)
+
+## fwd comptime_value.ct_str
+
+```mach
+fwd comptime_value.ct_str
+```
+
+forwards [`mach.lang.fe.comptime.value.ct_str`](comptime/value.md#fun-ct_str)
+
+## fwd comptime_value.ct_type
+
+```mach
+fwd comptime_value.ct_type
+```
+
+forwards [`mach.lang.fe.comptime.value.ct_type`](comptime/value.md#fun-ct_type)
+
+## fwd comptime_value.ct_u8
+
+```mach
+fwd comptime_value.ct_u8
+```
+
+forwards [`mach.lang.fe.comptime.value.ct_u8`](comptime/value.md#fun-ct_u8)
+
+## fwd comptime_value.ct_uint
+
+```mach
+fwd comptime_value.ct_uint
+```
+
+forwards [`mach.lang.fe.comptime.value.ct_uint`](comptime/value.md#fun-ct_uint)
+
+## fwd comptime_value.ct_zero_int
+
+```mach
+fwd comptime_value.ct_zero_int
+```
+
+forwards [`mach.lang.fe.comptime.value.ct_zero_int`](comptime/value.md#fun-ct_zero_int)
+
+## fwd comptime_value.field_value
+
+```mach
+fwd comptime_value.field_value
+```
+
+forwards [`mach.lang.fe.comptime.value.field_value`](comptime/value.md#fun-field_value)
+
+## fwd comptime_value.float_width_unread
+
+```mach
+fwd comptime_value.float_width_unread
+```
+
+forwards [`mach.lang.fe.comptime.value.float_width_unread`](comptime/value.md#fun-float_width_unread)
+
+## fwd comptime_value.is_descriptor
+
+```mach
+fwd comptime_value.is_descriptor
+```
+
+forwards [`mach.lang.fe.comptime.value.is_descriptor`](comptime/value.md#fun-is_descriptor)
+
+## fwd comptime_value.non_integer
+
+```mach
+fwd comptime_value.non_integer
+```
+
+forwards [`mach.lang.fe.comptime.value.non_integer`](comptime/value.md#fun-non_integer)
+
+## fwd comptime_value.pack_elem_value
+
+```mach
+fwd comptime_value.pack_elem_value
+```
+
+forwards [`mach.lang.fe.comptime.value.pack_elem_value`](comptime/value.md#fun-pack_elem_value)
+
+## fwd comptime_value.typed_int
+
+```mach
+fwd comptime_value.typed_int
+```
+
+forwards [`mach.lang.fe.comptime.value.typed_int`](comptime/value.md#fun-typed_int)
+
+## fwd comptime_capability.FIELD_SEL_CODE
+
+```mach
+fwd comptime_capability.FIELD_SEL_CODE
+```
+
+forwards [`mach.lang.fe.comptime.capability.FIELD_SEL_CODE`](comptime/capability.md#val-field_sel_code)
+
+## fwd comptime_capability.FIELD_SEL_HAS_PAYLOAD
+
+```mach
+fwd comptime_capability.FIELD_SEL_HAS_PAYLOAD
+```
+
+forwards [`mach.lang.fe.comptime.capability.FIELD_SEL_HAS_PAYLOAD`](comptime/capability.md#val-field_sel_has_payload)
+
+## fwd comptime_capability.FIELD_SEL_NAME
+
+```mach
+fwd comptime_capability.FIELD_SEL_NAME
+```
+
+forwards [`mach.lang.fe.comptime.capability.FIELD_SEL_NAME`](comptime/capability.md#val-field_sel_name)
+
+## fwd comptime_capability.FIELD_SEL_OFFSET
+
+```mach
+fwd comptime_capability.FIELD_SEL_OFFSET
+```
+
+forwards [`mach.lang.fe.comptime.capability.FIELD_SEL_OFFSET`](comptime/capability.md#val-field_sel_offset)
+
+## fwd comptime_capability.FIELD_SEL_TYPE
+
+```mach
+fwd comptime_capability.FIELD_SEL_TYPE
+```
+
+forwards [`mach.lang.fe.comptime.capability.FIELD_SEL_TYPE`](comptime/capability.md#val-field_sel_type)
+
+## fwd comptime_capability.FIELD_SEL_TYPE_BY_NAME
+
+```mach
+fwd comptime_capability.FIELD_SEL_TYPE_BY_NAME
+```
+
+forwards [`mach.lang.fe.comptime.capability.FIELD_SEL_TYPE_BY_NAME`](comptime/capability.md#val-field_sel_type_by_name)
+
+## fwd comptime_capability.FIELD_SEL_ZERO_BY_NAME
+
+```mach
+fwd comptime_capability.FIELD_SEL_ZERO_BY_NAME
+```
+
+forwards [`mach.lang.fe.comptime.capability.FIELD_SEL_ZERO_BY_NAME`](comptime/capability.md#val-field_sel_zero_by_name)
+
+## fwd comptime_capability.NoCapabilityContext
+
+```mach
+fwd comptime_capability.NoCapabilityContext
+```
+
+forwards [`mach.lang.fe.comptime.capability.NoCapabilityContext`](comptime/capability.md#rec-nocapabilitycontext)
+
+## fwd comptime_capability.PhaseCapabilities
+
+```mach
+fwd comptime_capability.PhaseCapabilities
+```
+
+forwards [`mach.lang.fe.comptime.capability.PhaseCapabilities`](comptime/capability.md#rec-phasecapabilities)
+
+## fwd comptime_capability.TYPE_QUERY_HOLDS_SECRET
+
+```mach
+fwd comptime_capability.TYPE_QUERY_HOLDS_SECRET
+```
+
+forwards [`mach.lang.fe.comptime.capability.TYPE_QUERY_HOLDS_SECRET`](comptime/capability.md#val-type_query_holds_secret)
+
+## fwd comptime_capability.TYPE_QUERY_IS_FLOAT
+
+```mach
+fwd comptime_capability.TYPE_QUERY_IS_FLOAT
+```
+
+forwards [`mach.lang.fe.comptime.capability.TYPE_QUERY_IS_FLOAT`](comptime/capability.md#val-type_query_is_float)
+
+## fwd comptime_capability.TYPE_QUERY_IS_INTEGER
+
+```mach
+fwd comptime_capability.TYPE_QUERY_IS_INTEGER
+```
+
+forwards [`mach.lang.fe.comptime.capability.TYPE_QUERY_IS_INTEGER`](comptime/capability.md#val-type_query_is_integer)
+
+## fwd comptime_capability.TYPE_QUERY_IS_POINTER
+
+```mach
+fwd comptime_capability.TYPE_QUERY_IS_POINTER
+```
+
+forwards [`mach.lang.fe.comptime.capability.TYPE_QUERY_IS_POINTER`](comptime/capability.md#val-type_query_is_pointer)
+
+## fwd comptime_capability.TYPE_QUERY_IS_RECORD
+
+```mach
+fwd comptime_capability.TYPE_QUERY_IS_RECORD
+```
+
+forwards [`mach.lang.fe.comptime.capability.TYPE_QUERY_IS_RECORD`](comptime/capability.md#val-type_query_is_record)
+
+## fwd comptime_capability.TYPE_QUERY_IS_SECRET
+
+```mach
+fwd comptime_capability.TYPE_QUERY_IS_SECRET
+```
+
+forwards [`mach.lang.fe.comptime.capability.TYPE_QUERY_IS_SECRET`](comptime/capability.md#val-type_query_is_secret)
+
+## fwd comptime_capability.TYPE_QUERY_IS_TAG
+
+```mach
+fwd comptime_capability.TYPE_QUERY_IS_TAG
+```
+
+forwards [`mach.lang.fe.comptime.capability.TYPE_QUERY_IS_TAG`](comptime/capability.md#val-type_query_is_tag)
+
+## fwd comptime_capability.TYPE_QUERY_IS_UNION
+
+```mach
+fwd comptime_capability.TYPE_QUERY_IS_UNION
+```
+
+forwards [`mach.lang.fe.comptime.capability.TYPE_QUERY_IS_UNION`](comptime/capability.md#val-type_query_is_union)
+
+## fwd comptime_capability.TYPE_QUERY_NAME
+
+```mach
+fwd comptime_capability.TYPE_QUERY_NAME
+```
+
+forwards [`mach.lang.fe.comptime.capability.TYPE_QUERY_NAME`](comptime/capability.md#val-type_query_name)
+
+## fwd comptime_capability.loading_capabilities
+
+```mach
+fwd comptime_capability.loading_capabilities
+```
+
+forwards [`mach.lang.fe.comptime.capability.loading_capabilities`](comptime/capability.md#fun-loading_capabilities)
+
+## fwd comptime_capability.lowering_capabilities
+
+```mach
+fwd comptime_capability.lowering_capabilities
+```
+
+forwards [`mach.lang.fe.comptime.capability.lowering_capabilities`](comptime/capability.md#fun-lowering_capabilities)
+
+## fwd comptime_capability.no_capabilities
+
+```mach
+fwd comptime_capability.no_capabilities
+```
+
+forwards [`mach.lang.fe.comptime.capability.no_capabilities`](comptime/capability.md#fun-no_capabilities)
+
+## fwd comptime_capability.resolution_capabilities
+
+```mach
+fwd comptime_capability.resolution_capabilities
+```
+
+forwards [`mach.lang.fe.comptime.capability.resolution_capabilities`](comptime/capability.md#fun-resolution_capabilities)
+
+## fwd comptime_capability.semantic_name_capabilities
+
+```mach
+fwd comptime_capability.semantic_name_capabilities
+```
+
+forwards [`mach.lang.fe.comptime.capability.semantic_name_capabilities`](comptime/capability.md#fun-semantic_name_capabilities)
+
+## fwd comptime_capability.semantic_type_capabilities
+
+```mach
+fwd comptime_capability.semantic_type_capabilities
+```
+
+forwards [`mach.lang.fe.comptime.capability.semantic_type_capabilities`](comptime/capability.md#fun-semantic_type_capabilities)
+
+## fwd comptime_scope.Bindings
+
+```mach
+fwd comptime_scope.Bindings
+```
+
+forwards [`mach.lang.fe.comptime.scope.Bindings`](comptime/scope.md#rec-bindings)
+
+## fwd comptime_scope.ComptimeCtx
+
+```mach
+fwd comptime_scope.ComptimeCtx
+```
+
+forwards [`mach.lang.fe.comptime.scope.ComptimeCtx`](comptime/scope.md#rec-comptimectx)
+
+## fwd comptime_scope.ComptimeEnv
+
+```mach
+fwd comptime_scope.ComptimeEnv
+```
+
+forwards [`mach.lang.fe.comptime.scope.ComptimeEnv`](comptime/scope.md#rec-comptimeenv)
+
+## fwd comptime_scope.EMBED_PATH_ESCAPED
+
+```mach
+fwd comptime_scope.EMBED_PATH_ESCAPED
+```
+
+forwards [`mach.lang.fe.comptime.scope.EMBED_PATH_ESCAPED`](comptime/scope.md#val-embed_path_escaped)
+
+## fwd comptime_scope.EMBED_PATH_NO_LOCATION
+
+```mach
+fwd comptime_scope.EMBED_PATH_NO_LOCATION
+```
+
+forwards [`mach.lang.fe.comptime.scope.EMBED_PATH_NO_LOCATION`](comptime/scope.md#val-embed_path_no_location)
+
+## fwd comptime_scope.EMBED_PATH_REFUSED
+
+```mach
+fwd comptime_scope.EMBED_PATH_REFUSED
+```
+
+forwards [`mach.lang.fe.comptime.scope.EMBED_PATH_REFUSED`](comptime/scope.md#val-embed_path_refused)
+
+## fwd comptime_scope.EMBED_PATH_RESOLVED
+
+```mach
+fwd comptime_scope.EMBED_PATH_RESOLVED
+```
+
+forwards [`mach.lang.fe.comptime.scope.EMBED_PATH_RESOLVED`](comptime/scope.md#val-embed_path_resolved)
+
+## fwd comptime_scope.EmbedPath
+
+```mach
+fwd comptime_scope.EmbedPath
+```
+
+forwards [`mach.lang.fe.comptime.scope.EmbedPath`](comptime/scope.md#rec-embedpath)
+
+## fwd comptime_scope.EmbedPathKind
+
+```mach
+fwd comptime_scope.EmbedPathKind
+```
+
+forwards [`mach.lang.fe.comptime.scope.EmbedPathKind`](comptime/scope.md#def-embedpathkind)
+
+## fwd comptime_scope.FrameMark
+
+```mach
+fwd comptime_scope.FrameMark
+```
+
+forwards [`mach.lang.fe.comptime.scope.FrameMark`](comptime/scope.md#rec-framemark)
+
+## fwd comptime_scope.GATE_STATE_FALSE
+
+```mach
+fwd comptime_scope.GATE_STATE_FALSE
+```
+
+forwards [`mach.lang.fe.comptime.scope.GATE_STATE_FALSE`](comptime/scope.md#val-gate_state_false)
+
+## fwd comptime_scope.GATE_STATE_REJECTED
+
+```mach
+fwd comptime_scope.GATE_STATE_REJECTED
+```
+
+forwards [`mach.lang.fe.comptime.scope.GATE_STATE_REJECTED`](comptime/scope.md#val-gate_state_rejected)
+
+## fwd comptime_scope.GATE_STATE_TRUE
+
+```mach
+fwd comptime_scope.GATE_STATE_TRUE
+```
+
+forwards [`mach.lang.fe.comptime.scope.GATE_STATE_TRUE`](comptime/scope.md#val-gate_state_true)
+
+## fwd comptime_scope.GATE_STATE_UNKNOWN
+
+```mach
+fwd comptime_scope.GATE_STATE_UNKNOWN
+```
+
+forwards [`mach.lang.fe.comptime.scope.GATE_STATE_UNKNOWN`](comptime/scope.md#val-gate_state_unknown)
+
+## fwd comptime_scope.GateState
+
+```mach
+fwd comptime_scope.GateState
+```
+
+forwards [`mach.lang.fe.comptime.scope.GateState`](comptime/scope.md#def-gatestate)
+
+## fwd comptime_scope.NamedConst
+
+```mach
+fwd comptime_scope.NamedConst
+```
+
+forwards [`mach.lang.fe.comptime.scope.NamedConst`](comptime/scope.md#rec-namedconst)
+
+## fwd comptime_scope.STAGE_LOAD
+
+```mach
+fwd comptime_scope.STAGE_LOAD
+```
+
+forwards [`mach.lang.fe.comptime.scope.STAGE_LOAD`](comptime/scope.md#val-stage_load)
+
+## fwd comptime_scope.STAGE_LOWER
+
+```mach
+fwd comptime_scope.STAGE_LOWER
+```
+
+forwards [`mach.lang.fe.comptime.scope.STAGE_LOWER`](comptime/scope.md#val-stage_lower)
+
+## fwd comptime_scope.STAGE_RESOLVE
+
+```mach
+fwd comptime_scope.STAGE_RESOLVE
+```
+
+forwards [`mach.lang.fe.comptime.scope.STAGE_RESOLVE`](comptime/scope.md#val-stage_resolve)
+
+## fwd comptime_scope.STAGE_SEMA
+
+```mach
+fwd comptime_scope.STAGE_SEMA
+```
+
+forwards [`mach.lang.fe.comptime.scope.STAGE_SEMA`](comptime/scope.md#val-stage_sema)
+
+## fwd comptime_scope.bind
+
+```mach
+fwd comptime_scope.bind
+```
+
+forwards [`mach.lang.fe.comptime.scope.bind`](comptime/scope.md#fun-bind)
+
+## fwd comptime_scope.bind_gated
+
+```mach
+fwd comptime_scope.bind_gated
+```
+
+forwards [`mach.lang.fe.comptime.scope.bind_gated`](comptime/scope.md#fun-bind_gated)
+
+## fwd comptime_scope.bindings_dnit
+
+```mach
+fwd comptime_scope.bindings_dnit
+```
+
+forwards [`mach.lang.fe.comptime.scope.bindings_dnit`](comptime/scope.md#fun-bindings_dnit)
+
+## fwd comptime_scope.decorator_embed_at
+
+```mach
+fwd comptime_scope.decorator_embed_at
+```
+
+forwards [`mach.lang.fe.comptime.scope.decorator_embed_at`](comptime/scope.md#fun-decorator_embed_at)
+
+## fwd comptime_scope.decorator_embed_file
+
+```mach
+fwd comptime_scope.decorator_embed_file
+```
+
+forwards [`mach.lang.fe.comptime.scope.decorator_embed_file`](comptime/scope.md#fun-decorator_embed_file)
+
+## fwd comptime_scope.decorator_embed_set
+
+```mach
+fwd comptime_scope.decorator_embed_set
+```
+
+forwards [`mach.lang.fe.comptime.scope.decorator_embed_set`](comptime/scope.md#fun-decorator_embed_set)
+
+## fwd comptime_scope.decorator_string_at
+
+```mach
+fwd comptime_scope.decorator_string_at
+```
+
+forwards [`mach.lang.fe.comptime.scope.decorator_string_at`](comptime/scope.md#fun-decorator_string_at)
+
+## fwd comptime_scope.decorator_string_set
+
+```mach
+fwd comptime_scope.decorator_string_set
+```
+
+forwards [`mach.lang.fe.comptime.scope.decorator_string_set`](comptime/scope.md#fun-decorator_string_set)
+
+## fwd comptime_scope.decorators_clear
+
+```mach
+fwd comptime_scope.decorators_clear
+```
+
+forwards [`mach.lang.fe.comptime.scope.decorators_clear`](comptime/scope.md#fun-decorators_clear)
+
+## fwd comptime_scope.defer_float_width
+
+```mach
+fwd comptime_scope.defer_float_width
+```
+
+forwards [`mach.lang.fe.comptime.scope.defer_float_width`](comptime/scope.md#fun-defer_float_width)
+
+## fwd comptime_scope.dnit
+
+```mach
+fwd comptime_scope.dnit
+```
+
+forwards [`mach.lang.fe.comptime.scope.dnit`](comptime/scope.md#fun-dnit)
+
+## fwd comptime_scope.environment
+
+```mach
+fwd comptime_scope.environment
+```
+
+forwards [`mach.lang.fe.comptime.scope.environment`](comptime/scope.md#fun-environment)
+
+## fwd comptime_scope.field_type_of_binding
+
+```mach
+fwd comptime_scope.field_type_of_binding
+```
+
+forwards [`mach.lang.fe.comptime.scope.field_type_of_binding`](comptime/scope.md#fun-field_type_of_binding)
+
+## fwd comptime_scope.frame_close
+
+```mach
+fwd comptime_scope.frame_close
+```
+
+forwards [`mach.lang.fe.comptime.scope.frame_close`](comptime/scope.md#fun-frame_close)
+
+## fwd comptime_scope.frame_open
+
+```mach
+fwd comptime_scope.frame_open
+```
+
+forwards [`mach.lang.fe.comptime.scope.frame_open`](comptime/scope.md#fun-frame_open)
+
+## fwd comptime_scope.gate_state
+
+```mach
+fwd comptime_scope.gate_state
+```
+
+forwards [`mach.lang.fe.comptime.scope.gate_state`](comptime/scope.md#fun-gate_state)
+
+## fwd comptime_scope.init
+
+```mach
+fwd comptime_scope.init
+```
+
+forwards [`mach.lang.fe.comptime.scope.init`](comptime/scope.md#fun-init)
+
+## fwd comptime_scope.layer_at
+
+```mach
+fwd comptime_scope.layer_at
+```
+
+forwards [`mach.lang.fe.comptime.scope.layer_at`](comptime/scope.md#fun-layer_at)
+
+## fwd comptime_scope.layer_set
+
+```mach
+fwd comptime_scope.layer_set
+```
+
+forwards [`mach.lang.fe.comptime.scope.layer_set`](comptime/scope.md#fun-layer_set)
+
+## fwd comptime_scope.lookup
+
+```mach
+fwd comptime_scope.lookup
+```
+
+forwards [`mach.lang.fe.comptime.scope.lookup`](comptime/scope.md#fun-lookup)
+
+## fwd comptime_scope.prepare_gates
+
+```mach
+fwd comptime_scope.prepare_gates
+```
+
+forwards [`mach.lang.fe.comptime.scope.prepare_gates`](comptime/scope.md#fun-prepare_gates)
+
+## fwd comptime_scope.publish
+
+```mach
+fwd comptime_scope.publish
+```
+
+forwards [`mach.lang.fe.comptime.scope.publish`](comptime/scope.md#fun-publish)
+
+## fwd comptime_scope.reader_init
+
+```mach
+fwd comptime_scope.reader_init
+```
+
+forwards [`mach.lang.fe.comptime.scope.reader_init`](comptime/scope.md#fun-reader_init)
+
+## fwd comptime_scope.set_build_context
+
+```mach
+fwd comptime_scope.set_build_context
+```
+
+forwards [`mach.lang.fe.comptime.scope.set_build_context`](comptime/scope.md#fun-set_build_context)
+
+## fwd comptime_scope.set_ct_mul
+
+```mach
+fwd comptime_scope.set_ct_mul
+```
+
+forwards [`mach.lang.fe.comptime.scope.set_ct_mul`](comptime/scope.md#fun-set_ct_mul)
+
+## fwd comptime_scope.set_extensions
+
+```mach
+fwd comptime_scope.set_extensions
+```
+
+forwards [`mach.lang.fe.comptime.scope.set_extensions`](comptime/scope.md#fun-set_extensions)
+
+## fwd comptime_scope.set_gate_state
+
+```mach
+fwd comptime_scope.set_gate_state
+```
+
+forwards [`mach.lang.fe.comptime.scope.set_gate_state`](comptime/scope.md#fun-set_gate_state)
+
+## fwd comptime_scope.set_nan_rule
+
+```mach
+fwd comptime_scope.set_nan_rule
+```
+
+forwards [`mach.lang.fe.comptime.scope.set_nan_rule`](comptime/scope.md#fun-set_nan_rule)
+
+## fwd comptime_scope.set_source_context
+
+```mach
+fwd comptime_scope.set_source_context
+```
+
+forwards [`mach.lang.fe.comptime.scope.set_source_context`](comptime/scope.md#fun-set_source_context)
+
+## fwd comptime_scope.set_target_defs
+
+```mach
+fwd comptime_scope.set_target_defs
+```
+
+forwards [`mach.lang.fe.comptime.scope.set_target_defs`](comptime/scope.md#fun-set_target_defs)
+
+## fwd comptime_scope.set_union_build
+
+```mach
+fwd comptime_scope.set_union_build
+```
+
+forwards [`mach.lang.fe.comptime.scope.set_union_build`](comptime/scope.md#fun-set_union_build)
+
+## fwd comptime_scope.set_va_list
+
+```mach
+fwd comptime_scope.set_va_list
+```
+
+forwards [`mach.lang.fe.comptime.scope.set_va_list`](comptime/scope.md#fun-set_va_list)
+
+## fwd comptime_scope.set_vocabulary
+
+```mach
+fwd comptime_scope.set_vocabulary
+```
+
+forwards [`mach.lang.fe.comptime.scope.set_vocabulary`](comptime/scope.md#fun-set_vocabulary)
+
+## fwd comptime_scope.stage_init
+
+```mach
+fwd comptime_scope.stage_init
+```
+
+forwards [`mach.lang.fe.comptime.scope.stage_init`](comptime/scope.md#fun-stage_init)
 
 ## val COMPTIME_TYPE_NEEDS_INSTANCE_MSG
 
 ```mach
 pub val COMPTIME_TYPE_NEEDS_INSTANCE_MSG: str =
 "a type comparison on an unsubstituted generic parameter is only decidable at an instantiation"
-```
-
-## val FIELD_SEL_NAME
-
-```mach
-pub val FIELD_SEL_NAME:         u8 = 0
-```
-
-## val FIELD_SEL_TYPE
-
-```mach
-pub val FIELD_SEL_TYPE:         u8 = 1
-```
-
-## val FIELD_SEL_OFFSET
-
-```mach
-pub val FIELD_SEL_OFFSET:       u8 = 2
-```
-
-## val FIELD_SEL_ZERO_BY_NAME
-
-```mach
-pub val FIELD_SEL_ZERO_BY_NAME: u8 = 3
-```
-
-## val FIELD_SEL_HAS_PAYLOAD
-
-```mach
-pub val FIELD_SEL_HAS_PAYLOAD:  u8 = 4
-```
-
-## val FIELD_SEL_CODE
-
-```mach
-pub val FIELD_SEL_CODE:         u8 = 5
-```
-
-## val FIELD_SEL_TYPE_BY_NAME
-
-```mach
-pub val FIELD_SEL_TYPE_BY_NAME: u8 = 6
-```
-
-## val TYPE_QUERY_IS_RECORD
-
-```mach
-pub val TYPE_QUERY_IS_RECORD:    u8 = 0
-```
-
-## val TYPE_QUERY_IS_UNION
-
-```mach
-pub val TYPE_QUERY_IS_UNION:     u8 = 1
-```
-
-## val TYPE_QUERY_IS_POINTER
-
-```mach
-pub val TYPE_QUERY_IS_POINTER:   u8 = 2
-```
-
-## val TYPE_QUERY_NAME
-
-```mach
-pub val TYPE_QUERY_NAME:         u8 = 3
-```
-
-## val TYPE_QUERY_IS_SECRET
-
-```mach
-pub val TYPE_QUERY_IS_SECRET:    u8 = 4
-```
-
-## val TYPE_QUERY_IS_TAG
-
-```mach
-pub val TYPE_QUERY_IS_TAG:       u8 = 5
-```
-
-## val TYPE_QUERY_IS_INTEGER
-
-```mach
-pub val TYPE_QUERY_IS_INTEGER:   u8 = 6
-```
-
-## val TYPE_QUERY_IS_FLOAT
-
-```mach
-pub val TYPE_QUERY_IS_FLOAT:     u8 = 7
-```
-
-## val TYPE_QUERY_HOLDS_SECRET
-
-```mach
-pub val TYPE_QUERY_HOLDS_SECRET: u8 = 8
-```
-
-## rec NoCapabilityContext
-
-```mach
-pub rec NoCapabilityContext;
-```
-
-the context of an evaluation that holds no phase capability
-
-## rec PhaseCapabilities
-
-```mach
-pub rec PhaseCapabilities[T];
-```
-
-## fun no_capabilities
-
-```mach
-pub fun no_capabilities() PhaseCapabilities[NoCapabilityContext];
-```
-
-no phase capability: an expression reads literals and the constants its context binds
-
-## fun loading_capabilities
-
-```mach
-pub fun loading_capabilities[T](member: fun(*T, ast_id.ExprId) res[opt[CTValue], EvalFail],
-cast: fun(*T, ast_id.ExprId, CTValue) res[CTValue, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
-```
-
-## fun resolution_capabilities
-
-```mach
-pub fun resolution_capabilities[T](ident: fun(*T, ast_id.ExprId) bool,
-expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
-```
-
-## fun semantic_name_capabilities
-
-```mach
-pub fun semantic_name_capabilities[T](
-member: fun(*T, ast_id.ExprId) res[opt[CTValue], EvalFail],
-ident: fun(*T, ast_id.ExprId) bool,
-expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
-```
-
-## fun semantic_type_capabilities
-
-```mach
-pub fun semantic_type_capabilities[T](
-member: fun(*T, ast_id.ExprId) res[opt[CTValue], EvalFail],
-type_: fun(*T, ast_id.ExprId) res[opt[u32], EvalFail],
-field: fun(*T, u32, u32, u8) res[opt[CTValue], EvalFail],
-query: fun(*T, u32, u8) res[opt[CTValue], EvalFail],
-layout: fun(*T, u32) res[opt[CTValue], EvalFail],
-cast: fun(*T, ast_id.ExprId, CTValue) res[CTValue, EvalFail],
-scalar: fun(*T, ast_id.ExprId, CTValue) res[CTValue, EvalFail],
-ident: fun(*T, ast_id.ExprId) bool,
-expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
-```
-
-## fun lowering_capabilities
-
-```mach
-pub fun lowering_capabilities[T](
-member: fun(*T, ast_id.ExprId) res[opt[CTValue], EvalFail],
-type_: fun(*T, ast_id.ExprId) res[opt[u32], EvalFail],
-field: fun(*T, u32, u32, u8) res[opt[CTValue], EvalFail],
-query: fun(*T, u32, u8) res[opt[CTValue], EvalFail],
-layout: fun(*T, u32) res[opt[CTValue], EvalFail],
-cast: fun(*T, ast_id.ExprId, CTValue) res[CTValue, EvalFail],
-scalar: fun(*T, ast_id.ExprId, CTValue) res[CTValue, EvalFail],
-ident: fun(*T, ast_id.ExprId) bool,
-expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
 ```
 
 ## val COMPTIME_FIELD_UNKNOWN_MEMBER_MSG
@@ -365,792 +1006,31 @@ pub val COMPTIME_CASE_NO_PAYLOAD_MSG: str =
 "this case has no payload, so it has no `.type` or `.offset`
 ```
 
-## def EvalFailKind
-
-```mach
-pub def EvalFailKind: u8
-```
-
-## val EVAL_FAIL_REJECTED
-
-```mach
-pub val EVAL_FAIL_REJECTED:       EvalFailKind = 1
-```
-
-## val EVAL_FAIL_UNBOUND
-
-```mach
-pub val EVAL_FAIL_UNBOUND:        EvalFailKind = 2
-```
-
-## val EVAL_FAIL_NEEDS_MEMBER
-
-```mach
-pub val EVAL_FAIL_NEEDS_MEMBER:   EvalFailKind = 3
-```
-
-## val EVAL_FAIL_NEEDS_TYPES
-
-```mach
-pub val EVAL_FAIL_NEEDS_TYPES:    EvalFailKind = 4
-```
-
-## val EVAL_FAIL_NEEDS_LAYOUT
-
-```mach
-pub val EVAL_FAIL_NEEDS_LAYOUT:   EvalFailKind = 5
-```
-
-## val EVAL_FAIL_INTERNAL
-
-```mach
-pub val EVAL_FAIL_INTERNAL:       EvalFailKind = 6
-```
-
-## val EVAL_FAIL_NEEDS_INSTANCE
-
-```mach
-pub val EVAL_FAIL_NEEDS_INSTANCE: EvalFailKind = 7
-```
-
-## rec EvalFail
-
-```mach
-pub rec EvalFail;
-```
-
-diag: the diagnostic kind the failure is reported as, where it reaches the user
-
-## fun eval_error
-
-```mach
-pub fun eval_error(kind: EvalFailKind, diag: diagnostic_kind.Kind, message: str) EvalFail;
-```
-
-## fun eval_from_fail
-
-```mach
-pub fun eval_from_fail(f: fail.Fail, diag: diagnostic_kind.Kind, rejected_message: str) EvalFail;
-```
-
-## rec FrameMark
-
-```mach
-pub rec FrameMark;
-```
-
-## rec ComptimeEnv
-
-```mach
-pub rec ComptimeEnv;
-```
-
-## def Stage
-
-```mach
-pub def Stage: u8
-```
-
-the stages that bind comptime state over a module, in the order they run; each binds into its
-own bindings and reads those of the stages before it
-
-## val STAGE_LOAD
-
-```mach
-pub val STAGE_LOAD:    Stage = 0
-```
-
-## val STAGE_RESOLVE
-
-```mach
-pub val STAGE_RESOLVE: Stage = 1
-```
-
-## val STAGE_SEMA
-
-```mach
-pub val STAGE_SEMA:    Stage = 2
-```
-
-## val STAGE_LOWER
-
-```mach
-pub val STAGE_LOWER:   Stage = 3
-```
-
-## def EmbedPathKind
-
-```mach
-pub def EmbedPathKind: u8
-```
-
-what the load made of an `embed` argument
-
-EMBED_PATH_RESOLVED: it names the file at `text`
-EMBED_PATH_NO_LOCATION: the declaring file has no path on disk to resolve it against
-EMBED_PATH_REFUSED: its path template is refused, for the reason `text`
-EMBED_PATH_ESCAPED: it names a file outside the project root, which is never read
-
-## val EMBED_PATH_RESOLVED
-
-```mach
-pub val EMBED_PATH_RESOLVED:    EmbedPathKind = 0
-```
-
-## val EMBED_PATH_NO_LOCATION
-
-```mach
-pub val EMBED_PATH_NO_LOCATION: EmbedPathKind = 1
-```
-
-## val EMBED_PATH_REFUSED
-
-```mach
-pub val EMBED_PATH_REFUSED:     EmbedPathKind = 2
-```
-
-## val EMBED_PATH_ESCAPED
-
-```mach
-pub val EMBED_PATH_ESCAPED:     EmbedPathKind = 3
-```
-
-## rec EmbedPath
-
-```mach
-pub rec EmbedPath;
-```
-
-## rec Bindings
-
-```mach
-pub rec Bindings;
-```
-
-what one stage binds over one module, which that stage alone writes and every later stage reads
-
-entries: its constants, innermost last
-deferred: the names whose float width only type checking can read
-gate_states: the gates it decided, by condition
-strings: the string each decorator argument evaluates to, by argument; only the load records them
-embeds: what each `embed` argument names, by argument; only the load records them
-
-## fun bindings_init
-
-```mach
-pub fun bindings_init(alloc: *A.Allocator) Bindings;
-```
-
-## fun bindings_dnit
-
-```mach
-pub fun bindings_dnit(b: *Bindings);
-```
-
-## rec ComptimeCtx
-
-```mach
-pub rec ComptimeCtx;
-```
-
-the scope one stage evaluates a module in: the shared description of the build and the module,
-the bindings of the stages before it, which it only reads, and its own, which it alone writes
-
-stage: the stage whose bindings `own` holds
-below: each earlier stage's bindings by stage, nil where the scope reads none
-
-## fun environment
-
-```mach
-pub fun environment(c: *ComptimeCtx) ComptimeEnv;
-```
-
-## fun init
-
-```mach
-pub fun init(
-alloc: *A.Allocator,
-target_os_id: u32,
-target_arch_id: u32,
-target_abi_id: u32,
-build_mode_id: u32,
-build_pie: u32,
-pointer_width: u32,
-vector_bits: u32,
-register_bits: u32,
-has_float: bool,
-compiler_name: intern.StrId,
-compiler_ver: intern.StrId) ComptimeCtx;
-```
-
-## fun stage_init
-
-```mach
-pub fun stage_init(load: *ComptimeCtx, stage: Stage, alloc: *A.Allocator) ComptimeCtx;
-```
-
-the scope `stage` evaluates a module in, over the load's scope of the module: the load's
-description and bindings, with every stage between them left for `layer_set`. what the stage
-binds is allocated from `alloc`, which outlives the product the bindings are published to
-
-## fun layer_set
-
-```mach
-pub fun layer_set(c: *ComptimeCtx, stage: Stage, b: *Bindings);
-```
-
-read the bindings `b` an earlier stage made, beneath the scope's own
-
-## fun layer_at
-
-```mach
-pub fun layer_at(c: *ComptimeCtx, stage: Stage) *Bindings;
-```
-
-the bindings of the earlier stage `stage` the scope reads, nil where it reads none
-
-## fun reader_init
-
-```mach
-pub fun reader_init(c: *ComptimeCtx) ComptimeCtx;
-```
-
-a scope that reads everything `c` reads and binds, with nothing of its own, for evaluating in
-another stage's or another module's scope without writing to it
-
-## fun publish
-
-```mach
-pub fun publish(c: *ComptimeCtx) Bindings;
-```
-
-hand the bindings the scope's stage made to its product; the scope keeps none
-
-## fun set_union_build
-
-```mach
-pub fun set_union_build(c: *ComptimeCtx, v: bool);
-```
-
-## fun set_target_defs
-
-```mach
-pub fun set_target_defs(c: *ComptimeCtx, d: *target_definition.Table);
-```
-
-## fun set_nan_rule
-
-```mach
-pub fun set_nan_rule(c: *ComptimeCtx, rule: float.NanRule);
-```
-
-## fun set_ct_mul
-
-```mach
-pub fun set_ct_mul(c: *ComptimeCtx, mask: ct.CtMulMask);
-```
-
-## fun set_extensions
-
-```mach
-pub fun set_extensions(c: *ComptimeCtx, view: target_model.ExtensionView);
-```
-
-## fun set_vocabulary
-
-```mach
-pub fun set_vocabulary(c: *ComptimeCtx, vocabulary: *extension.Vocabulary);
-```
-
-## fun set_va_list
-
-```mach
-pub fun set_va_list(c: *ComptimeCtx, size: u32, align: u32);
-```
-
-## fun set_build_context
-
-```mach
-pub fun set_build_context(
-c: *ComptimeCtx,
-project_id: intern.StrId,
-project_ver: intern.StrId,
-target_os: intern.StrId,
-target_isa: intern.StrId,
-target_abi: intern.StrId,
-target_platform: intern.StrId,
-bin_name: intern.StrId);
-```
-
-## fun set_source_context
-
-```mach
-pub fun set_source_context(c: *ComptimeCtx, module: intern.StrId, file: intern.StrId,
-owner_id: intern.StrId, owner_ver: intern.StrId);
-```
-
-the module a context compiles, what `$mach.source.*` and `$mach.project.*` read
-
-module: the module's fully qualified name
-file: its file, relative to the root of the project that owns it
-owner_id: the owning project's `[project].id`
-owner_ver: the owning project's `[project].version`
-
-## fun dnit
-
-```mach
-pub fun dnit(c: *ComptimeCtx);
-```
-
-release the scope's own bindings; what it reads below belongs to the stages that made it
-
-## fun prepare_gates
-
-```mach
-pub fun prepare_gates(c: *ComptimeCtx, expr_count: u32) err[fail.Fail];
-```
-
-size the scope's own gate decisions for a module tree of `expr_count` expressions
-
-## fun gate_state
-
-```mach
-pub fun gate_state(c: *ComptimeCtx, eid: ast_id.ExprId) GateState;
-```
-
-the decision on a gate: the scope's own, else the latest stage's below it that made one
-
-## fun set_gate_state
-
-```mach
-pub fun set_gate_state(c: *ComptimeCtx, eid: ast_id.ExprId, state: GateState);
-```
-
-## fun defer_float_width
-
-```mach
-pub fun defer_float_width(c: *ComptimeCtx, name: intern.StrId) err[fail.Fail];
-```
-
-## fun bind
-
-```mach
-pub fun bind(c: *ComptimeCtx, name: intern.StrId, value: CTValue) err[fail.Fail];
-```
-
-## fun bind_gated
-
-```mach
-pub fun bind_gated(c: *ComptimeCtx, name: intern.StrId, value: CTValue, gated: bool) err[fail.Fail];
-```
-
-## fun frame_open
-
-```mach
-pub fun frame_open(c: *ComptimeCtx) res[FrameMark, fail.Fail];
-```
-
-## fun frame_close
-
-```mach
-pub fun frame_close(c: *ComptimeCtx, mark: FrameMark) err[fail.Fail];
-```
-
-## fun lookup
-
-```mach
-pub fun lookup(c: *ComptimeCtx, name: intern.StrId) opt[NamedConst];
-```
-
-the constant `name` is bound to: the scope's own latest binding, else the latest stage's below it
-
-## fun decorator_string_set
-
-```mach
-pub fun decorator_string_set(c: *ComptimeCtx, arg: ast_id.ExprId, value: intern.StrId) err[fail.Fail];
-```
-
-record the string the decorator argument `arg` evaluates to
-
-## fun decorator_string_at
-
-```mach
-pub fun decorator_string_at(c: *ComptimeCtx, arg: ast_id.ExprId) intern.StrId;
-```
-
-the string the decorator argument `arg` evaluates to, as the load recorded it; STR_NIL when it is
-not a constant string
-
-## fun decorator_embed_set
-
-```mach
-pub fun decorator_embed_set(c: *ComptimeCtx, arg: ast_id.ExprId, path: EmbedPath) err[fail.Fail];
-```
-
-record what the `embed` argument `arg` names
-
-## fun decorator_embed_at
-
-```mach
-pub fun decorator_embed_at(c: *ComptimeCtx, arg: ast_id.ExprId) opt[EmbedPath];
-```
-
-what the `embed` argument `arg` names, as the load recorded it; none when it recorded nothing
-
-## fun decorator_embed_file
-
-```mach
-pub fun decorator_embed_file(c: *ComptimeCtx, arg: ast_id.ExprId) intern.StrId;
-```
-
-the file the `embed` argument `arg` names, as the load resolved it; STR_NIL when it names none
-the build reads
-
-## fun decorators_clear
-
-```mach
-pub fun decorators_clear(c: *ComptimeCtx);
-```
-
-drop every decorator record of the scope's own, before they are recorded again
-
-## fun field_type_of_binding
-
-```mach
-pub fun field_type_of_binding[T](c: *ComptimeCtx, cap_ctx: *T, caps: PhaseCapabilities[T], name: intern.StrId) res[opt[u32], EvalFail];
-```
-
 ## fun evaluate
 
 ```mach
 pub fun evaluate[T](
-c: *ComptimeCtx,
+c: *comptime_scope.ComptimeCtx,
 cap_ctx: *T,
-caps: PhaseCapabilities[T],
+caps: comptime_capability.PhaseCapabilities[T],
 a: *ast.Ast,
 source: str,
 e: ast_id.ExprId,
-interner: *intern.Interner) res[CTValue, EvalFail];
+interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail];
 ```
 
 ## fun evaluate_at_float_width
 
 ```mach
 pub fun evaluate_at_float_width[T](
-c: *ComptimeCtx,
+c: *comptime_scope.ComptimeCtx,
 cap_ctx: *T,
-caps: PhaseCapabilities[T],
+caps: comptime_capability.PhaseCapabilities[T],
 a: *ast.Ast,
 source: str,
 e: ast_id.ExprId,
 interner: *intern.Interner,
-fw: float.FloatWidth) res[CTValue, EvalFail];
-```
-
-## rec LitInt
-
-```mach
-pub rec LitInt;
-```
-
-## rec LitFloat
-
-```mach
-pub rec LitFloat;
-```
-
-## fun scan_lit_int
-
-```mach
-pub fun scan_lit_int(source: str, span: lang_source.Span) res[LitInt, EvalFail];
-```
-
-## fun scan_lit_float
-
-```mach
-pub fun scan_lit_float(source: str, span: lang_source.Span) res[LitFloat, EvalFail];
-```
-
-a literal's value at the width its suffix names, binary64 when it has none
-
-## fun lit_float_at
-
-```mach
-pub fun lit_float_at(source: str, span: lang_source.Span, w: float.FloatWidth) res[float.Rounded, fail.Fail];
-```
-
-a literal rounded once its type is known: at its suffix's width when it has one, else at
-`w`, the width its context gives it. every consumer of a literal's value, the parser, the
-comptime evaluator, lowering, and the rule sema applies, reads it from here
-
-source: the text the span indexes
-span: the literal's token
-w: the width of the literal's type
-ret: the rounded value and how it fit, or the scan's refusal
-
-## fun lit_float_spells
-
-```mach
-pub fun lit_float_spells(source: str, span: lang_source.Span, s: *float.Shortest) bool;
-```
-
-true when the literal's significant digits, leading and trailing zeros and exponent
-spelling aside, are exactly the shortest decimal that rounds back to `s`
-
-## fun eval_lit_char
-
-```mach
-pub fun eval_lit_char(source: str, span: lang_source.Span) res[CTValue, EvalFail];
-```
-
-## fun cast_scalar
-
-```mach
-pub fun cast_scalar(types: *type.TypeInterner, pointer_width: u32, nan_rule: float.NanRule, value: CTValue,
-from_ty: type.TypeId, to_ty: type.TypeId, reinterpret: bool) res[CTValue, EvalFail];
-```
-
-a float converted to another float width folds by `nan_rule`, the target's, so the
-folded conversion is the one the target makes at run time
-
-## fun call_intrinsic
-
-```mach
-pub fun call_intrinsic(a: *ast.Ast, source: str, eid: ast_id.ExprId) intrinsic.Id;
-```
-
-the intrinsic a comptime call `$name(...)` names; NONE for any other expression
-
-## fun ident_intrinsic
-
-```mach
-pub fun ident_intrinsic(source: str, full: lang_source.Span) intrinsic.Id;
-```
-
-the intrinsic a `$name` token spells
-
-## fun intrinsic_takes_type_operand
-
-```mach
-pub fun intrinsic_takes_type_operand(source: str, full: lang_source.Span) bool;
-```
-
-## fun is_type_of_call
-
-```mach
-pub fun is_type_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
-## fun type_of_arg
-
-```mach
-pub fun type_of_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId;
-```
-
-## fun is_fields_call
-
-```mach
-pub fun is_fields_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
-## fun is_cases_call
-
-```mach
-pub fun is_cases_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
-## fun is_descriptor
-
-```mach
-pub fun is_descriptor(v: CTValue) bool;
-```
-
-## fun comptime_if_declares_nothing
-
-```mach
-pub fun comptime_if_declares_nothing(a: *ast.Ast, branches_start: u32, branches_len: u32) bool;
-```
-
-## def GateProbe
-
-```mach
-pub def GateProbe: u8
-```
-
-## val GATE_PROBE_COMPTIME_PARAM
-
-```mach
-pub val GATE_PROBE_COMPTIME_PARAM:   GateProbe = 0
-```
-
-## val GATE_PROBE_TYPE_COMPARISON
-
-```mach
-pub val GATE_PROBE_TYPE_COMPARISON:  GateProbe = 2
-```
-
-## def GateNodeVerdict
-
-```mach
-pub def GateNodeVerdict: u8
-```
-
-## val GATE_NODE_NO
-
-```mach
-pub val GATE_NODE_NO:    GateNodeVerdict = 0
-```
-
-## val GATE_NODE_PRUNE
-
-```mach
-pub val GATE_NODE_PRUNE: GateNodeVerdict = 2
-```
-
-## rec GateProbes
-
-```mach
-pub rec GateProbes[T];
-```
-
-## fun gate_probes
-
-```mach
-pub fun gate_probes[T](
-comptime_param: fun(*T, ast_id.ExprId) bool,
-each_loopvar: fun(*T, ast_id.ExprId) bool,
-field_loopvar: fun(*T, ast_id.ExprId) bool,
-field_type_operand: fun(*T, ast_id.ExprId) bool,
-expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) GateProbes[T];
-```
-
-## fun gate_walk
-
-```mach
-pub fun gate_walk[T](a: *ast.Ast, source: str, obs: *T,
-action: fun(*T, ast_id.ExprId, *ast_expr.Expr) GateNodeVerdict,
-expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail],
-eid: ast_id.ExprId) res[bool, fail.Fail];
-```
-
-## fun gate_chain_depends_on
-
-```mach
-pub fun gate_chain_depends_on[T](
-a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe,
-branches_start: u32, branches_len: u32) res[bool, fail.Fail];
-```
-
-## def GateScope
-
-```mach
-pub def GateScope: u8
-```
-
-## val GATE_SCOPE_DECL
-
-```mach
-pub val GATE_SCOPE_DECL:     GateScope = 0
-```
-
-## val GATE_SCOPE_INSTANCE
-
-```mach
-pub val GATE_SCOPE_INSTANCE: GateScope = 1
-```
-
-## rec GateVerdict
-
-```mach
-pub rec GateVerdict;
-```
-
-## fun never_decided_message
-
-```mach
-pub fun never_decided_message(a: *A.Allocator, itn: *intern.Interner, depends: intern.StrId) opt[str];
-```
-
-what a failed gate says when the name it waits on is a constant nowhere the
-module can see: the name's own message, which the caller frees, or none when
-the name cannot be read, where the verdict's message stands
-
-## fun evaluate_gate
-
-```mach
-pub fun evaluate_gate[T](
-c: *ComptimeCtx,
-cap_ctx: *T,
-caps: PhaseCapabilities[T],
-a: *ast.Ast,
-source: str,
-cond: ast_id.ExprId,
-interner: *intern.Interner,
-scope: GateScope,
-cache: bool) res[GateVerdict, fail.Fail];
-```
-
-## fun gate_chain_defers
-
-```mach
-pub fun gate_chain_defers[T](
-a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T],
-branches_start: u32, branches_len: u32) res[bool, fail.Fail];
-```
-
-## fun gate_depends_on
-
-```mach
-pub fun gate_depends_on[T](
-a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe, eid: ast_id.ExprId) res[bool, fail.Fail];
-```
-
-## fun is_layout_intrinsic_call
-
-```mach
-pub fun is_layout_intrinsic_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
-## fun is_type_id_call
-
-```mach
-pub fun is_type_id_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
-## fun is_length_of_call
-
-```mach
-pub fun is_length_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
-## fun is_offset_of_call
-
-```mach
-pub fun is_offset_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
-## fun is_size_of_call
-
-```mach
-pub fun is_size_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
-## fun is_align_of_call
-
-```mach
-pub fun is_align_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
-## fun layout_intrinsic_type_arg
-
-```mach
-pub fun layout_intrinsic_type_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId;
-```
-
-## fun fields_type_arg
-
-```mach
-pub fun fields_type_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId;
+fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail];
 ```
 
 ## rec ArrayLitInfo
@@ -1165,120 +1045,23 @@ pub rec ArrayLitInfo;
 pub fun declared_float_width(a: *ast.Ast, source: str, t: ast_id.TypeId) float.FloatWidth;
 ```
 
-## fun apply_declared_int_type
-
-```mach
-pub fun apply_declared_int_type(a: *ast.Ast, source: str, t: ast_id.TypeId, value: CTValue) CTValue;
-```
-
-## fun cast_to_int
-
-```mach
-pub fun cast_to_int(value: CTValue, width: u32, signed: bool) res[CTValue, EvalFail];
-```
-
-an integer cast as a scalar cast computes it: a typed operand is read at its own width and sign,
-an untyped one as it stands, then the result is cut or extended to the destination
-
-## fun typed_int
-
-```mach
-pub fun typed_int(value: CTValue, unsigned: bool, width: u8) CTValue;
-```
-
-## fun float_width_unread
-
-```mach
-pub fun float_width_unread(v: CTValue) bool;
-```
-
 ## fun decl_array_lit
 
 ```mach
 pub fun decl_array_lit(a: *ast.Ast, decl_id: ast_id.DeclId) opt[ArrayLitInfo];
 ```
 
-## fun is_error_call
-
-```mach
-pub fun is_error_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
 ## fun error_message
 
 ```mach
 pub fun error_message[T](
-c: *ComptimeCtx,
+c: *comptime_scope.ComptimeCtx,
 cap_ctx: *T,
-caps: PhaseCapabilities[T],
+caps: comptime_capability.PhaseCapabilities[T],
 a: *ast.Ast,
 source: str,
 eid: ast_id.ExprId,
-interner: *intern.Interner) res[str, EvalFail];
-```
-
-## fun is_type_comparison_binary
-
-```mach
-pub fun is_type_comparison_binary(a: *ast.Ast, source: str, bin: *ast_expr.ExprBinary,
-lhs_is_field_type: bool, rhs_is_field_type: bool) bool;
-```
-
-## fun is_field_type_member
-
-```mach
-pub fun is_field_type_member(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
-## fun is_type_query_call
-
-```mach
-pub fun is_type_query_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
-## fun type_question
-
-```mach
-pub fun type_question(a: *ast.Ast, source: str, eid: ast_id.ExprId) res[ast_id.ExprId, fail.Fail];
-```
-
-the first call in an expression that asks a type question, EXPR_NIL when none does
-
-## fun type_question_message
-
-```mach
-pub fun type_question_message(interner: *intern.Interner, a: *ast.Ast, source: str, call: ast_id.ExprId, through: str) res[intern.StrId, fail.Fail];
-```
-
-a declaring gate may not ask a type question; `through` names the constants it asks it through,
-as ` through `T` -> `S``, or is empty when the gate asks it itself
-
-## fun ct_is_negative
-
-```mach
-pub fun ct_is_negative(v: CTValue) bool;
-```
-
-## fun ct_int_u64
-
-```mach
-pub fun ct_int_u64(v: CTValue) opt[u64];
-```
-
-an integer value that is neither negative nor above u64, read as a u64
-
-## fun ct_int_text
-
-```mach
-pub fun ct_int_text(v: CTValue, buf: *u8) str;
-```
-
-the decimal text of an integer value in a wide.FORMAT_CAP buffer
-
-## fun non_integer
-
-```mach
-pub fun non_integer(message: intern.StrId) CTValue;
+interner: *intern.Interner) res[str, comptime_failure.EvalFail];
 ```
 
 ## fun is_case_literal
@@ -1290,119 +1073,4 @@ pub fun is_case_literal(a: *ast.Ast, eid: ast_id.ExprId) bool;
 a literal is a case literal when its head names a tag case, `T.c{...}` or `T.[c]{...}`; the
 parser records the case only for a head with generic arguments, name resolution splits the
 others, so the answer is complete once the literal's head has been bound
-
-## fun is_path_call
-
-```mach
-pub fun is_path_call(a: *ast.Ast, e: ast_id.ExprId) bool;
-```
-
-a call whose callee is a rooted comptime path: `$mach.build.ct_mul(low, 64)`
-
-## fun is_comptime_value
-
-```mach
-pub fun is_comptime_value(a: *ast.Ast, e: ast_id.ExprId) bool;
-```
-
-a rooted comptime path, or a call on one: both fold to a constant
-
-## fun is_comptime_path
-
-```mach
-pub fun is_comptime_path(a: *ast.Ast, e: ast_id.ExprId) bool;
-```
-
-## fun comptime_ident_name
-
-```mach
-pub fun comptime_ident_name(full: lang_source.Span) lang_source.Span;
-```
-
-## val MODE_DEBUG
-
-```mach
-pub val MODE_DEBUG:   u32 = 0
-```
-
-## val MODE_RELEASE
-
-```mach
-pub val MODE_RELEASE: u32 = 1
-```
-
-## fun ct_float
-
-```mach
-pub fun ct_float(f: f64, w: float.FloatWidth) CTValue;
-```
-
-## fun field_value
-
-```mach
-pub fun field_value(owner: u32, index: u32) CTValue;
-```
-
-## fun case_value
-
-```mach
-pub fun case_value(owner: u32, index: u32) CTValue;
-```
-
-## fun pack_elem_value
-
-```mach
-pub fun pack_elem_value(index: u32, ty: u32) CTValue;
-```
-
-## fun const_elem_untyped
-
-```mach
-pub fun const_elem_untyped(elem: u32) CTValue;
-```
-
-a constant element whose checked type is not yet known: name resolution and loading bind case
-literals this way, and type checking rebinds them with the declared type
-
-## fun const_elem_value
-
-```mach
-pub fun const_elem_value(elem: u32, ty: u32) CTValue;
-```
-
-## fun ct_str
-
-```mach
-pub fun ct_str(s: intern.StrId) CTValue;
-```
-
-## fun ct_u8
-
-```mach
-pub fun ct_u8(n: u8) CTValue;
-```
-
-## fun is_u8
-
-```mach
-pub fun is_u8(v: CTValue) bool;
-```
-
-## fun ct_type
-
-```mach
-pub fun ct_type(t: u32) CTValue;
-```
-
-## fun ct_uint
-
-```mach
-pub fun ct_uint(n: u64) CTValue;
-```
-
-## fun ct_zero_int
-
-```mach
-pub fun ct_zero_int(unsigned: bool, width: u8) CTValue;
-```
 
