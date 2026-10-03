@@ -734,8 +734,19 @@ pub val FRAME_STEP_LAST: u8 = FRAME_STEP_REALIGN
 pub val FRAME_STEP_CAP: u32 = 32
 ```
 
-the most steps a frame record holds: enough for every callee-saved register
-a riscv prologue stores one at a time, the longest prologue any isa has
+the most steps a frame record holds. a prologue records one step per
+callee-saved register it saves and at most FRAME_FIXED_STEPS more (the two
+allocations around a realignment, the frame pointer and return address
+saves, setting the frame pointer and the realignment itself), so the cap
+holds every convention whose callee-saved file fits beside them, which
+registration checks. the record stays fixed-size because the linker and
+every object writer copy frame records by value
+
+## val FRAME_FIXED_STEPS
+
+```mach
+pub val FRAME_FIXED_STEPS: u32 = 6
+```
 
 ## rec FrameStep
 
@@ -1538,5 +1549,52 @@ import's call stub, as a call does
 
 ```mach
 pub fun reloc_symbol_name(img: *ObjectImage, r: *Relocation) intern.StrId;
+```
+
+## rec DeferredReloc
+
+```mach
+pub rec DeferredReloc;
+```
+
+## rec DeferredRelocs
+
+```mach
+pub rec DeferredRelocs;
+```
+
+## fun deferred_init
+
+```mach
+pub fun deferred_init(a: *A.Allocator) DeferredRelocs;
+```
+
+## fun deferred_dnit
+
+```mach
+pub fun deferred_dnit(d: *DeferredRelocs);
+```
+
+## fun defer_relocation
+
+```mach
+pub fun defer_relocation(d: *DeferredRelocs, rec: DeferredReloc, caps: *RelocationCapabilities,
+section_kind: SectionKind, codegen_image: bool) err[fail.Fail];
+```
+
+queues a relocation the target's seam can encode in a section of
+`section_kind`, to bind once the image's symbols are known
+
+## fun flush_deferred
+
+```mach
+pub fun flush_deferred(o: *ObjectImage, d: *DeferredRelocs) err[fail.Fail];
+```
+
+## fun rehome
+
+```mach
+pub fun rehome(dst_alloc: *A.Allocator, dst_interner: *intern.Interner,
+src: *ObjectImage, remap: intern.Remap) res[ObjectImage, fail.Fail];
 ```
 
