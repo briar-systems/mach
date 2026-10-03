@@ -258,6 +258,8 @@ pub rec Grammar;
 pub fun op_none() Operand;
 ```
 
+an operand naming nothing, the zero value
+
 ## fun op_reg
 
 ```mach

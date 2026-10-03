@@ -1409,11 +1409,7 @@ a block named `id` holding nothing
 pub rec MirVReg;
 ```
 
-## val VREG_TY_NIL
-
-```mach
-pub val VREG_TY_NIL: u32 = 0xFFFFFFFF
-```
+a zeroed vreg is blank: no spill slot, no register, no type and no home
 
 ## fun vreg
 
