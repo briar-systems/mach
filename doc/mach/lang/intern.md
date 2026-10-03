@@ -48,17 +48,19 @@ pub fun lookup(itn: *Interner, id: StrId) opt[str];
 pub fun intern(itn: *Interner, text: str) res[StrId, A.Error];
 ```
 
-## fun intern_span
-
-```mach
-pub fun intern_span(itn: *Interner, source: str, span: token.Span) res[StrId, A.Error];
-```
-
 ## fun intern_bytes
 
 ```mach
 pub fun intern_bytes(itn: *Interner, data: str, len: usize) res[StrId, A.Error];
 ```
+
+## fun intern_range
+
+```mach
+pub fun intern_range(itn: *Interner, source: str, offset: usize, len: usize) res[StrId, A.Error];
+```
+
+the `len` bytes of `source` from `offset`, interned
 
 ## rec ReinternMap
 

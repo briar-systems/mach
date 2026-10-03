@@ -189,13 +189,13 @@ pub fun error_recover_advance(p: *Parser, k: diagnostic_kind.Kind, message: str)
 ## fun error_at
 
 ```mach
-pub fun error_at(p: *Parser, k: diagnostic_kind.Kind, span: token.Span, message: str);
+pub fun error_at(p: *Parser, k: diagnostic_kind.Kind, span: lang_source.Span, message: str);
 ```
 
 ## fun error_naming
 
 ```mach
-pub fun error_naming(p: *Parser, k: diagnostic_kind.Kind, span: token.Span, fmt: str, name: token.Span);
+pub fun error_naming(p: *Parser, k: diagnostic_kind.Kind, span: lang_source.Span, fmt: str, name: lang_source.Span);
 ```
 
 an error at `span` whose text fills the one `{}` of `fmt` with the source
@@ -206,13 +206,13 @@ never buffered: a caller reads outside every deciding walk
 ## fun fatal_oom_at
 
 ```mach
-pub fun fatal_oom_at(p: *Parser, span: token.Span);
+pub fun fatal_oom_at(p: *Parser, span: lang_source.Span);
 ```
 
 ## fun fatal_ice_at
 
 ```mach
-pub fun fatal_ice_at(p: *Parser, span: token.Span, message: str);
+pub fun fatal_ice_at(p: *Parser, span: lang_source.Span, message: str);
 ```
 
 ## fun probed_init
@@ -289,7 +289,7 @@ pub fun sync_to_decl(p: *Parser);
 ## fun span_of
 
 ```mach
-pub fun span_of(start: token.Span, end: token.Span) token.Span;
+pub fun span_of(start: lang_source.Span, end: lang_source.Span) lang_source.Span;
 ```
 
 ## fun push_expr

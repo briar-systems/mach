@@ -539,7 +539,7 @@ not jumps to the else arm on the inverse condition and falls into the then arm
 ## fun push_row
 
 ```mach
-pub fun push_row(st: *EncodeState, text_offset: u32, loc: lang_source.SrcLoc) err[fail.Fail];
+pub fun push_row(st: *EncodeState, text_offset: u32, loc: lang_source.Location) err[fail.Fail];
 ```
 
 ## fun close_cmp_varlocs
@@ -600,6 +600,6 @@ native catalog: internal, named with the function it was found in
 ## fun asm_located_message
 
 ```mach
-pub fun asm_located_message(st: *EncodeState, loc: lang_source.SrcLoc, msg: str) str;
+pub fun asm_located_message(st: *EncodeState, loc: lang_source.Location, msg: str) str;
 ```
 
