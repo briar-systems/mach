@@ -1,10 +1,10 @@
 # mach.lang.be.codegen.regalloc
 
-## val REG_CLASS_GP
-
-```mach
-pub val REG_CLASS_GP: u32 = 0
-```
+register allocation for a MIR module: every function is coalesced, put in
+scan order, scanned in rounds until no spilled value earns a piece or a
+rematerialization, then rewritten onto physical registers and verified.
+each phase is a module of its own beside this one, and they share one
+regalloc.context.Context per function
 
 ## fun run
 
