@@ -1,0 +1,313 @@
+# the lints over a typed module: uses of deprecated declarations, and testing
+# declarations reached from code outside a test
+use std.collections.map;
+use mach.lang.deprecation;
+use mach.lang.diagnostic;
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.fail;
+use mach.lang.fe.ast;
+use ast_decl:   mach.lang.fe.ast.decl;
+use ast_expr:   mach.lang.fe.ast.expr;
+use ast_id:     mach.lang.fe.ast.id;
+use ast_module: mach.lang.fe.ast.module;
+use ast_type:   mach.lang.fe.ast.type;
+use fe_path:    mach.lang.fe.path;
+use mach.lang.fe.resolve;
+use sema_context: mach.lang.fe.sema.context;
+use mach.lang.intern;
+use lang_source: mach.lang.source;
+use mach.lang.type;
+use A: std.allocator;
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std_format:         std.format;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_len;
+
+fun warn_deprecated_at(sc: *sema_context.SemaContext, notice: deprecation.Deprecation, span: lang_source.Span, what: str,
+    seen: *map.Map[u64, u8]) err[fail.Fail] {
+    if (!notice.present || lang_source.file_same(notice.owner, sc.view.a.file_id) || span.len == 0) { ret err[fail.Fail].ok{}; }
+    val key:        u64      = span.offset::u64;
+    val seen_entry: opt[*u8] = map.get[u64, u8](seen, ?key);
+    if (sel seen_entry.some) { ret err[fail.Fail].ok{}; }
+    val name_r: res[str, StrError] = str_copy_slice(sc.s.alloc, sc.view.source, span.offset, span.len);
+    if (sel name_r.err) {
+        if (sel name_r.err.alloc) { ret err[fail.Fail].err{fail.refused(name_r.err.alloc)}; }
+        ret err[fail.Fail].err{fail.message("deprecated declaration name lies outside its source")};
+    }
+    val name: str = name_r.ok;
+    fin { str_free(sc.s.alloc, name); }
+    var text: str = "";
+    if (!intern.str_is_nil(notice.message)) {
+        val found: opt[str] = intern.get(?sc.s.interner, notice.message);
+        if (!sel found.some) { ret err[fail.Fail].err{fail.message("deprecation message is not interned")}; }
+        text = found.some;
+    }
+    var message: res[str, std_format.FormatError];
+    if (str_len(text) == 0) { message = std_format.sprint(sc.s.alloc, "{}`{}` is deprecated", what, name); }
+    or                      { message = std_format.sprint(sc.s.alloc, "{}`{}` is deprecated: {}", what, name, text); }
+    if (sel message.err)    { ret err[fail.Fail].err{fail.format_refused(message.err)}; }
+    val owned: str = message.ok;
+    fin { str_free(sc.s.alloc, owned); }
+    val emitted: err[fail.Fail] = diagnostic.report(sc.diags, diagnostic_kind.DECL_DEPRECATED, sc.view.a.file_id, span, owned);
+    if (sel emitted.err) { ret emitted; }
+    val remembered: res[bool, A.Error] = map.insert[u64, u8](seen, key, 1);
+    if (sel remembered.err) { ret err[fail.Fail].err{fail.refused(remembered.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun warn_deprecated_symbol(sc: *sema_context.SemaContext, sid: resolve.SymbolId, span: lang_source.Span,
+    seen: *map.Map[u64, u8]) err[fail.Fail] {
+    if (resolve.symbol_index(sid) >= sc.view.rr.symbol_count) { ret err[fail.Fail].ok{}; }
+    ret warn_deprecated_at(sc, sc.view.rr.symbols[resolve.symbol_index(sid)].deprecation, span, "", seen);
+}
+
+# the tag nominal a place of this type selects a case of: through outer secrecy and one
+# pointer level, as `sel` and a payload place read it
+fun deprecation_tag_of_place(sc: *sema_context.SemaContext, ty: type.TypeId) type.TypeId {
+    if (type.is_nil(ty) || type.is_error(ty)) { ret type.TYPE_NIL; }
+    var base: type.TypeId = type.strip_secret(?sc.s.types, ty);
+    if (type.is_pointer(?sc.s.types, base)) { base = type.strip_secret(?sc.s.types, type.deref_one(?sc.s.types, base)); }
+    val nominal: type.TypeId = type.aggregate_nominal(?sc.s.types, base);
+    if (!type.is_tag(?sc.s.types, nominal)) { ret type.TYPE_NIL; }
+    ret nominal;
+}
+
+fun warn_deprecated_case(sc: *sema_context.SemaContext, tag: type.TypeId, case_span: lang_source.Span,
+    seen: *map.Map[u64, u8]) err[fail.Fail] {
+    if (type.is_nil(tag) || case_span.len == 0) { ret err[fail.Fail].ok{}; }
+    val name: res[intern.StrId, A.Error] = intern.range_add(?sc.s.interner, sc.view.source, case_span.offset, case_span.len);
+    if (sel name.err) { ret err[fail.Fail].err{fail.refused(name.err)}; }
+    val table: opt[*type.FieldTable] = type.field_table_for(?sc.s.types, tag);
+    if (!sel table.some) { ret err[fail.Fail].ok{}; }
+    val ft: *type.FieldTable = table.some;
+    var i:  u32              = 0;
+    for (i < ft.fields_len) {
+        val entry: *type.FieldEntry = type.field_entry_at(?sc.s.types, ft, i);
+        if (entry != nil && intern.str_same(entry.name, name.ok)) {
+            ret warn_deprecated_at(sc, entry.deprecation, case_span, "tag case ", seen);
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# one warning per source site after every body and instantiation has been inferred: named
+# declaration uses through their resolved symbol, and tag case uses (construction, `sel`,
+# payload place) through the case table of the place's tag
+pub fun warn_deprecated_uses(sc: *sema_context.SemaContext) err[fail.Fail] {
+    if (sc.walk.silent || sc.walk.in_comptime_gate || sc.view.rr == nil || sc.view.expr_type == nil) { ret err[fail.Fail].ok{}; }
+    var seen: map.Map[u64, u8] = map.init[u64, u8](sc.s.alloc);
+    fin { map.dnit[u64, u8](?seen); }
+    var i: u32 = 0;
+    for (i < sc.view.rr.expr_count && i::usize < sc.view.a.expr_len) {
+        val e:    *ast_expr.Expr   = ?sc.view.a.exprs[i];
+        var span: lang_source.Span = e.span;
+        if (e.kind == ast_expr.EXPR_KIND_MEMBER) { span = e.data.member.name; }
+        if (e.kind == ast_expr.EXPR_KIND_IDENT)  { span = e.data.ident.tok; }
+        val warned: err[fail.Fail] = warn_deprecated_symbol(sc, sc.view.rr.expr_resolved[i], span, ?seen);
+        if (sel warned.err) { ret warned; }
+        var tag:       type.TypeId      = type.TYPE_NIL;
+        var case_span: lang_source.Span = lang_source.Span{offset: 0, len: 0};
+        if (e.kind == ast_expr.EXPR_KIND_SEL && ast_id.expr_is_nil(e.data.sel.case_desc) && ast_id.expr_index(e.data.sel.place) < sc.view.rr.expr_count) {
+            tag       = deprecation_tag_of_place(sc, sc.view.expr_type[ast_id.expr_index(e.data.sel.place)]);
+            case_span = e.data.sel.case_name;
+        }
+        or (e.kind == ast_expr.EXPR_KIND_MEMBER && !type.is_nil(sc.view.expr_type[i])) {
+            val self_ty: type.TypeId = sc.view.expr_type[i];
+            if (type.is_case_selector(?sc.s.types, self_ty))                     { tag = type.aggregate_nominal(?sc.s.types, type.case_selector_tag_type(?sc.s.types, self_ty)); }
+            or (ast_id.expr_index(e.data.member.object) < sc.view.rr.expr_count) { tag = deprecation_tag_of_place(sc, sc.view.expr_type[ast_id.expr_index(e.data.member.object)]); }
+            case_span = e.data.member.name;
+        }
+        or (e.kind == ast_expr.EXPR_KIND_STRUCT_LIT) {
+            val head: opt[*ast_type.Type] = ast.get_type(sc.view.a, e.data.struct_lit.ty);
+            if (sel head.some) {
+                if (head.some.kind == ast_type.TYPE_KIND_NAMED && ast_id.expr_is_nil(head.some.data.named.case_desc)) {
+                    tag       = deprecation_tag_of_place(sc, sc.view.expr_type[i]);
+                    case_span = head.some.data.named.case_name;
+                }
+            }
+        }
+        val case_warned: err[fail.Fail] = warn_deprecated_case(sc, tag, case_span, ?seen);
+        if (sel case_warned.err) { ret case_warned; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < sc.view.rr.type_count && i::usize < sc.view.a.type_len) {
+        val t: *ast_type.Type = ?sc.view.a.types[i];
+        if (t.kind == ast_type.TYPE_KIND_NAMED) {
+            val warned: err[fail.Fail] = warn_deprecated_symbol(sc, sc.view.rr.type_resolved[i], fe_path.leaf(sc.view.source, t.data.named.name), ?seen);
+            if (sel warned.err) { ret warned; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the source ranges of test bodies and `#[testing]` declarations in one declaration list, in
+# source order, descending into comptime branches
+fun collect_testing_regions(sc: *sema_context.SemaContext, start: u32, len: u32, regions: *collections_vector.Vector[lang_source.Span]) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < len) {
+        val pool_ix: u32 = start + i;
+        i = i + 1;
+        if (pool_ix::usize >= sc.view.a.decl_id_len) { ret err[fail.Fail].err{fail.message("testing regions: declaration index out of range")}; }
+        val did:     ast_id.DeclId       = sc.view.a.decl_ids[pool_ix];
+        val defined: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, did);
+        if (!sel defined.some) { cnt; }
+        val d: *ast_decl.Decl = defined.some;
+        if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+            var b: u32 = 0;
+            for (b < d.data.comptime_if.branches_len) {
+                val branch:    *ast_decl.ComptimeBranch = ?sc.view.a.comptime_branches[d.data.comptime_if.branches_start + b];
+                val collected: err[fail.Fail]           = collect_testing_regions(sc, branch.body_start, branch.body_len, regions);
+                if (sel collected.err) { ret collected; }
+                b = b + 1;
+            }
+            cnt;
+        }
+        if (d.kind != ast_decl.DECL_KIND_TEST && !resolve.declaration_testing(sc.view.a, did)) { cnt; }
+        val pushed: res[usize, A.Error] = collections_vector.push[lang_source.Span](regions, d.span);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# whether a source offset lies inside one of the sorted, disjoint regions
+fun in_testing_region(regions: *collections_vector.Vector[lang_source.Span], offset: usize) bool {
+    var lo: usize = 0;
+    var hi: usize = regions.len;
+    for (lo < hi) {
+        val mid:    usize            = lo + (hi - lo) / 2;
+        val region: lang_source.Span = regions.data[mid];
+        if (offset < region.offset)               { hi = mid; }
+        or (offset >= region.offset + region.len) { lo = mid + 1; }
+        or                                        { ret true; }
+    }
+    ret false;
+}
+
+fun report_testing_use(sc: *sema_context.SemaContext, span: lang_source.Span, what: str, why: str) err[fail.Fail] {
+    val name_r: res[str, StrError] = str_copy_slice(sc.s.alloc, sc.view.source, span.offset, span.len);
+    if (sel name_r.err) {
+        if (sel name_r.err.alloc) { ret err[fail.Fail].err{fail.refused(name_r.err.alloc)}; }
+        ret err[fail.Fail].err{fail.message("testing reference lies outside its source")};
+    }
+    val name: str = name_r.ok;
+    fin { str_free(sc.s.alloc, name); }
+    val message: res[str, std_format.FormatError] = std_format.sprint(sc.s.alloc, "{}`{}` is a `#[testing]` declaration: {}", what, name, why);
+    if (sel message.err) { ret err[fail.Fail].err{fail.format_refused(message.err)}; }
+    val owned: str = message.ok;
+    fin { str_free(sc.s.alloc, owned); }
+    sema_context.report(sc, diagnostic_kind.TESTING_USE, span, owned);
+    ret err[fail.Fail].ok{};
+}
+
+fun check_testing_symbol(sc: *sema_context.SemaContext, sid: resolve.SymbolId, span: lang_source.Span,
+    regions: *collections_vector.Vector[lang_source.Span], seen: *map.Map[u64, u8]) err[fail.Fail] {
+    if (resolve.symbol_index(sid) >= sc.view.rr.symbol_count || span.len == 0) { ret err[fail.Fail].ok{}; }
+    if (!sc.view.rr.symbols[resolve.symbol_index(sid)].testing)                { ret err[fail.Fail].ok{}; }
+    if (in_testing_region(regions, span.offset))                               { ret err[fail.Fail].ok{}; }
+    val key:        u64      = span.offset::u64;
+    val seen_entry: opt[*u8] = map.get[u64, u8](seen, ?key);
+    if (sel seen_entry.some) { ret err[fail.Fail].ok{}; }
+    val remembered: res[bool, A.Error] = map.insert[u64, u8](seen, key, 1);
+    if (sel remembered.err) { ret err[fail.Fail].err{fail.refused(remembered.err)}; }
+    ret report_testing_use(sc, span, "", "only a test body or another `#[testing]` declaration may reference it");
+}
+
+fun check_testing_fwds(sc: *sema_context.SemaContext, start: u32, len: u32) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < len) {
+        val pool_ix: u32 = start + i;
+        i = i + 1;
+        if (pool_ix::usize >= sc.view.a.decl_id_len) { ret err[fail.Fail].err{fail.message("testing re-exports: declaration index out of range")}; }
+        val did:     ast_id.DeclId       = sc.view.a.decl_ids[pool_ix];
+        val defined: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, did);
+        if (!sel defined.some) { cnt; }
+        val d: *ast_decl.Decl = defined.some;
+        if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+            var b: u32 = 0;
+            for (b < d.data.comptime_if.branches_len) {
+                val branch:  *ast_decl.ComptimeBranch = ?sc.view.a.comptime_branches[d.data.comptime_if.branches_start + b];
+                val checked: err[fail.Fail]           = check_testing_fwds(sc, branch.body_start, branch.body_len);
+                if (sel checked.err) { ret checked; }
+                b = b + 1;
+            }
+            cnt;
+        }
+        if (d.kind != ast_decl.DECL_KIND_FWD || sc.view.rr.decl_symbol == nil || ast_id.decl_index(did) >= sc.view.rr.decl_count) { cnt; }
+        val sid: resolve.SymbolId = sc.view.rr.decl_symbol[ast_id.decl_index(did)];
+        if (resolve.symbol_index(sid) >= sc.view.rr.symbol_count || !sc.view.rr.symbols[resolve.symbol_index(sid)].testing) { cnt; }
+        if (resolve.declaration_testing(sc.view.a, did))                                                                    { cnt; }
+        val reported: err[fail.Fail] = report_testing_use(sc, d.data.fwd_.path, "re-exported ",
+            "an unmarked `fwd` puts it on a production surface; mark the `fwd` `#[testing]`");
+        if (sel reported.err) { ret reported; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a reference to a `#[testing]` declaration is legal only inside a test body or another
+# `#[testing]` declaration: every resolved name and type use is checked against the source
+# ranges of those declarations, and an unmarked `fwd` may not re-export one
+pub fun check_testing_uses(sc: *sema_context.SemaContext) err[fail.Fail] {
+    if (sc.walk.silent || sc.walk.in_comptime_gate || sc.view.rr == nil) { ret err[fail.Fail].ok{}; }
+    val root: opt[*ast_module.Module] = ast.get_module(sc.view.a, sc.view.a.root_module);
+    if (!sel root.some) { ret err[fail.Fail].ok{}; }
+    var regions: collections_vector.Vector[lang_source.Span] = collections_vector.init[lang_source.Span](sc.s.alloc);
+    fin { collections_vector.dnit[lang_source.Span](?regions); }
+    val collected: err[fail.Fail] = collect_testing_regions(sc, root.some.decls_start, root.some.decls_len, ?regions);
+    if (sel collected.err) { ret collected; }
+    val fwds: err[fail.Fail] = check_testing_fwds(sc, root.some.decls_start, root.some.decls_len);
+    if (sel fwds.err) { ret fwds; }
+    var seen: map.Map[u64, u8] = map.init[u64, u8](sc.s.alloc);
+    fin { map.dnit[u64, u8](?seen); }
+    var i: u32 = 0;
+    for (i < sc.view.rr.expr_count && i::usize < sc.view.a.expr_len) {
+        val e:    *ast_expr.Expr   = ?sc.view.a.exprs[i];
+        var span: lang_source.Span = e.span;
+        if (e.kind == ast_expr.EXPR_KIND_MEMBER) { span = e.data.member.name; }
+        if (e.kind == ast_expr.EXPR_KIND_IDENT)  { span = e.data.ident.tok; }
+        val checked: err[fail.Fail] = check_testing_symbol(sc, sc.view.rr.expr_resolved[i], span, ?regions, ?seen);
+        if (sel checked.err) { ret checked; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < sc.view.rr.type_count && i::usize < sc.view.a.type_len) {
+        val t: *ast_type.Type = ?sc.view.a.types[i];
+        if (t.kind == ast_type.TYPE_KIND_NAMED) {
+            val checked: err[fail.Fail] = check_testing_symbol(sc, sc.view.rr.type_resolved[i], fe_path.leaf(sc.view.source, t.data.named.name), ?regions, ?seen);
+            if (sel checked.err) { ret checked; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+test in_testing_region__half_open_bounds {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var regions: collections_vector.Vector[lang_source.Span] = collections_vector.init[lang_source.Span](?alloc);
+    fin { collections_vector.dnit[lang_source.Span](?regions); }
+    val first:  res[usize, A.Error] = collections_vector.push[lang_source.Span](?regions, lang_source.Span{offset: 10, len: 5});
+    val second: res[usize, A.Error] = collections_vector.push[lang_source.Span](?regions, lang_source.Span{offset: 15, len: 3});
+    val third:  res[usize, A.Error] = collections_vector.push[lang_source.Span](?regions, lang_source.Span{offset: 30, len: 1});
+    if (sel first.err || sel second.err || sel third.err)                                                        { ret 2; }
+    if (in_testing_region(?regions, 9) || !in_testing_region(?regions, 10) || !in_testing_region(?regions, 14))  { ret 3; }
+    if (!in_testing_region(?regions, 15) || !in_testing_region(?regions, 17) || in_testing_region(?regions, 18)) { ret 4; }
+    if (in_testing_region(?regions, 29) || !in_testing_region(?regions, 30) || in_testing_region(?regions, 31))  { ret 5; }
+    var empty: collections_vector.Vector[lang_source.Span] = collections_vector.init[lang_source.Span](?alloc);
+    if (in_testing_region(?empty, 0)) { ret 6; }
+    ret 0;
+}
