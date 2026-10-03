@@ -1,0 +1,987 @@
+# typing one module: its declarations, bodies and instances, and the result it publishes
+use std_format: std.format;
+use mach.lang.diagnostic;
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.fail;
+use mach.lang.fe.ast;
+use ast_decl: mach.lang.fe.ast.decl;
+use ast_expr: mach.lang.fe.ast.expr;
+use ast_id:   mach.lang.fe.ast.id;
+use mach.lang.fe.ast.interpretation;
+use ast_module: mach.lang.fe.ast.module;
+use ast_stmt:   mach.lang.fe.ast.stmt;
+use ast_type:   mach.lang.fe.ast.type;
+use mach.lang.fe.comptime;
+use comptime_gate: mach.lang.fe.comptime.gate;
+use mach.lang.fe.decorator;
+use mach.lang.fe.resolve;
+use mach.lang.fe.sema.abitype;
+use sema_capability: mach.lang.fe.sema.capability;
+use sema_context:    mach.lang.fe.sema.context;
+use sema_declared:   mach.lang.fe.sema.declared;
+use sema_decorator:  mach.lang.fe.sema.decorator;
+use sema_embed:      mach.lang.fe.sema.embed;
+use mach.lang.fe.sema.fields;
+use mach.lang.fe.sema.generics;
+use sema_growth: mach.lang.fe.sema.growth;
+use sema_handle: mach.lang.fe.sema.handle;
+use mach.lang.fe.sema.infer;
+use sema_instance: mach.lang.fe.sema.instance;
+use sema_lint:     mach.lang.fe.sema.lint;
+use sema_literal:  mach.lang.fe.sema.literal;
+use sema_product:  mach.lang.fe.sema.product;
+use sema_stmt:     mach.lang.fe.sema.stmt;
+use mach.lang.intern;
+use mach.lang.module;
+use mach.lang.session;
+use lang_source: mach.lang.source;
+use mach.lang.type;
+use A: std.allocator;
+use std.allocator.page;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+
+# type a module in a scope over the load's, `load`, and resolve's bindings in `rr`, which sema
+# reads and never writes; what sema binds is its result's
+pub fun sema(
+    s: *session.Session,
+    a: *ast.Ast,
+    rr: *resolve.ResolveResult,
+    deps: *sema_product.SemaDeps,
+    load: *comptime.ComptimeCtx,
+    own_module: session.ModuleId,
+    diags: *diagnostic.DiagnosticStore) res[sema_product.SemaResult, fail.Fail] {
+    var scope: comptime.ComptimeCtx = comptime.stage_init(load, comptime.STAGE_SEMA, s.alloc);
+    fin { comptime.dnit(?scope); }
+    if (rr != nil) { comptime.layer_set(?scope, comptime.STAGE_RESOLVE, ?rr.constants); }
+    val gates: err[fail.Fail] = comptime.prepare_gates(?scope, a.expr_len::u32);
+    if (sel gates.err) { ret res[sema_product.SemaResult, fail.Fail].err{gates.err}; }
+    var sc:          sema_context.SemaContext;
+    var uni_reports: sema_context.UniReports;
+    uni_reports.len = 0;
+    var handle_reports: sema_context.UniReports;
+    handle_reports.len = 0;
+
+    val res_init: err[fail.Fail] = init_context(?sc, s, a, rr, deps, ?scope, own_module, diags);
+    if (sel res_init.err) { ret res[sema_product.SemaResult, fail.Fail].err{res_init.err}; }
+    fin { dnit_context(?sc); }
+    if (refused_module(?sc)) { ret finish_result(?sc, fields.init(s.alloc)); }
+
+    val res_embeds: err[fail.Fail] = resolve_all_embeds(?sc);
+    if (sel res_embeds.err) { ret res[sema_product.SemaResult, fail.Fail].err{res_embeds.err}; }
+
+    val res_types: err[fail.Fail] = resolve_all_types(?sc);
+    if (sel res_types.err) { ret res[sema_product.SemaResult, fail.Fail].err{res_types.err}; }
+
+    val analyzed: res[sema_growth.Analysis, fail.Fail] = sema_growth.analyze(s, a, rr, sc.view.source, own_module, s.alloc);
+    if (sel analyzed.err) { ret res[sema_product.SemaResult, fail.Fail].err{analyzed.err}; }
+    var growth: sema_growth.Analysis = analyzed.ok;
+    fin { sema_growth.dnit(?growth); }
+    sc.typing.growth = ?growth;
+    growth_refusals_report(?sc);
+
+    val res_decls: err[fail.Fail] = infer_all_decls(?sc);
+    if (sel res_decls.err) { ret res[sema_product.SemaResult, fail.Fail].err{res_decls.err}; }
+
+    val res_occurs: err[fail.Fail] = sema_declared.check_occurs_all(?sc);
+    if (sel res_occurs.err) { ret res[sema_product.SemaResult, fail.Fail].err{res_occurs.err}; }
+
+    val res_uni_secrecy: err[fail.Fail] = sema_declared.check_uni_secrecy_all(?sc);
+    if (sel res_uni_secrecy.err) { ret res[sema_product.SemaResult, fail.Fail].err{res_uni_secrecy.err}; }
+
+    sema_handle.check_handle_fields_all(?sc);
+
+    sc.typing.has_secret  = sema_context.recover[bool](?sc, generics.module_reaches_secret(s, sc.view.type_resolved_ty, a.type_len::u32), false);
+    sc.typing.uni_reports = ?uni_reports;
+    check_annotation_uni_secrecy_all(?sc);
+    sc.typing.handle_reports = ?handle_reports;
+    sema_handle.check_annotation_handles_all(?sc);
+
+    val caps_r: res[comptime.PhaseCapabilities[sema_context.SemaContext], fail.Fail] = sema_capability.semantic_type_caps();
+    if (sel caps_r.err) { ret res[sema_product.SemaResult, fail.Fail].err{caps_r.err}; }
+    sc.typing.caps = caps_r.ok;
+    val res_bodies: err[fail.Fail] = infer_all_bodies(?sc);
+    if (sel res_bodies.err) { ret res[sema_product.SemaResult, fail.Fail].err{res_bodies.err}; }
+
+    val res_reval: err[fail.Fail] = drain_instances(?sc, deps);
+    if (sel res_reval.err) { ret res[sema_product.SemaResult, fail.Fail].err{res_reval.err}; }
+    val reached: err[fail.Fail] = sema_instance.reach_settle(?sc.typing.insts.set);
+    if (sel reached.err) { ret res[sema_product.SemaResult, fail.Fail].err{reached.err}; }
+
+    sema_literal.check_float_literals(?sc);
+    sema_literal.check_literal_shifts(?sc);
+
+    val defaults: err[fail.Fail] = sema_literal.check_default_literals(?sc);
+    if (sel defaults.err) { ret res[sema_product.SemaResult, fail.Fail].err{defaults.err}; }
+
+    val notices: err[fail.Fail] = sema_lint.warn_deprecated_uses(?sc);
+    if (sel notices.err) { ret res[sema_product.SemaResult, fail.Fail].err{notices.err}; }
+
+    val confined: err[fail.Fail] = sema_lint.check_testing_uses(?sc);
+    if (sel confined.err) { ret res[sema_product.SemaResult, fail.Fail].err{confined.err}; }
+
+    ret build_result(?sc);
+}
+
+# a growing cycle no comptime gate stops is refused at its growing call, naming the
+# templates on it, before any instance of it is made
+fun growth_refusals_report(sc: *sema_context.SemaContext) {
+    val an: *sema_growth.Analysis = sc.typing.growth;
+    var i:  usize                 = 0;
+    for (i < an.cycles.len) {
+        val c: *sema_growth.Cycle = ?an.cycles.data[i];
+        if (c.refused) {
+            val msg: res[str, std_format.FormatError] = std_format.sprint(sc.s.alloc,
+                "`{}` instantiates `{}` here at an argument that grows, on a cycle of instances no comptime gate can stop ({}), so its instances never end",
+                intern.text(?sc.s.interner, c.caller), intern.text(?sc.s.interner, c.callee), intern.text(?sc.s.interner, c.members));
+            if (sel msg.err) { fail.internal(?sc.status, fail.describe(fail.format_refused(msg.err))); }
+            or (sel msg.ok) {
+                sema_context.report_note(sc, diagnostic_kind.GENERIC_GROWING_CYCLE, c.site, msg.ok,
+                    "an instance on this cycle asks for a new instance at every step; put the growing call under a comptime gate that ends it");
+                str_free(sc.s.alloc, msg.ok);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# resolve refused this module with its own diagnostic and bound nothing else, so there is
+# nothing to type, and the refusal is this pass's answer too
+fun refused_module(sc: *sema_context.SemaContext) bool {
+    if (sc.view.rr == nil || !sc.view.rr.refused) { ret false; }
+    fail.reject(?sc.status);
+    ret true;
+}
+
+fun copy_typeids(dst: *type.TypeId, src: *type.TypeId, n: usize) {
+    var i: u32 = 0;
+    for (i < n::u32) {
+        dst[i] = src[i];
+        i      = i + 1;
+    }
+}
+
+fun free_typeids(alloc: *A.Allocator, arr: *type.TypeId, n: usize) {
+    if (arr != nil && n > 0) { A.deallocate[type.TypeId](alloc, arr, n); }
+}
+
+# types every instance the module's typing asks for, in the order asked; typing one may
+# ask for more
+fun drain_instances(sc: *sema_context.SemaContext, deps: *sema_product.SemaDeps) err[fail.Fail] {
+    val wl: *sema_context.InstWorklist = sc.typing.insts;
+    for (wl.drained < sema_instance.count(?wl.set)) {
+        val r: err[fail.Fail] = instance_type(sc, deps, wl.drained);
+        if (sel r.err) { ret r; }
+        wl.drained = wl.drained + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a module's view of the declaring module of an instance: its own, or a foreign one read
+# through a scope of its own, so the body binds nothing there
+fun origin_view(sc: *sema_context.SemaContext, deps: *sema_product.SemaDeps, origin: session.ModuleId, foreign: *comptime.ComptimeCtx) res[sema_context.ModuleView, fail.Fail] {
+    var v: sema_context.ModuleView = sema_context.ModuleView{};
+    v.own_module = origin;
+    if (module.same(origin, sc.view.own_module)) {
+        v.a                = sc.view.a;
+        v.rr               = sc.view.rr;
+        v.ctx              = sc.view.ctx;
+        v.source           = sc.view.source;
+        v.decl_type        = sc.view.decl_type;
+        v.type_resolved_ty = sc.view.type_resolved_ty;
+        v.expr_type        = sc.view.expr_type;
+        ret res[sema_context.ModuleView, fail.Fail].ok{v};
+    }
+    if (deps == nil) { ret res[sema_context.ModuleView, fail.Fail].err{fail.message("instance typing has no definition acquisition capability")}; }
+    val acquired: res[sema_product.Definition, fail.Fail] = sema_product.acquire_definition(?deps.definitions, origin, sema_product.DEFINITION_TYPED);
+    if (sel acquired.err) {
+        val failure: fail.Fail = acquired.err;
+        if (sel failure.reported) { fail.reject(?sc.status); }
+        or                        { fail.internal(?sc.status, fail.describe(failure)); }
+        ret res[sema_context.ModuleView, fail.Fail].err{failure};
+    }
+    val definition: sema_product.Definition = acquired.ok;
+    @foreign           = comptime.reader_init(definition.ctx);
+    v.a                = definition.parsed.a;
+    v.rr               = definition.rr;
+    v.ctx              = foreign;
+    v.decl_type        = definition.sr.decl_type;
+    v.type_resolved_ty = definition.sr.type_resolved_ty;
+    v.expr_type        = definition.sr.expr_type;
+    if (v.a == nil || v.decl_type == nil) { ret res[sema_context.ModuleView, fail.Fail].err{fail.message("internal: instance typing: origin module decl table unavailable (dependency-ordering invariant violated)")}; }
+    val source_r: res[str, fail.Fail] = sema_context.source_text_of(sc.s, v.a);
+    if (sel source_r.err) { ret res[sema_context.ModuleView, fail.Fail].err{source_r.err}; }
+    v.source = source_r.ok;
+    ret res[sema_context.ModuleView, fail.Fail].ok{v};
+}
+
+# types instance `index` into its frame: a generic under its type arguments, a function with
+# comptime value parameters with them bound, a function with a pack over its element types
+fun instance_type(sc: *sema_context.SemaContext, deps: *sema_product.SemaDeps, index: u32) err[fail.Fail] {
+    val item:    sema_instance.Instance = @sema_instance.at(?sc.typing.insts.set, index);
+    var foreign: comptime.ComptimeCtx   = comptime.reader_init(sc.view.ctx);
+    fin { comptime.dnit(?foreign); }
+    val view_r: res[sema_context.ModuleView, fail.Fail] = origin_view(sc, deps, item.origin, ?foreign);
+    if (sel view_r.err) { ret err[fail.Fail].err{view_r.err}; }
+    val origin: sema_context.ModuleView = view_r.ok;
+    val oa:     *ast.Ast                = origin.a;
+
+    val d_opt: opt[*ast_decl.Decl] = ast.get_decl(oa, item.decl);
+    if (!sel d_opt.some) { ret err[fail.Fail].err{fail.message("internal: instance typing: instance decl id out of range in origin AST (invariant violated)")}; }
+    val d: *ast_decl.Decl = d_opt.some;
+    if (d.kind != ast_decl.DECL_KIND_FUN)     { ret err[fail.Fail].err{fail.message("internal: instance typing: instance decl is not a function (invariant violated)")}; }
+    if (ast_id.stmt_is_nil(d.data.fun_.body)) { ret err[fail.Fail].ok{}; }
+
+    var owner: type.GenericOwner;
+    if (item.arg_len > 0) {
+        val who_r: res[type.GenericOwner, fail.Fail] = sema_context.generic_owner_of_decl(sc.s, oa, item.origin, item.decl);
+        if (sel who_r.err) { ret err[fail.Fail].err{who_r.err}; }
+        owner = who_r.ok;
+    }
+
+    var scratch_expr: *type.TypeId = nil;
+    var scratch_decl: *type.TypeId = nil;
+    fin {
+        free_typeids(sc.s.alloc, scratch_expr, oa.expr_len);
+        free_typeids(sc.s.alloc, scratch_decl, oa.decl_len);
+    }
+    if (oa.expr_len > 0) {
+        val re: res[*type.TypeId, fail.Fail] = typeid_array_alloc(sc.s.alloc, oa.expr_len);
+        if (sel re.err) { ret err[fail.Fail].err{re.err}; }
+        scratch_expr = re.ok;
+        if (origin.expr_type != nil) { copy_typeids(scratch_expr, origin.expr_type, oa.expr_len); }
+    }
+    if (oa.decl_len > 0) {
+        val rd: res[*type.TypeId, fail.Fail] = typeid_array_alloc(sc.s.alloc, oa.decl_len);
+        if (sel rd.err) { ret err[fail.Fail].err{rd.err}; }
+        scratch_decl = rd.ok;
+        copy_typeids(scratch_decl, origin.decl_type, oa.decl_len);
+    }
+
+    val caps_r: res[comptime.PhaseCapabilities[sema_context.SemaContext], fail.Fail] = sema_capability.semantic_type_caps();
+    if (sel caps_r.err) { ret err[fail.Fail].err{caps_r.err}; }
+
+    var view: sema_context.ModuleView = origin;
+    view.expr_type = scratch_expr;
+    view.decl_type = scratch_decl;
+    var typing: sema_context.Typing = sc.typing;
+    typing.deps          = deps;
+    typing.caps          = caps_r.ok;
+    typing.collect_insts = true;
+    var instance: sema_context.Instance = sema_context.Instance{};
+    instance.depth       = item.depth + 1;
+    instance.parent      = index;
+    instance.frame       = item.frame;
+    instance.requester   = index;
+    instance.pack_types  = item.pack;
+    instance.pack_len    = item.pack_len;
+    instance.quiet       = item.kind != sema_instance.KIND_TYPE;
+    instance.site        = item.site;
+    instance.site_file   = item.site_file;
+    instance.site_set    = true;
+    instance.subst       = item.args;
+    instance.subst_len   = item.arg_len;
+    instance.subst_owner = owner;
+    var tsc: sema_context.SemaContext = sema_context.init(sc.s, sc.diags, typing, view, instance);
+    fin { fail.merge(?sc.status, tsc.status); }
+    tsc.walk.silent = instance.quiet;
+
+    var bound: comptime.FrameMark;
+    if (item.value_len > 0) {
+        val mark_r: res[comptime.FrameMark, fail.Fail] = comptime.frame_open(tsc.view.ctx);
+        if (sel mark_r.err) { ret err[fail.Fail].err{mark_r.err}; }
+        bound = mark_r.ok;
+        var vi: u32 = 0;
+        for (vi < item.value_len) {
+            val put: err[fail.Fail] = comptime.bind(tsc.view.ctx, item.names[vi], item.values[vi]);
+            if (sel put.err) {
+                val closed: err[fail.Fail] = comptime.frame_close(tsc.view.ctx, bound);
+                if (sel closed.err) { ret closed; }
+                ret put;
+            }
+            vi = vi + 1;
+        }
+    }
+
+    val ret_ty: type.TypeId = sema_context.resolved_type_of(?tsc, d.data.fun_.return_type);
+    sema_context.check_handle_in_array(?tsc, ret_ty, d.data.fun_.name);
+    var pi: u32 = 0;
+    for (pi < d.data.fun_.params_len) {
+        val ptn: *ast_decl.TypedName = ?oa.typed_names[d.data.fun_.params_start + pi];
+        generics.check_annotation(?tsc, ptn.ty);
+        if (ast_id.type_index(ptn.ty) < oa.type_len::u32) {
+            sema_context.check_handle_in_array(?tsc, sema_context.apply_subst(?tsc, tsc.view.type_resolved_ty[ast_id.type_index(ptn.ty)]), ptn.name);
+        }
+        pi = pi + 1;
+    }
+    val outcome: err[fail.Fail] = sema_stmt.infer_stmt(?tsc, d.data.fun_.body, ret_ty);
+    if (!tsc.instance.quiet) { sema_literal.check_instance_float_literals(?tsc, origin.expr_type); }
+    tsc.instance.site_set = false;
+    tsc.walk.offer        = nil;
+    if (item.value_len > 0) {
+        val closed: err[fail.Fail] = comptime.frame_close(tsc.view.ctx, bound);
+        if (sel closed.err) { ret closed; }
+    }
+    ret outcome;
+}
+
+fun init_context(
+    sc: *sema_context.SemaContext,
+    s: *session.Session,
+    a: *ast.Ast,
+    rr: *resolve.ResolveResult,
+    deps: *sema_product.SemaDeps,
+    ctx: *comptime.ComptimeCtx,
+    own_module: session.ModuleId,
+    diags: *diagnostic.DiagnosticStore) err[fail.Fail] {
+    val caps_r: res[comptime.PhaseCapabilities[sema_context.SemaContext], fail.Fail] = sema_capability.semantic_name_caps();
+    if (sel caps_r.err) { ret err[fail.Fail].err{caps_r.err}; }
+    val source_r: res[str, fail.Fail] = sema_context.source_text_of(s, a);
+    if (sel source_r.err) { ret err[fail.Fail].err{source_r.err}; }
+    var view: sema_context.ModuleView = sema_context.ModuleView{};
+    view.a          = a;
+    view.rr         = rr;
+    view.ctx        = ctx;
+    view.own_module = own_module;
+    view.source     = source_r.ok;
+    var typing: sema_context.Typing = sema_context.Typing{};
+    typing.deps                = deps;
+    typing.caps                = caps_r.ok;
+    typing.collect_insts       = true;
+    typing.subst_fn            = generics.substitute;
+    typing.annotation_check_fn = generics.check_annotation;
+    @sc                        = sema_context.init(s, diags, typing, view, sema_context.instance_none());
+
+    val worklist: res[*sema_context.InstWorklist, fail.Fail] = sema_context.inst_worklist_new(s.alloc);
+    if (sel worklist.err) { ret err[fail.Fail].err{worklist.err}; }
+    sc.typing.insts = worklist.ok;
+
+    if (a.expr_len > 0) {
+        val res_expr: res[*type.TypeId, fail.Fail] = typeid_array_alloc(s.alloc, a.expr_len);
+        if (sel res_expr.err) {
+            dnit_context(sc);
+            ret err[fail.Fail].err{res_expr.err};
+        }
+        sc.view.expr_type = res_expr.ok;
+    }
+    if (a.type_len > 0) {
+        val res_type: res[*type.TypeId, fail.Fail] = typeid_array_alloc(s.alloc, a.type_len);
+        if (sel res_type.err) {
+            dnit_context(sc);
+            ret err[fail.Fail].err{res_type.err};
+        }
+        sc.view.type_resolved_ty = res_type.ok;
+
+        val res_memo: res[*u8, fail.Fail] = memo_array_alloc(s.alloc, a.type_len);
+        if (sel res_memo.err) {
+            dnit_context(sc);
+            ret err[fail.Fail].err{res_memo.err};
+        }
+        sc.view.type_resolved_memo = res_memo.ok;
+
+        val res_emb: res[*u64, fail.Fail] = embed_len_array_alloc(s.alloc, a.type_len);
+        if (sel res_emb.err) {
+            dnit_context(sc);
+            ret err[fail.Fail].err{res_emb.err};
+        }
+        sc.view.embed_len = res_emb.ok;
+    }
+    if (a.decl_len > 0) {
+        val res_decl: res[*type.TypeId, fail.Fail] = typeid_array_alloc(s.alloc, a.decl_len);
+        if (sel res_decl.err) {
+            dnit_context(sc);
+            ret err[fail.Fail].err{res_decl.err};
+        }
+        sc.view.decl_type = res_decl.ok;
+
+        val res_lay: res[*u8, fail.Fail] = layout_state_alloc(s.alloc, a.decl_len);
+        if (sel res_lay.err) {
+            dnit_context(sc);
+            ret err[fail.Fail].err{res_lay.err};
+        }
+        sc.view.layout_state = res_lay.ok;
+    }
+
+    val res_seed: err[fail.Fail] = sema_declared.seed_builtins(sc);
+    if (sel res_seed.err) {
+        dnit_context(sc);
+        ret res_seed;
+    }
+
+    ret err[fail.Fail].ok{};
+}
+
+fun typeid_array_alloc(a: *A.Allocator, len: usize) res[*type.TypeId, fail.Fail] {
+    val res_arr: res[*type.TypeId, A.Error] = A.allocate[type.TypeId](a, len);
+    if (sel res_arr.err) { ret res[*type.TypeId, fail.Fail].err{fail.refused(res_arr.err)}; }
+    val arr: *type.TypeId = res_arr.ok;
+
+    var i: u32 = 0;
+    for (i < len::u32) {
+        arr[i] = type.TYPE_NIL;
+        i      = i + 1;
+    }
+    ret res[*type.TypeId, fail.Fail].ok{arr};
+}
+
+fun layout_state_alloc(a: *A.Allocator, len: usize) res[*u8, fail.Fail] {
+    val res_arr: res[*u8, A.Error] = A.allocate[u8](a, len);
+    if (sel res_arr.err) { ret res[*u8, fail.Fail].err{fail.refused(res_arr.err)}; }
+    val arr: *u8 = res_arr.ok;
+
+    var i: u32 = 0;
+    for (i < len::u32) {
+        arr[i] = sema_context.LAYOUT_PENDING;
+        i      = i + 1;
+    }
+    ret res[*u8, fail.Fail].ok{arr};
+}
+
+fun embed_len_array_alloc(a: *A.Allocator, len: usize) res[*u64, fail.Fail] {
+    val res_arr: res[*u64, A.Error] = A.allocate[u64](a, len);
+    if (sel res_arr.err) { ret res[*u64, fail.Fail].err{fail.refused(res_arr.err)}; }
+    val arr: *u64 = res_arr.ok;
+
+    var i: u32 = 0;
+    for (i < len::u32) {
+        arr[i] = sema_product.EMBED_LEN_NONE;
+        i      = i + 1;
+    }
+    ret res[*u64, fail.Fail].ok{arr};
+}
+
+fun memo_array_alloc(a: *A.Allocator, len: usize) res[*u8, fail.Fail] {
+    val res_arr: res[*u8, A.Error] = A.allocate[u8](a, len);
+    if (sel res_arr.err) { ret res[*u8, fail.Fail].err{fail.refused(res_arr.err)}; }
+    val arr: *u8 = res_arr.ok;
+
+    var i: u32 = 0;
+    for (i < len::u32) {
+        arr[i] = sema_context.TYPE_MEMO_NONE;
+        i      = i + 1;
+    }
+    ret res[*u8, fail.Fail].ok{arr};
+}
+
+fun dnit_context(sc: *sema_context.SemaContext) {
+    if (sc.view.expr_type != nil && sc.view.a.expr_len > 0) {
+        A.deallocate[type.TypeId](sc.s.alloc, sc.view.expr_type, sc.view.a.expr_len);
+    }
+    if (sc.view.type_resolved_ty != nil && sc.view.a.type_len > 0) {
+        A.deallocate[type.TypeId](sc.s.alloc, sc.view.type_resolved_ty, sc.view.a.type_len);
+    }
+    if (sc.view.decl_type != nil && sc.view.a.decl_len > 0) {
+        A.deallocate[type.TypeId](sc.s.alloc, sc.view.decl_type, sc.view.a.decl_len);
+    }
+    if (sc.view.type_resolved_memo != nil && sc.view.a.type_len > 0) {
+        A.deallocate[u8](sc.s.alloc, sc.view.type_resolved_memo, sc.view.a.type_len);
+    }
+    if (sc.view.layout_state != nil && sc.view.a.decl_len > 0) {
+        A.deallocate[u8](sc.s.alloc, sc.view.layout_state, sc.view.a.decl_len);
+    }
+    if (sc.view.embed_len != nil && sc.view.a.type_len > 0) {
+        A.deallocate[u64](sc.s.alloc, sc.view.embed_len, sc.view.a.type_len);
+    }
+    if (sc.view.embed_paths != nil && sc.view.embed_path_cap > 0) {
+        A.deallocate[intern.StrId](sc.s.alloc, sc.view.embed_paths, sc.view.embed_path_cap::usize);
+    }
+    sc.view.embed_len          = nil;
+    sc.view.embed_paths        = nil;
+    sc.view.embed_path_len     = 0;
+    sc.view.embed_path_cap     = 0;
+    sc.view.expr_type          = nil;
+    sc.view.type_resolved_ty   = nil;
+    sc.view.type_resolved_memo = nil;
+    sc.view.layout_state       = nil;
+    sc.view.decl_type          = nil;
+    sema_context.inst_worklist_dnit(sc);
+}
+
+fun check_annotation_uni_secrecy_all(sc: *sema_context.SemaContext) {
+    if (!sc.typing.has_secret)           { ret; }
+    if (sc.view.type_resolved_ty == nil) { ret; }
+    var i: u32 = 0;
+    for (i < sc.view.a.type_len::u32) {
+        generics.check_annotation_uni_secrecy(sc, ast_id.type(i));
+        i = i + 1;
+    }
+}
+
+fun resolve_all_types(sc: *sema_context.SemaContext) err[fail.Fail] {
+    if (sc.view.type_resolved_ty == nil) { ret err[fail.Fail].ok{}; }
+    val outer: sema_context.Walk = sema_context.walk_open(sc);
+    sc.walk.type_prepass = true;
+    var i: u32 = 0;
+    for (i < sc.view.a.type_len::u32) {
+        sc.view.type_resolved_ty[i] = sema_declared.resolve_type_ref(sc, ast_id.type(i));
+        i                           = i + 1;
+    }
+    sema_context.walk_close(sc, outer);
+    ret err[fail.Fail].ok{};
+}
+
+fun resolve_all_embeds(sc: *sema_context.SemaContext) err[fail.Fail] {
+    val opt_module: opt[*ast_module.Module] = ast.get_module(sc.view.a, sc.view.a.root_module);
+    if (!sel opt_module.some) {
+        ret err[fail.Fail].err{fail.message("root_module is not set on this Ast")};
+    }
+    val mnode: *ast_module.Module = opt_module.some;
+    ret resolve_embeds_in_list(sc, mnode.decls_start, mnode.decls_len);
+}
+
+fun resolve_embeds_in_list(sc: *sema_context.SemaContext, start: u32, len: u32) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < len) {
+        val did: ast_id.DeclId  = sc.view.a.decl_ids[start + i];
+        val r:   err[fail.Fail] = resolve_embeds_one(sc, did);
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun resolve_embeds_one(sc: *sema_context.SemaContext, did: ast_id.DeclId) err[fail.Fail] {
+    val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, did);
+    if (!sel opt_decl.some) { ret err[fail.Fail].err{fail.message("DeclId out of range")}; }
+    val d: *ast_decl.Decl = opt_decl.some;
+
+    if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+        val ci: *ast_decl.DeclComptimeIf = ?d.data.comptime_if;
+        if (comptime_gate.comptime_if_declares_nothing(sc.view.a, ci.branches_start, ci.branches_len)) {
+            ret err[fail.Fail].ok{};
+        }
+        var b: u32 = 0;
+        for (b < ci.branches_len) {
+            val br:       *ast_decl.ComptimeBranch = ?sc.view.a.comptime_branches[ci.branches_start + b];
+            val active_r: res[bool, fail.Fail]     = comptime_branch_active(sc, br);
+            if (sel active_r.err) { ret err[fail.Fail].err{active_r.err}; }
+            if (active_r.ok) {
+                ret resolve_embeds_in_list(sc, br.body_start, br.body_len);
+            }
+            b = b + 1;
+        }
+        ret err[fail.Fail].ok{};
+    }
+
+    var found: bool = false;
+    var i:     u32  = 0;
+    for (i < d.decorators_len) {
+        val dec: *ast_decl.Decorator = ?sc.view.a.decorators[d.decorators_start + i];
+        if (dec.id == decorator.EMBED) {
+            if (found) {
+                sema_context.report(sc, diagnostic_kind.DECORATOR_DUPLICATE, dec.name, "a declaration can carry only one `embed` decorator");
+            }
+            or {
+                val r: err[fail.Fail] = sema_embed.resolve_one(sc, did, d, dec);
+                if (sel r.err) { ret r; }
+                found = true;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun infer_all_decls(sc: *sema_context.SemaContext) err[fail.Fail] {
+    if (sc.view.decl_type == nil) { ret err[fail.Fail].ok{}; }
+    val opt_module: opt[*ast_module.Module] = ast.get_module(sc.view.a, sc.view.a.root_module);
+    if (!sel opt_module.some) {
+        ret err[fail.Fail].err{fail.message("root_module is not set on this Ast")};
+    }
+    val mnode: *ast_module.Module = opt_module.some;
+    ret infer_decls_in_list(sc, mnode.decls_start, mnode.decls_len);
+}
+
+fun decl_gate_verdict(sc: *sema_context.SemaContext, cond: ast_id.ExprId) res[comptime_gate.GateVerdict, fail.Fail] {
+    ret comptime_gate.evaluate_gate[sema_context.SemaContext](sc.view.ctx, sc, sc.typing.caps, sc.view.a, sc.view.source, cond,
+        ?sc.s.interner, comptime_gate.GATE_SCOPE_DECL, true);
+}
+
+fun decl_gate_is_active(sc: *sema_context.SemaContext, cond: ast_id.ExprId) res[bool, fail.Fail] {
+    val vr: res[comptime_gate.GateVerdict, fail.Fail] = decl_gate_verdict(sc, cond);
+    if (sel vr.err) {
+        ret res[bool, fail.Fail].err{vr.err};
+    }
+    ret res[bool, fail.Fail].ok{vr.ok.outcome == comptime_gate.GATE_ACTIVE};
+}
+
+fun infer_decls_in_list(sc: *sema_context.SemaContext, start: u32, len: u32) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < len) {
+        val did:      ast_id.DeclId  = sc.view.a.decl_ids[start + i];
+        val res_decl: err[fail.Fail] = infer_one_decl(sc, did);
+        if (sel res_decl.err) { ret res_decl; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun infer_one_decl(sc: *sema_context.SemaContext, did: ast_id.DeclId) err[fail.Fail] {
+    val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, did);
+    if (!sel opt_decl.some) { ret err[fail.Fail].err{fail.message("DeclId out of range")}; }
+    val d: *ast_decl.Decl = opt_decl.some;
+
+    if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+        ret infer_decls_comptime_if(sc, ?d.data.comptime_if);
+    }
+
+    val ty: type.TypeId = infer.infer_decl(sc, did);
+    sema_context.decl_type_set(sc, did, ty);
+    ret err[fail.Fail].ok{};
+}
+
+fun infer_decls_comptime_if(sc: *sema_context.SemaContext, ci: *ast_decl.DeclComptimeIf) err[fail.Fail] {
+    if (comptime_gate.comptime_if_declares_nothing(sc.view.a, ci.branches_start, ci.branches_len)) {
+        ret err[fail.Fail].ok{};
+    }
+    var i: u32 = 0;
+    for (i < ci.branches_len) {
+        val br: *ast_decl.ComptimeBranch = ?sc.view.a.comptime_branches[ci.branches_start + i];
+        if (!ast_id.expr_is_nil(br.cond) && comptime.gate_state(sc.view.ctx, br.cond) == comptime.GATE_STATE_UNKNOWN) {
+            if (!sema_stmt.gate_condition_check(sc, br.cond)) { ret err[fail.Fail].ok{}; }
+        }
+        val active_r: res[bool, fail.Fail] = comptime_branch_active(sc, br);
+        if (sel active_r.err) { ret err[fail.Fail].err{active_r.err}; }
+        if (active_r.ok) {
+            ret infer_decls_in_list(sc, br.body_start, br.body_len);
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun infer_all_bodies(sc: *sema_context.SemaContext) err[fail.Fail] {
+    if (sc.view.decl_type == nil) { ret err[fail.Fail].ok{}; }
+    val opt_module: opt[*ast_module.Module] = ast.get_module(sc.view.a, sc.view.a.root_module);
+    if (!sel opt_module.some) {
+        ret err[fail.Fail].err{fail.message("root_module is not set on this Ast")};
+    }
+    val mnode: *ast_module.Module = opt_module.some;
+    ret infer_bodies_in_list(sc, mnode.decls_start, mnode.decls_len);
+}
+
+fun infer_bodies_in_list(sc: *sema_context.SemaContext, start: u32, len: u32) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < len) {
+        val did:      ast_id.DeclId  = sc.view.a.decl_ids[start + i];
+        val res_body: err[fail.Fail] = infer_one_body(sc, did);
+        if (sel res_body.err) { ret res_body; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun pack_on_import_check(sc: *sema_context.SemaContext, d: *ast_decl.Decl) {
+    var i: u32 = 0;
+    for (i < d.data.fun_.params_len) {
+        val tn:    *ast_decl.TypedName = ?sc.view.a.typed_names[d.data.fun_.params_start + i];
+        val opt_t: opt[*ast_type.Type] = ast.get_type(sc.view.a, tn.ty);
+        if (sel opt_t.some) {
+            if (opt_t.some.kind == ast_type.TYPE_KIND_PACK) {
+                sema_context.report_note(sc, diagnostic_kind.PACK_BODYLESS, d.span,
+                    "a comptime variadic pack `...` cannot appear on a body-less `fun`",
+                    "a pack is monomorphized per call site and takes a mangled name, so no foreign library can export it; for a C function declared with `...`, write the C-variadic form instead: `ext fun f(a: T, ...)`");
+                ret;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fun infer_one_body(sc: *sema_context.SemaContext, did: ast_id.DeclId) err[fail.Fail] {
+    val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, did);
+    if (!sel opt_decl.some) { ret err[fail.Fail].err{fail.message("DeclId out of range")}; }
+    val d:               *ast_decl.Decl = opt_decl.some;
+    val saved_requester: u32            = sc.instance.requester;
+    sc.instance.requester = body_requester(sc, did, d);
+    val r: err[fail.Fail] = infer_one_body_as(sc, did, d);
+    sc.instance.requester = saved_requester;
+    ret r;
+}
+
+# who a declaration's body asks for instances as: the object it is emitted in, or nobody
+# for a template, which is emitted only through its instances
+fun body_requester(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl) u32 {
+    if (d.kind == ast_decl.DECL_KIND_FUN && fun_is_template(sc, d)) { ret sema_instance.FROM_TEMPLATE; }
+    if (d.kind == ast_decl.DECL_KIND_TEST)                          { ret sema_instance.FROM_TESTING; }
+    if (resolve.declaration_testing(sc.view.a, did))                { ret sema_instance.FROM_TESTING; }
+    ret sema_instance.FROM_NORMAL;
+}
+
+# a generic, a function with a comptime value parameter, or one with a pack: emitted only
+# as its instances
+fun fun_is_template(sc: *sema_context.SemaContext, d: *ast_decl.Decl) bool {
+    if (d.data.fun_.generics_len > 0) { ret true; }
+    var i: u32 = 0;
+    for (i < d.data.fun_.params_len) {
+        val tn: *ast_decl.TypedName = ?sc.view.a.typed_names[d.data.fun_.params_start + i];
+        if (tn.comptime) { ret true; }
+        if (i + 1 == d.data.fun_.params_len) {
+            val t: opt[*ast_type.Type] = ast.get_type(sc.view.a, tn.ty);
+            if (sel t.some) {
+                if (t.some.kind == ast_type.TYPE_KIND_PACK) { ret true; }
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun infer_one_body_as(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl) err[fail.Fail] {
+    sema_decorator.infer_decorator_args(sc, d);
+    sema_decorator.validate_decorators(sc, d);
+    sema_handle.check_handle_decl(sc, did, d);
+    sema_handle.check_handle_signature(sc, d);
+    abitype.check_abi_type_placement(sc, did, d);
+
+    if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+        ret infer_bodies_comptime_if(sc, ?d.data.comptime_if);
+    }
+    if (d.kind == ast_decl.DECL_KIND_FUN) {
+        if (!ast_id.stmt_is_nil(d.data.fun_.body)) {
+            if (d.data.fun_.c_variadic) {
+                sema_context.report(sc, diagnostic_kind.EXT_VARIADIC_BODY, d.span, "a C-variadic `...` declares a foreign import and cannot have a body");
+            }
+            val ret_ty: type.TypeId = sema_context.resolved_type_of(sc, d.data.fun_.return_type);
+            # a generic body is judged at each instantiation, against that instance's own
+            # types; the template has none to judge it by, so it types the body to fill the
+            # expression table that each instance and the lowering read, and says nothing
+            val outer: sema_context.Walk = sema_context.walk_open(sc);
+            if (d.data.fun_.generics_len > 0) { sc.walk.silent = true; }
+            val res_body: err[fail.Fail] = sema_stmt.infer_stmt(sc, d.data.fun_.body, ret_ty);
+            sema_context.walk_close(sc, outer);
+            ret res_body;
+        }
+        pack_on_import_check(sc, d);
+        ret err[fail.Fail].ok{};
+    }
+    if (d.kind == ast_decl.DECL_KIND_TEST) {
+        if (!ast_id.stmt_is_nil(d.data.test_.body)) {
+            val ret_ty: type.TypeId = sema_stmt.test_return_type(sc);
+            sc.walk.in_test = true;
+            val res_body: err[fail.Fail] = sema_stmt.infer_stmt(sc, d.data.test_.body, ret_ty);
+            sc.walk.in_test = false;
+            ret res_body;
+        }
+        ret err[fail.Fail].ok{};
+    }
+    if (d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR) {
+        if ((d.flags & ast_decl.DECL_FLAG_EXT) != 0 && !ast_id.expr_is_nil(d.data.bind.init)) {
+            sema_context.report(sc, diagnostic_kind.EXT_DATA_INITIALIZER, d.span, "an `ext` data import cannot have an initializer");
+            ret err[fail.Fail].ok{};
+        }
+        ret infer_binding_init(sc, did, d);
+    }
+    if (d.kind == ast_decl.DECL_KIND_COMPTIME_DIRECTIVE) {
+        sema_stmt.eval_comptime_directive(sc, d.data.comptime_directive.target, d.span);
+        ret err[fail.Fail].ok{};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun infer_binding_init(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl) err[fail.Fail] {
+    if (ast_id.expr_is_nil(d.data.bind.init)) { ret err[fail.Fail].ok{}; }
+    if (ast_id.type_is_nil(d.data.bind.ty))   { ret err[fail.Fail].ok{}; }
+
+    val actual:   type.TypeId = infer.infer_expr(sc, d.data.bind.init);
+    val expected: type.TypeId = sc.view.decl_type[ast_id.decl_index(did)];
+    if (!type.is_nil(expected) && !type.is_error(expected) && !type.is_error(actual)) {
+        sema_stmt.check_binding(sc, expected, d.data.bind.init, actual, d.span);
+        if (d.kind == ast_decl.DECL_KIND_VAL && comptime.is_case_literal(sc.view.a, d.data.bind.init)) {
+            ret rebind_constant_tag(sc, d, expected);
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# name resolution bound a case-literal `val` as an untyped constant element; the checked type lets
+# a nested payload read name its member types
+fun rebind_constant_tag(sc: *sema_context.SemaContext, d: *ast_decl.Decl, ty: type.TypeId) err[fail.Fail] {
+    val name_r: res[intern.StrId, A.Error] = intern.range_add(?sc.s.interner, sc.view.source, d.data.bind.name.offset, d.data.bind.name.len);
+    if (sel name_r.err) { ret err[fail.Fail].err{fail.refused(name_r.err)}; }
+    val name:  intern.StrId             = name_r.ok;
+    val bound: opt[comptime.NamedConst] = comptime.lookup(sc.view.ctx, name);
+    if (!sel bound.some) { ret err[fail.Fail].ok{}; }
+    val nc: comptime.NamedConst = bound.some;
+    if (nc.value.kind != comptime.CT_KIND_CONST_ELEM || nc.value.data.celem.elem != d.data.bind.init::u32) { ret err[fail.Fail].ok{}; }
+    if (nc.value.data.celem.ty == ty::u32)                                                                 { ret err[fail.Fail].ok{}; }
+    ret comptime.bind_gated(sc.view.ctx, name, comptime.const_elem_value(d.data.bind.init::u32, ty::u32), nc.gated);
+}
+
+fun infer_bodies_deferred_chain(sc: *sema_context.SemaContext, ci: *ast_decl.DeclComptimeIf) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < ci.branches_len) {
+        val br: *ast_decl.ComptimeBranch = ?sc.view.a.comptime_branches[ci.branches_start + i];
+        if (ast_id.expr_is_nil(br.cond)) {
+            ret infer_bodies_in_list(sc, br.body_start, br.body_len);
+        }
+        val e_opt: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, br.cond);
+        if (sel e_opt.err) { ret err[fail.Fail].err{fail.message("comptime branch cond ExprId out of range")}; }
+        val cond_span: lang_source.Span = e_opt.ok.span;
+
+        val outer: sema_context.Walk = sema_context.walk_open(sc);
+        sc.walk.in_comptime_gate = true;
+        val decided: res[opt[comptime_gate.GateVerdict], fail.Fail] = sema_stmt.deferred_gate_decide(sc, br.cond, cond_span);
+        sema_context.walk_close(sc, outer);
+        if (sel decided.err)     { ret err[fail.Fail].err{decided.err}; }
+        if (sel decided.ok.none) { ret err[fail.Fail].ok{}; }
+        val v: comptime_gate.GateVerdict = decided.ok.some;
+        if (sema_stmt.gate_verdict_truth(v)) {
+            ret infer_bodies_in_list(sc, br.body_start, br.body_len);
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun infer_bodies_comptime_if(sc: *sema_context.SemaContext, ci: *ast_decl.DeclComptimeIf) err[fail.Fail] {
+    if (comptime_gate.comptime_if_declares_nothing(sc.view.a, ci.branches_start, ci.branches_len)) {
+        ret infer_bodies_deferred_chain(sc, ci);
+    }
+    var i: u32 = 0;
+    for (i < ci.branches_len) {
+        val br:       *ast_decl.ComptimeBranch = ?sc.view.a.comptime_branches[ci.branches_start + i];
+        val active_r: res[bool, fail.Fail]     = comptime_branch_active(sc, br);
+        if (sel active_r.err) { ret err[fail.Fail].err{active_r.err}; }
+        if (active_r.ok) {
+            ret infer_bodies_in_list(sc, br.body_start, br.body_len);
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun comptime_branch_active(sc: *sema_context.SemaContext, br: *ast_decl.ComptimeBranch) res[bool, fail.Fail] {
+    if (ast_id.expr_is_nil(br.cond)) { ret res[bool, fail.Fail].ok{true}; }
+    ret decl_gate_is_active(sc, br.cond);
+}
+
+fun build_result(sc: *sema_context.SemaContext) res[sema_product.SemaResult, fail.Fail] {
+    if (sel sc.status.kind.internal) {
+        ret res[sema_product.SemaResult, fail.Fail].err{fail.phase_failure(sc.status)};
+    }
+    var graph: fields.Graph = fields.init(sc.s.alloc);
+    if (sel sc.status.kind.accepted) {
+        var roots: [3]fields.Roots;
+        roots[0] = fields.Roots{data: sc.view.expr_type, len: sc.view.a.expr_len};
+        roots[1] = fields.Roots{data: sc.view.type_resolved_ty, len: sc.view.a.type_len};
+        roots[2] = fields.Roots{data: sc.view.decl_type, len: sc.view.a.decl_len};
+        val captured: res[fields.Graph, fail.Fail] = fields.capture[sema_context.SemaContext](sc.s, sc.s.alloc,
+            ?roots[0], 3, fields.MATERIALIZED, sc.view.ctx.env.target_defs, sc, sema_declared.prepare_nominal_recipe);
+        if (sel captured.err) { ret res[sema_product.SemaResult, fail.Fail].err{captured.err}; }
+        graph = captured.ok;
+    }
+    ret finish_result(sc, graph);
+}
+
+fun finish_result(sc: *sema_context.SemaContext, graph: fields.Graph) res[sema_product.SemaResult, fail.Fail] {
+    if (sel sc.status.kind.internal) {
+        var owned: fields.Graph = graph;
+        fields.dnit(?owned);
+        ret res[sema_product.SemaResult, fail.Fail].err{fail.phase_failure(sc.status)};
+    }
+    var out: sema_product.SemaResult;
+    out.field_graph      = graph;
+    out.status           = sc.status;
+    out.alloc            = sc.s.alloc;
+    out.expr_type        = sc.view.expr_type;
+    out.type_resolved_ty = sc.view.type_resolved_ty;
+    out.decl_type        = sc.view.decl_type;
+    out.expr_count       = sc.view.a.expr_len::u32;
+    out.type_count       = sc.view.a.type_len::u32;
+    out.decl_count       = sc.view.a.decl_len::u32;
+    out.embed_paths      = sc.view.embed_paths;
+    out.embed_path_count = sc.view.embed_path_len;
+    out.constants        = comptime.publish(sc.view.ctx);
+    out.instances        = sc.typing.insts.set;
+    # the result owns the set and the analysis now
+    sc.typing.insts.set.alloc = nil;
+    out.growth.alloc          = nil;
+    if (sc.typing.growth != nil) {
+        out.growth             = @sc.typing.growth;
+        sc.typing.growth.alloc = nil;
+    }
+
+    sc.view.expr_type        = nil;
+    sc.view.type_resolved_ty = nil;
+    sc.view.decl_type        = nil;
+    out.embed_path_cap       = sc.view.embed_path_cap;
+    sc.view.embed_paths      = nil;
+    sc.view.embed_path_cap   = 0;
+    sc.view.embed_path_len   = 0;
+
+    ret res[sema_product.SemaResult, fail.Fail].ok{out};
+}
+
+test unknown_kind__never_becomes_an_error_type_without_failure {
+    var alloc:  A.Allocator;
+    val make_1: err[A.Error] = page.make(?alloc);
+    if (sel make_1.err) { ret 1; }
+    var s: session.Session = session.Session{};
+    s.alloc    = ?alloc;
+    s.interner = intern.init(?alloc);
+    fin { intern.dnit(?s.interner); }
+    var ex:     ast_expr.Expr         = ast_expr.Expr{kind: 200};
+    var de:     ast_decl.Decl         = ast_decl.Decl{kind: 200};
+    var ty:     ast_type.Type         = ast_type.Type{kind: 200};
+    var st:     ast_stmt.Stmt         = ast_stmt.Stmt{kind: 200};
+    var choice: interpretation.Choice = interpretation.PARSED;
+    var rr:     resolve.ResolveResult = resolve.ResolveResult{expr_choices: ?choice, expr_choices_count: 1};
+    var a:      ast.Ast               = ast.Ast{exprs: ?ex, expr_len: 1, decls: ?de, decl_len: 1,
+        types: ?ty, type_len: 1, stmts: ?st, stmt_len: 1};
+    var sc:    sema_context.SemaContext = sema_context.init(?s, nil, sema_context.Typing{}, sema_context.ModuleView{a: ?a, rr: ?rr}, sema_context.instance_none());
+    val names: [7]str                   = [7]str{"ExprKind", "BinOp", "UnOp", "DeclKind", "AstTypeKind", "StmtKind", "DeclKind"};
+    var i:     usize                    = 0;
+    for (i < 7) {
+        sc.status = fail.accepted();
+        var result: type.TypeId = type.TYPE_ERROR;
+        if (i < 3) {
+            if (i == 1) {
+                ex.kind           = ast_expr.EXPR_KIND_BINARY;
+                ex.data.binary.op = 200;
+            }
+            if (i == 2) {
+                ex.kind          = ast_expr.EXPR_KIND_UNARY;
+                ex.data.unary.op = 200;
+            }
+            result = infer.infer_expr(?sc, ast_id.expr(0));
+        }
+        or (i == 3) { result = infer.infer_decl(?sc, ast_id.decl(0)); }
+        or (i == 4) { result = sema_declared.resolve_type_ref(?sc, ast_id.type(0)); }
+        or {
+            if (i == 6) {
+                st.kind           = ast_stmt.STMT_KIND_DECL;
+                st.data.decl.decl = ast_id.decl(0);
+            }
+            val infer_stmt_2: err[fail.Fail] = sema_stmt.infer_stmt(?sc, ast_id.stmt(0), type.TYPE_NIL);
+            if (sel infer_stmt_2.ok) { ret 2; }
+        }
+        if (!type.is_error(result))                                                                                    { ret 3; }
+        if (!sel sc.status.kind.internal)                                                                              { ret 3; }
+        if (sc.status.rejections != 0)                                                                                 { ret 3; }
+        if (!str_contains(fail.status_text(sc.status), names[i]) || !str_contains(fail.status_text(sc.status), "200")) { ret 4; }
+        i = i + 1;
+    }
+    sc.status = fail.accepted();
+    ex.kind   = ast_expr.EXPR_KIND_ERROR;
+    de.kind   = ast_decl.DECL_KIND_USE;
+    ty.kind   = ast_type.TYPE_KIND_ERROR;
+    st.kind   = ast_stmt.STMT_KIND_ASM;
+    if (!type.is_error(infer.infer_expr(?sc, ast_id.expr(0))) || !type.is_nil(infer.infer_decl(?sc, ast_id.decl(0)))
+        || !type.is_error(sema_declared.resolve_type_ref(?sc, ast_id.type(0)))) { ret 5; }
+    val inferred_stmt: err[fail.Fail] = sema_stmt.infer_stmt(?sc, ast_id.stmt(0), type.TYPE_NIL);
+    if (sel inferred_stmt.err) { ret 5; }
+    st.kind = ast_stmt.STMT_KIND_ERROR;
+    val infer_stmt_3: err[fail.Fail] = sema_stmt.infer_stmt(?sc, ast_id.stmt(0), type.TYPE_NIL);
+    if (sel infer_stmt_3.err)         { ret 6; }
+    if (!sel sc.status.kind.accepted) { ret 6; }
+    ret 0;
+}

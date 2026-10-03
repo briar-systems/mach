@@ -1,5 +1,8 @@
 # mach.lang.fe.sema.context
 
+the state of one sema walk: the module typing it shares, the module it reads, the
+instance it types and its own walk state, with the reads and reports every check makes
+
 ## fun imported_definition
 
 ```mach
@@ -263,12 +266,6 @@ pub fun awaits_instance(sc: *SemaContext, tid: type.TypeId) bool;
 
 true while a type still names a type parameter: no operand predicate has an answer
 for it, and every question about it waits for an instantiation
-
-## fun decl_body_spreads_pack_to_c_variadic
-
-```mach
-pub fun decl_body_spreads_pack_to_c_variadic(sc: *SemaContext, origin: session.ModuleId, did: ast_id.DeclId) bool;
-```
 
 ## fun record_instance
 
@@ -558,9 +555,33 @@ pub fun require_constant_arg(sc: *SemaContext, dec: *ast_decl.Decorator, ord: u3
 an integer argument that is not a constant expression is refused as one;
 a question only a later phase answers, a layout or an instance, is left to it
 
+## fun decorator_arg_span
+
+```mach
+pub fun decorator_arg_span(sc: *SemaContext, eid: ast_id.ExprId, fallback: lang_source.Span) lang_source.Span;
+```
+
 ## def StmtListVisitor
 
 ```mach
 pub def StmtListVisitor: fun(ptr, *SemaContext, u32, u32) err[fail.Fail]
+```
+
+## fun source_text_of
+
+```mach
+pub fun source_text_of(s: *session.Session, a: *ast.Ast) res[str, fail.Fail];
+```
+
+## fun is_global_binding
+
+```mach
+pub fun is_global_binding(kind: ast_decl.DeclKind) bool;
+```
+
+## fun is_fun_or_global
+
+```mach
+pub fun is_fun_or_global(kind: ast_decl.DeclKind) bool;
 ```
 
