@@ -57,6 +57,7 @@ from the index below.
 
 - [diagnostics.md](diagnostics.md) — diagnostic keys, the code registry and its never-reused rule
 - [diagnostics-json.md](diagnostics-json.md) — `--diagnostics=json`, the versioned NDJSON record schema
+- [readout.md](readout.md) — what `-v` and `-vv` show for build, check and test, on which stream, and when
 
 ## Formal grammar
 

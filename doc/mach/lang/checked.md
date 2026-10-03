@@ -107,13 +107,6 @@ pub fun count_mul[Unit](value: Count[Unit], factor: usize)
 res[Count[Unit], Cause];
 ```
 
-## fun count_grow
-
-```mach
-pub fun count_grow[Unit](current: Count[Unit], required: Count[Unit])
-res[Count[Unit], Cause];
-```
-
 ## fun offset_add
 
 ```mach

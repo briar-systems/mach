@@ -1,0 +1,679 @@
+# edit: the commands that change a project's dependencies: add and remove edit the
+# manifest's [dep] tables, update moves selectors and pins. each is a transaction over the
+# project root held open: the manifest is published only after the closure it declares is
+# realized, and a failure names, through the report's effects, every change it leaves behind
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.data.toml;
+use fs:         std.filesystem;
+use std_format: std.format;
+use io_error:   std.io.error;
+use system_os:  std.system.os;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use driver_closure:  mach.lang.driver.closure;
+use mach.lang.fail;
+use mach.lang.manifest;
+use mach.lang.output;
+use mach.lang.output.remove;
+use output_testing: mach.lang.output.testing;
+use mach.lang.session;
+
+use mach.lang.package;
+use package_closure: mach.lang.package.closure;
+use git_member:      mach.lang.package.git.member;
+use package_path:    mach.lang.package.path;
+use package_pin:     mach.lang.package.pin;
+use mach.lang.package.report;
+use mach.lang.package.resolve;
+use mach.lang.package.resolver;
+use package_source: mach.lang.package.source;
+
+# the project root held open for an edit: the manifest is replaced through a sibling
+# temporary and the dependency root is reached through it
+pub rec Edit {
+    root_fd: usize;
+}
+
+pub fun begin(edit: *Edit, root: str) err[fail.Fail] {
+    edit.root_fd = system_os.INVALID_HANDLE;
+    val opened: i64 = remove.open_path(root, ?edit.root_fd);
+    if (opened < 0) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, system_os.error_message(opened))}; }
+    val root_r: res[bool, fail.Fail] = driver_closure.check_dep_root(root);
+    if (sel root_r.err) { ret err[fail.Fail].err{root_r.err}; }
+    ret err[fail.Fail].ok{};
+}
+
+# release the project root; err when closing it fails
+pub fun finish(edit: *Edit) err[fail.Fail] {
+    if (edit.root_fd == system_os.INVALID_HANDLE) { ret err[fail.Fail].ok{}; }
+    val closed: i64 = system_os.close(edit.root_fd);
+    edit.root_fd = system_os.INVALID_HANDLE;
+    if (closed < 0) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_CLOSE, system_os.error_message(closed))}; }
+    ret err[fail.Fail].ok{};
+}
+
+# `outcome` of the work an edit held the root for, then the edit released: a failure to close
+# the root is the outcome when the work succeeded, and is reported beside it otherwise
+fun finished(edit: *Edit, outcome: err[fail.Fail], rep: *report.Report) err[fail.Fail] {
+    val closed: err[fail.Fail] = finish(edit);
+    if (sel closed.ok)  { ret outcome; }
+    if (sel outcome.ok) { ret closed; }
+    report.fault(rep, closed.err);
+    ret outcome;
+}
+
+# start recording pins for a new project at `root`, as `mach init` does before it adds the
+# project's dependencies; a root that records them already is left as it is
+pub fun start(s: *session.Session, root: str) err[fail.Fail] {
+    val pins:  package_pin.Pin = git_member.pin(s);
+    val begun: err[fail.Fail]  = pins.begin(pins.ctx, root);
+    if (sel begun.err) { ret begun; }
+    val mode_r: res[u8, fail.Fail] = pins.mode(pins.ctx, root);
+    if (sel mode_r.err) { ret err[fail.Fail].err{mode_r.err}; }
+    ret err[fail.Fail].ok{};
+}
+
+# `mach dep update`: move one root-declared or transitive identity, or every one under `all`
+# ---
+# s:       the session; a failure may borrow from it, so the caller shows it before ending it
+# a:       the storage the operation works in
+# root:    the project root directory
+# all:     move every identity
+# name:    the identity to move when not `all`
+# quiet:   report no progress lines
+# lowest:  resolve each range to its lowest admitted release
+# offline: fetch nothing
+# rep:     receives progress, notes, and the effects a failure left
+# ret:     err naming the failure
+pub fun update(s: *session.Session, a: *A.Allocator, root: str, all: bool, name: str, quiet: bool, lowest: bool, offline: bool,
+    rep: *report.Report) err[fail.Fail] {
+    val opened: res[package_closure.Operation, fail.Fail] = package_closure.open(s, a, root, rep);
+    if (sel opened.err) { ret err[fail.Fail].err{opened.err}; }
+    var op: package_closure.Operation = opened.ok;
+    fin { package_closure.close(?op); }
+    val mode_r: res[u8, fail.Fail] = op.pins.mode(op.pins.ctx, root);
+    if (sel mode_r.err) { ret err[fail.Fail].err{mode_r.err}; }
+    var edit:  Edit;
+    val txn_r: err[fail.Fail] = begin(?edit, root);
+    if (sel txn_r.err) { ret finished(?edit, txn_r, rep); }
+    var closure: Vector[package_closure.Request] = collections_vector.init[package_closure.Request](a);
+    val applied: err[fail.Fail]                  = update_apply(?op, mode_r.ok, all, name, quiet, 0, lowest, offline, ?closure);
+    package_closure.free_requests(a, ?closure);
+    ret finished(?edit, applied, rep);
+}
+
+# update: the fixed git selectors move first (a ref is fetched and checked out), so their
+# manifests are the closure's when the version ranges resolve; then every chosen release is
+# realized and the closure is pulled, which syncs every path copy once and reports it
+#
+# `closure` receives the closure the final pull realized, which the caller frees;
+# `fail_after` stops the update with a failure after that many of its steps, 0 for none
+pub fun update_apply(op: *package_closure.Operation, mode: u8, all: bool, name: str, quiet: bool, fail_after: i32,
+    lowest: bool, offline: bool, closure: *Vector[package_closure.Request]) err[fail.Fail] {
+    val a:         *A.Allocator      = op.a;
+    val mt_path_r: res[str, A.Error] = types_path.join(a, op.root, package_closure.MANIFEST);
+    if (sel mt_path_r.err) { ret err[fail.Fail].err{package_closure.oom()}; }
+    val mt_r: res[manifest.Doc, fail.Fail] = package_closure.parse_file(a, mt_path_r.ok);
+    if (sel mt_r.err) { ret err[fail.Fail].err{mt_r.err}; }
+    var mt: manifest.Doc = mt_r.ok;
+
+    var reqs: Vector[package_closure.Request] = collections_vector.init[package_closure.Request](a);
+    fin { package_closure.free_requests(a, ?reqs); }
+    val seed_r: err[fail.Fail] = package_closure.declared(a, ?reqs, op.root, ?mt.table);
+    if (sel seed_r.err) { ret seed_r; }
+    var known: Vector[package_closure.Request] = collections_vector.init[package_closure.Request](a);
+    fin { package_closure.free_requests(a, ?known); }
+    var complete: bool = false;
+    fin {
+        if (!complete) {
+            package_closure.effects(op, ?reqs);
+            package_closure.effects(op, ?known);
+        }
+    }
+
+    # a name the root does not declare is looked up in the realized closure
+    val transitive: bool = !all && package_closure.index(?reqs, name) < 0;
+    if (!transitive) {
+        val advanced: err[fail.Fail] = advance_fixed(op, mode, ?reqs, true, all, name, quiet, offline, fail_after);
+        if (sel advanced.err) { ret advanced; }
+    }
+    var walk:      package_closure.Walk = package_closure.Walk{offline: offline, all: all, name: name};
+    val preflight: err[fail.Fail]       = package_closure.preflight(op, ?mt, ?known, true, ?walk);
+    if (sel preflight.err) { ret preflight; }
+    if (transitive && package_closure.index(?known, name) < 0) {
+        val msg: res[str, std_format.FormatError] = std_format.sprint(a, "dependency '{}' is not in the dependency closure", name);
+        if (sel msg.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_IN_CLOSURE, "the dependency is not in the dependency closure")}; }
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_IN_CLOSURE, msg.ok)};
+    }
+    # version ranges resolve together; naming one unlocks only that identity
+    var unlocked: str = nil;
+    if (!all) { unlocked = name; }
+    val resolved: res[resolve.Resolution, fail.Fail] = resolve.versions(op, ?mt, lowest, !all, unlocked, false, ?walk);
+    if (sel resolved.err) { ret err[fail.Fail].err{resolved.err}; }
+    if (!quiet)           { notes(op.rep, ?resolved.ok.notes); }
+    var picks:  Vector[resolver.Choice] = resolved.ok.picks;
+    val picked: bool                    = !all && resolve.pick_index(?picks, name) >= 0;
+    # a fixed selector the closure declares moves to the commit resolution read it at
+    if (all || (transitive && !picked)) {
+        val advanced: err[fail.Fail] = advance_fixed(op, mode, ?known, false, all, name, quiet, offline, fail_after);
+        if (sel advanced.err) { ret advanced; }
+    }
+
+    val moved: err[fail.Fail] = realize_picks(op, mode, ?picks, quiet, offline);
+    if (sel moved.err) { ret moved; }
+
+    val pulled: err[fail.Fail] = package_closure.realize(op, closure, quiet, offline, false, nil, ?picks);
+    if (sel pulled.err) { ret pulled; }
+    complete = true;
+    ret err[fail.Fail].ok{};
+}
+
+# a resolution's notes, as a command shows them unless --quiet
+pub fun notes(rep: *report.Report, lines: *Vector[str]) {
+    var i: usize = 0;
+    for (i < lines.len) {
+        report.line(rep, lines.data[i]);
+        i = i + 1;
+    }
+}
+
+# move every fixed git selector among `targets` (all of them, or the one `name` names), the
+# root's own declarations among them only when `roots`: its ref is fetched and checked out, and
+# a recorded pin is moved with it. a path has no selector to move; the closure pull that follows
+# syncs its copy
+fun advance_fixed(op: *package_closure.Operation, mode: u8, targets: *Vector[package_closure.Request],
+    roots: bool, all: bool, name: str, quiet: bool, offline: bool, fail_after: i32) err[fail.Fail] {
+    val a: *A.Allocator = op.a;
+    var i: usize        = 0;
+    for (i < targets.len) {
+        val r: *package_closure.Request = ?targets.data[i];
+        i = i + 1;
+        if (r.root_decl && !roots)                           { cnt; }
+        if (!all && !str_equals(r.id, name))                 { cnt; }
+        if (package_closure.selects_release(r) || !r.is_git) { cnt; }
+
+        val dep_full_r: res[str, fail.Fail] = package.dep_full_of(a, op.root, r.id);
+        if (sel dep_full_r.err) { ret err[fail.Fail].err{package_closure.oom()}; }
+        val dep_full: str = dep_full_r.ok;
+
+        # a slot realized at the selector just now has nothing to advance
+        var realized: u8             = package_source.REALIZED_NOTHING;
+        val slot_r:   err[fail.Fail] = package_closure.acquire(op, r, mode, false, quiet, offline, false, ?realized);
+        if (sel slot_r.err)                                                                            { ret slot_r; }
+        if (realized == package_source.REALIZED_CLONED || realized == package_source.REALIZED_ADOPTED) { cnt; }
+
+        val old:   str            = package_closure.head_text(op, dep_full);
+        val exact: bool           = !ref_advanceable(r.ref);
+        val fr:    err[fail.Fail] = op.checkouts.advance(op.checkouts.ctx, r.id, dep_full, r.ref, offline);
+        if (sel fr.err) { ret fr; }
+        r.effect = "fetched and checked out the requested selector";
+        if (fail_after == 1) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.GIT_COMMAND, "injected dependency checkout failure")}; }
+        val recorded: res[bool, fail.Fail] = op.pins.recorded(op.pins.ctx, op.root, r.id, mode);
+        if (sel recorded.err) { ret err[fail.Fail].err{recorded.err}; }
+        if (recorded.ok) {
+            val st: err[fail.Fail] = op.pins.record(op.pins.ctx, op.root, r.id);
+            if (sel st.err) { ret st; }
+            r.effect = "checked out and staged the requested selector";
+        }
+        val fresh: str = package_closure.head_text(op, dep_full);
+        if (!quiet) {
+            if (exact && str_equals(old, fresh)) { report.linef(op.rep, a, "{}: {} (exact selector, already pinned)", r.id, old); }
+            or (exact)                           { report.linef(op.rep, a, "{}: {} -> {} (pinned to the exact selector)", r.id, old, fresh); }
+            or                                   { report.linef(op.rep, a, "{}: {} -> {}", r.id, old, fresh); }
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun ref_advanceable(ref: str) bool {
+    if (str_empty(ref))                  { ret true; }
+    if (str_starts_with(ref, "branch/")) { ret true; }
+    if (str_starts_with(ref, "tag/"))    { ret false; }
+    if (str_starts_with(ref, "commit/")) { ret false; }
+    ret true;
+}
+
+# move every chosen release's slot to its tag: a missing slot is acquired, and one pinned
+# elsewhere is checked out and its pin recorded
+pub fun realize_picks(op: *package_closure.Operation, mode: u8, picks: *Vector[resolver.Choice], quiet: bool,
+    offline: bool) err[fail.Fail] {
+    val a: *A.Allocator = op.a;
+    var i: usize        = 0;
+    for (i < picks.len) {
+        val pick: *resolver.Choice = ?picks.data[i];
+        i = i + 1;
+        val full_r: res[str, fail.Fail] = package.dep_full_of(a, op.root, pick.id);
+        if (sel full_r.err) { ret err[fail.Fail].err{package_closure.oom()}; }
+        val full:  str                              = full_r.ok;
+        val ref_r: res[str, std_format.FormatError] = std_format.sprint(a, "tag/{}", pick.tag);
+        if (sel ref_r.err) { ret err[fail.Fail].err{package_closure.oom()}; }
+        var request: package_closure.Request = package_closure.Request{id: pick.id, url: pick.url, src_path: "", ref: ref_r.ok, version: "", chain: "",
+            root_decl: false, is_git: true, effect: ""};
+        val present: res[bool, io_error.Error] = fs.exists(full);
+        if (!(sel present.ok && present.ok)) {
+            var realized: u8             = package_source.REALIZED_NOTHING;
+            val acquired: err[fail.Fail] = package_closure.acquire(op, ?request, mode, false, quiet, offline, false, ?realized);
+            if (sel acquired.err) { ret acquired; }
+            cnt;
+        }
+        # the pin is the recorded one: a checkout at the chosen release that drifted from its
+        # pin still moves, or the closure pull after this would restore the old pin
+        if (op.checkouts.at_release(op.checkouts.ctx, op.root, pick.id, full, pick.version)) { cnt; }
+        val fr: err[fail.Fail] = op.checkouts.advance(op.checkouts.ctx, pick.id, full, request.ref, offline);
+        if (sel fr.err) { ret fr; }
+        val recorded: res[bool, fail.Fail] = op.pins.recorded(op.pins.ctx, op.root, pick.id, mode);
+        if (sel recorded.err) { ret err[fail.Fail].err{recorded.err}; }
+        if (recorded.ok) {
+            val st: err[fail.Fail] = op.pins.record(op.pins.ctx, op.root, pick.id);
+            if (sel st.err) { ret st; }
+        }
+        if (!quiet) { report.linef(op.rep, a, "{}: {} (release {})", pick.id, pick.tag, pick.version); }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# declare a git dependency at the caret range of the release resolution picks for the running
+# compiler and realize the closure, as `mach dep add <root> <name> --git <url>` does
+# ---
+# s:       the session; a failure may borrow from it, so the caller shows it before ending it
+# a:       the storage the operation works in
+# root:    the project root directory
+# name:    the dependency identity
+# url:     its git source
+# quiet:   report no progress lines
+# realize: check the release out; false only resolves the range and writes the table
+# rep:     receives progress, notes, and the effects a failure left
+# ret:     err naming the failure
+pub fun add_release(s: *session.Session, a: *A.Allocator, root: str, name: str, url: str, quiet: bool, realize: bool,
+    rep: *report.Report) err[fail.Fail] {
+    var spec: manifest.DepTableSpec;
+    spec.name    = name;
+    spec.source  = manifest.DEP_SOURCE_GIT;
+    spec.value   = url;
+    spec.ref     = "";
+    spec.version = "";
+    ret change(s, a, root, ?spec, name, true, false, quiet, realize, false, rep);
+}
+
+# add or remove the [dep] table `spec` describes and realize the closure it leaves
+# ---
+# s:       the session; a failure may borrow from it, so the caller shows it before ending it
+# a:       the storage the operation works in
+# root:    the project root directory
+# spec:    the table to add, or the name to remove
+# name:    the dependency identity
+# adding:  add the table; false removes it
+# purge:   on remove, delete dep/<name> as well
+# quiet:   report no progress lines
+# realize: realize the closure; false only writes the table
+# offline: fetch nothing
+# rep:     receives progress, notes, and the effects a failure left
+# ret:     err naming the failure
+pub fun change(s: *session.Session, a: *A.Allocator, root: str, spec: *manifest.DepTableSpec, name: str, adding: bool,
+    purge: bool, quiet: bool, realize: bool, offline: bool, rep: *report.Report) err[fail.Fail] {
+    val opened: res[package_closure.Operation, fail.Fail] = package_closure.open(s, a, root, rep);
+    if (sel opened.err) { ret err[fail.Fail].err{opened.err}; }
+    var op: package_closure.Operation = opened.ok;
+    fin { package_closure.close(?op); }
+    val mode_r: res[u8, fail.Fail] = op.pins.mode(op.pins.ctx, root);
+    if (sel mode_r.err) { ret err[fail.Fail].err{mode_r.err}; }
+    var edit:  Edit;
+    val txn_r: err[fail.Fail] = begin(?edit, root);
+    if (sel txn_r.err) { ret finished(?edit, txn_r, rep); }
+    val applied: err[fail.Fail] = apply(?edit, ?op, mode_r.ok, spec, name, adding, purge, quiet, realize, offline, 0);
+    ret finished(?edit, applied, rep);
+}
+
+# realize the dependency `add` declares by path or by ref, naming what it did in `completed`
+fun realize_added(op: *package_closure.Operation, mode: u8, spec: *manifest.DepTableSpec,
+    name: str, quiet: bool, offline: bool, completed: *str) err[fail.Fail] {
+    if (spec.source == manifest.DEP_SOURCE_PATH) {
+        var src: str = spec.value;
+        if (!types_path.is_abs(src)) {
+            val j: res[str, A.Error] = types_path.join(op.a, op.root, spec.value);
+            if (sel j.err) { ret err[fail.Fail].err{package_closure.oom()}; }
+            src = j.ok;
+        }
+        val pr: res[bool, fail.Fail] = package_path.realize(op.s, op.root, name, src, op.rep);
+        if (sel pr.err) { ret err[fail.Fail].err{pr.err}; }
+        @completed = "copied the local source";
+        ret err[fail.Fail].ok{};
+    }
+    var request: package_closure.Request;
+    request.version     = "";
+    request.id          = name;
+    request.url         = spec.value;
+    request.src_path    = "";
+    request.ref         = spec.ref;
+    request.chain       = "";
+    request.root_decl   = true;
+    request.is_git      = true;
+    request.via_release = false;
+    request.seed        = nil;
+    request.effect      = "";
+    var realized: u8             = package_source.REALIZED_NOTHING;
+    val acquired: err[fail.Fail] = package_closure.acquire(op, ?request, mode, true, quiet, offline, false, ?realized);
+    if (!str_empty(request.effect)) { @completed = request.effect; }
+    ret acquired;
+}
+
+# add or remove a declaration within an open edit. realize false only declares: the manifest
+# gains the table (a git one at its resolved range) and nothing is checked out. `fail_after`
+# stops the change with a failure after that many of its steps, 0 for none
+pub fun apply(edit: *Edit, op: *package_closure.Operation, mode: u8, spec: *manifest.DepTableSpec, name: str, adding: bool,
+    purge: bool, quiet: bool, realize: bool, offline: bool, fail_after: i32) err[fail.Fail] {
+    val a:         *A.Allocator         = op.a;
+    var walk:      package_closure.Walk = package_closure.Walk{offline: offline, all: false, name: nil};
+    val mt_path_r: res[str, A.Error]    = types_path.join(a, op.root, package_closure.MANIFEST);
+    if (sel mt_path_r.err) { ret err[fail.Fail].err{package_closure.oom()}; }
+    val mt_path: str = mt_path_r.ok;
+    fin { str_free(a, mt_path); }
+
+    val source_r: res[str, fs.FsError] = fs.read_string(a, mt_path);
+    if (sel source_r.err) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.fs_text(source_r.err))}; }
+    val source: str = source_r.ok;
+    fin { str_free(a, source); }
+
+    # a git dependency added without a selector takes the caret range of the release resolution picks
+    val choose_range: bool = adding && spec.source == manifest.DEP_SOURCE_GIT && str_empty(spec.ref)
+        && (spec.version == nil || str_empty(spec.version));
+    if (choose_range) {
+        spec.version = ">=0.0.0";
+        val probe_r: res[str, fail.Fail] = manifest.manifest_add_dep_table(a, source, spec);
+        if (sel probe_r.err) { ret err[fail.Fail].err{probe_r.err}; }
+        val probe_t: res[manifest.Doc, fail.Fail] = manifest.doc_parse(a, mt_path, probe_r.ok);
+        if (sel probe_t.err) { ret err[fail.Fail].err{probe_t.err}; }
+        var probe:  manifest.Doc                       = probe_t.ok;
+        val chosen: res[resolve.Resolution, fail.Fail] = resolve.versions(op, ?probe, false, true, name, false, ?walk);
+        manifest.doc_dnit(a, ?probe);
+        if (sel chosen.err) { ret err[fail.Fail].err{chosen.err}; }
+        val at: i64 = resolve.pick_index(?chosen.ok.picks, name);
+        if (at < 0) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_NO_RELEASE, "resolution chose no release for the new dependency")}; }
+        val caret: res[str, std_format.FormatError] = std_format.sprint(a, "^{}", chosen.ok.picks.data[at::usize].version);
+        if (sel caret.err) { ret err[fail.Fail].err{package_closure.oom()}; }
+        spec.version = caret.ok;
+    }
+
+    var candidate_r: res[str, fail.Fail];
+    if (adding)              { candidate_r = manifest.manifest_add_dep_table(a, source, spec); }
+    or                       { candidate_r = manifest.manifest_remove_dep_table(a, source, name); }
+    if (sel candidate_r.err) { ret err[fail.Fail].err{candidate_r.err}; }
+    val candidate: str = candidate_r.ok;
+    fin { str_free(a, candidate); }
+    if (!realize) { ret publish(op, mt_path, candidate, name, adding, quiet); }
+
+    val table_r: res[manifest.Doc, fail.Fail] = manifest.doc_parse(a, mt_path, candidate);
+    if (sel table_r.err) { ret err[fail.Fail].err{table_r.err}; }
+    var table: manifest.Doc = table_r.ok;
+    fin { manifest.doc_dnit(a, ?table); }
+    var known: Vector[package_closure.Request] = collections_vector.init[package_closure.Request](a);
+    fin { package_closure.free_requests(a, ?known); }
+    val preflight: err[fail.Fail] = package_closure.preflight(op, ?table, ?known, true, ?walk);
+    if (sel preflight.err) { ret preflight; }
+    val still_required: bool = !adding && package_closure.index(?known, name) >= 0;
+    if (still_required && purge) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_STILL_REQUIRED, "dependency is still required by the closure; cannot purge its checkout")}; }
+    var removing_git: bool = false;
+    if (!adding) {
+        val original_r: res[manifest.Doc, fail.Fail] = manifest.doc_parse(a, mt_path, source);
+        if (sel original_r.err) { ret err[fail.Fail].err{original_r.err}; }
+        var original:     manifest.Doc     = original_r.ok;
+        val declarations: opt[*toml.Table] = toml.get_table(?original.table, "dep");
+        if (sel declarations.some) {
+            val declaration: opt[*toml.Table] = toml.get_table(declarations.some, name);
+            if (sel declaration.some) { removing_git = !str_empty(package_closure.key_text(declaration.some, "git")); }
+        }
+        manifest.doc_dnit(a, ?original);
+    }
+    if (adding && spec.source == manifest.DEP_SOURCE_PATH) {
+        val destination_r: res[str, fail.Fail] = package.dep_full_of(a, op.root, name);
+        if (sel destination_r.err) { ret err[fail.Fail].err{package_closure.oom()}; }
+        val destination: str = destination_r.ok;
+        fin { str_free(a, destination); }
+        val exists_r:     res[bool, io_error.Error] = fs.exists(destination);
+        val is_symlink_r: res[bool, io_error.Error] = fs.is_symlink(destination);
+        if ((sel exists_r.ok && exists_r.ok))         { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_DESTINATION_EXISTS, "dependency destination already exists; existing checkout retained")}; }
+        if ((sel is_symlink_r.ok && is_symlink_r.ok)) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_DESTINATION_EXISTS, "dependency destination already exists; existing checkout retained")}; }
+    }
+    if (fail_after == 1) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_DESTINATION_EXISTS, "injected dependency preflight failure")}; }
+    var completed: str  = nil;
+    var success:   bool = false;
+    fin {
+        if (!success && completed != nil) {
+            report.effectf(op.rep, "note: dep/{}: {} before this failure; inspect Git and mach.toml before retrying", name, completed);
+        }
+    }
+
+    # a dependency added by path or by ref is realized first, so the ranges it declares
+    # are the closure's when they resolve; one added by range is a pick of that resolution
+    val fixed_add: bool = adding && (spec.source == manifest.DEP_SOURCE_PATH || spec.version == nil || str_empty(spec.version));
+    if (fixed_add) {
+        val placed: err[fail.Fail] = realize_added(op, mode, spec, name, quiet, offline, ?completed);
+        if (sel placed.err) { ret placed; }
+    }
+    val resolved: res[resolve.Resolution, fail.Fail] = resolve.versions(op, ?table, false, true, name, false, ?walk);
+    if (sel resolved.err) { ret err[fail.Fail].err{resolved.err}; }
+    if (!quiet)           { notes(op.rep, ?resolved.ok.notes); }
+    var picks: Vector[resolver.Choice] = resolved.ok.picks;
+
+    if (!adding) {
+        if (!still_required && removing_git) {
+            val ur: err[fail.Fail] = op.pins.drop(op.pins.ctx, op.root, name, mode, op.rep);
+            if (sel ur.err)                          { ret ur; }
+            if (mode == package_pin.REPOSITORY_ROOT) { completed = "removed the dependency registration; checkout retained"; }
+        }
+        if (purge) {
+            val removed: res[usize, fail.Fail] = purge_beneath(edit.root_fd, name);
+            if (sel removed.err) { ret err[fail.Fail].err{removed.err}; }
+            completed = "removed the dependency registration and purged its checkout";
+        }
+    }
+    or (!fixed_add) {
+        val placed: err[fail.Fail] = realize_picks(op, mode, ?picks, quiet, offline);
+        if (sel placed.err) { ret placed; }
+        completed = "realized the selected release";
+    }
+    if (fail_after == 2) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.GIT_COMMAND, "injected dependency realization failure")}; }
+
+    var closure: Vector[package_closure.Request] = collections_vector.init[package_closure.Request](a);
+    fin { package_closure.free_requests(a, ?closure); }
+    val pulled: err[fail.Fail] = package_closure.realize(op, ?closure, quiet, offline, false, ?table.table, ?picks);
+    if (sel pulled.err) { ret pulled; }
+    if (fail_after == 3) {
+        package_closure.effects(op, ?closure);
+        ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_WRITE, "injected dependency publication failure")};
+    }
+    val published: err[fail.Fail] = publish(op, mt_path, candidate, name, adding, quiet);
+    if (sel published.err) {
+        package_closure.effects(op, ?closure);
+        ret published;
+    }
+    success = true;
+    ret err[fail.Fail].ok{};
+}
+
+fun publish(op: *package_closure.Operation, mt_path: str, text: str, name: str, adding: bool, quiet: bool) err[fail.Fail] {
+    val w: err[fail.Fail] = output.replace(op.a, mt_path, text::*u8, str_len(text), 0o644);
+    if (sel w.err) { ret w; }
+    if (!quiet) {
+        if (adding) { report.linef(op.rep, op.a, "added [dep.{}]", name); }
+        or          { report.linef(op.rep, op.a, "removed [dep.{}]", name); }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+#[testing]
+pub fun purge_dependency_dir(a: *A.Allocator, root: str, name: str) res[usize, fail.Fail] {
+    if (!manifest.is_project_path(name)) { ret res[usize, fail.Fail].err{fail.user(diagnostic_kind.DEP_INVALID_PATH, "dependency removal requires a canonical path beneath dep")}; }
+    var root_fd: usize = system_os.INVALID_HANDLE;
+    val opened:  i64   = remove.open_path(root, ?root_fd);
+    if (opened < 0) { ret res[usize, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, system_os.error_message(opened))}; }
+    fin { system_os.close(root_fd); }
+    ret purge_beneath(root_fd, name);
+}
+
+pub fun purge_beneath(root_fd: usize, name: str) res[usize, fail.Fail] {
+    var fd:     usize = system_os.INVALID_HANDLE;
+    val opened: i64   = remove.open_dir(root_fd, driver_closure.DEP_DIR, ?fd);
+    if (system_os.error_kind(opened) == io_error.NOT_FOUND) { ret res[usize, fail.Fail].ok{0}; }
+    if (opened < 0)                                         { ret res[usize, fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_DIRECTORY, driver_closure.DEP_ROOT_REFUSED)}; }
+    fin { system_os.close(fd); }
+    val rr: remove.Removal = remove.relative(fd, name);
+    if (rr.failed) {
+        if (rr.containment) { ret res[usize, fail.Fail].err{fail.user(diagnostic_kind.DEP_PATH_ESCAPE, "dependency directory escapes the dependency root or is reached through a symlink; nothing was removed")}; }
+        ret res[usize, fail.Fail].err{fail.environment(diagnostic_kind.FS_REMOVE, remove.message(rr))};
+    }
+    ret res[usize, fail.Fail].ok{rr.removed};
+}
+
+# a refusal carries no native code, and a purge it stops is still an error
+test purge_beneath__a_removal_refusal_is_an_error {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val created: res[output_testing.Output, fail.Fail] = output_testing.create(?a, "mach-dep-refusal");
+    if (sel created.err) { ret 2; }
+    var owner: output_testing.Output = created.ok;
+    fin { output_testing.dnit(?owner); }
+    var root: usize = system_os.INVALID_HANDLE;
+    if (remove.open_path(owner.directory, ?root) < 0) { ret 3; }
+    fin { system_os.close(root); }
+    if (system_os.make_dir(root, "dep", 0o700) < 0 || system_os.make_dir(root, "dep/kept", 0o700) < 0) { ret 4; }
+    val long: str = remove.t_component(?a, 256);
+    if (long == nil) { ret 5; }
+    val too_long: res[usize, fail.Fail] = purge_beneath(root, long);
+    if (!sel too_long.err) { ret 6; }
+    val trailing: res[usize, fail.Fail] = purge_beneath(root, "kept/");
+    if (sel trailing.ok) { ret 7; }
+    val kept: res[usize, fail.Fail] = purge_beneath(root, "kept");
+    if (!(sel kept.ok && kept.ok > 0)) { ret 8; }
+    ret 0;
+}
+
+test dep_root_for__refuses_symlinked_dep_directory {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+
+    val res_temp: res[fs.TempFile, fs.FsError] = fs.temp_create(?a, "mach_test_dep_root_escape");
+    if (sel res_temp.err) { ret 1; }
+    var tf:   fs.TempFile = res_temp.ok;
+    val root: str         = fs.temp_path(?tf);
+    fs.temp_close_and_remove(?tf);
+
+    val proj:              str             = package_closure.concat3(?a, root, "/", "proj");
+    val outside:           str             = package_closure.concat3(?a, root, "/", "outside");
+    val create_dir_all_r2: err[fs.FsError] = fs.create_dir_all(?a, proj, 0o755);
+    val create_dir_all_r:  err[fs.FsError] = fs.create_dir_all(?a, outside, 0o755);
+    if (sel create_dir_all_r2.err) {
+        fs.remove_all(?a, root);
+        ret 1;
+    }
+    if (sel create_dir_all_r.err) {
+        fs.remove_all(?a, root);
+        ret 1;
+    }
+    val link:      str                 = package_closure.concat3(?a, proj, "/", "dep");
+    val symlink_r: err[io_error.Error] = fs.symlink(outside, link);
+    if (sel symlink_r.err) {
+        fs.remove_all(?a, root);
+        ret 1;
+    }
+
+    val res_dep_root: res[bool, fail.Fail]      = driver_closure.check_dep_root(proj);
+    val bad:          bool                      = sel res_dep_root.ok;
+    val purge_r:      res[usize, fail.Fail]     = purge_dependency_dir(?a, proj, "anything");
+    val purge_ok:     bool                      = sel purge_r.ok;
+    val exists_r:     res[bool, io_error.Error] = fs.exists(outside);
+    if (sel exists_r.err) { ret 99; }
+    val outside_kept: bool = (sel exists_r.ok && exists_r.ok);
+    fs.remove_all(?a, root);
+    if (bad || purge_ok || !outside_kept) { ret 1; }
+    ret 0;
+}
+
+test purge_dependency_dir__removes_only_a_contained_name_and_refuses_dotdot {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val res_temp: res[fs.TempFile, fs.FsError] = fs.temp_create(?a, "mach_test_dep_purge");
+    if (sel res_temp.err) { ret 1; }
+    var tf:   fs.TempFile = res_temp.ok;
+    val root: str         = fs.temp_path(?tf);
+    fs.temp_close_and_remove(?tf);
+
+    val proj:              str             = package_closure.concat3(?a, root, "/", "proj");
+    val outside:           str             = package_closure.concat3(?a, root, "/", "outside");
+    val depdir:            str             = package_closure.concat3(?a, proj, "/", "dep");
+    val libx:              str             = package_closure.concat3(?a, depdir, "/", "libx");
+    val create_dir_all_r2: err[fs.FsError] = fs.create_dir_all(?a, libx, 0o755);
+    val create_dir_all_r:  err[fs.FsError] = fs.create_dir_all(?a, outside, 0o755);
+    if (sel create_dir_all_r2.err) {
+        fs.remove_all(?a, root);
+        ret 1;
+    }
+    if (sel create_dir_all_r.err) {
+        fs.remove_all(?a, root);
+        ret 1;
+    }
+    val inner:          str             = package_closure.concat3(?a, libx, "/", "file.mach");
+    val sentinel:       str             = package_closure.concat3(?a, outside, "/", "sentinel");
+    val write_bytes_r2: err[fs.FsError] = fs.write_bytes(inner, "x"::*u8, 1, 0o644);
+    val write_bytes_r:  err[fs.FsError] = fs.write_bytes(sentinel, "s"::*u8, 1, 0o644);
+    if (sel write_bytes_r2.err) {
+        fs.remove_all(?a, root);
+        ret 1;
+    }
+    if (sel write_bytes_r.err) {
+        fs.remove_all(?a, root);
+        ret 1;
+    }
+
+    var bad:      i32                       = 0;
+    val dd:       res[usize, fail.Fail]     = purge_dependency_dir(?a, proj, "../../outside");
+    val exists_r: res[bool, io_error.Error] = fs.exists(sentinel);
+    if (sel exists_r.err)                               { ret 99; }
+    if (sel dd.ok || !(sel exists_r.ok && exists_r.ok)) { bad = 1; }
+    val dot:       res[usize, fail.Fail]     = purge_dependency_dir(?a, proj, ".");
+    val exists_r2: res[bool, io_error.Error] = fs.exists(inner);
+    if (sel exists_r2.err)                                 { ret 99; }
+    if (sel dot.ok || !(sel exists_r2.ok && exists_r2.ok)) { bad = 1; }
+    val missing: res[usize, fail.Fail] = purge_dependency_dir(?a, proj, "never");
+    if (!(sel missing.ok && missing.ok == 0)) { bad = 1; }
+    val ok:        res[usize, fail.Fail]     = purge_dependency_dir(?a, proj, "libx");
+    val exists_r3: res[bool, io_error.Error] = fs.exists(libx);
+    val exists_r4: res[bool, io_error.Error] = fs.exists(depdir);
+    if (!(sel ok.ok && ok.ok != 0))          { bad = 1; }
+    if (sel exists_r3.ok && exists_r3.ok)    { bad = 1; }
+    if (!(sel exists_r4.ok && exists_r4.ok)) { bad = 1; }
+
+    val nodep:             str             = package_closure.concat3(?a, root, "/", "nodep");
+    val create_dir_all_r3: err[fs.FsError] = fs.create_dir_all(?a, nodep, 0o755);
+    if (sel create_dir_all_r3.err) {
+        fs.remove_all(?a, root);
+        ret 1;
+    }
+    val absent: res[usize, fail.Fail] = purge_dependency_dir(?a, nodep, "libx");
+    if (!(sel absent.ok && absent.ok == 0)) { bad = 1; }
+
+    fs.remove_all(?a, root);
+    ret bad;
+}

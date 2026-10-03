@@ -1,11 +1,5 @@
 # mach.lang.be.linker.common
 
-## fun grow_cap
-
-```mach
-pub fun grow_cap[T](alloc: *A.Allocator, data: **T, cap: *u32, initial: u32) err[fail.Fail];
-```
-
 ## fun is_loadable_kind
 
 ```mach
