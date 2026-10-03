@@ -11,10 +11,10 @@ type checking, lowering and the link all read one value
 ## fun string_id
 
 ```mach
-pub fun string_id(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) opt[intern.StrId];
+pub fun string_id(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) intern.StrId;
 ```
 
-the string argument `ord` of `dec` evaluated to; none when it is not a constant string
+the string argument `ord` of `dec` evaluated to; STR_NIL when it is not a constant string
 
 ## fun string_of
 

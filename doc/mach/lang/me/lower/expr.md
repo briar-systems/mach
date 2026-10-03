@@ -15,7 +15,7 @@ pub fun lower_lit_str(ctx: *lower_context.LowerContext, e: *ast_expr.Expr) res[v
 ## fun symbol_linkage_name
 
 ```mach
-pub fun symbol_linkage_name(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) opt[intern.StrId];
+pub fun symbol_linkage_name(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) intern.StrId;
 ```
 
 ## fun references_function
