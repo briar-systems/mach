@@ -138,6 +138,16 @@ pub rec SemaDeps;
 the imported surfaces are borrowed: the driver owns each one and shares it
 between every importer in a pass
 
+## rec GrowthWatch
+
+```mach
+pub rec GrowthWatch;
+```
+
+who hears of a growing cycle's expansion: the module that declares it, the templates on
+it, and how many instances of it the module being typed has made so far; a nil
+`expanded` hears nothing
+
 ## fwd type.FieldEntry
 
 ```mach
@@ -154,28 +164,10 @@ fwd type.FieldTable
 
 forwards [`mach.lang.type.field.Table`](../../type/field.md#rec-table)
 
-## rec InstReq
-
-```mach
-pub rec InstReq;
-```
-
 ## val INST_NONE
 
 ```mach
-pub val INST_NONE: u32 = 4294967295
-```
-
-## val RECORD_OK
-
-```mach
-pub val RECORD_OK:          u8 = 0
-```
-
-## val RECORD_LIMIT_DEPTH
-
-```mach
-pub val RECORD_LIMIT_DEPTH: u8 = 1
+pub val INST_NONE: u32 = sema_instance.NONE
 ```
 
 ## rec InstWorklist
@@ -184,23 +176,8 @@ pub val RECORD_LIMIT_DEPTH: u8 = 1
 pub rec InstWorklist;
 ```
 
-## val SECRET_UNKNOWN
-
-```mach
-pub val SECRET_UNKNOWN: u8 = 0
-```
-
-## val SECRET_ABSENT
-
-```mach
-pub val SECRET_ABSENT:  u8 = 1
-```
-
-## val SECRET_PRESENT
-
-```mach
-pub val SECRET_PRESENT: u8 = 2
-```
+the instances a module's typing asks for, typed in the order they were first asked for;
+the set is the module's product, published with its result
 
 ## val TYPE_MEMO_NONE
 
@@ -331,10 +308,15 @@ pub fun decl_body_spreads_pack_to_c_variadic(sc: *SemaContext, origin: session.M
 ## fun record_instance
 
 ```mach
-pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: ast_id.DeclId,
-args: *type.TypeId, arg_len: u32, sig: type.TypeId,
-bare: intern.StrId, site: lang_source.Span) res[u8, fail.Fail];
+pub fun record_instance(sc: *SemaContext, item: sema_instance.Instance, eid: ast_id.ExprId) err[fail.Fail];
 ```
+
+an instance the walk asks for at `eid`: added to the module's set when new, and noted as
+what `eid` names in the walk's frame. an instance whose type arguments or pack still
+mention a type parameter is the template under other names: nothing in its body is
+settled until the caller is itself instantiated, and that caller's walk asks for the
+closed instance. `item` carries the kind, the declaration, its arguments, name,
+signature and site; the rest is the set's
 
 ## fun inst_worklist_new
 
@@ -353,6 +335,46 @@ pub fun inst_worklist_free(wl: *InstWorklist);
 ```mach
 pub fun inst_worklist_dnit(sc: *SemaContext);
 ```
+
+## fun expr_type_set
+
+```mach
+pub fun expr_type_set(sc: *SemaContext, eid: ast_id.ExprId, ty: type.TypeId);
+```
+
+the type the walk gives expression `eid`, recorded in its frame when the frame is not
+the module's own typing
+
+## fun decl_type_set
+
+```mach
+pub fun decl_type_set(sc: *SemaContext, did: ast_id.DeclId, ty: type.TypeId);
+```
+
+## fun walk_binds_values
+
+```mach
+pub fun walk_binds_values(sc: *SemaContext) bool;
+```
+
+the walk is typing a value instance, so the comptime parameters of the function it
+instantiates are bound
+
+## fun walk_binds_pack
+
+```mach
+pub fun walk_binds_pack(sc: *SemaContext) bool;
+```
+
+the walk is typing a pack instance, so the pack's element types are bound
+
+## fun gate_set
+
+```mach
+pub fun gate_set(sc: *SemaContext, cond: ast_id.ExprId, active: bool);
+```
+
+the verdict the walk gives a comptime gate in its frame
 
 ## fun decl_type_for
 
