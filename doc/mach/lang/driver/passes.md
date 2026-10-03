@@ -1,5 +1,24 @@
 # mach.lang.driver.passes
 
+## fun lower_scope_prepare
+
+```mach
+pub fun lower_scope_prepare(m: *project.ModuleEntry) err[fail.Fail];
+```
+
+the scope lowering binds a module's constants in, over what the load, resolve and sema bound
+over it, made on the first call and kept for as long as the module's syntax stands; each call
+sets the layers to the module's current products, so it runs only where nothing else reads them
+
+## fun lower_scope_of
+
+```mach
+pub fun lower_scope_of(m: *project.ModuleEntry) res[*comptime.ComptimeCtx, fail.Fail];
+```
+
+the lowering scope `lower_scope_prepare` made, read without writing it: a scope that was never
+made, or whose layers are not the module's current products, is a defect of the caller
+
 ## fun prepare_resolve_pass
 
 ```mach

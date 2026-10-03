@@ -25,7 +25,7 @@ declaration of its own, so a module-wide silence is a profile's `allow`
 ## fun key_of
 
 ```mach
-pub fun key_of(s: *session.Session, mid: session.ModuleId, eid: ast_id.ExprId) opt[str];
+pub fun key_of(s: *session.Session, ctx: *comptime.ComptimeCtx, eid: ast_id.ExprId) opt[str];
 ```
 
 the key an argument evaluates to; none when the argument is not a constant string
@@ -41,7 +41,7 @@ the span an argument occupies, where a refused or unfulfilled key is reported
 ## fun collect
 
 ```mach
-pub fun collect(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, source: str, ctx: *comptime.ComptimeCtx, checked: bool,
+pub fun collect(s: *session.Session, a: *ast.Ast, source: str, ctx: *comptime.ComptimeCtx, checked: bool,
 out: *Vector[diagnostic.Expectation]) err[fail.Fail];
 ```
 
@@ -49,9 +49,9 @@ every `#[expect]` key in the module, one expectation each
 
 a:       the parsed module
 source:  its text
-s:       the session whose attribute strings hold its keys
-mid:     the module
-ctx:     the comptime context whose gate decisions say which `$if` branch is taken
+s:       the session whose interner holds its keys
+ctx:     the comptime scope whose gate decisions say which `$if` branch is taken, over the load's
+         bindings that hold its keys
 checked: the module was type checked this build, or its warnings replayed
 out:     the list the expectations are appended to
 
