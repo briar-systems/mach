@@ -81,7 +81,7 @@ pub fun link_matches_target(itn: *intern.Interner, l: *LinkDef, t: *TargetDef) b
 whether a link's `os`, `isa` and `abi` filters all admit a target. an empty
 axis admits nothing, "*" everything
 
-itn: interns "*"
+itn: resolves the filter values
 l: the link
 t: the target
 ret: true when all three axes admit `t`
@@ -90,7 +90,7 @@ ret: true when all three axes admit `t`
 
 ```mach
 pub fun link_requirement(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef,
-proj_out: str, v: *TmplVars) res[LinkRequirement, fail.Fail];
+proj_out: str, v: *template.Values) res[LinkRequirement, fail.Fail];
 ```
 
 resolve a link entry for one target into a `LinkRequirement`. a local `path`
@@ -108,7 +108,7 @@ ret: the requirement; on error nothing is left allocated
 
 ```mach
 pub fun expand_local_path(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef,
-proj_out: str, v: *TmplVars) res[str, fail.Fail];
+proj_out: str, v: *template.Values) res[str, fail.Fail];
 ```
 
 expand a local link's `path` with `v`; a refusal points at the `path` value
