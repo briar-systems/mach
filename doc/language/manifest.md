@@ -1047,8 +1047,7 @@ The CLI selects and overrides at invocation time: `-p <name>` picks the
 profile; `-g` forces `debug` on for one build regardless of the profile's key
 (precedence `-g` > profile > off — there is no flag to force it off over a
 `debug = true` profile; edit the manifest or pick another profile). `-O0` and
-`-O2` override the profile's `opt` the same way; `-O1` is rejected (`-O1 was
-removed; use -O0 or -O2`).
+`-O2` override the profile's `opt` the same way, and there is no `-O1`.
 
 ## `[artifact.<name>]`
 
