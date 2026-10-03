@@ -12,6 +12,14 @@ pub rec Binding;
 a binding borrows every vtable from the registry it was resolved against;
 the borrow is live exactly while that registry stays published
 
+## fun reserved_gp_of
+
+```mach
+pub fun reserved_gp_of(arch: *isa.RegMachine, os: *lang_target_os.OsVTable, arch_id: u32) u32;
+```
+
+the reserved general registers of `arch` under `os`, resolved once with the binding
+
 ## fun live
 
 ```mach

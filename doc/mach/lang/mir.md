@@ -1310,7 +1310,8 @@ names its result lane in bits 0..27 of its vec_lane and its
 operand lane in bits 28..31: bit 31 is set for a float operand and bits
 28..30 hold log2 of the operand element bytes plus one, zero for a value
 that is not a conversion. these accessors are the only readers and writers
-of the operand bits
+of the operand bits. an operand lane is 1, 2, 4 or 8 bytes, the precondition
+every caller meets, so another width is a caller's broken precondition
 
 ## fun vec_lane_is_convert
 
@@ -1362,6 +1363,17 @@ the most lanes a debug location describes; a wider value binds no location
 ```mach
 pub rec MirBlock;
 ```
+
+a block's successors are its terminator's block operands; its predecessors
+are not stored, they are read from the control-flow graph mir.flow builds
+
+## fun block_empty
+
+```mach
+pub fun block_empty(id: u32) MirBlock;
+```
+
+a block named `id` holding nothing
 
 ## rec MirVReg
 
@@ -1538,8 +1550,11 @@ pub fun opcode_name(op: MirOpcode) str;
 
 ```mach
 pub fun instr_refusal(alloc: *A.Allocator, srcmap: *lang_source.SourceMap,
-fn_name: str, mi: *MirInstr, what: str) str;
+fn_name: str, mi: *MirInstr, what: str) res[str, fail.Fail];
 ```
+
+the text of a refusal of `mi` in the function `fn_name`, naming the
+instruction and where it came from, or the failure that refused to make it
 
 ## rec MirModule
 
@@ -1724,6 +1739,66 @@ pub fun op_sym(sym: intern.StrId, sym_off: i64) MirOperand;
 ```mach
 pub fun op_block(block: u32) MirOperand;
 ```
+
+## fun block_add
+
+```mach
+pub fun block_add(a: *A.Allocator, f: *MirFunction, id: u32) res[u32, fail.Fail];
+```
+
+appends an empty block named `id`, answering its position
+
+## fun instr_reserve
+
+```mach
+pub fun instr_reserve(a: *A.Allocator, mb: *MirBlock) err[fail.Fail];
+```
+
+room for one more instruction in `mb`
+
+## fun instr_add
+
+```mach
+pub fun instr_add(a: *A.Allocator, mb: *MirBlock, mi: MirInstr) err[fail.Fail];
+```
+
+## fun instr_add_at
+
+```mach
+pub fun instr_add_at(a: *A.Allocator, mb: *MirBlock, at: u32, mi: MirInstr) err[fail.Fail];
+```
+
+inserts `mi` before the instruction at `at`, or at the end when `at` is the count
+
+## fun instr_del
+
+```mach
+pub fun instr_del(mb: *MirBlock, at: u32);
+```
+
+removes the instruction at `at`, which owns nothing the caller has not taken
+
+## fun vreg_add
+
+```mach
+pub fun vreg_add(a: *A.Allocator, f: *MirFunction, class: u32, vec_bytes: u8, secret: bool) res[VRegId, fail.Fail];
+```
+
+## fun vreg_add_like
+
+```mach
+pub fun vreg_add_like(a: *A.Allocator, f: *MirFunction, like: u32) res[u32, fail.Fail];
+```
+
+a new virtual register of the class, shape, secrecy and type of `like`
+
+## fun operand_same
+
+```mach
+pub fun operand_same(a: *MirOperand, b: *MirOperand) bool;
+```
+
+whether two operands name the same register, virtual or physical
 
 ## fun vreg_is_fp
 

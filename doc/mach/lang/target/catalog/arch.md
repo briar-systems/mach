@@ -70,12 +70,14 @@ pub fun id_for(name: str) u32;
 ## fun float_absence_note
 
 ```mach
-pub fun float_absence_note(name: str) str;
+pub fun float_absence_note(name: str) res[opt[str], fail.Fail];
 ```
 
 why a selection has no floating-point unit, for a diagnostic that already names
-the selection: the letters a RISC-V string would need, or empty when the name
-carries no extension vocabulary the front end could ask the user to add
+the selection: the letters a RISC-V string would need, or none when the name
+carries no extension vocabulary the front end could ask the user to add. the
+name is the selection the target was resolved from, so one that does not
+parse is the failure that refused it
 
 ## fun name_for
 
