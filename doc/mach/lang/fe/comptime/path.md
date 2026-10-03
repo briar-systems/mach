@@ -246,3 +246,65 @@ pub fun unknown(source: str, stack: *lang_source.Span, depth: u32) str;
 
 the refusal of a path no row matches; nil when its root names no family
 
+## val COMPTIME_BARE_IDENT_MSG
+
+```mach
+pub val COMPTIME_BARE_IDENT_MSG: str =
+"comptime parameters are referenced without `$`
+```
+
+## fun eval_path
+
+```mach
+pub fun eval_path(
+c: *comptime_scope.ComptimeCtx,
+a: *ast.Ast,
+source: str,
+e: ast_id.ExprId,
+interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail];
+```
+
+## fun resolve_comptime_path
+
+```mach
+pub fun resolve_comptime_path(c: *comptime_scope.ComptimeCtx, source: str, stack: *lang_source.Span, depth: u32, interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail];
+```
+
+## fun os_tag_for
+
+```mach
+pub fun os_tag_for(name: View) res[u32, fail.Fail];
+```
+
+## fun arch_tag_for
+
+```mach
+pub fun arch_tag_for(name: View) res[u32, fail.Fail];
+```
+
+## fun abi_tag_for
+
+```mach
+pub fun abi_tag_for(name: View) res[u32, fail.Fail];
+```
+
+## val MODE_DEBUG
+
+```mach
+pub val MODE_DEBUG:   u32 = 0
+```
+
+## val MODE_RELEASE
+
+```mach
+pub val MODE_RELEASE: u32 = 1
+```
+
+## val MODE_COUNT
+
+```mach
+pub val MODE_COUNT: usize           = 2
+```
+
+the `$mach.mode.*` tags, each at its mode's value
+

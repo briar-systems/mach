@@ -298,7 +298,7 @@ pub fun lower_type(lc: *LowerContext, tid: type.TypeId) res[ir_type.IrTypeId, fa
 
 ```mach
 pub fun gate_is_active(lc: *LowerContext, source: str, cond: ast_id.ExprId,
-scope: comptime.GateScope, cache: bool) res[bool, fail.Fail];
+scope: comptime_gate.GateScope, cache: bool) res[bool, fail.Fail];
 ```
 
 ## fun block_terminated
