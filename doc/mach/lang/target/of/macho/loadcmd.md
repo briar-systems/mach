@@ -61,13 +61,6 @@ pub fun write_segment_cmd(buf: *u8, off: usize, name: str, vmaddr: u64, vmsize: 
 fileoff: u64, filesize: u64, maxprot: u32, initprot: u32, nsects: u32) usize;
 ```
 
-## fun write_section_64
-
-```mach
-pub fun write_section_64(buf: *u8, off: usize, sectname: str, segname: str, addr: u64, size: u64,
-fileoff: u32, align: u32, flags: u32) usize;
-```
-
 ## fun frame_cmd_count
 
 ```mach

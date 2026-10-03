@@ -6,12 +6,6 @@
 pub fun lower_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[value.Value, fail.Fail];
 ```
 
-## fun lower_lvalue
-
-```mach
-pub fun lower_lvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[value.Value, fail.Fail];
-```
-
 ## fun lower_lit_str
 
 ```mach
@@ -70,26 +64,6 @@ the aggregate copy is overlap-safe, so no snapshot sits between them (#4235, #42
 pub fun condition_value(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: value.Value) res[value.Value, fail.Fail];
 ```
 
-## fun case_descriptor_index
-
-```mach
-pub fun case_descriptor_index(ctx: *lower_context.LowerContext, desc_eid: ast_id.ExprId) res[u32, fail.Fail];
-```
-
-the case ordinal a comptime case descriptor names; type checking already tied it to this tag
-
-## fun literal_head_case
-
-```mach
-pub fun literal_head_case(ctx: *lower_context.LowerContext, tid: ast_id.TypeId) token.Span;
-```
-
-## fun literal_head_case_desc
-
-```mach
-pub fun literal_head_case_desc(ctx: *lower_context.LowerContext, tid: ast_id.TypeId) ast_id.ExprId;
-```
-
 ## fun literal_head_case_index
 
 ```mach
@@ -115,19 +89,6 @@ pub fun const_value_of_init(ctx: *lower_context.LowerContext, eid: ast_id.ExprId
 ```mach
 pub fun type_is_volatile_record(ctx: *lower_context.LowerContext, sem_ty: type.TypeId) bool;
 ```
-
-## fun access_is_volatile
-
-```mach
-pub fun access_is_volatile(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) bool;
-```
-
-volatility is a property of the storage an access is rooted in. the chain of
-member, projection and index steps is walked to the object it reads or writes,
-and any volatile nominal along it, the node's own type included, marks the
-access; an indirection ends the chain at its pointee, so a pointer field of a
-volatile record reaches ordinary storage and a raw scalar pointer is never
-volatile. one predicate for every access form, load and store alike
 
 ## fun field_index_in_type
 

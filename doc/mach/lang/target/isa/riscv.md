@@ -18,54 +18,6 @@ pub val X0:  i32 = 0
 pub val X1:  i32 = 1
 ```
 
-## val X2
-
-```mach
-pub val X2:  i32 = 2
-```
-
-## val X3
-
-```mach
-pub val X3:  i32 = 3
-```
-
-## val X4
-
-```mach
-pub val X4:  i32 = 4
-```
-
-## val X5
-
-```mach
-pub val X5:  i32 = 5
-```
-
-## val X6
-
-```mach
-pub val X6:  i32 = 6
-```
-
-## val X7
-
-```mach
-pub val X7:  i32 = 7
-```
-
-## val X8
-
-```mach
-pub val X8:  i32 = 8
-```
-
-## val X28
-
-```mach
-pub val X28: i32 = 28
-```
-
 ## val X29
 
 ```mach
@@ -112,18 +64,6 @@ pub val TP:   i32 = X4
 
 ```mach
 pub val FP:   i32 = X8
-```
-
-## val T0
-
-```mach
-pub val T0: i32 = X5
-```
-
-## val T1
-
-```mach
-pub val T1: i32 = X6
 ```
 
 ## val T2

@@ -1,11 +1,5 @@
 # mach.lang.target.of
 
-## val OF_UNKNOWN
-
-```mach
-pub val OF_UNKNOWN: u32 = 0
-```
-
 ## val OF_ELF
 
 ```mach
@@ -282,12 +276,6 @@ pub val RK_GOT_PAGE21:         RelocKind = 19
 pub val RK_GOT_LO12:           RelocKind = 20
 ```
 
-## val RK_ABS16
-
-```mach
-pub val RK_ABS16:              RelocKind = 21
-```
-
 ## val RK_GOTPCREL_NORELAX
 
 ```mach
@@ -346,30 +334,11 @@ a 64-bit field holding the target's distance from the field
 pub val RK_CATALOG_COUNT: u32 = 30
 ```
 
-## rec RelocKindDesc
-
-```mach
-pub rec RelocKindDesc;
-```
-
-one row per relocation kind, indexed by the kind: its display name and, for a
-difference kind, the kind the resolved difference is applied as (every other
-row applies as itself). adding a kind is adding a row; a kind without a row
-is outside the catalog and every lookup below refuses it
-
 ## fun reloc_kind_valid
 
 ```mach
 pub fun reloc_kind_valid(kind: RelocKind) bool;
 ```
-
-## fun reloc_desc
-
-```mach
-pub fun reloc_desc(kind: RelocKind) opt[*RelocKindDesc];
-```
-
-the row for a declared kind, absent for a member outside the catalog
 
 ## fun is_difference
 
@@ -950,14 +919,6 @@ pub rec BaseReloc;
 pub rec DynamicInfo;
 ```
 
-## rec TableSpan
-
-```mach
-pub rec TableSpan;
-```
-
-where a table the linker reserved for a format lies in the image
-
 ## rec TableShape
 
 ```mach
@@ -967,23 +928,6 @@ pub rec TableShape;
 what a table a format asks the linker to reserve takes: the linker lays it out
 under this section name before it gives anything an address, so the code
 reaches it whatever data the image carries
-
-## def StubShapeFn
-
-```mach
-pub def StubShapeFn: fun(u32, u32) res[TableShape, fail.Fail]
-```
-
-the call-stub table for a count of imported functions, at the end of the code
-
-## def GotShapeFn
-
-```mach
-pub def GotShapeFn: fun(u32, *DynamicInfo) res[TableShape, fail.Fail]
-```
-
-the import GOT for the imports of a dynamic link, at the end of the read-only
-data; an empty shape when no import needs a slot
 
 ## rec UnwindShape
 
@@ -1004,16 +948,6 @@ what the link's foreign objects bring to its unwind tables, measured before
 layout: the bytes of their own frame descriptions, which the frames table
 carries first, the entries among them that describe a function, and the
 functions their unwind index describes
-
-## def UnwindShapeFn
-
-```mach
-pub def UnwindShapeFn: fun(u32, *FrameUnwind, u32, *ForeignUnwind) res[UnwindShape, fail.Fail]
-```
-
-the unwind tables for the frame records a link keeps and what its foreign
-objects bring, at the end of the code, sized from the records' steps and the
-foreign measure alone so the linker reserves them before layout
 
 ## rec PltFixup
 
@@ -1327,12 +1261,6 @@ against what the target can link at all, never against the extensions it selects
 pub rec ElfAttributes;
 ```
 
-## rec ElfRelocationCapabilities
-
-```mach
-pub rec ElfRelocationCapabilities;
-```
-
 ## rec BranchReach
 
 ```mach
@@ -1389,73 +1317,16 @@ pub rec RelocationCapabilities;
 pub rec ObjectTarget;
 ```
 
-## def WriterFn
-
-```mach
-pub def WriterFn: fun(*ObjectTarget, *ObjectImage, str) err[fail.Fail]
-```
-
-## def ParserFn
-
-```mach
-pub def ParserFn: fun(*A.Allocator, *intern.Interner, *u8, usize, *ObjectImage) err[fail.Fail]
-```
-
-## def ExecFn
-
-```mach
-pub def ExecFn: fun(*A.Allocator, *intern.Interner, *ObjectTarget, *LoadSegment, u32, u64, u64, u64,
-*ExecFunction, u32, *Section, u32, *Section, u32,
-*SymtabEntry, u32,
-str, *u8, ImageOptions) err[fail.Fail]
-```
-
-## def DynExecFn
-
-```mach
-pub def DynExecFn: fun(*A.Allocator, *intern.Interner, *ObjectTarget, *LoadSegment, u32, u64, u64, u64,
-*ExecFunction, u32, *DynamicInfo, *PltFixup, u32,
-*Section, u32, *Section, u32,
-*SymtabEntry, u32,
-str, *u8, ImageOptions) err[fail.Fail]
-```
-
-## def SharedFn
-
-```mach
-pub def SharedFn: fun(*A.Allocator, *intern.Interner, *ObjectTarget, *LoadSegment, u32, u64,
-*ExecFunction, u32, *ExportSym, u32, *DynamicInfo, *Section, u32,
-*SymtabEntry, u32, str, ImageOptions) err[fail.Fail]
-```
-
 ## rec ExecutableSectionLocation
 
 ```mach
 pub rec ExecutableSectionLocation;
 ```
 
-## def ExecutableSectionLocationFn
-
-```mach
-pub def ExecutableSectionLocationFn: fun(u64, u64, u32) ExecutableSectionLocation
-```
-
 ## rec HeaderShape
 
 ```mach
 pub rec HeaderShape;
-```
-
-## def HeaderSpanFn
-
-```mach
-pub def HeaderSpanFn: fun(*HeaderShape, u64) u64
-```
-
-## def ExecImageFn
-
-```mach
-pub def ExecImageFn: fun(*A.Allocator, *LoadSegment, u32, u64, *u64, *usize) res[*u8, fail.Fail]
 ```
 
 ## rec OfVTable
@@ -1613,22 +1484,6 @@ pub val DBG_DWARF:    u32 = 1
 pub val DBG_SPIRV:    u32 = 3
 ```
 
-## def DebugShape
-
-```mach
-pub def DebugShape: u8
-```
-
-how a debug model reaches its format
-
-## val DEBUG_SHAPE_SECTIONS
-
-```mach
-pub val DEBUG_SHAPE_SECTIONS: DebugShape = 0
-```
-
-appends its own sections to a finished object image from address-keyed rows, through produce
-
 ## val DEBUG_SHAPE_MODULE
 
 ```mach
@@ -1641,18 +1496,6 @@ written by a whole-module emitter as it builds the module, so it declares no pro
 
 ```mach
 pub rec DebugProduceRequest;
-```
-
-## def DebugProduceFn
-
-```mach
-pub def DebugProduceFn:  fun(*DebugProduceRequest) err[fail.Fail]
-```
-
-## def DebugSupportsFn
-
-```mach
-pub def DebugSupportsFn: fun(*debug_input.DebugTarget) bool
 ```
 
 ## rec DebugVTable
@@ -1681,14 +1524,6 @@ pub fun debug_shape_for(vt: *OfVTable) DebugShape;
 
 a format whose object is the finished artifact takes its debug model from the emitter that
 builds it, and a format of linkable objects takes one that appends sections
-
-## fun debug_hooks_declared
-
-```mach
-pub fun debug_hooks_declared(vt: *DebugVTable) bool;
-```
-
-a sections model names its producer and a module model names none; both declare compatibility
 
 ## rec DebugRegistry
 

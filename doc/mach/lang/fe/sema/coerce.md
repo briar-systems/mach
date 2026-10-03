@@ -1,17 +1,5 @@
 # mach.lang.fe.sema.coerce
 
-## def CoerceKind
-
-```mach
-pub def CoerceKind: u8
-```
-
-## val COERCE_NOT_APPLICABLE
-
-```mach
-pub val COERCE_NOT_APPLICABLE: CoerceKind = 0
-```
-
 ## val COERCE_COERCED
 
 ```mach

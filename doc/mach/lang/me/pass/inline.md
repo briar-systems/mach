@@ -1,11 +1,5 @@
 # mach.lang.me.pass.inline
 
-## rec InlineBudget
-
-```mach
-pub rec InlineBudget;
-```
-
 ## fun run_in
 
 ```mach

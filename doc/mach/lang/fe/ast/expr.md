@@ -306,46 +306,6 @@ pub val UN_DEREF:   UnOp = 4
 pub val LIT_SUFFIX_NONE: type.TypeKind = 0xFF
 ```
 
-## rec ExprIdent
-
-```mach
-pub rec ExprIdent;
-```
-
-an identifier, or a `$name` comptime identifier whose `tok` covers the `$` and the name
-
-## rec ExprLitInt
-
-```mach
-pub rec ExprLitInt;
-```
-
-## rec ExprLitFloat
-
-```mach
-pub rec ExprLitFloat;
-```
-
-## rec ExprLitChar
-
-```mach
-pub rec ExprLitChar;
-```
-
-## rec ExprLitStr
-
-```mach
-pub rec ExprLitStr;
-```
-
-a string literal: `tok` covers the quotes
-
-## rec ExprLitNil
-
-```mach
-pub rec ExprLitNil;
-```
-
 ## fun lit_str_content
 
 ```mach

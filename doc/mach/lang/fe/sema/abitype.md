@@ -18,24 +18,6 @@ pub def ReadStatus: u8
 pub val READ_OK:      ReadStatus = 0
 ```
 
-## val READ_REFUSED
-
-```mach
-pub val READ_REFUSED: ReadStatus = 1
-```
-
-## rec Read
-
-```mach
-pub rec Read;
-```
-
-## fun decorator_of
-
-```mach
-pub fun decorator_of(sc: *sema_context.SemaContext, d: *ast_decl.Decl) *ast_decl.Decorator;
-```
-
 ## fun declares_abi_type
 
 ```mach

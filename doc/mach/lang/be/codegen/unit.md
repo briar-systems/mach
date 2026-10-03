@@ -1,11 +1,5 @@
 # mach.lang.be.codegen.unit
 
-## def UnitModule
-
-```mach
-pub def UnitModule: unit_input.UnitModule
-```
-
 ## val UNIT_NONE
 
 ```mach

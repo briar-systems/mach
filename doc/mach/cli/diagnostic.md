@@ -58,18 +58,6 @@ render_fail for a failure built in place
 f: the Fail
 ret: the exit code `exit.of` maps the failure to
 
-## fun outcome_code_w
-
-```mach
-pub fun outcome_code_w(w: *io_writer.Writer, bo: *outcome.BuildOutcome) i64;
-```
-
-map a build outcome's severity to the process exit code
-
-bo: the outcome
-ret: the shared exit code of the severity; a severity outside the catalog
-is an internal failure written to `w` naming the catalog and the tag
-
 ## fun outcome_code
 
 ```mach
@@ -196,14 +184,4 @@ the report's arena is released either way
 r: the command's report
 code: the exit code the command returns
 ret: code
-
-## val SCHEMA_VERSION
-
-```mach
-pub val SCHEMA_VERSION: i64 = 1
-```
-
-the version every json record carries in `schema`. adding a field, a record
-type or a value of an enumerated field keeps it; changing or removing one
-bumps it (doc/language/diagnostics-json.md)
 

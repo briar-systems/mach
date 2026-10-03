@@ -63,12 +63,6 @@ pub fun select_target(p: *project.Project, t: *project.TargetEntry) err[outcome.
 pub fun wildcard_match(pat: str, name: str) bool;
 ```
 
-## fun validate_contained_ancestors
-
-```mach
-pub fun validate_contained_ancestors(alloc: *A.Allocator, root: str, rel: str, label: str) err[outcome.Fail];
-```
-
 ## fun glob_shape_ok
 
 ```mach

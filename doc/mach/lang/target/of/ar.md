@@ -1,11 +1,5 @@
 # mach.lang.target.of.ar
 
-## rec Member
-
-```mach
-pub rec Member;
-```
-
 ## rec Step
 
 ```mach

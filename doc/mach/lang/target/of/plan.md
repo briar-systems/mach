@@ -1,17 +1,5 @@
 # mach.lang.target.of.plan
 
-## rec FileUnit
-
-```mach
-pub rec FileUnit;
-```
-
-## rec Region
-
-```mach
-pub rec Region;
-```
-
 ## rec FilePlan
 
 ```mach

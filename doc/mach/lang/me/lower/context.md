@@ -1,57 +1,9 @@
 # mach.lang.me.lower.context
 
-## val MAX_VALUE_INSTANCES
-
-```mach
-pub val MAX_VALUE_INSTANCES: u32 = 4096
-```
-
-## val MAX_PACK_INSTANCES
-
-```mach
-pub val MAX_PACK_INSTANCES: u32 = 8192
-```
-
-## val INSTANCE_NONE
-
-```mach
-pub val INSTANCE_NONE: u32 = 4294967295
-```
-
-## val MAX_INSTANCE_DEPTH
-
-```mach
-pub val MAX_INSTANCE_DEPTH: u32 = 32
-```
-
-## val MAX_INSTANCES
-
-```mach
-pub val MAX_INSTANCES: u32 = 8192
-```
-
 ## rec LoopFrame
 
 ```mach
 pub rec LoopFrame;
-```
-
-## rec Instance
-
-```mach
-pub rec Instance;
-```
-
-## rec ValueInstance
-
-```mach
-pub rec ValueInstance;
-```
-
-## rec PackInstance
-
-```mach
-pub rec PackInstance;
 ```
 
 ## rec NormalObject
@@ -125,12 +77,6 @@ pub rec LowerRequest;
 
 ```mach
 pub rec LowerContext;
-```
-
-## fun scope_nil
-
-```mach
-pub fun scope_nil() ModuleScope;
 ```
 
 ## fun module_scope
@@ -404,12 +350,6 @@ sema records the template's and every type decision here is made against this in
 
 ```mach
 pub fun expr_float_width(lc: *LowerContext, eid: ast_id.ExprId) float.FloatWidth;
-```
-
-## fun float_width_of_type
-
-```mach
-pub fun float_width_of_type(lc: *LowerContext, tid: type.TypeId) float.FloatWidth;
 ```
 
 ## fun expr_is_secret

@@ -14,12 +14,6 @@ whole width. a range reads its value as unsigned at the value's own width,
 and UNBOUNDED as its top means no bound below 2^64 - 1, which includes a
 value wider than 64 bits whose bound does not fit
 
-## val UNBOUNDED
-
-```mach
-pub val UNBOUNDED: u64 = 0xFFFFFFFFFFFFFFFF
-```
-
 ## rec Range
 
 ```mach
@@ -50,14 +44,6 @@ of it; `la` outlives the analysis
 ```mach
 pub fun dnit(ra: *RangeAnalysis);
 ```
-
-## fun range_at
-
-```mach
-pub fun range_at(ra: *RangeAnalysis, v: value.Value, at: ir_id.BlockId) Range;
-```
-
-the values `v` holds wherever block `at` reads it
 
 ## fun below
 

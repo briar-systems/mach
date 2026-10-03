@@ -6,20 +6,6 @@
 pub rec Version;
 ```
 
-## val MAX_RANGE_CLAUSES
-
-```mach
-pub val MAX_RANGE_CLAUSES: u32 = 16
-```
-
-## rec Bound
-
-```mach
-pub rec Bound;
-```
-
-one closed or open end of the interval a range denotes
-
 ## rec Range
 
 ```mach
@@ -33,12 +19,6 @@ releases whose pre-releases it names
 
 ```mach
 pub rec RangeError;
-```
-
-## def ClauseOp
-
-```mach
-pub def ClauseOp: u8
 ```
 
 ## fun parse_version

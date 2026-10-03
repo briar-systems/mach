@@ -9,15 +9,6 @@ string for each distinct selector, so the reference resolves and dead-strips
 like any definition. the stub reaches objc_msgSend through its GOT slot, so the
 import is attributed the way a plain `objc_msgSend` call is
 
-## fun makes_objc_stubs
-
-```mach
-pub fun makes_objc_stubs(tgt: *lang_target.Target, mode: LinkMode) bool;
-```
-
-whether this link makes selector stubs at all: a Mach-O executable or shared
-image for an instruction set the stubs are written for
-
 ## fun synthesize_objc_stubs
 
 ```mach

@@ -48,12 +48,6 @@ pub rec FieldRef;
 pub val CT_KIND_PACK_ELEM: CTKind = 5
 ```
 
-## rec PackElemRef
-
-```mach
-pub rec PackElemRef;
-```
-
 ## val CT_KIND_CONST_ELEM
 
 ```mach
@@ -149,33 +143,6 @@ pub val GATE_AWAITING_PHASE:    GateOutcome = 4
 pub val GATE_AWAITING_INSTANCE: GateOutcome = 5
 ```
 
-## rec ConstElemRef
-
-```mach
-pub rec ConstElemRef;
-```
-
-## val COMPTIME_BARE_IDENT_MSG
-
-```mach
-pub val COMPTIME_BARE_IDENT_MSG: str =
-"comptime parameters are referenced without `$`
-```
-
-## val COMPTIME_IDENT_UNBOUND_MSG
-
-```mach
-pub val COMPTIME_IDENT_UNBOUND_MSG: str =
-"identifier is not a comptime constant in scope"
-```
-
-## val COMPTIME_LAYOUT_NO_RESOLVER_MSG
-
-```mach
-pub val COMPTIME_LAYOUT_NO_RESOLVER_MSG: str =
-"a layout intrinsic is only comptime-evaluable after type checking: an arm of this `$if` declares something, so the gate selects DECLARATIONS and is decided during name resolution, before any type is laid out. a `$if` whose every arm declares nothing is decided during type checking and can measure a type"
-```
-
 ## rec CTValue
 
 ```mach
@@ -190,27 +157,6 @@ sees the same i64 it always did (#3511)
 
 ```mach
 pub rec NamedConst;
-```
-
-## val COMPTIME_MEMBER_NO_RESOLVER_MSG
-
-```mach
-pub val COMPTIME_MEMBER_NO_RESOLVER_MSG: str =
-"a module-qualified member path is only comptime-evaluable after name resolution"
-```
-
-## val COMPTIME_TYPE_NO_RESOLVER_MSG
-
-```mach
-pub val COMPTIME_TYPE_NO_RESOLVER_MSG: str =
-"a type comparison is only comptime-evaluable after type checking"
-```
-
-## val COMPTIME_TYPE_UNRESOLVED_MSG
-
-```mach
-pub val COMPTIME_TYPE_UNRESOLVED_MSG: str =
-"type comparison operand does not name a type"
 ```
 
 ## val COMPTIME_TYPE_NEEDS_INSTANCE_MSG
@@ -260,55 +206,6 @@ pub val FIELD_SEL_CODE:         u8 = 5
 
 ```mach
 pub val FIELD_SEL_TYPE_BY_NAME: u8 = 6
-```
-
-## val COMPTIME_SEL_NOT_CONSTANT_MSG
-
-```mach
-pub val COMPTIME_SEL_NOT_CONSTANT_MSG: str =
-"`sel` at compile time tests a constant tag: a module `val` constructed as `Type.case;
-```
-
-## val COMPTIME_SEL_DESCRIPTOR_NEEDS_TYPES_MSG
-
-```mach
-pub val COMPTIME_SEL_DESCRIPTOR_NEEDS_TYPES_MSG: str =
-"a case descriptor names its case only once the tag's fields are known, so this `sel` is decided during type checking"
-```
-
-## val COMPTIME_CASE_DESCRIPTOR_OPERAND_MSG
-
-```mach
-pub val COMPTIME_CASE_DESCRIPTOR_OPERAND_MSG: str =
-"a bracketed case operand is not a comptime case descriptor"
-```
-
-## val COMPTIME_CASE_PAYLOAD_MISSING_MSG
-
-```mach
-pub val COMPTIME_CASE_PAYLOAD_MISSING_MSG: str =
-"this tag case takes no payload"
-```
-
-## val COMPTIME_IDENT_RUNTIME_MSG
-
-```mach
-pub val COMPTIME_IDENT_RUNTIME_MSG: str =
-"identifier names a runtime binding, so it has no comptime value"
-```
-
-## val COMPTIME_ALIAS_FLOAT_MSG
-
-```mach
-pub val COMPTIME_ALIAS_FLOAT_MSG: str =
-"the width of a float constant whose type comes through an alias is not readable before type checking, so it has no comptime value here. spell the type as `f32` or `f64` on the declaration to fold it at this position"
-```
-
-## val FLOAT_WIDTH_MISMATCH_MSG
-
-```mach
-pub val FLOAT_WIDTH_MISMATCH_MSG: str =
-"float operands have different declared widths
 ```
 
 ## val TYPE_QUERY_IS_RECORD
@@ -363,48 +260,6 @@ pub val TYPE_QUERY_IS_FLOAT:     u8 = 7
 
 ```mach
 pub val TYPE_QUERY_HOLDS_SECRET: u8 = 8
-```
-
-## def PhaseCapabilityKind
-
-```mach
-pub def PhaseCapabilityKind: u8
-```
-
-## val PHASE_CAP_NONE
-
-```mach
-pub val PHASE_CAP_NONE:           PhaseCapabilityKind = 0
-```
-
-## val PHASE_CAP_LOADING
-
-```mach
-pub val PHASE_CAP_LOADING:        PhaseCapabilityKind = 1
-```
-
-## val PHASE_CAP_RESOLUTION
-
-```mach
-pub val PHASE_CAP_RESOLUTION:     PhaseCapabilityKind = 2
-```
-
-## val PHASE_CAP_SEMANTIC_NAMES
-
-```mach
-pub val PHASE_CAP_SEMANTIC_NAMES: PhaseCapabilityKind = 3
-```
-
-## val PHASE_CAP_SEMANTIC_TYPES
-
-```mach
-pub val PHASE_CAP_SEMANTIC_TYPES: PhaseCapabilityKind = 4
-```
-
-## val PHASE_CAP_LOWERING
-
-```mach
-pub val PHASE_CAP_LOWERING:       PhaseCapabilityKind = 5
 ```
 
 ## rec NoCapabilityContext
@@ -482,20 +337,6 @@ ident: fun(*T, ast_id.ExprId) bool,
 expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
 ```
 
-## val COMPTIME_TYPE_QUERY_NO_RESOLVER_MSG
-
-```mach
-pub val COMPTIME_TYPE_QUERY_NO_RESOLVER_MSG: str =
-"a comptime type predicate is only evaluable after type checking"
-```
-
-## val COMPTIME_FIELD_NO_RESOLVER_MSG
-
-```mach
-pub val COMPTIME_FIELD_NO_RESOLVER_MSG: str =
-"a field descriptor member is only comptime-evaluable after type checking"
-```
-
 ## val COMPTIME_FIELD_UNKNOWN_MEMBER_MSG
 
 ```mach
@@ -524,30 +365,10 @@ pub val COMPTIME_CASE_NO_PAYLOAD_MSG: str =
 "this case has no payload, so it has no `.type` or `.offset`
 ```
 
-## val COMPTIME_FIELD_UNAVAILABLE_MSG
-
-```mach
-pub val COMPTIME_FIELD_UNAVAILABLE_MSG: str =
-"this field descriptor member is not available until lowering"
-```
-
-## val COMPTIME_MEMBER_NOT_CONST_MSG
-
-```mach
-pub val COMPTIME_MEMBER_NOT_CONST_MSG: str =
-"module-qualified member does not name a module-level constant"
-```
-
 ## def EvalFailKind
 
 ```mach
 pub def EvalFailKind: u8
-```
-
-## val EVAL_FAIL_NONE
-
-```mach
-pub val EVAL_FAIL_NONE:           EvalFailKind = 0
 ```
 
 ## val EVAL_FAIL_REJECTED
@@ -592,12 +413,6 @@ pub val EVAL_FAIL_INTERNAL:       EvalFailKind = 6
 pub val EVAL_FAIL_NEEDS_INSTANCE: EvalFailKind = 7
 ```
 
-## val EVAL_FAIL_NOT_INTEGER
-
-```mach
-pub val EVAL_FAIL_NOT_INTEGER:    EvalFailKind = 8
-```
-
 ## rec EvalFail
 
 ```mach
@@ -612,24 +427,10 @@ diag: the diagnostic kind the failure is reported as, where it reaches the user
 pub fun eval_error(kind: EvalFailKind, diag: diagnostic_kind.Kind, message: str) EvalFail;
 ```
 
-## fun eval_internal
-
-```mach
-pub fun eval_internal(message: str) EvalFail;
-```
-
-an internal failure of the evaluator, a compiler defect wherever it surfaces
-
 ## fun eval_from_fail
 
 ```mach
 pub fun eval_from_fail(f: fail.Fail, diag: diagnostic_kind.Kind, rejected_message: str) EvalFail;
-```
-
-## fun gate_eval_failure_is_transient
-
-```mach
-pub fun gate_eval_failure_is_transient(kind: EvalFailKind) bool;
 ```
 
 ## rec FrameMark
@@ -648,33 +449,6 @@ pub rec ComptimeEnv;
 
 ```mach
 pub rec ComptimeCtx;
-```
-
-## def LoadMark
-
-```mach
-pub def LoadMark: u8
-```
-
-what the load walk decided for a declaration: unwalked, walked, or a `use`
-the load reported and bound nothing for, so resolve binds nothing and says nothing
-
-## val LOAD_MARK_NONE
-
-```mach
-pub val LOAD_MARK_NONE:    LoadMark = 0
-```
-
-## val LOAD_MARK_WALKED
-
-```mach
-pub val LOAD_MARK_WALKED:  LoadMark = 1
-```
-
-## val LOAD_MARK_UNBOUND
-
-```mach
-pub val LOAD_MARK_UNBOUND: LoadMark = 2
 ```
 
 ## fun environment
@@ -821,12 +595,6 @@ pub fun mark_use_unbound(c: *ComptimeCtx, did: ast_id.DeclId);
 pub fun defer_float_width(c: *ComptimeCtx, name: intern.StrId) err[fail.Fail];
 ```
 
-## fun float_width_deferred
-
-```mach
-pub fun float_width_deferred(c: *ComptimeCtx, name: intern.StrId) bool;
-```
-
 ## fun bind
 
 ```mach
@@ -908,12 +676,6 @@ pub rec LitFloat;
 pub fun scan_lit_int(source: str, span: token.Span) res[LitInt, EvalFail];
 ```
 
-## fun eval_lit_int
-
-```mach
-pub fun eval_lit_int(source: str, span: token.Span) res[CTValue, EvalFail];
-```
-
 ## fun scan_lit_float
 
 ```mach
@@ -950,12 +712,6 @@ spelling aside, are exactly the shortest decimal that rounds back to `s`
 
 ```mach
 pub fun eval_lit_char(source: str, span: token.Span) res[CTValue, EvalFail];
-```
-
-## fun eval_lit_str
-
-```mach
-pub fun eval_lit_str(source: str, span: token.Span, interner: *intern.Interner) res[CTValue, EvalFail];
 ```
 
 ## fun cast_scalar
@@ -1022,40 +778,10 @@ pub def GateProbe: u8
 pub val GATE_PROBE_COMPTIME_PARAM:   GateProbe = 0
 ```
 
-## val GATE_PROBE_LAYOUT_INTRINSIC
-
-```mach
-pub val GATE_PROBE_LAYOUT_INTRINSIC: GateProbe = 1
-```
-
 ## val GATE_PROBE_TYPE_COMPARISON
 
 ```mach
 pub val GATE_PROBE_TYPE_COMPARISON:  GateProbe = 2
-```
-
-## val GATE_PROBE_FIELD_DESCRIPTOR
-
-```mach
-pub val GATE_PROBE_FIELD_DESCRIPTOR: GateProbe = 3
-```
-
-## val GATE_PROBE_EACH_LOOPVAR
-
-```mach
-pub val GATE_PROBE_EACH_LOOPVAR:     GateProbe = 4
-```
-
-## val GATE_PROBE_NODE_ACTION
-
-```mach
-pub val GATE_PROBE_NODE_ACTION:      GateProbe = 5
-```
-
-## val GATE_PROBE_COUNT
-
-```mach
-pub val GATE_PROBE_COUNT: u32 = 5
 ```
 
 ## def GateNodeVerdict
@@ -1070,30 +796,10 @@ pub def GateNodeVerdict: u8
 pub val GATE_NODE_NO:    GateNodeVerdict = 0
 ```
 
-## val GATE_NODE_YES
-
-```mach
-pub val GATE_NODE_YES:   GateNodeVerdict = 1
-```
-
 ## val GATE_NODE_PRUNE
 
 ```mach
 pub val GATE_NODE_PRUNE: GateNodeVerdict = 2
-```
-
-## val GATE_PROBE_UNLISTED_KIND_MSG
-
-```mach
-pub val GATE_PROBE_UNLISTED_KIND_MSG: str =
-"internal: this expression kind has no entry in the compile-time dependency visitor
-```
-
-## val GATE_PROBE_NO_OBSERVER_MSG
-
-```mach
-pub val GATE_PROBE_NO_OBSERVER_MSG: str =
-"internal: this phase did not supply the observer a compile-time dependency probe needs"
 ```
 
 ## rec GateProbes
@@ -1110,13 +816,6 @@ comptime_param: fun(*T, ast_id.ExprId) bool,
 each_loopvar: fun(*T, ast_id.ExprId) bool,
 field_loopvar: fun(*T, ast_id.ExprId) bool,
 field_type_operand: fun(*T, ast_id.ExprId) bool,
-expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) GateProbes[T];
-```
-
-## fun gate_node_action_probes
-
-```mach
-pub fun gate_node_action_probes[T](action: fun(*T, ast_id.ExprId, *ast_expr.Expr) GateNodeVerdict,
 expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) GateProbes[T];
 ```
 
@@ -1155,38 +854,10 @@ pub val GATE_SCOPE_DECL:     GateScope = 0
 pub val GATE_SCOPE_INSTANCE: GateScope = 1
 ```
 
-## val GATE_U8_MSG
-
-```mach
-pub val GATE_U8_MSG: str =
-"comptime branch condition must have type u8"
-```
-
-## val GATE_U8_FLOAT_MSG
-
-```mach
-pub val GATE_U8_FLOAT_MSG: str =
-"comptime branch condition must have type u8, found float"
-```
-
-## val GATE_U8_STR_MSG
-
-```mach
-pub val GATE_U8_STR_MSG: str =
-"comptime branch condition must have type u8, found str"
-```
-
 ## rec GateVerdict
 
 ```mach
 pub rec GateVerdict;
-```
-
-## fun gate_unresolved_dependency
-
-```mach
-pub fun gate_unresolved_dependency[T](c: *ComptimeCtx, cap_ctx: *T, caps: PhaseCapabilities[T],
-a: *ast.Ast, source: str, interner: *intern.Interner, cond: ast_id.ExprId) res[intern.StrId, fail.Fail];
 ```
 
 ## fun evaluate_gate
@@ -1331,18 +1002,6 @@ eid: ast_id.ExprId,
 interner: *intern.Interner) res[str, EvalFail];
 ```
 
-## fun type_operand_value
-
-```mach
-pub fun type_operand_value(a: *ast.Ast, source: str, operand: ast_id.ExprId) ast_id.ExprId;
-```
-
-## fun is_type_comparison
-
-```mach
-pub fun is_type_comparison(a: *ast.Ast, source: str, bin: *ast_expr.ExprBinary) bool;
-```
-
 ## fun is_type_comparison_binary
 
 ```mach
@@ -1356,25 +1015,11 @@ lhs_is_field_type: bool, rhs_is_field_type: bool) bool;
 pub fun is_field_type_member(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
-## fun is_field_descriptor_member
-
-```mach
-pub fun is_field_descriptor_member(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
 ## fun is_type_query_call
 
 ```mach
 pub fun is_type_query_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
-
-## fun is_type_question_call
-
-```mach
-pub fun is_type_question_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
-```
-
-a call that asks about a type: its layout, its identity, or a predicate over it
 
 ## fun type_question
 
@@ -1392,14 +1037,6 @@ pub fun type_question_message(interner: *intern.Interner, a: *ast.Ast, source: s
 
 a declaring gate may not ask a type question; `through` names the constants it asks it through,
 as ` through `T` -> `S``, or is empty when the gate asks it itself
-
-## fun comptime_callee_span
-
-```mach
-pub fun comptime_callee_span(a: *ast.Ast, eid: ast_id.ExprId) token.Span;
-```
-
-the spelling of the intrinsic a comptime call names, `$size_of` for `$size_of(T)`
 
 ## fun ct_is_negative
 
@@ -1534,12 +1171,6 @@ pub fun ct_u8(n: u8) CTValue;
 
 ```mach
 pub fun is_u8(v: CTValue) bool;
-```
-
-## fun truth
-
-```mach
-pub fun truth(v: CTValue) bool;
 ```
 
 ## fun ct_type

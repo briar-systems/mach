@@ -30,12 +30,6 @@ pub val SEVERITY_INFO:    Severity = 2
 pub val SEVERITY_HELP:    Severity = 3
 ```
 
-## fun severity_valid
-
-```mach
-pub fun severity_valid(s: Severity) bool;
-```
-
 ## def Origin
 
 ```mach
@@ -177,12 +171,6 @@ pub rec Diagnostic;
 pub rec DiagnosticId;
 ```
 
-## rec DiagMark
-
-```mach
-pub rec DiagMark;
-```
-
 ## rec DiagnosticStore
 
 ```mach
@@ -258,12 +246,6 @@ build with errors judges none, since a pass it stopped may have been the one
 to raise the warning. the judgement is type checking's, whatever the store
 stamps otherwise
 
-## fun truncate
-
-```mach
-pub fun truncate(store: *DiagnosticStore, m: DiagMark) err[fail.Fail];
-```
-
 ## fun drop_file
 
 ```mach
@@ -295,18 +277,6 @@ pub fun len(store: *DiagnosticStore) usize;
 pub fun error_count(store: *DiagnosticStore) usize;
 ```
 
-## fun note_error
-
-```mach
-pub fun note_error(store: *DiagnosticStore);
-```
-
-## val UNKEYED_TEXT
-
-```mach
-pub val UNKEYED_TEXT: str = "a diagnostic names no live kind of the registry"
-```
-
 ## fun builder_init
 
 ```mach
@@ -332,18 +302,6 @@ pub fun attach_note(b: *DiagnosticBuilder, text: str) err[fail.Fail];
 
 ```mach
 pub fun attach_help(b: *DiagnosticBuilder, text: str) err[fail.Fail];
-```
-
-## fun attach_note_committed
-
-```mach
-pub fun attach_note_committed(store: *DiagnosticStore, id: DiagnosticId, text: str) err[fail.Fail];
-```
-
-## fun attach_help_committed
-
-```mach
-pub fun attach_help_committed(store: *DiagnosticStore, id: DiagnosticId, text: str) err[fail.Fail];
 ```
 
 ## fun attach_related
@@ -410,12 +368,6 @@ pub fun resolve(store: *DiagnosticStore, id: DiagnosticId) opt[*Diagnostic];
 ```
 
 absent when the store is nil or the id no longer names a live diagnostic
-
-## val STALE_ID_TEXT
-
-```mach
-pub val STALE_ID_TEXT: str = "stale diagnostic id"
-```
 
 ## fun error
 
@@ -510,20 +462,6 @@ pub fun note_lost(store: *DiagnosticStore);
 pub fun lost_count(store: *DiagnosticStore) usize;
 ```
 
-## val GATE_NEVER_DECIDED_PREFIX
-
-```mach
-pub val GATE_NEVER_DECIDED_PREFIX: str =
-"this `$if` gate is never decided: `"
-```
-
-## val GATE_NEVER_DECIDED_SUFFIX
-
-```mach
-pub val GATE_NEVER_DECIDED_SUFFIX: str =
-"` is not a compile-time constant anywhere this module can see"
-```
-
 ## fun gate_error_named
 
 ```mach
@@ -567,12 +505,6 @@ pub fun snapshot_from(src: *DiagnosticStore, from: usize, a: *A.Allocator) res[*
 
 ```mach
 pub fun replay_into(dst: *DiagnosticStore, src: *DiagnosticStore) err[fail.Fail];
-```
-
-## rec GateDiagKey
-
-```mach
-pub rec GateDiagKey;
 ```
 
 ## fun gate_commit

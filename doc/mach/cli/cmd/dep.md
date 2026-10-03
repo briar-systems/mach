@@ -48,22 +48,6 @@ root: the project root directory
 quiet: suppress progress lines
 ret: exit.OK when realized, otherwise the code `exit.of` maps the printed failure to
 
-## fun verify_project
-
-```mach
-pub fun verify_project(root: str, release: bool) i64;
-```
-
-check that every dependency of a project is realized and consistent without changing
-anything; prints "ok" on success. a project root that is not a repository root is noted
-and verified from the realized checkouts. a realized directory under dep/ outside the
-closure is an error here, where pull reports and retains it
-
-root: the project root directory
-release: also refuse a root dependency selected by a branch, a commit or a path
-ret: exit.OK when verified, exit.USER for a directory outside the closure, otherwise the
-         code `exit.of` maps the printed failure to
-
 ## fun pin_command
 
 ```mach
@@ -78,15 +62,6 @@ pull's refusal and init's --no-deps hint both name it
 ```mach
 pub fun unpinned_refusal(a: *A.Allocator, root: str, id: str, version: str) str;
 ```
-
-## fun dep_outdated
-
-```mach
-pub fun dep_outdated(root: str, offline: bool) i64;
-```
-
-each version-selected identity's pinned release, the highest this compiler and every range
-accept, and the highest release published
 
 ## fun add_release
 

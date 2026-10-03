@@ -20,29 +20,11 @@ pub val SYMBOL_REJECTED: SymbolId = 0xFFFFFFFE
 
 an identifier visited and rejected by resolution has no symbol to remap.
 
-## val SYMBOL_DEFERRED_NAME
-
-```mach
-pub val SYMBOL_DEFERRED_NAME: SymbolId = 0xFFFFFFFD
-```
-
-a name in an arm of a statement-level gate resolve could not decide, which resolved to
-nothing: sema reports it if it selects that arm, and an arm it discards reports nothing
-(#3485). one sentinel per message, so the report reads as resolve's would have.
-
 ## val SYMBOL_DEFERRED_TYPE
 
 ```mach
 pub val SYMBOL_DEFERRED_TYPE: SymbolId = 0xFFFFFFFC
 ```
-
-## val SYMBOL_RESERVED_MIN
-
-```mach
-pub val SYMBOL_RESERVED_MIN: SymbolId = SYMBOL_DEFERRED_TYPE
-```
-
-every id at or above this one is a sentinel, never a symbol
 
 ## fun symbol_deferred
 
@@ -252,15 +234,6 @@ own_module: session.ModuleId,
 diags: *diagnostic.DiagnosticStore) res[ResolveResult, fail.Fail];
 ```
 
-## fun declaration_deprecation
-
-```mach
-pub fun declaration_deprecation(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, source: str, did: ast_id.DeclId) res[deprecation.Deprecation, fail.Fail];
-```
-
-the notice a declaration's own `#[deprecated]` decorator records; a malformed decorator is
-reported by type checking and records nothing here
-
 ## fun decorators_deprecation
 
 ```mach
@@ -277,30 +250,6 @@ pub fun declaration_testing(a: *ast.Ast, source: str, did: ast_id.DeclId) bool;
 ```
 
 whether a declaration carries `#[testing]`, which confines every reference to it to test code
-
-## def TypeSpellStatus
-
-```mach
-pub def TypeSpellStatus: u8
-```
-
-## val TYPE_SPELL_NONE
-
-```mach
-pub val TYPE_SPELL_NONE:        TypeSpellStatus = 0
-```
-
-## val TYPE_SPELL_FOUND
-
-```mach
-pub val TYPE_SPELL_FOUND:       TypeSpellStatus = 1
-```
-
-## val TYPE_SPELL_VEC_REFUSED
-
-```mach
-pub val TYPE_SPELL_VEC_REFUSED: TypeSpellStatus = 2
-```
 
 ## fun symbol_is_runtime
 

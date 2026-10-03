@@ -107,12 +107,6 @@ pub val Q_LOWERED_SURFACE: QueryKind = 17
 pub val Q_EMBED_FILE:      QueryKind = 18
 ```
 
-## val Q_CODEGEN_FLAGS
-
-```mach
-pub val Q_CODEGEN_FLAGS:   QueryKind = 19
-```
-
 ## val Q_LOAD_VIEW
 
 ```mach
@@ -142,18 +136,6 @@ a kind keyed by a module carries its stable module id in the key's low 32 bits, 
 higher bits add (a test build), and a kind keyed by a file is keyed
 by its file id alone. file text is the source map's and the editor's input, released with them
 
-## val KEY_UNDECLARED
-
-```mach
-pub val KEY_UNDECLARED: KeyOwner = 0
-```
-
-## val KEY_UNOWNED
-
-```mach
-pub val KEY_UNOWNED:    KeyOwner = 1
-```
-
 ## val KEY_MODULE
 
 ```mach
@@ -166,80 +148,10 @@ pub val KEY_MODULE:     KeyOwner = 2
 pub val KEY_FILE:       KeyOwner = 3
 ```
 
-## val QUERY_KIND_COUNT
-
-```mach
-pub val QUERY_KIND_COUNT: u32 = 23
-```
-
-one past the highest kind; the owner table and every kind constant stay inside it
-
-## fun key_owner
-
-```mach
-pub fun key_owner(kind: QueryKind) KeyOwner;
-```
-
-## def OwnedFn
-
-```mach
-pub def OwnedFn: fun(ptr, KeyOwner, u32) bool
-```
-
-whether a released owner's products go, given the kind's owner class and the id its key names
-
 ## def Revision
 
 ```mach
 pub def Revision: u64
-```
-
-## def ShardRole
-
-```mach
-pub def ShardRole: u8
-```
-
-## val SHARD_INPUT
-
-```mach
-pub val SHARD_INPUT:    ShardRole = 0
-```
-
-## val SHARD_DERIVED
-
-```mach
-pub val SHARD_DERIVED:  ShardRole = 1
-```
-
-## val SHARD_METADATA
-
-```mach
-pub val SHARD_METADATA: ShardRole = 2
-```
-
-## def FinalizeFn
-
-```mach
-pub def FinalizeFn: fun(*u8, u32, *A.Allocator)
-```
-
-## rec MetadataRevision
-
-```mach
-pub rec MetadataRevision;
-```
-
-## def RevisionFn
-
-```mach
-pub def RevisionFn: fun(ptr, u64) res[MetadataRevision, fail.Fail]
-```
-
-## rec RevisionProvider
-
-```mach
-pub rec RevisionProvider;
 ```
 
 ## rec QueryKey
@@ -288,12 +200,6 @@ message: the failure's text when one was recorded, owned by the db's allocator
 pub rec QueryOutput;
 ```
 
-## rec Dep
-
-```mach
-pub rec Dep;
-```
-
 ## rec QueryView
 
 ```mach
@@ -308,12 +214,6 @@ value: the bytes the product published, owned by the db or the product's finaliz
 value_len: their length
 last_changed: the revision the bytes last changed at
 
-## rec QueryEntryDomain
-
-```mach
-pub rec QueryEntryDomain;
-```
-
 ## rec QueryShard
 
 ```mach
@@ -324,12 +224,6 @@ pub rec QueryShard;
 
 ```mach
 pub rec QueryDb;
-```
-
-## rec QueryCapabilities
-
-```mach
-pub rec QueryCapabilities[T];
 ```
 
 ## rec QueryRuntime

@@ -74,42 +74,6 @@ pub fun os_catalog_name(index: usize) str;
 pub fun os_fingerprint_tag(id: u32) u8;
 ```
 
-## val OS_LIBDIR_MAX
-
-```mach
-pub val OS_LIBDIR_MAX: u32 = 8
-```
-
-## val OS_OF_MAX
-
-```mach
-pub val OS_OF_MAX: u32 = 8
-```
-
-## val OS_ISA_MAX
-
-```mach
-pub val OS_ISA_MAX: u32 = 8
-```
-
-## def PieExecFn
-
-```mach
-pub def PieExecFn: fun(u32) bool
-```
-
-## def PageSizeFn
-
-```mach
-pub def PageSizeFn: fun(u32) u64
-```
-
-## val OS_ABI_MAX
-
-```mach
-pub val OS_ABI_MAX: u32 = 4
-```
-
 ## rec AbiSet
 
 ```mach
@@ -122,12 +86,6 @@ the rest, a freestanding os declares itself unconstrained and accepts every
 convention the instruction set covers, its first name being only the default
 `mach init` scaffolds. an empty constrained set means the os has no port to
 that instruction set
-
-## def AbiSetFn
-
-```mach
-pub def AbiSetFn: fun(u32) AbiSet
-```
 
 ## fun abi_set_none
 
@@ -153,63 +111,6 @@ pub fun abi_set_add(s: *AbiSet, name: str);
 pub fun abi_set_unconstrained(native: str) AbiSet;
 ```
 
-## def VariadicStackFn
-
-```mach
-pub def VariadicStackFn: fun(u32) bool
-```
-
-## def NaturalStackArgsFn
-
-```mach
-pub def NaturalStackArgsFn: fun(u32) bool
-```
-
-## def RegArgAlignFn
-
-```mach
-pub def RegArgAlignFn: fun(u32) u32
-```
-
-the largest alignment the argument registers honor for the instruction set,
-0 when the calling convention's own rule stands
-
-## def RegArgExtendFn
-
-```mach
-pub def RegArgExtendFn: fun(u32) u32
-```
-
-the width in bits the caller widens an integer argument narrower than it to,
-by the argument's signedness, in a register, 0 when the callee does it
-
-## def DeclaredAggAlignFn
-
-```mach
-pub def DeclaredAggAlignFn: fun(u32) bool
-```
-
-whether the os places an aggregate argument by its declared alignment on the
-instruction set, #[align] included, where the convention takes the natural one
-
-## def ReservedGpFn
-
-```mach
-pub def ReservedGpFn: fun(u32) u32
-```
-
-## def DitGuaranteedFn
-
-```mach
-pub def DitGuaranteedFn: fun(u32) bool
-```
-
-whether the os guarantees, on one instruction set, the processor's
-data-independent-timing mode a DIT_MODE constant-time multiply row needs: a
-process can set the mode at start, the kernel exposes whether the processor
-has it, and the mode is per-thread state the os preserves. declared per (os,
-isa) with its citations beside the declaration, never derived (#3508)
-
 ## rec VaList
 
 ```mach
@@ -222,22 +123,10 @@ pub rec VaList;
 pub fun va_list(size: u32, align: u32) VaList;
 ```
 
-## def VaListFn
-
-```mach
-pub def VaListFn: fun(u32) opt[VaList]
-```
-
 ## rec FsPolicy
 
 ```mach
 pub rec FsPolicy;
-```
-
-## def FsPolicyFn
-
-```mach
-pub def FsPolicyFn: fun(u32) opt[FsPolicy]
 ```
 
 ## rec OsVTable

@@ -8,14 +8,6 @@ evaluates each once, after its walk has bound every constant, and records the
 string in the session; every later reader takes it from there, so resolution,
 type checking, lowering and the link all read one value (#4022)
 
-## fun takes_string
-
-```mach
-pub fun takes_string(source: str, dec: *ast_decl.Decorator, ord: u32) bool;
-```
-
-whether argument `ord` of `dec` takes a string
-
 ## fun string_id
 
 ```mach

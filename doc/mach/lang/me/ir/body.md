@@ -6,12 +6,6 @@
 pub val MAX_INSTRUCTIONS:   u32   = 1024
 ```
 
-## val MAX_BYTES
-
-```mach
-pub val MAX_BYTES:          usize = 262144
-```
-
 ## val SMALL_INSTRUCTIONS
 
 ```mach
@@ -49,15 +43,6 @@ constant payloads belong to the destination module arena
 ```mach
 pub fun extract(dst: *me_ir.Module, src: *me_ir.Module, tgt: *lang_target.Target, scratch: *A.Allocator, recursive: *bool) err[fail.Fail];
 ```
-
-## rec Slot
-
-```mach
-pub rec Slot;
-```
-
-one attached body: which declaration of the importer it stands in for,
-and that declaration while it does
 
 ## rec Available
 

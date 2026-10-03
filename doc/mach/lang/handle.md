@@ -85,12 +85,6 @@ pub fun chunk_grow[T](e: *ChunkEditor[T], additional: usize) err[Error];
 pub fun chunk_append[T](e: *ChunkEditor[T], value: T) res[*T, Error];
 ```
 
-## rec HandleSlot
-
-```mach
-pub rec HandleSlot[T];
-```
-
 ## rec HandleId
 
 ```mach

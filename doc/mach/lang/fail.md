@@ -22,15 +22,6 @@ nothing new, never one that invents text. an allocation refusal is an
 internal failure; the compiler recovers from none of them at the site that
 met them
 
-## rec Keyed
-
-```mach
-pub rec Keyed;
-```
-
-kind: the row of the diagnostic kind table the failure is reported as
-text: the message
-
 ## fun reported
 
 ```mach
@@ -95,14 +86,6 @@ pub fun str_refused(e: StrError) Fail;
 a refused string operation: the allocator's refusal or a slice outside its
 string, which is a compiler defect
 
-## fun read_refused
-
-```mach
-pub fun read_refused(e: reader.ReadError) Fail;
-```
-
-a refused read met by the compiler (an object or archive it was handed)
-
 ## fun fs_refused
 
 ```mach
@@ -121,23 +104,6 @@ pub fun fs_environment(k: diagnostic_kind.Kind, e: fs.FsError) Fail;
 a filesystem operation on a file the build was handed (an object, an
 archive, a library) that the machine refused: the environment's under `k`,
 save an allocation refusal, which stays internal
-
-## fun read_environment
-
-```mach
-pub fun read_environment(k: diagnostic_kind.Kind, e: reader.ReadError) Fail;
-```
-
-a read of a file the build was handed that the machine refused, as
-`fs_environment`
-
-## fun write_environment
-
-```mach
-pub fun write_environment(k: diagnostic_kind.Kind, e: io_writer.WriteError) Fail;
-```
-
-a write of a file the build produces that the machine refused
 
 ## fun format_refused
 
@@ -256,26 +222,6 @@ pub fun phase_failure(s: PhaseStatus) Fail;
 pub fun merge(into: *PhaseStatus, from: PhaseStatus);
 ```
 
-## rec Member
-
-```mach
-pub rec Member;
-```
-
-closed catalogs. a dispatch over a finite catalog that reaches a member no
-arm names rejects through one of these, so one message shape names the
-catalog and the member and one class says where the fault lies: the member
-arrived from input or a cross-module product, the member is valid but the
-target or phase declares it cannot honor it, or the compiler produced a
-member its own catalog lacks. no site answers an unknown member with a
-default.
-
-## rec Unsupported
-
-```mach
-pub rec Unsupported;
-```
-
 ## tag Catalog
 
 ```mach
@@ -340,14 +286,6 @@ pub fun catalog_text(a: *A.Allocator, c: Catalog) res[str, std_format.FormatErro
 
 the message, owned by the caller's allocator (extent str_len + 1, released
 with str_free); the only failure a literal format can meet is the allocator's
-
-## fun catalog_interned
-
-```mach
-pub fun catalog_interned(itn: *intern.Interner, a: *A.Allocator, c: Catalog) res[str, Fail];
-```
-
-the message, owned by the interner so it outlives temporary phase storage
 
 ## fun catalog_message
 

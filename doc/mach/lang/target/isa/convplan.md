@@ -44,14 +44,6 @@ arg:   the target's per-step argument, an immediate or a lane width
 width: the register width in bytes the step runs at, 0 for the target's
        narrowest vector register
 
-## val STEPS_MAX
-
-```mach
-pub val STEPS_MAX: u32 = 24
-```
-
-the longest sequence any target's table needs, with room to spare
-
 ## rec Plan
 
 ```mach
@@ -79,15 +71,6 @@ pub fun push_at(p: *Plan, op: u32, dst: Place, src: Place, arg: u32, width: u32)
 ```
 
 a step at a register width wider than the target's narrowest
-
-## fun late_operand_read
-
-```mach
-pub fun late_operand_read(p: *Plan) u32;
-```
-
-the first step that reads the operand after an earlier step wrote the work register, or len for none.
-a step that reads the operand and writes the work register in one instruction reads before it writes
 
 ## fun alias_safe
 

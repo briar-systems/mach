@@ -277,12 +277,6 @@ pub fun from_f64_s(f: f64) Wide;
 pub fun format_u(a: Wide, buf: *u8, cap: usize) usize;
 ```
 
-## fun format_s
-
-```mach
-pub fun format_s(a: Wide, buf: *u8, cap: usize) usize;
-```
-
 ## val FORMAT_CAP
 
 ```mach

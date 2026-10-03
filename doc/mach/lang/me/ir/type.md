@@ -103,42 +103,6 @@ pub val REC_KEY_NONE: u32 = 0
 
 the key of a record no cycle of pointers reaches, and of every non-record type
 
-## rec IrTypeArray
-
-```mach
-pub rec IrTypeArray;
-```
-
-## rec IrTypeVector
-
-```mach
-pub rec IrTypeVector;
-```
-
-## rec IrTypeHandle
-
-```mach
-pub rec IrTypeHandle;
-```
-
-## rec IrTypeStruct
-
-```mach
-pub rec IrTypeStruct;
-```
-
-## rec IrTypeTag
-
-```mach
-pub rec IrTypeTag;
-```
-
-## rec IrTypeFn
-
-```mach
-pub rec IrTypeFn;
-```
-
 ## def IntExt
 
 ```mach
@@ -182,23 +146,6 @@ trailing EXT_NONE entries are dropped, so a list with none is EXT_LIST_NONE
 ```mach
 pub val EXT_LIST_NONE: ExtListId = 0
 ```
-
-## rec ExtList
-
-```mach
-pub rec ExtList;
-```
-
-## def IntForm
-
-```mach
-pub def IntForm: u8
-```
-
-what an integer type's bits encode. every operation on an IRT_INT is integer
-arithmetic whatever its form; a form other than INT_FORM_PLAIN names the
-value those bits carry, which a calling convention places as that value
-rather than as an integer (#3800)
 
 ## val INT_FORM_PLAIN
 

@@ -1071,12 +1071,6 @@ the operand layout of a member: what its operands are, how they pack into
 the word and how the printer lays the line out. this is the form byte the
 printer-private record used to carry, now a column of the member's row
 
-## val L_NONE
-
-```mach
-pub val L_NONE: Layout = 0
-```
-
 ## val L_ALU3
 
 ```mach
@@ -1325,101 +1319,6 @@ pub val L_NEON_DUP: Layout = 30
 dst vector at the arrangement the element width names, from the general
 register src1, or from src1.elem[src2] for a vector src1
 
-## def WidthRule
-
-```mach
-pub def WidthRule: u8
-```
-
-how the operand widths reach the base word
-
-## val W_NONE
-
-```mach
-pub val W_NONE: WidthRule = 0
-```
-
-## val W_SF
-
-```mach
-pub val W_SF: WidthRule = 1
-```
-
-bit 31 set for a 64-bit general-purpose operation
-
-## val W_SF_N
-
-```mach
-pub val W_SF_N: WidthRule = 2
-```
-
-sf and the bitfield N bit
-
-## val W_FTYPE
-
-```mach
-pub val W_FTYPE: WidthRule = 3
-```
-
-bit 22 set for a double-precision float operation
-
-## val W_SF_FTYPE
-
-```mach
-pub val W_SF_FTYPE: WidthRule = 4
-```
-
-sf from the general-purpose operand, ftype from the float operand
-
-## val W_FCVT
-
-```mach
-pub val W_FCVT: WidthRule = 5
-```
-
-ftype from the source float width, opc from the destination float width
-
-## val W_SIZE
-
-```mach
-pub val W_SIZE: WidthRule = 6
-```
-
-the load/store size field from the data register, with the vector bank bit
-and the quadword opc
-
-## val W_SIZE30
-
-```mach
-pub val W_SIZE30: WidthRule = 7
-```
-
-bit 30 set for a 64-bit data register
-
-## val W_LDP
-
-```mach
-pub val W_LDP: WidthRule = 8
-```
-
-the pair opc from the data register's bank and width
-
-## val W_FMOV_GEN
-
-```mach
-pub val W_FMOV_GEN: WidthRule = 9
-```
-
-FMOV (general): sf and ftype as W_SF_FTYPE, the direction from the banks
-
-## val W_SF_REV
-
-```mach
-pub val W_SF_REV: WidthRule = 10
-```
-
-rev: sf and the low opc bit set for a 64-bit register, whose bytes it reverses whole
-
 ## def LaneClass
 
 ```mach
@@ -1428,18 +1327,6 @@ pub def LaneClass: u8
 
 the lane class of a NEON member: how the element width reaches the size
 field and which arrangement the printer renders
-
-## val LANE_NONE
-
-```mach
-pub val LANE_NONE:  LaneClass = 0
-```
-
-## val LANE_INT
-
-```mach
-pub val LANE_INT:   LaneClass = 1
-```
 
 ## val LANE_FLOAT
 
@@ -1535,18 +1422,6 @@ one L_NEON_CRYPTO member: the arrangement of each operand (src2 ARR_NONE for
 a two-operand row), whether it folds its destination into the result, and
 the words its refusal ends with when the operands do not match
 
-## val CRYPTO_ROW_COUNT
-
-```mach
-pub val CRYPTO_ROW_COUNT: usize = 10
-```
-
-## val CRYPTO_ROWS
-
-```mach
-pub val CRYPTO_ROWS: [CRYPTO_ROW_COUNT]CryptoRow = [CRYPTO_ROW_COUNT]CryptoRow;
-```
-
 ## fun crypto_row
 
 ```mach
@@ -1577,14 +1452,6 @@ the assembler spelling the printer renders; absent outside the catalog
 pub fun layout(op: MachOp) Layout;
 ```
 
-## val FLAG_COND
-
-```mach
-pub val FLAG_COND:    u16 = 0x000F
-```
-
-`isa.Inst.flags` layout for an aarch64 notification
-
 ## val FLAG_WB_PRE
 
 ```mach
@@ -1614,12 +1481,6 @@ pub val FLAG_SP:         u16 = 0x0080
 
 index 31 in a general-purpose register operand names the stack pointer;
 without it index 31 is the zero register
-
-## val FLAG_ELEM
-
-```mach
-pub val FLAG_ELEM:       u16 = 0x0F00
-```
 
 ## val FLAG_LABEL_LOCAL
 
@@ -1674,12 +1535,6 @@ pub fun with_elem_bytes(flags: u16, eb: u8) u16;
 pub fun gp_id(n: u32) i32;
 ```
 
-## fun vec_id
-
-```mach
-pub fun vec_id(n: u32) i32;
-```
-
 ## fun gp
 
 ```mach
@@ -1692,45 +1547,11 @@ pub fun gp(n: u32, bytes: u8) isa.Operand;
 pub fun vec(n: u32, bytes: u8) isa.Operand;
 ```
 
-## fun is_gp
-
-```mach
-pub fun is_gp(op: *isa.Operand) bool;
-```
-
 ## fun is_vec
 
 ```mach
 pub fun is_vec(op: *isa.Operand) bool;
 ```
-
-## fun is_zero_reg
-
-```mach
-pub fun is_zero_reg(mi: *isa.Inst, op: *isa.Operand) bool;
-```
-
-index 31 in a data position with the stack pointer not named
-
-## fun base_word
-
-```mach
-pub fun base_word(mi: *isa.Inst) u32;
-```
-
-the base word with the operand widths applied: the row's rule names which
-operands the size bits come from
-
-## fun neon_conv_field
-
-```mach
-pub fun neon_conv_field(op: MachOp, eb: u8) u32;
-```
-
-the operand-width field of a lane-wise conversion: the shift-left-long
-immh marker, the narrowing size of its result, or the double-precision bit.
-fcvtl lengthens half to single (eb 2) or single to double (eb 4), and fcvtn
-narrows single to half (eb 4) or double to single (eb 8)
 
 ## fun logical_imm
 
@@ -1747,15 +1568,6 @@ value no element spells, all zeros and all ones among them
 ```mach
 pub fun assemble(mi: *isa.Inst) u32;
 ```
-
-## fun signed_at_width
-
-```mach
-pub fun signed_at_width(v: u64, wide: bool) i64;
-```
-
-the value of a move-wide fold as the register holds it: a 32-bit pattern
-with its top bit set is negative at that width
 
 ## fun spell
 

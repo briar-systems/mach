@@ -78,12 +78,6 @@ pub val ISA_PCOPY_FENCE: u16 = 0xFFFC
 pub val ISA_USE:         u16 = 0xFFFB
 ```
 
-## def OperandKind
-
-```mach
-pub def OperandKind: u8
-```
-
 ## val OPK_NONE
 
 ```mach
@@ -513,12 +507,6 @@ extension interleaves its lanes with, so both halves of one extension share
 it; its scalar row is each lane shifted right by its width less one, and
 only a packed cell is ever formed (#4198)
 
-## val VEC_OP_LAST
-
-```mach
-pub val VEC_OP_LAST:      VecOp = VEC_OP_SIGN_MASK
-```
-
 ## rec PackedForm
 
 ```mach
@@ -744,15 +732,6 @@ pub val MULW_THREE_ADDRESS: MulWideForm = 1
 pub val MULW_FIXED_PAIR:    MulWideForm = 2
 ```
 
-## rec AluWidth
-
-```mach
-pub rec AluWidth;
-```
-
-one width the alu computes an integer at, in bytes, legal while the model
-holds every extension in `ext` (0 when it always is)
-
 ## val ALU_WIDTH_CAP
 
 ```mach
@@ -819,14 +798,6 @@ pub fun is_shift_op(op: VecOp) bool;
 pub fun is_range_op(op: VecOp) bool;
 ```
 
-## fun is_permute_op
-
-```mach
-pub fun is_permute_op(op: VecOp) bool;
-```
-
-the lane rearrangements: a range of one vector's lanes and a join of several
-
 ## fun half_native
 
 ```mach
@@ -871,35 +842,6 @@ pub fun vector_width(m: *MachineModel, is_float: bool, lane_bits: u32) u32;
 
 the width in bits the packed rows over lanes of this kind and width run at
 under the selected extensions: the widest selected row's, or `vector_bits`
-
-## fun vector_domain_len
-
-```mach
-pub fun vector_domain_len() u32;
-```
-
-the retained (operation, lane kind, lane width, operand lane width) domain:
-every cell the vocabulary admits, in one fixed order, so a table can be
-checked against it
-
-## fun vector_domain_cell
-
-```mach
-pub fun vector_domain_cell(index: u32, cell: *ScalarForm) bool;
-```
-
-## def ScalarFamily
-
-```mach
-pub def ScalarFamily: u32
-```
-
-the families of retained cells a model leaves to the scalar path wherever
-its packed table does not claim them: the conversions; the widening
-multiplies with their high halves, the lane interleave, the lane-halving
-extensions with their sign masks and the widening group sums; the shifts, lane by lane through the
-scalar shift, which saturates the same way; the lane ranges and joins; and
-the f16 lane arithmetic and comparisons, each lane's scalar f16 operation (#3802)
 
 ## val SCALAR_CONVERSIONS
 
@@ -992,14 +934,6 @@ vocabulary that names them
 ```mach
 pub fun extension_view(m: *MachineModel) ExtensionView;
 ```
-
-## fun extension_domain
-
-```mach
-pub fun extension_domain(m: *MachineModel) u64;
-```
-
-every extension bit the model's vocabulary names
 
 ## fun extension_bit
 
@@ -1230,14 +1164,6 @@ pub fun gate_alu_width(m: *MachineModel, bytes: u32, ext: u64);
 
 declares the alu width `bytes`, legal only while the model holds `ext`
 
-## fun alu_width_set
-
-```mach
-pub fun alu_width_set(m: *MachineModel) u32;
-```
-
-the alu widths legal under the model's extensions, encoded like int_widths
-
 ## fun alu_min_width
 
 ```mach
@@ -1254,14 +1180,6 @@ pub fun max_alu_width(m: *MachineModel) u32;
 
 the widest legal alu width, above which legalize splits an operation into
 lanes; 0 for a model that declares none
-
-## fun alu_width_floor_set
-
-```mach
-pub fun alu_width_floor_set(m: *MachineModel) u32;
-```
-
-the alu widths legal under every extension set, encoded like int_widths
 
 ## fun clamp_alu_width
 
@@ -1289,26 +1207,6 @@ of this many bytes
 pub fun fits_vector_register(m: *MachineModel, is_float: bool, lane_bits: u32, lanes: u32) bool;
 ```
 
-## def AsmClobbersFn
-
-```mach
-pub def AsmClobbersFn: fun(str, *u32, *u32)
-```
-
-## def AsmReturnsFn
-
-```mach
-pub def AsmReturnsFn: fun(str) bool
-```
-
-## def AsmWritesSpFn
-
-```mach
-pub def AsmWritesSpFn: fun(str) bool
-```
-
-whether an asm body may write the stack pointer; true for a body it cannot parse
-
 ## def AsmCtScanFn
 
 ```mach
@@ -1317,37 +1215,6 @@ pub def AsmCtScanFn: fun(str, *ct.AsmSecret, u32, ct.CtMulMask, bool, *A.Allocat
 
 the constant-time scan of an asm body: the tracked bindings (`ct.AsmSecret`, by the name
 their `{name}` operand spells), the target's multiply admission and shift trust
-
-## def IsRegMoveFn
-
-```mach
-pub def IsRegMoveFn: fun(u32) bool
-```
-
-## def IsTrapTerminatorFn
-
-```mach
-pub def IsTrapTerminatorFn: fun(u32) bool
-```
-
-## def IntImmFitsFn
-
-```mach
-pub def IntImmFitsFn: fun(u64, u32) bool
-```
-
-whether one instruction materializes the integer `value`, read at `bits`
-(at most 64): the rule the middle end hoists a loop's constants by (#3807)
-
-## def ReadsConstFn
-
-```mach
-pub def ReadsConstFn: fun(*codegen_mir.MirInstr, u32) bool
-```
-
-whether the selected instruction reads operand `index` as a constant in
-place, as a constant-pool memory operand, at no instruction of its own: the
-rule the allocator folds a rebuilt constant into its reader by (#4184)
 
 ## def DwarfRegFn
 
@@ -1367,69 +1234,10 @@ pub def CvRegFn: arch.CvRegFn
 pub def RegFileFn: fun(*Register) i32
 ```
 
-## def FrameDistFn
-
-```mach
-pub def FrameDistFn: fun(*MachineModel, *codegen_mir.MirFunction, *u32, *u32)
-```
-
-## rec BackendIdentity
-
-```mach
-pub rec BackendIdentity;
-```
-
-## rec BackendAbi
-
-```mach
-pub rec BackendAbi;
-```
-
-## rec BackendOs
-
-```mach
-pub rec BackendOs;
-```
-
 ## rec BackendTarget
 
 ```mach
 pub rec BackendTarget;
-```
-
-## def SelectFn
-
-```mach
-pub def SelectFn: fun(*A.Allocator, *BackendTarget, *codegen_mir.MirFunction) err[fail.Fail]
-```
-
-## def EncodeFn
-
-```mach
-pub def EncodeFn: fun(*A.Allocator, *BackendTarget, *codegen_mir.MirModule) res[encoding.EncoderOutput, fail.Fail]
-```
-
-## def EmitAsmFn
-
-```mach
-pub def EmitAsmFn: fun(*A.Allocator, *BackendTarget, *codegen_mir.MirModule,
-*io_writer.Writer) res[encoding.EncoderOutput, fail.Fail]
-```
-
-## def EmitModuleFn
-
-```mach
-pub def EmitModuleFn: fun(*A.Allocator, *BackendTarget, *unit_input.Unit, *debug_input.ModuleDebug, *target_of.ObjectImage) err[fail.Fail]
-```
-
-a whole-module emitter fills the object image codegen initialized: its sections,
-symbols and relocations, in the same neutral kinds a native image carries, with
-section bytes allocated from the image's allocator. names are the emitter's own
-
-## rec AssemblyCapabilities
-
-```mach
-pub rec AssemblyCapabilities;
 ```
 
 ## rec RegMachine
@@ -1485,12 +1293,6 @@ pub val OP_OPERAND_CONSTANT:       OpOperandKind = 1
 pub val OP_OPERAND_LITERAL:        OpOperandKind = 2
 ```
 
-## val OP_OPERAND_POINTER_READ
-
-```mach
-pub val OP_OPERAND_POINTER_READ:   OpOperandKind = 3
-```
-
 ## val OP_OPERAND_POINTER_WRITE
 
 ```mach
@@ -1531,12 +1333,6 @@ pub val OP_OPERAND_SCOPE:          OpOperandKind = 9
 
 ```mach
 pub val OP_OPERAND_SEMANTICS:      OpOperandKind = 10
-```
-
-## val OP_OPERAND_KIND_COUNT
-
-```mach
-pub val OP_OPERAND_KIND_COUNT:     OpOperandKind = 11
 ```
 
 ## def OpResult
@@ -1672,16 +1468,6 @@ call. a typing with no requirements admits every type and needs nothing: it only
 the operand the row's relations are stated against. static data the target owns for
 the life of the program, like an OpEnum
 
-## def OpNumeric
-
-```mach
-pub def OpNumeric: u8
-```
-
-the numbers a typed row's data type is a scalar or vector of: any type at all, integers or
-floats, floats only, integers of either signedness, or integers of one signedness. a truth
-value is an unsigned integer
-
 ## val OP_NUMERIC_NONE
 
 ```mach
@@ -1716,12 +1502,6 @@ pub val OP_NUMERIC_UNSIGNED: OpNumeric = 4
 
 ```mach
 pub val OP_NUMERIC_INTEGER:  OpNumeric = 5
-```
-
-## val OP_NUMERIC_COUNT
-
-```mach
-pub val OP_NUMERIC_COUNT:    OpNumeric = 6
 ```
 
 ## fun op_numeric_admits
@@ -1801,21 +1581,6 @@ pub val OP_RELATION_SAMPLER:  OpRelation = 5
 pub val OP_RELATION_SHAPED:   OpRelation = 6
 ```
 
-## val OP_RELATION_COUNT
-
-```mach
-pub val OP_RELATION_COUNT:    OpRelation = 7
-```
-
-## def OpCountKind
-
-```mach
-pub def OpCountKind: u8
-```
-
-how a row's texel count is stated: exactly a number of components, or at least as many
-as the handle's format stores, any number when its format is unknown
-
 ## val OP_COUNT_EXACT
 
 ```mach
@@ -1826,12 +1591,6 @@ pub val OP_COUNT_EXACT:      OpCountKind = 0
 
 ```mach
 pub val OP_COUNT_FORMAT:     OpCountKind = 1
-```
-
-## val OP_COUNT_KIND_COUNT
-
-```mach
-pub val OP_COUNT_KIND_COUNT: OpCountKind = 2
 ```
 
 ## rec OpTexelCount
@@ -1880,47 +1639,6 @@ pub val TYPE_OPERAND_WORD: u32 = 0xFFFFFFFF
 pub val NO_TYPE_CTOR: u32 = 0xFFFFFFFF
 ```
 
-## def TypeRefuseFn
-
-```mach
-pub def TypeRefuseFn: fun(*u32, u32) str
-```
-
-## def TypeBindFn
-
-```mach
-pub def TypeBindFn: fun(*u32, u32) u32
-```
-
-the descriptor role a handle binds through, from its operands
-
-## def TypeComposeFn
-
-```mach
-pub def TypeComposeFn: fun(u32, *u32, u32) str
-```
-
-why a composing constructor refuses the handle named as its operand `index`, from
-that handle's own operands, nil when it composes over it
-
-## def TypeSampledFn
-
-```mach
-pub def TypeSampledFn: fun(*u32, u32) OpScalar
-```
-
-the scalar a handle's texels are read and written as, from its operands, class
-OP_DATA_OTHER when it has none
-
-## def TypeComponentsFn
-
-```mach
-pub def TypeComponentsFn: fun(*u32, u32) u32
-```
-
-the number of components a handle's format stores each texel in, from its operands, 0
-when its format is unknown
-
 ## val NO_TEXEL_OPERAND
 
 ```mach
@@ -1928,15 +1646,6 @@ pub val NO_TEXEL_OPERAND: u32 = 0xFFFFFFFF
 ```
 
 a constructor whose handles state their own texels, or have none
-
-## def TypeAddressFn
-
-```mach
-pub def TypeAddressFn: fun(*u32, u32) str
-```
-
-why no instruction may derive a pointer into a handle's memory, from its operands, nil
-when one may
 
 ## val HANDLE_BIND_SAMPLER
 
@@ -2131,14 +1840,6 @@ pub fun op_enumerant_brings(v: *OpEnumerant) u32;
 
 how many operands the enumerant `v` brings
 
-## fun op_enumerant_kind
-
-```mach
-pub fun op_enumerant_kind(v: *OpEnumerant, k: u32) OpOperandKind;
-```
-
-the kind of the `k`th operand the enumerant `v` brings
-
 ## fun op_enumerant_of
 
 ```mach
@@ -2146,15 +1847,6 @@ pub fun op_enumerant_of(e: *OpEnum, value: u32) *OpEnumerant;
 ```
 
 the enumerant of `e` whose value is exactly `value`, nil when none is
-
-## fun op_enum_admits
-
-```mach
-pub fun op_enum_admits(e: *OpEnum, value: u32, out_trailing: *u32) bool;
-```
-
-whether `value` is a value of `e`: one of its values, or for a mask a union of its
-bits. `out_trailing` receives the tail operands the value brings
 
 ## val NO_OPERAND
 
@@ -2566,12 +2258,6 @@ model: *MachineModel, emitter: *ModuleEmitter) IsaVTable;
 pub fun module_emitter(emit_module: EmitModuleFn, has_assembly: bool) ModuleEmitter;
 ```
 
-## rec IsaRegistryEntry
-
-```mach
-pub rec IsaRegistryEntry;
-```
-
 ## rec IsaRegistry
 
 ```mach
@@ -2697,18 +2383,6 @@ a local label with a number, so a listing can spell the jump as `1f` or
 
 ```mach
 pub fun local_label_number(op: *Operand) u32;
-```
-
-## val LOCAL_LABEL_FWD
-
-```mach
-pub val LOCAL_LABEL_FWD:  i64 = -1
-```
-
-## val LOCAL_LABEL_BACK
-
-```mach
-pub val LOCAL_LABEL_BACK: i64 = -2
 ```
 
 ## fun label_is_block

@@ -6,15 +6,6 @@
 pub val NO_BLOCK: u32 = 0xFFFFFFFF
 ```
 
-## val CK_PLAIN
-
-```mach
-pub val CK_PLAIN:     u8 = 0
-```
-
-the construct a node heads: a two-way selection, a loop, or a switch, which
-branches to one of any number of successors and merges like a selection
-
 ## val CK_SELECTION
 
 ```mach
@@ -59,12 +50,6 @@ pub val ROLE_CONTINUE:    u8 = 1
 pub val ROLE_UNREACHABLE: u8 = 2
 ```
 
-## val ROLE_SPLIT
-
-```mach
-pub val ROLE_SPLIT:       u8 = 3
-```
-
 ## val ROLE_FORWARD
 
 ```mach
@@ -87,36 +72,6 @@ pub val ROLE_DISPATCH:    u8 = 6
 
 ```mach
 pub val CFG_OK:            u8 = 0
-```
-
-## val CFG_IRREDUCIBLE
-
-```mach
-pub val CFG_IRREDUCIBLE:   u8 = 1
-```
-
-## val CFG_UNREACHABLE
-
-```mach
-pub val CFG_UNREACHABLE:   u8 = 2
-```
-
-## val CFG_MULTIWAY
-
-```mach
-pub val CFG_MULTIWAY:      u8 = 3
-```
-
-## val CFG_CROSSING_EDGE
-
-```mach
-pub val CFG_CROSSING_EDGE: u8 = 6
-```
-
-## val CFG_NO_TERMINATOR
-
-```mach
-pub val CFG_NO_TERMINATOR: u8 = 7
 ```
 
 ## rec Node

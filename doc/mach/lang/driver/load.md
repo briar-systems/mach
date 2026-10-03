@@ -24,22 +24,6 @@ pub fun entry_module_fqn(p: *project.Project, t: *project.TargetEntry) res[inter
 pub fun compose_module_fqn(alloc: *A.Allocator, itn: *intern.Interner, id_text: str, rel_text: str) res[intern.StrId, fail.Fail];
 ```
 
-## fun fqn_in_root_project
-
-```mach
-pub fun fqn_in_root_project(p: *project.Project, fqn: intern.StrId) bool;
-```
-
-the head segment of a module path names the project that owns the module, and
-the loader is where that ownership is decided: it is what picks the source
-root a module is read from
-
-## fun diag_join3
-
-```mach
-pub fun diag_join3(s: *session.Session, a: str, b: str, c: str, fallback: str) str;
-```
-
 ## fun diag_join_named
 
 ```mach
@@ -118,12 +102,6 @@ pub fun q_parse_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
 pub fun q_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
-## rec UseTarget
-
-```mach
-pub rec UseTarget;
-```
-
 ## fun check_gated_const_imports
 
 ```mach
@@ -138,17 +116,6 @@ pub fun record_attribute_strings(p: *project.Project, mid: session.ModuleId) err
 
 records the strings the module's attribute arguments evaluate to, read in the
 build target's frame the load walk bound (#4022)
-
-## fun eval_for_load
-
-```mach
-pub fun eval_for_load(
-p: *project.Project,
-mid: session.ModuleId,
-source: str,
-e: ast_id.ExprId,
-fw: float.FloatWidth) res[comptime.CTValue, comptime.EvalFail];
-```
 
 ## fun rebuild_topo
 

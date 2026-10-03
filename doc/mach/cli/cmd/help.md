@@ -1,13 +1,5 @@
 # mach.cli.cmd.help
 
-## def HelpRouteKind
-
-```mach
-pub def HelpRouteKind: u8
-```
-
-what a help request resolved to
-
 ## val HELP_ROUTE_NONE
 
 ```mach
@@ -15,46 +7,6 @@ pub val HELP_ROUTE_NONE: HelpRouteKind = 0
 ```
 
 argv is not a help request
-
-## val HELP_ROUTE_OVERVIEW
-
-```mach
-pub val HELP_ROUTE_OVERVIEW: HelpRouteKind = 1
-```
-
-the command overview
-
-## val HELP_ROUTE_COMMAND
-
-```mach
-pub val HELP_ROUTE_COMMAND: HelpRouteKind = 2
-```
-
-one command's page
-
-## val HELP_ROUTE_MALFORMED
-
-```mach
-pub val HELP_ROUTE_MALFORMED: HelpRouteKind = 3
-```
-
-a help request that names an unknown command or has the wrong shape
-
-## val HELP_ROUTE_ACTION
-
-```mach
-pub val HELP_ROUTE_ACTION: HelpRouteKind = 4
-```
-
-one action's block of a command that takes actions
-
-## val HELP_ROUTE_UNKNOWN_ACTION
-
-```mach
-pub val HELP_ROUTE_UNKNOWN_ACTION: HelpRouteKind = 5
-```
-
-a help request naming an action its command does not have
 
 ## rec HelpRoute
 
@@ -88,20 +40,6 @@ argc: process argument count
 argv: process arguments, argv[0] the program
 ret: the route; HELP_ROUTE_NONE when argv is not a help request
 
-## fun render_overview_at
-
-```mach
-pub fun render_overview_at(a: *A.Allocator, out: *io_writer.Writer, requested_width: usize) err[outcome.Fail];
-```
-
-write the command overview wrapped to a width
-
-a: allocator for the text buffer
-out: the destination
-requested_width: columns; clamped to the range 56 to 240
-ret: ok, or an error when the command schema is invalid, the buffer could not be built,
-                 or the write failed
-
 ## fun render_overview
 
 ```mach
@@ -114,52 +52,6 @@ not a number
 a: allocator for the text buffer
 out: the destination
 ret: as render_overview_at
-
-## fun render_command_page_at
-
-```mach
-pub fun render_command_page_at(a: *A.Allocator, out: *io_writer.Writer, id: args.CommandId,
-requested_width: usize) err[outcome.Fail];
-```
-
-write one command's help page wrapped to a width
-
-a: allocator for the text buffer
-out: the destination
-id: the command; an id with no record is an error
-requested_width: columns; clamped to the range 56 to 240
-ret: ok, or an error when the command schema is invalid, the command is unknown, the
-                 buffer could not be built, or the write failed
-
-## fun render_command_page
-
-```mach
-pub fun render_command_page(a: *A.Allocator, out: *io_writer.Writer, id: args.CommandId) err[outcome.Fail];
-```
-
-write one command's help page at the terminal width read from COLUMNS, 100 when unset or
-not a number
-
-a: allocator for the text buffer
-out: the destination
-id: the command
-ret: as render_command_page_at
-
-## fun render_action_page_at
-
-```mach
-pub fun render_action_page_at(a: *A.Allocator, out: *io_writer.Writer, action: args.DepAction,
-requested_width: usize) err[outcome.Fail];
-```
-
-write one action's block wrapped to a width
-
-a: allocator for the text buffer
-out: the destination
-action: the action; one with no record is an error
-requested_width: columns; clamped to the range 56 to 240
-ret: ok, or an error when the schema is invalid, the action is unknown, the buffer
-                 could not be built, or the write failed
 
 ## fun render_route
 

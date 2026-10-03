@@ -19,15 +19,6 @@ pub fun sites(m: *me_ir.Module, tgt: *lang_target.Target, out: *Vector[Scalarize
 every operator the target scalarizes, one site per operation, in function
 and block order: the sites `simd = "require"` refuses and the default warns at
 
-## fun detect
-
-```mach
-pub fun detect(m: *me_ir.Module, tgt: *lang_target.Target, first: *ScalarizeSite) u32;
-```
-
-operators the target scalarizes (declared scalar rows, lane counts past the
-register, and undeclared shapes alike), with the first site named
-
 ## fun detect_undeclared
 
 ```mach

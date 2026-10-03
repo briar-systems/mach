@@ -52,12 +52,6 @@ pub fun capture(a: *A.Allocator, inherited: **u8) res[Environment, outcome.Fail]
 
 inherited duplicate names retain the first value, matching native lookup
 
-## fun canonicalize
-
-```mach
-pub fun canonicalize(values: *Environment) err[outcome.Fail];
-```
-
 ## fun strings_free
 
 ```mach

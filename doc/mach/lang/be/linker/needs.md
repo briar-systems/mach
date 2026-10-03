@@ -11,24 +11,6 @@ dead-stripping treat it like any other definition: a start code that never
 reads it leaves nothing in the image. a target whose os declares nothing gets
 no cell, and its DIT rows are refused before any mark can exist
 
-## fun inputs_need_dit
-
-```mach
-pub fun inputs_need_dit(s: *session.Session, modules: *target_of.ObjectImage, module_count: u32) bool;
-```
-
-whether any input carries the DIT mark: the per-module fact, unioned
-
-## fun defines_dit_cell
-
-```mach
-pub fun defines_dit_cell(tgt: *lang_target.Target, mode: LinkMode) bool;
-```
-
-whether a link of this mode on this target defines the cell: an executable on
-an os that declares the DIT guarantee for the instruction set. a shared
-library runs no start code of its own and records nothing
-
 ## fun synthesize_runtime_needs
 
 ```mach

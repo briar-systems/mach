@@ -64,12 +64,6 @@ pub val NOTE_NO_LANDING: u32 = 0xFFFFFFFF
 pub fun note_blank() AsmNote;
 ```
 
-## val NOTE_SEED_MAX
-
-```mach
-pub val NOTE_SEED_MAX: u32 = 16
-```
-
 ## rec NoteSeeds
 
 ```mach
@@ -81,12 +75,6 @@ encodes: the origin vreg each register or slot operand was rewritten from
 and that vreg's declared secrecy. per operand, not per register: one
 register can carry a dying secret source and a born public destination in
 the same instruction, so a set keyed by register cannot say which
-
-## fun note_seeds_clear
-
-```mach
-pub fun note_seeds_clear(out: *NoteSeeds);
-```
 
 ## fun note_seeds
 

@@ -18,12 +18,6 @@ pub val ROOT_ARTIFACT: RootSet = 0
 pub val ROOT_UNION: RootSet = 1
 ```
 
-## def BuildMode
-
-```mach
-pub def BuildMode: u8
-```
-
 ## val MODE_EXECUTABLE
 
 ```mach
@@ -40,12 +34,6 @@ pub val MODE_LIBRARY: BuildMode = 1
 
 ```mach
 pub def TargetOpt: u8
-```
-
-## val TARGET_OPT_DEBUG
-
-```mach
-pub val TARGET_OPT_DEBUG: TargetOpt = 1
 ```
 
 ## val TARGET_OPT_RELEASE
@@ -194,12 +182,6 @@ pub rec RawLowerCapture;
 pub rec Project;
 ```
 
-## val QUERY_KIND_SLOTS
-
-```mach
-pub val QUERY_KIND_SLOTS: u32 = 32
-```
-
 ## fun note_compute
 
 ```mach
@@ -305,12 +287,6 @@ pub fun free_dep_entries_in_place(alloc: *A.Allocator, deps: *DepEntry, count: u
 ```
 
 release what each entry owns, leaving the entries' own storage to the caller
-
-## fun free_artifact_reqs
-
-```mach
-pub fun free_artifact_reqs(alloc: *A.Allocator, reqs: *manifest.ArtifactReq, count: u32);
-```
 
 ## fun map_opt
 

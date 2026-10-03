@@ -60,12 +60,3 @@ divisor that is no power of two on a target without a high multiply at the
 dividend's width. `pow2_width` is the width a shift sequence runs at, the
 dividend's width raised to the target's ALU floor
 
-## fun eval
-
-```mach
-pub fun eval(p: *DivPlan, x: wide.Wide) wide.Wide;
-```
-
-the value a plan computes for the dividend `x`, an `nbytes` value, with the
-steps' machine semantics at the plan's width
-
