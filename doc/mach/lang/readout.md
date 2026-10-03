@@ -132,8 +132,7 @@ pub rec Unit;
 ```
 
 a unit of the plan starts: what its goal calls the work (`building`,
-`checking`), the artifact, or none for the whole project, the target and the
-profile
+`checking`), the artifact, the target and the profile
 
 ## rec PhaseEnd
 
@@ -248,7 +247,7 @@ what the sink asks to receive
 ## fun unit
 
 ```mach
-pub fun unit(sink: *Sink, artifact: str, target: str, profile: str, verb: str, has_artifact: bool);
+pub fun unit(sink: *Sink, artifact: str, target: str, profile: str, verb: str);
 ```
 
 a unit starts; a nil sink is a no-op

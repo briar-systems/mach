@@ -200,6 +200,14 @@ fwd mach.lang.manifest.artifact.find_artifact
 
 forwards [`mach.lang.manifest.artifact.find_artifact`](manifest/artifact.md#fun-find_artifact)
 
+## fwd mach.lang.manifest.artifact.export_artifact
+
+```mach
+fwd mach.lang.manifest.artifact.export_artifact
+```
+
+forwards [`mach.lang.manifest.artifact.export_artifact`](manifest/artifact.md#fun-export_artifact)
+
 ## fwd mach.lang.manifest.artifact.artifact_needs_artifact
 
 ```mach
@@ -424,14 +432,6 @@ fwd mach.lang.manifest.plan.LIBKIND_SHARED
 
 forwards [`mach.lang.manifest.plan.LIBKIND_SHARED`](manifest/plan.md#val-libkind_shared)
 
-## fwd mach.lang.manifest.plan.Selection
-
-```mach
-fwd mach.lang.manifest.plan.Selection
-```
-
-forwards [`mach.lang.manifest.plan.Selection`](manifest/plan.md#rec-selection)
-
 ## fwd mach.lang.manifest.plan.BuildUnit
 
 ```mach
@@ -504,30 +504,6 @@ fwd mach.lang.manifest.plan.scope_is_dependency
 
 forwards [`mach.lang.manifest.plan.scope_is_dependency`](manifest/plan.md#fun-scope_is_dependency)
 
-## fwd mach.lang.manifest.plan.ResolvedTarget
-
-```mach
-fwd mach.lang.manifest.plan.ResolvedTarget
-```
-
-forwards [`mach.lang.manifest.plan.ResolvedTarget`](manifest/plan.md#rec-resolvedtarget)
-
-## fwd mach.lang.manifest.plan.ResolvedProfile
-
-```mach
-fwd mach.lang.manifest.plan.ResolvedProfile
-```
-
-forwards [`mach.lang.manifest.plan.ResolvedProfile`](manifest/plan.md#rec-resolvedprofile)
-
-## fwd mach.lang.manifest.plan.resolve_profile
-
-```mach
-fwd mach.lang.manifest.plan.resolve_profile
-```
-
-forwards [`mach.lang.manifest.plan.resolve_profile`](manifest/plan.md#fun-resolve_profile)
-
 ## fwd mach.lang.manifest.plan.local_path_demanded_by_step
 
 ```mach
@@ -552,21 +528,21 @@ fwd mach.lang.manifest.plan.resolve_artifact_reqs
 
 forwards [`mach.lang.manifest.plan.resolve_artifact_reqs`](manifest/plan.md#fun-resolve_artifact_reqs)
 
-## fwd mach.lang.manifest.plan.resolve_default_library_reqs
+## fwd mach.lang.manifest.plan.resolve_export_reqs
 
 ```mach
-fwd mach.lang.manifest.plan.resolve_default_library_reqs
+fwd mach.lang.manifest.plan.resolve_export_reqs
 ```
 
-forwards [`mach.lang.manifest.plan.resolve_default_library_reqs`](manifest/plan.md#fun-resolve_default_library_reqs)
+forwards [`mach.lang.manifest.plan.resolve_export_reqs`](manifest/plan.md#fun-resolve_export_reqs)
 
-## fwd mach.lang.manifest.plan.default_library_requires
+## fwd mach.lang.manifest.plan.export_requires
 
 ```mach
-fwd mach.lang.manifest.plan.default_library_requires
+fwd mach.lang.manifest.plan.export_requires
 ```
 
-forwards [`mach.lang.manifest.plan.default_library_requires`](manifest/plan.md#fun-default_library_requires)
+forwards [`mach.lang.manifest.plan.export_requires`](manifest/plan.md#fun-export_requires)
 
 ## fwd mach.lang.manifest.plan.plan_steps
 
@@ -583,14 +559,6 @@ fwd mach.lang.manifest.plan.plan_export_steps
 ```
 
 forwards [`mach.lang.manifest.plan.plan_export_steps`](manifest/plan.md#fun-plan_export_steps)
-
-## fwd mach.lang.manifest.plan.select_primary_artifact
-
-```mach
-fwd mach.lang.manifest.plan.select_primary_artifact
-```
-
-forwards [`mach.lang.manifest.plan.select_primary_artifact`](manifest/plan.md#fun-select_primary_artifact)
 
 ## fwd mach.lang.manifest.plan.resolve_build_unit
 
@@ -664,6 +632,46 @@ fwd mach.lang.manifest.select.Cell
 
 forwards [`mach.lang.manifest.select.Cell`](manifest/select.md#rec-cell)
 
+## fwd mach.lang.manifest.select.ResolvedTarget
+
+```mach
+fwd mach.lang.manifest.select.ResolvedTarget
+```
+
+forwards [`mach.lang.manifest.select.ResolvedTarget`](manifest/select.md#rec-resolvedtarget)
+
+## fwd mach.lang.manifest.select.ResolvedProfile
+
+```mach
+fwd mach.lang.manifest.select.ResolvedProfile
+```
+
+forwards [`mach.lang.manifest.select.ResolvedProfile`](manifest/select.md#rec-resolvedprofile)
+
+## fwd mach.lang.manifest.select.resolve_profile
+
+```mach
+fwd mach.lang.manifest.select.resolve_profile
+```
+
+forwards [`mach.lang.manifest.select.resolve_profile`](manifest/select.md#fun-resolve_profile)
+
+## fwd mach.lang.manifest.select.cell_of
+
+```mach
+fwd mach.lang.manifest.select.cell_of
+```
+
+forwards [`mach.lang.manifest.select.cell_of`](manifest/select.md#fun-cell_of)
+
+## fwd mach.lang.manifest.select.resolve_cell
+
+```mach
+fwd mach.lang.manifest.select.resolve_cell
+```
+
+forwards [`mach.lang.manifest.select.resolve_cell`](manifest/select.md#fun-resolve_cell)
+
 ## fwd mach.lang.manifest.select.selectors_init
 
 ```mach
@@ -679,6 +687,14 @@ fwd mach.lang.manifest.select.selectors_of
 ```
 
 forwards [`mach.lang.manifest.select.selectors_of`](manifest/select.md#fun-selectors_of)
+
+## fwd mach.lang.manifest.select.selectors_dnit
+
+```mach
+fwd mach.lang.manifest.select.selectors_dnit
+```
+
+forwards [`mach.lang.manifest.select.selectors_dnit`](manifest/select.md#fun-selectors_dnit)
 
 ## fwd mach.lang.manifest.select.single_selection_fail
 
@@ -710,10 +726,9 @@ the file name of a project manifest, looked up in a project root
 pub fun canonical_module(m: *Manifest) intern.StrId;
 ```
 
-the public entry a bare `use <id>;` binds: the one `entry` shared by every
-library artifact marked `default = true`. a `bin` never publishes an entry
+the public entry a bare `use <id>;` binds: the entry of the library artifact
+marked `export = true`. a `bin` never publishes an entry
 
 m: a parsed manifest
-ret: the shared entry id; STR_NIL when no library artifact is a default or two
-     default library artifacts name different entries
+ret: the export library's entry id; STR_NIL when no artifact is exported
 
