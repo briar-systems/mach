@@ -1,11 +1,5 @@
 # mach.lang.me.scratch
 
-## rec Function
-
-```mach
-pub rec Function;
-```
-
 ## rec Workspace
 
 ```mach
