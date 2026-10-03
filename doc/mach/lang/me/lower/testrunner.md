@@ -45,14 +45,11 @@ the dispatcher's entry: the name the runtime's start routine calls
 ## fun declares_tests
 
 ```mach
-pub fun declares_tests(a: *ast.Ast, text: str) bool;
+pub fun declares_tests(a: *ast.Ast) bool;
 ```
 
 the module has a test object: its source declares a test or a `#[testing]`
 declaration, in any comptime branch
-
-a: the module's parsed tree
-text: the module's source text, which decorator names are spans of
 
 ## fun synthesize_dispatcher
 

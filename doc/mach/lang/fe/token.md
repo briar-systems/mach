@@ -258,16 +258,16 @@ pub val KIND_DOT_DOT_DOT: Kind = 40
 pub val KIND_COLON_TILDE: Kind = 41
 ```
 
-## val KIND_ATTR_OPEN
+## val KIND_DECORATOR_OPEN
 
 ```mach
-pub val KIND_ATTR_OPEN: Kind = 42
+pub val KIND_DECORATOR_OPEN: Kind = 42
 ```
 
 ## val KIND_COLON_GT
 
 ```mach
-pub val KIND_COLON_GT:  Kind = 43
+pub val KIND_COLON_GT:       Kind = 43
 ```
 
 ## val KIND_EOF
