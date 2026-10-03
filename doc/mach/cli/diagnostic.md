@@ -58,6 +58,31 @@ render_fail for a failure built in place
 f: the Fail
 ret: the exit code `exit.of` maps the failure to
 
+## fun dependency_report
+
+```mach
+pub fun dependency_report(a: *A.Allocator) package_report.Report;
+```
+
+where a dependency command reports: progress on standard output, and notes and failures
+the command goes on past on standard error
+
+a: owns the report's effect notes
+ret: the report, released with `package_report.dnit`
+
+## fun dependency_outcome
+
+```mach
+pub fun dependency_outcome(rep: *package_report.Report, outcome: err[fail.Fail]) i64;
+```
+
+show how a dependency command ended: its failure, then a note for each change it made
+before failing
+
+rep: the report the command used
+outcome: how it ended
+ret: exit.OK, or the code `exit.of` maps the failure to
+
 ## fun outcome_code
 
 ```mach
