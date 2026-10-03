@@ -401,7 +401,7 @@ caller's instruction cache, or to hold code size down on a constrained target.
 
 - `inline` and `noinline` on the same function is a direct contradiction and is
   rejected in sema; neither wins silently.
-- `scalar` already declines inlining as a side effect (#2141), so pairing it
+- `scalar` already declines inlining as a side effect, so pairing it
   with `noinline` is legal but redundant.
 - Purely a hint to the inliner; it does not otherwise change codegen. It binds
   at every optimization level — the debug pipeline runs no inlining pass at
@@ -571,28 +571,12 @@ source of faults.
 `std.sync.atomic` is ordinary functions over `*i64`, so a pointer is the only route
 an atomic has to a field, and there is no pointer to hand it.
 
-**Vector fields.** A vector in a packed record is refused for now, including one
-reached through an array or a nested record. The reason is evidence rather than
-arithmetic: an unaligned **scalar** access is measured on real hardware, and that
-measurement is what `#[packed]` rests on.
-
-The vector measurement now exists too. The codegen corpus's `vec/vec_mem` case
-writes `f32x3` and `f32x5` — the two shapes whose size and alignment disagree — into
-packed buffers and records where every write has a live neighbour, folding the
-neighbour after the write so a store too wide by a lane changes the checksum. It
-runs at both pipelines on every target with an execution engine, against a C
-reference the host's own compiler built, so a dropped lane or a disturbed
-neighbouring byte is a differing number rather than a passing run. The row that
-matters is `aarch64-linux` on `ubuntu-24.04-arm`, because aarch64 has 128-bit forms
-with alignment requirements; `x86_64-linux` and `x86_64-windows` carry it too.
-`riscv64-linux` also passes and is not evidence: it runs under qemu-user, and
-riscv64 declares no 128-bit vector support, so the access there is a scalar
-expansion rather than a vector access.
-
-What the refusal still waits on is the other half,
-[#2687](https://github.com/briar-systems/mach/issues/2687) — a lane-dependent vector
-footprint through aggregate layout and ABI classification. This is a sequencing
-decision and is expected to be lifted, not a permanent rule.
+**Vector fields.** A vector in a packed record is refused, including one reached
+through an array or a nested record. Packing places the vector at an offset nothing
+guarantees is a multiple of its width, and a vector's size and alignment can
+disagree (`f32x3`, `f32x5`), so its footprint depends on its lane count through
+aggregate layout and ABI classification. Store the lanes as scalar fields, or drop
+`#[packed]` from the record.
 
 **Interface blocks.** `packed` cannot apply to a `#[uniform]`, `#[storage]` or `#[push]` block:
 its member offsets are fixed by the std140 / std430 layout rules and emitted as

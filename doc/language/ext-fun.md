@@ -235,18 +235,14 @@ ext fun consume(w: Wide) i64;
 This is the platform convention, and mach has no second one. A Mach→Mach call, a
 call through a `fun` value, a callback C invokes and an exported symbol reached by
 `dlsym` are all the same edge, so a C caller and a mach caller hand a mach callee the
-same thing, and a C callee and a mach callee do the same thing with it. Mach used to
-copy an incoming aggregate into storage of its own at entry as well, which made two
-copies of every such argument; [mach#3418][3418] ruled that out and
-[mach#3416][3416] removed it.
+same thing, and a C callee and a mach callee do the same thing with it.
+A mach callee copies nothing at entry: a second copy of every such argument would
+be wasted, since the caller already owns one.
 
 What the language guarantees on top of the convention is the capture point, not a
 second copy: reading an aggregate captures its value where it is read, so a later
 argument cannot change what an earlier one passed
 (see [expressions.md](expressions.md)).
-
-[3418]: https://github.com/briar-systems/mach/issues/3418
-[3416]: https://github.com/briar-systems/mach/issues/3416
 
 ## 128-bit integers and `__int128`
 

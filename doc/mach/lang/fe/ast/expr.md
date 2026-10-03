@@ -309,7 +309,7 @@ pub val LIT_SUFFIX_NONE: type.TypeKind = 0xFF
 ## fun lit_str_content
 
 ```mach
-pub fun lit_str_content(e: *Expr) opt[token.Span];
+pub fun lit_str_content(e: *Expr) opt[lang_source.Span];
 ```
 
 the text between a string literal's quotes, read from its token; none for any other node

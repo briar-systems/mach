@@ -56,7 +56,7 @@ pub fun lower_stored_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId
 
 the value a store consumes. when `in_place` holds, nothing writes memory between this read
 and the store, so an aggregate place is read where it lies and the store copies from it:
-the aggregate copy is overlap-safe, so no snapshot sits between them (#4235, #4241)
+the aggregate copy is overlap-safe, so no snapshot sits between them
 
 ## fun condition_value
 
@@ -93,6 +93,6 @@ pub fun type_is_volatile_record(ctx: *lower_context.LowerContext, sem_ty: type.T
 ## fun field_index_in_type
 
 ```mach
-pub fun field_index_in_type(ctx: *lower_context.LowerContext, rec_ty: type.TypeId, name: token.Span) u32;
+pub fun field_index_in_type(ctx: *lower_context.LowerContext, rec_ty: type.TypeId, name: lang_source.Span) u32;
 ```
 

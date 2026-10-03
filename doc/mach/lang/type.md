@@ -186,7 +186,7 @@ pub val TYPE_CASE_SELECTOR: TypeKind = 24
 pub val TYPE_U128: TypeKind = 25
 ```
 
-the 128-bit integers are appended kinds (#3511): the catalog, never the
+the 128-bit integers are appended kinds: the catalog, never the
 numbering, decides what is primitive
 
 ## val TYPE_I128
@@ -201,7 +201,7 @@ pub val TYPE_I128: TypeKind = 26
 pub val TYPE_F16: TypeKind = 27
 ```
 
-IEEE binary16, appended like the 128-bit integers (#3798)
+IEEE binary16, appended like the 128-bit integers
 
 ## val TYPE_KIND_COUNT
 

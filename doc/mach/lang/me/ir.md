@@ -462,7 +462,7 @@ pub fun constant_behind(fn: *Function, v: value.Value) value.Value;
 ```
 
 the constant a value is: the operand of the `const` that materializes it
-(#3807), read at the use's type and secrecy, and any other value as itself.
+, read at the use's type and secrecy, and any other value as itself.
 a pass that reads constants reads through this, so a materialized constant
 folds and compares as the constant it holds
 
@@ -553,7 +553,7 @@ pub fun dbg_expr_prepend_op(m: *Module, fn: *Function, eid: DbgExprId, op: DbgOp
 ## fun inline_site_add
 
 ```mach
-pub fun inline_site_add(m: *Module, fn: *Function, callee: intern.StrId, call_loc: lang_source.SrcLoc, parent: u32) res[u32, fail.Fail];
+pub fun inline_site_add(m: *Module, fn: *Function, callee: intern.StrId, call_loc: lang_source.Location, parent: u32) res[u32, fail.Fail];
 ```
 
 ## fun instr_inline_site_set

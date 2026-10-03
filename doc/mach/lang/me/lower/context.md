@@ -165,7 +165,7 @@ pub fun gated_lower_member_const_message(lc: *LowerContext, name: intern.StrId, 
 ## fun report_gate
 
 ```mach
-pub fun report_gate(lc: *LowerContext, k: diagnostic_kind.Kind, span: token.Span, message: str) fail.Fail;
+pub fun report_gate(lc: *LowerContext, k: diagnostic_kind.Kind, span: lang_source.Span, message: str) fail.Fail;
 ```
 
 ## fun record_eval_result
@@ -423,7 +423,7 @@ pub rec FnSig;
 ```
 
 a function's signature and the extension each parameter declares, which the
-signless signature does not carry (#3927)
+signless signature does not carry
 
 ## fun lower_fn_sig
 
@@ -492,7 +492,7 @@ pub fun decl_target_op(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, 
 ## fun emit_dbg_birth
 
 ```mach
-pub fun emit_dbg_birth(lc: *LowerContext, name_span: token.Span, ty: ir_type.IrTypeId,
+pub fun emit_dbg_birth(lc: *LowerContext, name_span: lang_source.Span, ty: ir_type.IrTypeId,
 ty_sem: type.TypeId, is_param: bool, val_v: value.Value,
 slot: opt[value.Value]) err[fail.Fail];
 ```

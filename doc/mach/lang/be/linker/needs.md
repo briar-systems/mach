@@ -1,6 +1,6 @@
 # mach.lang.be.linker.needs
 
-the runtime needs a linked executable records for its start code (#3508).
+the runtime needs a linked executable records for its start code.
 codegen marks a module that multiplies a secret in a cell admitted only under
 PSTATE.DIT with the local absolute symbol `ct.DIT_NEED_MARKER`; the link
 unions the marks and, on a target whose os declares the mode guaranteed,

@@ -20,7 +20,7 @@ pub fun int_imm_fits(value: u64, bits: u32) bool;
 
 one instruction takes an integer whose sign extension from 32 bits is
 itself as its immediate; any other is a movabs of its own first, the rule
-the middle end hoists a loop's constants by (#3807)
+the middle end hoists a loop's constants by
 
 ## fun is_trap_terminator
 

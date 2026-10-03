@@ -31,7 +31,7 @@ pub rec ModuleSema;
 ```
 
 exports are append-only, and `index` maps (origin, canon) to the first export with
-that key over the first `indexed` of them (#3472)
+that key over the first `indexed` of them
 
 ## fun module_sema_init
 
@@ -131,7 +131,7 @@ pub rec SemaDeps;
 ```
 
 the imported surfaces are borrowed: the driver owns each one and shares it
-between every importer in a pass (#3472)
+between every importer in a pass
 
 ## fwd type.FieldEntry
 
@@ -263,10 +263,10 @@ pub rec SemaContext;
 ## fun report_deferred_name
 
 ```mach
-pub fun report_deferred_name(sc: *SemaContext, k: diagnostic_kind.Kind, span: token.Span, prefix: str);
+pub fun report_deferred_name(sc: *SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str);
 ```
 
-a name resolve left for the arm sema selects (#3485), reported once at the name itself
+a name resolve left for the arm sema selects, reported once at the name itself
 whichever instantiation walks it, and never for an arm sema discards
 
 ## fun report_deferred_type
@@ -319,7 +319,7 @@ pub fun decl_body_spreads_pack_to_c_variadic(sc: *SemaContext, origin: session.M
 ```mach
 pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: ast_id.DeclId,
 args: *type.TypeId, arg_len: u32, sig: type.TypeId,
-bare: intern.StrId, site: token.Span) res[u8, fail.Fail];
+bare: intern.StrId, site: lang_source.Span) res[u8, fail.Fail];
 ```
 
 ## fun inst_worklist_new
@@ -379,19 +379,19 @@ pub fun machine_of(sc: *SemaContext) layout.Machine;
 ## fun report
 
 ```mach
-pub fun report(sc: *SemaContext, k: diagnostic_kind.Kind, span: token.Span, message: str);
+pub fun report(sc: *SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, message: str);
 ```
 
 ## fun check_handle_in_array
 
 ```mach
-pub fun check_handle_in_array(sc: *SemaContext, ty: type.TypeId, span: token.Span);
+pub fun check_handle_in_array(sc: *SemaContext, ty: type.TypeId, span: lang_source.Span);
 ```
 
 ## fun report_internal
 
 ```mach
-pub fun report_internal(sc: *SemaContext, span: token.Span, message: str);
+pub fun report_internal(sc: *SemaContext, span: lang_source.Span, message: str);
 ```
 
 ## fun diag_mark
@@ -409,13 +409,13 @@ pub fun reported_since(sc: *SemaContext, mark: u64) bool;
 ## fun report_note
 
 ```mach
-pub fun report_note(sc: *SemaContext, k: diagnostic_kind.Kind, span: token.Span, message: str, note: str);
+pub fun report_note(sc: *SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, message: str, note: str);
 ```
 
 ## fun report_numbered
 
 ```mach
-pub fun report_numbered(sc: *SemaContext, k: diagnostic_kind.Kind, span: token.Span, prefix: str, n: usize, suffix: str, fallback: str);
+pub fun report_numbered(sc: *SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str, n: usize, suffix: str, fallback: str);
 ```
 
 ## fun field_table_stage
@@ -544,7 +544,7 @@ pub fun record_eval_result(sc: *SemaContext, r: res[comptime.CTValue, comptime.E
 pub fun attr_string_arg(sc: *SemaContext, dec: *ast_decl.Decorator, ord: u32, kind: diagnostic_kind.Kind, kind_msg: str) opt[str];
 ```
 
-the string argument `ord` of an attribute evaluates to (#4022). one that is
+the string argument `ord` of an attribute evaluates to. one that is
 not a constant expression is refused with `decorator.not_constant`, naming
 the attribute, and a constant that is no string with `kind` and `kind_msg`
 

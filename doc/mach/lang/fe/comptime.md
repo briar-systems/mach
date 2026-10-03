@@ -151,7 +151,7 @@ pub rec CTValue;
 
 an integer value is 128 bits in data.w; data.i is its low limb, and a signed
 value sign-fills the high limb so every reader of a value that fits 64 bits
-sees the same i64 it always did (#3511)
+sees the same i64 it always did
 
 ## rec NamedConst
 
@@ -673,13 +673,13 @@ pub rec LitFloat;
 ## fun scan_lit_int
 
 ```mach
-pub fun scan_lit_int(source: str, span: token.Span) res[LitInt, EvalFail];
+pub fun scan_lit_int(source: str, span: lang_source.Span) res[LitInt, EvalFail];
 ```
 
 ## fun scan_lit_float
 
 ```mach
-pub fun scan_lit_float(source: str, span: token.Span) res[LitFloat, EvalFail];
+pub fun scan_lit_float(source: str, span: lang_source.Span) res[LitFloat, EvalFail];
 ```
 
 a literal's value at the width its suffix names, binary64 when it has none
@@ -687,7 +687,7 @@ a literal's value at the width its suffix names, binary64 when it has none
 ## fun lit_float_at
 
 ```mach
-pub fun lit_float_at(source: str, span: token.Span, w: float.FloatWidth) res[float.Rounded, fail.Fail];
+pub fun lit_float_at(source: str, span: lang_source.Span, w: float.FloatWidth) res[float.Rounded, fail.Fail];
 ```
 
 a literal rounded once its type is known: at its suffix's width when it has one, else at
@@ -702,7 +702,7 @@ ret: the rounded value and how it fit, or the scan's refusal
 ## fun lit_float_spells
 
 ```mach
-pub fun lit_float_spells(source: str, span: token.Span, s: *float.Shortest) bool;
+pub fun lit_float_spells(source: str, span: lang_source.Span, s: *float.Shortest) bool;
 ```
 
 true when the literal's significant digits, leading and trailing zeros and exponent
@@ -711,7 +711,7 @@ spelling aside, are exactly the shortest decimal that rounds back to `s`
 ## fun eval_lit_char
 
 ```mach
-pub fun eval_lit_char(source: str, span: token.Span) res[CTValue, EvalFail];
+pub fun eval_lit_char(source: str, span: lang_source.Span) res[CTValue, EvalFail];
 ```
 
 ## fun cast_scalar
@@ -727,7 +727,7 @@ folded conversion is the one the target makes at run time
 ## fun intrinsic_takes_type_operand
 
 ```mach
-pub fun intrinsic_takes_type_operand(source: str, full: token.Span) bool;
+pub fun intrinsic_takes_type_operand(source: str, full: lang_source.Span) bool;
 ```
 
 ## fun is_type_of_call
@@ -1101,7 +1101,7 @@ pub fun is_comptime_path(a: *ast.Ast, e: ast_id.ExprId) bool;
 ## fun comptime_ident_name
 
 ```mach
-pub fun comptime_ident_name(full: token.Span) token.Span;
+pub fun comptime_ident_name(full: lang_source.Span) lang_source.Span;
 ```
 
 ## val MODE_DEBUG

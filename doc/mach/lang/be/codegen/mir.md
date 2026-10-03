@@ -318,7 +318,6 @@ pub val MIR_VEC_WIDEN_S: MirOpcode = 54
 
 the IR lane-halving extensions: half the operand's integer lanes extended to
 twice the width, the low half at immediate base 0 and the high half at base N
-(#3738)
 
 ## val MIR_VEC_WIDEN_U
 
@@ -335,7 +334,7 @@ pub val MIR_MASK_LT_U: MirOpcode = 56
 all ones when the first operand is below the second read unsigned at the
 source width, zero otherwise, written at the instruction's width: the mask
 a saturating shift keeps its result by, one compare-to-mask sequence on
-every target (#3885). both widths are at most the alu width
+every target. both widths are at most the alu width
 
 ## val MIR_SELECT
 
@@ -343,7 +342,7 @@ every target (#3885). both widths are at most the alu width
 pub val MIR_SELECT:     MirOpcode = 57
 ```
 
-the IR select (#3346): [dst, cond, a, b] writes a when cond, read at the
+the IR select: [dst, cond, a, b] writes a when cond, read at the
 source width, is nonzero, else b. [dst, lhs, rhs, a, b, cmp] of
 MIR_SELECT_CMP decides by the integer compare opcode in the immediate
 `cmp` of lhs and rhs, read at the source width, whose 0/1 answer lowering
@@ -411,7 +410,7 @@ pub val MIR_MUL_HI_U: MirOpcode = 0x1008
 ```
 
 the high half of the full product, at the operands' width; on vector lanes
-the packed high multiply of each lane pair (#4119)
+the packed high multiply of each lane pair
 
 ## val MIR_MUL_HI_S
 
@@ -419,7 +418,7 @@ the packed high multiply of each lane pair (#4119)
 pub val MIR_MUL_HI_S: MirOpcode = 0x1009
 ```
 
-the signed high half, the pair of MIR_MUL_HI_U (#3511); claimed ahead of the
+the signed high half, the pair of MIR_MUL_HI_U; claimed ahead of the
 legalize expansion that will emit it
 
 ## val MIR_LANE_JOIN
@@ -430,7 +429,7 @@ pub val MIR_LANE_JOIN: MirOpcode = 0x100A
 
 a wide value assembled from lane-width pieces (dst, then one operand per
 lane) and one lane of a wide value (dst, src, lane index in imm); both exist
-only above the ALU width and legalize consumes them (#3511)
+only above the ALU width and legalize consumes them
 
 ## val MIR_LANE_PICK
 
@@ -448,7 +447,7 @@ the fixed-pair widening multiply of a MULW_FIXED_PAIR target: operands
 [acc, src], both one lane wide, where acc is the target's fixed accumulator
 (div_reg) and the instruction leaves the low half in it and the high half in
 div_hi_reg (x86's one-operand mul and imul). legalize emits it; only a
-target that declares the form has a rule for it (#3511)
+target that declares the form has a rule for it
 
 ## val MIR_MUL_PAIR_S
 
@@ -463,7 +462,7 @@ pub val MIR_VEC_RANGE: MirOpcode = 0x100E
 ```
 
 the IR lane range (dst, src, first lane in imm): the source's lanes from the
-first on, of the same lane type (#3864)
+first on, of the same lane type
 
 ## val MIR_VEC_CONCAT
 
@@ -473,7 +472,7 @@ pub val MIR_VEC_CONCAT: MirOpcode = 0x100F
 
 a lane join of two parts (dst, lo, hi, the lanes of lo in imm): the lanes of
 lo and then those of hi, of one lane type, in one register. the IR join of
-more parts lowers to a chain of these (#3589)
+more parts lowers to a chain of these
 
 ## val MIR_VEC_UPPER_CLEAR
 
@@ -485,7 +484,7 @@ the upper bytes of the vector registers above the compute width are
 cleared: a value wider than `vector_bits` a convention carried has left its
 register, and nothing the function holds lives above the compute width.
 emitted only where the model's register-width row says the narrower code
-pays for that state (isa.vector_upper_clear), x86-64's vzeroupper (#3751)
+pays for that state (isa.vector_upper_clear), x86-64's vzeroupper
 
 ## val MIR_VEC_INTERLEAVE
 
@@ -494,7 +493,7 @@ pub val MIR_VEC_INTERLEAVE: MirOpcode = 0x1011
 ```
 
 the IR lane interleave (dst, lo, hi, the first lane of the half in imm): lane
-i of lo and of hi from that lane on, joined into one lane twice as wide (#4119)
+i of lo and of hi from that lane on, joined into one lane twice as wide
 
 ## val MIR_VEC_WIDEN_SUM_U
 
@@ -504,7 +503,7 @@ pub val MIR_VEC_WIDEN_SUM_U: MirOpcode = 0x1012
 
 the IR widening group sum (dst, src): each result lane the zero-extended
 sum of the operand lanes it covers, the vec_lane naming the result lane and
-carrying the operand's (#4161)
+carrying the operand's
 
 ## val MIR_VEC_SIGN_MASK
 
@@ -513,7 +512,7 @@ pub val MIR_VEC_SIGN_MASK: MirOpcode = 0x1013
 ```
 
 the IR lane sign mask (dst, src): each integer lane of src all ones when it
-is negative, else zero (#4198)
+is negative, else zero
 
 ## val MIR_SEL_ADD
 
@@ -692,7 +691,7 @@ pub val MIR_SEL_NOT: MirOpcode = 0x1127
 pub val MIR_SEL_MUL_PAIR_U: MirOpcode = 0x1128
 ```
 
-the selected fixed-pair widening multiply (#3511)
+the selected fixed-pair widening multiply
 
 ## val MIR_SEL_MUL_PAIR_S
 
@@ -706,7 +705,7 @@ pub val MIR_SEL_MUL_PAIR_S: MirOpcode = 0x1129
 pub val MIR_SEL_MASK_LT_U: MirOpcode = 0x112A
 ```
 
-the selected compare-to-mask (#3885)
+the selected compare-to-mask
 
 ## val MIR_SEL_SELECT
 
@@ -714,7 +713,7 @@ the selected compare-to-mask (#3885)
 pub val MIR_SEL_SELECT:     MirOpcode = 0x112B
 ```
 
-the selected selects (#3346)
+the selected selects
 
 ## val MIR_SEL_SELECT_CMP
 
@@ -1195,7 +1194,7 @@ pub rec MirOperand;
 ```
 
 an immediate is 128 bits: imm is the low limb and imm_hi the high one, so
-every 64-bit immediate reads as its sign extension (#3511)
+every 64-bit immediate reads as its sign extension
 
 ## rec MirAsmBind
 
@@ -1343,12 +1342,12 @@ pub rec MirDbgBinding;
 
 lane: which lane of a value wider than one register `vreg` holds, of `lanes`
 lanes each `lane_bytes` wide but the last, which is `last_bytes` wide when
-that is not 0 (a split vector whose last piece holds the lanes left, #3589);
+that is not 0 (a split vector whose last piece holds the lanes left);
 `lanes` is 0 when `vreg` holds the whole value.
 at_end: the binding is published at the end of the instruction that carries
 it, where that instruction's def exists, instead of at its start.
 lhs_is_imm on a binding that is not a compare: the value is the constant
-`imm` rather than any vreg's, a value the allocator builds at its reads (#4185)
+`imm` rather than any vreg's, a value the allocator builds at its reads
 
 ## val DBG_LANES_MAX
 
@@ -1518,7 +1517,7 @@ same store the front-end passes of the module wrote; owned by the caller
 ## fun reject
 
 ```mach
-pub fun reject(diags: *diagnostic.DiagnosticStore, k: diagnostic_kind.Kind, loc: lang_source.SrcLoc, text: str) fail.Fail;
+pub fun reject(diags: *diagnostic.DiagnosticStore, k: diagnostic_kind.Kind, loc: lang_source.Location, text: str) fail.Fail;
 ```
 
 a backend pass rejects the program through the shared located refusal
@@ -1526,7 +1525,7 @@ a backend pass rejects the program through the shared located refusal
 ## fun refusal_loc
 
 ```mach
-pub fun refusal_loc(f: *MirFunction, mi: *MirInstr) lang_source.SrcLoc;
+pub fun refusal_loc(f: *MirFunction, mi: *MirInstr) lang_source.Location;
 ```
 
 the location a refusal of `mi` in `f` reports: the instruction's own when it
@@ -1725,7 +1724,7 @@ lane: u8, lanes: u8, lane_bytes: u8, last_bytes: u8, at_end: bool) err[fail.Fail
 
 a binding of one piece of a value held in several registers: `vreg` is its
 `lane`-th piece of `lanes`, each `lane_bytes` wide but a last one of
-`last_bytes` when that is not 0 (#3589)
+`last_bytes` when that is not 0
 
 ## fun instr_pass_dbg
 

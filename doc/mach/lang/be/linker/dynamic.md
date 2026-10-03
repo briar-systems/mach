@@ -27,7 +27,7 @@ merged: *MergedSection, groups: *SectionGroups) err[fail.Fail];
 
 reserves the format's call-stub table at the end of the merged code, before
 anything is given an address, so a call site and its stub are never separated
-by the image's data however large it is (#3888); the addresses are read back
+by the image's data however large it is; the addresses are read back
 by place_call_stubs once the layout is final
 
 ## fun place_call_stubs
@@ -45,7 +45,7 @@ merged: *MergedSection, groups: *SectionGroups) err[fail.Fail];
 
 reserves the format's import GOT at the end of the read-only data, before
 anything is given an address, so the zero-fill that follows it never
-separates the code from its slots however large it is (#3903). a GOT the
+separates the code from its slots however large it is. a GOT the
 linker already synthesized for defined symbols ends the same section under
 the same name, and the import slots extend it; the address is read back by
 place_import_got once the layout is final
