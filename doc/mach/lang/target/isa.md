@@ -953,13 +953,22 @@ what a manifest's `extensions` entry `name[0..len]` selects: a level's
 members when the model publishes one by that spelling, else the row's bit,
 0 when the vocabulary has neither
 
-## fun spell_levels
+## fun spelling_finish
 
 ```mach
-pub fun spell_levels(m: *MachineModel, buf: *u8, cap: usize);
+pub fun spelling_finish(b: *textbuild.TextBuilder, r: err[textbuild.Error]) res[str, fail.Fail];
 ```
 
-the model's levels, `, `-separated in buf, empty when it publishes none
+the text a spelling built into `b`, owned by `b`'s allocator (released with
+str_free), or the failure that stopped it; `b` is released either way
+
+## fun level_names
+
+```mach
+pub fun level_names(a: *A.Allocator, m: *MachineModel) res[str, fail.Fail];
+```
+
+the model's levels, `, `-separated, empty when it publishes none; owned by `a`
 
 ## fun extension_close
 
@@ -985,21 +994,29 @@ a target selects is never a decorator's, and `target_only` says why
 pub fun decorator_extension(reg: *IsaRegistry, selected: ExtensionView, name: str, len: usize) DecoratorExtension;
 ```
 
-## fun spell_extensions
+## fun extension_names
 
 ```mach
-pub fun spell_extensions(m: *MachineModel, buf: *u8, cap: usize);
+pub fun extension_names(a: *A.Allocator, m: *MachineModel) res[str, fail.Fail];
 ```
 
-the model's vocabulary, `, `-separated, or `none`, NUL-terminated in buf
+the model's vocabulary, `, `-separated, or `none`; owned by `a`
 
-## fun spell_all_extensions
+## fun table_names
 
 ```mach
-pub fun spell_all_extensions(reg: *IsaRegistry, buf: *u8, cap: usize);
+pub fun table_names(a: *A.Allocator, table: *extension.Extension, count: u32) res[str, fail.Fail];
 ```
 
-every registered vocabulary's names, each table once, `, `-separated in buf
+the names of an extension table, `, `-separated; owned by `a`
+
+## fun registered_extension_names
+
+```mach
+pub fun registered_extension_names(a: *A.Allocator, reg: *IsaRegistry) res[str, fail.Fail];
+```
+
+every registered vocabulary's names, each table once, `, `-separated; owned by `a`
 
 ## fun ct_mul_forms_refusal
 

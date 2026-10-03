@@ -21,8 +21,10 @@ pub fun compose_module_fqn(alloc: *A.Allocator, itn: *intern.Interner, id_text: 
 ## fun diag_join_named
 
 ```mach
-pub fun diag_join_named(s: *session.Session, prefix: str, name_id: intern.StrId, suffix: str, fallback: str) str;
+pub fun diag_join_named(s: *session.Session, prefix: str, name_id: intern.StrId, suffix: str) res[str, fail.Fail];
 ```
+
+`prefix`, the text of `name_id`, then `suffix`, interned
 
 ## fun join_path
 

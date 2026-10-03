@@ -286,11 +286,13 @@ pub fun reset_link_providers(s: *Session);
 pub fun record_link_publication(s: *Session, path: str, revision: query.Revision, digest: *[32]u8) err[fail.Fail];
 ```
 
-## fun lookup_link_publication
+## fun link_publication_at
 
 ```mach
-pub fun lookup_link_publication(s: *Session, path: str, revision: query.Revision, out: *[32]u8) bool;
+pub fun link_publication_at(s: *Session, path: str, revision: query.Revision) opt[[32]u8];
 ```
+
+the digest the link at `revision` published to `path`, none when it published none there
 
 ## fun register_module_phase
 

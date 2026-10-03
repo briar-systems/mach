@@ -101,7 +101,7 @@ ret: ok with `p.config.req_scopes` set; err from output expansion
 ## fun resolve_cascade_libs
 
 ```mach
-pub fun resolve_cascade_libs(p: *project.Project, isa: str, os: str, abi: str,
+pub fun resolve_cascade_libs(p: *project.Project, isa: intern.StrId, os: intern.StrId, abi: intern.StrId,
 own_libs: *manifest.LinkRequirement, own_count: u32) err[fail.Fail];
 ```
 
@@ -114,13 +114,13 @@ pub fun build_dep_root(alloc: *A.Allocator, project_root: str, dir_dep: str, ali
 ## fun cell_tmpl_vars
 
 ```mach
-pub fun cell_tmpl_vars(p: *project.Project) manifest.TmplVars;
+pub fun cell_tmpl_vars(p: *project.Project) template.Values;
 ```
 
 ## fun owner_tmpl_vars
 
 ```mach
-pub fun owner_tmpl_vars(p: *project.Project, owner: str) manifest.TmplVars;
+pub fun owner_tmpl_vars(p: *project.Project, owner: str) template.Values;
 ```
 
 `cell_tmpl_vars` whose `{artifact.<id>.out}` resolves in the requirement scope

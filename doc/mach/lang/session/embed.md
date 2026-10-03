@@ -40,7 +40,7 @@ pub fun init(alloc: *A.Allocator) EmbedCache;
 ## fun set_path_env
 
 ```mach
-pub fun set_path_env(c: *EmbedCache, root: str, scopes: *manifest.RequirementScope, scope_count: u32,
+pub fun set_path_env(c: *EmbedCache, root: str, scopes: *template.Requirements, scope_count: u32,
 builds: bool);
 ```
 
@@ -76,7 +76,7 @@ that reads other files, and reads the entry's current state
 
 ```mach
 pub fun resolve_arg(alloc: *A.Allocator, c: *EmbedCache, itn: *intern.Interner, module_fqn: intern.StrId,
-decl_file: str, arg: str) res[str, manifest.TemplateError];
+decl_file: str, arg: str) res[str, fail.Fail];
 ```
 
 resolve an `embed` argument: a literal path against the declaring file's
@@ -88,7 +88,8 @@ itn: resolves the module and scope names
 module_fqn: the declaring module, whose head segment names its project
 decl_file: the declaring file's path
 arg: the decorator's path argument
-ret: the resolved path; err as `manifest.expand_artifact_path`
+ret: the resolved path; err as `template.expand` refuses the template in
+            an `embed` path, or when the build has no project root to resolve it in
 
 ## fun escapes_root
 
