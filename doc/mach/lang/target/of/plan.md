@@ -151,6 +151,16 @@ pub fun align_bytes(value: usize, align: usize) res[usize, fail.Fail];
 a checked alignment for a writer that has no plan of its own: the same
 primitive, refusing an invalid alignment and an overflowing round-up
 
+## fun align_bounded
+
+```mach
+pub fun align_bounded(value: usize, align: usize) usize;
+```
+
+`align_bytes` for a value its writer has already bounded far below the file
+limit, as a name or a step count is: a round-up that fails is a compiler
+defect
+
 ## fun align_up
 
 ```mach

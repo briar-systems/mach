@@ -24,7 +24,7 @@ pub fun fill_section_bases(modules: *target_of.ObjectImage, module_count: u32, s
 ## fun add_u32_counts
 
 ```mach
-pub fun add_u32_counts[Unit](left: u32, right: u32) res[u32, layout.CheckCause];
+pub fun add_u32_counts[Unit](left: u32, right: u32) res[u32, lang_checked.Cause];
 ```
 
 ## fun total_sections

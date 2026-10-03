@@ -14,7 +14,7 @@ optimisation level of a profile, decoded from `[profile.<name>].opt`
 pub val MOPT_DEBUG: MOpt = 1
 ```
 
-`found = 0`: the debug pipeline
+`opt = 0`: the debug pipeline
 
 ## val MOPT_RELEASE
 
@@ -22,7 +22,7 @@ pub val MOPT_DEBUG: MOpt = 1
 pub val MOPT_RELEASE: MOpt = 2
 ```
 
-`found = 1` or `found = 2`: the release pipeline; both integers map here
+`opt = 1` or `opt = 2`: the release pipeline; both integers map here
 
 ## def SimdMode
 
@@ -39,7 +39,7 @@ decoded from `[profile.<name>].simd`
 pub val SIMD_SCALARIZE: SimdMode = 0
 ```
 
-`simd = "scalarize"`: emit the scalar expansion; the default for a dependency profile
+`simd = "scalarize"`: emit the scalar expansion
 
 ## val SIMD_REQUIRE
 
@@ -93,11 +93,9 @@ out: the required `out` key, an unexpanded path template relative to the
               expanded `[project].out`
 targets: the required `targets` array of declared target names or "*"; nil when empty
 target_count: length of `targets`
-link: the `link` array of `[link.<name>]` names; required at the root (`[]` for
-              none), optional in a dependency; nil when empty
+link: the `link` array of `[link.<name>]` names; nil when absent or empty
 link_count: length of `link`
-need: category-qualified step and artifact names or globs; required at the root
-              (`[]` for none), optional in a dependency; nil when empty
+need: category-qualified step and artifact names or globs; nil when absent or empty
 need_count: length of `need`
 is_lib: true unless `kind = "bin"`
 is_default: `default = true`; false when the key is absent
@@ -116,14 +114,12 @@ need_at: where each `need` entry is written, parallel to `need`
 pub rec ProfileDef;
 ```
 
-one explicit `[profile.<name>]` compilation policy as parsed, or one of the two
-profiles synthesized for a dependency manifest that declares none: `debug`
-(opt 0, debug true, vectorize false, default) and `release` (opt 2, debug
-false, vectorize true). a root manifest declares at least one
+one `[profile.<name>]` compilation policy as parsed. every manifest declares at
+least one
 
 name: the table key; a portable identifier
 is_default: `default = true`; false when the key is absent. more than one
-               default across declared profiles is a parse error at the root
+               default is a parse error
 opt: the required `opt` key
 debug: the required `debug` key
 simd: the required `simd` key
@@ -131,7 +127,7 @@ vectorize: the required `vectorize` key
 float_reassoc: the required `float_reassoc` key
 allow: the optional `allow` key: the warning kinds the profile silences,
                empty when the key is absent
-at: where the table's key is written, the zero place when synthesized
+at: where the table's key is written
 default_at: where its `default` value is written, the zero place when absent
 
 ## rec DepDef
@@ -201,17 +197,14 @@ path: the `path` key, required for a local source and rejected otherwise; a
                     project-relative path template, STR_NIL for non-local
 symbols: the `symbols` array; every entry non-empty and unique; nil when absent
 symbol_count: length of `symbols`
-os: the `os` filter axis: a string, an array of strings, or "*"; nil when absent or `[]`
+os: the required `os` filter axis, each value canonical or "*"; nil for `[]`,
+                    which matches no target
 os_count: length of `os`
-os_present: whether the `os` key was written. absent matches every target, `[]`
-                    matches none. required at the root, where every value must be canonical or "*"
 isa: the `isa` filter axis, as `os`
 isa_count: length of `isa`
-isa_present: as `os_present`
 abi: the `abi` filter axis, as `os`
 abi_count: length of `abi`
-abi_present: as `os_present`
-export: the `export` key, required at the root; false when absent in a dependency
+export: the `export` key; false when absent
 include_referenced: the `include` key: false for "always" (the default), true for "referenced"
 at: where the table's key is written
 path_at: where the `path` value is written, the zero place when absent
@@ -236,8 +229,7 @@ in: the required `in` array of project-relative paths
 in_count: length of `in`
 out: the required `out` array of project-relative paths; a '*' is rejected
 out_count: length of `out`
-need: the `need` array of step-qualified names or globs; required at the root (`[]` for none),
-            optional in a dependency
+need: the `need` array of step-qualified names or globs; nil when absent or empty
 need_count: length of `need`
 timeout: the `timeout` key, a duration such as "30s"; 0 when absent
 at: where the table's key is written
@@ -270,8 +262,7 @@ target_count: length of `targets`
 native_target: the owned synthesized host definition when no targets are declared
 artifacts: the `[artifact.*]` tables, nil when none
 artifact_count: length of `artifacts`
-profiles: the `[profile.*]` tables; at the root at least one, in a dependency
-                the two synthesized ones when none are declared
+profiles: the `[profile.*]` tables, at least one
 profile_count: length of `profiles`
 deps: the `[dep.*]` tables, nil when none
 dep_count: length of `deps`

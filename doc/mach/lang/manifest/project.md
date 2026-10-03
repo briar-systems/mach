@@ -57,28 +57,13 @@ pub fun duplicate_profiles(alloc: *A.Allocator, m: *Manifest, message: str) fail
 a refusal of more than one `default = true` profile, pointing at the first
 `default` value and naming the others as related
 
-## val MISSING_PROFILE_MESSAGE
-
-```mach
-pub val MISSING_PROFILE_MESSAGE: str = "mach.toml: no [profile.<name>] table is declared
-```
-
 ## fun parse_profiles
 
 ```mach
-pub fun parse_profiles(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[fail.Fail];
+pub fun parse_profiles(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
 ```
 
-the `[profile.*]` tables. a root manifest declares at least one; a dependency
-manifest that declares none gets the two synthesized ones, since its profiles
-are never read to build the consumer
-
-## fun builtin_profile
-
-```mach
-pub fun builtin_profile(itn: *intern.Interner, name: str, found: MOpt, debug: bool,
-vectorize: bool, is_default: bool) ProfileDef;
-```
+the `[profile.*]` tables; the schema check admits no manifest without one
 
 ## fun find_target_by_name
 

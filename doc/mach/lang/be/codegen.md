@@ -24,6 +24,7 @@ the back half of one module. a rejection of the program by any pass is an
 error appended to `diags`, the module's diagnostic store, and answers
 `reported`; a `message` failure is the apparatus (allocator, I/O, a target
 without a model) or a compiler defect
+the module's scratch arena grows from the session's backing allocator
 
 ## fun prepare_debug
 

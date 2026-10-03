@@ -4,7 +4,7 @@
 
 ```mach
 pub fun execute(bp: *build_plan.BuildPlan, backing: *A.Allocator, oa: *A.Allocator,
-ev: *readout.Progress) res[outcome.BuildOutcome, fail.Fail];
+sink: *readout.Sink) res[outcome.BuildOutcome, fail.Fail];
 ```
 
 run every planned cell cold: each unit gets its own session and arena over `backing`
@@ -16,8 +16,8 @@ unit
 
 bp: the plan, read only
 backing: the allocator each unit's arena grows from; released per unit
-oa: owns the returned outcome and every path, event and text in it
-ev: progress sink for the readout; nil for none
+oa: owns the returned outcome and every path and text in it
+sink: where every unit, failure, diagnostic and phase row is sent as it happens; nil for none
 ret: the outcome, released with outcome.outcome_dnit, or an engine failure whose text
          `oa` owns
 
@@ -25,7 +25,7 @@ ret: the outcome, released with outcome.outcome_dnit, or an engine failure whose
 
 ```mach
 pub fun execute_warm(bp: *build_plan.BuildPlan, unit_index: usize, s: *session.Session, oa: *A.Allocator,
-ev: *readout.Progress) res[outcome.BuildOutcome, fail.Fail];
+sink: *readout.Sink) res[outcome.BuildOutcome, fail.Fail];
 ```
 
 run one planned cell through a caller-owned session, reusing its query cache, source
@@ -38,7 +38,7 @@ bp: the plan, read only
 unit_index: the cell to run; out of range is an internal failure
 s: the warm session; its registry, sources and queries carry over between calls
 oa: owns the returned outcome
-ev: progress sink for the readout; nil for none
+sink: where the unit's failures, diagnostics and phase rows are sent as they happen; nil for none
 ret: the outcome of that one unit, released with outcome.outcome_dnit, or an engine failure
 
 ## fun set_link_config_input
