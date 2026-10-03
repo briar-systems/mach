@@ -85,9 +85,6 @@ its start. A column counts bytes, not characters, so a tool that needs UTF-16
 columns converts from the line's text. `line` and `column` are the position
 the human rendering shows after `-->`.
 
-`primary` may carry a `label`, a string, when a diagnostic labels its primary
-span.
-
 ### Origins
 
 | Origin | Produced by |

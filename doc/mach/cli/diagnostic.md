@@ -187,7 +187,6 @@ root: the project root as the command resolved it, nil until then; a json
           record names a file inside it relative to it
 errors: the error records written
 warnings: the warning records written
-notes: the note records written
 made: whether the arena record paths are built in, and the base they are
           measured from, have been made; they are on first use
 
