@@ -1,0 +1,511 @@
+# call planning: the specialised copy of each function per pointer binding at its call sites
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std_format: std.format;
+
+use A: std.allocator;
+
+use lang_checked: mach.lang.checked;
+use mach.lang.diagnostic;
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.float;
+use mach.lang.growth;
+use mach.lang.intern;
+use mach.lang.layout;
+use me_ir:   mach.lang.me.ir;
+use ir_id:   mach.lang.me.ir.id;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use lang_mir:          mach.lang.mir;
+use mir_debug:         mach.lang.mir.debug;
+use mir_structure:     mach.lang.mir.structure;
+use mir_unit:          mach.lang.mir.unit;
+use lang_source:       mach.lang.source;
+use target_definition: mach.lang.target.definition;
+use mach.lang.target.extension;
+use extension_spirv: mach.lang.target.extension.spirv;
+use mach.lang.target.isa;
+use isa_spirv: mach.lang.target.isa.spirv;
+use mach.lang.target.isa.spirv.debug;
+use mach.lang.target.isa.spirv.defs;
+use mach.lang.target.isa.spirv.ops;
+use mach.lang.target.isa.spirv.types;
+use target_model: mach.lang.target.model;
+use model_spirv:  mach.lang.target.model.spirv;
+use target_of:    mach.lang.target.of;
+use mach.lang.textbuild;
+use emitter: mach.lang.target.isa.spirv.emit.emitter;
+use emit_global: mach.lang.target.isa.spirv.emit.global;
+use emit_value: mach.lang.target.isa.spirv.emit.value;
+
+# the copies this module emits: each seed's own, then every one a planned copy's
+# calls ask for, keyed by how each call binds the callee's pointer parameters. the
+# call graph is acyclic by now, so the set is finite
+pub fun plan_copies(e: *emitter.Emit) err[fail.Fail] {
+    var fx: u32 = 0;
+    for (fx < e.fn_len) {
+        if (e.fns[fx].emit && emitter.fn_is_seed(e, fx)) {
+            val at: u32 = e.keys.len::u32;
+            val n:  u32 = emitter.fn_ir(e, fx).param_count;
+            var k:  u32 = 0;
+            for (k < n) {
+                var bind: u32 = emitter.BIND_VALUE;
+                if (emit_value.param_is_pointer(e, fx, k)) { bind = emitter.BIND_WHOLE; }
+                val pr: res[usize, A.Error] = collections_vector.push[u32](?e.keys, bind);
+                if (sel pr.err) { ret err[fail.Fail].err{fail.refused(pr.err)}; }
+                k = k + 1;
+            }
+            val ar: res[u32, fail.Fail] = add_copy(e, fx, at);
+            if (sel ar.err) { ret err[fail.Fail].err{ar.err}; }
+        }
+        fx = fx + 1;
+    }
+
+    var ad: emitter.Addr = addr_init(e);
+    fin { collections_vector.dnit[emitter.AddrStep](?ad.steps); }
+    var cx: u32 = 0;
+    for (cx < e.copies.len::u32) {
+        val r: err[fail.Fail] = plan_calls(e, cx, ?ad);
+        if (sel r.err) { ret r; }
+        cx = cx + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun addr_init(e: *emitter.Emit) emitter.Addr {
+    var ad: emitter.Addr;
+    ad.root    = 0;
+    ad.gix     = emit_global.GL_NONE;
+    ad.vreg    = lang_mir.MIR_VREG_NIL.n;
+    ad.param   = 0;
+    ad.root_mi = 0;
+    ad.root_ty = ir_type.IRT_NIL;
+    ad.cur_mi  = 0;
+    ad.cur_ty  = ir_type.IRT_NIL;
+    ad.steps   = collections_vector.init[emitter.AddrStep](e.alloc);
+    ret ad;
+}
+
+fun plan_calls(e: *emitter.Emit, cx: u32, ad: *emitter.Addr) err[fail.Fail] {
+    val fx: u32                   = e.copies.data[cx].fx;
+    val mf: *lang_mir.MirFunction = emitter.fn_mir(e, fx);
+    if (mf == nil) { ret err[fail.Fail].ok{}; }
+    # which pointer arguments are physical, from where the copy's registers point
+    val saved: *me_ir.Module = e.ir;
+    e.ir = emitter.fn_mod(e, fx);
+    fin { e.ir = saved; }
+    val n:  u32               = mf.vreg_count;
+    val rp: res[*u8, A.Error] = A.allocate[u8](e.alloc, (n + 1)::usize);
+    if (sel rp.err) { ret err[fail.Fail].err{fail.refused(rp.err)}; }
+    val prov: *u8 = rp.ok;
+    fin { A.deallocate[u8](e.alloc, prov, (n + 1)::usize); }
+    emit_value.classify_pointers(e, cx, mf, prov);
+    var bi: u32 = 0;
+    for (bi < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            ii = ii + 1;
+            val gx: u32 = mach_callee(e, fx, mi);
+            if (gx == emitter.FN_NONE) { cnt; }
+            val at: u32                  = e.keys.len::u32;
+            val kr: res[bool, fail.Fail] = call_key(e, cx, mf, mi, gx, ad, prov, n);
+            if (sel kr.err) { ret err[fail.Fail].err{kr.err}; }
+            # a call the emitter refuses asks for no copy
+            if (!kr.ok) {
+                e.keys.len = at::usize;
+                cnt;
+            }
+            val ar: res[u32, fail.Fail] = add_copy(e, gx, at);
+            if (sel ar.err) { ret err[fail.Fail].err{ar.err}; }
+        }
+        bi = bi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the emitted function a call's body is, FN_NONE for an `op`, an import or a callee with no body here
+pub fun mach_callee(e: *emitter.Emit, fx: u32, mi: *lang_mir.MirInstr) u32 {
+    if (mi.opcode != lang_mir.MIR_VALUE_CALL || mi.operand_count < 2) { ret emitter.FN_NONE; }
+    if (mi.operands[0].kind != lang_mir.MIR_OP_SYM)                   { ret emitter.FN_NONE; }
+    val xfn: *me_ir.Function = emit_value.ir_function_record(emitter.fn_mod(e, fx), mi.operands[0].sym);
+    if (xfn != nil && (xfn.op_set != defs.SPV_SET_NONE || xfn.is_import)) { ret emitter.FN_NONE; }
+    val gx: u32 = emitter.fn_lookup(e, mi.operands[0].sym);
+    if (gx == emitter.FN_NONE || !e.fns[gx].emit) { ret emitter.FN_NONE; }
+    ret gx;
+}
+
+pub fun param_is_handle(e: *emitter.Emit, fx: u32, k: u32) bool {
+    val fn: *me_ir.Function = emitter.fn_ir(e, fx);
+    if (k >= fn.param_count) { ret false; }
+    val t: opt[*ir_type.IrType] = ir_type.get(?emitter.fn_mod(e, fx).types, fn.params[k].ty);
+    if (sel t.none) { ret false; }
+    ret t.some.kind == ir_type.IRT_HANDLE;
+}
+
+# the copy of `fx` keyed by the words from `at` to the end of `keys`: an existing one,
+# whose key is then dropped, or a new one, the function's first taking its reserved id
+fun add_copy(e: *emitter.Emit, fx: u32, at: u32) res[u32, fail.Fail] {
+    val found: u32 = find_copy(e, fx, at);
+    if (found != emitter.COPY_NONE) {
+        e.keys.len = at::usize;
+        ret res[u32, fail.Fail].ok{found};
+    }
+    var first: bool = true;
+    var c:     u32  = 0;
+    for (c < e.copies.len::u32 && first) {
+        first = e.copies.data[c].fx != fx;
+        c     = c + 1;
+    }
+    var id: u32 = e.fns[fx].id;
+    if (!first) { id = isa_spirv.alloc_id(e.b); }
+    var cp: emitter.Copy;
+    cp.fx      = fx;
+    cp.id      = id;
+    cp.key_at  = at;
+    cp.key_len = e.keys.len::u32 - at;
+    val ix: u32                 = e.copies.len::u32;
+    val pr: res[usize, A.Error] = collections_vector.push[emitter.Copy](?e.copies, cp);
+    if (sel pr.err) { ret res[u32, fail.Fail].err{fail.refused(pr.err)}; }
+    ret res[u32, fail.Fail].ok{ix};
+}
+
+pub fun find_copy(e: *emitter.Emit, fx: u32, at: u32) u32 {
+    val len: u32 = e.keys.len::u32 - at;
+    var c:   u32 = 0;
+    for (c < e.copies.len::u32) {
+        val cp: *emitter.Copy = ?e.copies.data[c];
+        if (cp.fx == fx && cp.key_len == len) {
+            var i:    u32  = 0;
+            var same: bool = true;
+            for (i < len && same) {
+                same = e.keys.data[cp.key_at + i] == e.keys.data[at + i];
+                i    = i + 1;
+            }
+            if (same) { ret c; }
+        }
+        c = c + 1;
+    }
+    ret emitter.COPY_NONE;
+}
+
+# whether every pointer parameter of the copy is a whole object, the shape its source declares
+pub fun copy_is_primary(e: *emitter.Emit, cx: u32) bool {
+    val cp: *emitter.Copy = ?e.copies.data[cx];
+    var i:  u32   = 0;
+    for (i < cp.key_len) {
+        val w: u32 = e.keys.data[cp.key_at + i];
+        if (w != emitter.BIND_VALUE && w != emitter.BIND_WHOLE) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# where a binding's steps begin and how many there are
+pub fun binding_steps(e: *emitter.Emit, p: u32, out_n: *u32) u32 {
+    val bind: u32 = e.keys.data[p];
+    @out_n = 0;
+    if (bind == emitter.BIND_GLOBAL) {
+        @out_n = e.keys.data[p + 2];
+        ret p + 3;
+    }
+    if (bind == emitter.BIND_LOCAL) {
+        @out_n = e.keys.data[p + 3];
+        ret p + 4;
+    }
+    ret p + 1;
+}
+
+# how many SPIR-V parameters a binding takes: its root when passed, then its runtime indices
+pub fun binding_arity(e: *emitter.Emit, p: u32) u32 {
+    val bind: u32 = e.keys.data[p];
+    if (bind == emitter.BIND_VALUE || bind == emitter.BIND_WHOLE || bind == emitter.BIND_PHYSICAL) { ret 1; }
+    var n:    u32 = 0;
+    val from: u32 = binding_steps(e, p, ?n);
+    var r:    u32 = 0;
+    if (bind == emitter.BIND_LOCAL) { r = 1; }
+    var i: u32 = 0;
+    for (i < n) {
+        if (e.keys.data[from + i] == emitter.STEP_RUNTIME) { r = r + 1; }
+        i = i + 1;
+    }
+    ret r;
+}
+
+# appends the key a call gives its callee `gx` to `keys`; false when a pointer argument
+# addresses nothing one path can name, a call the emitter refuses
+pub fun call_key(e: *emitter.Emit, cx: u32, mf: *lang_mir.MirFunction, mi: *lang_mir.MirInstr, gx: u32, ad: *emitter.Addr,
+    prov: *u8, nv: u32) res[bool, fail.Fail] {
+    val n: u32 = emitter.fn_ir(e, gx).param_count;
+    if (n != mi.operand_count - 2) { ret res[bool, fail.Fail].ok{false}; }
+    var k: u32 = 0;
+    for (k < n) {
+        if (!emit_value.param_is_pointer(e, gx, k)) {
+            val pr: res[usize, A.Error] = collections_vector.push[u32](?e.keys, emitter.BIND_VALUE);
+            if (sel pr.err) { ret res[bool, fail.Fail].err{fail.refused(pr.err)}; }
+            k = k + 1;
+            cnt;
+        }
+        # a physical pointer is passed as the value it is
+        val pv: u8 = emit_value.prov_of(prov, nv, ?mi.operands[k + 2]);
+        if ((pv & (emitter.PROV_LOGICAL | emitter.PROV_PHYSICAL)) == emitter.PROV_PHYSICAL) {
+            val pr: res[usize, A.Error] = collections_vector.push[u32](?e.keys, emitter.BIND_PHYSICAL);
+            if (sel pr.err) { ret res[bool, fail.Fail].err{fail.refused(pr.err)}; }
+            k = k + 1;
+            cnt;
+        }
+        val tr: res[bool, fail.Fail] = trace_address(e, cx, mf, ?mi.operands[k + 2], ad);
+        if (sel tr.err) { ret tr; }
+        if (!tr.ok)     { ret tr; }
+        val er: err[fail.Fail] = push_binding(e, ad);
+        if (sel er.err) { ret res[bool, fail.Fail].err{er.err}; }
+        k = k + 1;
+    }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+fun push_binding(e: *emitter.Emit, ad: *emitter.Addr) err[fail.Fail] {
+    val n: u32 = ad.steps.len::u32;
+    if (ad.root != emitter.ROOT_GLOBAL && n == 0) { ret push_key(e, emitter.BIND_WHOLE); }
+    if (ad.root == emitter.ROOT_GLOBAL) {
+        val r0: err[fail.Fail] = push_key(e, emitter.BIND_GLOBAL);
+        if (sel r0.err) { ret r0; }
+        val r1: err[fail.Fail] = push_key(e, ad.gix);
+        if (sel r1.err) { ret r1; }
+    }
+    or {
+        val r0: err[fail.Fail] = push_key(e, emitter.BIND_LOCAL);
+        if (sel r0.err) { ret r0; }
+        val r1: err[fail.Fail] = push_key(e, ad.root_mi);
+        if (sel r1.err) { ret r1; }
+        val r2: err[fail.Fail] = push_key(e, ad.root_ty::u32);
+        if (sel r2.err) { ret r2; }
+    }
+    val rn: err[fail.Fail] = push_key(e, n);
+    if (sel rn.err) { ret rn; }
+    var i: u32 = 0;
+    for (i < n) {
+        val rs: err[fail.Fail] = push_key(e, ad.steps.data[i].ord);
+        if (sel rs.err) { ret rs; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun push_key(e: *emitter.Emit, w: u32) err[fail.Fail] {
+    val pr: res[usize, A.Error] = collections_vector.push[u32](?e.keys, w);
+    if (sel pr.err) { ret err[fail.Fail].err{fail.refused(pr.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# follows a pointer operand of copy `cx` back to its root: a global, a local
+# allocation or a parameter's object, through the chains and copies that
+# derive it; false when no single definition names it
+pub fun trace_address(e: *emitter.Emit, cx: u32, mf: *lang_mir.MirFunction, op: *lang_mir.MirOperand, ad: *emitter.Addr) res[bool, fail.Fail] {
+    ad.root      = 0;
+    ad.steps.len = 0;
+    ret trace_from(e, cx, mf, op, ad);
+}
+
+fun trace_from(e: *emitter.Emit, cx: u32, mf: *lang_mir.MirFunction, op: *lang_mir.MirOperand, ad: *emitter.Addr) res[bool, fail.Fail] {
+    if (op.kind == lang_mir.MIR_OP_SYM) {
+        if (op.sym_off != 0) { ret res[bool, fail.Fail].ok{false}; }
+        val gx: u32 = emit_global.gl_lookup(e, op.sym);
+        if (gx == emit_global.GL_NONE || e.gvar_ids == nil || e.gvar_ids[gx] == 0) { ret res[bool, fail.Fail].ok{false}; }
+        ad.root   = emitter.ROOT_GLOBAL;
+        ad.gix    = gx;
+        ad.cur_mi = e.gls[gx].mi;
+        ad.cur_ty = emit_global.gl_ir(e, gx).ty;
+        ret res[bool, fail.Fail].ok{true};
+    }
+    var v: u32 = lang_mir.MIR_VREG_NIL.n;
+    if (op.kind == lang_mir.MIR_OP_VREG)               { v = op.vreg.n; }
+    or (op.kind == lang_mir.MIR_OP_MEM && op.imm == 0) { v = op.vreg.n; }
+    if (v == lang_mir.MIR_VREG_NIL.n)                  { ret res[bool, fail.Fail].ok{false}; }
+    val def: *lang_mir.MirInstr = address_def(mf, v);
+    if (def == nil) { ret res[bool, fail.Fail].ok{false}; }
+    val fx: u32 = e.copies.data[cx].fx;
+
+    if (def.opcode == lang_mir.MIR_ALLOCA) {
+        if (def.operand_count < 2) { ret res[bool, fail.Fail].ok{false}; }
+        val slot: *lang_mir.MirSlot = emit_value.find_slot(mf, def.operands[1].vreg.n);
+        if (slot == nil || slot.ty == lang_mir.SLOT_TY_NIL) { ret res[bool, fail.Fail].ok{false}; }
+        ad.root    = emitter.ROOT_ALLOCA;
+        ad.vreg    = v;
+        ad.root_mi = e.fns[fx].mi;
+        ad.root_ty = slot.ty::ir_type.IrTypeId;
+        ad.cur_mi  = ad.root_mi;
+        ad.cur_ty  = ad.root_ty;
+        ret res[bool, fail.Fail].ok{true};
+    }
+    if (emit_value.is_reg_copy(def)) {
+        if (def.operands[1].kind != lang_mir.MIR_OP_VREG) { ret res[bool, fail.Fail].ok{false}; }
+        ret trace_from(e, cx, mf, ?def.operands[1], ad);
+    }
+    if (def.opcode == lang_mir.MIR_GEP) {
+        if (def.operand_count < 3 || def.operands[2].kind != lang_mir.MIR_OP_IMM || def.operands[2].imm != 0) {
+            ret res[bool, fail.Fail].ok{false};
+        }
+        val br: res[bool, fail.Fail] = trace_from(e, cx, mf, ?def.operands[1], ad);
+        if (sel br.err) { ret br; }
+        if (!br.ok)     { ret br; }
+        var k: u32 = 3;
+        for (k < def.operand_count) {
+            val ix: *lang_mir.MirOperand = ?def.operands[k];
+            var st: emitter.AddrStep;
+            st.ord        = emitter.STEP_RUNTIME;
+            st.from_param = false;
+            st.a          = v;
+            st.b          = k - 3;
+            if (ix.kind != lang_mir.MIR_OP_IMM && ix.kind != lang_mir.MIR_OP_VREG)             { ret res[bool, fail.Fail].ok{false}; }
+            if (ix.kind == lang_mir.MIR_OP_IMM && (ix.imm < 0 || ix.imm >= emitter.STEP_RUNTIME::i64)) { ret res[bool, fail.Fail].ok{false}; }
+            # an element index, constant or not, is passed; a member ordinal is part of the key
+            val tys: *ir_type.IrTypeTable = ?e.u.mods[ad.cur_mi].ir.types;
+            val to:  opt[*ir_type.IrType] = ir_type.get(tys, ad.cur_ty);
+            if (sel to.none)                       { ret res[bool, fail.Fail].ok{false}; }
+            if (to.some.kind == ir_type.IRT_ARRAY) { ad.cur_ty = to.some.data.array_.element; }
+            or {
+                if (ix.kind != lang_mir.MIR_OP_IMM) { ret res[bool, fail.Fail].ok{false}; }
+                st.ord    = ix.imm::u32;
+                ad.cur_ty = ir_member_type(tys, to.some, ad.cur_ty, st.ord);
+            }
+            val pr: res[usize, A.Error] = collections_vector.push[emitter.AddrStep](?ad.steps, st);
+            if (sel pr.err) { ret res[bool, fail.Fail].err{fail.refused(pr.err)}; }
+            k = k + 1;
+        }
+        ret res[bool, fail.Fail].ok{true};
+    }
+    if (def.opcode == lang_mir.MIR_VALUE_PARAM) {
+        if (def.operand_count != 2 || def.operands[1].kind != lang_mir.MIR_OP_IMM || def.operands[1].imm < 0
+            || def.operands[1].imm >= emitter.fn_ir(e, fx).param_count::i64) {
+            ret res[bool, fail.Fail].ok{false};
+        }
+        val k:    u32 = def.operands[1].imm::u32;
+        val p:    u32 = emit_value.key_param(e, e.copies.data[cx].key_at, k);
+        val bind: u32 = e.keys.data[p];
+        if (bind == emitter.BIND_VALUE) { ret res[bool, fail.Fail].ok{false}; }
+        val fn: *me_ir.Function      = emitter.fn_ir(e, fx);
+        val t:  opt[*ir_type.IrType] = ir_type.get(?emitter.fn_mod(e, fx).types, fn.params[k].ty);
+        if (sel t.none) { ret res[bool, fail.Fail].ok{false}; }
+        # whatever the binding, what the parameter points at is its declared pointee
+        ad.cur_mi = e.fns[fx].mi;
+        ad.cur_ty = t.some.data.pointee;
+        if (bind == emitter.BIND_WHOLE) {
+            ad.root    = emitter.ROOT_PARAM;
+            ad.param   = k;
+            ad.root_mi = e.fns[fx].mi;
+            ad.root_ty = t.some.data.pointee;
+            ret res[bool, fail.Fail].ok{true};
+        }
+        if (bind == emitter.BIND_GLOBAL) {
+            ad.root = emitter.ROOT_GLOBAL;
+            ad.gix  = e.keys.data[p + 1];
+        }
+        or {
+            ad.root    = emitter.ROOT_PARAM;
+            ad.param   = k;
+            ad.root_mi = e.keys.data[p + 1];
+            ad.root_ty = e.keys.data[p + 2]::ir_type.IrTypeId;
+        }
+        var n:    u32 = 0;
+        val from: u32 = binding_steps(e, p, ?n);
+        var j:    u32 = 0;
+        var i:    u32 = 0;
+        for (i < n) {
+            var st: emitter.AddrStep;
+            st.ord        = e.keys.data[from + i];
+            st.from_param = true;
+            st.a          = k;
+            st.b          = j;
+            if (st.ord == emitter.STEP_RUNTIME) { j = j + 1; }
+            val pr: res[usize, A.Error] = collections_vector.push[emitter.AddrStep](?ad.steps, st);
+            if (sel pr.err) { ret res[bool, fail.Fail].err{fail.refused(pr.err)}; }
+            i = i + 1;
+        }
+        ret res[bool, fail.Fail].ok{true};
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+# the type member `ord` of a composite `t` (id `id`) has, IRT_NIL where no further step can follow
+fun ir_member_type(tys: *ir_type.IrTypeTable, t: *ir_type.IrType, id: ir_type.IrTypeId, ord: u32) ir_type.IrTypeId {
+    if (t.kind == ir_type.IRT_STRUCT) {
+        if (ord >= t.data.struct_.field_count) { ret ir_type.IRT_NIL; }
+        ret t.data.struct_.fields[ord];
+    }
+    if (t.kind == ir_type.IRT_VECTOR) { ret t.data.vector_.element; }
+    # a tag's member 0 is its discriminator, and member 1 + c case c's payload
+    if (t.kind == ir_type.IRT_TAG && ord > 0 && ord <= ir_type.tag_case_count(tys, id)
+        && ir_type.tag_case_has_payload(tys, id, ord - 1)) {
+        ret ir_type.tag_case_type(tys, id, ord - 1);
+    }
+    ret ir_type.IRT_NIL;
+}
+
+# the one instruction that defines `v`, nil when none or several do
+pub fun address_def(mf: *lang_mir.MirFunction, v: u32) *lang_mir.MirInstr {
+    var found: *lang_mir.MirInstr = nil;
+    var bi:    u32                = 0;
+    for (bi < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            if (emit_value.instr_defines_vreg(mi, v)) {
+                if (found != nil) { ret nil; }
+                found = mi;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret found;
+}
+
+# each new copy is named by its own index, which an existing key finds again
+test add_copy__returns_the_index_of_the_copy {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var b: isa_spirv.Builder = isa_spirv.builder_init(?alloc);
+    fin { isa_spirv.builder_dnit(?b); }
+    var fns: [2]emitter.FnEnt;
+    fns[0].id = 5;
+    fns[1].id = 6;
+    var e: emitter.Emit;
+    e.alloc  = ?alloc;
+    e.b      = ?b;
+    e.fns    = ?fns[0];
+    e.fn_len = 2;
+    e.copies = collections_vector.init[emitter.Copy](?alloc);
+    e.keys   = collections_vector.init[u32](?alloc);
+    fin { collections_vector.dnit[emitter.Copy](?e.copies); }
+    fin { collections_vector.dnit[u32](?e.keys); }
+    # three distinct copies, then the second's key again
+    var fx:   [4]u32 = [4]u32{0, 1, 0, 1};
+    var bind: [4]u32 = [4]u32{emitter.BIND_VALUE, emitter.BIND_VALUE, emitter.BIND_WHOLE, emitter.BIND_VALUE};
+    var want: [4]u32 = [4]u32{0, 1, 2, 1};
+    var k:    u32    = 0;
+    for (k < 4) {
+        val at: u32                 = e.keys.len::u32;
+        val pr: res[usize, A.Error] = collections_vector.push[u32](?e.keys, bind[k]);
+        if (sel pr.err) { ret 1; }
+        val ar: res[u32, fail.Fail] = add_copy(?e, fx[k], at);
+        if (sel ar.err)                       { ret 2; }
+        if (ar.ok != want[k])                 { ret 10 + k::i32; }
+        if (e.copies.data[ar.ok].fx != fx[k]) { ret 20 + k::i32; }
+        k = k + 1;
+    }
+    if (e.copies.len != 3 || e.copies.data[0].id != 5 || e.copies.data[1].id != 6 || e.copies.data[2].id == 5) { ret 30; }
+    ret 0;
+}

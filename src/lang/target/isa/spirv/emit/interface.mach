@@ -1,0 +1,1613 @@
+# the stage interface: which globals each entry point reaches and how it accesses
+# them, their declaration, and the checks across stages
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std_format: std.format;
+
+use A: std.allocator;
+
+use lang_checked: mach.lang.checked;
+use mach.lang.diagnostic;
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.float;
+use mach.lang.growth;
+use mach.lang.intern;
+use mach.lang.layout;
+use me_ir:   mach.lang.me.ir;
+use ir_id:   mach.lang.me.ir.id;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use lang_mir:          mach.lang.mir;
+use mir_debug:         mach.lang.mir.debug;
+use mir_structure:     mach.lang.mir.structure;
+use mir_unit:          mach.lang.mir.unit;
+use lang_source:       mach.lang.source;
+use target_definition: mach.lang.target.definition;
+use mach.lang.target.extension;
+use extension_spirv: mach.lang.target.extension.spirv;
+use mach.lang.target.isa;
+use isa_spirv: mach.lang.target.isa.spirv;
+use mach.lang.target.isa.spirv.debug;
+use mach.lang.target.isa.spirv.defs;
+use mach.lang.target.isa.spirv.ops;
+use mach.lang.target.isa.spirv.types;
+use target_model: mach.lang.target.model;
+use model_spirv:  mach.lang.target.model.spirv;
+use target_of:    mach.lang.target.of;
+use mach.lang.textbuild;
+use emit_builtin: mach.lang.target.isa.spirv.emit.builtin;
+use emit_capability: mach.lang.target.isa.spirv.emit.capability;
+use emit_copy: mach.lang.target.isa.spirv.emit.copy;
+use emitter: mach.lang.target.isa.spirv.emit.emitter;
+use emit_global: mach.lang.target.isa.spirv.emit.global;
+use emit_instruction: mach.lang.target.isa.spirv.emit.instruction;
+use emit_layout: mach.lang.target.isa.spirv.emit.layout;
+use emit_memory: mach.lang.target.isa.spirv.emit.memory;
+use emit_op: mach.lang.target.isa.spirv.emit.op;
+use emit_value: mach.lang.target.isa.spirv.emit.value;
+
+val ACCESS_READ:  u8 = 2;
+
+# a parameter's origin, beside a global's index
+val ORIGIN_PARAM: u32 = 0x80000000;
+
+# a handle of no single root: one a function returns from more than one, all of
+# them read and written, which leaves nothing to mark through it
+val ORIGIN_UNKNOWN: u32 = 0xFFFFFFFE;
+
+# a function that returns a handle naming no binding
+val ORIGIN_UNROOTED: u32 = 0xFFFFFFFD;
+
+pub fun build_gl_access(e: *emitter.Emit) err[fail.Fail] {
+    if (e.gl_len == 0 || e.fn_len == 0) { ret err[fail.Fail].ok{}; }
+    val rw: res[*u8, A.Error] = A.allocate[u8](e.alloc, e.gl_len::usize);
+    if (sel rw.err) { ret err[fail.Fail].err{fail.refused(rw.err)}; }
+    e.gaccess = rw.ok;
+    var i: u32 = 0;
+    for (i < e.gl_len) {
+        e.gaccess[i] = 0;
+        i            = i + 1;
+    }
+
+    val rb: res[*u32, A.Error] = A.allocate[u32](e.alloc, e.fn_len::usize);
+    if (sel rb.err) { ret err[fail.Fail].err{fail.refused(rb.err)}; }
+    e.pbase = rb.ok;
+    val rr: res[*u32, A.Error] = A.allocate[u32](e.alloc, e.fn_len::usize);
+    if (sel rr.err) { ret err[fail.Fail].err{fail.refused(rr.err)}; }
+    e.rsum = rr.ok;
+    val rq: res[*u32, A.Error] = A.allocate[u32](e.alloc, e.fn_len::usize);
+    if (sel rq.err) { ret err[fail.Fail].err{fail.refused(rq.err)}; }
+    e.rptr = rq.ok;
+    var total: u32 = 0;
+    var fx:    u32 = 0;
+    for (fx < e.fn_len) {
+        e.pbase[fx] = total;
+        e.rsum[fx]  = emit_global.GL_NONE;
+        e.rptr[fx]  = emit_global.GL_NONE;
+        total       = total + emitter.fn_ir(e, fx).param_count;
+        fx          = fx + 1;
+    }
+    if (total > 0) {
+        val rp: res[*u8, A.Error] = A.allocate[u8](e.alloc, total::usize);
+        if (sel rp.err) { ret err[fail.Fail].err{fail.refused(rp.err)}; }
+        e.pacc     = rp.ok;
+        e.pacc_len = total;
+        i          = 0;
+        for (i < total) {
+            e.pacc[i] = 0;
+            i         = i + 1;
+        }
+    }
+
+    # a call touches what a pointer argument names as its callee does through the
+    # parameter, and its result names what the callee returns, so the scan repeats
+    # until no parameter's access or return's root grows; the marks on the globals
+    # only grow, so a refusal fires only for an access the program makes
+    var again: bool = true;
+    for (again) {
+        e.sum_grew = false;
+        fx         = 0;
+        for (fx < e.fn_len) {
+            if (!e.fns[fx].emit) {
+                fx = fx + 1;
+                cnt;
+            }
+            val mf: *lang_mir.MirFunction = emitter.fn_mir(e, fx);
+            if (mf == nil) {
+                fx = fx + 1;
+                cnt;
+            }
+            val r: err[fail.Fail] = scan_fn_access(e, fx, mf);
+            if (sel r.err) { ret r; }
+            fx = fx + 1;
+        }
+        again = e.sum_grew;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun scan_fn_access(e: *emitter.Emit, fx: u32, mf: *lang_mir.MirFunction) err[fail.Fail] {
+    val n:       u32  = mf.vreg_count;
+    var origin:  *u32 = nil;
+    var horigin: *u32 = nil;
+    if (n > 0) {
+        val ro: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+        if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+        origin = ro.ok;
+        val rh: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+        if (sel rh.err) {
+            A.deallocate[u32](e.alloc, origin, n::usize);
+            ret err[fail.Fail].err{fail.refused(rh.err)};
+        }
+        horigin = rh.ok;
+        var v: u32 = 0;
+        for (v < n) {
+            origin[v]  = emit_global.GL_NONE;
+            horigin[v] = emit_global.GL_NONE;
+            v          = v + 1;
+        }
+    }
+    val r: err[fail.Fail] = scan_fn_access_in(e, fx, mf, n, origin, horigin);
+    if (origin != nil)  { A.deallocate[u32](e.alloc, origin, n::usize); }
+    if (horigin != nil) { A.deallocate[u32](e.alloc, horigin, n::usize); }
+    ret r;
+}
+
+# `origin` is the global a pointer register points into, `horigin` the handle
+# global a register holds the descriptor of
+fun scan_fn_access_in(e: *emitter.Emit, fx: u32, mf: *lang_mir.MirFunction, n: u32, origin: *u32, horigin: *u32) err[fail.Fail] {
+    var hb: u32 = 0;
+    for (hb < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[hb];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val g: u32                  = descriptor_load(e, ?blk.instrs[ii]);
+            val d: *lang_mir.MirOperand = ?blk.instrs[ii].operands[0];
+            if (g != emit_global.GL_NONE && horigin != nil && d.kind == lang_mir.MIR_OP_VREG && d.vreg.n < n) { horigin[d.vreg.n] = g; }
+            # a handle parameter holds the descriptor the caller passes
+            val pm: *lang_mir.MirInstr = ?blk.instrs[ii];
+            if (pm.opcode == lang_mir.MIR_VALUE_PARAM && pm.operand_count == 2 && horigin != nil
+                && d.kind == lang_mir.MIR_OP_VREG && d.vreg.n < n && pm.operands[1].kind == lang_mir.MIR_OP_IMM
+                && pm.operands[1].imm >= 0 && emit_copy.param_is_handle(e, fx, pm.operands[1].imm::u32)) {
+                horigin[d.vreg.n] = ORIGIN_PARAM | pm.operands[1].imm::u32;
+            }
+            ii = ii + 1;
+        }
+        hb = hb + 1;
+    }
+
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var bi: u32 = 0;
+        for (bi < mf.block_count) {
+            val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+            var ii:  u32                = 0;
+            for (ii < blk.instr_count) {
+                val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+                ii = ii + 1;
+                # a pointer parameter names what the caller passes
+                if (mi.opcode == lang_mir.MIR_VALUE_PARAM && mi.operand_count == 2
+                    && mi.operands[0].kind == lang_mir.MIR_OP_VREG && mi.operands[1].kind == lang_mir.MIR_OP_IMM
+                    && mi.operands[1].imm >= 0 && emit_value.param_is_pointer(e, fx, mi.operands[1].imm::u32)) {
+                    val pv: u32 = mi.operands[0].vreg.n;
+                    if (origin != nil && pv < n && origin[pv] == emit_global.GL_NONE) {
+                        origin[pv] = ORIGIN_PARAM | mi.operands[1].imm::u32;
+                        changed    = true;
+                    }
+                    cnt;
+                }
+                # an access chain, and an `op` pointer result, point into what their base names
+                var dst_at:  u32 = 0;
+                var base_at: u32 = 0;
+                if (!derived_pointer(e, fx, mi, ?dst_at, ?base_at))   { cnt; }
+                if (mi.operands[dst_at].kind != lang_mir.MIR_OP_VREG) { cnt; }
+                val dst: u32 = mi.operands[dst_at].vreg.n;
+                if (origin == nil || dst == lang_mir.MIR_VREG_NIL.n || dst >= n) { cnt; }
+                val g: u32 = operand_origin(e, origin, n, ?mi.operands[base_at]);
+                if (g == emit_global.GL_NONE || origin[dst] == g) { cnt; }
+                if (origin[dst] != emit_global.GL_NONE) {
+                    val ra: err[fail.Fail] = mark_origin(e, fx, mi, origin[dst], emit_global.ACCESS_WRITE | ACCESS_READ);
+                    if (sel ra.err) { ret ra; }
+                    val rb: err[fail.Fail] = mark_origin(e, fx, mi, g, emit_global.ACCESS_WRITE | ACCESS_READ);
+                    if (sel rb.err) { ret rb; }
+                    cnt;
+                }
+                origin[dst] = g;
+                changed     = true;
+            }
+            bi = bi + 1;
+        }
+    }
+
+    # a handle read through a pointer holds the descriptor the pointer names, a
+    # call's handle result the one its callee returns, and an `op` handle result
+    # the one its row's source operand holds
+    var hchanged: bool = horigin != nil;
+    for (hchanged) {
+        hchanged = false;
+        var hp: u32 = 0;
+        for (hp < mf.block_count) {
+            val blk: *lang_mir.MirBlock = ?mf.blocks[hp];
+            var ii:  u32                = 0;
+            for (ii < blk.instr_count) {
+                val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+                ii = ii + 1;
+                var at:  u32 = emit_global.GL_NONE;
+                var d:   u32 = 0;
+                var src: u32 = 0;
+                if (pointer_handle_load(?emitter.fn_mod(e, fx).types, mf, mi)) {
+                    at = operand_origin(e, origin, n, ?mi.operands[1]);
+                    d  = mi.operands[0].vreg.n;
+                }
+                or (call_handle_result(e, fx, mf, mi)) {
+                    at = call_result_origin(e, fx, mi, n, origin, horigin);
+                    d  = mi.operands[1].vreg.n;
+                }
+                or (derived_handle(e, fx, mf, mi, ?src)) {
+                    at = operand_origin(e, horigin, n, ?mi.operands[src]);
+                    d  = mi.operands[1].vreg.n;
+                }
+                or { cnt; }
+                if (horigin[d] != at) {
+                    horigin[d] = at;
+                    hchanged   = true;
+                }
+            }
+            hp = hp + 1;
+        }
+    }
+
+    # what a returned handle names joins the function's return summary, and the
+    # first root a returned pointer names is kept for the refusal of the result
+    val rk: ir_type.IrTypeKind = return_kind(e, fx);
+    var hr: u32                = 0;
+    for (hr < mf.block_count && horigin != nil) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[hr];
+        hr = hr + 1;
+        if (blk.instr_count == 0) { cnt; }
+        val mi: *lang_mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
+        if (mi.opcode != lang_mir.MIR_RET || mi.operand_count != 1) { cnt; }
+        if (rk == ir_type.IRT_PTR) {
+            if (e.rptr[fx] == emit_global.GL_NONE) { e.rptr[fx] = operand_origin(e, origin, n, ?mi.operands[0]); }
+            cnt;
+        }
+        if (rk != ir_type.IRT_HANDLE) { cnt; }
+        val rj: err[fail.Fail] = join_return(e, fx, mi, operand_origin(e, horigin, n, ?mi.operands[0]));
+        if (sel rj.err) { ret rj; }
+    }
+
+    var bi2: u32 = 0;
+    for (bi2 < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi2];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi:  *lang_mir.MirInstr    = ?blk.instrs[ii];
+            val row: *target_definition.Op = call_op_row(e, fx, mi);
+            # loading a handle reads its descriptor, not the memory it names
+            val loads_handle: bool = descriptor_load(e, mi) != emit_global.GL_NONE || pointer_handle_load(?emitter.fn_mod(e, fx).types, mf, mi);
+            var oi:           u32  = 0;
+            for (oi < mi.operand_count) {
+                if (loads_handle) {
+                    oi = oi + 1;
+                    cnt;
+                }
+                # a handle operand's memory is touched only as its row's kind says
+                if (row != nil && oi >= 2 && target_definition.op_kind_is_handle(target_definition.op_operand_kind(row, oi - 2))) {
+                    val hg: u32 = operand_origin(e, horigin, n, ?mi.operands[oi]);
+                    var hw: u8  = ACCESS_READ;
+                    if (target_definition.op_operand_kind(row, oi - 2) == target_definition.OP_OPERAND_HANDLE_WRITE) { hw = emit_global.ACCESS_WRITE; }
+                    if (hg == emit_global.GL_NONE)                                                                               { ret err[fail.Fail].err{unrooted_handle(e, mi)}; }
+                    if (hg != ORIGIN_UNKNOWN) {
+                        val rh: err[fail.Fail] = mark_origin(e, fx, mi, hg, hw);
+                        if (sel rh.err) { ret rh; }
+                    }
+                    oi = oi + 1;
+                    cnt;
+                }
+                # a handle handed to a function has its memory touched as the callee touches it
+                # through that parameter, and read and written where no summary says how
+                if (row == nil && mi.opcode == lang_mir.MIR_VALUE_CALL && oi >= 2 && mi.operands[oi].kind == lang_mir.MIR_OP_VREG) {
+                    val cg: u32 = operand_origin(e, horigin, n, ?mi.operands[oi]);
+                    var ch: u8  = emit_global.ACCESS_WRITE | ACCESS_READ;
+                    if (!call_param_access(e, fx, mi, oi, ?ch)) { ch = emit_global.ACCESS_WRITE | ACCESS_READ; }
+                    if (cg == emit_global.GL_NONE && ch != 0 && handle_vreg(?emitter.fn_mod(e, fx).types, mf, ?mi.operands[oi])) {
+                        ret err[fail.Fail].err{unrooted_handle(e, mi)};
+                    }
+                    if (cg != emit_global.GL_NONE && cg != ORIGIN_UNKNOWN) {
+                        val rc: err[fail.Fail] = mark_origin(e, fx, mi, cg, ch);
+                        if (sel rc.err) { ret rc; }
+                    }
+                }
+                val g: u32 = operand_origin(e, origin, n, ?mi.operands[oi]);
+                if (g == emit_global.GL_NONE) {
+                    oi = oi + 1;
+                    cnt;
+                }
+                var how: u8 = 0;
+                if (row != nil) { how = op_operand_access(row, oi); }
+                or (!call_param_access(e, fx, mi, oi, ?how)) {
+                    if (!operand_only_reads(mi, oi))  { how = how | emit_global.ACCESS_WRITE; }
+                    if (!operand_never_reads(mi, oi)) { how = how | ACCESS_READ; }
+                }
+                val rm: err[fail.Fail] = mark_origin(e, fx, mi, g, how);
+                if (sel rm.err) { ret rm; }
+                oi = oi + 1;
+            }
+            ii = ii + 1;
+        }
+        bi2 = bi2 + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the handle global a load reads the descriptor of, GL_NONE for any other instruction
+fun descriptor_load(e: *emitter.Emit, mi: *lang_mir.MirInstr) u32 {
+    if (mi.opcode != lang_mir.MIR_LOAD || mi.operand_count != 2)                   { ret emit_global.GL_NONE; }
+    if (mi.operands[1].kind != lang_mir.MIR_OP_SYM || mi.operands[1].sym_off != 0) { ret emit_global.GL_NONE; }
+    val g: u32 = emit_global.gl_lookup(e, mi.operands[1].sym);
+    if (g == emit_global.GL_NONE || !emit_instruction.is_image_type(e, emit_global.gl_types(e, g), emit_global.gl_ir(e, g).ty)) { ret emit_global.GL_NONE; }
+    ret g;
+}
+
+# a load of a handle through a pointer to it rather than from its binding, `@img` of a `*Handle`
+fun pointer_handle_load(tys: *ir_type.IrTypeTable, mf: *lang_mir.MirFunction, mi: *lang_mir.MirInstr) bool {
+    if (mi.opcode != lang_mir.MIR_LOAD || mi.operand_count != 2)                                   { ret false; }
+    if (mi.operands[1].kind != lang_mir.MIR_OP_MEM && mi.operands[1].kind != lang_mir.MIR_OP_VREG) { ret false; }
+    ret handle_vreg(tys, mf, ?mi.operands[0]);
+}
+
+fun handle_vreg(tys: *ir_type.IrTypeTable, mf: *lang_mir.MirFunction, d: *lang_mir.MirOperand) bool {
+    if (d.kind != lang_mir.MIR_OP_VREG || d.vreg.n >= mf.vreg_count || mf.vregs[d.vreg.n].ty == lang_mir.VREG_TY_NIL) { ret false; }
+    val t: opt[*ir_type.IrType] = ir_type.get(tys, ir_type.id(mf.vregs[d.vreg.n].ty));
+    ret sel t.some && t.some.kind == ir_type.IRT_HANDLE;
+}
+
+# a call to an emitted function that defines a handle result
+fun call_handle_result(e: *emitter.Emit, fx: u32, mf: *lang_mir.MirFunction, mi: *lang_mir.MirInstr) bool {
+    if (emit_copy.mach_callee(e, fx, mi) == emitter.FN_NONE) { ret false; }
+    ret handle_vreg(?emitter.fn_mod(e, fx).types, mf, ?mi.operands[1]);
+}
+
+# an `op` call whose handle result is derived from the handle its row names as the
+# source, as an `OpSampledImage` holds its image: `out_src` is that operand. an `op`
+# handle of no source, or of a source that holds no handle, names no binding
+fun derived_handle(e: *emitter.Emit, fx: u32, mf: *lang_mir.MirFunction, mi: *lang_mir.MirInstr, out_src: *u32) bool {
+    val row: *target_definition.Op = call_op_row(e, fx, mi);
+    if (row == nil || row.source == target_definition.NO_OP_SOURCE || row.source + 2 >= mi.operand_count) { ret false; }
+    val tys: *ir_type.IrTypeTable = ?emitter.fn_mod(e, fx).types;
+    if (!handle_vreg(tys, mf, ?mi.operands[1]) || !handle_vreg(tys, mf, ?mi.operands[row.source + 2])) { ret false; }
+    @out_src = row.source + 2;
+    ret true;
+}
+
+# the root of a call's handle result: what its callee returns, through the argument
+# when that is one of its parameters. a callee that returns no handle yet, or more
+# than one root, leaves ORIGIN_UNKNOWN, and one returning a handle of no binding GL_NONE
+fun call_result_origin(e: *emitter.Emit, fx: u32, mi: *lang_mir.MirInstr, n: u32, origin: *u32, horigin: *u32) u32 {
+    val gx: u32 = emit_copy.mach_callee(e, fx, mi);
+    val s:  u32 = e.rsum[gx];
+    if (s == ORIGIN_UNROOTED)                { ret emit_global.GL_NONE; }
+    if (s == emit_global.GL_NONE || s == ORIGIN_UNKNOWN) { ret ORIGIN_UNKNOWN; }
+    if ((s & ORIGIN_PARAM) == 0)             { ret s; }
+    val k: u32 = s & ~ORIGIN_PARAM;
+    if (k + 2 >= mi.operand_count)  { ret emit_global.GL_NONE; }
+    if (emit_value.param_is_pointer(e, gx, k)) { ret operand_origin(e, origin, n, ?mi.operands[k + 2]); }
+    ret operand_origin(e, horigin, n, ?mi.operands[k + 2]);
+}
+
+# joins a returned handle's root into the function's summary. a handle of no binding
+# makes every result one, refused where it is read or written. once two roots meet,
+# or one of no single root does, every root returned is read and written, since the
+# caller can no longer tell which it holds
+fun join_return(e: *emitter.Emit, fx: u32, mi: *lang_mir.MirInstr, o: u32) err[fail.Fail] {
+    val cur: u32 = e.rsum[fx];
+    if (cur == ORIGIN_UNROOTED) { ret err[fail.Fail].ok{}; }
+    if (o == emit_global.GL_NONE) {
+        e.rsum[fx] = ORIGIN_UNROOTED;
+        e.sum_grew = true;
+        ret err[fail.Fail].ok{};
+    }
+    if (cur == o) { ret err[fail.Fail].ok{}; }
+    if (cur == emit_global.GL_NONE && o != ORIGIN_UNKNOWN) {
+        e.rsum[fx] = o;
+        e.sum_grew = true;
+        ret err[fail.Fail].ok{};
+    }
+    if (cur != emit_global.GL_NONE && cur != ORIGIN_UNKNOWN) {
+        val rc: err[fail.Fail] = mark_origin(e, fx, mi, cur, emit_global.ACCESS_WRITE | ACCESS_READ);
+        if (sel rc.err) { ret rc; }
+    }
+    if (o != ORIGIN_UNKNOWN) {
+        val ro: err[fail.Fail] = mark_origin(e, fx, mi, o, emit_global.ACCESS_WRITE | ACCESS_READ);
+        if (sel ro.err) { ret ro; }
+    }
+    if (cur != ORIGIN_UNKNOWN) {
+        e.rsum[fx] = ORIGIN_UNKNOWN;
+        e.sum_grew = true;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# an image read or written directly whose binding the scan cannot name. sema holds every
+# `op` handle result to a source operand, so no source reaches one: it is a compiler defect
+fun unrooted_handle(e: *emitter.Emit, mi: *lang_mir.MirInstr) fail.Fail {
+    val named: res[str, fail.Fail] = emitter.refusal_fn_name(e);
+    if (sel named.err) { ret named.err; }
+    ret fail.message_of(lang_mir.instr_refusal(e.alloc, e.srcmap, named.ok, mi,
+        "spirv.emit: an image read or written directly names no binding, though every handle an `op` returns derives from a source operand"));
+}
+
+# each confined `op` result is consumed only as an operand of another `op` call later in
+# the block that makes it. sema refuses returning one and passing one to a function, so
+# what reaches here is a block an operand evaluated after it splits, or a merge
+pub fun confined_flow(e: *emitter.Emit, fx: u32, mf: *lang_mir.MirFunction) err[fail.Fail] {
+    var bi: u32 = 0;
+    for (bi < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi:  *lang_mir.MirInstr    = ?blk.instrs[ii];
+            val row: *target_definition.Op = call_op_row(e, fx, mi);
+            if (row != nil && row.confined && mi.operands[1].kind == lang_mir.MIR_OP_VREG && !lang_mir.vreg_is_nil(mi.operands[1].vreg)) {
+                val r: err[fail.Fail] = confined_consumers(e, fx, mf, bi, ii, row);
+                if (sel r.err) { ret r; }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# refuses the first consumer of the confined result instruction `di` of block `db` defines
+# that is not an operand of an `op` call after it in that block
+fun confined_consumers(e: *emitter.Emit, fx: u32, mf: *lang_mir.MirFunction, db: u32, di: u32, row: *target_definition.Op) err[fail.Fail] {
+    val v:  u32 = mf.blocks[db].instrs[di].operands[1].vreg.n;
+    var bi: u32 = 0;
+    for (bi < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi:      *lang_mir.MirInstr = ?blk.instrs[ii];
+            val op_call: bool               = call_op_row(e, fx, mi) != nil;
+            var oi:      u32                = 0;
+            for (oi < mi.operand_count && !(bi == db && ii == di)) {
+                val op: *lang_mir.MirOperand = ?mi.operands[oi];
+                oi = oi + 1;
+                if (op.kind != lang_mir.MIR_OP_VREG || lang_mir.vreg_is_nil(op.vreg) || op.vreg.n != v) { cnt; }
+                if (op_call && oi > 2 && bi == db && ii > di)                                           { cnt; }
+                ret err[fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.OP_RESULT_FLOW, lang_mir.refusal_loc(mf, mi), confined_flow_text(e, row, op_call && oi > 2))};
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# why a confined result's consumer is refused: an `op` operand in another block, or anything else
+fun confined_flow_text(e: *emitter.Emit, row: *target_definition.Op, operand: bool) res[str, fail.Fail] {
+    var how: str = "reaches something other than an operand of another `op` instruction in its block, such as a return, a call or a merge where control flow joins, which SPIR-V forbids";
+    if (operand) { how = "is consumed in another block than the one that makes it, which SPIR-V forbids: an operand evaluated after it branches, as `&&` and `||` do, so compute that operand into a binding before the call"; }
+    ret fail.format(e.alloc, "the result of `{}` {}", row.name, how);
+}
+
+# the kind of value a function returns
+fun return_kind(e: *emitter.Emit, fx: u32) ir_type.IrTypeKind {
+    val tys: *ir_type.IrTypeTable = ?emitter.fn_mod(e, fx).types;
+    val so:  opt[*ir_type.IrType] = ir_type.get(tys, emitter.fn_ir(e, fx).sig);
+    if (sel so.none) { ret ir_type.IRT_VOID; }
+    val sig: *ir_type.IrType = so.some;
+    if (sig.kind != ir_type.IRT_FN) { ret ir_type.IRT_VOID; }
+    val rt: opt[*ir_type.IrType] = ir_type.get(tys, sig.data.fn.ret_type);
+    if (sel rt.none) { ret ir_type.IRT_VOID; }
+    ret rt.some.kind;
+}
+
+# the storage class the pointer a function returns points into: its global's, the
+# global the copy binds its parameter to, or Function for a local
+pub fun return_storage(e: *emitter.Emit, fx: u32, key: u32) u32 {
+    if (e.rptr == nil) { ret isa_spirv.STORAGE_FUNCTION; }
+    val o: u32 = e.rptr[fx];
+    if (o == emit_global.GL_NONE)            { ret isa_spirv.STORAGE_FUNCTION; }
+    if ((o & ORIGIN_PARAM) == 0) { ret e.gstorage[o]; }
+    val at: u32 = emit_value.key_param(e, key, o & ~ORIGIN_PARAM);
+    if (e.keys.data[at] == emitter.BIND_GLOBAL) { ret e.gstorage[e.keys.data[at + 1]]; }
+    ret isa_spirv.STORAGE_FUNCTION;
+}
+
+# the instruction row an `op` call assembles, nil for any other instruction
+fun call_op_row(e: *emitter.Emit, fx: u32, mi: *lang_mir.MirInstr) *target_definition.Op {
+    ret emit_value.call_op_row_in(e, emitter.fn_mod(e, fx), mi);
+}
+
+# the operand an instruction defines as a pointer into what another operand
+# names: a chain's base, or the source operand an `op` pointer result's row names
+fun derived_pointer(e: *emitter.Emit, fx: u32, mi: *lang_mir.MirInstr, out_dst: *u32, out_base: *u32) bool {
+    if (mi.opcode == lang_mir.MIR_GEP && mi.operand_count >= 2) {
+        @out_dst  = 0;
+        @out_base = 1;
+        ret true;
+    }
+    val row: *target_definition.Op = call_op_row(e, fx, mi);
+    if (row == nil || row.result != target_definition.OP_RESULT_POINTER)                    { ret false; }
+    if (row.source == target_definition.NO_OP_SOURCE || row.source + 2 >= mi.operand_count) { ret false; }
+    @out_dst  = 1;
+    @out_base = row.source + 2;
+    ret true;
+}
+
+# how an `op` call touches what operand `oi` names, exactly as its row says: the
+# callee and a pointer result it defines are no access, a pointer operand is read,
+# stored or both, and anything else is a value read from its object
+fun op_operand_access(row: *target_definition.Op, oi: u32) u8 {
+    if (oi < 2) { ret 0; }
+    val kind: target_definition.OpOperandKind = target_definition.op_operand_kind(row, oi - 2);
+    # a pointer result's base is touched by the result's own uses, never by deriving it
+    val base: bool = row.result == target_definition.OP_RESULT_POINTER && row.source == oi - 2;
+    if (base)                                                { ret 0; }
+    if (kind == target_definition.OP_OPERAND_POINTER_WRITE)  { ret emit_global.ACCESS_WRITE; }
+    if (kind == target_definition.OP_OPERAND_POINTER_UPDATE) { ret emit_global.ACCESS_WRITE | ACCESS_READ; }
+    ret ACCESS_READ;
+}
+
+# how a call touches what a pointer or handle argument names: as the callee does through
+# that parameter; false for an operand that is no such argument of an emitted callee
+fun call_param_access(e: *emitter.Emit, fx: u32, mi: *lang_mir.MirInstr, oi: u32, out: *u8) bool {
+    if (oi < 2 || e.pacc == nil) { ret false; }
+    val kind: lang_mir.MirOperandKind = mi.operands[oi].kind;
+    if (kind != lang_mir.MIR_OP_VREG && kind != lang_mir.MIR_OP_SYM) { ret false; }
+    val gx: u32 = emit_copy.mach_callee(e, fx, mi);
+    if (gx == emitter.FN_NONE)                                                       { ret false; }
+    if (!emit_value.param_is_pointer(e, gx, oi - 2) && !emit_copy.param_is_handle(e, gx, oi - 2)) { ret false; }
+    @out = e.pacc[e.pbase[gx] + oi - 2];
+    ret true;
+}
+
+# a parameter's origin marks what its function does through it, a global's what the module does to it
+fun mark_origin(e: *emitter.Emit, fx: u32, mi: *lang_mir.MirInstr, o: u32, how: u8) err[fail.Fail] {
+    if ((o & ORIGIN_PARAM) == 0 || o == emit_global.GL_NONE) { ret mark_access(e, mi, o, how); }
+    val at: u32 = e.pbase[fx] + (o & ~ORIGIN_PARAM);
+    if (e.pacc == nil || at >= e.pacc_len) { ret err[fail.Fail].ok{}; }
+    if ((how & ~e.pacc[at]) != 0) {
+        e.pacc[at] = e.pacc[at] | how;
+        e.sum_grew = true;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun operand_only_reads(mi: *lang_mir.MirInstr, oi: u32) bool {
+    val op: lang_mir.MirOpcode = mi.opcode;
+    if (op == lang_mir.MIR_VALUE_PARAM) { ret true; }
+    if (op == lang_mir.MIR_LOAD)        { ret oi == 1; }
+    if (op == lang_mir.MIR_GEP)         { ret oi < 2; }
+    if (op == lang_mir.MIR_MEMCPY)      { ret oi == 1; }
+    # a by-value argument is loaded from its object; a reference argument may be written through by the callee
+    if (op == lang_mir.MIR_VALUE_CALL) { ret oi >= 2 && mi.operands[oi].kind == lang_mir.MIR_OP_MEM; }
+    if (op == lang_mir.MIR_RET)        { ret oi == 0; }
+    ret false;
+}
+
+fun operand_origin(e: *emitter.Emit, origin: *u32, n: u32, op: *lang_mir.MirOperand) u32 {
+    if (op.kind == lang_mir.MIR_OP_SYM)                                    { ret emit_global.gl_lookup(e, op.sym); }
+    if (op.kind != lang_mir.MIR_OP_VREG && op.kind != lang_mir.MIR_OP_MEM) { ret emit_global.GL_NONE; }
+    if (origin == nil || lang_mir.vreg_is_nil(op.vreg) || op.vreg.n >= n)  { ret emit_global.GL_NONE; }
+    ret origin[op.vreg.n];
+}
+
+# an address operand the instruction writes through or only offsets, never loading what it names
+fun operand_never_reads(mi: *lang_mir.MirInstr, oi: u32) bool {
+    val op: lang_mir.MirOpcode = mi.opcode;
+    if (op == lang_mir.MIR_VALUE_PARAM) { ret true; }
+    if (op == lang_mir.MIR_STORE)       { ret oi == 0; }
+    if (op == lang_mir.MIR_MEMCPY)      { ret oi == 0; }
+    if (op == lang_mir.MIR_MEMZERO)     { ret oi == 0; }
+    if (op == lang_mir.MIR_GEP)         { ret oi < 2; }
+    ret false;
+}
+
+fun mark_access(e: *emitter.Emit, mi: *lang_mir.MirInstr, gix: u32, how: u8) err[fail.Fail] {
+    if (gix >= e.gl_len || e.gaccess == nil) { ret err[fail.Fail].ok{}; }
+    val fresh: u8 = how & ~e.gaccess[gix];
+    if (fresh == 0) { ret err[fail.Fail].ok{}; }
+    e.gaccess[gix] = e.gaccess[gix] | fresh;
+    val g: *me_ir.Global = emit_global.gl_ir(e, gix);
+    if ((fresh & emit_global.ACCESS_WRITE) != 0 && (g.iface_flags & me_ir.IFACE_FLAG_READONLY) != 0) {
+        val where: res[str, fail.Fail] = emit_global.gl_mod_prefix(e, gix);
+        if (sel where.err) { ret err[fail.Fail].err{where.err}; }
+        if (g.iface == me_ir.IFACE_SPEC) {
+            val sr: res[str, fail.Fail] = fail.format(e.alloc,
+                "a store reaches the `#[spec({})]` var{}: a specialization constant is supplied by the host at pipeline creation and is a constant from then on, so a shader has no storage to write it through. copy it into a local to change the value",
+                g.iface_a, where.ok);
+            ret err[fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_READONLY_STORE, lang_mir.refusal_loc(e.cur_fn, mi), sr)};
+        }
+        if (g.iface == me_ir.IFACE_PUSH) {
+            val pr: res[str, fail.Fail] = fail.format(e.alloc,
+                "a store reaches the `#[push]` block{}: a push-constant block is written by the host with the command that records the dispatch or draw, and a shader only reads it. copy the value into a local to change it",
+                where.ok);
+            ret err[fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_READONLY_STORE, lang_mir.refusal_loc(e.cur_fn, mi), pr)};
+        }
+        val r: res[str, fail.Fail] = fail.format(e.alloc,
+            "a store reaches the `#[storage({}, {}, \"readonly\")]` binding{}: the qualifier declares that nothing writes it, which is what lets this module mark the descriptor `NonWritable` and a vertex stage read it without `vertexPipelineStoresAndAtomics`. drop the `\"readonly\"` qualifier to write it",
+            g.iface_a, g.iface_b, where.ok);
+        ret err[fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_READONLY_STORE, lang_mir.refusal_loc(e.cur_fn, mi), r)};
+    }
+    if ((fresh & ACCESS_READ) != 0 && (g.iface_flags & me_ir.IFACE_FLAG_WRITEONLY) != 0) {
+        val where: res[str, fail.Fail] = emit_global.gl_mod_prefix(e, gix);
+        if (sel where.err) { ret err[fail.Fail].err{where.err}; }
+        val r: res[str, fail.Fail] = fail.format(e.alloc,
+            "a load reaches the `#[storage({}, {}, \"writeonly\")]` binding{}: the qualifier declares that nothing reads it, which is what lets this module mark the descriptor `NonReadable`. drop the `\"writeonly\"` qualifier to read it",
+            g.iface_a, g.iface_b, where.ok);
+        ret err[fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_WRITEONLY_LOAD, lang_mir.refusal_loc(e.cur_fn, mi), r)};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun declare_interface(e: *emitter.Emit) err[fail.Fail] {
+    val n: u32 = e.gl_len;
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+
+    val rg: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rg.err) { ret err[fail.Fail].err{fail.refused(rg.err)}; }
+    e.gvar_ids = rg.ok;
+
+    val rs: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rs.err) { ret err[fail.Fail].err{fail.refused(rs.err)}; }
+    e.gslot = rs.ok;
+    val rt: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rt.err) { ret err[fail.Fail].err{fail.refused(rt.err)}; }
+    e.gtype_ids = rt.ok;
+    val rc: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rc.err) { ret err[fail.Fail].err{fail.refused(rc.err)}; }
+    e.gstorage = rc.ok;
+    val rp: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rp.err) { ret err[fail.Fail].err{fail.refused(rp.err)}; }
+    e.gspec = rp.ok;
+
+    var i: u32 = 0;
+    for (i < n) {
+        e.gvar_ids[i]  = 0;
+        e.gslot[i]     = 0;
+        e.gtype_ids[i] = 0;
+        e.gstorage[i]  = 0;
+        e.gspec[i]     = 0;
+        i              = i + 1;
+    }
+
+    i = 0;
+    for (i < n) {
+        val g:  *me_ir.Global        = emit_global.gl_ir(e, i);
+        val gt: *ir_type.IrTypeTable = emit_global.gl_types(e, i);
+        if (g.iface == me_ir.IFACE_NONE) {
+            i = i + 1;
+            cnt;
+        }
+        emit_layout.use_at(e, g.decl_loc);
+        if (g.iface == me_ir.IFACE_SPEC) {
+            val sr: err[fail.Fail] = declare_spec(e, i);
+            if (sel sr.err) { ret sr; }
+            i = i + 1;
+            cnt;
+        }
+
+        if (g.iface == me_ir.IFACE_BUILTIN) {
+            val br: res[str, fail.Fail] = emit_builtin.builtin_type_refusal(gt, e.alloc, g.iface_a, g.ty);
+            if (sel br.err)   { ret err[fail.Fail].err{br.err}; }
+            if (br.ok != nil) { ret err[fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_INTERFACE, g.decl_loc, br.ok)}; }
+        }
+
+        val handle: bool = emit_instruction.is_image_type(e, gt, g.ty);
+        if (handle) {
+            val wr: err[fail.Fail] = emit_instruction.require_wide_texels(e, gt, i);
+            if (sel wr.err) { ret wr; }
+        }
+        var storage: u32 = isa_spirv.STORAGE_INPUT;
+        if (g.iface == me_ir.IFACE_OUTPUT)  { storage = isa_spirv.STORAGE_OUTPUT; }
+        or (g.iface == me_ir.IFACE_UNIFORM) { storage = isa_spirv.STORAGE_UNIFORM; }
+        or (g.iface == me_ir.IFACE_STORAGE) { storage = isa_spirv.storage_buffer_class(e.b.version); }
+        or (g.iface == me_ir.IFACE_SAMPLER) { storage = isa_spirv.STORAGE_UNIFORM_CONSTANT; }
+        or (g.iface == me_ir.IFACE_PUSH)    { storage = isa_spirv.STORAGE_PUSH_CONSTANT; }
+        or (g.iface == me_ir.IFACE_BUILTIN) { storage = emit_builtin.builtin_storage(g.iface_a); }
+        or (g.iface == me_ir.IFACE_SHARED)  { storage = isa_spirv.STORAGE_WORKGROUP; }
+        # every handle variable lives in UniformConstant, a storage image's included
+        if (handle) { storage = isa_spirv.STORAGE_UNIFORM_CONSTANT; }
+
+        if (handle && g.iface != emit_instruction.handle_role(e, gt, g.ty)) {
+            ret err[fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_INTERFACE, g.decl_loc, "an image handle carries an interface role other than the descriptor it binds as: a storage image is `#[storage(set, binding)]`, every other handle `#[sampler(set, binding)]`, and a handle reaches no other storage class")};
+        }
+        if (handle) {
+            val tr: err[fail.Fail] = emit_op.require_image_type(e, gt, g.ty);
+            if (sel tr.err) { ret tr; }
+        }
+        if (!handle && g.iface == me_ir.IFACE_SAMPLER) {
+            ret err[fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_INTERFACE, g.decl_loc, "a `#[sampler(set, binding)]` binding is not of an image handle type; a descriptor-bound block or buffer of an ordinary type is `#[uniform]` or `#[storage]`")};
+        }
+
+        var value_ty: u32 = 0;
+        if (emit_layout.is_block_iface(g.iface) && !handle) {
+            val ur: res[u32, fail.Fail] = emit_layout.block_type(e, gt, g.ty, g.iface);
+            if (sel ur.err) { ret err[fail.Fail].err{ur.err}; }
+            value_ty = ur.ok;
+        }
+        or (g.iface == me_ir.IFACE_INPUT || g.iface == me_ir.IFACE_OUTPUT) {
+            value_ty = emit_layout.interface_type(e, gt, g.ty);
+            val nr: err[fail.Fail] = emit_layout.require_interface_access(e, value_ty, i);
+            if (sel nr.err) { ret nr; }
+        }
+        or { value_ty = emit_value.global_spv_type(e, gt, g.ty); }
+        if (value_ty == 0) {
+            ret emitter.unsupported(e, "unsupported shader interface variable type in the SPIR-V target");
+        }
+        val ptr_ty: u32 = types.type_ptr(e.tt, storage, value_ty);
+        val var_id: u32 = isa_spirv.alloc_id(e.b);
+        var vop:    [4]u32;
+        vop[0] = ptr_ty;
+        vop[1] = var_id;
+        vop[2] = storage;
+        var vn: u32 = 3;
+        if (g.iface == me_ir.IFACE_SHARED && shared_native_zero(e) && !emit_memory.holds_physical(e, value_ty)) {
+            vop[3] = types.const_null(e.tt, value_ty);
+            vn     = 4;
+        }
+        or (storage == isa_spirv.STORAGE_OUTPUT && !output_zeroed_by_stage(e, gt, g, value_ty)) {
+            vop[3] = emit_memory.output_initializer(e, gt, g, value_ty);
+            vn     = 4;
+            if (vop[3] == 0) {
+                ret emitter.unsupported(e, "an output's initializer is not a constant the SPIR-V target can spell: an output starts at a constant of its own type, and this one holds an address or a type no constant composite has");
+            }
+        }
+        isa_spirv.inst(e.b, ?e.b.types_consts, isa_spirv.OP_VARIABLE, ?vop[0], vn);
+        e.gvar_ids[i]  = var_id;
+        e.gtype_ids[i] = value_ty;
+        e.gstorage[i]  = storage;
+        debug.name_shown(?e.dbg, var_id, g.disp, g.name);
+        if (emit_layout.is_block_iface(g.iface) && !handle) { debug.record(?e.dbg, value_ty, g.ty_sem); }
+
+        if (g.iface == me_ir.IFACE_INPUT || g.iface == me_ir.IFACE_OUTPUT) {
+            emit_memory.decorate(e, var_id, isa_spirv.DECOR_LOCATION, g.iface_a);
+        }
+        if (g.iface == me_ir.IFACE_BUILTIN) {
+            emit_memory.decorate(e, var_id, isa_spirv.DECOR_BUILTIN, emit_builtin.builtin_selector(g.iface_a));
+            val rq: err[fail.Fail] = emit_capability.require_at_made(e, g.decl_loc, 0, emit_builtin.builtin_capability(g.iface_a), 0,
+                emit_capability.builtin_decl_text(e, i));
+            if (sel rq.err) { ret rq; }
+        }
+        if (g.iface == me_ir.IFACE_UNIFORM || g.iface == me_ir.IFACE_STORAGE
+            || g.iface == me_ir.IFACE_SAMPLER) {
+            emit_memory.decorate(e, var_id, isa_spirv.DECOR_DESCRIPTOR_SET, g.iface_a);
+            emit_memory.decorate(e, var_id, isa_spirv.DECOR_BINDING, g.iface_b);
+        }
+        if (g.iface == me_ir.IFACE_STORAGE && !emit_global.gl_written(e, i)) {
+            emit_value.decorate_bare(e, var_id, isa_spirv.DECOR_NON_WRITABLE);
+        }
+        decorate_memory_quals(e, var_id, g.iface_flags);
+        if (e.vulkan_mm) {
+            val sr: err[fail.Fail] = emit_memory.mark_memory_scope(e, var_id, variable_scope(storage, g.iface_flags));
+            if (sel sr.err)                                                 { ret sr; }
+            if (handle && (g.iface_flags & me_ir.IFACE_FLAG_COHERENT) != 0) { e.coherent_images = true; }
+        }
+        e.gslot[i]  = e.iface_len + 1;
+        e.iface_len = e.iface_len + 1;
+        i           = i + 1;
+    }
+    emit_layout.use_at(e, lang_source.location_nil());
+    ret err[fail.Fail].ok{};
+}
+
+# a specialization constant is no variable: it is an OpSpecConstant whose literal is the
+# initializer, the default a pipeline keeps unless it supplies the SpecId
+fun declare_spec(e: *emitter.Emit, i: u32) err[fail.Fail] {
+    val g:      *me_ir.Global        = emit_global.gl_ir(e, i);
+    val gt:     *ir_type.IrTypeTable = emit_global.gl_types(e, i);
+    val t:      opt[*ir_type.IrType] = ir_type.get(gt, g.ty);
+    var scalar: bool                 = false;
+    emit_layout.use_at(e, g.decl_loc);
+    if (sel t.some) { scalar = t.some.kind == ir_type.IRT_INT || t.some.kind == ir_type.IRT_FLOAT; }
+    if (!scalar) {
+        val where: res[str, fail.Fail] = emit_global.gl_mod_prefix(e, i);
+        if (sel where.err) { ret err[fail.Fail].err{where.err}; }
+        val shown: res[str, fail.Fail] = emit_builtin.ir_type_spelling(gt, e.alloc, g.ty);
+        if (sel shown.err) { ret err[fail.Fail].err{shown.err}; }
+        ret err[fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_INTERFACE, g.decl_loc, fail.format(e.alloc,
+            "a `#[spec({})]` var must be a scalar integer or float{}: a specialization constant is one literal the host supplies, and this one is {}",
+            g.iface_a, where.ok, shown.ok))};
+    }
+    var j: u32 = 0;
+    for (j < i) {
+        val o: *me_ir.Global = emit_global.gl_ir(e, j);
+        if (o.iface == me_ir.IFACE_SPEC && o.iface_a == g.iface_a) {
+            val first: res[str, fail.Fail] = emit_global.gl_mod_prefix(e, j);
+            if (sel first.err) { ret err[fail.Fail].err{first.err}; }
+            val second: res[str, fail.Fail] = emit_global.gl_mod_prefix(e, i);
+            if (sel second.err) { ret err[fail.Fail].err{second.err}; }
+            ret err[fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_INTERFACE, g.decl_loc, fail.format(e.alloc,
+                "two `#[spec({})]` vars share one SpecId: `{}`{} and `{}`{}. a pipeline supplies a specialization constant by its id, so one id names one constant in a module. give them different ids",
+                g.iface_a, spec_name(e, j), first.ok, spec_name(e, i), second.ok))};
+        }
+        j = j + 1;
+    }
+    val value_ty: u32 = emit_value.global_spv_type(e, gt, g.ty);
+    if (value_ty == 0) { ret emitter.unsupported(e, "unsupported specialization constant type in the SPIR-V target"); }
+    val bits: u32 = types.type_bits(e.tt, value_ty);
+    val lit:  u64 = emit_memory.scalar_literal(?g.init, bits);
+    val id:   u32 = isa_spirv.alloc_id(e.b);
+    var ops:  [4]u32;
+    ops[0] = value_ty;
+    ops[1] = id;
+    ops[2] = (lit & 0xFFFFFFFF)::u32;
+    ops[3] = (lit >> 32)::u32;
+    var n: u32 = 3;
+    if (bits > 32) { n = 4; }
+    isa_spirv.inst(e.b, ?e.b.types_consts, isa_spirv.OP_SPEC_CONSTANT, ?ops[0], n);
+    emit_memory.decorate(e, id, isa_spirv.DECOR_SPEC_ID, g.iface_a);
+    debug.name_shown(?e.dbg, id, g.disp, g.name);
+    e.gspec[i]     = id;
+    e.gtype_ids[i] = value_ty;
+    ret err[fail.Fail].ok{};
+}
+
+# an output starting at zero whose OpConstantNull would need the arithmetic capability of a
+# narrow leaf the selection lacks carries no initializer, and each stage reaching it stores
+# a zero built from wider constants first, which needs only the storage access
+# capability the output holds anyway. one starting elsewhere keeps its constant
+fun output_zeroed_by_stage(e: *emitter.Emit, gt: *ir_type.IrTypeTable, g: *me_ir.Global, value_ty: u32) bool {
+    if (g.iface != me_ir.IFACE_OUTPUT || !holds_unconstant_narrow(e, value_ty)) { ret false; }
+    val v: *value.Value = ?g.init;
+    if (v.kind == value.VAL_CONST_NULL)                                   { ret true; }
+    if (v.kind == value.VAL_CONST_INT || v.kind == value.VAL_CONST_FLOAT) { ret v.data.int_lit == 0; }
+    if (v.kind == value.VAL_CONST_AGG && v.data.agg.reloc_count == 0)     { ret bytes_zero(v.data.agg.bytes, v.data.agg.len); }
+    if (v.kind == value.VAL_CONST_BYTES)                                  { ret bytes_zero(v.data.bytes.ptr, v.data.bytes.len); }
+    ret false;
+}
+
+fun bytes_zero(bytes: *u8, len: u32) bool {
+    var k: u32 = 0;
+    for (k < len) {
+        if (bytes[k] != 0) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# a type holding a narrow leaf whose constant needs an arithmetic capability the selection
+# lacks: a 16-bit integer without int16, an f16 without float16, an 8-bit integer without int8
+fun holds_unconstant_narrow(e: *emitter.Emit, ty: u32) bool {
+    if (ty == 0) { ret false; }
+    var n:    u32 = 0;
+    val lane: u32 = types.vector_shape(e.tt, ty, ?n);
+    if (lane != 0) { ret holds_unconstant_narrow(e, lane); }
+    if (types.is_composite(e.tt, ty)) {
+        val count: u32 = types.composite_count(e.tt, ty);
+        var i:     u32 = 0;
+        for (i < count) {
+            if (holds_unconstant_narrow(e, types.composite_member(e.tt, ty, i))) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+    if (types.type_is_bool(e.tt, ty)) { ret false; }
+    val bits: u32 = types.type_bits(e.tt, ty);
+    if (bits != 8 && bits != 16)       { ret false; }
+    if (types.type_is_float(e.tt, ty)) { ret !emit_layout.half_memory(e); }
+    ret emit_layout.carrier_bits(e, bits) != bits;
+}
+
+# the zero of `ty` with no constant of a narrow type holds_unconstant_narrow names: each such
+# scalar or vector converted from the zero of its 32-bit counterpart, and a composite built
+# from its members' zeros
+fun narrow_free_zero(e: *emitter.Emit, ty: u32) u32 {
+    if (!holds_unconstant_narrow(e, ty)) { ret types.const_null(e.tt, ty); }
+    var n:    u32 = 0;
+    val lane: u32 = types.vector_shape(e.tt, ty, ?n);
+    if (lane == 0 && types.is_composite(e.tt, ty)) {
+        val count: u32 = types.composite_count(e.tt, ty);
+        if (count == 0 || !types.instruction_operands_fit(2, count)) { ret 0; }
+        val ar: res[*u32, A.Error] = A.allocate[u32](e.alloc, count::usize);
+        if (sel ar.err) { ret 0; }
+        val parts: *u32 = ar.ok;
+        fin { A.deallocate[u32](e.alloc, parts, count::usize); }
+        var i: u32 = 0;
+        for (i < count) {
+            parts[i] = narrow_free_zero(e, types.composite_member(e.tt, ty, i));
+            if (parts[i] == 0) { ret 0; }
+            i = i + 1;
+        }
+        ret emit_layout.emit_construct(e, ty, parts, count);
+    }
+    var leaf: u32 = ty;
+    if (lane != 0) { leaf = lane; }
+    val float: bool = types.type_is_float(e.tt, leaf);
+    var wide:  u32  = types.type_int(e.tt, 32);
+    var op:    u32  = isa_spirv.OP_U_CONVERT;
+    if (float) {
+        wide = types.type_float(e.tt, 32);
+        op   = isa_spirv.OP_F_CONVERT;
+    }
+    if (lane != 0) { wide = types.type_vector(e.tt, wide, n); }
+    ret emit_layout.half_inst(e, op, ty, types.const_null(e.tt, wide), 0, 0, 1);
+}
+
+# the zero each output output_zeroed_by_stage names starts at, stored by a stage that reaches it
+pub fun emit_output_zeroing(e: *emitter.Emit, fx: u32) err[fail.Fail] {
+    var gx: u32 = 0;
+    for (gx < e.gl_len) {
+        val g: *me_ir.Global = emit_global.gl_ir(e, gx);
+        if (g.iface != me_ir.IFACE_OUTPUT || e.gslot[gx] == 0 || e.gvar_ids[gx] == 0 || !uses_iface(e, fx, e.gslot[gx] - 1)
+            || !output_zeroed_by_stage(e, emit_global.gl_types(e, gx), g, e.gtype_ids[gx])) {
+            gx = gx + 1;
+            cnt;
+        }
+        val zero: u32 = narrow_free_zero(e, e.gtype_ids[gx]);
+        if (zero == 0) { ret emitter.emit_fail(e, "spirv.emit: could not build an output's zero"); }
+        emit_memory.memory_store(e, e.gvar_ids[gx], zero, 0);
+        gx = gx + 1;
+    }
+    if (e.b.err) { ret err[fail.Fail].err{fail.message("spirv.emit: module builder hit an allocation error")}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun spec_name(e: *emitter.Emit, i: u32) str {
+    val g: *me_ir.Global = emit_global.gl_ir(e, i);
+    var n: intern.StrId  = g.disp;
+    if (intern.str_is_nil(n)) { n = g.name; }
+    ret intern.text(e.interner, n);
+}
+
+# the environment admits LocalSizeId: SPIR-V 1.2 without an environment, and on
+# Vulkan the maintenance4 feature only Vulkan 1.3 guarantees
+fun local_size_id_admitted(e: *emitter.Emit) bool {
+    if (e.tgt.identity.env_id == isa.ENV_NONE) { ret e.b.version >= isa_spirv.SPV_VERSION_1_2; }
+    val p: *isa_spirv.EnvProfile = isa_spirv.env_profile(e.tgt.identity.env_profile);
+    ret p != nil && p.local_size_id;
+}
+
+pub fun wg_is_spec(fn: *me_ir.Function) bool {
+    ret !intern.str_is_nil(fn.wg_spec[0]) || !intern.str_is_nil(fn.wg_spec[1]) || !intern.str_is_nil(fn.wg_spec[2]);
+}
+
+fun wg_literal(fn: *me_ir.Function, d: u32) u32 {
+    if (d == 0) { ret fn.wg_x; }
+    if (d == 1) { ret fn.wg_y; }
+    ret fn.wg_z;
+}
+
+# the id a workgroup dimension is: its `#[spec]` var's constant, or a 32-bit OpConstant
+pub fun wg_dim_id(e: *emitter.Emit, fn: *me_ir.Function, d: u32) res[u32, fail.Fail] {
+    val name: intern.StrId = fn.wg_spec[d];
+    if (intern.str_is_nil(name)) { ret res[u32, fail.Fail].ok{types.const_int(e.tt, 32, wg_literal(fn, d)::i64)}; }
+    val gx: u32 = emit_global.gl_lookup(e, name);
+    var id: u32 = 0;
+    if (gx != emit_global.GL_NONE && e.gspec != nil) { id = e.gspec[gx]; }
+    if (id == 0) {
+        ret res[u32, fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_INTERFACE, fn.decl_loc, "a `#[workgroup]` dimension names a var that is not a `#[spec(id)]` var: a dimension is a constant or a specialization constant the host supplies at pipeline creation")};
+    }
+    val ty: u32 = e.gtype_ids[gx];
+    if (types.type_is_float(e.tt, ty) || types.type_bits(e.tt, ty) != 32) {
+        ret res[u32, fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_INTERFACE, fn.decl_loc, "a `#[spec]` var sizing a `#[workgroup]` dimension must be a 32-bit integer: a workgroup size is three 32-bit integers")};
+    }
+    ret res[u32, fail.Fail].ok{id};
+}
+
+fun wg_same(a: *me_ir.Function, b: *me_ir.Function) bool {
+    var d: u32 = 0;
+    for (d < 3) {
+        if (!intern.str_same(a.wg_spec[d], b.wg_spec[d]))                            { ret false; }
+        if (intern.str_is_nil(a.wg_spec[d]) && wg_literal(a, d) != wg_literal(b, d)) { ret false; }
+        d = d + 1;
+    }
+    ret true;
+}
+
+# without LocalSizeId a specialized workgroup is the WorkgroupSize built-in over a
+# spec composite, which sizes every compute stage in the module, so they must agree
+pub fun plan_workgroup(e: *emitter.Emit) err[fail.Fail] {
+    var first: *me_ir.Function = nil;
+    var spec:  bool            = false;
+    var fx:    u32             = 0;
+    for (fx < e.fn_len) {
+        if (!e.fns[fx].emit) {
+            fx = fx + 1;
+            cnt;
+        }
+        val fn: *me_ir.Function = emitter.fn_ir(e, fx);
+        if (fn.stage != me_ir.STAGE_COMPUTE) {
+            fx = fx + 1;
+            cnt;
+        }
+        if (wg_is_spec(fn)) { spec = true; }
+        if (first == nil)   { first = fn; }
+        or (!wg_same(first, fn) && (spec || wg_is_spec(first)) && !local_size_id_admitted(e)) {
+            ret err[fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_INTERFACE, fn.decl_loc, "compute stages in one module size their workgroups differently and one of them by a `#[spec]` var: this environment has no LocalSizeId, so a specialized workgroup is the WorkgroupSize built-in, which sizes every compute stage in the module at once. give the stages one workgroup, split them into modules, or target vulkan1.3")};
+        }
+        fx = fx + 1;
+    }
+    if (!spec || local_size_id_admitted(e)) { ret err[fail.Fail].ok{}; }
+    var parts: [3]u32;
+    var d:     u32 = 0;
+    for (d < 3) {
+        val r: res[u32, fail.Fail] = wg_dim_id(e, first, d);
+        if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+        parts[d] = r.ok;
+        d        = d + 1;
+    }
+    val vec: u32 = types.type_vector(e.tt, types.type_int(e.tt, 32), 3);
+    val id:  u32 = isa_spirv.alloc_id(e.b);
+    var ops: [5]u32;
+    ops[0] = vec;
+    ops[1] = id;
+    ops[2] = parts[0];
+    ops[3] = parts[1];
+    ops[4] = parts[2];
+    isa_spirv.inst(e.b, ?e.b.types_consts, isa_spirv.OP_SPEC_CONSTANT_COMPOSITE, ?ops[0], 5);
+    emit_memory.decorate(e, id, isa_spirv.DECOR_BUILTIN, isa_spirv.BUILTIN_WORKGROUP_SIZE);
+    e.wg_builtin = true;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun build_iface_uses(e: *emitter.Emit) err[fail.Fail] {
+    if (e.iface_len == 0 || e.fn_len == 0) { ret err[fail.Fail].ok{}; }
+    val cells: u32               = e.fn_len * e.iface_len;
+    val ru:    res[*u8, A.Error] = A.allocate[u8](e.alloc, cells::usize);
+    if (sel ru.err) { ret err[fail.Fail].err{fail.refused(ru.err)}; }
+    e.iface_use = ru.ok;
+    var c: u32 = 0;
+    for (c < cells) {
+        e.iface_use[c] = 0;
+        c              = c + 1;
+    }
+
+    var fx: u32 = 0;
+    for (fx < e.fn_len) {
+        val mf: *lang_mir.MirFunction = emitter.fn_mir(e, fx);
+        if (mf == nil) {
+            fx = fx + 1;
+            cnt;
+        }
+        var bi: u32 = 0;
+        for (bi < mf.block_count) {
+            val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+            var ii:  u32                = 0;
+            for (ii < blk.instr_count) {
+                val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+                var oi: u32                = 0;
+                for (oi < mi.operand_count) {
+                    if (mi.operands[oi].kind == lang_mir.MIR_OP_SYM) {
+                        val slot: u32 = iface_slot_of(e, mi.operands[oi].sym);
+                        if (slot != 0) { e.iface_use[fx * e.iface_len + slot - 1] = 1; }
+                    }
+                    oi = oi + 1;
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+        fx = fx + 1;
+    }
+
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        fx      = 0;
+        for (fx < e.fn_len) {
+            var ci: u32 = 0;
+            for (ci < emitter.callee_count(e, fx)) {
+                val cx: u32 = emitter.callee_at(e, fx, ci);
+                if (cx != emitter.FN_NONE) {
+                    var s: u32 = 0;
+                    for (s < e.iface_len) {
+                        if (e.iface_use[cx * e.iface_len + s] != 0
+                            && e.iface_use[fx * e.iface_len + s] == 0) {
+                            e.iface_use[fx * e.iface_len + s] = 1;
+                            changed                           = true;
+                        }
+                        s = s + 1;
+                    }
+                }
+                ci = ci + 1;
+            }
+            fx = fx + 1;
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun uses_iface(e: *emitter.Emit, fn_ix: u32, slot: u32) bool {
+    if (e.iface_use == nil || fn_ix >= e.fn_len || slot >= e.iface_len) { ret false; }
+    ret e.iface_use[fn_ix * e.iface_len + slot] != 0;
+}
+
+fun iface_slot_of(e: *emitter.Emit, name: intern.StrId) u32 {
+    if (e.gslot == nil) { ret 0; }
+    val gx: u32 = emit_global.gl_lookup(e, name);
+    if (gx == emit_global.GL_NONE) { ret 0; }
+    ret e.gslot[gx];
+}
+
+pub fun check_call_graph(e: *emitter.Emit) err[fail.Fail] {
+    val n: u32 = e.fn_len;
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+
+    val rs: res[*u8, A.Error] = A.allocate[u8](e.alloc, n::usize);
+    if (sel rs.err) { ret err[fail.Fail].err{fail.refused(rs.err)}; }
+    val state: *u8                = rs.ok;
+    val rp:    res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rp.err) {
+        A.deallocate[u8](e.alloc, state, n::usize);
+        ret err[fail.Fail].err{fail.refused(rp.err)};
+    }
+    val path: *u32 = rp.ok;
+
+    var i: u32 = 0;
+    for (i < n) {
+        state[i] = 0;
+        path[i]  = 0;
+        i        = i + 1;
+    }
+
+    var msg: res[str, fail.Fail] = res[str, fail.Fail].ok{nil};
+    i = 0;
+    for (i < n && refusal_pending(msg)) {
+        if (state[i] == 0 && e.fns[i].emit) { msg = cg_visit(e, state, path, 0, i); }
+        i = i + 1;
+    }
+
+    A.deallocate[u8](e.alloc, state, n::usize);
+    A.deallocate[u32](e.alloc, path, n::usize);
+    if (sel msg.err)   { ret err[fail.Fail].err{msg.err}; }
+    if (msg.ok != nil) { ret err[fail.Fail].err{emitter.reject_module(e, diagnostic_kind.SPIRV_RECURSION, msg.ok)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# whether a refusal search has met neither a refusal nor a failure yet
+fun refusal_pending(r: res[str, fail.Fail]) bool {
+    if (sel r.ok) { ret r.ok == nil; }
+    ret false;
+}
+
+# the refusal of the first call cycle reached from `ix`, nil when none is
+fun cg_visit(e: *emitter.Emit, state: *u8, path: *u32, depth: u32, ix: u32) res[str, fail.Fail] {
+    state[ix]   = 1;
+    path[depth] = ix;
+
+    var ci: u32 = 0;
+    for (ci < emitter.callee_count(e, ix)) {
+        val cx: u32 = emitter.callee_at(e, ix, ci);
+        if (cx != emitter.FN_NONE && emitter.emittable(e, cx)) {
+            if (state[cx] == 1) { ret cycle_refusal(e, path, depth + 1, cx); }
+            if (state[cx] == 0) {
+                val sub: res[str, fail.Fail] = cg_visit(e, state, path, depth + 1, cx);
+                if (sel sub.err)   { ret sub; }
+                if (sub.ok != nil) { ret sub; }
+            }
+        }
+        ci = ci + 1;
+    }
+
+    state[ix] = 2;
+    ret res[str, fail.Fail].ok{nil};
+}
+
+fun cycle_refusal(e: *emitter.Emit, path: *u32, depth: u32, closes: u32) res[str, fail.Fail] {
+    val first: res[str, fail.Fail] = emitter.ir_fn_spelling(e, closes);
+    if (sel first.err) { ret first; }
+    var chain: str = first.ok;
+    var i:     u32 = 0;
+    for (i < depth && path[i] != closes) { i = i + 1; }
+    for (i < depth) {
+        val next: res[str, fail.Fail] = emitter.ir_fn_spelling(e, path[i]);
+        if (sel next.err) { ret next; }
+        val r: res[str, fail.Fail] = fail.format(e.alloc, "{} -> {}", chain, next.ok);
+        if (sel r.err) { ret r; }
+        chain = r.ok;
+        i     = i + 1;
+    }
+    ret fail.format(e.alloc,
+        "this call graph is a cycle and the SPIR-V target cannot express it: {}. a SPIR-V execution model has no call stack, so a function may not be reachable from itself. rewrite the recursion as a loop",
+        chain);
+}
+
+# the stages that reach each function: an entry point's own, carried to everything it calls
+pub fun build_fn_stages(e: *emitter.Emit) err[fail.Fail] {
+    if (e.fn_len == 0) { ret err[fail.Fail].ok{}; }
+    val rs: res[*u8, A.Error] = A.allocate[u8](e.alloc, e.fn_len::usize);
+    if (sel rs.err) { ret err[fail.Fail].err{fail.refused(rs.err)}; }
+    e.fn_stages = rs.ok;
+    var fx: u32 = 0;
+    for (fx < e.fn_len) {
+        e.fn_stages[fx] = 0;
+        if (e.fns[fx].emit) { e.fn_stages[fx] = emit_builtin.stage_bit(emitter.fn_ir(e, fx).stage); }
+        fx = fx + 1;
+    }
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        fx      = 0;
+        for (fx < e.fn_len) {
+            var ci: u32 = 0;
+            for (ci < emitter.callee_count(e, fx)) {
+                val cx: u32 = emitter.callee_at(e, fx, ci);
+                if (cx != emitter.FN_NONE && (e.fn_stages[fx] & ~e.fn_stages[cx]) != 0) {
+                    e.fn_stages[cx] = e.fn_stages[cx] | e.fn_stages[fx];
+                    changed         = true;
+                }
+                ci = ci + 1;
+            }
+            fx = fx + 1;
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun check_stage_interfaces(e: *emitter.Emit) err[fail.Fail] {
+    val n: u32 = e.gl_len;
+    if (e.iface_len == 0 || n == 0) { ret err[fail.Fail].ok{}; }
+
+    val rf: res[*u8, A.Error] = A.allocate[u8](e.alloc, n::usize);
+    if (sel rf.err) { ret err[fail.Fail].err{fail.refused(rf.err)}; }
+    val flat: *u8 = rf.ok;
+    var i:    u32 = 0;
+    for (i < n) {
+        flat[i] = 0;
+        i       = i + 1;
+    }
+
+    var msg: res[str, fail.Fail]  = res[str, fail.Fail].ok{nil};
+    var at:  lang_source.Location = lang_source.location_nil();
+    var fx:  u32                  = 0;
+    for (fx < e.fn_len && refusal_pending(msg)) {
+        if (!e.fns[fx].emit) {
+            fx = fx + 1;
+            cnt;
+        }
+        val fn: *me_ir.Function = emitter.fn_ir(e, fx);
+        if (fn.stage == me_ir.STAGE_NONE) {
+            fx = fx + 1;
+            cnt;
+        }
+        i = 0;
+        for (i < n) {
+            if (e.gslot[i] == 0 || !uses_iface(e, fx, e.gslot[i] - 1)) {
+                i = i + 1;
+                cnt;
+            }
+            val gi: *me_ir.Global = emit_global.gl_ir(e, i);
+            if (gi.iface == me_ir.IFACE_SHARED && fn.stage != me_ir.STAGE_COMPUTE) {
+                msg = shared_stage_refusal(e, fx, i);
+                at  = gi.decl_loc;
+                i   = n;
+                cnt;
+            }
+            if (e.gstorage[i] == isa_spirv.STORAGE_INPUT && needs_flat(emit_global.gl_types(e, i), gi.ty)) {
+                if (fn.stage == me_ir.STAGE_FRAGMENT) { flat[i] = flat[i] | 1; }
+                or (fn.stage == me_ir.STAGE_VERTEX)   { flat[i] = flat[i] | 2; }
+                if (flat[i] == 3) {
+                    msg = flat_conflict(e, i);
+                    at  = gi.decl_loc;
+                    i   = n;
+                    cnt;
+                }
+            }
+            if (gi.iface == me_ir.IFACE_BUILTIN) {
+                msg = emit_builtin.builtin_stage_refusal(e, fx, i);
+                if (sel msg.err || (sel msg.ok && msg.ok != nil)) {
+                    at = gi.decl_loc;
+                    i  = n;
+                    cnt;
+                }
+                val rq: err[fail.Fail] = emit_capability.require_at_made(e, fn.decl_loc, emit_builtin.stage_bit(fn.stage),
+                    emit_builtin.builtin_capability(gi.iface_a), 0, emit_capability.builtin_use_text(e, fx, i));
+                if (sel rq.err) {
+                    A.deallocate[u8](e.alloc, flat, n::usize);
+                    ret rq;
+                }
+            }
+            if (gi.iface == me_ir.IFACE_INPUT || gi.iface == me_ir.IFACE_OUTPUT) {
+                msg = location_overlap(e, fx, i);
+                if (sel msg.err || (sel msg.ok && msg.ok != nil)) {
+                    at = gi.decl_loc;
+                    i  = n;
+                    cnt;
+                }
+            }
+            if (gi.iface == me_ir.IFACE_UNIFORM || gi.iface == me_ir.IFACE_STORAGE
+                || gi.iface == me_ir.IFACE_SAMPLER) {
+                msg = descriptor_overlap(e, fx, i);
+                if (sel msg.err || (sel msg.ok && msg.ok != nil)) {
+                    at = gi.decl_loc;
+                    i  = n;
+                    cnt;
+                }
+            }
+            if (gi.iface == me_ir.IFACE_PUSH) {
+                msg = push_overlap(e, fx, i);
+                if (sel msg.err || (sel msg.ok && msg.ok != nil)) {
+                    at = gi.decl_loc;
+                    i  = n;
+                    cnt;
+                }
+            }
+            i = i + 1;
+        }
+        fx = fx + 1;
+    }
+
+    if (sel msg.ok && msg.ok == nil) {
+        i = 0;
+        for (i < n) {
+            if ((flat[i] & 1) != 0) { emit_value.decorate_bare(e, e.gvar_ids[i], isa_spirv.DECOR_FLAT); }
+            i = i + 1;
+        }
+    }
+    A.deallocate[u8](e.alloc, flat, n::usize);
+    if (sel msg.err)   { ret err[fail.Fail].err{msg.err}; }
+    if (msg.ok != nil) { ret err[fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_INTERFACE, at, msg.ok)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun shared_stage_refusal(e: *emitter.Emit, fx: u32, gi: u32) res[str, fail.Fail] {
+    val g:     *me_ir.Global       = emit_global.gl_ir(e, gi);
+    val shown: res[str, fail.Fail] = emit_builtin.ir_type_spelling(emit_global.gl_types(e, gi), e.alloc, g.ty);
+    if (sel shown.err) { ret shown; }
+    val where: res[str, fail.Fail] = emit_global.gl_mod_prefix(e, gi);
+    if (sel where.err) { ret where; }
+    val user: res[str, fail.Fail] = emitter.ir_fn_spelling(e, fx);
+    if (sel user.err) { ret user; }
+    ret fail.format(e.alloc,
+        "this `#[shared]` variable, {}{}, is used by the stage `{}`, which is not a compute stage: workgroup memory exists only in a compute stage, where one workgroup's invocations share it. a vertex or fragment stage has no workgroup to share it with",
+        shown.ok, where.ok, user.ok);
+}
+
+fun flat_conflict(e: *emitter.Emit, gi: u32) res[str, fail.Fail] {
+    val g:     *me_ir.Global       = emit_global.gl_ir(e, gi);
+    val shown: res[str, fail.Fail] = emit_builtin.ir_type_spelling(emit_global.gl_types(e, gi), e.alloc, g.ty);
+    if (sel shown.err) { ret shown; }
+    val where: res[str, fail.Fail] = emit_global.gl_mod_prefix(e, gi);
+    if (sel where.err) { ret where; }
+    ret fail.format(e.alloc,
+        "this `#[input({})]` variable, {}{}, is read by a vertex stage and by a fragment stage, and no SPIR-V module serves both: a fragment stage's integer or 64-bit input MUST carry a Flat decoration because such a value cannot be interpolated, and a vertex stage's input must NOT carry one. declare two variables. the two are different things anyway - a vertex stage's input is a vertex attribute, and a fragment stage's is the interpolated output of the stage before it",
+        g.iface_a, shown.ok, where.ok);
+}
+
+# the refusal of an input or output overlapping one before it in the stage, nil when none does
+fun location_overlap(e: *emitter.Emit, fx: u32, gi: u32) res[str, fail.Fail] {
+    val g:    *me_ir.Global = emit_global.gl_ir(e, gi);
+    val lo:   u32           = g.iface_a;
+    val span: u32           = location_span(e, emit_global.gl_types(e, gi), g.ty);
+    var j:    u32           = 0;
+    for (j < gi) {
+        val o: *me_ir.Global = emit_global.gl_ir(e, j);
+        if (o.iface != g.iface) {
+            j = j + 1;
+            cnt;
+        }
+        if (e.gslot[j] == 0 || !uses_iface(e, fx, e.gslot[j] - 1)) {
+            j = j + 1;
+            cnt;
+        }
+        val olo:   u32 = o.iface_a;
+        val ospan: u32 = location_span(e, emit_global.gl_types(e, j), o.ty);
+        if (lo < olo + ospan && olo < lo + span) {
+            var what: str = "input";
+            if (g.iface == me_ir.IFACE_OUTPUT) { what = "output"; }
+            val user: res[str, fail.Fail] = emitter.ir_fn_spelling(e, fx);
+            if (sel user.err) { ret user; }
+            val other: res[str, fail.Fail] = emit_builtin.ir_type_spelling(emit_global.gl_types(e, j), e.alloc, o.ty);
+            if (sel other.err) { ret other; }
+            val other_where: res[str, fail.Fail] = emit_global.gl_mod_prefix(e, j);
+            if (sel other_where.err) { ret other_where; }
+            val shown: res[str, fail.Fail] = emit_builtin.ir_type_spelling(emit_global.gl_types(e, gi), e.alloc, g.ty);
+            if (sel shown.err) { ret shown; }
+            val where: res[str, fail.Fail] = emit_global.gl_mod_prefix(e, gi);
+            if (sel where.err) { ret where; }
+            ret fail.format(e.alloc,
+                "two `#[{}(...)]` variables overlap in the stage `{}`: `#[{}({})]`, {}{}, occupies {} location(s) and so runs through location {}, and `#[{}({})]`, {}{}, starts inside it. a type wider than one location consumes the ones that follow it, so the numbers an author writes have to leave room for the type",
+                what, user.ok, what, olo,
+                other.ok, other_where.ok,
+                ospan, olo + ospan - 1,
+                what, lo, shown.ok, where.ok);
+        }
+        j = j + 1;
+    }
+    ret res[str, fail.Fail].ok{nil};
+}
+
+# the refusal of a descriptor slot claimed twice in the stage, nil when none is
+fun descriptor_overlap(e: *emitter.Emit, fx: u32, gi: u32) res[str, fail.Fail] {
+    val g: *me_ir.Global = emit_global.gl_ir(e, gi);
+    var j: u32           = 0;
+    for (j < gi) {
+        val o: *me_ir.Global = emit_global.gl_ir(e, j);
+        if (o.iface != me_ir.IFACE_UNIFORM && o.iface != me_ir.IFACE_STORAGE
+            && o.iface != me_ir.IFACE_SAMPLER) {
+            j = j + 1;
+            cnt;
+        }
+        if (e.gslot[j] == 0 || !uses_iface(e, fx, e.gslot[j] - 1)) {
+            j = j + 1;
+            cnt;
+        }
+        if (o.iface_a != g.iface_a || o.iface_b != g.iface_b) {
+            j = j + 1;
+            cnt;
+        }
+        val user: res[str, fail.Fail] = emitter.ir_fn_spelling(e, fx);
+        if (sel user.err) { ret user; }
+        val other: res[str, fail.Fail] = emit_builtin.ir_type_spelling(emit_global.gl_types(e, j), e.alloc, o.ty);
+        if (sel other.err) { ret other; }
+        val other_where: res[str, fail.Fail] = emit_global.gl_mod_prefix(e, j);
+        if (sel other_where.err) { ret other_where; }
+        val shown: res[str, fail.Fail] = emit_builtin.ir_type_spelling(emit_global.gl_types(e, gi), e.alloc, g.ty);
+        if (sel shown.err) { ret shown; }
+        val where: res[str, fail.Fail] = emit_global.gl_mod_prefix(e, gi);
+        if (sel where.err) { ret where; }
+        ret fail.format(e.alloc,
+            "two descriptor-bound variables claim the same `(set = {}, binding = {})` in the stage `{}`: `{}`, {}{}, and `{}`, {}{}. a host binds one resource to a descriptor slot, so a pipeline layout can satisfy only one of them and the other would read whatever the first was bound to. give them different bindings",
+            g.iface_a, g.iface_b, user.ok,
+            descriptor_role(o.iface), other.ok, other_where.ok,
+            descriptor_role(g.iface), shown.ok, where.ok);
+    }
+    ret res[str, fail.Fail].ok{nil};
+}
+
+# vulkan admits one push-constant block per entry point, so a second one a stage uses is refused naming both
+fun push_overlap(e: *emitter.Emit, fx: u32, gi: u32) res[str, fail.Fail] {
+    var j: u32 = 0;
+    for (j < gi) {
+        if (emit_global.gl_ir(e, j).iface != me_ir.IFACE_PUSH || e.gslot[j] == 0 || !uses_iface(e, fx, e.gslot[j] - 1)) {
+            j = j + 1;
+            cnt;
+        }
+        val user: res[str, fail.Fail] = emitter.ir_fn_spelling(e, fx);
+        if (sel user.err) { ret user; }
+        val other_where: res[str, fail.Fail] = emit_global.gl_mod_prefix(e, j);
+        if (sel other_where.err) { ret other_where; }
+        val where: res[str, fail.Fail] = emit_global.gl_mod_prefix(e, gi);
+        if (sel where.err) { ret where; }
+        ret fail.format(e.alloc,
+            "the stage `{}` uses two `#[push]` blocks, `{}`{} and `{}`{}: Vulkan admits at most one push-constant block per entry point, because a pipeline layout declares the push-constant range each stage sees as one block. merge them into one record, or keep each to a different stage",
+            user.ok, emit_global.gl_spelling(e, j), other_where.ok,
+            emit_global.gl_spelling(e, gi), where.ok);
+    }
+    ret res[str, fail.Fail].ok{nil};
+}
+
+fun descriptor_role(iface: u8) str {
+    if (iface == me_ir.IFACE_STORAGE) { ret "#[storage(...)]"; }
+    if (iface == me_ir.IFACE_SAMPLER) { ret "#[sampler(...)]"; }
+    ret "#[uniform(...)]";
+}
+
+fun location_span(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId) u32 {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(gt, id);
+    if (sel opt_.none) { ret 1; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind == ir_type.IRT_STRUCT) {
+        var total: u32 = 0;
+        var i:     u32 = 0;
+        for (i < t.data.struct_.field_count) {
+            total = total + location_span(e, gt, t.data.struct_.fields[i]);
+            i     = i + 1;
+        }
+        if (total == 0) { ret 1; }
+        ret total;
+    }
+    if (t.kind == ir_type.IRT_ARRAY) {
+        val es: u32 = location_span(e, gt, t.data.array_.element);
+        if (t.data.array_.count == 0) { ret 1; }
+        ret es * t.data.array_.count;
+    }
+    if (t.kind == ir_type.IRT_TAG) {
+        var total: u32 = 1;
+        var ci:    u32 = 0;
+        for (ci < t.data.tag_.case_count) {
+            if (ir_type.tag_case_has_payload(gt, id, ci)) { total = total + location_span(e, gt, t.data.tag_.cases[ci]); }
+            ci = ci + 1;
+        }
+        ret total;
+    }
+    val bytes: u32 = ir_type.byte_size_for_machine(gt, id, e.layout);
+    if (bytes <= 16) { ret 1; }
+    ret (bytes + 15) / 16;
+}
+
+fun needs_flat(tt: *ir_type.IrTypeTable, id: ir_type.IrTypeId) bool {
+    var lanes:    u32  = 0;
+    var bits:     u32  = 0;
+    var is_float: bool = false;
+    if (!emit_builtin.ir_scalar_shape(tt, id, ?lanes, ?bits, ?is_float)) { ret false; }
+    if (!is_float)                                          { ret true; }
+    ret bits == 64;
+}
+
+# the memory qualifiers a descriptor binding declares, whatever the binding holds. the
+# Vulkan memory model has no Coherent decoration: each access through a coherent
+# variable makes its own write available or its read visible instead
+fun decorate_memory_quals(e: *emitter.Emit, var_id: u32, flags: u32) {
+    if ((flags & me_ir.IFACE_FLAG_WRITEONLY) != 0)                { emit_value.decorate_bare(e, var_id, isa_spirv.DECOR_NON_READABLE); }
+    if ((flags & me_ir.IFACE_FLAG_COHERENT) != 0 && !e.vulkan_mm) { emit_value.decorate_bare(e, var_id, isa_spirv.DECOR_COHERENT); }
+}
+
+# the scope a variable's accesses are made available and visible at under the Vulkan
+# memory model, 0 when they are private. workgroup memory is coherent among the
+# workgroup's invocations, as it is under GLSL450, and a coherent binding among the
+# invocations of the queue family, the scope glslang gives `coherent`, which needs no
+# device-scope feature
+fun variable_scope(storage: u32, flags: u32) u32 {
+    if (storage == isa_spirv.STORAGE_WORKGROUP)   { ret isa_spirv.SCOPE_WORKGROUP; }
+    if ((flags & me_ir.IFACE_FLAG_COHERENT) != 0) { ret isa_spirv.SCOPE_QUEUE_FAMILY; }
+    ret 0;
+}
+
+# a `#[shared]` variable carries an OpConstantNull initializer where the selection
+# holds zero_init_workgroup, and each compute stage reaching one zeroes it otherwise
+pub fun shared_native_zero(e: *emitter.Emit) bool {
+    ret (e.tgt.model.extensions & extension_spirv.ZERO_INIT_WORKGROUP) != 0;
+}
+
+test needs_flat__integer_and_double_elements {
+    var alloc:  A.Allocator;
+    val r_3560: err[A.Error] = page.make(?alloc);
+    if (sel r_3560.err) { ret 1; }
+    var tt:     ir_type.IrTypeTable;
+    val r_3562: err[fail.Fail] = ir_type.init(?tt, ?alloc);
+    if (sel r_3562.err) { ret 1; }
+    fin { ir_type.dnit(?tt); }
+
+    val f32t_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_float(?tt, 32);
+    if (sel f32t_r.err) { ret 1; }
+    val f32t:   ir_type.IrTypeId                 = f32t_r.ok;
+    val f64t_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_float(?tt, 64);
+    if (sel f64t_r.err) { ret 1; }
+    val f64t:   ir_type.IrTypeId                 = f64t_r.ok;
+    val i32t_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?tt, 32);
+    if (sel i32t_r.err) { ret 1; }
+    val i32t:  ir_type.IrTypeId                 = i32t_r.ok;
+    val i8t_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?tt, 8);
+    if (sel i8t_r.err) { ret 1; }
+    val i8t:   ir_type.IrTypeId                 = i8t_r.ok;
+    val v4f_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?tt, f32t, 4);
+    if (sel v4f_r.err) { ret 1; }
+    val v4f:   ir_type.IrTypeId                 = v4f_r.ok;
+    val v3i_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?tt, i32t, 3);
+    if (sel v3i_r.err) { ret 1; }
+    val v3i:   ir_type.IrTypeId                 = v3i_r.ok;
+    val v2d_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?tt, f64t, 2);
+    if (sel v2d_r.err) { ret 1; }
+    val v2d:   ir_type.IrTypeId                 = v2d_r.ok;
+    val arr_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?tt, f32t, 4);
+    if (sel arr_r.err) { ret 1; }
+    val arr: ir_type.IrTypeId = arr_r.ok;
+
+    if (!needs_flat(?tt, i32t)) { ret 1; }
+    if (!needs_flat(?tt, i8t))  { ret 1; }
+    if (!needs_flat(?tt, v3i))  { ret 1; }
+
+    if (!needs_flat(?tt, f64t)) { ret 1; }
+    if (!needs_flat(?tt, v2d))  { ret 1; }
+
+    if (needs_flat(?tt, f32t)) { ret 1; }
+    if (needs_flat(?tt, v4f))  { ret 1; }
+
+    # an f16 is interpolated as the float its binary16 carrier stands for
+    val h_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int_form(?tt, 16, ir_type.INT_FORM_BINARY16);
+    if (sel h_r.err) { ret 1; }
+    val v4h_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?tt, h_r.ok, 4);
+    if (sel v4h_r.err)             { ret 1; }
+    if (needs_flat(?tt, h_r.ok))   { ret 1; }
+    if (needs_flat(?tt, v4h_r.ok)) { ret 1; }
+
+    if (needs_flat(?tt, arr)) { ret 1; }
+
+    ret 0;
+}
