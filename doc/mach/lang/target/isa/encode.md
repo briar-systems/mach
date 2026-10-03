@@ -86,6 +86,15 @@ every seed the walk needs at one notification. a note without a MirInstr
 (prologue, epilogue, relaxation) carries no seed. operands past
 NOTE_SEED_MAX are not described; no MIR instruction has that many.
 
+## rec TextStream
+
+```mach
+pub rec TextStream;
+```
+
+one output text section's bytes. stream 0 is the module's default text and
+stream n its text section n, so a record's stream is its section
+
 ## rec EncoderOutput
 
 ```mach
@@ -102,6 +111,12 @@ pub rec PendingReloc;
 
 ```mach
 pub rec SymbolMark;
+```
+
+## val MARK_NO_FUNCTION
+
+```mach
+pub val MARK_NO_FUNCTION: u32 = 0xFFFFFFFF
 ```
 
 ## val CONST_F32
@@ -244,11 +259,23 @@ pub fun sink_claim(buf: *ByteBuf, start: usize);
 pub fun render_bytes_text(out: *io_writer.Writer, bytes: *u8, n: usize) err[fail.Fail];
 ```
 
+## fun note_bytes
+
+```mach
+pub fun note_bytes(st: *EncodeState, bytes: *u8, n: usize, start: usize) err[fail.Fail];
+```
+
+a raw-byte directive's note, holding the directive's first bytes for an
+encoder that renders its listing from the notes once the function is final
+
 ## fun render_bytes_directive
 
 ```mach
-pub fun render_bytes_directive(buf: *ByteBuf, bytes: *u8, n: usize, start: usize) err[fail.Fail];
+pub fun render_bytes_directive(st: *EncodeState, bytes: *u8, n: usize, start: usize) err[fail.Fail];
 ```
+
+a raw-byte directive's note, rendered at once for an encoder whose listing
+streams as it encodes
 
 ## fun sink_claims
 
@@ -314,6 +341,22 @@ pub fun emit_u32(buf: *ByteBuf, value: u32);
 pub fun emit_u64(buf: *ByteBuf, value: u64);
 ```
 
+## fun word_read
+
+```mach
+pub fun word_read(buf: *ByteBuf, pos: usize) u32;
+```
+
+the little-endian 32-bit word already emitted at pos
+
+## fun word_write
+
+```mach
+pub fun word_write(buf: *ByteBuf, pos: usize, word: u32);
+```
+
+overwrites the 32-bit word at pos, little-endian
+
 ## rec BranchFixup
 
 ```mach
@@ -352,6 +395,51 @@ pub rec EncodeHooks;
 ```mach
 pub fun hooks_blank() EncodeHooks;
 ```
+
+## fun slot_base_reg
+
+```mach
+pub fun slot_base_reg(f: *lang_mir.MirFunction, sp: i32, fp: i32) i32;
+```
+
+the register a frame slot is addressed from, as the encoder numbers its
+stack pointer and frame pointer
+
+## val REGION_PROLOGUE
+
+```mach
+pub val REGION_PROLOGUE: u32 = 0xFFFFFFFF
+```
+
+the byte ranges an encoder emits outside any one instruction, as sink_check
+names them
+
+## val REGION_RELAX
+
+```mach
+pub val REGION_RELAX:    u32 = 0xFFFFFFFE
+```
+
+## fun sink_check
+
+```mach
+pub fun sink_check(st: *EncodeState, isa: str, region: u32) err[fail.Fail];
+```
+
+every byte emitted so far reached the listing through a notification. region
+is the opcode whose encoding is checked, or a REGION_ value
+
+## fun instr_encode
+
+```mach
+pub fun instr_encode(st: *EncodeState, f: *lang_mir.MirFunction, fn_base: u32, mi: *lang_mir.MirInstr,
+hooks: *EncodeHooks) err[fail.Fail];
+```
+
+one MIR instruction through the encoder: its variable bindings, the
+instructions no encoder emits bytes for, the refusal of a phi that survived
+allocation, then the encoder's own hook, the declassify barrier and the
+listing's accounting of what it emitted
 
 ## fun entry_align
 
@@ -537,6 +625,48 @@ pub fun consts_free(alloc: *A.Allocator, c: *ConstEntry, count: u32, cap: u32);
 pub fun scratch_release(st: *EncodeState);
 ```
 
+## fun streams_open
+
+```mach
+pub fun streams_open(st: *EncodeState, names: *intern.StrId, count: u32) err[fail.Fail];
+```
+
+one stream per output text section: the module's default text, then each of
+`names` in order. the default text holds the buffer first
+
+## fun stream_select
+
+```mach
+pub fun stream_select(st: *EncodeState, index: u32) err[fail.Fail];
+```
+
+hands the buffer to stream `index`, parking the one that held it
+
+## fun stream_align
+
+```mach
+pub fun stream_align(st: *EncodeState, align: u32);
+```
+
+the current stream's alignment covers an entry aligned to `align`
+
+## fun streams_unaccounted
+
+```mach
+pub fun streams_unaccounted(st: *EncodeState) usize;
+```
+
+the bytes no instruction notification claimed, across every stream
+
+## fun streams_close
+
+```mach
+pub fun streams_close(st: *EncodeState) res[*TextStream, fail.Fail];
+```
+
+the streams as the encoder hands them off, each holding exactly its bytes;
+the buffer and the parked streams are left empty
+
 ## fun tables_fit
 
 ```mach
@@ -550,6 +680,9 @@ give each table the encoder hands off exactly its count
 ```mach
 pub fun patch_branches(st: *EncodeState, hooks: *EncodeHooks) err[fail.Fail];
 ```
+
+patches the branches of the function just encoded, whose blocks all lie in
+the current stream, then forgets its blocks for the next function
 
 ## fun block_offset
 

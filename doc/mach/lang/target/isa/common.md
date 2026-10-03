@@ -16,6 +16,12 @@ pub fun is_mir_compare(op: lang_mir.MirOpcode) bool;
 pub fun is_mir_divide(op: lang_mir.MirOpcode) bool;
 ```
 
+## fun is_mir_float_arith
+
+```mach
+pub fun is_mir_float_arith(op: lang_mir.MirOpcode) bool;
+```
+
 ## fun is_mir_float_conv
 
 ```mach

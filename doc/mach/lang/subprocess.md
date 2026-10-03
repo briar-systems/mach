@@ -66,8 +66,7 @@ pub def Request: u8
 ```
 
 the termination a supervisor asked for, mirrored from the cancellation
-scope's reason: the oracle in mach.lang.validation records this kind, so
-the codes are the scope's 1.x reason codes and never change
+scope's reason, so the codes are the scope's 1.x reason codes and never change
 
 ## val REQUEST_ACTIVE
 

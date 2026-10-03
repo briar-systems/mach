@@ -615,20 +615,15 @@ the section lives and dies with the one `native.link_section` names: a coff
 associative comdat member, or an elf section ordered after its owner
 (SHF_LINK_ORDER). a final link keeps it exactly while it keeps that owner
 
-## fun section_format_retained
+## val SEC_FLAG_GROUP
 
 ```mach
-pub fun section_format_retained(sec: *Section) bool;
+pub val SEC_FLAG_GROUP: u32 = 0x80
 ```
 
-whether the format's own linkers keep a foreign section whatever references
-it: coff collects only comdat sections, so any other section is kept
-
-## val NATIVE_GROUP
-
-```mach
-pub val NATIVE_GROUP:       u32 = 17
-```
+the section lists sections of its object that a link keeps or drops
+together: a flags word, then one word per member holding the member's index
+plus one, NATIVE_GROUP_RELOC set on a member that is a section's relocations
 
 ## val NATIVE_GROUP_RELOC
 
@@ -734,8 +729,19 @@ pub val FRAME_STEP_LAST: u8 = FRAME_STEP_REALIGN
 pub val FRAME_STEP_CAP: u32 = 32
 ```
 
-the most steps a frame record holds: enough for every callee-saved register
-a riscv prologue stores one at a time, the longest prologue any isa has
+the most steps a frame record holds. a prologue records one step per
+callee-saved register it saves and at most FRAME_FIXED_STEPS more (the two
+allocations around a realignment, the frame pointer and return address
+saves, setting the frame pointer and the realignment itself), so the cap
+holds every convention whose callee-saved file fits beside them, which
+registration checks. the record stays fixed-size because the linker and
+every object writer copy frame records by value
+
+## val FRAME_FIXED_STEPS
+
+```mach
+pub val FRAME_FIXED_STEPS: u32 = 6
+```
 
 ## rec FrameStep
 
@@ -1314,6 +1320,152 @@ pub rec ExecutableSectionLocation;
 pub rec HeaderShape;
 ```
 
+## def ObjectMatchesFn
+
+```mach
+pub def ObjectMatchesFn: fun(*u8, usize, u32) bool
+```
+
+whether `bytes` are a relocatable object of the format for the instruction set
+
+## def PathNamesFn
+
+```mach
+pub def PathNamesFn: fun(*u8) bool
+```
+
+whether a path names a file of the kind
+
+## def SharedCandidateFn
+
+```mach
+pub def SharedCandidateFn: fun(*u8, *u8, u32, *u8, usize) bool
+```
+
+writes the file a bare library name is searched as in a directory, `index`
+from 0 in search order, into the buffer; false past the last
+
+## def SharedIdentityFn
+
+```mach
+pub def SharedIdentityFn: fun(*u8, usize, u32, *u8, *u8, usize) bool
+```
+
+whether `bytes` read from `path` are a loadable library for the instruction
+set, its loader name written to the buffer when they are
+
+## def AbsentShared
+
+```mach
+pub def AbsentShared: u8
+```
+
+how a path to a shared library that does not exist is linked
+
+## val ABSENT_REFUSED
+
+```mach
+pub val ABSENT_REFUSED: AbsentShared = 0
+```
+
+refused as a link input that cannot be found
+
+## val ABSENT_BY_NAME
+
+```mach
+pub val ABSENT_BY_NAME: AbsentShared = 1
+```
+
+linked by its file name, which the loader searches for
+
+## val ABSENT_BY_PATH
+
+```mach
+pub val ABSENT_BY_PATH: AbsentShared = 2
+```
+
+linked by the path as written, which the loader opens
+
+## rec SharedNaming
+
+```mach
+pub rec SharedNaming;
+```
+
+how a format's shared libraries are named, found and identified
+
+## rec InputNaming
+
+```mach
+pub rec InputNaming;
+```
+
+how a link token names one of the format's inputs and how the bytes of one
+are recognized. an archive is a static input of every format that names one
+
+library_prefix: the prefix a library file carries, tried before the bare name
+static_suffixes: the suffixes, without their dot, a bare name is searched
+                 with for a static input, in search order
+folds_case: file names compare without case
+object_matches: nil when the format reads no relocatable object
+shared: nil when the format takes no shared library
+
+## rec SelectorStubReloc
+
+```mach
+pub rec SelectorStubReloc;
+```
+
+a relocation one selector stub carries, at `offset` from the stub's start;
+against the stub's selector reference or the send function
+
+## rec SelectorStubShape
+
+```mach
+pub rec SelectorStubShape;
+```
+
+the objective-c selector stubs a format's linker makes for one instruction
+set: a call of `<send_symbol>$<selector>` reaches a stub that loads the
+selector's reference and jumps to the send function
+
+code: the `size` bytes every stub starts from, its relocated fields zero
+relocs: the relocations of one stub
+
+## def SelectorStubsFn
+
+```mach
+pub def SelectorStubsFn: fun(u32) *SelectorStubShape
+```
+
+the selector stubs of the instruction set, nil when the format makes none for it
+
+## fun path_write
+
+```mach
+pub fun path_write(buf: *u8, cap: usize, dir: *u8, parts: *str, count: u32) bool;
+```
+
+writes `dir` and the concatenated `parts` as one path into `buf`, a separator
+between them when `dir` is not empty and does not end in one; false when it
+does not fit
+
+## fun path_has_suffix
+
+```mach
+pub fun path_has_suffix(path: *u8, suffix: str, folds_case: bool) bool;
+```
+
+whether `path` ends in `suffix`, compared without case when `folds_case`
+
+## fun digit_text
+
+```mach
+pub fun digit_text(v: u32) str;
+```
+
+the decimal digit `v` as text, empty past 9
+
 ## rec OfVTable
 
 ```mach
@@ -1538,5 +1690,52 @@ import's call stub, as a call does
 
 ```mach
 pub fun reloc_symbol_name(img: *ObjectImage, r: *Relocation) intern.StrId;
+```
+
+## rec DeferredReloc
+
+```mach
+pub rec DeferredReloc;
+```
+
+## rec DeferredRelocs
+
+```mach
+pub rec DeferredRelocs;
+```
+
+## fun deferred_init
+
+```mach
+pub fun deferred_init(a: *A.Allocator) DeferredRelocs;
+```
+
+## fun deferred_dnit
+
+```mach
+pub fun deferred_dnit(d: *DeferredRelocs);
+```
+
+## fun defer_relocation
+
+```mach
+pub fun defer_relocation(d: *DeferredRelocs, rec: DeferredReloc, caps: *RelocationCapabilities,
+section_kind: SectionKind, codegen_image: bool) err[fail.Fail];
+```
+
+queues a relocation the target's seam can encode in a section of
+`section_kind`, to bind once the image's symbols are known
+
+## fun flush_deferred
+
+```mach
+pub fun flush_deferred(o: *ObjectImage, d: *DeferredRelocs) err[fail.Fail];
+```
+
+## fun rehome
+
+```mach
+pub fun rehome(dst_alloc: *A.Allocator, dst_interner: *intern.Interner,
+src: *ObjectImage, remap: intern.Remap) res[ObjectImage, fail.Fail];
 ```
 
