@@ -15,8 +15,10 @@ pub rec Workspace;
 ## fun init
 
 ```mach
-pub fun init(work: *Workspace) err[fail.Fail];
+pub fun init(work: *Workspace, backing: *A.Allocator) err[fail.Fail];
 ```
+
+a workspace whose region grows from the caller's freeing `backing`
 
 ## fun dnit
 
