@@ -875,7 +875,7 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   declaring file's directory; the required artifact is built first. The name is
   read in the manifest that owns the declaring module: the root's own module
   names an artifact the built artifact requires, and a dependency's module names
-  an artifact that dependency's `default = true` library artifact requires,
+  an artifact that dependency's `export = true` library artifact requires,
   which the consumer's build produces for it. No other template variable may
   appear in an `embed` path. See
   [manifest.md](manifest.md#artifact-requirements).
