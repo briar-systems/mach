@@ -81,19 +81,147 @@ fun c_vector_size(size: u64) bool {
     ret size != 0 && (size & (size - 1)) == 0;
 }
 
+# the eightbyte classes of a small aggregate, the mask a classifier reads:
+# bit 0 and bit 1 mark eightbyte 0 and 1 as SSE, bit 2 and bit 3 mark them as
+# holding no leaf at all (padding only), and an unmarked eightbyte inside the
+# object is INTEGER; bit 4 marks an aggregate holding a field at an offset that
+# is not a multiple of the field's own alignment (a packed record), which is
+# MEMORY regardless of what its eightbytes hold
+pub val EB_SSE_LO:    u8 = 1;
+pub val EB_SSE_HI:    u8 = 2;
+pub val EB_EMPTY_LO:  u8 = 4;
+pub val EB_EMPTY_HI:  u8 = 8;
+pub val EB_UNALIGNED: u8 = 16;
+
+val EB_NO_CLASS: u8 = 0;
+val EB_SSE:      u8 = 1;
+val EB_INTEGER:  u8 = 2;
+
+fun mark_eightbyte_range(classes: *u8, off: u64, size: u64, cls: u8) {
+    if (size == 0) { ret; }
+    var i:    u64 = off / 8;
+    val last: u64 = (off + size - 1) / 8;
+    for (i <= last) {
+        if (i < 2 && cls > classes[i]) { classes[i] = cls; }
+        i = i + 1;
+    }
+}
+
+# merges the class of every scalar the aggregate holds into the eightbytes it covers. members are never
+# collected into a bounded list first: a tag's unit cases are zero-width members and its payloads overlap, so
+# the member count of a 16-byte aggregate has no bound, and a member dropped past any cap is a dropped class
+fun mark_eightbytes(vt: *abi.AbiVTable, view: *abi.TypeView, ty: u32, base_off: u64, classes: *u8) {
+    val f: abi.TypeFacts = abi.type_facts(view, ty);
+    if (f.shape == abi.SHAPE_NONE) { ret; }
+    if (f.shape == abi.SHAPE_RECORD || f.shape == abi.SHAPE_UNION) {
+        var i: u32 = 0;
+        for (i < f.count) {
+            val m: abi.TypeMember = abi.type_member(view, ty, i);
+            mark_eightbytes(vt, view, m.ty, base_off + m.offset, classes);
+            i = i + 1;
+        }
+        ret;
+    }
+    if (f.shape == abi.SHAPE_ARRAY) {
+        val elem: abi.TypeMember = abi.type_member(view, ty, 0);
+        if (abi.type_facts(view, elem.ty).size == 0) { ret; }
+        var i: u32 = 0;
+        for (i < f.count) {
+            mark_eightbytes(vt, view, elem.ty, base_off + abi.type_member(view, ty, i).offset, classes);
+            i = i + 1;
+        }
+        ret;
+    }
+    if (f.shape == abi.SHAPE_TAG) {
+        mark_eightbyte_range(classes, base_off, f.disc_bytes, EB_INTEGER);
+        var i: u32 = 0;
+        for (i < f.count) {
+            val m: abi.TypeMember = abi.type_member(view, ty, i);
+            mark_eightbytes(vt, view, m.ty, base_off + m.offset, classes);
+            i = i + 1;
+        }
+        ret;
+    }
+    var cls: u8 = EB_INTEGER;
+    if (abi.shape_is_float(vt, f.shape)) { cls = EB_SSE; }
+    mark_eightbyte_range(classes, base_off, f.size, cls);
+}
+
+# the unaligned-field rule: a member whose offset is not a multiple of its own type's alignment makes the
+# whole aggregate MEMORY class. every record member is checked against its type's alignment at every nesting
+# level and every array element is visited at its own offset, so a packed element whose fields sit aligned in
+# element 0 and unaligned in element 1 is caught, exactly as clang walks it
+fun has_unaligned_field(view: *abi.TypeView, ty: u32, base_off: u64) bool {
+    val f: abi.TypeFacts = abi.type_facts(view, ty);
+    if (f.shape == abi.SHAPE_RECORD || f.shape == abi.SHAPE_UNION) {
+        var i: u32 = 0;
+        for (i < f.count) {
+            val m:   abi.TypeMember = abi.type_member(view, ty, i);
+            val fal: u64            = abi.type_facts(view, m.ty).align;
+            if (fal != 0 && (base_off + m.offset) % fal != 0)         { ret true; }
+            if (has_unaligned_field(view, m.ty, base_off + m.offset)) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+    if (f.shape == abi.SHAPE_ARRAY) {
+        var i: u32 = 0;
+        for (i < f.count) {
+            val m: abi.TypeMember = abi.type_member(view, ty, i);
+            if (has_unaligned_field(view, m.ty, base_off + m.offset)) { ret true; }
+            i = i + 1;
+        }
+    }
+    if (f.shape == abi.SHAPE_TAG) {
+        # a tag is the record of its layout: the discriminator at offset 0 against its own width, then every
+        # case payload at the common payload offset against that case's alignment
+        if (f.disc_bytes != 0 && base_off % f.disc_bytes != 0) { ret true; }
+        var i: u32 = 0;
+        for (i < f.count) {
+            val m:   abi.TypeMember = abi.type_member(view, ty, i);
+            val po:  u64            = base_off + m.offset;
+            val cal: u64            = abi.type_facts(view, m.ty).align;
+            if (cal != 0 && po % cal != 0)           { ret true; }
+            if (has_unaligned_field(view, m.ty, po)) { ret true; }
+            i = i + 1;
+        }
+    }
+    ret false;
+}
+
+# the eightbyte mask of `ty`, 0 for a type that is no aggregate of one or two eightbytes
+pub fun eightbyte_mask(vt: *abi.AbiVTable, view: *abi.TypeView, ty: u32) u8 {
+    val f: abi.TypeFacts = abi.type_facts(view, ty);
+    if (f.shape != abi.SHAPE_RECORD && f.shape != abi.SHAPE_ARRAY && f.shape != abi.SHAPE_UNION && f.shape != abi.SHAPE_TAG) { ret 0; }
+    if (f.size == 0 || f.size > 16)                                                                                          { ret 0; }
+    if (has_unaligned_field(view, ty, 0))                                                                                    { ret EB_UNALIGNED; }
+    var classes: [2]u8;
+    classes[0] = EB_NO_CLASS;
+    classes[1] = EB_NO_CLASS;
+    mark_eightbytes(vt, view, ty, 0, ?classes[0]);
+    var mask: u8 = 0;
+    if (classes[0] == EB_SSE)                    { mask = mask | EB_SSE_LO; }
+    if (classes[1] == EB_SSE)                    { mask = mask | EB_SSE_HI; }
+    if (classes[0] == EB_NO_CLASS)               { mask = mask | EB_EMPTY_LO; }
+    if (f.size > 8 && classes[1] == EB_NO_CLASS) { mask = mask | EB_EMPTY_HI; }
+    ret mask;
+}
+
 fun classify_arg(vt: *abi.AbiVTable, q: *abi.ArgQuery) abi.ParamSlot {
+    var eightbytes: u8 = 0;
+    if (abi.arg_members_read(q)) { eightbytes = eightbyte_mask(vt, q.types, q.ty); }
     # an empty record has no eightbyte to classify, so it takes no register and
     # no stack, as GCC and clang pass one in C
     if (q.is_aggregate && q.size == 0) {
         ret abi.make_slot(abi.CLASS_GP, -1, 0, 0, 0);
     }
 
-    if (q.is_aggregate && memory_class(q.size, q.eightbytes)) {
+    if (q.is_aggregate && memory_class(q.size, eightbytes)) {
         ret abi.make_slot(abi.CLASS_STACK, -1, 0, q.size, 0);
     }
 
     if (q.is_aggregate) {
-        val eb0_sse: bool = (q.eightbytes & abi.EB_SSE_LO) != 0;
+        val eb0_sse: bool = (eightbytes & EB_SSE_LO) != 0;
         if (q.size <= 8) {
             if (eb0_sse) {
                 if (q.fp_used < FP_PARAM_COUNT) {
@@ -107,9 +235,9 @@ fun classify_arg(vt: *abi.AbiVTable, q: *abi.ArgQuery) abi.ParamSlot {
             ret abi.make_slot(abi.CLASS_STACK, -1, 0, q.size, 0);
         }
 
-        val eb1_sse:  bool = (q.eightbytes & abi.EB_SSE_HI) != 0;
-        val eb0_used: bool = (q.eightbytes & abi.EB_EMPTY_LO) == 0;
-        val eb1_used: bool = (q.eightbytes & abi.EB_EMPTY_HI) == 0;
+        val eb1_sse:  bool = (eightbytes & EB_SSE_HI) != 0;
+        val eb0_used: bool = (eightbytes & EB_EMPTY_LO) == 0;
+        val eb1_used: bool = (eightbytes & EB_EMPTY_HI) == 0;
         var gp_need:  i32  = 0;
         var fp_need:  i32  = 0;
         if (eb0_used) {
@@ -178,7 +306,7 @@ fun classify_arg(vt: *abi.AbiVTable, q: *abi.ArgQuery) abi.ParamSlot {
         ret s;
     }
 
-    if (q.is_float) {
+    if (abi.arg_is_float(vt, q)) {
         if (q.fp_used < FP_PARAM_COUNT) {
             ret abi.make_slot(abi.CLASS_FP, fp_param_reg(q.fp_used), 0, q.size, q.size::u8);
         }
@@ -203,24 +331,25 @@ fun classify_arg(vt: *abi.AbiVTable, q: *abi.ArgQuery) abi.ParamSlot {
 }
 
 fun classify_return(vt: *abi.AbiVTable, q: *abi.RetQuery) abi.ParamSlot {
+    val eightbytes: u8 = eightbyte_mask(vt, q.types, q.ty);
     if (q.size == 0) {
         ret abi.make_slot(abi.CLASS_GP, -1, 0, 0, 0);
     }
 
-    if (q.is_aggregate && memory_class(q.size, q.eightbytes)) {
+    if (q.is_aggregate && memory_class(q.size, eightbytes)) {
         ret abi.make_slot(abi.CLASS_SRET, REG_RAX, 0, 8, 8);
     }
 
     if (q.is_aggregate) {
-        val eb0_sse: bool = (q.eightbytes & abi.EB_SSE_LO) != 0;
+        val eb0_sse: bool = (eightbytes & EB_SSE_LO) != 0;
         if (q.size <= 8) {
             if (eb0_sse) { ret abi.make_slot(abi.CLASS_GP, REG_XMM0, 0, q.size, 8); }
             ret abi.make_slot(abi.CLASS_GP, REG_RAX, 0, q.size, 8);
         }
 
-        val eb1_sse:  bool = (q.eightbytes & abi.EB_SSE_HI) != 0;
-        val eb0_used: bool = (q.eightbytes & abi.EB_EMPTY_LO) == 0;
-        val eb1_used: bool = (q.eightbytes & abi.EB_EMPTY_HI) == 0;
+        val eb1_sse:  bool = (eightbytes & EB_SSE_HI) != 0;
+        val eb0_used: bool = (eightbytes & EB_EMPTY_LO) == 0;
+        val eb1_used: bool = (eightbytes & EB_EMPTY_HI) == 0;
         var ni:       i32  = 0;
         var ns:       i32  = 0;
         var r0:       i32  = -1;
@@ -256,7 +385,7 @@ fun classify_return(vt: *abi.AbiVTable, q: *abi.RetQuery) abi.ParamSlot {
         ret abi.make_slot(abi.CLASS_FP, REG_XMM0, 0, q.size, vector_register_width(q.size));
     }
 
-    if (q.is_float) {
+    if (abi.ret_is_float(vt, q)) {
         ret abi.make_slot(abi.CLASS_FP, REG_XMM0, 0, q.size, q.size::u8);
     }
 
@@ -271,7 +400,7 @@ fun classify_return(vt: *abi.AbiVTable, q: *abi.RetQuery) abi.ParamSlot {
 # 3.2.3 rule 1: an aggregate larger than two eightbytes, or one holding an unaligned field, is MEMORY class
 fun memory_class(size: u64, fp_eightbytes: u8) bool {
     if (size > MAX_REG_RET) { ret true; }
-    ret (fp_eightbytes & abi.EB_UNALIGNED) != 0;
+    ret (fp_eightbytes & EB_UNALIGNED) != 0;
 }
 
 # one piece per classified eightbyte; a padding-only eightbyte (register -1) is delivered by nobody
@@ -449,40 +578,40 @@ test classify_arg__large_aggregate_is_memory_class {
 }
 
 test classify_arg__padding_only_eightbyte {
-    val s: abi.ParamSlot = t_arg(abi.arg_query(0, 16, 16, false, abi.EB_EMPTY_HI, true, false, 0, 0, 0, 0, abi.agg_none(), 16));
+    val s: abi.ParamSlot = t_arg(abi.arg_query(0, 16, 16, false, EB_EMPTY_HI, true, false, 0, 0, 0, 0, abi.agg_none(), 16));
     if (s.class != abi.CLASS_GP || s.piece_count != 1)                                                         { ret 1; }
     if (lang_mir.preg_regid(s.pieces[0].reg) != REG_RDI || s.pieces[0].width != 8 || s.pieces[0].src_off != 0) { ret 2; }
     if (s.size != 16)                                                                                          { ret 3; }
     val next: abi.ParamSlot = t_arg(abi.arg_query(1, 8, 8, false, 0, false, false, 1, 0, 0, 0, abi.agg_none(), 16));
     if (lang_mir.preg_regid(next.reg) != REG_RSI) { ret 4; }
-    val lo: abi.ParamSlot = t_arg(abi.arg_query(0, 16, 16, false, abi.EB_EMPTY_LO, true, false, 0, 0, 0, 0, abi.agg_none(), 16));
+    val lo: abi.ParamSlot = t_arg(abi.arg_query(0, 16, 16, false, EB_EMPTY_LO, true, false, 0, 0, 0, 0, abi.agg_none(), 16));
     if (lo.class != abi.CLASS_GP || lo.piece_count != 1)                                                          { ret 5; }
     if (lang_mir.preg_regid(lo.pieces[0].reg) != REG_RDI || lo.pieces[0].src_off != 8 || lo.pieces[0].width != 8) { ret 6; }
-    val sse_hi: abi.ParamSlot = t_arg(abi.arg_query(0, 16, 16, false, abi.EB_EMPTY_LO | abi.EB_SSE_HI, true, false, 0, 0, 0, 0, abi.agg_none(), 16));
+    val sse_hi: abi.ParamSlot = t_arg(abi.arg_query(0, 16, 16, false, EB_EMPTY_LO | EB_SSE_HI, true, false, 0, 0, 0, 0, abi.agg_none(), 16));
     if (sse_hi.piece_count != 1 || sse_hi.pieces[0].kind != abi.PIECE_FP || lang_mir.preg_regid(sse_hi.pieces[0].reg) != fp_param_reg(0)) { ret 7; }
-    val spilled: abi.ParamSlot = t_arg(abi.arg_query(0, 16, 16, false, abi.EB_EMPTY_HI, true, false, 6, 0, 0, 0, abi.agg_none(), 16));
+    val spilled: abi.ParamSlot = t_arg(abi.arg_query(0, 16, 16, false, EB_EMPTY_HI, true, false, 6, 0, 0, 0, abi.agg_none(), 16));
     if (spilled.class != abi.CLASS_STACK) { ret 8; }
-    val fits: abi.ParamSlot = t_arg(abi.arg_query(0, 16, 16, false, abi.EB_EMPTY_HI, true, false, 5, 0, 0, 0, abi.agg_none(), 16));
+    val fits: abi.ParamSlot = t_arg(abi.arg_query(0, 16, 16, false, EB_EMPTY_HI, true, false, 5, 0, 0, 0, abi.agg_none(), 16));
     if (fits.class != abi.CLASS_GP || lang_mir.preg_regid(fits.pieces[0].reg) != REG_R9) { ret 9; }
     ret 0;
 }
 
 test classify_return__padding_only_eightbyte {
-    val s: abi.ParamSlot = t_ret(abi.ret_query(16, 16, false, abi.EB_EMPTY_HI, true, false, 0, 0, abi.agg_none(), 16));
+    val s: abi.ParamSlot = t_ret(abi.ret_query(16, 16, false, EB_EMPTY_HI, true, false, 0, 0, abi.agg_none(), 16));
     if (s.class != abi.CLASS_GP || s.piece_count != 1 || lang_mir.preg_regid(s.pieces[0].reg) != REG_RAX || s.size != 16) { ret 1; }
     val full: abi.ParamSlot = t_ret(abi.ret_query(16, 8, false, 0, true, false, 0, 0, abi.agg_none(), 16));
     if (full.piece_count != 2 || lang_mir.preg_regid(full.pieces[1].reg) != REG_RDX) { ret 2; }
-    val hi: abi.ParamSlot = t_ret(abi.ret_query(16, 16, false, abi.EB_EMPTY_LO, true, false, 0, 0, abi.agg_none(), 16));
+    val hi: abi.ParamSlot = t_ret(abi.ret_query(16, 16, false, EB_EMPTY_LO, true, false, 0, 0, abi.agg_none(), 16));
     if (hi.piece_count != 1 || lang_mir.preg_regid(hi.pieces[0].reg) != REG_RAX || hi.pieces[0].src_off != 8) { ret 3; }
     ret 0;
 }
 
 test classify_arg__unaligned_field {
-    val s: abi.ParamSlot = t_arg(abi.arg_query(0, 5, 1, false, abi.EB_UNALIGNED, true, false, 0, 0, 0, 0, abi.agg_none(), 16));
+    val s: abi.ParamSlot = t_arg(abi.arg_query(0, 5, 1, false, EB_UNALIGNED, true, false, 0, 0, 0, 0, abi.agg_none(), 16));
     if (s.class != abi.CLASS_STACK || !lang_mir.preg_is_nil(s.reg) || s.size != 5) { ret 1; }
-    val two: abi.ParamSlot = t_arg(abi.arg_query(0, 9, 1, false, abi.EB_UNALIGNED, true, false, 0, 0, 0, 0, abi.agg_none(), 16));
+    val two: abi.ParamSlot = t_arg(abi.arg_query(0, 9, 1, false, EB_UNALIGNED, true, false, 0, 0, 0, 0, abi.agg_none(), 16));
     if (two.class != abi.CLASS_STACK || two.size != 9) { ret 2; }
-    val sse: abi.ParamSlot = t_arg(abi.arg_query(0, 16, 1, false, abi.EB_UNALIGNED | abi.EB_SSE_LO | abi.EB_SSE_HI, true, false, 0, 0, 0, 0, abi.agg_none(), 16));
+    val sse: abi.ParamSlot = t_arg(abi.arg_query(0, 16, 1, false, EB_UNALIGNED | EB_SSE_LO | EB_SSE_HI, true, false, 0, 0, 0, 0, abi.agg_none(), 16));
     if (sse.class != abi.CLASS_STACK) { ret 3; }
     val aligned: abi.ParamSlot = t_arg(abi.arg_query(0, 12, 1, false, 0, true, false, 0, 0, 0, 0, abi.agg_none(), 16));
     if (aligned.class != abi.CLASS_GP || aligned.piece_count != 2)                                                      { ret 4; }
@@ -493,9 +622,9 @@ test classify_arg__unaligned_field {
 }
 
 test classify_return__unaligned_field {
-    val s: abi.ParamSlot = t_ret(abi.ret_query(5, 1, false, abi.EB_UNALIGNED, true, false, 0, 0, abi.agg_none(), 16));
+    val s: abi.ParamSlot = t_ret(abi.ret_query(5, 1, false, EB_UNALIGNED, true, false, 0, 0, abi.agg_none(), 16));
     if (s.class != abi.CLASS_SRET || lang_mir.preg_regid(s.reg) != REG_RAX) { ret 1; }
-    val two: abi.ParamSlot = t_ret(abi.ret_query(9, 1, false, abi.EB_UNALIGNED, true, false, 0, 0, abi.agg_none(), 16));
+    val two: abi.ParamSlot = t_ret(abi.ret_query(9, 1, false, EB_UNALIGNED, true, false, 0, 0, abi.agg_none(), 16));
     if (two.class != abi.CLASS_SRET) { ret 2; }
     val aligned: abi.ParamSlot = t_ret(abi.ret_query(12, 1, false, 0, true, false, 0, 0, abi.agg_none(), 16));
     if (aligned.class != abi.CLASS_GP || aligned.piece_count != 2 || lang_mir.preg_regid(aligned.pieces[1].reg) != REG_RDX) { ret 3; }
