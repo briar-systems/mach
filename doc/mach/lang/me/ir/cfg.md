@@ -4,14 +4,6 @@ control-flow surgery every pass shares: cloning a region of blocks, listing
 clones into their blocks and pointing their operands at each other, and
 moving an edge from one block to another in a terminator or a phi
 
-## val NONE
-
-```mach
-pub val NONE: u32 = 0xFFFFFFFF
-```
-
-a map entry for a block or instruction that has no clone
-
 ## rec CloneMap
 
 ```mach
@@ -19,7 +11,7 @@ pub rec CloneMap;
 ```
 
 where each source block and instruction went: indexed by the source id, the
-clone's id or NONE
+clone's id or ir_id.NONE
 
 ## fun region_index
 

@@ -671,6 +671,39 @@ pub fun lt_s(b: *Builder, x: value.Value, y: value.Value) value.Value;
 pub fun lt_u(b: *Builder, x: value.Value, y: value.Value) value.Value;
 ```
 
+## fun le_u
+
+```mach
+pub fun le_u(b: *Builder, x: value.Value, y: value.Value) value.Value;
+```
+
+## fun phi
+
+```mach
+pub fun phi(b: *Builder, ty: ir_type.IrTypeId) value.Value;
+```
+
+## fun br
+
+```mach
+pub fun br(b: *Builder, target: ir_id.BlockId);
+```
+
+a branch, a conditional branch and a phi incoming in sticky mode, a failure
+kept as the run's first
+
+## fun cbr
+
+```mach
+pub fun cbr(b: *Builder, cond: value.Value, then_b: ir_id.BlockId, else_b: ir_id.BlockId);
+```
+
+## fun incoming
+
+```mach
+pub fun incoming(b: *Builder, phi_value: value.Value, source: ir_id.BlockId, value_arg: value.Value);
+```
+
 ## fun trunc
 
 ```mach

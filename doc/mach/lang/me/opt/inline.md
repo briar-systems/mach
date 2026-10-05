@@ -1,5 +1,14 @@
 # mach.lang.me.opt.inline
 
+inlining. a call is replaced by a copy of its callee's body when the callee
+asks for it with `#[inline]`, which every call site honours uncharged, or is
+small, under INLINE_INSTR_THRESHOLD live instructions and called at most
+INLINE_SMALL_CALLEE_FANOUT_CAP times, while the caller's growth stays within
+LIMIT. a recursive callee is never inlined; a self-recursive function is
+instead peeled PEEL_LEVELS deep into itself. bodies other modules offer are
+inlined like local ones. the policy also decides which bodies a module
+offers: OFFER
+
 ## val OFFER
 
 ```mach
