@@ -60,11 +60,47 @@ pub rec BlockSpan;
 pub rec CopyHint;
 ```
 
+## rec Liveness
+
+```mach
+pub rec Liveness;
+```
+
+what liveness builds each round: the flat instruction index, each block's
+span and loop weight, and every value's lifetime
+
+## rec Scan
+
+```mach
+pub rec Scan;
+```
+
+the interval scan's working state: the intervals in hand, the register
+file's occupancy, the fixed-register reservations and the copy hints
+
+## rec Spill
+
+```mach
+pub rec Spill;
+```
+
+the per-value spill decisions, kept across rounds and sized by table_count
+
+## rec Rewrite
+
+```mach
+pub rec Rewrite;
+```
+
+the reload registers the rewrite holds back at tight instructions
+
 ## rec Context
 
 ```mach
 pub rec Context;
 ```
+
+the facts every phase shares at the top, and each phase's own state below
 
 ## fun fail_for
 
@@ -93,6 +129,8 @@ pub fun bank_count(tgt: *lang_target.Binding, class: u32) u32;
 pub fun init(ctx: *Context, tgt: *lang_target.Binding, m: *lang_mir.MirModule, f: *lang_mir.MirFunction) err[fail.Fail];
 ```
 
+a failed init leaves what it took for dnit to release
+
 ## fun vreg_tables_reserve
 
 ```mach
@@ -115,6 +153,18 @@ the function has now, with every register free and no interval placed
 
 ```mach
 pub fun round_tables_dnit(ctx: *Context);
+```
+
+## fun liveness_dnit
+
+```mach
+pub fun liveness_dnit(ctx: *Context);
+```
+
+## fun spill_dnit
+
+```mach
+pub fun spill_dnit(ctx: *Context);
 ```
 
 ## fun dnit
@@ -141,6 +191,21 @@ keeps general register `id` from allocation
 
 ```mach
 pub fun function_has_reg_shift(ctx: *Context) bool;
+```
+
+## fun block_at
+
+```mach
+pub fun block_at(ctx: *Context, p: u32) *lang_mir.MirBlock;
+```
+
+the block at position p of the order the phases visit, which is the block
+array's own order until the scan order is built
+
+## fun order_identity
+
+```mach
+pub fun order_identity(order: *u32, n: u32);
 ```
 
 ## fun flat_instr
