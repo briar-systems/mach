@@ -36,12 +36,6 @@ pub val GATE_SCALAR: RuleGate = 1
 pub val GATE_VECTOR: RuleGate = 2
 ```
 
-## rec ExpansionBuilder
-
-```mach
-pub rec ExpansionBuilder;
-```
-
 ## rec Rule
 
 ```mach
@@ -81,7 +75,7 @@ pub fun find_rule(pack: *RulePack, tgt: *isa.BackendTarget, f: *lang_mir.MirFunc
 ## fun emit_instr
 
 ```mach
-pub fun emit_instr(builder: *ExpansionBuilder, opcode: u32, operands: *lang_mir.MirOperand, operand_count: u32) res[*lang_mir.MirInstr, fail.Fail];
+pub fun emit_instr(builder: *expansion.ExpansionBuilder, opcode: u32, operands: *lang_mir.MirOperand, operand_count: u32) res[*lang_mir.MirInstr, fail.Fail];
 ```
 
 ## fun guard_fp_bank_move
