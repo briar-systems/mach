@@ -1,0 +1,465 @@
+# the lane reads and writes of a target with 128-bit vectors and no lane
+# operations, each reached through a stack home of the vector
+use mach.lang.fail;
+use std.allocator.arena;
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use mach.lang.intern;
+use mach.lang.layout;
+use mach.lang.me.analysis;
+use me_ir: mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use ir_effect: mach.lang.me.ir.effect;
+use mach.lang.me.ir.equal;
+use ir_id:          mach.lang.me.ir.id;
+use ir_instruction: mach.lang.me.ir.instruction;
+use mach.lang.me.ir.opdesc;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.me.legalize.scalarize.place;
+use mach.lang.me.pass;
+use mach.lang.me.scratch;
+use me_testing: mach.lang.me.testing;
+use mach.lang.me.vecform;
+use lang_source:  mach.lang.source;
+use target_model: mach.lang.target.model;
+use mach.lang.target.resolved;
+
+rec LaneCtx {
+    c:           place.Ctx;
+    slot:        *value.Value;
+    slot_set:    *bool;
+    store_at:    *bool;
+    slot_alloca: *ir_id.InstructionId;
+    pslot:       *value.Value;
+    pslot_set:   *bool;
+    pallocas:    *ir_id.InstructionId;
+    palloca_len: u32;
+    pn:          u32;
+}
+
+fun make_lane_slot(c: *place.Ctx, vty: ir_type.IrTypeId, out_id: *ir_id.InstructionId) res[value.Value, fail.Fail] {
+    var ops: [1]value.Value;
+    ops[0] = value.const_int(1, c.idx_ty);
+    val ri: res[ir_id.InstructionId, fail.Fail] = place.new_instr(c.m, c.fn, ir_instruction.OP_ALLOCA, c.ptr_ty, vty, ?ops[0], 1, lang_source.location_nil());
+    if (sel ri.err) { ret res[value.Value, fail.Fail].err{ri.err}; }
+    val iid: ir_id.InstructionId = ri.ok;
+    @out_id = iid;
+    ret res[value.Value, fail.Fail].ok{value.instr(iid, c.ptr_ty)};
+}
+
+fun has_lane_op(fn: *me_ir.Function) bool {
+    var b: u32 = 0;
+    for (b < fn.block_count) {
+        val blk: *me_ir.Block = ?fn.blocks[b];
+        var i:   u32          = 0;
+        for (i < blk.instr_count) {
+            val k: ir_instruction.InstrKind = fn.instrs[blk.instructions[i]::u32].kind;
+            if (k == ir_instruction.OP_VEC_EXTRACT || k == ir_instruction.OP_VEC_INSERT) { ret true; }
+            i = i + 1;
+        }
+        b = b + 1;
+    }
+    ret false;
+}
+
+fun lane_index_of(inst: *ir_instruction.Instruction) res[u32, fail.Fail] {
+    if (inst.operands[1].kind != value.VAL_CONST_INT) {
+        ret res[u32, fail.Fail].err{fail.message("scalarize: vector lane index is not a constant")};
+    }
+    ret res[u32, fail.Fail].ok{inst.operands[1].data.int_lit::u32};
+}
+
+fun reserve_read_slot(lc: *LaneCtx, v: value.Value) err[fail.Fail] {
+    if (v.kind == value.VAL_INSTR) {
+        val j: u32 = v.data.instr::u32;
+        if (j >= lc.c.n)    { ret err[fail.Fail].err{fail.message("scalarize: lane read of an out-of-range value")}; }
+        if (lc.slot_set[j]) { ret err[fail.Fail].ok{}; }
+        val ms: res[value.Value, fail.Fail] = make_lane_slot(?lc.c, v.ty, ?lc.slot_alloca[j]);
+        if (sel ms.err) { ret err[fail.Fail].err{ms.err}; }
+        lc.slot[j]     = ms.ok;
+        lc.slot_set[j] = true;
+        lc.store_at[j] = true;
+        ret err[fail.Fail].ok{};
+    }
+    if (v.kind == value.VAL_PARAM) {
+        val p: u32 = v.data.param_ix;
+        if (p >= lc.pn)      { ret err[fail.Fail].err{fail.message("scalarize: lane read of an out-of-range parameter")}; }
+        if (lc.pslot_set[p]) { ret err[fail.Fail].ok{}; }
+        val ms: res[value.Value, fail.Fail] = make_lane_slot(?lc.c, v.ty, ?lc.pallocas[lc.palloca_len]);
+        if (sel ms.err) { ret err[fail.Fail].err{ms.err}; }
+        lc.palloca_len  = lc.palloca_len + 1;
+        lc.pslot[p]     = ms.ok;
+        lc.pslot_set[p] = true;
+        ret err[fail.Fail].ok{};
+    }
+    ret err[fail.Fail].err{fail.message("scalarize: lane read of a value with no stack home")};
+}
+
+fun slot_of(lc: *LaneCtx, v: value.Value) res[value.Value, fail.Fail] {
+    if (v.kind == value.VAL_INSTR) {
+        val j: u32 = v.data.instr::u32;
+        if (j < lc.c.n && lc.slot_set[j]) { ret res[value.Value, fail.Fail].ok{lc.slot[j]}; }
+    }
+    if (v.kind == value.VAL_PARAM) {
+        val p: u32 = v.data.param_ix;
+        if (p < lc.pn && lc.pslot_set[p]) { ret res[value.Value, fail.Fail].ok{lc.pslot[p]}; }
+    }
+    ret res[value.Value, fail.Fail].err{fail.message("scalarize: lane read has no reserved slot")};
+}
+
+fun expand_lane_read(lc: *LaneCtx, blk: *me_ir.Block, cur: ir_id.InstructionId) err[fail.Fail] {
+    val fn:   *me_ir.Function             = lc.c.fn;
+    val ip:   *ir_instruction.Instruction = ?fn.instrs[cur::u32];
+    val src:  value.Value                 = ip.operands[0];
+    val elem: ir_type.IrTypeId            = ip.ty;
+    val loc:  lang_source.Location        = ip.loc;
+
+    val rk: res[u32, fail.Fail] = lane_index_of(ip);
+    if (sel rk.err) { ret err[fail.Fail].err{rk.err}; }
+    val k: u32 = rk.ok;
+
+    var vi: place.VInfo;
+    val vr: err[fail.Fail] = place.vec_info(lc.c.m, src.ty, ?vi);
+    if (sel vr.err) { ret vr; }
+    val ra: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?lc.c.m.types, vi.elem, vi.lanes);
+    if (sel ra.err) { ret err[fail.Fail].err{ra.err}; }
+
+    val rb: res[value.Value, fail.Fail] = slot_of(lc, src);
+    if (sel rb.err) { ret err[fail.Fail].err{rb.err}; }
+
+    val rp: res[value.Value, fail.Fail] = place.lane_ptr(?lc.c, blk, rb.ok,
+        ra.ok, k, loc);
+    if (sel rp.err) { ret err[fail.Fail].err{rp.err}; }
+
+    val rl: res[value.Value, fail.Fail] = place.emit_load(?lc.c, blk, rp.ok, elem, loc, 0);
+    if (sel rl.err) { ret err[fail.Fail].err{rl.err}; }
+
+    lc.c.pval[cur::u32]     = place.lane_secret(?lc.c, rl.ok, src.secret);
+    lc.c.pval_set[cur::u32] = true;
+    ret err[fail.Fail].ok{};
+}
+
+fun expand_lane_write(lc: *LaneCtx, blk: *me_ir.Block, cur: ir_id.InstructionId) err[fail.Fail] {
+    val fn:       *me_ir.Function             = lc.c.fn;
+    val ip:       *ir_instruction.Instruction = ?fn.instrs[cur::u32];
+    val vty:      ir_type.IrTypeId            = ip.ty;
+    val loc:      lang_source.Location        = ip.loc;
+    val src:      value.Value                 = place.resolve(?lc.c, ip.operands[0]);
+    val lane_val: value.Value                 = place.resolve(?lc.c, ip.operands[2]);
+
+    val rk: res[u32, fail.Fail] = lane_index_of(ip);
+    if (sel rk.err) { ret err[fail.Fail].err{rk.err}; }
+    val k: u32 = rk.ok;
+
+    var vi: place.VInfo;
+    val vr: err[fail.Fail] = place.vec_info(lc.c.m, vty, ?vi);
+    if (sel vr.err) { ret vr; }
+    val ra: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?lc.c.m.types, vi.elem, vi.lanes);
+    if (sel ra.err) { ret err[fail.Fail].err{ra.err}; }
+    val arr: ir_type.IrTypeId = ra.ok;
+
+    val slot: value.Value = lc.slot[cur::u32];
+
+    val rs: err[fail.Fail] = place.emit_store(?lc.c, blk, src, slot, loc, 0);
+    if (sel rs.err) { ret rs; }
+
+    val rp: res[value.Value, fail.Fail] = place.lane_ptr(?lc.c, blk, slot, arr, k, loc);
+    if (sel rp.err) { ret err[fail.Fail].err{rp.err}; }
+
+    val rs2: err[fail.Fail] = place.emit_store(?lc.c, blk, lane_val, rp.ok, loc, 0);
+    if (sel rs2.err) { ret rs2; }
+
+    val rl: res[value.Value, fail.Fail] = place.emit_load(?lc.c, blk, slot, vty, loc, 0);
+    if (sel rl.err) { ret err[fail.Fail].err{rl.err}; }
+
+    lc.c.pval[cur::u32]     = rl.ok;
+    lc.c.pval_set[cur::u32] = true;
+    ret err[fail.Fail].ok{};
+}
+
+fun reserve_lane_slots(lc: *LaneCtx) err[fail.Fail] {
+    val fn:  *me_ir.Function = lc.c.fn;
+    var iid: u32             = 0;
+    for (iid < lc.c.n) {
+        if (!lc.c.listed[iid]) {
+            iid = iid + 1;
+            cnt;
+        }
+        val k: ir_instruction.InstrKind = fn.instrs[iid].kind;
+        if (k == ir_instruction.OP_VEC_INSERT) {
+            val ms: res[value.Value, fail.Fail] = make_lane_slot(?lc.c, fn.instrs[iid].ty, ?lc.slot_alloca[iid]);
+            if (sel ms.err) { ret err[fail.Fail].err{ms.err}; }
+            lc.slot[iid]     = ms.ok;
+            lc.slot_set[iid] = true;
+        }
+        or (k == ir_instruction.OP_VEC_EXTRACT) {
+            val rr: err[fail.Fail] = reserve_read_slot(lc, fn.instrs[iid].operands[0]);
+            if (sel rr.err) { ret rr; }
+        }
+        iid = iid + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun expand_lane_block(lc: *LaneCtx, blk: *me_ir.Block, is_entry: bool) err[fail.Fail] {
+    val fn: *me_ir.Function = lc.c.fn;
+
+    val old_len: u32                  = blk.instr_count;
+    var old:     *ir_id.InstructionId = nil;
+    if (old_len > 0) {
+        val ro: res[*ir_id.InstructionId, A.Error] = A.allocate[ir_id.InstructionId](lc.c.alloc, old_len::usize);
+        if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+        old = ro.ok;
+        var i: u32 = 0;
+        for (i < old_len) {
+            old[i] = blk.instructions[i];
+            i      = i + 1;
+        }
+    }
+    blk.instr_count = 0;
+
+    if (is_entry) {
+        var s: u32 = 0;
+        for (s < lc.palloca_len) {
+            val rap: err[fail.Fail] = me_ir.block_append_instr(lc.c.m, blk, lc.pallocas[s]);
+            if (sel rap.err) {
+                place.body_free(?lc.c, old, old_len);
+                ret rap;
+            }
+            s = s + 1;
+        }
+        var p: u32 = 0;
+        for (p < lc.pn) {
+            if (lc.pslot_set[p]) {
+                val rsp: err[fail.Fail] = place.emit_store(?lc.c, blk,
+                    value.param(p, fn.params[p].ty), lc.pslot[p], lang_source.location_nil(), 0);
+                if (sel rsp.err) {
+                    place.body_free(?lc.c, old, old_len);
+                    ret rsp;
+                }
+            }
+            p = p + 1;
+        }
+    }
+
+    var ph: u32 = 0;
+    for (ph < blk.phi_count) {
+        val pid: u32 = blk.phis[ph]::u32;
+        if (pid < lc.c.n && lc.store_at[pid]) {
+            val rap: err[fail.Fail] = me_ir.block_append_instr(lc.c.m, blk, lc.slot_alloca[pid]);
+            if (sel rap.err) {
+                place.body_free(?lc.c, old, old_len);
+                ret rap;
+            }
+            val rsp: err[fail.Fail] = place.emit_store(?lc.c, blk,
+                value.instr(pid::ir_id.InstructionId, fn.instrs[pid].ty), lc.slot[pid], fn.instrs[pid].loc, 0);
+            if (sel rsp.err) {
+                place.body_free(?lc.c, old, old_len);
+                ret rsp;
+            }
+        }
+        ph = ph + 1;
+    }
+
+    var oi: u32 = 0;
+    for (oi < old_len) {
+        val cur:  ir_id.InstructionId      = old[oi];
+        val kind: ir_instruction.InstrKind = fn.instrs[cur::u32].kind;
+        var rr:   err[fail.Fail]           = err[fail.Fail].ok{};
+        if (kind == ir_instruction.OP_VEC_EXTRACT) {
+            rr = expand_lane_read(lc, blk, cur);
+        }
+        or (kind == ir_instruction.OP_VEC_INSERT) {
+            rr = me_ir.block_append_instr(lc.c.m, blk, lc.slot_alloca[cur::u32]);
+            if (!sel rr.err) { rr = expand_lane_write(lc, blk, cur); }
+        }
+        or {
+            rr = me_ir.block_append_instr(lc.c.m, blk, cur);
+            if (!sel rr.err && cur::u32 < lc.c.n && lc.store_at[cur::u32]) {
+                rr = me_ir.block_append_instr(lc.c.m, blk, lc.slot_alloca[cur::u32]);
+                if (!sel rr.err) {
+                    rr = place.emit_store(?lc.c, blk,
+                        value.instr(cur, fn.instrs[cur::u32].ty), lc.slot[cur::u32], fn.instrs[cur::u32].loc, 0);
+                }
+            }
+        }
+        if (sel rr.err) {
+            place.body_free(?lc.c, old, old_len);
+            ret rr;
+        }
+        oi = oi + 1;
+    }
+
+    place.body_free(?lc.c, old, old_len);
+    ret err[fail.Fail].ok{};
+}
+
+fun lane_ctx_free(lc: *LaneCtx) {
+    if (lc.slot != nil && lc.c.n > 0)        { A.deallocate[value.Value](lc.c.alloc, lc.slot, lc.c.n::usize); }
+    if (lc.slot_set != nil && lc.c.n > 0)    { A.deallocate[bool](lc.c.alloc, lc.slot_set, lc.c.n::usize); }
+    if (lc.store_at != nil && lc.c.n > 0)    { A.deallocate[bool](lc.c.alloc, lc.store_at, lc.c.n::usize); }
+    if (lc.slot_alloca != nil && lc.c.n > 0) { A.deallocate[ir_id.InstructionId](lc.c.alloc, lc.slot_alloca, lc.c.n::usize); }
+    if (lc.pslot != nil && lc.pn > 0)        { A.deallocate[value.Value](lc.c.alloc, lc.pslot, lc.pn::usize); }
+    if (lc.pslot_set != nil && lc.pn > 0)    { A.deallocate[bool](lc.c.alloc, lc.pslot_set, lc.pn::usize); }
+    if (lc.pallocas != nil && lc.pn > 0)     { A.deallocate[ir_id.InstructionId](lc.c.alloc, lc.pallocas, lc.pn::usize); }
+    lc.slot        = nil;
+    lc.slot_set    = nil;
+    lc.store_at    = nil;
+    lc.slot_alloca = nil;
+    lc.pslot       = nil;
+    lc.pslot_set   = nil;
+    lc.pallocas    = nil;
+    place.ctx_free(?lc.c);
+}
+
+fun lane_work(work: *pass.Function, t: *place.Types, alloc: *A.Allocator) res[bool, fail.Fail] {
+    val m:       *me_ir.Module    = work.module;
+    val fn:      *me_ir.Function  = work.body;
+    val tgt:     *resolved.Target = work.target;
+    val void_ty: ir_type.IrTypeId = t.void_ty;
+    val ptr_ty:  ir_type.IrTypeId = t.ptr_ty;
+    val idx_ty:  ir_type.IrTypeId = t.idx_ty;
+    if (!has_lane_op(fn)) { ret res[bool, fail.Fail].ok{false}; }
+
+    var lc: LaneCtx;
+    lc.c.alloc     = alloc;
+    lc.c.m         = m;
+    lc.c.tgt       = tgt;
+    lc.c.fn        = fn;
+    lc.c.lane_buf  = nil;
+    lc.c.lane_cap  = 0;
+    lc.c.n         = fn.instr_len;
+    lc.c.pcount    = 0;
+    lc.c.is_vp     = nil;
+    lc.c.void_ty   = void_ty;
+    lc.c.ptr_ty    = ptr_ty;
+    lc.c.idx_ty    = idx_ty;
+    lc.pn          = fn.param_count;
+    lc.palloca_len = 0;
+
+    val rpv: res[*value.Value, A.Error] = A.allocate[value.Value](alloc, lc.c.n::usize);
+    if (sel rpv.err) { ret res[bool, fail.Fail].err{fail.refused(rpv.err)}; }
+    lc.c.pval = rpv.ok;
+    val rps: res[*bool, A.Error] = A.zallocate[bool](alloc, lc.c.n::usize);
+    if (sel rps.err) {
+        lane_ctx_free(?lc);
+        ret res[bool, fail.Fail].err{fail.refused(rps.err)};
+    }
+    lc.c.pval_set = rps.ok;
+
+    val rsl: res[*value.Value, A.Error] = A.allocate[value.Value](alloc, lc.c.n::usize);
+    if (sel rsl.err) {
+        lane_ctx_free(?lc);
+        ret res[bool, fail.Fail].err{fail.refused(rsl.err)};
+    }
+    lc.slot = rsl.ok;
+    val rss: res[*bool, A.Error] = A.zallocate[bool](alloc, lc.c.n::usize);
+    if (sel rss.err) {
+        lane_ctx_free(?lc);
+        ret res[bool, fail.Fail].err{fail.refused(rss.err)};
+    }
+    lc.slot_set = rss.ok;
+    val rsa: res[*bool, A.Error] = A.zallocate[bool](alloc, lc.c.n::usize);
+    if (sel rsa.err) {
+        lane_ctx_free(?lc);
+        ret res[bool, fail.Fail].err{fail.refused(rsa.err)};
+    }
+    lc.store_at = rsa.ok;
+    val ral: res[*ir_id.InstructionId, A.Error] = A.allocate[ir_id.InstructionId](alloc, lc.c.n::usize);
+    if (sel ral.err) {
+        lane_ctx_free(?lc);
+        ret res[bool, fail.Fail].err{fail.refused(ral.err)};
+    }
+    lc.slot_alloca = ral.ok;
+
+    if (lc.pn > 0) {
+        val rpl: res[*value.Value, A.Error] = A.allocate[value.Value](alloc, lc.pn::usize);
+        if (sel rpl.err) {
+            lane_ctx_free(?lc);
+            ret res[bool, fail.Fail].err{fail.refused(rpl.err)};
+        }
+        lc.pslot = rpl.ok;
+        val rpss: res[*bool, A.Error] = A.zallocate[bool](alloc, lc.pn::usize);
+        if (sel rpss.err) {
+            lane_ctx_free(?lc);
+            ret res[bool, fail.Fail].err{fail.refused(rpss.err)};
+        }
+        lc.pslot_set = rpss.ok;
+        val rpa: res[*ir_id.InstructionId, A.Error] = A.allocate[ir_id.InstructionId](alloc, lc.pn::usize);
+        if (sel rpa.err) {
+            lane_ctx_free(?lc);
+            ret res[bool, fail.Fail].err{fail.refused(rpa.err)};
+        }
+        lc.pallocas = rpa.ok;
+    }
+
+    val rm: err[fail.Fail] = place.mark_listed(?lc.c);
+    if (sel rm.err) {
+        lane_ctx_free(?lc);
+        ret res[bool, fail.Fail].err{rm.err};
+    }
+
+    val rr: err[fail.Fail] = reserve_lane_slots(?lc);
+    if (sel rr.err) {
+        lane_ctx_free(?lc);
+        ret res[bool, fail.Fail].err{rr.err};
+    }
+
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val rb: err[fail.Fail] = expand_lane_block(?lc, ?fn.blocks[bi], bi == 0);
+        if (sel rb.err) {
+            lane_ctx_free(?lc);
+            ret res[bool, fail.Fail].err{rb.err};
+        }
+        bi = bi + 1;
+    }
+    place.rewrite_uses(?lc.c, fn);
+
+    lane_ctx_free(?lc);
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# a run that owns its workspace
+#[testing]
+pub fun run(m: *me_ir.Module, tgt: *resolved.Target) res[bool, fail.Fail] {
+    ret pass.run_alone(?PASS, m, tgt);
+}
+
+# the lane-operation expansion the pipeline schedules
+pub val PASS: pass.Pass = pass.Pass{run: nil, applies: lanes_apply, preserves: analysis.NONE, visit: lanes_visit, skips: pass.SKIP_EXTERN | pass.SKIP_NO_INSTRS, eligible: nil, rounds: 1};
+
+# a target with 128-bit vectors and no lane operations reaches a lane by memory
+fun lanes_apply(ctx: *pass.Context) bool {
+    ret !ctx.target.model.has_lane_ops && ctx.target.model.has_v128;
+}
+
+fun lanes_visit(f: *pass.Function, alloc: *A.Allocator) res[bool, fail.Fail] {
+    val t: res[place.Types, fail.Fail] = place.lane_types(f.module, f.target);
+    if (sel t.err) { ret res[bool, fail.Fail].err{t.err}; }
+    var types: place.Types = t.ok;
+    ret lane_work(f, ?types, alloc);
+}
+
+#[testing]
+fun probe_lanes(a: *me_testing.Attempt, m: *me_ir.Module, workspace: *scratch.Workspace) err[fail.Fail] {
+    var ctx: pass.Context         = pass.context(m, a.target, workspace);
+    val r:   res[bool, fail.Fail] = pass.run(?PASS, ?ctx);
+    if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+    ret err[fail.Fail].ok{};
+}
+
+test lanes__refusal_at_every_ordinal_leaves_the_input_or_a_partial_expansion {
+    ret place.probe_walk("x86_64", probe_lanes);
+}

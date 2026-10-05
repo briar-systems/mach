@@ -1,28 +1,31 @@
 # mach.lang.me.ir.body
 
-## val MAX_INSTRUCTIONS
+## rec Cost
 
 ```mach
-pub val MAX_INSTRUCTIONS:   u32   = 1024
+pub rec Cost;
 ```
 
-## val SMALL_INSTRUCTIONS
-
-```mach
-pub val SMALL_INSTRUCTIONS: u32   = 25
-```
-
-## rec Budget
-
-```mach
-pub rec Budget;
-```
+what a body adds to a host it is copied into: its counted instructions and
+the bytes it carries
 
 ## fun charge
 
 ```mach
-pub fun charge(b: *Budget, instructions: u32, bytes: usize) bool;
+pub fun charge(total: *Cost, add: Cost, limit: Cost) bool;
 ```
+
+whether `add` fits beside `total` within `limit`, charged to `total` when it
+does
+
+## rec Offer
+
+```mach
+pub rec Offer;
+```
+
+the bodies a store offers for inlining: those `eligible` admits, while their
+costs fit `limit` together. the policy is the inliner's
 
 ## fun live_instructions
 
@@ -41,8 +44,11 @@ constant payloads belong to the destination module arena
 ## fun extract
 
 ```mach
-pub fun extract(dst: *me_ir.Module, src: *me_ir.Module, tgt: *resolved.Target, scratch: *A.Allocator, recursive: *bool) err[fail.Fail];
+pub fun extract(dst: *me_ir.Module, src: *me_ir.Module, tgt: *resolved.Target, scratch: *A.Allocator, recursive: *bool, offer: *Offer) err[fail.Fail];
 ```
+
+copies into `dst` every body of `src` that `offer` admits, `recursive` naming
+the functions left out whatever their cost
 
 ## rec Available
 
@@ -57,7 +63,7 @@ owns the module home that allocator comes from
 ## fun available_init
 
 ```mach
-pub fun available_init(a: *Available, name: intern.StrId, backing: *A.Allocator) err[fail.Fail];
+pub fun available_init(a: *Available, name: intern.StrId, backing: *A.Allocator, offer: Offer) err[fail.Fail];
 ```
 
 ## fun detach
@@ -93,6 +99,8 @@ pub fun acquire(a: *Available, dst: *me_ir.Module, provider: *me_ir.Module, name
 ## fun growth_cost
 
 ```mach
-pub fun growth_cost(fn: *me_ir.Function, out: *Budget) bool;
+pub fun growth_cost(fn: *me_ir.Function, limit: Cost, out: *Cost) bool;
 ```
+
+what inlining `fn` in its own module adds to the host, false past `limit`
 

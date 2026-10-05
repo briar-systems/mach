@@ -1,0 +1,1519 @@
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.system.panic.panic;
+
+use A: std.allocator;
+
+use mach.lang.intern;
+use mach.lang.me.analysis;
+use mach.lang.me.analysis.dependence;
+use mach.lang.me.analysis.loops;
+use me_ir: mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use ir_effect: mach.lang.me.ir.effect;
+use mach.lang.me.ir.equal;
+use ir_id:          mach.lang.me.ir.id;
+use ir_instruction: mach.lang.me.ir.instruction;
+use mach.lang.me.ir.opdesc;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.me.pass;
+use mach.lang.me.scratch;
+use me_testing: mach.lang.me.testing;
+
+# a run that owns its workspace
+#[testing]
+pub fun run(m: *me_ir.Module, tgt: *resolved.Target) res[bool, fail.Fail] {
+    ret pass.run_alone(?PASS, m, tgt);
+}
+
+# the pass the pipeline schedules
+pub val PASS: pass.Pass = pass.Pass{run: nil, applies: nil, preserves: analysis.DOMINANCE, visit: licm_function, skips: pass.SKIP_EXTERN | pass.SKIP_EMPTY, eligible: nil, rounds: 1};
+
+fun licm_function(work: *pass.Function, alloc: *A.Allocator) res[bool, fail.Fail] {
+    ret analysis.each_innermost_first[pass.Function](work.analyses, work.module, work.body, alloc, work, licm_each);
+}
+
+fun licm_each(work: *pass.Function, la: *loops.LoopAnalysis, lx: u32, alloc: *A.Allocator) res[bool, fail.Fail] {
+    ret licm_loop(work.module, work.body, la, lx, work.target);
+}
+
+fun licm_loop(m: *me_ir.Module, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, tgt: *resolved.Target) res[bool, fail.Fail] {
+    val lp:     *loops.Loop   = ?la.loops[lx];
+    val pre_id: ir_id.BlockId = lp.preheader;
+    if (ir_id.block_is_nil(pre_id)) { ret res[bool, fail.Fail].ok{false}; }
+
+    val opaque: bool = loop_has_opaque_effect(fn, la, lx);
+
+    var changed: bool = false;
+    var ri:      u32  = 0;
+    for (ri < la.dom.rpo_len) {
+        val b: ir_id.BlockId = la.dom.rpo[ri];
+        ri = ri + 1;
+        if (!loops.loop_contains(la, lx, b)) { cnt; }
+
+        val blk: *me_ir.Block = ?fn.blocks[b::u32];
+        var w:   u32          = 0;
+        var k:   u32          = 0;
+        for (k < blk.instr_count) {
+            val iid: ir_id.InstructionId = blk.instructions[k];
+            k = k + 1;
+
+            if (hoistable(m, fn, la, lx, tgt, iid, opaque)) {
+                val rp: err[fail.Fail] = me_ir.block_append_instr(m, ?fn.blocks[pre_id::u32], iid);
+                if (sel rp.err) {
+                    blk.instructions[w] = iid;
+                    keep_rest(blk, w + 1, k);
+                    ret res[bool, fail.Fail].err{rp.err};
+                }
+                val rs: err[fail.Fail] = loops.set_instr_block(la, iid, pre_id);
+                if (sel rs.err) {
+                    keep_rest(blk, w, k);
+                    ret res[bool, fail.Fail].err{rs.err};
+                }
+                changed = true;
+                cnt;
+            }
+
+            val split_r: res[bool, fail.Fail] = split_invariant_gep_prefix(m, fn, la, lx, iid, pre_id);
+            if (sel split_r.err) {
+                blk.instructions[w] = iid;
+                keep_rest(blk, w + 1, k);
+                ret split_r;
+            }
+            if (split_r.ok) { changed = true; }
+
+            blk.instructions[w] = iid;
+            w                   = w + 1;
+        }
+        blk.instr_count = w;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+# a refusal mid-block finishes the compaction the hoist loop was doing, so
+# the block lists each instruction once whether it was hoisted or kept
+fun keep_rest(blk: *me_ir.Block, w: u32, k: u32) {
+    var to:   u32 = w;
+    var from: u32 = k;
+    for (from < blk.instr_count) {
+        blk.instructions[to] = blk.instructions[from];
+        to                   = to + 1;
+        from                 = from + 1;
+    }
+    blk.instr_count = to;
+}
+
+fun hoistable(m: *me_ir.Module, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, tgt: *resolved.Target,
+    iid: ir_id.InstructionId, opaque: bool) bool {
+    if (iid::u32 >= fn.instr_len) { ret false; }
+    val k: ir_instruction.InstrKind = fn.instrs[iid::u32].kind;
+
+    if (opdesc.is_terminator(k))                           { ret false; }
+    if (k == ir_instruction.OP_PHI)                        { ret false; }
+    if (ir_effect.is_volatile(?fn.instrs[iid::u32]))       { ret false; }
+    if (!operands_invariant(la, lx, ?fn.instrs[iid::u32])) { ret false; }
+
+    if (k == ir_instruction.OP_LOAD) {
+        if (opaque) { ret false; }
+        ret load_is_speculable(m, fn, la, lx, tgt, iid);
+    }
+
+    if (!ir_effect.movable(?fn.instrs[iid::u32]))      { ret false; }
+    if (!ir_effect.speculatable(?fn.instrs[iid::u32])) { ret false; }
+    if (k == ir_instruction.OP_GEP)                    { ret gep_is_worth_hoisting(fn, iid); }
+    ret true;
+}
+
+fun gep_is_worth_hoisting(fn: *me_ir.Function, iid: ir_id.InstructionId) bool {
+    if (fn.instrs[iid::u32].operand_count == 0)                   { ret false; }
+    if (fn.instrs[iid::u32].operands[0].kind == value.VAL_GLOBAL) { ret true; }
+
+    var i: u32 = 1;
+    for (i < fn.instrs[iid::u32].operand_count) {
+        if (fn.instrs[iid::u32].operands[i].kind != value.VAL_CONST_INT) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun operands_invariant(la: *loops.LoopAnalysis, lx: u32, ins: *ir_instruction.Instruction) bool {
+    var i: u32 = 0;
+    for (i < ins.operand_count) {
+        if (!loops.is_invariant(la, lx, ins.operands[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun loop_has_opaque_effect(fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32) bool {
+    val lp: *loops.Loop = ?la.loops[lx];
+    var bi: u32         = 0;
+    for (bi < lp.body_len) {
+        val blk: *me_ir.Block = ?fn.blocks[lp.body[bi]::u32];
+        var k:   u32          = 0;
+        for (k < blk.instr_count) {
+            val ik: ir_instruction.InstrKind = fn.instrs[blk.instructions[k]::u32].kind;
+            if (opdesc.has(ik, opdesc.EFF_MAY_CALL)) { ret true; }
+            k = k + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+fun load_is_speculable(m: *me_ir.Module, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32,
+    tgt: *resolved.Target, iid: ir_id.InstructionId) bool {
+    if (fn.instrs[iid::u32].operand_count < 1) { ret false; }
+
+    var gix: u32 = 0;
+    var off: u64 = 0;
+    if (!global_const_address(m, fn, tgt, fn.instrs[iid::u32].operands[0], ?gix, ?off)) { ret false; }
+
+    val lty: ir_type.IrTypeId = fn.instrs[iid::u32].ty;
+    val gty: ir_type.IrTypeId = m.globals[gix].ty;
+    if (ir_type.is_nil(lty) || ir_type.is_nil(gty)) { ret false; }
+
+    val gsz: u64 = ir_type.byte_size_for_machine(?m.types, gty, resolved.layout_machine(tgt))::u64;
+    val lsz: u64 = ir_type.byte_size_for_machine(?m.types, lty, resolved.layout_machine(tgt))::u64;
+    if (lsz == 0)        { ret false; }
+    if (off > gsz)       { ret false; }
+    if (lsz > gsz - off) { ret false; }
+
+    ret !loop_may_write_global(m, fn, la, lx, gix);
+}
+
+# total over a verified function, whose address chains are acyclic
+fun global_const_address(m: *me_ir.Module, fn: *me_ir.Function, tgt: *resolved.Target, p: value.Value,
+    out_gix: *u32, out_off: *u64) bool {
+    var cur:   value.Value = p;
+    var off:   u64         = 0;
+    var steps: u32         = 0;
+
+    for (true) {
+        if (cur.kind == value.VAL_GLOBAL) {
+            @out_gix = cur.data.global_ix;
+            @out_off = off;
+            ret cur.data.global_ix < m.global_len;
+        }
+        if (cur.kind != value.VAL_INSTR) { ret false; }
+        val iid: ir_id.InstructionId = cur.data.instr;
+        if (iid::u32 >= fn.instr_len) { ret false; }
+
+        val k: ir_instruction.InstrKind = fn.instrs[iid::u32].kind;
+        if (k == ir_instruction.OP_BITCAST) {
+            if (fn.instrs[iid::u32].operand_count < 1) { ret false; }
+            cur = fn.instrs[iid::u32].operands[0];
+        }
+        or (k == ir_instruction.OP_GEP) {
+            var d: u64 = 0;
+            if (!gep_const_disp(m, fn, tgt, iid, ?d)) { ret false; }
+            off = off + d;
+            cur = fn.instrs[iid::u32].operands[0];
+        }
+        or {
+            ret false;
+        }
+
+        steps = steps + 1;
+        if (steps > fn.instr_len) { panic("mach.lang.me.opt.licm: cyclic pointer definition chain\n"); }
+    }
+    ret false;
+}
+
+fun gep_const_disp(m: *me_ir.Module, fn: *me_ir.Function, tgt: *resolved.Target, iid: ir_id.InstructionId, out_disp: *u64) bool {
+    val count: u32 = fn.instrs[iid::u32].operand_count;
+    if (count <= 1) {
+        @out_disp = 0;
+        ret true;
+    }
+
+    var cur: ir_type.IrTypeId = fn.instrs[iid::u32].aux_ty;
+    if (ir_type.is_nil(cur)) { ret false; }
+
+    var disp: u64 = 0;
+    var k:    u32 = 1;
+    for (k < count) {
+        val v: value.Value = fn.instrs[iid::u32].operands[k];
+        if (v.kind != value.VAL_CONST_INT) { ret false; }
+
+        if (k == 1) {
+            disp = disp + v.data.int_lit * ir_type.byte_size_for_machine(?m.types, cur, resolved.layout_machine(tgt))::u64;
+        }
+        or {
+            var next:     ir_type.IrTypeId = ir_type.IRT_NIL;
+            var is_field: bool             = false;
+            if (!descend_level(m, cur, v, ?next, ?is_field)) { ret false; }
+            if (is_field) {
+                disp = disp + ir_type.byte_offset_for_machine(?m.types, cur, v.data.int_lit::u32, resolved.layout_machine(tgt))::u64;
+            }
+            or {
+                disp = disp + v.data.int_lit * ir_type.byte_size_for_machine(?m.types, next, resolved.layout_machine(tgt))::u64;
+            }
+            cur = next;
+        }
+        k = k + 1;
+    }
+
+    @out_disp = disp;
+    ret true;
+}
+
+fun descend_level(m: *me_ir.Module, cur: ir_type.IrTypeId, v: value.Value,
+    out_next: *ir_type.IrTypeId, out_field: *bool) bool {
+    if (ir_type.is_nil(cur)) { ret false; }
+    val ct_opt: opt[*ir_type.IrType] = ir_type.get(?m.types, cur);
+    if (!sel ct_opt.some) { ret false; }
+    val ct: *ir_type.IrType = ct_opt.some;
+
+    if (ct.kind == ir_type.IRT_ARRAY) {
+        @out_next  = ct.data.array_.element;
+        @out_field = false;
+        ret true;
+    }
+
+    if (ct.kind == ir_type.IRT_STRUCT || ct.kind == ir_type.IRT_UNION) {
+        if (v.kind != value.VAL_CONST_INT)                      { ret false; }
+        if (v.data.int_lit >= ct.data.struct_.field_count::u64) { ret false; }
+        @out_next  = ct.data.struct_.fields[v.data.int_lit::u32];
+        @out_field = true;
+        ret true;
+    }
+
+    if (ct.kind == ir_type.IRT_TAG) {
+        if (v.kind != value.VAL_CONST_INT)                                 { ret false; }
+        if (v.data.int_lit >= ir_type.tag_field_count(?m.types, cur)::u64) { ret false; }
+        @out_next  = ir_type.tag_field_type(?m.types, cur, v.data.int_lit::u32);
+        @out_field = true;
+        ret true;
+    }
+
+    ret false;
+}
+
+fun loop_may_write_global(m: *me_ir.Module, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, gix: u32) bool {
+    val lp: *loops.Loop = ?la.loops[lx];
+    var bi: u32         = 0;
+    for (bi < lp.body_len) {
+        val blk: *me_ir.Block = ?fn.blocks[lp.body[bi]::u32];
+        var k:   u32          = 0;
+        for (k < blk.instr_count) {
+            val wid: ir_id.InstructionId = blk.instructions[k];
+            k = k + 1;
+            val ik: ir_instruction.InstrKind = fn.instrs[wid::u32].kind;
+
+            var dst: value.Value;
+            if (ik == ir_instruction.OP_STORE) {
+                if (fn.instrs[wid::u32].operand_count < 2) { ret true; }
+                dst = fn.instrs[wid::u32].operands[1];
+            }
+            or (ik == ir_instruction.OP_MEMZERO) {
+                if (fn.instrs[wid::u32].operand_count < 1) { ret true; }
+                dst = fn.instrs[wid::u32].operands[0];
+            }
+            or {
+                cnt;
+            }
+
+            if (may_alias_global(m, fn, dst, gix)) { ret true; }
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+fun may_alias_global(m: *me_ir.Module, fn: *me_ir.Function, p: value.Value, gix: u32) bool {
+    val root: value.Value = pointer_root(fn, p);
+
+    if (root.kind == value.VAL_GLOBAL) {
+        if (root.data.global_ix == gix)          { ret true; }
+        if (root.data.global_ix >= m.global_len) { ret true; }
+        val a: intern.StrId = m.globals[root.data.global_ix].name;
+        val b: intern.StrId = m.globals[gix].name;
+        if (intern.str_is_nil(a) || intern.str_is_nil(b)) { ret true; }
+        ret intern.str_same(a, b);
+    }
+
+    if (root.kind == value.VAL_INSTR) {
+        val iid: ir_id.InstructionId = root.data.instr;
+        if (iid::u32 < fn.instr_len && fn.instrs[iid::u32].kind == ir_instruction.OP_ALLOCA) { ret false; }
+    }
+
+    ret true;
+}
+
+# total over a verified function, whose address chains are acyclic
+fun pointer_root(fn: *me_ir.Function, p: value.Value) value.Value {
+    var cur:   value.Value = p;
+    var steps: u32         = 0;
+    for (cur.kind == value.VAL_INSTR) {
+        val iid: ir_id.InstructionId = cur.data.instr;
+        if (iid::u32 >= fn.instr_len) { ret cur; }
+        val k: ir_instruction.InstrKind = fn.instrs[iid::u32].kind;
+        if (k != ir_instruction.OP_GEP && k != ir_instruction.OP_BITCAST) { ret cur; }
+        if (fn.instrs[iid::u32].operand_count < 1)                        { ret cur; }
+        cur = fn.instrs[iid::u32].operands[0];
+
+        steps = steps + 1;
+        if (steps > fn.instr_len) { panic("mach.lang.me.opt.licm: cyclic pointer definition chain\n"); }
+    }
+    ret cur;
+}
+
+fun split_invariant_gep_prefix(m: *me_ir.Module, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32,
+    iid: ir_id.InstructionId, pre_id: ir_id.BlockId) res[bool, fail.Fail] {
+    if (iid::u32 >= fn.instr_len)                          { ret res[bool, fail.Fail].ok{false}; }
+    if (fn.instrs[iid::u32].kind != ir_instruction.OP_GEP) { ret res[bool, fail.Fail].ok{false}; }
+    if (ir_type.is_nil(fn.instrs[iid::u32].aux_ty))        { ret res[bool, fail.Fail].ok{false}; }
+
+    val count: u32 = fn.instrs[iid::u32].operand_count;
+    if (count < 3)                                                { ret res[bool, fail.Fail].ok{false}; }
+    if (fn.instrs[iid::u32].operands[0].kind != value.VAL_GLOBAL) { ret res[bool, fail.Fail].ok{false}; }
+
+    var k: u32 = 0;
+    for (k + 1 < count) {
+        if (!loops.is_invariant(la, lx, fn.instrs[iid::u32].operands[1 + k])) { brk; }
+        k = k + 1;
+    }
+    if (k == 0 || k == count - 1) { ret res[bool, fail.Fail].ok{false}; }
+
+    var body_src: ir_type.IrTypeId = ir_type.IRT_NIL;
+    if (!gep_level_type(m, fn, iid, k, ?body_src)) { ret res[bool, fail.Fail].ok{false}; }
+
+    var prefix: ir_id.InstructionId = find_prefix_gep(fn, ?fn.blocks[pre_id::u32], iid, k);
+    if (ir_id.instruction_is_nil(prefix)) {
+        val rn: res[ir_id.InstructionId, fail.Fail] = emit_prefix_gep(m, fn, iid, k);
+        if (sel rn.err) { ret res[bool, fail.Fail].err{rn.err}; }
+        prefix = rn.ok;
+
+        val rp: err[fail.Fail] = me_ir.block_append_instr(m, ?fn.blocks[pre_id::u32], prefix);
+        if (sel rp.err) { ret res[bool, fail.Fail].err{rp.err}; }
+        val rs: err[fail.Fail] = loops.set_instr_block(la, prefix, pre_id);
+        if (sel rs.err) { ret res[bool, fail.Fail].err{rs.err}; }
+    }
+
+    val rest: u32                                = count - 1 - k;
+    val rb:   res[me_ir.OperandArray, fail.Fail] = me_ir.operands_alloc(m, rest + 1);
+    if (sel rb.err) { ret res[bool, fail.Fail].err{rb.err}; }
+    val arr: me_ir.OperandArray = rb.ok;
+
+    var pv: value.Value = value.instr(prefix, fn.instrs[prefix::u32].ty);
+    pv.secret  = fn.instrs[prefix::u32].secret;
+    arr.ops[0] = pv;
+    var j: u32 = 0;
+    for (j < rest) {
+        arr.ops[1 + j] = fn.instrs[iid::u32].operands[1 + k + j];
+        j              = j + 1;
+    }
+
+    me_ir.instr_replace_operands(m, ?fn.instrs[iid::u32], arr);
+    fn.instrs[iid::u32].aux_ty = body_src;
+    ret res[bool, fail.Fail].ok{true};
+}
+
+fun gep_level_type(m: *me_ir.Module, fn: *me_ir.Function, iid: ir_id.InstructionId, k: u32, out_ty: *ir_type.IrTypeId) bool {
+    var cur: ir_type.IrTypeId = fn.instrs[iid::u32].aux_ty;
+    if (k == 0) {
+        @out_ty = cur;
+        ret true;
+    }
+
+    var j: u32 = 1;
+    for (j <= k) {
+        var next:     ir_type.IrTypeId = ir_type.IRT_NIL;
+        var is_field: bool             = false;
+        if (!descend_level(m, cur, fn.instrs[iid::u32].operands[1 + j], ?next, ?is_field)) { ret false; }
+        cur = next;
+        j   = j + 1;
+    }
+    @out_ty = cur;
+    ret true;
+}
+
+fun find_prefix_gep(fn: *me_ir.Function, pre: *me_ir.Block, iid: ir_id.InstructionId, k: u32) ir_id.InstructionId {
+    var i: u32 = 0;
+    for (i < pre.instr_count) {
+        val cid: ir_id.InstructionId = pre.instructions[i];
+        i = i + 1;
+        if (fn.instrs[cid::u32].kind != ir_instruction.OP_GEP)                     { cnt; }
+        if (fn.instrs[cid::u32].operand_count != k + 1)                            { cnt; }
+        if (!ir_type.same(fn.instrs[cid::u32].aux_ty, fn.instrs[iid::u32].aux_ty)) { cnt; }
+        if (fn.instrs[cid::u32].flags != fn.instrs[iid::u32].flags)                { cnt; }
+
+        var same: bool = true;
+        var j:    u32  = 0;
+        for (j < k + 1) {
+            if (!value.is_same(fn.instrs[cid::u32].operands[j], fn.instrs[iid::u32].operands[j])) {
+                same = false;
+                brk;
+            }
+            j = j + 1;
+        }
+        if (same) { ret cid; }
+    }
+    ret ir_id.INSTR_NIL;
+}
+
+fun emit_prefix_gep(m: *me_ir.Module, fn: *me_ir.Function, iid: ir_id.InstructionId, k: u32) res[ir_id.InstructionId, fail.Fail] {
+    val ra: res[*value.Value, A.Error] = A.allocate[value.Value](m.alloc, (k + 1)::usize);
+    if (sel ra.err) { ret res[ir_id.InstructionId, fail.Fail].err{fail.refused(ra.err)}; }
+    val ops: *value.Value = ra.ok;
+
+    var j: u32 = 0;
+    for (j < k + 1) {
+        ops[j] = fn.instrs[iid::u32].operands[j];
+        j      = j + 1;
+    }
+
+    var bld: builder.Builder = builder.on(m, fn);
+    builder.set_loc(?bld, fn.instrs[iid::u32].loc);
+    builder.set_flags(?bld, fn.instrs[iid::u32].flags);
+    builder.set_secret(?bld, fn.instrs[iid::u32].secret);
+    val ri: res[ir_id.InstructionId, fail.Fail] = builder.emit_instr_owned(?bld, ir_instruction.OP_GEP, fn.instrs[iid::u32].ty,
+        fn.instrs[iid::u32].aux_ty, ops, k + 1);
+    ret ri;
+}
+
+use mach.lang.target.resolved;
+use std.allocator.page;
+
+#[testing]
+fun mk_global(m: *me_ir.Module, itn: *intern.Interner, tag: str, ty: ir_type.IrTypeId,
+    ptrt: ir_type.IrTypeId, o_val: *value.Value) i32 {
+    val rn: res[intern.StrId, A.Error] = intern.add(itn, tag);
+    if (sel rn.err) { ret 1; }
+
+    var g: me_ir.Global = me_ir.global_init(rn.ok, ty, value.const_int(0, ty));
+    g.is_mut = true;
+    val added: res[u32, fail.Fail] = me_ir.global_add(m, g);
+    if (sel added.err) { ret 1; }
+    val idx: u32 = added.ok;
+    @o_val = value.global(idx, ptrt);
+    ret 0;
+}
+
+#[testing]
+fun block_holds(fn: *me_ir.Function, b: ir_id.BlockId, iid: ir_id.InstructionId) bool {
+    val blk: *me_ir.Block = ?fn.blocks[b::u32];
+    var i:   u32          = 0;
+    for (i < blk.instr_count) {
+        if (ir_id.instruction_same(blk.instructions[i], iid)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# 0 when the loop's global load hoists to the entry, 1 when it stays in the
+# body, 2 on a fixture failure
+#[testing]
+fun t_global_load_hoist(volatile: bool) i32 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) {
+        intern.dnit(?itn);
+        ret 2;
+    }
+    var m: me_ir.Module = rm.ok;
+
+    val rt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel rt.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 2;
+    }
+    val i64t: ir_type.IrTypeId                 = rt.ok;
+    val rp:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 2;
+    }
+    val ptrt: ir_type.IrTypeId = rp.ok;
+
+    var g: value.Value;
+    if (mk_global(?m, ?itn, "g_bound", i64t, ptrt, ?g) != 0) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 2;
+    }
+
+    val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 2;
+    }
+    val fn:  *me_ir.Function = ?m.functions[rf.ok];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val made_lp: res[builder.CountedLoop, fail.Fail] = builder.counted_loop_add(?bld, i64t);
+    if (sel made_lp.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 2;
+    }
+    var lp: builder.CountedLoop = made_lp.ok;
+
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?bld, g, i64t);
+    if (sel rl.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 2;
+    }
+    val ld: value.Value                 = rl.ok;
+    val rs: res[value.Value, fail.Fail] = builder.emit_add(?bld, lp.iv, ld);
+    if (sel rs.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 2;
+    }
+    val sum:       value.Value    = rs.ok;
+    val closed_lp: err[fail.Fail] = builder.counted_loop_close(?bld, ?lp, i64t);
+    if (sel closed_lp.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 2;
+    }
+
+    if (volatile) { fn.instrs[ld.data.instr::u32].flags = ir_instruction.INSTR_FLAG_VOLATILE; }
+
+    var code: i32                  = 2;
+    val rr:   res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rr.ok) {
+        val changed:  bool = rr.ok;
+        val in_entry: bool = block_holds(fn, lp.entry, ld.data.instr);
+        val in_body:  bool = block_holds(fn, lp.body, ld.data.instr);
+        if (block_holds(fn, lp.body, sum.data.instr)) {
+            if (changed && in_entry && !in_body) { code = 0; }
+            if (!in_entry && in_body)            { code = 1; }
+        }
+    }
+
+    me_ir.dnit(?m);
+    intern.dnit(?itn);
+    ret code;
+}
+
+# a speculable global load hoists, and the volatile flag alone keeps it in the loop
+test run__hoists_an_invariant_global_load_unless_volatile {
+    if (t_global_load_hoist(false) != 0) { ret 1; }
+    if (t_global_load_hoist(true) != 1)  { ret 2; }
+    ret 0;
+}
+
+test run__an_aliasing_store_blocks_a_load_hoist {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    var code: i32 = 0;
+    var pass: u32 = 0;
+    for (pass < 2) {
+        val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+        if (sel rm.err) {
+            intern.dnit(?itn);
+            ret 1;
+        }
+        var m: me_ir.Module = rm.ok;
+
+        val rt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+        if (sel rt.err) {
+            me_ir.dnit(?m);
+            intern.dnit(?itn);
+            ret 1;
+        }
+        val i64t: ir_type.IrTypeId                 = rt.ok;
+        val rp:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+        if (sel rp.err) {
+            me_ir.dnit(?m);
+            intern.dnit(?itn);
+            ret 1;
+        }
+        val ptrt: ir_type.IrTypeId = rp.ok;
+
+        var g:     value.Value;
+        var other: value.Value;
+        if (mk_global(?m, ?itn, "g_read", i64t, ptrt, ?g) != 0) {
+            me_ir.dnit(?m);
+            intern.dnit(?itn);
+            ret 1;
+        }
+        if (mk_global(?m, ?itn, "g_other", i64t, ptrt, ?other) != 0) {
+            me_ir.dnit(?m);
+            intern.dnit(?itn);
+            ret 1;
+        }
+
+        val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+        if (sel rf.err) {
+            me_ir.dnit(?m);
+            intern.dnit(?itn);
+            ret 1;
+        }
+        val fn:  *me_ir.Function = ?m.functions[rf.ok];
+        var bld: builder.Builder = builder.init(?m);
+        builder.set_function(?bld, fn);
+
+        val made_lp: res[builder.CountedLoop, fail.Fail] = builder.counted_loop_add(?bld, i64t);
+        if (sel made_lp.err) {
+            me_ir.dnit(?m);
+            intern.dnit(?itn);
+            ret 1;
+        }
+        var lp: builder.CountedLoop = made_lp.ok;
+
+        val rl: res[value.Value, fail.Fail] = builder.emit_load(?bld, g, i64t);
+        if (sel rl.err) {
+            me_ir.dnit(?m);
+            intern.dnit(?itn);
+            ret 1;
+        }
+        val ld:  value.Value = rl.ok;
+        var dst: value.Value = g;
+        if (pass == 1) { dst = other; }
+        val r_753: err[fail.Fail] = builder.emit_store(?bld, lp.iv, dst);
+        if (sel r_753.err) {
+            me_ir.dnit(?m);
+            intern.dnit(?itn);
+            ret 1;
+        }
+        val closed_lp: err[fail.Fail] = builder.counted_loop_close(?bld, ?lp, i64t);
+        if (sel closed_lp.err) {
+            me_ir.dnit(?m);
+            intern.dnit(?itn);
+            ret 1;
+        }
+
+        val r_756: res[bool, fail.Fail] = run(?m, ?tgt);
+        if (sel r_756.err) { code = 1; }
+
+        if (pass == 0) {
+            if (!block_holds(fn, lp.body, ld.data.instr)) { code = 1; }
+            if (block_holds(fn, lp.entry, ld.data.instr)) { code = 1; }
+        }
+        or {
+            if (!block_holds(fn, lp.entry, ld.data.instr)) { code = 1; }
+            if (block_holds(fn, lp.body, ld.data.instr))   { code = 1; }
+        }
+
+        me_ir.dnit(?m);
+        pass = pass + 1;
+    }
+
+    intern.dnit(?itn);
+    ret code;
+}
+
+test run__a_call_blocks_a_load_hoist {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) {
+        intern.dnit(?itn);
+        ret 1;
+    }
+    var m: me_ir.Module = rm.ok;
+
+    val rt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel rt.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId                 = rt.ok;
+    val rp:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val ptrt: ir_type.IrTypeId                 = rp.ok;
+    val rv:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_void(?m.types);
+    if (sel rv.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val voidt: ir_type.IrTypeId = rv.ok;
+
+    var g: value.Value;
+    if (mk_global(?m, ?itn, "g_called", i64t, ptrt, ?g) != 0) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+
+    val rcal: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, me_ir.FN_FLAG_EXTERN);
+    if (sel rcal.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val callee: value.Value = value.fn(rcal.ok, ptrt);
+
+    val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val fn:  *me_ir.Function = ?m.functions[rf.ok];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val made_lp: res[builder.CountedLoop, fail.Fail] = builder.counted_loop_add(?bld, i64t);
+    if (sel made_lp.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    var lp: builder.CountedLoop = made_lp.ok;
+
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?bld, g, i64t);
+    if (sel rl.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val ld:   value.Value                 = rl.ok;
+    val rmul: res[value.Value, fail.Fail] = builder.emit_mul(?bld, value.param(0, i64t), value.const_int(3, i64t));
+    if (sel rmul.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val prod:  value.Value                 = rmul.ok;
+    val r_820: res[value.Value, fail.Fail] = builder.emit_call(?bld, callee, nil, 0, voidt);
+    if (sel r_820.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val closed_lp: err[fail.Fail] = builder.counted_loop_close(?bld, ?lp, i64t);
+    if (sel closed_lp.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+
+    var code:  i32                  = 0;
+    val r_824: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel r_824.err) { code = 1; }
+
+    if (!block_holds(fn, lp.body, ld.data.instr))    { code = 1; }
+    if (block_holds(fn, lp.entry, ld.data.instr))    { code = 1; }
+    if (!block_holds(fn, lp.entry, prod.data.instr)) { code = 1; }
+
+    me_ir.dnit(?m);
+    intern.dnit(?itn);
+    ret code;
+}
+
+test run__a_divide_is_not_speculated {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    val rt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel rt.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId = rt.ok;
+
+    val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn:  *me_ir.Function = ?m.functions[rf.ok];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val made_lp: res[builder.CountedLoop, fail.Fail] = builder.counted_loop_add(?bld, i64t);
+    if (sel made_lp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    var lp: builder.CountedLoop = made_lp.ok;
+
+    val p0: value.Value                 = value.param(0, i64t);
+    val p1: value.Value                 = value.param(1, i64t);
+    val rd: res[value.Value, fail.Fail] = builder.emit_div_s(?bld, p0, p1);
+    if (sel rd.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val quo: value.Value                 = rd.ok;
+    val rr2: res[value.Value, fail.Fail] = builder.emit_rem_s(?bld, p0, p1);
+    if (sel rr2.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val rem:  value.Value                 = rr2.ok;
+    val rmul: res[value.Value, fail.Fail] = builder.emit_mul(?bld, p0, p1);
+    if (sel rmul.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val prod:      value.Value    = rmul.ok;
+    val closed_lp: err[fail.Fail] = builder.counted_loop_close(?bld, ?lp, i64t);
+    if (sel closed_lp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    var code:  i32                  = 0;
+    val r_875: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel r_875.err) { code = 1; }
+
+    if (!block_holds(fn, lp.body, quo.data.instr))   { code = 1; }
+    if (!block_holds(fn, lp.body, rem.data.instr))   { code = 1; }
+    if (!block_holds(fn, lp.entry, prod.data.instr)) { code = 1; }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+test run__an_unknown_pointer_load_is_not_speculated {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    val rt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel rt.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId                 = rt.ok;
+    val rp:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val ptrt: ir_type.IrTypeId = rp.ok;
+
+    val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn:  *me_ir.Function = ?m.functions[rf.ok];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val made_lp: res[builder.CountedLoop, fail.Fail] = builder.counted_loop_add(?bld, i64t);
+    if (sel made_lp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    var lp: builder.CountedLoop = made_lp.ok;
+
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?bld, value.param(1, ptrt), i64t);
+    if (sel rl.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val ld:   value.Value                 = rl.ok;
+    val rmul: res[value.Value, fail.Fail] = builder.emit_mul(?bld, value.param(0, i64t), value.const_int(5, i64t));
+    if (sel rmul.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val prod:      value.Value    = rmul.ok;
+    val closed_lp: err[fail.Fail] = builder.counted_loop_close(?bld, ?lp, i64t);
+    if (sel closed_lp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    var code:  i32                  = 0;
+    val r_923: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel r_923.err)                               { code = 1; }
+    if (!block_holds(fn, lp.body, ld.data.instr))    { code = 1; }
+    if (block_holds(fn, lp.entry, ld.data.instr))    { code = 1; }
+    if (!block_holds(fn, lp.entry, prod.data.instr)) { code = 1; }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+test run__splits_an_invariant_gep_prefix {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) {
+        intern.dnit(?itn);
+        ret 1;
+    }
+    var m: me_ir.Module = rm.ok;
+
+    val rt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel rt.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId                 = rt.ok;
+    val rp:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val ptrt: ir_type.IrTypeId                 = rp.ok;
+    val ra:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?m.types, i64t, 16);
+    if (sel ra.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val arrt: ir_type.IrTypeId = ra.ok;
+
+    var arr: value.Value;
+    if (mk_global(?m, ?itn, "g_arr", arrt, ptrt, ?arr) != 0) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+
+    val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val fn:  *me_ir.Function = ?m.functions[rf.ok];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val made_lp: res[builder.CountedLoop, fail.Fail] = builder.counted_loop_add(?bld, i64t);
+    if (sel made_lp.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    var lp: builder.CountedLoop = made_lp.ok;
+
+    var ix: [2]value.Value;
+    ix[0] = value.const_int(0, i64t);
+    ix[1] = lp.iv;
+    val rg: res[value.Value, fail.Fail] = builder.emit_gep(?bld, arr, arrt, ?ix[0], 2);
+    if (sel rg.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val gp:    value.Value    = rg.ok;
+    val r_974: err[fail.Fail] = builder.emit_store(?bld, lp.iv, gp);
+    if (sel r_974.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val closed_lp: err[fail.Fail] = builder.counted_loop_close(?bld, ?lp, i64t);
+    if (sel closed_lp.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+
+    var code:  i32                  = 0;
+    val r_978: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel r_978.err) { code = 1; }
+
+    if (!block_holds(fn, lp.body, gp.data.instr)) { code = 1; }
+    or {
+        val g: *ir_instruction.Instruction = ?fn.instrs[gp.data.instr::u32];
+        if (g.operand_count != 2) { code = 1; }
+        or {
+            if (!ir_type.same(g.aux_ty, i64t))         { code = 1; }
+            if (!value.is_same(g.operands[1], lp.iv))  { code = 1; }
+            if (g.operands[0].kind != value.VAL_INSTR) { code = 1; }
+            or {
+                val pid: ir_id.InstructionId = g.operands[0].data.instr;
+                if (!block_holds(fn, lp.entry, pid)) { code = 1; }
+                val p: *ir_instruction.Instruction = ?fn.instrs[pid::u32];
+                if (p.kind != ir_instruction.OP_GEP) { code = 1; }
+                if (p.operand_count != 2)            { code = 1; }
+                or {
+                    if (!ir_type.same(p.aux_ty, arrt))             { code = 1; }
+                    if (p.operands[0].kind != value.VAL_GLOBAL)    { code = 1; }
+                    if (p.operands[1].kind != value.VAL_CONST_INT) { code = 1; }
+                    or {
+                        if (p.operands[1].data.int_lit != 0) { code = 1; }
+                    }
+                }
+            }
+        }
+    }
+
+    me_ir.dnit(?m);
+    intern.dnit(?itn);
+    ret code;
+}
+
+test run__an_absorbed_gep_is_not_hoisted {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) {
+        intern.dnit(?itn);
+        ret 1;
+    }
+    var m: me_ir.Module = rm.ok;
+
+    val rt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel rt.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId                 = rt.ok;
+    val rp:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val ptrt: ir_type.IrTypeId                 = rp.ok;
+    val ra:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?m.types, i64t, 16);
+    if (sel ra.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val arrt: ir_type.IrTypeId = ra.ok;
+
+    var g: value.Value;
+    if (mk_global(?m, ?itn, "g_absorb", arrt, ptrt, ?g) != 0) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+
+    val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val fn:  *me_ir.Function = ?m.functions[rf.ok];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val made_lp: res[builder.CountedLoop, fail.Fail] = builder.counted_loop_add(?bld, i64t);
+    if (sel made_lp.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    var lp: builder.CountedLoop = made_lp.ok;
+
+    val p1: value.Value = value.param(1, ptrt);
+    val k3: value.Value = value.const_int(3, i64t);
+    val k0: value.Value = value.const_int(0, i64t);
+
+    var ax: [2]value.Value;
+    ax[0] = k0;
+    ax[1] = k3;
+    val rg1: res[value.Value, fail.Fail] = builder.emit_gep(?bld, p1, arrt, ?ax[0], 2);
+    if (sel rg1.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val absorbed: value.Value = rg1.ok;
+
+    var bx: [2]value.Value;
+    bx[0] = k0;
+    bx[1] = k3;
+    val rg2: res[value.Value, fail.Fail] = builder.emit_gep(?bld, g, arrt, ?bx[0], 2);
+    if (sel rg2.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val symbased: value.Value = rg2.ok;
+
+    var cx: [2]value.Value;
+    cx[0] = k0;
+    cx[1] = value.param(0, i64t);
+    val rg3: res[value.Value, fail.Fail] = builder.emit_gep(?bld, p1, arrt, ?cx[0], 2);
+    if (sel rg3.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val scaled: value.Value = rg3.ok;
+
+    val r_1067: err[fail.Fail] = builder.emit_store(?bld, lp.iv, absorbed);
+    if (sel r_1067.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val r_1068: err[fail.Fail] = builder.emit_store(?bld, lp.iv, symbased);
+    if (sel r_1068.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val r_1069: err[fail.Fail] = builder.emit_store(?bld, lp.iv, scaled);
+    if (sel r_1069.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+    val closed_lp: err[fail.Fail] = builder.counted_loop_close(?bld, ?lp, i64t);
+    if (sel closed_lp.err) {
+        me_ir.dnit(?m);
+        intern.dnit(?itn);
+        ret 1;
+    }
+
+    var code:   i32                  = 0;
+    val r_1073: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel r_1073.err) { code = 1; }
+
+    if (!block_holds(fn, lp.body, absorbed.data.instr))  { code = 1; }
+    if (block_holds(fn, lp.entry, absorbed.data.instr))  { code = 1; }
+    if (!block_holds(fn, lp.entry, symbased.data.instr)) { code = 1; }
+    if (!block_holds(fn, lp.entry, scaled.data.instr))   { code = 1; }
+
+    me_ir.dnit(?m);
+    intern.dnit(?itn);
+    ret code;
+}
+
+test run__hoists_a_dependent_chain_in_one_pass {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    val rt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel rt.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId = rt.ok;
+
+    val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn:  *me_ir.Function = ?m.functions[rf.ok];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val made_lp: res[builder.CountedLoop, fail.Fail] = builder.counted_loop_add(?bld, i64t);
+    if (sel made_lp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    var lp: builder.CountedLoop = made_lp.ok;
+
+    val p0: value.Value                 = value.param(0, i64t);
+    val ra: res[value.Value, fail.Fail] = builder.emit_add(?bld, p0, value.const_int(1, i64t));
+    if (sel ra.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val a:  value.Value                 = ra.ok;
+    val rb: res[value.Value, fail.Fail] = builder.emit_mul(?bld, a, a);
+    if (sel rb.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val b:  value.Value                 = rb.ok;
+    val rc: res[value.Value, fail.Fail] = builder.emit_add(?bld, b, lp.iv);
+    if (sel rc.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val c:         value.Value    = rc.ok;
+    val closed_lp: err[fail.Fail] = builder.counted_loop_close(?bld, ?lp, i64t);
+    if (sel closed_lp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    var code:   i32                  = 0;
+    val r_1124: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel r_1124.err) { code = 1; }
+
+    if (!block_holds(fn, lp.entry, a.data.instr)) { code = 1; }
+    if (!block_holds(fn, lp.entry, b.data.instr)) { code = 1; }
+    if (!block_holds(fn, lp.body, c.data.instr))  { code = 1; }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+test run__declines_a_loop_without_a_preheader {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    val rt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel rt.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId = rt.ok;
+
+    val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn:  *me_ir.Function = ?m.functions[rf.ok];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    var bids: [5]ir_id.BlockId;
+    var i:    u32 = 0;
+    for (i < 5) {
+        val rbk: res[ir_id.BlockId, fail.Fail] = builder.new_block(?bld);
+        if (sel rbk.err) {
+            me_ir.dnit(?m);
+            ret 1;
+        }
+        bids[i] = rbk.ok;
+        i       = i + 1;
+    }
+    val entry:  ir_id.BlockId = bids[0];
+    val arm:    ir_id.BlockId = bids[1];
+    val header: ir_id.BlockId = bids[2];
+    val body:   ir_id.BlockId = bids[3];
+    val exit:   ir_id.BlockId = bids[4];
+
+    val p0: value.Value = value.param(0, i64t);
+
+    builder.set_block(?bld, entry);
+    val rc0: res[value.Value, fail.Fail] = builder.emit_cmp_lt_s(?bld, p0, value.const_int(1, i64t));
+    if (sel rc0.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val r_1175: err[fail.Fail] = builder.emit_cbr(?bld, rc0.ok, arm, header);
+    if (sel r_1175.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    builder.set_block(?bld, arm);
+    val r_1178: err[fail.Fail] = builder.emit_br(?bld, header);
+    if (sel r_1178.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    builder.set_block(?bld, header);
+    val rphi: res[value.Value, fail.Fail] = builder.emit_phi(?bld, i64t);
+    if (sel rphi.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val iv:  value.Value                 = rphi.ok;
+    val rc1: res[value.Value, fail.Fail] = builder.emit_cmp_lt_s(?bld, iv, p0);
+    if (sel rc1.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val r_1186: err[fail.Fail] = builder.emit_cbr(?bld, rc1.ok, body, exit);
+    if (sel r_1186.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    builder.set_block(?bld, body);
+    val rmul: res[value.Value, fail.Fail] = builder.emit_mul(?bld, p0, value.const_int(7, i64t));
+    if (sel rmul.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val prod: value.Value                 = rmul.ok;
+    val ru:   res[value.Value, fail.Fail] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
+    if (sel ru.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val upd:    value.Value    = ru.ok;
+    val r_1195: err[fail.Fail] = builder.emit_br(?bld, header);
+    if (sel r_1195.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    val z:      value.Value    = value.const_int(0, i64t);
+    val r_1198: err[fail.Fail] = builder.phi_add_incoming(?bld, iv, entry, z);
+    if (sel r_1198.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val r_1199: err[fail.Fail] = builder.phi_add_incoming(?bld, iv, arm, z);
+    if (sel r_1199.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val r_1200: err[fail.Fail] = builder.phi_add_incoming(?bld, iv, body, upd);
+    if (sel r_1200.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    val made_lp_pre2: res[builder.CountedLoop, fail.Fail] = builder.counted_loop_add(?bld, i64t);
+    if (sel made_lp_pre2.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    var lp_pre2: builder.CountedLoop         = made_lp_pre2.ok;
+    val rm2:     res[value.Value, fail.Fail] = builder.emit_mul(?bld, p0, value.const_int(9, i64t));
+    if (sel rm2.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val prod2:          value.Value    = rm2.ok;
+    val closed_lp_pre2: err[fail.Fail] = builder.counted_loop_close(?bld, ?lp_pre2, i64t);
+    if (sel closed_lp_pre2.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    builder.set_block(?bld, exit);
+    val r_1211: err[fail.Fail] = builder.emit_br(?bld, lp_pre2.entry);
+    if (sel r_1211.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    var code: i32                  = 0;
+    val rr:   res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rr.err) { code = 1; }
+    or (sel rr.ok) {
+        if (!rr.ok) { code = 1; }
+    }
+    if (!block_holds(fn, body, prod.data.instr))           { code = 1; }
+    if (!block_holds(fn, lp_pre2.entry, prod2.data.instr)) { code = 1; }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+# the fail-at-N fixture: a loop whose body loads an invariant global
+# (hoisted), doubles the induction variable (kept, so the list is already
+# compacting when the next allocation comes), adds them and stores through a
+# gep with an invariant prefix (split, which allocates)
+#[testing]
+fun probe_build(a: *me_testing.Attempt, m: *me_ir.Module) i32 {
+    var itn: intern.Interner = intern.init(a.context::*A.Allocator);
+    fin { intern.dnit(?itn); }
+    val rt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel rt.err) { ret 1; }
+    val i64t: ir_type.IrTypeId                 = rt.ok;
+    val rp:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) { ret 2; }
+    val ptrt: ir_type.IrTypeId                 = rp.ok;
+    val ra:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?m.types, i64t, 16);
+    if (sel ra.err) { ret 3; }
+    val arrt: ir_type.IrTypeId = ra.ok;
+    var g:    value.Value;
+    if (mk_global(m, ?itn, "g_bound", i64t, ptrt, ?g) != 0) { ret 4; }
+    var arr: value.Value;
+    if (mk_global(m, ?itn, "g_arr", arrt, ptrt, ?arr) != 0) { ret 5; }
+    val rf: res[u32, fail.Fail] = me_ir.function_add(m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) { ret 6; }
+    var bld: builder.Builder = builder.init(m);
+    builder.set_function(?bld, ?m.functions[rf.ok]);
+    val made_lp: res[builder.CountedLoop, fail.Fail] = builder.counted_loop_add(?bld, i64t);
+    if (sel made_lp.err) { ret 7; }
+    var lp: builder.CountedLoop         = made_lp.ok;
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?bld, g, i64t);
+    if (sel rl.err) { ret 8; }
+    val rk: res[value.Value, fail.Fail] = builder.emit_mul(?bld, lp.iv, value.const_int(2, i64t));
+    if (sel rk.err) { ret 8; }
+    val rs: res[value.Value, fail.Fail] = builder.emit_add(?bld, rk.ok, rl.ok);
+    if (sel rs.err) { ret 9; }
+    var ix: [2]value.Value;
+    ix[0] = value.const_int(0, i64t);
+    ix[1] = lp.iv;
+    val rg: res[value.Value, fail.Fail] = builder.emit_gep(?bld, arr, arrt, ?ix[0], 2);
+    if (sel rg.err) { ret 10; }
+    val r_store: err[fail.Fail] = builder.emit_store(?bld, rs.ok, rg.ok);
+    if (sel r_store.err) { ret 11; }
+    val closed_lp: err[fail.Fail] = builder.counted_loop_close(?bld, ?lp, i64t);
+    if (sel closed_lp.err) { ret 12; }
+    ret 0;
+}
+
+#[testing]
+fun probe_transform(a: *me_testing.Attempt, m: *me_ir.Module, workspace: *scratch.Workspace) err[fail.Fail] {
+    var ctx: pass.Context         = pass.context(m, a.target, workspace);
+    val r:   res[bool, fail.Fail] = pass.run(?PASS, ?ctx);
+    if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the loop analysis and the loop order are scratch and precede the hoist; the
+# hoist grows the preheader and emits prefix geps from the module one
+# instruction at a time, so a refusal there leaves some invariant instructions
+# hoisted and the rest in place, every block listing each instruction once
+#[testing]
+fun probe_contract(a: *me_testing.Attempt, m: *me_ir.Module, ordinal: usize) bool {
+    if (equal.content_equal(m, a.control)) { ret true; }
+    ret me_testing.listed(m) >= me_testing.listed(a.control) && me_testing.verifies(m, true);
+}
+
+test pass__refusal_at_every_ordinal_leaves_the_input_or_a_consistent_partial_hoist {
+    var owner: A.Allocator;
+    val made:  err[A.Error] = page.make(?owner);
+    if (sel made.err) { ret 1; }
+    var tgt: resolved.Target    = resolved.described_named("x86_64");
+    var a:   me_testing.Attempt = me_testing.Attempt{build: probe_build, transform: probe_transform,
+        contract: probe_contract, target: ?tgt, control: nil, context: (?owner)::ptr};
+    var control: me_ir.Module;
+    if (me_testing.control(?a, ?owner, ?control) != 0) { ret 3; }
+    fin { me_ir.dnit(?control); }
+    ret me_testing.walk(?a);
+}
