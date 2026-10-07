@@ -52,10 +52,8 @@ after the code
 ## fun resolve_native_unwind
 
 ```mach
-pub fun resolve_native_unwind(s: *session.Session, plan: *UnwindPlan, modules: *target_of.ObjectImage,
-placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *target_of.ObjectImage,
-sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState, local_got: *LocalGotPlan,
-format: *target_of.OfVTable, arch: *isa.IsaVTable, image_base: u64, atoms: *AtomPlan, count: *u32) res[*target_of.NativeUnwind, fail.Fail];
+pub fun resolve_native_unwind(s: *session.Session, plan: *UnwindPlan, rs: *Resolution, local_got: *LocalGotPlan,
+count: *u32) res[*target_of.NativeUnwind, fail.Fail];
 ```
 
 the functions the foreign unwind indexes describe, at their final addresses,

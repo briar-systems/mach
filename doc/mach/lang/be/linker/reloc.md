@@ -15,23 +15,13 @@ pub rec LocalGotPlan;
 ## fun patch_relocations
 
 ```mach
-pub fun patch_relocations(s: *session.Session, out_img: *target_of.ObjectImage,
-modules: *target_of.ObjectImage, module_count: u32,
-placements: *Placement, sec_base: *u32, merged_to_out: *u32,
-sym_locs: *map.Map[intern.StrId, SymbolLoc],
-dyn: *DynState, local_got: *LocalGotPlan,
-strm: *StrMerge, format: *target_of.OfVTable,
-arch: *isa.IsaVTable,
-image_base: u64, atoms: *AtomPlan, thunks: *ThunkPlan) err[fail.Fail];
+pub fun patch_relocations(s: *session.Session, rs: *Resolution, local_got: *LocalGotPlan, thunks: *ThunkPlan) err[fail.Fail];
 ```
 
 ## fun relocation_target_vaddr
 
 ```mach
-pub fun relocation_target_vaddr(s: *session.Session, modules: *target_of.ObjectImage, m: u32, ri: u32,
-placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *target_of.ObjectImage,
-sym_locs: *map.Map[intern.StrId, SymbolLoc], format: *target_of.OfVTable, arch: *isa.IsaVTable,
-image_base: u64, atoms: *AtomPlan) res[opt[u64], fail.Fail];
+pub fun relocation_target_vaddr(s: *session.Session, rs: *Resolution, m: u32, ri: u32) res[opt[u64], fail.Fail];
 ```
 
 where relocation `ri` of module `m` points once the layout is final: its
@@ -41,10 +31,7 @@ defines no such symbol
 ## fun personality_slot
 
 ```mach
-pub fun personality_slot(s: *session.Session, modules: *target_of.ObjectImage, m: u32, ri: u32,
-placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *target_of.ObjectImage,
-sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState, local_got: *LocalGotPlan,
-format: *target_of.OfVTable, arch: *isa.IsaVTable, image_base: u64, atoms: *AtomPlan) res[target_of.UnwindPersonality, fail.Fail];
+pub fun personality_slot(s: *session.Session, rs: *Resolution, local_got: *LocalGotPlan, m: u32, ri: u32) res[target_of.UnwindPersonality, fail.Fail];
 ```
 
 the pointer slot relocation `ri` of module `m` reaches a personality through:
