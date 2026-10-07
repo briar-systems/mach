@@ -36,17 +36,17 @@ pub fun set_jal20(word: u32, delta: i64) u32;
 
 the j-type immediate: imm[20] at 31, imm[10:1] at 30:21, imm[11] at 20, imm[19:12] at 19:12
 
-## fun resolve_riscv_pcrel_pairs
+## fun resolve_pcrel_pairs
 
 ```mach
-pub fun resolve_riscv_pcrel_pairs(alloc: *A.Allocator,
+pub fun resolve_pcrel_pairs(alloc: *A.Allocator,
 img: *target_of.ObjectImage) err[fail.Fail];
 ```
 
-## fun resolve_riscv_reloc_operand
+## fun resolve_reloc_operand
 
 ```mach
-pub fun resolve_riscv_reloc_operand(img: *target_of.ObjectImage,
+pub fun resolve_reloc_operand(img: *target_of.ObjectImage,
 reloc_index: u32) res[target_of.RelocOperand, fail.Fail];
 ```
 
