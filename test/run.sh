@@ -25,7 +25,7 @@
 #                  riscv64zfh-linux and riscv32 under qemu-user when this host cannot run them natively
 #                  (a missing emulator is announced and its target is only built)
 #   --link         run the link cases (test/link/cases) instead of the corpus
-#   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
+#   --dwarf        build every case with -d and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 #   --asm          on an x86_64 ELF column, reassemble every case's and every std module's --emit-asm
 #                  listing at O0 and O2 with GNU as and require the same .text bytes as mach's own object
 #   --incremental  warm rebuilds of this compiler and of a manifest fixture match clean builds
@@ -314,7 +314,7 @@ art() { echo "$1" | tr / _; }
 manifest() {
     shape=$2
     echo '[project]'; echo 'id = "corpus"'; echo 'version = "0.0.0"'; echo 'mach = ">=5"'; echo 'src = "src"'
-    echo 'out = "o/{target.name}/{profile.name}"'; echo
+    echo 'work = "o/{target.name}/{profile.name}"'; echo
     names=
     printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry q env ext; do
         [ -n "$name" ] && [ "$entry" = "$shape" ] || continue
@@ -327,31 +327,31 @@ manifest() {
     done
     for p in o0 o2 g g2; do
         echo "[profile.$p]"
-        case $p in o0) echo 'opt = 0'; echo 'debug = false'; echo 'default = true' ;;
-                   o2) echo 'opt = 2'; echo 'debug = false' ;;
-                   g)  echo 'opt = 0'; echo 'debug = true' ;;
-                   g2) echo 'opt = 2'; echo 'debug = true' ;; esac
-        echo 'simd = "scalarize"'; echo 'vectorize = true'; echo 'float_reassoc = false'; echo
+        case $p in o0) echo 'optimize = false'; echo 'debug = false'; echo 'default = true' ;;
+                   o2) echo 'optimize = true'; echo 'debug = false' ;;
+                   g)  echo 'optimize = false'; echo 'debug = true' ;;
+                   g2) echo 'optimize = true'; echo 'debug = true' ;; esac
+        echo 'simd = "scalarize"'; echo
     done
     for c in $cases; do
         a=$(art "$c")
         if [ "$shape" = hosted ]; then
             echo "[artifact.$a]"; echo 'kind = "bin"'; echo "entry = \"entry/$a.mach\""
-            echo "out = \"{project.out}/bin/$a\""
+            echo "out = \"{project.work}/bin/$a\""
             echo "targets = [$(printf '%s\n' "$targets_all" | awk '$7 == "hosted" { printf "%s\"%s\"", (n++ ? ", " : ""), $1 }')]"
             echo 'link = []'; echo 'need = []'; echo
         else
             # one artifact per kind, built for every direct target of that kind
             for kind in $(printf '%s\n' "$targets_all" | awk '$7 == "direct" && !s[$6]++ { print $6 }'); do
                 echo "[artifact.${a}_$kind]"; echo "kind = \"$kind\""; echo "entry = \"cases/$c.mach\""
-                if [ "$kind" = static ]; then echo "out = \"{project.out}/lib/$a.a\""; else echo "out = \"{project.out}/bin/$a\""; fi
+                if [ "$kind" = static ]; then echo "out = \"{project.work}/lib/$a.a\""; else echo "out = \"{project.work}/bin/$a\""; fi
                 echo "targets = [$(printf '%s\n' "$targets_all" | awk -v k="$kind" '$7 == "direct" && $6 == k { printf "%s\"%s\"", (n++ ? ", " : ""), $1 }')]"
                 echo 'link = []'; echo 'need = []'; echo
             done
             printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry q env ext; do
                 [ -n "$name" ] && [ "$entry" = direct ] && [ "$q" != - ] || continue
                 echo "[artifact.${a}_run_$name]"; echo 'kind = "bin"'; echo "entry = \"run/$name/$a.mach\""
-                echo "out = \"{project.out}/run/$a\""
+                echo "out = \"{project.work}/run/$a\""
                 echo "targets = [\"$name\"]"; echo 'link = []'; echo 'need = []'; echo
             done
         fi
@@ -538,7 +538,7 @@ run_case() {
         fi
     fi
 
-    # the -g build through the external verifier for its debug model
+    # the -d build through the external verifier for its debug model
     if [ "$dwarf" -eq 1 ] && { [ "$fmt" = elf ] || [ "$fmt" = macho ] || [ "$fmt" = coff ]; }; then
         if ! build "$t" g "$c"; then
             fail "$t $c build g: $(first_error "$out/log/$t.g.$(art "$c").log")"; return
@@ -556,9 +556,9 @@ run_case() {
         fi
         o=$(object "$t" g2 "$c")
         if ! spirv-val $(val_env "$t") "$o" >"$out/log/$t.g2.$(art "$c").verify" 2>&1; then
-            fail "$t $c -g spirv-val: $(head -n1 "$out/log/$t.g2.$(art "$c").verify")"; return
+            fail "$t $c -d spirv-val: $(head -n1 "$out/log/$t.g2.$(art "$c").verify")"; return
         fi
-        spirv-dis "$o" 2>/dev/null | grep -q ' OpLine ' || { fail "$t $c -g: the module carries no OpLine"; return; }
+        spirv-dis "$o" 2>/dev/null | grep -q ' OpLine ' || { fail "$t $c -d: the module carries no OpLine"; return; }
     fi
     if [ "$asm" -eq 1 ] && lists_asm "$t"; then
         for p in o0 o2; do
@@ -717,8 +717,8 @@ link_cell() {
             gbin=
             if [ "$case_gbuild" = yes ]; then
                 gbin=$dir/out/link/prog-g$exe
-                if ! (cd "$dir" && $buildcc "$case_goal" . --target "$build_target" --profile "$profile" $case_build_flags $goal_flags -g -o "out/link/prog-g$exe") >"$tmp/build-g.log" 2>&1; then
-                    fail "$label $case_goal -g: $(first_error "$tmp/build-g.log")"; rm -rf "$tmp"; return
+                if ! (cd "$dir" && $buildcc "$case_goal" . --target "$build_target" --profile "$profile" $case_build_flags $goal_flags -d -o "out/link/prog-g$exe") >"$tmp/build-g.log" 2>&1; then
+                    fail "$label $case_goal -d: $(first_error "$tmp/build-g.log")"; rm -rf "$tmp"; return
                 fi
             fi
             # a fixture-owned .so the case's own steps built has to be findable at run time
@@ -858,7 +858,7 @@ id = "inc"
 version = "1.0.0"
 mach = ">=5"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+work = "out/{target.name}/{profile.name}"
 
 [target.host]
 isa = "$host_isa"
@@ -867,16 +867,14 @@ abi = "$abi"
 
 [profile.debug]
 default = true
-opt = 0
+optimize = false
 debug = false
 simd = "scalarize"
-vectorize = false
-float_reassoc = false
 
 [artifact.inc]
 kind = "static"
 entry = "main.mach"
-out = "{project.out}/lib/inc"
+out = "{project.work}/lib/inc"
 targets = ["*"]
 link = []
 need = []
@@ -1035,20 +1033,20 @@ doc_cell() {
     if [ "$annot" = error ] && [ -z "$expect" ]; then
         echo "FAIL $label an error block names the diagnostic it expects: \`\`\`mach error <text>" >"$b/result"; return
     fi
-    kind=static; art_out={project.out}/lib/block.a
-    if grep -rqF '#[symbol("main")]' "$b/src"; then kind=bin; art_out={project.out}/bin/block; fi
+    kind=static; art_out={project.work}/lib/block.a
+    if grep -rqF '#[symbol("main")]' "$b/src"; then kind=bin; art_out={project.work}/bin/block; fi
     mkdir -p "$b/dep/std"
     cp -R "$docs_std/src" "$b/dep/std/src"
     cp "$docs_std/mach.toml" "$b/dep/std/"
     {
         echo '[project]'; echo 'id = "example"'; echo 'version = "0.0.0"'; echo 'src = "src"'
-        echo 'out = "o"'; echo "mach = \"^$docs_major.0\""; echo
+        echo 'work = "o"'; echo "mach = \"^$docs_major.0\""; echo
         echo "[target.$docs_target]"
         echo "isa = \"$(target_field "$docs_target" 2)\""
         echo "os  = \"$(target_field "$docs_target" 3)\""
         echo "abi = \"$(target_field "$docs_target" 4)\""; echo
-        echo '[profile.debug]'; echo 'opt = 0'; echo 'debug = false'; echo 'simd = "scalarize"'
-        echo 'vectorize = true'; echo 'float_reassoc = false'; echo
+        echo '[profile.debug]'; echo 'optimize = false'; echo 'debug = false'; echo 'simd = "scalarize"'
+        echo
         echo '[artifact.block]'; echo "kind = \"$kind\""; echo "entry = \"$entry\""
         echo "out = \"$art_out\""; echo "targets = [\"$docs_target\"]"; echo 'link = []'; echo 'need = []'; echo
         echo '[dep.std]'; echo 'path = "dep/std"'

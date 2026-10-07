@@ -25,27 +25,51 @@ use mach.lang.fail;
 use mach.lang.intern;
 use mach.lang.manifest;
 use ir_printer: mach.lang.me.ir.printer;
+use mach.lang.me.pass;
 use mach.lang.me.pipeline;
 use catalog_subsystem: mach.lang.target.catalog.subsystem;
 use mach.lang.wire;
 
+# a binary profile lever as the command line sets it
+pub def Lever: u8;
+
+# neither `--key` nor `--no-key` was given: the profile decides
+pub val LEVER_PROFILE: Lever = 0;
+# `--key`
+pub val LEVER_ON: Lever = 1;
+# `--no-key`
+pub val LEVER_OFF: Lever = 2;
+
 # the typed options of a build-shaped command
 # ---
 # selectors: the `-a`, `-t` and `-p` patterns and `--all`
+# work:      the `-w` work directory, nil when absent
+# optimize:  `--optimize` or `--no-optimize`
+# debug:     `--debug` or `--no-debug`
+# simd:      the `--simd` value, nil when absent
+# pass:      the `--pass` names, each added to the pass set
+# skip:      the `--skip` names, each left out of it
+# relax:     the `--relax` names, each permitted
+# unrelax:   the `--no-relax` names, each withdrawn
 # jobs:      the `--jobs` count, 0 when absent
 pub rec CliArgs {
     verbosity:    u8;
     quiet:        bool;
     selectors:    manifest.Selectors;
     output:       *u8;
+    work:         *u8;
     emit_asm:     bool;
     emit_ir:      bool;
     emit_ir_form: *u8;
     pie:          bool;
     subsystem:    *u8;
-    g:            bool;
-    opt_set:      bool;
-    opt_release:  bool;
+    optimize:     Lever;
+    debug:        Lever;
+    simd:         *u8;
+    pass:         Vector[str];
+    skip:         Vector[str];
+    relax:        Vector[str];
+    unrelax:      Vector[str];
     jobs:         u32;
     include_deps: bool;
     no_cache:     bool;
@@ -151,14 +175,19 @@ pub rec BuildRequest {
 
     goal: BuildGoal;
 
-    opt:            u8;
+    opt: u8;
+    # the optimization passes run above `opt`'s set and those left out of it
+    passes: pipeline.PassSet;
+    skips:  pipeline.PassSet;
+    relax:  pass.Relax;
+    # the command line changed a lever of the selected profile, so a build that
+    # publishes artifacts must say where: presentation only, no part of any hash
+    overrides:      bool;
     debug:          bool;
     pie:            bool;
     subsystem_flag: SubsystemFlag;
     subsystem:      catalog_subsystem.Subsystem;
     simd:           manifest.SimdMode;
-    vectorize:      bool;
-    float_reassoc:  bool;
     # the warning kinds the profile silences: presentation only, so no part of the request hash
     allow: diagnostic_kind.KindSet;
     jobs:  u32;
@@ -167,6 +196,9 @@ pub rec BuildRequest {
     ir_form:  ir_printer.IrForm;
     emit_asm: bool;
     out:      str;
+    # `-w`, the root manifest's work directory in place of its `[project].work`;
+    # "" for none
+    work: str;
 
     link_tokens: Vector[LinkToken];
     lib_dirs:    Vector[str];
@@ -193,14 +225,17 @@ pub fun defaults() BuildRequest {
     r.subsystem_flag   = SUBSYSTEM_FLAG_NONE;
     r.subsystem        = catalog_subsystem.CONSOLE;
     r.simd             = manifest.SIMD_SCALARIZE;
-    r.vectorize        = true;
-    r.float_reassoc    = false;
+    r.passes           = pipeline.set_empty();
+    r.skips            = pipeline.set_empty();
+    r.relax            = pass.RELAX_NONE;
+    r.overrides        = false;
     r.allow            = diagnostic_kind.set_empty();
     r.jobs             = 0;
     r.emit_ir          = false;
     r.ir_form          = ir_printer.IR_FORM_DEBUG;
     r.emit_asm         = false;
     r.out              = "";
+    r.work             = "";
     r.link_tokens.a    = nil;
     r.link_tokens.data = nil;
     r.link_tokens.len  = 0;
@@ -285,15 +320,11 @@ pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
     }
     val pf: manifest.ResolvedProfile = pr_r.ok;
 
-    if (cli.opt_set) {
-        if (cli.opt_release) { r.opt = pipeline.OPT_RELEASE; }
-    }
-    or (pf.opt == manifest.MOPT_RELEASE) {
-        r.opt = pipeline.OPT_RELEASE;
-    }
-
-    r.debug = cli.g || pf.debug;
-    r.pie   = cli.pie;
+    val checked: err[fail.Fail] = profiles_check(a, itn, m);
+    if (sel checked.err) { ret res[BuildRequest, fail.Fail].err{checked.err}; }
+    val levers: err[fail.Fail] = levers_compose(a, itn, ?pf, cli, ?r);
+    if (sel levers.err) { ret res[BuildRequest, fail.Fail].err{levers.err}; }
+    r.pie = cli.pie;
 
     if (cli.subsystem != nil) {
         val ss:   str                = cli.subsystem::str;
@@ -304,10 +335,7 @@ pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
         r.subsystem_flag = flag.some;
     }
 
-    r.simd          = pf.simd;
-    r.vectorize     = pf.vectorize;
-    r.float_reassoc = pf.float_reassoc;
-    r.allow         = pf.allow;
+    r.allow = pf.allow;
 
     r.jobs = workers(cli.jobs);
 
@@ -321,6 +349,7 @@ pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
     }
     r.emit_asm = cli.emit_asm;
     if (cli.output != nil) { r.out = cli.output::str; }
+    if (cli.work != nil)   { r.work = cli.work::str; }
 
     r.link_tokens = collections_vector.init[LinkToken](a);
     var ti: usize = 0;
@@ -347,6 +376,214 @@ pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
     r.no_cache     = cli.no_cache;
     r.object_cache = goal_caches(goal) && !cli.no_cache;
     ret res[BuildRequest, fail.Fail].ok{r};
+}
+
+# the levers of the selected profile `pf`, then the command line's over them,
+# into `r`: built-in defaults, then the profile, then the command line
+fun levers_compose(a: *A.Allocator, itn: *intern.Interner, pf: *manifest.ResolvedProfile, cli: *CliArgs, r: *BuildRequest) err[fail.Fail] {
+    if (pf.optimize) { r.opt = pipeline.OPT_RELEASE; }
+    r.debug = pf.debug;
+    r.simd  = pf.simd;
+    val passes: res[pipeline.PassSet, fail.Fail] = profile_passes(a, itn, pf.name, ?pf.pass, "pass");
+    if (sel passes.err) { ret err[fail.Fail].err{passes.err}; }
+    r.passes = passes.ok;
+    val skips: res[pipeline.PassSet, fail.Fail] = profile_passes(a, itn, pf.name, ?pf.skip, "skip");
+    if (sel skips.err) { ret err[fail.Fail].err{skips.err}; }
+    r.skips = skips.ok;
+    val relax: res[pass.Relax, fail.Fail] = profile_relax(a, itn, pf.name, ?pf.relax);
+    if (sel relax.err) { ret err[fail.Fail].err{relax.err}; }
+    r.relax = relax.ok;
+
+    val profiled: BuildRequest = @r;
+    if (cli.optimize == LEVER_ON)  { r.opt = pipeline.OPT_RELEASE; }
+    if (cli.optimize == LEVER_OFF) { r.opt = pipeline.OPT_DEBUG; }
+    if (cli.debug == LEVER_ON)     { r.debug = true; }
+    if (cli.debug == LEVER_OFF)    { r.debug = false; }
+    if (cli.simd != nil) {
+        val mode: opt[manifest.SimdMode] = manifest.simd_named(cli.simd::str);
+        if (sel mode.none) {
+            ret err[fail.Fail].err{fail.user(diagnostic_kind.CLI_FLAG_VALUE, "--simd expects \"scalarize\" or \"require\"")};
+        }
+        r.simd = mode.some;
+    }
+    var i: usize = 0;
+    for (i < cli.pass.len) {
+        val at: res[usize, fail.Fail] = cli_pass(a, cli.pass.data[i], "--pass", ?cli.skip, "--skip");
+        if (sel at.err) { ret err[fail.Fail].err{at.err}; }
+        pipeline.set_add(?r.passes, at.ok);
+        pipeline.set_remove(?r.skips, at.ok);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < cli.skip.len) {
+        val at: res[usize, fail.Fail] = cli_pass(a, cli.skip.data[i], "--skip", ?cli.pass, "--pass");
+        if (sel at.err) { ret err[fail.Fail].err{at.err}; }
+        pipeline.set_add(?r.skips, at.ok);
+        pipeline.set_remove(?r.passes, at.ok);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < cli.relax.len) {
+        val bit: res[pass.Relax, fail.Fail] = cli_relax(a, cli.relax.data[i], "--relax", ?cli.unrelax, "--no-relax");
+        if (sel bit.err) { ret err[fail.Fail].err{bit.err}; }
+        r.relax = r.relax | bit.ok;
+        i       = i + 1;
+    }
+    i = 0;
+    for (i < cli.unrelax.len) {
+        val bit: res[pass.Relax, fail.Fail] = cli_relax(a, cli.unrelax.data[i], "--no-relax", ?cli.relax, "--relax");
+        if (sel bit.err) { ret err[fail.Fail].err{bit.err}; }
+        r.relax = r.relax & ~bit.ok;
+        i       = i + 1;
+    }
+    r.overrides = r.opt != profiled.opt || r.debug != profiled.debug || r.simd != profiled.simd
+        || r.passes.bits != profiled.passes.bits || r.skips.bits != profiled.skips.bits || r.relax != profiled.relax;
+    ret err[fail.Fail].ok{};
+}
+
+# every profile's set keys name what their catalogs hold, so a profile is
+# refused where it is written whichever profile is selected
+fun profiles_check(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < m.profile_count) {
+        val pf: *manifest.ProfileDef = ?m.profiles[i];
+        i = i + 1;
+        val passes: res[pipeline.PassSet, fail.Fail] = profile_passes(a, itn, pf.name, ?pf.pass, "pass");
+        if (sel passes.err) { ret err[fail.Fail].err{passes.err}; }
+        val skips: res[pipeline.PassSet, fail.Fail] = profile_passes(a, itn, pf.name, ?pf.skip, "skip");
+        if (sel skips.err) { ret err[fail.Fail].err{skips.err}; }
+        val relax: res[pass.Relax, fail.Fail] = profile_relax(a, itn, pf.name, ?pf.relax);
+        if (sel relax.err) { ret err[fail.Fail].err{relax.err}; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the optimization passes a profile's `key` lists, each refused where it is
+# written when the schedule runs no such pass or runs it in every build
+fun profile_passes(a: *A.Allocator, itn: *intern.Interner, profile: intern.StrId, names: *manifest.NameList, key: str) res[pipeline.PassSet, fail.Fail] {
+    var set: pipeline.PassSet = pipeline.set_empty();
+    if (names.count == 0) { ret res[pipeline.PassSet, fail.Fail].ok{set}; }
+    val what: res[str, fail.Fail] = fail.format(a, "mach.toml: [profile.{}].{}", intern.text(itn, profile), key);
+    if (sel what.err) { ret res[pipeline.PassSet, fail.Fail].err{what.err}; }
+    var i: u32 = 0;
+    for (i < names.count) {
+        val name: str                   = intern.text(itn, names.items[i]);
+        val at:   res[usize, fail.Fail] = optimization_pass(a, name, what.ok);
+        if (sel at.err) { ret res[pipeline.PassSet, fail.Fail].err{fail.at(a, at.err, names.sites[i])}; }
+        pipeline.set_add(?set, at.ok);
+        i = i + 1;
+    }
+    ret res[pipeline.PassSet, fail.Fail].ok{set};
+}
+
+# the permissions a profile's `relax` lists, each refused where it is written
+# when no such permission exists
+fun profile_relax(a: *A.Allocator, itn: *intern.Interner, profile: intern.StrId, names: *manifest.NameList) res[pass.Relax, fail.Fail] {
+    var bits: pass.Relax = pass.RELAX_NONE;
+    if (names.count == 0) { ret res[pass.Relax, fail.Fail].ok{bits}; }
+    val what: res[str, fail.Fail] = fail.format(a, "mach.toml: [profile.{}].relax", intern.text(itn, profile));
+    if (sel what.err) { ret res[pass.Relax, fail.Fail].err{what.err}; }
+    var i: u32 = 0;
+    for (i < names.count) {
+        val bit: res[pass.Relax, fail.Fail] = relaxation(a, intern.text(itn, names.items[i]), what.ok);
+        if (sel bit.err) { ret res[pass.Relax, fail.Fail].err{fail.at(a, bit.err, names.sites[i])}; }
+        bits = bits | bit.ok;
+        i    = i + 1;
+    }
+    ret res[pass.Relax, fail.Fail].ok{bits};
+}
+
+# the index of the optimization pass `name`, which `what` names; a legalization
+# pass is refused, since every build runs it
+fun optimization_pass(a: *A.Allocator, name: str, what: str) res[usize, fail.Fail] {
+    val at: opt[usize] = pipeline.pass_named(name);
+    if (sel at.none) {
+        ret res[usize, fail.Fail].err{fail.formatted_user(a, diagnostic_kind.MANIFEST_INVALID_VALUE,
+            "{} names \"{}\", which is no pass; `mach info passes` lists them", what, name)};
+    }
+    if (pipeline.pass_at(at.some).class != pass.CLASS_OPTIMIZATION) {
+        ret res[usize, fail.Fail].err{fail.formatted_user(a, diagnostic_kind.MANIFEST_INVALID_VALUE,
+            "{} names \"{}\", a legalization pass, which every build runs and none can add or skip", what, name)};
+    }
+    ret res[usize, fail.Fail].ok{at.some};
+}
+
+# the permission `name`, which `what` names
+fun relaxation(a: *A.Allocator, name: str, what: str) res[pass.Relax, fail.Fail] {
+    val bit: opt[pass.Relax] = pass.relax_named(name);
+    if (sel bit.some) { ret res[pass.Relax, fail.Fail].ok{bit.some}; }
+    var names: str   = "";
+    var i:     usize = 0;
+    for (i < pass.relax_count()) {
+        var longer: res[str, fail.Fail];
+        if (i == 0)         { longer = fail.format(a, "\"{}\"", pass.relax_name_at(i)); }
+        or                  { longer = fail.format(a, "{}, \"{}\"", names, pass.relax_name_at(i)); }
+        if (sel longer.err) { ret res[pass.Relax, fail.Fail].err{longer.err}; }
+        names = longer.ok;
+        i     = i + 1;
+    }
+    ret res[pass.Relax, fail.Fail].err{fail.formatted_user(a, diagnostic_kind.MANIFEST_INVALID_VALUE,
+        "{} names \"{}\", which is no relaxation; the relaxations are {}", what, name, names)};
+}
+
+# the index of the pass a command-line set flag names; one the opposite flag
+# names too is refused
+fun cli_pass(a: *A.Allocator, name: str, flag: str, other: *Vector[str], other_flag: str) res[usize, fail.Fail] {
+    val clash: err[fail.Fail] = cli_unclashed(a, name, flag, other, other_flag);
+    if (sel clash.err) { ret res[usize, fail.Fail].err{clash.err}; }
+    val at: res[usize, fail.Fail] = optimization_pass(a, name, flag);
+    if (sel at.err) { ret res[usize, fail.Fail].err{retagged(at.err)}; }
+    ret at;
+}
+
+# the permission a command-line relax flag names; one the opposite flag names
+# too is refused
+fun cli_relax(a: *A.Allocator, name: str, flag: str, other: *Vector[str], other_flag: str) res[pass.Relax, fail.Fail] {
+    val clash: err[fail.Fail] = cli_unclashed(a, name, flag, other, other_flag);
+    if (sel clash.err) { ret res[pass.Relax, fail.Fail].err{clash.err}; }
+    val bit: res[pass.Relax, fail.Fail] = relaxation(a, name, flag);
+    if (sel bit.err) { ret res[pass.Relax, fail.Fail].err{retagged(bit.err)}; }
+    ret bit;
+}
+
+# a manifest-shaped refusal of a command-line value, reported as one
+fun retagged(f: fail.Fail) fail.Fail {
+    if (fail.kind_of(f) != diagnostic_kind.MANIFEST_INVALID_VALUE) { ret f; }
+    val text: opt[str] = fail.text(f);
+    if (sel text.none) { ret f; }
+    ret fail.user(diagnostic_kind.CLI_FLAG_VALUE, text.some);
+}
+
+fun cli_unclashed(a: *A.Allocator, name: str, flag: str, other: *Vector[str], other_flag: str) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < other.len) {
+        if (str_equals(other.data[i], name)) {
+            ret err[fail.Fail].err{fail.formatted_user(a, diagnostic_kind.CLI_FLAG_CONFLICT, "{} {} and {} {} cannot be combined", flag, name, other_flag, name)};
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# `work`, a `-w` value, in place of the root manifest `m`'s `[project].work`: a
+# canonical path inside the project root, taken as written
+pub fun work_apply(itn: *intern.Interner, work: str, m: *manifest.Manifest) err[fail.Fail] {
+    if (!manifest.is_project_path(work) || str_contains(work, "{")) {
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.CLI_OUTPUT_PATH, WORK_CONSTRAINT)};
+    }
+    val id: res[intern.StrId, A.Error] = intern.add(itn, work);
+    if (sel id.err) { ret err[fail.Fail].err{fail.refused(id.err)}; }
+    m.work_tmpl = id.ok;
+    ret err[fail.Fail].ok{};
+}
+
+# the rule `-w` keeps
+pub val WORK_CONSTRAINT: str = "-w must name a canonical path inside the project root: relative, with no . or .. component and no template";
+
+# `r`'s `-w` over the root manifest `m` it is built from, nothing when it names none
+pub fun request_work_apply(itn: *intern.Interner, r: *BuildRequest, m: *manifest.Manifest) err[fail.Fail] {
+    if (str_empty(r.work)) { ret err[fail.Fail].ok{}; }
+    ret work_apply(itn, r.work, m);
 }
 
 pub fun for_cell(base: *BuildRequest, owner: str, target: str, artifact: str,
@@ -381,11 +618,12 @@ fun write_semantic_fields(s: *wire.Sink, r: *BuildRequest) {
     put_text(s, r.artifact);
     write_goal(s, r.goal);
     wire.put_u8(s, r.opt);
+    wire.put_u64(s, r.passes.bits);
+    wire.put_u64(s, r.skips.bits);
+    wire.put_u32(s, r.relax);
     put_flag(s, r.debug);
     put_flag(s, r.pie);
     wire.put_u8(s, r.simd);
-    put_flag(s, r.vectorize);
-    put_flag(s, r.float_reassoc);
     put_flag(s, r.include_deps);
 }
 
@@ -704,6 +942,81 @@ test semantic_hash__omits_nonsemantic_fields {
     val semantic_hash_r6: err[fail.Fail] = semantic_hash(?alloc, ?rb, ?d[0]);
     if (sel semantic_hash_r6.err) { ret 1; }
     if (dig_eq(?base[0], ?d[0]))  { ret 1; }
+    ret 0;
+}
+
+# command-line arguments that set no lever, their sets growable through `a`
+#[testing]
+fun t_cli_args(a: *A.Allocator) CliArgs {
+    var cli: CliArgs;
+    cli.pass    = collections_vector.init[str](a);
+    cli.skip    = collections_vector.init[str](a);
+    cli.relax   = collections_vector.init[str](a);
+    cli.unrelax = collections_vector.init[str](a);
+    ret cli;
+}
+
+# the profile's levers fill the request and each command-line lever wins over
+# its profile's, and only a change marks the request as overriding the profile
+test levers_compose__the_command_line_wins_over_the_profile {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    var itn:   intern.Interner = intern.init(?a);
+    var words: [4]str          = [4]str{"p", "inline", "vectorize", "float-reassoc"};
+    var ids:   [4]intern.StrId;
+    var i:     usize           = 0;
+    for (i < 4) {
+        val id: res[intern.StrId, A.Error] = intern.add(?itn, words[i]);
+        if (sel id.err) { ret 2; }
+        ids[i] = id.ok;
+        i      = i + 1;
+    }
+    var sites: [3]fail.Place;
+    var pf:    manifest.ResolvedProfile;
+    pf.name     = ids[0];
+    pf.optimize = false;
+    pf.debug    = false;
+    pf.simd     = manifest.SIMD_SCALARIZE;
+    pf.pass     = manifest.NameList{items: ?ids[1], sites: ?sites[0], count: 1};
+    pf.skip     = manifest.NameList{items: ?ids[2], sites: ?sites[1], count: 1};
+    pf.relax    = manifest.NameList{items: ?ids[3], sites: ?sites[2], count: 1};
+    val inline_at: opt[usize] = pipeline.pass_named("inline");
+    val vector_at: opt[usize] = pipeline.pass_named("vectorize");
+    if (sel inline_at.none) { ret 3; }
+    if (sel vector_at.none) { ret 3; }
+
+    var cli:         CliArgs        = t_cli_args(?a);
+    var r:           BuildRequest   = defaults();
+    val as_profiled: err[fail.Fail] = levers_compose(?a, ?itn, ?pf, ?cli, ?r);
+    if (sel as_profiled.err)                                                                       { ret 4; }
+    if (r.opt != pipeline.OPT_DEBUG || r.overrides || r.relax != pass.RELAX_FLOAT_REASSOC)         { ret 5; }
+    if (!pipeline.set_has(r.passes, inline_at.some) || !pipeline.set_has(r.skips, vector_at.some)) { ret 6; }
+
+    cli.optimize = LEVER_ON;
+    cli.debug    = LEVER_ON;
+    collections_vector.push[str](?cli.skip, "inline");
+    collections_vector.push[str](?cli.unrelax, "float-reassoc");
+    r = defaults();
+    val overridden: err[fail.Fail] = levers_compose(?a, ?itn, ?pf, ?cli, ?r);
+    if (sel overridden.err)                                                                       { ret 7; }
+    if (r.opt != pipeline.OPT_RELEASE || !r.debug || !r.overrides || r.relax != pass.RELAX_NONE)  { ret 8; }
+    if (pipeline.set_has(r.passes, inline_at.some) || !pipeline.set_has(r.skips, inline_at.some)) { ret 9; }
+
+    var both: CliArgs = t_cli_args(?a);
+    collections_vector.push[str](?both.pass, "licm");
+    collections_vector.push[str](?both.skip, "licm");
+    r = defaults();
+    val clashed: err[fail.Fail] = levers_compose(?a, ?itn, ?pf, ?both, ?r);
+    if (!(sel clashed.err && fail.kind_of(clashed.err) == diagnostic_kind.CLI_FLAG_CONFLICT)) { ret 10; }
+
+    val legal: res[intern.StrId, A.Error] = intern.add(?itn, "vecsplit");
+    if (sel legal.err) { ret 11; }
+    ids[2] = legal.ok;
+    var plain: CliArgs = t_cli_args(?a);
+    r = defaults();
+    val refused: err[fail.Fail] = levers_compose(?a, ?itn, ?pf, ?plain, ?r);
+    if (!(sel refused.err && str_contains(fail.describe(refused.err), "[profile.p].skip names \"vecsplit\", a legalization pass"))) { ret 12; }
     ret 0;
 }
 

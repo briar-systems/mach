@@ -32,29 +32,13 @@ fwd mach.lang.manifest.model.site_of
 
 forwards [`mach.lang.manifest.model.site_of`](manifest/model.md#fun-site_of)
 
-## fwd mach.lang.manifest.model.MOpt
+## fwd mach.lang.manifest.model.NameList
 
 ```mach
-fwd mach.lang.manifest.model.MOpt
+fwd mach.lang.manifest.model.NameList
 ```
 
-forwards [`mach.lang.manifest.model.MOpt`](manifest/model.md#def-mopt)
-
-## fwd mach.lang.manifest.model.MOPT_DEBUG
-
-```mach
-fwd mach.lang.manifest.model.MOPT_DEBUG
-```
-
-forwards [`mach.lang.manifest.model.MOPT_DEBUG`](manifest/model.md#val-mopt_debug)
-
-## fwd mach.lang.manifest.model.MOPT_RELEASE
-
-```mach
-fwd mach.lang.manifest.model.MOPT_RELEASE
-```
-
-forwards [`mach.lang.manifest.model.MOPT_RELEASE`](manifest/model.md#val-mopt_release)
+forwards [`mach.lang.manifest.model.NameList`](manifest/model.md#rec-namelist)
 
 ## fwd mach.lang.manifest.model.SimdMode
 
@@ -79,6 +63,14 @@ fwd mach.lang.manifest.model.SIMD_REQUIRE
 ```
 
 forwards [`mach.lang.manifest.model.SIMD_REQUIRE`](manifest/model.md#val-simd_require)
+
+## fwd mach.lang.manifest.model.simd_named
+
+```mach
+fwd mach.lang.manifest.model.simd_named
+```
+
+forwards [`mach.lang.manifest.model.simd_named`](manifest/model.md#fun-simd_named)
 
 ## fwd mach.lang.manifest.model.TargetDef
 
@@ -224,13 +216,13 @@ fwd mach.lang.manifest.artifact.artifact_supports_target
 
 forwards [`mach.lang.manifest.artifact.artifact_supports_target`](manifest/artifact.md#fun-artifact_supports_target)
 
-## fwd mach.lang.manifest.project.expand_project_out
+## fwd mach.lang.manifest.project.expand_project_work
 
 ```mach
-fwd mach.lang.manifest.project.expand_project_out
+fwd mach.lang.manifest.project.expand_project_work
 ```
 
-forwards [`mach.lang.manifest.project.expand_project_out`](manifest/project.md#fun-expand_project_out)
+forwards [`mach.lang.manifest.project.expand_project_work`](manifest/project.md#fun-expand_project_work)
 
 ## fwd mach.lang.manifest.link.LinkRequirement
 

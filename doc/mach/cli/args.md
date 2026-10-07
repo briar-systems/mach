@@ -191,14 +191,6 @@ pub val SUBSYSTEM: FlagSpec = FlagSpec;
 
 `--subsystem <console|gui>`
 
-## val DEBUG_INFO
-
-```mach
-pub val DEBUG_INFO: FlagSpec = FlagSpec;
-```
-
-`-g`
-
 ## val EMIT_ASM
 
 ```mach
@@ -219,7 +211,7 @@ dump, `--emit-ir=<form>` selects a row of printer.IR_FORMS
 ## val CGEN_N
 
 ```mach
-pub val CGEN_N: usize = 5
+pub val CGEN_N: usize = 4
 ```
 
 row count of CGEN
@@ -232,37 +224,118 @@ pub val CGEN: [CGEN_N]*FlagSpec = [CGEN_N]*FlagSpec;
 
 the codegen options, consumed by build and test
 
-## val OPT_DEBUG
+## val OPTIMIZE
 
 ```mach
-pub val OPT_DEBUG: FlagSpec = FlagSpec;
+pub val OPTIMIZE: FlagSpec = FlagSpec;
 ```
 
-`-O0`
+`--optimize`, the profile's `optimize = true` for this invocation
 
-## val OPT_RELEASE
+## val NO_OPTIMIZE
 
 ```mach
-pub val OPT_RELEASE: FlagSpec = FlagSpec;
+pub val NO_OPTIMIZE: FlagSpec = FlagSpec;
 ```
 
-`-O2`
+`--no-optimize`, the profile's `optimize = false` for this invocation
 
-## val OPT_N
+## val DEBUG
 
 ```mach
-pub val OPT_N: usize = 2
+pub val DEBUG: FlagSpec = FlagSpec;
 ```
 
-row count of OPT
+`--debug`, the profile's `debug = true` for this invocation
 
-## val OPT
+## val NO_DEBUG
 
 ```mach
-pub val OPT: [OPT_N]*FlagSpec = [OPT_N]*FlagSpec;
+pub val NO_DEBUG: FlagSpec = FlagSpec;
 ```
 
-the pipeline overrides `-O0` and `-O2`, consumed by build and test
+`--no-debug`, the profile's `debug = false` for this invocation
+
+## val SIMD
+
+```mach
+pub val SIMD: FlagSpec = FlagSpec;
+```
+
+`--simd <mode>`, the profile's `simd` for this invocation
+
+## val PASS
+
+```mach
+pub val PASS: FlagSpec = FlagSpec;
+```
+
+`--pass <name>`, a member added to the profile's pass set
+
+## val SKIP
+
+```mach
+pub val SKIP: FlagSpec = FlagSpec;
+```
+
+`--skip <name>`, a member left out of it
+
+## val RELAX
+
+```mach
+pub val RELAX: FlagSpec = FlagSpec;
+```
+
+`--relax <name>`, a permission added to the profile's relax set
+
+## val NO_RELAX
+
+```mach
+pub val NO_RELAX: FlagSpec = FlagSpec;
+```
+
+`--no-relax <name>`, a permission withdrawn from it
+
+## val LEVERS_N
+
+```mach
+pub val LEVERS_N: usize = 11
+```
+
+row count of LEVERS
+
+## val LEVERS
+
+```mach
+pub val LEVERS: [LEVERS_N]*FlagSpec = [LEVERS_N]*FlagSpec;
+```
+
+the profile levers, each over the selected profile for this invocation only,
+consumed by build and test
+
+## val WORK
+
+```mach
+pub val WORK: FlagSpec = FlagSpec;
+```
+
+`-w <path>`, the work directory
+
+## val WORKDIR_N
+
+```mach
+pub val WORKDIR_N: usize = 1
+```
+
+row count of WORKDIR
+
+## val WORKDIR
+
+```mach
+pub val WORKDIR: [WORKDIR_N]*FlagSpec = [WORKDIR_N]*FlagSpec;
+```
+
+`-w`, consumed by build and test
 
 ## val EMIT
 
@@ -579,7 +652,7 @@ other: the canonical row it names
 ## val RELATIONS_N
 
 ```mach
-pub val RELATIONS_N: usize = 3
+pub val RELATIONS_N: usize = 5
 ```
 
 length of RELATIONS
@@ -1098,10 +1171,9 @@ pub fun build_cli_invocation(a: *A.Allocator, inv: *ParsedInvocation, argv: **u8
 ```
 
 the typed request.CliArgs of a build-shaped command: verbosity 0, 1, or 2 from `-v` and `-vv`,
-quiet, the CGEN flags, the selectors, `-o` as a raw argv pointer or nil, `--jobs` as a count or 0
-when absent, opt_set and
-opt_release from `-O0` and `-O2` with `-O0` winning when both occur. include_deps is false for
-the command to set, and link_tokens and lib_dirs are left empty for collect_link_inputs
+quiet, the CGEN flags, the selectors, `-o` and `-w` as raw argv pointers or nil, the LEVERS as
+given, `--jobs` as a count or 0 when absent. include_deps is false for the command to set, and
+link_tokens and lib_dirs are left empty for collect_link_inputs
 
 a: backs the selector patterns
 inv: the parsed invocation
