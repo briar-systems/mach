@@ -161,6 +161,32 @@ pub fun add_expr_id(a: *Ast, id_: ast_id.ExprId) res[u32, fail.Fail];
 pub fun add_type_id(a: *Ast, id_: ast_id.TypeId) res[u32, fail.Fail];
 ```
 
+## fun literal_bytes_reserve
+
+```mach
+pub fun literal_bytes_reserve(a: *Ast, n: usize) res[*u8, fail.Fail];
+```
+
+a table over storage the caller owns, for a test that builds nodes in place
+room for `n` more bytes at the end of the literal byte table, which literal_bytes_take
+then claims
+
+## fun literal_bytes_take
+
+```mach
+pub fun literal_bytes_take(a: *Ast, n: usize) ast_expr.ByteRange;
+```
+
+claims the first `n` reserved bytes as one literal's value
+
+## fun lit_str_value
+
+```mach
+pub fun lit_str_value(a: *Ast, e: *ast_expr.Expr) View;
+```
+
+the decoded bytes a string literal names
+
 ## rec AstMark
 
 ```mach

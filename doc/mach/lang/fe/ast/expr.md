@@ -306,13 +306,14 @@ pub val UN_DEREF:   UnOp = 4
 pub val LIT_SUFFIX_NONE: type.TypeKind = 0xFF
 ```
 
-## fun lit_str_content
+## rec ByteRange
 
 ```mach
-pub fun lit_str_content(e: *Expr) opt[lang_source.Span];
+pub rec ByteRange;
 ```
 
-the text between a string literal's quotes, read from its token; none for any other node
+a string literal: `tok` covers the quotes
+a run of bytes in the tree's literal byte table
 
 ## rec ExprBinary
 
