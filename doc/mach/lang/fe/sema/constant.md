@@ -30,6 +30,14 @@ pub fun bind(sc: *sema_context.SemaContext, did: ast_id.DeclId) err[fail.Fail];
 
 binds the module `val` `did` declares when its initializer is a compile-time constant
 
+## fun declared_at_top
+
+```mach
+pub fun declared_at_top(sc: *sema_context.SemaContext, did: ast_id.DeclId) bool;
+```
+
+whether `did` is one of the module's own declarations rather than one in a gated arm
+
 ## fun settle
 
 ```mach
