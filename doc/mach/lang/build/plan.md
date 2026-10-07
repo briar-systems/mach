@@ -186,12 +186,20 @@ pub fun check_plan_outputs(a: *A.Allocator, plans: *Vector[BuildPlan]) err[fail.
 ```
 
 refuse two plans of one selection, one per profile, that would write one
-file: a `[project].out` without `{profile.name}` puts every profile's
+file: a `[project].work` without `{profile.name}` puts every profile's
 outputs at the same paths
 
 a: owns the message
 plans: the plans, one per profile
 ret: ok; err naming the two cells and the path
+
+## fun under_dir
+
+```mach
+pub fun under_dir(path: str, dir: str) bool;
+```
+
+whether `path` lies under the directory `dir`
 
 ## fun replan_unit
 
