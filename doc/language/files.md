@@ -51,7 +51,7 @@ id = "myproj"
 version = "0.1.0"
 mach = "^5.3"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+work = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
 isa = "x86_64"
@@ -61,17 +61,15 @@ abi = "sysv64"
 [artifact.myproj]
 kind = "bin"
 entry = "main.mach"
-out = "{project.out}/bin/myproj{artifact.suffix}"
+out = "{project.work}/bin/myproj{artifact.suffix}"
 targets = ["*"]
 link = []
 need = []
 
 [profile.debug]
-opt = 0
+optimize = false
 debug = true
 simd = "scalarize"
-vectorize = false
-float_reassoc = false
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"

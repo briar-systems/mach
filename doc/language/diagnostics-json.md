@@ -133,7 +133,7 @@ the path it was read at, as it names a source file.
 A refusal raised later from the parsed manifest, while a build is laid out or
 its steps run, points at the entry that caused it the same way:
 
-- a path template that does not expand, at its value: `[project].out`, an
+- a path template that does not expand, at its value: `[project].work`, an
   artifact's `out`, a local link's `path`, and a step's `argv`, `env`, `in` and
   `out` entries
 - a step output under a directory the compiler owns, at the output

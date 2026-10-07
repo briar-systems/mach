@@ -274,6 +274,24 @@ pub fun builder_init(a: *A.Allocator, k: diagnostic_kind.Kind, file_id: lang_sou
 
 a builder for a diagnostic of kind `k`
 
+## fun builder_initf
+
+```mach
+pub fun builder_initf(a: *A.Allocator, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, fmt: str, args: ...) res[DiagnosticBuilder, fail.Fail];
+```
+
+a builder for a diagnostic of kind `k` whose message is `fmt` formatted with `args`; a
+format the allocator refuses is a failure, never a substitute message
+
+## fun format
+
+```mach
+pub fun format(a: *A.Allocator, fmt: str, args: ...) res[str, fail.Fail];
+```
+
+the text of a message, `fmt` formatted with `args` and owned by the caller: the one place
+a refused format becomes a failure
+
 ## fun builder_dnit
 
 ```mach
@@ -342,6 +360,14 @@ pub fun report(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_s
 ```
 
 a diagnostic of kind `k` with no attachments
+
+## fun reportf
+
+```mach
+pub fun reportf(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, fmt: str, args: ...) err[fail.Fail];
+```
+
+a diagnostic of kind `k` with no attachments, its message `fmt` formatted with `args`
 
 ## fun record
 
