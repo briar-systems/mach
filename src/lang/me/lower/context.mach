@@ -34,8 +34,9 @@ use mach.lang.float;
 use mach.lang.intern;
 use me_ir: mach.lang.me.ir;
 use mach.lang.me.ir.builder;
-use ir_id:   mach.lang.me.ir.id;
-use ir_type: mach.lang.me.ir.type;
+use ir_debug: mach.lang.me.ir.debug;
+use ir_id:    mach.lang.me.ir.id;
+use ir_type:  mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.me.lower.half;
 use mach.lang.me.lower.mangle;
@@ -122,6 +123,12 @@ pub rec LowerRequest {
     checks:          bool;
 }
 
+# a pointer debug type whose pointee waits for the module's other debug types
+rec DebugPointee {
+    pointer: ir_debug.TypeId;
+    pointee: type.TypeId;
+}
+
 rec LogicalTypePath {
     ty:       type.TypeId;
     previous: *LogicalTypePath;
@@ -161,6 +168,13 @@ pub rec LowerContext {
     fn_index:   u32;
     ret_type:   ir_type.IrTypeId;
     fn_ret_sem: type.TypeId;
+
+    # the module's debug types by the substituted source type each describes, and
+    # the pointers whose pointee is described once every other type is
+    debug_types:       map.Map[type.TypeId, ir_debug.TypeId];
+    debug_pointees:    *DebugPointee;
+    debug_pointee_len: u32;
+    debug_pointee_cap: u32;
 
     loops:    *LoopFrame;
     loop_len: u32;
@@ -449,6 +463,11 @@ pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *me_ir.Module) er
     lc.pack_len      = 0;
     lc.pack_ret_type = type.TYPE_NIL;
 
+    lc.debug_types       = map.init[type.TypeId, ir_debug.TypeId](s.alloc);
+    lc.debug_pointees    = nil;
+    lc.debug_pointee_len = 0;
+    lc.debug_pointee_cap = 0;
+
     ret err[fail.Fail].ok{};
 }
 
@@ -497,6 +516,14 @@ pub fun dnit_context(lc: *LowerContext) {
     lc.pack_types    = nil;
     lc.pack_len      = 0;
     lc.pack_ret_type = type.TYPE_NIL;
+
+    map.dnit[type.TypeId, ir_debug.TypeId](?lc.debug_types);
+    if (lc.debug_pointees != nil && lc.debug_pointee_cap > 0) {
+        A.deallocate[DebugPointee](lc.s.alloc, lc.debug_pointees, lc.debug_pointee_cap::usize);
+    }
+    lc.debug_pointees    = nil;
+    lc.debug_pointee_len = 0;
+    lc.debug_pointee_cap = 0;
 }
 
 # the interface of the module `origin`: the one the lowering module published, or an import's
@@ -994,6 +1021,187 @@ pub fun lower_type(lc: *LowerContext, tid: type.TypeId) res[ir_type.IrTypeId, fa
     }
 
     ret ir_type.intern_ptr(?lc.m.types);
+}
+
+# the debug type a debug record names for source type `tid`, as substituted for
+# the code being lowered; TYPE_NIL when this lowering keeps no debug information
+# or nothing describes the type
+pub fun debug_type_of(lc: *LowerContext, tid: type.TypeId) res[ir_debug.TypeId, fail.Fail] {
+    if (!lc.debug) { ret res[ir_debug.TypeId, fail.Fail].ok{ir_debug.TYPE_NIL}; }
+    val rtid: type.TypeId = type.strip_secret(?lc.s.types, tid);
+    if (type.is_nil(rtid) || type.is_error(rtid)) { ret res[ir_debug.TypeId, fail.Fail].ok{ir_debug.TYPE_NIL}; }
+    val found: opt[*ir_debug.TypeId] = map.get[type.TypeId, ir_debug.TypeId](?lc.debug_types, ?rtid);
+    if (sel found.some) { ret res[ir_debug.TypeId, fail.Fail].ok{@found.some}; }
+    val layout: res[ir_type.IrTypeId, fail.Fail] = lower_type(lc, rtid);
+    if (sel layout.err) { ret res[ir_debug.TypeId, fail.Fail].err{layout.err}; }
+    ret debug_type_add(lc, rtid, layout.ok);
+}
+
+# describes every pointee left waiting: one that holds by value an instance of
+# an expansive generic this module describes no value of stays untyped, since
+# such a generic has unboundedly many instances behind its pointers
+pub fun debug_types_finish(lc: *LowerContext) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < lc.debug_pointee_len) {
+        val waiting: DebugPointee         = lc.debug_pointees[i];
+        val bounded: res[bool, fail.Fail] = debug_pointee_bounded(lc, waiting.pointee);
+        if (sel bounded.err) { ret err[fail.Fail].err{bounded.err}; }
+        if (bounded.ok) {
+            val pointee: res[ir_debug.TypeId, fail.Fail] = debug_type_of(lc, waiting.pointee);
+            if (sel pointee.err) { ret err[fail.Fail].err{pointee.err}; }
+            lc.m.debug_types.types[ir_debug.index(waiting.pointer)].elem = pointee.ok;
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# whether every expansive instance `tid` holds by value is one this module describes
+fun debug_pointee_bounded(lc: *LowerContext, tid: type.TypeId) res[bool, fail.Fail] {
+    val base: type.TypeId     = type.strip_secret(?lc.s.types, tid);
+    val to:   opt[*type.Type] = type.get(?lc.s.types, base);
+    if (sel to.none) { ret res[bool, fail.Fail].ok{true}; }
+    val k: type.TypeKind = to.some.kind;
+    if (k == type.TYPE_ARRAY)                                                                      { ret debug_pointee_bounded(lc, to.some.data.array.base); }
+    if (k != type.TYPE_REC && k != type.TYPE_UNI && k != type.TYPE_TAG && k != type.TYPE_INSTANCE) { ret res[bool, fail.Fail].ok{true}; }
+    if (k == type.TYPE_INSTANCE) {
+        val described: opt[*ir_debug.TypeId] = map.get[type.TypeId, ir_debug.TypeId](?lc.debug_types, ?base);
+        if (sel described.some) { ret res[bool, fail.Fail].ok{true}; }
+        val unbounded: res[bool, fail.Fail] = expansive.instance_is(?lc.s.types, ?lc.s.type_facts, base);
+        if (sel unbounded.err) { ret unbounded; }
+        if (unbounded.ok)      { ret res[bool, fail.Fail].ok{false}; }
+        val fields: err[fail.Fail] = subst.ensure_fields(lc.s, base);
+        if (sel fields.err) { ret res[bool, fail.Fail].err{fields.err}; }
+    }
+    val n: u32 = type.field_count(?lc.s.types, base);
+    var i: u32 = 0;
+    for (i < n) {
+        val fe: opt[*type.FieldEntry] = type.field_at(?lc.s.types, base, i);
+        if (sel fe.some) {
+            val held: res[bool, fail.Fail] = debug_pointee_bounded(lc, fe.some.ty);
+            if (sel held.err) { ret held; }
+            if (!held.ok)     { ret held; }
+        }
+        i = i + 1;
+    }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# the debug type of source type `tid`, laid out as `layout`, which lower_type
+# gave it; what it holds by value is described from the parts of that layout
+fun debug_type_held(lc: *LowerContext, tid: type.TypeId, layout: ir_type.IrTypeId) res[ir_debug.TypeId, fail.Fail] {
+    val rtid: type.TypeId = type.strip_secret(?lc.s.types, tid);
+    if (type.is_nil(rtid) || type.is_error(rtid)) { ret res[ir_debug.TypeId, fail.Fail].ok{ir_debug.TYPE_NIL}; }
+    val found: opt[*ir_debug.TypeId] = map.get[type.TypeId, ir_debug.TypeId](?lc.debug_types, ?rtid);
+    if (sel found.some) { ret res[ir_debug.TypeId, fail.Fail].ok{@found.some}; }
+    ret debug_type_add(lc, rtid, layout);
+}
+
+fun debug_type_add(lc: *LowerContext, tid: type.TypeId, layout: ir_type.IrTypeId) res[ir_debug.TypeId, fail.Fail] {
+    val nil_type: res[ir_debug.TypeId, fail.Fail] = res[ir_debug.TypeId, fail.Fail].ok{ir_debug.TYPE_NIL};
+    val to:       opt[*type.Type]                 = type.get(?lc.s.types, tid);
+    if (sel to.none) { ret nil_type; }
+    val t: *type.Type    = to.some;
+    val k: type.TypeKind = t.kind;
+
+    val d: type.PrimDesc = type.prim_desc(k);
+    if (d.class != type.PRIM_CLASS_NONE) {
+        val named: res[intern.StrId, A.Error] = intern.add(?lc.s.interner, type.prim_name(k));
+        if (sel named.err) { ret res[ir_debug.TypeId, fail.Fail].err{fail.refused(named.err)}; }
+        var base: ir_debug.Type = ir_debug.blank(ir_debug.KIND_BASE, named.ok);
+        base.bits = d.bits;
+        if (d.class == type.PRIM_CLASS_FLOAT) { base.encoding = ir_debug.ENCODING_FLOAT; }
+        or (d.class == type.PRIM_CLASS_PTR) {
+            base.encoding = ir_debug.ENCODING_ADDRESS;
+            base.bits     = 0;
+        }
+        or (d.signed) { base.encoding = ir_debug.ENCODING_SIGNED; }
+        ret debug_type_record(lc, tid, base);
+    }
+
+    if (k == type.TYPE_POINTER) {
+        val made: res[ir_debug.TypeId, fail.Fail] = debug_type_record(lc, tid, ir_debug.blank(ir_debug.KIND_POINTER, intern.STR_NIL));
+        if (sel made.err) { ret made; }
+        val grown: err[A.Error] = growth.reserve[DebugPointee](lc.s.alloc, ?lc.debug_pointees, ?lc.debug_pointee_cap, lc.debug_pointee_len::usize + 1);
+        if (sel grown.err) { ret res[ir_debug.TypeId, fail.Fail].err{fail.refused(grown.err)}; }
+        lc.debug_pointees[lc.debug_pointee_len].pointer = made.ok;
+        lc.debug_pointees[lc.debug_pointee_len].pointee = t.data.pointer.base;
+        lc.debug_pointee_len                            = lc.debug_pointee_len + 1;
+        ret made;
+    }
+
+    if (k == type.TYPE_ARRAY) {
+        val count: u32                             = t.data.array.count;
+        val elem:  res[ir_debug.TypeId, fail.Fail] = debug_type_held(lc, t.data.array.base, ir_type.array_element(?lc.m.types, layout));
+        if (sel elem.err)             { ret elem; }
+        if (ir_debug.is_nil(elem.ok)) { ret elem; }
+        var array: ir_debug.Type = ir_debug.blank(ir_debug.KIND_ARRAY, intern.STR_NIL);
+        array.elem  = elem.ok;
+        array.count = count;
+        ret debug_type_record(lc, tid, array);
+    }
+
+    if (k == type.TYPE_VECTOR) {
+        val lanes: u32              = t.data.vector.lanes;
+        val lane:  opt[type.TypeId] = type.prim(?lc.s.types, t.data.vector.element);
+        if (sel lane.none) { ret nil_type; }
+        val elem: res[ir_debug.TypeId, fail.Fail] = debug_type_held(lc, lane.some, ir_type.IRT_NIL);
+        if (sel elem.err)             { ret elem; }
+        if (ir_debug.is_nil(elem.ok)) { ret elem; }
+        var vector: ir_debug.Type = ir_debug.blank(ir_debug.KIND_VECTOR, intern.STR_NIL);
+        vector.elem  = elem.ok;
+        vector.count = lanes;
+        ret debug_type_record(lc, tid, vector);
+    }
+
+    if (k != type.TYPE_REC && k != type.TYPE_UNI && k != type.TYPE_TAG && k != type.TYPE_INSTANCE) { ret nil_type; }
+    var kind: ir_debug.Kind = ir_debug.KIND_STRUCT;
+    if (type.is_tag(?lc.s.types, tid))   { kind = ir_debug.KIND_TAG; }
+    or (type.is_union(?lc.s.types, tid)) { kind = ir_debug.KIND_UNION; }
+    var name: intern.StrId = intern.STR_NIL;
+    if (k != type.TYPE_INSTANCE) { name = t.data.nominal.name; }
+    var aggregate: ir_debug.Type = ir_debug.blank(kind, name);
+    aggregate.layout = layout;
+    val made: res[ir_debug.TypeId, fail.Fail] = debug_type_record(lc, tid, aggregate);
+    if (sel made.err) { ret made; }
+
+    val n:     u32                 = type.field_count(?lc.s.types, tid);
+    val start: res[u32, fail.Fail] = ir_debug.members_add(?lc.m.debug_types, made.ok, n);
+    if (sel start.err) { ret res[ir_debug.TypeId, fail.Fail].err{start.err}; }
+    var i: u32 = 0;
+    for (i < n) {
+        val fe: opt[*type.FieldEntry] = type.field_at(?lc.s.types, tid, i);
+        if (sel fe.none) {
+            ret res[ir_debug.TypeId, fail.Fail].err{fail.message("lower: field table for a described type is missing an in-range field")};
+        }
+        val field_name: intern.StrId    = fe.some.name;
+        var member_ty:  ir_debug.TypeId = ir_debug.TYPE_NIL;
+        if (kind == ir_debug.KIND_TAG) {
+            if (ir_type.tag_case_has_payload(?lc.m.types, layout, i)) {
+                val payload: res[ir_debug.TypeId, fail.Fail] = debug_type_held(lc, fe.some.ty, ir_type.tag_case_type(?lc.m.types, layout, i));
+                if (sel payload.err) { ret payload; }
+                member_ty = payload.ok;
+            }
+        }
+        or {
+            val field: res[ir_debug.TypeId, fail.Fail] = debug_type_held(lc, fe.some.ty, ir_type.record_field(?lc.m.types, layout, i));
+            if (sel field.err) { ret field; }
+            member_ty = field.ok;
+        }
+        lc.m.debug_types.members[start.ok + i].name = field_name;
+        lc.m.debug_types.members[start.ok + i].ty   = member_ty;
+        i                                           = i + 1;
+    }
+    ret made;
+}
+
+# `ty` added to the module's debug types as the description of `tid`
+fun debug_type_record(lc: *LowerContext, tid: type.TypeId, ty: ir_debug.Type) res[ir_debug.TypeId, fail.Fail] {
+    val added: res[ir_debug.TypeId, fail.Fail] = ir_debug.add(?lc.m.debug_types, ty);
+    if (sel added.err) { ret added; }
+    val keyed: res[bool, A.Error] = map.insert[type.TypeId, ir_debug.TypeId](?lc.debug_types, tid, added.ok);
+    if (sel keyed.err) { ret res[ir_debug.TypeId, fail.Fail].err{fail.refused(keyed.err)}; }
+    ret added;
 }
 
 fun lower_abi_type(lc: *LowerContext, t: *type.Type) res[ir_type.IrTypeId, fail.Fail] {
@@ -1621,22 +1829,23 @@ pub fun emit_dbg_birth(lc: *LowerContext, name_span: lang_source.Span, ty: ir_ty
     if (sel res_name.err) {
         ret err[fail.Fail].err{fail.refused(res_name.err)};
     }
-    val name: intern.StrId = res_name.ok;
-    val sem:  type.TypeId  = substitute_type(lc, ty_sem);
+    val name:       intern.StrId                    = res_name.ok;
+    val debug_type: res[ir_debug.TypeId, fail.Fail] = debug_type_of(lc, substitute_type(lc, ty_sem));
+    if (sel debug_type.err) { ret err[fail.Fail].err{debug_type.err}; }
     if (sel slot.some) {
         val sv: value.Value = slot.some;
         if (sv.kind == value.VAL_INSTR) {
             var dv: me_ir.DbgVar;
-            dv.name     = name;
-            dv.ty       = ty;
-            dv.ty_sem   = sem;
-            dv.is_param = is_param;
-            dv.scope    = 0;
+            dv.name       = name;
+            dv.ty         = ty;
+            dv.debug_type = debug_type.ok;
+            dv.is_param   = is_param;
+            dv.scope      = 0;
             val res_link: err[fail.Fail] = me_ir.record_alloca_dbg_var(lc.builder.fn, sv.data.instr, dv);
             if (sel res_link.err) { ret res_link; }
         }
     }
-    ret builder.emit_dbg_value(?lc.builder, val_v, name, ty, sem, is_param, 0);
+    ret builder.emit_dbg_value(?lc.builder, val_v, name, ty, debug_type.ok, is_param, 0);
 }
 
 pub fun symbol_of(lc: *LowerContext, sid: resolve.SymbolId) opt[*resolve.Symbol] {
