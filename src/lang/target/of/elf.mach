@@ -2597,163 +2597,228 @@ fun write_relative_relocs(buf: *u8, fp: *of_plan.FilePlan, row: u32, rel_type: u
     ret of_plan.close(fp, row, rela_off);
 }
 
-fun emit_pie_exec(img: *target_of.LinkedImage, dst: *of_destination.Destination) err[fail.Fail] {
-    val alloc:         *A.Allocator            = img.alloc;
-    val itn:           *intern.Interner        = img.interner;
-    val tgt_isa:       *target_of.ObjectTarget = img.target;
-    val segs:          *target_of.LoadSegment  = img.segments;
-    val seg_count:     u32                     = img.segment_count;
-    val page_size:     u64                     = img.page_size;
-    val entry:         u64                     = img.entry;
-    val funcs:         *target_of.ExecFunction = img.functions;
-    val func_count:    u32                     = img.function_count;
-    val dyn:           *target_of.DynamicInfo  = img.dynamic;
-    val debug:         *target_of.Section      = img.debug;
-    val debug_count:   u32                     = img.debug_count;
-    val symtab:        *target_of.SymtabEntry  = img.symbols;
-    val symtab_count:  u32                     = img.symbol_count;
-    val image_options: target_of.ImageOptions  = img.options;
+# the state every loaded ELF image builds through, whatever its kind: the plan
+# and its prologue, the symbol table, the unwind room, the section rows and,
+# once the plan is sealed, the buffer
+rec ImageBuild {
+    img:         *target_of.LinkedImage;
+    lay:         ElfLayout;
+    fp:          of_plan.FilePlan;
+    pro:         ImagePrologue;
+    sb:          SymtabBuild;
+    eh_hdr:      cfi.UnwindRoom;
+    sect_count:  u32;
+    hi_va:       u64;
+    phdr_count:  u32;
+    phdr_offset: usize;
+    aux:         *ShtAlloc;
+    aux_count:   u32;
+    dsht:        DebugSht;
+    total_size:  usize;
+    buf:         *u8;
+}
 
-    var elay: ElfLayout = layout_for(tgt_isa);
-    if (elay.class != ELFCLASS64) {
-        ret err[fail.Fail].err{fail.user(diagnostic_kind.TARGET_OUTPUT_UNSUPPORTED, "a position-independent image is ELF64-only (an ELFCLASS32 dynamic image is not implemented)")};
-    }
+fun image_build_dnit(b: *ImageBuild) {
+    val alloc: *A.Allocator = b.img.alloc;
+    debug_sht_free(alloc, ?b.dsht, b.img.debug_count, b.aux_count);
+    if (b.aux != nil) { A.deallocate[ShtAlloc](alloc, b.aux, b.aux_count::usize); }
+    b.aux = nil;
+    image_prologue_free(alloc, ?b.pro, b.img.segment_count);
+    of_plan.dnit(?b.fp);
+    free_symtab_bytes(alloc, ?b.sb);
+    b.sb.symtab_bytes = nil;
+    b.sb.strtab_bytes = nil;
+}
 
-    val nrel: u32 = dyn.base_reloc_count;
-
-    var eh_hdr:  cfi.UnwindRoom;
-    val unwound: err[fail.Fail] = fill_unwind(alloc, tgt_isa.arch_id, segs, seg_count, funcs, func_count, ?eh_hdr);
+# the first phase of a loaded image: the 64-bit class every dynamic image
+# needs, the unwind room, the symbol table and the image's highest address
+# ---
+# class_refusal: why a 32-bit class of this kind is refused
+fun image_begin(b: *ImageBuild, img: *target_of.LinkedImage, class_refusal: str) err[fail.Fail] {
+    b.img = img;
+    b.lay = layout_for(img.target);
+    if (b.lay.class != ELFCLASS64) { ret err[fail.Fail].err{fail.user(diagnostic_kind.TARGET_OUTPUT_UNSUPPORTED, class_refusal)}; }
+    val unwound: err[fail.Fail] = fill_unwind(img.alloc, img.target.arch_id, img.segments, img.segment_count, img.functions,
+        img.function_count, ?b.eh_hdr);
     if (sel unwound.err) { ret unwound; }
-
-    val sect_count: u32                         = image_section_count(segs, seg_count);
-    val sb_r:       res[SymtabBuild, fail.Fail] = build_symtab_bytes(alloc, itn, ?elay, symtab, symtab_count, segs, seg_count);
+    b.sect_count = image_section_count(img.segments, img.segment_count);
+    val sb_r: res[SymtabBuild, fail.Fail] = build_symtab_bytes(img.alloc, img.interner, ?b.lay, img.symbols, img.symbol_count,
+        img.segments, img.segment_count);
     if (sel sb_r.err) { ret err[fail.Fail].err{sb_r.err}; }
-    var sb: SymtabBuild = sb_r.ok;
-    fin { free_symtab_bytes(alloc, ?sb); }
+    b.sb    = sb_r.ok;
+    b.hi_va = highest_vaddr(img.segments, img.segment_count);
+    ret err[fail.Fail].ok{};
+}
 
-    val hi_va: u64 = highest_vaddr(segs, seg_count);
-
-    var relro_extra: u32 = 0;
-    if (pie_relro_seg(segs, seg_count, dyn) >= 0) { relro_extra = 1; }
-    var eh_extra: u32 = 0;
-    if (eh_hdr.present) { eh_extra = 1; }
-    val phdr_count: u32 = seg_count + 4 + relro_extra + eh_extra;
-
-    if (!header_fits_reserved_page(?elay, phdr_count, page_size)) {
-        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_SIZE_LIMIT, "PIE program headers exceed the one-page header reservation (too many load segments)")};
+# the prologue every loaded image starts with: the header, `phdr_count` program
+# headers and the build id note on the header page, then one row per segment
+# ---
+# overflow: why program headers that do not fit the header page are refused
+fun image_prologue(b: *ImageBuild, phdr_count: u32, overflow: str) err[fail.Fail] {
+    val img: *target_of.LinkedImage = b.img;
+    if (!header_fits_reserved_page(?b.lay, phdr_count, img.page_size)) {
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_SIZE_LIMIT, overflow)};
     }
-
-    val planned: res[of_plan.FilePlan, fail.Fail] = of_plan.init(alloc, itn, "elf", elf_limit(?elay));
+    b.phdr_count = phdr_count;
+    val planned: res[of_plan.FilePlan, fail.Fail] = of_plan.init(img.alloc, img.interner, "elf", elf_limit(?b.lay));
     if (sel planned.err) { ret err[fail.Fail].err{planned.err}; }
-    var fp: of_plan.FilePlan = planned.ok;
-    fin { of_plan.dnit(?fp); }
-
-    val pro_r: res[ImagePrologue, fail.Fail] = place_image_prologue(alloc, ?fp, ?elay, phdr_count, page_size, segs, seg_count);
+    b.fp = planned.ok;
+    val pro_r: res[ImagePrologue, fail.Fail] = place_image_prologue(img.alloc, ?b.fp, ?b.lay, phdr_count, img.page_size,
+        img.segments, img.segment_count);
     if (sel pro_r.err) { ret err[fail.Fail].err{pro_r.err}; }
-    var pro: ImagePrologue = pro_r.ok;
-    fin { image_prologue_free(alloc, ?pro, seg_count); }
-    val phdr_offset: usize = of_plan.offset(?fp, pro.phdr_row);
+    b.pro         = pro_r.ok;
+    b.phdr_offset = of_plan.offset(?b.fp, b.pro.phdr_row);
+    ret err[fail.Fail].ok{};
+}
 
-    val reladyn_size: res[usize, fail.Fail] = of_plan.table(?fp, "relative relocations", nrel::usize, RELA_SIZE);
+# the section rows every loaded image carries, its named sections and the build
+# id note, ahead of `extra` rows the kind fills; the first of those is returned
+fun image_rows(b: *ImageBuild, extra: u32) res[*ShtAlloc, fail.Fail] {
+    val img: *target_of.LinkedImage = b.img;
+    b.aux_count = b.sect_count + 1 + extra;
+    val axr: res[*ShtAlloc, A.Error] = A.zallocate[ShtAlloc](img.alloc, b.aux_count::usize);
+    if (sel axr.err) {
+        b.aux_count = 0;
+        ret res[*ShtAlloc, fail.Fail].err{fail.refused(axr.err)};
+    }
+    b.aux = axr.ok;
+    val filled: err[fail.Fail] = fill_image_section_aux(img.alloc, img.interner, ?b.fp, b.aux, img.segments, b.pro.seg_rows,
+        img.segment_count);
+    if (sel filled.err) { ret res[*ShtAlloc, fail.Fail].err{filled.err}; }
+    fill_note_aux(?b.aux[b.sect_count], b.pro.note_off, prologue_note_vaddr(img.segments, img.segment_count, b.pro.note_off,
+        img.page_size));
+    ret res[*ShtAlloc, fail.Fail].ok{?b.aux[b.sect_count + 1]};
+}
+
+# seals the plan with the section table after everything the kind placed, then
+# writes the header and the segments into the destination's buffer
+fun image_seal(b: *ImageBuild, dst: *of_destination.Destination, e_type: u16, entry: u64) err[fail.Fail] {
+    val img: *target_of.LinkedImage   = b.img;
+    val dp:  res[DebugSht, fail.Fail] = debug_sht_plan(img.alloc, img.interner, ?b.lay, ?b.fp, img.debug, img.debug_count,
+        b.aux, b.aux_count, ?b.sb);
+    if (sel dp.err) { ret err[fail.Fail].err{dp.err}; }
+    b.dsht = dp.ok;
+    val sealed: res[usize, fail.Fail] = of_plan.seal(?b.fp);
+    if (sel sealed.err) { ret err[fail.Fail].err{sealed.err}; }
+    b.total_size = sealed.ok;
+
+    var e_shoff:       u64            = 0;
+    var e_shnum:       u16            = 0;
+    var e_shstrndx:    u16            = 0;
+    val header_fields: err[fail.Fail] = debug_sht_header(?b.fp, ?b.dsht, ?e_shoff, ?e_shnum, ?e_shstrndx);
+    if (sel header_fields.err) { ret header_fields; }
+    val phnum: res[u16, fail.Fail] = of_plan.field_u16(?b.fp, b.phdr_count::usize, "e_phnum");
+    if (sel phnum.err) { ret err[fail.Fail].err{phnum.err}; }
+
+    val res_buf: res[*u8, fail.Fail] = of_destination.file_add(dst, "", b.total_size, 0o755);
+    if (sel res_buf.err) { ret err[fail.Fail].err{res_buf.err}; }
+    b.buf = res_buf.ok;
+    write_elf_ident(b.buf, ?b.lay);
+    write_ehdr(b.buf, ?b.lay, e_type, machine_for_arch(img.target.arch_id), img.options.machine_flags,
+        entry, b.phdr_offset::u64, e_shoff, phnum.ok, e_shnum, e_shstrndx);
+    copy_segment_rows(b.buf, ?b.fp, img.segments, b.pro.seg_rows, img.segment_count);
+    ret err[fail.Fail].ok{};
+}
+
+# closes the program headers the kind wrote up to `phdr_end`, writes the section
+# table and seals the build id over the finished image
+fun image_finish(b: *ImageBuild, phdr_end: usize) err[fail.Fail] {
+    val img:         *target_of.LinkedImage = b.img;
+    val phdr_closed: err[fail.Fail]         = of_plan.close(?b.fp, b.pro.phdr_row, phdr_end);
+    if (sel phdr_closed.err) { ret phdr_closed; }
+    val sht_written: err[fail.Fail] = debug_sht_write(b.buf, img.interner, ?b.lay, ?b.fp, img.debug, img.debug_count, b.aux,
+        b.aux_count, ?b.sb, ?b.dsht);
+    if (sel sht_written.err) { ret sht_written; }
+    ret seal_build_id(b.buf, b.total_size, ?b.lay, b.pro.note_off);
+}
+
+# a section row the kind adds, allocated in the image
+fun alloc_row(row: *ShtAlloc, name: str, sh_type: u32, addr: u64, off: usize, size: usize, link: u32, info: u32,
+    align: usize, entsize: usize) {
+    row.name    = name;
+    row.sh_type = sh_type;
+    row.flags   = SHF_ALLOC;
+    row.addr    = addr;
+    row.off     = off;
+    row.size    = size;
+    row.link    = link;
+    row.info    = info;
+    row.align   = align;
+    row.entsize = entsize;
+}
+
+# the program headers past one per segment a position-independent image takes:
+# the header table, the note, the read-only run and the dynamic section, its
+# relro and its unwind index where it has them, and `extra` more
+fun pie_phdr_count(b: *ImageBuild, extra: u32) u32 {
+    var n: u32 = b.img.segment_count + 4 + extra;
+    if (pie_relro_seg(b.img.segments, b.img.segment_count, b.img.dynamic) >= 0) { n = n + 1; }
+    if (b.eh_hdr.present)                                                       { n = n + 1; }
+    ret n;
+}
+
+fun emit_pie_exec(img: *target_of.LinkedImage, dst: *of_destination.Destination) err[fail.Fail] {
+    var b: ImageBuild;
+    fin { image_build_dnit(?b); }
+    val begun: err[fail.Fail] = image_begin(?b, img,
+        "a position-independent image is ELF64-only (an ELFCLASS32 dynamic image is not implemented)");
+    if (sel begun.err) { ret begun; }
+    val prologue: err[fail.Fail] = image_prologue(?b, pie_phdr_count(?b, 0),
+        "PIE program headers exceed the one-page header reservation (too many load segments)");
+    if (sel prologue.err) { ret prologue; }
+
+    val dyn:       *target_of.DynamicInfo = img.dynamic;
+    val page_size: u64                    = img.page_size;
+    val fp:        *of_plan.FilePlan      = ?b.fp;
+    val nrel:      u32                    = dyn.base_reloc_count;
+
+    val reladyn_size: res[usize, fail.Fail] = of_plan.table(fp, "relative relocations", nrel::usize, RELA_SIZE);
     if (sel reladyn_size.err) { ret err[fail.Fail].err{reladyn_size.err}; }
-    val reladyn_r: res[u32, fail.Fail] = of_plan.place(?fp, "relative relocations", target_of.no_section(), page_size::usize, reladyn_size.ok);
+    val reladyn_r: res[u32, fail.Fail] = of_plan.place(fp, "relative relocations", target_of.no_section(), page_size::usize, reladyn_size.ok);
     if (sel reladyn_r.err) { ret err[fail.Fail].err{reladyn_r.err}; }
     val reladyn_row: u32                 = reladyn_r.ok;
-    val ro_off:      usize               = of_plan.offset(?fp, reladyn_row);
-    val ro_va_r:     res[u64, fail.Fail] = of_plan.align_address(?fp, "read-only structures", hi_va, page_size);
+    val ro_off:      usize               = of_plan.offset(fp, reladyn_row);
+    val ro_va_r:     res[u64, fail.Fail] = of_plan.align_address(fp, "read-only structures", b.hi_va, page_size);
     if (sel ro_va_r.err) { ret err[fail.Fail].err{ro_va_r.err}; }
     val ro_va: u64 = ro_va_r.ok;
 
     var dyn_entries: u32 = 1;
     if (nrel > 0) { dyn_entries = dyn_entries + 4; }
-    val dyn_r: res[u32, fail.Fail] = of_plan.place(?fp, "dynamic section", target_of.no_section(), 8, dyn_entries::usize * DYN_SIZE);
+    val dyn_r: res[u32, fail.Fail] = of_plan.place(fp, "dynamic section", target_of.no_section(), 8, dyn_entries::usize * DYN_SIZE);
     if (sel dyn_r.err) { ret err[fail.Fail].err{dyn_r.err}; }
     val dyn_row:  u32                 = dyn_r.ok;
-    val dyn_off:  usize               = of_plan.offset(?fp, dyn_row);
-    val dyn_size: usize               = of_plan.size(?fp, dyn_row);
-    val dyn_va_r: res[u64, fail.Fail] = of_plan.address(?fp, dyn_row, ro_off, ro_va);
+    val dyn_off:  usize               = of_plan.offset(fp, dyn_row);
+    val dyn_size: usize               = of_plan.size(fp, dyn_row);
+    val dyn_va_r: res[u64, fail.Fail] = of_plan.address(fp, dyn_row, ro_off, ro_va);
     if (sel dyn_va_r.err) { ret err[fail.Fail].err{dyn_va_r.err}; }
     val dyn_va:  u64   = dyn_va_r.ok;
-    val ro_size: usize = of_plan.end(?fp, dyn_row) - ro_off;
+    val ro_size: usize = of_plan.end(fp, dyn_row) - ro_off;
 
-    var aux:       *ShtAlloc = nil;
-    var aux_count: u32       = 0;
-    if (sb.symtab_bytes != nil) {
-        aux_count = sect_count + 2;
-        val axr: res[*ShtAlloc, A.Error] = A.zallocate[ShtAlloc](alloc, aux_count::usize);
-        if (sel axr.err) { ret err[fail.Fail].err{fail.message("pie aux-section table alloc failed")}; }
-        aux = axr.ok;
-        val filled: err[fail.Fail] = fill_image_section_aux(alloc, itn, ?fp, aux, segs, pro.seg_rows, seg_count);
-        if (sel filled.err) { ret filled; }
-        fill_note_aux(?aux[sect_count], pro.note_off, prologue_note_vaddr(segs, seg_count, pro.note_off, page_size));
-        aux[sect_count + 1].name    = ".dynamic";
-        aux[sect_count + 1].sh_type = SHT_DYNAMIC;
-        aux[sect_count + 1].flags   = SHF_ALLOC;
-        aux[sect_count + 1].addr    = dyn_va;
-        aux[sect_count + 1].off     = dyn_off;
-        aux[sect_count + 1].size    = dyn_size;
-        aux[sect_count + 1].link    = 0;
-        aux[sect_count + 1].info    = 0;
-        aux[sect_count + 1].align   = 8;
-        aux[sect_count + 1].entsize = DYN_SIZE;
-    }
-    fin {
-        if (aux != nil) { A.deallocate[ShtAlloc](alloc, aux, aux_count::usize); }
-    }
+    val rows: res[*ShtAlloc, fail.Fail] = image_rows(?b, 1);
+    if (sel rows.err) { ret err[fail.Fail].err{rows.err}; }
+    alloc_row(rows.ok, ".dynamic", SHT_DYNAMIC, dyn_va, dyn_off, dyn_size, 0, 0, 8, DYN_SIZE);
 
-    val dp: res[DebugSht, fail.Fail] = debug_sht_plan(alloc, itn, ?elay, ?fp, debug, debug_count, aux, aux_count, ?sb);
-    if (sel dp.err) { ret err[fail.Fail].err{dp.err}; }
-    var dsht: DebugSht = dp.ok;
-    fin { debug_sht_free(alloc, ?dsht, debug_count, aux_count); }
+    val sealed: err[fail.Fail] = image_seal(?b, dst, ET_DYN, img.entry);
+    if (sel sealed.err) { ret sealed; }
+    val buf: *u8 = b.buf;
 
-    val sealed: res[usize, fail.Fail] = of_plan.seal(?fp);
-    if (sel sealed.err) { ret err[fail.Fail].err{sealed.err}; }
-    val total_size: usize = sealed.ok;
-
-    var e_shoff:       u64            = 0;
-    var e_shnum:       u16            = 0;
-    var e_shstrndx:    u16            = 0;
-    val header_fields: err[fail.Fail] = debug_sht_header(?fp, ?dsht, ?e_shoff, ?e_shnum, ?e_shstrndx);
-    if (sel header_fields.err) { ret header_fields; }
-    val phnum: res[u16, fail.Fail] = of_plan.field_u16(?fp, phdr_count::usize, "e_phnum");
-    if (sel phnum.err) { ret err[fail.Fail].err{phnum.err}; }
-
-    val res_buf: res[*u8, fail.Fail] = of_destination.file_add(dst, "", total_size, 0o755);
-    if (sel res_buf.err) { ret err[fail.Fail].err{res_buf.err}; }
-    var buf: *u8 = res_buf.ok;
-
-    write_elf_ident(buf, ?elay);
-    write_ehdr(buf, ?elay, ET_DYN, machine_for_arch(tgt_isa.arch_id), image_options.machine_flags,
-        entry, phdr_offset::u64, e_shoff, phnum.ok, e_shnum, e_shstrndx);
-
-    copy_segment_rows(buf, ?fp, segs, pro.seg_rows, seg_count);
-
-    val relocs_written: err[fail.Fail] = write_relative_relocs(buf, ?fp, reladyn_row, relative_type_for(tgt_isa.arch_id), dyn, segs, seg_count);
+    val relocs_written: err[fail.Fail] = write_relative_relocs(buf, fp, reladyn_row, relative_type_for(img.target.arch_id), dyn,
+        img.segments, img.segment_count);
     if (sel relocs_written.err) { ret relocs_written; }
 
     var dpos: usize = dyn_off;
     if (nrel > 0) {
         dpos = write_dyn_entry(buf, dpos, DT_RELA, ro_va);
-        dpos = write_dyn_entry(buf, dpos, DT_RELASZ, of_plan.size(?fp, reladyn_row)::u64);
+        dpos = write_dyn_entry(buf, dpos, DT_RELASZ, of_plan.size(fp, reladyn_row)::u64);
         dpos = write_dyn_entry(buf, dpos, DT_RELAENT, RELA_SIZE::u64);
         dpos = write_dyn_entry(buf, dpos, DT_RELACOUNT, nrel::u64);
     }
     dpos = write_dyn_entry(buf, dpos, DT_NULL, 0);
-    val dyn_closed: err[fail.Fail] = of_plan.close(?fp, dyn_row, dpos);
+    val dyn_closed: err[fail.Fail] = of_plan.close(fp, dyn_row, dpos);
     if (sel dyn_closed.err) { ret dyn_closed; }
 
-    val phdr_end: usize = write_pie_phdrs(buf, ?fp, phdr_offset, phdr_count, segs, pro.seg_rows, seg_count,
-        pro.note_off, ro_off, ro_va, ro_size, dyn_off, dyn_va, dyn_size, dyn, page_size, false, ?eh_hdr);
-    val phdr_closed: err[fail.Fail] = of_plan.close(?fp, pro.phdr_row, phdr_end);
-    if (sel phdr_closed.err) { ret phdr_closed; }
-
-    val sht_written: err[fail.Fail] = debug_sht_write(buf, itn, ?elay, ?fp, debug, debug_count, aux, aux_count, ?sb, ?dsht);
-    if (sel sht_written.err) { ret sht_written; }
-
-    val identified: err[fail.Fail] = seal_build_id(buf, total_size, ?elay, pro.note_off);
-    if (sel identified.err) { ret identified; }
-
-    ret err[fail.Fail].ok{};
+    ret image_finish(?b, write_pie_phdrs(buf, fp, b.phdr_offset, b.phdr_count, img.segments, b.pro.seg_rows, img.segment_count,
+        b.pro.note_off, ro_off, ro_va, ro_size, dyn_off, dyn_va, dyn_size, dyn, page_size, false, ?b.eh_hdr));
 }
 
 # the header page's address in a dyld-style image, where the first PT_LOAD
@@ -2864,68 +2929,26 @@ fun row_address(fp: *of_plan.FilePlan, row: u32, file_base: usize, address_base:
 }
 
 fun emit_shared(img: *target_of.LinkedImage, dst: *of_destination.Destination) err[fail.Fail] {
-    val alloc:        *A.Allocator            = img.alloc;
-    val itn:          *intern.Interner        = img.interner;
-    val tgt_isa:      *target_of.ObjectTarget = img.target;
-    val segs:         *target_of.LoadSegment  = img.segments;
-    val seg_count:    u32                     = img.segment_count;
-    val page_size:    u64                     = img.page_size;
-    val funcs:        *target_of.ExecFunction = img.functions;
-    val func_count:   u32                     = img.function_count;
-    val exports:      *target_of.ExportSym    = img.exports;
-    val export_count: u32                     = img.export_count;
-    val dyn:          *target_of.DynamicInfo  = img.dynamic;
-    val debug:        *target_of.Section      = img.debug;
-    val debug_count:  u32                     = img.debug_count;
-    val symtab:       *target_of.SymtabEntry  = img.symbols;
-    val symtab_count: u32                     = img.symbol_count;
-
-    val image_options: target_of.ImageOptions = img.options;
-
-    var elay: ElfLayout = layout_for(tgt_isa);
-    if (elay.class != ELFCLASS64) {
-        ret err[fail.Fail].err{fail.user(diagnostic_kind.TARGET_OUTPUT_UNSUPPORTED, "a shared object is ELF64-only (an ELFCLASS32 dynamic image is not implemented)")};
-    }
-
-    val sect_count: u32                         = image_section_count(segs, seg_count);
-    val sb_r:       res[SymtabBuild, fail.Fail] = build_symtab_bytes(alloc, itn, ?elay, symtab, symtab_count, segs, seg_count);
-    if (sel sb_r.err) { ret err[fail.Fail].err{sb_r.err}; }
-    var sb: SymtabBuild = sb_r.ok;
-    fin { free_symtab_bytes(alloc, ?sb); }
-
+    var b: ImageBuild;
+    fin { image_build_dnit(?b); }
+    val begun: err[fail.Fail] = image_begin(?b, img,
+        "a shared object is ELF64-only (an ELFCLASS32 dynamic image is not implemented)");
+    if (sel begun.err) { ret begun; }
+    val dyn: *target_of.DynamicInfo = img.dynamic;
     if (dyn.import_addr_fixup_count > 0) {
         ret err[fail.Fail].err{fail.user(diagnostic_kind.TARGET_OUTPUT_UNSUPPORTED, "data imports in a shared object are not supported")};
     }
+    val prologue: err[fail.Fail] = image_prologue(?b, pie_phdr_count(?b, 1),
+        "shared-object program headers exceed the one-page header reservation (too many load segments)");
+    if (sel prologue.err) { ret prologue; }
 
-    val nrel: u32 = dyn.base_reloc_count;
-    val nexp: u32 = export_count;
-
-    val hi_va: u64 = highest_vaddr(segs, seg_count);
-
-    var eh_hdr:  cfi.UnwindRoom;
-    val unwound: err[fail.Fail] = fill_unwind(alloc, tgt_isa.arch_id, segs, seg_count, funcs, func_count, ?eh_hdr);
-    if (sel unwound.err) { ret unwound; }
-
-    var relro_extra: u32 = 0;
-    if (pie_relro_seg(segs, seg_count, dyn) >= 0) { relro_extra = 1; }
-    var eh_extra: u32 = 0;
-    if (eh_hdr.present) { eh_extra = 1; }
-    val phdr_count: u32 = seg_count + 5 + relro_extra + eh_extra;
-
-    if (!header_fits_reserved_page(?elay, phdr_count, page_size)) {
-        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_SIZE_LIMIT, "shared-object program headers exceed the one-page header reservation (too many load segments)")};
-    }
-
-    val planned: res[of_plan.FilePlan, fail.Fail] = of_plan.init(alloc, itn, "elf", elf_limit(?elay));
-    if (sel planned.err) { ret err[fail.Fail].err{planned.err}; }
-    var fp: of_plan.FilePlan = planned.ok;
-    fin { of_plan.dnit(?fp); }
-
-    val pro_r: res[ImagePrologue, fail.Fail] = place_image_prologue(alloc, ?fp, ?elay, phdr_count, page_size, segs, seg_count);
-    if (sel pro_r.err) { ret err[fail.Fail].err{pro_r.err}; }
-    var pro: ImagePrologue = pro_r.ok;
-    fin { image_prologue_free(alloc, ?pro, seg_count); }
-    val phdr_offset: usize = of_plan.offset(?fp, pro.phdr_row);
+    val alloc:     *A.Allocator         = img.alloc;
+    val itn:       *intern.Interner     = img.interner;
+    val exports:   *target_of.ExportSym = img.exports;
+    val page_size: u64                  = img.page_size;
+    val fp:        *of_plan.FilePlan    = ?b.fp;
+    val nrel:      u32                  = dyn.base_reloc_count;
+    val nexp:      u32                  = img.export_count;
 
     var exp_str: *usize = nil;
     if (nexp > 0) {
@@ -2937,16 +2960,16 @@ fun emit_shared(img: *target_of.LinkedImage, dst: *of_destination.Destination) e
         if (exp_str != nil) { A.deallocate[usize](alloc, exp_str, nexp::usize); }
     }
 
-    val ro_va_r: res[u64, fail.Fail] = of_plan.align_address(?fp, "read-only structures", hi_va, page_size);
+    val ro_va_r: res[u64, fail.Fail] = of_plan.align_address(fp, "read-only structures", b.hi_va, page_size);
     if (sel ro_va_r.err) { ret err[fail.Fail].err{ro_va_r.err}; }
     val ro_va: u64 = ro_va_r.ok;
 
     var dynsym_row:  u32                   = of_plan.NO_ROW;
-    val dynsym_size: res[usize, fail.Fail] = of_plan.table(?fp, "dynamic symbols", (nexp + 1)::usize, SYM_SIZE);
+    val dynsym_size: res[usize, fail.Fail] = of_plan.table(fp, "dynamic symbols", (nexp + 1)::usize, SYM_SIZE);
     if (sel dynsym_size.err) { ret err[fail.Fail].err{dynsym_size.err}; }
-    val r1: err[fail.Fail] = place_row(?fp, "dynamic symbols", page_size::usize, dynsym_size.ok, ?dynsym_row);
+    val r1: err[fail.Fail] = place_row(fp, "dynamic symbols", page_size::usize, dynsym_size.ok, ?dynsym_row);
     if (sel r1.err) { ret r1; }
-    val ro_off: usize = of_plan.offset(?fp, dynsym_row);
+    val ro_off: usize = of_plan.offset(fp, dynsym_row);
 
     val soname:      str   = img.library_name;
     var dynstr_size: usize = 1 + (str_len(soname) + 1);
@@ -2956,124 +2979,62 @@ fun emit_shared(img: *target_of.LinkedImage, dst: *of_destination.Destination) e
         e           = e + 1;
     }
     var dynstr_row: u32            = of_plan.NO_ROW;
-    val r2:         err[fail.Fail] = place_row(?fp, "dynamic strings", 1, dynstr_size, ?dynstr_row);
+    val r2:         err[fail.Fail] = place_row(fp, "dynamic strings", 1, dynstr_size, ?dynstr_row);
     if (sel r2.err) { ret r2; }
 
     val nchain:   usize          = (nexp + 1)::usize;
     var hash_row: u32            = of_plan.NO_ROW;
-    val r3:       err[fail.Fail] = place_row(?fp, "hash table", 8, 8 + 4 + nchain * 4, ?hash_row);
+    val r3:       err[fail.Fail] = place_row(fp, "hash table", 8, 8 + 4 + nchain * 4, ?hash_row);
     if (sel r3.err) { ret r3; }
 
     var reladyn_row:  u32                   = of_plan.NO_ROW;
-    val reladyn_size: res[usize, fail.Fail] = of_plan.table(?fp, "relative relocations", nrel::usize, RELA_SIZE);
+    val reladyn_size: res[usize, fail.Fail] = of_plan.table(fp, "relative relocations", nrel::usize, RELA_SIZE);
     if (sel reladyn_size.err) { ret err[fail.Fail].err{reladyn_size.err}; }
-    val r4: err[fail.Fail] = place_row(?fp, "relative relocations", 8, reladyn_size.ok, ?reladyn_row);
+    val r4: err[fail.Fail] = place_row(fp, "relative relocations", 8, reladyn_size.ok, ?reladyn_row);
     if (sel r4.err) { ret r4; }
 
     var dyn_entries: u32 = 7;
     if (nrel > 0) { dyn_entries = dyn_entries + 4; }
     var dyn_row: u32            = of_plan.NO_ROW;
-    val r5:      err[fail.Fail] = place_row(?fp, "dynamic section", 8, dyn_entries::usize * DYN_SIZE, ?dyn_row);
+    val r5:      err[fail.Fail] = place_row(fp, "dynamic section", 8, dyn_entries::usize * DYN_SIZE, ?dyn_row);
     if (sel r5.err) { ret r5; }
-    val ro_size: usize = of_plan.end(?fp, dyn_row) - ro_off;
+    val ro_size: usize = of_plan.end(fp, dyn_row) - ro_off;
 
     var dynsym_va:  u64            = 0;
     var dynstr_va:  u64            = 0;
     var hash_va:    u64            = 0;
     var reladyn_va: u64            = 0;
     var dyn_va:     u64            = 0;
-    val a1:         err[fail.Fail] = row_address(?fp, dynsym_row, ro_off, ro_va, ?dynsym_va);
+    val a1:         err[fail.Fail] = row_address(fp, dynsym_row, ro_off, ro_va, ?dynsym_va);
     if (sel a1.err) { ret a1; }
-    val a2: err[fail.Fail] = row_address(?fp, dynstr_row, ro_off, ro_va, ?dynstr_va);
+    val a2: err[fail.Fail] = row_address(fp, dynstr_row, ro_off, ro_va, ?dynstr_va);
     if (sel a2.err) { ret a2; }
-    val a3: err[fail.Fail] = row_address(?fp, hash_row, ro_off, ro_va, ?hash_va);
+    val a3: err[fail.Fail] = row_address(fp, hash_row, ro_off, ro_va, ?hash_va);
     if (sel a3.err) { ret a3; }
-    val a4: err[fail.Fail] = row_address(?fp, reladyn_row, ro_off, ro_va, ?reladyn_va);
+    val a4: err[fail.Fail] = row_address(fp, reladyn_row, ro_off, ro_va, ?reladyn_va);
     if (sel a4.err) { ret a4; }
-    val a5: err[fail.Fail] = row_address(?fp, dyn_row, ro_off, ro_va, ?dyn_va);
+    val a5: err[fail.Fail] = row_address(fp, dyn_row, ro_off, ro_va, ?dyn_va);
     if (sel a5.err) { ret a5; }
 
-    val aux_count: u32                     = sect_count + 5;
-    val axr:       res[*ShtAlloc, A.Error] = A.zallocate[ShtAlloc](alloc, aux_count::usize);
-    if (sel axr.err) { ret err[fail.Fail].err{fail.message("shared aux-section table alloc failed")}; }
-    var aux: *ShtAlloc = axr.ok;
-    fin { A.deallocate[ShtAlloc](alloc, aux, aux_count::usize); }
-    val filled: err[fail.Fail] = fill_image_section_aux(alloc, itn, ?fp, aux, segs, pro.seg_rows, seg_count);
-    if (sel filled.err) { ret filled; }
-    fill_note_aux(?aux[sect_count], pro.note_off, prologue_note_vaddr(segs, seg_count, pro.note_off, page_size));
-    val i_dynsym: u32 = sect_count + 2;
-    val i_dynstr: u32 = sect_count + 3;
-    aux[sect_count + 1].name    = ".dynsym";
-    aux[sect_count + 1].sh_type = SHT_DYNSYM;
-    aux[sect_count + 1].flags   = SHF_ALLOC;
-    aux[sect_count + 1].addr    = dynsym_va;
-    aux[sect_count + 1].off     = of_plan.offset(?fp, dynsym_row);
-    aux[sect_count + 1].size    = of_plan.size(?fp, dynsym_row);
-    aux[sect_count + 1].link    = i_dynstr;
-    aux[sect_count + 1].info    = 1;
-    aux[sect_count + 1].align   = 8;
-    aux[sect_count + 1].entsize = SYM_SIZE;
-    aux[sect_count + 2].name    = ".dynstr";
-    aux[sect_count + 2].sh_type = SHT_STRTAB;
-    aux[sect_count + 2].flags   = SHF_ALLOC;
-    aux[sect_count + 2].addr    = dynstr_va;
-    aux[sect_count + 2].off     = of_plan.offset(?fp, dynstr_row);
-    aux[sect_count + 2].size    = dynstr_size;
-    aux[sect_count + 2].link    = 0;
-    aux[sect_count + 2].info    = 0;
-    aux[sect_count + 2].align   = 1;
-    aux[sect_count + 2].entsize = 0;
-    aux[sect_count + 3].name    = ".hash";
-    aux[sect_count + 3].sh_type = SHT_HASH;
-    aux[sect_count + 3].flags   = SHF_ALLOC;
-    aux[sect_count + 3].addr    = hash_va;
-    aux[sect_count + 3].off     = of_plan.offset(?fp, hash_row);
-    aux[sect_count + 3].size    = of_plan.size(?fp, hash_row);
-    aux[sect_count + 3].link    = i_dynsym;
-    aux[sect_count + 3].info    = 0;
-    aux[sect_count + 3].align   = 4;
-    aux[sect_count + 3].entsize = 4;
-    aux[sect_count + 4].name    = ".dynamic";
-    aux[sect_count + 4].sh_type = SHT_DYNAMIC;
-    aux[sect_count + 4].flags   = SHF_ALLOC;
-    aux[sect_count + 4].addr    = dyn_va;
-    aux[sect_count + 4].off     = of_plan.offset(?fp, dyn_row);
-    aux[sect_count + 4].size    = of_plan.size(?fp, dyn_row);
-    aux[sect_count + 4].link    = i_dynstr;
-    aux[sect_count + 4].info    = 0;
-    aux[sect_count + 4].align   = 8;
-    aux[sect_count + 4].entsize = DYN_SIZE;
+    val rows: res[*ShtAlloc, fail.Fail] = image_rows(?b, 4);
+    if (sel rows.err) { ret err[fail.Fail].err{rows.err}; }
+    val i_dynsym: u32       = b.sect_count + 2;
+    val i_dynstr: u32       = b.sect_count + 3;
+    val row:      *ShtAlloc = rows.ok;
+    alloc_row(?row[0], ".dynsym", SHT_DYNSYM, dynsym_va, of_plan.offset(fp, dynsym_row), of_plan.size(fp, dynsym_row), i_dynstr, 1,
+        8, SYM_SIZE);
+    alloc_row(?row[1], ".dynstr", SHT_STRTAB, dynstr_va, of_plan.offset(fp, dynstr_row), dynstr_size, 0, 0, 1, 0);
+    alloc_row(?row[2], ".hash", SHT_HASH, hash_va, of_plan.offset(fp, hash_row), of_plan.size(fp, hash_row), i_dynsym, 0, 4, 4);
+    alloc_row(?row[3], ".dynamic", SHT_DYNAMIC, dyn_va, of_plan.offset(fp, dyn_row), of_plan.size(fp, dyn_row), i_dynstr, 0, 8,
+        DYN_SIZE);
 
-    val dp: res[DebugSht, fail.Fail] = debug_sht_plan(alloc, itn, ?elay, ?fp, debug, debug_count, aux, aux_count, ?sb);
-    if (sel dp.err) { ret err[fail.Fail].err{dp.err}; }
-    var dsht: DebugSht = dp.ok;
-    fin { debug_sht_free(alloc, ?dsht, debug_count, aux_count); }
-
-    val sealed: res[usize, fail.Fail] = of_plan.seal(?fp);
-    if (sel sealed.err) { ret err[fail.Fail].err{sealed.err}; }
-    val total_size: usize = sealed.ok;
-
-    var e_shoff:       u64            = 0;
-    var e_shnum:       u16            = 0;
-    var e_shstrndx:    u16            = 0;
-    val header_fields: err[fail.Fail] = debug_sht_header(?fp, ?dsht, ?e_shoff, ?e_shnum, ?e_shstrndx);
-    if (sel header_fields.err) { ret header_fields; }
-    val phnum: res[u16, fail.Fail] = of_plan.field_u16(?fp, phdr_count::usize, "e_phnum");
-    if (sel phnum.err) { ret err[fail.Fail].err{phnum.err}; }
-    val nchain_field: res[u32, fail.Fail] = of_plan.field_u32(?fp, nchain, "hash chain count");
+    val nchain_field: res[u32, fail.Fail] = of_plan.field_u32(fp, nchain, "hash chain count");
     if (sel nchain_field.err) { ret err[fail.Fail].err{nchain_field.err}; }
+    val sealed: err[fail.Fail] = image_seal(?b, dst, ET_DYN, 0);
+    if (sel sealed.err) { ret sealed; }
+    val buf: *u8 = b.buf;
 
-    val res_buf: res[*u8, fail.Fail] = of_destination.file_add(dst, "", total_size, 0o755);
-    if (sel res_buf.err) { ret err[fail.Fail].err{res_buf.err}; }
-    var buf: *u8 = res_buf.ok;
-
-    write_elf_ident(buf, ?elay);
-    write_ehdr(buf, ?elay, ET_DYN, machine_for_arch(tgt_isa.arch_id), image_options.machine_flags,
-        0, phdr_offset::u64, e_shoff, phnum.ok, e_shnum, e_shstrndx);
-
-    copy_segment_rows(buf, ?fp, segs, pro.seg_rows, seg_count);
-
-    val dynstr_off: usize = of_plan.offset(?fp, dynstr_row);
+    val dynstr_off: usize = of_plan.offset(fp, dynstr_row);
     buf[dynstr_off] = 0;
     var str_pos:    usize = 1;
     val soname_off: usize = str_pos;
@@ -3084,10 +3045,12 @@ fun emit_shared(img: *target_of.LinkedImage, dst: *of_destination.Destination) e
         str_pos    = str_pos + bin.write_str(buf, dynstr_off + str_pos, bin.resolve_name(itn, exports[e].name));
         e          = e + 1;
     }
-    val dynstr_closed: err[fail.Fail] = of_plan.close_size(?fp, dynstr_row, str_pos);
+    val dynstr_closed: err[fail.Fail] = of_plan.close_size(fp, dynstr_row, str_pos);
     if (sel dynstr_closed.err) { ret dynstr_closed; }
 
-    var sym_off: usize = of_plan.offset(?fp, dynsym_row) + SYM_SIZE;
+    val segs:      *target_of.LoadSegment = img.segments;
+    val seg_count: u32                    = img.segment_count;
+    var sym_off:   usize                  = of_plan.offset(fp, dynsym_row) + SYM_SIZE;
     e = 0;
     for (e < nexp) {
         var st_type: u8 = STT_OBJECT;
@@ -3100,7 +3063,7 @@ fun emit_shared(img: *target_of.LinkedImage, dst: *of_destination.Destination) e
             sgi = sgi + 1;
         }
         if (exports[e].absolute) { shndx = 0xFFF1; }
-        val name_field: res[u32, fail.Fail] = of_plan.field_u32(?fp, exp_str[e], "export name offset");
+        val name_field: res[u32, fail.Fail] = of_plan.field_u32(fp, exp_str[e], "export name offset");
         if (sel name_field.err) { ret err[fail.Fail].err{name_field.err}; }
         bin.write_u32_le(buf, sym_off, name_field.ok);
         buf[sym_off + 4] = (STB_GLOBAL << 4) | (st_type & 0xF);
@@ -3111,10 +3074,10 @@ fun emit_shared(img: *target_of.LinkedImage, dst: *of_destination.Destination) e
         sym_off = sym_off + SYM_SIZE;
         e       = e + 1;
     }
-    val dynsym_closed: err[fail.Fail] = of_plan.close(?fp, dynsym_row, sym_off);
+    val dynsym_closed: err[fail.Fail] = of_plan.close(fp, dynsym_row, sym_off);
     if (sel dynsym_closed.err) { ret dynsym_closed; }
 
-    val hash_off: usize = of_plan.offset(?fp, hash_row);
+    val hash_off: usize = of_plan.offset(fp, hash_row);
     bin.write_u32_le(buf, hash_off, 1);
     bin.write_u32_le(buf, hash_off + 4, nchain_field.ok);
     if (nexp > 0) { bin.write_u32_le(buf, hash_off + 8, 1); }
@@ -3128,13 +3091,14 @@ fun emit_shared(img: *target_of.LinkedImage, dst: *of_destination.Destination) e
         hash_pos = hash_pos + 4;
         c        = c + 1;
     }
-    val hash_closed: err[fail.Fail] = of_plan.close(?fp, hash_row, hash_pos);
+    val hash_closed: err[fail.Fail] = of_plan.close(fp, hash_row, hash_pos);
     if (sel hash_closed.err) { ret hash_closed; }
 
-    val relocs_written: err[fail.Fail] = write_relative_relocs(buf, ?fp, reladyn_row, relative_type_for(tgt_isa.arch_id), dyn, segs, seg_count);
+    val relocs_written: err[fail.Fail] = write_relative_relocs(buf, fp, reladyn_row, relative_type_for(img.target.arch_id), dyn,
+        segs, seg_count);
     if (sel relocs_written.err) { ret relocs_written; }
 
-    var dpos: usize = of_plan.offset(?fp, dyn_row);
+    var dpos: usize = of_plan.offset(fp, dyn_row);
     dpos = write_dyn_entry(buf, dpos, DT_SONAME, soname_off::u64);
     dpos = write_dyn_entry(buf, dpos, DT_HASH, hash_va);
     dpos = write_dyn_entry(buf, dpos, DT_STRTAB, dynstr_va);
@@ -3143,26 +3107,17 @@ fun emit_shared(img: *target_of.LinkedImage, dst: *of_destination.Destination) e
     dpos = write_dyn_entry(buf, dpos, DT_SYMENT, SYM_SIZE::u64);
     if (nrel > 0) {
         dpos = write_dyn_entry(buf, dpos, DT_RELA, reladyn_va);
-        dpos = write_dyn_entry(buf, dpos, DT_RELASZ, of_plan.size(?fp, reladyn_row)::u64);
+        dpos = write_dyn_entry(buf, dpos, DT_RELASZ, of_plan.size(fp, reladyn_row)::u64);
         dpos = write_dyn_entry(buf, dpos, DT_RELAENT, RELA_SIZE::u64);
         dpos = write_dyn_entry(buf, dpos, DT_RELACOUNT, nrel::u64);
     }
     dpos = write_dyn_entry(buf, dpos, DT_NULL, 0);
-    val dyn_closed: err[fail.Fail] = of_plan.close(?fp, dyn_row, dpos);
+    val dyn_closed: err[fail.Fail] = of_plan.close(fp, dyn_row, dpos);
     if (sel dyn_closed.err) { ret dyn_closed; }
 
-    val phdr_end: usize = write_pie_phdrs(buf, ?fp, phdr_offset, phdr_count, segs, pro.seg_rows, seg_count,
-        pro.note_off, ro_off, ro_va, ro_size, of_plan.offset(?fp, dyn_row), dyn_va, of_plan.size(?fp, dyn_row), dyn, page_size, true, ?eh_hdr);
-    val phdr_closed: err[fail.Fail] = of_plan.close(?fp, pro.phdr_row, phdr_end);
-    if (sel phdr_closed.err) { ret phdr_closed; }
-
-    val sht_written: err[fail.Fail] = debug_sht_write(buf, itn, ?elay, ?fp, debug, debug_count, aux, aux_count, ?sb, ?dsht);
-    if (sel sht_written.err) { ret sht_written; }
-
-    val identified: err[fail.Fail] = seal_build_id(buf, total_size, ?elay, pro.note_off);
-    if (sel identified.err) { ret identified; }
-
-    ret err[fail.Fail].ok{};
+    ret image_finish(?b, write_pie_phdrs(buf, fp, b.phdr_offset, b.phdr_count, segs, b.pro.seg_rows, seg_count,
+        b.pro.note_off, ro_off, ro_va, ro_size, of_plan.offset(fp, dyn_row), dyn_va, of_plan.size(fp, dyn_row), dyn, page_size,
+        true, ?b.eh_hdr));
 }
 
 fun jump_slot_for(arch_id: u32) u32 {
@@ -3319,35 +3274,16 @@ fun dynstr_name_len(itn: *intern.Interner, id: intern.StrId) usize {
     ret str_len(s) + 1;
 }
 
+val DYN_CLASS_REFUSAL: str = "a dynamically linked executable is ELF64-only (an ELFCLASS32 dynamic image is not implemented)";
+
 fun emit_dyn_exec(img: *target_of.LinkedImage, dst: *of_destination.Destination) err[fail.Fail] {
-    val alloc:        *A.Allocator            = img.alloc;
-    val itn:          *intern.Interner        = img.interner;
-    val tgt_isa:      *target_of.ObjectTarget = img.target;
-    val segs:         *target_of.LoadSegment  = img.segments;
-    val seg_count:    u32                     = img.segment_count;
-    val page_size:    u64                     = img.page_size;
-    val entry:        u64                     = img.entry;
-    val funcs:        *target_of.ExecFunction = img.functions;
-    val func_count:   u32                     = img.function_count;
-    val dyn:          *target_of.DynamicInfo  = img.dynamic;
-    val fixups:       *target_of.ImportFixup  = img.dynamic.call_fixups;
-    val fixup_count:  u32                     = img.dynamic.call_fixup_count;
-    val debug:        *target_of.Section      = img.debug;
-    val debug_count:  u32                     = img.debug_count;
-    val symtab:       *target_of.SymtabEntry  = img.symbols;
-    val symtab_count: u32                     = img.symbol_count;
-
-    val image_options: target_of.ImageOptions = img.options;
-
-    var elay: ElfLayout = layout_for(tgt_isa);
-    if (elay.class != ELFCLASS64) {
-        ret err[fail.Fail].err{fail.user(diagnostic_kind.TARGET_OUTPUT_UNSUPPORTED, "a dynamically linked executable is ELF64-only (an ELFCLASS32 dynamic image is not implemented)")};
+    val dyn: *target_of.DynamicInfo = img.dynamic;
+    if (layout_for(img.target).class != ELFCLASS64) {
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.TARGET_OUTPUT_UNSUPPORTED, DYN_CLASS_REFUSAL)};
     }
-
-    if (!dyn_arch_supported(tgt_isa.arch_id)) {
+    if (!dyn_arch_supported(img.target.arch_id)) {
         ret err[fail.Fail].err{fail.user(diagnostic_kind.TARGET_OUTPUT_UNSUPPORTED, "dynamic linking is not implemented for this architecture")};
     }
-
     if (dyn.pie) {
         if (dyn.import_count > 0 || dyn.lib_count > 0) {
             ret err[fail.Fail].err{fail.user(diagnostic_kind.TARGET_OUTPUT_UNSUPPORTED, "PIE with dynamic imports is not supported (static-PIE only)")};
@@ -3355,41 +3291,28 @@ fun emit_dyn_exec(img: *target_of.LinkedImage, dst: *of_destination.Destination)
         ret emit_pie_exec(img, dst);
     }
 
-    val nimp:        u32                               = func_import_count(dyn);
+    val alloc:     *A.Allocator           = img.alloc;
+    val itn:       *intern.Interner       = img.interner;
+    val segs:      *target_of.LoadSegment = img.segments;
+    val seg_count: u32                    = img.segment_count;
+    val arch_id:   u32                    = img.target.arch_id;
+    val nimp:      u32                    = func_import_count(dyn);
+
     val planned_got: res[ImportAddressPlan, fail.Fail] = import_address_plan(alloc, dyn);
     if (sel planned_got.err) { ret err[fail.Fail].err{planned_got.err}; }
     var got: ImportAddressPlan = planned_got.ok;
     fin { import_address_plan_dnit(alloc, ?got); }
 
-    val sect_count: u32                         = image_section_count(segs, seg_count);
-    val sb_r:       res[SymtabBuild, fail.Fail] = build_symtab_bytes(alloc, itn, ?elay, symtab, symtab_count, segs, seg_count);
-    if (sel sb_r.err) { ret err[fail.Fail].err{sb_r.err}; }
-    var sb: SymtabBuild = sb_r.ok;
-    fin { free_symtab_bytes(alloc, ?sb); }
-
-    val hi_va: u64 = highest_vaddr(segs, seg_count);
-
-    var eh_hdr:  cfi.UnwindRoom;
-    val unwound: err[fail.Fail] = fill_unwind(alloc, tgt_isa.arch_id, segs, seg_count, funcs, func_count, ?eh_hdr);
-    if (sel unwound.err) { ret unwound; }
-
+    var b: ImageBuild;
+    fin { image_build_dnit(?b); }
+    val begun: err[fail.Fail] = image_begin(?b, img, DYN_CLASS_REFUSAL);
+    if (sel begun.err) { ret begun; }
     var phdr_count: u32 = seg_count + 6;
-    if (eh_hdr.present) { phdr_count = phdr_count + 1; }
-
-    if (!header_fits_reserved_page(?elay, phdr_count, page_size)) {
-        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_SIZE_LIMIT, "dynamic-exec program headers exceed the one-page header reservation (too many load segments)")};
-    }
-
-    val planned: res[of_plan.FilePlan, fail.Fail] = of_plan.init(alloc, itn, "elf", elf_limit(?elay));
-    if (sel planned.err) { ret err[fail.Fail].err{planned.err}; }
-    var fp: of_plan.FilePlan = planned.ok;
-    fin { of_plan.dnit(?fp); }
-
-    val pro_r: res[ImagePrologue, fail.Fail] = place_image_prologue(alloc, ?fp, ?elay, phdr_count, page_size, segs, seg_count);
-    if (sel pro_r.err) { ret err[fail.Fail].err{pro_r.err}; }
-    var pro: ImagePrologue = pro_r.ok;
-    fin { image_prologue_free(alloc, ?pro, seg_count); }
-    val phdr_offset: usize = of_plan.offset(?fp, pro.phdr_row);
+    if (b.eh_hdr.present) { phdr_count = phdr_count + 1; }
+    val prologue: err[fail.Fail] = image_prologue(?b, phdr_count,
+        "dynamic-exec program headers exceed the one-page header reservation (too many load segments)");
+    if (sel prologue.err) { ret prologue; }
+    val fp: *of_plan.FilePlan = ?b.fp;
 
     var seg_offsets: *usize = nil;
     if (seg_count > 0) {
@@ -3398,7 +3321,7 @@ fun emit_dyn_exec(img: *target_of.LinkedImage, dst: *of_destination.Destination)
         seg_offsets = so.ok;
         var li: u32 = 0;
         for (li < seg_count) {
-            seg_offsets[li] = of_plan.offset(?fp, pro.seg_rows[li]);
+            seg_offsets[li] = of_plan.offset(fp, b.pro.seg_rows[li]);
             li              = li + 1;
         }
     }
@@ -3406,57 +3329,18 @@ fun emit_dyn_exec(img: *target_of.LinkedImage, dst: *of_destination.Destination)
         if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
     }
 
-    val struct_va: res[u64, fail.Fail] = of_plan.align_address(?fp, "read-only structures", hi_va, page_size);
+    val struct_va: res[u64, fail.Fail] = of_plan.align_address(fp, "read-only structures", b.hi_va, img.page_size);
     if (sel struct_va.err) { ret err[fail.Fail].err{struct_va.err}; }
 
     var lay:  DynLayout;
-    val laid: err[fail.Fail] = compute_dyn_layout(itn, ?fp, ?lay, dyn, ?got, nimp, tgt_isa.arch_id,
-        struct_va.ok, page_size);
+    val laid: err[fail.Fail] = compute_dyn_layout(itn, fp, ?lay, dyn, ?got, nimp, arch_id, struct_va.ok, img.page_size);
     if (sel laid.err) { ret laid; }
-    val located: err[fail.Fail] = locate_plt(alloc, dyn, nimp, tgt_isa.arch_id, segs, seg_count, seg_offsets, ?lay);
+    val located: err[fail.Fail] = locate_plt(alloc, dyn, nimp, arch_id, segs, seg_count, seg_offsets, ?lay);
     if (sel located.err) { ret located; }
 
-    var aux:       *ShtAlloc = nil;
-    var aux_count: u32       = 0;
-    if (sb.symtab_bytes != nil) {
-        aux_count = sect_count + 2;
-        val axr: res[*ShtAlloc, A.Error] = A.zallocate[ShtAlloc](alloc, aux_count::usize);
-        if (sel axr.err) { ret err[fail.Fail].err{fail.message("dyn-exec aux-section table alloc failed")}; }
-        aux = axr.ok;
-        val filled: err[fail.Fail] = fill_image_section_aux(alloc, itn, ?fp, aux, segs, pro.seg_rows, seg_count);
-        if (sel filled.err) { ret filled; }
-        fill_note_aux(?aux[sect_count], pro.note_off, prologue_note_vaddr(segs, seg_count, pro.note_off, page_size));
-        aux[sect_count + 1].name    = ".dynamic";
-        aux[sect_count + 1].sh_type = SHT_DYNAMIC;
-        aux[sect_count + 1].flags   = SHF_ALLOC;
-        aux[sect_count + 1].addr    = lay.dynamic_va;
-        aux[sect_count + 1].off     = lay.dynamic_off;
-        aux[sect_count + 1].size    = lay.dynamic_size;
-        aux[sect_count + 1].link    = 0;
-        aux[sect_count + 1].info    = 0;
-        aux[sect_count + 1].align   = 8;
-        aux[sect_count + 1].entsize = DYN_SIZE;
-    }
-    fin {
-        if (aux != nil) { A.deallocate[ShtAlloc](alloc, aux, aux_count::usize); }
-    }
-
-    val dp: res[DebugSht, fail.Fail] = debug_sht_plan(alloc, itn, ?elay, ?fp, debug, debug_count, aux, aux_count, ?sb);
-    if (sel dp.err) { ret err[fail.Fail].err{dp.err}; }
-    var dsht: DebugSht = dp.ok;
-    fin { debug_sht_free(alloc, ?dsht, debug_count, aux_count); }
-
-    val sealed: res[usize, fail.Fail] = of_plan.seal(?fp);
-    if (sel sealed.err) { ret err[fail.Fail].err{sealed.err}; }
-    val total_size: usize = sealed.ok;
-
-    var e_shoff:       u64            = 0;
-    var e_shnum:       u16            = 0;
-    var e_shstrndx:    u16            = 0;
-    val header_fields: err[fail.Fail] = debug_sht_header(?fp, ?dsht, ?e_shoff, ?e_shnum, ?e_shstrndx);
-    if (sel header_fields.err) { ret header_fields; }
-    val phnum: res[u16, fail.Fail] = of_plan.field_u16(?fp, phdr_count::usize, "e_phnum");
-    if (sel phnum.err) { ret err[fail.Fail].err{phnum.err}; }
+    val rows: res[*ShtAlloc, fail.Fail] = image_rows(?b, 1);
+    if (sel rows.err) { ret err[fail.Fail].err{rows.err}; }
+    alloc_row(rows.ok, ".dynamic", SHT_DYNAMIC, lay.dynamic_va, lay.dynamic_off, lay.dynamic_size, 0, 0, 8, DYN_SIZE);
 
     var imp_str: *usize = nil;
     if (dyn.import_count > 0) {
@@ -3477,36 +3361,20 @@ fun emit_dyn_exec(img: *target_of.LinkedImage, dst: *of_destination.Destination)
         if (lib_str != nil) { A.deallocate[usize](alloc, lib_str, dyn.lib_count::usize); }
     }
 
-    val res_buf: res[*u8, fail.Fail] = of_destination.file_add(dst, "", total_size, 0o755);
-    if (sel res_buf.err) { ret err[fail.Fail].err{res_buf.err}; }
-    var buf: *u8 = res_buf.ok;
+    val sealed: err[fail.Fail] = image_seal(?b, dst, ET_EXEC, img.entry);
+    if (sel sealed.err) { ret sealed; }
+    val buf: *u8 = b.buf;
 
-    write_elf_ident(buf, ?elay);
-    write_ehdr(buf, ?elay, ET_EXEC, machine_for_arch(tgt_isa.arch_id), image_options.machine_flags,
-        entry, phdr_offset::u64, e_shoff, phnum.ok, e_shnum, e_shstrndx);
-
-    copy_segment_rows(buf, ?fp, segs, pro.seg_rows, seg_count);
-
-    val structures: err[fail.Fail] = write_dyn_structures(itn, buf, ?fp, ?lay, dyn, ?got, nimp, tgt_isa.arch_id, imp_str, lib_str);
+    val structures: err[fail.Fail] = write_dyn_structures(itn, buf, fp, ?lay, dyn, ?got, nimp, arch_id, imp_str, lib_str);
     if (sel structures.err) { ret structures; }
-    val plt_r: err[fail.Fail] =
-        patch_plt_fixups(buf, ?lay, dyn, fixups, fixup_count, seg_offsets, segs, seg_count, nimp, tgt_isa.arch_id);
+    val plt_r: err[fail.Fail] = patch_plt_fixups(buf, ?lay, dyn, dyn.call_fixups, dyn.call_fixup_count, seg_offsets, segs,
+        seg_count, nimp, arch_id);
     if (sel plt_r.err) { ret plt_r; }
-    val import_r: err[fail.Fail] = patch_import_addr_fixups(buf, ?lay, dyn, ?got, seg_offsets, segs, seg_count,
-        tgt_isa.arch_id);
+    val import_r: err[fail.Fail] = patch_import_addr_fixups(buf, ?lay, dyn, ?got, seg_offsets, segs, seg_count, arch_id);
     if (sel import_r.err) { ret import_r; }
 
-    val phdr_end:    usize          = write_dyn_phdrs(buf, ?fp, phdr_offset, phdr_count, ?lay, segs, pro.seg_rows, seg_count, pro.note_off, page_size, ?eh_hdr);
-    val phdr_closed: err[fail.Fail] = of_plan.close(?fp, pro.phdr_row, phdr_end);
-    if (sel phdr_closed.err) { ret phdr_closed; }
-
-    val sht_written: err[fail.Fail] = debug_sht_write(buf, itn, ?elay, ?fp, debug, debug_count, aux, aux_count, ?sb, ?dsht);
-    if (sel sht_written.err) { ret sht_written; }
-
-    val identified: err[fail.Fail] = seal_build_id(buf, total_size, ?elay, pro.note_off);
-    if (sel identified.err) { ret identified; }
-
-    ret err[fail.Fail].ok{};
+    ret image_finish(?b, write_dyn_phdrs(buf, fp, b.phdr_offset, b.phdr_count, ?lay, segs, b.pro.seg_rows, seg_count,
+        b.pro.note_off, img.page_size, ?b.eh_hdr));
 }
 
 # the dynamic structures are placed from the plan's cursor: the read-only run
@@ -5940,6 +5808,8 @@ test emit_pie_exec__static_pie_layout {
     dyn.base_reloc_count = 1;
     dyn.pie              = true;
 
+    var lsecs: [1]target_of.LoadSection;
+    if (!t_segment_sections(?i, ?segs[0], 1, ?lsecs[0])) { ret 9; }
     val tf_r: res[output_testing.Output, fail.Fail] = output_testing.create(?alloc, "elf_pie");
     if (sel tf_r.err) { ret 1; }
     var tf: output_testing.Output = tf_r.ok;
@@ -6033,6 +5903,30 @@ fun t_one_text_section(itn: *intern.Interner, seg: *target_of.LoadSegment, sec: 
     sec.flags         = 0;
     seg.sections      = sec;
     seg.section_count = 1;
+    ret true;
+}
+
+# one section per segment, named for the segment's place in the image, as the
+# linker hands a writer every segment
+#[testing]
+fun t_segment_sections(itn: *intern.Interner, segs: *target_of.LoadSegment, count: u32, secs: *target_of.LoadSection) bool {
+    val names: [4]str = [4]str{".s0", ".s1", ".s2", ".s3"};
+    var i:     u32    = 0;
+    for (i < count) {
+        if (i >= 4) { ret false; }
+        secs[i].name = t_intern(itn, names[i]);
+        if (intern.str_is_nil(secs[i].name)) { ret false; }
+        secs[i].kind = target_of.SK_RODATA;
+        if ((segs[i].flags & target_of.SEG_FLAG_EXECUTE) != 0) { secs[i].kind = target_of.SK_TEXT; }
+        or ((segs[i].flags & target_of.SEG_FLAG_WRITE) != 0)   { secs[i].kind = target_of.SK_DATA; }
+        secs[i].offset        = 0;
+        secs[i].len           = segs[i].filesz::u32;
+        secs[i].align         = 1;
+        secs[i].flags         = 0;
+        segs[i].sections      = ?secs[i];
+        segs[i].section_count = 1;
+        i                     = i + 1;
+    }
     ret true;
 }
 
@@ -6248,6 +6142,8 @@ test emit_pie_exec__relro_splits_rodata_from_rel_ro {
     dyn.base_reloc_count = 2;
     dyn.pie              = true;
 
+    var lsecs: [4]target_of.LoadSection;
+    if (!t_segment_sections(?i, ?segs[0], 4, ?lsecs[0])) { ret 9; }
     val tf_r: res[output_testing.Output, fail.Fail] = output_testing.create(?alloc, "elf_relro");
     if (sel tf_r.err) { ret 1; }
     var tf: output_testing.Output = tf_r.ok;
@@ -6351,6 +6247,8 @@ test emit_pie_exec__page_align_congruence_64k {
     dyn.base_reloc_count = 1;
     dyn.pie              = true;
 
+    var lsecs: [3]target_of.LoadSection;
+    if (!t_segment_sections(?i, ?segs[0], 3, ?lsecs[0])) { ret 9; }
     val tf_r: res[output_testing.Output, fail.Fail] = output_testing.create(?alloc, "elf_align");
     if (sel tf_r.err) { ret 1; }
     var tf: output_testing.Output = tf_r.ok;
@@ -6755,6 +6653,8 @@ test emit_pie_exec__debug_sections_trailing_nonloaded {
     dbg[0].len   = 4;
     dbg[0].align = 1;
 
+    var lsecs: [1]target_of.LoadSection;
+    if (!t_segment_sections(?i, ?segs[0], 1, ?lsecs[0])) { ret 9; }
     val tf_r: res[output_testing.Output, fail.Fail] = output_testing.create(?alloc, "elf_pie_dbg");
     if (sel tf_r.err) { ret 1; }
     var tf: output_testing.Output = tf_r.ok;
@@ -6776,11 +6676,12 @@ test emit_pie_exec__debug_sections_trailing_nonloaded {
     val e_shnum:    u32   = bin.read_u16_le(buf.data, 60)::u32;
     val e_shstrndx: u32   = bin.read_u16_le(buf.data, 62)::u32;
     if (e_shoff == 0)    { bad = true; }
-    if (e_shnum != 3)    { bad = true; }
-    if (e_shstrndx != 2) { bad = true; }
+    if (e_shnum != 6)    { bad = true; }
+    if (e_shstrndx != 5) { bad = true; }
     if (bad)             { ret 1; }
 
-    val sh1: usize = e_shoff + 1 * SHDR_SIZE;
+    # the allocated rows lead: the segment's section, the note, the dynamic section
+    val sh1: usize = e_shoff + 4 * SHDR_SIZE;
     if (bin.read_u32_le(buf.data, sh1 + 4) != SHT_PROGBITS)    { bad = true; }
     if ((bin.read_u64_le(buf.data, sh1 + 8) & SHF_ALLOC) != 0) { bad = true; }
     if (bin.read_u64_le(buf.data, sh1 + 16) != 0)              { bad = true; }
