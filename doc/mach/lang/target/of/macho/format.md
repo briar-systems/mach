@@ -774,12 +774,6 @@ pub val CODE_SIG_PAGE_SIZE:     usize = 4096
 pub val CODE_SIG_ALIGN:         usize = 16
 ```
 
-## fun arch_is_arm64
-
-```mach
-pub fun arch_is_arm64(arch_id: u32) bool;
-```
-
 ## rec IsaRow
 
 ```mach
@@ -803,6 +797,14 @@ the row of an instruction set mach-o covers, nil for any other
 ```mach
 pub fun macho_page_size(arch_id: u32) u64;
 ```
+
+## fun row_for_cpu
+
+```mach
+pub fun row_for_cpu(cpu_type: u32) *IsaRow;
+```
+
+the row of the instruction set a header's cpu type names, nil for any other
 
 ## fun cpu_type_for
 
