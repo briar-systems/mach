@@ -347,14 +347,6 @@ fwd comptime_value.typed_int
 
 forwards [`mach.lang.fe.comptime.value.typed_int`](comptime/value.md#fun-typed_int)
 
-## fwd comptime_capability.COMPTIME_CASE_NO_PAYLOAD_MSG
-
-```mach
-fwd comptime_capability.COMPTIME_CASE_NO_PAYLOAD_MSG
-```
-
-forwards [`mach.lang.fe.comptime.capability.COMPTIME_CASE_NO_PAYLOAD_MSG`](comptime/capability.md#val-comptime_case_no_payload_msg)
-
 ## fwd comptime_capability.FIELD_SEL_CODE
 
 ```mach
@@ -498,22 +490,6 @@ fwd comptime_capability.TYPE_QUERY_NAME
 ```
 
 forwards [`mach.lang.fe.comptime.capability.TYPE_QUERY_NAME`](comptime/capability.md#val-type_query_name)
-
-## fwd comptime_capability.field_member
-
-```mach
-fwd comptime_capability.field_member
-```
-
-forwards [`mach.lang.fe.comptime.capability.field_member`](comptime/capability.md#fun-field_member)
-
-## fwd comptime_capability.field_type_by_name
-
-```mach
-fwd comptime_capability.field_type_by_name
-```
-
-forwards [`mach.lang.fe.comptime.capability.field_type_by_name`](comptime/capability.md#fun-field_type_by_name)
 
 ## fwd comptime_capability.loading_capabilities
 
@@ -907,30 +883,6 @@ fwd comptime_scope.reader_init
 
 forwards [`mach.lang.fe.comptime.scope.reader_init`](comptime/scope.md#fun-reader_init)
 
-## fwd comptime_scope.set_build_context
-
-```mach
-fwd comptime_scope.set_build_context
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_build_context`](comptime/scope.md#fun-set_build_context)
-
-## fwd comptime_scope.set_ct_mul
-
-```mach
-fwd comptime_scope.set_ct_mul
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_ct_mul`](comptime/scope.md#fun-set_ct_mul)
-
-## fwd comptime_scope.set_extensions
-
-```mach
-fwd comptime_scope.set_extensions
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_extensions`](comptime/scope.md#fun-set_extensions)
-
 ## fwd comptime_scope.set_gate_state
 
 ```mach
@@ -939,13 +891,21 @@ fwd comptime_scope.set_gate_state
 
 forwards [`mach.lang.fe.comptime.scope.set_gate_state`](comptime/scope.md#fun-set_gate_state)
 
-## fwd comptime_scope.set_nan_rule
+## fwd comptime_scope.BuildFacts
 
 ```mach
-fwd comptime_scope.set_nan_rule
+fwd comptime_scope.BuildFacts
 ```
 
-forwards [`mach.lang.fe.comptime.scope.set_nan_rule`](comptime/scope.md#fun-set_nan_rule)
+forwards [`mach.lang.fe.comptime.scope.BuildFacts`](comptime/scope.md#rec-buildfacts)
+
+## fwd comptime_scope.build_facts
+
+```mach
+fwd comptime_scope.build_facts
+```
+
+forwards [`mach.lang.fe.comptime.scope.build_facts`](comptime/scope.md#fun-build_facts)
 
 ## fwd comptime_scope.set_source_context
 
@@ -954,38 +914,6 @@ fwd comptime_scope.set_source_context
 ```
 
 forwards [`mach.lang.fe.comptime.scope.set_source_context`](comptime/scope.md#fun-set_source_context)
-
-## fwd comptime_scope.set_target_defs
-
-```mach
-fwd comptime_scope.set_target_defs
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_target_defs`](comptime/scope.md#fun-set_target_defs)
-
-## fwd comptime_scope.set_union_build
-
-```mach
-fwd comptime_scope.set_union_build
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_union_build`](comptime/scope.md#fun-set_union_build)
-
-## fwd comptime_scope.set_va_list
-
-```mach
-fwd comptime_scope.set_va_list
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_va_list`](comptime/scope.md#fun-set_va_list)
-
-## fwd comptime_scope.set_vocabulary
-
-```mach
-fwd comptime_scope.set_vocabulary
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_vocabulary`](comptime/scope.md#fun-set_vocabulary)
 
 ## fwd comptime_scope.stage_init
 
@@ -1022,6 +950,14 @@ pub val COMPTIME_CASE_UNKNOWN_MEMBER_MSG: str =
 pub val COMPTIME_DESCRIPTOR_LAYOUT_MSG: str =
 "this descriptor's offset has no answer: the layout of its owning type could not be determined"
 ```
+
+## fwd comptime_capability.COMPTIME_CASE_NO_PAYLOAD_MSG
+
+```mach
+fwd comptime_capability.COMPTIME_CASE_NO_PAYLOAD_MSG
+```
+
+forwards [`mach.lang.fe.comptime.capability.COMPTIME_CASE_NO_PAYLOAD_MSG`](comptime/capability.md#val-comptime_case_no_payload_msg)
 
 ## fun evaluate
 

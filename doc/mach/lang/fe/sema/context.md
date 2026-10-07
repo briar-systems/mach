@@ -410,11 +410,29 @@ pub fun reported_since(sc: *SemaContext, mark: u64) bool;
 pub fun report_note(sc: *SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, message: str, note: str);
 ```
 
-## fun report_numbered
+## fun text
 
 ```mach
-pub fun report_numbered(sc: *SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str, n: usize, suffix: str, fallback: str);
+pub fun text(sc: *SemaContext, fmt: str, args: ...) opt[str];
 ```
+
+`fmt` formatted with `args`, owned by the caller and released with `text_free`; a refused
+format fails the phase as an internal failure and gives none
+
+## fun text_free
+
+```mach
+pub fun text_free(sc: *SemaContext, t: str);
+```
+
+## fun reportf
+
+```mach
+pub fun reportf(sc: *SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, fmt: str, args: ...);
+```
+
+a diagnostic whose message is `fmt` formatted with `args`; a refused format fails the
+phase as an internal failure, here and nowhere else
 
 ## fun field_table_stage
 
@@ -445,6 +463,14 @@ pub fun field_table_for(sc: *SemaContext, ty: type.TypeId) opt[*FieldTable];
 ```mach
 pub fun field_lookup(sc: *SemaContext, ty: type.TypeId, name: intern.StrId) opt[type.TypeId];
 ```
+
+## fun type_store
+
+```mach
+pub fun type_store(sc: *SemaContext) *type.TypeInterner;
+```
+
+the type store a comptime evaluation inside this walk reads
 
 ## fun resolve_type_comparison_operand
 
@@ -503,6 +529,14 @@ pub fun set_embed_len(sc: *SemaContext, tid: ast_id.TypeId, len: u64);
 ```mach
 pub fun record_embed_path(sc: *SemaContext, path_id: intern.StrId) err[fail.Fail];
 ```
+
+## fun query_of
+
+```mach
+pub fun query_of(sc: *SemaContext) type_query.Query;
+```
+
+a question to the type store whose internal failures land in this context
 
 ## fun recover
 

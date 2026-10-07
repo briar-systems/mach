@@ -193,7 +193,8 @@ expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure
 pub fun semantic_type_capabilities[T](
 member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 type_: fun(*T, ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail],
-field: fun(*T, u32, u32, u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
+types: fun(*T) *type.TypeInterner,
+offset: fun(*T, u32, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 query: fun(*T, u32, u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 layout: fun(*T, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 cast: fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail],
@@ -208,7 +209,8 @@ expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure
 pub fun lowering_capabilities[T](
 member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 type_: fun(*T, ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail],
-field: fun(*T, u32, u32, u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
+types: fun(*T) *type.TypeInterner,
+offset: fun(*T, u32, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 query: fun(*T, u32, u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 layout: fun(*T, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 cast: fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail],
@@ -241,22 +243,12 @@ pub fun capabilities_have_types[T](ctx: *T, caps: PhaseCapabilities[T]) bool;
 pub fun capabilities_cast[T](ctx: *T, caps: PhaseCapabilities[T]) bool;
 ```
 
-## fun field_member
+## fun field_of
 
 ```mach
-pub fun field_member(types: *type.TypeInterner, owner: u32, index: u32, pick: u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
+pub fun field_of[T](ctx: *T, caps: PhaseCapabilities[T], owner: u32, index: u32, pick: u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
 ```
 
-a field descriptor's member from the declared types alone, the same in every
-phase; none for `offset`, which each phase answers from its own layout, and
-for an unknown field or a member it does not hold
-
-## fun field_type_by_name
-
-```mach
-pub fun field_type_by_name(types: *type.TypeInterner, owner_ty: type.TypeId, name: intern.StrId) opt[comptime_value.CTValue];
-```
-
-the declared type of a field or case payload named on an owner; none for an
-unknown name or a payloadless case
+what a field descriptor answers about field `index` of `owner`, `pick` naming the member
+asked; every answer but the offset reads the type store, and the offset is the phase's
 
