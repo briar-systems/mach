@@ -600,6 +600,14 @@ fwd FieldTable: type_field.Table
 
 forwards [`mach.lang.type.field.Table`](type/field.md#rec-table)
 
+## fwd Decoration
+
+```mach
+fwd Decoration: type_field.Decoration
+```
+
+forwards [`mach.lang.type.field.Decoration`](type/field.md#rec-decoration)
+
 ## rec TypeSecret
 
 ```mach
@@ -1067,6 +1075,20 @@ pub fun field_table_stage_push_entry(ti: *TypeInterner, fe: FieldEntry) err[fail
 
 ```mach
 pub fun field_table_publish(ti: *TypeInterner, ty: TypeId, fields_start: u32, fields_len: u32) err[fail.Fail];
+```
+
+## fun decoration_of
+
+```mach
+pub fun decoration_of(ti: *TypeInterner, tid: TypeId) Decoration;
+```
+
+the layout decorations nominal `tid` declares under the current projection
+
+## fun decoration_set
+
+```mach
+pub fun decoration_set(ti: *TypeInterner, tid: TypeId, d: Decoration) err[fail.Fail];
 ```
 
 ## fun aggregate_nominal

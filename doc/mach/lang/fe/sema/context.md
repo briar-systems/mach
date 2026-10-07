@@ -123,6 +123,8 @@ pub rec Typing;
 the typing of one module that every walk of it shares: the instances it asks for, its
 growing cycles, and the reports each instance would otherwise repeat
 
+caps: what a comptime evaluation in the walk may ask of sema now
+type_caps: the whole semantic set, which a module constant is always evaluated with
 collect_insts: whether the walk records the instances it asks for
 subst_fn: substitutes an instance's type arguments into a type
 annotation_check_fn: the per-instance checks over one type annotation, run as each is resolved
@@ -337,6 +339,12 @@ pub fun gate_set(sc: *SemaContext, cond: ast_id.ExprId, active: bool);
 ```
 
 the verdict the walk gives a comptime gate in its frame
+
+## fun public_type_for
+
+```mach
+pub fun public_type_for(sc: *SemaContext, sym: *resolve.Symbol) opt[sema_product.TypeExport];
+```
 
 ## fun decl_type_for
 
