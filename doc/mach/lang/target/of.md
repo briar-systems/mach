@@ -1,39 +1,39 @@
 # mach.lang.target.of
 
-## val OF_ELF
+## val ELF
 
 ```mach
-pub val OF_ELF:     u32 = 1
+pub val ELF:        u32 = 1
 ```
 
-## val OF_MACHO
+## val MACHO
 
 ```mach
-pub val OF_MACHO:   u32 = 2
+pub val MACHO:      u32 = 2
 ```
 
-## val OF_COFF
+## val COFF
 
 ```mach
-pub val OF_COFF:    u32 = 3
+pub val COFF:       u32 = 3
 ```
 
-## val OF_RAW
+## val RAW
 
 ```mach
-pub val OF_RAW:     u32 = 4
+pub val RAW:        u32 = 4
 ```
 
-## val OF_SPV
+## val SPV
 
 ```mach
-pub val OF_SPV:     u32 = 5
+pub val SPV:        u32 = 5
 ```
 
-## val OF_FORMAT_CATALOG_VERSION
+## val FORMAT_CATALOG_VERSION
 
 ```mach
-pub val OF_FORMAT_CATALOG_VERSION: u8 = 1
+pub val FORMAT_CATALOG_VERSION: u8 = 1
 ```
 
 ## fun of_name_for
@@ -1201,18 +1201,26 @@ pub def ResolveRelocOperandFn: fun(*ObjectImage, u32) res[RelocOperand, fail.Fai
 ## def MachineFlagsFn
 
 ```mach
-pub def MachineFlagsFn: fun(u32, bool) u32
+pub def MachineFlagsFn: fun(*ObjectTarget) u32
 ```
 
-(float_arg_bits, has_compressed): the processor flags word a header records
+the processor flags word a header records for an object built for the target
+
+## def MachineFlagsNameFn
+
+```mach
+pub def MachineFlagsNameFn: fun(u32) str
+```
+
+names the calling-convention bits of a flags word for a refusal
 
 ## def BuildAttributesFn
 
 ```mach
-pub def BuildAttributesFn: fun(*A.Allocator, u32, u64, u32, bool, *u32) res[*u8, fail.Fail]
+pub def BuildAttributesFn: fun(*A.Allocator, *ObjectTarget, *u32) res[*u8, fail.Fail]
 ```
 
-build: (alloc, xlen_bits, selected extension bits, float_arg_bits, has_compressed, out_len)
+build: (alloc, the target, out_len)
 
 ## def MergeAttributesFn
 
@@ -1223,10 +1231,10 @@ pub def MergeAttributesFn: fun(*A.Allocator, *u8, u32, *u8, u32, *u32) res[*u8, 
 ## def ValidateAttributesFn
 
 ```mach
-pub def ValidateAttributesFn: fun(*u8, u32, u32, u32) err[fail.Fail]
+pub def ValidateAttributesFn: fun(*u8, u32, *ObjectTarget, u32) err[fail.Fail]
 ```
 
-validate: (bytes, len, xlen_bits, object machine flags), an input's section and flags
+validate: (bytes, len, the target, object machine flags), an input's section and flags
 against what the target can link at all, never against the extensions it selects
 
 ## rec IsaRecord
@@ -1505,10 +1513,19 @@ pub rec OfVTable;
 pub rec ArtifactName;
 ```
 
+## rec SystemNaming
+
+```mach
+pub rec SystemNaming;
+```
+
+how a system names the libraries and programs it runs: the affixes of a
+static library and the suffix of an executable
+
 ## fun artifact_naming
 
 ```mach
-pub fun artifact_naming(vt: *OfVTable, os_name: str, kind: catalog_artifact.Kind) res[ArtifactName, fail.Fail];
+pub fun artifact_naming(vt: *OfVTable, system: *SystemNaming, kind: catalog_artifact.Kind) res[ArtifactName, fail.Fail];
 ```
 
 ## fun validate
@@ -1643,11 +1660,26 @@ pub fun declares_machine_flags(vt: *OfVTable, arch_id: u32) bool;
 ## fun machine_flags
 
 ```mach
-pub fun machine_flags(vt: *OfVTable, arch_id: u32, float_arg_bits: u32, has_compressed: bool) u32;
+pub fun machine_flags(vt: *OfVTable, target: *ObjectTarget) u32;
 ```
 
-the processor flags word `vt` records for `arch_id` under an abi passing floats
-in `float_arg_bits`-wide registers; 0 when it records none
+the processor flags word `vt` records for an object built for `target`; 0 when it records none
+
+## fun machine_flags_abi
+
+```mach
+pub fun machine_flags_abi(vt: *OfVTable, arch_id: u32) u32;
+```
+
+the calling-convention bits of the flags word `vt` records for `arch_id`
+
+## fun machine_flags_abi_name
+
+```mach
+pub fun machine_flags_abi_name(vt: *OfVTable, arch_id: u32, abi_bits: u32) str;
+```
+
+the calling convention the bits `abi_bits` of a flags word name, for a refusal
 
 ## fun declares_attributes
 
@@ -1658,17 +1690,16 @@ pub fun declares_attributes(vt: *OfVTable, arch_id: u32) bool;
 ## fun attributes_build
 
 ```mach
-pub fun attributes_build(vt: *OfVTable, arch_id: u32, alloc: *A.Allocator, xlen_bits: u32, extensions: u64,
-float_arg_bits: u32, has_compressed: bool, out_len: *u32) res[*u8, fail.Fail];
+pub fun attributes_build(vt: *OfVTable, target: *ObjectTarget, alloc: *A.Allocator, out_len: *u32) res[*u8, fail.Fail];
 ```
 
-the attribute section body an object for `arch_id` carries, nil when the
+the attribute section body an object built for `target` carries, nil when the
 format carries none
 
 ## fun attributes_validate
 
 ```mach
-pub fun attributes_validate(vt: *OfVTable, arch_id: u32, xlen_bits: u32,
+pub fun attributes_validate(vt: *OfVTable, target: *ObjectTarget,
 bytes: *u8, len: u32, flags: u32) err[fail.Fail];
 ```
 

@@ -149,6 +149,9 @@ pub rec ConstEntry;
 pub rec ByteBuf;
 ```
 
+the bytes an encoder emits and what it records beside them: the listing they
+reach and the first refusal of the emission
+
 ## rec AsmSink
 
 ```mach

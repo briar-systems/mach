@@ -6,6 +6,8 @@
 pub fun machine_for_arch(arch_id: u32) u16;
 ```
 
+the machine field of an instruction set, 0 for one COFF does not cover
+
 ## fun looks_like_dll
 
 ```mach
