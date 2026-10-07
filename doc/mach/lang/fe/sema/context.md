@@ -518,6 +518,14 @@ pub fun set_embed_len(sc: *SemaContext, tid: ast_id.TypeId, len: u64);
 pub fun record_embed_path(sc: *SemaContext, path_id: intern.StrId) err[fail.Fail];
 ```
 
+## fun query_of
+
+```mach
+pub fun query_of(sc: *SemaContext) type_query.Query;
+```
+
+a question to the type store whose internal failures land in this context
+
 ## fun recover
 
 ```mach
