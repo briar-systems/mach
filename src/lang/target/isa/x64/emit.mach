@@ -1,0 +1,4192 @@
+# x64 instructions encoded to bytes in the encode buffer, and the vector forms built straight into it
+use mach.lang.fail;
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+use lang_mir: mach.lang.mir;
+use mach.lang.target.isa.common;
+use isa_encode: mach.lang.target.isa.encode;
+use isa_inst:   mach.lang.target.isa.inst;
+use mach.lang.target.isa.x64;
+use x64_inst:    mach.lang.target.isa.x64.inst;
+use x64_printer: mach.lang.target.isa.x64.printer;
+
+fun reg_bits(id: i32) u8 {
+    ret (isa_inst.regid_index(id) & 7)::u8;
+}
+
+pub fun operand_touches_reg(op: *isa_inst.Operand, reg: i32) bool {
+    if (op == nil)                   { ret false; }
+    if (op.kind == isa_inst.OPK_REG) { ret op.reg == reg; }
+    if (op.kind == isa_inst.OPK_MEM) { ret op.base == reg || op.index == reg; }
+    ret false;
+}
+
+pub fun pick_stage_scratch(a: *isa_inst.Operand, b: *isa_inst.Operand) i32 {
+    ret pick_stage_scratch_besides(a, b, isa_inst.REG_NONE);
+}
+
+# r11, else r10: a staging scratch neither operand touches and other than
+# `taken`, REG_NONE when none is free
+pub fun pick_stage_scratch_besides(a: *isa_inst.Operand, b: *isa_inst.Operand, taken: i32) i32 {
+    val cands: [2]i32 = [2]i32{x64.SCRATCH_REG, x64.SCRATCH_REG2};
+    var c:     u32    = 0;
+    for (c < 2) {
+        val reg: i32 = cands[c];
+        if (reg != taken && !operand_touches_reg(a, reg) && !operand_touches_reg(b, reg)) { ret reg; }
+        c = c + 1;
+    }
+    ret isa_inst.REG_NONE;
+}
+
+# a destination written only after the staging: its address registers must
+# survive it, a register it names need not
+pub fun store_target(op: *isa_inst.Operand) *isa_inst.Operand {
+    if (op.kind == isa_inst.OPK_MEM) { ret op; }
+    ret nil;
+}
+
+fun needs_rex(id: i32) bool {
+    val index: i32 = isa_inst.regid_index(id);
+    ret index >= 8 && index <= 15;
+}
+
+fun needs_rex_byte(id: i32) bool {
+    val index: i32 = isa_inst.regid_index(id);
+    ret index >= 4 && index <= 15;
+}
+
+fun encode_rex(w: u8, reg: i32, rm: i32) u8 {
+    var rex: u8 = 0x40;
+    if (w != 0) { rex = rex | 0x08; }
+    val reg_i: i32 = isa_inst.regid_index(reg);
+    val rm_i:  i32 = isa_inst.regid_index(rm);
+    if (reg_i >= 8 && reg_i <= 15) { rex = rex | 0x04; }
+    if (rm_i >= 8 && rm_i <= 15)   { rex = rex | 0x01; }
+    ret rex;
+}
+
+fun encode_rex_sib(w: u8, reg: i32, index: i32, base: i32) u8 {
+    var rex: u8 = 0x40;
+    if (w != 0) { rex = rex | 0x08; }
+    val reg_i:   i32 = isa_inst.regid_index(reg);
+    val index_i: i32 = isa_inst.regid_index(index);
+    val base_i:  i32 = isa_inst.regid_index(base);
+    if (reg_i >= 8 && reg_i <= 15)     { rex = rex | 0x04; }
+    if (index_i >= 8 && index_i <= 15) { rex = rex | 0x02; }
+    if (base_i >= 8 && base_i <= 15)   { rex = rex | 0x01; }
+    ret rex;
+}
+
+fun encode_modrm(mod_val: u8, reg: u8, rm: u8) u8 {
+    ret ((mod_val & 3) << 6) | ((reg & 7) << 3) | (rm & 7);
+}
+
+fun encode_sib(scale: u8, index: u8, base: u8) u8 {
+    ret ((scale & 3) << 6) | ((index & 7) << 3) | (base & 7);
+}
+
+fun size_to_w(size: u8, flags: u16) u8 {
+    if ((flags & x64_inst.FLAG_REX_W::u16) != 0) { ret 1; }
+    if (size >= 8)                               { ret 1; }
+    ret 0;
+}
+
+fun needs_any_rex(w: u8, reg: i32, rm: i32) bool {
+    if (w != 0) { ret true; }
+    val reg_i: i32 = isa_inst.regid_index(reg);
+    val rm_i:  i32 = isa_inst.regid_index(rm);
+    if (reg_i >= 8 && reg_i <= 15) { ret true; }
+    if (rm_i >= 8 && rm_i <= 15)   { ret true; }
+    ret false;
+}
+
+fun needs_rex_for_byte_reg(reg: i32) bool {
+    val index: i32 = isa_inst.regid_index(reg);
+    ret index >= 4 && index <= 7;
+}
+
+fun encode_mem_operand(buf: *isa_encode.ByteBuf, reg: i32, op: *isa_inst.Operand) {
+    encode_mem_operand_scaled(buf, reg, op, 1);
+}
+
+# the modrm, sib and displacement of a memory operand whose 8-bit displacement
+# counts units of `n` bytes: 1 for the legacy and vex encodings, and the evex
+# disp8*N compression otherwise, where a displacement that is not a multiple
+# of `n`, or whose quotient leaves the byte, takes the 32-bit field
+fun encode_mem_operand_scaled(buf: *isa_encode.ByteBuf, reg: i32, op: *isa_inst.Operand, n: i32) {
+    val base:      i32  = op.base;
+    val index:     i32  = op.index;
+    val disp:      i32  = op.disp;
+    val has_index: bool = index != isa_inst.REG_NONE;
+
+    if (base != isa_inst.REG_NONE && base != x64_inst.MEM_BASE_ABS && isa_inst.regid_class(base) != isa_inst.REG_CLASS_ID_GP) {
+        isa_encode.buf_refuse(buf, "encode: memory base register is not general-purpose");
+        ret;
+    }
+    if (has_index && isa_inst.regid_class(index) != isa_inst.REG_CLASS_ID_GP) {
+        isa_encode.buf_refuse(buf, "encode: memory index register is not general-purpose");
+        ret;
+    }
+    if (has_index && index == x64.RSP) {
+        isa_encode.buf_refuse(buf, "encode: RSP cannot be used as a SIB index register");
+        ret;
+    }
+
+    if (base == x64_inst.MEM_BASE_ABS) {
+        if (has_index) {
+            isa_encode.buf_refuse(buf, "encode: absolute memory operand carries an index register");
+            ret;
+        }
+        isa_encode.emit_byte(buf, encode_modrm(0, reg_bits(reg), 4));
+        isa_encode.emit_byte(buf, encode_sib(0, 4, 5));
+        isa_encode.emit_u32(buf, disp::u32);
+        ret;
+    }
+
+    if (base == isa_inst.REG_NONE && !has_index) {
+        isa_encode.emit_byte(buf, encode_modrm(0, reg_bits(reg), 5));
+        isa_encode.emit_u32(buf, disp::u32);
+        ret;
+    }
+
+    var scale_bits: u8 = 0;
+    if (has_index) {
+        if (op.scale <= 1) { scale_bits = 0; }
+        or (op.scale == 2) { scale_bits = 1; }
+        or (op.scale == 4) { scale_bits = 2; }
+        or (op.scale == 8) { scale_bits = 3; }
+        or {
+            isa_encode.buf_refuse(buf, "encode: invalid SIB scale (must be 1, 2, 4, or 8)");
+            ret;
+        }
+    }
+
+    if (base == isa_inst.REG_NONE && has_index) {
+        isa_encode.emit_byte(buf, encode_modrm(0, reg_bits(reg), 4));
+        isa_encode.emit_byte(buf, encode_sib(scale_bits, reg_bits(index), 5));
+        isa_encode.emit_u32(buf, disp::u32);
+        ret;
+    }
+
+    val base_needs_sib: bool = reg_bits(base) == 4;
+    val use_sib:        bool = has_index || base_needs_sib;
+
+    if (reg_bits(base) == 5) {
+        if (disp == 0) {
+            if (use_sib) {
+                isa_encode.emit_byte(buf, encode_modrm(1, reg_bits(reg), 4));
+                var idx_reg: u8 = 4;
+                if (has_index) { idx_reg = reg_bits(index); }
+                isa_encode.emit_byte(buf, encode_sib(scale_bits, idx_reg, reg_bits(base)));
+            }
+            or {
+                isa_encode.emit_byte(buf, encode_modrm(1, reg_bits(reg), reg_bits(base)));
+            }
+            isa_encode.emit_byte(buf, 0);
+            ret;
+        }
+    }
+
+    if (disp == 0) {
+        if (use_sib) {
+            isa_encode.emit_byte(buf, encode_modrm(0, reg_bits(reg), 4));
+            var idx_reg: u8 = 4;
+            if (has_index) { idx_reg = reg_bits(index); }
+            isa_encode.emit_byte(buf, encode_sib(scale_bits, idx_reg, reg_bits(base)));
+        }
+        or {
+            isa_encode.emit_byte(buf, encode_modrm(0, reg_bits(reg), reg_bits(base)));
+        }
+        ret;
+    }
+
+    if (disp % n == 0 && disp / n >= -128 && disp / n <= 127) {
+        if (use_sib) {
+            isa_encode.emit_byte(buf, encode_modrm(1, reg_bits(reg), 4));
+            var idx_reg: u8 = 4;
+            if (has_index) { idx_reg = reg_bits(index); }
+            isa_encode.emit_byte(buf, encode_sib(scale_bits, idx_reg, reg_bits(base)));
+        }
+        or {
+            isa_encode.emit_byte(buf, encode_modrm(1, reg_bits(reg), reg_bits(base)));
+        }
+        isa_encode.emit_byte(buf, (disp / n)::u8);
+        ret;
+    }
+
+    if (use_sib) {
+        isa_encode.emit_byte(buf, encode_modrm(2, reg_bits(reg), 4));
+        var idx_reg: u8 = 4;
+        if (has_index) { idx_reg = reg_bits(index); }
+        isa_encode.emit_byte(buf, encode_sib(scale_bits, idx_reg, reg_bits(base)));
+    }
+    or {
+        isa_encode.emit_byte(buf, encode_modrm(2, reg_bits(reg), reg_bits(base)));
+    }
+    isa_encode.emit_u32(buf, disp::u32);
+}
+
+fun rex_byte_mem(buf: *isa_encode.ByteBuf, reg: i32, mem: *isa_inst.Operand) {
+    if (mem.index != isa_inst.REG_NONE) {
+        isa_encode.emit_byte(buf, encode_rex_sib(0, reg, mem.index, mem.base));
+    }
+    or {
+        isa_encode.emit_byte(buf, encode_rex(0, reg, mem.base));
+    }
+}
+
+fun rex_if_needed(buf: *isa_encode.ByteBuf, w: u8, reg: i32, rm: i32) {
+    if (needs_any_rex(w, reg, rm)) {
+        isa_encode.emit_byte(buf, encode_rex(w, reg, rm));
+    }
+}
+
+fun rex_mem(buf: *isa_encode.ByteBuf, w: u8, reg: i32, mem: *isa_inst.Operand) {
+    val base:  i32 = mem.base;
+    val index: i32 = mem.index;
+    if (index != isa_inst.REG_NONE) {
+        val rex: u8 = encode_rex_sib(w, reg, index, base);
+        if (rex != 0x40 || w != 0) {
+            isa_encode.emit_byte(buf, rex);
+        }
+    }
+    or {
+        rex_if_needed(buf, w, reg, base);
+    }
+}
+
+fun prefix_reg(buf: *isa_encode.ByteBuf, size: u8, flags: u16, reg: i32, rm: i32) {
+    if (size == 2 || (flags & x64_inst.FLAG_16BIT::u16) != 0) { isa_encode.emit_byte(buf, 0x66); }
+    if (size == 1 && (needs_rex_for_byte_reg(reg) || needs_rex_for_byte_reg(rm))) {
+        isa_encode.emit_byte(buf, encode_rex(0, reg, rm));
+    }
+    or {
+        rex_if_needed(buf, size_to_w(size, flags), reg, rm);
+    }
+}
+
+fun prefix_mem(buf: *isa_encode.ByteBuf, size: u8, flags: u16, reg: i32, mem: *isa_inst.Operand) {
+    if (size == 2 || (flags & x64_inst.FLAG_16BIT::u16) != 0) { isa_encode.emit_byte(buf, 0x66); }
+    if (size == 1 && needs_rex_for_byte_reg(reg)) {
+        rex_byte_mem(buf, reg, mem);
+    }
+    or {
+        rex_mem(buf, size_to_w(size, flags), reg, mem);
+    }
+}
+
+# the override prefix of a memory operand's segment; 0 when it names none.
+# legacy prefixes lead the instruction, ahead of 66, f2/f3 and rex
+# an unassigned override is refused into `buf` and answers no prefix
+fun segment_prefix(op: *isa_inst.Operand, buf: *isa_encode.ByteBuf) u8 {
+    if (op.kind != isa_inst.OPK_MEM || op.seg == x64_inst.SEG_NONE) { ret 0; }
+    val row: *x64_inst.SegmentRow = x64_inst.segment_row(op.seg);
+    if (row == nil) {
+        isa_encode.buf_refuse(buf, "encode: memory operand names an unassigned segment override");
+        ret 0;
+    }
+    ret row.prefix;
+}
+
+fun inst_segment_prefix(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) u8 {
+    var p: u8 = segment_prefix(?mi.dst, buf);
+    if (p == 0) { p = segment_prefix(?mi.src1, buf); }
+    if (p == 0) { p = segment_prefix(?mi.src2, buf); }
+    if (p == 0) { p = segment_prefix(?mi.src3, buf); }
+    ret p;
+}
+
+fun imm_fits_width(imm: i64, size: u8) bool {
+    if (size == 1) { ret imm >= -128 && imm <= 255; }
+    if (size == 2) { ret imm >= -32768 && imm <= 65535; }
+    if (size == 4) { ret imm >= -2147483648 && imm <= 4294967295; }
+    ret true;
+}
+
+# an immediate as the signed value of its low `size` bytes, which is what the
+# instruction reads: 0xffffffff at 32 bits is -1 and takes the byte form
+fun imm_as_signed(imm: i64, size: u8) i64 {
+    if (size == 1) { ret imm::u8::i8::i64; }
+    if (size == 2) { ret imm::u16::i16::i64; }
+    if (size == 4) { ret imm::u32::i32::i64; }
+    ret imm;
+}
+
+fun imm_sized(buf: *isa_encode.ByteBuf, imm: i64, size: u8) {
+    if (size == 1) { isa_encode.emit_byte(buf, imm::u8); }
+    or (size == 2) { isa_encode.emit_u16(buf, imm::u16); }
+    or             { isa_encode.emit_u32(buf, imm::u32); }
+}
+
+fun encode_alu_rr(buf: *isa_encode.ByteBuf, opcode: u8, dst: i32, src: i32, size: u8, flags: u16) {
+    prefix_reg(buf, size, flags, src, dst);
+    isa_encode.emit_byte(buf, opcode);
+    isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(src), reg_bits(dst)));
+}
+
+fun encode_alu_rm(buf: *isa_encode.ByteBuf, opcode: u8, reg: i32, mem: *isa_inst.Operand, size: u8, flags: u16) {
+    prefix_mem(buf, size, flags, reg, mem);
+    isa_encode.emit_byte(buf, opcode);
+    encode_mem_operand(buf, reg, mem);
+}
+
+fun encode_alu_imm(buf: *isa_encode.ByteBuf, opcode: u16, reg: i32, imm: i64, size: u8, flags: u16) {
+    if (size == 8 && (imm < -2147483648 || imm > 2147483647)) {
+        val reg_op:  isa_inst.Operand = isa_inst.make_reg(reg, size);
+        val scratch: i32              = pick_stage_scratch(?reg_op, nil);
+        if (scratch == isa_inst.REG_NONE) { ret; }
+        var ld: isa_inst.Inst = isa_inst.inst_blank();
+        ld.opcode = x64.MOV;
+        ld.dst    = isa_inst.make_reg(scratch, 8);
+        ld.src1   = isa_inst.make_imm(imm, 8);
+        ld.size   = 8;
+        encode_inst(?ld, buf);
+        var rr: isa_inst.Inst = isa_inst.inst_blank();
+        rr.opcode = opcode;
+        rr.dst    = isa_inst.make_reg(reg, 8);
+        rr.src1   = isa_inst.make_reg(scratch, 8);
+        rr.size   = 8;
+        rr.flags  = flags;
+        encode_inst(?rr, buf);
+        ret;
+    }
+    if (!imm_fits_width(imm, size)) { ret; }
+
+    val group: u8 = alu_group(opcode);
+    prefix_reg(buf, size, flags, 0, reg);
+
+    # the accumulator has a form without a modrm byte, shorter wherever the
+    # immediate does not fit the sign-extended byte form, as assemblers choose
+    val simm:   i64  = imm_as_signed(imm, size);
+    val short8: bool = simm >= -128 && simm <= 127 && size > 1;
+    if (!short8 && reg == x64.RAX) {
+        if (size == 1) { isa_encode.emit_byte(buf, (group << 3) + 4); }
+        or             { isa_encode.emit_byte(buf, (group << 3) + 5); }
+        imm_sized(buf, imm, size);
+        ret;
+    }
+    if (short8) {
+        isa_encode.emit_byte(buf, 0x83);
+        isa_encode.emit_byte(buf, encode_modrm(3, group, reg_bits(reg)));
+        isa_encode.emit_byte(buf, imm::u8);
+    }
+    or {
+        var opc: u8 = 0x81;
+        if (size == 1) { opc = 0x80; }
+        isa_encode.emit_byte(buf, opc);
+        isa_encode.emit_byte(buf, encode_modrm(3, group, reg_bits(reg)));
+        imm_sized(buf, imm, size);
+    }
+}
+
+fun alu_group(opcode: u16) u8 {
+    if (opcode == x64.ADD) { ret 0; }
+    if (opcode == x64.OR)  { ret 1; }
+    if (opcode == x64.AND) { ret 4; }
+    if (opcode == x64.SUB) { ret 5; }
+    if (opcode == x64.SBB) { ret 3; }
+    if (opcode == x64.XOR) { ret 6; }
+    if (opcode == x64.CMP) { ret 7; }
+    ret 0;
+}
+
+fun alu_opcode_rr(opcode: u16, size: u8) u8 {
+    var base: u8 = 0;
+    if (opcode == x64.ADD) { base = 0x01; }
+    or (opcode == x64.OR)  { base = 0x09; }
+    or (opcode == x64.AND) { base = 0x21; }
+    or (opcode == x64.SUB) { base = 0x29; }
+    or (opcode == x64.SBB) { base = 0x19; }
+    or (opcode == x64.XOR) { base = 0x31; }
+    or (opcode == x64.CMP) { base = 0x39; }
+    or                     { base = 0x01; }
+    if (size == 1)         { ret base - 1; }
+    ret base;
+}
+
+fun condition_code(opcode: u16) u8 {
+    if (opcode == x64.JE || opcode == x64.SETE || opcode == x64.CMOVE)    { ret 0x04; }
+    if (opcode == x64.JNE || opcode == x64.SETNE || opcode == x64.CMOVNE) { ret 0x05; }
+    if (opcode == x64.JL || opcode == x64.SETL || opcode == x64.CMOVL)    { ret 0x0C; }
+    if (opcode == x64.JLE || opcode == x64.SETLE || opcode == x64.CMOVLE) { ret 0x0E; }
+    if (opcode == x64.JG || opcode == x64.SETG || opcode == x64.CMOVG)    { ret 0x0F; }
+    if (opcode == x64.JGE || opcode == x64.SETGE || opcode == x64.CMOVGE) { ret 0x0D; }
+    if (opcode == x64.JB || opcode == x64.SETB || opcode == x64.CMOVB)    { ret 0x02; }
+    if (opcode == x64.JBE || opcode == x64.SETBE || opcode == x64.CMOVBE) { ret 0x06; }
+    if (opcode == x64.JA || opcode == x64.SETA || opcode == x64.CMOVA)    { ret 0x07; }
+    if (opcode == x64.JAE || opcode == x64.SETAE || opcode == x64.CMOVAE) { ret 0x03; }
+    if (opcode == x64.SETP)                                               { ret 0x0A; }
+    if (opcode == x64.SETNP)                                              { ret 0x0B; }
+    ret 0x04;
+}
+
+# the family predicates read the opcode's row; no reader depends on how the
+# opcode numbers were assigned
+fun is_jcc(opcode: u16) bool {
+    ret x64_inst.describe(opcode).form == x64_inst.FORM_JCC;
+}
+
+fun is_setcc(opcode: u16) bool {
+    ret x64_inst.describe(opcode).form == x64_inst.FORM_SETCC;
+}
+
+fun is_alu(opcode: u16) bool {
+    ret x64_inst.describe(opcode).form == x64_inst.FORM_ALU;
+}
+
+fun is_sse_mov(opcode: u16) bool {
+    ret x64_inst.describe(opcode).form == x64_inst.FORM_SSE_MOV;
+}
+
+fun is_sse_alu(opcode: u16) bool {
+    ret x64_inst.describe(opcode).form == x64_inst.FORM_SSE_ALU;
+}
+
+fun is_cvt(opcode: u16) bool {
+    ret x64_inst.describe(opcode).form == x64_inst.FORM_CVT;
+}
+
+fun reg_is_xmm(op: *isa_inst.Operand) bool {
+    ret op.kind == isa_inst.OPK_REG && isa_inst.regid_class(op.reg) == isa_inst.REG_CLASS_ID_FP;
+}
+
+pub fun encode_fp_mov(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) res[i32, fail.Fail] {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+
+    if (mi.size == 32) {
+        val moved: err[fail.Fail] = ymm_value_move(@dst, @src1, buf);
+        if (sel moved.err) { ret res[i32, fail.Fail].err{moved.err}; }
+        ret res[i32, fail.Fail].ok{(buf.len - start)::i32};
+    }
+    if (mi.size == 16) {
+        if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+            movaps_rr(dst.reg, src1.reg, VB_XMM, buf);
+            ret res[i32, fail.Fail].ok{(buf.len - start)::i32};
+        }
+        if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_MEM) {
+            movups_load(dst.reg, @src1, buf);
+            ret res[i32, fail.Fail].ok{(buf.len - start)::i32};
+        }
+        if (dst.kind == isa_inst.OPK_MEM && src1.kind == isa_inst.OPK_REG) {
+            movups_store(@dst, src1.reg, buf);
+            ret res[i32, fail.Fail].ok{(buf.len - start)::i32};
+        }
+        # the zero vector a const materializes is a cleared register
+        if (src1.kind == isa_inst.OPK_IMM) {
+            if (src1.imm != 0) {
+                ret res[i32, fail.Fail].err{fail.message("encode: a vector move takes no immediate but zero")};
+            }
+            var work: i32 = float_scratch0();
+            if (dst.kind == isa_inst.OPK_REG) { work = dst.reg; }
+            val z: err[fail.Fail] = vec_zero(work, VB_XMM, buf);
+            if (sel z.err)                    { ret res[i32, fail.Fail].err{z.err}; }
+            if (dst.kind != isa_inst.OPK_REG) { movups_store(@dst, work, buf); }
+            ret res[i32, fail.Fail].ok{(buf.len - start)::i32};
+        }
+        movups_load(float_scratch0(), @src1, buf);
+        movups_store(@dst, float_scratch0(), buf);
+        ret res[i32, fail.Fail].ok{(buf.len - start)::i32};
+    }
+
+    val w: u8 = mi.size;
+    if (w == 2) {
+        val hm: err[fail.Fail] = half_move(@dst, @src1, buf);
+        if (sel hm.err) { ret res[i32, fail.Fail].err{hm.err}; }
+        ret res[i32, fail.Fail].ok{(buf.len - start)::i32};
+    }
+    if (!common.is_float_width(w)) {
+        ret res[i32, fail.Fail].err{fail.message("internal compiler error: float move has a non-float operand width (expected 2, 4, 8 or 16)")};
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG &&
+        reg_is_xmm(dst) != reg_is_xmm(src1)) {
+        if (reg_is_xmm(dst)) {
+            movd_movq_reg(src1.reg, dst.reg, w, true, buf);
+        }
+        or {
+            movd_movq_reg(dst.reg, src1.reg, w, false, buf);
+        }
+        ret res[i32, fail.Fail].ok{(buf.len - start)::i32};
+    }
+
+    if (reg_is_xmm(dst)) {
+        val ld: err[fail.Fail] = float_reg_or_slot_load(@src1, dst.reg, w, buf);
+        if (sel ld.err) { ret res[i32, fail.Fail].err{ld.err}; }
+        ret res[i32, fail.Fail].ok{(buf.len - start)::i32};
+    }
+    if (!reg_is_xmm(src1)) {
+        ret res[i32, fail.Fail].err{fail.message("encode: a same-bank float move names no SSE register")};
+    }
+    val st: err[fail.Fail] = float_store(@dst, src1.reg, w, buf);
+    if (sel st.err) { ret res[i32, fail.Fail].err{st.err}; }
+    ret res[i32, fail.Fail].ok{(buf.len - start)::i32};
+}
+
+fun encode_mov(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+    val size:  u8                = mi.size;
+    val flags: u16               = mi.flags;
+
+    if (reg_is_xmm(dst) || reg_is_xmm(src1) || size == 16 || size == 32) {
+        val fp: res[i32, fail.Fail] = encode_fp_mov(mi, buf);
+        if (sel fp.err) {
+            isa_encode.buf_refuse(buf, fail.describe(fp.err));
+            ret 0;
+        }
+        ret fp.ok;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+        prefix_reg(buf, size, flags, src1.reg, dst.reg);
+        if (size == 1) {
+            isa_encode.emit_byte(buf, 0x88);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0x89);
+        }
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(src1.reg), reg_bits(dst.reg)));
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_IMM) {
+        val w:   u8  = size_to_w(size, flags);
+        val imm: i64 = src1.imm;
+        if (size < 8 && !imm_fits_width(imm, size))               { ret 0; }
+        if (size == 2 || (flags & x64_inst.FLAG_16BIT::u16) != 0) { isa_encode.emit_byte(buf, 0x66); }
+        if (size == 1) {
+            if (needs_rex_byte(dst.reg)) {
+                isa_encode.emit_byte(buf, encode_rex(0, 0, dst.reg));
+            }
+            isa_encode.emit_byte(buf, 0xB0 + reg_bits(dst.reg));
+            isa_encode.emit_byte(buf, imm::u8);
+        }
+        or (size == 2) {
+            rex_if_needed(buf, 0, 0, dst.reg);
+            isa_encode.emit_byte(buf, 0xB8 + reg_bits(dst.reg));
+            isa_encode.emit_u16(buf, imm::u16);
+        }
+        or (size == 4) {
+            rex_if_needed(buf, 0, 0, dst.reg);
+            isa_encode.emit_byte(buf, 0xB8 + reg_bits(dst.reg));
+            isa_encode.emit_u32(buf, imm::u32);
+        }
+        or {
+            if (imm >= -2147483648 && imm <= 2147483647) {
+                rex_if_needed(buf, w, 0, dst.reg);
+                isa_encode.emit_byte(buf, 0xC7);
+                isa_encode.emit_byte(buf, encode_modrm(3, 0, reg_bits(dst.reg)));
+                isa_encode.emit_u32(buf, imm::u32);
+            }
+            or {
+                mi.opcode = x64.MOVABS;
+                isa_encode.emit_byte(buf, encode_rex(1, 0, dst.reg));
+                isa_encode.emit_byte(buf, 0xB8 + reg_bits(dst.reg));
+                isa_encode.emit_u64(buf, imm::u64);
+            }
+        }
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_MEM) {
+        prefix_mem(buf, size, flags, dst.reg, src1);
+        if (size == 1) {
+            isa_encode.emit_byte(buf, 0x8A);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0x8B);
+        }
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_MEM && src1.kind == isa_inst.OPK_REG) {
+        prefix_mem(buf, size, flags, src1.reg, dst);
+        if (size == 1) {
+            isa_encode.emit_byte(buf, 0x88);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0x89);
+        }
+        encode_mem_operand(buf, src1.reg, dst);
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_MEM && src1.kind == isa_inst.OPK_MEM) {
+        val scratch: i32 = pick_stage_scratch(dst, src1);
+        if (scratch == isa_inst.REG_NONE) { ret 0; }
+        var ld: isa_inst.Inst = isa_inst.inst_blank();
+        ld.opcode = mi.opcode;
+        ld.dst    = isa_inst.make_reg(scratch, size);
+        ld.src1   = mi.src1;
+        ld.size   = size;
+        ld.flags  = flags;
+        val ld_sz: i32           = encode_inst(?ld, buf);
+        var st:    isa_inst.Inst = isa_inst.inst_blank();
+        st.opcode = mi.opcode;
+        st.dst    = mi.dst;
+        st.src1   = isa_inst.make_reg(scratch, size);
+        st.size   = size;
+        st.flags  = flags;
+        val st_sz: i32 = encode_inst(?st, buf);
+        ret ld_sz + st_sz;
+    }
+
+    if (dst.kind == isa_inst.OPK_MEM && src1.kind == isa_inst.OPK_IMM) {
+        if (size == 8 && (src1.imm < -2147483648 || src1.imm > 2147483647)) {
+            val scratch: i32 = pick_stage_scratch(dst, nil);
+            if (scratch == isa_inst.REG_NONE) { ret 0; }
+            var ld: isa_inst.Inst = isa_inst.inst_blank();
+            ld.opcode = x64.MOVABS;
+            ld.dst    = isa_inst.make_reg(scratch, 8);
+            ld.src1   = isa_inst.make_imm(src1.imm, 8);
+            ld.size   = 8;
+            val ld_sz: i32           = encode_inst(?ld, buf);
+            var st:    isa_inst.Inst = isa_inst.inst_blank();
+            st.opcode = mi.opcode;
+            st.dst    = mi.dst;
+            st.src1   = isa_inst.make_reg(scratch, 8);
+            st.size   = 8;
+            st.flags  = flags;
+            val st_sz: i32 = encode_inst(?st, buf);
+            ret ld_sz + st_sz;
+        }
+        if (!imm_fits_width(src1.imm, size)) { ret 0; }
+        prefix_mem(buf, size, flags, 0, dst);
+        if (size == 1) {
+            isa_encode.emit_byte(buf, 0xC6);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0xC7);
+        }
+        encode_mem_operand(buf, 0, dst);
+        imm_sized(buf, src1.imm, size);
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+fun encode_lea(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+    if (dst.kind != isa_inst.OPK_REG) { ret 0; }
+
+    if (src1.kind == isa_inst.OPK_LABEL) {
+        val w: u8 = size_to_w(mi.size, mi.flags);
+        isa_encode.emit_byte(buf, encode_rex(w, dst.reg, 0));
+        isa_encode.emit_byte(buf, 0x8D);
+        isa_encode.emit_byte(buf, encode_modrm(0, reg_bits(dst.reg), 5));
+        isa_encode.emit_u32(buf, 0);
+        ret (buf.len - start)::i32;
+    }
+
+    if (src1.kind != isa_inst.OPK_MEM) { ret 0; }
+    val w: u8 = size_to_w(mi.size, mi.flags);
+    rex_mem(buf, w, dst.reg, src1);
+    isa_encode.emit_byte(buf, 0x8D);
+    encode_mem_operand(buf, dst.reg, src1);
+    ret (buf.len - start)::i32;
+}
+
+fun encode_push(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val src:   *isa_inst.Operand = ?mi.dst;
+    if (src.kind == isa_inst.OPK_REG) {
+        if (needs_rex(src.reg)) {
+            isa_encode.emit_byte(buf, encode_rex(0, 0, src.reg));
+        }
+        isa_encode.emit_byte(buf, 0x50 + reg_bits(src.reg));
+    }
+    or (src.kind == isa_inst.OPK_IMM) {
+        val imm: i64 = src.imm;
+        if (imm >= -128 && imm <= 127) {
+            isa_encode.emit_byte(buf, 0x6A);
+            isa_encode.emit_byte(buf, imm::u8);
+        }
+        or (imm >= -2147483648 && imm <= 2147483647) {
+            isa_encode.emit_byte(buf, 0x68);
+            isa_encode.emit_u32(buf, imm::u32);
+        }
+        or {
+            ret 0;
+        }
+    }
+    ret (buf.len - start)::i32;
+}
+
+fun encode_pop(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    if (dst.kind != isa_inst.OPK_REG) { ret 0; }
+    if (needs_rex(dst.reg)) {
+        isa_encode.emit_byte(buf, encode_rex(0, 0, dst.reg));
+    }
+    isa_encode.emit_byte(buf, 0x58 + reg_bits(dst.reg));
+    ret (buf.len - start)::i32;
+}
+
+fun encode_alu(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start:  usize             = buf.len;
+    val dst:    *isa_inst.Operand = ?mi.dst;
+    val src1:   *isa_inst.Operand = ?mi.src1;
+    val size:   u8                = mi.size;
+    val flags:  u16               = mi.flags;
+    val opcode: u16               = mi.opcode;
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+        val opc: u8 = alu_opcode_rr(opcode, size);
+        encode_alu_rr(buf, opc, dst.reg, src1.reg, size, flags);
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_IMM) {
+        encode_alu_imm(buf, opcode, dst.reg, src1.imm, size, flags);
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_MEM) {
+        val opc: u8 = alu_opcode_rr(opcode, size) + 2;
+        encode_alu_rm(buf, opc, dst.reg, src1, size, flags);
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_MEM && src1.kind == isa_inst.OPK_REG) {
+        val opc: u8 = alu_opcode_rr(opcode, size);
+        encode_alu_rm(buf, opc, src1.reg, dst, size, flags);
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_MEM && src1.kind == isa_inst.OPK_IMM) {
+        val imm: i64 = src1.imm;
+        if (size == 8 && (imm < -2147483648 || imm > 2147483647)) {
+            val scratch: i32 = pick_stage_scratch(dst, nil);
+            if (scratch == isa_inst.REG_NONE) { ret 0; }
+            var ld: isa_inst.Inst = isa_inst.inst_blank();
+            ld.opcode = x64.MOV;
+            ld.dst    = isa_inst.make_reg(scratch, 8);
+            ld.src1   = isa_inst.make_imm(imm, 8);
+            ld.size   = 8;
+            encode_inst(?ld, buf);
+            var rm: isa_inst.Inst = isa_inst.inst_blank();
+            rm.opcode = opcode;
+            rm.dst    = mi.dst;
+            rm.src1   = isa_inst.make_reg(scratch, 8);
+            rm.size   = 8;
+            rm.flags  = flags;
+            encode_inst(?rm, buf);
+            ret (buf.len - start)::i32;
+        }
+        if (!imm_fits_width(imm, size)) { ret 0; }
+        val grp: u8 = alu_group(opcode);
+        val w:   u8 = size_to_w(size, flags);
+        if ((flags & x64_inst.FLAG_16BIT::u16) != 0) { isa_encode.emit_byte(buf, 0x66); }
+        rex_mem(buf, w, grp::i32, dst);
+        val simm: i64 = imm_as_signed(imm, size);
+        if (simm >= -128 && simm <= 127 && size > 1) {
+            isa_encode.emit_byte(buf, 0x83);
+            encode_mem_operand(buf, grp::i32, dst);
+            isa_encode.emit_byte(buf, imm::u8);
+        }
+        or (size == 1) {
+            isa_encode.emit_byte(buf, 0x80);
+            encode_mem_operand(buf, grp::i32, dst);
+            isa_encode.emit_byte(buf, imm::u8);
+        }
+        or (size == 2) {
+            isa_encode.emit_byte(buf, 0x81);
+            encode_mem_operand(buf, grp::i32, dst);
+            isa_encode.emit_u16(buf, imm::u16);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0x81);
+            encode_mem_operand(buf, grp::i32, dst);
+            isa_encode.emit_u32(buf, imm::u32);
+        }
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+fun maybe_emit_lock(buf: *isa_encode.ByteBuf, flags: u16) {
+    if ((flags & x64_inst.FLAG_LOCK::u16) != 0) { isa_encode.emit_byte(buf, 0xF0); }
+}
+
+fun encode_unary_grp3(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start:     usize             = buf.len;
+    val dst:       *isa_inst.Operand = ?mi.dst;
+    val size:      u8                = mi.size;
+    val flags:     u16               = mi.flags;
+    var modrm_ext: u8                = 3;
+    if (mi.opcode == x64.NOT) { modrm_ext = 2; }
+
+    var opc: u8 = 0xF7;
+    if (size == 1) { opc = 0xF6; }
+
+    if (dst.kind == isa_inst.OPK_REG) {
+        prefix_reg(buf, size, flags, 0, dst.reg);
+        isa_encode.emit_byte(buf, opc);
+        isa_encode.emit_byte(buf, encode_modrm(3, modrm_ext, reg_bits(dst.reg)));
+        ret (buf.len - start)::i32;
+    }
+    if (dst.kind == isa_inst.OPK_MEM) {
+        prefix_mem(buf, size, flags, 0, dst);
+        isa_encode.emit_byte(buf, opc);
+        encode_mem_operand(buf, modrm_ext::i32, dst);
+        ret (buf.len - start)::i32;
+    }
+    ret 0;
+}
+
+fun encode_unary_grp5(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start:     usize             = buf.len;
+    val dst:       *isa_inst.Operand = ?mi.dst;
+    val size:      u8                = mi.size;
+    val flags:     u16               = mi.flags;
+    var modrm_ext: u8                = 0;
+    if (mi.opcode == x64.DEC) { modrm_ext = 1; }
+
+    var opc: u8 = 0xFF;
+    if (size == 1) { opc = 0xFE; }
+
+    if (dst.kind == isa_inst.OPK_REG) {
+        prefix_reg(buf, size, flags, 0, dst.reg);
+        isa_encode.emit_byte(buf, opc);
+        isa_encode.emit_byte(buf, encode_modrm(3, modrm_ext, reg_bits(dst.reg)));
+        ret (buf.len - start)::i32;
+    }
+    if (dst.kind == isa_inst.OPK_MEM) {
+        prefix_mem(buf, size, flags, 0, dst);
+        isa_encode.emit_byte(buf, opc);
+        encode_mem_operand(buf, modrm_ext::i32, dst);
+        ret (buf.len - start)::i32;
+    }
+    ret 0;
+}
+
+fun encode_xchg(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+    val size:  u8                = mi.size;
+    val flags: u16               = mi.flags;
+    var opc:   u8                = 0x87;
+    if (size == 1) { opc = 0x86; }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+        prefix_reg(buf, size, flags, src1.reg, dst.reg);
+        isa_encode.emit_byte(buf, opc);
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(src1.reg), reg_bits(dst.reg)));
+        ret (buf.len - start)::i32;
+    }
+    if (dst.kind == isa_inst.OPK_MEM && src1.kind == isa_inst.OPK_REG) {
+        prefix_mem(buf, size, flags, src1.reg, dst);
+        isa_encode.emit_byte(buf, opc);
+        encode_mem_operand(buf, src1.reg, dst);
+        ret (buf.len - start)::i32;
+    }
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_MEM) {
+        prefix_mem(buf, size, flags, dst.reg, src1);
+        isa_encode.emit_byte(buf, opc);
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+    ret 0;
+}
+
+fun encode_xadd_cmpxchg(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+    val size:  u8                = mi.size;
+    val flags: u16               = mi.flags;
+    if (src1.kind != isa_inst.OPK_REG) { ret 0; }
+
+    var opc2: u8 = 0xC1;
+    if (mi.opcode == x64.CMPXCHG) { opc2 = 0xB1; }
+    if (size == 1)                { opc2 = opc2 - 1; }
+
+    maybe_emit_lock(buf, flags);
+
+    if (dst.kind == isa_inst.OPK_REG) {
+        prefix_reg(buf, size, flags, src1.reg, dst.reg);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, opc2);
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(src1.reg), reg_bits(dst.reg)));
+        ret (buf.len - start)::i32;
+    }
+    if (dst.kind == isa_inst.OPK_MEM) {
+        prefix_mem(buf, size, flags, src1.reg, dst);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, opc2);
+        encode_mem_operand(buf, src1.reg, dst);
+        ret (buf.len - start)::i32;
+    }
+    ret 0;
+}
+
+fun encode_test(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+    val size:  u8                = mi.size;
+    val flags: u16               = mi.flags;
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+        prefix_reg(buf, size, flags, src1.reg, dst.reg);
+        if (size == 1) {
+            isa_encode.emit_byte(buf, 0x84);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0x85);
+        }
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(src1.reg), reg_bits(dst.reg)));
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_IMM) {
+        if (size == 8) {
+            if (src1.imm < -2147483648 || src1.imm > 2147483647) { ret 0; }
+        }
+        or (!imm_fits_width(src1.imm, size)) { ret 0; }
+        prefix_reg(buf, size, flags, 0, dst.reg);
+        var opc: u8 = 0xF7;
+        if (size == 1) { opc = 0xF6; }
+        isa_encode.emit_byte(buf, opc);
+        isa_encode.emit_byte(buf, encode_modrm(3, 0, reg_bits(dst.reg)));
+        imm_sized(buf, src1.imm, size);
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_MEM && src1.kind == isa_inst.OPK_IMM) {
+        if (size == 8) {
+            if (src1.imm < -2147483648 || src1.imm > 2147483647) { ret 0; }
+        }
+        or (!imm_fits_width(src1.imm, size)) { ret 0; }
+        prefix_mem(buf, size, flags, 0, dst);
+        var opc: u8 = 0xF7;
+        if (size == 1) { opc = 0xF6; }
+        isa_encode.emit_byte(buf, opc);
+        encode_mem_operand(buf, 0, dst);
+        imm_sized(buf, src1.imm, size);
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_MEM && src1.kind == isa_inst.OPK_REG) {
+        prefix_mem(buf, size, flags, src1.reg, dst);
+        if (size == 1) {
+            isa_encode.emit_byte(buf, 0x84);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0x85);
+        }
+        encode_mem_operand(buf, src1.reg, dst);
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+fun encode_imul(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+    val size:  u8                = mi.size;
+    val flags: u16               = mi.flags;
+
+    # the one-operand form: src r/m by rax into rdx:rax
+    if (dst.kind == isa_inst.OPK_NONE && src1.kind != isa_inst.OPK_NONE) {
+        ret encode_rm_one(mi, buf, 5);
+    }
+
+    # the three-operand form: dst = src1 * imm, with src1 an r/m
+    if (dst.kind == isa_inst.OPK_REG && src1.kind != isa_inst.OPK_NONE && mi.src2.kind == isa_inst.OPK_IMM) {
+        val imm: i64 = mi.src2.imm;
+        if (size < 2 || !imm_fits_width(imm, size))               { ret 0; }
+        if (size == 8 && (imm < -2147483648 || imm > 2147483647)) { ret 0; }
+        var opbyte: u8  = 0x69;
+        val simm:   i64 = imm_as_signed(imm, size);
+        if (simm >= -128 && simm <= 127) { opbyte = 0x6B; }
+        if (src1.kind == isa_inst.OPK_REG) {
+            prefix_reg(buf, size, flags, dst.reg, src1.reg);
+            isa_encode.emit_byte(buf, opbyte);
+            isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        }
+        or (src1.kind == isa_inst.OPK_MEM) {
+            val seg: u8 = segment_prefix(src1, buf);
+            if (seg != 0) { isa_encode.emit_byte(buf, seg); }
+            prefix_mem(buf, size, flags, dst.reg, src1);
+            isa_encode.emit_byte(buf, opbyte);
+            encode_mem_operand(buf, dst.reg, src1);
+        }
+        or                  { ret 0; }
+        if (opbyte == 0x6B) { isa_encode.emit_byte(buf, imm::u8); }
+        or                  { imm_sized(buf, imm, size); }
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+        prefix_reg(buf, size, flags, dst.reg, src1.reg);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0xAF);
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_MEM) {
+        prefix_mem(buf, size, flags, dst.reg, src1);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0xAF);
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_IMM) {
+        val imm: i64 = src1.imm;
+        if (size < 2) { ret 0; }
+        if (size == 8 && (imm < -2147483648 || imm > 2147483647)) {
+            val scratch: i32 = pick_stage_scratch(dst, nil);
+            if (scratch == isa_inst.REG_NONE) { ret 0; }
+            var ld: isa_inst.Inst = isa_inst.inst_blank();
+            ld.opcode = x64.MOV;
+            ld.dst    = isa_inst.make_reg(scratch, 8);
+            ld.src1   = isa_inst.make_imm(imm, 8);
+            ld.size   = 8;
+            encode_inst(?ld, buf);
+            var rr: isa_inst.Inst = isa_inst.inst_blank();
+            rr.opcode = x64.IMUL;
+            rr.dst    = isa_inst.make_reg(dst.reg, size);
+            rr.src1   = isa_inst.make_reg(scratch, size);
+            rr.size   = size;
+            rr.flags  = flags;
+            encode_inst(?rr, buf);
+            ret (buf.len - start)::i32;
+        }
+        if (!imm_fits_width(imm, size)) { ret 0; }
+        prefix_reg(buf, size, flags, dst.reg, dst.reg);
+        val simm: i64 = imm_as_signed(imm, size);
+        if (simm >= -128 && simm <= 127) {
+            isa_encode.emit_byte(buf, 0x6B);
+            isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(dst.reg)));
+            isa_encode.emit_byte(buf, imm::u8);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0x69);
+            isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(dst.reg)));
+            imm_sized(buf, imm, size);
+        }
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+fun encode_div(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf, is_signed: bool) i32 {
+    var modrm_ext: u8 = 6;
+    if (is_signed) { modrm_ext = 7; }
+    ret encode_rm_one(mi, buf, modrm_ext);
+}
+
+fun encode_mul1(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    ret encode_rm_one(mi, buf, 4);
+}
+
+# the group-3 one-operand family (mul imul div idiv): F6 or F7 with the
+# member in the modrm reg field and the r/m operand in src1
+fun encode_rm_one(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf, modrm_ext: u8) i32 {
+    val start: usize             = buf.len;
+    val src:   *isa_inst.Operand = ?mi.src1;
+    val size:  u8                = mi.size;
+    val flags: u16               = mi.flags;
+
+    if (src.kind == isa_inst.OPK_REG) {
+        prefix_reg(buf, size, flags, 0, src.reg);
+        if (size == 1) {
+            isa_encode.emit_byte(buf, 0xF6);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0xF7);
+        }
+        isa_encode.emit_byte(buf, encode_modrm(3, modrm_ext, reg_bits(src.reg)));
+        ret (buf.len - start)::i32;
+    }
+
+    if (src.kind == isa_inst.OPK_MEM) {
+        prefix_mem(buf, size, flags, 0, src);
+        if (size == 1) {
+            isa_encode.emit_byte(buf, 0xF6);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0xF7);
+        }
+        encode_mem_operand(buf, modrm_ext::i32, src);
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+fun encode_shift(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start:     usize             = buf.len;
+    val dst:       *isa_inst.Operand = ?mi.dst;
+    val src1:      *isa_inst.Operand = ?mi.src1;
+    val size:      u8                = mi.size;
+    val flags:     u16               = mi.flags;
+    val opcode:    u16               = mi.opcode;
+    var modrm_ext: u8                = 4;
+    if (opcode == x64.SHR) { modrm_ext = 5; }
+    if (opcode == x64.SAR) { modrm_ext = 7; }
+
+    if (dst.kind != isa_inst.OPK_REG && dst.kind != isa_inst.OPK_MEM) { ret 0; }
+    val dst_is_mem: bool = dst.kind == isa_inst.OPK_MEM;
+
+    if (src1.kind == isa_inst.OPK_REG) {
+        if (dst_is_mem) { prefix_mem(buf, size, flags, 0, dst); }
+        or              { prefix_reg(buf, size, flags, 0, dst.reg); }
+        if (size == 1) {
+            isa_encode.emit_byte(buf, 0xD2);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0xD3);
+        }
+        if (dst_is_mem) { encode_mem_operand(buf, modrm_ext::i32, dst); }
+        or              { isa_encode.emit_byte(buf, encode_modrm(3, modrm_ext, reg_bits(dst.reg))); }
+    }
+    or (src1.kind == isa_inst.OPK_IMM) {
+        val imm: i64 = src1.imm;
+        if (!imm_fits_width(imm, 1)) { ret 0; }
+        if (dst_is_mem)              { prefix_mem(buf, size, flags, 0, dst); }
+        or                           { prefix_reg(buf, size, flags, 0, dst.reg); }
+        if (imm == 1) {
+            if (size == 1) {
+                isa_encode.emit_byte(buf, 0xD0);
+            }
+            or {
+                isa_encode.emit_byte(buf, 0xD1);
+            }
+            if (dst_is_mem) { encode_mem_operand(buf, modrm_ext::i32, dst); }
+            or              { isa_encode.emit_byte(buf, encode_modrm(3, modrm_ext, reg_bits(dst.reg))); }
+        }
+        or {
+            if (size == 1) {
+                isa_encode.emit_byte(buf, 0xC0);
+            }
+            or {
+                isa_encode.emit_byte(buf, 0xC1);
+            }
+            if (dst_is_mem) { encode_mem_operand(buf, modrm_ext::i32, dst); }
+            or              { isa_encode.emit_byte(buf, encode_modrm(3, modrm_ext, reg_bits(dst.reg))); }
+            isa_encode.emit_byte(buf, imm::u8);
+        }
+    }
+    or {
+        ret 0;
+    }
+
+    ret (buf.len - start)::i32;
+}
+
+fun encode_jcc(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize = buf.len;
+    val cc:    u8    = condition_code(mi.opcode);
+    isa_encode.emit_byte(buf, 0x0F);
+    isa_encode.emit_byte(buf, 0x80 + cc);
+    isa_encode.emit_u32(buf, 0);
+    ret (buf.len - start)::i32;
+}
+
+fun encode_jmp(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+
+    if ((mi.flags & x64_inst.FLAG_INDIRECT::u16) != 0) {
+        if (dst.kind == isa_inst.OPK_REG) {
+            rex_if_needed(buf, 0, 0, dst.reg);
+            isa_encode.emit_byte(buf, 0xFF);
+            isa_encode.emit_byte(buf, encode_modrm(3, 4, reg_bits(dst.reg)));
+        }
+        or (dst.kind == isa_inst.OPK_MEM) {
+            rex_mem(buf, 0, 4, dst);
+            isa_encode.emit_byte(buf, 0xFF);
+            encode_mem_operand(buf, 4, dst);
+        }
+        ret (buf.len - start)::i32;
+    }
+
+    isa_encode.emit_byte(buf, 0xE9);
+    isa_encode.emit_u32(buf, 0);
+    ret (buf.len - start)::i32;
+}
+
+fun encode_call(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+
+    if ((mi.flags & x64_inst.FLAG_INDIRECT::u16) != 0) {
+        if (dst.kind == isa_inst.OPK_REG) {
+            rex_if_needed(buf, 0, 0, dst.reg);
+            isa_encode.emit_byte(buf, 0xFF);
+            isa_encode.emit_byte(buf, encode_modrm(3, 2, reg_bits(dst.reg)));
+        }
+        or (dst.kind == isa_inst.OPK_MEM) {
+            rex_mem(buf, 0, 2, dst);
+            isa_encode.emit_byte(buf, 0xFF);
+            encode_mem_operand(buf, 2, dst);
+        }
+        ret (buf.len - start)::i32;
+    }
+
+    isa_encode.emit_byte(buf, 0xE8);
+    isa_encode.emit_u32(buf, 0);
+    ret (buf.len - start)::i32;
+}
+
+fun encode_portio(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val is_in: bool              = mi.opcode == x64.IN;
+    var port:  *isa_inst.Operand = ?mi.dst;
+    var acc:   *isa_inst.Operand = ?mi.src1;
+    if (is_in) {
+        port = ?mi.src1;
+        acc  = ?mi.dst;
+    }
+
+    val w: u8 = acc.size;
+    if (w != 1 && w != 2 && w != 4) { ret 0; }
+
+    val imm_port: bool = port.kind == isa_inst.OPK_IMM;
+    if (!imm_port && port.kind != isa_inst.OPK_REG)   { ret 0; }
+    if (imm_port && (port.imm < 0 || port.imm > 255)) { ret 0; }
+
+    var op: u8 = 0xEC;
+    if (imm_port) { op = 0xE4; }
+    if (!is_in)   { op = op + 2; }
+    if (w != 1)   { op = op + 1; }
+
+    val start: usize = buf.len;
+    if (w == 2) { isa_encode.emit_byte(buf, 0x66); }
+    isa_encode.emit_byte(buf, op);
+    if (imm_port) { isa_encode.emit_byte(buf, (port.imm & 0xFF)::u8); }
+    ret (buf.len - start)::i32;
+}
+
+fun encode_setcc(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val cc:    u8                = condition_code(mi.opcode);
+
+    if (dst.kind == isa_inst.OPK_REG) {
+        prefix_reg(buf, 1, 0, 0, dst.reg);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0x90 + cc);
+        isa_encode.emit_byte(buf, encode_modrm(3, 0, reg_bits(dst.reg)));
+    }
+    ret (buf.len - start)::i32;
+}
+
+fun encode_xorps(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+        if (needs_rex(dst.reg) || needs_rex(src1.reg)) {
+            isa_encode.emit_byte(buf, encode_rex(0, dst.reg, src1.reg));
+        }
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0x57);
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (buf.len - start)::i32;
+    }
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_MEM) {
+        rex_mem(buf, 0, dst.reg, src1);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0x57);
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+    ret 0;
+}
+
+fun encode_movq(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+    if (dst.kind != isa_inst.OPK_REG || src1.kind != isa_inst.OPK_REG) { ret 0; }
+
+    var w: u8 = 0;
+    if (mi.size == 8) { w = 1; }
+    if (dst.size == 16) {
+        isa_encode.emit_byte(buf, 0x66);
+        rex_if_needed(buf, w, dst.reg, src1.reg);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0x6E);
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (buf.len - start)::i32;
+    }
+    isa_encode.emit_byte(buf, 0x66);
+    rex_if_needed(buf, w, src1.reg, dst.reg);
+    isa_encode.emit_byte(buf, 0x0F);
+    isa_encode.emit_byte(buf, 0x7E);
+    isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(src1.reg), reg_bits(dst.reg)));
+    ret (buf.len - start)::i32;
+}
+
+fun encode_movzx(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start:    usize             = buf.len;
+    val dst:      *isa_inst.Operand = ?mi.dst;
+    val src1:     *isa_inst.Operand = ?mi.src1;
+    val src_size: u8                = src1.size;
+    val w:        u8                = size_to_w(mi.size, mi.flags);
+
+    # a 32-bit source zero-extends through the plain 32-bit move, encoded as
+    # one, and the instruction says so for everything that reads it after
+    if (src_size >= 4) {
+        mi.opcode = x64.MOV;
+        mi.size   = 4;
+        mi.flags  = mi.flags & ~(x64_inst.FLAG_REX_W | x64_inst.FLAG_16BIT)::u16;
+        ret encode_mov(mi, buf);
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+        if (src_size == 1 && needs_rex_for_byte_reg(src1.reg)) {
+            isa_encode.emit_byte(buf, encode_rex(w, dst.reg, src1.reg));
+        }
+        or {
+            rex_if_needed(buf, w, dst.reg, src1.reg);
+        }
+        isa_encode.emit_byte(buf, 0x0F);
+        if (src_size == 1) {
+            isa_encode.emit_byte(buf, 0xB6);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0xB7);
+        }
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_MEM) {
+        rex_mem(buf, w, dst.reg, src1);
+        isa_encode.emit_byte(buf, 0x0F);
+        if (src_size == 1) {
+            isa_encode.emit_byte(buf, 0xB6);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0xB7);
+        }
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+fun encode_movsx(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start:    usize             = buf.len;
+    val dst:      *isa_inst.Operand = ?mi.dst;
+    val src1:     *isa_inst.Operand = ?mi.src1;
+    val src_size: u8                = src1.size;
+    if (src_size == 4) {
+        mi.opcode = x64.MOVSXD;
+        ret encode_movsxd(mi, buf);
+    }
+    val w: u8 = size_to_w(mi.size, mi.flags);
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+        if (src_size == 1 && needs_rex_for_byte_reg(src1.reg)) {
+            isa_encode.emit_byte(buf, encode_rex(w, dst.reg, src1.reg));
+        }
+        or {
+            rex_if_needed(buf, w, dst.reg, src1.reg);
+        }
+        isa_encode.emit_byte(buf, 0x0F);
+        if (src_size == 1) {
+            isa_encode.emit_byte(buf, 0xBE);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0xBF);
+        }
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_MEM) {
+        rex_mem(buf, w, dst.reg, src1);
+        isa_encode.emit_byte(buf, 0x0F);
+        if (src_size == 1) {
+            isa_encode.emit_byte(buf, 0xBE);
+        }
+        or {
+            isa_encode.emit_byte(buf, 0xBF);
+        }
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+fun encode_mov_ctlreg(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+
+    var gp: *isa_inst.Operand = dst;
+    var cr: *isa_inst.Operand = src1;
+    var op: u8                = 0x20;
+    if (dst.kind == isa_inst.OPK_IMM) {
+        gp = src1;
+        cr = dst;
+        op = 0x22;
+    }
+    if (gp.kind != isa_inst.OPK_REG || cr.kind != isa_inst.OPK_IMM) { ret 0; }
+
+    var rex: u8 = 0x40;
+    if (cr.imm >= 8)       { rex = rex | 0x04; }
+    if (needs_rex(gp.reg)) { rex = rex | 0x01; }
+    if (rex != 0x40)       { isa_encode.emit_byte(buf, rex); }
+
+    isa_encode.emit_byte(buf, 0x0F);
+    isa_encode.emit_byte(buf, op);
+    isa_encode.emit_byte(buf, encode_modrm(3, (cr.imm & 7)::u8, reg_bits(gp.reg)));
+    ret (buf.len - start)::i32;
+}
+
+fun encode_mov_segreg(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+    if (dst.kind != isa_inst.OPK_REG || src1.kind != isa_inst.OPK_IMM) { ret 0; }
+
+    if (mi.size == 2) { isa_encode.emit_byte(buf, 0x66); }
+    rex_if_needed(buf, 0, src1.imm::i32, dst.reg);
+
+    isa_encode.emit_byte(buf, 0x8C);
+    isa_encode.emit_byte(buf, encode_modrm(3, (src1.imm & 7)::u8, reg_bits(dst.reg)));
+    ret (buf.len - start)::i32;
+}
+
+# f3 0f ae /digit with rex.w for a 64-bit register
+fun fsgsbase_digit(opcode: u16) u8 {
+    if (opcode == x64.RDFSBASE) { ret 0; }
+    if (opcode == x64.RDGSBASE) { ret 1; }
+    if (opcode == x64.WRFSBASE) { ret 2; }
+    ret 3;
+}
+
+fun encode_fsgsbase(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    if (dst.kind != isa_inst.OPK_REG || isa_inst.regid_class(dst.reg) != isa_inst.REG_CLASS_ID_GP) { ret 0; }
+    if (mi.size != 4 && mi.size != 8)                                                              { ret 0; }
+
+    isa_encode.emit_byte(buf, 0xF3);
+    rex_if_needed(buf, size_to_w(mi.size, mi.flags), 0, dst.reg);
+    isa_encode.emit_byte(buf, 0x0F);
+    isa_encode.emit_byte(buf, 0xAE);
+    isa_encode.emit_byte(buf, encode_modrm(3, fsgsbase_digit(mi.opcode), reg_bits(dst.reg)));
+    ret (buf.len - start)::i32;
+}
+
+# the 0f opcode byte of a bit scan or count; the counts carry an f3 prefix
+fun bitscan_opbyte(opcode: u16) u8 {
+    if (opcode == x64.POPCNT)                     { ret 0xB8; }
+    if (opcode == x64.BSF || opcode == x64.TZCNT) { ret 0xBC; }
+    ret 0xBD;
+}
+
+fun bitscan_prefixed(opcode: u16) bool {
+    ret opcode == x64.POPCNT || opcode == x64.LZCNT || opcode == x64.TZCNT;
+}
+
+# [66] [f3] rex 0f xx /r: a 16-, 32- or 64-bit register from an r/m of the same width
+fun encode_bitscan(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+    val size:  u8                = mi.size;
+    if (dst.kind != isa_inst.OPK_REG || isa_inst.regid_class(dst.reg) != isa_inst.REG_CLASS_ID_GP) { ret 0; }
+    if (size != 2 && size != 4 && size != 8)                                                       { ret 0; }
+    val w: u8 = size_to_w(size, mi.flags);
+
+    if (src1.kind == isa_inst.OPK_REG) {
+        if (isa_inst.regid_class(src1.reg) != isa_inst.REG_CLASS_ID_GP) { ret 0; }
+        if (size == 2)                                                  { isa_encode.emit_byte(buf, 0x66); }
+        if (bitscan_prefixed(mi.opcode))                                { isa_encode.emit_byte(buf, 0xF3); }
+        rex_if_needed(buf, w, dst.reg, src1.reg);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, bitscan_opbyte(mi.opcode));
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (buf.len - start)::i32;
+    }
+    if (src1.kind == isa_inst.OPK_MEM) {
+        val seg: u8 = segment_prefix(src1, buf);
+        if (seg != 0)                    { isa_encode.emit_byte(buf, seg); }
+        if (size == 2)                   { isa_encode.emit_byte(buf, 0x66); }
+        if (bitscan_prefixed(mi.opcode)) { isa_encode.emit_byte(buf, 0xF3); }
+        rex_mem(buf, w, dst.reg, src1);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, bitscan_opbyte(mi.opcode));
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+    ret 0;
+}
+
+# [66] rex 0f 40+cc /r: the r/m moved into the register when the condition
+# holds. a 32-bit form clears the upper half whether or not it moves
+fun encode_cmov(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+    val size:  u8                = mi.size;
+    if (dst.kind != isa_inst.OPK_REG || isa_inst.regid_class(dst.reg) != isa_inst.REG_CLASS_ID_GP) { ret 0; }
+    if (size != 2 && size != 4 && size != 8)                                                       { ret 0; }
+    val w:  u8 = size_to_w(size, mi.flags);
+    val cc: u8 = condition_code(mi.opcode);
+
+    if (src1.kind == isa_inst.OPK_REG) {
+        if (isa_inst.regid_class(src1.reg) != isa_inst.REG_CLASS_ID_GP) { ret 0; }
+        if (size == 2)                                                  { isa_encode.emit_byte(buf, 0x66); }
+        rex_if_needed(buf, w, dst.reg, src1.reg);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0x40 + cc);
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (buf.len - start)::i32;
+    }
+    if (src1.kind == isa_inst.OPK_MEM) {
+        val seg: u8 = segment_prefix(src1, buf);
+        if (seg != 0)  { isa_encode.emit_byte(buf, seg); }
+        if (size == 2) { isa_encode.emit_byte(buf, 0x66); }
+        rex_mem(buf, w, dst.reg, src1);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0x40 + cc);
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+    ret 0;
+}
+
+# rex 0f c8+rd: one 32- or 64-bit register reversed in place
+fun encode_bswap(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    if (dst.kind != isa_inst.OPK_REG || isa_inst.regid_class(dst.reg) != isa_inst.REG_CLASS_ID_GP) { ret 0; }
+    if (mi.size != 4 && mi.size != 8)                                                              { ret 0; }
+    rex_if_needed(buf, size_to_w(mi.size, mi.flags), 0, dst.reg);
+    isa_encode.emit_byte(buf, 0x0F);
+    isa_encode.emit_byte(buf, 0xC8 + reg_bits(dst.reg));
+    ret (buf.len - start)::i32;
+}
+
+# [66] rex 0f a4|a5|ac|ad /r [ib]: the r/m in dst, the register feeding bits
+# in src1, and the count in src2 as an imm8 or cl
+fun encode_dshift(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+    val cnt:   *isa_inst.Operand = ?mi.src2;
+    val size:  u8                = mi.size;
+    if (src1.kind != isa_inst.OPK_REG || isa_inst.regid_class(src1.reg) != isa_inst.REG_CLASS_ID_GP) { ret 0; }
+    if (size != 2 && size != 4 && size != 8)                                                         { ret 0; }
+    var by_cl: bool = false;
+    if (cnt.kind == isa_inst.OPK_REG) {
+        if (cnt.reg != x64.RCX::i32) { ret 0; }
+        by_cl = true;
+    }
+    or (cnt.kind == isa_inst.OPK_IMM) {
+        if (cnt.imm < 0 || cnt.imm > 255) { ret 0; }
+    }
+    or { ret 0; }
+    var opbyte: u8 = 0xA4;
+    if (mi.opcode == x64.SHRD) { opbyte = 0xAC; }
+    if (by_cl)                 { opbyte = opbyte + 1; }
+
+    if (dst.kind == isa_inst.OPK_REG) {
+        if (isa_inst.regid_class(dst.reg) != isa_inst.REG_CLASS_ID_GP) { ret 0; }
+        prefix_reg(buf, size, mi.flags, src1.reg, dst.reg);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, opbyte);
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(src1.reg), reg_bits(dst.reg)));
+    }
+    or (dst.kind == isa_inst.OPK_MEM) {
+        val seg: u8 = segment_prefix(dst, buf);
+        if (seg != 0) { isa_encode.emit_byte(buf, seg); }
+        prefix_mem(buf, size, mi.flags, src1.reg, dst);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, opbyte);
+        encode_mem_operand(buf, src1.reg, dst);
+    }
+    or          { ret 0; }
+    if (!by_cl) { isa_encode.emit_byte(buf, cnt.imm::u8); }
+    ret (buf.len - start)::i32;
+}
+
+fun encode_movsxd(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+        isa_encode.emit_byte(buf, encode_rex(1, dst.reg, src1.reg));
+        isa_encode.emit_byte(buf, 0x63);
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_MEM) {
+        rex_mem(buf, 1, dst.reg, src1);
+        isa_encode.emit_byte(buf, 0x63);
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+fun encode_movabs(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+    if (dst.kind != isa_inst.OPK_REG) { ret 0; }
+    isa_encode.emit_byte(buf, encode_rex(1, 0, dst.reg));
+    isa_encode.emit_byte(buf, 0xB8 + reg_bits(dst.reg));
+    if (src1.kind == isa_inst.OPK_IMM) {
+        isa_encode.emit_u64(buf, src1.imm::u64);
+    }
+    or (src1.kind == isa_inst.OPK_SYM || src1.kind == isa_inst.OPK_LABEL) {
+        isa_encode.emit_u64(buf, 0);
+    }
+    or {
+        isa_encode.emit_u64(buf, 0);
+    }
+    ret (buf.len - start)::i32;
+}
+
+fun encode_sse_mov(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start:  usize             = buf.len;
+    val dst:    *isa_inst.Operand = ?mi.dst;
+    val src1:   *isa_inst.Operand = ?mi.src1;
+    val opcode: u16               = mi.opcode;
+
+    var prefix: u8 = 0xF3;
+    if (opcode == x64.MOVSD) { prefix = 0xF2; }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+        isa_encode.emit_byte(buf, prefix);
+        rex_if_needed(buf, 0, dst.reg, src1.reg);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0x10);
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_MEM) {
+        isa_encode.emit_byte(buf, prefix);
+        rex_mem(buf, 0, dst.reg, src1);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0x10);
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_MEM && src1.kind == isa_inst.OPK_REG) {
+        isa_encode.emit_byte(buf, prefix);
+        rex_mem(buf, 0, src1.reg, dst);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0x11);
+        encode_mem_operand(buf, src1.reg, dst);
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+fun encode_movaps(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_MEM) {
+        rex_mem(buf, 0, dst.reg, src1);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0x28);
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_MEM && src1.kind == isa_inst.OPK_REG) {
+        rex_mem(buf, 0, src1.reg, dst);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0x29);
+        encode_mem_operand(buf, src1.reg, dst);
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+fun sse_alu_opcode(opcode: u16) u8 {
+    if (opcode == x64.ADDSS || opcode == x64.ADDSD) { ret 0x58; }
+    if (opcode == x64.SUBSS || opcode == x64.SUBSD) { ret 0x5C; }
+    if (opcode == x64.MULSS || opcode == x64.MULSD) { ret 0x59; }
+    if (opcode == x64.DIVSS || opcode == x64.DIVSD) { ret 0x5E; }
+    ret 0x58;
+}
+
+fun sse_alu_prefix(opcode: u16) u8 {
+    if (opcode == x64.ADDSD || opcode == x64.SUBSD || opcode == x64.MULSD || opcode == x64.DIVSD) {
+        ret 0xF2;
+    }
+    ret 0xF3;
+}
+
+fun encode_sse_alu(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start:  usize             = buf.len;
+    val dst:    *isa_inst.Operand = ?mi.dst;
+    val src1:   *isa_inst.Operand = ?mi.src1;
+    val prefix: u8                = sse_alu_prefix(mi.opcode);
+    val opc:    u8                = sse_alu_opcode(mi.opcode);
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+        isa_encode.emit_byte(buf, prefix);
+        rex_if_needed(buf, 0, dst.reg, src1.reg);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, opc);
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_MEM) {
+        isa_encode.emit_byte(buf, prefix);
+        rex_mem(buf, 0, dst.reg, src1);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, opc);
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+fun encode_ucomiss(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize             = buf.len;
+    val dst:   *isa_inst.Operand = ?mi.dst;
+    val src1:  *isa_inst.Operand = ?mi.src1;
+
+    if (mi.opcode == x64.UCOMISD) {
+        isa_encode.emit_byte(buf, 0x66);
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+        rex_if_needed(buf, 0, dst.reg, src1.reg);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0x2E);
+        isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        ret (buf.len - start)::i32;
+    }
+
+    if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_MEM) {
+        rex_mem(buf, 0, dst.reg, src1);
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, 0x2E);
+        encode_mem_operand(buf, dst.reg, src1);
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+fun encode_cvt(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start:  usize             = buf.len;
+    val dst:    *isa_inst.Operand = ?mi.dst;
+    val src1:   *isa_inst.Operand = ?mi.src1;
+    val opcode: u16               = mi.opcode;
+
+    if (opcode == x64.CVTSI2SS) {
+        val w: u8 = size_to_w(mi.size, mi.flags);
+        if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+            isa_encode.emit_byte(buf, 0xF3);
+            rex_if_needed(buf, w, dst.reg, src1.reg);
+            isa_encode.emit_byte(buf, 0x0F);
+            isa_encode.emit_byte(buf, 0x2A);
+            isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        }
+        ret (buf.len - start)::i32;
+    }
+
+    if (opcode == x64.CVTSI2SD) {
+        val w: u8 = size_to_w(mi.size, mi.flags);
+        if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+            isa_encode.emit_byte(buf, 0xF2);
+            rex_if_needed(buf, w, dst.reg, src1.reg);
+            isa_encode.emit_byte(buf, 0x0F);
+            isa_encode.emit_byte(buf, 0x2A);
+            isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        }
+        ret (buf.len - start)::i32;
+    }
+
+    if (opcode == x64.CVTTSS2SI) {
+        val w: u8 = size_to_w(mi.size, mi.flags);
+        if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+            isa_encode.emit_byte(buf, 0xF3);
+            rex_if_needed(buf, w, dst.reg, src1.reg);
+            isa_encode.emit_byte(buf, 0x0F);
+            isa_encode.emit_byte(buf, 0x2C);
+            isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        }
+        ret (buf.len - start)::i32;
+    }
+
+    if (opcode == x64.CVTTSD2SI) {
+        val w: u8 = size_to_w(mi.size, mi.flags);
+        if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+            isa_encode.emit_byte(buf, 0xF2);
+            rex_if_needed(buf, w, dst.reg, src1.reg);
+            isa_encode.emit_byte(buf, 0x0F);
+            isa_encode.emit_byte(buf, 0x2C);
+            isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        }
+        ret (buf.len - start)::i32;
+    }
+
+    if (opcode == x64.CVTSS2SD) {
+        if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+            isa_encode.emit_byte(buf, 0xF3);
+            rex_if_needed(buf, 0, dst.reg, src1.reg);
+            isa_encode.emit_byte(buf, 0x0F);
+            isa_encode.emit_byte(buf, 0x5A);
+            isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        }
+        ret (buf.len - start)::i32;
+    }
+
+    if (opcode == x64.CVTSD2SS) {
+        if (dst.kind == isa_inst.OPK_REG && src1.kind == isa_inst.OPK_REG) {
+            isa_encode.emit_byte(buf, 0xF2);
+            rex_if_needed(buf, 0, dst.reg, src1.reg);
+            isa_encode.emit_byte(buf, 0x0F);
+            isa_encode.emit_byte(buf, 0x5A);
+            isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(dst.reg), reg_bits(src1.reg)));
+        }
+        ret (buf.len - start)::i32;
+    }
+
+    ret 0;
+}
+
+# a memory source beside a memory destination is staged through a scratch
+# register where the row admits one r/m operand: a shift's count and a swap's
+# second operand are never staged
+pub fun staged_source(mi: *isa_inst.Inst) bool {
+    if (mi.src1.kind != isa_inst.OPK_MEM || mi.dst.kind != isa_inst.OPK_MEM) { ret false; }
+    val desc: x64_inst.OpDesc = x64_inst.describe(mi.opcode);
+    if ((desc.mem & x64_inst.MEM_OPERAND) == 0) { ret false; }
+    ret desc.form != x64_inst.FORM_SHIFT && desc.shape != x64_inst.SHAPE_SWAP;
+}
+
+# the load staging a source into the scratch the instruction then reads, none
+# when no scratch is free
+pub fun staging_load(mi: *isa_inst.Inst) opt[isa_inst.Inst] {
+    var scratch: i32 = float_scratch0();
+    if (mi.size != 16 && mi.size != 32) {
+        scratch = pick_stage_scratch(?mi.dst, ?mi.src1);
+        if (scratch == isa_inst.REG_NONE) { ret opt[isa_inst.Inst].none{}; }
+    }
+    var ld: isa_inst.Inst = isa_inst.inst_blank();
+    ld.opcode = x64.MOV;
+    ld.dst    = isa_inst.make_reg(scratch, mi.size);
+    ld.src1   = mi.src1;
+    ld.size   = mi.size;
+    ld.flags  = mi.flags;
+    ret opt[isa_inst.Inst].some{ld};
+}
+
+pub fun encode_inst(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    if (mi == nil || buf == nil) { ret 0; }
+    val opcode: u16 = mi.opcode;
+
+    if (opcode == lang_mir.ISA_PCOPY::u16 || opcode == lang_mir.ISA_PCOPY_FENCE::u16) { ret 0; }
+
+    if (staged_source(mi)) {
+        val staged: opt[isa_inst.Inst] = staging_load(mi);
+        if (!sel staged.some) { ret 0; }
+        var ld:    isa_inst.Inst = staged.some;
+        val ld_sz: i32           = encode_inst(?ld, buf);
+        if (ld_sz <= 0) { ret 0; }
+        mi.src1 = ld.dst;
+        val rest: i32 = encode_inst(mi, buf);
+        if (rest <= 0) { ret 0; }
+        ret ld_sz + rest;
+    }
+
+    val desc:  x64_inst.OpDesc = x64_inst.describe(opcode);
+    val start: usize           = buf.len;
+    val seg:   u8              = inst_segment_prefix(mi, buf);
+    var lead:  i32             = 0;
+    if (seg != 0) {
+        # an address operand is never accessed, so an override on it relocates nothing
+        if ((desc.mem & x64_inst.MEM_ADDR) != 0) { ret 0; }
+        isa_encode.emit_byte(buf, seg);
+        lead = 1;
+    }
+    val n: i32 = encode_inst_one(mi, buf);
+    if (n <= 0) {
+        # an encoder refuses before its first byte, so only the prefix is withdrawn
+        buf.len = start;
+        ret n;
+    }
+    if (isa_encode.sink_unaccounted(buf) > 0) { x64_printer.note_inst(buf, mi, start); }
+    ret lead + n;
+}
+
+fun has_mem_operand(mi: *isa_inst.Inst) bool {
+    ret mi.dst.kind == isa_inst.OPK_MEM || mi.src1.kind == isa_inst.OPK_MEM ||
+        mi.src2.kind == isa_inst.OPK_MEM || mi.src3.kind == isa_inst.OPK_MEM;
+}
+
+# the sse rows the vex variant writes in their vex form; the packed rows
+# take theirs through emit_packed_body
+fun has_vex_form(op: u16) bool {
+    ret op == x64.MOVSS || op == x64.MOVSD || op == x64.MOVAPS || op == x64.MOVUPS || is_sse_alu(op)
+        || op == x64.UCOMISS || op == x64.UCOMISD || is_cvt(op) || op == x64.XORPS || op == x64.MOVQ;
+}
+
+# one scalar sse, move or conversion row in its vex form, VEX.LIG or VEX.128:
+# a row that merges into its destination (scalar arithmetic, a register
+# scalar move, an integer or float conversion into xmm, xorps) names the
+# destination in vvvv as the first source, and every other row leaves vvvv
+# empty. the listing is the vex spelling of the same operands
+fun encode_sse_vex(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val start: usize            = buf.len;
+    val op:    u16              = mi.opcode;
+    val dst:   isa_inst.Operand = mi.dst;
+    val src:   isa_inst.Operand = mi.src1;
+    var m:     OpMap            = OpMap{prefix: 0, map: 0, opbyte: 0, w: 0};
+    var reg:   i32              = isa_inst.REG_NONE;
+    var vvvv:  i32              = isa_inst.REG_NONE;
+    var rm:    isa_inst.Operand = src;
+    if (op == x64.MOVSS || op == x64.MOVSD) {
+        m.prefix = 0xF3;
+        if (op == x64.MOVSD) { m.prefix = 0xF2; }
+        m.opbyte = 0x10;
+        reg      = dst.reg;
+        if (dst.kind == isa_inst.OPK_REG && src.kind == isa_inst.OPK_REG) {
+            vvvv = dst.reg;
+            # an extended source into a low register takes the 11 form, whose
+            # R bit the two-byte prefix carries, as the assembler encodes it
+            if (reg_is_high(src.reg) && !reg_is_high(dst.reg)) {
+                m.opbyte = 0x11;
+                reg      = src.reg;
+                rm       = dst;
+            }
+        }
+        or (dst.kind == isa_inst.OPK_MEM && src.kind == isa_inst.OPK_REG) {
+            m.opbyte = 0x11;
+            reg      = src.reg;
+            rm       = dst;
+        }
+        or (dst.kind != isa_inst.OPK_REG || src.kind != isa_inst.OPK_MEM) { ret 0; }
+    }
+    or (op == x64.MOVAPS || op == x64.MOVUPS) {
+        m.opbyte = 0x28;
+        if (op == x64.MOVUPS) { m.opbyte = 0x10; }
+        reg = dst.reg;
+        if ((dst.kind == isa_inst.OPK_MEM && src.kind == isa_inst.OPK_REG)
+            || (dst.kind == isa_inst.OPK_REG && src.kind == isa_inst.OPK_REG && reg_is_high(src.reg) && !reg_is_high(dst.reg))) {
+            m.opbyte = m.opbyte + 1;
+            reg      = src.reg;
+            rm       = dst;
+        }
+        or (dst.kind != isa_inst.OPK_REG || (src.kind != isa_inst.OPK_REG && src.kind != isa_inst.OPK_MEM)) { ret 0; }
+    }
+    or (is_sse_alu(op) || op == x64.XORPS || op == x64.CVTSS2SD || op == x64.CVTSD2SS) {
+        if (dst.kind != isa_inst.OPK_REG || (src.kind != isa_inst.OPK_REG && src.kind != isa_inst.OPK_MEM)) { ret 0; }
+        if (op == x64.XORPS)                                                                                { m.opbyte = 0x57; }
+        or (op == x64.CVTSS2SD || op == x64.CVTSD2SS) {
+            m.prefix = 0xF3;
+            if (op == x64.CVTSD2SS) { m.prefix = 0xF2; }
+            m.opbyte = 0x5A;
+        }
+        or {
+            m.prefix = sse_alu_prefix(op);
+            m.opbyte = sse_alu_opcode(op);
+        }
+        reg  = dst.reg;
+        vvvv = dst.reg;
+    }
+    or (op == x64.UCOMISS || op == x64.UCOMISD) {
+        if (dst.kind != isa_inst.OPK_REG || (src.kind != isa_inst.OPK_REG && src.kind != isa_inst.OPK_MEM)) { ret 0; }
+        if (op == x64.UCOMISD)                                                                              { m.prefix = 0x66; }
+        m.opbyte = 0x2E;
+        reg      = dst.reg;
+    }
+    or (op == x64.CVTSI2SS || op == x64.CVTSI2SD || op == x64.CVTTSS2SI || op == x64.CVTTSD2SI) {
+        if (dst.kind != isa_inst.OPK_REG || src.kind != isa_inst.OPK_REG) { ret 0; }
+        m.prefix = 0xF3;
+        if (op == x64.CVTSI2SD || op == x64.CVTTSD2SI) { m.prefix = 0xF2; }
+        m.opbyte = 0x2C;
+        m.w      = size_to_w(mi.size, mi.flags);
+        reg      = dst.reg;
+        if (op == x64.CVTSI2SS || op == x64.CVTSI2SD) {
+            m.opbyte = 0x2A;
+            vvvv     = dst.reg;
+        }
+    }
+    or (op == x64.MOVQ) {
+        if (dst.kind != isa_inst.OPK_REG || src.kind != isa_inst.OPK_REG) { ret 0; }
+        m.prefix = 0x66;
+        m.opbyte = 0x6E;
+        if (mi.size == 8) { m.w = 1; }
+        reg = dst.reg;
+        if (dst.size != 16) {
+            m.opbyte = 0x7E;
+            reg      = src.reg;
+            rm       = dst;
+        }
+    }
+    or { ret 0; }
+    vex_rm(m, 0, reg, vvvv, rm, buf);
+    if (isa_encode.sink_active(buf)) {
+        var note: isa_inst.Inst = @mi;
+        note.flags = mi.flags | x64_inst.FLAG_VEX::u16;
+        if (vvvv != isa_inst.REG_NONE) {
+            note.src2 = src;
+            note.src1 = dst;
+        }
+        x64_printer.note_inst(buf, ?note, start);
+    }
+    ret (buf.len - start)::i32;
+}
+
+fun encode_inst_one(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val opcode: u16 = mi.opcode;
+
+    # an opcode without a row, or a memory operand on a row that reaches
+    # memory only implicitly or not at all, is refused before any byte
+    val desc: x64_inst.OpDesc = x64_inst.describe(opcode);
+    if (desc.form == x64_inst.FORM_NONE)                                                     { ret 0; }
+    if (has_mem_operand(mi) && (desc.mem & (x64_inst.MEM_OPERAND | x64_inst.MEM_ADDR)) == 0) { ret 0; }
+    if (vex_encoding(buf) && has_vex_form(opcode))                                           { ret encode_sse_vex(mi, buf); }
+
+    val form: x64_inst.Form = desc.form;
+    if (form == x64_inst.FORM_BARE || form == x64_inst.FORM_TRAP) { ret encode_fixed(opcode, buf); }
+    if (form == x64_inst.FORM_MOV)                                { ret encode_mov(mi, buf); }
+    if (form == x64_inst.FORM_LEA)                                { ret encode_lea(mi, buf); }
+    if (form == x64_inst.FORM_PUSH)                               { ret encode_push(mi, buf); }
+    if (form == x64_inst.FORM_POP)                                { ret encode_pop(mi, buf); }
+    if (form == x64_inst.FORM_ALU || form == x64_inst.FORM_CARRY) { ret encode_alu(mi, buf); }
+    if (form == x64_inst.FORM_TEST)                               { ret encode_test(mi, buf); }
+    if (form == x64_inst.FORM_IMUL)                               { ret encode_imul(mi, buf); }
+    if (form == x64_inst.FORM_DIV)                                { ret encode_div(mi, buf, opcode == x64.IDIV); }
+    if (form == x64_inst.FORM_MUL1)                               { ret encode_mul1(mi, buf); }
+    if (form == x64_inst.FORM_SHIFT)                              { ret encode_shift(mi, buf); }
+    if (form == x64_inst.FORM_JCC)                                { ret encode_jcc(mi, buf); }
+    if (form == x64_inst.FORM_JMP)                                { ret encode_jmp(mi, buf); }
+    if (form == x64_inst.FORM_CALL)                               { ret encode_call(mi, buf); }
+    if (form == x64_inst.FORM_RET)                                { ret encode_fixed(opcode, buf); }
+    if (form == x64_inst.FORM_SETCC)                              { ret encode_setcc(mi, buf); }
+    if (form == x64_inst.FORM_MOVX) {
+        if (opcode == x64.MOVZX) { ret encode_movzx(mi, buf); }
+        if (opcode == x64.MOVSX) { ret encode_movsx(mi, buf); }
+        ret encode_movsxd(mi, buf);
+    }
+    if (form == x64_inst.FORM_MOVQ)    { ret encode_movq(mi, buf); }
+    if (form == x64_inst.FORM_XORPS)   { ret encode_xorps(mi, buf); }
+    if (form == x64_inst.FORM_MOVABS)  { ret encode_movabs(mi, buf); }
+    if (form == x64_inst.FORM_SSE_MOV) { ret encode_sse_mov(mi, buf); }
+    # of the aligned and unaligned vector moves only movaps has a one-instruction form here
+    if (form == x64_inst.FORM_SSE_MOVA) {
+        if (opcode == x64.MOVAPS) { ret encode_movaps(mi, buf); }
+        ret 0;
+    }
+    if (form == x64_inst.FORM_SSE_ALU)  { ret encode_sse_alu(mi, buf); }
+    if (form == x64_inst.FORM_UCOMIS)   { ret encode_ucomiss(mi, buf); }
+    if (form == x64_inst.FORM_CVT)      { ret encode_cvt(mi, buf); }
+    if (form == x64_inst.FORM_MOV_CR)   { ret encode_mov_ctlreg(mi, buf); }
+    if (form == x64_inst.FORM_MOV_SEG)  { ret encode_mov_segreg(mi, buf); }
+    if (form == x64_inst.FORM_FSGSBASE) { ret encode_fsgsbase(mi, buf); }
+    if (form == x64_inst.FORM_BITSCAN)  { ret encode_bitscan(mi, buf); }
+    if (form == x64_inst.FORM_BSWAP)    { ret encode_bswap(mi, buf); }
+    if (form == x64_inst.FORM_DSHIFT)   { ret encode_dshift(mi, buf); }
+    if (form == x64_inst.FORM_CMOV)     { ret encode_cmov(mi, buf); }
+    if (form == x64_inst.FORM_LIDT)     { ret encode_lidt(mi, buf); }
+    if (form == x64_inst.FORM_PORTIO)   { ret encode_portio(mi, buf); }
+    if (form == x64_inst.FORM_GRP3)     { ret encode_unary_grp3(mi, buf); }
+    if (form == x64_inst.FORM_GRP5)     { ret encode_unary_grp5(mi, buf); }
+    if (form == x64_inst.FORM_XCHG)     { ret encode_xchg(mi, buf); }
+    if (form == x64_inst.FORM_XADD)     { ret encode_xadd_cmpxchg(mi, buf); }
+    if (form == x64_inst.FORM_DATA) {
+        isa_encode.emit_byte(buf, mi.dst.imm::u8);
+        ret 1;
+    }
+    if (form == x64_inst.FORM_STRING) { ret encode_string(mi, buf); }
+    ret 0;
+}
+
+fun encode_lidt(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val dst: *isa_inst.Operand = ?mi.dst;
+    if (dst.kind != isa_inst.OPK_MEM) { ret 0; }
+    val start: usize = buf.len;
+    rex_mem(buf, 0, 3, dst);
+    isa_encode.emit_byte(buf, 0x0F);
+    isa_encode.emit_byte(buf, 0x01);
+    encode_mem_operand(buf, 3, dst);
+    ret (buf.len - start)::i32;
+}
+
+# the bytes of an instruction that takes no operand: its whole encoding
+rec Fixed {
+    op:    u16;
+    len:   u8;
+    bytes: [3]u8;
+}
+
+val FIXED_COUNT: usize              = 23;
+val FIXED:       [FIXED_COUNT]Fixed = [FIXED_COUNT]Fixed{
+    Fixed{op: x64.NOP, len: 1, bytes: [3]u8{0x90, 0, 0}},
+    Fixed{op: x64.CDQ, len: 1, bytes: [3]u8{0x99, 0, 0}},
+    Fixed{op: x64.CQO, len: 2, bytes: [3]u8{0x48, 0x99, 0}},
+    Fixed{op: x64.SYSCALL, len: 2, bytes: [3]u8{0x0F, 0x05, 0}},
+    Fixed{op: x64.UD2, len: 2, bytes: [3]u8{0x0F, 0x0B, 0}},
+    Fixed{op: x64.PAUSE, len: 2, bytes: [3]u8{0xF3, 0x90, 0}},
+    Fixed{op: x64.MFENCE, len: 3, bytes: [3]u8{0x0F, 0xAE, 0xF0}},
+    Fixed{op: x64.HLT, len: 1, bytes: [3]u8{0xF4, 0, 0}},
+    Fixed{op: x64.CLI, len: 1, bytes: [3]u8{0xFA, 0, 0}},
+    Fixed{op: x64.STI, len: 1, bytes: [3]u8{0xFB, 0, 0}},
+    Fixed{op: x64.RDTSC, len: 2, bytes: [3]u8{0x0F, 0x31, 0}},
+    Fixed{op: x64.CPUID, len: 2, bytes: [3]u8{0x0F, 0xA2, 0}},
+    Fixed{op: x64.VZEROUPPER, len: 3, bytes: [3]u8{0xC5, 0xF8, 0x77}},
+    Fixed{op: x64.RDMSR, len: 2, bytes: [3]u8{0x0F, 0x32, 0}},
+    Fixed{op: x64.WRMSR, len: 2, bytes: [3]u8{0x0F, 0x30, 0}},
+    Fixed{op: x64.CLD, len: 1, bytes: [3]u8{0xFC, 0, 0}},
+    Fixed{op: x64.PUSHFQ, len: 1, bytes: [3]u8{0x9C, 0, 0}},
+    Fixed{op: x64.POPFQ, len: 1, bytes: [3]u8{0x9D, 0, 0}},
+    Fixed{op: x64.IRETQ, len: 2, bytes: [3]u8{0x48, 0xCF, 0}},
+    Fixed{op: x64.SWAPGS, len: 3, bytes: [3]u8{0x0F, 0x01, 0xF8}},
+    Fixed{op: x64.CBW, len: 2, bytes: [3]u8{0x66, 0x98, 0}},
+    Fixed{op: x64.CWD, len: 2, bytes: [3]u8{0x66, 0x99, 0}},
+    Fixed{op: x64.RET, len: 1, bytes: [3]u8{0xC3, 0, 0}},
+};
+
+# the fixed encoding of `op`, nothing for an opcode the table has no row for
+fun encode_fixed(op: u16, buf: *isa_encode.ByteBuf) i32 {
+    var i: usize = 0;
+    for (i < FIXED_COUNT) {
+        if (FIXED[i].op == op) {
+            var k: u8 = 0;
+            for (k < FIXED[i].len) {
+                isa_encode.emit_byte(buf, FIXED[i].bytes[k]);
+                k = k + 1;
+            }
+            ret FIXED[i].len::i32;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the opcode byte and element width of each string instruction
+rec StringRow {
+    op:    u16;
+    byte:  u8;
+    width: u8;
+}
+
+val STRING_ROW_COUNT: usize = 20;
+
+val STRING_ROWS: [STRING_ROW_COUNT]StringRow = [STRING_ROW_COUNT]StringRow{
+    StringRow{op: x64.MOVSB, byte: 0xA4, width: 1},
+    StringRow{op: x64.MOVSW, byte: 0xA5, width: 2},
+    StringRow{op: x64.MOVSD_STRING, byte: 0xA5, width: 4},
+    StringRow{op: x64.MOVSQ, byte: 0xA5, width: 8},
+    StringRow{op: x64.CMPSB, byte: 0xA6, width: 1},
+    StringRow{op: x64.CMPSW, byte: 0xA7, width: 2},
+    StringRow{op: x64.CMPSD, byte: 0xA7, width: 4},
+    StringRow{op: x64.CMPSQ, byte: 0xA7, width: 8},
+    StringRow{op: x64.STOSB, byte: 0xAA, width: 1},
+    StringRow{op: x64.STOSW, byte: 0xAB, width: 2},
+    StringRow{op: x64.STOSD, byte: 0xAB, width: 4},
+    StringRow{op: x64.STOSQ, byte: 0xAB, width: 8},
+    StringRow{op: x64.LODSB, byte: 0xAC, width: 1},
+    StringRow{op: x64.LODSW, byte: 0xAD, width: 2},
+    StringRow{op: x64.LODSD, byte: 0xAD, width: 4},
+    StringRow{op: x64.LODSQ, byte: 0xAD, width: 8},
+    StringRow{op: x64.SCASB, byte: 0xAE, width: 1},
+    StringRow{op: x64.SCASW, byte: 0xAF, width: 2},
+    StringRow{op: x64.SCASD, byte: 0xAF, width: 4},
+    StringRow{op: x64.SCASQ, byte: 0xAF, width: 8},
+};
+
+# the row of a string opcode; a width of 0 for anything else
+pub fun string_row(op: u16) StringRow {
+    var i: usize = 0;
+    for (i < STRING_ROW_COUNT) {
+        if (STRING_ROWS[i].op == op) { ret STRING_ROWS[i]; }
+        i = i + 1;
+    }
+    ret StringRow{op: op, byte: 0, width: 0};
+}
+
+# the operand-size prefix, the repeat prefix, rex.w and the opcode byte, in
+# the order GNU as emits them
+fun encode_string(mi: *isa_inst.Inst, buf: *isa_encode.ByteBuf) i32 {
+    val row: StringRow = string_row(mi.opcode);
+    if (row.width == 0) { ret 0; }
+    val start: usize = buf.len;
+    if (row.width == 2)                             { isa_encode.emit_byte(buf, 0x66); }
+    if ((mi.flags & x64_inst.FLAG_REP::u16) != 0)   { isa_encode.emit_byte(buf, 0xF3); }
+    or ((mi.flags & x64_inst.FLAG_REPNE::u16) != 0) { isa_encode.emit_byte(buf, 0xF2); }
+    if (row.width == 8)                             { isa_encode.emit_byte(buf, 0x48); }
+    isa_encode.emit_byte(buf, row.byte);
+    ret (buf.len - start)::i32;
+}
+
+pub fun is_rip_mem(op: *isa_inst.Operand) bool {
+    ret op.kind == isa_inst.OPK_MEM && op.base == isa_inst.REG_NONE && op.index == isa_inst.REG_NONE;
+}
+
+fun trailing_imm_width(mi: *isa_inst.Inst) i32 {
+    if (mi.src1.kind != isa_inst.OPK_IMM)                                        { ret 0; }
+    if (mi.size == 8 && (mi.src1.imm < -2147483648 || mi.src1.imm > 2147483647)) { ret 0; }
+    if (mi.size == 1)                                                            { ret 1; }
+    if (mi.size == 2)                                                            { ret 2; }
+    ret 4;
+}
+
+pub fun reloc_offset(ctx: ptr, mi: *isa_inst.Inst, inst_size: i32) i32 {
+    if (mi.opcode == x64.MOVABS) {
+        ret inst_size - 8;
+    }
+    if (mi.opcode == x64.CALL || mi.opcode == x64.JMP || is_jcc(mi.opcode)) {
+        ret inst_size - 4;
+    }
+    if (mi.dst.kind == isa_inst.OPK_LABEL || mi.src1.kind == isa_inst.OPK_LABEL) {
+        ret inst_size - 4;
+    }
+    if (is_rip_mem(?mi.dst)) {
+        ret inst_size - trailing_imm_width(mi) - 4;
+    }
+    if (is_rip_mem(?mi.src1)) {
+        ret inst_size - 4;
+    }
+    ret -1;
+}
+
+# the variant that writes every sse instruction in its vex form: a legacy one
+# that writes an xmm register while a ymm register's upper half holds state
+# pays a state merge on each, well past a hundred cycles on Zen 3, so under avx
+# no xmm instruction the compiler emits is legacy-encoded
+pub val VARIANT_VEX: u8 = 1;
+
+pub fun vex_encoding(buf: *isa_encode.ByteBuf) bool {
+    ret buf.variant == VARIANT_VEX;
+}
+
+pub fun float_scratch0() i32 {
+    ret x64.XMM14;
+}
+
+pub fun float_reg_or_slot_load(op: isa_inst.Operand, xmm: i32, w: u8, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    if (w == 2) { ret half_move(isa_inst.make_reg(xmm, 16), op, buf); }
+    if (!common.is_float_width(w)) {
+        ret err[fail.Fail].err{fail.message("internal compiler error: float load has a non-float access width (expected 4 or 8)")};
+    }
+    var mov_op: u16 = x64.MOVSD;
+    if (w == 4) { mov_op = x64.MOVSS; }
+
+    if (op.kind == isa_inst.OPK_MEM) {
+        var ld: isa_inst.Inst = isa_inst.inst_blank();
+        ld.opcode = mov_op;
+        ld.dst    = isa_inst.make_reg(xmm, 16);
+        ld.src1   = op;
+        ld.size   = w;
+        encode_inst(?ld, buf);
+        ret err[fail.Fail].ok{};
+    }
+    if (op.kind == isa_inst.OPK_REG) {
+        var mv: isa_inst.Inst = isa_inst.inst_blank();
+        mv.opcode = mov_op;
+        mv.dst    = isa_inst.make_reg(xmm, 16);
+        mv.src1   = isa_inst.make_reg(op.reg, 16);
+        mv.size   = w;
+        encode_inst(?mv, buf);
+        ret err[fail.Fail].ok{};
+    }
+    ret err[fail.Fail].err{fail.message("encode: float operand is not a register or a frame slot")};
+}
+
+pub fun float_store(dst: isa_inst.Operand, xmm: i32, w: u8, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    if (w == 2) { ret half_move(dst, isa_inst.make_reg(xmm, 16), buf); }
+    if (!common.is_float_width(w)) {
+        ret err[fail.Fail].err{fail.message("internal compiler error: float store has a non-float access width (expected 4 or 8)")};
+    }
+    var mov_op: u16 = x64.MOVSD;
+    if (w == 4) { mov_op = x64.MOVSS; }
+
+    if (dst.kind == isa_inst.OPK_MEM) {
+        var st: isa_inst.Inst = isa_inst.inst_blank();
+        st.opcode = mov_op;
+        st.dst    = dst;
+        st.src1   = isa_inst.make_reg(xmm, 16);
+        st.size   = w;
+        encode_inst(?st, buf);
+        ret err[fail.Fail].ok{};
+    }
+    if (dst.kind == isa_inst.OPK_REG) {
+        var mv: isa_inst.Inst = isa_inst.inst_blank();
+        mv.opcode = mov_op;
+        mv.dst    = isa_inst.make_reg(dst.reg, 16);
+        mv.src1   = isa_inst.make_reg(xmm, 16);
+        mv.size   = w;
+        encode_inst(?mv, buf);
+        ret err[fail.Fail].ok{};
+    }
+    ret err[fail.Fail].err{fail.message("encode: float destination is not a register or frame slot")};
+}
+
+# an f16 lives in the low word of an xmm register: a register copy
+# moves the whole register, memory is reached as a word by pinsrw and pextrw,
+# and a general register by movd, whose bits above the word are no part of
+# the value
+pub fun half_move(dst: isa_inst.Operand, src: isa_inst.Operand, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    val start: usize = buf.len;
+    if (reg_is_xmm(?dst) && reg_is_xmm(?src)) {
+        if (dst.reg != src.reg) { movaps_rr(dst.reg, src.reg, VB_XMM, buf); }
+        ret err[fail.Fail].ok{};
+    }
+    if (reg_is_xmm(?dst) && src.kind == isa_inst.OPK_REG) {
+        movd_movq_reg(src.reg, dst.reg, 4, true, buf);
+        ret err[fail.Fail].ok{};
+    }
+    if (reg_is_xmm(?src) && dst.kind == isa_inst.OPK_REG) {
+        movd_movq_reg(dst.reg, src.reg, 4, false, buf);
+        ret err[fail.Fail].ok{};
+    }
+    if (reg_is_xmm(?dst) && src.kind == isa_inst.OPK_MEM && vex_encoding(buf)) {
+        vex_rm(OpMap{prefix: 0x66, map: 0, opbyte: 0xC4, w: 0}, 0, dst.reg, dst.reg, src, buf);
+        isa_encode.emit_byte(buf, 0);
+        note_vec(buf, start, x64.PINSRW, x64_inst.FLAG_VEX, vec_reg(dst.reg, VB_XMM), vec_reg(dst.reg, VB_XMM), src, isa_inst.make_imm(0, 1), VB_XMM);
+        ret err[fail.Fail].ok{};
+    }
+    if (reg_is_xmm(?src) && dst.kind == isa_inst.OPK_MEM && vex_encoding(buf)) {
+        vex_rm(OpMap{prefix: 0x66, map: 0x3A, opbyte: 0x15, w: 0}, 0, src.reg, isa_inst.REG_NONE, dst, buf);
+        isa_encode.emit_byte(buf, 0);
+        note_vec(buf, start, x64.PEXTRW, x64_inst.FLAG_VEX, dst, vec_reg(src.reg, VB_XMM), isa_inst.make_imm(0, 1), isa_inst.make_none(), VB_XMM);
+        ret err[fail.Fail].ok{};
+    }
+    if (reg_is_xmm(?dst) && src.kind == isa_inst.OPK_MEM) {
+        sse_rm(0x66, 0xC4, dst.reg, src, buf);
+        isa_encode.emit_byte(buf, 0);
+        note_packed_imm(buf, start, x64.PINSRW, vec_reg(dst.reg, VB_XMM), src, 0);
+        ret err[fail.Fail].ok{};
+    }
+    if (reg_is_xmm(?src) && dst.kind == isa_inst.OPK_MEM) {
+        sse_map_rm(0x66, 0x3A, 0x15, src.reg, dst, buf);
+        isa_encode.emit_byte(buf, 0);
+        note_packed_imm(buf, start, x64.PEXTRW, dst, vec_reg(src.reg, VB_XMM), 0);
+        ret err[fail.Fail].ok{};
+    }
+    ret err[fail.Fail].err{fail.message("encode: an f16 move names no xmm register beside a register or frame slot")};
+}
+
+pub fun patch_rel32(buf: *isa_encode.ByteBuf, pos: usize, disp: i32) {
+    buf.data[pos]     = (disp & 0xFF)::u8;
+    buf.data[pos + 1] = ((disp >> 8) & 0xFF)::u8;
+    buf.data[pos + 2] = ((disp >> 16) & 0xFF)::u8;
+    buf.data[pos + 3] = ((disp >> 24) & 0xFF)::u8;
+}
+
+pub fun movd_movq_reg(gp: i32, xmm: i32, w: u8, gp_to_xmm: bool, buf: *isa_encode.ByteBuf) {
+    var mq: isa_inst.Inst = isa_inst.inst_blank();
+    mq.opcode = x64.MOVQ;
+    mq.size   = w;
+    if (gp_to_xmm) {
+        mq.dst  = isa_inst.make_reg(xmm, 16);
+        mq.src1 = isa_inst.make_reg(gp, w);
+    }
+    or {
+        mq.dst  = isa_inst.make_reg(gp, w);
+        mq.src1 = isa_inst.make_reg(xmm, 16);
+    }
+    encode_inst(?mq, buf);
+}
+
+# the mandatory prefix of a packed opcode, 0 for none
+fun packed_prefix(op: u16) u8 {
+    if (op == x64.ADDPS || op == x64.SUBPS || op == x64.MULPS || op == x64.DIVPS) { ret 0; }
+    if (op == x64.CMPPS || op == x64.MOVUPS)                                      { ret 0; }
+    if (op == x64.CVTDQ2PS || op == x64.CVTPS2PD)                                 { ret 0; }
+    if (op == x64.CVTTPS2DQ || op == x64.CVTDQ2PD)                                { ret 0xF3; }
+    ret 0x66;
+}
+
+# the modrm reg digit of an immediate packed shift
+fun packed_shift_digit(op: u16) u8 {
+    if (op == x64.PSRAW || op == x64.PSRAD)                    { ret 4; }
+    if (op == x64.PSRLDQ)                                      { ret 3; }
+    if (op == x64.PSLLDQ)                                      { ret 7; }
+    if (op == x64.PSRLW || op == x64.PSRLD || op == x64.PSRLQ) { ret 2; }
+    ret 6;
+}
+
+# the opcode byte of a packed shift whose count is an xmm register's low
+# quadword; absent for an opcode with no such form
+pub fun packed_shift_count_opbyte(op: u16) opt[u8] {
+    if (op == x64.PSRLW) { ret opt[u8].some{0xD1}; }
+    if (op == x64.PSRLD) { ret opt[u8].some{0xD2}; }
+    if (op == x64.PSRLQ) { ret opt[u8].some{0xD3}; }
+    if (op == x64.PSRAW) { ret opt[u8].some{0xE1}; }
+    if (op == x64.PSRAD) { ret opt[u8].some{0xE2}; }
+    if (op == x64.PSLLW) { ret opt[u8].some{0xF1}; }
+    if (op == x64.PSLLD) { ret opt[u8].some{0xF2}; }
+    if (op == x64.PSLLQ) { ret opt[u8].some{0xF3}; }
+    ret opt[u8].none{};
+}
+
+# the packed SSE2 opcode byte, absent for an x64.Opcode outside the packed set
+fun packed_opbyte(op: u16) opt[u8] {
+    if (op == x64.ADDPS || op == x64.ADDPD)                     { ret opt[u8].some{0x58}; }
+    if (op == x64.SUBPS || op == x64.SUBPD)                     { ret opt[u8].some{0x5C}; }
+    if (op == x64.MULPS || op == x64.MULPD)                     { ret opt[u8].some{0x59}; }
+    if (op == x64.DIVPS || op == x64.DIVPD)                     { ret opt[u8].some{0x5E}; }
+    if (op == x64.PADDB)                                        { ret opt[u8].some{0xFC}; }
+    if (op == x64.PADDW)                                        { ret opt[u8].some{0xFD}; }
+    if (op == x64.PADDD)                                        { ret opt[u8].some{0xFE}; }
+    if (op == x64.PADDQ)                                        { ret opt[u8].some{0xD4}; }
+    if (op == x64.PSUBB)                                        { ret opt[u8].some{0xF8}; }
+    if (op == x64.PSUBW)                                        { ret opt[u8].some{0xF9}; }
+    if (op == x64.PSUBD)                                        { ret opt[u8].some{0xFA}; }
+    if (op == x64.PSUBQ)                                        { ret opt[u8].some{0xFB}; }
+    if (op == x64.PSUBUSB)                                      { ret opt[u8].some{0xD8}; }
+    if (op == x64.PSUBUSW)                                      { ret opt[u8].some{0xD9}; }
+    if (op == x64.PMULLW)                                       { ret opt[u8].some{0xD5}; }
+    if (op == x64.PMULHW)                                       { ret opt[u8].some{0xE5}; }
+    if (op == x64.PMULHUW)                                      { ret opt[u8].some{0xE4}; }
+    if (op == x64.PMULUDQ)                                      { ret opt[u8].some{0xF4}; }
+    if (op == x64.PSADBW)                                       { ret opt[u8].some{0xF6}; }
+    if (op == x64.PAND)                                         { ret opt[u8].some{0xDB}; }
+    if (op == x64.POR)                                          { ret opt[u8].some{0xEB}; }
+    if (op == x64.PXOR)                                         { ret opt[u8].some{0xEF}; }
+    if (op == x64.CMPPS || op == x64.CMPPD)                     { ret opt[u8].some{0xC2}; }
+    if (op == x64.PCMPEQB)                                      { ret opt[u8].some{0x74}; }
+    if (op == x64.PCMPEQW)                                      { ret opt[u8].some{0x75}; }
+    if (op == x64.PCMPEQD)                                      { ret opt[u8].some{0x76}; }
+    if (op == x64.PCMPGTB)                                      { ret opt[u8].some{0x64}; }
+    if (op == x64.PCMPGTW)                                      { ret opt[u8].some{0x65}; }
+    if (op == x64.PCMPGTD)                                      { ret opt[u8].some{0x66}; }
+    if (op == x64.PSHUFD)                                       { ret opt[u8].some{0x70}; }
+    if (op == x64.PSLLD || op == x64.PSRLD)                     { ret opt[u8].some{0x72}; }
+    if (op == x64.PSLLW || op == x64.PSRAW || op == x64.PSRLW)  { ret opt[u8].some{0x71}; }
+    if (op == x64.PSRAD)                                        { ret opt[u8].some{0x72}; }
+    if (op == x64.PUNPCKLBW)                                    { ret opt[u8].some{0x60}; }
+    if (op == x64.PUNPCKLWD)                                    { ret opt[u8].some{0x61}; }
+    if (op == x64.PUNPCKLDQ)                                    { ret opt[u8].some{0x62}; }
+    if (op == x64.PUNPCKHBW)                                    { ret opt[u8].some{0x68}; }
+    if (op == x64.PUNPCKHWD)                                    { ret opt[u8].some{0x69}; }
+    if (op == x64.PUNPCKHDQ)                                    { ret opt[u8].some{0x6A}; }
+    if (op == x64.PSRLDQ || op == x64.PSRLQ || op == x64.PSLLQ) { ret opt[u8].some{0x73}; }
+    if (op == x64.PSLLDQ)                                       { ret opt[u8].some{0x73}; }
+    if (op == x64.PUNPCKLQDQ)                                   { ret opt[u8].some{0x6C}; }
+    if (op == x64.PACKSSWB)                                     { ret opt[u8].some{0x63}; }
+    if (op == x64.PACKSSDW)                                     { ret opt[u8].some{0x6B}; }
+    if (op == x64.CVTDQ2PS)                                     { ret opt[u8].some{0x5B}; }
+    if (op == x64.CVTTPS2DQ)                                    { ret opt[u8].some{0x5B}; }
+    if (op == x64.CVTDQ2PD)                                     { ret opt[u8].some{0xE6}; }
+    if (op == x64.CVTTPD2DQ)                                    { ret opt[u8].some{0xE6}; }
+    if (op == x64.CVTPS2PD)                                     { ret opt[u8].some{0x5A}; }
+    if (op == x64.CVTPD2PS)                                     { ret opt[u8].some{0x5A}; }
+    ret opt[u8].none{};
+}
+
+# the register widths a packed instruction runs at: 16 is the legacy sse
+# encoding over an xmm register, 32 the vex.256 encoding over a ymm one
+pub val VB_XMM: u8 = 16;
+
+pub val VB_YMM: u8 = 32;
+
+pub fun vec_reg(xmm: i32, vb: u8) isa_inst.Operand {
+    ret isa_inst.make_reg(xmm, vb);
+}
+
+# the vex prefix's vector length for a register width
+pub fun vex_l(vb: u8) u8 {
+    if (vb == VB_YMM) { ret 1; }
+    ret 0;
+}
+
+# one packed instruction for the listing: its operands in intel order, the
+# width it runs at, and the encoding flags (FLAG_VEX for the vex form of a
+# legacy opcode)
+pub fun note_vec(buf: *isa_encode.ByteBuf, start: usize, opcode: u16, flags: u16, dst: isa_inst.Operand, src1: isa_inst.Operand,
+    src2: isa_inst.Operand, src3: isa_inst.Operand, vb: u8) {
+    if (!isa_encode.sink_active(buf)) { ret; }
+    var mi: isa_inst.Inst = isa_inst.inst_blank();
+    mi.opcode = opcode;
+    mi.flags  = flags;
+    mi.dst    = dst;
+    mi.src1   = src1;
+    mi.src2   = src2;
+    mi.src3   = src3;
+    mi.size   = vb;
+    x64_printer.note_inst(buf, ?mi, start);
+}
+
+pub fun note_packed(buf: *isa_encode.ByteBuf, start: usize, opcode: u16, dst: isa_inst.Operand, src: isa_inst.Operand) {
+    note_vec(buf, start, opcode, 0, dst, src, isa_inst.make_none(), isa_inst.make_none(), VB_XMM);
+}
+
+pub fun note_packed_imm(buf: *isa_encode.ByteBuf, start: usize, opcode: u16, dst: isa_inst.Operand, src: isa_inst.Operand, imm: u8) {
+    note_vec(buf, start, opcode, 0, dst, src, isa_inst.make_imm(imm::i64, 1), isa_inst.make_none(), VB_XMM);
+}
+
+# a legacy packed op at `vb`: the sse form at 16 bytes outside the vex
+# variant, and otherwise the vex form, whose vvvv repeats the destination as
+# the first source where the opcode reads one, so the operands keep their
+# two-address meaning
+fun note_packed_at(buf: *isa_encode.ByteBuf, start: usize, opcode: u16, vb: u8, dst: isa_inst.Operand, src: isa_inst.Operand, imm: isa_inst.Operand) {
+    if (vb == VB_XMM && !vex_encoding(buf)) {
+        note_vec(buf, start, opcode, 0, dst, src, imm, isa_inst.make_none(), vb);
+        ret;
+    }
+    if (vex_reads_vvvv(opcode)) {
+        note_vec(buf, start, opcode, x64_inst.FLAG_VEX, dst, vec_reg(dst.reg, dst.size), src, imm, vb);
+        ret;
+    }
+    note_vec(buf, start, opcode, x64_inst.FLAG_VEX, dst, src, imm, isa_inst.make_none(), vb);
+}
+
+# an x64.Opcode no packed row names is a member the selector produced outside
+# the packed SSE2 catalog: internal. no diagnostic owner reaches this depth, so
+# the text names the catalog and the surrounding function names the site
+pub val PACKED_OPCODE_UNKNOWN: str = "encode: x64.Opcode outside the packed SSE2 catalog";
+
+pub val PACKED_WIDTH_UNKNOWN: str = "encode: a packed vector op at a register width x86-64 has no encoding for";
+
+pub fun packed_op(op: u16, vb: u8, dst_xmm: i32, src: isa_inst.Operand, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    ret packed_as(op, vb, vec_reg(dst_xmm, vb), src, buf);
+}
+
+# a packed op whose destination is not the width it runs at: a conversion
+# that halves or doubles its lanes' width writes, or reads, the xmm half
+pub fun packed_as(op: u16, vb: u8, dst: isa_inst.Operand, src: isa_inst.Operand, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    val start: usize          = buf.len;
+    val body:  err[fail.Fail] = packed_body(op, vb, dst.reg, src, buf);
+    if (sel body.err) { ret body; }
+    note_packed_at(buf, start, op, vb, dst, src, isa_inst.make_none());
+    ret err[fail.Fail].ok{};
+}
+
+pub fun packed_imm(op: u16, vb: u8, dst_xmm: i32, src: isa_inst.Operand, imm: u8, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    val start: usize          = buf.len;
+    val body:  err[fail.Fail] = packed_body(op, vb, dst_xmm, src, buf);
+    if (sel body.err) { ret body; }
+    isa_encode.emit_byte(buf, imm);
+    note_packed_at(buf, start, op, vb, vec_reg(dst_xmm, vb), src, isa_inst.make_imm(imm::i64, 1));
+    ret err[fail.Fail].ok{};
+}
+
+pub fun packed_rri(op: u16, vb: u8, dst_xmm: i32, src_xmm: i32, imm: u8, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    ret packed_imm(op, vb, dst_xmm, vec_reg(src_xmm, vb), imm, buf);
+}
+
+# whether the vex form of a legacy packed opcode reads a first source in
+# vvvv: every two-source op does, and a shuffle, conversion, extension, test
+# or move reads its one source from modrm.rm and leaves vvvv empty. an
+# immediate shift names its register in vvvv and a digit in modrm.reg, which
+# emit_packed_shift_imm spells itself
+fun vex_reads_vvvv(op: u16) bool {
+    if (op == x64.PSHUFD || op == x64.PTEST)                                          { ret false; }
+    if (op == x64.CVTDQ2PS || op == x64.CVTTPS2DQ || op == x64.CVTDQ2PD)              { ret false; }
+    if (op == x64.CVTTPD2DQ || op == x64.CVTPS2PD || op == x64.CVTPD2PS)              { ret false; }
+    if (op == x64.PMOVSXBW || op == x64.PMOVSXWD || op == x64.PMOVSXDQ)               { ret false; }
+    if (op == x64.PMOVZXBW || op == x64.PMOVZXWD || op == x64.PMOVZXDQ)               { ret false; }
+    if (op == x64.PMOVSXBD || op == x64.PMOVSXBQ || op == x64.PMOVSXWQ)               { ret false; }
+    if (op == x64.PMOVZXBD || op == x64.PMOVZXBQ || op == x64.PMOVZXWQ)               { ret false; }
+    if (op == x64.MOVAPS || op == x64.MOVUPS || op == x64.MOVDQA || op == x64.MOVDQU) { ret false; }
+    ret true;
+}
+
+# the prefix, map, opcode byte and modrm of a packed op whose source is a
+# register or memory: the legacy sse form at 16 bytes, and the vex form at 32
+# or in the vex variant, with the destination in vvvv as the first source
+# where the opcode reads one, so every two-address sequence keeps its meaning
+# at either width
+fun packed_body(op: u16, vb: u8, dst_xmm: i32, src: isa_inst.Operand, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    var m: OpMap = OpMap{prefix: 0, map: 0, opbyte: 0, w: 0};
+    if (!packed_map(op, ?m)) { ret err[fail.Fail].err{fail.message(PACKED_OPCODE_UNKNOWN)}; }
+    if (src.kind != isa_inst.OPK_REG && src.kind != isa_inst.OPK_MEM) {
+        ret err[fail.Fail].err{fail.message("encode: packed vector op source is not a register or aligned frame slot")};
+    }
+    if (vb == VB_XMM && !vex_encoding(buf)) {
+        sse_map_rm(m.prefix, m.map, m.opbyte, dst_xmm, src, buf);
+        ret err[fail.Fail].ok{};
+    }
+    if (vb != VB_XMM && vb != VB_YMM) { ret err[fail.Fail].err{fail.message(PACKED_WIDTH_UNKNOWN)}; }
+    var vvvv: i32 = isa_inst.REG_NONE;
+    if (vex_reads_vvvv(op)) { vvvv = dst_xmm; }
+    vex_rm(m, vex_l(vb), dst_xmm, vvvv, src, buf);
+    ret err[fail.Fail].ok{};
+}
+
+# where a legacy packed opcode sits in the opcode space: its prefix, escape
+# map and opcode byte; false for an opcode outside the packed catalog
+fun packed_map(op: u16, m: *OpMap) bool {
+    m.prefix = packed_prefix(op);
+    m.map    = 0;
+    m.w      = 0;
+    val opbyte: opt[u8] = packed_opbyte(op);
+    if (sel opbyte.some) {
+        m.opbyte = opbyte.some;
+        ret true;
+    }
+    ret mapped_opbytes(op, ?m.prefix, ?m.map, ?m.opbyte);
+}
+
+# the vex form names its first source apart from its destination, so a two-
+# source op whose destination and first source are registers is one
+# instruction there, with no copy of the first source into the destination
+pub fun vex_three(buf: *isa_encode.ByteBuf, vb: u8, dst: isa_inst.Operand, lhs: isa_inst.Operand) bool {
+    ret (vb == VB_YMM || vex_encoding(buf)) && dst.kind == isa_inst.OPK_REG && lhs.kind == isa_inst.OPK_REG;
+}
+
+# dst = lhs op rhs as one vex instruction, rhs a register or memory, with an
+# immediate after it when `imm` is one
+pub fun packed_three(op: u16, vb: u8, dst: i32, lhs: i32, rhs: isa_inst.Operand, imm: isa_inst.Operand, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    var m: OpMap = OpMap{prefix: 0, map: 0, opbyte: 0, w: 0};
+    if (!packed_map(op, ?m) || !vex_reads_vvvv(op)) { ret err[fail.Fail].err{fail.message(PACKED_OPCODE_UNKNOWN)}; }
+    if (rhs.kind != isa_inst.OPK_REG && rhs.kind != isa_inst.OPK_MEM) {
+        ret err[fail.Fail].err{fail.message("encode: packed vector op source is not a register or aligned frame slot")};
+    }
+    if (vb != VB_XMM && vb != VB_YMM) { ret err[fail.Fail].err{fail.message(PACKED_WIDTH_UNKNOWN)}; }
+    val start: usize = buf.len;
+    vex_rm(m, vex_l(vb), dst, lhs, rhs, buf);
+    if (imm.kind == isa_inst.OPK_IMM) { isa_encode.emit_byte(buf, imm.imm::u8); }
+    note_vec(buf, start, op, x64_inst.FLAG_VEX, vec_reg(dst, vb), vec_reg(lhs, vb), rhs, imm, vb);
+    ret err[fail.Fail].ok{};
+}
+
+# the mandatory prefix, the 0F 38 or 0F 3A map byte and the opcode byte of an
+# ssse3, sse41, sha, aes or pclmul row; false for an opcode outside those maps
+pub fun mapped_opbytes(op: u16, prefix: *u8, map: *u8, opbyte: *u8) bool {
+    @prefix = 0x66;
+    @map    = 0x38;
+    if (op == x64.SHA256RNDS2 || op == x64.SHA256MSG1 || op == x64.SHA256MSG2) { @prefix = 0; }
+    if (op == x64.SHA256RNDS2)                                                 { @opbyte = 0xCB; }
+    or (op == x64.SHA256MSG1)                                                  { @opbyte = 0xCC; }
+    or (op == x64.SHA256MSG2)                                                  { @opbyte = 0xCD; }
+    or (op == x64.PSHUFB)                                                      { @opbyte = 0x00; }
+    or (op == x64.PMULLD)                                                      { @opbyte = 0x40; }
+    or (op == x64.PCMPGTQ)                                                     { @opbyte = 0x37; }
+    or (op == x64.PCMPEQQ)                                                     { @opbyte = 0x29; }
+    or (op == x64.PMOVSXBW)                                                    { @opbyte = 0x20; }
+    or (op == x64.PMOVSXWD)                                                    { @opbyte = 0x23; }
+    or (op == x64.PMOVSXDQ)                                                    { @opbyte = 0x25; }
+    or (op == x64.PMOVZXBW)                                                    { @opbyte = 0x30; }
+    or (op == x64.PMOVZXWD)                                                    { @opbyte = 0x33; }
+    or (op == x64.PMOVZXDQ)                                                    { @opbyte = 0x35; }
+    or (op == x64.PMOVSXBD)                                                    { @opbyte = 0x21; }
+    or (op == x64.PMOVSXBQ)                                                    { @opbyte = 0x22; }
+    or (op == x64.PMOVSXWQ)                                                    { @opbyte = 0x24; }
+    or (op == x64.PMOVZXBD)                                                    { @opbyte = 0x31; }
+    or (op == x64.PMOVZXBQ)                                                    { @opbyte = 0x32; }
+    or (op == x64.PMOVZXWQ)                                                    { @opbyte = 0x34; }
+    or (op == x64.PTEST)                                                       { @opbyte = 0x17; }
+    or (op == x64.AESIMC)                                                      { @opbyte = 0xDB; }
+    or (op == x64.AESENC)                                                      { @opbyte = 0xDC; }
+    or (op == x64.AESENCLAST)                                                  { @opbyte = 0xDD; }
+    or (op == x64.AESDEC)                                                      { @opbyte = 0xDE; }
+    or (op == x64.AESDECLAST)                                                  { @opbyte = 0xDF; }
+    or {
+        @map = 0x3A;
+        if (op == x64.PALIGNR)         { @opbyte = 0x0F; }
+        or (op == x64.PBLENDW)         { @opbyte = 0x0E; }
+        or (op == x64.PINSRD)          { @opbyte = 0x22; }
+        or (op == x64.PEXTRD)          { @opbyte = 0x16; }
+        or (op == x64.PCLMULQDQ)       { @opbyte = 0x44; }
+        or (op == x64.AESKEYGENASSIST) { @opbyte = 0xDF; }
+        or                             { ret false; }
+    }
+    ret true;
+}
+
+# one legacy-prefixed 0F-map instruction with a register reg field and a register or memory rm
+pub fun sse_rm(prefix: u8, opbyte: u8, reg: i32, rm: isa_inst.Operand, buf: *isa_encode.ByteBuf) {
+    sse_map_rm(prefix, 0, opbyte, reg, rm, buf);
+}
+
+# as emit_sse_rm, with a 0F 38 or 0F 3A escape when `map` is nonzero
+pub fun sse_map_rm(prefix: u8, map: u8, opbyte: u8, reg: i32, rm: isa_inst.Operand, buf: *isa_encode.ByteBuf) {
+    val seg: u8 = segment_prefix(?rm, buf);
+    if (seg != 0)                    { isa_encode.emit_byte(buf, seg); }
+    if (prefix != 0)                 { isa_encode.emit_byte(buf, prefix); }
+    if (rm.kind == isa_inst.OPK_REG) { rex_if_needed(buf, 0, reg, rm.reg); }
+    or                               { rex_mem(buf, 0, reg, ?rm); }
+    isa_encode.emit_byte(buf, 0x0F);
+    if (map != 0) { isa_encode.emit_byte(buf, map); }
+    isa_encode.emit_byte(buf, opbyte);
+    if (rm.kind == isa_inst.OPK_REG) { isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(reg), reg_bits(rm.reg))); }
+    or                               { encode_mem_operand(buf, reg, ?rm); }
+}
+
+# where an instruction sits in the opcode space beyond its register operands:
+# the mandatory prefix (none, 66, f3 or f2), the escape map (0 for 0F, 0x38
+# for 0F 38, 0x3A for 0F 3A), the opcode byte and the W bit. the legacy
+# encoding spells the prefix and map as bytes, and the vex and evex prefixes
+# fold both into fields, so one row serves every encoding of an opcode
+pub rec OpMap {
+    prefix: u8;
+    map:    u8;
+    opbyte: u8;
+    w:      u8;
+}
+
+# the vex-only rows: instructions with no legacy encoding at all
+fun vex_row(op: u16) opt[OpMap] {
+    if (op == x64.VPSLLVD) { ret opt[OpMap].some{OpMap{prefix: 0x66, map: 0x38, opbyte: 0x47, w: 0}}; }
+    if (op == x64.VPSRLVD) { ret opt[OpMap].some{OpMap{prefix: 0x66, map: 0x38, opbyte: 0x45, w: 0}}; }
+    if (op == x64.VPSRAVD) { ret opt[OpMap].some{OpMap{prefix: 0x66, map: 0x38, opbyte: 0x46, w: 0}}; }
+    if (op == x64.VPSLLVQ) { ret opt[OpMap].some{OpMap{prefix: 0x66, map: 0x38, opbyte: 0x47, w: 1}}; }
+    if (op == x64.VPSRLVQ) { ret opt[OpMap].some{OpMap{prefix: 0x66, map: 0x38, opbyte: 0x45, w: 1}}; }
+    ret opt[OpMap].none{};
+}
+
+# the pp field that stands for a mandatory prefix in a vex or evex prefix
+fun vex_pp(prefix: u8) u8 {
+    if (prefix == 0x66) { ret 1; }
+    if (prefix == 0xF3) { ret 2; }
+    if (prefix == 0xF2) { ret 3; }
+    ret 0;
+}
+
+# the map field that stands for an escape in a vex or evex prefix
+fun vex_mmmmm(map: u8) u8 {
+    if (map == 0x38) { ret 2; }
+    if (map == 0x3A) { ret 3; }
+    ret 1;
+}
+
+# a register in the upper eight of its bank, which the prefix extends
+fun reg_is_high(id: i32) bool {
+    ret id != isa_inst.REG_NONE && isa_inst.regid_index(id) >= 8;
+}
+
+# the extension bits a register or memory rm operand needs: x for a memory
+# index, b for a memory base or the rm register. an absolute or rip-relative
+# address names no register
+fun rm_extends_x(rm: *isa_inst.Operand) bool {
+    ret rm.kind == isa_inst.OPK_MEM && reg_is_high(rm.index);
+}
+
+fun rm_extends_b(rm: *isa_inst.Operand) bool {
+    if (rm.kind == isa_inst.OPK_REG) { ret reg_is_high(rm.reg); }
+    ret rm.kind == isa_inst.OPK_MEM && rm.base != x64_inst.MEM_BASE_ABS && reg_is_high(rm.base);
+}
+
+# one vex-encoded instruction: `reg` in modrm.reg, `vvvv` the extra source
+# register (REG_NONE for none), and `rm` a register or memory. `l` is the vector
+# length, 0 for 128 bits and 1 for 256. the two-byte c5 prefix carries only
+# R, vvvv, L and pp, so W, the 0F 38 and 0F 3A maps and an extended index or
+# base need the three-byte c4 prefix. the extension bits and vvvv are stored
+# inverted
+pub fun vex_rm(m: OpMap, l: u8, reg: i32, vvvv: i32, rm: isa_inst.Operand, buf: *isa_encode.ByteBuf) {
+    val seg: u8 = segment_prefix(?rm, buf);
+    if (seg != 0) { isa_encode.emit_byte(buf, seg); }
+    var v: u8 = 0;
+    if (vvvv != isa_inst.REG_NONE) { v = isa_inst.regid_index(vvvv)::u8 & 0xF; }
+    val tail: u8   = ((~v & 0xF) << 3) | ((l & 1) << 2) | vex_pp(m.prefix);
+    var r:    u8   = 0x80;
+    val x:    bool = rm_extends_x(?rm);
+    val b:    bool = rm_extends_b(?rm);
+    if (reg_is_high(reg)) { r = 0; }
+    if (m.w == 0 && m.map == 0 && !x && !b) {
+        isa_encode.emit_byte(buf, 0xC5);
+        isa_encode.emit_byte(buf, r | tail);
+    }
+    or {
+        var head: u8 = r | 0x60 | vex_mmmmm(m.map);
+        if (x) { head = head & 0xBF; }
+        if (b) { head = head & 0xDF; }
+        isa_encode.emit_byte(buf, 0xC4);
+        isa_encode.emit_byte(buf, head);
+        isa_encode.emit_byte(buf, ((m.w & 1) << 7) | tail);
+    }
+    isa_encode.emit_byte(buf, m.opbyte);
+    if (rm.kind == isa_inst.OPK_REG) { isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(reg), reg_bits(rm.reg))); }
+    or                               { encode_mem_operand(buf, reg, ?rm); }
+}
+
+# how an evex row scales a compressed 8-bit displacement: the tuple type of
+# its memory operand
+def Tuple: u8;
+
+# a full vector: N is the vector length in bytes, or the element with the
+# broadcast bit set, 4 bytes under W0 and 8 under W1
+val TUPLE_FULL: Tuple = 0;
+
+# an opcode's evex encoding: its place in the opcode space, which the legacy
+# and vex encodings read as well, and the tuple type of its memory operand
+rec EvexRow {
+    m:     OpMap;
+    tuple: Tuple;
+}
+
+# the evex-only rows: instructions with no legacy or vex encoding
+fun evex_row(op: u16) opt[EvexRow] {
+    if (op == x64.VPMULLQ) { ret opt[EvexRow].some{EvexRow{m: OpMap{prefix: 0x66, map: 0x38, opbyte: 0x40, w: 1}, tuple: TUPLE_FULL}}; }
+    ret opt[EvexRow].none{};
+}
+
+# what an evex prefix carries beyond the row and the registers. `ll` is the
+# vector length (0 for 128 bits, 1 for 256, 2 for 512), or the rounding
+# control of a register form with `b` set. `mask` is the opmask register
+# k0-k7 that writes the destination lane by lane, k0 for none, and `zero`
+# clears the lanes it leaves out instead of keeping them. `b` broadcasts one
+# element of a memory source to every lane, or embeds the rounding control
+# (with suppressed exceptions) in a register form
+rec EvexCtl {
+    ll:   u8;
+    mask: u8;
+    zero: bool;
+    b:    bool;
+}
+
+fun evex_unmasked(ll: u8) EvexCtl {
+    ret EvexCtl{ll: ll, mask: 0, zero: false, b: false};
+}
+
+# the disp8*N scale of a row's memory operand under the prefix `e` sets
+# an unmodelled tuple type is refused into `buf` and scales by one
+fun evex_disp_scale(r: EvexRow, e: EvexCtl, buf: *isa_encode.ByteBuf) i32 {
+    if (r.tuple != TUPLE_FULL) {
+        isa_encode.buf_refuse(buf, "encode: evex row names an unmodelled tuple type");
+        ret 1;
+    }
+    if (e.b) {
+        if (r.m.w == 1) { ret 8; }
+        ret 4;
+    }
+    ret 16 << e.ll::i32;
+}
+
+# bit 3 and bit 4 of a register index, which the prefix carries apart from
+# the three modrm bits; false for no register
+fun reg_bit3(id: i32) bool {
+    ret id != isa_inst.REG_NONE && (isa_inst.regid_index(id) & 8) != 0;
+}
+
+fun reg_bit4(id: i32) bool {
+    ret id != isa_inst.REG_NONE && (isa_inst.regid_index(id) & 16) != 0;
+}
+
+# one evex-encoded instruction: 62, then P0 (inverted R X B R', the map),
+# P1 (W, inverted vvvv, a fixed one, pp) and P2 (z, L'L, b, inverted V', aaa).
+# `reg`, `vvvv` and a register `rm` index all 32 vector registers: R' and V'
+# carry bit 4 of reg and vvvv, and X carries it for a register rm, where it
+# names no index. a memory rm's 8-bit displacement is compressed by the row's
+# disp8*N scale
+fun evex_rm(r: EvexRow, e: EvexCtl, reg: i32, vvvv: i32, rm: isa_inst.Operand, buf: *isa_encode.ByteBuf) {
+    if (e.zero && e.mask == 0) {
+        isa_encode.buf_refuse(buf, "encode: evex zeroing names no opmask register");
+        ret;
+    }
+    val seg: u8 = segment_prefix(?rm, buf);
+    if (seg != 0) { isa_encode.emit_byte(buf, seg); }
+    var p0: u8 = 0xF0 | vex_mmmmm(r.m.map);
+    if (reg_bit3(reg)) { p0 = p0 & 0x7F; }
+    if (reg_bit4(reg)) { p0 = p0 & 0xEF; }
+    if (rm.kind == isa_inst.OPK_REG) {
+        if (reg_bit4(rm.reg)) { p0 = p0 & 0xBF; }
+        if (reg_bit3(rm.reg)) { p0 = p0 & 0xDF; }
+    }
+    or {
+        if (rm_extends_x(?rm)) { p0 = p0 & 0xBF; }
+        if (rm_extends_b(?rm)) { p0 = p0 & 0xDF; }
+    }
+    var v: u8 = 0;
+    if (vvvv != isa_inst.REG_NONE) { v = isa_inst.regid_index(vvvv)::u8 & 0x1F; }
+    val p1: u8 = ((r.m.w & 1) << 7) | ((~v & 0xF) << 3) | 0x04 | vex_pp(r.m.prefix);
+    var p2: u8 = ((e.ll & 3) << 5) | (e.mask & 7);
+    if (e.zero)          { p2 = p2 | 0x80; }
+    if (e.b)             { p2 = p2 | 0x10; }
+    if ((v & 0x10) == 0) { p2 = p2 | 0x08; }
+    isa_encode.emit_byte(buf, 0x62);
+    isa_encode.emit_byte(buf, p0);
+    isa_encode.emit_byte(buf, p1);
+    isa_encode.emit_byte(buf, p2);
+    isa_encode.emit_byte(buf, r.m.opbyte);
+    if (rm.kind == isa_inst.OPK_REG) { isa_encode.emit_byte(buf, encode_modrm(3, reg_bits(reg), reg_bits(rm.reg))); }
+    or                               { encode_mem_operand_scaled(buf, reg, ?rm, evex_disp_scale(r, e, buf)); }
+}
+
+# a three-operand instruction at `vb`, dst from src1 (vvvv) and src2 (rm),
+# vex-encoded where the opcode has a vex row and evex-encoded, unmasked,
+# where it has an evex one
+pub fun vec3(op: u16, vb: u8, dst_xmm: i32, src1_xmm: i32, src2: isa_inst.Operand, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    if (src2.kind != isa_inst.OPK_REG && src2.kind != isa_inst.OPK_MEM) {
+        ret err[fail.Fail].err{fail.message("encode: vex or evex vector op source is not a register or aligned frame slot")};
+    }
+    if (vb != VB_XMM && vb != VB_YMM) { ret err[fail.Fail].err{fail.message(PACKED_WIDTH_UNKNOWN)}; }
+    val start: usize        = buf.len;
+    val vex:   opt[OpMap]   = vex_row(op);
+    val evex:  opt[EvexRow] = evex_row(op);
+    if (sel vex.some)  { vex_rm(vex.some, vex_l(vb), dst_xmm, src1_xmm, src2, buf); }
+    or (sel evex.some) { evex_rm(evex.some, evex_unmasked(vex_l(vb)), dst_xmm, src1_xmm, src2, buf); }
+    or                 { ret err[fail.Fail].err{fail.message(PACKED_OPCODE_UNKNOWN)}; }
+    note_vec(buf, start, op, 0, vec_reg(dst_xmm, vb), vec_reg(src1_xmm, vb), src2, isa_inst.make_none(), vb);
+    ret err[fail.Fail].ok{};
+}
+
+# a three-operand instruction over codegen operands: the first source rides
+# vvvv and so must be a register, the second is a register or frame slot, and
+# the result forms in the destination register, or in scratch0 for a frame slot
+pub fun vec3_ops(op: u16, vb: u8, dst: isa_inst.Operand, lhs: isa_inst.Operand, rhs: isa_inst.Operand, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    var work: i32 = float_scratch0();
+    if (dst.kind == isa_inst.OPK_REG) { work = dst.reg; }
+    var src: i32 = work;
+    if (lhs.kind == isa_inst.OPK_REG) { src = lhs.reg; }
+    or {
+        # the second source stays where it is, so one in the work register
+        # would be overwritten by the load: form the result in scratch0
+        if (rhs.kind == isa_inst.OPK_REG && rhs.reg == work) { work = float_scratch0(); }
+        src = work;
+        val ll: err[fail.Fail] = vec_load(lhs, work, vb, buf);
+        if (sel ll.err) { ret ll; }
+    }
+    val r: err[fail.Fail] = vec3(op, vb, work, src, rhs, buf);
+    if (sel r.err)                                       { ret r; }
+    if (dst.kind == isa_inst.OPK_REG && dst.reg == work) { ret err[fail.Fail].ok{}; }
+    ret vec_store(dst, work, vb, buf);
+}
+
+# a 32-byte value between a ymm register and memory: vmovdqu, VEX.256.F3.0F
+# 6F to load and 7F to store. it has no alignment requirement, so the image
+# a ymm value is carried from or into needs none beyond its own
+fun ymm_move(dst: isa_inst.Operand, src: isa_inst.Operand, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    val start: usize = buf.len;
+    if (dst.kind == isa_inst.OPK_REG && src.kind == isa_inst.OPK_MEM) {
+        vex_rm(OpMap{prefix: 0xF3, map: 0, opbyte: 0x6F, w: 0}, 1, dst.reg, isa_inst.REG_NONE, src, buf);
+    }
+    or (dst.kind == isa_inst.OPK_MEM && src.kind == isa_inst.OPK_REG) {
+        vex_rm(OpMap{prefix: 0xF3, map: 0, opbyte: 0x7F, w: 0}, 1, src.reg, isa_inst.REG_NONE, dst, buf);
+    }
+    or (dst.kind == isa_inst.OPK_REG && src.kind == isa_inst.OPK_REG) {
+        movaps_rr(dst.reg, src.reg, VB_YMM, buf);
+        ret err[fail.Fail].ok{};
+    }
+    or { ret err[fail.Fail].err{fail.message("encode: a 32-byte vector move names no ymm register")}; }
+    note_vec(buf, start, x64.VMOVDQU, 0, vec_sized(dst, VB_YMM), vec_sized(src, VB_YMM), isa_inst.make_none(), isa_inst.make_none(), VB_YMM);
+    ret err[fail.Fail].ok{};
+}
+
+# a 32-byte vector value moved between a register and a register or memory,
+# memory to memory staged through scratch0 ahead of it (staging_load), and
+# the zero vector a const materializes, a cleared register
+fun ymm_value_move(dst: isa_inst.Operand, src: isa_inst.Operand, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    if (src.kind != isa_inst.OPK_IMM) { ret ymm_move(dst, src, buf); }
+    if (src.imm != 0)                 { ret err[fail.Fail].err{fail.message("encode: a vector move takes no immediate but zero")}; }
+    var work: i32 = float_scratch0();
+    if (dst.kind == isa_inst.OPK_REG) { work = dst.reg; }
+    val z: err[fail.Fail] = vec_zero(work, VB_YMM, buf);
+    if (sel z.err)                    { ret z; }
+    if (dst.kind == isa_inst.OPK_REG) { ret err[fail.Fail].ok{}; }
+    ret ymm_move(dst, vec_reg(work, VB_YMM), buf);
+}
+
+# a register or frame-slot operand read or written at `vb` bytes
+pub fun vec_sized(op: isa_inst.Operand, vb: u8) isa_inst.Operand {
+    var o: isa_inst.Operand = op;
+    o.size = vb;
+    ret o;
+}
+
+# the mandatory prefix and the load and store opcode bytes of a packed move
+fun vec_move_bytes(op: u16, prefix: *u8, load: *u8, store: *u8) bool {
+    @prefix = 0;
+    if (op == x64.MOVAPS) {
+        @load  = 0x28;
+        @store = 0x29;
+        ret true;
+    }
+    if (op == x64.MOVUPS) {
+        @load  = 0x10;
+        @store = 0x11;
+        ret true;
+    }
+    if (op == x64.MOVDQA) { @prefix = 0x66; }
+    or (op == x64.MOVDQU) { @prefix = 0xF3; }
+    or                    { ret false; }
+    @load  = 0x6F;
+    @store = 0x7F;
+    ret true;
+}
+
+# a packed move between a vector register and a vector register or memory, in either direction
+pub fun vec_move(op: u16, dst: isa_inst.Operand, src: isa_inst.Operand, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    var prefix: u8 = 0;
+    var load:   u8 = 0;
+    var store:  u8 = 0;
+    if (!vec_move_bytes(op, ?prefix, ?load, ?store)) { ret err[fail.Fail].err{fail.message(PACKED_OPCODE_UNKNOWN)}; }
+    val start: usize = buf.len;
+    if (dst.kind == isa_inst.OPK_REG && (src.kind == isa_inst.OPK_REG || src.kind == isa_inst.OPK_MEM)) {
+        sse_rm(prefix, load, dst.reg, src, buf);
+    }
+    or (dst.kind == isa_inst.OPK_MEM && src.kind == isa_inst.OPK_REG) {
+        sse_rm(prefix, store, src.reg, dst, buf);
+    }
+    or { ret err[fail.Fail].err{fail.message("encode: packed vector move needs a vector register on one side")}; }
+    note_packed(buf, start, op, dst, src);
+    ret err[fail.Fail].ok{};
+}
+
+# a packed shift by an immediate: the legacy form shifts its register in
+# place, and the vex.256 form names the destination in vvvv and the source in
+# modrm.rm, both the one register here, with the opcode digit in modrm.reg
+pub fun packed_shift_imm(op: u16, vb: u8, xmm: i32, imm: u8, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    val opbyte: opt[u8] = packed_opbyte(op);
+    if (sel opbyte.none) { ret err[fail.Fail].err{fail.message(PACKED_OPCODE_UNKNOWN)}; }
+    val start: usize = buf.len;
+    if (vb == VB_XMM && !vex_encoding(buf)) {
+        isa_encode.emit_byte(buf, 0x66);
+        if (needs_rex(xmm)) { isa_encode.emit_byte(buf, encode_rex(0, 0, xmm)); }
+        isa_encode.emit_byte(buf, 0x0F);
+        isa_encode.emit_byte(buf, opbyte.some);
+        isa_encode.emit_byte(buf, encode_modrm(3, packed_shift_digit(op), reg_bits(xmm)));
+        isa_encode.emit_byte(buf, imm);
+        note_packed(buf, start, op, vec_reg(xmm, vb), isa_inst.make_imm(imm::i64, 1));
+        ret err[fail.Fail].ok{};
+    }
+    if (vb != VB_XMM && vb != VB_YMM) { ret err[fail.Fail].err{fail.message(PACKED_WIDTH_UNKNOWN)}; }
+    val digit: i32 = isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, packed_shift_digit(op)::i32);
+    vex_rm(OpMap{prefix: 0x66, map: 0, opbyte: opbyte.some, w: 0}, vex_l(vb), digit, xmm, vec_reg(xmm, vb), buf);
+    isa_encode.emit_byte(buf, imm);
+    note_vec(buf, start, op, x64_inst.FLAG_VEX, vec_reg(xmm, vb), vec_reg(xmm, vb), isa_inst.make_imm(imm::i64, 1), isa_inst.make_none(), vb);
+    ret err[fail.Fail].ok{};
+}
+
+# a register copy: movaps, or vmovaps over the ymm register, VEX.256.0F 28
+# with the source in modrm.rm or 29 with it in modrm.reg: an extended source
+# into a low destination takes 29, whose extension bit R the two-byte prefix
+# carries, as the assembler encodes it
+pub fun movaps_rr(dst_xmm: i32, src_xmm: i32, vb: u8, buf: *isa_encode.ByteBuf) {
+    val start: usize = buf.len;
+    if (vb == VB_YMM || vex_encoding(buf)) {
+        if (reg_is_high(src_xmm) && !reg_is_high(dst_xmm)) {
+            vex_rm(OpMap{prefix: 0, map: 0, opbyte: 0x29, w: 0}, vex_l(vb), src_xmm, isa_inst.REG_NONE, vec_reg(dst_xmm, vb), buf);
+        }
+        or { vex_rm(OpMap{prefix: 0, map: 0, opbyte: 0x28, w: 0}, vex_l(vb), dst_xmm, isa_inst.REG_NONE, vec_reg(src_xmm, vb), buf); }
+        note_vec(buf, start, x64.MOVAPS, x64_inst.FLAG_VEX, vec_reg(dst_xmm, vb), vec_reg(src_xmm, vb), isa_inst.make_none(), isa_inst.make_none(), vb);
+        ret;
+    }
+    sse_rm(0, 0x28, dst_xmm, vec_reg(src_xmm, VB_XMM), buf);
+    note_packed(buf, start, x64.MOVAPS, vec_reg(dst_xmm, VB_XMM), vec_reg(src_xmm, VB_XMM));
+}
+
+fun movups_load(xmm: i32, mem: isa_inst.Operand, buf: *isa_encode.ByteBuf) {
+    val start: usize = buf.len;
+    if (vex_encoding(buf)) {
+        vex_rm(OpMap{prefix: 0, map: 0, opbyte: 0x10, w: 0}, 0, xmm, isa_inst.REG_NONE, mem, buf);
+        note_vec(buf, start, x64.MOVUPS, x64_inst.FLAG_VEX, vec_reg(xmm, VB_XMM), mem, isa_inst.make_none(), isa_inst.make_none(), VB_XMM);
+        ret;
+    }
+    sse_rm(0, 0x10, xmm, mem, buf);
+    note_packed(buf, start, x64.MOVUPS, vec_reg(xmm, VB_XMM), mem);
+}
+
+fun movups_store(mem: isa_inst.Operand, xmm: i32, buf: *isa_encode.ByteBuf) {
+    val start: usize = buf.len;
+    if (vex_encoding(buf)) {
+        vex_rm(OpMap{prefix: 0, map: 0, opbyte: 0x11, w: 0}, 0, xmm, isa_inst.REG_NONE, mem, buf);
+        note_vec(buf, start, x64.MOVUPS, x64_inst.FLAG_VEX, mem, vec_reg(xmm, VB_XMM), isa_inst.make_none(), isa_inst.make_none(), VB_XMM);
+        ret;
+    }
+    sse_rm(0, 0x11, xmm, mem, buf);
+    note_packed(buf, start, x64.MOVUPS, mem, vec_reg(xmm, VB_XMM));
+}
+
+# a vector operand into a register at `vb`: a register copy, or a load from
+# its frame slot, movaps at 16 bytes and vmovdqu at 32
+pub fun vec_load(op: isa_inst.Operand, xmm: i32, vb: u8, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    if (op.kind == isa_inst.OPK_REG) {
+        movaps_rr(xmm, op.reg, vb, buf);
+        ret err[fail.Fail].ok{};
+    }
+    if (op.kind == isa_inst.OPK_MEM && vb == VB_YMM) { ret ymm_move(vec_reg(xmm, vb), op, buf); }
+    if (op.kind == isa_inst.OPK_MEM && vb == VB_XMM) {
+        var ld: isa_inst.Inst = isa_inst.inst_blank();
+        ld.opcode = x64.MOVAPS;
+        ld.dst    = isa_inst.make_reg(xmm, 16);
+        ld.src1   = op;
+        ld.size   = 16;
+        encode_inst(?ld, buf);
+        ret err[fail.Fail].ok{};
+    }
+    ret err[fail.Fail].err{fail.message("encode: vector operand is not a register or aligned frame slot")};
+}
+
+pub fun vec_store(dst: isa_inst.Operand, xmm: i32, vb: u8, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    if (dst.kind == isa_inst.OPK_REG) {
+        movaps_rr(dst.reg, xmm, vb, buf);
+        ret err[fail.Fail].ok{};
+    }
+    if (dst.kind == isa_inst.OPK_MEM && vb == VB_YMM) { ret ymm_move(dst, vec_reg(xmm, vb), buf); }
+    if (dst.kind == isa_inst.OPK_MEM && vb == VB_XMM) {
+        var st: isa_inst.Inst = isa_inst.inst_blank();
+        st.opcode = x64.MOVAPS;
+        st.dst    = dst;
+        st.src1   = isa_inst.make_reg(xmm, 16);
+        st.size   = 16;
+        encode_inst(?st, buf);
+        ret err[fail.Fail].ok{};
+    }
+    ret err[fail.Fail].err{fail.message("encode: vector destination is not a register or aligned frame slot")};
+}
+
+pub fun vec_all_ones(xmm: i32, vb: u8, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    ret packed_op(x64.PCMPEQD, vb, xmm, vec_reg(xmm, vb), buf);
+}
+
+# a cleared register: pxor, and at 32 bytes vxorps, which avx has for a float
+# ymm value where the integer vpxor is avx2
+pub fun vec_zero(xmm: i32, vb: u8, buf: *isa_encode.ByteBuf) err[fail.Fail] {
+    if (vb == VB_XMM) { ret packed_op(x64.PXOR, vb, xmm, vec_reg(xmm, vb), buf); }
+    if (vb != VB_YMM) { ret err[fail.Fail].err{fail.message(PACKED_WIDTH_UNKNOWN)}; }
+    val start: usize = buf.len;
+    vex_rm(OpMap{prefix: 0, map: 0, opbyte: 0x57, w: 0}, 1, xmm, xmm, vec_reg(xmm, vb), buf);
+    note_vec(buf, start, x64.XORPS, x64_inst.FLAG_VEX, vec_reg(xmm, vb), vec_reg(xmm, vb), vec_reg(xmm, vb), isa_inst.make_none(), vb);
+    ret err[fail.Fail].ok{};
+}
+
+# the 128-bit half `hi` of a ymm register into an xmm one: vextractf128,
+# VEX.256.66.0F3A.W0 19 /r ib with the source in modrm.reg
+pub fun vextract128(dst_xmm: i32, src_ymm: i32, hi: u8, buf: *isa_encode.ByteBuf) {
+    val start: usize = buf.len;
+    vex_rm(OpMap{prefix: 0x66, map: 0x3A, opbyte: 0x19, w: 0}, 1, src_ymm, isa_inst.REG_NONE, vec_reg(dst_xmm, VB_XMM), buf);
+    isa_encode.emit_byte(buf, hi);
+    note_vec(buf, start, x64.VEXTRACTF128, 0, vec_reg(dst_xmm, VB_XMM), vec_reg(src_ymm, VB_YMM), isa_inst.make_imm(hi::i64, 1), isa_inst.make_none(), VB_YMM);
+}
+
+# a ymm register from `lo_ymm` with its half `hi` replaced by an xmm register
+# or 16 bytes of memory: vinsertf128, VEX.256.66.0F3A.W0 18 /r ib
+pub fun vinsert128(dst_ymm: i32, lo_ymm: i32, half: isa_inst.Operand, hi: u8, buf: *isa_encode.ByteBuf) {
+    val start: usize = buf.len;
+    vex_rm(OpMap{prefix: 0x66, map: 0x3A, opbyte: 0x18, w: 0}, 1, dst_ymm, lo_ymm, vec_sized(half, VB_XMM), buf);
+    isa_encode.emit_byte(buf, hi);
+    note_vec(buf, start, x64.VINSERTF128, 0, vec_reg(dst_ymm, VB_YMM), vec_reg(lo_ymm, VB_YMM), vec_sized(half, VB_XMM),
+        isa_inst.make_imm(hi::i64, 1), VB_YMM);
+}
+
+# the quadwords of a ymm register or memory, each result quadword the one its
+# two-bit field of `order` names: vpermq, VEX.256.66.0F3A.W1 00 /r ib (avx2)
+pub fun vpermq(dst_ymm: i32, src: isa_inst.Operand, order: u8, buf: *isa_encode.ByteBuf) {
+    val start: usize = buf.len;
+    vex_rm(OpMap{prefix: 0x66, map: 0x3A, opbyte: 0x00, w: 1}, 1, dst_ymm, isa_inst.REG_NONE, vec_sized(src, VB_YMM), buf);
+    isa_encode.emit_byte(buf, order);
+    note_vec(buf, start, x64.VPERMQ, 0, vec_reg(dst_ymm, VB_YMM), vec_sized(src, VB_YMM), isa_inst.make_imm(order::i64, 1), isa_inst.make_none(), VB_YMM);
+}
+
+#[testing]
+fun t_nibble(c: u8) u8 {
+    if (c >= '0'::u8 && c <= '9'::u8) { ret c - '0'::u8; }
+    ret c - 'a'::u8 + 10;
+}
+
+# decode lowercase hex into want, returning the byte count
+#[testing]
+pub fun t_unhex(hex: str, want: *u8) usize {
+    val len: usize = str_len(hex);
+    var i:   usize = 0;
+    for (i + 1 < len) {
+        want[i / 2] = (t_nibble(hex[i]::u8) << 4) | t_nibble(hex[i + 1]::u8);
+        i           = i + 2;
+    }
+    ret len / 2;
+}
+
+# the override rides the operand, so a form the grammar does not reach still carries it,
+# and an address operand refuses it before any byte
+test segment_override__rides_the_operand {
+    var bad: i32           = 0;
+    var ss:  isa_inst.Inst = isa_inst.inst_blank();
+    ss.opcode   = x64.MOVSS;
+    ss.size     = 4;
+    ss.dst      = isa_inst.make_reg(isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, 1), 4);
+    ss.src1     = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 4);
+    ss.src1.seg = x64_inst.SEG_GS;
+    var want: [5]u8;
+    want[0] = 0x65;
+    want[1] = 0xF3;
+    want[2] = 0x0F;
+    want[3] = 0x10;
+    want[4] = 0x08;
+    if (!t_inst_bytes(?ss, ?want[0], 5)) { bad = 1; }
+
+    var lea: isa_inst.Inst = isa_inst.inst_blank();
+    lea.opcode   = x64.LEA;
+    lea.size     = 8;
+    lea.flags    = x64_inst.FLAG_REX_W::u16;
+    lea.dst      = isa_inst.make_reg(x64.RAX, 8);
+    lea.src1     = isa_inst.make_mem(x64.RBX, 8, isa_inst.REG_NONE, 0, 8);
+    lea.src1.seg = x64_inst.SEG_FS;
+    if (!t_inst_refused(?lea)) { bad = 2; }
+    lea.src1.seg = x64_inst.SEG_NONE;
+    if (t_inst_refused(?lea)) { bad = 3; }
+
+    # a row that takes no memory operand refuses after the prefix, which is withdrawn
+    var set: isa_inst.Inst = isa_inst.inst_blank();
+    set.opcode  = x64.SETE;
+    set.size    = 1;
+    set.dst     = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 1);
+    set.dst.seg = x64_inst.SEG_FS;
+    if (!t_inst_refused(?set)) { bad = 4; }
+    ret bad;
+}
+
+#[testing]
+pub fun t_buf_is(buf: *isa_encode.ByteBuf, want: *u8, n: usize) bool {
+    if (buf.len != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (buf.data[i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the two-byte c5 prefix carries R, vvvv, L and pp, so a 0F-map row whose index
+# and base are low takes it even with extended registers in reg and vvvv; an
+# extended base, W or another map needs c4. goldens from GNU as 2.47
+test emit_vex_rm__c5_where_it_suffices_and_c4_otherwise {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var got: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    fin { isa_encode.buf_dnit(?got); }
+    val paddd: OpMap = OpMap{prefix: 0x66, map: 0, opbyte: 0xFE, w: 0};
+    val movdq: OpMap = OpMap{prefix: 0xF3, map: 0, opbyte: 0x6F, w: 0};
+    var want:  [32]u8;
+    vex_rm(paddd, 0, t_xmm(1), t_xmm(2), vec_reg(t_xmm(3), 16), ?got);
+    var n: usize = t_unhex("c5e9fecb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 1; }
+    got.len = 0;
+    vex_rm(paddd, 0, t_xmm(9), t_xmm(10), vec_reg(t_xmm(3), 16), ?got);
+    n = t_unhex("c529fecb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 2; }
+    got.len = 0;
+    vex_rm(paddd, 0, t_xmm(1), t_xmm(2), vec_reg(t_xmm(9), 16), ?got);
+    n = t_unhex("c4c169fec9", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 3; }
+    got.len = 0;
+    vex_rm(movdq, 1, t_xmm(0), isa_inst.REG_NONE, isa_inst.make_mem(x64.RSI, 0, isa_inst.REG_NONE, 0, 32), ?got);
+    n = t_unhex("c5fe6f06", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 4; }
+    got.len = 0;
+    vex_rm(movdq, 1, t_xmm(1), isa_inst.REG_NONE, isa_inst.make_mem(x64.R8, 0, isa_inst.REG_NONE, 0, 32), ?got);
+    n = t_unhex("c4c17e6f08", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 5; }
+    ret 0;
+}
+
+# the evex fields inline asm does not spell yet, against GNU as 2.47: xmm16
+# and up through R', V' and X, the opmask with merging and zeroing, the
+# broadcast bit and its element-sized disp8*N, and the 256- and 512-bit
+# vector lengths
+test emit_evex_rm__every_field_matches_gnu_as {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var got: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    fin { isa_encode.buf_dnit(?got); }
+    val row: opt[EvexRow] = evex_row(x64.VPMULLQ);
+    if (sel row.none) { ret 1; }
+    val r:     EvexRow = row.some;
+    val plain: EvexCtl = evex_unmasked(0);
+    var want:  [32]u8;
+    evex_rm(r, plain, t_xmm(17), t_xmm(18), vec_reg(t_xmm(19), 16), ?got);
+    var n: usize = t_unhex("62a2ed0040cb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 2; }
+    got.len = 0;
+    evex_rm(r, plain, t_xmm(24), t_xmm(25), vec_reg(t_xmm(31), 16), ?got);
+    n = t_unhex("6202b50040c7", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 3; }
+    got.len = 0;
+    evex_rm(r, plain, t_xmm(1), t_xmm(20), vec_reg(t_xmm(2), 16), ?got);
+    n = t_unhex("62f2dd0040ca", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 4; }
+    got.len = 0;
+    evex_rm(r, plain, t_xmm(20), t_xmm(1), isa_inst.make_mem(x64.R9, 16, isa_inst.REG_NONE, 0, 16), ?got);
+    n = t_unhex("62c2f508406101", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 5; }
+    got.len = 0;
+    evex_rm(r, EvexCtl{ll: 0, mask: 1, zero: false, b: false}, t_xmm(1), t_xmm(2), vec_reg(t_xmm(3), 16), ?got);
+    n = t_unhex("62f2ed0940cb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 6; }
+    got.len = 0;
+    evex_rm(r, EvexCtl{ll: 0, mask: 7, zero: true, b: false}, t_xmm(1), t_xmm(2), vec_reg(t_xmm(3), 16), ?got);
+    n = t_unhex("62f2ed8f40cb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 7; }
+    got.len = 0;
+    evex_rm(r, EvexCtl{ll: 0, mask: 0, zero: false, b: true}, t_xmm(1), t_xmm(2), isa_inst.make_mem(x64.RAX, 8, isa_inst.REG_NONE, 0, 8), ?got);
+    n = t_unhex("62f2ed18404801", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 8; }
+    got.len = 0;
+    evex_rm(r, evex_unmasked(1), t_xmm(1), t_xmm(2), isa_inst.make_mem(x64.RAX, 32, isa_inst.REG_NONE, 0, 32), ?got);
+    n = t_unhex("62f2ed28404801", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 9; }
+    got.len = 0;
+    evex_rm(r, evex_unmasked(2), t_xmm(1), t_xmm(2), vec_reg(t_xmm(3), 16), ?got);
+    n = t_unhex("62f2ed4840cb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 10; }
+    ret 0;
+}
+
+#[testing]
+pub fun t_inst_bytes(mi: *isa_inst.Inst, want: *u8, n: usize) bool {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    val got: i32                = encode_inst(mi, ?buf);
+    var ok:  bool               = got::usize == n && buf.len == n;
+    var i:   usize              = 0;
+    for (ok && i < n) {
+        if (buf.data[i] != want[i]) { ok = false; }
+        i = i + 1;
+    }
+    isa_encode.buf_dnit(?buf);
+    ret ok;
+}
+
+#[testing]
+fun t_inst_refused(mi: *isa_inst.Inst) bool {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    val got: i32                = encode_inst(mi, ?buf);
+    val ok:  bool               = got == 0 && buf.len == 0;
+    isa_encode.buf_dnit(?buf);
+    ret ok;
+}
+
+#[testing]
+fun t_indirect_jmp(dst: isa_inst.Operand) isa_inst.Inst {
+    var mi: isa_inst.Inst = isa_inst.inst_blank();
+    mi.opcode = x64.JMP;
+    mi.size   = 8;
+    mi.flags  = x64_inst.FLAG_INDIRECT::u16;
+    mi.dst    = dst;
+    ret mi;
+}
+
+test encode_jmp__indirect_forms_byte_exact {
+    var bad: i32 = 0;
+
+    var rax:      isa_inst.Inst = t_indirect_jmp(isa_inst.make_reg(x64.RAX, 8));
+    var rax_want: [2]u8;
+    rax_want[0] = 0xFF;
+    rax_want[1] = 0xE0;
+    if (!t_inst_bytes(?rax, ?rax_want[0], 2)) { bad = 1; }
+
+    var r11:      isa_inst.Inst = t_indirect_jmp(isa_inst.make_reg(x64.R11, 8));
+    var r11_want: [3]u8;
+    r11_want[0] = 0x41;
+    r11_want[1] = 0xFF;
+    r11_want[2] = 0xE3;
+    if (!t_inst_bytes(?r11, ?r11_want[0], 3)) { bad = 1; }
+
+    var m0:      isa_inst.Inst = t_indirect_jmp(isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 8));
+    var m0_want: [2]u8;
+    m0_want[0] = 0xFF;
+    m0_want[1] = 0x20;
+    if (!t_inst_bytes(?m0, ?m0_want[0], 2)) { bad = 1; }
+
+    var m8:      isa_inst.Inst = t_indirect_jmp(isa_inst.make_mem(x64.RAX, 8, isa_inst.REG_NONE, 0, 8));
+    var m8_want: [3]u8;
+    m8_want[0] = 0xFF;
+    m8_want[1] = 0x60;
+    m8_want[2] = 0x08;
+    if (!t_inst_bytes(?m8, ?m8_want[0], 3)) { bad = 1; }
+
+    var midx:    isa_inst.Inst = t_indirect_jmp(isa_inst.make_mem(x64.RAX, 16, x64.RBX, 8, 8));
+    var mi_want: [4]u8;
+    mi_want[0] = 0xFF;
+    mi_want[1] = 0x64;
+    mi_want[2] = 0xD8;
+    mi_want[3] = 0x10;
+    if (!t_inst_bytes(?midx, ?mi_want[0], 4)) { bad = 1; }
+
+    var m13:      isa_inst.Inst = t_indirect_jmp(isa_inst.make_mem(x64.R13, 0, isa_inst.REG_NONE, 0, 8));
+    var m13_want: [4]u8;
+    m13_want[0] = 0x41;
+    m13_want[1] = 0xFF;
+    m13_want[2] = 0x65;
+    m13_want[3] = 0x00;
+    if (!t_inst_bytes(?m13, ?m13_want[0], 4)) { bad = 1; }
+
+    var mabs:     isa_inst.Inst = t_indirect_jmp(isa_inst.make_mem(x64_inst.MEM_BASE_ABS, 0x100018, isa_inst.REG_NONE, 0, 8));
+    var abs_want: [7]u8;
+    abs_want[0] = 0xFF;
+    abs_want[1] = 0x24;
+    abs_want[2] = 0x25;
+    abs_want[3] = 0x18;
+    abs_want[4] = 0x00;
+    abs_want[5] = 0x10;
+    abs_want[6] = 0x00;
+    if (!t_inst_bytes(?mabs, ?abs_want[0], 7)) { bad = 1; }
+
+    ret bad;
+}
+
+test encode_jmp__refuses_unmodelled_indirect_target {
+    var bad: i32 = 0;
+
+    var lbl: isa_inst.Inst = t_indirect_jmp(isa_inst.make_block_label(7));
+    if (!t_inst_refused(?lbl)) { bad = 1; }
+
+    var mimm: isa_inst.Inst = t_indirect_jmp(isa_inst.make_imm(0x100018, 8));
+    if (!t_inst_refused(?mimm)) { bad = 1; }
+
+    var mnone: isa_inst.Inst = t_indirect_jmp(isa_inst.make_none());
+    if (!t_inst_refused(?mnone)) { bad = 1; }
+
+    ret bad;
+}
+
+# a 16-bit multiply takes an imm16, not an imm32, and refuses one past 16 bits; a byte multiply has no immediate form
+test encode_imul__immediate_widths {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+
+    var mi: isa_inst.Inst = isa_inst.inst_blank();
+    mi.opcode = x64.IMUL;
+    mi.dst    = isa_inst.make_reg(x64.RAX, 2);
+    mi.src1   = isa_inst.make_imm(0x1234, 2);
+    mi.size   = 2;
+    mi.flags  = x64_inst.FLAG_16BIT;
+    val n: i32 = encode_imul(?mi, ?buf);
+
+    var bad: i32 = 0;
+    if (n != 5)              { bad = 1; }
+    or (buf.data[0] != 0x66) { bad = 1; }
+    or (buf.data[1] != 0x69) { bad = 1; }
+    or (buf.data[2] != 0xC0) { bad = 1; }
+    or (buf.data[3] != 0x34) { bad = 1; }
+    or (buf.data[4] != 0x12) { bad = 1; }
+
+    var mi8: isa_inst.Inst = isa_inst.inst_blank();
+    mi8.opcode = x64.IMUL;
+    mi8.dst    = isa_inst.make_reg(x64.RAX, 1);
+    mi8.src1   = isa_inst.make_imm(5, 1);
+    mi8.size   = 1;
+    if (encode_imul(?mi8, ?buf) != 0) { bad = 1; }
+
+    var big: isa_inst.Inst = isa_inst.inst_blank();
+    big.opcode = x64.IMUL;
+    big.dst    = isa_inst.make_reg(x64.RAX, 2);
+    big.src1   = isa_inst.make_imm(70000, 2);
+    big.size   = 2;
+    if (encode_inst(?big, ?buf) != 0) { bad = 1; }
+
+    isa_encode.buf_dnit(?buf);
+    ret bad;
+}
+
+test encode_alu_rr__byte_reg_forces_rex {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+
+    encode_alu_rr(?buf, alu_opcode_rr(x64.AND, 1), x64.RSI, x64.RDI, 1, 0);
+
+    var bad: i32 = 0;
+    if (buf.len != 3)        { bad = 1; }
+    or (buf.data[0] != 0x40) { bad = 1; }
+    or (buf.data[1] != 0x20) { bad = 1; }
+    or (buf.data[2] != 0xFE) { bad = 1; }
+
+    isa_encode.buf_dnit(?buf);
+    ret bad;
+}
+
+test encode_movzx__wide_src_uses_mov {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var mi:  isa_inst.Inst      = isa_inst.inst_blank();
+    mi.opcode    = x64.MOVZX;
+    mi.dst       = isa_inst.make_reg(x64.RAX, 8);
+    mi.src1      = isa_inst.make_reg(x64.RBX, 4);
+    mi.src1.size = 4;
+    mi.size      = 8;
+    mi.flags     = x64_inst.FLAG_REX_W;
+    val n:   i32 = encode_inst(?mi, ?buf);
+    var bad: i32 = 0;
+    # the plain 32-bit move, in the store form an assembler picks for it
+    if (n != 2)                                                { bad = 1; }
+    or (buf.data[0] != 0x89)                                   { bad = 1; }
+    or (buf.data[1] != 0xD8)                                   { bad = 1; }
+    if (mi.opcode != x64.MOV || mi.size != 4 || mi.flags != 0) { bad = 1; }
+    isa_encode.buf_dnit(?buf);
+    ret bad;
+}
+
+test encode_mem_operand__rbp_base_disp0 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var mi:  isa_inst.Inst      = isa_inst.inst_blank();
+    mi.opcode = x64.MOV;
+    mi.dst    = isa_inst.make_reg(x64.RAX, 8);
+    mi.src1   = isa_inst.make_mem(x64.RBP, 0, isa_inst.REG_NONE, 0, 8);
+    mi.size   = 8;
+    mi.flags  = x64_inst.FLAG_REX_W;
+    val n:   i32 = encode_inst(?mi, ?buf);
+    var bad: i32 = 0;
+    if (n != 4)              { bad = 1; }
+    or (buf.data[0] != 0x48) { bad = 1; }
+    or (buf.data[1] != 0x8B) { bad = 1; }
+    or (buf.data[2] != 0x45) { bad = 1; }
+    or (buf.data[3] != 0x00) { bad = 1; }
+    isa_encode.buf_dnit(?buf);
+    ret bad;
+}
+
+test encode_push__imm_boundaries {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var bad: i32                = 0;
+
+    var m1: isa_inst.Inst = isa_inst.inst_blank();
+    m1.opcode = x64.PUSH;
+    m1.dst    = isa_inst.make_imm(127, 1);
+    m1.size   = 1;
+    val n1: i32 = encode_inst(?m1, ?buf);
+    if (n1 != 2)             { bad = 1; }
+    if (buf.data[0] != 0x6A) { bad = 1; }
+    if (buf.data[1] != 0x7F) { bad = 1; }
+
+    buf.len = 0;
+    var m2: isa_inst.Inst = isa_inst.inst_blank();
+    m2.opcode = x64.PUSH;
+    m2.dst    = isa_inst.make_imm(0x1000, 4);
+    m2.size   = 4;
+    val n2: i32 = encode_inst(?m2, ?buf);
+    if (n2 != 5)             { bad = 1; }
+    if (buf.data[0] != 0x68) { bad = 1; }
+
+    buf.len = 0;
+    var m3: isa_inst.Inst = isa_inst.inst_blank();
+    m3.opcode = x64.PUSH;
+    m3.dst    = isa_inst.make_imm(0x80000000, 8);
+    m3.size   = 8;
+    val n3: i32 = encode_inst(?m3, ?buf);
+    if (n3 != 0) { bad = 1; }
+
+    isa_encode.buf_dnit(?buf);
+    ret bad;
+}
+
+test x86_reloc_offset__legalized_disp32 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var st: isa_encode.EncodeState;
+    st.buf = isa_encode.buf_init(?alloc);
+
+    var big: isa_inst.Inst = isa_inst.inst_blank();
+    big.opcode   = x64.MOV;
+    big.size     = 8;
+    big.dst.kind = isa_inst.OPK_MEM;
+    big.dst.size = 8;
+    big.src1     = isa_inst.make_imm(0x100000000, 8);
+    val big_sz: i32 = encode_mov(?big, ?st.buf);
+
+    var small: isa_inst.Inst = isa_inst.inst_blank();
+    small.opcode   = x64.MOV;
+    small.size     = 8;
+    small.dst.kind = isa_inst.OPK_MEM;
+    small.dst.size = 8;
+    small.src1     = isa_inst.make_imm(5, 8);
+    val small_sz: i32 = encode_mov(?small, ?st.buf);
+
+    var bad: i32 = 0;
+    if (big_sz != 17)                             { bad = 1; }
+    or (trailing_imm_width(?big) != 0)            { bad = 1; }
+    or (reloc_offset(nil, ?big, big_sz) != 13)    { bad = 1; }
+    or (small_sz != 11)                           { bad = 1; }
+    or (trailing_imm_width(?small) != 4)          { bad = 1; }
+    or (reloc_offset(nil, ?small, small_sz) != 3) { bad = 1; }
+
+    isa_encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+test vec__mem_mem_16_stages_xmm14 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf:  isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var inst: isa_inst.Inst      = isa_inst.inst_blank();
+    inst.opcode = x64.MOV;
+    inst.size   = 16;
+    inst.dst    = isa_inst.make_mem(x64.RBP, -384, isa_inst.REG_NONE, 0, 16);
+    inst.src1   = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 16);
+    encode_inst(?inst, ?buf);
+    var bad: i32 = 0;
+    if (buf.len < 4)         { bad = 1; }
+    or (buf.data[0] != 0x44) { bad = 1; }
+    or (buf.data[1] != 0x0F) { bad = 1; }
+    or (buf.data[2] != 0x10) { bad = 1; }
+    or (buf.data[3] != 0x30) { bad = 1; }
+    isa_encode.buf_dnit(?buf);
+    ret bad;
+}
+
+test encode_shift__forms_and_count_width {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var bad: i32 = 0;
+
+    var buf1: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m1:   isa_inst.Inst      = isa_inst.inst_blank();
+    m1.opcode = x64.SHL;
+    m1.dst    = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 8);
+    m1.src1   = isa_inst.make_imm(3, 8);
+    m1.size   = 8;
+    val n1: i32 = encode_inst(?m1, ?buf1);
+    if (n1 != 4)              { bad = 1; }
+    or (buf1.data[0] != 0x48) { bad = 1; }
+    or (buf1.data[1] != 0xC1) { bad = 1; }
+    or (buf1.data[2] != 0x20) { bad = 1; }
+    or (buf1.data[3] != 0x03) { bad = 1; }
+    isa_encode.buf_dnit(?buf1);
+
+    var buf2: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m2:   isa_inst.Inst      = isa_inst.inst_blank();
+    m2.opcode = x64.SHL;
+    m2.dst    = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 8);
+    m2.src1   = isa_inst.make_imm(1, 8);
+    m2.size   = 8;
+    val n2: i32 = encode_inst(?m2, ?buf2);
+    if (n2 != 3)              { bad = 1; }
+    or (buf2.data[0] != 0x48) { bad = 1; }
+    or (buf2.data[1] != 0xD1) { bad = 1; }
+    or (buf2.data[2] != 0x20) { bad = 1; }
+    isa_encode.buf_dnit(?buf2);
+
+    var buf3: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m3:   isa_inst.Inst      = isa_inst.inst_blank();
+    m3.opcode = x64.SHL;
+    m3.dst    = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 1);
+    m3.src1   = isa_inst.make_reg(x64.RCX, 1);
+    m3.size   = 1;
+    val n3: i32 = encode_inst(?m3, ?buf3);
+    if (n3 != 2)              { bad = 1; }
+    or (buf3.data[0] != 0xD2) { bad = 1; }
+    or (buf3.data[1] != 0x20) { bad = 1; }
+    isa_encode.buf_dnit(?buf3);
+
+    var buf4: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m4:   isa_inst.Inst      = isa_inst.inst_blank();
+    m4.opcode = x64.SHL;
+    m4.dst    = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 8);
+    m4.src1   = isa_inst.make_mem(x64.RBX, 0, isa_inst.REG_NONE, 0, 8);
+    m4.size   = 8;
+    if (encode_inst(?m4, ?buf4) != 0) { bad = 1; }
+    isa_encode.buf_dnit(?buf4);
+
+    # a count immediate that does not fit a byte is refused
+    var buf5: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m5:   isa_inst.Inst      = isa_inst.inst_blank();
+    m5.opcode = x64.SHL;
+    m5.dst    = isa_inst.make_reg(x64.RAX, 8);
+    m5.src1   = isa_inst.make_imm(300, 8);
+    m5.size   = 8;
+    if (encode_inst(?m5, ?buf5) != 0) { bad = 1; }
+    isa_encode.buf_dnit(?buf5);
+
+    ret bad;
+}
+
+# the one-operand multiplies: F6/F7 with /4 for mul and /5 for imul, rex.b
+# following the r/m register, a memory multiplier through the modrm
+#[testing]
+fun t_one_operand(op: u16, src: isa_inst.Operand, size: u8, buf: *isa_encode.ByteBuf) i32 {
+    var mi: isa_inst.Inst = isa_inst.inst_blank();
+    mi.opcode = op;
+    mi.src1   = src;
+    mi.size   = size;
+    ret encode_inst(?mi, buf);
+}
+
+test encode_mul1__byte_exact {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+
+    if (t_one_operand(x64.MUL, isa_inst.make_reg(x64.RCX, 8), 8, ?buf) != 3) { ret 1; }
+    if (buf.data[0] != 0x48 || buf.data[1] != 0xF7 || buf.data[2] != 0xE1)   { ret 1; }
+
+    buf.len = 0;
+    if (t_one_operand(x64.MUL, isa_inst.make_reg(x64.R9, 8), 8, ?buf) != 3) { ret 2; }
+    if (buf.data[0] != 0x49 || buf.data[1] != 0xF7 || buf.data[2] != 0xE1)  { ret 2; }
+
+    buf.len = 0;
+    if (t_one_operand(x64.IMUL, isa_inst.make_reg(x64.RCX, 8), 8, ?buf) != 3) { ret 3; }
+    if (buf.data[0] != 0x48 || buf.data[1] != 0xF7 || buf.data[2] != 0xE9)    { ret 3; }
+
+    buf.len = 0;
+    if (t_one_operand(x64.MUL, isa_inst.make_reg(x64.RCX, 4), 4, ?buf) != 2) { ret 4; }
+    if (buf.data[0] != 0xF7 || buf.data[1] != 0xE1)                          { ret 4; }
+
+    buf.len = 0;
+    if (t_one_operand(x64.MUL, isa_inst.make_mem(x64.RBP, -8, isa_inst.REG_NONE, 0, 8), 8, ?buf) != 4) { ret 5; }
+    if (buf.data[0] != 0x48 || buf.data[1] != 0xF7 || buf.data[2] != 0x65 || buf.data[3] != 0xF8)      { ret 5; }
+
+    buf.len = 0;
+    if (t_one_operand(x64.MUL, isa_inst.make_reg(x64.RCX, 1), 1, ?buf) != 2) { ret 6; }
+    if (buf.data[0] != 0xF6 || buf.data[1] != 0xE1)                          { ret 6; }
+
+    buf.len = 0;
+    if (t_one_operand(x64.MUL, isa_inst.make_imm(3, 8), 8, ?buf) != 0) { ret 7; }
+    isa_encode.buf_dnit(?buf);
+    ret 0;
+}
+
+test pick_stage_scratch__avoids_operand_aliasing {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var bad: i32 = 0;
+
+    var bufA: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var addA: isa_inst.Inst      = isa_inst.inst_blank();
+    addA.opcode = x64.ADD;
+    addA.dst    = isa_inst.make_reg(x64.R11, 8);
+    addA.src1   = isa_inst.make_imm(0x123456789A, 8);
+    addA.size   = 8;
+    encode_inst(?addA, ?bufA);
+
+    var bufB: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var movB: isa_inst.Inst      = isa_inst.inst_blank();
+    movB.opcode = x64.MOV;
+    movB.dst    = isa_inst.make_reg(x64.R10, 8);
+    movB.src1   = isa_inst.make_imm(0x123456789A, 8);
+    movB.size   = 8;
+    encode_inst(?movB, ?bufB);
+    var addB: isa_inst.Inst = isa_inst.inst_blank();
+    addB.opcode = x64.ADD;
+    addB.dst    = isa_inst.make_reg(x64.R11, 8);
+    addB.src1   = isa_inst.make_reg(x64.R10, 8);
+    addB.size   = 8;
+    encode_inst(?addB, ?bufB);
+
+    if (bufA.len != bufB.len) { bad = 1; }
+    or {
+        var k: usize = 0;
+        for (k < bufA.len) {
+            if (bufA.data[k] != bufB.data[k]) { bad = 1; }
+            k = k + 1;
+        }
+    }
+    isa_encode.buf_dnit(?bufA);
+    isa_encode.buf_dnit(?bufB);
+
+    var bufC: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var movC: isa_inst.Inst      = isa_inst.inst_blank();
+    movC.opcode = x64.MOV;
+    movC.dst    = isa_inst.make_mem(x64.R11, 0, isa_inst.REG_NONE, 0, 8);
+    movC.src1   = isa_inst.make_mem(x64.R10, 8, isa_inst.REG_NONE, 0, 8);
+    movC.size   = 8;
+    if (encode_inst(?movC, ?bufC) != 0) { bad = 1; }
+    isa_encode.buf_dnit(?bufC);
+
+    ret bad;
+}
+
+test imm_fits_width__signed_and_unsigned_boundaries {
+    var bad: i32 = 0;
+    if (!imm_fits_width(255, 1))                { bad = 1; }
+    or (imm_fits_width(256, 1))                 { bad = 1; }
+    or (!imm_fits_width(-128, 1))               { bad = 1; }
+    or (imm_fits_width(-129, 1))                { bad = 1; }
+    or (!imm_fits_width(65535, 2))              { bad = 1; }
+    or (imm_fits_width(65536, 2))               { bad = 1; }
+    or (!imm_fits_width(4294967295, 4))         { bad = 1; }
+    or (imm_fits_width(4294967296, 4))          { bad = 1; }
+    or (!imm_fits_width(-2147483648, 4))        { bad = 1; }
+    or (imm_fits_width(-2147483649, 4))         { bad = 1; }
+    or (!imm_fits_width(0x7FFFFFFFFFFFFFFF, 8)) { bad = 1; }
+    ret bad;
+}
+
+# a register or memory destination refuses an immediate past its width and takes one at the edge
+test encode_alu__refuses_immediate_that_does_not_fit {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var bad: i32 = 0;
+
+    var buf1: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m1:   isa_inst.Inst      = isa_inst.inst_blank();
+    m1.opcode = x64.ADD;
+    m1.dst    = isa_inst.make_reg(x64.RAX, 4);
+    m1.src1   = isa_inst.make_imm(8589934592, 4);
+    m1.size   = 4;
+    if (encode_inst(?m1, ?buf1) != 0) { bad = 1; }
+    if (buf1.len != 0)                { bad = 1; }
+    m1.src1 = isa_inst.make_imm(4294967295, 4);
+    if (encode_inst(?m1, ?buf1) == 0) { bad = 2; }
+    isa_encode.buf_dnit(?buf1);
+
+    var buf2: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m2:   isa_inst.Inst      = isa_inst.inst_blank();
+    m2.opcode = x64.ADD;
+    m2.dst    = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 4);
+    m2.src1   = isa_inst.make_imm(4294967296, 4);
+    m2.size   = 4;
+    if (encode_inst(?m2, ?buf2) != 0) { bad = 3; }
+    if (buf2.len != 0)                { bad = 3; }
+    m2.src1 = isa_inst.make_imm(4294967295, 4);
+    if (encode_inst(?m2, ?buf2) == 0) { bad = 4; }
+    isa_encode.buf_dnit(?buf2);
+    ret bad;
+}
+
+# a byte register refuses an immediate past a byte and takes -1; a dword
+# memory destination refuses one past 32 bits and takes all ones
+test encode_mov__refuses_immediate_that_does_not_fit {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var bad: i32 = 0;
+
+    var buf0: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m0:   isa_inst.Inst      = isa_inst.inst_blank();
+    m0.opcode = x64.MOV;
+    m0.dst    = isa_inst.make_reg(x64.RAX, 1);
+    m0.src1   = isa_inst.make_imm(300, 1);
+    m0.size   = 1;
+    if (encode_inst(?m0, ?buf0) != 0) { bad = 1; }
+    if (buf0.len != 0)                { bad = 1; }
+    m0.src1 = isa_inst.make_imm(-1, 1);
+    val n0: i32 = encode_inst(?m0, ?buf0);
+    if (n0 != 2)              { bad = 1; }
+    or (buf0.data[1] != 0xFF) { bad = 1; }
+    isa_encode.buf_dnit(?buf0);
+
+    var buf1: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m1:   isa_inst.Inst      = isa_inst.inst_blank();
+    m1.opcode = x64.MOV;
+    m1.dst    = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 4);
+    m1.src1   = isa_inst.make_imm(4294967296, 4);
+    m1.size   = 4;
+    if (encode_inst(?m1, ?buf1) != 0) { bad = 1; }
+    if (buf1.len != 0)                { bad = 1; }
+    isa_encode.buf_dnit(?buf1);
+
+    var buf2: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m2:   isa_inst.Inst      = isa_inst.inst_blank();
+    m2.opcode = x64.MOV;
+    m2.dst    = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 4);
+    m2.src1   = isa_inst.make_imm(4294967295, 4);
+    m2.size   = 4;
+    val n2: i32 = encode_inst(?m2, ?buf2);
+    if (n2 != 6)              { bad = 1; }
+    or (buf2.data[0] != 0xC7) { bad = 1; }
+    or (buf2.data[2] != 0xFF) { bad = 1; }
+    or (buf2.data[5] != 0xFF) { bad = 1; }
+    isa_encode.buf_dnit(?buf2);
+    ret bad;
+}
+
+test encode_test__refuses_immediate_that_does_not_fit {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var bad: i32 = 0;
+
+    var buf1: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m1:   isa_inst.Inst      = isa_inst.inst_blank();
+    m1.opcode = x64.TEST;
+    m1.dst    = isa_inst.make_reg(x64.RAX, 2);
+    m1.src1   = isa_inst.make_imm(70000, 2);
+    m1.size   = 2;
+    if (encode_inst(?m1, ?buf1) != 0) { bad = 1; }
+    isa_encode.buf_dnit(?buf1);
+
+    var buf2: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m2:   isa_inst.Inst      = isa_inst.inst_blank();
+    m2.opcode = x64.TEST;
+    m2.dst    = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 1);
+    m2.src1   = isa_inst.make_imm(-200, 1);
+    m2.size   = 1;
+    if (encode_inst(?m2, ?buf2) != 0) { bad = 1; }
+    isa_encode.buf_dnit(?buf2);
+
+    var buf3: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m3:   isa_inst.Inst      = isa_inst.inst_blank();
+    m3.opcode = x64.TEST;
+    m3.dst    = isa_inst.make_reg(x64.RAX, 8);
+    m3.src1   = isa_inst.make_imm(4294967295, 8);
+    m3.size   = 8;
+    if (encode_inst(?m3, ?buf3) != 0) { bad = 1; }
+    isa_encode.buf_dnit(?buf3);
+
+    var buf4: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m4:   isa_inst.Inst      = isa_inst.inst_blank();
+    m4.opcode = x64.TEST;
+    m4.dst    = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 8);
+    m4.src1   = isa_inst.make_imm(4294967295, 8);
+    m4.size   = 8;
+    if (encode_inst(?m4, ?buf4) != 0) { bad = 1; }
+    isa_encode.buf_dnit(?buf4);
+    ret bad;
+}
+
+test xchg_xadd_cmpxchg__mem_mem_refused {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var bad: i32 = 0;
+
+    var buf1: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m1:   isa_inst.Inst      = isa_inst.inst_blank();
+    m1.opcode = x64.XCHG;
+    m1.dst    = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 8);
+    m1.src1   = isa_inst.make_mem(x64.RCX, 0, isa_inst.REG_NONE, 0, 8);
+    m1.size   = 8;
+    if (encode_inst(?m1, ?buf1) != 0) { bad = 1; }
+    isa_encode.buf_dnit(?buf1);
+
+    var buf2: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m2:   isa_inst.Inst      = isa_inst.inst_blank();
+    m2.opcode = x64.XADD;
+    m2.dst    = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 8);
+    m2.src1   = isa_inst.make_mem(x64.RCX, 0, isa_inst.REG_NONE, 0, 8);
+    m2.size   = 8;
+    if (encode_inst(?m2, ?buf2) != 0) { bad = 1; }
+    isa_encode.buf_dnit(?buf2);
+
+    var buf3: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m3:   isa_inst.Inst      = isa_inst.inst_blank();
+    m3.opcode = x64.CMPXCHG;
+    m3.dst    = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 8);
+    m3.src1   = isa_inst.make_mem(x64.RCX, 0, isa_inst.REG_NONE, 0, 8);
+    m3.size   = 8;
+    if (encode_inst(?m3, ?buf3) != 0) { bad = 1; }
+    isa_encode.buf_dnit(?buf3);
+
+    var buf4: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var m4:   isa_inst.Inst      = isa_inst.inst_blank();
+    m4.opcode = x64.XCHG;
+    m4.dst    = isa_inst.make_mem(x64.RAX, 0, isa_inst.REG_NONE, 0, 8);
+    m4.src1   = isa_inst.make_reg(x64.RCX, 8);
+    m4.size   = 8;
+    val n4: i32 = encode_inst(?m4, ?buf4);
+    if (n4 != 3)              { bad = 1; }
+    or (buf4.data[1] != 0x87) { bad = 1; }
+    isa_encode.buf_dnit(?buf4);
+
+    ret bad;
+}
+
+#[testing]
+pub fun t_xmm(n: i32) i32 {
+    ret isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, n);
+}
+
+# in the vex variant every sse row is its vex form, the gas bytes of
+# `vaddsd xmm1, xmm1, xmm9; vcvtsi2sd xmm2, xmm2, rax; vcvttss2si r10d, xmm3;
+# vmovss xmm0, xmm0, xmm8; vucomisd xmm4, [rbp-8]; vmovq xmm5, rcx; vmovd
+# eax, xmm6; vxorps xmm7, xmm7, xmm7; vmovaps [rbp-32], xmm9; vpaddd xmm1,
+# xmm1, xmm2`: a merging row names its destination in vvvv, and a register
+# move from an extended source takes the store form
+test sse_rows__vex_forms_in_the_vex_variant {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var got: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    fin { isa_encode.buf_dnit(?got); }
+    got.variant = VARIANT_VEX;
+    val rows: [9]u16 = [9]u16{x64.ADDSD, x64.CVTSI2SD, x64.CVTTSS2SI, x64.MOVSS, x64.UCOMISD, x64.MOVQ, x64.MOVQ, x64.XORPS, x64.MOVAPS};
+    var ops:  [9]isa_inst.Inst;
+    var k:    u32    = 0;
+    for (k < 9) {
+        ops[k]        = isa_inst.inst_blank();
+        ops[k].opcode = rows[k];
+        ops[k].size   = 16;
+        k             = k + 1;
+    }
+    ops[0].dst   = vec_reg(t_xmm(1), 16);
+    ops[0].src1  = vec_reg(t_xmm(9), 16);
+    ops[0].size  = 8;
+    ops[1].dst   = vec_reg(t_xmm(2), 16);
+    ops[1].src1  = isa_inst.make_reg(x64.RAX, 8);
+    ops[1].size  = 8;
+    ops[1].flags = x64_inst.FLAG_REX_W;
+    ops[2].dst   = isa_inst.make_reg(x64.R10, 4);
+    ops[2].src1  = vec_reg(t_xmm(3), 16);
+    ops[2].size  = 4;
+    ops[3].dst   = vec_reg(t_xmm(0), 16);
+    ops[3].src1  = vec_reg(t_xmm(8), 16);
+    ops[3].size  = 4;
+    ops[4].dst   = vec_reg(t_xmm(4), 16);
+    ops[4].src1  = isa_inst.make_mem(x64.RBP, -8, isa_inst.REG_NONE, 0, 8);
+    ops[5].dst   = vec_reg(t_xmm(5), 16);
+    ops[5].src1  = isa_inst.make_reg(x64.RCX, 8);
+    ops[5].size  = 8;
+    ops[6].dst   = isa_inst.make_reg(x64.RAX, 4);
+    ops[6].src1  = vec_reg(t_xmm(6), 16);
+    ops[6].size  = 4;
+    ops[7].dst   = vec_reg(t_xmm(7), 16);
+    ops[7].src1  = vec_reg(t_xmm(7), 16);
+    ops[8].dst   = isa_inst.make_mem(x64.RBP, -32, isa_inst.REG_NONE, 0, 16);
+    ops[8].src1  = vec_reg(t_xmm(9), 16);
+    k            = 0;
+    for (k < 9) {
+        if (encode_inst(?ops[k], ?got) <= 0) { ret 1; }
+        k = k + 1;
+    }
+    val p: err[fail.Fail] = packed_op(x64.PADDD, VB_XMM, t_xmm(1), vec_reg(t_xmm(2), VB_XMM), ?got);
+    if (sel p.err) { ret 2; }
+    var want: [64]u8;
+    val n:    usize = t_unhex("c4c17358c9c4e1eb2ad0c57a2cd3c57a11c0c5f92e65f8c4e1f96ee9c5f97ef0c5c057ffc578294de0c5f1feca", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 3; }
+    ret 0;
+}
+
+test encode_fp_mov__single_instruction_shapes {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var bad: i32                = 0;
+
+    var rr: isa_inst.Inst = isa_inst.inst_blank();
+    rr.opcode = x64.MOV;
+    rr.size   = 8;
+    rr.dst    = isa_inst.make_reg(x64.XMM3, 16);
+    rr.src1   = isa_inst.make_reg(x64.XMM5, 16);
+    buf.len   = 0;
+    encode_mov(?rr, ?buf);
+    if (buf.len != 4)        { bad = 1; }
+    or (buf.data[0] != 0xF2) { bad = 1; }
+    or (buf.data[1] != 0x0F) { bad = 1; }
+    or (buf.data[2] != 0x10) { bad = 1; }
+    or (buf.data[3] != 0xDD) { bad = 1; }
+
+    var ld: isa_inst.Inst = isa_inst.inst_blank();
+    ld.opcode = x64.MOV;
+    ld.size   = 4;
+    ld.dst    = isa_inst.make_reg(x64.XMM3, 16);
+    ld.src1   = isa_inst.make_mem(x64.RBP, -16, isa_inst.REG_NONE, 0, 4);
+    buf.len   = 0;
+    encode_mov(?ld, ?buf);
+    if (buf.len != 5)        { bad = 1; }
+    or (buf.data[0] != 0xF3) { bad = 1; }
+    or (buf.data[1] != 0x0F) { bad = 1; }
+    or (buf.data[2] != 0x10) { bad = 1; }
+    or (buf.data[3] != 0x5D) { bad = 1; }
+    or (buf.data[4] != 0xF0) { bad = 1; }
+
+    var st: isa_inst.Inst = isa_inst.inst_blank();
+    st.opcode = x64.MOV;
+    st.size   = 4;
+    st.dst    = isa_inst.make_mem(x64.RBP, -16, isa_inst.REG_NONE, 0, 4);
+    st.src1   = isa_inst.make_reg(x64.XMM3, 16);
+    buf.len   = 0;
+    encode_mov(?st, ?buf);
+    if (buf.len != 5)        { bad = 1; }
+    or (buf.data[0] != 0xF3) { bad = 1; }
+    or (buf.data[1] != 0x0F) { bad = 1; }
+    or (buf.data[2] != 0x11) { bad = 1; }
+    or (buf.data[3] != 0x5D) { bad = 1; }
+    or (buf.data[4] != 0xF0) { bad = 1; }
+
+    isa_encode.buf_dnit(?buf);
+    ret bad;
+}
+
+# the family predicates are exact over the whole opcode space, including
+# the two setcc rows assigned outside the setcc run
+test describe__family_predicates_read_the_table {
+    var jcc:     u32 = 0;
+    var setcc:   u32 = 0;
+    var sse_mov: u32 = 0;
+    var sse_alu: u32 = 0;
+    var alu:     u32 = 0;
+    var cvt:     u32 = 0;
+    var fp:      u32 = 0;
+    var op:      u32 = 0;
+    for (op < x64_inst.OPCODE_COUNT) {
+        val o: u16 = op::u16;
+        if (is_jcc(o))                { jcc = jcc + 1; }
+        if (is_setcc(o))              { setcc = setcc + 1; }
+        if (is_sse_mov(o))            { sse_mov = sse_mov + 1; }
+        if (is_sse_alu(o))            { sse_alu = sse_alu + 1; }
+        if (is_alu(o))                { alu = alu + 1; }
+        if (is_cvt(o))                { cvt = cvt + 1; }
+        if (x64_inst.is_fp_opcode(o)) { fp = fp + 1; }
+        op = op + 1;
+    }
+    if (jcc != 10 || setcc != 12 || sse_mov != 2 || sse_alu != 8 || alu != 6 || cvt != 6)                            { ret 1; }
+    if (!is_setcc(x64.SETP) || !is_setcc(x64.SETNP))                                                                 { ret 2; }
+    if (is_jcc(x64.JMP) || is_jcc(x64.SETE) || is_setcc(x64.JE) || is_setcc(x64.PUSHFQ))                             { ret 3; }
+    if (is_sse_alu(x64.ADDPS) || is_sse_mov(x64.MOVAPS) || is_alu(x64.TEST) || is_cvt(x64.MOVQ))                     { ret 4; }
+    if (!x64_inst.is_fp_opcode(x64.MOVQ) || !x64_inst.is_fp_opcode(x64.PADDB) || !x64_inst.is_fp_opcode(x64.MOVUPS)) { ret 5; }
+    if (x64_inst.is_fp_opcode(x64.MOV) || x64_inst.is_fp_opcode(x64.MOVABS) || x64_inst.is_fp_opcode(x64.MOVSB))     { ret 6; }
+    # movq, movss/movsd, 4 packed moves, 8 scalar alu, 2 ucomis, 6 cvt, xorps, 30 packed, pshufd, pslld,
+    # 11 packed conversions, 3 immediate shifts, 3 widening multiply halves,
+    # 7 packed extension rows, pinsrd/pextrd, the gated pmulld, and the
+    # lane-halving rows: 3 high unpacks, psrldq and 6 gated extends, the
+    # qword shifts of the 64-bit multiply sequence, and the word and dword
+    # logical right shifts of the vector shifts, and the 6 aes rows and pclmulqdq
+    # and the two lane-join rows, and the 5 avx2 variable shifts and vmovdqu,
+    # and the two f16c conversions and the pinsrw/pextrw word moves, and vpmullq,
+    # and the 6 sse41 extensions over several doublings and psadbw, and the
+    # 256-bit lane crossings vextractf128, vinsertf128 and vpermq, and pcmpgtq and pcmpeqq
+    if (fp != 1 + 2 + 4 + 8 + 2 + 6 + 1 + 30 + 1 + 1 + 11 + 3 + 3 + 7 + 2 + 1 + 3 + 1 + 6 + 2 + 2 + 7 + 2 + 5 + 1 + 2 + 2 + 1 + 6 + 1 + 3 + 2) { ret 7; }
+    if (is_jcc(x64_inst.OPCODE_COUNT::u16) || is_setcc(x64.ASM_BLOCK))                                                                         { ret 8; }
+    ret 0;
+}
+
+# an opcode with no row, and a memory operand on a row that never reaches
+# memory through an operand, are refused with the buffer untouched
+test encode_inst__rowless_and_memoryless_forms_emit_nothing {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: isa_encode.ByteBuf = isa_encode.buf_init(?alloc);
+    var bad: i32                = 0;
+
+    var mi: isa_inst.Inst = isa_inst.inst_blank();
+    mi.opcode = x64_inst.OPCODE_COUNT::u16;
+    if (encode_inst(?mi, ?buf) != 0 || buf.len != 0) { bad = 1; }
+    mi.opcode = x64.ASM_BLOCK;
+    if (encode_inst(?mi, ?buf) != 0 || buf.len != 0) { bad = 2; }
+
+    mi        = isa_inst.inst_blank();
+    mi.opcode = x64.SETE;
+    mi.dst    = isa_inst.make_mem(x64.RBP, -8, isa_inst.REG_NONE, 0, 1);
+    mi.size   = 1;
+    if (encode_inst(?mi, ?buf) != 0 || buf.len != 0) { bad = 3; }
+    mi.dst = isa_inst.make_reg(x64.RAX, 1);
+    if (encode_inst(?mi, ?buf) <= 0 || buf.len == 0) { bad = 4; }
+
+    buf.len   = 0;
+    mi        = isa_inst.inst_blank();
+    mi.opcode = x64.MOVQ;
+    mi.dst    = isa_inst.make_reg(x64.XMM0, 16);
+    mi.src1   = isa_inst.make_mem(x64.RBP, -8, isa_inst.REG_NONE, 0, 8);
+    mi.size   = 8;
+    if (encode_inst(?mi, ?buf) != 0 || buf.len != 0) { bad = 5; }
+
+    isa_encode.buf_dnit(?buf);
+    ret bad;
+}

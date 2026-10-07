@@ -1,5 +1,7 @@
 # mach.lang.target.isa.x64.encode
 
+MIR lowered to x64 instructions, with the frame each function lays out
+
 ## val HOOKS
 
 ```mach
@@ -18,18 +20,4 @@ the scalar float arithmetic and compare read their second source, a
 constant there included, as the r/m operand: a constant is one pool
 reference inside the instruction. a compare's second source is its
 right operand, or its left where the condition swaps them
-
-## fun returns
-
-```mach
-pub fun returns(body: str) bool;
-```
-
-whether an asm body returns, for the middle end, which reads no grammar
-
-## fun grammar
-
-```mach
-pub fun grammar() isa_asm.Grammar;
-```
 
