@@ -883,30 +883,6 @@ fwd comptime_scope.reader_init
 
 forwards [`mach.lang.fe.comptime.scope.reader_init`](comptime/scope.md#fun-reader_init)
 
-## fwd comptime_scope.set_build_context
-
-```mach
-fwd comptime_scope.set_build_context
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_build_context`](comptime/scope.md#fun-set_build_context)
-
-## fwd comptime_scope.set_ct_mul
-
-```mach
-fwd comptime_scope.set_ct_mul
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_ct_mul`](comptime/scope.md#fun-set_ct_mul)
-
-## fwd comptime_scope.set_extensions
-
-```mach
-fwd comptime_scope.set_extensions
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_extensions`](comptime/scope.md#fun-set_extensions)
-
 ## fwd comptime_scope.set_gate_state
 
 ```mach
@@ -915,13 +891,21 @@ fwd comptime_scope.set_gate_state
 
 forwards [`mach.lang.fe.comptime.scope.set_gate_state`](comptime/scope.md#fun-set_gate_state)
 
-## fwd comptime_scope.set_nan_rule
+## fwd comptime_scope.BuildFacts
 
 ```mach
-fwd comptime_scope.set_nan_rule
+fwd comptime_scope.BuildFacts
 ```
 
-forwards [`mach.lang.fe.comptime.scope.set_nan_rule`](comptime/scope.md#fun-set_nan_rule)
+forwards [`mach.lang.fe.comptime.scope.BuildFacts`](comptime/scope.md#rec-buildfacts)
+
+## fwd comptime_scope.build_facts
+
+```mach
+fwd comptime_scope.build_facts
+```
+
+forwards [`mach.lang.fe.comptime.scope.build_facts`](comptime/scope.md#fun-build_facts)
 
 ## fwd comptime_scope.set_source_context
 
@@ -930,38 +914,6 @@ fwd comptime_scope.set_source_context
 ```
 
 forwards [`mach.lang.fe.comptime.scope.set_source_context`](comptime/scope.md#fun-set_source_context)
-
-## fwd comptime_scope.set_target_defs
-
-```mach
-fwd comptime_scope.set_target_defs
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_target_defs`](comptime/scope.md#fun-set_target_defs)
-
-## fwd comptime_scope.set_union_build
-
-```mach
-fwd comptime_scope.set_union_build
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_union_build`](comptime/scope.md#fun-set_union_build)
-
-## fwd comptime_scope.set_va_list
-
-```mach
-fwd comptime_scope.set_va_list
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_va_list`](comptime/scope.md#fun-set_va_list)
-
-## fwd comptime_scope.set_vocabulary
-
-```mach
-fwd comptime_scope.set_vocabulary
-```
-
-forwards [`mach.lang.fe.comptime.scope.set_vocabulary`](comptime/scope.md#fun-set_vocabulary)
 
 ## fwd comptime_scope.stage_init
 
