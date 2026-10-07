@@ -126,6 +126,80 @@ pub fun apply_pcrel64(dst: *u8, patch_off: u32, sec_len: u32,
 sym_va: u64, addend: i64, patch_va: u64) res[bool, RelocError];
 ```
 
+## rec Site
+
+```mach
+pub rec Site;
+```
+
+one relocation to apply: the field it patches and the value it resolves to
+
+## def ApplyFn
+
+```mach
+pub def ApplyFn: fun(*Site) res[bool, RelocError]
+```
+
+## rec Row
+
+```mach
+pub rec Row;
+```
+
+one relocation kind an instruction set applies: the width of its field, how
+its addend is read, whether a pc-relative field in text carries its own width
+as a bias, and how it is written
+
+## fun row
+
+```mach
+pub fun row(rows: *Row, count: usize, kind: target_of.RelocKind) *Row;
+```
+
+the row of `kind` in an instruction set's table, nil for a kind it does not apply
+
+## fun table_traits
+
+```mach
+pub fun table_traits(rows: *Row, count: usize, kind: target_of.RelocKind,
+section_kind: target_of.SectionKind, codegen_image: bool) res[RelocTraits, RelocError];
+```
+
+the traits of `kind` as an instruction set's table states them
+
+## fun table_apply
+
+```mach
+pub fun table_apply(rows: *Row, count: usize, kind: target_of.RelocKind, dst: *u8, patch_off: u32,
+sec_len: u32, target: RelocTarget, addend: i64, patch_va: u64, image_base: u64) res[bool, RelocError];
+```
+
+`kind` applied through an instruction set's table
+
+## fun site_abs64
+
+```mach
+pub fun site_abs64(s: *Site) res[bool, RelocError];
+```
+
+## fun site_abs32
+
+```mach
+pub fun site_abs32(s: *Site) res[bool, RelocError];
+```
+
+## fun site_pcrel32
+
+```mach
+pub fun site_pcrel32(s: *Site) res[bool, RelocError];
+```
+
+## fun site_pcrel64
+
+```mach
+pub fun site_pcrel64(s: *Site) res[bool, RelocError];
+```
+
 ## fun normalize_image
 
 ```mach
