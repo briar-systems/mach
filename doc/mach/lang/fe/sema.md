@@ -138,6 +138,14 @@ fwd sema_product.acquire_symbol
 
 forwards [`mach.lang.fe.sema.product.acquire_symbol`](sema/product.md#fun-acquire_symbol)
 
+## fwd sema_product.acquire_interface
+
+```mach
+fwd sema_product.acquire_interface
+```
+
+forwards [`mach.lang.fe.sema.product.acquire_interface`](sema/product.md#fun-acquire_interface)
+
 ## fwd sema_product.SemaDeps
 
 ```mach
@@ -177,4 +185,12 @@ fwd mach.lang.fe.sema.instance
 ```
 
 forwards [`mach.lang.fe.sema.instance`](sema/instance.md)
+
+## fwd mach.lang.fe.sema.interface
+
+```mach
+fwd mach.lang.fe.sema.interface
+```
+
+forwards [`mach.lang.fe.sema.interface`](sema/interface.md)
 

@@ -115,17 +115,46 @@ pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *me_ir.Module) er
 pub fun dnit_context(lc: *LowerContext);
 ```
 
-## fun symbol_definition
+## fun interface_of
 
 ```mach
-pub fun symbol_definition(lc: *LowerContext, sym: *resolve.Symbol) res[fe_sema.DefinedSymbol, fail.Fail];
+pub fun interface_of(lc: *LowerContext, origin: session.ModuleId) res[*fe_sema.interface.Interface, fail.Fail];
 ```
 
-## fun declaring_comptime_ctx
+the interface of the module `origin`: the one the lowering module published, or an import's
+
+## rec Declared
 
 ```mach
-pub fun declaring_comptime_ctx(lc: *LowerContext, sym: *resolve.Symbol) *comptime.ComptimeCtx;
+pub rec Declared;
 ```
+
+a module-level declaration as the interface of its module describes it
+
+## fun declared
+
+```mach
+pub fun declared(lc: *LowerContext, sym: *resolve.Symbol) res[Declared, fail.Fail];
+```
+
+the declaration `sym` names: one of the module in scope by its id, or another module's by
+its kind and canonical name
+
+## fun declared_named
+
+```mach
+pub fun declared_named(lc: *LowerContext, origin: session.ModuleId, kind: resolve.SymKind, canon: intern.StrId) res[Declared, fail.Fail];
+```
+
+the one declaration of `kind` the module `origin` defines under `canon`
+
+## fun declared_scalar
+
+```mach
+pub fun declared_scalar(lc: *LowerContext, d: Declared) opt[comptime.CTValue];
+```
+
+the scalar a module `val` holds, none when it holds no constant or an aggregate
 
 ## fun gated_lower_member_const_message
 
@@ -438,24 +467,19 @@ EXT_LIST_EMPTY for any other type
 ## fun pack_instance_sig
 
 ```mach
-pub fun pack_instance_sig(lc: *LowerContext, d: *ast_decl.Decl, fixed_count: u32,
-types: *type.TypeId, type_len: u32, ret_ir: ir_type.IrTypeId) res[FnSig, fail.Fail];
+pub fun pack_instance_sig(lc: *LowerContext, fn_ty: type.TypeId, types: *type.TypeId, type_len: u32) res[FnSig, fail.Fail];
 ```
+
+the signature of a pack instance of the function typed `fn_ty`: its fixed parameters, then
+one per element of the pack
 
 ## fun instance_ref_sig
 
 ```mach
-pub fun instance_ref_sig(lc: *LowerContext, decl_id: ast_id.DeclId, origin: session.ModuleId,
-args: *type.TypeId, arg_len: u32) res[FnSig, fail.Fail];
+pub fun instance_ref_sig(lc: *LowerContext, item: *fe_sema.instance.Instance) res[FnSig, fail.Fail];
 ```
 
-## fun pack_instance_ref_sig
-
-```mach
-pub fun pack_instance_ref_sig(lc: *LowerContext, decl_id: ast_id.DeclId, origin: session.ModuleId,
-args: *type.TypeId, arg_len: u32,
-types: *type.TypeId, type_len: u32) res[FnSig, fail.Fail];
-```
+the signature an instance is referenced under: the one sema settled when it asked for it
 
 ## fun expr_symbol_of
 
@@ -479,11 +503,13 @@ pub fun ast_source(s: *session.Session, a: *ast.Ast) res[str, fail.Fail];
 
 the source text `a` was parsed from
 
-## fun decl_target_op
+## fun declared_op
 
 ```mach
-pub fun decl_target_op(itn: *intern.Interner, c: *comptime.ComptimeCtx, a: *ast.Ast, d: *ast_decl.Decl, defs: *target_definition.Table, out_op: *u32) u32;
+pub fun declared_op(lc: *LowerContext, d: Declared, out_op: *u32) u32;
 ```
+
+the operation of the selected target an `#[op]` function stands for, NO_OP_SET for any other
 
 ## fun emit_dbg_birth
 

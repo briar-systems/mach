@@ -1027,3 +1027,18 @@ a literal is a case literal when its head names a tag case, `T.c{...}` or `T.[c]
 parser records the case only for a head with generic arguments, name resolution splits the
 others, so the answer is complete once the literal's head has been bound
 
+## fun literal_case
+
+```mach
+pub fun literal_case[T](
+c: *comptime_scope.ComptimeCtx,
+cap_ctx: *T,
+caps: comptime_capability.PhaseCapabilities[T],
+a: *ast.Ast,
+source: str,
+e: ast_id.ExprId,
+interner: *intern.Interner) res[intern.StrId, comptime_failure.EvalFail];
+```
+
+the case the head of the literal `e` selects, STR_NIL for a record literal or any other expression
+
