@@ -74,6 +74,21 @@ pub val CT_KIND_NON_INTEGER: CTKind = 8
 an integer constant whose declared type is a def chain ending outside the integers;
 data.s is the interned refusal naming the chain, and reading it fails with that refusal
 
+## val CT_KIND_NODE
+
+```mach
+pub val CT_KIND_NODE: CTKind = 9
+```
+
+a node of a module's published constant values (see comptime.deep), read at type `ty`;
+`module` is the stable id of the module whose store holds it
+
+## rec NodeRef
+
+```mach
+pub rec NodeRef;
+```
+
 ## rec CTValue
 
 ```mach
@@ -288,6 +303,12 @@ literals this way, and type checking rebinds them with the declared type
 
 ```mach
 pub fun const_elem_value(elem: u32, ty: u32) CTValue;
+```
+
+## fun node_ref
+
+```mach
+pub fun node_ref(module: u32, node: u32, ty: u32) CTValue;
 ```
 
 ## fun ct_str

@@ -32,6 +32,9 @@ pub val EMBED_LEN_FAILED: u64 = 0xFFFFFFFFFFFFFFFE
 pub rec TypeExport;
 ```
 
+a constant an array, record or case literal gives is a value naming a node of the store its
+module's interface publishes
+
 ## rec ModuleSema
 
 ```mach

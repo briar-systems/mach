@@ -30,9 +30,9 @@ pub fun references_function(ctx: *lower_context.LowerContext, eid: ast_id.ExprId
 pub fun constant_literal_expr(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) opt[ast_id.ExprId];
 ```
 
-the literal a constant-valued expression stands for, when it stands for one: a `$each` element or
-a module `val` initialized with an aggregate literal, a member path into such a literal, or an
-identity cast of one. a range over such a literal, or a `::` between an array and a vector of
+the literal a constant-valued expression stands for, when it stands for one: a module `val`
+initialized with an aggregate literal, a member path into such a literal, or an identity cast
+of one. a range over such a literal, or a `::` between an array and a vector of
 it, stands for itself, the window its elements are read from. a static initializer spelled
 over such a name folds the literal it names
 

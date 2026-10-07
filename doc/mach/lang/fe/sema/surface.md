@@ -9,7 +9,7 @@ type and bound constant, and the field recipes of the types they reach
 pub rec Owner;
 ```
 
-the module whose surface is built: its ids, its load scope and the incarnation of its syntax
+the module whose surface is built: its ids and its load scope
 
 ## rec Origins
 

@@ -238,6 +238,12 @@ one `{name}` of an asm block and the local it binds
 pub fun param_symbol(r: *ResolveResult, decl: ast_id.DeclId, slot: u32) SymbolId;
 ```
 
+## fun stable_of_module
+
+```mach
+pub fun stable_of_module(s: *session.Session, mid: session.ModuleId) session.StableModuleId;
+```
+
 ## fun type_owner
 
 ```mach
