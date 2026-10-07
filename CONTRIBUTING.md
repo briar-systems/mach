@@ -15,13 +15,15 @@ host and put `mach` on `PATH`; CI seeds from the same archive
 ```bash
 git clone https://github.com/briar-systems/mach.git
 cd mach
-mach dep pull .
-mach build .
+bash .github/scripts/seed-build.sh mach a
+./a dep pull .
+./a build .
 ```
 
-The compiler is written to `out/<target>/<profile>/bin/mach`, or
-`bin/mach.exe` on Windows. A default Linux x86_64 build writes
-`out/linux-x86_64/debug/bin/mach`.
+A 6.x release reads only the previous manifest keys, so it builds `a` through
+`seed-build.sh` (see [Fixpoint](#fixpoint)), and `a` builds the compiler. It is
+written to `out/<target>/<profile>/bin/mach`, or `bin/mach.exe` on Windows. A
+default Linux x86_64 build writes `out/linux-x86_64/debug/bin/mach`.
 
 
 ## Fixpoint
@@ -38,14 +40,17 @@ v=$(sed -n 's/^seed=//p' .github/scripts/bootstrap.sh)
 t=x86_64-linux
 gh release download "v$v" -R briar-systems/mach -p "mach-$v-$t.tar.gz" -p SHA256SUMS -D ../mach-seed
 (cd ../mach-seed && grep " mach-$v-$t.tar.gz\$" SHA256SUMS | sha256sum -c - && tar -xzf "mach-$v-$t.tar.gz" mach)
-../mach-seed/mach dep pull .
-../mach-seed/mach build . -o a
+bash .github/scripts/seed-build.sh ../mach-seed/mach a
+./a dep pull .
 ./a build . -o b
 ./b build . -o c
 cmp b c
 ```
 
-The seed builds `a` from your tree. `a` builds `b`, and `b` builds `c`. `cmp`
+The seed builds `a` from your tree. A 6.x seed reads only the previous
+manifest keys, so `seed-build.sh` builds a copy under `out/seed` whose
+manifests it rewrites to them, with std at the committed pin. `a` builds `b`,
+and `b` builds `c`. `cmp`
 prints nothing and exits 0 when `b` and `c` are identical. CI runs the
 fixpoint on every pull request, so run it locally
 only when a change needs it. The seed builds the `mach` binary and nothing

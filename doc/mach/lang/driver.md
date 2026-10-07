@@ -24,14 +24,6 @@ fwd project.TargetEntry
 
 forwards [`mach.lang.driver.project.TargetEntry`](driver/project.md#rec-targetentry)
 
-## fwd project.TARGET_OPT_RELEASE
-
-```mach
-fwd project.TARGET_OPT_RELEASE
-```
-
-forwards [`mach.lang.driver.project.TARGET_OPT_RELEASE`](driver/project.md#val-target_opt_release)
-
 ## fwd project.dnit_project
 
 ```mach
