@@ -6,22 +6,22 @@
 pub def RelocError: target_of.RelocError
 ```
 
-## val RELOC_OVERFLOW
+## val OVERFLOW
 
 ```mach
-pub val RELOC_OVERFLOW: RelocError = target_of.RELOC_OVERFLOW
+pub val OVERFLOW: RelocError = target_of.RELOC_OVERFLOW
 ```
 
-## val RELOC_UNSUPPORTED
+## val UNSUPPORTED
 
 ```mach
-pub val RELOC_UNSUPPORTED: RelocError = target_of.RELOC_UNSUPPORTED
+pub val UNSUPPORTED: RelocError = target_of.RELOC_UNSUPPORTED
 ```
 
-## val RELOC_INVALID_INSTRUCTION
+## val INVALID_INSTRUCTION
 
 ```mach
-pub val RELOC_INVALID_INSTRUCTION: RelocError = target_of.RELOC_INVALID_INSTRUCTION
+pub val INVALID_INSTRUCTION: RelocError = target_of.RELOC_INVALID_INSTRUCTION
 ```
 
 ## def RelocAddendMode
@@ -30,22 +30,22 @@ pub val RELOC_INVALID_INSTRUCTION: RelocError = target_of.RELOC_INVALID_INSTRUCT
 pub def RelocAddendMode: target_of.RelocAddendMode
 ```
 
-## val RELOC_ADDEND_SYMBOL
+## val ADDEND_SYMBOL
 
 ```mach
-pub val RELOC_ADDEND_SYMBOL: RelocAddendMode = target_of.RELOC_ADDEND_SYMBOL
+pub val ADDEND_SYMBOL: RelocAddendMode = target_of.RELOC_ADDEND_SYMBOL
 ```
 
-## val RELOC_ADDEND_FIELD_BIAS
+## val ADDEND_FIELD_BIAS
 
 ```mach
-pub val RELOC_ADDEND_FIELD_BIAS: RelocAddendMode = target_of.RELOC_ADDEND_FIELD_BIAS
+pub val ADDEND_FIELD_BIAS: RelocAddendMode = target_of.RELOC_ADDEND_FIELD_BIAS
 ```
 
-## val RELOC_ADDEND_IGNORED
+## val ADDEND_IGNORED
 
 ```mach
-pub val RELOC_ADDEND_IGNORED: RelocAddendMode = target_of.RELOC_ADDEND_IGNORED
+pub val ADDEND_IGNORED: RelocAddendMode = target_of.RELOC_ADDEND_IGNORED
 ```
 
 ## def RelocTraits

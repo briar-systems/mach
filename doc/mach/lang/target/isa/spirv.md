@@ -1,41 +1,41 @@
 # mach.lang.target.isa.spirv
 
-## val SPV_MAGIC
+## val MAGIC
 
 ```mach
-pub val SPV_MAGIC: u32 = 0x07230203
+pub val MAGIC: u32 = 0x07230203
 ```
 
-## val SPV_MODULE_SECTION
+## val MODULE_SECTION
 
 ```mach
-pub val SPV_MODULE_SECTION: str = ".spirv"
+pub val MODULE_SECTION: str = ".spirv"
 ```
 
 the one section a SPIR-V object image carries: the finished module
 
-## val SPV_VERSION_1_2
+## val VERSION_1_2
 
 ```mach
-pub val SPV_VERSION_1_2: u32 = 0x00010200
+pub val VERSION_1_2: u32 = 0x00010200
 ```
 
-## val SPV_VERSION_1_3
+## val VERSION_1_3
 
 ```mach
-pub val SPV_VERSION_1_3: u32 = 0x00010300
+pub val VERSION_1_3: u32 = 0x00010300
 ```
 
-## val SPV_VERSION_1_5
+## val VERSION_1_5
 
 ```mach
-pub val SPV_VERSION_1_5: u32 = 0x00010500
+pub val VERSION_1_5: u32 = 0x00010500
 ```
 
-## val SPV_VERSION_1_6
+## val VERSION_1_6
 
 ```mach
-pub val SPV_VERSION_1_6: u32 = 0x00010600
+pub val VERSION_1_6: u32 = 0x00010600
 ```
 
 ## rec EnvProfile
@@ -50,10 +50,10 @@ pub rec EnvProfile;
 pub val ENV_PROFILE_COUNT: u32 = 4
 ```
 
-## val SPV_GENERATOR
+## val GENERATOR
 
 ```mach
-pub val SPV_GENERATOR: u32 = 0
+pub val GENERATOR: u32 = 0
 ```
 
 ## val OP_SOURCE

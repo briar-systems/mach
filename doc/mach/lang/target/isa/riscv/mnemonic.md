@@ -254,15 +254,15 @@ pub val FLAG_RL: u16 = 0x0200
 pub fun pattern(flags: u16) u16;
 ```
 
-## val MNEMONIC_COUNT
+## val ROW_COUNT
 
 ```mach
-pub val MNEMONIC_COUNT: usize = 107
+pub val ROW_COUNT: usize = 107
 ```
 
-## val MNEMONICS
+## val ROWS
 
 ```mach
-pub val MNEMONICS: [MNEMONIC_COUNT]isa_asm.Mnemonic = [MNEMONIC_COUNT]isa_asm.Mnemonic;
+pub val ROWS: [ROW_COUNT]isa_asm.Mnemonic = [ROW_COUNT]isa_asm.Mnemonic;
 ```
 
