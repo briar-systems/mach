@@ -12,6 +12,7 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_contains;
+use std.types.string.str_equals;
 
 use A: std.allocator;
 
@@ -50,22 +51,27 @@ pub def OptLevel: u8;
 pub val OPT_DEBUG:   OptLevel = 0;
 pub val OPT_RELEASE: OptLevel = 1;
 
-pub rec VectorizeEnabledOption { v: bool; }
-pub rec SimdRequireOption      { v: bool; }
-pub rec FloatReassocOption     { v: bool; }
+pub rec SimdRequireOption { v: bool; }
+
+# a set of the schedule's passes, one bit per row of `PASSES`
+pub rec PassSet {
+    bits: u64;
+}
 
 # diags is the module's diagnostic store: a shape or `simd = "require"` refusal
 # is a located error there, never a bare failure
 pub rec PipelineRequest {
-    module:            *me_ir.Module;
-    available:         *body.Available;
-    target:            *resolved.Target;
-    level:             OptLevel;
-    vectorize_enabled: VectorizeEnabledOption;
-    simd_require:      SimdRequireOption;
-    float_reassoc:     FloatReassocOption;
-    interner:          *intern.Interner;
-    source_map:        *lang_source.SourceMap;
+    module:    *me_ir.Module;
+    available: *body.Available;
+    target:    *resolved.Target;
+    level:     OptLevel;
+    # the optimization passes run above `level`'s and those left out of it
+    passes:       PassSet;
+    skips:        PassSet;
+    simd_require: SimdRequireOption;
+    relax:        pass.Relax;
+    interner:     *intern.Interner;
+    source_map:   *lang_source.SourceMap;
     # the module's diagnostic store: a shape or `simd = "require"` refusal is a
     # located error there, never a bare failure, and a scalarized operation a
     # warning at its site
@@ -137,8 +143,8 @@ val AFTER_SPLIT:   [AFTER_SPLIT_N]Row = [AFTER_SPLIT_N]Row{
 };
 
 # the vector checks, as passes that change nothing
-val DECLARED: pass.Pass = pass.Pass{run: declared_run, applies: nil, preserves: analysis.ALL};
-val FALLBACK: pass.Pass = pass.Pass{run: fallback_run, applies: nil, preserves: analysis.ALL};
+val DECLARED: pass.Pass = pass.Pass{name: "simd-declared", class: pass.CLASS_LEGALIZATION, run: declared_run, applies: nil, preserves: analysis.ALL};
+val FALLBACK: pass.Pass = pass.Pass{name: "simd-fallback", class: pass.CLASS_LEGALIZATION, run: fallback_run, applies: nil, preserves: analysis.ALL};
 
 # the middle end, in order. a row's comment says why its pass sits where it
 # does
@@ -214,29 +220,47 @@ fun run_impl(req: *PipelineRequest) res[bool, fail.Fail] {
     fin { scratch.dnit(?workspace); }
 
     var ctx: pass.Context = pass.context(req.module, req.target, ?workspace);
-    ctx.interner      = req.interner;
-    ctx.available     = req.available;
-    ctx.diags         = req.diags;
-    ctx.vectorize     = req.vectorize_enabled.v;
-    ctx.simd_require  = req.simd_require.v;
-    ctx.float_reassoc = req.float_reassoc.v;
+    ctx.interner     = req.interner;
+    ctx.available    = req.available;
+    ctx.diags        = req.diags;
+    ctx.simd_require = req.simd_require.v;
+    ctx.relax        = req.relax;
 
     val res_verify_in: err[fail.Fail] = verify_in(req.module, false, true, ?vc, ?workspace);
     if (sel res_verify_in.err) { ret res[bool, fail.Fail].err{res_verify_in.err}; }
-    val changed: res[bool, fail.Fail] = rows_run(?ctx, req.level, ?SCHEDULE[0], SCHEDULE_N, ?vc);
+    var picked:  Selection            = Selection{level: req.level, passes: req.passes, skips: req.skips};
+    val changed: res[bool, fail.Fail] = rows_run(?ctx, ?picked, ?SCHEDULE[0], SCHEDULE_N, ?vc);
     if (sel changed.err) { ret changed; }
     val res_verify_out: err[fail.Fail] = verify_in(req.module, true, true, ?vc, ?workspace);
     if (sel res_verify_out.err) { ret res[bool, fail.Fail].err{res_verify_out.err}; }
     ret changed;
 }
 
-# the `n` rows from `rows` in order at `level`, true when any pass changed the
-# module
-fun rows_run(ctx: *pass.Context, level: OptLevel, rows: *Row, n: usize, vc: *VerifyCtx) res[bool, fail.Fail] {
+# which rows a run takes: a legalization row by its level alone, an
+# optimization row by its level or `passes`, unless `skips` holds its pass
+rec Selection {
+    level:  OptLevel;
+    passes: PassSet;
+    skips:  PassSet;
+}
+
+# whether `picked` takes `row`
+fun row_taken(picked: *Selection, row: *Row) bool {
+    val by_level: bool = picked.level >= row.level;
+    if (row.pass.class != pass.CLASS_OPTIMIZATION) { ret by_level; }
+    val at: opt[usize] = pass_index(row.pass);
+    if (sel at.none)                    { ret by_level; }
+    if (set_has(picked.skips, at.some)) { ret false; }
+    ret by_level || set_has(picked.passes, at.some);
+}
+
+# the `n` rows from `rows` in order as `picked` takes them, true when any pass
+# changed the module
+fun rows_run(ctx: *pass.Context, picked: *Selection, rows: *Row, n: usize, vc: *VerifyCtx) res[bool, fail.Fail] {
     var changed: bool  = false;
     var i:       usize = 0;
     for (i < n) {
-        val ran: res[bool, fail.Fail] = row_run(ctx, level, ?rows[i], vc);
+        val ran: res[bool, fail.Fail] = row_run(ctx, picked, ?rows[i], vc);
         if (sel ran.err) { ret ran; }
         if (ran.ok)      { changed = true; }
         i = i + 1;
@@ -244,16 +268,16 @@ fun rows_run(ctx: *pass.Context, level: OptLevel, rows: *Row, n: usize, vc: *Ver
     ret res[bool, fail.Fail].ok{changed};
 }
 
-# a row skipped by its level or its pass's gate runs nothing and checks nothing;
-# a row that ran leaves only the analyses its pass preserves
-fun row_run(ctx: *pass.Context, level: OptLevel, row: *Row, vc: *VerifyCtx) res[bool, fail.Fail] {
-    if (level < row.level)            { ret res[bool, fail.Fail].ok{false}; }
+# a row the selection leaves out, or its pass's gate, runs nothing and checks
+# nothing; a row that ran leaves only the analyses its pass preserves
+fun row_run(ctx: *pass.Context, picked: *Selection, row: *Row, vc: *VerifyCtx) res[bool, fail.Fail] {
+    if (!row_taken(picked, row))      { ret res[bool, fail.Fail].ok{false}; }
     if (!pass.applies(row.pass, ctx)) { ret res[bool, fail.Fail].ok{false}; }
     val ran: res[bool, fail.Fail] = pass.run(row.pass, ctx);
     if (sel ran.err) { ret ran; }
     analysis.keep(ctx.analyses, row.pass.preserves);
     if (ran.ok && row.after_n > 0) {
-        val followed: res[bool, fail.Fail] = rows_run(ctx, level, row.after, row.after_n, vc);
+        val followed: res[bool, fail.Fail] = rows_run(ctx, picked, row.after, row.after_n, vc);
         if (sel followed.err) { ret followed; }
     }
     if (row.verify != VERIFY_NONE && (ran.ok || row.verify_unchanged)) {
@@ -261,6 +285,100 @@ fun row_run(ctx: *pass.Context, level: OptLevel, row: *Row, vc: *VerifyCtx) res[
         if (sel checked.err) { ret res[bool, fail.Fail].err{checked.err}; }
     }
     ret ran;
+}
+
+# every pass the schedule runs, in the order its first row runs it; a build
+# names a pass by its row here
+val PASS_COUNT: usize                  = 26;
+val PASSES:     [PASS_COUNT]*pass.Pass = [PASS_COUNT]*pass.Pass{
+    ?me_opt.mem2reg.PASS,
+    ?me_opt.constfold.PASS,
+    ?me_opt.dce.PASS,
+    ?me_opt.tailcall.RECURSE,
+    ?me_opt.inline.PASS,
+    ?me_opt.sroa.PASS,
+    ?me_opt.algebraic.PASS,
+    ?me_opt.cse.PASS,
+    ?me_opt.thread.PASS,
+    ?me_opt.ifconv.PASS,
+    ?me_legalize.shiftbound.PASS,
+    ?me_opt.licm.PASS,
+    ?me_opt.vectorize.PASS,
+    ?me_opt.strength.PASS,
+    ?me_opt.hoistconst.PASS,
+    ?me_legalize.vecsplat.PASS,
+    ?me_legalize.widenmul.PASS,
+    ?me_legalize.wide.div.PASS,
+    ?me_legalize.wide.conv.PASS,
+    ?DECLARED,
+    ?FALLBACK,
+    ?me_legalize.vecsplit.PASS,
+    ?me_legalize.scalarize.PASS,
+    ?me_legalize.scalarize.GAPS,
+    ?me_legalize.scalarize.LANES,
+    ?me_opt.tailcall.MARK,
+};
+
+# how many passes the schedule runs
+pub fun pass_count() usize {
+    ret PASS_COUNT;
+}
+
+# pass `i` of the schedule, in the order `PASSES` lists them
+pub fun pass_at(i: usize) *pass.Pass {
+    ret PASSES[i];
+}
+
+# the index of the pass named `name`, none when the schedule runs no such pass
+pub fun pass_named(name: str) opt[usize] {
+    var i: usize = 0;
+    for (i < PASS_COUNT) {
+        if (str_equals(PASSES[i].name, name)) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+fun pass_index(p: *pass.Pass) opt[usize] {
+    var i: usize = 0;
+    for (i < PASS_COUNT) {
+        if (PASSES[i] == p) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# the lowest level any row runs pass `i` at: OPT_DEBUG for a pass every build
+# runs unless it is skipped, OPT_RELEASE for one `optimize` selects
+pub fun pass_level(i: usize) OptLevel {
+    var lowest: OptLevel = OPT_RELEASE;
+    rows_lowest(PASSES[i], ?SCHEDULE[0], SCHEDULE_N, ?lowest);
+    ret lowest;
+}
+
+fun rows_lowest(p: *pass.Pass, rows: *Row, n: usize, lowest: *OptLevel) {
+    var i: usize = 0;
+    for (i < n) {
+        if (rows[i].pass == p && rows[i].level < @lowest) { @lowest = rows[i].level; }
+        if (rows[i].after_n > 0)                          { rows_lowest(p, rows[i].after, rows[i].after_n, lowest); }
+        i = i + 1;
+    }
+}
+
+pub fun set_empty() PassSet {
+    ret PassSet{bits: 0};
+}
+
+pub fun set_has(s: PassSet, i: usize) bool {
+    ret (s.bits & (1::u64 << i::u64)) != 0;
+}
+
+pub fun set_add(s: *PassSet, i: usize) {
+    s.bits = s.bits | (1::u64 << i::u64);
+}
+
+pub fun set_remove(s: *PassSet, i: usize) {
+    s.bits = s.bits & ~(1::u64 << i::u64);
 }
 
 fun declared_run(ctx: *pass.Context) res[bool, fail.Fail] {
@@ -326,14 +444,12 @@ fun verify_work(work: *VerifyWork, alloc: *A.Allocator) err[fail.Fail] {
 #[testing]
 fun t_ready_request() PipelineRequest {
     var req: PipelineRequest;
-    req.module            = nil;
-    req.target            = nil;
-    req.level             = OPT_DEBUG;
-    req.vectorize_enabled = VectorizeEnabledOption{v: false};
-    req.simd_require      = SimdRequireOption{v: false};
-    req.float_reassoc     = FloatReassocOption{v: false};
-    req.interner          = nil;
-    req.source_map        = nil;
+    req.module       = nil;
+    req.target       = nil;
+    req.level        = OPT_DEBUG;
+    req.simd_require = SimdRequireOption{v: false};
+    req.interner     = nil;
+    req.source_map   = nil;
     ret req;
 }
 
@@ -784,14 +900,12 @@ test run__simd_require_gate {
     or { code = 1; }
 
     var preq1: PipelineRequest;
-    preq1.module            = ?m;
-    preq1.target            = ?rv;
-    preq1.level             = OPT_DEBUG;
-    preq1.vectorize_enabled = VectorizeEnabledOption{v: true};
-    preq1.simd_require      = SimdRequireOption{v: true};
-    preq1.float_reassoc     = FloatReassocOption{v: false};
-    preq1.interner          = ?itn;
-    preq1.source_map        = nil;
+    preq1.module       = ?m;
+    preq1.target       = ?rv;
+    preq1.level        = OPT_DEBUG;
+    preq1.simd_require = SimdRequireOption{v: true};
+    preq1.interner     = ?itn;
+    preq1.source_map   = nil;
     var diags1: diagnostic.DiagnosticStore = diagnostic.store_init(?alloc);
     fin { diagnostic.store_dnit(?diags1); }
     preq1.diags = ?diags1;
@@ -840,14 +954,12 @@ test run__simd_require_gate {
     val r_677: err[fail.Fail] = builder.emit_ret_void(?b2);
     if (sel r_677.err) { code = 1; }
     var preq2: PipelineRequest;
-    preq2.module            = ?m2;
-    preq2.target            = ?rv;
-    preq2.level             = OPT_DEBUG;
-    preq2.vectorize_enabled = VectorizeEnabledOption{v: true};
-    preq2.simd_require      = SimdRequireOption{v: true};
-    preq2.float_reassoc     = FloatReassocOption{v: false};
-    preq2.interner          = ?itn;
-    preq2.source_map        = nil;
+    preq2.module       = ?m2;
+    preq2.target       = ?rv;
+    preq2.level        = OPT_DEBUG;
+    preq2.simd_require = SimdRequireOption{v: true};
+    preq2.interner     = ?itn;
+    preq2.source_map   = nil;
     val r_687: res[bool, fail.Fail] = run(?preq2);
     if (sel r_687.err) { code = 1; }
     me_ir.dnit(?m2);
@@ -915,14 +1027,12 @@ fun mul_require_refused(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_t
     }
 
     var preq3: PipelineRequest;
-    preq3.module            = ?m;
-    preq3.target            = ?rv;
-    preq3.level             = OPT_DEBUG;
-    preq3.vectorize_enabled = VectorizeEnabledOption{v: true};
-    preq3.simd_require      = SimdRequireOption{v: true};
-    preq3.float_reassoc     = FloatReassocOption{v: false};
-    preq3.interner          = itn;
-    preq3.source_map        = nil;
+    preq3.module       = ?m;
+    preq3.target       = ?rv;
+    preq3.level        = OPT_DEBUG;
+    preq3.simd_require = SimdRequireOption{v: true};
+    preq3.interner     = itn;
+    preq3.source_map   = nil;
     val changed_r: res[bool, fail.Fail] = run(?preq3);
     me_ir.dnit(?m);
     if (sel changed_r.err) { ret 1; }
@@ -1128,14 +1238,12 @@ fun vector_shift_outcome(alloc: *A.Allocator, itn: *intern.Interner, rv: *resolv
     val rret: err[fail.Fail] = builder.emit_ret(?b, rsh.ok);
     if (sel rret.err) { ret 9; }
     var preq: PipelineRequest;
-    preq.module            = ?m;
-    preq.target            = rv;
-    preq.level             = OPT_DEBUG;
-    preq.vectorize_enabled = VectorizeEnabledOption{v: false};
-    preq.simd_require      = SimdRequireOption{v: true};
-    preq.float_reassoc     = FloatReassocOption{v: false};
-    preq.interner          = itn;
-    preq.source_map        = nil;
+    preq.module       = ?m;
+    preq.target       = rv;
+    preq.level        = OPT_DEBUG;
+    preq.simd_require = SimdRequireOption{v: true};
+    preq.interner     = itn;
+    preq.source_map   = nil;
     var diags: diagnostic.DiagnosticStore = diagnostic.store_init(alloc);
     fin { diagnostic.store_dnit(?diags); }
     preq.diags = ?diags;
@@ -1215,14 +1323,12 @@ fun vector_mul_outcome(alloc: *A.Allocator, itn: *intern.Interner, rv: *resolved
         ret 9;
     }
     var preq: PipelineRequest;
-    preq.module            = ?m;
-    preq.target            = rv;
-    preq.level             = OPT_DEBUG;
-    preq.vectorize_enabled = VectorizeEnabledOption{v: false};
-    preq.simd_require      = SimdRequireOption{v: require};
-    preq.float_reassoc     = FloatReassocOption{v: false};
-    preq.interner          = itn;
-    preq.source_map        = nil;
+    preq.module       = ?m;
+    preq.target       = rv;
+    preq.level        = OPT_DEBUG;
+    preq.simd_require = SimdRequireOption{v: require};
+    preq.interner     = itn;
+    preq.source_map   = nil;
     var diags: diagnostic.DiagnosticStore = diagnostic.store_init(alloc);
     fin { diagnostic.store_dnit(?diags); }
     preq.diags = ?diags;
@@ -1525,12 +1631,13 @@ test row_run__leaves_only_the_analyses_its_pass_preserves {
     var ctx: pass.Context = pass.context(?module, nil, ?workspace);
     var vc:  VerifyCtx    = VerifyCtx{tgt: nil, itn: nil, srcmap: nil};
 
-    var keeps: Row                  = Row{pass: ?KEEPS_DOMINANCE, level: OPT_DEBUG, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0};
-    val kept:  res[bool, fail.Fail] = row_run(?ctx, OPT_DEBUG, ?keeps, ?vc);
+    var picked: Selection            = Selection{level: OPT_DEBUG, passes: set_empty(), skips: set_empty()};
+    var keeps:  Row                  = Row{pass: ?KEEPS_DOMINANCE, level: OPT_DEBUG, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0};
+    val kept:   res[bool, fail.Fail] = row_run(?ctx, ?picked, ?keeps, ?vc);
     if (sel kept.err)                                                                          { ret 2; }
     if (!analysis.has(?workspace.analyses, ?module, ?module.functions[0], analysis.DOMINANCE)) { ret 3; }
     var drops:   Row                  = Row{pass: ?KEEPS_NOTHING, level: OPT_DEBUG, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0};
-    val dropped: res[bool, fail.Fail] = row_run(?ctx, OPT_DEBUG, ?drops, ?vc);
+    val dropped: res[bool, fail.Fail] = row_run(?ctx, ?picked, ?drops, ?vc);
     if (sel dropped.err)                                                                      { ret 2; }
     if (analysis.has(?workspace.analyses, ?module, ?module.functions[0], analysis.DOMINANCE)) { ret 4; }
     ret 0;
