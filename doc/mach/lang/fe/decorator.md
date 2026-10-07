@@ -315,6 +315,7 @@ FLAG_ROLE: it gives a module binding a shader interface role, and a binding has 
 FLAG_TESTING_EXCLUSIVE: it names a consumer outside Mach source, which `#[testing]` cannot confine
 FLAG_WORDS: its arguments are bare names that bind to nothing, never expressions
 FLAG_STRINGS_CHECKED: its string arguments are checked by the row, not by the decorator's own rule
+FLAG_PLACE_CHECKED: the decorator refuses a misplacement itself, in a diagnostic of its own kind
 
 ## val FLAG_ONCE
 
@@ -344,6 +345,12 @@ pub val FLAG_WORDS:             Flags = 0x8
 
 ```mach
 pub val FLAG_STRINGS_CHECKED:   Flags = 0x10
+```
+
+## val FLAG_PLACE_CHECKED
+
+```mach
+pub val FLAG_PLACE_CHECKED:     Flags = 0x20
 ```
 
 ## val ARGS_ANY

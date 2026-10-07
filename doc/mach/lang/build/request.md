@@ -1,5 +1,37 @@
 # mach.lang.build.request
 
+## def Lever
+
+```mach
+pub def Lever: u8
+```
+
+a binary profile lever as the command line sets it
+
+## val LEVER_PROFILE
+
+```mach
+pub val LEVER_PROFILE: Lever = 0
+```
+
+neither `--key` nor `--no-key` was given: the profile decides
+
+## val LEVER_ON
+
+```mach
+pub val LEVER_ON: Lever = 1
+```
+
+`--key`
+
+## val LEVER_OFF
+
+```mach
+pub val LEVER_OFF: Lever = 2
+```
+
+`--no-key`
+
 ## rec CliArgs
 
 ```mach
@@ -9,6 +41,14 @@ pub rec CliArgs;
 the typed options of a build-shaped command
 
 selectors: the `-a`, `-t` and `-p` patterns and `--all`
+work: the `-w` work directory, nil when absent
+optimize: `--optimize` or `--no-optimize`
+debug: `--debug` or `--no-debug`
+simd: the `--simd` value, nil when absent
+pass: the `--pass` names, each added to the pass set
+skip: the `--skip` names, each left out of it
+relax: the `--relax` names, each permitted
+unrelax: the `--no-relax` names, each withdrawn
 jobs: the `--jobs` count, 0 when absent
 
 ## def SubsystemFlag
@@ -146,6 +186,31 @@ pub fun release(r: *BuildRequest) bool;
 pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
 cli: *CliArgs, root: str, goal: BuildGoal, profile: str) res[BuildRequest, fail.Fail];
 ```
+
+## fun work_apply
+
+```mach
+pub fun work_apply(itn: *intern.Interner, work: str, m: *manifest.Manifest) err[fail.Fail];
+```
+
+`work`, a `-w` value, in place of the root manifest `m`'s `[project].work`: a
+canonical path inside the project root, taken as written
+
+## val WORK_CONSTRAINT
+
+```mach
+pub val WORK_CONSTRAINT: str = "-w must name a canonical path inside the project root: relative, with no . or .. component and no template"
+```
+
+the rule `-w` keeps
+
+## fun request_work_apply
+
+```mach
+pub fun request_work_apply(itn: *intern.Interner, r: *BuildRequest, m: *manifest.Manifest) err[fail.Fail];
+```
+
+`r`'s `-w` over the root manifest `m` it is built from, nothing when it names none
 
 ## fun for_cell
 

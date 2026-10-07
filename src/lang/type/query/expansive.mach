@@ -1,0 +1,469 @@
+# whether a generic has unboundedly many instances, decided on the first question about
+# it once its fields exist and recorded for the projection it was decided under
+#
+# the instantiation graph is over declarations: a node is one parameter of one generic,
+# and an edge says that parameter flows into an argument of a generic its fields mention.
+# an edge grows when the argument wraps the parameter (`L[*T]` in `L[T]`) rather than
+# being it, `^T` included as the parameter itself since `^` is idempotent. a cycle with a
+# growing edge mints a fresh instance at every trip, so its generics are expansive
+use std.allocator.page;
+use std.collections.map;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.module;
+use mach.lang.scc;
+use lang_source: mach.lang.source;
+use mach.lang.type;
+use type_query: mach.lang.type.query;
+use mach.lang.type.query.mention;
+use mach.lang.type.query.subst;
+use mach.lang.type.visit;
+
+val NO_NODE: u32 = 0xFFFFFFFF;
+
+rec Edge {
+    from:  u32;
+    to:    u32;
+    grows: bool;
+}
+
+rec Graph {
+    q:     *type_query.Query;
+    key:   map.Map[u64, u32];
+    nodes: Vector[type.TypeId];
+    edges: Vector[Edge];
+    # the generics whose fields the graph holds, in the order they were met
+    found: map.Map[type.TypeId, bool];
+    work:  Vector[type.TypeId];
+    occ:   Vector[u32];
+    # a generic met had no field table, so its edges are unknown
+    incomplete: bool;
+}
+
+fun graph_init(q: *type_query.Query) Graph {
+    var x: Graph;
+    x.q          = q;
+    x.key        = map.init[u64, u32](q.types.a);
+    x.nodes      = collections_vector.init[type.TypeId](q.types.a);
+    x.edges      = collections_vector.init[Edge](q.types.a);
+    x.found      = map.init[type.TypeId, bool](q.types.a);
+    x.work       = collections_vector.init[type.TypeId](q.types.a);
+    x.occ        = collections_vector.init[u32](q.types.a);
+    x.incomplete = false;
+    ret x;
+}
+
+fun graph_dnit(x: *Graph) {
+    map.dnit[u64, u32](?x.key);
+    collections_vector.dnit[type.TypeId](?x.nodes);
+    collections_vector.dnit[Edge](?x.edges);
+    map.dnit[type.TypeId, bool](?x.found);
+    collections_vector.dnit[type.TypeId](?x.work);
+    collections_vector.dnit[u32](?x.occ);
+}
+
+fun body_enqueue(x: *Graph, body: type.TypeId) {
+    val seen: opt[*bool] = map.get[type.TypeId, bool](?x.found, ?body);
+    if (sel seen.some) { ret; }
+    val put: res[bool, A.Error] = map.insert[type.TypeId, bool](?x.found, body, true);
+    if (sel put.err) {
+        type_query.refused(x.q, put.err);
+        ret;
+    }
+    val pushed: res[usize, A.Error] = collections_vector.push[type.TypeId](?x.work, body);
+    if (sel pushed.err) { type_query.refused(x.q, pushed.err); }
+}
+
+fun node_of(x: *Graph, generic: type.TypeId, param: u32) u32 {
+    val k:    u64       = (type.index(generic)::u64 << 32) | param::u64;
+    val have: opt[*u32] = map.get[u64, u32](?x.key, ?k);
+    if (sel have.some) { ret @have.some; }
+    val ix:     u32                 = x.nodes.len::u32;
+    val pushed: res[usize, A.Error] = collections_vector.push[type.TypeId](?x.nodes, generic);
+    if (sel pushed.err) {
+        type_query.refused(x.q, pushed.err);
+        ret NO_NODE;
+    }
+    val put: res[bool, A.Error] = map.insert[u64, u32](?x.key, k, ix);
+    if (sel put.err) {
+        type_query.refused(x.q, put.err);
+        ret NO_NODE;
+    }
+    ret ix;
+}
+
+# what one walk over a generic's fields reads: the graph, the generic whose fields they
+# are, and the owner of its parameters
+rec Site {
+    x:     *Graph;
+    body:  type.TypeId;
+    owner: *type.GenericOwner;
+}
+
+# an anonymous aggregate of `owner`'s body, which the walk enters as part of it
+fun same_owner(x: *Graph, tid: type.TypeId, owner: *type.GenericOwner) bool {
+    if (!mention.has_param(x.q, tid)) { ret false; }
+    val of: opt[type.GenericOwner] = mention.owner(x.q, tid);
+    if (!sel of.some) { ret false; }
+    var who: type.GenericOwner = of.some;
+    ret type.generic_owner_equals(?who, owner);
+}
+
+# the parameters of the owner a type mentions, appended to x.occ
+fun occurrence_leaf(at: *Site, tid: type.TypeId, t: *type.Type) visit.Verdict {
+    if (t.kind == type.TYPE_GENERIC_PARAM) {
+        if (type.param_owned_by(?t.data.generic_param, at.owner)) {
+            val pushed: res[usize, A.Error] = collections_vector.push[u32](?at.x.occ, t.data.generic_param.index);
+            if (sel pushed.err) { type_query.refused(at.x.q, pushed.err); }
+        }
+        ret visit.PRUNE;
+    }
+    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_TAG) {
+        if (!same_owner(at.x, tid, at.owner)) { ret visit.PRUNE; }
+        val table: opt[*type.FieldTable] = type.field_table_for(at.x.q.types, tid);
+        if (!sel table.some) { ret visit.PRUNE; }
+        ret visit.DESCEND;
+    }
+    if (t.kind == type.TYPE_POINTER || t.kind == type.TYPE_ARRAY || t.kind == type.TYPE_SECRET
+        || t.kind == type.TYPE_FUN || t.kind == type.TYPE_INSTANCE) {
+        ret visit.DESCEND;
+    }
+    ret visit.PRUNE;
+}
+
+fun occurrences(at: *Site, tid: type.TypeId) {
+    collections_vector.clear[u32](?at.x.occ);
+    var scan: type.TypeScan;
+    if (!type_query.scan_begin(at.x.q, ?scan)) { ret; }
+    var w: visit.Walk[Site] = visit.Walk[Site]{types: at.x.q.types, status: at.x.q.status, scan: ?scan,
+        edges: visit.EDGES_SPELLING | visit.EDGE_FIELD, ctx: at, leaf: occurrence_leaf};
+    visit.reaches[Site](?w, tid);
+    type_query.scan_end(at.x.q, ?scan);
+}
+
+# whether `arg` is parameter `param` of `owner` itself, a `^` around it included
+fun arg_is_param(x: *Graph, arg: type.TypeId, owner: *type.GenericOwner, param: u32) bool {
+    val t: opt[*type.Type] = type.get(x.q.types, type.strip_secret(x.q.types, arg));
+    if (!sel t.some)                              { ret false; }
+    if (t.some.kind != type.TYPE_GENERIC_PARAM)   { ret false; }
+    if (t.some.data.generic_param.index != param) { ret false; }
+    ret type.param_owned_by(?t.some.data.generic_param, owner);
+}
+
+# the edges an instance mention in the body's fields adds: from each parameter of the
+# body that an argument mentions to that argument's parameter of the target
+fun instance_edges(at: *Site, t: *type.Type) {
+    val x:      *Graph      = at.x;
+    val target: type.TypeId = t.data.instance.nominal;
+    var j:      u32         = 0;
+    for (j < t.data.instance.args_len) {
+        val arg: opt[type.TypeId] = type.get_param(x.q.types, t.data.instance.args_start + j);
+        if (sel arg.some) {
+            occurrences(at, arg.some);
+            var k: usize = 0;
+            for (k < x.occ.len) {
+                val param: u32 = x.occ.data[k];
+                var edge:  Edge;
+                edge.from  = node_of(x, at.body, param);
+                edge.to    = node_of(x, target, j);
+                edge.grows = !arg_is_param(x, arg.some, at.owner, param);
+                if (edge.from == NO_NODE || edge.to == NO_NODE) { ret; }
+                val pushed: res[usize, A.Error] = collections_vector.push[Edge](?x.edges, edge);
+                if (sel pushed.err) {
+                    type_query.refused(x.q, pushed.err);
+                    ret;
+                }
+                body_enqueue(x, target);
+                k = k + 1;
+            }
+        }
+        j = j + 1;
+    }
+}
+
+fun edge_leaf(at: *Site, tid: type.TypeId, t: *type.Type) visit.Verdict {
+    if (t.kind == type.TYPE_INSTANCE) {
+        instance_edges(at, t);
+        ret visit.DESCEND;
+    }
+    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_TAG) {
+        if (!same_owner(at.x, tid, at.owner)) { ret visit.PRUNE; }
+        val table: opt[*type.FieldTable] = type.field_table_for(at.x.q.types, tid);
+        if (!sel table.some) {
+            at.x.incomplete = true;
+            ret visit.PRUNE;
+        }
+        ret visit.DESCEND;
+    }
+    if (t.kind == type.TYPE_POINTER || t.kind == type.TYPE_ARRAY || t.kind == type.TYPE_SECRET
+        || t.kind == type.TYPE_FUN) {
+        ret visit.DESCEND;
+    }
+    ret visit.PRUNE;
+}
+
+# the edges out of `body`'s parameters that its fields add
+fun body_edges(x: *Graph, body: type.TypeId, owner: *type.GenericOwner) {
+    var at:   Site = Site{x: x, body: body, owner: owner};
+    var scan: type.TypeScan;
+    if (!type_query.scan_begin(x.q, ?scan)) { ret; }
+    var w: visit.Walk[Site] = visit.Walk[Site]{types: x.q.types, status: x.q.status, scan: ?scan,
+        edges: visit.EDGES_SPELLING | visit.EDGE_FIELD, ctx: ?at, leaf: edge_leaf};
+    visit.reaches[Site](?w, body);
+    type_query.scan_end(x.q, ?scan);
+}
+
+fun node_push(x: *Graph, v: *Vector[u32], value: u32) bool {
+    val pushed: res[usize, A.Error] = collections_vector.push[u32](v, value);
+    if (sel pushed.err) {
+        type_query.refused(x.q, pushed.err);
+        ret false;
+    }
+    ret true;
+}
+
+fun flag_push(x: *Graph, v: *Vector[bool]) bool {
+    val pushed: res[usize, A.Error] = collections_vector.push[bool](v, false);
+    if (sel pushed.err) {
+        type_query.refused(x.q, pushed.err);
+        ret false;
+    }
+    ret true;
+}
+
+# the strongly connected components of the graph's nodes; `comp` gets each node's
+# component and the result is the component count
+fun components(x: *Graph, comp: *u32) u32 {
+    var arcs: Vector[scc.Arc] = collections_vector.init[scc.Arc](x.q.types.a);
+    fin { collections_vector.dnit[scc.Arc](?arcs); }
+    var i: usize = 0;
+    for (i < x.edges.len) {
+        val pushed: res[usize, A.Error] = collections_vector.push[scc.Arc](?arcs, scc.Arc{from: x.edges.data[i].from, to: x.edges.data[i].to});
+        if (sel pushed.err) {
+            type_query.refused(x.q, pushed.err);
+            ret 0;
+        }
+        i = i + 1;
+    }
+    val comps: res[u32, fail.Fail] = scc.components(x.q.types.a, x.nodes.len::u32, arcs.data, arcs.len::u32, comp);
+    if (sel comps.err) {
+        type_query.failed(x.q, comps.err);
+        ret 0;
+    }
+    ret comps.ok;
+}
+
+# walks every queued generic's fields, queueing what they flow into, then decides each
+# one met: expansive when one of its parameters sits in a component holding a growing
+# edge. a component is closed under the walk, so each decision is exact; the queue order
+# makes the graph deterministic
+fun analyze(x: *Graph, decided: *Vector[type.TypeId], expansive: *Vector[bool]) {
+    val q: *type_query.Query = x.q;
+
+    var next: usize = 0;
+    for (next < x.work.len) {
+        val body: type.TypeId            = x.work.data[next];
+        val of:   opt[type.GenericOwner] = mention.owner(q, body);
+        if (sel of.some) {
+            var owner: type.GenericOwner = of.some;
+            body_edges(x, body, ?owner);
+        }
+        or {
+            val table: opt[*type.FieldTable] = type.field_table_for(q.types, body);
+            if (sel table.none) { x.incomplete = true; }
+        }
+        if (sel q.status.kind.internal) { ret; }
+        next = next + 1;
+    }
+
+    val n:        u32          = x.nodes.len::u32;
+    var grows_of: Vector[bool] = collections_vector.init[bool](q.types.a);
+    var comp_of:  Vector[u32]  = collections_vector.init[u32](q.types.a);
+    fin {
+        collections_vector.dnit[bool](?grows_of);
+        collections_vector.dnit[u32](?comp_of);
+    }
+    var v: u32 = 0;
+    for (v < n) {
+        if (!node_push(x, ?comp_of, NO_NODE)) { ret; }
+        v = v + 1;
+    }
+    var comps: u32 = 0;
+    if (n > 0)                      { comps = components(x, comp_of.data); }
+    if (sel q.status.kind.internal) { ret; }
+    var c: u32 = 0;
+    for (c < comps) {
+        if (!flag_push(x, ?grows_of)) { ret; }
+        c = c + 1;
+    }
+    var i: usize = 0;
+    for (i < x.edges.len) {
+        val edge: *Edge = ?x.edges.data[i];
+        if (edge.grows && comp_of.data[edge.from] == comp_of.data[edge.to]) { grows_of.data[comp_of.data[edge.from]] = true; }
+        i = i + 1;
+    }
+
+    var b: usize = 0;
+    for (b < x.work.len) {
+        val pushed: res[usize, A.Error] = collections_vector.push[type.TypeId](decided, x.work.data[b]);
+        if (sel pushed.err) {
+            type_query.refused(q, pushed.err);
+            ret;
+        }
+        val flagged: res[usize, A.Error] = collections_vector.push[bool](expansive, false);
+        if (sel flagged.err) {
+            type_query.refused(q, flagged.err);
+            ret;
+        }
+        b = b + 1;
+    }
+    var w: u32 = 0;
+    for (w < n) {
+        if (grows_of.data[comp_of.data[w]]) {
+            var d: usize = 0;
+            for (d < decided.len) {
+                if (type.same(decided.data[d], x.nodes.data[w])) { expansive.data[d] = true; }
+                d = d + 1;
+            }
+        }
+        w = w + 1;
+    }
+}
+
+# whether generic nominal `generic` lies on an instantiation cycle that grows an
+# argument, so it has unboundedly many instances; true, with nothing recorded, when a
+# generic the cycle could pass through has no fields yet
+pub fun nominal(q: *type_query.Query, generic: type.TypeId) bool {
+    val prior: opt[bool] = type_query.expansive_get(q, generic);
+    if (sel prior.some) { ret prior.some; }
+
+    var x:         Graph               = graph_init(q);
+    var decided:   Vector[type.TypeId] = collections_vector.init[type.TypeId](q.types.a);
+    var expansive: Vector[bool]        = collections_vector.init[bool](q.types.a);
+    fin {
+        graph_dnit(?x);
+        collections_vector.dnit[type.TypeId](?decided);
+        collections_vector.dnit[bool](?expansive);
+    }
+    body_enqueue(?x, generic);
+    analyze(?x, ?decided, ?expansive);
+    if (sel q.status.kind.internal) { ret true; }
+    if (x.incomplete)               { ret true; }
+    var d: usize = 0;
+    for (d < decided.len) {
+        type_query.expansive_set(q, decided.data[d], expansive.data[d]);
+        d = d + 1;
+    }
+    val now: opt[bool] = type_query.expansive_get(q, generic);
+    if (sel now.some) { ret now.some; }
+    ret true;
+}
+
+fun held_leaf(q: *type_query.Query, tid: type.TypeId, t: *type.Type) visit.Verdict {
+    if (t.kind == type.TYPE_SECRET || t.kind == type.TYPE_ARRAY) { ret visit.DESCEND; }
+    if (t.kind != type.TYPE_REC && t.kind != type.TYPE_UNI && t.kind != type.TYPE_TAG && t.kind != type.TYPE_INSTANCE) {
+        ret visit.PRUNE;
+    }
+    if (t.kind == type.TYPE_INSTANCE) {
+        if (nominal(q, t.data.instance.nominal)) { ret visit.FOUND; }
+        subst.ensure(q, tid);
+    }
+    val table: opt[*type.FieldTable] = type.field_table_for(q.types, tid);
+    if (!sel table.some) { ret visit.PRUNE; }
+    ret visit.DESCEND;
+}
+
+# whether `tid` holds, by value, an instance of an expansive generic
+pub fun holds(q: *type_query.Query, tid: type.TypeId) bool {
+    var scan: type.TypeScan;
+    if (!type_query.scan_begin(q, ?scan)) { ret true; }
+    var w: visit.Walk[type_query.Query] = visit.Walk[type_query.Query]{types: q.types, status: q.status, scan: ?scan,
+        edges: visit.EDGES_VALUE, ctx: q, leaf: held_leaf};
+    val found: bool = visit.reaches[type_query.Query](?w, tid);
+    type_query.scan_end(q, ?scan);
+    ret found;
+}
+
+# whether `tid` is an instance of an expansive generic
+pub fun instance_is(types: *type.TypeInterner, facts: *type_query.Facts, tid: type.TypeId) res[bool, fail.Fail] {
+    var status: fail.PhaseStatus = fail.accepted();
+    var q:      type_query.Query = type_query.Query{types: types, facts: facts, status: ?status};
+    val t:      opt[*type.Type]  = type.get(types, tid);
+    if (!sel t.some)                       { ret res[bool, fail.Fail].err{fail.message("expansive: the store holds no such type id")}; }
+    if (t.some.kind != type.TYPE_INSTANCE) { ret res[bool, fail.Fail].ok{false}; }
+    ret type_query.answer[bool](?q, nominal(?q, t.some.data.instance.nominal));
+}
+
+# whether `tid` holds, by value, an instance of an expansive generic
+pub fun holds_instance(types: *type.TypeInterner, facts: *type_query.Facts, tid: type.TypeId) res[bool, fail.Fail] {
+    var status: fail.PhaseStatus = fail.accepted();
+    var q:      type_query.Query = type_query.Query{types: types, facts: facts, status: ?status};
+    ret type_query.answer[bool](?q, holds(?q, tid));
+}
+
+# `rec L[T] { next: *L[*T]; }`: undecided while L has no fields, decided once they exist,
+# and dropped with the projection the decision was read from
+test nominal__decided_once_fields_exist_and_dropped_with_the_projection {
+    var alloc: A.Allocator;
+    val made:  err[A.Error] = page.make(?alloc);
+    if (sel made.err) { ret 1; }
+    var types:  type.TypeInterner;
+    val opened: err[fail.Fail] = type.init(?types, ?alloc);
+    if (sel opened.err) { ret 1; }
+    var facts: type_query.Facts = type_query.facts_init(?alloc);
+    fin {
+        type_query.facts_dnit(?facts);
+        type.dnit(?types);
+    }
+    var status: fail.PhaseStatus = fail.accepted();
+    var q:      type_query.Query = type_query.Query{types: ?types, facts: ?facts, status: ?status};
+
+    val at:  type.TypeOwner              = type.TypeOwner{module: module.stable_id(3), file: lang_source.file_id(1)};
+    val l_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?types, intern.str_id(10), at, type.TYPE_REC);
+    if (sel l_r.err) { ret 1; }
+    val l: type.TypeId = l_r.ok;
+
+    if (!nominal(?q, l)) { ret 2; }
+    val unfielded: opt[bool] = type_query.expansive_get(?q, l);
+    if (sel unfielded.some) { ret 3; }
+
+    val t_r: res[type.TypeId, fail.Fail] = type.intern_generic_param(?types, intern.str_id(1), at, intern.str_id(10), type.TYPE_REC, 0);
+    if (sel t_r.err) { ret 4; }
+    var arg: [1]type.TypeId;
+    val pt:  res[type.TypeId, fail.Fail] = type.intern_pointer(?types, t_r.ok);
+    if (sel pt.err) { ret 4; }
+    arg[0] = pt.ok;
+    val inst: res[type.TypeId, fail.Fail] = type.intern_instance(?types, l, ?arg[0], 1);
+    if (sel inst.err) { ret 4; }
+    val next: res[type.TypeId, fail.Fail] = type.intern_pointer(?types, inst.ok);
+    if (sel next.err) { ret 4; }
+    val staged: res[u32, fail.Fail] = type.field_table_stage(?types, 1);
+    if (sel staged.err) { ret 4; }
+    val pushed: err[fail.Fail] = type.field_table_stage_push(?types, intern.str_id(2), next.ok);
+    if (sel pushed.err) { ret 4; }
+    val published: err[fail.Fail] = type.field_table_publish(?types, l, staged.ok, 1);
+    if (sel published.err) { ret 4; }
+
+    if (!nominal(?q, l)) { ret 5; }
+    val decided: opt[bool] = type_query.expansive_get(?q, l);
+    if (!sel decided.some)        { ret 6; }
+    if (!decided.some)            { ret 6; }
+    if (sel status.kind.internal) { ret 7; }
+
+    type.field_projection_reset(?types);
+    val dropped: opt[bool] = type_query.expansive_get(?q, l);
+    if (sel dropped.some) { ret 8; }
+    ret 0;
+}

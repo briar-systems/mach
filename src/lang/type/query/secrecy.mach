@@ -1,0 +1,397 @@
+# whether two types laid over one storage keep every byte's secrecy class: a cast or
+# retype from one to the other, or two union variants
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.string.str;
+
+use mach.lang.fail;
+use mach.lang.layout;
+use mach.lang.session;
+use mach.lang.type;
+use type_query: mach.lang.type.query;
+use mach.lang.type.query.deep;
+use mach.lang.type.query.expansive;
+use mach.lang.type.query.extent;
+
+# one run of bytes of the same secrecy class, as offsets into the type's storage;
+# a pointer run carries the stripped pointer type whose target it reaches
+rec Run {
+    start:    u32;
+    end:      u32;
+    ptr:      bool;
+    secret:   bool;
+    conflict: bool;
+    leaf:     type.TypeId;
+}
+
+rec Comparison {
+    mz:   *extent.Measure;
+    m:    layout.Machine;
+    scan: *type.PairScan;
+    # the walk met two pointees it cannot compare, which no answer can settle
+    unbounded: bool;
+}
+
+# how two storages compare on secrecy: they agree, they disagree, or the
+# comparison would follow pointers into an expansive generic, whose instances
+# are unbounded, so it cannot be decided and is refused
+pub def Agreement: u8;
+
+pub val AGREE:       Agreement = 0;
+pub val DISAGREE:    Agreement = 1;
+pub val UNDECIDABLE: Agreement = 2;
+
+fun agreement_of(agree: bool, unbounded: bool) Agreement {
+    if (agree)     { ret AGREE; }
+    if (unbounded) { ret UNDECIDABLE; }
+    ret DISAGREE;
+}
+
+# a pointee pair the walk can compare: equal ones need no walk, and distinct ones
+# holding an expansive instance would mint a fresh pair below every pointer
+fun pointees_bounded(w: *Comparison, a: type.TypeId, b: type.TypeId) bool {
+    if (type.same(a, b)) { ret true; }
+    val holds: bool = expansive.holds(w.mz.q, a) || expansive.holds(w.mz.q, b);
+    if (holds) { w.unbounded = true; }
+    ret !holds;
+}
+
+fun data_run(start: u32, end: u32, secret: bool) Run {
+    ret Run{start: start, end: end, ptr: false, secret: secret, conflict: false, leaf: type.TYPE_NIL};
+}
+
+# a byte the walk cannot classify; it agrees with nothing
+fun conflict_run(off: u32) Run {
+    ret Run{start: off, end: off + 1, ptr: false, secret: false, conflict: true, leaf: type.TYPE_NIL};
+}
+
+fun shift_run(r: Run, by: u32) Run {
+    var out: Run = r;
+    out.start = r.start + by;
+    out.end   = r.end + by;
+    ret out;
+}
+
+# the run of `tid` that holds byte `off`; padding is public, and an array of one
+# data class is a single run
+fun secrecy_run_at(w: *Comparison, tid: type.TypeId, inherited: bool, off: u32, depth: u32) Run {
+    if (depth > extent.MAX_DEPTH) { ret conflict_run(off); }
+
+    val secret: bool          = inherited || type.is_secret(w.mz.q.types, tid);
+    val base:   type.TypeId   = type.strip_secret(w.mz.q.types, tid);
+    val e:      layout.Extent = extent.size(w.mz, w.m, base);
+    if (!e.ok || off >= e.size) { ret conflict_run(off); }
+    val n: layout.Node = extent.describe(w.mz, base::u32);
+
+    if (n.kind == layout.NODE_SCALAR || n.kind == layout.NODE_VECTOR || n.kind == layout.NODE_OPAQUE) {
+        ret data_run(0, e.size, secret);
+    }
+    if (n.kind == layout.NODE_POINTER) {
+        ret Run{start: 0, end: e.size, ptr: true, secret: secret, conflict: false, leaf: base};
+    }
+
+    if (n.kind == layout.NODE_ARRAY) {
+        val child: type.TypeId   = n.child::type.TypeId;
+        val ce:    layout.Extent = extent.size(w.mz, w.m, type.strip_secret(w.mz.q.types, child));
+        if (!ce.ok || ce.size == 0) { ret conflict_run(off); }
+        val at:    u32 = (off / ce.size) * ce.size;
+        val inner: Run = secrecy_run_at(w, child, secret, off - at, depth + 1);
+        if (!inner.ptr && !inner.conflict && inner.start == 0 && inner.end == ce.size) {
+            ret data_run(at, e.size, inner.secret);
+        }
+        ret shift_run(inner, at);
+    }
+
+    if (n.kind == layout.NODE_TAG) {
+        val disc: u32 = n.bytes;
+        if (off < disc) { ret data_run(0, disc, false); }
+        val pe: layout.Extent = layout.field_offset_of[extent.Measure](w.mz, extent.describe, extent.field, base::u32, 0, w.m,
+            extent.MAX_DEPTH);
+        if (!pe.ok)        { ret conflict_run(off); }
+        if (off < pe.size) { ret data_run(disc, pe.size, false); }
+        ret overlay_run_at(w, base, n.field_count, pe.size, e.size, secret, off, depth);
+    }
+
+    if (n.kind == layout.NODE_AGGREGATE && n.overlays) {
+        ret overlay_run_at(w, base, n.field_count, 0, e.size, secret, off, depth);
+    }
+
+    if (n.kind == layout.NODE_AGGREGATE) {
+        var offset:   u32 = 0;
+        var prev_end: u32 = 0;
+        var i:        u32 = 0;
+        for (i < n.field_count) {
+            val fty: type.TypeId   = extent.field(w.mz, base::u32, i)::type.TypeId;
+            val fe:  layout.Extent = extent.size(w.mz, w.m, type.strip_secret(w.mz.q.types, fty));
+            if (!fe.ok) { ret conflict_run(off); }
+            if (!n.packed) {
+                val aligned: layout.Extent = layout.checked_round_up(offset, fe.align);
+                if (!aligned.ok) { ret conflict_run(off); }
+                offset = aligned.size;
+            }
+            if (off < offset) { ret data_run(prev_end, offset, false); }
+            if (off < offset + fe.size) {
+                ret shift_run(secrecy_run_at(w, fty, secret, off - offset, depth + 1), offset);
+            }
+            offset   = offset + fe.size;
+            prev_end = offset;
+            i        = i + 1;
+        }
+        ret data_run(prev_end, e.size, false);
+    }
+
+    ret conflict_run(off);
+}
+
+# the variants of a union or tag payload overlay one storage from `at`; a byte
+# takes the class every variant covering it agrees on, and a conflict otherwise
+fun overlay_run_at(w: *Comparison, base: type.TypeId, count: u32, at: u32, size: u32, secret: bool,
+    off: u32, depth: u32) Run {
+    var covered:   bool = false;
+    var out:       Run  = data_run(at, size, false);
+    var uncovered: u32  = at;
+    var i:         u32  = 0;
+    for (i < count) {
+        val vty: type.TypeId   = extent.field(w.mz, base::u32, i)::type.TypeId;
+        val ve:  layout.Extent = extent.size(w.mz, w.m, type.strip_secret(w.mz.q.types, vty));
+        if (!ve.ok) { ret conflict_run(off); }
+        if (off < at + ve.size) {
+            val r: Run = shift_run(secrecy_run_at(w, vty, secret, off - at, depth + 1), at);
+            if (!covered) {
+                out     = r;
+                covered = true;
+            }
+            or {
+                out = merge_overlay_runs(w, out, r);
+            }
+        }
+        or (at + ve.size > uncovered) { uncovered = at + ve.size; }
+        i = i + 1;
+    }
+    if (!covered) { ret data_run(uncovered, size, false); }
+    ret out;
+}
+
+fun merge_overlay_runs(w: *Comparison, a: Run, b: Run) Run {
+    var out: Run = a;
+    if (b.start > out.start) { out.start = b.start; }
+    if (b.end < out.end)     { out.end = b.end; }
+    if (a.conflict || b.conflict || a.ptr != b.ptr || a.secret != b.secret) {
+        out.conflict = true;
+        ret out;
+    }
+    if (a.ptr && (a.start != b.start || a.end != b.end || !pointer_leaves_equal(w, a.leaf, b.leaf))) {
+        out.conflict = true;
+    }
+    ret out;
+}
+
+# a run that holds no secret and reaches none
+fun run_is_public(w: *Comparison, r: Run) bool {
+    if (r.conflict || r.secret) { ret false; }
+    if (!r.ptr)                 { ret true; }
+    ret !deep.secret(w.mz.q, r.leaf);
+}
+
+fun runs_agree(w: *Comparison, a: Run, b: Run) bool {
+    if (a.conflict || b.conflict) { ret false; }
+    if (!a.ptr && !b.ptr)         { ret a.secret == b.secret; }
+    if (a.ptr && b.ptr && a.start == b.start && a.end == b.end) {
+        ret a.secret == b.secret && pointer_leaves_equal(w, a.leaf, b.leaf);
+    }
+    ret run_is_public(w, a) && run_is_public(w, b);
+}
+
+# beneath a pointer the target is shared storage, so the two targets must match
+# both ways: equal extent and the same class at every byte
+fun pointer_leaves_equal(w: *Comparison, a: type.TypeId, b: type.TypeId) bool {
+    if (!deep.secret(w.mz.q, a) && !deep.secret(w.mz.q, b)) { ret true; }
+
+    val oa: opt[*type.Type] = type.get(w.mz.q.types, a);
+    val ob: opt[*type.Type] = type.get(w.mz.q.types, b);
+    if (!sel oa.some) { ret false; }
+    if (!sel ob.some) { ret false; }
+    val ta: *type.Type = oa.some;
+    val tb: *type.Type = ob.some;
+
+    if (ta.kind == type.TYPE_POINTER && tb.kind == type.TYPE_POINTER) {
+        if (!pointees_bounded(w, ta.data.pointer.base, tb.data.pointer.base)) { ret false; }
+        ret storage_equal(w, ta.data.pointer.base, tb.data.pointer.base);
+    }
+    if (ta.kind == type.TYPE_FUN && tb.kind == type.TYPE_FUN) {
+        if (ta.data.fn.params_len != tb.data.fn.params_len)              { ret false; }
+        if (!storage_equal(w, ta.data.fn.ret_type, tb.data.fn.ret_type)) { ret false; }
+        var pi: u32 = 0;
+        for (pi < ta.data.fn.params_len) {
+            val pa: opt[type.TypeId] = type.get_param(w.mz.q.types, ta.data.fn.params_start + pi);
+            val pb: opt[type.TypeId] = type.get_param(w.mz.q.types, tb.data.fn.params_start + pi);
+            if (!sel pa.some)                        { ret false; }
+            if (!sel pb.some)                        { ret false; }
+            if (!storage_equal(w, pa.some, pb.some)) { ret false; }
+            pi = pi + 1;
+        }
+        ret true;
+    }
+    ret false;
+}
+
+fun storage_equal(w: *Comparison, a: type.TypeId, b: type.TypeId) bool {
+    if (type.is_nil(a) || type.is_nil(b))                   { ret type.same(a, b); }
+    if (type.same(a, b))                                    { ret true; }
+    if (!deep.secret(w.mz.q, a) && !deep.secret(w.mz.q, b)) { ret true; }
+
+    val mark_r: res[type.VisitMark, fail.Fail] = type.pair_scan_mark(w.mz.q.types, w.scan, a, b);
+    if (sel mark_r.err) {
+        type_query.failed(w.mz.q, mark_r.err);
+        ret false;
+    }
+    if (mark_r.ok == type.VISIT_SEEN) { ret true; }
+
+    val ea: layout.Extent = extent.size(w.mz, w.m, type.strip_secret(w.mz.q.types, a));
+    val eb: layout.Extent = extent.size(w.mz, w.m, type.strip_secret(w.mz.q.types, b));
+    if (!ea.ok || !eb.ok || ea.size != eb.size) { ret false; }
+    ret agree_below(w, a, b, ea.size);
+}
+
+# every byte below `limit`, which both types cover, has one class on both sides
+fun agree_below(w: *Comparison, a: type.TypeId, b: type.TypeId, limit: u32) bool {
+    var pos: u32 = 0;
+    for (pos < limit) {
+        val ra: Run = secrecy_run_at(w, a, false, pos, 0);
+        val rb: Run = secrecy_run_at(w, b, false, pos, 0);
+        if (sel w.mz.q.status.kind.internal) { ret false; }
+        if (!runs_agree(w, ra, rb))          { ret false; }
+        var next: u32 = ra.end;
+        if (rb.end < next) { next = rb.end; }
+        pos = next;
+    }
+    ret true;
+}
+
+# the one data class that holds every byte of the type; none for a type with no
+# bytes, a pointer or a byte of mixed class
+fun single_class(w: *Comparison, tid: type.TypeId, size: u32) opt[bool] {
+    if (size == 0) { ret opt[bool].none{}; }
+    val first: Run = secrecy_run_at(w, tid, false, 0, 0);
+    if (first.ptr || first.conflict) { ret opt[bool].none{}; }
+    var pos: u32 = first.end;
+    for (pos < size) {
+        val r: Run = secrecy_run_at(w, tid, false, pos, 0);
+        if (r.ptr || r.conflict || r.secret != first.secret) { ret opt[bool].none{}; }
+        pos = r.end;
+    }
+    ret opt[bool].some{first.secret};
+}
+
+# a `*S` retyped as `*T`: the bytes both cover keep their class, a narrowing is
+# accepted, and a widening only when `S` and `T` are one and the same class throughout
+fun retype_allowed(w: *Comparison, from: type.TypeId, to: type.TypeId) bool {
+    val ef: layout.Extent = extent.size(w.mz, w.m, type.strip_secret(w.mz.q.types, from));
+    val et: layout.Extent = extent.size(w.mz, w.m, type.strip_secret(w.mz.q.types, to));
+    if (!ef.ok || !et.ok) { ret false; }
+
+    var common: u32 = ef.size;
+    if (et.size < common)                  { common = et.size; }
+    if (!agree_below(w, from, to, common)) { ret false; }
+    if (et.size <= ef.size)                { ret true; }
+
+    val cf: opt[bool] = single_class(w, from, ef.size);
+    val ct: opt[bool] = single_class(w, to, et.size);
+    if (!sel cf.some) { ret false; }
+    if (!sel ct.some) { ret false; }
+    ret cf.some == ct.some;
+}
+
+fun is_data_leaf(mz: *extent.Measure, tid: type.TypeId) bool {
+    val n: layout.Node = extent.describe(mz, type.strip_secret(mz.q.types, tid)::u32);
+    ret n.kind == layout.NODE_SCALAR || n.kind == layout.NODE_VECTOR;
+}
+
+fun cast_walk(mz: *extent.Measure, m: layout.Machine, from: type.TypeId, to: type.TypeId, unbounded: *bool) bool {
+    if (!deep.secret(mz.q, from) && !deep.secret(mz.q, to)) { ret true; }
+
+    var scan:   type.PairScan;
+    val opened: err[fail.Fail] = type.pair_scan_begin(mz.q.types, ?scan);
+    if (sel opened.err) {
+        type_query.failed(mz.q, opened.err);
+        ret false;
+    }
+    var w: Comparison = Comparison{mz: mz, m: m, scan: ?scan, unbounded: false};
+
+    val sf:      type.TypeId     = type.strip_secret(mz.q.types, from);
+    val st:      type.TypeId     = type.strip_secret(mz.q.types, to);
+    val of:      opt[*type.Type] = type.get(mz.q.types, sf);
+    val ot:      opt[*type.Type] = type.get(mz.q.types, st);
+    var allowed: bool            = false;
+    if (sel of.some) {
+        if (sel ot.some) {
+            val same: bool = type.is_secret(mz.q.types, from) == type.is_secret(mz.q.types, to);
+            if (of.some.kind == type.TYPE_POINTER && ot.some.kind == type.TYPE_POINTER) {
+                allowed = same && retype_allowed(?w, of.some.data.pointer.base, ot.some.data.pointer.base);
+            }
+            or (is_data_leaf(mz, from) && is_data_leaf(mz, to)) {
+                allowed = same;
+            }
+            or {
+                allowed = overlay_agrees_walk(?w, from, to);
+            }
+        }
+    }
+    type.pair_scan_end(mz.q.types, ?scan);
+    @unbounded = w.unbounded;
+    ret allowed;
+}
+
+fun overlay_agrees_walk(w: *Comparison, a: type.TypeId, b: type.TypeId) bool {
+    val ea: layout.Extent = extent.size(w.mz, w.m, type.strip_secret(w.mz.q.types, a));
+    val eb: layout.Extent = extent.size(w.mz, w.m, type.strip_secret(w.mz.q.types, b));
+    if (!ea.ok || !eb.ok) { ret false; }
+    var common: u32 = ea.size;
+    if (eb.size < common) { common = eb.size; }
+    ret agree_below(w, a, b, common);
+}
+
+# two types laid over one storage from offset 0, as union variants are: every
+# byte both cover has one class on both sides
+fun overlay_walk(mz: *extent.Measure, m: layout.Machine, a: type.TypeId, b: type.TypeId, unbounded: *bool) bool {
+    if (!deep.secret(mz.q, a) && !deep.secret(mz.q, b)) { ret true; }
+
+    var scan:   type.PairScan;
+    val opened: err[fail.Fail] = type.pair_scan_begin(mz.q.types, ?scan);
+    if (sel opened.err) {
+        type_query.failed(mz.q, opened.err);
+        ret false;
+    }
+    var w:     Comparison = Comparison{mz: mz, m: m, scan: ?scan, unbounded: false};
+    val agree: bool       = overlay_agrees_walk(?w, a, b);
+    type.pair_scan_end(mz.q.types, ?scan);
+    @unbounded = w.unbounded;
+    ret agree;
+}
+
+pub val UNBOUNDED_VARIANTS_MSG: str = "union variants: cannot prove that overlapping fields agree on secrecy - they point into a generic whose argument grows through a pointer, which has unboundedly many instances, so the storage below the pointers cannot be compared";
+pub val UNBOUNDED_CAST_MSG:     str = "cannot prove that the two types agree on secrecy - they point into a generic whose argument grows through a pointer, which has unboundedly many instances, so the storage below the pointers cannot be compared";
+
+# whether a `::` or `:~` from `from` to `to` keeps every byte's secrecy class
+pub fun cast_allowed(s: *session.Session, m: layout.Machine, from: type.TypeId, to: type.TypeId) res[Agreement, fail.Fail] {
+    var status:    fail.PhaseStatus = fail.accepted();
+    var q:         type_query.Query = type_query.Query{types: ?s.types, facts: ?s.type_facts, status: ?status};
+    var mz:        extent.Measure   = extent.Measure{q: ?q, s: s};
+    var unbounded: bool             = false;
+    val allowed:   bool             = cast_walk(?mz, m, from, to, ?unbounded);
+    ret type_query.answer[Agreement](?q, agreement_of(allowed, unbounded));
+}
+
+# whether two union variants overlaying one storage agree on every byte they share
+pub fun overlay_agrees(s: *session.Session, m: layout.Machine, a: type.TypeId, b: type.TypeId) res[Agreement, fail.Fail] {
+    var status:    fail.PhaseStatus = fail.accepted();
+    var q:         type_query.Query = type_query.Query{types: ?s.types, facts: ?s.type_facts, status: ?status};
+    var mz:        extent.Measure   = extent.Measure{q: ?q, s: s};
+    var unbounded: bool             = false;
+    val agree:     bool             = overlay_walk(?mz, m, a, b, ?unbounded);
+    ret type_query.answer[Agreement](?q, agreement_of(agree, unbounded));
+}
