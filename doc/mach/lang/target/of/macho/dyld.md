@@ -107,7 +107,7 @@ text_va: u64, pz: u32) usize;
 
 ```mach
 pub fun patch_macho_fixups(buf: *u8, arch_id: u32, lay: *MachoDynLayout, dyn: *target_of.DynamicInfo,
-fixups: *target_of.PltFixup, fixup_count: u32, seg_offsets: *usize,
+fixups: *target_of.ImportFixup, fixup_count: u32, seg_offsets: *usize,
 segs: *target_of.LoadSegment, seg_count: u32, nimp: u32) err[fail.Fail];
 ```
 

@@ -975,17 +975,14 @@ layout: the bytes of their own frame descriptions, which the frames table
 carries first, the entries among them that describe a function, and the
 functions their unwind index describes
 
-## rec PltFixup
+## rec ImportFixup
 
 ```mach
-pub rec PltFixup;
+pub rec ImportFixup;
 ```
 
-## rec ImportAddrFixup
-
-```mach
-pub rec ImportAddrFixup;
-```
+a site in the image the loader's binding of an import completes: a call
+through the import's stub, or a load of its address
 
 ## rec LoadSection
 
@@ -1307,6 +1304,36 @@ pub rec RelocationCapabilities;
 ```mach
 pub rec ObjectTarget;
 ```
+
+## def ObjectEmitFn
+
+```mach
+pub def ObjectEmitFn: fun(*ObjectTarget, *ObjectImage, *of_destination.Destination) err[fail.Fail]
+```
+
+## rec LinkedImage
+
+```mach
+pub rec LinkedImage;
+```
+
+what the linker hands an image writer: the laid-out image and everything the
+format records about it, the same record for every product and format
+
+product: an executable or a shared library
+dynamic: what the loader binds, nil for an image it binds nothing in
+exports: what a shared library offers its users
+name: the product's name, which a format may record in the image
+library_name: the file name a loader finds a shared library by, empty for
+              an executable
+
+## def ImageEmitFn
+
+```mach
+pub def ImageEmitFn: fun(*LinkedImage, *of_destination.Destination) err[fail.Fail]
+```
+
+writes a linked image's files into the destination
 
 ## rec ExecutableSectionLocation
 
