@@ -36,9 +36,9 @@ pub fun is_special(member: Member) bool;
 pub rec ArMember;
 ```
 
-## fun write_archive
+## fun write
 
 ```mach
-pub fun write_archive(alloc: *A.Allocator, members: *ArMember, count: u32, destination: str) err[fail.Fail];
+pub fun write(alloc: *A.Allocator, members: *ArMember, count: u32, dst: *of_destination.Destination) err[fail.Fail];
 ```
 

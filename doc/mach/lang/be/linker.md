@@ -9,10 +9,10 @@ destination: str, name: *u8, mode: catalog_artifact.Kind, pie: bool,
 image_options: target_of.ImageOptions) err[fail.Fail];
 ```
 
-## rec LinkedImage
+## rec CapturedImage
 
 ```mach
-pub rec LinkedImage;
+pub rec CapturedImage;
 ```
 
 ## fun link_images
