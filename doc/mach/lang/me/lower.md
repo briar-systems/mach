@@ -32,30 +32,6 @@ fwd lower_context.NormalObject
 
 forwards [`mach.lang.me.lower.context.NormalObject`](lower/context.md#rec-normalobject)
 
-## fwd lower_context.BindSweep
-
-```mach
-fwd lower_context.BindSweep
-```
-
-forwards [`mach.lang.me.lower.context.BindSweep`](lower/context.md#def-bindsweep)
-
-## fwd lower_context.SWEEP_NORMAL
-
-```mach
-fwd lower_context.SWEEP_NORMAL
-```
-
-forwards [`mach.lang.me.lower.context.SWEEP_NORMAL`](lower/context.md#val-sweep_normal)
-
-## fwd lower_context.SWEEP_TESTING
-
-```mach
-fwd lower_context.SWEEP_TESTING
-```
-
-forwards [`mach.lang.me.lower.context.SWEEP_TESTING`](lower/context.md#val-sweep_testing)
-
 ## fwd lower_context.ModuleScope
 
 ```mach
@@ -237,21 +213,4 @@ forwards [`mach.lang.me.lower.context.symbol_of`](lower/context.md#fun-symbol_of
 ```mach
 pub fun lower_module(req: *lower_context.LowerRequest) res[me_ir.Module, fail.Fail];
 ```
-
-## fun bind_constants
-
-```mach
-pub fun bind_constants(req: *lower_context.LowerRequest, sweep: lower_context.BindSweep) err[fail.Fail];
-```
-
-binds the module's constants for `sweep` and emits nothing (see context.BindSweep)
-
-## fun constants_pending
-
-```mach
-pub fun constants_pending(s: *session.Session, a: *ast.Ast, ctx: *comptime.ComptimeCtx, sweep: lower_context.BindSweep) bool;
-```
-
-a bind sweep over the module has work: a module-scope global of the sweep's kind
-whose constant is not bound yet, in any branch of a comptime `if`
 

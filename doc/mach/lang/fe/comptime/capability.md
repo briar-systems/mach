@@ -183,6 +183,7 @@ expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure
 ```mach
 pub fun semantic_name_capabilities[T](
 member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
+constant: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 ident: fun(*T, ast_id.ExprId) bool,
 expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail]) res[PhaseCapabilities[T], fail.Fail];
 ```
@@ -192,6 +193,7 @@ expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure
 ```mach
 pub fun semantic_type_capabilities[T](
 member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
+constant: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 type_: fun(*T, ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail],
 types: fun(*T) *type.TypeInterner,
 offset: fun(*T, u32, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
@@ -229,6 +231,12 @@ pub fun capabilities_have_member[T](ctx: *T, caps: PhaseCapabilities[T]) bool;
 
 ```mach
 pub fun capabilities_have_ident[T](ctx: *T, caps: PhaseCapabilities[T]) bool;
+```
+
+## fun capabilities_have_constant
+
+```mach
+pub fun capabilities_have_constant[T](ctx: *T, caps: PhaseCapabilities[T]) bool;
 ```
 
 ## fun capabilities_have_types
