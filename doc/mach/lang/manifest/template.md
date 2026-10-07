@@ -16,13 +16,13 @@ pub def Context: u8
 
 where a template is written, which decides the variables it may name
 
-## val CONTEXT_PROJECT_OUT
+## val CONTEXT_PROJECT_WORK
 
 ```mach
-pub val CONTEXT_PROJECT_OUT: Context = 0
+pub val CONTEXT_PROJECT_WORK: Context = 0
 ```
 
-`[project].out`
+`[project].work`
 
 ## val CONTEXT_ARTIFACT_OUT
 
@@ -138,7 +138,7 @@ dependency: the dependency whose default library requirements they are, "" for
 ## fun expand
 
 ```mach
-pub fun expand(alloc: *A.Allocator, tmpl: str, ctx: Context, project_out: str, v: *Values) res[str, fail.Fail];
+pub fun expand(alloc: *A.Allocator, tmpl: str, ctx: Context, project_work: str, v: *Values) res[str, fail.Fail];
 ```
 
 expand `tmpl`, written in `ctx`
@@ -146,16 +146,16 @@ expand `tmpl`, written in `ctx`
 alloc: owns the result and a refusal's text
 tmpl: the template
 ctx: where it is written
-project_out: the value of `{project.out}`
+project_work: the value of `{project.work}`
 v: the other values
 ret: the expansion; err for an unterminated group, a variable the
-             context does not admit or that does not exist, an artifact
-             outside `v.reqs` or one whose output is ambiguous
+              context does not admit or that does not exist, an artifact
+              outside `v.reqs` or one whose output is ambiguous
 
 ## fun path_expand
 
 ```mach
-pub fun path_expand(alloc: *A.Allocator, tmpl: str, ctx: Context, project_out: str, v: *Values, field: str) res[str, fail.Fail];
+pub fun path_expand(alloc: *A.Allocator, tmpl: str, ctx: Context, project_work: str, v: *Values, field: str) res[str, fail.Fail];
 ```
 
 `expand`, then require the result to be a canonical strict descendant of the

@@ -24,7 +24,7 @@ and the backend makes a flagged call a jump where the calling convention
 lets the callee take over the caller's frame.
 
 a debug annotation of a call's result is dropped with the call, so the
-variable reads as optimized out there; -g annotates and never decides
+variable reads as optimized out there; -d annotates and never decides
 
 ## val RECURSE
 

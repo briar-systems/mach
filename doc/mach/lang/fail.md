@@ -24,6 +24,21 @@ distinguishes the environment. `reported` is declared first so a zero
 failure is one that invents no text. an allocation refusal is internal; the
 compiler recovers from none of them at the site that met them
 
+## rec Fix
+
+```mach
+pub rec Fix;
+```
+
+a machine-applicable rewrite of the file a failure points into: the bytes at
+`at`, or at the failure's own place when `at` is the zero place, become
+`replacement`. a nil label is no fix. the label and the replacement share the
+failure's places' lifetime
+
+label: what the rewrite does, as a fix line names it
+at: the bytes it replaces
+replacement: the text it writes in their place
+
 ## rec Related
 
 ```mach
@@ -171,6 +186,26 @@ order, each copied through `a` as `at` copies a place; an unspanned place is
 skipped. a failure that already names related places keeps them, and one
 whose copy is refused is that refusal
 
+## fun with_fix
+
+```mach
+pub fun with_fix(f: Fail, label: str, s: opt[lang_source.Span], replacement: str) Fail;
+```
+
+the same failure carrying the rewrite `label` names, which replaces the span
+`s` of the file it points into, or the bytes it points at when `s` is nil, with
+`replacement`. a failure with no kind carries none, and one that already
+carries a fix keeps it
+
+## fun fix_of
+
+```mach
+pub fun fix_of(f: Fail) opt[Fix];
+```
+
+the rewrite a failure carries, none when it carries no fix. a resolved fix
+whose own place is the zero place is given the failure's place
+
 ## fun related_of
 
 ```mach
@@ -284,8 +319,8 @@ pub fun places_retain(a: *A.Allocator, f: Fail) res[Fail, A.Error];
 ```
 
 a copy of the failure whose places, its own path and every related place,
-are owned through `a`, its text left as it is; for a holder that keeps the
-text apart. released with `places_dnit`
+and its fix are owned through `a`, its text left as it is; for a holder that
+keeps the text apart. released with `places_dnit`
 
 ## fun places_dnit
 
@@ -301,8 +336,8 @@ release the places a failure owns through `a`, as `places_retain` made them
 pub fun without_places(f: Fail) Fail;
 ```
 
-the same failure pointing nowhere and naming no related place, for a holder
-whose places were released or never copied
+the same failure pointing nowhere, naming no related place and carrying no
+fix, for a holder whose places were released or never copied
 
 ## fun same_places
 

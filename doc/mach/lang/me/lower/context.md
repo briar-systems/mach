@@ -210,11 +210,21 @@ pub fun resolve_type_query(lc: *LowerContext, tid: u32, which: u8) res[opt[compt
 pub fun resolve_layout_intrinsic(lc: *LowerContext, eid: u32) res[opt[comptime.CTValue], comptime.EvalFail];
 ```
 
-## fun resolve_field_member
+## fun field_offset
 
 ```mach
-pub fun resolve_field_member(lc: *LowerContext, owner: u32, index: u32, pick: u8) res[opt[comptime.CTValue], comptime.EvalFail];
+pub fun field_offset(lc: *LowerContext, owner: u32, index: u32) res[opt[comptime.CTValue], comptime.EvalFail];
 ```
+
+a field descriptor's offset, from the layout lowering gives the owning type
+
+## fun type_store
+
+```mach
+pub fun type_store(lc: *LowerContext) *type.TypeInterner;
+```
+
+the type store a comptime evaluation during lowering reads
 
 ## fun begin_function
 

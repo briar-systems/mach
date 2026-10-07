@@ -319,6 +319,16 @@ pub fun line_bounds(file: *SourceFile, line: usize) opt[Span];
 
 the bytes of line `line` (from 1) without its line ending
 
+## fun line_break_len
+
+```mach
+pub fun line_break_len(c: u8, next: u8) usize;
+```
+
+the bytes of a line break that starts with byte `c`, `next` being the byte after it: a
+line feed, a carriage return and line feed, or a carriage return alone; 0 for any other
+byte. the one rule every line count follows
+
 ## fun lines_init
 
 ```mach

@@ -1,5 +1,8 @@
 # mach.lang.fe.sema.generics
 
+the instantiation of a generic the sema context names, and the checks each instance owes
+its type annotations
+
 ## fun instantiate
 
 ```mach
@@ -21,40 +24,6 @@ arg_count: u32,
 span: lang_source.Span) bool;
 ```
 
-## def Agreement
-
-```mach
-pub def Agreement: u8
-```
-
-how two storages compare on secrecy: they agree, they disagree, or the
-comparison would follow pointers into an expansive generic, whose instances
-are unbounded, so it cannot be decided and is refused
-
-## val AGREE
-
-```mach
-pub val AGREE:       Agreement = 0
-```
-
-## val DISAGREE
-
-```mach
-pub val DISAGREE:    Agreement = 1
-```
-
-## val UNDECIDABLE
-
-```mach
-pub val UNDECIDABLE: Agreement = 2
-```
-
-## fun check_annotation_uni_secrecy
-
-```mach
-pub fun check_annotation_uni_secrecy(sc: *sema_context.SemaContext, ast_tid: ast_id.TypeId);
-```
-
 ## fun check_annotation
 
 ```mach
@@ -63,117 +32,4 @@ pub fun check_annotation(sc: *sema_context.SemaContext, ast_tid: ast_id.TypeId);
 
 the checks an instance owes each type annotation it resolves, which no check of the
 generic declaration can answer before its parameters are known
-
-## fun check_annotation_handles
-
-```mach
-pub fun check_annotation_handles(sc: *sema_context.SemaContext, ast_tid: ast_id.TypeId);
-```
-
-a generic record, union or tag instantiated so that a field or payload holds a handle,
-directly or through a pointer, array or secret: the instance is the declaration its
-arguments spell, and the same declaration written out is refused for that field. a
-pointer to a pointer to a handle is refused at the annotation that spells or forms it
-
-## fun substitute
-
-```mach
-pub fun substitute(s: *session.Session, body_type: type.TypeId, who: *type.GenericOwner, args: *type.TypeId, arg_count: u32) res[type.TypeId, fail.Fail];
-```
-
-replace `who`'s parameters in `body_type` with `args`, position for position;
-a parameter of any other declaration (an enclosing generic's, in an open
-instance) stays, so a substituted type reads as the identity under a second pass
-
-## fun ensure_fields
-
-```mach
-pub fun ensure_fields(s: *session.Session, tid: type.TypeId) err[fail.Fail];
-```
-
-## fun contains_secret_deep
-
-```mach
-pub fun contains_secret_deep(s: *session.Session, tid: type.TypeId) res[bool, fail.Fail];
-```
-
-## fun contains_float_deep
-
-```mach
-pub fun contains_float_deep(s: *session.Session, tid: type.TypeId) res[bool, fail.Fail];
-```
-
-## fun type_extent
-
-```mach
-pub fun type_extent(s: *session.Session, m: layout.Machine, tid: type.TypeId) res[layout.Extent, fail.Fail];
-```
-
-## fun type_field_offset
-
-```mach
-pub fun type_field_offset(s: *session.Session, m: layout.Machine, tid: type.TypeId, field_ix: u32) res[layout.Extent, fail.Fail];
-```
-
-the byte offset of a record field or tag payload from the same checked layout that sizes the type;
-`size` carries the offset when `ok`
-
-## fun secrecy_cast_allowed
-
-```mach
-pub fun secrecy_cast_allowed(s: *session.Session, m: layout.Machine, from: type.TypeId, to: type.TypeId) res[Agreement, fail.Fail];
-```
-
-whether a `::` or `:~` from `from` to `to` keeps every byte's secrecy class
-
-## fun secrecy_overlay_agrees
-
-```mach
-pub fun secrecy_overlay_agrees(s: *session.Session, m: layout.Machine, a: type.TypeId, b: type.TypeId) res[Agreement, fail.Fail];
-```
-
-whether two union variants overlaying one storage agree on every byte they share
-
-## val UNBOUNDED_VARIANTS_MSG
-
-```mach
-pub val UNBOUNDED_VARIANTS_MSG: str = "union variants: cannot prove that overlapping fields agree on secrecy - they point into a generic whose argument grows through a pointer, which has unboundedly many instances, so the storage below the pointers cannot be compared"
-```
-
-## val UNBOUNDED_CAST_MSG
-
-```mach
-pub val UNBOUNDED_CAST_MSG:     str = "cannot prove that the two types agree on secrecy - they point into a generic whose argument grows through a pointer, which has unboundedly many instances, so the storage below the pointers cannot be compared"
-```
-
-## fun module_reaches_secret
-
-```mach
-pub fun module_reaches_secret(s: *session.Session, resolved: *type.TypeId, len: u32) res[bool, fail.Fail];
-```
-
-## fun contains_tag_value
-
-```mach
-pub fun contains_tag_value(s: *session.Session, tid: type.TypeId) res[bool, fail.Fail];
-```
-
-## fun holds_expansive_instance
-
-```mach
-pub fun holds_expansive_instance(s: *session.Session, tid: type.TypeId) res[bool, fail.Fail];
-```
-
-whether `tid` holds, by value, an instance of a generic whose argument grows
-through a pointer, so its instances are unbounded
-
-## fun mark_expansive
-
-```mach
-pub fun mark_expansive(s: *session.Session) err[fail.Fail];
-```
-
-decides every generic the program instantiates (see ExpGraph) and records the
-decisions on the type store, for a consumer that follows pointers to cut at
-the expansive ones
 
