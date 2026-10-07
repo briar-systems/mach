@@ -135,6 +135,14 @@ module: the module a `pub use` names, for a module symbol
 pub rec Interface;
 ```
 
+## rec Reader
+
+```mach
+pub rec Reader;
+```
+
+how a lowering reads the interface another module published
+
 ## fun init
 
 ```mach
@@ -226,6 +234,14 @@ pub fun node_value(iface: *Interface, itn: *intern.Interner, node: u32) res[comp
 
 the value a scalar node holds, or the refusal a refused one gives; an aggregate has no
 value of its own
+
+## fun template_of
+
+```mach
+pub fun template_of(iface: *Interface) opt[*template.Template];
+```
+
+the template part, none for a module with no generic, comptime-parameter or pack function
 
 ## fun exported_add
 

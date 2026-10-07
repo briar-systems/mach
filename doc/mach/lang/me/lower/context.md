@@ -60,8 +60,7 @@ a: *ast.Ast,
 fqn: intern.StrId,
 sema_result: *fe_sema.SemaResult,
 rr: *resolve.ResolveResult,
-ctx: *comptime.ComptimeCtx,
-definitions: *fe_sema.DefinitionReader) res[ModuleScope, fail.Fail];
+ctx: *comptime.ComptimeCtx) res[ModuleScope, fail.Fail];
 ```
 
 ## fun origin_scope
@@ -69,6 +68,9 @@ definitions: *fe_sema.DefinitionReader) res[ModuleScope, fail.Fail];
 ```mach
 pub fun origin_scope(lc: *LowerContext, origin: session.ModuleId) res[ModuleScope, fail.Fail];
 ```
+
+the scope another module's template is read in: the copy its interface publishes, with a
+comptime scope over its constants that this lowering owns, so what an instance binds stays here
 
 ## fun request
 
@@ -88,7 +90,7 @@ shared_artifact: bool,
 debug: bool,
 checks: bool,
 diags: *diagnostic.DiagnosticStore,
-deps: *fe_sema.SemaDeps) res[LowerRequest, fail.Fail];
+interfaces: fe_sema.interface.Reader) res[LowerRequest, fail.Fail];
 ```
 
 ## fun scope_enter

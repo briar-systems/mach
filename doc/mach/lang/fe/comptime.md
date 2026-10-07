@@ -715,6 +715,14 @@ fwd comptime_scope.bind_gated
 
 forwards [`mach.lang.fe.comptime.scope.bind_gated`](comptime/scope.md#fun-bind_gated)
 
+## fwd comptime_scope.bindings_copy
+
+```mach
+fwd comptime_scope.bindings_copy
+```
+
+forwards [`mach.lang.fe.comptime.scope.bindings_copy`](comptime/scope.md#fun-bindings_copy)
+
 ## fwd comptime_scope.bindings_dnit
 
 ```mach
@@ -722,6 +730,14 @@ fwd comptime_scope.bindings_dnit
 ```
 
 forwards [`mach.lang.fe.comptime.scope.bindings_dnit`](comptime/scope.md#fun-bindings_dnit)
+
+## fwd comptime_scope.bindings_init
+
+```mach
+fwd comptime_scope.bindings_init
+```
+
+forwards [`mach.lang.fe.comptime.scope.bindings_init`](comptime/scope.md#fun-bindings_init)
 
 ## fwd comptime_scope.decorator_embed_at
 
@@ -858,6 +874,14 @@ fwd comptime_scope.lookup
 ```
 
 forwards [`mach.lang.fe.comptime.scope.lookup`](comptime/scope.md#fun-lookup)
+
+## fwd comptime_scope.lowering_over
+
+```mach
+fwd comptime_scope.lowering_over
+```
+
+forwards [`mach.lang.fe.comptime.scope.lowering_over`](comptime/scope.md#fun-lowering_over)
 
 ## fwd comptime_scope.prepare_gates
 

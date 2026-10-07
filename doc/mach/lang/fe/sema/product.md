@@ -130,15 +130,6 @@ pub fun acquire_definition(reader: *DefinitionReader, origin: session.ModuleId,
 phase: DefinitionPhase) res[Definition, fail.Fail];
 ```
 
-## fun acquire_interface
-
-```mach
-pub fun acquire_interface(reader: *DefinitionReader, origin: session.ModuleId) res[*interface.Interface, fail.Fail];
-```
-
-the interface the module `origin` published once typed, the only part of it an importer's
-lowering reads
-
 ## fun acquire_symbol
 
 ```mach
