@@ -26,7 +26,6 @@ use ast_type: mach.lang.fe.ast.type;
 use mach.lang.fe.comptime;
 use comptime_gate: mach.lang.fe.comptime.gate;
 use mach.lang.fe.comptime.intrinsic;
-use mach.lang.fe.decorator;
 use mach.lang.fe.resolve;
 use fe_sema:       mach.lang.fe.sema;
 use sema_declared: mach.lang.fe.sema.declared;
@@ -80,7 +79,8 @@ pub rec ModuleScope {
     source:      str;
     fqn:         intern.StrId;
     own_module:  session.ModuleId;
-    sema_result: *fe_sema.SemaResult;
+    typing:      fe_sema.template.Typing;
+    iface:       *fe_sema.interface.Interface;
     rr:          *resolve.ResolveResult;
     env:         comptime.ComptimeEnv;
     ctx:         *comptime.ComptimeCtx;
@@ -93,6 +93,11 @@ pub rec ModuleScope {
     frame: u32;
 }
 
+rec ForeignScope {
+    origin: session.ModuleId;
+    ctx:    *comptime.ComptimeCtx;
+}
+
 pub rec ScopeMark {
     owner:      ptr;
     depth:      u32;
@@ -101,12 +106,13 @@ pub rec ScopeMark {
 }
 
 pub rec LowerRequest {
-    deps:   *fe_sema.SemaDeps;
-    diags:  *diagnostic.DiagnosticStore;
-    s:      *session.Session;
-    tgt:    *resolved.Target;
-    malloc: *A.Allocator;
-    module: ModuleScope;
+    interfaces: fe_sema.interface.Reader;
+    instances:  *fe_sema.instance.Set;
+    diags:      *diagnostic.DiagnosticStore;
+    s:          *session.Session;
+    tgt:        *resolved.Target;
+    malloc:     *A.Allocator;
+    module:     ModuleScope;
     # nil when lowering the module's normal object; when lowering its test object, what
     # the normal object defines
     normal_object: *NormalObject;
@@ -132,10 +138,13 @@ pub rec LowerContext {
     logical_type_path: *LogicalTypePath;
     # the function whose signature lower_fn_sig lowers, and the annotation in it
     # being lowered, which a refusal raised outside any body points at
-    sig_decl:         ast_id.DeclId;
-    sig_site:         lang_source.Span;
-    sig_site_set:     bool;
-    deps:             *fe_sema.SemaDeps;
+    sig_decl:     ast_id.DeclId;
+    sig_site:     lang_source.Span;
+    sig_site_set: bool;
+    interfaces:   fe_sema.interface.Reader;
+    # the scopes another module's templates are lowered in, one per module, which this
+    # lowering owns and binds in
+    foreign:          collections_vector.Vector[ForeignScope];
     diags:            *diagnostic.DiagnosticStore;
     status:           fail.PhaseStatus;
     s:                *session.Session;
@@ -197,16 +206,17 @@ pub rec LowerContext {
 
 fun scope_nil() ModuleScope {
     var sc: ModuleScope;
-    sc.a           = nil;
-    sc.source      = nil;
-    sc.fqn         = intern.STR_NIL;
-    sc.own_module  = module.id(0);
-    sc.sema_result = nil;
-    sc.rr          = nil;
-    sc.ctx         = nil;
-    sc.subst       = nil;
-    sc.subst_len   = 0;
-    sc.frame       = fe_sema.instance.NONE;
+    sc.a          = nil;
+    sc.source     = nil;
+    sc.fqn        = intern.STR_NIL;
+    sc.own_module = module.id(0);
+    sc.typing     = fe_sema.template.Typing{};
+    sc.iface      = nil;
+    sc.rr         = nil;
+    sc.ctx        = nil;
+    sc.subst      = nil;
+    sc.subst_len  = 0;
+    sc.frame      = fe_sema.instance.NONE;
     ret sc;
 }
 
@@ -217,19 +227,15 @@ pub fun module_scope(
     fqn: intern.StrId,
     sema_result: *fe_sema.SemaResult,
     rr: *resolve.ResolveResult,
-    ctx: *comptime.ComptimeCtx,
-    definitions: *fe_sema.DefinitionReader) res[ModuleScope, fail.Fail] {
+    ctx: *comptime.ComptimeCtx) res[ModuleScope, fail.Fail] {
     if (s == nil)           { ret res[ModuleScope, fail.Fail].err{fail.message("lower: a module scope requires a session")}; }
     if (a == nil)           { ret res[ModuleScope, fail.Fail].err{fail.message("lower: module scope has no parsed AST")}; }
     if (sema_result == nil) { ret res[ModuleScope, fail.Fail].err{fail.message("lower: module scope has no semantic result")}; }
     if (rr == nil)          { ret res[ModuleScope, fail.Fail].err{fail.message("lower: module scope has no name-resolution result")}; }
     if (ctx == nil)         { ret res[ModuleScope, fail.Fail].err{fail.message("lower: module scope has no comptime context")}; }
-
-    val acquired: res[fe_sema.Definition, fail.Fail] = fe_sema.acquire_definition(definitions, own_module, fe_sema.DEFINITION_TYPED);
-    if (sel acquired.err) { ret res[ModuleScope, fail.Fail].err{acquired.err}; }
-    val current: fe_sema.Definition = acquired.ok;
-    if (current.parsed.a != a || current.sr != sema_result || current.rr != rr || current.ctx != ctx) {
-        ret res[ModuleScope, fail.Fail].err{fail.message("lower: module scope does not match its acquired definition")};
+    if (rr.expr_count::usize != a.exprs.len || sema_result.expr_count::usize != a.exprs.len
+        || rr.decl_count::usize != a.decls.len || sema_result.decl_count::usize != a.decls.len) {
+        ret res[ModuleScope, fail.Fail].err{fail.message("lower: module scope pieces were made from another syntax tree")};
     }
     if (!intern.str_same(session.module_fqn(s, own_module), fqn)) {
         ret res[ModuleScope, fail.Fail].err{fail.message("lower: module scope name belongs to another module")};
@@ -239,24 +245,68 @@ pub fun module_scope(
     if (sel source.err) { ret res[ModuleScope, fail.Fail].err{source.err}; }
 
     var sc: ModuleScope = scope_nil();
-    sc.a           = a;
-    sc.source      = source.ok;
-    sc.fqn         = fqn;
-    sc.own_module  = own_module;
-    sc.sema_result = sema_result;
-    sc.rr          = rr;
-    sc.env         = comptime.environment(ctx);
-    sc.ctx         = ctx;
+    sc.a          = a;
+    sc.source     = source.ok;
+    sc.fqn        = fqn;
+    sc.own_module = own_module;
+    sc.typing     = fe_sema.template.Typing{expr_type: sema_result.expr_type, type_resolved_ty: sema_result.type_resolved_ty,
+        decl_type: sema_result.decl_type, expr_count: sema_result.expr_count, type_count: sema_result.type_count, decl_count: sema_result.decl_count};
+    sc.iface = ?sema_result.interface;
+    sc.rr    = rr;
+    sc.env   = comptime.environment(ctx);
+    sc.ctx   = ctx;
     ret res[ModuleScope, fail.Fail].ok{sc};
 }
 
+# the scope another module's template is read in: the copy its interface publishes, with a
+# comptime scope over its constants that this lowering owns, so what an instance binds stays here
 pub fun origin_scope(lc: *LowerContext, origin: session.ModuleId) res[ModuleScope, fail.Fail] {
     if (module.same(origin, lc.scope.own_module)) { ret res[ModuleScope, fail.Fail].ok{lc.scope}; }
-    if (lc.deps == nil)                           { ret res[ModuleScope, fail.Fail].err{fail.message("lower: foreign definition requires scoped dependencies")}; }
-    val acquired: res[fe_sema.Definition, fail.Fail] = fe_sema.acquire_definition(?lc.deps.definitions, origin, fe_sema.DEFINITION_TYPED);
+    val acquired: res[*fe_sema.interface.Interface, fail.Fail] = interface_of(lc, origin);
     if (sel acquired.err) { ret res[ModuleScope, fail.Fail].err{acquired.err}; }
-    val current: fe_sema.Definition = acquired.ok;
-    ret module_scope(lc.s, origin, current.parsed.a, session.module_fqn(lc.s, origin), current.sr, current.rr, current.ctx, ?lc.deps.definitions);
+    val iface: *fe_sema.interface.Interface    = acquired.ok;
+    val found: opt[*fe_sema.template.Template] = fe_sema.interface.template_of(iface);
+    if (sel found.none) { ret res[ModuleScope, fail.Fail].err{fail.message("lower: an instance's module publishes no template")}; }
+    val t:      *fe_sema.template.Template            = found.some;
+    val scoped: res[*comptime.ComptimeCtx, fail.Fail] = foreign_ctx(lc, origin, t);
+    if (sel scoped.err) { ret res[ModuleScope, fail.Fail].err{scoped.err}; }
+
+    var sc: ModuleScope = scope_nil();
+    sc.a          = ?t.a;
+    sc.source     = t.source;
+    sc.fqn        = session.module_fqn(lc.s, origin);
+    sc.own_module = origin;
+    sc.typing     = t.typing;
+    sc.iface      = iface;
+    sc.rr         = ?t.rr;
+    sc.env        = t.env;
+    sc.ctx        = scoped.ok;
+    ret res[ModuleScope, fail.Fail].ok{sc};
+}
+
+fun foreign_ctx(lc: *LowerContext, origin: session.ModuleId, t: *fe_sema.template.Template) res[*comptime.ComptimeCtx, fail.Fail] {
+    var i: usize = 0;
+    for (i < lc.foreign.len) {
+        if (module.same(lc.foreign.data[i].origin, origin)) { ret res[*comptime.ComptimeCtx, fail.Fail].ok{lc.foreign.data[i].ctx}; }
+        i = i + 1;
+    }
+    val made: res[*comptime.ComptimeCtx, A.Error] = A.allocate[comptime.ComptimeCtx](lc.s.alloc, 1);
+    if (sel made.err) { ret res[*comptime.ComptimeCtx, fail.Fail].err{fail.refused(made.err)}; }
+    var c:    *comptime.ComptimeCtx = made.ok;
+    var kept: bool                  = false;
+    fin {
+        if (!kept) {
+            comptime.dnit(c);
+            A.deallocate[comptime.ComptimeCtx](lc.s.alloc, c, 1);
+        }
+    }
+    @c = comptime.lowering_over(t.env, ?t.load, ?t.resolved, ?t.typed, lc.s.alloc);
+    val gates: err[fail.Fail] = comptime.prepare_gates(c, t.a.exprs.len::u32);
+    if (sel gates.err) { ret res[*comptime.ComptimeCtx, fail.Fail].err{gates.err}; }
+    val pushed: res[usize, A.Error] = collections_vector.push[ForeignScope](?lc.foreign, ForeignScope{origin: origin, ctx: c});
+    if (sel pushed.err) { ret res[*comptime.ComptimeCtx, fail.Fail].err{fail.refused(pushed.err)}; }
+    kept = true;
+    ret res[*comptime.ComptimeCtx, fail.Fail].ok{c};
 }
 
 pub fun request(
@@ -274,17 +324,18 @@ pub fun request(
     debug: bool,
     checks: bool,
     diags: *diagnostic.DiagnosticStore,
-    deps: *fe_sema.SemaDeps) res[LowerRequest, fail.Fail] {
+    interfaces: fe_sema.interface.Reader) res[LowerRequest, fail.Fail] {
     if (tgt == nil)    { ret res[LowerRequest, fail.Fail].err{fail.message("lower: a lowering request requires a resolved target")}; }
     if (malloc == nil) { ret res[LowerRequest, fail.Fail].err{fail.message("lower: a lowering request requires an allocator")}; }
 
-    if (deps == nil) { ret res[LowerRequest, fail.Fail].err{fail.message("lower: a lowering request requires scoped dependencies")}; }
-    val sr: res[ModuleScope, fail.Fail] = module_scope(s, own_module, a, fqn, sema_result, rr, ctx, ?deps.definitions);
+    if (interfaces.read == nil) { ret res[LowerRequest, fail.Fail].err{fail.message("lower: a lowering request requires a reader of imported interfaces")}; }
+    val sr: res[ModuleScope, fail.Fail] = module_scope(s, own_module, a, fqn, sema_result, rr, ctx);
     if (sel sr.err) { ret res[LowerRequest, fail.Fail].err{sr.err}; }
 
     var req: LowerRequest;
     req.s               = s;
-    req.deps            = deps;
+    req.interfaces      = interfaces;
+    req.instances       = ?sema_result.instances;
     req.diags           = diags;
     req.tgt             = tgt;
     req.malloc          = malloc;
@@ -341,7 +392,8 @@ pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *me_ir.Module) er
     lc.sig_decl          = ast_id.DECL_NIL;
     lc.sig_site_set      = false;
     lc.s                 = s;
-    lc.deps              = req.deps;
+    lc.interfaces        = req.interfaces;
+    lc.foreign           = collections_vector.init[ForeignScope](s.alloc);
     lc.diags             = req.diags;
     lc.tgt               = req.tgt;
     lc.scope             = req.module;
@@ -404,7 +456,7 @@ pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *me_ir.Module) er
     lc.borrow_hit   = false;
     lc.discard_eid  = ast_id.EXPR_NIL;
 
-    lc.instances = ?req.module.sema_result.instances;
+    lc.instances = req.instances;
 
     lc.pack_slots    = nil;
     lc.pack_types    = nil;
@@ -433,6 +485,13 @@ pub fun dnit_context(lc: *LowerContext) {
     if (lc.scopes != nil && lc.scope_cap > 0) {
         A.deallocate[ModuleScope](lc.s.alloc, lc.scopes, lc.scope_cap::usize);
     }
+    var fi: usize = 0;
+    for (fi < lc.foreign.len) {
+        comptime.dnit(lc.foreign.data[fi].ctx);
+        A.deallocate[comptime.ComptimeCtx](lc.s.alloc, lc.foreign.data[fi].ctx, 1);
+        fi = fi + 1;
+    }
+    collections_vector.dnit[ForeignScope](?lc.foreign);
     lc.scope     = scope_nil();
     lc.scopes    = nil;
     lc.scope_len = 0;
@@ -467,27 +526,15 @@ pub fun dnit_context(lc: *LowerContext) {
     lc.debug_pointee_cap = 0;
 }
 
-pub fun symbol_definition(lc: *LowerContext, sym: *resolve.Symbol) res[fe_sema.DefinedSymbol, fail.Fail] {
-    if (module.same(sym.origin, lc.scope.own_module)) {
-        if (ast_id.decl_is_nil(sym.decl) || ast_id.decl_index(sym.decl) >= lc.scope.a.decls.len::u32) {
-            val reason: fail.Fail = fail.message("lower: symbol has no declaration in its active owner");
-            fail.internal(?lc.status, fail.describe(reason));
-            ret res[fe_sema.DefinedSymbol, fail.Fail].err{reason};
-        }
-        val parsed: resolve.ParsedDefinition = resolve.ParsedDefinition{
-            a: lc.scope.a, owner: resolve.type_owner(lc.s, sym.origin, lc.scope.a.file_id), incarnation: lc.scope.a.incarnation
-        };
-        ret res[fe_sema.DefinedSymbol, fail.Fail].ok{fe_sema.DefinedSymbol{
-            definition: fe_sema.Definition{parsed: parsed, origin: sym.origin, rr: lc.scope.rr,
-                sr: lc.scope.sema_result, ctx: lc.scope.ctx, decorators: lc.scope.ctx}, symbol: @sym
-        }};
-    }
-    if (lc.deps == nil) {
-        val reason: fail.Fail = fail.message("lower: foreign symbol requires scoped dependencies");
+# the interface of the module `origin`: the one the lowering module published, or an import's
+pub fun interface_of(lc: *LowerContext, origin: session.ModuleId) res[*fe_sema.interface.Interface, fail.Fail] {
+    if (module.same(origin, lc.scope.own_module)) { ret res[*fe_sema.interface.Interface, fail.Fail].ok{lc.scope.iface}; }
+    if (lc.interfaces.read == nil) {
+        val reason: fail.Fail = fail.message("lower: an imported interface requires a reader of interfaces");
         fail.internal(?lc.status, fail.describe(reason));
-        ret res[fe_sema.DefinedSymbol, fail.Fail].err{reason};
+        ret res[*fe_sema.interface.Interface, fail.Fail].err{reason};
     }
-    val acquired: res[fe_sema.DefinedSymbol, fail.Fail] = fe_sema.acquire_symbol(?lc.deps.definitions, sym, fe_sema.DEFINITION_TYPED);
+    val acquired: res[*fe_sema.interface.Interface, fail.Fail] = lc.interfaces.read(lc.interfaces.ctx, origin);
     if (sel acquired.err) {
         val reason: fail.Fail = acquired.err;
         if (sel reason.reported) { fail.reject(?lc.status); }
@@ -496,11 +543,44 @@ pub fun symbol_definition(lc: *LowerContext, sym: *resolve.Symbol) res[fe_sema.D
     ret acquired;
 }
 
-pub fun declaring_comptime_ctx(lc: *LowerContext, sym: *resolve.Symbol) *comptime.ComptimeCtx {
-    if (module.same(sym.origin, lc.scope.own_module)) { ret lc.scope.ctx; }
-    val acquired: res[fe_sema.DefinedSymbol, fail.Fail] = symbol_definition(lc, sym);
-    if (sel acquired.err) { ret nil; }
-    ret acquired.ok.definition.ctx;
+# a module-level declaration as the interface of its module describes it
+pub rec Declared {
+    iface:       *fe_sema.interface.Interface;
+    declaration: *fe_sema.interface.Declaration;
+}
+
+# the declaration `sym` names: one of the module in scope by its id, or another module's by
+# its kind and canonical name
+pub fun declared(lc: *LowerContext, sym: *resolve.Symbol) res[Declared, fail.Fail] {
+    if (!module.same(sym.origin, lc.scope.own_module)) { ret declared_named(lc, sym.origin, sym.definition_kind, sym.canon); }
+    val iface: *fe_sema.interface.Interface        = lc.scope.iface;
+    val own:   opt[*fe_sema.interface.Declaration] = fe_sema.interface.declaration_at(iface, sym.decl);
+    if (sel own.none) {
+        val reason: fail.Fail = fail.message("lower: symbol has no declaration in its module's interface");
+        fail.internal(?lc.status, fail.describe(reason));
+        ret res[Declared, fail.Fail].err{reason};
+    }
+    ret res[Declared, fail.Fail].ok{Declared{iface: iface, declaration: own.some}};
+}
+
+# the one declaration of `kind` the module `origin` defines under `canon`
+pub fun declared_named(lc: *LowerContext, origin: session.ModuleId, kind: resolve.SymKind, canon: intern.StrId) res[Declared, fail.Fail] {
+    val acquired: res[*fe_sema.interface.Interface, fail.Fail] = interface_of(lc, origin);
+    if (sel acquired.err) { ret res[Declared, fail.Fail].err{acquired.err}; }
+    val found: res[*fe_sema.interface.Declaration, fail.Fail] = fe_sema.interface.declaration_for(acquired.ok, kind, canon);
+    if (sel found.err) {
+        fail.internal(?lc.status, fail.describe(found.err));
+        ret res[Declared, fail.Fail].err{found.err};
+    }
+    ret res[Declared, fail.Fail].ok{Declared{iface: acquired.ok, declaration: found.ok}};
+}
+
+# the scalar a module `val` holds, none when it holds no constant or an aggregate
+pub fun declared_scalar(lc: *LowerContext, d: Declared) opt[comptime.CTValue] {
+    if (d.declaration.kind != resolve.SYM_VAL || d.declaration.value == fe_sema.interface.NONE) { ret opt[comptime.CTValue].none{}; }
+    val n: *fe_sema.interface.Node = fe_sema.interface.node_at(d.iface, d.declaration.value);
+    if (n.kind != fe_sema.interface.NODE_SCALAR) { ret opt[comptime.CTValue].none{}; }
+    ret opt[comptime.CTValue].some{n.value};
 }
 
 pub fun gated_lower_member_const_message(lc: *LowerContext, name: intern.StrId, dep_fqn: intern.StrId) res[str, fail.Fail] {
@@ -560,14 +640,11 @@ pub fun resolve_module_member_const(lc: *LowerContext, eid: ast_id.ExprId) res[o
     if (sym.kind != resolve.SYM_IMPORTED) {
         ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}};
     }
-    val octx: *comptime.ComptimeCtx = declaring_comptime_ctx(lc, sym);
-    if (octx == nil) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
-    val nc: opt[comptime.NamedConst] = comptime.lookup(octx, sym.name);
-    if (sel nc.none) {
-        ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}};
-    }
-    val named: comptime.NamedConst = nc.some;
-    if (named.gated && lc.scope.env.build.union_build) {
+    val found: res[Declared, fail.Fail] = declared(lc, sym);
+    if (sel found.err) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
+    val scalar: opt[comptime.CTValue] = declared_scalar(lc, found.ok);
+    if (sel scalar.none) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
+    if (found.ok.declaration.gated && lc.scope.env.build.union_build) {
         val msg_r: res[str, fail.Fail] = gated_lower_member_const_message(lc, sym.name, session.module_fqn(lc.s, sym.origin));
         if (sel msg_r.err) { ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_from_fail(msg_r.err, diagnostic_kind.CONST_TUPLE_DEPENDENT, "")}; }
         val msg:   str                           = msg_r.ok;
@@ -579,16 +656,12 @@ pub fun resolve_module_member_const(lc: *LowerContext, eid: ast_id.ExprId) res[o
         val f: fail.Fail = report_gate(lc, diagnostic_kind.CONST_TUPLE_DEPENDENT, span, msg);
         ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_from_fail(f, diagnostic_kind.CONST_TUPLE_DEPENDENT, msg)};
     }
-    ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].some{named.value}};
+    ret res[opt[comptime.CTValue], comptime.EvalFail].ok{scalar};
 }
 
 pub fun comptime_ident_is_runtime(lc: *LowerContext, eid: ast_id.ExprId) bool {
-    if (lc == nil || ast_id.expr_is_nil(eid)) { ret false; }
-    val rr: *resolve.ResolveResult = lc.scope.rr;
-    if (rr == nil || rr.expr_resolved == nil || eid::u32 >= rr.expr_count) { ret false; }
-    val sid: resolve.SymbolId = rr.expr_resolved[ast_id.expr_index(eid)];
-    if (resolve.symbol_is_nil(sid) || sid::u32 >= rr.symbol_count) { ret false; }
-    ret resolve.symbol_is_runtime(?rr.symbols[resolve.symbol_index(sid)]);
+    if (lc == nil) { ret false; }
+    ret resolve.expr_is_runtime(lc.scope.rr, eid);
 }
 
 fun resolve_scalar_value(lc: *LowerContext, eid: ast_id.ExprId, value: comptime.CTValue) res[comptime.CTValue, comptime.EvalFail] {
@@ -1450,7 +1523,7 @@ pub fun expr_type_of(lc: *LowerContext, eid: ast_id.ExprId) type.TypeId {
         val framed: opt[type.TypeId] = fe_sema.instance.expr_type_at(lc.instances, lc.scope.frame, eid);
         if (sel framed.some) { ret framed.some; }
     }
-    ret substitute_type(lc, lc.scope.sema_result.expr_type[ast_id.expr_index(eid)]);
+    ret substitute_type(lc, lc.scope.typing.expr_type[ast_id.expr_index(eid)]);
 }
 
 pub fun expr_float_width(lc: *LowerContext, eid: ast_id.ExprId) float.FloatWidth {
@@ -1511,7 +1584,7 @@ pub fun substitute_type(lc: *LowerContext, tid: type.TypeId) type.TypeId {
 pub fun type_resolved_of(lc: *LowerContext, tid: ast_id.TypeId) type.TypeId {
     if (ast_id.type_is_nil(tid))                               { ret type.TYPE_NIL; }
     if (ast_id.type_index(tid)::usize >= lc.scope.a.types.len) { ret type.TYPE_NIL; }
-    ret substitute_type(lc, lc.scope.sema_result.type_resolved_ty[ast_id.type_index(tid)]);
+    ret substitute_type(lc, lc.scope.typing.type_resolved_ty[ast_id.type_index(tid)]);
 }
 
 pub fun decl_type_of(lc: *LowerContext, did: ast_id.DeclId) type.TypeId {
@@ -1521,7 +1594,7 @@ pub fun decl_type_of(lc: *LowerContext, did: ast_id.DeclId) type.TypeId {
         val framed: opt[type.TypeId] = fe_sema.instance.decl_type_at(lc.instances, lc.scope.frame, did);
         if (sel framed.some) { ret framed.some; }
     }
-    ret substitute_type(lc, lc.scope.sema_result.decl_type[ast_id.decl_index(did)]);
+    ret substitute_type(lc, lc.scope.typing.decl_type[ast_id.decl_index(did)]);
 }
 
 # the instance sema decided the call or generic reference `eid` names, in the frame the
@@ -1642,8 +1715,20 @@ fun param_int_ext(lc: *LowerContext, sem: type.TypeId) ir_type.IntExt {
     ret ir_type.EXT_ZERO;
 }
 
-pub fun pack_instance_sig(lc: *LowerContext, d: *ast_decl.Decl, fixed_count: u32,
-    types: *type.TypeId, type_len: u32, ret_ir: ir_type.IrTypeId) res[FnSig, fail.Fail] {
+# the signature of a pack instance of the function typed `fn_ty`: its fixed parameters, then
+# one per element of the pack
+pub fun pack_instance_sig(lc: *LowerContext, fn_ty: type.TypeId, types: *type.TypeId, type_len: u32) res[FnSig, fail.Fail] {
+    val t_opt: opt[*type.Type] = type.get(?lc.s.types, type.strip_secret(?lc.s.types, substitute_type(lc, fn_ty)));
+    if (sel t_opt.none) { ret res[FnSig, fail.Fail].err{fail.message("lower: a pack instance's signature is not a function with a pack")}; }
+    val fn: *type.Type = t_opt.some;
+    if (fn.kind != type.TYPE_FUN || fn.data.fn.params_len == 0) {
+        ret res[FnSig, fail.Fail].err{fail.message("lower: a pack instance's signature is not a function with a pack")};
+    }
+    val fixed_count: u32                              = fn.data.fn.params_len - 1;
+    val res_ret_ir:  res[ir_type.IrTypeId, fail.Fail] = lower_type(lc, fn.data.fn.ret_type);
+    if (sel res_ret_ir.err) { ret res[FnSig, fail.Fail].err{res_ret_ir.err}; }
+    val ret_ir: ir_type.IrTypeId = res_ret_ir.ok;
+
     var out: FnSig;
     out.ext = ir_type.EXT_LIST_EMPTY;
     val total: u32 = fixed_count + type_len;
@@ -1654,23 +1739,25 @@ pub fun pack_instance_sig(lc: *LowerContext, d: *ast_decl.Decl, fixed_count: u32
         ret res[FnSig, fail.Fail].ok{out};
     }
 
+    var buf: *ir_type.IrTypeId = nil;
+    var ext: *ir_type.IntExt   = nil;
+    fin {
+        if (buf != nil) { A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, total::usize); }
+        if (ext != nil) { A.deallocate[ir_type.IntExt](lc.s.alloc, ext, total::usize); }
+    }
     val res_buf: res[*ir_type.IrTypeId, A.Error] = A.allocate[ir_type.IrTypeId](lc.s.alloc, total::usize);
     if (sel res_buf.err) { ret res[FnSig, fail.Fail].err{fail.refused(res_buf.err)}; }
-    val buf: *ir_type.IrTypeId = res_buf.ok;
-    fin { A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, total::usize); }
+    buf = res_buf.ok;
     val res_ext: res[*ir_type.IntExt, A.Error] = A.allocate[ir_type.IntExt](lc.s.alloc, total::usize);
     if (sel res_ext.err) { ret res[FnSig, fail.Fail].err{fail.refused(res_ext.err)}; }
-    val ext: *ir_type.IntExt = res_ext.ok;
-    fin { A.deallocate[ir_type.IntExt](lc.s.alloc, ext, total::usize); }
+    ext = res_ext.ok;
 
     var i: u32 = 0;
     for (i < total) {
         var elem_sem: type.TypeId = type.TYPE_NIL;
         if (i < fixed_count) {
-            val pool_ix: u32 = d.data.fun_.params_start + i;
-            if (pool_ix::usize < lc.scope.a.typed_names.len) {
-                elem_sem = type_resolved_of(lc, lc.scope.a.typed_names.data[pool_ix].ty);
-            }
+            val po: opt[type.TypeId] = type.get_param(?lc.s.types, fn.data.fn.params_start + i);
+            if (sel po.some) { elem_sem = po.some; }
         }
         or {
             elem_sem = types[i - fixed_count];
@@ -1691,63 +1778,14 @@ pub fun pack_instance_sig(lc: *LowerContext, d: *ast_decl.Decl, fixed_count: u32
     ret res[FnSig, fail.Fail].ok{out};
 }
 
-pub fun instance_ref_sig(lc: *LowerContext, decl_id: ast_id.DeclId, origin: session.ModuleId,
-    args: *type.TypeId, arg_len: u32) res[FnSig, fail.Fail] {
-    val acquired: res[ModuleScope, fail.Fail] = origin_scope(lc, origin);
-    if (sel acquired.err) { ret res[FnSig, fail.Fail].err{acquired.err}; }
-    var sc:    ModuleScope                       = acquired.ok;
-    val who_r: res[type.GenericOwner, fail.Fail] = fe_sema.generic_owner_of_decl(lc.s, sc.a, origin, decl_id);
-    if (sel who_r.err) { ret res[FnSig, fail.Fail].err{who_r.err}; }
-    sc.subst       = args;
-    sc.subst_len   = arg_len;
-    sc.subst_owner = who_r.ok;
-
-    val mark_r: res[ScopeMark, fail.Fail] = scope_enter(lc, sc);
-    if (sel mark_r.err) {
-        ret res[FnSig, fail.Fail].err{mark_r.err};
-    }
-
-    val res_sig: res[FnSig, fail.Fail] = lower_fn_sig(lc, decl_id);
-
-    val leave: err[fail.Fail] = scope_leave(lc, mark_r.ok);
-    if (sel leave.err) { ret res[FnSig, fail.Fail].err{leave.err}; }
-    ret res_sig;
-}
-
-pub fun pack_instance_ref_sig(lc: *LowerContext, decl_id: ast_id.DeclId, origin: session.ModuleId,
-    args: *type.TypeId, arg_len: u32,
-    types: *type.TypeId, type_len: u32) res[FnSig, fail.Fail] {
-    val acquired: res[ModuleScope, fail.Fail] = origin_scope(lc, origin);
-    if (sel acquired.err) { ret res[FnSig, fail.Fail].err{acquired.err}; }
-    var sc:    ModuleScope         = acquired.ok;
-    val opt_d: opt[*ast_decl.Decl] = ast.get_decl(sc.a, decl_id);
-    if (sel opt_d.none) { ret res[FnSig, fail.Fail].err{fail.message("lower: pack-instance-reference origin declaration not found")}; }
-    val d: *ast_decl.Decl = opt_d.some;
-    if (d.kind != ast_decl.DECL_KIND_FUN) { ret res[FnSig, fail.Fail].err{fail.message("lower: pack-instance-reference origin declaration is not a function")}; }
-    val who_r: res[type.GenericOwner, fail.Fail] = fe_sema.generic_owner_of_decl(lc.s, sc.a, origin, decl_id);
-    if (sel who_r.err) { ret res[FnSig, fail.Fail].err{who_r.err}; }
-    sc.subst       = args;
-    sc.subst_len   = arg_len;
-    sc.subst_owner = who_r.ok;
-
-    val mark_r: res[ScopeMark, fail.Fail] = scope_enter(lc, sc);
-    if (sel mark_r.err) {
-        ret res[FnSig, fail.Fail].err{mark_r.err};
-    }
-
-    var res_sig:    res[FnSig, fail.Fail];
-    val res_ret_ir: res[ir_type.IrTypeId, fail.Fail] = function_return_ir(lc, decl_id);
-    if (sel res_ret_ir.err) {
-        res_sig = res[FnSig, fail.Fail].err{res_ret_ir.err};
-    }
-    or (sel res_ret_ir.ok) {
-        val fixed_count: u32 = d.data.fun_.params_len - 1;
-        res_sig = pack_instance_sig(lc, d, fixed_count, types, type_len, res_ret_ir.ok);
-    }
-
-    val leave: err[fail.Fail] = scope_leave(lc, mark_r.ok);
-    if (sel leave.err) { ret res[FnSig, fail.Fail].err{leave.err}; }
-    ret res_sig;
+# the signature an instance is referenced under: the one sema settled when it asked for it
+pub fun instance_ref_sig(lc: *LowerContext, item: *fe_sema.instance.Instance) res[FnSig, fail.Fail] {
+    if (item.kind == fe_sema.instance.KIND_PACK) { ret pack_instance_sig(lc, item.sig, item.pack, item.pack_len); }
+    val res_sig: res[ir_type.IrTypeId, fail.Fail] = lower_type(lc, item.sig);
+    if (sel res_sig.err) { ret res[FnSig, fail.Fail].err{res_sig.err}; }
+    val res_ext: res[ir_type.ExtListId, fail.Fail] = fun_type_ext(lc, item.sig);
+    if (sel res_ext.err) { ret res[FnSig, fail.Fail].err{res_ext.err}; }
+    ret res[FnSig, fail.Fail].ok{FnSig{sig: res_sig.ok, ext: res_ext.ok}};
 }
 
 pub fun expr_symbol_of(lc: *LowerContext, eid: ast_id.ExprId) resolve.SymbolId {
@@ -1773,27 +1811,15 @@ pub fun ast_source(s: *session.Session, a: *ast.Ast) res[str, fail.Fail] {
     ret res[str, fail.Fail].ok{sf.some.text};
 }
 
-pub fun decl_target_op(itn: *intern.Interner, c: *comptime.ComptimeCtx, a: *ast.Ast, d: *ast_decl.Decl, defs: *target_definition.Table, out_op: *u32) u32 {
-    if (a == nil || d == nil) { ret target_definition.NO_OP_SET; }
-    var i: u32 = 0;
-    for (i < d.decorators_len) {
-        val dec: *ast_decl.Decorator = ?a.decorators.data[d.decorators_start + i];
-        if (dec.id != decorator.OP) {
-            i = i + 1;
-            cnt;
-        }
-        if (dec.args_len != 3) { ret target_definition.NO_OP_SET; }
-        val set_s: opt[str] = decorator.string_of(itn, c, a, dec, 1);
-        val nam_s: opt[str] = decorator.string_of(itn, c, a, dec, 2);
-        if (sel set_s.none) { ret target_definition.NO_OP_SET; }
-        if (sel nam_s.none) { ret target_definition.NO_OP_SET; }
-        val od: *target_definition.Op = target_definition.op_of_region(defs,
-            set_s.some, 0, str_len(set_s.some), nam_s.some, 0, str_len(nam_s.some));
-        if (od == nil) { ret target_definition.NO_OP_SET; }
-        @out_op = od.opcode;
-        ret od.set_tag;
-    }
-    ret target_definition.NO_OP_SET;
+# the operation of the selected target an `#[op]` function stands for, NO_OP_SET for any other
+pub fun declared_op(lc: *LowerContext, d: Declared, out_op: *u32) u32 {
+    if (intern.str_is_nil(d.declaration.op_set)) { ret target_definition.NO_OP_SET; }
+    val set_s: str                   = intern.text(?lc.s.interner, d.declaration.op_set);
+    val nam_s: str                   = intern.text(?lc.s.interner, d.declaration.op_name);
+    val od:    *target_definition.Op = target_definition.op_of_region(lc.tgt.defs, set_s, 0, str_len(set_s), nam_s, 0, str_len(nam_s));
+    if (od == nil) { ret target_definition.NO_OP_SET; }
+    @out_op = od.opcode;
+    ret od.set_tag;
 }
 
 pub fun emit_dbg_birth(lc: *LowerContext, name_span: lang_source.Span, ty: ir_type.IrTypeId,
@@ -1980,12 +2006,45 @@ test scope_leave__refuses_a_stale_or_out_of_order_mark {
 }
 
 #[testing]
-fun fixture_definition(raw: ptr, origin: session.ModuleId, phase: fe_sema.DefinitionPhase) res[fe_sema.Definition, fail.Fail] {
-    val current: *fe_sema.Definition = raw::*fe_sema.Definition;
-    if (current == nil || !module.same(current.origin, origin)) {
-        ret res[fe_sema.Definition, fail.Fail].err{fail.message("fixture definition owner differs")};
-    }
-    ret res[fe_sema.Definition, fail.Fail].ok{@current};
+fun fixture_interface(raw: ptr, origin: session.ModuleId) res[*fe_sema.interface.Interface, fail.Fail] {
+    ret res[*fe_sema.interface.Interface, fail.Fail].err{fail.message("fixture reads no interface")};
+}
+
+#[testing]
+rec ScopeFixture {
+    expr: ast_expr.Expr;
+    decl: ast_decl.Decl;
+    a1:   ast.Ast;
+    a2:   ast.Ast;
+    sm1:  fe_sema.SemaResult;
+    sm2:  fe_sema.SemaResult;
+    rr1:  resolve.ResolveResult;
+    rr2:  resolve.ResolveResult;
+    cc1:  comptime.ComptimeCtx;
+    mid:  session.ModuleId;
+    fqn:  intern.StrId;
+}
+
+# one module's tree, resolution and typing of one expression and one declaration, beside a tree
+# and products of none
+#[testing]
+fun scope_fixture(s: *session.Session, f: *ScopeFixture) bool {
+    val file: res[lang_source.FileId, lang_source.Error] = lang_source.add(?s.sources, "m.mach", "");
+    if (sel file.err) { ret false; }
+    f.a1.incarnation = 1;
+    f.a1.file_id     = file.ok;
+    f.a1.exprs       = ast.table_over[ast_expr.Expr](?f.expr, 1);
+    f.a1.decls       = ast.table_over[ast_decl.Decl](?f.decl, 1);
+    f.rr1.status     = fail.accepted();
+    f.rr1.expr_count = 1;
+    f.rr1.decl_count = 1;
+    f.sm1.status     = fail.accepted();
+    f.sm1.expr_count = 1;
+    f.sm1.decl_count = 1;
+    f.mid            = module.id(0);
+    f.fqn            = intern.str_id(7);
+    val ri: err[fail.Fail] = session.register_module_identity(s, f.mid, ?f.a1, f.fqn, module.stable_id(5));
+    ret sel ri.ok;
 }
 
 test module_scope__refuses_a_piece_that_belongs_to_another_module {
@@ -1996,67 +2055,37 @@ test module_scope__refuses_a_piece_that_belongs_to_another_module {
     if (sel sr.err) { ret 1; }
     var s: session.Session = sr.ok;
     fin { session.dnit(?s); }
-
-    var a1:  ast.Ast;
-    var a2:  ast.Ast;
-    var sm1: fe_sema.SemaResult = fe_sema.SemaResult{};
-    var sm2: fe_sema.SemaResult = fe_sema.SemaResult{};
-    var rr1: resolve.ResolveResult;
-    var rr2: resolve.ResolveResult;
-    var cc1: comptime.ComptimeCtx;
-    var cc2: comptime.ComptimeCtx;
-
-    val file: res[lang_source.FileId, lang_source.Error] = lang_source.add(?s.sources, "m.mach", "");
-    if (sel file.err) { ret 1; }
-    a1.incarnation = 1;
-    a1.file_id     = file.ok;
-    rr1.status     = fail.accepted();
-    sm1.status     = fail.accepted();
-
-    val mid: session.ModuleId = module.id(0);
-    val fqn: intern.StrId     = intern.str_id(7);
-
-    val ri: err[fail.Fail] = session.register_module_identity(?s, mid, ?a1, fqn, module.stable_id(5));
-    if (sel ri.err) { ret 1; }
-
-    var current: fe_sema.Definition = fe_sema.Definition{
-        parsed: resolve.ParsedDefinition{a: ?a1, owner: resolve.type_owner(?s, mid, a1.file_id), incarnation: a1.incarnation},
-        origin: mid, rr: ?rr1, sr: ?sm1, ctx: ?cc1
-    };
-    var deps: fe_sema.SemaDeps = fe_sema.SemaDeps{
-        definitions: fe_sema.reader_init((?current)::ptr, fixture_definition, ?alloc)
-    };
-    fin { fe_sema.reader_dnit(?deps.definitions); }
+    var f: ScopeFixture;
+    if (!scope_fixture(?s, ?f)) { ret 1; }
 
     var code: i32 = 0;
 
-    cc1.env.target.pointer_width = 99;
-    val good: res[ModuleScope, fail.Fail] = module_scope(?s, mid, ?a1, fqn, ?sm1, ?rr1, ?cc1, ?deps.definitions);
+    f.cc1.env.target.pointer_width = 99;
+    val good: res[ModuleScope, fail.Fail] = module_scope(?s, f.mid, ?f.a1, f.fqn, ?f.sm1, ?f.rr1, ?f.cc1);
     if (sel good.err) { ret 1; }
     val sc: ModuleScope = good.ok;
     if (sc.env.target.pointer_width != 99) { code = 1; }
-    cc1.env.target.pointer_width = 12;
+    f.cc1.env.target.pointer_width = 12;
     if (sc.env.target.pointer_width != 99) { code = 1; }
+    if (sc.iface != ?f.sm1.interface)      { code = 1; }
 
-    val r_2008: res[ModuleScope, fail.Fail] = module_scope(?s, mid, ?a2, fqn, ?sm1, ?rr1, ?cc1, ?deps.definitions);
+    val r_2008: res[ModuleScope, fail.Fail] = module_scope(?s, f.mid, ?f.a2, f.fqn, ?f.sm1, ?f.rr1, ?f.cc1);
     if (sel r_2008.ok) { code = 1; }
-    val r_2009: res[ModuleScope, fail.Fail] = module_scope(?s, mid, ?a1, intern.str_id(8), ?sm1, ?rr1, ?cc1, ?deps.definitions);
+    val r_2009: res[ModuleScope, fail.Fail] = module_scope(?s, f.mid, ?f.a1, intern.str_id(8), ?f.sm1, ?f.rr1, ?f.cc1);
     if (sel r_2009.ok) { code = 1; }
-    val r_2010: res[ModuleScope, fail.Fail] = module_scope(?s, mid, ?a1, fqn, ?sm2, ?rr1, ?cc1, ?deps.definitions);
+    val r_2010: res[ModuleScope, fail.Fail] = module_scope(?s, f.mid, ?f.a1, f.fqn, ?f.sm2, ?f.rr1, ?f.cc1);
     if (sel r_2010.ok) { code = 1; }
-    val r_2011: res[ModuleScope, fail.Fail] = module_scope(?s, mid, ?a1, fqn, ?sm1, ?rr2, ?cc1, ?deps.definitions);
+    val r_2011: res[ModuleScope, fail.Fail] = module_scope(?s, f.mid, ?f.a1, f.fqn, ?f.sm1, ?f.rr2, ?f.cc1);
     if (sel r_2011.ok) { code = 1; }
-    val r_2012: res[ModuleScope, fail.Fail] = module_scope(?s, mid, ?a1, fqn, ?sm1, ?rr1, ?cc2, ?deps.definitions);
-    if (sel r_2012.ok) { code = 1; }
-    val r_2013: res[ModuleScope, fail.Fail] = module_scope(?s, mid, nil, fqn, ?sm1, ?rr1, ?cc1, ?deps.definitions);
+    val r_2013: res[ModuleScope, fail.Fail] = module_scope(?s, f.mid, nil, f.fqn, ?f.sm1, ?f.rr1, ?f.cc1);
     if (sel r_2013.ok) { code = 1; }
-    val r_2014: res[ModuleScope, fail.Fail] = module_scope(?s, mid, ?a1, fqn, nil, ?rr1, ?cc1, ?deps.definitions);
+    val r_2014: res[ModuleScope, fail.Fail] = module_scope(?s, f.mid, ?f.a1, f.fqn, nil, ?f.rr1, ?f.cc1);
     if (sel r_2014.ok) { code = 1; }
-    val r_2015: res[ModuleScope, fail.Fail] = module_scope(?s, mid, ?a1, fqn, ?sm1, nil, ?cc1, ?deps.definitions);
+    val r_2015: res[ModuleScope, fail.Fail] = module_scope(?s, f.mid, ?f.a1, f.fqn, ?f.sm1, nil, ?f.cc1);
     if (sel r_2015.ok) { code = 1; }
-    val r_2016: res[ModuleScope, fail.Fail] = module_scope(?s, mid, ?a1, fqn, ?sm1, ?rr1, nil, ?deps.definitions);
+    val r_2016: res[ModuleScope, fail.Fail] = module_scope(?s, f.mid, ?f.a1, f.fqn, ?f.sm1, ?f.rr1, nil);
     if (sel r_2016.ok) { code = 1; }
-    val r_2017: res[ModuleScope, fail.Fail] = module_scope(?s, module.id(1), ?a1, fqn, ?sm1, ?rr1, ?cc1, ?deps.definitions);
+    val r_2017: res[ModuleScope, fail.Fail] = module_scope(?s, module.id(1), ?f.a1, f.fqn, ?f.sm1, ?f.rr1, ?f.cc1);
     if (sel r_2017.ok) { code = 1; }
 
     ret code;
@@ -2070,49 +2099,28 @@ test request__refuses_a_module_product_that_does_not_correspond {
     if (sel sr.err) { ret 1; }
     var s: session.Session = sr.ok;
     fin { session.dnit(?s); }
-
-    var a1:  ast.Ast;
-    var a2:  ast.Ast;
-    var sm1: fe_sema.SemaResult = fe_sema.SemaResult{};
-    var rr1: resolve.ResolveResult;
-    var cc1: comptime.ComptimeCtx;
-    var tgt: resolved.Target;
-
-    val file: res[lang_source.FileId, lang_source.Error] = lang_source.add(?s.sources, "m.mach", "");
-    if (sel file.err) { ret 1; }
-    a1.incarnation = 1;
-    a1.file_id     = file.ok;
-    rr1.status     = fail.accepted();
-    sm1.status     = fail.accepted();
-
-    val mid: session.ModuleId = module.id(0);
-    val fqn: intern.StrId     = intern.str_id(7);
-
-    val ri: err[fail.Fail] = session.register_module_identity(?s, mid, ?a1, fqn, module.stable_id(5));
-    if (sel ri.err) { ret 1; }
-
-    var current: fe_sema.Definition = fe_sema.Definition{
-        parsed: resolve.ParsedDefinition{a: ?a1, owner: resolve.type_owner(?s, mid, a1.file_id), incarnation: a1.incarnation},
-        origin: mid, rr: ?rr1, sr: ?sm1, ctx: ?cc1
-    };
-    var deps: fe_sema.SemaDeps = fe_sema.SemaDeps{
-        definitions: fe_sema.reader_init((?current)::ptr, fixture_definition, ?alloc)
-    };
-    fin { fe_sema.reader_dnit(?deps.definitions); }
+    var f: ScopeFixture;
+    if (!scope_fixture(?s, ?f)) { ret 1; }
+    var tgt:    resolved.Target          = resolved.Target{};
+    val reader: fe_sema.interface.Reader = fe_sema.interface.Reader{ctx: nil, read: fixture_interface};
+    val unread: fe_sema.interface.Reader = fe_sema.interface.Reader{ctx: nil, read: nil};
 
     var code: i32 = 0;
 
-    val good: res[LowerRequest, fail.Fail] = request(?s, ?tgt, ?alloc, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, nil, false, false, true, nil, ?deps);
+    val good: res[LowerRequest, fail.Fail] = request(?s, ?tgt, ?alloc, ?f.a1, f.fqn, f.mid, ?f.sm1, ?f.rr1, ?f.cc1, nil, false, false, true, nil, reader);
     if (sel good.err) { ret 1; }
     val req: LowerRequest = good.ok;
-    if (req.module.a != ?a1 || !module.same(req.module.own_module, mid)) { code = 1; }
+    if (req.module.a != ?f.a1 || !module.same(req.module.own_module, f.mid)) { code = 1; }
+    if (req.instances != ?f.sm1.instances)                                   { code = 1; }
 
-    val r_2066: res[LowerRequest, fail.Fail] = request(?s, nil, ?alloc, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, nil, false, false, true, nil, ?deps);
+    val r_2066: res[LowerRequest, fail.Fail] = request(?s, nil, ?alloc, ?f.a1, f.fqn, f.mid, ?f.sm1, ?f.rr1, ?f.cc1, nil, false, false, true, nil, reader);
     if (sel r_2066.ok) { code = 1; }
-    val r_2067: res[LowerRequest, fail.Fail] = request(?s, ?tgt, nil, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, nil, false, false, true, nil, ?deps);
+    val r_2067: res[LowerRequest, fail.Fail] = request(?s, ?tgt, nil, ?f.a1, f.fqn, f.mid, ?f.sm1, ?f.rr1, ?f.cc1, nil, false, false, true, nil, reader);
     if (sel r_2067.ok) { code = 1; }
-    val r_2068: res[LowerRequest, fail.Fail] = request(?s, ?tgt, ?alloc, ?a2, fqn, mid, ?sm1, ?rr1, ?cc1, nil, false, false, true, nil, ?deps);
+    val r_2068: res[LowerRequest, fail.Fail] = request(?s, ?tgt, ?alloc, ?f.a2, f.fqn, f.mid, ?f.sm1, ?f.rr1, ?f.cc1, nil, false, false, true, nil, reader);
     if (sel r_2068.ok) { code = 1; }
+    val r_2069: res[LowerRequest, fail.Fail] = request(?s, ?tgt, ?alloc, ?f.a1, f.fqn, f.mid, ?f.sm1, ?f.rr1, ?f.cc1, nil, false, false, true, nil, unread);
+    if (sel r_2069.ok) { code = 1; }
 
     ret code;
 }

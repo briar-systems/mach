@@ -248,6 +248,14 @@ pub fun remap_result(r: *ResolveResult, s: *session.Session);
 pub fun result_dnit(r: *ResolveResult);
 ```
 
+## fun result_copy
+
+```mach
+pub fun result_copy(r: *ResolveResult, alloc: *A.Allocator) res[ResolveResult, fail.Fail];
+```
+
+an owned copy of `r` from `alloc`, every entry at the id it has in `r`
+
 ## fun resolve
 
 ```mach
@@ -285,6 +293,15 @@ whether a declaration carries `#[testing]`, which confines every reference to it
 ```mach
 pub fun symbol_is_runtime(sym: *Symbol) bool;
 ```
+
+## fun expr_is_runtime
+
+```mach
+pub fun expr_is_runtime(rr: *ResolveResult, eid: ast_id.ExprId) bool;
+```
+
+whether a resolved expression names a runtime binding, a local or a parameter
+whose value no comptime evaluation sees; false for a name that resolved to none
 
 ## fun expression
 
