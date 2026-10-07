@@ -23,6 +23,7 @@ use mach.lang.deprecation;
 use mach.lang.diagnostic;
 use diagnostic_kind: mach.lang.diagnostic.kind;
 use mach.lang.fail;
+use fe_asm: mach.lang.fe.asm;
 use mach.lang.fe.ast;
 use ast_decl: mach.lang.fe.ast.decl;
 use ast_expr: mach.lang.fe.ast.expr;
@@ -304,6 +305,7 @@ rec ResolveContext {
     symbol_imports: collections_vector.Vector[SymbolImport];
     # `fwd` paths, which use the imports they name once every import is collected
     fwd_paths: collections_vector.Vector[lang_source.Span];
+    asm_binds: collections_vector.Vector[AsmBind];
 
     expr_choices:       *interpretation.Choice;
     expr_choices_count: usize;
@@ -333,11 +335,21 @@ pub rec ResolveResult {
     expr_choices:       *interpretation.Choice;
     expr_choices_count: usize;
 
+    # the local each `{name}` of an asm block binds
+    asm_binds: collections_vector.Vector[AsmBind];
+
     # a module-scope `$error` in a decided arm refused the module, so nothing else was resolved
     refused: bool;
 
     remap_sequence: u64;
     remap_modules:  u32;
+}
+
+# one `{name}` of an asm block and the local it binds
+pub rec AsmBind {
+    stmt:   ast_id.StmtId;
+    name:   intern.StrId;
+    symbol: SymbolId;
 }
 
 pub fun param_symbol(r: *ResolveResult, decl: ast_id.DeclId, slot: u32) SymbolId {
@@ -399,6 +411,7 @@ pub fun result_dnit(r: *ResolveResult) {
         A.deallocate[interpretation.Choice](r.alloc, r.expr_choices, r.expr_choices_count);
     }
     map.dnit[u64, SymbolId](?r.param_index);
+    collections_vector.dnit[AsmBind](?r.asm_binds);
     comptime.bindings_dnit(?r.constants);
     r.symbols               = nil;
     r.symbol_count          = 0;
@@ -457,7 +470,16 @@ pub fun result_copy(r: *ResolveResult, alloc: *A.Allocator) res[ResolveResult, f
         ret res[ResolveResult, fail.Fail].err{bound.err};
     }
     out.constants = bound.ok;
-    done          = true;
+    out.asm_binds = collections_vector.init[AsmBind](alloc);
+    val binds: res[usize, A.Error] = collections_vector.reserve[AsmBind](?out.asm_binds, r.asm_binds.len);
+    if (sel binds.err) { ret res[ResolveResult, fail.Fail].err{fail.refused(binds.err)}; }
+    var bi: usize = 0;
+    for (bi < r.asm_binds.len) {
+        out.asm_binds.data[bi] = r.asm_binds.data[bi];
+        bi                     = bi + 1;
+    }
+    out.asm_binds.len = r.asm_binds.len;
+    done              = true;
     ret res[ResolveResult, fail.Fail].ok{out};
 }
 
@@ -622,6 +644,7 @@ fun init_context(
     rc.lint_imports   = session.module_is_root_project(s, own_module);
     rc.symbol_imports = collections_vector.init[SymbolImport](s.alloc);
     rc.fwd_paths      = collections_vector.init[lang_source.Span](s.alloc);
+    rc.asm_binds      = collections_vector.init[AsmBind](s.alloc);
 
     rc.expr_choices       = nil;
     rc.expr_choices_count = 0;
@@ -720,6 +743,7 @@ fun dnit_context(rc: *ResolveContext) {
     map.dnit[intern.StrId, SymbolId](?rc.refused_names);
     collections_vector.dnit[SymbolImport](?rc.symbol_imports);
     collections_vector.dnit[lang_source.Span](?rc.fwd_paths);
+    collections_vector.dnit[AsmBind](?rc.asm_binds);
 }
 
 fun open_scope(rc: *ResolveContext, parent: ScopeId) res[ScopeId, fail.Fail] {
@@ -2109,20 +2133,77 @@ fun mark_arm_names(rc: *ResolveContext, start: u32, len: u32, bound: u32, at_dec
 }
 
 # an asm body names what it uses in `{name}` substitutions, which lowering binds
-fun mark_asm_names(rc: *ResolveContext, body: lang_source.Span) {
-    if (rc.symbol_imports.len == 0) { ret; }
-    val end: usize = body.offset + body.len;
-    var i:   usize = body.offset;
-    for (i < end) {
-        if (rc.source[i] != '{'::char) {
-            i = i + 1;
-            cnt;
+# binds each `{name}` of an asm block to the local it names: a runtime `val`, `var` or
+# parameter in scope, which lowering stores to and loads from by its slot
+fun bind_asm(rc: *ResolveContext, sid: ast_id.StmtId, body: lang_source.Span) err[fail.Fail] {
+    var at: usize = body.offset;
+    for (true) {
+        val r: fe_asm.Ref = fe_asm.ref_next(rc.source, body, ?at);
+        if (r.kind == fe_asm.REF_END) { brk; }
+        if (r.kind == fe_asm.REF_UNTERMINATED) {
+            record_report(rc, diagnostic_kind.ASM_SYNTAX, body, "unterminated '{' in inline asm body");
+            brk;
         }
-        var j: usize = i + 1;
-        for (j < end && rc.source[j] != '}'::char) { j = j + 1; }
-        mark_names_in(rc, lang_source.Span{offset: i + 1, len: j - i - 1});
-        i = j + 1;
+        if (r.kind == fe_asm.REF_EMPTY) {
+            record_report(rc, diagnostic_kind.ASM_SYNTAX, body, "empty '{}' in asm body; write '{name}' to reference a local");
+            brk;
+        }
+        mark_names_in(rc, r.inner);
+        if (r.kind == fe_asm.REF_NAME) {
+            val bound: err[fail.Fail] = bind_asm_name(rc, sid, body, r.inner);
+            if (sel bound.err) { ret bound; }
+        }
     }
+    ret err[fail.Fail].ok{};
+}
+
+fun bind_asm_name(rc: *ResolveContext, sid: ast_id.StmtId, body: lang_source.Span, name_span: lang_source.Span) err[fail.Fail] {
+    val name_r: res[intern.StrId, A.Error] = intern.range_add(?rc.s.interner, rc.source, name_span.offset, name_span.len);
+    if (sel name_r.err) { ret err[fail.Fail].err{fail.refused(name_r.err)}; }
+    val name: intern.StrId = name_r.ok;
+    var i:    usize        = 0;
+    for (i < rc.asm_binds.len) {
+        val b: *AsmBind = ?rc.asm_binds.data[i];
+        if (ast_id.stmt_same(b.stmt, sid) && intern.str_same(b.name, name)) { ret err[fail.Fail].ok{}; }
+        i = i + 1;
+    }
+    val found: SymbolId = scope_lookup_chain(rc, rc.current_scope, name);
+    var local: bool     = false;
+    if (!symbol_is_nil(found) && !symbol_is_rejected(found)) {
+        val sym: *Symbol = ?rc.symbols[symbol_index(found)];
+        local = (sym.kind == SYM_VAL || sym.kind == SYM_VAR || sym.kind == SYM_PARAM) && (sym.flags & SYM_FLAG_MODULE) == 0;
+        if (local && !symbol_is_runtime(sym)) {
+            ret report_asm_name(rc, body, "'", name, "' is not stack-allocated and cannot be used in inline asm");
+        }
+    }
+    if (!local) {
+        ret report_asm_name(rc, body, "unknown local '", name, "' in inline asm; only stack-allocated variables in scope can be referenced");
+    }
+    val pushed: res[usize, A.Error] = collections_vector.push[AsmBind](?rc.asm_binds, AsmBind{stmt: sid, name: name, symbol: found});
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun report_asm_name(rc: *ResolveContext, body: lang_source.Span, prefix: str, name: intern.StrId, suffix: str) err[fail.Fail] {
+    val begun: res[diagnostic.DiagnosticBuilder, fail.Fail] = named_builder(rc, diagnostic_kind.ASM_LOCAL, body, prefix, name, suffix);
+    if (sel begun.err) { ret err[fail.Fail].err{begun.err}; }
+    var b: diagnostic.DiagnosticBuilder = begun.ok;
+    val r: err[fail.Fail]               = commit_built(rc, ?b);
+    if (sel r.err) { ret r; }
+    ret err[fail.Fail].ok{};
+}
+
+# the locals an asm block binds, in the order its body names them
+pub fun asm_binds_at(r: *ResolveResult, sid: ast_id.StmtId, out: *collections_vector.Vector[AsmBind]) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < r.asm_binds.len) {
+        if (ast_id.stmt_same(r.asm_binds.data[i].stmt, sid)) {
+            val pushed: res[usize, A.Error] = collections_vector.push[AsmBind](out, r.asm_binds.data[i]);
+            if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
 }
 
 fun name_byte(c: char) bool {
@@ -2409,10 +2490,7 @@ fun bind_stmt(rc: *ResolveContext, sid: ast_id.StmtId) err[fail.Fail] {
     if (s.kind == ast_stmt.STMT_KIND_DECL) {
         ret bind_local_decl(rc, s.data.decl.decl);
     }
-    if (s.kind == ast_stmt.STMT_KIND_ASM) {
-        mark_asm_names(rc, s.data.asm_.body);
-        ret err[fail.Fail].ok{};
-    }
+    if (s.kind == ast_stmt.STMT_KIND_ASM) { ret bind_asm(rc, sid, s.data.asm_.body); }
     if (s.kind == ast_stmt.STMT_KIND_COMPTIME_IF) {
         ret bind_comptime_if(rc, s.data.comptime_if.branches_start, s.data.comptime_if.branches_len, false);
     }
@@ -3383,6 +3461,11 @@ fun build_result(rc: *ResolveContext) res[ResolveResult, fail.Fail] {
     remap_symbol_refs(rc.expr_resolved, rc.a.exprs.len::u32, remap, rc.sym_len);
     remap_symbol_refs(rc.type_resolved, rc.a.types.len::u32, remap, rc.sym_len);
     remap_symbol_refs(rc.decl_symbol, rc.a.decls.len::u32, remap, rc.sym_len);
+    var bi: usize = 0;
+    for (bi < rc.asm_binds.len) {
+        remap_symbol_refs(?rc.asm_binds.data[bi].symbol, 1, remap, rc.sym_len);
+        bi = bi + 1;
+    }
 
     if (remap != nil) { A.deallocate[u32](rc.s.alloc, remap, rc.sym_len::usize); }
 
@@ -3438,6 +3521,8 @@ fun build_result(rc: *ResolveContext) res[ResolveResult, fail.Fail] {
 
     out.expr_choices       = rc.expr_choices;
     out.expr_choices_count = rc.expr_choices_count;
+    out.asm_binds          = rc.asm_binds;
+    rc.asm_binds           = collections_vector.init[AsmBind](rc.s.alloc);
     out.constants          = comptime.publish(rc.ctx);
 
     rc.expr_resolved      = nil;
