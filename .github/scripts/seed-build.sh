@@ -2,8 +2,7 @@
 # builds this compiler with a 6.x seed, which reads only the previous major's
 # manifest keys. the seed builds a staged copy, out/seed: the source, std at the
 # committed pin as a path dependency, and both manifests rewritten to the
-# previous keys. a compatibility path listed on #4490, removed once the seed is
-# a 7.x release
+# previous keys. a compatibility path removed once the seed is a 7.x release
 #
 # usage: seed-build.sh <seed> <output> [build options...]
 set -euo pipefail
