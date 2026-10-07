@@ -1,5 +1,6 @@
 use mach.lang.fail;
 use std.allocator.page;
+use std.collections.map;
 use fs:        std.filesystem;
 use io_error:  std.io.error;
 use io_writer: std.io.writer;
@@ -28,6 +29,7 @@ use diagnostic_kind: mach.lang.diagnostic.kind;
 use mach.lang.fe.ast;
 use ast_expr: mach.lang.fe.ast.expr;
 use ast_id:   mach.lang.fe.ast.id;
+use ast_stmt: mach.lang.fe.ast.stmt;
 use mach.lang.fe.resolve;
 use mach.lang.intern;
 use mach.lang.manifest;
@@ -95,7 +97,6 @@ use mach.lang.driver.tests.testing.ut_vec_lower;
 use mach.lang.driver.tests.testing.ut_vec_sema_n;
 use ir_id: mach.lang.me.ir.id;
 use mach.lang.module;
-use lang_target: mach.lang.target;
 use mach.lang.toolchain;
 use mach.lang.type.query.deep;
 
@@ -1304,11 +1305,105 @@ fun ut_has_extern_fn(s: *session.Session, m: *me_ir.Module, needle: str) bool {
     ret false;
 }
 
+# an importer emits instances of another module's generic and comptime-parameter functions from
+# the template that module's interface published: with the exporter's own syntax tree wrecked
+# after typing, they still lower, a string literal with the bytes it decoded to and an asm
+# block with the local it binds
+test instance__lowers_from_the_exporter_interface_not_its_tree {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val sr: res[session.Session, fail.Fail] = toolchain.session_init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+
+    var names: [2]str = [2]str{"main.mach", "lib.mach"};
+    var texts: [2]str;
+    texts[0] = "use uniontest.lib;\npub fun f() i64 { ret lib.keep[i64](41); }\npub fun g() i64 { ret lib.scale(3, 14); }\npub fun h() ptr { ret lib.tell[i64](1); }\npub fun k() i64 { ret lib.spin[i64](2); }\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub fun keep[T](x: T) T { val y: T = x; ret y; }\npub fun scale($k: i64, x: i64) i64 { ret x * k; }\npub fun tell[T](x: T) ptr { ret \"hi\\x41\"; }\npub fun spin[T](x: T) T { var y: T = x; asm x86_64 { mov rax, {y} } ret y; }\n";
+    val root_r: res[str, fail.Fail] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (sel root_r.err) { ret 2; }
+    var selection: manifest.Selectors              = ut_target_sel("linux");
+    val pr:        res[project.Project, fail.Fail] = driver.build_project(?s, root_r.ok, ?selection);
+    fs.remove_all(?alloc, root_r.ok);
+    if (sel pr.err) { ret 2; }
+    var p: project.Project = pr.ok;
+    fin { project.dnit_project(?p); }
+    val typed: err[fail.Fail] = driver.run_sema_pass(?p);
+    if (sel typed.err) { ret 3; }
+
+    val lib: *ast.Ast = project.module_at(?p, ut_mid(?p, ?s, "uniontest.lib")::u32).a;
+    if (lib == nil || lib.exprs.len == 0) { ret 4; }
+    var i: usize = 0;
+    for (i < lib.exprs.len) {
+        lib.exprs.data[i].kind = ast_expr.EXPR_KIND_ERROR;
+        i                      = i + 1;
+    }
+    i = 0;
+    for (i < lib.stmts.len) {
+        lib.stmts.data[i].kind = ast_stmt.STMT_KIND_ERROR;
+        i                      = i + 1;
+    }
+    i = 0;
+    for (i < lib.literal_bytes.len) {
+        lib.literal_bytes.data[i] = 0;
+        i                         = i + 1;
+    }
+
+    val lowered: err[fail.Fail] = driver.run_lower_pass(?p);
+    if (sel lowered.err) { ret 5; }
+    val m: *me_ir.Module = ut_ir_of(?p, ?s, "uniontest.main");
+    if (ut_defined_fn_count(?s, m, "keep") != 1)  { ret 6; }
+    if (ut_defined_fn_count(?s, m, "scale") != 1) { ret 7; }
+    if (!ut_rodata_holds(m, "hiA"))               { ret 8; }
+    if (ut_asm_bind_count(m) != 1)                { ret 9; }
+    ret 0;
+}
+
+# how many locals the asm blocks of `m` bind, over every function
+#[testing]
+fun ut_asm_bind_count(m: *me_ir.Module) u32 {
+    if (m == nil) { ret 0; }
+    var n:  u32 = 0;
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val f:  *me_ir.Function = ?m.functions[fi];
+        var it: map.Iter        = map.iter[me_ir.InstructionId, me_ir.IrAsm](?f.asm_blocks);
+        var e:  map.Entry[me_ir.InstructionId, me_ir.IrAsm];
+        for (map.next[me_ir.InstructionId, me_ir.IrAsm](?f.asm_blocks, ?it, ?e)) { n = n + e.value.bind_count; }
+        fi = fi + 1;
+    }
+    ret n;
+}
+
+# whether a read-only global of `m` holds exactly `text`, its terminator aside
+#[testing]
+fun ut_rodata_holds(m: *me_ir.Module, text: str) bool {
+    if (m == nil) { ret false; }
+    val n:  usize = str_len(text);
+    var gi: u32   = 0;
+    for (gi < m.global_len) {
+        val v: value.Value = (?m.globals[gi]).init;
+        if (v.kind == value.VAL_CONST_BYTES && v.data.bytes.len::usize == n + 1) {
+            var same: bool  = true;
+            var k:    usize = 0;
+            for (k < n) {
+                if (v.data.bytes.ptr[k] != text[k]::u8) { same = false; }
+                k = k + 1;
+            }
+            if (same) { ret true; }
+        }
+        gi = gi + 1;
+    }
+    ret false;
+}
+
 # how a module value reaches an importer: a qualified or leaf-imported `val` folds to its
 # own module's value whatever shadows it, a same-module global folds through a cross-module
 # base, an own `val` folds and its global goes unused, an aliased import folds, a `fun`, a
-# `var`, a pointer `val` and a string `val` stay references to one definition, and a `def`
-# is the declaring module's
+# `var`, a pointer `val` and a string `val` stay references to one definition, a `def` is the
+# declaring module's, and a `$each` over an imported array folds its elements
 test module_const__folds_across_modules {
     var alloc:  A.Allocator;
     val make_r: err[A.Error] = page.make(?alloc);
@@ -1320,8 +1415,8 @@ test module_const__folds_across_modules {
 
     var names: [4]str = [4]str{"main.mach", "a.mach", "b.mach", "c.mach"};
     var texts: [4]str;
-    texts[0] = "use uniontest.a;\nuse uniontest.a.K;\nuse uniontest.a.MSG;\nuse x: uniontest.c;\nuse uniontest.b;\nval X: i64 = 707;\nval A: u64 = a.BASE + 0x48;\nval B: u64 = A + 8;\ndef T: [9]u8;\nfun f() i64 { ret 101; }\nvar G: i64 = 404;\npub val N: i64 = 6543;\npub fun p1() i64 { ret a.X; }\npub fun p2() i64 { ret X; }\npub fun p3() i64 { ret b.Y; }\npub fun p4() i64 { ret b.K; }\npub fun p5() i64 { ret K; }\npub fun p6() u64 { ret B; }\npub fun p7() i64 { ret a.f(); }\npub fun p8() i64 { ret a.G; }\npub fun p9() u64 { ret $size_of(a.T); }\npub fun p10() i64 { val L: i64 = 808; ret a.L + L; }\npub fun p11() i64 { ret N; }\npub fun p12() i64 { ret x.N; }\npub fun p13() ptr { ret x.PH; }\npub fun p14() ptr { ret a.MSG; }\npub fun p15() ptr { ret MSG; }\nfun main() i32 { ret 0; }\n";
-    texts[1] = "pub val X: i64 = 909;\npub val K: i64 = 303;\npub rec P { x: u64; y: u64; }\npub val BASE: u64 = $size_of(P);\npub def T: [7]u8;\npub fun f() i64 { ret 202; }\npub var G: i64 = 505;\npub val L: i64 = 616;\npub val MSG: ptr = \"hello\";\n";
+    texts[0] = "use uniontest.a;\nuse uniontest.a.K;\nuse uniontest.a.MSG;\nuse x: uniontest.c;\nuse uniontest.b;\nval X: i64 = 707;\nval A: u64 = a.BASE + 0x48;\nval B: u64 = A + 8;\ndef T: [9]u8;\nfun f() i64 { ret 101; }\nvar G: i64 = 404;\npub val N: i64 = 6543;\npub fun p1() i64 { ret a.X; }\npub fun p2() i64 { ret X; }\npub fun p3() i64 { ret b.Y; }\npub fun p4() i64 { ret b.K; }\npub fun p5() i64 { ret K; }\npub fun p6() u64 { ret B; }\npub fun p7() i64 { ret a.f(); }\npub fun p8() i64 { ret a.G; }\npub fun p9() u64 { ret $size_of(a.T); }\npub fun p10() i64 { val L: i64 = 808; ret a.L + L; }\npub fun p11() i64 { ret N; }\npub fun p12() i64 { ret x.N; }\npub fun p13() ptr { ret x.PH; }\npub fun p14() ptr { ret a.MSG; }\npub fun p15() ptr { ret MSG; }\npub fun p16() i64 { var t: i64 = 0; $each v in a.ARR { t = t + v; } ret t; }\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub val X: i64 = 909;\npub val K: i64 = 303;\npub rec P { x: u64; y: u64; }\npub val BASE: u64 = $size_of(P);\npub def T: [7]u8;\npub fun f() i64 { ret 202; }\npub var G: i64 = 505;\npub val L: i64 = 616;\npub val MSG: ptr = \"hello\";\npub val ARR: [3]i64 = [3]i64{7771, 7772, 7773};\n";
     texts[2] = "pub val Y: i64 = 1505;\npub val K: i64 = 606;\n";
     texts[3] = "pub val N: i64 = 4321;\npub var H: i64 = 1;\npub val PH: ptr = ?H;\n";
 
@@ -1333,9 +1428,9 @@ test module_const__folds_across_modules {
     val m: *me_ir.Module = ut_ir_of(?p, ?s, "uniontest.main");
     if (m == nil) { ret 4; }
 
-    var folded: [9]u64 = [9]u64{909, 707, 1505, 606, 303, 0x60, 1424, 6543, 4321};
-    var i:      usize  = 0;
-    for (i < 9) {
+    var folded: [10]u64 = [10]u64{909, 707, 1505, 606, 303, 0x60, 1424, 6543, 4321, 23316};
+    var i:      usize   = 0;
+    for (i < 10) {
         if (ut_const_uses(m, folded[i]) != 1) { ret (10 + i)::i32; }
         i = i + 1;
     }
