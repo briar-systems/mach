@@ -147,6 +147,14 @@ fwd comptime_value.CT_KIND_INT
 
 forwards [`mach.lang.fe.comptime.value.CT_KIND_INT`](comptime/value.md#val-ct_kind_int)
 
+## fwd comptime_value.CT_KIND_NODE
+
+```mach
+fwd comptime_value.CT_KIND_NODE
+```
+
+forwards [`mach.lang.fe.comptime.value.CT_KIND_NODE`](comptime/value.md#val-ct_kind_node)
+
 ## fwd comptime_value.CT_KIND_NON_INTEGER
 
 ```mach
@@ -322,6 +330,14 @@ fwd comptime_value.is_descriptor
 ```
 
 forwards [`mach.lang.fe.comptime.value.is_descriptor`](comptime/value.md#fun-is_descriptor)
+
+## fwd comptime_value.node_ref
+
+```mach
+fwd comptime_value.node_ref
+```
+
+forwards [`mach.lang.fe.comptime.value.node_ref`](comptime/value.md#fun-node_ref)
 
 ## fwd comptime_value.non_integer
 
@@ -866,6 +882,14 @@ fwd comptime_scope.layer_set
 ```
 
 forwards [`mach.lang.fe.comptime.scope.layer_set`](comptime/scope.md#fun-layer_set)
+
+## fwd comptime_scope.lowering_prepare
+
+```mach
+fwd comptime_scope.lowering_prepare
+```
+
+forwards [`mach.lang.fe.comptime.scope.lowering_prepare`](comptime/scope.md#fun-lowering_prepare)
 
 ## fwd comptime_scope.lookup
 

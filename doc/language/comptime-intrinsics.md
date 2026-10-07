@@ -822,16 +822,19 @@ fun run(n: i64) {
 }
 ```
 
-**Eligibility.** `ARR` must name an immutable `val` (never a `var`) declared in
-the current module, whose type is a fixed-size array `[N]E` fully initialized by
-an array literal of exactly `N` elements. `E` must be a scalar or record type;
+**Eligibility.** `ARR` must name an immutable `val` (never a `var`), declared in
+the current module, in a body, or in a module it imports, whose type is a
+fixed-size array `[N]E` fully initialized by an array literal of exactly `N`
+elements. `E` must be a scalar or record type;
 nested-array element types are not supported. An empty array (`[0]E`) unrolls to
 nothing. Each violation is reported with a teaching diagnostic.
 
 `x.field` on a record element projects the element's constant: a scalar field
-folds to a constant, a function-pointer field yields a function reference, and a
-record field materializes the nested literal. Projection is one level deep
-(`x.field`); `x` itself is a constant and has no address (`?x` is rejected).
+folds to a constant, a field the literal leaves out reads as its zero, and a
+record field materializes the nested literal, at any depth (`x.a.b`). A part of
+the element with no compile-time value, such as a function-pointer field, is
+read from the array itself. `x` itself is a constant and has no address (`?x` is
+rejected).
 
 ## Diagnostic intrinsics
 

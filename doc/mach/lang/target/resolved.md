@@ -64,7 +64,8 @@ pub rec Facts;
 what a program may ask of its target while it compiles: the catalog ids, the machine's
 widths and float support, the va_list shape, the instruction and type table, the
 constant-time multiply cells it admits, the extensions it selects and every vocabulary
-they are read against, and what a float conversion makes of a NaN
+they are read against, what a float conversion makes of a NaN, and whether `asm` reaches
+an assembler
 
 ## fun facts
 

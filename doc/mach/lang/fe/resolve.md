@@ -224,10 +224,24 @@ binding_count: how many records `bindings` holds
 pub rec ResolveResult;
 ```
 
+## rec AsmBind
+
+```mach
+pub rec AsmBind;
+```
+
+one `{name}` of an asm block and the local it binds
+
 ## fun param_symbol
 
 ```mach
 pub fun param_symbol(r: *ResolveResult, decl: ast_id.DeclId, slot: u32) SymbolId;
+```
+
+## fun stable_of_module
+
+```mach
+pub fun stable_of_module(s: *session.Session, mid: session.ModuleId) session.StableModuleId;
 ```
 
 ## fun type_owner
@@ -241,6 +255,33 @@ pub fun type_owner(s: *session.Session, mid: session.ModuleId, file: lang_source
 ```mach
 pub fun remap_result(r: *ResolveResult, s: *session.Session);
 ```
+
+## rec Exporters
+
+```mach
+pub rec Exporters;
+```
+
+the modules an importer's resolution reads: how many are loaded, with ids below that count,
+each one's resolution, nil when it has none, whether that resolution is current, and the
+path it is imported by
+
+## fun deps_of
+
+```mach
+pub fun deps_of(alloc: *A.Allocator, l: *fe_load.Loader, m: *fe_load.Module, from: *Exporters) res[ResolveDeps, fail.Fail];
+```
+
+the exports module `m` of loader `l` reads: each loaded module it imports and every module a
+reached one re-exports, each once, allocated from `alloc` and released with deps_dnit
+
+## fun deps_dnit
+
+```mach
+pub fun deps_dnit(alloc: *A.Allocator, deps: *ResolveDeps);
+```
+
+release what deps_of allocated
 
 ## fun result_dnit
 
@@ -287,6 +328,14 @@ pub fun declaration_testing(a: *ast.Ast, did: ast_id.DeclId) bool;
 ```
 
 whether a declaration carries `#[testing]`, which confines every reference to it to test code
+
+## fun asm_binds_at
+
+```mach
+pub fun asm_binds_at(r: *ResolveResult, sid: ast_id.StmtId, out: *collections_vector.Vector[AsmBind]) err[fail.Fail];
+```
+
+the locals an asm block binds, in the order its body names them
 
 ## fun symbol_is_runtime
 

@@ -8,8 +8,9 @@ element types. a frame is one typing of a stretch of syntax: frame 0 is the modu
 typing, which the module's typing tables hold, each instance has a root frame, and each
 `$each` iteration has a frame under the frame its statement was typed in. a frame holds
 what its typing decided differently from its parent's: expression and binding types, the
-instance each call names, and the verdict of each comptime gate. a lookup walks a frame
-and its parents, and a miss falls to the module's typing tables
+instance each call names, the verdict of each comptime gate, and the constant array each
+`$each` over one reads. a lookup walks a frame and its parents, and a miss falls to the
+module's typing tables
 
 ## def Kind
 
@@ -208,6 +209,14 @@ pub fun call_record(set: *Set, frame: u32, eid: ast_id.ExprId, id: u32) err[fail
 pub fun gate_record(set: *Set, frame: u32, cond: ast_id.ExprId, active: bool) err[fail.Fail];
 ```
 
+## fun each_record
+
+```mach
+pub fun each_record(set: *Set, frame: u32, sid: ast_id.StmtId, array: comptime.CTValue) err[fail.Fail];
+```
+
+the published constant value of the array the `$each` at `sid` reads
+
 ## fun expr_type_at
 
 ```mach
@@ -232,6 +241,12 @@ the instance the call or generic reference `eid` names in frame `frame`
 
 ```mach
 pub fun gate_at(set: *Set, frame: u32, cond: ast_id.ExprId) opt[bool];
+```
+
+## fun each_at
+
+```mach
+pub fun each_at(set: *Set, frame: u32, sid: ast_id.StmtId) opt[comptime.CTValue];
 ```
 
 ## fun edge_add

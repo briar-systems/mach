@@ -10,11 +10,13 @@ use ast_expr: mach.lang.fe.ast.expr;
 use ast_id:   mach.lang.fe.ast.id;
 use ast_type: mach.lang.fe.ast.type;
 use mach.lang.fe.comptime;
+use comptime_deep: mach.lang.fe.comptime.deep;
 use mach.lang.fe.decorator;
 use mach.lang.fe.resolve;
 use sema_growth:   mach.lang.fe.sema.growth;
 use sema_instance: mach.lang.fe.sema.instance;
-use sema_product:  mach.lang.fe.sema.product;
+use mach.lang.fe.sema.interface;
+use sema_product: mach.lang.fe.sema.product;
 use mach.lang.growth;
 use mach.lang.intern;
 use mach.lang.layout;
@@ -23,7 +25,8 @@ use mach.lang.session;
 use lang_source: mach.lang.source;
 use mach.lang.type;
 use type_query: mach.lang.type.query;
-use A:          std.allocator;
+use mach.lang.type.query.logical;
+use A: std.allocator;
 use std.collections.map;
 use std.text.string.str_free;
 use std.types.bool.bool;
@@ -136,22 +139,31 @@ pub rec Offer {
 # collect_insts:       whether the walk records the instances it asks for
 # subst_fn:            substitutes an instance's type arguments into a type
 # annotation_check_fn: the per-instance checks over one type annotation, run as each is resolved
+# module:              the stable id of the module being typed
+# values:              the store the module's constant values are built in, which its
+#                      interface publishes
 pub rec Typing {
-    deps:                *sema_product.SemaDeps;
-    caps:                comptime.PhaseCapabilities[SemaContext];
-    type_caps:           comptime.PhaseCapabilities[SemaContext];
-    insts:               *InstWorklist;
-    growth:              *sema_growth.Analysis;
-    collect_insts:       bool;
-    uni_reports:         *UniReports;
-    handle_reports:      *UniReports;
+    deps:           *sema_product.SemaDeps;
+    caps:           comptime.PhaseCapabilities[SemaContext];
+    type_caps:      comptime.PhaseCapabilities[SemaContext];
+    insts:          *InstWorklist;
+    growth:         *sema_growth.Analysis;
+    collect_insts:  bool;
+    uni_reports:    *UniReports;
+    handle_reports: *UniReports;
+    # the module's tests typed so far, by name
+    tests: *map.Map[u32, u32];
+    # the types a logical-addressing target was asked to declare, each judged once
+    logical_seen:        *map.Map[type.TypeId, bool];
     has_secret:          bool;
     subst_fn:            fun(*session.Session, type.TypeId, *type.GenericOwner, *type.TypeId, u32) res[type.TypeId, fail.Fail];
     annotation_check_fn: fun(*SemaContext, ast_id.TypeId);
+    module:              session.StableModuleId;
+    values:              *comptime_deep.Store;
 }
 
 # the module a walk reads and the typing tables it writes: the module being typed, or the
-# declaring module of an instance or of an imported `$each` sequence
+# declaring module of an instance
 pub rec ModuleView {
     a:          *ast.Ast;
     rr:         *resolve.ResolveResult;
@@ -164,8 +176,10 @@ pub rec ModuleView {
     decl_type:          *type.TypeId;
     type_resolved_memo: *u8;
     layout_state:       *u8;
-    # how far each module `val` is bound (see sema.constant); nil in a view of another module
+    # how far each module `val` is bound, and the node of its value in the module's store once
+    # built (see sema.constant); nil in a view of another module
     constant_state: *u8;
+    constant_node:  *u32;
     embed_len:      *u64;
     embed_paths:    *intern.StrId;
     embed_path_len: u32;
@@ -511,6 +525,7 @@ pub fun inst_worklist_dnit(sc: *SemaContext) {
 pub fun expr_type_set(sc: *SemaContext, eid: ast_id.ExprId, ty: type.TypeId) {
     if (sc.view.expr_type == nil || ast_id.expr_index(eid)::usize >= sc.view.a.exprs.len) { ret; }
     sc.view.expr_type[ast_id.expr_index(eid)] = ty;
+    logical_check(sc, ty, sc.view.a.exprs.data[ast_id.expr_index(eid)].span);
     if (!frame_records_typing(sc)) { ret; }
     val put: err[fail.Fail] = sema_instance.expr_record(?sc.typing.insts.set, sc.instance.frame, eid, ty);
     if (sel put.err) { fail.internal(?sc.status, fail.describe(put.err)); }
@@ -519,9 +534,54 @@ pub fun expr_type_set(sc: *SemaContext, eid: ast_id.ExprId, ty: type.TypeId) {
 pub fun decl_type_set(sc: *SemaContext, did: ast_id.DeclId, ty: type.TypeId) {
     if (sc.view.decl_type == nil || ast_id.decl_index(did)::usize >= sc.view.a.decls.len) { ret; }
     sc.view.decl_type[ast_id.decl_index(did)] = ty;
-    if (!frame_records_typing(sc)) { ret; }
+    val d: *ast_decl.Decl = ?sc.view.a.decls.data[ast_id.decl_index(did)];
+    if (d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR) { logical_check(sc, ty, d.span); }
+    if (d.kind == ast_decl.DECL_KIND_FUN)                                     { logical_check_signature(sc, d, ty); }
+    if (!frame_records_typing(sc))                                            { ret; }
     val put: err[fail.Fail] = sema_instance.decl_record(?sc.typing.insts.set, sc.instance.frame, did, ty);
     if (sel put.err) { fail.internal(?sc.status, fail.describe(put.err)); }
+}
+
+# a function's signature is judged a component at a time, each where it is written
+fun logical_check_signature(sc: *SemaContext, d: *ast_decl.Decl, ty: type.TypeId) {
+    val t: opt[*type.Type] = type.get(?sc.s.types, ty);
+    if (sel t.none)                   { ret; }
+    if (t.some.kind != type.TYPE_FUN) { ret; }
+    logical_check(sc, t.some.data.fn.ret_type, annotation_span(sc, d.data.fun_.return_type, d.span));
+    var i: u32 = 0;
+    for (i < t.some.data.fn.params_len) {
+        val p:  opt[type.TypeId] = type.get_param(?sc.s.types, t.some.data.fn.params_start + i);
+        var at: lang_source.Span = d.span;
+        if (i < d.data.fun_.params_len) { at = annotation_span(sc, sc.view.a.typed_names.data[d.data.fun_.params_start + i].ty, d.span); }
+        if (sel p.some)                 { logical_check(sc, p.some, at); }
+        i = i + 1;
+    }
+}
+
+fun annotation_span(sc: *SemaContext, tid: ast_id.TypeId, fallback: lang_source.Span) lang_source.Span {
+    if (ast_id.type_is_nil(tid)) { ret fallback; }
+    val t: opt[*ast_type.Type] = ast.get_type(sc.view.a, tid);
+    if (sel t.none) { ret fallback; }
+    ret t.some.span;
+}
+
+# a type the code needs that a logical-addressing target cannot declare is refused where
+# the code is written, once per type
+fun logical_check(sc: *SemaContext, ty: type.TypeId, span: lang_source.Span) {
+    if (sc.typing.logical_seen == nil || sc.view.ctx == nil || sc.walk.silent) { ret; }
+    if (sc.view.ctx.env.target.flat_addressing)                                { ret; }
+    if (type.is_nil(ty) || type.is_error(ty))                                  { ret; }
+    if (type.mentions_generic_param(?sc.s.types, ty))                          { ret; }
+    val fresh: res[bool, A.Error] = map.insert[type.TypeId, bool](sc.typing.logical_seen, ty, true);
+    if (sel fresh.err) {
+        fail.internal(?sc.status, lang_alloc.text(fresh.err));
+        ret;
+    }
+    if (!fresh.ok) { ret; }
+    var q: type_query.Query = query_of(sc);
+    val r: logical.Refusal  = logical.refusal(?q, ty);
+    if (r == logical.REFUSAL_RECURSIVE) { report(sc, diagnostic_kind.SPIRV_RECURSIVE_TYPE, span, logical.RECURSIVE_MSG); }
+    if (r == logical.REFUSAL_UNBOUNDED) { report(sc, diagnostic_kind.SPIRV_RECURSIVE_TYPE, span, logical.UNBOUNDED_MSG); }
 }
 
 # the walk is typing a value instance, so the comptime parameters of the function it
@@ -833,21 +893,9 @@ pub fun resolve_module_member_const(sc: *SemaContext, eid: ast_id.ExprId) res[op
     if (!exported.some.constant.present) {
         ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}};
     }
-    val item:  sema_product.TypeExport = exported.some;
-    val named: resolve.ExportConstant  = item.constant;
-    if (named.value.kind == comptime.CT_KIND_CONST_ELEM) {
-        val current: res[sema_product.DefinedSymbol, fail.Fail] = imported_definition(sc, sym, sema_product.DEFINITION_RESOLVED);
-        if (sel current.err) {
-            val reason: fail.Fail             = current.err;
-            var kind:   comptime.EvalFailKind = comptime.EVAL_FAIL_INTERNAL;
-            if (sel reason.reported) { kind = comptime.EVAL_FAIL_REJECTED; }
-            ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_error(kind, diagnostic_kind.COMPILER_INTERNAL, fail.describe(reason))};
-        }
-        if (current.ok.definition.parsed.incarnation != item.definition_incarnation) {
-            fail.internal(?sc.status, "constant element does not belong to the acquired parsed definition");
-            ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, fail.status_text(sc.status))};
-        }
-    }
+    val named: resolve.ExportConstant = exported.some.constant;
+    # another module's case-literal constant is no compile-time constant here (see tag.md)
+    if (named.value.kind == comptime.CT_KIND_NODE) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
     if (named.gated && sc.view.ctx.env.build.union_build) {
         val dep_path: intern.StrId        = session.module_fqn(sc.s, sym.origin);
         val msg_r:    res[str, fail.Fail] = gated_member_const_message(sc, sym.name, dep_path);
@@ -897,6 +945,30 @@ pub fun own_nominal_declaration(sc: *SemaContext, nominal: *type.Type) res[ast_i
     }
     if (ast_id.decl_is_nil(found) || ast_id.decl_index(found) >= sc.view.a.decls.len::u32) { ret res[ast_id.DeclId, fail.Fail].err{fail.message("nominal definition is absent from the active resolved owner")}; }
     ret res[ast_id.DeclId, fail.Fail].ok{found};
+}
+
+# the interface module `origin` published, read through the walk's acquisition of it
+pub fun interface_of(sc: *SemaContext, origin: session.ModuleId) res[*interface.Interface, fail.Fail] {
+    if (sc.typing.deps == nil) {
+        val reason: fail.Fail = fail.message("a published interface requires a definition reader");
+        fail.internal(?sc.status, fail.describe(reason));
+        ret res[*interface.Interface, fail.Fail].err{reason};
+    }
+    val acquired: res[sema_product.Definition, fail.Fail] = sema_product.acquire_definition(?sc.typing.deps.definitions, origin, sema_product.DEFINITION_TYPED);
+    if (sel acquired.err) {
+        val reason: fail.Fail = acquired.err;
+        if (sel reason.reported) { fail.reject(?sc.status); }
+        or                       { fail.internal(?sc.status, fail.describe(reason)); }
+        ret res[*interface.Interface, fail.Fail].err{reason};
+    }
+    ret res[*interface.Interface, fail.Fail].ok{?acquired.ok.sr.interface};
+}
+
+# the constant array the `$each` at `sid` reads in the walk's frame
+pub fun each_set(sc: *SemaContext, sid: ast_id.StmtId, array: comptime.CTValue) {
+    if (sc.typing.insts == nil) { ret; }
+    val put: err[fail.Fail] = sema_instance.each_record(?sc.typing.insts.set, sc.instance.frame, sid, array);
+    if (sel put.err) { fail.internal(?sc.status, fail.describe(put.err)); }
 }
 
 pub fun definition_ast(sc: *SemaContext, origin: session.ModuleId) *ast.Ast {

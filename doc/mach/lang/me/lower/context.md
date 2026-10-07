@@ -32,6 +32,15 @@ lowering the test object, which declares `name` because the normal object define
 pub rec ModuleScope;
 ```
 
+## rec EachElement
+
+```mach
+pub rec EachElement;
+```
+
+the element of a constant array a `$each` loop variable names: the array's expression and the
+element's index in it, where the element is stored
+
 ## rec ScopeMark
 
 ```mach
@@ -117,6 +126,14 @@ pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *me_ir.Module) er
 pub fun dnit_context(lc: *LowerContext);
 ```
 
+## fun each_element_of
+
+```mach
+pub fun each_element_of(lc: *LowerContext, name: intern.StrId) opt[EachElement];
+```
+
+the element the innermost `$each` loop variable `name` names
+
 ## fun interface_of
 
 ```mach
@@ -141,6 +158,14 @@ pub fun declared(lc: *LowerContext, sym: *resolve.Symbol) res[Declared, fail.Fai
 
 the declaration `sym` names: one of the module in scope by its id, or another module's by
 its kind and canonical name
+
+## fun constant_store
+
+```mach
+pub fun constant_store(lc: *LowerContext, module_index: u32) res[*comptime_deep.Store, fail.Fail];
+```
+
+the store of constant values the module with stable id `module_index` publishes in its interface
 
 ## fun declared_named
 
@@ -246,10 +271,10 @@ pub rec LocalBinding;
 pub fun bind_local(lc: *LowerContext, sym: resolve.SymbolId, v: value.Value, secrecy: ct.BindSecrecy) err[fail.Fail];
 ```
 
-## fun lookup_local_name
+## fun local_binding
 
 ```mach
-pub fun lookup_local_name(lc: *LowerContext, name: intern.StrId) opt[LocalBinding];
+pub fun local_binding(lc: *LowerContext, sym: resolve.SymbolId) opt[LocalBinding];
 ```
 
 ## fun lookup_local
@@ -325,13 +350,6 @@ pub fun debug_types_finish(lc: *LowerContext) err[fail.Fail];
 describes every pointee left waiting: one that holds by value an instance of
 an expansive generic this module describes no value of stays untyped, since
 such a generic has unboundedly many instances behind its pointers
-
-## fun gate_is_active
-
-```mach
-pub fun gate_is_active(lc: *LowerContext, source: str, cond: ast_id.ExprId,
-scope: comptime_gate.GateScope, cache: bool) res[bool, fail.Fail];
-```
 
 ## fun block_terminated
 
@@ -438,6 +456,15 @@ pub fun gate_of(lc: *LowerContext, cond: ast_id.ExprId) opt[bool];
 ```
 
 the verdict sema gave a statement gate in the frame the code is read through
+
+## fun each_array
+
+```mach
+pub fun each_array(lc: *LowerContext, stmt: ast_id.StmtId) res[comptime.CTValue, fail.Fail];
+```
+
+the published value of the array sema typed the `$each` at `stmt` over, in the frame the code
+is read through
 
 ## fun iteration_frame
 
