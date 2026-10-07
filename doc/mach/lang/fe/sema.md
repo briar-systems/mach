@@ -178,3 +178,19 @@ fwd mach.lang.fe.sema.instance
 
 forwards [`mach.lang.fe.sema.instance`](sema/instance.md)
 
+## fwd mach.lang.fe.sema.interface
+
+```mach
+fwd mach.lang.fe.sema.interface
+```
+
+forwards [`mach.lang.fe.sema.interface`](sema/interface.md)
+
+## fwd mach.lang.fe.sema.template
+
+```mach
+fwd mach.lang.fe.sema.template
+```
+
+forwards [`mach.lang.fe.sema.template`](sema/template.md)
+
