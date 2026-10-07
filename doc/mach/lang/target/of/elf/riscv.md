@@ -50,6 +50,46 @@ pub fun flags(float_arg_bits: u32, has_compressed: bool) u32;
 the e_flags word of an object whose abi passes floats in `float_arg_bits`-wide
 registers
 
+## val FLAGS_ABI
+
+```mach
+pub val FLAGS_ABI: u32 = EF_FLOAT_ABI_SINGLE | EF_FLOAT_ABI_DOUBLE
+```
+
+the e_flags bits that name the float abi, which every linked object shares
+
+## fun flags_abi_name
+
+```mach
+pub fun flags_abi_name(abi_bits: u32) str;
+```
+
+the float abi the bits `abi_bits` of an e_flags word name, for a refusal
+
+## fun target_flags
+
+```mach
+pub fun target_flags(target: *target_of.ObjectTarget) u32;
+```
+
+the e_flags word of an object built for `target`, which holds no compressed instructions
+
+## fun target_attributes
+
+```mach
+pub fun target_attributes(alloc: *A.Allocator, target: *target_of.ObjectTarget, out_len: *u32) res[*u8, fail.Fail];
+```
+
+the attribute section of an object built for `target`
+
+## fun target_attributes_validate
+
+```mach
+pub fun target_attributes_validate(bytes: *u8, len: u32, target: *target_of.ObjectTarget, flags: u32) err[fail.Fail];
+```
+
+an input's attribute section and e_flags against what `target` can link
+
 ## rec Ext
 
 ```mach
