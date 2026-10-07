@@ -66,14 +66,13 @@ pub fun offset_of_member_index(sc: *sema_context.SemaContext, c: *ast_expr.ExprC
 
 the member named by `$offset_of(T, m)`: a record field, or a tag case that owns a payload
 
-## fun resolve_field_member
+## fun field_offset
 
 ```mach
-pub fun resolve_field_member(sc: *sema_context.SemaContext, owner: u32, index: u32, pick: u8) res[opt[comptime.CTValue], comptime.EvalFail];
+pub fun field_offset(sc: *sema_context.SemaContext, owner: u32, index: u32) res[opt[comptime.CTValue], comptime.EvalFail];
 ```
 
-descriptor members answer from the checked type layout during type checking; the context callback
-answers every member that needs no layout and rejects storage questions about a payloadless case
+a field descriptor's offset, from the checked type layout
 
 ## fun resolve_layout_intrinsic
 

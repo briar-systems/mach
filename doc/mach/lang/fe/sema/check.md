@@ -115,18 +115,6 @@ pub fun check_return(sc: *sema_context.SemaContext, fn_ret: type.TypeId, value: 
 pub fun check_condition(sc: *sema_context.SemaContext, cond: type.TypeId, span: lang_source.Span) bool;
 ```
 
-## fun is_numeric
-
-```mach
-pub fun is_numeric(sc: *sema_context.SemaContext, t: type.TypeId) bool;
-```
-
-## fun is_integer
-
-```mach
-pub fun is_integer(sc: *sema_context.SemaContext, t: type.TypeId) bool;
-```
-
 ## fun byte_size
 
 ```mach
@@ -160,7 +148,7 @@ pub fun report_no_field(sc: *sema_context.SemaContext, span: lang_source.Span, n
 ## fun report_named
 
 ```mach
-pub fun report_named(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str, name: intern.StrId, suffix: str, fallback: str);
+pub fun report_named(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str, name: intern.StrId, suffix: str);
 ```
 
 ## fun report_missing_type_args
@@ -172,13 +160,13 @@ pub fun report_missing_type_args(sc: *sema_context.SemaContext, span: lang_sourc
 ## fun report_typed
 
 ```mach
-pub fun report_typed(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str, t: type.TypeId, suffix: str, fallback: str);
+pub fun report_typed(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str, t: type.TypeId, suffix: str);
 ```
 
 ## fun report_typed2
 
 ```mach
-pub fun report_typed2(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str, a: type.TypeId, mid: str, b: type.TypeId, suffix: str, fallback: str);
+pub fun report_typed2(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str, a: type.TypeId, mid: str, b: type.TypeId, suffix: str);
 ```
 
 ## fun expr_span_of

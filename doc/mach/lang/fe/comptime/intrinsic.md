@@ -233,6 +233,14 @@ pub fun takes_type_operand(id: Id) bool;
 
 whether `id` takes a type as its first argument
 
+## fun constructor_refusal
+
+```mach
+pub fun constructor_refusal(a: *A.Allocator) res[str, textbuild.Error];
+```
+
+the refusal of a `$` in a type that names no type constructor, listing the ones there are
+
 ## fun call_intrinsic
 
 ```mach

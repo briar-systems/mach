@@ -90,3 +90,14 @@ one by value or behind a pointer to its binding, never inside an array
 pub fun check_handle_decl(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl);
 ```
 
+## fun check_annotation_handles
+
+```mach
+pub fun check_annotation_handles(sc: *sema_context.SemaContext, ast_tid: ast_id.TypeId);
+```
+
+a generic record, union or tag instantiated so that a field or payload holds a handle,
+directly or through a pointer, array or secret: the instance is the declaration its
+arguments spell, and the same declaration written out is refused for that field. a
+pointer to a pointer to a handle is refused at the annotation that spells or forms it
+

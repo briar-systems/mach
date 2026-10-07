@@ -54,8 +54,8 @@ own included. [`--diagnostics json`](diagnostics-json.md#failure-records)
 carries the same place as the failure's `primary` span.
 
 ```
-error[manifest.invalid_value]: mach.toml: profile 'debug': opt must be 0, 1, or 2 (got 7)
- --> mach.toml:15:7
+error[manifest.invalid_value]: mach.toml: profile 'debug': simd must be "scalarize" or "require" (got "fast")
+ --> mach.toml:15:8
 ```
 
 Unknown sections and unknown keys are always errors. A path value is always
@@ -71,7 +71,7 @@ fails the consumer's build naming the dependency:
 
 ```
 error[manifest.unknown_key]: dep 'std': mach.toml: unknown key 'bogus' in [project]
-error[manifest.missing_required]: dep 'gfx': mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring opt, debug, simd, vectorize and float_reassoc
+error[manifest.missing_required]: dep 'gfx': mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring optimize, debug and simd
 ```
 
 What a consumer *uses* from a dependency's manifest is its export surface: the
@@ -99,7 +99,7 @@ id      = "demo"                       # required: identifier; root of every mod
 version = "0.1.0"                      # required
 mach    = "^5.3"                       # required: the compiler range
 src     = "src"                        # required: source dir, project-root-relative
-out     = "out/{target.name}/{profile.name}"  # required: output-path template root
+work    = "out/{target.name}/{profile.name}"  # required: the work directory template
 
 [target.linux]                         # a platform: a fully-spelled tuple
 isa = "x86_64"
@@ -107,17 +107,18 @@ os  = "linux"
 abi = "sysv64"
 
 [profile.debug]                        # a build variant; every manifest declares at least one
-opt   = 0                              # 0 (debug pipeline) | 1 | 2 (release pipeline)
+optimize = false                       # run the optimization pass set
 debug = true                           # emit debug info for this profile
 simd  = "scalarize"                    # SIMD lever: "scalarize" | "require"
-vectorize = false                      # auto-vectorization lever
-float_reassoc = false                  # float reassociation permission
+# pass  = ["inline"]                   # optional: optimization passes added to the set
+# skip  = ["vectorize"]                # optional: optimization passes left out of it
+# relax = ["float-reassoc"]            # optional: departures from exact semantics
 # allow = ["import.unused"]            # optional: warning keys this profile silences
 
 [artifact.demo]                        # a produced artifact
 kind    = "bin"                        # "bin" | "static" | "shared"
 entry   = "main.mach"                  # entry source, relative to src
-out     = "{project.out}/bin/demo{artifact.suffix}"  # output path, under the project out
+out     = "{project.work}/bin/demo{artifact.suffix}"  # output path, under the work directory
 targets = ["*"]                        # which declared targets build it ("*" = all)
 # link  = ["kernel32"]                 # optional: [link.X] names this artifact links
 # need  = ["step.generate"]            # optional: step.X / artifact.X requirements
@@ -139,19 +140,22 @@ ref = "branch/main"
 | `id`      | string | Root segment of every module path the project exposes: a file at `<src>/foo/bar.mach` is reachable as `<id>.foo.bar`. Must be a plain identifier — letters, digits, `_`, `-` — since it names the dependency store and keys step stamp files. Read by `$project.id`. |
 | `version` | string | Project version. Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
-| `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step `argv`, `in` and `out`, and local link paths. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
+| `work`    | string | The work directory template: everything a build writes besides its artifacts, referenced as `{project.work}` by artifact `out`, step `argv`, `in` and `out`, and local link paths. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). `-w` names another work directory for one build or test. |
 | `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.3"`). Required in every manifest, a dependency's included. See [Compiler range](#compiler-range). |
+| `out`     | removed | Refused as a removed key: the work directory is `work`. Its refusal carries the rename as a fix. |
 
-`[project]` is exactly these five keys, and `id`, `version`, `src` and `out` are
-required. Any other key, `name` and `description` included, is an unknown-key
-error (`mach.toml: unknown key 'name' in [project]`). `[profile.<name>]`
+`[project]` is exactly the five keys with a type, and every one is required. Any other
+key, `name` and `description` included, is an unknown-key error
+(`mach.toml: unknown key 'name' in [project]`). The previous major's `out` is
+refused by name, with the rename to `work` as its fix, and so is `{project.work}`
+in any template, with `{project.work}` as its fix. `[profile.<name>]`
 likewise carries no `emit_ir` or `emit_asm`: emission is `--emit-ir`/`--emit-asm`
 on the command line.
 
-### The output directory
+### The work directory
 
-Everything a build and its cache write lands under the expanded `out`, in one
-layout:
+Everything a build and its cache write besides its artifacts lands under the
+expanded `work`, in one layout:
 
 | Path | Holds |
 | --- | --- |
@@ -166,8 +170,8 @@ layout:
 | `dep/<id>/` | a dependency's artifact outputs (see [Dependency requirements travel](#dependency-requirements-travel)) |
 
 Test objects sit in `obj/` beside the module objects, as
-`obj/<project>/<module>.test.o`. Artifact outputs go wherever their own `out`
-names under the directory.
+`obj/<project>/<module>.test.o`. An artifact goes wherever its own `out` names,
+under the work directory when it is written from `{project.work}`.
 
 `mach clean` removes `obj/`, `ir/`, `asm/`, `.cache/`, `.stage/`, `test/` and
 `dep/` along with every artifact output, for every declared target and profile,
@@ -845,9 +849,10 @@ has to zero anything at startup.
 
 ## `[profile.<name>]`
 
-A profile is one explicit compilation policy: a build variant. The optimization
-level, the debug-emission toggle and the three SIMD levers live here because
-they are variant concerns, and every one of them is stated. Every manifest
+A profile is one explicit compilation policy: a build variant. Whether the
+optimization passes run, which passes are added or left out, which departures
+from exact semantics are permitted, the debug-emission toggle and the SIMD lever
+live here because they are variant concerns, and every one of them is stated. Every manifest
 declares at least one profile; nothing is synthesized. Values that are
 *derived* rather than declared live elsewhere: a target's object format and
 naming come from `[target.*]` facts, and an absent optional feature such as a
@@ -855,22 +860,68 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 
 | Key     | Type    | Meaning |
 |---------|---------|---------|
-| `opt`   | integer | Optimization level: `0` selects the debug pipeline (the always-on passes only), `1` and `2` select the release pipeline. `1` and `2` currently share a pass set, which includes loop auto-vectorization (see `vectorize` below). Any other integer — or a non-integer — is a manifest error. |
+| `optimize` | bool | Whether the optimization passes run. `true` runs the default set `mach info passes` lists with `default=optimize` over the passes every build runs (`default=always`); `false` runs only the latter. The legalization passes, which make the program something the target can execute, run at every setting. A non-boolean is a manifest error. |
+| `pass` | array of strings | **Optional.** Optimization passes added to the set this profile's `optimize` selects, each a name from [`mach info passes`](#passes), listed once. Absent, nothing is added. |
+| `skip` | array of strings | **Optional.** Optimization passes left out of the set, each listed once and never in `pass` too. Absent, nothing is left out. |
+| `relax` | array of strings | **Optional.** The departures from exact semantics the build permits. The one there is, `"float-reassoc"`, is described under [Float reassociation](#float-reassociation). Absent, the build keeps exact semantics. |
 | `debug` | bool    | Emit debug info for this profile: DWARF in ELF, Mach-O and COFF objects alike, and the core SPIR-V debug instructions on a `spirv` target (see [Finished-module targets](#finished-module-targets)). A PE image carries its DWARF in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
 | `simd`  | string  | SIMD scalarization lever. `"scalarize"` emits a defined unrolled scalar expansion wherever the target has no packed instruction for a vector operator, with one `vector.scalarize` warning at each such operation naming the operation, its lanes, the function, the target and the extension that would pack it (or that none would). `"require"` makes each of those sites a hard error with the same text. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. Any other string is a manifest error. |
-| `vectorize` | bool | Auto-vectorization lever. When `true`, the release pipeline rewrites provably-safe counted loops to SIMD at the target's vector width (128 bits, and 256 on x86-64 under `avx2`, or `avx` for float lanes) on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
-| `float_reassoc` | bool | Permission to treat floating-point addition and multiplication as **associative**. It lets the vectorizer reduce an `f32`/`f64` accumulator through lane-count partial sums, which changes the result — see [Float reassociation](#float-reassociation) for what that costs and what it buys. A non-boolean is a manifest error. |
 | `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile requirement and selection](#profile-requirement-and-selection). |
 | `allow` | array of strings | **Optional.** The warnings this profile silences, each entry a key or a family of keys from the [warning key table](#silencing-warnings), named once. An unknown key, an entry that covers only errors, a repeated entry or a non-string entry is a manifest error. Absent, nothing is silenced. |
+| `opt` | removed | Refused as a removed key: write `optimize = true` or `optimize = false`. |
+| `vectorize` | removed | Refused as a removed key: vectorization is the `vectorize` pass of the set `optimize` selects, left out with `skip = ["vectorize"]`. |
+| `float_reassoc` | removed | Refused as a removed key: reassociation is permitted with `relax = ["float-reassoc"]`. |
 
-Five keys (`opt`, `debug`, `simd`, `vectorize`, `float_reassoc`) are required
-in every profile; only `default` (absent: not the default) and `allow` (absent:
-nothing silenced) are optional. A missing key is a manifest error naming the table and
-the key:
+Three keys (`optimize`, `debug`, `simd`) are required in every profile; the
+others are optional, with the meaning of their absence above. A missing key is a
+manifest error naming the table and the key:
 
 ```
-error[manifest.missing_required]: mach.toml: [profile.debug] is missing required key 'vectorize'; a profile declares opt, debug, simd, vectorize and float_reassoc
+error[manifest.missing_required]: mach.toml: [profile.debug] is missing required key 'simd'; a profile declares optimize, debug and simd
 ```
+
+A pass name that is no pass, or names a legalization pass, which every build
+runs and none can add or skip, is refused where it is written, and so is a
+relaxation that does not exist:
+
+```
+error[manifest.invalid_value]: mach.toml: [profile.release].skip names "vecsplit", a legalization pass, which every build runs and none can add or skip
+```
+
+The previous major's keys are refused by name, each with what replaced it, and
+with the rewrite `mach migrate` applies as a fix wherever the value has a
+mechanical one: `opt = 0` is `optimize = false`, `opt = 1` and `opt = 2` are
+`optimize = true`, `vectorize = true` is the default set and is removed,
+`vectorize = false` is `skip = ["vectorize"]`, `float_reassoc = false` is
+removed and `float_reassoc = true` is `relax = ["float-reassoc"]`:
+
+```
+error[manifest.removed_key]: mach.toml: [profile.release] uses removed key 'opt'; write `optimize = true` or `optimize = false`
+ --> mach.toml:12:1
+ = fix: write `optimize = true`
+ --> mach.toml:12:1
+   -> replace with `optimize = true`
+```
+
+### Passes
+
+The middle end runs one schedule of passes, and `mach info passes` lists every
+one of them in the order it first runs, with its class and the setting that
+puts it in the default set:
+
+```
+mem2reg          class=optimization  default=always
+inline           class=optimization  default=optimize
+vectorize        class=optimization  default=optimize
+vecsplit         class=legalization  default=always
+```
+
+An **optimization** pass only improves the code: `optimize` selects it (or every
+build runs it, `default=always`), `pass` adds it at either setting and `skip`
+leaves it out. A **legalization** pass rewrites what the target cannot execute
+and runs in every build; no profile and no flag can add or skip one. Vectorizing
+a loop is the `vectorize` optimization pass, which a target without 128-bit
+vectors never runs.
 
 ### Profile requirement and selection
 
@@ -878,11 +929,11 @@ Every manifest declares at least one `[profile.*]` table, a dependency's
 included. One that declares none is refused:
 
 ```
-error[manifest.missing_required]: mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring opt, debug, simd, vectorize and float_reassoc
+error[manifest.missing_required]: mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring optimize, debug and simd
 ```
 
-`mach init` writes `debug` (`opt = 0`, `debug = true`, `default = true`) and
-`release` (`opt = 2`, `vectorize = true`) in full, so a scaffold never starts
+`mach init` writes `debug` (`optimize = false`, `debug = true`, `default = true`) and
+`release` (`optimize = true`, `debug = false`) in full, so a scaffold never starts
 from that error. More than one profile marked `default = true` is refused in
 every manifest.
 
@@ -903,21 +954,20 @@ Emission of the human-readable IR and assembly side-artifacts is **not** a profi
 concern — it is controlled only by the `--emit-ir` / `--emit-asm` flags of
 `mach build`.
 
-The `vectorize` lever only ever *subtracts*. The pass it gates runs in the release
-pipeline on targets that report 128-bit vector support (SSE2 on x86-64, NEON on
+Skipping `vectorize` only ever *subtracts*. The pass runs when `optimize` selects it, on targets that report 128-bit vector support (SSE2 on x86-64, NEON on
 aarch64, and `OpTypeVector` on spirv) and rewrites counted, unit-stride loops whose dependence analysis proves
 independence — element-wise maps behind a runtime alias guard, and associative-exact
 integer reductions. A loop it cannot prove safe stays scalar, and a target without
-hardware vectors (riscv64) never enters the pass, so `vectorize = false` changes
+hardware vectors (riscv64) never enters the pass, so `skip = ["vectorize"]` changes
 performance and never semantics. For a single function, the `#[scalar]` decorator is
 the finer-grained opt-out (see [decorators.md](decorators.md)).
 
-`float_reassoc` is the one lever here that *adds*, and the only profile key that can
-change a program's computed answer. It widens that same pass to float reductions and
-does nothing else; `vectorize = false` switches the pass off wholesale and so overrides
-it.
+`relax = ["float-reassoc"]` is the one lever here that *adds*, and the only profile
+key that can change a program's computed answer. It widens that same pass to float
+reductions and does nothing else; skipping `vectorize` switches the pass off wholesale
+and so overrides it. A relaxation never rides on `optimize`.
 
-The `simd`, `vectorize` and `float_reassoc` levers are always the **consumer's**.
+Every lever of a profile is always the **consumer's**.
 As [Dependency manifests](#dependency-manifests) sets out, a dependency's `[profile.*]`
 is parsed by the same schema and never read to build the consumer, so a library's
 values are inert — the effective levers come from the consumer's resolved profile.
@@ -940,11 +990,9 @@ never silenced.
 
 ```toml
 [profile.release]
-opt = 2
+optimize = true
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 allow = ["import.unused", "target"]
 ```
 
@@ -996,7 +1044,7 @@ never read to build it, so a library cannot silence the consumer's warnings.
 
 ### Float reassociation
 
-`float_reassoc = true` grants the optimizer exactly one liberty: it may treat
+`relax = ["float-reassoc"]` grants the optimizer exactly one liberty: it may treat
 floating-point `+` and `*` as **associative**, and regroup a reduction accordingly.
 Nothing else changes. It does not license reciprocal substitution for division,
 assumptions that operands are finite or non-NaN, contraction into a fused
@@ -1036,30 +1084,56 @@ that is a property of this input, not a guarantee. The honest statement is that 
 result **changes**, by roughly the accumulated rounding error of the sum, in a direction
 that depends on the data. Code whose correctness depends on the exact bit pattern of a
 float reduction — a checksum, a reproducibility requirement, a comparison against a
-reference implementation — must leave the key off.
+reference implementation — must not relax it.
 
 Two exactness properties are preserved rather than traded away. The idle lanes are
 seeded with the op's **exact** IEEE identity — `-0.0` for addition (`x + (-0.0)` is `x`
 for every `x`, where `+0.0` would turn a negative-zero sum positive) and `1.0` for
 multiplication — so no signed-zero or NaN behaviour changes. And a trip count below the
 lane count never enters the vector loop at all, so short reductions are bit-identical
-regardless of the key.
+regardless of the relaxation.
 
-The key is profile-wide. For a single function, `#[scalar]` opts out of vectorization
+The relaxation is profile-wide. For a single function, `#[scalar]` opts out of vectorization
 entirely and takes precedence over it, so a routine that must stay IEEE-strict inside
 an otherwise-reassociating build has a spelling. There is no per-function opt-*in*:
 whether a reduction may be reassociated is the caller's tolerance to decide, not the
 callee author's.
 
-Integer reductions are untouched by this key. They vectorize unconditionally and are
+Integer reductions are untouched by this relaxation. They vectorize unconditionally and are
 bit-identical to the scalar reference, because integer add / xor / or / and reassociate
 exactly.
 
-The CLI selects and overrides at invocation time: `-p <name>` picks the
-profile; `-g` forces `debug` on for one build regardless of the profile's key
-(precedence `-g` > profile > off — there is no flag to force it off over a
-`debug = true` profile; edit the manifest or pick another profile). `-O0` and
-`-O2` override the profile's `opt` the same way, and there is no `-O1`.
+### Levers on the command line
+
+`-p <name>` picks the profile, and every lever has its command-line form over
+it for one invocation. A binary fact is a `--key` and `--no-key` pair, a value
+is `--key value`, and a set takes repeatable add and remove flags:
+
+| Key | Flags |
+|---|---|
+| `optimize` | `--optimize` (`-O`), `--no-optimize` |
+| `debug` | `--debug` (`-d`), `--no-debug` |
+| `simd` | `--simd scalarize`, `--simd require` |
+| `pass`, `skip` | `--pass NAME` adds a pass, `--skip NAME` leaves one out |
+| `relax` | `--relax NAME` permits, `--no-relax NAME` withdraws |
+
+The levers apply in one order: the built-in defaults, then the selected profile,
+then the command line. Both flags of a pair, or `--pass` and `--skip` of the
+same pass, are refused. The previous major's `-g`, `-O0` and `-O2` are refused
+naming `-d`, `--no-optimize` and `-O`.
+
+A `mach build` whose flags change the selected profile writes a differently
+configured build, so it must say where: it names the artifact with `-o`, or a
+work directory with `-w` that every artifact it writes sits under. Without
+either it is refused:
+
+```
+error[cli.flag_conflict]: these options would write a differently configured build over the profile's existing artifacts; name an artifact path with -o or a work directory with -w
+```
+
+The object cache is keyed by the whole configuration, so only published
+artifacts can collide. `mach test` publishes none and takes the levers freely,
+and `mach check` and `mach run` build nothing.
 
 ## `[artifact.<name>]`
 
@@ -1070,7 +1144,7 @@ reads the selected artifact's name.
 |-----------|----------|---------|
 | `kind`    | yes | `"bin"`, `"static"`, or `"shared"` (see below). |
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
-| `out`     | yes | This artifact's output path, relative to the project root like every other path. Write `{project.out}/bin/demo` to place it under the build output, or any other project path to place it there. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
+| `out`     | yes | This artifact's output path, relative to the project root like every other path. Write `{project.work}/bin/demo` to place it under the build output, or any other project path to place it there. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | absent: links nothing | Array of `[link.X]` names this artifact links (see below). A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names no [link.*] table: 'nosuch' (declared: [link.kernel32])`). |
 | `need`    | absent: needs nothing | Array of category-qualified requirements such as `step.generate`, `artifact.support`, and `artifact.shader-*`. Each glob matches only its named category. See [Artifact requirements](#artifact-requirements). |
@@ -1147,7 +1221,7 @@ spell its desired `lib` prefix directly.
 [artifact.app]
 kind = "bin"
 entry = "main.mach"
-out = "{project.out}/bin/app{artifact.suffix}"
+out = "{project.work}/bin/app{artifact.suffix}"
 targets = ["*"]
 link = []
 need = []
@@ -1183,7 +1257,7 @@ target. An explicit literal such as `bin/app.exe` can therefore collide with
 [artifact.game]
 kind = "bin"
 entry = "main.mach"
-out = "{project.out}/bin/game.exe"
+out = "{project.work}/bin/game.exe"
 targets = ["*"]
 link = []
 need = []
@@ -1220,7 +1294,7 @@ the same way on a target whose format has no subsystem (`mach help build`).
 [artifact.game]
 kind = "bin"
 entry = "main.mach"
-out = "{project.out}/bin/game.exe"
+out = "{project.work}/bin/game.exe"
 targets = ["*"]
 link = []
 need = []
@@ -1406,11 +1480,11 @@ step whose outputs still exist is skipped. Changing an inherited environment
 value received by the child also invalidates the step.
 
 The fingerprint of the last successful run is kept as a stamp in
-`{project.out}/.cache/steps/`, and a step's outputs under `{project.out}` are
-written into scratch space in `{project.out}/.stage/<name>/` and published only
+`{project.work}/.cache/steps/`, and a step's outputs under `{project.work}` are
+written into scratch space in `{project.work}/.stage/<name>/` and published only
 once the step succeeds. Both belong
-to the compiler: a declared `out` inside `{project.out}/.cache/` or
-`{project.out}/.stage/` fails at manifest load, naming the step and the path.
+to the compiler: a declared `out` inside `{project.work}/.cache/` or
+`{project.work}/.stage/` fails at manifest load, naming the step and the path.
 `mach clean` removes both, so the next build runs every demanded step again.
 
 **Bounding a step.** `timeout` gives the step a deadline measured from
@@ -1435,19 +1509,19 @@ sema and an untouched asset is a cache hit — the same guarantee `in` gives a
 step, keyed to one file instead of a step's whole input list, and by digest
 rather than timestamp either way.
 
-**Output homing.** `{project.out}` resolves to the **root** project's expanded
+**Output homing.** `{project.work}` resolves to the **root** project's expanded
 `out` in every manifest of the closure. A dependency's step outputs land in the
 consumer's output tree — exactly as a dependency's compiled modules do — and the
 dependency's own checkout is never written to. For an exported dependency step,
-the command receives `{project.out}` as an absolute path rooted at the consumer;
+the command receives `{project.work}` as an absolute path rooted at the consumer;
 it does not depend on the directory from which the consumer was invoked. An ordinary relative
 consumer root (including `./` segments) and its normalized absolute spelling produce
 the same expanded command and cache key.
 
-**The module object tree is reserved.** `{project.out}/obj/<project.id>/` belongs
+**The module object tree is reserved.** `{project.work}/obj/<project.id>/` belongs
 to the compiler: every module of the project compiles to one object in it, named
 after the module's path (`src/window.mach` in project `glfw` becomes
-`{project.out}/obj/glfw/window.o`). A step that writes there collides with those
+`{project.work}/obj/glfw/window.o`). A step that writes there collides with those
 objects by name, and because the link takes whichever file survived, the result is
 a binary that is subtly wrong rather than a build that fails.
 
@@ -1479,7 +1553,7 @@ key, a damaged one or another key is rebuilt, never linked stale. `obj/` holds o
 object per module, the latest, and each object is written to a sibling temporary
 and renamed into place, so an interrupted build leaves the previous object or the
 new one, never a torn file. The digests of the sources the keys read are
-remembered in `{project.out}/.cache/digests` under each file's path, size,
+remembered in `{project.work}/.cache/digests` under each file's path, size,
 modification time and identity, so an unchanged file is not hashed again for its
 key; a missing or damaged memo is rebuilt. `--no-cache` forces an uncached
 build: it reuses no object and writes each one without a key, and `mach clean`
@@ -1491,11 +1565,11 @@ that writes an object there without declaring it is caught after it runs, with t
 same message — this covers the common case of a vendored `make` dropping every
 object it built into the output directory.
 
-Pick any other subtree of `{project.out}`. The conventional choice for a vendored
+Pick any other subtree of `{project.work}`. The conventional choice for a vendored
 library is a directory named after the library rather than after the project, e.g.
-`{project.out}/obj/miniaudio/` for a project whose own id is `audio`; note that
+`{project.work}/obj/miniaudio/` for a project whose own id is `audio`; note that
 this only stays clear of the reserved tree while the two names differ, so prefer a
-distinct sibling such as `{project.out}/vendor/<library>/`.
+distinct sibling such as `{project.work}/vendor/<library>/`.
 
 **Target environment.** Every step process additionally receives the active
 build cell's target tuple as `MACH_TARGET_ISA`, `MACH_TARGET_OS`, and
@@ -1554,7 +1628,7 @@ How a `version` is resolved to a release, how pins are recorded, and what
 
 Paths and step `argv` entries expand over a closed, final set of eight variables:
 
-- `{project.out}` — the **root** project's expanded `[project].out`, in every
+- `{project.work}` — the **root** project's expanded `[project].work`, in every
   manifest of the closure. In a dependency's artifact `out` it is that
   dependency's home under it, `dep/<id>`.
 - `{target.name}` — the resolved target name (never the literal `native`).
@@ -1567,7 +1641,7 @@ Paths and step `argv` entries expand over a closed, final set of eight variables
   Available only in an artifact's own `out`. See
   [Artifact filenames and identity](#artifact-filenames-and-identity).
 - `{artifact.<id>.out}` — the output path of a required artifact, relative to the
-  root project's directory exactly as `{project.out}` is. In a dependency's module
+  root project's directory exactly as `{project.work}` is. In a dependency's module
   it names a requirement of that dependency's export library artifact, homed under
   `dep/<id>`. See [Artifact requirements](#artifact-requirements).
 
@@ -1576,8 +1650,8 @@ The three `{target.*}` tuple keys are also exported to every step process as
 
 Every output path is explicit and none is rooted for you: an artifact's `out`, a
 step's `out` list and a local link's `path` are relative to the project root and
-name `{project.out}` where they mean the build output, so an artifact may be
-placed anywhere in the project. Naming `{project.out}` is what homes a
+name `{project.work}` where they mean the build output, so an artifact may be
+placed anywhere in the project. Naming `{project.work}` is what homes a
 dependency's build products into the *consumer's* output tree rather than the
 dependency's checkout, and a dependency's artifact `out` must begin with it.
 
@@ -1586,7 +1660,7 @@ template is written decides what it may name, and every template is checked when
 the manifest is read, the root's and each dependency's alike: an unknown `{...}`
 reference, an unterminated `{`, or a variable its place does not admit is
 refused there, pointing at the template.
-`{project.out}` is not available inside `[project].out` itself (it would be
+`{project.work}` is not available inside `[project].work` itself (it would be
 self-referential), and `{artifact.<id>.out}` is not available inside an artifact's
 own `out` for the same reason. `{artifact.suffix}` is available nowhere but an
 artifact's own `out`. In a step's `argv` and `env` values a brace group outside
@@ -1615,7 +1689,7 @@ builds for several targets here and therefore has no single output.
 [artifact.shader-blur]
 kind    = "bin"
 entry   = "shaders/blur.mach"
-out     = "{project.out}/shaders/blur.spv"
+out     = "{project.work}/shaders/blur.spv"
 targets = ["vulkan"]
 link    = []
 need    = []
@@ -1623,7 +1697,7 @@ need    = []
 [artifact.app]
 kind    = "bin"
 entry   = "main.mach"
-out     = "{project.out}/bin/app"
+out     = "{project.work}/bin/app"
 targets = ["linux-x86_64"]
 link    = []
 need    = ["artifact.shader-*"]
@@ -1684,7 +1758,7 @@ command builds when no `-a` names an artifact.
 export  = true
 kind    = "static"
 entry   = "lib.mach"
-out     = "{project.out}/lib/shlib{artifact.suffix}"
+out     = "{project.work}/lib/shlib{artifact.suffix}"
 targets = ["linux-x86_64"]
 link    = []
 need    = ["artifact.shader-frag"]
@@ -1692,7 +1766,7 @@ need    = ["artifact.shader-frag"]
 [artifact.shader-frag]
 kind    = "bin"
 entry   = "shaders/frag.mach"
-out     = "{project.out}/spv/frag{artifact.suffix}"
+out     = "{project.work}/spv/frag{artifact.suffix}"
 targets = ["spirv"]
 link    = []
 need    = []
@@ -1713,11 +1787,11 @@ The rules:
   several targets has no single `{artifact.<id>.out}`, exactly as within one
   manifest.
 - **Homed in the consumer, namespaced by id.** In a dependency's artifact `out`,
-  `{project.out}` is `<expanded root [project].out>/dep/<dependency id>`, so two
+  `{project.work}` is `<expanded root [project].work>/dep/<dependency id>`, so two
   dependencies that both declare `shader-quad` produce two files and neither
   writes into its own checkout. A dependency's artifact `out` must begin with
-  `{project.out}`; one placed anywhere else is refused, since it would write into
-  the consumer's tree. In a dependency's steps `{project.out}` keeps meaning the
+  `{project.work}`; one placed anywhere else is refused, since it would write into
+  the consumer's tree. In a dependency's steps `{project.work}` keeps meaning the
   root's out, and the cell's objects sit in the root's `obj/` beside every other
   module's. `mach clean`
   removes that home and those objects with the rest of the output, reading the
@@ -1758,7 +1832,7 @@ id      = "demo"
 version = "0.1.0"
 mach    = "^5.3"
 src     = "src"
-out     = "out/{target.name}/{profile.name}"
+work    = "out/{target.name}/{profile.name}"
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
@@ -1774,7 +1848,7 @@ ref = "tag/v1.0.3"
 
 [link.shim]
 source = "local"
-path   = "{project.out}/obj/platform/shim.o"
+path   = "{project.work}/obj/platform/shim.o"
 os     = ["*"]
 isa    = ["*"]
 abi    = ["*"]
@@ -1782,7 +1856,7 @@ export = false
 
 [link.shim-x11]
 source = "local"
-path   = "{project.out}/obj/platform/x11.o"
+path   = "{project.work}/obj/platform/x11.o"
 os     = ["linux"]
 isa    = ["*"]
 abi    = ["*"]
@@ -1790,7 +1864,7 @@ export = false
 
 [link.shim-win32]
 source = "local"
-path   = "{project.out}/obj/platform/win32.o"
+path   = "{project.work}/obj/platform/win32.o"
 os     = ["windows"]
 isa    = ["*"]
 abi    = ["*"]
@@ -1807,27 +1881,27 @@ export = false
 [artifact.demo]
 kind    = "bin"
 entry   = "main.mach"
-out     = "{project.out}/bin/demo"
+out     = "{project.work}/bin/demo"
 targets = ["linux", "windows"]
 link    = ["shim", "shim-x11", "shim-win32", "gl"]
 need    = []
 
 [step.shim]
-argv = ["cc", "-c", "-O2", "-fPIC", "-Ivendor/platform", "-o", "{project.out}/obj/platform/shim.o", "vendor/platform/shim.c"]
+argv = ["cc", "-c", "-O2", "-fPIC", "-Ivendor/platform", "-o", "{project.work}/obj/platform/shim.o", "vendor/platform/shim.c"]
 in   = ["vendor/platform/shim.c"]
-out  = ["{project.out}/obj/platform/shim.o"]
+out  = ["{project.work}/obj/platform/shim.o"]
 need = []
 
 [step.shim-x11]
-argv = ["cc", "-c", "-O2", "-fPIC", "-Ivendor/platform", "-o", "{project.out}/obj/platform/x11.o", "vendor/platform/x11.c"]
+argv = ["cc", "-c", "-O2", "-fPIC", "-Ivendor/platform", "-o", "{project.work}/obj/platform/x11.o", "vendor/platform/x11.c"]
 in   = ["vendor/platform/x11.c"]
-out  = ["{project.out}/obj/platform/x11.o"]
+out  = ["{project.work}/obj/platform/x11.o"]
 need = []
 
 [step.shim-win32]
-argv = ["cc", "-c", "-O2", "-fPIC", "-Ivendor/platform", "-o", "{project.out}/obj/platform/win32.o", "vendor/platform/win32.c"]
+argv = ["cc", "-c", "-O2", "-fPIC", "-Ivendor/platform", "-o", "{project.work}/obj/platform/win32.o", "vendor/platform/win32.c"]
 in   = ["vendor/platform/win32.c"]
-out  = ["{project.out}/obj/platform/win32.o"]
+out  = ["{project.work}/obj/platform/win32.o"]
 need = []
 
 [target.linux]
@@ -1841,12 +1915,12 @@ os  = "windows"
 abi = "win64"
 
 [profile.debug]
-opt   = 0
+optimize = false
 debug = true
 simd  = "scalarize"
 
 [profile.release]
-opt   = 2
+optimize = true
 debug = false
 simd  = "scalarize"
 ```
@@ -1868,7 +1942,7 @@ darwin frameworks apply only on darwin.
 id      = "glfw"
 version = "0.3.0"
 src     = "src"
-out     = "out/{target.name}/{profile.name}"
+work    = "out/{target.name}/{profile.name}"
 
 [link.glfw]
 source = "system"
@@ -1923,20 +1997,20 @@ consumer's output tree:
 id      = "mz"
 version = "1.0.3"
 src     = "src"
-out     = "out/{target.name}/{profile.name}"
+work    = "out/{target.name}/{profile.name}"
 
 [link.miniz]
 source = "local"
-path   = "{project.out}/obj/miniz/miniz.o"
+path   = "{project.work}/obj/miniz/miniz.o"
 os     = ["*"]
 isa    = ["*"]
 abi    = ["*"]
 export = true
 
 [step.miniz]
-argv = ["cc", "-c", "-O2", "-fPIC", "-Ivendor/miniz", "-o", "{project.out}/obj/miniz/miniz.o", "vendor/miniz/miniz.c"]
+argv = ["cc", "-c", "-O2", "-fPIC", "-Ivendor/miniz", "-o", "{project.work}/obj/miniz/miniz.o", "vendor/miniz/miniz.c"]
 in   = ["vendor/miniz/*.c", "vendor/miniz/*.h"]
-out  = ["{project.out}/obj/miniz/miniz.o"]
+out  = ["{project.work}/obj/miniz/miniz.o"]
 need = []
 ```
 
