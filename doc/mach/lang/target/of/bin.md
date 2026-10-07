@@ -90,6 +90,15 @@ pub fun resolve_name(itn: *intern.Interner, id: intern.StrId) str;
 
 the text of a name an image holds, nil for STR_NIL, an entry with no name
 
+## fun strtab_size
+
+```mach
+pub fun strtab_size(img: *target_of.ObjectImage) usize;
+```
+
+the bytes of a symbol string table that opens with the empty name and holds
+every symbol's name after it, each ended by a nul
+
 ## fun name_message
 
 ```mach
@@ -121,6 +130,14 @@ pub fun number_message(itn: *intern.Interner, a: *A.Allocator, prefix: str, valu
 ```
 
 `prefix` and `value` joined, as name_message joins them
+
+## fun reloc_type_rejection
+
+```mach
+pub fun reloc_type_rejection(itn: *intern.Interner, a: *A.Allocator, r_type: u64) res[str, fail.Fail];
+```
+
+why a native relocation type a format reads no kind for is refused
 
 ## fun reloc_counts
 

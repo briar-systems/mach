@@ -45,6 +45,13 @@ pub val FIELD_SEL_CODE:         u8 = 5
 pub val FIELD_SEL_TYPE_BY_NAME: u8 = 6
 ```
 
+## val COMPTIME_CASE_NO_PAYLOAD_MSG
+
+```mach
+pub val COMPTIME_CASE_NO_PAYLOAD_MSG: str =
+"this case has no payload, so it has no `.type` or `.offset`
+```
+
 ## val TYPE_QUERY_IS_RECORD
 
 ```mach
@@ -233,4 +240,23 @@ pub fun capabilities_have_types[T](ctx: *T, caps: PhaseCapabilities[T]) bool;
 ```mach
 pub fun capabilities_cast[T](ctx: *T, caps: PhaseCapabilities[T]) bool;
 ```
+
+## fun field_member
+
+```mach
+pub fun field_member(types: *type.TypeInterner, owner: u32, index: u32, pick: u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
+```
+
+a field descriptor's member from the declared types alone, the same in every
+phase; none for `offset`, which each phase answers from its own layout, and
+for an unknown field or a member it does not hold
+
+## fun field_type_by_name
+
+```mach
+pub fun field_type_by_name(types: *type.TypeInterner, owner_ty: type.TypeId, name: intern.StrId) opt[comptime_value.CTValue];
+```
+
+the declared type of a field or case payload named on an owner; none for an
+unknown name or a payloadless case
 

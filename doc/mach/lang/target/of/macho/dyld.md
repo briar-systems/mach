@@ -6,12 +6,6 @@
 pub rec MachoDynLayout;
 ```
 
-## fun func_import_count
-
-```mach
-pub fun func_import_count(dyn: *target_of.DynamicInfo) u32;
-```
-
 ## fun import_needs_got
 
 ```mach

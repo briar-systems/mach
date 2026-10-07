@@ -162,14 +162,6 @@ fwd sema_context.generic_owner_of_decl
 
 forwards [`mach.lang.fe.sema.context.generic_owner_of_decl`](sema/context.md#fun-generic_owner_of_decl)
 
-## fwd sema_context.field_type_by_name
-
-```mach
-fwd sema_context.field_type_by_name
-```
-
-forwards [`mach.lang.fe.sema.context.field_type_by_name`](sema/context.md#fun-field_type_by_name)
-
 ## fwd mach.lang.fe.sema.fields
 
 ```mach

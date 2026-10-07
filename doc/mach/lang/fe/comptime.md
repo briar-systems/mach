@@ -347,6 +347,14 @@ fwd comptime_value.typed_int
 
 forwards [`mach.lang.fe.comptime.value.typed_int`](comptime/value.md#fun-typed_int)
 
+## fwd comptime_capability.COMPTIME_CASE_NO_PAYLOAD_MSG
+
+```mach
+fwd comptime_capability.COMPTIME_CASE_NO_PAYLOAD_MSG
+```
+
+forwards [`mach.lang.fe.comptime.capability.COMPTIME_CASE_NO_PAYLOAD_MSG`](comptime/capability.md#val-comptime_case_no_payload_msg)
+
 ## fwd comptime_capability.FIELD_SEL_CODE
 
 ```mach
@@ -490,6 +498,22 @@ fwd comptime_capability.TYPE_QUERY_NAME
 ```
 
 forwards [`mach.lang.fe.comptime.capability.TYPE_QUERY_NAME`](comptime/capability.md#val-type_query_name)
+
+## fwd comptime_capability.field_member
+
+```mach
+fwd comptime_capability.field_member
+```
+
+forwards [`mach.lang.fe.comptime.capability.field_member`](comptime/capability.md#fun-field_member)
+
+## fwd comptime_capability.field_type_by_name
+
+```mach
+fwd comptime_capability.field_type_by_name
+```
+
+forwards [`mach.lang.fe.comptime.capability.field_type_by_name`](comptime/capability.md#fun-field_type_by_name)
 
 ## fwd comptime_capability.loading_capabilities
 
@@ -997,13 +1021,6 @@ pub val COMPTIME_CASE_UNKNOWN_MEMBER_MSG: str =
 ```mach
 pub val COMPTIME_DESCRIPTOR_LAYOUT_MSG: str =
 "this descriptor's offset has no answer: the layout of its owning type could not be determined"
-```
-
-## val COMPTIME_CASE_NO_PAYLOAD_MSG
-
-```mach
-pub val COMPTIME_CASE_NO_PAYLOAD_MSG: str =
-"this case has no payload, so it has no `.type` or `.offset`
 ```
 
 ## fun evaluate

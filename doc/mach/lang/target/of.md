@@ -30,35 +30,13 @@ pub val OF_RAW:     u32 = 4
 pub val OF_SPV:     u32 = 5
 ```
 
-## val OF_FORMAT_CATALOG_VERSION
+## val FINGERPRINT_VERSION
 
 ```mach
-pub val OF_FORMAT_CATALOG_VERSION: u8 = 1
+pub val FINGERPRINT_VERSION: u8 = 1
 ```
 
-## fun of_name_for
-
-```mach
-pub fun of_name_for(id: u32) str;
-```
-
-## fun of_count
-
-```mach
-pub fun of_count() usize;
-```
-
-## fun of_name_at
-
-```mach
-pub fun of_name_at(index: usize) str;
-```
-
-## fun of_fingerprint_tag
-
-```mach
-pub fun of_fingerprint_tag(id: u32) u8;
-```
+the version of the fingerprint tags formats declare; a tag is never reused
 
 ## def SectionKind
 
@@ -643,6 +621,57 @@ pub rec NativeSection;
 pub rec Section;
 ```
 
+## fun associated_owner
+
+```mach
+pub fun associated_owner(sec: *Section) opt[u32];
+```
+
+the section an associated section lives and dies with, as an index into its
+object's sections; none for a section that is not associated
+
+## fun unwind_entry_size
+
+```mach
+pub fun unwind_entry_size(sec: *Section) u64;
+```
+
+the bytes of one entry of an unwind index section, 0 when it declares none
+
+## rec GroupMember
+
+```mach
+pub rec GroupMember;
+```
+
+a member of a section group: a section of the group's object, or that
+section's relocations
+
+## fun group_member_count
+
+```mach
+pub fun group_member_count(sec: *Section) u32;
+```
+
+the members a group section lists
+
+## fun group_member_at
+
+```mach
+pub fun group_member_at(sec: *Section, i: u32) opt[GroupMember];
+```
+
+the group's member `i`, none for an entry that names no section
+
+## fun group_rebase
+
+```mach
+pub fun group_rebase(sec: *Section, by: u32);
+```
+
+moves every member of a group section `by` sections along, as its object's
+sections move when objects are combined
+
 ## fun validate_native_sections
 
 ```mach
@@ -944,6 +973,24 @@ pub rec BaseReloc;
 ```mach
 pub rec DynamicInfo;
 ```
+
+## fun func_import_count
+
+```mach
+pub fun func_import_count(dyn: *DynamicInfo) u32;
+```
+
+the imported functions of a dynamic part, nil for an image the loader binds
+nothing in
+
+## fun func_ordinal
+
+```mach
+pub fun func_ordinal(dyn: *DynamicInfo, import_index: u32) u32;
+```
+
+an imported function's place among the imported functions in import order,
+0xFFFFFFFF for an import that is not a function
 
 ## rec SpanLocation
 
@@ -1526,11 +1573,31 @@ pub rec OfVTable;
 pub rec ArtifactName;
 ```
 
+## rec SystemNaming
+
+```mach
+pub rec SystemNaming;
+```
+
+how an operating system names the files it runs and links: a static library
+and an executable, each suffix with its dot or empty
+
 ## fun artifact_naming
 
 ```mach
-pub fun artifact_naming(vt: *OfVTable, os_name: str, kind: catalog_artifact.Kind) res[ArtifactName, fail.Fail];
+pub fun artifact_naming(vt: *OfVTable, system: *SystemNaming, kind: catalog_artifact.Kind) res[ArtifactName, fail.Fail];
 ```
+
+the name an artifact of `kind` takes from its format and its system
+
+## fun object_ext
+
+```mach
+pub fun object_ext(vt: *OfVTable) str;
+```
+
+the object suffix without its dot, as the build names the object files of
+its object directory
 
 ## fun validate
 

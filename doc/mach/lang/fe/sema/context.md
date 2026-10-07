@@ -446,20 +446,6 @@ pub fun field_table_for(sc: *SemaContext, ty: type.TypeId) opt[*FieldTable];
 pub fun field_lookup(sc: *SemaContext, ty: type.TypeId, name: intern.StrId) opt[type.TypeId];
 ```
 
-## fun resolve_field_member
-
-```mach
-pub fun resolve_field_member(sc: *SemaContext, owner: u32, index: u32, pick: u8) res[opt[comptime.CTValue], comptime.EvalFail];
-```
-
-## fun field_type_by_name
-
-```mach
-pub fun field_type_by_name(types: *type.TypeInterner, owner_ty: type.TypeId, name: intern.StrId) opt[comptime.CTValue];
-```
-
-the declared type of a field or case payload named on an owner; none for an unknown name or a payloadless case
-
 ## fun resolve_type_comparison_operand
 
 ```mach
