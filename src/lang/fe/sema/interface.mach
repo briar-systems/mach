@@ -1,0 +1,369 @@
+# what a module publishes for the lowering of every module that imports it, in place of
+# its syntax tree: the facts of each module-level function and binding, the deep value of
+# each module constant, and the public surface a `fwd` re-exports. it owns everything it
+# holds and points into no syntax tree, scope or other product
+use std.collections.map;
+use collections_vector: std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use std.allocator.page;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.fail;
+use ast_id: mach.lang.fe.ast.id;
+use mach.lang.fe.comptime;
+use mach.lang.fe.resolve;
+use mach.lang.fe.sema.template;
+use mach.lang.intern;
+use mach.lang.session;
+use mach.lang.type;
+
+pub val NONE: u32 = 0xFFFFFFFF;
+
+pub def DeclarationFlags: u8;
+pub val DECLARATION_EXT:  DeclarationFlags = 1;
+pub val DECLARATION_BODY: DeclarationFlags = 2;
+pub val DECLARATION_PACK: DeclarationFlags = 4;
+
+# one module-level function, `val` or `var`
+# ---
+# decl:         the declaration in its module, which keys the session's tables of it
+# generics:     how many type parameters a function declares
+# params_start: where a function's parameters start in `params`
+# op_set:       the instruction set and operation an `#[op]` names, STR_NIL without one
+# value:        the node of a `val`'s constant value, or of the compile-time value a `var`'s
+#               initializer gives it, NONE when it has none
+# gated:        the value is declared under a comptime condition
+pub rec Declaration {
+    kind:         resolve.SymKind;
+    canon:        intern.StrId;
+    decl:         ast_id.DeclId;
+    flags:        DeclarationFlags;
+    generics:     u32;
+    params_start: u32;
+    params_len:   u32;
+    op_set:       intern.StrId;
+    op_name:      intern.StrId;
+    value:        u32;
+    gated:        bool;
+}
+
+pub rec Param {
+    comptime: bool;
+}
+
+pub def NodeKind: u8;
+# a value the evaluator holds whole
+pub val NODE_SCALAR: NodeKind = 0;
+# an array literal: its elements, in order
+pub val NODE_ARRAY: NodeKind = 1;
+# a record or case literal: the case its head selects, STR_NIL for a record, then its
+# named fields as written and its positional elements
+pub val NODE_LITERAL: NodeKind = 2;
+# a leaf that has no compile-time value, with the refusal reading it gives
+pub val NODE_REFUSED: NodeKind = 3;
+
+pub rec Refusal {
+    kind:    comptime.EvalFailKind;
+    diag:    diagnostic_kind.Kind;
+    message: intern.StrId;
+}
+
+# one node of a constant's value; an aggregate's members are `members[first .. first + len]`
+pub rec Node {
+    kind:    NodeKind;
+    ty:      type.TypeId;
+    value:   comptime.CTValue;
+    head:    intern.StrId;
+    first:   u32;
+    len:     u32;
+    refusal: Refusal;
+}
+
+# a member of an aggregate node: a named field, or an element or positional value with STR_NIL
+pub rec Member {
+    name: intern.StrId;
+    node: u32;
+}
+
+# one symbol on the module's public surface, as an importer of it names it
+# ---
+# origin: the module that declares it, which may be one this module re-exports
+# module: the module a `pub use` names, for a module symbol
+pub rec Exported {
+    kind:                resolve.SymKind;
+    name:                intern.StrId;
+    canon:               intern.StrId;
+    origin:              session.StableModuleId;
+    module:              session.StableModuleId;
+    generic_arity:       u32;
+    has_comptime_params: bool;
+    has_pack_param:      bool;
+}
+
+pub rec Interface {
+    alloc:        *A.Allocator;
+    declarations: collections_vector.Vector[Declaration];
+    params:       collections_vector.Vector[Param];
+    nodes:        collections_vector.Vector[Node];
+    members:      collections_vector.Vector[Member];
+    surface:      collections_vector.Vector[Exported];
+    by_decl:      map.Map[u32, u32];
+    by_canon:     map.Map[u64, u32];
+    # what an importer emits the module's instances from
+    template: template.Template;
+}
+
+# how a lowering reads the interface another module published
+pub rec Reader {
+    ctx:  ptr;
+    read: fun(ptr, session.ModuleId) res[*Interface, fail.Fail];
+}
+
+pub fun init(alloc: *A.Allocator) Interface {
+    ret Interface{
+        alloc:    alloc, declarations: collections_vector.init[Declaration](alloc), params: collections_vector.init[Param](alloc),
+        nodes:    collections_vector.init[Node](alloc), members: collections_vector.init[Member](alloc),
+        surface:  collections_vector.init[Exported](alloc), by_decl: map.init[u32, u32](alloc), by_canon: map.init[u64, u32](alloc),
+        template: template.none(alloc)
+    };
+}
+
+pub fun dnit(iface: *Interface) {
+    if (iface == nil || iface.alloc == nil) { ret; }
+    collections_vector.dnit[Declaration](?iface.declarations);
+    collections_vector.dnit[Param](?iface.params);
+    collections_vector.dnit[Node](?iface.nodes);
+    collections_vector.dnit[Member](?iface.members);
+    collections_vector.dnit[Exported](?iface.surface);
+    map.dnit[u32, u32](?iface.by_decl);
+    map.dnit[u64, u32](?iface.by_canon);
+    template.dnit(?iface.template);
+    iface.alloc = nil;
+}
+
+fun canon_key(kind: resolve.SymKind, canon: intern.StrId) u64 {
+    ret (kind::u64 << 32) | intern.str_index(canon)::u64;
+}
+
+# adds `d` with the parameters `params[0 .. params_len]`; a second declaration of one kind and
+# canonical name leaves that name ambiguous, which a lookup by name refuses
+pub fun declaration_add(iface: *Interface, d: Declaration, params: *Param, params_len: u32) err[fail.Fail] {
+    var owned: Declaration = d;
+    owned.params_start = iface.params.len::u32;
+    owned.params_len   = params_len;
+    var i: u32 = 0;
+    for (i < params_len) {
+        val pushed: res[usize, A.Error] = collections_vector.push[Param](?iface.params, params[i]);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    val at:     u32                 = iface.declarations.len::u32;
+    val pushed: res[usize, A.Error] = collections_vector.push[Declaration](?iface.declarations, owned);
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    val by_decl: res[bool, A.Error] = map.insert[u32, u32](?iface.by_decl, ast_id.decl_index(d.decl), at);
+    if (sel by_decl.err) { ret err[fail.Fail].err{fail.refused(by_decl.err)}; }
+    var key:  u64       = canon_key(d.kind, d.canon);
+    val seen: opt[*u32] = map.get[u64, u32](?iface.by_canon, ?key);
+    var slot: u32       = at;
+    if (sel seen.some) { slot = NONE; }
+    val by_canon: res[bool, A.Error] = map.insert[u64, u32](?iface.by_canon, key, slot);
+    if (sel by_canon.err) { ret err[fail.Fail].err{fail.refused(by_canon.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the declaration `decl` of the module, none for one the interface does not describe
+pub fun declaration_at(iface: *Interface, decl: ast_id.DeclId) opt[*Declaration] {
+    if (ast_id.decl_is_nil(decl)) { ret opt[*Declaration].none{}; }
+    var key:   u32       = ast_id.decl_index(decl);
+    val found: opt[*u32] = map.get[u32, u32](?iface.by_decl, ?key);
+    if (sel found.none) { ret opt[*Declaration].none{}; }
+    ret opt[*Declaration].some{?iface.declarations.data[@found.some]};
+}
+
+# the one declaration of `kind` the module defines under `canon`
+pub fun declaration_for(iface: *Interface, kind: resolve.SymKind, canon: intern.StrId) res[*Declaration, fail.Fail] {
+    var key:   u64       = canon_key(kind, canon);
+    val found: opt[*u32] = map.get[u64, u32](?iface.by_canon, ?key);
+    if (sel found.none)      { ret res[*Declaration, fail.Fail].err{fail.message("interface: the module defines no such declaration")}; }
+    if (@found.some == NONE) { ret res[*Declaration, fail.Fail].err{fail.message("interface: the declaration's canonical name is ambiguous")}; }
+    ret res[*Declaration, fail.Fail].ok{?iface.declarations.data[@found.some]};
+}
+
+pub fun param_at(iface: *Interface, d: *Declaration, ord: u32) opt[Param] {
+    if (ord >= d.params_len) { ret opt[Param].none{}; }
+    ret opt[Param].some{iface.params.data[d.params_start + ord]};
+}
+
+pub fun declaration_has_comptime_param(iface: *Interface, d: *Declaration) bool {
+    var i: u32 = 0;
+    for (i < d.params_len) {
+        if (iface.params.data[d.params_start + i].comptime) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a generic, comptime-parameter or pack function has instances in place of one definition
+pub fun declaration_has_instances(iface: *Interface, d: *Declaration) bool {
+    ret d.generics > 0 || (d.flags & DECLARATION_PACK) != 0 || declaration_has_comptime_param(iface, d);
+}
+
+pub fun node_add(iface: *Interface, n: Node) res[u32, fail.Fail] {
+    val at:     u32                 = iface.nodes.len::u32;
+    val pushed: res[usize, A.Error] = collections_vector.push[Node](?iface.nodes, n);
+    if (sel pushed.err) { ret res[u32, fail.Fail].err{fail.refused(pushed.err)}; }
+    ret res[u32, fail.Fail].ok{at};
+}
+
+# the members of an aggregate are added together once its children are, so they are contiguous
+pub fun members_add(iface: *Interface, node: u32, members: *Member, len: u32) err[fail.Fail] {
+    val first: u32 = iface.members.len::u32;
+    var i:     u32 = 0;
+    for (i < len) {
+        val pushed: res[usize, A.Error] = collections_vector.push[Member](?iface.members, members[i]);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    iface.nodes.data[node].first = first;
+    iface.nodes.data[node].len   = len;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun node_at(iface: *Interface, node: u32) *Node {
+    ret ?iface.nodes.data[node];
+}
+
+pub fun member_at(iface: *Interface, n: *Node, ord: u32) opt[Member] {
+    if (n.kind != NODE_ARRAY && n.kind != NODE_LITERAL) { ret opt[Member].none{}; }
+    if (ord >= n.len)                                   { ret opt[Member].none{}; }
+    ret opt[Member].some{iface.members.data[n.first + ord]};
+}
+
+# the value a scalar node holds, or the refusal a refused one gives; an aggregate has no
+# value of its own
+pub fun node_value(iface: *Interface, itn: *intern.Interner, node: u32) res[comptime.CTValue, comptime.EvalFail] {
+    val n: *Node = node_at(iface, node);
+    if (n.kind == NODE_SCALAR) { ret res[comptime.CTValue, comptime.EvalFail].ok{n.value}; }
+    if (n.kind == NODE_REFUSED) {
+        ret res[comptime.CTValue, comptime.EvalFail].err{comptime.eval_error(n.refusal.kind, n.refusal.diag, intern.text(itn, n.refusal.message))};
+    }
+    ret res[comptime.CTValue, comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_REJECTED, diagnostic_kind.COMPTIME_NOT_EVALUABLE,
+        "an aggregate constant has no single compile-time value")};
+}
+
+# the template part, none for a module with no generic, comptime-parameter or pack function
+pub fun template_of(iface: *Interface) opt[*template.Template] {
+    if (!iface.template.present) { ret opt[*template.Template].none{}; }
+    ret opt[*template.Template].some{?iface.template};
+}
+
+pub fun exported_add(iface: *Interface, e: Exported) err[fail.Fail] {
+    val pushed: res[usize, A.Error] = collections_vector.push[Exported](?iface.surface, e);
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun exported_count(iface: *Interface) u32 {
+    ret iface.surface.len::u32;
+}
+
+pub fun exported_at(iface: *Interface, ord: u32) *Exported {
+    ret ?iface.surface.data[ord];
+}
+
+#[testing]
+fun t_declaration(kind: resolve.SymKind, canon: u32, decl: u32) Declaration {
+    ret Declaration{kind: kind, canon: intern.str_id(canon), decl: ast_id.decl(decl), value: NONE, op_set: intern.STR_NIL, op_name: intern.STR_NIL};
+}
+
+#[testing]
+fun t_added(iface: *Interface, kind: resolve.SymKind, canon: u32, decl: u32, params: *Param, len: u32) bool {
+    val added: err[fail.Fail] = declaration_add(iface, t_declaration(kind, canon, decl), params, len);
+    ret sel added.ok;
+}
+
+#[testing]
+fun t_found(iface: *Interface, kind: resolve.SymKind, canon: u32) *Declaration {
+    val found: res[*Declaration, fail.Fail] = declaration_for(iface, kind, intern.str_id(canon));
+    if (sel found.ok) { ret found.ok; }
+    ret nil;
+}
+
+# a declaration is found by its id and by its kind and name, a second one of the same kind and
+# name is refused by name but still found by id, and its parameters read back in order
+test declaration__reads_by_id_and_refuses_an_ambiguous_name {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var iface: Interface = init(?alloc);
+    fin { dnit(?iface); }
+    var params: [2]Param = [2]Param{Param{comptime: false}, Param{comptime: true}};
+    if (!t_added(?iface, resolve.SYM_FUN, 10, 3, ?params[0], 2)) { ret 2; }
+    if (!t_added(?iface, resolve.SYM_VAL, 10, 4, nil, 0))        { ret 2; }
+    val f: *Declaration = t_found(?iface, resolve.SYM_FUN, 10);
+    if (f == nil || !ast_id.decl_same(f.decl, ast_id.decl(3))) { ret 3; }
+    if (!declaration_has_comptime_param(?iface, f))            { ret 4; }
+    if (!declaration_has_instances(?iface, f))                 { ret 4; }
+    val second: opt[Param] = param_at(?iface, f, 1);
+    if (sel second.none)       { ret 5; }
+    if (!second.some.comptime) { ret 5; }
+    val third: opt[Param] = param_at(?iface, f, 2);
+    if (sel third.some)                                   { ret 5; }
+    if (t_found(?iface, resolve.SYM_VAR, 10) != nil)      { ret 6; }
+    if (!t_added(?iface, resolve.SYM_FUN, 10, 5, nil, 0)) { ret 7; }
+    if (t_found(?iface, resolve.SYM_FUN, 10) != nil)      { ret 8; }
+    val by_id: opt[*Declaration] = declaration_at(?iface, ast_id.decl(5));
+    if (sel by_id.none)             { ret 9; }
+    if (by_id.some.params_len != 0) { ret 9; }
+    val absent: opt[*Declaration] = declaration_at(?iface, ast_id.decl(6));
+    if (sel absent.some) { ret 10; }
+    ret 0;
+}
+
+# an aggregate's members read back in order, a scalar gives its value, and a refused leaf gives
+# its refusal
+test node__reads_members_and_leaves {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var itn: intern.Interner = intern.init(?alloc);
+    fin { intern.dnit(?itn); }
+    var iface: Interface = init(?alloc);
+    fin { dnit(?iface); }
+    val why: res[intern.StrId, A.Error] = intern.add(?itn, "not constant");
+    if (sel why.err) { ret 1; }
+    val leaf: res[u32, fail.Fail] = node_add(?iface, Node{kind: NODE_SCALAR, value: comptime.ct_u8(7)});
+    if (sel leaf.err) { ret 2; }
+    val refused: res[u32, fail.Fail] = node_add(?iface, Node{kind: NODE_REFUSED,
+        refusal: Refusal{kind: comptime.EVAL_FAIL_REJECTED, diag: diagnostic_kind.COMPTIME_NOT_EVALUABLE, message: why.ok}});
+    if (sel refused.err) { ret 2; }
+    val array: res[u32, fail.Fail] = node_add(?iface, Node{kind: NODE_ARRAY});
+    if (sel array.err) { ret 2; }
+    var members: [2]Member      = [2]Member{Member{name: intern.STR_NIL, node: leaf.ok}, Member{name: intern.STR_NIL, node: refused.ok}};
+    val linked:  err[fail.Fail] = members_add(?iface, array.ok, ?members[0], 2);
+    if (sel linked.err) { ret 3; }
+    val second: opt[Member] = member_at(?iface, node_at(?iface, array.ok), 1);
+    if (sel second.none)                { ret 4; }
+    if (second.some.node != refused.ok) { ret 4; }
+    val past: opt[Member] = member_at(?iface, node_at(?iface, array.ok), 2);
+    if (sel past.some) { ret 4; }
+    val v: res[comptime.CTValue, comptime.EvalFail] = node_value(?iface, ?itn, leaf.ok);
+    if (sel v.err)        { ret 5; }
+    if (v.ok.data.i != 7) { ret 5; }
+    val r: res[comptime.CTValue, comptime.EvalFail] = node_value(?iface, ?itn, refused.ok);
+    if (sel r.ok)                                             { ret 6; }
+    if (r.err.diag != diagnostic_kind.COMPTIME_NOT_EVALUABLE) { ret 6; }
+    if (!str_equals(r.err.message, "not constant"))           { ret 6; }
+    val whole: res[comptime.CTValue, comptime.EvalFail] = node_value(?iface, ?itn, array.ok);
+    if (sel whole.ok) { ret 7; }
+    ret 0;
+}
