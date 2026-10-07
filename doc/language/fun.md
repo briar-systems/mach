@@ -207,7 +207,7 @@ reference.
 
 ## Tail calls
 
-The release pipeline (`opt = 2`) treats a call whose result the function
+A build with `optimize = true` treats a call whose result the function
 returns unchanged, as in `ret f(a, b);`, as a tail call. A call to the function
 itself becomes a loop: the recursion runs in the stack of one frame at any
 depth. `ret f(n - 1) + x`, and the same with `*`, `|` or `^` on integers, is a
@@ -219,10 +219,11 @@ A call stays a call when the function has a `fin` pending at the `ret`, when
 the address of one of its locals escapes (to the callee or to any earlier
 call), when it runs inline assembly or is `#[naked]` or `#[oblivious]`, when a
 by-value argument is a copy the caller has to make, or when the callee takes
-more stack arguments than the caller received. The debug pipeline (`opt = 0`)
-makes no tail calls.
+more stack arguments than the caller received. A build with `optimize = false`
+makes no tail calls, and neither does one that skips the `tailrec` and `tailcall`
+passes.
 
-`-g` changes none of this: debug information is added to the same code. A
+`debug = true` changes none of this: debug information is added to the same code. A
 debugger or unwinder therefore never sees the frame a tail call left. A
 backtrace taken inside the callee shows it directly below the caller's own
 caller, and a self tail call shows as the one frame of the loop, its parameters
