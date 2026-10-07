@@ -56,8 +56,9 @@ pub fun name(d: *Debug, target: u32, text: intern.StrId);
 ## fun record
 
 ```mach
-pub fun record(d: *Debug, struct_id: u32, ty: type.TypeId);
+pub fun record(d: *Debug, struct_id: u32, types: *ir_debug.Table, ty: ir_debug.TypeId);
 ```
 
-OpName for a record type and OpMemberName for each field, from its declared source type
+OpName for a record type and OpMemberName for each field, from the debug type
+its module's table gives it
 

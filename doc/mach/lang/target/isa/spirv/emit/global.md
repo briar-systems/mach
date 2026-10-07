@@ -32,6 +32,12 @@ pub fun ir_of(e: *emitter.Emit, ix: u32) *me_ir.Global;
 pub fun types_of(e: *emitter.Emit, ix: u32) *ir_type.IrTypeTable;
 ```
 
+## fun debug_types_of
+
+```mach
+pub fun debug_types_of(e: *emitter.Emit, ix: u32) *ir_debug.Table;
+```
+
 ## fun lookup
 
 ```mach
