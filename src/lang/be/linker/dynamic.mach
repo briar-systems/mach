@@ -48,12 +48,11 @@ use mach.lang.be.linker.input.context_atoms;
 use mach.lang.be.linker.merge.MergedSection;
 use mach.lang.be.linker.merge.Placement;
 use mach.lang.be.linker.merge.SectionGroups;
-use mach.lang.be.linker.merge.align_up_u64_checked;
-use mach.lang.be.linker.merge.section_group_add;
 use mach.lang.be.linker.resolve.SymbolLoc;
 use mach.lang.be.linker.resolve.collect_symbols;
 use mach.lang.be.linker.resolve.is_undefined_extern;
 use mach.lang.be.linker.resolve.resolved_symbol_name;
+use mach.lang.be.linker.table;
 
 pub rec DynState {
     info:                  target_of.DynamicInfo;
@@ -64,11 +63,10 @@ pub rec DynState {
     base_reloc_cap:        u32;
     import_addr_fixup_cap: u32;
     active:                bool;
-    # where the reserved call-stub table starts inside the merged code, which
-    # every later relayout moves with it
-    stubs_offset: u32;
-    # where the reserved import GOT starts inside the merged read-only data
-    got_offset: u32;
+    # where the reserved call-stub table and import GOT lie, which every later
+    # relayout moves with the section they end
+    stubs_at: table.At;
+    got_at:   table.At;
 }
 
 pub fun init_dynstate(dyn: *DynState) {
@@ -86,10 +84,10 @@ pub fun init_dynstate(dyn: *DynState) {
     dyn.info.import_addr_fixup_count = 0;
     dyn.info.stubs.vaddr             = 0;
     dyn.info.stubs.size              = 0;
-    dyn.stubs_offset                 = 0;
+    dyn.stubs_at                     = table.At{};
     dyn.info.got.vaddr               = 0;
     dyn.info.got.size                = 0;
-    dyn.got_offset                   = 0;
+    dyn.got_at                       = table.At{};
     dyn.call_fixup_cap               = 0;
     dyn.lib_cap                      = 0;
     dyn.import_cap                   = 0;
@@ -121,120 +119,48 @@ pub fun free_dynstate(alloc: *A.Allocator, dyn: *DynState) {
     init_dynstate(dyn);
 }
 
-# reserves the format's call-stub table at the end of the merged code, before
-# anything is given an address, so a call site and its stub are never separated
-# by the image's data however large it is; the addresses are read back
-# by place_call_stubs once the layout is final
-pub fun reserve_call_stubs(s: *session.Session, tgt: *lang_target.Binding, dyn: *DynState,
+# reserves the tables the format declares for the imports of a dynamic link,
+# each where its shape places it and before anything is given an address: the
+# call stubs, so a call site and its stub are never separated by the image's
+# data however large it is, and the GOT the loader binds; place_import_tables
+# reads their addresses back once the layout is final
+pub fun reserve_import_tables(s: *session.Session, tgt: *lang_target.Binding, dyn: *DynState,
     merged: *MergedSection, groups: *SectionGroups) err[fail.Fail] {
-    if (tgt.of == nil || tgt.of.stub_shape == nil) { ret err[fail.Fail].ok{}; }
-    var count: u32 = 0;
-    var i:     u32 = 0;
-    for (i < dyn.info.import_count) {
-        if (dyn.info.imports[i].is_func) { count = count + 1; }
-        i = i + 1;
-    }
-    if (count == 0) { ret err[fail.Fail].ok{}; }
-    val shape_r: res[target_of.TableShape, fail.Fail] = tgt.of.stub_shape(tgt.object.arch_id, count);
-    if (sel shape_r.err) { ret err[fail.Fail].err{shape_r.err}; }
-    val shape: target_of.TableShape = shape_r.ok;
-    if (shape.size == 0 || shape.align == 0) {
-        ret err[fail.Fail].err{fail.message("the format declared an empty call-stub table")};
-    }
-
-    val text:    u32                 = target_of.SK_TEXT::u32;
-    val start_r: res[u64, fail.Fail] = align_up_u64_checked(merged[text].len::u64, shape.align::u64);
-    if (sel start_r.err) { ret err[fail.Fail].err{start_r.err}; }
-    val start: u64 = start_r.ok;
-    if (shape.size::u64 > 0xFFFFFFFF - start) {
-        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_SIZE_LIMIT, "the call-stub table takes the code past the maximum section size")};
-    }
-    val end: u64 = start + shape.size::u64;
-    merged[text].used = true;
-    if (merged[text].align < shape.align) { merged[text].align = shape.align; }
-    merged[text].len = end::u32;
-
-    val name_r: res[intern.StrId, A.Error] = intern.add(?s.interner, shape.name);
-    if (sel name_r.err) { ret err[fail.Fail].err{fail.refused(name_r.err)}; }
-    val ga: res[u32, fail.Fail] = section_group_add(s.alloc, groups, text, name_r.ok, 0);
-    if (sel ga.err) { ret err[fail.Fail].err{ga.err}; }
-    val gi: u32 = ga.ok;
-    groups.items[gi].align  = shape.align;
-    groups.items[gi].base   = start::u32;
-    groups.items[gi].cursor = end::u32;
-    groups.items[gi].len    = shape.size::u32;
-
-    dyn.stubs_offset    = start::u32;
-    dyn.info.stubs.size = shape.size;
-    ret err[fail.Fail].ok{};
-}
-
-pub fun place_call_stubs(dyn: *DynState, merged: *MergedSection) {
-    if (dyn.info.stubs.size == 0) { ret; }
-    dyn.info.stubs.vaddr = merged[target_of.SK_TEXT::u32].vaddr + dyn.stubs_offset::u64;
-}
-
-# reserves the format's import GOT at the end of the read-only data, before
-# anything is given an address, so the zero-fill that follows it never
-# separates the code from its slots however large it is. a GOT the
-# linker already synthesized for defined symbols ends the same section under
-# the same name, and the import slots extend it; the address is read back by
-# place_import_got once the layout is final
-pub fun reserve_import_got(s: *session.Session, tgt: *lang_target.Binding, dyn: *DynState,
-    merged: *MergedSection, groups: *SectionGroups) err[fail.Fail] {
-    if (tgt.of == nil || tgt.of.got_shape == nil) { ret err[fail.Fail].ok{}; }
-    val shape_r: res[target_of.TableShape, fail.Fail] = tgt.of.got_shape(tgt.object.arch_id, ?dyn.info);
-    if (sel shape_r.err) { ret err[fail.Fail].err{shape_r.err}; }
-    val shape: target_of.TableShape = shape_r.ok;
-    if (shape.size == 0) { ret err[fail.Fail].ok{}; }
-    if (shape.align == 0) {
-        ret err[fail.Fail].err{fail.message("the format declared an unaligned import GOT")};
-    }
-
-    val relro:   u32                 = target_of.SK_RELRO::u32;
-    val start_r: res[u64, fail.Fail] = align_up_u64_checked(merged[relro].len::u64, shape.align::u64);
-    if (sel start_r.err) { ret err[fail.Fail].err{start_r.err}; }
-    val start: u64 = start_r.ok;
-    if (shape.size::u64 > 0xFFFFFFFF - start) {
-        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_SIZE_LIMIT, "the import GOT takes the read-only data past the maximum section size")};
-    }
-    val end: u64 = start + shape.size::u64;
-
-    val name_r: res[intern.StrId, A.Error] = intern.add(?s.interner, shape.name);
-    if (sel name_r.err) { ret err[fail.Fail].err{fail.refused(name_r.err)}; }
-    val name: intern.StrId = name_r.ok;
-    var gi:   u32          = 0xFFFFFFFF;
-    var i:    u32          = 0;
-    for (i < groups.count) {
-        if (groups.items[i].slot == relro && intern.str_same(groups.items[i].name, name)
-            && groups.items[i].base::u64 + groups.items[i].len::u64 == merged[relro].len::u64) {
-            gi = i;
+    if (tgt.of == nil) { ret err[fail.Fail].ok{}; }
+    val count: u32 = target_of.func_import_count(?dyn.info);
+    if (tgt.of.stub_shape != nil && count > 0) {
+        val shape_r: res[target_of.TableShape, fail.Fail] = tgt.of.stub_shape(tgt.object.arch_id, count);
+        if (sel shape_r.err) { ret err[fail.Fail].err{shape_r.err}; }
+        var shape: target_of.TableShape = shape_r.ok;
+        if (shape.size == 0 || shape.align == 0) {
+            ret err[fail.Fail].err{fail.message("the format declared an empty call-stub table")};
         }
-        i = i + 1;
+        val at: res[table.At, fail.Fail] = table.reserve(s, merged, groups, ?shape, 0,
+            "the call-stub table takes the code past the maximum section size");
+        if (sel at.err) { ret err[fail.Fail].err{at.err}; }
+        dyn.stubs_at        = at.ok;
+        dyn.info.stubs.size = shape.size;
     }
-    if (gi == 0xFFFFFFFF) {
-        val ga: res[u32, fail.Fail] = section_group_add(s.alloc, groups, relro, name, 0);
-        if (sel ga.err) { ret err[fail.Fail].err{ga.err}; }
-        gi                     = ga.ok;
-        groups.items[gi].base  = start::u32;
-        groups.items[gi].align = shape.align;
+    if (tgt.of.got_shape != nil) {
+        val shape_r: res[target_of.TableShape, fail.Fail] = tgt.of.got_shape(tgt.object.arch_id, ?dyn.info);
+        if (sel shape_r.err) { ret err[fail.Fail].err{shape_r.err}; }
+        var shape: target_of.TableShape = shape_r.ok;
+        if (shape.size == 0) { ret err[fail.Fail].ok{}; }
+        if (shape.align == 0) {
+            ret err[fail.Fail].err{fail.message("the format declared an unaligned import GOT")};
+        }
+        val at: res[table.At, fail.Fail] = table.reserve(s, merged, groups, ?shape, 0,
+            "the import GOT takes the read-only data past the maximum section size");
+        if (sel at.err) { ret err[fail.Fail].err{at.err}; }
+        dyn.got_at        = at.ok;
+        dyn.info.got.size = shape.size;
     }
-    if (groups.items[gi].align < shape.align) { groups.items[gi].align = shape.align; }
-    groups.items[gi].cursor = end::u32;
-    groups.items[gi].len    = (end - groups.items[gi].base::u64)::u32;
-
-    merged[relro].used = true;
-    if (merged[relro].align < shape.align) { merged[relro].align = shape.align; }
-    merged[relro].len = end::u32;
-
-    dyn.got_offset    = start::u32;
-    dyn.info.got.size = shape.size;
     ret err[fail.Fail].ok{};
 }
 
-pub fun place_import_got(dyn: *DynState, merged: *MergedSection) {
-    if (dyn.info.got.size == 0) { ret; }
-    dyn.info.got.vaddr = merged[target_of.SK_RELRO::u32].vaddr + dyn.got_offset::u64;
+pub fun place_import_tables(dyn: *DynState, merged: *MergedSection) {
+    if (dyn.info.stubs.size > 0) { dyn.info.stubs.vaddr = table.vaddr_of(dyn.stubs_at, merged); }
+    if (dyn.info.got.size > 0)   { dyn.info.got.vaddr = table.vaddr_of(dyn.got_at, merged); }
 }
 
 # a GOT-kind relocation reaches the import under any of the names it is known by

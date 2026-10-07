@@ -1528,13 +1528,11 @@ pub rec DynamicInfo {
     import_addr_fixups:      *ImportFixup;
     import_addr_fixup_count: u32;
 
-    # the call-stub table the linker reserved at the end of the code, one stub
-    # per imported function in import order; empty when the format lays out
-    # its own stubs
+    # the call-stub table the linker reserved, one stub per imported function;
+    # empty when the format declares none
     stubs: TableSpan;
-    # the import GOT the linker reserved at the end of the read-only data, ahead
-    # of the zero-fill, one slot per import the format's got_shape counts in
-    # import order; empty when the format lays out its own GOT
+    # the import GOT the linker reserved, one slot per import the format's
+    # got_shape counts; empty when the format declares none
     got: TableSpan;
 }
 
@@ -1603,21 +1601,170 @@ pub fun span_locate(a: *A.Allocator, span: TableSpan, segs: *LoadSegment, seg_co
     ret res[SpanLocation, fail.Fail].err{fail.formatted(a, "{} lies outside every load segment", table)};
 }
 
+# where the linker lays out a table a format asks it to reserve. a table at the
+# end of the code or of the read-only data moves everything after it, so the
+# format shapes it before anything is given an address; a table in a segment
+# of its own follows every other, so the format shapes it once the image is
+# final, from the image itself
+pub def TablePlacement: u8;
+# at the end of the code, so no data lies between the code and the table
+pub val TABLE_CODE_END: TablePlacement = 0;
+# at the end of the read-only data the loader writes once, ahead of the zero-fill
+pub val TABLE_RELRO_END: TablePlacement = 1;
+# in a segment of its own after the image's last one, on a page of its own
+pub val TABLE_OWN_SEGMENT: TablePlacement = 2;
+
 # what a table a format asks the linker to reserve takes: the linker lays it out
-# under this section name before it gives anything an address, so the code
-# reaches it whatever data the image carries
+# under this section name where `placement` puts it, before it gives anything
+# an address, so the code reaches it whatever data the image carries
+# ---
+# flags: the segment's SEG_FLAG_ bits, for a table in a segment of its own
 pub rec TableShape {
-    name:  str;
-    size:  usize;
-    align: u32;
+    name:      str;
+    size:      usize;
+    align:     u32;
+    placement: TablePlacement;
+    flags:     u32;
 }
 
-# the call-stub table for a count of imported functions, at the end of the code
+# the call-stub table for a count of imported functions
 def StubShapeFn: fun(u32, u32) res[TableShape, fail.Fail];
 
-# the import GOT for the imports of a dynamic link, at the end of the read-only
-# data; an empty shape when no import needs a slot
+# the import GOT for the imports of a dynamic link; an empty shape when no
+# import needs a slot
 def GotShapeFn: fun(u32, *DynamicInfo) res[TableShape, fail.Fail];
+
+# the tables a format lays out in segments of their own after the image, in the
+# order it adds them
+pub rec TableList {
+    alloc:  *A.Allocator;
+    shapes: *TableShape;
+    count:  u32;
+    cap:    u32;
+}
+
+pub fun table_list_init(alloc: *A.Allocator) TableList {
+    ret TableList{alloc: alloc, shapes: nil, count: 0, cap: 0};
+}
+
+pub fun table_list_dnit(list: *TableList) {
+    if (list.shapes != nil && list.cap > 0) { A.deallocate[TableShape](list.alloc, list.shapes, list.cap::usize); }
+    list.shapes = nil;
+    list.count  = 0;
+    list.cap    = 0;
+}
+
+# adds a table in a segment of its own, none when it is empty
+pub fun table_add(list: *TableList, shape: TableShape) err[fail.Fail] {
+    if (shape.size == 0) { ret err[fail.Fail].ok{}; }
+    if (shape.placement != TABLE_OWN_SEGMENT || shape.align == 0) {
+        ret err[fail.Fail].err{fail.message("a table in a segment of its own declares that placement and an alignment")};
+    }
+    val grown: err[A.Error] = growth.reserve[TableShape](list.alloc, ?list.shapes, ?list.cap, list.count::usize + 1);
+    if (sel grown.err) { ret err[fail.Fail].err{fail.refused(grown.err)}; }
+    list.shapes[list.count] = shape;
+    list.count              = list.count + 1;
+    ret err[fail.Fail].ok{};
+}
+
+# shapes the tables the image takes in segments of their own, once everything
+# else in it is final, adding each to the list
+pub def SegmentTablesFn: fun(*LinkedImage, *TableList) err[fail.Fail];
+
+# the segments `segs` and, after every other, one for each table in `tables`,
+# each on a page of its own, its bytes zero for the format to write and named
+# by its one section. the returned array holds `segs` by value, so the caller
+# releases the array `segs` but nothing its segments own
+pub fun table_segments_append(alloc: *A.Allocator, itn: *intern.Interner, segs: *LoadSegment, count: u32, tables: *TableList,
+    page: u64) res[*LoadSegment, fail.Fail] {
+    val nr: res[*LoadSegment, A.Error] = A.zallocate[LoadSegment](alloc, (count + tables.count)::usize);
+    if (sel nr.err) { ret res[*LoadSegment, fail.Fail].err{fail.refused(nr.err)}; }
+    val out: *LoadSegment = nr.ok;
+    var va:  u64          = 0;
+    var i:   u32          = 0;
+    for (i < count) {
+        out[i] = segs[i];
+        if (segs[i].vaddr + segs[i].memsz::u64 > va) { va = segs[i].vaddr + segs[i].memsz::u64; }
+        i = i + 1;
+    }
+    var t:    u32            = 0;
+    var made: err[fail.Fail] = err[fail.Fail].ok{};
+    for (t < tables.count && !sel made.err) {
+        made = table_segment_fill(alloc, itn, ?out[count + t], ?tables.shapes[t], ?va, page);
+        if (!sel made.err) { t = t + 1; }
+    }
+    if (sel made.err) {
+        table_segments_free(alloc, ?out[count], t);
+        A.deallocate[LoadSegment](alloc, out, (count + tables.count)::usize);
+        ret res[*LoadSegment, fail.Fail].err{made.err};
+    }
+    ret res[*LoadSegment, fail.Fail].ok{out};
+}
+
+fun table_segment_fill(alloc: *A.Allocator, itn: *intern.Interner, seg: *LoadSegment, shape: *TableShape, va: *u64,
+    page: u64) err[fail.Fail] {
+    var align: u64 = shape.align::u64;
+    if (align < page) { align = page; }
+    if (@va > 0xFFFFFFFFFFFFFFFF - (align - 1)) {
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_SIZE_LIMIT, "a table segment overflows the address space")};
+    }
+    val at: u64 = (@va + align - 1) & ~(align - 1);
+    if (at > 0xFFFFFFFFFFFFFFFF - shape.size::u64) {
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_SIZE_LIMIT, "a table segment overflows the address space")};
+    }
+    val name_r: res[intern.StrId, A.Error] = intern.add(itn, shape.name);
+    if (sel name_r.err) { ret err[fail.Fail].err{fail.refused(name_r.err)}; }
+    val sec_r: res[*LoadSection, A.Error] = A.zallocate[LoadSection](alloc, 1);
+    if (sel sec_r.err) { ret err[fail.Fail].err{fail.refused(sec_r.err)}; }
+    val bytes_r: res[*u8, A.Error] = A.zallocate[u8](alloc, shape.size);
+    if (sel bytes_r.err) {
+        A.deallocate[LoadSection](alloc, sec_r.ok, 1);
+        ret err[fail.Fail].err{fail.refused(bytes_r.err)};
+    }
+    var kind: SectionKind = SK_RODATA;
+    if ((shape.flags & SEG_FLAG_EXECUTE) != 0) { kind = SK_TEXT; }
+    or ((shape.flags & SEG_FLAG_WRITE) != 0)   { kind = SK_DATA; }
+    sec_r.ok[0]       = LoadSection{name: name_r.ok, kind: kind, offset: 0, len: shape.size::u32, align: shape.align, flags: 0};
+    seg.vaddr         = at;
+    seg.filesz        = shape.size;
+    seg.memsz         = shape.size;
+    seg.flags         = shape.flags;
+    seg.bytes         = bytes_r.ok;
+    seg.table         = true;
+    seg.sections      = sec_r.ok;
+    seg.section_count = 1;
+    @va               = at + shape.size::u64;
+    ret err[fail.Fail].ok{};
+}
+
+# releases what `count` table segments own: their bytes and their one section
+pub fun table_segments_free(alloc: *A.Allocator, segs: *LoadSegment, count: u32) {
+    var i: u32 = 0;
+    for (i < count) {
+        if (segs[i].table) {
+            if (segs[i].bytes != nil && segs[i].filesz > 0) { A.deallocate[u8](alloc, segs[i].bytes, segs[i].filesz); }
+            if (segs[i].sections != nil)                    { A.deallocate[LoadSection](alloc, segs[i].sections, segs[i].section_count::usize); }
+            segs[i].bytes    = nil;
+            segs[i].sections = nil;
+        }
+        i = i + 1;
+    }
+}
+
+# the image's segment for the table the format added `i`-th, nil when it added
+# fewer; the linker appends them after every other segment, in that order
+pub fun table_segment(img: *LinkedImage, i: u32) *LoadSegment {
+    var seen: u32 = 0;
+    var k:    u32 = 0;
+    for (k < img.segment_count) {
+        if (img.segments[k].table) {
+            if (seen == i) { ret ?img.segments[k]; }
+            seen = seen + 1;
+        }
+        k = k + 1;
+    }
+    ret nil;
+}
 
 # the unwind tables of an image: an index an unwinder searches by address
 # and the frame descriptions it reaches, each empty when the format needs none
@@ -1669,6 +1816,9 @@ pub rec LoadSegment {
     memsz:  usize;
     flags:  u32;
     bytes:  *u8;
+    # the linker reserved the segment whole for a table the format declared in
+    # a segment of its own, named by its one section; the format writes it
+    table: bool;
 
     sections:      *LoadSection;
     section_count: u32;
@@ -2165,10 +2315,12 @@ pub rec OfVTable {
     default_stack_reserve:       u64;
     header_span:                 HeaderSpanFn;
     executable_section_location: ExecutableSectionLocationFn;
-    # nil when the format's dynamic writer places its own call stubs
+    # nil when the format reserves no call stubs before layout
     stub_shape: StubShapeFn;
-    # nil when the format's dynamic writer places its own import GOT
+    # nil when the format reserves no import GOT before layout
     got_shape: GotShapeFn;
+    # nil when the format lays out no table in a segment of its own
+    segment_tables: SegmentTablesFn;
     # nil when the format's images carry no unwind tables the linker reserves
     unwind_shape: UnwindShapeFn;
     # the platform unwinder recognizes an epilogue by decoding its code, and
@@ -2590,6 +2742,40 @@ test span_locate__finds_the_segment_holding_the_table_whole {
     ret 0;
 }
 
+test table_segments_append__lays_tables_out_after_the_image_in_order {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    fin { intern.dnit(?itn); }
+    var list: TableList = table_list_init(?alloc);
+    fin { table_list_dnit(?list); }
+    val empty: err[fail.Fail] = table_add(?list, TableShape{name: ".none", size: 0, align: 4, placement: TABLE_OWN_SEGMENT});
+    if (sel empty.err || list.count != 0) { ret 1; }
+    val moved: err[fail.Fail] = table_add(?list, TableShape{name: ".got", size: 8, align: 8, placement: TABLE_CODE_END});
+    if (!sel moved.err) { ret 2; }
+    val a: err[fail.Fail] = table_add(?list, TableShape{name: ".a", size: 0x10, align: 8, placement: TABLE_OWN_SEGMENT, flags: SEG_FLAG_READ});
+    val b: err[fail.Fail] = table_add(?list, TableShape{name: ".b", size: 4, align: 4, placement: TABLE_OWN_SEGMENT,
+        flags: SEG_FLAG_READ | SEG_FLAG_WRITE});
+    if (sel a.err || sel b.err) { ret 3; }
+
+    var segs: [2]LoadSegment;
+    segs[0].vaddr = 0x1000;
+    segs[0].memsz = 0x80;
+    segs[1].vaddr = 0x2000;
+    segs[1].memsz = 0x1001;
+    val out: res[*LoadSegment, fail.Fail] = table_segments_append(?alloc, ?itn, ?segs[0], 2, ?list, 0x1000);
+    if (sel out.err) { ret 4; }
+    val laid: *LoadSegment = out.ok;
+    fin {
+        table_segments_free(?alloc, ?laid[2], 2);
+        A.deallocate[LoadSegment](?alloc, laid, 4);
+    }
+    if (laid[1].vaddr != 0x2000 || laid[1].table)                                     { ret 5; }
+    if (laid[2].vaddr != 0x4000 || !laid[2].table || laid[2].filesz != 0x10)          { ret 6; }
+    if (laid[3].vaddr != 0x5000 || laid[3].flags != (SEG_FLAG_READ | SEG_FLAG_WRITE)) { ret 7; }
+    ret 0;
+}
+
 test abs_kind_for_pointer_width__width_ladder {
     val r2: res[RelocKind, fail.Fail] = abs_kind_for_pointer_width(2);
     if (sel r2.err)        { ret 1; }
@@ -2612,6 +2798,28 @@ test abs_kind_for_pointer_width__width_ladder {
     if (is_pointer_abs_kind(RK_ABS64, 2) || is_pointer_abs_kind(RK_ABS32, 8) || is_pointer_abs_kind(RK_ABS64, 4))    { ret 6; }
     if (is_pointer_abs_kind(RK_PC32, 4) || is_pointer_abs_kind(RK_PC32, 8) || is_pointer_abs_kind(RK_ABS64, 3))      { ret 7; }
     ret 0;
+}
+
+# writes `img` through `write` once the tables `tables` shapes are laid out in
+# segments of their own, as the linker lays them out, and publishes what it
+# wrote at `path`
+#[testing]
+pub fun image_write_tabled(tables: SegmentTablesFn, write: ImageEmitFn, img: LinkedImage, path: str) err[fail.Fail] {
+    var held: LinkedImage = img;
+    var list: TableList   = table_list_init(img.alloc);
+    fin { table_list_dnit(?list); }
+    val shaped: err[fail.Fail] = tables(?held, ?list);
+    if (sel shaped.err) { ret shaped; }
+    val appended: res[*LoadSegment, fail.Fail] = table_segments_append(img.alloc, img.interner, img.segments, img.segment_count,
+        ?list, img.page_size);
+    if (sel appended.err) { ret err[fail.Fail].err{appended.err}; }
+    held.segments      = appended.ok;
+    held.segment_count = img.segment_count + list.count;
+    fin {
+        table_segments_free(img.alloc, ?held.segments[img.segment_count], list.count);
+        A.deallocate[LoadSegment](img.alloc, held.segments, held.segment_count::usize);
+    }
+    ret image_write(write, held, path);
 }
 
 # writes `img` through `write` and publishes what it wrote at `path`

@@ -2911,6 +2911,54 @@ fun collect_function_unwind(segs: *target_of.LoadSegment, seg_count: u32, funcs:
     ret n;
 }
 
+# the unwind codes of every function the image describes that no foreign
+# entry already does, and the bytes the unwind data and the exception table take
+rec PeUnwind {
+    all:        *FunctionUnwind;
+    cap:        u32;
+    count:      u32;
+    xdata_size: usize;
+    pdata_size: usize;
+}
+
+fun pe_unwind_measure(img: *target_of.LinkedImage) res[PeUnwind, fail.Fail] {
+    var u:   PeUnwind;
+    val frr: res[u32, fail.Fail] = foreign_runtime_count(img.exceptions, img.exception_count);
+    if (sel frr.err) { ret res[PeUnwind, fail.Fail].err{frr.err}; }
+    val foreign_count: u32 = frr.ok;
+    if (img.function_count == 0 || img.functions == nil) {
+        u.pdata_size = foreign_count::usize * RUNTIME_FUNCTION_SIZE;
+        ret res[PeUnwind, fail.Fail].ok{u};
+    }
+    val ur: res[*FunctionUnwind, A.Error] = A.zallocate[FunctionUnwind](img.alloc, img.function_count::usize);
+    if (sel ur.err) { ret res[PeUnwind, fail.Fail].err{fail.message("unwind table alloc failed")}; }
+    u.all   = ur.ok;
+    u.cap   = img.function_count;
+    u.count = collect_function_unwind(img.segments, img.segment_count, img.functions, img.function_count,
+        img.exceptions, img.exception_count, img.image_base, u.all);
+    var ui: u32 = 0;
+    for (ui < u.count) {
+        val grown: res[usize, lang_checked.Cause] = lang_checked.usize_add(u.xdata_size, u.all[ui].xdata_size);
+        if (sel grown.err) {
+            pe_unwind_dnit(img.alloc, ?u);
+            ret res[PeUnwind, fail.Fail].err{fail.user(diagnostic_kind.LINK_SIZE_LIMIT, "PE unwind data exceeds the file offset width")};
+        }
+        u.xdata_size = grown.ok;
+        ui           = ui + 1;
+    }
+    if (foreign_count > 0xFFFFFFFF - u.count) {
+        pe_unwind_dnit(img.alloc, ?u);
+        ret res[PeUnwind, fail.Fail].err{fail.user(diagnostic_kind.LINK_SIZE_LIMIT, "PE exception table count overflows")};
+    }
+    u.pdata_size = (u.count + foreign_count)::usize * RUNTIME_FUNCTION_SIZE;
+    ret res[PeUnwind, fail.Fail].ok{u};
+}
+
+fun pe_unwind_dnit(alloc: *A.Allocator, u: *PeUnwind) {
+    if (u.all != nil) { A.deallocate[FunctionUnwind](alloc, u.all, u.cap::usize); }
+    u.all = nil;
+}
+
 fun compute_pe_layout(alloc: *A.Allocator, itn: *intern.Interner, lay: *PeLayout, segs: *target_of.LoadSegment, seg_count: u32,
     dyn: *target_of.DynamicInfo, seg_secs: *PeSection,
     image_base: u64,
@@ -2942,10 +2990,6 @@ fun compute_pe_layout(alloc: *A.Allocator, itn: *intern.Interner, lay: *PeLayout
     lay.rp = rp_r.ok;
 
     var nsec: u32 = seg_count + 1;
-    if (lay.have_stub)  { nsec = nsec + 1; }
-    if (lay.have_idata) { nsec = nsec + 1; }
-    if (lay.have_xdata) { nsec = nsec + 1; }
-    if (lay.have_pdata) { nsec = nsec + 1; }
     if (lay.have_rsrc)  { nsec = nsec + 1; }
     if (lay.have_reloc) { nsec = nsec + 1; }
     val nsec_r: res[u32, fail.Fail] = of_plan.count_u32(?lay.fp, "section headers", nsec, debug_count);
@@ -2989,20 +3033,23 @@ fun compute_pe_layout(alloc: *A.Allocator, itn: *intern.Interner, lay: *PeLayout
         li = li + 1;
     }
 
+    # the stubs and the import directory lie in the segments the linker
+    # reserved for them, after every other
     if (lay.have_stub) {
-        val stub_bytes: res[usize, fail.Fail] = of_plan.table(?lay.fp, "import stubs", lay.nimp::usize, IMPORT_STUB_SIZE);
-        if (sel stub_bytes.err) { ret err[fail.Fail].err{stub_bytes.err}; }
-        val placed: err[fail.Fail] = place_pe_section(lay, "import stubs", ?lay.stub_sec, false, 0,
-            stub_bytes.ok::u64, stub_bytes.ok);
-        if (sel placed.err) { ret placed; }
+        val k: u32 = table_segment(itn, segs, seg_count, STUBS_TABLE, lay.nimp::usize * IMPORT_STUB_SIZE);
+        if (k == NO_TABLE_SEGMENT) {
+            ret err[fail.Fail].err{fail.message("the linker laid out no import stub table for the imported functions")};
+        }
+        lay.stub_sec = seg_secs[k];
     }
-
     if (lay.have_idata) {
         val idata_planned: err[fail.Fail] = plan_import_directory(alloc, itn, dyn, ?lay.idata);
         if (sel idata_planned.err) { ret idata_planned; }
-        val placed: err[fail.Fail] = place_pe_section(lay, "import directory", ?lay.idata_sec, false, 0,
-            lay.idata.vsize::u64, lay.idata.vsize);
-        if (sel placed.err) { ret placed; }
+        val k: u32 = table_segment(itn, segs, seg_count, IMPORTS_TABLE, lay.idata.vsize);
+        if (k == NO_TABLE_SEGMENT) {
+            ret err[fail.Fail].err{fail.message("the linker laid out no import directory for the imports")};
+        }
+        lay.idata_sec       = seg_secs[k];
         lay.import_dir_rva  = lay.idata_sec.rva + lay.idata.dir_off::u64;
         lay.import_dir_size = import_dir_bytes(dyn)::u64;
         lay.iat_rva         = lay.idata_sec.rva + lay.idata.iat_off::u64;
@@ -3010,13 +3057,15 @@ fun compute_pe_layout(alloc: *A.Allocator, itn: *intern.Interner, lay: *PeLayout
     }
 
     if (lay.have_xdata) {
-        val placed: err[fail.Fail] = place_pe_section(lay, "unwind data", ?lay.xdata_sec, false, 0, xdata_vsize::u64, xdata_vsize);
-        if (sel placed.err) { ret placed; }
+        val k: u32 = table_segment(itn, segs, seg_count, UNWIND_DATA_TABLE, xdata_vsize);
+        if (k == NO_TABLE_SEGMENT) { ret err[fail.Fail].err{fail.message("the linker laid out no unwind data for the image's functions")}; }
+        lay.xdata_sec = seg_secs[k];
     }
 
     if (lay.have_pdata) {
-        val placed: err[fail.Fail] = place_pe_section(lay, "exception table", ?lay.pdata_sec, false, 0, pdata_vsize::u64, pdata_vsize);
-        if (sel placed.err) { ret placed; }
+        val k: u32 = table_segment(itn, segs, seg_count, EXCEPTION_TABLE, pdata_vsize);
+        if (k == NO_TABLE_SEGMENT) { ret err[fail.Fail].err{fail.message("the linker laid out no exception table for the image's functions")}; }
+        lay.pdata_sec      = seg_secs[k];
         lay.exception_rva  = lay.pdata_sec.rva;
         lay.exception_size = pdata_vsize::u64;
     }
@@ -3044,7 +3093,7 @@ fun compute_pe_layout(alloc: *A.Allocator, itn: *intern.Interner, lay: *PeLayout
     var sni:          u32   = 0;
     for (sni < seg_count) {
         val sn_has_data: bool = segs[sni].bytes != nil && segs[sni].filesz > 0;
-        val sn:          str  = segment_name(segs[sni].flags, sn_has_data, seg_is_relro(dyn, segs, sni));
+        val sn:          str  = pe_segment_name(itn, segs, sni, sn_has_data, dyn);
         if (name_in_strtab(sn)) { strtab_bytes = strtab_bytes + str_len(sn) + 1; }
         sni = sni + 1;
     }
@@ -3113,9 +3162,6 @@ fun image_emit(img: *target_of.LinkedImage, dst: *of_destination.Destination) er
     }
     if (seg_count == 0) { ret err[fail.Fail].err{fail.message("no loadable segments")}; }
 
-    val frr: res[u32, fail.Fail] = foreign_runtime_count(exceptions, exception_count);
-    if (sel frr.err) { ret err[fail.Fail].err{frr.err}; }
-    val foreign_count: u32 = frr.ok;
     if ((image_base & 0xFFFF) != 0) {
         ret err[fail.Fail].err{fail.message("PE image base is not 64 KiB-aligned")};
     }
@@ -3161,34 +3207,14 @@ fun image_emit(img: *target_of.LinkedImage, dst: *of_destination.Destination) er
         if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
     }
 
-    var uw_all:      *FunctionUnwind = nil;
-    var uw_count:    u32             = 0;
-    var xdata_vsize: usize           = 0;
-    var pdata_vsize: usize           = 0;
-    if (func_count > 0 && funcs != nil) {
-        val ur: res[*FunctionUnwind, A.Error] = A.zallocate[FunctionUnwind](alloc, func_count::usize);
-        if (sel ur.err) { ret err[fail.Fail].err{fail.message("unwind table alloc failed")}; }
-        uw_all = ur.ok;
-    }
-    fin {
-        if (uw_all != nil) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
-    }
-    if (uw_all != nil) {
-        uw_count = collect_function_unwind(segs, seg_count, funcs, func_count,
-            exceptions, exception_count, image_base, uw_all);
-        var ui: u32 = 0;
-        for (ui < uw_count) {
-            val grown: res[usize, lang_checked.Cause] = lang_checked.usize_add(xdata_vsize, uw_all[ui].xdata_size);
-            if (sel grown.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_SIZE_LIMIT, "PE unwind data exceeds the file offset width")}; }
-            xdata_vsize = grown.ok;
-            ui          = ui + 1;
-        }
-        if (foreign_count > 0xFFFFFFFF - uw_count) { ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_SIZE_LIMIT, "PE exception table count overflows")}; }
-        pdata_vsize = (uw_count + foreign_count)::usize * RUNTIME_FUNCTION_SIZE;
-    }
-    or {
-        pdata_vsize = foreign_count::usize * RUNTIME_FUNCTION_SIZE;
-    }
+    val measured: res[PeUnwind, fail.Fail] = pe_unwind_measure(img);
+    if (sel measured.err) { ret err[fail.Fail].err{measured.err}; }
+    var unwind: PeUnwind = measured.ok;
+    fin { pe_unwind_dnit(alloc, ?unwind); }
+    val uw_all:      *FunctionUnwind = unwind.all;
+    val uw_count:    u32             = unwind.count;
+    val xdata_vsize: usize           = unwind.xdata_size;
+    val pdata_vsize: usize           = unwind.pdata_size;
 
     if (dyn != nil && dyn.base_reloc_count > 0) {
         sort.sort_by[target_of.BaseReloc](dyn.base_relocs, dyn.base_reloc_count::usize, base_reloc_cmp);
@@ -3251,7 +3277,7 @@ fun image_emit(img: *target_of.LinkedImage, dst: *of_destination.Destination) er
         li = 0;
         for (li < seg_count) {
             val sn_has_data: bool = segs[li].bytes != nil && segs[li].filesz > 0;
-            val sn:          str  = segment_name(segs[li].flags, sn_has_data, seg_is_relro(dyn, segs, li));
+            val sn:          str  = pe_segment_name(itn, segs, li, sn_has_data, dyn);
             if (name_in_strtab(sn)) { str_pos = str_pos + bin.write_str(buf, lay.strtab_off + str_pos, sn); }
             li = li + 1;
         }
@@ -3854,30 +3880,10 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *target_of.LoadSegment, seg
     var li:        u32   = 0;
     for (li < seg_count) {
         val has_data: bool = segs[li].bytes != nil && segs[li].filesz > 0;
-        write_pe_section_header(buf, pos, segment_name(segs[li].flags, has_data, seg_is_relro(dyn, segs, li)),
+        write_pe_section_header(buf, pos, pe_segment_name(itn, segs, li, has_data, dyn),
             ?str_pos, ?lay.seg_secs[li], pe_section_flags(segs[li].flags, has_data));
         pos = pos + SECTION_HEADER_SIZE;
         li  = li + 1;
-    }
-    if (lay.have_stub) {
-        write_pe_section_header(buf, pos, ".itext", ?str_pos, ?lay.stub_sec,
-            IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ);
-        pos = pos + SECTION_HEADER_SIZE;
-    }
-    if (lay.have_idata) {
-        write_pe_section_header(buf, pos, ".idata", ?str_pos, ?lay.idata_sec,
-            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE);
-        pos = pos + SECTION_HEADER_SIZE;
-    }
-    if (lay.have_xdata) {
-        write_pe_section_header(buf, pos, ".xdata", ?str_pos, ?lay.xdata_sec,
-            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
-        pos = pos + SECTION_HEADER_SIZE;
-    }
-    if (lay.have_pdata) {
-        write_pe_section_header(buf, pos, ".pdata", ?str_pos, ?lay.pdata_sec,
-            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
-        pos = pos + SECTION_HEADER_SIZE;
     }
     if (lay.have_rsrc) {
         write_pe_section_header(buf, pos, ".rsrc", ?str_pos, ?lay.rsrc_sec,
@@ -3967,6 +3973,36 @@ fun seg_is_relro(dyn: *target_of.DynamicInfo, segs: *target_of.LoadSegment, ls: 
     ret seg_is_rebased(dyn, ls);
 }
 
+val NO_TABLE_SEGMENT: u32 = 0xFFFFFFFF;
+
+# the PE tables the linker lays out in sections of their own after the image,
+# in the order the loader's tools expect them
+val STUBS_TABLE:       str = ".itext";
+val IMPORTS_TABLE:     str = ".idata";
+val UNWIND_DATA_TABLE: str = ".xdata";
+val EXCEPTION_TABLE:   str = ".pdata";
+
+# the segment the linker laid out for the table `name` of `size` bytes,
+# NO_TABLE_SEGMENT when it laid out none
+fun table_segment(itn: *intern.Interner, segs: *target_of.LoadSegment, seg_count: u32, name: str, size: usize) u32 {
+    var i: u32 = 0;
+    for (i < seg_count) {
+        if (segs[i].table && segs[i].section_count == 1 && segs[i].filesz == size
+            && str_equals(bin.resolve_name(itn, segs[i].sections[0].name), name)) {
+            ret i;
+        }
+        i = i + 1;
+    }
+    ret NO_TABLE_SEGMENT;
+}
+
+# a segment's section name: a reserved table's own, and otherwise the name its
+# protection gives it
+fun pe_segment_name(itn: *intern.Interner, segs: *target_of.LoadSegment, li: u32, has_data: bool, dyn: *target_of.DynamicInfo) str {
+    if (segs[li].table && segs[li].section_count == 1) { ret bin.resolve_name(itn, segs[li].sections[0].name); }
+    ret segment_name(segs[li].flags, has_data, seg_is_relro(dyn, segs, li));
+}
+
 fun segment_name(flags: u32, has_data: bool, relro: bool) str {
     if ((flags & target_of.SEG_FLAG_EXECUTE) != 0) { ret ".text"; }
     if (!has_data)                                 { ret ".bss"; }
@@ -4047,6 +4083,35 @@ val INPUT_NAMING: target_of.InputNaming = target_of.InputNaming{
     shared:              ?SHARED_NAMING,
 };
 
+# the tables a PE image keeps in sections of their own after its segments: the
+# import stubs, one jump through the import address table each, the import
+# directory with that table inside it, and the unwind data and exception
+# table the platform unwinder reads
+fun segment_tables(img: *target_of.LinkedImage, tables: *target_of.TableList) err[fail.Fail] {
+    val dyn:   *target_of.DynamicInfo = img.dynamic;
+    val stubs: err[fail.Fail]         = target_of.table_add(tables, target_of.TableShape{name: STUBS_TABLE,
+        size:      target_of.func_import_count(dyn)::usize * IMPORT_STUB_SIZE, align: 16,
+        placement: target_of.TABLE_OWN_SEGMENT, flags: target_of.SEG_FLAG_READ | target_of.SEG_FLAG_EXECUTE});
+    if (sel stubs.err) { ret stubs; }
+    if (dyn != nil && (dyn.lib_count > 0 || dyn.import_count > 0)) {
+        var dir:     ImportDirLayout;
+        val planned: err[fail.Fail] = plan_import_directory(img.alloc, img.interner, dyn, ?dir);
+        if (sel planned.err) { ret planned; }
+        val imports: err[fail.Fail] = target_of.table_add(tables, target_of.TableShape{name: IMPORTS_TABLE, size: dir.vsize,
+            align: 8, placement: target_of.TABLE_OWN_SEGMENT, flags: target_of.SEG_FLAG_READ | target_of.SEG_FLAG_WRITE});
+        if (sel imports.err) { ret imports; }
+    }
+    val measured: res[PeUnwind, fail.Fail] = pe_unwind_measure(img);
+    if (sel measured.err) { ret err[fail.Fail].err{measured.err}; }
+    var unwind: PeUnwind = measured.ok;
+    fin { pe_unwind_dnit(img.alloc, ?unwind); }
+    val xdata: err[fail.Fail] = target_of.table_add(tables, target_of.TableShape{name: UNWIND_DATA_TABLE, size: unwind.xdata_size,
+        align: 4, placement: target_of.TABLE_OWN_SEGMENT, flags: target_of.SEG_FLAG_READ});
+    if (sel xdata.err) { ret xdata; }
+    ret target_of.table_add(tables, target_of.TableShape{name: EXCEPTION_TABLE, size: unwind.pdata_size, align: 4,
+        placement: target_of.TABLE_OWN_SEGMENT, flags: target_of.SEG_FLAG_READ});
+}
+
 pub val VTABLE: target_of.OfVTable = target_of.OfVTable{
     id:                  target_of.OF_COFF,
     fingerprint_tag:     3,
@@ -4057,6 +4122,7 @@ pub val VTABLE: target_of.OfVTable = target_of.OfVTable{
     parse_object:        coff_parse_object,
     image_emit:          image_emit,
     writes_dynamic:      true,
+    segment_tables:      segment_tables,
     two_level_namespace: true,
     default_debug:       "dwarf",
     # a PE image maps its debug sections at addresses, so an offset into one is section-relative
@@ -6158,7 +6224,7 @@ test coff_emit_exec__pe32plus_header {
     var tf: output_testing.Output = tf_r.ok;
     fin { output_testing.dnit(?tf); }
 
-    val em: err[fail.Fail] = target_of.image_write(image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 2, page_size: 4096, image_base: base - PE_SECTION_ALIGN, entry: entry, name: "coffexe"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
+    val em: err[fail.Fail] = target_of.image_write_tabled(segment_tables, image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 2, page_size: 4096, image_base: base - PE_SECTION_ALIGN, entry: entry, name: "coffexe"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
     if (sel em.err) { ret 1; }
 
     val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(?alloc, output_testing.path(?tf));
@@ -6319,7 +6385,7 @@ fun emit_stack_image(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *target
     var tf: output_testing.Output = tf_r.ok;
     fin { output_testing.dnit(?tf); }
 
-    val em: err[fail.Fail] = target_of.image_write(image_emit, target_of.LinkedImage{alloc: alloc, interner: itn, target: isa_vt, segments: segs, segment_count: 1, page_size: 4096, image_base: segs[0].vaddr - PE_SECTION_ALIGN, entry: entry, name: "coffstack"::*u8, options: @opts, product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
+    val em: err[fail.Fail] = target_of.image_write_tabled(segment_tables, image_emit, target_of.LinkedImage{alloc: alloc, interner: itn, target: isa_vt, segments: segs, segment_count: 1, page_size: 4096, image_base: segs[0].vaddr - PE_SECTION_ALIGN, entry: entry, name: "coffstack"::*u8, options: @opts, product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
     if (sel em.err) {
         ret res[Vector[u8], fail.Fail].err{em.err};
     }
@@ -6338,7 +6404,7 @@ fun emit_subsystem_image(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *ta
     var tf: output_testing.Output = tf_r.ok;
     fin { output_testing.dnit(?tf); }
 
-    val em: err[fail.Fail] = target_of.image_write(image_emit, target_of.LinkedImage{alloc: alloc, interner: itn, target: isa_vt, segments: segs, segment_count: 1, page_size: 4096, image_base: segs[0].vaddr - PE_SECTION_ALIGN, entry: entry, name: "coffsubsys"::*u8, options: target_of.image_options_default(subsystem), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
+    val em: err[fail.Fail] = target_of.image_write_tabled(segment_tables, image_emit, target_of.LinkedImage{alloc: alloc, interner: itn, target: isa_vt, segments: segs, segment_count: 1, page_size: 4096, image_base: segs[0].vaddr - PE_SECTION_ALIGN, entry: entry, name: "coffsubsys"::*u8, options: target_of.image_options_default(subsystem), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
     if (sel em.err) {
         ret res[Vector[u8], fail.Fail].err{em.err};
     }
@@ -6578,7 +6644,7 @@ test coff_emit_exec__unwind_xdata_pdata {
     var tf: output_testing.Output = tf_r.ok;
     fin { output_testing.dnit(?tf); }
 
-    val em: err[fail.Fail] = target_of.image_write(image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 1, page_size: 4096, image_base: base - PE_SECTION_ALIGN, entry: entry, functions: ?funcs[0], function_count: 1, name: "coffunwind"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
+    val em: err[fail.Fail] = target_of.image_write_tabled(segment_tables, image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 1, page_size: 4096, image_base: base - PE_SECTION_ALIGN, entry: entry, functions: ?funcs[0], function_count: 1, name: "coffunwind"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
     if (sel em.err) { ret 1; }
 
     val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(?alloc, output_testing.path(?tf));
@@ -6718,7 +6784,7 @@ test coff_emit_exec__foreign_pdata_authoritative {
     if (sel tf_r.err) { ret 1; }
     var tf: output_testing.Output = tf_r.ok;
     fin { output_testing.dnit(?tf); }
-    val em: err[fail.Fail] = target_of.image_write(image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 2, page_size: 4096, image_base: image_base, entry: segs[0].vaddr, functions: ?funcs[0], function_count: 1, exceptions: ?exceptions[0], exception_count: 1, name: "coffforeignunwind"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
+    val em: err[fail.Fail] = target_of.image_write_tabled(segment_tables, image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 2, page_size: 4096, image_base: image_base, entry: segs[0].vaddr, functions: ?funcs[0], function_count: 1, exceptions: ?exceptions[0], exception_count: 1, name: "coffforeignunwind"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
     if (sel em.err) { ret 1; }
 
     val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(?alloc, output_testing.path(?tf));
@@ -6792,7 +6858,7 @@ test coff_emit_exec__rejects_malformed_foreign_pdata {
     if (sel tf_r.err) { ret 1; }
     var tf: output_testing.Output = tf_r.ok;
     fin { output_testing.dnit(?tf); }
-    val em: err[fail.Fail] = target_of.image_write(image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?seg, segment_count: 1, page_size: 4096, image_base: 0x140000000, entry: seg.vaddr, exceptions: ?exception, exception_count: 1, name: "coffbadforeignunwind"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
+    val em: err[fail.Fail] = target_of.image_write_tabled(segment_tables, image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?seg, segment_count: 1, page_size: 4096, image_base: 0x140000000, entry: seg.vaddr, exceptions: ?exception, exception_count: 1, name: "coffbadforeignunwind"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
 
     if (!sel em.err)                                                          { ret 1; }
     if (!str_contains(fail.describe(em.err), "malformed exception metadata")) { ret 1; }
@@ -7446,7 +7512,7 @@ test coff_emit_exec__debug_sections_discardable {
     var tf: output_testing.Output = tf_r.ok;
     fin { output_testing.dnit(?tf); }
 
-    val em: err[fail.Fail] = target_of.image_write(image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 1, page_size: 4096, image_base: base - PE_SECTION_ALIGN, entry: entry, debug: ?dbg[0], debug_count: 2, name: "coffdbg"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
+    val em: err[fail.Fail] = target_of.image_write_tabled(segment_tables, image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 1, page_size: 4096, image_base: base - PE_SECTION_ALIGN, entry: entry, debug: ?dbg[0], debug_count: 2, name: "coffdbg"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
     if (sel em.err) { ret 1; }
 
     val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(?alloc, output_testing.path(?tf));
@@ -7581,7 +7647,7 @@ test coff_emit_dyn_exec__relro_section_naming {
     var tf: output_testing.Output = tf_r.ok;
     fin { output_testing.dnit(?tf); }
 
-    val em: err[fail.Fail] = target_of.image_write(image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 5, page_size: 4096, image_base: base - PE_SECTION_ALIGN, entry: base, dynamic: ?dyn, name: "coffrelro"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
+    val em: err[fail.Fail] = target_of.image_write_tabled(segment_tables, image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 5, page_size: 4096, image_base: base - PE_SECTION_ALIGN, entry: base, dynamic: ?dyn, name: "coffrelro"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
     if (sel em.err) { ret 1; }
 
     val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(?alloc, output_testing.path(?tf));
@@ -7786,7 +7852,7 @@ test coff_emit_dyn_exec__import_stub_code_accounting {
     if (sel tf_r.err) { ret 1; }
     var tf: output_testing.Output = tf_r.ok;
     fin { output_testing.dnit(?tf); }
-    val em: err[fail.Fail] = target_of.image_write(image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 3, page_size: 4096, image_base: base - PE_SECTION_ALIGN, entry: base, dynamic: ?dyn, name: "coffstub"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
+    val em: err[fail.Fail] = target_of.image_write_tabled(segment_tables, image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 3, page_size: 4096, image_base: base - PE_SECTION_ALIGN, entry: base, dynamic: ?dyn, name: "coffstub"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
     if (sel em.err) { ret 1; }
     val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(?alloc, output_testing.path(?tf));
 
@@ -7804,6 +7870,14 @@ test coff_emit_dyn_exec__import_stub_code_accounting {
     val oh:        usize = ch + COFF_HEADER_SIZE;
     val sec_table: usize = oh + bin.read_u16_le(file.data, ch + 16)::usize;
     if (bin.read_u32_le(file.data, oh + 4) <= bin.read_u32_le(file.data, sec_table + 16)) { ret 1; }
+
+    # the stubs and the imports live only in the segments the linker lays out
+    val untabled: err[fail.Fail] = target_of.image_write(image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt,
+        segments: ?segs[0], segment_count: 3, page_size: 4096, image_base: base - PE_SECTION_ALIGN, entry: base, dynamic: ?dyn,
+        name:     "coffstub"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE},
+        output_testing.path(?tf));
+    if (!sel untabled.err)                                                     { ret 2; }
+    if (!str_contains(fail.describe(untabled.err), "laid out no import stub")) { ret 3; }
     ret 0;
 }
 
@@ -7844,7 +7918,7 @@ test coff_emit_exec__resource_directory_and_accounting {
     if (sel tf_r.err) { ret 1; }
     var tf: output_testing.Output = tf_r.ok;
     fin { output_testing.dnit(?tf); }
-    val em: err[fail.Fail] = target_of.image_write(image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?itn, target: ?isa_vt, segments: ?seg, segment_count: 1, page_size: 4096, image_base: base - PE_SECTION_ALIGN, entry: base, name: "resource-test"::*u8, options: opts, product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
+    val em: err[fail.Fail] = target_of.image_write_tabled(segment_tables, image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?itn, target: ?isa_vt, segments: ?seg, segment_count: 1, page_size: 4096, image_base: base - PE_SECTION_ALIGN, entry: base, name: "resource-test"::*u8, options: opts, product: catalog_artifact.EXECUTABLE}, output_testing.path(?tf));
     if (sel em.err) { ret 1; }
     val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(?alloc, output_testing.path(?tf));
 
@@ -8396,7 +8470,7 @@ test write_pe__refuses_an_overlapping_dictated_segment {
     fin { output_testing.dnit(?tf); }
     val tpath: str = output_testing.path(?tf);
 
-    val em: err[fail.Fail] = target_of.image_write(image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 2, page_size: 4096, image_base: 0x140000000, entry: 0x140001000, name: "overlap"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, tpath);
+    val em: err[fail.Fail] = target_of.image_write_tabled(segment_tables, image_emit, target_of.LinkedImage{alloc: ?alloc, interner: ?i, target: ?isa_vt, segments: ?segs[0], segment_count: 2, page_size: 4096, image_base: 0x140000000, entry: 0x140001000, name: "overlap"::*u8, options: target_of.image_options_default(catalog_subsystem.CONSOLE), product: catalog_artifact.EXECUTABLE}, tpath);
     if (sel em.ok)                                             { ret 2; }
     if (!str_contains(fail.describe(em.err), "starts before")) { ret 3; }
     if (!t_untouched(?alloc, tpath))                           { ret 4; }
