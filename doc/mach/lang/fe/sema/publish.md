@@ -10,3 +10,5 @@ public surface its resolution published
 pub fun interface_of(sc: *sema_context.SemaContext) res[interface.Interface, fail.Fail];
 ```
 
+the interface takes over the module's store of constant values, which its typing built in
+

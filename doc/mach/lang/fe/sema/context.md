@@ -128,6 +128,9 @@ type_caps: the whole semantic set, which a module constant is always evaluated w
 collect_insts: whether the walk records the instances it asks for
 subst_fn: substitutes an instance's type arguments into a type
 annotation_check_fn: the per-instance checks over one type annotation, run as each is resolved
+module: the stable id of the module being typed
+values: the store the module's constant values are built in, which its
+                     interface publishes
 
 ## rec ModuleView
 
@@ -136,7 +139,7 @@ pub rec ModuleView;
 ```
 
 the module a walk reads and the typing tables it writes: the module being typed, or the
-declaring module of an instance or of an imported `$each` sequence
+declaring module of an instance
 
 ## rec Instance
 
@@ -497,6 +500,22 @@ pub fun resolve_module_member_const(sc: *SemaContext, eid: ast_id.ExprId) res[op
 ```mach
 pub fun own_nominal_declaration(sc: *SemaContext, nominal: *type.Type) res[ast_id.DeclId, fail.Fail];
 ```
+
+## fun interface_of
+
+```mach
+pub fun interface_of(sc: *SemaContext, origin: session.ModuleId) res[*interface.Interface, fail.Fail];
+```
+
+the interface module `origin` published, read through the walk's acquisition of it
+
+## fun each_set
+
+```mach
+pub fun each_set(sc: *SemaContext, sid: ast_id.StmtId, array: comptime.CTValue);
+```
+
+the constant array the `$each` at `sid` reads in the walk's frame
 
 ## fun definition_ast
 

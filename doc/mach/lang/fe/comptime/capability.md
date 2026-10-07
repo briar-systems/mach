@@ -184,6 +184,7 @@ expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure
 pub fun semantic_name_capabilities[T](
 member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 constant: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
+store: fun(*T, u32) res[*comptime_deep.Store, comptime_failure.EvalFail],
 ident: fun(*T, ast_id.ExprId) bool,
 expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail]) res[PhaseCapabilities[T], fail.Fail];
 ```
@@ -194,6 +195,7 @@ expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure
 pub fun semantic_type_capabilities[T](
 member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 constant: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
+store: fun(*T, u32) res[*comptime_deep.Store, comptime_failure.EvalFail],
 type_: fun(*T, ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail],
 types: fun(*T) *type.TypeInterner,
 offset: fun(*T, u32, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
@@ -210,6 +212,7 @@ expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure
 ```mach
 pub fun lowering_capabilities[T](
 member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
+store: fun(*T, u32) res[*comptime_deep.Store, comptime_failure.EvalFail],
 type_: fun(*T, ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail],
 types: fun(*T) *type.TypeInterner,
 offset: fun(*T, u32, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
@@ -238,6 +241,14 @@ pub fun capabilities_have_ident[T](ctx: *T, caps: PhaseCapabilities[T]) bool;
 ```mach
 pub fun capabilities_have_constant[T](ctx: *T, caps: PhaseCapabilities[T]) bool;
 ```
+
+## fun store_of
+
+```mach
+pub fun store_of[T](ctx: *T, caps: PhaseCapabilities[T], module: u32) res[*comptime_deep.Store, comptime_failure.EvalFail];
+```
+
+the store holding the node a value names, which only a phase that reads interfaces has
 
 ## fun capabilities_have_types
 

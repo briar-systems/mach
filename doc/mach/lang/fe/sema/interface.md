@@ -47,8 +47,8 @@ decl: the declaration in its module, which keys the session's tables of it
 generics: how many type parameters a function declares
 params_start: where a function's parameters start in `params`
 op_set: the instruction set and operation an `#[op]` names, STR_NIL without one
-value: the node of a `val`'s constant value, or of the compile-time value a `var`'s
-              initializer gives it, NONE when it has none
+value: the node in `values` of a `val`'s constant value, or of the compile-time value
+              a `var`'s initializer gives it, NONE when it has none
 gated: the value is declared under a comptime condition
 
 ## rec Param
@@ -56,67 +56,6 @@ gated: the value is declared under a comptime condition
 ```mach
 pub rec Param;
 ```
-
-## def NodeKind
-
-```mach
-pub def NodeKind: u8
-```
-
-## val NODE_SCALAR
-
-```mach
-pub val NODE_SCALAR: NodeKind = 0
-```
-
-a value the evaluator holds whole
-
-## val NODE_ARRAY
-
-```mach
-pub val NODE_ARRAY: NodeKind = 1
-```
-
-an array literal: its elements, in order
-
-## val NODE_LITERAL
-
-```mach
-pub val NODE_LITERAL: NodeKind = 2
-```
-
-a record or case literal: the case its head selects, STR_NIL for a record, then its
-named fields as written and its positional elements
-
-## val NODE_REFUSED
-
-```mach
-pub val NODE_REFUSED: NodeKind = 3
-```
-
-a leaf that has no compile-time value, with the refusal reading it gives
-
-## rec Refusal
-
-```mach
-pub rec Refusal;
-```
-
-## rec Node
-
-```mach
-pub rec Node;
-```
-
-one node of a constant's value; an aggregate's members are `members[first .. first + len]`
-
-## rec Member
-
-```mach
-pub rec Member;
-```
-
-a member of an aggregate node: a named field, or an element or positional value with STR_NIL
 
 ## rec Exported
 
@@ -199,41 +138,6 @@ pub fun declaration_has_instances(iface: *Interface, d: *Declaration) bool;
 ```
 
 a generic, comptime-parameter or pack function has instances in place of one definition
-
-## fun node_add
-
-```mach
-pub fun node_add(iface: *Interface, n: Node) res[u32, fail.Fail];
-```
-
-## fun members_add
-
-```mach
-pub fun members_add(iface: *Interface, node: u32, members: *Member, len: u32) err[fail.Fail];
-```
-
-the members of an aggregate are added together once its children are, so they are contiguous
-
-## fun node_at
-
-```mach
-pub fun node_at(iface: *Interface, node: u32) *Node;
-```
-
-## fun member_at
-
-```mach
-pub fun member_at(iface: *Interface, n: *Node, ord: u32) opt[Member];
-```
-
-## fun node_value
-
-```mach
-pub fun node_value(iface: *Interface, itn: *intern.Interner, node: u32) res[comptime.CTValue, comptime.EvalFail];
-```
-
-the value a scalar node holds, or the refusal a refused one gives; an aggregate has no
-value of its own
 
 ## fun template_of
 
