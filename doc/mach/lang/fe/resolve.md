@@ -275,6 +275,14 @@ release what deps_of allocated
 pub fun result_dnit(r: *ResolveResult);
 ```
 
+## fun result_copy
+
+```mach
+pub fun result_copy(r: *ResolveResult, alloc: *A.Allocator) res[ResolveResult, fail.Fail];
+```
+
+an owned copy of `r` from `alloc`, every entry at the id it has in `r`
+
 ## fun resolve
 
 ```mach
