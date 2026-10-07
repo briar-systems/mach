@@ -715,6 +715,14 @@ fwd comptime_scope.bind_gated
 
 forwards [`mach.lang.fe.comptime.scope.bind_gated`](comptime/scope.md#fun-bind_gated)
 
+## fwd comptime_scope.bindings_copy
+
+```mach
+fwd comptime_scope.bindings_copy
+```
+
+forwards [`mach.lang.fe.comptime.scope.bindings_copy`](comptime/scope.md#fun-bindings_copy)
+
 ## fwd comptime_scope.bindings_dnit
 
 ```mach
@@ -722,6 +730,14 @@ fwd comptime_scope.bindings_dnit
 ```
 
 forwards [`mach.lang.fe.comptime.scope.bindings_dnit`](comptime/scope.md#fun-bindings_dnit)
+
+## fwd comptime_scope.bindings_init
+
+```mach
+fwd comptime_scope.bindings_init
+```
+
+forwards [`mach.lang.fe.comptime.scope.bindings_init`](comptime/scope.md#fun-bindings_init)
 
 ## fwd comptime_scope.decorator_embed_at
 
@@ -866,6 +882,14 @@ fwd comptime_scope.lookup
 ```
 
 forwards [`mach.lang.fe.comptime.scope.lookup`](comptime/scope.md#fun-lookup)
+
+## fwd comptime_scope.lowering_over
+
+```mach
+fwd comptime_scope.lowering_over
+```
+
+forwards [`mach.lang.fe.comptime.scope.lowering_over`](comptime/scope.md#fun-lowering_over)
 
 ## fwd comptime_scope.prepare_gates
 
@@ -1034,4 +1058,19 @@ pub fun is_case_literal(a: *ast.Ast, eid: ast_id.ExprId) bool;
 a literal is a case literal when its head names a tag case, `T.c{...}` or `T.[c]{...}`; the
 parser records the case only for a head with generic arguments, name resolution splits the
 others, so the answer is complete once the literal's head has been bound
+
+## fun literal_case
+
+```mach
+pub fun literal_case[T](
+c: *comptime_scope.ComptimeCtx,
+cap_ctx: *T,
+caps: comptime_capability.PhaseCapabilities[T],
+a: *ast.Ast,
+source: str,
+e: ast_id.ExprId,
+interner: *intern.Interner) res[intern.StrId, comptime_failure.EvalFail];
+```
+
+the case the head of the literal `e` selects, STR_NIL for a record literal or any other expression
 

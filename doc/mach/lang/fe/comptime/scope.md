@@ -181,6 +181,23 @@ pub fun bindings_init(alloc: *A.Allocator) Bindings;
 pub fun bindings_dnit(b: *Bindings);
 ```
 
+## fun bindings_copy
+
+```mach
+pub fun bindings_copy(b: *Bindings, alloc: *A.Allocator) res[Bindings, fail.Fail];
+```
+
+an owned copy of `b` from `alloc`, which reads as `b` does
+
+## fun lowering_over
+
+```mach
+pub fun lowering_over(env: ComptimeEnv, load: *Bindings, resolved: *Bindings, typed: *Bindings, alloc: *A.Allocator) ComptimeCtx;
+```
+
+a lowering scope over the description `env` that reads the bindings the load, resolve and sema
+made, and binds its own from `alloc`; nothing it binds reaches the bindings it reads
+
 ## rec ComptimeCtx
 
 ```mach
