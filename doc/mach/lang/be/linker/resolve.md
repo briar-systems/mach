@@ -9,9 +9,7 @@ pub rec SymbolLoc;
 ## fun synthesize_common_storage
 
 ```mach
-pub fun synthesize_common_storage(s: *session.Session, modules: *target_of.ObjectImage,
-module_count: u32, mode: catalog_artifact.Kind,
-out: *target_of.ObjectImage) res[bool, fail.Fail];
+pub fun synthesize_common_storage(ctx: *LinkContext, inputs: *InputSet, out: *target_of.ObjectImage) res[bool, fail.Fail];
 ```
 
 ## fun weak_fallback_name
