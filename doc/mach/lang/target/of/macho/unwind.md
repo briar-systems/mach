@@ -6,10 +6,10 @@ frame compact unwind cannot say points into `__TEXT,__eh_frame` instead. both
 are sized from the frame records' steps before layout and filled once every
 function has its address
 
-## fun macho_unwind_shape
+## fun unwind_shape
 
 ```mach
-pub fun macho_unwind_shape(arch_id: u32, frames: *target_of.FrameUnwind, count: u32, foreign: *target_of.ForeignUnwind) res[target_of.UnwindShape, fail.Fail];
+pub fun unwind_shape(arch_id: u32, frames: *target_of.FrameUnwind, count: u32, foreign: *target_of.ForeignUnwind) res[target_of.UnwindShape, fail.Fail];
 ```
 
 `__unwind_info` for a function and a gap after each, with a full personality

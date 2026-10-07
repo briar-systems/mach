@@ -1,9 +1,9 @@
 # mach.lang.target.of.macho.parse
 
-## fun macho_kind_from
+## fun kind_from
 
 ```mach
-pub fun macho_kind_from(flags: u32, is_text: bool, is_data_const: bool, is_rodata: bool) target_of.SectionKind;
+pub fun kind_from(flags: u32, is_text: bool, is_data_const: bool, is_rodata: bool) target_of.SectionKind;
 ```
 
 ## fun parse_object
