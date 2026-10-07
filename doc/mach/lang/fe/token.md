@@ -294,6 +294,30 @@ pub rec Token;
 pub fun make(kind: Kind, offset: usize, len: usize) Token;
 ```
 
+## rec Spelling
+
+```mach
+pub rec Spelling;
+```
+
+a token the source spells with fixed punctuation
+
+## val SPELLING_COUNT
+
+```mach
+pub val SPELLING_COUNT: usize                    = 39
+```
+
+every fixed spelling, longest first, so the first one a scan matches is the longest
+
+## fun spelling_at
+
+```mach
+pub fun spelling_at(source: str, pos: usize) opt[Spelling];
+```
+
+the fixed spelling that starts at `pos` in NUL-terminated `source`, the longest one
+
 ## fun infix_precedence
 
 ```mach

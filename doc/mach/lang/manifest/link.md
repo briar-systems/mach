@@ -100,7 +100,7 @@ into an owned array
 alloc: owns the symbol copy
 itn: interns the expanded path
 l: the link
-proj_out: the expanded `[project].out`
+proj_out: the expanded `[project].work`
 v: the template values
 ret: the requirement; on error nothing is left allocated
 

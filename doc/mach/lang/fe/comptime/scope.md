@@ -51,6 +51,34 @@ pub rec FrameMark;
 pub rec ComptimeEnv;
 ```
 
+## rec BuildFacts
+
+```mach
+pub rec BuildFacts;
+```
+
+the build a program is compiled by and for: its mode, the compiler, the project, the
+names its target entry gives the os, isa, abi and platform, the binary, and whether it
+is a union build
+
+## fun build_facts
+
+```mach
+pub fun build_facts(mode_id: u32, pie: u32, compiler_name: intern.StrId, compiler_ver: intern.StrId) BuildFacts;
+```
+
+the build facts of a build that names no project, artifact or target entry
+
+## rec SourceFacts
+
+```mach
+pub rec SourceFacts;
+```
+
+the module being compiled: the source map its files are read from, its fully qualified
+name, its file relative to the root of the project that owns it, and that project's id
+and version
+
 ## def Stage
 
 ```mach
@@ -174,20 +202,10 @@ pub fun environment(c: *ComptimeCtx) ComptimeEnv;
 ## fun init
 
 ```mach
-pub fun init(
-alloc: *A.Allocator,
-target_os_id: u32,
-target_arch_id: u32,
-target_abi_id: u32,
-build_mode_id: u32,
-build_pie: u32,
-pointer_width: u32,
-vector_bits: u32,
-register_bits: u32,
-has_float: bool,
-compiler_name: intern.StrId,
-compiler_ver: intern.StrId) ComptimeCtx;
+pub fun init(alloc: *A.Allocator, target: resolved.Facts, build: BuildFacts) ComptimeCtx;
 ```
+
+a load scope over the target and build `target` and `build` describe, with no module yet
 
 ## fun stage_init
 
@@ -232,66 +250,10 @@ pub fun publish(c: *ComptimeCtx) Bindings;
 
 hand the bindings the scope's stage made to its product; the scope keeps none
 
-## fun set_union_build
-
-```mach
-pub fun set_union_build(c: *ComptimeCtx, v: bool);
-```
-
-## fun set_target_defs
-
-```mach
-pub fun set_target_defs(c: *ComptimeCtx, d: *target_definition.Table);
-```
-
-## fun set_nan_rule
-
-```mach
-pub fun set_nan_rule(c: *ComptimeCtx, rule: float.NanRule);
-```
-
-## fun set_ct_mul
-
-```mach
-pub fun set_ct_mul(c: *ComptimeCtx, mask: ct.CtMulMask);
-```
-
-## fun set_extensions
-
-```mach
-pub fun set_extensions(c: *ComptimeCtx, view: target_model.ExtensionView);
-```
-
-## fun set_vocabulary
-
-```mach
-pub fun set_vocabulary(c: *ComptimeCtx, vocabulary: *extension.Vocabulary);
-```
-
-## fun set_va_list
-
-```mach
-pub fun set_va_list(c: *ComptimeCtx, size: u32, align: u32);
-```
-
-## fun set_build_context
-
-```mach
-pub fun set_build_context(
-c: *ComptimeCtx,
-project_id: intern.StrId,
-project_ver: intern.StrId,
-target_os: intern.StrId,
-target_isa: intern.StrId,
-target_abi: intern.StrId,
-target_platform: intern.StrId,
-bin_name: intern.StrId);
-```
-
 ## fun set_source_context
 
 ```mach
-pub fun set_source_context(c: *ComptimeCtx, module: intern.StrId, file: intern.StrId,
+pub fun set_source_context(c: *ComptimeCtx, sources: *lang_source.SourceMap, module: intern.StrId, file: intern.StrId,
 owner_id: intern.StrId, owner_ver: intern.StrId);
 ```
 

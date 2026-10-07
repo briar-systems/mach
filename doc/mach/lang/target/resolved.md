@@ -55,6 +55,32 @@ pub fun ct_mul_admitted(tgt: *Target) ct.CtMulMask;
 the constant-time multiply cells this target admits: the one decision the
 lowering gate, the oblivious validators and `$mach.build.ct_mul` all read
 
+## rec Facts
+
+```mach
+pub rec Facts;
+```
+
+what a program may ask of its target while it compiles: the catalog ids, the machine's
+widths and float support, the va_list shape, the instruction and type table, the
+constant-time multiply cells it admits, the extensions it selects and every vocabulary
+they are read against, and what a float conversion makes of a NaN
+
+## fun facts
+
+```mach
+pub fun facts(tgt: *Target) Facts;
+```
+
+## fun facts_none
+
+```mach
+pub fun facts_none() Facts;
+```
+
+the facts where no target is selected: an 8-byte pointer, 128-bit vectors, floats, and no
+table, extension, multiply cell or NaN rule to read
+
 ## fun ct_mul_dit_cells
 
 ```mach
