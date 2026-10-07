@@ -1,39 +1,39 @@
 # mach.lang.target.of
 
-## val OF_ELF
+## val ELF
 
 ```mach
-pub val OF_ELF:     u32 = 1
+pub val ELF:        u32 = 1
 ```
 
-## val OF_MACHO
+## val MACHO
 
 ```mach
-pub val OF_MACHO:   u32 = 2
+pub val MACHO:      u32 = 2
 ```
 
-## val OF_COFF
+## val COFF
 
 ```mach
-pub val OF_COFF:    u32 = 3
+pub val COFF:       u32 = 3
 ```
 
-## val OF_RAW
+## val RAW
 
 ```mach
-pub val OF_RAW:     u32 = 4
+pub val RAW:        u32 = 4
 ```
 
-## val OF_SPV
+## val SPV
 
 ```mach
-pub val OF_SPV:     u32 = 5
+pub val SPV:        u32 = 5
 ```
 
-## val OF_FORMAT_CATALOG_VERSION
+## val FORMAT_CATALOG_VERSION
 
 ```mach
-pub val OF_FORMAT_CATALOG_VERSION: u8 = 1
+pub val FORMAT_CATALOG_VERSION: u8 = 1
 ```
 
 ## fun of_name_for

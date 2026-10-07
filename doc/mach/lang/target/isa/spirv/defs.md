@@ -1,21 +1,21 @@
 # mach.lang.target.isa.spirv.defs
 
-## val SPV_SET_NONE
+## val SET_NONE
 
 ```mach
-pub val SPV_SET_NONE:    u8 = 0
+pub val SET_NONE:    u8 = 0
 ```
 
-## val SPV_SET_CORE
+## val SET_CORE
 
 ```mach
-pub val SPV_SET_CORE:    u8 = 1
+pub val SET_CORE:    u8 = 1
 ```
 
-## val SPV_SET_GLSL450
+## val SET_GLSL450
 
 ```mach
-pub val SPV_SET_GLSL450: u8 = 2
+pub val SET_GLSL450: u8 = 2
 ```
 
 ## val GLSL450_PACK_HALF_2X16
@@ -32,22 +32,22 @@ the GLSL.std.450 instructions the emitter itself moves an f16's bits through
 pub val GLSL450_UNPACK_HALF_2X16: u32 = 62
 ```
 
-## val SPV_CTOR_IMAGE
+## val CTOR_IMAGE
 
 ```mach
-pub val SPV_CTOR_IMAGE:         u32 = 0
+pub val CTOR_IMAGE:         u32 = 0
 ```
 
-## val SPV_CTOR_SAMPLED_IMAGE
+## val CTOR_SAMPLED_IMAGE
 
 ```mach
-pub val SPV_CTOR_SAMPLED_IMAGE: u32 = 1
+pub val CTOR_SAMPLED_IMAGE: u32 = 1
 ```
 
-## val SPV_CTOR_SAMPLER
+## val CTOR_SAMPLER
 
 ```mach
-pub val SPV_CTOR_SAMPLER:       u32 = 2
+pub val CTOR_SAMPLER:       u32 = 2
 ```
 
 ## val TEXEL_I32

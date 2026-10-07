@@ -636,16 +636,16 @@ pub val REBASE_TYPE_POINTER:                       u8 = 0x1
 pub val DARWIN_DYLD_PATH: str = "/usr/lib/dyld"
 ```
 
-## val MACHO_X86_STUB_SIZE
+## val X86_STUB_SIZE
 
 ```mach
-pub val MACHO_X86_STUB_SIZE:   usize = 6
+pub val X86_STUB_SIZE:   usize = 6
 ```
 
-## val MACHO_ARM64_STUB_SIZE
+## val ARM64_STUB_SIZE
 
 ```mach
-pub val MACHO_ARM64_STUB_SIZE: usize = 12
+pub val ARM64_STUB_SIZE: usize = 12
 ```
 
 ## val X86_THREAD_STATE64
@@ -792,10 +792,10 @@ pub fun row_for(arch_id: u32) *IsaRow;
 
 the row of an instruction set mach-o covers, nil for any other
 
-## fun macho_page_size
+## fun page_size
 
 ```mach
-pub fun macho_page_size(arch_id: u32) u64;
+pub fun page_size(arch_id: u32) u64;
 ```
 
 ## fun row_for_cpu
@@ -828,22 +828,22 @@ the Mach-O segment, section name and section flags of every section kind,
 indexed by the kind. a kind without a row is outside the catalog and the
 lookups below refuse it
 
-## fun macho_section
+## fun section
 
 ```mach
-pub fun macho_section(kind: target_of.SectionKind) opt[*MachoSectionDesc];
+pub fun section(kind: target_of.SectionKind) opt[*MachoSectionDesc];
 ```
 
-## fun macho_sectname
+## fun sectname
 
 ```mach
-pub fun macho_sectname(kind: target_of.SectionKind) opt[str];
+pub fun sectname(kind: target_of.SectionKind) opt[str];
 ```
 
-## fun macho_section_flags
+## fun section_flags
 
 ```mach
-pub fun macho_section_flags(kind: target_of.SectionKind) opt[u32];
+pub fun section_flags(kind: target_of.SectionKind) opt[u32];
 ```
 
 ## fun align_log2

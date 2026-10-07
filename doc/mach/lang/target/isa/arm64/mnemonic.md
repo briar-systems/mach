@@ -239,16 +239,16 @@ pub val CALLER_SAVED: u32 = 0x4007FFFF
 pub val SMCCC_CLOBBER: u32 = 0x0003FFFF
 ```
 
-## val MNEMONIC_COUNT
+## val ROW_COUNT
 
 ```mach
-pub val MNEMONIC_COUNT: usize = 86
+pub val ROW_COUNT: usize = 86
 ```
 
-## val MNEMONICS
+## val ROWS
 
 ```mach
-pub val MNEMONICS: [MNEMONIC_COUNT]isa_asm.Mnemonic = [MNEMONIC_COUNT]isa_asm.Mnemonic;
+pub val ROWS: [ROW_COUNT]isa_asm.Mnemonic = [ROW_COUNT]isa_asm.Mnemonic;
 ```
 
 ## val VEC_TWIN_COUNT

@@ -8,10 +8,10 @@ what each arm64 instruction reads, writes and leaks, for the constant-time check
 pub fun asm_ct_class(code: u32, flags: u16) ct.AsmClass;
 ```
 
-## fun inst_effects
+## fun describe
 
 ```mach
-pub fun inst_effects(mi: *isa_inst.Inst, e: *isa_effect.InstEffects);
+pub fun describe(mi: *isa_inst.Inst, e: *isa_effect.InstEffects);
 ```
 
 the effect description of one emitted aarch64 instruction: the closed class

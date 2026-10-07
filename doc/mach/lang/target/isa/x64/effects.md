@@ -11,10 +11,10 @@ pub fun asm_ct_class(code: u32, flags: u16) ct.AsmClass;
 the flags and latency row of an opcode, as the inline-asm scan and the
 effect walk read it: the class column of the one description table
 
-## fun inst_effects
+## fun describe
 
 ```mach
-pub fun inst_effects(mi: *isa_inst.Inst, e: *isa_effect.InstEffects);
+pub fun describe(mi: *isa_inst.Inst, e: *isa_effect.InstEffects);
 ```
 
 the effect description of one emitted x86-64 instruction: the opcode's
