@@ -13,9 +13,7 @@ the import is attributed the way a plain call of it is
 ## fun synthesize_objc_stubs
 
 ```mach
-pub fun synthesize_objc_stubs(s: *session.Session, tgt: *lang_target.Binding,
-modules: *target_of.ObjectImage, module_count: u32, mode: catalog_artifact.Kind,
-out: *target_of.ObjectImage) res[bool, fail.Fail];
+pub fun synthesize_objc_stubs(ctx: *LinkContext, inputs: *InputSet, out: *target_of.ObjectImage) res[bool, fail.Fail];
 ```
 
 the synthetic input carrying the stubs; false when the inputs leave none undefined
