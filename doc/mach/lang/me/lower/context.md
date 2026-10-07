@@ -275,13 +275,6 @@ pub fun pop_fins_to(lc: *LowerContext, mark: u32);
 pub fun lower_type(lc: *LowerContext, tid: type.TypeId) res[ir_type.IrTypeId, fail.Fail];
 ```
 
-## fun gate_is_active
-
-```mach
-pub fun gate_is_active(lc: *LowerContext, source: str, cond: ast_id.ExprId,
-scope: comptime_gate.GateScope, cache: bool) res[bool, fail.Fail];
-```
-
 ## fun block_terminated
 
 ```mach
