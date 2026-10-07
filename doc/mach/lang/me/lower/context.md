@@ -306,6 +306,26 @@ pub fun pop_fins_to(lc: *LowerContext, mark: u32);
 pub fun lower_type(lc: *LowerContext, tid: type.TypeId) res[ir_type.IrTypeId, fail.Fail];
 ```
 
+## fun debug_type_of
+
+```mach
+pub fun debug_type_of(lc: *LowerContext, tid: type.TypeId) res[ir_debug.TypeId, fail.Fail];
+```
+
+the debug type a debug record names for source type `tid`, as substituted for
+the code being lowered; TYPE_NIL when this lowering keeps no debug information
+or nothing describes the type
+
+## fun debug_types_finish
+
+```mach
+pub fun debug_types_finish(lc: *LowerContext) err[fail.Fail];
+```
+
+describes every pointee left waiting: one that holds by value an instance of
+an expansive generic this module describes no value of stays untyped, since
+such a generic has unboundedly many instances behind its pointers
+
 ## fun gate_is_active
 
 ```mach
