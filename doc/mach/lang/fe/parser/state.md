@@ -56,12 +56,6 @@ fe/sema/infer.mach) with a message that says what to do about it, so the
 parser must sit above that or sema never gets to speak. the compiler's own
 source and the standard library reach 14.
 
-## rec ListBuf
-
-```mach
-pub rec ListBuf[T];
-```
-
 ## fun make
 
 ```mach
@@ -322,69 +316,32 @@ pub fun push_type(p: *Parser, t: ast_type.Type) ast_id.TypeId;
 pub fun push_module(p: *Parser, m: ast_module.Module) ast_id.ModuleNodeId;
 ```
 
-## fun list_buf_init
+## fun list_init
 
 ```mach
-pub fun list_buf_init[T]() ListBuf[T];
+pub fun list_init[T](p: *Parser) Vector[T];
 ```
 
-## fun list_buf_push
+a list gathered while its length is unknown, then flushed into its AST table in one run
+
+## fun list_push
 
 ```mach
-pub fun list_buf_push[T](p: *Parser, b: *ListBuf[T], x: T);
+pub fun list_push[T](p: *Parser, b: *Vector[T], x: T);
 ```
 
-## fun list_buf_free
+## fun list_free
 
 ```mach
-pub fun list_buf_free[T](p: *Parser, b: *ListBuf[T]);
+pub fun list_free[T](p: *Parser, b: *Vector[T]);
 ```
 
-## fun decl_id_buf_flush
+## fun list_flush
 
 ```mach
-pub fun decl_id_buf_flush(p: *Parser, b: *ListBuf[ast_id.DeclId], out_len: *u32) u32;
+pub fun list_flush[T](p: *Parser, b: *Vector[T], table: *Vector[T], out_len: *u32) u32;
 ```
 
-## fun stmt_id_buf_flush
-
-```mach
-pub fun stmt_id_buf_flush(p: *Parser, b: *ListBuf[ast_id.StmtId], out_len: *u32) u32;
-```
-
-## fun expr_id_buf_flush
-
-```mach
-pub fun expr_id_buf_flush(p: *Parser, b: *ListBuf[ast_id.ExprId], out_len: *u32) u32;
-```
-
-## fun type_id_buf_flush
-
-```mach
-pub fun type_id_buf_flush(p: *Parser, b: *ListBuf[ast_id.TypeId], out_len: *u32) u32;
-```
-
-## fun field_init_buf_flush
-
-```mach
-pub fun field_init_buf_flush(p: *Parser, b: *ListBuf[ast_expr.FieldInit], out_len: *u32) u32;
-```
-
-## fun typed_name_buf_flush
-
-```mach
-pub fun typed_name_buf_flush(p: *Parser, b: *ListBuf[ast_decl.TypedName], out_len: *u32) u32;
-```
-
-## fun tag_case_buf_flush
-
-```mach
-pub fun tag_case_buf_flush(p: *Parser, b: *ListBuf[ast_decl.TagCase], out_len: *u32) u32;
-```
-
-## fun comptime_branch_buf_flush
-
-```mach
-pub fun comptime_branch_buf_flush(p: *Parser, b: *ListBuf[ast_decl.ComptimeBranch], out_len: *u32) u32;
-```
+appends the gathered list to `table`, frees it, and answers where it starts in the
+table, with its length in `out_len`
 

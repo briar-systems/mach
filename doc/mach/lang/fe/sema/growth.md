@@ -37,12 +37,6 @@ its ungated part and the templates that call joins
 pub rec Analysis;
 ```
 
-## rec Arc
-
-```mach
-pub rec Arc;
-```
-
 ## fun init
 
 ```mach
@@ -86,13 +80,4 @@ alloc: *A.Allocator) res[Analysis, fail.Fail];
 ```
 
 the growing cycles of module `own`, parsed as `a` and resolved as `rr`
-
-## fun components
-
-```mach
-pub fun components(alloc: *A.Allocator, n: u32, arcs: *Arc, e: u32, comp: *u32) res[u32, fail.Fail];
-```
-
-Tarjan's strongly connected components over `n` nodes and `e` arcs, iteratively; `comp`
-gets each node's component and the result is the component count
 
