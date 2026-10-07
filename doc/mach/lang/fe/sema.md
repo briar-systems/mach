@@ -170,6 +170,14 @@ fwd mach.lang.fe.sema.fields
 
 forwards [`mach.lang.fe.sema.fields`](sema/fields.md)
 
+## fwd mach.lang.fe.sema.surface
+
+```mach
+fwd mach.lang.fe.sema.surface
+```
+
+forwards [`mach.lang.fe.sema.surface`](sema/surface.md)
+
 ## fwd mach.lang.fe.sema.instance
 
 ```mach

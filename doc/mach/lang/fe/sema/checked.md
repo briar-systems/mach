@@ -1,4 +1,4 @@
 # mach.lang.fe.sema.checked
 
-a test fixture that checks one module held in memory with the front end alone
+a test fixture that types modules held in memory with the front end alone
 
