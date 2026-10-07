@@ -945,6 +945,27 @@ pub rec BaseReloc;
 pub rec DynamicInfo;
 ```
 
+## rec SpanLocation
+
+```mach
+pub rec SpanLocation;
+```
+
+the load segment that holds a reserved table, and where in it the table starts
+
+## fun span_locate
+
+```mach
+pub fun span_locate(a: *A.Allocator, span: TableSpan, segs: *LoadSegment, seg_count: u32, executable: bool,
+table: str) res[SpanLocation, fail.Fail];
+```
+
+the load segment that holds `span` whole, refused when none does or when the
+one that does is executable and `executable` says it must not be, or the
+other way around
+
+table: the table as a refusal names it, as "the PLT"
+
 ## rec TableShape
 
 ```mach
