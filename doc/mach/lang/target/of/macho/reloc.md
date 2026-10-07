@@ -6,10 +6,10 @@
 pub rec MachoReloc;
 ```
 
-## fun macho_reloc_for
+## fun reloc_for
 
 ```mach
-pub fun macho_reloc_for(itn: *intern.Interner, alloc: *A.Allocator, arch_id: u32, kind: target_of.RelocKind, origin: target_of.RelocOrigin) res[MachoReloc, fail.Fail];
+pub fun reloc_for(itn: *intern.Interner, alloc: *A.Allocator, arch_id: u32, kind: target_of.RelocKind, origin: target_of.RelocOrigin) res[MachoReloc, fail.Fail];
 ```
 
 ## fun reloc_kind_for
