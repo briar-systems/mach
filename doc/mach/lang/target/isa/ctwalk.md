@@ -1,4 +1,4 @@
-# mach.lang.be.codegen.ctwalk
+# mach.lang.target.isa.ctwalk
 
 ## rec Refusal
 
