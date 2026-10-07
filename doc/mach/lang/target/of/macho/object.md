@@ -40,9 +40,9 @@ pub val CARRIER_SECTNAME: str = "__mach_link"
 a codegen image's carrier rides in `__MACH,__mach_link`, debug-attributed
 like the request list so no link loads it
 
-## fun emit_object
+## fun object_emit
 
 ```mach
-pub fun emit_object(isa_vt: *target_of.ObjectTarget, img: *target_of.ObjectImage, destination: str) err[fail.Fail];
+pub fun object_emit(isa_vt: *target_of.ObjectTarget, img: *target_of.ObjectImage, dst: *of_destination.Destination) err[fail.Fail];
 ```
 
