@@ -278,6 +278,20 @@ pub fun reference_valid(t: *IrTypeTable, id: IrTypeId) bool;
 pub fun array_count(t: *IrTypeTable, id: IrTypeId) u32;
 ```
 
+## fun array_element
+
+```mach
+pub fun array_element(t: *IrTypeTable, id: IrTypeId) IrTypeId;
+```
+
+## fun record_field
+
+```mach
+pub fun record_field(t: *IrTypeTable, id: IrTypeId, field_ix: u32) IrTypeId;
+```
+
+field `field_ix` of a struct or union
+
 ## fun is_aggregate
 
 ```mach

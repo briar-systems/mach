@@ -355,6 +355,12 @@ and rounds total size without repacking nested payloads. Packed value access
 uses legal unaligned operations. A typed payload pointer must not promise
 stronger alignment than its storage provides.
 
+Debug information describes a tag as a structure laid out the same way. Its
+first member, `tag`, holds the discriminator as an enumeration that names every
+case by its code, and each case with a payload follows as a member named for the
+case at the common payload offset. `tag` is a keyword, so no case can take that
+name.
+
 Construction captures the active payload before overwriting the destination and
 zeroes tag-owned gaps, inactive payload suffix bytes, and tail padding. Active
 payload representation rules remain unchanged, including raw union bytes.

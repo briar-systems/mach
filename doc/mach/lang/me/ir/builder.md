@@ -529,7 +529,7 @@ pub fun emit_asm(b: *Builder, operands: *value.Value, operand_count: u32) res[ir
 
 ```mach
 pub fun emit_dbg_value(b: *Builder, val: value.Value, name: intern.StrId, ty: ir_type.IrTypeId,
-ty_sem: type.TypeId, is_param: bool, scope: u32) err[fail.Fail];
+debug_type: ir_debug.TypeId, is_param: bool, scope: u32) err[fail.Fail];
 ```
 
 ## fun emit_vcompare
