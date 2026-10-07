@@ -20,25 +20,25 @@ a function's stub loads it from a slot, and a GOT-kind relocation reads one
 pub fun got_import_count(dyn: *target_of.DynamicInfo) u32;
 ```
 
-## fun macho_stub_size
+## fun stub_size
 
 ```mach
-pub fun macho_stub_size(arch_id: u32) usize;
+pub fun stub_size(arch_id: u32) usize;
 ```
 
-## fun macho_stub_shape
+## fun stub_shape
 
 ```mach
-pub fun macho_stub_shape(arch_id: u32, count: u32) res[target_of.TableShape, fail.Fail];
+pub fun stub_shape(arch_id: u32, count: u32) res[target_of.TableShape, fail.Fail];
 ```
 
 the __TEXT,__stubs table the linker reserves at the end of the code, so a
 call site's branch reaches its stub whatever data the image carries
 
-## fun macho_got_shape
+## fun got_shape
 
 ```mach
-pub fun macho_got_shape(arch_id: u32, dyn: *target_of.DynamicInfo) res[target_of.TableShape, fail.Fail];
+pub fun got_shape(arch_id: u32, dyn: *target_of.DynamicInfo) res[target_of.TableShape, fail.Fail];
 ```
 
 the __DATA_CONST,__got table the linker reserves ahead of the zero-fill, so a
@@ -114,9 +114,9 @@ segs: *target_of.LoadSegment,
 seg_count: u32) err[fail.Fail];
 ```
 
-## fun macho_got_ordinal
+## fun got_ordinal
 
 ```mach
-pub fun macho_got_ordinal(dyn: *target_of.DynamicInfo, import_index: u32) u32;
+pub fun got_ordinal(dyn: *target_of.DynamicInfo, import_index: u32) u32;
 ```
 
