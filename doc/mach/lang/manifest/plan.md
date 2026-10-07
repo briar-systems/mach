@@ -10,28 +10,26 @@ one resolved build cell: a target, a profile, and an artifact with every path
 expanded. produced by `resolve_build_unit`; `libs` is owned by the unit
 
 target: the resolved target; points into the manifest, except for the host
-               target synthesized when the manifest declares no targets
+              target synthesized when the manifest declares no targets
 artifact: the resolved artifact, pointing into the manifest
 target_name: `target.name`
 profile_name: the resolved profile's name
 entry: the artifact's `entry`
-bin_path: the artifact's output: the expanded `[project].out` joined with the
-               expanded artifact `out`
-out_root: `<expanded project out>`, whose layout beneath it the build owns
-obj_root: `<expanded project out>/obj`
-ir_root: `<expanded project out>/ir`
-asm_root: `<expanded project out>/asm`
-test_root: `<expanded project out>/test/{name}`, with `{name}` left literal for
-               the test runner to fill
-cache_root: `<expanded project out>/.cache`, the compiler-only state
-stage_root: `<expanded project out>/.stage`, the build step scratch space
-opt: from the resolved profile
+bin_path: the artifact's output: the expanded `[project].work` joined with the
+              expanded artifact `out`
+out_root: `<expanded project work>`, whose layout beneath it the build owns
+obj_root: `<expanded project work>/obj`
+ir_root: `<expanded project work>/ir`
+asm_root: `<expanded project work>/asm`
+test_root: `<expanded project work>/test/{name}`, with `{name}` left literal for
+              the test runner to fill
+cache_root: `<expanded project work>/.cache`, the compiler-only state
+stage_root: `<expanded project work>/.stage`, the build step scratch space
+optimize: from the resolved profile
 debug: from the resolved profile
 simd: from the resolved profile
-vectorize: from the resolved profile
-float_reassoc: from the resolved profile
 libs: the artifact's `link` entries that match the target, resolved in `link`
-               order and sized exactly; a `link` name matching no `[link.*]` table is skipped
+              order and sized exactly; a `link` name matching no `[link.*]` table is skipped
 lib_count: length of `libs`
 
 ## rec Scope
@@ -43,8 +41,8 @@ pub rec Scope;
 the manifest that declares a build cell, and the root project the cell is built
 for. a root cell has `owner == root`. a dependency's cell is one of the
 requirements its export library carries: it resolves its artifact, targets and
-links in `owner`, its profile in `root`, expands the root's `[project].out`, and
-reads `{project.out}` in its artifact outputs as `dep/<owner id>` of that out,
+links in `owner`, its profile in `root`, expands the root's `[project].work`, and
+reads `{project.work}` in its artifact outputs as `dep/<owner id>` of that out,
 so identically named artifacts of two dependencies never share a path
 
 root: the manifest of the project being built
@@ -56,7 +54,7 @@ owner: the manifest declaring the cell's artifact; `root` for the root's own
 pub val DEPENDENCY_ARTIFACT_DIR: str = "dep"
 ```
 
-the directory under the expanded root `[project].out` that holds a dependency's
+the directory under the expanded root `[project].work` that holds a dependency's
 artifact outputs, one subdirectory per dependency id
 
 ## val CACHE_DIR
@@ -65,7 +63,7 @@ artifact outputs, one subdirectory per dependency id
 pub val CACHE_DIR: str = ".cache"
 ```
 
-the directory under the expanded `[project].out` that holds compiler-only state:
+the directory under the expanded `[project].work` that holds compiler-only state:
 nothing but the compiler reads or writes it, and a step output may not name it
 
 ## val STEP_STAMP_DIR
@@ -82,7 +80,7 @@ the directory under `CACHE_DIR` that holds one fingerprint stamp per build step
 pub val STAGE_DIR: str = ".stage"
 ```
 
-the directory under the expanded `[project].out` that holds build step scratch
+the directory under the expanded `[project].work` that holds build step scratch
 space, one subdirectory per step, reset before the step runs
 
 ## fun root_scope
@@ -205,7 +203,7 @@ m: the manifest
 art_names: the artifacts to plan for; unknown names are skipped
 art_count: length of `art_names`
 t: the target
-proj_out: the expanded `[project].out`
+proj_out: the expanded `[project].work`
 v: the template values
 out_order: receives the step indices in run order, sized exactly; nil when none
 out_count: receives the length
@@ -227,7 +225,7 @@ alloc: owns the returned order
 itn: resolves names
 m: the manifest
 t: the target
-proj_out: the expanded `[project].out`
+proj_out: the expanded `[project].work`
 v: the template values
 out_order: receives the step indices in run order, sized exactly; nil when none
 out_count: receives the length
@@ -261,7 +259,7 @@ pub fun resolve_scoped_build_unit(alloc: *A.Allocator, itn: *intern.Interner, re
 ```
 
 `resolve_build_unit` for a cell of `s`: target, artifact and links resolve in
-`s.owner`, the profile and `[project].out` in `s.root`, and `{project.out}` in
+`s.owner`, the profile and `[project].work` in `s.root`, and `{project.work}` in
 the artifact output names the scope's artifact root
 
 alloc: owns `libs` and temporary strings
