@@ -109,12 +109,6 @@ pub val EXTENT_SIZE_OVERFLOW:  ExtentCause = 6
 pub rec Extent;
 ```
 
-## val DEPTH_UNBOUNDED
-
-```mach
-pub val DEPTH_UNBOUNDED: u32 = 0
-```
-
 ## fun unknown_extent
 
 ```mach
@@ -143,7 +137,7 @@ pub fun checked_round_up(value: u32, align: u32) Extent;
 
 ```mach
 pub fun extent_of[T](ctx: *T, describe: fun(*T, u32) Node, field: fun(*T, u32, u32) u32,
-id: u32, m: Machine, max_depth: u32) Extent;
+id: u32, m: Machine) Extent;
 ```
 
 ## fun field_offset_of
@@ -151,7 +145,7 @@ id: u32, m: Machine, max_depth: u32) Extent;
 ```mach
 pub fun field_offset_of[T](ctx: *T, describe: fun(*T, u32) Node,
 field: fun(*T, u32, u32) u32, id: u32, field_ix: u32,
-m: Machine, max_depth: u32) Extent;
+m: Machine) Extent;
 ```
 
 ## fun cause_name

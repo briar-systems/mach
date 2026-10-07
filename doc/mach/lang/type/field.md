@@ -6,6 +6,15 @@
 pub rec Entry;
 ```
 
+## rec Decoration
+
+```mach
+pub rec Decoration;
+```
+
+the layout decorations a nominal declares: its alignment, zero when it declares
+none, and whether it is packed or volatile
+
 ## rec Table
 
 ```mach
@@ -18,8 +27,9 @@ pub rec Table;
 pub rec Projection;
 ```
 
-the field tables of every aggregate and the declared discriminator of every
-tag, for one type projection; a projection reset clears all of it
+the field tables of every aggregate, the declared discriminator of every tag and
+the layout decorations of every nominal, for one type projection; a projection
+reset clears all of it
 
 ## fun projection_init
 
@@ -97,5 +107,19 @@ pub fun discriminator_set(p: *Projection, nom: TypeId, disc: TypeId) err[fail.Fa
 
 ```mach
 pub fun discriminator_del(p: *Projection, nom: TypeId);
+```
+
+## fun decoration_of
+
+```mach
+pub fun decoration_of(p: *Projection, ty: TypeId) Decoration;
+```
+
+the decorations `ty` declares; none when it declares none
+
+## fun decoration_set
+
+```mach
+pub fun decoration_set(p: *Projection, ty: TypeId, d: Decoration) err[fail.Fail];
 ```
 
