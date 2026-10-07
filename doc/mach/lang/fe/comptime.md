@@ -851,6 +851,14 @@ fwd comptime_scope.layer_set
 
 forwards [`mach.lang.fe.comptime.scope.layer_set`](comptime/scope.md#fun-layer_set)
 
+## fwd comptime_scope.lowering_prepare
+
+```mach
+fwd comptime_scope.lowering_prepare
+```
+
+forwards [`mach.lang.fe.comptime.scope.lowering_prepare`](comptime/scope.md#fun-lowering_prepare)
+
 ## fwd comptime_scope.lookup
 
 ```mach
