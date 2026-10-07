@@ -1,0 +1,209 @@
+# a published constant value laid out as the constant bytes of its type: a record's fields at
+# their offsets, a tag's case code and payload, an array's or a vector's elements at the
+# element stride, and a string leaf as a pointer to its bytes
+use mach.lang.growth;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+use mach.lang.fail;
+use mach.lang.fe.comptime;
+use comptime_deep: mach.lang.fe.comptime.deep;
+use mach.lang.float;
+use mach.lang.intern;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use lower_context: mach.lang.me.lower.context;
+use mach.lang.target.resolved;
+use mach.lang.type;
+use mach.lang.wide;
+
+rec Relocs {
+    data: *value.AggReloc;
+    len:  u32;
+    cap:  u32;
+}
+
+# node `node` of `store` as a constant of the IR type `ity`
+pub fun aggregate(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, node: u32, ity: ir_type.IrTypeId) res[value.Value, fail.Fail] {
+    val size: u32 = ir_type.byte_size_for_machine(?ctx.m.types, ity, resolved.layout_machine(ctx.tgt));
+    if (size == 0) { ret res[value.Value, fail.Fail].err{fail.message("lower: a constant value has a type with no size")}; }
+    val res_blob: res[*u8, A.Error] = A.zallocate[u8](ctx.m.alloc, size::usize);
+    if (sel res_blob.err) { ret res[value.Value, fail.Fail].err{fail.refused(res_blob.err)}; }
+    val blob:   *u8            = res_blob.ok;
+    var relocs: Relocs         = Relocs{data: nil, len: 0, cap: 0};
+    val placed: err[fail.Fail] = place(ctx, store, node, ity, blob, 0, ?relocs);
+    if (sel placed.err) {
+        A.deallocate[u8](ctx.m.alloc, blob, size::usize);
+        if (relocs.data != nil) { A.deallocate[value.AggReloc](ctx.m.alloc, relocs.data, relocs.cap::usize); }
+        ret res[value.Value, fail.Fail].err{placed.err};
+    }
+    ret res[value.Value, fail.Fail].ok{value.const_agg(blob, size, relocs.data, relocs.len, relocs.cap, ity)};
+}
+
+fun place(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, node: u32, ity: ir_type.IrTypeId, blob: *u8, base: u32, relocs: *Relocs) err[fail.Fail] {
+    val n: *comptime_deep.Node = comptime_deep.node_at(store, node);
+    if (n.kind == comptime_deep.NODE_REFUSED) { ret err[fail.Fail].err{fail.message("lower: a constant value holds a leaf with no compile-time value")}; }
+    val opt_t: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
+    if (sel opt_t.none) { ret err[fail.Fail].err{fail.message("lower: a constant value has an unknown IR type")}; }
+    val k: ir_type.IrTypeKind = opt_t.some.kind;
+    if (k == ir_type.IRT_TAG)                              { ret place_tag(ctx, store, n, ity, blob, base, relocs); }
+    if (k == ir_type.IRT_STRUCT || k == ir_type.IRT_UNION) { ret place_record(ctx, store, n, ity, blob, base, relocs); }
+    if (k == ir_type.IRT_ARRAY || k == ir_type.IRT_VECTOR) { ret place_elements(ctx, store, n, ity, blob, base, relocs); }
+    ret place_scalar(ctx, n, ity, blob, base, relocs);
+}
+
+# the field or case `name` declares on the semantic type `owner`
+fun member_index(ctx: *lower_context.LowerContext, owner: type.TypeId, name: intern.StrId) opt[u32] {
+    val stripped: type.TypeId = type.strip_secret(?ctx.s.types, owner);
+    val n:        u32         = type.field_count(?ctx.s.types, stripped);
+    var i:        u32         = 0;
+    for (i < n) {
+        val fa: opt[*type.FieldEntry] = type.field_at(?ctx.s.types, stripped, i);
+        if (sel fa.some && intern.str_same(fa.some.name, name)) { ret opt[u32].some{i}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# a tag holds its case code at offset zero and its payload at the common payload offset
+fun place_tag(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, n: *comptime_deep.Node, ity: ir_type.IrTypeId, blob: *u8, base: u32, relocs: *Relocs) err[fail.Fail] {
+    if (n.kind != comptime_deep.NODE_LITERAL || intern.str_is_nil(n.head)) { ret err[fail.Fail].err{fail.message("lower: a constant tag is no case literal")}; }
+    val case_ix: opt[u32] = member_index(ctx, n.ty, n.head);
+    if (sel case_ix.none) { ret err[fail.Fail].err{fail.message("lower: a constant tag holds a case its type does not declare")}; }
+    val opt_t: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
+    if (sel opt_t.none) { ret err[fail.Fail].err{fail.message("lower: a constant tag has an unknown IR type")}; }
+    val t: *ir_type.IrType = opt_t.some;
+    if (case_ix.some >= t.data.tag_.case_count) { ret err[fail.Fail].err{fail.message("lower: a constant tag's case exceeds its IR case count")}; }
+    write_bits(blob, base, wide.from_u64(case_ix.some::u64), ir_type.tag_discriminator_bytes(?ctx.m.types, ity));
+    val payload: opt[comptime_deep.Member] = comptime_deep.member_at(store, n, 0);
+    if (sel payload.none) { ret err[fail.Fail].ok{}; }
+    val payload_off: u32 = ir_type.tag_payload_offset_for_machine(?ctx.m.types, ity, resolved.layout_machine(ctx.tgt));
+    ret place(ctx, store, payload.some.node, t.data.tag_.cases[case_ix.some], blob, base + payload_off, relocs);
+}
+
+# a record's named fields at their offsets; a field the literal leaves out stays zero
+fun place_record(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, n: *comptime_deep.Node, ity: ir_type.IrTypeId, blob: *u8, base: u32, relocs: *Relocs) err[fail.Fail] {
+    if (n.kind != comptime_deep.NODE_LITERAL || !intern.str_is_nil(n.head)) { ret err[fail.Fail].err{fail.message("lower: a constant record is no record literal")}; }
+    val opt_t: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
+    if (sel opt_t.none) { ret err[fail.Fail].err{fail.message("lower: a constant record has an unknown IR type")}; }
+    val t: *ir_type.IrType = opt_t.some;
+    var i: u32             = 0;
+    for (i < n.len) {
+        val m:        comptime_deep.Member = store.members.data[n.first + i];
+        val field_ix: opt[u32]             = member_index(ctx, n.ty, m.name);
+        var ix:       u32                  = t.data.struct_.field_count;
+        if (sel field_ix.some)                { ix = field_ix.some; }
+        if (ix >= t.data.struct_.field_count) { ret err[fail.Fail].err{fail.message("lower: a constant record names a field its type does not declare")}; }
+        val foff:   u32            = ir_type.byte_offset_for_machine(?ctx.m.types, ity, ix, resolved.layout_machine(ctx.tgt));
+        val placed: err[fail.Fail] = place(ctx, store, m.node, t.data.struct_.fields[ix], blob, base + foff, relocs);
+        if (sel placed.err) { ret placed; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# an array's or a vector's elements at the element stride; an element the literal leaves out
+# stays zero
+fun place_elements(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, n: *comptime_deep.Node, ity: ir_type.IrTypeId, blob: *u8, base: u32, relocs: *Relocs) err[fail.Fail] {
+    val opt_t: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
+    if (sel opt_t.none) { ret err[fail.Fail].err{fail.message("lower: a constant array has an unknown IR type")}; }
+    val t:     *ir_type.IrType  = opt_t.some;
+    var ety:   ir_type.IrTypeId = ir_type.IRT_NIL;
+    var count: u32              = 0;
+    if (t.kind == ir_type.IRT_VECTOR) {
+        ety   = t.data.vector_.element;
+        count = t.data.vector_.lanes;
+    }
+    or {
+        ety   = t.data.array_.element;
+        count = ir_type.array_count(?ctx.m.types, ity);
+    }
+    val stride: u32 = ir_type.byte_size_for_machine(?ctx.m.types, ety, resolved.layout_machine(ctx.tgt));
+    var i:      u32 = 0;
+    for (i < count && i < n.len) {
+        val placed: err[fail.Fail] = place(ctx, store, store.members.data[n.first + i].node, ety, blob, base + i * stride, relocs);
+        if (sel placed.err) { ret placed; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun place_scalar(ctx: *lower_context.LowerContext, n: *comptime_deep.Node, ity: ir_type.IrTypeId, blob: *u8, base: u32, relocs: *Relocs) err[fail.Fail] {
+    if (n.kind != comptime_deep.NODE_SCALAR) { ret err[fail.Fail].err{fail.message("lower: a constant scalar is an aggregate")}; }
+    val v:    comptime.CTValue = n.value;
+    val size: u32              = ir_type.byte_size_for_machine(?ctx.m.types, ity, resolved.layout_machine(ctx.tgt));
+    if (v.kind == comptime.CT_KIND_STR) { ret place_string(ctx, v.data.s, ity, base, relocs); }
+    if (size == 0 || size > 16)         { ret err[fail.Fail].err{fail.message("lower: a constant scalar has an unsupported size")}; }
+    if (v.kind == comptime.CT_KIND_INT) {
+        write_bits(blob, base, v.data.w, size);
+        ret err[fail.Fail].ok{};
+    }
+    if (v.kind == comptime.CT_KIND_FLOAT) {
+        var bits: u64 = 0;
+        if (size == 8) { bits = float.f64_bits(v.data.f); }
+        or (size == 4) { bits = float.f64_to_f32_bits(float.f64_bits(v.data.f))::u64; }
+        or (size == 2) { bits = float.bits_at(v.data.f, float.FLOAT_W_16); }
+        or             { ret err[fail.Fail].err{fail.message("lower: a constant float has an unsupported width")}; }
+        write_bits(blob, base, wide.from_u64(bits), size);
+        ret err[fail.Fail].ok{};
+    }
+    ret err[fail.Fail].err{fail.message("lower: a constant leaf holds no runtime value")};
+}
+
+# a string leaf points at its bytes, which become a constant of their own
+fun place_string(ctx: *lower_context.LowerContext, text: intern.StrId, ity: ir_type.IrTypeId, base: u32, relocs: *Relocs) err[fail.Fail] {
+    val opt_txt: opt[str] = intern.get(?ctx.s.interner, text);
+    if (sel opt_txt.none) { ret err[fail.Fail].err{fail.message("lower: a constant string is not interned")}; }
+    val s:     str                         = opt_txt.some;
+    val bytes: value.Value                 = value.const_bytes(s::*u8, (str_len(s) + 1::usize)::u32, ity);
+    val added: res[value.Value, fail.Fail] = lower_context.add_rodata_bytes(ctx, bytes, ity);
+    if (sel added.err) { ret err[fail.Fail].err{added.err}; }
+    val gv: value.Value = added.ok;
+    if (gv.kind != value.VAL_GLOBAL || gv.data.global_ix >= ctx.m.global_len) { ret err[fail.Fail].err{fail.message("lower: a constant string did not lower to a global")}; }
+    val grown: err[A.Error] = growth.reserve[value.AggReloc](ctx.m.alloc, ?relocs.data, ?relocs.cap, relocs.len::usize + 1);
+    if (sel grown.err) { ret err[fail.Fail].err{fail.refused(grown.err)}; }
+    relocs.data[relocs.len] = value.AggReloc{offset: base, symbol: ctx.m.globals[gv.data.global_ix].name, addend: 0, is_fn: false};
+    relocs.len              = relocs.len + 1;
+    ret err[fail.Fail].ok{};
+}
+
+# little-endian bytes of a constant: the low limb first, then the high limb
+# once the leaf is wider than 8 bytes
+pub fun write_bits(blob: *u8, base: u32, bits: wide.Wide, size: u32) {
+    var i: u32 = 0;
+    for (i < size) {
+        blob[base + i] = wide.shr_u(bits, i * 8).lo::u8;
+        i              = i + 1;
+    }
+}
+
+# a 16-byte leaf lays its low limb down first, then its high limb, and a
+# narrower leaf still takes only its own bytes of the low limb
+test write_bits__sixteen_byte_leaf_is_little_endian_lo_then_hi {
+    var blob: [20]u8;
+    var i:    u32 = 0;
+    for (i < 20) {
+        blob[i] = 0xCC;
+        i       = i + 1;
+    }
+    write_bits(?blob[0], 2, wide.make(0x0807060504030201, 0x100F0E0D0C0B0A09), 16);
+    if (blob[0] != 0xCC || blob[1] != 0xCC) { ret 1; }
+    i = 0;
+    for (i < 16) {
+        if (blob[2 + i] != (i + 1)::u8) { ret 2; }
+        i = i + 1;
+    }
+    if (blob[18] != 0xCC || blob[19] != 0xCC) { ret 3; }
+    write_bits(?blob[0], 0, wide.make(0xFFFFFFFFFFFFFF11, 0xFFFFFFFFFFFFFFFF), 1);
+    if (blob[0] != 0x11 || blob[1] != 0xCC) { ret 4; }
+    write_bits(?blob[0], 0, wide.make(0x0000000000000000, 0x00000000000000AB), 9);
+    if (blob[8] != 0xAB || blob[9] != 8) { ret 5; }
+    ret 0;
+}
