@@ -1,7 +1,7 @@
 # mach.lang.fe.literal
 
-scanning and decoding a literal's spelling: the value an integer, float or character
-literal names and the suffix it carries, or why it does not scan
+scanning and decoding a literal's spelling: the value an integer, float, character or
+string literal names and the suffix it carries, or why it does not scan
 
 ## rec Int
 
@@ -75,6 +75,19 @@ pub fun char_scan(source: str, span: lang_source.Span) res[u8, Refusal];
 ```
 
 the byte a character literal names
+
+## fun str_scan
+
+```mach
+pub fun str_scan(source: str, span: lang_source.Span, out: *u8) res[usize, Refusal];
+```
+
+the bytes a string literal names, its escapes decoded, written to `out`
+
+source: the text the span indexes
+span: the literal's token
+out: room for at least span.len bytes
+ret: how many bytes were written, or why the literal does not scan
 
 ## fun escape_decode
 
