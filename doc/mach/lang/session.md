@@ -170,42 +170,6 @@ pub fun export_library(s: *Session, mid: module.ModuleId, did: u32) intern.StrId
 pub fun reset_type_projection(s: *Session) err[fail.Fail];
 ```
 
-## fun register_type_align
-
-```mach
-pub fun register_type_align(s: *Session, tid: u32, align: u32) err[fail.Fail];
-```
-
-## fun register_type_packed
-
-```mach
-pub fun register_type_packed(s: *Session, tid: u32) err[fail.Fail];
-```
-
-## fun type_is_packed
-
-```mach
-pub fun type_is_packed(s: *Session, tid: u32) bool;
-```
-
-## fun register_type_volatile
-
-```mach
-pub fun register_type_volatile(s: *Session, tid: u32) err[fail.Fail];
-```
-
-## fun type_is_volatile
-
-```mach
-pub fun type_is_volatile(s: *Session, tid: u32) bool;
-```
-
-## fun type_align
-
-```mach
-pub fun type_align(s: *Session, tid: u32) opt[u32];
-```
-
 ## fun register_import_library
 
 ```mach
@@ -261,12 +225,6 @@ pub fun link_publication_at(s: *Session, path: str, revision: query.Revision) op
 ```
 
 the digest the link at `revision` published to `path`, none when it published none there
-
-## fun register_module_phase
-
-```mach
-pub fun register_module_phase(s: *Session, mid: module.ModuleId, sema: ptr, resolve: ptr) err[fail.Fail];
-```
 
 ## fun register_module_identity
 
