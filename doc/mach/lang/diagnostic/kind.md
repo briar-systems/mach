@@ -1047,12 +1047,6 @@ pub val INDEX_TYPE:                       Kind = 168
 pub val LAYOUT_CYCLE:                     Kind = 169
 ```
 
-## val LAYOUT_MEASUREMENT_OVERFLOW
-
-```mach
-pub val LAYOUT_MEASUREMENT_OVERFLOW:      Kind = 170
-```
-
 ## val LAYOUT_UNAVAILABLE
 
 ```mach
