@@ -1,0 +1,138 @@
+# the module constants sema binds: every module `val` whose initializer evaluates at compile
+# time, bound once in sema's own bindings, which its result publishes to lowering and to every
+# importer. a constant is bound where it is first read while declarations are typed, and every
+# other one once they all are, before any body or instance is
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.fail;
+use mach.lang.fe.ast;
+use ast_decl:   mach.lang.fe.ast.decl;
+use ast_id:     mach.lang.fe.ast.id;
+use ast_module: mach.lang.fe.ast.module;
+use mach.lang.fe.comptime;
+use mach.lang.fe.decorator;
+use mach.lang.fe.resolve;
+use sema_context: mach.lang.fe.sema.context;
+use mach.lang.fe.sema.infer;
+use sema_product: mach.lang.fe.sema.product;
+use mach.lang.intern;
+use mach.lang.module;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+
+use A: std.allocator;
+
+# pending: not bound yet, and tried again on the next read; none: no constant, for good
+pub val CONSTANT_PENDING: u8 = 0;
+val     CONSTANT_ACTIVE:  u8 = 1;
+val     CONSTANT_BOUND:   u8 = 2;
+val     CONSTANT_NONE:    u8 = 3;
+
+# the value of the module constant the bare name `eid` names: one of this module's, bound on
+# first read, or one an imported module published
+pub fun named(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptime.CTValue], comptime.EvalFail] {
+    if (sc == nil) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
+    val found: opt[*resolve.Symbol] = sema_context.symbol_for_expr(sc, eid);
+    if (!sel found.some) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
+    val sym: *resolve.Symbol = found.some;
+    if (sym.kind == resolve.SYM_IMPORTED) {
+        # a constant bound per tuple in a union build was refused where its import was bound
+        val exported: opt[sema_product.TypeExport] = sema_context.public_type_for(sc, sym);
+        if (sel exported.some && exported.some.constant.gated && sc.view.ctx.env.build.union_build) {
+            ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}};
+        }
+        ret sema_context.resolve_module_member_const(sc, eid);
+    }
+    if (sym.kind != resolve.SYM_VAL || (sym.flags & resolve.SYM_FLAG_MODULE) == 0 || ast_id.decl_is_nil(sym.decl)
+        || !module.same(sym.origin, sc.view.own_module)) {
+        ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}};
+    }
+    ret bound_of(sc, sym.decl);
+}
+
+# binds the module `val` `did` declares when its initializer is a compile-time constant
+pub fun bind(sc: *sema_context.SemaContext, did: ast_id.DeclId) err[fail.Fail] {
+    val made: res[opt[comptime.CTValue], comptime.EvalFail] = bound_of(sc, did);
+    if (sel made.ok) { ret err[fail.Fail].ok{}; }
+    val failure: comptime.EvalFail = made.err;
+    if (failure.kind == comptime.EVAL_FAIL_INTERNAL) { ret err[fail.Fail].err{fail.message(failure.message)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun bound_of(sc: *sema_context.SemaContext, did: ast_id.DeclId) res[opt[comptime.CTValue], comptime.EvalFail] {
+    val none: res[opt[comptime.CTValue], comptime.EvalFail] = res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}};
+    # a module read only through an instance of it is bound by its own typing
+    if (sc.view.constant_state == nil || ast_id.decl_index(did) >= sc.view.a.decls.len::u32) { ret none; }
+    val ix: u32 = ast_id.decl_index(did);
+    val st: u8  = sc.view.constant_state[ix];
+    if (st == CONSTANT_ACTIVE || st == CONSTANT_NONE) { ret none; }
+
+    val d_opt: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, did);
+    if (!sel d_opt.some) { ret none; }
+    val d: *ast_decl.Decl = d_opt.some;
+    if (d.kind != ast_decl.DECL_KIND_VAL || (d.flags & ast_decl.DECL_FLAG_EXT) != 0 || ast_id.expr_is_nil(d.data.bind.init)
+        || decorator.has(sc.view.a, d, decorator.EMBED)) {
+        sc.view.constant_state[ix] = CONSTANT_NONE;
+        ret none;
+    }
+    val name_r: res[intern.StrId, A.Error] = intern.range_add(?sc.s.interner, sc.view.source, d.data.bind.name.offset, d.data.bind.name.len);
+    if (sel name_r.err) { ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, "out of memory naming a module constant")}; }
+    val name: intern.StrId = name_r.ok;
+    # what an earlier stage bound, a constant tag over its literal included, stands
+    val prior: opt[comptime.NamedConst] = comptime.lookup(sc.view.ctx, name);
+    if (st == CONSTANT_BOUND || sel prior.some) {
+        sc.view.constant_state[ix] = CONSTANT_BOUND;
+        if (!sel prior.some) { ret none; }
+        ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].some{prior.some.value}};
+    }
+
+    sc.view.constant_state[ix] = CONSTANT_ACTIVE;
+    # typed and evaluated quietly: the declaration reports what is wrong with it when it is
+    # typed in turn, and a reader reports that it read no constant
+    val outer: sema_context.Walk = sema_context.walk_open(sc);
+    sc.walk.silent = true;
+    infer.infer_expr(sc, d.data.bind.init);
+    val evaluated: res[comptime.CTValue, comptime.EvalFail] = comptime.evaluate_at_float_width[sema_context.SemaContext](sc.view.ctx, sc,
+        sc.typing.type_caps, sc.view.a, sc.view.source, d.data.bind.init, ?sc.s.interner,
+        comptime.declared_float_width(sc.view.a, sc.view.source, d.data.bind.ty));
+    sema_context.walk_close(sc, outer);
+    if (sel evaluated.err) {
+        sc.view.constant_state[ix] = CONSTANT_PENDING;
+        if (evaluated.err.kind == comptime.EVAL_FAIL_INTERNAL) { ret res[opt[comptime.CTValue], comptime.EvalFail].err{evaluated.err}; }
+        ret none;
+    }
+    val value: comptime.CTValue = comptime.apply_declared_int_type(sc.view.a, sc.view.source, d.data.bind.ty, evaluated.ok);
+    val put:   err[fail.Fail]   = comptime.bind_gated(sc.view.ctx, name, value, !declared_at_top(sc, did));
+    if (sel put.err) {
+        sc.view.constant_state[ix] = CONSTANT_NONE;
+        ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, fail.describe(put.err))};
+    }
+    sc.view.constant_state[ix] = CONSTANT_BOUND;
+    ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].some{value}};
+}
+
+# whether `did` is one of the module's own declarations rather than one in a gated arm
+fun declared_at_top(sc: *sema_context.SemaContext, did: ast_id.DeclId) bool {
+    val m_opt: opt[*ast_module.Module] = ast.get_module(sc.view.a, sc.view.a.root_module);
+    if (!sel m_opt.some) { ret false; }
+    var i: u32 = 0;
+    for (i < m_opt.some.decls_len) {
+        if (ast_id.decl_same(sc.view.a.decl_ids.data[m_opt.some.decls_start + i], did)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# every constant still unbound once all are tried is none, so no later read, inside a body or
+# an instance, evaluates one again
+pub fun settle(sc: *sema_context.SemaContext) {
+    if (sc.view.constant_state == nil) { ret; }
+    var i: u32 = 0;
+    for (i < sc.view.a.decls.len::u32) {
+        if (sc.view.constant_state[i] == CONSTANT_PENDING) { sc.view.constant_state[i] = CONSTANT_NONE; }
+        i = i + 1;
+    }
+}
