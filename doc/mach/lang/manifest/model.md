@@ -1,28 +1,17 @@
 # mach.lang.manifest.model
 
-## def MOpt
+## rec NameList
 
 ```mach
-pub def MOpt: u8
+pub rec NameList;
 ```
 
-optimisation level of a profile, decoded from `[profile.<name>].opt`
+the names one of a profile's set keys lists, as written: the build checks
+each against the catalog it names into
 
-## val MOPT_DEBUG
-
-```mach
-pub val MOPT_DEBUG: MOpt = 1
-```
-
-`opt = 0`: the debug pipeline
-
-## val MOPT_RELEASE
-
-```mach
-pub val MOPT_RELEASE: MOpt = 2
-```
-
-`opt = 1` or `opt = 2`: the release pipeline; both integers map here
+items: the names, nil when the key is absent or empty
+sites: where each is written, parallel to `items`
+count: how many
 
 ## def SimdMode
 
@@ -48,6 +37,15 @@ pub val SIMD_REQUIRE: SimdMode = 1
 ```
 
 `simd = "require"`: a missing packed instruction is a build error
+
+## fun simd_named
+
+```mach
+pub fun simd_named(name: str) opt[SimdMode];
+```
+
+the mode `name` names, as a manifest and the command line write it; none for
+any other name
 
 ## rec TargetDef
 
@@ -87,7 +85,7 @@ name: the table key; a portable identifier
 kind: the required `kind` key, decoded through the artifact kind catalog
 entry: the required `entry` key, a project-relative path under `[project].src`
 out: the required `out` key, an unexpanded path template relative to the
-              project root; `{project.out}` places the output under the build output
+              project root; `{project.work}` places the output under the work directory
 targets: the required `targets` array of declared target names or "*"; nil when empty
 target_count: length of `targets`
 link: the `link` array of `[link.<name>]` names; nil when absent or empty
@@ -120,14 +118,16 @@ least one
 
 name: the table key; a portable identifier
 is_default: `default = true`; false when the key is absent. more than one
-               default is a parse error
-opt: the required `opt` key
+            default is a parse error
+optimize: the required `optimize` key: whether the release pass set runs
+pass: the optional `pass` key: the optimization passes added to the set
+skip: the optional `skip` key: the optimization passes left out of it
+relax: the optional `relax` key: the departures from exact semantics
+            the build permits
 debug: the required `debug` key
 simd: the required `simd` key
-vectorize: the required `vectorize` key
-float_reassoc: the required `float_reassoc` key
 allow: the optional `allow` key: the warning kinds the profile silences,
-               empty when the key is absent
+            empty when the key is absent
 at: where the table's key is written
 default_at: where its `default` value is written, the zero place when absent
 
@@ -254,8 +254,9 @@ that caused it
 id: the required `[project].id`, a portable identifier
 version: the required `[project].version`, carried verbatim
 src: the required `[project].src`, a project-relative path
-out_tmpl: the required `[project].out`, an unexpanded path template
-out_at: where `[project].out` is written
+work_tmpl: the required `[project].work`, an unexpanded path template for
+                the work directory
+work_at: where `[project].work` is written
 targets: the `[target.*]` tables, nil when none
 target_count: length of `targets`
 native_target: the owned synthesized host definition when no targets are declared
@@ -307,6 +308,14 @@ the step itself is its owner's
 ```mach
 pub fun free_strarr(alloc: *A.Allocator, items: *intern.StrId, count: u32);
 ```
+
+## fun names_free
+
+```mach
+pub fun names_free(alloc: *A.Allocator, l: *NameList);
+```
+
+release what a name list owns
 
 ## fun free_sites
 

@@ -120,8 +120,30 @@ key: the key as written
 shape: the shape its value must have
 rule: whether a manifest must write it
 note: for a required key, a hint added to the refusal of its absence, "" for
-       none; for an optional key, what its absence means; for a derived key, the
-       value that decides it; for a removed key, what replaces it
+         none; for an optional key, what its absence means; for a derived key, the
+         value that decides it; for a removed key, what replaces it
+migrate: for a removed key, the rewrite its refusal carries as a fix; nil for
+         a key whose replacement is no mechanical rewrite
+
+## rec Rewrite
+
+```mach
+pub rec Rewrite;
+```
+
+the mechanical rewrite of a removed key as written
+
+label: what the rewrite does; nil when the value as written has none
+whole: the rewrite replaces the key and its value, not the key alone
+replacement: the text written in their place
+
+## def Migrate
+
+```mach
+pub def Migrate: fun(*toml.Table, *toml.Value) Rewrite
+```
+
+the rewrite of the removed key `v` of `tab`
 
 ## rec Rows
 
