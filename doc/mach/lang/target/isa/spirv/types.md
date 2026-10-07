@@ -19,10 +19,10 @@ no Int8, Int16 or Float16, which every other request of the width does.
 first located use of each Builder.caps_needed bit, by bit position, which a refusal
 of the capability points at
 
-## fun types_init
+## fun init
 
 ```mach
-pub fun types_init(b: *isa_spirv.Builder) TypeTable;
+pub fun init(b: *isa_spirv.Builder) TypeTable;
 ```
 
 ## fun raise_at
@@ -41,10 +41,10 @@ pub fun need_loc(tt: *TypeTable, need: u64) lang_source.Location;
 
 the first located use of the lowest bit of `need`, nil where no use was located
 
-## fun types_dnit
+## fun dnit
 
 ```mach
-pub fun types_dnit(tt: *TypeTable);
+pub fun dnit(tt: *TypeTable);
 ```
 
 ## fun composite_member

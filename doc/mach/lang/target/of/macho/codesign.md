@@ -1,9 +1,9 @@
 # mach.lang.target.of.macho.codesign
 
-## fun codesign_ident_len
+## fun ident_len
 
 ```mach
-pub fun codesign_ident_len(name: *u8) usize;
+pub fun ident_len(name: *u8) usize;
 ```
 
 ## fun code_signature_size
