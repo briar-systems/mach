@@ -267,7 +267,7 @@ interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFai
 ## fun resolve_comptime_path
 
 ```mach
-pub fun resolve_comptime_path(c: *comptime_scope.ComptimeCtx, source: str, stack: *lang_source.Span, depth: u32, interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail];
+pub fun resolve_comptime_path(c: *comptime_scope.ComptimeCtx, source: str, file: lang_source.FileId, stack: *lang_source.Span, depth: u32, interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail];
 ```
 
 ## fun os_tag_for

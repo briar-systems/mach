@@ -1,0 +1,300 @@
+# the generic unions an annotation instantiates must have variants agreeing on secrecy
+# under their arguments, which no check of the generic declaration can answer
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.fail;
+use mach.lang.fe.ast;
+use ast_id:       mach.lang.fe.ast.id;
+use ast_type:     mach.lang.fe.ast.type;
+use sema_context: mach.lang.fe.sema.context;
+use lang_source:  mach.lang.source;
+use mach.lang.type;
+use type_query: mach.lang.type.query;
+use mach.lang.type.query.deep;
+use mach.lang.type.query.expansive;
+use mach.lang.type.query.mention;
+use mach.lang.type.query.reach;
+use mach.lang.type.query.secrecy;
+use mach.lang.type.query.subst;
+use mach.lang.type.visit;
+
+pub fun check_annotation_uni_secrecy(sc: *sema_context.SemaContext, ast_tid: ast_id.TypeId) {
+    if (!sc.typing.has_secret)                                  { ret; }
+    if (sc.view.type_resolved_ty == nil)                        { ret; }
+    if (ast_id.type_index(ast_tid) >= sc.view.a.types.len::u32) { ret; }
+
+    val t_opt: opt[*ast_type.Type] = ast.get_type(sc.view.a, ast_tid);
+    if (!sel t_opt.some) { ret; }
+
+    check_type(sc, sc.view.type_resolved_ty[ast_id.type_index(ast_tid)], ?sc.instance.subst_owner, sc.instance.subst,
+        sc.instance.subst_len, t_opt.some.span);
+}
+
+# one check's state: the unions already compared, and whether the one unprovable report
+# the annotation draws has been made
+rec Check {
+    sc:                  *sema_context.SemaContext;
+    q:                   *type_query.Query;
+    scan:                type.TypeScan;
+    span:                lang_source.Span;
+    unprovable_reported: bool;
+}
+
+# a walk over one type under the arguments its parameters stand for
+rec Under {
+    c:       *Check;
+    who:     *type.GenericOwner;
+    args:    *type.TypeId;
+    arg_len: u32;
+}
+
+fun check_type(sc: *sema_context.SemaContext, tid: type.TypeId, who: *type.GenericOwner, args: *type.TypeId, arg_len: u32,
+    span: lang_source.Span) {
+    if (!sc.typing.has_secret)                  { ret; }
+    if (type.is_nil(tid) || type.is_error(tid)) { ret; }
+
+    var q: type_query.Query = sema_context.query_of(sc);
+    var c: Check;
+    c.sc                  = sc;
+    c.q                   = ?q;
+    c.span                = span;
+    c.unprovable_reported = false;
+    if (!type_query.scan_begin(?q, ?c.scan)) { ret; }
+    walk_under(?c, tid, who, args, arg_len);
+    type_query.scan_end(?q, ?c.scan);
+}
+
+fun walk_under(c: *Check, tid: type.TypeId, who: *type.GenericOwner, args: *type.TypeId, arg_len: u32) {
+    var u: Under             = Under{c: c, who: who, args: args, arg_len: arg_len};
+    var w: visit.Walk[Under] = visit.Walk[Under]{types: c.q.types, status: c.q.status, scan: nil,
+        edges: visit.EDGE_BASE | visit.EDGE_POINTEE | visit.EDGE_ELEMENT | visit.EDGE_SIGNATURE, ctx: ?u,
+        leaf:  under_leaf};
+    visit.reaches[Under](?w, tid);
+}
+
+fun under_leaf(u: *Under, tid: type.TypeId, t: *type.Type) visit.Verdict {
+    val k: type.TypeKind = t.kind;
+    if (k == type.TYPE_INSTANCE) {
+        walk_instance(u, tid, t);
+        ret visit.PRUNE;
+    }
+    if (k == type.TYPE_REC || k == type.TYPE_UNI || k == type.TYPE_TAG) {
+        walk_nominal(u.c, tid, u.args, u.arg_len);
+        ret visit.PRUNE;
+    }
+    if (k == type.TYPE_SECRET || k == type.TYPE_POINTER || k == type.TYPE_ARRAY || k == type.TYPE_FUN) {
+        ret visit.DESCEND;
+    }
+    ret visit.PRUNE;
+}
+
+fun walk_instance(u: *Under, tid: type.TypeId, t: *type.Type) {
+    val c:          *Check            = u.c;
+    val q:          *type_query.Query = c.q;
+    val gnom:       type.TypeId       = t.data.instance.nominal;
+    val args_start: u32               = t.data.instance.args_start;
+    val args_len:   u32               = t.data.instance.args_len;
+    if (args_len == 0) { ret; }
+
+    val res_raw: res[*type.TypeId, A.Error] = A.allocate[type.TypeId](q.types.a, args_len::usize);
+    if (sel res_raw.err) {
+        type_query.refused(q, res_raw.err);
+        ret;
+    }
+    val raw: *type.TypeId = res_raw.ok;
+    fin { A.deallocate[type.TypeId](q.types.a, raw, args_len::usize); }
+
+    var i: u32 = 0;
+    for (i < args_len) {
+        val a_opt: opt[type.TypeId] = type.get_param(q.types, args_start + i);
+        if (!sel a_opt.some) { ret; }
+        raw[i] = a_opt.some;
+        i      = i + 1;
+    }
+
+    i = 0;
+    for (i < args_len) {
+        walk_under(c, raw[i], u.who, u.args, u.arg_len);
+        i = i + 1;
+    }
+
+    # an expansive generic's instances are unbounded, so the walk cannot visit them all;
+    # it needs to only when a secret and a generic union lie below
+    if (!type.is_error(gnom) && expansive.nominal(q, gnom)) {
+        if (deep.secret(q, tid) && reach.generic_union(q, gnom)) { report_unbounded(c); }
+        ret;
+    }
+
+    if (type.is_error(gnom)) {
+        sema_context.report_internal(c.sc, c.span, "internal: union-secrecy instance walk: generic instance target declaration unavailable (pristine-type invariant violated)");
+        ret;
+    }
+
+    val res_conc: res[*type.TypeId, A.Error] = A.allocate[type.TypeId](q.types.a, args_len::usize);
+    if (sel res_conc.err) {
+        type_query.refused(q, res_conc.err);
+        ret;
+    }
+    val conc: *type.TypeId = res_conc.ok;
+    fin { A.deallocate[type.TypeId](q.types.a, conc, args_len::usize); }
+
+    i = 0;
+    for (i < args_len) {
+        conc[i] = subst.apply_or_self(q, raw[i], u.who, u.args, u.arg_len);
+        i       = i + 1;
+    }
+
+    walk_nominal(c, gnom, conc, args_len);
+}
+
+fun walk_nominal(c: *Check, nom: type.TypeId, args: *type.TypeId, arg_len: u32) {
+    val q:       *type_query.Query = c.q;
+    val opt_nom: opt[*type.Type]   = type.get(q.types, nom);
+    if (!sel opt_nom.some) {
+        report_unprovable(c);
+        ret;
+    }
+    val nom_kind: type.TypeKind         = opt_nom.some.kind;
+    val opt_tab:  opt[*type.FieldTable] = type.field_table_for(q.types, nom);
+    if (!sel opt_tab.some) {
+        report_unprovable(c);
+        ret;
+    }
+    val fields_len: u32 = opt_tab.some.fields_len;
+
+    var a:       *type.TypeId = args;
+    var n:       u32          = arg_len;
+    val generic: bool         = mention.has_param(q, nom);
+    if (!generic) {
+        a = nil;
+        n = 0;
+    }
+
+    val key: type.TypeId = visit_key(q, nom, a, n);
+    if (!type_query.scan_fresh(q, ?c.scan, key)) { ret; }
+
+    # a non-generic nominal walks its fields with no arguments, under no owner
+    var who: type.GenericOwner;
+    if (generic) {
+        val who_opt: opt[type.GenericOwner] = mention.owner(q, nom);
+        if (!sel who_opt.some) {
+            report_unprovable(c);
+            ret;
+        }
+        who = who_opt.some;
+    }
+
+    if (generic && nom_kind == type.TYPE_UNI) { check_variants(c, nom, ?who, a, n, key); }
+
+    var f: u32 = 0;
+    for (f < fields_len) {
+        val e_opt: opt[*type.FieldEntry] = type.field_at(q.types, nom, f);
+        if (!sel e_opt.some) {
+            report_unprovable(c);
+            ret;
+        }
+        walk_under(c, e_opt.some.ty, ?who, a, n);
+        f = f + 1;
+    }
+}
+
+fun report_unbounded(c: *Check) {
+    if (c.unprovable_reported) { ret; }
+    c.unprovable_reported = true;
+    sema_context.report(c.sc, diagnostic_kind.SECRET_VARIANT_UNPROVABLE, c.span, "cannot prove that every generic union this type reaches has variants agreeing on secrecy - it reaches them through a generic whose argument grows through a pointer, so the unions are instantiated unboundedly many ways");
+}
+
+fun report_unprovable(c: *Check) {
+    if (c.unprovable_reported) { ret; }
+    c.unprovable_reported = true;
+    sema_context.report(c.sc, diagnostic_kind.SECRET_VARIANT_UNPROVABLE, c.span, "cannot prove that every generic union this type reaches has variants agreeing on secrecy - its field layout is unavailable or its type graph is too large");
+}
+
+fun check_variants(c: *Check, nom: type.TypeId, who: *type.GenericOwner, args: *type.TypeId, arg_len: u32,
+    key: type.TypeId) {
+    val sc: *sema_context.SemaContext = c.sc;
+    val q:  *type_query.Query         = c.q;
+
+    val opt_tab: opt[*type.FieldTable] = type.field_table_for(q.types, nom);
+    if (!sel opt_tab.some) {
+        report_unprovable(c);
+        ret;
+    }
+    val fields_len: u32 = opt_tab.some.fields_len;
+    if (fields_len < 2) { ret; }
+
+    var i: u32 = 0;
+    for (i < fields_len) {
+        val vi: opt[type.TypeId] = variant_at(q, nom, i, who, args, arg_len);
+        if (!sel vi.some) {
+            report_unprovable(c);
+            ret;
+        }
+        if (mention.mentioned(q, vi.some)) { ret; }
+        i = i + 1;
+    }
+
+    # agreement is pairwise over the bytes each pair shares, so no variant stands in for the rest
+    i = 1;
+    for (i < fields_len) {
+        val vi: opt[type.TypeId] = variant_at(q, nom, i, who, args, arg_len);
+        var j:  u32              = 0;
+        for (j < i) {
+            val vj: opt[type.TypeId] = variant_at(q, nom, j, who, args, arg_len);
+            if (sel vi.some) {
+                if (sel vj.some) {
+                    val agreement: res[secrecy.Agreement, fail.Fail] = secrecy.overlay_agrees(sc.s, sema_context.machine_of(sc), vj.some, vi.some);
+                    if (sel agreement.err) {
+                        type_query.failed(q, agreement.err);
+                        ret;
+                    }
+                    if (agreement.ok == secrecy.UNDECIDABLE) {
+                        if (sema_context.uni_report_mark(sc.typing.uni_reports, key)) {
+                            sema_context.report(sc, diagnostic_kind.SECRET_VARIANT_UNPROVABLE, c.span, secrecy.UNBOUNDED_VARIANTS_MSG);
+                        }
+                        ret;
+                    }
+                    if (agreement.ok == secrecy.DISAGREE) {
+                        if (sema_context.uni_report_mark(sc.typing.uni_reports, key)) {
+                            sema_context.report(sc, diagnostic_kind.SECRET_VARIANT_MISMATCH, c.span, "union variants must agree on secrecy: this instantiation makes overlapping fields part secret `^` and part public, which would alias the same storage at two classifications");
+                        }
+                        ret;
+                    }
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun variant_at(q: *type_query.Query, nom: type.TypeId, i: u32, who: *type.GenericOwner, args: *type.TypeId,
+    arg_len: u32) opt[type.TypeId] {
+    val e_opt: opt[*type.FieldEntry] = type.field_at(q.types, nom, i);
+    if (!sel e_opt.some) { ret opt[type.TypeId].none{}; }
+    ret opt[type.TypeId].some{subst.apply_or_self(q, e_opt.some.ty, who, args, arg_len)};
+}
+
+fun visit_key(q: *type_query.Query, nom: type.TypeId, args: *type.TypeId, arg_len: u32) type.TypeId {
+    if (args == nil || arg_len == 0) { ret nom; }
+
+    val opt_nom: opt[*type.Type] = type.get(q.types, nom);
+    if (!sel opt_nom.some) { ret nom; }
+    val t: *type.Type = opt_nom.some;
+    if (t.kind != type.TYPE_REC && t.kind != type.TYPE_UNI && t.kind != type.TYPE_TAG) { ret nom; }
+
+    val r: res[type.TypeId, fail.Fail] = type.intern_instance(q.types, nom, args, arg_len);
+    if (sel r.err) {
+        type_query.failed(q, r.err);
+        ret nom;
+    }
+    ret r.ok;
+}
