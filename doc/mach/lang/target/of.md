@@ -30,35 +30,13 @@ pub val RAW:        u32 = 4
 pub val SPV:        u32 = 5
 ```
 
-## val FORMAT_CATALOG_VERSION
+## val FINGERPRINT_VERSION
 
 ```mach
-pub val FORMAT_CATALOG_VERSION: u8 = 1
+pub val FINGERPRINT_VERSION: u8 = 1
 ```
 
-## fun of_name_for
-
-```mach
-pub fun of_name_for(id: u32) str;
-```
-
-## fun of_count
-
-```mach
-pub fun of_count() usize;
-```
-
-## fun of_name_at
-
-```mach
-pub fun of_name_at(index: usize) str;
-```
-
-## fun of_fingerprint_tag
-
-```mach
-pub fun of_fingerprint_tag(id: u32) u8;
-```
+the version of the fingerprint tags formats declare; a tag is never reused
 
 ## def SectionKind
 
@@ -643,6 +621,57 @@ pub rec NativeSection;
 pub rec Section;
 ```
 
+## fun associated_owner
+
+```mach
+pub fun associated_owner(sec: *Section) opt[u32];
+```
+
+the section an associated section lives and dies with, as an index into its
+object's sections; none for a section that is not associated
+
+## fun unwind_entry_size
+
+```mach
+pub fun unwind_entry_size(sec: *Section) u64;
+```
+
+the bytes of one entry of an unwind index section, 0 when it declares none
+
+## rec GroupMember
+
+```mach
+pub rec GroupMember;
+```
+
+a member of a section group: a section of the group's object, or that
+section's relocations
+
+## fun group_member_count
+
+```mach
+pub fun group_member_count(sec: *Section) u32;
+```
+
+the members a group section lists
+
+## fun group_member_at
+
+```mach
+pub fun group_member_at(sec: *Section, i: u32) opt[GroupMember];
+```
+
+the group's member `i`, none for an entry that names no section
+
+## fun group_rebase
+
+```mach
+pub fun group_rebase(sec: *Section, by: u32);
+```
+
+moves every member of a group section `by` sections along, as its object's
+sections move when objects are combined
+
 ## fun validate_native_sections
 
 ```mach
@@ -945,6 +974,81 @@ pub rec BaseReloc;
 pub rec DynamicInfo;
 ```
 
+## fun func_import_count
+
+```mach
+pub fun func_import_count(dyn: *DynamicInfo) u32;
+```
+
+the imported functions of a dynamic part, nil for an image the loader binds
+nothing in
+
+## fun func_ordinal
+
+```mach
+pub fun func_ordinal(dyn: *DynamicInfo, import_index: u32) u32;
+```
+
+an imported function's place among the imported functions in import order,
+0xFFFFFFFF for an import that is not a function
+
+## rec SpanLocation
+
+```mach
+pub rec SpanLocation;
+```
+
+the load segment that holds a reserved table, and where in it the table starts
+
+## fun span_locate
+
+```mach
+pub fun span_locate(a: *A.Allocator, span: TableSpan, segs: *LoadSegment, seg_count: u32, executable: bool,
+table: str) res[SpanLocation, fail.Fail];
+```
+
+the load segment that holds `span` whole, refused when none does or when the
+one that does is executable and `executable` says it must not be, or the
+other way around
+
+table: the table as a refusal names it, as "the PLT"
+
+## def TablePlacement
+
+```mach
+pub def TablePlacement: u8
+```
+
+where the linker lays out a table a format asks it to reserve. a table at the
+end of the code or of the read-only data moves everything after it, so the
+format shapes it before anything is given an address; a table in a segment
+of its own follows every other, so the format shapes it once the image is
+final, from the image itself
+
+## val TABLE_CODE_END
+
+```mach
+pub val TABLE_CODE_END: TablePlacement = 0
+```
+
+at the end of the code, so no data lies between the code and the table
+
+## val TABLE_RELRO_END
+
+```mach
+pub val TABLE_RELRO_END: TablePlacement = 1
+```
+
+at the end of the read-only data the loader writes once, ahead of the zero-fill
+
+## val TABLE_OWN_SEGMENT
+
+```mach
+pub val TABLE_OWN_SEGMENT: TablePlacement = 2
+```
+
+in a segment of its own after the image's last one, on a page of its own
+
 ## rec TableShape
 
 ```mach
@@ -952,8 +1056,77 @@ pub rec TableShape;
 ```
 
 what a table a format asks the linker to reserve takes: the linker lays it out
-under this section name before it gives anything an address, so the code
-reaches it whatever data the image carries
+under this section name where `placement` puts it, before it gives anything
+an address, so the code reaches it whatever data the image carries
+
+flags: the segment's SEG_FLAG_ bits, for a table in a segment of its own
+
+## rec TableList
+
+```mach
+pub rec TableList;
+```
+
+the tables a format lays out in segments of their own after the image, in the
+order it adds them
+
+## fun table_list_init
+
+```mach
+pub fun table_list_init(alloc: *A.Allocator) TableList;
+```
+
+## fun table_list_dnit
+
+```mach
+pub fun table_list_dnit(list: *TableList);
+```
+
+## fun table_add
+
+```mach
+pub fun table_add(list: *TableList, shape: TableShape) err[fail.Fail];
+```
+
+adds a table in a segment of its own, none when it is empty
+
+## def SegmentTablesFn
+
+```mach
+pub def SegmentTablesFn: fun(*LinkedImage, *TableList) err[fail.Fail]
+```
+
+shapes the tables the image takes in segments of their own, once everything
+else in it is final, adding each to the list
+
+## fun table_segments_append
+
+```mach
+pub fun table_segments_append(alloc: *A.Allocator, itn: *intern.Interner, segs: *LoadSegment, count: u32, tables: *TableList,
+page: u64) res[*LoadSegment, fail.Fail];
+```
+
+the segments `segs` and, after every other, one for each table in `tables`,
+each on a page of its own, its bytes zero for the format to write and named
+by its one section. the returned array holds `segs` by value, so the caller
+releases the array `segs` but nothing its segments own
+
+## fun table_segments_free
+
+```mach
+pub fun table_segments_free(alloc: *A.Allocator, segs: *LoadSegment, count: u32);
+```
+
+releases what `count` table segments own: their bytes and their one section
+
+## fun table_segment
+
+```mach
+pub fun table_segment(img: *LinkedImage, i: u32) *LoadSegment;
+```
+
+the image's segment for the table the format added `i`-th, nil when it added
+fewer; the linker appends them after every other segment, in that order
 
 ## rec UnwindShape
 
@@ -975,17 +1148,14 @@ layout: the bytes of their own frame descriptions, which the frames table
 carries first, the entries among them that describe a function, and the
 functions their unwind index describes
 
-## rec PltFixup
+## rec ImportFixup
 
 ```mach
-pub rec PltFixup;
+pub rec ImportFixup;
 ```
 
-## rec ImportAddrFixup
-
-```mach
-pub rec ImportAddrFixup;
-```
+a site in the image the loader's binding of an import completes: a call
+through the import's stub, or a load of its address
 
 ## rec LoadSection
 
@@ -1316,6 +1486,36 @@ pub rec RelocationCapabilities;
 pub rec ObjectTarget;
 ```
 
+## def ObjectEmitFn
+
+```mach
+pub def ObjectEmitFn: fun(*ObjectTarget, *ObjectImage, *of_destination.Destination) err[fail.Fail]
+```
+
+## rec LinkedImage
+
+```mach
+pub rec LinkedImage;
+```
+
+what the linker hands an image writer: the laid-out image and everything the
+format records about it, the same record for every product and format
+
+product: an executable or a shared library
+dynamic: what the loader binds, nil for an image it binds nothing in
+exports: what a shared library offers its users
+name: the product's name, which a format may record in the image
+library_name: the file name a loader finds a shared library by, empty for
+              an executable
+
+## def ImageEmitFn
+
+```mach
+pub def ImageEmitFn: fun(*LinkedImage, *of_destination.Destination) err[fail.Fail]
+```
+
+writes a linked image's files into the destination
+
 ## rec ExecutableSectionLocation
 
 ```mach
@@ -1492,14 +1692,25 @@ pub rec ArtifactName;
 pub rec SystemNaming;
 ```
 
-how a system names the libraries and programs it runs: the affixes of a
-static library and the suffix of an executable
+how an operating system names the files it runs and links: a static library
+and an executable, each suffix with its dot or empty
 
 ## fun artifact_naming
 
 ```mach
 pub fun artifact_naming(vt: *OfVTable, system: *SystemNaming, kind: catalog_artifact.Kind) res[ArtifactName, fail.Fail];
 ```
+
+the name an artifact of `kind` takes from its format and its system
+
+## fun object_ext
+
+```mach
+pub fun object_ext(vt: *OfVTable) str;
+```
+
+the object suffix without its dot, as the build names the object files of
+its object directory
 
 ## fun validate
 
