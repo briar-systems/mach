@@ -313,6 +313,15 @@ whether a declaration carries `#[testing]`, which confines every reference to it
 pub fun symbol_is_runtime(sym: *Symbol) bool;
 ```
 
+## fun expr_is_runtime
+
+```mach
+pub fun expr_is_runtime(rr: *ResolveResult, eid: ast_id.ExprId) bool;
+```
+
+whether a resolved expression names a runtime binding, a local or a parameter
+whose value no comptime evaluation sees; false for a name that resolved to none
+
 ## fun expression
 
 ```mach
