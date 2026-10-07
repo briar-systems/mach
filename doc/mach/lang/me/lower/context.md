@@ -215,10 +215,10 @@ pub rec LocalBinding;
 pub fun bind_local(lc: *LowerContext, sym: resolve.SymbolId, v: value.Value, secrecy: ct.BindSecrecy) err[fail.Fail];
 ```
 
-## fun lookup_local_name
+## fun local_binding
 
 ```mach
-pub fun lookup_local_name(lc: *LowerContext, name: intern.StrId) opt[LocalBinding];
+pub fun local_binding(lc: *LowerContext, sym: resolve.SymbolId) opt[LocalBinding];
 ```
 
 ## fun lookup_local

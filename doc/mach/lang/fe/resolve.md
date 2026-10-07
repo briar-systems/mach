@@ -224,6 +224,14 @@ binding_count: how many records `bindings` holds
 pub rec ResolveResult;
 ```
 
+## rec AsmBind
+
+```mach
+pub rec AsmBind;
+```
+
+one `{name}` of an asm block and the local it binds
+
 ## fun param_symbol
 
 ```mach
@@ -279,6 +287,14 @@ pub fun declaration_testing(a: *ast.Ast, did: ast_id.DeclId) bool;
 ```
 
 whether a declaration carries `#[testing]`, which confines every reference to it to test code
+
+## fun asm_binds_at
+
+```mach
+pub fun asm_binds_at(r: *ResolveResult, sid: ast_id.StmtId, out: *collections_vector.Vector[AsmBind]) err[fail.Fail];
+```
+
+the locals an asm block binds, in the order its body names them
 
 ## fun symbol_is_runtime
 
