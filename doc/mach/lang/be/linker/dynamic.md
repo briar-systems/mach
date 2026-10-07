@@ -102,11 +102,12 @@ name: intern.StrId) res[ImportName, fail.Fail];
 ## fun synthesize_local_imports
 
 ```mach
-pub fun synthesize_local_imports(s: *session.Session, prefix: str,
-modules: *target_of.ObjectImage, module_count: u32,
-mode: catalog_artifact.Kind, sec_base: *u32, atoms: *AtomPlan,
-out: *target_of.ObjectImage) res[bool, fail.Fail];
+pub fun synthesize_local_imports(ctx: *LinkContext, inputs: *InputSet, out: *target_of.ObjectImage) res[bool, fail.Fail];
 ```
+
+the pointer cells a COFF link synthesizes for the `__imp_` aliases its own
+definitions answer, so an import-address reference to a local definition
+reads its address, declined where the format names no import-address prefix
 
 ## fun dynstate_import_index
 
