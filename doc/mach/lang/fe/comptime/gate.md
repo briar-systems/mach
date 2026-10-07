@@ -148,12 +148,11 @@ pub rec GateVerdict;
 ## fun never_decided_message
 
 ```mach
-pub fun never_decided_message(a: *A.Allocator, itn: *intern.Interner, depends: intern.StrId) opt[str];
+pub fun never_decided_message(a: *A.Allocator, itn: *intern.Interner, depends: intern.StrId) res[str, fail.Fail];
 ```
 
 what a failed gate says when the name it waits on is a constant nowhere the
-module can see: the name's own message, which the caller frees, or none when
-the name cannot be read, where the verdict's message stands
+module can see, which the caller frees
 
 ## fun evaluate_gate
 

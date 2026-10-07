@@ -6,6 +6,9 @@
 pub rec Ast;
 ```
 
+one parsed file: each node kind and each side list lives in its own table, and a
+node is named by its index in that table
+
 ## fun init
 
 ```mach
@@ -17,6 +20,14 @@ pub fun init(a: *A.Allocator, file_id: lang_source.FileId) Ast;
 ```mach
 pub fun dnit(a: *Ast);
 ```
+
+## fun table_push
+
+```mach
+pub fun table_push[T](v: *Vector[T], value: T) res[u32, fail.Fail];
+```
+
+appends `value` to an AST table and answers the index it takes
 
 ## fun add_module
 
@@ -155,6 +166,8 @@ pub fun add_type_id(a: *Ast, id_: ast_id.TypeId) res[u32, fail.Fail];
 ```mach
 pub rec AstMark;
 ```
+
+the length of every table, to roll a failed parse back to
 
 ## fun mark
 

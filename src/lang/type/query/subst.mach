@@ -1,0 +1,407 @@
+# a generic's body under type arguments: substitution, and the field table an instance reads
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.module;
+use mach.lang.session;
+use lang_source: mach.lang.source;
+use mach.lang.type;
+use type_query: mach.lang.type.query;
+use mach.lang.type.query.mention;
+
+pub fun apply(q: *type_query.Query, body_type: type.TypeId, who: *type.GenericOwner, args: *type.TypeId, arg_count: u32) type.TypeId {
+    if (type.is_nil(body_type) || type.is_error(body_type)) { ret body_type; }
+
+    val opt_type: opt[*type.Type] = type.get(q.types, body_type);
+    if (!sel opt_type.some) { ret body_type; }
+    val t: *type.Type = opt_type.some;
+
+    if (t.kind == type.TYPE_GENERIC_PARAM) {
+        if (!type.param_owned_by(?t.data.generic_param, who)) { ret body_type; }
+        val index: u32 = t.data.generic_param.index;
+        if (index < arg_count) { ret args[index]; }
+        ret type.TYPE_ERROR;
+    }
+
+    if (t.kind == type.TYPE_POINTER) {
+        val original_base: type.TypeId = t.data.pointer.base;
+        val base:          type.TypeId = apply(q, original_base, who, args, arg_count);
+        if (type.same(base, original_base)) { ret body_type; }
+        ret interned(q, type.intern_pointer(q.types, base));
+    }
+
+    if (t.kind == type.TYPE_ARRAY) {
+        val original_base: type.TypeId = t.data.array.base;
+        val count:         u32         = t.data.array.count;
+        val base:          type.TypeId = apply(q, original_base, who, args, arg_count);
+        if (type.same(base, original_base)) { ret body_type; }
+        ret interned(q, type.intern_array(q.types, base, count));
+    }
+
+    if (t.kind == type.TYPE_SECRET) {
+        val original_base: type.TypeId = t.data.secret.base;
+        val base:          type.TypeId = apply(q, original_base, who, args, arg_count);
+        if (type.same(base, original_base)) { ret body_type; }
+        ret interned(q, type.intern_secret(q.types, base));
+    }
+
+    if (t.kind == type.TYPE_FUN)      { ret apply_fun(q, t, who, args, arg_count, body_type); }
+    if (t.kind == type.TYPE_INSTANCE) { ret apply_instance(q, t, who, args, arg_count, body_type); }
+
+    # a bare nominal mentioning parameters is an anonymous aggregate declared
+    # inside a generic (a named generic is spelled with its arguments or refused):
+    # its parameters are the enclosing declaration's, so it is instantiated
+    # with `who`'s arguments exactly when `who` is that declaration
+    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_TAG) {
+        if (!mention.has_param(q, body_type)) { ret body_type; }
+        val of: opt[type.GenericOwner] = mention.owner(q, body_type);
+        if (!sel of.some) { ret body_type; }
+        var owner: type.GenericOwner = of.some;
+        if (!type.generic_owner_equals(?owner, who)) { ret body_type; }
+        ret apply_aggregate(q, args, arg_count, body_type);
+    }
+
+    if (t.kind == type.TYPE_CASE_SELECTOR) {
+        val original_tag: type.TypeId = t.data.case_selector.tag_type;
+        val new_tag:      type.TypeId = apply(q, original_tag, who, args, arg_count);
+        if (type.same(new_tag, original_tag)) { ret body_type; }
+        ret interned(q, type.intern_case_selector(q.types, new_tag, t.data.case_selector.case_name, t.data.case_selector.case_index));
+    }
+    ret body_type;
+}
+
+# builds the field table of instance `tid` for the current projection, once
+pub fun ensure(q: *type_query.Query, tid: type.TypeId) {
+    val opt_existing: opt[*type.FieldTable] = type.field_table_for(q.types, tid);
+    if (sel opt_existing.some) {
+        if (opt_existing.some.epoch == type.field_epoch(q.types)) { ret; }
+    }
+
+    val opt_type: opt[*type.Type] = type.get(q.types, tid);
+    if (!sel opt_type.some) { ret; }
+    val t: *type.Type = opt_type.some;
+    if (t.kind != type.TYPE_INSTANCE) { ret; }
+
+    val gnom: type.TypeId = t.data.instance.nominal;
+    if (type.is_error(gnom)) { ret; }
+
+    table_build(q, tid, gnom);
+}
+
+fun table_build(q: *type_query.Query, instance: type.TypeId, gnom: type.TypeId) {
+    val opt_instance_table: opt[*type.FieldTable] = type.field_table_for(q.types, instance);
+    if (sel opt_instance_table.some) {
+        if (opt_instance_table.some.epoch == type.field_epoch(q.types)) { ret; }
+    }
+
+    val opt_generic_table: opt[*type.FieldTable] = type.field_table_for(q.types, gnom);
+    if (!sel opt_generic_table.some) { ret; }
+    val fields_len: u32 = opt_generic_table.some.fields_len;
+    # fields that mention no parameter (an unused one) copy over under no owner
+    val who_opt: opt[type.GenericOwner] = mention.owner(q, gnom);
+    var who:     type.GenericOwner;
+    if (sel who_opt.some) { who = who_opt.some; }
+
+    val opt_instance: opt[*type.Type] = type.get(q.types, instance);
+    if (!sel opt_instance.some) { ret; }
+    val instance_type: *type.Type = opt_instance.some;
+    if (instance_type.kind != type.TYPE_INSTANCE) { ret; }
+    val args_start: u32 = instance_type.data.instance.args_start;
+    val args_len:   u32 = instance_type.data.instance.args_len;
+
+    var args: *type.TypeId = nil;
+    fin {
+        if (args != nil) { A.deallocate[type.TypeId](q.types.a, args, args_len::usize); }
+    }
+    if (args_len > 0) {
+        val res_alloc_args: res[*type.TypeId, A.Error] = A.allocate[type.TypeId](q.types.a, args_len::usize);
+        if (sel res_alloc_args.err) {
+            type_query.refused(q, res_alloc_args.err);
+            ret;
+        }
+        args = res_alloc_args.ok;
+
+        var i: u32 = 0;
+        for (i < args_len) {
+            val opt_arg: opt[type.TypeId] = type.get_param(q.types, args_start + i);
+            if (!sel opt_arg.some) { ret; }
+            args[i] = opt_arg.some;
+            i       = i + 1;
+        }
+    }
+
+    if (fields_len == 0) {
+        val start_r: res[u32, fail.Fail] = type.field_table_stage(q.types, 0);
+        if (sel start_r.err) { type_query.failed(q, start_r.err); }
+        or (sel start_r.ok) {
+            val published: err[fail.Fail] = type.field_table_publish(q.types, instance, start_r.ok, 0);
+            if (sel published.err) { type_query.failed(q, published.err); }
+        }
+        ret;
+    }
+
+    val res_alloc_types: res[*type.TypeId, A.Error] = A.allocate[type.TypeId](q.types.a, fields_len::usize);
+    if (sel res_alloc_types.err) {
+        type_query.refused(q, res_alloc_types.err);
+        ret;
+    }
+    val field_types: *type.TypeId = res_alloc_types.ok;
+    fin { A.deallocate[type.TypeId](q.types.a, field_types, fields_len::usize); }
+
+    val res_alloc_names: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](q.types.a, fields_len::usize);
+    if (sel res_alloc_names.err) {
+        type_query.refused(q, res_alloc_names.err);
+        ret;
+    }
+    val field_names: *intern.StrId = res_alloc_names.ok;
+    fin { A.deallocate[intern.StrId](q.types.a, field_names, fields_len::usize); }
+
+    var i: u32 = 0;
+    for (i < fields_len) {
+        val opt_entry: opt[*type.FieldEntry] = type.field_at(q.types, gnom, i);
+        if (!sel opt_entry.some) {
+            field_names[i] = intern.STR_NIL;
+            field_types[i] = type.TYPE_ERROR;
+        }
+        or (sel opt_entry.some) {
+            val entry: *type.FieldEntry = opt_entry.some;
+            field_names[i] = entry.name;
+            field_types[i] = apply(q, entry.ty, ?who, args, args_len);
+        }
+        i = i + 1;
+    }
+
+    val start_r: res[u32, fail.Fail] = type.field_table_stage(q.types, fields_len);
+    if (sel start_r.err) { type_query.failed(q, start_r.err); }
+    or (sel start_r.ok) {
+        if (!sel q.status.kind.internal) {
+            val start:  u32  = start_r.ok;
+            var staged: bool = true;
+            i = 0;
+            for (i < fields_len) {
+                val pushed: err[fail.Fail] = type.field_table_stage_push(q.types, field_names[i], field_types[i]);
+                if (sel pushed.err) {
+                    type_query.failed(q, pushed.err);
+                    staged = false;
+                    brk;
+                }
+                i = i + 1;
+            }
+            if (staged) {
+                val published: err[fail.Fail] = type.field_table_publish(q.types, instance, start, fields_len);
+                if (sel published.err) { type_query.failed(q, published.err); }
+            }
+        }
+    }
+}
+
+fun apply_fun(q: *type_query.Query, t: *type.Type, who: *type.GenericOwner, args: *type.TypeId, arg_count: u32, original: type.TypeId) type.TypeId {
+    val original_ret: type.TypeId = t.data.fn.ret_type;
+    val params_start: u32         = t.data.fn.params_start;
+    val params_len:   u32         = t.data.fn.params_len;
+
+    var changed:   bool         = false;
+    var param_buf: *type.TypeId = nil;
+    if (params_len > 0) {
+        val res_alloc_params: res[*type.TypeId, A.Error] = A.allocate[type.TypeId](q.types.a, params_len::usize);
+        if (sel res_alloc_params.err) {
+            type_query.refused(q, res_alloc_params.err);
+            ret type.TYPE_ERROR;
+        }
+        param_buf = res_alloc_params.ok;
+
+        var i: u32 = 0;
+        for (i < params_len) {
+            val opt_param: opt[type.TypeId] = type.get_param(q.types, params_start + i);
+            if (!sel opt_param.some) {
+                A.deallocate[type.TypeId](q.types.a, param_buf, params_len::usize);
+                ret type.TYPE_ERROR;
+            }
+            val original_param: type.TypeId = opt_param.some;
+            param_buf[i] = apply(q, original_param, who, args, arg_count);
+            if (!type.same(param_buf[i], original_param)) { changed = true; }
+            i = i + 1;
+        }
+    }
+
+    val new_ret: type.TypeId = apply(q, original_ret, who, args, arg_count);
+    if (!type.same(new_ret, original_ret)) { changed = true; }
+
+    if (!changed) {
+        if (params_len > 0) { A.deallocate[type.TypeId](q.types.a, param_buf, params_len::usize); }
+        ret original;
+    }
+
+    val res_fun: res[type.TypeId, fail.Fail] = type.intern_function(q.types, new_ret, param_buf, params_len, t.data.fn.c_variadic);
+    if (params_len > 0) { A.deallocate[type.TypeId](q.types.a, param_buf, params_len::usize); }
+    ret interned(q, res_fun);
+}
+
+fun apply_instance(q: *type_query.Query, t: *type.Type, who: *type.GenericOwner, args: *type.TypeId, arg_count: u32, original: type.TypeId) type.TypeId {
+    val nominal:    type.TypeId = t.data.instance.nominal;
+    val args_start: u32         = t.data.instance.args_start;
+    val args_len:   u32         = t.data.instance.args_len;
+
+    if (args_len == 0) { ret original; }
+
+    val res_alloc_args: res[*type.TypeId, A.Error] = A.allocate[type.TypeId](q.types.a, args_len::usize);
+    if (sel res_alloc_args.err) {
+        type_query.refused(q, res_alloc_args.err);
+        ret type.TYPE_ERROR;
+    }
+    val arg_buf: *type.TypeId = res_alloc_args.ok;
+
+    var changed: bool = false;
+    var i:       u32  = 0;
+    for (i < args_len) {
+        val opt_arg: opt[type.TypeId] = type.get_param(q.types, args_start + i);
+        if (!sel opt_arg.some) {
+            A.deallocate[type.TypeId](q.types.a, arg_buf, args_len::usize);
+            ret type.TYPE_ERROR;
+        }
+        val original_arg: type.TypeId = opt_arg.some;
+        arg_buf[i] = apply(q, original_arg, who, args, arg_count);
+        if (!type.same(arg_buf[i], original_arg)) { changed = true; }
+        i = i + 1;
+    }
+
+    if (!changed) {
+        A.deallocate[type.TypeId](q.types.a, arg_buf, args_len::usize);
+        ret original;
+    }
+
+    val res_instance: res[type.TypeId, fail.Fail] = type.intern_instance(q.types, nominal, arg_buf, args_len);
+    A.deallocate[type.TypeId](q.types.a, arg_buf, args_len::usize);
+    ret interned(q, res_instance);
+}
+
+fun apply_aggregate(q: *type_query.Query, args: *type.TypeId, arg_count: u32, original: type.TypeId) type.TypeId {
+    val res_instance: res[type.TypeId, fail.Fail] = type.intern_instance(q.types, original, args, arg_count);
+    if (sel res_instance.err) {
+        type_query.failed(q, res_instance.err);
+        ret type.TYPE_ERROR;
+    }
+    val instance: type.TypeId = res_instance.ok;
+
+    table_build(q, instance, original);
+    ret instance;
+}
+
+fun interned(q: *type_query.Query, outcome: res[type.TypeId, fail.Fail]) type.TypeId {
+    if (sel outcome.err) {
+        type_query.failed(q, outcome.err);
+        ret type.TYPE_ERROR;
+    }
+    ret outcome.ok;
+}
+
+# `tid` under `who`'s arguments, or itself when there are none
+pub fun apply_or_self(q: *type_query.Query, tid: type.TypeId, who: *type.GenericOwner, args: *type.TypeId, arg_len: u32) type.TypeId {
+    if (args == nil || arg_len == 0) { ret tid; }
+    ret apply(q, tid, who, args, arg_len);
+}
+
+# replace `who`'s parameters in `body_type` with `args`, position for position;
+# a parameter of any other declaration (an enclosing generic's, in an open
+# instance) stays, so a substituted type reads as the identity under a second pass
+pub fun substitute(s: *session.Session, body_type: type.TypeId, who: *type.GenericOwner, args: *type.TypeId, arg_count: u32) res[type.TypeId, fail.Fail] {
+    var status: fail.PhaseStatus = fail.accepted();
+    var q:      type_query.Query = type_query.Query{types: ?s.types, facts: ?s.type_facts, status: ?status};
+    ret type_query.answer[type.TypeId](?q, apply(?q, body_type, who, args, arg_count));
+}
+
+pub fun ensure_fields(s: *session.Session, tid: type.TypeId) err[fail.Fail] {
+    var status: fail.PhaseStatus = fail.accepted();
+    var q:      type_query.Query = type_query.Query{types: ?s.types, facts: ?s.type_facts, status: ?status};
+    ensure(?q, tid);
+    ret type_query.settled(?q);
+}
+
+# substitution is keyed by the declaration whose parameters it replaces.
+# a parameter of another declaration at the same index stays, a type substituted
+# once reads as itself under a second pass with the same owner, and an anonymous
+# aggregate is instantiated by the declaration that encloses it only
+test substitute__replaces_only_the_owners_parameters {
+    var alloc: A.Allocator;
+    val made:  err[A.Error] = page.make(?alloc);
+    if (sel made.err) { ret 1; }
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+
+    val at: type.TypeOwner = type.TypeOwner{module: module.stable_id(3), file: lang_source.file_id(1)};
+    # fun callee[T] (name 10) and fun caller[U, W] (name 11)
+    var callee: type.GenericOwner           = type.GenericOwner{owner: at, name: intern.str_id(10), kind: type.TYPE_FUN};
+    var caller: type.GenericOwner           = type.GenericOwner{owner: at, name: intern.str_id(11), kind: type.TYPE_FUN};
+    val t_r:    res[type.TypeId, fail.Fail] = type.intern_generic_param(?s.types, intern.str_id(1), at, intern.str_id(10), type.TYPE_FUN, 0);
+    if (sel t_r.err) { ret 2; }
+    val t:   type.TypeId                 = t_r.ok;
+    val u_r: res[type.TypeId, fail.Fail] = type.intern_generic_param(?s.types, intern.str_id(2), at, intern.str_id(11), type.TYPE_FUN, 0);
+    if (sel u_r.err) { ret 2; }
+    val u:   type.TypeId                 = u_r.ok;
+    val w_r: res[type.TypeId, fail.Fail] = type.intern_generic_param(?s.types, intern.str_id(3), at, intern.str_id(11), type.TYPE_FUN, 1);
+    if (sel w_r.err) { ret 2; }
+    val w:     type.TypeId      = w_r.ok;
+    val u32_o: opt[type.TypeId] = type.prim(?s.types, type.TYPE_U32);
+    if (!sel u32_o.some) { ret 3; }
+    val i64_o: opt[type.TypeId] = type.prim(?s.types, type.TYPE_I64);
+    if (!sel i64_o.some) { ret 3; }
+    val t_u32: type.TypeId = u32_o.some;
+    val t_i64: type.TypeId = i64_o.some;
+
+    # the open instance callee[caller.W]: callee.T (index 0) becomes caller.W, and
+    # caller.U (also index 0) is not the callee's, so it is left as it is
+    var w_args: [1]type.TypeId              = [1]type.TypeId{w};
+    val once:   res[type.TypeId, fail.Fail] = substitute(?s, t, ?callee, ?w_args[0], 1);
+    if (sel once.err)           { ret 5; }
+    if (!type.same(once.ok, w)) { ret 5; }
+    val foreign: res[type.TypeId, fail.Fail] = substitute(?s, u, ?callee, ?w_args[0], 1);
+    if (sel foreign.err)           { ret 6; }
+    if (!type.same(foreign.ok, u)) { ret 6; }
+    # a second pass with the callee's arguments over the substituted type is the identity
+    val twice: res[type.TypeId, fail.Fail] = substitute(?s, w, ?callee, ?w_args[0], 1);
+    if (sel twice.err)           { ret 7; }
+    if (!type.same(twice.ok, w)) { ret 7; }
+    # and the caller's own instantiation resolves caller.W by the caller's position
+    var c_args: [2]type.TypeId              = [2]type.TypeId{t_u32, t_i64};
+    val closed: res[type.TypeId, fail.Fail] = substitute(?s, w, ?caller, ?c_args[0], 2);
+    if (sel closed.err)               { ret 8; }
+    if (!type.same(closed.ok, t_i64)) { ret 8; }
+
+    # an anonymous aggregate `uni { a: U; }` declared inside caller: its
+    # parameters are caller's, so callee's arguments leave it alone and
+    # caller's instantiate it
+    val anon_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?s.types, intern.STR_NIL, at, type.TYPE_UNI);
+    if (sel anon_r.err) { ret 9; }
+    val anon:   type.TypeId         = anon_r.ok;
+    val staged: res[u32, fail.Fail] = type.field_table_stage(?s.types, 1);
+    if (sel staged.err) { ret 9; }
+    val pushed: err[fail.Fail] = type.field_table_stage_push(?s.types, intern.str_id(1), u);
+    if (sel pushed.err) { ret 9; }
+    val published: err[fail.Fail] = type.field_table_publish(?s.types, anon, staged.ok, 1);
+    if (sel published.err) { ret 9; }
+    val by_callee: res[type.TypeId, fail.Fail] = substitute(?s, anon, ?callee, ?w_args[0], 1);
+    if (sel by_callee.err)              { ret 10; }
+    if (!type.same(by_callee.ok, anon)) { ret 10; }
+    val by_caller: res[type.TypeId, fail.Fail] = substitute(?s, anon, ?caller, ?c_args[0], 2);
+    if (sel by_caller.err) { ret 11; }
+    val inst_o: opt[*type.Type] = type.get(?s.types, by_caller.ok);
+    if (!sel inst_o.some)                                                                              { ret 11; }
+    if (inst_o.some.kind != type.TYPE_INSTANCE || !type.same(inst_o.some.data.instance.nominal, anon)) { ret 11; }
+    val fe: opt[*type.FieldEntry] = type.field_at(?s.types, by_caller.ok, 0);
+    if (!sel fe.some)                  { ret 12; }
+    if (!type.same(fe.some.ty, t_u32)) { ret 12; }
+
+    ret 0;
+}
