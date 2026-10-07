@@ -410,11 +410,29 @@ pub fun reported_since(sc: *SemaContext, mark: u64) bool;
 pub fun report_note(sc: *SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, message: str, note: str);
 ```
 
-## fun report_numbered
+## fun text
 
 ```mach
-pub fun report_numbered(sc: *SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str, n: usize, suffix: str, fallback: str);
+pub fun text(sc: *SemaContext, fmt: str, args: ...) opt[str];
 ```
+
+`fmt` formatted with `args`, owned by the caller and released with `text_free`; a refused
+format fails the phase as an internal failure and gives none
+
+## fun text_free
+
+```mach
+pub fun text_free(sc: *SemaContext, t: str);
+```
+
+## fun reportf
+
+```mach
+pub fun reportf(sc: *SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, fmt: str, args: ...);
+```
+
+a diagnostic whose message is `fmt` formatted with `args`; a refused format fails the
+phase as an internal failure, here and nowhere else
 
 ## fun field_table_stage
 
@@ -446,19 +464,13 @@ pub fun field_table_for(sc: *SemaContext, ty: type.TypeId) opt[*FieldTable];
 pub fun field_lookup(sc: *SemaContext, ty: type.TypeId, name: intern.StrId) opt[type.TypeId];
 ```
 
-## fun resolve_field_member
+## fun type_store
 
 ```mach
-pub fun resolve_field_member(sc: *SemaContext, owner: u32, index: u32, pick: u8) res[opt[comptime.CTValue], comptime.EvalFail];
+pub fun type_store(sc: *SemaContext) *type.TypeInterner;
 ```
 
-## fun field_type_by_name
-
-```mach
-pub fun field_type_by_name(types: *type.TypeInterner, owner_ty: type.TypeId, name: intern.StrId) opt[comptime.CTValue];
-```
-
-the declared type of a field or case payload named on an owner; none for an unknown name or a payloadless case
+the type store a comptime evaluation inside this walk reads
 
 ## fun resolve_type_comparison_operand
 
