@@ -1,6 +1,7 @@
 use diagnostic_kind: mach.lang.diagnostic.kind;
 use mach.lang.fail;
 use mach.lang.intern;
+use catalog_arch:    mach.lang.target.catalog.arch;
 use isa_arm64_reloc: mach.lang.target.isa.arm64.reloc;
 use target_of:       mach.lang.target.of;
 use mach.lang.target.of.bin;
@@ -76,8 +77,7 @@ pub fun got_import_count(dyn: *target_of.DynamicInfo) u32 {
 }
 
 pub fun macho_stub_size(arch_id: u32) usize {
-    if (macho_format.arch_is_arm64(arch_id)) { ret macho_format.MACHO_ARM64_STUB_SIZE; }
-    ret macho_format.MACHO_X86_STUB_SIZE;
+    ret macho_format.row_for(arch_id).stub_size;
 }
 
 # the __TEXT,__stubs table the linker reserves at the end of the code, so a
@@ -100,22 +100,29 @@ pub fun write_macho_stub(buf: *u8, arch_id: u32, stub_off: usize, stub_va: u64, 
     if (stub_va > 0x7FFFFFFFFFFFFFFF || slot_va > 0x7FFFFFFFFFFFFFFF) {
         ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_RELOCATION_OVERFLOW, "a stub or its GOT slot lies outside the signed address range")};
     }
-    if (macho_format.arch_is_arm64(arch_id)) {
-        val slot_page: u64 = (slot_va >> 12) << 12;
-        val stub_page: u64 = (stub_va >> 12) << 12;
-        val delta:     i64 = (slot_page::i64) - (stub_page::i64);
-        if (delta < -4294967296 || delta >= 4294967296) {
-            ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_RELOCATION_OVERFLOW, "a stub's GOT slot lies outside the adrp +-4GB range")};
-        }
-        val imm21: u64 = ((delta >> 12)::u64) & 0x1FFFFF;
-        val immlo: u32 = (imm21 & 0x3)::u32;
-        val immhi: u32 = ((imm21 >> 2) & 0x7FFFF)::u32;
-        bin.write_u32_le(buf, stub_off, 0x90000000 | (immlo << 29) | (immhi << 5) | 16);
-        val imm12: u32 = (((slot_va & 0xFFF) >> 3) & 0xFFF)::u32;
-        bin.write_u32_le(buf, stub_off + 4, 0xF9400000 | (imm12 << 10) | (16 << 5) | 16);
-        bin.write_u32_le(buf, stub_off + 8, 0xD61F0200);
-        ret err[fail.Fail].ok{};
+    ret stubs_for(arch_id).write(buf, stub_off, stub_va, slot_va);
+}
+
+# adrp x16, slot@PAGE; ldr x16, [x16, slot@PAGEOFF]; br x16
+fun arm64_stub(buf: *u8, stub_off: usize, stub_va: u64, slot_va: u64) err[fail.Fail] {
+    val slot_page: u64 = (slot_va >> 12) << 12;
+    val stub_page: u64 = (stub_va >> 12) << 12;
+    val delta:     i64 = (slot_page::i64) - (stub_page::i64);
+    if (delta < -4294967296 || delta >= 4294967296) {
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_RELOCATION_OVERFLOW, "a stub's GOT slot lies outside the adrp +-4GB range")};
     }
+    val imm21: u64 = ((delta >> 12)::u64) & 0x1FFFFF;
+    val immlo: u32 = (imm21 & 0x3)::u32;
+    val immhi: u32 = ((imm21 >> 2) & 0x7FFFF)::u32;
+    bin.write_u32_le(buf, stub_off, 0x90000000 | (immlo << 29) | (immhi << 5) | 16);
+    val imm12: u32 = (((slot_va & 0xFFF) >> 3) & 0xFFF)::u32;
+    bin.write_u32_le(buf, stub_off + 4, 0xF9400000 | (imm12 << 10) | (16 << 5) | 16);
+    bin.write_u32_le(buf, stub_off + 8, 0xD61F0200);
+    ret err[fail.Fail].ok{};
+}
+
+# jmp [rip + slot]
+fun x64_stub(buf: *u8, stub_off: usize, stub_va: u64, slot_va: u64) err[fail.Fail] {
     val disp: i64 = slot_va::i64 - (stub_va + 6)::i64;
     if (disp > 2147483647 || disp < -2147483648) {
         ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_RELOCATION_OVERFLOW, "a stub's GOT slot lies outside the rip-relative +-2GB range")};
@@ -124,6 +131,52 @@ pub fun write_macho_stub(buf: *u8, arch_id: u32, stub_off: usize, stub_va: u64, 
     buf[stub_off + 1] = 0x25;
     bin.write_u32_le(buf, stub_off + 2, (disp::u64)::u32);
     ret err[fail.Fail].ok{};
+}
+
+# a call site bound to its stub: a b or bl's 26-bit word displacement
+fun arm64_call(buf: *u8, file_off: usize, disp: i64) err[fail.Fail] {
+    val lim: i64 = 134217728;
+    if (disp < -lim || disp >= lim || (disp & 3) != 0) {
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_RELOCATION_OVERFLOW, "dynamic call-site displacement overflows a 26-bit branch")};
+    }
+    val word:  u32 = bin.read_u32_le(buf, file_off);
+    val imm26: u32 = (((disp::u64) & 0x0FFFFFFC) >> 2)::u32;
+    bin.write_u32_le(buf, file_off, (word & 0xFC000000) | imm26);
+    ret err[fail.Fail].ok{};
+}
+
+# a call site bound to its stub: a call's 32-bit displacement
+fun x64_call(buf: *u8, file_off: usize, disp: i64) err[fail.Fail] {
+    if (disp > 2147483647 || disp < -2147483648) {
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_RELOCATION_OVERFLOW, "dynamic call-site displacement overflows 32 bits")};
+    }
+    bin.write_u32_le(buf, file_off, (disp::u64)::u32);
+    ret err[fail.Fail].ok{};
+}
+
+# how the linker writes an instruction set's import stubs and binds the code
+# that reaches them: a call by its displacement, and the parts of an import's
+# address through the instruction set's relocations, nil where none bind
+rec StubRow {
+    arch:         u32;
+    write:        fun(*u8, usize, u64, u64) err[fail.Fail];
+    bind_call:    fun(*u8, usize, i64) err[fail.Fail];
+    bind_address: target_of.ApplyRelocFn;
+}
+
+val STUB_ROW_COUNT: usize                   = 2;
+val STUB_ROWS:      [STUB_ROW_COUNT]StubRow = [STUB_ROW_COUNT]StubRow{
+    StubRow{arch: catalog_arch.X86_64, write: x64_stub, bind_call: x64_call, bind_address: nil},
+    StubRow{arch: catalog_arch.AARCH64, write: arm64_stub, bind_call: arm64_call, bind_address: isa_arm64_reloc.apply_reloc},
+};
+
+fun stubs_for(arch_id: u32) *StubRow {
+    var i: usize = 0;
+    for (i < STUB_ROW_COUNT) {
+        if (STUB_ROWS[i].arch == arch_id) { ret ?STUB_ROWS[i]; }
+        i = i + 1;
+    }
+    ret nil;
 }
 
 pub fun dylib_ordinal_for(dyn: *target_of.DynamicInfo, import_index: u32) u32 {
@@ -338,31 +391,21 @@ pub fun patch_macho_fixups(buf: *u8, arch_id: u32, lay: *MachoDynLayout, dyn: *t
         val disp:     i64   = (stub_va::i64) + fx.addend - (fx.patch_vaddr::i64);
         val file_off: usize = seg_offsets[fx.seg_index] + fx.seg_offset::usize;
 
+        val stubs: *StubRow = stubs_for(arch_id);
         if (target_of.is_pcrel_address_kind(fx.kind)) {
             # one part of a function import's address, bound to its stub
             var patched: res[bool, of_reloc.RelocError] = res[bool, of_reloc.RelocError].err{of_reloc.RELOC_UNSUPPORTED};
-            if (macho_format.arch_is_arm64(arch_id)) {
-                patched = isa_arm64_reloc.apply_reloc(fx.kind, (buf::usize + file_off)::*u8, 0, 4,
+            if (stubs.bind_address != nil) {
+                patched = stubs.bind_address(fx.kind, (buf::usize + file_off)::*u8, 0, 4,
                     of_reloc.target(stub_va, 0, 0), fx.addend, fx.patch_vaddr, 0);
             }
             if (sel patched.err) {
                 ret err[fail.Fail].err{fail.message("a function import's address cannot be bound to its stub")};
             }
         }
-        or (macho_format.arch_is_arm64(arch_id)) {
-            val lim: i64 = 134217728;
-            if (disp < -lim || disp >= lim || (disp & 3) != 0) {
-                ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_RELOCATION_OVERFLOW, "dynamic call-site displacement overflows a 26-bit branch")};
-            }
-            val word:  u32 = bin.read_u32_le(buf, file_off);
-            val imm26: u32 = (((disp::u64) & 0x0FFFFFFC) >> 2)::u32;
-            bin.write_u32_le(buf, file_off, (word & 0xFC000000) | imm26);
-        }
         or {
-            if (disp > 2147483647 || disp < -2147483648) {
-                ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_RELOCATION_OVERFLOW, "dynamic call-site displacement overflows 32 bits")};
-            }
-            bin.write_u32_le(buf, file_off, (disp::u64)::u32);
+            val bound: err[fail.Fail] = stubs.bind_call(buf, file_off, disp);
+            if (sel bound.err) { ret bound; }
         }
         i = i + 1;
     }
