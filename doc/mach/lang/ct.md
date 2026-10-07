@@ -90,6 +90,27 @@ the capability a target must provide for an operation to be constant-time,
 absent for an operation outside the catalog: an unknown operation is never
 answered with "no capability needed"
 
+## fun latency_refusal
+
+```mach
+pub fun latency_refusal(op: CtOp) opt[str];
+```
+
+what a secret operand of `op` does where the target does not provide its capability,
+worded to follow the name of the code that does it; every stage that refuses one reads
+it here. none for an operation outside the catalog
+
+## val DIT_REFUSAL
+
+```mach
+pub val DIT_REFUSAL: str =
+"uses a secret value in an integer multiply whose timing is data-independent only under;
+```
+
+the refusal of a secret multiply the instruction set declares data-independent only
+under a mode the operating system declares no guarantee for, formatted with the mode,
+the instruction set and the operating system
+
 ## fun cap_at_sema
 
 ```mach
