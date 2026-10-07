@@ -1,175 +1,430 @@
-# a test fixture that checks one module held in memory with the front end alone
-use std.types.bool.bool;
+# a test fixture that types modules held in memory with the front end alone
 use mach.lang.diagnostic;
 use mach.lang.fail;
 use mach.lang.fe.comptime;
 #[testing]
 use fe_load: mach.lang.fe.load;
 use mach.lang.fe.resolve;
+use mach.lang.fe.sema.fields;
 use sema_module:  mach.lang.fe.sema.module;
 use sema_product: mach.lang.fe.sema.product;
-use mach.lang.intern;
+use sema_surface: mach.lang.fe.sema.surface;
 use mach.lang.module;
 use mach.lang.session;
-#[testing]
-use mach.lang.source.provider.resident;
 use A: std.allocator;
 use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std.system.panic.panic;
+use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
-use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.StrError;
 use std.types.string.str;
-use std.types.string.str_contains;
+use std.types.string.str_join;
 
-# one module checked by the front end alone: its text held in memory as the
-# module `t.main`, loaded, resolved and typed in a fresh session whose store
-# holds the diagnostics; it must not move once made
+# one resolved module as far as typing took it
 #[testing]
-pub rec Checked {
-    alloc:  A.Allocator;
-    s:      session.Session;
-    held:   resident.Resident;
-    host:   fe_load.Fixture;
-    loader: fe_load.Loader;
-    mid:    session.ModuleId;
-    rr:     resolve.ResolveResult;
-    sr:     sema_product.SemaResult;
-    view:   comptime.ComptimeCtx;
-    # how far it was made: the session, then what reads the session
-    opened:   bool;
-    hosted:   bool;
-    resolved: bool;
+rec Typed {
+    sr: sema_product.SemaResult;
+    # the published surfaces of every module it reaches, which typing and lowering read
+    surfaces: [resolve.FIXTURE_MODULES]*sema_product.ModuleSema;
+    reached:  u32;
+    surface:  sema_product.ModuleSema;
+    view:     comptime.ComptimeCtx;
     typed:    bool;
+    surfaced: bool;
     viewed:   bool;
 }
 
+# modules resolved by the resolve fixture, then typed and published in the same order unless
+# the load or a resolution rejected them, as a build stops there; it must not move once made
 #[testing]
-fun checked_module(c: *Checked) *fe_load.Module {
-    ret c.host.rows[module.index(c.mid)].load;
+pub rec Checked {
+    r:     resolve.Resolved;
+    mods:  [resolve.FIXTURE_MODULES]Typed;
+    count: u32;
+    # the standing of the typing of every module
+    typed: fail.PhaseStatus;
 }
 
 #[testing]
 fun checked_definition(raw: ptr, origin: session.ModuleId, phase: sema_product.DefinitionPhase) res[sema_product.Definition, fail.Fail] {
     val c: *Checked = raw::*Checked;
-    if (!module.same(origin, c.mid)) {
-        ret res[sema_product.Definition, fail.Fail].err{fail.message("a checked module reads no other module's definitions")};
+    if (module.is_nil(origin) || module.index(origin) >= c.r.host.count) {
+        ret res[sema_product.Definition, fail.Fail].err{fail.message("a checked definition names a module the check does not hold")};
     }
-    val row: fe_load.Row             = c.host.rows[module.index(c.mid)];
+    val row: fe_load.Row             = resolve.resolved_row(?c.r, origin);
     var d:   sema_product.Definition = sema_product.Definition{
-        parsed: resolve.ParsedDefinition{a: row.syntax, owner: resolve.type_owner(?c.s, c.mid, row.file), incarnation: row.syntax.incarnation},
-        origin: origin, decorators: ?checked_module(c).ctx
+        parsed: resolve.ParsedDefinition{a: row.syntax, owner: resolve.type_owner(?c.r.s, origin, row.file), incarnation: row.syntax.incarnation},
+        origin: origin, decorators: ?row.load.ctx
     };
-    if (phase >= sema_product.DEFINITION_RESOLVED) { d.rr = ?c.rr; }
+    if (phase < sema_product.DEFINITION_RESOLVED) { ret res[sema_product.Definition, fail.Fail].ok{d}; }
+    val place: u32 = resolve.resolved_place(?c.r, origin);
+    if (place == resolve.FIXTURE_MODULES) { ret res[sema_product.Definition, fail.Fail].err{fail.message("a checked definition is read before its module is resolved")}; }
+    d.rr = ?c.r.results[place];
     if (phase == sema_product.DEFINITION_TYPED) {
-        d.sr = ?c.sr;
-        if (c.viewed) { comptime.dnit(?c.view); }
-        c.viewed = true;
-        c.view   = comptime.stage_init(?checked_module(c).ctx, comptime.STAGE_LOWER, ?c.alloc);
-        comptime.layer_set(?c.view, comptime.STAGE_RESOLVE, ?c.rr.constants);
-        comptime.layer_set(?c.view, comptime.STAGE_SEMA, ?c.sr.constants);
-        d.ctx = ?c.view;
+        val t: *Typed = ?c.mods[place];
+        if (place >= c.count || !t.typed) { ret res[sema_product.Definition, fail.Fail].err{fail.message("a checked definition is read before its module is typed")}; }
+        d.sr = ?t.sr;
+        val scoped: res[*comptime.ComptimeCtx, fail.Fail] = checked_scope(c, place);
+        if (sel scoped.err) { ret res[sema_product.Definition, fail.Fail].err{scoped.err}; }
+        d.ctx = scoped.ok;
     }
     ret res[sema_product.Definition, fail.Fail].ok{d};
 }
 
-# check `text` into `c`, released with checked_dnit also when this fails; a
-# failure is the fixture's own, and the module's verdict is in the diagnostics
+# the scope lowering binds the module typed at `place` in, made on the first call, as a build
+# keeps one per module for its definition reads and its lowering
+#[testing]
+pub fun checked_scope(c: *Checked, place: u32) res[*comptime.ComptimeCtx, fail.Fail] {
+    val t:     *Typed             = ?c.mods[place];
+    val row:   fe_load.Row        = resolve.resolved_row(?c.r, c.r.order[place]);
+    var typed: *comptime.Bindings = nil;
+    if (t.typed) { typed = ?t.sr.constants; }
+    val prepared: err[fail.Fail] = comptime.lowering_prepare(?t.view, ?t.viewed, ?row.load.ctx, row.syntax.exprs.len::u32, ?c.r.results[place].constants, typed);
+    if (sel prepared.err) { ret res[*comptime.ComptimeCtx, fail.Fail].err{prepared.err}; }
+    ret res[*comptime.ComptimeCtx, fail.Fail].ok{?t.view};
+}
+
+#[testing]
+fun origin_stable(raw: ptr, mid: session.ModuleId) session.StableModuleId {
+    val c: *Checked = raw::*Checked;
+    if (module.is_nil(mid) || module.index(mid) >= c.r.host.count) { ret session.STABLE_MODULE_NIL; }
+    ret resolve.resolved_row(?c.r, mid).stable;
+}
+
+# a published surface copied out for its reader, who owns the copy
+#[testing]
+fun origin_read(raw: ptr, mid: session.ModuleId, a: *A.Allocator) res[sema_product.ModuleSema, fail.Fail] {
+    val c:     *Checked = raw::*Checked;
+    val place: u32      = resolve.resolved_place(?c.r, mid);
+    if (place >= c.count) { ret res[sema_product.ModuleSema, fail.Fail].err{fail.message("a forwarded surface is read before its module is typed")}; }
+    val t: *Typed = ?c.mods[place];
+    if (!t.surfaced) { ret res[sema_product.ModuleSema, fail.Fail].err{fail.phase_failure(t.sr.status)}; }
+    var copy: sema_product.ModuleSema = sema_product.module_sema_init(a, t.surface.path, t.surface.module);
+    var i:    usize                   = 0;
+    for (i < t.surface.exports.len) {
+        val pushed: res[usize, A.Error] = collections_vector.push[sema_product.TypeExport](?copy.exports, t.surface.exports.data[i]);
+        if (sel pushed.err) {
+            sema_product.module_sema_dnit(?copy);
+            ret res[sema_product.ModuleSema, fail.Fail].err{fail.refused(pushed.err)};
+        }
+        i = i + 1;
+    }
+    ret res[sema_product.ModuleSema, fail.Fail].ok{copy};
+}
+
+#[testing]
+fun closure_add(c: *Checked, mid: session.ModuleId, out: *session.ModuleId, len: u32) u32 {
+    if (module.is_nil(mid) || module.index(mid) >= c.r.host.count) { ret len; }
+    var i: u32 = 0;
+    for (i < len) {
+        if (module.same(out[i], mid)) { ret len; }
+        i = i + 1;
+    }
+    out[len] = mid;
+    ret len + 1;
+}
+
+# every module `m` reaches through its imports, each once
+#[testing]
+fun closure_of(c: *Checked, m: *fe_load.Module, out: *session.ModuleId) u32 {
+    var len: u32   = 0;
+    var i:   usize = 0;
+    for (i < m.deps.len) {
+        len = closure_add(c, fe_load.module_of(?c.r.loader, m.deps.data[i]), out, len);
+        i   = i + 1;
+    }
+    var head: u32 = 0;
+    for (head < len) {
+        val dep: *fe_load.Module = resolve.resolved_row(?c.r, out[head]).load;
+        var j:   usize           = 0;
+        for (j < dep.deps.len) {
+            len = closure_add(c, fe_load.module_of(?c.r.loader, dep.deps.data[j]), out, len);
+            j   = j + 1;
+        }
+        head = head + 1;
+    }
+    ret len;
+}
+
+# what typing or lowering the module at `place` reads of the others: their definitions and
+# the surfaces it reaches; the caller releases the reader with sema_product.reader_dnit
+#[testing]
+pub fun checked_deps(c: *Checked, place: u32) sema_product.SemaDeps {
+    var deps: sema_product.SemaDeps = sema_product.SemaDeps{};
+    deps.definitions = sema_product.reader_init(c::ptr, checked_definition, ?c.r.alloc);
+    deps.entries     = ?c.mods[place].surfaces[0];
+    deps.count       = c.mods[place].reached;
+    ret deps;
+}
+
+# type and publish the module resolved at `place` over the surfaces of every module it
+# reaches; one that reaches a rejected module is left untyped and rejected, as its importer is
+#[testing]
+fun type_one(c: *Checked, place: u32) err[fail.Fail] {
+    val t:     *Typed           = ?c.mods[place];
+    val mid:   session.ModuleId = c.r.order[place];
+    val row:   fe_load.Row      = resolve.resolved_row(?c.r, mid);
+    val m:     *fe_load.Module  = row.load;
+    var reach: [resolve.FIXTURE_MODULES]session.ModuleId;
+    t.reached = closure_of(c, m, ?reach[0]);
+    var i: u32 = 0;
+    for (i < t.reached) {
+        val at: u32 = resolve.resolved_place(?c.r, reach[i]);
+        if (at >= c.count) { ret err[fail.Fail].err{fail.message("a checked module imports one that is not typed before it")}; }
+        if (!c.mods[at].surfaced) {
+            fail.reject(?c.typed);
+            ret err[fail.Fail].ok{};
+        }
+        t.surfaces[i] = ?c.mods[at].surface;
+        i             = i + 1;
+    }
+    var sdeps: sema_product.SemaDeps = checked_deps(c, place);
+    fin { sema_product.reader_dnit(?sdeps.definitions); }
+    val sr: res[sema_product.SemaResult, fail.Fail] = sema_module.sema(?c.r.s, row.syntax, ?c.r.results[place], ?sdeps, ?m.ctx, mid, ?c.r.s.diags);
+    if (sel sr.err) { ret err[fail.Fail].err{sr.err}; }
+    t.sr    = sr.ok;
+    t.typed = true;
+    fail.merge(?c.typed, t.sr.status);
+    if (!sel t.sr.status.kind.accepted) { ret err[fail.Fail].ok{}; }
+
+    var owner:   sema_surface.Owner                      = sema_surface.Owner{module: mid, stable: row.stable, path: row.name, ctx: ?m.ctx, incarnation: row.syntax.incarnation};
+    var origins: sema_surface.Origins                    = sema_surface.Origins{ctx: c::ptr, stable: origin_stable, read: origin_read};
+    val built:   res[sema_product.ModuleSema, fail.Fail] = sema_surface.exports(?c.r.s, ?owner, ?c.r.results[place], ?t.sr, ?origins, ?c.r.alloc);
+    if (sel built.err) { ret err[fail.Fail].err{built.err}; }
+    t.surface  = built.ok;
+    t.surfaced = true;
+    val graph: res[fields.Graph, fail.Fail] = sema_surface.graph(?c.r.s, ?owner, ?t.surface);
+    if (sel graph.err) { ret err[fail.Fail].err{graph.err}; }
+    t.surface.graph = graph.ok;
+    ret fields.install(?c.r.s, ?t.surface.graph);
+}
+
+# check `src` into `c`, released with checked_dnit also when this fails; a failure is the
+# fixture's own, and the modules' verdict is in the standings and the diagnostics
+#[testing]
+pub fun checked_check(c: *Checked, src: *resolve.Sources) err[fail.Fail] {
+    c.count = 0;
+    c.typed = fail.accepted();
+    val front: err[fail.Fail] = resolve.resolved_check(?c.r, src);
+    if (sel front.err)                 { ret front; }
+    if (!sel c.r.status.kind.accepted) { ret err[fail.Fail].ok{}; }
+    var i: u32 = 0;
+    for (i < c.r.count) {
+        c.mods[i].typed    = false;
+        c.mods[i].surfaced = false;
+        c.mods[i].viewed   = false;
+        c.mods[i].reached  = 0;
+        c.count            = i + 1;
+        val typed: err[fail.Fail] = type_one(c, i);
+        if (sel typed.err) { ret typed; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# check `text` as the one module `t.main`
 #[testing]
 pub fun checked_init(c: *Checked, text: str) err[fail.Fail] {
-    c.opened   = false;
-    c.hosted   = false;
-    c.resolved = false;
-    c.typed    = false;
-    c.viewed   = false;
-    c.mid      = module.MODULE_NIL;
-    page.make(?c.alloc);
-    val made: res[session.Session, fail.Fail] = session.init(?c.alloc);
-    if (sel made.err) { ret err[fail.Fail].err{made.err}; }
-    c.s      = made.ok;
-    c.opened = true;
-    val root: res[intern.StrId, A.Error] = intern.add(?c.s.interner, "t");
-    if (sel root.err) { ret err[fail.Fail].err{fail.refused(root.err)}; }
-    c.held   = resident.init(?c.alloc, ?c.s.interner, root.ok);
-    c.host   = fe_load.fixture_init(?c.s, ?c.alloc, ?c.s.diags);
-    c.loader = fe_load.init(?c.s, ?c.alloc);
-    c.hosted = true;
-    val set: err[fail.Fail] = resident.module_set(?c.held, "t.main", text);
-    if (sel set.err) { ret set; }
-    fe_load.bind(?c.loader, fe_load.fixture_host(?c.host), resident.provider_of(?c.held), ?c.s.diags);
-
-    val name: res[intern.StrId, A.Error] = intern.add(?c.s.interner, "t.main");
-    if (sel name.err) { ret err[fail.Fail].err{fail.refused(name.err)}; }
-    val loaded: res[session.ModuleId, fail.Fail] = fe_load.module_load(?c.loader, name.ok);
-    if (sel loaded.err) { ret err[fail.Fail].err{loaded.err}; }
-    c.mid = loaded.ok;
-    val row: fe_load.Row = c.host.rows[module.index(c.mid)];
-    if (row.syntax == nil) { ret err[fail.Fail].err{fail.message("the checked module was not parsed")}; }
-    val registered: err[fail.Fail] = session.register_module_ast(?c.s, c.mid, row.syntax);
-    if (sel registered.err) { ret registered; }
-
-    val m:     *fe_load.Module                       = row.load;
-    var rdeps: resolve.ResolveDeps                   = resolve.ResolveDeps{entries: nil, count: 0, bindings: m.bindings.data, binding_count: m.bindings.len::u32};
-    val rr:    res[resolve.ResolveResult, fail.Fail] = resolve.resolve(?c.s, row.syntax, ?rdeps, ?m.ctx, c.mid, ?c.s.diags);
-    if (sel rr.err) { ret err[fail.Fail].err{rr.err}; }
-    c.rr       = rr.ok;
-    c.resolved = true;
-
-    var sdeps: sema_product.SemaDeps = sema_product.SemaDeps{};
-    sdeps.definitions = sema_product.reader_init(c::ptr, checked_definition, ?c.alloc);
-    fin { sema_product.reader_dnit(?sdeps.definitions); }
-    sdeps.entries = nil;
-    sdeps.count   = 0;
-    val sr: res[sema_product.SemaResult, fail.Fail] = sema_module.sema(?c.s, row.syntax, ?c.rr, ?sdeps, ?m.ctx, c.mid, ?c.s.diags);
-    if (sel sr.err) { ret err[fail.Fail].err{sr.err}; }
-    c.sr    = sr.ok;
-    c.typed = true;
-    ret err[fail.Fail].ok{};
+    var src: resolve.Sources = resolve.sources("t.main", text);
+    ret checked_check(c, ?src);
 }
 
 #[testing]
 pub fun checked_dnit(c: *Checked) {
-    if (c.viewed)   { comptime.dnit(?c.view); }
-    if (c.typed)    { sema_product.result_dnit(?c.sr); }
-    if (c.resolved) { resolve.result_dnit(?c.rr); }
-    if (c.hosted) {
-        fe_load.dnit(?c.loader);
-        fe_load.fixture_dnit(?c.host);
-        resident.dnit(?c.held);
-    }
-    if (c.opened) { session.dnit(?c.s); }
-}
-
-# whether any diagnostic the check reported says `needle`
-#[testing]
-pub fun checked_says(c: *Checked, needle: str) bool {
-    var i: usize = 0;
-    for (i < diagnostic.len(?c.s.diags)) {
-        val d: opt[*diagnostic.Diagnostic] = diagnostic.get(?c.s.diags, i);
-        if (sel d.some) {
-            if (str_contains(d.some.message, needle)) { ret true; }
-        }
+    var i: u32 = 0;
+    for (i < c.count) {
+        val t: *Typed = ?c.mods[i];
+        if (t.viewed)   { comptime.dnit(?t.view); }
+        if (t.surfaced) { sema_product.module_sema_dnit(?t.surface); }
+        if (t.typed)    { sema_product.result_dnit(?t.sr); }
         i = i + 1;
     }
-    ret false;
+    resolve.resolved_dnit(?c.r);
+}
+
+# whether the load, the resolutions and the typing all accepted the modules
+#[testing]
+pub fun checked_accepted(c: *Checked) bool {
+    ret sel c.r.status.kind.accepted && sel c.typed.kind.accepted;
+}
+
+# the errors the front end reported over `src`, -1 when the check failed or a phase rejected
+# the modules without one
+#[testing]
+pub fun probe_errors(src: *resolve.Sources) i32 {
+    var c:    Checked;
+    val made: err[fail.Fail] = checked_check(?c, src);
+    fin { checked_dnit(?c); }
+    if (sel made.err) { ret -1; }
+    val errors: usize = diagnostic.error_count(?c.r.s.diags);
+    if (errors == 0 && !checked_accepted(?c)) { ret -1; }
+    ret errors::i32;
+}
+
+# whether the front end rejected `src` with an error that says `needle`
+#[testing]
+pub fun probe_rejects_with(src: *resolve.Sources, needle: str) bool {
+    var c:    Checked;
+    val made: err[fail.Fail] = checked_check(?c, src);
+    fin { checked_dnit(?c); }
+    if (sel made.err || checked_accepted(?c)) { ret false; }
+    ret diagnostic.error_says(?c.r.s.diags, needle);
+}
+
+# zero when the front end rejects `src` with an error that says `needle`, or with `note`
+# when a note on an error says it, rejected or not; the diagnostics are shown when it does not
+#[testing]
+pub fun probe_diagnostic(src: *resolve.Sources, needle: str, note: bool) i32 {
+    var c:    Checked;
+    val made: err[fail.Fail] = checked_check(?c, src);
+    fin { checked_dnit(?c); }
+    if (sel made.err) { ret 1; }
+    var hit: bool = !checked_accepted(?c) && diagnostic.error_says(?c.r.s.diags, needle);
+    if (note) { hit = diagnostic.note_says(?c.r.s.diags, needle); }
+    if (hit)  { ret 0; }
+    diagnostic.show(?c.r.s.diags);
+    ret 1;
+}
+
+# whether the front end rejected `src` with an error that says `needle` over exactly the span
+# at `offset`
+#[testing]
+pub fun probe_rejects_at(src: *resolve.Sources, needle: str, offset: usize, len: usize) bool {
+    var c:    Checked;
+    val made: err[fail.Fail] = checked_check(?c, src);
+    fin { checked_dnit(?c); }
+    if (sel made.err || checked_accepted(?c)) { ret false; }
+    ret diagnostic.error_at(?c.r.s.diags, needle, offset, len);
+}
+
+# `head` followed by `tail`, for a source assembled from shared declarations; it is never
+# released, and a refused allocation ends the test
+#[testing]
+pub fun joined(head: str, tail: str) str {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val made: res[str, StrError] = str_join(?alloc, head, tail);
+    if (sel made.ok) { ret made.ok; }
+    panic("checked: a joined source was refused\n");
+    ret head;
+}
+
+# whether typing rejected `text` with one error that says `needle` at the instantiation over
+# the span at `site` and relates the template's operator over the span at `body`
+#[testing]
+pub fun sema_trail(text: str, needle: str, site: usize, site_len: usize, body: usize, body_len: usize) bool {
+    var c:    Checked;
+    val made: err[fail.Fail] = checked_init(?c, text);
+    fin { checked_dnit(?c); }
+    if (sel made.err || !sel c.r.status.kind.accepted || sel c.typed.kind.accepted) { ret false; }
+    ret diagnostic.error_traced(?c.r.s.diags, needle, site, site_len, body, body_len);
+}
+
+# the one-module forms of the probes, over `t.main`
+#[testing]
+pub fun sema_errors(text: str) i32 {
+    var src: resolve.Sources = resolve.sources("t.main", text);
+    ret probe_errors(?src);
+}
+
+#[testing]
+pub fun sema_clean(text: str) bool {
+    ret sema_errors(text) == 0;
+}
+
+#[testing]
+pub fun sema_rejects(text: str) bool {
+    ret sema_errors(text) > 0;
+}
+
+#[testing]
+pub fun sema_rejects_with(text: str, needle: str) bool {
+    var src: resolve.Sources = resolve.sources("t.main", text);
+    ret probe_rejects_with(?src, needle);
+}
+
+#[testing]
+pub fun sema_diag(text: str, needle: str) i32 {
+    var src: resolve.Sources = resolve.sources("t.main", text);
+    ret probe_diagnostic(?src, needle, false);
+}
+
+#[testing]
+pub fun sema_note(text: str, needle: str) i32 {
+    var src: resolve.Sources = resolve.sources("t.main", text);
+    ret probe_diagnostic(?src, needle, true);
+}
+
+#[testing]
+pub fun sema_rejects_at(text: str, needle: str, offset: usize, len: usize) bool {
+    var src: resolve.Sources = resolve.sources("t.main", text);
+    ret probe_rejects_at(?src, needle, offset, len);
+}
+
+# the two-module forms, `t.main` importing what it names of `t.lib`
+#[testing]
+pub fun sema_pair(main: str, lib: str) resolve.Sources {
+    var src: resolve.Sources = resolve.sources("t.main", main);
+    resolve.sources_add(?src, "t.lib", lib);
+    ret src;
+}
+
+#[testing]
+pub fun sema_clean2(main: str, lib: str) bool {
+    var src: resolve.Sources = sema_pair(main, lib);
+    ret probe_errors(?src) == 0;
+}
+
+#[testing]
+pub fun sema_diag2(main: str, lib: str, needle: str) i32 {
+    var src: resolve.Sources = sema_pair(main, lib);
+    ret probe_diagnostic(?src, needle, false);
+}
+
+# zero when `text` checks clean
+#[testing]
+pub fun sema_ok(text: str) i32 {
+    if (sema_clean(text)) { ret 0; }
+    ret 1;
+}
+
+#[testing]
+pub fun sema_ok2(main: str, lib: str) i32 {
+    if (sema_clean2(main, lib)) { ret 0; }
+    ret 1;
+}
+
+# zero when `text` is rejected with an error that says `want` and none that says `other`, the
+# arm a gate takes and the one it does not
+#[testing]
+pub fun sema_arm(text: str, want: str, other: str) i32 {
+    if (sema_diag(text, want) != 0)  { ret 1; }
+    if (sema_diag(text, other) == 0) { ret 1; }
+    ret 0;
 }
 
 test checked__a_well_typed_module_reports_nothing {
     var c:    Checked;
     val made: err[fail.Fail] = checked_init(?c, "fun twice(x: i32) i32 { ret x + x; }\n");
     fin { checked_dnit(?c); }
-    if (sel made.err)                    { ret 1; }
-    if (diagnostic.len(?c.s.diags) != 0) { ret 2; }
+    if (sel made.err)                      { ret 1; }
+    if (diagnostic.len(?c.r.s.diags) != 0) { ret 2; }
+    if (!checked_accepted(?c))             { ret 3; }
     ret 0;
 }
 
 test checked__a_narrowing_return_is_rejected {
-    var c:    Checked;
-    val made: err[fail.Fail] = checked_init(?c, "fun narrow(x: i64) i32 { ret x; }\n");
-    fin { checked_dnit(?c); }
-    if (sel made.err)                       { ret 1; }
-    if (!checked_says(?c, "type mismatch")) { ret 2; }
+    if (!sema_rejects_with("fun narrow(x: i64) i32 { ret x; }\n", "type mismatch")) { ret 1; }
+    ret 0;
+}
+
+test checked__an_import_is_typed_through_its_published_surface {
+    if (!sema_clean2("use t.lib;\nfun main() i32 { var b: lib.Box; b.v = lib.K; ret b.v; }\n", "pub val K: i32 = 7;\npub rec Box { v: i32; }\n")) { ret 1; }
+    if (sema_diag2("use t.lib;\nfun main() i64 { var b: lib.Box; ret b.v; }\n", "pub rec Box { v: i32; }\n", "type mismatch") != 0)               { ret 2; }
     ret 0;
 }

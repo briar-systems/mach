@@ -1,0 +1,174 @@
+# the typed surface a module publishes to its importers: each public symbol's
+# type and bound constant, and the field recipes of the types they reach
+use collections_vector: std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.fail;
+use ast_id: mach.lang.fe.ast.id;
+use mach.lang.fe.comptime;
+use mach.lang.fe.resolve;
+use mach.lang.fe.sema.fields;
+use sema_product: mach.lang.fe.sema.product;
+use mach.lang.intern;
+use mach.lang.module;
+use mach.lang.session;
+use mach.lang.type;
+
+# the module whose surface is built: its ids, its load scope and the incarnation of its syntax
+pub rec Owner {
+    module:      session.ModuleId;
+    stable:      session.StableModuleId;
+    path:        intern.StrId;
+    ctx:         *comptime.ComptimeCtx;
+    incarnation: u64;
+}
+
+# where the surfaces of the modules a surface forwards from are read: the stable id of a
+# loaded module, nil when it is not loaded, and its published surface, owned by the caller
+pub rec Origins {
+    ctx:    ptr;
+    stable: fun(ptr, session.ModuleId) session.StableModuleId;
+    read:   fun(ptr, session.ModuleId, *A.Allocator) res[sema_product.ModuleSema, fail.Fail];
+}
+
+# a module's own export, with the constant type checking left it bound to
+fun own_export(s: *session.Session, owner: *Owner, symbol: *resolve.Symbol,
+    rr: *resolve.ResolveResult, sr: *sema_product.SemaResult) res[sema_product.TypeExport, fail.Fail] {
+    var row: sema_product.TypeExport = sema_product.TypeExport{
+        origin:   owner.stable, canon: symbol.canon, ty: type.TYPE_NIL,
+        constant: resolve.ExportConstant{name: symbol.canon}
+    };
+    if (symbol.definition_kind == resolve.SYM_USE) { ret res[sema_product.TypeExport, fail.Fail].ok{row}; }
+    if (!module.same(symbol.origin, owner.module) || sr == nil || ast_id.decl_is_nil(symbol.decl) || ast_id.decl_index(symbol.decl) >= sr.decl_count) {
+        ret res[sema_product.TypeExport, fail.Fail].err{fail.message("typed export has no matching current declaration")};
+    }
+    row.ty = sr.decl_type[ast_id.decl_index(symbol.decl)];
+    if (symbol.definition_kind == resolve.SYM_VAL) {
+        var typed: comptime.ComptimeCtx = comptime.stage_init(owner.ctx, comptime.STAGE_LOWER, s.alloc);
+        fin { comptime.dnit(?typed); }
+        comptime.layer_set(?typed, comptime.STAGE_RESOLVE, ?rr.constants);
+        comptime.layer_set(?typed, comptime.STAGE_SEMA, ?sr.constants);
+        val found: opt[comptime.NamedConst] = comptime.lookup(?typed, symbol.canon);
+        if (sel found.some) {
+            val constant: comptime.NamedConst = found.some;
+            row.constant.present = true;
+            row.constant.gated   = constant.gated;
+            row.constant.value   = constant.value;
+            if (constant.value.kind == comptime.CT_KIND_CONST_ELEM) { row.definition_incarnation = owner.incarnation; }
+        }
+    }
+    ret res[sema_product.TypeExport, fail.Fail].ok{row};
+}
+
+rec OriginSurface { module: session.ModuleId; surface: sema_product.ModuleSema; }
+
+fun free_origin_surfaces(decoded: *collections_vector.Vector[OriginSurface]) {
+    var i: usize = 0;
+    for (i < decoded.len) {
+        sema_product.module_sema_dnit(?decoded.data[i].surface);
+        i = i + 1;
+    }
+    collections_vector.dnit[OriginSurface](decoded);
+}
+
+# one read per origin module while a surface is built, however many symbols it forwards
+fun origin_surface(s: *session.Session, origins: *Origins, mid: session.ModuleId, decoded: *collections_vector.Vector[OriginSurface]) res[*sema_product.ModuleSema, fail.Fail] {
+    var i: usize = 0;
+    for (i < decoded.len) {
+        if (module.same(decoded.data[i].module, mid)) { ret res[*sema_product.ModuleSema, fail.Fail].ok{?decoded.data[i].surface}; }
+        i = i + 1;
+    }
+    val acquired: res[sema_product.ModuleSema, fail.Fail] = origins.read(origins.ctx, mid, s.alloc);
+    if (sel acquired.err) { ret res[*sema_product.ModuleSema, fail.Fail].err{acquired.err}; }
+    var surface: sema_product.ModuleSema = acquired.ok;
+    val added:   res[usize, A.Error]     = collections_vector.push[OriginSurface](decoded, OriginSurface{module: mid, surface: surface});
+    if (sel added.err) {
+        sema_product.module_sema_dnit(?surface);
+        ret res[*sema_product.ModuleSema, fail.Fail].err{fail.refused(added.err)};
+    }
+    ret res[*sema_product.ModuleSema, fail.Fail].ok{?decoded.data[decoded.len - 1].surface};
+}
+
+fun imported_export(s: *session.Session, origins: *Origins, symbol: *resolve.Symbol,
+    decoded: *collections_vector.Vector[OriginSurface]) res[sema_product.TypeExport, fail.Fail] {
+    val mid:    session.ModuleId       = symbol.origin;
+    val origin: session.StableModuleId = origins.stable(origins.ctx, mid);
+    if (module.stable_is_nil(origin)) { ret res[sema_product.TypeExport, fail.Fail].err{fail.message("forwarded type origin is not loaded")}; }
+    val acquired: res[*sema_product.ModuleSema, fail.Fail] = origin_surface(s, origins, mid, decoded);
+    if (sel acquired.err) { ret res[sema_product.TypeExport, fail.Fail].err{acquired.err}; }
+    val surface: *sema_product.ModuleSema = acquired.ok;
+    var i:       usize                    = 0;
+    for (i < surface.exports.len) {
+        val row: sema_product.TypeExport = surface.exports.data[i];
+        if (module.stable_same(row.origin, origin) && intern.str_same(row.canon, symbol.canon)) { ret res[sema_product.TypeExport, fail.Fail].ok{row}; }
+        i = i + 1;
+    }
+    ret res[sema_product.TypeExport, fail.Fail].err{fail.message("forwarded type has no acquired canonical public surface")};
+}
+
+# the exports of `owner`'s typed surface, allocated from `a`; a symbol it forwards is read
+# from the surface its origin published
+pub fun exports(s: *session.Session, owner: *Owner, rr: *resolve.ResolveResult, sr: *sema_product.SemaResult,
+    origins: *Origins, a: *A.Allocator) res[sema_product.ModuleSema, fail.Fail] {
+    var surface:     sema_product.ModuleSema                  = sema_product.module_sema_init(a, owner.path, owner.module);
+    var transferred: bool                                     = false;
+    var decoded:     collections_vector.Vector[OriginSurface] = collections_vector.init[OriginSurface](s.alloc);
+    fin {
+        free_origin_surfaces(?decoded);
+        if (!transferred) { sema_product.module_sema_dnit(?surface); }
+    }
+    var i: u32 = 0;
+    for (i < rr.pub_count) {
+        val symbol:   *resolve.Symbol = ?rr.symbols[i];
+        var captured: res[sema_product.TypeExport, fail.Fail];
+        if (module.same(symbol.origin, owner.module)) { captured = own_export(s, owner, symbol, rr, sr); }
+        or                                            { captured = imported_export(s, origins, symbol, ?decoded); }
+        if (sel captured.err)                         { ret res[sema_product.ModuleSema, fail.Fail].err{captured.err}; }
+        val added: res[usize, A.Error] = collections_vector.push[sema_product.TypeExport](?surface.exports, captured.ok);
+        if (sel added.err) { ret res[sema_product.ModuleSema, fail.Fail].err{fail.refused(added.err)}; }
+        i = i + 1;
+    }
+    transferred = true;
+    ret res[sema_product.ModuleSema, fail.Fail].ok{surface};
+}
+
+fun prepared_recipe(s: *session.Session, ty: type.TypeId) err[fail.Fail] {
+    val table: opt[*type.FieldTable] = type.field_table_for(?s.types, ty);
+    if (sel table.none) {
+        ret err[fail.Fail].err{fail.message("public nominal recipe was not prepared by its acquired semantic owner")};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the field recipes of every type the exports of `surface` reach, under `owner`'s target
+pub fun graph(s: *session.Session, owner: *Owner, surface: *sema_product.ModuleSema) res[fields.Graph, fail.Fail] {
+    var roots: collections_vector.Vector[type.TypeId] = collections_vector.init[type.TypeId](surface.exports.a);
+    fin { collections_vector.dnit[type.TypeId](?roots); }
+    var i: usize = 0;
+    for (i < surface.exports.len) {
+        val row:   *sema_product.TypeExport = ?surface.exports.data[i];
+        val added: res[usize, A.Error]      = collections_vector.push[type.TypeId](?roots, row.ty);
+        if (sel added.err) { ret res[fields.Graph, fail.Fail].err{fail.refused(added.err)}; }
+        if (row.constant.present) {
+            val value: comptime.CTValue = row.constant.value;
+            var extra: type.TypeId      = type.TYPE_NIL;
+            if (value.kind == comptime.CT_KIND_TYPE)                                         { extra = value.data.t::type.TypeId; }
+            or (value.kind == comptime.CT_KIND_FIELD || value.kind == comptime.CT_KIND_CASE) { extra = value.data.fld.owner::type.TypeId; }
+            or (value.kind == comptime.CT_KIND_PACK_ELEM)                                    { extra = value.data.pelem.ty::type.TypeId; }
+            or (value.kind == comptime.CT_KIND_CONST_ELEM)                                   { extra = value.data.celem.ty::type.TypeId; }
+            val pushed: res[usize, A.Error] = collections_vector.push[type.TypeId](?roots, extra);
+            if (sel pushed.err) { ret res[fields.Graph, fail.Fail].err{fail.refused(pushed.err)}; }
+        }
+        i = i + 1;
+    }
+    var group: fields.Roots = fields.Roots{data: roots.data, len: roots.len};
+    ret fields.capture[session.Session](s, surface.exports.a, ?group, 1, fields.RECIPES, owner.ctx.env.target.defs, s, prepared_recipe);
+}

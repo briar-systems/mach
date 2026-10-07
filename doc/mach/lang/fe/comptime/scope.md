@@ -236,6 +236,18 @@ the scope `stage` evaluates a module in, over the load's scope of the module: th
 description and bindings, with every stage between them left for `layer_set`. what the stage
 binds is allocated from `alloc`, which outlives the product the bindings are published to
 
+## fun lowering_prepare
+
+```mach
+pub fun lowering_prepare(scope: *ComptimeCtx, made: *bool, load: *ComptimeCtx, expr_count: u32,
+resolved: *Bindings, typed: *Bindings) err[fail.Fail];
+```
+
+make or bring up to date the scope lowering binds a module's constants in, over what the
+module's load scope `load`, its resolution and its typing bound, nil where there is none.
+`made` says the scope exists; it is made on the first call with room for the gate decisions
+of a tree of `expr_count` expressions, and each call points its layers at the products given
+
 ## fun layer_set
 
 ```mach

@@ -250,6 +250,33 @@ pub fun type_owner(s: *session.Session, mid: session.ModuleId, file: lang_source
 pub fun remap_result(r: *ResolveResult, s: *session.Session);
 ```
 
+## rec Exporters
+
+```mach
+pub rec Exporters;
+```
+
+the modules an importer's resolution reads: how many are loaded, with ids below that count,
+each one's resolution, nil when it has none, whether that resolution is current, and the
+path it is imported by
+
+## fun deps_of
+
+```mach
+pub fun deps_of(alloc: *A.Allocator, l: *fe_load.Loader, m: *fe_load.Module, from: *Exporters) res[ResolveDeps, fail.Fail];
+```
+
+the exports module `m` of loader `l` reads: each loaded module it imports and every module a
+reached one re-exports, each once, allocated from `alloc` and released with deps_dnit
+
+## fun deps_dnit
+
+```mach
+pub fun deps_dnit(alloc: *A.Allocator, deps: *ResolveDeps);
+```
+
+release what deps_of allocated
+
 ## fun result_dnit
 
 ```mach
