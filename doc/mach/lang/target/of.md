@@ -1013,6 +1013,42 @@ other way around
 
 table: the table as a refusal names it, as "the PLT"
 
+## def TablePlacement
+
+```mach
+pub def TablePlacement: u8
+```
+
+where the linker lays out a table a format asks it to reserve. a table at the
+end of the code or of the read-only data moves everything after it, so the
+format shapes it before anything is given an address; a table in a segment
+of its own follows every other, so the format shapes it once the image is
+final, from the image itself
+
+## val TABLE_CODE_END
+
+```mach
+pub val TABLE_CODE_END: TablePlacement = 0
+```
+
+at the end of the code, so no data lies between the code and the table
+
+## val TABLE_RELRO_END
+
+```mach
+pub val TABLE_RELRO_END: TablePlacement = 1
+```
+
+at the end of the read-only data the loader writes once, ahead of the zero-fill
+
+## val TABLE_OWN_SEGMENT
+
+```mach
+pub val TABLE_OWN_SEGMENT: TablePlacement = 2
+```
+
+in a segment of its own after the image's last one, on a page of its own
+
 ## rec TableShape
 
 ```mach
@@ -1020,8 +1056,77 @@ pub rec TableShape;
 ```
 
 what a table a format asks the linker to reserve takes: the linker lays it out
-under this section name before it gives anything an address, so the code
-reaches it whatever data the image carries
+under this section name where `placement` puts it, before it gives anything
+an address, so the code reaches it whatever data the image carries
+
+flags: the segment's SEG_FLAG_ bits, for a table in a segment of its own
+
+## rec TableList
+
+```mach
+pub rec TableList;
+```
+
+the tables a format lays out in segments of their own after the image, in the
+order it adds them
+
+## fun table_list_init
+
+```mach
+pub fun table_list_init(alloc: *A.Allocator) TableList;
+```
+
+## fun table_list_dnit
+
+```mach
+pub fun table_list_dnit(list: *TableList);
+```
+
+## fun table_add
+
+```mach
+pub fun table_add(list: *TableList, shape: TableShape) err[fail.Fail];
+```
+
+adds a table in a segment of its own, none when it is empty
+
+## def SegmentTablesFn
+
+```mach
+pub def SegmentTablesFn: fun(*LinkedImage, *TableList) err[fail.Fail]
+```
+
+shapes the tables the image takes in segments of their own, once everything
+else in it is final, adding each to the list
+
+## fun table_segments_append
+
+```mach
+pub fun table_segments_append(alloc: *A.Allocator, itn: *intern.Interner, segs: *LoadSegment, count: u32, tables: *TableList,
+page: u64) res[*LoadSegment, fail.Fail];
+```
+
+the segments `segs` and, after every other, one for each table in `tables`,
+each on a page of its own, its bytes zero for the format to write and named
+by its one section. the returned array holds `segs` by value, so the caller
+releases the array `segs` but nothing its segments own
+
+## fun table_segments_free
+
+```mach
+pub fun table_segments_free(alloc: *A.Allocator, segs: *LoadSegment, count: u32);
+```
+
+releases what `count` table segments own: their bytes and their one section
+
+## fun table_segment
+
+```mach
+pub fun table_segment(img: *LinkedImage, i: u32) *LoadSegment;
+```
+
+the image's segment for the table the format added `i`-th, nil when it added
+fewer; the linker appends them after every other segment, in that order
 
 ## rec UnwindShape
 
