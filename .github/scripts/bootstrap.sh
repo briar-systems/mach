@@ -35,8 +35,8 @@ else
     MACH_VERSION=$seed MACH_INSTALL_DIR=$dir sh dist/install.sh
 fi
 
-"$dir/mach$exe" dep pull .
-"$dir/mach$exe" build . --profile "$profile" -o "a$exe"
+bash .github/scripts/seed-build.sh "$dir/mach$exe" "a$exe" --profile "$profile"
+"./a$exe" dep pull .
 "./a$exe" build . --profile "$profile" -o "b$exe"
 last=b$exe
 if [ "$fixpoint" = 1 ]; then

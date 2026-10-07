@@ -109,7 +109,7 @@ environment, and `1` otherwise.
 
 Artifacts cannot share an output path: a manifest whose expanded `out` templates
 collide is rejected before the build starts, and so is a selection spanning
-profiles whose `[project].out` has no `{profile.name}` to keep them apart.
+profiles whose `[project].work` has no `{profile.name}` to keep them apart.
 
 ## `native` target resolution
 

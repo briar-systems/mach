@@ -18,18 +18,6 @@ pub val ROOT_ARTIFACT: RootSet = 0
 pub val ROOT_UNION: RootSet = 1
 ```
 
-## def TargetOpt
-
-```mach
-pub def TargetOpt: u8
-```
-
-## val TARGET_OPT_RELEASE
-
-```mach
-pub val TARGET_OPT_RELEASE: TargetOpt = 2
-```
-
 ## rec TargetEntry
 
 ```mach
@@ -52,7 +40,7 @@ what a configured build cell compiles and where it writes
 
 project_root: the directory of the project that declares the cell: the root
                   project, or for a dependency's cell the dependency's realization
-home_root: the root project's directory; `project_out` is rooted here
+home_root: the root project's directory; `project_work` is rooted here
 owner: the dependency that declares the cell, moved out of the closure;
                   meaningful only with `dependency_owned`
 dependency_owned: the cell is a requirement of a dependency's default library
@@ -207,15 +195,6 @@ pub fun free_dep_entries_in_place(alloc: *A.Allocator, deps: *DepEntry, count: u
 ```
 
 release what each entry owns, leaving the entries' own storage to the caller
-
-## fun map_opt
-
-```mach
-pub fun map_opt(o: manifest.MOpt) opt[TargetOpt];
-```
-
-the pipeline level a manifest profile level selects; absent for a tag
-outside the catalog, which the caller reports through the catalog policy
 
 ## fun module_count
 

@@ -48,7 +48,7 @@ whether a `need` entry of `a` selects `other`, a different artifact
 
 ```mach
 pub fun expand_artifact_output(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
-a: *ArtifactDef, project_out: str, vars: *template.Values) res[str, fail.Fail];
+a: *ArtifactDef, project_work: str, vars: *template.Values) res[str, fail.Fail];
 ```
 
 expand an artifact's `out` for the target `vars` names; a refusal points at the `out` value
