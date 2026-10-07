@@ -9,8 +9,7 @@ backend lays it out by
 pub rec Measure;
 ```
 
-a layout walk's view of the store: the query it answers within, and the session that
-records each type's declared alignment and packing
+a layout walk's view of the store: the query it answers within
 
 ## fun describe
 
@@ -23,14 +22,6 @@ pub fun describe(mz: *Measure, id: u32) layout.Node;
 ```mach
 pub fun field(mz: *Measure, id: u32, index: u32) u32;
 ```
-
-## val MAX_DEPTH
-
-```mach
-pub val MAX_DEPTH: u32 = 64
-```
-
-how deep a layout walk descends before it gives up
 
 ## fun size
 

@@ -40,6 +40,9 @@ fields_start: u32, fields_len: u32) intern.StrId;
 pub fun ensure_layout_ready(sc: *sema_context.SemaContext, tid: type.TypeId) intern.StrId;
 ```
 
+elaborates every nominal `tid` holds by value, each once; the name of a nominal whose
+layout is still being decided when it is reached again, nil otherwise
+
 ## fun prepare_nominal_recipe
 
 ```mach
