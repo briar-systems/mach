@@ -1,0 +1,1113 @@
+# loads, stores, access chains and memory copies over the module's storage classes
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std_format:         std.format;
+
+use A: std.allocator;
+
+use lang_checked: mach.lang.checked;
+use mach.lang.diagnostic;
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.float;
+use mach.lang.growth;
+use mach.lang.intern;
+use mach.lang.layout;
+use me_ir:   mach.lang.me.ir;
+use ir_id:   mach.lang.me.ir.id;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use lang_mir:          mach.lang.mir;
+use mir_debug:         mach.lang.mir.debug;
+use mir_structure:     mach.lang.mir.structure;
+use mir_unit:          mach.lang.mir.unit;
+use lang_source:       mach.lang.source;
+use target_definition: mach.lang.target.definition;
+use mach.lang.target.extension;
+use extension_spirv: mach.lang.target.extension.spirv;
+use mach.lang.target.isa;
+use isa_spirv: mach.lang.target.isa.spirv;
+use mach.lang.target.isa.spirv.debug;
+use mach.lang.target.isa.spirv.defs;
+use mach.lang.target.isa.spirv.emit.arith;
+use emit_builtin: mach.lang.target.isa.spirv.emit.builtin;
+use emit_copy:    mach.lang.target.isa.spirv.emit.copy;
+use mach.lang.target.isa.spirv.emit.emitter;
+use emit_global: mach.lang.target.isa.spirv.emit.global;
+use emit_layout: mach.lang.target.isa.spirv.emit.layout;
+use emit_value:  mach.lang.target.isa.spirv.emit.value;
+use mach.lang.target.isa.spirv.ops;
+use mach.lang.target.isa.spirv.types;
+use target_model: mach.lang.target.model;
+use model_spirv:  mach.lang.target.model.spirv;
+use target_of:    mach.lang.target.of;
+use mach.lang.textbuild;
+
+# the bits of a scalar constant as a `bits`-wide literal
+pub fun scalar_literal(v: *value.Value, bits: u32) u64 {
+    var lit: u64 = v.data.int_lit;
+    if (v.kind == value.VAL_CONST_FLOAT) {
+        lit = float.bits_at(float.bits_f64(v.data.int_lit), float.width_of_bits(bits));
+    }
+    or (v.kind != value.VAL_CONST_INT) { lit = 0; }
+    if (bits < 64)                     { lit = lit & ((1::u64 << bits::u64) - 1); }
+    ret lit;
+}
+
+# the constant an Output variable starts at: its initializer, spelled as
+# OpConstantNull where that is zero, which is also what an output declared without one
+# holds, as every mach `var` does. 0 where the initializer has no constant form
+pub fun output_initializer(e: *emitter.Emit, gt: *ir_type.IrTypeTable, g: *me_ir.Global, value_ty: u32) u32 {
+    val v: *value.Value         = ?g.init;
+    val t: opt[*ir_type.IrType] = ir_type.get(gt, g.ty);
+    if (sel t.none)                     { ret 0; }
+    if (v.kind == value.VAL_CONST_NULL) { ret types.const_null(e.tt, value_ty); }
+    if (v.kind == value.VAL_CONST_INT || v.kind == value.VAL_CONST_FLOAT) {
+        val scalar: bool = t.some.kind == ir_type.IRT_INT || t.some.kind == ir_type.IRT_FLOAT;
+        if (v.data.int_lit == 0 && v.kind == value.VAL_CONST_INT) { ret types.const_null(e.tt, value_ty); }
+        if (!scalar)                                              { ret 0; }
+        val lit: u64 = scalar_literal(v, types.type_bits(e.tt, value_ty));
+        if (lit == 0) { ret types.const_null(e.tt, value_ty); }
+        ret types.const_scalar(e.tt, value_ty, (lit & 0xFFFFFFFF)::u32, (lit >> 32)::u32);
+    }
+    if (v.kind == value.VAL_CONST_AGG) {
+        if (v.data.agg.reloc_count != 0) { ret 0; }
+        ret image_constant(e, gt, g.ty, value_ty, v.data.agg.bytes, v.data.agg.len, 0);
+    }
+    if (v.kind == value.VAL_CONST_BYTES) {
+        ret image_constant(e, gt, g.ty, value_ty, v.data.bytes.ptr, v.data.bytes.len, 0);
+    }
+    ret 0;
+}
+
+# the constant of `spv_ty` that the byte image of ir type `id` at `off` spells, laid out
+# as the target lays the type out; a byte past the image is zero
+fun image_constant(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId, spv_ty: u32,
+    bytes: *u8, len: u32, off: u32) u32 {
+    if (spv_ty == 0) { ret 0; }
+    val size: u32  = ir_type.byte_size_for_machine(gt, id, e.layout);
+    var zero: bool = true;
+    var k:    u32  = 0;
+    for (k < size && zero) {
+        if (off + k < len && bytes[off + k] != 0) { zero = false; }
+        k = k + 1;
+    }
+    if (zero) { ret types.const_null(e.tt, spv_ty); }
+
+    val opt_: opt[*ir_type.IrType] = ir_type.get(gt, id);
+    if (sel opt_.none) { ret 0; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind == ir_type.IRT_INT || t.kind == ir_type.IRT_FLOAT) {
+        if (size > 8) { ret 0; }
+        var lit: u64 = 0;
+        k = 0;
+        for (k < size) {
+            if (off + k < len) { lit = lit | (bytes[off + k]::u64 << (k * 8)::u64); }
+            k = k + 1;
+        }
+        ret types.const_scalar(e.tt, spv_ty, (lit & 0xFFFFFFFF)::u32, (lit >> 32)::u32);
+    }
+    var n:    u32              = 0;
+    var elem: ir_type.IrTypeId = ir_type.IRT_NIL;
+    if (t.kind == ir_type.IRT_VECTOR) {
+        n    = t.data.vector_.lanes;
+        elem = t.data.vector_.element;
+    }
+    or (t.kind == ir_type.IRT_ARRAY) {
+        n    = t.data.array_.count;
+        elem = t.data.array_.element;
+    }
+    or (t.kind == ir_type.IRT_STRUCT) { n = t.data.struct_.field_count; }
+    or                                { ret 0; }
+    if (n == 0)                       { ret 0; }
+
+    val rp: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rp.err) { ret 0; }
+    val parts: *u32 = rp.ok;
+    var ok:    bool = true;
+    var i:     u32  = 0;
+    for (i < n && ok) {
+        var mid:  ir_type.IrTypeId = elem;
+        var moff: u32              = off;
+        if (t.kind == ir_type.IRT_STRUCT) {
+            mid  = t.data.struct_.fields[i];
+            moff = off + ir_type.byte_offset_for_machine(gt, id, i, e.layout);
+        }
+        or { moff = off + i * ir_type.byte_size_for_machine(gt, elem, e.layout); }
+        parts[i] = image_constant(e, gt, mid, emit_layout.spv_type_of(e, gt, mid), bytes, len, moff);
+        if (parts[i] == 0) { ok = false; }
+        i = i + 1;
+    }
+    var c: u32 = 0;
+    if (ok) { c = types.const_composite(e.tt, spv_ty, parts, n); }
+    A.deallocate[u32](e.alloc, parts, n::usize);
+    ret c;
+}
+
+fun spec_target(e: *emitter.Emit, op: *lang_mir.MirOperand) u32 {
+    if (e.gspec == nil || op.kind != lang_mir.MIR_OP_SYM || op.sym_off != 0) { ret 0; }
+    val gx: u32 = emit_global.lookup(e, op.sym);
+    if (gx == emit_global.GL_NONE) { ret 0; }
+    ret e.gspec[gx];
+}
+
+pub fun mark_memory_scope(e: *emitter.Emit, ptr: u32, scope: u32) err[fail.Fail] {
+    if (scope == 0 && ptr::usize >= e.pscope.len) { ret err[fail.Fail].ok{}; }
+    for (e.pscope.len <= ptr::usize) {
+        val pr: res[usize, A.Error] = collections_vector.push[u8](?e.pscope, 0);
+        if (sel pr.err) { ret err[fail.Fail].err{fail.refused(pr.err)}; }
+    }
+    e.pscope.data[ptr::usize] = scope::u8;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun memory_scope_of(e: *emitter.Emit, ptr: u32) u32 {
+    if (ptr::usize >= e.pscope.len) { ret 0; }
+    ret e.pscope.data[ptr::usize]::u32;
+}
+
+# an access chain's accesses share the scope of the pointer it walks from
+pub fun chain_memory_scope(e: *emitter.Emit, result: u32, base: u32) {
+    if (!e.vulkan_mm) { ret; }
+    val r: err[fail.Fail] = mark_memory_scope(e, result, memory_scope_of(e, base));
+    if (sel r.err) { e.b.err = true; }
+}
+
+pub fun decorate(e: *emitter.Emit, target: u32, decor: u32, operand: u32) {
+    var ops: [3]u32;
+    ops[0] = target;
+    ops[1] = decor;
+    ops[2] = operand;
+    isa_spirv.inst(e.b, ?e.b.decorations, isa_spirv.OP_DECORATE, ?ops[0], 3);
+}
+
+val ADDR_UNKNOWN: u8 = 0;
+
+val ADDR_GLOBAL: u8 = 1;
+
+val ADDR_ALLOCA: u8 = 2;
+
+fun address_origin(e: *emitter.Emit, mf: *lang_mir.MirFunction, op: *lang_mir.MirOperand, out_ix: *u32) u8 {
+    @out_ix = 0;
+    if (op.kind == lang_mir.MIR_OP_SYM) {
+        val gx: u32 = emit_global.lookup(e, op.sym);
+        if (gx != emit_global.GL_NONE) {
+            @out_ix = gx;
+            ret ADDR_GLOBAL;
+        }
+        ret ADDR_UNKNOWN;
+    }
+    var base: u32 = lang_mir.MIR_VREG_NIL.n;
+    if (op.kind == lang_mir.MIR_OP_VREG) { base = op.vreg.n; }
+    or (op.kind == lang_mir.MIR_OP_MEM)  { base = op.vreg.n; }
+    if (base == lang_mir.MIR_VREG_NIL.n) { ret ADDR_UNKNOWN; }
+
+    val def: *lang_mir.MirInstr = defining_instr(mf, base);
+    if (def == nil)                        { ret ADDR_UNKNOWN; }
+    if (def.opcode == lang_mir.MIR_ALLOCA) { ret ADDR_ALLOCA; }
+    if (def.opcode == lang_mir.MIR_GEP && def.operand_count >= 2
+        && def.operands[1].kind == lang_mir.MIR_OP_SYM) {
+        ret address_origin(e, mf, ?def.operands[1], out_ix);
+    }
+    ret ADDR_UNKNOWN;
+}
+
+fun defining_instr(mf: *lang_mir.MirFunction, vreg: u32) *lang_mir.MirInstr {
+    var bi: u32 = 0;
+    for (bi < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            if (lang_mir.instr_defines_shape(mi) && mi.operand_count > 0
+                && mi.operands[0].kind == lang_mir.MIR_OP_VREG && mi.operands[0].vreg.n == vreg) {
+                ret mi;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret nil;
+}
+
+pub fun holds_physical(e: *emitter.Emit, ty: u32) bool {
+    ret e.physical && types.holds_pointer(e.tt, ty, isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER);
+}
+
+# the zero of a type, built from its parts where it holds a physical pointer
+pub fun zero_value(e: *emitter.Emit, ty: u32) u32 {
+    if (!holds_physical(e, ty))          { ret types.const_null(e.tt, ty); }
+    if (emit_value.physical_type(e, ty)) { ret emit_value.pointer_constant(e, ty, 0); }
+    val n: u32 = types.composite_count(e.tt, ty);
+    if (n == 0 || !types.instruction_operands_fit(2, n)) {
+        e.b.err = true;
+        ret 0;
+    }
+    val ar: res[*u32, A.Error] = A.allocate[u32](e.alloc, (n + 2)::usize);
+    if (sel ar.err) {
+        e.b.err = true;
+        ret 0;
+    }
+    val words: *u32 = ar.ok;
+    fin { A.deallocate[u32](e.alloc, words, (n + 2)::usize); }
+    var i: u32 = 0;
+    for (i < n) {
+        words[2 + i] = zero_value(e, types.composite_member(e.tt, ty, i));
+        i            = i + 1;
+    }
+    words[0] = ty;
+    words[1] = isa_spirv.alloc_id(e.b);
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COMPOSITE_CONSTRUCT, words, n + 2);
+    ret words[1];
+}
+
+fun interface_target(e: *emitter.Emit, op: *lang_mir.MirOperand) u32 {
+    if (op.kind != lang_mir.MIR_OP_SYM || op.sym_off != 0) { ret 0; }
+    ret emit_global.global_var_id(e, op.sym);
+}
+
+fun addressed_memory_refusal(e: *emitter.Emit, mf: *lang_mir.MirFunction, op: *lang_mir.MirOperand) res[str, fail.Fail] {
+    var gix:    u32 = 0;
+    val origin: u8  = address_origin(e, mf, op, ?gix);
+    if (origin == ADDR_ALLOCA) {
+        ret res[str, fail.Fail].ok{"a function-local object is reachable from the SPIR-V target only as a whole value: this access arrived as an address into its storage rather than as a load or a store of the object itself, which logical addressing has no pointer to express. it is a lowering that ran where it should not have, not something the program asked for"};
+    }
+    if (origin != ADDR_GLOBAL) {
+        ret res[str, fail.Fail].ok{"addressed memory is not yet supported by the SPIR-V target: this access reached the back end as a computed address with no object behind it that the emitter can name, and logical addressing has no general pointer to follow"};
+    }
+    val g: *me_ir.Global = emit_global.ir_of(e, gix);
+    if (g.iface == me_ir.IFACE_NONE) {
+        ret res[str, fail.Fail].ok{"a plain module-scope variable is not reachable from the SPIR-V target: a shader has no general global storage, so a module-scope `var` reaches a stage only by carrying an interface role (`#[input]`, `#[output]`, `#[builtin]`, `#[uniform]`, `#[storage]`, `#[sampler]`, `#[push]`, or `#[shared]`), and a module-scope `val` only as a whole value, which the shader reads as the constant it is"};
+    }
+    val shown: res[str, fail.Fail] = emit_builtin.ir_type_spelling(emit_global.types_of(e, gix), e.alloc, g.ty);
+    if (sel shown.err) { ret shown; }
+    ret fail.format(e.alloc,
+        "this shader interface variable carries a role, so it is reachable - but the access reached the back end as COMPUTED ADDRESSING rather than as a direct reference to the variable, which is the one shape the SPIR-V target can name. that is a lowering that ran where it should not have, not a limit of the declaration: the variable is {}",
+        shown.ok);
+}
+
+fun memory_load(e: *emitter.Emit, ty: u32, result: u32, ptr: u32, flags: u8) {
+    var ops: [6]u32;
+    ops[0] = ty;
+    ops[1] = result;
+    ops[2] = ptr;
+    val count: u32 = 3 + memory_operands(e, ptr, flags, isa_spirv.MEMORY_ACCESS_MAKE_POINTER_VISIBLE, ?ops[3]);
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_LOAD, ?ops[0], count);
+}
+
+pub fun memory_store(e: *emitter.Emit, ptr: u32, value: u32, flags: u8) {
+    var ops: [5]u32;
+    ops[0] = ptr;
+    ops[1] = value;
+    val count: u32 = 2 + memory_operands(e, ptr, flags, isa_spirv.MEMORY_ACCESS_MAKE_POINTER_AVAILABLE, ?ops[2]);
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_STORE, ?ops[0], count);
+}
+
+# the Memory Operands of an access through `ptr`, written to `out`, and how many words
+# they take: Volatile for a volatile access, Aligned with its literal for an access through
+# a physical pointer, which every one carries, and under the Vulkan memory model, where
+# the pointer's memory is coherent, `avail_vis` (a store's MakePointerAvailable or a
+# load's MakePointerVisible) with NonPrivatePointer and the scope id
+fun memory_operands(e: *emitter.Emit, ptr: u32, flags: u8, avail_vis: u32, out: *u32) u32 {
+    var mask: u32 = 0;
+    if ((flags & lang_mir.MEMORY_VOLATILE) != 0) { mask = isa_spirv.MEMORY_ACCESS_VOLATILE; }
+    val align:    u32  = emit_layout.pointer_align(e, ptr);
+    val scope:    u32  = memory_scope_of(e, ptr);
+    val coherent: bool = e.vulkan_mm && scope != 0;
+    if (align != 0) { mask = mask | isa_spirv.MEMORY_ACCESS_ALIGNED; }
+    if (coherent)   { mask = mask | avail_vis | isa_spirv.MEMORY_ACCESS_NON_PRIVATE_POINTER; }
+    if (mask == 0)  { ret 0; }
+    out[0] = mask;
+    var n: u32 = 1;
+    if (align != 0) {
+        out[n] = align;
+        n      = n + 1;
+    }
+    if (coherent) {
+        out[n] = types.const_int(e.tt, 32, scope::i64);
+        n      = n + 1;
+    }
+    ret n;
+}
+
+# a scalar access through a pointer to a composite reaches the composite's leading leaf: member 0,
+# recursively, which is what offset zero means on a logical target.
+fun leading_leaf(e: *emitter.Emit, ptr: u32, ty: u32, storage: u32, want: u32, out_ptr: *u32) u32 {
+    var cur_ptr: u32 = ptr;
+    var cur:     u32 = ty;
+    var depth:   u32 = 0;
+    for (cur != want && cur != 0 && types.is_composite(e.tt, cur) && depth < 8) {
+        val member: u32 = types.composite_member(e.tt, cur, 0);
+        if (member == 0) { ret 0; }
+        val ptr_ty: u32 = types.type_ptr(e.tt, storage, member);
+        val result: u32 = isa_spirv.alloc_id(e.b);
+        var ops:    [4]u32;
+        ops[0] = ptr_ty;
+        ops[1] = result;
+        ops[2] = cur_ptr;
+        ops[3] = types.const_int(e.tt, 32, 0);
+        isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_ACCESS_CHAIN, ?ops[0], 4);
+        chain_memory_scope(e, result, cur_ptr);
+        if (storage == isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER) { emit_layout.mark_physical(e, result, member); }
+        cur_ptr = result;
+        cur     = member;
+        depth   = depth + 1;
+    }
+    if (cur != want) { ret 0; }
+    @out_ptr = cur_ptr;
+    ret cur;
+}
+
+# an array in memory held whole as the vector of its elements, a `[4]u64` member as a
+# `u64x4` or an `[8]f32` one as the array an `f32x8` is carried in: the array is loaded and
+# stored as the type memory declares it, a block's laid-out one included, and rebuilt
+# between it and the vector (whole_value_as) rather than reached as a leading leaf
+fun array_held_as_vector(e: *emitter.Emit, mem_ty: u32, to_ty: u32) bool {
+    if (mem_ty == 0 || to_ty == 0 || mem_ty == to_ty) { ret false; }
+    var n: u32 = 0;
+    if (types.array_shape(e.tt, mem_ty, ?n) == 0) { ret false; }
+    var lanes: u32 = 0;
+    ret types.vector_value_shape(e.tt, to_ty, ?lanes) != 0 && lanes == n;
+}
+
+fun array_vector_refusal(e: *emitter.Emit) str {
+    ret "an array held as a vector whose lanes are not of its element type is not supported by the SPIR-V target: logical addressing moves the array as the value it is, and rebuilds the vector from its elements or the array from its lanes";
+}
+
+fun leaf_refusal(e: *emitter.Emit) str {
+    ret "a scalar access through a composite reaches no leading member of its type in the SPIR-V target: a logical object is read and written as a whole or through a member walk, and offset zero of a composite is its first member";
+}
+
+fun access_storage_at(e: *emitter.Emit, vm: *emitter.VMaps, op: *lang_mir.MirOperand, known: u32) u32 {
+    if (known != 0) { ret known; }
+    ret access_storage(e, vm, op);
+}
+
+fun access_storage(e: *emitter.Emit, vm: *emitter.VMaps, op: *lang_mir.MirOperand) u32 {
+    val sc: u32 = arith.chain_storage(vm, op);
+    if (sc != 0)                        { ret sc; }
+    if (op.kind != lang_mir.MIR_OP_SYM) { ret isa_spirv.STORAGE_FUNCTION; }
+    val gx: u32 = emit_global.lookup(e, op.sym);
+    if (gx == emit_global.GL_NONE) { ret isa_spirv.STORAGE_FUNCTION; }
+    ret e.gstorage[gx];
+}
+
+pub fun global_load_emit(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, mi: *lang_mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count != 2 || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+        ret emitter.unsupported_made(e, addressed_memory_refusal(e, mf, ?mi.operands[0]));
+    }
+    # a specialization constant is read as the constant it is, with no load
+    val spec_id: u32 = spec_target(e, ?mi.operands[1]);
+    if (spec_id != 0) { ret arith.store_vreg(e, vm, mi.operands[0].vreg.n, spec_id); }
+    var chain_ty:       u32  = 0;
+    var chain_sc:       u32  = 0;
+    var var_id:         u32  = address(e, vm, ?mi.operands[1], ?chain_ty, ?chain_sc);
+    var from_interface: bool = false;
+    if (var_id == 0) {
+        var_id         = interface_target(e, ?mi.operands[1]);
+        from_interface = true;
+    }
+    # so is a module-scope `val`, which a shader has no storage for
+    if (var_id == 0 && mi.operands[0].vreg.n < vm.n) {
+        val cid: u32 = constant_load(e, ?mi.operands[1], vm.type_id[mi.operands[0].vreg.n]);
+        if (cid != 0) { ret arith.store_vreg(e, vm, mi.operands[0].vreg.n, cid); }
+    }
+    if (var_id == 0) { ret emitter.unsupported_made(e, addressed_memory_refusal(e, mf, ?mi.operands[1])); }
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n || vm.type_id[dst] == 0) {
+        ret emitter.defect(e, "spirv.emit: interface load result vreg has no type");
+    }
+    if (types.type_is_opaque(e.tt, vm.type_id[dst])) {
+        # a pointer to the handle itself, a `*Handle` parameter, is no member walk
+        if (chain_ty != 0 && chain_ty != vm.type_id[dst]) {
+            ret emitter.unsupported(e, "an image handle reached through a member walk is not supported by the SPIR-V target: a handle has no members, so this is an access chain into something that is not an aggregate");
+        }
+        if ((mi.memory_flags & lang_mir.MEMORY_VOLATILE) == 0) {
+            vm.opq_var[dst] = var_id;
+            ret err[fail.Fail].ok{};
+        }
+        vm.opq_var[dst] = 0;
+    }
+    or {
+        if (from_interface) { chain_ty = emit_value.interface_value_type(e, ?mi.operands[1]); }
+        if (array_held_as_vector(e, chain_ty, vm.type_id[dst])) {
+            val whole: u32 = load_whole_as(e, chain_ty, var_id, access_storage_at(e, vm, ?mi.operands[1], chain_sc), vm.type_id[dst], mi.memory_flags);
+            if (whole == 0) { ret emitter.unsupported(e, array_vector_refusal(e)); }
+            ret arith.store_vreg(e, vm, dst, whole);
+        }
+        if (chain_ty != 0 && chain_ty != vm.type_id[dst] && types.is_composite(e.tt, chain_ty)
+            && !types.is_composite(e.tt, vm.type_id[dst])) {
+            var leaf_ptr: u32 = 0;
+            if (leading_leaf(e, var_id, chain_ty, access_storage_at(e, vm, ?mi.operands[1], chain_sc), vm.type_id[dst], ?leaf_ptr) == 0) {
+                ret emitter.unsupported(e, leaf_refusal(e));
+            }
+            var_id = leaf_ptr;
+        }
+    }
+    if (emit_layout.half_bits_bridged(e, chain_ty, vm.type_id[dst])) {
+        val loaded: u32 = isa_spirv.alloc_id(e.b);
+        memory_load(e, chain_ty, loaded, var_id, mi.memory_flags);
+        ret arith.store_vreg(e, vm, dst, emit_layout.half_bits_as(e, loaded, chain_ty, vm.type_id[dst]));
+    }
+    if (emit_layout.memory_bridged(e, chain_ty, vm.type_id[dst])) {
+        val loaded: u32 = isa_spirv.alloc_id(e.b);
+        memory_load(e, chain_ty, loaded, var_id, mi.memory_flags);
+        ret arith.store_vreg(e, vm, dst, emit_layout.lane_width_as(e, loaded, chain_ty, vm.type_id[dst]));
+    }
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    memory_load(e, vm.type_id[dst], result, var_id, mi.memory_flags);
+    ret arith.store_vreg(e, vm, dst, result);
+}
+
+pub fun global_store_emit(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, mi: *lang_mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count != 2) { ret emitter.unsupported_made(e, addressed_memory_refusal(e, mf, ?mi.operands[0])); }
+    var chain_ty: u32 = 0;
+    var chain_sc: u32 = 0;
+    var var_id:   u32 = address(e, vm, ?mi.operands[0], ?chain_ty, ?chain_sc);
+    var value_ty: u32 = chain_ty;
+    # memory holds no logical pointer: a logical pointer names memory the module declares
+    if (mi.operands[1].kind == lang_mir.MIR_OP_VREG && (emit_value.prov_of(vm.prov, vm.n, ?mi.operands[1]) & (emitter.PROV_LOGICAL | emitter.PROV_PHYSICAL)) == emitter.PROV_LOGICAL) {
+        ret emitter.unsupported(e, "a logical pointer cannot be stored in memory in the SPIR-V target: a pointer held in memory is a physical pointer, an address in a buffer the host passes, and this one names a local, an interface variable or an element or member of one, which have no address. store the index of what it points at, or pass the pointer to the function that uses it");
+    }
+    if (var_id == 0) {
+        var_id   = interface_target(e, ?mi.operands[0]);
+        value_ty = emit_value.interface_value_type(e, ?mi.operands[0]);
+    }
+    if (var_id == 0) { ret emitter.unsupported_made(e, addressed_memory_refusal(e, mf, ?mi.operands[0])); }
+    if (mi.operands[1].kind == lang_mir.MIR_OP_VREG && mi.operands[1].vreg.n < vm.n
+        && array_held_as_vector(e, value_ty, vm.type_id[mi.operands[1].vreg.n])) {
+        val vec_ty: u32 = vm.type_id[mi.operands[1].vreg.n];
+        val whole:  u32 = whole_value_as(e, emit_value.read_operand(e, vm, ?mi.operands[1], vec_ty), vec_ty, value_ty);
+        if (e.b.err || whole == 0) { ret emitter.unsupported(e, array_vector_refusal(e)); }
+        memory_store(e, var_id, whole, mi.memory_flags);
+        ret err[fail.Fail].ok{};
+    }
+    if (value_ty != 0 && types.is_composite(e.tt, value_ty) && stored_scalar(e, vm, mi, ?mi.operands[1])) {
+        var want: u32 = 0;
+        if (mi.operands[1].kind == lang_mir.MIR_OP_VREG) { want = vm.type_id[mi.operands[1].vreg.n]; }
+        or {
+            val leaf: u32 = emit_value.leading_leaf_type(e, value_ty);
+            if (mi.width != 0 && types.type_bits(e.tt, leaf) == mi.width::u32 * 8) { want = leaf; }
+        }
+        var leaf_ptr: u32 = 0;
+        if (want == 0 || leading_leaf(e, var_id, value_ty, access_storage_at(e, vm, ?mi.operands[0], chain_sc), want, ?leaf_ptr) == 0) {
+            ret emitter.unsupported(e, leaf_refusal(e));
+        }
+        var_id   = leaf_ptr;
+        value_ty = want;
+    }
+    var value: u32                  = 0;
+    val op:    *lang_mir.MirOperand = ?mi.operands[1];
+    # the value as the function carries it: its register's type, or for a constant the
+    # carrier of the memory's width
+    var held_ty: u32 = value_ty;
+    if (op.kind == lang_mir.MIR_OP_VREG && op.vreg.n < vm.n) { held_ty = vm.type_id[op.vreg.n]; }
+    or (op.kind == lang_mir.MIR_OP_IMM && value_ty != 0 && !types.type_is_float(e.tt, value_ty) && types.type_bits(e.tt, value_ty) != 0) {
+        held_ty = types.type_int(e.tt, emit_layout.carrier_bits(e, types.type_bits(e.tt, value_ty)));
+    }
+    if (emit_layout.half_bits_bridged(e, held_ty, value_ty)) { value = emit_layout.half_bits_as(e, emit_value.read_operand(e, vm, op, held_ty), held_ty, value_ty); }
+    or (emit_layout.memory_bridged(e, held_ty, value_ty))    { value = emit_layout.lane_width_as(e, emit_value.read_operand(e, vm, op, held_ty), held_ty, value_ty); }
+    or                                                       { value = emit_value.read_operand(e, vm, op, value_ty); }
+    if (e.b.err || value == 0)                               { ret emitter.defect(e, "spirv.emit: unreadable value in an interface store"); }
+    memory_store(e, var_id, value, mi.memory_flags);
+    ret err[fail.Fail].ok{};
+}
+
+# an immediate, or a vreg holding a scalar or vector rather than a composite's address
+fun stored_scalar(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, op: *lang_mir.MirOperand) bool {
+    if (op.kind == lang_mir.MIR_OP_IMM)                       { ret true; }
+    if (op.kind != lang_mir.MIR_OP_VREG || op.vreg.n >= vm.n) { ret false; }
+    val ty: u32 = vm.type_id[op.vreg.n];
+    ret ty != 0 && !types.is_composite(e.tt, ty);
+}
+
+# a whole object of the memory type `mem_ty` at `ptr`, read as one of `to_ty`
+# (whole_value_as). one holding an f16 of a stage interface without float16 is read leaf
+# by leaf, since a 16-bit type of no arithmetic capability is loaded only as a scalar or
+# vector. an object read as its own type is loaded whole, since a function holds
+# no bare OpTypeFloat 16. 0 when the types do not match
+fun load_whole_as(e: *emitter.Emit, mem_ty: u32, ptr: u32, storage: u32, to_ty: u32, flags: u8) u32 {
+    if (mem_ty == to_ty || !types.is_composite(e.tt, mem_ty) || !holds_bare_half(e, mem_ty)) {
+        val loaded: u32 = isa_spirv.alloc_id(e.b);
+        memory_load(e, mem_ty, loaded, ptr, flags);
+        ret whole_value_as(e, loaded, mem_ty, to_ty);
+    }
+    val n: u32 = types.composite_count(e.tt, mem_ty);
+    if (n == 0 || !types.is_composite(e.tt, to_ty) || n != types.composite_count(e.tt, to_ty)) { ret 0; }
+    val ar: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel ar.err) {
+        e.b.err = true;
+        ret 0;
+    }
+    val parts: *u32 = ar.ok;
+    fin { A.deallocate[u32](e.alloc, parts, n::usize); }
+    var i: u32 = 0;
+    for (i < n) {
+        val member: u32 = types.composite_member(e.tt, mem_ty, i);
+        val chain:  u32 = emitter.pair_emit(e, isa_spirv.OP_ACCESS_CHAIN, types.type_ptr(e.tt, storage, member), ptr, types.const_int(e.tt, 32, i::i64));
+        chain_memory_scope(e, chain, ptr);
+        parts[i] = load_whole_as(e, member, chain, storage, types.composite_member(e.tt, to_ty, i), flags);
+        if (parts[i] == 0) { ret 0; }
+        i = i + 1;
+    }
+    ret emit_layout.construct_emit(e, to_ty, parts, n);
+}
+
+# a type holding an OpTypeFloat 16 where the selection lacks float16, which only a stage
+# interface declares
+fun holds_bare_half(e: *emitter.Emit, ty: u32) bool {
+    if (ty == 0 || emit_layout.half_memory(e)) { ret false; }
+    var n:    u32 = 0;
+    val lane: u32 = types.vector_shape(e.tt, ty, ?n);
+    if (lane != 0)                     { ret emit_layout.is_half_type(e, lane); }
+    if (!types.is_composite(e.tt, ty)) { ret emit_layout.is_half_type(e, ty); }
+    val count: u32 = types.composite_count(e.tt, ty);
+    var i:     u32 = 0;
+    for (i < count) {
+        if (holds_bare_half(e, types.composite_member(e.tt, ty, i))) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a whole object moved between two declarations of its type: OpCopyLogical where they
+# match member for member, and otherwise rebuilt member by member where they differ only
+# in how memory and a function hold their leaves (memory_bridged), as a narrow integer
+# member of a buffer and of a local do. 0 when they are other types
+fun whole_value_as(e: *emitter.Emit, value: u32, from_ty: u32, to_ty: u32) u32 {
+    if (value == 0 || from_ty == 0 || to_ty == 0) { ret 0; }
+    if (from_ty == to_ty)                         { ret value; }
+    if (types.logically_match(e.tt, from_ty, to_ty)) {
+        val res_: u32 = isa_spirv.alloc_id(e.b);
+        var ops:  [3]u32;
+        ops[0] = to_ty;
+        ops[1] = res_;
+        ops[2] = value;
+        isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COPY_LOGICAL, ?ops[0], 3);
+        ret res_;
+    }
+    if (emit_layout.half_bits_bridged(e, from_ty, to_ty)) { ret emit_layout.half_bits_as(e, value, from_ty, to_ty); }
+    if (emit_layout.memory_bridged(e, from_ty, to_ty))    { ret emit_layout.lane_width_as(e, value, from_ty, to_ty); }
+    # rebuilt member by member, or lane by lane between a vector and the elements of an array
+    var elems: u32 = 0;
+    if (!types.is_composite(e.tt, from_ty) && types.array_shape(e.tt, to_ty, ?elems) == 0) { ret 0; }
+    if (!types.is_composite(e.tt, to_ty) && types.array_shape(e.tt, from_ty, ?elems) == 0) { ret 0; }
+    val n: u32 = types.composite_count(e.tt, from_ty);
+    if (n == 0 || n != types.composite_count(e.tt, to_ty)) { ret 0; }
+    val ar: res[*u32, A.Error] = A.allocate[u32](e.alloc, (n + 2)::usize);
+    if (sel ar.err) {
+        e.b.err = true;
+        ret 0;
+    }
+    val parts: *u32 = ar.ok;
+    fin { A.deallocate[u32](e.alloc, parts, (n + 2)::usize); }
+    var i: u32 = 0;
+    for (i < n) {
+        val from_m: u32 = types.composite_member(e.tt, from_ty, i);
+        val part:   u32 = isa_spirv.alloc_id(e.b);
+        var ops:    [4]u32;
+        ops[0] = from_m;
+        ops[1] = part;
+        ops[2] = value;
+        ops[3] = i;
+        isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COMPOSITE_EXTRACT, ?ops[0], 4);
+        parts[2 + i] = whole_value_as(e, part, from_m, types.composite_member(e.tt, to_ty, i));
+        if (parts[2 + i] == 0) { ret 0; }
+        i = i + 1;
+    }
+    val built: u32 = isa_spirv.alloc_id(e.b);
+    parts[0] = to_ty;
+    parts[1] = built;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COMPOSITE_CONSTRUCT, parts, n + 2);
+    ret built;
+}
+
+pub fun access_chain_emit(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps,
+    mi: *lang_mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count < 3 || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+        ret emitter.unsupported_made(e, addressed_memory_refusal(e, mf, ?mi.operands[1]));
+    }
+    var base_id:  u32 = 0;
+    var base_ty:  u32 = 0;
+    var base_sc:  u32 = 0;
+    var prior_ty: u32 = 0;
+    var prior_sc: u32 = 0;
+    val prior:    u32 = address(e, vm, ?mi.operands[1], ?prior_ty, ?prior_sc);
+    if (prior != 0) {
+        base_id = prior;
+        base_ty = prior_ty;
+        base_sc = prior_sc;
+    }
+    or {
+        var gix: u32 = 0;
+        if (address_origin(e, mf, ?mi.operands[1], ?gix) != ADDR_GLOBAL) {
+            ret emitter.unsupported_made(e, addressed_memory_refusal(e, mf, ?mi.operands[1]));
+        }
+        val g: *me_ir.Global = emit_global.ir_of(e, gix);
+        if (g.iface == me_ir.IFACE_NONE || e.gvar_ids[gix] == 0) {
+            ret emitter.unsupported_made(e, addressed_memory_refusal(e, mf, ?mi.operands[1]));
+        }
+        base_id = e.gvar_ids[gix];
+        base_ty = e.gtype_ids[gix];
+        base_sc = e.gstorage[gix];
+    }
+
+    val physical: bool = base_sc == isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER;
+    val stepped:  bool = mi.operands[2].kind != lang_mir.MIR_OP_IMM || mi.operands[2].imm != 0;
+    if (stepped && !physical) {
+        ret emitter.unsupported(e, "pointer arithmetic across whole objects is not supported by the SPIR-V target: a logical pointer names one object, so a getelementptr's leading index may only be 0");
+    }
+
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n) { ret emitter.defect(e, "spirv.emit: access chain result vreg out of range"); }
+
+    val count: u32 = mi.operand_count - 3;
+    if (count == 0 && !physical) { ret emitter.unsupported_made(e, addressed_memory_refusal(e, mf, ?mi.operands[1])); }
+    if (count > 8) {
+        ret emitter.unsupported(e, "an access chain of more than 8 levels is not supported by the SPIR-V target");
+    }
+
+    var idx: [8]u32;
+    var cur: u32 = base_ty;
+    var k:   u32 = 0;
+    for (k < count) {
+        val opnd: *lang_mir.MirOperand = ?mi.operands[3 + k];
+        if (opnd.kind == lang_mir.MIR_OP_IMM) {
+            if (opnd.imm < 0) { ret emitter.unsupported(e, "a negative index is not supported by the SPIR-V target"); }
+            # a tag's IR field numbering is the composite's: discriminator first, then one member per case
+            val ordinal: u32 = opnd.imm::u32;
+            cur    = types.composite_member(e.tt, cur, ordinal);
+            idx[k] = types.const_int(e.tt, 32, ordinal::i64);
+        }
+        or {
+            val elem:  u32 = types.composite_member(e.tt, cur, 0);
+            var lanes: u32 = 0;
+            if (elem == 0 || types.vector_shape(e.tt, cur, ?lanes) != 0) {
+                ret emitter.unsupported(e, "a runtime index into a record or vector is not supported by the SPIR-V target: SPIR-V takes a struct member and a vector lane by a constant ordinal, since the type reached depends on which one it is");
+            }
+            idx[k] = emit_value.read_operand(e, vm, opnd, types.type_int(e.tt, 32));
+            cur    = elem;
+        }
+        if (cur == 0 || idx[k] == 0) {
+            ret emitter.unsupported(e, "an index reaches past the end of its aggregate in the SPIR-V target");
+        }
+        k = k + 1;
+    }
+    if (e.b.err) { ret emitter.defect(e, "spirv.emit: unreadable index in an access chain"); }
+
+    val ptr_ty: u32 = types.type_ptr(e.tt, base_sc, cur);
+    var result: u32 = base_id;
+    var ops:    [12]u32;
+    ops[0] = ptr_ty;
+    ops[2] = base_id;
+    var at:     u32 = 3;
+    var opcode: u32 = isa_spirv.OP_ACCESS_CHAIN;
+    # a physical pointer steps across whole objects by its pointee's stride
+    if (stepped) {
+        val sr: err[fail.Fail] = stride_pointer(e, base_ty);
+        if (sel sr.err) { ret sr; }
+        ops[3] = emit_value.read_operand(e, vm, ?mi.operands[2], types.type_int(e.tt, 32));
+        if (e.b.err || ops[3] == 0) { ret emitter.defect(e, "spirv.emit: unreadable element step of a physical pointer"); }
+        at     = 4;
+        opcode = isa_spirv.OP_PTR_ACCESS_CHAIN;
+    }
+    k = 0;
+    for (k < count) {
+        ops[at + k] = idx[k];
+        k           = k + 1;
+    }
+    if (stepped || count > 0) {
+        result = isa_spirv.alloc_id(e.b);
+        ops[1] = result;
+        isa_spirv.inst(e.b, ?e.b.functions, opcode, ?ops[0], count + at);
+        chain_memory_scope(e, result, base_id);
+    }
+    if (physical) { emit_layout.mark_physical(e, result, cur); }
+    # a register another instruction defines too holds the pointer as its value
+    if (physical && vm.var_id[dst] != 0) { ret arith.store_vreg(e, vm, dst, result); }
+
+    vm.chain_id[dst] = result;
+    vm.chain_ty[dst] = cur;
+    vm.chain_sc[dst] = base_sc;
+    # the indices as read here, which a call passing this address hands on
+    vm.gep_at[dst] = vm.gep_ids.len::u32 + 1;
+    k              = 0;
+    for (k < count) {
+        val pr: res[usize, A.Error] = collections_vector.push[u32](?vm.gep_ids, idx[k]);
+        if (sel pr.err) { ret err[fail.Fail].err{fail.refused(pr.err)}; }
+        k = k + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a physical pointer stepped across whole objects has its pointee's stride declared on its type
+fun stride_pointer(e: *emitter.Emit, pointee: u32) err[fail.Fail] {
+    val ptr_ty: u32   = types.type_ptr(e.tt, isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER, pointee);
+    var i:      usize = 0;
+    for (i < e.strided.len) {
+        if (e.strided.data[i] == ptr_ty) { ret err[fail.Fail].ok{}; }
+        i = i + 1;
+    }
+    val stride: u32 = emit_layout.vec_at(?e.tsize, pointee);
+    if (stride == 0) { ret emitter.defect(e, "spirv.emit: a physical pointer's pointee has no recorded extent"); }
+    decorate(e, ptr_ty, isa_spirv.DECOR_ARRAY_STRIDE, stride);
+    val pr: res[usize, A.Error] = collections_vector.push[u32](?e.strided, ptr_ty);
+    if (sel pr.err) { ret err[fail.Fail].err{fail.refused(pr.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the physical pointer register an address operand holds, the register itself or the
+# memory at it, MIR_VREG_NIL when it holds none
+pub fun physical_value(vm: *emitter.VMaps, op: *lang_mir.MirOperand) u32 {
+    var v: u32 = lang_mir.MIR_VREG_NIL.n;
+    if (op.kind == lang_mir.MIR_OP_VREG)                                { v = op.vreg.n; }
+    or (op.kind == lang_mir.MIR_OP_MEM && op.imm == 0)                  { v = op.vreg.n; }
+    if (v >= vm.n || vm.prov == nil)                                    { ret lang_mir.MIR_VREG_NIL.n; }
+    if ((vm.prov[v] & emitter.PROV_PHYSICAL) == 0 || vm.var_id[v] == 0) { ret lang_mir.MIR_VREG_NIL.n; }
+    ret v;
+}
+
+# the pointer an address operand names, with its pointee and storage class: an access
+# chain's, or the physical pointer a register holds, read here
+pub fun address(e: *emitter.Emit, vm: *emitter.VMaps, op: *lang_mir.MirOperand, out_ty: *u32, out_sc: *u32) u32 {
+    @out_sc = 0;
+    val c: u32 = emit_value.chain_target(vm, op, out_ty);
+    if (c != 0) {
+        @out_sc = arith.chain_storage(vm, op);
+        ret c;
+    }
+    val v: u32 = physical_value(vm, op);
+    if (v == lang_mir.MIR_VREG_NIL.n) { ret 0; }
+    var sc:      u32 = 0;
+    val pointee: u32 = types.pointer_shape(e.tt, vm.type_id[v], ?sc);
+    if (pointee == 0 || sc != isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER) { ret 0; }
+    var r: lang_mir.MirOperand = @op;
+    r.kind = lang_mir.MIR_OP_VREG;
+    val p: u32 = emit_value.read_operand(e, vm, ?r, 0);
+    if (p == 0) { ret 0; }
+    @out_ty = pointee;
+    @out_sc = sc;
+    ret p;
+}
+
+pub fun memzero_emit(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, mi: *lang_mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count < 1) { ret emitter.defect(e, "spirv.emit: memzero with no destination"); }
+    var target_ty: u32 = 0;
+    var target_sc: u32 = 0;
+    var target:    u32 = address(e, vm, ?mi.operands[0], ?target_ty, ?target_sc);
+    if (target == 0) {
+        target    = interface_target(e, ?mi.operands[0]);
+        target_ty = emit_value.interface_value_type(e, ?mi.operands[0]);
+    }
+    if (target == 0 || target_ty == 0) {
+        ret emitter.unsupported_made(e, addressed_memory_refusal(e, mf, ?mi.operands[0]));
+    }
+    memory_store(e, target, zero_value(e, target_ty), mi.memory_flags);
+    ret err[fail.Fail].ok{};
+}
+
+pub fun memcpy_emit(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, mi: *lang_mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count < 2) { ret emitter.defect(e, "spirv.emit: memcpy with no source or destination"); }
+
+    var dst_ty: u32 = 0;
+    var dst_sc: u32 = 0;
+    var dst:    u32 = address(e, vm, ?mi.operands[0], ?dst_ty, ?dst_sc);
+    if (dst == 0) {
+        dst    = interface_target(e, ?mi.operands[0]);
+        dst_ty = emit_value.interface_value_type(e, ?mi.operands[0]);
+    }
+    if (dst == 0 || dst_ty == 0) { ret emitter.unsupported_made(e, addressed_memory_refusal(e, mf, ?mi.operands[0])); }
+
+    var src_ty: u32 = 0;
+    var src_sc: u32 = 0;
+    var src:    u32 = address(e, vm, ?mi.operands[1], ?src_ty, ?src_sc);
+    if (src == 0) {
+        src    = interface_target(e, ?mi.operands[1]);
+        src_ty = emit_value.interface_value_type(e, ?mi.operands[1]);
+    }
+    # so is the whole of a module-scope `val`, which a shader has no storage for
+    if (src == 0) {
+        val cid: u32 = constant_copy(e, mi, dst_ty);
+        if (cid != 0) {
+            memory_store(e, dst, cid, mi.memory_flags);
+            ret err[fail.Fail].ok{};
+        }
+    }
+    if (src == 0 || src_ty == 0) { ret emitter.unsupported_made(e, addressed_memory_refusal(e, mf, ?mi.operands[1])); }
+
+    val stored: u32 = load_whole_as(e, src_ty, src, access_storage_at(e, vm, ?mi.operands[1], src_sc), dst_ty, mi.memory_flags);
+    if (stored == 0) {
+        ret emitter.unsupported(e, "copying between two objects of different types is not supported by the SPIR-V target: logical addressing carries an object as a value of its own type, so a copy that reinterprets one type as another has no pointer to perform it through");
+    }
+
+    memory_store(e, dst, stored, mi.memory_flags);
+    ret err[fail.Fail].ok{};
+}
+
+pub fun read_value(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, op: *lang_mir.MirOperand,
+    want_ty: u32, flags: u8) res[u32, fail.Fail] {
+    if (op.kind == lang_mir.MIR_OP_MEM || op.kind == lang_mir.MIR_OP_SYM) {
+        var ty:  u32 = 0;
+        var sc:  u32 = 0;
+        var src: u32 = address(e, vm, op, ?ty, ?sc);
+        if (src == 0) {
+            src = interface_target(e, op);
+            ty  = emit_value.interface_value_type(e, op);
+        }
+        if (src == 0 || ty == 0) { ret res[u32, fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_UNSUPPORTED, lang_mir.refusal_loc(mf, e.cur_instr), addressed_memory_refusal(e, mf, op))}; }
+        val converted: u32 = load_whole_as(e, ty, src, access_storage_at(e, vm, op, sc), want_ty, flags);
+        if (converted == 0) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: logical argument object does not match its declared type")}; }
+        ret res[u32, fail.Fail].ok{converted};
+    }
+    if (!arith.operand_matches_type(vm, op, want_ty)) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: logical argument type mismatch")}; }
+    val result: u32 = emit_value.read_operand(e, vm, op, want_ty);
+    if (result == 0 || e.b.err) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: unreadable logical value")}; }
+    ret res[u32, fail.Fail].ok{result};
+}
+
+pub fun write_value(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, op: *lang_mir.MirOperand,
+    held: u32, held_ty: u32, flags: u8) err[fail.Fail] {
+    var storage: u32 = 0;
+    val pointee: u32 = types.pointer_shape(e.tt, held_ty, ?storage);
+    # a physical pointer register holds the pointer as its value
+    if (pointee != 0 && storage == isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER && op.kind == lang_mir.MIR_OP_VREG
+        && op.vreg.n < vm.n && vm.var_id[op.vreg.n] != 0) {
+        ret arith.store_vreg(e, vm, op.vreg.n, held);
+    }
+    if (pointee != 0) {
+        if (op.kind != lang_mir.MIR_OP_VREG || op.vreg.n >= vm.n || vm.type_id[op.vreg.n] != held_ty) {
+            ret emitter.defect(e, "spirv.emit: logical reference binding type mismatch");
+        }
+        vm.chain_id[op.vreg.n] = held;
+        vm.chain_ty[op.vreg.n] = pointee;
+        vm.chain_sc[op.vreg.n] = storage;
+        ret err[fail.Fail].ok{};
+    }
+    if (op.kind == lang_mir.MIR_OP_MEM) {
+        var ty:  u32 = 0;
+        var sc:  u32 = 0;
+        val dst: u32 = address(e, vm, op, ?ty, ?sc);
+        if (dst == 0 || ty == 0) { ret emitter.unsupported_made(e, addressed_memory_refusal(e, mf, op)); }
+        val converted: u32 = whole_value_as(e, held, held_ty, ty);
+        if (converted == 0) { ret emitter.defect(e, "spirv.emit: logical result object does not match its owned home"); }
+        memory_store(e, dst, converted, flags);
+        ret err[fail.Fail].ok{};
+    }
+    if (op.kind != lang_mir.MIR_OP_VREG || op.vreg.n >= vm.n || vm.type_id[op.vreg.n] != held_ty) {
+        ret emitter.defect(e, "spirv.emit: logical result type mismatch");
+    }
+    ret arith.store_vreg(e, vm, op.vreg.n, held);
+}
+
+pub fun param_emit(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, mi: *lang_mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count != 2 || mi.operands[1].kind != lang_mir.MIR_OP_IMM || mi.operands[1].imm < 0) {
+        ret emitter.defect(e, "spirv.emit: malformed logical parameter binding");
+    }
+    val index: u32             = mi.operands[1].imm::u32;
+    val fn:    *me_ir.Function = emit_value.ir_function_record(e.ir, mf.name);
+    if (fn == nil || index >= fn.param_count) { ret emitter.defect(e, "spirv.emit: logical parameter has no signature"); }
+    val at:   u32 = emit_value.key_param(e, e.copies.data[e.cur_copy].key_at, index);
+    val slot: u32 = e.cur_pslot[index];
+    val bind: u32 = e.keys.data[at];
+    if (bind == emitter.BIND_GLOBAL || bind == emitter.BIND_LOCAL) { ret bind_path_param(e, vm, mi, at, slot); }
+    if (bind == emitter.BIND_PHYSICAL) {
+        val pp: res[u32, fail.Fail] = emit_layout.phys_pointer(e, ?e.ir.types, fn.params[index].ty);
+        if (sel pp.err) { ret err[fail.Fail].err{pp.err}; }
+        emit_layout.mark_physical_ptr(e, e.cur_params[slot], pp.ok);
+        ret write_value(e, mf, vm, ?mi.operands[0], e.cur_params[slot], pp.ok, mi.memory_flags);
+    }
+    ret write_value(e, mf, vm, ?mi.operands[0], e.cur_params[slot],
+        emit_value.ir_value_spv_type(e, fn.params[index].ty), mi.memory_flags);
+}
+
+pub fun path_root_type(e: *emitter.Emit, at: u32) u32 {
+    ret emit_layout.spv_type_of(e, ?e.u.mods[e.keys.data[at + 1]].ir.types, e.keys.data[at + 2]::ir_type.IrTypeId);
+}
+
+# a pointer parameter bound to a path: the chain from its root, a global the copy
+# names or the Function-storage object it receives, through the constant ordinals
+# of the key and the indices the copy receives
+fun bind_path_param(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, at: u32, slot: u32) err[fail.Fail] {
+    val dst: *lang_mir.MirOperand = ?mi.operands[0];
+    if (dst.kind != lang_mir.MIR_OP_VREG || dst.vreg.n >= vm.n) {
+        ret emitter.defect(e, "spirv.emit: a reference parameter is not bound to a register");
+    }
+    var root: u32 = 0;
+    var cur:  u32 = 0;
+    var sc:   u32 = isa_spirv.STORAGE_FUNCTION;
+    var next: u32 = slot;
+    if (e.keys.data[at] == emitter.BIND_GLOBAL) {
+        val gx: u32 = e.keys.data[at + 1];
+        root = e.gvar_ids[gx];
+        cur  = e.gtype_ids[gx];
+        sc   = e.gstorage[gx];
+    }
+    or {
+        root = e.cur_params[slot];
+        cur  = path_root_type(e, at);
+        next = slot + 1;
+    }
+    var n:    u32 = 0;
+    val from: u32 = emit_copy.binding_steps(e, at, ?n);
+    var ptr:  u32 = root;
+    if (n > 0) {
+        val ar: res[*u32, A.Error] = A.allocate[u32](e.alloc, (n + 3)::usize);
+        if (sel ar.err) { ret err[fail.Fail].err{fail.refused(ar.err)}; }
+        val ops: *u32 = ar.ok;
+        fin { A.deallocate[u32](e.alloc, ops, (n + 3)::usize); }
+        var i: u32 = 0;
+        for (i < n) {
+            val step: u32 = e.keys.data[from + i];
+            if (step == emitter.STEP_RUNTIME) {
+                ops[3 + i] = e.cur_params[next];
+                next       = next + 1;
+                cur        = types.composite_member(e.tt, cur, 0);
+            }
+            or {
+                ops[3 + i] = types.const_int(e.tt, 32, step::i64);
+                cur        = types.composite_member(e.tt, cur, step);
+            }
+            if (cur == 0) { ret emitter.defect(e, "spirv.emit: a reference parameter's path reaches past its root"); }
+            i = i + 1;
+        }
+        ptr    = isa_spirv.alloc_id(e.b);
+        ops[0] = types.type_ptr(e.tt, sc, cur);
+        ops[1] = ptr;
+        ops[2] = root;
+        isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_ACCESS_CHAIN, ops, n + 3);
+        chain_memory_scope(e, ptr, root);
+    }
+    vm.chain_id[dst.vreg.n] = ptr;
+    vm.chain_ty[dst.vreg.n] = cur;
+    vm.chain_sc[dst.vreg.n] = sc;
+    ret err[fail.Fail].ok{};
+}
+
+# the constant of `ty` the copy `mi` reads, 0 unless it copies the whole of a module-scope `val`
+pub fun constant_copy(e: *emitter.Emit, mi: *lang_mir.MirInstr, ty: u32) u32 {
+    if (mi.operand_count != 3) { ret 0; }
+    val src:  *lang_mir.MirOperand = ?mi.operands[1];
+    val size: *lang_mir.MirOperand = ?mi.operands[2];
+    if (src.kind != lang_mir.MIR_OP_SYM || src.sym_off != 0 || size.kind != lang_mir.MIR_OP_IMM) { ret 0; }
+    val gx: u32 = emit_global.lookup(e, src.sym);
+    if (gx == emit_global.GL_NONE)                                                                                          { ret 0; }
+    if (size.imm != ir_type.byte_size_for_machine(emit_global.types_of(e, gx), emit_global.ir_of(e, gx).ty, e.layout)::i64) { ret 0; }
+    ret constant_global(e, src.sym, ty);
+}
+
+# the constant id of `want_ty` a module-scope `val` named `sym` spells, 0 when it is none:
+# such a value reaches a shader only as a constant, never as a variable it addresses
+pub fun constant_global(e: *emitter.Emit, sym: intern.StrId, want_ty: u32) u32 {
+    val gx: u32 = emit_global.lookup(e, sym);
+    if (gx == emit_global.GL_NONE) { ret 0; }
+    val g: *me_ir.Global = emit_global.ir_of(e, gx);
+    if (g.is_mut || g.is_extern || g.is_import || g.iface != me_ir.IFACE_NONE) { ret 0; }
+    val gt: *ir_type.IrTypeTable = emit_global.types_of(e, gx);
+    if (emit_value.global_spv_type(e, gt, g.ty) != want_ty) { ret 0; }
+    ret output_initializer(e, gt, g, want_ty);
+}
+
+# the constant a whole-value load from `op` reads, 0 unless it names a module-scope `val`
+pub fun constant_load(e: *emitter.Emit, op: *lang_mir.MirOperand, want_ty: u32) u32 {
+    if (want_ty == 0 || op.kind != lang_mir.MIR_OP_SYM || op.sym_off != 0) { ret 0; }
+    ret constant_global(e, op.sym, want_ty);
+}
+
+test memcpy_emit__volatile_self_copy_keeps_load_and_store {
+    var alloc:  A.Allocator;
+    val r_3601: err[A.Error] = page.make(?alloc);
+    if (sel r_3601.err) { ret 1; }
+    var b: isa_spirv.Builder = isa_spirv.builder_init(?alloc);
+    fin { isa_spirv.builder_dnit(?b); }
+    var e: emitter.Emit;
+    e.alloc = ?alloc;
+    e.b     = ?b;
+    var ids: [1]u32 = [1]u32{37};
+    var tys: [1]u32 = [1]u32{42};
+    var scs: [1]u32 = [1]u32{isa_spirv.STORAGE_FUNCTION};
+    var vm:  emitter.VMaps;
+    vm.n        = 1;
+    vm.chain_id = ?ids[0];
+    vm.chain_ty = ?tys[0];
+    vm.chain_sc = ?scs[0];
+    var mf:  lang_mir.MirFunction;
+    var ops: [3]lang_mir.MirOperand;
+    ops[0] = lang_mir.op_mem_value(lang_mir.vreg_id(0), 0);
+    ops[1] = lang_mir.op_mem_value(lang_mir.vreg_id(0), 0);
+    ops[2] = lang_mir.op_imm(16);
+    var mi:   lang_mir.MirInstr = lang_mir.instr(lang_mir.MIR_MEMCPY, ?ops[0], 3, 8, 8);
+    var mode: u32               = 0;
+    for (mode < 2) {
+        b.functions.len = 0;
+        mi.memory_flags = 0;
+        if (mode == 1) { mi.memory_flags = lang_mir.MEMORY_VOLATILE; }
+        val rr: err[fail.Fail] = memcpy_emit(?e, ?mf, ?vm, ?mi);
+        if (sel rr.err) { ret 2; }
+        if (b.err)      { ret 2; }
+        val load_words:  u32 = 4 + mode;
+        val store_words: u32 = 3 + mode;
+        if (b.functions.len != load_words + store_words) { ret 3; }
+        val words: *u32 = b.functions.words;
+        if (words[0] != ((load_words << 16) | isa_spirv.OP_LOAD))             { ret 4; }
+        if (words[1] != 42 || words[3] != 37)                                 { ret 5; }
+        if (words[load_words] != ((store_words << 16) | isa_spirv.OP_STORE))  { ret 6; }
+        if (words[load_words + 1] != 37 || words[load_words + 2] != words[2]) { ret 7; }
+        if (mode == 1 && (words[4] != 1 || words[load_words + 3] != 1))       { ret 8; }
+        mode = mode + 1;
+    }
+    ret 0;
+}
+
+test global_load_emit__volatile_opaque_load_is_evaluated_once {
+    var alloc:  A.Allocator;
+    val r_3643: err[A.Error] = page.make(?alloc);
+    if (sel r_3643.err) { ret 1; }
+    var b: isa_spirv.Builder = isa_spirv.builder_init(?alloc);
+    fin { isa_spirv.builder_dnit(?b); }
+    var tt: types.TypeTable = types.types_init(?b);
+    fin { types.types_dnit(?tt); }
+    val ty: u32 = types.type_sampler(?tt);
+    if (ty == 0) { ret 1; }
+    var globals: [1]emitter.GlobalEnt;
+    globals[0].name = intern.str_id(1);
+    var ids: [1]u32 = [1]u32{37};
+    var e:   emitter.Emit;
+    e.alloc    = ?alloc;
+    e.b        = ?b;
+    e.tt       = ?tt;
+    e.gls      = ?globals[0];
+    e.gl_len   = 1;
+    e.gvar_ids = ?ids[0];
+    var tys:      [1]u32 = [1]u32{ty};
+    var held:     [1]u32 = [1]u32{0};
+    var deferred: [1]u32 = [1]u32{37};
+    var vm:       emitter.VMaps;
+    vm.n       = 1;
+    vm.type_id = ?tys[0];
+    vm.opq_ssa = ?held[0];
+    vm.opq_var = ?deferred[0];
+    var mf:  lang_mir.MirFunction;
+    var ops: [2]lang_mir.MirOperand;
+    ops[0] = lang_mir.op_vreg(lang_mir.vreg_id(0));
+    ops[1] = lang_mir.op_sym(intern.str_id(1), 0);
+    var mi: lang_mir.MirInstr = lang_mir.instr(lang_mir.MIR_LOAD, ?ops[0], 2, 8, 8);
+    mi.memory_flags = lang_mir.MEMORY_VOLATILE;
+    val r_3674: err[fail.Fail] = global_load_emit(?e, ?mf, ?vm, ?mi);
+    if (sel r_3674.err)                                    { ret 2; }
+    if (b.functions.len != 5 || b.functions.words[4] != 1) { ret 3; }
+    if (held[0] == 0 || deferred[0] != 0)                  { ret 4; }
+    val first:  u32 = emit_value.read_operand(?e, ?vm, ?ops[0], ty);
+    val second: u32 = emit_value.read_operand(?e, ?vm, ?ops[0], ty);
+    if (first != held[0] || second != held[0]) { ret 5; }
+    if (b.functions.len != 5 || b.err)         { ret 6; }
+    ret 0;
+}

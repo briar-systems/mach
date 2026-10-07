@@ -1,0 +1,1031 @@
+# how a type is laid out in memory and the SPIR-V type that carries it: block
+# layout rules, physical pointers and the narrow and half-width bridges
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std_format: std.format;
+
+use A: std.allocator;
+
+use lang_checked: mach.lang.checked;
+use mach.lang.diagnostic;
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.float;
+use mach.lang.growth;
+use mach.lang.intern;
+use mach.lang.layout;
+use me_ir:   mach.lang.me.ir;
+use ir_id:   mach.lang.me.ir.id;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use lang_mir:          mach.lang.mir;
+use mir_debug:         mach.lang.mir.debug;
+use mir_structure:     mach.lang.mir.structure;
+use mir_unit:          mach.lang.mir.unit;
+use lang_source:       mach.lang.source;
+use target_definition: mach.lang.target.definition;
+use mach.lang.target.extension;
+use extension_spirv: mach.lang.target.extension.spirv;
+use mach.lang.target.isa;
+use isa_spirv: mach.lang.target.isa.spirv;
+use mach.lang.target.isa.spirv.debug;
+use mach.lang.target.isa.spirv.defs;
+use emit_builtin:    mach.lang.target.isa.spirv.emit.builtin;
+use emit_capability: mach.lang.target.isa.spirv.emit.capability;
+use mach.lang.target.isa.spirv.emit.emitter;
+use emit_global: mach.lang.target.isa.spirv.emit.global;
+use mach.lang.target.isa.spirv.ops;
+use mach.lang.target.isa.spirv.types;
+use target_model: mach.lang.target.model;
+use model_spirv:  mach.lang.target.model.spirv;
+use target_of:    mach.lang.target.of;
+use mach.lang.textbuild;
+
+pub fun is_block_iface(iface: u8) bool {
+    ret iface == me_ir.IFACE_UNIFORM || iface == me_ir.IFACE_STORAGE || iface == me_ir.IFACE_PUSH;
+}
+
+# an f16 is the OpTypeFloat 16 it is where the selection holds Float16: in a stage
+# interface, a buffer, push block or `#[shared]` variable, and a local,
+# parameter or result
+pub fun half_memory(e: *emitter.Emit) bool {
+    ret (e.tgt.model.extensions & extension_spirv.FLOAT16) != 0;
+}
+
+# the type a host-shared variable or member of the ir type `id` is declared with: its
+# 8- and 16-bit scalars declared under their storage access capability rather than the
+# arithmetic one of their width
+fun host_shared_type(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId) u32 {
+    val prior: bool = e.tt.storage_only;
+    e.tt.storage_only = true;
+    val ty: u32 = spv_type_of(e, gt, id);
+    e.tt.storage_only = prior;
+    ret ty;
+}
+
+# the type a stage input or output of the ir type `id` is declared with: as host-shared
+# memory, with an f16 the OpTypeFloat 16 it is under every selection, since a pipeline
+# interpolates a float and matches stages by type, and without float16 a function carries
+# its bits
+pub fun interface_type(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId) u32 {
+    val prior: bool = e.half_interface;
+    e.half_interface = true;
+    val ty: u32 = host_shared_type(e, gt, id);
+    e.half_interface = prior;
+    ret ty;
+}
+
+# the widths of 8- and 16-bit scalars a type holds anywhere inside it, 8 | 16 as bits
+fun narrow_widths(e: *emitter.Emit, ty: u32) u32 {
+    if (ty == 0) { ret 0; }
+    var lanes: u32 = 0;
+    val lane:  u32 = types.vector_shape(e.tt, ty, ?lanes);
+    if (lane != 0) { ret narrow_widths(e, lane); }
+    if (types.is_composite(e.tt, ty)) {
+        var w: u32 = 0;
+        var i: u32 = 0;
+        val n: u32 = types.composite_count(e.tt, ty);
+        for (i < n) {
+            w = w | narrow_widths(e, types.composite_member(e.tt, ty, i));
+            i = i + 1;
+        }
+        ret w;
+    }
+    if (types.type_is_bool(e.tt, ty)) { ret 0; }
+    val bits: u32 = types.type_bits(e.tt, ty);
+    if (bits == 8 || bits == 16) { ret bits; }
+    ret 0;
+}
+
+# the storage access capability and feature of `bits` held in memory of `role`, a block's
+# interface role or ROLE_PHYSICAL. false when there is none
+fun storage_access(role: u8, bits: u32, out_cap: *u32, out_ext: *u64) bool {
+    val wide: bool = bits == 16;
+    if (role == me_ir.IFACE_STORAGE || role == emitter.ROLE_PHYSICAL) {
+        if (wide) {
+            @out_cap = isa_spirv.CAP_STORAGE_BUFFER_16BIT_ACCESS;
+            @out_ext = extension_spirv.STORAGE_BUFFER_16BIT_ACCESS;
+        }
+        or {
+            @out_cap = isa_spirv.CAP_STORAGE_BUFFER_8BIT_ACCESS;
+            @out_ext = extension_spirv.STORAGE_BUFFER_8BIT_ACCESS;
+        }
+        ret true;
+    }
+    if (role == me_ir.IFACE_UNIFORM) {
+        if (wide) {
+            @out_cap = isa_spirv.CAP_UNIFORM_AND_STORAGE_BUFFER_16BIT_ACCESS;
+            @out_ext = extension_spirv.UNIFORM_AND_STORAGE_BUFFER_16BIT_ACCESS;
+        }
+        or {
+            @out_cap = isa_spirv.CAP_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS;
+            @out_ext = extension_spirv.UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS;
+        }
+        ret true;
+    }
+    if (role == me_ir.IFACE_PUSH) {
+        if (wide) {
+            @out_cap = isa_spirv.CAP_STORAGE_PUSH_CONSTANT16;
+            @out_ext = extension_spirv.STORAGE_PUSH_CONSTANT16;
+        }
+        or {
+            @out_cap = isa_spirv.CAP_STORAGE_PUSH_CONSTANT8;
+            @out_ext = extension_spirv.STORAGE_PUSH_CONSTANT8;
+        }
+        ret true;
+    }
+    ret false;
+}
+
+# a block member of `leaf_ty` in memory of `role` needs the storage access feature of its width
+fun require_member_access(e: *emitter.Emit, leaf_ty: u32, role: u8) err[fail.Fail] {
+    val w: u32 = narrow_widths(e, leaf_ty);
+    if (w == 0) { ret err[fail.Fail].ok{}; }
+    var cap: u32 = 0;
+    var ext: u64 = 0;
+    if (!storage_access(role, w, ?cap, ?ext)) { ret emitter.defect(e, "spirv.emit: a block member's storage class has no storage access capability"); }
+    # StorageBuffer8BitAccess is defined on the StorageBuffer class, and a storage buffer
+    # is a BufferBlock in Uniform below SPIR-V 1.3
+    if (role == me_ir.IFACE_STORAGE && (w & 8) != 0 && isa_spirv.storage_buffer_class(e.b.version) != isa_spirv.STORAGE_STORAGE_BUFFER) {
+        val r: res[str, std_format.FormatError] = std_format.sprint(e.alloc,
+            "an 8-bit member of a `#[storage(...)]` block needs the StorageBuffer storage class, which the storage_buffer_8bit_access feature is defined on, and the `{}` environment selects SPIR-V {}.{}, where a storage buffer is a BufferBlock in the Uniform class: raise `env` to `{}` or later, or widen the member",
+            isa_spirv.env_profile_name(e.tgt.identity.env_profile), isa_spirv.version_major(e.b.version), isa_spirv.version_minor(e.b.version), isa_spirv.env_name_from(isa_spirv.SPV_VERSION_1_3));
+        if (sel r.err) { ret err[fail.Fail].err{fail.format_refused(r.err)}; }
+        ret err[fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_CAPABILITY, site_loc(e), r.ok)};
+    }
+    var place: str = block_place(role, "a");
+    if (role == emitter.ROLE_PHYSICAL) { place = "a record a physical pointer reaches"; }
+    ret emit_capability.require_at_made(e, site_loc(e), e.cur_stages, cap, ext, fail.format(e.alloc, "a {}-bit member of {}", w, place));
+}
+
+# a stage input or output holding a 16-bit scalar needs storage_input_output16, and one
+# holding an 8-bit scalar is refused, since Vulkan defines no 8-bit stage interface
+pub fun require_interface_access(e: *emitter.Emit, value_ty: u32, gi: u32) err[fail.Fail] {
+    val w: u32 = narrow_widths(e, value_ty);
+    if (w == 0) { ret err[fail.Fail].ok{}; }
+    val where: res[str, fail.Fail] = emit_global.mod_prefix(e, gi);
+    if (sel where.err) { ret err[fail.Fail].err{where.err}; }
+    if ((w & 8) != 0) {
+        ret err[fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_INTERFACE, emit_global.ir_of(e, gi).decl_loc, fail.format(e.alloc,
+            "the stage interface variable `{}`{} holds an 8-bit scalar, and Vulkan defines no 8-bit stage input or output: there is no storage capability or device feature for one. carry the value in a 16- or 32-bit member",
+            emit_global.spelling_of(e, gi), where.ok))};
+    }
+    ret emit_capability.require_at_made(e, emit_global.ir_of(e, gi).decl_loc, 0, isa_spirv.CAP_STORAGE_INPUT_OUTPUT16, extension_spirv.STORAGE_INPUT_OUTPUT16,
+        fail.format(e.alloc, "the stage interface variable `{}`{}, which holds a 16-bit scalar,", emit_global.spelling_of(e, gi), where.ok));
+}
+
+# a memory type and the type a function carries its value in that differ only in how
+# the function holds it: a narrow integer of host-shared memory, or a vector of them, and
+# the wider integer it is computed in where its width has no arithmetic capability
+pub fun memory_bridged(e: *emitter.Emit, a: u32, b: u32) bool {
+    if (a == 0 || b == 0 || a == b) { ret false; }
+    var na: u32 = 1;
+    var nb: u32 = 1;
+    val la: u32 = lane_of(e, a, ?na);
+    val lb: u32 = lane_of(e, b, ?nb);
+    if (na != nb || types.type_is_float(e.tt, la) || types.type_is_float(e.tt, lb)) { ret false; }
+    val ab: u32 = types.type_bits(e.tt, la);
+    val bb: u32 = types.type_bits(e.tt, lb);
+    ret ab != 0 && bb != 0 && ab != bb;
+}
+
+# an OpTypeFloat 16 of a stage interface and the 16- or 32-bit integer bits, or a vector
+# of them lane for lane, a function carries an f16 in without float16
+pub fun half_bits_bridged(e: *emitter.Emit, a: u32, b: u32) bool {
+    if (a == 0 || b == 0 || a == b) { ret false; }
+    var na: u32 = 1;
+    var nb: u32 = 1;
+    val la: u32 = lane_of(e, a, ?na);
+    val lb: u32 = lane_of(e, b, ?nb);
+    if (na != nb) { ret false; }
+    val ha: bool = is_half_type(e, la);
+    if (ha == is_half_type(e, lb)) { ret false; }
+    var held: u32 = la;
+    if (ha)                                                                { held = lb; }
+    if (types.type_is_float(e.tt, held) || types.type_is_bool(e.tt, held)) { ret false; }
+    val w: u32 = types.type_bits(e.tt, held);
+    ret w == 16 || w == 32;
+}
+
+# the integer bits a function carries an f16 of a stage interface in without float16: a
+# scalar, or each lane of a vector, at the carrier of its width. any other type as it is
+pub fun half_bits_type(e: *emitter.Emit, ty: u32) u32 {
+    if (ty == 0 || half_memory(e)) { ret ty; }
+    var n:    u32 = 1;
+    val lane: u32 = lane_of(e, ty, ?n);
+    if (!is_half_type(e, lane)) { ret ty; }
+    val held: u32 = types.type_int(e.tt, carrier_bits(e, 16));
+    if (n == 1) { ret held; }
+    ret types.type_vector_value(e.tt, held, n);
+}
+
+pub fun is_half_type(e: *emitter.Emit, ty: u32) bool {
+    ret types.type_is_float(e.tt, ty) && types.type_bits(e.tt, ty) == 16;
+}
+
+# a vector type's lane type and count, and a scalar as one lane of itself
+pub fun lane_of(e: *emitter.Emit, ty: u32, out_count: *u32) u32 {
+    var n:    u32 = 0;
+    val lane: u32 = types.vector_shape(e.tt, ty, ?n);
+    if (lane != 0) {
+        @out_count = n;
+        ret lane;
+    }
+    @out_count = 1;
+    ret ty;
+}
+
+# an f16 moved across half_bits_bridged, lane by lane through binary32: without Float16
+# no instruction but a width conversion takes an OpTypeFloat 16, so its bits are not
+# bitcast but packed and unpacked, and an f16 is exact in binary32 both ways
+pub fun half_bits_as(e: *emitter.Emit, value: u32, from_ty: u32, to_ty: u32) u32 {
+    var n:  u32 = 1;
+    var m:  u32 = 1;
+    val fl: u32 = lane_of(e, from_ty, ?n);
+    val tl: u32 = lane_of(e, to_ty, ?m);
+    if (value == 0 || n == 0 || n > 16 || n != m) { ret 0; }
+    val glsl: u32 = ext_set_id(e, defs.SPV_SET_GLSL450::u32);
+    val f32t: u32 = types.type_float(e.tt, 32);
+    val u32t: u32 = types.type_int(e.tt, 32);
+    val pair: u32 = types.type_vector_value(e.tt, f32t, 2);
+    var wide: u32 = f32t;
+    if (n > 1) { wide = types.type_vector_value(e.tt, f32t, n); }
+    var lanes: [16]u32;
+    var i:     u32 = 0;
+    if (is_half_type(e, fl)) {
+        val zero: u32 = types.const_scalar(e.tt, f32t, 0, 0);
+        val w:    u32 = half_inst(e, isa_spirv.OP_F_CONVERT, wide, value, 0, 0, 1);
+        for (i < n) {
+            var f: u32 = w;
+            if (n > 1) { f = half_inst(e, isa_spirv.OP_COMPOSITE_EXTRACT, f32t, w, i, 0, 2); }
+            val v:    u32 = half_inst(e, isa_spirv.OP_COMPOSITE_CONSTRUCT, pair, f, zero, 0, 2);
+            val bits: u32 = half_inst(e, isa_spirv.OP_EXT_INST, u32t, glsl, defs.GLSL450_PACK_HALF_2X16, v, 3);
+            lanes[i] = lane_width_as(e, bits, u32t, tl);
+            i        = i + 1;
+        }
+        if (n == 1) { ret lanes[0]; }
+        ret construct_emit(e, to_ty, ?lanes[0], n);
+    }
+    for (i < n) {
+        var c: u32 = value;
+        if (n > 1) { c = half_inst(e, isa_spirv.OP_COMPOSITE_EXTRACT, fl, value, i, 0, 2); }
+        val bits: u32 = lane_width_as(e, c, fl, u32t);
+        val v:    u32 = half_inst(e, isa_spirv.OP_EXT_INST, pair, glsl, defs.GLSL450_UNPACK_HALF_2X16, bits, 3);
+        lanes[i] = half_inst(e, isa_spirv.OP_COMPOSITE_EXTRACT, f32t, v, 0, 0, 2);
+        i        = i + 1;
+    }
+    var w: u32 = lanes[0];
+    if (n > 1) { w = construct_emit(e, wide, ?lanes[0], n); }
+    ret half_inst(e, isa_spirv.OP_F_CONVERT, to_ty, w, 0, 0, 1);
+}
+
+# an instruction of half_bits_as: a result of `ty` from `argc` operand words
+pub fun half_inst(e: *emitter.Emit, opcode: u32, ty: u32, a: u32, b: u32, c: u32, argc: u32) u32 {
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var words:  [5]u32;
+    words[0] = ty;
+    words[1] = result;
+    words[2] = a;
+    words[3] = b;
+    words[4] = c;
+    isa_spirv.inst(e.b, ?e.b.functions, opcode, ?words[0], 2 + argc);
+    ret result;
+}
+
+# an OpCompositeConstruct of `ty` from its `n` parts
+pub fun construct_emit(e: *emitter.Emit, ty: u32, parts: *u32, n: u32) u32 {
+    val ar: res[*u32, A.Error] = A.allocate[u32](e.alloc, (n + 2)::usize);
+    if (sel ar.err) {
+        e.b.err = true;
+        ret 0;
+    }
+    val words: *u32 = ar.ok;
+    fin { A.deallocate[u32](e.alloc, words, (n + 2)::usize); }
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    words[0] = ty;
+    words[1] = result;
+    var i: u32 = 0;
+    for (i < n) {
+        words[2 + i] = parts[i];
+        i            = i + 1;
+    }
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COMPOSITE_CONSTRUCT, words, 2 + n);
+    ret result;
+}
+
+pub fun bitcast_emit(e: *emitter.Emit, to_ty: u32, value: u32) u32 {
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var words:  [3]u32;
+    words[0] = to_ty;
+    words[1] = result;
+    words[2] = value;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_BITCAST, ?words[0], 3);
+    ret result;
+}
+
+pub fun block_type(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId, role: u8) res[u32, fail.Fail] {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(gt, id);
+    if (sel opt_.none) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: uniform global has no IR type")}; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind != ir_type.IRT_STRUCT) {
+        ret res[u32, fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_INTERFACE, site_loc(e), fail.format(e.alloc,
+            "a `{}` variable must be a `rec`: it is a BLOCK with a host-visible layout, and a bare scalar or vector has no block layout for a pipeline to bind. wrap the value in a record with one field",
+            block_role(role)))};
+    }
+    val n: u32 = t.data.struct_.field_count;
+    if (n == 0 || n > types.MAX_STRUCT_MEMBERS) {
+        ret res[u32, fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_INTERFACE, site_loc(e), "a `#[uniform(...)]` / `#[storage(...)]` / `#[push]` block must have between 1 and 16 fields")};
+    }
+
+    val sr: res[u32, fail.Fail] = laid_out_struct(e, gt, id, role);
+    if (sel sr.err) { ret sr; }
+    val struct_id: u32 = sr.ok;
+
+    var bops: [2]u32;
+    bops[0] = struct_id;
+    bops[1] = isa_spirv.DECOR_BLOCK;
+    if (role == me_ir.IFACE_STORAGE) { bops[1] = isa_spirv.storage_block_decoration(e.b.version); }
+    isa_spirv.inst(e.b, ?e.b.decorations, isa_spirv.OP_DECORATE, ?bops[0], 2);
+    ret res[u32, fail.Fail].ok{struct_id};
+}
+
+fun laid_out_struct(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId, role: u8) res[u32, fail.Fail] {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(gt, id);
+    if (sel opt_.none) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: uniform block member has no IR type")}; }
+    val t: *ir_type.IrType = opt_.some;
+    val n: u32             = t.data.struct_.field_count;
+    if (n == 0 || n > types.MAX_STRUCT_MEMBERS) {
+        if (role == emitter.ROLE_PHYSICAL) {
+            ret res[u32, fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_INTERFACE, site_loc(e), "a record a physical pointer reaches must have between 1 and 16 fields in the SPIR-V target")};
+        }
+        ret res[u32, fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_INTERFACE, site_loc(e), "a `#[uniform(...)]` / `#[storage(...)]` block must have between 1 and 16 fields")};
+    }
+    # a record a cycle of pointers reaches is declared once, after the pointer its cycle names it by
+    val key: u32 = t.data.struct_.key;
+    var rx:  u32 = emitter.COPY_NONE;
+    if (role == emitter.ROLE_PHYSICAL && key != ir_type.REC_KEY_NONE) {
+        val rr: res[u32, fail.Fail] = phys_rec(e, key);
+        if (sel rr.err) { ret rr; }
+        rx = rr.ok;
+        if (e.precs.data[rx].strct != 0) { ret res[u32, fail.Fail].ok{e.precs.data[rx].strct}; }
+        e.precs.data[rx].building = true;
+    }
+
+    var members: [16]u32;
+    var offs:    [16]u32;
+    var i:       u32 = 0;
+    for (i < n) {
+        val mr: res[u32, fail.Fail] = laid_out_type(e, gt, t.data.struct_.fields[i], role);
+        if (sel mr.err) { ret mr; }
+        members[i] = mr.ok;
+        offs[i]    = ir_type.byte_offset_for_machine(gt, id, i, e.layout);
+        i          = i + 1;
+    }
+
+    val lr: err[fail.Fail] = check_block_layout(e, gt, id, role);
+    if (sel lr.err) { ret res[u32, fail.Fail].err{lr.err}; }
+    if (role == emitter.ROLE_PHYSICAL && rx == emitter.COPY_NONE) {
+        val hit: u32 = phys_find(e, false, n, ?members[0], ?offs[0]);
+        if (hit != 0) { ret res[u32, fail.Fail].ok{hit}; }
+    }
+    val struct_id: u32 = types.type_struct(e.tt, ?members[0], n, true);
+    if (struct_id == 0) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: could not build a uniform block type")}; }
+
+    i = 0;
+    for (i < n) {
+        var mops: [4]u32;
+        mops[0] = struct_id;
+        mops[1] = i;
+        mops[2] = isa_spirv.DECOR_OFFSET;
+        mops[3] = offs[i];
+        isa_spirv.inst(e.b, ?e.b.decorations, isa_spirv.OP_MEMBER_DECORATE, ?mops[0], 4);
+        i = i + 1;
+    }
+    if (role != emitter.ROLE_PHYSICAL) { ret res[u32, fail.Fail].ok{struct_id}; }
+    val nr: err[fail.Fail] = phys_note(e, struct_id, gt, id);
+    if (sel nr.err) { ret res[u32, fail.Fail].err{nr.err}; }
+    if (rx != emitter.COPY_NONE) {
+        e.precs.data[rx].strct    = struct_id;
+        e.precs.data[rx].building = false;
+        if (types.type_ptr_at(e.tt, e.precs.data[rx].ptr, isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER, struct_id) == 0) {
+            ret res[u32, fail.Fail].err{fail.message("spirv.emit: could not declare a physical pointer to a record")};
+        }
+        ret res[u32, fail.Fail].ok{struct_id};
+    }
+    val kr: err[fail.Fail] = phys_keep(e, false, n, ?members[0], ?offs[0], struct_id);
+    if (sel kr.err) { ret res[u32, fail.Fail].err{kr.err}; }
+    ret res[u32, fail.Fail].ok{struct_id};
+}
+
+fun laid_out_type(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId, role: u8) res[u32, fail.Fail] {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(gt, id);
+    if (sel opt_.none) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: uniform block member has no IR type")}; }
+    val t: *ir_type.IrType = opt_.some;
+
+    if (t.kind == ir_type.IRT_STRUCT) { ret laid_out_struct(e, gt, id, role); }
+
+    # a pointer held in memory is a physical one, whatever memory holds it
+    if (t.kind == ir_type.IRT_PTR) {
+        val pr: res[u32, fail.Fail] = phys_pointer(e, gt, id);
+        if (sel pr.err)                    { ret pr; }
+        if (role != emitter.ROLE_PHYSICAL) { ret pr; }
+        val ptr: u32            = pr.ok;
+        val nr:  err[fail.Fail] = phys_note(e, ptr, gt, id);
+        if (sel nr.err) { ret res[u32, fail.Fail].err{nr.err}; }
+        ret res[u32, fail.Fail].ok{ptr};
+    }
+
+    if (t.kind == ir_type.IRT_TAG) {
+        ret res[u32, fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_INTERFACE, site_loc(e), fail.format(e.alloc,
+            "a `tag` inside {} is not supported by the SPIR-V target: the block's layout is the host's contract, mach places every case payload at one common offset, and SPIR-V block members may not overlap, so no member offsets can describe where the host writes the payload. keep the tag in Function storage or an `#[input]` / `#[output]` variable, or carry the discriminator and the payload as separate block members{}",
+            block_place(role, "a"), storage_hint(role)))};
+    }
+
+    if (t.kind == ir_type.IRT_ARRAY) {
+        val er: res[u32, fail.Fail] = laid_out_type(e, gt, t.data.array_.element, role);
+        if (sel er.err) { ret er; }
+        val elem_ty: u32 = er.ok;
+        val stride:  u32 = ir_type.byte_size_for_machine(gt, t.data.array_.element, e.layout);
+        val want:    u32 = required_stride(e, gt, t.data.array_.element, is_std430(role));
+        if (want == 0) {
+            ret res[u32, fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_INTERFACE, site_loc(e), "unsupported uniform block member type in the SPIR-V target")};
+        }
+        if (stride != want) {
+            ret res[u32, fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_INTERFACE, site_loc(e), fail.format(e.alloc,
+                "an array inside {} needs an element stride of {} bytes in the SPIR-V target, and mach's layout packs it at {}: a block's array stride is rounded up to the element's base alignment, which mach's own layout does not do, so the shader and the host would disagree about where the elements are. pad the element to {} bytes, or use an element that is that wide already (`f32x4`){}",
+                block_place(role, "a"), want, stride, want, storage_hint(role)))};
+        }
+        var ids:  [1]u32;
+        var offs: [1]u32;
+        ids[0]  = elem_ty;
+        offs[0] = stride;
+        if (role == emitter.ROLE_PHYSICAL) {
+            val hit: u32 = phys_find(e, true, t.data.array_.count, ?ids[0], ?offs[0]);
+            if (hit != 0) { ret res[u32, fail.Fail].ok{hit}; }
+        }
+        val arr_id: u32 = types.type_array(e.tt, elem_ty, t.data.array_.count, true);
+        if (arr_id == 0) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: could not build a uniform block array type")}; }
+        var aops: [3]u32;
+        aops[0] = arr_id;
+        aops[1] = isa_spirv.DECOR_ARRAY_STRIDE;
+        aops[2] = stride;
+        isa_spirv.inst(e.b, ?e.b.decorations, isa_spirv.OP_DECORATE, ?aops[0], 3);
+        if (role == emitter.ROLE_PHYSICAL) {
+            val kr: err[fail.Fail] = phys_keep(e, true, t.data.array_.count, ?ids[0], ?offs[0], arr_id);
+            if (sel kr.err) { ret res[u32, fail.Fail].err{kr.err}; }
+            val nr: err[fail.Fail] = phys_note(e, arr_id, gt, id);
+            if (sel nr.err) { ret res[u32, fail.Fail].err{nr.err}; }
+        }
+        ret res[u32, fail.Fail].ok{arr_id};
+    }
+
+    val mt: u32 = host_shared_type(e, gt, id);
+    if (mt == 0) {
+        if (e.has_held) {
+            e.has_held = false;
+            ret res[u32, fail.Fail].err{e.held};
+        }
+        ret res[u32, fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_INTERFACE, site_loc(e), "unsupported uniform block member type in the SPIR-V target")};
+    }
+    val ar: err[fail.Fail] = require_member_access(e, mt, role);
+    if (sel ar.err) { ret res[u32, fail.Fail].err{ar.err}; }
+    if (role == emitter.ROLE_PHYSICAL) {
+        val nr: err[fail.Fail] = phys_note(e, mt, gt, id);
+        if (sel nr.err) { ret res[u32, fail.Fail].err{nr.err}; }
+    }
+    ret res[u32, fail.Fail].ok{mt};
+}
+
+# the explicit-layout type built for physical memory with these members, 0 when none is
+fun phys_find(e: *emitter.Emit, array: bool, n: u32, ids: *u32, offs: *u32) u32 {
+    var w: u32 = n;
+    if (array) { w = 1; }
+    var i: usize = 0;
+    for (i < e.pkeys.len) {
+        val k: *emitter.PhysKey = ?e.pkeys.data[i];
+        i = i + 1;
+        if (k.array != array || k.n != n) { cnt; }
+        var j:    u32  = 0;
+        var same: bool = true;
+        for (j < w && same) {
+            same = k.ids[j] == ids[j] && k.offs[j] == offs[j];
+            j    = j + 1;
+        }
+        if (same) { ret k.id; }
+    }
+    ret 0;
+}
+
+fun phys_keep(e: *emitter.Emit, array: bool, n: u32, ids: *u32, offs: *u32, id: u32) err[fail.Fail] {
+    var k: emitter.PhysKey;
+    k.array = array;
+    k.n     = n;
+    k.id    = id;
+    var w: u32 = n;
+    if (array) { w = 1; }
+    var j: u32 = 0;
+    for (j < w) {
+        k.ids[j]  = ids[j];
+        k.offs[j] = offs[j];
+        j         = j + 1;
+    }
+    val pr: res[usize, A.Error] = collections_vector.push[emitter.PhysKey](?e.pkeys, k);
+    if (sel pr.err) { ret err[fail.Fail].err{fail.refused(pr.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# records the alignment and extent physical memory holds the type `spv` in, the least
+# alignment any type it stands for asks, which an access through a pointer to it carries
+fun phys_note(e: *emitter.Emit, spv: u32, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId) err[fail.Fail] {
+    val align: u32 = ir_type.natural_align_for_machine(gt, id, e.layout);
+    val size:  u32 = ir_type.byte_size_for_machine(gt, id, e.layout);
+    val had:   u32 = vec_at(?e.talign, spv);
+    if (had != 0 && had < align) { ret err[fail.Fail].ok{}; }
+    val ra: err[fail.Fail] = vec_set(?e.talign, spv, align);
+    if (sel ra.err) { ret ra; }
+    ret vec_set(?e.tsize, spv, size);
+}
+
+pub fun vec_at(v: *Vector[u32], at: u32) u32 {
+    if (at::usize >= v.len) { ret 0; }
+    ret v.data[at::usize];
+}
+
+fun vec_set(v: *Vector[u32], at: u32, value: u32) err[fail.Fail] {
+    for (v.len <= at::usize) {
+        val pr: res[usize, A.Error] = collections_vector.push[u32](v, 0);
+        if (sel pr.err) { ret err[fail.Fail].err{fail.refused(pr.err)}; }
+    }
+    v.data[at::usize] = value;
+    ret err[fail.Fail].ok{};
+}
+
+# a physical pointer is declared once the program holds one: a pointer in memory, made from
+# an address or handed between functions. it needs the bufferDeviceAddress feature
+fun require_physical(e: *emitter.Emit) err[fail.Fail] {
+    if (e.physical) { ret err[fail.Fail].ok{}; }
+    var loc: lang_source.Location = lang_source.location_nil();
+    if (e.cur_fn != nil) { loc = lang_mir.refusal_loc(e.cur_fn, e.cur_instr); }
+    val r: err[fail.Fail] = emit_capability.require_at(e, loc, e.cur_stages, isa_spirv.CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES,
+        extension_spirv.BUFFER_DEVICE_ADDRESS, "a pointer held in memory or made from an address, which is a physical pointer into a buffer the host passes by its device address,");
+    if (sel r.err) { ret r; }
+    e.physical = true;
+    ret err[fail.Fail].ok{};
+}
+
+# the PhysicalStorageBuffer pointer a pointer type `id` of `gt` is in memory: to the
+# explicit-layout type its pointee is held in, or to the record its key names
+pub fun phys_pointer(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId) res[u32, fail.Fail] {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(gt, id);
+    if (sel opt_.none) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: a physical pointer has no pointer type")}; }
+    val pt_ir: *ir_type.IrType = opt_.some;
+    if (pt_ir.kind != ir_type.IRT_PTR) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: a physical pointer has no pointer type")}; }
+    val pointee: ir_type.IrTypeId = pt_ir.data.pointee;
+    if (ir_type.is_nil(pointee)) {
+        ret res[u32, fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_UNSUPPORTED, site_loc(e), "an untyped `ptr` held in memory or made from an address is not supported by the SPIR-V target: a physical pointer is declared with the type it points at, so spell it `*T`")};
+    }
+    val rq: err[fail.Fail] = require_physical(e);
+    if (sel rq.err) { ret res[u32, fail.Fail].err{rq.err}; }
+    val pt: opt[*ir_type.IrType] = ir_type.get(gt, pointee);
+    if (sel pt.none)                        { ret res[u32, fail.Fail].err{fail.message("spirv.emit: a physical pointer's pointee has no IR type")}; }
+    if (pt.some.kind == ir_type.IRT_RECREF) { ret phys_rec_pointer(e, pt.some.data.bits); }
+    val lr: res[u32, fail.Fail] = laid_out_type(e, gt, pointee, emitter.ROLE_PHYSICAL);
+    if (sel lr.err) { ret lr; }
+    val ptr: u32 = types.type_ptr(e.tt, isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER, lr.ok);
+    if (ptr == 0) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: could not declare a physical pointer")}; }
+    ret res[u32, fail.Fail].ok{ptr};
+}
+
+# the use the types built from here serve: an instruction, whose expression has the type,
+# a function's declaration, whose signature does, or an interface global's declaration.
+# a capability a type raises is located at its first use
+pub fun use_at(e: *emitter.Emit, loc: lang_source.Location) {
+    e.tt.use_loc = loc;
+}
+
+# where a refusal of what is being built points: the instruction in a function, or the
+# declaration of the global whose types are being built
+pub fun site_loc(e: *emitter.Emit) lang_source.Location {
+    if (e.cur_fn == nil) { ret e.tt.use_loc; }
+    ret lang_mir.refusal_loc(e.cur_fn, e.cur_instr);
+}
+
+# the pointer to the record `key` names: declared with the record, named ahead of it by a
+# member of the record's own cycle
+fun phys_rec_pointer(e: *emitter.Emit, key: u32) res[u32, fail.Fail] {
+    val rr: res[u32, fail.Fail] = phys_rec(e, key);
+    if (sel rr.err) { ret rr; }
+    val ix: u32 = rr.ok;
+    if (e.precs.data[ix].strct != 0) { ret res[u32, fail.Fail].ok{e.precs.data[ix].ptr}; }
+    if (e.precs.data[ix].building) {
+        if (!e.precs.data[ix].forwarded) {
+            types.type_forward_pointer(e.tt, e.precs.data[ix].ptr, isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER);
+            e.precs.data[ix].forwarded = true;
+        }
+        ret res[u32, fail.Fail].ok{e.precs.data[ix].ptr};
+    }
+    var m: u32 = 0;
+    for (m < e.u.len) {
+        val gt:  *ir_type.IrTypeTable = ?e.u.mods[m].ir.types;
+        val sid: ir_type.IrTypeId     = ir_type.keyed_struct(gt, key);
+        if (!ir_type.is_nil(sid)) {
+            val lr: res[u32, fail.Fail] = laid_out_type(e, gt, sid, emitter.ROLE_PHYSICAL);
+            if (sel lr.err) { ret lr; }
+            ret res[u32, fail.Fail].ok{e.precs.data[ix].ptr};
+        }
+        m = m + 1;
+    }
+    ret res[u32, fail.Fail].err{fail.message("spirv.emit: a record reference names no record of the unit")};
+}
+
+fun phys_rec(e: *emitter.Emit, key: u32) res[u32, fail.Fail] {
+    var i: usize = 0;
+    for (i < e.precs.len) {
+        if (e.precs.data[i].key == key) { ret res[u32, fail.Fail].ok{i::u32}; }
+        i = i + 1;
+    }
+    var r: emitter.PhysRec;
+    r.key       = key;
+    r.ptr       = isa_spirv.alloc_id(e.b);
+    r.strct     = 0;
+    r.building  = false;
+    r.forwarded = false;
+    val pr: res[usize, A.Error] = collections_vector.push[emitter.PhysRec](?e.precs, r);
+    if (sel pr.err) { ret res[u32, fail.Fail].err{fail.refused(pr.err)}; }
+    ret res[u32, fail.Fail].ok{(pr.ok - 1)::u32};
+}
+
+# the same, for a type query that answers 0 for what it cannot declare: the refusal is held
+# for the refusal the 0 becomes
+pub fun phys_pointer_quiet(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId) u32 {
+    val r: res[u32, fail.Fail] = phys_pointer(e, gt, id);
+    if (sel r.ok) { ret r.ok; }
+    if (!e.has_held) {
+        e.held     = r.err;
+        e.has_held = true;
+    }
+    ret 0;
+}
+
+# the alignment an access through the physical pointer `ptr` carries, 0 for a logical one
+pub fun pointer_align(e: *emitter.Emit, ptr: u32) u32 {
+    ret vec_at(?e.palign, ptr);
+}
+
+# notes that `ptr` is a physical pointer of the pointer type `ty`
+pub fun mark_physical_ptr(e: *emitter.Emit, ptr: u32, ty: u32) {
+    var sc:      u32 = 0;
+    val pointee: u32 = types.pointer_shape(e.tt, ty, ?sc);
+    if (pointee != 0 && sc == isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER) { mark_physical(e, ptr, pointee); }
+}
+
+# notes that `ptr` is a physical pointer to the type `pointee`
+pub fun mark_physical(e: *emitter.Emit, ptr: u32, pointee: u32) {
+    var a: u32 = vec_at(?e.talign, pointee);
+    if (a == 0) { a = 1; }
+    val r: err[fail.Fail] = vec_set(?e.palign, ptr, a);
+    if (sel r.err) { e.b.err = true; }
+}
+
+# `v` rounded up to the power-of-two `a`, `v` itself for no alignment, and 0
+# when the round-up leaves 32 bits
+fun round_up_to(v: u32, a: u32) u32 {
+    if (a == 0) { ret v; }
+    val aligned: res[u64, lang_checked.Cause] = lang_checked.align_u64_up(v::u64, a::u64);
+    if (sel aligned.ok) {
+        if (aligned.ok <= 0xFFFFFFFF) { ret aligned.ok::u32; }
+    }
+    ret 0;
+}
+
+# a uniform block is laid out by std140-shaped rules, a storage or push-constant block by std430-shaped ones
+fun is_std430(role: u8) bool {
+    ret role != me_ir.IFACE_UNIFORM;
+}
+
+fun block_role(role: u8) str {
+    if (role == me_ir.IFACE_STORAGE) { ret "#[storage(...)]"; }
+    if (role == me_ir.IFACE_PUSH)    { ret "#[push]"; }
+    ret "#[uniform(...)]";
+}
+
+# where a member sits, for a refusal: "a `#[storage(...)]` block", or physical memory
+fun block_place(role: u8, article: str) str {
+    if (role == emitter.ROLE_PHYSICAL) { ret "a record a physical pointer reaches, which follows the std430 block rules"; }
+    if (str_equals(article, "this")) {
+        if (role == me_ir.IFACE_STORAGE) { ret "this `#[storage(...)]` block"; }
+        if (role == me_ir.IFACE_PUSH)    { ret "this `#[push]` block"; }
+        ret "this `#[uniform(...)]` block";
+    }
+    if (role == me_ir.IFACE_STORAGE) { ret "a `#[storage(...)]` block"; }
+    if (role == me_ir.IFACE_PUSH)    { ret "a `#[push]` block"; }
+    ret "a `#[uniform(...)]` block";
+}
+
+fun storage_hint(role: u8) str {
+    if (is_std430(role)) { ret ""; }
+    ret ", and a `#[storage(...)]` buffer accepts any element width where read-write descriptor semantics are acceptable";
+}
+
+fun std_base_align(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId, std430: bool) u32 {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(gt, id);
+    if (sel opt_.none) { ret 0; }
+    val t: *ir_type.IrType = opt_.some;
+
+    if (t.kind == ir_type.IRT_STRUCT) {
+        var a: u32 = 1;
+        var i: u32 = 0;
+        for (i < t.data.struct_.field_count) {
+            val ma: u32 = std_base_align(e, gt, t.data.struct_.fields[i], std430);
+            if (ma == 0) { ret 0; }
+            if (ma > a)  { a = ma; }
+            i = i + 1;
+        }
+        if (!std430) { ret round_up_to(a, 16); }
+        ret a;
+    }
+    if (t.kind == ir_type.IRT_ARRAY) {
+        val ea: u32 = std_base_align(e, gt, t.data.array_.element, std430);
+        if (ea == 0) { ret 0; }
+        if (!std430) { ret round_up_to(ea, 16); }
+        ret ea;
+    }
+    if (t.kind == ir_type.IRT_VECTOR) {
+        val lane: u32 = ir_type.byte_size_for_machine(gt, t.data.vector_.element, e.layout);
+        if (t.data.vector_.lanes == 2) { ret 2 * lane; }
+        ret 4 * lane;
+    }
+    if (t.kind == ir_type.IRT_INT || t.kind == ir_type.IRT_FLOAT || t.kind == ir_type.IRT_PTR) {
+        ret ir_type.byte_size_for_machine(gt, id, e.layout);
+    }
+    ret 0;
+}
+
+fun std_extent(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId, std430: bool) u32 {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(gt, id);
+    if (sel opt_.none) { ret 0; }
+    val t: *ir_type.IrType = opt_.some;
+
+    if (t.kind == ir_type.IRT_STRUCT) {
+        val a: u32 = std_base_align(e, gt, id, std430);
+        if (a == 0) { ret 0; }
+        var end: u32 = 0;
+        var i:   u32 = 0;
+        for (i < t.data.struct_.field_count) {
+            val me: u32 = std_extent(e, gt, t.data.struct_.fields[i], std430);
+            if (me == 0) { ret 0; }
+            val moff: u32 = ir_type.byte_offset_for_machine(gt, id, i, e.layout);
+            if (moff + me > end) { end = moff + me; }
+            i = i + 1;
+        }
+        ret round_up_to(end, a);
+    }
+    if (t.kind == ir_type.IRT_ARRAY) {
+        val s: u32 = required_stride(e, gt, t.data.array_.element, std430);
+        if (s == 0) { ret 0; }
+        ret s * t.data.array_.count;
+    }
+    ret ir_type.byte_size_for_machine(gt, id, e.layout);
+}
+
+fun required_stride(e: *emitter.Emit, gt: *ir_type.IrTypeTable, elem: ir_type.IrTypeId, std430: bool) u32 {
+    var a: u32 = std_base_align(e, gt, elem, std430);
+    if (a == 0)  { ret 0; }
+    if (!std430) { a = round_up_to(a, 16); }
+    val ext: u32 = std_extent(e, gt, elem, std430);
+    if (ext == 0) { ret 0; }
+    ret round_up_to(ext, a);
+}
+
+fun check_block_layout(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId, role: u8) err[fail.Fail] {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(gt, id);
+    if (sel opt_.none) { ret err[fail.Fail].ok{}; }
+    val t:      *ir_type.IrType = opt_.some;
+    val std430: bool            = is_std430(role);
+
+    var prev_end: u32 = 0;
+    var i:        u32 = 0;
+    for (i < t.data.struct_.field_count) {
+        val fty: ir_type.IrTypeId = t.data.struct_.fields[i];
+        val a:   u32              = std_base_align(e, gt, fty, std430);
+        if (a == 0) {
+            i = i + 1;
+            cnt;
+        }
+        val off: u32 = ir_type.byte_offset_for_machine(gt, id, i, e.layout);
+
+        if ((off % a) != 0 || off < prev_end) {
+            var want: u32 = round_up_to(prev_end, a);
+            if (want < round_up_to(off, a)) { want = round_up_to(off, a); }
+            ret err[fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_INTERFACE, site_loc(e), layout_refusal(e, gt, role, i, fty, off, want, a,
+                off < prev_end, prev_end))};
+        }
+        val ext: u32 = std_extent(e, gt, fty, std430);
+        if (ext == 0) {
+            i = i + 1;
+            cnt;
+        }
+        prev_end = off + ext;
+        i        = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun layout_refusal(e: *emitter.Emit, gt: *ir_type.IrTypeTable, role: u8, ix: u32, fty: ir_type.IrTypeId, off: u32,
+    want: u32, align: u32, overlaps: bool, prev_end: u32) res[str, fail.Fail] {
+    var why: res[str, fail.Fail];
+    if (overlaps) {
+        why = fail.format(e.alloc,
+            "the member before it runs to offset {} under those rules and mach's layout ends it sooner, so the two overlap",
+            prev_end);
+    }
+    or {
+        why = fail.format(e.alloc,
+            "a member of this type has a base alignment of {} bytes under those rules and mach's layout does not place it on one",
+            align);
+    }
+    if (sel why.err) { ret why; }
+    val shown: res[str, fail.Fail] = emit_builtin.ir_type_spelling(gt, e.alloc, fty);
+    if (sel shown.err) { ret shown; }
+    ret fail.format(e.alloc,
+        "member {} of {} ({}) is placed at offset {} by mach's layout and the SPIR-V block layout rules require offset {}: {}. the offsets are the host's contract, so this is refused rather than repacked - repacking would move the members out from under a host writing by `$offset_of`. pad the block explicitly so the member lands where the rules put it, or promote a nested record's members into the block{}",
+        ix, block_place(role, "this"), shown.ok, off, want,
+        why.ok, storage_hint(role));
+}
+
+# the width an integer of `bits` is carried at outside host-shared memory: its
+# own where the environment has its capability, otherwise the narrowest wider
+# width the model's alu computes at under every environment
+pub fun carrier_bits(e: *emitter.Emit, bits: u32) u32 {
+    if (bits == 0 || bits % 8 != 0 || bits > 64) { ret bits; }
+    ret target_model.clamp_alu_width(?e.tgt.model, (bits / 8)::u8)::u32 * 8;
+}
+
+# the spirv type of an ir type. an f16, carried in the ir as a 16-bit integer whose form
+# is binary16, is the OpTypeFloat 16 it stands for wherever half_memory holds, in memory
+# and in a function alike, in a stage interface always, and its 16-bit
+# integer bits otherwise
+pub fun spv_type_of(e: *emitter.Emit, tys: *ir_type.IrTypeTable, id: ir_type.IrTypeId) u32 {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(tys, id);
+    if (sel opt_.none) { ret 0; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind == ir_type.IRT_PTR) {
+        if (ir_type.is_nil(t.data.pointee)) { ret 0; }
+        val pointee: u32 = spv_type_of(e, tys, t.data.pointee);
+        if (pointee == 0) { ret 0; }
+        ret types.type_ptr(e.tt, isa_spirv.STORAGE_FUNCTION, pointee);
+    }
+    if (t.kind == ir_type.IRT_INT && (half_memory(e) || e.half_interface) && t.data.bits == 16
+        && ir_type.int_form(tys, id) == ir_type.INT_FORM_BINARY16) {
+        ret types.type_float(e.tt, 16);
+    }
+    if (t.kind == ir_type.IRT_INT)   { ret types.type_int(e.tt, t.data.bits); }
+    if (t.kind == ir_type.IRT_FLOAT) { ret types.type_float(e.tt, t.data.bits); }
+    if (t.kind == ir_type.IRT_VECTOR) {
+        val elem: u32 = spv_type_of(e, tys, t.data.vector_.element);
+        if (elem == 0) { ret 0; }
+        ret types.type_vector_value(e.tt, elem, t.data.vector_.lanes);
+    }
+    if (t.kind == ir_type.IRT_ARRAY) {
+        val elem: u32 = member_spv_type(e, tys, t.data.array_.element);
+        if (elem == 0) { ret 0; }
+        ret types.type_array(e.tt, elem, t.data.array_.count, false);
+    }
+    if (t.kind == ir_type.IRT_HANDLE) { ret handle_spv_type(e, tys, t); }
+    if (t.kind == ir_type.IRT_TAG)    { ret tag_spv_type(e, tys, id); }
+    if (t.kind == ir_type.IRT_STRUCT) {
+        val n: u32 = t.data.struct_.field_count;
+        if (n == 0 || n > types.MAX_STRUCT_MEMBERS) { ret 0; }
+        var members: [16]u32;
+        var i:       u32 = 0;
+        for (i < n) {
+            val mt: u32 = member_spv_type(e, tys, t.data.struct_.fields[i]);
+            if (mt == 0) { ret 0; }
+            members[i] = mt;
+            i          = i + 1;
+        }
+        ret types.type_struct(e.tt, ?members[0], n, false);
+    }
+    ret 0;
+}
+
+# the type of a member or an element: a pointer held in an aggregate is a physical one
+pub fun member_spv_type(e: *emitter.Emit, tys: *ir_type.IrTypeTable, id: ir_type.IrTypeId) u32 {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(tys, id);
+    if (sel opt_.some && opt_.some.kind == ir_type.IRT_PTR) { ret phys_pointer_quiet(e, tys, id); }
+    ret spv_type_of(e, tys, id);
+}
+
+# a tag is the composite of its declared discriminator and one member per case in declaration
+# order, the unit composite standing in for a payloadless case, so case c is member 1 + c
+fun tag_spv_type(e: *emitter.Emit, tys: *ir_type.IrTypeTable, id: ir_type.IrTypeId) u32 {
+    val n: u32 = ir_type.tag_case_count(tys, id);
+    if (n == 0 || n + 1 > types.MAX_STRUCT_MEMBERS) { ret 0; }
+    var members: [16]u32;
+    members[0] = types.type_int(e.tt, ir_type.tag_discriminator_bytes(tys, id) * 8);
+    if (members[0] == 0) { ret 0; }
+    var i: u32 = 0;
+    for (i < n) {
+        var mt: u32 = 0;
+        if (!ir_type.tag_case_has_payload(tys, id, i)) { mt = types.type_unit(e.tt); }
+        or {
+            mt = spv_type_of(e, tys, ir_type.tag_case_type(tys, id, i));
+            var storage: u32 = 0;
+            if (mt != 0 && types.pointer_shape(e.tt, mt, ?storage) != 0) { mt = 0; }
+        }
+        if (mt == 0) { ret 0; }
+        members[1 + i] = mt;
+        i              = i + 1;
+    }
+    ret types.type_tag_struct(e.tt, ?members[0], n + 1);
+}
+
+fun handle_spv_type(e: *emitter.Emit, tys: *ir_type.IrTypeTable, t: *ir_type.IrType) u32 {
+    val ctor: u32 = t.data.handle_.ctor;
+    val n:    u32 = t.data.handle_.count;
+
+    if (ctor == defs.SPV_CTOR_SAMPLER) { ret types.type_sampler(e.tt); }
+
+    if (ctor == defs.SPV_CTOR_SAMPLED_IMAGE) {
+        if (n != 1) { ret 0; }
+        val img: u32 = spv_type_of(e, tys, t.data.handle_.operands[0]);
+        if (img == 0) { ret 0; }
+        ret types.type_sampled_image(e.tt, img);
+    }
+
+    if (ctor == defs.SPV_CTOR_IMAGE) {
+        if (n != defs.IMAGE_ARITY) { ret 0; }
+        ret types.type_image(e.tt,
+            texel_spv_type(e, t.data.handle_.operands[defs.IMAGE_OP_TEXEL]::u32),
+            t.data.handle_.operands[defs.IMAGE_OP_DIM]::u32,
+            t.data.handle_.operands[defs.IMAGE_OP_DEPTH]::u32,
+            t.data.handle_.operands[defs.IMAGE_OP_ARRAYED]::u32,
+            t.data.handle_.operands[defs.IMAGE_OP_MS]::u32,
+            t.data.handle_.operands[defs.IMAGE_OP_SAMPLED]::u32,
+            t.data.handle_.operands[defs.IMAGE_OP_FORMAT]::u32);
+    }
+
+    ret 0;
+}
+
+# the sampled type of an image of texel class `texel`, signed for a signed class, which
+# Vulkan holds to the signedness of the image's format (VUID-StandaloneSpirv-Image-04965)
+fun texel_spv_type(e: *emitter.Emit, texel: u32) u32 {
+    if (texel == defs.TEXEL_I32) { ret types.type_int_signed(e.tt, 32); }
+    if (texel == defs.TEXEL_U32) { ret types.type_int(e.tt, 32); }
+    if (texel == defs.TEXEL_I64) { ret types.type_int_signed(e.tt, 64); }
+    if (texel == defs.TEXEL_U64) { ret types.type_int(e.tt, 64); }
+    ret types.type_float(e.tt, 32);
+}
+
+pub fun ext_set_id(e: *emitter.Emit, set: u32) u32 {
+    if (set >= 8)            { ret 0; }
+    if (e.ext_ids[set] != 0) { ret e.ext_ids[set]; }
+    val name: str = defs.set_import_name(set::u8);
+    if (str_len(name) == 0::usize) { ret 0; }
+    val id: u32 = isa_spirv.ext_inst_import(e.b, name);
+    e.ext_ids[set::u32] = id;
+    ret id;
+}
+
+# an integer, or a vector of them lane for lane, moved between a width memory holds and
+# its carrier's: OpUConvert where the two differ. a narrowing keeps the low bits, which
+# hold the value
+pub fun lane_width_as(e: *emitter.Emit, value: u32, from_ty: u32, to_ty: u32) u32 {
+    if (value == 0 || from_ty == to_ty || from_ty == 0 || to_ty == 0) { ret value; }
+    var nf: u32 = 1;
+    var nt: u32 = 1;
+    val fl: u32 = lane_of(e, from_ty, ?nf);
+    val tl: u32 = lane_of(e, to_ty, ?nt);
+    if (nf != nt || types.type_is_float(e.tt, fl) || types.type_is_float(e.tt, tl)
+        || types.type_bits(e.tt, fl) == 0 || types.type_bits(e.tt, tl) == 0) { ret value; }
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var ops:    [3]u32;
+    ops[0] = to_ty;
+    ops[1] = result;
+    ops[2] = value;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_U_CONVERT, ?ops[0], 3);
+    ret result;
+}
+
+test round_up_to__overflow_is_unrepresentable_not_a_wrap {
+    if (round_up_to(5, 16) != 16)                  { ret 1; }
+    if (round_up_to(32, 16) != 32)                 { ret 1; }
+    if (round_up_to(7, 0) != 7)                    { ret 1; }
+    if (round_up_to(0xFFFFFFE0, 32) != 0xFFFFFFE0) { ret 1; }
+    if (round_up_to(0xFFFFFFF0, 32) != 0)          { ret 1; }
+    if (round_up_to(0xFFFFFFFF, 2) != 0)           { ret 1; }
+    ret 0;
+}

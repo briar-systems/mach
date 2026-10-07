@@ -1,0 +1,1039 @@
+# the value maps of one function: which SPIR-V id and type each virtual register holds
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std_format:         std.format;
+
+use A: std.allocator;
+
+use lang_checked: mach.lang.checked;
+use mach.lang.diagnostic;
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.float;
+use mach.lang.growth;
+use mach.lang.intern;
+use mach.lang.layout;
+use me_ir:   mach.lang.me.ir;
+use ir_id:   mach.lang.me.ir.id;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use lang_mir:          mach.lang.mir;
+use mir_debug:         mach.lang.mir.debug;
+use mir_structure:     mach.lang.mir.structure;
+use mir_unit:          mach.lang.mir.unit;
+use lang_source:       mach.lang.source;
+use target_definition: mach.lang.target.definition;
+use mach.lang.target.extension;
+use extension_spirv: mach.lang.target.extension.spirv;
+use mach.lang.target.isa;
+use isa_spirv: mach.lang.target.isa.spirv;
+use mach.lang.target.isa.spirv.debug;
+use mach.lang.target.isa.spirv.defs;
+use mach.lang.target.isa.spirv.emit.emitter;
+use emit_global: mach.lang.target.isa.spirv.emit.global;
+use emit_layout: mach.lang.target.isa.spirv.emit.layout;
+use mach.lang.target.isa.spirv.ops;
+use mach.lang.target.isa.spirv.types;
+use target_model: mach.lang.target.model;
+use model_spirv:  mach.lang.target.model.spirv;
+use target_of:    mach.lang.target.of;
+use mach.lang.textbuild;
+
+pub fun param_is_pointer(e: *emitter.Emit, fx: u32, k: u32) bool {
+    val fn: *me_ir.Function = emitter.fn_ir(e, fx);
+    if (k >= fn.param_count) { ret false; }
+    val t: opt[*ir_type.IrType] = ir_type.get(?emitter.fn_mod(e, fx).types, fn.params[k].ty);
+    if (sel t.none) { ret false; }
+    ret t.some.kind == ir_type.IRT_PTR;
+}
+
+# the offset in `keys` of the binding of source parameter `k` in the key at `at`
+pub fun key_param(e: *emitter.Emit, at: u32, k: u32) u32 {
+    var p: u32 = at;
+    var i: u32 = 0;
+    for (i < k) {
+        p = p + binding_len(e, p);
+        i = i + 1;
+    }
+    ret p;
+}
+
+fun binding_len(e: *emitter.Emit, p: u32) u32 {
+    val bind: u32 = e.keys.data[p];
+    if (bind == emitter.BIND_GLOBAL) { ret 3 + e.keys.data[p + 2]; }
+    if (bind == emitter.BIND_LOCAL)  { ret 4 + e.keys.data[p + 3]; }
+    ret 1;
+}
+
+pub fun instr_defines_vreg(mi: *lang_mir.MirInstr, v: u32) bool {
+    val op: lang_mir.MirOpcode = mi.opcode;
+    if (op == lang_mir.MIR_VALUE_CALL) {
+        ret mi.operand_count >= 2 && mi.operands[1].kind == lang_mir.MIR_OP_VREG && mi.operands[1].vreg.n == v;
+    }
+    if (op == lang_mir.MIR_VALUE_PARAM) {
+        ret mi.operand_count >= 1 && mi.operands[0].kind == lang_mir.MIR_OP_VREG && mi.operands[0].vreg.n == v;
+    }
+    # these name the memory they write first, and define nothing
+    if (op == lang_mir.MIR_STORE || op == lang_mir.MIR_MEMCPY || op == lang_mir.MIR_MEMZERO) { ret false; }
+    ret lang_mir.instr_defines_shape(mi) && mi.operands[0].kind == lang_mir.MIR_OP_VREG && mi.operands[0].vreg.n == v;
+}
+
+pub fun call_op_row_in(e: *emitter.Emit, m: *me_ir.Module, mi: *lang_mir.MirInstr) *target_definition.Op {
+    if (mi.opcode != lang_mir.MIR_VALUE_CALL || mi.operand_count < 2) { ret nil; }
+    if (mi.operands[0].kind != lang_mir.MIR_OP_SYM)                   { ret nil; }
+    val callee: *me_ir.Function = ir_function_record(m, mi.operands[0].sym);
+    if (callee == nil || callee.op_set == defs.SPV_SET_NONE) { ret nil; }
+    ret target_definition.op_by_code(e.tgt.defs, callee.op_set, callee.op_code);
+}
+
+pub fun decorate_bare(e: *emitter.Emit, target: u32, decor: u32) {
+    var ops: [2]u32;
+    ops[0] = target;
+    ops[1] = decor;
+    isa_spirv.inst(e.b, ?e.b.decorations, isa_spirv.OP_DECORATE, ?ops[0], 2);
+}
+
+pub fun build_vmaps(e: *emitter.Emit, mf: *lang_mir.MirFunction, irfn: *me_ir.Function, out: *emitter.VMaps) err[fail.Fail] {
+    val n: u32 = mf.vreg_count;
+    out.n        = n;
+    out.type_id  = nil;
+    out.var_id   = nil;
+    out.is_bool  = nil;
+    out.chain_id = nil;
+    out.chain_ty = nil;
+    out.chain_sc = nil;
+    out.opq_var  = nil;
+    out.opq_ssa  = nil;
+    out.gep_at   = nil;
+    out.prov     = nil;
+    out.gep_ids  = collections_vector.init[u32](e.alloc);
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+
+    val rt: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rt.err) { ret err[fail.Fail].err{fail.refused(rt.err)}; }
+    out.type_id = rt.ok;
+    val rv: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rv.err) { ret err[fail.Fail].err{fail.refused(rv.err)}; }
+    out.var_id = rv.ok;
+    val rb: res[*bool, A.Error] = A.allocate[bool](e.alloc, n::usize);
+    if (sel rb.err) { ret err[fail.Fail].err{fail.refused(rb.err)}; }
+    out.is_bool = rb.ok;
+    val rch: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rch.err) { ret err[fail.Fail].err{fail.refused(rch.err)}; }
+    out.chain_id = rch.ok;
+    val rct: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rct.err) { ret err[fail.Fail].err{fail.refused(rct.err)}; }
+    out.chain_ty = rct.ok;
+    val rcs: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rcs.err) { ret err[fail.Fail].err{fail.refused(rcs.err)}; }
+    out.chain_sc = rcs.ok;
+    val rga: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rga.err) { ret err[fail.Fail].err{fail.refused(rga.err)}; }
+    out.gep_at = rga.ok;
+    val rov: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rov.err) { ret err[fail.Fail].err{fail.refused(rov.err)}; }
+    out.opq_var = rov.ok;
+    val ros: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel ros.err) { ret err[fail.Fail].err{fail.refused(ros.err)}; }
+    out.opq_ssa = ros.ok;
+    val rpv: res[*u8, A.Error] = A.allocate[u8](e.alloc, n::usize);
+    if (sel rpv.err) { ret err[fail.Fail].err{fail.refused(rpv.err)}; }
+    out.prov = rpv.ok;
+    classify_pointers(e, e.cur_copy, mf, out.prov);
+
+    var i: u32 = 0;
+    for (i < n) {
+        out.type_id[i]  = 0;
+        out.var_id[i]   = 0;
+        out.is_bool[i]  = false;
+        out.chain_id[i] = 0;
+        out.chain_ty[i] = 0;
+        out.chain_sc[i] = 0;
+        out.gep_at[i]   = 0;
+        out.opq_var[i]  = 0;
+        out.opq_ssa[i]  = 0;
+        i               = i + 1;
+    }
+
+    var pb: u32 = 0;
+    for (pb < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[pb];
+        var ei:  u32                = 0;
+        for (ei < blk.instr_count) {
+            val mi:   *lang_mir.MirInstr   = ?blk.instrs[ei];
+            var dest: *lang_mir.MirOperand = nil;
+            var ty:   u32                  = 0;
+            emit_layout.use_at(e, lang_mir.refusal_loc(mf, mi));
+            if (mi.opcode == lang_mir.MIR_VALUE_PARAM) {
+                if (mi.operand_count != 2 || mi.operands[1].kind != lang_mir.MIR_OP_IMM
+                    || mi.operands[1].imm < 0 || mi.operands[1].imm >= irfn.param_count::i64) {
+                    ret emitter.defect(e, "spirv.emit: malformed logical parameter binding");
+                }
+                dest = ?mi.operands[0];
+                ty   = ir_value_spv_type(e, irfn.params[mi.operands[1].imm::u32].ty);
+            }
+            or (mi.opcode == lang_mir.MIR_VALUE_CALL) {
+                if (mi.operand_count < 2) { ret emitter.defect(e, "spirv.emit: malformed logical call"); }
+                dest = ?mi.operands[1];
+                val row: *target_definition.Op = call_op_row_in(e, e.ir, mi);
+                if (row != nil && row.result == target_definition.OP_RESULT_BOOL) { ty = types.type_bool(e.tt); }
+                or (dest.kind == lang_mir.MIR_OP_VREG && dest.vreg.n < n) {
+                    ty = ir_value_spv_type(e, ir_type.id(mf.vregs[dest.vreg.n].ty));
+                }
+            }
+            if (dest != nil && dest.kind == lang_mir.MIR_OP_VREG && dest.vreg.n < n && ty != 0) {
+                out.type_id[dest.vreg.n] = ty;
+                out.is_bool[dest.vreg.n] = types.type_is_bool(e.tt, ty);
+            }
+            ei = ei + 1;
+        }
+        pb = pb + 1;
+    }
+
+    # a physical pointer is typed before any width is read off it, since typing it by its
+    # width first would declare a 64-bit integer no instruction computes on
+    val pr: err[fail.Fail] = type_physical_values(e, mf, out);
+    if (sel pr.err) { ret pr; }
+    val r1: err[fail.Fail] = type_computed_defs(e, mf, out, true);
+    if (sel r1.err) { ret r1; }
+    propagate_copy_types(mf, out);
+    seed_declared_copy_types(e, mf, out);
+    propagate_copy_types(mf, out);
+    val r2: err[fail.Fail] = type_computed_defs(e, mf, out, false);
+    if (sel r2.err) { ret r2; }
+
+    val ar: err[fail.Fail] = declare_allocas(e, mf, irfn, out);
+    if (sel ar.err) { ret ar; }
+
+    i = 0;
+    for (i < n) {
+        var storage:  u32  = 0;
+        val physical: bool = (out.prov[i] & emitter.PROV_PHYSICAL) != 0;
+        if (out.type_id[i] != 0 && !types.type_is_opaque(e.tt, out.type_id[i])
+            && (physical || types.pointer_shape(e.tt, out.type_id[i], ?storage) == 0)) {
+            val ptr_ty: u32 = types.type_ptr(e.tt, isa_spirv.STORAGE_FUNCTION, out.type_id[i]);
+            val var_id: u32 = isa_spirv.alloc_id(e.b);
+            var vop:    [3]u32;
+            vop[0] = ptr_ty;
+            vop[1] = var_id;
+            vop[2] = isa_spirv.STORAGE_FUNCTION;
+            isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_VARIABLE, ?vop[0], 3);
+            # a variable holding a physical pointer says whether what it points at is aliased
+            if (physical) { decorate_bare(e, var_id, isa_spirv.DECOR_ALIASED_POINTER); }
+            out.var_id[i] = var_id;
+        }
+        i = i + 1;
+    }
+    name_bound_values(e, mf, irfn, out);
+    ret err[fail.Fail].ok{};
+}
+
+# the declared IR type of register `v`, nil when it has none
+fun vreg_ir_type(e: *emitter.Emit, mf: *lang_mir.MirFunction, v: u32) *ir_type.IrType {
+    if (v >= mf.vreg_count || mf.vregs[v].ty == lang_mir.VREG_TY_NIL) { ret nil; }
+    val t: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, ir_type.id(mf.vregs[v].ty));
+    if (sel t.none) { ret nil; }
+    ret t.some;
+}
+
+fun vreg_is_pointer(e: *emitter.Emit, mf: *lang_mir.MirFunction, v: u32) bool {
+    val t: *ir_type.IrType = vreg_ir_type(e, mf, v);
+    ret t != nil && t.kind == ir_type.IRT_PTR;
+}
+
+pub fun prov_of(prov: *u8, n: u32, op: *lang_mir.MirOperand) u8 {
+    var v: u32 = lang_mir.MIR_VREG_NIL.n;
+    if (op.kind == lang_mir.MIR_OP_VREG || op.kind == lang_mir.MIR_OP_MEM) { v = op.vreg.n; }
+    if (v >= n)                                                            { ret 0; }
+    ret prov[v];
+}
+
+# a pointer made from `nil` alone, which takes the provenance of what it meets
+val PROV_NIL: u8 = 4;
+
+# where each pointer register of copy `cx` points, from its definitions: a local, an
+# interface variable and a logically bound parameter name declared memory, and so does
+# an access chain into one. a pointer read from memory, made from an address, returned
+# by a function or bound as a physical parameter is a physical pointer, since memory
+# holds no logical one. a copy or a select takes its operands' provenance, so a register
+# both reach is one the emitter refuses. a pointer only ever `nil` is physical
+pub fun classify_pointers(e: *emitter.Emit, cx: u32, mf: *lang_mir.MirFunction, prov: *u8) {
+    val n: u32 = mf.vreg_count;
+    var i: u32 = 0;
+    for (i < n) {
+        prov[i] = 0;
+        i       = i + 1;
+    }
+    var key: u32 = emitter.COPY_NONE;
+    var fx:  u32 = emitter.FN_NONE;
+    if (cx != emitter.COPY_NONE) {
+        key = e.copies.data[cx].key_at;
+        fx  = e.copies.data[cx].fx;
+    }
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var bi: u32 = 0;
+        for (bi < mf.block_count) {
+            val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+            var ii:  u32                = 0;
+            for (ii < blk.instr_count) {
+                val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+                ii = ii + 1;
+                var dst: u32                = lang_mir.MIR_VREG_NIL.n;
+                var got: u8                 = 0;
+                val op:  lang_mir.MirOpcode = mi.opcode;
+                if (op == lang_mir.MIR_VALUE_CALL) {
+                    if (mi.operand_count < 2 || mi.operands[1].kind != lang_mir.MIR_OP_VREG) { cnt; }
+                    dst = mi.operands[1].vreg.n;
+                    if (!vreg_is_pointer(e, mf, dst)) { cnt; }
+                    got = emitter.PROV_PHYSICAL;
+                    if (call_op_row_in(e, e.ir, mi) != nil) { got = emitter.PROV_LOGICAL; }
+                }
+                or (op == lang_mir.MIR_VALUE_PARAM) {
+                    if (mi.operand_count != 2 || mi.operands[0].kind != lang_mir.MIR_OP_VREG || mi.operands[1].kind != lang_mir.MIR_OP_IMM) { cnt; }
+                    if (fx == emitter.FN_NONE || mi.operands[1].imm < 0 || !param_is_pointer(e, fx, mi.operands[1].imm::u32))               { cnt; }
+                    dst = mi.operands[0].vreg.n;
+                    got = emitter.PROV_LOGICAL;
+                    if (e.keys.data[key_param(e, key, mi.operands[1].imm::u32)] == emitter.BIND_PHYSICAL) { got = emitter.PROV_PHYSICAL; }
+                }
+                or (op == lang_mir.MIR_STORE || op == lang_mir.MIR_MEMCPY || op == lang_mir.MIR_MEMZERO) { cnt; }
+                or {
+                    if (!lang_mir.instr_defines_shape(mi) || mi.operand_count == 0 || mi.operands[0].kind != lang_mir.MIR_OP_VREG) { cnt; }
+                    dst = mi.operands[0].vreg.n;
+                    if (op == lang_mir.MIR_ALLOCA) { got = emitter.PROV_LOGICAL; }
+                    or (op == lang_mir.MIR_GEP && mi.operand_count >= 2) {
+                        if (mi.operands[1].kind == lang_mir.MIR_OP_SYM) { got = emitter.PROV_LOGICAL; }
+                        or                                              { got = prov_of(prov, n, ?mi.operands[1]) & (emitter.PROV_LOGICAL | emitter.PROV_PHYSICAL); }
+                    }
+                    or (op == lang_mir.MIR_LOAD) {
+                        if (vreg_is_pointer(e, mf, dst)) { got = emitter.PROV_PHYSICAL; }
+                    }
+                    or (op == lang_mir.MIR_BITCAST && mi.operand_count == 2) {
+                        if (vreg_is_pointer(e, mf, dst)) {
+                            got = emitter.PROV_PHYSICAL;
+                            if (mi.operands[1].kind == lang_mir.MIR_OP_VREG && vreg_is_pointer(e, mf, mi.operands[1].vreg.n)) {
+                                got = prov_of(prov, n, ?mi.operands[1]);
+                            }
+                        }
+                    }
+                    or (is_reg_copy(mi)) {
+                        if (mi.operands[1].kind == lang_mir.MIR_OP_VREG)                               { got = prov_of(prov, n, ?mi.operands[1]); }
+                        or (mi.operands[1].kind == lang_mir.MIR_OP_IMM && vreg_is_pointer(e, mf, dst)) { got = PROV_NIL; }
+                    }
+                    or (op == lang_mir.MIR_SELECT || op == lang_mir.MIR_SELECT_CMP) {
+                        var ai: u32 = 2;
+                        if (op == lang_mir.MIR_SELECT_CMP) { ai = 3; }
+                        if (mi.operand_count >= ai + 2) {
+                            got = prov_of(prov, n, ?mi.operands[ai]) | prov_of(prov, n, ?mi.operands[ai + 1]);
+                            if (mi.operands[ai].kind == lang_mir.MIR_OP_IMM && vreg_is_pointer(e, mf, dst))     { got = got | PROV_NIL; }
+                            if (mi.operands[ai + 1].kind == lang_mir.MIR_OP_IMM && vreg_is_pointer(e, mf, dst)) { got = got | PROV_NIL; }
+                        }
+                    }
+                }
+                if (dst >= n || got == 0 || (prov[dst] | got) == prov[dst]) { cnt; }
+                prov[dst] = prov[dst] | got;
+                changed   = true;
+            }
+            bi = bi + 1;
+        }
+    }
+    i = 0;
+    for (i < n) {
+        if (prov[i] == PROV_NIL) { prov[i] = emitter.PROV_PHYSICAL; }
+        i = i + 1;
+    }
+}
+
+# a physical pointer register that a copy, a load, a call or a parameter defines holds the
+# pointer as a value of its PhysicalStorageBuffer pointer type. one only an access chain
+# defines is that chain, like a logical one
+fun type_physical_values(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps) err[fail.Fail] {
+    val n:  u32                 = vm.n;
+    val rv: res[*bool, A.Error] = A.allocate[bool](e.alloc, (n + 1)::usize);
+    if (sel rv.err) { ret err[fail.Fail].err{fail.refused(rv.err)}; }
+    val value: *bool = rv.ok;
+    fin { A.deallocate[bool](e.alloc, value, (n + 1)::usize); }
+    var i: u32 = 0;
+    for (i < n) {
+        value[i] = false;
+        i        = i + 1;
+    }
+    var mixed: *lang_mir.MirInstr = nil;
+    var bi:    u32                = 0;
+    for (bi < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            ii = ii + 1;
+            var dst: u32 = lang_mir.MIR_VREG_NIL.n;
+            if (mi.opcode == lang_mir.MIR_VALUE_CALL && mi.operand_count >= 2 && mi.operands[1].kind == lang_mir.MIR_OP_VREG)                      { dst = mi.operands[1].vreg.n; }
+            or (mi.operand_count > 0 && mi.operands[0].kind == lang_mir.MIR_OP_VREG && instr_defines_vreg(mi, mi.operands[0].vreg.n))              { dst = mi.operands[0].vreg.n; }
+            if (dst >= n)                                                                                                                          { cnt; }
+            if ((vm.prov[dst] & (emitter.PROV_LOGICAL | emitter.PROV_PHYSICAL)) == (emitter.PROV_LOGICAL | emitter.PROV_PHYSICAL) && mixed == nil) { mixed = mi; }
+            if (mi.opcode != lang_mir.MIR_GEP)                                                                                                     { value[dst] = true; }
+        }
+        bi = bi + 1;
+    }
+    if (mixed != nil) {
+        e.cur_instr = mixed;
+        ret emitter.unsupported(e, "this pointer is a logical pointer on one path and a physical pointer on another: a logical pointer names memory the module declares and a physical one an address in a buffer the host passes, and SPIR-V gives the two different storage classes, so one register cannot hold both. keep the two pointers in separate variables");
+    }
+    i = 0;
+    for (i < n) {
+        if ((vm.prov[i] & emitter.PROV_PHYSICAL) == 0 || !value[i]) {
+            i = i + 1;
+            cnt;
+        }
+        val t: *ir_type.IrType = vreg_ir_type(e, mf, i);
+        if (t == nil || t.kind != ir_type.IRT_PTR) {
+            i = i + 1;
+            cnt;
+        }
+        val pr: res[u32, fail.Fail] = emit_layout.phys_pointer(e, ?e.ir.types, ir_type.id(mf.vregs[i].ty));
+        if (sel pr.err) { ret err[fail.Fail].err{pr.err}; }
+        vm.type_id[i] = pr.ok;
+        vm.is_bool[i] = false;
+        i             = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a source variable bound to a value names the function variable that holds it
+fun name_bound_values(e: *emitter.Emit, mf: *lang_mir.MirFunction, irfn: *me_ir.Function, vm: *emitter.VMaps) {
+    if (!e.dbg.on) { ret; }
+    var bi: u32 = 0;
+    for (bi < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            var di: u32                = 0;
+            for (di < mi.dbg_binding_count) {
+                val bind: *lang_mir.MirDbgBinding = ?mi.dbg_bindings[di];
+                if (bind.vreg < vm.n && vm.var_id[bind.vreg] != 0) {
+                    val dv: opt[*me_ir.DbgVar] = me_ir.dbg_var_get(irfn, bind.iid::ir_id.InstructionId);
+                    if (sel dv.some) { debug.name(?e.dbg, vm.var_id[bind.vreg], dv.some.name); }
+                }
+                di = di + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+}
+
+fun declare_allocas(e: *emitter.Emit, mf: *lang_mir.MirFunction, irfn: *me_ir.Function, out: *emitter.VMaps) err[fail.Fail] {
+    var bi: u32 = 0;
+    for (bi < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            if (mi.opcode != lang_mir.MIR_ALLOCA || mi.operand_count < 2
+                || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+                ii = ii + 1;
+                cnt;
+            }
+            val dst: u32 = mi.operands[0].vreg.n;
+            if (dst >= out.n) {
+                ii = ii + 1;
+                cnt;
+            }
+
+            emit_layout.use_at(e, lang_mir.refusal_loc(mf, mi));
+            val slot: *lang_mir.MirSlot = find_slot(mf, mi.operands[1].vreg.n);
+            if (slot == nil || slot.ty == lang_mir.SLOT_TY_NIL) {
+                ret emitter.unsupported(e, "a local allocation whose type was not recorded is not supported by the SPIR-V target: a shader variable needs a type, and a size and alignment do not determine one");
+            }
+            var ty: u32 = ir_value_spv_type(e, ir_type.id(slot.ty));
+            # a pointer held in a local is in memory, so it is a physical one
+            val st: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, ir_type.id(slot.ty));
+            if (sel st.some && st.some.kind == ir_type.IRT_PTR) { ty = emit_layout.phys_pointer_quiet(e, ?e.ir.types, ir_type.id(slot.ty)); }
+            if (ty == 0) {
+                ret emitter.unsupported(e, "unsupported local allocation type in the SPIR-V target");
+            }
+            if (slot.size != ir_type.byte_size_for_machine(?e.ir.types, ir_type.id(slot.ty), e.layout)) {
+                ret emitter.unsupported(e, "a multi-element local allocation is not supported by the SPIR-V target: it is an array of whole objects reached by pointer arithmetic, which the logical addressing model has no form for");
+            }
+
+            var storage: u32 = 0;
+            if (types.pointer_shape(e.tt, ty, ?storage) != 0 && storage != isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER) {
+                ret emitter.unsupported(e, "SPIR-V Logical Shader pointer-valued local storage requires VariablePointers capability");
+            }
+            val ptr_ty: u32 = types.type_ptr(e.tt, isa_spirv.STORAGE_FUNCTION, ty);
+            val var_id: u32 = isa_spirv.alloc_id(e.b);
+            var vop:    [3]u32;
+            vop[0] = ptr_ty;
+            vop[1] = var_id;
+            vop[2] = isa_spirv.STORAGE_FUNCTION;
+            isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_VARIABLE, ?vop[0], 3);
+            if (storage == isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER) { decorate_bare(e, var_id, isa_spirv.DECOR_ALIASED_POINTER); }
+            if (slot.origin != lang_mir.SLOT_ORIGIN_NIL) {
+                val local: opt[*me_ir.DbgVar] = me_ir.alloca_dbg_var_get(irfn, slot.origin::ir_id.InstructionId);
+                if (sel local.some) { debug.name(?e.dbg, var_id, local.some.name); }
+            }
+            out.chain_id[dst] = var_id;
+            out.chain_ty[dst] = ty;
+            out.chain_sc[dst] = isa_spirv.STORAGE_FUNCTION;
+            ii                = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun find_slot(mf: *lang_mir.MirFunction, key: u32) *lang_mir.MirSlot {
+    var i: u32 = 0;
+    for (i < mf.frame.slot_count) {
+        if (mf.frame.slots[i].value == key) { ret ?mf.frame.slots[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun type_computed_defs(e: *emitter.Emit, mf: *lang_mir.MirFunction, out: *emitter.VMaps, skip_copies: bool) err[fail.Fail] {
+    var bi: u32 = 0;
+    for (bi < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            if (mi.opcode == lang_mir.MIR_GEP || mi.opcode == lang_mir.MIR_ALLOCA) {
+                ii = ii + 1;
+                cnt;
+            }
+            emit_layout.use_at(e, lang_mir.refusal_loc(mf, mi));
+            if (mi.opcode == lang_mir.MIR_LOAD && mi.operand_count == 2
+                && mi.operands[0].kind == lang_mir.MIR_OP_VREG) {
+                val lv: u32 = mi.operands[0].vreg.n;
+                # an interface is read into the type a function carries its value in
+                var lt: u32 = carried_value_type(e, interface_value_type(e, ?mi.operands[1]));
+                if (lt != 0 && types.is_composite(e.tt, lt)) {
+                    val leaf: u32 = leading_leaf_type(e, lt);
+                    lt = 0;
+                    if (mi.width != 0 && types.type_bits(e.tt, leaf) == mi.width::u32 * 8) { lt = leaf; }
+                }
+                if (lv < out.n && out.type_id[lv] == 0 && lt != 0) {
+                    out.type_id[lv] = lt;
+                    out.is_bool[lv] = types.type_is_bool(e.tt, lt);
+                    ii              = ii + 1;
+                    cnt;
+                }
+            }
+            if (lang_mir.instr_defines_shape(mi) && mi.operands[0].kind == lang_mir.MIR_OP_VREG) {
+                val v: u32 = mi.operands[0].vreg.n;
+                if (v < out.n && out.type_id[v] == 0 && !(skip_copies && is_reg_copy(mi))) {
+                    val boolean: bool = (lang_mir.is_cmp_opcode(mi.opcode) || mi.opcode == lang_mir.MIR_FCMP)
+                        && !lang_mir.vec_lane_is_vector(mi.vec_lane);
+                    out.is_bool[v] = boolean;
+                    if (boolean) {
+                        out.type_id[v] = types.type_bool(e.tt);
+                    }
+                    or {
+                        var bytes: u32 = mi.width::u32;
+                        if (bytes == 0) { bytes = e.tgt.model.gpr_width; }
+                        val t: u32 = value_type_for(e, mf, mi, v, bytes::u8);
+                        if (t == 0) { ret emitter.unsupported(e, unsupported_value_type(e, mi)); }
+                        out.type_id[v] = t;
+                    }
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun is_reg_copy(mi: *lang_mir.MirInstr) bool {
+    if (mi.opcode != lang_mir.MIR_MOV && mi.opcode != lang_mir.MIR_DECLASSIFY) { ret false; }
+    if (mi.operand_count != 2)                                                 { ret false; }
+    ret mi.operands[1].kind == lang_mir.MIR_OP_VREG
+        || mi.operands[1].kind == lang_mir.MIR_OP_IMM;
+}
+
+fun propagate_copy_types(mf: *lang_mir.MirFunction, out: *emitter.VMaps) {
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var bi: u32 = 0;
+        for (bi < mf.block_count) {
+            val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+            var ii:  u32                = 0;
+            for (ii < blk.instr_count) {
+                val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+                if (is_reg_copy(mi) && mi.operands[0].kind == lang_mir.MIR_OP_VREG &&
+                    mi.operands[1].kind == lang_mir.MIR_OP_VREG) {
+                    val d:  u32 = mi.operands[0].vreg.n;
+                    val sv: u32 = mi.operands[1].vreg.n;
+                    if (d < out.n && sv < out.n && out.type_id[d] == 0 && out.type_id[sv] != 0) {
+                        out.type_id[d] = out.type_id[sv];
+                        out.is_bool[d] = out.is_bool[sv];
+                        changed        = true;
+                    }
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+    }
+}
+
+fun seed_declared_copy_types(e: *emitter.Emit, mf: *lang_mir.MirFunction, out: *emitter.VMaps) {
+    var bi: u32 = 0;
+    for (bi < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            emit_layout.use_at(e, lang_mir.refusal_loc(mf, mi));
+            if (is_reg_copy(mi) && mi.operands[0].kind == lang_mir.MIR_OP_VREG) {
+                val v: u32 = mi.operands[0].vreg.n;
+                if (v < out.n && v < mf.vreg_count && out.type_id[v] == 0
+                    && mf.vregs[v].ty != lang_mir.VREG_TY_NIL) {
+                    val t: u32 = ir_value_spv_type(e, ir_type.id(mf.vregs[v].ty));
+                    if (t != 0) {
+                        out.type_id[v] = t;
+                        out.is_bool[v] = types.type_is_bool(e.tt, t);
+                    }
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+}
+
+pub fun vmaps_dnit(e: *emitter.Emit, vm: *emitter.VMaps) {
+    if (vm.type_id != nil)  { A.deallocate[u32](e.alloc, vm.type_id, vm.n::usize); }
+    if (vm.var_id != nil)   { A.deallocate[u32](e.alloc, vm.var_id, vm.n::usize); }
+    if (vm.is_bool != nil)  { A.deallocate[bool](e.alloc, vm.is_bool, vm.n::usize); }
+    if (vm.opq_var != nil)  { A.deallocate[u32](e.alloc, vm.opq_var, vm.n::usize); }
+    if (vm.opq_ssa != nil)  { A.deallocate[u32](e.alloc, vm.opq_ssa, vm.n::usize); }
+    if (vm.chain_id != nil) { A.deallocate[u32](e.alloc, vm.chain_id, vm.n::usize); }
+    if (vm.chain_ty != nil) { A.deallocate[u32](e.alloc, vm.chain_ty, vm.n::usize); }
+    if (vm.chain_sc != nil) { A.deallocate[u32](e.alloc, vm.chain_sc, vm.n::usize); }
+    if (vm.gep_at != nil)   { A.deallocate[u32](e.alloc, vm.gep_at, vm.n::usize); }
+    if (vm.prov != nil)     { A.deallocate[u8](e.alloc, vm.prov, vm.n::usize); }
+    collections_vector.dnit[u32](?vm.gep_ids);
+    vm.type_id  = nil;
+    vm.var_id   = nil;
+    vm.is_bool  = nil;
+    vm.chain_id = nil;
+    vm.chain_ty = nil;
+    vm.chain_sc = nil;
+    vm.gep_at   = nil;
+    vm.prov     = nil;
+    vm.n        = 0;
+}
+
+# the type a lane of the class `lane` is held in: a float as itself, and an integer at
+# the carrier of its width, as a scalar is
+fun lane_type_of(e: *emitter.Emit, lane: u32) u32 {
+    val bits: u32 = lang_mir.vec_lane_elem_bytes(lane)::u32 * 8;
+    if (lang_mir.vec_lane_kind(lane) == lang_mir.VEC_LANE_FLOAT) {
+        if (bits != 16 && bits != 32 && bits != 64) { ret 0; }
+        ret types.type_float(e.tt, bits);
+    }
+    if (bits != 8 && bits != 16 && bits != 32 && bits != 64) { ret 0; }
+    ret types.type_int(e.tt, emit_layout.carrier_bits(e, bits));
+}
+
+pub fun vector_type_of(e: *emitter.Emit, lane: u32, as_int: bool) u32 {
+    var lane_ty: u32 = 0;
+    if (as_int) {
+        val bits: u32 = lang_mir.vec_lane_elem_bytes(lane)::u32 * 8;
+        if (bits != 8 && bits != 16 && bits != 32 && bits != 64) { ret 0; }
+        lane_ty = types.type_int(e.tt, emit_layout.carrier_bits(e, bits));
+    }
+    or                { lane_ty = lane_type_of(e, lane); }
+    if (lane_ty == 0) { ret 0; }
+    ret types.type_vector_value(e.tt, lane_ty, lang_mir.vec_lane_count(lane));
+}
+
+fun value_type_for(e: *emitter.Emit, mf: *lang_mir.MirFunction, mi: *lang_mir.MirInstr, vreg: u32, width: u8) u32 {
+    # an f16 register is the float its type declares, which no width or lane class spells
+    if (vreg < mf.vreg_count && mf.vregs[vreg].ty != lang_mir.VREG_TY_NIL && is_half_value(e, ir_type.id(mf.vregs[vreg].ty))) {
+        ret emit_layout.spv_type_of(e, ?e.ir.types, ir_type.id(mf.vregs[vreg].ty));
+    }
+    if (lang_mir.vec_lane_is_vector(mi.vec_lane) && !reinterprets_to_scalar(e, mf, mi, vreg)) {
+        if (mi.opcode == lang_mir.MIR_VEC_EXTRACT) { ret carried_lane_type(e, lane_type_of(e, mi.vec_lane)); }
+        val as_int: bool = lang_mir.is_cmp_opcode(mi.opcode) || mi.opcode == lang_mir.MIR_FCMP;
+        ret vector_type_of(e, mi.vec_lane, as_int);
+    }
+    var bytes: u32 = width::u32;
+    if (bytes == 0) { bytes = e.tgt.model.gpr_width; }
+    val bits:     u32  = bytes * 8;
+    var floating: bool = mi.opcode == lang_mir.MIR_FADD || mi.opcode == lang_mir.MIR_FSUB
+        || mi.opcode == lang_mir.MIR_FMUL || mi.opcode == lang_mir.MIR_FDIV || mi.opcode == lang_mir.MIR_FNEG
+        || mi.opcode == lang_mir.MIR_FP_TRUNC || mi.opcode == lang_mir.MIR_FP_EXT
+        || mi.opcode == lang_mir.MIR_SI_TO_FP || mi.opcode == lang_mir.MIR_UI_TO_FP;
+    if (vreg < mf.vreg_count && mf.vregs[vreg].ty != lang_mir.VREG_TY_NIL) {
+        val declared: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, ir_type.id(mf.vregs[vreg].ty));
+        # a handle read through a pointer is the handle, which no width spells
+        if (sel declared.some && declared.some.kind == ir_type.IRT_HANDLE) { ret emit_layout.spv_type_of(e, ?e.ir.types, ir_type.id(mf.vregs[vreg].ty)); }
+        if (sel declared.some)                                             { floating = declared.some.kind == ir_type.IRT_FLOAT; }
+    }
+    if (floating) {
+        if (bits == 16 || bits == 32 || bits == 64) { ret types.type_float(e.tt, bits); }
+        ret 0;
+    }
+    if (bits == 8 || bits == 16 || bits == 32 || bits == 64) { ret types.type_int(e.tt, emit_layout.carrier_bits(e, bits)); }
+    ret 0;
+}
+
+# a vector reinterpreted as a scalar carries its operand's lanes, since its result has
+# none, and is the scalar its register declares
+fun reinterprets_to_scalar(e: *emitter.Emit, mf: *lang_mir.MirFunction, mi: *lang_mir.MirInstr, vreg: u32) bool {
+    if (mi.opcode != lang_mir.MIR_BITCAST || vreg >= mf.vreg_count || mf.vregs[vreg].ty == lang_mir.VREG_TY_NIL) { ret false; }
+    val declared: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, ir_type.id(mf.vregs[vreg].ty));
+    if (sel declared.none) { ret false; }
+    ret declared.some.kind != ir_type.IRT_VECTOR;
+}
+
+# an ir f16 carrier, or a vector of them, that half_memory makes an OpTypeFloat 16
+fun is_half_value(e: *emitter.Emit, id: ir_type.IrTypeId) bool {
+    if (!emit_layout.half_memory(e)) { ret false; }
+    val tys: *ir_type.IrTypeTable = ?e.ir.types;
+    val o:   opt[*ir_type.IrType] = ir_type.get(tys, id);
+    if (sel o.none) { ret false; }
+    var lane: ir_type.IrTypeId = id;
+    if (o.some.kind == ir_type.IRT_VECTOR) { lane = o.some.data.vector_.element; }
+    val lo: opt[*ir_type.IrType] = ir_type.get(tys, lane);
+    if (sel lo.none) { ret false; }
+    ret lo.some.kind == ir_type.IRT_INT && ir_type.int_form(tys, lane) == ir_type.INT_FORM_BINARY16;
+}
+
+# the spirv type a value of an ir type has in a function: a scalar integer, and each
+# integer lane of a vector, at its carrier, an f16 without float16 included since it is
+# carried as its bits, a pointer to one pointing at the carrier, and every
+# other type as declared, since a composite member keeps its width wherever it lives
+pub fun value_spv_type(e: *emitter.Emit, tys: *ir_type.IrTypeTable, id: ir_type.IrTypeId) u32 {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(tys, id);
+    if (sel opt_.none) { ret 0; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind == ir_type.IRT_INT && !(emit_layout.half_memory(e) && ir_type.int_form(tys, id) == ir_type.INT_FORM_BINARY16)) {
+        ret types.type_int(e.tt, emit_layout.carrier_bits(e, t.data.bits));
+    }
+    if (t.kind == ir_type.IRT_VECTOR) {
+        val lane: u32 = value_spv_type(e, tys, t.data.vector_.element);
+        if (lane == 0) { ret 0; }
+        ret types.type_vector_value(e.tt, lane, t.data.vector_.lanes);
+    }
+    if (t.kind == ir_type.IRT_PTR && !ir_type.is_nil(t.data.pointee)) {
+        val pointee: u32 = value_spv_type(e, tys, t.data.pointee);
+        if (pointee == 0) { ret 0; }
+        ret types.type_ptr(e.tt, isa_spirv.STORAGE_FUNCTION, pointee);
+    }
+    ret emit_layout.spv_type_of(e, tys, id);
+}
+
+# a carried integer, or a vector of them lane for lane, read as one of `bits`: the
+# arithmetic leaves the carrier's upper bits unspecified, so the value is zero- or
+# sign-extended from `bits` wherever they would be observed. a value at its own width
+# is as it is
+pub fun narrow_extend(e: *emitter.Emit, value: u32, ty: u32, bits: u32, signed: bool) u32 {
+    var n:    u32 = 1;
+    val lane: u32 = emit_layout.lane_of(e, ty, ?n);
+    if (value == 0 || bits == 0 || types.type_is_bool(e.tt, lane) || types.type_is_float(e.tt, lane)) { ret value; }
+    val cb: u32 = types.type_bits(e.tt, lane);
+    if (cb == 0 || bits >= cb) { ret value; }
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var words:  [4]u32;
+    words[0] = ty;
+    if (!signed) {
+        words[1] = result;
+        words[2] = value;
+        words[3] = lanes_immediate(e, ty, n, ((1::u64 << bits::u64) - 1):~i64);
+        isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_BITWISE_AND, ?words[0], 4);
+        ret result;
+    }
+    val count:   u32 = lanes_immediate(e, ty, n, (cb - bits)::i64);
+    val shifted: u32 = isa_spirv.alloc_id(e.b);
+    words[1] = shifted;
+    words[2] = value;
+    words[3] = count;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_SHIFT_LEFT_LOGICAL, ?words[0], 4);
+    words[1] = result;
+    words[2] = shifted;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_SHIFT_RIGHT_ARITHMETIC, ?words[0], 4);
+    ret result;
+}
+
+# an integer constant of `ty`, in each of its `n` lanes where it is a vector
+fun lanes_immediate(e: *emitter.Emit, ty: u32, n: u32, imm: i64) u32 {
+    if (n < 2) { ret immediate(e, ty, imm); }
+    ret mask_splat(e, ty, n, (imm::u64 & 0xFFFFFFFF)::u32, (imm::u64 >> 32)::u32);
+}
+
+# an integer operand read at `bits`, in the carrier of that width
+pub fun read_narrow(e: *emitter.Emit, vm: *emitter.VMaps, op: *lang_mir.MirOperand, ty: u32, bits: u32, signed: bool) u32 {
+    if (op.kind == lang_mir.MIR_OP_IMM && bits > 0 && bits < 64) {
+        # a constant is extended from `bits` as the value it is compared with is
+        val low: u64 = op.imm::u64 & ((1::u64 << bits::u64) - 1);
+        var v:   i64 = low:~i64;
+        if (signed && (low >> (bits - 1)::u64) != 0) { v = (low | ~((1::u64 << bits::u64) - 1)):~i64; }
+        ret immediate(e, ty, v);
+    }
+    ret narrow_extend(e, read_operand(e, vm, op, ty), ty, bits, signed);
+}
+
+pub fun ir_value_spv_type(e: *emitter.Emit, id: ir_type.IrTypeId) u32 {
+    ret value_spv_type(e, ?e.ir.types, id);
+}
+
+pub fun global_spv_type(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId) u32 {
+    ret emit_layout.spv_type_of(e, gt, id);
+}
+
+# whether an `op` call's data type is signed: the sampled type of an image of a signed
+# texel class, which a texel pointer into one points to. its related values are the
+# unsigned integers the module computes on, so they cross into the instruction bitcast
+pub fun op_signed_data(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, row: *target_definition.Op, sig: *ir_type.IrType) bool {
+    if (row.typing == nil) { ret false; }
+    val at: u32 = row.typing.operand;
+    if (at >= sig.data.fn.param_count) { ret false; }
+    var param: ir_type.IrTypeId = sig.data.fn.params[at];
+    if (target_definition.op_kind_is_pointer(target_definition.op_operand_kind(row, at))) {
+        var ty: u32 = 0;
+        if (chain_target(vm, ?mi.operands[at + 2], ?ty) != 0 && types.type_is_signed(e.tt, ty)) { ret true; }
+        val opt_: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, param);
+        if (!sel opt_.some) { ret false; }
+        val pt: *ir_type.IrType = opt_.some;
+        if (pt.kind != ir_type.IRT_PTR) { ret false; }
+        param = pt.data.pointee;
+    }
+    var img: *ir_type.IrType = image_handle(e, param);
+    if (img == nil) { img = sampled_image_handle(e, param); }
+    if (img == nil) { ret false; }
+    val texel: u32 = img.data.handle_.operands[defs.IMAGE_OP_TEXEL]::u32;
+    ret texel == defs.TEXEL_I32 || texel == defs.TEXEL_I64;
+}
+
+# whether relation `rel` ties a value to an `op` call's data type
+pub fun op_relation_is_data(rel: target_definition.OpRelation) bool {
+    ret rel == target_definition.OP_RELATION_DATA || rel == target_definition.OP_RELATION_TEXEL;
+}
+
+pub fun ir_return_spv_type(e: *emitter.Emit, irfn: *me_ir.Function, out_void: *bool) u32 {
+    @out_void = false;
+    val sig_opt: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, irfn.sig);
+    if (sel sig_opt.none) { ret 0; }
+    val sig: *ir_type.IrType = sig_opt.some;
+    if (sig.kind != ir_type.IRT_FN) { ret 0; }
+    val rt:     ir_type.IrTypeId     = sig.data.fn.ret_type;
+    val rt_opt: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, rt);
+    if (sel rt_opt.none) { ret 0; }
+    val rtt: *ir_type.IrType = rt_opt.some;
+    if (rtt.kind == ir_type.IRT_VOID) {
+        @out_void = true;
+        ret types.type_void(e.tt);
+    }
+    # a returned pointer is a physical one: a logical pointer names memory of the caller's
+    # or the module's, which no result can carry
+    if (rtt.kind == ir_type.IRT_PTR && !ir_type.is_nil(rtt.data.pointee)) { ret emit_layout.phys_pointer_quiet(e, ?e.ir.types, rt); }
+    ret ir_value_spv_type(e, rt);
+}
+
+pub fun unsupported_value_type(e: *emitter.Emit, mi: *lang_mir.MirInstr) str {
+    if (!lang_mir.vec_lane_is_vector(mi.vec_lane)) {
+        ret "unsupported value type in the SPIR-V target";
+    }
+    ret "unsupported vector lane type in the SPIR-V target";
+}
+
+pub fun leading_leaf_type(e: *emitter.Emit, ty: u32) u32 {
+    var cur:   u32 = ty;
+    var depth: u32 = 0;
+    for (cur != 0 && types.is_composite(e.tt, cur) && depth < 8) {
+        cur   = types.composite_member(e.tt, cur, 0);
+        depth = depth + 1;
+    }
+    ret cur;
+}
+
+pub fun interface_value_type(e: *emitter.Emit, op: *lang_mir.MirOperand) u32 {
+    if (op.kind != lang_mir.MIR_OP_SYM) { ret 0; }
+    val gx: u32 = emit_global.lookup(e, op.sym);
+    if (gx == emit_global.GL_NONE) { ret 0; }
+    val g: *me_ir.Global = emit_global.ir_of(e, gx);
+    if (g.iface == me_ir.IFACE_NONE) { ret 0; }
+    ret e.gtype_ids[gx];
+}
+
+# the type a function carries a value of the memory type `ty` in: a scalar integer, and
+# each integer lane of a vector, at its carrier, an interface f16 as its bits
+# (half_bits_type), and any other type as it is
+fun carried_value_type(e: *emitter.Emit, mem_ty: u32) u32 {
+    if (mem_ty == 0) { ret 0; }
+    val ty:    u32 = emit_layout.half_bits_type(e, mem_ty);
+    var lanes: u32 = 0;
+    val lane:  u32 = types.vector_shape(e.tt, ty, ?lanes);
+    if (lane != 0) {
+        val held: u32 = carried_lane_type(e, lane);
+        if (held == lane) { ret ty; }
+        ret types.type_vector(e.tt, held, lanes);
+    }
+    ret carried_lane_type(e, ty);
+}
+
+pub fun chain_target(vm: *emitter.VMaps, op: *lang_mir.MirOperand, out_ty: *u32) u32 {
+    @out_ty = 0;
+    var v: u32 = lang_mir.MIR_VREG_NIL.n;
+    if (op.kind == lang_mir.MIR_OP_VREG)               { v = op.vreg.n; }
+    or (op.kind == lang_mir.MIR_OP_MEM && op.imm == 0) { v = op.vreg.n; }
+    if (v == lang_mir.MIR_VREG_NIL.n || v >= vm.n)     { ret 0; }
+    @out_ty = vm.chain_ty[v];
+    ret vm.chain_id[v];
+}
+
+# the `image` handle type a `sampled_image` handle type `param` composes over, nil when it is none
+pub fun sampled_image_handle(e: *emitter.Emit, param: ir_type.IrTypeId) *ir_type.IrType {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, param);
+    if (!sel opt_.some) { ret nil; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind != ir_type.IRT_HANDLE || t.data.handle_.ctor != defs.SPV_CTOR_SAMPLED_IMAGE || t.data.handle_.count != 1) { ret nil; }
+    ret image_handle(e, t.data.handle_.operands[0]);
+}
+
+# the `image` handle type `param` is, nil when it is no image
+pub fun image_handle(e: *emitter.Emit, param: ir_type.IrTypeId) *ir_type.IrType {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, param);
+    if (!sel opt_.some) { ret nil; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind != ir_type.IRT_HANDLE || t.data.handle_.ctor != defs.SPV_CTOR_IMAGE
+        || t.data.handle_.count != defs.IMAGE_ARITY) { ret nil; }
+    ret t;
+}
+
+pub fun ir_function_record(irmod: *me_ir.Module, name: intern.StrId) *me_ir.Function {
+    var i: u32 = 0;
+    for (i < irmod.function_len) {
+        if (intern.str_same(irmod.functions[i].name, name)) { ret ?irmod.functions[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+pub fun read_operand(e: *emitter.Emit, vm: *emitter.VMaps, op: *lang_mir.MirOperand, want_ty: u32) u32 {
+    if (op.kind == lang_mir.MIR_OP_VREG) {
+        val v: u32 = op.vreg.n;
+        if (v < vm.n && vm.opq_var[v] != 0) {
+            val fresh: u32 = isa_spirv.alloc_id(e.b);
+            var ol:    [3]u32;
+            ol[0] = vm.type_id[v];
+            ol[1] = fresh;
+            ol[2] = vm.opq_var[v];
+            isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_LOAD, ?ol[0], 3);
+            ret fresh;
+        }
+        if (v < vm.n && vm.opq_ssa[v] != 0) { ret vm.opq_ssa[v]; }
+        # an access chain from a physical pointer is the physical pointer it computes
+        if (v < vm.n && vm.chain_sc[v] == isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER) { ret vm.chain_id[v]; }
+        if (v >= vm.n || vm.var_id[v] == 0) {
+            e.b.err = true;
+            ret 0;
+        }
+        val result: u32 = isa_spirv.alloc_id(e.b);
+        var lo:     [3]u32;
+        lo[0] = vm.type_id[v];
+        lo[1] = result;
+        lo[2] = vm.var_id[v];
+        isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_LOAD, ?lo[0], 3);
+        if (vm.prov != nil && (vm.prov[v] & emitter.PROV_PHYSICAL) != 0) {
+            var sc:      u32 = 0;
+            val pointee: u32 = types.pointer_shape(e.tt, vm.type_id[v], ?sc);
+            if (pointee != 0 && sc == isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER) { emit_layout.mark_physical(e, result, pointee); }
+        }
+        if (vm.is_bool[v] && want_ty != 0 && !types.type_is_bool(e.tt, want_ty)) {
+            ret widen_bool(e, result, want_ty);
+        }
+        ret result;
+    }
+    if (op.kind == lang_mir.MIR_OP_IMM) {
+        ret immediate(e, want_ty, op.imm);
+    }
+
+    e.b.err = true;
+    ret 0;
+}
+
+fun widen_bool(e: *emitter.Emit, boolean: u32, want_ty: u32) u32 {
+    val one:  u32 = types.const_scalar(e.tt, want_ty, 1, 0);
+    val zero: u32 = types.const_scalar(e.tt, want_ty, 0, 0);
+    if (one == 0 || zero == 0) {
+        e.b.err = true;
+        ret 0;
+    }
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var ops:    [5]u32;
+    ops[0] = want_ty;
+    ops[1] = result;
+    ops[2] = boolean;
+    ops[3] = one;
+    ops[4] = zero;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_SELECT, ?ops[0], 5);
+    ret result;
+}
+
+pub fun immediate(e: *emitter.Emit, want_ty: u32, imm: i64) u32 {
+    var ty: u32 = want_ty;
+    if (ty == 0) { ty = types.type_int(e.tt, e.tgt.model.gpr_width * 8); }
+    if (e.physical) {
+        if (physical_type(e, ty)) { ret pointer_constant(e, ty, imm); }
+    }
+    if (types.type_is_bool(e.tt, ty)) { ret types.const_bool(e.tt, imm != 0); }
+    val pattern: u64 = imm::u64;
+    ret types.const_scalar(e.tt, ty, (pattern & 0xFFFFFFFF)::u32, ((pattern >> 32) & 0xFFFFFFFF)::u32);
+}
+
+pub fun physical_type(e: *emitter.Emit, ty: u32) bool {
+    var sc: u32 = 0;
+    ret types.pointer_shape(e.tt, ty, ?sc) != 0 && sc == isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER;
+}
+
+# a physical pointer constant, `nil` or an integer literal, made from the address it is
+pub fun pointer_constant(e: *emitter.Emit, ty: u32, imm: i64) u32 {
+    val bits:   u32 = immediate(e, types.type_int(e.tt, 64), imm);
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var words:  [3]u32;
+    words[0] = ty;
+    words[1] = result;
+    words[2] = bits;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_CONVERT_U_TO_PTR, ?words[0], 3);
+    ret result;
+}
+
+pub fun mask_splat(e: *emitter.Emit, vec_ty: u32, lanes: u32, lo: u32, hi: u32) u32 {
+    var count:   u32 = 0;
+    val lane_ty: u32 = types.vector_shape(e.tt, vec_ty, ?count);
+    if (lane_ty == 0 || count == 0 || count > model_spirv.MAX_VECTOR_COMPONENTS) { ret 0; }
+    val lane:  u32 = types.const_scalar(e.tt, lane_ty, lo, hi);
+    var parts: [4]u32;
+    var i:     u32 = 0;
+    for (i < count) {
+        parts[i] = lane;
+        i        = i + 1;
+    }
+    ret types.const_composite(e.tt, vec_ty, ?parts[0], count);
+}
+
+# the scalar a vector lane of `lane_ty` is held in once extracted: an integer
+# lane at its carrier, which a lane is held in already
+fun carried_lane_type(e: *emitter.Emit, lane_ty: u32) u32 {
+    if (lane_ty == 0 || types.type_is_float(e.tt, lane_ty) || types.type_is_bool(e.tt, lane_ty)) { ret lane_ty; }
+    val bits: u32 = types.type_bits(e.tt, lane_ty);
+    if (bits == 0) { ret lane_ty; }
+    ret types.type_int(e.tt, emit_layout.carrier_bits(e, bits));
+}

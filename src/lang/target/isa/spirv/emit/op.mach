@@ -1,0 +1,1155 @@
+# the `#[op]` instructions a function calls, checked against their row and emitted
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std_format: std.format;
+
+use A: std.allocator;
+
+use lang_checked: mach.lang.checked;
+use mach.lang.diagnostic;
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.float;
+use mach.lang.growth;
+use mach.lang.intern;
+use mach.lang.layout;
+use me_ir:   mach.lang.me.ir;
+use ir_id:   mach.lang.me.ir.id;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use lang_mir:          mach.lang.mir;
+use mir_debug:         mach.lang.mir.debug;
+use mir_structure:     mach.lang.mir.structure;
+use mir_unit:          mach.lang.mir.unit;
+use lang_source:       mach.lang.source;
+use target_definition: mach.lang.target.definition;
+use mach.lang.target.extension;
+use extension_spirv: mach.lang.target.extension.spirv;
+use mach.lang.target.isa;
+use isa_spirv: mach.lang.target.isa.spirv;
+use mach.lang.target.isa.spirv.debug;
+use mach.lang.target.isa.spirv.defs;
+use mach.lang.target.isa.spirv.emit.arith;
+use emit_builtin:    mach.lang.target.isa.spirv.emit.builtin;
+use emit_capability: mach.lang.target.isa.spirv.emit.capability;
+use emit_copy:       mach.lang.target.isa.spirv.emit.copy;
+use mach.lang.target.isa.spirv.emit.emitter;
+use emit_global: mach.lang.target.isa.spirv.emit.global;
+use emit_layout: mach.lang.target.isa.spirv.emit.layout;
+use emit_memory: mach.lang.target.isa.spirv.emit.memory;
+use emit_value:  mach.lang.target.isa.spirv.emit.value;
+use mach.lang.target.isa.spirv.ops;
+use mach.lang.target.isa.spirv.types;
+use target_model: mach.lang.target.model;
+use model_spirv:  mach.lang.target.model.spirv;
+use target_of:    mach.lang.target.of;
+use mach.lang.textbuild;
+
+# a value tested for truth at `bits`, 0 for its whole type
+pub fun read_condition(e: *emitter.Emit, vm: *emitter.VMaps, op: *lang_mir.MirOperand, bits: u32) u32 {
+    if (op.kind != lang_mir.MIR_OP_VREG) {
+        e.b.err = true;
+        ret 0;
+    }
+    val v: u32 = op.vreg.n;
+    if (v >= vm.n) {
+        e.b.err = true;
+        ret 0;
+    }
+    val ty:  u32 = vm.type_id[v];
+    var raw: u32 = emit_value.read_operand(e, vm, op, ty);
+    if (e.b.err || raw == 0) { ret 0; }
+    if (vm.is_bool[v])       { ret raw; }
+    raw = emit_value.narrow_extend(e, raw, ty, bits, false);
+
+    var cmp_ty: u32 = ty;
+    if (cmp_ty == 0) { cmp_ty = types.type_int(e.tt, e.tgt.model.gpr_width * 8); }
+    var opcode: u32 = isa_spirv.OP_I_NOT_EQUAL;
+    if (types.type_is_float(e.tt, cmp_ty)) { opcode = isa_spirv.OP_F_UNORD_NOT_EQUAL; }
+    val zero:   u32 = types.const_scalar(e.tt, cmp_ty, 0, 0);
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var ops:    [4]u32;
+    ops[0] = types.type_bool(e.tt);
+    ops[1] = result;
+    ops[2] = raw;
+    ops[3] = zero;
+    isa_spirv.inst(e.b, ?e.b.functions, opcode, ?ops[0], 4);
+    ret result;
+}
+
+# a call to an `#[op]` declaration is the instruction its row names: the row says
+# whether it has a result id, and how each operand is written, so a pointer operand
+# takes the storage class of the argument's own access chain rather than a
+# parameter type's
+pub fun spirv_op_emit(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, fn: *me_ir.Function) err[fail.Fail] {
+    val sig_opt: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, fn.sig);
+    if (sel sig_opt.none) {
+        ret emitter.defect(e, "spirv.emit: an `op` callee has no signature type");
+    }
+    val sig: *ir_type.IrType = sig_opt.some;
+    if (sig.kind != ir_type.IRT_FN) {
+        ret emitter.defect(e, "spirv.emit: an `op` callee's signature is not a function type");
+    }
+    val argc: u32 = sig.data.fn.param_count;
+    if (argc != mi.operand_count - 2)             { ret emitter.defect(e, "spirv.emit: mapped logical call arity mismatch"); }
+    if (!types.instruction_operands_fit(4, argc)) { ret emitter.unsupported(e, "SPIR-V mapped instruction arguments exceed its 65535-word encoding"); }
+    val row: *target_definition.Op = target_definition.op_by_code(e.tgt.defs, fn.op_set, fn.op_code);
+    if (row == nil || argc < row.min_arity || argc > row.arity) {
+        ret emitter.defect(e, "spirv.emit: an `op` callee has no instruction row of its arity");
+    }
+    val rq: err[fail.Fail] = emit_capability.require_made(e, mf, row.capability, row.requires, op_use_text(e, row, nil));
+    if (sel rq.err) { ret rq; }
+
+    val signed:       bool = emit_value.op_signed_data(e, vm, mi, row, sig);
+    var returns_void: bool = false;
+    var ret_ty:       u32  = 0;
+    var pointee:      u32  = 0;
+    if (row.result == target_definition.OP_RESULT_POINTER) {
+        pointee = ir_pointee_spv_type(e, sig.data.fn.ret_type);
+        if (signed && row.result_relation == target_definition.OP_RELATION_POINTEE) { pointee = types.signed_twin(e.tt, pointee); }
+        if (pointee == 0)                                                           { ret emitter.unsupported(e, "the type an `op` pointer result addresses has no SPIR-V form"); }
+        ret_ty = types.type_ptr(e.tt, row.result_space, pointee);
+    }
+    or (row.result == target_definition.OP_RESULT_BOOL) {
+        ret_ty = types.type_bool(e.tt);
+    }
+    or {
+        ret_ty = emit_value.ir_return_spv_type(e, fn, ?returns_void);
+        if (ret_ty == 0) { ret emitter.unsupported(e, "unsupported return type in the SPIR-V target"); }
+    }
+    if ((row.result == target_definition.OP_RESULT_NONE) != returns_void) {
+        ret emitter.defect(e, "spirv.emit: an `op` declaration's return disagrees with its instruction's result");
+    }
+
+    # an extended instruction always has a result id, void when it produces nothing
+    val core:       bool = fn.op_set == defs.SPV_SET_CORE;
+    val has_result: bool = !core || row.result != target_definition.OP_RESULT_NONE;
+
+    # two words beyond the call's own, for the texel operands a coherent image access adds
+    val ar: res[*u32, A.Error] = A.allocate[u32](e.alloc, (argc + 6)::usize);
+    if (sel ar.err) { ret err[fail.Fail].err{fail.refused(ar.err)}; }
+    val ops: *u32 = ar.ok;
+    fin { A.deallocate[u32](e.alloc, ops, (argc + 6)::usize); }
+    # a signed result is read back as the unsigned value the module computes on
+    var signed_ty: u32 = 0;
+    if (signed && row.result == target_definition.OP_RESULT_VALUE && emit_value.op_relation_is_data(row.result_relation)) {
+        signed_ty = types.signed_twin(e.tt, ret_ty);
+        if (signed_ty == 0) { ret emitter.unsupported(e, "a signed image's texels are integers, and this `op` result is not one"); }
+    }
+    var base: u32 = 0;
+    if (has_result) {
+        ops[0] = ret_ty;
+        if (signed_ty != 0) { ops[0] = signed_ty; }
+        base = 2;
+    }
+    if (!core) {
+        val set_id: u32 = emit_layout.ext_set_id(e, fn.op_set);
+        if (set_id == 0) {
+            ret emitter.defect(e, "spirv.emit: an `op` names an instruction set with no import name");
+        }
+        ops[2] = set_id;
+        ops[3] = fn.op_code;
+        base   = 4;
+    }
+
+    # the operands the row spells first, whose literal words decide the kinds of the rest
+    val span: u32 = target_definition.op_literal_span(row, argc);
+    var i:    u32 = 0;
+    for (i < span) {
+        val hr: err[fail.Fail] = require_handle_access(e, mf, row, target_definition.op_operand_kind(row, i), sig.data.fn.params[i]);
+        if (sel hr.err) { ret hr; }
+        val word: res[u32, fail.Fail] = op_operand(e, mf, vm, mi, row, i, target_definition.op_operand_kind(row, i), sig.data.fn.params[i]);
+        if (sel word.err) { ret emitter.read_failure(e, word.err); }
+        ops[base + i] = word.ok;
+        i             = i + 1;
+    }
+    val er: err[fail.Fail] = op_enumerated_operands(e, mf, row, argc, ?ops[base]);
+    if (sel er.err) { ret er; }
+    var kinds: [target_definition.OP_MAX_OPERANDS]target_definition.OpOperandKind;
+    target_definition.op_call_kinds(row, argc, ?ops[base], ?kinds[0]);
+    for (i < argc) {
+        val fr: err[fail.Fail] = op_brought_fits(e, mf, row, i, kinds[i], sig.data.fn.params[i]);
+        if (sel fr.err) { ret fr; }
+        val word: res[u32, fail.Fail] = op_operand(e, mf, vm, mi, row, i, kinds[i], sig.data.fn.params[i]);
+        if (sel word.err) { ret emitter.read_failure(e, word.err); }
+        ops[base + i] = word.ok;
+        i             = i + 1;
+    }
+    if (signed) {
+        i = 0;
+        for (i < argc) {
+            if (kinds[i] == target_definition.OP_OPERAND_VALUE && emit_value.op_relation_is_data(target_definition.op_operand_relation(row, i))) {
+                val sty: u32 = types.signed_twin(e.tt, emit_value.ir_value_spv_type(e, sig.data.fn.params[i]));
+                if (sty == 0) { ret emitter.unsupported(e, "a signed image's texels are integers, and this `op` operand is not one"); }
+                ops[base + i] = emit_layout.bitcast_emit(e, sty, ops[base + i]);
+            }
+            i = i + 1;
+        }
+    }
+    val tr: err[fail.Fail] = op_typed_requirement(e, mf, vm, mi, row, sig);
+    if (sel tr.err) { ret tr; }
+    if (core) {
+        val ir_: err[fail.Fail] = refuse_image_use(e, mf, row, argc, ?ops[base], sig);
+        if (sel ir_.err) { ret ir_; }
+    }
+    var words: u32 = argc;
+    if (core) { words = coherent_texel_operands(e, vm, mi, row, sig, ?ops[base]); }
+    var result: u32 = 0;
+    if (has_result) {
+        result = isa_spirv.alloc_id(e.b);
+        ops[1] = result;
+    }
+
+    var opcode: u32 = isa_spirv.OP_EXT_INST;
+    if (core) { opcode = fn.op_code; }
+    isa_spirv.inst(e.b, ?e.b.functions, opcode, ?ops[0], base + words);
+
+    if (row.result == target_definition.OP_RESULT_NONE) {
+        if (mi.operands[1].kind != lang_mir.MIR_OP_VREG || !lang_mir.vreg_is_nil(mi.operands[1].vreg)) {
+            ret emitter.defect(e, "spirv.emit: a void `op` call names a result");
+        }
+        ret err[fail.Fail].ok{};
+    }
+    if (row.result == target_definition.OP_RESULT_POINTER) {
+        val dst: *lang_mir.MirOperand = ?mi.operands[1];
+        if (dst.kind != lang_mir.MIR_OP_VREG || dst.vreg.n >= vm.n) {
+            ret emitter.defect(e, "spirv.emit: an `op` pointer result is not bound to a register");
+        }
+        vm.chain_id[dst.vreg.n] = result;
+        vm.chain_ty[dst.vreg.n] = pointee;
+        vm.chain_sc[dst.vreg.n] = row.result_space;
+        ret err[fail.Fail].ok{};
+    }
+    if (signed_ty != 0) { result = emit_layout.bitcast_emit(e, ret_ty, result); }
+    ret emit_memory.write_value(e, mf, vm, ?mi.operands[1], result, ret_ty, mi.memory_flags);
+}
+
+# under the Vulkan memory model a read of a coherent storage image's texels makes them
+# visible and a write makes them available, as a coherent buffer's loads and stores do:
+# the emitter adds MakeTexelVisible or MakeTexelAvailable with NonPrivateTexel and the
+# scope id to the instruction's Image Operands, whose mask leads the row's tail. the
+# scope operand lands in bit order, after the operands of the call's lower bits and
+# before those of its higher ones, and a call that already carries the bit keeps its own
+# scope. a handle reaching a function as a parameter has no variable to read the
+# qualifier from, so its accesses are coherent wherever the module binds a coherent
+# image. returns the operand count, the added words included
+fun coherent_texel_operands(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, row: *target_definition.Op, sig: *ir_type.IrType, words: *u32) u32 {
+    val argc: u32 = sig.data.fn.param_count;
+    if (!e.vulkan_mm || target_definition.op_tail_literal(row) == nil) { ret argc; }
+    var h: u32 = 0;
+    for (h < argc && !target_definition.op_kind_is_handle(target_definition.op_operand_kind(row, h))) { h = h + 1; }
+    if (h == argc) { ret argc; }
+    val img: *ir_type.IrType = emit_value.image_handle(e, sig.data.fn.params[h]);
+    if (img == nil || img.data.handle_.operands[defs.IMAGE_OP_SAMPLED]::u32 != isa_spirv.IMAGE_SAMPLED_STORAGE) { ret argc; }
+    val op:    *lang_mir.MirOperand = ?mi.operands[h + 2];
+    var scope: u32                  = 0;
+    if (op.kind == lang_mir.MIR_OP_VREG && op.vreg.n < vm.n && vm.opq_var[op.vreg.n] != 0) {
+        scope = emit_memory.memory_scope_of(e, vm.opq_var[op.vreg.n]);
+    }
+    or (op.kind == lang_mir.MIR_OP_SYM && op.sym_off == 0) {
+        scope = emit_memory.memory_scope_of(e, emit_global.global_var_id(e, op.sym));
+    }
+    or (e.coherent_images) { scope = isa_spirv.SCOPE_QUEUE_FAMILY; }
+    if (scope == 0)        { ret argc; }
+    var bit: u32 = defs.IMAGE_OPERANDS_MAKE_TEXEL_VISIBLE;
+    if (target_definition.op_operand_kind(row, h) == target_definition.OP_OPERAND_HANDLE_WRITE) { bit = defs.IMAGE_OPERANDS_MAKE_TEXEL_AVAILABLE; }
+    ret splice_texel_operands(words, argc, row.min_arity, target_definition.op_tail_literal(row), bit, types.const_int(e.tt, 32, scope::i64));
+}
+
+# `bit` with NonPrivateTexel and its `scope` id spliced into the Image Operands mask at
+# `at` of the `argc` operands in `words`, the mask added when the call passes none. the
+# scope follows the mask and the operands the call's bits below `bit` bring, which `en`
+# counts, and a call already carrying `bit` keeps its own scope. returns the operand count
+fun splice_texel_operands(words: *u32, argc: u32, at: u32, en: *target_definition.OpEnum, bit: u32, scope: u32) u32 {
+    if (argc <= at) {
+        words[argc]     = bit | defs.IMAGE_OPERANDS_NON_PRIVATE_TEXEL;
+        words[argc + 1] = scope;
+        ret argc + 2;
+    }
+    val mask: u32 = words[at];
+    words[at] = mask | defs.IMAGE_OPERANDS_NON_PRIVATE_TEXEL;
+    if ((mask & bit) != 0) { ret argc; }
+    words[at] = words[at] | bit;
+    var pos: u32 = at + 1;
+    var low: u32 = 1;
+    for (low < bit) {
+        if ((mask & low) != 0) {
+            val one: *target_definition.OpEnumerant = target_definition.op_enumerant_of(en, low);
+            if (one != nil) { pos = pos + target_definition.op_enumerant_brings(one); }
+        }
+        low = low << 1;
+    }
+    var k: u32 = argc;
+    for (k > pos) {
+        words[k] = words[k - 1];
+        k        = k - 1;
+    }
+    words[pos] = scope;
+    ret argc + 1;
+}
+
+# a typed row's data type, in the storage class its operand addresses, against the row's
+# typing: the requirement admitting both is collected like the row's, and a type the
+# typing admits only in other classes is refused naming the class
+fun op_typed_requirement(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, row: *target_definition.Op,
+    sig: *ir_type.IrType) err[fail.Fail] {
+    val t: *target_definition.OpTyping = row.typing;
+    if (!target_definition.op_typing_constrains(t)) { ret err[fail.Fail].ok{}; }
+    if (t.operand >= sig.data.fn.param_count)       { ret emitter.defect(e, "spirv.emit: a typed `op` row reads its data type from an operand the call does not pass"); }
+    var dty:   ir_type.IrTypeId = sig.data.fn.params[t.operand];
+    var space: u32              = target_definition.NO_OP_SPACE;
+    if (target_definition.op_kind_is_pointer(target_definition.op_operand_kind(row, t.operand))) {
+        val pt: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, dty);
+        if (sel pt.none)                     { ret emitter.defect(e, "spirv.emit: a typed `op` pointer operand has no pointer type"); }
+        if (pt.some.kind != ir_type.IRT_PTR) { ret emitter.defect(e, "spirv.emit: a typed `op` pointer operand has no pointer type"); }
+        dty   = pt.some.data.pointee;
+        space = op_pointer_space(e, vm, ?mi.operands[t.operand + 2]);
+    }
+    # a vector is held to the typing by its element, when the typing admits vectors
+    var scalar: bool                 = true;
+    val whole:  opt[*ir_type.IrType] = ir_type.get(?e.ir.types, dty);
+    if (sel whole.some) {
+        if (whole.some.kind == ir_type.IRT_VECTOR) {
+            scalar = false;
+            dty    = whole.some.data.vector_.element;
+        }
+    }
+    var class: target_definition.OpDataClass = target_definition.OP_DATA_OTHER;
+    var bits:  u32                           = 0;
+    val got:   opt[*ir_type.IrType]          = ir_type.get(?e.ir.types, dty);
+    if (sel got.some) {
+        if (got.some.kind == ir_type.IRT_INT) {
+            bits  = got.some.data.bits;
+            class = target_definition.OP_DATA_INT;
+            # an f16 carried as its 16 bits is still a float to the instruction
+            if (got.some.form == ir_type.INT_FORM_BINARY16) { class = target_definition.OP_DATA_FLOAT; }
+        }
+        or (got.some.kind == ir_type.IRT_FLOAT) {
+            bits  = got.some.data.bits;
+            class = target_definition.OP_DATA_FLOAT;
+        }
+    }
+    if (!scalar && !t.vectors) { class = target_definition.OP_DATA_OTHER; }
+    val one: *target_definition.OpTypeRequirement = target_definition.op_type_requirement(t, class, bits, space);
+    if (one == nil) {
+        val r: res[str, std_format.FormatError] = std_format.sprint(e.alloc,
+            "`{}` on a {}-bit {} is not available in the {} storage class: {} on a type beyond a 32-bit integer is defined only on a storage buffer, buffer memory through a physical pointer, `#[shared]` workgroup memory or a storage image texel, and on a texel only for a 64-bit integer or an f32",
+            row.name, bits, data_class_name(class), storage_class_name(space), t.name);
+        if (sel r.err) { ret err[fail.Fail].err{fail.format_refused(r.err)}; }
+        ret err[fail.Fail].err{emitter.reject_at(e, diagnostic_kind.SPIRV_CAPABILITY, lang_mir.refusal_loc(mf, e.cur_instr), r.ok)};
+    }
+    ret emit_capability.require_made(e, mf, one.capability, one.requires, fail.format(e.alloc, "`{}` on a {}-bit {} in the {} storage class",
+        row.name, bits, data_class_name(class), storage_class_name(space)));
+}
+
+fun data_class_name(class: target_definition.OpDataClass) str {
+    if (class == target_definition.OP_DATA_FLOAT) { ret "float"; }
+    ret "integer";
+}
+
+# the storage class the memory a pointer operand names lives in, NO_OP_SPACE when it names none
+fun op_pointer_space(e: *emitter.Emit, vm: *emitter.VMaps, op: *lang_mir.MirOperand) u32 {
+    var ty: u32 = 0;
+    if (emit_value.chain_target(vm, op, ?ty) != 0)                     { ret arith.chain_storage(vm, op); }
+    if (emit_memory.physical_value(vm, op) != lang_mir.MIR_VREG_NIL.n) { ret isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER; }
+    if (op.kind == lang_mir.MIR_OP_SYM && op.sym_off == 0) {
+        val gx: u32 = emit_global.lookup(e, op.sym);
+        if (gx != emit_global.GL_NONE && emit_global.ir_of(e, gx).iface != me_ir.IFACE_NONE) { ret e.gstorage[gx]; }
+    }
+    ret target_definition.NO_OP_SPACE;
+}
+
+pub fun storage_class_name(space: u32) str {
+    if (space == isa_spirv.STORAGE_STORAGE_BUFFER)          { ret "StorageBuffer"; }
+    if (space == isa_spirv.STORAGE_UNIFORM)                 { ret "Uniform"; }
+    if (space == isa_spirv.STORAGE_WORKGROUP)               { ret "Workgroup"; }
+    if (space == isa_spirv.STORAGE_FUNCTION)                { ret "Function"; }
+    if (space == isa_spirv.STORAGE_IMAGE)                   { ret "Image"; }
+    if (space == isa_spirv.STORAGE_PUSH_CONSTANT)           { ret "PushConstant"; }
+    if (space == isa_spirv.STORAGE_INPUT)                   { ret "Input"; }
+    if (space == isa_spirv.STORAGE_OUTPUT)                  { ret "Output"; }
+    if (space == isa_spirv.STORAGE_UNIFORM_CONSTANT)        { ret "UniformConstant"; }
+    if (space == isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER) { ret "PhysicalStorageBuffer"; }
+    ret "unknown";
+}
+
+# each enumerated literal's value against its enumeration: it must be one of its values,
+# the operands it brings must be the optional tail the call passes, and each value's
+# requirement is collected like the row's. a literal leading the tail is passed or left
+# out with its operands, so a call at the row's required count passes no mask
+fun op_enumerated_operands(e: *emitter.Emit, mf: *lang_mir.MirFunction, row: *target_definition.Op, argc: u32, words: *u32) err[fail.Fail] {
+    var bad:  u32 = target_definition.NO_OPERAND;
+    val want: u32 = target_definition.op_call_arity(row, argc, words, ?bad);
+    if (bad != target_definition.NO_OPERAND) {
+        ret err[fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.OP_OPERAND_VALUE, lang_mir.refusal_loc(mf, e.cur_instr),
+            op_operand_value_text(e, row, bad, target_definition.op_operand_enum(row, bad), words[bad]))};
+    }
+    val span: u32 = target_definition.op_literal_span(row, argc);
+    var i:    u32 = 0;
+    for (i < span) {
+        val en: *target_definition.OpEnum = target_definition.op_operand_enum(row, i);
+        if (en == nil) {
+            i = i + 1;
+            cnt;
+        }
+        val value: u32 = words[i];
+        if (!en.mask) {
+            val one: *target_definition.OpEnumerant = target_definition.op_enumerant_of(en, value);
+            val rq:  err[fail.Fail]                 = emit_capability.require_made(e, mf, one.capability, one.requires, op_use_text(e, row, one.name));
+            if (sel rq.err) { ret rq; }
+        }
+        or {
+            var bit: u32 = 1;
+            for (bit != 0 && bit <= value) {
+                if ((value & bit) != 0) {
+                    val one: *target_definition.OpEnumerant = target_definition.op_enumerant_of(en, bit);
+                    val rq:  err[fail.Fail]                 = emit_capability.require_made(e, mf, one.capability, one.requires, op_use_text(e, row, one.name));
+                    if (sel rq.err) { ret rq; }
+                }
+                bit = bit << 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (want != argc) {
+        val r: res[str, std_format.FormatError] = std_format.sprint(e.alloc,
+            "`{}` takes {} operands with the literal values this call passes, and the declaration passes {}: the operands after the {} it always takes are present exactly as far as a literal's value brings them, so declare the instruction once per shape",
+            row.name, want, argc, row.min_arity);
+        if (sel r.err) { ret err[fail.Fail].err{fail.format_refused(r.err)}; }
+        ret err[fail.Fail].err{emitter.reject_at(e, diagnostic_kind.OP_OPERAND_VALUE, lang_mir.refusal_loc(mf, e.cur_instr), r.ok)};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun op_operand_value_text(e: *emitter.Emit, row: *target_definition.Op, i: u32, en: *target_definition.OpEnum, value: u32) res[str, fail.Fail] {
+    var b: textbuild.TextBuilder = textbuild.tb_init(e.alloc);
+    var k: u32                   = 0;
+    for (k < en.count) {
+        if (k > 0) {
+            val sep: err[textbuild.Error] = textbuild.tb_append(?b, ", ");
+            if (sel sep.err) { ret target_model.spelling_finish(?b, sep); }
+        }
+        val named: err[textbuild.Error] = textbuild.tb_append(?b, en.values[k].name);
+        if (sel named.err) { ret target_model.spelling_finish(?b, named); }
+        k = k + 1;
+    }
+    val names: res[str, fail.Fail] = target_model.spelling_finish(?b, err[textbuild.Error].ok{});
+    if (sel names.err) { ret names; }
+    var form: str = "one of";
+    if (en.mask) { form = "a union of"; }
+    ret fail.format(e.alloc,
+        "operand {} of `{}` is a `{}`, and {} is not {} its values ({}): the word would be written into the module as a value the specification does not define",
+        i + 1, row.name, en.name, value, form, names.ok);
+}
+
+# "`OpGroupNonUniformIAdd`", or with the literal value that raised the requirement
+fun op_use_text(e: *emitter.Emit, row: *target_definition.Op, value: str) res[str, fail.Fail] {
+    if (value == nil) { ret fail.format(e.alloc, "`{}`", row.name); }
+    ret fail.format(e.alloc, "`{}` with `{}`", row.name, value);
+}
+
+# an image instruction against the image it names and the Image Operands it passes,
+# which only the call's literal and the image's own operands decide together
+fun refuse_image_use(e: *emitter.Emit, mf: *lang_mir.MirFunction, row: *target_definition.Op, argc: u32, words: *u32,
+    sig: *ir_type.IrType) err[fail.Fail] {
+    var mask: u32 = 0;
+    val span: u32 = target_definition.op_literal_span(row, argc);
+    var i:    u32 = 0;
+    for (i < span) {
+        if (defs.is_image_operands(target_definition.op_operand_enum(row, i))) { mask = words[i]; }
+        i = i + 1;
+    }
+    var image:   bool = false;
+    var ms:      bool = false;
+    var storage: bool = false;
+    var depth:   bool = false;
+    var dim:     u32  = defs.NO_IMAGE_DIM;
+    if (argc > 0) {
+        val img: *ir_type.IrType = emit_value.image_handle(e, sig.data.fn.params[0]);
+        if (img != nil) {
+            image   = true;
+            ms      = img.data.handle_.operands[defs.IMAGE_OP_MS]::u32 != 0;
+            storage = img.data.handle_.operands[defs.IMAGE_OP_SAMPLED]::u32 == isa_spirv.IMAGE_SAMPLED_STORAGE;
+            dim     = img.data.handle_.operands[defs.IMAGE_OP_DIM]::u32;
+            depth   = img.data.handle_.operands[defs.IMAGE_OP_DEPTH]::u32 == 1;
+        }
+        val sampled: *ir_type.IrType = emit_value.sampled_image_handle(e, sig.data.fn.params[0]);
+        if (sampled != nil) {
+            dim   = sampled.data.handle_.operands[defs.IMAGE_OP_DIM]::u32;
+            depth = sampled.data.handle_.operands[defs.IMAGE_OP_DEPTH]::u32 == 1;
+        }
+    }
+    val lod: res[str, fail.Fail] = implicit_lod_stage_refusal(e, row);
+    if (sel lod.err) { ret err[fail.Fail].err{lod.err}; }
+    var why: str = lod.ok;
+    if (why == nil)                                          { why = defs.image_use_refusal(row.opcode, image, ms, storage, dim, depth, mask); }
+    if (why == nil && mask != 0 && dim != defs.NO_IMAGE_DIM) { why = image_operand_shapes(e, row, argc, sig, mask, dim); }
+    if (why == nil)                                          { ret err[fail.Fail].ok{}; }
+    ret err[fail.Fail].err{emitter.reject_at(e, diagnostic_kind.OP_OPERAND_VALUE, lang_mir.refusal_loc(mf, e.cur_instr), why)};
+}
+
+# an implicit-lod sample derives its level of detail from the derivatives of its
+# coordinate across neighbouring invocations, which only a fragment stage has: a compute
+# stage has them only under a derivative-group execution mode this target does not
+# declare, and a vertex stage never
+fun implicit_lod_stage_refusal(e: *emitter.Emit, row: *target_definition.Op) res[str, fail.Fail] {
+    var explicit: str = "OpImageSampleExplicitLod";
+    if (row.opcode == isa_spirv.OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD) { explicit = "OpImageSampleDrefExplicitLod"; }
+    or (row.opcode != isa_spirv.OP_IMAGE_SAMPLE_IMPLICIT_LOD)      { ret res[str, fail.Fail].ok{nil}; }
+    val other: u8 = e.cur_stages & ~emit_builtin.stage_bit(me_ir.STAGE_FRAGMENT);
+    if (other == 0) { ret res[str, fail.Fail].ok{nil}; }
+    val stages: res[str, fail.Fail] = emit_builtin.stages_spelling(e, other);
+    if (sel stages.err) { ret stages; }
+    ret fail.format(e.alloc,
+        "`{}` derives its level of detail from the derivatives of its coordinate, which only a fragment stage has, and this call is reached from a {} stage: sample there with `{}` and a `Lod` or `Grad`",
+        row.name, stages.ok, explicit);
+}
+
+# the operands each set bit of the Image Operands mask `mask` brings, in bit order after
+# the mask, against the dimensionality of the image the call's first operand is or
+# samples. nil when they fit, or when the image is not one this target describes
+fun image_operand_shapes(e: *emitter.Emit, row: *target_definition.Op, argc: u32, sig: *ir_type.IrType, mask: u32, dim: u32) str {
+    val span: u32                       = target_definition.op_literal_span(row, argc);
+    var en:   *target_definition.OpEnum = nil;
+    var i:    u32                       = 0;
+    for (i < span) {
+        if (defs.is_image_operands(target_definition.op_operand_enum(row, i))) { en = target_definition.op_operand_enum(row, i); }
+        i = i + 1;
+    }
+    if (en == nil) { ret nil; }
+    var at:  u32 = span;
+    var bit: u32 = 1;
+    for (bit != 0 && bit <= mask) {
+        if ((mask & bit) != 0) {
+            val n: u32 = target_definition.op_enumerant_brings(target_definition.op_enumerant_of(en, bit));
+            var k: u32 = 0;
+            for (k < n && at + k < argc) {
+                var float:      bool = false;
+                var components: u32  = 0;
+                var elements:   u32  = 0;
+                var why:        str  = nil;
+                if (ir_numeric_array_shape(e, sig.data.fn.params[at + k], ?float, ?components, ?elements)) {
+                    why = defs.image_operand_shape_refusal(bit, dim, float, components, elements);
+                }
+                if (why != nil) { ret why; }
+                k = k + 1;
+            }
+            at = at + n;
+        }
+        bit = bit << 1;
+    }
+    ret nil;
+}
+
+# whether `id` is a number or a vector of them, with whether it is a float and how many components it has
+fun ir_numeric_shape(e: *emitter.Emit, id: ir_type.IrTypeId, out_float: *bool, out_components: *u32) bool {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, id);
+    if (sel opt_.none) { ret false; }
+    var t: *ir_type.IrType = opt_.some;
+    @out_components = 1;
+    if (t.kind == ir_type.IRT_VECTOR) {
+        @out_components = t.data.vector_.lanes;
+        val el: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, t.data.vector_.element);
+        if (sel el.none) { ret false; }
+        t = el.some;
+    }
+    @out_float = t.kind == ir_type.IRT_FLOAT;
+    ret t.kind == ir_type.IRT_FLOAT || t.kind == ir_type.IRT_INT;
+}
+
+# whether `id` is a number, a vector of them or an array of either, with the shape
+# `ir_numeric_shape` gives its element and how many elements it has, 0 for no array
+fun ir_numeric_array_shape(e: *emitter.Emit, id: ir_type.IrTypeId, out_float: *bool, out_components: *u32, out_elements: *u32) bool {
+    @out_elements = 0;
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, id);
+    if (sel opt_.none)                       { ret false; }
+    if (opt_.some.kind != ir_type.IRT_ARRAY) { ret ir_numeric_shape(e, id, out_float, out_components); }
+    @out_elements = opt_.some.data.array_.count;
+    ret ir_numeric_shape(e, opt_.some.data.array_.element, out_float, out_components);
+}
+
+# a multisampled storage image is declared only under StorageImageMultisample, and an
+# arrayed one under ImageMSArray as well, both enabled by the device feature that permits them
+pub fun require_image_type(e: *emitter.Emit, gt: *ir_type.IrTypeTable, id: ir_type.IrTypeId) err[fail.Fail] {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(gt, id);
+    if (!sel opt_.some) { ret err[fail.Fail].ok{}; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind != ir_type.IRT_HANDLE || t.data.handle_.ctor != defs.SPV_CTOR_IMAGE
+        || t.data.handle_.count != defs.IMAGE_ARITY) { ret err[fail.Fail].ok{}; }
+    if (t.data.handle_.operands[defs.IMAGE_OP_MS]::u32 == 0
+        || t.data.handle_.operands[defs.IMAGE_OP_SAMPLED]::u32 != isa_spirv.IMAGE_SAMPLED_STORAGE) { ret err[fail.Fail].ok{}; }
+    val rq: err[fail.Fail] = emit_capability.require(e, nil, isa_spirv.CAP_STORAGE_IMAGE_MULTISAMPLE, extension_spirv.STORAGE_IMAGE_MULTISAMPLE,
+        "a multisampled storage image");
+    if (sel rq.err)                                               { ret rq; }
+    if (t.data.handle_.operands[defs.IMAGE_OP_ARRAYED]::u32 == 0) { ret err[fail.Fail].ok{}; }
+    ret emit_capability.require(e, nil, isa_spirv.CAP_IMAGE_MS_ARRAY, extension_spirv.STORAGE_IMAGE_MULTISAMPLE, "an arrayed multisampled storage image");
+}
+
+# a storage image of Unknown format is read or written only under the capability
+# for doing so without a format, and the device feature that permits it
+fun require_handle_access(e: *emitter.Emit, mf: *lang_mir.MirFunction, row: *target_definition.Op, kind: target_definition.OpOperandKind,
+    param: ir_type.IrTypeId) err[fail.Fail] {
+    if (!target_definition.op_kind_is_handle(kind)) { ret err[fail.Fail].ok{}; }
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, param);
+    if (!sel opt_.some) { ret err[fail.Fail].ok{}; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind != ir_type.IRT_HANDLE || t.data.handle_.ctor != defs.SPV_CTOR_IMAGE
+        || t.data.handle_.count != defs.IMAGE_ARITY) { ret err[fail.Fail].ok{}; }
+    if (t.data.handle_.operands[defs.IMAGE_OP_SAMPLED]::u32 != isa_spirv.IMAGE_SAMPLED_STORAGE
+        || t.data.handle_.operands[defs.IMAGE_OP_FORMAT]::u32 != isa_spirv.IMAGE_FORMAT_UNKNOWN) { ret err[fail.Fail].ok{}; }
+    val what: res[str, fail.Fail] = fail.format(e.alloc, "`{}` on a storage image of `Unknown` format", row.name);
+    if (kind == target_definition.OP_OPERAND_HANDLE_WRITE) {
+        ret emit_capability.require_made(e, mf, isa_spirv.CAP_STORAGE_IMAGE_WRITE_NO_FORMAT, extension_spirv.STORAGE_WRITE_WITHOUT_FORMAT, what);
+    }
+    ret emit_capability.require_made(e, mf, isa_spirv.CAP_STORAGE_IMAGE_READ_NO_FORMAT, extension_spirv.STORAGE_READ_WITHOUT_FORMAT, what);
+}
+
+# the parameter of an operand a literal's value brings, against the kind the value gives
+# it: the declaration could not be checked for it, since only the call decides the value
+fun op_brought_fits(e: *emitter.Emit, mf: *lang_mir.MirFunction, row: *target_definition.Op, i: u32, kind: target_definition.OpOperandKind,
+    param: ir_type.IrTypeId) err[fail.Fail] {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, param);
+    if (sel opt_.none) { ret err[fail.Fail].ok{}; }
+    val t:       *ir_type.IrType = opt_.some;
+    val integer: bool            = t.kind == ir_type.IRT_INT;
+    var why:     str             = nil;
+    if (kind == target_definition.OP_OPERAND_CONSTANT && !ir_integer_constant(e, t, 0)) {
+        why = "is an integer constant the literal's value brings, so its parameter must be an integer, a vector of integers or an array of them";
+    }
+    or ((kind == target_definition.OP_OPERAND_LITERAL || kind == target_definition.OP_OPERAND_BOOL || kind == target_definition.OP_OPERAND_SCOPE || kind == target_definition.OP_OPERAND_SEMANTICS) && !integer) {
+        why = "is a word or a scalar constant the literal's value brings, so its parameter must be an integer";
+    }
+    or (kind == target_definition.OP_OPERAND_VALUE && (t.kind == ir_type.IRT_PTR || t.kind == ir_type.IRT_HANDLE)) {
+        why = "is an ordinary value the literal's value brings, so its parameter cannot be a pointer or a handle";
+    }
+    if (why == nil) { ret err[fail.Fail].ok{}; }
+    ret err[fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.OP_SIGNATURE, lang_mir.refusal_loc(mf, e.cur_instr), op_operand_text(e, row, i, why))};
+}
+
+# whether `t` is an integer, a vector of integers or an array of either: what an integer constant id can be
+fun ir_integer_constant(e: *emitter.Emit, t: *ir_type.IrType, depth: u32) bool {
+    if (t.kind == ir_type.IRT_INT || ir_integer_vector(e, t)) { ret true; }
+    if (t.kind != ir_type.IRT_ARRAY || depth > 8)             { ret false; }
+    val el: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, t.data.array_.element);
+    ret sel el.some && ir_integer_constant(e, el.some, depth + 1);
+}
+
+fun ir_integer_vector(e: *emitter.Emit, t: *ir_type.IrType) bool {
+    if (t.kind != ir_type.IRT_VECTOR) { ret false; }
+    val el: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, t.data.vector_.element);
+    ret sel el.some && el.some.kind == ir_type.IRT_INT;
+}
+
+# the word operand `i` of an `op` call contributes, written as `kind` says
+fun op_operand(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, row: *target_definition.Op,
+    i: u32, kind: target_definition.OpOperandKind, param: ir_type.IrTypeId) res[u32, fail.Fail] {
+    val op: *lang_mir.MirOperand = ?mi.operands[i + 2];
+    if (target_definition.op_kind_is_pointer(kind)) { ret op_pointer_operand(e, mf, vm, row, i, op, param); }
+    if (kind == target_definition.OP_OPERAND_BOOL) {
+        if (op.kind == lang_mir.MIR_OP_IMM) { ret res[u32, fail.Fail].ok{types.const_bool(e.tt, op.imm != 0)}; }
+        val c: u32 = read_condition(e, vm, op, ir_type.byte_size_for_machine(?e.ir.types, param, e.layout) * 8);
+        if (c == 0) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: an `op` truth operand has no value to test")}; }
+        ret res[u32, fail.Fail].ok{c};
+    }
+    if (kind == target_definition.OP_OPERAND_CONSTANT && op.kind != lang_mir.MIR_OP_IMM) {
+        val c: u32 = constant_operand(e, mf, vm, op, emit_value.ir_value_spv_type(e, param), 0);
+        if (c != 0) { ret res[u32, fail.Fail].ok{c}; }
+    }
+    if (target_definition.op_kind_is_constant(kind) || kind == target_definition.OP_OPERAND_LITERAL) {
+        if (op.kind != lang_mir.MIR_OP_IMM) {
+            ret res[u32, fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.OP_OPERAND_NOT_CONSTANT, lang_mir.refusal_loc(mf, e.cur_instr),
+                op_operand_text(e, row, i, "is an integer constant the instruction takes by value (a scope, memory semantics, an operand mask or a constant offset), and this argument is not a constant by emission: pass a literal or a constant, not a value computed at run time"))};
+        }
+        if (kind == target_definition.OP_OPERAND_LITERAL) {
+            if (op.imm < -2147483648 || op.imm > 4294967295) {
+                ret res[u32, fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.OP_OPERAND_NOT_CONSTANT, lang_mir.refusal_loc(mf, e.cur_instr),
+                    op_operand_text(e, row, i, "is a literal word written inline, and this constant does not fit one 32-bit word"))};
+            }
+            ret res[u32, fail.Fail].ok{(op.imm & 0xFFFFFFFF)::u32};
+        }
+        val mr: err[fail.Fail] = require_memory_operand(e, mf, row, kind, (op.imm & 0xFFFFFFFF)::u32);
+        if (sel mr.err) { ret res[u32, fail.Fail].err{mr.err}; }
+    }
+    ret emit_memory.read_value(e, mf, vm, op, emit_value.ir_value_spv_type(e, param), mi.memory_flags);
+}
+
+# a memory scope or semantics value held to the memory model the module declares: under
+# the Vulkan model the Device scope needs vulkanMemoryModelDeviceScope, and under GLSL450
+# the QueueFamily scope and the availability, visibility and volatile semantics, which
+# only the Vulkan model defines, need its feature. SequentiallyConsistent semantics are
+# refused in every Vulkan environment and under the Vulkan model, which define no such
+# order (VUID-StandaloneSpirv-MemorySemantics-10866)
+fun require_memory_operand(e: *emitter.Emit, mf: *lang_mir.MirFunction, row: *target_definition.Op, kind: target_definition.OpOperandKind, value: u32) err[fail.Fail] {
+    if (kind == target_definition.OP_OPERAND_SEMANTICS && (value & isa_spirv.SEMANTICS_SEQ_CST) != 0
+        && (e.vulkan_mm || e.tgt.identity.env_id != isa.ENV_NONE)) {
+        val r: res[str, std_format.FormatError] = std_format.sprint(e.alloc,
+            "`{}` with SequentiallyConsistent memory semantics is not allowed in a Vulkan environment (VUID-StandaloneSpirv-MemorySemantics-10866): Vulkan defines no sequentially consistent order, so use Acquire, Release or AcquireRelease",
+            row.name);
+        if (sel r.err) { ret err[fail.Fail].err{fail.format_refused(r.err)}; }
+        ret err[fail.Fail].err{emitter.reject_at(e, diagnostic_kind.OP_OPERAND_VALUE, lang_mir.refusal_loc(mf, e.cur_instr), r.ok)};
+    }
+    var capability: u32 = target_definition.NO_OP_CAPABILITY;
+    var requires:   u64 = 0;
+    var what:       str = nil;
+    if (kind == target_definition.OP_OPERAND_SCOPE && e.vulkan_mm && value == isa_spirv.SCOPE_DEVICE) {
+        capability = isa_spirv.CAP_VULKAN_MEMORY_MODEL_DEVICE_SCOPE;
+        requires   = extension_spirv.VULKAN_MEMORY_MODEL_DEVICE_SCOPE;
+        what       = "with the Device memory scope under the Vulkan memory model";
+    }
+    or (kind == target_definition.OP_OPERAND_SCOPE && !e.vulkan_mm && value == isa_spirv.SCOPE_QUEUE_FAMILY) {
+        requires = extension_spirv.VULKAN_MEMORY_MODEL;
+        what     = "with the QueueFamily memory scope, which only the Vulkan memory model defines,";
+    }
+    or (kind == target_definition.OP_OPERAND_SEMANTICS && !e.vulkan_mm && (value & isa_spirv.SEMANTICS_VULKAN_ONLY) != 0) {
+        requires = extension_spirv.VULKAN_MEMORY_MODEL;
+        what     = "with MakeAvailable, MakeVisible or Volatile memory semantics, which only the Vulkan memory model defines,";
+    }
+    if (what == nil) { ret err[fail.Fail].ok{}; }
+    ret emit_capability.require_made(e, mf, capability, requires, fail.format(e.alloc, "`{}` {}", row.name, what));
+}
+
+# the constant id of `want_ty` an `op` argument is by emission, 0 when it is not one: an
+# immediate, a module-scope `val`, a register whose one definition in the function
+# builds a vector from constants or copies one, or an aggregate passed through a
+# temporary written whole by constants. the register's own load would be a value, not
+# a constant id
+fun constant_operand(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, op: *lang_mir.MirOperand, want_ty: u32, depth: u32) u32 {
+    if (want_ty == 0 || depth > 8)                                                                { ret 0; }
+    if (op.kind == lang_mir.MIR_OP_IMM)                                                           { ret emit_value.immediate(e, want_ty, op.imm); }
+    if (op.kind == lang_mir.MIR_OP_SYM && op.sym_off == 0)                                        { ret emit_memory.constant_global(e, op.sym, want_ty); }
+    if (op.kind == lang_mir.MIR_OP_MEM && depth == 0)                                             { ret constant_temporary(e, mf, vm, op, want_ty, depth); }
+    if (op.kind != lang_mir.MIR_OP_VREG || op.vreg.n >= vm.n || vm.type_id[op.vreg.n] != want_ty) { ret 0; }
+    val def: *lang_mir.MirInstr = sole_definition(mf, op.vreg.n);
+    if (def == nil)                                                { ret 0; }
+    if (def.opcode == lang_mir.MIR_LOAD && def.operand_count == 2) { ret emit_memory.constant_load(e, ?def.operands[1], want_ty); }
+    if (emit_value.is_reg_copy(def))                               { ret constant_operand(e, mf, vm, ?def.operands[1], want_ty, depth + 1); }
+    if (def.opcode != lang_mir.MIR_VEC_BUILD)                      { ret 0; }
+    var lanes:   u32 = 0;
+    val lane_ty: u32 = types.vector_value_shape(e.tt, want_ty, ?lanes);
+    if (lane_ty == 0 || lanes != def.operand_count - 1 || lanes > model_spirv.MAX_VECTOR_COMPONENTS) { ret 0; }
+    var parts: [4]u32;
+    var k:     u32 = 0;
+    for (k < lanes) {
+        val lane: *lang_mir.MirOperand = ?def.operands[1 + k];
+        if (lane.kind == lang_mir.MIR_OP_IMM) { parts[k] = emit_value.immediate(e, lane_ty, lane.imm); }
+        or                                    { parts[k] = constant_operand(e, mf, vm, lane, lane_ty, depth + 1); }
+        if (parts[k] == 0)                    { ret 0; }
+        k = k + 1;
+    }
+    ret types.const_composite(e.tt, want_ty, ?parts[0], lanes);
+}
+
+# one write of a temporary an aggregate constant operand passes: the access path from
+# the temporary's address to what it writes, and the store or copy that writes there
+rec ConstWrite {
+    path:  [8]u32;
+    depth: u32;
+    mi:    *lang_mir.MirInstr;
+}
+
+# the constant id of `want_ty` the temporary an aggregate argument `op` passes holds, 0
+# unless the call reading it is its only other use and every write of it precedes the
+# call in its block, each a store of a constant or a copy of a module-scope `val`
+# reached through constant access chains, together writing every element exactly once.
+# a run-time store, a partial or repeated write, a write after the call or any other
+# use of its address, which could write it unseen, leaves it a value
+fun constant_temporary(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, op: *lang_mir.MirOperand, want_ty: u32, depth: u32) u32 {
+    val a: u32 = op.vreg.n;
+    if (op.imm != 0 || e.cur_instr == nil || a >= vm.n)                            { ret 0; }
+    if (vm.chain_ty[a] != want_ty || vm.chain_sc[a] != isa_spirv.STORAGE_FUNCTION) { ret 0; }
+    val def: *lang_mir.MirInstr = emit_copy.address_def(mf, a);
+    if (def == nil || def.opcode != lang_mir.MIR_ALLOCA) { ret 0; }
+    var cb: u32 = 0;
+    var ci: u32 = 0;
+    if (!instr_position(mf, e.cur_instr, ?cb, ?ci)) { ret 0; }
+    var writes: Vector[ConstWrite] = collections_vector.init[ConstWrite](e.alloc);
+    fin { collections_vector.dnit[ConstWrite](?writes); }
+    var path: [8]u32;
+    if (!collect_writes(e, mf, a, ?path[0], 0, cb, ci, ?writes)) { ret 0; }
+    var used: u32 = 0;
+    val c:    u32 = constant_at(e, mf, vm, ?writes, ?path[0], 0, want_ty, depth, ?used);
+    if (used != writes.len::u32) { ret 0; }
+    ret c;
+}
+
+# the block and index of `mi` in `mf`
+fun instr_position(mf: *lang_mir.MirFunction, mi: *lang_mir.MirInstr, out_block: *u32, out_index: *u32) bool {
+    var bi: u32 = 0;
+    for (bi < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            if (?blk.instrs[ii] == mi) {
+                @out_block = bi;
+                @out_index = ii;
+                ret true;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+# every write through address `a`, at `path` of `depth` indices into the temporary,
+# into `writes`. false when `a` has a use that is neither such a write preceding the
+# call at instruction `ci` of block `cb` nor that call's read of the whole temporary
+fun collect_writes(e: *emitter.Emit, mf: *lang_mir.MirFunction, a: u32, path: *u32, depth: u32, cb: u32, ci: u32,
+    writes: *Vector[ConstWrite]) bool {
+    var bi: u32 = 0;
+    for (bi < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            # an allocation's second operand is its frame slot's key, not a register
+            if (mi.opcode == lang_mir.MIR_ALLOCA) {
+                ii = ii + 1;
+                cnt;
+            }
+            val before: bool = bi == cb && ii < ci;
+            var k:      u32  = 0;
+            for (k < mi.operand_count) {
+                val o: *lang_mir.MirOperand = ?mi.operands[k];
+                if ((o.kind != lang_mir.MIR_OP_VREG && o.kind != lang_mir.MIR_OP_MEM) || o.vreg.n != a || (k == 0 && emit_value.instr_defines_vreg(mi, a))) {
+                    k = k + 1;
+                    cnt;
+                }
+                if (mi == e.cur_instr) {
+                    if (depth != 0 || o.kind != lang_mir.MIR_OP_MEM || o.imm != 0) { ret false; }
+                }
+                or (k == 0 && o.kind == lang_mir.MIR_OP_MEM && o.imm == 0 && before
+                    && ((mi.opcode == lang_mir.MIR_STORE && mi.operand_count == 2)
+                    || (mi.opcode == lang_mir.MIR_MEMCPY && mi.operand_count == 3))) {
+                    var w: ConstWrite;
+                    var d: u32 = 0;
+                    for (d < depth) {
+                        w.path[d] = path[d];
+                        d         = d + 1;
+                    }
+                    w.depth = depth;
+                    w.mi    = mi;
+                    val pr: res[usize, A.Error] = collections_vector.push[ConstWrite](writes, w);
+                    if (sel pr.err) { ret false; }
+                }
+                or (k == 1 && mi.opcode == lang_mir.MIR_GEP && (o.kind == lang_mir.MIR_OP_VREG || o.imm == 0)) {
+                    if (!collect_chain_writes(e, mf, mi, path, depth, cb, ci, writes)) { ret false; }
+                }
+                or { ret false; }
+                k = k + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret true;
+}
+
+# the writes through access chain `gep`, whose base is the temporary at `path`: each of
+# its indices a constant, the leading one 0
+fun collect_chain_writes(e: *emitter.Emit, mf: *lang_mir.MirFunction, gep: *lang_mir.MirInstr, path: *u32, depth: u32, cb: u32, ci: u32,
+    writes: *Vector[ConstWrite]) bool {
+    if (gep.operand_count < 4 || gep.operands[0].kind != lang_mir.MIR_OP_VREG)   { ret false; }
+    if (gep.operands[2].kind != lang_mir.MIR_OP_IMM || gep.operands[2].imm != 0) { ret false; }
+    val count: u32 = gep.operand_count - 3;
+    if (depth + count > 8) { ret false; }
+    var inner: [8]u32;
+    var d:     u32 = 0;
+    for (d < depth) {
+        inner[d] = path[d];
+        d        = d + 1;
+    }
+    var k: u32 = 0;
+    for (k < count) {
+        val ix: *lang_mir.MirOperand = ?gep.operands[3 + k];
+        if (ix.kind != lang_mir.MIR_OP_IMM || ix.imm < 0 || ix.imm > 0xFFFFFFFF) { ret false; }
+        inner[depth + k] = ix.imm::u32;
+        k                = k + 1;
+    }
+    ret collect_writes(e, mf, gep.operands[0].vreg.n, ?inner[0], depth + count, cb, ci, writes);
+}
+
+# the constant of `ty` the temporary holds at `path`: the write there, which no write
+# beneath it shares, or else a composite of its members, each written so. `used` counts
+# the writes it spells, so a write it never reaches, repeated or out of range, is seen
+fun constant_at(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, writes: *Vector[ConstWrite], path: *u32, depth: u32,
+    ty: u32, cdepth: u32, used: *u32) u32 {
+    if (ty == 0) { ret 0; }
+    var exact: *ConstWrite = nil;
+    var under: bool        = false;
+    var i:     usize       = 0;
+    for (i < writes.len) {
+        val w: *ConstWrite = ?writes.data[i];
+        i = i + 1;
+        if (w.depth < depth) { cnt; }
+        var d:  u32  = 0;
+        var on: bool = true;
+        for (d < depth && on) {
+            on = w.path[d] == path[d];
+            d  = d + 1;
+        }
+        # a repeated write is left unspelled, which the caller's count of them refuses
+        if (!on)             { cnt; }
+        if (w.depth > depth) { under = true; }
+        or                   { exact = w; }
+    }
+    if (exact != nil) {
+        if (under) { ret 0; }
+        @used = @used + 1;
+        ret write_constant(e, mf, vm, exact.mi, ty, cdepth);
+    }
+    if (!under || depth >= 8) { ret 0; }
+    val n: u32 = types.composite_count(e.tt, ty);
+    if (n == 0) { ret 0; }
+    val pr: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel pr.err) { ret 0; }
+    val parts: *u32 = pr.ok;
+    fin { A.deallocate[u32](e.alloc, parts, n::usize); }
+    var k: u32 = 0;
+    for (k < n) {
+        path[depth] = k;
+        parts[k]    = constant_at(e, mf, vm, writes, path, depth + 1, types.composite_member(e.tt, ty, k), cdepth, used);
+        if (parts[k] == 0) { ret 0; }
+        k = k + 1;
+    }
+    ret types.const_composite(e.tt, ty, parts, n);
+}
+
+# the constant of `ty` the store or copy `mi` writes, 0 when it writes none: a store of
+# an immediate as wide as a scalar, or of a constant operand, or a copy of the whole of
+# a module-scope `val`
+fun write_constant(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, ty: u32, depth: u32) u32 {
+    val src: *lang_mir.MirOperand = ?mi.operands[1];
+    if (mi.opcode == lang_mir.MIR_STORE) {
+        if (src.kind != lang_mir.MIR_OP_IMM) { ret constant_operand(e, mf, vm, src, ty, depth + 1); }
+        # a composite has no width of its own, so an immediate fills only a scalar
+        if (!types.type_is_bool(e.tt, ty) && mi.width::u32 * 8 != types.type_bits(e.tt, ty)) { ret 0; }
+        ret emit_value.immediate(e, ty, src.imm);
+    }
+    ret emit_memory.constant_copy(e, mi, ty);
+}
+
+# the one instruction of `mf` that writes register `v`, nil when none or several do
+fun sole_definition(mf: *lang_mir.MirFunction, v: u32) *lang_mir.MirInstr {
+    var found: *lang_mir.MirInstr = nil;
+    var bi:    u32                = 0;
+    for (bi < mf.block_count) {
+        val blk: *lang_mir.MirBlock = ?mf.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi:     *lang_mir.MirInstr = ?blk.instrs[ii];
+            var writes: bool               = lang_mir.instr_defines_shape(mi) && mi.operands[0].kind == lang_mir.MIR_OP_VREG && mi.operands[0].vreg.n == v;
+            if (mi.opcode == lang_mir.MIR_VALUE_CALL && mi.operand_count > 1) {
+                writes = mi.operands[1].kind == lang_mir.MIR_OP_VREG && mi.operands[1].vreg.n == v;
+            }
+            if (writes) {
+                if (found != nil) { ret nil; }
+                found = mi;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret found;
+}
+
+# a pointer operand is the argument's own address: an access chain, a function-local
+# object or an interface variable, in the storage class that memory lives in
+fun op_pointer_operand(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, row: *target_definition.Op, i: u32,
+    op: *lang_mir.MirOperand, param: ir_type.IrTypeId) res[u32, fail.Fail] {
+    var ty:  u32 = 0;
+    var sc:  u32 = 0;
+    var ptr: u32 = emit_memory.address(e, vm, op, ?ty, ?sc);
+    if (ptr == 0 && op.kind == lang_mir.MIR_OP_SYM && op.sym_off == 0) {
+        val gx: u32 = emit_global.lookup(e, op.sym);
+        if (gx != emit_global.GL_NONE && emit_global.ir_of(e, gx).iface != me_ir.IFACE_NONE) {
+            ptr = e.gvar_ids[gx];
+            ty  = e.gtype_ids[gx];
+        }
+    }
+    if (ptr == 0 || ty == 0) {
+        ret res[u32, fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_UNSUPPORTED, lang_mir.refusal_loc(mf, e.cur_instr),
+            op_operand_text(e, row, i, "is a pointer, and this argument names no memory the module can address: pass the address of a shader interface variable, a local, or an element or member of one"))};
+    }
+    # memory holds a narrow integer as itself, where a function carries it wider
+    val want: u32 = ir_pointee_spv_type(e, param);
+    # a texel of a signed image is held signed, and read and written as its unsigned form
+    if (want == 0 || (want != ty && !emit_layout.memory_bridged(e, ty, want) && !types.signed_twins(e.tt, ty, want))) {
+        ret res[u32, fail.Fail].err{emitter.reject_made_at(e, diagnostic_kind.SPIRV_UNSUPPORTED, lang_mir.refusal_loc(mf, e.cur_instr),
+            op_operand_text(e, row, i, "is a pointer whose pointee is not the type the argument addresses in its storage class: an explicitly laid out block member and its function-local counterpart are distinct SPIR-V types, so point at a scalar or vector element"))};
+    }
+    ret res[u32, fail.Fail].ok{ptr};
+}
+
+fun ir_pointee_spv_type(e: *emitter.Emit, ptr: ir_type.IrTypeId) u32 {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?e.ir.types, ptr);
+    if (sel opt_.none)                                                               { ret 0; }
+    if (opt_.some.kind != ir_type.IRT_PTR || ir_type.is_nil(opt_.some.data.pointee)) { ret 0; }
+    ret emit_value.ir_value_spv_type(e, opt_.some.data.pointee);
+}
+
+fun op_operand_text(e: *emitter.Emit, row: *target_definition.Op, i: u32, why: str) res[str, fail.Fail] {
+    ret fail.format(e.alloc, "operand {} of `{}` {}", i + 1, row.name, why);
+}
+
+# the texel operands land in bit order and only where the call does not already carry
+# them: added with the mask to a call passing none, after a lower bit's operand and before
+# a higher one's, and a bit the call carries keeps the call's scope
+test splice_texel_operands__bit_order_and_idempotent {
+    var values: [3]target_definition.OpEnumerant = [3]target_definition.OpEnumerant{
+        target_definition.OpEnumerant{value: defs.IMAGE_OPERANDS_SAMPLE, name: "Sample", capability: target_definition.NO_OP_CAPABILITY, requires: 0, operands: "v"},
+        target_definition.OpEnumerant{value: defs.IMAGE_OPERANDS_MAKE_TEXEL_VISIBLE, name: "MakeTexelVisible", capability: target_definition.NO_OP_CAPABILITY, requires: 0, operands: "s"},
+        target_definition.OpEnumerant{value: 0x10000, name: "Offsets", capability: target_definition.NO_OP_CAPABILITY, requires: 0, operands: "c"},
+    };
+    var en:  target_definition.OpEnum = target_definition.OpEnum{name: "Image Operands", values: ?values[0], count: 3, mask: true};
+    val vis: u32                      = defs.IMAGE_OPERANDS_MAKE_TEXEL_VISIBLE;
+    val np:  u32                      = defs.IMAGE_OPERANDS_NON_PRIVATE_TEXEL;
+    var w:   [8]u32;
+    w[0] = 10;
+    w[1] = 11;
+    if (splice_texel_operands(?w[0], 2, 2, ?en, vis, 99) != 4 || w[2] != (vis | np) || w[3] != 99) { ret 1; }
+    # Sample's operand stays before the scope, Offsets' after it
+    w[2] = defs.IMAGE_OPERANDS_SAMPLE | 0x10000;
+    w[3] = 20;
+    w[4] = 30;
+    if (splice_texel_operands(?w[0], 5, 2, ?en, vis, 99) != 6)                                               { ret 2; }
+    if (w[2] != (defs.IMAGE_OPERANDS_SAMPLE | 0x10000 | vis | np) || w[3] != 20 || w[4] != 99 || w[5] != 30) { ret 3; }
+    # a call carrying the bit keeps its own scope and gains no second one
+    w[2] = vis;
+    w[3] = 42;
+    if (splice_texel_operands(?w[0], 4, 2, ?en, vis, 99) != 4 || w[2] != (vis | np) || w[3] != 42) { ret 4; }
+    ret 0;
+}
+
+# a store of `value` to element `k` of the temporary at register 0, through the access
+# chain register `g`, appended to `ins` at `at` with its operands at `o`
+#[testing]
+fun ut_ct_store(ops: *lang_mir.MirOperand, ins: *lang_mir.MirInstr, at: *u32, o: *u32, g: u32, k: i64, value: lang_mir.MirOperand) {
+    val p: u32 = @o;
+    ops[p]       = lang_mir.op_vreg(lang_mir.vreg_id(g));
+    ops[p + 1]   = lang_mir.op_mem_value(lang_mir.vreg_id(0), 0);
+    ops[p + 2]   = lang_mir.op_imm(0);
+    ops[p + 3]   = lang_mir.op_imm(k);
+    ops[p + 4]   = lang_mir.op_mem_value(lang_mir.vreg_id(g), 0);
+    ops[p + 5]   = value;
+    ins[@at]     = lang_mir.instr(lang_mir.MIR_GEP, ?ops[p], 4, 8, 8);
+    ins[@at + 1] = lang_mir.instr(lang_mir.MIR_STORE, ?ops[p + 4], 2, 4, 4);
+    @at          = @at + 2;
+    @o           = p + 6;
+}
+
+# the temporary of `[4]i32` at register 0 written by four constant stores, then read
+# by the call it returns, with `mode` breaking one guard: a run-time store, a store
+# after the call, a missing element, a repeated element, a copy of the address, and a
+# zeroing write, a store past the last element, and the call taking its address too
+#[testing]
+fun ut_ct_build(mode: u32, ops: *lang_mir.MirOperand, ins: *lang_mir.MirInstr, out_n: *u32) *lang_mir.MirInstr {
+    var n: u32 = 0;
+    var o: u32 = 0;
+    ops[0] = lang_mir.op_vreg(lang_mir.vreg_id(0));
+    ops[1] = lang_mir.op_mem_value(lang_mir.vreg_id(15), 0);
+    ins[0] = lang_mir.instr(lang_mir.MIR_ALLOCA, ?ops[0], 2, 8, 8);
+    n      = 1;
+    o      = 2;
+    if (mode == 6) {
+        ops[o]     = lang_mir.op_mem_value(lang_mir.vreg_id(0), 0);
+        ops[o + 1] = lang_mir.op_imm(16);
+        ins[n]     = lang_mir.instr(lang_mir.MIR_MEMZERO, ?ops[o], 2, 8, 8);
+        n          = n + 1;
+        o          = o + 2;
+    }
+    var k: u32 = 0;
+    for (k < 4) {
+        var value: lang_mir.MirOperand = lang_mir.op_imm(10 + k::i64);
+        if (mode == 1 && k == 2)                   { value = lang_mir.op_vreg(lang_mir.vreg_id(9)); }
+        if (!((mode == 2 || mode == 3) && k == 3)) { ut_ct_store(ops, ins, ?n, ?o, 1 + k, k::i64, value); }
+        k = k + 1;
+    }
+    if (mode == 4) { ut_ct_store(ops, ins, ?n, ?o, 5, 1, lang_mir.op_imm(99)); }
+    if (mode == 7) { ut_ct_store(ops, ins, ?n, ?o, 5, 4, lang_mir.op_imm(99)); }
+    if (mode == 5) {
+        ops[o]     = lang_mir.op_vreg(lang_mir.vreg_id(10));
+        ops[o + 1] = lang_mir.op_vreg(lang_mir.vreg_id(0));
+        ins[n]     = lang_mir.instr(lang_mir.MIR_MOV, ?ops[o], 2, 8, 8);
+        n          = n + 1;
+        o          = o + 2;
+    }
+    ops[o]     = lang_mir.op_sym(intern.str_id(1), 0);
+    ops[o + 1] = lang_mir.op_vreg(lang_mir.vreg_id(8));
+    ops[o + 2] = lang_mir.op_mem_value(lang_mir.vreg_id(0), 0);
+    ops[o + 3] = lang_mir.op_vreg(lang_mir.vreg_id(0));
+    var argc: u32 = 3;
+    if (mode == 8) { argc = 4; }
+    val call: u32 = n;
+    ins[n] = lang_mir.instr(lang_mir.MIR_VALUE_CALL, ?ops[o], argc, 0, 0);
+    n      = n + 1;
+    o      = o + 4;
+    if (mode == 2) { ut_ct_store(ops, ins, ?n, ?o, 4, 3, lang_mir.op_imm(13)); }
+    @out_n = n;
+    ret ?ins[call];
+}
+
+# an aggregate passed through a temporary is a constant only when constants write each
+# of its elements once before the call that reads it, and nothing else touches it
+test constant_temporary__whole_constant_writes_only {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var b: isa_spirv.Builder = isa_spirv.builder_init(?alloc);
+    fin { isa_spirv.builder_dnit(?b); }
+    var tt: types.TypeTable = types.types_init(?b);
+    fin { types.types_dnit(?tt); }
+    val elem: u32 = types.type_int(?tt, 32);
+    val arr:  u32 = types.type_array(?tt, elem, 4, false);
+    if (elem == 0 || arr == 0) { ret 1; }
+    var e: emitter.Emit;
+    e.alloc = ?alloc;
+    e.b     = ?b;
+    e.tt    = ?tt;
+    var type_id:  [16]u32;
+    var chain_ty: [16]u32;
+    var chain_sc: [16]u32;
+    chain_ty[0] = arr;
+    chain_sc[0] = isa_spirv.STORAGE_FUNCTION;
+    type_id[9]  = elem;
+    var vm: emitter.VMaps;
+    vm.n        = 16;
+    vm.type_id  = ?type_id[0];
+    vm.chain_ty = ?chain_ty[0];
+    vm.chain_sc = ?chain_sc[0];
+    var parts: [4]u32;
+    var k:     u32 = 0;
+    for (k < 4) {
+        parts[k] = types.const_int(?tt, 32, 10 + k::i64);
+        k        = k + 1;
+    }
+    val want: u32 = types.const_composite(?tt, arr, ?parts[0], 4);
+    var mode: u32 = 0;
+    for (mode < 9) {
+        var ops: [48]lang_mir.MirOperand;
+        var ins: [16]lang_mir.MirInstr;
+        var n:   u32 = 0;
+        e.cur_instr = ut_ct_build(mode, ?ops[0], ?ins[0], ?n);
+        var blk: lang_mir.MirBlock;
+        blk.instrs      = ?ins[0];
+        blk.instr_count = n;
+        var mf: lang_mir.MirFunction;
+        mf.blocks      = ?blk;
+        mf.block_count = 1;
+        val got: u32 = constant_operand(?e, ?mf, ?vm, ?e.cur_instr.operands[2], arr, 0);
+        if (mode == 0 && got != want) { ret 2; }
+        if (mode != 0 && got != 0)    { ret 3 + mode::i32; }
+        mode = mode + 1;
+    }
+    ret 0;
+}

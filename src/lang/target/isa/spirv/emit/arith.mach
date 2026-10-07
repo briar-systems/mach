@@ -1,0 +1,985 @@
+# arithmetic, comparison, conversion and vector lane instructions
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std_format:         std.format;
+
+use A: std.allocator;
+
+use lang_checked: mach.lang.checked;
+use mach.lang.diagnostic;
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.float;
+use mach.lang.growth;
+use mach.lang.intern;
+use mach.lang.layout;
+use me_ir:   mach.lang.me.ir;
+use ir_id:   mach.lang.me.ir.id;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use lang_mir:          mach.lang.mir;
+use mir_debug:         mach.lang.mir.debug;
+use mir_structure:     mach.lang.mir.structure;
+use mir_unit:          mach.lang.mir.unit;
+use lang_source:       mach.lang.source;
+use target_definition: mach.lang.target.definition;
+use mach.lang.target.extension;
+use extension_spirv: mach.lang.target.extension.spirv;
+use mach.lang.target.isa;
+use isa_spirv: mach.lang.target.isa.spirv;
+use mach.lang.target.isa.spirv.debug;
+use mach.lang.target.isa.spirv.defs;
+use mach.lang.target.isa.spirv.emit.emitter;
+use emit_layout: mach.lang.target.isa.spirv.emit.layout;
+use emit_value:  mach.lang.target.isa.spirv.emit.value;
+use mach.lang.target.isa.spirv.ops;
+use mach.lang.target.isa.spirv.types;
+use target_model: mach.lang.target.model;
+use model_spirv:  mach.lang.target.model.spirv;
+use target_of:    mach.lang.target.of;
+use mach.lang.textbuild;
+
+pub fun chain_storage(vm: *emitter.VMaps, op: *lang_mir.MirOperand) u32 {
+    var v: u32 = lang_mir.MIR_VREG_NIL.n;
+    if (op.kind == lang_mir.MIR_OP_VREG)               { v = op.vreg.n; }
+    or (op.kind == lang_mir.MIR_OP_MEM && op.imm == 0) { v = op.vreg.n; }
+    if (v == lang_mir.MIR_VREG_NIL.n || v >= vm.n)     { ret 0; }
+    ret vm.chain_sc[v];
+}
+
+fun operand_carries_type(vm: *emitter.VMaps, op: *lang_mir.MirOperand) bool {
+    if (op.kind != lang_mir.MIR_OP_VREG)                 { ret false; }
+    if (op.vreg.n >= vm.n || vm.type_id[op.vreg.n] == 0) { ret false; }
+    ret !vm.is_bool[op.vreg.n];
+}
+
+pub fun operand_matches_type(vm: *emitter.VMaps, op: *lang_mir.MirOperand, want_ty: u32) bool {
+    if (!operand_carries_type(vm, op)) { ret true; }
+    ret vm.type_id[op.vreg.n] == want_ty;
+}
+
+pub fun store_vreg(e: *emitter.Emit, vm: *emitter.VMaps, vreg: u32, value: u32) err[fail.Fail] {
+    if (vreg < vm.n && vm.type_id[vreg] != 0 && types.type_is_opaque(e.tt, vm.type_id[vreg])) {
+        vm.opq_ssa[vreg] = value;
+        ret err[fail.Fail].ok{};
+    }
+    if (vreg >= vm.n || vm.var_id[vreg] == 0) {
+        ret emitter.defect(e, "spirv.emit: store to an undeclared vreg");
+    }
+    var so: [2]u32;
+    so[0] = vm.var_id[vreg];
+    so[1] = value;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_STORE, ?so[0], 2);
+    ret err[fail.Fail].ok{};
+}
+
+# `shift` names the second operand a shift count, which is typed by its own
+# operand rather than the result: a shift's count may be any integer width
+pub fun binary_emit(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, op_code: u32, shift: bool) err[fail.Fail] {
+    if (mi.operand_count != 3 || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+        ret emitter.defect(e, "spirv.emit: malformed binary instruction");
+    }
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n) { ret emitter.defect(e, "spirv.emit: binary result vreg out of range"); }
+    val ty: u32 = vm.type_id[dst];
+    if (!operand_matches_type(vm, ?mi.operands[1], ty)) {
+        ret emitter.defect(e, "spirv.emit: binary instruction mixes operand types");
+    }
+    var b_ty: u32 = ty;
+    if (shift && operand_carries_type(vm, ?mi.operands[2])) {
+        b_ty = vm.type_id[mi.operands[2].vreg.n];
+        if (types.type_is_float(e.tt, b_ty) || types.type_is_opaque(e.tt, b_ty)) {
+            ret emitter.defect(e, "spirv.emit: shift count is not an integer");
+        }
+    }
+    or (!operand_matches_type(vm, ?mi.operands[2], ty)) {
+        ret emitter.defect(e, "spirv.emit: binary instruction mixes operand types");
+    }
+    var a: u32 = emit_value.read_operand(e, vm, ?mi.operands[1], ty);
+    var b: u32 = emit_value.read_operand(e, vm, ?mi.operands[2], b_ty);
+    if (e.b.err) { ret emitter.defect(e, "spirv.emit: unreadable operand in binary instruction"); }
+    # a quotient or remainder of carried integer lanes is of their values, which the
+    # lowering extends for a scalar and the lanes here
+    if (lang_mir.vec_lane_is_vector(mi.vec_lane) && divides(op_code)) {
+        val lbits:  u32  = lang_mir.vec_lane_elem_bytes(mi.vec_lane)::u32 * 8;
+        val signed: bool = op_code == isa_spirv.OP_S_DIV || op_code == isa_spirv.OP_S_REM;
+        a = emit_value.narrow_extend(e, a, ty, lbits, signed);
+        b = emit_value.narrow_extend(e, b, ty, lbits, signed);
+    }
+    val row: *ops.CoreOp = ops.core(op_code);
+    if (row.arity != 2) { ret emitter.defect(e, "spirv.emit: a binary instruction was mapped to an opcode whose row is not two operands"); }
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var words:  [4]u32;
+    words[0] = vm.type_id[dst];
+    words[1] = result;
+    words[2] = a;
+    words[3] = b;
+    isa_spirv.inst(e.b, ?e.b.functions, op_code, ?words[0], ops.operand_words(row));
+    ret store_vreg(e, vm, dst, result);
+}
+
+fun divides(op_code: u32) bool {
+    ret op_code == isa_spirv.OP_U_DIV || op_code == isa_spirv.OP_S_DIV || op_code == isa_spirv.OP_U_MOD || op_code == isa_spirv.OP_S_REM;
+}
+
+# a lane-wise shift saturates each lane as the scalar shift does, and
+# OpShift* leaves a component shifted by its width or more undefined.
+# the fill a lane saturates to is 0, or for an arithmetic shift the shift by
+# width - 1. a constant count is the bare shift, or the fill when it is out of
+# range. any other count keeps the shift where the count is below the width
+# and selects the fill elsewhere. a uniform count is one scalar, splatted
+# since OpShift* shifts by a count per component
+pub fun vector_shift_emit(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, op_code: u32) err[fail.Fail] {
+    if (mi.operand_count != 3 || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+        ret emitter.defect(e, "spirv.emit: malformed vector shift instruction");
+    }
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n) { ret emitter.defect(e, "spirv.emit: vector shift result vreg out of range"); }
+    val ty:      u32 = vm.type_id[dst];
+    val lanes:   u32 = lang_mir.vec_lane_count(mi.vec_lane);
+    val bits:    u32 = lang_mir.vec_lane_elem_bytes(mi.vec_lane)::u32 * 8;
+    val lane_ty: u32 = types.type_int(e.tt, emit_layout.carrier_bits(e, bits));
+    val bvec_ty: u32 = types.type_vector(e.tt, types.type_bool(e.tt), lanes);
+    if (ty == 0 || lane_ty == 0 || bvec_ty == 0 || !operand_matches_type(vm, ?mi.operands[1], ty)) {
+        ret emitter.unsupported(e, emit_value.unsupported_value_type(e, mi));
+    }
+    # a right shift brings a carried lane's upper bits down, so it shifts the lane's value
+    var a: u32 = emit_value.read_operand(e, vm, ?mi.operands[1], ty);
+    if (e.b.err)                                    { ret emitter.defect(e, "spirv.emit: unreadable operand in vector shift"); }
+    if (op_code != isa_spirv.OP_SHIFT_LEFT_LOGICAL) { a = emit_value.narrow_extend(e, a, ty, bits, op_code == isa_spirv.OP_SHIFT_RIGHT_ARITHMETIC); }
+
+    val cnt: *lang_mir.MirOperand = ?mi.operands[2];
+    if (cnt.kind == lang_mir.MIR_OP_IMM) {
+        if (cnt.imm < 0 || cnt.imm >= bits::i64) {
+            val out: u32 = shift_fill(e, op_code, ty, lanes, bits, a);
+            if (out == 0) { ret emitter.defect(e, "spirv.emit: could not build a vector shift fill"); }
+            ret store_vreg(e, vm, dst, out);
+        }
+        val by: u32 = emit_value.mask_splat(e, ty, lanes, cnt.imm::u32, 0);
+        if (by == 0) { ret emitter.defect(e, "spirv.emit: could not build a vector shift count constant"); }
+        ret store_vreg(e, vm, dst, shift_words(e, op_code, ty, a, by));
+    }
+    var c: u32 = 0;
+    if (operand_carries_type(vm, cnt) && vm.type_id[cnt.vreg.n] == ty) {
+        c = emit_value.read_operand(e, vm, cnt, ty);
+    }
+    or {
+        var one: u32 = emit_value.read_operand(e, vm, cnt, lane_ty);
+        if (e.b.err) { ret emitter.defect(e, "spirv.emit: unreadable count in vector shift"); }
+        if (operand_carries_type(vm, cnt) && vm.type_id[cnt.vreg.n] != lane_ty) {
+            val from: u32 = vm.type_id[cnt.vreg.n];
+            # a narrower count widens to the lane by its value; a wider one
+            # would lose the bits that saturate it
+            if (types.type_is_float(e.tt, from) || types.type_is_opaque(e.tt, from)
+                || types.type_bits(e.tt, from) == 0 || types.type_bits(e.tt, from) > bits) {
+                ret emitter.defect(e, "spirv.emit: a uniform shift count is not an integer as wide as the lane or narrower");
+            }
+            val cv: u32 = isa_spirv.alloc_id(e.b);
+            var uw: [3]u32;
+            uw[0] = lane_ty;
+            uw[1] = cv;
+            uw[2] = one;
+            isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_U_CONVERT, ?uw[0], 3);
+            one = cv;
+        }
+        c = isa_spirv.alloc_id(e.b);
+        var cw: [6]u32;
+        cw[0] = ty;
+        cw[1] = c;
+        var i: u32 = 0;
+        for (i < lanes) {
+            cw[2 + i] = one;
+            i         = i + 1;
+        }
+        isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COMPOSITE_CONSTRUCT, ?cw[0], 2 + lanes);
+    }
+    # a count is held to the lane's width before it is tested against it
+    c = emit_value.narrow_extend(e, c, ty, bits, false);
+    val width: u32 = emit_value.mask_splat(e, ty, lanes, bits, 0);
+    if (e.b.err || c == 0 || width == 0) { ret emitter.defect(e, "spirv.emit: unreadable count in vector shift"); }
+
+    val below: u32 = isa_spirv.alloc_id(e.b);
+    var lw:    [4]u32;
+    lw[0] = bvec_ty;
+    lw[1] = below;
+    lw[2] = c;
+    lw[3] = width;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_U_LESS_THAN, ?lw[0], 4);
+    val shifted: u32 = shift_words(e, op_code, ty, a, c);
+    val fill:    u32 = shift_fill(e, op_code, ty, lanes, bits, a);
+    if (fill == 0) { ret emitter.defect(e, "spirv.emit: could not build a vector shift fill"); }
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var sw:     [5]u32;
+    sw[0] = ty;
+    sw[1] = result;
+    sw[2] = below;
+    sw[3] = shifted;
+    sw[4] = fill;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_SELECT, ?sw[0], 5);
+    ret store_vreg(e, vm, dst, result);
+}
+
+# what a lane shifted by its width or more answers: 0, or the sign fill
+fun shift_fill(e: *emitter.Emit, op_code: u32, ty: u32, lanes: u32, bits: u32, a: u32) u32 {
+    if (op_code != isa_spirv.OP_SHIFT_RIGHT_ARITHMETIC) { ret emit_value.mask_splat(e, ty, lanes, 0, 0); }
+    val top: u32 = emit_value.mask_splat(e, ty, lanes, bits - 1, 0);
+    if (top == 0) { ret 0; }
+    ret shift_words(e, op_code, ty, a, top);
+}
+
+fun shift_words(e: *emitter.Emit, op_code: u32, ty: u32, a: u32, by: u32) u32 {
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var words:  [4]u32;
+    words[0] = ty;
+    words[1] = result;
+    words[2] = a;
+    words[3] = by;
+    isa_spirv.inst(e.b, ?e.b.functions, op_code, ?words[0], 4);
+    ret result;
+}
+
+pub fun unary_emit(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, op_code: u32) err[fail.Fail] {
+    if (mi.operand_count != 2 || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+        ret emitter.defect(e, "spirv.emit: malformed unary instruction");
+    }
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n) { ret emitter.defect(e, "spirv.emit: unary result vreg out of range"); }
+    val a: u32 = emit_value.read_operand(e, vm, ?mi.operands[1], vm.type_id[dst]);
+    if (e.b.err) { ret emitter.defect(e, "spirv.emit: unreadable operand in unary instruction"); }
+    val row: *ops.CoreOp = ops.core(op_code);
+    if (row.arity != 1) { ret emitter.defect(e, "spirv.emit: a unary instruction was mapped to an opcode whose row is not one operand"); }
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var words:  [3]u32;
+    words[0] = vm.type_id[dst];
+    words[1] = result;
+    words[2] = a;
+    isa_spirv.inst(e.b, ?e.b.functions, op_code, ?words[0], ops.operand_words(row));
+    ret store_vreg(e, vm, dst, result);
+}
+
+pub fun compare_emit(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, op_code: u32) err[fail.Fail] {
+    if (lang_mir.vec_lane_is_vector(mi.vec_lane)) {
+        ret vector_compare_emit(e, vm, mi, op_code);
+    }
+    var cbits: u32 = mi.width::u32 * 8;
+    if (cbits == 0) { cbits = e.tgt.model.gpr_width * 8; }
+    val cmp_ty: u32 = types.type_int(e.tt, emit_layout.carrier_bits(e, cbits));
+    if (cmp_ty == 0) {
+        ret emitter.unsupported(e, "unsupported comparison width in the SPIR-V target");
+    }
+    ret compare_typed_emit(e, vm, mi, op_code, cmp_ty, cbits);
+}
+
+fun vector_compare_emit(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, op_code: u32) err[fail.Fail] {
+    if (mi.operand_count != 3 || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+        ret emitter.defect(e, "spirv.emit: malformed vector comparison instruction");
+    }
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n) { ret emitter.defect(e, "spirv.emit: comparison result vreg out of range"); }
+
+    val lanes:      u32 = lang_mir.vec_lane_count(mi.vec_lane);
+    val operand_ty: u32 = emit_value.vector_type_of(e, mi.vec_lane, false);
+    val bvec_ty:    u32 = types.type_vector(e.tt, types.type_bool(e.tt), lanes);
+    val mask_ty:    u32 = vm.type_id[dst];
+    if (operand_ty == 0 || bvec_ty == 0 || mask_ty == 0) {
+        ret emitter.unsupported(e, emit_value.unsupported_value_type(e, mi));
+    }
+
+    # a carried integer lane is compared at its own width
+    val lbits:  u32  = lang_mir.vec_lane_elem_bytes(mi.vec_lane)::u32 * 8;
+    val signed: bool = signed_compare(op_code);
+    val a:      u32  = emit_value.narrow_extend(e, emit_value.read_operand(e, vm, ?mi.operands[1], operand_ty), operand_ty, lbits, signed);
+    val b:      u32  = emit_value.narrow_extend(e, emit_value.read_operand(e, vm, ?mi.operands[2], operand_ty), operand_ty, lbits, signed);
+    if (e.b.err) { ret emitter.defect(e, "spirv.emit: unreadable operand in vector comparison"); }
+
+    val row: *ops.CoreOp = ops.core(op_code);
+    if (row.arity != 2) { ret emitter.defect(e, "spirv.emit: a comparison was mapped to an opcode whose row is not two operands"); }
+    val bvec: u32 = isa_spirv.alloc_id(e.b);
+    var cops: [4]u32;
+    cops[0] = bvec_ty;
+    cops[1] = bvec;
+    cops[2] = a;
+    cops[3] = b;
+    isa_spirv.inst(e.b, ?e.b.functions, op_code, ?cops[0], ops.operand_words(row));
+
+    val ones:  u32 = emit_value.mask_splat(e, mask_ty, lanes, 0xFFFFFFFF, 0xFFFFFFFF);
+    val zeros: u32 = emit_value.mask_splat(e, mask_ty, lanes, 0, 0);
+    if (ones == 0 || zeros == 0) {
+        ret emitter.defect(e, "spirv.emit: could not build a vector comparison mask constant");
+    }
+
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var sops:   [5]u32;
+    sops[0] = mask_ty;
+    sops[1] = result;
+    sops[2] = bvec;
+    sops[3] = ones;
+    sops[4] = zeros;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_SELECT, ?sops[0], 5);
+    ret store_vreg(e, vm, dst, result);
+}
+
+pub fun vec_extract_emit(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count != 3 || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+        ret emitter.defect(e, "spirv.emit: malformed vector extract instruction");
+    }
+    if (mi.operands[2].kind != lang_mir.MIR_OP_IMM) {
+        ret emitter.unsupported(e, "a runtime vector lane index is not supported by the SPIR-V target");
+    }
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n) { ret emitter.defect(e, "spirv.emit: vector extract result vreg out of range"); }
+    val vec_ty: u32 = operand_vector_type(e, vm, mi, ?mi.operands[1]);
+    if (vec_ty == 0) { ret emitter.unsupported(e, emit_value.unsupported_value_type(e, mi)); }
+    val src: u32 = emit_value.read_operand(e, vm, ?mi.operands[1], vec_ty);
+    if (e.b.err) { ret emitter.defect(e, "spirv.emit: unreadable operand in vector extract"); }
+
+    var lanes:   u32 = 0;
+    var lane_ty: u32 = types.vector_value_shape(e.tt, vec_ty, ?lanes);
+    if (lane_ty == 0) { lane_ty = vm.type_id[dst]; }
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var ops:    [4]u32;
+    ops[0] = lane_ty;
+    ops[1] = result;
+    ops[2] = src;
+    ops[3] = mi.operands[2].imm::u32;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COMPOSITE_EXTRACT, ?ops[0], 4);
+    ret store_vreg(e, vm, dst, emit_layout.lane_width_as(e, result, lane_ty, vm.type_id[dst]));
+}
+
+# a scalar operand read as a vector lane of `lane_ty`
+fun read_lane(e: *emitter.Emit, vm: *emitter.VMaps, op: *lang_mir.MirOperand, lane_ty: u32) u32 {
+    if (!operand_carries_type(vm, op)) { ret emit_value.read_operand(e, vm, op, lane_ty); }
+    val own: u32 = vm.type_id[op.vreg.n];
+    ret emit_layout.lane_width_as(e, emit_value.read_operand(e, vm, op, own), own, lane_ty);
+}
+
+pub fun vec_insert_emit(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count != 4 || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+        ret emitter.defect(e, "spirv.emit: malformed vector insert instruction");
+    }
+    if (mi.operands[2].kind != lang_mir.MIR_OP_IMM) {
+        ret emitter.unsupported(e, "a runtime vector lane index is not supported by the SPIR-V target");
+    }
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n) { ret emitter.defect(e, "spirv.emit: vector insert result vreg out of range"); }
+    val vec_ty: u32 = vm.type_id[dst];
+    if (vec_ty == 0) { ret emitter.unsupported(e, emit_value.unsupported_value_type(e, mi)); }
+    var lanes:   u32 = 0;
+    val lane_ty: u32 = types.vector_value_shape(e.tt, vec_ty, ?lanes);
+    if (lane_ty == 0) { ret emitter.unsupported(e, emit_value.unsupported_value_type(e, mi)); }
+
+    val src:  u32 = emit_value.read_operand(e, vm, ?mi.operands[1], vec_ty);
+    val lane: u32 = read_lane(e, vm, ?mi.operands[3], lane_ty);
+    if (e.b.err) { ret emitter.defect(e, "spirv.emit: unreadable operand in vector insert"); }
+
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var ops:    [5]u32;
+    ops[0] = vec_ty;
+    ops[1] = result;
+    ops[2] = lane;
+    ops[3] = src;
+    ops[4] = mi.operands[2].imm::u32;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COMPOSITE_INSERT, ?ops[0], 5);
+    ret store_vreg(e, vm, dst, result);
+}
+
+pub fun vec_build_emit(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count < 2 || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+        ret emitter.defect(e, "spirv.emit: malformed vector build instruction");
+    }
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n) { ret emitter.defect(e, "spirv.emit: vector build result vreg out of range"); }
+    val vec_ty: u32 = vm.type_id[dst];
+    if (vec_ty == 0) { ret emitter.unsupported(e, emit_value.unsupported_value_type(e, mi)); }
+    var lanes:   u32 = 0;
+    val lane_ty: u32 = types.vector_value_shape(e.tt, vec_ty, ?lanes);
+    if (lane_ty == 0) { ret emitter.unsupported(e, emit_value.unsupported_value_type(e, mi)); }
+
+    val given: u32 = mi.operand_count - 1;
+    if (given != lanes) {
+        ret emitter.defect(e, "spirv.emit: vector build lane count does not match its vector type");
+    }
+    val ro: res[*u32, A.Error] = A.allocate[u32](e.alloc, (given + 2)::usize);
+    if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+    val ops: *u32 = ro.ok;
+    ops[0] = vec_ty;
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    ops[1] = result;
+    var i: u32 = 0;
+    for (i < given) {
+        ops[2 + i] = read_lane(e, vm, ?mi.operands[1 + i], lane_ty);
+        i          = i + 1;
+    }
+    if (e.b.err) {
+        A.deallocate[u32](e.alloc, ops, (given + 2)::usize);
+        ret emitter.defect(e, "spirv.emit: unreadable operand in vector build");
+    }
+
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COMPOSITE_CONSTRUCT, ops, 2 + given);
+    A.deallocate[u32](e.alloc, ops, (given + 2)::usize);
+    ret store_vreg(e, vm, dst, result);
+}
+
+fun operand_vector_type(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr, op: *lang_mir.MirOperand) u32 {
+    if (op.kind == lang_mir.MIR_OP_VREG && op.vreg.n < vm.n && vm.type_id[op.vreg.n] != 0) {
+        ret vm.type_id[op.vreg.n];
+    }
+    if (!lang_mir.vec_lane_is_vector(mi.vec_lane)) { ret 0; }
+    ret emit_value.vector_type_of(e, mi.vec_lane, false);
+}
+
+pub fun float_compare_emit(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr) err[fail.Fail] {
+    var fbits: u32 = mi.width::u32 * 8;
+    if (fbits != 16 && fbits != 32 && fbits != 64) {
+        ret emitter.unsupported(e, "unsupported float comparison width in the SPIR-V target");
+    }
+    val op_code: u32 = ops.float_compare(mi.src_width);
+    if (op_code == 0) { ret emitter.unsupported(e, "unknown float comparison condition in the SPIR-V target"); }
+    ret compare_typed_emit(e, vm, mi, op_code, types.type_float(e.tt, fbits), 0);
+}
+
+fun compare_typed_emit(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr,
+    op_code: u32, operand_ty: u32, bits: u32) err[fail.Fail] {
+    if (mi.operand_count != 3 || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+        ret emitter.defect(e, "spirv.emit: malformed comparison instruction");
+    }
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n) { ret emitter.defect(e, "spirv.emit: comparison result vreg out of range"); }
+    if (!operand_matches_type(vm, ?mi.operands[1], operand_ty)
+        || !operand_matches_type(vm, ?mi.operands[2], operand_ty)) {
+        ret emitter.defect(e, "spirv.emit: comparison mixes operand types");
+    }
+    val signed: bool = signed_compare(op_code);
+    val a:      u32  = emit_value.read_narrow(e, vm, ?mi.operands[1], operand_ty, bits, signed);
+    val b:      u32  = emit_value.read_narrow(e, vm, ?mi.operands[2], operand_ty, bits, signed);
+    if (e.b.err) { ret emitter.defect(e, "spirv.emit: unreadable operand in comparison"); }
+    val row: *ops.CoreOp = ops.core(op_code);
+    if (row.arity != 2) { ret emitter.defect(e, "spirv.emit: a comparison was mapped to an opcode whose row is not two operands"); }
+    val bool_ty: u32 = types.type_bool(e.tt);
+    val result:  u32 = isa_spirv.alloc_id(e.b);
+    var words:   [4]u32;
+    words[0] = bool_ty;
+    words[1] = result;
+    words[2] = a;
+    words[3] = b;
+    isa_spirv.inst(e.b, ?e.b.functions, op_code, ?words[0], ops.operand_words(row));
+    ret store_vreg(e, vm, dst, result);
+}
+
+fun signed_compare(op_code: u32) bool {
+    ret op_code == isa_spirv.OP_S_LESS_THAN || op_code == isa_spirv.OP_S_LESS_THAN_EQUAL;
+}
+
+# a select is OpSelect on a boolean: the folded compare's, a boolean
+# condition as it is, or an integer condition tested against zero
+pub fun select_emit(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr) err[fail.Fail] {
+    val fused: bool = mi.opcode == lang_mir.MIR_SELECT_CMP;
+    var need:  u32  = 4;
+    var ai:    u32  = 2;
+    if (fused) {
+        need = 6;
+        ai   = 3;
+    }
+    if (mi.operand_count != need || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+        ret emitter.defect(e, "spirv.emit: malformed select instruction");
+    }
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n) { ret emitter.defect(e, "spirv.emit: select result vreg out of range"); }
+    val res_ty:  u32 = vm.type_id[dst];
+    val bool_ty: u32 = types.type_bool(e.tt);
+    if (res_ty == 0) { ret emitter.unsupported(e, emit_value.unsupported_value_type(e, mi)); }
+
+    var cbits: u32 = mi.src_width::u32 * 8;
+    if (cbits == 0) { cbits = e.tgt.model.gpr_width * 8; }
+    val cmp_ty: u32 = types.type_int(e.tt, emit_layout.carrier_bits(e, cbits));
+    if (cmp_ty == 0) { ret emitter.unsupported(e, "unsupported select condition width in the SPIR-V target"); }
+
+    var cond: u32 = 0;
+    var cw:   [4]u32;
+    if (fused) {
+        val m: *ops.MirMap = ops.map_of(mi.operands[5].imm::lang_mir.MirOpcode);
+        if (m == nil || m.shape != ops.SH_COMPARE) { ret emitter.defect(e, "spirv.emit: a select names no integer compare"); }
+        val signed: bool = signed_compare(ops.select(m, false));
+        cw[2] = emit_value.read_narrow(e, vm, ?mi.operands[1], cmp_ty, cbits, signed);
+        cw[3] = emit_value.read_narrow(e, vm, ?mi.operands[2], cmp_ty, cbits, signed);
+        cond  = isa_spirv.alloc_id(e.b);
+        cw[0] = bool_ty;
+        cw[1] = cond;
+        isa_spirv.inst(e.b, ?e.b.functions, ops.select(m, false), ?cw[0], 4);
+    }
+    or (mi.operands[1].kind == lang_mir.MIR_OP_VREG && mi.operands[1].vreg.n < vm.n && vm.is_bool[mi.operands[1].vreg.n]) {
+        cond = emit_value.read_operand(e, vm, ?mi.operands[1], bool_ty);
+    }
+    or {
+        cw[2] = emit_value.read_narrow(e, vm, ?mi.operands[1], cmp_ty, cbits, false);
+        cw[3] = emit_value.immediate(e, cmp_ty, 0);
+        cond  = isa_spirv.alloc_id(e.b);
+        cw[0] = bool_ty;
+        cw[1] = cond;
+        isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_I_NOT_EQUAL, ?cw[0], 4);
+    }
+    val a: u32 = emit_value.read_operand(e, vm, ?mi.operands[ai], res_ty);
+    val b: u32 = emit_value.read_operand(e, vm, ?mi.operands[ai + 1], res_ty);
+    if (e.b.err) { ret emitter.defect(e, "spirv.emit: unreadable operand in select"); }
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var sw:     [5]u32;
+    sw[0] = res_ty;
+    sw[1] = result;
+    sw[2] = cond;
+    sw[3] = a;
+    sw[4] = b;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_SELECT, ?sw[0], 5);
+    ret store_vreg(e, vm, dst, result);
+}
+
+# the unsigned compare selects all ones or zero of the result type
+pub fun compare_mask_emit(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count != 3 || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+        ret emitter.defect(e, "spirv.emit: malformed compare-to-mask instruction");
+    }
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n) { ret emitter.defect(e, "spirv.emit: compare-to-mask result vreg out of range"); }
+    var cbits: u32 = mi.src_width::u32 * 8;
+    if (cbits == 0) { cbits = e.tgt.model.gpr_width * 8; }
+    val cmp_ty:  u32 = types.type_int(e.tt, emit_layout.carrier_bits(e, cbits));
+    val mask_ty: u32 = vm.type_id[dst];
+    if (cmp_ty == 0 || mask_ty == 0) {
+        ret emitter.unsupported(e, "unsupported compare-to-mask width in the SPIR-V target");
+    }
+    val a: u32 = emit_value.read_narrow(e, vm, ?mi.operands[1], cmp_ty, cbits, false);
+    val b: u32 = emit_value.read_narrow(e, vm, ?mi.operands[2], cmp_ty, cbits, false);
+    if (e.b.err) { ret emitter.defect(e, "spirv.emit: unreadable operand in compare-to-mask"); }
+    val below: u32 = isa_spirv.alloc_id(e.b);
+    var cw:    [4]u32;
+    cw[0] = types.type_bool(e.tt);
+    cw[1] = below;
+    cw[2] = a;
+    cw[3] = b;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_U_LESS_THAN, ?cw[0], 4);
+    # all ones at the mask's own width: a literal's bits above it must be zero
+    val mbits: u32 = types.type_bits(e.tt, mask_ty);
+    var all:   i64 = -1;
+    if (mbits > 0 && mbits < 64) { all = ((1::u64 << mbits::u64) - 1):~i64; }
+    val ones: u32 = emit_value.immediate(e, mask_ty, all);
+    val zero: u32 = emit_value.immediate(e, mask_ty, 0);
+    if (ones == 0 || zero == 0) { ret emitter.defect(e, "spirv.emit: compare-to-mask constants"); }
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var sw:     [5]u32;
+    sw[0] = mask_ty;
+    sw[1] = result;
+    sw[2] = below;
+    sw[3] = ones;
+    sw[4] = zero;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_SELECT, ?sw[0], 5);
+    ret store_vreg(e, vm, dst, result);
+}
+
+pub fun convert_emit(e: *emitter.Emit, mf: *lang_mir.MirFunction, vm: *emitter.VMaps, mi: *lang_mir.MirInstr,
+    op_code: u32, src_is_float: bool) err[fail.Fail] {
+    if (mi.operand_count != 2 || mi.operands[0].kind != lang_mir.MIR_OP_VREG) {
+        ret emitter.defect(e, "spirv.emit: malformed conversion instruction");
+    }
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n) { ret emitter.defect(e, "spirv.emit: conversion result vreg out of range"); }
+    # a constant reinterpreted is the constant of the result type with its bits
+    if (op_code == isa_spirv.OP_BITCAST && mi.operands[1].kind == lang_mir.MIR_OP_IMM) {
+        ret store_vreg(e, vm, dst, emit_value.immediate(e, vm.type_id[dst], mi.operands[1].imm));
+    }
+    var src_ty: u32 = 0;
+    if (!operand_carries_type(vm, ?mi.operands[1])) {
+        var sbits: u32 = mi.src_width::u32 * 8;
+        if (sbits == 0)   { sbits = e.tgt.model.gpr_width * 8; }
+        if (src_is_float) { src_ty = types.type_float(e.tt, sbits); }
+        or                { src_ty = types.type_int(e.tt, emit_layout.carrier_bits(e, sbits)); }
+        if (src_ty == 0) {
+            ret emitter.unsupported(e, "unsupported conversion source width in the SPIR-V target");
+        }
+    }
+    var a: u32 = emit_value.read_operand(e, vm, ?mi.operands[1], src_ty);
+    if (e.b.err) { ret emitter.defect(e, "spirv.emit: unreadable operand in conversion"); }
+    # the type the source was read in: its own, or the one a truth value or a
+    # constant was widened to
+    var a_ty: u32 = src_ty;
+    if (a_ty == 0 && mi.operands[1].kind == lang_mir.MIR_OP_VREG && mi.operands[1].vreg.n < vm.n) {
+        a_ty = vm.type_id[mi.operands[1].vreg.n];
+    }
+    # an extension reads its source at the source width, which a carrier holds
+    # with unspecified bits above it, a vector's at the width of its lanes
+    val zext: bool = mi.opcode == lang_mir.MIR_ZEXT || mi.opcode == lang_mir.MIR_UI_TO_FP;
+    val sext: bool = mi.opcode == lang_mir.MIR_SEXT || mi.opcode == lang_mir.MIR_SI_TO_FP;
+    if ((zext || sext) && mi.operands[1].kind == lang_mir.MIR_OP_VREG) {
+        var sbits: u32 = mi.src_width::u32 * 8;
+        if (lang_mir.vec_lane_is_vector(mi.vec_lane)) {
+            sbits = declared_bits(e, mf, ?mi.operands[1]);
+            if (sbits == 0) { ret emitter.defect(e, "spirv.emit: a vector extension's source records no lane width"); }
+        }
+        a = emit_value.narrow_extend(e, a, a_ty, sbits, sext);
+    }
+    if (op_code == isa_spirv.OP_BITCAST) {
+        var bits: u32 = 0;
+        val fw:   u32 = declared_bits(e, mf, ?mi.operands[1]);
+        val tw:   u32 = declared_bits(e, mf, ?mi.operands[0]);
+        if (carries_narrow_lanes(e, a_ty, fw) || carries_narrow_lanes(e, vm.type_id[dst], tw)) {
+            bits = carried_bits_as(e, a, a_ty, fw, vm.type_id[dst], tw);
+        }
+        or                        { bits = bits_as(e, a, a_ty, vm.type_id[dst]); }
+        if (bits == 0 || e.b.err) { ret emitter.defect(e, "spirv.emit: a reinterpret between types of unequal widths"); }
+        ret store_vreg(e, vm, dst, bits);
+    }
+    # an integer width change within one carrier is no instruction: OpUConvert
+    # and OpSConvert need two widths
+    if ((op_code == isa_spirv.OP_U_CONVERT || op_code == isa_spirv.OP_S_CONVERT) && a_ty != 0 && a_ty == vm.type_id[dst]) {
+        ret store_vreg(e, vm, dst, a);
+    }
+    val row: *ops.CoreOp = ops.core(op_code);
+    if (row.arity != 1) { ret emitter.defect(e, "spirv.emit: a conversion was mapped to an opcode whose row is not one operand"); }
+    val result: u32 = isa_spirv.alloc_id(e.b);
+    var words:  [3]u32;
+    words[0] = vm.type_id[dst];
+    words[1] = result;
+    words[2] = a;
+    isa_spirv.inst(e.b, ?e.b.functions, op_code, ?words[0], ops.operand_words(row));
+    ret store_vreg(e, vm, dst, result);
+}
+
+# the declared width of the scalar a register holds, or of each lane of its vector: 0
+# where its type is not recorded or is neither
+fun declared_bits(e: *emitter.Emit, mf: *lang_mir.MirFunction, op: *lang_mir.MirOperand) u32 {
+    if (op.kind != lang_mir.MIR_OP_VREG || op.vreg.n >= mf.vreg_count || mf.vregs[op.vreg.n].ty == lang_mir.VREG_TY_NIL) { ret 0; }
+    val tys: *ir_type.IrTypeTable = ?e.ir.types;
+    val o:   opt[*ir_type.IrType] = ir_type.get(tys, ir_type.id(mf.vregs[op.vreg.n].ty));
+    if (sel o.none) { ret 0; }
+    var t: *ir_type.IrType = o.some;
+    if (t.kind == ir_type.IRT_VECTOR) {
+        val lo: opt[*ir_type.IrType] = ir_type.get(tys, t.data.vector_.element);
+        if (sel lo.none) { ret 0; }
+        t = lo.some;
+    }
+    if (t.kind != ir_type.IRT_INT && t.kind != ir_type.IRT_FLOAT) { ret 0; }
+    ret t.data.bits;
+}
+
+# a vector whose lanes are carried wider than the `bits` they hold
+fun carries_narrow_lanes(e: *emitter.Emit, ty: u32, bits: u32) bool {
+    var n:    u32 = 0;
+    val lane: u32 = lane_shape(e, ty, ?n);
+    ret lane != 0 && n > 1 && bits != 0 && types.type_bits(e.tt, lane) > bits;
+}
+
+# `value` of `from_ty`, whose lanes or scalar hold `fw` bits each, reinterpreted as `to_ty`,
+# whose lanes hold `tw`, where a side carries its lanes wider than they are. the bits
+# meet in 32-bit words, or one word of all of them where they are fewer: a narrow lane is
+# masked and shifted into its place in a word and shifted out of it, a 64-bit one is two
+# words, and anything else is its word reinterpreted. 0 when the two are not the same number
+# of bits
+fun carried_bits_as(e: *emitter.Emit, value: u32, from_ty: u32, fw: u32, to_ty: u32, tw: u32) u32 {
+    var nf: u32 = 0;
+    var nt: u32 = 0;
+    val fl: u32 = lane_shape(e, from_ty, ?nf);
+    val tl: u32 = lane_shape(e, to_ty, ?nt);
+    if (value == 0 || fl == 0 || tl == 0 || fw == 0 || tw == 0 || fw * nf != tw * nt) { ret 0; }
+    if (from_ty == to_ty && fw == tw)                                                 { ret value; }
+    val total: u32 = fw * nf;
+    var ww:    u32 = 32;
+    if (total < 32)                                                                { ww = total; }
+    if (total % ww != 0 || (fw < ww && ww % fw != 0) || (tw < ww && ww % tw != 0)) { ret 0; }
+    val nw:   u32                = total / ww;
+    val u32t: u32                = types.type_int(e.tt, 32);
+    val pair: u32                = types.type_vector(e.tt, u32t, 2);
+    val wr:   res[*u32, A.Error] = A.allocate[u32](e.alloc, nw::usize);
+    if (sel wr.err) { ret 0; }
+    val words: *u32 = wr.ok;
+    fin { A.deallocate[u32](e.alloc, words, nw::usize); }
+    val pr: res[*u32, A.Error] = A.allocate[u32](e.alloc, nt::usize);
+    if (sel pr.err) { ret 0; }
+    val parts: *u32 = pr.ok;
+    fin { A.deallocate[u32](e.alloc, parts, nt::usize); }
+
+    var per: u32 = 1;
+    if (fw < ww) { per = ww / fw; }
+    var i: u32 = 0;
+    for (i < nf) {
+        var lane: u32 = value;
+        if (nf > 1) { lane = lane_extract(e, value, fl, i); }
+        if (fw == 64) {
+            val halves: u32 = emit_layout.bitcast_emit(e, pair, lane);
+            words[2 * i]     = lane_extract(e, halves, u32t, 0);
+            words[2 * i + 1] = lane_extract(e, halves, u32t, 1);
+        }
+        or (fw >= ww) { words[i] = lane_bits_word(e, lane, fl); }
+        or {
+            val j:    u32 = i % per;
+            var bits: u32 = lane_bits_word(e, lane, fl);
+            if (j + 1 < per && types.type_bits(e.tt, fl) > fw) { bits = emit_value.narrow_extend(e, bits, u32t, fw, false); }
+            if (j > 0)                                         { bits = shift_words(e, isa_spirv.OP_SHIFT_LEFT_LOGICAL, u32t, bits, types.const_int(e.tt, 32, (fw * j)::i64)); }
+            if (j == 0)                                        { words[i / per] = bits; }
+            or                                                 { words[i / per] = emitter.pair_emit(e, isa_spirv.OP_BITWISE_OR, u32t, words[i / per], bits); }
+        }
+        i = i + 1;
+    }
+
+    per = 1;
+    if (tw < ww) { per = ww / tw; }
+    i = 0;
+    for (i < nt) {
+        if (tw == 64) {
+            var halves: [2]u32;
+            halves[0] = words[2 * i];
+            halves[1] = words[2 * i + 1];
+            parts[i]  = emit_layout.bitcast_emit(e, tl, emit_layout.construct_emit(e, pair, ?halves[0], 2));
+        }
+        or (tw >= ww) { parts[i] = word_as_lane(e, words[i], tl); }
+        or {
+            val j:    u32 = i % per;
+            var bits: u32 = words[i / per];
+            if (j > 0) { bits = shift_words(e, isa_spirv.OP_SHIFT_RIGHT_LOGICAL, u32t, bits, types.const_int(e.tt, 32, (tw * j)::i64)); }
+            parts[i] = word_as_lane(e, bits, tl);
+        }
+        if (parts[i] == 0) { ret 0; }
+        i = i + 1;
+    }
+    if (nt == 1) { ret parts[0]; }
+    ret emit_layout.construct_emit(e, to_ty, parts, nt);
+}
+
+# a lane's bits in the low bits of a 32-bit integer: an f16 beside a zero half, a narrow
+# integer widened, and anything else of 32 bits as it is
+fun lane_bits_word(e: *emitter.Emit, lane: u32, lane_ty: u32) u32 {
+    val u32t: u32 = types.type_int(e.tt, 32);
+    val bits: u32 = types.type_bits(e.tt, lane_ty);
+    if (types.type_is_float(e.tt, lane_ty) && bits == 16) {
+        var halves: [2]u32;
+        halves[0] = lane;
+        halves[1] = types.const_null(e.tt, lane_ty);
+        ret emit_layout.bitcast_emit(e, u32t, emit_layout.construct_emit(e, types.type_vector(e.tt, lane_ty, 2), ?halves[0], 2));
+    }
+    if (types.type_is_float(e.tt, lane_ty)) { ret emit_layout.bitcast_emit(e, u32t, lane); }
+    if (bits == 32)                         { ret lane; }
+    ret emit_layout.lane_width_as(e, lane, lane_ty, u32t);
+}
+
+# the low bits of a 32-bit integer as a lane of `lane_ty`, the inverse of lane_bits_word
+fun word_as_lane(e: *emitter.Emit, word: u32, lane_ty: u32) u32 {
+    val u32t: u32 = types.type_int(e.tt, 32);
+    val bits: u32 = types.type_bits(e.tt, lane_ty);
+    if (types.type_is_float(e.tt, lane_ty) && bits == 16) {
+        ret lane_extract(e, emit_layout.bitcast_emit(e, types.type_vector(e.tt, lane_ty, 2), word), lane_ty, 0);
+    }
+    if (types.type_is_float(e.tt, lane_ty)) { ret emit_layout.bitcast_emit(e, lane_ty, word); }
+    if (bits == 32)                         { ret word; }
+    ret emit_layout.lane_width_as(e, word, u32t, lane_ty);
+}
+
+# `value` of `from_ty` reinterpreted as `to_ty`. two types alike are one value, as an f16
+# and the ir carrier of its bits are under half_memory. an f16 and the 32-bit
+# carrier of a 16-bit integer meet through a vector of two halves, the low one the f16,
+# so the reinterpretation needs no 16-bit integer type
+fun bits_as(e: *emitter.Emit, value: u32, from_ty: u32, to_ty: u32) u32 {
+    if (value == 0 || from_ty == to_ty || from_ty == 0 || to_ty == 0) { ret value; }
+    if (lanes_in_array(e, from_ty) || lanes_in_array(e, to_ty))       { ret lanes_as(e, value, from_ty, to_ty); }
+    val half_from: bool = types.type_is_float(e.tt, from_ty) && types.type_bits(e.tt, from_ty) == 16;
+    val half_to:   bool = types.type_is_float(e.tt, to_ty) && types.type_bits(e.tt, to_ty) == 16;
+    val wide_from: bool = !types.type_is_float(e.tt, from_ty) && types.type_bits(e.tt, from_ty) == 32;
+    val wide_to:   bool = !types.type_is_float(e.tt, to_ty) && types.type_bits(e.tt, to_ty) == 32;
+    if (half_from && wide_to) {
+        val pair:  u32 = types.type_vector_value(e.tt, from_ty, 2);
+        val built: u32 = isa_spirv.alloc_id(e.b);
+        var words: [5]u32;
+        words[0] = pair;
+        words[1] = built;
+        words[2] = value;
+        words[3] = types.const_null(e.tt, from_ty);
+        isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COMPOSITE_CONSTRUCT, ?words[0], 4);
+        ret emit_layout.bitcast_emit(e, to_ty, built);
+    }
+    if (wide_from && half_to) {
+        val pair:  u32 = emit_layout.bitcast_emit(e, types.type_vector_value(e.tt, to_ty, 2), value);
+        val low:   u32 = isa_spirv.alloc_id(e.b);
+        var words: [4]u32;
+        words[0] = to_ty;
+        words[1] = low;
+        words[2] = pair;
+        words[3] = 0;
+        isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COMPOSITE_EXTRACT, ?words[0], 4);
+        ret low;
+    }
+    ret emit_layout.bitcast_emit(e, to_ty, value);
+}
+
+# a vector wider than SPIR-V's is carried as an array of its lanes, which OpBitcast cannot take
+fun lanes_in_array(e: *emitter.Emit, ty: u32) bool {
+    var n: u32 = 0;
+    ret types.vector_shape(e.tt, ty, ?n) == 0 && types.vector_value_shape(e.tt, ty, ?n) != 0;
+}
+
+# the lane type and count of a vector value, a scalar being one lane of itself
+fun lane_shape(e: *emitter.Emit, ty: u32, out_count: *u32) u32 {
+    val lane: u32 = types.vector_value_shape(e.tt, ty, out_count);
+    if (lane != 0) { ret lane; }
+    @out_count = 0;
+    if (types.type_bits(e.tt, ty) == 0) { ret 0; }
+    @out_count = 1;
+    ret ty;
+}
+
+fun lane_extract(e: *emitter.Emit, value: u32, lane_ty: u32, index: u32) u32 {
+    val part:  u32 = isa_spirv.alloc_id(e.b);
+    var words: [4]u32;
+    words[0] = lane_ty;
+    words[1] = part;
+    words[2] = value;
+    words[3] = index;
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COMPOSITE_EXTRACT, ?words[0], 4);
+    ret part;
+}
+
+# a vector value reinterpreted where one side is carried as an array. its lanes are
+# regrouped at the wider lane width, each group reinterpreted through a vector SPIR-V
+# can bitcast, and the result built from the regrouped lanes. 0 when the two
+# are not the same number of bits
+fun lanes_as(e: *emitter.Emit, value: u32, from_ty: u32, to_ty: u32) u32 {
+    var nf: u32 = 0;
+    var nt: u32 = 0;
+    val fl: u32 = lane_shape(e, from_ty, ?nf);
+    val tl: u32 = lane_shape(e, to_ty, ?nt);
+    val fw: u32 = types.type_bits(e.tt, fl);
+    val tw: u32 = types.type_bits(e.tt, tl);
+    if (fw == 0 || tw == 0 || fw * nf != tw * nt || !types.instruction_operands_fit(2, nt)) { ret 0; }
+    val sr: res[*u32, A.Error] = A.allocate[u32](e.alloc, nf::usize);
+    if (sel sr.err) { ret 0; }
+    val src: *u32 = sr.ok;
+    fin { A.deallocate[u32](e.alloc, src, nf::usize); }
+    val wr: res[*u32, A.Error] = A.allocate[u32](e.alloc, (nt + 2)::usize);
+    if (sel wr.err) { ret 0; }
+    val words: *u32 = wr.ok;
+    fin { A.deallocate[u32](e.alloc, words, (nt + 2)::usize); }
+    var i: u32 = 0;
+    for (i < nf) {
+        if (nf == 1) { src[i] = value; }
+        or           { src[i] = lane_extract(e, value, fl, i); }
+        i = i + 1;
+    }
+    i = 0;
+    if (fw == tw) {
+        for (i < nt) {
+            words[2 + i] = bits_as(e, src[i], fl, tl);
+            i            = i + 1;
+        }
+    }
+    or (fw < tw) {
+        val k: u32 = tw / fw;
+        for (i < nt) {
+            words[2 + i] = lanes_packed(e, ?src[i * k], k, fl, tl);
+            i            = i + 1;
+        }
+    }
+    or {
+        val k: u32 = fw / tw;
+        for (i < nf) {
+            if (!lanes_unpacked(e, src[i], k, tl, ?words[2 + i * k])) { ret 0; }
+            i = i + 1;
+        }
+    }
+    i = 0;
+    for (i < nt) {
+        if (words[2 + i] == 0) { ret 0; }
+        i = i + 1;
+    }
+    if (nt == 1) { ret words[2]; }
+    words[0] = to_ty;
+    words[1] = isa_spirv.alloc_id(e.b);
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COMPOSITE_CONSTRUCT, words, nt + 2);
+    ret words[1];
+}
+
+# `count` lanes of `lane_ty` as one `to_ty`, through a vector of them. more lanes than a
+# vector holds are first packed into integers of as many lanes as one holds
+fun lanes_packed(e: *emitter.Emit, parts: *u32, count: u32, lane_ty: u32, to_ty: u32) u32 {
+    val max: u32 = model_spirv.MAX_VECTOR_COMPONENTS;
+    if (count > max) {
+        val groups: u32 = count / max;
+        val mid:    u32 = types.type_int(e.tt, types.type_bits(e.tt, lane_ty) * max);
+        var inner:  [4]u32;
+        if (mid == 0 || groups > max || groups * max != count) { ret 0; }
+        var g: u32 = 0;
+        for (g < groups) {
+            inner[g] = lanes_packed(e, ?parts[g * max], max, lane_ty, mid);
+            if (inner[g] == 0) { ret 0; }
+            g = g + 1;
+        }
+        ret lanes_packed(e, ?inner[0], groups, mid, to_ty);
+    }
+    val vec_ty: u32 = types.type_vector(e.tt, lane_ty, count);
+    if (vec_ty == 0) { ret 0; }
+    var words: [6]u32;
+    words[0] = vec_ty;
+    words[1] = isa_spirv.alloc_id(e.b);
+    var i: u32 = 0;
+    for (i < count) {
+        words[2 + i] = parts[i];
+        i            = i + 1;
+    }
+    isa_spirv.inst(e.b, ?e.b.functions, isa_spirv.OP_COMPOSITE_CONSTRUCT, ?words[0], count + 2);
+    ret emit_layout.bitcast_emit(e, to_ty, words[1]);
+}
+
+# one value as `count` lanes of `lane_ty` into `out`, the inverse of lanes_packed
+fun lanes_unpacked(e: *emitter.Emit, value: u32, count: u32, lane_ty: u32, out: *u32) bool {
+    val max: u32 = model_spirv.MAX_VECTOR_COMPONENTS;
+    if (count > max) {
+        val groups: u32 = count / max;
+        val mid:    u32 = types.type_int(e.tt, types.type_bits(e.tt, lane_ty) * max);
+        var inner:  [4]u32;
+        if (mid == 0 || groups > max || groups * max != count) { ret false; }
+        if (!lanes_unpacked(e, value, groups, mid, ?inner[0])) { ret false; }
+        var g: u32 = 0;
+        for (g < groups) {
+            if (!lanes_unpacked(e, inner[g], max, lane_ty, ?out[g * max])) { ret false; }
+            g = g + 1;
+        }
+        ret true;
+    }
+    val vec_ty: u32 = types.type_vector(e.tt, lane_ty, count);
+    if (vec_ty == 0) { ret false; }
+    val vec: u32 = emit_layout.bitcast_emit(e, vec_ty, value);
+    var i:   u32 = 0;
+    for (i < count) {
+        out[i] = lane_extract(e, vec, lane_ty, i);
+        i      = i + 1;
+    }
+    ret true;
+}
+
+pub fun mov_emit(e: *emitter.Emit, vm: *emitter.VMaps, mi: *lang_mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count != 2) { ret emitter.defect(e, "spirv.emit: malformed move instruction"); }
+    val dst: *lang_mir.MirOperand = ?mi.operands[0];
+    val src: *lang_mir.MirOperand = ?mi.operands[1];
+
+    if (dst.kind == lang_mir.MIR_OP_VREG) {
+        if (dst.vreg.n >= vm.n) { ret emitter.defect(e, "spirv.emit: move destination vreg out of range"); }
+        var pointee:   u32 = 0;
+        val reference: u32 = emit_value.chain_target(vm, src, ?pointee);
+        # a physical pointer copied into a register of its own is that register's value
+        if (reference != 0 && vm.var_id[dst.vreg.n] != 0 && chain_storage(vm, src) == isa_spirv.STORAGE_PHYSICAL_STORAGE_BUFFER) {
+            ret store_vreg(e, vm, dst.vreg.n, reference);
+        }
+        if (reference != 0) {
+            vm.chain_id[dst.vreg.n] = reference;
+            vm.chain_ty[dst.vreg.n] = pointee;
+            vm.chain_sc[dst.vreg.n] = chain_storage(vm, src);
+            ret err[fail.Fail].ok{};
+        }
+        val val_id: u32 = emit_value.read_operand(e, vm, src, vm.type_id[dst.vreg.n]);
+        if (e.b.err) { ret emitter.defect(e, "spirv.emit: unreadable move source"); }
+        ret store_vreg(e, vm, dst.vreg.n, val_id);
+    }
+    ret emitter.unsupported(e, "memory-destination move is not yet supported by the SPIR-V target");
+}
