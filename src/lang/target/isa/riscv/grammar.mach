@@ -1,0 +1,2143 @@
+# the inline assembly grammar: riscv statements parsed, checked and encoded
+use mach.lang.fail;
+use std.allocator.page;
+use std.collections.map;
+use io_writer: std.io.writer;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char;
+use std.types.char.char_is_digit;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_equals;
+use std.types.string.str_index_of;
+use std.types.string.str_len;
+use std.types.string.str_region_equals;
+
+use A: std.allocator;
+
+use mach.lang.ct;
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.intern;
+use lang_mir: mach.lang.mir;
+use mach.lang.target.extension;
+use extension_riscv: mach.lang.target.extension.riscv;
+use isa_asm:         mach.lang.target.isa.asm;
+use isa_encode:      mach.lang.target.isa.encode;
+use isa_inst:        mach.lang.target.isa.inst;
+use isa_riscv:       mach.lang.target.isa.riscv;
+use riscv_effects:   mach.lang.target.isa.riscv.effects;
+use riscv_emit:      mach.lang.target.isa.riscv.emit;
+use mach.lang.target.isa.riscv.inst;
+use riscv_mnemonic: mach.lang.target.isa.riscv.mnemonic;
+use riscv_printer:  mach.lang.target.isa.riscv.printer;
+use target_model:   mach.lang.target.model;
+use target_of:      mach.lang.target.of;
+
+pub fun mnemonic(op: u16) opt[str] {
+    ret inst.mnemonic(op::inst.MachOp);
+}
+
+pub fun reg_name(id: i32, size: u8) str {
+    if (isa_inst.regid_class(id) == isa_inst.REG_CLASS_ID_FP) { ret riscv_printer.fp_name(isa_inst.regid_index(id)::u32); }
+    ret riscv_printer.gp_name(isa_inst.regid_index(id)::u32);
+}
+
+fun asm_reg_index_region(body: str, lo: usize, hi: usize) i32 {
+    val len: usize = hi - lo;
+    var r:   u32   = 0;
+    for (r < 32) {
+        if (str_region_equals(body, lo, len, isa_riscv.GP_NAMES[r])) { ret r::i32; }
+        r = r + 1;
+    }
+    # the frame pointer is s0's second name
+    if (str_region_equals(body, lo, len, "fp")) { ret 8; }
+    if (len >= 2 && body[lo] == 'x'::char) {
+        var n: i32   = 0;
+        var i: usize = lo + 1;
+        for (i < hi) {
+            if (body[i] < '0'::char || body[i] > '9'::char) { ret -1; }
+            n = n * 10 + (body[i]::i32 - '0'::char::i32);
+            i = i + 1;
+        }
+        if (n >= 0 && n < 32) { ret n; }
+    }
+    ret -1;
+}
+
+fun asm_reg_index(tok: str) i32 {
+    ret asm_reg_index_region(tok, 0, str_len(tok));
+}
+
+fun decode_amo(body: str, lo: usize, hi: usize, m: *isa_asm.Mnemonic, n_out: *usize) bool {
+    var end: usize = lo;
+    for (end < hi && !isa_asm.is_space(body[end])) { end = end + 1; }
+    var len: usize = end - lo;
+    if (len < 4) { ret false; }
+
+    var order: u16 = 0;
+    if (len >= 5 && str_region_equals(body, lo + len - 5, 5, ".aqrl")) {
+        order = riscv_mnemonic.FLAG_AQ | riscv_mnemonic.FLAG_RL;
+        len   = len - 5;
+    }
+    or (len >= 3 && str_region_equals(body, lo + len - 3, 3, ".aq")) {
+        order = riscv_mnemonic.FLAG_AQ;
+        len   = len - 3;
+    }
+    or (len >= 3 && str_region_equals(body, lo + len - 3, 3, ".rl")) {
+        order = riscv_mnemonic.FLAG_RL;
+        len   = len - 3;
+    }
+    if (len < 4) { ret false; }
+
+    # the stem with its width suffix is the table's spelling; the .w and .d
+    # rows of one operation are adjacent, .w first
+    var op: inst.MachOp = inst.LR_W;
+    if (str_region_equals(body, lo + len - 2, 2, ".d"))  { op = inst.LR_D; }
+    or (!str_region_equals(body, lo + len - 2, 2, ".w")) { ret false; }
+    var code: u32 = 0;
+    for (op <= inst.AMOMAXU_D && code == 0) {
+        if (str_region_equals(body, lo, len, inst.ROWS[op::usize].name)) { code = op::u32; }
+        op = op + 2;
+    }
+    if (code == 0) { ret false; }
+    var pat: u16 = riscv_mnemonic.PATTERN_AMO;
+    if (code == inst.LR_W::u32 || code == inst.LR_D::u32) { pat = riscv_mnemonic.PATTERN_AMO_LR; }
+
+    m.name     = nil;
+    m.code     = code;
+    m.form     = isa_asm.AF_OPS;
+    m.writes   = isa_asm.AW_OP0;
+    m.implicit = 0;
+    m.flags    = pat | order;
+    m.words    = 1;
+    @n_out     = end - lo;
+    ret true;
+}
+
+fun operand(c: *isa_asm.Cursor, lo: usize, hi: usize, op: *isa_asm.Operand) err[fail.Fail] {
+    @op = isa_asm.op_none();
+    if (hi <= lo) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_SYNTAX, "malformed inline-asm operand")}; }
+
+    if (c.body[lo] == '{'::char) {
+        var off:     i64                  = 0;
+        val bound_r: res[bool, fail.Fail] = isa_asm.bind_offset(c, lo, hi, ?off);
+        if (sel bound_r.err) { ret err[fail.Fail].err{bound_r.err}; }
+        if (bound_r.ok) {
+            @op = isa_asm.op_mem(isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, riscv_emit.RSP::i32), off, isa_inst.REG_NONE, 0, 8);
+            ret err[fail.Fail].ok{};
+        }
+        op.kind     = isa_asm.AOP_BIND;
+        op.size     = 8;
+        op.name_off = lo + 1;
+        op.name_len = hi - lo - 2;
+        ret err[fail.Fail].ok{};
+    }
+
+    val ri: i32 = asm_reg_index_region(c.body, lo, hi);
+    if (ri >= 0) {
+        @op = isa_asm.op_reg(isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, ri), 8);
+        ret err[fail.Fail].ok{};
+    }
+
+    if (c.body[lo] == '%'::char) { ret modifier(c, lo, hi, op); }
+
+    if (c.body[hi - 1] == ')'::char) { ret mem_operand(c, lo, hi, op); }
+
+    val iv: opt[i64] = isa_asm.region_i64(c.body, lo, hi);
+    if (sel iv.some) {
+        @op = isa_asm.op_imm(iv.some, 8);
+        ret err[fail.Fail].ok{};
+    }
+
+    if (isa_asm.is_sym_region(c.body, lo, hi)) {
+        @op = isa_asm.op_sym(lo, hi - lo, isa_inst.SYM_MOD_NONE, 8);
+        ret err[fail.Fail].ok{};
+    }
+    ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_SYNTAX, "malformed inline-asm operand")};
+}
+
+fun modifier(c: *isa_asm.Cursor, lo: usize, hi: usize, op: *isa_asm.Operand) err[fail.Fail] {
+    if (c.body[hi - 1] != ')'::char) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_SYNTAX, "malformed inline-asm relocation modifier")}; }
+    var open:  usize = lo;
+    var found: bool  = false;
+    for (open < hi && !found) {
+        if (c.body[open] == '('::char) { found = true; }
+        or                             { open = open + 1; }
+    }
+    if (!found) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_SYNTAX, "malformed inline-asm relocation modifier")}; }
+
+    var mod:  isa_inst.SymModifier = isa_inst.SYM_MOD_NONE;
+    val nlen: usize                = open - lo - 1;
+    if (str_region_equals(c.body, lo + 1, nlen, "pcrel_hi") && nlen == 8)      { mod = isa_inst.SYM_MOD_PCREL_HI; }
+    or (str_region_equals(c.body, lo + 1, nlen, "pcrel_lo") && nlen == 8)      { mod = isa_inst.SYM_MOD_PCREL_LO; }
+    or (str_region_equals(c.body, lo + 1, nlen, "got_pcrel_hi") && nlen == 12) { mod = isa_inst.SYM_MOD_GOT_HI; }
+    or {
+        ret err[fail.Fail].err{isa_asm.reject_made(c, diagnostic_kind.ASM_UNSUPPORTED, isa_asm.span_message(c,
+            "unsupported riscv64 inline-asm relocation modifier '", lo, hi, "'"))};
+    }
+    if (!isa_asm.is_sym_region(c.body, open + 1, hi - 1)) {
+        ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_SYNTAX, "malformed inline-asm relocation modifier")};
+    }
+    @op = isa_asm.op_sym(open + 1, hi - 1 - (open + 1), mod, 8);
+    ret err[fail.Fail].ok{};
+}
+
+fun mem_operand(c: *isa_asm.Cursor, lo: usize, hi: usize, op: *isa_asm.Operand) err[fail.Fail] {
+    var open:  usize = lo;
+    var found: bool  = false;
+    for (open < hi && !found) {
+        if (c.body[open] == '('::char) { found = true; }
+        or                             { open = open + 1; }
+    }
+    if (!found) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_SYNTAX, "malformed inline-asm memory operand")}; }
+
+    var bbuf: [24]u8;
+    if (!isa_asm.copy_region(c.body, open + 1, hi - 1, ?bbuf[0], 24)) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_SYNTAX, "malformed inline-asm memory operand")}; }
+    val base: i32 = asm_reg_index((?bbuf[0])::str);
+    if (base < 0) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_SYNTAX, "malformed inline-asm memory operand")}; }
+
+    var disp:  i64   = 0;
+    var flags: u8    = 0;
+    var a:     usize = lo;
+    var b:     usize = open;
+    for (a < b && isa_asm.is_space(c.body[a])) { a = a + 1; }
+    for (b > a && isa_asm.is_space(c.body[b - 1])) { b = b - 1; }
+    if (b > a) {
+        val dv: opt[i64] = isa_asm.region_i64(c.body, a, b);
+        if (!sel dv.some) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_SYNTAX, "malformed inline-asm memory operand")}; }
+        disp  = dv.some;
+        flags = isa_asm.AOF_HAS_DISP;
+    }
+    @op      = isa_asm.op_mem(isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, base), disp, isa_inst.REG_NONE, 0, 8);
+    op.flags = flags;
+    ret err[fail.Fail].ok{};
+}
+
+fun is_addr(op: *isa_asm.Operand) bool {
+    ret op.kind == isa_asm.AOP_MEM || op.kind == isa_asm.AOP_BIND;
+}
+
+fun name_eq(name: str, want: str) bool {
+    val n: usize = str_len(name);
+    if (n != str_len(want)) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        var c: u32 = name[i]::u32;
+        if (c >= 'A'::u32 && c <= 'Z'::u32) { c = c + ('a'::u32 - 'A'::u32); }
+        if (c != want[i]::u32)              { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun csr_name(name: str, out: *u32) bool {
+    if (name_eq(name, "sstatus")) {
+        @out = 0x100;
+        ret true;
+    }
+    if (name_eq(name, "sie")) {
+        @out = 0x104;
+        ret true;
+    }
+    if (name_eq(name, "stvec")) {
+        @out = 0x105;
+        ret true;
+    }
+    if (name_eq(name, "sepc")) {
+        @out = 0x141;
+        ret true;
+    }
+    if (name_eq(name, "scause")) {
+        @out = 0x142;
+        ret true;
+    }
+    if (name_eq(name, "sip")) {
+        @out = 0x144;
+        ret true;
+    }
+    if (name_eq(name, "satp")) {
+        @out = 0x180;
+        ret true;
+    }
+
+    if (name_eq(name, "mstatus")) {
+        @out = 0x300;
+        ret true;
+    }
+    if (name_eq(name, "mie")) {
+        @out = 0x304;
+        ret true;
+    }
+    if (name_eq(name, "mtvec")) {
+        @out = 0x305;
+        ret true;
+    }
+    if (name_eq(name, "mepc")) {
+        @out = 0x341;
+        ret true;
+    }
+    if (name_eq(name, "mcause")) {
+        @out = 0x342;
+        ret true;
+    }
+    if (name_eq(name, "mip")) {
+        @out = 0x344;
+        ret true;
+    }
+    if (name_eq(name, "mhartid")) {
+        @out = 0xF14;
+        ret true;
+    }
+
+    if (name_eq(name, "cycle")) {
+        @out = 0xC00;
+        ret true;
+    }
+    if (name_eq(name, "time")) {
+        @out = 0xC01;
+        ret true;
+    }
+    if (name_eq(name, "instret")) {
+        @out = 0xC02;
+        ret true;
+    }
+
+    ret false;
+}
+
+fun csr_operand(c: *isa_asm.Cursor, s: *isa_asm.Stmt, idx: u32, op: *isa_asm.Operand, out: *u32) bool {
+    if (op.kind == isa_asm.AOP_IMM) {
+        if (op.imm < 0 || op.imm > 0xFFF) { ret false; }
+        @out = op.imm::u32;
+        ret true;
+    }
+    var buf: [16]u8;
+    if (!isa_asm.copy_region(c.body, s.arg_lo[idx::usize], s.arg_hi[idx::usize], ?buf[0], 16)) { ret false; }
+    ret csr_name((?buf[0])::str, out);
+}
+
+fun label_operand(pat: u16, n: u32) u32 {
+    if (pat == riscv_mnemonic.PATTERN_BRANCH || pat == riscv_mnemonic.PATTERN_BRANCH_SW)    { ret 2; }
+    if (pat == riscv_mnemonic.PATTERN_BRANCH_Z1 || pat == riscv_mnemonic.PATTERN_BRANCH_Z2) { ret 1; }
+    if (pat == riscv_mnemonic.PATTERN_J)                                                    { ret 0; }
+    if (pat == riscv_mnemonic.PATTERN_JAL)                                                  { ret n - 1; }
+    ret 0xFFFFFFFF;
+}
+
+fun parse(c: *isa_asm.Cursor, s: *isa_asm.Stmt, item: *isa_asm.Item) err[fail.Fail] {
+    val pat: u16 = riscv_mnemonic.pattern(s.m.flags);
+    val n:   u32 = s.nargs;
+
+    val label_at: u32 = label_operand(pat, n);
+    var i:        u32 = 0;
+    for (i < n) {
+        if (i != label_at) {
+            val r: err[fail.Fail] = operand(c, s.arg_lo[i::usize], s.arg_hi[i::usize], ?item.ops[i::usize]);
+            if (sel r.err) { ret r; }
+        }
+        i = i + 1;
+    }
+
+    if (pat == riscv_mnemonic.PATTERN_RRR || pat == riscv_mnemonic.PATTERN_RRI || pat == riscv_mnemonic.PATTERN_SHIFT) {
+        if (n != 3) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm instruction expects three operands")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG || item.ops[1].kind != isa_asm.AOP_REG) {
+            ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm instruction operand must be a register")};
+        }
+        if (pat == riscv_mnemonic.PATTERN_RRR) {
+            if (item.ops[2].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm instruction source must be a register")}; }
+            ret err[fail.Fail].ok{};
+        }
+        if (pat == riscv_mnemonic.PATTERN_RRI && item.ops[2].kind == isa_asm.AOP_SYM) { ret err[fail.Fail].ok{}; }
+        if (item.ops[2].kind != isa_asm.AOP_IMM)                                      { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm operand must be an immediate")}; }
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_LOAD || pat == riscv_mnemonic.PATTERN_STORE) {
+        if (n != 2)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm load/store expects rd, off(base)")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm load/store value must be a register")}; }
+        if (!is_addr(?item.ops[1]))              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm load/store address must be off(base)")}; }
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_UIMM) {
+        if (n != 2)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm lui/auipc expects rd, imm")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm destination must be a register")}; }
+        if (item.ops[1].kind == isa_asm.AOP_SYM) { ret err[fail.Fail].ok{}; }
+        if (item.ops[1].kind != isa_asm.AOP_IMM) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm lui/auipc needs an immediate")}; }
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_BRANCH || pat == riscv_mnemonic.PATTERN_BRANCH_SW) {
+        if (n != 3) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm branch expects rs1, rs2, label")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG || item.ops[1].kind != isa_asm.AOP_REG) {
+            ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm branch operand must be a register")};
+        }
+        ret branch_target(c, s, item, 2, false);
+    }
+    if (pat == riscv_mnemonic.PATTERN_BRANCH_Z1 || pat == riscv_mnemonic.PATTERN_BRANCH_Z2) {
+        if (n != 2)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm branch expects rs, label")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm branch operand must be a register")}; }
+        ret branch_target(c, s, item, 1, false);
+    }
+    if (pat == riscv_mnemonic.PATTERN_J) {
+        if (n != 1) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm jump expects a label or symbol")}; }
+        ret branch_target(c, s, item, 0, true);
+    }
+    if (pat == riscv_mnemonic.PATTERN_JAL) {
+        if (n == 1) {
+            item.writes = isa_asm.AW_NONE;
+            ret branch_target(c, s, item, 0, true);
+        }
+        if (n != 2)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm jump expects target or rd, target")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm 'jal' destination must be a register")}; }
+        ret branch_target(c, s, item, 1, true);
+    }
+    if (pat == riscv_mnemonic.PATTERN_JR) {
+        if (n != 1)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm 'jr' expects a register")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm jr/jalr operand must be a register")}; }
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_JALR) {
+        if (n == 1) {
+            if (item.ops[0].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm jr/jalr operand must be a register")}; }
+            ret err[fail.Fail].ok{};
+        }
+        if (n != 3) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm jalr expects rs or rd, rs, imm")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG || item.ops[1].kind != isa_asm.AOP_REG) {
+            ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm jalr operand must be a register")};
+        }
+        if (item.ops[2].kind != isa_asm.AOP_IMM) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm jalr needs an immediate")}; }
+        item.writes = isa_asm.AW_OP0;
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_MV || pat == riscv_mnemonic.PATTERN_NOT || pat == riscv_mnemonic.PATTERN_SEQZ || pat == riscv_mnemonic.PATTERN_NEG || pat == riscv_mnemonic.PATTERN_SNEZ) {
+        if (n != 2) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm instruction expects rd, rs")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG || item.ops[1].kind != isa_asm.AOP_REG) {
+            ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm instruction operand must be a register")};
+        }
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_LI) {
+        if (n != 2)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm 'li' expects rd, imm")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm 'li' destination must be a register")}; }
+        if (item.ops[1].kind != isa_asm.AOP_IMM) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm 'li' needs an immediate")}; }
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_LA) {
+        if (n != 2)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm 'la' expects rd, sym")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm 'la' destination must be a register")}; }
+        if (item.ops[1].kind != isa_asm.AOP_SYM) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm 'la' target must be a symbol")}; }
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_CALL || pat == riscv_mnemonic.PATTERN_TAIL) {
+        if (n != 1)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm call/tail expects a symbol")}; }
+        if (item.ops[0].kind != isa_asm.AOP_SYM) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm call/tail target must be a symbol")}; }
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_AMO) {
+        if (n != 3) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm atomic expects rd, rs2, (rs1)")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG || item.ops[1].kind != isa_asm.AOP_REG) {
+            ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm atomic operand must be a register")};
+        }
+        ret amo_addr(c, ?item.ops[2]);
+    }
+    if (pat == riscv_mnemonic.PATTERN_AMO_LR) {
+        if (n != 2)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm 'lr' expects rd, (rs1)")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm 'lr' destination must be a register")}; }
+        ret amo_addr(c, ?item.ops[1]);
+    }
+    if (pat == riscv_mnemonic.PATTERN_CSR) {
+        if (n != 3)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm csrrw/csrrs/csrrc expects rd, csr, rs1")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm csr destination must be a register")}; }
+        if (item.ops[2].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm csr source must be a register")}; }
+        var addr: u32 = 0;
+        if (!csr_operand(c, s, 1, ?item.ops[1], ?addr)) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_UNSUPPORTED, "unsupported inline-asm CSR")}; }
+        item.ops[1] = isa_asm.op_imm(addr::i64, 1);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_CSR_I) {
+        if (n != 3)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm csrrwi/csrrsi/csrrci expects rd, csr, uimm5")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm csr destination must be a register")}; }
+        if (item.ops[2].kind != isa_asm.AOP_IMM || item.ops[2].imm < 0 || item.ops[2].imm > 31) {
+            ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_IMMEDIATE_RANGE, "inline-asm csr immediate must be 0-31")};
+        }
+        var addr: u32 = 0;
+        if (!csr_operand(c, s, 1, ?item.ops[1], ?addr)) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_UNSUPPORTED, "unsupported inline-asm CSR")}; }
+        item.ops[1] = isa_asm.op_imm(addr::i64, 1);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_CSRR) {
+        if (n != 2)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm 'csrr' expects rd, csr")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm 'csrr' destination must be a register")}; }
+        var addr: u32 = 0;
+        if (!csr_operand(c, s, 1, ?item.ops[1], ?addr)) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_UNSUPPORTED, "unsupported inline-asm CSR")}; }
+        item.ops[1] = isa_asm.op_imm(addr::i64, 1);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_CSRW) {
+        if (n != 2)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm csrw/csrs/csrc expects csr, rs1")}; }
+        if (item.ops[1].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm csr source must be a register")}; }
+        var addr: u32 = 0;
+        if (!csr_operand(c, s, 0, ?item.ops[0], ?addr)) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_UNSUPPORTED, "unsupported inline-asm CSR")}; }
+        item.ops[0] = isa_asm.op_imm(addr::i64, 1);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_CSRWI) {
+        if (n != 2) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm csrwi/csrsi/csrci expects csr, uimm5")}; }
+        if (item.ops[1].kind != isa_asm.AOP_IMM || item.ops[1].imm < 0 || item.ops[1].imm > 31) {
+            ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_IMMEDIATE_RANGE, "inline-asm csr immediate must be 0-31")};
+        }
+        var addr: u32 = 0;
+        if (!csr_operand(c, s, 0, ?item.ops[0], ?addr)) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_UNSUPPORTED, "unsupported inline-asm CSR")}; }
+        item.ops[0] = isa_asm.op_imm(addr::i64, 1);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_RDCYCLE || pat == riscv_mnemonic.PATTERN_RDTIME || pat == riscv_mnemonic.PATTERN_RDINSTRET) {
+        if (n != 1)                              { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm rdcycle/rdtime/rdinstret expects a register")}; }
+        if (item.ops[0].kind != isa_asm.AOP_REG) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm rdcycle/rdtime/rdinstret destination must be a register")}; }
+        ret err[fail.Fail].ok{};
+    }
+    if (n != 0) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm instruction takes no operands")}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun amo_addr(c: *isa_asm.Cursor, op: *isa_asm.Operand) err[fail.Fail] {
+    if (!is_addr(op)) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm atomic address must be (rs1)")}; }
+    if ((op.flags & isa_asm.AOF_HAS_DISP) != 0 || op.imm != 0) {
+        ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm atomic address takes no displacement")};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a branch or jump target: a numeric local label (Nf / Nb) on every row, a
+# symbol only where the row has a relocation kind (the jal rows, R_RISCV_JAL);
+# a conditional branch has no R_RISCV_BRANCH kind, so a symbol there is refused
+fun branch_target(c: *isa_asm.Cursor, s: *isa_asm.Stmt, item: *isa_asm.Item, idx: u32, allow_sym: bool) err[fail.Fail] {
+    val lo: usize                = s.arg_lo[idx::usize];
+    val hi: usize                = s.arg_hi[idx::usize];
+    val lr: res[bool, fail.Fail] = isa_asm.local_ref(c, lo, hi, item);
+    if (sel lr.err) { ret err[fail.Fail].err{lr.err}; }
+    if (lr.ok)      { ret err[fail.Fail].ok{}; }
+    if (lo < hi && char_is_digit(c.body[lo])) {
+        ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_SYNTAX, "inline-asm numeric local-label reference must be 'Nf' or 'Nb'")};
+    }
+    if (!allow_sym) {
+        ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_UNSUPPORTED, "inline-asm conditional branch to a symbol is unsupported (no 12-bit branch relocation kind); branch to a numeric local label instead")};
+    }
+    if (!isa_asm.is_sym_region(c.body, lo, hi)) {
+        ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm jump target must be a symbol or a numeric local label")};
+    }
+    item.ref     = isa_asm.AR_SYM;
+    item.ref_off = lo;
+    item.ref_len = hi - lo;
+    ret err[fail.Fail].ok{};
+}
+
+fun reg(op: *isa_asm.Operand) u32 {
+    if (op.kind != isa_asm.AOP_REG || op.reg == isa_inst.REG_NONE) { ret riscv_emit.RZERO; }
+    ret isa_inst.regid_index(op.reg)::u32;
+}
+
+fun absent_message(c: *isa_asm.Cursor, item: *isa_asm.Item, xl: u8) res[str, fail.Fail] {
+    val end: usize = item.src_off + item.src_len;
+    var i:   usize = item.src_off;
+    for (i < end && !isa_asm.is_space(c.body[i])) { i = i + 1; }
+
+    if (xl == 4) {
+        ret isa_asm.span_message(c, "inline-asm instruction '", item.src_off, i,
+            "' is not implemented on riscv32");
+    }
+    ret isa_asm.span_message(c, "inline-asm instruction '", item.src_off, i,
+        "' is not implemented on riscv64");
+}
+
+fun extension_message(c: *isa_asm.Cursor, item: *isa_asm.Item, ext: str) res[str, fail.Fail] {
+    val end: usize = item.src_off + item.src_len;
+    var i:   usize = item.src_off;
+    for (i < end && !isa_asm.is_space(c.body[i])) { i = i + 1; }
+    val suffix: res[str, fail.Fail] = fail.format(c.alloc,
+        "' needs the {} extension, which this target does not select; add it to the target's `extensions`, or mark the function `#[extensions(...)]` and call it only after detecting the extension at run time",
+        ext);
+    if (sel suffix.err) { ret suffix; }
+    val text: res[str, fail.Fail] = isa_asm.span_message(c, "inline-asm instruction '", item.src_off, i, suffix.ok);
+    str_free(c.alloc, suffix.ok);
+    ret text;
+}
+
+fun emit(st: *isa_encode.EncodeState, c: *isa_asm.Cursor, l: *isa_asm.Labels, item: *isa_asm.Item) err[fail.Fail] {
+    val pat: u16         = riscv_mnemonic.pattern(item.flags);
+    val op:  inst.MachOp = item.code::inst.MachOp;
+
+    if (!inst.admits(op, riscv_emit.xlen(st))) { ret err[fail.Fail].err{isa_asm.reject_made(c, diagnostic_kind.ASM_INSTRUCTION_UNAVAILABLE, absent_message(c, item, riscv_emit.xlen(st)))}; }
+    # the user's instruction needs an extension the target does not select
+    val lacking: opt[str] = riscv_emit.missing_extension(isa_asm.admitted_extensions(st, c), op);
+    if (sel lacking.some) { ret err[fail.Fail].err{isa_asm.reject_made(c, diagnostic_kind.ASM_EXTENSION, extension_message(c, item, lacking.some))}; }
+    val admitted: err[fail.Fail] = riscv_emit.admission(isa_asm.admitted_extensions(st, c), riscv_emit.xlen(st), op);
+    if (sel admitted.err) { ret admitted; }
+
+    val row:    *inst.Row = inst.row(op);
+    val opcode: u32       = row.opcode7;
+    val f3:     u32       = row.funct3;
+    val f7:     u32       = row.funct7;
+
+    if (pat == riscv_mnemonic.PATTERN_ECALL || pat == riscv_mnemonic.PATTERN_EBREAK || pat == riscv_mnemonic.PATTERN_FENCE || pat == riscv_mnemonic.PATTERN_PAUSE) {
+        riscv_emit.i_type(st, opcode, f3, riscv_emit.RZERO, riscv_emit.RZERO, row.sel);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_NOP) {
+        riscv_emit.i_type(st, opcode, f3, riscv_emit.RZERO, riscv_emit.RZERO, 0);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_RET) {
+        riscv_emit.i_type(st, opcode, f3, riscv_emit.RZERO, riscv_emit.RRA, 0);
+        ret err[fail.Fail].ok{};
+    }
+
+    if (pat == riscv_mnemonic.PATTERN_RRR) {
+        riscv_emit.r_type(st, opcode, f3, f7, reg(?item.ops[0]), reg(?item.ops[1]), reg(?item.ops[2]));
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_RRI) {
+        if (item.ops[2].kind == isa_asm.AOP_SYM) { ret emit_pcrel_lo(st, c, item, opcode, f3); }
+        val v: i64 = item.ops[2].imm;
+        if (v < -2048 || v > 2047) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_IMMEDIATE_RANGE, "inline-asm immediate is out of the 12-bit signed range")}; }
+        riscv_emit.i_type(st, opcode, f3, reg(?item.ops[0]), reg(?item.ops[1]), v::u32 & 0xFFF);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_SHIFT) {
+        var mask: u32 = 0x3F;
+        if (opcode == riscv_emit.OPC_OP_IMM_32 || riscv_emit.xlen(st) == 4) { mask = 0x1F; }
+        val v: i64 = item.ops[2].imm;
+        if (v < 0 || v::u32 > mask) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_IMMEDIATE_RANGE, "inline-asm shift amount is out of range")}; }
+        var imm: u32 = v::u32 & mask;
+        if (op == inst.SRAI || op == inst.SRAIW) { imm = imm | 0x400; }
+        riscv_emit.i_type(st, opcode, f3, reg(?item.ops[0]), reg(?item.ops[1]), imm);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_LOAD || pat == riscv_mnemonic.PATTERN_STORE) {
+        val mem: *isa_asm.Operand = ?item.ops[1];
+        if (mem.imm < -2048 || mem.imm > 2047) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_IMMEDIATE_RANGE, "inline-asm load/store offset is out of the 12-bit signed range")}; }
+        if (pat == riscv_mnemonic.PATTERN_LOAD) {
+            riscv_emit.i_type(st, opcode, f3, reg(?item.ops[0]), isa_inst.regid_index(mem.reg)::u32, mem.imm::u32 & 0xFFF);
+        }
+        or {
+            riscv_emit.s_type(st, opcode, f3, isa_inst.regid_index(mem.reg)::u32, reg(?item.ops[0]), mem.imm::u32 & 0xFFF);
+        }
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_UIMM) { ret emit_uimm(st, c, item, opcode); }
+    if (pat == riscv_mnemonic.PATTERN_BRANCH || pat == riscv_mnemonic.PATTERN_BRANCH_SW || pat == riscv_mnemonic.PATTERN_BRANCH_Z1 || pat == riscv_mnemonic.PATTERN_BRANCH_Z2) {
+        var rs1: u32 = riscv_emit.RZERO;
+        var rs2: u32 = riscv_emit.RZERO;
+        if (pat == riscv_mnemonic.PATTERN_BRANCH) {
+            rs1 = reg(?item.ops[0]);
+            rs2 = reg(?item.ops[1]);
+        }
+        or (pat == riscv_mnemonic.PATTERN_BRANCH_SW) {
+            rs1 = reg(?item.ops[1]);
+            rs2 = reg(?item.ops[0]);
+        }
+        or (pat == riscv_mnemonic.PATTERN_BRANCH_Z1) { rs1 = reg(?item.ops[0]); }
+        or                                           { rs2 = reg(?item.ops[0]); }
+        val pos: u32 = st.buf.bytes.len::u32;
+        riscv_emit.b_type(st, opcode, f3, rs1, rs2, 0);
+        riscv_emit.note_local_target(st, item.ref_num, item.ref_fwd);
+        ret isa_asm.resolve_local(st, c, l, pos, item.ref_num, item.ref_fwd);
+    }
+    if (pat == riscv_mnemonic.PATTERN_J || pat == riscv_mnemonic.PATTERN_JAL) {
+        var rd: u32 = riscv_emit.RZERO;
+        if (pat == riscv_mnemonic.PATTERN_JAL) {
+            rd = riscv_emit.RRA;
+            if (item.nops == 2) { rd = reg(?item.ops[0]); }
+        }
+        val pos: u32 = st.buf.bytes.len::u32;
+        riscv_emit.j_type(st, riscv_emit.OPC_JAL, rd, 0);
+        if (item.ref == isa_asm.AR_SYM) {
+            val sr: res[intern.StrId, A.Error] = intern.bytes_add(st.interner, (c.body::usize + item.ref_off)::str, item.ref_len);
+            if (sel sr.err) { ret err[fail.Fail].err{fail.refused(sr.err)}; }
+            riscv_emit.note_sym_target(st, sr.ok, isa_inst.SYM_MOD_NONE, 0);
+            ret isa_encode.push_reloc(st, pos, target_of.RK_JAL20, sr.ok, 0);
+        }
+        riscv_emit.note_local_target(st, item.ref_num, item.ref_fwd);
+        ret isa_asm.resolve_local(st, c, l, pos, item.ref_num, item.ref_fwd);
+    }
+    if (pat == riscv_mnemonic.PATTERN_JR) {
+        riscv_emit.i_type(st, riscv_emit.OPC_JALR, riscv_emit.F3_ADD, riscv_emit.RZERO, reg(?item.ops[0]), 0);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_JALR) {
+        if (item.nops == 1) {
+            riscv_emit.i_type(st, riscv_emit.OPC_JALR, riscv_emit.F3_ADD, riscv_emit.RRA, reg(?item.ops[0]), 0);
+            ret err[fail.Fail].ok{};
+        }
+        val v: i64 = item.ops[2].imm;
+        if (v < -2048 || v > 2047) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_IMMEDIATE_RANGE, "inline-asm jalr offset is out of the 12-bit signed range")}; }
+        riscv_emit.i_type(st, riscv_emit.OPC_JALR, riscv_emit.F3_ADD, reg(?item.ops[0]), reg(?item.ops[1]), v::u32 & 0xFFF);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_MV) {
+        riscv_emit.i_type(st, opcode, f3, reg(?item.ops[0]), reg(?item.ops[1]), 0);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_NOT) {
+        riscv_emit.i_type(st, opcode, f3, reg(?item.ops[0]), reg(?item.ops[1]), 0xFFF);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_SEQZ) {
+        riscv_emit.i_type(st, opcode, f3, reg(?item.ops[0]), reg(?item.ops[1]), 1);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_NEG) {
+        riscv_emit.r_type(st, opcode, f3, f7, reg(?item.ops[0]), riscv_emit.RZERO, reg(?item.ops[1]));
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_SNEZ) {
+        riscv_emit.r_type(st, opcode, f3, f7, reg(?item.ops[0]), riscv_emit.RZERO, reg(?item.ops[1]));
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_LI) {
+        riscv_emit.li(st, reg(?item.ops[0]), item.ops[1].imm);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_LA)   { ret emit_la(st, c, item); }
+    if (pat == riscv_mnemonic.PATTERN_CALL) { ret emit_call(st, c, item, riscv_emit.RRA, riscv_emit.RRA); }
+    if (pat == riscv_mnemonic.PATTERN_TAIL) { ret emit_call(st, c, item, riscv_emit.SCRATCH2, riscv_emit.RZERO); }
+    if (pat == riscv_mnemonic.PATTERN_AMO || pat == riscv_mnemonic.PATTERN_AMO_LR) {
+        var f7o: u32 = f7;
+        if ((item.flags & riscv_mnemonic.FLAG_AQ) != 0) { f7o = f7o | 0x2; }
+        if ((item.flags & riscv_mnemonic.FLAG_RL) != 0) { f7o = f7o | 0x1; }
+        if (pat == riscv_mnemonic.PATTERN_AMO_LR) {
+            riscv_emit.r_type(st, opcode, f3, f7o, reg(?item.ops[0]), isa_inst.regid_index(item.ops[1].reg)::u32, riscv_emit.RZERO);
+            ret err[fail.Fail].ok{};
+        }
+        riscv_emit.r_type(st, opcode, f3, f7o, reg(?item.ops[0]), isa_inst.regid_index(item.ops[2].reg)::u32, reg(?item.ops[1]));
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_CSR) {
+        riscv_emit.i_type(st, opcode, f3, reg(?item.ops[0]), reg(?item.ops[2]), item.ops[1].imm::u32);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_CSR_I) {
+        riscv_emit.i_type(st, opcode, f3, reg(?item.ops[0]), item.ops[2].imm::u32, item.ops[1].imm::u32);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_CSRR) {
+        riscv_emit.i_type(st, opcode, f3, reg(?item.ops[0]), riscv_emit.RZERO, item.ops[1].imm::u32);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_CSRW) {
+        riscv_emit.i_type(st, opcode, f3, riscv_emit.RZERO, reg(?item.ops[1]), item.ops[0].imm::u32);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_CSRWI) {
+        riscv_emit.i_type(st, opcode, f3, riscv_emit.RZERO, item.ops[1].imm::u32, item.ops[0].imm::u32);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_RDCYCLE) {
+        riscv_emit.i_type(st, opcode, f3, reg(?item.ops[0]), riscv_emit.RZERO, 0xC00);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_RDTIME) {
+        riscv_emit.i_type(st, opcode, f3, reg(?item.ops[0]), riscv_emit.RZERO, 0xC01);
+        ret err[fail.Fail].ok{};
+    }
+    if (pat == riscv_mnemonic.PATTERN_RDINSTRET) {
+        riscv_emit.i_type(st, opcode, f3, reg(?item.ops[0]), riscv_emit.RZERO, 0xC02);
+        ret err[fail.Fail].ok{};
+    }
+    ret err[fail.Fail].err{fail.message("internal compiler error: inline-asm riscv64 form has no emitter")};
+}
+
+fun emit_uimm(st: *isa_encode.EncodeState, c: *isa_asm.Cursor, item: *isa_asm.Item, opcode: u32) err[fail.Fail] {
+    val src: *isa_asm.Operand = ?item.ops[1];
+    if (src.kind == isa_asm.AOP_SYM) {
+        if (opcode != riscv_emit.OPC_AUIPC || (src.mod != isa_inst.SYM_MOD_PCREL_HI && src.mod != isa_inst.SYM_MOD_GOT_HI)) {
+            ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm upper-immediate symbol reference must be an 'auipc rd, %pcrel_hi(sym)' or 'auipc rd, %got_pcrel_hi(sym)'")};
+        }
+        val sr: res[intern.StrId, fail.Fail] = intern_symbol(st, c, src);
+        if (sel sr.err)                         { ret err[fail.Fail].err{sr.err}; }
+        if (src.mod == isa_inst.SYM_MOD_GOT_HI) { ret riscv_emit.got_hi(st, reg(?item.ops[0]), sr.ok); }
+        ret riscv_emit.pcrel_hi(st, reg(?item.ops[0]), sr.ok, 0);
+    }
+    if (src.imm < 0 || src.imm > 0xFFFFF) { ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_IMMEDIATE_RANGE, "inline-asm lui/auipc immediate is out of the 20-bit range")}; }
+    riscv_emit.u_type(st, opcode, reg(?item.ops[0]), src.imm::u32 & 0xFFFFF);
+    ret err[fail.Fail].ok{};
+}
+
+fun emit_pcrel_lo(st: *isa_encode.EncodeState, c: *isa_asm.Cursor, item: *isa_asm.Item, opcode: u32, f3: u32) err[fail.Fail] {
+    val src: *isa_asm.Operand = ?item.ops[2];
+    if (src.mod != isa_inst.SYM_MOD_PCREL_LO) {
+        ret err[fail.Fail].err{isa_asm.reject(c, diagnostic_kind.ASM_OPERAND, "inline-asm register-immediate symbol reference must be a '%pcrel_lo(sym)'")};
+    }
+    val sr: res[intern.StrId, fail.Fail] = intern_symbol(st, c, src);
+    if (sel sr.err) { ret err[fail.Fail].err{sr.err}; }
+    val sym: intern.StrId = sr.ok;
+    val pos: u32          = st.buf.bytes.len::u32;
+    riscv_emit.i_type(st, opcode, f3, reg(?item.ops[0]), reg(?item.ops[1]), 0);
+    riscv_emit.note_sym_target(st, sym, isa_inst.SYM_MOD_PCREL_LO, 0);
+    ret riscv_emit.push_pcrel_lo_of(st, pos, target_of.RK_PCREL_LO12_I, latest_high_kind(st, sym), sym);
+}
+
+# the kind of the high part that last named sym: '%pcrel_lo(sym)' pairs with
+# whichever of '%pcrel_hi(sym)' and '%got_pcrel_hi(sym)' came last
+fun latest_high_kind(st: *isa_encode.EncodeState, sym: intern.StrId) target_of.RelocKind {
+    val got: res[*isa_encode.RelocPairSite, fail.Fail] = isa_encode.reloc_pair_site(st, target_of.RK_GOT_PCREL_HI20, sym);
+    if (sel got.err) { ret target_of.RK_PCREL_HI20; }
+    val pc: res[*isa_encode.RelocPairSite, fail.Fail] = isa_encode.reloc_pair_site(st, target_of.RK_PCREL_HI20, sym);
+    if (sel pc.ok && pc.ok.reloc_index > got.ok.reloc_index) { ret target_of.RK_PCREL_HI20; }
+    ret target_of.RK_GOT_PCREL_HI20;
+}
+
+fun emit_la(st: *isa_encode.EncodeState, c: *isa_asm.Cursor, item: *isa_asm.Item) err[fail.Fail] {
+    val sr: res[intern.StrId, fail.Fail] = intern_symbol(st, c, ?item.ops[1]);
+    if (sel sr.err) { ret err[fail.Fail].err{sr.err}; }
+    val sym: intern.StrId   = sr.ok;
+    val rd:  u32            = reg(?item.ops[0]);
+    val hr:  err[fail.Fail] = riscv_emit.pcrel_hi(st, rd, sym, 0);
+    if (sel hr.err) { ret hr; }
+    val lo_pos: u32 = st.buf.bytes.len::u32;
+    riscv_emit.i_type(st, riscv_emit.OPC_OP_IMM, riscv_emit.F3_ADD, rd, rd, 0);
+    riscv_emit.note_sym_target(st, sym, isa_inst.SYM_MOD_PCREL_LO, 0);
+    ret riscv_emit.push_pcrel_lo(st, lo_pos, target_of.RK_PCREL_LO12_I, sym);
+}
+
+fun emit_call(st: *isa_encode.EncodeState, c: *isa_asm.Cursor, item: *isa_asm.Item, link: u32, ret_reg: u32) err[fail.Fail] {
+    val sr: res[intern.StrId, fail.Fail] = intern_symbol(st, c, ?item.ops[0]);
+    if (sel sr.err) { ret err[fail.Fail].err{sr.err}; }
+    val sym: intern.StrId = sr.ok;
+    val pos: u32          = st.buf.bytes.len::u32;
+    riscv_emit.u_type(st, riscv_emit.OPC_AUIPC, link, 0);
+    riscv_emit.note_sym_target(st, sym, isa_inst.SYM_MOD_PCREL_HI, 0);
+    riscv_emit.i_type(st, riscv_emit.OPC_JALR, riscv_emit.F3_ADD, ret_reg, link, 0);
+    riscv_emit.note_sym_target(st, sym, isa_inst.SYM_MOD_PCREL_LO, 0);
+    val pushed: err[fail.Fail] = isa_encode.push_reloc(st, pos, target_of.RK_PLT32, sym, 0);
+    if (sel pushed.err) { ret err[fail.Fail].err{pushed.err}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun intern_symbol(st: *isa_encode.EncodeState, c: *isa_asm.Cursor, op: *isa_asm.Operand) res[intern.StrId, fail.Fail] {
+    val interned: res[intern.StrId, A.Error] = intern.bytes_add(st.interner, (c.body::usize + op.name_off)::str, op.name_len);
+    if (sel interned.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(interned.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{interned.ok};
+}
+
+fun patch(st: *isa_encode.EncodeState, patch_pos: u32, target_off: u32) err[fail.Fail] {
+    var fx: isa_encode.BranchFixup;
+    fx.patch_pos    = patch_pos;
+    fx.next_ip      = 0;
+    fx.target_block = 0;
+    fx.fn_text_base = 0;
+    ret riscv_emit.patch_branch(st, ?fx, target_off);
+}
+
+fun writes_sp(item: *isa_asm.Item) bool {
+    if (item.kind == isa_asm.AI_LABEL) { ret false; }
+    if (item.kind == isa_asm.AI_BYTES) {
+        if (item.declared) { ret (item.decl_gp & (1::u32 << riscv_emit.RSP)) != 0; }
+        ret true;
+    }
+    if ((item.implicit & (1::u32 << riscv_emit.RSP)) != 0)                           { ret true; }
+    if ((item.writes & isa_asm.AW_OP0) != 0 && item.nops > 0 && is_sp(?item.ops[0])) { ret true; }
+    if ((item.writes & isa_asm.AW_OP1) != 0 && item.nops > 1 && is_sp(?item.ops[1])) { ret true; }
+    ret false;
+}
+
+fun is_sp(op: *isa_asm.Operand) bool {
+    ret op.kind == isa_asm.AOP_REG && op.reg == isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, riscv_emit.RSP::i32);
+}
+
+fun isa_tag(xl: u8) str {
+    if (xl == 4) { ret "riscv32"; }
+    ret "riscv64";
+}
+
+fun grammar_named(tag: str) isa_asm.Grammar {
+    var g: isa_asm.Grammar;
+    g.isa        = tag;
+    g.unknown    = "unknown riscv inline-asm instruction '";
+    g.rows       = ?riscv_mnemonic.ROWS[0];
+    g.row_count  = riscv_mnemonic.ROW_COUNT;
+    g.data       = ?isa_asm.DIRECTIVES_WORD32[0];
+    g.data_count = isa_asm.DIRECTIVE_COUNT;
+    g.decode     = decode_amo;
+    g.parse      = parse;
+    g.emit       = emit;
+    g.patch      = patch;
+    g.slot_sp    = true;
+    g.writes_sp  = writes_sp;
+    g.all_gp     = 0xFFFFFFFF;
+    g.all_fp     = 0xFFFFFFFF;
+    g.word       = 4;
+    g.endian     = target_model.ENDIAN_LITTLE;
+    g.ct_class   = riscv_effects.asm_ct_class;
+    g.note_bytes = isa_encode.note_bytes;
+    g.note_label = asm_note_label;
+    g.decl_reg   = decl_reg;
+    g.no_fall    = no_fall;
+    ret g;
+}
+
+fun grammar_of(st: *isa_encode.EncodeState) isa_asm.Grammar {
+    ret grammar_named(isa_tag(riscv_emit.xlen(st)));
+}
+
+# whether an asm body returns, for the middle end, which reads no grammar
+pub fun returns(body: str) bool {
+    ret isa_asm.returns(grammar, body);
+}
+
+pub fun grammar() isa_asm.Grammar {
+    ret grammar_named("riscv");
+}
+
+fun no_fall(item: *isa_asm.Item) bool {
+    if (item.kind != isa_asm.AI_INST) { ret false; }
+    ret item.code == inst.EBREAK::u32;
+}
+
+fun decl_reg(name: str, bank: *u8, idx: *u32) bool {
+    val gp: i32 = asm_reg_index(name);
+    if (gp >= 0) {
+        @bank = isa_asm.ABANK_GP;
+        @idx  = gp::u32;
+        ret true;
+    }
+    val fp: i32 = asm_fp_reg_index(name);
+    if (fp >= 0) {
+        @bank = isa_asm.ABANK_FP;
+        @idx  = fp::u32;
+        ret true;
+    }
+    ret false;
+}
+
+fun asm_fp_reg_index(tok: str) i32 {
+    var i: u32 = 0;
+    for (i < 32) {
+        if (str_equals(tok, riscv_printer.fp_name(i))) { ret i::i32; }
+        i = i + 1;
+    }
+    if (tok[0] != 'f'::char || tok[1] == 0) { ret -1; }
+    var n: i32   = 0;
+    var k: usize = 1;
+    for (tok[k] != 0) {
+        if (tok[k] < '0'::char || tok[k] > '9'::char) { ret -1; }
+        n = n * 10 + (tok[k]::i32 - '0'::char::i32);
+        k = k + 1;
+    }
+    if (n >= 0 && n < 32) { ret n; }
+    ret -1;
+}
+
+pub fun encode_asm_block(st: *isa_encode.EncodeState, f: *lang_mir.MirFunction, fn_base: u32, mi: *lang_mir.MirInstr) err[fail.Fail] {
+    var g: isa_asm.Grammar = grammar_of(st);
+    ret isa_asm.encode_block(st, ?g, f, mi);
+}
+
+#[testing]
+pub fun asm_text(st: *isa_encode.EncodeState, f: *lang_mir.MirFunction, l: *isa_asm.Labels, text: str) err[fail.Fail] {
+    var g: isa_asm.Grammar = grammar_of(st);
+    var c: isa_asm.Cursor;
+    isa_asm.cursor_init(?c, ?g, text, st.alloc, st.interner, f, nil);
+    ret isa_asm.run(st, ?g, ?c, l);
+}
+
+test asm_clobbers__classification {
+    var bad: i32 = 0;
+    var gp:  u32 = 0;
+    var fp:  u32 = 0;
+
+    isa_asm.clobbers(grammar, "ld a0, 0(sp)\naddi a1, sp, 8\nsd a0, 0(a1)\ncall main", ?gp, ?fp);
+    if ((gp & (1::u32 << 10)) == 0)                                      { bad = 1; }
+    if ((gp & (1::u32 << 11)) == 0)                                      { bad = 1; }
+    if ((gp & riscv_emit.CALLER_SAVED_GP) != riscv_emit.CALLER_SAVED_GP) { bad = 1; }
+    if (fp != 0)                                                         { bad = 1; }
+
+    gp = 0;
+    fp = 0;
+    isa_asm.clobbers(grammar, "sd a0, 0(sp)\nbeq a0, a1, 1f\necall\n1:", ?gp, ?fp);
+    if (gp != 0) { bad = 1; }
+
+    gp = 0;
+    fp = 0;
+    isa_asm.clobbers(grammar, "ld a0, {v}\nsd a1, {out}", ?gp, ?fp);
+    if (gp != (1::u32 << 10)) { bad = 1; }
+
+    gp = 0;
+    fp = 0;
+    isa_asm.clobbers(grammar, "1: addi t0, t0, 1", ?gp, ?fp);
+    if ((gp & (1::u32 << 5)) == 0)  { bad = 1; }
+    if ((gp & ~(1::u32 << 5)) != 0) { bad = 1; }
+
+    gp = 0;
+    fp = 0;
+    isa_asm.clobbers(grammar, "beq a0, a1, end", ?gp, ?fp);
+    if (gp != 0xFFFFFFFF) { bad = 1; }
+
+    gp = 0;
+    fp = 0;
+    isa_asm.clobbers(grammar, "lr.d t0, (a1)\nsc.d t1, a2, (a1)\namoadd.d.aqrl a0, a2, (a1)\npause", ?gp, ?fp);
+    if ((gp & (1::u32 << 5)) == 0)  { bad = 1; }
+    if ((gp & (1::u32 << 6)) == 0)  { bad = 1; }
+    if ((gp & (1::u32 << 10)) == 0) { bad = 1; }
+    val amo_mask: u32 = (1::u32 << 5) | (1::u32 << 6) | (1::u32 << 10);
+    if ((gp & ~amo_mask) != 0) { bad = 1; }
+    if (fp != 0)               { bad = 1; }
+
+    gp = 0;
+    fp = 0;
+    isa_asm.clobbers(grammar, "frobnicate a0, a1", ?gp, ?fp);
+    if (gp != 0xFFFFFFFF) { bad = 1; }
+    if (fp != 0xFFFFFFFF) { bad = 1; }
+
+    if (asm_reg_index("x0") != 0)            { bad = 1; }
+    if (asm_reg_index("x31") != 31)          { bad = 1; }
+    if (asm_reg_index("sp") != 2)            { bad = 1; }
+    if (asm_reg_index("fp") != 8)            { bad = 1; }
+    if (asm_reg_index("a7") != 17)           { bad = 1; }
+    if (asm_reg_index("t6") != 31)           { bad = 1; }
+    if (asm_reg_index("notareg") != (0 - 1)) { bad = 1; }
+
+    ret bad;
+}
+
+#[testing]
+pub fun tasm(st: *isa_encode.EncodeState, alloc: *A.Allocator, interner: *intern.Interner) {
+    page.make(alloc);
+    @interner = intern.init(alloc);
+    isa_encode.state_blank(st, alloc, riscv_emit.rv64_machine());
+    st.interner = interner;
+}
+
+#[testing]
+var t_model_rv32: target_model.Machine;
+
+#[testing]
+pub fun rv32_machine() *target_model.Machine {
+    t_model_rv32.pointer_width = 4;
+    t_model_rv32.gpr_width     = 4;
+    target_model.declare_alu_widths(?t_model_rv32, target_model.ALU_WIDTHS_4);
+    t_model_rv32.spill_width = 4;
+    t_model_rv32.flen_bits   = 64;
+    t_model_rv32.extensions  = extension_riscv.ALL;
+    ret ?t_model_rv32;
+}
+
+#[testing]
+pub fun tasm32(st: *isa_encode.EncodeState, alloc: *A.Allocator, interner: *intern.Interner) {
+    page.make(alloc);
+    @interner = intern.init(alloc);
+    isa_encode.state_blank(st, alloc, rv32_machine());
+    st.interner = interner;
+}
+
+# an instruction whose extension the target leaves out is admitted inside an
+# #[extensions] function that names it, and refused elsewhere
+#[testing]
+fun t_admits(text: str, f_exts: u64) bool {
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    riscv_emit.t_model.extensions = extension_riscv.I;
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+    f.extensions = f_exts;
+    val r: err[fail.Fail] = asm_text(?st, ?f, ?labels, text);
+    riscv_emit.t_model.extensions = extension_riscv.ALL;
+    isa_asm.labels_dnit(?labels);
+    ret sel r.ok;
+}
+
+test inline_asm__admits_the_function_extensions {
+    if (t_admits("mul a0, a1, a2", 0))                     { ret 1; }
+    if (!t_admits("mul a0, a1, a2", extension_riscv.M))    { ret 2; }
+    if (t_admits("mul a0, a1, a2", extension_riscv.A))     { ret 3; }
+    if (!t_admits("add a0, a1, a2", 0))                    { ret 4; }
+    if (!t_admits("csrr a0, time", extension_riscv.ZICSR)) { ret 5; }
+    ret 0;
+}
+
+test inline_asm__core_forms {
+    var bad:      i32 = 0;
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+
+    asm_text(?st, ?f, ?labels, "ecall");
+    asm_text(?st, ?f, ?labels, "nop");
+    asm_text(?st, ?f, ?labels, "ret");
+    asm_text(?st, ?f, ?labels, "fence");
+    asm_text(?st, ?f, ?labels, "li a7, 93");
+    asm_text(?st, ?f, ?labels, "mv a0, a1");
+    asm_text(?st, ?f, ?labels, "add a0, a1, a2");
+    asm_text(?st, ?f, ?labels, "sub a0, a1, a2");
+    asm_text(?st, ?f, ?labels, "addi a0, a1, 5");
+    asm_text(?st, ?f, ?labels, "ld a0, 8(sp)");
+    asm_text(?st, ?f, ?labels, "sd a0, 16(sp)");
+    asm_text(?st, ?f, ?labels, "lui a0, 0x12345");
+    asm_text(?st, ?f, ?labels, "auipc a0, 0");
+    asm_text(?st, ?f, ?labels, "slli a0, a1, 3");
+    asm_text(?st, ?f, ?labels, "srai a0, a1, 3");
+    asm_text(?st, ?f, ?labels, "addiw a0, a1, 1");
+    asm_text(?st, ?f, ?labels, "neg a0, a1");
+    asm_text(?st, ?f, ?labels, "not a0, a1");
+    asm_text(?st, ?f, ?labels, "seqz a0, a1");
+    asm_text(?st, ?f, ?labels, "snez a0, a1");
+    asm_text(?st, ?f, ?labels, "mul a0, a1, a2");
+    asm_text(?st, ?f, ?labels, "addw a0, a1, a2");
+
+    if (isa_encode.word_read(?st.buf, 0) != 0x00000073)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 4) != 0x00000013)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 8) != 0x00008067)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 12) != 0x0FF0000F) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 16) != 0x05D00893) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 20) != 0x00058513) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 24) != 0x00C58533) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 28) != 0x40C58533) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 32) != 0x00558513) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 36) != 0x00813503) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 40) != 0x00A13823) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 44) != 0x12345537) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 48) != 0x00000517) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 52) != 0x00359513) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 56) != 0x4035D513) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 60) != 0x0015851B) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 64) != 0x40B00533) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 68) != 0xFFF5C513) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 72) != 0x0015B513) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 76) != 0x00B03533) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 80) != 0x02C58533) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 84) != 0x00C5853B) { bad = 1; }
+
+    isa_asm.labels_dnit(?labels);
+    isa_encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+#[testing]
+val RV64_ONLY_COUNT: usize = 14;
+
+#[testing]
+val RV64_ONLY_ASM: [RV64_ONLY_COUNT]str = [RV64_ONLY_COUNT]str{
+    "ld a0, 8(sp)",
+    "sd a0, 16(sp)",
+    "lwu a0, 0(a1)",
+    "addw a0, a1, a2",
+    "sllw a0, a1, a2",
+    "mulw a0, a1, a2",
+    "divw a0, a1, a2",
+    "addiw a0, a1, 1",
+    "slliw a0, a1, 3",
+    "sext.w a0, a1",
+    "negw a0, a1",
+    "lr.d a0, (a1)",
+    "sc.d a0, a2, (a1)",
+    "amoadd.d a0, a2, (a1)",
+};
+
+#[testing]
+val RV_BOTH_COUNT: usize = 17;
+
+#[testing]
+val RV_BOTH_ASM: [RV_BOTH_COUNT]str = [RV_BOTH_COUNT]str{
+    "ecall",
+    "fence",
+    "pause",
+    "add a0, a1, a2",
+    "sll a0, a1, a2",
+    "mul a0, a1, a2",
+    "div a0, a1, a2",
+    "addi a0, a1, 5",
+    "slli a0, a1, 3",
+    "lb a0, 0(a1)",
+    "lw a0, 0(a1)",
+    "sw a0, 0(a1)",
+    "lui a0, 0x12345",
+    "auipc a0, 0",
+    "mv a0, a1",
+    "lr.w a0, (a1)",
+    "amoadd.w a0, a2, (a1)",
+};
+
+test inline_asm__rv64_only_forms_refused_on_rv32 {
+    var bad: i32 = 0;
+
+    var st64:    isa_encode.EncodeState;
+    var alloc64: A.Allocator;
+    var itn64:   intern.Interner;
+    tasm(?st64, ?alloc64, ?itn64);
+    var lab64: isa_asm.Labels;
+    isa_asm.labels_init(?lab64, ?alloc64);
+
+    var st32:    isa_encode.EncodeState;
+    var alloc32: A.Allocator;
+    var itn32:   intern.Interner;
+    tasm32(?st32, ?alloc32, ?itn32);
+    var lab32: isa_asm.Labels;
+    isa_asm.labels_init(?lab32, ?alloc32);
+
+    var f: lang_mir.MirFunction;
+
+    var i: usize = 0;
+    for (i < RV64_ONLY_COUNT) {
+        st32.buf.bytes.len = 0;
+        val r32: err[fail.Fail] = asm_text(?st32, ?f, ?lab32, RV64_ONLY_ASM[i]);
+        if (!t_refused(r32, ?st32.buf)) { bad = 1; }
+        or (sel r32.err) {
+            if (!str_contains(fail.describe(r32.err), "is not implemented on riscv32")) { bad = 1; }
+        }
+
+        st64.buf.bytes.len = 0;
+        if (!t_accepted(asm_text(?st64, ?f, ?lab64, RV64_ONLY_ASM[i]), ?st64.buf)) { bad = 1; }
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < RV_BOTH_COUNT) {
+        st32.buf.bytes.len = 0;
+        if (!t_accepted(asm_text(?st32, ?f, ?lab32, RV_BOTH_ASM[i]), ?st32.buf)) { bad = 1; }
+        st64.buf.bytes.len = 0;
+        if (!t_accepted(asm_text(?st64, ?f, ?lab64, RV_BOTH_ASM[i]), ?st64.buf)) { bad = 1; }
+        i = i + 1;
+    }
+
+    st32.buf.bytes.len = 0;
+    val ur: err[fail.Fail] = asm_text(?st32, ?f, ?lab32, "frobnicate a0, a1");
+    if (!t_refused(ur, ?st32.buf)) { bad = 1; }
+    or (sel ur.err) {
+        if (!str_contains(fail.describe(ur.err), "unknown riscv inline-asm instruction")) { bad = 1; }
+    }
+
+    st32.buf.bytes.len = 0;
+    if (!t_refused(asm_text(?st32, ?f, ?lab32, "slli a0, a1, 32"), ?st32.buf)) { bad = 1; }
+    st32.buf.bytes.len = 0;
+    if (!t_accepted(asm_text(?st32, ?f, ?lab32, "slli a0, a1, 31"), ?st32.buf)) { bad = 1; }
+    st64.buf.bytes.len = 0;
+    if (!t_accepted(asm_text(?st64, ?f, ?lab64, "slli a0, a1, 32"), ?st64.buf)) { bad = 1; }
+
+    isa_asm.labels_dnit(?lab32);
+    isa_encode.buf_dnit(?st32.buf);
+    isa_asm.labels_dnit(?lab64);
+    isa_encode.buf_dnit(?st64.buf);
+    ret bad;
+}
+
+test grammar__every_row_states_its_machines {
+    var bad: i32 = 0;
+
+    var i: usize = 0;
+    for (i < riscv_mnemonic.ROW_COUNT) {
+        if (inst.xlens(riscv_mnemonic.ROWS[i].code::inst.MachOp) == 0) { bad = 1; }
+        i = i + 1;
+    }
+
+    var op: inst.MachOp = inst.LR_W;
+    for (op <= inst.AMOMAXU_D) {
+        if (inst.xlens(op) == 0) { bad = 1; }
+        op = op + 1;
+    }
+
+    if (inst.xlens(inst.MOP_NONE) != 0)     { bad = 1; }
+    if (inst.xlens(inst.MOP_LAST + 1) != 0) { bad = 1; }
+
+    if (inst.xlens(inst.LD) != inst.XL64)   { bad = 1; }
+    if (inst.xlens(inst.LW) != inst.XL_ANY) { bad = 1; }
+    if (inst.admits(inst.LD, 4))            { bad = 1; }
+    if (!inst.admits(inst.LD, 8))           { bad = 1; }
+    if (!inst.admits(inst.LW, 4))           { bad = 1; }
+    if (!inst.admits(inst.LW, 8))           { bad = 1; }
+
+    if (inst.admits(inst.ADD, 0)) { bad = 1; }
+
+    ret bad;
+}
+
+test inline_asm__long_symbol_operand {
+    var bad: i32 = 0;
+
+    var st1:       isa_encode.EncodeState;
+    var alloc1:    A.Allocator;
+    var interner1: intern.Interner;
+    tasm(?st1, ?alloc1, ?interner1);
+    var labels1: isa_asm.Labels;
+    isa_asm.labels_init(?labels1, ?alloc1);
+    var f1: lang_mir.MirFunction;
+    val r1: err[fail.Fail] = asm_text(?st1, ?f1, ?labels1, "call short_sym");
+    if (sel r1.err) { bad = 1; }
+
+    val long_name: str =
+        "sym_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    val long_call: str =
+        "call sym_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    var st2:       isa_encode.EncodeState;
+    var alloc2:    A.Allocator;
+    var interner2: intern.Interner;
+    tasm(?st2, ?alloc2, ?interner2);
+    var labels2: isa_asm.Labels;
+    isa_asm.labels_init(?labels2, ?alloc2);
+    var f2: lang_mir.MirFunction;
+    val r2: err[fail.Fail] = asm_text(?st2, ?f2, ?labels2, long_call);
+    if (sel r2.err) { bad = 1; }
+
+    if (st1.buf.bytes.len != st2.buf.bytes.len) { bad = 1; }
+    or {
+        var i: usize = 0;
+        for (i < st1.buf.bytes.len) {
+            if (st1.buf.bytes.data[i] != st2.buf.bytes.data[i]) { bad = 1; }
+            i = i + 1;
+        }
+    }
+
+    if (st2.reloc_count == 0) { bad = 1; }
+    or {
+        val nm: opt[str] = intern.get(st2.interner, st2.relocs[st2.reloc_count - 1].sym);
+        if (sel nm.some && !str_equals(nm.some, long_name)) { bad = 1; }
+    }
+
+    var st3:       isa_encode.EncodeState;
+    var alloc3:    A.Allocator;
+    var interner3: intern.Interner;
+    tasm(?st3, ?alloc3, ?interner3);
+    var labels3: isa_asm.Labels;
+    isa_asm.labels_init(?labels3, ?alloc3);
+    var f3: lang_mir.MirFunction;
+    val r3: err[fail.Fail] = asm_text(?st3, ?f3, ?labels3, "ld a0, )(sp");
+    if (sel r3.ok) { bad = 1; }
+
+    isa_asm.labels_dnit(?labels1);
+    isa_encode.buf_dnit(?st1.buf);
+    isa_asm.labels_dnit(?labels2);
+    isa_encode.buf_dnit(?st2.buf);
+    isa_asm.labels_dnit(?labels3);
+    isa_encode.buf_dnit(?st3.buf);
+    ret bad;
+}
+
+test inline_asm__data_directives {
+    var bad:      i32 = 0;
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+
+    asm_text(?st, ?f, ?labels, "nop");
+    asm_text(?st, ?f, ?labels, ".word 0x00000013");
+    asm_text(?st, ?f, ?labels, ".long 0x00000013");
+    asm_text(?st, ?f, ?labels, ".byte 0x13, 0x00, 0x00, 0x00");
+    asm_text(?st, ?f, ?labels, ".quad 0x0000001300000013");
+    asm_text(?st, ?f, ?labels, ".word 0xc0102573");
+
+    if (isa_encode.word_read(?st.buf, 0) != 0x00000013)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 4) != 0x00000013)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 8) != 0x00000013)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 12) != 0x00000013) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 16) != 0x00000013) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 20) != 0x00000013) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 24) != 0xC0102573) { bad = 1; }
+    if (st.buf.bytes.len != 28)                          { bad = 1; }
+
+    isa_asm.labels_dnit(?labels);
+    isa_encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+test inline_asm__data_directive_refusals {
+    var bad:      i32 = 0;
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+
+    val r1: err[fail.Fail] = asm_text(?st, ?f, ?labels, ".byte 0x13");
+    if (!sel r1.err) { bad = 1; }
+    or (sel r1.err) {
+        if (!str_contains(fail.describe(r1.err), "whole number of instruction words")) { bad = 1; }
+    }
+
+    val r2: err[fail.Fail] = asm_text(?st, ?f, ?labels, ".byte 0x13, 0x00, 0x00");
+    if (!sel r2.err) { bad = 1; }
+    or (sel r2.err) {
+        if (!str_contains(fail.describe(r2.err), "whole number of instruction words")) { bad = 1; }
+    }
+
+    val r3: err[fail.Fail] = asm_text(?st, ?f, ?labels, ".word 0x100000013");
+    if (!sel r3.err) { bad = 1; }
+    or (sel r3.err) {
+        if (!str_contains(fail.describe(r3.err), "cannot hold")) { bad = 1; }
+    }
+
+    val r4: err[fail.Fail] = asm_text(?st, ?f, ?labels, ".half 0x1234");
+    if (!sel r4.err) { bad = 1; }
+    or (sel r4.err) {
+        if (!str_contains(fail.describe(r4.err), "unknown riscv inline-asm instruction")) { bad = 1; }
+    }
+
+    isa_asm.labels_dnit(?labels);
+    isa_encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+test emit_asm__renders_data_directives {
+    var bad:      i32 = 0;
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+
+    var w: io_writer.Writer;
+    riscv_printer.test_sink_writer(?w);
+    riscv_printer.test_sink_reset();
+    var sink: isa_encode.AsmSink = isa_encode.sink_init(?w, ?interner);
+    st.buf.asm = ?sink;
+
+    val r1: err[fail.Fail] =
+        asm_text(?st, ?f, ?labels, ".byte 0x13, 0x05, 0x00, 0x00, 0x93, 0x05, 0x10, 0x00");
+    if (sel r1.err) { bad = 1; }
+    val r2: err[fail.Fail] = asm_text(?st, ?f, ?labels, "addi zero, zero, 0");
+    if (sel r2.err) { bad = 1; }
+
+    if (isa_encode.note_inst_count(?st.buf) * riscv_emit.WORD_SIZE != st.buf.bytes.len::u32) { bad = 1; }
+
+    val rr: err[fail.Fail] = riscv_printer.render_notes(?st.buf);
+    if (sel rr.err) { bad = 1; }
+    if (sel rr.ok) {
+        val text: str        = riscv_printer.test_sink_text();
+        val di:   opt[usize] = str_index_of(text, ".byte 0x13, 0x05, 0x00, 0x00");
+        val dj:   opt[usize] = str_index_of(text, ".byte 0x93, 0x05, 0x10, 0x00");
+        val ii:   opt[usize] = str_index_of(text, "addi zero, zero, 0");
+        if (sel di.none) { ret 99; }
+        if (sel dj.none) { ret 99; }
+        if (sel di.some) {
+            if (sel dj.some) {
+                if (sel ii.some) {
+                    if (di.some >= dj.some) { bad = 1; }
+                    if (dj.some >= ii.some) { bad = 1; }
+                }
+            }
+        }
+    }
+
+    isa_asm.labels_dnit(?labels);
+    isa_encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+test asm_clobbers__declared_raw_encodings {
+    var gp:  u32 = 0;
+    var fp:  u32 = 0;
+    var bad: i32 = 0;
+
+    isa_asm.clobbers(grammar, ".word 0xc0102573 :: writes(a0)", ?gp, ?fp);
+    if (gp != (1::u32 << 10)) { bad = 1; }
+    if (fp != 0)              { bad = 1; }
+
+    gp = 0;
+    fp = 0;
+    isa_asm.clobbers(grammar, ".word 0xc0102573", ?gp, ?fp);
+    if (gp != 0xFFFFFFFF) { bad = 1; }
+    if (fp != 0xFFFFFFFF) { bad = 1; }
+
+    gp = 0;
+    fp = 0;
+    isa_asm.clobbers(grammar, ".word 0x00000013 :: writes(ft2, fa0)", ?gp, ?fp);
+    if (gp != 0)                                { bad = 1; }
+    if (fp != ((1::u32 << 2) | (1::u32 << 10))) { bad = 1; }
+
+    gp = 0;
+    fp = 0;
+    isa_asm.clobbers(grammar, ".word 0x0ff0000f :: writes()", ?gp, ?fp);
+    if (gp != 0) { bad = 1; }
+    if (fp != 0) { bad = 1; }
+
+    gp = 0;
+    fp = 0;
+    isa_asm.clobbers(grammar, ".word 0x00000013 :: writes(a8)", ?gp, ?fp);
+    if (gp != 0xFFFFFFFF) { bad = 1; }
+
+    gp = 0;
+    fp = 0;
+    isa_asm.clobbers(grammar, "addi a0, a1, 1 :: writes()", ?gp, ?fp);
+    if (gp != 0xFFFFFFFF) { bad = 1; }
+
+    ret bad;
+}
+
+test inline_asm__local_labels {
+    var bad:      i32 = 0;
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+
+    asm_text(?st, ?f, ?labels, "1:");
+    asm_text(?st, ?f, ?labels, "addi a0, a0, 1");
+    asm_text(?st, ?f, ?labels, "bne a0, a1, 1b");
+    asm_text(?st, ?f, ?labels, "j 2f");
+    asm_text(?st, ?f, ?labels, "nop");
+    asm_text(?st, ?f, ?labels, "2:");
+    asm_text(?st, ?f, ?labels, "ret");
+
+    if (isa_encode.word_read(?st.buf, 0) != 0x00150513)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 4) != 0xFEB51EE3)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 8) != 0x0080006F)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 12) != 0x00000013) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 16) != 0x00008067) { bad = 1; }
+    if (labels.fixup_count != 0)                         { bad = 1; }
+
+    isa_asm.labels_dnit(?labels);
+    isa_encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+test inline_asm__symbol_relocs {
+    var bad:      i32 = 0;
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+
+    asm_text(?st, ?f, ?labels, "call foo");
+    if (isa_encode.word_read(?st.buf, 0) != 0x00000097) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 4) != 0x000080E7) { bad = 1; }
+    if (st.reloc_count != 1)                            { bad = 1; }
+    or {
+        if (st.relocs[0].kind != target_of.RK_PLT32) { bad = 1; }
+        if (st.relocs[0].offset != 0)                { bad = 1; }
+    }
+
+    asm_text(?st, ?f, ?labels, "tail foo");
+    if (isa_encode.word_read(?st.buf, 8) != 0x00000317)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 12) != 0x00030067) { bad = 1; }
+    if (st.reloc_count != 2)                             { bad = 1; }
+    or {
+        if (st.relocs[1].kind != target_of.RK_PLT32) { bad = 1; }
+        if (st.relocs[1].offset != 8)                { bad = 1; }
+    }
+
+    asm_text(?st, ?f, ?labels, "la a0, foo");
+    if (isa_encode.word_read(?st.buf, 16) != 0x00000517) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 20) != 0x00050513) { bad = 1; }
+    if (st.reloc_count != 4)                             { bad = 1; }
+    or {
+        if (st.relocs[2].kind != target_of.RK_PCREL_HI20)   { bad = 1; }
+        if (st.relocs[2].offset != 16)                      { bad = 1; }
+        if (st.relocs[3].kind != target_of.RK_PCREL_LO12_I) { bad = 1; }
+        if (st.relocs[3].offset != 20)                      { bad = 1; }
+    }
+
+    # the jal rows take a symbol under one R_RISCV_JAL: j is jal x0, jal is
+    # jal ra, and jal rd names its link register; the field is left zero for
+    # the linker
+    val foo: res[intern.StrId, A.Error] = intern.add(?interner, "foo");
+    if (sel foo.err) { ret 1; }
+    asm_text(?st, ?f, ?labels, "j foo");
+    if (isa_encode.word_read(?st.buf, 24) != 0x0000006F) { bad = 1; }
+    if (st.reloc_count != 5)                             { bad = 1; }
+    or {
+        if (st.relocs[4].kind != target_of.RK_JAL20)    { bad = 1; }
+        if (st.relocs[4].offset != 24)                  { bad = 1; }
+        if (!intern.str_same(st.relocs[4].sym, foo.ok)) { bad = 1; }
+        if (st.relocs[4].addend != 0)                   { bad = 1; }
+    }
+
+    asm_text(?st, ?f, ?labels, "jal foo");
+    if (isa_encode.word_read(?st.buf, 28) != 0x000000EF) { bad = 1; }
+    if (st.reloc_count != 6)                             { bad = 1; }
+    or {
+        if (st.relocs[5].kind != target_of.RK_JAL20)    { bad = 1; }
+        if (st.relocs[5].offset != 28)                  { bad = 1; }
+        if (!intern.str_same(st.relocs[5].sym, foo.ok)) { bad = 1; }
+    }
+
+    asm_text(?st, ?f, ?labels, "jal t0, foo");
+    if (isa_encode.word_read(?st.buf, 32) != 0x000002EF) { bad = 1; }
+    if (st.reloc_count != 7)                             { bad = 1; }
+    or {
+        if (st.relocs[6].kind != target_of.RK_JAL20) { bad = 1; }
+        if (st.relocs[6].offset != 32)               { bad = 1; }
+    }
+
+    # a numeric local still resolves in place, and records no relocation
+    asm_text(?st, ?f, ?labels, "j 1f");
+    asm_text(?st, ?f, ?labels, "1:");
+    if (isa_encode.word_read(?st.buf, 36) != 0x0040006F) { bad = 1; }
+    if (st.reloc_count != 7)                             { bad = 1; }
+
+    # a conditional branch has no branch relocation kind, so a symbol there is
+    # refused at the asm site, and a malformed local is named as one
+    val br: err[fail.Fail] = asm_text(?st, ?f, ?labels, "beq a0, a1, foo");
+    if (!sel br.err) { bad = 1; }
+    or (sel br.err) {
+        if (!str_contains(fail.describe(br.err), "conditional branch to a symbol is unsupported")) { bad = 1; }
+    }
+    val bz: err[fail.Fail] = asm_text(?st, ?f, ?labels, "beqz a0, foo");
+    if (!sel bz.err) { bad = 1; }
+    val ml: err[fail.Fail] = asm_text(?st, ?f, ?labels, "j 1x");
+    if (!sel ml.err) { bad = 1; }
+    or (sel ml.err) {
+        if (!str_contains(fail.describe(ml.err), "must be 'Nf' or 'Nb'")) { bad = 1; }
+    }
+    val ns: err[fail.Fail] = asm_text(?st, ?f, ?labels, "j foo+4");
+    if (!sel ns.err)         { bad = 1; }
+    if (st.reloc_count != 7) { bad = 1; }
+
+    val ur: err[fail.Fail] = asm_text(?st, ?f, ?labels, "frobnicate a0, a1");
+    if (!sel ur.err) { bad = 1; }
+    or (sel ur.err) {
+        if (!str_contains(fail.describe(ur.err), "unknown riscv inline-asm instruction")) { bad = 1; }
+    }
+
+    isa_asm.labels_dnit(?labels);
+    isa_encode.buf_dnit(?st.buf);
+    map.dnit[u64, isa_encode.RelocPairSite](?st.reloc_pair_sites);
+    ret bad;
+}
+
+test inline_asm__atomics {
+    var bad:      i32 = 0;
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+
+    asm_text(?st, ?f, ?labels, "lr.w a0, (a1)");
+    asm_text(?st, ?f, ?labels, "lr.d a0, (a1)");
+    asm_text(?st, ?f, ?labels, "sc.w a0, a2, (a1)");
+    asm_text(?st, ?f, ?labels, "sc.d a0, a2, (a1)");
+    asm_text(?st, ?f, ?labels, "amoswap.w a0, a2, (a1)");
+    asm_text(?st, ?f, ?labels, "amoadd.d a0, a2, (a1)");
+    asm_text(?st, ?f, ?labels, "lr.w.aq a0, (a1)");
+    asm_text(?st, ?f, ?labels, "sc.d.rl a0, a2, (a1)");
+    asm_text(?st, ?f, ?labels, "amoadd.w.aqrl a0, a2, (a1)");
+    asm_text(?st, ?f, ?labels, "amomaxu.d.aqrl a0, a2, (a1)");
+    asm_text(?st, ?f, ?labels, "pause");
+
+    if (isa_encode.word_read(?st.buf, 0) != 0x1005A52F)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 4) != 0x1005B52F)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 8) != 0x18C5A52F)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 12) != 0x18C5B52F) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 16) != 0x08C5A52F) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 20) != 0x00C5B52F) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 24) != 0x1405A52F) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 28) != 0x1AC5B52F) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 32) != 0x06C5A52F) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 36) != 0xE6C5B52F) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 40) != 0x0100000F) { bad = 1; }
+
+    val dr: err[fail.Fail] = asm_text(?st, ?f, ?labels, "lr.d a0, 8(a1)");
+    if (!sel dr.err) { bad = 1; }
+    or (sel dr.err) {
+        if (!str_contains(fail.describe(dr.err), "no displacement")) { bad = 1; }
+    }
+
+    val ur: err[fail.Fail] = asm_text(?st, ?f, ?labels, "amobogus.q a0, a2, (a1)");
+    if (!sel ur.err) { bad = 1; }
+    or (sel ur.err) {
+        if (!str_contains(fail.describe(ur.err), "unknown riscv inline-asm instruction")) { bad = 1; }
+    }
+
+    val settled: usize          = st.buf.bytes.len;
+    val br:      err[fail.Fail] = asm_text(?st, ?f, ?labels, "amoadd.d.aqrl a0, a2, {slot}");
+    if (!sel br.err) { bad = 1; }
+    or (sel br.err) {
+        if (!str_contains(fail.describe(br.err), "unresolved '{name}'")) { bad = 1; }
+    }
+    var assembled: err[fail.Fail] = asm_text(?st, ?f, ?labels, "lr.d a0, {slot}");
+    if (!sel assembled.err) { bad = 1; }
+    assembled = asm_text(?st, ?f, ?labels, "ld a0, {slot}");
+    if (!sel assembled.err) { bad = 1; }
+    assembled = asm_text(?st, ?f, ?labels, "sd a0, {slot}");
+    if (!sel assembled.err)          { bad = 1; }
+    if (st.buf.bytes.len != settled) { bad = 1; }
+
+    isa_asm.labels_dnit(?labels);
+    isa_encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+test inline_asm__csr_forms {
+    var bad:      i32 = 0;
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+
+    asm_text(?st, ?f, ?labels, "csrrw a0, mstatus, a1");
+    asm_text(?st, ?f, ?labels, "csrrs a0, mstatus, a1");
+    asm_text(?st, ?f, ?labels, "csrrwi a0, mstatus, 5");
+    asm_text(?st, ?f, ?labels, "csrr a0, mstatus");
+    asm_text(?st, ?f, ?labels, "csrw mstatus, a1");
+    asm_text(?st, ?f, ?labels, "csrwi mstatus, 5");
+    asm_text(?st, ?f, ?labels, "rdtime a0");
+
+    if (isa_encode.word_read(?st.buf, 0) != 0x30059573)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 4) != 0x3005A573)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 8) != 0x3002D573)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 12) != 0x30002573) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 16) != 0x30059073) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 20) != 0x3002D073) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 24) != 0xC0102573) { bad = 1; }
+
+    isa_asm.labels_dnit(?labels);
+    isa_encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+test inline_asm__csr_names {
+    var bad:      i32 = 0;
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+
+    val r1: err[fail.Fail] = asm_text(?st, ?f, ?labels, "csrr a0, sstatus");
+    val r2: err[fail.Fail] = asm_text(?st, ?f, ?labels, "csrr a0, satp");
+    val r3: err[fail.Fail] = asm_text(?st, ?f, ?labels, "csrr a0, mepc");
+    val r4: err[fail.Fail] = asm_text(?st, ?f, ?labels, "csrr a0, mhartid");
+    val r5: err[fail.Fail] = asm_text(?st, ?f, ?labels, "csrr a0, cycle");
+    if (sel r1.err) { bad = 1; }
+    if (sel r2.err) { bad = 1; }
+    if (sel r3.err) { bad = 1; }
+    if (sel r4.err) { bad = 1; }
+    if (sel r5.err) { bad = 1; }
+
+    if (isa_encode.word_read(?st.buf, 0) != 0x10002573)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 4) != 0x18002573)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 8) != 0x34102573)  { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 12) != 0xF1402573) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 16) != 0xC0002573) { bad = 1; }
+
+    val settled: usize = st.buf.bytes.len;
+    asm_text(?st, ?f, ?labels, "csrr a0, MTVEC");
+    asm_text(?st, ?f, ?labels, "csrr a0, MtVeC");
+    asm_text(?st, ?f, ?labels, "csrr a0, 0xC01");
+    if (isa_encode.word_read(?st.buf, settled) != 0x30502573)     { bad = 1; }
+    if (isa_encode.word_read(?st.buf, settled + 4) != 0x30502573) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, settled + 8) != 0xC0102573) { bad = 1; }
+
+    isa_asm.labels_dnit(?labels);
+    isa_encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+test inline_asm__csr_refusals {
+    var bad:      i32 = 0;
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+
+    val nr: err[fail.Fail] = asm_text(?st, ?f, ?labels, "csrr a0, frobnicate");
+    if (!sel nr.err) { bad = 1; }
+    or (sel nr.err) {
+        if (!str_contains(fail.describe(nr.err), "unsupported inline-asm CSR")) { bad = 1; }
+    }
+
+    val or_: err[fail.Fail] = asm_text(?st, ?f, ?labels, "csrr a0, 0x1000");
+    if (!sel or_.err) { bad = 1; }
+    or (sel or_.err) {
+        if (!str_contains(fail.describe(or_.err), "unsupported inline-asm CSR")) { bad = 1; }
+    }
+
+    val ir: err[fail.Fail] = asm_text(?st, ?f, ?labels, "csrrwi a0, mstatus, 32");
+    if (!sel ir.err) { bad = 1; }
+    or (sel ir.err) {
+        if (!str_contains(fail.describe(ir.err), "immediate must be 0-31")) { bad = 1; }
+    }
+    val iw: err[fail.Fail] = asm_text(?st, ?f, ?labels, "csrwi mstatus, 32");
+    if (!sel iw.err) { bad = 1; }
+    or (sel iw.err) {
+        if (!str_contains(fail.describe(iw.err), "immediate must be 0-31")) { bad = 1; }
+    }
+
+    if (st.buf.bytes.len != 0) { bad = 1; }
+
+    isa_asm.labels_dnit(?labels);
+    isa_encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+test emit_asm__renders_csr {
+    var bad:      i32 = 0;
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+
+    var w: io_writer.Writer;
+    riscv_printer.test_sink_writer(?w);
+    riscv_printer.test_sink_reset();
+    var sink: isa_encode.AsmSink = isa_encode.sink_init(?w, ?interner);
+    st.buf.asm = ?sink;
+
+    val r1: err[fail.Fail] = asm_text(?st, ?f, ?labels, "csrrw a0, mstatus, a1");
+    if (sel r1.err) { bad = 1; }
+    val r2: err[fail.Fail] = asm_text(?st, ?f, ?labels, "rdtime a1");
+    if (sel r2.err) { bad = 1; }
+
+    if (isa_encode.note_inst_count(?st.buf) * riscv_emit.WORD_SIZE != st.buf.bytes.len::u32) { bad = 1; }
+
+    val rr: err[fail.Fail] = riscv_printer.render_notes(?st.buf);
+    if (sel rr.err) { bad = 1; }
+    if (sel rr.ok) {
+        val text: str        = riscv_printer.test_sink_text();
+        val ci:   opt[usize] = str_index_of(text, "csrrw a0, 768, a1");
+        val ti:   opt[usize] = str_index_of(text, "csrrs a1, 3073, zero");
+        if (sel ci.none) { ret 99; }
+        if (sel ci.some) {
+            if (sel ti.some) {
+                if (ci.some >= ti.some) { bad = 1; }
+            }
+        }
+    }
+
+    isa_asm.labels_dnit(?labels);
+    isa_encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# an asm block's label definitions are listed where the block makes them,
+# so the `1b` and `2f` beside them name a label the listing defines
+test emit_asm__renders_local_labels {
+    var bad:      i32 = 0;
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+
+    var w: io_writer.Writer;
+    riscv_printer.test_sink_writer(?w);
+    riscv_printer.test_sink_reset();
+    var sink: isa_encode.AsmSink = isa_encode.sink_init(?w, ?interner);
+    st.buf.asm = ?sink;
+
+    val r1: err[fail.Fail] = asm_text(?st, ?f, ?labels, "1:\n addi a0, a0, -1\n bnez a0, 1b\n j 2f\n2:\n nop");
+    if (sel r1.err) { bad = 1; }
+
+    val rr: err[fail.Fail] = riscv_printer.render_notes(?st.buf);
+    if (sel rr.err) { bad = 1; }
+    val text: str = riscv_printer.test_sink_text();
+    if (!str_contains(text, "1:\n  addi a0, a0, -1\n  bne a0, zero, 1b\n")) { bad = 2; }
+    if (!str_contains(text, "2f\n2:\n  addi zero, zero, 0\n"))              { bad = 3; }
+
+    isa_asm.labels_dnit(?labels);
+    isa_encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+test grammar__rows_read_the_table {
+    var bad: i32   = 0;
+    var i:   usize = 0;
+    for (i < riscv_mnemonic.ROW_COUNT) {
+        val m:  *isa_asm.Mnemonic = ?riscv_mnemonic.ROWS[i];
+        val op: inst.MachOp       = m.code::inst.MachOp;
+        if (!inst.in_catalog(op)) { bad = 1; }
+        # a row that is the instruction itself carries the table's spelling
+        val pat: u16 = riscv_mnemonic.pattern(m.flags);
+        if (pat == riscv_mnemonic.PATTERN_RRR || pat == riscv_mnemonic.PATTERN_RRI || pat == riscv_mnemonic.PATTERN_SHIFT || pat == riscv_mnemonic.PATTERN_LOAD || pat == riscv_mnemonic.PATTERN_STORE
+            || pat == riscv_mnemonic.PATTERN_UIMM || pat == riscv_mnemonic.PATTERN_BRANCH || pat == riscv_mnemonic.PATTERN_JAL || pat == riscv_mnemonic.PATTERN_JALR
+            || pat == riscv_mnemonic.PATTERN_CSR || pat == riscv_mnemonic.PATTERN_CSR_I || pat == riscv_mnemonic.PATTERN_ECALL || pat == riscv_mnemonic.PATTERN_EBREAK
+            || pat == riscv_mnemonic.PATTERN_FENCE || pat == riscv_mnemonic.PATTERN_PAUSE) {
+            val spelled: opt[str] = inst.mnemonic(op);
+            if (sel spelled.some) {
+                if (!str_equals(m.name, spelled.some)) { bad = 2; }
+            }
+            or { bad = 2; }
+        }
+        i = i + 1;
+    }
+
+    # the amo decoder reads the same spellings, with the ordering suffix split off
+    var m: isa_asm.Mnemonic;
+    var n: usize = 0;
+    if (!decode_amo("amoadd.w.aqrl a0, a1, (a2)", 0, 26, ?m, ?n) || m.code != inst.AMOADD_W::u32
+        || riscv_mnemonic.pattern(m.flags) != riscv_mnemonic.PATTERN_AMO || (m.flags & (riscv_mnemonic.FLAG_AQ | riscv_mnemonic.FLAG_RL)) != (riscv_mnemonic.FLAG_AQ | riscv_mnemonic.FLAG_RL) || n != 13) { bad = 3; }
+    if (!decode_amo("lr.d a0, (a2)", 0, 13, ?m, ?n) || m.code != inst.LR_D::u32 || riscv_mnemonic.pattern(m.flags) != riscv_mnemonic.PATTERN_AMO_LR)        { bad = 4; }
+    if (!decode_amo("sc.w.rl a0, a1, (a2)", 0, 20, ?m, ?n) || m.code != inst.SC_W::u32 || m.flags != (riscv_mnemonic.PATTERN_AMO | riscv_mnemonic.FLAG_RL)) { bad = 5; }
+    if (decode_amo("amoadd.x a0, a1, (a2)", 0, 21, ?m, ?n))                                                                                                 { bad = 6; }
+    if (decode_amo("amonot.w a0, a1, (a2)", 0, 21, ?m, ?n))                                                                                                 { bad = 7; }
+    ret bad;
+}
+
+test asm_clobbers__byte_accounting {
+    var bad: i32 = 0;
+    var gp:  u32 = 0;
+    var fp:  u32 = 0;
+
+    isa_asm.clobbers(grammar, "fence rw, rw", ?gp, ?fp);
+    if (gp != 0xFFFFFFFF) { bad = 1; }
+
+    gp = 0;
+    fp = 0;
+    isa_asm.clobbers(grammar, "addi a0, a1, 1 junk", ?gp, ?fp);
+    if (gp != 0xFFFFFFFF) { bad = 1; }
+
+    gp = 0;
+    fp = 0;
+    isa_asm.clobbers(grammar, "  addi a0 , a1 , 1  ;  mv a2, a3  ", ?gp, ?fp);
+    if (gp != ((1::u32 << 10) | (1::u32 << 12))) { bad = 1; }
+    ret bad;
+}
+
+test inline_asm__relocation_modifiers {
+    var bad:      i32 = 0;
+    var st:       isa_encode.EncodeState;
+    var alloc:    A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: isa_asm.Labels;
+    isa_asm.labels_init(?labels, ?alloc);
+    var f: lang_mir.MirFunction;
+
+    val hr: err[fail.Fail] = asm_text(?st, ?f, ?labels, "auipc a0, %pcrel_hi(foo)");
+    if (sel hr.err) { bad = 1; }
+    val lr: err[fail.Fail] = asm_text(?st, ?f, ?labels, "addi a0, a0, %pcrel_lo(foo)");
+    if (sel lr.err)                                     { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 0) != 0x00000517) { bad = 1; }
+    if (isa_encode.word_read(?st.buf, 4) != 0x00050513) { bad = 1; }
+    if (st.reloc_count != 2)                            { bad = 1; }
+    or {
+        if (st.relocs[0].kind != target_of.RK_PCREL_HI20)   { bad = 1; }
+        if (st.relocs[1].kind != target_of.RK_PCREL_LO12_I) { bad = 1; }
+    }
+
+    val gr: err[fail.Fail] = asm_text(?st, ?f, ?labels, "auipc a0, %got_pcrel_hi(foo)");
+    if (sel gr.err) { bad = 2; }
+    val gl: err[fail.Fail] = asm_text(?st, ?f, ?labels, "addi a0, a0, %pcrel_lo(foo)");
+    if (sel gl.err)                                     { bad = 2; }
+    if (isa_encode.word_read(?st.buf, 8) != 0x00000517) { bad = 2; }
+    if (st.reloc_count != 4)                            { bad = 2; }
+    or {
+        if (st.relocs[2].kind != target_of.RK_GOT_PCREL_HI20) { bad = 2; }
+        if (st.relocs[3].kind != target_of.RK_PCREL_LO12_I)   { bad = 2; }
+        if (st.relocs[3].pair != 3)                           { bad = 2; }
+    }
+
+    val br: err[fail.Fail] = asm_text(?st, ?f, ?labels, "auipc a0, %bogus(foo)");
+    if (!sel br.err) { bad = 1; }
+    or (sel br.err) {
+        if (!str_contains(fail.describe(br.err), "unsupported riscv64 inline-asm relocation modifier")) { bad = 1; }
+    }
+
+    isa_asm.labels_dnit(?labels);
+    isa_encode.buf_dnit(?st.buf);
+    if (st.relocs != nil && st.reloc_cap > 0) {
+        A.deallocate[isa_encode.PendingReloc](?alloc, st.relocs, st.reloc_cap::usize);
+    }
+    map.dnit[u64, isa_encode.RelocPairSite](?st.reloc_pair_sites);
+    ret bad;
+}
+
+#[testing]
+pub fun t_refused(r: err[fail.Fail], buf: *isa_encode.ByteBuf) bool {
+    if (!sel r.err) { ret false; }
+    ret buf.bytes.len == 0;
+}
+
+#[testing]
+pub fun t_accepted(r: err[fail.Fail], buf: *isa_encode.ByteBuf) bool {
+    if (sel r.err) { ret false; }
+    ret buf.bytes.len > 0;
+}
+
+test asm_ct_scan__a_spill_does_not_launder_a_secret {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var bad: i32 = 0;
+
+    var names: [1]ct.AsmSecret;
+    names[0] = ct.asm_secret_value("r");
+
+    val addr:    str                = "ld a0, {r}\nsd a0, 0(sp)\nld a1, 0(sp)\nld a2, 0(a1)";
+    var scanned: err[ct.AsmRefusal] = isa_asm.ct_scan(grammar, addr, ?names[0], 1, ct.mul_mask_none(), false);
+    if (!sel scanned.err) { bad = bad + 1; }
+    scanned = isa_asm.ct_scan(grammar, addr, ?names[0], 0, ct.mul_mask_none(), false);
+    if (sel scanned.err) { bad = bad + 2; }
+
+    val lat: str = "ld a0, {r}\nsd a0, 0(sp)\nld a1, 0(sp)\ndiv a2, a3, a1";
+    scanned = isa_asm.ct_scan(grammar, lat, ?names[0], 1, ct.mul_mask_none(), false);
+    if (!sel scanned.err) { bad = bad + 4; }
+    scanned = isa_asm.ct_scan(grammar, lat, ?names[0], 0, ct.mul_mask_none(), false);
+    if (sel scanned.err) { bad = bad + 8; }
+
+    ret bad;
+}
+
+# a `*^T` binding is a public address whose loads produce a secret; a `^T` binding is a
+# secret value, so it is a secret address
+test asm_ct_scan__a_pointer_to_a_secret_is_a_public_address_and_a_secret_load {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var bad: i32 = 0;
+
+    var binds: [2]ct.AsmSecret;
+    binds[0] = ct.asm_secret_pointee("p");
+    binds[1] = ct.asm_secret_value("k");
+
+    if (isa_asm.t_scan_refused(grammar, "ld a0, {p}\nlw a1, 0(a0)\naddi a1, a1, 1\nsw a1, 0(a0)", ?binds[0], 2, ct.mul_mask_none(), false)) { bad = bad + 1; }
+
+    val secret_addr: err[ct.AsmRefusal] = isa_asm.ct_scan(grammar, "ld a0, {k}\nlw a1, 0(a0)", ?binds[0], 2, ct.mul_mask_none(), false);
+    if (sel secret_addr.err) {
+        if (!str_contains(secret_addr.err.message, "addresses memory with a secret value")) { bad = bad + 2; }
+    }
+    or { bad = bad + 2; }
+
+    val branch: err[ct.AsmRefusal] = isa_asm.ct_scan(grammar, "ld a0, {p}\nlw a1, 0(a0)\nbeq a1, a2, 1f\n1:\nnop", ?binds[0], 2, ct.mul_mask_none(), false);
+    if (sel branch.err) {
+        if (!str_contains(branch.err.message, "branches on a secret value")) { bad = bad + 4; }
+    }
+    or                                                                                                                                             { bad = bad + 4; }
+    if (!isa_asm.t_scan_refused(grammar, "ld a0, {p}\nld a1, 0(a0)\nld a2, 0(a1)", ?binds[0], 2, ct.mul_mask_none(), false))                       { bad = bad + 8; }
+    if (!isa_asm.t_scan_refused(grammar, "ld a0, {p}\nmv a3, a0\nlw a1, 0(a3)\nbeq a1, a2, 1f\n1:\nnop", ?binds[0], 2, ct.mul_mask_none(), false)) { bad = bad + 16; }
+
+    if (isa_asm.t_scan_refused(grammar, "ld a0, {p}\nlw a1, 0(a0)\nbeq a1, a2, 1f\n1:\nnop", ?binds[0], 0, ct.mul_mask_none(), false))                              { bad = bad + 32; }
+    if (!isa_asm.t_scan_refused(grammar, "ld a0, {p}\nsd a0, 0(sp)\nld a3, 0(sp)\nlw a1, 0(a3)\nbeq a1, a2, 1f\n1:\nnop", ?binds[0], 2, ct.mul_mask_none(), false)) { bad = bad + 64; }
+
+    ret bad;
+}
+
+#[testing]
+fun t_mask_of(op: ct.CtMulOp, width: u8) ct.CtMulMask {
+    var m: ct.CtMulMask = ct.mul_mask_none();
+    ct.mul_mask_add(?m, ct.mul_cell(op, width, false));
+    ret m;
+}
+
+#[testing]
+fun t_scan_ok(body: str, names: *ct.AsmSecret, mul: ct.CtMulMask, alloc: *A.Allocator) bool {
+    val r: err[ct.AsmRefusal] = isa_asm.ct_scan(grammar, body, names, 1, mul, false);
+    ret sel r.ok;
+}
+
+# each multiply asks for its own cell: the high halves by signedness, and
+# mulw the low half at 32 bits whatever the register width
+test asm_ct_scan__a_secret_multiply_needs_its_exact_cell {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var names: [1]ct.AsmSecret;
+    names[0] = ct.asm_secret_value("r");
+    val mul:    str          = "ld a1, {r}\nmul a0, a1, a2";
+    val mulh:   str          = "ld a1, {r}\nmulh a0, a1, a2";
+    val mulhu:  str          = "ld a1, {r}\nmulhu a0, a1, a2";
+    val mulhsu: str          = "ld a1, {r}\nmulhsu a0, a1, a2";
+    val mulw:   str          = "ld a1, {r}\nmulw a0, a1, a2";
+    val low64:  ct.CtMulMask = t_mask_of(ct.CT_MUL_LOW, 64);
+    if (t_scan_ok(mul, ?names[0], ct.mul_mask_none(), ?alloc))                   { ret 1; }
+    if (!t_scan_ok(mul, ?names[0], low64, ?alloc))                               { ret 2; }
+    if (!t_scan_ok(mulh, ?names[0], t_mask_of(ct.CT_MUL_HIGH_S, 64), ?alloc))    { ret 3; }
+    if (t_scan_ok(mulh, ?names[0], t_mask_of(ct.CT_MUL_HIGH_U, 64), ?alloc))     { ret 4; }
+    if (!t_scan_ok(mulhu, ?names[0], t_mask_of(ct.CT_MUL_HIGH_U, 64), ?alloc))   { ret 5; }
+    if (!t_scan_ok(mulhsu, ?names[0], t_mask_of(ct.CT_MUL_HIGH_SU, 64), ?alloc)) { ret 6; }
+    if (t_scan_ok(mulhsu, ?names[0], t_mask_of(ct.CT_MUL_HIGH_S, 64), ?alloc))   { ret 7; }
+    if (t_scan_ok(mulw, ?names[0], low64, ?alloc))                               { ret 8; }
+    if (!t_scan_ok(mulw, ?names[0], t_mask_of(ct.CT_MUL_LOW, 32), ?alloc))       { ret 9; }
+    ret 0;
+}
+
+test asm_ct_scan__register_indirect_transfer_on_secret_refused {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var names: [1]ct.AsmSecret;
+    names[0] = ct.asm_secret_value("r");
+
+    val jrt: str = "ld a1, {r}\njr a1";
+    if (!isa_asm.t_scan_refused(grammar, jrt, ?names[0], 1, ct.mul_mask_none(), false)) { ret 1; }
+    if (isa_asm.t_scan_refused(grammar, jrt, ?names[0], 0, ct.mul_mask_none(), false))  { ret 2; }
+
+    val jalrt: str = "ld a1, {r}\njalr ra, a1, 0";
+    if (!isa_asm.t_scan_refused(grammar, jalrt, ?names[0], 1, ct.mul_mask_none(), false)) { ret 3; }
+    if (isa_asm.t_scan_refused(grammar, jalrt, ?names[0], 0, ct.mul_mask_none(), false))  { ret 4; }
+
+    val rett: str = "ld ra, {r}\nret";
+    if (!isa_asm.t_scan_refused(grammar, rett, ?names[0], 1, ct.mul_mask_none(), false)) { ret 5; }
+    if (isa_asm.t_scan_refused(grammar, rett, ?names[0], 0, ct.mul_mask_none(), false))  { ret 6; }
+
+    val pubjr: str = "li a1, 5\njr a1";
+    if (isa_asm.t_scan_refused(grammar, pubjr, ?names[0], 1, ct.mul_mask_none(), false)) { ret 7; }
+
+    val ordinaryret: str = "ld a0, {r}\nret";
+    if (isa_asm.t_scan_refused(grammar, ordinaryret, ?names[0], 1, ct.mul_mask_none(), false)) { ret 8; }
+
+    val direct: str = "j 1f\n1:";
+    if (isa_asm.t_scan_refused(grammar, direct, ?names[0], 1, ct.mul_mask_none(), false)) { ret 9; }
+
+    # a direct symbol transfer is the numeric-label form's class: not register
+    # conditioned, so a secret in the block does not refuse it
+    val direct_sym: str = "ld a0, {r}\nj some_symbol";
+    if (isa_asm.t_scan_refused(grammar, direct_sym, ?names[0], 1, ct.mul_mask_none(), false)) { ret 10; }
+    val jal_sym: str = "ld a0, {r}\njal some_symbol";
+    if (isa_asm.t_scan_refused(grammar, jal_sym, ?names[0], 1, ct.mul_mask_none(), false)) { ret 11; }
+
+    ret 0;
+}
+
+# the listing is rendered from the notes once the function is final, so a
+# label definition is a note of its own, at the offset it labels
+fun asm_note_label(st: *isa_encode.EncodeState, number: u32) err[fail.Fail] {
+    var note: isa_encode.AsmNote = isa_encode.note_blank();
+    note.kind = isa_encode.ASM_NOTE_LABEL;
+    note.off  = st.buf.bytes.len::u32;
+    note.id   = number;
+    ret isa_encode.note_push(?st.buf, ?note);
+}
+
+test asm_returns__trap_ends_control {
+    var bad: i32 = 0;
+
+    if (isa_asm.returns(grammar, "li a7, 94\necall\nebreak")) { bad = 1; }
+    if (isa_asm.returns(grammar, "ebreak"))                   { bad = 1; }
+
+    if (!isa_asm.returns(grammar, "li a7, 64\necall")) { bad = 1; }
+    if (!isa_asm.returns(grammar, "nop"))              { bad = 1; }
+    if (!isa_asm.returns(grammar, "ebreak\nnop"))      { bad = 1; }
+    if (!isa_asm.returns(grammar, "1:\nebreak"))       { bad = 1; }
+    if (!isa_asm.returns(grammar, ".word 0x00100073")) { bad = 1; }
+    if (!isa_asm.returns(grammar, "this is not asm"))  { bad = 1; }
+    if (!isa_asm.returns(grammar, ""))                 { bad = 1; }
+
+    ret bad;
+}
