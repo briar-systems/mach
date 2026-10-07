@@ -45,6 +45,13 @@ pub val FIELD_SEL_CODE:         u8 = 5
 pub val FIELD_SEL_TYPE_BY_NAME: u8 = 6
 ```
 
+## val COMPTIME_CASE_NO_PAYLOAD_MSG
+
+```mach
+pub val COMPTIME_CASE_NO_PAYLOAD_MSG: str =
+"this case has no payload, so it has no `.type` or `.offset`
+```
+
 ## val TYPE_QUERY_IS_RECORD
 
 ```mach
@@ -186,7 +193,8 @@ expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure
 pub fun semantic_type_capabilities[T](
 member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 type_: fun(*T, ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail],
-field: fun(*T, u32, u32, u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
+types: fun(*T) *type.TypeInterner,
+offset: fun(*T, u32, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 query: fun(*T, u32, u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 layout: fun(*T, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 cast: fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail],
@@ -201,7 +209,8 @@ expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure
 pub fun lowering_capabilities[T](
 member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 type_: fun(*T, ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail],
-field: fun(*T, u32, u32, u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
+types: fun(*T) *type.TypeInterner,
+offset: fun(*T, u32, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 query: fun(*T, u32, u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 layout: fun(*T, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 cast: fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail],
@@ -233,4 +242,13 @@ pub fun capabilities_have_types[T](ctx: *T, caps: PhaseCapabilities[T]) bool;
 ```mach
 pub fun capabilities_cast[T](ctx: *T, caps: PhaseCapabilities[T]) bool;
 ```
+
+## fun field_of
+
+```mach
+pub fun field_of[T](ctx: *T, caps: PhaseCapabilities[T], owner: u32, index: u32, pick: u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
+```
+
+what a field descriptor answers about field `index` of `owner`, `pick` naming the member
+asked; every answer but the offset reads the type store, and the offset is the phase's
 

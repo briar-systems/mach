@@ -999,12 +999,13 @@ pub val COMPTIME_DESCRIPTOR_LAYOUT_MSG: str =
 "this descriptor's offset has no answer: the layout of its owning type could not be determined"
 ```
 
-## val COMPTIME_CASE_NO_PAYLOAD_MSG
+## fwd comptime_capability.COMPTIME_CASE_NO_PAYLOAD_MSG
 
 ```mach
-pub val COMPTIME_CASE_NO_PAYLOAD_MSG: str =
-"this case has no payload, so it has no `.type` or `.offset`
+fwd comptime_capability.COMPTIME_CASE_NO_PAYLOAD_MSG
 ```
+
+forwards [`mach.lang.fe.comptime.capability.COMPTIME_CASE_NO_PAYLOAD_MSG`](comptime/capability.md#val-comptime_case_no_payload_msg)
 
 ## fun evaluate
 
