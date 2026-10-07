@@ -358,7 +358,7 @@ identity even when direct calls are inlined.
 Release optimization makes small ordinary helper bodies available across source
 modules without emitting extra definitions. A helper is small when its body has
 fewer than 25 live instructions after promotion, debug annotations excluded, so
-`-g` never moves the decision. Extraction, import and per-caller heuristic expansion each
+`debug = true` never moves the decision. Extraction, import and per-caller heuristic expansion each
 have a limit of 1024 copied IR instructions and 256 KiB of owned payload. An
 `inline` function is expanded at every direct call site in the same module
 without charging that budget, so the outcome never depends on what else the

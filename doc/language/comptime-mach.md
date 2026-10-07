@@ -38,9 +38,10 @@ $mach.build.extensions.<name>   # live; 1 when the target selects that instructi
 spellings. A riscv isa string such as `rv32imc` answers `$mach.arch.riscv32`.
 
 `$mach.build.mode` answers which pipeline the build runs, whatever the profile is
-named: `$mach.mode.release` when the selected profile's `opt` is 1 or 2, and
-`$mach.mode.debug` when it is 0. A `-O0` or `-O2` on the command line overrides
-the profile's `opt` and the mode with it.
+named: `$mach.mode.release` when the build runs the optimization passes (the
+selected profile's `optimize = true`), and `$mach.mode.debug` when it does not. A
+`-O` or `--no-optimize` on the command line overrides the profile's `optimize`
+and the mode with it.
 
 The members above are the whole subtree, and no manifest key adds one. The
 `extensions` members are the selected isa's own vocabulary, not the manifest's. A

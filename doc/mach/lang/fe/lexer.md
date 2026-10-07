@@ -12,6 +12,9 @@ pub rec TokenStream;
 pub fun tokenize(source: str, alloc: *A.Allocator, file_id: lang_source.FileId) res[TokenStream, fail.Fail];
 ```
 
+splits `source`, a NUL-terminated text, into tokens, the lex errors met, and the comment
+runs a later doc lookup reads; the stream borrows `source` and owns the rest
+
 ## fun dnit
 
 ```mach

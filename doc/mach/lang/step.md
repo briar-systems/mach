@@ -13,7 +13,7 @@ pub fun run(a: *A.Allocator, p: *project.Project) err[fail.Fail];
 
 run the declaring project's prerequisite steps for the configured cell, in its
 own directory. a dependency's cell runs them as a dependency step runs, homed
-in the root's output tree through an absolute `{project.out}`
+in the root's output tree through an absolute `{project.work}`
 
 ## fun dependency_out_home
 
