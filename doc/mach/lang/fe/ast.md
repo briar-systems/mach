@@ -21,6 +21,14 @@ pub fun init(a: *A.Allocator, file_id: lang_source.FileId) Ast;
 pub fun dnit(a: *Ast);
 ```
 
+## fun copy
+
+```mach
+pub fun copy(src: *Ast, alloc: *A.Allocator) res[Ast, fail.Fail];
+```
+
+an owned copy of `src` from `alloc`, every node at the id it has in `src`
+
 ## fun table_push
 
 ```mach
