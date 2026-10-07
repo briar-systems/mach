@@ -95,6 +95,86 @@ pub val SKIP_SCALAR:    u32 = 0x10
 pub val SKIP_OBLIVIOUS: u32 = 0x20
 ```
 
+## def Class
+
+```mach
+pub def Class: u8
+```
+
+whether a build may leave a pass out
+
+## val CLASS_LEGALIZATION
+
+```mach
+pub val CLASS_LEGALIZATION: Class = 0
+```
+
+a rewrite every build needs, whatever it optimizes: never skipped
+
+## val CLASS_OPTIMIZATION
+
+```mach
+pub val CLASS_OPTIMIZATION: Class = 1
+```
+
+a rewrite that only improves the code: `optimize` selects it, `pass` adds it
+and `skip` removes it
+
+## fun class_name
+
+```mach
+pub fun class_name(c: Class) str;
+```
+
+what a class is called where a build names it
+
+## def Relax
+
+```mach
+pub def Relax: u32
+```
+
+the departures from exact semantics a build permits, one bit each
+
+## val RELAX_NONE
+
+```mach
+pub val RELAX_NONE: Relax = 0
+```
+
+## val RELAX_FLOAT_REASSOC
+
+```mach
+pub val RELAX_FLOAT_REASSOC: Relax = 1
+```
+
+floating-point additions and multiplications may be reassociated, as a
+vector reduction does
+
+## fun relax_named
+
+```mach
+pub fun relax_named(name: str) opt[Relax];
+```
+
+the permission `name` names, none for a name no row declares
+
+## fun relax_count
+
+```mach
+pub fun relax_count() usize;
+```
+
+how many permissions a `relax` set may name
+
+## fun relax_name_at
+
+```mach
+pub fun relax_name_at(i: usize) str;
+```
+
+the name of permission `i`, in declaration order
+
 ## rec Pass
 
 ```mach
