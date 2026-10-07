@@ -103,11 +103,12 @@ pub rec ResolvedProfile;
 the profile a selection resolves to, copied out of its `ProfileDef`
 
 name: the profile's name
-opt: as `ProfileDef`
+optimize: as `ProfileDef`
+pass: as `ProfileDef`, borrowed from the manifest
+skip: as `ProfileDef`, borrowed from the manifest
+relax: as `ProfileDef`, borrowed from the manifest
 debug: as `ProfileDef`
 simd: as `ProfileDef`
-vectorize: as `ProfileDef`
-float_reassoc: as `ProfileDef`
 allow: as `ProfileDef`
 
 ## fun resolve_target
