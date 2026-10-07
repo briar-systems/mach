@@ -155,6 +155,8 @@ pub val EMBED_PATH_ESCAPED:     EmbedPathKind = 3
 pub rec EmbedPath;
 ```
 
+artifact: the artifact whose output a resolved template names, nil when it names none
+
 ## rec Bindings
 
 ```mach

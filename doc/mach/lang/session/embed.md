@@ -72,11 +72,23 @@ the returned `*EmbedFile` is stable until `dnit`: the store never moves an
 entry when more files are added, so the pointer may be held across a refresh
 that reads other files, and reads the entry's current state
 
+## rec Resolution
+
+```mach
+pub rec Resolution;
+```
+
+what an `embed` argument resolves to
+
+path: the file it names, owned by the allocator resolve_arg was given
+artifact: the artifact whose output a template names, nil for a literal path or a
+          template that names none
+
 ## fun resolve_arg
 
 ```mach
 pub fun resolve_arg(alloc: *A.Allocator, c: *EmbedCache, itn: *intern.Interner, module_fqn: intern.StrId,
-decl_file: str, arg: str) res[str, fail.Fail];
+decl_file: str, arg: str) res[Resolution, fail.Fail];
 ```
 
 resolve an `embed` argument: a literal path against the declaring file's
@@ -88,7 +100,7 @@ itn: resolves the module and scope names
 module_fqn: the declaring module, whose head segment names its project
 decl_file: the declaring file's path
 arg: the decorator's path argument
-ret: the resolved path; err as `template.expand` refuses the template in
+ret: the resolution; err as `template.expand` refuses the template in
             an `embed` path, or when the build has no project root to resolve it in
 
 ## fun escapes_root
