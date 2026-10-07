@@ -1059,12 +1059,6 @@ pub val LAYOUT_MEASUREMENT_OVERFLOW:      Kind = 170
 pub val LAYOUT_UNAVAILABLE:               Kind = 171
 ```
 
-## val LITERAL_INVALID_ESCAPE
-
-```mach
-pub val LITERAL_INVALID_ESCAPE:           Kind = 172
-```
-
 ## val LITERAL_MALFORMED
 
 ```mach

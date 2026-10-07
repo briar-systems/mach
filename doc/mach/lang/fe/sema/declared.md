@@ -95,6 +95,15 @@ pub fun check_occurs_all(sc: *sema_context.SemaContext) err[fail.Fail];
 pub fun check_uni_secrecy_all(sc: *sema_context.SemaContext) err[fail.Fail];
 ```
 
+## fun declared_align
+
+```mach
+pub fun declared_align(sc: *sema_context.SemaContext, d: *ast_decl.Decl) u32;
+```
+
+the alignment `d` declares, zero when it declares none or a refused one, which is
+reported here for a type, a function and a global alike
+
 ## fun intrinsic_operand_type
 
 ```mach
