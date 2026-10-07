@@ -5,14 +5,6 @@ each block's predecessors, the reverse postorder from the entry, immediate
 dominators, the tree's children and a numbering of the tree that makes a
 dominance query an interval test, and on request the dominance frontiers
 
-## val NONE
-
-```mach
-pub val NONE: u32 = 0xFFFFFFFF
-```
-
-the reverse postorder index of a block no path from the entry reaches
-
 ## rec Dominance
 
 ```mach

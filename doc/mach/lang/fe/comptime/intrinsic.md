@@ -233,3 +233,182 @@ pub fun takes_type_operand(id: Id) bool;
 
 whether `id` takes a type as its first argument
 
+## fun call_intrinsic
+
+```mach
+pub fun call_intrinsic(a: *ast.Ast, source: str, eid: ast_id.ExprId) Id;
+```
+
+the intrinsic a comptime call `$name(...)` names; NONE for any other expression
+
+## fun ident_intrinsic
+
+```mach
+pub fun ident_intrinsic(source: str, full: lang_source.Span) Id;
+```
+
+the intrinsic a `$name` token spells
+
+## fun first_call_arg
+
+```mach
+pub fun first_call_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId;
+```
+
+## fun intrinsic_takes_type_operand
+
+```mach
+pub fun intrinsic_takes_type_operand(source: str, full: lang_source.Span) bool;
+```
+
+## fun is_type_of_call
+
+```mach
+pub fun is_type_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+## fun type_of_arg
+
+```mach
+pub fun type_of_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId;
+```
+
+## fun is_fields_call
+
+```mach
+pub fun is_fields_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+## fun is_cases_call
+
+```mach
+pub fun is_cases_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+## fun is_layout_intrinsic_call
+
+```mach
+pub fun is_layout_intrinsic_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+## fun is_type_id_call
+
+```mach
+pub fun is_type_id_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+## fun is_length_of_call
+
+```mach
+pub fun is_length_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+## fun is_offset_of_call
+
+```mach
+pub fun is_offset_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+## fun is_size_of_call
+
+```mach
+pub fun is_size_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+## fun is_align_of_call
+
+```mach
+pub fun is_align_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+## fun layout_intrinsic_type_arg
+
+```mach
+pub fun layout_intrinsic_type_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId;
+```
+
+## fun fields_type_arg
+
+```mach
+pub fun fields_type_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId;
+```
+
+## fun is_error_call
+
+```mach
+pub fun is_error_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+## fun type_operand_value
+
+```mach
+pub fun type_operand_value(a: *ast.Ast, source: str, operand: ast_id.ExprId) ast_id.ExprId;
+```
+
+## fun is_type_comparison
+
+```mach
+pub fun is_type_comparison(a: *ast.Ast, source: str, bin: *ast_expr.ExprBinary) bool;
+```
+
+## fun is_type_comparison_binary
+
+```mach
+pub fun is_type_comparison_binary(a: *ast.Ast, source: str, bin: *ast_expr.ExprBinary,
+lhs_is_field_type: bool, rhs_is_field_type: bool) bool;
+```
+
+## fun is_field_type_member
+
+```mach
+pub fun is_field_type_member(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+## fun is_field_descriptor_member
+
+```mach
+pub fun is_field_descriptor_member(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+## fun is_type_query_call
+
+```mach
+pub fun is_type_query_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+## fun is_type_question_call
+
+```mach
+pub fun is_type_question_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
+```
+
+a call that asks about a type: its layout, its identity, or a predicate over it
+
+## fun is_path_call
+
+```mach
+pub fun is_path_call(a: *ast.Ast, e: ast_id.ExprId) bool;
+```
+
+a call whose callee is a rooted comptime path: `$mach.build.ct_mul(low, 64)`
+
+## fun is_comptime_value
+
+```mach
+pub fun is_comptime_value(a: *ast.Ast, e: ast_id.ExprId) bool;
+```
+
+a rooted comptime path, or a call on one: both fold to a constant
+
+## fun is_comptime_path
+
+```mach
+pub fun is_comptime_path(a: *ast.Ast, e: ast_id.ExprId) bool;
+```
+
+## fun comptime_ident_name
+
+```mach
+pub fun comptime_ident_name(full: lang_source.Span) lang_source.Span;
+```
+

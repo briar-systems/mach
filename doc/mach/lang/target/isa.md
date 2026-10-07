@@ -120,43 +120,6 @@ pub rec ModuleEmitter;
 pub def RelocSeam: target_of.RelocationCapabilities
 ```
 
-## fun environment_lookup
-
-```mach
-pub fun environment_lookup(vt: *IsaVTable, name: str) u32;
-```
-
-## fun environment_profile
-
-```mach
-pub fun environment_profile(vt: *IsaVTable, env_id: u32) u32;
-```
-
-## fun environment_extensions
-
-```mach
-pub fun environment_extensions(vt: *IsaVTable, env_id: u32) u64;
-```
-
-the extensions the target's environment guarantees, which its selection holds
-beside the ones it names
-
-## rec Environment
-
-```mach
-pub rec Environment;
-```
-
-an execution environment an isa defines: its name, its profile, and the
-extensions of the isa's vocabulary it guarantees (spirv's `zero_init_workgroup`
-from vulkan1.3)
-
-## val ENV_NONE
-
-```mach
-pub val ENV_NONE: u32 = 0xFFFFFFFF
-```
-
 ## rec IsaVTable
 
 ```mach

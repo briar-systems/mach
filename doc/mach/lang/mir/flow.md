@@ -8,7 +8,9 @@ as the IR records them. an operand naming no block of the function is no
 edge. predecessors list every edge into a block, from reached and unreached
 blocks alike, ordered by the source block's position and then its operand.
 
-init builds the edges and the reverse postorder from the entry. dominators,
+init builds the edges and the reverse postorder from the entry over the
+block array as it stands, and init_ordered over the blocks in a given order
+without moving them: position p is then the block at order[p]. dominators,
 loop depth and strongly connected components are built when a pass asks for
 them. a graph describes the function as it stood when it was built: a pass
 that changes a terminator or the block array builds a new one
@@ -35,7 +37,8 @@ block positions by block id, ids being unique within a function
 pub rec Graph;
 ```
 
-every table is indexed by block position in the function's block array
+every table is indexed by block position: in the function's block array,
+or in the order init_ordered was given
 
 n: the number of blocks
 index: each block's position by its id
@@ -77,6 +80,15 @@ the position of the block named `id`, NONE when no block has that id
 ```mach
 pub fun init(alloc: *A.Allocator, f: *lang_mir.MirFunction) res[Graph, fail.Fail];
 ```
+
+## fun init_ordered
+
+```mach
+pub fun init_ordered(alloc: *A.Allocator, f: *lang_mir.MirFunction, order: *u32) res[Graph, fail.Fail];
+```
+
+the graph over the blocks in `order`, f.block_count positions into the block
+array with the entry first
 
 ## fun dnit
 

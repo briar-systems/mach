@@ -1,5 +1,13 @@
 # mach.lang.me.ir.id
 
+## val NONE
+
+```mach
+pub val NONE: u32 = 0xFFFFFFFF
+```
+
+the index of nothing: a slot, a block or an entry a table does not hold
+
 ## rec BlockId
 
 ```mach

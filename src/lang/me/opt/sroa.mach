@@ -1,0 +1,3158 @@
+# scalar replacement of aggregates. a local record, array or tag whose every
+# use is a typed access to one field, at a constant offset, is split into one
+# local per field, and mem2reg and dce then promote them. a tag splits like a
+# record of its discriminator and its cases. a local is declined when its
+# address escapes, when it has more than MAX_FIELDS fields or MAX_BYTES bytes,
+# or when it nests deeper than MAX_DEPTH, so a split never grows a function
+# past what promotion repays. a secret local splits into secret fields
+use mach.lang.fail;
+use std.allocator.page;
+use std.collections.map;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.intern;
+use mach.lang.me.analysis;
+use me_ir: mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use mach.lang.me.ir.equal;
+use ir_id:          mach.lang.me.ir.id;
+use ir_instruction: mach.lang.me.ir.instruction;
+use mach.lang.me.ir.mutate;
+use mach.lang.me.ir.opdesc;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.me.opt.dce;
+use mach.lang.me.opt.mem2reg;
+use mach.lang.me.pass;
+use mach.lang.me.scratch;
+use me_testing:   mach.lang.me.testing;
+use lang_source:  mach.lang.source;
+use target_model: mach.lang.target.model;
+use mach.lang.target.resolved;
+
+# the most fields a split local may have
+val MAX_FIELDS: u32 = 8;
+
+# the largest local split, in bytes
+val MAX_BYTES: u32 = 64;
+
+# the deepest nesting of aggregates a split reaches through
+val MAX_DEPTH: u32 = 4;
+
+# one round per nesting level, and one to settle
+val MAX_ROUNDS: u32 = MAX_DEPTH + 1;
+
+rec State {
+    alloc: *A.Allocator;
+    m:     *me_ir.Module;
+    fn:    *me_ir.Function;
+    tgt:   *resolved.Target;
+
+    pool_len:    u32;
+    instr_block: *ir_id.BlockId;
+    cand_of:     *u32;
+    gep_of:      *u32;
+    gep_field:   *u32;
+    uni_gep:     *bool;
+    erase:       *bool;
+    # an address some instruction uses other than as a load's address or a store's destination
+    escapes: *bool;
+
+    cand_id:   *ir_id.InstructionId;
+    cand_ty:   *ir_type.IrTypeId;
+    cand_phi:  *bool;
+    cand_nf:   *u32;
+    cand_root: *u32;
+    cand_out:  *bool;
+    # one flag per candidate and field: a field's slot is secret when a typed access to that field is, or when the
+    # candidate's home itself is. an aggregate-level secret operation (a store, copy or zeroing of the whole object)
+    # says only that some byte of the object is secret and taints no field by itself; the typed field accesses say which
+    field_secret: *bool;
+    cand_home:    *ir_id.BlockId;
+    cand_local:   *bool;
+    cand_slot:    *u32;
+    cand_count:   u32;
+    cand_cap:     u32;
+
+    block_count: u32;
+    visit:       *bool;
+    queue:       *ir_id.BlockId;
+
+    slots:      *value.Value;
+    slot_total: u32;
+
+    ptr_ty:  ir_type.IrTypeId;
+    void_ty: ir_type.IrTypeId;
+    i64_ty:  ir_type.IrTypeId;
+    int_ty:  [4]ir_type.IrTypeId;
+}
+
+# a run that owns its workspace
+#[testing]
+pub fun run(m: *me_ir.Module, tgt: *resolved.Target) res[bool, fail.Fail] {
+    ret pass.run_alone(?PASS, m, tgt);
+}
+
+# the pass the pipeline schedules
+pub val PASS: pass.Pass = pass.Pass{run: nil, applies: nil, preserves: analysis.NONE, visit: split_function, skips: pass.SKIP_EXTERN | pass.SKIP_EMPTY | pass.SKIP_VOLATILE, eligible: nil, rounds: MAX_ROUNDS};
+
+fun split_function(work: *pass.Function, alloc: *A.Allocator) res[bool, fail.Fail] {
+    val m:   *me_ir.Module    = work.module;
+    val fn:  *me_ir.Function  = work.body;
+    val tgt: *resolved.Target = work.target;
+    var st:  State;
+    state_init(?st, m, fn, tgt, alloc);
+    fin { state_dnit(?st); }
+
+    val res_maps: err[fail.Fail] = state_alloc(?st);
+    if (sel res_maps.err) { ret res[bool, fail.Fail].err{res_maps.err}; }
+    if (st.pool_len == 0) { ret res[bool, fail.Fail].ok{false}; }
+
+    val res_ints: err[fail.Fail] = intern_int_widths(?st);
+    if (sel res_ints.err) { ret res[bool, fail.Fail].err{res_ints.err}; }
+
+    me_ir.placement_fill(st.fn, st.instr_block, nil, st.pool_len);
+    collect_candidates(?st);
+    if (st.cand_count == 0) { ret res[bool, fail.Fail].ok{false}; }
+
+    link_phi_partitions(?st);
+    mark_escaping_addresses(?st);
+    classify_references(?st);
+    mark_union_member_geps(?st);
+    classify_gep_uses(?st);
+    check_partitions(?st);
+    propagate_escapes(?st);
+
+    val survivors: u32 = assign_slots(?st);
+    if (survivors == 0) { ret res[bool, fail.Fail].ok{false}; }
+
+    val res_rw: err[fail.Fail] = rewrite(?st);
+    if (sel res_rw.err) { ret res[bool, fail.Fail].err{res_rw.err}; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+fun state_init(st: *State, m: *me_ir.Module, fn: *me_ir.Function, tgt: *resolved.Target, alloc: *A.Allocator) {
+    st.alloc = alloc;
+    st.m     = m;
+    st.fn    = fn;
+    st.tgt   = tgt;
+
+    st.pool_len    = fn.instr_len;
+    st.instr_block = nil;
+    st.cand_of     = nil;
+    st.gep_of      = nil;
+    st.gep_field   = nil;
+    st.erase       = nil;
+
+    st.cand_id      = nil;
+    st.cand_ty      = nil;
+    st.cand_phi     = nil;
+    st.cand_nf      = nil;
+    st.cand_root    = nil;
+    st.cand_out     = nil;
+    st.field_secret = nil;
+    st.cand_home    = nil;
+    st.cand_local   = nil;
+    st.cand_slot    = nil;
+    st.cand_count   = 0;
+    st.cand_cap     = 0;
+
+    st.block_count = fn.block_count;
+    st.visit       = nil;
+    st.queue       = nil;
+
+    st.slots      = nil;
+    st.slot_total = 0;
+
+    st.ptr_ty  = ir_type.IRT_NIL;
+    st.void_ty = ir_type.IRT_NIL;
+    st.i64_ty  = ir_type.IRT_NIL;
+    var w: u32 = 0;
+    for (w < 4) {
+        st.int_ty[w] = ir_type.IRT_NIL;
+        w            = w + 1;
+    }
+}
+
+fun intern_int_widths(st: *State) err[fail.Fail] {
+    var w: u32 = 0;
+    for (w < 4) {
+        val r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?st.m.types, 8 << w);
+        if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+        st.int_ty[w] = r.ok;
+        w            = w + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun int_of_bytes(st: *State, bytes: u32) ir_type.IrTypeId {
+    if (bytes == 1) { ret st.int_ty[0]; }
+    if (bytes == 2) { ret st.int_ty[1]; }
+    if (bytes == 4) { ret st.int_ty[2]; }
+    if (bytes == 8) { ret st.int_ty[3]; }
+    ret ir_type.IRT_NIL;
+}
+
+fun state_alloc(st: *State) err[fail.Fail] {
+    val n: u32 = st.pool_len;
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+
+    val r_ib: res[*ir_id.BlockId, A.Error] = A.allocate[ir_id.BlockId](st.alloc, n::usize);
+    if (sel r_ib.err) { ret err[fail.Fail].err{fail.refused(r_ib.err)}; }
+    st.instr_block = r_ib.ok;
+
+    val r_co: res[*u32, A.Error] = A.allocate[u32](st.alloc, n::usize);
+    if (sel r_co.err) { ret err[fail.Fail].err{fail.refused(r_co.err)}; }
+    st.cand_of = r_co.ok;
+
+    val r_go: res[*u32, A.Error] = A.allocate[u32](st.alloc, n::usize);
+    if (sel r_go.err) { ret err[fail.Fail].err{fail.refused(r_go.err)}; }
+    st.gep_of = r_go.ok;
+
+    val r_gf: res[*u32, A.Error] = A.allocate[u32](st.alloc, n::usize);
+    if (sel r_gf.err) { ret err[fail.Fail].err{fail.refused(r_gf.err)}; }
+    st.gep_field = r_gf.ok;
+
+    val r_ug: res[*bool, A.Error] = A.allocate[bool](st.alloc, n::usize);
+    if (sel r_ug.err) { ret err[fail.Fail].err{fail.refused(r_ug.err)}; }
+    st.uni_gep = r_ug.ok;
+
+    val r_er: res[*bool, A.Error] = A.allocate[bool](st.alloc, n::usize);
+    if (sel r_er.err) { ret err[fail.Fail].err{fail.refused(r_er.err)}; }
+    st.erase = r_er.ok;
+
+    val r_es: res[*bool, A.Error] = A.allocate[bool](st.alloc, n::usize);
+    if (sel r_es.err) { ret err[fail.Fail].err{fail.refused(r_es.err)}; }
+    st.escapes = r_es.ok;
+
+    var i: u32 = 0;
+    for (i < n) {
+        st.instr_block[i] = ir_id.BLOCK_NIL;
+        st.cand_of[i]     = ir_id.NONE;
+        st.gep_of[i]      = ir_id.NONE;
+        st.gep_field[i]   = 0;
+        st.uni_gep[i]     = false;
+        st.erase[i]       = false;
+        st.escapes[i]     = false;
+        i                 = i + 1;
+    }
+
+    val r_ci: res[*ir_id.InstructionId, A.Error] = A.allocate[ir_id.InstructionId](st.alloc, n::usize);
+    if (sel r_ci.err) { ret err[fail.Fail].err{fail.refused(r_ci.err)}; }
+    st.cand_id = r_ci.ok;
+    # the capacity is recorded with the first candidate array, so a refusal of
+    # a later one releases the earlier ones at their true extent
+    st.cand_cap = n;
+
+    val r_ct: res[*ir_type.IrTypeId, A.Error] = A.allocate[ir_type.IrTypeId](st.alloc, n::usize);
+    if (sel r_ct.err) { ret err[fail.Fail].err{fail.refused(r_ct.err)}; }
+    st.cand_ty = r_ct.ok;
+
+    val r_cp: res[*bool, A.Error] = A.allocate[bool](st.alloc, n::usize);
+    if (sel r_cp.err) { ret err[fail.Fail].err{fail.refused(r_cp.err)}; }
+    st.cand_phi = r_cp.ok;
+
+    val r_cn: res[*u32, A.Error] = A.allocate[u32](st.alloc, n::usize);
+    if (sel r_cn.err) { ret err[fail.Fail].err{fail.refused(r_cn.err)}; }
+    st.cand_nf = r_cn.ok;
+
+    val r_cr: res[*u32, A.Error] = A.allocate[u32](st.alloc, n::usize);
+    if (sel r_cr.err) { ret err[fail.Fail].err{fail.refused(r_cr.err)}; }
+    st.cand_root = r_cr.ok;
+
+    val r_cx: res[*bool, A.Error] = A.allocate[bool](st.alloc, n::usize);
+    if (sel r_cx.err) { ret err[fail.Fail].err{fail.refused(r_cx.err)}; }
+    st.cand_out = r_cx.ok;
+
+    val r_cs: res[*bool, A.Error] = A.allocate[bool](st.alloc, (n * MAX_FIELDS)::usize);
+    if (sel r_cs.err) { ret err[fail.Fail].err{fail.refused(r_cs.err)}; }
+    st.field_secret = r_cs.ok;
+    var fs: u32 = 0;
+    for (fs < n * MAX_FIELDS) {
+        st.field_secret[fs] = false;
+        fs                  = fs + 1;
+    }
+
+    val r_ch: res[*ir_id.BlockId, A.Error] = A.allocate[ir_id.BlockId](st.alloc, n::usize);
+    if (sel r_ch.err) { ret err[fail.Fail].err{fail.refused(r_ch.err)}; }
+    st.cand_home = r_ch.ok;
+
+    val r_ck: res[*bool, A.Error] = A.allocate[bool](st.alloc, n::usize);
+    if (sel r_ck.err) { ret err[fail.Fail].err{fail.refused(r_ck.err)}; }
+    st.cand_local = r_ck.ok;
+
+    val r_cl: res[*u32, A.Error] = A.allocate[u32](st.alloc, n::usize);
+    if (sel r_cl.err) { ret err[fail.Fail].err{fail.refused(r_cl.err)}; }
+    st.cand_slot = r_cl.ok;
+
+    val bn:   u32                 = st.block_count;
+    val r_vi: res[*bool, A.Error] = A.allocate[bool](st.alloc, bn::usize);
+    if (sel r_vi.err) { ret err[fail.Fail].err{fail.refused(r_vi.err)}; }
+    st.visit = r_vi.ok;
+
+    val r_qu: res[*ir_id.BlockId, A.Error] = A.allocate[ir_id.BlockId](st.alloc, bn::usize);
+    if (sel r_qu.err) { ret err[fail.Fail].err{fail.refused(r_qu.err)}; }
+    st.queue = r_qu.ok;
+
+    ret err[fail.Fail].ok{};
+}
+
+fun state_dnit(st: *State) {
+    val n: u32 = st.pool_len;
+    if (st.instr_block != nil) { A.deallocate[ir_id.BlockId](st.alloc, st.instr_block, n::usize); }
+    if (st.cand_of != nil)     { A.deallocate[u32](st.alloc, st.cand_of, n::usize); }
+    if (st.gep_of != nil)      { A.deallocate[u32](st.alloc, st.gep_of, n::usize); }
+    if (st.gep_field != nil)   { A.deallocate[u32](st.alloc, st.gep_field, n::usize); }
+    if (st.uni_gep != nil)     { A.deallocate[bool](st.alloc, st.uni_gep, n::usize); }
+    if (st.erase != nil)       { A.deallocate[bool](st.alloc, st.erase, n::usize); }
+    if (st.escapes != nil)     { A.deallocate[bool](st.alloc, st.escapes, n::usize); }
+
+    val c: u32 = st.cand_cap;
+    if (st.cand_id != nil)      { A.deallocate[ir_id.InstructionId](st.alloc, st.cand_id, c::usize); }
+    if (st.cand_ty != nil)      { A.deallocate[ir_type.IrTypeId](st.alloc, st.cand_ty, c::usize); }
+    if (st.cand_phi != nil)     { A.deallocate[bool](st.alloc, st.cand_phi, c::usize); }
+    if (st.cand_nf != nil)      { A.deallocate[u32](st.alloc, st.cand_nf, c::usize); }
+    if (st.cand_root != nil)    { A.deallocate[u32](st.alloc, st.cand_root, c::usize); }
+    if (st.cand_out != nil)     { A.deallocate[bool](st.alloc, st.cand_out, c::usize); }
+    if (st.field_secret != nil) { A.deallocate[bool](st.alloc, st.field_secret, (c * MAX_FIELDS)::usize); }
+    if (st.cand_home != nil)    { A.deallocate[ir_id.BlockId](st.alloc, st.cand_home, c::usize); }
+    if (st.cand_local != nil)   { A.deallocate[bool](st.alloc, st.cand_local, c::usize); }
+    if (st.cand_slot != nil)    { A.deallocate[u32](st.alloc, st.cand_slot, c::usize); }
+
+    val bn: u32 = st.block_count;
+    if (st.visit != nil) { A.deallocate[bool](st.alloc, st.visit, bn::usize); }
+    if (st.queue != nil) { A.deallocate[ir_id.BlockId](st.alloc, st.queue, bn::usize); }
+
+    if (st.slots != nil) { A.deallocate[value.Value](st.alloc, st.slots, st.slot_total::usize); }
+}
+
+# a tag splits like a struct of its discriminator and one field per case.
+# the cases overlap in memory but never in a well-formed program: a payload
+# is written only by the construction of its case and read only under a
+# guard for that case, so each case can own a slot of its own, and a case
+# without a payload owns none
+fun agg_field_count(st: *State, ty: ir_type.IrTypeId) u32 {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?st.m.types, ty);
+    if (sel opt_.none) { ret 0; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind == ir_type.IRT_STRUCT) { ret t.data.struct_.field_count; }
+    if (t.kind == ir_type.IRT_ARRAY)  { ret t.data.array_.count; }
+    if (t.kind == ir_type.IRT_TAG)    { ret ir_type.tag_field_count(?st.m.types, ty); }
+    ret 0;
+}
+
+fun void_field(st: *State, ft: ir_type.IrTypeId) bool {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?st.m.types, ft);
+    if (sel opt_.none) { ret false; }
+    ret opt_.some.kind == ir_type.IRT_VOID;
+}
+
+fun agg_field_type(st: *State, ty: ir_type.IrTypeId, k: u32) ir_type.IrTypeId {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?st.m.types, ty);
+    if (sel opt_.none) { ret ir_type.IRT_NIL; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind == ir_type.IRT_STRUCT) {
+        if (k >= t.data.struct_.field_count) { ret ir_type.IRT_NIL; }
+        ret t.data.struct_.fields[k];
+    }
+    if (t.kind == ir_type.IRT_TAG) {
+        if (k >= ir_type.tag_field_count(?st.m.types, ty)) { ret ir_type.IRT_NIL; }
+        ret ir_type.tag_field_type(?st.m.types, ty, k);
+    }
+    if (t.kind == ir_type.IRT_ARRAY) {
+        if (k >= t.data.array_.count) { ret ir_type.IRT_NIL; }
+        ret t.data.array_.element;
+    }
+    ret ir_type.IRT_NIL;
+}
+
+fun splittable_ty(st: *State, ty: ir_type.IrTypeId) bool {
+    ret splittable_at(st, ty, 0);
+}
+
+fun splittable_at(st: *State, ty: ir_type.IrTypeId, depth: u32) bool {
+    if (depth >= MAX_DEPTH) { ret false; }
+    val nf: u32 = agg_field_count(st, ty);
+    if (nf == 0 || nf > MAX_FIELDS)                                                                  { ret false; }
+    if (ir_type.byte_size_for_machine(?st.m.types, ty, resolved.layout_machine(st.tgt)) > MAX_BYTES) { ret false; }
+    var k: u32 = 0;
+    for (k < nf) {
+        val ft: ir_type.IrTypeId = agg_field_type(st, ty, k);
+        if (!scalar_field(st, ft) && !void_field(st, ft) && ir_type.is_nil(union_leaf_ty(st, ft))
+            && !splittable_at(st, ft, depth + 1)) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+fun union_leaf_ty(st: *State, ty: ir_type.IrTypeId) ir_type.IrTypeId {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?st.m.types, ty);
+    if (sel opt_.none) { ret ir_type.IRT_NIL; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind != ir_type.IRT_UNION) { ret ir_type.IRT_NIL; }
+
+    val size:   u32              = ir_type.byte_size_for_machine(?st.m.types, ty, resolved.layout_machine(st.tgt));
+    var pick:   ir_type.IrTypeId = ir_type.IRT_NIL;
+    var rank:   u32              = 3;
+    var narrow: bool             = false;
+    var k:      u32              = 0;
+    for (k < t.data.struct_.field_count) {
+        val mt: ir_type.IrTypeId = t.data.struct_.fields[k];
+        if (!scalar_field(st, mt))                                                                  { ret ir_type.IRT_NIL; }
+        if (ir_type.byte_size_for_machine(?st.m.types, mt, resolved.layout_machine(st.tgt)) < size) { narrow = true; }
+        or {
+            if (storage_rank(st, mt) < rank) {
+                pick = mt;
+                rank = storage_rank(st, mt);
+            }
+        }
+        k = k + 1;
+    }
+    if (!narrow)                                               { ret pick; }
+    if (st.tgt.model.endianness != target_model.ENDIAN_LITTLE) { ret ir_type.IRT_NIL; }
+    ret int_of_bytes(st, size);
+}
+
+fun storage_rank(st: *State, ft: ir_type.IrTypeId) u32 {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?st.m.types, ft);
+    if (sel opt_.none) { ret 2; }
+    val k: ir_type.IrTypeKind = opt_.some.kind;
+    if (k == ir_type.IRT_INT) { ret 0; }
+    if (k == ir_type.IRT_PTR) { ret 1; }
+    ret 2;
+}
+
+fun union_member_count(st: *State, ty: ir_type.IrTypeId) u32 {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?st.m.types, ty);
+    if (sel opt_.none) { ret 0; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind != ir_type.IRT_UNION) { ret 0; }
+    ret t.data.struct_.field_count;
+}
+
+fun slot_ty(st: *State, ty: ir_type.IrTypeId, k: u32) ir_type.IrTypeId {
+    val ft: ir_type.IrTypeId = agg_field_type(st, ty, k);
+    val ut: ir_type.IrTypeId = union_leaf_ty(st, ft);
+    if (!ir_type.is_nil(ut)) { ret ut; }
+    ret ft;
+}
+
+fun scalar_field(st: *State, ft: ir_type.IrTypeId) bool {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?st.m.types, ft);
+    if (sel opt_.none) { ret false; }
+    val k: ir_type.IrTypeKind = opt_.some.kind;
+    ret k == ir_type.IRT_INT || k == ir_type.IRT_FLOAT || k == ir_type.IRT_PTR;
+}
+
+fun collect_candidates(st: *State) {
+    val fn: *me_ir.Function = st.fn;
+    var i:  u32             = 0;
+    for (i < st.pool_len) {
+        if (ir_id.block_is_nil(st.instr_block[i])) {
+            i = i + 1;
+            cnt;
+        }
+        val inst: *ir_instruction.Instruction = ?fn.instrs[i];
+
+        var ty:     ir_type.IrTypeId = ir_type.IRT_NIL;
+        var is_phi: bool             = false;
+        if (inst.kind == ir_instruction.OP_ALLOCA) {
+            if (inst.operand_count >= 1 && inst.operands[0].kind == value.VAL_CONST_INT
+                && inst.operands[0].data.int_lit == 1) {
+                ty = inst.aux_ty;
+            }
+        }
+        or (inst.kind == ir_instruction.OP_PHI) {
+            ty     = inst.ty;
+            is_phi = true;
+        }
+
+        if (!ir_type.is_nil(ty) && splittable_ty(st, ty)) {
+            val c: u32 = st.cand_count;
+            st.cand_of[i]   = c;
+            st.cand_id[c]   = i::ir_id.InstructionId;
+            st.cand_ty[c]   = ty;
+            st.cand_phi[c]  = is_phi;
+            st.cand_nf[c]   = agg_field_count(st, ty);
+            st.cand_root[c] = c;
+            st.cand_out[c]  = false;
+            taint_all(st, c, inst.secret);
+            st.cand_home[c]  = st.instr_block[i];
+            st.cand_local[c] = true;
+            st.cand_slot[c]  = ir_id.NONE;
+            st.cand_count    = c + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun find_root(st: *State, c: u32) u32 {
+    var x: u32 = c;
+    for (st.cand_root[x] != x) {
+        st.cand_root[x] = st.cand_root[st.cand_root[x]];
+        x               = st.cand_root[x];
+    }
+    ret x;
+}
+
+fun union_roots(st: *State, a: u32, b: u32) {
+    val ra: u32 = find_root(st, a);
+    val rb: u32 = find_root(st, b);
+    if (ra != rb) { st.cand_root[rb] = ra; }
+}
+
+fun link_phi_partitions(st: *State) {
+    val fn: *me_ir.Function = st.fn;
+    var c:  u32             = 0;
+    for (c < st.cand_count) {
+        if (st.cand_phi[c] == false) {
+            c = c + 1;
+            cnt;
+        }
+        val phi: *ir_instruction.Instruction = ?fn.instrs[st.cand_id[c]::u32];
+        if (phi.operand_count == 0) {
+            st.cand_out[c] = true;
+            c              = c + 1;
+            cnt;
+        }
+
+        var o: u32 = 1;
+        for (o < phi.operand_count) {
+            val v:  value.Value = phi.operands[o];
+            var ok: bool        = false;
+            if (v.kind == value.VAL_INSTR && v.data.instr::u32 < st.pool_len) {
+                val ic: u32 = st.cand_of[v.data.instr::u32];
+                if (ic != ir_id.NONE && st.cand_phi[ic] == false && ir_type.same(st.cand_ty[ic], st.cand_ty[c])) {
+                    union_roots(st, c, ic);
+                    ok = true;
+                }
+            }
+            if (!ok) { st.cand_out[c] = true; }
+            o = o + 2;
+        }
+        c = c + 1;
+    }
+}
+
+fun is_address_value(v: value.Value) bool {
+    ret v.kind == value.VAL_INSTR || v.kind == value.VAL_PARAM || v.kind == value.VAL_GLOBAL;
+}
+
+fun taint_field(st: *State, c: u32, k: u32, s: bool) {
+    if (s && k < MAX_FIELDS) { st.field_secret[c * MAX_FIELDS + k] = true; }
+}
+
+# a secret home (a secret alloca, or its address used as a secret value) is secret in every field
+fun taint_all(st: *State, c: u32, s: bool) {
+    if (!s) { ret; }
+    var k: u32 = 0;
+    for (k < MAX_FIELDS) {
+        st.field_secret[c * MAX_FIELDS + k] = true;
+        k                                   = k + 1;
+    }
+}
+
+fun note_home(st: *State, c: u32, b: ir_id.BlockId) {
+    if (ir_id.block_is_nil(b)) { ret; }
+    if (ir_id.block_is_nil(st.cand_home[c])) {
+        st.cand_home[c] = b;
+        ret;
+    }
+    if (!ir_id.block_same(st.cand_home[c], b)) { st.cand_local[c] = false; }
+}
+
+fun classify_references(st: *State) {
+    val fn: *me_ir.Function = st.fn;
+    var i:  u32             = 0;
+    for (i < st.pool_len) {
+        if (ir_id.block_is_nil(st.instr_block[i])) {
+            i = i + 1;
+            cnt;
+        }
+        val inst: *ir_instruction.Instruction = ?fn.instrs[i];
+
+        if (inst.kind == ir_instruction.OP_ASM) { mark_asm_binds(st, i::ir_id.InstructionId); }
+
+        if (inst.kind == ir_instruction.OP_DBG_VALUE) {
+            i = i + 1;
+            cnt;
+        }
+
+        var o: u32 = 0;
+        for (o < inst.operand_count) {
+            val op: value.Value = inst.operands[o];
+            if (op.kind == value.VAL_INSTR && op.data.instr::u32 < st.pool_len) {
+                val c: u32 = st.cand_of[op.data.instr::u32];
+                if (c != ir_id.NONE) {
+                    taint_all(st, c, op.secret);
+                    if (inst.kind != ir_instruction.OP_PHI)                    { note_home(st, c, st.instr_block[i]); }
+                    if (!classify_one(st, c, i::ir_id.InstructionId, inst, o)) { st.cand_out[c] = true; }
+                }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun classify_one(st: *State, c: u32, iid: ir_id.InstructionId, inst: *ir_instruction.Instruction, o: u32) bool {
+    if (inst.kind == ir_instruction.OP_GEP && o == 0) {
+        if (inst.operand_count < 3)                       { ret false; }
+        if (inst.operands[1].kind != value.VAL_CONST_INT) { ret false; }
+        if (inst.operands[1].data.int_lit != 0)           { ret false; }
+        if (inst.operands[2].kind != value.VAL_CONST_INT) { ret false; }
+        val k: u64 = inst.operands[2].data.int_lit;
+        if (k >= st.cand_nf[c]::u64)                                   { ret false; }
+        if (void_field(st, agg_field_type(st, st.cand_ty[c], k::u32))) { ret false; }
+        if (inst.operand_count > 3
+            && !ir_type.is_nil(union_leaf_ty(st, agg_field_type(st, st.cand_ty[c], k::u32)))) { ret false; }
+        st.gep_of[iid::u32]    = c;
+        st.gep_field[iid::u32] = k::u32;
+        ret true;
+    }
+    if (inst.kind == ir_instruction.OP_MEMZERO && o == 0) { ret st.cand_phi[c] == false; }
+    if (inst.kind == ir_instruction.OP_STORE && inst.operand_count >= 2) {
+        if (o == 1) {
+            if (st.cand_phi[c])                                    { ret false; }
+            if (!ir_type.same(inst.operands[0].ty, st.cand_ty[c])) { ret false; }
+            ret is_address_value(inst.operands[0]);
+        }
+        if (o == 0) {
+            if (!ir_type.same(inst.operands[0].ty, st.cand_ty[c])) { ret false; }
+            val d: value.Value = inst.operands[1];
+            if (d.kind != value.VAL_INSTR)        { ret false; }
+            if (d.data.instr::u32 >= st.pool_len) { ret false; }
+            val dc: u32 = st.cand_of[d.data.instr::u32];
+            if (dc == ir_id.NONE || st.cand_phi[dc]) { ret false; }
+            ret ir_type.same(st.cand_ty[dc], st.cand_ty[c]);
+        }
+        ret false;
+    }
+    if (opdesc.operand_role(inst.kind, o) == opdesc.ROLE_PHI_VALUE) {
+        val pc: u32 = st.cand_of[iid::u32];
+        if (pc == ir_id.NONE || st.cand_phi[pc] == false) { ret false; }
+        ret find_root(st, pc) == find_root(st, c);
+    }
+    ret false;
+}
+
+fun mark_union_member_geps(st: *State) {
+    val fn: *me_ir.Function = st.fn;
+    var i:  u32             = 0;
+    for (i < st.pool_len) {
+        if (ir_id.block_is_nil(st.instr_block[i])) {
+            i = i + 1;
+            cnt;
+        }
+        if (st.gep_of[i] != ir_id.NONE) {
+            i = i + 1;
+            cnt;
+        }
+        val inst: *ir_instruction.Instruction = ?fn.instrs[i];
+        if (inst.kind != ir_instruction.OP_GEP || inst.operand_count != 3) {
+            i = i + 1;
+            cnt;
+        }
+
+        val base: value.Value = inst.operands[0];
+        if (base.kind != value.VAL_INSTR) {
+            i = i + 1;
+            cnt;
+        }
+        if (base.data.instr::u32 >= st.pool_len) {
+            i = i + 1;
+            cnt;
+        }
+        val bid: u32 = base.data.instr::u32;
+        if (st.gep_of[bid] == ir_id.NONE || st.uni_gep[bid]) {
+            i = i + 1;
+            cnt;
+        }
+
+        val c:  u32              = st.gep_of[bid];
+        val k:  u32              = st.gep_field[bid];
+        val ft: ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], k);
+        if (ir_type.is_nil(union_leaf_ty(st, ft))) {
+            i = i + 1;
+            cnt;
+        }
+        if (!ir_type.same(inst.aux_ty, ft)) {
+            i = i + 1;
+            cnt;
+        }
+        if (inst.operands[1].kind != value.VAL_CONST_INT) {
+            i = i + 1;
+            cnt;
+        }
+        if (inst.operands[1].data.int_lit != 0) {
+            i = i + 1;
+            cnt;
+        }
+        if (inst.operands[2].kind != value.VAL_CONST_INT) {
+            i = i + 1;
+            cnt;
+        }
+        if (inst.operands[2].data.int_lit >= union_member_count(st, ft)::u64) {
+            i = i + 1;
+            cnt;
+        }
+
+        st.gep_of[i]    = c;
+        st.gep_field[i] = k;
+        st.uni_gep[i]   = true;
+        i               = i + 1;
+    }
+}
+
+fun mark_asm_binds(st: *State, asm_id: ir_id.InstructionId) {
+    var key:  ir_id.InstructionId = asm_id;
+    val res_: opt[*me_ir.IrAsm]   = map.get[ir_id.InstructionId, me_ir.IrAsm](?st.fn.asm_blocks, ?key);
+    if (sel res_.none) { ret; }
+    val payload: *me_ir.IrAsm = res_.some;
+    var b:       u32          = 0;
+    for (b < payload.bind_count) {
+        val bid: ir_id.InstructionId = payload.binds[b].instr;
+        if (bid::u32 < st.pool_len && st.cand_of[bid::u32] != ir_id.NONE) {
+            st.cand_out[st.cand_of[bid::u32]] = true;
+        }
+        b = b + 1;
+    }
+}
+
+fun classify_gep_uses(st: *State) {
+    val fn: *me_ir.Function = st.fn;
+    var i:  u32             = 0;
+    for (i < st.pool_len) {
+        if (ir_id.block_is_nil(st.instr_block[i])) {
+            i = i + 1;
+            cnt;
+        }
+        val inst: *ir_instruction.Instruction = ?fn.instrs[i];
+        if (inst.kind == ir_instruction.OP_DBG_VALUE) {
+            i = i + 1;
+            cnt;
+        }
+
+        var o: u32 = 0;
+        for (o < inst.operand_count) {
+            val op: value.Value = inst.operands[o];
+            if (op.kind == value.VAL_INSTR && op.data.instr::u32 < st.pool_len) {
+                val g: u32 = st.gep_of[op.data.instr::u32];
+                if (g != ir_id.NONE) {
+                    taint_field(st, g, st.gep_field[op.data.instr::u32], op.secret || inst.secret);
+                    note_home(st, g, st.instr_block[i]);
+                    if (!gep_use_ok(st, g, op.data.instr, i::ir_id.InstructionId, inst, o)) { st.cand_out[g] = true; }
+                }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun gep_use_ok(st: *State, c: u32, gid: ir_id.InstructionId, uid: ir_id.InstructionId, inst: *ir_instruction.Instruction, o: u32) bool {
+    val cell: bool = !ir_type.is_nil(union_leaf_ty(st, agg_field_type(st, st.cand_ty[c], st.gep_field[gid::u32])));
+    if (inst.kind == ir_instruction.OP_LOAD && o == 0) {
+        if (cell) { ret union_access_ok(st, c, gid, inst.ty); }
+        ret true;
+    }
+    if (inst.kind == ir_instruction.OP_STORE && o == 1) {
+        if (st.cand_phi[c]) { ret false; }
+        if (cell)           { ret union_access_ok(st, c, gid, inst.operands[0].ty); }
+        ret true;
+    }
+    if (inst.kind == ir_instruction.OP_GEP && o == 0) { ret gep_stays_in_field(st, c, gid, uid, inst); }
+    ret false;
+}
+
+fun union_access_ok(st: *State, c: u32, gid: ir_id.InstructionId, at: ir_type.IrTypeId) bool {
+    if (!scalar_field(st, at)) { ret false; }
+    val ft:   ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], st.gep_field[gid::u32]);
+    val cell: u32              = ir_type.byte_size_for_machine(?st.m.types, ft, resolved.layout_machine(st.tgt));
+    val acc:  u32              = ir_type.byte_size_for_machine(?st.m.types, at, resolved.layout_machine(st.tgt));
+    if (acc > cell)                                                   { ret false; }
+    if (acc == cell)                                                  { ret true; }
+    if (!ir_type.same(union_leaf_ty(st, ft), int_of_bytes(st, cell))) { ret false; }
+    ret !ir_type.is_nil(int_of_bytes(st, acc));
+}
+
+# every instruction whose result some use takes as more than a place to load from or store into
+fun mark_escaping_addresses(st: *State) {
+    val fn: *me_ir.Function = st.fn;
+    var i:  u32             = 0;
+    for (i < st.pool_len) {
+        if (ir_id.block_is_nil(st.instr_block[i])) {
+            i = i + 1;
+            cnt;
+        }
+        val inst: *ir_instruction.Instruction = ?fn.instrs[i];
+        if (inst.kind == ir_instruction.OP_DBG_VALUE) {
+            i = i + 1;
+            cnt;
+        }
+        var o: u32 = 0;
+        for (o < inst.operand_count) {
+            val op: value.Value = inst.operands[o];
+            if (op.kind == value.VAL_INSTR && op.data.instr::u32 < st.pool_len) {
+                val place: bool = (inst.kind == ir_instruction.OP_LOAD && o == 0)
+                    || (inst.kind == ir_instruction.OP_STORE && o == 1);
+                if (!place) { st.escapes[op.data.instr::u32] = true; }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# a pointer-arithmetic gep on a field address stays in the field only when it adds no
+# offset and its own result is used just to load and store: passed on, the address reaches
+# the field's siblings, which a split no longer keeps beside it
+fun gep_stays_in_field(st: *State, c: u32, gid: ir_id.InstructionId, uid: ir_id.InstructionId, inst: *ir_instruction.Instruction) bool {
+    val ft: ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], st.gep_field[gid::u32]);
+    if (!ir_type.is_nil(union_leaf_ty(st, ft)))       { ret st.uni_gep[uid::u32]; }
+    if (st.escapes[uid::u32])                         { ret false; }
+    if (inst.operand_count < 2)                       { ret false; }
+    if (inst.operands[1].kind != value.VAL_CONST_INT) { ret false; }
+    if (inst.operands[1].data.int_lit != 0)           { ret false; }
+    ret ir_type.same(inst.aux_ty, ft);
+}
+
+fun check_partitions(st: *State) {
+    var c: u32 = 0;
+    for (c < st.cand_count) {
+        if (st.cand_phi[c] == false || st.cand_out[c]) {
+            c = c + 1;
+            cnt;
+        }
+        val home: ir_id.BlockId = st.cand_home[c];
+        if (ir_id.block_is_nil(home) || st.cand_local[c] == false) {
+            st.cand_out[c] = true;
+            c              = c + 1;
+            cnt;
+        }
+        if (block_writes_partition(st, home, c)) {
+            st.cand_out[c] = true;
+            c              = c + 1;
+            cnt;
+        }
+
+        val root: u32 = find_root(st, c);
+        var a:    u32 = 0;
+        for (a < st.cand_count) {
+            if (st.cand_phi[a] || find_root(st, a) != root) {
+                a = a + 1;
+                cnt;
+            }
+            if (st.cand_local[a] == false || ir_id.block_is_nil(st.cand_home[a])) {
+                st.cand_out[a] = true;
+                a              = a + 1;
+                cnt;
+            }
+            var b: u32 = 0;
+            for (b < st.cand_count) {
+                if (b == a || st.cand_phi[b] || find_root(st, b) != root) {
+                    b = b + 1;
+                    cnt;
+                }
+                if (ir_id.block_same(st.cand_home[b], st.cand_home[a])) { st.cand_out[a] = true; }
+                or {
+                    if (reaches_between(st, st.cand_home[a], st.cand_home[b], root)) { st.cand_out[a] = true; }
+                }
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+        c = c + 1;
+    }
+}
+
+fun reaches_between(st: *State, from: ir_id.BlockId, to: ir_id.BlockId, root: u32) bool {
+    var i: u32 = 0;
+    for (i < st.block_count) {
+        st.visit[i] = false;
+        i           = i + 1;
+    }
+
+    var tail: u32 = 0;
+    push_successors(st, from, ?tail);
+
+    var head: u32 = 0;
+    for (head < tail) {
+        val b: ir_id.BlockId = st.queue[head];
+        head = head + 1;
+        if (ir_id.block_same(b, to))             { ret true; }
+        if (is_partition_phi_block(st, b, root)) { cnt; }
+        push_successors(st, b, ?tail);
+    }
+    ret false;
+}
+
+fun push_successors(st: *State, b: ir_id.BlockId, tail: *u32) {
+    var s0: ir_id.BlockId = ir_id.BLOCK_NIL;
+    var s1: ir_id.BlockId = ir_id.BLOCK_NIL;
+    val n:  u32           = me_ir.block_successors(st.fn, ?st.fn.blocks[b::u32], ?s0, ?s1);
+    if (n >= 1) { push_block(st, s0, tail); }
+    if (n >= 2) { push_block(st, s1, tail); }
+}
+
+fun push_block(st: *State, b: ir_id.BlockId, tail: *u32) {
+    if (ir_id.block_is_nil(b) || b::u32 >= st.block_count) { ret; }
+    if (st.visit[b::u32])                                  { ret; }
+    st.visit[b::u32] = true;
+    st.queue[@tail]  = b;
+    @tail            = @tail + 1;
+}
+
+fun is_partition_phi_block(st: *State, b: ir_id.BlockId, root: u32) bool {
+    var c: u32 = 0;
+    for (c < st.cand_count) {
+        if (st.cand_phi[c] && find_root(st, c) == root && ir_id.block_same(st.cand_home[c], b)) { ret true; }
+        c = c + 1;
+    }
+    ret false;
+}
+
+fun block_writes_partition(st: *State, b: ir_id.BlockId, c: u32) bool {
+    val fn:   *me_ir.Function = st.fn;
+    val root: u32             = find_root(st, c);
+    val blk:  *me_ir.Block    = ?fn.blocks[b::u32];
+    var ix:   u32             = 0;
+    for (ix < blk.instr_count) {
+        val iid: ir_id.InstructionId = blk.instructions[ix];
+        ix = ix + 1;
+        if (iid::u32 >= st.pool_len) { cnt; }
+        val inst: *ir_instruction.Instruction = ?fn.instrs[iid::u32];
+
+        var target: value.Value;
+        if (inst.kind == ir_instruction.OP_MEMZERO && inst.operand_count >= 1) {
+            target = inst.operands[0];
+        }
+        or (inst.kind == ir_instruction.OP_STORE && inst.operand_count >= 2) {
+            target = inst.operands[1];
+        }
+        or { cnt; }
+
+        if (target.kind != value.VAL_INSTR || target.data.instr::u32 >= st.pool_len) { cnt; }
+        val ti:    u32 = target.data.instr::u32;
+        var owner: u32 = st.cand_of[ti];
+        if (owner == ir_id.NONE)                                 { owner = st.gep_of[ti]; }
+        if (owner != ir_id.NONE && find_root(st, owner) == root) { ret true; }
+    }
+    ret false;
+}
+
+fun propagate_escapes(st: *State) {
+    val fn:      *me_ir.Function = st.fn;
+    var changed: bool            = true;
+    for (changed) {
+        changed = false;
+
+        var c: u32 = 0;
+        for (c < st.cand_count) {
+            if (st.cand_out[c]) { st.cand_out[find_root(st, c)] = true; }
+            c = c + 1;
+        }
+        var d: u32 = 0;
+        for (d < st.cand_count) {
+            if (st.cand_out[d] == false && st.cand_out[find_root(st, d)]) {
+                st.cand_out[d] = true;
+                changed        = true;
+            }
+            d = d + 1;
+        }
+
+        var i: u32 = 0;
+        for (i < st.pool_len) {
+            if (ir_id.block_is_nil(st.instr_block[i])) {
+                i = i + 1;
+                cnt;
+            }
+            val inst: *ir_instruction.Instruction = ?fn.instrs[i];
+            if (inst.kind != ir_instruction.OP_STORE || inst.operand_count < 2) {
+                i = i + 1;
+                cnt;
+            }
+            val sv: value.Value = inst.operands[0];
+            val dv: value.Value = inst.operands[1];
+            if (sv.kind != value.VAL_INSTR || dv.kind != value.VAL_INSTR) {
+                i = i + 1;
+                cnt;
+            }
+            if (sv.data.instr::u32 >= st.pool_len || dv.data.instr::u32 >= st.pool_len) {
+                i = i + 1;
+                cnt;
+            }
+            val sc: u32 = st.cand_of[sv.data.instr::u32];
+            val dc: u32 = st.cand_of[dv.data.instr::u32];
+            if (sc != ir_id.NONE && st.cand_out[sc] == false) {
+                if (dc == ir_id.NONE || st.cand_out[dc]) {
+                    st.cand_out[sc] = true;
+                    changed         = true;
+                }
+            }
+            i = i + 1;
+        }
+    }
+}
+
+fun assign_slots(st: *State) u32 {
+    var total: u32 = 0;
+    var live:  u32 = 0;
+    var c:     u32 = 0;
+    for (c < st.cand_count) {
+        if (st.cand_out[c] == false && find_root(st, c) == c) {
+            st.cand_slot[c] = total;
+            total           = total + st.cand_nf[c];
+        }
+        c = c + 1;
+    }
+    var d: u32 = 0;
+    for (d < st.cand_count) {
+        if (st.cand_out[d] == false) {
+            st.cand_slot[d] = st.cand_slot[find_root(st, d)];
+            live            = live + 1;
+        }
+        d = d + 1;
+    }
+    st.slot_total = total;
+    ret live;
+}
+
+rec Cursor {
+    bid: ir_id.BlockId;
+    loc: lang_source.Location;
+}
+
+fun rewrite(st: *State) err[fail.Fail] {
+    val r_slots: res[*value.Value, A.Error] = A.allocate[value.Value](st.alloc, st.slot_total::usize);
+    if (sel r_slots.err) { ret err[fail.Fail].err{fail.refused(r_slots.err)}; }
+    st.slots = r_slots.ok;
+
+    val r_types: err[fail.Fail] = intern_types(st);
+    if (sel r_types.err) { ret r_types; }
+
+    val r_alloc: err[fail.Fail] = emit_field_slots(st);
+    if (sel r_alloc.err) { ret r_alloc; }
+
+    var rw:   mutate.Rewrite;
+    val r_rw: err[fail.Fail] = mutate.rewrite_init(?rw, st.alloc, st.fn.instr_len);
+    if (sel r_rw.err) { ret r_rw; }
+
+    val r_body: err[fail.Fail] = rewrite_blocks(st, ?rw);
+    if (sel r_body.err) {
+        mutate.rewrite_dnit(?rw, st.alloc);
+        ret r_body;
+    }
+
+    mutate.rewrite_apply(st.fn, ?rw);
+    mutate.rewrite_dnit(?rw, st.alloc);
+
+    val changed_r: res[bool, fail.Fail] = mutate.erase_marked[State](st.m, st.fn, st.alloc, st, erase_test);
+    if (sel changed_r.err) { ret err[fail.Fail].err{changed_r.err}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun intern_types(st: *State) err[fail.Fail] {
+    val rp: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?st.m.types);
+    if (sel rp.err) { ret err[fail.Fail].err{rp.err}; }
+    st.ptr_ty = rp.ok;
+
+    val rv: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_void(?st.m.types);
+    if (sel rv.err) { ret err[fail.Fail].err{rv.err}; }
+    st.void_ty = rv.ok;
+
+    val ri: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?st.m.types, 64);
+    if (sel ri.err) { ret err[fail.Fail].err{ri.err}; }
+    st.i64_ty = ri.ok;
+    ret err[fail.Fail].ok{};
+}
+
+# an instruction over the `n` operands allocated at `ops`, which it takes,
+# listed at the end of the cursor's block
+fun emit(st: *State, cur: *Cursor, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId,
+    ops: *value.Value, n: u32, aux_ty: ir_type.IrTypeId, secret: bool) res[ir_id.InstructionId, fail.Fail] {
+    var bld: builder.Builder = builder.init(st.m);
+    builder.set_function(?bld, st.fn);
+    builder.set_loc(?bld, cur.loc);
+    builder.set_secret(?bld, secret);
+    builder.at_end(?bld, cur.bid);
+    ret builder.emit_instr_owned(?bld, kind, ty, aux_ty, ops, n);
+}
+
+fun emit_slot(st: *State, cur: *Cursor, ft: ir_type.IrTypeId, secret: bool) res[value.Value, fail.Fail] {
+    val r: res[*value.Value, A.Error] = A.allocate[value.Value](st.m.alloc, 1::usize);
+    if (sel r.err) { ret res[value.Value, fail.Fail].err{fail.refused(r.err)}; }
+    val ops: *value.Value = r.ok;
+    ops[0] = value.const_int(1, st.i64_ty);
+
+    val ri: res[ir_id.InstructionId, fail.Fail] = emit(st, cur, ir_instruction.OP_ALLOCA, st.ptr_ty, ops, 1, ft, secret);
+    if (sel ri.err) { ret res[value.Value, fail.Fail].err{ri.err}; }
+    var v: value.Value = value.instr(ri.ok, st.ptr_ty);
+    v.secret = secret;
+    ret res[value.Value, fail.Fail].ok{v};
+}
+
+fun emit_store(st: *State, cur: *Cursor, v: value.Value, ptr: value.Value, secret: bool) err[fail.Fail] {
+    val r: res[*value.Value, A.Error] = A.allocate[value.Value](st.m.alloc, 2::usize);
+    if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
+    val ops: *value.Value = r.ok;
+    ops[0] = v;
+    ops[1] = ptr;
+    val ri: res[ir_id.InstructionId, fail.Fail] = emit(st, cur, ir_instruction.OP_STORE, st.void_ty, ops, 2,
+        ir_type.IRT_NIL, secret || v.secret);
+    if (sel ri.err) { ret err[fail.Fail].err{ri.err}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun emit_load(st: *State, cur: *Cursor, ptr: value.Value, ty: ir_type.IrTypeId, secret: bool) res[value.Value, fail.Fail] {
+    val r: res[*value.Value, A.Error] = A.allocate[value.Value](st.m.alloc, 1::usize);
+    if (sel r.err) { ret res[value.Value, fail.Fail].err{fail.refused(r.err)}; }
+    val ops: *value.Value = r.ok;
+    ops[0] = ptr;
+    val ri: res[ir_id.InstructionId, fail.Fail] = emit(st, cur, ir_instruction.OP_LOAD, ty, ops, 1, ir_type.IRT_NIL, secret);
+    if (sel ri.err) { ret res[value.Value, fail.Fail].err{ri.err}; }
+    var v: value.Value = value.instr(ri.ok, ty);
+    v.secret = secret;
+    ret res[value.Value, fail.Fail].ok{v};
+}
+
+fun emit_bitcast(st: *State, cur: *Cursor, v: value.Value, to: ir_type.IrTypeId, secret: bool) res[value.Value, fail.Fail] {
+    val r: res[*value.Value, A.Error] = A.allocate[value.Value](st.m.alloc, 1::usize);
+    if (sel r.err) { ret res[value.Value, fail.Fail].err{fail.refused(r.err)}; }
+    val ops: *value.Value = r.ok;
+    ops[0] = v;
+    val tainted: bool                                = secret || v.secret;
+    val ri:      res[ir_id.InstructionId, fail.Fail] = emit(st, cur, ir_instruction.OP_BITCAST, to, ops, 1, ir_type.IRT_NIL, tainted);
+    if (sel ri.err) { ret res[value.Value, fail.Fail].err{ri.err}; }
+    var out: value.Value = value.instr(ri.ok, to);
+    out.secret = tainted;
+    ret res[value.Value, fail.Fail].ok{out};
+}
+
+fun emit_convert(st: *State, cur: *Cursor, kind: ir_instruction.InstrKind, v: value.Value,
+    to: ir_type.IrTypeId, secret: bool) res[value.Value, fail.Fail] {
+    val r: res[*value.Value, A.Error] = A.allocate[value.Value](st.m.alloc, 1::usize);
+    if (sel r.err) { ret res[value.Value, fail.Fail].err{fail.refused(r.err)}; }
+    val ops: *value.Value = r.ok;
+    ops[0] = v;
+    val tainted: bool                                = secret || v.secret;
+    val ri:      res[ir_id.InstructionId, fail.Fail] = emit(st, cur, kind, to, ops, 1, ir_type.IRT_NIL, tainted);
+    if (sel ri.err) { ret res[value.Value, fail.Fail].err{ri.err}; }
+    var out: value.Value = value.instr(ri.ok, to);
+    out.secret = tainted;
+    ret res[value.Value, fail.Fail].ok{out};
+}
+
+fun emit_binary(st: *State, cur: *Cursor, kind: ir_instruction.InstrKind, a: value.Value,
+    b: value.Value, secret: bool) res[value.Value, fail.Fail] {
+    val r: res[*value.Value, A.Error] = A.allocate[value.Value](st.m.alloc, 2::usize);
+    if (sel r.err) { ret res[value.Value, fail.Fail].err{fail.refused(r.err)}; }
+    val ops: *value.Value = r.ok;
+    ops[0] = a;
+    ops[1] = b;
+    val tainted: bool                                = secret || a.secret || b.secret;
+    val ri:      res[ir_id.InstructionId, fail.Fail] = emit(st, cur, kind, a.ty, ops, 2, ir_type.IRT_NIL, tainted);
+    if (sel ri.err) { ret res[value.Value, fail.Fail].err{ri.err}; }
+    var out: value.Value = value.instr(ri.ok, a.ty);
+    out.secret = tainted;
+    ret res[value.Value, fail.Fail].ok{out};
+}
+
+fun emit_memzero(st: *State, cur: *Cursor, ptr: value.Value, ft: ir_type.IrTypeId, secret: bool) err[fail.Fail] {
+    val r: res[*value.Value, A.Error] = A.allocate[value.Value](st.m.alloc, 1::usize);
+    if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
+    val ops: *value.Value = r.ok;
+    ops[0] = ptr;
+    val ri: res[ir_id.InstructionId, fail.Fail] = emit(st, cur, ir_instruction.OP_MEMZERO, st.void_ty, ops, 1, ft, secret);
+    if (sel ri.err) { ret err[fail.Fail].err{ri.err}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun emit_field_gep(st: *State, cur: *Cursor, base: value.Value, ty: ir_type.IrTypeId, k: u32, secret: bool) res[value.Value, fail.Fail] {
+    val r: res[*value.Value, A.Error] = A.allocate[value.Value](st.m.alloc, 3::usize);
+    if (sel r.err) { ret res[value.Value, fail.Fail].err{fail.refused(r.err)}; }
+    val ops: *value.Value = r.ok;
+    ops[0] = base;
+    ops[1] = value.const_int(0, st.i64_ty);
+    ops[2] = value.const_int(k::u64, st.i64_ty);
+    val ri: res[ir_id.InstructionId, fail.Fail] = emit(st, cur, ir_instruction.OP_GEP, st.ptr_ty, ops, 3, ty, secret);
+    if (sel ri.err) { ret res[value.Value, fail.Fail].err{ri.err}; }
+    var v: value.Value = value.instr(ri.ok, st.ptr_ty);
+    v.secret = secret;
+    ret res[value.Value, fail.Fail].ok{v};
+}
+
+fun emit_field_slots(st: *State) err[fail.Fail] {
+    val before: u32 = st.fn.blocks[0].instr_count;
+    var cur:    Cursor;
+    cur.bid = ir_id.block(0);
+
+    var c: u32 = 0;
+    for (c < st.cand_count) {
+        if (st.cand_out[c] || find_root(st, c) != c) {
+            c = c + 1;
+            cnt;
+        }
+        cur.loc = st.fn.instrs[st.cand_id[c]::u32].loc;
+        var k: u32 = 0;
+        for (k < st.cand_nf[c]) {
+            val ft: ir_type.IrTypeId = slot_ty(st, st.cand_ty[c], k);
+            if (void_field(st, ft)) {
+                st.slots[st.cand_slot[c] + k] = value.const_null(ir_type.IRT_NIL);
+                k                             = k + 1;
+                cnt;
+            }
+            val r: res[value.Value, fail.Fail] = emit_slot(st, ?cur, ft, partition_field_secret(st, c, k));
+            if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+            st.slots[st.cand_slot[c] + k] = r.ok;
+            k                             = k + 1;
+        }
+        c = c + 1;
+    }
+
+    ret rotate_to_front(st, ir_id.block(0), before);
+}
+
+fun partition_field_secret(st: *State, c: u32, k: u32) bool {
+    if (k >= MAX_FIELDS) { ret true; }
+    val root: u32 = find_root(st, c);
+    var d:    u32 = 0;
+    for (d < st.cand_count) {
+        if (st.field_secret[d * MAX_FIELDS + k] && find_root(st, d) == root) { ret true; }
+        d = d + 1;
+    }
+    ret false;
+}
+
+fun rotate_to_front(st: *State, bid: ir_id.BlockId, before: u32) err[fail.Fail] {
+    val blk: *me_ir.Block = ?st.fn.blocks[bid::u32];
+    if (blk.instr_count == before) { ret err[fail.Fail].ok{}; }
+
+    val r: res[*ir_id.InstructionId, A.Error] = A.allocate[ir_id.InstructionId](st.alloc, blk.instr_count::usize);
+    if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
+    val tmp: *ir_id.InstructionId = r.ok;
+
+    var w: u32 = 0;
+    var i: u32 = before;
+    for (i < blk.instr_count) {
+        tmp[w] = blk.instructions[i];
+        w      = w + 1;
+        i      = i + 1;
+    }
+    var j: u32 = 0;
+    for (j < before) {
+        tmp[w] = blk.instructions[j];
+        w      = w + 1;
+        j      = j + 1;
+    }
+    var z: u32 = 0;
+    for (z < blk.instr_count) {
+        blk.instructions[z] = tmp[z];
+        z                   = z + 1;
+    }
+
+    A.deallocate[ir_id.InstructionId](st.alloc, tmp, blk.instr_count::usize);
+    ret err[fail.Fail].ok{};
+}
+
+fun rewrite_blocks(st: *State, rw: *mutate.Rewrite) err[fail.Fail] {
+    var bi: u32 = 0;
+    for (bi < st.fn.block_count) {
+        val res_: err[fail.Fail] = rewrite_block(st, rw, bi::ir_id.BlockId);
+        if (sel res_.err) { ret res_; }
+        bi = bi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun rewrite_block(st: *State, rw: *mutate.Rewrite, bid: ir_id.BlockId) err[fail.Fail] {
+    val old_n: u32 = st.fn.blocks[bid::u32].instr_count;
+    if (old_n == 0) { ret err[fail.Fail].ok{}; }
+
+    var old:   *ir_id.InstructionId = nil;
+    var added: *u32                 = nil;
+    fin {
+        if (old != nil)   { A.deallocate[ir_id.InstructionId](st.alloc, old, old_n::usize); }
+        if (added != nil) { A.deallocate[u32](st.alloc, added, old_n::usize); }
+    }
+    val r_old: res[*ir_id.InstructionId, A.Error] = A.allocate[ir_id.InstructionId](st.alloc, old_n::usize);
+    if (sel r_old.err) { ret err[fail.Fail].err{fail.refused(r_old.err)}; }
+    old = r_old.ok;
+    var s: u32 = 0;
+    for (s < old_n) {
+        old[s] = st.fn.blocks[bid::u32].instructions[s];
+        s      = s + 1;
+    }
+
+    val r_cnt: res[*u32, A.Error] = A.allocate[u32](st.alloc, old_n::usize);
+    if (sel r_cnt.err) { ret err[fail.Fail].err{fail.refused(r_cnt.err)}; }
+    added = r_cnt.ok;
+
+    var failed: opt[fail.Fail] = opt[fail.Fail].none{};
+    var ix:     u32            = 0;
+    for (ix < old_n && sel failed.none) {
+        val at:   u32            = st.fn.blocks[bid::u32].instr_count;
+        val res_: err[fail.Fail] = rewrite_instr(st, rw, bid, old[ix]);
+        if (sel res_.err) { failed = opt[fail.Fail].some{res_.err}; }
+        or                { added[ix] = st.fn.blocks[bid::u32].instr_count - at; }
+        ix = ix + 1;
+    }
+
+    var relaid: err[fail.Fail] = err[fail.Fail].ok{};
+    if (sel failed.none) { relaid = relayout_block(st, bid, old, old_n, added); }
+
+    if (sel failed.some) { ret err[fail.Fail].err{failed.some}; }
+    ret relaid;
+}
+
+fun relayout_block(st: *State, bid: ir_id.BlockId, old: *ir_id.InstructionId, old_n: u32, added: *u32) err[fail.Fail] {
+    val blk:   *me_ir.Block = ?st.fn.blocks[bid::u32];
+    val total: u32          = blk.instr_count;
+    if (total == old_n) { ret err[fail.Fail].ok{}; }
+
+    val r: res[*ir_id.InstructionId, A.Error] = A.allocate[ir_id.InstructionId](st.alloc, total::usize);
+    if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
+    val plan: *ir_id.InstructionId = r.ok;
+
+    var w:   u32 = 0;
+    var src: u32 = old_n;
+    var ix:  u32 = 0;
+    for (ix < old_n) {
+        var a: u32 = 0;
+        for (a < added[ix]) {
+            plan[w] = blk.instructions[src];
+            w       = w + 1;
+            src     = src + 1;
+            a       = a + 1;
+        }
+        plan[w] = old[ix];
+        w       = w + 1;
+        ix      = ix + 1;
+    }
+    var z: u32 = 0;
+    for (z < total) {
+        blk.instructions[z] = plan[z];
+        z                   = z + 1;
+    }
+
+    A.deallocate[ir_id.InstructionId](st.alloc, plan, total::usize);
+    ret err[fail.Fail].ok{};
+}
+
+fun rewrite_instr(st: *State, rw: *mutate.Rewrite, bid: ir_id.BlockId, iid: ir_id.InstructionId) err[fail.Fail] {
+    if (iid::u32 >= st.pool_len) { ret err[fail.Fail].ok{}; }
+    val inst: *ir_instruction.Instruction = ?st.fn.instrs[iid::u32];
+    var cur:  Cursor;
+    cur.bid = bid;
+    cur.loc = inst.loc;
+
+    val g: u32 = st.gep_of[iid::u32];
+    if (g != ir_id.NONE && st.cand_out[g] == false) { ret retarget_gep(st, rw, iid, g); }
+
+    if (inst.kind == ir_instruction.OP_LOAD && inst.operand_count >= 1) {
+        val ug: u32 = union_access_at(st, inst.operands[0]);
+        if (ug != ir_id.NONE) { ret reinterpret_load(st, rw, ?cur, iid, inst, ug); }
+    }
+
+    if (inst.kind == ir_instruction.OP_STORE && inst.operand_count >= 2) {
+        val ug: u32 = union_access_at(st, inst.operands[1]);
+        if (ug != ir_id.NONE) { ret reinterpret_store(st, ?cur, iid, inst, ug); }
+    }
+
+    if (inst.kind == ir_instruction.OP_MEMZERO && inst.operand_count >= 1) {
+        val c: u32 = candidate_at(st, inst.operands[0]);
+        if (c != ir_id.NONE && st.cand_out[c] == false) {
+            st.erase[iid::u32] = true;
+            ret expand_memzero(st, ?cur, c);
+        }
+        ret err[fail.Fail].ok{};
+    }
+
+    if (inst.kind == ir_instruction.OP_STORE && inst.operand_count >= 2) {
+        val dc: u32 = candidate_at(st, inst.operands[1]);
+        if (dc != ir_id.NONE && st.cand_out[dc] == false) {
+            st.erase[iid::u32] = true;
+            ret expand_copy(st, ?cur, dc, inst.operands[0]);
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun union_access_at(st: *State, v: value.Value) u32 {
+    if (v.kind != value.VAL_INSTR)        { ret ir_id.NONE; }
+    if (v.data.instr::u32 >= st.pool_len) { ret ir_id.NONE; }
+    val gid: u32 = v.data.instr::u32;
+    val c:   u32 = st.gep_of[gid];
+    if (c == ir_id.NONE || st.cand_out[c])                                                       { ret ir_id.NONE; }
+    if (ir_type.is_nil(union_leaf_ty(st, agg_field_type(st, st.cand_ty[c], st.gep_field[gid])))) { ret ir_id.NONE; }
+    ret gid;
+}
+
+fun reinterpret_load(st: *State, rw: *mutate.Rewrite, cur: *Cursor, iid: ir_id.InstructionId,
+    inst: *ir_instruction.Instruction, gid: u32) err[fail.Fail] {
+    val c:   u32              = st.gep_of[gid];
+    val sty: ir_type.IrTypeId = slot_ty(st, st.cand_ty[c], st.gep_field[gid]);
+    if (ir_type.same(inst.ty, sty)) { ret err[fail.Fail].ok{}; }
+
+    val slot:    value.Value                 = st.slots[st.cand_slot[c] + st.gep_field[gid]];
+    val tainted: bool                        = inst.secret || partition_field_secret(st, c, st.gep_field[gid]);
+    val inst_ty: ir_type.IrTypeId            = inst.ty;
+    val r_load:  res[value.Value, fail.Fail] = emit_load(st, cur, slot, sty, tainted);
+    if (sel r_load.err) { ret err[fail.Fail].err{r_load.err}; }
+    var cur_v: value.Value = r_load.ok;
+
+    val acc: u32 = ir_type.byte_size_for_machine(?st.m.types, inst_ty, resolved.layout_machine(st.tgt));
+    if (acc < ir_type.byte_size_for_machine(?st.m.types, sty, resolved.layout_machine(st.tgt))) {
+        val r_tr: res[value.Value, fail.Fail] = emit_convert(st, cur, ir_instruction.OP_TRUNC, cur_v,
+            int_of_bytes(st, acc), tainted);
+        if (sel r_tr.err) { ret err[fail.Fail].err{r_tr.err}; }
+        cur_v = r_tr.ok;
+    }
+    if (!ir_type.same(cur_v.ty, inst_ty)) {
+        val r_cast: res[value.Value, fail.Fail] = emit_bitcast(st, cur, cur_v, inst_ty, tainted);
+        if (sel r_cast.err) { ret err[fail.Fail].err{r_cast.err}; }
+        cur_v = r_cast.ok;
+    }
+
+    mutate.replace_value(rw, iid, cur_v);
+    st.erase[iid::u32] = true;
+    ret err[fail.Fail].ok{};
+}
+
+fun reinterpret_store(st: *State, cur: *Cursor, iid: ir_id.InstructionId,
+    inst: *ir_instruction.Instruction, gid: u32) err[fail.Fail] {
+    val c:   u32              = st.gep_of[gid];
+    val sty: ir_type.IrTypeId = slot_ty(st, st.cand_ty[c], st.gep_field[gid]);
+    val v:   value.Value      = inst.operands[0];
+    if (ir_type.same(v.ty, sty)) { ret err[fail.Fail].ok{}; }
+
+    val slot:    value.Value = st.slots[st.cand_slot[c] + st.gep_field[gid]];
+    val tainted: bool        = inst.secret || v.secret || partition_field_secret(st, c, st.gep_field[gid]);
+    val acc:     u32         = ir_type.byte_size_for_machine(?st.m.types, v.ty, resolved.layout_machine(st.tgt));
+    val cell:    u32         = ir_type.byte_size_for_machine(?st.m.types, sty, resolved.layout_machine(st.tgt));
+
+    var cur_v: value.Value = v;
+    if (acc < cell) {
+        if (!ir_type.same(cur_v.ty, int_of_bytes(st, acc))) {
+            val r_ci: res[value.Value, fail.Fail] = emit_bitcast(st, cur, cur_v, int_of_bytes(st, acc), tainted);
+            if (sel r_ci.err) { ret err[fail.Fail].err{r_ci.err}; }
+            cur_v = r_ci.ok;
+        }
+        val r_z: res[value.Value, fail.Fail] = emit_convert(st, cur, ir_instruction.OP_ZEXT, cur_v, sty, tainted);
+        if (sel r_z.err) { ret err[fail.Fail].err{r_z.err}; }
+        cur_v = r_z.ok;
+
+        val r_old: res[value.Value, fail.Fail] = emit_load(st, cur, slot, sty, tainted);
+        if (sel r_old.err) { ret err[fail.Fail].err{r_old.err}; }
+        val keep:  value.Value                 = value.const_int(~((1::u64 << (acc * 8)) - 1), sty);
+        val r_and: res[value.Value, fail.Fail] = emit_binary(st, cur, ir_instruction.OP_AND,
+            r_old.ok, keep, tainted);
+        if (sel r_and.err) { ret err[fail.Fail].err{r_and.err}; }
+        val r_or: res[value.Value, fail.Fail] = emit_binary(st, cur, ir_instruction.OP_OR,
+            r_and.ok, cur_v, tainted);
+        if (sel r_or.err) { ret err[fail.Fail].err{r_or.err}; }
+        cur_v = r_or.ok;
+    }
+    or {
+        val r_cast: res[value.Value, fail.Fail] = emit_bitcast(st, cur, cur_v, sty, tainted);
+        if (sel r_cast.err) { ret err[fail.Fail].err{r_cast.err}; }
+        cur_v = r_cast.ok;
+    }
+
+    val r_store: err[fail.Fail] = emit_store(st, cur, cur_v, slot, tainted);
+    if (sel r_store.err) { ret r_store; }
+    st.erase[iid::u32] = true;
+    ret err[fail.Fail].ok{};
+}
+
+fun candidate_at(st: *State, v: value.Value) u32 {
+    if (v.kind != value.VAL_INSTR)        { ret ir_id.NONE; }
+    if (v.data.instr::u32 >= st.pool_len) { ret ir_id.NONE; }
+    ret st.cand_of[v.data.instr::u32];
+}
+
+fun retarget_gep(st: *State, rw: *mutate.Rewrite, gid: ir_id.InstructionId, c: u32) err[fail.Fail] {
+    val inst: *ir_instruction.Instruction = ?st.fn.instrs[gid::u32];
+    val k:    u32                         = st.gep_field[gid::u32];
+    val slot: value.Value                 = st.slots[st.cand_slot[c] + k];
+
+    if (inst.operand_count == 3) {
+        mutate.replace_value(rw, gid, slot);
+        st.erase[gid::u32] = true;
+        ret err[fail.Fail].ok{};
+    }
+
+    val n: u32                                = inst.operand_count - 1;
+    val r: res[me_ir.OperandArray, fail.Fail] = me_ir.operands_alloc(st.m, n);
+    if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+    val arr: me_ir.OperandArray = r.ok;
+    arr.ops[0] = slot;
+    arr.ops[1] = inst.operands[1];
+    var i: u32 = 3;
+    var w: u32 = 2;
+    for (i < inst.operand_count) {
+        arr.ops[w] = inst.operands[i];
+        w          = w + 1;
+        i          = i + 1;
+    }
+
+    me_ir.instr_replace_operands(st.m, inst, arr);
+    inst.aux_ty = agg_field_type(st, st.cand_ty[c], k);
+    ret err[fail.Fail].ok{};
+}
+
+# zeroing writes a public constant, so each field's store carries the field's own secrecy and not the object's
+fun expand_memzero(st: *State, cur: *Cursor, c: u32) err[fail.Fail] {
+    var k: u32 = 0;
+    for (k < st.cand_nf[c]) {
+        val ft: ir_type.IrTypeId = slot_ty(st, st.cand_ty[c], k);
+        if (void_field(st, ft)) {
+            k = k + 1;
+            cnt;
+        }
+        val slot:    value.Value = st.slots[st.cand_slot[c] + k];
+        val tainted: bool        = partition_field_secret(st, c, k);
+        if (ir_type.is_aggregate(?st.m.types, ft)) {
+            val r: err[fail.Fail] = emit_memzero(st, cur, slot, ft, tainted);
+            if (sel r.err) { ret r; }
+        }
+        or {
+            val r: err[fail.Fail] = emit_store(st, cur, zero_of(st, ft), slot, tainted);
+            if (sel r.err) { ret r; }
+        }
+        k = k + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a whole-object copy is secret only in the fields whose typed accesses are: the object's own flag is the union
+# over its fields and would make every public field secret
+fun expand_copy(st: *State, cur: *Cursor, dst: u32, src: value.Value) err[fail.Fail] {
+    val sc: u32 = candidate_at(st, src);
+    var k:  u32 = 0;
+    for (k < st.cand_nf[dst]) {
+        if (void_field(st, slot_ty(st, st.cand_ty[dst], k))) {
+            k = k + 1;
+            cnt;
+        }
+        var tainted: bool = partition_field_secret(st, dst, k);
+        var from:    value.Value;
+        if (sc != ir_id.NONE && st.cand_out[sc] == false) {
+            from = st.slots[st.cand_slot[sc] + k];
+            if (partition_field_secret(st, sc, k)) { tainted = true; }
+        }
+        or {
+            val r: res[value.Value, fail.Fail] = emit_field_gep(st, cur, src, st.cand_ty[dst], k, tainted);
+            if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+            from = r.ok;
+        }
+        val res_: err[fail.Fail] = copy_field(st, cur, st.slots[st.cand_slot[dst] + k],
+            from, slot_ty(st, st.cand_ty[dst], k), tainted);
+        if (sel res_.err) { ret res_; }
+        k = k + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun copy_field(st: *State, cur: *Cursor, slot: value.Value, from: value.Value, ft: ir_type.IrTypeId, tainted: bool) err[fail.Fail] {
+    if (ir_type.is_aggregate(?st.m.types, ft)) {
+        ret emit_store(st, cur, value.retype(from, ft), slot, tainted);
+    }
+    val r_load: res[value.Value, fail.Fail] = emit_load(st, cur, from, ft, tainted);
+    if (sel r_load.err) { ret err[fail.Fail].err{r_load.err}; }
+    ret emit_store(st, cur, r_load.ok, slot, tainted);
+}
+
+fun zero_of(st: *State, ft: ir_type.IrTypeId) value.Value {
+    if (ir_type.is_float_scalar(?st.m.types, ft)) { ret value.const_float(0.0, ft); }
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?st.m.types, ft);
+    if (sel opt_.some) {
+        if (sel opt_.none)                     { ret value.const_null(ft); }
+        if (opt_.some.kind == ir_type.IRT_PTR) { ret value.const_null(ft); }
+    }
+    ret value.const_int(0, ft);
+}
+
+fun erase_test(st: *State, iid: ir_id.InstructionId) bool {
+    if (iid::u32 >= st.pool_len) { ret false; }
+    if (st.erase[iid::u32])      { ret true; }
+    val c: u32 = st.cand_of[iid::u32];
+    ret c != ir_id.NONE && st.cand_out[c] == false;
+}
+
+#[testing]
+fun ut_count(fn: *me_ir.Function, kind: ir_instruction.InstrKind) u32 {
+    var n: u32 = 0;
+    var b: u32 = 0;
+    for (b < fn.block_count) {
+        val blk: *me_ir.Block = ?fn.blocks[b];
+        var i:   u32          = 0;
+        for (i < blk.instr_count) {
+            if (fn.instrs[blk.instructions[i]::u32].kind == kind) { n = n + 1; }
+            i = i + 1;
+        }
+        var p: u32 = 0;
+        for (p < blk.phi_count) {
+            if (fn.instrs[blk.phis[p]::u32].kind == kind) { n = n + 1; }
+            p = p + 1;
+        }
+        b = b + 1;
+    }
+    ret n;
+}
+
+#[testing]
+fun ut_ret_value(fn: *me_ir.Function) value.Value {
+    var b: u32 = 0;
+    for (b < fn.block_count) {
+        val blk: *me_ir.Block = ?fn.blocks[b];
+        if (!ir_id.instruction_is_nil(blk.terminator)) {
+            val t: *ir_instruction.Instruction = ?fn.instrs[blk.terminator::u32];
+            if (t.kind == ir_instruction.OP_RET && t.operand_count >= 1) { ret t.operands[0]; }
+        }
+        b = b + 1;
+    }
+    ret value.const_null(ir_type.IRT_NIL);
+}
+
+#[testing]
+fun ut_rec2(m: *me_ir.Module, out: *ir_type.IrTypeId) i32 {
+    val r8: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    if (sel r8.err) { ret 1; }
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) { ret 1; }
+    var fields: [2]ir_type.IrTypeId;
+    fields[0] = r8.ok;
+    fields[1] = r64.ok;
+    val rs: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_struct(?m.types, ?fields[0], 2, 0, false);
+    if (sel rs.err) { ret 1; }
+    @out = rs.ok;
+    ret 0;
+}
+
+#[testing]
+fun ut_gep(b: *builder.Builder, m: *me_ir.Module, base: value.Value, ty: ir_type.IrTypeId, k: u64) res[value.Value, fail.Fail] {
+    val r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r.err) { ret res[value.Value, fail.Fail].err{r.err}; }
+    val i64t: ir_type.IrTypeId = r.ok;
+    var idx:  [2]value.Value;
+    idx[0] = value.const_int(0, i64t);
+    idx[1] = value.const_int(k, i64t);
+    ret builder.emit_gep(b, base, ty, ?idx[0], 2);
+}
+
+#[testing]
+fun ut_field_type(m: *me_ir.Module, ty: ir_type.IrTypeId, k: u32) ir_type.IrTypeId {
+    val opt_: opt[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (sel opt_.none) { ret ir_type.IRT_NIL; }
+    val t: *ir_type.IrType = opt_.some;
+    if (t.kind == ir_type.IRT_ARRAY)     { ret t.data.array_.element; }
+    if (k >= t.data.struct_.field_count) { ret ir_type.IRT_NIL; }
+    ret t.data.struct_.fields[k];
+}
+
+#[testing]
+fun ut_build_local(m: *me_ir.Module, b: *builder.Builder, rec: ir_type.IrTypeId, slot: *value.Value) u32 {
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) { ret ir_id.NONE; }
+    val i64t: ir_type.IrTypeId = r64.ok;
+    val ft:   ir_type.IrTypeId = ut_field_type(m, rec, 1);
+    if (ir_type.is_nil(ft)) { ret ir_id.NONE; }
+
+    val rf: res[u32, fail.Fail] = me_ir.function_add(m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) { ret ir_id.NONE; }
+    val ix: u32 = rf.ok;
+
+    builder.set_function(b, ?m.functions[ix]);
+    val rb: res[ir_id.BlockId, fail.Fail] = builder.new_block(b);
+    if (sel rb.err) { ret ir_id.NONE; }
+    builder.set_block(b, rb.ok);
+
+    val ra: res[value.Value, fail.Fail] = builder.emit_alloca(b, rec, value.const_int(1, i64t));
+    if (sel ra.err) { ret ir_id.NONE; }
+    @slot = ra.ok;
+    val zeroed: err[fail.Fail] = builder.emit_memzero(b, @slot, rec);
+    if (sel zeroed.err) { ret ir_id.NONE; }
+
+    val g1: res[value.Value, fail.Fail] = ut_gep(b, m, @slot, rec, 1);
+    if (sel g1.err) { ret ir_id.NONE; }
+    val stored_g1: err[fail.Fail] = builder.emit_store(b, value.param(0, ft), g1.ok);
+    if (sel stored_g1.err) { ret ir_id.NONE; }
+    ret ix;
+}
+
+test run__declines_each_defeating_use {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    var rec: ir_type.IrTypeId;
+    if (ut_rec2(?m, ?rec) != 0) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId                 = r64.ok;
+    val rp:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val ptrt: ir_type.IrTypeId                 = rp.ok;
+    val rv:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_void(?m.types);
+    if (sel rv.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val voidt: ir_type.IrTypeId = rv.ok;
+
+    val rc: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, me_ir.FN_FLAG_EXTERN);
+    if (sel rc.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val callee: value.Value = value.fn(rc.ok, ptrt);
+
+    var code: i32             = 0;
+    var b:    builder.Builder = builder.init(?m);
+    var slot: value.Value;
+
+    val f_cast: u32 = ut_build_local(?m, ?b, rec, ?slot);
+    if (f_cast == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val cast: res[value.Value, fail.Fail] = builder.emit_bitcast(?b, slot, ptrt);
+    if (sel cast.err) { code = 1; }
+    val cast_returned: err[fail.Fail] = builder.emit_ret_void(?b);
+    if (sel cast_returned.err) { code = 1; }
+
+    val f_var: u32 = ut_build_local(?m, ?b, rec, ?slot);
+    if (f_var == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    var idx: [2]value.Value;
+    idx[0] = value.const_int(0, i64t);
+    idx[1] = value.param(0, i64t);
+    val address: res[value.Value, fail.Fail] = builder.emit_gep(?b, slot, rec, ?idx[0], 2);
+    if (sel address.err) { code = 1; }
+    val var_returned: err[fail.Fail] = builder.emit_ret_void(?b);
+    if (sel var_returned.err) { code = 1; }
+
+    val f_ret: u32 = ut_build_local(?m, ?b, rec, ?slot);
+    if (f_ret == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val returned_slot: err[fail.Fail] = builder.emit_ret(?b, value.retype(slot, rec));
+    if (sel returned_slot.err) { code = 1; }
+
+    val f_field: u32 = ut_build_local(?m, ?b, rec, ?slot);
+    if (f_field == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val g0: res[value.Value, fail.Fail] = ut_gep(?b, ?m, slot, rec, 0);
+    if (sel g0.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    var args: [1]value.Value;
+    args[0] = g0.ok;
+    val called: res[value.Value, fail.Fail] = builder.emit_call(?b, callee, ?args[0], 1, voidt);
+    if (sel called.err) { code = 1; }
+    val field_returned: err[fail.Fail] = builder.emit_ret_void(?b);
+    if (sel field_returned.err) { code = 1; }
+
+    val f_escape: u32 = ut_build_local(?m, ?b, rec, ?slot);
+    if (f_escape == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    args[0] = slot;
+    val r_escape: res[value.Value, fail.Fail] = builder.emit_call(?b, callee, ?args[0], 1, voidt);
+    if (sel r_escape.err) { code = 1; }
+    val r_escape_ret: err[fail.Fail] = builder.emit_ret_void(?b);
+    if (sel r_escape_ret.err) { code = 1; }
+
+    val r8: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    if (sel r8.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    var ufields: [2]ir_type.IrTypeId;
+    ufields[0] = r8.ok;
+    ufields[1] = i64t;
+    val ru: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_union(?m.types, ?ufields[0], 2, 0, false);
+    if (sel ru.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val f_uni: u32 = ut_build_local(?m, ?b, ru.ok, ?slot);
+    if (f_uni == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val r_uni_ret: err[fail.Fail] = builder.emit_ret_void(?b);
+    if (sel r_uni_ret.err) { code = 1; }
+
+    val rarr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?m.types, i64t, 32);
+    if (sel rarr.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val f_arr: u32 = ut_build_local(?m, ?b, rarr.ok, ?slot);
+    if (f_arr == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val r_arr_ret: err[fail.Fail] = builder.emit_ret_void(?b);
+    if (sel r_arr_ret.err) { code = 1; }
+
+    val rs: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rs.err) { code = 1; }
+    or (sel rs.ok) {
+        if (rs.ok) { code = 1; }
+    }
+
+    if (ut_count(?m.functions[f_cast], ir_instruction.OP_ALLOCA) != 1)   { code = 1; }
+    if (ut_count(?m.functions[f_var], ir_instruction.OP_ALLOCA) != 1)    { code = 1; }
+    if (ut_count(?m.functions[f_ret], ir_instruction.OP_ALLOCA) != 1)    { code = 1; }
+    if (ut_count(?m.functions[f_field], ir_instruction.OP_ALLOCA) != 1)  { code = 1; }
+    if (ut_count(?m.functions[f_escape], ir_instruction.OP_ALLOCA) != 1) { code = 1; }
+    if (ut_count(?m.functions[f_uni], ir_instruction.OP_ALLOCA) != 1)    { code = 1; }
+    if (ut_count(?m.functions[f_arr], ir_instruction.OP_ALLOCA) != 1)    { code = 1; }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+test run__declines_a_strided_field_address {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    val r8: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    if (sel r8.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i8t: ir_type.IrTypeId                 = r8.ok;
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId                 = r64.ok;
+    val rarr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?m.types, i8t, 2);
+    if (sel rarr.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val pair: ir_type.IrTypeId = rarr.ok;
+
+    var inner: ir_type.IrTypeId;
+    if (ut_rec2(?m, ?inner) != 0) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    var nfields: [2]ir_type.IrTypeId;
+    nfields[0] = i8t;
+    nfields[1] = inner;
+    val rn: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_struct(?m.types, ?nfields[0], 2, 0, false);
+    if (sel rn.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val nested: ir_type.IrTypeId = rn.ok;
+
+    var code: i32             = 0;
+    var b:    builder.Builder = builder.init(?m);
+    var slot: value.Value;
+
+    val f_stride: u32 = ut_build_local(?m, ?b, pair, ?slot);
+    if (f_stride == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val g0: res[value.Value, fail.Fail] = ut_gep(?b, ?m, slot, pair, 0);
+    if (sel g0.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    var stride: [1]value.Value;
+    stride[0] = value.param(0, i64t);
+    val rs1: res[value.Value, fail.Fail] = builder.emit_gep(?b, g0.ok, i8t, ?stride[0], 1);
+    if (sel rs1.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val stored_rs1: err[fail.Fail] = builder.emit_store(?b, value.const_int(7, i8t), rs1.ok);
+    if (sel stored_rs1.err) { code = 1; }
+    val stride_returned: err[fail.Fail] = builder.emit_ret_void(?b);
+    if (sel stride_returned.err) { code = 1; }
+
+    val f_nested: u32 = ut_build_local(?m, ?b, nested, ?slot);
+    if (f_nested == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val g1: res[value.Value, fail.Fail] = ut_gep(?b, ?m, slot, nested, 1);
+    if (sel g1.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val g1x: res[value.Value, fail.Fail] = ut_gep(?b, ?m, g1.ok, inner, 1);
+    if (sel g1x.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val stored_g1x: err[fail.Fail] = builder.emit_store(?b, value.const_int(9, i64t), g1x.ok);
+    if (sel stored_g1x.err) { code = 1; }
+    val nested_returned: err[fail.Fail] = builder.emit_ret_void(?b);
+    if (sel nested_returned.err) { code = 1; }
+
+    val rr: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rr.err) { code = 1; }
+    or (sel rr.ok) {
+        if (!rr.ok) { code = 1; }
+    }
+
+    if (ut_count(?m.functions[f_stride], ir_instruction.OP_ALLOCA) != 1) { code = 1; }
+    if (ut_count(?m.functions[f_nested], ir_instruction.OP_ALLOCA) != 3) { code = 1; }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+test run__splits_a_local_record_keeping_a_secret_field {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    var rec: ir_type.IrTypeId;
+    if (ut_rec2(?m, ?rec) != 0) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId = r64.ok;
+
+    val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn: *me_ir.Function = ?m.functions[rf.ok];
+
+    var b: builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    val rb: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel rb.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    builder.set_block(?b, rb.ok);
+
+    var code: i32                         = 0;
+    val ra:   res[value.Value, fail.Fail] = builder.emit_alloca(?b, rec, value.const_int(1, i64t));
+    if (sel ra.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val s:      value.Value    = ra.ok;
+    val zeroed: err[fail.Fail] = builder.emit_memzero(?b, s, rec);
+    if (sel zeroed.err) { code = 1; }
+
+    var secret_v: value.Value = value.param(0, i64t);
+    secret_v.secret = true;
+    val g1: res[value.Value, fail.Fail] = ut_gep(?b, ?m, s, rec, 1);
+    if (sel g1.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val stored_g1: err[fail.Fail] = builder.emit_store(?b, secret_v, g1.ok);
+    if (sel stored_g1.err) { code = 1; }
+
+    val h1: res[value.Value, fail.Fail] = ut_gep(?b, ?m, s, rec, 1);
+    if (sel h1.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?b, h1.ok, i64t);
+    if (sel rl.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    var loaded: value.Value = rl.ok;
+    fn.instrs[loaded.data.instr::u32].secret = true;
+    loaded.secret                            = true;
+    val returned: err[fail.Fail] = builder.emit_ret(?b, loaded);
+    if (sel returned.err) { code = 1; }
+
+    val rs: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rs.err) { code = 1; }
+    or (sel rs.ok) {
+        if (!rs.ok) { code = 1; }
+    }
+
+    var tainted_slots: u32 = 0;
+    var i:             u32 = 0;
+    for (i < fn.instr_len) {
+        if (fn.instrs[i].kind == ir_instruction.OP_ALLOCA && fn.instrs[i].secret) { tainted_slots = tainted_slots + 1; }
+        i = i + 1;
+    }
+    # the field the secret was stored to is secret; the untouched public field beside it is not
+    if (tainted_slots != 1) { code = 1; }
+
+    val ran: res[bool, fail.Fail] = mem2reg.run(?m);
+    if (sel ran.err) { code = 1; }
+    val cleaned: res[bool, fail.Fail] = dce.run(?m);
+    if (sel cleaned.err)                              { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_ALLOCA) != 0)  { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_MEMZERO) != 0) { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_LOAD) != 0)    { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_STORE) != 0)   { code = 1; }
+    val rv: value.Value = ut_ret_value(fn);
+    if (rv.kind != value.VAL_PARAM || rv.data.param_ix != 0) { code = 1; }
+    if (!rv.secret)                                          { code = 1; }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+test run__splits_an_aggregate_phi_partition {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    var rec: ir_type.IrTypeId;
+    if (ut_rec2(?m, ?rec) != 0) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId                 = r64.ok;
+    val r8:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    if (sel r8.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i8t: ir_type.IrTypeId = r8.ok;
+
+    val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn: *me_ir.Function = ?m.functions[rf.ok];
+
+    var b: builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    var blocks: [4]ir_id.BlockId;
+    var n:      u32 = 0;
+    for (n < 4) {
+        val rb: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
+        if (sel rb.err) {
+            me_ir.dnit(?m);
+            ret 1;
+        }
+        blocks[n] = rb.ok;
+        n         = n + 1;
+    }
+
+    var code: i32 = 0;
+    var arm:  [2]value.Value;
+
+    builder.set_block(?b, blocks[0]);
+    val rcmp: res[value.Value, fail.Fail] = builder.emit_cmp_eq(?b, value.param(0, i64t), value.const_int(0, i64t));
+    if (sel rcmp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val branched: err[fail.Fail] = builder.emit_cbr(?b, rcmp.ok, blocks[1], blocks[2]);
+    if (sel branched.err) { code = 1; }
+
+    var a: u32 = 0;
+    for (a < 2) {
+        builder.set_block(?b, blocks[1 + a]);
+        val ra: res[value.Value, fail.Fail] = builder.emit_alloca(?b, rec, value.const_int(1, i64t));
+        if (sel ra.err) {
+            me_ir.dnit(?m);
+            ret 1;
+        }
+        arm[a] = ra.ok;
+        val zeroed: err[fail.Fail] = builder.emit_memzero(?b, arm[a], rec);
+        if (sel zeroed.err) { code = 1; }
+        val g0: res[value.Value, fail.Fail] = ut_gep(?b, ?m, arm[a], rec, 0);
+        if (sel g0.err) {
+            me_ir.dnit(?m);
+            ret 1;
+        }
+        val stored_g0: err[fail.Fail] = builder.emit_store(?b, value.const_int(a::u64, i8t), g0.ok);
+        if (sel stored_g0.err) { code = 1; }
+        val g1: res[value.Value, fail.Fail] = ut_gep(?b, ?m, arm[a], rec, 1);
+        if (sel g1.err) {
+            me_ir.dnit(?m);
+            ret 1;
+        }
+        val stored_g1: err[fail.Fail] = builder.emit_store(?b, value.const_int(10 + a::u64, i64t), g1.ok);
+        if (sel stored_g1.err) { code = 1; }
+        val branched_blocks: err[fail.Fail] = builder.emit_br(?b, blocks[3]);
+        if (sel branched_blocks.err) { code = 1; }
+        a = a + 1;
+    }
+
+    builder.set_block(?b, blocks[3]);
+    val rphi: res[value.Value, fail.Fail] = builder.emit_phi(?b, rec);
+    if (sel rphi.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val phi:    value.Value    = rphi.ok;
+    val joined: err[fail.Fail] = builder.phi_add_incoming(?b, phi, blocks[1], value.retype(arm[0], rec));
+    if (sel joined.err) { code = 1; }
+    val joined_phi: err[fail.Fail] = builder.phi_add_incoming(?b, phi, blocks[2], value.retype(arm[1], rec));
+    if (sel joined_phi.err) { code = 1; }
+    val hp: res[value.Value, fail.Fail] = ut_gep(?b, ?m, phi, rec, 1);
+    if (sel hp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?b, hp.ok, i64t);
+    if (sel rl.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val returned: err[fail.Fail] = builder.emit_ret(?b, rl.ok);
+    if (sel returned.err) { code = 1; }
+
+    if (ut_count(fn, ir_instruction.OP_ALLOCA) != 2)  { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_MEMZERO) != 2) { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_PHI) != 1)     { code = 1; }
+
+    val rs: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rs.err) { code = 1; }
+    or (sel rs.ok) {
+        if (!rs.ok) { code = 1; }
+    }
+    val ran: res[bool, fail.Fail] = mem2reg.run(?m);
+    if (sel ran.err) { code = 1; }
+    val cleaned: res[bool, fail.Fail] = dce.run(?m);
+    if (sel cleaned.err) { code = 1; }
+
+    if (ut_count(fn, ir_instruction.OP_ALLOCA) != 0)  { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_MEMZERO) != 0) { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_LOAD) != 0)    { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_STORE) != 0)   { code = 1; }
+    val rv: value.Value = ut_ret_value(fn);
+    if (rv.kind != value.VAL_INSTR) { code = 1; }
+    or {
+        val d: *ir_instruction.Instruction = ?fn.instrs[rv.data.instr::u32];
+        if (d.kind != ir_instruction.OP_PHI) { code = 1; }
+        if (!ir_type.same(d.ty, i64t))       { code = 1; }
+    }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+#[testing]
+fun ut_tagged(m: *me_ir.Module, a: ir_type.IrTypeId, b: ir_type.IrTypeId, out: *ir_type.IrTypeId) i32 {
+    var members: [2]ir_type.IrTypeId;
+    members[0] = a;
+    members[1] = b;
+    val ru: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_union(?m.types, ?members[0], 2, 0, false);
+    if (sel ru.err) { ret 1; }
+
+    val r8: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    if (sel r8.err) { ret 1; }
+    var fields: [2]ir_type.IrTypeId;
+    fields[0] = r8.ok;
+    fields[1] = ru.ok;
+    val rs: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_struct(?m.types, ?fields[0], 2, 0, false);
+    if (sel rs.err) { ret 1; }
+    @out = rs.ok;
+    ret 0;
+}
+
+#[testing]
+fun ut_member_gep(b: *builder.Builder, m: *me_ir.Module, base: value.Value, ty: ir_type.IrTypeId, k: u64) res[value.Value, fail.Fail] {
+    val gf: res[value.Value, fail.Fail] = ut_gep(b, m, base, ty, 1);
+    if (sel gf.err) { ret gf; }
+    ret ut_gep(b, m, gf.ok, ut_field_type(m, ty, 1), k);
+}
+
+#[testing]
+fun ut_open_local(m: *me_ir.Module, b: *builder.Builder, ty: ir_type.IrTypeId, slot: *value.Value) u32 {
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) { ret ir_id.NONE; }
+
+    val rf: res[u32, fail.Fail] = me_ir.function_add(m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) { ret ir_id.NONE; }
+    val ix: u32 = rf.ok;
+
+    builder.set_function(b, ?m.functions[ix]);
+    val rb: res[ir_id.BlockId, fail.Fail] = builder.new_block(b);
+    if (sel rb.err) { ret ir_id.NONE; }
+    builder.set_block(b, rb.ok);
+
+    val ra: res[value.Value, fail.Fail] = builder.emit_alloca(b, ty, value.const_int(1, r64.ok));
+    if (sel ra.err) { ret ir_id.NONE; }
+    @slot = ra.ok;
+    val zeroed: err[fail.Fail] = builder.emit_memzero(b, @slot, ty);
+    if (sel zeroed.err) { ret ir_id.NONE; }
+    ret ix;
+}
+
+#[testing]
+fun ut_def(fn: *me_ir.Function, v: value.Value) *ir_instruction.Instruction {
+    if (v.kind != value.VAL_INSTR)                             { ret nil; }
+    if (ir_id.instruction_index(v.data.instr) >= fn.instr_len) { ret nil; }
+    ret ?fn.instrs[v.data.instr::u32];
+}
+
+test run__splits_a_tagged_union_payload_into_registers {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId                 = r64.ok;
+    val rp:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val ptrt: ir_type.IrTypeId                 = rp.ok;
+    val r8:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    if (sel r8.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i8t: ir_type.IrTypeId = r8.ok;
+
+    var rec: ir_type.IrTypeId;
+    if (ut_tagged(?m, i64t, ptrt, ?rec) != 0) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    var code: i32             = 0;
+    var b:    builder.Builder = builder.init(?m);
+    var slot: value.Value;
+    val ix:   u32             = ut_open_local(?m, ?b, rec, ?slot);
+    if (ix == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn: *me_ir.Function = ?m.functions[ix];
+
+    val gt: res[value.Value, fail.Fail] = ut_gep(?b, ?m, slot, rec, 0);
+    if (sel gt.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val stored_gt: err[fail.Fail] = builder.emit_store(?b, value.const_int(1, i8t), gt.ok);
+    if (sel stored_gt.err) { code = 1; }
+
+    val gp: res[value.Value, fail.Fail] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (sel gp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val stored_gp: err[fail.Fail] = builder.emit_store(?b, value.param(0, i64t), gp.ok);
+    if (sel stored_gp.err) { code = 1; }
+
+    val hp: res[value.Value, fail.Fail] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (sel hp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?b, hp.ok, i64t);
+    if (sel rl.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val returned: err[fail.Fail] = builder.emit_ret(?b, rl.ok);
+    if (sel returned.err) { code = 1; }
+
+    if (ut_count(fn, ir_instruction.OP_ALLOCA) != 1) { code = 1; }
+
+    val rs: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rs.err) { code = 1; }
+    or (sel rs.ok) {
+        if (!rs.ok) { code = 1; }
+    }
+    val ran: res[bool, fail.Fail] = mem2reg.run(?m);
+    if (sel ran.err) { code = 1; }
+    val cleaned: res[bool, fail.Fail] = dce.run(?m);
+    if (sel cleaned.err) { code = 1; }
+
+    if (ut_count(fn, ir_instruction.OP_ALLOCA) != 0)  { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_MEMZERO) != 0) { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_LOAD) != 0)    { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_STORE) != 0)   { code = 1; }
+    val rv: value.Value = ut_ret_value(fn);
+    if (rv.kind != value.VAL_PARAM) { code = 1; }
+    if (rv.data.param_ix != 0)      { code = 1; }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+test run__reinterprets_a_member_of_another_type {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId                 = r64.ok;
+    val rp:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val ptrt: ir_type.IrTypeId = rp.ok;
+
+    var rec: ir_type.IrTypeId;
+    if (ut_tagged(?m, i64t, ptrt, ?rec) != 0) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    var code: i32             = 0;
+    var b:    builder.Builder = builder.init(?m);
+    var slot: value.Value;
+    val ix:   u32             = ut_open_local(?m, ?b, rec, ?slot);
+    if (ix == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn: *me_ir.Function = ?m.functions[ix];
+
+    val gp: res[value.Value, fail.Fail] = ut_member_gep(?b, ?m, slot, rec, 1);
+    if (sel gp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val stored_gp: err[fail.Fail] = builder.emit_store(?b, value.param(0, ptrt), gp.ok);
+    if (sel stored_gp.err) { code = 1; }
+
+    val hp: res[value.Value, fail.Fail] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (sel hp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?b, hp.ok, i64t);
+    if (sel rl.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val returned: err[fail.Fail] = builder.emit_ret(?b, rl.ok);
+    if (sel returned.err) { code = 1; }
+
+    val rs: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rs.err) { code = 1; }
+    val ran: res[bool, fail.Fail] = mem2reg.run(?m);
+    if (sel ran.err) { code = 1; }
+    val cleaned: res[bool, fail.Fail] = dce.run(?m);
+    if (sel cleaned.err) { code = 1; }
+
+    if (ut_count(fn, ir_instruction.OP_ALLOCA) != 0) { code = 1; }
+    val cast: *ir_instruction.Instruction = ut_def(fn, ut_ret_value(fn));
+    if (cast == nil) { code = 1; }
+    or {
+        if (cast.kind != ir_instruction.OP_BITCAST) { code = 1; }
+        if (!ir_type.same(cast.ty, i64t))           { code = 1; }
+        if (cast.operand_count != 1)                { code = 1; }
+        or {
+            if (cast.operands[0].kind != value.VAL_PARAM) { code = 1; }
+            if (cast.operands[0].data.param_ix != 0)      { code = 1; }
+        }
+    }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+test run__a_narrow_member_preserves_its_cell {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId                 = r64.ok;
+    val r8:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    if (sel r8.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i8t: ir_type.IrTypeId = r8.ok;
+
+    var rec: ir_type.IrTypeId;
+    if (ut_tagged(?m, i64t, i8t, ?rec) != 0) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    var code: i32             = 0;
+    var b:    builder.Builder = builder.init(?m);
+    var slot: value.Value;
+    val ix:   u32             = ut_open_local(?m, ?b, rec, ?slot);
+    if (ix == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn: *me_ir.Function = ?m.functions[ix];
+
+    val gw: res[value.Value, fail.Fail] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (sel gw.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val stored_gw: err[fail.Fail] = builder.emit_store(?b, value.param(0, i64t), gw.ok);
+    if (sel stored_gw.err) { code = 1; }
+
+    val gn: res[value.Value, fail.Fail] = ut_member_gep(?b, ?m, slot, rec, 1);
+    if (sel gn.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val stored_gn: err[fail.Fail] = builder.emit_store(?b, value.param(1, i8t), gn.ok);
+    if (sel stored_gn.err) { code = 1; }
+
+    val hw: res[value.Value, fail.Fail] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (sel hw.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?b, hw.ok, i64t);
+    if (sel rl.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val returned: err[fail.Fail] = builder.emit_ret(?b, rl.ok);
+    if (sel returned.err) { code = 1; }
+
+    val rs: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rs.err) { code = 1; }
+    val ran: res[bool, fail.Fail] = mem2reg.run(?m);
+    if (sel ran.err) { code = 1; }
+    val cleaned: res[bool, fail.Fail] = dce.run(?m);
+    if (sel cleaned.err) { code = 1; }
+
+    if (ut_count(fn, ir_instruction.OP_ALLOCA) != 0) { code = 1; }
+
+    val merge: *ir_instruction.Instruction = ut_def(fn, ut_ret_value(fn));
+    if (merge == nil) {
+        code = 1;
+        me_ir.dnit(?m);
+        ret code;
+    }
+    if (merge.kind != ir_instruction.OP_OR || merge.operand_count != 2) {
+        code = 1;
+        me_ir.dnit(?m);
+        ret code;
+    }
+
+    val keep: *ir_instruction.Instruction = ut_def(fn, merge.operands[0]);
+    if (keep == nil) { code = 1; }
+    or {
+        if (keep.kind != ir_instruction.OP_AND || keep.operand_count != 2) { code = 1; }
+        or {
+            if (keep.operands[0].kind != value.VAL_PARAM)     { code = 1; }
+            if (keep.operands[0].data.param_ix != 0)          { code = 1; }
+            if (keep.operands[1].kind != value.VAL_CONST_INT) { code = 1; }
+            or {
+                if (keep.operands[1].data.int_lit != 0xFFFFFFFFFFFFFF00) { code = 1; }
+            }
+        }
+    }
+
+    val wide: *ir_instruction.Instruction = ut_def(fn, merge.operands[1]);
+    if (wide == nil) { code = 1; }
+    or {
+        if (wide.kind != ir_instruction.OP_ZEXT || !ir_type.same(wide.ty, i64t)) { code = 1; }
+        or {
+            if (wide.operands[0].kind != value.VAL_PARAM) { code = 1; }
+            if (wide.operands[0].data.param_ix != 1)      { code = 1; }
+        }
+    }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+#[testing]
+fun ut_tagged_probe(m: *me_ir.Module, a: ir_type.IrTypeId, b: ir_type.IrTypeId, member: u64, at: ir_type.IrTypeId) u32 {
+    var rec: ir_type.IrTypeId;
+    if (ut_tagged(m, a, b, ?rec) != 0) { ret ir_id.NONE; }
+
+    var bl:   builder.Builder = builder.init(m);
+    var slot: value.Value;
+    val ix:   u32             = ut_open_local(m, ?bl, rec, ?slot);
+    if (ix == ir_id.NONE) { ret ir_id.NONE; }
+
+    val g: res[value.Value, fail.Fail] = ut_member_gep(?bl, m, slot, rec, member);
+    if (sel g.err) { ret ir_id.NONE; }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?bl, g.ok, at);
+    if (sel rl.err) { ret ir_id.NONE; }
+    val returned: err[fail.Fail] = builder.emit_ret(?bl, rl.ok);
+    if (sel returned.err) { ret ir_id.NONE; }
+    ret ix;
+}
+
+test run__declines_shapes_no_cell_can_hold {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId                 = r64.ok;
+    val r32:  res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 32);
+    if (sel r32.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i32t: ir_type.IrTypeId                 = r32.ok;
+    val r8:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    if (sel r8.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i8t: ir_type.IrTypeId = r8.ok;
+
+    var pair_fields: [2]ir_type.IrTypeId;
+    pair_fields[0] = i32t;
+    pair_fields[1] = i32t;
+    val rpair: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_struct(?m.types, ?pair_fields[0], 2, 0, false);
+    if (sel rpair.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val pair: ir_type.IrTypeId = rpair.ok;
+
+    val f_wide: u32 = ut_tagged_probe(?m, i8t, i8t, 0, i64t);
+    if (f_wide == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val f_read: u32 = ut_tagged_probe(?m, i64t, i64t, 0, pair);
+    if (f_read == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val f_ord: u32 = ut_tagged_probe(?m, i64t, i64t, 2, i64t);
+    if (f_ord == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val f_agg: u32 = ut_tagged_probe(?m, pair, i64t, 1, i64t);
+    if (f_agg == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val rp: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val f_ptr: u32 = ut_tagged_probe(?m, rp.ok, rp.ok, 0, i8t);
+    if (f_ptr == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    var code: i32                  = 0;
+    val rs:   res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rs.err) { code = 1; }
+    or (sel rs.ok) {
+        if (rs.ok) { code = 1; }
+    }
+
+    if (ut_count(?m.functions[f_wide], ir_instruction.OP_ALLOCA) != 1) { code = 1; }
+    if (ut_count(?m.functions[f_read], ir_instruction.OP_ALLOCA) != 1) { code = 1; }
+    if (ut_count(?m.functions[f_ord], ir_instruction.OP_ALLOCA) != 1)  { code = 1; }
+    if (ut_count(?m.functions[f_agg], ir_instruction.OP_ALLOCA) != 1)  { code = 1; }
+    if (ut_count(?m.functions[f_ptr], ir_instruction.OP_ALLOCA) != 1)  { code = 1; }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+test run__reads_a_narrow_member_by_truncation {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    val rp: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val ptrt: ir_type.IrTypeId                 = rp.ok;
+    val r8:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    if (sel r8.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i8t: ir_type.IrTypeId = r8.ok;
+
+    var rec: ir_type.IrTypeId;
+    if (ut_tagged(?m, i8t, ptrt, ?rec) != 0) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    var code: i32             = 0;
+    var b:    builder.Builder = builder.init(?m);
+    var slot: value.Value;
+    val ix:   u32             = ut_open_local(?m, ?b, rec, ?slot);
+    if (ix == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn: *me_ir.Function = ?m.functions[ix];
+
+    val gn: res[value.Value, fail.Fail] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (sel gn.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val stored_gn: err[fail.Fail] = builder.emit_store(?b, value.param(0, i8t), gn.ok);
+    if (sel stored_gn.err) { code = 1; }
+
+    val hn: res[value.Value, fail.Fail] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (sel hn.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?b, hn.ok, i8t);
+    if (sel rl.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val returned: err[fail.Fail] = builder.emit_ret(?b, rl.ok);
+    if (sel returned.err) { code = 1; }
+
+    val rs: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rs.err) { code = 1; }
+    val ran: res[bool, fail.Fail] = mem2reg.run(?m);
+    if (sel ran.err) { code = 1; }
+    val cleaned: res[bool, fail.Fail] = dce.run(?m);
+    if (sel cleaned.err) { code = 1; }
+
+    if (ut_count(fn, ir_instruction.OP_ALLOCA) != 0) { code = 1; }
+    val narrow: *ir_instruction.Instruction = ut_def(fn, ut_ret_value(fn));
+    if (narrow == nil) { code = 1; }
+    or {
+        if (narrow.kind != ir_instruction.OP_TRUNC) { code = 1; }
+        if (!ir_type.same(narrow.ty, i8t))          { code = 1; }
+    }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+test run__declines_a_gep_walking_past_a_union_field {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId                 = r64.ok;
+    val rp:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val ptrt: ir_type.IrTypeId = rp.ok;
+
+    var rec: ir_type.IrTypeId;
+    if (ut_tagged(?m, i64t, ptrt, ?rec) != 0) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    var code: i32             = 0;
+    var b:    builder.Builder = builder.init(?m);
+
+    var slot:   value.Value;
+    val ix_one: u32 = ut_open_local(?m, ?b, rec, ?slot);
+    if (ix_one == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn_one: *me_ir.Function = ?m.functions[ix_one];
+
+    var idx: [3]value.Value;
+    idx[0] = value.const_int(0, i64t);
+    idx[1] = value.const_int(1, i64t);
+    idx[2] = value.const_int(0, i64t);
+    val gd: res[value.Value, fail.Fail] = builder.emit_gep(?b, slot, rec, ?idx[0], 3);
+    if (sel gd.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?b, gd.ok, i64t);
+    if (sel rl.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val returned: err[fail.Fail] = builder.emit_ret(?b, rl.ok);
+    if (sel returned.err) { code = 1; }
+
+    var slot2:  value.Value;
+    val ix_two: u32 = ut_open_local(?m, ?b, rec, ?slot2);
+    if (ix_two == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn_two: *me_ir.Function = ?m.functions[ix_two];
+
+    val gm: res[value.Value, fail.Fail] = ut_member_gep(?b, ?m, slot2, rec, 0);
+    if (sel gm.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val gp: res[value.Value, fail.Fail] = ut_gep(?b, ?m, gm.ok, i64t, 0);
+    if (sel gp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val rl2: res[value.Value, fail.Fail] = builder.emit_load(?b, gp.ok, i64t);
+    if (sel rl2.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val returned_rl2: err[fail.Fail] = builder.emit_ret(?b, rl2.ok);
+    if (sel returned_rl2.err) { code = 1; }
+
+    var struct_fields: [2]ir_type.IrTypeId;
+    struct_fields[0] = i64t;
+    struct_fields[1] = i64t;
+    val rother: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_struct(?m.types, ?struct_fields[0], 2, 0, false);
+    if (sel rother.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val other: ir_type.IrTypeId = rother.ok;
+
+    var slot3:    value.Value;
+    val ix_three: u32 = ut_open_local(?m, ?b, rec, ?slot3);
+    if (ix_three == ir_id.NONE) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn_three: *me_ir.Function = ?m.functions[ix_three];
+
+    val gf: res[value.Value, fail.Fail] = ut_gep(?b, ?m, slot3, rec, 1);
+    if (sel gf.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val go: res[value.Value, fail.Fail] = ut_gep(?b, ?m, gf.ok, other, 1);
+    if (sel go.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val rl3: res[value.Value, fail.Fail] = builder.emit_load(?b, go.ok, i64t);
+    if (sel rl3.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val returned_rl3: err[fail.Fail] = builder.emit_ret(?b, rl3.ok);
+    if (sel returned_rl3.err) { code = 1; }
+
+    val rs: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rs.err) { code = 1; }
+    or (sel rs.ok) {
+        if (rs.ok) { code = 1; }
+    }
+    if (ut_count(fn_one, ir_instruction.OP_ALLOCA) != 1)   { code = 1; }
+    if (ut_count(fn_two, ir_instruction.OP_ALLOCA) != 1)   { code = 1; }
+    if (ut_count(fn_three, ir_instruction.OP_ALLOCA) != 1) { code = 1; }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+# a function over a local [4]i8 that fills every element, then takes `gep (gep a, 0, 0), 0`
+# and either passes that derived address to a call or only loads through it
+#[testing]
+fun ut_derived_element(escape: bool, split: *bool, allocas: *u32) i32 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target              = resolved.described_named("x86_64");
+    val rm:  res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 2; }
+    var m: me_ir.Module = rm.ok;
+    fin { me_ir.dnit(?m); }
+    val r8:  res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    val rv:  res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_void(?m.types);
+    val rp:  res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel r8.err)  { ret 3; }
+    if (sel r64.err) { ret 3; }
+    if (sel rv.err)  { ret 3; }
+    if (sel rp.err)  { ret 3; }
+    val i8t:  ir_type.IrTypeId                 = r8.ok;
+    val i64t: ir_type.IrTypeId                 = r64.ok;
+    val rarr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?m.types, i8t, 4);
+    if (sel rarr.err) { ret 3; }
+    val arr: ir_type.IrTypeId    = rarr.ok;
+    val rc:  res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, me_ir.FN_FLAG_EXTERN);
+    if (sel rc.err) { ret 4; }
+    val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) { ret 4; }
+    val fn: *me_ir.Function = ?m.functions[rf.ok];
+    var b:  builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    val rb: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel rb.err) { ret 5; }
+    builder.set_block(?b, rb.ok);
+    val ra: res[value.Value, fail.Fail] = builder.emit_alloca(?b, arr, value.const_int(1, i64t));
+    if (sel ra.err) { ret 6; }
+    val a: value.Value = ra.ok;
+    var k: u64         = 0;
+    for (k < 4) {
+        val gk: res[value.Value, fail.Fail] = ut_gep(?b, ?m, a, arr, k);
+        if (sel gk.err) { ret 7; }
+        val st_r: err[fail.Fail] = builder.emit_store(?b, value.const_int(0xA0 + k, i8t), gk.ok);
+        if (sel st_r.err) { ret 7; }
+        k = k + 1;
+    }
+    val g0: res[value.Value, fail.Fail] = ut_gep(?b, ?m, a, arr, 0);
+    if (sel g0.err) { ret 8; }
+    var zero: [1]value.Value;
+    zero[0] = value.const_int(0, i64t);
+    val rd: res[value.Value, fail.Fail] = builder.emit_gep(?b, g0.ok, i8t, ?zero[0], 1);
+    if (sel rd.err) { ret 8; }
+    if (escape) {
+        var args: [1]value.Value;
+        args[0] = rd.ok;
+        val called: res[value.Value, fail.Fail] = builder.emit_call(?b, value.fn(rc.ok, rp.ok), ?args[0], 1, rv.ok);
+        if (sel called.err) { ret 9; }
+    }
+    or {
+        val loaded: res[value.Value, fail.Fail] = builder.emit_load(?b, rd.ok, i8t);
+        if (sel loaded.err) { ret 9; }
+    }
+    val g1: res[value.Value, fail.Fail] = ut_gep(?b, ?m, a, arr, 1);
+    if (sel g1.err) { ret 10; }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?b, g1.ok, i8t);
+    if (sel rl.err) { ret 10; }
+    val rr: err[fail.Fail] = builder.emit_ret(?b, rl.ok);
+    if (sel rr.err) { ret 10; }
+    val ran: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel ran.err) { ret 11; }
+    @split   = ran.ok;
+    @allocas = ut_count(fn, ir_instruction.OP_ALLOCA);
+    ret 0;
+}
+
+test run__keeps_an_array_whole_when_a_derived_element_address_escapes {
+    var split:   bool = false;
+    var allocas: u32  = 0;
+    val built:   i32  = ut_derived_element(true, ?split, ?allocas);
+    if (built != 0)   { ret built; }
+    if (split)        { ret 20; }
+    if (allocas != 1) { ret 21; }
+    val placed: i32 = ut_derived_element(false, ?split, ?allocas);
+    if (placed != 0) { ret placed; }
+    if (!split)      { ret 22; }
+    ret 0;
+}
+
+test run__declines_a_phi_whose_merge_writes_a_member {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target = resolved.described_named("x86_64");
+
+    val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+
+    var rec: ir_type.IrTypeId;
+    if (ut_rec2(?m, ?rec) != 0) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i64t: ir_type.IrTypeId                 = r64.ok;
+    val r8:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    if (sel r8.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i8t: ir_type.IrTypeId = r8.ok;
+
+    val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn: *me_ir.Function = ?m.functions[rf.ok];
+
+    var b: builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    var blocks: [4]ir_id.BlockId;
+    var n:      u32 = 0;
+    for (n < 4) {
+        val rb: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
+        if (sel rb.err) {
+            me_ir.dnit(?m);
+            ret 1;
+        }
+        blocks[n] = rb.ok;
+        n         = n + 1;
+    }
+
+    var code: i32 = 0;
+    var arm:  [2]value.Value;
+
+    builder.set_block(?b, blocks[0]);
+    val rcmp: res[value.Value, fail.Fail] = builder.emit_cmp_eq(?b, value.param(0, i64t), value.const_int(0, i64t));
+    if (sel rcmp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val branched: err[fail.Fail] = builder.emit_cbr(?b, rcmp.ok, blocks[1], blocks[2]);
+    if (sel branched.err) { code = 1; }
+
+    var a: u32 = 0;
+    for (a < 2) {
+        builder.set_block(?b, blocks[1 + a]);
+        val ra: res[value.Value, fail.Fail] = builder.emit_alloca(?b, rec, value.const_int(1, i64t));
+        if (sel ra.err) {
+            me_ir.dnit(?m);
+            ret 1;
+        }
+        arm[a] = ra.ok;
+        val zeroed_arm: err[fail.Fail] = builder.emit_memzero(?b, arm[a], rec);
+        if (sel zeroed_arm.err) { code = 1; }
+        val g0: res[value.Value, fail.Fail] = ut_gep(?b, ?m, arm[a], rec, 0);
+        if (sel g0.err) {
+            me_ir.dnit(?m);
+            ret 1;
+        }
+        val stored_g0: err[fail.Fail] = builder.emit_store(?b, value.const_int(a::u64, i8t), g0.ok);
+        if (sel stored_g0.err) { code = 1; }
+        val g1: res[value.Value, fail.Fail] = ut_gep(?b, ?m, arm[a], rec, 1);
+        if (sel g1.err) {
+            me_ir.dnit(?m);
+            ret 1;
+        }
+        val stored_g1: err[fail.Fail] = builder.emit_store(?b, value.const_int(10 + a::u64, i64t), g1.ok);
+        if (sel stored_g1.err) { code = 1; }
+        val branched_blocks: err[fail.Fail] = builder.emit_br(?b, blocks[3]);
+        if (sel branched_blocks.err) { code = 1; }
+        a = a + 1;
+    }
+
+    builder.set_block(?b, blocks[3]);
+    val rphi: res[value.Value, fail.Fail] = builder.emit_phi(?b, rec);
+    if (sel rphi.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val phi:    value.Value    = rphi.ok;
+    val joined: err[fail.Fail] = builder.phi_add_incoming(?b, phi, blocks[1], value.retype(arm[0], rec));
+    if (sel joined.err) { code = 1; }
+    val joined_phi: err[fail.Fail] = builder.phi_add_incoming(?b, phi, blocks[2], value.retype(arm[1], rec));
+    if (sel joined_phi.err) { code = 1; }
+
+    val gw: res[value.Value, fail.Fail] = ut_gep(?b, ?m, arm[0], rec, 1);
+    if (sel gw.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val stored_gw: err[fail.Fail] = builder.emit_store(?b, value.const_int(77, i64t), gw.ok);
+    if (sel stored_gw.err) { code = 1; }
+
+    val hp: res[value.Value, fail.Fail] = ut_gep(?b, ?m, phi, rec, 1);
+    if (sel hp.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?b, hp.ok, i64t);
+    if (sel rl.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val returned: err[fail.Fail] = builder.emit_ret(?b, rl.ok);
+    if (sel returned.err) { code = 1; }
+
+    if (ut_count(fn, ir_instruction.OP_ALLOCA) != 2)  { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_MEMZERO) != 2) { code = 1; }
+
+    val rs: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rs.err) { code = 1; }
+
+    if (ut_count(fn, ir_instruction.OP_MEMZERO) != 2) { code = 1; }
+    if (ut_count(fn, ir_instruction.OP_ALLOCA) != 2)  { code = 1; }
+
+    me_ir.dnit(?m);
+    ret code;
+}
+
+# the fail-at-N fixture: a local two-field record, zeroed, both fields
+# stored, one loaded back, which splits into registers
+#[testing]
+fun probe_build(a: *me_testing.Attempt, m: *me_ir.Module) i32 {
+    var rec: ir_type.IrTypeId;
+    if (ut_rec2(m, ?rec) != 0) { ret 1; }
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) { ret 2; }
+    val i64t: ir_type.IrTypeId                 = r64.ok;
+    val r8:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    if (sel r8.err) { ret 3; }
+    val i8t: ir_type.IrTypeId    = r8.ok;
+    val rf:  res[u32, fail.Fail] = me_ir.function_add(m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) { ret 4; }
+    var b: builder.Builder = builder.init(m);
+    builder.set_function(?b, ?m.functions[rf.ok]);
+    val rb: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel rb.err) { ret 5; }
+    builder.set_block(?b, rb.ok);
+    val ra: res[value.Value, fail.Fail] = builder.emit_alloca(?b, rec, value.const_int(1, i64t));
+    if (sel ra.err) { ret 6; }
+    val s:      value.Value    = ra.ok;
+    val r_zero: err[fail.Fail] = builder.emit_memzero(?b, s, rec);
+    if (sel r_zero.err) { ret 7; }
+    val g0: res[value.Value, fail.Fail] = ut_gep(?b, m, s, rec, 0);
+    if (sel g0.err) { ret 8; }
+    val r_s0: err[fail.Fail] = builder.emit_store(?b, value.const_int(1, i8t), g0.ok);
+    if (sel r_s0.err) { ret 9; }
+    val g1: res[value.Value, fail.Fail] = ut_gep(?b, m, s, rec, 1);
+    if (sel g1.err) { ret 10; }
+    val r_s1: err[fail.Fail] = builder.emit_store(?b, value.param(0, i64t), g1.ok);
+    if (sel r_s1.err) { ret 11; }
+    val h1: res[value.Value, fail.Fail] = ut_gep(?b, m, s, rec, 1);
+    if (sel h1.err) { ret 12; }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?b, h1.ok, i64t);
+    if (sel rl.err) { ret 13; }
+    val r_ret: err[fail.Fail] = builder.emit_ret(?b, rl.ok);
+    if (sel r_ret.err) { ret 14; }
+    ret 0;
+}
+
+#[testing]
+fun probe_transform(a: *me_testing.Attempt, m: *me_ir.Module, workspace: *scratch.Workspace) err[fail.Fail] {
+    var ctx: pass.Context         = pass.context(m, a.target, workspace);
+    val r:   res[bool, fail.Fail] = pass.run(?PASS, ?ctx);
+    if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the analysis (instruction maps, candidate tables, block queue, slots) is
+# scratch and precedes the rewrite; the rewrite emits the field slots and the
+# per-block replacement instructions from the module before the rewrite table
+# is applied and the originals erased, so a refusal there leaves the original
+# accesses in place with unused field slots and replacements beside them;
+# rounds before the refusing round are applied whole. either way the module
+# is well formed
+#[testing]
+fun probe_contract(a: *me_testing.Attempt, m: *me_ir.Module, ordinal: usize) bool {
+    if (equal.content_equal(m, a.control)) { ret true; }
+    ret me_testing.verifies(m, true);
+}
+
+test pass__refusal_at_every_ordinal_leaves_the_input_or_a_well_formed_partial_split {
+    var owner: A.Allocator;
+    val made:  err[A.Error] = page.make(?owner);
+    if (sel made.err) { ret 1; }
+    var tgt: resolved.Target    = resolved.described_named("x86_64");
+    var a:   me_testing.Attempt = me_testing.Attempt{build: probe_build, transform: probe_transform,
+        contract: probe_contract, target: ?tgt, control: nil, context: nil};
+    var control: me_ir.Module;
+    if (me_testing.control(?a, ?owner, ?control) != 0) { ret 3; }
+    fin { me_ir.dnit(?control); }
+    ret me_testing.walk(?a);
+}

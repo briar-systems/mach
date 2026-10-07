@@ -1,60 +1,12 @@
 # mach.lang.fe.sema.infer
 
-## fun seed_builtins
-
-```mach
-pub fun seed_builtins(sc: *sema_context.SemaContext) err[fail.Fail];
-```
+typing expressions: each expression's type, the checks on its operands, and the instances
+its calls ask for
 
 ## fun infer_decl
 
 ```mach
 pub fun infer_decl(sc: *sema_context.SemaContext, did: ast_id.DeclId) type.TypeId;
-```
-
-## fun prepare_nominal_recipe
-
-```mach
-pub fun prepare_nominal_recipe(sc: *sema_context.SemaContext, ty: type.TypeId) err[fail.Fail];
-```
-
-## fun resolve_type_query
-
-```mach
-pub fun resolve_type_query(sc: *sema_context.SemaContext, tid: u32, which: u8) res[opt[comptime.CTValue], comptime.EvalFail];
-```
-
-## fun answer_type_query
-
-```mach
-pub fun answer_type_query(s: *session.Session, tid: u32, which: u8) res[opt[comptime.CTValue], comptime.EvalFail];
-```
-
-## fun resolve_field_member
-
-```mach
-pub fun resolve_field_member(sc: *sema_context.SemaContext, owner: u32, index: u32, pick: u8) res[opt[comptime.CTValue], comptime.EvalFail];
-```
-
-descriptor members answer from the checked type layout during type checking; the context callback
-answers every member that needs no layout and rejects storage questions about a payloadless case
-
-## fun resolve_layout_intrinsic
-
-```mach
-pub fun resolve_layout_intrinsic(sc: *sema_context.SemaContext, eid: u32) res[opt[comptime.CTValue], comptime.EvalFail];
-```
-
-## fun check_occurs_all
-
-```mach
-pub fun check_occurs_all(sc: *sema_context.SemaContext) err[fail.Fail];
-```
-
-## fun check_uni_secrecy_all
-
-```mach
-pub fun check_uni_secrecy_all(sc: *sema_context.SemaContext) err[fail.Fail];
 ```
 
 ## fun infer_expr
@@ -97,11 +49,5 @@ secrecy protects the active case, and a generic parameter defers to its instanti
 
 ```mach
 pub fun type_is_generic_param(sc: *sema_context.SemaContext, ty: type.TypeId) bool;
-```
-
-## fun resolve_type_ref
-
-```mach
-pub fun resolve_type_ref(sc: *sema_context.SemaContext, tid: ast_id.TypeId) type.TypeId;
 ```
 

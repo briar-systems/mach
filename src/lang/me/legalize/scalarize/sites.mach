@@ -1,0 +1,226 @@
+# the operations the target scalarizes, one site per operation, read by the
+# checks that warn at or refuse them
+use mach.lang.fail;
+use std.allocator.arena;
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use mach.lang.intern;
+use mach.lang.layout;
+use mach.lang.me.analysis;
+use me_ir: mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use ir_effect: mach.lang.me.ir.effect;
+use mach.lang.me.ir.equal;
+use ir_id:          mach.lang.me.ir.id;
+use ir_instruction: mach.lang.me.ir.instruction;
+use mach.lang.me.ir.opdesc;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.me.legalize.scalarize.place;
+use mach.lang.me.pass;
+use mach.lang.me.scratch;
+use me_testing: mach.lang.me.testing;
+use mach.lang.me.vecform;
+use lang_source:  mach.lang.source;
+use target_model: mach.lang.target.model;
+use mach.lang.target.resolved;
+
+# loc is the operation's own location when it has one, else the function's
+# declaration. lane_bits is 0 when the lane shape is outside the vocabulary,
+# and from_bits is the operand lane width, which a conversion changes
+pub rec Site {
+    fn_name:   intern.StrId;
+    op:        ir_instruction.InstrKind;
+    is_float:  bool;
+    lane_bits: u32;
+    from_bits: u32;
+    lanes:     u32;
+    loc:       lang_source.Location;
+    # a shift's count is one scalar for every lane rather than lane counts
+    uniform_count: bool;
+}
+
+fun site_of(m: *me_ir.Module, fn: *me_ir.Function, inst: *ir_instruction.Instruction) Site {
+    var site: Site;
+    site.fn_name       = fn.name;
+    site.op            = inst.kind;
+    site.is_float      = false;
+    site.lane_bits     = 0;
+    site.from_bits     = 0;
+    site.lanes         = 0;
+    site.uniform_count = vecform.uniform_count(m, inst);
+    site.loc           = fn.decl_loc;
+    if (lang_source.location_is_valid(inst.loc)) { site.loc = inst.loc; }
+    var d: vecform.LaneDesc;
+    if (vecform.lane_desc(m, inst, ?d)) {
+        site.is_float  = d.is_float;
+        site.lane_bits = d.lane_bits;
+        site.from_bits = d.from_bits;
+        site.lanes     = d.lanes;
+    }
+    ret site;
+}
+
+# every operator the target scalarizes, one site per operation, in function
+# and block order: the sites `simd = "require"` refuses and the default warns at
+pub fun list(m: *me_ir.Module, tgt: *resolved.Target, out: *Vector[Site]) err[A.Error] {
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val fn: *me_ir.Function = ?m.functions[fi];
+        if ((fn.flags & me_ir.FN_FLAG_EXTERN) == 0) {
+            var bi: u32 = 0;
+            for (bi < fn.block_count) {
+                val blk: *me_ir.Block = ?fn.blocks[bi];
+                var ii:  u32          = 0;
+                for (ii < blk.instr_count) {
+                    val inst: *ir_instruction.Instruction = ?fn.instrs[blk.instructions[ii]::u32];
+                    if (place.is_operator(m, inst) && !vecform.realizes_packed(m, tgt, inst)) {
+                        val pushed: res[usize, A.Error] = collections_vector.push[Site](out, site_of(m, fn, inst));
+                        if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+                    }
+                    ii = ii + 1;
+                }
+                bi = bi + 1;
+            }
+        }
+        fi = fi + 1;
+    }
+    ret err[A.Error].ok{};
+}
+
+# operators the target scalarizes (declared scalar rows, lane counts past the
+# register, and undeclared shapes alike), with the first site named
+pub fun detect(m: *me_ir.Module, tgt: *resolved.Target, first: *Site) u32 {
+    ret detect_sites(m, tgt, first, false);
+}
+
+# operators whose lane shape the target's catalog names neither packed nor scalar
+pub fun detect_undeclared(m: *me_ir.Module, tgt: *resolved.Target, first: *Site) u32 {
+    ret detect_sites(m, tgt, first, true);
+}
+
+fun detect_sites(m: *me_ir.Module, tgt: *resolved.Target, first: *Site, undeclared_only: bool) u32 {
+    var count: u32 = 0;
+    var fi:    u32 = 0;
+    for (fi < m.function_len) {
+        val fn: *me_ir.Function = ?m.functions[fi];
+        if ((fn.flags & me_ir.FN_FLAG_EXTERN) == 0) {
+            var bi: u32 = 0;
+            for (bi < fn.block_count) {
+                val blk: *me_ir.Block = ?fn.blocks[bi];
+                var ii:  u32          = 0;
+                for (ii < blk.instr_count) {
+                    val inst: *ir_instruction.Instruction = ?fn.instrs[blk.instructions[ii]::u32];
+                    var hit:  bool                        = false;
+                    if (place.is_operator(m, inst)) {
+                        if (undeclared_only) { hit = vecform.decide(m, tgt, inst) == target_model.FORM_UNDECLARED; }
+                        or                   { hit = !vecform.realizes_packed(m, tgt, inst); }
+                    }
+                    if (hit) {
+                        if (count == 0) { @first = site_of(m, fn, inst); }
+                        count = count + 1;
+                    }
+                    ii = ii + 1;
+                }
+                bi = bi + 1;
+            }
+        }
+        fi = fi + 1;
+    }
+    ret count;
+}
+
+test detect__counts_only_vector_operators {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel res_m.err) { ret 1; }
+    var m: me_ir.Module = res_m.ok;
+
+    val res_f: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_float(?m.types, 32);
+    if (sel res_f.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val f32:   ir_type.IrTypeId                 = res_f.ok;
+    val res_v: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?m.types, f32, 4);
+    if (sel res_v.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val vec:   ir_type.IrTypeId                 = res_v.ok;
+    val res_i: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 32);
+    if (sel res_i.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val i32: ir_type.IrTypeId = res_i.ok;
+
+    val res_fn: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel res_fn.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val fn: *me_ir.Function = ?m.functions[res_fn.ok];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_blk: res[ir_id.BlockId, fail.Fail] = builder.new_block(?bld);
+    if (sel res_blk.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    builder.set_block(?bld, res_blk.ok);
+
+    val pv0: value.Value = value.param(0, vec);
+    val pv1: value.Value = value.param(1, vec);
+    val ps:  value.Value = value.param(2, i32);
+
+    val sum: res[value.Value, fail.Fail] = builder.emit_add(?bld, ps, ps);
+    if (sel sum.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val sum_pv0: res[value.Value, fail.Fail] = builder.emit_add(?bld, pv0, pv1);
+    if (sel sum_pv0.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    val product: res[value.Value, fail.Fail] = builder.emit_mul(?bld, pv0, pv1);
+    if (sel product.err) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    var rt:  resolved.Target = resolved.described_named("riscv64");
+    var tgt: resolved.Target = rt;
+
+    var site: Site;
+    val n:    u32 = detect(?m, ?tgt, ?site);
+    if (n != 2) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    if (site.op != ir_instruction.OP_ADD) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+    if (site.lane_bits != 32) {
+        me_ir.dnit(?m);
+        ret 1;
+    }
+
+    me_ir.dnit(?m);
+    ret 0;
+}

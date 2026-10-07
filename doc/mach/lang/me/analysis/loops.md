@@ -1,11 +1,5 @@
 # mach.lang.me.analysis.loops
 
-## val NONE_U32
-
-```mach
-pub val NONE_U32: u32 = 0xFFFFFFFF
-```
-
 ## rec InductionVar
 
 ```mach

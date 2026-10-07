@@ -42,3 +42,15 @@ pub fun type_of(sc: *sema_context.SemaContext, d: *ast_decl.Decl) type.TypeId;
 pub fun exclusion_message() str;
 ```
 
+## fun type_carries_abi_type
+
+```mach
+pub fun type_carries_abi_type(sc: *sema_context.SemaContext, t: type.TypeId) bool;
+```
+
+## fun check_abi_type_placement
+
+```mach
+pub fun check_abi_type_placement(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl);
+```
+

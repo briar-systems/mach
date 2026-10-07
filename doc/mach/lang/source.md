@@ -83,6 +83,14 @@ pub fun span_end(s: Span) usize;
 
 the offset just past the span's last byte
 
+## fun span_view
+
+```mach
+pub fun span_view(text: str, s: Span) View;
+```
+
+the bytes of `text` the span covers
+
 ## fun location
 
 ```mach

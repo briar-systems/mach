@@ -48,3 +48,45 @@ pub fun validate(sc: *sema_context.SemaContext, d: *ast_decl.Decl, dec: *ast_dec
 pub fun type_of(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl) type.TypeId;
 ```
 
+## fun check_annotation_handles_all
+
+```mach
+pub fun check_annotation_handles_all(sc: *sema_context.SemaContext);
+```
+
+## fun type_carries_handle
+
+```mach
+pub fun type_carries_handle(sc: *sema_context.SemaContext, t: type.TypeId) bool;
+```
+
+## fun annotation_refuses_indirection
+
+```mach
+pub fun annotation_refuses_indirection(sc: *sema_context.SemaContext, ann: ast_id.TypeId, t: type.TypeId) bool;
+```
+
+a binding whose written annotation holds a chain of pointers over a handle has drawn that
+annotation's refusal, and a binding whose type is inferred has no annotation to draw it
+
+## fun check_handle_fields_all
+
+```mach
+pub fun check_handle_fields_all(sc: *sema_context.SemaContext);
+```
+
+## fun check_handle_signature
+
+```mach
+pub fun check_handle_signature(sc: *sema_context.SemaContext, d: *ast_decl.Decl);
+```
+
+a function's parameters and result are values the program passes, and a handle reaches
+one by value or behind a pointer to its binding, never inside an array
+
+## fun check_handle_decl
+
+```mach
+pub fun check_handle_decl(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl);
+```
+
