@@ -138,6 +138,23 @@ rec Over { x: u8; }
 rec Holder { buf: [$size_of(Pair)]u8; } # an array length, inside a field type
 ```
 
+A module `val` initialized from a measurement is a compile-time constant like any
+other: it serves as an array length and in a gate, in its own module and in every
+module that imports it, wherever it is declared relative to the place that reads it.
+
+```mach
+rec Pair { a: u64; b: u64; }
+
+val PAIR_BYTES: u64 = $size_of(Pair);
+
+fun pair_bytes() u64 {
+    var raw: [PAIR_BYTES]u8;
+    var n:   u64 = 0;
+    $if (PAIR_BYTES == 16) { n = $size_of([PAIR_BYTES]u8); }
+    ret n;
+}
+```
+
 `$offset_of` and a descriptor's `.offset` answer from the same checked layout that
 sizes the type, under the same complete-type rules as `$size_of`. A layout the
 walk cannot determine is reported, never guessed.
