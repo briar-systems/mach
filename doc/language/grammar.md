@@ -486,10 +486,12 @@ Notes:
   [comptime-intrinsics.md](comptime-intrinsics.md). Nesting (`[N][M]T`) falls out
   of the recursion.
 - `[_]T` is an inferred array length: the length is not written but taken
-  from elsewhere. It is legal **only** on a `val` carrying `#[embed(...)]`, where
-  the length comes from the embedded file's byte count; written anywhere else it
-  is rejected — "an inferred array length `[_]` is only valid on an
-  `#[embed(...)]` declaration". See
+  from elsewhere. It is legal only as the type of an array literal
+  (`[_]T{...}`), as the annotation of a `val` or `var` initialized by an array
+  literal, where the length is the literal's element count, and on a `val`
+  carrying `#[embed(...)]`, where it is the embedded file's byte count. Anywhere
+  else, including nested in another type, it is rejected with
+  `array.inferred_length`. See [types.md](types.md#inferred-length-_t) and
   [decorators.md](decorators.md#embedstr--compile-time-file-embedding).
 - `named-type` covers both plain names (`i64`, `Point`) and generic
   instantiations (`Pair[i64, u8]`, `Map[str, u32]`). The dotted path allows
