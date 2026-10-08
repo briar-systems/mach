@@ -279,7 +279,13 @@ that:
    release tag, read from the checkout's own refs, and that release is inside
    every requirer's range, the root's included; and every release in the
    closure selects only releases (see [A release selects only
-   releases](#a-release-selects-only-releases)).
+   releases](#a-release-selects-only-releases));
+7. no identity is pinned at two commits: the root and every project of the
+   closure, a path dependency's source included, record the gitlink of each
+   Git dependency they declare, and all records of one identity agree
+   (`dependency 'b' is pinned at two commits: <commit> at <root>/dep/b, and
+   <other> at <path>/dep/b; pin it at one commit across the closure`). The
+   first pin met, root first, is the one the others are compared with.
 
 A pin outside a range names the requirer chain, the range, the pinned release
 and a runnable remedy (`dependency 'vb': root -> vb requires version '^1.2' but
@@ -343,6 +349,9 @@ Then, when the checkout lacks the tag its selection is read by (the tag a
 `tag/` names, or a release tag naming a `version` selection's pin), pull
 fetches its tags (`fetched the tags of std`). `update` and `outdated` fetch
 them the same way to read a pin's release, unless `--offline`.
+
+`pull` also notes each identity pinned at two commits across the closure, as
+verify's item 7 refuses it, and still realizes.
 
 A symlink, a file, a directory that is not a checkout of its own, and a dirty
 checkout that would be registered are refused and left as they are. `mach dep
