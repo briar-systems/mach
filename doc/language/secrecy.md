@@ -229,9 +229,11 @@ fun publish(a: ^u32) u32 { ret a:^u32; }
 ```
 
 `:>T` peels exactly the outer qualifier, so it can never launder a welded pointee
-(`*^T` stays `*^T`). `::` and `:~` may neither add nor drop `^`. Promotion needs
+(`*^T` stays `*^T`). `::` and `:~` may add `^` but never drop it. Promotion needs
 no operator of its own: a public value coerces up to secret implicitly, and a
-cast to a secret type (`x::^u16`) is an ordinary cast.
+cast to a secret type (`x::^u16`) is an ordinary cast. A cast may also add `^`
+beneath a pointer, so `*u8` and a pointer to a record of mixed public and secret
+fields both cast to `*^u8`, which lets a wipe reach every byte of any type.
 
 `:>T` is the only declassification and there is no untyped form: `:^` is not
 an operator, so `x:^` and `x:^T` are parse errors at the colon. Inside a
@@ -291,13 +293,15 @@ and a pointer counted by what it reaches. A `::` or `:~` from `*S` to `*T`
 retypes the storage `S` covers, and a `*S` may address a run of `S` values, so
 the rule is directional:
 
-1. every byte both `S` and `T` cover has the same class on both sides
+1. every byte both `S` and `T` cover has the same class on both sides, or is
+   public in `S` and secret in `T`
 2. a narrowing (`T` no larger than `S`) is accepted
 3. a widening is accepted only when the extra bytes cannot change class: every
-   byte of `S` has one class and every byte of `T` has that same class
-4. beneath a pointer (a pointer field, a pointer to a pointer, a union variant
-   of pointer type) the target is shared storage, so the relation holds both
-   ways: equal extent and the same class at every byte
+   byte of `S` has one class and every byte of `T` has that same class or is
+   secret over public `S`
+4. beneath a pointer field (a pointer to a pointer, a union variant of pointer
+   type) the target is shared storage, so the relation holds both ways: equal
+   extent and the same class at every byte, with no adding
 
 The rule is the same for scalars and aggregates, and the variants of a union
 overlay its own storage from offset 0, so every pair of variants agrees on each
@@ -364,7 +368,7 @@ and each has a test pinning it:
 
 | refused | why |
 | --- | --- |
-| `p::usize`, `p:~usize` | `::` and `:~` may neither add nor drop `^` |
+| `p::usize`, `p:~usize` | `::` and `:~` may not drop `^` |
 | `p:>*u8` | a `:>T` target must name the operand's *stripped* type, and `*^u8` stripped is `*^u8` |
 | `@((?p):~*usize)` | the same, reached through a pointer to the slot |
 | `val e: ptr = p;` | a secret-welded pointer does not erase to `ptr` |
