@@ -334,8 +334,10 @@ fun widen(p: *Key) *Wide {
 
 A type that stores no value (an empty `rec`, a `[0]T`, or an aggregate of only
 those) has zero extent and so no class: anything narrows to it, and it widens
-to nothing that stores a value. Reading past an object by indexing
-(`(?q.a)[1]`) is a bounds question no cast rule closes.
+to nothing that stores a value. The rule speaks only for the bytes a cast's
+types cover. Indexing past them, as `(?q.a)[1]` does or as indexing a narrowed
+`*^u8` past its first byte does, is an out-of-bounds access, and no cast rule
+closes it (see [Assurance](#assurance)).
 
 The comparison reads the same layout the backend emits. Where it cannot
 determine a layout it declines, which rejects.
@@ -805,6 +807,10 @@ empirical.
 **The constant-time guarantee is incomplete. This support is an experimental
 preview and has not been audited. Do not build production cryptography on it at
 this version.**
+
+Secrecy holds for in-bounds accesses only. Indexing past the object a pointer
+addresses, including past a narrowed pointer cast, is outside the guarantee, the
+same as any other out-of-bounds access.
 
 What holds today: the type system checks that the source respects the leakage
 model, `#[oblivious]` carries the obligation through codegen, and the translation
