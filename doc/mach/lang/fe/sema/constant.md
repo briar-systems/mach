@@ -131,3 +131,20 @@ the node of the expression `eid`: an aggregate literal member by member, the val
 constant it names, an address, or anything else as the evaluator answers it at the type the
 walk gave it
 
+## fun zero_ready
+
+```mach
+pub fun zero_ready(sc: *sema_context.SemaContext, ty: type.TypeId) bool;
+```
+
+whether the zero of `ty` can be built now: a tag's cases are declared once the layout of what
+it holds by value is decided, which the rest of the types need nothing of
+
+## fun zero_of
+
+```mach
+pub fun zero_of(sc: *sema_context.SemaContext, ty: u32) res[comptime.CTValue, comptime.EvalFail];
+```
+
+the zero of the type `ty` as a value, for an evaluation that holds a type and no expression
+
