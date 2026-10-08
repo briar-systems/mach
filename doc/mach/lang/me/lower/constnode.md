@@ -13,6 +13,15 @@ pub fun aggregate(ctx: *lower_context.LowerContext, store: *comptime_deep.Store,
 
 node `node` of `store` as a constant of the IR type `ity`
 
+## fun terminated_bytes
+
+```mach
+pub fun terminated_bytes(bytes: View, ty: ir_type.IrTypeId) value.Value;
+```
+
+an interned string as constant data: every byte it holds, NULs included,
+then the terminator the interner keeps after them
+
 ## fun write_bits
 
 ```mach
