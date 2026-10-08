@@ -16,6 +16,7 @@ use comptime_deep: mach.lang.fe.comptime.deep;
 use mach.lang.fe.decorator;
 use mach.lang.fe.resolve;
 use sema_context: mach.lang.fe.sema.context;
+use mach.lang.fe.sema.declared;
 use mach.lang.fe.sema.infer;
 use mach.lang.fe.sema.interface;
 use sema_product: mach.lang.fe.sema.product;
@@ -69,12 +70,38 @@ pub fun named(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptim
 pub fun member(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptime.CTValue], comptime.EvalFail] {
     if (sc == nil) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
     val found: opt[*resolve.Symbol] = sema_context.symbol_for_expr(sc, eid);
+    if (!sel found.some) {
+        val projected: res[opt[comptime.CTValue], comptime.EvalFail] = projected_value(sc, eid);
+        if (sel projected.err)     { ret projected; }
+        if (sel projected.ok.some) { ret projected; }
+    }
     if (sel found.some) {
         val aggregate: res[opt[comptime.CTValue], comptime.EvalFail] = aggregate_value(sc, found.some);
         if (sel aggregate.err)     { ret aggregate; }
         if (sel aggregate.ok.some) { ret aggregate; }
     }
     ret sema_context.resolve_module_member_const(sc, eid);
+}
+
+# the value a field or element path into a constant reads, which includes the zero of a member
+# its literal leaves out: the same answer a typed read gets, since it needs only the types the
+# constant records on its nodes
+fun projected_value(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptime.CTValue], comptime.EvalFail] {
+    val none:  res[opt[comptime.CTValue], comptime.EvalFail] = res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}};
+    val e_opt: opt[*ast_expr.Expr]                           = ast.get_expr(sc.view.a, eid);
+    if (sel e_opt.none) { ret none; }
+    val e: *ast_expr.Expr = e_opt.some;
+    if (e.kind != ast_expr.EXPR_KIND_MEMBER && !(e.kind == ast_expr.EXPR_KIND_INDEX && !ast_expr.is_range(?e.data.index))) { ret none; }
+    val reached: res[Reach, fail.Fail] = reach(sc, eid, 0);
+    if (sel reached.err)                  { ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_from_fail(reached.err, diagnostic_kind.COMPTIME_NOT_CONSTANT, "")}; }
+    if (reached.ok.kind == REACH_REFUSED) { ret res[opt[comptime.CTValue], comptime.EvalFail].err{reached.ok.why}; }
+    if (reached.ok.kind != REACH_NODE)    { ret none; }
+    val own:     u32                 = module.stable_index(sc.typing.module);
+    val adopted: res[u32, fail.Fail] = adopt(sc, reached.ok.store, reached.ok.node);
+    if (sel adopted.err) { ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_from_fail(adopted.err, diagnostic_kind.COMPTIME_NOT_CONSTANT, "")}; }
+    val read: res[comptime.CTValue, comptime.EvalFail] = comptime_deep.read(sc.typing.values, ?sc.s.interner, own, adopted.ok);
+    if (sel read.err) { ret res[opt[comptime.CTValue], comptime.EvalFail].err{read.err}; }
+    ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].some{read.ok}};
 }
 
 # the value of the record, array or case constant `sym` names, as the store of values holds it:
@@ -247,6 +274,7 @@ pub fun own_value(sc: *sema_context.SemaContext, sym: *resolve.Symbol) res[u32, 
             ret scalar;
         }
     }
+    type_initializer(sc, sym);
     sc.view.constant_node[ix] = NODE_BUILDING;
     val built: res[u32, fail.Fail] = node_build(sc, d.data.bind.init);
     if (sel built.err) {
@@ -613,8 +641,14 @@ fun reach_member(sc: *sema_context.SemaContext, eid: ast_id.ExprId, e: *ast_expr
     val name: res[intern.StrId, A.Error] = intern.range_add(?sc.s.interner, sc.view.source, e.data.member.name.offset, e.data.member.name.len);
     if (sel name.err) { ret res[Reach, fail.Fail].err{fail.refused(name.err)}; }
     val p: comptime_deep.Projection = comptime_deep.project(inner.ok.store, inner.ok.node, name.ok);
-    if (p.kind == comptime_deep.PROJECT_MEMBER)  { ret reach_node(inner.ok.store, p.node); }
-    if (p.kind == comptime_deep.PROJECT_OMITTED) { ret reach_zero(sc, type_at(sc, eid)); }
+    if (p.kind == comptime_deep.PROJECT_MEMBER) { ret reach_node(inner.ok.store, p.node); }
+    if (p.kind == comptime_deep.PROJECT_OMITTED) {
+        val owner: type.TypeId = comptime_deep.node_at(inner.ok.store, inner.ok.node).ty;
+        if (!intern.str_is_nil(declared.ensure_layout_ready(sc, owner))) { ret reach_refused(refused(LAYOUT_PENDING_MSG)); }
+        val field: opt[type.TypeId] = sema_context.field_lookup(sc, type.strip_secret(?sc.s.types, owner), name.ok);
+        if (sel field.none) { ret reach_refused(refused(ZERO_UNKNOWN_MSG)); }
+        ret reach_zero(sc, field.some);
+    }
     if (p.kind == comptime_deep.PROJECT_UNSELECTED) {
         ret reach_refused(refused("this reads the payload of a case the constant does not hold"));
     }
@@ -637,19 +671,17 @@ fun reach_index(sc: *sema_context.SemaContext, eid: ast_id.ExprId, e: *ast_expr.
     if (sel at.err) { ret reach_refused(at.err); }
     val start_o: opt[u64] = comptime.ct_int_u64(at.ok);
     if (sel start_o.none) { ret reach_refused(refused("an index into a constant must be a non-negative integer")); }
-    val start:    u64      = start_o.some;
-    val declared: opt[u32] = type.element_count(?sc.s.types, type_at(sc, e.data.index.object));
-    if (sel declared.none) { ret res[Reach, fail.Fail].ok{Reach{kind: REACH_NONE}}; }
+    val start: u64 = start_o.some;
     if (!ast_expr.is_range(?e.data.index)) {
         val element: comptime_deep.Element = comptime_deep.element(inner.ok.store, inner.ok.node, start);
         if (element.kind == comptime_deep.ELEMENT_PAST_END) { ret reach_refused(refused(comptime_deep.INDEX_PAST_END_MSG)); }
         if (element.kind == comptime_deep.ELEMENT_MEMBER)   { ret reach_node(inner.ok.store, element.node); }
-        ret reach_zero(sc, type_at(sc, eid));
+        ret reach_zero(sc, element_type(sc, array.ty));
     }
     val ty:    type.TypeId = type_at(sc, eid);
     val count: opt[u32]    = type.element_count(?sc.s.types, ty);
-    if (sel count.none)                               { ret res[Reach, fail.Fail].ok{Reach{kind: REACH_NONE}}; }
-    if (start + count.some::u64 > declared.some::u64) { ret reach_refused(refused("this window runs past the end of the constant it reads")); }
+    if (sel count.none)                                { ret res[Reach, fail.Fail].ok{Reach{kind: REACH_NONE}}; }
+    if (start + count.some::u64 > array.declared::u64) { ret reach_refused(refused("this window runs past the end of the constant it reads")); }
     var held: u32 = 0;
     if (start < array.len::u64) { held = array.len - start::u32; }
     if (held > count.some)      { held = count.some; }
@@ -673,14 +705,27 @@ fun reach_index(sc: *sema_context.SemaContext, eid: ast_id.ExprId, e: *ast_expr.
     ret reach_node(sc.typing.values, window.ok);
 }
 
-val ZERO_UNKNOWN_MSG: str = "the zero of this field's type is not known";
+# the element type of the array or vector constant type `ty`, which the constant records itself so
+# a read no walk has typed still knows the zero of an element
+fun element_type(sc: *sema_context.SemaContext, ty: type.TypeId) type.TypeId {
+    val types: *type.TypeInterner = ?sc.s.types;
+    val found: opt[*type.Type]    = type.get(types, type.strip_secret(types, ty));
+    if (sel found.none)                     { ret type.TYPE_NIL; }
+    if (found.some.kind == type.TYPE_ARRAY) { ret found.some.data.array.base; }
+    val lane: opt[type.TypeId] = type.prim(types, type.vector_element(types, ty));
+    if (sel lane.none) { ret type.TYPE_NIL; }
+    ret lane.some;
+}
+
+val ZERO_UNKNOWN_MSG:   str = "the zero of this field's type is not known";
+val LAYOUT_PENDING_MSG: str = "the zero of this field's type needs a layout that is still being decided";
 
 # the zero of `ty`, which a member a literal leaves out holds: a record or an array with no
 # members, a scalar zero, or a tag's first declared case over the zero of its payload
 fun reach_zero(sc: *sema_context.SemaContext, ty: type.TypeId) res[Reach, fail.Fail] {
     val types: *type.TypeInterner = ?sc.s.types;
     if (type.is_tag(types, type.strip_secret(types, ty))) { ret reach_zero_tag(sc, ty); }
-    var node:     comptime_deep.Node = comptime_deep.Node{kind: comptime_deep.NODE_SCALAR, ty: ty};
+    var node:     comptime_deep.Node = comptime_deep.Node{kind: comptime_deep.NODE_SCALAR, ty: ty, head: intern.STR_NIL};
     val elements: opt[u32]           = type.element_count(types, ty);
     if (type.is_record(types, ty) || type.is_union(types, ty)) { node.kind = comptime_deep.NODE_LITERAL; }
     or (sel elements.some) {
@@ -703,8 +748,9 @@ fun reach_zero(sc: *sema_context.SemaContext, ty: type.TypeId) res[Reach, fail.F
 # the case literal of the first declared case of tag `ty`, holding the zero of its payload when it
 # declares one: the shape a written case literal has, and the value lowering zero-fills
 fun reach_zero_tag(sc: *sema_context.SemaContext, ty: type.TypeId) res[Reach, fail.Fail] {
-    val types: *type.TypeInterner    = ?sc.s.types;
-    val bare:  type.TypeId           = type.strip_secret(types, ty);
+    val types: *type.TypeInterner = ?sc.s.types;
+    val bare:  type.TypeId        = type.strip_secret(types, ty);
+    if (!intern.str_is_nil(declared.ensure_layout_ready(sc, bare))) { ret reach_refused(refused(LAYOUT_PENDING_MSG)); }
     val first: opt[*type.FieldEntry] = type.field_at(types, bare, 0);
     if (sel first.none) { ret res[Reach, fail.Fail].err{fail.message("sema: a tag has no cases")}; }
     var payload: Reach = Reach{kind: REACH_NONE};
