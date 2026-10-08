@@ -16,6 +16,14 @@ fwd mach.lang.manifest.schema.is_project_path
 
 forwards [`mach.lang.manifest.schema.is_project_path`](manifest/schema.md#fun-is_project_path)
 
+## fwd mach.lang.manifest.schema.OUTPUT_CONSTRAINT
+
+```mach
+fwd mach.lang.manifest.schema.OUTPUT_CONSTRAINT
+```
+
+forwards [`mach.lang.manifest.schema.OUTPUT_CONSTRAINT`](manifest/schema.md#val-output_constraint)
+
 ## fwd mach.lang.manifest.refusal.at_sites
 
 ```mach

@@ -689,14 +689,6 @@ pub val RELATIONS: [RELATIONS_N]Relation = [RELATIONS_N]Relation;
 
 the relations among the shared rows, in force in every schema that accepts both rows
 
-## val OUTPUT_CONSTRAINT
-
-```mach
-pub val OUTPUT_CONSTRAINT: str = "-o must name a canonical path inside the project root: relative, with no . or .. component"
-```
-
-the rule `-o` keeps wherever it names an output, which each command taking it prints and refuses by
-
 ## val SELECTOR_CONSTRAINT
 
 ```mach

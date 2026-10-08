@@ -95,8 +95,8 @@ and `-p`.
 `-o` names a canonical path inside the project root, as an artifact's `out` does:
 relative, `/`-separated, with no `.` or `..` component and no empty one.
 `-o ../mach`, `-o ./mach` and `-o /tmp/mach` are refused with `-o must name a
-canonical path inside the project root`, so a build never writes outside the
-tree it was asked to build.
+canonical path inside the project root: relative, with no . or .. component`, so
+a build never writes outside the tree it was asked to build.
 
 ## When one cell fails
 
