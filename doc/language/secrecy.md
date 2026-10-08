@@ -229,9 +229,13 @@ fun publish(a: ^u32) u32 { ret a:^u32; }
 ```
 
 `:>T` peels exactly the outer qualifier, so it can never launder a welded pointee
-(`*^T` stays `*^T`). `::` and `:~` may neither add nor drop `^`. Promotion needs
-no operator of its own: a public value coerces up to secret implicitly, and a
-cast to a secret type (`x::^u16`) is an ordinary cast.
+(`*^T` stays `*^T`). `::` and `:~` may add `^` at a value position but never drop it. Promotion
+needs no operator of its own: a public value coerces up to secret implicitly,
+and a cast to a secret type (`x::^u16`) is an ordinary cast. The same holds for
+a scalar, for a scalar field of a by-value aggregate, and for a pointer value,
+whose address becomes secret. What a pointer reaches stays exact at every depth,
+so `*u8` does not cast to `*^u8`: the target is shared storage, and a secret
+written through the new alias would be read back through the old public one.
 
 `:>T` is the only declassification and there is no untyped form: `:^` is not
 an operator, so `x:^` and `x:^T` are parse errors at the colon. Inside a
@@ -295,9 +299,12 @@ the rule is directional:
 2. a narrowing (`T` no larger than `S`) is accepted
 3. a widening is accepted only when the extra bytes cannot change class: every
    byte of `S` has one class and every byte of `T` has that same class
-4. beneath a pointer (a pointer field, a pointer to a pointer, a union variant
-   of pointer type) the target is shared storage, so the relation holds both
-   ways: equal extent and the same class at every byte
+4. beneath a pointer field (a pointer to a pointer, a union variant of pointer
+   type) the target is shared storage, so the relation holds both ways: equal
+   extent and the same class at every byte
+
+A by-value cast between aggregates is the one place a byte may turn from public
+to secret, and a pointer field keeps its target exact even there.
 
 The rule is the same for scalars and aggregates, and the variants of a union
 overlay its own storage from offset 0, so every pair of variants agrees on each
@@ -364,7 +371,8 @@ and each has a test pinning it:
 
 | refused | why |
 | --- | --- |
-| `p::usize`, `p:~usize` | `::` and `:~` may neither add nor drop `^` |
+| `p::usize`, `p:~usize` | `::` and `:~` may not drop `^` |
+| `p::*^u8` from `p: *u8` | adding `^` to a pointer's target lets a secret be written through the alias and read back public |
 | `p:>*u8` | a `:>T` target must name the operand's *stripped* type, and `*^u8` stripped is `*^u8` |
 | `@((?p):~*usize)` | the same, reached through a pointer to the slot |
 | `val e: ptr = p;` | a secret-welded pointer does not erase to `ptr` |

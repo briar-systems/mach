@@ -482,8 +482,9 @@ A conversion folded at compile time follows the build target's rule, so a folded
 conversion the target has no instruction for follows the same rule. `:~` never
 converts, so it reads and writes a NaN's bits exactly on every target.
 
-Neither `::` nor `:~` may add or drop the `^` secret qualifier, and neither can
-erase a secret-welded pointer to `ptr`. Representation-changing `::` and `:~` casts
+`::` and `:~` may add the `^` secret qualifier to a value, a by-value aggregate
+or a pointer value, but never to what a pointer reaches, and neither may drop it.
+Neither can erase a secret-welded pointer to `ptr`. Representation-changing `::` and `:~` casts
 are rejected when either by-value representation contains a tag, including through
 records, arrays, or union variants. Transparent aliases preserve the tag type.
 The only secrecy downgrade is the `:>T` strip cast, which removes outer secrecy
