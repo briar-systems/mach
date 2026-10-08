@@ -56,8 +56,8 @@ pub fun own_value(sc: *sema_context.SemaContext, sym: *resolve.Symbol) res[u32, 
 ```
 
 the node of the value the module `val` `sym` declares, built in the module's store on first
-ask: the constant sema bound, or an array, record or case literal evaluated member by member;
-NONE for any other initializer
+ask: the constant sema bound, or its initializer evaluated member by member; NONE for a
+declaration with no initializer of its own
 
 ## fun array_value
 
@@ -94,4 +94,14 @@ pub fun type_at(sc: *sema_context.SemaContext, eid: ast_id.ExprId) type.TypeId;
 ```
 
 the type the walk gave an expression
+
+## fun node_build
+
+```mach
+pub fun node_build(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[u32, fail.Fail];
+```
+
+the node of the expression `eid`: an aggregate literal member by member, the value of the
+constant it names, an address, or anything else as the evaluator answers it at the type the
+walk gave it
 

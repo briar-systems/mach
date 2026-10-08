@@ -73,6 +73,17 @@ its bytes — is never duplicated this way. It keeps one definition and every
 reference reads it, so two references to one `str` constant compare pointer-equal
 no matter which module they are in or how they are spelled.
 
+A module-level `val` or `var` of record, case, array or vector type is laid out
+as constant data at compile time. Its initializer is a literal of that type, or
+names a constant `val` (this module's or an imported one, bare or through a field,
+an element or a window `A[start, n]` of one), and each member is built the same
+way, down to leaves that are compile-time scalars, strings, `nil`, a function
+named bare, or the address `?place` of a module-level function, `val` or `var`
+or of a field or element of one. An address leaf keeps its symbol, so it crosses
+modules like any other member. A leaf that has no compile-time value, such as a
+call or the address of a place behind a pointer, is rejected at that leaf with
+the reason it has none.
+
 ## `ext` — foreign data imports
 
 `ext val` / `ext var` declares a binding whose storage lives in another object,

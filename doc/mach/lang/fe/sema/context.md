@@ -489,6 +489,12 @@ the type store a comptime evaluation inside this walk reads
 pub fun resolve_type_comparison_operand(sc: *SemaContext, eid: ast_id.ExprId) res[opt[u32], comptime.EvalFail];
 ```
 
+## fun gated_member_const_message
+
+```mach
+pub fun gated_member_const_message(sc: *SemaContext, name: intern.StrId, dep_path: intern.StrId) res[str, fail.Fail];
+```
+
 ## fun resolve_module_member_const
 
 ```mach

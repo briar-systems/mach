@@ -1,14 +1,14 @@
 # a published constant value laid out as the constant bytes of its type: a record's fields at
 # their offsets, a tag's case code and payload, an array's or a vector's elements at the
-# element stride, and a string leaf as a pointer to its bytes
+# element stride, a string leaf as a pointer to its bytes, and an address as a relocation
+# against the symbol it points into
 use mach.lang.growth;
 use std.types.bool.false;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
-use std.types.string.str;
-use std.types.string.str_len;
+use std.types.view.View;
 
 use A: std.allocator;
 
@@ -20,6 +20,9 @@ use mach.lang.intern;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use lower_context: mach.lang.me.lower.context;
+use mach.lang.me.lower.mangle;
+use mach.lang.module;
+use mach.lang.session;
 use mach.lang.target.resolved;
 use mach.lang.type;
 use mach.lang.wide;
@@ -50,6 +53,7 @@ pub fun aggregate(ctx: *lower_context.LowerContext, store: *comptime_deep.Store,
 fun place(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, node: u32, ity: ir_type.IrTypeId, blob: *u8, base: u32, relocs: *Relocs) err[fail.Fail] {
     val n: *comptime_deep.Node = comptime_deep.node_at(store, node);
     if (n.kind == comptime_deep.NODE_REFUSED) { ret err[fail.Fail].err{fail.message("lower: a constant value holds a leaf with no compile-time value")}; }
+    if (n.kind == comptime_deep.NODE_ADDRESS) { ret place_address(ctx, store, n, base, relocs); }
     val opt_t: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
     if (sel opt_t.none) { ret err[fail.Fail].err{fail.message("lower: a constant value has an unknown IR type")}; }
     val k: ir_type.IrTypeKind = opt_t.some.kind;
@@ -159,19 +163,58 @@ fun place_scalar(ctx: *lower_context.LowerContext, n: *comptime_deep.Node, ity: 
 
 # a string leaf points at its bytes, which become a constant of their own
 fun place_string(ctx: *lower_context.LowerContext, text: intern.StrId, ity: ir_type.IrTypeId, base: u32, relocs: *Relocs) err[fail.Fail] {
-    val opt_txt: opt[str] = intern.get(?ctx.s.interner, text);
-    if (sel opt_txt.none) { ret err[fail.Fail].err{fail.message("lower: a constant string is not interned")}; }
-    val s:     str                         = opt_txt.some;
-    val bytes: value.Value                 = value.const_bytes(s::*u8, (str_len(s) + 1::usize)::u32, ity);
-    val added: res[value.Value, fail.Fail] = lower_context.add_rodata_bytes(ctx, bytes, ity);
+    val opt_bytes: opt[View] = intern.bytes(?ctx.s.interner, text);
+    if (sel opt_bytes.none) { ret err[fail.Fail].err{fail.message("lower: a constant string is not interned")}; }
+    val added: res[value.Value, fail.Fail] = lower_context.add_rodata_bytes(ctx, terminated_bytes(opt_bytes.some, ity), ity);
     if (sel added.err) { ret err[fail.Fail].err{added.err}; }
     val gv: value.Value = added.ok;
     if (gv.kind != value.VAL_GLOBAL || gv.data.global_ix >= ctx.m.global_len) { ret err[fail.Fail].err{fail.message("lower: a constant string did not lower to a global")}; }
+    ret reloc_add(ctx, relocs, value.AggReloc{offset: base, symbol: ctx.m.globals[gv.data.global_ix].name, addend: 0, is_fn: false});
+}
+
+# an address is a relocation against the linkage name of the symbol it points into, offset to
+# the place its field and element steps reach
+fun place_address(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, n: *comptime_deep.Node, base: u32, relocs: *Relocs) err[fail.Fail] {
+    val mid: session.ModuleId = session.module_id_for_stable(ctx.s, module.stable_id(n.symbol.module));
+    if (module.is_nil(mid)) { ret err[fail.Fail].err{fail.message("lower: a constant address names a module the session has not loaded")}; }
+    val name: res[intern.StrId, fail.Fail] = mangle.declaration_linkage_name(ctx.s, mid, n.symbol.canon, n.symbol.decl);
+    if (sel name.err) { ret err[fail.Fail].err{name.err}; }
+    var addend: i64 = 0;
+    var i:      u32 = 0;
+    for (i < n.len) {
+        val m:       comptime_deep.Member = store.members.data[n.first + i];
+        val step:    *comptime_deep.Node  = comptime_deep.node_at(store, m.node);
+        val ordinal: opt[u64]             = comptime.ct_int_u64(step.value);
+        if (sel ordinal.none) { ret err[fail.Fail].err{fail.message("lower: a constant address step holds no ordinal")}; }
+        val owner: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, step.ty);
+        if (sel owner.err) { ret err[fail.Fail].err{owner.err}; }
+        if (!intern.str_is_nil(m.name)) {
+            addend = addend + ir_type.member_offset_for_machine(?ctx.m.types, owner.ok, ordinal.some::u32, resolved.layout_machine(ctx.tgt))::i64;
+        }
+        or {
+            val opt_t: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, owner.ok);
+            if (sel opt_t.none) { ret err[fail.Fail].err{fail.message("lower: a constant address steps into an unknown IR type")}; }
+            var ety: ir_type.IrTypeId = opt_t.some.data.array_.element;
+            if (opt_t.some.kind == ir_type.IRT_VECTOR) { ety = opt_t.some.data.vector_.element; }
+            addend = addend + ordinal.some::i64 * ir_type.byte_size_for_machine(?ctx.m.types, ety, resolved.layout_machine(ctx.tgt))::i64;
+        }
+        i = i + 1;
+    }
+    ret reloc_add(ctx, relocs, value.AggReloc{offset: base, symbol: name.ok, addend: addend, is_fn: n.symbol.function});
+}
+
+fun reloc_add(ctx: *lower_context.LowerContext, relocs: *Relocs, r: value.AggReloc) err[fail.Fail] {
     val grown: err[A.Error] = growth.reserve[value.AggReloc](ctx.m.alloc, ?relocs.data, ?relocs.cap, relocs.len::usize + 1);
     if (sel grown.err) { ret err[fail.Fail].err{fail.refused(grown.err)}; }
-    relocs.data[relocs.len] = value.AggReloc{offset: base, symbol: ctx.m.globals[gv.data.global_ix].name, addend: 0, is_fn: false};
+    relocs.data[relocs.len] = r;
     relocs.len              = relocs.len + 1;
     ret err[fail.Fail].ok{};
+}
+
+# an interned string as constant data: every byte it holds, NULs included,
+# then the terminator the interner keeps after them
+pub fun terminated_bytes(bytes: View, ty: ir_type.IrTypeId) value.Value {
+    ret value.const_bytes(bytes.data::*u8, (bytes.len + 1)::u32, ty);
 }
 
 # little-endian bytes of a constant: the low limb first, then the high limb
@@ -206,4 +249,84 @@ test write_bits__sixteen_byte_leaf_is_little_endian_lo_then_hi {
     write_bits(?blob[0], 0, wide.make(0x0000000000000000, 0x00000000000000AB), 9);
     if (blob[8] != 0xAB || blob[9] != 8) { ret 5; }
     ret 0;
+}
+
+#[testing]
+rec ConstNodeInner {
+    x: u32;
+    y: u64;
+}
+
+#[testing]
+rec ConstNodeProbe {
+    a:     u32;
+    b:     u64;
+    c:     u8;
+    inner: ConstNodeInner;
+    arr:   [3]u32;
+}
+
+#[testing]
+val constnode_probe_static: ConstNodeProbe = ConstNodeProbe{a: 7};
+
+#[testing]
+val constnode_probe_ct_arr: [1]ConstNodeProbe = [1]ConstNodeProbe{ConstNodeProbe{a: 7}};
+
+#[noinline]
+#[testing]
+fun constnode_probe_dirty() u64 {
+    var junk: [24]u64;
+    var i:    u32 = 0;
+    for (i < 24) {
+        junk[i] = 0xAAAAAAAAAAAAAAAA;
+        i       = i + 1;
+    }
+    ret junk[0];
+}
+
+#[noinline]
+#[testing]
+fun constnode_probe_runtime() ConstNodeProbe {
+    ret ConstNodeProbe{a: 7};
+}
+
+test constnode__static_and_runtime_agree_on_omitted_fields {
+    if (constnode_probe_dirty() != 0xAAAAAAAAAAAAAAAA) { ret 1; }
+
+    val r: ConstNodeProbe = constnode_probe_runtime();
+
+    if (r.a != 7)                      { ret 2; }
+    if (constnode_probe_static.a != 7) { ret 3; }
+
+    if (r.b != 0)                                        { ret 4; }
+    if (r.c != 0)                                        { ret 5; }
+    if (r.inner.x != 0 || r.inner.y != 0)                { ret 6; }
+    if (r.arr[0] != 0 || r.arr[1] != 0 || r.arr[2] != 0) { ret 7; }
+
+    if (constnode_probe_static.b != r.b) { ret 8; }
+    if (constnode_probe_static.c != r.c) { ret 9; }
+    val st: ConstNodeProbe = constnode_probe_static;
+    if (st.inner.x != r.inner.x) { ret 10; }
+    if (st.inner.y != r.inner.y) { ret 11; }
+    if (st.arr[0] != r.arr[0])   { ret 12; }
+    if (st.arr[2] != r.arr[2])   { ret 13; }
+
+    ret 0;
+}
+
+test constnode__comptime_constant_and_runtime_agree_on_omitted_fields {
+    var bad: i32 = 0;
+    $each item in constnode_probe_ct_arr {
+        $if (item.b == 0 && item.c == 0) {
+            val r: ConstNodeProbe = constnode_probe_runtime();
+            if (r.b != 0)                      { bad = bad + 1; }
+            if (r.c != 0)                      { bad = bad + 2; }
+            if (r.inner.y != 0)                { bad = bad + 4; }
+            if (constnode_probe_static.b != 0) { bad = bad + 8; }
+        }
+        $or {
+            bad = bad + 32;
+        }
+    }
+    ret bad;
 }
