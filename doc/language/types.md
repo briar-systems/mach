@@ -224,7 +224,7 @@ and the inline expansion otherwise (see
 conversions between `f16` and `f32` lanes are packed (`fcvtl`, `fcvtn`) with or
 without `fp16`. A comparison makes no NaN and every widening is exact, so
 comparing in `f32` lanes gives the scalar mask. x86-64 has no packed `f16`
-arithmetic below AVX-512 FP16, and the AVX-512 FP16 rows are #4159.
+arithmetic below AVX-512 FP16, and mach does not emit AVX-512 FP16.
 
 ### Size and alignment
 
