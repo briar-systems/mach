@@ -49,7 +49,7 @@ params_start: where a function's parameters start in `params`
 op_set: the instruction set and operation an `#[op]` names, STR_NIL without one
 value: the node in `values` of a `val`'s constant value, or of the value
               a `var`'s initializer gives it, NONE when it has none
-gated: the value is declared under a comptime condition
+gated: the value is declared under a comptime condition; the one record sema reads for it, from the binding the module's context holds
 
 ## rec Param
 
