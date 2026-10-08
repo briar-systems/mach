@@ -1170,9 +1170,9 @@ any of them (see [test.md](test.md#which-tests-run)).
   as a `.a`.
 - **`shared`** links a dynamic library at the resolved `out`. Only ELF targets
   write one today: `linux` on `x86_64`, `aarch64` and `riscv64` produce a `.so`
-  whose `SONAME` is its file name. The Mach-O `.dylib` and PE `.dll` writers are
-  not built yet, so a `darwin` or `windows` target refuses with `link: object
-  format cannot write shared libraries` (#3588). A `freestanding` target never
+  whose `SONAME` is its file name. mach writes no Mach-O `.dylib` or PE `.dll`,
+  so a `darwin` or `windows` target refuses with `link: object format cannot
+  write shared libraries`. A `freestanding` target never
   writes one: its default `raw` format refuses with `a flat-image object format
   produces only executables`, and setting `of = "elf"` moves the refusal to the
   link, `link: a shared library needs a loader to map it, and os =
@@ -1235,8 +1235,8 @@ inspection use the same expansion.
 | Target output format | `bin` suffix | `static` suffix | `shared` suffix |
 | --- | --- | --- | --- |
 | ELF on Linux or freestanding | empty | `.a` | `.so` (refused on freestanding) |
-| Mach-O on Darwin | empty | `.a` | `.dylib` (not written yet, #3588) |
-| COFF/PE on Windows | `.exe` | `.lib` | `.dll` (not written yet, #3588) |
+| Mach-O on Darwin | empty | `.a` | `.dylib` (not written) |
+| COFF/PE on Windows | `.exe` | `.lib` | `.dll` (not written) |
 | Raw image | empty | unsupported | unsupported |
 | SPIR-V module | `.spv` | unsupported | unsupported |
 

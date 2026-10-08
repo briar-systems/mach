@@ -896,8 +896,8 @@ timing-preserving. What it refuses, it refuses closed: an operation it does not
 know, an out-of-range register reference, and inline assembly without a
 complete effect declaration are rejected, never defaulted to public. A proof
 over the final allocated machine program — after selection, allocation, spills
-and frame insertion, over physical registers and flags — is planned additive
-work (#3591), not something this version claims. Where mach does not own
+and frame insertion, over physical registers and flags — is not something
+this version claims. Where mach does not own
 the later stages at all — a whole-module emitter such as SPIR-V — the contract
 is refused rather than assumed.
 
