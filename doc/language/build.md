@@ -49,7 +49,7 @@ refused, naming them.
   `skip` line, and not run, whatever emulation the host has. `--runner <cmd>` runs a
   foreign target's tests through a command and needs the selection to resolve to one
   cell. A run in which nothing was runnable exits `1`, so a green run always ran
-  something.
+  something, unless `--allow-unrunnable` accepts it.
 - `mach run <path>` and `mach doc <path>` consume exactly one cell and refuse a
   selection that resolves to several, naming them. `mach run` takes no `--all`, and
   `mach doc` selects with `-a` and `-t` only.
