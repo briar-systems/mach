@@ -24,6 +24,15 @@ pub fun named(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptim
 the value of the module constant the bare name `eid` names: one of this module's, bound on
 first read, or one an imported module published
 
+## fun member
+
+```mach
+pub fun member(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptime.CTValue], comptime.EvalFail];
+```
+
+the value of the module constant a path names, which for a path through a module is the
+imported constant itself
+
 ## fun bind
 
 ```mach
