@@ -574,7 +574,7 @@ cast         ::= ( "::" | ":~" ) type
 
 `::` is a value conversion and `:~` a same-size bit reinterpret; see
 [operators.md](operators.md#cast). `::` and `:~` may add the
-`^` secret qualifier but never drop it. `:>` is the only downgrade: it strips `^` from the
+`^` secret qualifier to a value but never drop it, and never add it to a pointer's target. `:>` is the only downgrade: it strips `^` from the
 operand's type, producing a new public value ([secrecy.md](secrecy.md)).
 Its target type is required and names the operand's stripped public type; a bare
 `:>` is a parse error, and `:>` never reinterprets storage.

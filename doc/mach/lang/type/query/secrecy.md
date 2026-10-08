@@ -49,7 +49,7 @@ pub val UNBOUNDED_CAST_MSG:     str = "cannot prove that the two types agree on 
 pub fun cast_allowed(s: *session.Session, m: layout.Machine, from: type.TypeId, to: type.TypeId) res[Agreement, fail.Fail];
 ```
 
-whether a `::` or `:~` from `from` to `to` keeps every byte's secrecy class or only makes public bytes secret
+whether a `::` or `:~` from `from` to `to` keeps every byte's secrecy class or only makes public bytes secret in a value
 
 ## fun overlay_agrees
 
