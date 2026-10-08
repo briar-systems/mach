@@ -411,14 +411,6 @@ fwd comptime_capability.FIELD_SEL_TYPE_BY_NAME
 
 forwards [`mach.lang.fe.comptime.capability.FIELD_SEL_TYPE_BY_NAME`](comptime/capability.md#val-field_sel_type_by_name)
 
-## fwd comptime_capability.FIELD_SEL_ZERO_BY_NAME
-
-```mach
-fwd comptime_capability.FIELD_SEL_ZERO_BY_NAME
-```
-
-forwards [`mach.lang.fe.comptime.capability.FIELD_SEL_ZERO_BY_NAME`](comptime/capability.md#val-field_sel_zero_by_name)
-
 ## fwd comptime_capability.NoCapabilityContext
 
 ```mach

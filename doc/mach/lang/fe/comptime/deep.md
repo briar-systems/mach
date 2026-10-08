@@ -283,3 +283,65 @@ pub fun clone(to: *Store, from: *Store, node: u32) res[u32, fail.Fail];
 
 node `node` of `from` with everything under it, added to `to`, which is another store
 
+## val ZERO_UNKNOWN_MSG
+
+```mach
+pub val ZERO_UNKNOWN_MSG: str = "the zero of this field's type is not known"
+```
+
+## fun zero_defined
+
+```mach
+pub fun zero_defined(types: *type.TypeInterner, ty: type.TypeId) bool;
+```
+
+whether `ty` has a zero: every type the type store holds does, an unresolved or error type does not
+
+## fun zero_into
+
+```mach
+pub fun zero_into(s: *Store, types: *type.TypeInterner, pointer_width: u32, ty: type.TypeId) res[u32, fail.Fail];
+```
+
+the zero of `ty` built into `s`, which a member a literal leaves out holds: a record, union or
+array with no members, a scalar zero, or a tag's first declared case over the zero of its
+payload. The tag's field table must be ready, and a tag with no cases is an internal failure.
+A failure leaves `s` as it was.
+
+## val SCRATCH_MODULE
+
+```mach
+pub val SCRATCH_MODULE: u32 = 0xFFFFFFFF
+```
+
+the module index a scratch store of zeros answers to when a node of it is read as a value
+
+## rec Zeros
+
+```mach
+pub rec Zeros;
+```
+
+the zeros a phase without a module store reads, one node tree per type and kept for the phase's
+life, so it holds at most one tree per distinct type however often a zero is read
+
+## fun zeros_init
+
+```mach
+pub fun zeros_init(alloc: *A.Allocator) Zeros;
+```
+
+## fun zeros_dnit
+
+```mach
+pub fun zeros_dnit(z: *Zeros);
+```
+
+## fun zeros_read
+
+```mach
+pub fun zeros_read(z: *Zeros, types: *type.TypeInterner, itn: *intern.Interner, pointer_width: u32, ty: type.TypeId) res[comptime_value.CTValue, comptime_failure.EvalFail];
+```
+
+the zero of `ty` as a value: a scalar's value, or the aggregate as a node of the scratch store
+

@@ -21,12 +21,6 @@ pub val FIELD_SEL_TYPE:         u8 = 1
 pub val FIELD_SEL_OFFSET:       u8 = 2
 ```
 
-## val FIELD_SEL_ZERO_BY_NAME
-
-```mach
-pub val FIELD_SEL_ZERO_BY_NAME: u8 = 3
-```
-
 ## val FIELD_SEL_HAS_PAYLOAD
 
 ```mach
@@ -199,6 +193,7 @@ store: fun(*T, u32) res[*comptime_deep.Store, comptime_failure.EvalFail],
 type_: fun(*T, ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail],
 types: fun(*T) *type.TypeInterner,
 offset: fun(*T, u32, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
+zero: fun(*T, u32) res[comptime_value.CTValue, comptime_failure.EvalFail],
 query: fun(*T, u32, u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 layout: fun(*T, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 cast: fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail],
@@ -216,6 +211,7 @@ store: fun(*T, u32) res[*comptime_deep.Store, comptime_failure.EvalFail],
 type_: fun(*T, ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail],
 types: fun(*T) *type.TypeInterner,
 offset: fun(*T, u32, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
+zero: fun(*T, u32) res[comptime_value.CTValue, comptime_failure.EvalFail],
 query: fun(*T, u32, u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 layout: fun(*T, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 cast: fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail],
