@@ -306,6 +306,14 @@ whether `value` is a canonical strict descendant of the project root: non-empty,
 value: the candidate path
 ret: true when every rule holds
 
+## val OUTPUT_CONSTRAINT
+
+```mach
+pub val OUTPUT_CONSTRAINT: str = "-o must name a canonical path inside the project root: relative, with no . or .. component"
+```
+
+the rule `-o` keeps wherever it names an output, which the cli prints and build refuses by
+
 ## fun check_path
 
 ```mach
