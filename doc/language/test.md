@@ -161,6 +161,7 @@ run are:
 --diagnostics <human|json>  write failures and the run's records to stderr as text or NDJSON
 --runner <cmd>           launch each test through a host-side command
 --timeout <duration>     terminate a test and its process group after the duration
+--allow-unrunnable       exit 0 when nothing selected can run on this host, after building it
 ```
 
 A roll-up is `<module>  <ok> ok[  <fail> FAIL]  <duration>`, written once the
@@ -294,7 +295,9 @@ whose `os` and `isa` are the host's runs its tests; any other is built and repor
 on a `skip` line, since an emulator the host happens to have is not the target.
 `--runner <cmd>` launches each test as `<cmd> <exe> <index>` and needs the selection
 to resolve to one (artifact, target, profile), foreign or not. A run that executed
-nothing exits `1`, naming the host, so a passing run always ran tests.
+nothing exits `1`, naming the host, so a passing run always ran tests. A
+selection with nothing runnable on the host exits `0` under `--allow-unrunnable`,
+after building it and printing each skip line; a build failure still exits non-zero.
 
 An inline `test name { }` declaration in a module the artifact reaches runs
 with no further wiring. A module that exists only for tests, such as a suite
