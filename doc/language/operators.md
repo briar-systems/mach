@@ -122,7 +122,8 @@ binary32, because that conversion quiets a signaling operand and the half unit
 would give a signaling NaN priority. Where the NaN the operation makes is the
 target's (see [A NaN between float widths](#a-nan-between-float-widths)), every
 path above makes the one the target's native half instruction would.
-x86-64's native rows under AVX-512 FP16 are #4159.
+x86-64 takes the rows above with or without AVX-512 FP16, which mach does not
+emit.
 
 That is proven, not assumed: the exhaustive proof `test/run.sh --f16proof`
 checks every pair of `f16` operands for each operator, and every input of
