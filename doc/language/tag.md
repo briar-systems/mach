@@ -259,8 +259,8 @@ refuses one.
 gate on a module `val` constructed with `C.case{...}` tests the constant's
 selected case, guards `C.case` in its arm the same way a runtime chain arm
 does, and its payload reads fold to the constant payload. A comptime `sel` on
-anything that is not a constant tag element (a parameter, a local, a module
-`var`, or a constant of another module) is rejected with a located diagnostic
+anything that is not a constant tag element (a parameter, a local, or a module
+`var`) is rejected with a located diagnostic
 at the condition, and a payload read of a case the constant does not hold is a
 compile-time error rather than the runtime undefined behavior, because comptime
 state is never stale.

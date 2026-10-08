@@ -271,3 +271,12 @@ pub fun field_of[T](ctx: *T, caps: PhaseCapabilities[T], owner: u32, index: u32,
 what a field descriptor answers about field `index` of `owner`, `pick` naming the member
 asked; every answer but the offset reads the type store, and the offset is the phase's
 
+## fun zero_of_element
+
+```mach
+pub fun zero_of_element(types: *type.TypeInterner, array: type.TypeId) opt[comptime_value.CTValue];
+```
+
+the zero of the element type of the array `array`, which an element its literal omits holds;
+none when it is no scalar
+

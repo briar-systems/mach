@@ -213,6 +213,60 @@ pub fun project(s: *Store, node: u32, name: intern.StrId) Projection;
 member `name` of a record or case literal: a record's field, or a case literal's payload when
 `name` is the case it holds
 
+## def ElementKind
+
+```mach
+pub def ElementKind: u8
+```
+
+## val ELEMENT_ABSENT
+
+```mach
+pub val ELEMENT_ABSENT: ElementKind = 0
+```
+
+the node is no array
+
+## val ELEMENT_MEMBER
+
+```mach
+pub val ELEMENT_MEMBER: ElementKind = 1
+```
+
+## val ELEMENT_OMITTED
+
+```mach
+pub val ELEMENT_OMITTED:  ElementKind = 2
+```
+
+an index the array declares but its literal leaves out, which holds its zero
+
+## val ELEMENT_PAST_END
+
+```mach
+pub val ELEMENT_PAST_END: ElementKind = 3
+```
+
+## val INDEX_PAST_END_MSG
+
+```mach
+pub val INDEX_PAST_END_MSG: str = "this index is past the end of the constant it reads"
+```
+
+## rec Element
+
+```mach
+pub rec Element;
+```
+
+## fun element
+
+```mach
+pub fun element(s: *Store, node: u32, index: u64) Element;
+```
+
+element `index` of an array node
+
 ## fun refused_within
 
 ```mach
