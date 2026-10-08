@@ -47,7 +47,7 @@ decl: the declaration in its module, which keys the session's tables of it
 generics: how many type parameters a function declares
 params_start: where a function's parameters start in `params`
 op_set: the instruction set and operation an `#[op]` names, STR_NIL without one
-value: the node in `values` of a `val`'s constant value, or of the compile-time value
+value: the node in `values` of a `val`'s constant value, or of the value
               a `var`'s initializer gives it, NONE when it has none
 gated: the value is declared under a comptime condition
 

@@ -1,8 +1,9 @@
 # mach.lang.fe.comptime.deep
 
 the deep value of a constant: an array, record or case literal as a tree of nodes with every
-member evaluated, and a leaf that has no compile-time value kept with its refusal. a store
-holds the trees of one module, and a value names a node of it by the module's stable id
+member evaluated, an address as the symbol it points into, and a leaf that has no compile-time
+value kept with its refusal. a store holds the trees of one module, every node under a tree's
+root in that store, and a value names a node of it by the module's stable id
 
 ## def NodeKind
 
@@ -43,11 +44,31 @@ pub val NODE_REFUSED: NodeKind = 3
 
 a leaf that has no compile-time value, with the refusal reading it gives
 
+## val NODE_ADDRESS
+
+```mach
+pub val NODE_ADDRESS: NodeKind = 4
+```
+
+the address of `symbol`, then of the place its members step to: a field, named, or an
+element, unnamed, each a scalar holding its ordinal at the type it steps into
+
 ## rec Refusal
 
 ```mach
 pub rec Refusal;
 ```
+
+what reading a leaf with no compile-time value gives, and where that leaf is
+
+## rec Symbol
+
+```mach
+pub rec Symbol;
+```
+
+the module-level function, `val` or `var` an address points into: its declaration `decl` in
+the module with stable id `module`, which name it in every module that reads it
 
 ## rec Node
 
@@ -122,7 +143,7 @@ pub fun value(s: *Store, itn: *intern.Interner, node: u32) res[comptime_value.CT
 ```
 
 the value a scalar node holds, or the refusal a refused one gives; an aggregate has no
-value of its own
+value of its own, and an address has none until the program is linked
 
 ## fun read
 
@@ -131,7 +152,7 @@ pub fun read(s: *Store, itn: *intern.Interner, module: u32, node: u32) res[compt
 ```
 
 what reading node `node` of module `module`'s store gives: a scalar's value, a refused leaf's
-refusal, or the aggregate itself as a value naming it
+or an address's refusal, or the aggregate itself as a value naming it
 
 ## def ProjectionKind
 
@@ -199,4 +220,12 @@ pub fun refused_within(s: *Store, node: u32) opt[u32];
 ```
 
 the first leaf under `node` that has no compile-time value, none when every leaf has one
+
+## fun clone
+
+```mach
+pub fun clone(to: *Store, from: *Store, node: u32) res[u32, fail.Fail];
+```
+
+node `node` of `from` with everything under it, added to `to`, which is another store
 

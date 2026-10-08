@@ -18,34 +18,10 @@ pub fun lower_lit_str(ctx: *lower_context.LowerContext, e: *ast_expr.Expr) res[v
 pub fun symbol_linkage_name(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) intern.StrId;
 ```
 
-## fun references_function
-
-```mach
-pub fun references_function(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) bool;
-```
-
-## fun constant_literal_expr
-
-```mach
-pub fun constant_literal_expr(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) opt[ast_id.ExprId];
-```
-
-the literal a constant-valued expression stands for, when it stands for one: a module `val`
-initialized with an aggregate literal, a member path into such a literal, or an identity cast
-of one. a range over such a literal, or a `::` between an array and a vector of
-it, stands for itself, the window its elements are read from. a static initializer spelled
-over such a name folds the literal it names
-
 ## fun try_lower_comptime_intrinsic
 
 ```mach
 pub fun try_lower_comptime_intrinsic(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) opt[res[value.Value, fail.Fail]];
-```
-
-## fun try_lower_comptime_cast
-
-```mach
-pub fun try_lower_comptime_cast(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) opt[res[value.Value, fail.Fail]];
 ```
 
 ## fun lower_stored_rvalue

@@ -2,7 +2,8 @@
 
 a published constant value laid out as the constant bytes of its type: a record's fields at
 their offsets, a tag's case code and payload, an array's or a vector's elements at the
-element stride, and a string leaf as a pointer to its bytes
+element stride, a string leaf as a pointer to its bytes, and an address as a relocation
+against the symbol it points into
 
 ## fun aggregate
 
