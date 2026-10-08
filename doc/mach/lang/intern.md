@@ -81,7 +81,16 @@ them, is a broken precondition of the caller, and it stops the compiler
 pub fun get(itn: *Interner, id: StrId) opt[str];
 ```
 
-the text of `id`, or none for an id the interner never issued
+the text of `id`, or none for an id the interner never issued. it ends at
+the first NUL, so a string that may hold one is read through `bytes`
+
+## fun bytes
+
+```mach
+pub fun bytes(itn: *Interner, id: StrId) opt[View];
+```
+
+every byte of `id`, NULs included, or none for an id the interner never issued
 
 ## fun add
 
@@ -101,7 +110,8 @@ pub fun bytes_add(itn: *Interner, data: str, len: usize) res[StrId, A.Error];
 pub fun range_add(itn: *Interner, source: str, offset: usize, len: usize) res[StrId, A.Error];
 ```
 
-the `len` bytes of `source` from `offset`, interned
+the `len` bytes of `source` from `offset`, interned. the bytes are taken as
+they are, so a NUL among them is part of the string
 
 ## rec Remap
 
