@@ -565,6 +565,30 @@ pub val TIMEOUTS: [TIMEOUTS_N]*FlagSpec = [TIMEOUTS_N]*FlagSpec;
 
 `--timeout`, consumed by run and test
 
+## val ALLOW_UNRUNNABLE
+
+```mach
+pub val ALLOW_UNRUNNABLE: FlagSpec = FlagSpec;
+```
+
+`--allow-unrunnable`
+
+## val ALLOW_UNRUNNABLES_N
+
+```mach
+pub val ALLOW_UNRUNNABLES_N: usize = 1
+```
+
+row count of ALLOW_UNRUNNABLES
+
+## val ALLOW_UNRUNNABLES
+
+```mach
+pub val ALLOW_UNRUNNABLES: [ALLOW_UNRUNNABLES_N]*FlagSpec = [ALLOW_UNRUNNABLES_N]*FlagSpec;
+```
+
+`--allow-unrunnable`, consumed by test
+
 ## val OFFLINE
 
 ```mach
