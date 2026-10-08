@@ -68,6 +68,23 @@ the node of the value the module `val` `sym` declares, built in the module's sto
 ask: the constant sema bound, or its initializer evaluated member by member; NONE for a
 declaration with no initializer of its own
 
+## fun gated_in_union
+
+```mach
+pub fun gated_in_union(sc: *sema_context.SemaContext, sym: *resolve.Symbol) bool;
+```
+
+whether `sym` is an imported constant a union build refuses to read: its exporter binds it under
+a per-target-tuple condition, so no one tuple's value may stand for it
+
+## fun report_gated
+
+```mach
+pub fun report_gated(sc: *sema_context.SemaContext, sym: *resolve.Symbol, span: lang_source.Span);
+```
+
+reports the union build's refusal of the imported constant `sym` a read at `span` names
+
 ## fun array_value
 
 ```mach
