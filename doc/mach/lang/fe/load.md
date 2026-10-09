@@ -43,8 +43,9 @@ pub rec Const;
 a public constant a module binds in its build frame, exported to the gates of its importers
 
 gated: it is bound under a gate, so a union build cannot read one value for every tuple. the
-       load's copy of the `gated` the same site binds in the module's context, kept for the
-       refusal the load makes before any sema exists. sema reads the published declaration's
+       declaration's DECL_FLAG_GATED, which the parser set where it first saw the declaration.
+       the load never reads such a constant in a union build and says nothing of it: the gate
+       that needs it waits for sema, which refuses the read
 
 ## def BindingKind
 
@@ -186,7 +187,6 @@ states: how far each module is loaded, by id
 demands: the gates and constants the load is deciding, innermost last
 union: the build decides every gate under each of `tuples` as well as its own target
 filter: the tuples the walk is under now, nil for all of them
-gated: the walk is inside a gate's arm, so what it binds is gated
 foreign: the walk is under an artifact this target does not build
 artifact: the artifact a module reached now is attributed to
 dirty: a module reached under a new tuple after it loaded was walked again, which can give
@@ -291,14 +291,6 @@ pub fun walked(m: *Module, did: ast_id.DeclId) bool;
 ```
 
 whether the walk reached a declaration in the module's build target's frame
-
-## fun gated_imports_check
-
-```mach
-pub fun gated_imports_check(l: *Loader) err[fail.Fail];
-```
-
-a union build refuses every imported constant its exporter binds only under some tuples
 
 ## fun const_find
 

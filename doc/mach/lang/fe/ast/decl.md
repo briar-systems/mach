@@ -96,6 +96,15 @@ pub val DECL_FLAG_PUB: u8 = 1
 pub val DECL_FLAG_EXT: u8 = 2
 ```
 
+## val DECL_FLAG_GATED
+
+```mach
+pub val DECL_FLAG_GATED: u8 = 4
+```
+
+a module declaration in the arm of a declaration-level `$if`, at any depth of nesting: the parser
+sets it where it first sees the declaration, and every later phase reads it
+
 ## rec TypedName
 
 ```mach
