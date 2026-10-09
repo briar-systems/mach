@@ -67,10 +67,12 @@ pub fun count_nil_terminated(arr: **u8) usize;
 ## fun env_prefix
 
 ```mach
-pub fun env_prefix(alloc: *A.Allocator, entry: *u8, prefix: str) res[bool, fail.Fail];
+pub fun env_prefix(alloc: *A.Allocator, entry: *Unit, prefix: str) res[bool, fail.Fail];
 ```
 
-compare reserved key segments through the host's environment name identity
+whether the name of `entry`, NAME=value in native units, begins with the
+segments of `prefix` by the host's environment name identity. a prefix ending
+in '=' names the whole variable
 
 ## fun query_capture
 
