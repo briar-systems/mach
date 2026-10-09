@@ -403,18 +403,6 @@ pub fun check_handle_in_array(sc: *SemaContext, ty: type.TypeId, span: lang_sour
 pub fun report_internal(sc: *SemaContext, span: lang_source.Span, message: str);
 ```
 
-## fun diag_mark
-
-```mach
-pub fun diag_mark(sc: *SemaContext) u64;
-```
-
-## fun reported_since
-
-```mach
-pub fun reported_since(sc: *SemaContext, mark: u64) bool;
-```
-
 ## fun report_note
 
 ```mach
