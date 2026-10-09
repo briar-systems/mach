@@ -317,12 +317,6 @@ pub fun names_free(alloc: *A.Allocator, l: *NameList);
 
 release what a name list owns
 
-## fun free_sites
-
-```mach
-pub fun free_sites(alloc: *A.Allocator, sites: *fail.Place, count: u32);
-```
-
 ## fun site_of
 
 ```mach

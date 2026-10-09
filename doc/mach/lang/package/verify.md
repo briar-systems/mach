@@ -20,21 +20,6 @@ chain: the requiring chain, ending at the dependency
 requested: the requirer's selector, as `ref = "..."`, `version = "..."` or `path = "..."`
 declared: the root's selector, in the same form
 
-## fun root_overrides
-
-```mach
-pub fun root_overrides(s: *session.Session, root_m: *manifest.Manifest, deps: *project.DepEntry, dep_count: u32,
-out: *Vector[RootOverride]) err[fail.Fail];
-```
-
-every edge of a realized closure whose selector a root override replaced, in closure order
-
-s: the session; the returned ids are interned in it
-root_m: the root manifest
-deps: the realized closure
-dep_count: its length
-out: receives one RootOverride per replaced edge
-
 ## fun root_override_text
 
 ```mach
@@ -42,32 +27,6 @@ pub fun root_override_text(s: *session.Session, o: *RootOverride) res[str, fail.
 ```
 
 the note `mach dep verify` prints for one override
-
-## fun release_selects_releases
-
-```mach
-pub fun release_selects_releases(s: *session.Session, chain: str, what: str, m: *manifest.Manifest,
-root: *manifest.Manifest) err[fail.Fail];
-```
-
-a manifest reached through a release (a version range or a `tag/`) may itself select only
-releases, so the release is reproducible from its tag all the way down
-
-s: the session
-chain: the requirer chain that reached `m`, or the root's name
-what: how `m` was selected, as its manifest line spells it
-m: the manifest to check
-ret: err naming the first dependency selected by a branch, a commit or a path
-
-## fun edge_release_rule
-
-```mach
-pub fun edge_release_rule(s: *session.Session, chain: str, selected: *manifest.DepDef, m: *manifest.Manifest,
-root_m: *manifest.Manifest) err[fail.Fail];
-```
-
-a release reached through `selected` selects only releases, apart from identities the root
-declares: the root's selector replaces the release's there, so the closure stays reproducible
 
 ## fun dependencies
 

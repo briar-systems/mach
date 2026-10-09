@@ -86,14 +86,6 @@ pub val STEPS: Phase = 11
 
 the build steps a project and its dependencies declare
 
-## rec PhaseSpec
-
-```mach
-pub rec PhaseSpec;
-```
-
-what the readout shows of a phase: its row label
-
 ## fun label_of
 
 ```mach
@@ -161,22 +153,6 @@ pub rec Summary;
 a unit built its output: the path, the modules in it, its size in bytes when
 the output is one file, the time no row accounts for, and the unit's wall time
 
-## rec Failure
-
-```mach
-pub rec Failure;
-```
-
-a failure that reached no diagnostic store, and the phase it is reported under
-
-## rec Diagnostics
-
-```mach
-pub rec Diagnostics;
-```
-
-a unit's diagnostics with the sources they point into
-
 ## rec TestResult
 
 ```mach
@@ -196,14 +172,6 @@ a test run starts over count tests in collection order, each with its art set
 and none done, launched through runner when it is not nil. tests stays valid
 and in place until the run's run_end, so a renderer may read every result as
 it finishes
-
-## rec TestEnd
-
-```mach
-pub rec TestEnd;
-```
-
-the test at position at of the run finished, whatever its outcome
 
 ## rec RunEnd
 
@@ -374,14 +342,6 @@ pub fun phase_carved(pr: *Progress, ph: Phase);
 ```
 
 phase ph runs inside another phase and is timed by the spans moved into it
-
-## fun phase_workers
-
-```mach
-pub fun phase_workers(pr: *Progress, ph: Phase, n: u32);
-```
-
-phase ph ran on n workers
 
 ## fun phase_dropped
 

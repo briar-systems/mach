@@ -45,12 +45,6 @@ pub fun check_dep_root(project_root: str) res[bool, fail.Fail];
 
 whether the dependency root exists; err when it is anything but a physical directory
 
-## val CLOSURE_MAX
-
-```mach
-pub val CLOSURE_MAX: usize = 128
-```
-
 ## fun locate
 
 ```mach

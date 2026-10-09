@@ -20,12 +20,6 @@ pub val RESULT_PASS:                   GateResultKind = 0
 pub val RESULT_SEMANTIC_MISMATCH:      GateResultKind = 1
 ```
 
-## val RESULT_UNSUPPORTED_INPUT
-
-```mach
-pub val RESULT_UNSUPPORTED_INPUT:      GateResultKind = 2
-```
-
 ## val RESULT_TOOL_UNAVAILABLE
 
 ```mach
@@ -42,12 +36,6 @@ pub val RESULT_INFRASTRUCTURE_FAILURE: GateResultKind = 4
 
 ```mach
 pub val RESULT_RESOURCE_EXHAUSTION:    GateResultKind = 5
-```
-
-## val RESULT_INVALID_INJECTION
-
-```mach
-pub val RESULT_INVALID_INJECTION:      GateResultKind = 6
 ```
 
 ## def GateCause

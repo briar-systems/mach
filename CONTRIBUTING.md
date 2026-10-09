@@ -94,6 +94,13 @@ time: each file under `test/cases` and `test/lib`, and each project under
 `test/link/cases` (its `mach.toml`). CI's `formatter` step checks all of them.
 The fuzz corpus is retained input and is left as it is.
 
+Two tests in `src/lang/driver/tests/hygiene.mach` hold the source to its import
+and surface rules. A module is imported under the same name in every file, and
+a name imports one module in every file, but for the arms of a
+declaration-level `$if`. A `pub` declaration is named in some other file, or
+its doc comment says what reaches it, as in `reached only by mach-lsp`. The
+code that leaves for mirl, masc and mink is exempt.
+
 The API reference is held the same way: `doc/mach` and `doc/README.md` are what `mach doc .`
 writes, so a change to a doc-comment or to the module tree regenerates them in
 the same pull request, and CI fails when the committed pages differ from a

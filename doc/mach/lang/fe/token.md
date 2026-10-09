@@ -302,14 +302,6 @@ pub rec Spelling;
 
 a token the source spells with fixed punctuation
 
-## val SPELLING_COUNT
-
-```mach
-pub val SPELLING_COUNT: usize                    = 39
-```
-
-every fixed spelling, longest first, so the first one a scan matches is the longest
-
 ## fun spelling_at
 
 ```mach

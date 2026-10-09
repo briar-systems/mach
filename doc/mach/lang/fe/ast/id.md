@@ -154,12 +154,6 @@ pub fun type(index: u32) TypeId;
 pub fun type_index(id: TypeId) u32;
 ```
 
-## fun type_same
-
-```mach
-pub fun type_same(left: TypeId, right: TypeId) bool;
-```
-
 ## fun type_is_nil
 
 ```mach
@@ -176,12 +170,6 @@ pub fun module_node(index: u32) ModuleNodeId;
 
 ```mach
 pub fun module_node_index(id: ModuleNodeId) u32;
-```
-
-## fun module_node_same
-
-```mach
-pub fun module_node_same(left: ModuleNodeId, right: ModuleNodeId) bool;
 ```
 
 ## fun module_node_is_nil

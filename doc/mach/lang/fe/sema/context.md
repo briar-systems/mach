@@ -33,12 +33,6 @@ fwd type.FieldTable
 
 forwards [`mach.lang.type.field.Table`](../../type/field.md#rec-table)
 
-## val INST_NONE
-
-```mach
-pub val INST_NONE: u32 = sema_instance.NONE
-```
-
 ## rec InstWorklist
 
 ```mach
@@ -291,12 +285,6 @@ signature and site; the rest is the set's
 pub fun inst_worklist_new(alloc: *A.Allocator) res[*InstWorklist, fail.Fail];
 ```
 
-## fun inst_worklist_free
-
-```mach
-pub fun inst_worklist_free(wl: *InstWorklist);
-```
-
 ## fun inst_worklist_dnit
 
 ```mach
@@ -343,12 +331,6 @@ pub fun gate_set(sc: *SemaContext, cond: ast_id.ExprId, active: bool);
 
 the verdict the walk gives a comptime gate in its frame
 
-## fun public_type_for
-
-```mach
-pub fun public_type_for(sc: *SemaContext, sym: *resolve.Symbol) opt[sema_product.TypeExport];
-```
-
 ## fun decl_type_for
 
 ```mach
@@ -371,12 +353,6 @@ pub fun comptime_ident_is_runtime(sc: *SemaContext, eid: ast_id.ExprId) bool;
 
 ```mach
 pub fun symbol_for_type(sc: *SemaContext, tid: ast_id.TypeId) opt[*resolve.Symbol];
-```
-
-## fun symbol_by_id
-
-```mach
-pub fun symbol_by_id(sc: *SemaContext, sid: resolve.SymbolId) opt[*resolve.Symbol];
 ```
 
 ## fun machine_of

@@ -218,82 +218,10 @@ where a decorator may stand: one bit per declaration kind, one for an `ext`
 import, one for a tag case, and one for every declaration no decorator names.
 PLACES_ANY is every declaration; a tag case admits only a row that names it
 
-## val PLACE_USE
-
-```mach
-pub val PLACE_USE:   Places = 0x1
-```
-
-## val PLACE_FWD
-
-```mach
-pub val PLACE_FWD:   Places = 0x2
-```
-
-## val PLACE_FUN
-
-```mach
-pub val PLACE_FUN:   Places = 0x4
-```
-
-## val PLACE_REC
-
-```mach
-pub val PLACE_REC:   Places = 0x8
-```
-
-## val PLACE_UNI
-
-```mach
-pub val PLACE_UNI:   Places = 0x10
-```
-
-## val PLACE_TAG
-
-```mach
-pub val PLACE_TAG:   Places = 0x20
-```
-
-## val PLACE_DEF
-
-```mach
-pub val PLACE_DEF:   Places = 0x40
-```
-
-## val PLACE_VAL
-
-```mach
-pub val PLACE_VAL:   Places = 0x80
-```
-
-## val PLACE_VAR
-
-```mach
-pub val PLACE_VAR:   Places = 0x100
-```
-
-## val PLACE_TEST
-
-```mach
-pub val PLACE_TEST:  Places = 0x200
-```
-
-## val PLACE_EXT
-
-```mach
-pub val PLACE_EXT:   Places = 0x400
-```
-
 ## val PLACE_CASE
 
 ```mach
 pub val PLACE_CASE:  Places = 0x800
-```
-
-## val PLACE_OTHER
-
-```mach
-pub val PLACE_OTHER: Places = 0x1000
 ```
 
 ## val PLACES_ANY
@@ -351,20 +279,6 @@ pub val FLAG_STRINGS_CHECKED:   Flags = 0x10
 
 ```mach
 pub val FLAG_PLACE_CHECKED:     Flags = 0x20
-```
-
-## val ARGS_ANY
-
-```mach
-pub val ARGS_ANY:     u32 = 0xFFFFFFFF
-```
-
-an argument count with no upper bound, and string arguments that run to the last
-
-## val STRINGS_REST
-
-```mach
-pub val STRINGS_REST: u32 = 0xFFFFFFFF
 ```
 
 ## rec Row

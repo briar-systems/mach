@@ -125,18 +125,6 @@ pub rec FixId;
 
 a fix's position in its diagnostic's fix list
 
-## fun fix_id
-
-```mach
-pub fun fix_id(index: usize) FixId;
-```
-
-## fun fix_index
-
-```mach
-pub fun fix_index(f: FixId) usize;
-```
-
 ## rec Diagnostic
 
 ```mach

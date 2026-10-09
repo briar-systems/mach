@@ -54,67 +54,6 @@ pid: the process id as decimal text
 argv: room for four entries
 ret: the program's path, which argv[0] also names
 
-## fun path_is_executable
-
-```mach
-pub fun path_is_executable(p: str) bool;
-```
-
-whether the host would run the file at p; windows runs any file, and decides by its extension
-
-## tag NativeTextError
-
-```mach
-pub tag NativeTextError: u8 {
-    native: i64;
-    alloc:  A.Error;
-}
-```
-
-why text could not be put in native units
-
-native: the conversion refused it, malformed UTF-8 on windows; the native code
-alloc: the owned copy could not be acquired
-
-## fun native_text
-
-```mach
-pub fun native_text(a: *A.Allocator, text: str) res[NativeName, NativeTextError];
-```
-
-`text` in std.runtime.native units, owned and terminated: converted from
-UTF-8 once on windows, the bytes as they are elsewhere
-
-a: allocator for the units, which native_text_free releases
-text: the UTF-8 text, nil read as empty
-ret: the units and their length, or the refusal
-
-## fun native_text_free
-
-```mach
-pub fun native_text_free(a: *A.Allocator, name: *NativeName);
-```
-
-## fun native_text_message
-
-```mach
-pub fun native_text_message(error: NativeTextError) str;
-```
-
-the refusal of a native text conversion as text
-
-## fun compare_env_names
-
-```mach
-pub fun compare_env_names(left: *Unit, left_length: usize, right: *Unit, right_length: usize) res[i32, i64];
-```
-
-compare two environment variable names in native units by the host's
-identity, returning -1, 0 or 1: ordinal case-insensitive UTF-16 order on
-windows, byte order elsewhere
-
-ret: the order, or the native code when windows refuses the comparison
-
 ## fun program_resolve
 
 ```mach

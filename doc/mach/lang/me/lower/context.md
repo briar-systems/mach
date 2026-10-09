@@ -544,14 +544,6 @@ pub fun module_source(lc: *LowerContext) str;
 
 the source of the module in scope, read when the scope was made
 
-## fun ast_source
-
-```mach
-pub fun ast_source(s: *session.Session, a: *ast.Ast) res[str, fail.Fail];
-```
-
-the source text `a` was parsed from
-
 ## fun declared_op
 
 ```mach
@@ -590,11 +582,5 @@ pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: ir_type.
 
 ```mach
 pub fun add_rodata_bytes(lc: *LowerContext, init: value.Value, pty: ir_type.IrTypeId) res[value.Value, fail.Fail];
-```
-
-## fun recover_type
-
-```mach
-pub fun recover_type(lc: *LowerContext, r: res[type.TypeId, fail.Fail]) type.TypeId;
 ```
 

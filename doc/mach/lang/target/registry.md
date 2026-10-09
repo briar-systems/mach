@@ -7,12 +7,6 @@ nothing and is never released. a registry is published once the catalog it
 holds is checked whole, and publication is the proof every later read
 relies on
 
-## val AXIS_CAP
-
-```mach
-pub val AXIS_CAP: u32 = 16
-```
-
 ## rec Axis
 
 ```mach

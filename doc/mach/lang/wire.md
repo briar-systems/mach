@@ -21,28 +21,10 @@ pub def Destination: u8
 
 where a sink's bytes go
 
-## val MEASURE
-
-```mach
-pub val MEASURE: Destination = 0
-```
-
 ## val FIXED
 
 ```mach
 pub val FIXED:   Destination = 1
-```
-
-## val GROWN
-
-```mach
-pub val GROWN:   Destination = 2
-```
-
-## val DIGEST
-
-```mach
-pub val DIGEST:  Destination = 3
 ```
 
 ## rec Sink
@@ -245,12 +227,6 @@ copy the next `n` bytes into dst
 pub fun take_u8(r: *Source) u8;
 ```
 
-## fun take_u16
-
-```mach
-pub fun take_u16(r: *Source) u16;
-```
-
 ## fun take_u32
 
 ```mach
@@ -261,18 +237,6 @@ pub fun take_u32(r: *Source) u32;
 
 ```mach
 pub fun take_u64(r: *Source) u64;
-```
-
-## fun take_unsigned
-
-```mach
-pub fun take_unsigned(r: *Source) u64;
-```
-
-## fun take_signed
-
-```mach
-pub fun take_signed(r: *Source) i64;
 ```
 
 ## fun take_count

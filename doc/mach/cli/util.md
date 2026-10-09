@@ -43,17 +43,6 @@ a resolved project operand; every string is owned and freed by dnit_project_loca
 root: the project directory
 manifest: the path of its mach.toml
 
-## fun dnit_project_location
-
-```mach
-pub fun dnit_project_location(a: *A.Allocator, loc: *ProjectLocation);
-```
-
-free the two strings of a location; nil strings are skipped
-
-a: the allocator resolve_project_location was given
-loc: the location
-
 ## fun resolve_project_location
 
 ```mach

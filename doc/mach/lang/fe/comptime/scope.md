@@ -69,25 +69,6 @@ pub fun build_facts(mode_id: u32, pie: u32, compiler_name: intern.StrId, compile
 
 the build facts of a build that names no project, artifact or target entry
 
-## rec SourceFacts
-
-```mach
-pub rec SourceFacts;
-```
-
-the module being compiled: the source map its files are read from, its fully qualified
-name, its file relative to the root of the project that owns it, and that project's id
-and version
-
-## def Stage
-
-```mach
-pub def Stage: u8
-```
-
-the stages that bind comptime state over a module, in the order they run; each binds into its
-own bindings and reads those of the stages before it
-
 ## val STAGE_LOAD
 
 ```mach

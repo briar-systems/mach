@@ -140,25 +140,6 @@ pick: the profile name, or "" for the default
 ret: the profile; err "mach.toml: no profile named '<pick>'" or, with an empty
        name, an error when several profiles are declared and none is the default
 
-## fun default_selection_includes
-
-```mach
-pub fun default_selection_includes(itn: *intern.Interner, m: *Manifest, a: *ArtifactDef,
-target: intern.StrId, executables_only: bool) bool;
-```
-
-the default selection: what a command takes for a target when no `-a`
-names an artifact. of the artifacts the target builds, those marked
-`default = true` when any is, otherwise every one. build and check take the whole
-selection, and a command that needs one artifact takes it only when it holds one
-
-itn: resolves names
-m: the manifest
-a: the artifact asked about
-target: the resolved target's name
-executables_only: consider `bin` artifacts only, so a library beside them is never taken
-ret: true when the default selection holds `a`
-
 ## fun selectors_init
 
 ```mach

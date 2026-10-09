@@ -39,12 +39,6 @@ pub val CT_KIND_TYPE: CTKind = 3
 pub val CT_KIND_FIELD: CTKind = 4
 ```
 
-## rec FieldRef
-
-```mach
-pub rec FieldRef;
-```
-
 ## val CT_KIND_PACK_ELEM
 
 ```mach
@@ -82,12 +76,6 @@ pub val CT_KIND_NODE: CTKind = 9
 
 a node of a module's published constant values (see comptime.deep), read at type `ty`;
 `module` is the stable id of the module whose store holds it
-
-## rec NodeRef
-
-```mach
-pub rec NodeRef;
-```
 
 ## rec CTValue
 

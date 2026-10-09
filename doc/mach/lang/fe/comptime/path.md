@@ -16,30 +16,6 @@ pub def Read: u8
 
 what a path reads; `Row.arg` refines the version components, 0 major, 1 minor and 2 patch
 
-## val READ_NONE
-
-```mach
-pub val READ_NONE:             Read = 0
-```
-
-## val READ_COMPILER_VERSION
-
-```mach
-pub val READ_COMPILER_VERSION: Read = 1
-```
-
-## val READ_COMPILER_NAME
-
-```mach
-pub val READ_COMPILER_NAME:    Read = 2
-```
-
-## val READ_COMPILER_PART
-
-```mach
-pub val READ_COMPILER_PART:    Read = 3
-```
-
 ## val READ_OS_TAG
 
 ```mach
@@ -64,136 +40,10 @@ pub val READ_ABI_TAG:          Read = 6
 pub val READ_MODE_TAG:         Read = 7
 ```
 
-## val READ_OWNER_ID
-
-```mach
-pub val READ_OWNER_ID:         Read = 8
-```
-
-## val READ_OWNER_VERSION
-
-```mach
-pub val READ_OWNER_VERSION:    Read = 9
-```
-
-## val READ_OWNER_PART
-
-```mach
-pub val READ_OWNER_PART:       Read = 10
-```
-
-## val READ_SOURCE_FILE
-
-```mach
-pub val READ_SOURCE_FILE:      Read = 11
-```
-
-## val READ_SOURCE_MODULE
-
-```mach
-pub val READ_SOURCE_MODULE:    Read = 12
-```
-
-## val READ_SOURCE_LINE
-
-```mach
-pub val READ_SOURCE_LINE:      Read = 13
-```
-
-## val READ_BUILD_OS
-
-```mach
-pub val READ_BUILD_OS:         Read = 14
-```
-
-## val READ_BUILD_ARCH
-
-```mach
-pub val READ_BUILD_ARCH:       Read = 15
-```
-
-## val READ_BUILD_ABI
-
-```mach
-pub val READ_BUILD_ABI:        Read = 16
-```
-
-## val READ_BUILD_WIDTH
-
-```mach
-pub val READ_BUILD_WIDTH:      Read = 17
-```
-
-## val READ_BUILD_MODE
-
-```mach
-pub val READ_BUILD_MODE:       Read = 18
-```
-
-## val READ_BUILD_PIE
-
-```mach
-pub val READ_BUILD_PIE:        Read = 19
-```
-
-## val READ_BUILD_EXTENSION
-
-```mach
-pub val READ_BUILD_EXTENSION:  Read = 20
-```
-
-## val READ_BUILD_PLATFORM
-
-```mach
-pub val READ_BUILD_PLATFORM:   Read = 21
-```
-
 ## val READ_BUILD_CT_MUL
 
 ```mach
 pub val READ_BUILD_CT_MUL:     Read = 22
-```
-
-## val READ_PROJECT_ID
-
-```mach
-pub val READ_PROJECT_ID:       Read = 23
-```
-
-## val READ_PROJECT_VERSION
-
-```mach
-pub val READ_PROJECT_VERSION:  Read = 24
-```
-
-## val READ_PROJECT_PART
-
-```mach
-pub val READ_PROJECT_PART:     Read = 25
-```
-
-## val READ_TARGET_OS
-
-```mach
-pub val READ_TARGET_OS:        Read = 26
-```
-
-## val READ_TARGET_ARCH
-
-```mach
-pub val READ_TARGET_ARCH:      Read = 27
-```
-
-## val READ_TARGET_ABI
-
-```mach
-pub val READ_TARGET_ABI:       Read = 28
-```
-
-## val READ_BIN_NAME
-
-```mach
-pub val READ_BIN_NAME:         Read = 29
 ```
 
 ## val READ_REFUSED
