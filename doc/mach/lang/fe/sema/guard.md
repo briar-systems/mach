@@ -15,7 +15,7 @@ pub fun close(sc: *sema_context.SemaContext, frame: *sema_context.Guard);
 ## fun open_sel
 
 ```mach
-pub fun open_sel(sc: *sema_context.SemaContext, cond: ast_id.ExprId, frame: *sema_context.Guard) bool;
+pub fun open_sel(sc: *sema_context.SemaContext, cond: ast_id.ExprId, frame: *sema_context.Guard) res[bool, fail.Fail];
 ```
 
 opens a guard for `P.c` when the condition is exactly `sel P.c`
@@ -23,13 +23,13 @@ opens a guard for `P.c` when the condition is exactly `sel P.c`
 ## fun guarded
 
 ```mach
-pub fun guarded(sc: *sema_context.SemaContext, place: ast_id.ExprId, case_name: intern.StrId) bool;
+pub fun guarded(sc: *sema_context.SemaContext, place: ast_id.ExprId, case_name: intern.StrId) res[bool, fail.Fail];
 ```
 
 ## fun open_exit_chain
 
 ```mach
-pub fun open_exit_chain(sc: *sema_context.SemaContext, sid: ast_id.StmtId, frame: *sema_context.Guard) bool;
+pub fun open_exit_chain(sc: *sema_context.SemaContext, sid: ast_id.StmtId, frame: *sema_context.Guard) res[bool, fail.Fail];
 ```
 
 a chain whose arms all test one place with `sel` or `!sel` and all exit leaves the block knowing

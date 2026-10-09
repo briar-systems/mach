@@ -18,7 +18,7 @@ pub fun infer_expr(sc: *sema_context.SemaContext, eid: ast_id.ExprId) type.TypeI
 ## fun is_field_type_operand
 
 ```mach
-pub fun is_field_type_operand(sc: *sema_context.SemaContext, eid: ast_id.ExprId) bool;
+pub fun is_field_type_operand(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[bool, fail.Fail];
 ```
 
 ## fun refuse_confined_flow

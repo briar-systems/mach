@@ -30,13 +30,14 @@ default Linux x86_64 build writes `out/linux-x86_64/debug/bin/mach`.
 
 A change to the compiler has to reach the self-host fixpoint: the compiler it
 builds must build itself byte for byte. The stages start from a seed, a
-published release fetched and checked against the release's `SHA256SUMS`, as
-CI does in `.github/scripts/bootstrap.sh`. The seed is the release that script
-pins (its `seed=` line), not whichever `mach` happens to be on `PATH`. From
-the repository root on x86_64 Linux:
+published release fetched and checked against the release's `SHA256SUMS`.
+The seed is the release named on the `seed` line of `.github/bootstrap-chain`,
+not whichever `mach` happens to be on `PATH`. CI walks that chain from the
+seed through each pinned mach commit in `.github/scripts/bootstrap.sh`, and
+its last step builds `a`. From the repository root on x86_64 Linux:
 
 ```bash
-v=$(sed -n 's/^seed=//p' .github/scripts/bootstrap.sh)
+v=$(awk '$1 == "seed" { print $2 }' .github/bootstrap-chain)
 t=x86_64-linux
 gh release download "v$v" -R briar-systems/mach -p "mach-$v-$t.tar.gz" -p SHA256SUMS -D ../mach-seed
 (cd ../mach-seed && grep " mach-$v-$t.tar.gz\$" SHA256SUMS | sha256sum -c - && tar -xzf "mach-$v-$t.tar.gz" mach)

@@ -64,7 +64,7 @@ pub fun answer_type_query(s: *session.Session, tid: u32, which: u8) res[opt[comp
 ## fun offset_of_member_index
 
 ```mach
-pub fun offset_of_member_index(sc: *sema_context.SemaContext, c: *ast_expr.ExprCall, owner: type.TypeId, span: lang_source.Span, silent: bool) opt[u32];
+pub fun offset_of_member_index(sc: *sema_context.SemaContext, c: *ast_expr.ExprCall, owner: type.TypeId, span: lang_source.Span, silent: bool) res[opt[u32], fail.Fail];
 ```
 
 the member named by `$offset_of(T, m)`: a record field, or a tag case that owns a payload

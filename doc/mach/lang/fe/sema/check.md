@@ -48,7 +48,7 @@ pub fun check_const_index(sc: *sema_context.SemaContext, object: type.TypeId, id
 ## fun check_range_count
 
 ```mach
-pub fun check_range_count(sc: *sema_context.SemaContext, count: ast_id.ExprId, span: lang_source.Span) opt[u32];
+pub fun check_range_count(sc: *sema_context.SemaContext, count: ast_id.ExprId) opt[u32];
 ```
 
 the count of a range `x[i, n]`: a comptime constant, at least one. absent,
@@ -172,7 +172,7 @@ pub fun report_typed2(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, sp
 ## fun expr_span_of
 
 ```mach
-pub fun expr_span_of(sc: *sema_context.SemaContext, eid: ast_id.ExprId, fallback: lang_source.Span) lang_source.Span;
+pub fun expr_span_of(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[lang_source.Span, fail.Fail];
 ```
 
 ## fun report_out_of_range
