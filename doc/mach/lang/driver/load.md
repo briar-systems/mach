@@ -12,12 +12,6 @@ pub val MACH_VERSION: str = lang_version.MACH_VERSION
 pub fun entry_module_fqn(p: *project.Project, t: *project.TargetEntry) res[intern.StrId, fail.Fail];
 ```
 
-## fun compose_module_fqn
-
-```mach
-pub fun compose_module_fqn(alloc: *A.Allocator, itn: *intern.Interner, id_text: str, rel_text: str) res[intern.StrId, fail.Fail];
-```
-
 ## fun diag_join_named
 
 ```mach
