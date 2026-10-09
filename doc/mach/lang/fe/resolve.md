@@ -14,14 +14,6 @@ a symbol's slot in the resolve context's symbol table
 pub val SYMBOL_NIL: SymbolId = SymbolId;
 ```
 
-## val SYMBOL_REJECTED
-
-```mach
-pub val SYMBOL_REJECTED: SymbolId = SymbolId;
-```
-
-an identifier visited and rejected by resolution has no symbol to remap.
-
 ## fun symbol_id
 
 ```mach
@@ -161,6 +153,8 @@ pub val SYM_TAG:    SymKind = 13
 ```mach
 pub val SYM_FLAG_PUB: u8 = 1
 ```
+
+reached only by mach-lsp
 
 ## val SYM_FLAG_COMPTIME
 

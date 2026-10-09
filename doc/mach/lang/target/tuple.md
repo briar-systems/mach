@@ -14,30 +14,6 @@ pub val OK:              u32 = 0
 pub val NO_CODEGEN:      u32 = 1
 ```
 
-## val ABI_MISMATCH
-
-```mach
-pub val ABI_MISMATCH:    u32 = 2
-```
-
-## val OS_NO_OF
-
-```mach
-pub val OS_NO_OF:        u32 = 3
-```
-
-## val OF_UNCOVERED
-
-```mach
-pub val OF_UNCOVERED:    u32 = 4
-```
-
-## val OF_SHAPE
-
-```mach
-pub val OF_SHAPE:        u32 = 5
-```
-
 ## val OS_NO_ISA
 
 ```mach

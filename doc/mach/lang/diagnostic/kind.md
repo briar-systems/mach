@@ -921,12 +921,6 @@ pub val GENERIC_ARITY:                    Kind = 147
 pub val GENERIC_COMPTIME_VALUE_PARAM:     Kind = 148
 ```
 
-## val GENERIC_INSTANTIATION_LIMIT
-
-```mach
-pub val GENERIC_INSTANTIATION_LIMIT:      Kind = 149
-```
-
 ## val GENERIC_MISSING_TYPE_ARGS
 
 ```mach
@@ -1171,12 +1165,6 @@ pub val PACK_SPREAD:                      Kind = 191
 
 ```mach
 pub val PTR_DEREF_NON_POINTER:            Kind = 192
-```
-
-## val PTR_UNTYPED_ACCESS
-
-```mach
-pub val PTR_UNTYPED_ACCESS:               Kind = 193
 ```
 
 ## val RANGE_COUNT_INVALID
@@ -2763,12 +2751,6 @@ pub val TEMPLATE_AMBIGUOUS_ARTIFACT:      Kind = 460
 pub val TEMPLATE_ARTIFACT_NOT_REQUIRED:   Kind = 461
 ```
 
-## val TEMPLATE_TOO_LARGE
-
-```mach
-pub val TEMPLATE_TOO_LARGE:               Kind = 462
-```
-
 ## val TEMPLATE_UNAVAILABLE
 
 ```mach
@@ -2797,12 +2779,6 @@ pub val TEST_NONE_DECLARED:               Kind = 466
 
 ```mach
 pub val TOML_MALFORMED:                   Kind = 467
-```
-
-## val TOML_VALUE_TOO_LONG
-
-```mach
-pub val TOML_VALUE_TOO_LONG:              Kind = 468
 ```
 
 ## val USE_NO_PUBLIC_MODULE
@@ -2971,12 +2947,6 @@ pub val DECORATOR_NOT_CONSTANT:           Kind = 496
 
 ```mach
 pub val SELECTION_NO_HOST_TARGET:         Kind = 497
-```
-
-## val TARGET_DEFAULT_DEPRECATED
-
-```mach
-pub val TARGET_DEFAULT_DEPRECATED:        Kind = 498
 ```
 
 ## val READ_WRITEONLY_STORAGE

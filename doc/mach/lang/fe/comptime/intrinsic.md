@@ -121,24 +121,6 @@ pub val POINTEE_OF:      Id = 16
 pub val DISCRIMINANT_OF: Id = 17
 ```
 
-## val FIELDS
-
-```mach
-pub val FIELDS:          Id = 18
-```
-
-## val CASES
-
-```mach
-pub val CASES:           Id = 19
-```
-
-## val ERROR
-
-```mach
-pub val ERROR:           Id = 20
-```
-
 ## def Class
 
 ```mach
@@ -164,30 +146,6 @@ pub val CLASS_LAYOUT:      Class = 0
 
 ```mach
 pub val CLASS_QUERY:       Class = 1
-```
-
-## val CLASS_GATE
-
-```mach
-pub val CLASS_GATE:        Class = 2
-```
-
-## val CLASS_CONSTRUCTOR
-
-```mach
-pub val CLASS_CONSTRUCTOR: Class = 3
-```
-
-## val CLASS_ITERATION
-
-```mach
-pub val CLASS_ITERATION:   Class = 4
-```
-
-## val CLASS_DIRECTIVE
-
-```mach
-pub val CLASS_DIRECTIVE:   Class = 5
 ```
 
 ## rec Row
@@ -224,14 +182,6 @@ pub fun in_class(id: Id, class: Class) bool;
 ```
 
 whether `id` answers within `class`
-
-## fun takes_type_operand
-
-```mach
-pub fun takes_type_operand(id: Id) bool;
-```
-
-whether `id` takes a type as its first argument
 
 ## fun constructor_refusal
 

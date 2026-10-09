@@ -71,12 +71,6 @@ pub rec EvalFail;
 
 diag: the diagnostic kind the failure is reported as, where it reaches the user
 
-## fun eval_refused_result
-
-```mach
-pub fun eval_refused_result[T](r: res[T, A.Error]) res[T, EvalFail];
-```
-
 ## fun eval_error
 
 ```mach

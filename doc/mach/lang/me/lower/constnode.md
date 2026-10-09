@@ -22,12 +22,3 @@ pub fun terminated_bytes(bytes: View, ty: ir_type.IrTypeId) value.Value;
 an interned string as constant data: every byte it holds, NULs included,
 then the terminator the interner keeps after them
 
-## fun write_bits
-
-```mach
-pub fun write_bits(blob: *u8, base: u32, bits: wide.Wide, size: u32);
-```
-
-little-endian bytes of a constant: the low limb first, then the high limb
-once the leaf is wider than 8 bytes
-

@@ -16,49 +16,6 @@ pub def State: u8
 
 how far the load has reached a module
 
-## val STATE_NEW
-
-```mach
-pub val STATE_NEW:     State = 0
-```
-
-## val STATE_LOADING
-
-```mach
-pub val STATE_LOADING: State = 1
-```
-
-## val STATE_DONE
-
-```mach
-pub val STATE_DONE:    State = 2
-```
-
-## rec Const
-
-```mach
-pub rec Const;
-```
-
-a public constant a module binds in its build frame, exported to the gates of its importers
-
-gated: it is bound under a gate, so a union build cannot read one value for every tuple. the
-       declaration's DECL_FLAG_GATED, which the parser set where it first saw the declaration.
-       the load never reads such a constant in a union build and says nothing of it: the gate
-       that needs it waits for sema, which refuses the read
-
-## def BindingKind
-
-```mach
-pub def BindingKind: u8
-```
-
-what an import declaration binds, as the load decided it
-
-BINDING_MODULE: the declaration names a module and binds it under `name`
-BINDING_MEMBER: it names the member `name` of a module
-BINDING_UNBOUND: its path names no module; the load reported it, so resolve says nothing more
-
 ## val BINDING_MODULE
 
 ```mach
@@ -92,20 +49,6 @@ module: the module it names
 span: its path
 constant: a `use` of a member under the member's own name, so the member's public constant is
           bound for the importer's gates
-
-## rec Demand
-
-```mach
-pub rec Demand;
-```
-
-one declaration or gate the load is deciding, so a demand that reaches it again is a cycle
-
-module: the module it is in
-frame: the frame it is decided in
-decl: the `val` being walked, or DECL_NIL for a gate
-cond: the gate's condition, or EXPR_NIL for a `val`
-name: the `val`'s name
 
 ## rec Tuple
 
@@ -291,14 +234,6 @@ pub fun walked(m: *Module, did: ast_id.DeclId) bool;
 ```
 
 whether the walk reached a declaration in the module's build target's frame
-
-## fun const_find
-
-```mach
-pub fun const_find(m: *Module, name: intern.StrId) opt[*Const];
-```
-
-the public constant `name` a loaded module exports to the gates of its importers
 
 ## fun binding_for
 

@@ -27,14 +27,6 @@ pub val STATE_SPAWN_FAILURE: SubprocessState = 1
 
 the one spawn attempt started no child
 
-## val STATE_RUNNING
-
-```mach
-pub val STATE_RUNNING: SubprocessState = 2
-```
-
-a child is running and not yet reaped
-
 ## val STATE_EXITED
 
 ```mach
@@ -51,14 +43,6 @@ pub val STATE_SIGNALED: SubprocessState = 4
 
 the child was ended by a signal, and as a terminal kind, ended that way
 
-## val STATE_REAPED
-
-```mach
-pub val STATE_REAPED: SubprocessState = 7
-```
-
-the terminal was observed and the child reaped, so the owner is done
-
 ## def Request
 
 ```mach
@@ -67,46 +51,6 @@ pub def Request: u8
 
 the termination a supervisor asked for, mirrored from the cancellation
 scope's reason, so the codes are the scope's 1.x reason codes and never change
-
-## val REQUEST_ACTIVE
-
-```mach
-pub val REQUEST_ACTIVE: Request = 0
-```
-
-no termination was asked for
-
-## val REQUEST_CANCELLED
-
-```mach
-pub val REQUEST_CANCELLED: Request = 1
-```
-
-the supervisor cancelled the child
-
-## val REQUEST_TIMED_OUT
-
-```mach
-pub val REQUEST_TIMED_OUT: Request = 2
-```
-
-the child outlived its deadline
-
-## val REQUEST_DESTROYED
-
-```mach
-pub val REQUEST_DESTROYED: Request = 3
-```
-
-the cancellation scope was destroyed
-
-## val REQUEST_INVALID
-
-```mach
-pub val REQUEST_INVALID: Request = 4
-```
-
-the scope reported a reason this module does not know
 
 ## rec Error
 

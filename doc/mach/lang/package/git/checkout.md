@@ -118,25 +118,11 @@ tree, and then there is no record to read
 pub fun slot_dnit(alloc: *A.Allocator, slot: *Slot);
 ```
 
-## fun slot_tree
-
-```mach
-pub fun slot_tree(alloc: *A.Allocator, dep_full: str) res[u8, fail.Fail];
-```
-
 ## fun observe_slot
 
 ```mach
 pub fun observe_slot(s: *session.Session, root: str, id: str, mode: u8) res[Slot, fail.Fail];
 ```
-
-## fun refuse_slot
-
-```mach
-pub fun refuse_slot(s: *session.Session, root: str, id: str, mode: u8, slot: *Slot, accept: bool) err[fail.Fail];
-```
-
-refuse a slot whose realization would replace or record work mach did not make
 
 ## fun realize_slot
 

@@ -8,15 +8,6 @@ fwd request.CliArgs
 
 forwards [`mach.lang.build.request.CliArgs`](../lang/build/request.md#rec-cliargs)
 
-## def OptionArity
-
-```mach
-pub def OptionArity: u8
-```
-
-whether an option is a bare flag, takes the next argv token, or takes a value
-attached to its own token after `=`
-
 ## val ARITY_FLAG
 
 ```mach
@@ -61,14 +52,6 @@ repeatable: the option may occur more than once; a second occurrence of any othe
 alias_of: the canonical row this spelling stands for, which the parser records in its
             place; nil for a canonical row
 
-## val ARTIFACT
-
-```mach
-pub val ARTIFACT: FlagSpec = FlagSpec;
-```
-
-`--artifact <pattern>`, a selector
-
 ## val TARGET
 
 ```mach
@@ -76,14 +59,6 @@ pub val TARGET: FlagSpec = FlagSpec;
 ```
 
 `--target <pattern>`, a selector
-
-## val PROFILE
-
-```mach
-pub val PROFILE: FlagSpec = FlagSpec;
-```
-
-`--profile <pattern>`, a selector
 
 ## val ALL
 
@@ -118,22 +93,6 @@ pub val SEL: [SEL_N]*FlagSpec = [SEL_N]*FlagSpec;
 the selection options, consumed by build, check, run, test and doc. each
 selector takes an exact name or a glob and repeats. check hides `-o`, run
 hides `--all`, and doc accepts only `--artifact` and `--target`
-
-## val VERBOSE
-
-```mach
-pub val VERBOSE: FlagSpec = FlagSpec;
-```
-
-`-v`; what each readout level shows is the readout contract, doc/language/readout.md
-
-## val VERBOSE_FULL
-
-```mach
-pub val VERBOSE_FULL: FlagSpec = FlagSpec;
-```
-
-`-vv`, which implies `-v`
 
 ## val VERBOSITY_N
 
@@ -175,39 +134,6 @@ pub val QUIETNESS: [QUIETNESS_N]*FlagSpec = [QUIETNESS_N]*FlagSpec;
 
 `--quiet` and `-q`, consumed by build, check, test, doc, init and every dep action
 
-## val PIE
-
-```mach
-pub val PIE: FlagSpec = FlagSpec;
-```
-
-`--pie`
-
-## val SUBSYSTEM
-
-```mach
-pub val SUBSYSTEM: FlagSpec = FlagSpec;
-```
-
-`--subsystem <console|gui>`
-
-## val EMIT_ASM
-
-```mach
-pub val EMIT_ASM: FlagSpec = FlagSpec;
-```
-
-`--emit-asm`
-
-## val EMIT_IR
-
-```mach
-pub val EMIT_IR: FlagSpec = FlagSpec;
-```
-
-`--emit-ir[=form]`, the one attached-value row: bare it writes the ir-debug
-dump, `--emit-ir=<form>` selects a row of printer.IR_FORMS
-
 ## val CGEN_N
 
 ```mach
@@ -232,14 +158,6 @@ pub val OPTIMIZE: FlagSpec = FlagSpec;
 
 `--optimize`, the profile's `optimize = true` for this invocation
 
-## val NO_OPTIMIZE
-
-```mach
-pub val NO_OPTIMIZE: FlagSpec = FlagSpec;
-```
-
-`--no-optimize`, the profile's `optimize = false` for this invocation
-
 ## val DEBUG
 
 ```mach
@@ -247,22 +165,6 @@ pub val DEBUG: FlagSpec = FlagSpec;
 ```
 
 `--debug`, the profile's `debug = true` for this invocation
-
-## val NO_DEBUG
-
-```mach
-pub val NO_DEBUG: FlagSpec = FlagSpec;
-```
-
-`--no-debug`, the profile's `debug = false` for this invocation
-
-## val SIMD
-
-```mach
-pub val SIMD: FlagSpec = FlagSpec;
-```
-
-`--simd <mode>`, the profile's `simd` for this invocation
 
 ## val PASS
 
@@ -280,22 +182,6 @@ pub val SKIP: FlagSpec = FlagSpec;
 
 `--skip <name>`, a member left out of it
 
-## val RELAX
-
-```mach
-pub val RELAX: FlagSpec = FlagSpec;
-```
-
-`--relax <name>`, a permission added to the profile's relax set
-
-## val NO_RELAX
-
-```mach
-pub val NO_RELAX: FlagSpec = FlagSpec;
-```
-
-`--no-relax <name>`, a permission withdrawn from it
-
 ## val LEVERS_N
 
 ```mach
@@ -312,14 +198,6 @@ pub val LEVERS: [LEVERS_N]*FlagSpec = [LEVERS_N]*FlagSpec;
 
 the profile levers, each over the selected profile for this invocation only,
 consumed by build and test
-
-## val WORK
-
-```mach
-pub val WORK: FlagSpec = FlagSpec;
-```
-
-`-w <path>`, the work directory
 
 ## val WORKDIR_N
 
@@ -361,14 +239,6 @@ pub val EMITS: [EMITS_N]*FlagSpec = [EMITS_N]*FlagSpec;
 
 `--emit`, consumed by build
 
-## val JOBS
-
-```mach
-pub val JOBS: FlagSpec = FlagSpec;
-```
-
-`--jobs <n>`
-
 ## val WORKERS_N
 
 ```mach
@@ -384,14 +254,6 @@ pub val WORKERS: [WORKERS_N]*FlagSpec = [WORKERS_N]*FlagSpec;
 ```
 
 `--jobs`, consumed by build and test
-
-## val LIB_DIR
-
-```mach
-pub val LIB_DIR: FlagSpec = FlagSpec;
-```
-
-`-L <dir>`
 
 ## val LIB
 
@@ -417,16 +279,6 @@ pub val LINKIN: [LINKIN_N]*FlagSpec = [LINKIN_N]*FlagSpec;
 
 the repeatable link inputs `-L` and `-l`, consumed by build and test
 
-## val NO_CACHE
-
-```mach
-pub val NO_CACHE: FlagSpec = FlagSpec;
-```
-
-`--no-cache`. a build reads `obj/` as the object cache by default: a module
-whose object there carries the build's key is reused instead of lowered and
-generated
-
 ## val CACHE_N
 
 ```mach
@@ -442,14 +294,6 @@ pub val CACHE: [CACHE_N]*FlagSpec = [CACHE_N]*FlagSpec;
 ```
 
 `--no-cache`, consumed by build and test
-
-## val DIAGNOSTICS
-
-```mach
-pub val DIAGNOSTICS: FlagSpec = FlagSpec;
-```
-
-`--diagnostics <human|json>`: how diagnostics, failures and a test run's results reach stderr
 
 ## val DIAG_N
 
@@ -500,22 +344,6 @@ pub val HELP: FlagSpec = FlagSpec;
 `--help`: the invocation asks for its command's page, or its action's, instead of running it.
 every schema accepts it without declaring it, and it takes precedence over every refusal
 but an unknown action
-
-## val HELPS_N
-
-```mach
-pub val HELPS_N: usize = 2
-```
-
-row count of HELPS
-
-## val HELPS
-
-```mach
-pub val HELPS: [HELPS_N]*FlagSpec = [HELPS_N]*FlagSpec;
-```
-
-`--help` and `-h`
 
 ## val RUNNER
 
@@ -810,18 +638,6 @@ help: the command that answers a `--help` request, given the invocation that ask
 globals: the options argv[1] may give in place of a command word; nil when global_n is 0
 global_n: length of globals
 
-## fun command_set
-
-```mach
-pub fun command_set(specs: **CommandSpec, n: usize) CommandSet;
-```
-
-a set of commands that answers no help request and takes no global options
-
-specs: first entry of the command list
-n: length of specs
-ret: the set
-
 ## fun command_for
 
 ```mach
@@ -915,20 +731,6 @@ to globals_valid. help refuses to render when this is false
 
 set: the commands
 ret: true when every check passes
-
-## rec Occurrence
-
-```mach
-pub rec Occurrence;
-```
-
-one recognized option in argv
-
-row: the canonical row the option names, whichever spelling was given
-idx: argv index of the option token
-has_value: a value token followed within the scanned range, or an ARITY_ATTACHED option carried one after `=`
-value_idx: argv index of the value token, or idx when has_value is false
-value_off: byte offset of the value inside argv[value_idx]; non-zero only for an ARITY_ATTACHED option
 
 ## rec ParsedInvocation
 
@@ -1031,18 +833,6 @@ whether the invocation asks for a page rather than a run: `--help` or `-h` occur
 inv: the parsed invocation
 ret: true when it did
 
-## fun occurred
-
-```mach
-pub fun occurred(inv: *ParsedInvocation, row: *FlagSpec) bool;
-```
-
-whether row itself occurred in argv, under any of its spellings
-
-inv: the parsed invocation
-row: a canonical row
-ret: true when some occurrence records row
-
 ## fun given
 
 ```mach
@@ -1081,19 +871,6 @@ inv: the parsed invocation
 argv: the argument vector inv was parsed from
 row: a canonical row
 ret: the values; err when the vector cannot grow
-
-## fun diagnostics_format
-
-```mach
-pub fun diagnostics_format(inv: *ParsedInvocation, argv: **u8) res[cli_diagnostic.Format, fail.Fail];
-```
-
-the diagnostics format `--diagnostics <human|json>` selects; human when the command does not take
-the option or it is absent
-
-inv: the parsed invocation
-argv: the argument vector inv was parsed from
-ret: the format, or a user failure for any value but `human` and `json`
 
 ## fun run
 

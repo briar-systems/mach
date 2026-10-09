@@ -270,15 +270,6 @@ pub fun text(f: Fail) opt[str];
 
 the text a failure carries, absent for a reported one
 
-## val REPORTED_TEXT
-
-```mach
-pub val REPORTED_TEXT: str = "failure was reported through diagnostics"
-```
-
-the failure as one line of presentation text; a reported failure has no
-text of its own and is named as such, never as an empty message
-
 ## fun describe
 
 ```mach
@@ -655,12 +646,6 @@ pub fun unknown_member_in(catalog: str, tag: u32, where: str) Catalog;
 ```
 
 the same, named with the site that produced it
-
-## fun is_internal_member
-
-```mach
-pub fun is_internal_member(c: Catalog) bool;
-```
 
 ## fun catalog_text
 

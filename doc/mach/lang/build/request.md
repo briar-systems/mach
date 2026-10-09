@@ -128,6 +128,8 @@ pub val EMIT_ERROR: str = "--emit expects 'obj' or 'exe'"
 pub rec LinkToken;
 ```
 
+reached only by mach-lsp
+
 ## rec BuildRequest
 
 ```mach
@@ -195,14 +197,6 @@ pub fun work_apply(itn: *intern.Interner, work: str, m: *manifest.Manifest) err[
 
 `work`, a `-w` value, in place of the root manifest `m`'s `[project].work`: a
 canonical path inside the project root, taken as written
-
-## val WORK_CONSTRAINT
-
-```mach
-pub val WORK_CONSTRAINT: str = "-w must name a canonical path inside the project root: relative, with no . or .. component and no template"
-```
-
-the rule `-w` keeps
 
 ## fun request_work_apply
 

@@ -48,15 +48,6 @@ open an operation on the project at `root`, released with `close`
 pub fun close(op: *Operation);
 ```
 
-## rec RangeDecl
-
-```mach
-pub rec RangeDecl;
-```
-
-a further range declared for the identity of a request by another requirer: the closure
-keeps one request per identity, and every range on it takes part in resolution
-
 ## rec Request
 
 ```mach
@@ -115,12 +106,6 @@ pub fun selects_release(r: *Request) bool;
 ```
 
 a release-selected git dependency: its requirements are the chosen release's
-
-## fun is_ranged
-
-```mach
-pub fun is_ranged(r: *Request) bool;
-```
 
 ## fun realize
 

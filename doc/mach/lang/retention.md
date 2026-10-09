@@ -22,18 +22,6 @@ pub val RETAINER_SESSION: RetainerId = RetainerId;
 
 the retainer a session records under until a caller names another
 
-## fun retainer_id
-
-```mach
-pub fun retainer_id(index: u32) RetainerId;
-```
-
-## fun retainer_index
-
-```mach
-pub fun retainer_index(r: RetainerId) u32;
-```
-
 ## fun retainer_same
 
 ```mach

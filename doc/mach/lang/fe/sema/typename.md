@@ -12,12 +12,6 @@ pub fun type_to_str(s: *session.Session, t: type.TypeId) res[str, fail.Fail];
 pub fun type_str_free(s: *session.Session, owned: str);
 ```
 
-## fun instance_spelling
-
-```mach
-pub fun instance_spelling(s: *session.Session, name: intern.StrId, args: *type.TypeId, arg_len: u32) res[str, fail.Fail];
-```
-
 ## fun name_str
 
 ```mach

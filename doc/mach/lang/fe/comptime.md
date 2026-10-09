@@ -1026,22 +1026,10 @@ interner: *intern.Interner,
 fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail];
 ```
 
-## rec ArrayLitInfo
-
-```mach
-pub rec ArrayLitInfo;
-```
-
 ## fun declared_float_width
 
 ```mach
 pub fun declared_float_width(a: *ast.Ast, source: str, t: ast_id.TypeId) float.FloatWidth;
-```
-
-## fun decl_array_lit
-
-```mach
-pub fun decl_array_lit(a: *ast.Ast, decl_id: ast_id.DeclId) opt[ArrayLitInfo];
 ```
 
 ## fun error_message

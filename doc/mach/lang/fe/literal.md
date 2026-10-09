@@ -89,9 +89,3 @@ span: the literal's token
 out: room for at least span.len bytes
 ret: how many bytes were written, or why the literal does not scan
 
-## fun escape_decode
-
-```mach
-pub fun escape_decode(p: *u8, len: usize, out_consumed: *usize) res[u8, fail.Fail];
-```
-
