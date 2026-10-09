@@ -403,18 +403,6 @@ pub fun check_handle_in_array(sc: *SemaContext, ty: type.TypeId, span: lang_sour
 pub fun report_internal(sc: *SemaContext, span: lang_source.Span, message: str);
 ```
 
-## fun diag_mark
-
-```mach
-pub fun diag_mark(sc: *SemaContext) u64;
-```
-
-## fun reported_since
-
-```mach
-pub fun reported_since(sc: *SemaContext, mark: u64) bool;
-```
-
 ## fun report_note
 
 ```mach
@@ -545,16 +533,16 @@ fields): the one key both interning a parameter and substituting for it use
 pub fun generic_param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId;
 ```
 
-## fun embed_len_of
+## fun inferred_len_of
 
 ```mach
-pub fun embed_len_of(sc: *SemaContext, tid: ast_id.TypeId) u64;
+pub fun inferred_len_of(sc: *SemaContext, tid: ast_id.TypeId) u64;
 ```
 
-## fun set_embed_len
+## fun set_inferred_len
 
 ```mach
-pub fun set_embed_len(sc: *SemaContext, tid: ast_id.TypeId, len: u64);
+pub fun set_inferred_len(sc: *SemaContext, tid: ast_id.TypeId, len: u64);
 ```
 
 ## fun record_embed_path
