@@ -1,11 +1,14 @@
 use diagnostic_kind: mach.lang.diagnostic.kind;
 use mach.lang.fail;
+use mach.lang.host;
 use collections_vector: std.collections.vector;
 use std.collections.vector.Vector;
 use std_format: std.format;
 use std.process.env;
 use std.process.exec;
-use std.text.string.str_dup;
+use std.runtime.native.view.NativeName;
+use std.runtime.native.view.Unit;
+use system_os: std.system.os;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -13,27 +16,34 @@ use std.types.bool.true;
 use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
-use types_string: std.types.string;
 use std.types.string.str;
-use std.types.string.str_copy_slice;
 use std.types.string.str_len;
 
 use A: std.allocator;
 use std.allocator.page;
 use T: std.allocator.testing;
-use std.types.string.str_equals;
 
+# one variable, NAME=value in std.runtime.native units, so an inherited
+# variable with no UTF-8 spelling is carried as it is
+# ---
+# units:  the entry, owned and terminated
+# length: its length in units
+# name:   the units of its name, before its first '='
 pub rec Entry {
-    name:  str;
-    value: str;
+    units:  *Unit;
+    length: usize;
+    name:   usize;
 }
 
+# a child's environment, one entry per name by the host's name identity
 pub rec Environment {
     entries: Vector[Entry];
 }
 
+# a nil-terminated array of native NAME=value entries, owned, for
+# exec.NativeEnvironment.given
 pub rec Strings {
-    items: **u8;
+    items: **Unit;
     count: u32;
 }
 
@@ -41,14 +51,112 @@ pub fun init(a: *A.Allocator) Environment {
     ret Environment{entries: collections_vector.init[Entry](a)};
 }
 
+pub fun entry_free(a: *A.Allocator, entry: *Entry) {
+    if (entry.units == nil) { ret; }
+    A.deallocate[Unit](a, entry.units, entry.length + 1);
+    entry.units  = nil;
+    entry.length = 0;
+    entry.name   = 0;
+}
+
 pub fun dnit(values: *Environment) {
     var i: usize = 0;
     for (i < values.entries.len) {
-        str_free(values.entries.a, values.entries.data[i].name);
-        str_free(values.entries.a, values.entries.data[i].value);
+        entry_free(values.entries.a, ?values.entries.data[i]);
         i = i + 1;
     }
     collections_vector.dnit[Entry](?values.entries);
+}
+
+# the length of a native entry's name, its units before the first '=', or a
+# refusal when it has no name or no '='
+fun entry_name(units: *Unit, length: usize) res[usize, fail.Fail] {
+    var name: usize = 0;
+    for (name < length && units[name] != '='::Unit) { name = name + 1; }
+    if (name == 0 || name == length) {
+        ret res[usize, fail.Fail].err{fail.message("environment entry must have a name and '='")};
+    }
+    ret res[usize, fail.Fail].ok{name};
+}
+
+# a native entry copied from `units`, nul-terminated
+pub fun entry_native(a: *A.Allocator, units: *Unit) res[Entry, fail.Fail] {
+    if (units == nil) { ret res[Entry, fail.Fail].err{fail.message("environment entry is nil")}; }
+    var length: usize = 0;
+    for (units[length] != 0) { length = length + 1; }
+    val nr: res[usize, fail.Fail] = entry_name(units, length);
+    if (sel nr.err) { ret res[Entry, fail.Fail].err{nr.err}; }
+    val cr: res[*Unit, A.Error] = A.allocate[Unit](a, length + 1);
+    if (sel cr.err) { ret res[Entry, fail.Fail].err{fail.refused(cr.err)}; }
+    var i: usize = 0;
+    for (i <= length) {
+        cr.ok[i] = units[i];
+        i        = i + 1;
+    }
+    ret res[Entry, fail.Fail].ok{Entry{units: cr.ok, length: length, name: nr.ok}};
+}
+
+# a UTF-8 NAME=value entry in native units
+pub fun entry_text(a: *A.Allocator, text: str) res[Entry, fail.Fail] {
+    if (text == nil) { ret res[Entry, fail.Fail].err{fail.message("environment entry is nil")}; }
+    var split: usize = 0;
+    for (text[split] != 0 && text[split] != '=') { split = split + 1; }
+    if (split == 0 || text[split] != '=') {
+        ret res[Entry, fail.Fail].err{fail.message("environment entry must have a name and '='")};
+    }
+    val cr: res[NativeName, host.NativeTextError] = host.native_text(a, text);
+    if (sel cr.err) { ret res[Entry, fail.Fail].err{fail.message(host.native_text_message(cr.err))}; }
+    var converted: NativeName            = cr.ok;
+    val nr:        res[usize, fail.Fail] = entry_name(converted.units, converted.length);
+    if (sel nr.err) {
+        host.native_text_free(a, ?converted);
+        ret res[Entry, fail.Fail].err{nr.err};
+    }
+    ret res[Entry, fail.Fail].ok{Entry{units: converted.units, length: converted.length, name: nr.ok}};
+}
+
+# order two native names by the host's identity
+pub fun compare_names(left: *Unit, left_length: usize, right: *Unit, right_length: usize) res[i32, fail.Fail] {
+    val order: res[i32, i64] = host.compare_env_names(left, left_length, right, right_length);
+    if (sel order.err) { ret res[i32, fail.Fail].err{fail.environment(diagnostic_kind.ENV_READ, system_os.error_message(order.err))}; }
+    ret res[i32, fail.Fail].ok{order.ok};
+}
+
+# add `entry`, which the environment takes: a name already present keeps its
+# value unless `replace`, and the entry not kept is released
+pub fun put_owned(values: *Environment, entry: Entry, replace: bool) err[fail.Fail] {
+    val a:     *A.Allocator = values.entries.a;
+    var owned: Entry        = entry;
+    var found: usize        = values.entries.len;
+    var i:     usize        = 0;
+    for (i < values.entries.len) {
+        val held:  *Entry              = ?values.entries.data[i];
+        val order: res[i32, fail.Fail] = compare_names(held.units, held.name, owned.units, owned.name);
+        if (sel order.err) {
+            entry_free(a, ?owned);
+            ret err[fail.Fail].err{order.err};
+        }
+        if (order.ok == 0) {
+            found = i;
+            brk;
+        }
+        i = i + 1;
+    }
+    if (found < values.entries.len) {
+        if (!replace) {
+            entry_free(a, ?owned);
+            ret err[fail.Fail].ok{};
+        }
+        entry_free(a, ?values.entries.data[found]);
+        values.entries.data[found] = owned;
+        ret err[fail.Fail].ok{};
+    }
+    val pushed: res[usize, A.Error] = collections_vector.push[Entry](?values.entries, owned);
+    if (sel pushed.err) {
+        entry_free(a, ?owned);
+        ret err[fail.Fail].err{fail.refused(pushed.err)};
+    }
+    ret err[fail.Fail].ok{};
 }
 
 # entries own both strings and use host identity before any overlay is applied
@@ -60,121 +168,61 @@ pub fun put(values: *Environment, name: str, value: str, replace: bool) err[fail
         if (name[i] == '=') { ret err[fail.Fail].err{fail.message("environment variable name contains '='")}; }
         i = i + 1;
     }
-    val valid: res[i32, env.EnvError] = env.compare_names(name, name);
-    if (sel valid.err) { ret err[fail.Fail].err{fail.message(fail.env_text(valid.err))}; }
-    var found: usize = values.entries.len;
-    i = 0;
-    for (i < values.entries.len) {
-        val order: res[i32, env.EnvError] = env.compare_names(values.entries.data[i].name, name);
-        if (sel order.err) { ret err[fail.Fail].err{fail.message(fail.env_text(order.err))}; }
-        if (order.ok == 0) {
-            found = i;
-            brk;
-        }
-        i = i + 1;
-    }
-    if (found < values.entries.len && !replace) { ret err[fail.Fail].ok{}; }
-    val a:  *A.Allocator      = values.entries.a;
-    val nr: res[str, A.Error] = str_dup(a, name);
-    if (sel nr.err) { ret err[fail.Fail].err{fail.refused(nr.err)}; }
-    val owned_name: str               = nr.ok;
-    val vr:         res[str, A.Error] = str_dup(a, value);
-    if (sel vr.err) {
-        str_free(a, owned_name);
-        ret err[fail.Fail].err{fail.refused(vr.err)};
-    }
-    val entry: Entry = Entry{name: owned_name, value: vr.ok};
-    if (found < values.entries.len) {
-        str_free(a, values.entries.data[found].name);
-        str_free(a, values.entries.data[found].value);
-        values.entries.data[found] = entry;
-    }
-    or {
-        val pushed: res[usize, A.Error] = collections_vector.push[Entry](?values.entries, entry);
-        if (sel pushed.err) {
-            str_free(a, entry.name);
-            str_free(a, entry.value);
-            ret err[fail.Fail].err{fail.refused(pushed.err)};
-        }
-    }
-    ret err[fail.Fail].ok{};
+    val a:  *A.Allocator                     = values.entries.a;
+    val sr: res[str, std_format.FormatError] = std_format.sprint(a, "{}={}", name, value);
+    if (sel sr.err) { ret err[fail.Fail].err{fail.message(fail.format_text(sr.err))}; }
+    val er: res[Entry, fail.Fail] = entry_text(a, sr.ok);
+    str_free(a, sr.ok);
+    if (sel er.err) { ret err[fail.Fail].err{er.err}; }
+    ret put_owned(values, er.ok, replace);
 }
 
 pub fun put_entry(values: *Environment, entry: str, replace: bool) err[fail.Fail] {
-    var split: usize = 0;
-    if (entry == nil) { ret err[fail.Fail].err{fail.message("environment entry is nil")}; }
-    for (entry[split] != 0 && entry[split] != '=') { split = split + 1; }
-    if (split == 0 || entry[split] != '=') {
-        ret err[fail.Fail].err{fail.message("environment entry must have a name and '='")};
-    }
-    val a:  *A.Allocator                    = values.entries.a;
-    val nr: res[str, types_string.StrError] = str_copy_slice(a, entry, 0, split);
-    if (sel nr.err) { ret err[fail.Fail].err{fail.message(fail.str_text(nr.err))}; }
-    val name:  str            = nr.ok;
-    val added: err[fail.Fail] = put(values, name, ?entry[split + 1], replace);
-    str_free(a, name);
-    ret added;
+    val er: res[Entry, fail.Fail] = entry_text(values.entries.a, entry);
+    if (sel er.err) { ret err[fail.Fail].err{er.err}; }
+    ret put_owned(values, er.ok, replace);
 }
 
-# the entries of an environment, read in UTF-8
-# ---
-# items:  nil-terminated NAME=value entries
-# listed: the listing that owns the entries when they were inherited
-# owned:  whether items and listed are this value's to release
-pub rec Entries {
-    items:  **u8;
-    listed: Vector[env.Listed];
-    owned:  bool;
+# drop the entry at `index`, keeping the order of the rest
+pub fun remove(values: *Environment, index: usize) {
+    if (index >= values.entries.len) { ret; }
+    entry_free(values.entries.a, ?values.entries.data[index]);
+    var i: usize = index + 1;
+    for (i < values.entries.len) {
+        values.entries.data[i - 1] = values.entries.data[i];
+        i                          = i + 1;
+    }
+    values.entries.len = values.entries.len - 1;
 }
 
-# the entries of `e` for reading: a given array as it is, or this process's
-# environment listed for inherit. an inherited variable with no UTF-8 spelling
-# is refused, since whatever reads the entries builds an environment in UTF-8
-# that could not carry it
-pub fun entries(a: *A.Allocator, e: exec.Environment) res[Entries, fail.Fail] {
-    if (sel e.given) {
-        if (e.given == nil) { ret res[Entries, fail.Fail].err{fail.environment(diagnostic_kind.ENV_READ, "the given environment is nil")}; }
-        ret res[Entries, fail.Fail].ok{Entries{items: e.given, listed: collections_vector.init[env.Listed](a), owned: false}};
-    }
-    val lr: res[Vector[env.Listed], env.EnvError] = env.environ(a);
-    if (sel lr.err) { ret res[Entries, fail.Fail].err{fail.environment(diagnostic_kind.ENV_READ, fail.env_text(lr.err))}; }
-    var listed: Vector[env.Listed] = lr.ok;
-    val ar:     res[**u8, A.Error] = A.allocate[*u8](a, listed.len + 1);
-    if (sel ar.err) {
-        env.environ_free(?listed);
-        ret res[Entries, fail.Fail].err{fail.refused(ar.err)};
-    }
-    val items: **u8  = ar.ok;
-    var i:     usize = 0;
-    for (i < listed.len) {
-        val entry: env.Listed = listed.data[i];
-        if (sel entry.unspellable) {
-            A.deallocate[*u8](a, items, listed.len + 1);
-            env.environ_free(?listed);
-            ret res[Entries, fail.Fail].err{fail.environment(diagnostic_kind.ENV_READ, "the environment holds a variable with no UTF-8 spelling, which an edited environment cannot carry")};
-        }
-        items[i] = entry.variable::*u8;
-        i        = i + 1;
-    }
-    items[listed.len] = nil;
-    ret res[Entries, fail.Fail].ok{Entries{items: items, listed: listed, owned: true}};
-}
-
-# release what entries listed for inherit. a given array stays the caller's
-pub fun entries_free(a: *A.Allocator, e: *Entries) {
-    if (!e.owned) { ret; }
-    A.deallocate[*u8](a, e.items, e.listed.len + 1);
-    env.environ_free(?e.listed);
-    e.items = nil;
-    e.owned = false;
-}
-
-# inherited duplicate names retain the first value, matching native lookup
-pub fun capture(a: *A.Allocator, inherited: **u8) res[Environment, fail.Fail] {
+# the environment `e` describes, in native units: a given UTF-8 array, or this
+# process's own as the native capture holds it, so a variable with no UTF-8
+# spelling is carried unit for unit. duplicate names keep their first value,
+# matching native lookup
+pub fun capture(a: *A.Allocator, e: exec.Environment) res[Environment, fail.Fail] {
     var values: Environment = init(a);
     var i:      usize       = 0;
-    for (inherited != nil && inherited[i] != nil) {
-        val added: err[fail.Fail] = put_entry(?values, inherited[i]::str, false);
+    if (sel e.given) {
+        if (e.given == nil) { ret res[Environment, fail.Fail].err{fail.environment(diagnostic_kind.ENV_READ, "the given environment is nil")}; }
+        for (e.given[i] != nil) {
+            val added: err[fail.Fail] = put_entry(?values, e.given[i]::str, false);
+            if (sel added.err) {
+                dnit(?values);
+                ret res[Environment, fail.Fail].err{added.err};
+            }
+            i = i + 1;
+        }
+        ret res[Environment, fail.Fail].ok{values};
+    }
+    val native: **Unit = env.environ_native();
+    if (native == nil) { ret res[Environment, fail.Fail].err{fail.environment(diagnostic_kind.ENV_READ, fail.env_text(env.EnvError.unavailable{}))}; }
+    for (native[i] != nil) {
+        val er: res[Entry, fail.Fail] = entry_native(a, native[i]);
+        if (sel er.err) {
+            dnit(?values);
+            ret res[Environment, fail.Fail].err{er.err};
+        }
+        val added: err[fail.Fail] = put_owned(?values, er.ok, false);
         if (sel added.err) {
             dnit(?values);
             ret res[Environment, fail.Fail].err{added.err};
@@ -189,8 +237,10 @@ fun canonicalize(values: *Environment) err[fail.Fail] {
     for (i < values.entries.len) {
         var j: usize = i;
         for (j > 0) {
-            val order: res[i32, env.EnvError] = env.compare_names(values.entries.data[j - 1].name, values.entries.data[j].name);
-            if (sel order.err) { ret err[fail.Fail].err{fail.message(fail.env_text(order.err))}; }
+            val left:  *Entry              = ?values.entries.data[j - 1];
+            val right: *Entry              = ?values.entries.data[j];
+            val order: res[i32, fail.Fail] = compare_names(left.units, left.name, right.units, right.name);
+            if (sel order.err) { ret err[fail.Fail].err{order.err}; }
             if (order.ok <= 0) { brk; }
             val previous: Entry = values.entries.data[j - 1];
             values.entries.data[j - 1] = values.entries.data[j];
@@ -202,45 +252,84 @@ fun canonicalize(values: *Environment) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
+# the length of a native entry in units
+pub fun units_length(units: *Unit) usize {
+    var n: usize = 0;
+    for (units[n] != 0) { n = n + 1; }
+    ret n;
+}
+
 pub fun strings_free(a: *A.Allocator, strings: *Strings) {
     if (strings.items == nil) { ret; }
     var i: u32 = 0;
     for (i < strings.count) {
-        str_free(a, strings.items[i]::str);
+        A.deallocate[Unit](a, strings.items[i], units_length(strings.items[i]) + 1);
         i = i + 1;
     }
-    A.deallocate[*u8](a, strings.items, strings.count::usize + 1);
+    A.deallocate[*Unit](a, strings.items, strings.count::usize + 1);
     strings.items = nil;
     strings.count = 0;
 }
 
+# the entries sorted by name, each copied, for a child
 pub fun to_strings(values: *Environment) res[Strings, fail.Fail] {
     val sorted: err[fail.Fail] = canonicalize(values);
     if (sel sorted.err) { ret res[Strings, fail.Fail].err{sorted.err}; }
     val count: usize = values.entries.len;
     if (count > 0xffffffff) { ret res[Strings, fail.Fail].err{fail.message("environment has too many entries")}; }
-    val a:  *A.Allocator       = values.entries.a;
-    val ar: res[**u8, A.Error] = A.allocate[*u8](a, count + 1);
+    val a:  *A.Allocator         = values.entries.a;
+    val ar: res[**Unit, A.Error] = A.allocate[*Unit](a, count + 1);
     if (sel ar.err) { ret res[Strings, fail.Fail].err{fail.refused(ar.err)}; }
-    val items: **u8  = ar.ok;
-    var i:     usize = 0;
+    val items: **Unit = ar.ok;
+    var i:     usize  = 0;
     for (i < count) {
-        val entry: Entry                            = values.entries.data[i];
-        val sr:    res[str, std_format.FormatError] = std_format.sprint(a, "{}={}", entry.name, entry.value);
-        if (sel sr.err) {
+        val entry: Entry               = values.entries.data[i];
+        val cr:    res[*Unit, A.Error] = A.allocate[Unit](a, entry.length + 1);
+        if (sel cr.err) {
             var j: usize = 0;
             for (j < i) {
-                str_free(a, items[j]::str);
+                A.deallocate[Unit](a, items[j], values.entries.data[j].length + 1);
                 j = j + 1;
             }
-            A.deallocate[*u8](a, items, count + 1);
-            ret res[Strings, fail.Fail].err{fail.message(fail.format_text(sr.err))};
+            A.deallocate[*Unit](a, items, count + 1);
+            ret res[Strings, fail.Fail].err{fail.refused(cr.err)};
         }
-        items[i] = sr.ok::*u8;
+        var k: usize = 0;
+        for (k <= entry.length) {
+            cr.ok[k] = entry.units[k];
+            k        = k + 1;
+        }
+        items[i] = cr.ok;
         i        = i + 1;
     }
     items[count] = nil;
     ret res[Strings, fail.Fail].ok{Strings{items: items, count: count::u32}};
+}
+
+# a given UTF-8 environment as a child receives it
+#[testing]
+pub fun t_strings(a: *A.Allocator, given: **u8) res[Strings, fail.Fail] {
+    val cr: res[Environment, fail.Fail] = capture(a, exec.Environment.given{given});
+    if (sel cr.err) { ret res[Strings, fail.Fail].err{cr.err}; }
+    var values: Environment = cr.ok;
+    fin { dnit(?values); }
+    ret to_strings(?values);
+}
+
+# whether native `units` spell `text` exactly
+#[testing]
+pub fun t_spells(a: *A.Allocator, units: *Unit, text: str) bool {
+    val cr: res[NativeName, host.NativeTextError] = host.native_text(a, text);
+    if (sel cr.err) { ret false; }
+    var converted: NativeName = cr.ok;
+    fin { host.native_text_free(a, ?converted); }
+    if (units == nil || units_length(units) != converted.length) { ret false; }
+    var i: usize = 0;
+    for (i < converted.length) {
+        if (units[i] != converted.units[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 test owned_overlays_use_host_name_identity {
@@ -254,16 +343,16 @@ test owned_overlays_use_host_name_identity {
         entry[i] = initial[i];
         i        = i + 1;
     }
-    var inherited: [3]usize;
-    inherited[0] = (?entry[0])::usize;
-    inherited[1] = ("MACH_X=ignored")::usize;
-    inherited[2] = 0;
-    val cr: res[Environment, fail.Fail] = capture(?a, (?inherited[0])::**u8);
+    var inherited: [3]*u8;
+    inherited[0] = ?entry[0];
+    inherited[1] = "MACH_X=ignored";
+    inherited[2] = nil;
+    val cr: res[Environment, fail.Fail] = capture(?a, exec.Environment.given{?inherited[0]});
     if (sel cr.err) { ret 2; }
     var values: Environment = cr.ok;
     fin { dnit(?values); }
     entry[7] = 'X';
-    if (values.entries.len != 1 || !str_equals(values.entries.data[0].value, "one")) { ret 3; }
+    if (values.entries.len != 1 || !t_spells(?a, values.entries.data[0].units, "MACH_X=one")) { ret 3; }
     val put_r: err[fail.Fail] = put(?values, "MACH_X", "declared=value", true);
     if (sel put_r.err) { ret 4; }
     val put_r2: err[fail.Fail] = put(?values, "MACH_ÄΩ", "first", true);
@@ -280,7 +369,7 @@ test owned_overlays_use_host_name_identity {
     if (sel sr.err) { ret 9; }
     var strings: Strings = sr.ok;
     fin { strings_free(?a, ?strings); }
-    if (!str_equals(strings.items[0]::str, "MACH_X=declared=value") || strings.items[strings.count] != nil) { ret 10; }
+    if (!t_spells(?a, strings.items[0], "MACH_X=declared=value") || strings.items[strings.count] != nil) { ret 10; }
     val put_entry_r: err[fail.Fail] = put_entry(?values, "=bad", true);
     if (sel put_entry_r.ok) { ret 11; }
     val put_entry_r2: err[fail.Fail] = put_entry(?values, "missing", true);
@@ -290,19 +379,10 @@ test owned_overlays_use_host_name_identity {
 
 #[testing]
 fun t_env_attempt(a: *A.Allocator) bool {
-    var inherited: [11]usize;
-    inherited[0]  = ("MACH_Z=initial")::usize;
-    inherited[1]  = ("MACH_A=retained")::usize;
-    inherited[2]  = ("MACH_B=retained")::usize;
-    inherited[3]  = ("MACH_C=retained")::usize;
-    inherited[4]  = ("MACH_D=retained")::usize;
-    inherited[5]  = ("MACH_E=retained")::usize;
-    inherited[6]  = ("MACH_F=retained")::usize;
-    inherited[7]  = ("MACH_G=retained")::usize;
-    inherited[8]  = ("MACH_H=retained")::usize;
-    inherited[9]  = ("MACH_I=retained")::usize;
-    inherited[10] = 0;
-    val cr: res[Environment, fail.Fail] = capture(a, (?inherited[0])::**u8);
+    var inherited: [11]*u8 = [11]*u8{"MACH_Z=initial", "MACH_A=retained", "MACH_B=retained",
+        "MACH_C=retained", "MACH_D=retained", "MACH_E=retained", "MACH_F=retained",
+        "MACH_G=retained", "MACH_H=retained", "MACH_I=retained", nil};
+    val cr: res[Environment, fail.Fail] = capture(a, exec.Environment.given{?inherited[0]});
     if (sel cr.err) { ret false; }
     var values: Environment = cr.ok;
     fin { dnit(?values); }

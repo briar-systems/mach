@@ -12,7 +12,10 @@ use std_format: std.format;
 use io_error:   std.io.error;
 use std.process.env;
 use std.process.exec;
+use std.runtime.native.view.NativeName;
+use std.runtime.native.view.Unit;
 use system_os: std.system.os;
+use std.text.string.str_dup;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -37,6 +40,7 @@ use diagnostic_kind:    mach.lang.diagnostic.kind;
 use driver_environment: mach.lang.driver.environment;
 use driver_load:        mach.lang.driver.load;
 use mach.lang.fail;
+use mach.lang.host;
 use mach.lang.session;
 use mach.lang.subprocess;
 use mach.lang.toolchain;
@@ -147,8 +151,10 @@ pub fun count_nil_terminated(arr: **u8) usize {
     ret n;
 }
 
-# compare reserved key segments through the host's environment name identity
-pub fun env_prefix(alloc: *A.Allocator, entry: *u8, prefix: str) res[bool, fail.Fail] {
+# whether the name of `entry`, NAME=value in native units, begins with the
+# segments of `prefix` by the host's environment name identity. a prefix ending
+# in '=' names the whole variable
+pub fun env_prefix(alloc: *A.Allocator, entry: *Unit, prefix: str) res[bool, fail.Fail] {
     val prefix_size: usize = str_len(prefix);
     val exact:       bool  = prefix[prefix_size - 1] == '=';
     var wanted:      usize = 0;
@@ -159,8 +165,8 @@ pub fun env_prefix(alloc: *A.Allocator, entry: *u8, prefix: str) res[bool, fail.
     }
     var size:  usize = 0;
     var parts: usize = 0;
-    for (entry[size] != 0 && entry[size] != '=') {
-        if (!exact && entry[size] == '_') {
+    for (entry[size] != 0 && entry[size] != '='::Unit) {
+        if (!exact && entry[size] == '_'::Unit) {
             parts = parts + 1;
             if (parts == wanted) {
                 size = size + 1;
@@ -171,24 +177,23 @@ pub fun env_prefix(alloc: *A.Allocator, entry: *u8, prefix: str) res[bool, fail.
     }
     var compared: usize = prefix_size;
     if (exact) {
-        if (entry[size] != '=') { ret res[bool, fail.Fail].ok{false}; }
+        if (entry[size] != '='::Unit) { ret res[bool, fail.Fail].ok{false}; }
         compared = compared - 1;
     }
     or (parts != wanted) { ret res[bool, fail.Fail].ok{false}; }
-    val lr: res[str, types_string.StrError] = str_copy_slice(alloc, entry::str, 0, size);
-    if (sel lr.err) { ret res[bool, fail.Fail].err{fail.message(fail.str_text(lr.err))}; }
-    val left: str = lr.ok;
-    fin { str_free(alloc, left); }
     val rr: res[str, types_string.StrError] = str_copy_slice(alloc, prefix, 0, compared);
     if (sel rr.err) { ret res[bool, fail.Fail].err{fail.message(fail.str_text(rr.err))}; }
-    val right: str = rr.ok;
-    fin { str_free(alloc, right); }
-    val order: res[i32, env.EnvError] = env.compare_names(left, right);
-    if (sel order.err) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.ENV_READ, fail.env_text(order.err))}; }
+    val nr: res[NativeName, host.NativeTextError] = host.native_text(alloc, rr.ok);
+    str_free(alloc, rr.ok);
+    if (sel nr.err) { ret res[bool, fail.Fail].err{fail.message(host.native_text_message(nr.err))}; }
+    var right: NativeName = nr.ok;
+    fin { host.native_text_free(alloc, ?right); }
+    val order: res[i32, fail.Fail] = driver_environment.compare_names(entry, size, right.units, right.length);
+    if (sel order.err) { ret res[bool, fail.Fail].err{order.err}; }
     ret res[bool, fail.Fail].ok{order.ok == 0};
 }
 
-fun env_names_config(alloc: *A.Allocator, entry: *u8) res[bool, fail.Fail] {
+fun env_names_config(alloc: *A.Allocator, entry: *Unit) res[bool, fail.Fail] {
     var prefixes: [3]str = [3]str{"GIT_CONFIG_COUNT=", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"};
     var i:        usize  = 0;
     for (i < 3) {
@@ -200,7 +205,7 @@ fun env_names_config(alloc: *A.Allocator, entry: *u8) res[bool, fail.Fail] {
     ret res[bool, fail.Fail].ok{false};
 }
 
-fun inherits_env(alloc: *A.Allocator, entry: *u8, config_override: bool) res[bool, fail.Fail] {
+fun inherits_env(alloc: *A.Allocator, entry: *Unit, config_override: bool) res[bool, fail.Fail] {
     val family: res[bool, fail.Fail] = env_prefix(alloc, entry, "GIT_");
     if (sel family.err) { ret res[bool, fail.Fail].err{family.err}; }
     if (!family.ok)     { ret res[bool, fail.Fail].ok{true}; }
@@ -229,43 +234,52 @@ fun same_environment(left: exec.Environment, right: exec.Environment) bool {
     ret sel right.inherit;
 }
 
-# git's environment over `environ`, with `extras` layered on top
+# git's environment over `environ`, with `extras` layered on top. the inherited
+# entries stay in native units, so a variable with no UTF-8 spelling reaches git
 fun environment(alloc: *A.Allocator, environ: exec.Environment, extras: **u8) res[driver_environment.Strings, fail.Fail] {
-    val entries_r: res[driver_environment.Entries, fail.Fail] = driver_environment.entries(alloc, environ);
-    if (sel entries_r.err) { ret res[driver_environment.Strings, fail.Fail].err{entries_r.err}; }
-    var entries_held: driver_environment.Entries = entries_r.ok;
-    fin { driver_environment.entries_free(alloc, ?entries_held); }
-    val inherited: **u8                           = entries_held.items;
-    var values:    driver_environment.Environment = driver_environment.init(alloc);
-    fin { driver_environment.dnit(?values); }
     var override: bool  = false;
     var i:        usize = 0;
     for (extras != nil && extras[i] != nil) {
-        val config: res[bool, fail.Fail] = env_names_config(alloc, extras[i]);
+        val er: res[driver_environment.Entry, fail.Fail] = driver_environment.entry_text(alloc, extras[i]::str);
+        if (sel er.err) { ret res[driver_environment.Strings, fail.Fail].err{er.err}; }
+        var extra:  driver_environment.Entry = er.ok;
+        val config: res[bool, fail.Fail]     = env_names_config(alloc, extra.units);
+        driver_environment.entry_free(alloc, ?extra);
         if (sel config.err) { ret res[driver_environment.Strings, fail.Fail].err{config.err}; }
         if (config.ok)      { override = true; }
         i = i + 1;
+    }
+    val captured: res[driver_environment.Environment, fail.Fail] = driver_environment.capture(alloc, environ);
+    if (sel captured.err) { ret res[driver_environment.Strings, fail.Fail].err{captured.err}; }
+    var values: driver_environment.Environment = captured.ok;
+    fin { driver_environment.dnit(?values); }
+    i = 0;
+    for (i < values.entries.len) {
+        val keep: res[bool, fail.Fail] = inherits_env(alloc, values.entries.data[i].units, override);
+        if (sel keep.err) { ret res[driver_environment.Strings, fail.Fail].err{keep.err}; }
+        if (keep.ok)      { i = i + 1; }
+        or                { driver_environment.remove(?values, i); }
     }
     val locks: err[fail.Fail] = driver_environment.put(?values, "GIT_OPTIONAL_LOCKS", "0", true);
     if (sel locks.err) { ret res[driver_environment.Strings, fail.Fail].err{locks.err}; }
     val prompt: err[fail.Fail] = driver_environment.put(?values, "GIT_TERMINAL_PROMPT", "0", true);
     if (sel prompt.err) { ret res[driver_environment.Strings, fail.Fail].err{prompt.err}; }
-    var layers: [2]**u8 = [2]**u8{inherited, extras};
-    var layer:  usize   = 0;
-    for (layer < 2) {
-        val entries: **u8 = layers[layer];
-        i = 0;
-        for (entries != nil && entries[i] != nil) {
-            val suppress_config: bool                 = layer == 0 && override;
-            val keep:            res[bool, fail.Fail] = inherits_env(alloc, entries[i], suppress_config);
-            if (sel keep.err) { ret res[driver_environment.Strings, fail.Fail].err{keep.err}; }
-            if (keep.ok) {
-                val added: err[fail.Fail] = driver_environment.put_entry(?values, entries[i]::str, layer != 0);
-                if (sel added.err) { ret res[driver_environment.Strings, fail.Fail].err{added.err}; }
-            }
-            i = i + 1;
+    i = 0;
+    for (extras != nil && extras[i] != nil) {
+        val er: res[driver_environment.Entry, fail.Fail] = driver_environment.entry_text(alloc, extras[i]::str);
+        if (sel er.err) { ret res[driver_environment.Strings, fail.Fail].err{er.err}; }
+        var extra: driver_environment.Entry = er.ok;
+        val keep:  res[bool, fail.Fail]     = inherits_env(alloc, extra.units, false);
+        if (sel keep.err) {
+            driver_environment.entry_free(alloc, ?extra);
+            ret res[driver_environment.Strings, fail.Fail].err{keep.err};
         }
-        layer = layer + 1;
+        if (keep.ok) {
+            val added: err[fail.Fail] = driver_environment.put_owned(?values, extra, true);
+            if (sel added.err) { ret res[driver_environment.Strings, fail.Fail].err{added.err}; }
+        }
+        or { driver_environment.entry_free(alloc, ?extra); }
+        i = i + 1;
     }
     ret driver_environment.to_strings(?values);
 }
@@ -355,7 +369,7 @@ fun run_capture(alloc: *A.Allocator, gi: *Inspector, argv: **u8, shown: **u8, tr
     options.capture        = fs.temp_path(?temp);
     options.capture_stderr = capture_stderr;
     options.capture_limit  = 1048576;
-    val sr: err[subprocess.Error] = subprocess.spawn(alloc, ?child, gi.program, argv, exec.Environment.given{git_env.items}, options);
+    val sr: err[subprocess.Error] = subprocess.spawn_native(alloc, ?child, gi.program, argv, exec.NativeEnvironment.given{git_env.items}, options);
     if (sel sr.err) {
         capture_cleanup(alloc, ?temp, ?child, false);
         ret res[Bytes, fail.Fail].err{fail.environment(diagnostic_kind.GIT_COMMAND, subprocess.text(alloc, sr.err))};
@@ -942,18 +956,21 @@ pub fun t_environ_configured(config: **u8) exec.Environment {
     var alloc:  A.Allocator;
     val made_a: err[A.Error] = page.make(?alloc);
     if (sel made_a.err) { ret exec.Environment.inherit{}; }
-    val listed: res[driver_environment.Entries, fail.Fail] = driver_environment.entries(?alloc, exec.Environment.inherit{});
-    if (sel listed.err) { ret exec.Environment.inherit{}; }
-    val inherited: **u8               = listed.ok.items;
-    val count:     usize              = count_nil_terminated(inherited);
-    val extra:     usize              = count_nil_terminated(config);
-    val made:      res[**u8, A.Error] = A.allocate[*u8](?alloc, count + extra + 1);
+    val inherited: **u8 = t_inherited_text(?alloc);
+    if (inherited == nil) { ret exec.Environment.inherit{}; }
+    val count: usize              = count_nil_terminated(inherited);
+    val extra: usize              = count_nil_terminated(config);
+    val made:  res[**u8, A.Error] = A.allocate[*u8](?alloc, count + extra + 1);
     if (sel made.err) { ret exec.Environment.inherit{}; }
     val out: **u8  = made.ok;
     var n:   usize = 0;
     var i:   usize = 0;
     for (i < count) {
-        val configured: res[bool, fail.Fail] = env_names_config(?alloc, inherited[i]);
+        val er: res[driver_environment.Entry, fail.Fail] = driver_environment.entry_text(?alloc, inherited[i]::str);
+        if (sel er.err) { ret exec.Environment.inherit{}; }
+        var native:     driver_environment.Entry = er.ok;
+        val configured: res[bool, fail.Fail]     = env_names_config(?alloc, native.units);
+        driver_environment.entry_free(?alloc, ?native);
         if (sel configured.ok && !configured.ok) {
             out[n] = inherited[i];
             n      = n + 1;
@@ -968,6 +985,36 @@ pub fun t_environ_configured(config: **u8) exec.Environment {
     }
     out[n] = nil;
     ret exec.Environment.given{out};
+}
+
+# this process's environment as nil-terminated UTF-8 entries, for a given
+# environment built from it, or nil when it cannot be listed or holds a
+# variable with no UTF-8 spelling
+#[testing]
+pub fun t_inherited_text(alloc: *A.Allocator) **u8 {
+    val lr: res[Vector[env.Listed], env.EnvError] = env.environ(alloc);
+    if (sel lr.err) { ret nil; }
+    val listed: Vector[env.Listed] = lr.ok;
+    val made:   res[**u8, A.Error] = A.allocate[*u8](alloc, listed.len + 1);
+    if (sel made.err) { ret nil; }
+    var i: usize = 0;
+    for (i < listed.len) {
+        if (sel listed.data[i].unspellable) { ret nil; }
+        made.ok[i] = listed.data[i].variable::*u8;
+        i          = i + 1;
+    }
+    made.ok[listed.len] = nil;
+    ret made.ok;
+}
+
+# env_prefix over a UTF-8 entry
+#[testing]
+pub fun t_text_prefix(alloc: *A.Allocator, entry: *u8, prefix: str) res[bool, fail.Fail] {
+    val er: res[driver_environment.Entry, fail.Fail] = driver_environment.entry_text(alloc, entry::str);
+    if (sel er.err) { ret res[bool, fail.Fail].err{er.err}; }
+    var native: driver_environment.Entry = er.ok;
+    fin { driver_environment.entry_free(alloc, ?native); }
+    ret env_prefix(alloc, native.units, prefix);
 }
 
 #[testing]
@@ -1087,7 +1134,11 @@ test project_root_authority__repo_root_nested_and_absent {
 
 #[testing]
 fun t_inheritance(alloc: *A.Allocator, entry: *u8, override: bool, expected: bool) bool {
-    val result: res[bool, fail.Fail] = inherits_env(alloc, entry, override);
+    val er: res[driver_environment.Entry, fail.Fail] = driver_environment.entry_text(alloc, entry::str);
+    if (sel er.err) { ret false; }
+    var native: driver_environment.Entry = er.ok;
+    fin { driver_environment.entry_free(alloc, ?native); }
+    val result: res[bool, fail.Fail] = inherits_env(alloc, native.units, override);
     ret sel result.ok && result.ok == expected;
 }
 
@@ -1137,14 +1188,46 @@ test git_environment__inherited_configuration_keeps_first_native_name {
     if (sel result.err) { ret 2; }
     var strings: driver_environment.Strings = result.ok;
     fin { driver_environment.strings_free(?alloc, ?strings); }
-    if (strings.count != 6)                                          { ret 3; }
-    if (!str_equals(strings.items[0]::str, inherited[0]::str))       { ret 4; }
-    if (!str_equals(strings.items[1]::str, inherited[2]::str))       { ret 5; }
-    if (!str_equals(strings.items[2]::str, inherited[3]::str))       { ret 6; }
-    if (!str_equals(strings.items[3]::str, "GIT_OPTIONAL_LOCKS=0"))  { ret 7; }
-    if (!str_equals(strings.items[4]::str, "GIT_TERMINAL_PROMPT=0")) { ret 8; }
-    if (!str_equals(strings.items[5]::str, "MACH_PROBE=inherited"))  { ret 9; }
+    if (strings.count != 6)                                                              { ret 3; }
+    if (!driver_environment.t_spells(?alloc, strings.items[0], inherited[0]::str))       { ret 4; }
+    if (!driver_environment.t_spells(?alloc, strings.items[1], inherited[2]::str))       { ret 5; }
+    if (!driver_environment.t_spells(?alloc, strings.items[2], inherited[3]::str))       { ret 6; }
+    if (!driver_environment.t_spells(?alloc, strings.items[3], "GIT_OPTIONAL_LOCKS=0"))  { ret 7; }
+    if (!driver_environment.t_spells(?alloc, strings.items[4], "GIT_TERMINAL_PROMPT=0")) { ret 8; }
+    if (!driver_environment.t_spells(?alloc, strings.items[5], "MACH_PROBE=inherited"))  { ret 9; }
     ret 0;
+}
+
+# git runs while this process holds a variable with no UTF-8 spelling, and the
+# child receives it unit for unit. the test runs itself again in git's place,
+# which a marker variable tells apart
+test git_environment__carries_an_unspellable_inherited_variable {
+    $if ($mach.build.os == $mach.os.windows) {
+        if (subprocess.t_is_set("M4719GC")) {
+            if (!subprocess.t_holds_unspellable("M4719G")) { ret 20; }
+            ret 0;
+        }
+        if (!subprocess.t_set_unspellable("M4719G", "M4719GC")) { ret 1; }
+        var alloc:  A.Allocator;
+        val make_r: err[A.Error] = page.make(?alloc);
+        if (sel make_r.err) { ret 2; }
+        var exe:   [1024]u8;
+        var index: [32]u8;
+        var argv:  [3]*u8;
+        if (!subprocess.t_self_argv(?exe[0], 1024, ?index[0], 32, ?argv[0])) { ret 3; }
+        val program: res[str, A.Error] = str_dup(?alloc, (?exe[0])::str);
+        if (sel program.err) { ret 4; }
+        var gi: Inspector = Inspector{program: program.ok, inherited_env: exec.Environment.inherit{}, alloc: ?alloc};
+        fin { inspector_dnit(?alloc, ?gi); }
+        val ran: res[Bytes, fail.Fail] = run_capture(?alloc, ?gi, ?argv[0], ?argv[0], false, nil, system_os.INVALID_HANDLE, false);
+        if (sel ran.err) { ret 5; }
+        var out: Bytes = ran.ok;
+        bytes_free(?alloc, ?out);
+        ret 0;
+    }
+    $or {
+        ret 0;
+    }
 }
 
 #[testing]
