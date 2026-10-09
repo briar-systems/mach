@@ -52,19 +52,19 @@ ret: the exit code `exit.of` maps the failure to
 ## fun dependency_report
 
 ```mach
-pub fun dependency_report(a: *A.Allocator) package_report.Report;
+pub fun dependency_report(a: *A.Allocator) report.Report;
 ```
 
 where a dependency command reports: progress on standard output, and notes and failures
 the command goes on past on standard error
 
 a: owns the report's effect notes
-ret: the report, released with `package_report.dnit`
+ret: the report, released with `report.dnit`
 
 ## fun dependency_outcome
 
 ```mach
-pub fun dependency_outcome(rep: *package_report.Report, outcome: err[fail.Fail]) i64;
+pub fun dependency_outcome(rep: *report.Report, outcome: err[fail.Fail]) i64;
 ```
 
 show how a dependency command ended: its failure, then a note for each change it made
@@ -79,14 +79,6 @@ ret: exit.OK, or the code `exit.of` maps the failure to
 ```mach
 pub fun outcome_code(bo: *outcome.BuildOutcome) i64;
 ```
-
-## fun size_split
-
-```mach
-pub fun size_split(bytes: usize, unit: *str) i64;
-```
-
-split a byte count into the binary magnitude it reads best in and its unit
 
 ## rec Readout
 
@@ -143,15 +135,6 @@ failure and diagnostic the plan rendered, a failure record printed as its own
 beside every store's diagnostics, so the tally never reads `0 errors` above a
 nonzero exit. json closes in report_close
 
-## fun result_name
-
-```mach
-pub fun result_name(r: *outcome.GateResult) *u8;
-```
-
-the outcome a test record names: `pass`, `exit`, `signal`, `spawn`,
-`timeout`, or `other`
-
 ## fun has_capture
 
 ```mach
@@ -173,12 +156,6 @@ default, or `--diagnostics=json`
 
 ```mach
 pub val FORMAT_HUMAN: Format = 0
-```
-
-## val FORMAT_JSON
-
-```mach
-pub val FORMAT_JSON:  Format = 1
 ```
 
 ## fun format_named
@@ -238,18 +215,6 @@ r: the command's report
 f: the failure
 origin: the phase it is reported under; ORIGIN_NONE for the command line itself
 ret: the exit code `exit.of` maps the failure to
-
-## fun report_test
-
-```mach
-pub fun report_test(r: *Report, t: *readout.TestResult);
-```
-
-one test's result as a record under json; human text writes nothing here,
-the runner's own readout carrying it
-
-r: the command's report
-t: the finished test
 
 ## fun report_case
 

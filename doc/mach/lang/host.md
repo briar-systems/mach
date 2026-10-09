@@ -54,14 +54,6 @@ pid: the process id as decimal text
 argv: room for four entries
 ret: the program's path, which argv[0] also names
 
-## fun path_is_executable
-
-```mach
-pub fun path_is_executable(p: str) bool;
-```
-
-whether the host would run the file at p; windows runs any file, and decides by its extension
-
 ## fun program_resolve
 
 ```mach

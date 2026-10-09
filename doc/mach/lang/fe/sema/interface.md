@@ -11,12 +11,6 @@ holds and points into no syntax tree, scope or other product
 pub val NONE: u32 = 0xFFFFFFFF
 ```
 
-## def DeclarationFlags
-
-```mach
-pub def DeclarationFlags: u8
-```
-
 ## val DECLARATION_EXT
 
 ```mach
@@ -142,7 +136,7 @@ a generic, comptime-parameter or pack function has instances in place of one def
 ## fun template_of
 
 ```mach
-pub fun template_of(iface: *Interface) opt[*template.Template];
+pub fun template_of(iface: *Interface) opt[*sema_template.Template];
 ```
 
 the template part, none for a module with no generic, comptime-parameter or pack function

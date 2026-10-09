@@ -154,20 +154,6 @@ pub fun read(s: *Store, itn: *intern.Interner, module: u32, node: u32) res[compt
 what reading node `node` of module `module`'s store gives: a scalar's value, a refused leaf's
 or an address's refusal, or the aggregate itself as a value naming it
 
-## def ProjectionKind
-
-```mach
-pub def ProjectionKind: u8
-```
-
-## val PROJECT_ABSENT
-
-```mach
-pub val PROJECT_ABSENT: ProjectionKind = 0
-```
-
-the node is no record or case literal
-
 ## val PROJECT_MEMBER
 
 ```mach
@@ -213,33 +199,11 @@ pub fun project(s: *Store, node: u32, name: intern.StrId) Projection;
 member `name` of a record or case literal: a record's field, or a case literal's payload when
 `name` is the case it holds
 
-## def ElementKind
-
-```mach
-pub def ElementKind: u8
-```
-
-## val ELEMENT_ABSENT
-
-```mach
-pub val ELEMENT_ABSENT: ElementKind = 0
-```
-
-the node is no array
-
 ## val ELEMENT_MEMBER
 
 ```mach
 pub val ELEMENT_MEMBER: ElementKind = 1
 ```
-
-## val ELEMENT_OMITTED
-
-```mach
-pub val ELEMENT_OMITTED:  ElementKind = 2
-```
-
-an index the array declares but its literal leaves out, which holds its zero
 
 ## val ELEMENT_PAST_END
 

@@ -43,15 +43,6 @@ the comptime context of a build for `t` under `req`: every fact comptime reads f
 the target and the build options, and nothing of a project, so the build and the
 editor fold the same program the same way
 
-## fun loader_of
-
-```mach
-pub fun loader_of(p: *project.Project) res[*fe_load.Loader, fail.Fail];
-```
-
-the project's loader, pointed at the project where it is now: the project is a value its
-callers move, so what the loader holds of it is bound again before each use
-
 ## fun module_load
 
 ```mach

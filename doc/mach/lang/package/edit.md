@@ -78,16 +78,6 @@ pub fun notes(rep: *report.Report, lines: *Vector[str]);
 
 a resolution's notes, as a command shows them unless --quiet
 
-## fun realize_picks
-
-```mach
-pub fun realize_picks(op: *package_closure.Operation, mode: u8, picks: *Vector[resolver.Choice], quiet: bool,
-offline: bool) err[fail.Fail];
-```
-
-move every chosen release's slot to its tag: a missing slot is acquired, and one pinned
-elsewhere is checked out and its pin recorded
-
 ## fun add_release
 
 ```mach
@@ -139,10 +129,4 @@ purge: bool, quiet: bool, realize: bool, offline: bool) err[fail.Fail];
 
 add or remove a declaration within an open edit. realize false only declares: the manifest
 gains the table (a git one at its resolved range) and nothing is checked out
-
-## fun purge_beneath
-
-```mach
-pub fun purge_beneath(root_fd: usize, name: str) res[usize, fail.Fail];
-```
 

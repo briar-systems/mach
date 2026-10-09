@@ -1,22 +1,5 @@
 # mach.cli.cmd
 
-## val COMMANDS_N
-
-```mach
-pub val COMMANDS_N: usize = 11
-```
-
-length of COMMANDS; the compiler refuses a COMMANDS literal of any other length
-
-## val COMMANDS
-
-```mach
-pub val COMMANDS: [COMMANDS_N]*args.CommandSpec = [COMMANDS_N]*args.CommandSpec;
-```
-
-every command, in the order help lists them. a command is its own file's args.CommandSpec and
-its row here; nothing else registers it
-
 ## fun commands
 
 ```mach

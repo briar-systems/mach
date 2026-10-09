@@ -64,14 +64,6 @@ pub val EDGE_FIELD: Edges = 64
 
 a record's, union's or tag's declared fields
 
-## val EDGE_INSTANCE_FIELD
-
-```mach
-pub val EDGE_INSTANCE_FIELD: Edges = 128
-```
-
-an instance's own fields, from the table built for it
-
 ## val EDGES_VALUE
 
 ```mach

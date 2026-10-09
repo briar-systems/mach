@@ -13,12 +13,6 @@ step, so it has no declaration
 pub def Refusal: u8
 ```
 
-## val REFUSAL_NONE
-
-```mach
-pub val REFUSAL_NONE: Refusal = 0
-```
-
 ## val REFUSAL_RECURSIVE
 
 ```mach

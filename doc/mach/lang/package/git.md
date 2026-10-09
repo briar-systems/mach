@@ -12,15 +12,6 @@ another repository, and every failure names the command, how it ended and what g
 pub rec Entry;
 ```
 
-## rec Tree
-
-```mach
-pub rec Tree;
-```
-
-one checked-out tree's committed entries, as `git ls-tree -r -t --full-tree HEAD` lists
-them: repository-relative paths with their object modes, sorted by path
-
 ## rec Inspector
 
 ```mach

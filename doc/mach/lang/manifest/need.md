@@ -6,14 +6,6 @@ need whose name the entry selects. one walker follows the edges: it refuses a
 cycle wherever it meets one, and orders what it visits after what each needs,
 for validation and planning alike
 
-## def Category
-
-```mach
-pub def Category: u8
-```
-
-a kind of declaration the graph holds
-
 ## val CATEGORY_STEP
 
 ```mach
@@ -42,12 +34,6 @@ one declaration of the graph: entry `index` of its category's tables
 
 ```mach
 pub fun step_node(index: u32) Node;
-```
-
-## fun artifact_node
-
-```mach
-pub fun artifact_node(index: u32) Node;
 ```
 
 ## fun is_glob
@@ -108,14 +94,6 @@ pub fun visit(w: *Walk, n: Node) err[fail.Fail];
 visit `n` and every declaration its `need` reaches, adding each to `order`
 after what it needs; reaching a declaration again while its own visit is open
 is a cycle, refused at the first edge of the cycle with the others related
-
-## fun entry_visit
-
-```mach
-pub fun entry_visit(w: *Walk, from: Node, i: u32) err[fail.Fail];
-```
-
-visit every declaration entry `i` of `from`'s `need` selects
 
 ## fun validate
 

@@ -14,10 +14,12 @@ one serial facade over a borrowed session, with compact open-buffer slots
 pub def AnalysisPhase: driver.FrontendPhase
 ```
 
+reached only by mach-lsp
+
 ## val PHASE_PARSE
 
 ```mach
-pub val PHASE_PARSE:   AnalysisPhase = driver.FRONTEND_PARSE
+pub val PHASE_PARSE: AnalysisPhase = driver.FRONTEND_PARSE
 ```
 
 ## val PHASE_RESOLVE
@@ -26,11 +28,15 @@ pub val PHASE_PARSE:   AnalysisPhase = driver.FRONTEND_PARSE
 pub val PHASE_RESOLVE: AnalysisPhase = driver.FRONTEND_RESOLVE
 ```
 
+reached only by mach-lsp
+
 ## val PHASE_SEMA
 
 ```mach
-pub val PHASE_SEMA:    AnalysisPhase = driver.FRONTEND_SEMA
+pub val PHASE_SEMA: AnalysisPhase = driver.FRONTEND_SEMA
 ```
+
+reached only by mach-lsp
 
 ## rec AnalysisRequest
 
@@ -100,7 +106,7 @@ the AST of the analyzed buffer. raw products borrow the current serial view: a l
 open, update, close, dnit, analyze, build or query operation expires the view, after
 which every checked accessor answers a Fail and a pointer already obtained must not be
 dereferenced. a rejected parse can still expose a partial AST; a fatal acquisition
-exposes nil
+exposes nil; reached only by mach-lsp
 
 result: the envelope, whose EditorSession and Session must both still exist
 ret: the borrowed AST, or the expiry failure
@@ -113,7 +119,7 @@ pub fun resolve_of(result: *AnalysisResult) res[*resolve.ResolveResult, fail.Fai
 
 the resolve product, under ast_of's view rules; the phase must be at least
 PHASE_RESOLVE. symbols may be SYMBOL_NIL or SYMBOL_REJECTED and must be checked before
-indexing the symbol array
+indexing the symbol array; reached only by mach-lsp
 
 ret: the borrowed product, or the expiry or phase failure
 
@@ -123,7 +129,8 @@ ret: the borrowed product, or the expiry or phase failure
 pub fun sema_of(result: *AnalysisResult) res[*fe_sema.SemaResult, fail.Fail];
 ```
 
-the sema product, under ast_of's view rules; the phase must be PHASE_SEMA
+the sema product, under ast_of's view rules; the phase must be PHASE_SEMA; reached only
+by mach-lsp
 
 ret: the borrowed product, or the expiry or phase failure
 

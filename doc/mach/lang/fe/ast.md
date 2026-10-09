@@ -115,17 +115,13 @@ pub fun get_type(a: *Ast, id_: ast_id.TypeId) opt[*ast_type.Type];
 pub fun add_typed_name(a: *Ast, tn: ast_decl.TypedName) res[u32, fail.Fail];
 ```
 
-## fun add_tag_case
-
-```mach
-pub fun add_tag_case(a: *Ast, member: ast_decl.TagCase) res[u32, fail.Fail];
-```
-
 ## fun add_field_init
 
 ```mach
 pub fun add_field_init(a: *Ast, fi: ast_expr.FieldInit) res[u32, fail.Fail];
 ```
+
+reached only by mach-lsp
 
 ## fun add_generic_name
 
@@ -133,40 +129,10 @@ pub fun add_field_init(a: *Ast, fi: ast_expr.FieldInit) res[u32, fail.Fail];
 pub fun add_generic_name(a: *Ast, name: lang_source.Span) res[u32, fail.Fail];
 ```
 
-## fun add_comptime_branch
-
-```mach
-pub fun add_comptime_branch(a: *Ast, br: ast_decl.ComptimeBranch) res[u32, fail.Fail];
-```
-
 ## fun add_decorator
 
 ```mach
 pub fun add_decorator(a: *Ast, d: ast_decl.Decorator) res[u32, fail.Fail];
-```
-
-## fun add_decl_id
-
-```mach
-pub fun add_decl_id(a: *Ast, id_: ast_id.DeclId) res[u32, fail.Fail];
-```
-
-## fun add_stmt_id
-
-```mach
-pub fun add_stmt_id(a: *Ast, id_: ast_id.StmtId) res[u32, fail.Fail];
-```
-
-## fun add_expr_id
-
-```mach
-pub fun add_expr_id(a: *Ast, id_: ast_id.ExprId) res[u32, fail.Fail];
-```
-
-## fun add_type_id
-
-```mach
-pub fun add_type_id(a: *Ast, id_: ast_id.TypeId) res[u32, fail.Fail];
 ```
 
 ## fun literal_bytes_reserve
@@ -220,6 +186,8 @@ pub fun rollback(a: *Ast, m: AstMark) bool;
 ```mach
 pub fun span_contains(span: lang_source.Span, offset: usize) bool;
 ```
+
+reached only by mach-lsp
 
 ## fun offset_to_expr
 

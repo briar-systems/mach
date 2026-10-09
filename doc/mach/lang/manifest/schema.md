@@ -9,62 +9,6 @@ pub def Shape: u8
 the TOML shape a manifest key's value must have; a value of any other shape is
 refused where it is written
 
-## val SHAPE_STRING
-
-```mach
-pub val SHAPE_STRING: Shape = 0
-```
-
-a string, never empty
-
-## val SHAPE_INTEGER
-
-```mach
-pub val SHAPE_INTEGER: Shape = 1
-```
-
-an integer
-
-## val SHAPE_BOOL
-
-```mach
-pub val SHAPE_BOOL: Shape = 2
-```
-
-a boolean
-
-## val SHAPE_STRINGS
-
-```mach
-pub val SHAPE_STRINGS: Shape = 3
-```
-
-an array whose every element is a string
-
-## val SHAPE_TABLE
-
-```mach
-pub val SHAPE_TABLE: Shape = 4
-```
-
-a table whose keys are the author's own, such as a step's `env`
-
-## val SHAPE_SECTION
-
-```mach
-pub val SHAPE_SECTION: Shape = 5
-```
-
-a table checked against the rows of its own key, such as `[project]`
-
-## val SHAPE_ENTRIES
-
-```mach
-pub val SHAPE_ENTRIES: Shape = 6
-```
-
-a table of named tables, each checked against the rows of the key, such as `[target.*]`
-
 ## def Rule
 
 ```mach
@@ -74,56 +18,6 @@ pub def Rule: u8
 whether a manifest must write a key. a key may be left out only when leaving it
 out safely means that it does not apply, and one rule holds in every manifest,
 whoever reads it
-
-## val RULE_REQUIRED
-
-```mach
-pub val RULE_REQUIRED: Rule = 0
-```
-
-every manifest writes it
-
-## val RULE_OPTIONAL
-
-```mach
-pub val RULE_OPTIONAL: Rule = 1
-```
-
-a manifest may leave it out; the row's note says what its absence means
-
-## val RULE_DERIVED
-
-```mach
-pub val RULE_DERIVED: Rule = 2
-```
-
-another value of the same table decides whether it is written; the row's note
-names that value
-
-## val RULE_REMOVED
-
-```mach
-pub val RULE_REMOVED: Rule = 3
-```
-
-no longer read and refused by name; the row's note says what replaces it
-
-## rec KeyRow
-
-```mach
-pub rec KeyRow;
-```
-
-one key of a manifest table
-
-key: the key as written
-shape: the shape its value must have
-rule: whether a manifest must write it
-note: for a required key, a hint added to the refusal of its absence, "" for
-         none; for an optional key, what its absence means; for a derived key, the
-         value that decides it; for a removed key, what replaces it
-migrate: for a removed key, the rewrite its refusal carries as a fix; nil for
-         a key whose replacement is no mechanical rewrite
 
 ## rec Rewrite
 
@@ -136,44 +30,6 @@ the mechanical rewrite of a removed key as written
 label: what the rewrite does; nil when the value as written has none
 whole: the rewrite replaces the key and its value, not the key alone
 replacement: the text written in their place
-
-## def Migrate
-
-```mach
-pub def Migrate: fun(*toml.Table, *toml.Value) Rewrite
-```
-
-the rewrite of the removed key `v` of `tab`
-
-## rec Rows
-
-```mach
-pub rec Rows;
-```
-
-the rows of one table
-
-rows: the first row
-count: how many rows there are
-noun: what one entry of an `SHAPE_ENTRIES` table is called in a refusal
-
-## fun root_rows
-
-```mach
-pub fun root_rows() Rows;
-```
-
-the rows of the document root
-
-## fun rows_of
-
-```mach
-pub fun rows_of(key: str) Rows;
-```
-
-the rows of the table a root key names, the empty set for any other key
-
-key: a key of the document root
 
 ## fun row_of
 
