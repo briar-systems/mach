@@ -29,19 +29,13 @@ exe=
 
 # the chain file names the seed release, then each mach sha in order. a step's
 # binary is kept under $RUNNER_TEMP/chain/<sha>, which CI caches by os, arch and
-# sha, and a step already there is not rebuilt
+# the chain file's hash, and a step already there is not rebuilt
 chain=.github/bootstrap-chain
 seed=$(awk '$1 == "seed" { print $2 }' "$chain")
 steps=$(awk '!/^#/ && NF && $1 != "seed" { print $1 }' "$chain")
 [ -n "$seed" ] && [ -n "$steps" ] || { echo "::error::$chain needs a seed and a step"; exit 1; }
 root=$RUNNER_TEMP/chain
 [ "$RUNNER_OS" = Windows ] && root=$(cygpath -u "$root")
-
-# a restored cache can hold steps the chain no longer lists
-for old in "$root"/*; do
-    [ -d "$old" ] || continue
-    echo "$steps" | grep -qx "$(basename "$old")" || rm -rf "$old"
-done
 
 fetch() {
     rm -rf "$2"
@@ -70,7 +64,9 @@ for sha in $steps; do
             (cd "$src" && bash .github/scripts/seed-build.sh "$dir/mach$exe" "$bin")
         else
             mkdir -p "$root/$sha"
-            (cd "$src" && "$prev" dep pull . && "$prev" build . -o "$bin")
+            # build -o refuses a path outside the project
+            (cd "$src" && "$prev" dep pull . && "$prev" build . -o "mach$exe")
+            mv "$src/mach$exe" "$bin"
         fi
         rm -rf "$src"
     fi
