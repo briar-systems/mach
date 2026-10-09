@@ -78,14 +78,6 @@ reparse and re-walk one loaded module after its text changed, and say whether it
 survived, so the project's other modules stand as they are; every product the project holds of
 the module is dropped, since each is keyed by the old syntax tree
 
-## fun gated_imports_check
-
-```mach
-pub fun gated_imports_check(p: *project.Project) err[fail.Fail];
-```
-
-refuse each imported constant a union build cannot read one value of
-
 ## fun decorators_record
 
 ```mach
