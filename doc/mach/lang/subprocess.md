@@ -254,7 +254,7 @@ group, with nothing captured
 ## fun spawn
 
 ```mach
-pub fun spawn(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
+pub fun spawn(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: exec.Environment,
 options: SpawnOptions) err[Error];
 ```
 
@@ -269,7 +269,7 @@ a: allocator for the owner's copies, which dnit releases
 p: the owner, from init
 pathname: path to the executable
 argv: null-terminated argument array
-envp: null-terminated environment array
+envp: the child's environment, given entries or this process's inherited
 options: directory, stdin, grouping and capture (see SpawnOptions)
 ret: nothing, or the refusal named by the pathname
 

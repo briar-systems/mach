@@ -24,7 +24,7 @@ ret: exit.OK, the code `exit.of` maps the action's rendered failure to, or the f
 ## fun pull_project
 
 ```mach
-pub fun pull_project(a: *A.Allocator, root: str, quiet: bool, environ: **u8) res[i64, fail.Fail];
+pub fun pull_project(a: *A.Allocator, root: str, quiet: bool, environ: exec.Environment) res[i64, fail.Fail];
 ```
 
 `mach dep pull`: realize the dependency closure of a project (package_pull.project_closure)
