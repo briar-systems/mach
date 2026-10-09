@@ -906,6 +906,16 @@ pub fun intern_array(ti: *TypeInterner, base: TypeId, count: u32) res[TypeId, fa
 pub fun intern_vector(ti: *TypeInterner, element: TypeKind, lanes: u32) res[TypeId, fail.Fail];
 ```
 
+## fun intern_window
+
+```mach
+pub fun intern_window(ti: *TypeInterner, object: TypeId, count: u32) res[TypeId, fail.Fail];
+```
+
+the type of the window `object[start, count]`, its one owner: `count` lanes of a vector as a
+vector of that width, or `count` elements of an array or through a pointer as `[count]T`; a
+secret object gives a secret window, as a whole read of it is secret
+
 ## fun intern_handle
 
 ```mach
