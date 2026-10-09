@@ -1,0 +1,469 @@
+# the hygiene of the code that stays at the toolchain split, read from the
+# source tree under the working directory: each module is imported under one
+# name and each name imports one module, and no pub declaration is named only
+# in its own file unless its doc comment says what reaches it
+use std.allocator.arena;
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use fs:       std.filesystem;
+use io_error: std.io.error;
+use std.print;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_ends_with;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_region_equals;
+
+use A: std.allocator;
+
+use mach.lang.diagnostic;
+use driver_load: mach.lang.driver.load;
+use mach.lang.fail;
+use mach.lang.fe.ast;
+use ast_decl:   mach.lang.fe.ast.decl;
+use ast_id:     mach.lang.fe.ast.id;
+use ast_module: mach.lang.fe.ast.module;
+use fe_lexer:   mach.lang.fe.lexer;
+use fe_parser:  mach.lang.fe.parser;
+use mach.lang.fe.parser.state;
+use mach.lang.fe.token;
+use mach.lang.intern;
+use lang_source: mach.lang.source;
+
+#[testing]
+val NONE: u32 = 0xFFFFFFFF;
+
+# the code that leaves for mirl, masc and mink: each prefix is a module and
+# every module under it
+#[testing]
+val LEAVING_N: usize          = 13;
+#[testing]
+val LEAVING:   [LEAVING_N]str = [LEAVING_N]str{
+    "mach.lang.be.codegen",
+    "mach.lang.be.linker",
+    "mach.lang.ct",
+    "mach.lang.layout",
+    "mach.lang.me",
+    "mach.lang.mir",
+    "mach.lang.target.abi",
+    "mach.lang.target.catalog",
+    "mach.lang.target.extension",
+    "mach.lang.target.isa",
+    "mach.lang.target.model",
+    "mach.lang.target.of",
+    "mach.lang.target.os",
+};
+
+# what stays under a leaving prefix: lowering is rebuilt in place onto mirl
+#[testing]
+val KEPT_N: usize       = 1;
+#[testing]
+val KEPT:   [KEPT_N]str = [KEPT_N]str{"mach.lang.me.lower"};
+
+# what a doc comment says to keep a pub declaration that no other file names,
+# as in "reached through the ROWS table" or "reached only by mach-lsp"
+#[testing]
+val REACHED: str = "reached ";
+
+# a `use` in a staying file: the name it binds and the path it imports; a gated
+# use sits in an arm of a declaration-level `$if`
+#[testing]
+rec Binding {
+    file:  u32;
+    line:  usize;
+    name:  intern.StrId;
+    path:  intern.StrId;
+    gated: bool;
+}
+
+# a pub declaration in a staying file, and whether its doc comment says what
+# reaches it
+#[testing]
+rec Surface {
+    file:   u32;
+    line:   usize;
+    name:   intern.StrId;
+    exempt: bool;
+}
+
+# the source tree as the checks read it, in alloc, with each file's text and
+# syntax in an arena over backing released once the file is read. first and shared are by name index:
+# the first file naming the name, and whether another file names it too
+#[testing]
+rec Tree {
+    alloc:    *A.Allocator;
+    backing:  *A.Allocator;
+    itn:      intern.Interner;
+    paths:    Vector[str];
+    bindings: Vector[Binding];
+    surface:  Vector[Surface];
+    first:    Vector[u32];
+    shared:   Vector[bool];
+}
+
+# where a scan stands in a file's text, so lines are counted once
+#[testing]
+rec Cursor {
+    text:   str;
+    offset: usize;
+    line:   usize;
+}
+
+#[testing]
+fun under(name: str, prefix: str) bool {
+    val n: usize = str_len(prefix);
+    if (str_len(name) < n || !str_region_equals(name, 0, n, prefix)) { ret false; }
+    ret name[n] == 0 || name[n] == '.';
+}
+
+# whether the module or symbol a dotted name spells leaves at the split
+#[testing]
+fun leaves(name: str) bool {
+    var i: usize = 0;
+    for (i < KEPT_N) {
+        if (under(name, KEPT[i])) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < LEAVING_N) {
+        if (under(name, LEAVING[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+#[testing]
+fun is_dir(path: str) bool {
+    val r: res[bool, io_error.Error] = fs.is_dir(path);
+    if (sel r.ok) { ret r.ok; }
+    ret false;
+}
+
+#[testing]
+fun is_file(path: str) bool {
+    val r: res[bool, io_error.Error] = fs.is_file(path);
+    if (sel r.ok) { ret r.ok; }
+    ret false;
+}
+
+# the source root above the working directory: the one holding this module
+#[testing]
+fun find_src(alloc: *A.Allocator) res[str, fail.Fail] {
+    var prefix: str   = ".";
+    var depth:  usize = 0;
+    for (depth < 8) {
+        val rs: res[str, A.Error] = types_path.join(alloc, prefix, "src");
+        if (sel rs.err) { ret res[str, fail.Fail].err{fail.refused(rs.err)}; }
+        val rm: res[str, A.Error] = types_path.join(alloc, rs.ok, "lang/driver/tests/hygiene.mach");
+        if (sel rm.err)     { ret res[str, fail.Fail].err{fail.refused(rm.err)}; }
+        if (is_file(rm.ok)) { ret res[str, fail.Fail].ok{rs.ok}; }
+        val ru: res[str, A.Error] = types_path.join(alloc, prefix, "..");
+        if (sel ru.err) { ret res[str, fail.Fail].err{fail.refused(ru.err)}; }
+        prefix = ru.ok;
+        depth  = depth + 1;
+    }
+    ret res[str, fail.Fail].err{fail.message("hygiene: no source root above the working directory")};
+}
+
+# the line of `offset`, which no earlier call on the cursor passed
+#[testing]
+fun line_at(c: *Cursor, offset: usize) usize {
+    if (offset < c.offset) {
+        c.offset = 0;
+        c.line   = 1;
+    }
+    for (c.offset < offset) {
+        if (c.text[c.offset] == '\n') { c.line = c.line + 1; }
+        c.offset = c.offset + 1;
+    }
+    ret c.line;
+}
+
+#[testing]
+fun holds(text: str, span: lang_source.Span, needle: str) bool {
+    val n: usize = str_len(needle);
+    var i: usize = span.offset;
+    for (i + n <= span.offset + span.len) {
+        if (str_region_equals(?text[i], 0, n, needle)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# file f names the name `id`
+#[testing]
+fun mark(t: *Tree, id: intern.StrId, f: u32) err[fail.Fail] {
+    val at: usize = intern.str_index(id)::usize;
+    for (t.first.len <= at) {
+        val pf: res[usize, A.Error] = collections_vector.push[u32](?t.first, NONE);
+        if (sel pf.err) { ret err[fail.Fail].err{fail.refused(pf.err)}; }
+        val ps: res[usize, A.Error] = collections_vector.push[bool](?t.shared, false);
+        if (sel ps.err) { ret err[fail.Fail].err{fail.refused(ps.err)}; }
+    }
+    if (t.first.data[at] == NONE) { t.first.data[at] = f; }
+    or (t.first.data[at] != f)    { t.shared.data[at] = true; }
+    ret err[fail.Fail].ok{};
+}
+
+#[testing]
+fun bind(t: *Tree, f: u32, text: str, c: *Cursor, d: *ast_decl.Decl) err[fail.Fail] {
+    val path: lang_source.Span           = d.data.use_.path;
+    val rp:   res[intern.StrId, A.Error] = intern.range_add(?t.itn, text, path.offset, path.len);
+    if (sel rp.err)                         { ret err[fail.Fail].err{fail.refused(rp.err)}; }
+    if (leaves(intern.text(?t.itn, rp.ok))) { ret err[fail.Fail].ok{}; }
+
+    # an unaliased use binds the path's leaf
+    var name: lang_source.Span = d.data.use_.alias;
+    if (name.len == 0) {
+        var at: usize = path.offset + path.len;
+        for (at > path.offset && text[at - 1] != '.') { at = at - 1; }
+        name = lang_source.span(at, path.offset + path.len - at);
+    }
+    val rn: res[intern.StrId, A.Error] = intern.range_add(?t.itn, text, name.offset, name.len);
+    if (sel rn.err) { ret err[fail.Fail].err{fail.refused(rn.err)}; }
+
+    val b:      Binding             = Binding{file: f, line: line_at(c, d.span.offset), name: rn.ok, path: rp.ok, gated: (d.flags & ast_decl.DECL_FLAG_GATED) != 0};
+    val pushed: res[usize, A.Error] = collections_vector.push[Binding](?t.bindings, b);
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+#[testing]
+fun publishes(d: *ast_decl.Decl) bool {
+    if ((d.flags & ast_decl.DECL_FLAG_PUB) == 0)                                                                  { ret false; }
+    if (d.kind == ast_decl.DECL_KIND_FUN || d.kind == ast_decl.DECL_KIND_REC || d.kind == ast_decl.DECL_KIND_UNI) { ret true; }
+    if (d.kind == ast_decl.DECL_KIND_TAG || d.kind == ast_decl.DECL_KIND_DEF)                                     { ret true; }
+    ret d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR;
+}
+
+# the module-scope declarations from `start`, through every arm of a
+# declaration-level `$if`
+#[testing]
+fun walk(t: *Tree, f: u32, text: str, c: *Cursor, a: *ast.Ast, start: u32, len: u32) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < len) {
+        val did: ast_id.DeclId  = a.decl_ids.data[start + i];
+        val d:   *ast_decl.Decl = ?a.decls.data[ast_id.decl_index(did)];
+        i = i + 1;
+        if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+            var b: u32 = 0;
+            for (b < d.data.comptime_if.branches_len) {
+                val br:     *ast_decl.ComptimeBranch = ?a.comptime_branches.data[d.data.comptime_if.branches_start + b];
+                val walked: err[fail.Fail]           = walk(t, f, text, c, a, br.body_start, br.body_len);
+                if (sel walked.err) { ret walked; }
+                b = b + 1;
+            }
+            cnt;
+        }
+        if (d.kind == ast_decl.DECL_KIND_USE) {
+            val bound: err[fail.Fail] = bind(t, f, text, c, d);
+            if (sel bound.err) { ret bound; }
+            cnt;
+        }
+        if (!publishes(d)) { cnt; }
+        val span: lang_source.Span           = ast.decl_name_span(a, did);
+        val rn:   res[intern.StrId, A.Error] = intern.range_add(?t.itn, text, span.offset, span.len);
+        if (sel rn.err) { ret err[fail.Fail].err{fail.refused(rn.err)}; }
+        val s:      Surface             = Surface{file: f, line: line_at(c, span.offset), name: rn.ok, exempt: holds(text, d.doc, REACHED)};
+        val pushed: res[usize, A.Error] = collections_vector.push[Surface](?t.surface, s);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# every name file f spells, and when it stays, its imports and pub surface;
+# the text and its syntax live in `scratch`, released by the caller
+#[testing]
+fun scan(t: *Tree, scratch: *A.Allocator, f: u32, path: str, stays: bool) err[fail.Fail] {
+    val rt: res[str, fs.FsError] = fs.read_string(scratch, path);
+    if (sel rt.err) { ret err[fail.Fail].err{fail.fs_refused(rt.err)}; }
+    val text: str = rt.ok;
+
+    val tr: res[fe_lexer.TokenStream, fail.Fail] = fe_lexer.tokenize(text, scratch, lang_source.FILE_NIL);
+    if (sel tr.err) { ret err[fail.Fail].err{tr.err}; }
+    var stream: fe_lexer.TokenStream = tr.ok;
+    var k:      usize                = 0;
+    for (k < stream.len) {
+        val tok: token.Token = stream.tokens[k];
+        k = k + 1;
+        if (tok.kind != token.KIND_IDENT) { cnt; }
+        val rn: res[intern.StrId, A.Error] = intern.range_add(?t.itn, text, tok.span.offset, tok.span.len);
+        if (sel rn.err) { ret err[fail.Fail].err{fail.refused(rn.err)}; }
+        val marked: err[fail.Fail] = mark(t, rn.ok, f);
+        if (sel marked.err) { ret marked; }
+    }
+    if (!stays) { ret err[fail.Fail].ok{}; }
+
+    var diags: diagnostic.DiagnosticStore             = diagnostic.store_init(scratch);
+    var a:     ast.Ast                                = ast.init(scratch, lang_source.FILE_NIL);
+    val pr:    res[fail.PhaseStatus, state.ParseFail] = fe_parser.parse(?stream, ?a, ?diags);
+    if (sel pr.err || diagnostic.has_errors(?diags)) { ret err[fail.Fail].err{fail.message("the file does not parse")}; }
+
+    var c: Cursor             = Cursor{text: text, offset: 0, line: 1};
+    val m: *ast_module.Module = ?a.modules.data[ast_id.module_node_index(a.root_module)];
+    ret walk(t, f, text, ?c, ?a, m.decls_start, m.decls_len);
+}
+
+#[testing]
+fun collect(t: *Tree, src: str, dir: str) err[fail.Fail] {
+    val rd: res[Vector[str], fs.FsError] = fs.read_dir(t.alloc, dir);
+    if (sel rd.err) { ret err[fail.Fail].err{fail.fs_refused(rd.err)}; }
+    var names: Vector[str] = rd.ok;
+    var i:     usize       = 0;
+    for (i < names.len) {
+        val name: str = names.data[i];
+        i = i + 1;
+        if (str_equals(name, ".") || str_equals(name, "..")) { cnt; }
+        val rj: res[str, A.Error] = types_path.join(t.alloc, dir, name);
+        if (sel rj.err) { ret err[fail.Fail].err{fail.refused(rj.err)}; }
+        val path: str = rj.ok;
+        if (is_dir(path)) {
+            val e: err[fail.Fail] = collect(t, src, path);
+            if (sel e.err) { ret e; }
+            cnt;
+        }
+        if (!str_ends_with(path, ".mach")) { cnt; }
+
+        val rel: str                          = (?path[str_len(src) + 1])::str;
+        val rm:  res[intern.StrId, fail.Fail] = driver_load.compose_module_fqn(t.alloc, ?t.itn, "mach", rel);
+        if (sel rm.err) { ret err[fail.Fail].err{rm.err}; }
+        val f:      u32                 = t.paths.len::u32;
+        val pushed: res[usize, A.Error] = collections_vector.push[str](?t.paths, rel);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+
+        var ar:      arena.Arena;
+        var scratch: A.Allocator;
+        val made:    err[A.Error] = arena.init(?ar, t.backing, 0);
+        if (sel made.err) { ret err[fail.Fail].err{fail.refused(made.err)}; }
+        arena.make(?scratch, ?ar);
+        val scanned: err[fail.Fail] = scan(t, ?scratch, f, path, !leaves(intern.text(?t.itn, rm.ok)));
+        arena.dnit(?ar);
+        if (sel scanned.err) {
+            print.eprintlnf("hygiene: {}: {}", rel, fail.describe(scanned.err));
+            ret scanned;
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the tree under the source root, or none with the reason printed
+#[testing]
+fun load(alloc: *A.Allocator, backing: *A.Allocator, t: *Tree) bool {
+    t.alloc    = alloc;
+    t.backing  = backing;
+    t.itn      = intern.init(alloc);
+    t.paths    = collections_vector.init[str](alloc);
+    t.bindings = collections_vector.init[Binding](alloc);
+    t.surface  = collections_vector.init[Surface](alloc);
+    t.first    = collections_vector.init[u32](alloc);
+    t.shared   = collections_vector.init[bool](alloc);
+    val rs: res[str, fail.Fail] = find_src(alloc);
+    if (sel rs.err) {
+        print.eprintln(fail.describe(rs.err));
+        ret false;
+    }
+    val walked: err[fail.Fail] = collect(t, rs.ok, rs.ok);
+    ret !sel walked.err;
+}
+
+# by name index, NONE everywhere
+#[testing]
+fun index(t: *Tree) Vector[u32] {
+    var v: Vector[u32] = collections_vector.init[u32](t.alloc);
+    var i: usize       = 0;
+    for (i < intern.count(?t.itn)) {
+        collections_vector.push[u32](?v, NONE);
+        i = i + 1;
+    }
+    ret v;
+}
+
+# the bindings that import a path under a second name, or bind a name to a
+# second path, each printed; the arms of a declaration-level `$if` may bind one
+# name to a module apiece, so a gated binding is held to the first rule only
+#[testing]
+fun alias_violations(t: *Tree) usize {
+    var by_path: Vector[u32] = index(t);
+    var by_name: Vector[u32] = index(t);
+    var count:   usize       = 0;
+    var i:       usize       = 0;
+    for (i < t.bindings.len) {
+        val b:  *Binding = ?t.bindings.data[i];
+        val pi: usize    = intern.str_index(b.path)::usize;
+        if (by_path.data[pi] == NONE) { by_path.data[pi] = i::u32; }
+        or {
+            val o: *Binding = ?t.bindings.data[by_path.data[pi]];
+            if (!intern.str_same(o.name, b.name)) {
+                print.eprintlnf("hygiene: {}:{}: {} is imported as {}, and as {} at {}:{}", t.paths.data[b.file], b.line, intern.text(?t.itn, b.path), intern.text(?t.itn, b.name), intern.text(?t.itn, o.name), t.paths.data[o.file], o.line);
+                count = count + 1;
+            }
+        }
+        if (!b.gated) {
+            val ni: usize = intern.str_index(b.name)::usize;
+            if (by_name.data[ni] == NONE) { by_name.data[ni] = i::u32; }
+            or {
+                val o: *Binding = ?t.bindings.data[by_name.data[ni]];
+                if (!intern.str_same(o.path, b.path)) {
+                    print.eprintlnf("hygiene: {}:{}: {} names {}, and {} at {}:{}", t.paths.data[b.file], b.line, intern.text(?t.itn, b.name), intern.text(?t.itn, b.path), intern.text(?t.itn, o.path), t.paths.data[o.file], o.line);
+                    count = count + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret count;
+}
+
+# the pub declarations no other file names and whose doc says nothing reaches
+# them, each printed
+#[testing]
+fun surface_violations(t: *Tree) usize {
+    var count: usize = 0;
+    var i:     usize = 0;
+    for (i < t.surface.len) {
+        val s: *Surface = ?t.surface.data[i];
+        i = i + 1;
+        if (s.exempt || t.shared.data[intern.str_index(s.name)]) { cnt; }
+        print.eprintlnf("hygiene: {}:{}: pub {} is named only in its own file; drop pub, or say in its doc comment what reaches it", t.paths.data[s.file], s.line, intern.text(?t.itn, s.name));
+        count = count + 1;
+    }
+    ret count;
+}
+
+test hygiene__each_module_is_imported_under_one_name {
+    var backing: A.Allocator;
+    page.make(?backing);
+    var ar:    arena.Arena;
+    var alloc: A.Allocator;
+    val made:  err[A.Error] = arena.init(?ar, ?backing, 0);
+    if (sel made.err) { ret 1; }
+    arena.make(?alloc, ?ar);
+    var t: Tree;
+    if (!load(?alloc, ?backing, ?t)) { ret 1; }
+    if (t.bindings.len == 0)         { ret 2; }
+    if (alias_violations(?t) != 0)   { ret 3; }
+    ret 0;
+}
+
+test hygiene__no_pub_declaration_is_named_only_in_its_own_file {
+    var backing: A.Allocator;
+    page.make(?backing);
+    var ar:    arena.Arena;
+    var alloc: A.Allocator;
+    val made:  err[A.Error] = arena.init(?ar, ?backing, 0);
+    if (sel made.err) { ret 1; }
+    arena.make(?alloc, ?ar);
+    var t: Tree;
+    if (!load(?alloc, ?backing, ?t)) { ret 1; }
+    if (t.surface.len == 0)          { ret 2; }
+    if (surface_violations(?t) != 0) { ret 3; }
+    ret 0;
+}
