@@ -27,7 +27,7 @@ ret: exit.OK, the code `exit.of` maps the action's rendered failure to, or the f
 pub fun pull_project(a: *A.Allocator, root: str, quiet: bool, environ: **u8) res[i64, fail.Fail];
 ```
 
-`mach dep pull`: realize the dependency closure of a project (package_closure.pull)
+`mach dep pull`: realize the dependency closure of a project (package_pull.project_closure)
 
 a: owns what the pull allocates
 root: the project root directory
