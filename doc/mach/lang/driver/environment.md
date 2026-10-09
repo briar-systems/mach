@@ -64,14 +64,6 @@ pub fun entry_text(a: *A.Allocator, text: str) res[Entry, fail.Fail];
 
 a UTF-8 NAME=value entry in native units
 
-## fun compare_names
-
-```mach
-pub fun compare_names(left: *Unit, left_length: usize, right: *Unit, right_length: usize) res[i32, fail.Fail];
-```
-
-order two native names by the host's identity
-
 ## fun put_owned
 
 ```mach
@@ -88,12 +80,6 @@ pub fun put(values: *Environment, name: str, value: str, replace: bool) err[fail
 ```
 
 entries own both strings and use host identity before any overlay is applied
-
-## fun put_entry
-
-```mach
-pub fun put_entry(values: *Environment, entry: str, replace: bool) err[fail.Fail];
-```
 
 ## fun remove
 
