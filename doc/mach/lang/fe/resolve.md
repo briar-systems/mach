@@ -198,6 +198,8 @@ pub rec ModuleExports;
 pub rec ExportConstant;
 ```
 
+a constant an importer reads, whose per-tuple gate is the published declaration's, not this record's
+
 ## rec ParsedDefinition
 
 ```mach

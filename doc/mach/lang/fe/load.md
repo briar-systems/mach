@@ -42,7 +42,9 @@ pub rec Const;
 
 a public constant a module binds in its build frame, exported to the gates of its importers
 
-gated: it is bound under a gate, so a union build cannot read one value for every tuple
+gated: it is bound under a gate, so a union build cannot read one value for every tuple. the
+       load's copy of the `gated` the same site binds in the module's context, kept for the
+       refusal the load makes before any sema exists. sema reads the published declaration's
 
 ## def BindingKind
 
