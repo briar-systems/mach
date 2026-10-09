@@ -14,17 +14,25 @@ pub rec SemaResult;
 pub fun result_dnit(r: *SemaResult);
 ```
 
-## val EMBED_LEN_NONE
+## val INFERRED_LEN_NONE
 
 ```mach
-pub val EMBED_LEN_NONE: u64 = 0xFFFFFFFFFFFFFFFF
+pub val INFERRED_LEN_NONE: u64 = 0xFFFFFFFFFFFFFFFF
 ```
 
-## val EMBED_LEN_FAILED
+## val INFERRED_LEN_FAILED
 
 ```mach
-pub val EMBED_LEN_FAILED: u64 = 0xFFFFFFFFFFFFFFFE
+pub val INFERRED_LEN_FAILED: u64 = 0xFFFFFFFFFFFFFFFE
 ```
+
+## val INFERRED_LEN_NEEDS_LITERAL
+
+```mach
+pub val INFERRED_LEN_NEEDS_LITERAL: u64 = 0xFFFFFFFFFFFFFFFD
+```
+
+a `[_]T` annotation on a binding whose initializer is absent or not an array literal
 
 ## rec TypeExport
 

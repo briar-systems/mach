@@ -574,6 +574,30 @@ val a: [4]i64    = [4]i64{1, 2, 3, 4};
 val g: [2][2]i64 = [2][2]i64{[2]i64{1, 2}, [2]i64{3, 4}};
 ```
 
+### Inferred length `[_]T`
+
+`[_]T` leaves the length for an array literal to give. It is legal only
+where an array literal of known element count fixes it: the literal's own
+type spelling, and the annotation of a `val` or `var` initialized by one. The
+length is the literal's element count, the same count `array.literal_length`
+checks.
+
+```mach fragment
+val NAMES: [_]str = [_]str{"a", "b", "c"};   # [3]str
+val K:     [_]u8  = [2]u8{1, 2};              # [2]u8
+val GRID:  [_][2]u8 = [_][2]u8{[2]u8{1, 2}, [2]u8{3, 4}}; # [2][2]u8
+```
+
+Every other `[_]` is refused with `array.inferred_length`: a parameter, a field,
+a result, a `var` with no initializer, an initializer that is not an array
+literal, and a `[_]` nested in another type, whether as the element of an array
+(`[_][_]T`, `[3][_]T`), behind a pointer (`*[_]T`) or under a secret (`^[_]T`).
+Only the outermost length is inferred, since one literal counts only its own
+elements. An `#[embed]` declaration takes its length from the file instead (see
+[decorators.md](decorators.md#embedstr--compile-time-file-embedding)). The
+inferred type is an ordinary `[N]T`, so a generic body, a comptime `val` and a
+secret element type (`[_]^T`) behave as the written length would.
+
 **Constant indices are bounds-checked at compile time.** `N` is part of the
 type, so an index the compiler can fold must land in `[0, N)`:
 

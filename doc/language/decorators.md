@@ -881,8 +881,8 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   appear in an `embed` path. See
   [manifest.md](manifest.md#artifact-requirements).
 - The annotation must be `[_]u8` or `[N]u8`; the element type must be `u8`.
-  `[_]` is an inferred array length, legal **only** on an `#[embed]`
-  declaration — written anywhere else it is rejected (see
+  `[_]` is an inferred array length, which an `#[embed]` declaration takes from
+  the file and an array literal gives its own annotation (see
   [grammar.md](grammar.md#types)). A `[_]u8` embed can be asked for its own
   length: `$length_of(LOGO)` is its element count and `$size_of(LOGO)` its byte
   count, both folded at compile time (see
