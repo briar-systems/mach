@@ -27,13 +27,13 @@ pub fun out_of_range(to: type.TypeId, value: wide.Wide, negated: bool, bounds: t
 ## fun try_coerce_literal
 
 ```mach
-pub fun try_coerce_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type.TypeId) CoerceResult;
+pub fun try_coerce_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type.TypeId) res[CoerceResult, fail.Fail];
 ```
 
 ## fun probe_literal_range
 
 ```mach
-pub fun probe_literal_range(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type.TypeId) CoerceResult;
+pub fun probe_literal_range(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type.TypeId) res[CoerceResult, fail.Fail];
 ```
 
 ask whether a literal-shaped expression fits the integer range of `to` without
@@ -43,12 +43,12 @@ sign, and any other kind means the shape is not a literal or it fits
 sc: the semantic context
 eid: the expression to probe
 to: the integer type whose range is asked about
-ret: the probe result; never commits an expression type
+ret: the probe result, or the failure of a refused read; never commits an expression type
 
 ## fun is_untyped_int_literal
 
 ```mach
-pub fun is_untyped_int_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId) bool;
+pub fun is_untyped_int_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[bool, fail.Fail];
 ```
 
 whether an expression is built only from unsuffixed integer literals under the
@@ -56,7 +56,7 @@ operators a literal coerces through, so its exact value is still untyped
 
 sc: the semantic context
 eid: the expression to ask about
-ret: true when every leaf is an unsuffixed integer literal
+ret: true when every leaf is an unsuffixed integer literal, or the failure of a refused read
 
 ## fun fit_ct_int
 
