@@ -100,7 +100,7 @@ pub fun gate_probes[T](
 comptime_param: fun(*T, ast_id.ExprId) bool,
 each_loopvar: fun(*T, ast_id.ExprId) bool,
 field_loopvar: fun(*T, ast_id.ExprId) bool,
-field_type_operand: fun(*T, ast_id.ExprId) bool,
+field_type_operand: fun(*T, ast_id.ExprId) res[bool, fail.Fail],
 expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail]) GateProbes[T];
 ```
 
@@ -108,7 +108,7 @@ expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure
 
 ```mach
 pub fun gate_walk[T](a: *ast.Ast, source: str, obs: *T,
-action: fun(*T, ast_id.ExprId, *ast_expr.Expr) GateNodeVerdict,
+action: fun(*T, ast_id.ExprId, *ast_expr.Expr) res[GateNodeVerdict, fail.Fail],
 expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail],
 eid: ast_id.ExprId) res[bool, fail.Fail];
 ```
