@@ -19,7 +19,9 @@ use std_format: std.format;
 use std.process.env;
 use std.process.events;
 use std.process.exec;
-use rt_native:   std.runtime.native;
+use rt_native: std.runtime.native;
+use std.runtime.native.view.NativeName;
+use std.runtime.native.view.Unit;
 use sync_cancel: std.sync.cancel;
 use system_os:   std.system.os;
 use std.text.string.str_dup;
@@ -547,12 +549,8 @@ pub fun spawn(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, e
     redirect.cwd     = options.cwd;
     redirect.stdin   = options.stdin;
     redirect.grouped = options.grouped;
-    if (!str_empty(options.capture)) {
-        val opened: err[Error] = capture_open(a, p, pathname, options);
-        if (sel opened.err) { ret spawn_refused(a, p, opened.err); }
-        redirect.stdout = p.capture.file.handle.value;
-        if (options.capture_stderr) { redirect.stderr = redirect.stdout; }
-    }
+    val opened: err[Error] = spawn_capture(a, p, pathname, options, ?redirect.stdout, ?redirect.stderr);
+    if (sel opened.err) { ret spawn_refused(a, p, opened.err); }
 
     val cr: res[SpawnCopy, Error] = prepare_spawn_copy(a, pathname, argv, envp);
     if (sel cr.err) { ret spawn_refused(a, p, cr.err); }
@@ -564,6 +562,118 @@ pub fun spawn(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, e
         ret spawn_refused(a, p, failure(pathname, Cause.exec{sr.err}));
     }
     p.pathname = c.pathname;
+    observe_spawn(p, sr.ok);
+    ret err[Error].ok{};
+}
+
+# open the capture `options` asks for and point the child's stdout, and stderr
+# when asked, at it
+fun spawn_capture(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, options: SpawnOptions, stdout: *usize, stderr: *usize) err[Error] {
+    if (str_empty(options.capture)) { ret err[Error].ok{}; }
+    val opened: err[Error] = capture_open(a, p, pathname, options);
+    if (sel opened.err) { ret opened; }
+    @stdout = p.capture.file.handle.value;
+    if (options.capture_stderr) { @stderr = @stdout; }
+    ret err[Error].ok{};
+}
+
+# `text` in native units, a refusal named by `identity`
+fun native_copy(a: *A.Allocator, identity: str, text: str) res[NativeName, Error] {
+    val cr: res[NativeName, host.NativeTextError] = host.native_text(a, text);
+    if (sel cr.err) {
+        if (sel cr.err.alloc) { ret res[NativeName, Error].err{failure(identity, Cause.alloc{cr.err.alloc})}; }
+        ret res[NativeName, Error].err{failure(identity, Cause.native{cr.err.native})};
+    }
+    ret res[NativeName, Error].ok{cr.ok};
+}
+
+# release the first `filled` of a list of `count` native arguments, and the list
+fun native_list_free(a: *A.Allocator, list: **Unit, filled: usize, count: usize) {
+    var i: usize = 0;
+    for (i < filled) {
+        var name: NativeName = NativeName{units: list[i], length: native_length(list[i])};
+        host.native_text_free(a, ?name);
+        i = i + 1;
+    }
+    A.deallocate[*Unit](a, list, count + 1);
+}
+
+fun native_length(units: *Unit) usize {
+    var n: usize = 0;
+    for (units[n] != 0) { n = n + 1; }
+    ret n;
+}
+
+# the arguments of a native spawn, each converted, nil-terminated
+fun native_argv(a: *A.Allocator, pathname: str, argv: **u8) res[**Unit, Error] {
+    val n:  usize                = cstr_count(argv);
+    val ar: res[**Unit, A.Error] = A.allocate[*Unit](a, n + 1);
+    if (sel ar.err) { ret res[**Unit, Error].err{failure(pathname, Cause.alloc{ar.err})}; }
+    val out: **Unit = ar.ok;
+    var i:   usize  = 0;
+    for (i < n) {
+        val cr: res[NativeName, Error] = native_copy(a, pathname, argv[i]::str);
+        if (sel cr.err) {
+            native_list_free(a, out, i, n);
+            ret res[**Unit, Error].err{cr.err};
+        }
+        out[i] = cr.ok.units;
+        i      = i + 1;
+    }
+    out[n] = nil;
+    ret res[**Unit, Error].ok{out};
+}
+
+# spawn with the child's environment in native units, so an inherited variable
+# with no UTF-8 spelling reaches it unit for unit. the pathname, argv and
+# working directory are UTF-8 as spawn takes them, converted once; the
+# environment is read only during the call. everything else is as spawn
+# ---
+# envp: the child's environment, given native entries or this process's inherited
+pub fun spawn_native(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: exec.NativeEnvironment,
+    options: SpawnOptions) err[Error] {
+    if (!begin_spawn(p)) { ret err[Error].err{failure(owner_identity(p), Cause.attempted{})}; }
+    var redirect: exec.NativeSpawnOptions = exec.native_spawn_options();
+    redirect.stdin   = options.stdin;
+    redirect.grouped = options.grouped;
+    val opened: err[Error] = spawn_capture(a, p, pathname, options, ?redirect.stdout, ?redirect.stderr);
+    if (sel opened.err) { ret spawn_refused(a, p, opened.err); }
+
+    val identity_r: res[*u8, Error] = dup_cstr(a, pathname::*u8);
+    if (sel identity_r.err) { ret spawn_refused(a, p, identity_r.err); }
+    val identity:  *u8                    = identity_r.ok;
+    val program_r: res[NativeName, Error] = native_copy(a, pathname, pathname);
+    if (sel program_r.err) {
+        free_cstr(a, identity);
+        ret spawn_refused(a, p, program_r.err);
+    }
+    var program: NativeName             = program_r.ok;
+    val cwd_r:   res[NativeName, Error] = native_copy(a, pathname, options.cwd);
+    if (sel cwd_r.err) {
+        host.native_text_free(a, ?program);
+        free_cstr(a, identity);
+        ret spawn_refused(a, p, cwd_r.err);
+    }
+    var cwd: NativeName = cwd_r.ok;
+    redirect.cwd = cwd.units;
+    val argv_r: res[**Unit, Error] = native_argv(a, pathname, argv);
+    if (sel argv_r.err) {
+        host.native_text_free(a, ?cwd);
+        host.native_text_free(a, ?program);
+        free_cstr(a, identity);
+        ret spawn_refused(a, p, argv_r.err);
+    }
+    val native_argv_list: **Unit                      = argv_r.ok;
+    val sr:               res[exec.Child, exec.Error] = exec.spawn_native_with_options(program.units, native_argv_list, envp, redirect);
+    val count:            usize                       = cstr_count(argv);
+    native_list_free(a, native_argv_list, count, count);
+    host.native_text_free(a, ?cwd);
+    host.native_text_free(a, ?program);
+    if (sel sr.err) {
+        free_cstr(a, identity);
+        ret spawn_refused(a, p, failure(pathname, Cause.exec{sr.err}));
+    }
+    p.pathname = identity;
     observe_spawn(p, sr.ok);
     ret err[Error].ok{};
 }
@@ -1785,7 +1895,7 @@ $if ($mach.build.os == $mach.os.windows) {
     ext fun SetEnvironmentVariableW(name: *u16, value: *u16) i32;
 
     #[testing]
-    fun t_wide(text: str, out: *u16) {
+    pub fun t_wide(text: str, out: *u16) {
         var i: usize = 0;
         for (text[i] != 0) {
             out[i] = text[i]::u16;
@@ -1806,43 +1916,74 @@ $if ($mach.build.os == $mach.os.windows) {
         out[n::usize] = 0;
         ret true;
     }
+
+    # set `name` to a\ud800b, a value with no UTF-8 spelling, or with `marker`
+    # to 1 as well, which tells a test run again as a child apart. the native
+    # capture is taken at first use, so this runs before anything reads it
+    #[testing]
+    pub fun t_set_unspellable(name: str, marker: str) bool {
+        var wide: [32]u16;
+        t_wide(name, ?wide[0]);
+        var value: [4]u16;
+        value[0] = 'a'::u16;
+        value[1] = 0xd800;
+        value[2] = 'b'::u16;
+        value[3] = 0;
+        if (SetEnvironmentVariableW(?wide[0], ?value[0]) == 0) { ret false; }
+        if (marker == nil)                                     { ret true; }
+        var on: [2]u16;
+        t_wide("1", ?on[0]);
+        t_wide(marker, ?wide[0]);
+        ret SetEnvironmentVariableW(?wide[0], ?on[0]) != 0;
+    }
+
+    # whether `name` is set, read natively
+    #[testing]
+    pub fun t_is_set(name: str) bool {
+        var wide: [32]u16;
+        t_wide(name, ?wide[0]);
+        var got:  [8]u16;
+        val read: res[opt[usize], env.EnvError] = env.get_native(?wide[0], ?got[0], 8);
+        ret sel read.ok && sel read.ok.some;
+    }
+
+    # whether `name` holds a\ud800b unit for unit
+    #[testing]
+    pub fun t_holds_unspellable(name: str) bool {
+        var wide: [32]u16;
+        t_wide(name, ?wide[0]);
+        var got:  [8]u16;
+        val read: res[opt[usize], env.EnvError] = env.get_native(?wide[0], ?got[0], 8);
+        if (!sel read.ok)      { ret false; }
+        if (!sel read.ok.some) { ret false; }
+        if (read.ok.some != 3) { ret false; }
+        ret got[0] == 'a'::u16 && got[1] == 0xd800 && got[2] == 'b'::u16;
+    }
+
+    # this test process and its test index, as argv for running it again
+    #[testing]
+    pub fun t_self_argv(exe: *u8, exe_capacity: usize, index: *u8, index_capacity: usize, argv: **u8) bool {
+        if (!t_own_arg(0, exe, exe_capacity) || !t_own_arg(1, index, index_capacity)) { ret false; }
+        argv[0] = exe;
+        argv[1] = index;
+        argv[2] = nil;
+        ret true;
+    }
 }
 
 # an inheriting child receives a variable with no UTF-8 spelling unit for unit.
 # the test runs itself again as that child, which a marker variable tells apart
 test spawn__an_inheriting_child_receives_an_unspellable_variable_unchanged {
     $if ($mach.build.os == $mach.os.windows) {
-        var name: [6]u16;
-        t_wide("M4707", ?name[0]);
-        var marker: [7]u16;
-        t_wide("M4707C", ?marker[0]);
-        var got:   [8]u16;
-        val probe: res[opt[usize], env.EnvError] = env.get_native(?marker[0], ?got[0], 8);
-        if (sel probe.ok && sel probe.ok.some) {
-            val read: res[opt[usize], env.EnvError] = env.get_native(?name[0], ?got[0], 8);
-            if (!sel read.ok)                                                 { ret 20; }
-            if (!sel read.ok.some)                                            { ret 21; }
-            if (read.ok.some != 3)                                            { ret 21; }
-            if (got[0] != 'a'::u16 || got[1] != 0xd800 || got[2] != 'b'::u16) { ret 22; }
+        if (t_is_set("M4707C")) {
+            if (!t_holds_unspellable("M4707")) { ret 20; }
             ret 0;
         }
-
-        var value: [4]u16;
-        value[0] = 'a'::u16;
-        value[1] = 0xd800;
-        value[2] = 'b'::u16;
-        value[3] = 0;
-        var on: [2]u16;
-        t_wide("1", ?on[0]);
-        if (SetEnvironmentVariableW(?name[0], ?value[0]) == 0) { ret 1; }
-        if (SetEnvironmentVariableW(?marker[0], ?on[0]) == 0)  { ret 1; }
+        if (!t_set_unspellable("M4707", "M4707C")) { ret 1; }
         var exe:   [1024]u8;
         var index: [32]u8;
-        if (!t_own_arg(0, ?exe[0], 1024) || !t_own_arg(1, ?index[0], 32)) { ret 2; }
-        var argv: [3]*u8;
-        argv[0] = ?exe[0];
-        argv[1] = ?index[0];
-        argv[2] = nil;
+        var argv:  [3]*u8;
+        if (!t_self_argv(?exe[0], 1024, ?index[0], 32, ?argv[0])) { ret 2; }
         var alloc:  A.Allocator;
         val make_r: err[A.Error] = page.make(?alloc);
         if (sel make_r.err) { ret 3; }
@@ -1855,8 +1996,6 @@ test spawn__an_inheriting_child_receives_an_unspellable_variable_unchanged {
         }
         val wr: res[SubprocessTerminal, Error] = wait(?alloc, ?p);
         dnit(?alloc, ?p);
-        SetEnvironmentVariableW(?name[0], nil);
-        SetEnvironmentVariableW(?marker[0], nil);
         if (sel wr.err)                                    { ret 5; }
         if (wr.ok.kind != STATE_EXITED || wr.ok.code != 0) { ret 6; }
         ret 0;
