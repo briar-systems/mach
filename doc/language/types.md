@@ -585,13 +585,15 @@ checks.
 ```mach fragment
 val NAMES: [_]str = [_]str{"a", "b", "c"};   # [3]str
 val K:     [_]u8  = [2]u8{1, 2};              # [2]u8
+val S:     ^[_]u8 = [2]u8{1, 2};              # ^[2]u8
 val GRID:  [_][2]u8 = [_][2]u8{[2]u8{1, 2}, [2]u8{3, 4}}; # [2][2]u8
 ```
 
 Every other `[_]` is refused with `array.inferred_length`: a parameter, a field,
 a result, a `var` with no initializer, an initializer that is not an array
 literal, and a `[_]` nested in another type, whether as the element of an array
-(`[_][_]T`, `[3][_]T`), behind a pointer (`*[_]T`) or under a secret (`^[_]T`).
+(`[_][_]T`, `[3][_]T`) or behind a pointer (`*[_]T`). A `val` or `var`
+annotation may wrap the `[_]` in a secret (`^[_]T`), since an array length is public.
 Only the outermost length is inferred, since one literal counts only its own
 elements. An `#[embed]` declaration takes its length from the file instead (see
 [decorators.md](decorators.md#embedstr--compile-time-file-embedding)). The
