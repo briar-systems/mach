@@ -58,6 +58,31 @@ fun first(k: Key) ^u8 {
 }
 ```
 
+A window keeps the secret of what it reads. `x[start, n]` over a secret array
+`^[N]T` is the secret array `^[n]T`, as a window over a secret vector is a
+secret vector, so `$is_secret` gives a window the same answer it gives the
+whole value. The checker and constant evaluation type a window with the same
+rule.
+
+A secret array `^[N]T` coerces to the array of secrets `[N]^T` with no syntax,
+and does so at every array level (`^[N][M]T` to `[N]^[M]T` or `[N][M]^T`).
+Each element stays secret, so nothing is declassified. The coercion only moves
+the secret inward: `[N]^T` lifts to `^[N]T` only by the usual public-to-secret
+lift, which needs it to fit `[N]T` and so never applies, and no coercion
+reaches the public `[N]T`:
+
+```mach
+val K: ^[_]u8 = [2]u8{1, 2};
+
+fun main() i32 {
+    val q:    ^[2]u8 = K[0, 2]; # the window's own type
+    val s:    [2]^u8 = K[0, 2]; # fine: every element stays secret
+    val last: u8     = q[1]:>u8;
+    val head: u8     = s[0]:>u8;
+    ret last::i32 + head::i32 - 3;
+}
+```
+
 Taking the address of a `^T` value with `?` gives the public pointer `*^T` (the
 address is public, the pointee secret), and dereferencing it with `@` recovers
 the secret `^T`.
