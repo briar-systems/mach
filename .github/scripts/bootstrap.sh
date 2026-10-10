@@ -2,7 +2,8 @@
 # walks the bootstrap chain (.github/bootstrap-chain) and builds this compiler
 # from its last step: that step builds a, a builds b, and --fixpoint adds c and
 # requires b == c.
-# the last stage is exported to later steps as MACH.
+# contract: reads RUNNER_OS and RUNNER_TEMP from the runner, and writes
+# MACH=<absolute path of the last stage> to GITHUB_ENV for later steps.
 #
 # usage: bootstrap.sh [--fixpoint] [--profile <name>]
 set -euo pipefail
