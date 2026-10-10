@@ -367,6 +367,33 @@ pub fun machine_of(sc: *SemaContext) layout.Machine;
 pub fun report(sc: *SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, message: str);
 ```
 
+## fun refuse_nesting
+
+```mach
+pub fun refuse_nesting(sc: *SemaContext, span: lang_source.Span);
+```
+
+the walkers recurse as deep as the input nests, on frames larger than the parser's, so
+each asks for stack before it descends and refuses the node it stands on. a silent walk
+refuses aloud too: the nesting stops every walk alike, so no probe may read it as an answer
+
+## fun refuse_nesting_in
+
+```mach
+pub fun refuse_nesting_in(sc: *SemaContext, at: lang_source.Location);
+```
+
+the same refusal of a node in another module's syntax, which a walk across modules meets
+
+## fun refuse
+
+```mach
+pub fun refuse(sc: *SemaContext, span: lang_source.Span, f: fail.Fail);
+```
+
+a failure a walker without a diagnostic store returned, reported against `span`: a
+refusal of the input under its own kind, any other failure as internal
+
 ## fun check_handle_in_array
 
 ```mach

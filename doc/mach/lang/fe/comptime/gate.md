@@ -48,8 +48,20 @@ pub val GATE_AWAITING_INSTANCE: GateOutcome = 5
 ## fun comptime_if_declares_nothing
 
 ```mach
-pub fun comptime_if_declares_nothing(a: *ast.Ast, branches_start: u32, branches_len: u32) bool;
+pub fun comptime_if_declares_nothing(a: *ast.Ast, branches_start: u32, branches_len: u32) res[bool, fail.Fail];
 ```
+
+whether every arm of a chain, at any depth, declares nothing but directives and chains; a
+chain nested deeper than the stack lets the walk descend is refused (`nesting`)
+
+## fun nesting
+
+```mach
+pub fun nesting() fail.Fail;
+```
+
+the refusal of a walk over nesting deeper than the stack lets it descend, which the phase
+that asked reports against the node it asked about
 
 ## def GateProbe
 

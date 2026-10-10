@@ -49,7 +49,9 @@ pub fun declares_tests(a: *ast.Ast) bool;
 ```
 
 the module has a test object: its source declares a test or a `#[testing]`
-declaration, in any comptime branch
+declaration, in any comptime branch. the declaration lists of the module and of
+every branch of a declaring chain are the only lists the declaration pool holds,
+so one pass over the pool reads every branch at any depth without descending
 
 ## fun synthesize_dispatcher
 
