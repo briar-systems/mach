@@ -6,7 +6,13 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.option.opt;
 use std.types.result.res;
+use std.types.size.usize;
 
+use A:                  std.allocator;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+
+use lang_alloc: mach.lang.alloc;
 use mach.lang.fail;
 use mach.lang.type;
 
@@ -47,57 +53,145 @@ pub rec Walk[C] {
     types:  *type.TypeInterner;
     status: *fail.PhaseStatus;
     # the aggregates already entered; nil enters each every time it is met
-    scan:  *type.TypeScan;
+    scan: *type.TypeScan;
+    # with a scan, every type is entered once, not only an aggregate: for a property whose
+    # answer below a type does not depend on the path the walk took to it, so a scan shared
+    # across many roots visits each type once in all
+    once:  bool;
     edges: Edges;
     ctx:   *C;
     leaf:  fun(*C, type.TypeId, *type.Type) Verdict;
 }
 
-# whether the property holds at `tid` or below it; false once the walk has failed
+# whether the property holds at `tid` or below it; false once the walk has failed. the walk
+# keeps what it has yet to visit on a worklist rather than the stack, in the order a recursive
+# walk would visit it, so a type nested through flat defs deeper than any stack is still answered
 pub fun reaches[C](w: *Walk[C], tid: type.TypeId) bool {
+    var work: Vector[Pending] = collections_vector.init[Pending](w.types.a);
+    fin { collections_vector.dnit[Pending](?work); }
+    var next: Pending = Pending{kind: PENDING_TYPE, ty: tid};
+    for {
+        if (sel w.status.kind.internal) { ret false; }
+        val at: opt[type.TypeId] = pending_type[C](w, ?work, next);
+        if (sel at.some) {
+            val found: bool = step[C](w, ?work, at.some);
+            if (found) { ret true; }
+        }
+        val popped: opt[Pending] = collections_vector.pop[Pending](?work);
+        if (sel popped.none) { ret false; }
+        next = popped.some;
+    }
+}
+
+# what the walk has yet to visit: a type, a parameter by its pool index, an aggregate's field
+# table to open, or one of its fields by index. a parameter or field is read only when its turn
+# comes, as a recursive walk would read it
+def PendingKind: u8;
+
+val PENDING_TYPE:   PendingKind = 0;
+val PENDING_PARAM:  PendingKind = 1;
+val PENDING_FIELDS: PendingKind = 2;
+val PENDING_FIELD:  PendingKind = 3;
+
+rec Pending {
+    kind:  PendingKind;
+    ty:    type.TypeId;
+    index: u32;
+}
+
+# the type `p` names, none for a table opened onto the worklist or a failure recorded
+fun pending_type[C](w: *Walk[C], work: *Vector[Pending], p: Pending) opt[type.TypeId] {
+    if (p.kind == PENDING_TYPE) { ret opt[type.TypeId].some{p.ty}; }
+    if (p.kind == PENDING_PARAM) {
+        val param: opt[type.TypeId] = type.get_param(w.types, p.index);
+        if (sel param.none) { fail.internal(w.status, "type walk: a parameter list runs past the store"); }
+        ret param;
+    }
+    if (p.kind == PENDING_FIELDS) {
+        val table: opt[*type.FieldTable] = type.field_table_for(w.types, p.ty);
+        if (!sel table.some) {
+            fail.internal(w.status, "type walk: an aggregate it entered has no field table");
+            ret opt[type.TypeId].none{};
+        }
+        var f: u32 = table.some.fields_len;
+        for (f > 0) {
+            f = f - 1;
+            if (!pend[C](w, work, Pending{kind: PENDING_FIELD, ty: p.ty, index: f})) { ret opt[type.TypeId].none{}; }
+        }
+        ret opt[type.TypeId].none{};
+    }
+    val entry: opt[*type.FieldEntry] = type.field_at(w.types, p.ty, p.index);
+    if (!sel entry.some) {
+        fail.internal(w.status, "type walk: a field table is shorter than it says");
+        ret opt[type.TypeId].none{};
+    }
+    ret opt[type.TypeId].some{entry.some.ty};
+}
+
+fun pend[C](w: *Walk[C], work: *Vector[Pending], p: Pending) bool {
+    val pushed: res[usize, A.Error] = collections_vector.push[Pending](work, p);
+    if (sel pushed.err) {
+        fail.internal(w.status, lang_alloc.text(pushed.err));
+        ret false;
+    }
+    ret true;
+}
+
+# the parameters of the pool from `start`, pended so the first is visited first
+fun pend_params[C](w: *Walk[C], work: *Vector[Pending], start: u32, len: u32) bool {
+    var i: u32 = len;
+    for (i > 0) {
+        i = i - 1;
+        if (!pend[C](w, work, Pending{kind: PENDING_PARAM, index: start + i})) { ret false; }
+    }
+    ret true;
+}
+
+# whether the property is at `tid`; when it may lie below, the edges the walk follows are
+# pended so they are visited in order
+fun step[C](w: *Walk[C], work: *Vector[Pending], tid: type.TypeId) bool {
     if (type.is_nil(tid) || type.is_error(tid)) { ret false; }
-    if (sel w.status.kind.internal)             { ret false; }
     val found: opt[*type.Type] = type.get(w.types, tid);
     if (!sel found.some) {
         fail.internal(w.status, "type walk: the store holds no such type id");
         ret false;
     }
+    if (w.once && !entered[C](w, tid)) { ret false; }
     val t:       *type.Type = found.some;
     val verdict: Verdict    = w.leaf(w.ctx, tid, t);
     if (verdict == FOUND) { ret true; }
     if (verdict == PRUNE) { ret false; }
-    ret children_reach[C](w, tid, t);
+    pend_children[C](w, work, tid, t);
+    ret false;
 }
 
 fun follows[C](w: *Walk[C], e: Edges) bool {
     ret (w.edges & e) != 0;
 }
 
-fun children_reach[C](w: *Walk[C], tid: type.TypeId, t: *type.Type) bool {
+fun pend_children[C](w: *Walk[C], work: *Vector[Pending], tid: type.TypeId, t: *type.Type) {
     val k: type.TypeKind = t.kind;
-    if (k == type.TYPE_SECRET && follows[C](w, EDGE_BASE))     { ret reaches[C](w, t.data.secret.base); }
-    if (k == type.TYPE_ARRAY && follows[C](w, EDGE_ELEMENT))   { ret reaches[C](w, t.data.array.base); }
-    if (k == type.TYPE_POINTER && follows[C](w, EDGE_POINTEE)) { ret reaches[C](w, t.data.pointer.base); }
+    if (k == type.TYPE_SECRET && follows[C](w, EDGE_BASE))     { pend[C](w, work, Pending{kind: PENDING_TYPE, ty: t.data.secret.base}); }
+    if (k == type.TYPE_ARRAY && follows[C](w, EDGE_ELEMENT))   { pend[C](w, work, Pending{kind: PENDING_TYPE, ty: t.data.array.base}); }
+    if (k == type.TYPE_POINTER && follows[C](w, EDGE_POINTEE)) { pend[C](w, work, Pending{kind: PENDING_TYPE, ty: t.data.pointer.base}); }
     if (k == type.TYPE_FUN && follows[C](w, EDGE_SIGNATURE)) {
-        if (reaches[C](w, t.data.fn.ret_type)) { ret true; }
-        ret params_reach[C](w, t.data.fn.params_start, t.data.fn.params_len);
+        if (!pend_params[C](w, work, t.data.fn.params_start, t.data.fn.params_len)) { ret; }
+        pend[C](w, work, Pending{kind: PENDING_TYPE, ty: t.data.fn.ret_type});
     }
     if (k == type.TYPE_INSTANCE) {
         val by_args:   bool = follows[C](w, EDGE_ARGUMENT);
         val by_decl:   bool = follows[C](w, EDGE_DECLARATION);
         val by_fields: bool = follows[C](w, EDGE_INSTANCE_FIELD);
-        if (!by_args && !by_decl && !by_fields)                                                  { ret false; }
-        if (!entered[C](w, tid))                                                                 { ret false; }
-        if (by_args && params_reach[C](w, t.data.instance.args_start, t.data.instance.args_len)) { ret true; }
-        if (by_decl && reaches[C](w, t.data.instance.nominal))                                   { ret true; }
-        if (by_fields)                                                                           { ret fields_reach[C](w, tid); }
-        ret false;
+        if (!by_args && !by_decl && !by_fields)                                                     { ret; }
+        if (!w.once && !entered[C](w, tid))                                                         { ret; }
+        if (by_fields && !pend[C](w, work, Pending{kind: PENDING_FIELDS, ty: tid}))                 { ret; }
+        if (by_decl && !pend[C](w, work, Pending{kind: PENDING_TYPE, ty: t.data.instance.nominal})) { ret; }
+        if (by_args)                                                                                { pend_params[C](w, work, t.data.instance.args_start, t.data.instance.args_len); }
     }
     if ((k == type.TYPE_REC || k == type.TYPE_UNI || k == type.TYPE_TAG) && follows[C](w, EDGE_FIELD)) {
-        if (!entered[C](w, tid)) { ret false; }
-        ret fields_reach[C](w, tid);
+        if (!w.once && !entered[C](w, tid)) { ret; }
+        pend[C](w, work, Pending{kind: PENDING_FIELDS, ty: tid});
     }
-    ret false;
 }
 
 # whether this is the first time the walk enters aggregate `tid`
@@ -109,38 +203,4 @@ fun entered[C](w: *Walk[C], tid: type.TypeId) bool {
         ret false;
     }
     ret mark.ok == type.VISIT_FRESH;
-}
-
-fun params_reach[C](w: *Walk[C], start: u32, len: u32) bool {
-    var i: u32 = 0;
-    for (i < len) {
-        val p: opt[type.TypeId] = type.get_param(w.types, start + i);
-        if (!sel p.some) {
-            fail.internal(w.status, "type walk: a parameter list runs past the store");
-            ret false;
-        }
-        if (reaches[C](w, p.some)) { ret true; }
-        i = i + 1;
-    }
-    ret false;
-}
-
-fun fields_reach[C](w: *Walk[C], tid: type.TypeId) bool {
-    val table: opt[*type.FieldTable] = type.field_table_for(w.types, tid);
-    if (!sel table.some) {
-        fail.internal(w.status, "type walk: an aggregate it entered has no field table");
-        ret false;
-    }
-    val n: u32 = table.some.fields_len;
-    var f: u32 = 0;
-    for (f < n) {
-        val entry: opt[*type.FieldEntry] = type.field_at(w.types, tid, f);
-        if (!sel entry.some) {
-            fail.internal(w.status, "type walk: a field table is shorter than it says");
-            ret false;
-        }
-        if (reaches[C](w, entry.some.ty)) { ret true; }
-        f = f + 1;
-    }
-    ret false;
 }
