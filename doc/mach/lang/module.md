@@ -76,3 +76,11 @@ pub fun stable_same(left: StableModuleId, right: StableModuleId) bool;
 pub fun stable_is_nil(m: StableModuleId) bool;
 ```
 
+## fun compose_fqn
+
+```mach
+pub fun compose_fqn(alloc: *A.Allocator, itn: *intern.Interner, id_text: str, rel_text: str) res[intern.StrId, fail.Fail];
+```
+
+the module name of a source path under a package: the id, then the path without its suffix, its separators dotted
+

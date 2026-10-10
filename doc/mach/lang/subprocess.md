@@ -217,6 +217,20 @@ envp: the child's environment, given entries or this process's inherited
 options: directory, stdin, grouping and capture (see SpawnOptions)
 ret: nothing, or the refusal named by the pathname
 
+## fun spawn_native
+
+```mach
+pub fun spawn_native(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: exec.NativeEnvironment,
+options: SpawnOptions) err[Error];
+```
+
+spawn with the child's environment in native units, so an inherited variable
+with no UTF-8 spelling reaches it unit for unit. the pathname, argv and
+working directory are UTF-8 as spawn takes them, converted once; the
+environment is read only during the call. everything else is as spawn
+
+envp: the child's environment, given native entries or this process's inherited
+
 ## fun wait
 
 ```mach
