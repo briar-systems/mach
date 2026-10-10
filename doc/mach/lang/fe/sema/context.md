@@ -90,6 +90,20 @@ pub rec UniReports;
 pub fun uni_report_mark(ur: *UniReports, key: type.TypeId) bool;
 ```
 
+## rec SecrecyWalk
+
+```mach
+pub rec SecrecyWalk;
+```
+
+the walk the union-secrecy checks of every annotation in one scope share, under the one
+substitution the scope is typed with, so a type several annotations reach is walked once
+
+nominals: the nominals already walked, each by the instantiation that keys it
+walked: the types already walked, each paired with the nominal instantiation whose
+          arguments it was walked under, or nil for the scope's own substitution
+visits: how many types the walk has visited
+
 ## rec Guard
 
 ```mach
@@ -155,6 +169,7 @@ quiet: a value or non-generic pack instance retypes what its template already
 site: where the instance was asked for, while `site_set`
 subst: the type arguments that replace the parameters of `subst_owner`, position
             for position; a parameter of any other declaration is left alone
+secrecy: the union-secrecy walk the instance's annotations share; nil outside one
 
 ## rec Walk
 
