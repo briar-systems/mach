@@ -8,6 +8,10 @@ a generic's body under type arguments: substitution, and the field table an inst
 pub fun apply(q: *type_query.Query, body_type: type.TypeId, who: *type.GenericOwner, args: *type.TypeId, arg_count: u32) type.TypeId;
 ```
 
+`body_type` with `who`'s parameters replaced by `args`. the walk recurses as deep as the type
+nests, so it asks for stack before it descends, and a type nested deeper refuses the query
+(`type_query.descend`) and reads as the error type
+
 ## fun ensure
 
 ```mach

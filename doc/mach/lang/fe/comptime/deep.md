@@ -245,7 +245,10 @@ the first leaf under `node` that has no compile-time value, none when every leaf
 pub fun clone(to: *Store, from: *Store, node: u32) res[u32, fail.Fail];
 ```
 
-node `node` of `from` with everything under it, added to `to`, which is another store
+node `node` of `from` with everything under it, added to `to`, which is another store. the
+copy recurses as deep as the value nests, so it asks for stack before it descends and refuses
+a value nested deeper (`nesting`), which the node that asked reports. a failure leaves `to`
+as it was
 
 ## val ZERO_UNKNOWN_MSG
 
@@ -273,15 +276,6 @@ It is built the first time it is asked for and shared by every later reader, so 
 most one tree per distinct type. Nothing writes a node once its members are linked, which is
 what makes the sharing safe. The tag's field table must be ready, and a tag with no cases is
 an internal failure. A failure leaves `s` as it was.
-
-## fun zero_read
-
-```mach
-pub fun zero_read(s: *Store, types: *type.TypeInterner, itn: *intern.Interner, pointer_width: u32, module: u32, ty: type.TypeId) res[comptime_value.CTValue, comptime_failure.EvalFail];
-```
-
-the zero of `ty` as a value of module `module`'s store `s`: a scalar's value, or the aggregate
-as a node of `s`
 
 ## val SCRATCH_MODULE
 

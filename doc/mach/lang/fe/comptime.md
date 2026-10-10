@@ -91,6 +91,14 @@ fwd comptime_failure.eval_from_fail
 
 forwards [`mach.lang.fe.comptime.failure.eval_from_fail`](comptime/failure.md#fun-eval_from_fail)
 
+## fwd comptime_failure.eval_from_refusal
+
+```mach
+fwd comptime_failure.eval_from_refusal
+```
+
+forwards [`mach.lang.fe.comptime.failure.eval_from_refusal`](comptime/failure.md#fun-eval_from_refusal)
+
 ## fwd comptime_value.CTKind
 
 ```mach

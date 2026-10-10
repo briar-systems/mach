@@ -816,8 +816,12 @@ pub fun strip_secret(ti: *TypeInterner, tid: TypeId) TypeId;
 ## fun mentions_generic_param
 
 ```mach
-pub fun mentions_generic_param(ti: *TypeInterner, tid: TypeId) bool;
+pub fun mentions_generic_param(ti: *TypeInterner, tid: TypeId) res[bool, fail.Fail];
 ```
+
+whether `tid` mentions a type parameter anywhere it is spelled. the walk keeps the types it
+has yet to visit on a worklist rather than the stack, so a type nested through flat defs
+deeper than any stack is still answered; a worklist that cannot grow is the failure
 
 ## fun shape_kind
 
@@ -837,14 +841,18 @@ pub fun is_u8(ti: *TypeInterner, tid: TypeId) bool;
 pub fun carries_secret(ti: *TypeInterner, tid: TypeId) bool;
 ```
 
+whether `tid` is secret or reaches a secret through pointers and array elements alone
+
 ## fun contains_secret
 
 ```mach
-pub fun contains_secret(ti: *TypeInterner, tid: TypeId) bool;
+pub fun contains_secret(ti: *TypeInterner, tid: TypeId) res[bool, fail.Fail];
 ```
 
 true when any byte of a value of this type may be secret: the type itself, an element, a field or a case
-payload; a pointer's pointee is not the object's storage and does not count
+payload; a pointer's pointee is not the object's storage and does not count. the walk keeps the
+fields it has yet to visit on a worklist, so a type nested deeper than any stack is still
+answered; a worklist that cannot grow is the failure
 
 ## fun type_scan_begin
 

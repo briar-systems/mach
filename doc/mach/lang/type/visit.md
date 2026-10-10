@@ -124,5 +124,7 @@ pub rec Walk[C];
 pub fun reaches[C](w: *Walk[C], tid: type.TypeId) bool;
 ```
 
-whether the property holds at `tid` or below it; false once the walk has failed
+whether the property holds at `tid` or below it; false once the walk has failed. the walk
+keeps what it has yet to visit on a worklist rather than the stack, in the order a recursive
+walk would visit it, so a type nested through flat defs deeper than any stack is still answered
 

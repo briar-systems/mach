@@ -568,11 +568,33 @@ a question to the type store whose internal failures land in this context
 pub fun recover[T](sc: *SemaContext, r: res[T, fail.Fail], recovery: T) T;
 ```
 
-## fun record_result
+the answer of a query that cannot refuse the input, or `recovery` once it failed, which
+fails the phase as internal
+
+## fun recover_at
 
 ```mach
-pub fun record_result(sc: *SemaContext, r: err[fail.Fail]);
+pub fun recover_at[T](sc: *SemaContext, span: lang_source.Span, r: res[T, fail.Fail], recovery: T) T;
 ```
+
+the answer of a query asked at `span`, or `recovery` once it failed: a refusal of the input
+is reported there, and any other failure fails the phase as internal
+
+## fun record_at
+
+```mach
+pub fun record_at(sc: *SemaContext, span: lang_source.Span, r: err[fail.Fail]);
+```
+
+the outcome of a query asked at `span` that answers nothing, reported as recover_at reports it
+
+## fun query_settle
+
+```mach
+pub fun query_settle(sc: *SemaContext, q: *type_query.Query, span: lang_source.Span);
+```
+
+a query built by query_of whose walk refused the input, reported at `span`
 
 ## fun record_eval_result
 

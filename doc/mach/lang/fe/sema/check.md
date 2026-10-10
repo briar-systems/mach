@@ -109,8 +109,13 @@ pub fun check_condition(sc: *sema_context.SemaContext, cond: type.TypeId, span: 
 ## fun byte_size
 
 ```mach
-pub fun byte_size(sc: *sema_context.SemaContext, t: type.TypeId) u32;
+pub fun byte_size(sc: *sema_context.SemaContext, t: type.TypeId, span: lang_source.Span) u32;
 ```
+
+the size of a value of `t`, 0 when it has none or does not fit 32 bits; an array is its
+element's size times every count above it, read in a loop, so an array nested through flat
+defs deeper than the stack still has its size. a measurement asked at `span` that refuses
+the input is reported there
 
 ## fun type_to_str
 
