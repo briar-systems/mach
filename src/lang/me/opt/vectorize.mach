@@ -750,7 +750,7 @@ fun vectorize_one(analyses: *analysis.Cache, m: *me_ir.Module, tgt: *resolved.Ta
     A.deallocate[bool](alloc, vset, vset_len::usize);
     if (sel rsp.err) { ret res[bool, fail.Fail].err{rsp.err}; }
 
-    val rss: err[fail.Fail] = scale_recurrence_steps(fn, flp, shape.lanes);
+    val rss: err[fail.Fail] = scale_recurrence_steps(m, fn, flp, shape.lanes);
     if (sel rss.err) { ret res[bool, fail.Fail].err{rss.err}; }
 
     val rbt: err[fail.Fail] = rewrite_lane_bound_test(m, fn, fast_header, iv_phi_val, shape.lanes, iv_ty, lane_bound, flp.counted.pred, fast_cmp);
@@ -1182,27 +1182,61 @@ fun latch_update(fn: *me_ir.Function, pid: ir_id.InstructionId, latch: ir_id.Blo
     ret ir_id.INSTR_NIL;
 }
 
-fun scale_recurrence_steps(fn: *me_ir.Function, lp: *loops.Loop, lanes: u32) err[fail.Fail] {
-    val hdr: *me_ir.Block = ?fn.blocks[lp.header::u32];
-    var pi:  u32          = 0;
-    for (pi < hdr.phi_count) {
-        val uid: ir_id.InstructionId = latch_update(fn, hdr.phis[pi], lp.latch);
-        if (ir_id.instruction_is_nil(uid)) { ret err[fail.Fail].err{fail.message("vectorize: loop recurrence has no latch update")}; }
-        val opt_: opt[*ir_instruction.Instruction] = me_ir.instruction_get(fn, uid);
-        if (sel opt_.none) { ret err[fail.Fail].err{fail.message("vectorize: loop recurrence update is missing")}; }
-        val upd:    *ir_instruction.Instruction = opt_.some;
-        var scaled: bool                        = false;
-        var si:     u32                         = 0;
-        for (si < upd.operand_count) {
-            if (upd.operands[si].kind == value.VAL_CONST_INT) {
-                upd.operands[si] = value.const_int(upd.operands[si].data.int_lit * lanes::u64, upd.operands[si].ty);
-                scaled           = true;
-            }
-            si = si + 1;
-        }
-        if (!scaled) { ret err[fail.Fail].err{fail.message("vectorize: loop recurrence has no constant step")}; }
+# every header recurrence of the vector loop steps `lanes` times as far
+fun scale_recurrence_steps(m: *me_ir.Module, fn: *me_ir.Function, lp: *loops.Loop, lanes: u32) err[fail.Fail] {
+    var pi: u32 = 0;
+    for (pi < fn.blocks[lp.header::u32].phi_count) {
+        val rs: err[fail.Fail] = step_by_lanes(m, fn, lp, fn.blocks[lp.header::u32].phis[pi], lanes);
+        if (sel rs.err) { ret rs; }
         pi = pi + 1;
     }
+    ret err[fail.Fail].ok{};
+}
+
+# header phi `pid` takes a new latch update, its scalar one with each constant
+# step `lanes` times as large, placed just after it. the scalar update stays
+# as it is for the body's own reads of it: an index `i + 1` that also steps `i`
+# still addresses one element on
+fun step_by_lanes(m: *me_ir.Module, fn: *me_ir.Function, lp: *loops.Loop, pid: ir_id.InstructionId, lanes: u32) err[fail.Fail] {
+    val uid: ir_id.InstructionId = latch_update(fn, pid, lp.latch);
+    if (ir_id.instruction_is_nil(uid)) { ret err[fail.Fail].err{fail.message("vectorize: loop recurrence has no latch update")}; }
+    val opt_: opt[*ir_instruction.Instruction] = me_ir.instruction_get(fn, uid);
+    if (sel opt_.none) { ret err[fail.Fail].err{fail.message("vectorize: loop recurrence update is missing")}; }
+    val upd: *ir_instruction.Instruction = opt_.some;
+    if (upd.operand_count != 2) { ret err[fail.Fail].err{fail.message("vectorize: loop recurrence update is not a two-operand step")}; }
+    var ops:    [2]value.Value;
+    var scaled: bool = false;
+    var si:     u32  = 0;
+    for (si < 2) {
+        ops[si] = upd.operands[si];
+        if (ops[si].kind == value.VAL_CONST_INT) {
+            ops[si] = value.const_int(ops[si].data.int_lit * lanes::u64, ops[si].ty);
+            scaled  = true;
+        }
+        si = si + 1;
+    }
+    if (!scaled) { ret err[fail.Fail].err{fail.message("vectorize: loop recurrence has no constant step")}; }
+
+    var at_blk: ir_id.BlockId = ir_id.BLOCK_NIL;
+    var bi:     u32           = 0;
+    for (bi < lp.body_len) {
+        if (block_holds_instr(?fn.blocks[lp.body[bi]::u32], uid)) { at_blk = lp.body[bi]; }
+        bi = bi + 1;
+    }
+    if (ir_id.block_is_nil(at_blk)) { ret err[fail.Fail].err{fail.message("vectorize: loop recurrence update is outside its loop")}; }
+
+    val kind:  ir_instruction.InstrKind = upd.kind;
+    val ty:    ir_type.IrTypeId         = upd.ty;
+    val aux:   ir_type.IrTypeId         = upd.aux_ty;
+    val flags: u16                      = upd.flags;
+    var b:     builder.Builder          = builder.init(m);
+    builder.set_function(?b, fn);
+    builder.at(?b, at_blk, block_index_of(?fn.blocks[at_blk::u32], uid) + 1);
+    builder.derive(?b, uid);
+    builder.set_flags(?b, flags);
+    val rn: res[ir_id.InstructionId, fail.Fail] = builder.emit_instr(?b, kind, ty, aux, ?ops[0], 2);
+    if (sel rn.err) { ret err[fail.Fail].err{rn.err}; }
+    set_phi_value(fn, lp.header, lp.latch, pid, value.instr(rn.ok, ty));
     ret err[fail.Fail].ok{};
 }
 
@@ -1699,7 +1733,6 @@ fun vectorize_reduction(m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Func
     val preheader: ir_id.BlockId            = lp.preheader;
     val exit:      ir_id.BlockId            = lp.exit;
     val iv_phi:    ir_id.InstructionId      = lp.iv.phi;
-    val iv_upd:    ir_id.InstructionId      = lp.iv.update;
     val iv_ty:     ir_type.IrTypeId         = lp.iv.init.ty;
     val cmp_id:    ir_id.InstructionId      = lp.counted.cmp;
     val orig_pred: ir_instruction.InstrKind = lp.counted.pred;
@@ -1880,7 +1913,8 @@ fun vectorize_reduction(m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Func
         if (sel rof.err) { ret res[bool, fail.Fail].err{rof.err}; }
     }
 
-    step_iv_by_lanes(fn, iv_upd, lanes, iv_ty);
+    val rsi: err[fail.Fail] = step_by_lanes(m, fn, lp, iv_phi, lanes);
+    if (sel rsi.err) { ret res[bool, fail.Fail].err{rsi.err}; }
 
     val rbt: err[fail.Fail] = rewrite_lane_bound_test(m, fn, header, value.instr(iv_phi, iv_ty), lanes, iv_ty, lane_bound, orig_pred, cmp_id);
     if (sel rbt.err) { ret res[bool, fail.Fail].err{rbt.err}; }
@@ -1973,18 +2007,6 @@ fun phi_index(blk: *me_ir.Block, pid: ir_id.InstructionId) u32 {
         i = i + 1;
     }
     ret 0;
-}
-
-fun step_iv_by_lanes(fn: *me_ir.Function, iv_upd: ir_id.InstructionId, lanes: u32, iv_ty: ir_type.IrTypeId) {
-    val opt_: opt[*ir_instruction.Instruction] = me_ir.instruction_get(fn, iv_upd);
-    if (sel opt_.some) {
-        val upd: *ir_instruction.Instruction = opt_.some;
-        var si:  u32                         = 0;
-        for (si < upd.operand_count) {
-            if (upd.operands[si].kind == value.VAL_CONST_INT) { upd.operands[si] = value.const_int(lanes::u64, iv_ty); }
-            si = si + 1;
-        }
-    }
 }
 
 fun build_accumulator_init(b: *builder.Builder, op: ir_instruction.InstrKind, acc_init: value.Value, acc_ty: ir_type.IrTypeId, is_float: bool, arr_ty: ir_type.IrTypeId, vec_ty: ir_type.IrTypeId, ord_ty: ir_type.IrTypeId, lanes: u32) res[value.Value, fail.Fail] {
@@ -2633,6 +2655,173 @@ test run__a_decline_leaves_the_function_untouched {
     }
 
     me_ir.dnit(?m);
+    ret code;
+}
+
+# the index `k * i + c` of the copy fixture: an index `i + 1` is the update
+# that steps i, as value numbering leaves it, and `i - c` a subtraction
+#[testing]
+fun t_offset_index(bld: *builder.Builder, iv: value.Value, upd: value.Value, k: u64, c: i64, i64t: ir_type.IrTypeId) res[value.Value, fail.Fail] {
+    var x: value.Value = iv;
+    if (k != 1) {
+        val rm: res[value.Value, fail.Fail] = builder.emit_mul(bld, iv, value.const_int(k, i64t));
+        if (sel rm.err) { ret rm; }
+        x = rm.ok;
+    }
+    or (c == 1) { ret res[value.Value, fail.Fail].ok{upd}; }
+    if (c > 0)  { ret builder.emit_add(bld, x, value.const_int(c::u64, i64t)); }
+    if (c < 0)  { ret builder.emit_sub(bld, x, value.const_int((0 - c)::u64, i64t)); }
+    ret res[value.Value, fail.Fail].ok{x};
+}
+
+# the offset from its loop's induction variable of the index of the vector
+# load, or store, and the step that variable takes, false when there is none
+#[testing]
+fun t_vector_offset(m: *me_ir.Module, fn: *me_ir.Function, store: bool, out_c: *i64, out_step: *u64) bool {
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val blk: *me_ir.Block = ?fn.blocks[bi];
+        var ii:  u32          = 0;
+        for (ii < blk.instr_count) {
+            val inst: *ir_instruction.Instruction = ?fn.instrs[blk.instructions[ii]::u32];
+            var ptr:  value.Value                 = value.const_int(0, ir_type.IRT_NIL);
+            if (store && inst.kind == ir_instruction.OP_STORE && ir_type.is_vector(?m.types, inst.operands[0].ty)) { ptr = inst.operands[1]; }
+            if (!store && inst.kind == ir_instruction.OP_LOAD && ir_type.is_vector(?m.types, inst.ty))             { ptr = inst.operands[0]; }
+            if (ptr.kind == value.VAL_INSTR) {
+                val gep: *ir_instruction.Instruction = ?fn.instrs[ptr.data.instr::u32];
+                val idx: value.Value                 = gep.operands[gep.operand_count - 1];
+                if (idx.kind != value.VAL_INSTR) { ret false; }
+                var phi: value.Value                 = idx;
+                var c:   i64                         = 0;
+                val ix:  *ir_instruction.Instruction = ?fn.instrs[idx.data.instr::u32];
+                if (ix.kind == ir_instruction.OP_ADD || ix.kind == ir_instruction.OP_SUB) {
+                    if (ix.operands[1].kind != value.VAL_CONST_INT) { ret false; }
+                    phi = ix.operands[0];
+                    c   = ix.operands[1].data.int_lit::i64;
+                    if (ix.kind == ir_instruction.OP_SUB) { c = 0 - c; }
+                }
+                if (phi.kind != value.VAL_INSTR || fn.instrs[phi.data.instr::u32].kind != ir_instruction.OP_PHI) { ret false; }
+                val p: *ir_instruction.Instruction = ?fn.instrs[phi.data.instr::u32];
+                var o: u32                         = 1;
+                for (o < p.operand_count) {
+                    val v: value.Value = p.operands[o];
+                    if (v.kind == value.VAL_INSTR && fn.instrs[v.data.instr::u32].kind == ir_instruction.OP_ADD) {
+                        val u: *ir_instruction.Instruction = ?fn.instrs[v.data.instr::u32];
+                        if (u.operands[0].kind == value.VAL_INSTR && ir_id.instruction_same(u.operands[0].data.instr, phi.data.instr) && u.operands[1].kind == value.VAL_CONST_INT) {
+                            @out_c    = c;
+                            @out_step = u.operands[1].data.int_lit;
+                            ret true;
+                        }
+                    }
+                    o = o + 2;
+                }
+                ret false;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+# `for (i = 0; i < n; i = i + 1) { a[sk * i + sc] = b[i + lc]; }` over i64,
+# vectorized or not: 0 when its vector store and load keep their offsets while
+# i steps two lanes, 2 when the loop stays scalar, 1 otherwise
+#[testing]
+fun t_offset_copy(sk: u64, sc: i64, lc: i64) i32 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target              = resolved.described_named("x86_64");
+    val rm:  res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: me_ir.Module = rm.ok;
+    fin { me_ir.dnit(?m); }
+    val rt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel rt.err) { ret 1; }
+    val i64t: ir_type.IrTypeId                 = rt.ok;
+    val rp:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) { ret 1; }
+    var sig: ir_type.IrTypeId;
+    if (me_testing.axpy_sig(?m, i64t, rp.ok, ?sig) != 0) { ret 1; }
+    val rf: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, sig, 0);
+    if (sel rf.err) { ret 1; }
+    val fn:  *me_ir.Function = ?m.functions[rf.ok];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val re: res[ir_id.BlockId, fail.Fail] = builder.new_block(?bld);
+    if (sel re.err) { ret 1; }
+    val rh: res[ir_id.BlockId, fail.Fail] = builder.new_block(?bld);
+    if (sel rh.err) { ret 1; }
+    val rb: res[ir_id.BlockId, fail.Fail] = builder.new_block(?bld);
+    if (sel rb.err) { ret 1; }
+    val rx: res[ir_id.BlockId, fail.Fail] = builder.new_block(?bld);
+    if (sel rx.err) { ret 1; }
+
+    builder.set_block(?bld, re.ok);
+    val to_header: err[fail.Fail] = builder.emit_br(?bld, rh.ok);
+    if (sel to_header.err) { ret 1; }
+    builder.set_block(?bld, rh.ok);
+    val rphi: res[value.Value, fail.Fail] = builder.emit_phi(?bld, i64t);
+    if (sel rphi.err) { ret 1; }
+    val iv: value.Value                 = rphi.ok;
+    val rc: res[value.Value, fail.Fail] = builder.emit_cmp_lt_s(?bld, iv, value.param(0, i64t));
+    if (sel rc.err) { ret 1; }
+    val to_body: err[fail.Fail] = builder.emit_cbr(?bld, rc.ok, rb.ok, rx.ok);
+    if (sel to_body.err) { ret 1; }
+
+    builder.set_block(?bld, rb.ok);
+    val ru: res[value.Value, fail.Fail] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
+    if (sel ru.err) { ret 1; }
+    val rli: res[value.Value, fail.Fail] = t_offset_index(?bld, iv, ru.ok, 1, lc, i64t);
+    if (sel rli.err) { ret 1; }
+    var ix: [1]value.Value;
+    ix[0] = rli.ok;
+    val rgl: res[value.Value, fail.Fail] = builder.emit_gep(?bld, value.param(2, rp.ok), i64t, ?ix[0], 1);
+    if (sel rgl.err) { ret 1; }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?bld, rgl.ok, i64t);
+    if (sel rl.err) { ret 1; }
+    val rsi: res[value.Value, fail.Fail] = t_offset_index(?bld, iv, ru.ok, sk, sc, i64t);
+    if (sel rsi.err) { ret 1; }
+    ix[0] = rsi.ok;
+    val rgs: res[value.Value, fail.Fail] = builder.emit_gep(?bld, value.param(1, rp.ok), i64t, ?ix[0], 1);
+    if (sel rgs.err) { ret 1; }
+    val stored: err[fail.Fail] = builder.emit_store(?bld, rl.ok, rgs.ok);
+    if (sel stored.err) { ret 1; }
+    val back: err[fail.Fail] = builder.emit_br(?bld, rh.ok);
+    if (sel back.err) { ret 1; }
+    builder.set_block(?bld, rx.ok);
+    val returned: err[fail.Fail] = builder.emit_ret_void(?bld);
+    if (sel returned.err) { ret 1; }
+    val from_entry: err[fail.Fail] = builder.phi_add_incoming(?bld, iv, re.ok, value.const_int(0, i64t));
+    if (sel from_entry.err) { ret 1; }
+    val from_body: err[fail.Fail] = builder.phi_add_incoming(?bld, iv, rb.ok, ru.ok);
+    if (sel from_body.err) { ret 1; }
+
+    val rr: res[bool, fail.Fail] = run(?m, ?tgt, false, nil);
+    if (sel rr.err)                     { ret 1; }
+    if (!me_testing.verifies(?m, true)) { ret 1; }
+    if (!rr.ok)                         { ret 2; }
+    var st_c:    i64 = 0;
+    var ld_c:    i64 = 0;
+    var st_step: u64 = 0;
+    var ld_step: u64 = 0;
+    if (!t_vector_offset(?m, fn, true, ?st_c, ?st_step) || !t_vector_offset(?m, fn, false, ?ld_c, ?ld_step)) { ret 1; }
+    if (st_c != sc || ld_c != lc || st_step != 2 || ld_step != 2)                                            { ret 1; }
+    ret 0;
+}
+
+# an index the induction variable offsets keeps its offset once the loop
+# steps by the lane count, whether it is the very update that steps the
+# variable or an addition or subtraction of its own, on either side of the
+# copy. a scaled index is not unit-stride, and the loop stays scalar
+test run__offset_indices_keep_their_offset {
+    var code: i32 = 0;
+    if (t_offset_copy(1, 1, 0) != 0)  { code = 1; }
+    if (t_offset_copy(1, 3, 0) != 0)  { code = 1; }
+    if (t_offset_copy(1, -1, 0) != 0) { code = 1; }
+    if (t_offset_copy(1, 0, 1) != 0)  { code = 1; }
+    if (t_offset_copy(2, 1, 0) != 2)  { code = 1; }
     ret code;
 }
 
