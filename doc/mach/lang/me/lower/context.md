@@ -195,6 +195,33 @@ pub fun gated_lower_member_const_message(lc: *LowerContext, name: intern.StrId, 
 pub fun report_gate(lc: *LowerContext, k: diagnostic_kind.Kind, span: lang_source.Span, message: str) fail.Fail;
 ```
 
+## fun refuse_nesting
+
+```mach
+pub fun refuse_nesting(lc: *LowerContext, span: lang_source.Span) fail.Fail;
+```
+
+the lowering recurses as deep as the input nests, on frames far larger than the checks
+before it, so each walk asks for stack before it descends and refuses the node it stands on
+
+## fun refuse_type_nesting
+
+```mach
+pub fun refuse_type_nesting(lc: *LowerContext) fail.Fail;
+```
+
+the same refusal of a walk over a type, which has no place of its own, at the node the
+lowering stands on
+
+## fun refuse
+
+```mach
+pub fun refuse(lc: *LowerContext, f: fail.Fail) fail.Fail;
+```
+
+a failure a walk with no place of its own returned: a refusal of the input is reported under
+its own kind at the node the lowering stands on; any other failure is the lowering's own
+
 ## fun record_eval_result
 
 ```mach

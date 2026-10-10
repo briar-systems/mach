@@ -37,6 +37,9 @@ its ungated part and the templates that call joins
 pub rec Analysis;
 ```
 
+nested: the walk met a body nested deeper than the stack lets it descend, at nested_at,
+and left the rest of that body unwalked
+
 ## fun init
 
 ```mach
