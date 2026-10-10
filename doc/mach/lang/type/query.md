@@ -36,13 +36,30 @@ pub rec Query;
 one question put to the store: what it reads, the facts it may consult and record, and
 where an internal failure lands
 
+## fun descend
+
+```mach
+pub fun descend(q: *Query) bool;
+```
+
+whether a walk that builds types may descend another level: false once the stack has no
+room left, which refuses the query and unwinds every walk under it
+
+## fun nesting
+
+```mach
+pub fun nesting() fail.Fail;
+```
+
+the refusal of a query whose walk ran out of stack
+
 ## fun answer
 
 ```mach
 pub fun answer[T](q: *Query, value: T) res[T, fail.Fail];
 ```
 
-a query's answer, or the internal failure it met
+a query's answer, or the internal failure it met, or its refusal of the input
 
 ## fun settled
 
@@ -50,7 +67,7 @@ a query's answer, or the internal failure it met
 pub fun settled(q: *Query) err[fail.Fail];
 ```
 
-a query that answers nothing but whether it met an internal failure
+a query that answers nothing but whether it met an internal failure or refused the input
 
 ## fun refused
 
@@ -63,6 +80,15 @@ pub fun refused(q: *Query, e: A.Error);
 ```mach
 pub fun failed(q: *Query, f: fail.Fail);
 ```
+
+## fun inherit
+
+```mach
+pub fun inherit(q: *Query, f: fail.Fail);
+```
+
+a failure a query asked under this one returned: its refusal of the input is this query's,
+and any other failure is internal
 
 ## fun scan_begin
 

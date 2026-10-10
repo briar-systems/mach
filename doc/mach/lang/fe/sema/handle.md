@@ -54,6 +54,9 @@ pub fun type_of(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.
 pub fun check_annotation_handles_all(sc: *sema_context.SemaContext);
 ```
 
+every annotation's check shares one walk, so a type that several annotations spell, as a
+chain of defs each over the one before does, is walked once rather than once per annotation
+
 ## fun type_carries_handle
 
 ```mach

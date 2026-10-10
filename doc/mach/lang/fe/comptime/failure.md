@@ -91,3 +91,13 @@ an internal failure of the evaluator, a compiler defect wherever it surfaces
 pub fun eval_from_fail(f: fail.Fail, diag: diagnostic_kind.Kind, rejected_message: str) EvalFail;
 ```
 
+## fun eval_from_refusal
+
+```mach
+pub fun eval_from_refusal(f: fail.Fail, diag: diagnostic_kind.Kind, rejected_message: str) EvalFail;
+```
+
+a failure a walk with no place of its own returned to an evaluation: a refusal of the input
+is rejected under its own kind, which the evaluation reports at the node it stands on, and
+any other failure reads as eval_from_fail reads it
+
