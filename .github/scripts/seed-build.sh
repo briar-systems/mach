@@ -15,8 +15,9 @@ case "$seed" in
     *) seed=$(command -v "$seed") ;;
 esac
 
-# [project] work as out, {project.work} as {project.out}, and a profile's
-# optimize as opt with vectorize and float_reassoc spelled out
+# [project] work as out, {project.work} as {project.out}, a profile's
+# optimize as opt with vectorize and float_reassoc spelled out, and export
+# dropped from [artifact.*] tables
 previous() {
     if grep -qE '^(pass|skip|relax)[[:space:]]*=' "$1"; then
         echo "seed-build.sh: $1 sets a pass, skip or relax list, which the seed cannot read" >&2
@@ -34,7 +35,9 @@ previous() {
             next
         }
         /^\[dep\.std\]/ { print; print "path = \"std\""; dep = 1; next }
-        /^\[/ { dep = 0 }
+        /^\[artifact\./ { art = 1; dep = 0; print; next }
+        /^\[/ { dep = 0; art = 0 }
+        art && /^export[[:space:]]*=/ { next }
         dep && /^(git|ref|version)[[:space:]]*=/ { next }
         { print }
     ' "$1"
