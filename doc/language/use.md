@@ -70,10 +70,7 @@ use a: example.top.delta.answer;  # through an alias of an alias
 ```
 
 A segment that names no module re-exported there ends the path, and the use
-is refused naming the module and the segment. Only a one-segment project id
-reaches a project's public module: a longer path names the project's source
-tree, so `use example.alpha;` names `src/alpha.mach` and does not look in the
-public module for a `fwd` named `alpha`.
+is refused naming the module and the segment.
 
 ## Design rule
 
