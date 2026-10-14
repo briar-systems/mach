@@ -46,6 +46,35 @@ exports none has no public module and is imported by full path only; std is
 one (`use std;` is refused naming the rule, while `use std.print;` needs no
 export).
 
+## Paths through re-exports
+
+A path follows `fwd` re-exports. Once a path reaches a module, each further
+segment but the last may name a module that module re-exports with `fwd`, at
+any depth of re-export, and the path goes on in the module it names. A path
+reaches a member through a module alias the same way it does through the
+module itself:
+
+```mach fragment
+# src/deep/alpha.mach
+pub fun answer() i64 { ret 42; }
+
+# src/lib/lib.mach
+fwd beta: example.deep.alpha;
+
+# src/top.mach
+fwd delta: example.lib.lib.beta;
+
+# another module of project 'example'
+use example.lib.lib.beta.answer;  # binds alpha's 'answer'
+use a: example.top.delta.answer;  # through an alias of an alias
+```
+
+A segment that names no module re-exported there ends the path, and the use
+is refused naming the module and the segment. Only a one-segment project id
+reaches a project's public module: a longer path names the project's source
+tree, so `use example.alpha;` names `src/alpha.mach` and does not look in the
+public module for a `fwd` named `alpha`.
+
 ## Design rule
 
 A Mach module imports every dependency it directly names — including any
