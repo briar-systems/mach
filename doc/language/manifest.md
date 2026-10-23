@@ -113,7 +113,7 @@ debug = true                           # emit debug info for this profile
 simd  = "scalarize"                    # SIMD lever: "scalarize" | "require"
 # pass  = ["inline"]                   # optional: optimization passes added to the set
 # skip  = ["vectorize"]                # optional: optimization passes left out of it
-# relax = ["float-reassoc"]            # optional: departures from exact semantics
+# relax = false                        # optional: whether the linker may relax the code
 # allow = ["import.unused"]            # optional: warning keys this profile silences
 
 [artifact.demo]                        # a produced artifact
@@ -941,8 +941,8 @@ has to zero anything at startup.
 ## `[profile.<name>]`
 
 A profile is one explicit compilation policy: a build variant. Whether the
-optimization passes run, which passes are added or left out, which departures
-from exact semantics are permitted, the debug-emission toggle and the SIMD lever
+optimization passes run, which passes are added or left out, whether the linker
+may relax the code, the debug-emission toggle and the SIMD lever
 live here because they are variant concerns, and every one of them is stated. Every manifest
 declares at least one profile; nothing is synthesized. Values that are
 *derived* rather than declared live elsewhere: a target's object format and
@@ -954,14 +954,14 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 | `optimize` | bool | Whether the optimization passes run. `true` runs the default set `mach info passes` lists with `default=optimize` over the passes every build runs (`default=always`); `false` runs only the latter. The legalization passes, which make the program something the target can execute, run at every setting. A non-boolean is a manifest error. |
 | `pass` | array of strings | **Optional.** Optimization passes added to the set this profile's `optimize` selects, each a name from [`mach info passes`](#passes), listed once. Absent, nothing is added. |
 | `skip` | array of strings | **Optional.** Optimization passes left out of the set, each listed once and never in `pass` too. Absent, nothing is left out. |
-| `relax` | array of strings | **Optional.** The departures from exact semantics the build permits. The one there is, `"float-reassoc"`, is described under [Float reassociation](#float-reassociation). Absent, the build keeps exact semantics. |
+| `relax` | bool | **Optional.** Whether the linker may relax the code, as RISC-V linker relaxation shortens a call or an address pair once the link has placed its target. The build hands it to mirl's `relax` build option on every target, and a target whose linker relaxes nothing reads it as no change. `false` keeps every instruction sequence at the length the compiler laid it out. Absent, it is `true`. A non-boolean is a manifest error. |
 | `debug` | bool    | Emit debug info for this profile: DWARF in ELF, Mach-O and COFF objects alike, and the core SPIR-V debug instructions on a `spirv` target (see [Finished-module targets](#finished-module-targets)). A PE image carries its DWARF in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
 | `simd`  | string  | SIMD scalarization lever. `"scalarize"` emits a defined unrolled scalar expansion wherever the target has no packed instruction for a vector operator, with one `vector.scalarize` warning at each such operation naming the operation, its lanes, the function, the target and the extension that would pack it (or that none would). `"require"` makes each of those sites a hard error with the same text. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. Any other string is a manifest error. |
 | `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile requirement and selection](#profile-requirement-and-selection). |
 | `allow` | array of strings | **Optional.** The warnings this profile silences, each entry a key or a family of keys from the [warning key table](#silencing-warnings), named once. An unknown key, an entry that covers only errors, a repeated entry or a non-string entry is a manifest error. Absent, nothing is silenced. |
 | `opt` | removed | Refused as a removed key: write `optimize = true` or `optimize = false`. |
 | `vectorize` | removed | Refused as a removed key: vectorization is the `vectorize` pass of the set `optimize` selects, left out with `skip = ["vectorize"]`. |
-| `float_reassoc` | removed | Refused as a removed key: reassociation is permitted with `relax = ["float-reassoc"]`. |
+| `float_reassoc` | removed | Refused as a removed key: float arithmetic keeps exact semantics, and no build permits reassociation. |
 
 Three keys (`optimize`, `debug`, `simd`) are required in every profile; the
 others are optional, with the meaning of their absence above. A missing key is a
@@ -972,8 +972,7 @@ error[manifest.missing_required]: mach.toml: [profile.debug] is missing required
 ```
 
 A pass name that is no pass, or names a legalization pass, which every build
-runs and none can add or skip, is refused where it is written, and so is a
-relaxation that does not exist:
+runs and none can add or skip, is refused where it is written:
 
 ```
 error[manifest.invalid_value]: mach.toml: [profile.release].skip names "vecsplit", a legalization pass, which every build runs and none can add or skip
@@ -983,8 +982,8 @@ The previous major's keys are refused by name, each with what replaced it, and
 with the rewrite `mach migrate` applies as a fix wherever the value has a
 mechanical one: `opt = 0` is `optimize = false`, `opt = 1` and `opt = 2` are
 `optimize = true`, `vectorize = true` is the default set and is removed,
-`vectorize = false` is `skip = ["vectorize"]`, `float_reassoc = false` is
-removed and `float_reassoc = true` is `relax = ["float-reassoc"]`:
+`vectorize = false` is `skip = ["vectorize"]` and `float_reassoc = false` is
+removed. `float_reassoc = true` has no replacement:
 
 ```
 error[manifest.removed_key]: mach.toml: [profile.release] uses removed key 'opt'; write `optimize = true` or `optimize = false`
@@ -1052,11 +1051,6 @@ integer reductions. A loop it cannot prove safe stays scalar, and a target witho
 hardware vectors (riscv64) never enters the pass, so `skip = ["vectorize"]` changes
 performance and never semantics. For a single function, the `#[scalar]` decorator is
 the finer-grained opt-out (see [decorators.md](decorators.md)).
-
-`relax = ["float-reassoc"]` is the one lever here that *adds*, and the only profile
-key that can change a program's computed answer. It widens that same pass to float
-reductions and does nothing else; skipping `vectorize` switches the pass off wholesale
-and so overrides it. A relaxation never rides on `optimize`.
 
 Every lever of a profile is always the **consumer's**.
 As [Dependency manifests](#dependency-manifests) sets out, a dependency's `[profile.*]`
@@ -1134,67 +1128,6 @@ error[allow.error_key]: mach.toml: [profile.release].allow entry "secret.not_obl
 Like the SIMD levers, `allow` is the consumer's: a dependency's profiles are
 never read to build it, so a library cannot silence the consumer's warnings.
 
-### Float reassociation
-
-`relax = ["float-reassoc"]` grants the optimizer exactly one liberty: it may treat
-floating-point `+` and `*` as **associative**, and regroup a reduction accordingly.
-Nothing else changes. It does not license reciprocal substitution for division,
-assumptions that operands are finite or non-NaN, contraction into a fused
-multiply-add, or flushing subnormals to zero. Each of those would be its own key, with
-its own argument.
-
-What it unlocks is the reduction vectorizer. `s = s + a[i]` is a serial dependence
-chain: every iteration must wait for the previous one's rounded result, so it cannot be
-done four lanes at a time without regrouping the additions. With the key set, the loop
-becomes lane-count independent partial accumulators plus a horizontal combine at the
-end — which computes a *differently grouped*, and therefore differently rounded, sum.
-Element-wise float loops (`a[i] = b[i] * c[i]`) never needed the key and are
-unaffected: each lane performs exactly the operation the scalar loop performed.
-
-The reductions it admits are sum (`s = s + x`), product (`s = s * x`), and the dot /
-matmul inner loop (`s = s + a[i]*b[i]`). Subtraction and division reductions are not
-associative in real arithmetic either, so they are refused with the key set exactly as
-without it.
-
-**The accuracy cost, measured.** Summing one million `f64` values of `0.1`, scored
-against a compensated (Kahan) reference on x86-64:
-
-| ordering | result | relative error |
-|---|---|---|
-| strict, sequential | `100000.00000133288` | 1.33e-11 |
-| reassociated, 2 lanes | `99999.9999991058` | 8.94e-12 |
-
-The two answers differ from **each other** by 2.2e-11 relative — about 153,000 `f64`
-ULPs at that magnitude. The same experiment in `f32` (4 lanes) differs by 1.2e-2
-relative: strict gives `100958.34`, reassociated `99759.85`, against a true value of
-`100000.0`.
-
-Note the direction. In both cases the *reassociated* answer is the more accurate one,
-because splitting into per-lane partials keeps each running total smaller and so grinds
-off fewer low bits — the same reason pairwise summation beats sequential summation. But
-that is a property of this input, not a guarantee. The honest statement is that the
-result **changes**, by roughly the accumulated rounding error of the sum, in a direction
-that depends on the data. Code whose correctness depends on the exact bit pattern of a
-float reduction — a checksum, a reproducibility requirement, a comparison against a
-reference implementation — must not relax it.
-
-Two exactness properties are preserved rather than traded away. The idle lanes are
-seeded with the op's **exact** IEEE identity — `-0.0` for addition (`x + (-0.0)` is `x`
-for every `x`, where `+0.0` would turn a negative-zero sum positive) and `1.0` for
-multiplication — so no signed-zero or NaN behaviour changes. And a trip count below the
-lane count never enters the vector loop at all, so short reductions are bit-identical
-regardless of the relaxation.
-
-The relaxation is profile-wide. For a single function, `#[scalar]` opts out of vectorization
-entirely and takes precedence over it, so a routine that must stay IEEE-strict inside
-an otherwise-reassociating build has a spelling. There is no per-function opt-*in*:
-whether a reduction may be reassociated is the caller's tolerance to decide, not the
-callee author's.
-
-Integer reductions are untouched by this relaxation. They vectorize unconditionally and are
-bit-identical to the scalar reference, because integer add / xor / or / and reassociate
-exactly.
-
 ### Levers on the command line
 
 `-p <name>` picks the profile, and every lever has its command-line form over
@@ -1207,9 +1140,8 @@ is `--key value`, and a set takes repeatable add and remove flags:
 | `debug` | `--debug` (`-d`), `--no-debug` |
 | `simd` | `--simd scalarize`, `--simd require` |
 | `pass`, `skip` | `--pass NAME` adds a pass, `--skip NAME` leaves one out |
-| `relax` | `--relax NAME` permits, `--no-relax NAME` withdraws |
 
-The levers apply in one order: the built-in defaults, then the selected profile,
+`relax` has no command-line form, so a build relaxes as its profile says. The levers apply in one order: the built-in defaults, then the selected profile,
 then the command line. Both flags of a pair, or `--pass` and `--skip` of the
 same pass, are refused. The previous major's `-g`, `-O0` and `-O2` are refused
 naming `-d`, `--no-optimize` and `-O`.

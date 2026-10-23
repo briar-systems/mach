@@ -9,7 +9,6 @@ use std.types.size.usize;
 use std.types.string.str;
 
 use A: std.allocator;
-use std.allocator.page;
 
 use mach.lang.fail;
 use mach.lang.fe.ast;
@@ -18,13 +17,22 @@ use ast_id:     mach.lang.fe.ast.id;
 use ast_module: mach.lang.fe.ast.module;
 use mach.lang.fe.resolve;
 use mach.lang.intern;
-use me_ir: mach.lang.me.ir;
-use mach.lang.me.ir.builder;
-use ir_id:          mach.lang.me.ir.id;
-use ir_instruction: mach.lang.me.ir.instruction;
-use ir_type:        mach.lang.me.ir.type;
-use mach.lang.me.ir.value;
+use mach.lang.me.lower.builder;
+use lower_context: mach.lang.me.lower.context;
+use mach.lang.me.lower.irt;
+use mach.lang.me.lower.value;
 use mach.lang.session;
+
+use mink.model.symbol;
+use mirl.ir.function.FunctionData;
+use mirl.ir.id;
+use mirl.ir.linkage.Linkage;
+use mirl_module: mirl.ir.module;
+use types:       mirl.ir.type;
+use mirl.ir.type.Type;
+use collections_vector: std.collections.vector;
+use std.types.string.str_len;
+use std.types.view.View;
 
 # name: the qualified name `<module path>#<identifier>`, which is also the test's symbol
 pub rec Test {
@@ -48,14 +56,14 @@ pub fun collected_init() Collected {
 }
 
 # the test declarations of one lowered module, in function order
-pub fun collect_module(s: *session.Session, c: *Collected, mod: *me_ir.Module, mod_idx: u32) err[fail.Fail] {
-    var ii: u32 = 0;
-    for (ii < mod.function_len) {
-        val fn: *me_ir.Function = ?mod.functions[ii];
-        if ((fn.flags & me_ir.FN_FLAG_TEST) != 0) {
+pub fun collect_module(s: *session.Session, c: *Collected, unit: *lower_context.Unit, mod_idx: u32) err[fail.Fail] {
+    var ii: usize = 0;
+    for (ii < unit.fns.len) {
+        val info: *lower_context.FnInfo = ?unit.fns.data[ii];
+        if (info.test) {
             var t: Test;
-            t.name    = fn.name;
-            t.line    = fn.line;
+            t.name    = info.name;
+            t.line    = info.line;
             t.mod_idx = mod_idx;
             val res_push: err[fail.Fail] = push(s, c, t);
             if (sel res_push.err) { ret res_push; }
@@ -109,31 +117,27 @@ val TEST_STATUS_WIDE: u64 = 255;
 # exits `TEST_STATUS_WIDE`; a missing or malformed index, or one past `count`,
 # exits 2
 # ---
-# s:     the session whose interner names the dispatcher and `main`
-# tests: the collected tests in dispatch order, indexed by argv[1]
-# count: how many tests there are, at least one
-# ret:   the dispatcher module, owned by the caller, or why it could not be built
-pub fun synthesize_dispatcher(s: *session.Session, tests: *Test, count: u32) res[me_ir.Module, fail.Fail] {
-    if (count == 0) { ret res[me_ir.Module, fail.Fail].err{fail.message("test dispatcher: no tests to dispatch")}; }
+# s:       the session whose interner names the dispatcher and `main`
+# machine: the target the dispatcher is built for
+# tests:   the collected tests in dispatch order, indexed by argv[1]
+# count:   how many tests there are, at least one
+# ret:     the dispatcher unit, owned by the caller, or why it could not be built
+pub fun synthesize_dispatcher(s: *session.Session, machine: *lower_context.Machine, tests: *Test, count: u32) res[lower_context.Unit, fail.Fail] {
+    if (count == 0) { ret res[lower_context.Unit, fail.Fail].err{fail.message("test dispatcher: no tests to dispatch")}; }
 
     val res_name: res[intern.StrId, A.Error] = intern.add(?s.interner, "__mach_test_dispatch");
-    if (sel res_name.err) {
-        ret res[me_ir.Module, fail.Fail].err{fail.refused(res_name.err)};
-    }
+    if (sel res_name.err) { ret res[lower_context.Unit, fail.Fail].err{fail.refused(res_name.err)}; }
 
-    val res_module: res[me_ir.Module, fail.Fail] = me_ir.init(s.alloc, res_name.ok);
-    if (sel res_module.err) {
-        ret res[me_ir.Module, fail.Fail].err{res_module.err};
-    }
-    var m: me_ir.Module = res_module.ok;
+    val made: res[lower_context.Unit, fail.Fail] = lower_context.unit_init(s.alloc, machine, res_name.ok, true);
+    if (sel made.err) { ret made; }
+    var u: lower_context.Unit = made.ok;
 
-    val res_build: err[fail.Fail] = build_dispatcher(s, ?m, tests, count);
+    val res_build: err[fail.Fail] = build_dispatcher(s, machine, ?u, tests, count);
     if (sel res_build.err) {
-        me_ir.dnit(?m);
-        ret res[me_ir.Module, fail.Fail].err{res_build.err};
+        lower_context.unit_dnit(?u);
+        ret res[lower_context.Unit, fail.Fail].err{res_build.err};
     }
-
-    ret res[me_ir.Module, fail.Fail].ok{m};
+    ret res[lower_context.Unit, fail.Fail].ok{u};
 }
 
 pub fun push(s: *session.Session, c: *Collected, t: Test) err[fail.Fail] {
@@ -148,316 +152,144 @@ pub fun push(s: *session.Session, c: *Collected, t: Test) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
-fun build_dispatcher(s: *session.Session, m: *me_ir.Module, tests: *Test, count: u32) err[fail.Fail] {
-    val res_i8: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
-    if (sel res_i8.err) { ret err[fail.Fail].err{res_i8.err}; }
-    val i8t: ir_type.IrTypeId = res_i8.ok;
+fun view_of(s: *session.Session, name: intern.StrId) View {
+    val text: str = intern.text(?s.interner, name);
+    ret View{data: text, len: str_len(text)};
+}
 
-    val res_i32: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 32);
-    if (sel res_i32.err) { ret err[fail.Fail].err{res_i32.err}; }
-    val i32t: ir_type.IrTypeId = res_i32.ok;
+fun build_dispatcher(s: *session.Session, machine: *lower_context.Machine, u: *lower_context.Unit, tests: *Test, count: u32) err[fail.Fail] {
+    val t: *types.Table    = ?u.m.types;
+    var b: builder.Builder = builder.init(?u.m, s.alloc, machine.target, machine.ctx, ?s.sources, false);
+    fin { builder.dnit(?b); }
 
-    val res_i64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
-    if (sel res_i64.err) { ret err[fail.Fail].err{res_i64.err}; }
-    val i64t: ir_type.IrTypeId = res_i64.ok;
+    val i8t:  Type = builder.int_type(?b, 8);
+    val i32t: Type = builder.int_type(?b, 32);
+    val i64t: Type = builder.int_type(?b, 64);
+    val ptrt: Type = builder.ptr_type(?b);
 
-    val res_ptr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
-    if (sel res_ptr.err) { ret err[fail.Fail].err{res_ptr.err}; }
-    val ptrt: ir_type.IrTypeId = res_ptr.ok;
-
-    val res_tsig: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_fn(?m.types, i32t, nil, 0, false);
+    var test_result: Type                 = i32t;
+    var test_ext:    types.Extension      = types.Extension.sext{};
+    val res_tsig:    res[Type, fail.Fail] = irt.signature(t, nil, nil, 0, ?test_result, ?test_ext, 1);
     if (sel res_tsig.err) { ret err[fail.Fail].err{res_tsig.err}; }
-    val tsig: ir_type.IrTypeId = res_tsig.ok;
+    val tsig: Type = res_tsig.ok;
 
-    var main_params: [2]ir_type.IrTypeId;
-    main_params[0] = i64t;
-    main_params[1] = ptrt;
-    val res_msig: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_fn(?m.types, i64t, ?main_params[0], 2, false);
+    var main_params: [2]Type              = [2]Type{i64t, ptrt};
+    var main_ext:    [2]types.Extension   = [2]types.Extension{types.Extension.none{}, types.Extension.none{}};
+    var main_result: Type                 = i64t;
+    var main_rext:   types.Extension      = types.Extension.none{};
+    val res_msig:    res[Type, fail.Fail] = irt.signature(t, ?main_params[0], ?main_ext[0], 2, ?main_result, ?main_rext, 1);
     if (sel res_msig.err) { ret err[fail.Fail].err{res_msig.err}; }
-    val msig: ir_type.IrTypeId = res_msig.ok;
+    val msig: Type = res_msig.ok;
 
-    val res_callees: res[*value.Value, A.Error] = A.allocate[value.Value](m.alloc, count::usize);
-    if (sel res_callees.err) { ret err[fail.Fail].err{fail.refused(res_callees.err)}; }
-    val callees: *value.Value = res_callees.ok;
-
+    val global:  Linkage                                = Linkage{binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT};
+    var callees: collections_vector.Vector[value.Value] = collections_vector.init[value.Value](s.alloc);
+    fin { collections_vector.dnit[value.Value](?callees); }
     var k: u32 = 0;
     for (k < count) {
-        val res_ext: res[u32, fail.Fail] = append_function(m, tests[k].name, tsig, me_ir.FN_FLAG_EXTERN);
-        if (sel res_ext.err) { ret err[fail.Fail].err{res_ext.err}; }
-        callees[k] = value.fn(res_ext.ok, tsig);
-        k          = k + 1;
+        val f: res[id.Function, fail.Fail] = add(u, FunctionData{name: view_of(s, tests[k].name), signature: tsig, linkage: global, constant_time: false}, tests[k].name, false);
+        if (sel f.err) { ret err[fail.Fail].err{f.err}; }
+        val pushed: res[usize, A.Error] = collections_vector.push[value.Value](?callees, value.fn(f.ok.index, ptrt, tsig));
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        k = k + 1;
     }
 
     val res_main: res[intern.StrId, A.Error] = intern.add(?s.interner, MAIN_LINKAGE);
     if (sel res_main.err) { ret err[fail.Fail].err{fail.refused(res_main.err)}; }
-    val res_main_idx: res[u32, fail.Fail] = append_function(m, res_main.ok, msig, me_ir.FN_FLAG_PUB);
-    if (sel res_main_idx.err) { ret err[fail.Fail].err{res_main_idx.err}; }
-    val main_idx: u32 = res_main_idx.ok;
+    val main_f: res[id.Function, fail.Fail] = add(u, FunctionData{name: view_of(s, res_main.ok), signature: msig, linkage: global, constant_time: false}, res_main.ok, true);
+    if (sel main_f.err) { ret err[fail.Fail].err{main_f.err}; }
 
-    val res_params: res[*value.Value, A.Error] = A.allocate[value.Value](m.alloc, 2);
-    if (sel res_params.err) { ret err[fail.Fail].err{fail.refused(res_params.err)}; }
-    val params: *value.Value = res_params.ok;
-    params[0]                         = value.param(0, i64t);
-    params[1]                         = value.param(1, ptrt);
-    m.functions[main_idx].params      = params;
-    m.functions[main_idx].param_count = 2;
+    val b_entry: id.Block    = builder.enter(?b, main_f.ok, ?main_params[0], nil, 2);
+    val argc:    value.Value = builder.block_param(?b, b_entry, 0, i64t);
+    val argv:    value.Value = builder.block_param(?b, b_entry, 1, ptrt);
 
-    var b: builder.Builder = builder.init(m);
-    builder.set_function(?b, ?m.functions[main_idx]);
+    # the digit loop carries the character pointer and the index read so far
+    var loop_tys: [2]Type  = [2]Type{ptrt, i64t};
+    val b_bad:    id.Block = builder.new_block_with(?b, nil, nil, 0);
+    val b_getarg: id.Block = builder.new_block_with(?b, nil, nil, 0);
+    val b_head:   id.Block = builder.new_block_with(?b, ?loop_tys[0], nil, 2);
+    val b_low_ok: id.Block = builder.new_block_with(?b, nil, nil, 0);
+    val b_body:   id.Block = builder.new_block_with(?b, nil, nil, 0);
+    val b_step:   id.Block = builder.new_block_with(?b, nil, nil, 0);
+    val b_wide:   id.Block = builder.new_block_with(?b, nil, nil, 0);
+    val b_found:  id.Block = builder.new_block_with(?b, nil, nil, 0);
 
-    val res_entry: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
-    if (sel res_entry.err) { ret err[fail.Fail].err{res_entry.err}; }
-    val b_entry: ir_id.BlockId = res_entry.ok;
-
-    val res_bad: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
-    if (sel res_bad.err) { ret err[fail.Fail].err{res_bad.err}; }
-    val b_bad: ir_id.BlockId = res_bad.ok;
-
-    val res_getarg: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
-    if (sel res_getarg.err) { ret err[fail.Fail].err{res_getarg.err}; }
-    val b_getarg: ir_id.BlockId = res_getarg.ok;
-
-    val res_head: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
-    if (sel res_head.err) { ret err[fail.Fail].err{res_head.err}; }
-    val b_head: ir_id.BlockId = res_head.ok;
-
-    val res_low: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
-    if (sel res_low.err) { ret err[fail.Fail].err{res_low.err}; }
-    val b_low_ok: ir_id.BlockId = res_low.ok;
-
-    val res_body: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
-    if (sel res_body.err) { ret err[fail.Fail].err{res_body.err}; }
-    val b_body: ir_id.BlockId = res_body.ok;
-
-    val res_wide: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
-    if (sel res_wide.err) { ret err[fail.Fail].err{res_wide.err}; }
-    val b_wide: ir_id.BlockId = res_wide.ok;
-
-    val res_dblocks: res[*ir_id.BlockId, A.Error] = A.allocate[ir_id.BlockId](m.alloc, count::usize);
-    if (sel res_dblocks.err) { ret err[fail.Fail].err{fail.refused(res_dblocks.err)}; }
-    val dblocks: *ir_id.BlockId = res_dblocks.ok;
-
-    val res_cblocks: res[*ir_id.BlockId, A.Error] = A.allocate[ir_id.BlockId](m.alloc, count::usize);
-    if (sel res_cblocks.err) { ret err[fail.Fail].err{fail.refused(res_cblocks.err)}; }
-    val cblocks: *ir_id.BlockId = res_cblocks.ok;
-
-    k = 0;
-    for (k < count) {
-        val res_d: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
-        if (sel res_d.err) { ret err[fail.Fail].err{res_d.err}; }
-        dblocks[k] = res_d.ok;
-
-        val res_c: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
-        if (sel res_c.err) { ret err[fail.Fail].err{res_c.err}; }
-        cblocks[k] = res_c.ok;
-        k          = k + 1;
-    }
-
-    val argc: value.Value = value.param(0, i64t);
-    val argv: value.Value = value.param(1, ptrt);
-
-    builder.set_block(?b, b_entry);
-    val res_lt2: res[value.Value, fail.Fail] = builder.emit_cmp_lt_s(?b, argc, value.const_int(2, i64t));
-    if (sel res_lt2.err) { ret err[fail.Fail].err{res_lt2.err}; }
-    val res_cbr0: err[fail.Fail] = builder.emit_cbr(?b, res_lt2.ok, b_bad, b_getarg);
-    if (sel res_cbr0.err) { ret res_cbr0; }
+    builder.cbr(?b, builder.lt_s(?b, argc, value.const_int(2, i64t)), b_bad, b_getarg);
 
     builder.set_block(?b, b_bad);
-    val res_ret2: err[fail.Fail] = builder.emit_ret(?b, value.const_int(2, i64t));
-    if (sel res_ret2.err) { ret res_ret2; }
+    builder.take_err(?b, builder.emit_ret(?b, value.const_int(2, i64t)));
 
     builder.set_block(?b, b_getarg);
-    var one_idx: [1]value.Value;
-    one_idx[0] = value.const_int(1, i64t);
-    val res_gep1: res[value.Value, fail.Fail] = builder.emit_gep(?b, argv, ptrt, ?one_idx[0], 1);
-    if (sel res_gep1.err) { ret err[fail.Fail].err{res_gep1.err}; }
-    val res_arg: res[value.Value, fail.Fail] = builder.emit_load(?b, res_gep1.ok, ptrt);
-    if (sel res_arg.err) { ret err[fail.Fail].err{res_arg.err}; }
-    val arg:    value.Value                 = res_arg.ok;
-    val res_c0: res[value.Value, fail.Fail] = builder.emit_load(?b, arg, i8t);
-    if (sel res_c0.err) { ret err[fail.Fail].err{res_c0.err}; }
-    val res_c0z: res[value.Value, fail.Fail] = builder.emit_cmp_eq(?b, res_c0.ok, value.const_int(0, i8t));
-    if (sel res_c0z.err) { ret err[fail.Fail].err{res_c0z.err}; }
-    val res_cbr1: err[fail.Fail] = builder.emit_cbr(?b, res_c0z.ok, b_bad, b_head);
-    if (sel res_cbr1.err) { ret res_cbr1; }
+    val slot1: value.Value = builder.take(?b, builder.emit_step(?b, argv, ptrt, value.const_int(1, i64t)));
+    val arg:   value.Value = builder.take(?b, builder.emit_load(?b, slot1, ptrt));
+    val c0:    value.Value = builder.take(?b, builder.emit_load(?b, arg, i8t));
+    val start: id.Block    = builder.new_block_with(?b, nil, nil, 0);
+    builder.cbr(?b, builder.eq(?b, c0, value.const_int(0, i8t)), b_bad, start);
+    builder.set_block(?b, start);
+    var first: [2]value.Value = [2]value.Value{arg, value.const_int(0, i64t)};
+    builder.take_err(?b, builder.emit_br_args(?b, b_head, ?first[0], 2));
 
     builder.set_block(?b, b_head);
-    val res_pphi: res[value.Value, fail.Fail] = builder.emit_phi(?b, ptrt);
-    if (sel res_pphi.err) { ret err[fail.Fail].err{res_pphi.err}; }
-    val p_phi:    value.Value                 = res_pphi.ok;
-    val res_aphi: res[value.Value, fail.Fail] = builder.emit_phi(?b, i64t);
-    if (sel res_aphi.err) { ret err[fail.Fail].err{res_aphi.err}; }
-    val acc_phi: value.Value = res_aphi.ok;
-
-    val res_c: res[value.Value, fail.Fail] = builder.emit_load(?b, p_phi, i8t);
-    if (sel res_c.err) { ret err[fail.Fail].err{res_c.err}; }
-    val c:       value.Value                 = res_c.ok;
-    val res_end: res[value.Value, fail.Fail] = builder.emit_cmp_eq(?b, c, value.const_int(0, i8t));
-    if (sel res_end.err) { ret err[fail.Fail].err{res_end.err}; }
-    val res_cbr2: err[fail.Fail] = builder.emit_cbr(?b, res_end.ok, dblocks[0], b_low_ok);
-    if (sel res_cbr2.err) { ret res_cbr2; }
+    val p:   value.Value = builder.block_param(?b, b_head, 0, ptrt);
+    val acc: value.Value = builder.block_param(?b, b_head, 1, i64t);
+    val c:   value.Value = builder.take(?b, builder.emit_load(?b, p, i8t));
+    builder.cbr(?b, builder.eq(?b, c, value.const_int(0, i8t)), b_found, b_low_ok);
 
     builder.set_block(?b, b_low_ok);
-    val res_lt0: res[value.Value, fail.Fail] = builder.emit_cmp_lt_u(?b, c, value.const_int(48, i8t));
-    if (sel res_lt0.err) { ret err[fail.Fail].err{res_lt0.err}; }
-    val res_cbr3: err[fail.Fail] = builder.emit_cbr(?b, res_lt0.ok, b_bad, b_body);
-    if (sel res_cbr3.err) { ret res_cbr3; }
+    builder.cbr(?b, builder.lt_u(?b, c, value.const_int(48, i8t)), b_bad, b_body);
 
     builder.set_block(?b, b_body);
-    val res_gt9: res[value.Value, fail.Fail] = builder.emit_cmp_lt_u(?b, value.const_int(57, i8t), c);
-    if (sel res_gt9.err) { ret err[fail.Fail].err{res_gt9.err}; }
-
-    val res_step: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
-    if (sel res_step.err) { ret err[fail.Fail].err{res_step.err}; }
-    val b_step:   ir_id.BlockId  = res_step.ok;
-    val res_cbr4: err[fail.Fail] = builder.emit_cbr(?b, res_gt9.ok, b_bad, b_step);
-    if (sel res_cbr4.err) { ret res_cbr4; }
+    builder.cbr(?b, builder.lt_u(?b, value.const_int(57, i8t), c), b_bad, b_step);
 
     builder.set_block(?b, b_step);
-    val res_cz: res[value.Value, fail.Fail] = builder.emit_zext(?b, c, i64t);
-    if (sel res_cz.err) { ret err[fail.Fail].err{res_cz.err}; }
-    val res_dig: res[value.Value, fail.Fail] = builder.emit_sub(?b, res_cz.ok, value.const_int(48, i64t));
-    if (sel res_dig.err) { ret err[fail.Fail].err{res_dig.err}; }
-    val res_m10: res[value.Value, fail.Fail] = builder.emit_mul(?b, acc_phi, value.const_int(10, i64t));
-    if (sel res_m10.err) { ret err[fail.Fail].err{res_m10.err}; }
-    val res_acc: res[value.Value, fail.Fail] = builder.emit_add(?b, res_m10.ok, res_dig.ok);
-    if (sel res_acc.err) { ret err[fail.Fail].err{res_acc.err}; }
-    val acc_next: value.Value                 = res_acc.ok;
-    val res_pn:   res[value.Value, fail.Fail] = builder.emit_gep(?b, p_phi, i8t, ?one_idx[0], 1);
-    if (sel res_pn.err) { ret err[fail.Fail].err{res_pn.err}; }
-    val p_next: value.Value    = res_pn.ok;
-    val res_br: err[fail.Fail] = builder.emit_br(?b, b_head);
-    if (sel res_br.err) { ret res_br; }
+    val digit: value.Value    = builder.sub(?b, builder.zext(?b, c, i64t), value.const_int(48, i64t));
+    var next:  [2]value.Value = [2]value.Value{
+        builder.take(?b, builder.emit_step(?b, p, i8t, value.const_int(1, i64t))),
+        builder.add(?b, builder.mul(?b, acc, value.const_int(10, i64t)), digit)
+    };
+    builder.take_err(?b, builder.emit_br_args(?b, b_head, ?next[0], 2));
 
-    val res_in1: err[fail.Fail] = builder.phi_add_incoming(?b, p_phi, b_getarg, arg);
-    if (sel res_in1.err) { ret res_in1; }
-    val res_in2: err[fail.Fail] = builder.phi_add_incoming(?b, p_phi, b_step, p_next);
-    if (sel res_in2.err) { ret res_in2; }
-    val res_in3: err[fail.Fail] = builder.phi_add_incoming(?b, acc_phi, b_getarg, value.const_int(0, i64t));
-    if (sel res_in3.err) { ret res_in3; }
-    val res_in4: err[fail.Fail] = builder.phi_add_incoming(?b, acc_phi, b_step, acc_next);
-    if (sel res_in4.err) { ret res_in4; }
+    # one case per test; any other index is malformed
+    builder.set_block(?b, b_found);
+    var cases:   collections_vector.Vector[u64]      = collections_vector.init[u64](s.alloc);
+    var targets: collections_vector.Vector[id.Block] = collections_vector.init[id.Block](s.alloc);
+    fin {
+        collections_vector.dnit[u64](?cases);
+        collections_vector.dnit[id.Block](?targets);
+    }
+    k = 0;
+    for (k < count) {
+        val pc: res[usize, A.Error] = collections_vector.push[u64](?cases, k::u64);
+        if (sel pc.err) { ret err[fail.Fail].err{fail.refused(pc.err)}; }
+        val pt: res[usize, A.Error] = collections_vector.push[id.Block](?targets, builder.new_block_with(?b, nil, nil, 0));
+        if (sel pt.err) { ret err[fail.Fail].err{fail.refused(pt.err)}; }
+        k = k + 1;
+    }
+    builder.take_err(?b, builder.emit_switch(?b, acc, b_bad, cases.data, targets.data, count));
 
     k = 0;
     for (k < count) {
-        builder.set_block(?b, dblocks[k]);
-        val res_eq: res[value.Value, fail.Fail] = builder.emit_cmp_eq(?b, acc_phi, value.const_int(k::u64, i64t));
-        if (sel res_eq.err) { ret err[fail.Fail].err{res_eq.err}; }
-        var miss: ir_id.BlockId = b_bad;
-        if (k + 1 < count) { miss = dblocks[k + 1]; }
-        val res_cbrk: err[fail.Fail] = builder.emit_cbr(?b, res_eq.ok, cblocks[k], miss);
-        if (sel res_cbrk.err) { ret res_cbrk; }
-
-        builder.set_block(?b, cblocks[k]);
-        val res_call: res[value.Value, fail.Fail] = builder.emit_call(?b, callees[k], nil, 0, i32t);
-        if (sel res_call.err) { ret err[fail.Fail].err{res_call.err}; }
-        val result: value.Value = res_call.ok;
-
+        builder.set_block(?b, targets.data[k]);
+        val result: value.Value = builder.take(?b, builder.emit_call(?b, callees.data[k], tsig, nil, 0));
         # an unsigned compare puts every negative result past 255 as well
-        val res_over: res[value.Value, fail.Fail] = builder.emit_cmp_lt_u(?b, value.const_int(TEST_STATUS_WIDE, i32t), result);
-        if (sel res_over.err) { ret err[fail.Fail].err{res_over.err}; }
-        val res_narrow: res[ir_id.BlockId, fail.Fail] = builder.new_block(?b);
-        if (sel res_narrow.err) { ret err[fail.Fail].err{res_narrow.err}; }
-        val b_narrow: ir_id.BlockId  = res_narrow.ok;
-        val res_cbrw: err[fail.Fail] = builder.emit_cbr(?b, res_over.ok, b_wide, b_narrow);
-        if (sel res_cbrw.err) { ret res_cbrw; }
-
-        builder.set_block(?b, b_narrow);
-        val res_r64: res[value.Value, fail.Fail] = builder.emit_sext(?b, result, i64t);
-        if (sel res_r64.err) { ret err[fail.Fail].err{res_r64.err}; }
-        val res_retk: err[fail.Fail] = builder.emit_ret(?b, res_r64.ok);
-        if (sel res_retk.err) { ret res_retk; }
+        val narrow: id.Block = builder.new_block_with(?b, nil, nil, 0);
+        builder.cbr(?b, builder.lt_u(?b, value.const_int(TEST_STATUS_WIDE, i32t), result), b_wide, narrow);
+        builder.set_block(?b, narrow);
+        builder.take_err(?b, builder.emit_ret(?b, builder.sext(?b, result, i64t)));
         k = k + 1;
     }
 
     builder.set_block(?b, b_wide);
-    val res_retw: err[fail.Fail] = builder.emit_ret(?b, value.const_int(TEST_STATUS_WIDE, i64t));
-    if (sel res_retw.err) { ret res_retw; }
-
-    ret err[fail.Fail].ok{};
+    builder.take_err(?b, builder.emit_ret(?b, value.const_int(TEST_STATUS_WIDE, i64t)));
+    builder.leave(?b);
+    ret builder.done(?b);
 }
 
-fun append_function(m: *me_ir.Module, name: intern.StrId, sig: ir_type.IrTypeId, flags: u32) res[u32, fail.Fail] {
-    val res_add: res[u32, fail.Fail] = me_ir.function_add(m, name, sig, flags);
-    if (sel res_add.err) {
-        ret res[u32, fail.Fail].err{res_add.err};
-    }
-    val idx: u32 = res_add.ok;
-
-    val res_reg: err[fail.Fail] = me_ir.function_register(m, name, idx);
-    if (sel res_reg.err) {
-        ret res[u32, fail.Fail].err{res_reg.err};
-    }
-
-    ret res[u32, fail.Fail].ok{idx};
-}
-
-# the synthesized dispatcher folds every result outside 0..255 to `TEST_STATUS_WIDE`:
-# the entry compares each test's result against 255 unsigned, and one block returns
-# the fold. this reads the module, so it holds on every host the compiler runs on
-test synthesize_dispatcher__folds_a_wide_result_to_the_status_range {
-    var alloc:  A.Allocator;
-    val make_r: err[A.Error] = page.make(?alloc);
-    if (sel make_r.err) { ret 1; }
-    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
-    if (sel sr.err) { ret 1; }
-    var s: session.Session = sr.ok;
-    fin { session.dnit(?s); }
-
-    var tests: [2]Test;
-    var k:     u32 = 0;
-    for (k < 2) {
-        val name_r: res[intern.StrId, A.Error] = intern.add(?s.interner, "m#t_probe");
-        if (sel name_r.err) { ret 1; }
-        tests[k].name    = name_r.ok;
-        tests[k].line    = k + 1;
-        tests[k].mod_idx = 0;
-        k                = k + 1;
-    }
-    val mr: res[me_ir.Module, fail.Fail] = synthesize_dispatcher(?s, ?tests[0], 2);
-    if (sel mr.err) { ret 1; }
-    var m: me_ir.Module = mr.ok;
-    fin { me_ir.dnit(?m); }
-
-    val main_r: res[intern.StrId, A.Error] = intern.add(?s.interner, "main");
-    if (sel main_r.err) { ret 1; }
-    val main_ix: opt[u32] = me_ir.function_lookup(?m, main_r.ok);
-    if (sel main_ix.none) { ret 2; }
-    val fn: *me_ir.Function = ?m.functions[main_ix.some];
-
-    # every branch on a `255 <u result` compare must take the true edge to a block
-    # that does nothing but `ret 255`
-    var guarded: u32 = 0;
-    var i:       u32 = 0;
-    for (i < fn.instr_len) {
-        val ins: *ir_instruction.Instruction = ?fn.instrs[i];
-        if (ins.kind != ir_instruction.OP_CBR || ins.operand_count != 3) {
-            i = i + 1;
-            cnt;
-        }
-        if (ins.operands[0].kind != value.VAL_INSTR) {
-            i = i + 1;
-            cnt;
-        }
-        val cond: *ir_instruction.Instruction = ?fn.instrs[ins.operands[0].data.instr::u32];
-        if (cond.kind != ir_instruction.OP_CMP_LT_U || cond.operand_count != 2
-            || cond.operands[0].kind != value.VAL_CONST_INT
-            || cond.operands[0].data.int_lit != TEST_STATUS_WIDE) {
-            i = i + 1;
-            cnt;
-        }
-        guarded = guarded + 1;
-        val target: u32 = ins.operands[1].data.int_lit::u32;
-        if (target >= fn.block_count) { ret 3; }
-        val blk: *me_ir.Block = ?fn.blocks[target];
-        if (blk.instr_count != 0 || blk.phi_count != 0) { ret 4; }
-        val fold: *ir_instruction.Instruction = ?fn.instrs[blk.terminator::u32];
-        if (fold.kind != ir_instruction.OP_RET || fold.operand_count != 1
-            || fold.operands[0].kind != value.VAL_CONST_INT
-            || fold.operands[0].data.int_lit != TEST_STATUS_WIDE) { ret 5; }
-        i = i + 1;
-    }
-    # one guard per test
-    if (guarded != 2) { ret 6; }
-    ret 0;
+# add a function to the dispatcher's unit with what mach knows of it
+fun add(u: *lower_context.Unit, data: FunctionData, name: intern.StrId, defined: bool) res[id.Function, fail.Fail] {
+    val made: res[id.Function, mirl_module.Error] = mirl_module.add_function(?u.m, data);
+    if (sel made.err) { ret res[id.Function, fail.Fail].err{fail.message("test dispatcher: mirl refused a function")}; }
+    val pushed: res[usize, A.Error] = collections_vector.push[lower_context.FnInfo](?u.fns,
+        lower_context.FnInfo{name: name, line: 0, test: false, noreturn: false, defined: defined});
+    if (sel pushed.err) { ret res[id.Function, fail.Fail].err{fail.refused(pushed.err)}; }
+    ret res[id.Function, fail.Fail].ok{made.ok};
 }
