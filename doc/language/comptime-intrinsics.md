@@ -845,7 +845,7 @@ Code intrinsics — runtime-instruction emitters like `trap`, `fence`,
 `pause` — are not in the compiler-shipped set. They belong in stdlib as
 functions with per-arch `asm` bodies. See [policy.md](policy.md).
 
-**`$assert` is not an intrinsic either**, and is not planned as one: `$if` and
+**`$assert` is not an intrinsic either**, and it won't become one: `$if` and
 `$error` already compose to it exactly, so a dedicated directive would add spelling
 without adding capability. Write the composition directly.
 

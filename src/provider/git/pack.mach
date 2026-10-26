@@ -1,0 +1,534 @@
+# checked pack decoding with bounded zlib streams and delta reconstruction
+
+use mach.provider.git.object;
+use mach.provider.git.protocol;
+use A: std.allocator;
+use std.collections.map;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use inflater: std.compress.inflate;
+use std.compress.zlib;
+use std.crypto.hash.siphash;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+pub val MAX_OBJECT:      usize = 67108864;
+pub val MAX_TOTAL:       usize = 536870912;
+pub val MAX_OBJECTS:     usize = 1000000;
+pub val MAX_DELTA_DEPTH: usize = 64;
+
+pub rec Object {
+    id:     object.Id;
+    kind:   u8;
+    bytes:  Vector[u8];
+    offset: usize;
+    depth:  usize;
+}
+
+pub rec Pack {
+    objects:     Vector[Object];
+    index:       map.MapKeyed[IdKey, usize];
+    index_ready: bool;
+}
+
+rec Pending {
+    kind:        u8;
+    bytes:       Vector[u8];
+    offset:      usize;
+    base_offset: usize;
+    base_id:     object.Id;
+    resolved:    bool;
+}
+
+rec IdKey {
+    a:   u64;
+    b:   u64;
+    c:   u64;
+    d:   u64;
+    len: usize;
+}
+
+fun id_key(id: *object.Id) IdKey {
+    var words: [4]u64;
+    var i:     usize = 0;
+    for (i < id.len) {
+        words[i / 8] = words[i / 8] | (id.bytes[i]::u64 << ((i % 8) * 8)::u32);
+        i            = i + 1;
+    }
+    ret IdKey{a: words[0], b: words[1], c: words[2], d: words[3], len: id.len};
+}
+
+pub fun dnit(p: *Pack) {
+    if (p.index_ready) {
+        map.dnit_keyed[IdKey, usize](?p.index);
+        p.index_ready = false;
+    }
+    var i: usize = 0;
+    for (i < p.objects.len) {
+        vector.dnit[u8](?p.objects.data[i].bytes);
+        i = i + 1;
+    }
+    vector.dnit[Object](?p.objects);
+}
+
+pub fun kind_name(kind: u8) str {
+    if (kind == 1) { ret "commit"; }
+    if (kind == 2) { ret "tree"; }
+    if (kind == 3) { ret "blob"; }
+    if (kind == 4) { ret "tag"; }
+    ret "";
+}
+
+pub fun read_be32(data: *u8) u32 {
+    ret (data[0]::u32 << 24) | (data[1]::u32 << 16) | (data[2]::u32 << 8) | data[3]::u32;
+}
+
+fun inflate(a: *A.Allocator, r: *protocol.Reader, size: usize) res[Vector[u8], str] {
+    val created: res[zlib.Decompressor, zlib.InflateError] = zlib.init(a);
+    if (sel created.err) { ret res[Vector[u8], str].err{"Git inflater allocation refused"}; }
+    var z: zlib.Decompressor = created.ok;
+    fin { zlib.dnit(?z); }
+    var out:  Vector[u8] = vector.init[u8](a);
+    var keep: bool       = false;
+    fin {
+        if (!keep) { vector.dnit[u8](?out); }
+    }
+    var scratch: [8192]u8;
+    for (!zlib.is_done(?z)) {
+        val step: res[zlib.Progress, zlib.InflateError] = zlib.decompress(?z,
+            ?r.data[r.pos], r.len - r.pos, ?scratch[0], 8192);
+        if (sel step.err)                     { ret res[Vector[u8], str].err{"invalid Git object zlib stream"}; }
+        if (step.ok.written > size - out.len) { ret res[Vector[u8], str].err{"Git object exceeds declared size"}; }
+        val appended: err[str] = protocol.append_bytes(?out, ?scratch[0], step.ok.written);
+        if (sel appended.err) { ret res[Vector[u8], str].err{appended.err}; }
+        r.pos = r.pos + step.ok.consumed;
+        if (step.ok.consumed == 0 && step.ok.written == 0 && !zlib.is_done(?z)) {
+            ret res[Vector[u8], str].err{"truncated Git object zlib stream"};
+        }
+    }
+    # the inflater may have prefetched bytes belonging to the next pack entry
+    val prefetched: usize = inflater.buffered_bytes(?z.inf);
+    if (prefetched > r.pos) { ret res[Vector[u8], str].err{"invalid Git inflater position"}; }
+    r.pos = r.pos - prefetched;
+    if (out.len != size) { ret res[Vector[u8], str].err{"Git object size mismatch"}; }
+    keep = true;
+    ret res[Vector[u8], str].ok{out};
+}
+
+fun entry(a: *A.Allocator, r: *protocol.Reader, hash_len: usize) res[Pending, str] {
+    if (r.pos == r.len) { ret res[Pending, str].err{"truncated Git pack entry"}; }
+    var item: Pending;
+    item.offset = r.pos;
+    var b: u8 = r.data[r.pos];
+    r.pos     = r.pos + 1;
+    item.kind = (b >> 4) & 7;
+    var size:  usize = (b & 15)::usize;
+    var shift: u32   = 4;
+    for ((b & 128) != 0) {
+        if (r.pos == r.len || shift >= 64) { ret res[Pending, str].err{"invalid Git pack size"}; }
+        b     = r.data[r.pos];
+        r.pos = r.pos + 1;
+        if ((b & 127)::usize > (0xffffffffffffffffu64::usize >> shift)) {
+            ret res[Pending, str].err{"Git pack size overflow"};
+        }
+        size  = size | ((b & 127)::usize << shift);
+        shift = shift + 7;
+    }
+    if (size > MAX_OBJECT) { ret res[Pending, str].err{"Git object exceeds size limit"}; }
+    if (item.kind == 6) {
+        if (r.pos == r.len) { ret res[Pending, str].err{"truncated Git delta offset"}; }
+        b     = r.data[r.pos];
+        r.pos = r.pos + 1;
+        var distance: usize = (b & 127)::usize;
+        for ((b & 128) != 0) {
+            if (r.pos == r.len || distance >= (0xffffffffffffffffu64::usize >> 7)) {
+                ret res[Pending, str].err{"invalid Git delta offset"};
+            }
+            b        = r.data[r.pos];
+            r.pos    = r.pos + 1;
+            distance = ((distance + 1) << 7) | (b & 127)::usize;
+        }
+        if (distance == 0 || distance > item.offset - 12) {
+            ret res[Pending, str].err{"Git delta base outside pack"};
+        }
+        item.base_offset = item.offset - distance;
+    }
+    or (item.kind == 7) {
+        if (hash_len > r.len - r.pos) { ret res[Pending, str].err{"truncated Git delta base ID"}; }
+        item.base_id.len = hash_len;
+        var i: usize = 0;
+        for (i < hash_len) {
+            item.base_id.bytes[i] = r.data[r.pos + i];
+            i                     = i + 1;
+        }
+        r.pos = r.pos + hash_len;
+    }
+    or (item.kind < 1 || item.kind > 4) { ret res[Pending, str].err{"invalid Git pack object type"}; }
+    val decoded: res[Vector[u8], str] = inflate(a, r, size);
+    if (sel decoded.err) { ret res[Pending, str].err{decoded.err}; }
+    item.bytes = decoded.ok;
+    ret res[Pending, str].ok{item};
+}
+
+pub fun find(p: *Pack, id: *object.Id) *Object {
+    if (p.index_ready) {
+        var key:     IdKey       = id_key(id);
+        val located: opt[*usize] = map.get_keyed[IdKey, usize](?p.index, ?key);
+        if (sel located.some) { ret ?p.objects.data[@located.some]; }
+        ret nil;
+    }
+    var i: usize = 0;
+    for (i < p.objects.len) {
+        if (object.equal(?p.objects.data[i].id, id)) { ret ?p.objects.data[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# decode a self-contained pack; upload-pack requests must not negotiate thin-pack
+pub fun decode(a: *A.Allocator, data: *u8, len: usize, hash_len: usize) res[Pack, str] {
+    if (data == nil || (hash_len != 20 && hash_len != 32) || len < 12 + hash_len || len > MAX_TOTAL) {
+        ret res[Pack, str].err{"invalid Git pack length"};
+    }
+    if (data[0] != 'P' || data[1] != 'A' || data[2] != 'C' || data[3] != 'K') {
+        ret res[Pack, str].err{"invalid Git pack signature"};
+    }
+    val version: u32 = read_be32(?data[4]);
+    if (version != 2 && version != 3) { ret res[Pack, str].err{"unsupported Git pack version"}; }
+    val count: usize = read_be32(?data[8])::usize;
+    if (count > MAX_OBJECTS || count > len - 12 - hash_len) { ret res[Pack, str].err{"Git pack object count exceeds limit"}; }
+    val computed: res[object.Id, str] = object.digest(data, len - hash_len, hash_len);
+    if (sel computed.err) { ret res[Pack, str].err{computed.err}; }
+    var checksum: object.Id = computed.ok;
+    var j:        usize     = 0;
+    for (j < hash_len) {
+        if (checksum.bytes[j] != data[len - hash_len + j]) { ret res[Pack, str].err{"Git pack checksum mismatch"}; }
+        j = j + 1;
+    }
+    var pending: Vector[Pending] = vector.init[Pending](a);
+    fin {
+        var i: usize = 0;
+        for (i < pending.len) {
+            vector.dnit[u8](?pending.data[i].bytes);
+            i = i + 1;
+        }
+        vector.dnit[Pending](?pending);
+    }
+    var p: Pack;
+    p.objects = vector.init[Object](a);
+    var keep: bool = false;
+    fin {
+        if (!keep) { dnit(?p); }
+    }
+    var r:     protocol.Reader = protocol.Reader{data: data, len: len - hash_len, pos: 12};
+    var total: usize           = 0;
+    var i:     usize           = 0;
+    for (i < count) {
+        val parsed: res[Pending, str] = entry(a, ?r, hash_len);
+        if (sel parsed.err) { ret res[Pack, str].err{parsed.err}; }
+        var item: Pending = parsed.ok;
+        if (item.bytes.len > MAX_TOTAL - total) {
+            vector.dnit[u8](?item.bytes);
+            ret res[Pack, str].err{"Git pack decompressed bytes exceed limit"};
+        }
+        total = total + item.bytes.len;
+        val added: res[usize, A.Error] = vector.push[Pending](?pending, item);
+        if (sel added.err) {
+            vector.dnit[u8](?item.bytes);
+            ret res[Pack, str].err{"Git pack allocation refused"};
+        }
+        i = i + 1;
+    }
+    if (r.pos != r.len) { ret res[Pack, str].err{"trailing Git pack bytes"}; }
+    val random: opt[siphash.Key] = siphash.random_key();
+    if (sel random.none) { ret res[Pack, str].err{"Git object index entropy unavailable"}; }
+    var ids:     map.MapKeyed[IdKey, usize] = map.init_keyed[IdKey, usize](a, random.some);
+    var offsets: map.MapKeyed[usize, usize] = map.init_keyed[usize, usize](a, random.some);
+    fin {
+        if (!keep) { map.dnit_keyed[IdKey, usize](?ids); }
+        map.dnit_keyed[usize, usize](?offsets);
+    }
+    for (p.objects.len < count) {
+        val before: usize = p.objects.len;
+        i = 0;
+        for (i < pending.len) {
+            val item: *Pending = ?pending.data[i];
+            if (item.resolved) {
+                i = i + 1;
+                cnt;
+            }
+            var kind:  u8         = item.kind;
+            var depth: usize      = 0;
+            var bytes: Vector[u8] = vector.init[u8](a);
+            if (kind == 6 || kind == 7) {
+                var base: *Object = nil;
+                if (kind == 6) {
+                    val located: opt[*usize] = map.get_keyed[usize, usize](?offsets, ?item.base_offset);
+                    if (sel located.some) { base = ?p.objects.data[@located.some]; }
+                }
+                or {
+                    var key:     IdKey       = id_key(?item.base_id);
+                    val located: opt[*usize] = map.get_keyed[IdKey, usize](?ids, ?key);
+                    if (sel located.some) { base = ?p.objects.data[@located.some]; }
+                }
+                if (base == nil) {
+                    i = i + 1;
+                    cnt;
+                }
+                if (base.depth >= MAX_DELTA_DEPTH) { ret res[Pack, str].err{"Git delta chain exceeds limit"}; }
+                val expanded: res[Vector[u8], str] = protocol.apply_delta(a, base.bytes.data, base.bytes.len,
+                    item.bytes.data, item.bytes.len, MAX_OBJECT);
+                if (sel expanded.err) { ret res[Pack, str].err{expanded.err}; }
+                bytes = expanded.ok;
+                kind  = base.kind;
+                depth = base.depth + 1;
+                if (bytes.len > MAX_TOTAL - total) {
+                    vector.dnit[u8](?bytes);
+                    ret res[Pack, str].err{"Git delta expansion exceeds total limit"};
+                }
+                total = total + bytes.len;
+            }
+            or {
+                bytes      = item.bytes;
+                item.bytes = vector.init[u8](a);
+            }
+            val hashed: res[object.Id, str] = object.object_id(kind_name(kind), bytes.data, bytes.len, hash_len);
+            if (sel hashed.err) {
+                vector.dnit[u8](?bytes);
+                ret res[Pack, str].err{hashed.err};
+            }
+            val added: res[usize, A.Error] = vector.push[Object](?p.objects,
+                Object{id: hashed.ok, kind: kind, bytes: bytes, offset: item.offset, depth: depth});
+            if (sel added.err) {
+                vector.dnit[u8](?bytes);
+                ret res[Pack, str].err{"Git object allocation refused"};
+            }
+            val position: usize              = p.objects.len - 1;
+            val indexed:  res[bool, A.Error] = map.insert_keyed[IdKey, usize](?ids, id_key(?p.objects.data[position].id), position);
+            if (sel indexed.err) { ret res[Pack, str].err{"Git object ID index allocation refused"}; }
+            val positioned: res[bool, A.Error] = map.insert_keyed[usize, usize](?offsets, item.offset, position);
+            if (sel positioned.err) { ret res[Pack, str].err{"Git object offset index allocation refused"}; }
+            item.resolved = true;
+            i             = i + 1;
+        }
+        if (p.objects.len == before) { ret res[Pack, str].err{"Git delta base missing or cyclic"}; }
+    }
+    p.index       = ids;
+    p.index_ready = true;
+    keep          = true;
+    ret res[Pack, str].ok{p};
+}
+
+rec PackIndex {
+    data:     *u8;
+    count:    usize;
+    hash_len: usize;
+    offsets:  usize;
+    large:    usize;
+    end:      usize;
+}
+
+fun indexed_offset(index: *PackIndex, id: *object.Id) res[usize, str] {
+    var low:  usize = 0;
+    var high: usize = index.count;
+    for (low < high) {
+        val middle: usize = low + (high - low) / 2;
+        val at:     usize = 1032 + middle * index.hash_len;
+        var i:      usize = 0;
+        for (i < index.hash_len && index.data[at + i] == id.bytes[i]) { i = i + 1; }
+        if (i == index.hash_len) {
+            val value: u32 = read_be32(?index.data[index.offsets + middle * 4]);
+            if ((value & 0x80000000) == 0) { ret res[usize, str].ok{value::usize}; }
+            val slot: usize = (value & 0x7fffffff)::usize;
+            if (slot >= (index.end - index.large) / 8) { ret res[usize, str].err{"Git pack index large offset outside table"}; }
+            val pos:    usize = index.large + slot * 8;
+            val offset: u64   = (read_be32(?index.data[pos])::u64 << 32) | read_be32(?index.data[pos + 4])::u64;
+            if (offset > MAX_TOTAL::u64) { ret res[usize, str].err{"Git pack offset exceeds limit"}; }
+            ret res[usize, str].ok{offset::usize};
+        }
+        if (index.data[at + i] < id.bytes[i]) { low = middle + 1; }
+        or                                    { high = middle; }
+    }
+    ret res[usize, str].err{"Git object is absent from pack index"};
+}
+
+fun indexed_object(a: *A.Allocator, data: *u8, len: usize, index: *PackIndex,
+    offset: usize, depth: usize, budget: *usize) res[Object, str] {
+    if (offset < 12 || offset >= len - index.hash_len || depth > MAX_DELTA_DEPTH) {
+        ret res[Object, str].err{"invalid Git indexed object offset or delta depth"};
+    }
+    var r:      protocol.Reader   = protocol.Reader{data: data, len: len - index.hash_len, pos: offset};
+    val parsed: res[Pending, str] = entry(a, ?r, index.hash_len);
+    if (sel parsed.err) { ret res[Object, str].err{parsed.err}; }
+    var item: Pending = parsed.ok;
+    fin { vector.dnit[u8](?item.bytes); }
+    if (item.bytes.len > MAX_TOTAL - @budget) { ret res[Object, str].err{"Git indexed object expansion exceeds limit"}; }
+    @budget = @budget + item.bytes.len;
+    var kind:  u8         = item.kind;
+    var bytes: Vector[u8] = vector.init[u8](a);
+    var keep:  bool       = false;
+    fin {
+        if (!keep) { vector.dnit[u8](?bytes); }
+    }
+    if (kind == 6 || kind == 7) {
+        var base_offset: usize = item.base_offset;
+        if (kind == 7) {
+            val located: res[usize, str] = indexed_offset(index, ?item.base_id);
+            if (sel located.err) { ret res[Object, str].err{located.err}; }
+            base_offset = located.ok;
+        }
+        val decoded: res[Object, str] = indexed_object(a, data, len, index, base_offset, depth + 1, budget);
+        if (sel decoded.err) { ret decoded; }
+        var base: Object = decoded.ok;
+        fin { vector.dnit[u8](?base.bytes); }
+        if (kind == 7 && !object.equal(?base.id, ?item.base_id)) { ret res[Object, str].err{"Git indexed reference delta base hash mismatch"}; }
+        val expanded: res[Vector[u8], str] = protocol.apply_delta(a, base.bytes.data, base.bytes.len,
+            item.bytes.data, item.bytes.len, MAX_OBJECT);
+        if (sel expanded.err) { ret res[Object, str].err{expanded.err}; }
+        bytes = expanded.ok;
+        if (bytes.len > MAX_TOTAL - @budget) { ret res[Object, str].err{"Git indexed delta expansion exceeds limit"}; }
+        @budget = @budget + bytes.len;
+        kind    = base.kind;
+    }
+    or {
+        bytes      = item.bytes;
+        item.bytes = vector.init[u8](a);
+    }
+    val hashed: res[object.Id, str] = object.object_id(kind_name(kind), bytes.data, bytes.len, index.hash_len);
+    if (sel hashed.err) { ret res[Object, str].err{hashed.err}; }
+    keep = true;
+    ret res[Object, str].ok{Object{id: hashed.ok, kind: kind, bytes: bytes, offset: offset, depth: depth}};
+}
+
+pub rec IndexedPack { data: *u8; len: usize; index: PackIndex; }
+
+# verify immutable pack and index buffers once before repeated object reads
+pub fun open_indexed(data: *u8, len: usize,
+    index_data: *u8, index_len: usize, h: usize) res[IndexedPack, str] {
+    if ((h != 20 && h != 32) || data == nil || index_data == nil || len < 12 + h || len > MAX_TOTAL
+        || index_len < 1032 + h * 2 || index_len > MAX_TOTAL) { ret res[IndexedPack, str].err{"invalid Git indexed pack size"}; }
+    if (data[0] != 'P' || data[1] != 'A' || data[2] != 'C' || data[3] != 'K'
+        || (read_be32(?data[4]) != 2 && read_be32(?data[4]) != 3)) { ret res[IndexedPack, str].err{"invalid Git indexed pack header"}; }
+    if (read_be32(index_data) != 0xff744f63 || read_be32(?index_data[4]) != 2) {
+        ret res[IndexedPack, str].err{"unsupported Git pack index format"};
+    }
+    val count: usize = read_be32(?index_data[1028])::usize;
+    val end:   usize = index_len - h * 2;
+    if (count > MAX_OBJECTS || count != read_be32(?data[8])::usize || count > (end - 1032) / (h + 8)) {
+        ret res[IndexedPack, str].err{"invalid Git pack index object count"};
+    }
+    val index_hash: res[object.Id, str] = object.digest(index_data, index_len - h, h);
+    if (sel index_hash.err) { ret res[IndexedPack, str].err{index_hash.err}; }
+    val pack_hash: res[object.Id, str] = object.digest(data, len - h, h);
+    if (sel pack_hash.err) { ret res[IndexedPack, str].err{pack_hash.err}; }
+    var ih: object.Id = index_hash.ok;
+    var ph: object.Id = pack_hash.ok;
+    var i:  usize     = 0;
+    for (i < h) {
+        if (ih.bytes[i] != index_data[index_len - h + i] || ph.bytes[i] != data[len - h + i]
+            || ph.bytes[i] != index_data[end + i]) { ret res[IndexedPack, str].err{"Git pack or index checksum mismatch"}; }
+        i = i + 1;
+    }
+    var prior: u32 = 0;
+    i = 0;
+    for (i < 256) {
+        val value: u32 = read_be32(?index_data[8 + i * 4]);
+        if (value < prior || value::usize > count) { ret res[IndexedPack, str].err{"invalid Git pack index fanout"}; }
+        prior = value;
+        i     = i + 1;
+    }
+    var index: PackIndex = PackIndex{data: index_data, count: count, hash_len: h,
+        offsets: 1032 + count * (h + 4), large: 1032 + count * (h + 8), end: end};
+    if ((end - index.large) % 8 != 0) { ret res[IndexedPack, str].err{"invalid Git pack index large offset table"}; }
+    ret res[IndexedPack, str].ok{IndexedPack{data: data, len: len, index: index}};
+}
+
+# the owner keeps both verified buffers immutable for this view's entire lifetime
+pub fun read_opened(a: *A.Allocator, p: *IndexedPack, id: *object.Id) res[Object, str] {
+    if (id.len != p.index.hash_len) { ret res[Object, str].err{"Git indexed object format mismatch"}; }
+    val offset: res[usize, str] = indexed_offset(?p.index, id);
+    if (sel offset.err) { ret res[Object, str].err{offset.err}; }
+    var budget:  usize            = 0;
+    val decoded: res[Object, str] = indexed_object(a, p.data, p.len, ?p.index, offset.ok, 0, ?budget);
+    if (sel decoded.err) { ret decoded; }
+    var result: Object = decoded.ok;
+    if (!object.equal(?result.id, id)) {
+        vector.dnit[u8](?result.bytes);
+        ret res[Object, str].err{"Git indexed object hash mismatch"};
+    }
+    ret res[Object, str].ok{result};
+}
+
+pub fun read_indexed(a: *A.Allocator, data: *u8, len: usize, index_data: *u8, index_len: usize, id: *object.Id) res[Object, str] {
+    val opened: res[IndexedPack, str] = open_indexed(data, len, index_data, index_len, id.len);
+    if (sel opened.err) { ret res[Object, str].err{opened.err}; }
+    var p: IndexedPack = opened.ok;
+    ret read_opened(a, ?p, id);
+}
+
+use std.allocator.page;
+use std.print;
+
+val T_PLAIN: [46]u8 = [46]u8{0x50, 0x41, 0x43, 0x4b, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x35, 0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x06, 0x2c, 0x02, 0x15, 0x77, 0x20, 0xd4, 0x1b, 0xf3, 0xa7, 0x16, 0xde, 0xc8, 0x04, 0x1e, 0xcc, 0x7e, 0x0a, 0x74, 0x84, 0xea, 0x53, 0x44, 0xdc};
+
+val T_OFFSET: [62]u8 = [62]u8{0x50, 0x41, 0x43, 0x4b, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x35, 0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x06, 0x2c, 0x02, 0x15, 0x66, 0x0e, 0x78, 0x9c, 0x63, 0x65, 0x9b, 0xc0, 0xca, 0xa8, 0x08, 0x00, 0x02, 0xb4, 0x00, 0xc3, 0x0c, 0x4a, 0x21, 0x02, 0x26, 0xd6, 0x94, 0xa9, 0x6f, 0xb6, 0x8f, 0xc9, 0x97, 0x9c, 0xed, 0x96, 0x14, 0x1c, 0xb0, 0xfe};
+
+val T_REFERENCE: [81]u8 = [81]u8{0x50, 0x41, 0x43, 0x4b, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x76, 0xb6, 0xfc, 0x4c, 0x62, 0x0b, 0x67, 0xd9, 0x5f, 0x95, 0x3a, 0x5c, 0x1c, 0x12, 0x30, 0xaa, 0xab, 0x5d, 0xb5, 0xa1, 0xb0, 0x78, 0x9c, 0x63, 0x65, 0x9b, 0xc0, 0xca, 0xa8, 0x08, 0x00, 0x02, 0xb4, 0x00, 0xc3, 0x35, 0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x06, 0x2c, 0x02, 0x15, 0x12, 0xe2, 0x1f, 0xf6, 0x4c, 0xc6, 0x50, 0x46, 0xda, 0x7b, 0x0f, 0xd9, 0xdf, 0x64, 0xc0, 0xc1, 0x7a, 0xfb, 0xc2, 0xa7};
+
+val T_SHA256: [58]u8 = [58]u8{0x50, 0x41, 0x43, 0x4b, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x35, 0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x06, 0x2c, 0x02, 0x15, 0xbd, 0xbb, 0x5a, 0xda, 0xaf, 0x2e, 0xe6, 0xb8, 0x2b, 0x8c, 0x85, 0x38, 0xb1, 0x17, 0x53, 0xfc, 0x86, 0x1b, 0x1e, 0x15, 0x1c, 0xd4, 0xea, 0x0c, 0xb6, 0x39, 0x65, 0x3f, 0x02, 0x09, 0x5b, 0x9b};
+
+fun t_pack(data: *u8, len: usize, hash_len: usize, count: usize, expanded: bool) i32 {
+    var a: A.Allocator;
+    page.make(?a);
+    val parsed: res[Pack, str] = decode(?a, data, len, hash_len);
+    if (sel parsed.err) {
+        print.eprintln(parsed.err);
+        ret 1;
+    }
+    var p: Pack = parsed.ok;
+    fin { dnit(?p); }
+    if (p.objects.len != count) { ret 2; }
+    if (expanded) {
+        var found: bool  = false;
+        var i:     usize = 0;
+        for (i < p.objects.len) {
+            val item: *Object = ?p.objects.data[i];
+            if (item.bytes.len == 6 && item.bytes.data[5] == '!') { found = true; }
+            i = i + 1;
+        }
+        if (!found) { ret 3; }
+    }
+    var n: usize = 0;
+    for (n < len) {
+        val truncated: res[Pack, str] = decode(?a, data, n, hash_len);
+        if (sel truncated.ok) {
+            var leaked: Pack = truncated.ok;
+            dnit(?leaked);
+            ret 4;
+        }
+        n = n + 1;
+    }
+    ret 0;
+}
+
+test pack__plain {
+    ret t_pack(?T_PLAIN[0], 46, 20, 1, false);
+}
+
+test pack__offset {
+    ret t_pack(?T_OFFSET[0], 62, 20, 2, true);
+}
+
+test pack__reference {
+    ret t_pack(?T_REFERENCE[0], 81, 20, 2, true);
+}
+
+test pack__sha256 {
+    ret t_pack(?T_SHA256[0], 58, 32, 1, false);
+}

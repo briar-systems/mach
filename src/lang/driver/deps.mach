@@ -2,6 +2,7 @@ use mach.lang.build.outcome;
 use dkind:     mach.lang.diagnostic.kind;
 use child_env: mach.lang.driver.environment;
 use mach.lang.fail;
+use native_git: mach.provider.git.native;
 use std.allocator.page;
 use std.collections.sort;
 use std.collections.vector;
@@ -71,6 +72,8 @@ rec GitTree {
 # a checkout drops the listings.
 rec GitInspector {
     program:       str;
+    native:        bool;
+    provider:      native_git.State;
     inherited_env: **u8;
     alloc:         *A.Allocator;
     env_ready:     bool;
@@ -81,15 +84,91 @@ rec GitInspector {
     trees_ready:   bool;
 }
 
-fun git_inspector_init(alloc: *A.Allocator) res[GitInspector, outcome.Fail] {
-    val rr: res[str, exec.Error] = exec.resolve(alloc, "git");
-    if (sel rr.err) { ret res[GitInspector, outcome.Fail].err{outcome.environment(dkind.GIT_MISSING, "git not found on PATH; dependency verification requires Git")}; }
-    val inherited: **u8 = env.environ();
-    if (inherited == nil) {
-        str_free(alloc, rr.ok);
-        ret res[GitInspector, outcome.Fail].err{outcome.environment(dkind.GIT_MISSING, "Git dependency environment unavailable")};
+# backend preference is fixed once per compiler invocation, never after an operation fails
+var git_backend: u8 = 0;
+
+# POSIX spawn reports an exec failure as 127; do not confuse that with a
+# running Git returning an error. Inspect only that ambiguous probe result.
+fun git_launcher_unavailable(a: *A.Allocator, program: str) bool {
+    val opened: res[fs.File, io_error.Error] = fs.open(program);
+    if (sel opened.err) { ret opened.err.kind == io_error.NOT_FOUND; }
+    var file: fs.File = opened.ok;
+    fin { fs.close(?file); }
+    var header: [512]u8;
+    val read:   res[usize, io_error.Error] = fs.read(file, ?header[0], 512);
+    if (sel read.err) { ret false; }
+    val n: usize = read.ok;
+    if (n >= 2 && header[0] == '#' && header[1] == '!') {
+        var start: usize = 2;
+        for (start < n && (header[start] == ' ' || header[start] == '\t')) { start = start + 1; }
+        var end: usize = start;
+        for (end < n && header[end] != ' ' && header[end] != '\t' && header[end] != '\n' && header[end] != '\r') { end = end + 1; }
+        if (end == n || start == end) { ret false; }
+        header[end] = 0;
+        val interpreter: res[str, exec.Error] = exec.resolve(a, (?header[start])::str);
+        if (sel interpreter.err) { ret true; }
+        str_free(a, interpreter.ok);
+        ret false;
     }
-    ret res[GitInspector, outcome.Fail].ok{GitInspector{program: rr.ok, inherited_env: inherited, alloc: alloc}};
+    if (n >= 4) {
+        if (header[0] == 127 && header[1] == 'E' && header[2] == 'L' && header[3] == 'F')                                                                        { ret n < 52; }
+        if (header[0] == 'M' && header[1] == 'Z')                                                                                                                { ret false; }
+        if ((header[0] == 0xcf || header[0] == 0xce) && header[1] == 0xfa && header[2] == 0xed && header[3] == 0xfe)                                             { ret false; }
+        if (header[0] == 0xfe && header[1] == 0xed && header[2] == 0xfa && (header[3] == 0xce || header[3] == 0xcf))                                             { ret false; }
+        if ((header[0] == 0xca && header[1] == 0xfe && header[2] == 0xba) || (header[0] == 0xbe && header[1] == 0xba && header[2] == 0xfe && header[3] == 0xca)) { ret false; }
+    }
+    ret true;
+}
+
+fun git_inspector_init(alloc: *A.Allocator) res[GitInspector, outcome.Fail] {
+    var gi: GitInspector;
+    gi.alloc         = alloc;
+    gi.inherited_env = env.environ();
+    if (gi.inherited_env == nil) { ret res[GitInspector, outcome.Fail].err{outcome.environment(dkind.GIT_COMMAND, "dependency environment unavailable")}; }
+    val resolved: res[str, exec.Error] = exec.resolve(alloc, "git");
+    val missing:  bool                 = sel resolved.err;
+    if (git_backend == 0) {
+        if (missing) { git_backend = 2; }
+        or (sel resolved.ok) {
+            var argv:  [3]*u8                       = [3]*u8{resolved.ok::*u8, "--version", nil};
+            val probe: res[exec.Output, exec.Error] = exec.output(alloc, resolved.ok, ?argv[0], gi.inherited_env);
+            if (sel probe.err) {
+                if (sel probe.err.native) {
+                    if (probe.err.native.operation == os.PROCESS_OP_SPAWN) { git_backend = 2; }
+                }
+                if (git_backend != 2) {
+                    str_free(alloc, resolved.ok);
+                    ret res[GitInspector, outcome.Fail].err{outcome.environment(dkind.GIT_COMMAND, "could not probe Git availability")};
+                }
+            }
+            or (sel probe.ok) {
+                var output:  exec.Output = probe.ok;
+                val success: bool        = output.status.kind == exec.PROCESS_EXITED && output.status.code == 0;
+                vector.dnit[u8](?output.bytes);
+                if (!success) {
+                    if (output.status.kind == exec.PROCESS_EXITED && output.status.code == 127 && git_launcher_unavailable(alloc, resolved.ok)) { git_backend = 2; }
+                    or {
+                        str_free(alloc, resolved.ok);
+                        ret res[GitInspector, outcome.Fail].err{outcome.environment(dkind.GIT_COMMAND, "git --version failed; external Git error retained")};
+                    }
+                }
+                or { git_backend = 1; }
+            }
+        }
+    }
+    if (git_backend == 2) {
+        if (sel resolved.ok) { str_free(alloc, resolved.ok); }
+        val sentinel: res[str, A.Error] = str_dup(alloc, "git");
+        if (sel sentinel.err) { ret res[GitInspector, outcome.Fail].err{outcome.refused(sentinel.err)}; }
+        gi.program  = sentinel.ok;
+        gi.native   = true;
+        gi.provider = native_git.init(alloc);
+    }
+    or {
+        if (sel resolved.err) { ret res[GitInspector, outcome.Fail].err{outcome.environment(dkind.GIT_MISSING, "selected external Git is no longer available")}; }
+        gi.program = resolved.ok;
+    }
+    ret res[GitInspector, outcome.Fail].ok{gi};
 }
 
 fun git_tree_free(alloc: *A.Allocator, t: *GitTree) {
@@ -115,6 +194,10 @@ fun git_inspector_drop_trees(gi: *GitInspector) {
 }
 
 fun git_inspector_dnit(alloc: *A.Allocator, gi: *GitInspector) {
+    if (gi.native) {
+        native_git.dnit(?gi.provider);
+        gi.native = false;
+    }
     git_inspector_drop_trees(gi);
     if (gi.env_ready) { child_env.strings_free(gi.alloc, ?gi.env); }
     gi.env_ready = false;
@@ -416,6 +499,24 @@ fun git_argv_reads_only(argv: **u8) bool {
 
 fun git_query_capture(alloc: *A.Allocator, gi: *GitInspector, dir: str, args: *str, count: usize,
     trim_line_end: bool, extra_env: **u8, stdin_fd: usize, capture_stderr: bool) res[GitBytes, outcome.Fail] {
+    if (gi.native) {
+        git_inspector_drop_trees(gi);
+        val result: res[Vector[u8], str] = native_git.run(?gi.provider, dir, args, count);
+        if (sel result.err) { ret res[GitBytes, outcome.Fail].err{outcome.environment(dkind.GIT_COMMAND, result.err)}; }
+        var bytes: Vector[u8] = result.ok;
+        fin { vector.dnit[u8](?bytes); }
+        var n: usize = bytes.len;
+        for (trim_line_end && n > 0 && (bytes.data[n - 1] == '\n' || bytes.data[n - 1] == '\r')) { n = n - 1; }
+        val copied: res[*u8, A.Error] = A.allocate[u8](alloc, n + 1);
+        if (sel copied.err) { ret res[GitBytes, outcome.Fail].err{outcome.refused(copied.err)}; }
+        var i: usize = 0;
+        for (i < n) {
+            copied.ok[i] = bytes.data[i];
+            i            = i + 1;
+        }
+        copied.ok[n] = 0;
+        ret res[GitBytes, outcome.Fail].ok{GitBytes{data: copied.ok, len: n}};
+    }
     val ar: res[**u8, A.Error] = A.allocate[*u8](alloc, count + 8);
     if (sel ar.err) { ret res[GitBytes, outcome.Fail].err{outcome.refused(ar.err)}; }
     val argv: **u8 = ar.ok;
@@ -2118,8 +2219,8 @@ fun project_root_authority(s: *session.Session, gi: *GitInspector, alias: str,
     val inside_r: res[str, outcome.Fail] = git_query(s.build_alloc, gi, project_root, ?inside_args[0], 2);
     if (sel inside_r.err) {
         val nr: res[str, format.FormatError] = format.sprint(s.build_alloc,
-            "dependency '{}': project root '{}' is not inside a Git repository; dependency realization is verified from Git",
-            alias, project_root);
+            "dependency '{}': project root '{}' is not inside a Git repository; dependency realization is verified from Git: {}",
+            alias, project_root, outcome.describe(inside_r.err));
         if (sel nr.err) { ret res[u8, outcome.Fail].err{outcome.user(dkind.DEP_NO_REPOSITORY, "project root is not inside a Git repository")}; }
         ret res[u8, outcome.Fail].err{outcome.user(dkind.DEP_NO_REPOSITORY, nr.ok)};
     }
@@ -3112,6 +3213,12 @@ fun add_git_submodule(s: *session.Session, gi: *GitInspector, root: str, id: str
     val metadata: err[outcome.Fail] = require_matches_index(s, gi, id, root, ".gitmodules", "dependency metadata before registration");
     if (sel metadata.err) { ret metadata; }
 
+    if (gi.native) {
+        val added: err[str] = native_git.add_dependency(?gi.provider, root, rel, url, ref, offline);
+        if (sel added.err) { ret err[outcome.Fail].err{outcome.environment(dkind.GIT_COMMAND, added.err)}; }
+        ret err[outcome.Fail].ok{};
+    }
+
     var add_args: [5]str = [5]str{"submodule", "add", url, rel, ""};
     var add_n:    usize  = 4;
     if (reuse_store) {
@@ -3390,6 +3497,11 @@ pub fun selection_commit(s: *session.Session, root: str, id: str, dep_full: str,
         if (sel held.ok) { ret held; }
         if (offline)     { ret res[str, outcome.Fail].err{offline_ref_missing(a, id, ref, dep_full)}; }
     }
+    if (gi.native) {
+        val fetched: err[str] = native_git.fetch_selection(?gi.provider, dep_full, ref);
+        if (sel fetched.err) { ret res[str, outcome.Fail].err{outcome.environment(dkind.GIT_COMMAND, fetched.err)}; }
+        ret git_query(a, ?gi, dep_full, ?args[0], 4);
+    }
     var fetch: [3]str                 = [3]str{"fetch", "--all", "--tags"};
     val f:     res[str, outcome.Fail] = git_op(a, ?gi, dep_full, ?fetch[0], 3, nil);
     if (sel f.err) { ret f; }
@@ -3492,6 +3604,11 @@ pub fun release_at_pin(s: *session.Session, root: str, id: str, dep_full: str, f
     if (sel held.err)                  { ret held; }
     if (!fetch || !str_empty(held.ok)) { ret held; }
     str_free(s.build_alloc, held.ok);
+    if (gi.native) {
+        val fetched: err[str] = native_git.ensure_pin_tag(?gi.provider, dep_full, pin.ok);
+        if (sel fetched.err) { ret res[str, outcome.Fail].err{outcome.environment(dkind.GIT_COMMAND, fetched.err)}; }
+        ret release_at(s.build_alloc, ?gi, dep_full, pin.ok);
+    }
     val fetched: err[outcome.Fail] = fetch_tags(s.build_alloc, ?gi, dep_full);
     if (sel fetched.err) { ret res[str, outcome.Fail].err{fetched.err}; }
     ret release_at(s.build_alloc, ?gi, dep_full, pin.ok);
@@ -3564,6 +3681,20 @@ pub fun fetch_selection_tags(s: *session.Session, root: str, id: str, dep_full: 
     or { ret res[bool, outcome.Fail].ok{false}; }
     var gi: GitInspector = GitInspector{program: nil};
     fin { git_inspector_dnit(a, ?gi); }
+    val required: err[outcome.Fail] = git_inspector_require(a, ?gi);
+    if (sel required.err) { ret res[bool, outcome.Fail].err{required.err}; }
+    if (gi.native) {
+        var fetched: err[str];
+        if (ranged) {
+            val pin: res[str, outcome.Fail] = pinned_commit(s, root, id, dep_full);
+            if (sel pin.err) { ret res[bool, outcome.Fail].err{pin.err}; }
+            fetched = native_git.ensure_pin_tag(?gi.provider, dep_full, pin.ok);
+            str_free(a, pin.ok);
+        }
+        or                   { fetched = native_git.fetch_selection(?gi.provider, dep_full, ref); }
+        if (sel fetched.err) { ret res[bool, outcome.Fail].err{outcome.environment(dkind.GIT_COMMAND, fetched.err)}; }
+        ret res[bool, outcome.Fail].ok{true};
+    }
     val fetched: err[outcome.Fail] = fetch_tags(a, ?gi, dep_full);
     if (sel fetched.err) { ret res[bool, outcome.Fail].err{fetched.err}; }
     ret res[bool, outcome.Fail].ok{true};
@@ -3673,7 +3804,17 @@ fun realize_git_clone_env(s: *session.Session, root: str, id: str, url: str, ref
     clone_args[0] = "clone";
     clone_args[1] = url;
     clone_args[2] = id;
-    val clone_r: res[str, outcome.Fail] = git_op(s.build_alloc, ?gi, dep_root, ?clone_args[0], 3, extra_env);
+    var clone_r: res[str, outcome.Fail];
+    if (gi.native) {
+        val cloned: err[str] = native_git.clone_selection(?gi.provider, dep_root, url, id, ref);
+        if (sel cloned.err) { clone_r = res[str, outcome.Fail].err{outcome.environment(dkind.GIT_COMMAND, cloned.err)}; }
+        or {
+            val empty: res[str, A.Error] = str_dup(s.build_alloc, "");
+            if (sel empty.err) { clone_r = res[str, outcome.Fail].err{outcome.refused(empty.err)}; }
+            or (sel empty.ok)  { clone_r = res[str, outcome.Fail].ok{empty.ok}; }
+        }
+    }
+    or { clone_r = git_op(s.build_alloc, ?gi, dep_root, ?clone_args[0], 3, extra_env); }
     str_free(s.build_alloc, dep_root);
     if (sel clone_r.err) {
         print.eprintlnf("note: cloning dep/{} failed; existing and partial checkouts retained", id);
@@ -4756,6 +4897,16 @@ pub fun fetch_and_checkout(s: *session.Session, id: str, dep_full: str, ref: str
         val out: err[outcome.Fail] = realize_selector_ref(s.build_alloc, ?gi, dep_full, ref, nil);
         git_inspector_dnit(s.build_alloc, ?gi);
         ret out;
+    }
+    if (gi.native) {
+        val fetched: err[str] = native_git.fetch_selection(?gi.provider, dep_full, ref);
+        if (sel fetched.err) {
+            git_inspector_dnit(s.build_alloc, ?gi);
+            ret err[outcome.Fail].err{outcome.environment(dkind.GIT_COMMAND, fetched.err)};
+        }
+        val moved: err[outcome.Fail] = realize_selector_ref(s.build_alloc, ?gi, dep_full, ref, nil);
+        git_inspector_dnit(s.build_alloc, ?gi);
+        ret moved;
     }
     var fetch_args: [3]str;
     fetch_args[0] = "fetch";

@@ -1,0 +1,444 @@
+# synchronous dependency requests over Mach HTTP and authenticated Mach TLS
+
+use crypto.contracts;
+use crypto.secret;
+use http.client.url;
+use http.core.field;
+use http.core.method;
+use http.h1.parser;
+use mach.provider.git.protocol;
+use A: std.allocator;
+use std.chrono.duration;
+use std.chrono.time;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use fs: std.filesystem;
+use std.format;
+use io_error: std.io.error;
+use std.io.lifecycle;
+use std.io.runtime;
+use std.memory.buffers;
+use net: std.net.async;
+use std.net.dns;
+use std.net.ip;
+use std.net.resolve.types;
+use std.net.tcp;
+use std.process.env;
+use std.sync.cancel;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_len;
+use std.types.view;
+use tls.buffer;
+use tls.cert.bundle;
+use tls.client;
+use tls.clock;
+use tls.config;
+use tls.error;
+use tls.record;
+use tls.stream;
+use tls.tls13;
+use tls.transport;
+
+pub val MAX_BODY: usize = 536870912;
+
+rec Connection {
+    rt:              runtime.Runtime;
+    driver:          net.Driver;
+    socket:          tcp.Stream;
+    scope:           cancel.Scope;
+    pool:            buffers.Pool;
+    account:         buffers.Account;
+    plain:           buffers.Source;
+    secrets:         buffers.SecretSource;
+    trust:           bundle.Loaded;
+    entropy:         secret.Entropy;
+    clock:           clock.Source;
+    configuration:   config.ClientConfig;
+    handshake:       client.Handshake;
+    tls:             stream.Stream;
+    adapter:         transport.TcpAdapter;
+    lower:           transport.Transport;
+    rt_ready:        bool;
+    driver_ready:    bool;
+    socket_ready:    bool;
+    scope_ready:     bool;
+    pool_ready:      bool;
+    account_ready:   bool;
+    handshake_ready: bool;
+    tls_ready:       bool;
+    generation:      u32;
+    alpn:            config.ProtocolName;
+    versions:        [1]u16;
+    suites:          [3]tls13.CipherSuite;
+    groups:          [2]tls13.NamedGroup;
+    signatures:      [5]tls13.SignatureScheme;
+}
+
+fun raw_wait(c: *Connection) res[runtime.Completion, str] {
+    var completion: runtime.Completion;
+    for {
+        val waited: res[usize, io_error.Error] = net.wait(?c.driver, ?completion, 1, 1000);
+        if (sel waited.err)       { ret res[runtime.Completion, str].err{"Git HTTPS transport wait failed"}; }
+        if (waited.ok == 0)       { cnt; }
+        if (completion.has_error) { ret res[runtime.Completion, str].err{"Git HTTPS transport operation failed"}; }
+        ret res[runtime.Completion, str].ok{completion};
+    }
+}
+
+fun tls_wait(c: *Connection, writing: bool, token: transport.Token) res[transport.Snapshot, str] {
+    for {
+        val state: stream.Snapshot    = stream.snapshot(?c.tls);
+        var op:    transport.Snapshot = state.read;
+        if (writing) { op = state.write; }
+        if (op.state == transport.OPERATION_TERMINAL) {
+            if (!stream.destroy_operation(?c.tls, token)) { ret res[transport.Snapshot, str].err{"Git TLS operation cleanup failed"}; }
+            if (op.terminal_error != error.OK)            { ret res[transport.Snapshot, str].err{"Git TLS handshake or data transfer failed"}; }
+            ret res[transport.Snapshot, str].ok{op};
+        }
+        var completion: runtime.Completion;
+        val waited:     res[usize, io_error.Error] = net.wait(?c.driver, ?completion, 1, 1000);
+        if (sel waited.err) { ret res[transport.Snapshot, str].err{"Git TLS transport wait failed"}; }
+        if (waited.ok != 0 && !stream.accept(?c.tls, ?completion)) {
+            ret res[transport.Snapshot, str].err{"unowned Git TLS completion"};
+        }
+    }
+}
+
+fun close(c: *Connection, a: *A.Allocator) {
+    if (c.scope_ready) { cancel.cancel(?c.scope); }
+    if (c.tls_ready) {
+        var completion: runtime.Completion;
+        for (runtime.pending(?c.rt) != 0) {
+            val waited: res[usize, io_error.Error] = net.wait(?c.driver, ?completion, 1, 1000);
+            if (sel waited.err) { brk; }
+            if (waited.ok != 0) { stream.accept(?c.tls, ?completion); }
+        }
+        stream.destroy(?c.tls);
+    }
+    if (c.handshake_ready) { client.destroy(?c.handshake); }
+    if (c.socket_ready) {
+        var closing: cancel.Scope;
+        cancel.make_root(?closing, opt[time.Instant].none{});
+        val submitted: res[runtime.Token, io_error.Error] = net.submit_stream_close(?c.driver,
+            ?closing, ?c.socket, lifecycle.ABORTIVE, 0);
+        if (sel submitted.ok) { raw_wait(c); }
+        cancel.destroy(?closing);
+    }
+    if (c.driver_ready)  { net.destroy(?c.driver); }
+    if (c.rt_ready)      { runtime.destroy(?c.rt); }
+    if (c.scope_ready)   { cancel.destroy(?c.scope); }
+    if (c.account_ready) { buffers.close_account(?c.pool, ?c.account); }
+    if (c.pool_ready)    { buffers.destroy(?c.pool); }
+    bundle.release(a, ?c.trust);
+}
+
+fun raw_write(c: *Connection, data: *u8, len: usize) err[str] {
+    var pos: usize = 0;
+    for (pos < len) {
+        val submitted: res[runtime.Token, io_error.Error] = net.submit_write(?c.driver, ?c.scope,
+            ?c.socket, ?data[pos], len - pos, 0);
+        if (sel submitted.err) { ret err[str].err{"Git proxy request failed"}; }
+        val done: res[runtime.Completion, str] = raw_wait(c);
+        if (sel done.err)       { ret err[str].err{done.err}; }
+        if (done.ok.bytes == 0) { ret err[str].err{"Git proxy request made no progress"}; }
+        pos = pos + done.ok.bytes;
+    }
+    ret err[str].ok{};
+}
+
+fun proxy_connect(c: *Connection, a: *A.Allocator, authority: str) err[str] {
+    val request: res[str, format.FormatError] = format.sprint(a,
+        "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n", authority, authority);
+    if (sel request.err) { ret err[str].err{"Git proxy request allocation refused"}; }
+    fin { str_free(a, request.ok); }
+    val sent: err[str] = raw_write(c, request.ok, str_len(request.ok));
+    if (sel sent.err) { ret sent; }
+    var head: [32768]u8;
+    var n:    usize = 0;
+    for (n < 32768) {
+        val submitted: res[runtime.Token, io_error.Error] = net.submit_read(?c.driver, ?c.scope,
+            ?c.socket, ?head[n], 1, 0);
+        if (sel submitted.err) { ret err[str].err{"Git proxy response failed"}; }
+        val done: res[runtime.Completion, str] = raw_wait(c);
+        if (sel done.err)       { ret err[str].err{done.err}; }
+        if (done.ok.bytes != 1) { ret err[str].err{"Git proxy closed before CONNECT response"}; }
+        n = n + 1;
+        if (n >= 4 && head[n - 4] == '\r' && head[n - 3] == '\n' && head[n - 2] == '\r' && head[n - 1] == '\n') { brk; }
+    }
+    if (n < 12 || n == 32768 || head[0] != 'H' || head[1] != 'T' || head[2] != 'T'
+        || head[3] != 'P' || head[8] != ' ' || head[9] != '2' || head[10] != '0' || head[11] != '0') {
+        ret err[str].err{"Git HTTPS proxy refused CONNECT"};
+    }
+    ret err[str].ok{};
+}
+
+fun trust(c: *Connection, a: *A.Allocator) err[str] {
+    var configured:   [8192]u8;
+    val configured_r: res[opt[usize], env.EnvError] = env.get("SSL_CERT_FILE", ?configured[0], 8192);
+    if (sel configured_r.err) { ret err[str].err{"could not read HTTPS CA configuration"}; }
+    var configured_len: usize = 0;
+    if (sel configured_r.ok.some) { configured_len = configured_r.ok.some; }
+    if (configured_len != 0) {
+        if (configured_len >= 8192 || bundle.load(a, (?configured[0])::str, ?c.trust) != bundle.OK) {
+            ret err[str].err{"could not load configured HTTPS CA bundle"};
+        }
+        ret err[str].ok{};
+    }
+    val paths: [4]str = [4]str{"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem", "/usr/local/share/certs/ca-root-nss.crt"};
+    var i: usize = 0;
+    for (i < 4) {
+        if (bundle.load(a, paths[i], ?c.trust) == bundle.OK) { ret err[str].ok{}; }
+        bundle.release(a, ?c.trust);
+        i = i + 1;
+    }
+    ret err[str].err{"no HTTPS CA bundle found; configure SSL_CERT_FILE"};
+}
+
+fun open(c: *Connection, a: *A.Allocator, target: url.URL) err[str] {
+    val made: err[io_error.Error] = runtime.make(?c.rt, a, 8);
+    if (sel made.err) { ret err[str].err{"Git network runtime creation failed"}; }
+    c.rt_ready = true;
+    val driven: err[io_error.Error] = net.make(?c.driver, ?c.rt);
+    if (sel driven.err) { ret err[str].err{"Git network driver creation failed"}; }
+    c.driver_ready = true;
+    val now: time.InstantClock = time.instant();
+    if (sel now.err) { ret err[str].err{"Git HTTPS clock unavailable"}; }
+    cancel.make_root(?c.scope, opt[time.Instant].some{time.instant_add(now.ok, 120 * duration.SECOND)});
+    c.scope_ready = true;
+    var proxy_text: [8192]u8;
+    var proxy_len:  usize                         = 0;
+    val proxy_r:    res[opt[usize], env.EnvError] = env.get("HTTPS_PROXY", ?proxy_text[0], 8192);
+    if (sel proxy_r.err)     { ret err[str].err{"could not read HTTPS proxy configuration"}; }
+    if (sel proxy_r.ok.some) { proxy_len = proxy_r.ok.some; }
+    if (proxy_len == 0) {
+        val lower: res[opt[usize], env.EnvError] = env.get("https_proxy", ?proxy_text[0], 8192);
+        if (sel lower.err)     { ret err[str].err{"could not read HTTPS proxy configuration"}; }
+        if (sel lower.ok.some) { proxy_len = lower.ok.some; }
+    }
+    if (proxy_len >= 8192) { ret err[str].err{"HTTPS proxy URL exceeds limit"}; }
+    var peer: url.URL = target;
+    if (proxy_len != 0) {
+        val proxy: url.Parsed = url.parse(view.view(?proxy_text[0], proxy_len), url.limits_default());
+        if (proxy.status != url.URL_OK || url.secure(proxy.url)) {
+            ret err[str].err{"Git HTTPS requires an HTTP CONNECT proxy"};
+        }
+        peer = proxy.url;
+    }
+    val name: res[str, string.StrError] = str_copy_slice(a, peer.host.data::str, 0, peer.host.len);
+    if (sel name.err) { ret err[str].err{"Git host allocation refused"}; }
+    fin { str_free(a, name.ok); }
+    var endpoint: ip.Endpoint;
+    endpoint.port = peer.port;
+    val literal: res[ip.Addr, ip.ParseError] = ip.addr_parse(name.ok);
+    if (sel literal.ok) { endpoint.addr = literal.ok; }
+    or {
+        var address:  ip.IPv4;
+        val resolved: res[bool, types.Error] = dns.resolve(name.ok, ?address);
+        if (sel resolved.err) { ret err[str].err{"Git HTTPS host resolution failed"}; }
+        if (!resolved.ok)     { ret err[str].err{"Git HTTPS host has no address"}; }
+        endpoint.addr.v4 = address;
+    }
+    val connected: res[runtime.Token, io_error.Error] = net.submit_connect(?c.driver, ?c.scope, endpoint, 0);
+    if (sel connected.err) { ret err[str].err{"Git HTTPS connection submission failed"}; }
+    val done: res[runtime.Completion, str] = raw_wait(c);
+    if (sel done.err) { ret err[str].err{done.err}; }
+    var completion: runtime.Completion = done.ok;
+    c.socket       = net.stream(?completion);
+    c.socket_ready = true;
+    if (proxy_len != 0) {
+        val host: res[str, string.StrError] = str_copy_slice(a, target.host.data::str, 0, target.host.len);
+        if (sel host.err) { ret err[str].err{"Git CONNECT hostname allocation refused"}; }
+        val authority: res[str, format.FormatError] = format.sprint(a, "{}:{}", host.ok, target.port);
+        str_free(a, host.ok);
+        if (sel authority.err) { ret err[str].err{"Git CONNECT authority allocation refused"}; }
+        val tunneled: err[str] = proxy_connect(c, a, authority.ok);
+        str_free(a, authority.ok);
+        if (sel tunneled.err) { ret tunneled; }
+    }
+    val trusted: err[str] = trust(c, a);
+    if (sel trusted.err) { ret trusted; }
+    var classes: [2]buffers.ClassConfig;
+    classes[0] = buffers.ClassConfig{size: 17408, align: 0, secret: false, high_water: 0};
+    classes[1] = buffers.ClassConfig{size: record.CONTEXT_SIZE, align: record.CONTEXT_ALIGN, secret: true, high_water: 0};
+    var pool_config: buffers.Config;
+    pool_config.classes       = ?classes[0];
+    pool_config.class_count   = 2;
+    pool_config.lanes         = 1;
+    pool_config.global_budget = 16777216;
+    pool_config.initial_slots = 32;
+    if (!buffers.make(?c.pool, pool_config, a)) { ret err[str].err{"Git TLS buffer pool creation failed"}; }
+    c.pool_ready = true;
+    var budgets: buffers.Budgets;
+    budgets.lanes    = 1;
+    budgets.bytes[0] = 16777216;
+    val accounted: buffers.Reason = buffers.open_account(?c.pool, ?c.account, 1, budgets, 0);
+    if (!(sel accounted.none)) { ret err[str].err{"Git TLS memory account creation failed"}; }
+    c.account_ready = true;
+    c.plain         = buffers.source(?c.pool);
+    c.secrets       = buffers.secret_source(?c.pool);
+    val plain:   buffer.Lease       = buffer.Lease{source: ?c.plain, account: ?c.account, lane: 0};
+    val secrets: buffer.SecretLease = buffer.SecretLease{source: ?c.secrets, account: ?c.account, lane: 0};
+    c.entropy    = secret.system_entropy();
+    c.clock      = clock.system();
+    c.alpn       = config.ProtocolName{data: "http/1.1", len: 8};
+    c.versions   = [1]u16{tls13.VERSION};
+    c.suites     = [3]tls13.CipherSuite{tls13.AES_128_GCM_SHA256, tls13.CHACHA20_POLY1305_SHA256, tls13.AES_256_GCM_SHA384};
+    c.groups     = [2]tls13.NamedGroup{tls13.X25519, tls13.SECP256R1};
+    c.signatures = [5]tls13.SignatureScheme{tls13.ECDSA_SECP256R1_SHA256, tls13.ECDSA_SECP384R1_SHA384,
+        tls13.ED25519, tls13.RSA_PSS_RSAE_SHA256, tls13.RSA_PSS_RSAE_SHA384};
+    c.configuration.server_name   = contracts.Bytes{data: target.host.data, len: target.host.len};
+    c.configuration.alpn          = ?c.alpn;
+    c.configuration.alpn_len      = 1;
+    c.configuration.trust         = ?c.trust.bundle.store;
+    c.configuration.versions      = ?c.versions[0];
+    c.configuration.version_len   = 1;
+    c.configuration.suites        = ?c.suites[0];
+    c.configuration.suite_len     = 3;
+    c.configuration.groups        = ?c.groups[0];
+    c.configuration.group_len     = 2;
+    c.configuration.signatures    = ?c.signatures[0];
+    c.configuration.signature_len = 5;
+    c.configuration.entropy       = ?c.entropy;
+    c.configuration.clock         = ?c.clock;
+    c.configuration.limits        = config.production_limits();
+    var extra: client.ExtraExtension;
+    if (!client.init(?c.handshake, ?c.configuration, plain, extra, 0)) {
+        ret err[str].err{"Git TLS client initialization failed"};
+    }
+    c.handshake_ready = true;
+    if (!transport.make_tcp(?c.lower, ?c.adapter, ?c.driver, ?c.socket, lifecycle.ABORTIVE)) {
+        ret err[str].err{"Git TLS TCP adapter initialization failed"};
+    }
+    val token: transport.Token = transport.Token{index: 0, generation: 1};
+    if (!stream.connect(?c.tls, ?c.handshake, plain, secrets, ?c.lower, ?c.scope, token, 0)) {
+        ret err[str].err{"Git TLS connection initialization failed"};
+    }
+    c.tls_ready = true;
+    val secured: res[transport.Snapshot, str] = tls_wait(c, true, token);
+    if (sel secured.err) { ret err[str].err{secured.err}; }
+    c.generation = 1;
+    ret err[str].ok{};
+}
+
+fun transfer(c: *Connection, data: *u8, len: usize, writing: bool) res[transport.Snapshot, str] {
+    c.generation = c.generation + 1;
+    val token:     transport.Token = transport.Token{index: 0, generation: c.generation};
+    var submitted: bool            = false;
+    if (writing)    { submitted = stream.write(?c.tls, ?c.scope, token, data, len, 0); }
+    or              { submitted = stream.read(?c.tls, ?c.scope, token, data, len, 0); }
+    if (!submitted) { ret res[transport.Snapshot, str].err{"Git TLS data operation refused"}; }
+    ret tls_wait(c, writing, token);
+}
+
+# one HTTP/1.1 exchange, with bounded framing and no transparent content encoding
+pub fun exchange(a: *A.Allocator, text: str, post: bool, body: *u8, body_len: usize,
+    expected_type: str, limit: usize) res[Vector[u8], str] {
+    val target: url.Parsed = url.parse(view.view(text, str_len(text)), url.limits_default());
+    if (target.status != url.URL_OK || !url.secure(target.url) || target.url.has_fragment || limit > MAX_BODY) {
+        ret res[Vector[u8], str].err{"invalid Git HTTPS request URL or limit"};
+    }
+    var c: Connection;
+    fin { close(?c, a); }
+    val connected: err[str] = open(?c, a, target.url);
+    if (sel connected.err) { ret res[Vector[u8], str].err{connected.err}; }
+    val authority: res[str, string.StrError] = str_copy_slice(a, target.url.authority.data::str, 0, target.url.authority.len);
+    if (sel authority.err) { ret res[Vector[u8], str].err{"Git HTTP authority allocation refused"}; }
+    fin { str_free(a, authority.ok); }
+    val path: res[str, string.StrError] = str_copy_slice(a, target.url.path.data::str, 0, target.url.path.len);
+    if (sel path.err) { ret res[Vector[u8], str].err{"Git HTTP path allocation refused"}; }
+    fin { str_free(a, path.ok); }
+    var query:       str = "";
+    var query_owned: str = nil;
+    if (target.url.has_query) {
+        val copied: res[str, string.StrError] = str_copy_slice(a, target.url.query.data::str, 0, target.url.query.len);
+        if (sel copied.err) { ret res[Vector[u8], str].err{"Git HTTP query allocation refused"}; }
+        query_owned = copied.ok;
+        query       = query_owned;
+    }
+    fin { str_free(a, query_owned); }
+    var query_sep: str = "";
+    if (target.url.has_query) { query_sep = "?"; }
+    var verb: str = "GET";
+    if (post) { verb = "POST"; }
+    var request_path: str = path.ok;
+    if (target.url.path.len == 0) { request_path = "/"; }
+    val request: res[str, format.FormatError] = format.sprint(a,
+        "{} {}{}{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: mach\r\nAccept: {}\r\nAccept-Encoding: identity\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        verb, request_path, query_sep, query, authority.ok, expected_type, body_len);
+    if (sel request.err) { ret res[Vector[u8], str].err{"Git HTTP request allocation refused"}; }
+    fin { str_free(a, request.ok); }
+    val sent: res[transport.Snapshot, str] = transfer(?c, request.ok, str_len(request.ok), true);
+    if (sel sent.err) { ret res[Vector[u8], str].err{sent.err}; }
+    if (body_len != 0) {
+        val written: res[transport.Snapshot, str] = transfer(?c, body, body_len, true);
+        if (sel written.err)                          { ret res[Vector[u8], str].err{written.err}; }
+        if (written.ok.application_bytes != body_len) { ret res[Vector[u8], str].err{"short Git HTTP request body"}; }
+    }
+    var line:     [8192]u8;
+    var storage:  [32768]u8;
+    var fields:   [100]field.Field;
+    var trailers: [32]field.Field;
+    var limits:   parser.Limits = parser.limits_default();
+    limits.max_body_bytes = limit::u64;
+    var parsed:         parser.Parser;
+    var request_method: method.Kind = method.GET;
+    if (post) { request_method = method.POST; }
+    if (!parser.init_response(?parsed, request_method, ?line[0], 8192, ?storage[0], 32768,
+        ?fields[0], 100, ?trailers[0], 32, limits)) { ret res[Vector[u8], str].err{"Git HTTP parser initialization failed"}; }
+    var out:  Vector[u8] = vector.init[u8](a);
+    var keep: bool       = false;
+    fin {
+        if (!keep) { vector.dnit[u8](?out); }
+    }
+    var input: [32768]u8;
+    var n:     usize = 0;
+    var pos:   usize = 0;
+    for {
+        if (pos == n) {
+            val read: res[transport.Snapshot, str] = transfer(?c, ?input[0], 32768, false);
+            if (sel read.err) { ret res[Vector[u8], str].err{read.err}; }
+            n   = read.ok.application_bytes;
+            pos = 0;
+            if (n == 0) {
+                val eof: parser.Feed = parser.finish_eof(?parsed, read.ok.last_end_of_stream);
+                if (eof.status != parser.PARSE_MESSAGE) { ret res[Vector[u8], str].err{"incomplete Git HTTP response"}; }
+                brk;
+            }
+        }
+        val step: parser.Feed = parser.feed(?parsed, ?input[pos], n - pos);
+        pos = pos + step.consumed;
+        if (step.status == parser.PARSE_ERROR) { ret res[Vector[u8], str].err{"invalid Git HTTP response framing"}; }
+        if (step.status == parser.PARSE_HEADERS) {
+            if (parsed.parsed.status != 200) { ret res[Vector[u8], str].err{"Git HTTPS server returned a non-success status"}; }
+            val content_type: *field.Field = field.find_first(?parsed.parsed.fields, view.view("content-type", 12));
+            if (content_type == nil || content_type.value.len != str_len(expected_type)) {
+                ret res[Vector[u8], str].err{"unexpected Git HTTP content type"};
+            }
+            var i: usize = 0;
+            for (i < content_type.value.len) {
+                if (content_type.value.data[i] != expected_type[i]) { ret res[Vector[u8], str].err{"unexpected Git HTTP content type"}; }
+                i = i + 1;
+            }
+        }
+        if (step.body_length > limit - out.len) { ret res[Vector[u8], str].err{"Git HTTP body exceeds limit"}; }
+        val copied: err[str] = protocol.append_bytes(?out, step.body, step.body_length);
+        if (sel copied.err)                      { ret res[Vector[u8], str].err{copied.err}; }
+        if (step.status == parser.PARSE_MESSAGE) { brk; }
+        if (step.consumed == 0 && step.body_length == 0 && step.status != parser.PARSE_HEADERS) {
+            ret res[Vector[u8], str].err{"Git HTTP parser made no progress"};
+        }
+    }
+    keep = true;
+    ret res[Vector[u8], str].ok{out};
+}

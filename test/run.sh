@@ -824,12 +824,17 @@ if [ "$mode" = incremental ]; then
     mkdir -p "$out/log"
     self=$out/incremental/self
     rm -rf "$out/incremental"
-    mkdir -p "$self/dep/std"
+    for dep in std http tls crypto pki; do
+        mkdir -p "$self/dep/$dep"
+        cp -r "$repo/dep/$dep/src" "$repo/dep/$dep/mach.toml" "$self/dep/$dep/"
+    done
     cp -r "$repo/src" "$repo/mach.toml" "$self/"
-    cp -r "$repo/dep/std/src" "$repo/dep/std/mach.toml" "$self/dep/std/"
-    # the copy is no git checkout, so std is the pinned tree taken by path
-    sed -i '/^\[dep\.std\]$/,/^$/{s/^git = .*$/path = "dep\/std"/;/^ref = /d;/^version = /d}' "$self/mach.toml"
-    grep -q '^path = "dep/std"$' "$self/mach.toml" || fail "incremental: the copied manifest still names std by git"
+    # The copy has no Git checkout; use the same realized dependency trees by path.
+    for dep in std http tls; do
+        sed -i "/^\[dep\.$dep\]$/,/^$/{s|^git = .*$|path = \"dep/$dep\"|;/^ref = /d;/^version = /d;}" "$self/mach.toml"
+        grep -q "^path = \"dep/$dep\"$" "$self/mach.toml" || fail "incremental: the copied manifest still names $dep by git"
+    done
+    printf '\n[dep.crypto]\npath = "dep/crypto"\n\n[dep.pki]\npath = "dep/pki"\n' >>"$self/mach.toml"
     echo "incremental: $self"
     if inc_build "$self" "the clean build" o/clean &&
         inc_build "$self" "the warm no-op rebuild" o/warm; then

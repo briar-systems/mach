@@ -1,0 +1,239 @@
+# checked Git index decoding; entry paths borrow the caller's input bytes
+
+use mach.provider.git.object;
+use mach.provider.git.pack;
+use mach.provider.git.protocol;
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.view;
+
+pub val MAX_ENTRIES: usize = 1000000;
+
+pub rec Entry {
+    stat:     [40]u8;
+    id:       object.Id;
+    mode:     u32;
+    flags:    u16;
+    extended: u16;
+    name:     view.View;
+}
+
+pub rec Index {
+    entries: Vector[Entry];
+    version: u32;
+}
+
+# encode entries in v3 form without derived optional extension caches
+pub fun encode(a: *A.Allocator, index: *Index, hash_len: usize) res[Vector[u8], str] {
+    if ((hash_len != 20 && hash_len != 32) || index.entries.len > MAX_ENTRIES) {
+        ret res[Vector[u8], str].err{"invalid Git index output shape"};
+    }
+    var out:  Vector[u8] = vector.init[u8](a);
+    var keep: bool       = false;
+    fin {
+        if (!keep) { vector.dnit[u8](?out); }
+    }
+    var header: [12]u8 = [12]u8{'D', 'I', 'R', 'C', 0, 0, 0, 3, 0, 0, 0, 0};
+    var i:      usize  = 0;
+    for (i < 4) {
+        header[8 + i] = (index.entries.len >> ((3 - i) * 8)::u32)::u8;
+        i             = i + 1;
+    }
+    val head: err[str] = protocol.append_bytes(?out, ?header[0], 12);
+    if (sel head.err) { ret res[Vector[u8], str].err{head.err}; }
+    i = 0;
+    for (i < index.entries.len) {
+        val entry: *Entry = ?index.entries.data[i];
+        if (entry.id.len != hash_len || !safe_name(entry.name.data, entry.name.len) || (entry.flags & 0x3000) != 0) {
+            ret res[Vector[u8], str].err{"invalid Git index output entry"};
+        }
+        val start: usize  = out.len;
+        var stat:  [40]u8 = entry.stat;
+        var j:     usize  = 0;
+        for (j < 4) {
+            stat[24 + j] = (entry.mode >> ((3 - j) * 8)::u32)::u8;
+            j            = j + 1;
+        }
+        val cached: err[str] = protocol.append_bytes(?out, ?stat[0], 40);
+        if (sel cached.err) { ret res[Vector[u8], str].err{cached.err}; }
+        val id: err[str] = protocol.append_bytes(?out, ?entry.id.bytes[0], hash_len);
+        if (sel id.err) { ret res[Vector[u8], str].err{id.err}; }
+        var name_len: usize = entry.name.len;
+        if (name_len > 4095) { name_len = 4095; }
+        var flags: u16 = (entry.flags & 0x8000) | name_len::u16;
+        if (entry.extended != 0) { flags = flags | 0x4000; }
+        var flag_bytes: [4]u8 = [4]u8{(flags >> 8)::u8, flags::u8, (entry.extended >> 8)::u8, entry.extended::u8};
+        var flag_len:   usize = 2;
+        if (entry.extended != 0) { flag_len = 4; }
+        val marked: err[str] = protocol.append_bytes(?out, ?flag_bytes[0], flag_len);
+        if (sel marked.err) { ret res[Vector[u8], str].err{marked.err}; }
+        val path: err[str] = protocol.append_bytes(?out, entry.name.data, entry.name.len);
+        if (sel path.err) { ret res[Vector[u8], str].err{path.err}; }
+        var zero: u8    = 0;
+        var pad:  usize = 8 - (out.len - start) % 8;
+        for (pad > 0) {
+            val padded: err[str] = protocol.append_bytes(?out, ?zero, 1);
+            if (sel padded.err) { ret res[Vector[u8], str].err{padded.err}; }
+            pad = pad - 1;
+        }
+        if (out.len > pack.MAX_TOTAL) { ret res[Vector[u8], str].err{"Git index output exceeds limit"}; }
+        i = i + 1;
+    }
+    val hashed: res[object.Id, str] = object.digest(out.data, out.len, hash_len);
+    if (sel hashed.err) { ret res[Vector[u8], str].err{hashed.err}; }
+    var checksum: object.Id = hashed.ok;
+    val appended: err[str]  = protocol.append_bytes(?out, ?checksum.bytes[0], hash_len);
+    if (sel appended.err) { ret res[Vector[u8], str].err{appended.err}; }
+    keep = true;
+    ret res[Vector[u8], str].ok{out};
+}
+
+fun read_u16(data: *u8) u16 {
+    ret (data[0]::u16 << 8) | data[1]::u16;
+}
+
+fun safe_name(data: *u8, len: usize) bool {
+    if (len == 0 || data == nil || data[0] == '/' || data[len - 1] == '/') { ret false; }
+    var start: usize = 0;
+    var i:     usize = 0;
+    for (i <= len) {
+        if (i == len || data[i] == '/') {
+            val n: usize = i - start;
+            if (n == 0 || (n == 1 && data[start] == '.') || (n == 2 && data[start] == '.' && data[start + 1] == '.')) { ret false; }
+            start = i + 1;
+        }
+        or (data[i] == 0 || data[i] == '\\' || data[i] == ':') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# v2/v3 decoding preserves the stat cache, staging flags and extended flags
+pub fun decode(a: *A.Allocator, data: *u8, len: usize, hash_len: usize) res[Index, str] {
+    if (data == nil || (hash_len != 20 && hash_len != 32) || len < 12 + hash_len || len > pack.MAX_TOTAL) {
+        ret res[Index, str].err{"invalid Git index size"};
+    }
+    if (data[0] != 'D' || data[1] != 'I' || data[2] != 'R' || data[3] != 'C') {
+        ret res[Index, str].err{"invalid Git index signature"};
+    }
+    val version: u32 = pack.read_be32(?data[4]);
+    if (version != 2 && version != 3) { ret res[Index, str].err{"unsupported Git index version"}; }
+    val checksum: res[object.Id, str] = object.digest(data, len - hash_len, hash_len);
+    if (sel checksum.err) { ret res[Index, str].err{checksum.err}; }
+    var expected: object.Id = checksum.ok;
+    var i:        usize     = 0;
+    for (i < hash_len) {
+        if (data[len - hash_len + i] != expected.bytes[i]) { ret res[Index, str].err{"Git index checksum mismatch"}; }
+        i = i + 1;
+    }
+    val count: usize = pack.read_be32(?data[8])::usize;
+    val end:   usize = len - hash_len;
+    if (count > MAX_ENTRIES || count > (end - 12) / (40 + hash_len + 3)) {
+        ret res[Index, str].err{"Git index entry count exceeds limit"};
+    }
+    var out:  Index = Index{entries: vector.init[Entry](a), version: version};
+    var keep: bool  = false;
+    fin {
+        if (!keep) { vector.dnit[Entry](?out.entries); }
+    }
+    var pos: usize = 12;
+    i = 0;
+    for (i < count) {
+        val start: usize = pos;
+        if (pos > end || 40 + hash_len + 2 > end - pos) { ret res[Index, str].err{"truncated Git index entry"}; }
+        var entry: Entry;
+        var j:     usize = 0;
+        for (j < 40) {
+            entry.stat[j] = data[pos + j];
+            j             = j + 1;
+        }
+        entry.mode   = pack.read_be32(?data[pos + 24]);
+        pos          = pos + 40;
+        entry.id.len = hash_len;
+        j            = 0;
+        for (j < hash_len) {
+            entry.id.bytes[j] = data[pos + j];
+            j                 = j + 1;
+        }
+        pos         = pos + hash_len;
+        entry.flags = read_u16(?data[pos]);
+        pos         = pos + 2;
+        if ((entry.flags & 0x3000) != 0) { ret res[Index, str].err{"Git index has unresolved stages"}; }
+        if ((entry.flags & 0x4000) != 0) {
+            if (version < 3 || end - pos < 2) { ret res[Index, str].err{"invalid Git index extended flags"}; }
+            entry.extended = read_u16(?data[pos]);
+            pos            = pos + 2;
+            if ((entry.extended & 0x9fff) != 0) { ret res[Index, str].err{"unsupported Git index entry flags"}; }
+        }
+        val name_start: usize = pos;
+        for (pos < end && data[pos] != 0) { pos = pos + 1; }
+        if (pos == end || !safe_name(?data[name_start], pos - name_start)) {
+            ret res[Index, str].err{"unsafe Git index entry path"};
+        }
+        entry.name = view.view(?data[name_start], pos - name_start);
+        val declared: usize = (entry.flags & 0x0fff)::usize;
+        if ((declared != 0x0fff && entry.name.len != declared) || (declared == 0x0fff && entry.name.len < 0x0fff)) {
+            ret res[Index, str].err{"Git index path length mismatch"};
+        }
+        pos = pos + 1;
+        for ((pos - start) % 8 != 0) {
+            if (pos == end || data[pos] != 0) { ret res[Index, str].err{"invalid Git index entry padding"}; }
+            pos = pos + 1;
+        }
+        if (out.entries.len != 0) {
+            val prior: view.View = out.entries.data[out.entries.len - 1].name;
+            j = 0;
+            for (j < prior.len && j < entry.name.len && prior.data[j] == entry.name.data[j]) { j = j + 1; }
+            if ((j == entry.name.len) || (j < prior.len && prior.data[j] >= entry.name.data[j])) {
+                ret res[Index, str].err{"Git index paths are not strictly ordered"};
+            }
+        }
+        val added: res[usize, A.Error] = vector.push[Entry](?out.entries, entry);
+        if (sel added.err) { ret res[Index, str].err{"Git index allocation refused"}; }
+        i = i + 1;
+    }
+    for (pos < end) {
+        if (end - pos < 8) { ret res[Index, str].err{"truncated Git index extension"}; }
+        # lowercase extensions change index semantics (split/sparse indexes)
+        if (data[pos] < 'A' || data[pos] > 'Z') { ret res[Index, str].err{"unsupported required Git index extension"}; }
+        val size: usize = pack.read_be32(?data[pos + 4])::usize;
+        pos = pos + 8;
+        if (size > end - pos) { ret res[Index, str].err{"truncated Git index extension payload"}; }
+        pos = pos + size;
+    }
+    keep = true;
+    ret res[Index, str].ok{out};
+}
+
+#[testing]
+use std.allocator.page;
+
+val T_INDEX: [96]u8 = [96]u8{0x44, 0x49, 0x52, 0x43, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81, 0xa4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xce, 0x01, 0x36, 0x25, 0x03, 0x0b, 0xa8, 0xdb, 0xa9, 0x06, 0xf7, 0x56, 0x96, 0x7f, 0x9e, 0x9c, 0xa3, 0x94, 0x46, 0x4a, 0x00, 0x01, 0x61, 0x00, 0xe4, 0xa3, 0xab, 0xab, 0x47, 0x03, 0x0d, 0xa2, 0x0b, 0x00, 0x22, 0xa6, 0x75, 0x8c, 0x13, 0x57, 0xe3, 0x01, 0xc7, 0xd2};
+
+test index__known_entry_and_all_truncations {
+    var a: A.Allocator;
+    page.make(?a);
+    val parsed: res[Index, str] = decode(?a, ?T_INDEX[0], 96, 20);
+    if (sel parsed.err) { ret 1; }
+    var index: Index = parsed.ok;
+    fin { vector.dnit[Entry](?index.entries); }
+    if (index.entries.len != 1 || index.entries.data[0].mode != 0o100644 || index.entries.data[0].name.len != 1 || index.entries.data[0].name.data[0] != 'a') { ret 2; }
+    var n: usize = 0;
+    for (n < 96) {
+        val truncated: res[Index, str] = decode(?a, ?T_INDEX[0], n, 20);
+        if (sel truncated.ok) {
+            var leaked: Index = truncated.ok;
+            vector.dnit[Entry](?leaked.entries);
+            ret 3;
+        }
+        n = n + 1;
+    }
+}

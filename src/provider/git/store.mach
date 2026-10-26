@@ -1,0 +1,588 @@
+# Git-compatible loose object storage, refs and committed tree inspection
+
+use mach.provider.git.object;
+use mach.provider.git.pack;
+use mach.provider.git.protocol;
+use mach.provider.git.remote;
+use A: std.allocator;
+#[testing]
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.compress.zlib;
+use std.crypto.hash.adler32;
+use fs: std.filesystem;
+use std.format;
+use io_error: std.io.error;
+#[testing]
+use std.print;
+#[testing]
+use std.process.env;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+#[testing]
+use std.types.option.opt;
+use std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_ends_with;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+pub rec Repository {
+    directory: str;
+    hash_len:  usize;
+}
+
+pub rec TreeEntry {
+    mode:     u32;
+    name:     *u8;
+    name_len: usize;
+    id:       object.Id;
+}
+
+# open an ordinary checkout or submodule; linked-worktree common dirs are refused
+pub fun open(a: *A.Allocator, worktree: str) res[Repository, str] {
+    val marker: res[str, str] = join(a, worktree, ".git");
+    if (sel marker.err) { ret res[Repository, str].err{marker.err}; }
+    var directory: str  = marker.ok;
+    var keep:      bool = false;
+    fin {
+        if (!keep) { str_free(a, directory); }
+    }
+    val observed: res[fs.Metadata, io_error.Error] = fs.metadata_link(directory);
+    if (sel observed.err) { ret res[Repository, str].err{"Git checkout metadata unavailable"}; }
+    var metadata: fs.Metadata = observed.ok;
+    if (fs.meta_is_file(?metadata)) {
+        val bytes: res[Vector[u8], str] = read_bounded(a, directory, 8192);
+        if (sel bytes.err) { ret res[Repository, str].err{bytes.err}; }
+        var data: Vector[u8] = bytes.ok;
+        fin { vector.dnit[u8](?data); }
+        val terminated: res[usize, A.Error] = vector.push[u8](?data, 0);
+        if (sel terminated.err)                           { ret res[Repository, str].err{"Git directory pointer allocation refused"}; }
+        if (!str_starts_with(data.data::str, "gitdir: ")) { ret res[Repository, str].err{"invalid Git directory pointer"}; }
+        var end: usize = data.len - 1;
+        for (end > 8 && (data.data[end - 1] == '\r' || data.data[end - 1] == '\n')) { end = end - 1; }
+        if (end <= 8) { ret res[Repository, str].err{"empty Git directory pointer"}; }
+        data.data[end] = 0;
+        val resolved: res[path.Path, A.Error] = path.resolve(a, worktree, (?data.data[8])::str);
+        if (sel resolved.err) { ret res[Repository, str].err{"Git directory resolution failed"}; }
+        str_free(a, directory);
+        directory = resolved.ok;
+        val pointed: res[fs.Metadata, io_error.Error] = fs.metadata_link(directory);
+        if (sel pointed.err) { ret res[Repository, str].err{"Git directory pointer target unavailable"}; }
+        metadata = pointed.ok;
+    }
+    if (!fs.meta_is_dir(?metadata)) { ret res[Repository, str].err{"Git metadata is not a directory"}; }
+    val common: res[str, str] = join(a, directory, "commondir");
+    if (sel common.err) { ret res[Repository, str].err{common.err}; }
+    val linked: res[bool, io_error.Error] = fs.exists(common.ok);
+    str_free(a, common.ok);
+    if (sel linked.err) { ret res[Repository, str].err{"Git common directory inspection failed"}; }
+    if (linked.ok)      { ret res[Repository, str].err{"linked Git worktrees are not supported"}; }
+    # format extensions require explicit admission; never guess a hash from an ID
+    val config_file: res[str, str] = join(a, directory, "config");
+    if (sel config_file.err) { ret res[Repository, str].err{config_file.err}; }
+    val configured: res[Vector[u8], str] = read_bounded(a, config_file.ok, 1048576);
+    str_free(a, config_file.ok);
+    if (sel configured.err) { ret res[Repository, str].err{configured.err}; }
+    var config: Vector[u8] = configured.ok;
+    fin { vector.dnit[u8](?config); }
+    var hash_len:   usize = 20;
+    var pos:        usize = 0;
+    var extensions: bool  = false;
+    for (pos < config.len) {
+        var end: usize = pos;
+        for (end < config.len && config.data[end] != '\n') { end = end + 1; }
+        var start: usize = pos;
+        for (start < end && (config.data[start] == ' ' || config.data[start] == '\t')) { start = start + 1; }
+        var stop: usize = end;
+        for (stop > start && (config.data[stop - 1] == '\r' || config.data[stop - 1] == ' ' || config.data[stop - 1] == '\t')) { stop = stop - 1; }
+        if (start < stop && config.data[start] == '[') {
+            extensions = stop - start == 12;
+            val expected: str   = "[extensions]";
+            var i:        usize = 0;
+            for (extensions && i < 12) {
+                var c: u8 = config.data[start + i];
+                if (c >= 'A' && c <= 'Z') { c = c + 32; }
+                if (c != expected[i])     { extensions = false; }
+                i = i + 1;
+            }
+        }
+        or (extensions && start < stop && config.data[start] != '#' && config.data[start] != ';') {
+            var key_end: usize = start;
+            for (key_end < stop && config.data[key_end] != '=' && config.data[key_end] != ' ' && config.data[key_end] != '\t') { key_end = key_end + 1; }
+            val expected: str = "objectformat";
+            if (key_end - start != 12) { ret res[Repository, str].err{"unsupported Git repository extension"}; }
+            var i: usize = 0;
+            for (i < 12) {
+                var c: u8 = config.data[start + i];
+                if (c >= 'A' && c <= 'Z') { c = c + 32; }
+                if (c != expected[i])     { ret res[Repository, str].err{"unsupported Git repository extension"}; }
+                i = i + 1;
+            }
+            var value: usize = key_end;
+            for (value < stop && (config.data[value] == ' ' || config.data[value] == '\t' || config.data[value] == '=')) { value = value + 1; }
+            if (stop - value == 6 && config.data[value] == 's' && config.data[value + 1] == 'h' && config.data[value + 2] == 'a'
+                && config.data[value + 3] == '2' && config.data[value + 4] == '5' && config.data[value + 5] == '6') { hash_len = 32; }
+            or (stop - value == 4 && config.data[value] == 's' && config.data[value + 1] == 'h' && config.data[value + 2] == 'a'
+                && config.data[value + 3] == '1') { hash_len = 20; }
+            or { ret res[Repository, str].err{"unsupported Git object format"}; }
+        }
+        pos = end + 1;
+    }
+    keep = true;
+    ret res[Repository, str].ok{Repository{directory: directory, hash_len: hash_len}};
+}
+
+pub fun read_ref(a: *A.Allocator, repo: *Repository, name: str) res[object.Id, str] {
+    ret read_ref_depth(a, repo, name, 0);
+}
+
+fun read_ref_depth(a: *A.Allocator, repo: *Repository, name: str, depth: usize) res[object.Id, str] {
+    if (depth >= 8 || (!str_equals(name, "HEAD") && !str_starts_with(name, "refs/"))
+        || !remote.valid_ref(name, str_len(name))) { ret res[object.Id, str].err{"invalid or cyclic Git reference"}; }
+    val file: res[str, str] = join(a, repo.directory, name);
+    if (sel file.err) { ret res[object.Id, str].err{file.err}; }
+    fin { str_free(a, file.ok); }
+    val exists: res[bool, io_error.Error] = fs.exists(file.ok);
+    if (sel exists.err) { ret res[object.Id, str].err{"Git reference inspection failed"}; }
+    if (exists.ok) {
+        val read: res[Vector[u8], str] = read_bounded(a, file.ok, 8192);
+        if (sel read.err) { ret res[object.Id, str].err{read.err}; }
+        var bytes: Vector[u8] = read.ok;
+        fin { vector.dnit[u8](?bytes); }
+        for (bytes.len > 0 && (bytes.data[bytes.len - 1] == '\n' || bytes.data[bytes.len - 1] == '\r')) { bytes.len = bytes.len - 1; }
+        val length:     usize               = bytes.len;
+        val terminated: res[usize, A.Error] = vector.push[u8](?bytes, 0);
+        if (sel terminated.err)                        { ret res[object.Id, str].err{"Git reference allocation refused"}; }
+        if (str_starts_with(bytes.data::str, "ref: ")) { ret read_ref_depth(a, repo, (?bytes.data[5])::str, depth + 1); }
+        val parsed: res[object.Id, str] = object.parse_id(bytes.data, length);
+        if (sel parsed.err)                 { ret parsed; }
+        if (parsed.ok.len != repo.hash_len) { ret res[object.Id, str].err{"Git reference hash format mismatch"}; }
+        ret parsed;
+    }
+    val packed_file: res[str, str] = join(a, repo.directory, "packed-refs");
+    if (sel packed_file.err) { ret res[object.Id, str].err{packed_file.err}; }
+    val read: res[Vector[u8], str] = read_bounded(a, packed_file.ok, remote.MAX_DISCOVERY);
+    str_free(a, packed_file.ok);
+    if (sel read.err) { ret res[object.Id, str].err{read.err}; }
+    var bytes: Vector[u8] = read.ok;
+    fin { vector.dnit[u8](?bytes); }
+    var pos: usize = 0;
+    for (pos < bytes.len) {
+        var end: usize = pos;
+        for (end < bytes.len && bytes.data[end] != '\n') { end = end + 1; }
+        val digits: usize = repo.hash_len * 2;
+        if (end - pos > digits && bytes.data[pos + digits] == ' ' && end - pos - digits - 1 == str_len(name)) {
+            var i: usize = 0;
+            for (i < str_len(name) && bytes.data[pos + digits + 1 + i] == name[i]) { i = i + 1; }
+            if (i == str_len(name)) { ret object.parse_id(?bytes.data[pos], digits); }
+        }
+        pos = end + 1;
+    }
+    ret res[object.Id, str].err{"Git reference not found"};
+}
+
+pub fun join(a: *A.Allocator, root: str, relative: str) res[str, str] {
+    val joined: res[path.Path, A.Error] = path.join(a, root, relative);
+    if (sel joined.err) { ret res[str, str].err{"Git path allocation refused"}; }
+    ret res[str, str].ok{joined.ok};
+}
+
+pub fun read_bounded(a: *A.Allocator, file: str, limit: usize) res[Vector[u8], str] {
+    val meta: res[fs.Metadata, io_error.Error] = fs.metadata_link(file);
+    if (sel meta.err) { ret res[Vector[u8], str].err{"Git file metadata unavailable"}; }
+    var m: fs.Metadata = meta.ok;
+    if (!fs.meta_is_file(?m) || m.size > limit::u64) { ret res[Vector[u8], str].err{"Git file is not a bounded regular file"}; }
+    val opened: res[fs.File, io_error.Error] = fs.open(file);
+    if (sel opened.err) { ret res[Vector[u8], str].err{"Git file could not be opened"}; }
+    var handle: fs.File = opened.ok;
+    fin { fs.close(?handle); }
+    var out:  Vector[u8] = vector.init[u8](a);
+    var keep: bool       = false;
+    fin {
+        if (!keep) { vector.dnit[u8](?out); }
+    }
+    var scratch: [8192]u8;
+    for {
+        val read: res[usize, io_error.Error] = fs.read(handle, ?scratch[0], 8192);
+        if (sel read.err)              { ret res[Vector[u8], str].err{"Git file read failed"}; }
+        if (read.ok == 0)              { brk; }
+        if (read.ok > limit - out.len) { ret res[Vector[u8], str].err{"Git file exceeds limit"}; }
+        val copy: err[str] = protocol.append_bytes(?out, ?scratch[0], read.ok);
+        if (sel copy.err) { ret res[Vector[u8], str].err{copy.err}; }
+    }
+    keep = true;
+    ret res[Vector[u8], str].ok{out};
+}
+
+fun object_path(a: *A.Allocator, repo: *Repository, id: *object.Id) res[str, str] {
+    var text: [65]u8;
+    if (!object.format_id(id, ?text[0]) || id.len != repo.hash_len) {
+        ret res[str, str].err{"Git object format mismatch"};
+    }
+    var prefix: [3]u8;
+    prefix[0] = text[0];
+    prefix[1] = text[1];
+    val formatted: res[str, format.FormatError] = format.sprint(a, "{}/objects/{}/{}", repo.directory,
+        (?prefix[0])::str, (?text[2])::str);
+    if (sel formatted.err) { ret res[str, str].err{"Git object path allocation refused"}; }
+    ret res[str, str].ok{formatted.ok};
+}
+
+pub fun has_loose(a: *A.Allocator, repo: *Repository, id: *object.Id) res[bool, str] {
+    val file: res[str, str] = object_path(a, repo, id);
+    if (sel file.err) { ret res[bool, str].err{file.err}; }
+    val exists: res[bool, io_error.Error] = fs.exists(file.ok);
+    str_free(a, file.ok);
+    if (sel exists.err) { ret res[bool, str].err{"Git object inspection failed"}; }
+    ret res[bool, str].ok{exists.ok};
+}
+
+# store a canonical object as an RFC 1950 stream with uncompressed deflate blocks
+pub fun write_object(a: *A.Allocator, repo: *Repository, item: *pack.Object) err[str] {
+    val computed: res[object.Id, str] = object.object_id(pack.kind_name(item.kind),
+        item.bytes.data, item.bytes.len, repo.hash_len);
+    if (sel computed.err) { ret err[str].err{computed.err}; }
+    var id: object.Id = computed.ok;
+    if (!object.equal(?id, ?item.id)) { ret err[str].err{"Git object ID changed before storage"}; }
+    val file: res[str, str] = object_path(a, repo, ?item.id);
+    if (sel file.err) { ret err[str].err{file.err}; }
+    fin { str_free(a, file.ok); }
+    val parent: res[path.Path, A.Error] = path.parent(a, file.ok);
+    if (sel parent.err) { ret err[str].err{"Git object directory allocation refused"}; }
+    val made: err[fs.FsError] = fs.create_dir_all(a, parent.ok, 493);
+    str_free(a, parent.ok);
+    if (sel made.err) { ret err[str].err{"Git object directory could not be created"}; }
+    val header: res[str, format.FormatError] = format.sprint(a, "{} {}", pack.kind_name(item.kind), item.bytes.len);
+    if (sel header.err) { ret err[str].err{"Git object header allocation refused"}; }
+    fin { str_free(a, header.ok); }
+    var raw: Vector[u8] = vector.init[u8](a);
+    fin { vector.dnit[u8](?raw); }
+    val h: err[str] = protocol.append_bytes(?raw, header.ok, str_len(header.ok) + 1);
+    if (sel h.err) { ret h; }
+    val b: err[str] = protocol.append_bytes(?raw, item.bytes.data, item.bytes.len);
+    if (sel b.err) { ret b; }
+    var compressed: Vector[u8] = vector.init[u8](a);
+    fin { vector.dnit[u8](?compressed); }
+    var zhead: [2]u8    = [2]u8{0x78, 0x01};
+    val zh:    err[str] = protocol.append_bytes(?compressed, ?zhead[0], 2);
+    if (sel zh.err) { ret zh; }
+    var pos: usize = 0;
+    for (pos < raw.len) {
+        var n: usize = raw.len - pos;
+        if (n > 65535) { n = 65535; }
+        var block: [5]u8;
+        if (pos + n == raw.len) { block[0] = 1; }
+        block[1] = n::u8;
+        block[2] = (n >> 8)::u8;
+        block[3] = ~block[1];
+        block[4] = ~block[2];
+        val bh: err[str] = protocol.append_bytes(?compressed, ?block[0], 5);
+        if (sel bh.err) { ret bh; }
+        val payload: err[str] = protocol.append_bytes(?compressed, ?raw.data[pos], n);
+        if (sel payload.err) { ret payload; }
+        pos = pos + n;
+    }
+    val sum:     u32   = adler32.hash(raw.data, raw.len);
+    var trailer: [4]u8;
+    var i:       usize = 0;
+    for (i < 4) {
+        trailer[i] = (sum >> ((3 - i) * 8)::u32)::u8;
+        i          = i + 1;
+    }
+    val checksum: err[str] = protocol.append_bytes(?compressed, ?trailer[0], 4);
+    if (sel checksum.err) { ret checksum; }
+    val written: err[fs.FsError] = fs.replace_bytes_atomic(a, file.ok, compressed.data, compressed.len, 292, 493);
+    if (sel written.err) { ret err[str].err{"Git object could not be stored"}; }
+    ret err[str].ok{};
+}
+
+pub fun write_pack(a: *A.Allocator, repo: *Repository, p: *pack.Pack) err[str] {
+    var i: usize = 0;
+    for (i < p.objects.len) {
+        val written: err[str] = write_object(a, repo, ?p.objects.data[i]);
+        if (sel written.err) { ret written; }
+        i = i + 1;
+    }
+    ret err[str].ok{};
+}
+
+fun parse_loose(a: *A.Allocator, raw: *Vector[u8], id: *object.Id) res[pack.Object, str] {
+    var separator: usize = 0;
+    for (separator < raw.len && raw.data[separator] != ' ') { separator = separator + 1; }
+    if (separator == raw.len || separator > 6) { ret res[pack.Object, str].err{"invalid Git loose object type"}; }
+    var kind:    u8   = 1;
+    var matched: bool = false;
+    for (kind <= 4) {
+        val text: str   = pack.kind_name(kind);
+        var i:    usize = 0;
+        for (i < separator && text[i] == raw.data[i]) { i = i + 1; }
+        if (i == separator && text[i] == 0) {
+            matched = true;
+            brk;
+        }
+        kind = kind + 1;
+    }
+    if (!matched) { ret res[pack.Object, str].err{"unknown Git loose object type"}; }
+    var pos:          usize = separator + 1;
+    val digits_start: usize = pos;
+    var size:         usize = 0;
+    for (pos < raw.len && raw.data[pos] != 0) {
+        val c: u8 = raw.data[pos];
+        if (c < '0' || c > '9' || size > pack.MAX_OBJECT / 10) { ret res[pack.Object, str].err{"invalid Git loose object size"}; }
+        size = size * 10 + (c - '0')::usize;
+        pos  = pos + 1;
+    }
+    if (pos == raw.len || pos == digits_start || (pos > digits_start + 1 && raw.data[digits_start] == '0')) {
+        ret res[pack.Object, str].err{"invalid Git loose object header"};
+    }
+    pos = pos + 1;
+    if (size != raw.len - pos || size > pack.MAX_OBJECT) { ret res[pack.Object, str].err{"Git loose object size mismatch"}; }
+    val computed: res[object.Id, str] = object.object_id(pack.kind_name(kind), ?raw.data[pos], size, id.len);
+    if (sel computed.err) { ret res[pack.Object, str].err{computed.err}; }
+    var actual: object.Id = computed.ok;
+    if (!object.equal(?actual, id)) { ret res[pack.Object, str].err{"Git loose object hash mismatch"}; }
+    var bytes:  Vector[u8] = vector.init[u8](a);
+    val copied: err[str]   = protocol.append_bytes(?bytes, ?raw.data[pos], size);
+    if (sel copied.err) {
+        vector.dnit[u8](?bytes);
+        ret res[pack.Object, str].err{copied.err};
+    }
+    ret res[pack.Object, str].ok{pack.Object{id: @id, kind: kind, bytes: bytes, offset: 0, depth: 0}};
+}
+
+pub fun read_object(a: *A.Allocator, repo: *Repository, id: *object.Id) res[pack.Object, str] {
+    val file: res[str, str] = object_path(a, repo, id);
+    if (sel file.err) { ret res[pack.Object, str].err{file.err}; }
+    fin { str_free(a, file.ok); }
+    val exists: res[bool, io_error.Error] = fs.exists(file.ok);
+    if (sel exists.err) { ret res[pack.Object, str].err{"Git object inspection failed"}; }
+    if (!exists.ok)     { ret read_packed_object(a, repo, id); }
+    val read: res[Vector[u8], str] = read_bounded(a, file.ok, pack.MAX_OBJECT + 65536);
+    if (sel read.err) { ret res[pack.Object, str].err{read.err}; }
+    var compressed: Vector[u8] = read.ok;
+    fin { vector.dnit[u8](?compressed); }
+    val made: res[zlib.Decompressor, zlib.InflateError] = zlib.init(a);
+    if (sel made.err) { ret res[pack.Object, str].err{"Git loose object inflater allocation refused"}; }
+    var z: zlib.Decompressor = made.ok;
+    fin { zlib.dnit(?z); }
+    var raw: Vector[u8] = vector.init[u8](a);
+    fin { vector.dnit[u8](?raw); }
+    var input:   usize = 0;
+    var scratch: [8192]u8;
+    for (!zlib.is_done(?z)) {
+        val step: res[zlib.Progress, zlib.InflateError] = zlib.decompress(?z, ?compressed.data[input],
+            compressed.len - input, ?scratch[0], 8192);
+        if (sel step.err)                                     { ret res[pack.Object, str].err{"invalid Git loose object zlib stream"}; }
+        if (step.ok.written > pack.MAX_OBJECT + 32 - raw.len) { ret res[pack.Object, str].err{"Git loose object exceeds limit"}; }
+        val copied: err[str] = protocol.append_bytes(?raw, ?scratch[0], step.ok.written);
+        if (sel copied.err) { ret res[pack.Object, str].err{copied.err}; }
+        input = input + step.ok.consumed;
+        if (step.ok.written == 0 && step.ok.consumed == 0 && !zlib.is_done(?z)) {
+            ret res[pack.Object, str].err{"truncated Git loose object"};
+        }
+    }
+    if (input != compressed.len) { ret res[pack.Object, str].err{"trailing Git loose object bytes"}; }
+    ret parse_loose(a, ?raw, id);
+}
+
+fun read_packed_object(a: *A.Allocator, repo: *Repository, id: *object.Id) res[pack.Object, str] {
+    val directory: res[str, str] = join(a, repo.directory, "objects/pack");
+    if (sel directory.err) { ret res[pack.Object, str].err{directory.err}; }
+    fin { str_free(a, directory.ok); }
+    val listed: res[Vector[str], fs.FsError] = fs.read_dir(a, directory.ok);
+    if (sel listed.err) { ret res[pack.Object, str].err{"Git object unavailable in local store"}; }
+    var names: Vector[str] = listed.ok;
+    fin {
+        var i: usize = 0;
+        for (i < names.len) {
+            str_free(a, names.data[i]);
+            i = i + 1;
+        }
+        vector.dnit[str](?names);
+    }
+    var i: usize = 0;
+    for (i < names.len) {
+        val name: str = names.data[i];
+        i = i + 1;
+        if (!str_starts_with(name, "pack-") || !str_ends_with(name, ".pack")) { cnt; }
+        val file: res[str, str] = join(a, directory.ok, name);
+        if (sel file.err) { ret res[pack.Object, str].err{file.err}; }
+        val read: res[Vector[u8], str] = read_bounded(a, file.ok, pack.MAX_TOTAL);
+        str_free(a, file.ok);
+        if (sel read.err) { ret res[pack.Object, str].err{read.err}; }
+        var bytes: Vector[u8] = read.ok;
+        val n:     usize      = str_len(name);
+        # names are owned strings; restore the original extent before freeing them
+        name[n - 4] = 'i';
+        name[n - 3] = 'd';
+        name[n - 2] = 'x';
+        name[n - 1] = 0;
+        val index_file: res[str, str] = join(a, directory.ok, name);
+        name[n - 4] = 'p';
+        name[n - 3] = 'a';
+        name[n - 2] = 'c';
+        name[n - 1] = 'k';
+        if (sel index_file.err) {
+            vector.dnit[u8](?bytes);
+            ret res[pack.Object, str].err{index_file.err};
+        }
+        val index_read: res[Vector[u8], str] = read_bounded(a, index_file.ok, pack.MAX_TOTAL);
+        str_free(a, index_file.ok);
+        if (sel index_read.err) {
+            vector.dnit[u8](?bytes);
+            ret res[pack.Object, str].err{index_read.err};
+        }
+        var index_bytes: Vector[u8]            = index_read.ok;
+        val decoded:     res[pack.Object, str] = pack.read_indexed(a, bytes.data, bytes.len, index_bytes.data, index_bytes.len, id);
+        vector.dnit[u8](?index_bytes);
+        vector.dnit[u8](?bytes);
+        if (sel decoded.err) {
+            if (str_equals(decoded.err, "Git object is absent from pack index")) { cnt; }
+            ret decoded;
+        }
+        ret decoded;
+    }
+    ret res[pack.Object, str].err{"Git object unavailable in local packs"};
+}
+
+# parse one borrowed tree entry; refuse checkout-control names before path creation
+pub fun tree_next(r: *protocol.Reader, hash_len: usize) res[TreeEntry, str] {
+    if (r.data == nil || r.pos >= r.len) { ret res[TreeEntry, str].err{"truncated Git tree entry"}; }
+    var entry:  TreeEntry;
+    var digits: usize = 0;
+    for (r.pos < r.len && r.data[r.pos] != ' ') {
+        val c: u8 = r.data[r.pos];
+        if (c < '0' || c > '7' || digits >= 6) { ret res[TreeEntry, str].err{"invalid Git tree mode"}; }
+        entry.mode = entry.mode * 8 + (c - '0')::u32;
+        digits     = digits + 1;
+        r.pos      = r.pos + 1;
+    }
+    if (digits == 0 || r.pos == r.len) { ret res[TreeEntry, str].err{"truncated Git tree mode"}; }
+    if (entry.mode != 0o40000 && entry.mode != 0o100644 && entry.mode != 0o100755
+        && entry.mode != 0o120000 && entry.mode != 0o160000) { ret res[TreeEntry, str].err{"unsupported Git tree mode"}; }
+    r.pos = r.pos + 1;
+    val start: usize = r.pos;
+    for (r.pos < r.len && r.data[r.pos] != 0) {
+        if (r.data[r.pos] == '/' || r.data[r.pos] == '\\' || r.data[r.pos] == ':') {
+            ret res[TreeEntry, str].err{"unsafe Git tree name"};
+        }
+        r.pos = r.pos + 1;
+    }
+    entry.name     = ?r.data[start];
+    entry.name_len = r.pos - start;
+    if (r.pos == r.len || entry.name_len == 0 || entry.name_len > 255) { ret res[TreeEntry, str].err{"invalid Git tree name length"}; }
+    if ((entry.name_len == 1 && entry.name[0] == '.') || (entry.name_len == 2 && entry.name[0] == '.' && entry.name[1] == '.')) {
+        ret res[TreeEntry, str].err{"unsafe Git tree dot path"};
+    }
+    if (entry.name_len >= 4) {
+        var folded: [5]u8;
+        var i:      usize = 0;
+        for (i < 4) {
+            var c: u8 = entry.name[i];
+            if (c >= 'A' && c <= 'Z') { c = c + 32; }
+            folded[i] = c;
+            i         = i + 1;
+        }
+        if (str_equals((?folded[0])::str, ".git")) {
+            var dangerous: bool = entry.name_len == 4;
+            if (entry.name_len > 4) { dangerous = entry.name[4] == '.' || entry.name[4] == ' '; }
+            if (dangerous)          { ret res[TreeEntry, str].err{"Git tree contains repository-control path"}; }
+        }
+    }
+    r.pos = r.pos + 1;
+    if ((hash_len != 20 && hash_len != 32) || hash_len > r.len - r.pos) { ret res[TreeEntry, str].err{"truncated Git tree object ID"}; }
+    entry.id.len = hash_len;
+    var i: usize = 0;
+    for (i < hash_len) {
+        entry.id.bytes[i] = r.data[r.pos + i];
+        i                 = i + 1;
+    }
+    r.pos = r.pos + hash_len;
+    ret res[TreeEntry, str].ok{entry};
+}
+
+test store__loose_roundtrip_and_integrity {
+    var a: A.Allocator;
+    page.make(?a);
+    val temporary: res[fs.TempFile, fs.FsError] = fs.temp_create(?a, "mach_git_store");
+    if (sel temporary.err) { ret 1; }
+    var temp: fs.TempFile = temporary.ok;
+    fs.temp_close_and_remove(?temp);
+    val directory: str = fs.temp_path(?temp);
+    fin {
+        fs.remove_all(?a, directory);
+        str_free(?a, directory);
+    }
+    var repo:  Repository = Repository{directory: directory, hash_len: 20};
+    var bytes: Vector[u8] = vector.init[u8](?a);
+    fin { vector.dnit[u8](?bytes); }
+    var i: usize = 0;
+    for (i < 70000) {
+        val added: res[usize, A.Error] = vector.push[u8](?bytes, (i % 251)::u8);
+        if (sel added.err) { ret 2; }
+        i = i + 1;
+    }
+    val id: res[object.Id, str] = object.object_id("blob", bytes.data, bytes.len, 20);
+    if (sel id.err) { ret 3; }
+    var item:    pack.Object = pack.Object{id: id.ok, kind: 3, bytes: bytes, offset: 0, depth: 0};
+    val written: err[str]    = write_object(?a, ?repo, ?item);
+    if (sel written.err) {
+        print.eprintln(written.err);
+        ret 4;
+    }
+    val read: res[pack.Object, str] = read_object(?a, ?repo, ?item.id);
+    if (sel read.err) {
+        print.eprintln(read.err);
+        ret 5;
+    }
+    var restored: pack.Object = read.ok;
+    fin { vector.dnit[u8](?restored.bytes); }
+    if (restored.bytes.len != bytes.len) { ret 6; }
+    i = 0;
+    for (i < bytes.len) {
+        if (bytes.data[i] != restored.bytes.data[i]) { ret 7; }
+        i = i + 1;
+    }
+    item.id.bytes[0] = item.id.bytes[0] ^ 1;
+    val mismatched: err[str] = write_object(?a, ?repo, ?item);
+    if (sel mismatched.ok) { ret 8; }
+}
+
+test store__existing_repository_opt_in {
+    var path_text: [8192]u8;
+    val enabled:   res[opt[usize], env.EnvError] = env.get("MACH_GIT_REPOSITORY_TEST", ?path_text[0], 8192);
+    if (sel enabled.err)         { ret 1; }
+    if (sel enabled.ok.none)     { ret 0; }
+    if (enabled.ok.some >= 8192) { ret 2; }
+    var a: A.Allocator;
+    page.make(?a);
+    val opened: res[Repository, str] = open(?a, (?path_text[0])::str);
+    if (sel opened.err) {
+        print.eprintln(opened.err);
+        ret 3;
+    }
+    var repo: Repository = opened.ok;
+    fin { str_free(?a, repo.directory); }
+    val head: res[object.Id, str] = read_ref(?a, ?repo, "HEAD");
+    if (sel head.err) {
+        print.eprintln(head.err);
+        ret 4;
+    }
+    var id:   object.Id             = head.ok;
+    val read: res[pack.Object, str] = read_object(?a, ?repo, ?id);
+    if (sel read.err) {
+        print.eprintln(read.err);
+        ret 5;
+    }
+    var item: pack.Object = read.ok;
+    fin { vector.dnit[u8](?item.bytes); }
+    if (item.kind != 1 || item.bytes.len == 0) { ret 6; }
+}

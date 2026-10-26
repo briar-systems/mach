@@ -1,0 +1,548 @@
+# repository operations shared by native dependency acquisition and verification
+
+use cfg: mach.provider.git.configuration;
+use mach.provider.git.index;
+use mach.provider.git.object;
+use mach.provider.git.pack;
+use mach.provider.git.protocol;
+use mach.provider.git.store;
+use A: std.allocator;
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use fs: std.filesystem;
+use std.format;
+use io_error: std.io.error;
+use std.io.handle;
+use std.process.env;
+use std.system.os;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+use std.types.string.str_ends_with;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+use std.types.view;
+
+rec PackFiles { bytes: Vector[u8]; index: Vector[u8]; view: pack.IndexedPack; }
+
+pub rec Context {
+    a:           *A.Allocator;
+    root:        str;
+    repo:        store.Repository;
+    raw_index:   Vector[u8];
+    staged:      index.Index;
+    objects:     Vector[pack.Object];
+    packs:       Vector[PackFiles];
+    packs_ready: bool;
+}
+
+pub fun dnit(c: *Context) {
+    str_free(c.a, c.root);
+    str_free(c.a, c.repo.directory);
+    vector.dnit[index.Entry](?c.staged.entries);
+    vector.dnit[u8](?c.raw_index);
+    var i: usize = 0;
+    for (i < c.objects.len) {
+        vector.dnit[u8](?c.objects.data[i].bytes);
+        i = i + 1;
+    }
+    vector.dnit[pack.Object](?c.objects);
+    i = 0;
+    for (i < c.packs.len) {
+        vector.dnit[u8](?c.packs.data[i].bytes);
+        vector.dnit[u8](?c.packs.data[i].index);
+        i = i + 1;
+    }
+    vector.dnit[PackFiles](?c.packs);
+}
+
+pub fun read_config(a: *A.Allocator, file: str) res[cfg.Config, str] {
+    val exists: res[bool, io_error.Error] = fs.exists(file);
+    if (sel exists.err) { ret res[cfg.Config, str].err{"Git configuration inspection failed"}; }
+    if (!exists.ok)     { ret res[cfg.Config, str].ok{cfg.Config{pairs: vector.init[cfg.Pair](a)}}; }
+    val read: res[Vector[u8], str] = store.read_bounded(a, file, 16777216);
+    if (sel read.err) { ret res[cfg.Config, str].err{read.err}; }
+    var data: Vector[u8] = read.ok;
+    fin { vector.dnit[u8](?data); }
+    ret cfg.parse(a, data.data, data.len);
+}
+
+pub fun absolute(a: *A.Allocator, directory: str) res[str, str] {
+    val cwd: res[string.OwnedString, env.EnvError] = env.current_dir(a);
+    if (sel cwd.err) { ret res[str, str].err{"current directory unavailable"}; }
+    val resolved: res[path.Path, A.Error] = path.resolve(a, cwd.ok.data, directory);
+    var owned:    string.OwnedString      = cwd.ok;
+    string.owned_release(?owned);
+    if (sel resolved.err) { ret res[str, str].err{"Git repository path allocation refused"}; }
+    ret res[str, str].ok{resolved.ok};
+}
+
+pub fun open(a: *A.Allocator, directory: str) res[Context, str] {
+    val absolute_path: res[str, str] = absolute(a, directory);
+    if (sel absolute_path.err) { ret res[Context, str].err{absolute_path.err}; }
+    var c: Context;
+    c.a    = a;
+    c.root = absolute_path.ok;
+    val directory_exists: res[bool, io_error.Error] = fs.is_dir(c.root);
+    if (sel directory_exists.err) {
+        str_free(a, c.root);
+        ret res[Context, str].err{"Git directory inspection failed"};
+    }
+    if (!directory_exists.ok) {
+        str_free(a, c.root);
+        ret res[Context, str].err{"Git directory does not exist"};
+    }
+    c.raw_index      = vector.init[u8](a);
+    c.staged.entries = vector.init[index.Entry](a);
+    c.objects        = vector.init[pack.Object](a);
+    c.packs          = vector.init[PackFiles](a);
+    var keep: bool = false;
+    fin {
+        if (!keep) { dnit(?c); }
+    }
+    for {
+        val marker: res[str, str] = store.join(a, c.root, ".git");
+        if (sel marker.err) { ret res[Context, str].err{marker.err}; }
+        val exists: res[bool, io_error.Error] = fs.exists(marker.ok);
+        str_free(a, marker.ok);
+        if (sel exists.err) { ret res[Context, str].err{"Git repository inspection failed"}; }
+        if (exists.ok) {
+            val opened: res[store.Repository, str] = store.open(a, c.root);
+            if (sel opened.err) { ret res[Context, str].err{opened.err}; }
+            c.repo = opened.ok;
+            brk;
+        }
+        val objects: res[str, str] = store.join(a, c.root, "objects");
+        if (sel objects.err) { ret res[Context, str].err{objects.err}; }
+        val bare: res[bool, io_error.Error] = fs.is_dir(objects.ok);
+        str_free(a, objects.ok);
+        if (sel bare.ok && bare.ok) {
+            val copied: res[str, str] = cfg.copy(a, c.root);
+            if (sel copied.err) { ret res[Context, str].err{copied.err}; }
+            c.repo.directory = copied.ok;
+            c.repo.hash_len  = 20;
+            val config_path: res[str, str] = store.join(a, c.root, "config");
+            if (sel config_path.err) { ret res[Context, str].err{config_path.err}; }
+            val loaded: res[cfg.Config, str] = read_config(a, config_path.ok);
+            str_free(a, config_path.ok);
+            if (sel loaded.err) { ret res[Context, str].err{loaded.err}; }
+            var config: cfg.Config    = loaded.ok;
+            val format: res[str, str] = cfg.get(a, ?config, "extensions.objectformat", false);
+            cfg.dnit(a, ?config);
+            if (sel format.ok) {
+                if (str_equals(format.ok, "sha256")) { c.repo.hash_len = 32; }
+                str_free(a, format.ok);
+            }
+            brk;
+        }
+        val parent: res[path.Path, A.Error] = path.parent(a, c.root);
+        if (sel parent.err) { ret res[Context, str].err{"Git parent path allocation refused"}; }
+        if (str_equals(parent.ok, c.root)) {
+            str_free(a, parent.ok);
+            ret res[Context, str].err{"not a Git repository"};
+        }
+        str_free(a, c.root);
+        c.root = parent.ok;
+    }
+    val index_file: res[str, str] = store.join(a, c.repo.directory, "index");
+    if (sel index_file.err) { ret res[Context, str].err{index_file.err}; }
+    val exists: res[bool, io_error.Error] = fs.exists(index_file.ok);
+    if (sel exists.err) {
+        str_free(a, index_file.ok);
+        ret res[Context, str].err{"Git index inspection failed"};
+    }
+    if (exists.ok) {
+        val read: res[Vector[u8], str] = store.read_bounded(a, index_file.ok, pack.MAX_TOTAL);
+        str_free(a, index_file.ok);
+        if (sel read.err) { ret res[Context, str].err{read.err}; }
+        c.raw_index = read.ok;
+        val decoded: res[index.Index, str] = index.decode(a, c.raw_index.data, c.raw_index.len, c.repo.hash_len);
+        if (sel decoded.err) { ret res[Context, str].err{decoded.err}; }
+        c.staged = decoded.ok;
+    }
+    or { str_free(a, index_file.ok); }
+    keep = true;
+    ret res[Context, str].ok{c};
+}
+
+pub fun entry(c: *Context, relative: str) *index.Entry {
+    var i: usize = 0;
+    for (i < c.staged.entries.len) {
+        val e: *index.Entry = ?c.staged.entries.data[i];
+        if (str_len(relative) == e.name.len) {
+            var j: usize = 0;
+            for (j < e.name.len && e.name.data[j] == relative[j]) { j = j + 1; }
+            if (j == e.name.len) { ret e; }
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun open_packs(c: *Context) err[str] {
+    if (c.packs_ready) { ret err[str].ok{}; }
+    val dir: res[str, str] = store.join(c.a, c.repo.directory, "objects/pack");
+    if (sel dir.err) { ret err[str].err{dir.err}; }
+    fin { str_free(c.a, dir.ok); }
+    val listed: res[Vector[str], fs.FsError] = fs.read_dir(c.a, dir.ok);
+    if (sel listed.err) {
+        c.packs_ready = true;
+        ret err[str].ok{};
+    }
+    var names: Vector[str] = listed.ok;
+    fin {
+        var i: usize = 0;
+        for (i < names.len) {
+            str_free(c.a, names.data[i]);
+            i = i + 1;
+        }
+        vector.dnit[str](?names);
+    }
+    var i: usize = 0;
+    for (i < names.len) {
+        val name: str = names.data[i];
+        i = i + 1;
+        if (!str_starts_with(name, "pack-") || !str_ends_with(name, ".pack")) { cnt; }
+        val file: res[str, str] = store.join(c.a, dir.ok, name);
+        if (sel file.err) { ret err[str].err{file.err}; }
+        val read: res[Vector[u8], str] = store.read_bounded(c.a, file.ok, pack.MAX_TOTAL);
+        str_free(c.a, file.ok);
+        if (sel read.err) { ret err[str].err{read.err}; }
+        var bytes: Vector[u8] = read.ok;
+        var keep:  bool       = false;
+        fin {
+            if (!keep) { vector.dnit[u8](?bytes); }
+        }
+        val n: usize = str_len(name);
+        name[n - 4] = 'i';
+        name[n - 3] = 'd';
+        name[n - 2] = 'x';
+        name[n - 1] = 0;
+        val index_file: res[str, str] = store.join(c.a, dir.ok, name);
+        name[n - 4] = 'p';
+        name[n - 3] = 'a';
+        name[n - 2] = 'c';
+        name[n - 1] = 'k';
+        if (sel index_file.err) { ret err[str].err{index_file.err}; }
+        val index_read: res[Vector[u8], str] = store.read_bounded(c.a, index_file.ok, pack.MAX_TOTAL);
+        str_free(c.a, index_file.ok);
+        if (sel index_read.err) { ret err[str].err{index_read.err}; }
+        var index_bytes: Vector[u8] = index_read.ok;
+        fin {
+            if (!keep) { vector.dnit[u8](?index_bytes); }
+        }
+        val verified: res[pack.IndexedPack, str] = pack.open_indexed(bytes.data, bytes.len, index_bytes.data, index_bytes.len, c.repo.hash_len);
+        if (sel verified.err) { ret err[str].err{verified.err}; }
+        val added: res[usize, A.Error] = vector.push[PackFiles](?c.packs, PackFiles{bytes: bytes, index: index_bytes, view: verified.ok});
+        if (sel added.err) { ret err[str].err{"Git pack cache allocation refused"}; }
+        keep = true;
+    }
+    c.packs_ready = true;
+    ret err[str].ok{};
+}
+
+pub fun load(c: *Context, id: *object.Id) res[*pack.Object, str] {
+    var i: usize = 0;
+    for (i < c.objects.len) {
+        if (object.equal(?c.objects.data[i].id, id)) { ret res[*pack.Object, str].ok{?c.objects.data[i]}; }
+        i = i + 1;
+    }
+    val loose: res[bool, str] = store.has_loose(c.a, ?c.repo, id);
+    if (sel loose.err) { ret res[*pack.Object, str].err{loose.err}; }
+    var read: res[pack.Object, str] = res[pack.Object, str].err{"Git object unavailable in local packs"};
+    if (loose.ok) { read = store.read_object(c.a, ?c.repo, id); }
+    or {
+        val ready: err[str] = open_packs(c);
+        if (sel ready.err) { ret res[*pack.Object, str].err{ready.err}; }
+        var j: usize = 0;
+        for (j < c.packs.len) {
+            read = pack.read_opened(c.a, ?c.packs.data[j].view, id);
+            if (sel read.ok) { brk; }
+            if (sel read.err) {
+                if (!str_equals(read.err, "Git object is absent from pack index")) { ret res[*pack.Object, str].err{read.err}; }
+            }
+            j = j + 1;
+        }
+    }
+    if (sel read.err) { ret res[*pack.Object, str].err{read.err}; }
+    var item:   pack.Object         = read.ok;
+    val pushed: res[usize, A.Error] = vector.push[pack.Object](?c.objects, item);
+    if (sel pushed.err) {
+        vector.dnit[u8](?item.bytes);
+        ret res[*pack.Object, str].err{"Git object cache allocation refused"};
+    }
+    ret res[*pack.Object, str].ok{?c.objects.data[c.objects.len - 1]};
+}
+
+pub fun peel(c: *Context, id: object.Id) res[object.Id, str] {
+    var current: object.Id = id;
+    var depth:   usize     = 0;
+    for (depth < 8) {
+        val loaded: res[*pack.Object, str] = load(c, ?current);
+        if (sel loaded.err) { ret res[object.Id, str].err{loaded.err}; }
+        val o: *pack.Object = loaded.ok;
+        if (o.kind != 4)                       { ret res[object.Id, str].ok{current}; }
+        if (o.bytes.len < 8 + current.len * 2) { ret res[object.Id, str].err{"malformed Git annotated tag"}; }
+        val parsed: res[object.Id, str] = object.parse_id(?o.bytes.data[7], current.len * 2);
+        if (sel parsed.err) { ret parsed; }
+        current = parsed.ok;
+        depth   = depth + 1;
+    }
+    ret res[object.Id, str].err{"Git tag chain exceeds limit"};
+}
+
+pub fun resolve(c: *Context, spec: str) res[object.Id, str] {
+    var n:      usize = str_len(spec);
+    var commit: bool  = false;
+    if (str_ends_with(spec, "^{commit}")) {
+        n      = n - 9;
+        commit = true;
+    }
+    val base: res[str, string.StrError] = string.str_copy_slice(c.a, spec, 0, n);
+    if (sel base.err) { ret res[object.Id, str].err{"Git revision allocation refused"}; }
+    fin { str_free(c.a, base.ok); }
+    var id:        res[object.Id, str] = object.parse_id(base.ok, n);
+    val needs_ref: bool                = sel id.err;
+    if (needs_ref) {
+        id = store.read_ref(c.a, ?c.repo, base.ok);
+        val missing_ref: bool = sel id.err;
+        if (missing_ref && !str_starts_with(base.ok, "refs/") && !str_equals(base.ok, "HEAD")) {
+            val prefixes: [3]str = [3]str{"refs/tags/", "refs/remotes/", "refs/heads/"};
+            var i:        usize  = 0;
+            for (i < 3) {
+                val name: res[str, format.FormatError] = format.sprint(c.a, "{}{}", prefixes[i], base.ok);
+                if (sel name.err) { ret res[object.Id, str].err{"Git revision allocation refused"}; }
+                id = store.read_ref(c.a, ?c.repo, name.ok);
+                str_free(c.a, name.ok);
+                if (sel id.ok) { brk; }
+                i = i + 1;
+            }
+        }
+    }
+    if (sel id.err) { ret id; }
+    val held: res[*pack.Object, str] = load(c, ?id.ok);
+    if (sel held.err) { ret res[object.Id, str].err{held.err}; }
+    if (!commit)      { ret id; }
+    val peeled: res[object.Id, str] = peel(c, id.ok);
+    if (sel peeled.err) { ret peeled; }
+    val loaded: res[*pack.Object, str] = load(c, ?peeled.ok);
+    if (sel loaded.err)      { ret res[object.Id, str].err{loaded.err}; }
+    if (loaded.ok.kind != 1) { ret res[object.Id, str].err{"Git revision is not a commit"}; }
+    ret peeled;
+}
+
+pub fun tree(c: *Context, revision: str) res[object.Id, str] {
+    val resolved: res[object.Id, str] = resolve(c, revision);
+    if (sel resolved.err) { ret resolved; }
+    val peeled: res[object.Id, str] = peel(c, resolved.ok);
+    if (sel peeled.err) { ret peeled; }
+    val loaded: res[*pack.Object, str] = load(c, ?peeled.ok);
+    if (sel loaded.err) { ret res[object.Id, str].err{loaded.err}; }
+    val o: *pack.Object = loaded.ok;
+    if (o.kind == 2)                                          { ret peeled; }
+    if (o.kind != 1 || o.bytes.len < 6 + c.repo.hash_len * 2) { ret res[object.Id, str].err{"Git revision has no tree"}; }
+    val prefix: str   = "tree ";
+    var i:      usize = 0;
+    for (i < 5) {
+        if (o.bytes.data[i] != prefix[i]) { ret res[object.Id, str].err{"malformed Git commit tree"}; }
+        i = i + 1;
+    }
+    ret object.parse_id(?o.bytes.data[5], c.repo.hash_len * 2);
+}
+
+pub fun lookup(c: *Context, root: object.Id, relative: str) res[store.TreeEntry, str] {
+    var current: object.Id = root;
+    var start:   usize     = 0;
+    val n:       usize     = str_len(relative);
+    for (start < n) {
+        var end: usize = start;
+        for (end < n && relative[end] != '/') { end = end + 1; }
+        val loaded: res[*pack.Object, str] = load(c, ?current);
+        if (sel loaded.err)      { ret res[store.TreeEntry, str].err{loaded.err}; }
+        if (loaded.ok.kind != 2) { ret res[store.TreeEntry, str].err{"Git path traverses a non-tree"}; }
+        var r:     protocol.Reader = protocol.Reader{data: loaded.ok.bytes.data, len: loaded.ok.bytes.len, pos: 0};
+        var found: bool            = false;
+        for (r.pos < r.len) {
+            val parsed: res[store.TreeEntry, str] = store.tree_next(?r, c.repo.hash_len);
+            if (sel parsed.err) { ret parsed; }
+            var e: store.TreeEntry = parsed.ok;
+            if (e.name_len == end - start) {
+                var j: usize = 0;
+                for (j < e.name_len && relative[start + j] == e.name[j]) { j = j + 1; }
+                if (j == e.name_len) {
+                    if (end == n) { ret res[store.TreeEntry, str].ok{e}; }
+                    current = e.id;
+                    found   = true;
+                    brk;
+                }
+            }
+        }
+        if (!found) { ret res[store.TreeEntry, str].err{"Git committed path not found"}; }
+        start = end + 1;
+    }
+    ret res[store.TreeEntry, str].err{"empty Git committed path"};
+}
+
+pub fun mode_text(mode: u32) str {
+    if (mode == 0o40000)  { ret "040000"; }
+    if (mode == 0o160000) { ret "160000"; }
+    if (mode == 0o120000) { ret "120000"; }
+    if (mode == 0o100755) { ret "100755"; }
+    ret "100644";
+}
+
+pub fun append(out: *Vector[u8], text: str) err[str] {
+    ret protocol.append_bytes(out, text, str_len(text));
+}
+
+pub fun id_text(a: *A.Allocator, id: *object.Id) res[str, str] {
+    var hex: [65]u8;
+    if (!object.format_id(id, ?hex[0])) { ret res[str, str].err{"invalid Git object ID"}; }
+    ret cfg.copy(a, (?hex[0])::str);
+}
+
+pub fun save_index(c: *Context) err[str] {
+    val file: res[str, str] = store.join(c.a, c.repo.directory, "index");
+    if (sel file.err) { ret err[str].err{file.err}; }
+    fin { str_free(c.a, file.ok); }
+    val lock_name: res[str, format.FormatError] = format.sprint(c.a, "{}.lock", file.ok);
+    if (sel lock_name.err) { ret err[str].err{"Git index lock allocation refused"}; }
+    fin { str_free(c.a, lock_name.ok); }
+    var fd:     usize = os.INVALID_HANDLE;
+    val locked: i64   = os.open(os.working_dir(), lock_name.ok, os.O_CREAT | os.O_EXCL | os.O_RDWR, 420, ?fd);
+    if (locked < 0) { ret err[str].err{"Git index is locked; index retained"}; }
+    var handle_file: fs.File = fs.File{handle: handle.FileHandle{value: fd}};
+    var closed:      bool    = false;
+    fin {
+        if (!closed) { fs.close(?handle_file); }
+        fs.remove_file(lock_name.ok);
+    }
+    # reject a concurrent index replacement after the snapshot was read
+    val exists: res[bool, io_error.Error] = fs.exists(file.ok);
+    if (sel exists.err) { ret err[str].err{"Git index inspection failed"}; }
+    if (exists.ok) {
+        val read: res[Vector[u8], str] = store.read_bounded(c.a, file.ok, pack.MAX_TOTAL);
+        if (sel read.err) { ret err[str].err{read.err}; }
+        var bytes: Vector[u8] = read.ok;
+        fin { vector.dnit[u8](?bytes); }
+        if (bytes.len != c.raw_index.len) { ret err[str].err{"Git index changed concurrently"}; }
+        var i: usize = 0;
+        for (i < bytes.len) {
+            if (bytes.data[i] != c.raw_index.data[i]) { ret err[str].err{"Git index changed concurrently"}; }
+            i = i + 1;
+        }
+    }
+    or (c.raw_index.len != 0) { ret err[str].err{"Git index changed concurrently"}; }
+    val encoded: res[Vector[u8], str] = index.encode(c.a, ?c.staged, c.repo.hash_len);
+    if (sel encoded.err) { ret err[str].err{encoded.err}; }
+    var bytes:      Vector[u8] = encoded.ok;
+    var kept_bytes: bool       = false;
+    fin {
+        if (!kept_bytes) { vector.dnit[u8](?bytes); }
+    }
+    var pos: usize = 0;
+    for (pos < bytes.len) {
+        val written: res[usize, io_error.Error] = fs.write(handle_file, ?bytes.data[pos], bytes.len - pos);
+        if (sel written.err) { ret err[str].err{"Git index lock write failed"}; }
+        if (written.ok == 0) { ret err[str].err{"short Git index lock write"}; }
+        pos = pos + written.ok;
+    }
+    val synced: err[io_error.Error] = fs.sync(handle_file);
+    if (sel synced.err) { ret err[str].err{"Git index sync failed"}; }
+    val close_result: err[io_error.Error] = fs.close(?handle_file);
+    closed = true;
+    if (sel close_result.err) { ret err[str].err{"Git index close failed"}; }
+    val published: err[io_error.Error] = fs.rename(lock_name.ok, file.ok);
+    if (sel published.err) { ret err[str].err{"Git index replacement failed"}; }
+    val refreshed: res[index.Index, str] = index.decode(c.a, bytes.data, bytes.len, c.repo.hash_len);
+    if (sel refreshed.err) { ret err[str].err{refreshed.err}; }
+    vector.dnit[index.Entry](?c.staged.entries);
+    vector.dnit[u8](?c.raw_index);
+    c.raw_index = bytes;
+    c.staged    = refreshed.ok;
+    kept_bytes  = true;
+    ret err[str].ok{};
+}
+
+pub fun config_set(a: *A.Allocator, file: str, key: str, value: str, remove_section: bool) err[str] {
+    val read: res[cfg.Config, str] = read_config(a, file);
+    if (sel read.err) { ret err[str].err{read.err}; }
+    var c: cfg.Config = read.ok;
+    fin { cfg.dnit(a, ?c); }
+    var out: cfg.Config = cfg.Config{pairs: vector.init[cfg.Pair](a)};
+    fin { cfg.dnit(a, ?out); }
+    var i: usize = 0;
+    for (i < c.pairs.len) {
+        val p: *cfg.Pair     = ?c.pairs.data[i];
+        val n: res[str, str] = cfg.name(a, p);
+        if (sel n.err) { ret err[str].err{n.err}; }
+        var discard: bool = str_equals(n.ok, key);
+        if (remove_section) { discard = str_starts_with(n.ok, key) && n.ok[str_len(key)] == '.'; }
+        str_free(a, n.ok);
+        if (!discard) {
+            val added: res[usize, A.Error] = vector.push[cfg.Pair](?out.pairs, @p);
+            if (sel added.err) { ret err[str].err{"Git configuration allocation refused"}; }
+            p.section    = nil;
+            p.subsection = nil;
+            p.key        = nil;
+            p.value      = nil;
+        }
+        i = i + 1;
+    }
+    if (!remove_section) {
+        var first: usize = 0;
+        for (key[first] != 0 && key[first] != '.') { first = first + 1; }
+        var last: usize = str_len(key);
+        for (last > first && key[last] != '.') { last = last - 1; }
+        if (key[first] == 0 || first == 0 || key[last + 1] == 0) { ret err[str].err{"invalid Git configuration key"}; }
+        val section: res[str, string.StrError] = string.str_copy_slice(a, key, 0, first);
+        if (sel section.err) { ret err[str].err{"Git configuration allocation refused"}; }
+        var sub_len: usize = 0;
+        if (last > first) { sub_len = last - first - 1; }
+        val sub: res[str, string.StrError] = string.str_copy_slice(a, key, first + 1, sub_len);
+        if (sel sub.err) {
+            str_free(a, section.ok);
+            ret err[str].err{"Git configuration allocation refused"};
+        }
+        # the subsection excludes the dot immediately before the key
+        var subsection: str = sub.ok;
+
+        val k: res[str, str] = cfg.copy(a, (?key[last + 1])::str);
+        if (sel k.err) {
+            str_free(a, section.ok);
+            str_free(a, subsection);
+            ret err[str].err{k.err};
+        }
+        val v: res[str, str] = cfg.copy(a, value);
+        if (sel v.err) {
+            str_free(a, section.ok);
+            str_free(a, subsection);
+            str_free(a, k.ok);
+            ret err[str].err{v.err};
+        }
+        val added: res[usize, A.Error] = vector.push[cfg.Pair](?out.pairs, cfg.Pair{section: section.ok, subsection: subsection, key: k.ok, value: v.ok});
+        if (sel added.err) {
+            str_free(a, section.ok);
+            str_free(a, subsection);
+            str_free(a, k.ok);
+            str_free(a, v.ok);
+            ret err[str].err{"Git configuration allocation refused"};
+        }
+    }
+    val encoded: res[Vector[u8], str] = cfg.encode(a, ?out);
+    if (sel encoded.err) { ret err[str].err{encoded.err}; }
+    var bytes: Vector[u8] = encoded.ok;
+    fin { vector.dnit[u8](?bytes); }
+    val written: err[fs.FsError] = fs.replace_bytes_atomic(a, file, bytes.data, bytes.len, 420, 493);
+    if (sel written.err) { ret err[str].err{"Git configuration write failed"}; }
+    ret err[str].ok{};
+}
