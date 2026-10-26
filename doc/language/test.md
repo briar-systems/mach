@@ -4,8 +4,6 @@ A `test` declaration names a block of statements the test runner can
 execute on its own. Any module may declare them, and `mach test` collects
 every test in the selected artifact's closure and links the selected ones into
 one small test binary.
-What earns a test, and where it sits, is set by the
-[test policy](#test-policy).
 
 ## Grammar
 
@@ -348,45 +346,6 @@ test crypto__aes128_matches_fips_197 {
 
 A test that checks several arms, each with its own gate, fails when any arm
 fails and otherwise returns `77` when any arm skipped.
-
-## Test policy
-
-A change does not need a test of its own. A unit test exists only if it:
-
-- covers a unique surface, duplicating no other test
-- covers functionality critical to correctness that cannot be allowed to break
-- is deterministic, never depending on timing or performance
-- is valuable to check automatically
-- covers logic that is not blatantly simple
-- checks correctness
-- is no more complicated than the code it tests, unless that is unavoidable
-- does not pin a problem that no longer exists
-
-Coverage means branches and known failure points, not volume. `str_len` gets
-the inputs that exercise each of its branches, not a pile of strings, and a
-parser's tests cover its surface concisely, not exhaustively.
-
-A test sits beside what it tests, in the module whose code it covers. A test
-that exercises several modules together sits in the module that composes them,
-the lowest one whose own imports reach everything the test drives, and it drives
-them through the same entry points production uses, never through one that
-exists only for tests. A tests-only module, a `tests.mach` that gathers a
-subject's tests apart from it, is not used.
-
-A fixture lives at the layer of what it builds, in the module that owns the
-type it makes. A test reaches its fixtures through the imports its module
-already makes, or through a `#[testing] use` of a module at its own layer or
-below. An import only tests make never reaches above its module's layer: the
-mark is no cycle escape, so such an edge would push the module up the graph.
-The compiler holds its own tree to this with a test.
-
-A test that pins a defect is an ordinary test of the surface the defect was in,
-named for that surface and the case it covers. A test builds its fixtures in a
-temporary directory, and any `git` it runs is held inside that directory.
-
-The compiler's codegen corpus and link cases get the same scrutiny, scoped to
-what cannot be tested inside the compiler: the final codegen and link result on
-disk.
 
 ## See also
 

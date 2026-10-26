@@ -62,6 +62,6 @@ at: the scan's offset into `source`, which starts at body.offset
 pub fun comments_strip(a: *A.Allocator, source: str, body: lang_source.Span) res[str, fail.Fail];
 ```
 
-the body with its comments removed, the text an assembler reads; owned by `a`, body.len + 1
-bytes
+the body with each comment blanked to spaces, the text an assembler reads, every offset
+the body's own; owned by `a`, body.len + 1 bytes
 

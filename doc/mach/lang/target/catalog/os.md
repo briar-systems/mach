@@ -70,15 +70,6 @@ pub fun owner_of(id: u32) *mink_os.System;
 
 mink's system row the os `id` means, nil for an unknown id
 
-## fun env_of
-
-```mach
-pub fun env_of(id: u32) opt[*mink_os.Env];
-```
-
-the environment of mink's system a target of the os `id` runs under, none for
-a host under none or an unknown id
-
 ## fun is_hosted
 
 ```mach

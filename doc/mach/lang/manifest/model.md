@@ -123,16 +123,18 @@ least one
 
 name: the table key; a portable identifier
 is_default: `default = true`; false when the key is absent. more than one
-            default is a parse error
+              default is a parse error
 optimize: the required `optimize` key: whether the release pass set runs
 pass: the optional `pass` key: the optimization passes added to the set
 skip: the optional `skip` key: the optimization passes left out of it
 relax: the optional `relax` key: the departures from exact semantics
-            the build permits
+              the build permits
+linker_relax: the optional `linker_relax` key: whether the linker may relax the
+              code, true when the key is absent
 debug: the required `debug` key
 simd: the required `simd` key
 allow: the optional `allow` key: the warning kinds the profile silences,
-            empty when the key is absent
+              empty when the key is absent
 at: where the table's key is written
 default_at: where its `default` value is written, the zero place when absent
 

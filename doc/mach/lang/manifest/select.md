@@ -107,6 +107,7 @@ optimize: as `ProfileDef`
 pass: as `ProfileDef`, borrowed from the manifest
 skip: as `ProfileDef`, borrowed from the manifest
 relax: as `ProfileDef`, borrowed from the manifest
+linker_relax: as `ProfileDef`
 debug: as `ProfileDef`
 simd: as `ProfileDef`
 allow: as `ProfileDef`

@@ -1,0 +1,1441 @@
+# the emission layer over mirl's builder: each operation lowering asks for, made at the
+# cursor in the function being built. a constant, function or global value becomes a mirl
+# value where an instruction uses it, an aggregate travels as the address of its storage
+# and is loaded whole only where a call or a return passes it, and a bool is a byte, so
+# a comparison is widened to one and a condition is compared with zero
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+
+use core_state: masc.core.state;
+use mbuild:     mirl.build;
+use mirl.build.failure;
+use mirl.ir.assembly.Assembly;
+use mirl.ir.attribute.Attribute;
+use mirl.ir.body;
+use mirl.ir.constant.Address;
+use mirl.ir.constant.Bits;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.constant.Spec;
+use mirl.ir.debug;
+use mirl_global: mirl.ir.global;
+use mirl.ir.id;
+use mirl_instruction: mirl.ir.instruction;
+use mirl.ir.instruction.Branch;
+use mirl.ir.instruction.Request;
+use mirl_metadata: mirl.ir.metadata;
+use mirl.ir.metadata.Flags;
+use mirl.ir.module;
+use mirl.ir.native;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Immediate;
+use mirl.ir.opcode.Opcode;
+use mirl.ir.opcode.Ordering;
+use mirl.ir.place.Named;
+use mirl_point: mirl.ir.point;
+use types:      mirl.ir.type;
+use mirl.ir.type.Type;
+use mirl_value: mirl.ir.value;
+use mirl.ir.value.Declaration;
+use mirl_target:  mirl.target;
+use spirv_schema: mirl.target.spirv.schema;
+
+use mach.lang.fail;
+use mach.lang.float;
+use mach.lang.me.lower.irt;
+use mach.lang.me.lower.oblivious;
+use mach.lang.me.lower.value;
+use lang_source: mach.lang.source;
+use mach.lang.wide;
+
+pub rec Builder {
+    m:        *module.Module;
+    a:        *A.Allocator;
+    mb:       mbuild.Builder;
+    target:   *mirl_target.Target;
+    layout:   mirl_target.Layout;
+    slots:    u32;
+    fn:       opt[id.Function];
+    entry:    id.Block;
+    block:    id.Block;
+    allocas:  u32;
+    ended:    vector.Vector[bool];
+    secret:   bool;
+    volatile: bool;
+    loc:      lang_source.Location;
+    debug:    bool;
+    sources:  *lang_source.SourceMap;
+    files:    vector.Vector[u32];
+    failure:  opt[fail.Fail];
+    # whether the function being built is `#[oblivious]`, and the first computation on a
+    # secret it makes where it is not
+    oblivious: bool;
+    computed:  opt[Computed];
+}
+
+# a computation on a secret: where it is and its opcode
+pub rec Computed {
+    loc:  lang_source.Location;
+    code: Opcode;
+}
+
+val NO_BLOCK: id.Block = id.Block{index: 0xFFFFFFFF};
+val NO_FILE:  u32      = 0xFFFFFFFF;
+
+# a builder over `m`, whose types the target's layout lays out under the build's context,
+# with its stack slots in the address space `slots`
+pub fun init(m: *module.Module, a: *A.Allocator, target: *mirl_target.Target, ctx: opt[*core_state.Context], slots: u32, sources: *lang_source.SourceMap, debug_info: bool) Builder {
+    var b: Builder;
+    b.m         = m;
+    b.a         = a;
+    b.mb        = mbuild.init(m);
+    b.target    = target;
+    b.layout    = mirl_target.of(target, ?m.types, ctx);
+    b.slots     = slots;
+    b.fn        = opt[id.Function].none{};
+    b.entry     = NO_BLOCK;
+    b.block     = NO_BLOCK;
+    b.allocas   = 0;
+    b.ended     = vector.init[bool](a);
+    b.secret    = false;
+    b.volatile  = false;
+    b.loc       = lang_source.location_nil();
+    b.debug     = debug_info;
+    b.sources   = sources;
+    b.files     = vector.init[u32](a);
+    b.failure   = opt[fail.Fail].none{};
+    b.oblivious = false;
+    b.computed  = opt[Computed].none{};
+    ret b;
+}
+
+pub fun dnit(b: *Builder) {
+    vector.dnit[bool](?b.ended);
+    vector.dnit[u32](?b.files);
+}
+
+pub fun fault(b: *Builder, f: fail.Fail) {
+    val held: bool = sel b.failure.some;
+    if (held) { ret; }
+    b.failure = opt[fail.Fail].some{f};
+}
+
+pub fun failed(b: *Builder) bool {
+    ret sel b.failure.some || mbuild.failed(?b.mb);
+}
+
+# the first failure of the work: lowering's own, else the one mirl's builder kept
+pub fun done(b: *Builder) err[fail.Fail] {
+    if (sel b.failure.some) { ret err[fail.Fail].err{b.failure.some}; }
+    val got: err[failure.Failure] = mbuild.done(?b.mb);
+    if (sel got.err) { ret err[fail.Fail].err{refusal(b.a, got.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# a refusal of mirl's builder, named by what it was building: a defect of the lowering
+fun refusal(a: *A.Allocator, f: failure.Failure) fail.Fail {
+    val w: failure.Work = f.work;
+    if (sel w.instruction) {
+        val row: opt[opcode.Row] = opcode.row(w.instruction);
+        if (sel row.some) {
+            if (sel f.error.ir) { ret fail.formatted(a, "lower: mirl refused the `{}` lowering built", row.some.name); }
+            ret fail.formatted(a, "lower: mirl's builder could not place the `{}` lowering built", row.some.name);
+        }
+    }
+    if (sel w.block)     { ret fail.message("lower: mirl refused a block lowering built"); }
+    if (sel w.parameter) { ret fail.message("lower: mirl refused a block parameter lowering asked for"); }
+    if (sel w.constant)  { ret fail.message("lower: mirl refused a constant lowering built"); }
+    if (sel w.global)    { ret fail.message("lower: mirl refused a global lowering declared"); }
+    if (sel w.function)  { ret fail.message("lower: mirl refused a function lowering declared"); }
+    if (sel w.signature) { ret fail.message("lower: mirl refused a signature lowering built"); }
+    if (sel w.bind)      { ret fail.message("lower: mirl refused a variable binding lowering made"); }
+    ret fail.message("lower: mirl's builder refused the module lowering built");
+}
+
+pub fun after_err_pub(b: *Builder) err[fail.Fail] {
+    ret after_err(b);
+}
+
+# bind a variable to the stack slot `slot` holds it in: the slot's alloca names it
+pub fun bind_storage(b: *Builder, slot: value.Value, binding: debug.Binding) err[fail.Fail] {
+    if (slot.kind != value.VAL_SSA) { ret err[fail.Fail].ok{}; }
+    val d: res[mirl_value.ValueData, module.Error] = body.value_data(b.m, fn_of(b), slot.id);
+    if (sel d.err)              { ret err[fail.Fail].ok{}; }
+    if (!(sel d.ok.def.result)) { ret err[fail.Fail].ok{}; }
+    val i:   id.Instruction                                      = d.ok.def.result.instruction;
+    val got: res[mirl_instruction.InstructionData, module.Error] = body.instruction_data(b.m, fn_of(b), i);
+    if (sel got.err)                                { ret err[fail.Fail].ok{}; }
+    if (got.ok.opcode.index != opcode.ALLOCA.index) { ret err[fail.Fail].ok{}; }
+    var list: [1]debug.Binding                          = [1]debug.Binding{binding};
+    val made: res[mirl_metadata.Bindings, module.Error] = module.bindings(b.m, Slice[debug.Binding]{data: ?list[0], size: 1});
+    if (sel made.err) { ret err[fail.Fail].err{fail.message("lower: mirl refused a variable's storage binding")}; }
+    var md: mirl_metadata.Metadata = got.ok.metadata;
+    md.bindings = made.ok;
+    val set: err[module.Error] = body.set_metadata(b.m, fn_of(b), i, md);
+    if (sel set.err) { ret err[fail.Fail].err{fail.message("lower: mirl refused a variable's storage binding")}; }
+    ret err[fail.Fail].ok{};
+}
+
+# bind a variable to `v` from the cursor's point on
+pub fun bind_value(b: *Builder, binding: debug.Binding, v: value.Value) {
+    if (value.is_none(v)) { ret; }
+    val read: id.Value = use(b, v);
+    mbuild.bind_at(?b.mb, binding, mirl_point.Reads.operand{mirl_point.Operand{value: read, expression: mirl_point.PLAIN}});
+}
+
+pub fun take(b: *Builder, r: res[value.Value, fail.Fail]) value.Value {
+    if (sel r.err) {
+        fault(b, r.err);
+        ret value.none();
+    }
+    ret r.ok;
+}
+
+pub fun take_type(b: *Builder, r: res[Type, fail.Fail]) Type {
+    if (sel r.err) {
+        fault(b, r.err);
+        ret irt.NONE;
+    }
+    ret r.ok;
+}
+
+pub fun take_err(b: *Builder, r: err[fail.Fail]) {
+    if (sel r.err) { fault(b, r.err); }
+}
+
+fun ok(v: value.Value) res[value.Value, fail.Fail] {
+    ret res[value.Value, fail.Fail].ok{v};
+}
+
+fun bad(text: str) res[value.Value, fail.Fail] {
+    ret res[value.Value, fail.Fail].err{fail.message(text)};
+}
+
+# mirl's refusal, once its builder has kept one, as lowering's failure
+fun after(b: *Builder, v: value.Value) res[value.Value, fail.Fail] {
+    if (mbuild.failed(?b.mb)) {
+        val got: err[failure.Failure] = mbuild.done(?b.mb);
+        if (sel got.err) { ret res[value.Value, fail.Fail].err{refusal(b.a, got.err)}; }
+    }
+    ret ok(v);
+}
+
+fun after_err(b: *Builder) err[fail.Fail] {
+    if (mbuild.failed(?b.mb)) {
+        val got: err[failure.Failure] = mbuild.done(?b.mb);
+        if (sel got.err) { ret err[fail.Fail].err{refusal(b.a, got.err)}; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun types_of(b: *Builder) *types.Table {
+    ret ?b.m.types;
+}
+
+# a pointer into the storage a function's own slots live in, which a pointer the source
+# names no other storage of points into
+pub fun ptr_type(b: *Builder) Type {
+    ret ptr_in(b, slot_space(b));
+}
+
+# a pointer into the address space `space`
+pub fun ptr_in(b: *Builder, space: u32) Type {
+    ret take_type(b, irt.ptr_in(?b.m.types, space));
+}
+
+# the address space a stack slot lives in, as mirl's target states it
+pub fun slot_space(b: *Builder) u32 {
+    ret b.slots;
+}
+
+# the address space global `ix` lives in: its storage class where the target's pointers
+# name one, the default space elsewhere
+pub fun global_space(b: *Builder, ix: u32) u32 {
+    if (!classes(b)) { ret types.DEFAULT_SPACE; }
+    val node: *mirl_global.Node = ?b.m.globals.data[ix::usize];
+    ret spirv_schema.storage(Slice[Attribute]{data: node.attributes.data, size: node.attributes.len})::u32;
+}
+
+# whether the target's pointers name a storage class each, so a function's pointer
+# parameters take the classes of the storage their arguments point into
+pub fun classes(b: *Builder) bool {
+    ret sel b.target.caps.addressing.logical;
+}
+
+pub fun int_type(b: *Builder, bits: u32) Type {
+    ret take_type(b, irt.int(?b.m.types, bits));
+}
+
+fun i1(b: *Builder) Type {
+    ret int_type(b, 1);
+}
+
+fun i8(b: *Builder) Type {
+    ret int_type(b, 8);
+}
+
+# the integer as wide as a pointer, which addresses are compared and stepped in. a
+# logical pointer is no address and has no width, so an index into what it points to
+# is a 32-bit word, as spir-v writes a constant index
+pub fun index_type(b: *Builder) Type {
+    if (classes(b)) { ret int_type(b, 32); }
+    val p: res[u64, fail.Fail] = irt.size(?b.layout, ptr_type(b));
+    if (sel p.err) { ret int_type(b, 64); }
+    ret int_type(b, (p.ok * 8)::u32);
+}
+
+pub fun size_of(b: *Builder, ty: Type) u64 {
+    val r: res[u64, fail.Fail] = irt.size(?b.layout, ty);
+    if (sel r.err) {
+        fault(b, r.err);
+        ret 0;
+    }
+    ret r.ok;
+}
+
+pub fun align_of(b: *Builder, ty: Type) u64 {
+    # a pointer into a storage class has no representation in memory, so a slot or an access
+    # holding one constrains nothing, and promotion leaves no memory of it
+    if (classes(b) && irt.is_ptr(?b.m.types, ty)) { ret 1; }
+    val r: res[u64, fail.Fail] = irt.align(?b.layout, ty);
+    if (sel r.err) {
+        fault(b, r.err);
+        ret 1;
+    }
+    ret r.ok;
+}
+
+pub fun offset_of(b: *Builder, ty: Type, member: u32) u64 {
+    val r: res[u64, fail.Fail] = irt.offset(?b.layout, ty, member);
+    if (sel r.err) {
+        fault(b, r.err);
+        ret 0;
+    }
+    ret r.ok;
+}
+
+# build in function `f`, whose entry block takes `params`, each secret as `secrets` says
+pub fun enter(b: *Builder, f: id.Function, params: *Type, secrets: *bool, n: u32) id.Block {
+    b.fn      = opt[id.Function].some{f};
+    b.allocas = 0;
+    vector.clear[bool](?b.ended);
+    mbuild.enter(?b.mb, f);
+    b.secret    = false;
+    b.volatile  = false;
+    b.oblivious = b.m.functions.data[f.index].data.constant_time;
+    b.computed  = opt[Computed].none{};
+    val entry: id.Block = new_block_with(b, params, secrets, n);
+    b.entry = entry;
+    set_block(b, entry);
+    ret entry;
+}
+
+# end every block left open with unreachable: a block nothing branches to, such as the one
+# after a return
+pub fun seal(b: *Builder) err[fail.Fail] {
+    var k: usize = 0;
+    for (k < b.ended.len) {
+        if (!b.ended.data[k]) {
+            set_block(b, id.Block{index: k::u32});
+            val ended: err[fail.Fail] = emit_unreachable(b);
+            if (sel ended.err) { ret ended; }
+        }
+        k = k + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# leave the function: nothing is built until the next is entered
+pub fun leave(b: *Builder) {
+    b.fn    = opt[id.Function].none{};
+    b.entry = NO_BLOCK;
+    b.block = NO_BLOCK;
+    mbuild.detach(?b.mb);
+}
+
+pub fun in_function(b: *Builder) bool {
+    ret sel b.fn.some;
+}
+
+pub fun function(b: *Builder) id.Function {
+    if (sel b.fn.some) { ret b.fn.some; }
+    ret id.Function{index: 0xFFFFFFFF};
+}
+
+pub fun entry_block(b: *Builder) id.Block {
+    ret b.entry;
+}
+
+pub fun new_block(b: *Builder) res[id.Block, fail.Fail] {
+    val made: id.Block = new_block_with(b, nil, nil, 0);
+    if (failed(b)) { ret res[id.Block, fail.Fail].err{block_failure(b)}; }
+    ret res[id.Block, fail.Fail].ok{made};
+}
+
+fun block_failure(b: *Builder) fail.Fail {
+    if (sel b.failure.some) { ret b.failure.some; }
+    val got: err[failure.Failure] = mbuild.done(?b.mb);
+    if (sel got.err) { ret refusal(b.a, got.err); }
+    ret fail.message("lower: a block could not be made");
+}
+
+# a block whose parameters are `params`, which every edge into it passes
+pub fun new_block_with(b: *Builder, params: *Type, secrets: *bool, n: u32) id.Block {
+    var decls: vector.Vector[Declaration] = vector.init[Declaration](b.a);
+    fin { vector.dnit[Declaration](?decls); }
+    var i: u32 = 0;
+    for (i < n) {
+        var s: bool = false;
+        if (secrets != nil) { s = secrets[i]; }
+        val pushed: res[usize, A.Error] = vector.push[Declaration](?decls, Declaration{type: params[i], secret: s, name: opt[View].none{}});
+        if (sel pushed.err) {
+            fault(b, fail.refused(pushed.err));
+            ret NO_BLOCK;
+        }
+        i = i + 1;
+    }
+    val k: id.Block = mbuild.block(?b.mb, Slice[Declaration]{data: decls.data, size: decls.len});
+    if (mbuild.failed(?b.mb)) { ret NO_BLOCK; }
+    for (b.ended.len <= k.index::usize) {
+        val grown: res[usize, A.Error] = vector.push[bool](?b.ended, false);
+        if (sel grown.err) {
+            fault(b, fail.refused(grown.err));
+            ret NO_BLOCK;
+        }
+    }
+    ret k;
+}
+
+# parameter `i` of block `k`, typed `ty`
+pub fun block_param(b: *Builder, k: id.Block, i: u32, ty: Type) value.Value {
+    val v: id.Value = mbuild.parameter(?b.mb, k, i);
+    ret value.ssa(v, ty, secret_of(b, v));
+}
+
+pub fun set_block(b: *Builder, k: id.Block) {
+    b.block = k;
+    mbuild.at_end(?b.mb, k);
+}
+
+pub fun current_block(b: *Builder) id.Block {
+    ret b.block;
+}
+
+pub fun block_terminated(b: *Builder, k: id.Block) bool {
+    if (k.index::usize >= b.ended.len) { ret false; }
+    ret b.ended.data[k.index];
+}
+
+# whether the block being built already ends
+pub fun terminated(b: *Builder) bool {
+    if (sel b.fn.none) { ret false; }
+    ret block_terminated(b, b.block);
+}
+
+fun ends(b: *Builder) {
+    if (b.block.index::usize < b.ended.len) { b.ended.data[b.block.index] = true; }
+}
+
+pub fun set_loc(b: *Builder, loc: lang_source.Location) {
+    b.loc = loc;
+    if (!b.debug) { ret; }
+    mbuild.locate(?b.mb, location_of(b, loc));
+}
+
+pub fun current_loc(b: *Builder) lang_source.Location {
+    ret b.loc;
+}
+
+# the debug table's location of a source location, none when it has no file
+pub fun location_of(b: *Builder, loc: lang_source.Location) opt[debug.Location] {
+    if (!lang_source.location_is_valid(loc)) { ret opt[debug.Location].none{}; }
+    val sf: opt[*lang_source.SourceFile] = lang_source.get(b.sources, loc.file);
+    if (sel sf.none) { ret opt[debug.Location].none{}; }
+    val fi: u32 = lang_source.file_index(loc.file);
+    for (b.files.len <= fi::usize) {
+        val grown: res[usize, A.Error] = vector.push[u32](?b.files, NO_FILE);
+        if (sel grown.err) { ret opt[debug.Location].none{}; }
+    }
+    if (b.files.data[fi] == NO_FILE) {
+        val path: str                          = sf.some.path;
+        val made: res[debug.File, debug.Error] = debug.file(?b.m.debug, View{data: path, len: str_len(path)});
+        if (sel made.err) { ret opt[debug.Location].none{}; }
+        b.files.data[fi] = made.ok.index;
+    }
+    val pos: lang_source.Position             = lang_source.position(sf.some, loc.span.offset);
+    val at:  res[debug.Location, debug.Error] = debug.location(?b.m.debug, debug.Position{file: debug.File{index: b.files.data[fi]}, line: pos.line::u32, column: pos.col::u32});
+    if (sel at.err) { ret opt[debug.Location].none{}; }
+    ret opt[debug.Location].some{at.ok};
+}
+
+# the debug location the next instructions are built for
+pub fun debug_location(b: *Builder) opt[debug.Location] {
+    ret b.mb.location;
+}
+
+# whether the next instructions are marked secret: a load, call or atomic read of a secret
+pub fun set_secret(b: *Builder, s: bool) {
+    b.secret = s;
+    mbuild.secret(?b.mb, s);
+}
+
+# whether the next memory accesses are volatile
+pub fun set_volatile(b: *Builder, v: bool) {
+    b.volatile = v;
+    mbuild.flags(?b.mb, Flags{volatile: v, kept: false, bounded: false, checked: false});
+}
+
+# whether the next writes are kept: a wipe of memory that held a secret
+pub fun set_kept(b: *Builder, k: bool) {
+    mbuild.flags(?b.mb, Flags{volatile: b.volatile, kept: k, bounded: false, checked: false});
+}
+
+fun fn_of(b: *Builder) id.Function {
+    if (sel b.fn.some) { ret b.fn.some; }
+    ret id.Function{index: 0xFFFFFFFF};
+}
+
+fun secret_of(b: *Builder, v: id.Value) bool {
+    if (sel b.fn.none) { ret false; }
+    val d: res[mirl_value.ValueData, module.Error] = body.value_data(b.m, fn_of(b), v);
+    if (sel d.err) { ret false; }
+    ret d.ok.secret;
+}
+
+fun words_of(bits: wide.Wide, width: u32, out: *u64) usize {
+    if (width > 64) {
+        out[0] = bits.lo;
+        out[1] = bits.hi;
+        if (width < 128) { out[1] = bits.hi & ((1u64 << (width - 64)::u64) - 1); }
+        ret 2;
+    }
+    out[0] = bits.lo;
+    if (width < 64) { out[0] = bits.lo & ((1u64 << width::u64) - 1); }
+    ret 1;
+}
+
+# the module constant a constant value stands for
+# the bits of the integer or float constant `v`, written into `words`, which holds two; none,
+# with the builder faulted, for any other value
+fun scalar_bits(b: *Builder, v: value.Value, words: *u64) opt[Bits] {
+    if (v.kind == value.VAL_INT) {
+        val w: u32 = irt.int_width(?b.m.types, v.ty);
+        if (w == 0) {
+            fault(b, fail.message("lower: an integer constant of a type that is not an integer"));
+            ret opt[Bits].none{};
+        }
+        if (w > 128) {
+            fault(b, fail.message("lower: an integer constant wider than 128 bits"));
+            ret opt[Bits].none{};
+        }
+        val n: usize = words_of(v.bits, w, words);
+        ret opt[Bits].some{Bits{type: v.ty, words: Slice[u64]{data: words, size: n}}};
+    }
+    if (v.kind == value.VAL_FLOAT) {
+        val w: u32 = irt.float_width(?b.m.types, v.ty);
+        val f: f64 = value.float_lit(v);
+        if (w == 64) { words[0] = float.f64_bits(f); }
+        or (w == 32) { words[0] = float.f64_to_f32_bits(float.f64_bits(f))::u64; }
+        or (w == 16) { words[0] = float.bits_at(f, float.FLOAT_W_16); }
+        or {
+            fault(b, fail.message("lower: a float constant of a type that is not a float"));
+            ret opt[Bits].none{};
+        }
+        ret opt[Bits].some{Bits{type: v.ty, words: Slice[u64]{data: words, size: 1}}};
+    }
+    fault(b, fail.message("lower: a scalar constant asked of a value that is none"));
+    ret opt[Bits].none{};
+}
+
+# the specialization constant `spec_id`, whose default is the integer or float constant `default`
+pub fun spec_constant(b: *Builder, spec_id: u32, default: value.Value) value.Value {
+    var words: [2]u64;
+    val bits:  opt[Bits] = scalar_bits(b, default, ?words[0]);
+    if (sel bits.none) { ret value.none(); }
+    val c: id.Constant = mbuild.constant(?b.mb, ConstantData.spec{Spec{id: spec_id, default: bits.some}});
+    ret value.constant(c, default.ty);
+}
+
+pub fun constant_of(b: *Builder, v: value.Value) id.Constant {
+    if (v.kind == value.VAL_INT) {
+        if (irt.int_width(?b.m.types, v.ty) == 0 && irt.is_ptr(?b.m.types, v.ty) && wide.is_zero(v.bits)) { ret mbuild.constant(?b.mb, ConstantData.zero{v.ty}); }
+        var words: [2]u64;
+        val bits:  opt[Bits] = scalar_bits(b, v, ?words[0]);
+        if (sel bits.none) { ret id.Constant{index: 0xFFFFFFFF}; }
+        ret mbuild.constant(?b.mb, ConstantData.integer{bits.some});
+    }
+    if (v.kind == value.VAL_FLOAT) {
+        var words: [2]u64;
+        val bits:  opt[Bits] = scalar_bits(b, v, ?words[0]);
+        if (sel bits.none) { ret id.Constant{index: 0xFFFFFFFF}; }
+        ret mbuild.constant(?b.mb, ConstantData.float{bits.some});
+    }
+    if (v.kind == value.VAL_NULL)  { ret mbuild.constant(?b.mb, ConstantData.zero{v.ty}); }
+    if (v.kind == value.VAL_CONST) { ret id.Constant{index: v.index}; }
+    if (v.kind == value.VAL_GLOBAL) {
+        ret mbuild.constant(?b.mb, ConstantData.address{Address{type: ptr_in(b, v.space), symbol: id.Symbol.global{id.Global{index: v.index}}, offset: 0}});
+    }
+    if (v.kind == value.VAL_FN) {
+        ret mbuild.constant(?b.mb, ConstantData.address{Address{type: ptr_type(b), symbol: id.Symbol.function{id.Function{index: v.index}}, offset: 0}});
+    }
+    fault(b, fail.message("lower: a value with no constant asked for one"));
+    ret id.Constant{index: 0xFFFFFFFF};
+}
+
+# the mirl value `v` stands for in the function being built
+pub fun use(b: *Builder, v: value.Value) id.Value {
+    if (v.kind == value.VAL_SSA) { ret v.id; }
+    if (v.kind == value.VAL_FN) {
+        var imm: [2]Immediate = [2]Immediate{Immediate.function{id.Function{index: v.index}}, Immediate.ty{ptr_type(b)}};
+        ret made(b, opcode.FUNC_ADDR, nil, 0, ?imm[0], 2).id;
+    }
+    if (v.kind == value.VAL_NONE) {
+        fault(b, fail.message("lower: an operation used a value that is no value"));
+        ret id.Value{index: 0xFFFFFFFF};
+    }
+    ret mbuild.use_constant(?b.mb, constant_of(b, v));
+}
+
+fun request(code: Opcode, ops: *id.Value, n: u32, imm: *Immediate, ni: u32) Request {
+    ret Request{
+        opcode:     code,
+        operands:   Slice[id.Value]{data: ops, size: n::usize},
+        immediates: Slice[Immediate]{data: imm, size: ni::usize},
+        targets:    Slice[Branch]{data: nil, size: 0},
+    };
+}
+
+# an instruction of one result at the cursor
+fun made(b: *Builder, code: Opcode, ops: *id.Value, n: u32, imm: *Immediate, ni: u32) value.Value {
+    val v: id.Value = mbuild.value(?b.mb, request(code, ops, n, imm, ni));
+    if (mbuild.failed(?b.mb)) { ret value.none(); }
+    val d: res[mirl_value.ValueData, module.Error] = body.value_data(b.m, fn_of(b), v);
+    if (sel d.err) { ret value.none(); }
+    if (d.ok.secret && !b.oblivious && sel b.computed.none && !oblivious.moves(code)) {
+        b.computed = opt[Computed].some{Computed{loc: b.loc, code: code}};
+    }
+    var out: value.Value = value.ssa(v, d.ok.type, d.ok.secret);
+    out.space = irt.space_of(?b.m.types, d.ok.type);
+    ret out;
+}
+
+fun placed(b: *Builder, code: Opcode, ops: *id.Value, n: u32, imm: *Immediate, ni: u32) err[fail.Fail] {
+    mbuild.emit(?b.mb, request(code, ops, n, imm, ni));
+    ret after_err(b);
+}
+
+# a store marked volatile where `vol` holds: an access of a volatile place
+pub fun emit_store_marked(b: *Builder, v: value.Value, ptr: value.Value, vol: bool) err[fail.Fail] {
+    if (!vol) { ret emit_store(b, v, ptr); }
+    set_volatile(b, true);
+    val r: err[fail.Fail] = emit_store(b, v, ptr);
+    set_volatile(b, false);
+    ret r;
+}
+
+# a load marked volatile where `vol` holds
+pub fun emit_load_marked(b: *Builder, ptr: value.Value, ty: Type, vol: bool) res[value.Value, fail.Fail] {
+    if (!vol) { ret emit_load(b, ptr, ty); }
+    set_volatile(b, true);
+    val r: res[value.Value, fail.Fail] = emit_load(b, ptr, ty);
+    set_volatile(b, false);
+    ret r;
+}
+
+fun unary(b: *Builder, code: Opcode, x: value.Value) res[value.Value, fail.Fail] {
+    var ops: [1]id.Value = [1]id.Value{use(b, x)};
+    ret after(b, made(b, code, ?ops[0], 1, nil, 0));
+}
+
+fun binary(b: *Builder, code: Opcode, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    var ops: [2]id.Value = [2]id.Value{use(b, x), use(b, y)};
+    ret after(b, made(b, code, ?ops[0], 2, nil, 0));
+}
+
+fun converted(b: *Builder, code: Opcode, x: value.Value, to: Type) res[value.Value, fail.Fail] {
+    var ops: [1]id.Value  = [1]id.Value{use(b, x)};
+    var imm: [1]Immediate = [1]Immediate{Immediate.ty{to}};
+    ret after(b, made(b, code, ?ops[0], 1, ?imm[0], 1));
+}
+
+fun is_float(b: *Builder, v: value.Value) bool {
+    ret irt.is_float_like(?b.m.types, v.ty);
+}
+
+fun is_ptr(b: *Builder, v: value.Value) bool {
+    ret irt.is_ptr(?b.m.types, v.ty);
+}
+
+# an address read as the integer as wide as a pointer, which comparisons and differences read
+fun as_address_int(b: *Builder, v: value.Value) value.Value {
+    if (!is_ptr(b, v))            { ret v; }
+    if (v.kind == value.VAL_NULL) { ret value.const_int(0, index_type(b)); }
+    ret take(b, converted(b, opcode.PTRTOINT, v, index_type(b)));
+}
+
+pub fun emit_add(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    if (is_ptr(b, x) && !is_ptr(b, y)) { ret emit_offset(b, x, y); }
+    if (is_ptr(b, y) && !is_ptr(b, x)) { ret emit_offset(b, y, x); }
+    if (is_float(b, x))                { ret binary(b, opcode.FADD, x, y); }
+    ret binary(b, opcode.ADD, x, y);
+}
+
+pub fun emit_sub(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    if (is_ptr(b, x) && !is_ptr(b, y)) {
+        val negated: res[value.Value, fail.Fail] = unary(b, opcode.NEG, y);
+        if (sel negated.err) { ret negated; }
+        ret emit_offset(b, x, negated.ok);
+    }
+    if (is_ptr(b, x) && is_ptr(b, y)) { ret binary(b, opcode.SUB, as_address_int(b, x), as_address_int(b, y)); }
+    if (is_float(b, x))               { ret binary(b, opcode.FSUB, x, y); }
+    ret binary(b, opcode.SUB, x, y);
+}
+
+pub fun emit_mul(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    if (is_float(b, x)) { ret binary(b, opcode.FMUL, x, y); }
+    ret binary(b, opcode.MUL, x, y);
+}
+
+pub fun emit_div_s(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    if (is_float(b, x)) { ret binary(b, opcode.FDIV, x, y); }
+    ret binary(b, opcode.DIV_S, x, y);
+}
+
+pub fun emit_div_u(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    if (is_float(b, x)) { ret binary(b, opcode.FDIV, x, y); }
+    ret binary(b, opcode.DIV_U, x, y);
+}
+
+pub fun emit_rem_s(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    if (is_float(b, x)) { ret binary(b, opcode.FREM, x, y); }
+    ret binary(b, opcode.REM_S, x, y);
+}
+
+pub fun emit_rem_u(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    if (is_float(b, x)) { ret binary(b, opcode.FREM, x, y); }
+    ret binary(b, opcode.REM_U, x, y);
+}
+
+pub fun emit_and(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret binary(b, opcode.AND, x, y);
+}
+
+pub fun emit_or(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret binary(b, opcode.OR, x, y);
+}
+
+pub fun emit_xor(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret binary(b, opcode.XOR, x, y);
+}
+
+# a shift count of the shifted operand's own type, which mirl's shifts take
+fun count_for(b: *Builder, x: value.Value, n: value.Value) value.Value {
+    if (irt.same(x.ty, n.ty)) { ret n; }
+    if (irt.is_vector(?b.m.types, x.ty) && !irt.is_vector(?b.m.types, n.ty)) {
+        val lane: value.Value = count_for(b, value.retype(x, irt.element(?b.m.types, x.ty)), n);
+        ret take(b, emit_splat(b, x.ty, lane));
+    }
+    ret take(b, resize_int(b, n, x.ty, false));
+}
+
+pub fun emit_shl(b: *Builder, x: value.Value, n: value.Value) res[value.Value, fail.Fail] {
+    ret binary(b, opcode.SHL, x, count_for(b, x, n));
+}
+
+pub fun emit_shr_s(b: *Builder, x: value.Value, n: value.Value) res[value.Value, fail.Fail] {
+    ret binary(b, opcode.SHR_S, x, count_for(b, x, n));
+}
+
+pub fun emit_shr_u(b: *Builder, x: value.Value, n: value.Value) res[value.Value, fail.Fail] {
+    ret binary(b, opcode.SHR_U, x, count_for(b, x, n));
+}
+
+pub fun emit_neg(b: *Builder, x: value.Value) res[value.Value, fail.Fail] {
+    if (is_float(b, x)) { ret unary(b, opcode.FNEG, x); }
+    ret unary(b, opcode.NEG, x);
+}
+
+pub fun emit_not(b: *Builder, x: value.Value) res[value.Value, fail.Fail] {
+    ret unary(b, opcode.NOT, x);
+}
+
+# an i1, or a vector of them, widened to the bool byte, or the vector of the lane type
+# a mask is kept in, every bit set where it holds
+fun widened(b: *Builder, r: res[value.Value, fail.Fail], to: Type, mask: bool) res[value.Value, fail.Fail] {
+    if (sel r.err) { ret r; }
+    if (mask)      { ret converted(b, opcode.EXT_S, r.ok, to); }
+    ret converted(b, opcode.EXT_U, r.ok, to);
+}
+
+fun compare(b: *Builder, int_code: Opcode, float_code: Opcode, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    if (is_float(b, x)) { ret widened(b, binary(b, float_code, x, y), i8(b), false); }
+    ret widened(b, binary(b, int_code, as_address_int(b, x), as_address_int(b, y)), i8(b), false);
+}
+
+pub fun emit_cmp_eq(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret compare(b, opcode.EQ, opcode.FEQ_O, x, y);
+}
+
+pub fun emit_cmp_ne(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret compare(b, opcode.NE, opcode.FNE_U, x, y);
+}
+
+pub fun emit_cmp_lt_s(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret compare(b, opcode.LT_S, opcode.FLT_O, x, y);
+}
+
+pub fun emit_cmp_lt_u(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret compare(b, opcode.LT_U, opcode.FLT_O, x, y);
+}
+
+pub fun emit_cmp_le_s(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret compare(b, opcode.LE_S, opcode.FLE_O, x, y);
+}
+
+pub fun emit_cmp_le_u(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret compare(b, opcode.LE_U, opcode.FLE_O, x, y);
+}
+
+pub fun emit_cmp_gt_s(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret compare(b, opcode.GT_S, opcode.FGT_O, x, y);
+}
+
+pub fun emit_cmp_gt_u(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret compare(b, opcode.GT_U, opcode.FGT_O, x, y);
+}
+
+pub fun emit_cmp_ge_s(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret compare(b, opcode.GE_S, opcode.FGE_O, x, y);
+}
+
+pub fun emit_cmp_ge_u(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret compare(b, opcode.GE_U, opcode.FGE_O, x, y);
+}
+
+# a lanewise comparison of two vectors as a mask of `result_ty`, every bit of a lane set where it holds
+pub fun emit_vcompare(b: *Builder, int_code: Opcode, float_code: Opcode, x: value.Value, y: value.Value, result_ty: Type) res[value.Value, fail.Fail] {
+    if (is_float(b, x)) { ret widened(b, binary(b, float_code, x, y), result_ty, true); }
+    ret widened(b, binary(b, int_code, x, y), result_ty, true);
+}
+
+# an i1 that holds where a bool byte, or any integer, is not zero
+pub fun truth(b: *Builder, c: value.Value) value.Value {
+    if (irt.int_width(?b.m.types, c.ty) == 1) { ret c; }
+    ret take(b, binary(b, opcode.NE, c, value.const_int(0, c.ty)));
+}
+
+# `x` where `c` holds, else `y`; a vector condition picks lane by lane
+pub fun emit_select(b: *Builder, c: value.Value, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    var cond: value.Value = c;
+    if (irt.is_vector(?b.m.types, c.ty)) {
+        val lanes: u32  = irt.lanes(?b.m.types, c.ty);
+        val mask:  Type = take_type(b, irt.vector(?b.m.types, i1(b), lanes));
+        if (!irt.same(c.ty, mask)) {
+            val zero: value.Value = take(b, emit_splat(b, c.ty, value.const_int(0, irt.element(?b.m.types, c.ty))));
+            cond = take(b, binary(b, opcode.NE, c, zero));
+        }
+    }
+    or { cond = truth(b, c); }
+    var ops: [3]id.Value = [3]id.Value{use(b, cond), use(b, x), use(b, y)};
+    ret after(b, made(b, opcode.SELECT, ?ops[0], 3, nil, 0));
+}
+
+# an integer of `to`'s width from `x`: kept, truncated or extended by `signed`
+pub fun resize_int(b: *Builder, x: value.Value, to: Type, signed: bool) res[value.Value, fail.Fail] {
+    val from_w: u32 = irt.int_width(?b.m.types, irt.element(?b.m.types, x.ty));
+    val to_w:   u32 = irt.int_width(?b.m.types, irt.element(?b.m.types, to));
+    if (x.kind == value.VAL_INT && !irt.is_vector(?b.m.types, to)) {
+        var bits: wide.Wide = x.bits;
+        if (signed && from_w < 128 && from_w > 0) { bits = wide.sext(bits, from_w); }
+        ret ok(value.const_int_wide(bits, to));
+    }
+    if (from_w == to_w) { ret ok(value.retype(x, to)); }
+    if (from_w > to_w)  { ret converted(b, opcode.TRUNC, x, to); }
+    if (signed)         { ret converted(b, opcode.EXT_S, x, to); }
+    ret converted(b, opcode.EXT_U, x, to);
+}
+
+pub fun emit_trunc(b: *Builder, x: value.Value, to: Type) res[value.Value, fail.Fail] {
+    ret resize_int(b, x, to, false);
+}
+
+pub fun emit_sext(b: *Builder, x: value.Value, to: Type) res[value.Value, fail.Fail] {
+    ret resize_int(b, x, to, true);
+}
+
+pub fun emit_zext(b: *Builder, x: value.Value, to: Type) res[value.Value, fail.Fail] {
+    ret resize_int(b, x, to, false);
+}
+
+pub fun emit_fp_trunc(b: *Builder, x: value.Value, to: Type) res[value.Value, fail.Fail] {
+    if (irt.same(x.ty, to)) { ret ok(x); }
+    ret converted(b, opcode.FDEMOTE, x, to);
+}
+
+pub fun emit_fp_ext(b: *Builder, x: value.Value, to: Type) res[value.Value, fail.Fail] {
+    if (irt.same(x.ty, to)) { ret ok(x); }
+    ret converted(b, opcode.FPROMOTE, x, to);
+}
+
+# a float of `to`'s format from `x`, promoted or demoted
+pub fun emit_fp_resize(b: *Builder, x: value.Value, to: Type) res[value.Value, fail.Fail] {
+    val from_w: u32 = irt.float_width(?b.m.types, irt.element(?b.m.types, x.ty));
+    val to_w:   u32 = irt.float_width(?b.m.types, irt.element(?b.m.types, to));
+    if (from_w == to_w) { ret ok(value.retype(x, to)); }
+    if (from_w > to_w)  { ret converted(b, opcode.FDEMOTE, x, to); }
+    ret converted(b, opcode.FPROMOTE, x, to);
+}
+
+pub fun emit_fp_to_si(b: *Builder, x: value.Value, to: Type) res[value.Value, fail.Fail] {
+    ret converted(b, opcode.FTOI_S, x, to);
+}
+
+pub fun emit_fp_to_ui(b: *Builder, x: value.Value, to: Type) res[value.Value, fail.Fail] {
+    ret converted(b, opcode.FTOI_U, x, to);
+}
+
+pub fun emit_si_to_fp(b: *Builder, x: value.Value, to: Type) res[value.Value, fail.Fail] {
+    ret converted(b, opcode.ITOF_S, x, to);
+}
+
+pub fun emit_ui_to_fp(b: *Builder, x: value.Value, to: Type) res[value.Value, fail.Fail] {
+    ret converted(b, opcode.ITOF_U, x, to);
+}
+
+# the same bits as `to`: an address read as an integer and back, a resize between integers
+# of different widths, or a reinterpretation of equal widths
+pub fun emit_bitcast(b: *Builder, x: value.Value, to: Type) res[value.Value, fail.Fail] {
+    if (irt.same(x.ty, to)) { ret ok(x); }
+    val t: *types.Table = ?b.m.types;
+    if (irt.is_ptr(t, x.ty) && irt.is_ptr(t, to)) { ret ok(value.retype(x, to)); }
+    if (irt.is_ptr(t, x.ty) && irt.is_int(t, to)) {
+        if (x.kind == value.VAL_NULL) { ret ok(value.const_int(0, to)); }
+        ret converted(b, opcode.PTRTOINT, x, to);
+    }
+    if (irt.is_int(t, x.ty) && irt.is_ptr(t, to)) {
+        if (x.kind == value.VAL_INT && wide.is_zero(x.bits)) { ret ok(value.const_null(to)); }
+        ret converted(b, opcode.INTTOPTR, x, to);
+    }
+    if (irt.is_int(t, x.ty) && irt.is_int(t, to))           { ret resize_int(b, x, to, false); }
+    if (irt.is_function(t, to) || irt.is_function(t, x.ty)) { ret ok(value.retype(x, to)); }
+    ret converted(b, opcode.BITCAST, x, to);
+}
+
+# `x` made secret: a block parameter declared secret, which the branch into it passes `x`
+pub fun emit_classify(b: *Builder, x: value.Value) res[value.Value, fail.Fail] {
+    var ty:     [1]Type        = [1]Type{x.ty};
+    var secret: [1]bool        = [1]bool{true};
+    var arg:    [1]value.Value = [1]value.Value{x};
+    val k:      id.Block       = new_block_with(b, ?ty[0], ?secret[0], 1);
+    val passed: err[fail.Fail] = emit_br_args(b, k, ?arg[0], 1);
+    if (sel passed.err) { ret res[value.Value, fail.Fail].err{passed.err}; }
+    set_block(b, k);
+    ret after(b, block_param(b, k, 0, x.ty));
+}
+
+pub fun emit_declassify(b: *Builder, x: value.Value) res[value.Value, fail.Fail] {
+    if (value.is_constant(x)) { ret ok(x); }
+    ret unary(b, opcode.DECLASSIFY, x);
+}
+
+# a stack slot of `ty`, made in the entry block so every path reaches it
+pub fun emit_alloca(b: *Builder, ty: Type) res[value.Value, fail.Fail] {
+    ret alloca_aligned(b, ty, align_of(b, ty));
+}
+
+pub fun alloca_aligned(b: *Builder, ty: Type, align: u64) res[value.Value, fail.Fail] {
+    if (sel b.fn.none) { ret bad("lower: a stack slot asked for outside a function"); }
+    val saved: mbuild.Cursor = mbuild.cursor(?b.mb);
+    mbuild.at(?b.mb, b.entry, b.allocas);
+    val loc_saved:    opt[debug.Location] = b.mb.location;
+    val secret_saved: bool                = b.mb.secret;
+    val flags_saved:  Flags               = b.mb.flags;
+    mbuild.plain(?b.mb);
+    var imm:  [3]Immediate = [3]Immediate{Immediate.ty{ty}, Immediate.ty{ptr_in(b, slot_space(b))}, Immediate.alignment{align}};
+    var slot: value.Value  = made(b, opcode.ALLOCA, nil, 0, ?imm[0], 3);
+    slot.held     = ty;
+    b.allocas     = b.allocas + 1;
+    b.mb.cursor   = saved;
+    b.mb.location = loc_saved;
+    b.mb.secret   = secret_saved;
+    b.mb.flags    = flags_saved;
+    ret after(b, slot);
+}
+
+# a value of `ty` read from `addr`: an aggregate is copied into a slot of its own, whose
+# address is the value
+pub fun emit_load(b: *Builder, addr: value.Value, ty: Type) res[value.Value, fail.Fail] {
+    if (irt.is_aggregate(?b.m.types, ty)) {
+        val slot: res[value.Value, fail.Fail] = emit_alloca(b, ty);
+        if (sel slot.err) { ret slot; }
+        val copied: err[fail.Fail] = emit_copy(b, slot.ok, addr, ty);
+        if (sel copied.err) { ret res[value.Value, fail.Fail].err{copied.err}; }
+        ret ok(value.retype(slot.ok, ty));
+    }
+    ret load_whole(b, addr, ty);
+}
+
+# a value of `ty` read whole, an aggregate as one mirl value, as a call or a return passes it.
+# a pointer read from a slot is of the pointer the slot was made to hold
+fun load_whole(b: *Builder, addr: value.Value, ty: Type) res[value.Value, fail.Fail] {
+    var read: Type = ty;
+    if (irt.is_ptr(?b.m.types, ty) && irt.is_ptr(?b.m.types, addr.held)) { read = addr.held; }
+    var ops: [1]id.Value  = [1]id.Value{use(b, addr)};
+    var imm: [2]Immediate = [2]Immediate{Immediate.ty{read}, Immediate.alignment{align_of(b, read)}};
+    ret after(b, made(b, opcode.LOAD, ?ops[0], 1, ?imm[0], 2));
+}
+
+# write `v` to `addr`: an aggregate, held at an address, is copied
+pub fun emit_store(b: *Builder, v: value.Value, addr: value.Value) err[fail.Fail] {
+    if (irt.is_aggregate(?b.m.types, v.ty)) { ret emit_copy(b, addr, v, v.ty); }
+    var ops: [2]id.Value  = [2]id.Value{use(b, addr), use(b, v)};
+    var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align_of(b, v.ty)}};
+    ret placed(b, opcode.STORE, ?ops[0], 2, ?imm[0], 1);
+}
+
+# write a whole mirl value of `ty`, as a parameter or a call's result arrives
+fun store_whole(b: *Builder, whole: id.Value, ty: Type, addr: value.Value) err[fail.Fail] {
+    var ops: [2]id.Value  = [2]id.Value{use(b, addr), whole};
+    var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align_of(b, ty)}};
+    ret placed(b, opcode.STORE, ?ops[0], 2, ?imm[0], 1);
+}
+
+# copy the bytes of a `ty` from `src` to `dst`
+pub fun emit_copy(b: *Builder, dst: value.Value, src: value.Value, ty: Type) err[fail.Fail] {
+    val n: u64 = size_of(b, ty);
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+    var ops: [3]id.Value  = [3]id.Value{use(b, dst), use(b, src), use(b, value.const_int(n, index_type(b)))};
+    var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align_of(b, ty)}};
+    ret placed(b, opcode.MEM_COPY, ?ops[0], 3, ?imm[0], 1);
+}
+
+# zero the bytes of a `ty` at `addr`
+pub fun emit_memzero(b: *Builder, addr: value.Value, ty: Type) err[fail.Fail] {
+    val n: u64 = size_of(b, ty);
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+    var ops: [3]id.Value  = [3]id.Value{use(b, addr), use(b, value.const_int(0, i8(b))), use(b, value.const_int(n, index_type(b)))};
+    var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align_of(b, ty)}};
+    ret placed(b, opcode.MEM_FILL, ?ops[0], 3, ?imm[0], 1);
+}
+
+# the address `bytes` past `addr`
+pub fun emit_offset(b: *Builder, addr: value.Value, bytes: value.Value) res[value.Value, fail.Fail] {
+    var ops: [2]id.Value = [2]id.Value{use(b, addr), use(b, bytes)};
+    ret after(b, made(b, opcode.PTR_ADD, ?ops[0], 2, nil, 0));
+}
+
+# the address of member `k` of the aggregate `agg` at `addr`: a structure's member, an
+# array's or vector's element, and a union's every member, which all start where it does
+pub fun emit_member(b: *Builder, addr: value.Value, agg: Type, k: u32) res[value.Value, fail.Fail] {
+    val t: *types.Table = ?b.m.types;
+    if (irt.is_union(t, agg)) { ret ok(value.retype(addr, ptr_in(b, addr.space))); }
+    if (irt.is_struct(t, agg)) {
+        var ops: [1]id.Value  = [1]id.Value{use(b, addr)};
+        var imm: [2]Immediate = [2]Immediate{Immediate.ty{agg}, Immediate.member{k}};
+        ret after(b, made(b, opcode.PTR_MEMBER, ?ops[0], 1, ?imm[0], 2));
+    }
+    ret emit_element(b, addr, agg, value.const_int(k::u64, index_type(b)));
+}
+
+# the address of element `ix` of the array or vector `agg` at `addr`
+pub fun emit_element(b: *Builder, addr: value.Value, agg: Type, ix: value.Value) res[value.Value, fail.Fail] {
+    val t:     *types.Table = ?b.m.types;
+    var array: Type         = agg;
+    if (irt.is_vector(t, agg)) { array = take_type(b, irt.array(t, irt.element(t, agg), irt.lanes(t, agg)::u64)); }
+    var ops: [2]id.Value  = [2]id.Value{use(b, addr), use(b, ix)};
+    var imm: [1]Immediate = [1]Immediate{Immediate.ty{array}};
+    ret after(b, made(b, opcode.PTR_INDEX, ?ops[0], 2, ?imm[0], 1));
+}
+
+# the address `ix` elements of `elem` past `addr`, as a pointer steps
+pub fun emit_step(b: *Builder, addr: value.Value, elem: Type, ix: value.Value) res[value.Value, fail.Fail] {
+    val run: Type = take_type(b, irt.array(?b.m.types, elem, 1));
+    ret emit_element(b, addr, run, ix);
+}
+
+# a vector of `ty` with `scalar` in every lane
+pub fun emit_splat(b: *Builder, ty: Type, scalar: value.Value) res[value.Value, fail.Fail] {
+    var ops: [1]id.Value  = [1]id.Value{use(b, scalar)};
+    var imm: [1]Immediate = [1]Immediate{Immediate.ty{ty}};
+    ret after(b, made(b, opcode.VSPLAT, ?ops[0], 1, ?imm[0], 1));
+}
+
+# lane `lane` of `vec`, read as `ty`: a constant lane is read in place, any other through
+# the vector's bytes in a slot
+pub fun emit_vec_extract(b: *Builder, vec: value.Value, lane: value.Value, ty: Type) res[value.Value, fail.Fail] {
+    if (lane.kind == value.VAL_INT) {
+        var ops: [1]id.Value  = [1]id.Value{use(b, vec)};
+        var imm: [1]Immediate = [1]Immediate{Immediate.lane{value.int_lit(lane)::u32}};
+        ret after(b, made(b, opcode.VEXTRACT, ?ops[0], 1, ?imm[0], 1));
+    }
+    val slot: res[value.Value, fail.Fail] = emit_alloca(b, vec.ty);
+    if (sel slot.err) { ret slot; }
+    val put: err[fail.Fail] = emit_store(b, vec, slot.ok);
+    if (sel put.err) { ret res[value.Value, fail.Fail].err{put.err}; }
+    val at: res[value.Value, fail.Fail] = emit_element(b, slot.ok, vec.ty, lane);
+    if (sel at.err) { ret at; }
+    ret emit_load(b, at.ok, ty);
+}
+
+pub fun emit_vec_insert(b: *Builder, vec: value.Value, lane: value.Value, x: value.Value) res[value.Value, fail.Fail] {
+    if (lane.kind == value.VAL_INT) {
+        var ops: [2]id.Value  = [2]id.Value{use(b, vec), use(b, x)};
+        var imm: [1]Immediate = [1]Immediate{Immediate.lane{value.int_lit(lane)::u32}};
+        ret after(b, made(b, opcode.VINSERT, ?ops[0], 2, ?imm[0], 1));
+    }
+    val slot: res[value.Value, fail.Fail] = emit_alloca(b, vec.ty);
+    if (sel slot.err) { ret slot; }
+    val put: err[fail.Fail] = emit_store(b, vec, slot.ok);
+    if (sel put.err) { ret res[value.Value, fail.Fail].err{put.err}; }
+    val at: res[value.Value, fail.Fail] = emit_element(b, slot.ok, vec.ty, lane);
+    if (sel at.err) { ret at; }
+    val put_lane: err[fail.Fail] = emit_store(b, x, at.ok);
+    if (sel put_lane.err) { ret res[value.Value, fail.Fail].err{put_lane.err}; }
+    ret emit_load(b, slot.ok, vec.ty);
+}
+
+# a vector of `ty` from one value per lane
+pub fun emit_vec_build(b: *Builder, ty: Type, lanes: *value.Value, n: u32) res[value.Value, fail.Fail] {
+    if (irt.lanes(?b.m.types, ty) != n) { ret bad("lower: a vector build's lane count is not its vector's"); }
+    var ops: vector.Vector[id.Value] = vector.init[id.Value](b.a);
+    fin { vector.dnit[id.Value](?ops); }
+    var i: u32 = 0;
+    for (i < n) {
+        val pushed: res[usize, A.Error] = vector.push[id.Value](?ops, use(b, lanes[i]));
+        if (sel pushed.err) { ret res[value.Value, fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    var imm: [1]Immediate = [1]Immediate{Immediate.ty{ty}};
+    ret after(b, made(b, opcode.VBUILD, ops.data, n, ?imm[0], 1));
+}
+
+# lanes of `x` and `y` joined, picked by `picks`, as a vector of `ty`
+pub fun emit_shuffle(b: *Builder, ty: Type, x: value.Value, y: value.Value, picks: *u32, n: u32) res[value.Value, fail.Fail] {
+    var ops: [2]id.Value  = [2]id.Value{use(b, x), use(b, y)};
+    var imm: [2]Immediate = [2]Immediate{Immediate.ty{ty}, Immediate.lanes{Slice[u32]{data: picks, size: n::usize}}};
+    ret after(b, made(b, opcode.VSHUFFLE, ?ops[0], 2, ?imm[0], 2));
+}
+
+# a reduction of a vector's lanes to one scalar
+pub fun emit_reduce(b: *Builder, code: Opcode, x: value.Value) res[value.Value, fail.Fail] {
+    ret unary(b, code, x);
+}
+
+# a lanewise or scalar operation of one operand
+pub fun emit_unary(b: *Builder, code: Opcode, x: value.Value) res[value.Value, fail.Fail] {
+    ret unary(b, code, x);
+}
+
+# a lanewise or scalar operation of two operands
+pub fun emit_binary(b: *Builder, code: Opcode, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    ret binary(b, code, x, y);
+}
+
+# a lanewise or scalar operation of three operands
+pub fun emit_ternary(b: *Builder, code: Opcode, x: value.Value, y: value.Value, z: value.Value) res[value.Value, fail.Fail] {
+    var ops: [3]id.Value = [3]id.Value{use(b, x), use(b, y), use(b, z)};
+    ret after(b, made(b, code, ?ops[0], 3, nil, 0));
+}
+
+# an atomic read of the integer `ty` at `addr`
+pub fun emit_atomic_load(b: *Builder, addr: value.Value, ty: Type, order: Ordering) res[value.Value, fail.Fail] {
+    var ops: [1]id.Value  = [1]id.Value{use(b, addr)};
+    var imm: [2]Immediate = [2]Immediate{Immediate.ty{ty}, Immediate.ordering{order}};
+    ret after(b, made(b, opcode.ATOMIC_LOAD, ?ops[0], 1, ?imm[0], 2));
+}
+
+pub fun emit_atomic_store(b: *Builder, addr: value.Value, x: value.Value, order: Ordering) err[fail.Fail] {
+    var ops: [2]id.Value  = [2]id.Value{use(b, addr), use(b, x)};
+    var imm: [1]Immediate = [1]Immediate{Immediate.ordering{order}};
+    ret placed(b, opcode.ATOMIC_STORE, ?ops[0], 2, ?imm[0], 1);
+}
+
+# an atomic read-modify-write, giving the value held before
+pub fun emit_atomic_rmw(b: *Builder, code: Opcode, addr: value.Value, x: value.Value, order: Ordering) res[value.Value, fail.Fail] {
+    var ops: [2]id.Value  = [2]id.Value{use(b, addr), use(b, x)};
+    var imm: [1]Immediate = [1]Immediate{Immediate.ordering{order}};
+    ret after(b, made(b, code, ?ops[0], 2, ?imm[0], 1));
+}
+
+# an atomic compare and exchange, giving the value held before
+pub fun emit_atomic_cmpxchg(b: *Builder, addr: value.Value, expected: value.Value, desired: value.Value, success: Ordering, failure_order: Ordering) res[value.Value, fail.Fail] {
+    var ops: [3]id.Value    = [3]id.Value{use(b, addr), use(b, expected), use(b, desired)};
+    var imm: [2]Immediate   = [2]Immediate{Immediate.ordering{success}, Immediate.ordering{failure_order}};
+    val i:   id.Instruction = mbuild.emit(?b.mb, request(opcode.ATOMIC_CMPXCHG, ?ops[0], 3, ?imm[0], 2));
+    if (mbuild.failed(?b.mb)) { ret after(b, value.none()); }
+    val v: id.Value = mbuild.result(?b.mb, i, 0);
+    ret after(b, value.ssa(v, expected.ty, secret_of(b, v)));
+}
+
+pub fun emit_fence(b: *Builder, order: Ordering) err[fail.Fail] {
+    var imm: [1]Immediate = [1]Immediate{Immediate.ordering{order}};
+    ret placed(b, opcode.FENCE, nil, 0, ?imm[0], 1);
+}
+
+# a call of `callee` through the signature `sig`. an aggregate argument is passed whole,
+# read from the address it travels at, and an aggregate result lands in a slot of its own
+pub fun emit_call(b: *Builder, callee: value.Value, sig: Type, args: *value.Value, n: u32) res[value.Value, fail.Fail] {
+    val t: *types.Table = ?b.m.types;
+    if (irt.param_count(t, sig) != n) { ret bad("lower: a call passes a count of arguments its signature does not take"); }
+    var ops: vector.Vector[id.Value] = vector.init[id.Value](b.a);
+    fin { vector.dnit[id.Value](?ops); }
+    var head: id.Value = id.Value{index: 0xFFFFFFFF};
+    if (callee.kind == value.VAL_FN) { head = mbuild.use_constant(?b.mb, constant_of(b, callee)); }
+    or                               { head = use(b, callee); }
+    val first: res[usize, A.Error] = vector.push[id.Value](?ops, head);
+    if (sel first.err) { ret res[value.Value, fail.Fail].err{fail.refused(first.err)}; }
+    var i: u32 = 0;
+    for (i < n) {
+        val p: Type     = irt.param_of(t, sig, i);
+        var a: id.Value = id.Value{index: 0xFFFFFFFF};
+        if (irt.is_aggregate(t, p)) {
+            val whole: res[value.Value, fail.Fail] = load_whole(b, args[i], p);
+            if (sel whole.err) { ret whole; }
+            a = whole.ok.id;
+        }
+        or { a = use(b, args[i]); }
+        val pushed: res[usize, A.Error] = vector.push[id.Value](?ops, a);
+        if (sel pushed.err) { ret res[value.Value, fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    var imm:  [2]Immediate   = [2]Immediate{Immediate.ty{sig}, Immediate.named{Named.all{}}};
+    val call: id.Instruction = mbuild.emit(?b.mb, request(opcode.CALL, ops.data, ops.len::u32, ?imm[0], 2));
+    if (mbuild.failed(?b.mb)) { ret after(b, value.none()); }
+    val rt: Type = irt.result_of(t, sig);
+    if (irt.is_none(rt)) { ret ok(value.none()); }
+    val r: id.Value = mbuild.result(?b.mb, call, 0);
+    if (irt.is_aggregate(t, rt)) {
+        val slot: res[value.Value, fail.Fail] = emit_alloca(b, rt);
+        if (sel slot.err) { ret slot; }
+        val put: err[fail.Fail] = store_whole(b, r, rt, slot.ok);
+        if (sel put.err) { ret res[value.Value, fail.Fail].err{put.err}; }
+        var out: value.Value = value.retype(slot.ok, rt);
+        out.secret = secret_of(b, r);
+        ret ok(out);
+    }
+    ret after(b, value.ssa(r, rt, secret_of(b, r)));
+}
+
+# parameter `i` of the function being built, of `ty`: an aggregate lands in a slot of its
+# own, whose address is the value
+pub fun param(b: *Builder, i: u32, ty: Type) res[value.Value, fail.Fail] {
+    val v: id.Value = mbuild.parameter(?b.mb, b.entry, i);
+    if (mbuild.failed(?b.mb)) { ret after(b, value.none()); }
+    if (irt.is_aggregate(?b.m.types, ty)) {
+        val slot: res[value.Value, fail.Fail] = emit_alloca(b, ty);
+        if (sel slot.err) { ret slot; }
+        val put: err[fail.Fail] = store_whole(b, v, ty, slot.ok);
+        if (sel put.err) { ret res[value.Value, fail.Fail].err{put.err}; }
+        var out: value.Value = value.retype(slot.ok, ty);
+        out.secret = secret_of(b, v);
+        ret ok(out);
+    }
+    ret ok(value.ssa(v, ty, secret_of(b, v)));
+}
+
+fun branch(b: *Builder, code: Opcode, ops: *id.Value, n: u32, targets: *Branch, nt: u32, imm: *Immediate, ni: u32) err[fail.Fail] {
+    mbuild.emit(?b.mb, Request{
+        opcode:     code,
+        operands:   Slice[id.Value]{data: ops, size: n::usize},
+        immediates: Slice[Immediate]{data: imm, size: ni::usize},
+        targets:    Slice[Branch]{data: targets, size: nt::usize},
+    });
+    ends(b);
+    ret after_err(b);
+}
+
+fun no_args() Slice[id.Value] {
+    ret Slice[id.Value]{data: nil, size: 0};
+}
+
+pub fun emit_br(b: *Builder, target: id.Block) err[fail.Fail] {
+    var edge: [1]Branch = [1]Branch{Branch{block: target, arguments: no_args()}};
+    ret branch(b, opcode.BR, nil, 0, ?edge[0], 1, nil, 0);
+}
+
+# a branch to `target`, passing one argument per parameter of it
+pub fun emit_br_args(b: *Builder, target: id.Block, args: *value.Value, n: u32) err[fail.Fail] {
+    var passed: vector.Vector[id.Value] = vector.init[id.Value](b.a);
+    fin { vector.dnit[id.Value](?passed); }
+    var i: u32 = 0;
+    for (i < n) {
+        val pushed: res[usize, A.Error] = vector.push[id.Value](?passed, use(b, args[i]));
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    var edge: [1]Branch = [1]Branch{Branch{block: target, arguments: Slice[id.Value]{data: passed.data, size: passed.len}}};
+    ret branch(b, opcode.BR, nil, 0, ?edge[0], 1, nil, 0);
+}
+
+pub fun emit_cbr(b: *Builder, c: value.Value, then_b: id.Block, else_b: id.Block) err[fail.Fail] {
+    var ops:   [1]id.Value = [1]id.Value{use(b, truth(b, c))};
+    var edges: [2]Branch   = [2]Branch{Branch{block: then_b, arguments: no_args()}, Branch{block: else_b, arguments: no_args()}};
+    ret branch(b, opcode.CBR, ?ops[0], 1, ?edges[0], 2, nil, 0);
+}
+
+# a branch on `sel` to the target of the case it equals, else to `otherwise`. `cases` holds
+# strictly increasing values, one per target
+pub fun emit_switch(b: *Builder, selector: value.Value, otherwise: id.Block, cases: *u64, targets: *id.Block, n: u32) err[fail.Fail] {
+    var edges: vector.Vector[Branch] = vector.init[Branch](b.a);
+    fin { vector.dnit[Branch](?edges); }
+    val first: res[usize, A.Error] = vector.push[Branch](?edges, Branch{block: otherwise, arguments: no_args()});
+    if (sel first.err) { ret err[fail.Fail].err{fail.refused(first.err)}; }
+    var i: u32 = 0;
+    for (i < n) {
+        val pushed: res[usize, A.Error] = vector.push[Branch](?edges, Branch{block: targets[i], arguments: no_args()});
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    var ops: [1]id.Value  = [1]id.Value{use(b, selector)};
+    var imm: [1]Immediate = [1]Immediate{Immediate.cases{Slice[u64]{data: cases, size: n::usize}}};
+    ret branch(b, opcode.SWITCH, ?ops[0], 1, edges.data, edges.len::u32, ?imm[0], 1);
+}
+
+# return `v` from the function being built: an aggregate is read whole from its address
+pub fun emit_ret(b: *Builder, v: value.Value) err[fail.Fail] {
+    if (value.is_none(v)) { ret emit_ret_void(b); }
+    var r: id.Value = id.Value{index: 0xFFFFFFFF};
+    if (irt.is_aggregate(?b.m.types, v.ty)) {
+        val whole: res[value.Value, fail.Fail] = load_whole(b, v, v.ty);
+        if (sel whole.err) { ret err[fail.Fail].err{whole.err}; }
+        r = whole.ok.id;
+    }
+    or { r = use(b, v); }
+    var ops: [1]id.Value = [1]id.Value{r};
+    ret branch(b, opcode.RET, ?ops[0], 1, nil, 0, nil, 0);
+}
+
+pub fun emit_ret_void(b: *Builder) err[fail.Fail] {
+    ret branch(b, opcode.RET, nil, 0, nil, 0, nil, 0);
+}
+
+# an inline assembly block at the cursor, binding the `n` values at `values` in its operands'
+# order. the instruction copies the block, so it may be borrowed
+pub fun emit_asm(b: *Builder, block: *Assembly, values: *value.Value, n: u32) err[fail.Fail] {
+    var ops: vector.Vector[id.Value] = vector.init[id.Value](b.a);
+    fin { vector.dnit[id.Value](?ops); }
+    var i: u32 = 0;
+    for (i < n) {
+        val pushed: res[usize, A.Error] = vector.push[id.Value](?ops, use(b, values[i]));
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    var imm: [1]Immediate = [1]Immediate{Immediate.assembly{block}};
+    ret placed(b, opcode.ASM, ops.data, ops.len::u32, ?imm[0], 1);
+}
+
+# the target op `op` at the cursor over the `n` values at `values`, in its operands' order,
+# its result the one `op` states or none. the instruction copies the op, so it may be borrowed
+pub fun emit_target_op(b: *Builder, op: *native.Op, values: *value.Value, n: u32) res[value.Value, fail.Fail] {
+    var ops: vector.Vector[id.Value] = vector.init[id.Value](b.a);
+    fin { vector.dnit[id.Value](?ops); }
+    var i: u32 = 0;
+    for (i < n) {
+        val pushed: res[usize, A.Error] = vector.push[id.Value](?ops, use(b, values[i]));
+        if (sel pushed.err) { ret res[value.Value, fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    var code: Opcode = opcode.TARGET_OP;
+    if (native.touches(op)) { code = opcode.TARGET_OP_MEMORY; }
+    var imm:  [1]Immediate   = [1]Immediate{Immediate.op{op}};
+    val made: id.Instruction = mbuild.emit(?b.mb, request(code, ops.data, ops.len::u32, ?imm[0], 1));
+    if (mbuild.failed(?b.mb)) { ret after(b, value.none()); }
+    if (op.results.size == 0) { ret ok(value.none()); }
+    val r: id.Value = mbuild.result(?b.mb, made, 0);
+    ret after(b, value.ssa(r, op.results.data[0], secret_of(b, r)));
+}
+
+pub fun emit_unreachable(b: *Builder) err[fail.Fail] {
+    ret branch(b, opcode.UNREACHABLE, nil, 0, nil, 0, nil, 0);
+}
+
+pub fun add(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_add(b, x, y));
+}
+
+pub fun sub(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_sub(b, x, y));
+}
+
+pub fun mul(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_mul(b, x, y));
+}
+
+pub fun band(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_and(b, x, y));
+}
+
+pub fun bor(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_or(b, x, y));
+}
+
+pub fun bxor(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_xor(b, x, y));
+}
+
+pub fun shl(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_shl(b, x, y));
+}
+
+pub fun shr_u(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_shr_u(b, x, y));
+}
+
+pub fun shr_s(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_shr_s(b, x, y));
+}
+
+pub fun eq(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_cmp_eq(b, x, y));
+}
+
+pub fun ne(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_cmp_ne(b, x, y));
+}
+
+pub fun lt_s(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_cmp_lt_s(b, x, y));
+}
+
+pub fun lt_u(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_cmp_lt_u(b, x, y));
+}
+
+pub fun le_u(b: *Builder, x: value.Value, y: value.Value) value.Value {
+    ret take(b, emit_cmp_le_u(b, x, y));
+}
+
+pub fun trunc(b: *Builder, x: value.Value, to: Type) value.Value {
+    ret take(b, emit_trunc(b, x, to));
+}
+
+pub fun zext(b: *Builder, x: value.Value, to: Type) value.Value {
+    ret take(b, emit_zext(b, x, to));
+}
+
+pub fun sext(b: *Builder, x: value.Value, to: Type) value.Value {
+    ret take(b, emit_sext(b, x, to));
+}
+
+pub fun bitcast(b: *Builder, x: value.Value, to: Type) value.Value {
+    ret take(b, emit_bitcast(b, x, to));
+}
+
+pub fun br(b: *Builder, target: id.Block) {
+    take_err(b, emit_br(b, target));
+}
+
+pub fun cbr(b: *Builder, c: value.Value, then_b: id.Block, else_b: id.Block) {
+    take_err(b, emit_cbr(b, c, then_b, else_b));
+}

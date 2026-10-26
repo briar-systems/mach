@@ -109,6 +109,22 @@ a module the project loaded: its identity, what the load decided for it, and the
 staging of its objects. its front-end products are the query engine's, keyed by its file and
 its stable id, and read through mach.lang.driver.frontend
 
+## rec Record
+
+```mach
+pub rec Record;
+```
+
+the cache record a compiled object carries into `obj/`, nil until the cache publishes one
+
+## fun record_release
+
+```mach
+pub fun record_release(p: *Project, r: *Record);
+```
+
+give back a record's bytes
+
 ## rec TestObject
 
 ```mach
@@ -118,20 +134,6 @@ pub rec TestObject;
 a module's test object, beside its normal object and never changing it: the
 module's tests and what they reach that the normal object does not define. the
 fields mirror the normal object's on ModuleEntry
-
-## rec RawLowerCapture
-
-```mach
-pub rec RawLowerCapture;
-```
-
-a lowering in flight on the serial path: the raw module an inline-bodies computation lowered
-for it, and whether its caller optimizes it outside the computation
-
-key: the lowering's back-half key
-output: the raw lowering the inline-bodies product handed over, nil until it does
-available: the bodies a deferred lowering's optimization may inline (release only)
-deferred: the caller optimizes the lowering on its workers and completes the prepared product
 
 ## rec Project
 
@@ -157,7 +159,7 @@ pub fun link_name_for(p: *Project, bare: intern.StrId) res[intern.StrId, fail.Fa
 pub fun release_staged(p: *Project, m: *ModuleEntry);
 ```
 
-staged images are project-owned until a query takes them, object_image is borrowed
+a staged object is the project's until a query takes it, and `object` is borrowed
 
 ## fun release_staged_test
 

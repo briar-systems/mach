@@ -1,4 +1,3 @@
-use mach.lang.growth;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -9,10 +8,10 @@ use std.types.result.res;
 use std.types.size.usize;
 use types_string: std.types.string;
 use std.types.string.str;
-use std.types.string.str_equals;
 use std.types.string.str_join;
 
-use A: std.allocator;
+use A:          std.allocator;
+use std_format: std.format;
 
 use mach.lang.diagnostic;
 use diagnostic_kind: mach.lang.diagnostic.kind;
@@ -29,25 +28,37 @@ use mach.lang.fe.resolve;
 use fe_sema: mach.lang.fe.sema;
 use mach.lang.intern;
 use mach.lang.linkage;
-use me_ir: mach.lang.me.ir;
-use mach.lang.me.ir.builder;
-use ir_debug: mach.lang.me.ir.debug;
-use ir_id:    mach.lang.me.ir.id;
-use ir_type:  mach.lang.me.ir.type;
-use mach.lang.me.ir.value;
+use mach.lang.me.lower.builder;
 use mach.lang.me.lower.constnode;
 use lower_context: mach.lang.me.lower.context;
 use lower_expr:    mach.lang.me.lower.expr;
+use mach.lang.me.lower.irt;
 use mach.lang.me.lower.mangle;
-use lower_stmt: mach.lang.me.lower.stmt;
+use lower_oblivious: mach.lang.me.lower.oblivious;
+use lower_shader:    mach.lang.me.lower.shader;
+use lower_stmt:      mach.lang.me.lower.stmt;
+use mach.lang.me.lower.value;
 use mach.lang.module;
 use mach.lang.session;
 use session_embed: mach.lang.session.embed;
 use lang_source:   mach.lang.source;
 use mach.lang.stack;
 use target_definition: mach.lang.target.definition;
-use target_model:      mach.lang.target.model;
 use mach.lang.type;
+
+use mink_section: mink.model.section;
+use mink.model.symbol;
+use mirl.ir.function.FunctionData;
+use mirl_global: mirl.ir.global;
+use mirl.ir.global.GlobalData;
+use mirl.ir.global.Section;
+use mirl.ir.id;
+use mirl.ir.linkage.Linkage;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use collections_vector: std.collections.vector;
+use std.types.string.str_len;
+use std.types.view.View;
 
 pub fun lower_decl(ctx: *lower_context.LowerContext, did: ast_id.DeclId) err[fail.Fail] {
     val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(ctx.scope.a, did);
@@ -85,7 +96,7 @@ pub fun lower_decl(ctx: *lower_context.LowerContext, did: ast_id.DeclId) err[fai
 # exports whichever module defines it, so a re-export reaches a dependency's
 # definition without that dependency knowing anything about this library
 fun lower_fwd(ctx: *lower_context.LowerContext, did: ast_id.DeclId) err[fail.Fail] {
-    if (!ctx.m.root_project)                                    { ret err[fail.Fail].ok{}; }
+    if (!ctx.unit.root_project)                                 { ret err[fail.Fail].ok{}; }
     if (ctx.scope.rr == nil || ctx.scope.rr.decl_symbol == nil) { ret err[fail.Fail].ok{}; }
     if (did::u32 >= ctx.scope.rr.decl_count)                    { ret err[fail.Fail].ok{}; }
 
@@ -189,7 +200,7 @@ fun record_reexport_symbol(ctx: *lower_context.LowerContext, e: fe_sema.interfac
     val export: intern.StrId                 = linkage.export_name(ctx.linkage, origin, d.decl::u32);
     val named:  res[intern.StrId, fail.Fail] = mangle.linkage_name(ctx.s, fqn, e.canon, export);
     if (sel named.err) { ret err[fail.Fail].err{named.err}; }
-    ret me_ir.export_request_add(ctx.m, named.ok);
+    ret lower_context.export_add(ctx, named.ok);
 }
 
 fun instanced_what(pack: bool, comptime_params: bool) str {
@@ -221,6 +232,36 @@ fun warn_reexport_has_instances(ctx: *lower_context.LowerContext, symbol: intern
     ret err[fail.Fail].ok{};
 }
 
+# how far a definition of this module is seen: every module of the image may call it, and
+# a `pub` one of the root project is the library's surface
+fun defined_linkage(ctx: *lower_context.LowerContext, pub_decl: bool) Linkage {
+    if (pub_decl && ctx.unit.root_project) { ret Linkage{binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT}; }
+    ret Linkage{binding: ?symbol.GLOBAL, visibility: ?symbol.HIDDEN};
+}
+
+# an instance every instantiating module defines, of which the link keeps one
+fun weak_linkage() Linkage {
+    ret Linkage{binding: ?symbol.WEAKLY, visibility: ?symbol.HIDDEN};
+}
+
+# a function attribute mirl gives no function: refused where the decorator is written
+fun refuse_function_decorator(ctx: *lower_context.LowerContext, d: *ast_decl.Decl, id: decorator.Id, what: str) err[fail.Fail] {
+    val dec: opt[*ast_decl.Decorator] = decorator.get(ctx.scope.a, d, id);
+    if (sel dec.none) { ret err[fail.Fail].ok{}; }
+    fail.reject(?ctx.status);
+    val loc: lang_source.Location = lang_source.location(ctx.scope.a.file_id, d.span);
+    ret err[fail.Fail].err{diagnostic.reject(ctx.diags, diagnostic_kind.DECORATOR_ARGUMENT, loc, what)};
+}
+
+# the decorators of a function no mirl function states yet
+fun refuse_unplaced_function(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) err[fail.Fail] {
+    val sec: err[fail.Fail] = refuse_function_decorator(ctx, d, decorator.SECTION, "`#[section]` on a function waits for mirl to place a function in a section");
+    if (sel sec.err) { ret sec; }
+    val al: err[fail.Fail] = refuse_function_decorator(ctx, d, decorator.ALIGN, "`#[align]` on a function waits for mirl to align a function's entry");
+    if (sel al.err) { ret al; }
+    ret refuse_function_decorator(ctx, d, decorator.NAKED, "`#[naked]` waits for inline assembly in mirl");
+}
+
 fun lower_fun(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl) err[fail.Fail] {
     if (d.data.fun_.generics_len > 0)   { ret err[fail.Fail].ok{}; }
     if (fun_has_comptime_param(ctx, d)) { ret err[fail.Fail].ok{}; }
@@ -240,64 +281,36 @@ fun lower_fun(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl
 
     val own: opt[*fe_sema.interface.Declaration] = fe_sema.interface.declaration_at(ctx.scope.iface, did);
     if (sel own.none) { ret err[fail.Fail].err{fail.message("lower: a function has no declaration in its module's interface")}; }
-    var op_code: u32 = 0;
-    val op_set:  u32 = lower_context.declared_op(ctx, lower_context.Declared{iface: ctx.scope.iface, declaration: own.some}, ?op_code);
+    # an instruction on the selected target is no function there: each call is the instruction
+    val op: opt[*target_definition.Op] = lower_context.declared_op(ctx, lower_context.Declared{iface: ctx.scope.iface, declaration: own.some});
+    if (sel op.some) { ret lower_shader.refuse_core_op(ctx, d, op.some); }
 
-    var flags: u32 = 0;
-    if ((d.flags & ast_decl.DECL_FLAG_PUB) != 0) { flags = flags | me_ir.FN_FLAG_PUB; }
-    # an instruction on the selected target has no body there: lowering one would let
-    # the optimizer inline it in place of the instruction
-    if ((d.flags & ast_decl.DECL_FLAG_EXT) != 0 || ast_id.stmt_is_nil(d.data.fun_.body) || op_set != target_definition.NO_OP_SET) {
-        flags = flags | me_ir.FN_FLAG_EXTERN;
+    # a body the normal object defines is declared in the test object
+    var declared_only: bool = (d.flags & ast_decl.DECL_FLAG_EXT) != 0 || ast_id.stmt_is_nil(d.data.fun_.body);
+    if (lower_context.normal_defines(ctx, name)) { declared_only = true; }
+    if (declared_only) {
+        val declared: res[u32, fail.Fail] = lower_context.ensure_extern_function(ctx, name, sig);
+        if (sel declared.err) { ret err[fail.Fail].err{declared.err}; }
+        ret err[fail.Fail].ok{};
     }
-    val declared: bool = lower_context.normal_defines(ctx, name);
-    if (declared) { flags = flags | me_ir.FN_FLAG_EXTERN; }
-    flags = flags | decorator_fn_flags(ctx, d);
 
-    val res_ret_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.function_return_ir(ctx, did);
-    if (sel res_ret_ir.err) { ret err[fail.Fail].err{res_ret_ir.err}; }
-    val ret_ir: ir_type.IrTypeId = res_ret_ir.ok;
+    val refused: err[fail.Fail] = refuse_unplaced_function(ctx, d);
+    if (sel refused.err) { ret refused; }
 
-    val res_idx: res[u32, fail.Fail] = append_function(ctx, name, sig, flags, d.data.fun_.params_len);
+    # where pointers name a storage class, a function taking one is lowered only as the
+    # copies its callers' classes ask for
+    if (builder.classes(?ctx.builder) && irt.takes_pointer(?ctx.m.types, sig.sig)) { ret err[fail.Fail].ok{}; }
+
+    val res_idx: res[u32, fail.Fail] = define_function(ctx, name, sig, defined_linkage(ctx, (d.flags & ast_decl.DECL_FLAG_PUB) != 0), oblivious(ctx, d));
     if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
-    val fn_index: u32 = res_idx.ok;
+    val staged: err[fail.Fail] = lower_shader.function_attributes(ctx, d, res_idx.ok, bare);
+    if (sel staged.err) { ret staged; }
+    ret emit_function_body(ctx, did, d, res_idx.ok, sig, lower_context.decl_ret_sem(ctx, did), lang_source.location(ctx.scope.a.file_id, d.data.fun_.name));
+}
 
-    val exts: res[u64, fail.Fail] = decl_extensions(ctx, d);
-    if (sel exts.err) { ret err[fail.Fail].err{exts.err}; }
-    ctx.m.functions[fn_index].extensions = exts.ok;
-    ctx.m.functions[fn_index].section    = decl_section_of(ctx, d);
-    ctx.m.functions[fn_index].stage      = decl_stage_of(ctx, d);
-    var wg: [3]u32;
-    var wi: u32 = 0;
-    for (wi < 3) {
-        val dim: res[u32, fail.Fail] = decl_workgroup_dim(ctx, d, wi);
-        if (sel dim.err) { ret err[fail.Fail].err{dim.err}; }
-        wg[wi] = dim.ok;
-        val spec: res[intern.StrId, fail.Fail] = decl_workgroup_spec(ctx, d, wi);
-        if (sel spec.err) { ret err[fail.Fail].err{spec.err}; }
-        ctx.m.functions[fn_index].wg_spec[wi] = spec.ok;
-        wi                                    = wi + 1;
-    }
-    ctx.m.functions[fn_index].wg_x   = wg[0];
-    ctx.m.functions[fn_index].wg_y   = wg[1];
-    ctx.m.functions[fn_index].wg_z   = wg[2];
-    ctx.m.functions[fn_index].op_set = op_set;
-    if (op_set != target_definition.NO_OP_SET) { ctx.m.functions[fn_index].op_code = op_code; }
-
-    val res_align: res[u32, fail.Fail] = decl_align_of(ctx, d);
-    if (sel res_align.err) { ret err[fail.Fail].err{res_align.err}; }
-    ctx.m.functions[fn_index].align = res_align.ok;
-
-    ctx.m.functions[fn_index].is_import = (d.flags & ast_decl.DECL_FLAG_EXT) != 0;
-
-    val published: err[fail.Fail] = publish_function_debug(ctx, fn_index, d, bare, lower_context.decl_ret_sem(ctx, did));
-    if (sel published.err) { ret published; }
-
-    # the normal object's definition is this module's body, which release inlining may import
-    if (declared)                            { ctx.m.functions[fn_index].body_module = ctx.scope.fqn; }
-    if ((flags & me_ir.FN_FLAG_EXTERN) != 0) { ret err[fail.Fail].ok{}; }
-
-    ret emit_function_body(ctx, did, d, fn_index, ret_ir, lower_context.decl_ret_sem(ctx, did));
+# a function constant time: its secrets never steer its timing
+fun oblivious(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) bool {
+    ret decorator.has(ctx.scope.a, d, decorator.OBLIVIOUS);
 }
 
 pub fun lower_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId) err[fail.Fail] {
@@ -314,48 +327,28 @@ pub fun lower_pack_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId
 
     val fixed_count: u32 = d.data.fun_.params_len - 1;
 
-    val res_ret_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.function_return_ir(ctx, did);
-    if (sel res_ret_ir.err) { ret err[fail.Fail].err{res_ret_ir.err}; }
-    val ret_ir: ir_type.IrTypeId = res_ret_ir.ok;
-
     val res_sig: res[lower_context.FnSig, fail.Fail] = lower_context.pack_instance_sig(ctx, lower_context.decl_type_of(ctx, did), types, type_len);
     if (sel res_sig.err) { ret err[fail.Fail].err{res_sig.err}; }
     val sig: lower_context.FnSig = res_sig.ok;
 
-    val res_bare: res[intern.StrId, fail.Fail] = function_bare_name(ctx, d);
-    if (sel res_bare.err) { ret err[fail.Fail].err{res_bare.err}; }
-    val bare: intern.StrId = res_bare.ok;
+    if (lower_context.normal_defines(ctx, name)) { ret declare_instance(ctx, name, sig); }
 
-    if (lower_context.normal_defines(ctx, name)) { ret declare_instance(ctx, name, sig, fixed_count + type_len); }
+    val refused: err[fail.Fail] = refuse_unplaced_function(ctx, d);
+    if (sel refused.err) { ret refused; }
 
-    # weak so each instantiating module's copy coalesces; not a `pub` declaration
-    var flags: u32 = me_ir.FN_FLAG_WEAK;
-    flags = flags | decorator_fn_flags(ctx, d);
-    val res_idx: res[u32, fail.Fail] = append_function(ctx, name, sig, flags, fixed_count + type_len);
+    val res_idx: res[u32, fail.Fail] = define_function(ctx, name, sig, weak_linkage(), oblivious(ctx, d));
     if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
-    val fn_index: u32                 = res_idx.ok;
-    val exts:     res[u64, fail.Fail] = decl_extensions(ctx, d);
-    if (sel exts.err) { ret err[fail.Fail].err{exts.err}; }
-    ctx.m.functions[fn_index].extensions = exts.ok;
+    val fn_index: u32 = res_idx.ok;
 
-    val published: err[fail.Fail] = publish_function_debug(ctx, fn_index, d, bare, lower_context.decl_ret_sem(ctx, did));
-    if (sel published.err) { ret published; }
-
-    lower_context.begin_function(ctx, fn_index, ret_ir);
+    val ret_sem: type.TypeId    = lower_context.decl_ret_sem(ctx, did);
+    val entered: err[fail.Fail] = enter_function(ctx, fn_index, sig, ret_sem, lang_source.location(ctx.scope.a.file_id, d.data.fun_.name));
+    if (sel entered.err) { ret entered; }
 
     ctx.pack_types    = types;
     ctx.pack_len      = type_len;
-    ctx.pack_ret_type = lower_context.decl_ret_sem(ctx, did);
+    ctx.pack_ret_type = ret_sem;
 
-    builder.set_function(?ctx.builder, ?ctx.m.functions[fn_index]);
-
-    val res_entry: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_entry.err) { ret err[fail.Fail].err{res_entry.err}; }
-    builder.set_block(?ctx.builder, res_entry.ok);
-
-    builder.set_loc(?ctx.builder, ctx.m.functions[fn_index].decl_loc);
-
-    val res_params: err[fail.Fail] = lower_pack_params(ctx, did, d, fn_index, fixed_count, types, type_len);
+    val res_params: err[fail.Fail] = lower_pack_params(ctx, did, d, fixed_count, types, type_len);
     if (sel res_params.err) {
         clear_pack_state(ctx);
         ret res_params;
@@ -367,7 +360,7 @@ pub fun lower_pack_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId
         ret res_body;
     }
 
-    val res_close: err[fail.Fail] = close_function(ctx, ret_ir);
+    val res_close: err[fail.Fail] = close_function(ctx);
     clear_pack_state(ctx);
     ret res_close;
 }
@@ -394,10 +387,28 @@ fun fun_has_pack_param(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) bool
     ret opt_type.some.kind == type.TYPE_PACK;
 }
 
+# a global's section: the named one `#[section]` gives it, of the kind its mutability needs
+fun global_section(ctx: *lower_context.LowerContext, d: *ast_decl.Decl, is_mut: bool) opt[Section] {
+    val named: intern.StrId = decl_section_of(ctx, d);
+    if (intern.str_is_nil(named)) { ret opt[Section].none{}; }
+    val text: str                = intern.text(?ctx.s.interner, named);
+    var kind: *mink_section.Kind = ?mink_section.RODATA;
+    if (is_mut) { kind = ?mink_section.DATA; }
+    ret opt[Section].some{Section{name: View{data: text, len: str_len(text)}, kind: kind}};
+}
+
 fun lower_global(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, is_mut: bool) err[fail.Fail] {
-    val res_gty: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, lower_context.decl_type_of(ctx, did));
+    val sem:     type.TypeId          = lower_context.decl_type_of(ctx, did);
+    val res_gty: res[Type, fail.Fail] = lower_context.lower_type(ctx, sem);
     if (sel res_gty.err) { ret err[fail.Fail].err{res_gty.err}; }
-    val gty: ir_type.IrTypeId = res_gty.ok;
+    val gty: Type = res_gty.ok;
+
+    # mirl's globals state no secrecy, so a secret one would read as public to every
+    # constant-time walk
+    if (lower_context.type_contains_secret(ctx, sem)) {
+        ret err[fail.Fail].err{lower_context.report_gate(ctx, diagnostic_kind.SECRET_UNVERIFIABLE, d.data.bind.name,
+            "a module-level binding holding a secret waits for mirl to state a global's secrecy (mirl#441)")};
+    }
 
     val res_bare: res[intern.StrId, A.Error] = intern.range_add(?ctx.s.interner, lower_context.module_source(ctx), d.data.bind.name.offset, d.data.bind.name.len);
     if (sel res_bare.err) { ret err[fail.Fail].err{fail.refused(res_bare.err)}; }
@@ -410,97 +421,51 @@ fun lower_global(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_d
     # the normal object defines it: a test that reads it declares it where it does
     if (lower_context.normal_defines(ctx, name)) { ret err[fail.Fail].ok{}; }
 
-    var is_embed: bool        = false;
-    var init_val: value.Value = value.const_int(0, gty);
+    if ((d.flags & ast_decl.DECL_FLAG_EXT) != 0) {
+        val declared: res[u32, fail.Fail] = lower_context.ensure_extern_global(ctx, name, gty);
+        if (sel declared.err) { ret err[fail.Fail].err{declared.err}; }
+        ret err[fail.Fail].ok{};
+    }
+
+    # a `#[spec]` var is a specialization constant wherever it is read
+    if (lower_shader.specialized(ctx, d)) { ret err[fail.Fail].ok{}; }
+
+    var init_val: value.Value = value.const_null(gty);
     if (decorator.has(ctx.scope.a, d, decorator.EMBED)) {
         val er: res[*session_embed.EmbedFile, fail.Fail] = embed_file_of(ctx, d);
-        if (sel er.err) {
-            ret err[fail.Fail].err{er.err};
-        }
-        val e:       *session_embed.EmbedFile = er.ok;
-        val bytes_r: res[*u8, fail.Fail]      = copy_embed_bytes(ctx.m.alloc, e.bytes, e.len);
-        if (sel bytes_r.err) { ret err[fail.Fail].err{bytes_r.err}; }
-        init_val = value.const_bytes(bytes_r.ok, e.len, gty);
-        is_embed = true;
+        if (sel er.err) { ret err[fail.Fail].err{er.err}; }
+        val bytes: res[value.Value, fail.Fail] = constnode.bytes_constant(ctx, er.ok.bytes, er.ok.len::u64);
+        if (sel bytes.err) { ret err[fail.Fail].err{bytes.err}; }
+        init_val = bytes.ok;
     }
     or (!ast_id.expr_is_nil(d.data.bind.init)) {
         val res_fold: res[value.Value, fail.Fail] = fold_global_init(ctx, did, d.data.bind.init, gty, bare);
-        if (sel res_fold.err) {
-            ret err[fail.Fail].err{res_fold.err};
-        }
+        if (sel res_fold.err) { ret err[fail.Fail].err{res_fold.err}; }
         init_val = res_fold.ok;
     }
 
     val res_align: res[u32, fail.Fail] = decl_align_of(ctx, d);
     if (sel res_align.err) { ret err[fail.Fail].err{res_align.err}; }
+    var align: u64 = res_align.ok::u64;
+    if (align == 0) { align = lower_context.storage_align(ctx, sem, gty); }
 
-    if ((d.flags & ast_decl.DECL_FLAG_EXT) != 0) {
-        var gx: me_ir.Global;
-        gx.name        = name;
-        gx.ty          = gty;
-        gx.init        = value.const_int(0, gty);
-        gx.is_mut      = is_mut;
-        gx.is_pub      = false;
-        gx.is_extern   = true;
-        gx.is_import   = true;
-        gx.is_local    = false;
-        gx.is_embed    = false;
-        gx.align       = res_align.ok;
-        gx.section     = intern.STR_NIL;
-        gx.iface       = me_ir.IFACE_NONE;
-        gx.iface_a     = 0;
-        gx.iface_b     = 0;
-        gx.iface_flags = 0;
-        gx.disp        = bare;
-        val debug_type: res[ir_debug.TypeId, fail.Fail] = lower_context.debug_type_of(ctx, lower_context.decl_type_of(ctx, did));
-        if (sel debug_type.err) { ret err[fail.Fail].err{debug_type.err}; }
-        gx.debug_type = debug_type.ok;
-        gx.decl_loc   = lang_source.location(ctx.scope.a.file_id, d.data.bind.name);
-        val res_ext: res[u32, fail.Fail] = append_global(ctx, gx);
-        if (sel res_ext.err) { ret err[fail.Fail].err{res_ext.err}; }
-        ret err[fail.Fail].ok{};
-    }
+    val initial: id.Constant    = builder.constant_of(?ctx.builder, init_val);
+    val built:   err[fail.Fail] = lower_context.builder_state(ctx);
+    if (sel built.err) { ret built; }
 
-    var g: me_ir.Global;
-    g.name        = name;
-    g.ty          = gty;
-    g.init        = init_val;
-    g.is_mut      = is_mut;
-    g.is_pub      = (d.flags & ast_decl.DECL_FLAG_PUB) != 0;
-    g.is_extern   = false;
-    g.is_import   = false;
-    g.is_local    = false;
-    g.is_embed    = is_embed;
-    g.align       = res_align.ok;
-    g.section     = decl_section_of(ctx, d);
-    g.iface       = me_ir.IFACE_NONE;
-    g.iface_a     = 0;
-    g.iface_b     = 0;
-    g.iface_flags = 0;
-    g.disp        = bare;
-    val debug_type: res[ir_debug.TypeId, fail.Fail] = lower_context.debug_type_of(ctx, lower_context.decl_type_of(ctx, did));
-    if (sel debug_type.err) { ret err[fail.Fail].err{debug_type.err}; }
-    g.debug_type = debug_type.ok;
-    g.decl_loc   = lang_source.location(ctx.scope.a.file_id, d.data.bind.name);
-    val role: err[fail.Fail] = fill_iface_role(ctx, d, ?g);
-    if (sel role.err) { ret role; }
-
-    val res_idx: res[u32, fail.Fail] = append_global(ctx, g);
+    var g: GlobalData;
+    g.name    = View{data: intern.text(?ctx.s.interner, name), len: str_len(intern.text(?ctx.s.interner, name))};
+    g.type    = init_val.ty;
+    g.initial = opt[id.Constant].some{initial};
+    if (!lower_shader.initialized(ctx, d)) { g.initial = opt[id.Constant].none{}; }
+    g.alignment = opt[u64].some{align};
+    g.section   = global_section(ctx, d, is_mut);
+    g.tls       = opt[mirl_global.Tls].none{};
+    g.linkage   = defined_linkage(ctx, (d.flags & ast_decl.DECL_FLAG_PUB) != 0);
+    g.constant  = !is_mut;
+    val res_idx: res[u32, fail.Fail] = lower_context.define_global(ctx, g);
     if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
-    ret err[fail.Fail].ok{};
-}
-
-fun copy_embed_bytes(alloc: *A.Allocator, bytes: *u8, len: u32) res[*u8, fail.Fail] {
-    if (len == 0) { ret res[*u8, fail.Fail].ok{nil}; }
-    val copied: res[*u8, A.Error] = A.allocate[u8](alloc, len::usize);
-    if (sel copied.err) { ret res[*u8, fail.Fail].err{fail.refused(copied.err)}; }
-    val out: *u8 = copied.ok;
-    var i:   u32 = 0;
-    for (i < len) {
-        out[i] = bytes[i];
-        i      = i + 1;
-    }
-    ret res[*u8, fail.Fail].ok{out};
+    ret lower_shader.global_attributes(ctx, d, res_idx.ok);
 }
 
 fun lower_weak_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId, ret_sem: type.TypeId) err[fail.Fail] {
@@ -510,39 +475,31 @@ fun lower_weak_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d:
     if (sel res_sig.err) { ret err[fail.Fail].err{res_sig.err}; }
     val sig: lower_context.FnSig = res_sig.ok;
 
-    val res_ret_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.function_return_ir(ctx, did);
-    if (sel res_ret_ir.err) { ret err[fail.Fail].err{res_ret_ir.err}; }
-    val ret_ir: ir_type.IrTypeId = res_ret_ir.ok;
+    if (lower_context.normal_defines(ctx, name)) { ret declare_instance(ctx, name, sig); }
 
-    val res_bare: res[intern.StrId, fail.Fail] = function_bare_name(ctx, d);
-    if (sel res_bare.err) { ret err[fail.Fail].err{res_bare.err}; }
-    val bare: intern.StrId = res_bare.ok;
-
-    if (lower_context.normal_defines(ctx, name)) { ret declare_instance(ctx, name, sig, d.data.fun_.params_len); }
+    val refused: err[fail.Fail] = refuse_unplaced_function(ctx, d);
+    if (sel refused.err) { ret refused; }
 
     # weak so each instantiating module's copy coalesces; not a `pub` declaration
-    var flags: u32 = me_ir.FN_FLAG_WEAK;
-    flags = flags | decorator_fn_flags(ctx, d);
-    val res_idx: res[u32, fail.Fail] = append_function(ctx, name, sig, flags, d.data.fun_.params_len);
+    val res_idx: res[u32, fail.Fail] = define_function(ctx, name, sig, weak_linkage(), oblivious(ctx, d));
     if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
-    val fn_index: u32                 = res_idx.ok;
-    val exts:     res[u64, fail.Fail] = decl_extensions(ctx, d);
-    if (sel exts.err) { ret err[fail.Fail].err{exts.err}; }
-    ctx.m.functions[fn_index].extensions = exts.ok;
-    val res_align: res[u32, fail.Fail] = decl_align_of(ctx, d);
-    if (sel res_align.err) { ret err[fail.Fail].err{res_align.err}; }
-    ctx.m.functions[fn_index].align = res_align.ok;
+    ret emit_function_body(ctx, did, d, res_idx.ok, sig, ret_sem, lang_source.location(ctx.scope.a.file_id, d.data.fun_.name));
+}
 
-    val published: err[fail.Fail] = publish_function_debug(ctx, fn_index, d, bare, ret_sem);
-    if (sel published.err) { ret published; }
-
-    ret emit_function_body(ctx, did, d, fn_index, ret_ir, ret_sem);
+# a copy of the function `did` whose pointer parameters take the classes `sig` states,
+# local to the module whose call asked for it
+pub fun lower_class_copy(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId, sig: Type) err[fail.Fail] {
+    if (ast_id.stmt_is_nil(d.data.fun_.body)) { ret err[fail.Fail].ok{}; }
+    val copied:  lower_context.FnSig = lower_context.FnSig{sig: sig};
+    val res_idx: res[u32, fail.Fail] = define_function(ctx, name, copied, Linkage{binding: ?symbol.LOCAL, visibility: ?symbol.DEFAULT}, oblivious(ctx, d));
+    if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
+    ret emit_function_body(ctx, did, d, res_idx.ok, copied, lower_context.decl_ret_sem(ctx, did), lang_source.location(ctx.scope.a.file_id, d.data.fun_.name));
 }
 
 # an instance the normal object already defines is declared in the test object, never lowered
-# again. it stays weak: every instantiating module's copy is one shared definition
-fun declare_instance(ctx: *lower_context.LowerContext, name: intern.StrId, sig: lower_context.FnSig, param_hint: u32) err[fail.Fail] {
-    val res_idx: res[u32, fail.Fail] = append_function(ctx, name, sig, me_ir.FN_FLAG_WEAK | me_ir.FN_FLAG_EXTERN, param_hint);
+# again: every instantiating module's copy is one shared definition
+fun declare_instance(ctx: *lower_context.LowerContext, name: intern.StrId, sig: lower_context.FnSig) err[fail.Fail] {
+    val res_idx: res[u32, fail.Fail] = lower_context.ensure_extern_function(ctx, name, sig);
     if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
     ret err[fail.Fail].ok{};
 }
@@ -553,28 +510,46 @@ fun function_bare_name(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) res[
     ret res[intern.StrId, fail.Fail].ok{r_353.ok};
 }
 
-fun publish_function_debug(ctx: *lower_context.LowerContext, fn_index: u32, d: *ast_decl.Decl,
-    bare: intern.StrId, ret_sem: type.TypeId) err[fail.Fail] {
-    val ret_debug: res[ir_debug.TypeId, fail.Fail] = lower_context.debug_type_of(ctx, ret_sem);
-    if (sel ret_debug.err) { ret err[fail.Fail].err{ret_debug.err}; }
-    ctx.m.functions[fn_index].disp           = bare;
-    ctx.m.functions[fn_index].ret_debug_type = ret_debug.ok;
-    ctx.m.functions[fn_index].decl_loc       = lang_source.location(ctx.scope.a.file_id, d.data.fun_.name);
-    ret err[fail.Fail].ok{};
+# the module's definition of the function `name`, which a reference earlier in the module
+# may have declared
+fun define_function(ctx: *lower_context.LowerContext, name: intern.StrId, sig: lower_context.FnSig, linkage_of: Linkage, constant_time: bool) res[u32, fail.Fail] {
+    val text: str = intern.text(?ctx.s.interner, name);
+    ret lower_context.define_function(ctx, FunctionData{name: View{data: text, len: str_len(text)}, signature: sig.sig, linkage: linkage_of, constant_time: constant_time},
+        lower_context.FnInfo{name: name, line: 0, test: false, noreturn: false, defined: true});
 }
 
-fun emit_function_body(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, fn_index: u32, ret_ir: ir_type.IrTypeId, ret_sem: type.TypeId) err[fail.Fail] {
-    lower_context.begin_function(ctx, fn_index, ret_ir);
+# start building function `fn_index`: its entry takes its signature's parameters
+fun enter_function(ctx: *lower_context.LowerContext, fn_index: u32, sig: lower_context.FnSig, ret_sem: type.TypeId, at: lang_source.Location) err[fail.Fail] {
+    val t:       *types.Table                    = ?ctx.m.types;
+    val n:       u32                             = irt.param_count(t, sig.sig);
+    var params:  collections_vector.Vector[Type] = collections_vector.init[Type](ctx.s.alloc);
+    var secrets: collections_vector.Vector[bool] = collections_vector.init[bool](ctx.s.alloc);
+    fin {
+        collections_vector.dnit[Type](?params);
+        collections_vector.dnit[bool](?secrets);
+    }
+    var i: u32 = 0;
+    for (i < n) {
+        val p: res[usize, A.Error] = collections_vector.push[Type](?params, irt.param_of(t, sig.sig, i));
+        if (sel p.err) { ret err[fail.Fail].err{fail.refused(p.err)}; }
+        val q: res[usize, A.Error] = collections_vector.push[bool](?secrets, false);
+        if (sel q.err) { ret err[fail.Fail].err{fail.refused(q.err)}; }
+        i = i + 1;
+    }
+    lower_context.begin_function(ctx, fn_index, irt.result_of(t, sig.sig));
     ctx.fn_ret_sem = ret_sem;
-    builder.set_function(?ctx.builder, ?ctx.m.functions[fn_index]);
+    ctx.fn_sig     = sig.sig;
+    ctx.fn_shown   = at.span;
+    builder.enter(?ctx.builder, id.Function{index: fn_index}, params.data, secrets.data, n);
+    builder.set_loc(?ctx.builder, at);
+    ret lower_context.builder_state(ctx);
+}
 
-    val res_entry: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_entry.err) { ret err[fail.Fail].err{res_entry.err}; }
-    builder.set_block(?ctx.builder, res_entry.ok);
+fun emit_function_body(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, fn_index: u32, sig: lower_context.FnSig, ret_sem: type.TypeId, at: lang_source.Location) err[fail.Fail] {
+    val entered: err[fail.Fail] = enter_function(ctx, fn_index, sig, ret_sem, at);
+    if (sel entered.err) { ret entered; }
 
-    builder.set_loc(?ctx.builder, ctx.m.functions[fn_index].decl_loc);
-
-    val res_params: err[fail.Fail] = lower_params(ctx, did, d, fn_index);
+    val res_params: err[fail.Fail] = lower_params(ctx, did, d);
     if (sel res_params.err) { ret res_params; }
 
     if (!ast_id.stmt_is_nil(d.data.fun_.body)) {
@@ -582,7 +557,7 @@ fun emit_function_body(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: 
         if (sel res_body.err) { ret res_body; }
     }
 
-    ret close_function(ctx, ret_ir);
+    ret close_function(ctx);
 }
 
 fun clear_pack_state(ctx: *lower_context.LowerContext) {
@@ -595,24 +570,13 @@ fun clear_pack_state(ctx: *lower_context.LowerContext) {
     ctx.pack_ret_type = type.TYPE_NIL;
 }
 
-fun lower_pack_params(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, fn_index: u32,
-    fixed_count: u32, types: *type.TypeId, type_len: u32) err[fail.Fail] {
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?ctx.m.types, 64);
-    if (sel res_xty.err) { ret err[fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
-
+fun lower_pack_params(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl,
+    fixed_count: u32, types_of: *type.TypeId, type_len: u32) err[fail.Fail] {
     val total:  u32          = fixed_count + type_len;
-    var params: *value.Value = nil;
-    if (total > 0) {
-        val res_params: res[*value.Value, A.Error] = A.allocate[value.Value](ctx.s.alloc, total::usize);
-        if (sel res_params.err) { ret err[fail.Fail].err{fail.refused(res_params.err)}; }
-        params = res_params.ok;
-    }
-
     var slots:  *value.Value = nil;
     var handed: bool         = false;
     fin {
-        if (!handed) { free_pack_param_bufs(ctx, params, total, slots, type_len); }
+        if (!handed && slots != nil) { A.deallocate[value.Value](ctx.s.alloc, slots, type_len::usize); }
     }
     if (type_len > 0) {
         val res_slots: res[*value.Value, A.Error] = A.allocate[value.Value](ctx.s.alloc, type_len::usize);
@@ -629,85 +593,66 @@ fun lower_pack_params(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *
                 p_sem = lower_context.type_resolved_of(ctx, ctx.scope.a.typed_names.data[pool_ix].ty);
             }
         }
-        or {
-            p_sem = types[i - fixed_count];
-        }
+        or { p_sem = types_of[i - fixed_count]; }
 
-        val res_slot: res[value.Value, fail.Fail] = emit_pack_param(ctx, params, i, p_sem, xty);
-        if (sel res_slot.err) { ret err[fail.Fail].err{res_slot.err}; }
-        val slot: value.Value = res_slot.ok;
+        val res_home: res[Home, fail.Fail] = param_home(ctx, i, p_sem);
+        if (sel res_home.err) { ret err[fail.Fail].err{res_home.err}; }
 
         if (i < fixed_count) {
             val sid: resolve.SymbolId = param_symbol(ctx, did, i);
             if (!resolve.symbol_is_nil(sid)) {
-                val res_bind: err[fail.Fail] = lower_context.bind_local(ctx, sid, slot, lower_context.bind_secrecy_of(ctx, p_sem));
+                val res_bind: err[fail.Fail] = lower_context.bind_local(ctx, sid, res_home.ok.slot);
                 if (sel res_bind.err) { ret res_bind; }
             }
         }
-        or {
-            slots[i - fixed_count] = slot;
-        }
+        or { slots[i - fixed_count] = res_home.ok.slot; }
         i = i + 1;
     }
 
-    ctx.m.functions[fn_index].params      = params;
-    ctx.m.functions[fn_index].param_count = total;
-    ctx.pack_slots                        = slots;
-    handed                                = true;
+    ctx.pack_slots = slots;
+    handed         = true;
     ret err[fail.Fail].ok{};
 }
 
-# the home a parameter's name binds to, always an address. an aggregate arrives as
-# memory the caller copied and the callee owns for the call, so its home is the
-# incoming memory itself; a parameter in a register gets a slot and an entry store
-fun param_home(ctx: *lower_context.LowerContext, pval: value.Value, p_ir: ir_type.IrTypeId, p_sem: type.TypeId,
-    xty: ir_type.IrTypeId) res[value.Value, fail.Fail] {
-    if (ir_type.is_aggregate(?ctx.m.types, p_ir)) {
-        val res_ptr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?ctx.m.types);
-        if (sel res_ptr.err) { ret res[value.Value, fail.Fail].err{res_ptr.err}; }
-        ret res[value.Value, fail.Fail].ok{value.retype(pval, res_ptr.ok)};
-    }
-
-    val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, p_ir, value.const_int(1, xty));
-    if (sel res_slot.err) { ret res_slot; }
-    val slot: value.Value = res_slot.ok;
-
-    val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, pval, slot);
-    if (sel res_store.err)                              { ret res[value.Value, fail.Fail].err{res_store.err}; }
-    if (lower_expr.type_is_volatile_record(ctx, p_sem)) { builder.mark_last_volatile(?ctx.builder); }
-    ret res[value.Value, fail.Fail].ok{slot};
+# where a parameter lives in the body: the slot its name binds to, always an address, and the
+# value it arrived as
+rec Home {
+    slot:    value.Value;
+    arrived: value.Value;
 }
 
-fun emit_pack_param(ctx: *lower_context.LowerContext, params: *value.Value, w: u32, p_sem: type.TypeId, xty: ir_type.IrTypeId) res[value.Value, fail.Fail] {
-    val res_p_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, p_sem);
-    if (sel res_p_ir.err) { ret res[value.Value, fail.Fail].err{res_p_ir.err}; }
-    val p_ir: ir_type.IrTypeId = res_p_ir.ok;
+# the home a parameter's name binds to. an aggregate arrives in a slot of its own; a
+# parameter in a register gets a slot and an entry store
+fun param_home(ctx: *lower_context.LowerContext, w: u32, p_sem: type.TypeId) res[Home, fail.Fail] {
+    val res_p_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, p_sem);
+    if (sel res_p_ir.err) { ret res[Home, fail.Fail].err{res_p_ir.err}; }
+    var p_ir: Type = res_p_ir.ok;
+    # a pointer parameter is of the class the signature states, which a copy's call sites chose
+    if (irt.is_ptr(?ctx.m.types, p_ir)) { p_ir = irt.param_of(?ctx.m.types, ctx.fn_sig, w); }
 
-    var pval: value.Value = value.param(w, p_ir);
+    val got: res[value.Value, fail.Fail] = builder.param(?ctx.builder, w, p_ir);
+    if (sel got.err) { ret res[Home, fail.Fail].err{got.err}; }
+    var pval: value.Value = got.ok;
     if (lower_context.type_contains_secret(ctx, p_sem)) { pval.secret = true; }
 
-    val res_home: res[value.Value, fail.Fail] = param_home(ctx, pval, p_ir, p_sem, xty);
-    if (sel res_home.err) { ret res_home; }
-
-    params[w] = pval;
-    ret res_home;
-}
-
-fun free_pack_param_bufs(ctx: *lower_context.LowerContext, params: *value.Value, total: u32, slots: *value.Value, type_len: u32) {
-    if (params != nil && total > 0)   { A.deallocate[value.Value](ctx.s.alloc, params, total::usize); }
-    if (slots != nil && type_len > 0) { A.deallocate[value.Value](ctx.s.alloc, slots, type_len::usize); }
+    if (irt.is_aggregate(?ctx.m.types, p_ir)) {
+        ret res[Home, fail.Fail].ok{Home{slot: value.retype(pval, lower_context.ptr_or_none(ctx)), arrived: pval}};
+    }
+    val res_slot: res[value.Value, fail.Fail] = lower_context.slot_for(ctx, p_sem, p_ir);
+    if (sel res_slot.err) { ret res[Home, fail.Fail].err{res_slot.err}; }
+    val res_store: err[fail.Fail] = builder.emit_store_marked(?ctx.builder, pval, res_slot.ok, lower_expr.type_is_volatile_record(ctx, p_sem));
+    if (sel res_store.err) { ret res[Home, fail.Fail].err{res_store.err}; }
+    ret res[Home, fail.Fail].ok{Home{slot: res_slot.ok, arrived: pval}};
 }
 
 fun lower_test(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl) err[fail.Fail] {
-    val res_i32: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?ctx.m.types, 32);
+    val res_i32: res[Type, fail.Fail] = irt.int(?ctx.m.types, 32);
     if (sel res_i32.err) { ret err[fail.Fail].err{res_i32.err}; }
-    val ret_type: ir_type.IrTypeId = res_i32.ok;
-
-    val res_sig: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_fn(?ctx.m.types, ret_type, nil, 0, false);
+    var result:     Type                 = res_i32.ok;
+    var result_ext: types.Extension      = types.Extension.sext{};
+    val res_sig:    res[Type, fail.Fail] = irt.signature(?ctx.m.types, nil, nil, 0, ?result, ?result_ext, 1);
     if (sel res_sig.err) { ret err[fail.Fail].err{res_sig.err}; }
-    var sig: lower_context.FnSig;
-    sig.sig = res_sig.ok;
-    sig.ext = ir_type.EXT_LIST_EMPTY;
+    val sig: lower_context.FnSig = lower_context.FnSig{sig: res_sig.ok};
 
     val res_ident: res[intern.StrId, A.Error] = intern.range_add(?ctx.s.interner, lower_context.module_source(ctx), d.data.test_.name.offset, d.data.test_.name.len);
     if (sel res_ident.err) { ret err[fail.Fail].err{fail.refused(res_ident.err)}; }
@@ -717,204 +662,148 @@ fun lower_test(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_dec
     if (sel res_name.err) { ret err[fail.Fail].err{res_name.err}; }
     val name: intern.StrId = res_name.ok;
 
-    val existing: opt[u32] = me_ir.function_lookup(ctx.m, name);
-    if (sel existing.some) { ret err[fail.Fail].err{fail.message("lower: a test name sema accepted is emitted twice")}; }
+    val twice: opt[u32] = lower_context.function_named(ctx, name);
+    if (sel twice.some) { ret err[fail.Fail].err{fail.message("lower: a test name sema accepted is emitted twice")}; }
 
-    val res_idx: res[u32, fail.Fail] = append_function(ctx, name, sig, me_ir.FN_FLAG_TEST, 0);
-    if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
-    val fn_index: u32 = res_idx.ok;
-
-    ctx.m.functions[fn_index].decl_loc = lang_source.location(ctx.scope.a.file_id, d.data.test_.name);
-
+    var line:   u32                          = 0;
     val opt_sf: opt[*lang_source.SourceFile] = lang_source.get(?ctx.s.sources, ctx.scope.a.file_id);
-    if (sel opt_sf.some) {
-        val pos: lang_source.Position = lang_source.position(opt_sf.some, d.data.test_.name.offset);
-        ctx.m.functions[fn_index].line = pos.line::u32;
-    }
+    if (sel opt_sf.some) { line = lang_source.position(opt_sf.some, d.data.test_.name.offset).line::u32; }
 
-    ret emit_test_body(ctx, d, fn_index, ret_type);
-}
+    val text:    str                 = intern.text(?ctx.s.interner, name);
+    val res_idx: res[u32, fail.Fail] = lower_context.define_function(ctx,
+        FunctionData{name: View{data: text, len: str_len(text)}, signature: sig.sig, linkage: Linkage{binding: ?symbol.GLOBAL, visibility: ?symbol.HIDDEN}, constant_time: false},
+        lower_context.FnInfo{name: name, line: line, test: true, noreturn: false, defined: true});
+    if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
 
-fun emit_test_body(ctx: *lower_context.LowerContext, d: *ast_decl.Decl, fn_index: u32, ret_type: ir_type.IrTypeId) err[fail.Fail] {
-    lower_context.begin_function(ctx, fn_index, ret_type);
-    builder.set_function(?ctx.builder, ?ctx.m.functions[fn_index]);
-
-    val res_entry: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_entry.err) { ret err[fail.Fail].err{res_entry.err}; }
-    builder.set_block(?ctx.builder, res_entry.ok);
-
-    builder.set_loc(?ctx.builder, ctx.m.functions[fn_index].decl_loc);
-
+    val entered: err[fail.Fail] = enter_function(ctx, res_idx.ok, sig, type.TYPE_NIL, lang_source.location(ctx.scope.a.file_id, d.data.test_.name));
+    if (sel entered.err) { ret entered; }
     if (!ast_id.stmt_is_nil(d.data.test_.body)) {
         val res_body: err[fail.Fail] = lower_stmt.lower_stmt(ctx, d.data.test_.body);
         if (sel res_body.err) { ret res_body; }
     }
-
-    ret close_function(ctx, ret_type);
+    ret close_function(ctx);
 }
 
-fun lower_params(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, fn_index: u32) err[fail.Fail] {
+fun lower_params(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl) err[fail.Fail] {
     val count: u32 = d.data.fun_.params_len;
-
-    val res_ity: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?ctx.m.types);
-    if (sel res_ity.err) { ret err[fail.Fail].err{res_ity.err}; }
-    val ity: ir_type.IrTypeId = res_ity.ok;
-
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?ctx.m.types, 64);
-    if (sel res_xty.err) { ret err[fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
-
-    var rt_count: u32 = 0;
-    var pi:       u32 = 0;
-    for (pi < count) {
-        val pool_ix: u32 = d.data.fun_.params_start + pi;
-        if (pool_ix::usize >= ctx.scope.a.typed_names.len || !ctx.scope.a.typed_names.data[pool_ix].comptime) {
-            rt_count = rt_count + 1;
-        }
-        pi = pi + 1;
-    }
-
-    var params: *value.Value = nil;
-    if (rt_count > 0) {
-        val res_params: res[*value.Value, A.Error] = A.allocate[value.Value](ctx.s.alloc, rt_count::usize);
-        if (sel res_params.err) { ret err[fail.Fail].err{fail.refused(res_params.err)}; }
-        params = res_params.ok;
-    }
-
-    var w: u32 = 0;
-    var i: u32 = 0;
+    var w:     u32 = 0;
+    var i:     u32 = 0;
     for (i < count) {
         val pool_ix: u32 = d.data.fun_.params_start + i;
         if (pool_ix::usize < ctx.scope.a.typed_names.len && ctx.scope.a.typed_names.data[pool_ix].comptime) {
             i = i + 1;
             cnt;
         }
-        var p_ir:  ir_type.IrTypeId = ity;
-        var p_sem: type.TypeId      = type.TYPE_NIL;
-        if (pool_ix::usize < ctx.scope.a.typed_names.len) {
-            val tn: *ast_decl.TypedName = ?ctx.scope.a.typed_names.data[pool_ix];
-            p_sem = lower_context.type_resolved_of(ctx, tn.ty);
-            val res_p_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, p_sem);
-            if (sel res_p_ir.err) {
-                if (params != nil) { A.deallocate[value.Value](ctx.s.alloc, params, rt_count::usize); }
-                ret err[fail.Fail].err{res_p_ir.err};
-            }
-            p_ir = res_p_ir.ok;
-        }
-        var pval: value.Value = value.param(w, p_ir);
-        if (lower_context.type_contains_secret(ctx, p_sem)) { pval.secret = true; }
-        params[w] = pval;
+        var p_sem: type.TypeId = type.TYPE_NIL;
+        if (pool_ix::usize < ctx.scope.a.typed_names.len) { p_sem = lower_context.type_resolved_of(ctx, ctx.scope.a.typed_names.data[pool_ix].ty); }
 
-        val res_home: res[value.Value, fail.Fail] = param_home(ctx, pval, p_ir, p_sem, xty);
-        if (sel res_home.err) {
-            if (params != nil) { A.deallocate[value.Value](ctx.s.alloc, params, rt_count::usize); }
-            ret err[fail.Fail].err{res_home.err};
-        }
-        val slot: value.Value = res_home.ok;
+        val res_home: res[Home, fail.Fail] = param_home(ctx, w, p_sem);
+        if (sel res_home.err) { ret err[fail.Fail].err{res_home.err}; }
 
         val sid: resolve.SymbolId = param_symbol(ctx, did, i);
         if (!resolve.symbol_is_nil(sid)) {
-            val res_bind: err[fail.Fail] = lower_context.bind_local(ctx, sid, slot, lower_context.bind_secrecy_of(ctx, p_sem));
-            if (sel res_bind.err) {
-                if (params != nil) { A.deallocate[value.Value](ctx.s.alloc, params, rt_count::usize); }
-                ret res_bind;
-            }
+            val res_bind: err[fail.Fail] = lower_context.bind_local(ctx, sid, res_home.ok.slot);
+            if (sel res_bind.err) { ret res_bind; }
         }
 
         if (ctx.debug && pool_ix::usize < ctx.scope.a.typed_names.len) {
-            val p_sem:   type.TypeId    = lower_context.type_resolved_of(ctx, ctx.scope.a.typed_names.data[pool_ix].ty);
-            val res_dbg: err[fail.Fail] = lower_context.emit_dbg_birth(ctx, ctx.scope.a.typed_names.data[pool_ix].name, p_ir, p_sem, true, pval, opt[value.Value].none{});
-            if (sel res_dbg.err) {
-                if (params != nil) { A.deallocate[value.Value](ctx.s.alloc, params, rt_count::usize); }
-                ret res_dbg;
-            }
+            val res_dbg: err[fail.Fail] = lower_context.emit_dbg_birth(ctx, ctx.scope.a.typed_names.data[pool_ix].name, p_sem,
+                opt[u32].some{w}, res_home.ok.arrived, opt[value.Value].some{res_home.ok.slot});
+            if (sel res_dbg.err) { ret res_dbg; }
         }
 
         w = w + 1;
         i = i + 1;
     }
-
-    ctx.m.functions[fn_index].params      = params;
-    ctx.m.functions[fn_index].param_count = rt_count;
     ret err[fail.Fail].ok{};
 }
 
-fun close_function(ctx: *lower_context.LowerContext, ret_ir: ir_type.IrTypeId) err[fail.Fail] {
-    if (!lower_context.block_terminated(ctx) && !cursor_block_unreachable(ctx)) {
-        val res_term: err[fail.Fail] = emit_default_terminator(ctx, ret_ir);
+# end the function: the block it falls off the end of returns zero, every other block left
+# open is unreachable, and the builder's first refusal is the function's
+fun close_function(ctx: *lower_context.LowerContext) err[fail.Fail] {
+    if (!lower_context.block_terminated(ctx)) {
+        val res_term: err[fail.Fail] = emit_default_terminator(ctx);
         if (sel res_term.err) { ret res_term; }
     }
-    ret terminate_orphan_blocks(ctx);
+    val sealed: err[fail.Fail] = builder.seal(?ctx.builder);
+    var state:  err[fail.Fail] = lower_context.builder_state(ctx);
+    if (sel sealed.err && !sel state.err) { state = sealed; }
+    val computed: opt[builder.Computed] = ctx.builder.computed;
+    builder.leave(?ctx.builder);
+    if (sel state.err)     { ret state; }
+    if (sel computed.none) { ret state; }
+    ret report_not_oblivious(ctx, computed.some);
 }
 
-fun cursor_block_unreachable(ctx: *lower_context.LowerContext) bool {
-    if (ctx.builder.fn == nil) { ret false; }
-    val fn: *me_ir.Function = ctx.builder.fn;
-    val b:  me_ir.BlockId   = ctx.builder.block;
-    if (ir_id.block_is_nil(b))                  { ret false; }
-    if (ir_id.block_index(b) >= fn.block_count) { ret false; }
-    if (ir_id.block_same(b, ir_id.block(0)))    { ret false; }
-    ret fn.blocks[ir_id.block_index(b)].pred_count == 0;
+# a function that computes on a secret without declaring `#[oblivious]` is refused at its
+# first such computation; an instance is named by the instantiation as well
+fun report_not_oblivious(ctx: *lower_context.LowerContext, at: builder.Computed) err[fail.Fail] {
+    val node:  *FunctionData              = ?ctx.m.functions.data[ctx.fn_index].data;
+    val shown: res[intern.StrId, A.Error] = intern.range_add(?ctx.s.interner, lower_context.module_source(ctx), ctx.fn_shown.offset, ctx.fn_shown.len);
+    if (sel shown.err) { ret err[fail.Fail].err{fail.refused(shown.err)}; }
+    val name: str                              = intern.text(?ctx.s.interner, shown.ok);
+    val mr:   res[str, std_format.FormatError] = std_format.sprint(ctx.s.alloc,
+        "`{}` performs a constant-time {} on a secret value but is not declared `#[oblivious]`",
+        name, lower_oblivious.class_name(at.code));
+    if (sel mr.err) { ret err[fail.Fail].err{fail.format_refused(mr.err)}; }
+    val msg: str                                          = mr.ok;
+    val br:  res[diagnostic.DiagnosticBuilder, fail.Fail] = diagnostic.builder_init(ctx.s.alloc, diagnostic_kind.SECRET_NOT_OBLIVIOUS, at.loc.file, at.loc.span, msg);
+    A.deallocate[u8](ctx.s.alloc, msg::*u8, str_len(msg) + 1);
+    if (sel br.err) { ret err[fail.Fail].err{br.err}; }
+    var b:    diagnostic.DiagnosticBuilder = br.ok;
+    var info: opt[*lower_context.FnInfo]   = opt[*lower_context.FnInfo].none{};
+    if (node.linkage.binding == ?symbol.WEAKLY) { info = lower_context.fn_info(ctx.unit, ctx.fn_index); }
+    if (sel info.some) {
+        val nr: res[str, std_format.FormatError] = std_format.sprint(ctx.s.alloc, "in the instantiation `{}`", intern.text(?ctx.s.interner, info.some.name));
+        if (sel nr.err) {
+            diagnostic.builder_dnit(?b);
+            ret err[fail.Fail].err{fail.format_refused(nr.err)};
+        }
+        val noted: err[fail.Fail] = diagnostic.attach_note(?b, nr.ok);
+        A.deallocate[u8](ctx.s.alloc, nr.ok::*u8, str_len(nr.ok) + 1);
+        if (sel noted.err) {
+            diagnostic.builder_dnit(?b);
+            ret noted;
+        }
+    }
+    val helped: err[fail.Fail] = diagnostic.attach_help(?b,
+        "annotate the function with `#[oblivious]` to declare its constant-time contract; only a function that merely moves or stores secrets may omit it");
+    if (sel helped.err) {
+        diagnostic.builder_dnit(?b);
+        ret helped;
+    }
+    val committed: err[fail.Fail] = diagnostic.commit(?b, ctx.diags);
+    if (sel committed.err) {
+        diagnostic.builder_dnit(?b);
+        ret committed;
+    }
+    # the rest of the module is still lowered, so every such function is named
+    fail.reject(?ctx.status);
+    ret err[fail.Fail].ok{};
 }
 
-fun emit_default_terminator(ctx: *lower_context.LowerContext, ret_ir: ir_type.IrTypeId) err[fail.Fail] {
-    if ((ctx.m.functions[ctx.fn_index].flags & me_ir.FN_FLAG_NORETURN) != 0) {
-        ret builder.emit_unreachable(?ctx.builder);
-    }
-    if (lower_context.is_void_ir(ctx, ret_ir)) {
-        ret builder.emit_ret_void(?ctx.builder);
-    }
+fun emit_default_terminator(ctx: *lower_context.LowerContext) err[fail.Fail] {
+    val info: opt[*lower_context.FnInfo] = lower_context.fn_info(ctx.unit, ctx.fn_index);
+    if (sel info.some && info.some.noreturn) { ret builder.emit_unreachable(?ctx.builder); }
+    if (irt.is_none(ctx.ret_type))           { ret builder.emit_ret_void(?ctx.builder); }
 
-    val res_zero: res[value.Value, fail.Fail] = default_return_value(ctx, ret_ir);
-    if (sel res_zero.err) {
-        ret err[fail.Fail].err{res_zero.err};
-    }
+    val res_zero: res[value.Value, fail.Fail] = default_return_value(ctx, ctx.ret_type);
+    if (sel res_zero.err) { ret err[fail.Fail].err{res_zero.err}; }
     ret builder.emit_ret(?ctx.builder, res_zero.ok);
 }
 
-fun default_return_value(ctx: *lower_context.LowerContext, ret_ir: ir_type.IrTypeId) res[value.Value, fail.Fail] {
-    if (ir_type.is_float_scalar(?ctx.m.types, ret_ir)) {
-        ret res[value.Value, fail.Fail].ok{value.const_float(0.0, ret_ir)};
-    }
-    if (!ir_type.is_aggregate(?ctx.m.types, ret_ir)) {
-        ret res[value.Value, fail.Fail].ok{value.const_int(0, ret_ir)};
-    }
-
-    val res_count_ty: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?ctx.m.types, 64);
-    if (sel res_count_ty.err) {
-        ret res[value.Value, fail.Fail].err{res_count_ty.err};
-    }
-    val count_ty: ir_type.IrTypeId = res_count_ty.ok;
-
-    val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, ret_ir, value.const_int(1, count_ty));
+fun default_return_value(ctx: *lower_context.LowerContext, ret_ir: Type) res[value.Value, fail.Fail] {
+    if (!irt.is_aggregate(?ctx.m.types, ret_ir)) { ret res[value.Value, fail.Fail].ok{value.const_null(ret_ir)}; }
+    val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, ret_ir);
     if (sel res_slot.err) { ret res_slot; }
-    val slot: value.Value = res_slot.ok;
-
-    val res_mz: err[fail.Fail] = builder.emit_memzero(?ctx.builder, slot, ret_ir);
-    if (sel res_mz.err) {
-        ret res[value.Value, fail.Fail].err{res_mz.err};
-    }
-    ret res[value.Value, fail.Fail].ok{slot};
-}
-
-fun terminate_orphan_blocks(ctx: *lower_context.LowerContext) err[fail.Fail] {
-    if (ctx.builder.fn == nil) { ret err[fail.Fail].ok{}; }
-    val fn: *me_ir.Function = ctx.builder.fn;
-    var i:  u32             = 0;
-    for (i < fn.block_count) {
-        if (ir_id.instruction_is_nil(fn.blocks[i].terminator)) {
-            builder.set_block(?ctx.builder, i::me_ir.BlockId);
-            val res_unreachable: err[fail.Fail] = builder.emit_unreachable(?ctx.builder);
-            if (sel res_unreachable.err) { ret res_unreachable; }
-        }
-        i = i + 1;
-    }
-    ret err[fail.Fail].ok{};
+    val res_mz: err[fail.Fail] = builder.emit_memzero(?ctx.builder, res_slot.ok, ret_ir);
+    if (sel res_mz.err) { ret res[value.Value, fail.Fail].err{res_mz.err}; }
+    ret res[value.Value, fail.Fail].ok{value.retype(res_slot.ok, ret_ir)};
 }
 
 # the constant a global's initialiser binds, folded exactly as its lowering folds it; `did` is the
 # declaration whose published value lays it out, DECL_NIL for a decorator argument, which has none
-fun fold_global_init(ctx: *lower_context.LowerContext, did: ast_id.DeclId, eid: ast_id.ExprId, gty: ir_type.IrTypeId, name: intern.StrId) res[value.Value, fail.Fail] {
+fun fold_global_init(ctx: *lower_context.LowerContext, did: ast_id.DeclId, eid: ast_id.ExprId, gty: Type, name: intern.StrId) res[value.Value, fail.Fail] {
     val folded: res[value.Value, fail.Fail] = fold_global_value(ctx, did, eid, gty, name);
     if (sel ctx.status.kind.internal) { ret res[value.Value, fail.Fail].err{fail.phase_failure(ctx.status)}; }
     if (sel folded.err) {
@@ -927,7 +816,7 @@ fun fold_global_init(ctx: *lower_context.LowerContext, did: ast_id.DeclId, eid: 
     ret folded;
 }
 
-fun fold_global_value(ctx: *lower_context.LowerContext, did: ast_id.DeclId, eid: ast_id.ExprId, gty: ir_type.IrTypeId, name: intern.StrId) res[value.Value, fail.Fail] {
+fun fold_global_value(ctx: *lower_context.LowerContext, did: ast_id.DeclId, eid: ast_id.ExprId, gty: Type, name: intern.StrId) res[value.Value, fail.Fail] {
     if (is_null_init(ctx, eid)) { ret res[value.Value, fail.Fail].ok{value.const_null(gty)}; }
 
     val laid: res[opt[value.Value], fail.Fail] = published_layout(ctx, did, gty);
@@ -984,7 +873,7 @@ fun published_scalar(ctx: *lower_context.LowerContext, did: ast_id.DeclId) opt[c
 
 # the bytes of a global whose published value is an aggregate or an address, laid out from that
 # value; none for a scalar, which folds as its published value, and for no declaration
-fun published_layout(ctx: *lower_context.LowerContext, did: ast_id.DeclId, gty: ir_type.IrTypeId) res[opt[value.Value], fail.Fail] {
+fun published_layout(ctx: *lower_context.LowerContext, did: ast_id.DeclId, gty: Type) res[opt[value.Value], fail.Fail] {
     val none:  res[opt[value.Value], fail.Fail]    = res[opt[value.Value], fail.Fail].ok{opt[value.Value].none{}};
     val found: opt[*fe_sema.interface.Declaration] = fe_sema.interface.declaration_at(ctx.scope.iface, did);
     if (sel found.none)                             { ret none; }
@@ -994,7 +883,7 @@ fun published_layout(ctx: *lower_context.LowerContext, did: ast_id.DeclId, gty: 
     val n:     *comptime_deep.Node  = comptime_deep.node_at(store, node);
     var laid:  bool                 = n.kind == comptime_deep.NODE_LITERAL || n.kind == comptime_deep.NODE_ARRAY || n.kind == comptime_deep.NODE_ADDRESS;
     if (n.kind == comptime_deep.NODE_SCALAR && n.value.kind == comptime.CT_KIND_STR)                                    { laid = true; }
-    if (n.kind == comptime_deep.NODE_REFUSED && (ir_type.is_aggregate(?ctx.m.types, gty) || ir_is_ptr_or_fn(ctx, gty))) { laid = true; }
+    if (n.kind == comptime_deep.NODE_REFUSED && (irt.is_aggregate(?ctx.m.types, gty) || irt.is_ptr(?ctx.m.types, gty))) { laid = true; }
     if (!laid)                                                                                                          { ret none; }
     val refused: opt[u32] = comptime_deep.refused_within(store, node);
     if (sel refused.some) {
@@ -1007,12 +896,6 @@ fun published_layout(ctx: *lower_context.LowerContext, did: ast_id.DeclId, gty: 
     val agg: res[value.Value, fail.Fail] = constnode.aggregate(ctx, store, node, gty);
     if (sel agg.err) { ret res[opt[value.Value], fail.Fail].err{agg.err}; }
     ret res[opt[value.Value], fail.Fail].ok{opt[value.Value].some{agg.ok}};
-}
-
-fun ir_is_ptr_or_fn(ctx: *lower_context.LowerContext, ity: ir_type.IrTypeId) bool {
-    val opt_t: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
-    if (sel opt_t.none) { ret false; }
-    ret opt_t.some.kind == ir_type.IRT_PTR || opt_t.some.kind == ir_type.IRT_FN;
 }
 
 fun is_null_init(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) bool {
@@ -1071,220 +954,6 @@ fun lower_comptime_if(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) err[f
     ret err[fail.Fail].ok{};
 }
 
-# the function flags a declaration's decorators set
-rec FnFlagRow {
-    id:   decorator.Id;
-    flag: u32;
-}
-
-val FN_FLAG_ROWS_N: usize                     = 5;
-val FN_FLAG_ROWS:   [FN_FLAG_ROWS_N]FnFlagRow = [FN_FLAG_ROWS_N]FnFlagRow{
-    FnFlagRow{id: decorator.INLINE, flag: me_ir.FN_FLAG_INLINE},
-    FnFlagRow{id: decorator.NOINLINE, flag: me_ir.FN_FLAG_NOINLINE},
-    FnFlagRow{id: decorator.OBLIVIOUS, flag: me_ir.FN_FLAG_OBLIVIOUS},
-    FnFlagRow{id: decorator.SCALAR, flag: me_ir.FN_FLAG_SCALAR},
-    FnFlagRow{id: decorator.NAKED, flag: me_ir.FN_FLAG_NAKED},
-};
-
-fun decorator_fn_flags(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) u32 {
-    var flags: u32   = 0;
-    var i:     usize = 0;
-    for (i < FN_FLAG_ROWS_N) {
-        if (decorator.has(ctx.scope.a, d, FN_FLAG_ROWS[i].id)) { flags = flags | FN_FLAG_ROWS[i].flag; }
-        i = i + 1;
-    }
-    ret flags;
-}
-
-fun fill_iface_role(ctx: *lower_context.LowerContext, d: *ast_decl.Decl, g: *me_ir.Global) err[fail.Fail] {
-    var role: decorator.Id = decorator.SHARED;
-    var a_n:  u32          = 0;
-    var b_n:  u32          = 0;
-    if (decorator.has(ctx.scope.a, d, decorator.INPUT)) {
-        g.iface = me_ir.IFACE_INPUT;
-        role    = decorator.INPUT;
-        a_n     = 1;
-    }
-    or (decorator.has(ctx.scope.a, d, decorator.OUTPUT)) {
-        g.iface = me_ir.IFACE_OUTPUT;
-        role    = decorator.OUTPUT;
-        a_n     = 1;
-    }
-    or (decorator.has(ctx.scope.a, d, decorator.BUILTIN)) {
-        g.iface   = me_ir.IFACE_BUILTIN;
-        g.iface_a = decl_builtin_of(ctx, d);
-    }
-    or (decorator.has(ctx.scope.a, d, decorator.UNIFORM)) {
-        g.iface = me_ir.IFACE_UNIFORM;
-        role    = decorator.UNIFORM;
-        a_n     = 1;
-        b_n     = 1;
-    }
-    or (decorator.has(ctx.scope.a, d, decorator.STORAGE)) {
-        g.iface       = me_ir.IFACE_STORAGE;
-        g.iface_flags = decl_storage_flags(ctx, d);
-        role          = decorator.STORAGE;
-        a_n           = 1;
-        b_n           = 1;
-    }
-    or (decorator.has(ctx.scope.a, d, decorator.PUSH)) {
-        g.iface       = me_ir.IFACE_PUSH;
-        g.iface_flags = me_ir.IFACE_FLAG_READONLY;
-    }
-    or (decorator.has(ctx.scope.a, d, decorator.SAMPLER)) {
-        g.iface = me_ir.IFACE_SAMPLER;
-        role    = decorator.SAMPLER;
-        a_n     = 1;
-        b_n     = 1;
-    }
-    or (decorator.has(ctx.scope.a, d, decorator.SPEC)) {
-        g.iface       = me_ir.IFACE_SPEC;
-        g.iface_flags = me_ir.IFACE_FLAG_READONLY;
-        role          = decorator.SPEC;
-        a_n           = 1;
-    }
-    or (decorator.has(ctx.scope.a, d, decorator.SHARED)) { g.iface = me_ir.IFACE_SHARED; }
-    if (a_n > 0) {
-        val ia: res[u32, fail.Fail] = decorator_uint(ctx, d, role, 0, 0);
-        if (sel ia.err) { ret err[fail.Fail].err{ia.err}; }
-        g.iface_a = ia.ok;
-    }
-    if (b_n > 0) {
-        val ib: res[u32, fail.Fail] = decorator_uint(ctx, d, role, 1, 0);
-        if (sel ib.err) { ret err[fail.Fail].err{ib.err}; }
-        g.iface_b = ib.ok;
-    }
-    ret err[fail.Fail].ok{};
-}
-
-fun decl_storage_flags(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) u32 {
-    val dec: opt[*ast_decl.Decorator] = decorator.get(ctx.scope.a, d, decorator.STORAGE);
-    if (sel dec.none) { ret 0; }
-    var flags: u32 = 0;
-    var ord:   u32 = 2;
-    for (ord < dec.some.args_len) {
-        val qual: opt[str] = decorator.string_of(?ctx.s.interner, ctx.scope.ctx, ctx.scope.a, dec.some, ord);
-        if (sel qual.some) { flags = flags | storage_qual_flag(qual.some); }
-        ord = ord + 1;
-    }
-    ret flags;
-}
-
-fun storage_qual_flag(q: str) u32 {
-    if (str_equals(q, "readonly"))  { ret me_ir.IFACE_FLAG_READONLY; }
-    if (str_equals(q, "writeonly")) { ret me_ir.IFACE_FLAG_WRITEONLY; }
-    if (str_equals(q, "coherent"))  { ret me_ir.IFACE_FLAG_COHERENT; }
-    ret 0;
-}
-
-fun decl_builtin_of(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) u32 {
-    val v: opt[str] = decorator_string(ctx, d, decorator.BUILTIN, 0);
-    if (sel v.none) { ret me_ir.BUILTIN_POSITION; }
-    val b: str = v.some;
-    if (str_equals(b, "position"))               { ret me_ir.BUILTIN_POSITION; }
-    if (str_equals(b, "vertex_index"))           { ret me_ir.BUILTIN_VERTEX_INDEX; }
-    if (str_equals(b, "instance_index"))         { ret me_ir.BUILTIN_INSTANCE_INDEX; }
-    if (str_equals(b, "frag_coord"))             { ret me_ir.BUILTIN_FRAG_COORD; }
-    if (str_equals(b, "point_size"))             { ret me_ir.BUILTIN_POINT_SIZE; }
-    if (str_equals(b, "global_invocation"))      { ret me_ir.BUILTIN_GLOBAL_INVOCATION; }
-    if (str_equals(b, "local_invocation"))       { ret me_ir.BUILTIN_LOCAL_INVOCATION; }
-    if (str_equals(b, "workgroup_id"))           { ret me_ir.BUILTIN_WORKGROUP_ID; }
-    if (str_equals(b, "num_workgroups"))         { ret me_ir.BUILTIN_NUM_WORKGROUPS; }
-    if (str_equals(b, "local_invocation_index")) { ret me_ir.BUILTIN_LOCAL_INVOCATION_INDEX; }
-    if (str_equals(b, "subgroup_size"))          { ret me_ir.BUILTIN_SUBGROUP_SIZE; }
-    if (str_equals(b, "subgroup_invocation"))    { ret me_ir.BUILTIN_SUBGROUP_INVOCATION; }
-    if (str_equals(b, "subgroup_id"))            { ret me_ir.BUILTIN_SUBGROUP_ID; }
-    if (str_equals(b, "num_subgroups"))          { ret me_ir.BUILTIN_NUM_SUBGROUPS; }
-    ret me_ir.BUILTIN_POSITION;
-}
-
-# the string argument `ord` of the declaration's decorator `id` evaluated to
-fun decorator_string(ctx: *lower_context.LowerContext, d: *ast_decl.Decl, id: decorator.Id, ord: u32) opt[str] {
-    val dec: opt[*ast_decl.Decorator] = decorator.get(ctx.scope.a, d, id);
-    if (sel dec.none) { ret opt[str].none{}; }
-    ret decorator.string_of(?ctx.s.interner, ctx.scope.ctx, ctx.scope.a, dec.some, ord);
-}
-
-# argument `ord` of decorator `id` on `d` as a u32, `dflt` when the decorator gives none
-fun decorator_uint(ctx: *lower_context.LowerContext, d: *ast_decl.Decl, id: decorator.Id, ord: u32, dflt: u32) res[u32, fail.Fail] {
-    val opt_arg: opt[ast_id.ExprId] = decorator_arg_eid(ctx, d, id, ord);
-    if (sel opt_arg.none) { ret res[u32, fail.Fail].ok{dflt}; }
-    ret constant_u32(ctx, opt_arg.some, 0);
-}
-
-# the integer constant `arg` folds to, which sema admitted as an integer: one below `least` or
-# past a u32 is refused where it is written
-fun constant_u32(ctx: *lower_context.LowerContext, arg: ast_id.ExprId, least: u64) res[u32, fail.Fail] {
-    val res_u64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?ctx.m.types, 64);
-    if (sel res_u64.err) { ret res[u32, fail.Fail].err{res_u64.err}; }
-    val res_fold: res[value.Value, fail.Fail] = fold_global_init(ctx, ast_id.DECL_NIL, arg, res_u64.ok, intern.STR_NIL);
-    if (sel res_fold.err) { ret res[u32, fail.Fail].err{res_fold.err}; }
-    val v: value.Value = res_fold.ok;
-    if (v.kind != value.VAL_CONST_INT)                         { ret res[u32, fail.Fail].err{fail.message("lower: a decorator argument sema admitted as an integer did not fold to one")}; }
-    if (v.data.int_lit < least || v.data.int_lit > 0xFFFFFFFF) { ret range_refused(ctx, arg, least); }
-    ret res[u32, fail.Fail].ok{v.data.int_lit::u32};
-}
-
-fun range_refused(ctx: *lower_context.LowerContext, arg: ast_id.ExprId, least: u64) res[u32, fail.Fail] {
-    fail.reject(?ctx.status);
-    val text: res[str, fail.Fail] = fail.format(ctx.s.alloc, "this decorator argument must lie in {} to 4294967295", least);
-    if (sel text.err) { ret res[u32, fail.Fail].err{text.err}; }
-    val loc: lang_source.Location = lang_source.location(ctx.scope.a.file_id, lower_expr.expr_span_of(ctx, arg));
-    ret res[u32, fail.Fail].err{diagnostic.reject(ctx.diags, diagnostic_kind.DECORATOR_ARGUMENT, loc, text.ok)};
-}
-
-fun decl_stage_of(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) u8 {
-    val v: opt[str] = decorator_string(ctx, d, decorator.STAGE, 0);
-    if (sel v.none)                     { ret me_ir.STAGE_NONE; }
-    if (str_equals(v.some, "vertex"))   { ret me_ir.STAGE_VERTEX; }
-    if (str_equals(v.some, "fragment")) { ret me_ir.STAGE_FRAGMENT; }
-    if (str_equals(v.some, "compute"))  { ret me_ir.STAGE_COMPUTE; }
-    ret me_ir.STAGE_NONE;
-}
-
-# dimension `ord` of a function's `#[workgroup]`, 1 without one; a `#[spec]` var sizes it by its
-# default until the host supplies another
-fun decl_workgroup_dim(ctx: *lower_context.LowerContext, d: *ast_decl.Decl, ord: u32) res[u32, fail.Fail] {
-    val opt_arg: opt[ast_id.ExprId] = decorator_arg_eid(ctx, d, decorator.WORKGROUP, ord);
-    if (sel opt_arg.none) { ret res[u32, fail.Fail].ok{1}; }
-    val spec: res[intern.StrId, fail.Fail] = decl_workgroup_spec(ctx, d, ord);
-    if (sel spec.err)                { ret res[u32, fail.Fail].err{spec.err}; }
-    if (!intern.str_is_nil(spec.ok)) { ret spec_default(ctx, opt_arg.some); }
-    ret constant_u32(ctx, opt_arg.some, 1);
-}
-
-# the default the `#[spec]` var `arg` names declares, which sizes the workgroup until the host
-# supplies another; read from its declaration, since a var binds no constant. sema admits only
-# a `#[spec]` var with an integer default here
-fun spec_default(ctx: *lower_context.LowerContext, arg: ast_id.ExprId) res[u32, fail.Fail] {
-    val opt_sym: opt[*resolve.Symbol] = lower_context.symbol_of(ctx, lower_context.expr_symbol_of(ctx, arg));
-    if (sel opt_sym.none) { ret res[u32, fail.Fail].err{fail.message("lower: a workgroup `#[spec]` var names no symbol")}; }
-    val found: res[lower_context.Declared, fail.Fail] = lower_context.declared(ctx, opt_sym.some);
-    if (sel found.err) { ret res[u32, fail.Fail].err{found.err}; }
-    val d: *fe_sema.interface.Declaration = found.ok.declaration;
-    if (d.kind != resolve.SYM_VAR || d.value == fe_sema.interface.NONE) { ret res[u32, fail.Fail].err{fail.message("lower: a workgroup `#[spec]` var declares no default")}; }
-    val v: res[comptime.CTValue, comptime.EvalFail] = comptime_deep.value(?found.ok.iface.values, ?ctx.s.interner, d.value);
-    if (!sel v.ok) { ret res[u32, fail.Fail].err{fail.message("lower: a workgroup `#[spec]` var's default does not read back")}; }
-    val n: opt[u64] = comptime.ct_int_u64(v.ok);
-    if (!sel n.some)                        { ret res[u32, fail.Fail].err{fail.message("lower: a workgroup `#[spec]` var's default is not an integer")}; }
-    if (n.some == 0 || n.some > 0xFFFFFFFF) { ret range_refused(ctx, arg, 1); }
-    ret res[u32, fail.Fail].ok{n.some::u32};
-}
-
-# the linkage name of the module `var` a workgroup dimension names, nil for a constant
-# dimension. sema admits only a `#[spec]` var there, and the back end holds it to that
-fun decl_workgroup_spec(ctx: *lower_context.LowerContext, d: *ast_decl.Decl, ord: u32) res[intern.StrId, fail.Fail] {
-    val opt_arg: opt[ast_id.ExprId] = decorator_arg_eid(ctx, d, decorator.WORKGROUP, ord);
-    if (sel opt_arg.none) { ret res[intern.StrId, fail.Fail].ok{intern.STR_NIL}; }
-    val opt_sym: opt[*resolve.Symbol] = lower_context.symbol_of(ctx, lower_context.expr_symbol_of(ctx, opt_arg.some));
-    if (sel opt_sym.none) { ret res[intern.StrId, fail.Fail].ok{intern.STR_NIL}; }
-    val sym: *resolve.Symbol = opt_sym.some;
-    if (sym.kind != resolve.SYM_VAR && !(sym.kind == resolve.SYM_IMPORTED && sym.definition_kind == resolve.SYM_VAR)) {
-        ret res[intern.StrId, fail.Fail].ok{intern.STR_NIL};
-    }
-    ret lower_expr.symbol_linkage_name(ctx, opt_arg.some);
-}
-
 fun decl_section_of(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) intern.StrId {
     val dec: opt[*ast_decl.Decorator] = decorator.get(ctx.scope.a, d, decorator.SECTION);
     if (sel dec.none) { ret intern.STR_NIL; }
@@ -1316,37 +985,6 @@ fun embed_file_of(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) res[*sess
     ret res[*session_embed.EmbedFile, fail.Fail].ok{e};
 }
 
-# the extensions a function's `#[extensions(...)]` admits in its body, as bits of
-# the target isa's vocabulary closed over what they imply; a name only another
-# isa declares admits nothing here, and one only a target selects is refused
-fun decl_extensions(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) res[u64, fail.Fail] {
-    val found: opt[*ast_decl.Decorator] = decorator.get(ctx.scope.a, d, decorator.EXTENSIONS);
-    if (sel found.none) { ret res[u64, fail.Fail].ok{0}; }
-    val dec:  *ast_decl.Decorator = found.some;
-    val src:  str                 = lower_context.module_source(ctx);
-    var bits: u64                 = 0;
-    var i:    u32                 = 0;
-    for (i < dec.args_len) {
-        val e_opt: opt[*ast_expr.Expr] = ast.get_expr(ctx.scope.a, ctx.scope.a.expr_ids.data[dec.args_start + i]);
-        val bare:  res[u64, fail.Fail] = res[u64, fail.Fail].err{fail.message("`extensions` decorator arguments are bare extension names")};
-        if (!sel e_opt.some) { ret bare; }
-        val e: *ast_expr.Expr = e_opt.some;
-        if (e.kind != ast_expr.EXPR_KIND_IDENT) { ret bare; }
-        val span:  lang_source.Span                = e.data.ident.tok;
-        val name:  str                             = (src::usize + span.offset::usize)::str;
-        val found: target_model.DecoratorExtension = target_model.decorator_extension(?ctx.tgt.vocabulary, target_model.extension_view(?ctx.tgt.model), name, span.len::usize);
-        if (!found.known) {
-            ret res[u64, fail.Fail].err{fail.message("`extensions` decorator names an extension no instruction set declares")};
-        }
-        if (found.target_only != nil) {
-            ret res[u64, fail.Fail].err{fail.message("`extensions` decorator names an extension only a target selects")};
-        }
-        bits = bits | found.bit;
-        i    = i + 1;
-    }
-    ret res[u64, fail.Fail].ok{target_model.extension_close(?ctx.tgt.model, bits)};
-}
-
 fun decorator_arg_eid(ctx: *lower_context.LowerContext, d: *ast_decl.Decl, id: decorator.Id, ord: u32) opt[ast_id.ExprId] {
     val dec: opt[*ast_decl.Decorator] = decorator.get(ctx.scope.a, d, id);
     if (sel dec.none) { ret opt[ast_id.ExprId].none{}; }
@@ -1361,54 +999,18 @@ fun decl_align_of(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) res[u32, 
     if (sel opt_arg.none) { ret res[u32, fail.Fail].ok{0}; }
     val arg: ast_id.ExprId = opt_arg.some;
 
-    val res_u64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?ctx.m.types, 64);
+    val res_u64: res[Type, fail.Fail] = irt.int(?ctx.m.types, 64);
     if (sel res_u64.err) { ret res[u32, fail.Fail].err{res_u64.err}; }
-    val u64t: ir_type.IrTypeId = res_u64.ok;
+    val u64t: Type = res_u64.ok;
 
     val res_fold: res[value.Value, fail.Fail] = fold_global_init(ctx, ast_id.DECL_NIL, arg, u64t, intern.STR_NIL);
     if (sel res_fold.err) { ret res[u32, fail.Fail].err{res_fold.err}; }
     val v: value.Value = res_fold.ok;
     # sema decided the value is a power of two that fits
-    if (v.kind != value.VAL_CONST_INT) { ret res[u32, fail.Fail].err{fail.message("lower: an `align` sema accepted did not fold to an integer")}; }
-    val n: u64 = v.data.int_lit;
+    if (v.kind != value.VAL_INT) { ret res[u32, fail.Fail].err{fail.message("lower: an `align` sema accepted did not fold to an integer")}; }
+    val n: u64 = value.int_lit(v);
     if (n == 0 || (n & (n - 1)) != 0 || n > 0xFFFFFFFF) { ret res[u32, fail.Fail].err{fail.message("lower: an `align` sema accepted is not a power of two that fits")}; }
     ret res[u32, fail.Fail].ok{n::u32};
-}
-
-fun append_function(ctx: *lower_context.LowerContext, name: intern.StrId, sig: lower_context.FnSig, flags: u32, param_hint: u32) res[u32, fail.Fail] {
-    val m: *me_ir.Module = ctx.m;
-
-    val existing: opt[u32] = me_ir.function_lookup(m, name);
-    if (sel existing.some) {
-        val ei: u32 = existing.some;
-        if ((m.functions[ei].flags & me_ir.FN_FLAG_EXTERN) != 0) {
-            m.functions[ei].sig       = sig.sig;
-            m.functions[ei].param_ext = sig.ext;
-            m.functions[ei].flags     = flags;
-            ret res[u32, fail.Fail].ok{ei};
-        }
-    }
-
-    val grown: err[A.Error] = growth.reserve[me_ir.Function](m.alloc, ?m.functions, ?m.function_cap, m.function_len::usize + 1);
-    if (sel grown.err) { ret res[u32, fail.Fail].err{fail.refused(grown.err)}; }
-
-    val idx: u32 = m.function_len;
-    m.functions[idx]           = me_ir.function_new(m.alloc, name, sig.sig, flags);
-    m.functions[idx].param_ext = sig.ext;
-    m.function_len             = m.function_len + 1;
-    val res_reg: err[fail.Fail] = me_ir.function_register(m, name, idx);
-    if (sel res_reg.err) { ret res[u32, fail.Fail].err{res_reg.err}; }
-    ret res[u32, fail.Fail].ok{idx};
-}
-
-fun append_global(ctx: *lower_context.LowerContext, g: me_ir.Global) res[u32, fail.Fail] {
-    val m:     *me_ir.Module       = ctx.m;
-    val added: res[u32, fail.Fail] = me_ir.global_add(m, g);
-    if (sel added.err) { ret added; }
-    val idx:     u32            = added.ok;
-    val res_reg: err[fail.Fail] = me_ir.global_register(m, g.name, idx);
-    if (sel res_reg.err) { ret res[u32, fail.Fail].err{res_reg.err}; }
-    ret res[u32, fail.Fail].ok{idx};
 }
 
 fun param_symbol(ctx: *lower_context.LowerContext, fun_did: ast_id.DeclId, index: u32) resolve.SymbolId {

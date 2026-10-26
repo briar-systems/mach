@@ -1,0 +1,559 @@
+# the back half a build hands its lowered modules to: mirl compiles a unit to mink's object
+# in memory, mink lays an object out in the target's format or reads one back, and mink links
+# objects into an image. nothing here starts a process or writes a file between the stages
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.view.View;
+use std.types.view.view_eq_str;
+
+use A:          std.allocator;
+use std_writer: std.io.writer;
+use std.memory;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.fail;
+use lower_context: mach.lang.me.lower.context;
+use target_owner:  mach.lang.target.owner;
+use mach.lang.target.resolved;
+
+use masc_ct: masc.core.ct;
+use mct:     mirl.ct;
+use mirl.ir.id.Function;
+use mirl.ir.module.Module;
+use opcode_row:   mirl.ir.opcode.row;
+use opcode_table: mirl.ir.opcode.table;
+use mirl_machine: mirl.machine.compile;
+use mirl_inline:  mirl.machine.inline;
+use mirl_engine:  mirl.machine.select.engine;
+use pass_failure: mirl.pass.failure;
+use mirl.pass.relaxation;
+use mirl_pass:    mirl.pass.schedule;
+use mirl_compile: mirl.target.compile;
+use mirl_family:  mirl.target.family;
+use mirl_record:  mirl.target.record;
+use mirl_spirv:   mirl.target.spirv.error;
+
+use mink.base.diag;
+use mink_fail: mink.base.fail;
+use mink.base.fail.Fail;
+use mink.base.intern.Name;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink.catalog.format.Format;
+use mink_os: mink.catalog.os;
+use mink.catalog.output;
+use mink_subsystem: mink.catalog.subsystem;
+use mink.format.contract;
+use mink.format.registry;
+use mink.link.input.Source;
+use mink.link.options.Options;
+use mink.link.state;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.section;
+use mink.model.symbol;
+use mink_target: mink.model.target;
+
+# the target a build compiles for and the formats it reads and writes
+# ---
+# assembled: the target the owners assemble for the cell, nil for a cell none assembles yet
+# machine:   what lowering builds its units for, borrowing `assembled`
+# format:    the object format of the target's system
+# formats:   mink's format registry
+pub rec Back {
+    assembled: *target_owner.Assembled;
+    machine:   lower_context.Machine;
+    format:    *Format;
+    formats:   registry.Registry;
+    opened:    bool;
+}
+
+# a back half that compiles nothing, for a project with no target yet
+pub fun none() Back {
+    var b: Back;
+    b.assembled = nil;
+    b.format    = nil;
+    b.opened    = false;
+    ret b;
+}
+
+# the back half of the resolved cell `t`, none assembled where no owner assembles the cell
+pub fun open(a: *A.Allocator, t: *resolved.Target) res[Back, fail.Fail] {
+    var b:       Back                         = none();
+    val formats: res[registry.Registry, Fail] = registry.builtin(a);
+    if (sel formats.err) { ret res[Back, fail.Fail].err{refused_by_mink(a, "mink's formats did not open", formats.err)}; }
+    b.formats = formats.ok;
+    b.opened  = true;
+    val made: res[opt[*target_owner.Assembled], fail.Fail] = target_owner.assemble_resolved(a, t);
+    if (sel made.err) {
+        close(a, ?b);
+        ret res[Back, fail.Fail].err{made.err};
+    }
+    if (sel made.ok.none) { ret res[Back, fail.Fail].ok{b}; }
+    b.assembled = made.ok.some;
+    val machine: res[lower_context.Machine, fail.Fail] = lower_context.machine_of(b.assembled);
+    if (sel machine.err) {
+        close(a, ?b);
+        ret res[Back, fail.Fail].err{machine.err};
+    }
+    b.machine = machine.ok;
+    val f: res[*Format, mirl_record.Error] = mirl_record.format(?b.assembled.target);
+    if (sel f.ok) { b.format = f.ok; }
+    ret res[Back, fail.Fail].ok{b};
+}
+
+pub fun close(a: *A.Allocator, b: *Back) {
+    if (b.assembled != nil) { target_owner.release(a, b.assembled); }
+    if (b.opened)           { val released: err[Fail] = registry.release(?b.formats); }
+    @b = none();
+}
+
+# the machine lowering builds for, refused for a cell no owner assembles yet
+pub fun machine(b: *Back) res[*lower_context.Machine, fail.Fail] {
+    if (b.assembled == nil) { ret res[*lower_context.Machine, fail.Fail].err{fail.message("no owner assembles a mirl target for this cell yet, so it has no back end")}; }
+    ret res[*lower_context.Machine, fail.Fail].ok{?b.machine};
+}
+
+# mink's failure `f` as mach's, under `lead`
+pub fun refused_by_mink(a: *A.Allocator, lead: str, f: Fail) fail.Fail {
+    var out:  Sink      = sink.make(a, LITTLE);
+    val r:    err[Fail] = diag.render(f, ?out);
+    var text: str       = "";
+    if (sel r.ok && sink.len(?out) > 0) {
+        val n:      usize             = sink.len(?out) - 1;
+        val copied: res[*u8, A.Error] = A.allocate[u8](a, n + 1);
+        if (sel copied.ok) {
+            memory.copy[u8](copied.ok, sink.data(?out), n);
+            copied.ok[n] = 0;
+            text         = copied.ok::str;
+        }
+    }
+    val freed: err[Fail] = sink.release(?out);
+    ret fail.message_of(fail.join(a, lead, ": ", text));
+}
+
+# the mirl module `m` compiled to mink's object at mirl's level `level`, its schedule's own checks
+# run with `checked`, the linker let relax its code with `relax` and the float relaxations `floats`
+# permitted. the module is the schedule's to rewrite, so it is spent here
+pub fun compile(b: *Back, a: *A.Allocator, m: *Module, level: u8, checked: bool, relax: bool, floats: relaxation.Relaxations, name: str) res[Object, fail.Fail] {
+    if (b.assembled == nil) { ret res[Object, fail.Fail].err{fail.message("no owner assembles a mirl target for this cell yet, so it has no back end")}; }
+    val o: mirl_compile.Options = mirl_compile.Options{
+        output:   mirl_family.Output.object{},
+        relax:    relax,
+        floats:   floats,
+        level:    level::mirl_pass.Level,
+        checked:  checked,
+        added:    target_owner.added(b.assembled),
+        machine:  opt[*std_writer.Writer].none{},
+        listing:  opt[*std_writer.Writer].none{},
+        warnings: opt[*std_writer.Writer].none{}
+    };
+    val made: res[Object, mirl_compile.Error] = mirl_compile.compile(a, m, ?b.assembled.target, o);
+    if (sel made.ok) { ret res[Object, fail.Fail].ok{made.ok}; }
+    ret res[Object, fail.Fail].err{uncompiled(a, m, name, made.err)};
+}
+
+# why mirl did not compile the module `name`: a constant-time function the target cannot
+# time is the source's to change, and every other refusal is the compiler's
+fun uncompiled(a: *A.Allocator, m: *Module, name: str, e: mirl_compile.Error) fail.Fail {
+    if (sel e.timing) { ret untimed(a, m, name, e.timing, "the ir's constant-time check"); }
+    val block: opt[fail.Fail] = assembly_refused(a, name, e);
+    if (sel block.some) { ret block.some; }
+    var why: str = "its back end refused it";
+    if (sel e.back) {
+        val back: mirl_family.Back = e.back;
+        if (sel back.register) { ret register_refused(a, m, name, back.register); }
+        if (sel back.spirv) {
+            val q: mirl_spirv.Error = back.spirv;
+            if (sel q.unmet)    { ret fail.message_of(fail.join(a, "mirl did not compile '", name, "': it needs ", q.unmet.name, ", which the target's selection does not hold")); }
+            if (sel q.encoding) { ret fail.message_of(fail.join(a, "mirl did not compile '", name, "': masc refused an instruction: ", q.encoding.message)); }
+            why = spirv_refusal(q);
+        }
+    }
+    if (sel e.unserved)   { why = "no family of mirl serves the target"; }
+    or (sel e.listing)    { why = "mirl's families do not list their owners"; }
+    or (sel e.foreign)    { why = "it holds an operation the target's family does not serve"; }
+    or (sel e.open)       { why = "mirl opened no build of the target's selection"; }
+    or (sel e.schedule)   { ret schedule_refused(a, m, name, e.schedule); }
+    or (sel e.introduced) { why = "mirl's schedule left an operation the target's family does not serve"; }
+    or (sel e.alloc)      { ret fail.refused(e.alloc); }
+    ret fail.message_of(fail.join(a, "mirl did not compile '", name, "': ", why));
+}
+
+# what mirl's pass schedule refused of the module `name`: the pass, the function and why, as
+# mirl's error states them
+fun schedule_refused(a: *A.Allocator, m: *Module, name: str, e: pass_failure.Error) fail.Fail {
+    if (sel e.alloc) { ret fail.refused(e.alloc); }
+    if (sel e.input) { ret fail.message_of(fail.join(a, "mirl's schedule refused '", name, "' before any pass ran: ", e.input.what)); }
+    if (sel e.unverified) {
+        val u:    pass_failure.Unverified = e.unverified;
+        var what: str                     = "the verifier ran out of storage";
+        if (sel u.error.refused) { what = u.error.refused.what; }
+        ret fail.message_of(fail.join(a, "mirl's verifier refused '", name, "' after the pass ", u.pass, ": ", what));
+    }
+    if (sel e.refused) {
+        val r:     pass_failure.Refusal = e.refused;
+        var where: str                  = "the module";
+        if (sel r.function.some) {
+            val fname: res[str, fail.Fail] = function_name(a, m, r.function.some);
+            if (sel fname.err) { ret fname.err; }
+            where = fname.ok;
+        }
+        ret fail.message_of(fail.join(a, "mirl's pass ", r.pass, " refused '", where, "' of '", name, "': ", pass_why(r.why)));
+    }
+    if (sel e.schedule) { ret fail.message_of(fail.join(a, "mirl's schedule for '", name, "' is malformed at the pass ", e.schedule.pass)); }
+    ret fail.message_of(fail.join(a, "mirl's schedule for '", name, "' was given a machine opened for another target"));
+}
+
+# why a pass refused, in the words of its case
+fun pass_why(w: pass_failure.Why) str {
+    if (sel w.reason)      { ret w.reason; }
+    if (sel w.alloc)       { ret "the allocator refused storage"; }
+    if (sel w.ir)          { ret "the module or a body refused an edit or a read"; }
+    if (sel w.cfg)         { ret "a graph edit or a copy was refused"; }
+    if (sel w.build)       { ret "the builder stopped"; }
+    if (sel w.convention)  { ret "a call, an entry or a return was not classified"; }
+    if (sel w.pieces)      { ret "an assignment is not carried in pieces of the ir"; }
+    if (sel w.text)        { ret "a function delivered in the text form was not read"; }
+    if (sel w.timing)      { ret "a function that requires constant time would take a time that depends on a secret"; }
+    if (sel w.condition)   { ret "a capability's condition was not read on the build's machine"; }
+    if (sel w.unheld)      { ret "a float type the target holds no unit for"; }
+    if (sel w.threaded)    { ret "a thread-local global the build's threads reach no variable of yet"; }
+    if (sel w.indexed)     { ret "a thread-local global reached through the runtime's index, which no selection forms yet"; }
+    if (sel w.specialized) { ret "a specialization constant, on a target that holds none"; }
+    ret "a pointer slot the target holds no pointer in";
+}
+
+# what mirl's register back end refused of the module `name`: a constant-time walk of the
+# encoded code is the source's, and every other case is the compiler's, named by its case
+fun register_refused(a: *A.Allocator, m: *Module, name: str, e: mirl_machine.Error) fail.Fail {
+    if (sel e.alloc) { ret fail.refused(e.alloc); }
+    if (sel e.timing) {
+        val unmet: mct.Unmet = e.timing;
+        if (sel unmet.refused) { ret untimed(a, m, name, unmet.refused, "the walk of its encoded code"); }
+        val fname: res[str, fail.Fail] = function_name(a, m, unmet.unfollowed.function);
+        if (sel fname.err) { ret fname.err; }
+        ret fail.user_of(diagnostic_kind.SECRET_UNVERIFIABLE, fail.join(a, "'", fname.ok, "' of '", name, "' requires constant time, and mirl could not follow its encoded code: ", unmet.unfollowed.unread.message));
+    }
+    var why: str = "the register back end refused it";
+    if (sel e.foreign)   { why = "the build was opened for another target"; }
+    or (sel e.uncarried) { why = "masc's registry carries no record of the build's instruction set"; }
+    or (sel e.locations) { why = "the target's register and memory locations were refused"; }
+    or (sel e.table)     { why = "the selection table was refused for the target"; }
+    or (sel e.moves)     { why = "the instruction set's moves were refused for the target"; }
+    or (sel e.code)      { why = "the frame code was not bound to the target's selection"; }
+    or (sel e.emit)      { why = "emission refused the laid out functions"; }
+    or (sel e.machine)   { why = "the machine form text was not printed"; }
+    or (sel e.write)     { why = "the listing was not written"; }
+    or (sel e.function) {
+        val failed: mirl_machine.Failed = e.function;
+        val fname:  res[str, fail.Fail] = function_name(a, m, failed.function);
+        if (sel fname.err) { ret fname.err; }
+        var step: str = "before its steps";
+        if (sel failed.step.some) { step = failed.step.some; }
+        ret fail.message_of(fail.join(a, "mirl did not compile '", fname.ok, "' of '", name, "': ", stage_refusal(failed.stage), " (", step, ")", selection_lead(failed.stage), selection_named(failed.stage)));
+    }
+    ret fail.message_of(fail.join(a, "mirl did not compile '", name, "': ", why));
+}
+
+# what selection could not select, as a clause after its stage, "" for any other stage
+fun selection_lead(s: mirl_machine.Stage) str {
+    if (!(sel s.select)) { ret ""; }
+    val e: mirl_engine.Error = s.select;
+    if (sel e.unmatched) {
+        val op: mirl_engine.Operation = e.unmatched.operation;
+        if (sel op.opcode) { ret ": no rule selects "; }
+        ret ": no rule materialises a constant";
+    }
+    if (sel e.unheld)    { ret ": no register class holds a value of its type"; }
+    if (sel e.ambiguous) { ret ": two register classes hold a value of its type"; }
+    if (sel e.aggregate) { ret ": a value of an aggregate type, which no register holds"; }
+    if (sel e.unplaced)  { ret ": an entry whose parameters the abi legalisation did not place"; }
+    if (sel e.placed)    { ret ": a piece at a place selection does not carry"; }
+    if (sel e.unchecked) { ret ": a division without the checked mark"; }
+    ret "";
+}
+
+# the opcode selection found no rule for, "" when it refused anything else
+fun selection_named(s: mirl_machine.Stage) str {
+    if (!(sel s.select)) { ret ""; }
+    val e: mirl_engine.Error = s.select;
+    if (!(sel e.unmatched)) { ret ""; }
+    val op: mirl_engine.Operation = e.unmatched.operation;
+    if (!(sel op.opcode)) { ret ""; }
+    val row: opt[opcode_row.Row] = opcode_table.row(op.opcode);
+    if (sel row.some) { ret row.some.name; }
+    ret "";
+}
+
+# what refused a function at a stage of the register back end, by the stage's case
+fun stage_refusal(s: mirl_machine.Stage) str {
+    if (sel s.select)     { ret "selection refused an operation"; }
+    if (sel s.timing)     { ret "a timing check refused it"; }
+    if (sel s.alloc)      { ret "the allocator refused storage"; }
+    if (sel s.pointer)    { ret "the frame pointer was refused"; }
+    if (sel s.allowed)    { ret "a register the function may not use was asked for"; }
+    if (sel s.allocate)   { ret "register allocation refused it"; }
+    if (sel s.frame)      { ret "the frame was not finished"; }
+    if (sel s.copies)     { ret "its copies were not lowered"; }
+    if (sel s.configure)  { ret "the configuration step refused it"; }
+    if (sel s.loops)      { ret "a loop was not expanded"; }
+    if (sel s.layout)     { ret "its layout was refused"; }
+    if (sel s.ranges)     { ret "a branch range was refused"; }
+    if (sel s.verify)     { ret "the machine verifier refused it"; }
+    if (sel s.watched)    { ret "a watched step refused it"; }
+    if (sel s.misplaced)  { ret "an instruction was misplaced"; }
+    if (sel s.unfinished) { ret "it was left unfinished"; }
+    ret "its calling convention was refused";
+}
+
+# what mirl's spir-v back end refused of a module, in the words of its error's cases
+fun spirv_refusal(e: mirl_spirv.Error) str {
+    if (sel e.ir)            { ret "the spir-v back end could not read the module"; }
+    if (sel e.layout)        { ret "the spir-v data layout gave a type no extent"; }
+    if (sel e.basis)         { ret "the selection a spir-v unit is read under was not opened"; }
+    if (sel e.analysis)      { ret "a function's structure was not read"; }
+    if (sel e.unselected)    { ret "an instruction spir-v has no form of yet"; }
+    if (sel e.untyped)       { ret "a type spir-v has no form of here"; }
+    if (sel e.unpointed)     { ret "a pointer whose pointee no definition or use states"; }
+    if (sel e.reinterpreted) { ret "an access through a pointer at a type other than what it points to"; }
+    if (sel e.variable)      { ret "a pointer chosen at run time, which logical addressing reaches only through variable pointers"; }
+    if (sel e.storage)       { ret "a global whose address is used in another storage class than its own"; }
+    if (sel e.slot)          { ret "a stack slot whose pointer is not into the Function class"; }
+    if (sel e.entry)         { ret "an entry point that takes or returns a value"; }
+    if (sel e.imported)      { ret "an image that imports a function or a global"; }
+    if (sel e.unmet)         { ret "a capability, extension or version the module needs that the selection does not hold"; }
+    if (sel e.unstructured)  { ret "a function whose region tree the emitter cannot follow"; }
+    if (sel e.encoding)      { ret "masc refused an instruction"; }
+    if (sel e.builder)       { ret "masc's builder refused the module"; }
+    if (sel e.container)     { ret "mink's object refused the module"; }
+    ret "the spir-v back end refused it";
+}
+
+# a function of the module `name` that requires constant time, refused as mirl words it: a
+# set that classifies no timing is the target's, and a secret where the code may hold none is
+# the source's
+fun untimed(a: *A.Allocator, m: *Module, name: str, r: mct.Refused, by: str) fail.Fail {
+    val fname: res[str, fail.Fail] = function_name(a, m, r.function);
+    if (sel fname.err) { ret fname.err; }
+    var at: str = "the function as a whole";
+    if (sel r.at.instruction) { at = "an instruction of it"; }
+    or (sel r.at.offset)      { at = "a byte of its encoded code"; }
+    var kind: diagnostic_kind.Kind = diagnostic_kind.SECRET_UNVERIFIABLE;
+    if (r.refusal.reason == masc_ct.UNCLASSIFIED) { kind = diagnostic_kind.SECRET_TARGET_UNVERIFIABLE; }
+    if (sel r.callee.some) {
+        val callee: res[str, fail.Fail] = function_name(a, m, r.callee.some);
+        if (sel callee.err) { ret callee.err; }
+        ret fail.user_of(kind, fail.join(a, "'", fname.ok, "' of '", name, "' requires constant time, which ", by, " refused at ", at, ": ", masc_ct.message(?r.refusal), ", '", callee.ok, "'"));
+    }
+    ret fail.user_of(kind, fail.join(a, "'", fname.ok, "' of '", name, "' requires constant time, which ", by, " refused at ", at, ": ", masc_ct.message(?r.refusal)));
+}
+
+# the name a function of `m` is declared by, copied
+fun function_name(a: *A.Allocator, m: *Module, f: Function) res[str, fail.Fail] {
+    if (f.index::usize >= m.functions.len) { ret res[str, fail.Fail].err{fail.message("mirl refused a function its module does not hold")}; }
+    val v:      View               = m.functions.data[f.index::usize].data.name;
+    val copied: res[str, StrError] = str_copy_slice(a, v.data, 0, v.len);
+    if (sel copied.err) { ret res[str, fail.Fail].err{fail.str_refused(copied.err)}; }
+    ret res[str, fail.Fail].ok{copied.ok};
+}
+
+# an asm block of the module `name` that selection refused, which the source states,
+# none for any other refusal
+fun assembly_refused(a: *A.Allocator, name: str, e: mirl_compile.Error) opt[fail.Fail] {
+    if (sel e.back) {
+        val back: mirl_family.Back = e.back;
+        if (sel back.register) {
+            val machine: mirl_machine.Error = back.register;
+            if (sel machine.function) {
+                val stage: mirl_machine.Stage = machine.function.stage;
+                if (sel stage.select) {
+                    val selection: mirl_engine.Error = stage.select;
+                    if (sel selection.assembly) { ret opt[fail.Fail].some{block_refused(a, name, selection.assembly.refusal)}; }
+                }
+            }
+        }
+    }
+    ret opt[fail.Fail].none{};
+}
+
+# why mirl compiles no asm block of the module `name` as it is written
+fun block_refused(a: *A.Allocator, name: str, r: mirl_inline.Refusal) fail.Fail {
+    if (sel r.alloc)  { ret fail.refused(r.alloc); }
+    if (sel r.parsed) { ret fail.user_of(diagnostic_kind.ASM_SYNTAX, fail.join(a, "an asm block of '", name, "': ", r.parsed)); }
+    if (sel r.leaves) {
+        ret fail.user_of(diagnostic_kind.ASM_UNSUPPORTED, fail.join(a, "an asm block of '", name, "' leaves itself by a jump, a return or a fault, where mirl compiles only a block that falls through, calls or traps and comes back"));
+    }
+    if (sel r.operands) { ret fail.user_of(diagnostic_kind.ASM_OPERAND, fail.join(a, "an asm block of '", name, "' binds more names than one block may")); }
+    if (sel r.class)    { ret fail.user_of(diagnostic_kind.ASM_OPERAND, fail.join(a, "an asm block of '", name, "' binds a name in another register class than its operand takes")); }
+    ret fail.user_of(diagnostic_kind.ASM_UNSUPPORTED, fail.join(a, "an asm block of '", name, "' binds an address as an immediate, which mirl carries no relocation for yet"));
+}
+
+# the bytes of `o` laid out in the target's object format, given back with sink.release
+pub fun object_bytes(b: *Back, a: *A.Allocator, o: *Object) res[Sink, fail.Fail] {
+    if (b.format == nil) { ret res[Sink, fail.Fail].err{fail.message("the target's system states no object format mink lays out")}; }
+    val built: res[contract.Model, Fail] = registry.from_neutral(?b.formats, b.format, a, o);
+    if (sel built.err) { ret res[Sink, fail.Fail].err{refused_by_mink(a, "mink did not lay the object out", built.err)}; }
+    var model: contract.Model = built.ok;
+    fin { val dropped: err[Fail] = contract.release(?model); }
+    val laid: res[Sink, Fail] = contract.write(?model);
+    if (sel laid.err) { ret res[Sink, fail.Fail].err{refused_by_mink(a, "mink did not write the object", laid.err)}; }
+    ret res[Sink, fail.Fail].ok{laid.ok};
+}
+
+# the object the bytes of the file `file` hold, none when mink reads no object from them
+pub fun read_object(b: *Back, a: *A.Allocator, file: str, data: *u8, len: usize) opt[Object] {
+    var input: contract.Input            = contract.Input{file: file, data: data, len: len};
+    val read:  res[contract.Model, Fail] = registry.read(?b.formats, a, ?input);
+    if (sel read.err) { ret opt[Object].none{}; }
+    var model: contract.Model = read.ok;
+    fin { val dropped: err[Fail] = contract.release(?model); }
+    var o:         Object    = object.make(a, nil, nil);
+    val converted: err[Fail] = contract.to_neutral(?model, ?b.formats.relocs, ?o);
+    if (sel converted.err) {
+        val released: err[Fail] = object.release(?o);
+        ret opt[Object].none{};
+    }
+    ret opt[Object].some{o};
+}
+
+# the section an object carries mach's cache record in. mink states no flag a link drops a
+# section by (mink#538), so the section is unreferenced and the link's collection leaves it out
+pub val RECORD_SECTION: str = ".mach.cache";
+
+# the bytes of `o` with the section `name` holding the `len` bytes at `data` added, laid out in
+# the target's format; `o` is left as it was
+pub fun object_bytes_with(b: *Back, a: *A.Allocator, o: *Object, name: str, data: *u8, len: usize) res[Sink, fail.Fail] {
+    val copied: res[Object, Fail] = object.copy(a, o);
+    if (sel copied.err) { ret res[Sink, fail.Fail].err{refused_by_mink(a, "mink did not copy the object", copied.err)}; }
+    var c: Object = copied.ok;
+    fin { release_object(?c); }
+    val named: res[Id[Name], Fail] = object.name_str(?c, name);
+    if (sel named.err) { ret res[Sink, fail.Fail].err{refused_by_mink(a, "mink did not name the section", named.err)}; }
+    val held: res[object.Contents, Fail] = object.own(?c, data, len);
+    if (sel held.err) { ret res[Sink, fail.Fail].err{refused_by_mink(a, "mink did not hold the section", held.err)}; }
+    val added: res[Id[object.Section], Fail] = object.add_section(?c, object.Section{
+        name:        opt[Id[Name]].some{named.ok},
+        kind:        ?section.METADATA,
+        flags:       0,
+        align:       1,
+        entsize:     0,
+        contents:    held.ok,
+        owner:       opt[Id[object.Section]].none{},
+        group:       opt[Id[object.Group]].none{},
+        disposition: ?section.WHOLE,
+        priority:    opt[u32].none{}
+    });
+    if (sel added.err) { ret res[Sink, fail.Fail].err{refused_by_mink(a, "mink did not add the section", added.err)}; }
+    ret object_bytes(b, a, ?c);
+}
+
+# the bytes of the first section of `o` named `name`, nil and zero for none
+pub fun section_bytes(o: *Object, name: str, len: *usize) *u8 {
+    @len = 0;
+    val n: usize = table.count[object.Section](?o.sections);
+    var i: usize = 0;
+    for (i < n) {
+        val sec: *object.Section = ?table.items[object.Section](?o.sections)[i];
+        if (sel sec.name.some) {
+            val spelled: View = object.name_of(o, sec.name.some);
+            if (view_eq_str(spelled, name)) {
+                val held: Bytes = object.bytes(o, ?sec.contents);
+                @len = held.len;
+                ret held.data;
+            }
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+pub fun release_object(o: *Object) {
+    val released: err[Fail] = object.release(o);
+}
+
+# how many symbols `o` holds
+pub fun symbol_count(o: *Object) usize {
+    ret table.count[object.Symbol](?o.symbols);
+}
+
+# whether symbol `i` of `o` is one the object defines and links outside it
+pub fun exported(o: *Object, i: usize) bool {
+    val s: *object.Symbol = ?table.items[object.Symbol](?o.symbols)[i];
+    if (s.binding == ?symbol.LOCAL) { ret false; }
+    ret sel s.def.placed || sel s.def.absolute || sel s.def.common;
+}
+
+# a copy of `o` in which its definition of `name`, when it has a global one, yields to
+# another as a weak definition; none when `o` defines no such symbol
+pub fun weakened(a: *A.Allocator, o: *Object, name: str) res[opt[Object], fail.Fail] {
+    var at: usize = symbol_count(o);
+    var i:  usize = 0;
+    for (i < symbol_count(o)) {
+        val s: *object.Symbol = ?table.items[object.Symbol](?o.symbols)[i];
+        if (s.binding == ?symbol.GLOBAL && sel s.def.placed && view_eq_str(symbol_name(o, i), name)) {
+            at = i;
+            brk;
+        }
+        i = i + 1;
+    }
+    if (at == symbol_count(o)) { ret res[opt[Object], fail.Fail].ok{opt[Object].none{}}; }
+    val copied: res[Object, Fail] = object.copy(a, o);
+    if (sel copied.err) { ret res[opt[Object], fail.Fail].err{refused_by_mink(a, "mink did not copy the object", copied.err)}; }
+    var c: Object = copied.ok;
+    table.items[object.Symbol](?c.symbols)[at].binding = ?symbol.WEAKLY;
+    ret res[opt[Object], fail.Fail].ok{opt[Object].some{c}};
+}
+
+# the name of symbol `i` of `o`
+pub fun symbol_name(o: *Object, i: usize) View {
+    ret object.name_of(o, table.items[object.Symbol](?o.symbols)[i].name);
+}
+
+# the image of `kind` in `format` mink links from the `count` sources at `sources`, named `output` where
+# its format records a name, its unreferenced sections left out with `gc`
+pub fun link(b: *Back, a: *A.Allocator, kind: *output.Kind, format: *Format, sources: *Source, count: usize, output_path: str, gc: bool) res[Sink, fail.Fail] {
+    if (format == nil)      { ret res[Sink, fail.Fail].err{fail.message("the target's system states no image format mink links")}; }
+    if (b.assembled == nil) { ret res[Sink, fail.Fail].err{fail.message("no owner assembles a mirl target for this cell yet, so it has no back end")}; }
+    # the image runs on the system the cell's target names, which its objects do not state
+    val t:      *mirl_record.Target = ?b.assembled.target;
+    val target: mink_target.Target  = mink_target.Target{
+        arch:      t.arch,
+        system:    opt[*mink_os.System].some{t.system},
+        env:       t.env,
+        version:   opt[mink_os.Version].none{},
+        sdk:       opt[mink_os.Version].none{},
+        subsystem: opt[*mink_subsystem.Subsystem].none{}
+    };
+    val o: Options = Options{
+        kind:             kind,
+        format:           format,
+        target:           target,
+        entry:            nil,
+        keep:             nil,
+        keep_count:       0,
+        gc_sections:      opt[bool].some{gc},
+        keep_temporaries: opt[bool].none{},
+        tail_merge:       opt[bool].none{},
+        output:           output_path,
+        sign:             opt[bool].none{},
+        state:            nil
+    };
+    var notes: Sink = sink.make(a, LITTLE);
+    fin { val freed: err[Fail] = sink.release(?notes); }
+    val linked: res[Sink, Fail] = state.link(a, ?b.formats, o, sources, count, ?notes);
+    if (sel linked.err) { ret res[Sink, fail.Fail].err{fail.as_user(diagnostic_kind.LINK_INPUT_INVALID, refused_by_mink(a, "the link failed", linked.err))}; }
+    ret res[Sink, fail.Fail].ok{linked.ok};
+}

@@ -180,26 +180,10 @@ pub val DEBUG: FlagSpec = FlagSpec;
 
 `--debug`, the profile's `debug = true` for this invocation
 
-## val PASS
-
-```mach
-pub val PASS: FlagSpec = FlagSpec;
-```
-
-`--pass <name>`, a member added to the profile's pass set
-
-## val SKIP
-
-```mach
-pub val SKIP: FlagSpec = FlagSpec;
-```
-
-`--skip <name>`, a member left out of it
-
 ## val LEVERS_N
 
 ```mach
-pub val LEVERS_N: usize = 11
+pub val LEVERS_N: usize = 7
 ```
 
 row count of LEVERS

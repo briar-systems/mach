@@ -6,6 +6,82 @@
 pub rec LoopFrame;
 ```
 
+## rec Machine
+
+```mach
+pub rec Machine;
+```
+
+the target lowering builds for: the tuple its modules are named for, the target mirl
+assembled from it, and the context the build's selection opened, none for a target with
+no baseline
+slots: the address space the target's frame slots live in
+
+## fun machine_of
+
+```mach
+pub fun machine_of(x: *target_owner.Assembled) res[Machine, fail.Fail];
+```
+
+the machine of a target the owners assembled, borrowing it
+
+## rec FnInfo
+
+```mach
+pub rec FnInfo;
+```
+
+what the driver reads of a lowered module beside its mirl module: its name and, for
+each function of the module by index, what mach declared it as
+
+test: a test, run by the dispatcher under `name`
+noreturn: it never returns, so falling off its end is unreachable
+defined: the module gives it a body
+
+## rec Unit
+
+```mach
+pub rec Unit;
+```
+
+what mach keeps of a lowered module once its mirl module is compiled and gone: its name
+and the facts of its functions
+
+exports: the linkage names a root-project `fwd` puts on a shared library's surface,
+         which another module of the image defines
+
+## fun unit_init
+
+```mach
+pub fun unit_init(a: *A.Allocator, name: intern.StrId, root_project: bool) Unit;
+```
+
+an empty unit named `name`, its facts held in `a`
+
+## fun unit_dnit
+
+```mach
+pub fun unit_dnit(u: *Unit);
+```
+
+release a unit's facts
+
+## fun module_init
+
+```mach
+pub fun module_init(a: *A.Allocator, machine: *Machine) res[mirl_module.Module, fail.Fail];
+```
+
+an empty mirl module in `a`, built for the machine's target and stated as mach's
+
+## fun fn_info
+
+```mach
+pub fun fn_info(u: *Unit, f: u32) opt[*FnInfo];
+```
+
+the facts of function `f` of a unit, none past its functions
+
 ## rec NormalObject
 
 ```mach
@@ -46,6 +122,20 @@ element's index in it, where the element is stored
 ```mach
 pub rec ScopeMark;
 ```
+
+## rec ClassCopy
+
+```mach
+pub rec ClassCopy;
+```
+
+a copy of a function whose pointer parameters take the classes its call sites pass,
+lowered into this module once the module's own declarations are
+
+origin: the module that declares the function
+decl: its declaration there
+name: the copy's linkage name, the function's own with the classes it takes
+sig: the copy's signature
 
 ## rec LowerRequest
 
@@ -88,6 +178,7 @@ pub fun request(
 s: *session.Session,
 l: *linkage.Linkage,
 tgt: *resolved.Target,
+machine: *Machine,
 malloc: *A.Allocator,
 a: *ast.Ast,
 fqn: intern.StrId,
@@ -118,7 +209,7 @@ pub fun scope_leave(lc: *LowerContext, mark: ScopeMark) err[fail.Fail];
 ## fun init_context
 
 ```mach
-pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *me_ir.Module) err[fail.Fail];
+pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *mirl_module.Module, unit: *Unit) err[fail.Fail];
 ```
 
 ## fun dnit_context
@@ -299,6 +390,15 @@ pub fun resolve_layout_intrinsic(lc: *LowerContext, eid: u32) res[opt[comptime.C
 a lowering capability; a nil context, which the capability check refuses before any call,
 answers as an evaluation with no lowering would
 
+## fun member_offset
+
+```mach
+pub fun member_offset(lc: *LowerContext, tid: type.TypeId, ir: Type, index: u32) res[u64, fail.Fail];
+```
+
+the byte offset of field or case `index` of the source type `tid`, lowered as `ir`: a
+record's field, a union's member at zero, or a tag case's payload
+
 ## fun field_offset
 
 ```mach
@@ -318,25 +418,13 @@ the type store a comptime evaluation during lowering reads
 ## fun begin_function
 
 ```mach
-pub fun begin_function(lc: *LowerContext, fn_index: u32, ret_type: ir_type.IrTypeId);
-```
-
-## rec LocalBinding
-
-```mach
-pub rec LocalBinding;
+pub fun begin_function(lc: *LowerContext, fn_index: u32, ret_type: Type);
 ```
 
 ## fun bind_local
 
 ```mach
-pub fun bind_local(lc: *LowerContext, sym: resolve.SymbolId, v: value.Value, secrecy: ct.BindSecrecy) err[fail.Fail];
-```
-
-## fun local_binding
-
-```mach
-pub fun local_binding(lc: *LowerContext, sym: resolve.SymbolId) opt[LocalBinding];
+pub fun bind_local(lc: *LowerContext, sym: resolve.SymbolId, v: value.Value) err[fail.Fail];
 ```
 
 ## fun lookup_local
@@ -348,7 +436,7 @@ pub fun lookup_local(lc: *LowerContext, sym: resolve.SymbolId) opt[value.Value];
 ## fun push_loop
 
 ```mach
-pub fun push_loop(lc: *LowerContext, header: me_ir.BlockId, exit: me_ir.BlockId) err[fail.Fail];
+pub fun push_loop(lc: *LowerContext, header: id.Block, exit: id.Block) err[fail.Fail];
 ```
 
 ## fun pop_loop
@@ -387,21 +475,115 @@ pub fun fin_at(lc: *LowerContext, i: u32) ast_id.StmtId;
 pub fun pop_fins_to(lc: *LowerContext, mark: u32);
 ```
 
+## val TAG_DISCRIMINANT
+
+```mach
+pub val TAG_DISCRIMINANT: u32 = 0
+```
+
+a tag lowers to a structure of its discriminant and, when a case holds a payload, the
+union of the payloads, which every payload starts at
+
+## val TAG_PAYLOAD
+
+```mach
+pub val TAG_PAYLOAD:      u32 = 1
+```
+
+## fun ptr_or_none
+
+```mach
+pub fun ptr_or_none(lc: *LowerContext) Type;
+```
+
+the pointer type, which every address is held in
+
+## fun byte_type
+
+```mach
+pub fun byte_type(lc: *LowerContext) Type;
+```
+
+the byte type, which a global another module defines is declared as when only its
+address is taken
+
+## fun builder_state
+
+```mach
+pub fun builder_state(lc: *LowerContext) err[fail.Fail];
+```
+
+the first refusal the builder met, which every builder call after it skips
+
+## fun int_type
+
+```mach
+pub fun int_type(lc: *LowerContext, bits: u32) res[Type, fail.Fail];
+```
+
+## fun ptr_type
+
+```mach
+pub fun ptr_type(lc: *LowerContext) res[Type, fail.Fail];
+```
+
 ## fun lower_type
 
 ```mach
-pub fun lower_type(lc: *LowerContext, tid: type.TypeId) res[ir_type.IrTypeId, fail.Fail];
+pub fun lower_type(lc: *LowerContext, tid: type.TypeId) res[Type, fail.Fail];
 ```
+
+the mirl type a value of the source type `tid` is held in
+
+## fun tag_case_has_payload
+
+```mach
+pub fun tag_case_has_payload(lc: *LowerContext, tid: type.TypeId, i: u32) bool;
+```
+
+whether case `i` of the tag `tid` holds a payload
+
+## fun tag_payload_member
+
+```mach
+pub fun tag_payload_member(lc: *LowerContext, tid: type.TypeId, i: u32) u32;
+```
+
+the member of the payload union case `i` of the tag `tid` is laid out as
+
+## fun tag_disc_type
+
+```mach
+pub fun tag_disc_type(lc: *LowerContext, tid: type.TypeId) res[Type, fail.Fail];
+```
+
+the integer a tag's discriminant is held in
+
+## fun storage_align
+
+```mach
+pub fun storage_align(lc: *LowerContext, tid: type.TypeId, ir: Type) u64;
+```
+
+the alignment a value of the source type `tid`, held in `ir`, is stored at: a decorated
+record's, else the target's
+
+## fun slot_for
+
+```mach
+pub fun slot_for(lc: *LowerContext, tid: type.TypeId, ir: Type) res[value.Value, fail.Fail];
+```
+
+a stack slot for a value of the source type `tid`, held in `ir`
 
 ## fun debug_type_of
 
 ```mach
-pub fun debug_type_of(lc: *LowerContext, tid: type.TypeId) res[ir_debug.TypeId, fail.Fail];
+pub fun debug_type_of(lc: *LowerContext, tid: type.TypeId) res[opt[mirl_debug.Type], fail.Fail];
 ```
 
-the debug type a debug record names for source type `tid`, as substituted for
-the code being lowered; TYPE_NIL when this lowering keeps no debug information
-or nothing describes the type
+the debug type a debug record names for source type `tid`, as substituted for the code
+being lowered; none when this lowering keeps no debug information
 
 ## fun debug_types_finish
 
@@ -409,9 +591,9 @@ or nothing describes the type
 pub fun debug_types_finish(lc: *LowerContext) err[fail.Fail];
 ```
 
-describes every pointee left waiting: one that holds by value an instance of
-an expansive generic this module describes no value of stays untyped, since
-such a generic has unboundedly many instances behind its pointers
+describe every pointee left waiting, then link the table. an instance of an expansive
+generic the module describes no value of stays undescribed past its pointer, since such
+a generic has unboundedly many instances behind its pointers, and is described opaque
 
 ## fun block_terminated
 
@@ -419,10 +601,12 @@ such a generic has unboundedly many instances behind its pointers
 pub fun block_terminated(lc: *LowerContext) bool;
 ```
 
+whether the block being built already ends
+
 ## fun is_void_ir
 
 ```mach
-pub fun is_void_ir(lc: *LowerContext, tid: ir_type.IrTypeId) bool;
+pub fun is_void_ir(lc: *LowerContext, tid: Type) bool;
 ```
 
 ## fun expr_type_of
@@ -459,22 +643,6 @@ pub fun type_is_secret(lc: *LowerContext, tid: type.TypeId) bool;
 ```mach
 pub fun type_contains_secret(lc: *LowerContext, tid: type.TypeId) bool;
 ```
-
-## fun type_carries_secret
-
-```mach
-pub fun type_carries_secret(lc: *LowerContext, tid: type.TypeId) bool;
-```
-
-## fun bind_secrecy_of
-
-```mach
-pub fun bind_secrecy_of(lc: *LowerContext, tid: type.TypeId) ct.BindSecrecy;
-```
-
-the secrecy an inline-asm binding of this type carries: its own storage (`^usize`,
-`^*T`) and, for a pointer, whether the pointee reaches a secret (`*^T`, `**^T`,
-`*rec{ k: ^u32 }`); a pointer to a secret is a public address and a secret load
 
 ## fun substitute_type
 
@@ -545,7 +713,7 @@ pub fun decl_ret_sem(lc: *LowerContext, did: ast_id.DeclId) type.TypeId;
 ## fun function_return_ir
 
 ```mach
-pub fun function_return_ir(lc: *LowerContext, did: ast_id.DeclId) res[ir_type.IrTypeId, fail.Fail];
+pub fun function_return_ir(lc: *LowerContext, did: ast_id.DeclId) res[Type, fail.Fail];
 ```
 
 ## rec FnSig
@@ -554,8 +722,8 @@ pub fun function_return_ir(lc: *LowerContext, did: ast_id.DeclId) res[ir_type.Ir
 pub rec FnSig;
 ```
 
-a function's signature and the extension each parameter declares, which the
-signless signature does not carry
+a function's signature: its parameters and result, each narrow integer stating the
+extension its source type's signedness gives it
 
 ## fun lower_fn_sig
 
@@ -563,22 +731,29 @@ signless signature does not carry
 pub fun lower_fn_sig(lc: *LowerContext, did: ast_id.DeclId) res[FnSig, fail.Fail];
 ```
 
-the signature of the semantic type `tid` and, when it is a function type,
-its parameters' extensions
+the signature of the function `did` declares
 
-## fun fun_type_ext
+## fun fn_sig_of_type
 
 ```mach
-pub fun fun_type_ext(lc: *LowerContext, tid: type.TypeId) res[ir_type.ExtListId, fail.Fail];
+pub fun fn_sig_of_type(lc: *LowerContext, tid: type.TypeId) res[FnSig, fail.Fail];
 ```
 
-the extensions the parameters of the semantic function type `tid` declare,
-EXT_LIST_EMPTY for any other type
+the signature a value of the source function type `tid` is called through
+
+## fun ext_of
+
+```mach
+pub fun ext_of(lc: *LowerContext, sem: type.TypeId) types.Extension;
+```
+
+the extension a convention gives an integer narrower than a register: its declared
+signedness. a bool is a byte read unsigned
 
 ## fun pack_instance_sig
 
 ```mach
-pub fun pack_instance_sig(lc: *LowerContext, fn_ty: type.TypeId, types: *type.TypeId, type_len: u32) res[FnSig, fail.Fail];
+pub fun pack_instance_sig(lc: *LowerContext, fn_ty: type.TypeId, elems: *type.TypeId, elem_len: u32) res[FnSig, fail.Fail];
 ```
 
 the signature of a pack instance of the function typed `fn_ty`: its fixed parameters, then
@@ -609,18 +784,21 @@ the source of the module in scope, read when the scope was made
 ## fun declared_op
 
 ```mach
-pub fun declared_op(lc: *LowerContext, d: Declared, out_op: *u32) u32;
+pub fun declared_op(lc: *LowerContext, d: Declared) opt[*target_definition.Op];
 ```
 
-the operation of the selected target an `#[op]` function stands for, NO_OP_SET for any other
+the operation of the selected target an `#[op]` function stands for, none for any other
 
 ## fun emit_dbg_birth
 
 ```mach
-pub fun emit_dbg_birth(lc: *LowerContext, name_span: lang_source.Span, ty: ir_type.IrTypeId,
-ty_sem: type.TypeId, is_param: bool, val_v: value.Value,
+pub fun emit_dbg_birth(lc: *LowerContext, name_span: lang_source.Span, ty_sem: type.TypeId, param: opt[u32], val_v: value.Value,
 slot: opt[value.Value]) err[fail.Fail];
 ```
+
+a source variable named at `name_span` begins: one held in a stack slot is bound to the
+slot, which describes it wherever it lives, and any other, a parameter, to its value
+from here on
 
 ## fun symbol_of
 
@@ -628,21 +806,100 @@ slot: opt[value.Value]) err[fail.Fail];
 pub fun symbol_of(lc: *LowerContext, sid: resolve.SymbolId) opt[*resolve.Symbol];
 ```
 
+## fun external_linkage
+
+```mach
+pub fun external_linkage() Linkage;
+```
+
+the linkage of a symbol another module defines, or a definition every module sees
+
+## fun add_function
+
+```mach
+pub fun add_function(lc: *LowerContext, data: FunctionData, info: FnInfo) res[u32, fail.Fail];
+```
+
+add a function to the module with what mach declares of it
+
+## fun function_named
+
+```mach
+pub fun function_named(lc: *LowerContext, name: intern.StrId) opt[u32];
+```
+
+the function of the module named `name`, none when no function is
+
+## fun global_named
+
+```mach
+pub fun global_named(lc: *LowerContext, name: intern.StrId) opt[u32];
+```
+
+the global of the module named `name`, none when no global is
+
+## fun export_add
+
+```mach
+pub fun export_add(lc: *LowerContext, name: intern.StrId) err[fail.Fail];
+```
+
+put `name` on the shared library's export surface
+
+## fun define_function
+
+```mach
+pub fun define_function(lc: *LowerContext, data: FunctionData, info: FnInfo) res[u32, fail.Fail];
+```
+
+the module's definition of a function: a reference earlier in the module declared it,
+and the definition takes the declaration's place
+
+## fun define_global
+
+```mach
+pub fun define_global(lc: *LowerContext, g: GlobalData) res[u32, fail.Fail];
+```
+
+the module's definition of a global, in place of a declaration a reference made
+
 ## fun ensure_extern_function
 
 ```mach
-pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: FnSig, import_flag: bool) res[u32, fail.Fail];
+pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: FnSig) res[u32, fail.Fail];
 ```
+
+the module's function `name`, declared here when another module defines it
+
+## fun class_copy
+
+```mach
+pub fun class_copy(lc: *LowerContext, origin: session.ModuleId, decl: ast_id.DeclId, base: intern.StrId, sig: Type) res[u32, fail.Fail];
+```
+
+the copy of the function `decl` of `origin`, linked as `base`, whose pointer parameters
+take the classes `sig` states, declared here and lowered once the module's own
+declarations are. one name is one copy, so a copy asked for twice is asked for once
 
 ## fun ensure_extern_global
 
 ```mach
-pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: ir_type.IrTypeId, import_flag: bool) res[u32, fail.Fail];
+pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type) res[u32, fail.Fail];
 ```
 
-## fun add_rodata_bytes
+the module's global `name` of `ty`, declared here when another module defines it
+
+## fun add_global
 
 ```mach
-pub fun add_rodata_bytes(lc: *LowerContext, init: value.Value, pty: ir_type.IrTypeId) res[value.Value, fail.Fail];
+pub fun add_global(lc: *LowerContext, g: GlobalData) res[u32, fail.Fail];
 ```
+
+## fun constant_global
+
+```mach
+pub fun constant_global(lc: *LowerContext, v: value.Value) res[value.Value, fail.Fail];
+```
+
+a read-only global of the module's own holding the constant `v`, whose address is the value
 

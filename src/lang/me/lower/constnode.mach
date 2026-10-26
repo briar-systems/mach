@@ -1,9 +1,13 @@
 # a published constant value laid out as the constant bytes of its type: a record's fields at
 # their offsets, a tag's case code and payload, an array's or a vector's elements at the
 # element stride, a string leaf as a pointer to its bytes, and an address as a relocation
-# against the symbol it points into
-use mach.lang.growth;
+# against the symbol it points into. the bytes become one mirl constant: runs of bytes
+# between the addresses, each address at its offset
+use std.collections.slice.Slice;
+use collections_vector: std.collections.vector;
+use std.types.bool.bool;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
@@ -15,52 +19,205 @@ use A: std.allocator;
 use mach.lang.fail;
 use mach.lang.fe.comptime;
 use comptime_deep: mach.lang.fe.comptime.deep;
+use mach.lang.fe.resolve;
 use mach.lang.float;
 use mach.lang.intern;
-use ir_type: mach.lang.me.ir.type;
-use mach.lang.me.ir.value;
 use lower_context: mach.lang.me.lower.context;
+use mach.lang.me.lower.irt;
 use mach.lang.me.lower.mangle;
+use mach.lang.me.lower.value;
 use mach.lang.module;
 use mach.lang.session;
-use mach.lang.target.resolved;
 use mach.lang.type;
 use mach.lang.wide;
 
-rec Relocs {
-    data: *value.AggReloc;
-    len:  u32;
-    cap:  u32;
+use mbuild: mirl.build;
+use mirl.ir.constant.Address;
+use mirl.ir.constant.Aggregate;
+use mirl.ir.constant.Bits;
+use mirl.ir.constant.ConstantData;
+use mirl.ir.id;
+use mirl_module: mirl.ir.module;
+use mirl.ir.type.Type;
+
+# an address the bytes hold at `offset`
+rec Reloc {
+    offset: u64;
+    symbol: id.Symbol;
+    addend: i64;
 }
 
-# node `node` of `store` as a constant of the IR type `ity`
-pub fun aggregate(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, node: u32, ity: ir_type.IrTypeId) res[value.Value, fail.Fail] {
-    val size: u32 = ir_type.byte_size_for_machine(?ctx.m.types, ity, resolved.layout_machine(ctx.tgt));
-    if (size == 0) { ret res[value.Value, fail.Fail].err{fail.message("lower: a constant value has a type with no size")}; }
-    val res_blob: res[*u8, A.Error] = A.zallocate[u8](ctx.m.alloc, size::usize);
+# the bytes of a constant being laid out and the addresses among them
+rec Image {
+    blob:   *u8;
+    size:   u64;
+    relocs: collections_vector.Vector[Reloc];
+}
+
+fun size_of(ctx: *lower_context.LowerContext, ty: Type) res[u64, fail.Fail] {
+    ret irt.size(?ctx.builder.layout, ty);
+}
+
+# node `node` of `store` as a constant of the mirl type `ity`, which a global of `ity` is
+# initialised with
+pub fun aggregate(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, node: u32, ity: Type) res[value.Value, fail.Fail] {
+    val size: res[u64, fail.Fail] = size_of(ctx, ity);
+    if (sel size.err) { ret res[value.Value, fail.Fail].err{size.err}; }
+    if (size.ok == 0) { ret res[value.Value, fail.Fail].err{fail.message("lower: a constant value has a type with no size")}; }
+    val res_blob: res[*u8, A.Error] = A.zallocate[u8](ctx.s.alloc, size.ok::usize);
     if (sel res_blob.err) { ret res[value.Value, fail.Fail].err{fail.refused(res_blob.err)}; }
-    val blob:   *u8            = res_blob.ok;
-    var relocs: Relocs         = Relocs{data: nil, len: 0, cap: 0};
-    val placed: err[fail.Fail] = place(ctx, store, node, ity, blob, 0, ?relocs);
-    if (sel placed.err) {
-        A.deallocate[u8](ctx.m.alloc, blob, size::usize);
-        if (relocs.data != nil) { A.deallocate[value.AggReloc](ctx.m.alloc, relocs.data, relocs.cap::usize); }
-        ret res[value.Value, fail.Fail].err{placed.err};
+    var image: Image = Image{blob: res_blob.ok, size: size.ok, relocs: collections_vector.init[Reloc](ctx.s.alloc)};
+    fin {
+        A.deallocate[u8](ctx.s.alloc, image.blob, image.size::usize);
+        collections_vector.dnit[Reloc](?image.relocs);
     }
-    ret res[value.Value, fail.Fail].ok{value.const_agg(blob, size, relocs.data, relocs.len, relocs.cap, ity)};
+    val placed: err[fail.Fail] = place(ctx, store, node, ity, 0, ?image);
+    if (sel placed.err) { ret res[value.Value, fail.Fail].err{placed.err}; }
+    val made: res[id.Constant, fail.Fail] = constant_of_image(ctx, ?image, ity);
+    if (sel made.err) { ret res[value.Value, fail.Fail].err{made.err}; }
+    ret res[value.Value, fail.Fail].ok{value.constant(made.ok, constant_type(ctx, made.ok, ity))};
 }
 
-fun place(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, node: u32, ity: ir_type.IrTypeId, blob: *u8, base: u32, relocs: *Relocs) err[fail.Fail] {
+# the type a constant made from an image holds: the image's own when it is no constant of `ity`
+fun constant_type(ctx: *lower_context.LowerContext, c: id.Constant, ity: Type) Type {
+    val held: res[Type, mirl_module.Error] = mirl_module.constant_type(ctx.m, c);
+    if (sel held.ok) { ret held.ok; }
+    ret ity;
+}
+
+# bytes as one constant: zero when every byte is, an address when one address fills them,
+# else a structure of byte runs and the addresses between them
+fun constant_of_image(ctx: *lower_context.LowerContext, image: *Image, ity: Type) res[id.Constant, fail.Fail] {
+    val ptr: Type = lower_context.ptr_or_none(ctx);
+    if (image.relocs.len == 0 && all_zero(image.blob, image.size)) {
+        ret made(ctx, ConstantData.zero{ity});
+    }
+    val psize: res[u64, fail.Fail] = size_of(ctx, ptr);
+    if (sel psize.err) { ret res[id.Constant, fail.Fail].err{psize.err}; }
+    if (image.relocs.len == 1 && image.size == psize.ok && image.relocs.data[0].offset == 0 && irt.is_ptr(?ctx.m.types, ity)) {
+        val r: Reloc = image.relocs.data[0];
+        ret made(ctx, ConstantData.address{Address{type: ptr, symbol: r.symbol, offset: r.addend}});
+    }
+
+    var members:  collections_vector.Vector[Type]        = collections_vector.init[Type](ctx.s.alloc);
+    var offsets:  collections_vector.Vector[u64]         = collections_vector.init[u64](ctx.s.alloc);
+    var elements: collections_vector.Vector[id.Constant] = collections_vector.init[id.Constant](ctx.s.alloc);
+    fin {
+        collections_vector.dnit[Type](?members);
+        collections_vector.dnit[u64](?offsets);
+        collections_vector.dnit[id.Constant](?elements);
+    }
+    var at: u64   = 0;
+    var r:  usize = 0;
+    for (at < image.size) {
+        var end: u64 = image.size;
+        if (r < image.relocs.len) { end = image.relocs.data[r].offset; }
+        if (end > at) {
+            val run: res[Pair, fail.Fail] = byte_run(ctx, image.blob, at, end - at);
+            if (sel run.err) { ret res[id.Constant, fail.Fail].err{run.err}; }
+            val pushed: err[fail.Fail] = member_add(?members, ?offsets, ?elements, run.ok.ty, at, run.ok.c);
+            if (sel pushed.err) { ret res[id.Constant, fail.Fail].err{pushed.err}; }
+            at = end;
+        }
+        if (r < image.relocs.len) {
+            val rl:   Reloc                       = image.relocs.data[r];
+            val addr: res[id.Constant, fail.Fail] = made(ctx, ConstantData.address{Address{type: ptr, symbol: rl.symbol, offset: rl.addend}});
+            if (sel addr.err) { ret addr; }
+            val pushed: err[fail.Fail] = member_add(?members, ?offsets, ?elements, ptr, at, addr.ok);
+            if (sel pushed.err) { ret res[id.Constant, fail.Fail].err{pushed.err}; }
+            at = at + psize.ok;
+            r  = r + 1;
+        }
+    }
+    val st: res[Type, fail.Fail] = irt.structure_at(?ctx.m.types, members.data, offsets.data, members.len::u32);
+    if (sel st.err) { ret res[id.Constant, fail.Fail].err{st.err}; }
+    ret made(ctx, ConstantData.aggregate{Aggregate{type: st.ok, elements: Slice[id.Constant]{data: elements.data, size: elements.len}}});
+}
+
+rec Pair {
+    ty: Type;
+    c:  id.Constant;
+}
+
+fun member_add(members: *collections_vector.Vector[Type], offsets: *collections_vector.Vector[u64], elements: *collections_vector.Vector[id.Constant],
+    ty: Type, at: u64, c: id.Constant) err[fail.Fail] {
+    val m: res[usize, A.Error] = collections_vector.push[Type](members, ty);
+    if (sel m.err) { ret err[fail.Fail].err{fail.refused(m.err)}; }
+    val o: res[usize, A.Error] = collections_vector.push[u64](offsets, at);
+    if (sel o.err) { ret err[fail.Fail].err{fail.refused(o.err)}; }
+    val e: res[usize, A.Error] = collections_vector.push[id.Constant](elements, c);
+    if (sel e.err) { ret err[fail.Fail].err{fail.refused(e.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# `len` bytes from `at` as a byte array constant
+fun byte_run(ctx: *lower_context.LowerContext, blob: *u8, at: u64, len: u64) res[Pair, fail.Fail] {
+    val i8t: res[Type, fail.Fail] = irt.int(?ctx.m.types, 8);
+    if (sel i8t.err) { ret res[Pair, fail.Fail].err{i8t.err}; }
+    val arr: res[Type, fail.Fail] = irt.array(?ctx.m.types, i8t.ok, len);
+    if (sel arr.err) { ret res[Pair, fail.Fail].err{arr.err}; }
+    if (all_zero((blob::usize + at::usize)::*u8, len)) {
+        val z: res[id.Constant, fail.Fail] = made(ctx, ConstantData.zero{arr.ok});
+        if (sel z.err) { ret res[Pair, fail.Fail].err{z.err}; }
+        ret res[Pair, fail.Fail].ok{Pair{ty: arr.ok, c: z.ok}};
+    }
+    var bytes: collections_vector.Vector[id.Constant] = collections_vector.init[id.Constant](ctx.s.alloc);
+    fin { collections_vector.dnit[id.Constant](?bytes); }
+    var each: [256]u32;
+    var c:    u32 = 0;
+    for (c < 256) {
+        each[c] = 0xFFFFFFFF;
+        c       = c + 1;
+    }
+    var i: u64 = 0;
+    for (i < len) {
+        val bv: u32 = blob[at + i]::u32;
+        if (each[bv] == 0xFFFFFFFF) {
+            var word: [1]u64                      = [1]u64{bv::u64};
+            val one:  res[id.Constant, fail.Fail] = made(ctx, ConstantData.integer{Bits{type: i8t.ok, words: Slice[u64]{data: ?word[0], size: 1}}});
+            if (sel one.err) { ret res[Pair, fail.Fail].err{one.err}; }
+            each[bv] = one.ok.index;
+        }
+        val pushed: res[usize, A.Error] = collections_vector.push[id.Constant](?bytes, id.Constant{index: each[bv]});
+        if (sel pushed.err) { ret res[Pair, fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    val agg: res[id.Constant, fail.Fail] = made(ctx, ConstantData.aggregate{Aggregate{type: arr.ok, elements: Slice[id.Constant]{data: bytes.data, size: bytes.len}}});
+    if (sel agg.err) { ret res[Pair, fail.Fail].err{agg.err}; }
+    ret res[Pair, fail.Fail].ok{Pair{ty: arr.ok, c: agg.ok}};
+}
+
+# bytes as a constant of their own: a byte array, which a string leaf and an embedded file are
+pub fun bytes_constant(ctx: *lower_context.LowerContext, data: *u8, len: u64) res[value.Value, fail.Fail] {
+    val run: res[Pair, fail.Fail] = byte_run(ctx, data, 0, len);
+    if (sel run.err) { ret res[value.Value, fail.Fail].err{run.err}; }
+    ret res[value.Value, fail.Fail].ok{value.constant(run.ok.c, run.ok.ty)};
+}
+
+fun made(ctx: *lower_context.LowerContext, data: ConstantData) res[id.Constant, fail.Fail] {
+    val c:   id.Constant    = mbuild.constant(?ctx.builder.mb, data);
+    val why: err[fail.Fail] = lower_context.builder_state(ctx);
+    if (sel why.err) { ret res[id.Constant, fail.Fail].err{why.err}; }
+    ret res[id.Constant, fail.Fail].ok{c};
+}
+
+fun all_zero(blob: *u8, len: u64) bool {
+    var i: u64 = 0;
+    for (i < len) {
+        if (blob[i] != 0) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun place(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, node: u32, ity: Type, base: u64, image: *Image) err[fail.Fail] {
     val n: *comptime_deep.Node = comptime_deep.node_at(store, node);
-    if (n.kind == comptime_deep.NODE_REFUSED) { ret err[fail.Fail].err{fail.message("lower: a constant value holds a leaf with no compile-time value")}; }
-    if (n.kind == comptime_deep.NODE_ADDRESS) { ret place_address(ctx, store, n, base, relocs); }
-    val opt_t: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
-    if (sel opt_t.none) { ret err[fail.Fail].err{fail.message("lower: a constant value has an unknown IR type")}; }
-    val k: ir_type.IrTypeKind = opt_t.some.kind;
-    if (k == ir_type.IRT_TAG)                              { ret place_tag(ctx, store, n, ity, blob, base, relocs); }
-    if (k == ir_type.IRT_STRUCT || k == ir_type.IRT_UNION) { ret place_record(ctx, store, n, ity, blob, base, relocs); }
-    if (k == ir_type.IRT_ARRAY || k == ir_type.IRT_VECTOR) { ret place_elements(ctx, store, n, ity, blob, base, relocs); }
-    ret place_scalar(ctx, n, ity, blob, base, relocs);
+    if (n.kind == comptime_deep.NODE_REFUSED)                                { ret err[fail.Fail].err{fail.message("lower: a constant value holds a leaf with no compile-time value")}; }
+    if (n.kind == comptime_deep.NODE_ADDRESS)                                { ret place_address(ctx, store, n, base, image); }
+    if (n.kind == comptime_deep.NODE_LITERAL && !intern.str_is_nil(n.head))  { ret place_tag(ctx, store, n, ity, base, image); }
+    if (irt.is_struct(?ctx.m.types, ity) || irt.is_union(?ctx.m.types, ity)) { ret place_record(ctx, store, n, ity, base, image); }
+    if (irt.is_array(?ctx.m.types, ity) || irt.is_vector(?ctx.m.types, ity)) { ret place_elements(ctx, store, n, ity, base, image); }
+    ret place_scalar(ctx, n, ity, base, image);
 }
 
 # the field or case `name` declares on the semantic type `owner`
@@ -76,109 +233,134 @@ fun member_index(ctx: *lower_context.LowerContext, owner: type.TypeId, name: int
     ret opt[u32].none{};
 }
 
-# a tag holds its case code at offset zero and its payload at the common payload offset
-fun place_tag(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, n: *comptime_deep.Node, ity: ir_type.IrTypeId, blob: *u8, base: u32, relocs: *Relocs) err[fail.Fail] {
-    if (n.kind != comptime_deep.NODE_LITERAL || intern.str_is_nil(n.head)) { ret err[fail.Fail].err{fail.message("lower: a constant tag is no case literal")}; }
+# the byte offset of member `i` of the structure or union `ity`
+fun member_offset(ctx: *lower_context.LowerContext, ity: Type, i: u32) res[u64, fail.Fail] {
+    if (irt.is_union(?ctx.m.types, ity)) { ret res[u64, fail.Fail].ok{0}; }
+    ret irt.offset(?ctx.builder.layout, ity, i);
+}
+
+# a tag holds its case code in its discriminant and its payload in the union after it
+fun place_tag(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, n: *comptime_deep.Node, ity: Type, base: u64, image: *Image) err[fail.Fail] {
     val case_ix: opt[u32] = member_index(ctx, n.ty, n.head);
     if (sel case_ix.none) { ret err[fail.Fail].err{fail.message("lower: a constant tag holds a case its type does not declare")}; }
-    val opt_t: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
-    if (sel opt_t.none) { ret err[fail.Fail].err{fail.message("lower: a constant tag has an unknown IR type")}; }
-    val t: *ir_type.IrType = opt_t.some;
-    if (case_ix.some >= t.data.tag_.case_count) { ret err[fail.Fail].err{fail.message("lower: a constant tag's case exceeds its IR case count")}; }
-    write_bits(blob, base, wide.from_u64(case_ix.some::u64), ir_type.tag_discriminator_bytes(?ctx.m.types, ity));
+    val disc: Type                = irt.member(?ctx.m.types, ity, lower_context.TAG_DISCRIMINANT);
+    val dsz:  res[u64, fail.Fail] = size_of(ctx, disc);
+    if (sel dsz.err) { ret err[fail.Fail].err{dsz.err}; }
+    write_bits(image.blob, base, wide.from_u64(case_ix.some::u64), dsz.ok);
     val payload: opt[comptime_deep.Member] = comptime_deep.member_at(store, n, 0);
-    if (sel payload.none) { ret err[fail.Fail].ok{}; }
-    val payload_off: u32 = ir_type.tag_payload_offset_for_machine(?ctx.m.types, ity, resolved.layout_machine(ctx.tgt));
-    ret place(ctx, store, payload.some.node, t.data.tag_.cases[case_ix.some], blob, base + payload_off, relocs);
+    if (sel payload.none)                                             { ret err[fail.Fail].ok{}; }
+    if (!lower_context.tag_case_has_payload(ctx, n.ty, case_ix.some)) { ret err[fail.Fail].err{fail.message("lower: a constant tag holds a payload its case does not")}; }
+    val at: res[u64, fail.Fail] = irt.offset(?ctx.builder.layout, ity, lower_context.TAG_PAYLOAD);
+    if (sel at.err) { ret err[fail.Fail].err{at.err}; }
+    val payloads: Type = irt.member(?ctx.m.types, ity, lower_context.TAG_PAYLOAD);
+    val held:     Type = irt.member(?ctx.m.types, payloads, lower_context.tag_payload_member(ctx, n.ty, case_ix.some));
+    ret place(ctx, store, payload.some.node, held, base + at.ok, image);
 }
 
 # a record's named fields at their offsets; a field the literal leaves out stays zero
-fun place_record(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, n: *comptime_deep.Node, ity: ir_type.IrTypeId, blob: *u8, base: u32, relocs: *Relocs) err[fail.Fail] {
-    if (n.kind != comptime_deep.NODE_LITERAL || !intern.str_is_nil(n.head)) { ret err[fail.Fail].err{fail.message("lower: a constant record is no record literal")}; }
-    val opt_t: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
-    if (sel opt_t.none) { ret err[fail.Fail].err{fail.message("lower: a constant record has an unknown IR type")}; }
-    val t: *ir_type.IrType = opt_t.some;
-    var i: u32             = 0;
+fun place_record(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, n: *comptime_deep.Node, ity: Type, base: u64, image: *Image) err[fail.Fail] {
+    if (n.kind != comptime_deep.NODE_LITERAL) { ret err[fail.Fail].err{fail.message("lower: a constant record is no record literal")}; }
+    val count: u32 = irt.member_count(?ctx.m.types, ity);
+    var i:     u32 = 0;
     for (i < n.len) {
         val m:        comptime_deep.Member = store.members.data[n.first + i];
         val field_ix: opt[u32]             = member_index(ctx, n.ty, m.name);
-        var ix:       u32                  = t.data.struct_.field_count;
-        if (sel field_ix.some)                { ix = field_ix.some; }
-        if (ix >= t.data.struct_.field_count) { ret err[fail.Fail].err{fail.message("lower: a constant record names a field its type does not declare")}; }
-        val foff:   u32            = ir_type.byte_offset_for_machine(?ctx.m.types, ity, ix, resolved.layout_machine(ctx.tgt));
-        val placed: err[fail.Fail] = place(ctx, store, m.node, t.data.struct_.fields[ix], blob, base + foff, relocs);
+        var ix:       u32                  = count;
+        if (sel field_ix.some) { ix = field_ix.some; }
+        if (ix >= count)       { ret err[fail.Fail].err{fail.message("lower: a constant record names a field its type does not declare")}; }
+        val foff: res[u64, fail.Fail] = member_offset(ctx, ity, ix);
+        if (sel foff.err) { ret err[fail.Fail].err{foff.err}; }
+        val placed: err[fail.Fail] = place(ctx, store, m.node, irt.member(?ctx.m.types, ity, ix), base + foff.ok, image);
         if (sel placed.err) { ret placed; }
         i = i + 1;
     }
     ret err[fail.Fail].ok{};
+}
+
+# the bytes from one element of the array or vector `ity` to the next: the array's stride as
+# the layout states it, a vector's lane size
+fun element_stride(ctx: *lower_context.LowerContext, ity: Type) res[u64, fail.Fail] {
+    if (irt.is_vector(?ctx.m.types, ity)) { ret size_of(ctx, irt.element(?ctx.m.types, ity)); }
+    ret irt.stride(?ctx.builder.layout, ity);
 }
 
 # an array's or a vector's elements at the element stride; an element the literal leaves out
 # stays zero
-fun place_elements(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, n: *comptime_deep.Node, ity: ir_type.IrTypeId, blob: *u8, base: u32, relocs: *Relocs) err[fail.Fail] {
-    val opt_t: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
-    if (sel opt_t.none) { ret err[fail.Fail].err{fail.message("lower: a constant array has an unknown IR type")}; }
-    val t:     *ir_type.IrType  = opt_t.some;
-    var ety:   ir_type.IrTypeId = ir_type.IRT_NIL;
-    var count: u32              = 0;
-    if (t.kind == ir_type.IRT_VECTOR) {
-        ety   = t.data.vector_.element;
-        count = t.data.vector_.lanes;
-    }
-    or {
-        ety   = t.data.array_.element;
-        count = ir_type.array_count(?ctx.m.types, ity);
-    }
-    val stride: u32 = ir_type.byte_size_for_machine(?ctx.m.types, ety, resolved.layout_machine(ctx.tgt));
-    var i:      u32 = 0;
-    for (i < count && i < n.len) {
-        val placed: err[fail.Fail] = place(ctx, store, store.members.data[n.first + i].node, ety, blob, base + i * stride, relocs);
+fun place_elements(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, n: *comptime_deep.Node, ity: Type, base: u64, image: *Image) err[fail.Fail] {
+    val ety:   Type = irt.element(?ctx.m.types, ity);
+    var count: u64  = irt.count(?ctx.m.types, ity);
+    if (irt.is_vector(?ctx.m.types, ity)) { count = irt.lanes(?ctx.m.types, ity)::u64; }
+    val stride: res[u64, fail.Fail] = element_stride(ctx, ity);
+    if (sel stride.err) { ret err[fail.Fail].err{stride.err}; }
+    var i: u32 = 0;
+    for (i::u64 < count && i < n.len) {
+        val placed: err[fail.Fail] = place(ctx, store, store.members.data[n.first + i].node, ety, base + i::u64 * stride.ok, image);
         if (sel placed.err) { ret placed; }
         i = i + 1;
     }
     ret err[fail.Fail].ok{};
 }
 
-fun place_scalar(ctx: *lower_context.LowerContext, n: *comptime_deep.Node, ity: ir_type.IrTypeId, blob: *u8, base: u32, relocs: *Relocs) err[fail.Fail] {
+fun place_scalar(ctx: *lower_context.LowerContext, n: *comptime_deep.Node, ity: Type, base: u64, image: *Image) err[fail.Fail] {
     if (n.kind != comptime_deep.NODE_SCALAR) { ret err[fail.Fail].err{fail.message("lower: a constant scalar is an aggregate")}; }
-    val v:    comptime.CTValue = n.value;
-    val size: u32              = ir_type.byte_size_for_machine(?ctx.m.types, ity, resolved.layout_machine(ctx.tgt));
-    if (v.kind == comptime.CT_KIND_STR) { ret place_string(ctx, v.data.s, ity, base, relocs); }
-    if (size == 0 || size > 16)         { ret err[fail.Fail].err{fail.message("lower: a constant scalar has an unsupported size")}; }
+    val v:    comptime.CTValue    = n.value;
+    val size: res[u64, fail.Fail] = size_of(ctx, ity);
+    if (sel size.err)                   { ret err[fail.Fail].err{size.err}; }
+    if (v.kind == comptime.CT_KIND_STR) { ret place_string(ctx, v.data.s, base, image); }
+    if (size.ok == 0 || size.ok > 16)   { ret err[fail.Fail].err{fail.message("lower: a constant scalar has an unsupported size")}; }
     if (v.kind == comptime.CT_KIND_INT) {
-        write_bits(blob, base, v.data.w, size);
+        write_bits(image.blob, base, v.data.w, size.ok);
         ret err[fail.Fail].ok{};
     }
     if (v.kind == comptime.CT_KIND_FLOAT) {
         var bits: u64 = 0;
-        if (size == 8) { bits = float.f64_bits(v.data.f); }
-        or (size == 4) { bits = float.f64_to_f32_bits(float.f64_bits(v.data.f))::u64; }
-        or (size == 2) { bits = float.bits_at(v.data.f, float.FLOAT_W_16); }
-        or             { ret err[fail.Fail].err{fail.message("lower: a constant float has an unsupported width")}; }
-        write_bits(blob, base, wide.from_u64(bits), size);
+        if (size.ok == 8) { bits = float.f64_bits(v.data.f); }
+        or (size.ok == 4) { bits = float.f64_to_f32_bits(float.f64_bits(v.data.f))::u64; }
+        or (size.ok == 2) { bits = float.bits_at(v.data.f, float.FLOAT_W_16); }
+        or                { ret err[fail.Fail].err{fail.message("lower: a constant float has an unsupported width")}; }
+        write_bits(image.blob, base, wide.from_u64(bits), size.ok);
         ret err[fail.Fail].ok{};
     }
     ret err[fail.Fail].err{fail.message("lower: a constant leaf holds no runtime value")};
 }
 
-# a string leaf points at its bytes, which become a constant of their own
-fun place_string(ctx: *lower_context.LowerContext, text: intern.StrId, ity: ir_type.IrTypeId, base: u32, relocs: *Relocs) err[fail.Fail] {
-    val opt_bytes: opt[View] = intern.bytes(?ctx.s.interner, text);
-    if (sel opt_bytes.none) { ret err[fail.Fail].err{fail.message("lower: a constant string is not interned")}; }
-    val added: res[value.Value, fail.Fail] = lower_context.add_rodata_bytes(ctx, terminated_bytes(opt_bytes.some, ity), ity);
+# a string leaf points at its bytes, which become a global of their own
+fun place_string(ctx: *lower_context.LowerContext, text: intern.StrId, base: u64, image: *Image) err[fail.Fail] {
+    val added: res[value.Value, fail.Fail] = string_global(ctx, text);
     if (sel added.err) { ret err[fail.Fail].err{added.err}; }
-    val gv: value.Value = added.ok;
-    if (gv.kind != value.VAL_GLOBAL || gv.data.global_ix >= ctx.m.global_len) { ret err[fail.Fail].err{fail.message("lower: a constant string did not lower to a global")}; }
-    ret reloc_add(ctx, relocs, value.AggReloc{offset: base, symbol: ctx.m.globals[gv.data.global_ix].name, addend: 0, is_fn: false});
+    ret reloc_add(image, Reloc{offset: base, symbol: id.Symbol.global{id.Global{index: added.ok.index}}, addend: 0});
 }
 
-# an address is a relocation against the linkage name of the symbol it points into, offset to
-# the place its field and element steps reach
-fun place_address(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, n: *comptime_deep.Node, base: u32, relocs: *Relocs) err[fail.Fail] {
+# the read-only global holding an interned string's bytes, NULs included, and the terminator
+# the interner keeps after them; its address is the value
+pub fun string_global(ctx: *lower_context.LowerContext, text: intern.StrId) res[value.Value, fail.Fail] {
+    val opt_bytes: opt[View] = intern.bytes(?ctx.s.interner, text);
+    if (sel opt_bytes.none) { ret res[value.Value, fail.Fail].err{fail.message("lower: a constant string is not interned")}; }
+    val bytes: res[value.Value, fail.Fail] = bytes_constant(ctx, opt_bytes.some.data::*u8, (opt_bytes.some.len + 1)::u64);
+    if (sel bytes.err) { ret bytes; }
+    ret lower_context.constant_global(ctx, bytes.ok);
+}
+
+# an address is a relocation against the symbol it points into, offset to the place its field
+# and element steps reach
+fun place_address(ctx: *lower_context.LowerContext, store: *comptime_deep.Store, n: *comptime_deep.Node, base: u64, image: *Image) err[fail.Fail] {
     val mid: session.ModuleId = session.module_id_for_stable(ctx.s, module.stable_id(n.symbol.module));
     if (module.is_nil(mid)) { ret err[fail.Fail].err{fail.message("lower: a constant address names a module the session has not loaded")}; }
     val name: res[intern.StrId, fail.Fail] = mangle.declaration_linkage_name(ctx.linkage, ctx.s, mid, n.symbol.canon, n.symbol.decl);
     if (sel name.err) { ret err[fail.Fail].err{name.err}; }
+    var target: id.Symbol = id.Symbol.global{id.Global{index: 0}};
+    if (n.symbol.function) {
+        val sig: res[lower_context.FnSig, fail.Fail] = lower_context.fn_sig_of_type(ctx, n.ty);
+        if (sel sig.err) { ret err[fail.Fail].err{sig.err}; }
+        val f: res[u32, fail.Fail] = lower_context.ensure_extern_function(ctx, name.ok, sig.ok);
+        if (sel f.err) { ret err[fail.Fail].err{f.err}; }
+        target = id.Symbol.function{id.Function{index: f.ok}};
+    }
+    or {
+        val g: res[u32, fail.Fail] = lower_context.ensure_extern_global(ctx, name.ok, lower_context.byte_type(ctx));
+        if (sel g.err) { ret err[fail.Fail].err{g.err}; }
+        target = id.Symbol.global{id.Global{index: g.ok}};
+    }
     var addend: i64 = 0;
     var i:      u32 = 0;
     for (i < n.len) {
@@ -186,147 +368,35 @@ fun place_address(ctx: *lower_context.LowerContext, store: *comptime_deep.Store,
         val step:    *comptime_deep.Node  = comptime_deep.node_at(store, m.node);
         val ordinal: opt[u64]             = comptime.ct_int_u64(step.value);
         if (sel ordinal.none) { ret err[fail.Fail].err{fail.message("lower: a constant address step holds no ordinal")}; }
-        val owner: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, step.ty);
+        val owner: res[Type, fail.Fail] = lower_context.lower_type(ctx, step.ty);
         if (sel owner.err) { ret err[fail.Fail].err{owner.err}; }
         if (!intern.str_is_nil(m.name)) {
-            addend = addend + ir_type.member_offset_for_machine(?ctx.m.types, owner.ok, ordinal.some::u32, resolved.layout_machine(ctx.tgt))::i64;
+            val off: res[u64, fail.Fail] = member_offset(ctx, owner.ok, ordinal.some::u32);
+            if (sel off.err) { ret err[fail.Fail].err{off.err}; }
+            addend = addend + off.ok::i64;
         }
         or {
-            val opt_t: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, owner.ok);
-            if (sel opt_t.none) { ret err[fail.Fail].err{fail.message("lower: a constant address steps into an unknown IR type")}; }
-            var ety: ir_type.IrTypeId = opt_t.some.data.array_.element;
-            if (opt_t.some.kind == ir_type.IRT_VECTOR) { ety = opt_t.some.data.vector_.element; }
-            addend = addend + ordinal.some::i64 * ir_type.byte_size_for_machine(?ctx.m.types, ety, resolved.layout_machine(ctx.tgt))::i64;
+            val stride: res[u64, fail.Fail] = element_stride(ctx, owner.ok);
+            if (sel stride.err) { ret err[fail.Fail].err{stride.err}; }
+            addend = addend + ordinal.some::i64 * stride.ok::i64;
         }
         i = i + 1;
     }
-    ret reloc_add(ctx, relocs, value.AggReloc{offset: base, symbol: name.ok, addend: addend, is_fn: n.symbol.function});
+    ret reloc_add(image, Reloc{offset: base, symbol: target, addend: addend});
 }
 
-fun reloc_add(ctx: *lower_context.LowerContext, relocs: *Relocs, r: value.AggReloc) err[fail.Fail] {
-    val grown: err[A.Error] = growth.reserve[value.AggReloc](ctx.m.alloc, ?relocs.data, ?relocs.cap, relocs.len::usize + 1);
-    if (sel grown.err) { ret err[fail.Fail].err{fail.refused(grown.err)}; }
-    relocs.data[relocs.len] = r;
-    relocs.len              = relocs.len + 1;
+fun reloc_add(image: *Image, r: Reloc) err[fail.Fail] {
+    val pushed: res[usize, A.Error] = collections_vector.push[Reloc](?image.relocs, r);
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
     ret err[fail.Fail].ok{};
-}
-
-# an interned string as constant data: every byte it holds, NULs included,
-# then the terminator the interner keeps after them
-pub fun terminated_bytes(bytes: View, ty: ir_type.IrTypeId) value.Value {
-    ret value.const_bytes(bytes.data::*u8, (bytes.len + 1)::u32, ty);
 }
 
 # little-endian bytes of a constant: the low limb first, then the high limb
 # once the leaf is wider than 8 bytes
-fun write_bits(blob: *u8, base: u32, bits: wide.Wide, size: u32) {
-    var i: u32 = 0;
+fun write_bits(blob: *u8, base: u64, bits: wide.Wide, size: u64) {
+    var i: u64 = 0;
     for (i < size) {
-        blob[base + i] = wide.shr_u(bits, i * 8).lo::u8;
+        blob[base + i] = wide.shr_u(bits, (i * 8)::u32).lo::u8;
         i              = i + 1;
     }
-}
-
-# a 16-byte leaf lays its low limb down first, then its high limb, and a
-# narrower leaf still takes only its own bytes of the low limb
-test write_bits__sixteen_byte_leaf_is_little_endian_lo_then_hi {
-    var blob: [20]u8;
-    var i:    u32 = 0;
-    for (i < 20) {
-        blob[i] = 0xCC;
-        i       = i + 1;
-    }
-    write_bits(?blob[0], 2, wide.make(0x0807060504030201, 0x100F0E0D0C0B0A09), 16);
-    if (blob[0] != 0xCC || blob[1] != 0xCC) { ret 1; }
-    i = 0;
-    for (i < 16) {
-        if (blob[2 + i] != (i + 1)::u8) { ret 2; }
-        i = i + 1;
-    }
-    if (blob[18] != 0xCC || blob[19] != 0xCC) { ret 3; }
-    write_bits(?blob[0], 0, wide.make(0xFFFFFFFFFFFFFF11, 0xFFFFFFFFFFFFFFFF), 1);
-    if (blob[0] != 0x11 || blob[1] != 0xCC) { ret 4; }
-    write_bits(?blob[0], 0, wide.make(0x0000000000000000, 0x00000000000000AB), 9);
-    if (blob[8] != 0xAB || blob[9] != 8) { ret 5; }
-    ret 0;
-}
-
-#[testing]
-rec ConstNodeInner {
-    x: u32;
-    y: u64;
-}
-
-#[testing]
-rec ConstNodeProbe {
-    a:     u32;
-    b:     u64;
-    c:     u8;
-    inner: ConstNodeInner;
-    arr:   [3]u32;
-}
-
-#[testing]
-val constnode_probe_static: ConstNodeProbe = ConstNodeProbe{a: 7};
-
-#[testing]
-val constnode_probe_ct_arr: [1]ConstNodeProbe = [1]ConstNodeProbe{ConstNodeProbe{a: 7}};
-
-#[noinline]
-#[testing]
-fun constnode_probe_dirty() u64 {
-    var junk: [24]u64;
-    var i:    u32 = 0;
-    for (i < 24) {
-        junk[i] = 0xAAAAAAAAAAAAAAAA;
-        i       = i + 1;
-    }
-    ret junk[0];
-}
-
-#[noinline]
-#[testing]
-fun constnode_probe_runtime() ConstNodeProbe {
-    ret ConstNodeProbe{a: 7};
-}
-
-test constnode__static_and_runtime_agree_on_omitted_fields {
-    if (constnode_probe_dirty() != 0xAAAAAAAAAAAAAAAA) { ret 1; }
-
-    val r: ConstNodeProbe = constnode_probe_runtime();
-
-    if (r.a != 7)                      { ret 2; }
-    if (constnode_probe_static.a != 7) { ret 3; }
-
-    if (r.b != 0)                                        { ret 4; }
-    if (r.c != 0)                                        { ret 5; }
-    if (r.inner.x != 0 || r.inner.y != 0)                { ret 6; }
-    if (r.arr[0] != 0 || r.arr[1] != 0 || r.arr[2] != 0) { ret 7; }
-
-    if (constnode_probe_static.b != r.b) { ret 8; }
-    if (constnode_probe_static.c != r.c) { ret 9; }
-    val st: ConstNodeProbe = constnode_probe_static;
-    if (st.inner.x != r.inner.x) { ret 10; }
-    if (st.inner.y != r.inner.y) { ret 11; }
-    if (st.arr[0] != r.arr[0])   { ret 12; }
-    if (st.arr[2] != r.arr[2])   { ret 13; }
-
-    ret 0;
-}
-
-test constnode__comptime_constant_and_runtime_agree_on_omitted_fields {
-    var bad: i32 = 0;
-    $each item in constnode_probe_ct_arr {
-        $if (item.b == 0 && item.c == 0 && item.inner.y == 0) {
-            val r: ConstNodeProbe = constnode_probe_runtime();
-            if (r.b != 0)                      { bad = bad + 1; }
-            if (r.c != 0)                      { bad = bad + 2; }
-            if (r.inner.y != 0)                { bad = bad + 4; }
-            if (constnode_probe_static.b != 0) { bad = bad + 8; }
-        }
-        $or {
-            bad = bad + 32;
-        }
-    }
-    ret bad;
 }

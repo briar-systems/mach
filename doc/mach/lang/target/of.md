@@ -1748,19 +1748,19 @@ pub fun id_of(vt: *OfVTable) u32;
 ## val DBG_UNKNOWN
 
 ```mach
-pub val DBG_UNKNOWN:  u32 = 0
+pub val DBG_UNKNOWN: u32 = 0
 ```
 
 ## val DBG_DWARF
 
 ```mach
-pub val DBG_DWARF:    u32 = 1
+pub val DBG_DWARF:   u32 = 1
 ```
 
 ## val DBG_SPIRV
 
 ```mach
-pub val DBG_SPIRV:    u32 = 3
+pub val DBG_SPIRV:   u32 = 3
 ```
 
 ## def DebugShape
@@ -1798,6 +1798,15 @@ pub rec DebugProduceRequest;
 ```mach
 pub rec DebugVTable;
 ```
+
+## val DWARF
+
+```mach
+pub val DWARF: DebugVTable = DebugVTable;
+```
+
+the dwarf debug model the build's targets select. mirl writes a module's debug
+information as it compiles it, so nothing asks this model to produce sections
 
 ## fun debug_shape_for
 
