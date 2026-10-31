@@ -759,9 +759,11 @@ a thread entry point whose register state at entry *is* the interface.
   rejected. A local, an expression, or a `ret` lowers to code that assumes a
   frame the function does not have, and the result would run and return a wrong
   answer rather than fail.
-- **No return is generated.** If the asm falls off the end, control runs into
-  whatever the linker placed next. Write the return the ABI (or the interrupt
+- **No return is generated.** Control that falls off the end of the asm reaches
+  a trap the compiler places there. Write the return the ABI (or the interrupt
   controller) actually calls for.
+- **An asm block of a naked body binds no `{name}`.** The function has no frame
+  to hold a local, so a binding is refused where the block is written.
 - **Parameters and the return type are still checked** at every call site, so a
   naked function is called like any other. No moves are emitted for them: the
   arguments arrive in the ABI's registers and the body reads them there.
