@@ -106,6 +106,17 @@ An indirect call clobbers exactly as a direct one does — the callee's caller-s
 registers, which the surrounding block's barrier already covers. The register or
 memory holding the target is **read**, not written.
 
+A block may leave for good, by a jump out of it, taken or conditional, or by a
+fault such as `hlt` or `ud2`. Control that leaves never comes back to the
+function, so the compiler owes that path nothing: the block is compiled as
+coming back the way its calls and traps do, and code after a block that always
+leaves is unreachable. A thread's first jump off a fresh stack is the case it
+exists for: after `clone` the child runs on a stack the function's frame is not
+on, and must leave inside the block. A `ret` is refused, since it would skip the
+epilogue that restores the caller's frame. A body that returns by hand is a
+[`#[naked]`](decorators.md#naked--no-prologue-no-epilogue-body-as-written)
+function's.
+
 ## Operand sizes (x86-64)
 
 A register operand states its own width, so `mov eax, [rcx]` is a four-byte load
