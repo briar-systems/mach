@@ -100,10 +100,10 @@ pub val SCALAR:     Id = 11
 pub val NAKED:      Id = 12
 ```
 
-## val EXTENSIONS
+## val EXT
 
 ```mach
-pub val EXTENSIONS: Id = 13
+pub val EXT:        Id = 13
 ```
 
 ## val EMBED
@@ -318,6 +318,24 @@ pub fun id_of(source: str, name: lang_source.Span) Id;
 ```
 
 the decorator the name at `name` in `source` spells; NONE when it spells none
+
+## fun renamed
+
+```mach
+pub fun renamed(source: str, name: lang_source.Span) str;
+```
+
+the name this major gives the decorator the name at `name` in `source`
+spells, nil when no previous major named one so
+
+## fun renamed_note
+
+```mach
+pub fun renamed_note(source: str, name: lang_source.Span) str;
+```
+
+the refusal of the previous major's name the name at `name` in `source`
+spells, nil when it spells none
 
 ## fun name_of
 

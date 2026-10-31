@@ -78,7 +78,7 @@ doc with grammar, examples, and neighboring links. Start from the index below.
 - [manifest.md](manifest.md) — the `mach.toml` manifest reference
 - [dependencies.md](dependencies.md) — how dependencies are resolved, pinned and verified
 - [build.md](build.md) — which targets, profiles and artifacts a command builds
-- [ir-output.md](ir-output.md) — `--emit-ir` and its two forms, and which one is stable for tooling
+- [ir-output.md](ir-output.md) — `--emit-ir`, which writes mirl's text of each module
 - `mach --help` and `mach help <command>` — the command-line reference
 
 The supported, source-stable surface of the compiler is the editor API

@@ -78,7 +78,7 @@ does; a module first reached behind a gate decided later reads its importer's.
 
 ```mach fragment
 val ver: str = $project.version;                 # "2.0.0", from [project].version
-$if ($project.target.os == "windows") { ... }    # the declared os string
+$if ($project.target.sys == "windows") { ... }    # the declared os string
 ```
 
 ## The bare `$ident` is rejected

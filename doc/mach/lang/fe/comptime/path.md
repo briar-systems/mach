@@ -5,8 +5,9 @@ answers, matched once against a written path's segments
 
 a row names the value its path reads; the evaluator reads it by that id and
 never by a segment's spelling. a path that matches no row is refused with the
-message of the most specific family it falls in. a new path is a row here and
-its read
+message of the most specific family it falls in, or, when a previous major
+named its leading segments, with the name this one gives them, which
+`mach migrate` writes. a new path is a row here and its read
 
 ## def Read
 
@@ -16,10 +17,10 @@ pub def Read: u8
 
 what a path reads; `Row.arg` refines the version components, 0 major, 1 minor and 2 patch
 
-## val READ_OS_TAG
+## val READ_SYS_TAG
 
 ```mach
-pub val READ_OS_TAG:           Read = 4
+pub val READ_SYS_TAG:          Read = 4
 ```
 
 ## val READ_ARCH_TAG
@@ -71,6 +72,35 @@ arg: what `read` needs beyond the path, a version component
 call: the path is called with arguments, `$mach.build.ct_mul(op, width)`
 note: the refusal READ_REFUSED and READ_RESERVED report
 
+## rec Renamed
+
+```mach
+pub rec Renamed;
+```
+
+leading segments a previous major named, and the name this one gives them
+
+from: the segments as the previous major wrote them, `.`-separated
+to: the segments that replace them
+note: the refusal of a path that writes them
+
+## fun renamed
+
+```mach
+pub fun renamed(source: str, stack: *lang_source.Span, depth: u32) *Renamed;
+```
+
+the renamed row whose segments lead the written path, nil when none does.
+`stack` holds its `depth` segments innermost first, the root at `depth - 1`
+
+## fun renamed_depth
+
+```mach
+pub fun renamed_depth(r: *Renamed) u32;
+```
+
+how many segments a renamed row's `from` spans
+
 ## fun at
 
 ```mach
@@ -120,10 +150,10 @@ interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFai
 pub fun resolve_comptime_path(c: *comptime_scope.ComptimeCtx, source: str, file: lang_source.FileId, stack: *lang_source.Span, depth: u32, interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail];
 ```
 
-## fun os_tag_for
+## fun sys_tag_for
 
 ```mach
-pub fun os_tag_for(name: View) res[u32, fail.Fail];
+pub fun sys_tag_for(name: View) res[u32, fail.Fail];
 ```
 
 ## fun arch_tag_for

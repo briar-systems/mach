@@ -47,8 +47,7 @@ pub fun early_restore_enabled(p: *project.Project) bool;
 ```
 
 a module whose object is cached skips lowering when nothing else needs its
-ir: the ir and asm emitters read it, and a whole-module backend reads every
-referenced module's ir while generating one object
+unit: the ir and asm emitters read it
 
 ## fun restored
 
@@ -130,12 +129,9 @@ keys again, and a project that is not keyed processes every module
 pub fun read(p: *project.Project, location: str, expected: *[32]u8) res[opt[Cached], fail.Fail];
 ```
 
-the image the object at `location` records when its record says it was
-built under `expected`, none on a miss: an object that is missing,
-unreadable, carries no record or a damaged one, or was built under another
-key is rebuilt, never reused. the object is parsed only to find its record,
-since what a format spells is not always what the link reads. err only when
-allocation fails
+the object at `location` when its record says it was built under `expected`, none on a
+miss: an object that is missing, unreadable, carries no record or a damaged one, or was
+built under another key is rebuilt, never reused. err only when allocation fails
 
 ## val TEST_KEY_BIT
 
@@ -175,15 +171,15 @@ configuration identity. its items are reported under the readout phase ph
 ## fun take_staged
 
 ```mach
-pub fun take_staged(p: *project.Project, m: *project.ModuleEntry) *target_of.ObjectImage;
+pub fun take_staged(p: *project.Project, m: *project.ModuleEntry) *Object;
 ```
 
-hand the staged image to the query that publishes it; the facts stay with the module
+hand the staged object to the query that publishes it; the facts stay with the module
 
 ## fun take_staged_test
 
 ```mach
-pub fun take_staged_test(p: *project.Project, m: *project.ModuleEntry) *target_of.ObjectImage;
+pub fun take_staged_test(p: *project.Project, m: *project.ModuleEntry) *Object;
 ```
 
 ## fun collect_tests
@@ -192,23 +188,24 @@ pub fun take_staged_test(p: *project.Project, m: *project.ModuleEntry) *target_o
 pub fun collect_tests(p: *project.Project, m: *project.ModuleEntry, mid: u32, c: *testrunner.Collected) err[fail.Fail];
 ```
 
-a module's tests, from its lowered test ir or from the facts its restored test object carries
+a module's tests, from its lowered test unit or from the facts its restored test object carries
 
 ## fun publish
 
 ```mach
-pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *target_of.ObjectImage, object: query.QueryKey) err[fail.Fail];
+pub fun publish(p: *project.Project, m: *project.ModuleEntry, o: *Object, object: query.QueryKey) err[fail.Fail];
 ```
 
-a generated image carries its record into `obj/`: the key it was built
-under, the facts its lowered ir holds, and the image itself
+a compiled object carries its record into `obj/`: the key it was built under, the facts its
+lowered unit holds and the warnings building it reported. the record waits on the module
+until its object is written
 
 ## fun publish_test
 
 ```mach
-pub fun publish_test(p: *project.Project, m: *project.ModuleEntry, image: *target_of.ObjectImage, object: query.QueryKey) err[fail.Fail];
+pub fun publish_test(p: *project.Project, m: *project.ModuleEntry, o: *Object, object: query.QueryKey) err[fail.Fail];
 ```
 
-the same for the module's test object, which records only its own back half's
-warnings: the normal object carries the front end's
+the same for the module's test object, which records only its own back half's warnings:
+the normal object carries the front end's
 

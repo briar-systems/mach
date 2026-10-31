@@ -43,15 +43,10 @@ a lever or value left unset leaves the profile's
 
 output: the `-o` path, nil when absent
 work: the `-w` work directory, nil when absent
-ir_form: the form `emit_ir` prints in
 subsystem: the declared subsystem, SUBSYSTEM_FLAG_NONE for the artifact's own
 optimize: whether to optimize, or LEVER_PROFILE
 debug: whether to emit debug information, or LEVER_PROFILE
 simd: the vector lowering mode, none for the profile's
-pass: the pass names, each added to the pass set
-skip: the pass names, each left out of it
-relax: the relaxation names, each permitted
-unrelax: the relaxation names, each withdrawn
 jobs: the worker count, 0 for the host's
 
 ## fun overrides_init
@@ -87,6 +82,20 @@ the flag a subsystem name sets, none for a name no flag sets
 
 ```mach
 pub fun subsystem_from_flag(f: SubsystemFlag) opt[catalog_subsystem.Subsystem];
+```
+
+## val OPT_DEBUG
+
+```mach
+pub val OPT_DEBUG:   u8 = 0
+```
+
+a build's optimization lever: off, or the level mirl's schedule optimizes at
+
+## val OPT_RELEASE
+
+```mach
+pub val OPT_RELEASE: u8 = 2
 ```
 
 ## def BuildGoal

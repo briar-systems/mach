@@ -8,6 +8,54 @@ fwd lower_context.LoopFrame
 
 forwards [`mach.lang.me.lower.context.LoopFrame`](lower/context.md#rec-loopframe)
 
+## fwd lower_context.Unit
+
+```mach
+fwd lower_context.Unit
+```
+
+forwards [`mach.lang.me.lower.context.Unit`](lower/context.md#rec-unit)
+
+## fwd lower_context.FnInfo
+
+```mach
+fwd lower_context.FnInfo
+```
+
+forwards [`mach.lang.me.lower.context.FnInfo`](lower/context.md#rec-fninfo)
+
+## fwd lower_context.Machine
+
+```mach
+fwd lower_context.Machine
+```
+
+forwards [`mach.lang.me.lower.context.Machine`](lower/context.md#rec-machine)
+
+## fwd lower_context.unit_dnit
+
+```mach
+fwd lower_context.unit_dnit
+```
+
+forwards [`mach.lang.me.lower.context.unit_dnit`](lower/context.md#fun-unit_dnit)
+
+## fwd lower_context.fn_info
+
+```mach
+fwd lower_context.fn_info
+```
+
+forwards [`mach.lang.me.lower.context.fn_info`](lower/context.md#fun-fn_info)
+
+## fwd lower_context.machine_of
+
+```mach
+fwd lower_context.machine_of
+```
+
+forwards [`mach.lang.me.lower.context.machine_of`](lower/context.md#fun-machine_of)
+
 ## fwd lower_context.LowerContext
 
 ```mach
@@ -211,6 +259,9 @@ forwards [`mach.lang.me.lower.context.symbol_of`](lower/context.md#fun-symbol_of
 ## fun lower_module
 
 ```mach
-pub fun lower_module(req: *lower_context.LowerRequest) res[me_ir.Module, fail.Fail];
+pub fun lower_module(req: *lower_context.LowerRequest, m: *mirl_module.Module) res[lower_context.Unit, fail.Fail];
 ```
+
+the module `req` names lowered into the mirl module `m` and held to mirl's verifier, and the
+unit of facts kept of it
 

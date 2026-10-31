@@ -70,14 +70,13 @@ pub fun free_dispatch_inputs(p: *project.Project, di: *DispatchInputs);
 
 ```mach
 pub fun link_dispatcher(p: *project.Project, sc: *TestScope, di: *DispatchInputs,
-modules: *target_of.ObjectImage, module_len: u32, dispatcher: str, artifact: str) err[fail.Fail];
+modules: **Object, module_len: u32, dispatcher: str, artifact: str) err[fail.Fail];
 ```
 
-synthesize the dispatcher over the selected tests, write it to `dispatcher`, and
-link it with the test objects and the normal objects into `artifact`. the images
-are compiler-produced, so the link keeps only what the selected tests reach
+synthesize the dispatcher over the selected tests, write its object to `dispatcher`, and
+link it with the test objects and the normal objects into `artifact`
 
-modules: the build's current images: normal and test objects in topological order
+modules: the build's current objects: test and normal objects in topological order
 
 ## fun fingerprint_scope
 

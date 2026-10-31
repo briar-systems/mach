@@ -18,42 +18,10 @@ pub val UNIT_NONE: u32 = 0xFFFFFFFF
 pub rec Unit;
 ```
 
-## rec IrSet
-
-```mach
-pub rec IrSet;
-```
-
-## fun ir_set_empty
-
-```mach
-pub fun ir_set_empty() IrSet;
-```
-
-## fun root_ir
-
-```mach
-pub fun root_ir(u: *Unit) *me_ir.Module;
-```
-
 ## fun root_mir
 
 ```mach
 pub fun root_mir(u: *Unit) *lang_mir.MirModule;
-```
-
-## fun defined_index
-
-```mach
-pub fun defined_index(m: *me_ir.Module, name: intern.StrId) u32;
-```
-
-the module's name table answers a definition over a declaration
-
-## fun defined_global_index
-
-```mach
-pub fun defined_global_index(m: *me_ir.Module, name: intern.StrId) u32;
 ```
 
 ## fun mir_index
