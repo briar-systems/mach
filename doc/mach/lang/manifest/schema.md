@@ -25,11 +25,13 @@ whoever reads it
 pub rec Rewrite;
 ```
 
-the mechanical rewrite of a removed key as written
+the mechanical rewrite of a key as a previous major wrote it
 
 label: what the rewrite does; nil when the value as written has none
 whole: the rewrite replaces the key and its value, not the key alone
 replacement: the text written in their place
+why: for a key this major still reads, why the key as written is
+             refused; nil for a removed key, whose row's note says it
 
 ## fun row_of
 
@@ -68,6 +70,31 @@ alloc: owns the refusal's text
 doc: the document root
 key: a key of the document root, such as "project"
 ret: ok when the section has the schema's shape
+
+## rec Fix
+
+```mach
+pub rec Fix;
+```
+
+one replacement of the bytes `at` to `at + len` of a manifest's text by
+`text` and `pad` spaces after it
+
+## fun rewrites
+
+```mach
+pub fun rewrites(alloc: *A.Allocator, doc: *toml.Table, out: *Vector[Fix]) err[A.Error];
+```
+
+every rewrite the schema's rows call for in a parsed manifest document, as
+fixes of its text: each removed key's rewrite and each retired value's, in
+every table the schema holds. a key no row names or of the wrong shape adds
+none, since the check refuses it as it stands
+
+alloc: owns the fixes' storage
+doc: the document root
+out: receives the fixes, in no order
+ret: ok, or the allocator's refusal
 
 ## fun key_text
 

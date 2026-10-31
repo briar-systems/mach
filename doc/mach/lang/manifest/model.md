@@ -58,20 +58,22 @@ the manifest text, unvalidated against the target registry
 
 name: the table key; a portable identifier, never `native`
 env: the `env` key, or STR_NIL when absent; parse checks only that it is a
-                 non-empty string, the isa validates the value later
-isa: the required `isa` key
-os: the required `os` key
+               non-empty string, the architecture validates the value later
+arch: the required `arch` key
+isa: the `isa` key, the instruction set every machine of the target has,
+               or STR_NIL for the architecture's default
+sys: the required `sys` key
 abi: the required `abi` key
 of: the `of` object-format override, or STR_NIL when absent
 platform: the `platform` tag, or STR_NIL when absent
 base: the `base` load address, 0 when absent
 stack_reserve: the `stack_reserve` byte count, 0 when absent
 stack_commit: the `stack_commit` byte count, 0 when absent
-extensions: the `extensions` names, each an identifier and listed once; the isa
-                 refuses a name its vocabulary does not hold when the target resolves
-extension_count: how many of `extensions` are set
+ext: the `ext` names, each an identifier and listed once; the architecture
+               refuses a name its vocabulary does not hold when the target resolves
+ext_count: how many of `ext` are set
 runner: the `runner` argv templates the target's programs are launched
-                 through; nil when absent. freed by `dnit`
+               through; nil when absent. freed by `dnit`
 runner_count: length of `runner`
 runner_at: where each `runner` entry is written
 at: where the table's key is written
@@ -204,12 +206,12 @@ path: the `path` key, required for a local source and rejected otherwise; a
                     project-relative path template, STR_NIL for non-local
 symbols: the `symbols` array; every entry non-empty and unique; nil when absent
 symbol_count: length of `symbols`
-os: the required `os` filter axis, each value canonical or "*"; nil for `[]`,
+sys: the required `sys` filter axis, each value canonical or "*"; nil for `[]`,
                     which matches no target
-os_count: length of `os`
-isa: the `isa` filter axis, as `os`
-isa_count: length of `isa`
-abi: the `abi` filter axis, as `os`
+sys_count: length of `sys`
+arch: the `arch` filter axis, as `sys`
+arch_count: length of `arch`
+abi: the `abi` filter axis, as `sys`
 abi_count: length of `abi`
 export: the `export` key; false when absent
 include_referenced: the `include` key: false for "always" (the default), true for "referenced"

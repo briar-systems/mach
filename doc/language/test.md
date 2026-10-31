@@ -300,7 +300,7 @@ Tests run once per (target, profile). When several artifacts are selected there,
 the tests they reach are combined and each qualified name runs once. A target that
 declares a [`runner`](manifest.md#targetname) runs its tests through it, whether or
 not it is the host: each test launches as the expanded runner followed by its index,
-`{artifact.out}` naming the dispatcher. A target whose `os` and `isa` are the host's
+`{artifact.out}` naming the dispatcher. A target whose `sys` and `arch` are the host's
 and that declares none runs each test as `<exe> <index>`. Any other target is built
 and reported on a `skip` line, since an emulator the host happens to have is not the
 target unless the manifest says so. `--runner <cmd>` replaces the target's runner for
@@ -326,7 +326,7 @@ A test that can run only on some hosts sits in a declaration-level `$if`, so on
 any other host it is absent rather than reported as a pass:
 
 ```mach fragment
-$if ($mach.build.os != $mach.os.windows) {
+$if ($mach.build.sys != $mach.sys.windows) {
     test spawn__a_shell_script_runs {
         ret 0;
     }

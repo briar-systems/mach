@@ -611,7 +611,7 @@ warning[vector.scalarize]: vector divide on 4 lanes of 32-bit integers in 'app.m
 Every packed row in a target's catalog declares the extension its instruction
 needs, and the warning reads those rows. When a row declared under an extension
 would pack the operation, the warning names that extension in place of "no
-packed form", for example "declaring `sse41` in the target's `extensions` packs it", and
+packed form", for example "declaring `sse41` in the target's `ext` packs it", and
 declaring it in [`[target.<name>].extensions`](manifest.md#instruction-set-extensions)
 makes the warning go away. Code that is portable on purpose silences the key
 with `allow = ["vector.scalarize"]` in its profile, a declaration that

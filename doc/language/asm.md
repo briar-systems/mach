@@ -338,13 +338,13 @@ tracks secrets in vector registers separately from general-purpose ones.
 Some instructions exist only on processors that implement an extension beyond
 the instruction set's baseline. Each such row names its extension, and the
 encoder refuses it unless the target selects that extension (the manifest's
-[`extensions`](manifest.md#instruction-set-extensions) key) or the enclosing
-function admits it with [`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function).
+[`ext`](manifest.md#instruction-set-extensions) key) or the enclosing
+function admits it with [`#[ext(...)]`](decorators.md#extnames--an-outlier-function).
 The refusal names the instruction, the extension, and both ways to admit it.
 
 The one invariant behind every check: **an instruction that requires extension E
 is emitted only into a function whose admitted set holds E**, where a function's
-admitted set is the target's selection plus what its `#[extensions(...)]` names,
+admitted set is the target's selection plus what its `#[ext(...)]` names,
 each closed over what it implies. The encoder applies it to every row of an `asm`
 block, and the inliner applies the same predicate before moving one body into
 another, so an inlined body never carries an instruction its new home does not
@@ -369,7 +369,7 @@ inherits its function's set.
 | aarch64 | `aes` | `aese vN.16b, vN.16b`, `aesd vN.16b, vN.16b`, `aesmc vN.16b, vN.16b`, `aesimc vN.16b, vN.16b` (FEAT_AES) |
 | aarch64 | `pmull` | `pmull vN.1q, vN.1d, vN.1d`, `pmull2 vN.1q, vN.2d, vN.2d` (FEAT_PMULL; brings `aes`) |
 
-A manifest [level](manifest.md#levels) (`extensions = ["x86-64-v2"]`) selects every
+A manifest [level](manifest.md#levels) (`ext = ["x86-64-v2"]`) selects every
 member name, so it admits the rows of each: `pmulld` assembles under `x86-64-v2`, and
 `tzcnt`, `lzcnt` and `vpsllvd` under `x86-64-v3`, and `vpmullq` under `x86-64-v4`. The
 names a level brings that have no rows yet (`sse42`, `avx`, `avx512f`, `avx512bw`,

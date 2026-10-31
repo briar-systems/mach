@@ -2,8 +2,13 @@
 
 The `$mach.*` subtree is the compiler's view of the world: the resolved build
 context, the compiler identity, the project that owns the module, and source
-position. All reads, all comptime constants. The tags `$mach.{os,arch,abi,mode}.*`
+position. All reads, all comptime constants. The tags `$mach.{sys,arch,abi,mode}.*`
 exist for path-value comparison against the resolved-build facts.
+
+v6 spelled `$mach.sys.*` as `$mach.os.*`, `$mach.build.sys` as `$mach.build.os`,
+`$mach.build.ext.*` as `$mach.build.extensions.*` and `$project.target.sys` as
+`$project.target.os`. Each previous spelling is refused naming its v7 one, which
+`mach migrate` writes.
 
 Every path is deterministic: a function of the source, the manifests and the
 selected build, never of the clock, the host machine or the checkout. The same
@@ -17,12 +22,12 @@ wants one generates a source file from a
 
 ### `$mach.build.*` — what we're building for
 
-The resolved active build's facts. `os`/`arch`/`abi`/`mode` share the numeric
-tag space of `$mach.{os,arch,abi,mode}.*`, so a comparison is a plain integer
+The resolved active build's facts. `sys`/`arch`/`abi`/`mode` share the numeric
+tag space of `$mach.{sys,arch,abi,mode}.*`, so a comparison is a plain integer
 compare (see [Comparison](#comparison)).
 
 ```mach fragment
-$mach.build.os                  # live; compared against $mach.os.* tags
+$mach.build.sys                 # live; compared against $mach.sys.* tags
 $mach.build.arch                # live; compared against $mach.arch.* tags
 $mach.build.abi                 # live; compared against $mach.abi.* tags
 $mach.build.pointer_width       # live; integer count of bytes
@@ -30,13 +35,13 @@ $mach.build.mode                # live; compared against $mach.mode.* tags
 $mach.build.pie                 # live; 1 when building position-independent, else 0
 $mach.build.platform            # live; the target's open platform tag as a string, "" when unset
 $mach.build.ct_mul(op, width)   # live; 1 when a secret multiply of that cell is admitted, else 0
-$mach.build.extensions.<name>   # live; 1 when the target selects that instruction-set extension, else 0
+$mach.build.ext.<name>          # live; 1 when the target selects that instruction-set extension, else 0
 ```
 
-`$mach.build.arch` answers the target's `isa` key: the manifest calls the axis
-`isa` and both comptime roots call it `arch`, and the tags are the isa catalog's
-spellings. A target's `baseline` never changes it: `isa = "riscv32"` on
-`baseline = "rv32imc"` answers `$mach.arch.riscv32`.
+`$mach.build.arch` answers the target's `arch` key: the manifest calls the axis
+`arch` and both comptime roots call it `arch`, and the tags are the architecture
+catalog's spellings. A target's `isa` never changes it: `arch = "riscv32"` on
+`isa = "rv32imc"` answers `$mach.arch.riscv32`.
 
 `$mach.build.mode` answers which pipeline the build runs, whatever the profile is
 named: `$mach.mode.release` when the build runs the optimization passes (the
@@ -45,7 +50,7 @@ selected profile's `optimize = true`), and `$mach.mode.debug` when it does not. 
 and the mode with it.
 
 The members above are the whole subtree, and no manifest key adds one. The
-`extensions` members are the selected isa's own vocabulary, not the manifest's. A
+`ext` members are the selected architecture's own vocabulary, not the manifest's. A
 `$mach.build.<name>` that names none of them is a compile error at the use site
 (`` unknown `$mach.*` path ``). A project's own configuration constants are
 ordinary `val`s selected with `$if` over the facts above.
@@ -92,37 +97,37 @@ $or {
   missing argument, or arguments on any other path is a compile error that names
   what is accepted.
 
-#### `$mach.build.extensions.<name>` — instruction-set extensions
+#### `$mach.build.ext.<name>` — instruction-set extensions
 
-One `u8` member per extension name of the selected isa, like `$mach.build.pie`. It is
+One `u8` member per extension name of the selected architecture, like `$mach.build.pie`. It is
 1 when the target selects that extension and 0 otherwise. A build selects extensions
-with the target's `extensions` key and, on riscv, its `baseline`, closed over what
+with the target's `ext` key and, on riscv, its `isa`, closed over what
 each one implies (see
 [Instruction-set extensions](manifest.md#instruction-set-extensions)), so
-`extensions = ["sse41"]` answers 1 for `ssse3` too. On spirv the target's `env`
+`ext = ["sse41"]` answers 1 for `ssse3` too. On spirv the target's `env`
 selects them.
 
-The names are the selected isa's vocabulary and nothing else. Each isa's
-vocabulary is listed under
+The names are the selected architecture's vocabulary and nothing else. Each
+architecture's vocabulary is listed under
 [Instruction-set extensions](manifest.md#instruction-set-extensions).
 
-A name the selected isa does not declare is a compile error, never a silent 0, as
+A name the selected architecture does not declare is a compile error, never a silent 0, as
 `$mach.arch.*` refuses an unknown architecture:
 
 ```
-`$mach.build.extensions.sha`: `sha` is not an extension of isa 'aarch64'; its
+`$mach.build.ext.sha`: `sha` is not an extension of arch 'aarch64'; its
 extensions are: FEAT_SHA1, FEAT_SB, FEAT_AES, FEAT_PMULL, FEAT_FP16
 ```
 
-So a source that serves several isas nests the extension question under an
+So a source that serves several architectures nests the extension question under an
 architecture guard. `&&` does not stand in for the nesting: every `$mach` path in a
 condition is checked on its own, so
-`$if ($mach.build.arch == $mach.arch.x86_64 && $mach.build.extensions.sha == 1)` is
+`$if ($mach.build.arch == $mach.arch.x86_64 && $mach.build.ext.sha == 1)` is
 refused on aarch64 although the left side is false. Write the nested form:
 
 ```mach fragment
 $if ($mach.build.arch == $mach.arch.x86_64) {
-    $if ($mach.build.extensions.sha == 1) {
+    $if ($mach.build.ext.sha == 1) {
         use backend: std.crypto.hash.sha256.x86_sha;
     }
     $or {
@@ -130,7 +135,7 @@ $if ($mach.build.arch == $mach.arch.x86_64) {
     }
 }
 $or ($mach.build.arch == $mach.arch.aarch64) {
-    $if ($mach.build.extensions.sha2 == 1) {
+    $if ($mach.build.ext.sha2 == 1) {
         use backend: std.crypto.hash.sha256.arm_sha2;
     }
     $or {
@@ -142,14 +147,14 @@ $or {
 }
 ```
 
-A bare `$mach.build.extensions` is refused too.
+A bare `$mach.build.ext` is refused too.
 
 In an editor union build each target tuple answers for its own target, as
-`$mach.build.os` does.
+`$mach.build.sys` does.
 
 The member answers for the whole build. A function that uses an extension the target
 does not select, behind a run-time check, is marked
-[`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function) instead,
+[`#[ext(...)]`](decorators.md#extnames--an-outlier-function) instead,
 and the member stays 0 for it.
 
 ### `$mach.version` — the compiler version
@@ -217,14 +222,14 @@ val LINE: u64 = $mach.source.line;
 
 A member the subtree does not carry is `` unknown `$mach.source.*` path ``.
 
-### `$mach.os.*`, `$mach.arch.*`, `$mach.abi.*`, `$mach.mode.*` — tag values
+### `$mach.sys.*`, `$mach.arch.*`, `$mach.abi.*`, `$mach.mode.*` — tag values
 
 ```mach fragment
-$mach.os.linux
-$mach.os.darwin
-$mach.os.windows
-$mach.os.freestanding           # no OS / bare metal
-$mach.os.vulkan                 # a spir-v module's system
+$mach.sys.linux
+$mach.sys.darwin
+$mach.sys.windows
+$mach.sys.freestanding           # no OS / bare metal
+$mach.sys.vulkan                 # a spir-v module's system
 $mach.arch.x86_64
 $mach.arch.aarch64
 $mach.arch.riscv64
@@ -258,7 +263,7 @@ Tag comparisons are path-value — no `.id` suffix or unwrapping. Both sides sha
 one numeric space, so the comparison is an ordinary integer compare:
 
 ```mach fragment
-$if ($mach.build.os == $mach.os.linux) { ... }
+$if ($mach.build.sys == $mach.sys.linux) { ... }
 $if ($mach.build.arch == $mach.arch.x86_64) { ... }
 ```
 
@@ -270,7 +275,7 @@ RHS at compile time:
 ```mach
 use std.types.string.str;
 
-pub val IS_LINUX: u8  = $mach.build.os == $mach.os.linux;
+pub val IS_LINUX: u8  = $mach.build.sys == $mach.sys.linux;
 pub val COMPILER: *u8 = $mach.compiler.name;
 pub val VERSION:  str = $mach.version;
 pub val MAJOR:    u64 = $mach.version.major;

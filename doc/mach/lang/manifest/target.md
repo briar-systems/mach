@@ -1,15 +1,15 @@
 # mach.lang.manifest.target
 
-## fun host_isa_name
+## fun host_arch_name
 
 ```mach
-pub fun host_isa_name() str;
+pub fun host_arch_name() str;
 ```
 
-## fun host_os_name
+## fun host_sys_name
 
 ```mach
-pub fun host_os_name() str;
+pub fun host_sys_name() str;
 ```
 
 ## fun host_tuple
@@ -29,11 +29,11 @@ ret: the formatted tuple; err when the allocator refused it
 pub fun tuple_of(alloc: *A.Allocator, os_name: str, isa_name: str) res[str, fail.Fail];
 ```
 
-the one spelling of an (os, isa) pair, "<os>-<isa>", e.g. "linux-x86_64"
+the one spelling of a (sys, arch) pair, "<sys>-<arch>", e.g. "linux-x86_64"
 
 alloc: owns the returned string
-os_name: the os name
-isa_name: the isa name
+os_name: the system's name
+isa_name: the architecture's name
 ret: the formatted tuple; err when the allocator refused it
 
 ## fun parse_targets
@@ -71,7 +71,7 @@ ret: the binding; err the registry's refusal of the request
 pub fun target_matches_host(itn: *intern.Interner, d: *TargetDef, host_os: u32, host_arch: u32) bool;
 ```
 
-whether a target's `os` and `isa` name the given host ids. the abi is not compared
+whether a target's `sys` and `arch` name the given host ids. the abi is not compared
 
 itn: resolves the target's strings
 d: the target
