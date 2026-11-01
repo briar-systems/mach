@@ -78,7 +78,7 @@ ret: ok, without allocating, when nothing is new; err on a symbol count
 pub fun link_matches_target(itn: *intern.Interner, l: *LinkDef, t: *TargetDef) bool;
 ```
 
-whether a link's `os`, `isa` and `abi` filters all admit a target. an empty
+whether a link's `sys`, `arch` and `abi` filters all admit a target. an empty
 axis admits nothing, "*" everything
 
 itn: resolves the filter values

@@ -1,3 +1,4 @@
+use std.collections.slice.Slice;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -6,6 +7,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.view.View;
 
 use A: std.allocator;
@@ -26,24 +28,28 @@ use mach.lang.fe.resolve;
 use fe_sema: mach.lang.fe.sema;
 use mach.lang.float;
 use mach.lang.intern;
-use me_ir: mach.lang.me.ir;
-use mach.lang.me.ir.builder;
-use ir_instruction: mach.lang.me.ir.instruction;
-use ir_type:        mach.lang.me.ir.type;
-use mach.lang.me.ir.value;
+use mach.lang.me.lower.builder;
 use mach.lang.me.lower.constnode;
 use lower_context: mach.lang.me.lower.context;
-use mach.lang.me.lower.half;
+use mach.lang.me.lower.irt;
 use mach.lang.me.lower.mangle;
-use mach.lang.me.vecform;
+use lower_shader: mach.lang.me.lower.shader;
+use mach.lang.me.lower.value;
 use mach.lang.module;
 use mach.lang.session;
 use lang_source: mach.lang.source;
 use mach.lang.stack;
-use catalog_abi:       mach.lang.target.catalog.abi;
 use target_definition: mach.lang.target.definition;
-use mach.lang.target.resolved;
 use mach.lang.type;
+use mach.lang.wide;
+
+use mirl.ir.id;
+use mirl.ir.native;
+use mirl.ir.opcode;
+use mirl.ir.opcode.Opcode;
+use types: mirl.ir.type;
+use mirl.ir.type.Type;
+use collections_vector: std.collections.vector;
 
 pub fun lower_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[value.Value, fail.Fail] {
     val opt_e: res[ast_expr.Expr, fail.Fail] = lower_context.expression(ctx, eid);
@@ -64,7 +70,7 @@ pub fun lower_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[v
 
     val res_: res[value.Value, fail.Fail] = lower_rvalue_kind(ctx, eid, e);
     if (sel res_.err) { ret res_; }
-    ret res[value.Value, fail.Fail].ok{stamp_secret(ctx, eid, res_.ok)};
+    ret stamp_secret(ctx, eid, res_.ok);
 }
 
 fun lower_rvalue_kind(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
@@ -94,16 +100,18 @@ fun lower_rvalue_kind(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *
     ret res[value.Value, fail.Fail].err{fail.message("lower: unsupported expression kind in rvalue position")};
 }
 
-fun stamp_secret(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: value.Value) value.Value {
+# a value of a secret type is secret: one built from public operands, or a constant, is
+# classified where it is made. an aggregate is its storage's address, which is public
+fun stamp_secret(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: value.Value) res[value.Value, fail.Fail] {
     var sec: bool = lower_context.expr_is_secret(ctx, eid);
-    if (!sec) { sec = compare_operand_secret(ctx, eid); }
-    var out: value.Value = v;
-    out.secret = sec;
-    if (sec) {
-        val fn: *me_ir.Function = ctx.builder.fn;
-        ir_instruction.mark_result_secret(fn.instrs, fn.instr_len, v);
+    if (!sec)                                 { sec = compare_operand_secret(ctx, eid); }
+    if (!sec || v.secret || value.is_none(v)) { ret res[value.Value, fail.Fail].ok{v}; }
+    if (irt.is_aggregate(?ctx.m.types, v.ty)) {
+        var out: value.Value = v;
+        out.secret = true;
+        ret res[value.Value, fail.Fail].ok{out};
     }
-    ret out;
+    ret builder.emit_classify(?ctx.builder, v);
 }
 
 fun compare_operand_secret(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) bool {
@@ -138,7 +146,7 @@ fun lower_lvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[value
     if (k == ast_expr.EXPR_KIND_UNARY)   { ret lower_rvalue(ctx, e.data.unary.operand); }
 
     if (k == ast_expr.EXPR_KIND_CALL) {
-        val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+        val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
         if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
         if (is_aggregate_ir(ctx, res_ir.ok)) {
             ret lower_rvalue(ctx, eid);
@@ -149,50 +157,38 @@ fun lower_lvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[value
 }
 
 fun lower_lit_int(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
     ret res[value.Value, fail.Fail].ok{value.const_int_wide(e.data.lit_int.value, res_ir.ok)};
 }
 
 fun lower_lit_float(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
     val lit: res[float.Rounded, fail.Fail] = fe_literal.float_at(lower_context.module_source(ctx), e.data.lit_float.tok, lower_context.expr_float_width(ctx, eid));
     if (sel lit.err) { ret res[value.Value, fail.Fail].err{lit.err}; }
     ret res[value.Value, fail.Fail].ok{float_constant(ctx, lit.ok.value, res_ir.ok)};
 }
 
-# a float constant of the ir type `ty`: an f16's carrier holds the value's encoding
-fun float_constant(ctx: *lower_context.LowerContext, f: f64, ty: ir_type.IrTypeId) value.Value {
-    val opt_ty: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ty);
-    if (sel opt_ty.none)                     { ret value.const_float(f, ty); }
-    if (opt_ty.some.kind != ir_type.IRT_INT) { ret value.const_float(f, ty); }
-    ret value.const_int(float.bits_at(f, float.width_of_bits(opt_ty.some.data.bits)), ty);
+fun float_constant(ctx: *lower_context.LowerContext, f: f64, ty: Type) value.Value {
+    ret value.const_float(f, ty);
 }
 
 fun lower_lit_char(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
     ret res[value.Value, fail.Fail].ok{value.const_int(e.data.lit_char.value::u64, res_ir.ok)};
 }
 
 fun lower_lit_str(ctx: *lower_context.LowerContext, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
-    val res_ptr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?ctx.m.types);
-    if (sel res_ptr.err) { ret res[value.Value, fail.Fail].err{res_ptr.err}; }
-    val pty: ir_type.IrTypeId = res_ptr.ok;
-
     val inner:   View                       = ast.lit_str_value(ctx.scope.a, e);
     val res_sid: res[intern.StrId, A.Error] = intern.bytes_add(?ctx.s.interner, inner.data::str, inner.len);
     if (sel res_sid.err) { ret res[value.Value, fail.Fail].err{fail.refused(res_sid.err)}; }
-    val opt_bytes: opt[View] = intern.bytes(?ctx.s.interner, res_sid.ok);
-    if (sel opt_bytes.none) { ret res[value.Value, fail.Fail].err{fail.message("lower: string literal lookup failed")}; }
-
-    val blob: value.Value = constnode.terminated_bytes(opt_bytes.some, pty);
-    ret lower_context.add_rodata_bytes(ctx, blob, pty);
+    ret constnode.string_global(ctx, res_sid.ok);
 }
 
 fun lower_lit_nil(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[value.Value, fail.Fail] {
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
     ret res[value.Value, fail.Fail].ok{value.const_null(res_ir.ok)};
 }
@@ -217,8 +213,8 @@ fun lower_ident_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res
 
     val opt_local: opt[value.Value] = lower_context.lookup_local(ctx, sid);
     if (sel opt_local.some) {
-        val slot:   value.Value                      = opt_local.some;
-        val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+        val slot:   value.Value          = opt_local.some;
+        val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
         if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
         ret rvalue_at(ctx, slot, res_ir.ok, lower_context.expr_type_of(ctx, eid), access_is_volatile(ctx, eid));
     }
@@ -262,20 +258,18 @@ fun element_value(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, element:
     if (sel refused.some) {
         val res_at: res[value.Value, fail.Fail] = element_address(ctx, eid);
         if (sel res_at.err) { ret res_at; }
-        val res_load_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+        val res_load_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
         if (sel res_load_ir.err) { ret res[value.Value, fail.Fail].err{res_load_ir.err}; }
         ret rvalue_at(ctx, res_at.ok, res_load_ir.ok, lower_context.expr_type_of(ctx, eid), false);
     }
     val n: *comptime_deep.Node = comptime_deep.node_at(store, element.data.node.node);
     if (n.kind == comptime_deep.NODE_SCALAR) { ret const_value_of(ctx, eid, n.value); }
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
-    val ity:     ir_type.IrTypeId            = res_ir.ok;
+    val ity:     Type                        = res_ir.ok;
     val res_agg: res[value.Value, fail.Fail] = constnode.aggregate(ctx, store, element.data.node.node, ity);
     if (sel res_agg.err) { ret res_agg; }
-    val res_ptr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?ctx.m.types);
-    if (sel res_ptr.err) { ret res[value.Value, fail.Fail].err{res_ptr.err}; }
-    val res_global: res[value.Value, fail.Fail] = lower_context.add_rodata_bytes(ctx, res_agg.ok, res_ptr.ok);
+    val res_global: res[value.Value, fail.Fail] = lower_context.constant_global(ctx, res_agg.ok);
     if (sel res_global.err) { ret res_global; }
     ret rvalue_at(ctx, res_global.ok, ity, lower_context.expr_type_of(ctx, eid), false);
 }
@@ -284,7 +278,7 @@ fun load_pack_elem(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, ord: u3
     if (ctx.pack_slots == nil || ord >= ctx.pack_len) {
         ret res[value.Value, fail.Fail].err{fail.message("lower: pack element ordinal out of range")};
     }
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
     ret rvalue_at(ctx, ctx.pack_slots[ord], res_ir.ok, lower_context.expr_type_of(ctx, eid), access_is_volatile(ctx, eid));
 }
@@ -310,7 +304,7 @@ fun load_pack_slot(ctx: *lower_context.LowerContext, slot_ix: u32) res[value.Val
     if (ctx.pack_slots == nil || slot_ix >= ctx.pack_len) {
         ret res[value.Value, fail.Fail].err{fail.message("lower: pack slot index out of range")};
     }
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, ctx.pack_types[slot_ix]);
+    val res_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, ctx.pack_types[slot_ix]);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
     ret rvalue_at(ctx, ctx.pack_slots[slot_ix], res_ir.ok, ctx.pack_types[slot_ix], type_is_volatile_record(ctx, ctx.pack_types[slot_ix]));
 }
@@ -359,30 +353,23 @@ fun symbol_reference(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, sid: 
     }
     val sym: *resolve.Symbol = opt_sym.some;
 
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
-    if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
-    val vty: ir_type.IrTypeId = res_ir.ok;
-
     val res_ln: res[intern.StrId, fail.Fail] = reference_linkage_name(ctx, sym);
     if (sel res_ln.err) { ret res[value.Value, fail.Fail].err{res_ln.err}; }
     val link: intern.StrId = res_ln.ok;
 
     if (names_function(ctx, sym)) {
-        val res_ext: res[ir_type.ExtListId, fail.Fail] = lower_context.fun_type_ext(ctx, lower_context.expr_type_of(ctx, eid));
-        if (sel res_ext.err) { ret res[value.Value, fail.Fail].err{res_ext.err}; }
-        var fs: lower_context.FnSig;
-        fs.sig = vty;
-        fs.ext = res_ext.ok;
-        val res_imp: res[bool, fail.Fail] = references_import_function(ctx, sym);
-        if (sel res_imp.err) { ret res[value.Value, fail.Fail].err{res_imp.err}; }
-        val res_fn: res[value.Value, fail.Fail] = fn_reference(ctx, link, fs, res_imp.ok);
-        if (sel res_fn.err) { ret res_fn; }
-        val res_op: err[fail.Fail] = stamp_spirv_op(ctx, sym, res_fn.ok);
-        if (sel res_op.err) { ret res[value.Value, fail.Fail].err{res_op.err}; }
-        val res_ci: err[fail.Fail] = stamp_body_provider(ctx, sym, res_fn.ok);
-        if (sel res_ci.err) { ret res[value.Value, fail.Fail].err{res_ci.err}; }
-        ret res_fn;
+        val res_sig: res[lower_context.FnSig, fail.Fail] = lower_context.fn_sig_of_type(ctx, lower_context.expr_type_of(ctx, eid));
+        if (sel res_sig.err) { ret res[value.Value, fail.Fail].err{res_sig.err}; }
+        ret fn_reference(ctx, link, res_sig.ok);
     }
+
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
+    if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
+    val vty: Type = res_ir.ok;
+
+    val spec: res[opt[lower_shader.SpecVar], fail.Fail] = lower_shader.spec_var(ctx, sym);
+    if (sel spec.err)     { ret res[value.Value, fail.Fail].err{spec.err}; }
+    if (sel spec.ok.some) { ret spec_reference(ctx, spec.ok.some, vty); }
 
     val res_cv: res[opt[comptime.CTValue], fail.Fail] = module_const_value(ctx, sym);
     if (sel res_cv.err) {
@@ -398,11 +385,22 @@ fun symbol_reference(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, sid: 
         ret emit_global_rvalue(ctx, eid, opt_gi.some, vty);
     }
 
-    val res_imported: res[bool, fail.Fail] = references_import_data(ctx, sym);
-    if (sel res_imported.err) { ret res[value.Value, fail.Fail].err{res_imported.err}; }
-    val res_xg: res[u32, fail.Fail] = lower_context.ensure_extern_global(ctx, link, vty, res_imported.ok);
+    val res_xg: res[u32, fail.Fail] = lower_context.ensure_extern_global(ctx, link, vty);
     if (sel res_xg.err) { ret res[value.Value, fail.Fail].err{res_xg.err}; }
+    val shaded: err[fail.Fail] = lower_shader.extern_global_attributes(ctx, sym, res_xg.ok);
+    if (sel shaded.err) { ret res[value.Value, fail.Fail].err{shaded.err}; }
     ret emit_global_rvalue(ctx, eid, res_xg.ok, vty);
+}
+
+# a read of a `#[spec]` var: its specialization constant, of the var's type `vty`
+fun spec_reference(ctx: *lower_context.LowerContext, spec: lower_shader.SpecVar, vty: Type) res[value.Value, fail.Fail] {
+    var default: value.Value = value.none();
+    if (spec.default.kind == comptime.CT_KIND_FLOAT) { default = float_constant(ctx, spec.default.data.f, vty); }
+    or                                               { default = value.const_int_wide(spec.default.data.w, vty); }
+    val stated: value.Value    = builder.spec_constant(?ctx.builder, spec.id, default);
+    val built:  err[fail.Fail] = lower_context.builder_state(ctx);
+    if (sel built.err) { ret res[value.Value, fail.Fail].err{built.err}; }
+    ret res[value.Value, fail.Fail].ok{stated};
 }
 
 fun module_const_value(ctx: *lower_context.LowerContext, sym: *resolve.Symbol) res[opt[comptime.CTValue], fail.Fail] {
@@ -429,55 +427,6 @@ fun const_has_no_identity(v: comptime.CTValue) bool {
         || v.kind == comptime.CT_KIND_FLOAT;
 }
 
-fun references_import_data(ctx: *lower_context.LowerContext, sym: *resolve.Symbol) res[bool, fail.Fail] {
-    if (sym.kind != resolve.SYM_IMPORTED) { ret res[bool, fail.Fail].ok{false}; }
-    val found: res[lower_context.Declared, fail.Fail] = lower_context.declared(ctx, sym);
-    if (sel found.err) { ret res[bool, fail.Fail].err{found.err}; }
-    val d: *fe_sema.interface.Declaration = found.ok.declaration;
-    if (d.kind != resolve.SYM_VAL && d.kind != resolve.SYM_VAR) { ret res[bool, fail.Fail].ok{false}; }
-    ret res[bool, fail.Fail].ok{(d.flags & fe_sema.interface.DECLARATION_EXT) != 0};
-}
-
-fun stamp_spirv_op(ctx: *lower_context.LowerContext, sym: *resolve.Symbol, v: value.Value) err[fail.Fail] {
-    if (v.kind != value.VAL_FN || v.data.fn_ix >= ctx.m.function_len) {
-        ret err[fail.Fail].err{fail.message("lower: function reference has no IR function identity")};
-    }
-    val found: res[lower_context.Declared, fail.Fail] = lower_context.declared(ctx, sym);
-    if (sel found.err) { ret err[fail.Fail].err{found.err}; }
-    val fi:    u32 = v.data.fn_ix;
-    val set_v: u32 = lower_context.declared_op(ctx, found.ok, ?ctx.m.functions[fi].op_code);
-    if (set_v != target_definition.NO_OP_SET) { ctx.m.functions[fi].op_set = set_v; }
-    ret err[fail.Fail].ok{};
-}
-
-fun references_import_function(ctx: *lower_context.LowerContext, sym: *resolve.Symbol) res[bool, fail.Fail] {
-    if (sym.kind != resolve.SYM_IMPORTED) { ret res[bool, fail.Fail].ok{false}; }
-    val found: res[lower_context.Declared, fail.Fail] = lower_context.declared(ctx, sym);
-    if (sel found.err) { ret res[bool, fail.Fail].err{found.err}; }
-    val d: *fe_sema.interface.Declaration = found.ok.declaration;
-    if (d.kind != resolve.SYM_FUN) { ret res[bool, fail.Fail].ok{false}; }
-    ret res[bool, fail.Fail].ok{(d.flags & fe_sema.interface.DECLARATION_EXT) != 0};
-}
-
-fun stamp_body_provider(ctx: *lower_context.LowerContext, sym: *resolve.Symbol, v: value.Value) err[fail.Fail] {
-    if (v.kind != value.VAL_FN || v.data.fn_ix >= ctx.m.function_len) {
-        ret err[fail.Fail].err{fail.message("lower: function reference has no IR function identity")};
-    }
-    val found: res[lower_context.Declared, fail.Fail] = lower_context.declared(ctx, sym);
-    if (sel found.err) { ret err[fail.Fail].err{found.err}; }
-    val d: *fe_sema.interface.Declaration = found.ok.declaration;
-    if (d.kind != resolve.SYM_FUN)                                                                                 { ret err[fail.Fail].err{fail.message("lower: function reference acquired a non-function declaration")}; }
-    if ((d.flags & fe_sema.interface.DECLARATION_EXT) != 0 || (d.flags & fe_sema.interface.DECLARATION_BODY) == 0) { ret err[fail.Fail].ok{}; }
-    val origin: intern.StrId = session.module_fqn(ctx.s, resolve.origin_of(ctx.s, sym));
-    if (intern.str_is_nil(origin)) { ret err[fail.Fail].err{fail.message("lower: function body has no stable module identity")}; }
-    val fn: *me_ir.Function = ?ctx.m.functions[v.data.fn_ix];
-    if (!intern.str_is_nil(fn.body_module) && !intern.str_same(fn.body_module, origin)) {
-        ret err[fail.Fail].err{fail.message("lower: one function linkage names conflicting body providers")};
-    }
-    fn.body_module = origin;
-    ret err[fail.Fail].ok{};
-}
-
 fun names_function(ctx: *lower_context.LowerContext, sym: *resolve.Symbol) bool {
     ret sym.kind == resolve.SYM_FUN
         || (sym.kind == resolve.SYM_IMPORTED && sym.definition_kind == resolve.SYM_FUN);
@@ -499,13 +448,12 @@ fun symbol_lvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, sid: res
         ret global_pointer(ctx, opt_gi.some);
     }
 
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
-    val vty:          ir_type.IrTypeId     = res_ir.ok;
-    val res_imported: res[bool, fail.Fail] = references_import_data(ctx, sym);
-    if (sel res_imported.err) { ret res[value.Value, fail.Fail].err{res_imported.err}; }
-    val res_xg: res[u32, fail.Fail] = lower_context.ensure_extern_global(ctx, link, vty, res_imported.ok);
+    val res_xg: res[u32, fail.Fail] = lower_context.ensure_extern_global(ctx, link, res_ir.ok);
     if (sel res_xg.err) { ret res[value.Value, fail.Fail].err{res_xg.err}; }
+    val shaded: err[fail.Fail] = lower_shader.extern_global_attributes(ctx, sym, res_xg.ok);
+    if (sel shaded.err) { ret res[value.Value, fail.Fail].err{shaded.err}; }
     ret global_pointer(ctx, res_xg.ok);
 }
 
@@ -557,14 +505,9 @@ fun element_address(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[va
     val element:  lower_context.EachElement   = found.some;
     val res_base: res[value.Value, fail.Fail] = lower_lvalue(ctx, element.array);
     if (sel res_base.err) { ret res_base; }
-    val res_arr: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, lower_context.expr_type_of(ctx, element.array));
+    val res_arr: res[Type, fail.Fail] = lower_context.lower_type(ctx, lower_context.expr_type_of(ctx, element.array));
     if (sel res_arr.err) { ret res[value.Value, fail.Fail].err{res_arr.err}; }
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-    var idx: [2]value.Value;
-    idx[0] = value.const_int(0, res_xty.ok);
-    idx[1] = value.const_int(element.index::u64, res_xty.ok);
-    ret builder.emit_gep(?ctx.builder, res_base.ok, res_arr.ok, ?idx[0], 2);
+    ret builder.emit_element(?ctx.builder, res_base.ok, res_arr.ok, value.const_int(element.index::u64, builder.index_type(?ctx.builder)));
 }
 
 fun try_lower_element_member(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) opt[res[value.Value, fail.Fail]] {
@@ -634,24 +577,18 @@ fun lower_comptime_value(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) r
 # a zero of an expression's type, for a read the constant folding proved dead or a field a
 # constant leaves out
 fun dead_zero_value(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[value.Value, fail.Fail] {
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
-    val ity: ir_type.IrTypeId = res_ir.ok;
-    if (ir_type.is_aggregate(?ctx.m.types, ity)) {
-        val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-        if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-        val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, ity, value.const_int(1, res_xty.ok));
+    val ity: Type = res_ir.ok;
+    if (irt.is_aggregate(?ctx.m.types, ity)) {
+        val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, ity);
         if (sel res_slot.err) { ret res_slot; }
         val slot:   value.Value    = res_slot.ok;
         val res_mz: err[fail.Fail] = builder.emit_memzero(?ctx.builder, slot, ity);
         if (sel res_mz.err) { ret res[value.Value, fail.Fail].err{res_mz.err}; }
         ret res[value.Value, fail.Fail].ok{value.retype(slot, ity)};
     }
-    val opt_ty: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
-    if (sel opt_ty.some && opt_ty.some.kind == ir_type.IRT_FLOAT) {
-        ret res[value.Value, fail.Fail].ok{value.const_float(0.0, ity)};
-    }
-    ret res[value.Value, fail.Fail].ok{value.const_int(0, ity)};
+    ret res[value.Value, fail.Fail].ok{value.const_null(ity)};
 }
 
 fun try_lower_field_member(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) opt[res[value.Value, fail.Fail]] {
@@ -667,19 +604,11 @@ fun try_lower_field_member(ctx: *lower_context.LowerContext, eid: ast_id.ExprId,
     if (sel res_member.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{fail.message(res_member.err.message)}}; }
     val v: comptime.CTValue = res_member.ok;
     if (v.kind == comptime.CT_KIND_INT) {
-        val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+        val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
         if (sel res_ir.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_ir.err}}; }
         ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].ok{value.const_int_wide(v.data.w, res_ir.ok)}};
     }
-    if (v.kind == comptime.CT_KIND_STR) {
-        val res_ptr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?ctx.m.types);
-        if (sel res_ptr.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_ptr.err}}; }
-        val pty:       ir_type.IrTypeId = res_ptr.ok;
-        val opt_bytes: opt[View]        = intern.bytes(?ctx.s.interner, v.data.s);
-        if (sel opt_bytes.none) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{fail.message("lower: field name lookup failed")}}; }
-        val blob: value.Value = constnode.terminated_bytes(opt_bytes.some, pty);
-        ret opt[res[value.Value, fail.Fail]].some{lower_context.add_rodata_bytes(ctx, blob, pty)};
-    }
+    if (v.kind == comptime.CT_KIND_STR) { ret opt[res[value.Value, fail.Fail]].some{constnode.string_global(ctx, v.data.s)}; }
     ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{fail.message("lower: unsupported field descriptor member in value position")}};
 }
 
@@ -689,11 +618,11 @@ fun try_lower_pack_len(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: 
     if (sel opt_t.none)                    { ret opt[res[value.Value, fail.Fail]].none{}; }
     if (opt_t.some.kind != type.TYPE_PACK) { ret opt[res[value.Value, fail.Fail]].none{}; }
 
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) {
         ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_ir.err}};
     }
-    val ity: ir_type.IrTypeId = res_ir.ok;
+    val ity: Type = res_ir.ok;
     ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].ok{value.const_int(ctx.pack_len::u64, ity)}};
 }
 
@@ -718,7 +647,7 @@ fun lower_member_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e:
 
     val res_ptr: res[value.Value, fail.Fail] = lower_member_lvalue(ctx, eid, e);
     if (sel res_ptr.err) { ret res_ptr; }
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
     ret rvalue_at(ctx, res_ptr.ok, res_ir.ok, lower_context.expr_type_of(ctx, eid), access_is_volatile(ctx, eid));
 }
@@ -742,39 +671,36 @@ fun lower_member_lvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e:
     ret field_gep(ctx, base, rec_ty, field_ix);
 }
 
-# the address of a tag's discriminator: field 0 of the tag, addressed like any struct field
-fun disc_gep(ctx: *lower_context.LowerContext, base: value.Value, tag_ir: ir_type.IrTypeId) res[value.Value, fail.Fail] {
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
-    var idx: [2]value.Value;
-    idx[0] = value.const_int(0, xty);
-    idx[1] = value.const_int(ir_type.tag_disc_field()::u64, xty);
-    ret builder.emit_gep(?ctx.builder, base, tag_ir, ?idx[0], 2);
+# the address of a tag's discriminator, the first member of the structure it lowers to
+fun disc_gep(ctx: *lower_context.LowerContext, base: value.Value, tag_ir: Type) res[value.Value, fail.Fail] {
+    ret builder.emit_member(?ctx.builder, base, tag_ir, lower_context.TAG_DISCRIMINANT);
+}
+
+# the integer a tag's discriminator is held in
+fun disc_type(ctx: *lower_context.LowerContext, tag_ir: Type) Type {
+    ret irt.member(?ctx.m.types, tag_ir, lower_context.TAG_DISCRIMINANT);
 }
 
 # a guarded payload access in the debug profile traps when the discriminator no longer selects its case
 fun emit_case_check(ctx: *lower_context.LowerContext, base: value.Value, tag_ty: type.TypeId, case_ix: u32) err[fail.Fail] {
-    val res_tag_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, tag_ty);
+    val res_tag_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, tag_ty);
     if (sel res_tag_ir.err) { ret err[fail.Fail].err{res_tag_ir.err}; }
-    val tag_ir: ir_type.IrTypeId = res_tag_ir.ok;
-
-    val disc_ir: ir_type.IrTypeId = ir_type.tag_disc_type(?ctx.m.types, tag_ir);
+    val tag_ir:  Type = res_tag_ir.ok;
+    val disc_ir: Type = disc_type(ctx, tag_ir);
 
     val res_dp: res[value.Value, fail.Fail] = disc_gep(ctx, base, tag_ir);
     if (sel res_dp.err) { ret err[fail.Fail].err{res_dp.err}; }
     val res_code: res[value.Value, fail.Fail] = builder.emit_load(?ctx.builder, res_dp.ok, disc_ir);
     if (sel res_code.err) { ret err[fail.Fail].err{res_code.err}; }
-    val res_ok: res[value.Value, fail.Fail] = builder.emit_cmp_eq(?ctx.builder,
-        res_code.ok, value.const_int(case_ix::u64, disc_ir));
+    val res_ok: res[value.Value, fail.Fail] = builder.emit_cmp_eq(?ctx.builder, res_code.ok, value.const_int(case_ix::u64, disc_ir));
     if (sel res_ok.err) { ret err[fail.Fail].err{res_ok.err}; }
 
-    val res_cont: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
+    val res_cont: res[id.Block, fail.Fail] = builder.new_block(?ctx.builder);
     if (sel res_cont.err) { ret err[fail.Fail].err{res_cont.err}; }
-    val res_trap: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
+    val res_trap: res[id.Block, fail.Fail] = builder.new_block(?ctx.builder);
     if (sel res_trap.err) { ret err[fail.Fail].err{res_trap.err}; }
-    val cont: me_ir.BlockId = res_cont.ok;
-    val trap: me_ir.BlockId = res_trap.ok;
+    val cont: id.Block = res_cont.ok;
+    val trap: id.Block = res_trap.ok;
 
     val res_cbr: err[fail.Fail] = builder.emit_cbr(?ctx.builder, res_ok.ok, cont, trap);
     if (sel res_cbr.err) { ret res_cbr; }
@@ -799,7 +725,7 @@ fun project_field_index(ctx: *lower_context.LowerContext, field_eid: ast_id.Expr
 fun lower_project_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
     val res_ptr: res[value.Value, fail.Fail] = lower_project_lvalue(ctx, eid, e);
     if (sel res_ptr.err) { ret res_ptr; }
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
     ret rvalue_at(ctx, res_ptr.ok, res_ir.ok, lower_context.expr_type_of(ctx, eid), access_is_volatile(ctx, eid));
 }
@@ -851,7 +777,7 @@ fun lower_index_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: 
     }
     val res_ptr: res[value.Value, fail.Fail] = lower_index_lvalue(ctx, eid, e);
     if (sel res_ptr.err) { ret res_ptr; }
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
     ret rvalue_at(ctx, res_ptr.ok, res_ir.ok, lower_context.expr_type_of(ctx, eid), access_is_volatile(ctx, eid));
 }
@@ -863,16 +789,10 @@ fun lower_vector_lane_read(ctx: *lower_context.LowerContext, eid: ast_id.ExprId,
     val res_vec: res[value.Value, fail.Fail] = lower_rvalue(ctx, e.data.index.object);
     if (sel res_vec.err) { ret res_vec; }
 
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
 
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-
-    ret builder.emit_vec_extract(?ctx.builder,
-        res_vec.ok,
-        value.const_int(lane.ok, res_xty.ok),
-        res_ir.ok);
+    ret builder.emit_vec_extract(?ctx.builder, res_vec.ok, value.const_int(lane.ok, builder.index_type(?ctx.builder)), res_ir.ok);
 }
 
 fun is_vector_range(ctx: *lower_context.LowerContext, e: *ast_expr.Expr) bool {
@@ -901,111 +821,36 @@ fun lower_vector_range_read(ctx: *lower_context.LowerContext, eid: ast_id.ExprId
     if (sel start.err) { ret res[value.Value, fail.Fail].err{start.err}; }
     val res_vec: res[value.Value, fail.Fail] = lower_rvalue(ctx, e.data.index.object);
     if (sel res_vec.err) { ret res_vec; }
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
     ret extract_lanes(ctx, res_vec.ok, start.ok, res_ir.ok, opt[bool].none{});
 }
 
 # the vector of type `ty` whose lanes are `vec`'s from lane `start` on, each
 # extended to `ty`'s lane type under `extend`'s signedness when it is present:
-# one lane range where the target packs it (and the extension after it where
-# that packs too), otherwise one build where the target has it, otherwise a
-# slot written lane by lane and read whole
-fun extract_lanes(ctx: *lower_context.LowerContext, vec: value.Value, start: u64, ty: ir_type.IrTypeId, extend: opt[bool]) res[value.Value, fail.Fail] {
-    val opt_vt: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ty);
-    if (sel opt_vt.none) { ret res[value.Value, fail.Fail].err{fail.message("lower: vector range type is not an IR vector")}; }
-    val vt: *ir_type.IrType = opt_vt.some;
-    if (vt.kind != ir_type.IRT_VECTOR) { ret res[value.Value, fail.Fail].err{fail.message("lower: vector range type is not an IR vector")}; }
-    val elem:    ir_type.IrTypeId                 = vt.data.vector_.element;
-    val lanes:   u32                              = vt.data.vector_.lanes;
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
-    var src: ir_type.IrTypeId = elem;
+# the range is one shuffle, and the extension one lane-wise conversion
+fun extract_lanes(ctx: *lower_context.LowerContext, vec: value.Value, start: u64, ty: Type, extend: opt[bool]) res[value.Value, fail.Fail] {
+    val t:     *types.Table = builder.types_of(?ctx.builder);
+    val lanes: u32          = irt.lanes(t, ty);
+    var range: Type         = ty;
     if (sel extend.some) {
-        val opt_st: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, vec.ty);
-        if (sel opt_st.none) { ret res[value.Value, fail.Fail].err{fail.message("lower: vector range source is not an IR vector")}; }
-        val st: *ir_type.IrType = opt_st.some;
-        if (st.kind != ir_type.IRT_VECTOR) { ret res[value.Value, fail.Fail].err{fail.message("lower: vector range source is not an IR vector")}; }
-        src = st.data.vector_.element;
+        val rt: res[Type, fail.Fail] = irt.vector(t, irt.element(t, vec.ty), lanes);
+        if (sel rt.err) { ret res[value.Value, fail.Fail].err{rt.err}; }
+        range = rt.ok;
     }
-
-    if (ctx.tgt != nil) {
-        val packed: opt[res[value.Value, fail.Fail]] = packed_range(ctx, vec, start, ty, src, lanes, xty, extend);
-        if (sel packed.some) { ret packed.some; }
-    }
-
-    if (ctx.tgt != nil && ctx.tgt.model.has_vec_build) {
-        val res_lanes: res[*value.Value, fail.Fail] = builder.lanes_reserve(?ctx.builder, lanes);
-        if (sel res_lanes.err) { ret res[value.Value, fail.Fail].err{res_lanes.err}; }
-        val built: *value.Value                = res_lanes.ok;
-        val whole: res[value.Value, fail.Fail] = build_lanes(ctx, vec, start, ty, xty, src, elem, extend, built, lanes);
-        builder.lanes_release(?ctx.builder, built, lanes);
-        ret whole;
-    }
-
-    val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, ty, value.const_int(1, xty));
-    if (sel res_slot.err) { ret res_slot; }
-    val slot: value.Value = res_slot.ok;
-    var k:    u32         = 0;
-    for (k < lanes) {
-        val x: res[value.Value, fail.Fail] = extract_lane(ctx, vec, start + k::u64, xty, src, elem, extend);
-        if (sel x.err) { ret x; }
-        var idx: [2]value.Value;
-        idx[0] = value.const_int(0, xty);
-        idx[1] = value.const_int(k::u64, xty);
-        val res_gep: res[value.Value, fail.Fail] = builder.emit_gep(?ctx.builder, slot, ty, ?idx[0], 2);
-        if (sel res_gep.err) { ret res_gep; }
-        val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, x.ok, res_gep.ok);
-        if (sel res_store.err) { ret res[value.Value, fail.Fail].err{res_store.err}; }
-        k = k + 1;
-    }
-    ret builder.emit_load(?ctx.builder, slot, ty);
-}
-
-# the `ty` vector of `lanes` lanes of `vec` from `start` on, built whole from `built`
-fun build_lanes(ctx: *lower_context.LowerContext, vec: value.Value, start: u64, ty: ir_type.IrTypeId, xty: ir_type.IrTypeId,
-    src: ir_type.IrTypeId, elem: ir_type.IrTypeId, extend: opt[bool], built: *value.Value, lanes: u32) res[value.Value, fail.Fail] {
+    var picks: collections_vector.Vector[u32] = collections_vector.init[u32](ctx.s.alloc);
+    fin { collections_vector.dnit[u32](?picks); }
     var k: u32 = 0;
     for (k < lanes) {
-        val x: res[value.Value, fail.Fail] = extract_lane(ctx, vec, start + k::u64, xty, src, elem, extend);
-        if (sel x.err) { ret x; }
-        built[k] = x.ok;
-        k        = k + 1;
+        val pushed: res[usize, A.Error] = collections_vector.push[u32](?picks, (start + k::u64)::u32);
+        if (sel pushed.err) { ret res[value.Value, fail.Fail].err{fail.refused(pushed.err)}; }
+        k = k + 1;
     }
-    ret builder.emit_vec_build(?ctx.builder, ty, built, lanes);
-}
-
-# the lanes of `vec` from `start` on as one lane range into a vector of `lanes`
-# `src` lanes, then extended lane-wise to `ty` when `extend` is present; absent
-# where the target does not pack the range, or the extension, at these lanes
-fun packed_range(ctx: *lower_context.LowerContext, vec: value.Value, start: u64, ty: ir_type.IrTypeId, src: ir_type.IrTypeId,
-    lanes: u32, xty: ir_type.IrTypeId, extend: opt[bool]) opt[res[value.Value, fail.Fail]] {
-    var range_ty: ir_type.IrTypeId = ty;
-    if (sel extend.some) {
-        val res_rt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?ctx.m.types, src, lanes);
-        if (sel res_rt.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_rt.err}}; }
-        range_ty = res_rt.ok;
-        var conv: ir_instruction.InstrKind = ir_instruction.OP_ZEXT;
-        if (extend.some)                                                   { conv = ir_instruction.OP_SEXT; }
-        if (!vecform.conversion_packs(ctx.m, ctx.tgt, conv, ty, range_ty)) { ret opt[res[value.Value, fail.Fail]].none{}; }
-    }
-    if (!vecform.range_packs(ctx.m, ctx.tgt, range_ty, vec.ty)) { ret opt[res[value.Value, fail.Fail]].none{}; }
-    val r: res[value.Value, fail.Fail] = builder.emit_vec_range(?ctx.builder, vec, value.const_int(start, xty), range_ty);
-    if (sel r.err)       { ret opt[res[value.Value, fail.Fail]].some{r}; }
-    if (sel extend.none) { ret opt[res[value.Value, fail.Fail]].some{r}; }
-    if (extend.some)     { ret opt[res[value.Value, fail.Fail]].some{builder.emit_sext(?ctx.builder, r.ok, ty)}; }
-    ret opt[res[value.Value, fail.Fail]].some{builder.emit_zext(?ctx.builder, r.ok, ty)};
-}
-
-# lane `lane` of `vec`, a `src` value, extended to `elem` under `extend`'s
-# signedness when it is present
-fun extract_lane(ctx: *lower_context.LowerContext, vec: value.Value, lane: u64, xty: ir_type.IrTypeId, src: ir_type.IrTypeId, elem: ir_type.IrTypeId, extend: opt[bool]) res[value.Value, fail.Fail] {
-    val x: res[value.Value, fail.Fail] = builder.emit_vec_extract(?ctx.builder, vec, value.const_int(lane, xty), src);
-    if (sel x.err)       { ret x; }
-    if (sel extend.none) { ret x; }
-    if (extend.some)     { ret builder.emit_sext(?ctx.builder, x.ok, elem); }
-    ret builder.emit_zext(?ctx.builder, x.ok, elem);
+    val r: res[value.Value, fail.Fail] = builder.emit_shuffle(?ctx.builder, range, vec, vec, picks.data, lanes);
+    if (sel r.err)       { ret r; }
+    if (sel extend.none) { ret r; }
+    if (extend.some)     { ret builder.emit_sext(?ctx.builder, r.ok, ty); }
+    ret builder.emit_zext(?ctx.builder, r.ok, ty);
 }
 
 fun lower_index_lvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
@@ -1026,11 +871,9 @@ fun lower_index_lvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: 
 
     val res_ix: res[value.Value, fail.Fail] = lower_rvalue(ctx, e.data.index.index);
     if (sel res_ix.err) { ret res_ix; }
-    var ix: value.Value = res_ix.ok;
-
-    val res_widen: res[value.Value, fail.Fail] = widen_index(ctx, ix, lower_context.expr_type_of(ctx, e.data.index.index));
+    val res_widen: res[value.Value, fail.Fail] = widen_index(ctx, res_ix.ok, lower_context.expr_type_of(ctx, e.data.index.index));
     if (sel res_widen.err) { ret res_widen; }
-    ix = res_widen.ok;
+    val ix: value.Value = res_widen.ok;
 
     if (is_ptr) {
         val opt_pt: opt[*type.Type] = type.get(?ctx.s.types, obj_ty);
@@ -1039,39 +882,14 @@ fun lower_index_lvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: 
         if (pt.kind != type.TYPE_POINTER) {
             ret res[value.Value, fail.Fail].err{fail.message("lower: an index sema accepted reads through an untyped pointer")};
         }
-        val res_elem_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, pt.data.pointer.base);
+        val res_elem_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, pt.data.pointer.base);
         if (sel res_elem_ir.err) { ret res[value.Value, fail.Fail].err{res_elem_ir.err}; }
-        var idx1: [1]value.Value;
-        idx1[0] = ix;
-        ret builder.emit_gep(?ctx.builder, base, res_elem_ir.ok, ?idx1[0], 1);
+        ret builder.emit_step(?ctx.builder, base, res_elem_ir.ok, ix);
     }
 
-    val res_obj_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, obj_ty);
+    val res_obj_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, obj_ty);
     if (sel res_obj_ir.err) { ret res[value.Value, fail.Fail].err{res_obj_ir.err}; }
-    var arr_ir: ir_type.IrTypeId = res_obj_ir.ok;
-
-    if (type.is_vector(?ctx.s.types, obj_ty)) {
-        val opt_v: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, arr_ir);
-        if (sel opt_v.some) {
-            val vt: *ir_type.IrType = opt_v.some;
-            if (vt.kind == ir_type.IRT_VECTOR) {
-                val elem:    ir_type.IrTypeId                 = vt.data.vector_.element;
-                val lanes:   u32                              = vt.data.vector_.lanes;
-                val res_arr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?ctx.m.types, elem, lanes);
-                if (sel res_arr.err) { ret res[value.Value, fail.Fail].err{res_arr.err}; }
-                arr_ir = res_arr.ok;
-            }
-        }
-    }
-
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
-
-    var idx: [2]value.Value;
-    idx[0] = value.const_int(0, xty);
-    idx[1] = ix;
-    ret builder.emit_gep(?ctx.builder, base, arr_ir, ?idx[0], 2);
+    ret builder.emit_element(?ctx.builder, base, res_obj_ir.ok, ix);
 }
 
 pub fun try_lower_comptime_intrinsic(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) opt[res[value.Value, fail.Fail]] {
@@ -1084,8 +902,8 @@ pub fun try_lower_comptime_intrinsic(ctx: *lower_context.LowerContext, eid: ast_
     val ce:       *ast_expr.Expr = ?ce_value;
     if (ce.kind != ast_expr.EXPR_KIND_COMPTIME_IDENT) { ret opt[res[value.Value, fail.Fail]].none{}; }
 
-    val id: intrinsic.Id = intrinsic.ident_intrinsic(lower_context.module_source(ctx), ce.data.comptime_ident.tok);
-    if (id == intrinsic.TYPE_NAME || id == intrinsic.TYPE_ID) {
+    val id_of: intrinsic.Id = intrinsic.ident_intrinsic(lower_context.module_source(ctx), ce.data.comptime_ident.tok);
+    if (id_of == intrinsic.TYPE_NAME || id_of == intrinsic.TYPE_ID) {
         val tv: res[comptime.CTValue, comptime.EvalFail] = comptime.evaluate[lower_context.LowerContext](ctx.scope.ctx, ctx, ctx.caps, ctx.scope.a, lower_context.module_source(ctx), eid, ?ctx.s.interner);
         lower_context.record_eval_result(ctx, tv);
         if (sel tv.err) {
@@ -1093,38 +911,38 @@ pub fun try_lower_comptime_intrinsic(ctx: *lower_context.LowerContext, eid: ast_
         }
         ret opt[res[value.Value, fail.Fail]].some{const_value_of(ctx, eid, tv.ok)};
     }
-    if (!intrinsic.in_class(id, intrinsic.CLASS_LAYOUT)) { ret opt[res[value.Value, fail.Fail]].none{}; }
+    if (!intrinsic.in_class(id_of, intrinsic.CLASS_LAYOUT)) { ret opt[res[value.Value, fail.Fail]].none{}; }
 
-    val arity: u32 = intrinsic.row(id).args;
+    val arity: u32 = intrinsic.row(id_of).args;
     if (e.data.call.args_len < arity ||
         e.data.call.args_start::usize + e.data.call.args_len::usize > ctx.scope.a.expr_ids.len) {
         ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{fail.message("lower: comptime intrinsic argument index out of range")}};
     }
-    val arg0_eid:  ast_id.ExprId                    = ctx.scope.a.expr_ids.data[e.data.call.args_start];
-    val op_ty:     type.TypeId                      = type.strip_secret(?ctx.s.types, lower_context.expr_type_of(ctx, arg0_eid));
-    val res_op_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, op_ty);
+    val arg0_eid:  ast_id.ExprId        = ctx.scope.a.expr_ids.data[e.data.call.args_start];
+    val op_ty:     type.TypeId          = type.strip_secret(?ctx.s.types, lower_context.expr_type_of(ctx, arg0_eid));
+    val res_op_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, op_ty);
     if (sel res_op_ir.err) {
         ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_op_ir.err}};
     }
-    val op_ir: ir_type.IrTypeId = res_op_ir.ok;
+    val op_ir: Type = res_op_ir.ok;
 
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) {
         ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_ir.err}};
     }
-    val rt: ir_type.IrTypeId = res_ir.ok;
+    val rt: Type = res_ir.ok;
 
-    var n: u32 = 0;
-    if (id == intrinsic.SIZE_OF)  { n = ir_type.byte_size_for_machine(?ctx.m.types, op_ir, resolved.layout_machine(ctx.tgt)); }
-    if (id == intrinsic.ALIGN_OF) { n = ir_type.byte_align_for_machine(?ctx.m.types, op_ir, resolved.layout_machine(ctx.tgt)); }
-    if (id == intrinsic.LENGTH_OF) {
+    var n: u64 = 0;
+    if (id_of == intrinsic.SIZE_OF)  { n = builder.size_of(?ctx.builder, op_ir); }
+    if (id_of == intrinsic.ALIGN_OF) { n = lower_context.storage_align(ctx, op_ty, op_ir); }
+    if (id_of == intrinsic.LENGTH_OF) {
         val c_opt: opt[u32] = type.element_count(?ctx.s.types, op_ty);
         if (sel c_opt.none) {
             ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{fail.message("lower: $length_of operand has no element count")}};
         }
-        n = c_opt.some;
+        n = c_opt.some::u64;
     }
-    if (id == intrinsic.OFFSET_OF) {
+    if (id_of == intrinsic.OFFSET_OF) {
         val f_eid: ast_id.ExprId                 = ctx.scope.a.expr_ids.data[e.data.call.args_start + 1];
         val opt_f: res[ast_expr.Expr, fail.Fail] = lower_context.expression(ctx, f_eid);
         if (sel opt_f.err) {
@@ -1133,9 +951,13 @@ pub fun try_lower_comptime_intrinsic(ctx: *lower_context.LowerContext, eid: ast_
         if (opt_f.ok.kind != ast_expr.EXPR_KIND_IDENT) {
             ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{fail.message("lower: offset_of field argument is not a bare identifier")}};
         }
-        val field_ix: u32 = field_index_in_type(ctx, op_ty, opt_f.ok.data.ident.tok);
-        n = ir_type.member_offset_for_machine(?ctx.m.types, op_ir, field_ix, resolved.layout_machine(ctx.tgt));
+        val field_ix: u32                 = field_index_in_type(ctx, op_ty, opt_f.ok.data.ident.tok);
+        val at:       res[u64, fail.Fail] = lower_context.member_offset(ctx, op_ty, op_ir, field_ix);
+        if (sel at.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{at.err}}; }
+        n = at.ok;
     }
+    val measured: err[fail.Fail] = lower_context.builder_state(ctx);
+    if (sel measured.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{measured.err}}; }
 
     val dst_ty:  type.TypeId     = type.strip_secret(?ctx.s.types, lower_context.expr_type_of(ctx, eid));
     val opt_dst: opt[*type.Type] = type.get(?ctx.s.types, dst_ty);
@@ -1146,20 +968,53 @@ pub fun try_lower_comptime_intrinsic(ctx: *lower_context.LowerContext, eid: ast_
             if (d.signed) { max = (1::u64 << (d.bits - 1)::usize) - 1; }
             or            { max = ~(0::u64) >> (64 - d.bits)::usize; }
             # sema refused a measurement its destination cannot hold
-            if (n::u64 > max) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{fail.message("lower: a layout measurement sema admitted does not fit its type")}}; }
+            if (n > max) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{fail.message("lower: a layout measurement sema admitted does not fit its type")}}; }
         }
     }
 
-    ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].ok{value.const_int(n::u64, rt)}};
+    ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].ok{value.const_int(n, rt)}};
 }
 
 fun lower_call(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
     val opt_intr: opt[res[value.Value, fail.Fail]] = try_lower_comptime_intrinsic(ctx, eid, e);
     if (sel opt_intr.some) { ret opt_intr.some; }
 
-    val res_callee: res[value.Value, fail.Fail] = lower_callee(ctx, eid, e);
-    if (sel res_callee.err) { ret res_callee; }
-    val callee: value.Value = res_callee.ok;
+    # a call of an `#[op]` function on its target is the instruction it names
+    val opt_named: opt[lower_context.Declared] = callee_declared(ctx, e.data.call.callee);
+    if (sel opt_named.some) {
+        val op: opt[*target_definition.Op] = lower_context.declared_op(ctx, opt_named.some);
+        if (sel op.some) { ret lower_target_op(ctx, eid, e, op.some); }
+    }
+
+    # on a target whose pointers name a storage class, a direct call of a plain function is
+    # resolved once its arguments are, since the classes they point into choose the copy
+    val opt_plain: opt[lower_context.Declared] = classed_callee(ctx, e);
+    var callee:    value.Value                 = value.none();
+    var sig:       Type                        = irt.NONE;
+    if (sel opt_plain.some) {
+        val res_plain: res[lower_context.FnSig, fail.Fail] = lower_context.fn_sig_of_type(ctx, lower_context.expr_type_of(ctx, e.data.call.callee));
+        if (sel res_plain.err) { ret res[value.Value, fail.Fail].err{res_plain.err}; }
+        sig = res_plain.ok.sig;
+    }
+    or {
+        val res_callee: res[value.Value, fail.Fail] = lower_callee(ctx, eid, e);
+        if (sel res_callee.err) { ret res_callee; }
+        callee = res_callee.ok;
+        sig    = callee.sig;
+        # an instance is emitted once at its own signature, never per tuple of classes
+        if (builder.classes(?ctx.builder) && callee.kind == value.VAL_FN && irt.takes_pointer(?ctx.m.types, sig)) {
+            ret res[value.Value, fail.Fail].err{lower_context.report_gate(ctx, diagnostic_kind.SPIRV_UNSUPPORTED, e.span,
+                "a generic, comptime-parameter or pack function taking a pointer is not yet called where pointers name a storage class: its instance is lowered once, not once per class its callers pass (#4854)")};
+        }
+    }
+
+    # a direct call is made through its callee's signature, an indirect one through the
+    # function type it calls
+    if (sel opt_plain.none && callee.kind != value.VAL_FN) {
+        val res_sig: res[lower_context.FnSig, fail.Fail] = lower_context.fn_sig_of_type(ctx, lower_context.expr_type_of(ctx, e.data.call.callee));
+        if (sel res_sig.err) { ret res[value.Value, fail.Fail].err{res_sig.err}; }
+        sig = res_sig.ok.sig;
+    }
 
     # the callee's comptime parameters take no argument at run time
     val opt_cf: opt[lower_context.Declared] = callee_declared(ctx, e.data.call.callee);
@@ -1176,8 +1031,7 @@ fun lower_call(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_exp
     if (has_ct)     { rtc = runtime_arg_count(cf, argc); }
     if (has_spread) { rtc = (argc - 1) + ctx.pack_len; }
 
-    var args:     *value.Value = nil;
-    var borrowed: bool         = false;
+    var args: *value.Value = nil;
     fin {
         if (args != nil) { A.deallocate[value.Value](ctx.s.alloc, args, rtc::usize); }
     }
@@ -1217,49 +1071,117 @@ fun lower_call(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_exp
             ctx.borrow_eid   = arg_eid;
             ctx.borrow_hit   = false;
             val res_arg: res[value.Value, fail.Fail] = lower_rvalue(ctx, arg_eid);
-            if (ctx.borrow_hit) { borrowed = true; }
             ctx.borrow_armed = saved_armed;
             ctx.borrow_eid   = saved_eid;
             ctx.borrow_hit   = saved_hit;
             if (sel res_arg.err) { ret res_arg; }
             args[dst] = res_arg.ok;
-            # an aggregate argument whose bytes may hold a secret rides secret carriers, whatever its outer secrecy
-            if (lower_context.type_contains_secret(ctx, lower_context.expr_type_of(ctx, arg_eid))) { args[dst].secret = true; }
-            dst = dst + 1;
-            i   = i + 1;
+            dst       = dst + 1;
+            i         = i + 1;
         }
     }
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
-    if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
-    val rt: ir_type.IrTypeId = res_ir.ok;
 
-    val res_call: res[value.Value, fail.Fail] = builder.emit_call(?ctx.builder, callee, args, rtc, rt);
-    if (sel res_call.err) { ret res_call; }
-    var out: value.Value = res_call.ok;
-    # a direct call carries its callee's declared extensions; an indirect one
-    # takes them from the function type it calls through
-    if (callee.kind != value.VAL_FN) {
-        val res_ext: res[ir_type.ExtListId, fail.Fail] = lower_context.fun_type_ext(ctx, lower_context.expr_type_of(ctx, e.data.call.callee));
-        if (sel res_ext.err) { ret res[value.Value, fail.Fail].err{res_ext.err}; }
-        ctx.builder.fn.instrs[out.data.instr::u32].arg_ext = res_ext.ok;
+    if (sel opt_plain.some) {
+        val chosen: res[value.Value, fail.Fail] = classed_reference(ctx, e.data.call.callee, opt_plain.some, sig, args, rtc);
+        if (sel chosen.err) { ret chosen; }
+        callee = chosen.ok;
+        sig    = callee.sig;
     }
-    # an inliner must copy a borrowed argument before the callee body can write it
-    if (borrowed) { ctx.builder.fn.instrs[out.data.instr::u32].flags = ctx.builder.fn.instrs[out.data.instr::u32].flags | ir_instruction.INSTR_FLAG_BORROWED_ARGS; }
-    if (!out.secret && lower_context.type_contains_secret(ctx, lower_context.expr_type_of(ctx, eid))) {
-        out.secret = true;
-        ir_instruction.mark_result_secret(ctx.builder.fn.instrs, ctx.builder.fn.instr_len, out);
+
+    # a call whose result holds a secret gives a secret result
+    builder.set_secret(?ctx.builder, lower_context.type_contains_secret(ctx, lower_context.expr_type_of(ctx, eid)));
+    val res_call: res[value.Value, fail.Fail] = builder.emit_call(?ctx.builder, callee, sig, args, rtc);
+    builder.set_secret(?ctx.builder, false);
+    ret res_call;
+}
+
+# a call of an `#[op]` function, as the target op it names: its operands are the arguments in
+# order, its result is the function's declared return, and it touches the memory its row's
+# pointer and handle operands do
+fun lower_target_op(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr, row: *target_definition.Op) res[value.Value, fail.Fail] {
+    if (lower_shader.core_op(row)) { ret res[value.Value, fail.Fail].err{lower_context.report_gate(ctx, diagnostic_kind.SPIRV_UNSUPPORTED, e.span, lower_shader.CORE_OP_REFUSED)}; }
+    val res_sig: res[lower_context.FnSig, fail.Fail] = lower_context.fn_sig_of_type(ctx, lower_context.expr_type_of(ctx, e.data.call.callee));
+    if (sel res_sig.err) { ret res[value.Value, fail.Fail].err{res_sig.err}; }
+    var result: Type                                   = irt.result_of(?ctx.m.types, res_sig.ok.sig);
+    val argc:   u32                                    = e.data.call.args_len;
+    var args:   collections_vector.Vector[value.Value] = collections_vector.init[value.Value](ctx.s.alloc);
+    fin { collections_vector.dnit[value.Value](?args); }
+    var i: u32 = 0;
+    for (i < argc) {
+        val arg: res[value.Value, fail.Fail] = lower_rvalue(ctx, ctx.scope.a.expr_ids.data[e.data.call.args_start + i]);
+        if (sel arg.err) { ret arg; }
+        val pushed: res[usize, A.Error] = collections_vector.push[value.Value](?args, arg.ok);
+        if (sel pushed.err) { ret res[value.Value, fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
     }
-    ret res[value.Value, fail.Fail].ok{out};
+    var results: Slice[Type] = Slice[Type]{data: ?result, size: 1};
+    if (irt.is_none(result)) { results = Slice[Type]{data: nil, size: 0}; }
+    var op: native.Op = native.Op{
+        set:     View{data: row.set, len: str_len(row.set)},
+        name:    View{data: row.name, len: str_len(row.name)},
+        results: results,
+        reads:   target_definition.op_reads(row),
+        writes:  target_definition.op_writes(row)
+    };
+    builder.set_secret(?ctx.builder, lower_context.type_contains_secret(ctx, lower_context.expr_type_of(ctx, eid)));
+    val made: res[value.Value, fail.Fail] = builder.emit_target_op(?ctx.builder, ?op, args.data, args.len::u32);
+    builder.set_secret(?ctx.builder, false);
+    ret made;
+}
+
+# the function a direct call names, when it is a plain one called on a target whose pointers
+# name a storage class: no comptime, pack or generic parameter, and no spread argument
+fun classed_callee(ctx: *lower_context.LowerContext, e: *ast_expr.Expr) opt[lower_context.Declared] {
+    if (!builder.classes(?ctx.builder) || e.data.call.type_args_len != 0 || call_has_spread(ctx, e)) { ret opt[lower_context.Declared].none{}; }
+    val opt_cf: opt[lower_context.Declared] = callee_declared(ctx, e.data.call.callee);
+    if (sel opt_cf.none) { ret opt_cf; }
+    val d: *fe_sema.interface.Declaration = opt_cf.some.declaration;
+    if (fe_sema.interface.declaration_has_comptime_param(opt_cf.some.iface, d)) { ret opt[lower_context.Declared].none{}; }
+    if ((d.flags & fe_sema.interface.DECLARATION_PACK) != 0 || d.generics > 0)  { ret opt[lower_context.Declared].none{}; }
+    ret opt_cf;
+}
+
+# the function a plain direct call calls: the function itself where it takes no pointer,
+# else the copy of it this module lowers taking its pointers in the classes the `n`
+# arguments at `args` point into, one copy for each tuple of classes
+fun classed_reference(ctx: *lower_context.LowerContext, callee_eid: ast_id.ExprId, cf: lower_context.Declared, sig: Type,
+    args: *value.Value, n: u32) res[value.Value, fail.Fail] {
+    val t:   *types.Table         = ?ctx.m.types;
+    val sym: opt[*resolve.Symbol] = lower_context.symbol_of(ctx, lower_context.expr_symbol_of(ctx, callee_eid));
+    if (sel sym.none) { ret res[value.Value, fail.Fail].err{fail.message("lower: a callee names no symbol")}; }
+    val res_ln: res[intern.StrId, fail.Fail] = reference_linkage_name(ctx, sym.some);
+    if (sel res_ln.err) { ret res[value.Value, fail.Fail].err{res_ln.err}; }
+    val origin: session.ModuleId = resolve.origin_of(ctx.s, sym.some);
+
+    var params: collections_vector.Vector[Type] = collections_vector.init[Type](ctx.s.alloc);
+    fin { collections_vector.dnit[Type](?params); }
+    var pointers: bool = false;
+    var i:        u32  = 0;
+    for (i < irt.param_count(t, sig)) {
+        var p: Type = irt.param_of(t, sig, i);
+        if (irt.is_ptr(t, p) && i < n) {
+            pointers = true;
+            val a:         value.Value = args[i];
+            val addressed: bool        = a.kind == value.VAL_GLOBAL || (a.kind == value.VAL_SSA && irt.is_ptr(t, a.ty));
+            if (addressed) { p = builder.ptr_in(?ctx.builder, a.space); }
+        }
+        val pushed: res[usize, A.Error] = collections_vector.push[Type](?params, p);
+        if (sel pushed.err) { ret res[value.Value, fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    if (!pointers) { ret fn_reference(ctx, res_ln.ok, lower_context.FnSig{sig: sig}); }
+    val copied: res[Type, fail.Fail] = irt.restated(t, sig, params.data, params.len::u32);
+    if (sel copied.err) { ret res[value.Value, fail.Fail].err{copied.err}; }
+    val made: res[u32, fail.Fail] = lower_context.class_copy(ctx, origin, cf.declaration.decl, res_ln.ok, copied.ok);
+    if (sel made.err) { ret res[value.Value, fail.Fail].err{made.err}; }
+    ret res[value.Value, fail.Fail].ok{value.fn(made.ok, builder.ptr_type(?ctx.builder), copied.ok)};
 }
 
 # whether call argument `ord` may be read in place: an aggregate place with no secret, read
-# where no later argument can write anything, so the ABI placement at the call still copies
-# the value the argument had when it was evaluated
+# where no later argument can write anything, so the call's whole read of it still sees the
+# value the argument had when it was evaluated
 fun arg_may_borrow(ctx: *lower_context.LowerContext, e: *ast_expr.Expr, ord: u32, arg_eid: ast_id.ExprId,
     has_ct: bool, cf: lower_context.Declared) bool {
-    # the in-place read rests on the caller's placement copy, which a convention that
-    # passes logical values does not make
-    if (ctx.tgt == nil || ctx.tgt.passing != catalog_abi.PASSING_CARRIERS) { ret false; }
     val opt_e: res[ast_expr.Expr, fail.Fail] = lower_context.expression(ctx, arg_eid);
     if (sel opt_e.err) { ret false; }
     val k: ast_expr.ExprKind = opt_e.ok.kind;
@@ -1267,7 +1189,7 @@ fun arg_may_borrow(ctx: *lower_context.LowerContext, e: *ast_expr.Expr, ord: u32
         && k != ast_expr.EXPR_KIND_INDEX && k != ast_expr.EXPR_KIND_UNARY) { ret false; }
     if (k == ast_expr.EXPR_KIND_UNARY && opt_e.ok.data.unary.op != ast_expr.UN_DEREF)      { ret false; }
     if (lower_context.type_contains_secret(ctx, lower_context.expr_type_of(ctx, arg_eid))) { ret false; }
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, arg_eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, arg_eid);
     if (sel res_ir.err)                    { ret false; }
     if (!is_aggregate_ir(ctx, res_ir.ok))  { ret false; }
     if (!expr_write_free(ctx, arg_eid, 0)) { ret false; }
@@ -1419,7 +1341,7 @@ fun lower_instance_reference(ctx: *lower_context.LowerContext, eid: ast_id.ExprI
 
     val sig: res[lower_context.FnSig, fail.Fail] = lower_context.instance_ref_sig(ctx, item);
     if (sel sig.err) { ret res[value.Value, fail.Fail].err{sig.err}; }
-    ret fn_reference(ctx, link.ok, sig.ok, false);
+    ret fn_reference(ctx, link.ok, sig.ok);
 }
 
 fun lower_binary(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
@@ -1430,11 +1352,11 @@ fun lower_binary(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_e
 
     val res_lhs: res[value.Value, fail.Fail] = lower_rvalue(ctx, e.data.binary.lhs);
     if (sel res_lhs.err) { ret res_lhs; }
-    var lhs: value.Value = res_lhs.ok;
+    val lhs: value.Value = res_lhs.ok;
 
     val res_rhs: res[value.Value, fail.Fail] = lower_rvalue(ctx, e.data.binary.rhs);
     if (sel res_rhs.err) { ret res_rhs; }
-    var rhs: value.Value = res_rhs.ok;
+    val rhs: value.Value = res_rhs.ok;
 
     val lty:    type.TypeId = lower_context.expr_type_of(ctx, e.data.binary.lhs);
     val rty:    type.TypeId = lower_context.expr_type_of(ctx, e.data.binary.rhs);
@@ -1444,8 +1366,7 @@ fun lower_binary(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_e
         ret lower_vector_binary(ctx, op, lhs, rhs, lty);
     }
 
-    if (is_compare_binop(op))   { ret lower_cmp(ctx, op, lhs, lty, rhs, rty); }
-    if (is_half_type(ctx, lty)) { ret lower_half_binary(ctx, op, lhs, rhs); }
+    if (is_compare_binop(op)) { ret lower_cmp(ctx, op, lhs, lty, rhs, rty); }
 
     if (op == ast_expr.BIN_ADD) { ret builder.emit_add(?ctx.builder, lhs, rhs); }
     if (op == ast_expr.BIN_SUB) { ret builder.emit_sub(?ctx.builder, lhs, rhs); }
@@ -1455,8 +1376,7 @@ fun lower_binary(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_e
         ret builder.emit_div_u(?ctx.builder, lhs, rhs);
     }
     if (op == ast_expr.BIN_MOD) {
-        if (is_float_type(ctx, lty)) { ret lower_float_rem(ctx, lhs, rhs); }
-        if (signed)                  { ret builder.emit_rem_s(?ctx.builder, lhs, rhs); }
+        if (signed) { ret builder.emit_rem_s(?ctx.builder, lhs, rhs); }
         ret builder.emit_rem_u(?ctx.builder, lhs, rhs);
     }
     if (op == ast_expr.BIN_BIT_AND) { ret builder.emit_and(?ctx.builder, lhs, rhs); }
@@ -1471,45 +1391,8 @@ fun lower_binary(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_e
     ret res[value.Value, fail.Fail].err{fail.message("lower: unsupported binary operator")};
 }
 
-fun half_of(ctx: *lower_context.LowerContext) res[half.Half, fail.Fail] {
-    ret half.init(?ctx.builder, ctx.tgt);
-}
-
-# an f16 operator: `%` is exact, so the remainder of the operands widened to
-# the expansion's format narrows without rounding
-fun lower_half_binary(ctx: *lower_context.LowerContext, op: ast_expr.BinOp, lhs: value.Value, rhs: value.Value) res[value.Value, fail.Fail] {
-    val res_h: res[half.Half, fail.Fail] = half_of(ctx);
-    if (sel res_h.err) { ret res[value.Value, fail.Fail].err{res_h.err}; }
-    var h: half.Half = res_h.ok;
-    if (op == ast_expr.BIN_ADD) { ret half.done(?h, half.arith(?h, ir_instruction.OP_ADD, lhs, rhs)); }
-    if (op == ast_expr.BIN_SUB) { ret half.done(?h, half.arith(?h, ir_instruction.OP_SUB, lhs, rhs)); }
-    if (op == ast_expr.BIN_MUL) { ret half.done(?h, half.arith(?h, ir_instruction.OP_MUL, lhs, rhs)); }
-    if (op == ast_expr.BIN_DIV) { ret half.done(?h, half.arith(?h, ir_instruction.OP_DIV_U, lhs, rhs)); }
-    if (op != ast_expr.BIN_MOD) { ret res[value.Value, fail.Fail].err{fail.message("lower: unsupported f16 operator")}; }
-    val wl: res[value.Value, fail.Fail] = half.done(?h, half.widen(?h, lhs));
-    if (sel wl.err) { ret wl; }
-    val wr: res[value.Value, fail.Fail] = half.done(?h, half.widen(?h, rhs));
-    if (sel wr.err) { ret wr; }
-    val r: res[value.Value, fail.Fail] = lower_float_rem(ctx, wl.ok, wr.ok);
-    if (sel r.err) { ret r; }
-    ret half.done(?h, half.narrow(?h, r.ok));
-}
-
-# a comparison operand at `bits`: an f16 as its exact widening, and a narrower
-# float beside a wider one extended to it
-fun half_compare_operand(ctx: *lower_context.LowerContext, h: *half.Half, v: value.Value, tid: type.TypeId, bits: u32) res[value.Value, fail.Fail] {
-    if (is_half_type(ctx, tid) && bits == 16) { ret half.done(h, half.compare_operand(h, v)); }
-    if (is_half_type(ctx, tid))               { ret half.done(h, half.to_float(h, v, bits)); }
-    if (scalar_bits(ctx, tid) >= bits)        { ret res[value.Value, fail.Fail].ok{v}; }
-    if (bits == 64)                           { ret builder.emit_fp_ext(?ctx.builder, v, h.f64t); }
-    val ft: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_float(?ctx.builder.m.types, bits);
-    if (sel ft.err) { ret res[value.Value, fail.Fail].err{ft.err}; }
-    ret builder.emit_fp_ext(?ctx.builder, v, ft.ok);
-}
-
 fun lower_vector_binary(ctx: *lower_context.LowerContext, op: ast_expr.BinOp, lhs: value.Value, rhs: value.Value, lty: type.TypeId) res[value.Value, fail.Fail] {
-    if (is_half_vector(ctx, lty)) { ret lower_half_vector_binary(ctx, op, lhs, rhs); }
-    if (is_compare_binop(op))     { ret lower_vector_compare(ctx, op, lhs, rhs, vector_lane_signed(ctx, lty)); }
+    if (is_compare_binop(op)) { ret lower_vector_compare(ctx, op, lhs, rhs, vector_lane_signed(ctx, lty)); }
 
     if (op == ast_expr.BIN_ADD) { ret builder.emit_add(?ctx.builder, lhs, rhs); }
     if (op == ast_expr.BIN_SUB) { ret builder.emit_sub(?ctx.builder, lhs, rhs); }
@@ -1530,49 +1413,28 @@ fun lower_vector_binary(ctx: *lower_context.LowerContext, op: ast_expr.BinOp, lh
     ret res[value.Value, fail.Fail].err{fail.message("lower: unsupported vector binary operator")};
 }
 
-# an operator over f16 lanes, each lane as me.half lowers the scalar one
-fun lower_half_vector_binary(ctx: *lower_context.LowerContext, op: ast_expr.BinOp, lhs: value.Value, rhs: value.Value) res[value.Value, fail.Fail] {
-    val res_h: res[half.Half, fail.Fail] = half_of(ctx);
-    if (sel res_h.err) { ret res[value.Value, fail.Fail].err{res_h.err}; }
-    var h: half.Half = res_h.ok;
-    if (op == ast_expr.BIN_ADD) { ret half.done(?h, half.vec_arith(?h, ir_instruction.OP_ADD, lhs, rhs)); }
-    if (op == ast_expr.BIN_SUB) { ret half.done(?h, half.vec_arith(?h, ir_instruction.OP_SUB, lhs, rhs)); }
-    if (op == ast_expr.BIN_MUL) { ret half.done(?h, half.vec_arith(?h, ir_instruction.OP_MUL, lhs, rhs)); }
-    if (op == ast_expr.BIN_DIV) { ret half.done(?h, half.vec_arith(?h, ir_instruction.OP_DIV_U, lhs, rhs)); }
-    if (!is_compare_binop(op))  { ret res[value.Value, fail.Fail].err{fail.message("lower: unsupported f16 vector operator")}; }
-    val res_mask: res[ir_type.IrTypeId, fail.Fail] = vector_mask_ir(ctx, lhs.ty);
-    if (sel res_mask.err) { ret res[value.Value, fail.Fail].err{res_mask.err}; }
-    val mask: ir_type.IrTypeId = res_mask.ok;
-    if (op == ast_expr.BIN_EQ)  { ret half.done(?h, half.vec_compare(?h, ir_instruction.OP_CMP_EQ, lhs, rhs, mask)); }
-    if (op == ast_expr.BIN_NEQ) { ret half.done(?h, half.vec_compare(?h, ir_instruction.OP_CMP_NE, lhs, rhs, mask)); }
-    if (op == ast_expr.BIN_LT)  { ret half.done(?h, half.vec_compare(?h, ir_instruction.OP_CMP_LT_U, lhs, rhs, mask)); }
-    if (op == ast_expr.BIN_LEQ) { ret half.done(?h, half.vec_compare(?h, ir_instruction.OP_CMP_LE_U, lhs, rhs, mask)); }
-    if (op == ast_expr.BIN_GT)  { ret half.done(?h, half.vec_compare(?h, ir_instruction.OP_CMP_LT_U, rhs, lhs, mask)); }
-    ret half.done(?h, half.vec_compare(?h, ir_instruction.OP_CMP_LE_U, rhs, lhs, mask));
-}
-
 fun lower_vector_compare(ctx: *lower_context.LowerContext, op: ast_expr.BinOp, lhs: value.Value, rhs: value.Value, signed: bool) res[value.Value, fail.Fail] {
-    val res_mask: res[ir_type.IrTypeId, fail.Fail] = vector_mask_ir(ctx, lhs.ty);
+    val res_mask: res[Type, fail.Fail] = vector_mask_ir(ctx, lhs.ty);
     if (sel res_mask.err) { ret res[value.Value, fail.Fail].err{res_mask.err}; }
-    val mask: ir_type.IrTypeId = res_mask.ok;
+    val mask: Type = res_mask.ok;
 
-    if (op == ast_expr.BIN_EQ)  { ret builder.emit_vcompare(?ctx.builder, ir_instruction.OP_CMP_EQ, lhs, rhs, mask); }
-    if (op == ast_expr.BIN_NEQ) { ret builder.emit_vcompare(?ctx.builder, ir_instruction.OP_CMP_NE, lhs, rhs, mask); }
-    if (op == ast_expr.BIN_LT)  { ret builder.emit_vcompare(?ctx.builder, vec_cmp_lt(signed), lhs, rhs, mask); }
-    if (op == ast_expr.BIN_LEQ) { ret builder.emit_vcompare(?ctx.builder, vec_cmp_le(signed), lhs, rhs, mask); }
-    if (op == ast_expr.BIN_GT)  { ret builder.emit_vcompare(?ctx.builder, vec_cmp_lt(signed), rhs, lhs, mask); }
-    if (op == ast_expr.BIN_GEQ) { ret builder.emit_vcompare(?ctx.builder, vec_cmp_le(signed), rhs, lhs, mask); }
+    if (op == ast_expr.BIN_EQ)  { ret builder.emit_vcompare(?ctx.builder, opcode.EQ, opcode.FEQ_O, lhs, rhs, mask); }
+    if (op == ast_expr.BIN_NEQ) { ret builder.emit_vcompare(?ctx.builder, opcode.NE, opcode.FNE_U, lhs, rhs, mask); }
+    if (op == ast_expr.BIN_LT)  { ret builder.emit_vcompare(?ctx.builder, vec_cmp_lt(signed), opcode.FLT_O, lhs, rhs, mask); }
+    if (op == ast_expr.BIN_LEQ) { ret builder.emit_vcompare(?ctx.builder, vec_cmp_le(signed), opcode.FLE_O, lhs, rhs, mask); }
+    if (op == ast_expr.BIN_GT)  { ret builder.emit_vcompare(?ctx.builder, vec_cmp_lt(signed), opcode.FLT_O, rhs, lhs, mask); }
+    if (op == ast_expr.BIN_GEQ) { ret builder.emit_vcompare(?ctx.builder, vec_cmp_le(signed), opcode.FLE_O, rhs, lhs, mask); }
     ret res[value.Value, fail.Fail].err{fail.message("lower: unsupported vector comparison operator")};
 }
 
-fun vec_cmp_lt(signed: bool) ir_instruction.InstrKind {
-    if (signed) { ret ir_instruction.OP_CMP_LT_S; }
-    ret ir_instruction.OP_CMP_LT_U;
+fun vec_cmp_lt(signed: bool) Opcode {
+    if (signed) { ret opcode.LT_S; }
+    ret opcode.LT_U;
 }
 
-fun vec_cmp_le(signed: bool) ir_instruction.InstrKind {
-    if (signed) { ret ir_instruction.OP_CMP_LE_S; }
-    ret ir_instruction.OP_CMP_LE_U;
+fun vec_cmp_le(signed: bool) Opcode {
+    if (signed) { ret opcode.LE_S; }
+    ret opcode.LE_U;
 }
 
 fun vector_lane_signed(ctx: *lower_context.LowerContext, lty: type.TypeId) bool {
@@ -1580,407 +1442,16 @@ fun vector_lane_signed(ctx: *lower_context.LowerContext, lty: type.TypeId) bool 
     ret type.prim_desc(type.vector_element(?ctx.s.types, base)).signed;
 }
 
-fun vector_mask_ir(ctx: *lower_context.LowerContext, vec_ir: ir_type.IrTypeId) res[ir_type.IrTypeId, fail.Fail] {
-    val opt_v: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, vec_ir);
-    if (sel opt_v.none) { ret res[ir_type.IrTypeId, fail.Fail].err{fail.message("lower: vector compare operand is not an IR vector")}; }
-    val vt: *ir_type.IrType = opt_v.some;
-    if (vt.kind != ir_type.IRT_VECTOR) { ret res[ir_type.IrTypeId, fail.Fail].err{fail.message("lower: vector compare operand is not an IR vector")}; }
-
-    val opt_e: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, vt.data.vector_.element);
-    if (sel opt_e.none) { ret res[ir_type.IrTypeId, fail.Fail].err{fail.message("lower: vector element type not resolvable")}; }
-    val lane_bits: u32 = opt_e.some.data.bits;
-    val lanes:     u32 = vt.data.vector_.lanes;
-
-    val res_elem: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?ctx.m.types, lane_bits);
+# the mask a comparison of `vec_ir` vectors gives: an integer lane as wide as each of theirs
+fun vector_mask_ir(ctx: *lower_context.LowerContext, vec_ir: Type) res[Type, fail.Fail] {
+    val t: *types.Table = builder.types_of(?ctx.builder);
+    if (!irt.is_vector(t, vec_ir)) { ret res[Type, fail.Fail].err{fail.message("lower: vector compare operand is not a vector")}; }
+    val lane: Type = irt.element(t, vec_ir);
+    var bits: u32  = irt.int_width(t, lane);
+    if (irt.is_float(t, lane)) { bits = irt.float_width(t, lane); }
+    val res_elem: res[Type, fail.Fail] = irt.int(t, bits);
     if (sel res_elem.err) { ret res_elem; }
-    ret ir_type.intern_vector(?ctx.m.types, res_elem.ok, lanes);
-}
-
-# the quotient of the operands float_rem_needs_narrow selects is a zero, an
-# infinity or a NaN, which truncation leaves unchanged, so the formula is taken
-# in floating point as it stands: a zero divisor and an infinite dividend give
-# NaN on every target. a zero quotient means a finite dividend over an
-# infinite divisor, where `0 * inf` would be NaN, so the dividend is the result
-# as in C fmod
-fun float_rem_narrow(ctx: *lower_context.LowerContext, lhs: value.Value, rhs: value.Value) res[value.Value, fail.Fail] {
-    val res_q: res[value.Value, fail.Fail] = builder.emit_div_u(?ctx.builder, lhs, rhs);
-    if (sel res_q.err) { ret res_q; }
-    val q: value.Value = res_q.ok;
-
-    val res_qzero: res[value.Value, fail.Fail] = builder.emit_cmp_eq(?ctx.builder, q, value.const_float(0.0, q.ty));
-    if (sel res_qzero.err) { ret res_qzero; }
-    val q_zero:    value.Value   = res_qzero.ok;
-    val blk_entry: me_ir.BlockId = ctx.builder.block;
-
-    val res_bf: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_bf.err) { ret res[value.Value, fail.Fail].err{res_bf.err}; }
-    val blk_formula: me_ir.BlockId                 = res_bf.ok;
-    val res_bj:      res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_bj.err) { ret res[value.Value, fail.Fail].err{res_bj.err}; }
-    val blk_join: me_ir.BlockId  = res_bj.ok;
-    val res_cbr:  err[fail.Fail] = builder.emit_cbr(?ctx.builder, q_zero, blk_join, blk_formula);
-    if (sel res_cbr.err) { ret res[value.Value, fail.Fail].err{res_cbr.err}; }
-
-    builder.set_block(?ctx.builder, blk_formula);
-    val res_prod: res[value.Value, fail.Fail] = builder.emit_mul(?ctx.builder, q, rhs);
-    if (sel res_prod.err) { ret res_prod; }
-    val res_diff: res[value.Value, fail.Fail] = builder.emit_sub(?ctx.builder, lhs, res_prod.ok);
-    if (sel res_diff.err) { ret res_diff; }
-    val diff:   value.Value    = res_diff.ok;
-    val res_br: err[fail.Fail] = builder.emit_br(?ctx.builder, blk_join);
-    if (sel res_br.err) { ret res[value.Value, fail.Fail].err{res_br.err}; }
-
-    builder.set_block(?ctx.builder, blk_join);
-    val res_phi: res[value.Value, fail.Fail] = builder.emit_phi(?ctx.builder, lhs.ty);
-    if (sel res_phi.err) { ret res_phi; }
-    val phi:     value.Value    = res_phi.ok;
-    val res_in0: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, phi, blk_entry, lhs);
-    if (sel res_in0.err) { ret res[value.Value, fail.Fail].err{res_in0.err}; }
-    val res_in1: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, phi, blk_formula, diff);
-    if (sel res_in1.err) { ret res[value.Value, fail.Fail].err{res_in1.err}; }
-    ret res[value.Value, fail.Fail].ok{phi};
-}
-
-fun float_abs(ctx: *lower_context.LowerContext, v: value.Value, zero: value.Value) res[value.Value, fail.Fail] {
-    val res_neg: res[value.Value, fail.Fail] = builder.emit_cmp_lt_u(?ctx.builder, v, zero);
-    if (sel res_neg.err) { ret res_neg; }
-    val is_neg: value.Value = res_neg.ok;
-
-    val res_bneg: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_bneg.err) { ret res[value.Value, fail.Fail].err{res_bneg.err}; }
-    val blk_neg: me_ir.BlockId = res_bneg.ok;
-
-    val res_bpos: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_bpos.err) { ret res[value.Value, fail.Fail].err{res_bpos.err}; }
-    val blk_pos: me_ir.BlockId = res_bpos.ok;
-
-    val res_bmerge: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_bmerge.err) { ret res[value.Value, fail.Fail].err{res_bmerge.err}; }
-    val blk_merge: me_ir.BlockId = res_bmerge.ok;
-
-    val res_cbr: err[fail.Fail] = builder.emit_cbr(?ctx.builder, is_neg, blk_neg, blk_pos);
-    if (sel res_cbr.err) { ret res[value.Value, fail.Fail].err{res_cbr.err}; }
-
-    builder.set_block(?ctx.builder, blk_neg);
-    val res_negated: res[value.Value, fail.Fail] = builder.emit_sub(?ctx.builder, zero, v);
-    if (sel res_negated.err) { ret res_negated; }
-    val negated: value.Value    = res_negated.ok;
-    val res_br1: err[fail.Fail] = builder.emit_br(?ctx.builder, blk_merge);
-    if (sel res_br1.err) { ret res[value.Value, fail.Fail].err{res_br1.err}; }
-
-    builder.set_block(?ctx.builder, blk_pos);
-    val res_br2: err[fail.Fail] = builder.emit_br(?ctx.builder, blk_merge);
-    if (sel res_br2.err) { ret res[value.Value, fail.Fail].err{res_br2.err}; }
-
-    builder.set_block(?ctx.builder, blk_merge);
-    val res_phi: res[value.Value, fail.Fail] = builder.emit_phi(?ctx.builder, v.ty);
-    if (sel res_phi.err) { ret res_phi; }
-    val phi:     value.Value    = res_phi.ok;
-    val res_in1: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, phi, blk_neg, negated);
-    if (sel res_in1.err) { ret res[value.Value, fail.Fail].err{res_in1.err}; }
-    val res_in2: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, phi, blk_pos, v);
-    if (sel res_in2.err) { ret res[value.Value, fail.Fail].err{res_in2.err}; }
-
-    ret res[value.Value, fail.Fail].ok{phi};
-}
-
-fun float_rem_reduce(ctx: *lower_context.LowerContext, x0: value.Value, y: value.Value, two: value.Value) res[value.Value, fail.Fail] {
-    val fty: ir_type.IrTypeId = x0.ty;
-
-    val res_xhalf: res[value.Value, fail.Fail] = builder.emit_div_u(?ctx.builder, x0, two);
-    if (sel res_xhalf.err) { ret res_xhalf; }
-    val x_half: value.Value = res_xhalf.ok;
-
-    val blk_entry: me_ir.BlockId = ctx.builder.block;
-
-    val res_l1h: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_l1h.err) { ret res[value.Value, fail.Fail].err{res_l1h.err}; }
-    val l1_head: me_ir.BlockId = res_l1h.ok;
-
-    val res_l1b: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_l1b.err) { ret res[value.Value, fail.Fail].err{res_l1b.err}; }
-    val l1_body: me_ir.BlockId = res_l1b.ok;
-
-    val res_l1e: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_l1e.err) { ret res[value.Value, fail.Fail].err{res_l1e.err}; }
-    val l1_exit: me_ir.BlockId = res_l1e.ok;
-
-    val res_enter1: err[fail.Fail] = builder.emit_br(?ctx.builder, l1_head);
-    if (sel res_enter1.err) { ret res[value.Value, fail.Fail].err{res_enter1.err}; }
-
-    builder.set_block(?ctx.builder, l1_head);
-    val res_ykphi: res[value.Value, fail.Fail] = builder.emit_phi(?ctx.builder, fty);
-    if (sel res_ykphi.err) { ret res_ykphi; }
-    val yk_phi1: value.Value                 = res_ykphi.ok;
-    val res_c1:  res[value.Value, fail.Fail] = builder.emit_cmp_le_u(?ctx.builder, yk_phi1, x_half);
-    if (sel res_c1.err) { ret res_c1; }
-    val res_cbr1: err[fail.Fail] = builder.emit_cbr(?ctx.builder, res_c1.ok, l1_body, l1_exit);
-    if (sel res_cbr1.err) { ret res[value.Value, fail.Fail].err{res_cbr1.err}; }
-
-    builder.set_block(?ctx.builder, l1_body);
-    val res_ykn: res[value.Value, fail.Fail] = builder.emit_mul(?ctx.builder, yk_phi1, two);
-    if (sel res_ykn.err) { ret res_ykn; }
-    val yk_next1:  value.Value    = res_ykn.ok;
-    val res_back1: err[fail.Fail] = builder.emit_br(?ctx.builder, l1_head);
-    if (sel res_back1.err) { ret res[value.Value, fail.Fail].err{res_back1.err}; }
-
-    val res_i1a: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, yk_phi1, blk_entry, y);
-    if (sel res_i1a.err) { ret res[value.Value, fail.Fail].err{res_i1a.err}; }
-    val res_i1b: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, yk_phi1, l1_body, yk_next1);
-    if (sel res_i1b.err) { ret res[value.Value, fail.Fail].err{res_i1b.err}; }
-
-    builder.set_block(?ctx.builder, l1_exit);
-
-    val res_l2h: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_l2h.err) { ret res[value.Value, fail.Fail].err{res_l2h.err}; }
-    val l2_head: me_ir.BlockId = res_l2h.ok;
-
-    val res_l2s: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_l2s.err) { ret res[value.Value, fail.Fail].err{res_l2s.err}; }
-    val l2_sub: me_ir.BlockId = res_l2s.ok;
-
-    val res_l2n: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_l2n.err) { ret res[value.Value, fail.Fail].err{res_l2n.err}; }
-    val l2_nosub: me_ir.BlockId = res_l2n.ok;
-
-    val res_l2m: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_l2m.err) { ret res[value.Value, fail.Fail].err{res_l2m.err}; }
-    val l2_merge: me_ir.BlockId = res_l2m.ok;
-
-    val res_l2e: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_l2e.err) { ret res[value.Value, fail.Fail].err{res_l2e.err}; }
-    val l2_exit: me_ir.BlockId = res_l2e.ok;
-
-    val res_l2g: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_l2g.err) { ret res[value.Value, fail.Fail].err{res_l2g.err}; }
-    val l2_sub_gate: me_ir.BlockId = res_l2g.ok;
-
-    val res_enter2: err[fail.Fail] = builder.emit_br(?ctx.builder, l2_head);
-    if (sel res_enter2.err) { ret res[value.Value, fail.Fail].err{res_enter2.err}; }
-
-    builder.set_block(?ctx.builder, l2_head);
-    val res_xphi: res[value.Value, fail.Fail] = builder.emit_phi(?ctx.builder, fty);
-    if (sel res_xphi.err) { ret res_xphi; }
-    val x_phi:      value.Value                 = res_xphi.ok;
-    val res_ykphi2: res[value.Value, fail.Fail] = builder.emit_phi(?ctx.builder, fty);
-    if (sel res_ykphi2.err) { ret res_ykphi2; }
-    val yk_phi2: value.Value                 = res_ykphi2.ok;
-    val res_c2:  res[value.Value, fail.Fail] = builder.emit_cmp_le_u(?ctx.builder, y, yk_phi2);
-    if (sel res_c2.err) { ret res_c2; }
-    val res_cbr2: err[fail.Fail] = builder.emit_cbr(?ctx.builder, res_c2.ok, l2_sub_gate, l2_exit);
-    if (sel res_cbr2.err) { ret res[value.Value, fail.Fail].err{res_cbr2.err}; }
-
-    builder.set_block(?ctx.builder, l2_sub_gate);
-    val res_c3: res[value.Value, fail.Fail] = builder.emit_cmp_le_u(?ctx.builder, yk_phi2, x_phi);
-    if (sel res_c3.err) { ret res_c3; }
-    val res_cbr3: err[fail.Fail] = builder.emit_cbr(?ctx.builder, res_c3.ok, l2_sub, l2_nosub);
-    if (sel res_cbr3.err) { ret res[value.Value, fail.Fail].err{res_cbr3.err}; }
-
-    builder.set_block(?ctx.builder, l2_sub);
-    val res_xsub: res[value.Value, fail.Fail] = builder.emit_sub(?ctx.builder, x_phi, yk_phi2);
-    if (sel res_xsub.err) { ret res_xsub; }
-    val x_subbed: value.Value    = res_xsub.ok;
-    val res_brs:  err[fail.Fail] = builder.emit_br(?ctx.builder, l2_merge);
-    if (sel res_brs.err) { ret res[value.Value, fail.Fail].err{res_brs.err}; }
-
-    builder.set_block(?ctx.builder, l2_nosub);
-    val res_brn2: err[fail.Fail] = builder.emit_br(?ctx.builder, l2_merge);
-    if (sel res_brn2.err) { ret res[value.Value, fail.Fail].err{res_brn2.err}; }
-
-    builder.set_block(?ctx.builder, l2_merge);
-    val res_xnphi: res[value.Value, fail.Fail] = builder.emit_phi(?ctx.builder, fty);
-    if (sel res_xnphi.err) { ret res_xnphi; }
-    val x_next:  value.Value    = res_xnphi.ok;
-    val res_i3a: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, x_next, l2_sub, x_subbed);
-    if (sel res_i3a.err) { ret res[value.Value, fail.Fail].err{res_i3a.err}; }
-    val res_i3b: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, x_next, l2_nosub, x_phi);
-    if (sel res_i3b.err) { ret res[value.Value, fail.Fail].err{res_i3b.err}; }
-
-    val res_yknext2: res[value.Value, fail.Fail] = builder.emit_div_u(?ctx.builder, yk_phi2, two);
-    if (sel res_yknext2.err) { ret res_yknext2; }
-    val yk_next2:  value.Value    = res_yknext2.ok;
-    val res_back2: err[fail.Fail] = builder.emit_br(?ctx.builder, l2_head);
-    if (sel res_back2.err) { ret res[value.Value, fail.Fail].err{res_back2.err}; }
-
-    val res_i2a: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, x_phi, l1_exit, x0);
-    if (sel res_i2a.err) { ret res[value.Value, fail.Fail].err{res_i2a.err}; }
-    val res_i2b: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, x_phi, l2_merge, x_next);
-    if (sel res_i2b.err) { ret res[value.Value, fail.Fail].err{res_i2b.err}; }
-    val res_i2c: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, yk_phi2, l1_exit, yk_phi1);
-    if (sel res_i2c.err) { ret res[value.Value, fail.Fail].err{res_i2c.err}; }
-    val res_i2d: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, yk_phi2, l2_merge, yk_next2);
-    if (sel res_i2d.err) { ret res[value.Value, fail.Fail].err{res_i2d.err}; }
-
-    builder.set_block(?ctx.builder, l2_exit);
-    ret res[value.Value, fail.Fail].ok{x_phi};
-}
-
-fun float_rem_general(ctx: *lower_context.LowerContext, lhs: value.Value, rhs: value.Value, zero: value.Value, two: value.Value) res[value.Value, fail.Fail] {
-    val res_aneg: res[value.Value, fail.Fail] = builder.emit_cmp_lt_u(?ctx.builder, lhs, zero);
-    if (sel res_aneg.err) { ret res_aneg; }
-    val a_neg: value.Value = res_aneg.ok;
-
-    val res_x0: res[value.Value, fail.Fail] = float_abs(ctx, lhs, zero);
-    if (sel res_x0.err) { ret res_x0; }
-    val x0: value.Value = res_x0.ok;
-
-    val res_y: res[value.Value, fail.Fail] = float_abs(ctx, rhs, zero);
-    if (sel res_y.err) { ret res_y; }
-    val y: value.Value = res_y.ok;
-
-    val res_reduced: res[value.Value, fail.Fail] = float_rem_reduce(ctx, x0, y, two);
-    if (sel res_reduced.err) { ret res_reduced; }
-    val reduced: value.Value = res_reduced.ok;
-
-    val res_bneg: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_bneg.err) { ret res[value.Value, fail.Fail].err{res_bneg.err}; }
-    val blk_neg: me_ir.BlockId = res_bneg.ok;
-
-    val res_bpos: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_bpos.err) { ret res[value.Value, fail.Fail].err{res_bpos.err}; }
-    val blk_pos: me_ir.BlockId = res_bpos.ok;
-
-    val res_bmerge: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_bmerge.err) { ret res[value.Value, fail.Fail].err{res_bmerge.err}; }
-    val blk_merge: me_ir.BlockId = res_bmerge.ok;
-
-    val res_cbr: err[fail.Fail] = builder.emit_cbr(?ctx.builder, a_neg, blk_neg, blk_pos);
-    if (sel res_cbr.err) { ret res[value.Value, fail.Fail].err{res_cbr.err}; }
-
-    builder.set_block(?ctx.builder, blk_neg);
-    val res_negr: res[value.Value, fail.Fail] = builder.emit_neg(?ctx.builder, reduced);
-    if (sel res_negr.err) { ret res_negr; }
-    val neg_reduced: value.Value    = res_negr.ok;
-    val res_br1:     err[fail.Fail] = builder.emit_br(?ctx.builder, blk_merge);
-    if (sel res_br1.err) { ret res[value.Value, fail.Fail].err{res_br1.err}; }
-
-    builder.set_block(?ctx.builder, blk_pos);
-    val res_br2: err[fail.Fail] = builder.emit_br(?ctx.builder, blk_merge);
-    if (sel res_br2.err) { ret res[value.Value, fail.Fail].err{res_br2.err}; }
-
-    builder.set_block(?ctx.builder, blk_merge);
-    val res_phi: res[value.Value, fail.Fail] = builder.emit_phi(?ctx.builder, lhs.ty);
-    if (sel res_phi.err) { ret res_phi; }
-    val phi:     value.Value    = res_phi.ok;
-    val res_in1: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, phi, blk_neg, neg_reduced);
-    if (sel res_in1.err) { ret res[value.Value, fail.Fail].err{res_in1.err}; }
-    val res_in2: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, phi, blk_pos, reduced);
-    if (sel res_in2.err) { ret res[value.Value, fail.Fail].err{res_in2.err}; }
-
-    ret res[value.Value, fail.Fail].ok{phi};
-}
-
-# the operands float_rem_narrow answers directly, as comptime does: a zero,
-# infinite or NaN divisor, where the reduction would never finish or would drop
-# the NaN, and an infinite dividend
-fun float_rem_needs_narrow(ctx: *lower_context.LowerContext, lhs: value.Value, rhs: value.Value, zero: value.Value, two: value.Value) res[value.Value, fail.Fail] {
-    # b / b is exactly 1 for every finite nonzero b and NaN for the rest
-    val res_bb: res[value.Value, fail.Fail] = builder.emit_div_u(?ctx.builder, rhs, rhs);
-    if (sel res_bb.err) { ret res_bb; }
-    val res_bzero: res[value.Value, fail.Fail] = builder.emit_cmp_ne(?ctx.builder, res_bb.ok, value.const_float(1.0, rhs.ty));
-    if (sel res_bzero.err) { ret res_bzero; }
-    val b_zero:    value.Value   = res_bzero.ok;
-    val blk_entry: me_ir.BlockId = ctx.builder.block;
-
-    val res_check: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_check.err) { ret res[value.Value, fail.Fail].err{res_check.err}; }
-    val blk_check:   me_ir.BlockId                 = res_check.ok;
-    val res_nonzero: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_nonzero.err) { ret res[value.Value, fail.Fail].err{res_nonzero.err}; }
-    val blk_nonzero: me_ir.BlockId                 = res_nonzero.ok;
-    val res_inner:   res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_inner.err) { ret res[value.Value, fail.Fail].err{res_inner.err}; }
-    val blk_inner: me_ir.BlockId                 = res_inner.ok;
-    val res_outer: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_outer.err) { ret res[value.Value, fail.Fail].err{res_outer.err}; }
-    val blk_outer: me_ir.BlockId = res_outer.ok;
-
-    val res_cbr0: err[fail.Fail] = builder.emit_cbr(?ctx.builder, b_zero, blk_outer, blk_check);
-    if (sel res_cbr0.err) { ret res[value.Value, fail.Fail].err{res_cbr0.err}; }
-    builder.set_block(?ctx.builder, blk_check);
-    val res_a2: res[value.Value, fail.Fail] = builder.emit_mul(?ctx.builder, lhs, two);
-    if (sel res_a2.err) { ret res_a2; }
-    val a2:       value.Value                 = res_a2.ok;
-    val res_eqa2: res[value.Value, fail.Fail] = builder.emit_cmp_eq(?ctx.builder, lhs, a2);
-    if (sel res_eqa2.err) { ret res_eqa2; }
-    val a_eq_2a:  value.Value    = res_eqa2.ok;
-    val res_cbr1: err[fail.Fail] = builder.emit_cbr(?ctx.builder, a_eq_2a, blk_nonzero, blk_inner);
-    if (sel res_cbr1.err) { ret res[value.Value, fail.Fail].err{res_cbr1.err}; }
-
-    builder.set_block(?ctx.builder, blk_nonzero);
-    val res_ne: res[value.Value, fail.Fail] = builder.emit_cmp_ne(?ctx.builder, lhs, zero);
-    if (sel res_ne.err) { ret res_ne; }
-    val a_ne_zero:    value.Value    = res_ne.ok;
-    val res_br_inner: err[fail.Fail] = builder.emit_br(?ctx.builder, blk_inner);
-    if (sel res_br_inner.err) { ret res[value.Value, fail.Fail].err{res_br_inner.err}; }
-
-    builder.set_block(?ctx.builder, blk_inner);
-    val res_iphi: res[value.Value, fail.Fail] = builder.emit_phi(?ctx.builder, b_zero.ty);
-    if (sel res_iphi.err) { ret res_iphi; }
-    val inner:  value.Value    = res_iphi.ok;
-    val res_i0: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, inner, blk_check, a_eq_2a);
-    if (sel res_i0.err) { ret res[value.Value, fail.Fail].err{res_i0.err}; }
-    val res_i1: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, inner, blk_nonzero, a_ne_zero);
-    if (sel res_i1.err) { ret res[value.Value, fail.Fail].err{res_i1.err}; }
-    val res_br_outer: err[fail.Fail] = builder.emit_br(?ctx.builder, blk_outer);
-    if (sel res_br_outer.err) { ret res[value.Value, fail.Fail].err{res_br_outer.err}; }
-
-    builder.set_block(?ctx.builder, blk_outer);
-    val res_ophi: res[value.Value, fail.Fail] = builder.emit_phi(?ctx.builder, b_zero.ty);
-    if (sel res_ophi.err) { ret res_ophi; }
-    val outer:  value.Value    = res_ophi.ok;
-    val res_o0: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, outer, blk_entry, b_zero);
-    if (sel res_o0.err) { ret res[value.Value, fail.Fail].err{res_o0.err}; }
-    val res_o1: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, outer, blk_inner, inner);
-    if (sel res_o1.err) { ret res[value.Value, fail.Fail].err{res_o1.err}; }
-    ret res[value.Value, fail.Fail].ok{outer};
-}
-
-fun lower_float_rem(ctx: *lower_context.LowerContext, lhs: value.Value, rhs: value.Value) res[value.Value, fail.Fail] {
-    val zero:              value.Value                 = value.const_float(0.0, lhs.ty);
-    val two:               value.Value                 = value.const_float(2.0, lhs.ty);
-    val res_narrow_needed: res[value.Value, fail.Fail] = float_rem_needs_narrow(ctx, lhs, rhs, zero, two);
-    if (sel res_narrow_needed.err) { ret res_narrow_needed; }
-    val narrow_needed: value.Value = res_narrow_needed.ok;
-
-    val res_bn: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_bn.err) { ret res[value.Value, fail.Fail].err{res_bn.err}; }
-    val blk_narrow: me_ir.BlockId                 = res_bn.ok;
-    val res_bg:     res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_bg.err) { ret res[value.Value, fail.Fail].err{res_bg.err}; }
-    val blk_general: me_ir.BlockId                 = res_bg.ok;
-    val res_bj:      res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_bj.err) { ret res[value.Value, fail.Fail].err{res_bj.err}; }
-    val blk_join: me_ir.BlockId  = res_bj.ok;
-    val res_cbr:  err[fail.Fail] = builder.emit_cbr(?ctx.builder, narrow_needed, blk_narrow, blk_general);
-    if (sel res_cbr.err) { ret res[value.Value, fail.Fail].err{res_cbr.err}; }
-
-    builder.set_block(?ctx.builder, blk_narrow);
-    val res_narrow: res[value.Value, fail.Fail] = float_rem_narrow(ctx, lhs, rhs);
-    if (sel res_narrow.err) { ret res_narrow; }
-    val narrow_result: value.Value    = res_narrow.ok;
-    val narrow_end:    me_ir.BlockId  = ctx.builder.block;
-    val res_brn:       err[fail.Fail] = builder.emit_br(?ctx.builder, blk_join);
-    if (sel res_brn.err) { ret res[value.Value, fail.Fail].err{res_brn.err}; }
-
-    builder.set_block(?ctx.builder, blk_general);
-    val res_general: res[value.Value, fail.Fail] = float_rem_general(ctx, lhs, rhs, zero, two);
-    if (sel res_general.err) { ret res_general; }
-    val general_result: value.Value    = res_general.ok;
-    val general_end:    me_ir.BlockId  = ctx.builder.block;
-    val res_brg:        err[fail.Fail] = builder.emit_br(?ctx.builder, blk_join);
-    if (sel res_brg.err) { ret res[value.Value, fail.Fail].err{res_brg.err}; }
-
-    builder.set_block(?ctx.builder, blk_join);
-    val res_phi: res[value.Value, fail.Fail] = builder.emit_phi(?ctx.builder, lhs.ty);
-    if (sel res_phi.err) { ret res_phi; }
-    val phi:     value.Value    = res_phi.ok;
-    val res_in1: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, phi, narrow_end, narrow_result);
-    if (sel res_in1.err) { ret res[value.Value, fail.Fail].err{res_in1.err}; }
-    val res_in2: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, phi, general_end, general_result);
-    if (sel res_in2.err) { ret res[value.Value, fail.Fail].err{res_in2.err}; }
-
-    ret res[value.Value, fail.Fail].ok{phi};
+    ret irt.vector(t, res_elem.ok, irt.lanes(t, vec_ir));
 }
 
 fun is_compare_binop(op: ast_expr.BinOp) bool {
@@ -1990,22 +1461,6 @@ fun is_compare_binop(op: ast_expr.BinOp) bool {
 }
 
 fun lower_cmp(ctx: *lower_context.LowerContext, op: ast_expr.BinOp, lhs: value.Value, lty: type.TypeId, rhs: value.Value, rty: type.TypeId) res[value.Value, fail.Fail] {
-    if (is_half_type(ctx, lty) || is_half_type(ctx, rty)) {
-        val res_h: res[half.Half, fail.Fail] = half_of(ctx);
-        if (sel res_h.err) { ret res[value.Value, fail.Fail].err{res_h.err}; }
-        var h: half.Half = res_h.ok;
-        # both sides meet at the wider of the expansion's format and the other
-        # side's width, unless both are f16 the target compares natively
-        var bits: u32 = half.wide_bits(?h);
-        if (is_half_type(ctx, lty) && is_half_type(ctx, rty))        { bits = 16; }
-        or (!is_half_type(ctx, lty) && scalar_bits(ctx, lty) > bits) { bits = scalar_bits(ctx, lty); }
-        or (!is_half_type(ctx, rty) && scalar_bits(ctx, rty) > bits) { bits = scalar_bits(ctx, rty); }
-        val hl: res[value.Value, fail.Fail] = half_compare_operand(ctx, ?h, lhs, lty, bits);
-        if (sel hl.err) { ret hl; }
-        val hr: res[value.Value, fail.Fail] = half_compare_operand(ctx, ?h, rhs, rty, bits);
-        if (sel hr.err) { ret hr; }
-        ret emit_cmp_int(ctx, op, false, hl.ok, hr.ok);
-    }
     if (is_float_type(ctx, lty) || is_float_type(ctx, rty)) {
         var fl:        value.Value    = lhs;
         var fr:        value.Value    = rhs;
@@ -2044,9 +1499,9 @@ fun lower_cmp(ctx: *lower_context.LowerContext, op: ast_expr.BinOp, lhs: value.V
     if (scalar_bits(ctx, s_ty) > w) { w = scalar_bits(ctx, s_ty); }
     if (scalar_bits(ctx, u_ty) > w) { w = scalar_bits(ctx, u_ty); }
 
-    val res_tyw: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?ctx.m.types, w);
+    val res_tyw: res[Type, fail.Fail] = irt.int(?ctx.m.types, w);
     if (sel res_tyw.err) { ret res[value.Value, fail.Fail].err{res_tyw.err}; }
-    val tyw: ir_type.IrTypeId = res_tyw.ok;
+    val tyw: Type = res_tyw.ok;
 
     val res_sw: res[value.Value, fail.Fail] = widen_signed_to(ctx, s_val, s_ty, tyw, w);
     if (sel res_sw.err) { ret res_sw; }
@@ -2085,12 +1540,12 @@ fun emit_cmp_int(ctx: *lower_context.LowerContext, op: ast_expr.BinOp, signed: b
     ret res[value.Value, fail.Fail].err{fail.message("lower: unsupported comparison operator")};
 }
 
-fun widen_signed_to(ctx: *lower_context.LowerContext, v: value.Value, vty: type.TypeId, tyw: ir_type.IrTypeId, w: u32) res[value.Value, fail.Fail] {
+fun widen_signed_to(ctx: *lower_context.LowerContext, v: value.Value, vty: type.TypeId, tyw: Type, w: u32) res[value.Value, fail.Fail] {
     if (scalar_bits(ctx, vty) >= w) { ret res[value.Value, fail.Fail].ok{v}; }
     ret builder.emit_sext(?ctx.builder, v, tyw);
 }
 
-fun lower_cmp_signed_wide(ctx: *lower_context.LowerContext, op: ast_expr.BinOp, s64: value.Value, u: value.Value, s_is_lhs: bool, ty64: ir_type.IrTypeId) res[value.Value, fail.Fail] {
+fun lower_cmp_signed_wide(ctx: *lower_context.LowerContext, op: ast_expr.BinOp, s64: value.Value, u: value.Value, s_is_lhs: bool, ty64: Type) res[value.Value, fail.Fail] {
     var nop: ast_expr.BinOp = op;
     if (!s_is_lhs) { nop = swap_cmp_op(op); }
     val zero: value.Value = value.const_int(0, ty64);
@@ -2174,7 +1629,7 @@ fun unify_int_compare_widths(ctx: *lower_context.LowerContext, lhs: *value.Value
     ret err[fail.Fail].ok{};
 }
 
-fun extend_int_value(ctx: *lower_context.LowerContext, v: value.Value, from: type.TypeId, to: ir_type.IrTypeId) res[value.Value, fail.Fail] {
+fun extend_int_value(ctx: *lower_context.LowerContext, v: value.Value, from: type.TypeId, to: Type) res[value.Value, fail.Fail] {
     if (is_signed_type(ctx, from)) { ret builder.emit_sext(?ctx.builder, v, to); }
     ret builder.emit_zext(?ctx.builder, v, to);
 }
@@ -2199,9 +1654,8 @@ fun lower_assign(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_e
     if (sel res_lhs.err) { ret res_lhs; }
     val ptr: value.Value = res_lhs.ok;
 
-    val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, rhs, ptr);
-    if (sel res_store.err)                          { ret res[value.Value, fail.Fail].err{res_store.err}; }
-    if (access_is_volatile(ctx, e.data.binary.lhs)) { builder.mark_last_volatile(?ctx.builder); }
+    val res_store: err[fail.Fail] = builder.emit_store_marked(?ctx.builder, rhs, ptr, access_is_volatile(ctx, e.data.binary.lhs));
+    if (sel res_store.err) { ret res[value.Value, fail.Fail].err{res_store.err}; }
 
     # a borrowed source may change later, and the destination holds the value it wrote
     if (borrowed) { ret assign_epilogue(ctx, e, value.retype(ptr, rhs.ty)); }
@@ -2226,7 +1680,7 @@ pub fun lower_stored_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId
     if (sel res_v.err) { ret res_v; }
     var v: value.Value = res_v.ok;
     # the store reads the source itself, so it carries the secrecy the snapshot copy did
-    if (@borrowed && lower_context.type_carries_secret(ctx, lower_context.expr_type_of(ctx, eid))) { v.secret = true; }
+    if (@borrowed && lower_context.type_contains_secret(ctx, lower_context.expr_type_of(ctx, eid))) { v.secret = true; }
     ret res[value.Value, fail.Fail].ok{v};
 }
 
@@ -2241,24 +1695,19 @@ fun lower_vector_store(ctx: *lower_context.LowerContext, e: *ast_expr.Expr) opt[
     if (!is_array_type(ctx, to_ty))                                                          { ret opt[res[value.Value, fail.Fail]].none{}; }
     if (!type.is_vector(?ctx.s.types, lower_context.expr_type_of(ctx, rhs.data.cast.value))) { ret opt[res[value.Value, fail.Fail]].none{}; }
 
-    val res_arr: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, to_ty);
+    val res_arr: res[Type, fail.Fail] = lower_context.lower_type(ctx, to_ty);
     if (sel res_arr.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_arr.err}}; }
     val res_vec: res[value.Value, fail.Fail] = lower_rvalue(ctx, rhs.data.cast.value);
     if (sel res_vec.err) { ret opt[res[value.Value, fail.Fail]].some{res_vec}; }
     val res_lhs: res[value.Value, fail.Fail] = lower_lvalue(ctx, e.data.binary.lhs);
     if (sel res_lhs.err) { ret opt[res[value.Value, fail.Fail]].some{res_lhs}; }
 
-    val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, res_vec.ok, res_lhs.ok);
-    if (sel res_store.err)                          { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_store.err}}; }
-    if (access_is_volatile(ctx, e.data.binary.lhs)) { builder.mark_last_volatile(?ctx.builder); }
+    val res_store: err[fail.Fail] = builder.emit_store_marked(?ctx.builder, res_vec.ok, res_lhs.ok, access_is_volatile(ctx, e.data.binary.lhs));
+    if (sel res_store.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_store.err}}; }
     ret opt[res[value.Value, fail.Fail]].some{assign_epilogue(ctx, e, value.retype(res_lhs.ok, res_arr.ok))};
 }
 
 fun assign_epilogue(ctx: *lower_context.LowerContext, e: *ast_expr.Expr, rhs: value.Value) res[value.Value, fail.Fail] {
-    if (lower_context.type_is_secret(ctx, lower_context.expr_type_of(ctx, e.data.binary.lhs))) {
-        builder.mark_last_secret(?ctx.builder);
-    }
-
     if (ctx.debug) {
         val opt_lhs: res[ast_expr.Expr, fail.Fail] = lower_context.expression(ctx, e.data.binary.lhs);
         if (sel opt_lhs.ok) {
@@ -2266,7 +1715,7 @@ fun assign_epilogue(ctx: *lower_context.LowerContext, e: *ast_expr.Expr, rhs: va
             val lhs_e:       *ast_expr.Expr = ?lhs_e_value;
             if (lhs_e.kind == ast_expr.EXPR_KIND_IDENT) {
                 val lhs_sem: type.TypeId    = lower_context.expr_type_of(ctx, e.data.binary.lhs);
-                val res_dbg: err[fail.Fail] = lower_context.emit_dbg_birth(ctx, lhs_e.data.ident.tok, rhs.ty, lhs_sem, false, rhs, opt[value.Value].none{});
+                val res_dbg: err[fail.Fail] = lower_context.emit_dbg_birth(ctx, lhs_e.data.ident.tok, lhs_sem, opt[u32].none{}, rhs, opt[value.Value].none{});
                 if (sel res_dbg.err) {
                     ret res[value.Value, fail.Fail].err{res_dbg.err};
                 }
@@ -2293,20 +1742,13 @@ fun lower_vector_lane_write(ctx: *lower_context.LowerContext, lhs: ast_id.ExprId
     if (sel res_slot.err) { ret res[bool, fail.Fail].err{res_slot.err}; }
     val slot: value.Value = res_slot.ok;
 
-    val res_vty: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, lower_context.expr_type_of(ctx, e.data.index.object));
+    val res_vty: res[Type, fail.Fail] = lower_context.lower_type(ctx, lower_context.expr_type_of(ctx, e.data.index.object));
     if (sel res_vty.err) { ret res[bool, fail.Fail].err{res_vty.err}; }
-    val vty: ir_type.IrTypeId = res_vty.ok;
 
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[bool, fail.Fail].err{res_xty.err}; }
-
-    val res_old: res[value.Value, fail.Fail] = builder.emit_load(?ctx.builder, slot, vty);
+    val res_old: res[value.Value, fail.Fail] = builder.emit_load(?ctx.builder, slot, res_vty.ok);
     if (sel res_old.err) { ret res[bool, fail.Fail].err{res_old.err}; }
 
-    val res_new: res[value.Value, fail.Fail] = builder.emit_vec_insert(?ctx.builder,
-        res_old.ok,
-        value.const_int(lane_r.ok, res_xty.ok),
-        rhs);
+    val res_new: res[value.Value, fail.Fail] = builder.emit_vec_insert(?ctx.builder, res_old.ok, value.const_int(lane_r.ok, builder.index_type(?ctx.builder)), rhs);
     if (sel res_new.err) { ret res[bool, fail.Fail].err{res_new.err}; }
 
     val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, res_new.ok, slot);
@@ -2323,16 +1765,12 @@ fun lower_vector_range_write(ctx: *lower_context.LowerContext, e: *ast_expr.Expr
     if (sel res_slot.err) { ret res[bool, fail.Fail].err{res_slot.err}; }
     val slot: value.Value = res_slot.ok;
 
-    val res_vty: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, lower_context.expr_type_of(ctx, e.data.index.object));
+    val res_vty: res[Type, fail.Fail] = lower_context.lower_type(ctx, lower_context.expr_type_of(ctx, e.data.index.object));
     if (sel res_vty.err) { ret res[bool, fail.Fail].err{res_vty.err}; }
-    val opt_vt: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, rhs.ty);
-    if (sel opt_vt.none) { ret res[bool, fail.Fail].err{fail.message("lower: vector range value is not an IR vector")}; }
-    val elem:  ir_type.IrTypeId = opt_vt.some.data.vector_.element;
-    val lanes: u32              = opt_vt.some.data.vector_.lanes;
-
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[bool, fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
+    val t:     *types.Table = builder.types_of(?ctx.builder);
+    val elem:  Type         = irt.element(t, rhs.ty);
+    val lanes: u32          = irt.lanes(t, rhs.ty);
+    val xty:   Type         = builder.index_type(?ctx.builder);
 
     val res_old: res[value.Value, fail.Fail] = builder.emit_load(?ctx.builder, slot, res_vty.ok);
     if (sel res_old.err) { ret res[bool, fail.Fail].err{res_old.err}; }
@@ -2352,55 +1790,49 @@ fun lower_vector_range_write(ctx: *lower_context.LowerContext, e: *ast_expr.Expr
 }
 
 fun lower_logical(ctx: *lower_context.LowerContext, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
-    val res_i8: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?ctx.m.types, 8);
+    val res_i8: res[Type, fail.Fail] = irt.int(?ctx.m.types, 8);
     if (sel res_i8.err) { ret res[value.Value, fail.Fail].err{res_i8.err}; }
-    val i8: ir_type.IrTypeId = res_i8.ok;
-
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
-
-    val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, i8, value.const_int(1, xty));
-    if (sel res_slot.err) { ret res_slot; }
-    val slot: value.Value = res_slot.ok;
+    val i8: Type = res_i8.ok;
 
     val res_lhs: res[value.Value, fail.Fail] = lower_rvalue(ctx, e.data.binary.lhs);
     if (sel res_lhs.err) { ret res_lhs; }
     val res_lhs_condition: res[value.Value, fail.Fail] = condition_value(ctx, e.data.binary.lhs, res_lhs.ok);
     if (sel res_lhs_condition.err) { ret res_lhs_condition; }
-    val lhs:           value.Value    = res_lhs_condition.ok;
-    val res_store_lhs: err[fail.Fail] = builder.emit_store(?ctx.builder, lhs, slot);
-    if (sel res_store_lhs.err) { ret res[value.Value, fail.Fail].err{res_store_lhs.err}; }
+    var lhs: [1]value.Value = [1]value.Value{res_lhs_condition.ok};
 
-    val res_rhs_block: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
+    val res_rhs_block: res[id.Block, fail.Fail] = builder.new_block(?ctx.builder);
     if (sel res_rhs_block.err) { ret res[value.Value, fail.Fail].err{res_rhs_block.err}; }
-    val rhs_block: me_ir.BlockId = res_rhs_block.ok;
+    val rhs_block: id.Block = res_rhs_block.ok;
 
-    val res_join: res[me_ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
-    if (sel res_join.err) { ret res[value.Value, fail.Fail].err{res_join.err}; }
-    val join: me_ir.BlockId = res_join.ok;
+    # the join takes the operand that decided the result, the left's when it short-circuits
+    var joined: [1]Type  = [1]Type{i8};
+    var secret: [1]bool  = [1]bool{lhs[0].secret};
+    val join:   id.Block = builder.new_block_with(?ctx.builder, ?joined[0], ?secret[0], 1);
+
+    val res_short: res[id.Block, fail.Fail] = builder.new_block(?ctx.builder);
+    if (sel res_short.err) { ret res[value.Value, fail.Fail].err{res_short.err}; }
+    val short: id.Block = res_short.ok;
 
     var res_cbr: err[fail.Fail] = err[fail.Fail].ok{};
-    if (e.data.binary.op == ast_expr.BIN_AND) {
-        res_cbr = builder.emit_cbr(?ctx.builder, lhs, rhs_block, join);
-    }
-    or {
-        res_cbr = builder.emit_cbr(?ctx.builder, lhs, join, rhs_block);
-    }
-    if (sel res_cbr.err) { ret res[value.Value, fail.Fail].err{res_cbr.err}; }
+    if (e.data.binary.op == ast_expr.BIN_AND) { res_cbr = builder.emit_cbr(?ctx.builder, lhs[0], rhs_block, short); }
+    or                                        { res_cbr = builder.emit_cbr(?ctx.builder, lhs[0], short, rhs_block); }
+    if (sel res_cbr.err)                      { ret res[value.Value, fail.Fail].err{res_cbr.err}; }
+
+    builder.set_block(?ctx.builder, short);
+    val res_skip: err[fail.Fail] = builder.emit_br_args(?ctx.builder, join, ?lhs[0], 1);
+    if (sel res_skip.err) { ret res[value.Value, fail.Fail].err{res_skip.err}; }
 
     builder.set_block(?ctx.builder, rhs_block);
     val res_rhs: res[value.Value, fail.Fail] = lower_rvalue(ctx, e.data.binary.rhs);
     if (sel res_rhs.err) { ret res_rhs; }
     val res_rhs_condition: res[value.Value, fail.Fail] = condition_value(ctx, e.data.binary.rhs, res_rhs.ok);
     if (sel res_rhs_condition.err) { ret res_rhs_condition; }
-    val res_store_rhs: err[fail.Fail] = builder.emit_store(?ctx.builder, res_rhs_condition.ok, slot);
-    if (sel res_store_rhs.err) { ret res[value.Value, fail.Fail].err{res_store_rhs.err}; }
-    val res_br: err[fail.Fail] = builder.emit_br(?ctx.builder, join);
+    var rhs:    [1]value.Value = [1]value.Value{res_rhs_condition.ok};
+    val res_br: err[fail.Fail] = builder.emit_br_args(?ctx.builder, join, ?rhs[0], 1);
     if (sel res_br.err) { ret res[value.Value, fail.Fail].err{res_br.err}; }
 
     builder.set_block(?ctx.builder, join);
-    ret builder.emit_load(?ctx.builder, slot, i8);
+    ret res[value.Value, fail.Fail].ok{builder.block_param(?ctx.builder, join, 0, i8)};
 }
 
 fun address_operand_names_function(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) bool {
@@ -2428,7 +1860,7 @@ fun lower_unary(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_ex
     if (op == ast_expr.UN_DEREF) {
         val res_ptr: res[value.Value, fail.Fail] = lower_rvalue(ctx, e.data.unary.operand);
         if (sel res_ptr.err) { ret res_ptr; }
-        val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+        val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
         if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
         ret rvalue_at(ctx, res_ptr.ok, res_ir.ok, lower_context.expr_type_of(ctx, eid), access_is_volatile(ctx, eid));
     }
@@ -2437,12 +1869,6 @@ fun lower_unary(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_ex
     if (sel res_v.err) { ret res_v; }
     val v: value.Value = res_v.ok;
 
-    if (op == ast_expr.UN_NEG && is_half_type(ctx, lower_context.expr_type_of(ctx, e.data.unary.operand))) {
-        val res_h: res[half.Half, fail.Fail] = half_of(ctx);
-        if (sel res_h.err) { ret res[value.Value, fail.Fail].err{res_h.err}; }
-        var h: half.Half = res_h.ok;
-        ret half.done(?h, half.neg(?h, v));
-    }
     if (op == ast_expr.UN_NEG)     { ret builder.emit_neg(?ctx.builder, v); }
     if (op == ast_expr.UN_BIT_NOT) { ret builder.emit_not(?ctx.builder, v); }
     if (op == ast_expr.UN_NOT)     { ret builder.emit_cmp_ne(?ctx.builder, v, value.const_int(1, v.ty)); }
@@ -2460,7 +1886,7 @@ pub fun condition_value(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v:
             ret res[value.Value, fail.Fail].ok{v};
         }
         # a runtime `sel` is already the discriminator compare; a folded one stays a constant
-        if (e.kind == ast_expr.EXPR_KIND_SEL && v.kind != value.VAL_CONST_INT) {
+        if (e.kind == ast_expr.EXPR_KIND_SEL && v.kind != value.VAL_INT) {
             ret res[value.Value, fail.Fail].ok{v};
         }
     }
@@ -2479,9 +1905,9 @@ fun lower_cast(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_exp
     if (sel res_v.err) { ret res_v; }
     val v: value.Value = res_v.ok;
 
-    val res_dst: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, to_ty);
+    val res_dst: res[Type, fail.Fail] = lower_context.lower_type(ctx, to_ty);
     if (sel res_dst.err) { ret res[value.Value, fail.Fail].err{res_dst.err}; }
-    val dst: ir_type.IrTypeId = res_dst.ok;
+    val dst: Type = res_dst.ok;
 
     # a vector converts lane by lane, so the rule is chosen from the lane types
     var from_rule: type.TypeId = from_ty;
@@ -2507,10 +1933,6 @@ fun lower_cast(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_exp
     val from_bits:   u32  = scalar_bits(ctx, from_rule);
     val to_bits:     u32  = scalar_bits(ctx, to_rule);
 
-    if ((from_float && from_bits == 16) || (to_float && to_bits == 16)) {
-        ret lower_half_cast(ctx, v, dst, from_float, from_bits, from_signed, to_float, to_bits, to_signed, lanewise);
-    }
-
     if (from_float && to_float) {
         if (to_bits < from_bits) { ret builder.emit_fp_trunc(?ctx.builder, v, dst); }
         if (to_bits > from_bits) { ret builder.emit_fp_ext(?ctx.builder, v, dst); }
@@ -2533,24 +1955,6 @@ fun lower_cast(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_exp
     ret emit_retype(ctx, v, dst);
 }
 
-# a `::` with an f16 on either side, of a scalar or lane by lane
-fun lower_half_cast(ctx: *lower_context.LowerContext, v: value.Value, dst: ir_type.IrTypeId, from_float: bool, from_bits: u32, from_signed: bool,
-    to_float: bool, to_bits: u32, to_signed: bool, lanewise: bool) res[value.Value, fail.Fail] {
-    if (from_float && to_float && from_bits == to_bits) { ret emit_retype(ctx, v, dst); }
-    val res_h: res[half.Half, fail.Fail] = half_of(ctx);
-    if (sel res_h.err) { ret res[value.Value, fail.Fail].err{res_h.err}; }
-    var h: half.Half = res_h.ok;
-    if (lanewise) {
-        ret half.done(?h, half.vec_convert(?h, v, dst, from_float, from_bits, from_signed, to_float, to_bits, to_signed));
-    }
-    if (from_float && from_bits == 16) {
-        if (to_float) { ret half.done(?h, half.to_float(?h, v, to_bits)); }
-        ret half.done(?h, half.to_int(?h, v, dst, to_bits, to_signed));
-    }
-    if (from_float) { ret half.done(?h, half.from_float(?h, v, from_bits)); }
-    ret half.done(?h, half.from_int(?h, v, from_bits, from_signed));
-}
-
 # the conversions whose operand's shape is their lowering: an array in memory
 # read as a vector is one vector load, and a range of a vector widened lane by
 # lane extends straight from the vector
@@ -2564,15 +1968,11 @@ fun lower_cast_shape(ctx: *lower_context.LowerContext, operand: ast_id.ExprId, f
 }
 
 fun lower_array_as_vector(ctx: *lower_context.LowerContext, operand: ast_id.ExprId, to_ty: type.TypeId) res[value.Value, fail.Fail] {
-    val res_dst: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, to_ty);
+    val res_dst: res[Type, fail.Fail] = lower_context.lower_type(ctx, to_ty);
     if (sel res_dst.err) { ret res[value.Value, fail.Fail].err{res_dst.err}; }
     val res_ptr: res[value.Value, fail.Fail] = array_address(ctx, operand);
     if (sel res_ptr.err) { ret res_ptr; }
-    val res_ptr_ty: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?ctx.m.types);
-    if (sel res_ptr_ty.err) { ret res[value.Value, fail.Fail].err{res_ptr_ty.err}; }
-    val loaded: res[value.Value, fail.Fail] = builder.emit_load(?ctx.builder, value.retype(res_ptr.ok, res_ptr_ty.ok), res_dst.ok);
-    if (sel loaded.ok && access_is_volatile(ctx, operand)) { builder.mark_last_volatile(?ctx.builder); }
-    ret loaded;
+    ret builder.emit_load_marked(?ctx.builder, value.retype(res_ptr.ok, builder.ptr_type(?ctx.builder)), res_dst.ok, access_is_volatile(ctx, operand));
 }
 
 # where an array operand's elements are: a place is read where it lives, and
@@ -2588,21 +1988,17 @@ fun array_address(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[valu
     ret lower_rvalue(ctx, eid);
 }
 
-# `v[a, n]::T` over an integer vector, where each lane of `T` is wider: a half
-# (`v[0, n]` or `v[n, n]` of `2n` lanes) at twice the width is the lane-halving
-# extension where the target packs that cell, and any other range is extracted
-# with each lane extended straight from `v`
+# `v[a, n]::T` over an integer vector, where each lane of `T` is wider: the range is
+# extracted and each lane extended straight from `v`
 fun lower_range_cast(ctx: *lower_context.LowerContext, operand: ast_id.ExprId, from_ty: type.TypeId, to_ty: type.TypeId) opt[res[value.Value, fail.Fail]] {
     val e_opt: res[ast_expr.Expr, fail.Fail] = lower_context.expression(ctx, operand);
     if (sel e_opt.err) { ret opt[res[value.Value, fail.Fail]].none{}; }
     var e_value: ast_expr.Expr  = e_opt.ok;
     val e:       *ast_expr.Expr = ?e_value;
-    if (!is_vector_range(ctx, e) || ctx.tgt == nil) { ret opt[res[value.Value, fail.Fail]].none{}; }
+    if (!is_vector_range(ctx, e)) { ret opt[res[value.Value, fail.Fail]].none{}; }
 
-    val src_ty: type.TypeId      = lower_context.expr_type_of(ctx, e.data.index.object);
-    val lf:     opt[type.TypeId] = type.prim(?ctx.s.types, type.vector_element(?ctx.s.types, from_ty));
-    val lt:     opt[type.TypeId] = type.prim(?ctx.s.types, type.vector_element(?ctx.s.types, to_ty));
-    val lanes:  u32              = type.vector_lanes(?ctx.s.types, from_ty);
+    val lf: opt[type.TypeId] = type.prim(?ctx.s.types, type.vector_element(?ctx.s.types, from_ty));
+    val lt: opt[type.TypeId] = type.prim(?ctx.s.types, type.vector_element(?ctx.s.types, to_ty));
     if (sel lf.none)                                                { ret opt[res[value.Value, fail.Fail]].none{}; }
     if (sel lt.none)                                                { ret opt[res[value.Value, fail.Fail]].none{}; }
     if (is_float_type(ctx, lf.some) || is_float_type(ctx, lt.some)) { ret opt[res[value.Value, fail.Fail]].none{}; }
@@ -2610,53 +2006,34 @@ fun lower_range_cast(ctx: *lower_context.LowerContext, operand: ast_id.ExprId, f
 
     val start: res[u64, fail.Fail] = vector_range_start(ctx, e);
     if (sel start.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{start.err}}; }
-
-    val res_dst: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, to_ty);
+    val res_dst: res[Type, fail.Fail] = lower_context.lower_type(ctx, to_ty);
     if (sel res_dst.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_dst.err}}; }
-    val res_src: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, src_ty);
-    if (sel res_src.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_src.err}}; }
-    val signed: bool                     = is_signed_type(ctx, lf.some);
-    var kind:   ir_instruction.InstrKind = ir_instruction.OP_VEC_WIDEN_U;
-    if (signed) { kind = ir_instruction.OP_VEC_WIDEN_S; }
-
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_xty.err}}; }
     val res_vec: res[value.Value, fail.Fail] = lower_rvalue(ctx, e.data.index.object);
     if (sel res_vec.err) { ret opt[res[value.Value, fail.Fail]].some{res_vec}; }
-    var half: bool = scalar_bits(ctx, lt.some) == scalar_bits(ctx, lf.some) * 2 && type.vector_lanes(?ctx.s.types, src_ty) == lanes * 2;
-    if (start.ok != 0 && start.ok != lanes::u64) { half = false; }
-    if (half && vecform.widen_half_packs(ctx.m, ctx.tgt, kind, res_dst.ok, res_src.ok)) {
-        ret opt[res[value.Value, fail.Fail]].some{builder.emit_vec_widen_half(?ctx.builder, signed, res_vec.ok,
-            value.const_int(start.ok, res_xty.ok), res_dst.ok)};
-    }
-    ret opt[res[value.Value, fail.Fail]].some{extract_lanes(ctx, res_vec.ok, start.ok, res_dst.ok, opt[bool].some{signed})};
+    ret opt[res[value.Value, fail.Fail]].some{extract_lanes(ctx, res_vec.ok, start.ok, res_dst.ok, opt[bool].some{is_signed_type(ctx, lf.some)})};
 }
 
-fun emit_retype(ctx: *lower_context.LowerContext, v: value.Value, dst: ir_type.IrTypeId) res[value.Value, fail.Fail] {
-    if (ir_type.same(v.ty, dst)) { ret res[value.Value, fail.Fail].ok{v}; }
+fun emit_retype(ctx: *lower_context.LowerContext, v: value.Value, dst: Type) res[value.Value, fail.Fail] {
+    if (irt.same(v.ty, dst)) { ret res[value.Value, fail.Fail].ok{v}; }
     ret builder.emit_bitcast(?ctx.builder, v, dst);
 }
 
-fun lower_reinterpret(ctx: *lower_context.LowerContext, v: value.Value, from_ty: type.TypeId, dst: ir_type.IrTypeId) res[value.Value, fail.Fail] {
-    val res_src: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, from_ty);
+fun lower_reinterpret(ctx: *lower_context.LowerContext, v: value.Value, from_ty: type.TypeId, dst: Type) res[value.Value, fail.Fail] {
+    val res_src: res[Type, fail.Fail] = lower_context.lower_type(ctx, from_ty);
     if (sel res_src.err) { ret res[value.Value, fail.Fail].err{res_src.err}; }
-    val src: ir_type.IrTypeId = res_src.ok;
+    val src: Type = res_src.ok;
 
     val src_agg: bool = is_aggregate_ir(ctx, src);
     val dst_agg: bool = is_aggregate_ir(ctx, dst);
     if (src_agg == dst_agg) { ret emit_retype(ctx, v, dst); }
 
     if (src_agg) {
-        val res_ptr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?ctx.m.types);
+        val res_ptr: res[Type, fail.Fail] = irt.ptr(?ctx.m.types);
         if (sel res_ptr.err) { ret res[value.Value, fail.Fail].err{res_ptr.err}; }
         ret builder.emit_load(?ctx.builder, value.retype(v, res_ptr.ok), dst);
     }
 
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
-
-    val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, dst, value.const_int(1, xty));
+    val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, dst);
     if (sel res_slot.err) { ret res_slot; }
     val slot: value.Value = res_slot.ok;
 
@@ -2681,16 +2058,13 @@ fun lower_comptime_path(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) re
 }
 
 fun lower_array_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
-    val arr_ty:     type.TypeId                      = lower_context.expr_type_of(ctx, eid);
-    val res_arr_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, arr_ty);
+    val arr_ty:     type.TypeId          = lower_context.expr_type_of(ctx, eid);
+    val res_arr_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, arr_ty);
     if (sel res_arr_ir.err) { ret res[value.Value, fail.Fail].err{res_arr_ir.err}; }
-    val arr_ir: ir_type.IrTypeId = res_arr_ir.ok;
+    val arr_ir: Type = res_arr_ir.ok;
+    val xty:    Type = builder.index_type(?ctx.builder);
 
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
-
-    val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, arr_ir, value.const_int(1, xty));
+    val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, arr_ir);
     if (sel res_slot.err) { ret res_slot; }
     val slot: value.Value = res_slot.ok;
 
@@ -2704,12 +2078,9 @@ fun lower_array_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *as
         val res_elem: res[value.Value, fail.Fail] = lower_rvalue(ctx, elem_eid);
         if (sel res_elem.err) { ret res_elem; }
 
-        var idx: [2]value.Value;
-        idx[0] = value.const_int(0, xty);
-        idx[1] = value.const_int(i::u64, xty);
-        val res_gep: res[value.Value, fail.Fail] = builder.emit_gep(?ctx.builder, slot, arr_ir, ?idx[0], 2);
-        if (sel res_gep.err) { ret res_gep; }
-        val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, res_elem.ok, res_gep.ok);
+        val res_at: res[value.Value, fail.Fail] = builder.emit_element(?ctx.builder, slot, arr_ir, value.const_int(i::u64, xty));
+        if (sel res_at.err) { ret res_at; }
+        val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, res_elem.ok, res_at.ok);
         if (sel res_store.err) { ret res[value.Value, fail.Fail].err{res_store.err}; }
         i = i + 1;
     }
@@ -2717,71 +2088,28 @@ fun lower_array_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *as
     ret res[value.Value, fail.Fail].ok{value.retype(slot, arr_ir)};
 }
 
-fun build_vector_lit(ctx: *lower_context.LowerContext, e: *ast_expr.Expr, vec_ir: ir_type.IrTypeId, lanes: *value.Value) res[value.Value, fail.Fail] {
+fun lower_vector_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
+    val vec_ty:     type.TypeId          = lower_context.expr_type_of(ctx, eid);
+    val res_vec_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, vec_ty);
+    if (sel res_vec_ir.err) { ret res[value.Value, fail.Fail].err{res_vec_ir.err}; }
+    val vec_ir: Type = res_vec_ir.ok;
+
+    val n:     u32                                    = e.data.vector_lit.elems_len;
+    var lanes: collections_vector.Vector[value.Value] = collections_vector.init[value.Value](ctx.s.alloc);
+    fin { collections_vector.dnit[value.Value](?lanes); }
     var li: u32 = 0;
-    for (li < e.data.vector_lit.elems_len) {
+    for (li < n) {
         val lpool_ix: u32 = e.data.vector_lit.elems_start + li;
         if (lpool_ix::usize >= ctx.scope.a.expr_ids.len) {
             ret res[value.Value, fail.Fail].err{fail.message("lower: vector literal element index out of range")};
         }
         val lres: res[value.Value, fail.Fail] = lower_rvalue(ctx, ctx.scope.a.expr_ids.data[lpool_ix]);
         if (sel lres.err) { ret lres; }
-        lanes[li] = lres.ok;
-        li        = li + 1;
+        val pushed: res[usize, A.Error] = collections_vector.push[value.Value](?lanes, lres.ok);
+        if (sel pushed.err) { ret res[value.Value, fail.Fail].err{fail.refused(pushed.err)}; }
+        li = li + 1;
     }
-    ret builder.emit_vec_build(?ctx.builder, vec_ir, lanes, e.data.vector_lit.elems_len);
-}
-
-fun lower_vector_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) res[value.Value, fail.Fail] {
-    val vec_ty:     type.TypeId                      = lower_context.expr_type_of(ctx, eid);
-    val res_vec_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, vec_ty);
-    if (sel res_vec_ir.err) { ret res[value.Value, fail.Fail].err{res_vec_ir.err}; }
-    val vec_ir: ir_type.IrTypeId = res_vec_ir.ok;
-
-    val opt_vt: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, vec_ir);
-    if (sel opt_vt.none) { ret res[value.Value, fail.Fail].err{fail.message("lower: vector literal type is not an IR vector")}; }
-    val vt: *ir_type.IrType = opt_vt.some;
-    if (vt.kind != ir_type.IRT_VECTOR) { ret res[value.Value, fail.Fail].err{fail.message("lower: vector literal type is not an IR vector")}; }
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
-
-    # a target that builds vectors from lanes has no register ceiling on the lane count
-    if (ctx.tgt != nil && ctx.tgt.model.has_vec_build) {
-        val n:         u32                          = e.data.vector_lit.elems_len;
-        val res_lanes: res[*value.Value, fail.Fail] = builder.lanes_reserve(?ctx.builder, n);
-        if (sel res_lanes.err) { ret res[value.Value, fail.Fail].err{res_lanes.err}; }
-        val lanes: *value.Value                = res_lanes.ok;
-        val built: res[value.Value, fail.Fail] = build_vector_lit(ctx, e, vec_ir, lanes);
-        builder.lanes_release(?ctx.builder, lanes, n);
-        ret built;
-    }
-
-    val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, vec_ir, value.const_int(1, xty));
-    if (sel res_slot.err) { ret res_slot; }
-    val slot: value.Value = res_slot.ok;
-
-    var i: u32 = 0;
-    for (i < e.data.vector_lit.elems_len) {
-        val pool_ix: u32 = e.data.vector_lit.elems_start + i;
-        if (pool_ix::usize >= ctx.scope.a.expr_ids.len) {
-            ret res[value.Value, fail.Fail].err{fail.message("lower: vector literal element index out of range")};
-        }
-        val elem_eid: ast_id.ExprId               = ctx.scope.a.expr_ids.data[pool_ix];
-        val res_elem: res[value.Value, fail.Fail] = lower_rvalue(ctx, elem_eid);
-        if (sel res_elem.err) { ret res_elem; }
-
-        var idx: [2]value.Value;
-        idx[0] = value.const_int(0, xty);
-        idx[1] = value.const_int(i::u64, xty);
-        val res_gep: res[value.Value, fail.Fail] = builder.emit_gep(?ctx.builder, slot, vec_ir, ?idx[0], 2);
-        if (sel res_gep.err) { ret res_gep; }
-        val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, res_elem.ok, res_gep.ok);
-        if (sel res_store.err) { ret res[value.Value, fail.Fail].err{res_store.err}; }
-        i = i + 1;
-    }
-
-    ret builder.emit_load(?ctx.builder, slot, vec_ir);
+    ret builder.emit_vec_build(?ctx.builder, vec_ir, lanes.data, n);
 }
 
 # `sel` loads the discriminator and compares it with the case code; it never reads a payload.
@@ -2794,11 +2122,10 @@ fun lower_sel(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr
     val res_addr: res[value.Value, fail.Fail] = member_receiver(ctx, place_eid, ?tag_ty);
     if (sel res_addr.err) { ret res_addr; }
 
-    val res_tag_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, tag_ty);
+    val res_tag_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, tag_ty);
     if (sel res_tag_ir.err) { ret res[value.Value, fail.Fail].err{res_tag_ir.err}; }
-    val tag_ir: ir_type.IrTypeId = res_tag_ir.ok;
-
-    val disc_ir: ir_type.IrTypeId = ir_type.tag_disc_type(?ctx.m.types, tag_ir);
+    val tag_ir:  Type = res_tag_ir.ok;
+    val disc_ir: Type = disc_type(ctx, tag_ir);
 
     val res_dp: res[value.Value, fail.Fail] = disc_gep(ctx, res_addr.ok, tag_ir);
     if (sel res_dp.err) { ret res_dp; }
@@ -2812,8 +2139,7 @@ fun lower_sel(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr
         case_ix = res_ix.ok;
     }
     or { case_ix = field_index_in_type(ctx, tag_ty, e.data.sel.case_name); }
-    ret builder.emit_cmp_eq(?ctx.builder,
-        res_code.ok, value.const_int(case_ix::u64, disc_ir));
+    ret builder.emit_cmp_eq(?ctx.builder, res_code.ok, value.const_int(case_ix::u64, disc_ir));
 }
 
 # the case ordinal a comptime case descriptor names; type checking already tied it to this tag
@@ -2858,20 +2184,16 @@ fun literal_head_case_index(ctx: *lower_context.LowerContext, tid: ast_id.TypeId
     ret res[opt[u32], fail.Fail].ok{opt[u32].some{field_index_in_type(ctx, tag_ty, case_span)}};
 }
 
-# a construction zeroes the whole object, writes the case code at offset zero and stores the payload
+# a construction zeroes the whole object, writes the case code to the discriminant and stores
+# the payload in its member of the payload union
 fun lower_tag_case_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr,
     tag_ty: type.TypeId, case_ix: u32) res[value.Value, fail.Fail] {
-    val res_tag_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, tag_ty);
+    val res_tag_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, tag_ty);
     if (sel res_tag_ir.err) { ret res[value.Value, fail.Fail].err{res_tag_ir.err}; }
-    val tag_ir: ir_type.IrTypeId = res_tag_ir.ok;
+    val tag_ir:  Type = res_tag_ir.ok;
+    val disc_ir: Type = disc_type(ctx, tag_ir);
 
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
-
-    val disc_ir: ir_type.IrTypeId = ir_type.tag_disc_type(?ctx.m.types, tag_ir);
-
-    val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, tag_ir, value.const_int(1, xty));
+    val res_slot: res[value.Value, fail.Fail] = lower_context.slot_for(ctx, tag_ty, tag_ir);
     if (sel res_slot.err) { ret res_slot; }
     val slot: value.Value = res_slot.ok;
 
@@ -2881,13 +2203,9 @@ fun lower_tag_case_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: 
     if (e.data.struct_lit.elems_len == 1) {
         val res_payload: res[value.Value, fail.Fail] = lower_rvalue(ctx, ctx.scope.a.expr_ids.data[e.data.struct_lit.elems_start]);
         if (sel res_payload.err) { ret res_payload; }
-        var idx: [2]value.Value;
-        idx[0] = value.const_int(0, xty);
-        idx[1] = value.const_int(ir_type.tag_case_field(case_ix)::u64, xty);
-        val res_gep: res[value.Value, fail.Fail] = builder.emit_gep(?ctx.builder, slot, tag_ir, ?idx[0], 2);
-        if (sel res_gep.err) { ret res_gep; }
-        val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder,
-            res_payload.ok, res_gep.ok);
+        val res_at: res[value.Value, fail.Fail] = field_gep(ctx, slot, tag_ty, case_ix);
+        if (sel res_at.err) { ret res_at; }
+        val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, res_payload.ok, res_at.ok);
         if (sel res_store.err) { ret res[value.Value, fail.Fail].err{res_store.err}; }
     }
 
@@ -2903,12 +2221,8 @@ fun lower_struct_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *a
     val rec_ty:   type.TypeId              = lower_context.expr_type_of(ctx, eid);
     val res_case: res[opt[u32], fail.Fail] = literal_head_case_index(ctx, e.data.struct_lit.ty, rec_ty);
     if (sel res_case.err) { ret res[value.Value, fail.Fail].err{res_case.err}; }
-    val r_2844: opt[u32] = res_case.ok;
-    if (sel r_2844.some) {
-        val r_2845_r: opt[u32] = res_case.ok;
-        if (sel r_2845_r.none) { ret res[value.Value, fail.Fail].err{fail.message("lower_struct_lit: a required element is absent")}; }
-        ret lower_tag_case_lit(ctx, eid, e, rec_ty, r_2845_r.some);
-    }
+    val head: opt[u32] = res_case.ok;
+    if (sel head.some) { ret lower_tag_case_lit(ctx, eid, e, rec_ty, head.some); }
     if (type.is_vector(?ctx.s.types, rec_ty)) {
         var vector: ast_expr.Expr = @e;
         vector.kind            = ast_expr.EXPR_KIND_VECTOR_LIT;
@@ -2916,15 +2230,11 @@ fun lower_struct_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *a
             elems_start: e.data.struct_lit.elems_start, elems_len: e.data.struct_lit.elems_len};
         ret lower_vector_lit(ctx, eid, ?vector);
     }
-    val res_rec_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, rec_ty);
+    val res_rec_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, rec_ty);
     if (sel res_rec_ir.err) { ret res[value.Value, fail.Fail].err{res_rec_ir.err}; }
-    val rec_ir: ir_type.IrTypeId = res_rec_ir.ok;
+    val rec_ir: Type = res_rec_ir.ok;
 
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
-
-    val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, rec_ir, value.const_int(1, xty));
+    val res_slot: res[value.Value, fail.Fail] = lower_context.slot_for(ctx, rec_ty, rec_ir);
     if (sel res_slot.err) { ret res_slot; }
     val slot: value.Value = res_slot.ok;
 
@@ -2944,12 +2254,9 @@ fun lower_struct_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *a
         val res_field: res[value.Value, fail.Fail] = lower_rvalue(ctx, fi.value);
         if (sel res_field.err) { ret res_field; }
 
-        var idx: [2]value.Value;
-        idx[0] = value.const_int(0, xty);
-        idx[1] = value.const_int(field_ix::u64, xty);
-        val res_gep: res[value.Value, fail.Fail] = builder.emit_gep(?ctx.builder, slot, rec_ir, ?idx[0], 2);
-        if (sel res_gep.err) { ret res_gep; }
-        val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, res_field.ok, res_gep.ok);
+        val res_at: res[value.Value, fail.Fail] = field_gep(ctx, slot, rec_ty, field_ix);
+        if (sel res_at.err) { ret res_at; }
+        val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, res_field.ok, res_at.ok);
         if (sel res_store.err) { ret res[value.Value, fail.Fail].err{res_store.err}; }
         i = i + 1;
     }
@@ -2965,45 +2272,37 @@ pub fun const_value_of_init(ctx: *lower_context.LowerContext, eid: ast_id.ExprId
     ret materialize_const_value(ctx, eid, v, false);
 }
 
+# a comptime scalar as a value of the expression's type; a string is the address of a global
+# holding its bytes, which a global's initialiser names as a constant address
 fun materialize_const_value(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: comptime.CTValue, expr_pos: bool) res[value.Value, fail.Fail] {
-    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
-    val ty_id: ir_type.IrTypeId = res_ir.ok;
+    val ty_id: Type = res_ir.ok;
 
     if (v.kind == comptime.CT_KIND_INT)   { ret res[value.Value, fail.Fail].ok{value.const_int_wide(v.data.w, ty_id)}; }
     if (v.kind == comptime.CT_KIND_FLOAT) { ret res[value.Value, fail.Fail].ok{float_constant(ctx, v.data.f, ty_id)}; }
-    if (v.kind == comptime.CT_KIND_STR) {
-        val opt_txt: opt[View] = intern.bytes(?ctx.s.interner, v.data.s);
-        if (sel opt_txt.none) { ret res[value.Value, fail.Fail].err{fail.message("lower: comptime string lookup failed")}; }
-        val blob: value.Value = constnode.terminated_bytes(opt_txt.some, ty_id);
-        if (expr_pos) { ret lower_context.add_rodata_bytes(ctx, blob, ty_id); }
-        ret res[value.Value, fail.Fail].ok{blob};
-    }
+    if (v.kind == comptime.CT_KIND_STR)   { ret constnode.string_global(ctx, v.data.s); }
     ret res[value.Value, fail.Fail].err{fail.message("lower: unsupported comptime value kind")};
 }
 
 fun snapshot_aggregate(ctx: *lower_context.LowerContext, source_value: value.Value, sem_ty: type.TypeId, vol: bool) res[value.Value, fail.Fail] {
-    val count_ty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel count_ty.err) { ret res[value.Value, fail.Fail].err{count_ty.err}; }
-    val allocated: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, source_value.ty,
-        value.const_int(1, count_ty.ok));
+    val allocated: res[value.Value, fail.Fail] = lower_context.slot_for(ctx, sem_ty, source_value.ty);
     if (sel allocated.err) { ret allocated; }
-    val slot:     value.Value = allocated.ok;
-    var captured: value.Value = source_value;
-    captured.secret = lower_context.type_carries_secret(ctx, sem_ty);
-    val copied: err[fail.Fail] = builder.emit_store(?ctx.builder, captured, slot);
-    if (sel copied.err)                              { ret res[value.Value, fail.Fail].err{copied.err}; }
-    if (vol || type_is_volatile_record(ctx, sem_ty)) { builder.mark_last_volatile(?ctx.builder); }
+    val slot:   value.Value    = allocated.ok;
+    val copied: err[fail.Fail] = builder.emit_store_marked(?ctx.builder, source_value, slot, vol || type_is_volatile_record(ctx, sem_ty));
+    if (sel copied.err) { ret res[value.Value, fail.Fail].err{copied.err}; }
     # the value owns its bytes before later expressions can mutate its source
     var result: value.Value = value.retype(slot, source_value.ty);
-    result.secret = captured.secret;
+    result.secret = lower_context.type_contains_secret(ctx, sem_ty);
     ret res[value.Value, fail.Fail].ok{result};
 }
 
-fun rvalue_at(ctx: *lower_context.LowerContext, ptr: value.Value, ity: ir_type.IrTypeId, sem_ty: type.TypeId, vol: bool) res[value.Value, fail.Fail] {
+# the value of `sem_ty` stored at `ptr`: a read of a secret is marked so, and its result
+# is secret
+fun rvalue_at(ctx: *lower_context.LowerContext, ptr: value.Value, ity: Type, sem_ty: type.TypeId, vol: bool) res[value.Value, fail.Fail] {
     if (is_aggregate_ir(ctx, ity)) {
-        # a call argument nothing later can write is read in place: the call's own ABI
-        # placement is then the only copy
+        # a call argument nothing later can write is read in place: the call's own whole
+        # read is then the only copy
         if (ctx.borrow_now && !vol && !type_is_volatile_record(ctx, sem_ty)) {
             ctx.borrow_now = false;
             ctx.borrow_hit = true;
@@ -3011,32 +2310,28 @@ fun rvalue_at(ctx: *lower_context.LowerContext, ptr: value.Value, ity: ir_type.I
         }
         ret snapshot_aggregate(ctx, value.retype(ptr, ity), sem_ty, vol);
     }
-    val res_: res[value.Value, fail.Fail] = builder.emit_load(?ctx.builder, ptr, ity);
-    if (vol && sel res_.ok) { builder.mark_last_volatile(?ctx.builder); }
+    builder.set_secret(?ctx.builder, lower_context.type_contains_secret(ctx, sem_ty));
+    val res_: res[value.Value, fail.Fail] = builder.emit_load_marked(?ctx.builder, ptr, ity, vol);
+    builder.set_secret(?ctx.builder, false);
     ret res_;
 }
 
 fun global_pointer(ctx: *lower_context.LowerContext, global_ix: u32) res[value.Value, fail.Fail] {
-    val res_ptr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?ctx.m.types);
-    if (sel res_ptr.err) { ret res[value.Value, fail.Fail].err{res_ptr.err}; }
-    ret res[value.Value, fail.Fail].ok{value.global(global_ix, res_ptr.ok)};
+    val space: u32 = builder.global_space(?ctx.builder, global_ix);
+    ret res[value.Value, fail.Fail].ok{value.global(global_ix, builder.ptr_in(?ctx.builder, space), space)};
 }
 
-fun emit_global_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, global_ix: u32, vty: ir_type.IrTypeId) res[value.Value, fail.Fail] {
+fun emit_global_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, global_ix: u32, vty: Type) res[value.Value, fail.Fail] {
     val res_gptr: res[value.Value, fail.Fail] = global_pointer(ctx, global_ix);
     if (sel res_gptr.err) { ret res_gptr; }
     val gptr: value.Value = res_gptr.ok;
     ret rvalue_at(ctx, gptr, vty, lower_context.expr_type_of(ctx, eid), access_is_volatile(ctx, eid));
 }
 
-fun fn_reference(ctx: *lower_context.LowerContext, link: intern.StrId, sig: lower_context.FnSig, is_import: bool) res[value.Value, fail.Fail] {
-    val opt_fi: opt[u32] = find_function(ctx, link);
-    if (sel opt_fi.some) {
-        ret res[value.Value, fail.Fail].ok{value.fn(opt_fi.some, sig.sig)};
-    }
-    val res_xfn: res[u32, fail.Fail] = lower_context.ensure_extern_function(ctx, link, sig, is_import);
+fun fn_reference(ctx: *lower_context.LowerContext, link: intern.StrId, sig: lower_context.FnSig) res[value.Value, fail.Fail] {
+    val res_xfn: res[u32, fail.Fail] = lower_context.ensure_extern_function(ctx, link, sig);
     if (sel res_xfn.err) { ret res[value.Value, fail.Fail].err{res_xfn.err}; }
-    ret res[value.Value, fail.Fail].ok{value.fn(res_xfn.ok, sig.sig)};
+    ret res[value.Value, fail.Fail].ok{value.fn(res_xfn.ok, builder.ptr_type(?ctx.builder), sig.sig)};
 }
 
 fun member_receiver(ctx: *lower_context.LowerContext, obj_eid: ast_id.ExprId, out_rec_ty: *type.TypeId) res[value.Value, fail.Fail] {
@@ -3105,41 +2400,37 @@ fun access_is_volatile(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) boo
     ret false;
 }
 
+# the address of member `field_ix` of the record, union or tag `rec_ty` at `base`: a tag's
+# case is its member of the payload union
 fun field_gep(ctx: *lower_context.LowerContext, base: value.Value, rec_ty: type.TypeId, field_ix: u32) res[value.Value, fail.Fail] {
-    val res_rec_ir: res[ir_type.IrTypeId, fail.Fail] = lower_context.lower_type(ctx, rec_ty);
+    val res_rec_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, rec_ty);
     if (sel res_rec_ir.err) { ret res[value.Value, fail.Fail].err{res_rec_ir.err}; }
-    val rec_ir: ir_type.IrTypeId = res_rec_ir.ok;
-
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
-
-    var ir_ix: u32 = field_ix;
-    if (ir_type.is_tag(?ctx.m.types, rec_ir)) { ir_ix = ir_type.tag_case_field(field_ix); }
-    var idx: [2]value.Value;
-    idx[0] = value.const_int(0, xty);
-    idx[1] = value.const_int(ir_ix::u64, xty);
-    ret builder.emit_gep(?ctx.builder, base, rec_ir, ?idx[0], 2);
+    val rec_ir: Type = res_rec_ir.ok;
+    if (!type.is_tag(?ctx.s.types, type.strip_secret(?ctx.s.types, lower_context.substitute_type(ctx, rec_ty)))) {
+        ret builder.emit_member(?ctx.builder, base, rec_ir, field_ix);
+    }
+    val payloads: res[value.Value, fail.Fail] = builder.emit_member(?ctx.builder, base, rec_ir, lower_context.TAG_PAYLOAD);
+    if (sel payloads.err) { ret payloads; }
+    val union_ir: Type = irt.member(?ctx.m.types, rec_ir, lower_context.TAG_PAYLOAD);
+    ret builder.emit_member(?ctx.builder, payloads.ok, union_ir, lower_context.tag_payload_member(ctx, rec_ty, field_ix));
 }
 
-fun ir_type_of_expr(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[ir_type.IrTypeId, fail.Fail] {
+fun ir_type_of_expr(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[Type, fail.Fail] {
     ret lower_context.lower_type(ctx, lower_context.expr_type_of(ctx, eid));
 }
 
-fun index_bits(ctx: *lower_context.LowerContext) u32 {
-    ret ctx.tgt.model.index_width;
-}
-
-fun index_type(ctx: *lower_context.LowerContext) res[ir_type.IrTypeId, fail.Fail] {
-    ret ir_type.intern_int(?ctx.m.types, index_bits(ctx));
-}
-
 fun widen_index(ctx: *lower_context.LowerContext, v: value.Value, sem_ty: type.TypeId) res[value.Value, fail.Fail] {
-    val res_xty: res[ir_type.IrTypeId, fail.Fail] = index_type(ctx);
-    if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
-    val xty: ir_type.IrTypeId = res_xty.ok;
-    if (scalar_bits(ctx, sem_ty) >= index_bits(ctx)) { ret res[value.Value, fail.Fail].ok{v}; }
-    if (is_signed_type(ctx, sem_ty))                 { ret builder.emit_sext(?ctx.builder, v, xty); }
+    # an index into what a logical pointer points to is read at its own width, and a
+    # constant one in the word spir-v writes a constant index in where it fits there
+    if (builder.classes(?ctx.builder)) {
+        if (v.kind == value.VAL_INT && wide.lt_u(v.bits, wide.from_u64(0x80000000))) {
+            ret res[value.Value, fail.Fail].ok{value.const_int_wide(v.bits, builder.index_type(?ctx.builder))};
+        }
+        ret res[value.Value, fail.Fail].ok{v};
+    }
+    val xty: Type = builder.index_type(?ctx.builder);
+    if (scalar_bits(ctx, sem_ty) >= irt.int_width(?ctx.m.types, xty)) { ret res[value.Value, fail.Fail].ok{v}; }
+    if (is_signed_type(ctx, sem_ty))                                  { ret builder.emit_sext(?ctx.builder, v, xty); }
     ret builder.emit_zext(?ctx.builder, v, xty);
 }
 
@@ -3166,21 +2457,6 @@ fun is_signed_type(ctx: *lower_context.LowerContext, tid: type.TypeId) bool {
     ret type.prim_desc(ok.some).signed;
 }
 
-fun is_half_type(ctx: *lower_context.LowerContext, tid: type.TypeId) bool {
-    val ok: opt[type.TypeKind] = repr_kind(ctx, tid);
-    if (sel ok.none) { ret false; }
-    val d: type.PrimDesc = type.prim_desc(ok.some);
-    ret d.class == type.PRIM_CLASS_FLOAT && d.bits == 16;
-}
-
-# a vector of f16 lanes
-fun is_half_vector(ctx: *lower_context.LowerContext, tid: type.TypeId) bool {
-    val base: type.TypeId = type.strip_secret(?ctx.s.types, tid);
-    if (!type.is_vector(?ctx.s.types, base)) { ret false; }
-    val d: type.PrimDesc = type.prim_desc(type.vector_element(?ctx.s.types, base));
-    ret d.class == type.PRIM_CLASS_FLOAT && d.bits == 16;
-}
-
 fun is_float_type(ctx: *lower_context.LowerContext, tid: type.TypeId) bool {
     val ok: opt[type.TypeKind] = repr_kind(ctx, tid);
     if (sel ok.none) { ret false; }
@@ -3200,8 +2476,8 @@ fun is_pointer_type(ctx: *lower_context.LowerContext, tid: type.TypeId) bool {
     ret k == type.TYPE_PTR || k == type.TYPE_POINTER;
 }
 
-fun is_aggregate_ir(ctx: *lower_context.LowerContext, ity: ir_type.IrTypeId) bool {
-    ret ir_type.is_aggregate(?ctx.m.types, ity);
+fun is_aggregate_ir(ctx: *lower_context.LowerContext, ity: Type) bool {
+    ret irt.is_aggregate(?ctx.m.types, ity);
 }
 
 # the index of the member `name` names in `rec_ty`; a name sema bound that names no member, or
@@ -3229,314 +2505,6 @@ fun field_index_in_type(ctx: *lower_context.LowerContext, rec_ty: type.TypeId, n
     ret 0;
 }
 
-fun find_function(ctx: *lower_context.LowerContext, name: intern.StrId) opt[u32] {
-    ret me_ir.function_lookup(ctx.m, name);
-}
-
 fun find_global(ctx: *lower_context.LowerContext, name: intern.StrId) opt[u32] {
-    ret me_ir.global_lookup(ctx.m, name);
-}
-
-#[testing]
-rec StructLitProbe {
-    a: u32;
-    b: u32;
-    c: u32;
-    d: u32;
-}
-
-#[testing]
-rec StructLitProbeInner {
-    x: u32;
-    y: u32;
-}
-
-#[testing]
-rec StructLitProbeOuter {
-    tag:   u32;
-    inner: StructLitProbeInner;
-    arr:   [3]u32;
-}
-
-#[testing]
-val struct_lit_probe_ct_arr: [1]StructLitProbe = [1]StructLitProbe{StructLitProbe{a: 5}};
-
-#[noinline]
-#[testing]
-fun struct_lit_probe_outer_partial() StructLitProbeOuter {
-    ret StructLitProbeOuter{tag: 3};
-}
-
-#[testing]
-fun struct_lit_probe_outer_nested_partial() StructLitProbeOuter {
-    ret StructLitProbeOuter{tag: 9, inner: StructLitProbeInner{x: 5}, arr: [3]u32{1, 2, 3}};
-}
-
-#[testing]
-fun struct_lit_probe_runtime_y() u32 {
-    val r: StructLitProbe = StructLitProbe{a: 5};
-    ret r.b;
-}
-
-test struct_lit__partial_literal_zeroes_nested_aggregate_region {
-    var bad: i32                 = 0;
-    val o:   StructLitProbeOuter = struct_lit_probe_outer_partial();
-    if (o.tag != 3)     { bad = bad + 1; }
-    if (o.inner.x != 0) { bad = bad + 2; }
-    if (o.inner.y != 0) { bad = bad + 4; }
-    if (o.arr[0] != 0)  { bad = bad + 8; }
-    if (o.arr[1] != 0)  { bad = bad + 16; }
-    if (o.arr[2] != 0)  { bad = bad + 32; }
-    ret bad;
-}
-
-test struct_lit__partial_literal_nested_inside_full_literal {
-    var bad: i32                 = 0;
-    val o:   StructLitProbeOuter = struct_lit_probe_outer_nested_partial();
-    if (o.tag != 9)     { bad = bad + 1; }
-    if (o.inner.x != 5) { bad = bad + 2; }
-    if (o.inner.y != 0) { bad = bad + 4; }
-    if (o.arr[0] != 1)  { bad = bad + 8; }
-    if (o.arr[1] != 2)  { bad = bad + 16; }
-    if (o.arr[2] != 3)  { bad = bad + 32; }
-    ret bad;
-}
-
-test struct_lit__comptime_and_runtime_agree_on_omitted_field {
-    var bad: i32 = 0;
-    $each item in struct_lit_probe_ct_arr {
-        $if (item.b == 0) {
-            if (struct_lit_probe_runtime_y() != 0) { bad = bad + 1; }
-        }
-        $or {
-            bad = bad + 2;
-        }
-    }
-    ret bad;
-}
-
-#[testing]
-rec StructLitOmitInner {
-    x: u32;
-    y: u64;
-}
-
-#[testing]
-rec StructLitOmitProbe {
-    tag:    u64;
-    count:  u64;
-    ptr:    *u8;
-    inner:  StructLitOmitInner;
-    key:    ^u64;
-    secret: ^[8]u8;
-    welded: *^u8;
-}
-
-#[testing]
-val struct_lit_omit_static: StructLitOmitProbe = StructLitOmitProbe{tag: 7};
-
-#[noinline]
-#[testing]
-fun struct_lit_omit_dirty(round: u64) u64 {
-    var junk: [64]u64;
-    var i:    u32 = 0;
-    for (i < 64) {
-        junk[i] = 0xAAAAAAAAAAAAAAAA ^ (round & 1);
-        i       = i + 1;
-    }
-    ret junk[(round & 63)::u32];
-}
-
-#[noinline]
-#[testing]
-fun struct_lit_omit_runtime(tag: u64) StructLitOmitProbe {
-    ret StructLitOmitProbe{tag: tag};
-}
-
-#[noinline]
-#[testing]
-fun struct_lit_omit_constant() StructLitOmitProbe {
-    ret StructLitOmitProbe{tag: 7};
-}
-
-# a bitmask below 64 of the omitted fields that are not zero, plus 1 when the named tag is wrong
-#[testing]
-fun struct_lit_omit_residue(r: *StructLitOmitProbe, tag: u64) i32 {
-    var bad: i32 = 0;
-    if (r.tag != tag)    { bad = bad | 1; }
-    if (r.count != 0)    { bad = bad | 2; }
-    if (r.ptr != nil)    { bad = bad | 4; }
-    if (r.inner.x != 0)  { bad = bad | 8; }
-    if (r.inner.y != 0)  { bad = bad | 8; }
-    if (r.key:>u64 != 0) { bad = bad | 16; }
-    if (r.welded != nil) { bad = bad | 32; }
-    val secret: [8]u8 = r.secret:>[8]u8;
-    var i:      u32   = 0;
-    for (i < 8) {
-        if (secret[i] != 0) { bad = bad | 16; }
-        i = i + 1;
-    }
-    ret bad;
-}
-
-test struct_lit__omitted_fields_zero_including_welded_over_dirty_stack {
-    var round: u64 = 0;
-    # both parities of the dirt pattern
-    for (round < 2) {
-        if ((struct_lit_omit_dirty(round) & 0xFFFFFFFFFFFFFFFE) != 0xAAAAAAAAAAAAAAAA) { ret 255; }
-        var runtime:     StructLitOmitProbe = struct_lit_omit_runtime(round + 1);
-        val bad_runtime: i32                = struct_lit_omit_residue(?runtime, round + 1);
-        if (bad_runtime != 0) { ret bad_runtime; }
-
-        if ((struct_lit_omit_dirty(round) & 0xFFFFFFFFFFFFFFFE) != 0xAAAAAAAAAAAAAAAA) { ret 255; }
-        var constant:     StructLitOmitProbe = struct_lit_omit_constant();
-        val bad_constant: i32                = struct_lit_omit_residue(?constant, 7);
-        if (bad_constant != 0) { ret 64 + bad_constant; }
-
-        if ((struct_lit_omit_dirty(round) & 0xFFFFFFFFFFFFFFFE) != 0xAAAAAAAAAAAAAAAA) { ret 255; }
-        var global:     StructLitOmitProbe = struct_lit_omit_static;
-        val bad_global: i32                = struct_lit_omit_residue(?global, 7);
-        if (bad_global != 0) { ret 128 + bad_global; }
-        round = round + 1;
-    }
-    ret 0;
-}
-
-#[testing]
-uni StructLitProbeUnion {
-    small: u8;
-    big:   u64;
-}
-
-#[testing]
-val struct_lit_probe_union_static: StructLitProbeUnion = StructLitProbeUnion{small: 1};
-
-#[noinline]
-#[testing]
-fun struct_lit_probe_union_dirty() u64 {
-    var junk: [16]u64;
-    var i:    u32 = 0;
-    for (i < 16) {
-        junk[i] = 0xAAAAAAAAAAAAAAAA;
-        i       = i + 1;
-    }
-    ret junk[0];
-}
-
-#[noinline]
-#[testing]
-fun struct_lit_probe_union_partial() StructLitProbeUnion {
-    ret StructLitProbeUnion{small: 1};
-}
-
-test struct_lit__partial_union_literal_zeroes_tail_bytes_over_dirty_stack {
-    var bad: i32 = 0;
-
-    val dirty_check: u64 = struct_lit_probe_union_dirty();
-    if (dirty_check != 0xAAAAAAAAAAAAAAAA) { bad = bad + 1; }
-
-    val u: StructLitProbeUnion = struct_lit_probe_union_partial();
-    if (u.small != 1)                                  { bad = bad + 2; }
-    if ((u.big >> 8) != 0)                             { bad = bad + 4; }
-    if ((struct_lit_probe_union_static.big >> 8) != 0) { bad = bad + 8; }
-
-    ret bad;
-}
-
-#[testing]
-val convert_const_probe_u64:        u64 = 18446744073709551615;
-#[testing]
-val convert_const_probe_u64_as_f64: f64 = convert_const_probe_u64::f64;
-
-#[testing]
-fun convert_const_probe_u64_to_f64_runtime(x: u64) f64 {
-    ret x::f64;
-}
-
-#[testing]
-val convert_const_probe_f64_high:   f64 = 9223372036854775808.0;
-#[testing]
-val convert_const_probe_f64_as_u64: u64 = convert_const_probe_f64_high::u64;
-
-#[testing]
-fun convert_const_probe_f64_to_u64_runtime(x: f64) u64 {
-    ret x::u64;
-}
-
-test convert_const_scalar__unsigned_conversions_agree_with_runtime {
-    var bad: i32 = 0;
-
-    if (convert_const_probe_u64_as_f64 != convert_const_probe_u64_to_f64_runtime(convert_const_probe_u64)) { bad = bad + 1; }
-    if (convert_const_probe_u64_as_f64 <= 0.0)                                                             { bad = bad + 2; }
-
-    if (convert_const_probe_f64_as_u64 != convert_const_probe_f64_to_u64_runtime(convert_const_probe_f64_high)) { bad = bad + 4; }
-    if (convert_const_probe_f64_as_u64 != 9223372036854775808)                                                  { bad = bad + 8; }
-
-    ret bad;
-}
-
-#[testing]
-fun t_pointer_float(value: ptr) f64 {
-    ret value::f64;
-}
-
-#[testing]
-fun t_float_pointer(value: f64) ptr {
-    ret value::ptr;
-}
-
-test convert_const_scalar__nonnumeric_casts_preserve_bits {
-    val bits: u64 = 0x3FF0000000000000;
-    if (t_pointer_float(bits::ptr) != 1.0) { ret 1; }
-    if (t_float_pointer(1.0)::u64 != bits) { ret 2; }
-    ret 0;
-}
-
-#[testing]
-val reinterpret_probe_f64:      f64 = 5.0;
-#[testing]
-val reinterpret_probe_f64_bits: u64 = reinterpret_probe_f64:~u64;
-
-#[testing]
-fun reinterpret_probe_f64_runtime(f: f64) u64 {
-    ret f:~u64;
-}
-
-#[testing]
-val reinterpret_probe_f32:      f32 = 5.0;
-#[testing]
-val reinterpret_probe_f32_bits: u32 = reinterpret_probe_f32:~u32;
-
-#[testing]
-fun reinterpret_probe_f32_runtime(f: f32) u32 {
-    ret f:~u32;
-}
-
-test convert_const_scalar__reinterpret_agrees_with_runtime {
-    var bad: i32 = 0;
-
-    if (reinterpret_probe_f64_bits != reinterpret_probe_f64_runtime(reinterpret_probe_f64)) { bad = bad + 1; }
-    if (reinterpret_probe_f64_bits != 0x4014000000000000)                                   { bad = bad + 2; }
-
-    if (reinterpret_probe_f32_bits != reinterpret_probe_f32_runtime(reinterpret_probe_f32)) { bad = bad + 4; }
-    if (reinterpret_probe_f32_bits != 0x40A00000)                                           { bad = bad + 8; }
-
-    ret bad;
-}
-
-#[testing]
-val lit_str_probe_const: *u8 = "ab\0foo\0x"::*u8;
-
-# a string literal is every byte it spells, embedded NULs included, then a NUL
-test lit_str__keeps_every_byte_after_an_embedded_nul {
-    val want:    [9]u8 = [9]u8{97, 98, 0, 102, 111, 111, 0, 120, 0};
-    val runtime: *u8   = "ab\0foo\0x"::*u8;
-    var bad:     i32   = 0;
-    var i:       usize = 0;
-    for (i < 9) {
-        if (runtime[i] != want[i])             { bad = bad | 1; }
-        if (lit_str_probe_const[i] != want[i]) { bad = bad | 2; }
-        i = i + 1;
-    }
-    ret bad;
+    ret lower_context.global_named(ctx, name);
 }

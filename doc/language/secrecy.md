@@ -694,7 +694,7 @@ data-independent timing:
   time](#pstatedit-at-run-time));
 - **extensions selected**: the cell is data-independent only on a machine that
   has the named extensions, so the row is admitted only when the target selects
-  every one of them (`extensions` in the manifest, or the `baseline`).
+  every one of them (`ext` in the manifest, or the `isa`).
 
 The multiply column is the spelling `$mach.build.ct_mul` takes: `low` is the
 same-width product, `high_u` and `high_s` the upper half of the unsigned and

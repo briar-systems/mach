@@ -106,6 +106,17 @@ An indirect call clobbers exactly as a direct one does — the callee's caller-s
 registers, which the surrounding block's barrier already covers. The register or
 memory holding the target is **read**, not written.
 
+A block may leave for good, by a jump out of it, taken or conditional, or by a
+fault such as `hlt` or `ud2`. Control that leaves never comes back to the
+function, so the compiler owes that path nothing: the block is compiled as
+coming back the way its calls and traps do, and code after a block that always
+leaves is unreachable. A thread's first jump off a fresh stack is the case it
+exists for: after `clone` the child runs on a stack the function's frame is not
+on, and must leave inside the block. A `ret` is refused, since it would skip the
+epilogue that restores the caller's frame. A body that returns by hand is a
+[`#[naked]`](decorators.md#naked--no-prologue-no-epilogue-body-as-written)
+function's.
+
 ## Operand sizes (x86-64)
 
 A register operand states its own width, so `mov eax, [rcx]` is a four-byte load
@@ -338,13 +349,13 @@ tracks secrets in vector registers separately from general-purpose ones.
 Some instructions exist only on processors that implement an extension beyond
 the instruction set's baseline. Each such row names its extension, and the
 encoder refuses it unless the target selects that extension (the manifest's
-[`extensions`](manifest.md#instruction-set-extensions) key) or the enclosing
-function admits it with [`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function).
+[`ext`](manifest.md#instruction-set-extensions) key) or the enclosing
+function admits it with [`#[ext(...)]`](decorators.md#extnames--an-outlier-function).
 The refusal names the instruction, the extension, and both ways to admit it.
 
 The one invariant behind every check: **an instruction that requires extension E
 is emitted only into a function whose admitted set holds E**, where a function's
-admitted set is the target's selection plus what its `#[extensions(...)]` names,
+admitted set is the target's selection plus what its `#[ext(...)]` names,
 each closed over what it implies. The encoder applies it to every row of an `asm`
 block, and the inliner applies the same predicate before moving one body into
 another, so an inlined body never carries an instruction its new home does not
@@ -369,7 +380,7 @@ inherits its function's set.
 | aarch64 | `aes` | `aese vN.16b, vN.16b`, `aesd vN.16b, vN.16b`, `aesmc vN.16b, vN.16b`, `aesimc vN.16b, vN.16b` (FEAT_AES) |
 | aarch64 | `pmull` | `pmull vN.1q, vN.1d, vN.1d`, `pmull2 vN.1q, vN.2d, vN.2d` (FEAT_PMULL; brings `aes`) |
 
-A manifest [level](manifest.md#levels) (`extensions = ["x86-64-v2"]`) selects every
+A manifest [level](manifest.md#levels) (`ext = ["x86-64-v2"]`) selects every
 member name, so it admits the rows of each: `pmulld` assembles under `x86-64-v2`, and
 `tzcnt`, `lzcnt` and `vpsllvd` under `x86-64-v3`, and `vpmullq` under `x86-64-v4`. The
 names a level brings that have no rows yet (`sse42`, `avx`, `avx512f`, `avx512bw`,

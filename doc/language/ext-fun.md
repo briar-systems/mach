@@ -566,16 +566,16 @@ library path. Filters select the applicable target:
 [link.foo-unix]
 source  = "system"
 name    = "foo"
-os      = ["linux", "darwin"]
-isa     = ["*"]
+sys      = ["linux", "darwin"]
+arch     = ["*"]
 abi     = ["*"]
 export  = false
 
 [link.foo-win]
 source  = "system"
 name    = "foo.dll"
-os      = ["windows"]
-isa     = ["*"]
+sys      = ["windows"]
+arch     = ["*"]
 abi     = ["*"]
 export  = false
 ```
@@ -586,7 +586,7 @@ constant under `$if` and writes one attribution:
 ```mach
 use std.types.string.str;
 
-$if ($mach.build.os == $mach.os.windows) {
+$if ($mach.build.sys == $mach.sys.windows) {
     val FOO: str = "foo-win";
 }
 $or {

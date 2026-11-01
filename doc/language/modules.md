@@ -81,7 +81,7 @@ Two common uses:
 - **Topical splits** — organize a large module by topic; all splits
   forwarded unconditionally.
 - **Multiplatform splits** — one impl per target, selected by `$if` on
-  `$mach.build.os` or `$mach.build.arch`.
+  `$mach.build.sys` or `$mach.build.arch`.
 
 ## See also
 

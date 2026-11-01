@@ -9,6 +9,12 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+### Added
+- `mach migrate [<path>] [--check]` rewrites a project written for v6 into v7's spelling: its `mach.toml` and every source file under `[project].src`. Each rule is the row that retires the name, a removed or retired manifest key with a rewrite, a renamed template variable, comptime path or decorator, so a name a later major retires is migrated by the row that retires it. `--check` writes nothing and names each file that would change. `mach fmt` and `mach migrate` share one pass over a project's source.
+
+### Changed
+- **Breaking:** a target names its parts as the whole toolchain does. `[target.*]` writes `arch` for the architecture (v6 `isa`), `isa` for the instruction set every machine of the target has (v6 `baseline`), `sys` for the system (v6 `os`) and `ext` for its extensions (v6 `extensions`), and `[link.*]` filters by `sys` and `arch`. Templates read `{target.arch}` and `{target.sys}`, comptime reads `$mach.sys.*`, `$mach.build.sys`, `$mach.build.ext.*` and `$project.target.sys`, the extension decorator is `#[ext(...)]`, a build step's environment carries `MACH_TARGET_ARCH` and `MACH_TARGET_SYS`, and `mach info` prints `sys`. Each v6 name is refused naming its v7 one and carries the rewrite `mach migrate` applies, and an `isa` that names an architecture is refused as v6's `arch`.
+
 ## [6.10.1] - 2026-10-02
 
 ### Fixed

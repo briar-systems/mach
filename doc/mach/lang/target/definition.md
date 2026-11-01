@@ -647,6 +647,24 @@ the kind of operand `i` as the row spells it. an operand a literal's value bring
 typed by its enumerant (`op_call_kinds`), and is never a pointer or a handle, so it
 reads here as a value
 
+## fun op_reads
+
+```mach
+pub fun op_reads(d: *Op) bool;
+```
+
+whether an operation reads memory through an operand its row spells: a pointer it reads
+through or updates, or a handle whose memory it reads
+
+## fun op_writes
+
+```mach
+pub fun op_writes(d: *Op) bool;
+```
+
+whether an operation writes memory through an operand its row spells: a pointer it
+stores through or updates, or a handle whose memory it writes
+
 ## fun op_kind_is_pointer
 
 ```mach

@@ -9,9 +9,10 @@ extensions each one grants a target that names it
 pub rec Environment;
 ```
 
-an execution environment an isa defines: its name, its profile, and the
-extensions of the isa's vocabulary it guarantees (spirv's `zero_init_workgroup`
-from vulkan1.3)
+an execution environment an isa defines: its name, its profile, the extensions of
+the isa's vocabulary it guarantees (spirv's `zero_init_workgroup` from vulkan1.3),
+and the selection a target for it stands on in masc's spelling, nil for an isa whose
+baseline the environment does not set
 
 ## rec Set
 
@@ -19,8 +20,8 @@ from vulkan1.3)
 pub rec Set;
 ```
 
-the environments an isa defines, and what a target naming none of them is
-granted of the vocabulary
+the environments an isa defines, and what a target naming none of them is granted
+of the vocabulary and stands on
 
 ## val NONE
 
@@ -48,6 +49,15 @@ pub fun extensions(set: *Set, env_id: u32) u64;
 
 the extensions the target's environment guarantees, which its selection holds
 beside the ones it names
+
+## fun stands
+
+```mach
+pub fun stands(set: *Set, env_id: u32) opt[str];
+```
+
+the selection a target for the environment stands on, none where the environment
+sets no baseline
 
 ## fun validate
 

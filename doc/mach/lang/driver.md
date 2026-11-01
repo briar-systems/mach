@@ -64,30 +64,6 @@ fwd passes.codegen_reusable
 
 forwards [`mach.lang.driver.passes.codegen_reusable`](driver/passes.md#fun-codegen_reusable)
 
-## fwd passes.CodeSources
-
-```mach
-fwd passes.CodeSources
-```
-
-forwards [`mach.lang.driver.passes.CodeSources`](driver/passes.md#rec-codesources)
-
-## fwd passes.code_sources
-
-```mach
-fwd passes.code_sources
-```
-
-forwards [`mach.lang.driver.passes.code_sources`](driver/passes.md#fun-code_sources)
-
-## fwd passes.sources_dnit
-
-```mach
-fwd passes.sources_dnit
-```
-
-forwards [`mach.lang.driver.passes.sources_dnit`](driver/passes.md#fun-sources_dnit)
-
 ## fwd passes.module_in_current_project
 
 ```mach
@@ -95,14 +71,6 @@ fwd passes.module_in_current_project
 ```
 
 forwards [`mach.lang.driver.passes.module_in_current_project`](driver/passes.md#fun-module_in_current_project)
-
-## fwd passes.debug_info_of
-
-```mach
-fwd passes.debug_info_of
-```
-
-forwards [`mach.lang.driver.passes.debug_info_of`](driver/passes.md#fun-debug_info_of)
 
 ## fwd driver_load.entry_module_fqn
 
@@ -140,7 +108,7 @@ pub fun append_frontend_roots(p: *project.Project, roots: *Vector[query.QueryKey
 pub fun append_test_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[fail.Fail];
 ```
 
-the backend's roots and each test object's lowering and codegen
+the backend's roots and each test object's codegen
 
 ## fun phase_finish
 

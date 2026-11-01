@@ -53,8 +53,8 @@ src = "src"
 work = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
-isa = "x86_64"
-os  = "linux"
+arch = "x86_64"
+sys  = "linux"
 abi = "sysv64"
 
 [artifact.myproj]

@@ -134,20 +134,20 @@ A target is a fully spelled tuple of isa, os and abi, plus the extensions every 
 
 ```toml
 [target.linux]
-isa = "x86_64"
-os  = "linux"
+arch = "x86_64"
+sys  = "linux"
 abi = "sysv64"
-extensions = ["x86-64-v3", "sha"]
+ext = ["x86-64-v3", "sha"]
 
 [target.board]
-isa      = "riscv32"
-baseline = "rv32imc"
-os       = "freestanding"
+arch      = "riscv32"
+isa = "rv32imc"
+sys       = "freestanding"
 abi      = "ilp32"
 
 [target.gpu]
-isa = "spirv"
-os  = "vulkan"
+arch = "spirv"
+sys  = "vulkan"
 abi = "spirv"
 env = "vulkan1.3"
 ```
@@ -159,7 +159,7 @@ mach build . -t '*'
 A target's extensions are comptime facts, so one module can carry a hardware path and a portable fallback. The branch a target does not select is dropped before it is type-checked.
 
 ```mach
-$if ($mach.build.extensions.sha) {
+$if ($mach.build.ext.sha) {
     use impl: app.sha.hw;
 }
 $or {
@@ -167,7 +167,7 @@ $or {
 }
 ```
 
-A target names an `isa`, an `os`, an `abi` and optionally an object format `of`, and a spirv target an `env`. The values each axis accepts are listed in [the manifest reference](doc/language/manifest.md#accepted-tuple-values).
+A target names an `arch`, an `sys`, an `abi` and optionally an object format `of`, and a spirv target an `env`. The values each axis accepts are listed in [the manifest reference](doc/language/manifest.md#accepted-tuple-values).
 
 x86_64 linux is the primary host. aarch64 linux runs natively in CI, riscv64 linux self-hosts under qemu, darwin self-hosts on both architectures, and windows is a cross-compilation target. `mach info targets` lists every tuple your binary can build.
 

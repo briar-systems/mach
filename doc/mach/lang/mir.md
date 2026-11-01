@@ -991,14 +991,6 @@ the instruction reads and writes the target's fixed accumulator pair, which
 the allocator closes at the instruction to any value live across it or read
 by it, and after it until the pair is read back
 
-## fun lowered_opcode
-
-```mach
-pub fun lowered_opcode(k: ir_instruction.InstrKind) MirOpcode;
-```
-
-the MIR opcode an IR kind lowers to; MIR_OP_NONE for a kind with no row
-
 ## def OperandBank
 
 ```mach

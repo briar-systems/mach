@@ -45,8 +45,8 @@ refused, naming them.
   exported dependency entries, and links the dispatcher in place of its entry. Tests
   then run once per (target, profile): the tests every selected artifact reaches
   there are combined, each qualified name running once. A target that declares a
-  [`runner`](manifest.md#targetname) runs through it, and a target whose `os` and
-  `isa` are the host's and that declares none runs directly; every other (target,
+  [`runner`](manifest.md#targetname) runs through it, and a target whose `sys` and
+  `arch` are the host's and that declares none runs directly; every other (target,
   profile) is built, reported on a `skip` line, and not run, whatever emulation the
   host has. `--runner <cmd>` replaces the target's runner for one invocation and needs
   the selection to resolve to one cell. A run in which nothing was runnable exits `1`, so a green run always ran

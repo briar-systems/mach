@@ -1,18 +1,5 @@
 # mach.cli.cmd.fmt
 
-## rec Report
-
-```mach
-pub rec Report;
-```
-
-`mach fmt`: the project's own source in the one canonical layout
-
-visited: source files read
-differing: files whose layout is not canonical (rewritten, or listed by --check)
-malformed: files that do not parse; each was reported and left unchanged
-diagnostics: where a malformed file's diagnostics are rendered
-
 ## def Operand
 
 ```mach

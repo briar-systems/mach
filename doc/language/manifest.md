@@ -102,8 +102,8 @@ src     = "src"                        # required: source dir, project-root-rela
 work    = "out/{target.name}/{profile.name}"  # required: the work directory template
 
 [target.linux]                         # a platform: a fully-spelled tuple
-isa = "x86_64"
-os  = "linux"
+arch = "x86_64"
+sys  = "linux"
 abi = "sysv64"
 # runner = ["wine", "{artifact.out}"]  # optional: the command run and test launch through
 
@@ -114,6 +114,7 @@ simd  = "scalarize"                    # SIMD lever: "scalarize" | "require"
 # pass  = ["inline"]                   # optional: optimization passes added to the set
 # skip  = ["vectorize"]                # optional: optimization passes left out of it
 # relax = ["float-reassoc"]            # optional: departures from exact semantics
+# linker_relax = false                 # optional: whether the linker may relax the code
 # allow = ["import.unused"]            # optional: warning keys this profile silences
 
 [artifact.demo]                        # a produced artifact
@@ -141,7 +142,7 @@ ref = "branch/main"
 | `id`      | string | Root segment of every module path the project exposes: a file at `<src>/foo/bar.mach` is reachable as `<id>.foo.bar`. Must be a plain identifier — letters, digits, `_`, `-` — since it names the dependency store and keys step stamp files. Read by `$project.id`. |
 | `version` | string | Project version. Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
-| `work`    | string | The work directory template: everything a build writes besides its artifacts, referenced as `{project.work}` by artifact `out`, step `argv`, `in` and `out`, and local link paths. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). `-w` names another work directory for one build or test. |
+| `work`    | string | The work directory template: everything a build writes besides its artifacts, referenced as `{project.work}` by artifact `out`, step `argv`, `in` and `out`, and local link paths. Expanded over `{target.name}`/`{target.arch}`/`{target.sys}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). `-w` names another work directory for one build or test. |
 | `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.3"`). Required in every manifest, a dependency's included. See [Compiler range](#compiler-range). |
 | `out`     | removed | Refused as a removed key: the work directory is `work`. Its refusal carries the rename as a fix. |
 
@@ -266,19 +267,20 @@ to whichever *declared* target matches the host.
 
 | Key   | Required | Meaning |
 |-------|----------|---------|
-| `isa` | yes      | Instruction-set architecture. Read by `$project.target.arch`. |
-| `baseline` | absent: the os's floor; required on `freestanding` | The selection the target stands on, spelled as masc's catalog for the isa spells one, such as `rv32imc`. Only an isa whose catalog spells selections takes it. See [RISC-V baselines](#risc-v-baselines). |
-| `os`  | yes      | Operating system. Read by `$project.target.os`. |
+| `arch` | yes      | Architecture, such as `x86_64` or `riscv64`. Read by `$project.target.arch`. |
+| `isa` | absent: the system's floor; required on `freestanding` | The instruction set every machine of the target has, spelled as masc's catalog for the architecture spells a selection, such as `rv32imc`. Only an architecture whose catalog spells selections takes it, and an `isa` that names an architecture is v6's spelling of `arch`, refused with the rename `mach migrate` writes. See [RISC-V baselines](#risc-v-baselines). |
+| `sys`  | yes      | System. Read by `$project.target.sys`. |
 | `abi` | yes      | Application binary interface. Read by `$project.target.abi`. |
-| `of`  | absent: the os's format | Object-format override; defers to the os's format when omitted. See [Object-format override](#object-format-override). |
-| `base` | absent: the os's base | Load-address override (integer). Overrides the os's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
+| `of`  | absent: the system's format | Object-format override; defers to the system's format when omitted. See [Object-format override](#object-format-override). |
+| `base` | absent: the system's base | Load-address override (integer). Overrides the system's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
 | `stack_reserve` | absent: the format's default | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
 | `stack_commit` | absent: the format's default | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
 | `default` | removed | Refused as a removed key. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
-| `extensions` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the isa's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
+| `os`, `baseline`, `extensions` | removed | v6's names of `sys`, `isa` and `ext`, refused with the rename `mach migrate` writes. |
+| `ext` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the architecture's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
 | `runner` | absent: the host runs its own programs, and no other target's | Array of argv templates the target's programs are launched through by `mach run` and `mach test`, whether or not the target is the host. See [Execution command](#execution-command). |
-| `env` | absent: the isa's default | Consumer environment (string). The values are owned by the target's isa: an `env` the isa does not define is a manifest error naming the target and the known values, and an isa that defines none refuses the key outright. Today only `spirv` defines any; see [Finished-module targets](#finished-module-targets). |
+| `env` | absent: none | The environment the target's system runs it under (string), such as `macos` on `darwin`, `msvc` on `windows` or `vulkan1.2` on `vulkan`. Any target may state it. The values are the system's, owned by mink's host rows and mirl's target record, and an `env` the system does not list is a manifest error. It is required where the system has no host without an environment, as on `darwin` and `windows`. An architecture that defines its own environments, today only `spirv`, also checks the value against them; see [Finished-module targets](#finished-module-targets). |
 
 ### Execution command
 
@@ -295,14 +297,14 @@ as in a step's `argv`.
 
 ```toml
 [target.windows]
-isa    = "x86_64"
-os     = "windows"
+arch    = "x86_64"
+sys     = "windows"
 abi    = "win64"
 runner = ["wine", "{artifact.out}"]
 
 [target.pc]
-isa    = "x86_64"
-os     = "freestanding"
+arch    = "x86_64"
+sys     = "freestanding"
 abi    = "sysv64"
 runner = ["qemu-system-x86_64", "-drive", "format=raw,file={project.work}/disk.img",
           "-device", "isa-debug-exit"]
@@ -324,24 +326,24 @@ is refused when the manifest loads.
 
 ### Instruction-set extensions
 
-`extensions` lists the extensions a target may assume beyond its isa's baseline:
+`ext` lists the extensions a target may assume beyond its `isa`:
 
 ```toml
 [target.linux-x86_64-sha]
-isa        = "x86_64"
-extensions = ["sha", "ssse3", "sse41"]
-os         = "linux"
-abi        = "sysv64"
+arch = "x86_64"
+ext  = ["sha", "ssse3", "sse41"]
+sys  = "linux"
+abi  = "sysv64"
 ```
 
-Each isa owns its vocabulary. The names are identifiers, so each one is also a
-comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md)):
+Each architecture owns its vocabulary. The names are identifiers, so each one is also a
+comptime member, `$mach.build.ext.<name>` (see [`$mach`](comptime-mach.md)):
 
-| `isa` | Baseline | Extensions |
+| `arch` | `isa` | Extensions |
 |-------|----------|------------|
 | `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul` |
-| `aarch64` | the target's `baseline` | `FEAT_SHA1`, `FEAT_SB`, `FEAT_AES`, `FEAT_PMULL`, `FEAT_FP16` |
-| `riscv64`, `riscv32` | the target's `baseline` | `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zfhmin`, `zfh`, `zkt` |
+| `aarch64` | the target's `isa` | `FEAT_SHA1`, `FEAT_SB`, `FEAT_AES`, `FEAT_PMULL`, `FEAT_FP16` |
+| `riscv64`, `riscv32` | the target's `isa` | `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zfhmin`, `zfh`, `zkt` |
 | `spirv` | | `float16`, `int8`, `int16`, `int64`, `float64`, `zero_init_workgroup`, `storage_read_without_format`, `storage_write_without_format`, `vulkan_memory_model`, `vulkan_memory_model_device_scope`, `buffer_device_address`, `subgroup_arithmetic`, `subgroup_clustered`, `subgroup_vote`, `subgroup_ballot`, `subgroup_shuffle`, `subgroup_shuffle_relative`, `subgroup_quad`, `subgroup_graphics_stages`, `buffer_int64_atomics`, `shared_int64_atomics`, `buffer_float32_atomics`, `buffer_float32_atomic_add`, `buffer_float32_atomic_min_max`, `buffer_float64_atomics`, `buffer_float64_atomic_add`, `buffer_float64_atomic_min_max`, `shared_float32_atomics`, `shared_float32_atomic_add`, `shared_float32_atomic_min_max`, `shared_float64_atomics`, `shared_float64_atomic_add`, `shared_float64_atomic_min_max`, `buffer_float16_atomics`, `buffer_float16_atomic_add`, `buffer_float16_atomic_min_max`, `shared_float16_atomics`, `shared_float16_atomic_add`, `shared_float16_atomic_min_max`, `image_int64_atomics`, `image_float32_atomics`, `image_float32_atomic_add`, `image_float32_atomic_min_max`, `storage_image_multisample`, `resource_min_lod`, `image_gather_extended`, `maintenance8`, `storage_buffer_16bit_access`, `uniform_and_storage_buffer_16bit_access`, `storage_push_constant16`, `storage_input_output16`, `storage_buffer_8bit_access`, `uniform_and_storage_buffer_8bit_access`, `storage_push_constant8` |
 
 On `spirv` each name is a device feature a module may require.
@@ -369,8 +371,8 @@ masc's extension catalog for the instruction set, and mach adds only which of it
 rows the compiler emits against. The spirv names are mach's own until a catalog
 names them. A name may cover several rows, as llvm's aarch64 `aes` covers
 `FEAT_AES` and `FEAT_PMULL` and `sha2` covers `FEAT_SHA1` and `FEAT_SHA256`: in
-`extensions` and `#[extensions(...)]` it selects every row it covers, and
-`$mach.build.extensions.<name>` answers for the one row it stands for, the one that
+`ext` and `#[ext(...)]` it selects every row it covers, and
+`$mach.build.ext.<name>` answers for the one row it stands for, the one that
 implies the rest (`FEAT_PMULL` for `aes`). The table names each aarch64 row by masc's
 name for it. A level is a bundle, never an axis of its own: each
 name may imply others, and the selection is closed over that once, when the target
@@ -379,9 +381,9 @@ resolves. `sse41` brings `ssse3` (the chain stops there; SSE3 is not a name),
 and every `avx512*` set brings `avx512f`, which brings `avx2`, `fma` and `f16c`. On
 aarch64 `FEAT_PMULL` brings `FEAT_AES`. On riscv `d` brings
 `f`, `zfh` brings `zfhmin`, `zfhmin` brings `f`, and `f` brings `zicsr`, as masc's
-riscv catalog has it, so `extensions = ["d"]` on `baseline = "rv64i"` selects
-`rv64ifd` with Zicsr. The baseline and the list feed one set: `baseline = "rv64i"`
-with `extensions = ["m"]` selects the same machine as `baseline = "rv64im"`. A name nothing in
+riscv catalog has it, so `ext = ["d"]` on `isa = "rv64i"` selects
+`rv64ifd` with Zicsr. The baseline and the list feed one set: `isa = "rv64i"`
+with `ext = ["m"]` selects the same machine as `isa = "rv64im"`. A name nothing in
 the compiler encodes against yet (`avx`, `avx512f`) is still a declared requirement:
 the inline assembler has no rows to admit under it, so today it records only the
 promise the binary makes about its hosts, and the promise is the program's to check.
@@ -391,7 +393,7 @@ promise the binary makes about its hosts, and the promise is the program's to ch
 x86-64 also spells the published microarchitecture levels. A level is a manifest
 spelling that expands to its member names, so it may stand alone or beside names
 (`["x86-64-v2", "sha"]`), and it includes every lower level. It has no bit of its own:
-`$mach.build.extensions.x86-64-v2` and `#[extensions("x86-64-v2")]` do not exist,
+`$mach.build.ext.x86-64-v2` and `#[ext("x86-64-v2")]` do not exist,
 programs ask about the members (`.avx2`). `sse2`, `cmpxchg8b` and `lahf-sahf` are the
 `x86_64` baseline and are not names. The levels are masc's x86 catalog's, and a test
 holds this table to them:
@@ -405,17 +407,17 @@ holds this table to them:
 `native` is not a spelling and never a default: the hardware requirement is visible
 in the manifest, never inferred from the build machine.
 
-The list is never part of `{target.isa}`. That placeholder is the `isa` value as
+The list is never part of `{target.arch}`. That placeholder is the `arch` value as
 written (`riscv64`, `x86_64`), on every isa; the list belongs to the target's identity
 and to `{target.name}`.
 
 "Selects" means the extension is assumed of every machine the binary runs on: the
-inline assembler admits its rows, `$mach.build.extensions.<name>` answers 1, and a
+inline assembler admits its rows, `$mach.build.ext.<name>` answers 1, and a
 property the extension declares (Zkt's data-independent timing, which the
 constant-time multiply rows read) is taken as given. It never means a mode is on. A
 row such as a `dit` would admit `msr dit`, not set it.
 
-The `extensions` list is the manifest's only lever over the constant-time multiply,
+The `ext` list is the manifest's only lever over the constant-time multiply,
 and only on riscv64, where `zkt` is what admits a secret `*`. There is no key that
 declares or overrides a timing mode. On aarch64 the condition is PSTATE.DIT, which
 the operating system declares it guarantees (linux and darwin) and the linked
@@ -431,7 +433,7 @@ Some rows are the target's alone. On riscv `i` is the baseline, `c` is a code-si
 selection mach never emits, and `f` and `d` select the float register file and the
 calling convention's float registers, and `zkt` is a promise about the machine's
 execution timing that the constant-time rows read, so none of them may be named in
-[`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function); the
+[`#[ext(...)]`](decorators.md#extnames--an-outlier-function); the
 refusal says why. So are spirv `float16`, `int8`, `int16`, `int64` and `float64`,
 the device features that let the whole module use a type of that width, and spirv
 `zero_init_workgroup`, the device feature
@@ -454,7 +456,7 @@ Selecting an extension is a promise about **every** machine the binary runs on. 
 inline assembler admits the extension's mnemonics anywhere in the build, and a host
 without the extension faults on the first one it executes. A portable binary keeps the
 target at its baseline instead. It confines the extension instructions to
-[`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function) functions
+[`#[ext(...)]`](decorators.md#extnames--an-outlier-function) functions
 and picks one of those at run time, after detecting the host's features.
 
 A mnemonic that needs an extension the target does not select, outside such a
@@ -463,11 +465,11 @@ function, is refused. The refusal names the line to add:
 ```
 error[asm.extension]: inline-asm instruction 'sha256rnds2' needs the `sha` extension, which
 this target does not select; add `extensions = ["sha"]` to the target, or mark the
-function `#[extensions(sha)]` and call it only after detecting the extension at run time
+function `#[ext(sha)]` and call it only after detecting the extension at run time
 ```
 
 The selected set is part of the target's identity: two targets that differ only in
-`extensions` never share cached products.
+`ext` never share cached products.
 
 The selection also reaches code generation. Every vector operation is legal on every
 target and its shape never depends on the extension list; what moves is the lowering.
@@ -489,8 +491,8 @@ as byte counts:
 
 ```toml
 [target.windows]
-isa = "x86_64"
-os  = "windows"
+arch = "x86_64"
+sys  = "windows"
 abi = "win64"
 stack_reserve = 0x800000        # 8 MiB
 stack_commit  = 0x1000          # 4 KiB
@@ -541,14 +543,14 @@ such an image is refused at link rather than silently dropped.
 
 | Axis  | Values |
 |-------|--------|
-| `isa` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv` |
-| `os`  | `linux`, `windows`, `darwin`, `freestanding`, `vulkan` |
+| `arch` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv` |
+| `sys`  | `linux`, `windows`, `darwin`, `freestanding`, `vulkan` |
 | `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `spirv` |
 | `of`  | `elf`, `macho`, `coff`, `flat`, `spirv` |
 | `env` | `vulkan1.0`, `vulkan1.1`, `vulkan1.2`, `vulkan1.3` |
 
-Each `isa`, `os` and `of` value is the name of a row of mink's catalog: `isa` an
-architecture, `os` a system and `of` a format. mach reads the spelling from that row,
+Each `arch`, `sys` and `of` value is the name of a row of mink's catalog: `arch` an
+architecture, `sys` a system and `of` a format. mach reads the spelling from that row,
 and the catalog's rows mach has no target for (`x86`, `wasm32`, `uefi`, `wasi`, ...)
 are not values here. A spelling mink names otherwise is refused where it is written,
 naming the new spelling and carrying the rewrite `mach migrate` applies:
@@ -557,8 +559,8 @@ naming the new spelling and carrying the rewrite `mach migrate` applies:
 |-----|---------|-------------|
 | `of` | `raw` | `flat` |
 | `of` | `spv` | `spirv` |
-| `os` (on `isa = "spirv"`) | `freestanding` | `vulkan` |
-| `isa` | a RISC-V selection such as `rv32imc` | `isa = "riscv32"` and `baseline = "rv32imc"` |
+| `sys` (on `arch = "spirv"`) | `freestanding` | `vulkan` |
+| `arch` | a RISC-V selection such as `rv32imc` | `arch = "riscv32"` and `isa = "rv32imc"` |
 
 ```
 error[target.retired_spelling]: mach.toml: [target.metal].of = "raw" is a retired spelling; write "flat", mink's name for it
@@ -566,8 +568,8 @@ error[target.retired_spelling]: mach.toml: [target.metal].of = "raw" is a retire
 
 `env` is defined only by `spirv`.
 
-A `[target.*]` naming an `isa`, `os` or `abi` outside these lists is refused
-through the registry's own lookup (`no isa implementation registered for
+A `[target.*]` naming an `arch`, `sys` or `abi` outside these lists is refused
+through the registry's own lookup (`no arch implementation registered for
 'mos6502' (registered: ...)`).
 
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
@@ -584,29 +586,29 @@ emits a finished GPU module rather than machine code (see
 
 ### RISC-V baselines
 
-`isa` names the architecture, and `baseline` the selection the target stands on,
-spelled as masc's catalog for the isa spells one. A target with an operating system that
-names no baseline stands on the **floor** mink states for that system and isa:
-`riscv64` on `linux` is `rv64gc`, and `aarch64` on `linux` is `armv8-a+fp+simd`. A
-`freestanding` target must name its baseline, since the chip decides
-it and a default would fault on hardware that lacks an extension; leaving it out is
-refused (`target.baseline_required`). A baseline such as `rv32imc` or `rv64imafd`
-selects a smaller machine, and `extensions` adds names on top of it:
+`arch` names the architecture, and `isa` the instruction set every machine of the
+target has, spelled as masc's catalog for the architecture spells a selection. A
+target with an operating system that names no `isa` stands on the **floor** mink
+states for that system and architecture: `riscv64` on `linux` is `rv64gc`, and
+`aarch64` on `linux` is `armv8-a+fp+simd`. A `freestanding` target must name its
+`isa`, since the chip decides it and a default would fault on hardware that lacks an
+extension; leaving it out is refused (`target.baseline_required`). An `isa` such as
+`rv32imc` or `rv64imafd` selects a smaller machine, and `ext` adds names on top of it:
 
 ```toml
 [target.board]
-isa      = "riscv32"
-baseline = "rv32imc"
-os       = "freestanding"
-abi      = "ilp32"
+arch = "riscv32"
+isa  = "rv32imc"
+sys  = "freestanding"
+abi  = "ilp32"
 ```
 
-masc reads the baseline, closes it over the catalog's implications (`g` is IMAFD
+masc reads the `isa`, closes it over the catalog's implications (`g` is IMAFD
 plus Zicsr and Zifencei, D brings F and F brings Zicsr) and says whether the
-architecture enters it. A baseline masc's catalog refuses, or one of the other
-width (`rv64gc` on `riscv32`) or the E base, is refused naming the baseline and the
-isa. An isa whose catalog spells no selection (`x86_64`, `spirv`) refuses
-`baseline` outright, naming the isa: name what it adds with `extensions`.
+architecture enters it. An `isa` masc's catalog refuses, or one of the other
+width (`rv64gc` on `riscv32`) or the E base, is refused naming the `isa` and the
+architecture. An architecture whose catalog spells no selection (`x86_64`, `spirv`)
+refuses `isa` outright, naming the architecture: name what it adds with `ext`.
 
 mach emits against I, M, A, F, D, C, Zicond, Zicsr, Zifencei, Zfhmin, Zfh and Zkt.
 Zicond adds `czero.eqz` and `czero.nez`, which a branch-free select compiles to
@@ -628,7 +630,7 @@ selected machine, but the emitter writes full-width instructions only.
 The ABI still selects the calling convention on its own, and it must fit the
 selected machine: `rv32imc` and `rv32imac` have no floating-point registers, so
 they take `ilp32` and are refused with `ilp32f` or `ilp32d`; name
-`baseline = "rv32imafdc"` when RV32 hardware floating point is wanted.
+`isa = "rv32imafdc"` when RV32 hardware floating point is wanted.
 
 `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, and `ilp32d` are the RISC-V psABI
 calling-convention family, one `abi` per member. The lp64 three target
@@ -671,8 +673,8 @@ os cannot enter is refused.
 
 ```toml
 [target.metal]
-isa = "x86_64"
-os  = "freestanding"   # os default object format is "flat"
+arch = "x86_64"
+sys  = "freestanding"   # os default object format is "flat"
 abi = "sysv64"
 of  = "elf"            # override: emit an ELF object instead
 ```
@@ -708,8 +710,8 @@ linker: the build publishes the entry module at the artifact's resolved `out` (o
 
 ```toml
 [target.gpu]
-isa = "spirv"
-os  = "vulkan"
+arch = "spirv"
+sys  = "vulkan"
 abi = "spirv"
 # no `of`: the finished-module format resolves on its own
 ```
@@ -738,7 +740,7 @@ feature.
 
 The environment also selects the `zero_init_workgroup` extension from `vulkan1.3`,
 where `shaderZeroInitializeWorkgroupMemory` is core, and a module without `env` has
-it too. A target for an earlier version selects it with `extensions` when its consumer
+it too. A target for an earlier version selects it with `ext` when its consumer
 enables `VK_KHR_zero_initialize_workgroup_memory`.
 
 The environment also selects `storage_read_without_format` and
@@ -756,7 +758,7 @@ memory model unless its target selects `vulkan_memory_model`, Vulkan's
 `VulkanMemoryModel` capability and, below SPIR-V 1.5, the
 `SPV_KHR_vulkan_memory_model` extension. `vulkan1.3` requires the feature of every
 device, so it selects the extension, and a module without `env` has it too. A target
-for `vulkan1.1` or `vulkan1.2` selects it with `extensions` when its consumer enables
+for `vulkan1.1` or `vulkan1.2` selects it with `ext` when its consumer enables
 the feature, and one for `vulkan1.0` is refused, since the model needs SPIR-V 1.3.
 Under the Vulkan model a memory scope of `Device` needs
 `vulkanMemoryModelDeviceScope` as well, which `vulkan1.3` also requires: an
@@ -774,7 +776,7 @@ then declares the `PhysicalStorageBufferAddresses` capability, the
 `PhysicalStorageBuffer64` addressing model and, below SPIR-V 1.5, the
 `SPV_KHR_physical_storage_buffer` extension. `vulkan1.3` requires the feature of every
 device, so it selects the extension, and a module without `env` has it too. A target
-for an earlier version selects it with `extensions` when its consumer enables the
+for an earlier version selects it with `ext` when its consumer enables the
 feature.
 
 No environment selects `storage_image_multisample`, Vulkan's
@@ -793,7 +795,7 @@ admits that operand on a fetch or a sample as well as a gather.
 No environment selects a type's feature, since every Vulkan version leaves them
 optional: `int8`, `int16`, `int64`, `float16` and `float64` are Vulkan's
 `shaderInt8`, `shaderInt16`, `shaderInt64`, `shaderFloat16` and `shaderFloat64`,
-and the target selects one with `extensions` when its consumer enables it. A module
+and the target selects one with `ext` when its consumer enables it. A module
 without `env` has all five. The ceiling below still bounds them, so `int8` or
 `float16` under `vulkan1.0` is refused for the environment, not the feature.
 
@@ -855,11 +857,11 @@ class, which the 8-bit feature does not reach.
 
 ```toml
 [target.gpu]
-isa        = "spirv"
-os         = "vulkan"
+arch        = "spirv"
+sys         = "vulkan"
 abi        = "spirv"
 env        = "vulkan1.0"
-extensions = ["int16", "int64", "float64"]
+ext = ["int16", "int64", "float64"]
 ```
 
 | `env` | SPIR-V | capabilities the ceiling admits |
@@ -882,8 +884,8 @@ appendix's required version: 1.0, 1.3, 1.5 and 1.6.
 
 ```toml
 [target.gpu]
-isa = "spirv"
-os  = "vulkan"
+arch = "spirv"
+sys  = "vulkan"
 abi = "spirv"
 env = "vulkan1.2"
 ```
@@ -897,15 +899,15 @@ there is no archive, shared object, or executable form for a module.
 ### Platform targets (bare metal)
 
 A bare-metal platform — such as [BareMetal](https://github.com/ReturnInfinity/BareMetal)
-(`bmos`), Return Infinity's x86-64 exokernel — is not its own `os`. It is
-`os = "freestanding"` plus two optional keys: a `base` load-address override and an
+(`bmos`), Return Infinity's x86-64 exokernel — is not its own `sys`. It is
+`sys = "freestanding"` plus two optional keys: a `base` load-address override and an
 open `platform` tag a support library keys its backend on (surfaced to comptime as
 `$mach.build.platform`). A BareMetal target:
 
 ```toml
 [target.bmos]
-isa      = "x86_64"
-os       = "freestanding"
+arch      = "x86_64"
+sys       = "freestanding"
 abi      = "sysv64"
 base     = 0xFFFF800000000000   # BareMetal copies the flat image here and calls it
 platform = "bmos"               # selects the mach-bmos backend
@@ -955,6 +957,7 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 | `pass` | array of strings | **Optional.** Optimization passes added to the set this profile's `optimize` selects, each a name from [`mach info passes`](#passes), listed once. Absent, nothing is added. |
 | `skip` | array of strings | **Optional.** Optimization passes left out of the set, each listed once and never in `pass` too. Absent, nothing is left out. |
 | `relax` | array of strings | **Optional.** The departures from exact semantics the build permits. The one there is, `"float-reassoc"`, is described under [Float reassociation](#float-reassociation). Absent, the build keeps exact semantics. |
+| `linker_relax` | bool | **Optional.** Whether the linker may relax the code, as RISC-V linker relaxation shortens a call or an address pair once the link has placed its target. The build hands it to mirl's `relax` build option on every target, and a target whose linker relaxes nothing takes it without effect. `false` keeps every instruction sequence at the length the compiler laid it out. Absent, it is `true`. It has no command-line form. A non-boolean is a manifest error. |
 | `debug` | bool    | Emit debug info for this profile: DWARF in ELF, Mach-O and COFF objects alike, and the core SPIR-V debug instructions on a `spirv` target (see [Finished-module targets](#finished-module-targets)). A PE image carries its DWARF in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
 | `simd`  | string  | SIMD scalarization lever. `"scalarize"` emits a defined unrolled scalar expansion wherever the target has no packed instruction for a vector operator, with one `vector.scalarize` warning at each such operation naming the operation, its lanes, the function, the target and the extension that would pack it (or that none would). `"require"` makes each of those sites a hard error with the same text. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. Any other string is a manifest error. |
 | `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile requirement and selection](#profile-requirement-and-selection). |
@@ -1297,7 +1300,7 @@ any of them (see [test.md](test.md#which-tests-run)).
     A `freestanding` target is refused as well. With its default `flat` format
     the artifact fails naming (`artifact naming: this object format has no
     shared-library form`), and with `of = "elf"` the link refuses with
-    `link: a shared library needs a loader to map it, and os = "freestanding"
+    `link: a shared library needs a loader to map it, and sys = "freestanding"
     has none`.
 
 Per-target extension or per-target entry is not a per-cell exception table — it is a
@@ -1374,7 +1377,7 @@ mach.toml: artifact.game.subsystem: Subsystem gui is unsupported by elf (target 
 An omitted key is the console default and is never refused, so an artifact
 that declares no subsystem still builds everywhere. An artifact that needs the
 key and also targets a non-windows cell declares two artifacts, one per format,
-the way `[link.X]` entries carry `os`/`isa`/`abi` axes: the manifest never
+the way `[link.X]` entries carry `sys`/`arch`/`abi` axes: the manifest never
 carries a declaration a build silently ignores.
 
 `--subsystem console|gui` overrides the key for one invocation and is refused
@@ -1437,17 +1440,18 @@ the same entries, so nothing behaves differently as a dependency.
 | `name`    | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. |
 | `path`    | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
 | `symbols` | absent: none claimed | Array of symbol names this dependency provides, attributing imports that have no `ext` declaration to decorate (see below). Written as **source-level** names; the target's C symbol prefix is applied by Mach. |
-| `os`      | yes | Filter axis: an array of canonical `os` values or `"*"` (any); `[]` matches none. |
-| `isa`     | yes | Filter axis over `isa`, same forms. |
+| `sys`      | yes | Filter axis: an array of canonical `sys` values or `"*"` (any); `[]` matches none. |
+| `arch`     | yes | Filter axis over `arch`, same forms. |
 | `abi`     | yes | Filter axis over `abi`, same forms. |
 | `export`  | absent: not exported | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
 | `include` | absent: `"always"` | `"always"` names the dynamic library in the linked image whether or not anything imports from it; `"referenced"` names it only when a live import references it, so an unused provider leaves no load command behind. Any other value is a manifest error (`[link.k].include must be "always" or "referenced"`). |
 | `library` | removed | Refused as a removed key. The table key is the library's identity, and `#[library]` names the entry by that key. |
+| `os`, `isa` | removed | v6's names of `sys` and `arch`, refused with the rename `mach migrate` writes. |
 
-The `os`/`isa`/`abi` axes select the build cells an entry applies to. Each is an
+The `sys`/`arch`/`abi` axes select the build cells an entry applies to. Each is an
 array, like an artifact's `targets`: canonical values, `"*"` for any, and `[]`
 matching nothing (an entry deliberately switched off). A bare string is refused. The three axes are required: an axis left out would mean every
-target, which is an assumption to state, so a `kernel32` entry with no `os` is
+target, which is an assumption to state, so a `kernel32` entry with no `sys` is
 refused rather than linked on Linux. A non-canonical spelling is a manifest
 error. An entry applies
 to a cell when all three axes match.
@@ -1496,8 +1500,8 @@ with no declaration to decorate, so the entry that provides them claims them:
 source  = "system"
 name    = "kernel32.dll"
 symbols = ["Sleep", "CreateFileW", "CloseHandle"]
-os      = ["windows"]
-isa     = ["*"]
+sys      = ["windows"]
+arch     = ["*"]
 abi     = ["*"]
 export  = true
 ```
@@ -1664,9 +1668,9 @@ this only stays clear of the reserved tree while the two names differ, so prefer
 distinct sibling such as `{project.work}/vendor/<library>/`.
 
 **Target environment.** Every step process additionally receives the active
-build cell's target tuple as `MACH_TARGET_ISA`, `MACH_TARGET_OS`, and
+build cell's target tuple as `MACH_TARGET_ARCH`, `MACH_TARGET_SYS`, and
 `MACH_TARGET_ABI`, so the script `argv` invokes can branch on the target
-without threading it through the template — e.g. `cc --target=$MACH_TARGET_ISA-…`.
+without threading it through the template — e.g. `cc --target=$MACH_TARGET_ARCH-…`.
 The step inherits the planner's environment, then applies its declared `env`
 values, then assigns those three target variables. Names use host identity:
 case-sensitive on Unix and ordinal case-insensitive on Windows, including Unicode
@@ -1725,8 +1729,8 @@ set of nine variables:
   manifest of the closure. In a dependency's artifact `out` it is that
   dependency's home under it, `dep/<id>`.
 - `{target.name}` — the resolved target name (never the literal `native`).
-- `{target.isa}` — the resolved target's `isa` (e.g. `x86_64`).
-- `{target.os}` — the resolved target's `os` (e.g. `linux`).
+- `{target.arch}` — the resolved target's `arch` (e.g. `x86_64`).
+- `{target.sys}` — the resolved target's `sys` (e.g. `linux`).
 - `{target.abi}` — the resolved target's `abi` (e.g. `sysv64`).
 - `{profile.name}` — the selected profile name.
 - `{artifact.suffix}` — the conventional filename suffix of the artifact being
@@ -1741,7 +1745,7 @@ set of nine variables:
   Available only in a `runner`. See [Execution command](#execution-command).
 
 The three `{target.*}` tuple keys are also exported to every step process as
-`MACH_TARGET_ISA`/`MACH_TARGET_OS`/`MACH_TARGET_ABI` (see [build steps](#stepname--build-steps)).
+`MACH_TARGET_ARCH`/`MACH_TARGET_SYS`/`MACH_TARGET_ABI` (see [build steps](#stepname--build-steps)).
 
 Every output path is explicit and none is rooted for you: an artifact's `out`, a
 step's `out` list and a local link's `path` are relative to the project root and
@@ -1920,7 +1924,7 @@ outputs, is described in [build.md](build.md).
 A project that uses a system-lib binding (`glfw`) and a vendored-C library
 (`miniz`), building a native binary and cross-compiling to windows. The platform
 shim is built by steps and linked through `local` entries; the OS-specific shims
-are gated by their link entries' `os` axis, so the x11 step runs on a linux build
+are gated by their link entries' `sys` axis, so the x11 step runs on a linux build
 and never on a windows one.
 
 ```toml
@@ -1946,32 +1950,32 @@ ref = "tag/v1.0.3"
 [link.shim]
 source = "local"
 path   = "{project.work}/obj/platform/shim.o"
-os     = ["*"]
-isa    = ["*"]
+sys     = ["*"]
+arch    = ["*"]
 abi    = ["*"]
 export = false
 
 [link.shim-x11]
 source = "local"
 path   = "{project.work}/obj/platform/x11.o"
-os     = ["linux"]
-isa    = ["*"]
+sys     = ["linux"]
+arch    = ["*"]
 abi    = ["*"]
 export = false
 
 [link.shim-win32]
 source = "local"
 path   = "{project.work}/obj/platform/win32.o"
-os     = ["windows"]
-isa    = ["*"]
+sys     = ["windows"]
+arch    = ["*"]
 abi    = ["*"]
 export = false
 
 [link.gl]
 source = "system"
 name   = "GL"
-os     = ["linux"]
-isa    = ["*"]
+sys     = ["linux"]
+arch    = ["*"]
 abi    = ["*"]
 export = false
 
@@ -2002,13 +2006,13 @@ out  = ["{project.work}/obj/platform/win32.o"]
 need = []
 
 [target.linux]
-isa = "x86_64"
-os  = "linux"
+arch = "x86_64"
+sys  = "linux"
 abi = "sysv64"
 
 [target.windows]
-isa = "x86_64"
-os  = "windows"
+arch = "x86_64"
+sys  = "windows"
 abi = "win64"
 
 [profile.debug]
@@ -2022,9 +2026,9 @@ debug = false
 simd  = "scalarize"
 ```
 
-The `gl` and `shim-x11` entries carry `os = "linux"`, so on a windows build cell
+The `gl` and `shim-x11` entries carry `sys = "linux"`, so on a windows build cell
 they filter out (and `shim-x11`'s step is never demanded); `shim-win32` carries
-`os = "windows"` and applies only there. The unconditional `shim` entry (`os = "*"`)
+`sys = "windows"` and applies only there. The unconditional `shim` entry (`sys = "*"`)
 applies to both.
 
 ## Worked example: a C-binding dependency's export
@@ -2044,24 +2048,24 @@ work    = "out/{target.name}/{profile.name}"
 [link.glfw]
 source = "system"
 name   = "glfw"
-os     = ["linux", "darwin"]
-isa    = ["*"]
+sys     = ["linux", "darwin"]
+arch    = ["*"]
 abi    = ["*"]
 export = true
 
 [link.glfw-win]
 source = "system"
 name   = "glfw3.dll"
-os     = ["windows"]
-isa    = ["*"]
+sys     = ["windows"]
+arch    = ["*"]
 abi    = ["*"]
 export = true
 
 [link.Cocoa]
 source = "framework"
 name   = "Cocoa"
-os     = ["darwin"]
-isa    = ["*"]
+sys     = ["darwin"]
+arch    = ["*"]
 abi    = ["*"]
 export = true
 ```
@@ -2072,7 +2076,7 @@ declaration carries the same attribution on every target:
 ```mach
 use std.types.string.str;
 
-$if ($mach.build.os == $mach.os.windows) {
+$if ($mach.build.sys == $mach.sys.windows) {
     val GLFW: str = "glfw-win";
 }
 $or {
@@ -2099,8 +2103,8 @@ work    = "out/{target.name}/{profile.name}"
 [link.miniz]
 source = "local"
 path   = "{project.work}/obj/miniz/miniz.o"
-os     = ["*"]
-isa    = ["*"]
+sys     = ["*"]
+arch    = ["*"]
 abi    = ["*"]
 export = true
 

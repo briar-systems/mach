@@ -779,7 +779,7 @@ shapes. Which names the compiler answers is a semantic concern.
 comptime-ident ::= "$" IDENT                       (* $size_of, $mach, $type_of, ... *)
 
 intrinsic-call ::= comptime-ident call-args         (* $size_of(T), $fields(T), $type_of(e) *)
-mach-read      ::= comptime-ident { member }        (* $mach.build.os, $mach.arch.x86_64 *)
+mach-read      ::= comptime-ident { member }        (* $mach.build.sys, $mach.arch.x86_64 *)
 ```
 
 - An intrinsic call is a `comptime-ident` callee with `call-args`. The set of

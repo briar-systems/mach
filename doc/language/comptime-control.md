@@ -47,10 +47,10 @@ range is a compile error rather than a silent wrap.
 ### Target-conditional code
 
 ```mach fragment
-$if ($mach.build.os == $mach.os.linux) {
+$if ($mach.build.sys == $mach.sys.linux) {
     use full.os.linux;
 }
-$or ($mach.build.os == $mach.os.windows) {
+$or ($mach.build.sys == $mach.sys.windows) {
     use full.os.windows;
 }
 $or {

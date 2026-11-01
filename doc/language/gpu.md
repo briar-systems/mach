@@ -742,7 +742,7 @@ checked at the call, where the literal's value is known:
 | a requirement's extension the target does not select   | `spirv.capability`, naming the extension |
 | a capability whose SPIR-V version the environment is below | `spirv.capability`, naming the first `env` that reaches it |
 
-A device feature is an extension the target names in its `extensions` once the
+A device feature is an extension the target names in its `ext` once the
 consumer enables it, since no environment guarantees it: `subgroup_arithmetic` is
 Vulkan's `VK_SUBGROUP_FEATURE_ARITHMETIC_BIT`, and a target naming no `env` holds
 every extension. A module declares a capability only when something it emits needs

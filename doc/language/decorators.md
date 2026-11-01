@@ -41,7 +41,7 @@ A decorator is written as `#[...]`:
 #[oblivious]         # constant-time boundary (no arguments)
 #[scalar]            # opt out of auto-vectorization (no arguments)
 #[naked]             # no prologue or epilogue; body as written (no arguments)
-#[extensions(a, b)]  # the function may use these instruction-set extensions
+#[ext(a, b)]         # the function may use these instruction-set extensions
 #[embed("path")]     # compile-time file embedding (val only)
 #[stage("name")]     # GPU pipeline stage; makes the function an entry point
 #[workgroup(x,y,z)]  # compute workgroup dimensions, constants or #[spec] vars (with #[stage("compute")])
@@ -90,7 +90,7 @@ name you give it: the compiler adds no platform decoration of its own, and a
 `val` gated by comptime is how one declaration names its symbol per target.
 
 ```mach
-$if ($mach.build.os == $mach.os.darwin) {
+$if ($mach.build.sys == $mach.sys.darwin) {
     val SPIN: *u8 = "_spin";
 }
 $or {
@@ -759,9 +759,11 @@ a thread entry point whose register state at entry *is* the interface.
   rejected. A local, an expression, or a `ret` lowers to code that assumes a
   frame the function does not have, and the result would run and return a wrong
   answer rather than fail.
-- **No return is generated.** If the asm falls off the end, control runs into
-  whatever the linker placed next. Write the return the ABI (or the interrupt
+- **No return is generated.** Control that falls off the end of the asm reaches
+  a trap the compiler places there. Write the return the ABI (or the interrupt
   controller) actually calls for.
+- **An asm block of a naked body binds no `{name}`.** The function has no frame
+  to hold a local, so a binding is refused where the block is written.
 - **Parameters and the return type are still checked** at every call site, so a
   naked function is called like any other. No moves are emitted for them: the
   arguments arrive in the ABI's registers and the body reads them there.
@@ -784,13 +786,15 @@ also makes a call gets one, since an unaligned call boundary (x86-64) or a
 clobbered link register (aarch64, riscv64) is not something the author asked
 for by writing assembly.
 
-### `extensions(names)` — an outlier function
+### `ext(names)` — an outlier function
 
 Lets one function use instruction-set extensions the target does not select.
-Applies to a function with a body; takes one or more bare extension names.
+Applies to a function with a body; takes one or more bare extension names. v6
+named it `extensions`, which is refused naming `ext` and which `mach migrate`
+rewrites.
 
 ```mach fragment
-#[extensions(sha, ssse3)]
+#[ext(sha, ssse3)]
 fun compress_sha_ni(state: *[8]u32, block: *[64]u8) {
     asm x86_64 {
         # sha256msg1, sha256rnds2, pshufb, ...
@@ -818,11 +822,11 @@ processor's features and when that answer holds.
   the names the compiler emits against. A name a catalog holds that the compiler
   emits nothing against, or that another instruction set declares, admits
   nothing on this target and is not an error, so one
-  declaration serves a multi-arch source: `#[extensions(sse41, sha2)]` admits
+  declaration serves a multi-arch source: `#[ext(sse41, sha2)]` admits
   `sse41` on x86_64 and `sha2` on aarch64, and an `asm aarch64 {}` block in an
   x86_64 build still refuses `sha256h` because the tag, not the decorator, picks
   the isa. Each name may appear once. The names are those the manifest's
-  [`extensions`](manifest.md#instruction-set-extensions) key takes, closed over
+  [`ext`](manifest.md#instruction-set-extensions) key takes, closed over
   what they imply (`sse41` admits `pshufb`), except the rows only a target
   selects (riscv `i`, `c`, `f`, `d`, `zkt`), which are refused with the reason.
 - **One predicate, everywhere.** A function's admitted set is the target's
@@ -964,7 +968,7 @@ a further rule the decorator's own section states.
 | `oblivious` | `fun` |  |
 | `scalar` | `fun` |  |
 | `naked` | `fun` |  |
-| `extensions` | `fun` | a function with a body |
+| `ext` | `fun` | a function with a body |
 | `embed` | `val` | a `val` that is not `ext`, checked by `embed` itself |
 | `stage` | `fun` |  |
 | `workgroup` | `fun` | a function that also carries `#[stage("compute")]` |
@@ -991,7 +995,7 @@ is refused with `decorator.unknown`, and the refusal lists every decorator.
 - [visibility.md](visibility.md) — `pub` / `ext` visibility (not decorator-controlled)
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of` / `$align_of` as `align` arguments
 - [secrecy.md](secrecy.md) — `^` secret types and the `oblivious` constant-time contract
-- [asm.md](asm.md) — inline `asm`, the only body a `naked` function may have, and the extension instructions `extensions` admits
+- [asm.md](asm.md) — inline `asm`, the only body a `naked` function may have, and the extension instructions `ext` admits
 - [val-var.md](val-var.md) — `val` / `var` bindings, and the `embed` exemption to `val`'s initializer requirement
 - [grammar.md](grammar.md#types) — the `[_]` inferred array length `embed` introduces
 - [types.md](types.md) — the SIMD vector types a shader stage computes over and `op` operates on, and the handle types `handle` declares

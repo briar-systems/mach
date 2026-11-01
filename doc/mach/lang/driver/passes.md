@@ -8,29 +8,14 @@ pub val LOWERED_SURFACE: query.Kind = query.Kind;
 
 a module's source with what lowering omits cut away, keyed by its stable id
 
-## val INLINE_BODIES
-
-```mach
-pub val INLINE_BODIES: query.Kind = query.Kind;
-```
-
-the bodies a module offers its importers to inline, keyed by its back-half key
-
-## val LOWER
-
-```mach
-pub val LOWER: query.Kind = query.Kind;
-```
-
-a module's optimized ir, keyed by its back-half key
-
 ## val CODEGEN
 
 ```mach
 pub val CODEGEN: query.Kind = query.Kind;
 ```
 
-a module's object image, keyed by its back-half key
+a module's object, mink's, and the facts its lowering kept, keyed by its back-half key. one
+step lowers and compiles the module, so no mirl module outlives its own codegen
 
 ## val LINK
 
@@ -126,17 +111,14 @@ pub fun codegen_reusable(p: *project.Project, mid: session.ModuleId) res[bool, f
 pub fun test_build(p: *project.Project) bool;
 ```
 
-## fun debug_info_of
-
-```mach
-pub fun debug_info_of(p: *project.Project) res[codegen.DebugInfo, fail.Fail];
-```
-
 ## fun run_lower_pass
 
 ```mach
 pub fun run_lower_pass(p: *project.Project) err[fail.Fail];
 ```
+
+the lowering's inputs, acquired before any module is lowered: each module's typed
+definition and its lowered surface. the codegen pass lowers each module in its step
 
 ## fun prepare_lower_pass
 
@@ -150,9 +132,8 @@ pub fun prepare_lower_pass(p: *project.Project) err[fail.Fail];
 pub fun acquire_codegen_inputs(p: *project.Project) err[fail.Fail];
 ```
 
-the modules that still lower here are those without a product restored under
-this operation's snapshot; a module restored in the lower operation keeps its
-staged product when the snapshot is unchanged and lowers now if it changed
+the codegen operation's inputs: the typed definitions every step reads. the facts a
+module's step keeps are read from its product as the pass takes it
 
 ## fun acquire_test_inputs
 
@@ -160,8 +141,7 @@ staged product when the snapshot is unchanged and lowers now if it changed
 pub fun acquire_test_inputs(p: *project.Project) err[fail.Fail];
 ```
 
-the test operation's inputs: the typed definitions and each test object's
-lowered ir, unless the load restored its object from `obj/`
+the test operation's inputs: the typed definitions every test object's step reads
 
 ## fun run_test_object_pass
 
@@ -175,26 +155,6 @@ pub fun run_test_object_pass(p: *project.Project) err[fail.Fail];
 pub fun run_codegen_pass(p: *project.Project) err[fail.Fail];
 ```
 
-## fun code_sources
-
-```mach
-pub fun code_sources(p: *project.Project, mid: session.ModuleId, seed: *me_ir.Module, a: *A.Allocator) res[CodeSources, fail.Fail];
-```
-
-the other modules' lowered ir a whole-module backend reads to generate `seed`, module mid's ir
-
-## rec CodeSources
-
-```mach
-pub rec CodeSources;
-```
-
-## fun sources_dnit
-
-```mach
-pub fun sources_dnit(a: *A.Allocator, cs: *CodeSources);
-```
-
 ## fun test_codegen_reusable
 
 ```mach
@@ -202,6 +162,15 @@ pub fun test_codegen_reusable(p: *project.Project, mid: session.ModuleId) res[bo
 ```
 
 the test object's codegen product is current or cached, so no worker generates it
+
+## fun compile_module
+
+```mach
+pub fun compile_module(p: *project.Project, m: *Module, name: str) res[Object, fail.Fail];
+```
+
+the mirl module `m` compiled into an object, which owns its storage in the session's backing
+allocator. compiling spends the module
 
 ## fun run_link_pass
 

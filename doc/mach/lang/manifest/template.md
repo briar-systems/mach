@@ -64,6 +64,23 @@ pub val CONTEXT_RUNNER: Context = 5
 
 a target's `runner` entries
 
+## rec Renamed
+
+```mach
+pub rec Renamed;
+```
+
+a variable a previous major named, and the name that replaced it, which
+`mach migrate` writes
+
+## fun renamed
+
+```mach
+pub fun renamed(i: usize) *Renamed;
+```
+
+the renamed row at `i`, nil past the end
+
 ## rec Requirement
 
 ```mach
@@ -99,8 +116,8 @@ pub rec Values;
 the values a template expands with
 
 target: `{target.name}`
-isa: `{target.isa}`
-os: `{target.os}`
+arch: `{target.arch}`
+sys: `{target.sys}`
 abi: `{target.abi}`
 declared: the declared target the values name, nil when none
 profile: `{profile.name}`
