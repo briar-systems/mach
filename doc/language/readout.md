@@ -41,6 +41,23 @@ other        -              32ms
 built out/app  48 modules  1 MiB  in 358ms
 ```
 
+Each module's object is made by a step that lowers it, holds it to mirl's
+verifier and has mirl compile it. The `lower` and `verify` rows are the sums of
+those stages over the modules, moved out of the `codegen` row, which keeps the
+rest. After the rows each counter prints its total over the unit's modules:
+
+| Counter | What it counts | Read from |
+|---|---|---|
+| `functions` | the functions of the lowered modules | mirl's module |
+| `ir instrs` | the instructions lowering built into their bodies | mirl's bodies |
+| `verify runs` | the runs of mirl's verifier mach made over them | mach |
+| `heap blocks` | the blocks a lowered module holds in its step's heap | std's heap |
+| `heap bytes` | the bytes it holds there | std's heap |
+| `heap peak` | the most bytes a step's heap mapped, the largest over the modules | std's heap |
+
+Under `-vv` each module prints a line per stage and per counter as its step
+finishes.
+
 `(N threads)` shows when a phase ran on more than one worker, and
 `(N target-gated, not carried forward)` when it dropped modules gated to
 another target. Under `-vv` each module or file prints as an indented line
@@ -59,7 +76,7 @@ instance count doubles, so an expansion that does not stop shows while it runs:
 
 Under `--diagnostics json` every one of these lines is a record, written when
 the line would be: a `phase` record for a row, a `phase_item` record for an
-item, a `growth` record for a growing cycle's line, a `phase` record named `other` without a count, and each `built` line as
+item, a `counter` record for a counter's line, a `growth` record for a growing cycle's line, a `phase` record named `other` without a count, and each `built` line as
 a member of the closing `summary` record. Every unit opens with a `unit` record
 naming its artifact, target and profile, even when the text prints no banner or
 `profile` header, so a tool can tell apart the rows of several units and of
