@@ -350,7 +350,7 @@ On `spirv` each name is a device feature a module may require.
 `vulkan1.3` selects `zero_init_workgroup`, `storage_read_without_format`,
 `storage_write_without_format`, `vulkan_memory_model`,
 `vulkan_memory_model_device_scope` and `buffer_device_address`. The atomic and
-sampling features are described with [`op`](gpu.md#optarget-set-name--a-function-that-is-a-target-instruction),
+sampling features are described with [`op`](gpu.md#intrinsictarget-set-name--a-function-that-is-a-target-instruction),
 and the image features with [handles](types.md#handles).
 
 A name the selected isa does not hold is refused when the target resolves, with the
@@ -371,7 +371,7 @@ masc's extension catalog for the instruction set, and mach adds only which of it
 rows the compiler emits against. The spirv names are mach's own until a catalog
 names them. A name may cover several rows, as llvm's aarch64 `aes` covers
 `FEAT_AES` and `FEAT_PMULL` and `sha2` covers `FEAT_SHA1` and `FEAT_SHA256`: in
-`ext` and `#[ext(...)]` it selects every row it covers, and
+`ext` and `#[extension(...)]` it selects every row it covers, and
 `$mach.build.ext.<name>` answers for the one row it stands for, the one that
 implies the rest (`FEAT_PMULL` for `aes`). The table names each aarch64 row by masc's
 name for it. A level is a bundle, never an axis of its own: each
@@ -393,7 +393,7 @@ promise the binary makes about its hosts, and the promise is the program's to ch
 x86-64 also spells the published microarchitecture levels. A level is a manifest
 spelling that expands to its member names, so it may stand alone or beside names
 (`["x86-64-v2", "sha"]`), and it includes every lower level. It has no bit of its own:
-`$mach.build.ext.x86-64-v2` and `#[ext("x86-64-v2")]` do not exist,
+`$mach.build.ext.x86-64-v2` and `#[extension("x86-64-v2")]` do not exist,
 programs ask about the members (`.avx2`). `sse2`, `cmpxchg8b` and `lahf-sahf` are the
 `x86_64` baseline and are not names. The levels are masc's x86 catalog's, and a test
 holds this table to them:
@@ -433,12 +433,12 @@ Some rows are the target's alone. On riscv `i` is the baseline, `c` is a code-si
 selection mach never emits, and `f` and `d` select the float register file and the
 calling convention's float registers, and `zkt` is a promise about the machine's
 execution timing that the constant-time rows read, so none of them may be named in
-[`#[ext(...)]`](decorators.md#extnames--an-outlier-function); the
+[`#[extension(...)]`](decorators.md#extnames--an-outlier-function); the
 refusal says why. So are spirv `float16`, `int8`, `int16`, `int64` and `float64`,
 the device features that let the whole module use a type of that width, and spirv
 `zero_init_workgroup`, the device feature
 that zero-initializes the workgroup memory of every
-[`#[shared]`](gpu.md#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
+[`#[gpu.shared]`](gpu.md#gpuinputn--gpuoutputn--gpubuiltinstr--gpuuniformset-binding--gpustorageset-binding--gpusamplerset-binding--gpupush--gpuspecid--gpushared--shader-interface)
 variable in the module, and spirv `storage_read_without_format` and
 `storage_write_without_format`, the device features that let a storage image of
 `Unknown` format be read and written, spirv `storage_image_multisample`, the
@@ -456,7 +456,7 @@ Selecting an extension is a promise about **every** machine the binary runs on. 
 inline assembler admits the extension's mnemonics anywhere in the build, and a host
 without the extension faults on the first one it executes. A portable binary keeps the
 target at its baseline instead. It confines the extension instructions to
-[`#[ext(...)]`](decorators.md#extnames--an-outlier-function) functions
+[`#[extension(...)]`](decorators.md#extnames--an-outlier-function) functions
 and picks one of those at run time, after detecting the host's features.
 
 A mnemonic that needs an extension the target does not select, outside such a
@@ -465,7 +465,7 @@ function, is refused. The refusal names the line to add:
 ```
 error[asm.extension]: inline-asm instruction 'sha256rnds2' needs the `sha` extension, which
 this target does not select; add `extensions = ["sha"]` to the target, or mark the
-function `#[ext(sha)]` and call it only after detecting the extension at run time
+function `#[extension("sha")]` and call it only after detecting the extension at run time
 ```
 
 The selected set is part of the target's identity: two targets that differ only in
@@ -766,8 +766,8 @@ instruction taking that scope is refused unless the target selects
 `vulkan_memory_model_device_scope`, which brings `vulkan_memory_model` with it. Under
 GLSL450 the `QueueFamily` scope and the `MakeAvailable`, `MakeVisible` and `Volatile`
 memory semantics, which only the Vulkan model defines, are refused. What
-`"coherent"` and `#[shared]` mean under each model is in
-[gpu.md](gpu.md#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface).
+`"coherent"` and `#[gpu.shared]` mean under each model is in
+[gpu.md](gpu.md#gpuinputn--gpuoutputn--gpubuiltinstr--gpuuniformset-binding--gpustorageset-binding--gpusamplerset-binding--gpupush--gpuspecid--gpushared--shader-interface).
 
 Physical pointers follow it too. A module holding one, a pointer stored in memory or
 made from an address ([types.md](types.md#pointers-on-spir-v)), is refused unless the
@@ -803,7 +803,7 @@ Under `float16` an `f16` is the native `OpTypeFloat 16` wherever it lives, compu
 negated and converted by the core float instructions, so an `f16` shader needs
 `float16` alone. A local, a parameter or a result is that type, and so is an `f16` in
 memory the host or the workgroup shares, a stage input or output, a storage buffer, a
-uniform or push block, a record a physical pointer reaches or a `#[shared]` variable,
+uniform or push block, a record a physical pointer reaches or a `#[gpu.shared]` variable,
 so an atomic can operate on it and a whole record moves between that memory and a
 local as it is. Reading an `f16`'s bits with `:~` into a `u16` or `i16` local, or
 back, needs no `int16` either. Without it an `f16` is the software expansion on its 16 bits, which
@@ -822,7 +822,7 @@ program can tell. A vector is carried lane by lane the same way, so a `u8x4`,
 `i16x4` or `u16x8` local, and without `float16` an `f16x4`, needs no feature either,
 and its lanes are wrapped and extended at their own width where the program can
 tell, a reinterpret with `:~` included. A member of an aggregate keeps its declared
-width, so an 8-bit or 16-bit one, or a vector of them, in a local or in `#[shared]`
+width, so an 8-bit or 16-bit one, or a vector of them, in a local or in `#[gpu.shared]`
 memory needs its feature, and the module is refused, naming it, without. Memory the
 host shares keeps its width too, under the storage feature below rather than `int8`
 or `int16`, and a load from it or a store to it converts to and from the wider integer
@@ -838,10 +838,10 @@ the version that took it into the core.
 
 | Memory | 16-bit | 8-bit |
 |---|---|---|
-| `#[storage(...)]`, or a record a physical pointer reaches | `storage_buffer_16bit_access` (`StorageBuffer16BitAccess`) | `storage_buffer_8bit_access` (`StorageBuffer8BitAccess`) |
-| `#[uniform(...)]` | `uniform_and_storage_buffer_16bit_access` (`UniformAndStorageBuffer16BitAccess`) | `uniform_and_storage_buffer_8bit_access` (`UniformAndStorageBuffer8BitAccess`) |
-| `#[push]` | `storage_push_constant16` (`StoragePushConstant16`) | `storage_push_constant8` (`StoragePushConstant8`) |
-| `#[input(n)]`, `#[output(n)]` | `storage_input_output16` (`StorageInputOutput16`) | refused |
+| `#[gpu.storage(...)]`, or a record a physical pointer reaches | `storage_buffer_16bit_access` (`StorageBuffer16BitAccess`) | `storage_buffer_8bit_access` (`StorageBuffer8BitAccess`) |
+| `#[gpu.uniform(...)]` | `uniform_and_storage_buffer_16bit_access` (`UniformAndStorageBuffer16BitAccess`) | `uniform_and_storage_buffer_8bit_access` (`UniformAndStorageBuffer8BitAccess`) |
+| `#[gpu.push]` | `storage_push_constant16` (`StoragePushConstant16`) | `storage_push_constant8` (`StoragePushConstant8`) |
+| `#[gpu.input(n)]`, `#[gpu.output(n)]` | `storage_input_output16` (`StorageInputOutput16`) | refused |
 
 A stage output starts at its initializer, and at zero without one. A constant of a
 16-bit type needs the type's own feature, `int16` or `float16`, so an output holding a
@@ -851,7 +851,7 @@ the zero first, converted from a 32-bit one, and the output needs
 constant, which needs the type's feature as well. The 16-bit capabilities need
 `SPV_KHR_16bit_storage` below SPIR-V 1.3 and the 8-bit ones `SPV_KHR_8bit_storage`
 below SPIR-V 1.5. Vulkan defines no 8-bit stage input or
-output, so one is refused, and an 8-bit member of a `#[storage(...)]` buffer is
+output, so one is refused, and an 8-bit member of a `#[gpu.storage(...)]` buffer is
 refused under `vulkan1.0`, whose storage buffer is a `BufferBlock` in the `Uniform`
 class, which the 8-bit feature does not reach.
 
@@ -1053,7 +1053,7 @@ aarch64, and `OpTypeVector` on spirv) and rewrites counted, unit-stride loops wh
 independence — element-wise maps behind a runtime alias guard, and associative-exact
 integer reductions. A loop it cannot prove safe stays scalar, and a target without
 hardware vectors (riscv64) never enters the pass, so `skip = ["vectorize"]` changes
-performance and never semantics. For a single function, the `#[scalar]` decorator is
+performance and never semantics. For a single function, the `#[vectorize("never")]` decorator is
 the finer-grained opt-out (see [decorators.md](decorators.md)).
 
 `relax = ["float-reassoc"]` is the one lever here that *adds*, and the only profile
@@ -1115,7 +1115,7 @@ reused for a different kind: see [the registry](diagnostics.md#the-registry).
 | `target.skipped` | multi-target analysis skips a declared target this build does not support | no |
 | `vector.scalarize` | a vector operation falls back to scalar code on the target (see `simd`); portable code silences it | no |
 | `expect.unfulfilled` | an `#[expect]` names a key decided by source and no such warning is raised inside its declaration | no |
-| `secret.target_unenforceable` | an `#[oblivious]` function compiles for a target whose instruction set masc says cannot guarantee constant-time execution (wasm) | no |
+| `secret.target_unenforceable` | an `#[constant_time]` function compiles for a target whose instruction set masc says cannot guarantee constant-time execution (wasm) | no |
 
 A kind decided by source warns or not from the source text alone, whatever the
 target, goal or profile. Only such a key is reported when an `#[expect]`
@@ -1128,7 +1128,7 @@ unknown:
 
 | Key | Error |
 |---|---|
-| `secret.not_oblivious` | a function performs a constant-time operation on a secret value without `#[oblivious]` |
+| `secret.not_oblivious` | a function performs a constant-time operation on a secret value without `#[constant_time]` |
 
 ```
 error[allow.error_key]: mach.toml: [profile.release].allow entry "secret.not_oblivious" names an error; only a warning can be silenced
@@ -1188,7 +1188,7 @@ multiplication — so no signed-zero or NaN behaviour changes. And a trip count 
 lane count never enters the vector loop at all, so short reductions are bit-identical
 regardless of the relaxation.
 
-The relaxation is profile-wide. For a single function, `#[scalar]` opts out of vectorization
+The relaxation is profile-wide. For a single function, `#[vectorize("never")]` opts out of vectorization
 entirely and takes precedence over it, so a routine that must stay IEEE-strict inside
 an otherwise-reassociating build has a spelling. There is no per-function opt-*in*:
 whether a reduction may be reassociated is the caller's tolerance to decide, not the
