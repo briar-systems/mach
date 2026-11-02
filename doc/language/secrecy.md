@@ -876,6 +876,17 @@ operating system's, and each declaration carries its citation beside it:
   reads no mode there: a `soft` function runs without it, and a `hard` one
   builds only where the target's baseline holds DIT.
 
+## Padding of secret aggregates
+
+A secret aggregate's padding bytes are zero. A type holding a secret, a `^T` or
+an aggregate with a secret member or element, has every byte its layout leaves
+between or after its members zeroed wherever a value of it is built: a literal,
+a member-by-member construction and a default initialization. A copy moves the
+value whole, padding included, so the padding stays zero. A stale secret
+therefore never rides in the padding of a value that is later copied or written
+out whole. An aggregate that holds no secret is laid out and built as before,
+its padding unspecified.
+
 ## Trusted base
 
 The only secret-to-public crossings are the explicit `:>T` cast and inline `asm`
