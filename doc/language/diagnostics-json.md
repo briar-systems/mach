@@ -246,7 +246,7 @@ A **phase** record is a phase row:
 
 | Member | Type | Meaning |
 |---|---|---|
-| `name` | string | the row's label: `steps`, `load`, `resolve`, `sema`, `lower`, `optimize`, `codegen`, `emit`, `link`, `cache`, `test lower`, `test codegen`, or `other` for the time no row accounts for |
+| `name` | string | the row's label: `steps`, `load`, `resolve`, `sema`, `lower`, `verify`, `optimize`, `codegen`, `emit`, `link`, `cache`, `test lower`, `test verify`, `test codegen`, or `other` for the time no row accounts for |
 | `count` | integer | what the phase processed; absent for `other` |
 | `unit` | string | the noun the count is in, singular for a count of one: `"modules"`, `"objects"` |
 | `time_us` | integer | the phase's time |
@@ -270,6 +270,21 @@ written as it finishes, before its phase's record:
 | `phase` | string | the label of the phase that processed it |
 | `name` | string | the module or file |
 | `time_us` | integer | its time |
+
+Under `-v` a **counter** record is the unit's total of a counter, written after the rows
+of the phase that counted it, and under `-vv` one is also written for each module,
+named by it, as its step finishes:
+
+```json
+{"schema":1,"record":"counter","counter":"ir instrs","name":"std.filesystem","value":20811}
+{"schema":1,"record":"counter","counter":"ir instrs","value":412093}
+```
+
+| Member | Type | Meaning |
+|---|---|---|
+| `counter` | string | the counter's label: `functions`, `ir instrs`, `verify runs`, `heap blocks`, `heap bytes`, `heap peak` |
+| `name` | string | the module, absent for the unit's total |
+| `value` | integer | its value; a total is the sum over modules, and for `heap peak` the most any module reached |
 
 Under `-v` a **growth** record is a growing cycle of instances, written each time its
 instance count doubles:
