@@ -3,6 +3,7 @@ use std.allocator.page;
 use std.data.toml;
 use std.text.string.str_free;
 use std.types.bool.bool;
+use std.types.bool.false;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
@@ -19,10 +20,12 @@ use mach.lang.intern;
 use lang_source:     mach.lang.source;
 use lang_target:     mach.lang.target;
 use target_baseline: mach.lang.target.baseline;
-use catalog_abi:     mach.lang.target.catalog.abi;
-use catalog_arch:    mach.lang.target.catalog.arch;
-use catalog_os:      mach.lang.target.catalog.os;
-use mach.lang.target.extension;
+use mach.lang.target.resolved;
+use target_tags:  mach.lang.target.tags;
+use mink_fail:    mink.base.fail;
+use mink_arch:    mink.catalog.arch;
+use mink_os:      mink.catalog.os;
+use mink_os_list: mink.catalog.os.list;
 
 use mach.lang.manifest.model.Manifest;
 use mach.lang.manifest.model.TargetDef;
@@ -40,11 +43,11 @@ use mach.lang.manifest.schema.key_span;
 use mach.lang.manifest.schema.key_text;
 
 pub fun host_arch_name() str {
-    ret catalog_arch.name_for(lang_target.host_arch_id());
+    ret lang_target.host_arch_name();
 }
 
 pub fun host_sys_name() str {
-    ret catalog_os.name_for(lang_target.host_os_id());
+    ret lang_target.host_sys_name();
 }
 
 # the host as `mach info` names it, by `tuple_of`
@@ -65,9 +68,9 @@ pub fun tuple_of(alloc: *A.Allocator, os_name: str, isa_name: str) res[str, fail
     ret sfmt(alloc, "{}-{}", os_name, isa_name);
 }
 
-# `[target.X].ext`: an array of extension names, each an identifier and listed
-# once. the names are checked against the architecture's vocabulary when the
-# target resolves, since only the registry holds it
+# `[target.X].ext`: an array of names of masc's extension catalog, each listed
+# once. the names are checked against masc's catalog of the architecture when
+# the target resolves
 fun parse_target_extensions(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml.Table, label: str,
     d: *TargetDef) err[fail.Fail] {
     d.ext_count = 0;
@@ -76,8 +79,8 @@ fun parse_target_extensions(alloc: *A.Allocator, itn: *intern.Interner, sub: *to
     val v:   *toml.Value = v_o.some;
     val arr: *toml.Array = ?v.data.array;
     val n:   usize       = toml.array_len(arr);
-    if (n > extension.MAX_SELECTED::usize) {
-        ret fail_at(refuse(alloc, diagnostic_kind.EXTENSION_TOO_MANY, "mach.toml: {}.ext names more than {} extensions", label, extension.MAX_SELECTED), v.span);
+    if (n > resolved.MAX_ADDED::usize) {
+        ret fail_at(refuse(alloc, diagnostic_kind.EXTENSION_TOO_MANY, "mach.toml: {}.ext names more than {} extensions", label, resolved.MAX_ADDED), v.span);
     }
     var i: usize = 0;
     for (i < n) {
@@ -85,8 +88,8 @@ fun parse_target_extensions(alloc: *A.Allocator, itn: *intern.Interner, sub: *to
         if (sel e_o.none) { brk; }
         val e:    *toml.Value = e_o.some;
         val name: str         = e.data.string;
-        if (!extension.is_spelling(name, str_len(name))) {
-            ret fail_at(refuse(alloc, diagnostic_kind.EXTENSION_INVALID_NAME, "mach.toml: {}.ext entry \"{}\" is not an extension name or level; names are identifiers, such as \"sse41\", and levels are hyphenated, such as \"x86-64-v2\"", label, name), e.span);
+        if (str_len(name) == 0) {
+            ret fail_at(refuse(alloc, diagnostic_kind.EXTENSION_INVALID_NAME, "mach.toml: {}.ext entry \"\" names no extension", label), e.span);
         }
         val id_r: res[intern.StrId, fail.Fail] = id_of(itn, name);
         if (sel id_r.err) { ret err[fail.Fail].err{id_r.err}; }
@@ -198,10 +201,10 @@ fun refuse_arch_selection(alloc: *A.Allocator, sub: *toml.Table, label: str) err
     val v: opt[*toml.Value] = toml.get(sub, "arch");
     if (sel v.none) { ret err[fail.Fail].ok{}; }
     val written: str = key_text(sub, "arch");
-    if (catalog_arch.id_for(written) != catalog_arch.UNKNOWN) { ret err[fail.Fail].ok{}; }
-    val arch: u32 = target_baseline.entered_by(alloc, written);
-    if (arch == catalog_arch.UNKNOWN) { ret err[fail.Fail].ok{}; }
-    val name: str       = catalog_arch.name_for(arch);
+    if (target_tags.arch_named(written) != target_tags.NONE) { ret err[fail.Fail].ok{}; }
+    val arch: *mink_arch.Arch = target_baseline.entered_by(alloc, written);
+    if (arch == nil) { ret err[fail.Fail].ok{}; }
+    val name: str       = arch.name;
     var f:    fail.Fail = refuse(alloc, diagnostic_kind.TARGET_RETIRED_SPELLING,
         "mach.toml: {}.arch = \"{}\" names an instruction set; write `arch = \"{}\"`, mink's name for the architecture, and `isa = \"{}\"`", label, written, name, written);
     var fix:    res[str, fail.Fail] = sfmt(alloc, "\"{}\"\nisa = \"{}\"", name, written);
@@ -301,50 +304,51 @@ pub fun find_target_by_name(itn: *intern.Interner, m: *Manifest, name: str) *Tar
 # ---
 # alloc: owns the `env` origin a refusal names
 # itn:   resolves the target's strings and holds that origin
-# reg:   the registry the target resolves against
 # d:     the target
-# ret:   the binding; err the registry's refusal of the request
-pub fun resolve_declared(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, d: *TargetDef) res[lang_target.Binding, fail.Fail] {
-    val isa_name: str                       = intern.text(itn, d.arch);
-    var req:      lang_target.TargetRequest = lang_target.target_request(isa_name, intern.text(itn, d.sys), intern.text(itn, d.abi));
+# ret:   the target; err the owners' refusal of the request
+pub fun resolve_declared(alloc: *A.Allocator, itn: *intern.Interner, d: *TargetDef) res[resolved.Target, fail.Fail] {
+    val arch_name: str = intern.text(itn, d.arch);
+    var abi_name:  str = "";
+    if (!intern.str_is_nil(d.abi)) { abi_name = intern.text(itn, d.abi); }
+    var req: lang_target.TargetRequest = lang_target.target_request(arch_name, intern.text(itn, d.sys), abi_name);
     if (!intern.str_is_nil(d.of)) { lang_target.with_of(?req, intern.text(itn, d.of)); }
     lang_target.with_image(?req, d.base, d.stack_reserve, d.stack_commit);
-    if (!intern.str_is_nil(d.isa)) { lang_target.with_baseline(?req, intern.text(itn, d.isa)); }
+    if (!intern.str_is_nil(d.isa)) { lang_target.with_isa(?req, intern.text(itn, d.isa)); }
     if (!intern.str_is_nil(d.env) && str_len(intern.text(itn, d.env)) != 0) {
         val env_name: str = intern.text(itn, d.env);
-        # a target the manifest does not name is labelled by its isa
-        var label: str = isa_name;
+        # a target the manifest does not name is labelled by its arch
+        var label: str = arch_name;
         if (!intern.str_is_nil(d.name) && str_len(intern.text(itn, d.name)) != 0) { label = intern.text(itn, d.name); }
         val origin: res[str, fail.Fail] = fail.format_intern(itn, alloc, "mach.toml: [target.{}] env = \"{}\"", label, env_name);
-        if (sel origin.err) { ret res[lang_target.Binding, fail.Fail].err{origin.err}; }
+        if (sel origin.err) { ret res[resolved.Target, fail.Fail].err{origin.err}; }
         lang_target.with_env(?req, env_name, origin.ok);
     }
-    var ext_names: [extension.MAX_SELECTED]str;
+    var ext_names: [resolved.MAX_ADDED]str;
     var ei:        u32 = 0;
     for (ei < d.ext_count) {
         ext_names[ei] = intern.text(itn, d.ext[ei]);
         ei            = ei + 1;
     }
     lang_target.with_extensions(?req, ?ext_names[0], d.ext_count);
-    ret lang_target.resolve(reg, ?req);
+    ret lang_target.resolve(alloc, ?req);
 }
 
-# whether a target's `sys` and `arch` name the given host ids. the abi is not compared
+# whether a target's `sys` and `arch` name the host the compiler runs on. the abi is not compared
 # ---
-# itn:       resolves the target's strings
-# d:         the target
-# host_os:   an os id from `mach.lang.target.os`
-# host_arch: an arch id from `mach.lang.target.isa`
-# ret:       true when both ids match
-pub fun target_matches_host(itn: *intern.Interner, d: *TargetDef, host_os: u32, host_arch: u32) bool {
-    ret catalog_os.id_for(intern.text(itn, d.sys)) == host_os && catalog_arch.id_for(intern.text(itn, d.arch)) == host_arch;
+# itn: resolves the target's strings
+# d:   the target
+# ret: true when both names are the host's
+pub fun target_matches_host(itn: *intern.Interner, d: *TargetDef) bool {
+    ret str_equals(intern.text(itn, d.sys), host_sys_name()) && str_equals(intern.text(itn, d.arch), host_arch_name());
 }
 
-# whether `native` could ever name the target: its os is one a build host runs. a
-# target of any other os (freestanding, or a finished-module target such as spirv)
-# is only ever selected by name
+# whether `native` could ever name the target: its system has a host row whose
+# environment and architecture the target states, so a build could run on one. a
+# freestanding or vulkan target is only ever selected by name
 pub fun target_is_hosted(itn: *intern.Interner, d: *TargetDef) bool {
-    ret catalog_os.is_hosted(catalog_os.id_for(intern.text(itn, d.sys)));
+    val sys: res[*mink_os.System, mink_fail.Fail] = mink_os_list.by_name(intern.text(itn, d.sys));
+    if (sel sys.err) { ret false; }
+    ret sys.ok.mapped;
 }
 
 pub fun make_native_target(alloc: *A.Allocator, itn: *intern.Interner) res[*TargetDef, fail.Fail] {
@@ -358,7 +362,7 @@ pub fun make_native_target(alloc: *A.Allocator, itn: *intern.Interner) res[*Targ
     val os_name: res[intern.StrId, fail.Fail] = id_of(itn, host_sys_name());
     if (sel os_name.err) { ret res[*TargetDef, fail.Fail].err{os_name.err}; }
     host.sys = os_name.ok;
-    val abi_name: res[intern.StrId, fail.Fail] = id_of(itn, catalog_abi.name_for(lang_target.host_abi_id()));
+    val abi_name: res[intern.StrId, fail.Fail] = id_of(itn, lang_target.host_abi_name());
     if (sel abi_name.err) { ret res[*TargetDef, fail.Fail].err{abi_name.err}; }
     host.abi           = abi_name.ok;
     host.env           = intern.STR_NIL;
