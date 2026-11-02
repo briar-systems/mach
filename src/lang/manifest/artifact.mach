@@ -19,9 +19,11 @@ use mach.lang.intern;
 use lang_target:       mach.lang.target;
 use catalog_artifact:  mach.lang.target.catalog.artifact;
 use catalog_subsystem: mach.lang.target.catalog.subsystem;
+use mink_layout:       mink.link.layout;
 use mach.lang.target.resolved;
 
 use mach.lang.manifest.model.ArtifactDef;
+use mach.lang.manifest.model.RegionDef;
 use mach.lang.manifest.model.Manifest;
 use mach.lang.manifest.model.id_of;
 use mach.lang.manifest.need;
@@ -91,8 +93,13 @@ pub fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Tab
         slot.link_at      = nil;
         slot.need         = nil;
         slot.need_count   = 0;
-        slot.need_at      = nil;
-        initialized       = initialized + 1;
+        slot.need_at       = nil;
+        slot.sections      = nil;
+        slot.section_count = 0;
+        slot.size          = opt[u64].none{};
+        slot.regions       = nil;
+        slot.region_count  = 0;
+        initialized        = initialized + 1;
     }
 
     var i: usize = 0;
@@ -227,6 +234,9 @@ fun artifact_decode(alloc: *A.Allocator, itn: *intern.Interner, name: str, label
     if (sel res_manifest.err) { ret err[fail.Fail].err{res_manifest.err}; }
     d.app_manifest = res_manifest.ok;
 
+    val placed: err[fail.Fail] = layout_decode(alloc, itn, label, sub, d);
+    if (sel placed.err) { ret placed; }
+
     if (d.is_export && !catalog_artifact.is_library(d.kind)) {
         ret fail_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {}.export marks the library a bare `use` binds, and a kind = \"bin\" artifact is no library", label), value_span(sub, "export"));
     }
@@ -237,6 +247,143 @@ fun artifact_decode(alloc: *A.Allocator, itn: *intern.Interner, name: str, label
         ret fail_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {}.icon and .manifest apply only to kind = \"bin\" artifacts", label), conflict);
     }
     ret err[fail.Fail].ok{};
+}
+
+# the layout an artifact states its link: the section order, the size ceiling and the
+# memory regions, each section running in at most one region and loading in at most one
+# other, which mink lays out as a linker script's MEMORY and AT> do
+fun layout_decode(alloc: *A.Allocator, itn: *intern.Interner, label: str, sub: *toml.Table, d: *ArtifactDef) err[fail.Fail] {
+    var order_at: *fail.Place = nil;
+    val ordered:  err[fail.Fail] = entries_decode(alloc, itn, sub, label, "sections", ?d.sections, ?d.section_count, ?order_at);
+    if (order_at != nil && d.section_count > 0) { A.deallocate[fail.Place](alloc, order_at, d.section_count::usize); }
+    if (sel ordered.err) { ret ordered; }
+    val size: opt[i64] = toml.get_int(sub, "size");
+    if (sel size.some) {
+        if (size.some <= 0) { ret fail_at(refuse(alloc, diagnostic_kind.MANIFEST_INVALID_VALUE, "mach.toml: {}.size must be a positive byte count", label), value_span(sub, "size")); }
+        d.size = opt[u64].some{size.some::u64};
+    }
+    val regions_o: opt[*toml.Table] = toml.get_table(sub, "region");
+    if (sel regions_o.none) { ret err[fail.Fail].ok{}; }
+    val tab: *toml.Table = regions_o.some;
+    val n:   usize       = toml.table_len(tab);
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+    val made: res[*RegionDef, A.Error] = A.allocate[RegionDef](alloc, n);
+    if (sel made.err) { ret err[fail.Fail].err{fail.refused(made.err)}; }
+    d.regions      = made.ok;
+    d.region_count = n::u32;
+    var i: usize = 0;
+    for (i < n) {
+        d.regions[i].run        = nil;
+        d.regions[i].run_count  = 0;
+        d.regions[i].load       = nil;
+        d.regions[i].load_count = 0;
+        i                       = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        val decoded: err[fail.Fail] = region_decode(alloc, itn, label, tab, i, ?d.regions[i]);
+        if (sel decoded.err) { ret decoded; }
+        i = i + 1;
+    }
+    ret regions_check(alloc, itn, label, sub, d);
+}
+
+fun region_decode(alloc: *A.Allocator, itn: *intern.Interner, label: str, tab: *toml.Table, i: usize, r: *RegionDef) err[fail.Fail] {
+    val name_o: opt[str]         = toml.table_key(tab, i);
+    val v_o:    opt[*toml.Value] = toml.table_value(tab, i);
+    if (sel name_o.none) { ret err[fail.Fail].err{fail.message("internal: a region entry index is outside its table")}; }
+    if (sel v_o.none)    { ret err[fail.Fail].err{fail.message("internal: a region entry index is outside its table")}; }
+    val sub:  *toml.Table               = ?v_o.some.data.table;
+    val name: res[intern.StrId, fail.Fail] = id_of(itn, name_o.some);
+    if (sel name.err) { ret err[fail.Fail].err{name.err}; }
+    r.name   = name.ok;
+    r.at     = span_site(v_o.some.key);
+    r.origin = written_integer(sub, "origin");
+    r.length = written_integer(sub, "length");
+    val access: str = key_text(sub, "access");
+    var bits:   u8  = 0;
+    var k:      usize = 0;
+    for (access[k] != 0) {
+        var bit: u8 = 0;
+        if (access[k] == 'r')      { bit = mink_layout.READABLE; }
+        or (access[k] == 'w')      { bit = mink_layout.WRITABLE; }
+        or (access[k] == 'x')      { bit = mink_layout.EXECUTABLE; }
+        if (bit == 0 || (bits & bit) != 0) {
+            ret fail_at(refuse(alloc, diagnostic_kind.MANIFEST_INVALID_VALUE, "mach.toml: {}.region.{}.access is the letters r, w and x, each at most once (got \"{}\")", label, name_o.some, access), value_span(sub, "access"));
+        }
+        bits = bits | bit;
+        k    = k + 1;
+    }
+    r.access = bits;
+    var run_at: *fail.Place = nil;
+    val runs:   err[fail.Fail] = entries_decode(alloc, itn, sub, label, "run", ?r.run, ?r.run_count, ?run_at);
+    if (run_at != nil && r.run_count > 0) { A.deallocate[fail.Place](alloc, run_at, r.run_count::usize); }
+    if (sel runs.err) { ret runs; }
+    var load_at: *fail.Place = nil;
+    val loads:   err[fail.Fail] = entries_decode(alloc, itn, sub, label, "load", ?r.load, ?r.load_count, ?load_at);
+    if (load_at != nil && r.load_count > 0) { A.deallocate[fail.Place](alloc, load_at, r.load_count::usize); }
+    ret loads;
+}
+
+# the integer the schema check admitted under `key`, 0 when it is not written
+fun written_integer(sub: *toml.Table, key: str) u64 {
+    val v: opt[i64] = toml.get_int(sub, key);
+    if (sel v.some) { ret v.some::u64; }
+    ret 0;
+}
+
+# each section runs in at most one region and loads in at most one, and a section that
+# loads in a region runs in another
+fun regions_check(alloc: *A.Allocator, itn: *intern.Interner, label: str, sub: *toml.Table, d: *ArtifactDef) err[fail.Fail] {
+    val at: toml.Span = value_span(sub, "region");
+    var i: u32 = 0;
+    for (i < d.region_count) {
+        val r: *RegionDef = ?d.regions[i];
+        var k: u32        = 0;
+        for (k < r.run_count) {
+            if (regions_holding(d, r.run[k], true) > 1) {
+                ret fail_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {} runs section '{}' in more than one region", label, intern.text(itn, r.run[k])), at);
+            }
+            k = k + 1;
+        }
+        k = 0;
+        for (k < r.load_count) {
+            if (regions_holding(d, r.load[k], false) > 1) {
+                ret fail_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {} loads section '{}' in more than one region", label, intern.text(itn, r.load[k])), at);
+            }
+            if (regions_holding(d, r.load[k], true) == 0) {
+                ret fail_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {} loads section '{}' in region '{}' and runs it in none: a section loads apart only from the region it runs in", label, intern.text(itn, r.load[k]), intern.text(itn, r.name)), at);
+            }
+            if (holds(r.run, r.run_count, r.load[k])) {
+                ret fail_at(refuse(alloc, diagnostic_kind.MANIFEST_KEY_CONFLICT, "mach.toml: {} loads section '{}' in region '{}', which it runs in: a section loads apart only from the region it runs in", label, intern.text(itn, r.load[k]), intern.text(itn, r.name)), at);
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# how many regions of `d` run, or with `run` false load, the section `s`
+fun regions_holding(d: *ArtifactDef, s: intern.StrId, run: bool) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < d.region_count) {
+        val r: *RegionDef = ?d.regions[i];
+        if (run && holds(r.run, r.run_count, s))    { n = n + 1; }
+        if (!run && holds(r.load, r.load_count, s)) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun holds(items: *intern.StrId, count: u32, s: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (intern.str_same(items[i], s)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # more than one `export = true` artifact is refused, pointing at each `export` value
