@@ -1,4 +1,3 @@
-use std.allocator.page;
 use std.collections.map;
 use collections_vector: std.collections.vector;
 use std.types.bool.bool;
@@ -16,7 +15,10 @@ use std.types.view.View;
 use std.types.view.view;
 use std.types.view.view_eq_str;
 
-use A: std.allocator;
+use A:        std.allocator;
+use fs:       std.filesystem;
+use io_error: std.io.error;
+use std.memory;
 use std.process.exec;
 use std.sync.atomic;
 use sync_thread: std.sync.thread;
@@ -74,10 +76,14 @@ pub val CODEGEN: query.Kind = query.Kind{
     name:     "codegen", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_CODEGEN, compute: codegen_compute,
     finalize: codegen_finalize, replay: true
 };
-# the link's inputs as revisions, so a link reruns only when one moved
+# the build's artifact, written by the link job from the current objects. its product is the
+# artifact's path and the digest of the bytes written, and it reruns only when an input moved
 pub val LINK: query.Kind = query.Kind{name: "link", role: query.DERIVED, owner: query.KEY_UNOWNED, origin: diagnostic.ORIGIN_LINK, compute: link_compute};
 # what the link is configured with beyond the build context, set by the build
 pub val LINK_CONFIG: query.Kind = query.Kind{name: "link config", role: query.INPUT, owner: query.KEY_UNOWNED};
+# moves whenever the artifact on disk is not the one the link last wrote, so a missing or
+# overwritten artifact is linked again
+pub val LINK_ARTIFACT: query.Kind = query.Kind{name: "link artifact", role: query.INPUT, owner: query.KEY_UNOWNED};
 
 # a rejected module is one module's answer, so the pass folds it and carries
 # on over the rest; an internal failure ends the pass where it met it
@@ -407,7 +413,7 @@ fun handle_decode(e: query.QueryView) ptr {
 
 # the codegen operation's inputs: the typed definitions every step reads. the facts a
 # module's step keeps are read from its product as the pass takes it
-pub fun acquire_codegen_inputs(p: *project.Project) err[fail.Fail] {
+fun acquire_codegen_inputs(p: *project.Project) err[fail.Fail] {
     var clear: u32 = 0;
     for (clear < project.module_count(p)) {
         project.module_at(p, clear).unit = nil;
@@ -417,7 +423,7 @@ pub fun acquire_codegen_inputs(p: *project.Project) err[fail.Fail] {
 }
 
 # the test operation's inputs: the typed definitions every test object's step reads
-pub fun acquire_test_inputs(p: *project.Project) err[fail.Fail] {
+fun acquire_test_inputs(p: *project.Project) err[fail.Fail] {
     var clear: u32 = 0;
     for (clear < project.module_count(p)) {
         project.module_at(p, clear).test.unit = nil;
@@ -426,7 +432,14 @@ pub fun acquire_test_inputs(p: *project.Project) err[fail.Fail] {
     ret acquire_frontend_inputs(p);
 }
 
-pub fun run_test_object_pass(p: *project.Project) err[fail.Fail] {
+# the test stage's computation: each test object's typed inputs, then each test object
+pub fun run_test_pass(p: *project.Project) err[fail.Fail] {
+    val inputs: err[fail.Fail] = acquire_test_inputs(p);
+    if (sel inputs.err) { ret inputs; }
+    ret run_test_object_pass(p);
+}
+
+fun run_test_object_pass(p: *project.Project) err[fail.Fail] {
     var i: u32 = 0;
     for (i < p.emit_len) {
         val mid: session.ModuleId = p.topo[i];
@@ -600,48 +613,99 @@ fun codegen_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
     product_release(handle_decode(query.QueryView{value: value, value_len: value_len}), alloc);
 }
 
-pub fun run_link_pass(p: *project.Project) res[bool, fail.Fail] {
+# the link stage's computation: the current objects, then the link the build's job names,
+# which runs only when one of its inputs moved
+pub fun run_link_pass(p: *project.Project) err[fail.Fail] {
     val images: err[fail.Fail] = run_codegen_pass(p);
-    if (sel images.err) { ret res[bool, fail.Fail].err{images.err}; }
-    val prior: query.Revision                  = query.peek_revision(?p.s.queries, ?LINK, 0);
-    val e_r:   res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?LINK, 0);
-    if (sel e_r.err) { ret res[bool, fail.Fail].err{e_r.err}; }
-    val now: query.Revision = e_r.ok.last_changed;
-    ret res[bool, fail.Fail].ok{now != prior};
+    if (sel images.err) { ret images; }
+    val linked: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?LINK, 0);
+    if (sel linked.err) { ret err[fail.Fail].err{linked.err}; }
+    ret err[fail.Fail].ok{};
 }
 
-fun link_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
-    val p:  *project.Project = raw::*project.Project;
-    val db: *query.QueryDb   = ?p.s.queries;
-    val s:  *session.Session = p.s;
-
-    var fb: wire.Sink = wire.grown(alloc);
+# before the link stage's operation: when the artifact on disk is not what the link last wrote
+# to `artifact`, or nothing was linked yet, LINK_ARTIFACT moves to a value it never held, the
+# database's next revision, so the link runs again
+pub fun prepare_link(p: *project.Project, artifact: str) err[fail.Fail] {
+    val db:    *query.QueryDb       = ?p.s.queries;
+    val last:  opt[query.QueryView] = query.published(db, ?LINK, 0, 0);
+    var whole: bool                 = false;
+    if (sel last.some) {
+        if (query.peek_revision(db, ?LINK_ARTIFACT, 0) != 0) {
+            val held: res[bool, fail.Fail] = artifact_held(p, last.some, artifact);
+            if (sel held.err) { ret err[fail.Fail].err{held.err}; }
+            whole = held.ok;
+        }
+    }
+    if (whole) { ret err[fail.Fail].ok{}; }
+    var fb: wire.Sink = wire.grown(p.alloc);
     fin { wire.dnit(?fb); }
+    wire.put_u64(?fb, db.revision);
+    val taken: res[query.QueryOutput, fail.Fail] = codec.output(?fb);
+    if (sel taken.err) { ret err[fail.Fail].err{taken.err}; }
+    val set: err[fail.Fail] = query.set_input(db, ?LINK_ARTIFACT, 0, taken.ok.bytes, taken.ok.len);
+    if (taken.ok.bytes != nil) { A.deallocate[u8](p.alloc, taken.ok.bytes, taken.ok.len::usize); }
+    ret set;
+}
 
-    val rt: res[query.Revision, fail.Fail] = query.revision[project.Project](?p.queries, p, ?context.TARGET, 0);
+# the link's last product names `artifact`, and the file there holds the bytes it recorded
+fun artifact_held(p: *project.Project, last: query.QueryView, artifact: str) res[bool, fail.Fail] {
+    val n:        usize = str_len(artifact);
+    val recorded: usize = last.value_len::usize;
+    if (recorded != n + LINK_DIGEST)                          { ret res[bool, fail.Fail].ok{false}; }
+    if (!memory.raw_equal(last.value::ptr, artifact::ptr, n)) { ret res[bool, fail.Fail].ok{false}; }
+    val present: res[bool, io_error.Error] = fs.is_file(artifact);
+    if (sel present.err) {
+        if (present.err.kind == io_error.NOT_FOUND) { ret res[bool, fail.Fail].ok{false}; }
+        ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_STAT, fail.io_text(present.err))};
+    }
+    if (!present.ok) { ret res[bool, fail.Fail].ok{false}; }
+    var now:    [LINK_DIGEST]u8;
+    val digest: err[fail.Fail] = lang_fingerprint.file_sha256(artifact, ?now[0]);
+    if (sel digest.err) { ret res[bool, fail.Fail].err{digest.err}; }
+    ret res[bool, fail.Fail].ok{memory.raw_equal((?now[0])::ptr, (?last.value[n])::ptr, LINK_DIGEST)};
+}
+
+# the bytes of a link product's digest, after the artifact's path
+val LINK_DIGEST: usize = 32;
+
+# the link: every object the artifact takes, the target, the link configuration and the
+# artifact's standing are its inputs, and the build's link job writes the artifact
+fun link_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
+    val p:   *project.Project = raw::*project.Project;
+    val job: *project.LinkJob = p.link;
+    if (job == nil) { ret res[query.QueryOutput, fail.Fail].err{fail.message("link: the build set no link job")}; }
+
+    val rt: err[fail.Fail] = query.depend[project.Project](?p.queries, p, ?context.TARGET, 0);
     if (sel rt.err) { ret res[query.QueryOutput, fail.Fail].err{rt.err}; }
-    wire.put_u64(?fb, rt.ok);
-
-    val rc: res[query.Revision, fail.Fail] = query.revision[project.Project](?p.queries, p, ?LINK_CONFIG, 0);
+    val rc: err[fail.Fail] = query.depend[project.Project](?p.queries, p, ?LINK_CONFIG, 0);
     if (sel rc.err) { ret res[query.QueryOutput, fail.Fail].err{rc.err}; }
-    wire.put_u64(?fb, rc.ok);
+    val ra: err[fail.Fail] = query.depend[project.Project](?p.queries, p, ?LINK_ARTIFACT, 0);
+    if (sel ra.err) { ret res[query.QueryOutput, fail.Fail].err{ra.err}; }
 
-    wire.put_u32(?fb, p.emit_len);
     var i: u32 = 0;
     for (i < p.emit_len) {
-        val m:  *project.ModuleEntry           = project.module_at(p, (p.topo[i])::u32);
-        val rd: res[query.Revision, fail.Fail] = query.revision[project.Project](?p.queries, p, ?CODEGEN, back_half_key_for(p, m));
+        val m:  *project.ModuleEntry = project.module_at(p, (p.topo[i])::u32);
+        val rd: err[fail.Fail]       = query.depend[project.Project](?p.queries, p, ?CODEGEN, back_half_key_for(p, m));
         if (sel rd.err) { ret res[query.QueryOutput, fail.Fail].err{rd.err}; }
-        wire.put_u64(?fb, rd.ok);
         # a test build links each test object too
         if (has_test_object(p, m)) {
-            val rtest: res[query.Revision, fail.Fail] = query.revision[project.Project](?p.queries, p, ?CODEGEN, test_key_for(m));
+            val rtest: err[fail.Fail] = query.depend[project.Project](?p.queries, p, ?CODEGEN, test_key_for(m));
             if (sel rtest.err) { ret res[query.QueryOutput, fail.Fail].err{rtest.err}; }
-            wire.put_u64(?fb, rtest.ok);
         }
         i = i + 1;
     }
 
+    val linked: err[fail.Fail] = job.run(job.ctx, p);
+    if (sel linked.err) { ret res[query.QueryOutput, fail.Fail].err{linked.err}; }
+
+    var written: [LINK_DIGEST]u8;
+    val digest:  err[fail.Fail] = lang_fingerprint.file_sha256(job.artifact, ?written[0]);
+    if (sel digest.err) { ret res[query.QueryOutput, fail.Fail].err{digest.err}; }
+    var fb: wire.Sink = wire.grown(alloc);
+    fin { wire.dnit(?fb); }
+    wire.put_bytes(?fb, job.artifact::*u8, str_len(job.artifact));
+    wire.put_bytes(?fb, ?written[0], LINK_DIGEST);
     ret codec.output(?fb);
 }
 
