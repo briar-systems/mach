@@ -1,0 +1,476 @@
+# an entry build: one artifact of one entry file built with no mach.toml, the command line
+# stating the whole project. the project it states is written as manifest text and read
+# through the manifest's own parser, so an entry build is held to every rule a declared
+# project is, and the build that follows cannot tell the two apart
+use std.collections.vector.Vector;
+use collections_vector: std.collections.vector;
+use std_format:         std.format;
+use std.text.string.str_dup_range;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_empty;
+use std.types.string.str_ends_with;
+use std.types.string.str_equals;
+use std.types.string.str_index_char;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use driver_closure:  mach.lang.driver.closure;
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.query;
+use mach.lang.session;
+use lang_source: mach.lang.source;
+use lang_target: mach.lang.target;
+use target_host: mach.lang.target.host;
+use mach.lang.textbuild;
+use mink_os: mink.catalog.os;
+
+# one `[target]` key an entry build's command line states
+# ---
+# key:     the manifest key, as `[target.<name>]` spells it
+# value:   the value as written
+# integer: the key takes an integer, written bare
+pub rec TargetSetting {
+    key:     str;
+    value:   str;
+    integer: bool;
+}
+
+# what the command line states of an entry build
+# ---
+# entry:         the entry file, a canonical path under the current directory
+# kind:          the artifact kind's manifest spelling
+# sources:       each `-s` value, `name=dir` as written
+# source_count:  length of `sources`
+# settings:      the target keys the command line states, in its order
+# setting_count: length of `settings`
+# optimize:      the build runs the optimization pass set
+# debug:         the build emits debug information
+pub rec EntryRequest {
+    entry:         str;
+    kind:          str;
+    sources:       *str;
+    source_count:  usize;
+    settings:      *TargetSetting;
+    setting_count: usize;
+    optimize:      bool;
+    debug:         bool;
+}
+
+# the path an entry build's manifest text reads as in a refusal
+val ENTRY_PATH: str = "(entry build)";
+
+# the work directory an entry build lays its intermediates in, `mach init`'s
+val ENTRY_WORK: str = "out/{target.name}/{profile.name}";
+
+# the rule an entry build's entry keeps
+val ENTRY_CONSTRAINT: str = "an entry build's entry must be a .mach file inside the current directory, named by a relative path with no . or .. component";
+
+# one `-s` binding, split
+rec Binding {
+    name: str;
+    dir:  str;
+}
+
+# the project an entry build states, read as its manifest. the project root is the current
+# directory, so `-o` and `-w` keep the rules they keep in a project
+# ---
+# s:   the session the manifest is read in, which holds its text
+# r:   what the command line states
+# ret: the manifest, owned by the session's build allocator; err as the command line names
+#      no buildable project
+pub fun entry_manifest(s: *session.Session, r: *EntryRequest) res[manifest.Manifest, fail.Fail] {
+    val a: *A.Allocator = s.build_alloc;
+    if (!manifest.is_project_path(r.entry) || !str_ends_with(r.entry, ".mach")) {
+        ret res[manifest.Manifest, fail.Fail].err{fail.user(diagnostic_kind.CLI_OPERAND, ENTRY_CONSTRAINT)};
+    }
+
+    var bindings: Vector[Binding] = collections_vector.init[Binding](a);
+    fin { collections_vector.dnit[Binding](?bindings); }
+    var i: usize = 0;
+    for (i < r.source_count) {
+        val split: res[Binding, fail.Fail] = binding_of(a, r.sources[i]);
+        if (sel split.err) { ret res[manifest.Manifest, fail.Fail].err{split.err}; }
+        var k: usize = 0;
+        for (k < bindings.len) {
+            if (str_equals(bindings.data[k].name, split.ok.name)) {
+                ret res[manifest.Manifest, fail.Fail].err{fail.formatted_user(a, diagnostic_kind.CLI_FLAG_VALUE, "-s binds '{}' twice", split.ok.name)};
+            }
+            k = k + 1;
+        }
+        val pushed: res[usize, A.Error] = collections_vector.push[Binding](?bindings, split.ok);
+        if (sel pushed.err) { ret res[manifest.Manifest, fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+
+    # the entry's own package is the binding whose directory holds it, else the entry's
+    # directory under the entry's stem
+    val file:   str               = types_path.filename(r.entry);
+    val stem_r: res[str, A.Error] = str_dup_range(a, file, 0, str_len(file) - 5);
+    if (sel stem_r.err) { ret res[manifest.Manifest, fail.Fail].err{fail.refused(stem_r.err)}; }
+    val stem:  str   = stem_r.ok;
+    var id:    str   = stem;
+    var src:   str   = ".";
+    var entry: str   = file;
+    var own:   usize = bindings.len;
+    i = 0;
+    for (i < bindings.len) {
+        val dir: str = bindings.data[i].dir;
+        if (str_equals(dir, "."))                                                                           { own = i; }
+        or (manifest.is_project_path(dir) && str_starts_with(r.entry, dir) && r.entry[str_len(dir)] == '/') { own = i; }
+        i = i + 1;
+    }
+    if (own < bindings.len) {
+        id  = bindings.data[own].name;
+        src = bindings.data[own].dir;
+        if (!str_equals(src, ".")) { entry = (?r.entry[str_len(src) + 1])::str; }
+        or                         { entry = r.entry; }
+    }
+    or {
+        if (!manifest.is_valid_id(stem)) {
+            ret res[manifest.Manifest, fail.Fail].err{fail.formatted_user(a, diagnostic_kind.CLI_OPERAND,
+                "the entry's stem '{}' is no project id; name the entry's source root with -s <name>=<dir>", stem)};
+        }
+        val parent: res[str, A.Error] = types_path.parent(a, r.entry);
+        if (sel parent.err)        { ret res[manifest.Manifest, fail.Fail].err{fail.refused(parent.err)}; }
+        if (!str_empty(parent.ok)) { src = parent.ok; }
+    }
+
+    val text: res[str, fail.Fail] = manifest_text(a, r, id, src, entry, stem);
+    if (sel text.err) { ret res[manifest.Manifest, fail.Fail].err{text.err}; }
+    val loaded: res[lang_source.FileId, fail.Fail] = session.load_source(s, ENTRY_PATH, text.ok);
+    if (sel loaded.err) { ret res[manifest.Manifest, fail.Fail].err{loaded.err}; }
+    val parsed: res[manifest.Manifest, fail.Fail] = manifest.parse_text(a, ?s.interner, ENTRY_PATH, text.ok);
+    str_free(a, text.ok);
+    if (sel parsed.err) { ret parsed; }
+    var m: manifest.Manifest = parsed.ok;
+    m.source          = loaded.ok;
+    m.source_revision = query.peek_revision(?s.queries, ?session.FILE_TEXT, lang_source.file_index(loaded.ok)::u64);
+
+    # a manifest cannot state the project root as its source directory, an entry build can
+    if (str_equals(src, ".")) {
+        val dot: res[intern.StrId, A.Error] = intern.add(?s.interner, ".");
+        if (sel dot.err) {
+            manifest.dnit(?m, a);
+            ret res[manifest.Manifest, fail.Fail].err{fail.refused(dot.err)};
+        }
+        m.src = dot.ok;
+    }
+
+    val roots: err[fail.Fail] = source_roots(s, ?m, ?bindings, own);
+    if (sel roots.err) {
+        manifest.dnit(?m, a);
+        ret res[manifest.Manifest, fail.Fail].err{roots.err};
+    }
+    ret res[manifest.Manifest, fail.Fail].ok{m};
+}
+
+# `name=dir`, split at its first `=`, its directory cleaned
+fun binding_of(a: *A.Allocator, written: str) res[Binding, fail.Fail] {
+    val found: opt[usize] = str_index_char(written, '=');
+    var at:    usize      = 0;
+    if (sel found.some) { at = found.some; }
+    if (at == 0 || at + 1 >= str_len(written)) {
+        ret res[Binding, fail.Fail].err{fail.formatted_user(a, diagnostic_kind.CLI_FLAG_VALUE, "-s '{}' must be written <name>=<dir>", written)};
+    }
+    val name: res[str, A.Error] = str_dup_range(a, written, 0, at);
+    if (sel name.err) { ret res[Binding, fail.Fail].err{fail.refused(name.err)}; }
+    if (!manifest.is_valid_id(name.ok)) {
+        ret res[Binding, fail.Fail].err{fail.formatted_user(a, diagnostic_kind.CLI_FLAG_VALUE, "-s '{}' must name a portable identifier (letters, digits, '_', '-')", written)};
+    }
+    # `./src` and `src/` bind the directory `src` does
+    val dir: res[str, A.Error] = types_path.clean(a, (?written[at + 1])::str);
+    if (sel dir.err) { ret res[Binding, fail.Fail].err{fail.refused(dir.err)}; }
+    ret res[Binding, fail.Fail].ok{Binding{name: name.ok, dir: dir.ok}};
+}
+
+# every binding but the entry's own, as the manifest's source roots
+fun source_roots(s: *session.Session, m: *manifest.Manifest, bindings: *Vector[Binding], own: usize) err[fail.Fail] {
+    var n: usize = bindings.len;
+    if (own < bindings.len) { n = n - 1; }
+    if (n == 0)             { ret err[fail.Fail].ok{}; }
+    val made: res[*manifest.SourceRoot, A.Error] = A.allocate[manifest.SourceRoot](s.build_alloc, n);
+    if (sel made.err) { ret err[fail.Fail].err{fail.refused(made.err)}; }
+    m.sources      = made.ok;
+    m.source_count = n::u32;
+    var at: usize = 0;
+    var i:  usize = 0;
+    for (i < bindings.len) {
+        if (i == own) {
+            i = i + 1;
+            cnt;
+        }
+        val name: res[intern.StrId, A.Error] = intern.add(?s.interner, bindings.data[i].name);
+        if (sel name.err) { ret err[fail.Fail].err{fail.refused(name.err)}; }
+        val dir: res[intern.StrId, A.Error] = intern.add(?s.interner, bindings.data[i].dir);
+        if (sel dir.err) { ret err[fail.Fail].err{fail.refused(dir.err)}; }
+        m.sources[at] = manifest.SourceRoot{name: name.ok, dir: dir.ok};
+        at            = at + 1;
+        i             = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the manifest text of the project an entry build states
+fun manifest_text(a: *A.Allocator, r: *EntryRequest, id: str, src: str, entry: str, stem: str) res[str, fail.Fail] {
+    var b: textbuild.TextBuilder = textbuild.tb_init(a);
+    fin { textbuild.tb_dnit(?b); }
+
+    val floor: res[str, std_format.FormatError] = driver_closure.running_mach_range_floor(a);
+    if (sel floor.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(floor.err))}; }
+    put(?b, "[project]\nid = ");
+    quoted(?b, id);
+    put(?b, "\nversion = \"0.0.0\"\nmach = ");
+    quoted(?b, floor.ok);
+    str_free(a, floor.ok);
+    # a manifest's src is a child of the root, which the entry build's may not be; it is set after
+    put(?b, "\nsrc = ");
+    if (str_equals(src, ".")) { quoted(?b, "src"); }
+    or                        { quoted(?b, src); }
+    put(?b, "\nwork = ");
+    quoted(?b, ENTRY_WORK);
+    put(?b, "\n\n");
+
+    if (r.optimize) { put(?b, "[profile.release]\n"); }
+    or              { put(?b, "[profile.debug]\n"); }
+    put(?b, "default = true\noptimize = ");
+    flag(?b, r.optimize);
+    put(?b, "\ndebug = ");
+    flag(?b, r.debug);
+    put(?b, "\nsimd = \"scalarize\"\n\n");
+
+    val cell: opt[lang_target.Cell] = cell_of(a, r);
+    if (r.setting_count > 0) {
+        val stated: err[fail.Fail] = target_text(a, ?b, r, cell);
+        if (sel stated.err) { ret res[str, fail.Fail].err{stated.err}; }
+    }
+
+    var libraries: *str  = nil;
+    var library_n: usize = 0;
+    val linked:    bool  = !str_equals(r.kind, "static");
+    if (sel cell.some) {
+        val host: res[*mink_os.Host, fail.Fail] = target_host.of(a, cell.some.sys, cell.some.env, cell.some.arch, cell.some.abi);
+        if (sel host.ok) {
+            if (linked) {
+                libraries = host.ok.libraries;
+                library_n = host.ok.library_count;
+            }
+        }
+    }
+
+    put(?b, "[artifact.");
+    put(?b, id);
+    put(?b, "]\nkind = ");
+    quoted(?b, r.kind);
+    put(?b, "\ndefault = true\nentry = ");
+    quoted(?b, entry);
+    put(?b, "\nout = \"");
+    put(?b, stem);
+    put(?b, "{artifact.suffix}\"\ntargets = [\"*\"]\n");
+    var k: usize = 0;
+    for (k < library_n) {
+        if (k == 0) { put(?b, "link = ["); }
+        or          { put(?b, ", "); }
+        put(?b, "\"");
+        stem_of(?b, libraries[k]);
+        put(?b, "\"");
+        k = k + 1;
+    }
+    if (library_n > 0) { put(?b, "]\n"); }
+    put(?b, "\n");
+    k = 0;
+    for (k < library_n) {
+        put(?b, "[link.");
+        stem_of(?b, libraries[k]);
+        put(?b, "]\nsource = \"system\"\nname = ");
+        quoted(?b, libraries[k]);
+        put(?b, "\nsys = [\"*\"]\narch = [\"*\"]\nabi = [\"*\"]\n\n");
+        k = k + 1;
+    }
+
+    val made: res[str, textbuild.Error] = textbuild.tb_finish(?b);
+    if (sel made.err) { ret res[str, fail.Fail].err{fail.message(textbuild.text(made.err))}; }
+    ret res[str, fail.Fail].ok{made.ok};
+}
+
+# the one `[target]` table the command line states: every key it names, and the arch, sys
+# and abi it leaves out taken from the first cell the owners build that agrees with it
+fun target_text(a: *A.Allocator, b: *textbuild.TextBuilder, r: *EntryRequest, cell: opt[lang_target.Cell]) err[fail.Fail] {
+    val arch: str = target_value(r, "arch", lang_target.host_arch_name(), cell);
+    val sys:  str = target_value(r, "sys", lang_target.host_sys_name(), cell);
+    put(b, "[target.");
+    put_name(b, sys);
+    put(b, "-");
+    put_name(b, arch);
+    put(b, "]\narch = ");
+    quoted(b, arch);
+    put(b, "\nsys = ");
+    quoted(b, sys);
+    put(b, "\nabi = ");
+    quoted(b, target_value(r, "abi", lang_target.host_abi_name(), cell));
+    put(b, "\n");
+    if (sel cell.some) {
+        if (sel cell.some.env.some) {
+            if (setting(r, "env") == nil) {
+                put(b, "env = ");
+                quoted(b, cell.some.env.some.name);
+                put(b, "\n");
+            }
+        }
+    }
+    var listed: bool  = false;
+    var i:      usize = 0;
+    for (i < r.setting_count) {
+        val t: *TargetSetting = ?r.settings[i];
+        i = i + 1;
+        if (str_equals(t.key, "arch") || str_equals(t.key, "sys") || str_equals(t.key, "abi")) { cnt; }
+        if (str_equals(t.key, "ext")) {
+            if (listed) { cnt; }
+            listed = true;
+            put(b, "ext = [");
+            var k:     usize = 0;
+            var first: bool  = true;
+            for (k < r.setting_count) {
+                if (str_equals(r.settings[k].key, "ext")) {
+                    if (!first) { put(b, ", "); }
+                    quoted(b, r.settings[k].value);
+                    first = false;
+                }
+                k = k + 1;
+            }
+            put(b, "]\n");
+            cnt;
+        }
+        put(b, t.key);
+        put(b, " = ");
+        if (t.integer) { put(b, t.value); }
+        or             { quoted(b, t.value); }
+        put(b, "\n");
+    }
+    put(b, "\n");
+    ret err[fail.Fail].ok{};
+}
+
+# the value the command line states for `key`, else the cell's, else `host`'s
+fun target_value(r: *EntryRequest, key: str, host: str, cell: opt[lang_target.Cell]) str {
+    val stated: *TargetSetting = setting(r, key);
+    if (stated != nil) { ret stated.value; }
+    if (sel cell.some) {
+        if (str_equals(key, "arch")) { ret cell.some.arch.name; }
+        if (str_equals(key, "sys"))  { ret cell.some.sys.name; }
+        if (str_equals(key, "abi"))  { ret cell.some.abi; }
+    }
+    ret host;
+}
+
+fun setting(r: *EntryRequest, key: str) *TargetSetting {
+    var i: usize = 0;
+    for (i < r.setting_count) {
+        if (str_equals(r.settings[i].key, key)) { ret ?r.settings[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the first cell the owners build whose arch and sys are the stated ones, the host's where
+# none is stated, and whose abi and env agree with any the command line states. with nothing
+# stated it is the host's own cell
+fun cell_of(a: *A.Allocator, r: *EntryRequest) opt[lang_target.Cell] {
+    var all: Vector[lang_target.Cell] = collections_vector.init[lang_target.Cell](a);
+    fin { collections_vector.dnit[lang_target.Cell](?all); }
+    val listed: err[fail.Fail] = lang_target.cells(a, ?all);
+    if (sel listed.err) { ret opt[lang_target.Cell].none{}; }
+    var arch: str = lang_target.host_arch_name();
+    var sys:  str = lang_target.host_sys_name();
+    var abi:  str = nil;
+    var env:  str = nil;
+    if (setting(r, "arch") != nil) { arch = setting(r, "arch").value; }
+    if (setting(r, "sys") != nil)  { sys = setting(r, "sys").value; }
+    if (setting(r, "abi") != nil)  { abi = setting(r, "abi").value; }
+    if (setting(r, "env") != nil)  { env = setting(r, "env").value; }
+    if (r.setting_count == 0)      { abi = lang_target.host_abi_name(); }
+    var i: usize = 0;
+    for (i < all.len) {
+        val c: lang_target.Cell = all.data[i];
+        i = i + 1;
+        if (!str_equals(c.arch.name, arch) || !str_equals(c.sys.name, sys)) { cnt; }
+        if (abi != nil && !str_equals(c.abi, abi))                          { cnt; }
+        if (env != nil) {
+            var agrees: bool = false;
+            if (sel c.env.some) { agrees = str_equals(c.env.some.name, env); }
+            if (!agrees)        { cnt; }
+        }
+        ret opt[lang_target.Cell].some{c};
+    }
+    ret opt[lang_target.Cell].none{};
+}
+
+fun put(b: *textbuild.TextBuilder, text: str) {
+    textbuild.tb_append(b, text);
+}
+
+fun flag(b: *textbuild.TextBuilder, on: bool) {
+    if (on) { put(b, "true"); }
+    or      { put(b, "false"); }
+}
+
+# `text` as a toml basic string
+fun quoted(b: *textbuild.TextBuilder, text: str) {
+    var one: [3]u8;
+    one[2] = 0;
+    put(b, "\"");
+    var i: usize = 0;
+    for (text[i] != 0) {
+        val c: u8 = text[i];
+        if (c == '"' || c == '\\') {
+            one[0] = '\\';
+            one[1] = c;
+        }
+        or {
+            one[0] = c;
+            one[1] = 0;
+        }
+        put(b, (?one[0])::str);
+        i = i + 1;
+    }
+    put(b, "\"");
+}
+
+# `text` as a table key: every byte a bare key does not take as '_'
+fun put_name(b: *textbuild.TextBuilder, text: str) {
+    var one: [2]u8;
+    one[1] = 0;
+    var i: usize = 0;
+    for (text[i] != 0) {
+        val c: u8 = text[i];
+        one[0] = '_';
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') { one[0] = c; }
+        put(b, (?one[0])::str);
+        i = i + 1;
+    }
+}
+
+# a library's name up to its first '.', the key its link table goes by
+fun stem_of(b: *textbuild.TextBuilder, library: str) {
+    var one: [2]u8;
+    one[1] = 0;
+    var n: usize = 0;
+    for (library[n] != 0 && library[n] != '.') {
+        one[0] = library[n];
+        put(b, (?one[0])::str);
+        n = n + 1;
+    }
+}
