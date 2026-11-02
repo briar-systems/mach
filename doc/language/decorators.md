@@ -45,7 +45,7 @@ uses generic words such as `input` and `shared`.
 #[packed]            # lay a rec / uni / tag out with no padding (no arguments)
 #[volatile]          # every access to a rec / uni / tag is a volatile access (no arguments)
 #[section(".name")]  # place in a named object section
-#[at(offset)]        # place at an offset in a flat bare-metal image
+#[at(offset)]        # place a module global at an offset in the image
 #[thread]            # one copy of a module var per thread (no arguments)
 #[constant_time("soft")] # constant-time boundary; the mode is "soft" or "hard"
 #[vectorize("never")] # opt out of auto-vectorization
@@ -689,12 +689,25 @@ section holds code, a `var`'s writable data, a `val`'s read-only data and a
 `#[thread]` var's thread-local template. Cross-section calls and accesses use
 ordinary relocations.
 
-### `at(offset)` — placement in a flat image
+### `at(offset)` — placement in the image
 
-Places a function or global at an integer offset in a flat bare-metal image.
-The name and its argument are fixed. Placement itself belongs to the bare-metal
-image work (mach#4890), and until it lands the decorator is refused where it is
-written.
+Places a module global at an integer offset in the image, counted from the start
+of the region it runs in, or from the image base where it runs in none (see
+[manifest.md](manifest.md#memory-regions)). The global becomes a section of its
+own, which the link places at the offset, so a boot signature, a header a loader
+looks for at a fixed byte or a page table at a known offset is stated in source.
+
+```mach fragment
+#[at(510)]
+val SIGNATURE: [2]u8 = [2]u8{0x55, 0xaa};
+```
+
+- It applies to a module `val` or `var` only, and takes one integer constant.
+- It cannot combine with `section`, since a placed global is a section of its
+  own, or with `thread`, since each thread's copy lies in its own block. An
+  `ext` declaration places nothing.
+- Two globals at one offset are refused at the link. A format whose loader maps
+  the image itself is refused by mink, which places the section.
 
 ### `export` — a shared library's export
 
@@ -702,7 +715,9 @@ Exports a function or global from a shared library under its symbol name. It
 requires `pub` and is refused with `decorator.requires` on a declaration that is
 not `pub`, and with `decorator.misplaced` on an `ext` declaration, which another
 image defines. `pub` alone states a module's interface to other Mach modules and
-never exports. Takes no arguments, and `#[testing]` cannot combine with it.
+never exports. Takes no arguments, and `#[testing]` cannot combine with it. An
+exported declaration is seen from outside the image wherever its project sits in
+the build, so a dependency's `#[export]` is exported as the root project's is.
 
 ```mach fragment
 #[export]
@@ -1034,7 +1049,7 @@ a further rule the decorator's own section states.
 | `align` | `fun`, `rec`, `uni`, `tag`, `val`, `var` |  |
 | `packed` | `rec`, `uni`, `tag` | not a `gpu.uniform`, `gpu.storage` or `gpu.push` block |
 | `volatile` | `rec`, `uni`, `tag` |  |
-| `at` | `fun`, `val`, `var` | refused until mach#4890 |
+| `at` | `val`, `var` | not `ext`, `section` or `thread` |
 | `thread` | `var` | no shader interface role |
 | `constant_time` | `fun` |  |
 | `vectorize` | `fun` |  |

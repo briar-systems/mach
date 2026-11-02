@@ -1249,6 +1249,9 @@ reads the selected artifact's name.
 | `manifest` | absent: no application manifest | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `default` | absent: not marked | Selection only. `true` puts the artifact in the [default selection](build.md#selection-and-the-build-matrix): with no `-a`, `mach build` and `mach check` take the marked artifacts among those supporting the selected target (every one of them when none is marked), and a command that needs one artifact (`mach test`, `mach run`, the editor's union build) takes the marked one. A command that needs one artifact refuses two marked candidates; an explicit `-a` always wins, and a sole candidate needs no marker. |
 | `export` | absent: not exported | `true` marks the library whose requirements travel to consumers (see [Dependency requirements travel](#dependency-requirements-travel)). It describes the prebuilt library only and never affects how a `use` path resolves. It applies to `static` and `shared` artifacts only, and a project exports at most one. |
+| `sections` | absent: the format's order | Array of output section names the link places ahead of the rest, in the order written, such as `[".boot", ".text", ".rodata", ".data", ".bss"]`. A named section the image does not hold is refused by the link, naming it. |
+| `size` | absent: no ceiling | The most bytes the image loads from its base, a positive integer. A flat image is padded to exactly `size`, and on any other format it is a ceiling. An image over it is refused by the link, naming the section that overflows. |
+| `region` | absent: no region | Named memory regions the link lays sections into, each an `[artifact.<name>.region.<region>]` table. See [Memory regions](#memory-regions). |
 
 `entry` is the build cell's source root. The build follows its active `use` and
 `fwd` edges transitively and compiles that reachable module set; another file under
@@ -1264,45 +1267,71 @@ any of them (see [test.md](test.md#which-tests-run)).
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
   as a `.a`.
-- **`shared`** links a dynamic library at the resolved `out`. Only ELF targets
-  write one today: `linux` on `x86_64`, `aarch64` and `riscv64` produce a `.so`
-  whose `SONAME` is its file name. mach writes no Mach-O `.dylib` or PE `.dll`,
-  so a `darwin` or `windows` target refuses with `link: object format cannot
-  write shared libraries`. A `freestanding` target never
-  writes one: its default `flat` format refuses with `a flat-image object format
-  produces only executables`, and setting `of = "elf"` moves the refusal to the
-  link, `link: a shared library needs a loader to map it, and os =
-  "freestanding" has none`, because a shared library only exists to be mapped by
-  a loader the os provides.
-  - **Exports.** The library exports the root project's `pub` functions and
-    variables and every name its modules re-export with `fwd`, including a
-    dependency's. A dependency's own `pub` surface is not exported unless it is
-    re-exported. `#[symbol("name")]` sets the name an export carries and does not
-    make anything visible: a `pub` function exports under its `#[symbol]` name,
-    and a non-`pub` one stays hidden whatever its name.
+- **`shared`** links a dynamic library at the resolved `out`, as mink's shared
+  output kind: a `.so` on ELF, a `.dll` on PE and a `.dylib` on Mach-O, named as
+  mink's system names the file. A system whose loader maps no library into
+  another image, such as `freestanding` or `wasi`, builds none, and the artifact
+  is refused with mink's reason when its name is formed.
+  - **Exports.** The library exports exactly the declarations marked
+    [`#[export]`](decorators.md#export--a-shared-librarys-export), in any project
+    of the build, each under its symbol name. `pub` alone exports nothing, and
+    `#[symbol("name")]` sets the name an export carries without exporting it.
   - **Internals.** Every other definition still links inside the library but is
-    absent from `.dynsym`. In the `.so` it is a `LOCAL` symbol in `.symtab`, and
-    in the per-module object it is a `GLOBAL` symbol whose visibility the
-    format spells its own way: ELF `STV_HIDDEN`, Mach-O `N_PEXT`, and COFF, which
-    has no visibility bit, a `.drectve` section listing every exported definition
-    as ` /EXPORT:<name>`, so a global definition the directives do not name is
-    hidden. A COFF object with no `.drectve` says nothing about visibility and
-    is read as it was. A `fwd` re-export of a dependency's symbol is a request
-    the object carries separately: on COFF it is one more `/EXPORT:` token, and
-    on ELF and Mach-O it rides in a non-loaded mach section (`.mach.exports`, or
-    `__MACH,__mach_exports`) the parser consumes. A relocatable object emitted
-    and parsed back therefore keeps the same visibility and the same requests.
-  - **Refusals.** A shared artifact that exports nothing is refused:
+    seen from no other image.
+  - **Thread-locals.** A `#[thread]` var in a shared library is reached through
+    the initial-exec model, at an offset its loader fixes when the process
+    starts. General-dynamic access is never lowered.
+  - **Linking against one.** An executable names the library through a
+    `[link.X]` entry, a `local` path to the built file, and `need`s the artifact
+    that builds it. On a host whose loader neither runs executables position
+    independent by default nor places every image, as `linux`, an executable
+    that links a shared library is linked as mink's dynamic kind, so its loader
+    binds the library at start.
 
-    ```
-    link: shared library '<artifact>' exports nothing: a shared library needs at least one `pub` declaration in the project, or a `fwd` re-export of one
-    ```
+### Memory regions
 
-    A `freestanding` target is refused as well. With its default `flat` format
-    the artifact fails naming (`artifact naming: this object format has no
-    shared-library form`), and with `of = "elf"` the link refuses with
-    `link: a shared library needs a loader to map it, and sys = "freestanding"
-    has none`.
+An artifact may lay its image out as a linker script's `MEMORY` and `AT>` do.
+Each `[artifact.<name>.region.<region>]` table states one region, and each
+section runs in at most one region and loads in at most one other:
+
+```toml
+[artifact.firmware]
+kind     = "bin"
+entry    = "bin/main.mach"
+out      = "{project.work}/firmware{artifact.suffix}"
+targets  = ["*"]
+sections = [".text", ".rodata", ".data", ".bss"]
+
+[artifact.firmware.region.flash]
+origin = 0x08000000
+length = 0x40000
+access = "rx"
+run    = [".text", ".rodata"]
+load   = [".data"]
+
+[artifact.firmware.region.ram]
+origin = 0x20000000
+length = 0x8000
+access = "rw"
+run    = [".data", ".bss"]
+```
+
+| Key | Required | Meaning |
+|-----|----------|---------|
+| `origin` | yes | The address the region starts at. |
+| `length` | yes | The bytes it spans. |
+| `access` | yes | What it allows, the letters `r`, `w` and `x`, each at most once. |
+| `run` | absent: none | The output sections that run in the region. |
+| `load` | absent: none | The output sections whose bytes load in the region and run in another, as `.data` loaded in flash and run in RAM. |
+
+A section that runs in two regions or loads in two is refused, and so is one that
+loads in a region and runs in none, or loads in the region it runs in. mach hands
+the regions, the section order, the size ceiling and every `#[at]` placement to
+mink as one link plan, and reports mink's refusals, an overflow, an overlap or a
+missing section, as mink names them. mink names the bounds of each section by
+its load and run addresses, `__load_start_<section>`, `__load_stop_<section>`,
+`__run_start_<section>` and `__run_stop_<section>`, so startup code, such as
+copying `.data` out of its load region, is a library's and never the compiler's.
 
 Per-target extension or per-target entry is not a per-cell exception table — it is a
 second artifact stanza, so the condition stays visible like everything else.
