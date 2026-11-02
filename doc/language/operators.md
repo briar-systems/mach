@@ -63,8 +63,8 @@ whether the target may execute it. A secret `/` or `%` is always refused, and a
 secret `*` compiles only where the instruction set declares the exact multiply
 it emits (the low half, a high half or the widening product, at that operand
 width) as data-independent-timing under a condition the build meets: on x86-64
-every scalar cell unconditionally, on aarch64 under PSTATE.DIT on linux and
-darwin, on riscv64 with `m` and `zkt` selected, and nowhere else. An undeclared
+every scalar cell unconditionally, on aarch64 under PSTATE.DIT, which a
+constant-time function holds as its mode says, on riscv64 with `m` and `zkt` selected, and nowhere else. An undeclared
 cell is a compile error at lowering, never a slower substitute. The widening
 form above carries through: `(a::^u128) * (b::^u128)` over 64-bit secrets is
 the 64-bit widening cell, and its halves are `^u64`. The per-instruction-set

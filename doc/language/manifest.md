@@ -419,10 +419,10 @@ row such as a `dit` would admit `msr dit`, not set it.
 
 The `ext` list is the manifest's only lever over the constant-time multiply,
 and only on riscv64, where `zkt` is what admits a secret `*`. There is no key that
-declares or overrides a timing mode. On aarch64 the condition is PSTATE.DIT, which
-the operating system declares it guarantees (linux and darwin) and the linked
-program's start code turns on for a binary that needs it; a manifest cannot assert
-it for an OS that declares nothing. On x86-64 the multiply rows hold unconditionally
+declares or overrides a timing mode. On aarch64 the condition is PSTATE.DIT, which a
+`soft` constant-time function sets around itself where the processor has it and a
+`hard` one requires in the target's baseline
+([secrecy.md](secrecy.md#soft-and-hard)); a manifest cannot assert it. On x86-64 the multiply rows hold unconditionally
 on Intel and AMD, so nothing is there to declare, and Intel's DOITM is a kernel-owned
 model-specific register that hardens memory-side predictors rather than the
 multiplier, so mach offers no key for it either. The rows, their conditions and
@@ -1128,10 +1128,10 @@ unknown:
 
 | Key | Error |
 |---|---|
-| `secret.not_oblivious` | a function performs a constant-time operation on a secret value without `#[constant_time]` |
+| `secret.branch` | a secret value decides a branch or loop condition |
 
 ```
-error[allow.error_key]: mach.toml: [profile.release].allow entry "secret.not_oblivious" names an error; only a warning can be silenced
+error[allow.error_key]: mach.toml: [profile.release].allow entry "secret.branch" names an error; only a warning can be silenced
 ```
 
 Like the SIMD levers, `allow` is the consumer's: a dependency's profiles are

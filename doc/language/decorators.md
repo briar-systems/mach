@@ -297,7 +297,7 @@ errors, and a key named twice are refused, since an error is never
 acknowledged:
 
 ```
-error[expect.error_key]: `secret.not_oblivious` names an error, and an error is never acknowledged
+error[expect.error_key]: `secret.branch` names an error, and an error is never acknowledged
 ```
 
 ### `symbol(str)` — linker name
@@ -737,10 +737,22 @@ var depth: u32 = 0;
 ### `constant_time(mode)` — constant-time boundary
 
 Marks a function as a constant-time boundary. Applies to functions only, and
-takes one mode, `"soft"` or `"hard"`, which is required. Inside it the backend must not introduce a secret-dependent
-branch or select a variable-latency instruction on a secret operand; a
-translation validator re-derives the secret taint over the lowered MIR and
-rejects any such leak.
+takes one mode, `"soft"` or `"hard"`, which is required: a bare
+`#[constant_time]` is refused. Inside it, in either mode, the emitted code may
+not branch, index, address or divide on a secret, and a callee that receives a
+secret must be constant time itself. masc's walk proves this on the encoded
+code.
+
+- `"soft"`: mirl saves, sets and restores the processor's data-independent
+  timing mode (aarch64's DIT) around the function, guarded by std's
+  availability byte where the target does not guarantee the mode. Without it
+  the function runs anyway.
+- `"hard"`: decided at compile time. The target must guarantee data-independent
+  timing for every operation the function uses (aarch64 needs DIT in the
+  baseline, riscv needs Zkt in the selection, x86-64's scalar cells pass), or
+  the build is refused naming the missing feature.
+
+See [secrecy.md](secrecy.md#soft-and-hard) for both modes.
 
 Inline `asm` inside such a function is **validated rather than rejected**: the
 block is parsed and walked for the same leaks, and refused only where a leak is
@@ -760,21 +772,18 @@ for what that covers and what it does not.
 fun ct_eq(a: ^[8]u8, b: ^[8]u8) u8 { ... }
 ```
 
-The decorator is purely subtractive — on a secret-free function it is a no-op.
-A function instance that *computes* on a `^` secret (arithmetic, bitwise, shift,
-comparison, negation) is **required** to carry it; an instance that only moves,
-stores, or declassifies secrets stays annotation-free.
+No function is required to carry it. The secret gates hold in every function
+with or without it, and a function that computes on a secret without it compiles
+with no promise about the timing of its code.
 
-It is rejected outright for a target whose back half emits a module for a
-downstream compiler rather than the executed instructions (the experimental
-SPIR-V backend): the contract cannot be validated or upheld there.
+It is refused at the mark for a target whose instruction set classifies no
+instruction's timing (SPIR-V, whose module a downstream compiler translates),
+and warned at the mark for one that cannot guarantee any instruction's timing
+(wasm, whose runtime decides the instructions that run).
 
 v6 spelled it `#[oblivious]`, which warns naming `constant_time` and its two
 modes (see [v6 spellings](#v6-spellings)).
 
-> **Experimental preview.** The constant-time guarantee is not complete and has
-> not been audited — see [secrecy.md](secrecy.md#assurance) for the known open
-> holes. Do not build production cryptography on it at this version.
 
 ### `vectorize("never")` — opt out of auto-vectorization
 
