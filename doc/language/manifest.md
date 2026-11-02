@@ -276,6 +276,7 @@ to whichever *declared* target matches the host.
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
 | `stack_reserve` | absent: the format's default | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
 | `stack_commit` | absent: the format's default | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
+| `code_model` | absent: mirl's default for the target | The code model the target's code is built under (string), by the psABI name mirl's catalog gives it, such as `medlow` or `medany` on `riscv64`. Any target may state it, and a model the target does not offer is refused with mirl's reason. `--code-model` states it for an entry build. |
 | `default` | removed | Refused as a removed key. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
 | `os`, `baseline`, `extensions` | removed | v6's names of `sys`, `isa` and `ext`, refused with the rename `mach migrate` writes. |
 | `ext` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the architecture's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
