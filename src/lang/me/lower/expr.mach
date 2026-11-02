@@ -6,9 +6,11 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.view.View;
 
 use A: std.allocator;
+use std.collections.slice.Slice;
 
 use mach.lang.diagnostic;
 use diagnostic_kind: mach.lang.diagnostic.kind;
@@ -40,6 +42,9 @@ use mach.lang.stack;
 use mach.lang.type;
 use mach.lang.wide;
 
+use masc_effect:  masc.core.effect;
+use masc_operand: masc.core.operand;
+use masc_row:     masc.core.row;
 use mirl_global: mirl.ir.global;
 use mirl.ir.id;
 use mirl.ir.native;
@@ -47,6 +52,7 @@ use mirl.ir.opcode;
 use mirl.ir.opcode.Opcode;
 use types: mirl.ir.type;
 use mirl.ir.type.Type;
+use mirl_capability: mirl.target.capability;
 use collections_vector: std.collections.vector;
 
 pub fun lower_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[value.Value, fail.Fail] {
@@ -989,11 +995,18 @@ fun lower_call(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_exp
     val opt_intr: opt[res[value.Value, fail.Fail]] = try_lower_comptime_intrinsic(ctx, eid, e);
     if (sel opt_intr.some) { ret opt_intr.some; }
 
+    # a function an `#[intrinsic]` of the selected target makes an instruction is called as it
+    val opt_op: opt[lower_context.Declared] = callee_declared(ctx, e.data.call.callee);
+    if (sel opt_op.some && !intern.str_is_nil(opt_op.some.declaration.op_set)) { ret lower_target_op(ctx, eid, e, opt_op.some.declaration); }
+
     # on a target whose pointers name a storage class, a direct call of a plain function is
     # resolved once its arguments are, since the classes they point into choose the copy
     val opt_plain: opt[lower_context.Declared] = classed_callee(ctx, e);
     var callee:    value.Value                 = value.none();
     var sig:       Type                        = irt.NONE;
+    # an instance taking a pointer on such a target is called as the copy of it taking its
+    # pointers in the classes its arguments point into
+    var instance: u32 = fe_sema.instance.NONE;
     if (sel opt_plain.some) {
         val res_plain: res[lower_context.FnSig, fail.Fail] = lower_context.fn_sig_of_type(ctx, lower_context.expr_type_of(ctx, e.data.call.callee));
         if (sel res_plain.err) { ret res[value.Value, fail.Fail].err{res_plain.err}; }
@@ -1004,10 +1017,14 @@ fun lower_call(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_exp
         if (sel res_callee.err) { ret res_callee; }
         callee = res_callee.ok;
         sig    = callee.sig;
-        # an instance is emitted once at its own signature, never per tuple of classes
         if (builder.classes(?ctx.builder) && callee.kind == value.VAL_FN && irt.takes_pointer(?ctx.m.types, sig)) {
-            ret res[value.Value, fail.Fail].err{lower_context.report_gate(ctx, diagnostic_kind.SPIRV_UNSUPPORTED, e.span,
-                "a generic, comptime-parameter or pack function taking a pointer is not yet called where pointers name a storage class: its instance is lowered once, not once per class its callers pass (#4854)")};
+            if (!instancing(ctx, e)) {
+                ret res[value.Value, fail.Fail].err{lower_context.report_gate(ctx, diagnostic_kind.SPIRV_UNSUPPORTED, e.span,
+                    "a call that spreads a pack into a function taking a pointer is not yet made where pointers name a storage class: name each argument")};
+            }
+            val id: res[u32, fail.Fail] = lower_context.instance_id_of_call(ctx, eid);
+            if (sel id.err) { ret res[value.Value, fail.Fail].err{id.err}; }
+            instance = id.ok;
         }
     }
 
@@ -1090,6 +1107,12 @@ fun lower_call(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_exp
         callee = chosen.ok;
         sig    = callee.sig;
     }
+    if (instance != fe_sema.instance.NONE) {
+        val chosen: res[value.Value, fail.Fail] = classed_instance(ctx, instance, sig, args, rtc);
+        if (sel chosen.err) { ret chosen; }
+        callee = chosen.ok;
+        sig    = callee.sig;
+    }
 
     # a call whose result holds a secret gives a secret result
     builder.set_secret(?ctx.builder, lower_context.type_contains_secret(ctx, lower_context.expr_type_of(ctx, eid)));
@@ -1115,13 +1138,124 @@ fun classed_callee(ctx: *lower_context.LowerContext, e: *ast_expr.Expr) opt[lowe
 # arguments at `args` point into, one copy for each tuple of classes
 fun classed_reference(ctx: *lower_context.LowerContext, callee_eid: ast_id.ExprId, cf: lower_context.Declared, sig: Type,
     args: *value.Value, n: u32) res[value.Value, fail.Fail] {
-    val t:   *types.Table         = ?ctx.m.types;
     val sym: opt[*resolve.Symbol] = lower_context.symbol_of(ctx, lower_context.expr_symbol_of(ctx, callee_eid));
     if (sel sym.none) { ret res[value.Value, fail.Fail].err{fail.message("lower: a callee names no symbol")}; }
     val res_ln: res[intern.StrId, fail.Fail] = reference_linkage_name(ctx, sym.some);
     if (sel res_ln.err) { ret res[value.Value, fail.Fail].err{res_ln.err}; }
     val origin: session.ModuleId = resolve.origin_of(ctx.s, sym.some);
 
+    val copied: res[opt[Type], fail.Fail] = classed_signature(ctx, sig, args, n);
+    if (sel copied.err)     { ret res[value.Value, fail.Fail].err{copied.err}; }
+    if (sel copied.ok.none) { ret fn_reference(ctx, res_ln.ok, lower_context.FnSig{sig: sig}); }
+    val made: res[u32, fail.Fail] = lower_context.class_copy(ctx, origin, cf.declaration.decl, res_ln.ok, copied.ok.some, fe_sema.instance.NONE);
+    if (sel made.err) { ret res[value.Value, fail.Fail].err{made.err}; }
+    ret res[value.Value, fail.Fail].ok{value.fn(made.ok, builder.ptr_type(?ctx.builder), copied.ok.some)};
+}
+
+# a call of the function `op` declares an instruction of the target's catalog: the
+# instruction itself, its operands the call's arguments in order and its result the
+# function's return type. the set and the op are read in mirl's catalog of the target,
+# which holds the rows masc states, and mirl's verifier holds the instruction to its row
+fun lower_target_op(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr, op: *fe_sema.interface.Declaration) res[value.Value, fail.Fail] {
+    val set_name: str = intern.text(?ctx.s.interner, op.op_set);
+    val op_name:  str = intern.text(?ctx.s.interner, op.op_name);
+    val set_view: View = View{data: set_name, len: str_len(set_name)};
+    val op_view:  View = View{data: op_name, len: str_len(op_name)};
+    val held: mirl_capability.Ops = ctx.machine.target.caps.ops;
+    if (!(sel held.catalog)) {
+        ret res[value.Value, fail.Fail].err{lower_context.report_gate(ctx, diagnostic_kind.OP_UNKNOWN, e.span,
+            "the selected target's catalog holds no instruction set, so no `intrinsic` of it is an instruction")};
+    }
+    val c:   *mirl_capability.Catalog    = held.catalog;
+    val set: opt[*mirl_capability.OpSet] = mirl_capability.op_set(c, set_view);
+    if (sel set.none) {
+        ret res[value.Value, fail.Fail].err{op_refused(ctx, e.span, fail.join(ctx.s.alloc, "the selected target's catalog holds no instruction set `", set_name, "`"))};
+    }
+    val refused: opt[*mirl_capability.Refused] = mirl_capability.refusal(set.some, op_view);
+    if (sel refused.some) {
+        ret res[value.Value, fail.Fail].err{op_refused(ctx, e.span, fail.join(ctx.s.alloc, "`", op_name, "` is no `intrinsic`: the language writes it as ", refused.some.form))};
+    }
+    val row: opt[*masc_row.Row] = mirl_capability.op_row(c, set.some, op_view);
+    if (sel row.none) {
+        ret res[value.Value, fail.Fail].err{op_refused(ctx, e.span, fail.join(ctx.s.alloc, "instruction set `", set_name, "` of the selected target holds no `", op_name, "`"))};
+    }
+
+    val argc: u32 = e.data.call.args_len;
+    var args: *value.Value = nil;
+    fin {
+        if (args != nil) { A.deallocate[value.Value](ctx.s.alloc, args, argc::usize); }
+    }
+    if (argc > 0) {
+        val made: res[*value.Value, A.Error] = A.allocate[value.Value](ctx.s.alloc, argc::usize);
+        if (sel made.err) { ret res[value.Value, fail.Fail].err{fail.refused(made.err)}; }
+        args = made.ok;
+    }
+    var i: u32 = 0;
+    for (i < argc) {
+        val arg_eid: ast_id.ExprId                 = ctx.scope.a.expr_ids.data[e.data.call.args_start + i];
+        val lowered: res[value.Value, fail.Fail]   = lower_rvalue(ctx, arg_eid);
+        if (sel lowered.err) { ret lowered; }
+        args[i] = lowered.ok;
+        i       = i + 1;
+    }
+
+    var results: [1]Type = [1]Type{irt.NONE};
+    var count:   usize   = 0;
+    val ret_sem: type.TypeId = lower_context.expr_type_of(ctx, eid);
+    if (!type.is_nil(ret_sem)) {
+        val lowered: res[Type, fail.Fail] = lower_context.lower_type(ctx, ret_sem);
+        if (sel lowered.err) { ret res[value.Value, fail.Fail].err{lowered.err}; }
+        results[0] = lowered.ok;
+        count      = 1;
+    }
+    var instruction: native.Op = native.Op{
+        set:     set_view,
+        name:    op_view,
+        results: Slice[Type]{data: ?results[0], size: count},
+        reads:   row_touches(row.some, masc_operand.READ),
+        writes:  row_touches(row.some, masc_operand.WRITE)
+    };
+    ret builder.emit_target_op(?ctx.builder, ?instruction, args, argc);
+}
+
+# an `intrinsic` call the target's catalog refuses, reported with `text` where it is written
+fun op_refused(ctx: *lower_context.LowerContext, span: lang_source.Span, text: res[str, fail.Fail]) fail.Fail {
+    if (sel text.err) { ret text.err; }
+    ret lower_context.report_gate(ctx, diagnostic_kind.OP_UNKNOWN, span, text.ok);
+}
+
+# whether the memory a row of masc's states is touched in the role `want`: an access's own
+# role, else the role of the operand it names
+fun row_touches(r: *masc_row.Row, want: masc_operand.Role) bool {
+    var i: u32 = 0;
+    for (i < r.effect.memory.len) {
+        val access: *masc_effect.Access = ?r.effect.memory.at[i];
+        var role:   masc_operand.Role   = access.role;
+        if (role == masc_operand.NONE && access.operand::u32 < r.operands.len) { role = r.operands.at[access.operand].role; }
+        if ((role & want) != 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the copy of the instance `id` of the module's set a call calls, taking its pointers in the
+# classes the `n` arguments at `args` point into, one copy for each tuple of classes
+fun classed_instance(ctx: *lower_context.LowerContext, id: u32, sig: Type, args: *value.Value, n: u32) res[value.Value, fail.Fail] {
+    val item: *fe_sema.instance.Instance  = fe_sema.instance.at(ctx.instances, id);
+    val link: res[intern.StrId, fail.Fail] = lower_context.instance_link_name(ctx, item);
+    if (sel link.err) { ret res[value.Value, fail.Fail].err{link.err}; }
+    val copied: res[opt[Type], fail.Fail] = classed_signature(ctx, sig, args, n);
+    if (sel copied.err)     { ret res[value.Value, fail.Fail].err{copied.err}; }
+    if (sel copied.ok.none) { ret fn_reference(ctx, link.ok, lower_context.FnSig{sig: sig}); }
+    val made: res[u32, fail.Fail] = lower_context.class_copy(ctx, item.origin, item.decl, link.ok, copied.ok.some, id);
+    if (sel made.err) { ret res[value.Value, fail.Fail].err{made.err}; }
+    ret res[value.Value, fail.Fail].ok{value.fn(made.ok, builder.ptr_type(?ctx.builder), copied.ok.some)};
+}
+
+# `sig` restated with each pointer parameter in the class the argument of the `n` at `args`
+# passed for it points into, none where it takes no pointer
+fun classed_signature(ctx: *lower_context.LowerContext, sig: Type, args: *value.Value, n: u32) res[opt[Type], fail.Fail] {
+    val t: *types.Table = ?ctx.m.types;
     var params: collections_vector.Vector[Type] = collections_vector.init[Type](ctx.s.alloc);
     fin { collections_vector.dnit[Type](?params); }
     var pointers: bool = false;
@@ -1135,15 +1269,23 @@ fun classed_reference(ctx: *lower_context.LowerContext, callee_eid: ast_id.ExprI
             if (addressed) { p = builder.ptr_in(?ctx.builder, a.space); }
         }
         val pushed: res[usize, A.Error] = collections_vector.push[Type](?params, p);
-        if (sel pushed.err) { ret res[value.Value, fail.Fail].err{fail.refused(pushed.err)}; }
+        if (sel pushed.err) { ret res[opt[Type], fail.Fail].err{fail.refused(pushed.err)}; }
         i = i + 1;
     }
-    if (!pointers) { ret fn_reference(ctx, res_ln.ok, lower_context.FnSig{sig: sig}); }
+    if (!pointers) { ret res[opt[Type], fail.Fail].ok{opt[Type].none{}}; }
     val copied: res[Type, fail.Fail] = irt.restated(t, sig, params.data, params.len::u32);
-    if (sel copied.err) { ret res[value.Value, fail.Fail].err{copied.err}; }
-    val made: res[u32, fail.Fail] = lower_context.class_copy(ctx, origin, cf.declaration.decl, res_ln.ok, copied.ok);
-    if (sel made.err) { ret res[value.Value, fail.Fail].err{made.err}; }
-    ret res[value.Value, fail.Fail].ok{value.fn(made.ok, builder.ptr_type(?ctx.builder), copied.ok)};
+    if (sel copied.err) { ret res[opt[Type], fail.Fail].err{copied.err}; }
+    ret res[opt[Type], fail.Fail].ok{opt[Type].some{copied.ok}};
+}
+
+# whether a call names an instance, as lower_callee reads it: a function with comptime or
+# pack parameters, or one given type arguments
+fun instancing(ctx: *lower_context.LowerContext, e: *ast_expr.Expr) bool {
+    if (e.data.call.type_args_len != 0) { ret true; }
+    val opt_cf: opt[lower_context.Declared] = callee_declared(ctx, e.data.call.callee);
+    if (sel opt_cf.none) { ret false; }
+    val cf: lower_context.Declared = opt_cf.some;
+    ret fe_sema.interface.declaration_has_comptime_param(cf.iface, cf.declaration) || (cf.declaration.flags & fe_sema.interface.DECLARATION_PACK) != 0;
 }
 
 # whether call argument `ord` may be read in place: an aggregate place with no secret, read
