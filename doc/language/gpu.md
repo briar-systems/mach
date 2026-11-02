@@ -7,7 +7,11 @@ instructions. Every decorator, and where each one applies, is listed in
 [decorators.md](decorators.md#applicability). The `spirv` target and its
 environments are described in [manifest.md](manifest.md#finished-module-targets).
 
-## `stage(str)` — GPU pipeline stage
+The GPU set is dotted, `#[gpu.stage]`, `#[gpu.input]` and the rest, since its
+generic words apply only to shader stages. v6 spelled each without the prefix,
+and `intrinsic` as `op`. Each v6 spelling warns, naming its replacement.
+
+## `gpu.stage(str)` — GPU pipeline stage
 
 Marks a function as the entry point of a graphics or compute pipeline stage. The
 argument names the stage and the set is closed:
@@ -22,10 +26,10 @@ An unrecognized value is a compile error, not a module that quietly forms no
 stage.
 
 ```mach
-#[stage("vertex")]
+#[gpu.stage("vertex")]
 fun vertex_main() {}
 
-#[stage("fragment")]
+#[gpu.stage("fragment")]
 fun fragment_main() {}
 ```
 
@@ -45,20 +49,20 @@ artifact rather than just the one function. A shader module carries entry points
 and no external linkage at all; a module with no stage is a **library module**,
 which publishes each function as a linkage export so a consumer can find it. The
 two are exclusive — a Vulkan consumer refuses a module carrying linkage — so
-adding the first `#[stage(...)]` to a module stops it exporting its functions.
+adding the first `#[gpu.stage(...)]` to a module stops it exporting its functions.
 
 The entry point's name, as a pipeline-creation call looks it up, is the function's
 **bare source name** (`vertex_main` above), not a mangled linker symbol. A shader
 module has no linker symbols to mangle.
 
-## `workgroup(x, y, z)` — compute workgroup dimensions
+## `gpu.workgroup(x, y, z)` — compute workgroup dimensions
 
-Sizes the workgroup of a `#[stage("compute")]` function. The three arguments are
+Sizes the workgroup of a `#[gpu.stage("compute")]` function. The three arguments are
 comptime integers giving the x, y and z dimensions.
 
 ```mach
-#[stage("compute")]
-#[workgroup(64, 1, 1)]
+#[gpu.stage("compute")]
+#[gpu.workgroup(64, 1, 1)]
 fun compute_main() {}
 ```
 
@@ -68,15 +72,15 @@ stage takes the single-invocation default `(1, 1, 1)`; the dimensions are always
 declared in the emitted module, since a compute stage that does not state its
 workgroup size is not one a consumer can dispatch.
 
-Any dimension may instead name a `#[spec]` var (see
-[`spec`](#specid--specialization-constants)), which the host sets when it creates
+Any dimension may instead name a `#[gpu.spec]` var (see
+[`gpu.spec`](#gpuspecid--specialization-constants)), which the host sets when it creates
 the pipeline. The var must be a `u32` or `i32`, and any other variable is refused.
 
 ```mach fragment
-#[spec(0)] var tile: u32 = 64;
+#[gpu.spec(0)] var tile: u32 = 64;
 
-#[stage("compute")]
-#[workgroup(tile, 1, 1)]
+#[gpu.stage("compute")]
+#[gpu.workgroup(tile, 1, 1)]
 fun compute_main() {}
 ```
 
@@ -87,40 +91,40 @@ needs SPIR-V 1.2 and, on Vulkan, the `maintenance4` feature, which only Vulkan
 `vulkan1.3`. Every other environment gets a `WorkgroupSize` built-in over an
 `OpSpecConstantComposite`. That built-in sizes **every** compute stage in the
 module, so a module in such an environment whose compute stages size their
-workgroups differently, and at least one of them through a `#[spec]` var, is
+workgroups differently, and at least one of them through a `#[gpu.spec]` var, is
 refused. Give the stages one workgroup or put them in separate modules.
 
-## `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` / `storage(set, binding)` / `sampler(set, binding)` / `push` / `spec(id)` / `shared` — shader interface
+## `gpu.input(n)` / `gpu.output(n)` / `gpu.builtin(str)` / `gpu.uniform(set, binding)` / `gpu.storage(set, binding)` / `gpu.sampler(set, binding)` / `gpu.push` / `gpu.spec(id)` / `gpu.shared` — shader interface
 
 A pipeline stage does not receive its inputs or return its results through a call.
 It reads and writes **module-scope variables** that the pipeline binds, and these
 decorators say which kind each variable is. They apply only to module-level
 `val` / `var` bindings, and a variable carries **exactly one** of them — they
-are mutually exclusive. `spec`, described in its own section below, is one of
+are mutually exclusive. `gpu.spec`, described in its own section below, is one of
 them too.
 
 ```mach fragment
-#[input(0)]            var in_position: f32x4;
-#[output(0)]           var out_colour:  f32x4;
-#[builtin("position")] var position:    f32x4;
+#[gpu.input(0)]            var in_position: f32x4;
+#[gpu.output(0)]           var out_colour:  f32x4;
+#[gpu.builtin("position")] var position:    f32x4;
 
 rec Camera { view: f32x4; proj: f32x4; }
-#[uniform(0, 0)] var camera: Camera;
+#[gpu.uniform(0, 0)] var camera: Camera;
 
 rec Particles { pos: [64]f32x4; }
-#[storage(0, 1)] var particles: Particles;
+#[gpu.storage(0, 1)] var particles: Particles;
 
-#[sampler(1, 0)] var albedo: Sampler2D;
+#[gpu.sampler(1, 0)] var albedo: Sampler2D;
 
 rec Params { tint: f32x4; count: u32; }
-#[push] var params: Params;
+#[gpu.push] var params: Params;
 ```
 
-`input` and `output` number a **varying** with a location, which is how one
+`gpu.input` and `gpu.output` number a **varying** with a location, which is how one
 stage's outputs line up with the next stage's inputs: the producer's
-`#[output(0)]` feeds the consumer's `#[input(0)]`.
+`#[gpu.output(0)]` feeds the consumer's `#[gpu.input(0)]`.
 
-`builtin` names a value the pipeline supplies or consumes instead of one a
+`gpu.builtin` names a value the pipeline supplies or consumes instead of one a
 location carries. The accepted set is closed:
 
 | Value                      | Meaning                                | Type    | Direction | Stage    |
@@ -142,7 +146,7 @@ location carries. The accepted set is closed:
 
 The direction is a property of the built-in, not something you restate — a stage
 writes its position and reads what the pipeline hands it — so there is no
-input/output marker to pair with `builtin`, and none that could disagree with it.
+input/output marker to pair with `gpu.builtin`, and none that could disagree with it.
 
 The **type** is a property of the built-in too, and it is a requirement rather
 than a suggestion: the pipeline binds the variable itself, so a wider or narrower
@@ -162,15 +166,15 @@ its row, directly or through a function it calls, is a compile error naming the
 built-in and both stages. The four subgroup built-ins need SPIR-V 1.3, and outside
 a compute stage the `subgroup_graphics_stages` feature, as the subgroup operations do.
 
-`uniform` binds a read-only block by descriptor set and binding. Its type **must
+`gpu.uniform` binds a read-only block by descriptor set and binding. Its type **must
 be a `rec`**: a uniform is a block with a host-visible layout, and a bare scalar
 or vector has no block layout for a pipeline to bind. The record is emitted with
 its `Block` decoration and an explicit byte offset on every member, taken from the
 same layout the rest of the compiler uses, so what the shader reads is what the
 host wrote. Wrap a single value in a one-field record.
 
-`storage` binds a **read-write** buffer by descriptor set and binding, where
-`uniform` binds a read-only one. Both must be a `rec` for the same reason, and both
+`gpu.storage` binds a **read-write** buffer by descriptor set and binding, where
+`gpu.uniform` binds a read-only one. Both must be a `rec` for the same reason, and both
 are emitted as a `Block`-decorated struct with an explicit offset on every member.
 
 They differ in one place: their **layout rules**. A uniform block follows
@@ -178,19 +182,19 @@ std140-shaped rules, under which an array's stride is rounded up to 16 — which
 mach's own layout does not do, so an array of anything narrower than 16 bytes is
 refused rather than silently repacked. A storage buffer follows std430-shaped
 rules, which use the element's natural stride, and that *is* mach's layout, so
-`[8]f32` is fine in a `storage` block and rejected in a `uniform` one.
+`[8]f32` is fine in a `gpu.storage` block and rejected in a `gpu.uniform` one.
 
-A compute stage's data path is `storage`: Vulkan forbids the `Output` storage class
+A compute stage's data path is `gpu.storage`: Vulkan forbids the `Output` storage class
 in a compute execution model, so a compute shader reads and writes buffers rather
 than varyings.
 
-`storage` takes **memory qualifiers** after the descriptor pair, any number of them
+`gpu.storage` takes **memory qualifiers** after the descriptor pair, any number of them
 in any order: `"readonly"`, `"writeonly"` and `"coherent"`. `"readonly"` says that
 nothing writes the binding:
 
 ```mach
 rec Palette { columns: [512]f32x4; }
-#[storage(0, 3, "readonly")]
+#[gpu.storage(0, 3, "readonly")]
 var palette: Palette;
 ```
 
@@ -210,7 +214,7 @@ the binding, and it is accepted whether it is written inline or through a local:
 ```mach
 rec Shard { v: [64]u32; }
 rec Table { shards: [4]*Shard; }
-#[storage(0, 0, "readonly")]
+#[gpu.storage(0, 0, "readonly")]
 var table: Table;
 
 fun fill(i: u32, x: u32) {
@@ -229,7 +233,7 @@ is emitted `NonReadable`.
 
 ```mach
 rec Frame { texels: [4096]f32x4; }
-#[storage(0, 4, "writeonly")]
+#[gpu.storage(0, 4, "writeonly")]
 var frame: Frame;
 ```
 
@@ -263,12 +267,12 @@ selects (see [manifest.md](manifest.md#finished-module-targets)):
 
 ```mach
 rec Counters { done: u32; }
-#[storage(0, 5, "coherent")]
+#[gpu.storage(0, 5, "coherent")]
 var counters: Counters;
 ```
 
-`sampler` binds a **handle** by descriptor set and binding, at the same descriptor
-addressing `uniform` and `storage` use, so a host binds one the way it binds the
+`gpu.sampler` binds a **handle** by descriptor set and binding, at the same descriptor
+addressing `gpu.uniform` and `gpu.storage` use, so a host binds one the way it binds the
 others. Its type must be a **handle type**, a bodyless `def` carrying `#[handle]`
 (see [types.md](types.md)), and a handle type must carry this decorator: a handle
 names a descriptor rather than an object with storage, so one with no descriptor
@@ -277,12 +281,12 @@ array, or in a local binding, and each of those is a compile error naming why.
 
 A **storage image** is the exception: an `image` handle whose `Sampled` operand is
 `2` is read and written directly rather than sampled, which is Vulkan's
-`STORAGE_IMAGE` descriptor, so it binds through `storage` and not `sampler`. The
+`STORAGE_IMAGE` descriptor, so it binds through `gpu.storage` and not `gpu.sampler`. The
 `"readonly"`, `"writeonly"` and `"coherent"` qualifiers apply to it exactly as they
 do to a buffer, checked against the instructions that read and write its texels. A
 storage texel buffer, an image of `Dim` `Buffer` with `Sampled` `2`, binds the same
-way, and a uniform texel buffer (`Sampled` `1`) keeps `sampler`. Binding a storage
-image through `sampler`, or any other handle through `storage`, is a compile error.
+way, and a uniform texel buffer (`Sampled` `1`) keeps `gpu.sampler`. Binding a storage
+image through `gpu.sampler`, or any other handle through `gpu.storage`, is a compile error.
 A storage image is read and written by `OpImageRead` and `OpImageWrite`, a uniform
 texel buffer or a sampled image is fetched texel by texel by `OpImageFetch`, and
 `OpImageQuerySize`, `OpImageQuerySizeLod`, `OpImageQueryLevels` and
@@ -326,10 +330,10 @@ Each is refused at the call with `op.operand_value`.
 #[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, MULTISAMPLED, SAMPLED, FORMAT_UNKNOWN)]
 pub def TextureMS;
 
-#[op("spirv", "core", "OpImageFetch")]
+#[intrinsic("spirv", "core", "OpImageFetch")]
 fun fetch_sample(img: TextureMS, at: i32x2, mask: u32, sample: i32) f32x4;
 
-#[op("spirv", "core", "OpImageQuerySamples")]
+#[intrinsic("spirv", "core", "OpImageQuerySamples")]
 fun sample_count(img: TextureMS) i32;
 ```
 
@@ -337,10 +341,10 @@ fun sample_count(img: TextureMS) i32;
 #[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, STORAGE, FORMAT_RGBA8)]
 pub def Target2D;
 
-#[op("spirv", "core", "OpImageWrite")]
+#[intrinsic("spirv", "core", "OpImageWrite")]
 fun image_write(img: Target2D, at: i32x2, texel: f32x4);
 
-#[storage(0, 6, "writeonly")] var target: Target2D;
+#[gpu.storage(0, 6, "writeonly")] var target: Target2D;
 ```
 
 A **depth comparison** samples a depth image, one whose `Depth` operand is `1`
@@ -357,13 +361,13 @@ whose `Depth` is `0` is refused with `op.operand_value`, and so is one of a `3D`
 image, which Vulkan never compares (`VUID-StandaloneSpirv-OpImage-04777`).
 
 ```mach fragment
-#[op("spirv", "core", "OpImageSampleDrefImplicitLod")]
+#[intrinsic("spirv", "core", "OpImageSampleDrefImplicitLod")]
 fun shadow(s: ShadowSampler, uv: f32x2, depth: f32) f32;
 
-#[op("spirv", "core", "OpImageSampleDrefExplicitLod")]
+#[intrinsic("spirv", "core", "OpImageSampleDrefExplicitLod")]
 fun shadow_lod(s: ShadowSampler, uv: f32x2, depth: f32, mask: u32, lod: f32) f32;
 
-#[op("spirv", "core", "OpImageDrefGather")]
+#[intrinsic("spirv", "core", "OpImageDrefGather")]
 fun shadow_gather(s: ShadowSampler, uv: f32x2, depth: f32, mask: u32, offset: i32x2) f32x4;
 ```
 
@@ -375,12 +379,12 @@ already give, HLSL, MSL and WGSL have none, and each brings its own refusals (no
 `Cube` image, no arrayed one). A declaration naming one is refused as an
 instruction the target does not define.
 
-`push` binds a **push-constant block**, a small `rec` the host supplies with the
+`gpu.push` binds a **push-constant block**, a small `rec` the host supplies with the
 command that records a dispatch or draw rather than through a descriptor, so it
-takes no arguments: there is no set or binding to name. Like `uniform` and
-`storage` it must be a `rec`, and it is emitted as a `Block`-decorated struct with
+takes no arguments: there is no set or binding to name. Like `gpu.uniform` and
+`gpu.storage` it must be a `rec`, and it is emitted as a `Block`-decorated struct with
 an explicit offset on every member. Its layout rules are std430-shaped, the same
-ones a `storage` buffer follows and checked the same way, so `[8]f32` is fine in a
+ones a `gpu.storage` buffer follows and checked the same way, so `[8]f32` is fine in a
 push block.
 
 A push block is **read-only** in the shader. A store to it is a compile error on
@@ -391,18 +395,18 @@ that each use a different one are accepted.
 
 ```mach
 rec Params { scale: f32; slot: u32; }
-#[push]
+#[gpu.push]
 var params: Params;
 ```
 
-Sampling a handle is an `#[op(...)]` declaration rather than a language form,
+Sampling a handle is an `#[intrinsic(...)]` declaration rather than a language form,
 because a sample IS one SPIR-V instruction like `sqrt` and `dot` are:
 
 ```mach fragment
-#[op("spirv", "core", "OpImageSampleImplicitLod")]
+#[intrinsic("spirv", "core", "OpImageSampleImplicitLod")]
 fun sample(s: Sampler2D, uv: f32x2) f32x4;
 
-#[stage("fragment")]
+#[gpu.stage("fragment")]
 fun frag_main() {
     out_colour = sample(albedo, in_uv);
 }
@@ -412,13 +416,13 @@ The separately-bound form works the same way, with the instruction that combines
 an image and a sampler declared alongside it:
 
 ```mach fragment
-#[op("spirv", "core", "OpSampledImage")]
+#[intrinsic("spirv", "core", "OpSampledImage")]
 fun combine(t: Texture2D, s: Sampler) Sampler2D;
 
-#[sampler(1, 0)] var base_tex: Texture2D;
-#[sampler(1, 1)] var base_smp: Sampler;
+#[gpu.sampler(1, 0)] var base_tex: Texture2D;
+#[gpu.sampler(1, 1)] var base_smp: Sampler;
 
-#[stage("fragment")]
+#[gpu.stage("fragment")]
 fun frag_sep() { out_colour = sample(combine(base_tex, base_smp), in_uv); }
 ```
 
@@ -430,26 +434,26 @@ error. Returning one, or passing one to a function, is refused with
 do, since its sampled image would then be consumed in another block. Compute such an
 operand into a binding before the call.
 
-`shared` declares **workgroup memory**: one instance per workgroup of a compute
+`gpu.shared` declares **workgroup memory**: one instance per workgroup of a compute
 stage, which every invocation of that workgroup reads and writes. It applies to a
 `var` only, since a `val` of workgroup memory could only ever read zero. It takes no
 arguments, and the variable has no descriptor and no location, because the pipeline
 never binds it.
 
 ```mach fragment
-#[builtin("local_invocation")] var local_id: u32x3;
-#[shared] var tile: [256]f32;
+#[gpu.builtin("local_invocation")] var local_id: u32x3;
+#[gpu.shared] var tile: [256]f32;
 
-#[stage("compute")]
-#[workgroup(64, 1, 1)]
+#[gpu.stage("compute")]
+#[gpu.workgroup(64, 1, 1)]
 fun blur() { tile[local_id[0]] = 1.0; }
 ```
 
-Workgroup memory exists only in a compute stage, so a `#[shared]` variable used from
+Workgroup memory exists only in a compute stage, so a `#[gpu.shared]` variable used from
 a vertex or fragment stage, directly or through a function the stage calls, is a
 compile error naming the stage.
 
-A `#[shared]` variable is **zero** when a compute stage starts, as every mach
+A `#[gpu.shared]` variable is **zero** when a compute stage starts, as every mach
 variable is, on every environment. How depends on the environment:
 
 - Where workgroup memory is zero-initialized by the consumer, the variable carries an
@@ -464,13 +468,13 @@ variable is, on every environment. How depends on the environment:
   type for invocation 0, and then the stage executes one workgroup `OpControlBarrier`.
   The barrier precedes all of the stage's own code, so every invocation reaches it.
 
-Because the value on entry is always zero, a `#[shared]` variable cannot have an
+Because the value on entry is always zero, a `#[gpu.shared]` variable cannot have an
 initializer. Assign it inside the stage.
 
 Workgroup memory is **coherent** among the invocations of a workgroup under either
 memory model. Under GLSL450 it is so by definition. Under the Vulkan model an access
 is private unless it says otherwise, and a barrier orders no private access between
-invocations, so each load and store of a `#[shared]` variable carries
+invocations, so each load and store of a `#[gpu.shared]` variable carries
 `MakePointerVisible` or `MakePointerAvailable` with `NonPrivatePointer` at the
 `Workgroup` scope, the compiler's own zeroing stores included. A workgroup barrier
 with acquire-release semantics then orders them as it does under GLSL450.
@@ -480,37 +484,37 @@ role says who puts the first value in it:
 
 | Role                                             | Initializer | Why                                                   |
 |--------------------------------------------------|-------------|-------------------------------------------------------|
-| `input`, a read built-in                         | refused     | the previous stage or the pipeline supplies the value |
-| `uniform`, `storage`, `sampler`, `push`          | refused     | the host binds or supplies the memory                 |
-| `shared`                                         | refused     | workgroup memory is zero when a stage starts          |
-| `spec`                                           | required    | it is the default the pipeline keeps                  |
-| `output`, a written built-in                     | allowed     | it is the value the variable starts at                |
+| `gpu.input`, a read built-in                         | refused     | the previous stage or the pipeline supplies the value |
+| `gpu.uniform`, `gpu.storage`, `gpu.sampler`, `gpu.push`          | refused     | the host binds or supplies the memory                 |
+| `gpu.shared`                                         | refused     | workgroup memory is zero when a stage starts          |
+| `gpu.spec`                                           | required    | it is the default the pipeline keeps                  |
+| `gpu.output`, a written built-in                     | allowed     | it is the value the variable starts at                |
 
 A refused initializer is a compile error, because the value it writes would never be
-the one the shader sees. An `output` or a written built-in starts at its
+the one the shader sees. An `gpu.output` or a written built-in starts at its
 initializer, and at zero without one, as every mach `var` does:
 
 ```mach fragment
-#[output(0)] var out_colour: f32x4 = f32x4{0.0, 0.0, 0.0, 1.0};
-#[output(1)] var out_mask:   u32;
+#[gpu.output(0)] var out_colour: f32x4 = f32x4{0.0, 0.0, 0.0, 1.0};
+#[gpu.output(1)] var out_mask:   u32;
 ```
 
 On `spirv` the Output `OpVariable` carries that value as its initializer: the
 constant the initializer spells, or `OpConstantNull` where it is zero or absent.
 SPIR-V and Vulkan both admit an initializer on an Output variable.
 
-As with `#[stage(...)]`, these are accepted on every target and acted on only by a
+As with `#[gpu.stage(...)]`, these are accepted on every target and acted on only by a
 target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in the
 matching storage class, carrying the matching decoration, and the Input and Output
-variables are named in every entry point's interface list. A `sampler` binding
+variables are named in every entry point's interface list. A `gpu.sampler` binding
 becomes an `OpVariable` in the `UniformConstant` class — the one class Vulkan
 permits an image, sampler or sampled-image variable in — carrying `DescriptorSet`
-and `Binding` exactly as a `uniform` does. A `push` block becomes an `OpVariable`
-in the `PushConstant` class, with no `DescriptorSet` or `Binding`. A `shared` variable
+and `Binding` exactly as a `gpu.uniform` does. A `gpu.push` block becomes an `OpVariable`
+in the `PushConstant` class, with no `DescriptorSet` or `Binding`. A `gpu.shared` variable
 becomes an `OpVariable` in the `Workgroup` class, named in the interface of each entry
 point that uses it from SPIR-V 1.4.
 
-## `spec(id)` — specialization constants
+## `gpu.spec(id)` — specialization constants
 
 A specialization constant is a value the host supplies when it creates the
 pipeline, after the shader has been compiled. It is declared as a module-level
@@ -518,9 +522,9 @@ pipeline, after the shader has been compiled. It is declared as a module-level
 keeps when the host supplies nothing for that id. The initializer is required:
 
 ```mach
-#[spec(0)]
+#[gpu.spec(0)]
 var tile_size: u32 = 64;
-#[spec(1)]
+#[gpu.spec(1)]
 var gain:      f32 = 0.5;
 ```
 
@@ -528,7 +532,7 @@ It is a `var` like every other value the host supplies, and that settles how the
 compiler treats it:
 
 - It is **never a compile-time value**. It cannot be an array length or a comptime
-  operand, since what it holds is decided after the build. A `#[spec]` on a `val`
+  operand, since what it holds is decided after the build. A `#[gpu.spec]` on a `val`
   is refused for the same reason.
 - The optimizer **never folds it to its initializer**, even when nothing in the
   module writes it. A mutable global is never replaced by its initial value, and
@@ -543,19 +547,19 @@ of `u8`. Write a flag as an integer spec var, which the host sets with the same 
 bytes as a `VkBool32`:
 
 ```mach
-#[spec(3)]
+#[gpu.spec(3)]
 var use_fog: u32 = 1;
 ```
 
 A narrower integer such as `u8` works too, but it needs the capability for its
 width like any other `u8` in a shader. On `spirv` each one becomes an
 `OpSpecConstant` whose literal is the initializer, decorated with `SpecId`, and a
-read uses that constant directly with no load. Two `#[spec]` vars with one id in
+read uses that constant directly with no load. Two `#[gpu.spec]` vars with one id in
 the same module are refused, since the host names the constant by its id. On a
 machine target the decorator has no effect and the var is an ordinary global.
 
-A `#[spec]` var may also size a compute workgroup (see
-[`workgroup`](#workgroupx-y-z--compute-workgroup-dimensions)).
+A `#[gpu.spec]` var may also size a compute workgroup (see
+[`gpu.workgroup`](#gpuworkgroupx-y-z--compute-workgroup-dimensions)).
 
 ## `handle(target, constructor, operands...)` — a type the target mints
 
@@ -589,7 +593,7 @@ handles compiles on a machine target. A constructor name the selected target doe
 not define, an operand count that disagrees with the constructor's, or an operand
 combination the target cannot emit is a compile error at the declaration.
 
-## `op(target, set, name)` — a function that *is* a target instruction
+## `intrinsic(target, set, name)` — a function that *is* a target instruction
 
 A shader needs `sqrt`, `normalize`, `dot` and `mix`. None of them is an operator,
 and none of them is a call SPIR-V can make: each is one instruction. This decorator
@@ -597,13 +601,13 @@ says which one a function is, so that on a `spirv` target a call to it becomes t
 instruction, inline, rather than a call.
 
 ```mach
-#[op("spirv", "GLSL.std.450", "Sqrt")]
+#[intrinsic("spirv", "GLSL.std.450", "Sqrt")]
 pub fun sqrt(x: f32) f32;
 
-#[op("spirv", "GLSL.std.450", "Normalize")]
+#[intrinsic("spirv", "GLSL.std.450", "Normalize")]
 pub fun normalize(v: f32x4) f32x4;
 
-#[op("spirv", "core", "OpDot")]
+#[intrinsic("spirv", "core", "OpDot")]
 pub fun dot(a: f32x4, b: f32x4) f32;
 ```
 
@@ -645,10 +649,10 @@ selected the declaration's types are checked against both:
 
 A **pointer operand takes its storage class from the call site**: the argument's
 own access chain decides whether it points into a storage buffer, workgroup memory,
-a function-local object or an image, since an `op` has no body and so no boundary at
+a function-local object or an image, since an `intrinsic` has no body and so no boundary at
 which its parameter's pointer could be given one. Any access chain is accepted, a
 member or element as well as a whole object. The kinds are also what the
-`"readonly"` and `"writeonly"` qualifiers of a `storage` binding are checked
+`"readonly"` and `"writeonly"` qualifiers of a `gpu.storage` binding are checked
 against: an atomic load through a `readonly` binding is accepted and an atomic add
 on it is refused, and an atomic store into a `writeonly` binding is accepted and an
 atomic load from it is refused. A handle passed as an ordinary value names its
@@ -667,13 +671,13 @@ which a target without `int8` carries at 32 bits like any other 8-bit local
 ([manifest.md](manifest.md#finished-module-targets)), so the module needs no Int8 for it.
 
 ```mach
-#[op("spirv", "core", "OpControlBarrier")]
+#[intrinsic("spirv", "core", "OpControlBarrier")]
 pub fun barrier(execution: u32, memory: u32, semantics: u32);
 
-#[op("spirv", "core", "OpMemoryBarrier")]
+#[intrinsic("spirv", "core", "OpMemoryBarrier")]
 pub fun memory_barrier(memory: u32, semantics: u32);
 
-#[op("spirv", "core", "OpAtomicIAdd")]
+#[intrinsic("spirv", "core", "OpAtomicIAdd")]
 pub fun atomic_add(p: *u32, scope: u32, semantics: u32, v: u32) u32;
 ```
 
@@ -711,10 +715,10 @@ alone or the tail too, and each call must pass exactly the operands its literal'
 value brings. `OpGroupNonUniformIAdd` is one:
 
 ```mach
-#[op("spirv", "core", "OpGroupNonUniformIAdd")]
+#[intrinsic("spirv", "core", "OpGroupNonUniformIAdd")]
 pub fun subgroup_add(scope: u32, operation: u32, v: u32) u32;
 
-#[op("spirv", "core", "OpGroupNonUniformIAdd")]
+#[intrinsic("spirv", "core", "OpGroupNonUniformIAdd")]
 pub fun subgroup_cluster_add(scope: u32, operation: u32, v: u32, cluster_size: u32) u32;
 ```
 
@@ -756,10 +760,10 @@ storage class is known. A load reads its pointer and every other atomic writes i
 a `"readonly"` binding admits only an atomic load.
 
 ```mach
-#[op("spirv", "core", "OpAtomicIAdd")]
+#[intrinsic("spirv", "core", "OpAtomicIAdd")]
 pub fun atomic_add64(p: *u64, scope: u32, semantics: u32, v: u64) u64;
 
-#[op("spirv", "core", "OpAtomicFAddEXT")]
+#[intrinsic("spirv", "core", "OpAtomicFAddEXT")]
 pub fun atomic_fadd(p: *f32, scope: u32, semantics: u32, v: f32) f32;
 ```
 
@@ -767,7 +771,7 @@ A 32-bit integer atomic is core in every storage class. Every other type needs t
 Vulkan device feature of its storage class, named for its `shaderBuffer*`,
 `shaderShared*` or `shaderImage*` member: `buffer_*` on buffer memory
 (`StorageBuffer`, `Uniform` before SPIR-V 1.3, or `PhysicalStorageBuffer` through a
-[physical pointer](types.md#pointers-on-spir-v)), `shared_*` on [`#[shared]`](#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
+[physical pointer](types.md#pointers-on-spir-v)), `shared_*` on [`#[gpu.shared]`](#gpuinputn--gpuoutputn--gpubuiltinstr--gpuuniformset-binding--gpustorageset-binding--gpusamplerset-binding--gpupush--gpuspecid--gpushared--shader-interface)
 workgroup memory, and `image_*` on a storage image texel (`Image`, through
 `OpImageTexelPointer`), where Vulkan defines only a 64-bit integer and an `f32`. Any
 other storage class is refused. An image of 64-bit texels (`R64ui` or `R64i`) declares
@@ -815,7 +819,7 @@ at the declaration rather than as an invalid module.
 | `OpImageDrefGather` | the result is a 4-vector of the image's texel scalar, and the reference is an `f32` scalar |
 | `OpImageWrite` | the texel is a scalar or vector of the image's texel scalar, with at least as many components as the image's format stores (any for `Unknown`) |
 | `OpImageTexelPointer` | the result points to the image's texel scalar, into a storage image of `R32ui`, `R32i`, `R32f`, `R64ui` or `R64i` format |
-| `OpSampledImage` | the result is a sampled image composed over the image operand's own type, and the second operand is a `sampler` |
+| `OpSampledImage` | the result is a sampled image composed over the image operand's own type, and the second operand is a `gpu.sampler` |
 | `OpGroupNonUniformBroadcast*`, `Shuffle*`, `Quad*` and the arithmetic rows | the result is the value operand's type |
 | the GLSL.std.450 math rows, float and integer | the result and every operand are the first operand's type, except `Refract`'s `eta`, and `Length` and `Distance`, whose result is a scalar |
 | `Modf` | the result is the value's type, and the out-pointer points to the value's type, where the whole part is stored |
@@ -824,11 +828,11 @@ at the declaration rather than as an invalid module.
 
 A relation on a pointer operand, such as the out-pointer `Modf` and `Frexp` store
 their second part through, holds the type it points to. The pointer may address a
-local, a `#[shared]` variable or a storage buffer, or any part of one, and the store
+local, a `#[gpu.shared]` variable or a storage buffer, or any part of one, and the store
 counts as a write to that binding, so a `readonly` one is refused.
 
 ```mach
-#[op("spirv", "GLSL.std.450", "Frexp")]
+#[intrinsic("spirv", "GLSL.std.450", "Frexp")]
 pub fun frexp(x: f32x4, exp: *i32x4) f32x4;
 ```
 
@@ -876,10 +880,10 @@ vertex or fragment stage, an operation or a subgroup built-in alike, also needs
 ```mach
 use std.types.bool.bool;
 
-#[op("spirv", "core", "OpGroupNonUniformBallot")]
+#[intrinsic("spirv", "core", "OpGroupNonUniformBallot")]
 pub fun subgroup_ballot(scope: u32, predicate: bool) u32x4;
 
-#[op("spirv", "core", "OpGroupNonUniformShuffleXor")]
+#[intrinsic("spirv", "core", "OpGroupNonUniformShuffleXor")]
 pub fun subgroup_shuffle_xor(scope: u32, v: u32, mask: u32) u32;
 ```
 

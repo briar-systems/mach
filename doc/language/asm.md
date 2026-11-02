@@ -232,7 +232,7 @@ The constant-time check treats `rsi` and `rdi` as addresses, so a secret in
 either is refused as one. A single step is a load or store and passes data
 through as `mov` does. A repeated one runs once per element and a compare also
 stops on its data, so its timing is its count and its contents. In an
-`#[oblivious]` function it is refused whenever it reads a secret: a secret
+`#[constant_time]` function it is refused whenever it reads a secret: a secret
 count, a secret value to store, or memory a pointer to a secret addresses. A
 public count storing public data is admitted even into secret memory, which is
 how a key buffer is cleared with `rep stosb`.
@@ -267,7 +267,7 @@ writes, and the constant-time check treats `fs:[rbx]` exactly as `[rbx]`. The
 language itself has no thread-local storage. These forms only let a block reach
 a base that something else set up.
 
-In an `#[oblivious]` function the constant-time check reads two facts off each
+In an `#[constant_time]` function the constant-time check reads two facts off each
 `{name}` binding: a pointer to a secret (`*^u32`) is a public address and a
 secret load, so `mov rax, {p}` then `mov ecx, [rax]` is admitted and `ecx` is a
 secret from then on, while a secret pointer (`^*u32`) is a secret address and is
@@ -350,12 +350,12 @@ Some instructions exist only on processors that implement an extension beyond
 the instruction set's baseline. Each such row names its extension, and the
 encoder refuses it unless the target selects that extension (the manifest's
 [`ext`](manifest.md#instruction-set-extensions) key) or the enclosing
-function admits it with [`#[ext(...)]`](decorators.md#extnames--an-outlier-function).
+function admits it with [`#[extension(...)]`](decorators.md#extnames--an-outlier-function).
 The refusal names the instruction, the extension, and both ways to admit it.
 
 The one invariant behind every check: **an instruction that requires extension E
 is emitted only into a function whose admitted set holds E**, where a function's
-admitted set is the target's selection plus what its `#[ext(...)]` names,
+admitted set is the target's selection plus what its `#[extension(...)]` names,
 each closed over what it implies. The encoder applies it to every row of an `asm`
 block, and the inliner applies the same predicate before moving one body into
 another, so an inlined body never carries an instruction its new home does not
@@ -409,7 +409,7 @@ The aes rounds and the carry-less multiplies are data-independent: Intel lists
 `pclmulqdq` among the instructions whose latency does not depend on their data
 operands, and Arm lists `aese`, `aesd`, `aesmc`, `aesimc`, `pmull` and `pmull2`
 among those whose timing is independent of their data under DIT. The
-constant-time check admits them in an `#[oblivious]` function the way it admits
+constant-time check admits them in an `#[constant_time]` function the way it admits
 the sha rows, and follows a secret through them, so what they compute from a
 secret is still a secret. On aarch64 `pmull` names its product `.1q` and its
 operands `.1d`, and `pmull2` reads the high halves at `.2d`. The `pmull` row
@@ -527,7 +527,7 @@ On aarch64 and riscv64 a statement must emit a whole number of instruction words
 instruction after it. x86-64 has no such constraint.
 
 A raw encoding is an instruction stream the parser cannot read, so by default the
-block's clobber set becomes **every register in every bank**, and an `#[oblivious]`
+block's clobber set becomes **every register in every bank**, and an `#[constant_time]`
 function may not contain one at all — which is why a real mnemonic is always preferable
 where one exists.
 
@@ -601,7 +601,7 @@ register your encoding overwrites. This is the one place in the inline-asm surfa
 correctness rests on the author. Declare what the instruction's manual says it writes,
 including any implicit destination, and prefer a real mnemonic whenever one exists.
 
-**A declaration buys allocation quality, not verification.** An `#[oblivious]` function
+**A declaration buys allocation quality, not verification.** An `#[constant_time]` function
 still refuses a data directive whether or not it is declared. A write set says which
 registers change; it says nothing about whether the encoding branches on a secret or
 divides in variable time, which is what that check exists to catch.

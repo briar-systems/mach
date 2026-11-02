@@ -9,8 +9,8 @@ are stdlib `def`s.
 
 | Family | Members |
 |---|---|
-| Unsigned int | `u8`, `u16`, `u32`, `u64`, `u128` |
-| Signed int | `i8`, `i16`, `i32`, `i64`, `i128` |
+| Unsigned int | `u8`, `u16`, `u32`, `u64`, `u128`, `u256`, `u512` |
+| Signed int | `i8`, `i16`, `i32`, `i64`, `i128`, `i256`, `i512` |
 | Float | `f16`, `f32`, `f64` |
 | Untyped pointer | `ptr` |
 
@@ -110,6 +110,24 @@ Three operations have a shape worth knowing:
 The secrecy page states which 128-bit operations a secret may reach
 ([secrecy.md](secrecy.md)); the calling conventions for `u128` and `i128`
 across an `ext fun` boundary are on [ext-fun.md](ext-fun.md).
+
+### 256 and 512-bit integers
+
+`u256`, `i256`, `u512` and `i512` are integers like the narrower widths: every
+operator applies at run time, and conversions to and from every other integer
+width follow the same rules. Size and alignment are mirl's layout of the width
+on the target, and code generation is mirl's legalisation of the width over
+the target's registers. A target whose layout holds no such width refuses the
+type where it is laid out.
+
+Constants at these widths are held in 128 bits for now (mach#4803 widens
+them):
+
+- No literal suffix names them, and a literal or constant of one of them
+  reaches what an `i128` holds, `-2^127` to `2^127 - 1`. It extends to the full
+  width by its sign.
+- Comptime evaluation reads a value of one of them as an untyped integer, exact
+  to 128 bits, with any overflow past that refused.
 
 There is no compiler `bool`. `bool` is a stdlib `def bool: u8;` with `true` /
 `false` as stdlib `val`s (`1` / `0`) — see [def.md](def.md).
@@ -368,7 +386,7 @@ The spirv `image` constructor takes the seven operands of `OpTypeImage` in its
 order: the texel scalar (`0` `f32`, `1` `i32`, `2` `u32`, `3` `i64`, `4` `u64`), `Dim`, `Depth`, `Arrayed`, `MS`, `Sampled` and the
 `Image Format`. The format is required, and `0` (`Unknown`) is the usual choice for
 a sampled image. `Sampled` `1` is an image read through a sampler and `2` a storage
-image, read and written directly and bound through `#[storage]` (see
+image, read and written directly and bound through `#[gpu.storage]` (see
 [decorators.md](decorators.md)). A storage image of a known format needs no device
 feature to read or write, and a format other than `Rgba32f`, `Rgba16f`, `R32f`,
 `Rgba8`, `Rgba8Snorm` and the `Rgba32`, `Rgba16`, `Rgba8` and `R32` integer forms
@@ -444,7 +462,7 @@ naming the operand rather than the declaration. The SPIR-V target refuses a
 other than `Buffer`, and a `Sampled` other than `1` or `2`, each with what SPIR-V
 would need instead.
 
-See [decorators.md](decorators.md) for `#[handle]` and `#[sampler(set, binding)]`,
+See [decorators.md](decorators.md) for `#[handle]` and `#[gpu.sampler(set, binding)]`,
 and the shader library for the handles a SPIR-V target declares.
 
 ## ABI types
@@ -526,10 +544,10 @@ the storage class of every pointer on that target.
 ```mach fragment
 rec Node { next: *Node; value: u32; }
 rec Head { first: *Node; total: u32; }
-#[storage(0, 0)] var head: Head;
+#[gpu.storage(0, 0)] var head: Head;
 
-#[stage("compute")]
-#[workgroup(1, 1, 1)]
+#[gpu.stage("compute")]
+#[gpu.workgroup(1, 1, 1)]
 fun walk() {
     var p:   *Node = head.first;
     var sum: u32   = 0;
@@ -544,7 +562,7 @@ fun walk() {
 A physical pointer is a full `*T`. It is dereferenced, indexed, stepped (`?p[i]`),
 compared, ordered as an unsigned 64-bit address and cast to and from `u64`, and it
 can be held in memory, passed and returned. Its pointee is laid out by the std430
-rules a `#[storage]` block follows (see [decorators.md](decorators.md)), refused
+rules a `#[gpu.storage]` block follows (see [decorators.md](decorators.md)), refused
 where mach's layout disagrees with them. A record that reaches itself through
 pointers, like `Node` above, is a recursive type, and so is a set of records that
 reach each other. A tag cannot sit behind a physical pointer.
