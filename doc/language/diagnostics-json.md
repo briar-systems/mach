@@ -282,7 +282,7 @@ named by it, as its step finishes:
 
 | Member | Type | Meaning |
 |---|---|---|
-| `counter` | string | the counter's label: `functions`, `ir instrs`, `verify runs`, `heap blocks`, `heap bytes`, `heap peak` |
+| `counter` | string | the counter's label: `functions`, `ir instrs`, `verify runs`, `allocated blocks`, `allocated bytes`, `heap peak` |
 | `name` | string | the module, absent for the unit's total |
 | `value` | integer | its value; a total is the sum over modules, and for `heap peak` the most any module reached |
 
