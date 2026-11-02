@@ -4,7 +4,7 @@
 Sema tracks secrecy as an information-flow discipline: secret data may move and
 be stored, but it may never reach a position a classical leakage model observes
 (a branch, a memory address, a variable-latency instruction). This page covers
-the flow-typing rules and the `#[oblivious]` codegen contract. The grammar lives
+the flow-typing rules and the `#[constant_time]` codegen contract. The grammar lives
 in [grammar.md](grammar.md); the decorator reference is in
 [decorators.md](decorators.md).
 
@@ -46,7 +46,7 @@ arithmetic, bitwise, shift, and comparison operators, and through a value read
 out of a secret container:
 
 ```mach
-#[oblivious]
+#[constant_time("hard")]
 fun mix(a: ^u32, b: u32) ^u32 {
     ret a + b; # ^u32 + u32 -> ^u32
 }
@@ -456,7 +456,7 @@ Three deliberate decisions:
   one unsigned integer compare of pointer width, data-independent on every
   supported target. There is no secret operand for the leakage model to track.
 
-Inside a `#[oblivious]` function this needs no exception. The result of ordering
+Inside a `#[constant_time]` function this needs no exception. The result of ordering
 two public addresses is public, so it may steer a branch there like any other
 public condition. The gates are unchanged where the *pointer itself* is the
 secret: a `^*T` is a secret value, the order of two of them is secret, and that
@@ -465,7 +465,7 @@ secret: a `^*T` is a secret value, the order of two of them is secret, and that
 ```mach error secret value used as a branch condition
 use std.types.bool.bool;
 
-#[oblivious]
+#[constant_time("hard")]
 fun before(a: *^u8, b: *^u8) bool {
     ret a < b; # public addresses, public bool
 }
@@ -476,9 +476,9 @@ fun leak(a: ^*u8, b: ^*u8) u8 {
 }
 ```
 
-## `#[oblivious]` — the codegen contract
+## `#[constant_time]` — the codegen contract
 
-The flow typing constrains the *source*; `#[oblivious]` carries the obligation
+The flow typing constrains the *source*; `#[constant_time]` carries the obligation
 through *codegen*. Inside a function carrying it, the backend must not introduce
 a secret-dependent branch or select a variable-latency instruction on a secret
 operand.
@@ -581,7 +581,7 @@ carry no divide, multiply or float instruction at all, so it reaches only their
 register-count shifts. riscv64's grammar admits the whole M-extension, so on that
 target the check is substantive.
 
-`#[oblivious]` remains a **per-function** contract. A call out to a non-oblivious
+`#[constant_time]` remains a **per-function** contract. A call out to a non-oblivious
 function is not validated — that is the boundary the decorator draws, not a hole in
 it, and it applies to a callee containing `asm` exactly as it applies to any other.
 
@@ -593,13 +593,13 @@ clone, instruction selection, and register-allocator copy. The one place taint
 stops is the declassify barrier a `:>T` cast lowers to. Secret-free code carries
 no taint and compiles byte-identically.
 
-A function instance that **computes** on a secret must carry `#[oblivious]`; one
+A function instance that **computes** on a secret must carry `#[constant_time]`; one
 that only moves, stores, or declassifies secrets is transparent and stays
 annotation-free. The check runs per monomorphized instance, so a generic
 instantiated at a secret type is held to the concrete type's rules.
 
 ```mach
-#[oblivious]
+#[constant_time("hard")]
 fun ct_select(mask: ^u32, a: ^u32, b: ^u32) ^u32 {
     ret (a & mask) | (b & ~mask);
 }
@@ -615,7 +615,7 @@ gates, not a replacement for them.
 ## The zeroizing-write guarantee
 
 Wiping a secret is only useful if the wipe survives to run. That guarantee exists,
-but it is **not** provided by `#[oblivious]`, and it is scoped more broadly than the
+but it is **not** provided by `#[constant_time]`, and it is scoped more broadly than the
 decorator is.
 
 A store into secret storage is tainted at lowering, from two composing sources: the
@@ -649,7 +649,7 @@ var x: ^u8 = k;
 x = 0;          # NOT guaranteed: `x` may never have been in memory
 ```
 
-Adding `#[oblivious]` does not change this — the wipe is outside the memory-address
+Adding `#[constant_time]` does not change this — the wipe is outside the memory-address
 leakage model rather than an exception within it. To wipe reliably, write through a
 pointer whose target is memory the compiler cannot promote away, which is what the
 standard library's `zeroize` does. Settled: the wipe guarantee is memory-scoped; secret register lifetimes are outside
@@ -661,7 +661,7 @@ release. The guarantee becomes load-bearing only if such a pass is added, and th
 taint is what would hold that pass to it. `mach.lang.driver:secret_store_taint_survives_lower`
 pins the taint.
 
-What a target offers is read at the `#[oblivious]` mark from masc's instruction
+What a target offers is read at the `#[constant_time]` mark from masc's instruction
 set for the target's architecture, which says whether its rows classify their
 timing, whether it cannot guarantee timing at all, or whether it classifies none:
 
@@ -884,7 +884,7 @@ addresses, including past a narrowed pointer cast, is outside the guarantee, the
 same as any other out-of-bounds access.
 
 What holds today: the type system checks that the source respects the leakage
-model, `#[oblivious]` carries the obligation through codegen, and the translation
+model, `#[constant_time]` carries the obligation through codegen, and the translation
 validator independently re-checks the lowered MIR. All three are static. Two
 host-executed measurements sit under them, and each only means anything on the
 machine it runs on, which is why both are unit tests rather than build checks.
@@ -932,7 +932,7 @@ sampled at a comparable cost to the probe it is bounding, or a quiet control at 
 magnitude certifies nothing about noise at another.
 
 **The x86-64 inline-asm flags table is measured, not inferred.** The twenty-two-row
-classification the `#[oblivious]` asm model rests on, naming which instructions
+classification the `#[constant_time]` asm model rests on, naming which instructions
 *define* ZF and CF, which merely write them, and which read them, is re-derived on x86-64
 hosts by `mach.lang.target.isa.x64.probe`, which runs each instruction twice with
 RFLAGS preset all-set and all-clear and compares what the CPU did against the
@@ -992,5 +992,5 @@ is refused rather than assumed.
 - [tag.md](tag.md) - tagged values and outer-secret ^Tag rules
 - [comptime-intrinsics.md](comptime-intrinsics.md) - $is_secret, $holds_secret and the rest of the type-predicate family
 - [operators.md](operators.md) - the :: / :~ casts that preserve secrecy and :>T
-- [decorators.md](decorators.md) - the #[oblivious] decorator reference
+- [decorators.md](decorators.md) - the #[constant_time] decorator reference
 - [grammar.md](grammar.md) - the formal grammar of ^ and :>T

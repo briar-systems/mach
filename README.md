@@ -96,7 +96,7 @@ pub fun halt() {
 **Constant-time cryptography** (experimental preview). Mark a value [secret](doc/language/secrecy.md) and the compiler refuses to let it steer a branch, an index or a timing. Constant-time code, checked instead of hoped for.
 
 ```mach
-#[oblivious]
+#[constant_time("hard")]
 fun check(mac: ^u64, want: ^u64) bool {
     if (mac == want) {
         ret true;
@@ -113,14 +113,14 @@ error[secret.branch]: secret value used as a branch condition
 **GPU compute and shaders.** Vertex, fragment and compute stages are Mach functions. A `spirv` target compiles them straight to a finished SPIR-V module a Vulkan driver loads, with no shading language on the side and no second toolchain. See [shaders](https://machlang.org/docs/shaders.html).
 
 ```mach
-#[storage(0, 0)]
+#[gpu.storage(0, 0)]
 var particles: Particles;
 
-#[builtin("global_invocation")]
+#[gpu.builtin("global_invocation")]
 var global_id: u32x3;
 
-#[stage("compute")]
-#[workgroup(64, 1, 1)]
+#[gpu.stage("compute")]
+#[gpu.workgroup(64, 1, 1)]
 fun step() {
     val i: u32 = global_id[0];
     particles.position[i] = particles.position[i] + particles.velocity[i];

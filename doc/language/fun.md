@@ -217,7 +217,7 @@ chain of such calls, mutual recursion included, also runs in constant stack.
 
 A call stays a call when the function has a `fin` pending at the `ret`, when
 the address of one of its locals escapes (to the callee or to any earlier
-call), when it runs inline assembly or is `#[naked]` or `#[oblivious]`, when a
+call), when it runs inline assembly or is `#[naked]` or `#[constant_time]`, when a
 by-value argument is a copy the caller has to make, or when the callee takes
 more stack arguments than the caller received. A build with `optimize = false`
 makes no tail calls, and neither does one that skips the `tailrec` and `tailcall`

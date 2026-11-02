@@ -168,7 +168,8 @@ digit, otherwise it lexes as a separate `.` token (so `1.field` is
 
 ```ebnf
 LIT_CHAR ::= "'" char-body "'"
-LIT_STR  ::= '"' { str-char } '"'
+LIT_STR  ::= '"' { str-char } '"' | ml-line { newline { " " | "\t" } ml-line }
+ml-line  ::= "\\" { any-char-except-newline }   (* "\\" is two backslash characters *)
 ```
 
 The lexer captures the raw span between the quotes and treats `\` as an
@@ -183,9 +184,13 @@ escapes are:
 escapes:  \n  \t  \r  \\  \'  \"  \0  \xHH
 ```
 
-A string literal is single-line (see [literals.md](literals.md)): the lexer
+A quoted string literal is single-line (see [literals.md](literals.md)): the lexer
 scans from the opening `"` to the next unescaped `"`, stopping at an
-unescaped newline or EOF. A char literal scans likewise to the next `'`. An
+unescaped newline or EOF. A multiline string is one token from its first
+`\\` through the end of the last line whose first text is `\\`. Its value is
+each line's text after its `\\`, read with no escapes, the lines joined by
+`\n` with none after the last. A line break of `\r\n` joins as `\n`, and a line
+that starts otherwise, a blank line or a comment, ends the token. A char literal scans likewise to the next `'`. An
 unterminated `'` or `"` (the scan hits a newline or EOF first) is a lexer
 error but still produces a token span covering the rest of that line.
 
@@ -231,14 +236,19 @@ declaration. Each clause is a decorator name, optionally followed by a
 parenthesized argument list of comptime expressions.
 
 ```ebnf
-decorator      ::= "#[" IDENT [ "(" [ expr { "," expr } [ "," ] ] ")" ] "]"
+decorator      ::= "#[" decorator-name [ "(" [ expr { "," expr } [ "," ] ] ")" ] "]"
+decorator-name ::= IDENT [ "." IDENT ]   (* no space around the "." *)
 decorated-decl ::= { decorator } decl
 ```
 
 - Decorators attach to the **immediately following** declaration and do not
   bleed across declarations.
 - Clauses may appear on the same line (space-separated) or one per line.
-- The argument list is optional; a bare `#[inline]` carries no arguments.
+- The argument list is optional; a bare `#[naked]` carries no arguments.
+- A dotted name is one name only where nothing stands between its words, as in
+  `#[gpu.stage("compute")]`. Only the GPU set is dotted.
+- Every argument is a constant expression: a number is an integer, and every
+  name, mode or path is a string. No decorator takes a bare word.
 - Arguments are comptime expressions (not types): `$size_of(T)` is a valid
   argument; `T` as a raw type name is not. A layout intrinsic is accepted on both
   a global's `align` and a record/union type's, see [decorators.md](decorators.md).

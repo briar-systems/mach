@@ -68,7 +68,7 @@ substitutes a slower or leakier path.
 - **The compiler owns the decision.** Each instruction set declares the
   multiply cells it can execute in data-independent time and the condition
   each holds under (always, PSTATE.DIT on, or extensions selected), and the
-  lowering gate, the `#[oblivious]` validators and `$mach.build.ct_mul` read
+  lowering gate, the `#[constant_time]` validators and `$mach.build.ct_mul` read
   one admission function over those rows. An undeclared cell, an unmet
   condition or an operating system that declares no guarantee for the mode
   is a compile error naming what is missing. The compiler never emits a
