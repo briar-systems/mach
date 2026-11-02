@@ -1524,17 +1524,17 @@ C-binding project declares them once.
 A symbol may be claimed only once per link: two selected entries claiming it, or a
 claim contradicting a `#[library]` decorator, is an error naming both claimants
 rather than an order-dependent win — repeating the *same* claim is fine. Listing a
-symbol twice within one entry is rejected, and so is a claim on an entry that
-resolves to a **static** input, which defines symbols rather than importing them.
+symbol twice within one entry is rejected.
 On ELF the key is accepted and validated but changes no emitted bytes, since that
 loader resolves imports by global search.
 
-Whether an input links **statically** or **dynamically** follows the resolved file
-— a loose `.o`/`.obj` or static `.a`/`.lib` links statically; ELF `.so`, Mach-O `.dylib`,
-and PE `.dll` inputs are recorded using their format's canonical loader name.
-An `@rpath/` Mach-O install name also retains the directory where resolution found
-the dylib, which the executable records as `LC_RPATH`. Darwin frameworks use a
-version-independent system framework path. See
+A `system` or `framework` entry is found by name through mink's library search
+as the link runs, the archive first, in each `-L` directory, then the working
+directory, then the system's directories the target's host row states. A `local`
+entry names its file. Whether an input links **statically** or **dynamically**
+follows the file found — a loose `.o`/`.obj` or static `.a`/`.lib` links
+statically, and an ELF `.so`, Mach-O `.dylib` or PE `.dll` is recorded by its
+format's canonical loader name. See
 [ext-fun.md](ext-fun.md#linking-external-objects) for the `ext fun` workflow
 that consumes these inputs.
 
