@@ -63,7 +63,7 @@ val TRACING: u64 = $mach.build.TRACING;
 
 The one call-shaped fact. It folds to 1 exactly when the selected target admits
 a secret-operand multiply of that cell, and to 0 otherwise. The answer comes from
-the same decision the lowering gate and the `#[oblivious]` validators make, so a
+the same decision the lowering gate and the `#[constant_time]` validators make, so a
 library can choose its hardware or bit-serial path without keeping a per-target
 list:
 
@@ -154,7 +154,7 @@ In an editor union build each target tuple answers for its own target, as
 
 The member answers for the whole build. A function that uses an extension the target
 does not select, behind a run-time check, is marked
-[`#[ext(...)]`](decorators.md#extnames--an-outlier-function) instead,
+[`#[extension(...)]`](decorators.md#extnames--an-outlier-function) instead,
 and the member stays 0 for it.
 
 ### `$mach.version` — the compiler version

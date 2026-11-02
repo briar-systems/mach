@@ -150,8 +150,25 @@ val msg: *u8 = "hello, mach\n";
 
 String escapes: the same set.
 
-A string literal is a single line. There is no multi-line string syntax —
-long content uses `\n` escapes or lives in external files.
+A quoted string literal is a single line. Text of several lines is a
+**multiline string**: each line starts with `\\`, and the lines join with `\n`.
+
+```mach
+val usage: *u8 =
+    \\usage: tool [options] <file>
+    \\  -v  print each step
+;
+```
+
+- The text of a line is every byte after its `\\` up to the line's end, as
+  written. Nothing in it is an escape, and a `"` or a `#` in it is text.
+- The last line adds no newline. End with a bare `\\` line for one.
+- A line that starts with anything other than `\\` ends the string, so a blank
+  line or a comment does. The `;` or `,` after a multiline string goes on the
+  next line, since a line's text runs to its end.
+- A CRLF line break joins as `\n`.
+- `mach fmt` indents each line, and keeps the bytes after each `\\` as written,
+  trailing whitespace included.
 
 ## `nil`
 

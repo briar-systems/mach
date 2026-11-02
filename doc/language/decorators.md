@@ -5,16 +5,22 @@ notices or influence how the compiler emits the symbol: its linker name,
 alignment, section placement, inlining, dynamic import attribution, constant-time
 obligations, or exclusion from auto-vectorization.
 
-Visibility (`pub` / `ext`) is separate and unaffected by decorators.
+Visibility (`pub` / `ext`) is separate. `#[export]` builds on `pub` and never
+replaces it.
 
 ## Surface
 
 A decorator is written as `#[...]`:
 
 ```
-#[<name>]          # bare flag (e.g. inline)
-#[<name>(args)]    # decorator with comptime-expr arguments
+#[<name>]          # bare flag (e.g. naked)
+#[<name>(args)]    # decorator with constant arguments
+#[gpu.<name>(..)]  # a decorator of the GPU set
 ```
+
+Every name is lowercase, with `snake_case` where it is several words. Only the
+GPU set is dotted: it is a large domain that applies only to shader stages and
+uses generic words such as `input` and `shared`.
 
 > `#[...]` is the only decorator surface. A backtick is not a token: one
 > anywhere in source is a lexer error.
@@ -32,34 +38,37 @@ A decorator is written as `#[...]`:
 #[expect("key", ..)] # acknowledge the named warnings inside this declaration
 #[symbol("name")]    # linker name override
 #[library("dep")]    # dynamic import attribution (ext only)
-#[inline]            # force inlining (no arguments)
-#[noinline]          # forbid inlining (no arguments)
+#[export]            # export from a shared library (pub only)
+#[inline("always")]  # force inlining
+#[inline("never")]   # forbid inlining
 #[align(expr)]       # alignment; expr is a comptime integer
 #[packed]            # lay a rec / uni / tag out with no padding (no arguments)
 #[volatile]          # every access to a rec / uni / tag is a volatile access (no arguments)
 #[section(".name")]  # place in a named object section
-#[oblivious]         # constant-time boundary (no arguments)
-#[scalar]            # opt out of auto-vectorization (no arguments)
+#[at(offset)]        # place at an offset in a flat bare-metal image
+#[thread]            # one copy of a module var per thread (no arguments)
+#[constant_time("soft")] # constant-time boundary; the mode is "soft" or "hard"
+#[vectorize("never")] # opt out of auto-vectorization
 #[naked]             # no prologue or epilogue; body as written (no arguments)
-#[ext(a, b)]         # the function may use these instruction-set extensions
+#[extension("a", "b")] # the function may use these instruction-set extensions
 #[embed("path")]     # compile-time file embedding (val only)
-#[stage("name")]     # GPU pipeline stage; makes the function an entry point
-#[workgroup(x,y,z)]  # compute workgroup dimensions, constants or #[spec] vars (with #[stage("compute")])
-#[input(n)]          # shader interface input at location n (global only)
-#[output(n)]         # shader interface output at location n (global only)
-#[builtin("name")]   # pipeline built-in variable (global only)
-#[uniform(set, bnd)] # descriptor-bound uniform block, read-only (global only)
-#[storage(set, bnd)] # descriptor-bound storage buffer, read-write (global only)
-#[storage(set, bnd, "readonly")] # the same buffer, with writes refused
-#[storage(set, bnd, "writeonly")] # the same buffer, with reads refused
-#[storage(set, bnd, "coherent")] # the same buffer, its writes visible across workgroups
-#[sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
-#[push]              # push-constant block, read-only (global only)
-#[spec(id)]          # specialization constant the host supplies (module var only)
-#[shared]            # compute workgroup memory, zero when a stage starts (global only)
-#[op(tgt,set,name)]   # the target instruction this function is (bodyless fun only)
+#[intrinsic(tgt,set,name)] # the target instruction this function is (bodyless fun only)
 #[handle(tgt,ctor,..)] # the target type this declares (bodyless def only)
 #[abi_type("name")]   # a C type whose layout the target declares (bodyless def only)
+#[gpu.stage("name")]     # GPU pipeline stage; makes the function an entry point
+#[gpu.workgroup(x,y,z)]  # compute workgroup dimensions, constants or #[gpu.spec] vars (with #[gpu.stage("compute")])
+#[gpu.input(n)]          # shader interface input at location n (global only)
+#[gpu.output(n)]         # shader interface output at location n (global only)
+#[gpu.builtin("name")]   # pipeline built-in variable (global only)
+#[gpu.uniform(set, bnd)] # descriptor-bound uniform block, read-only (global only)
+#[gpu.storage(set, bnd)] # descriptor-bound storage buffer, read-write (global only)
+#[gpu.storage(set, bnd, "readonly")] # the same buffer, with writes refused
+#[gpu.storage(set, bnd, "writeonly")] # the same buffer, with reads refused
+#[gpu.storage(set, bnd, "coherent")] # the same buffer, its writes visible across workgroups
+#[gpu.sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
+#[gpu.push]              # push-constant block, read-only (global only)
+#[gpu.spec(id)]          # specialization constant the host supplies (module var only)
+#[gpu.shared]            # compute workgroup memory, zero when a stage starts (global only)
 ```
 
 Decorators appear **before** the declaration they target, one per line or
@@ -67,7 +76,7 @@ space-separated on the same line. They attach to the immediately following
 declaration only and do not bleed across declarations.
 
 ```mach fragment
-#[inline]
+#[inline("always")]
 #[symbol("big")]
 fun big(a: i64, b: i64) i64 { ... }
 
@@ -76,8 +85,10 @@ pub var g_lit64: u8 = 7;
 ```
 
 Each decorator is wrapped in its own clause: `#[<name>]` for a bare flag or
-`#[<name>(args)]` for a decorator that takes arguments. Arguments are comptime
-expressions.
+`#[<name>(args)]` for a decorator that takes arguments. Every argument is a
+constant expression: a number is an integer, and every name, mode or path is a
+string. No decorator takes a bare word. A mode is an argument of one
+decorator, never a sibling decorator: `inline("never")`, not `noinline`.
 
 ### Constant arguments
 
@@ -346,11 +357,14 @@ ext fun wsa_startup(ver: u16, data: *u8) i32;
 - `library` composes with `symbol`: the import is emitted under the renamed
   symbol within the named dependency.
 
-### `inline` — force inlining
+### `inline(mode)` — force or forbid inlining
 
-Marks a function for inlining at every direct call site, overriding the
-compiler's size and use-count heuristics and exempt from the caller's expansion
-budget. Applies to functions only and takes no arguments. The optimization
+Takes one mode, `"always"` or `"never"`, and applies to functions only. It may
+stand once on a function, so the two modes never meet.
+
+`inline("always")` marks a function for inlining at every direct call site,
+overriding the compiler's size and use-count heuristics and exempt from the
+caller's expansion budget. The optimization
 pipeline must enable inlining. Indirect calls and recursive call cycles are not
 expanded by this decorator. Taking a function's address retains its callable
 identity even when direct calls are inlined.
@@ -363,10 +377,10 @@ have a limit of 1024 copied IR instructions and 256 KiB of owned payload. An
 `inline` function is expanded at every direct call site in the same module
 without charging that budget, so the outcome never depends on what else the
 caller expanded first; across modules it is imported within the extraction and
-import limits like any other body. An
-`oblivious` function is expanded only into another `oblivious` function, so
+import limits like any other body. A
+`constant_time` function is expanded only into another `constant_time` function, so
 its instructions never leave a constant-time validated body; a `naked` or
-`noinline` function, a recursive cycle and an indirect call are never expanded.
+`inline("never")` function, a recursive cycle and an indirect call are never expanded.
 A remaining call or taken address still names the original defining function.
 Generic, comptime and pack specializations keep their existing shared weak
 linkage. When several modules materialize that same specialization, body import
@@ -377,20 +391,17 @@ objects have module-local identity. Named globals keep their original symbols,
 and copied instructions preserve effects, assembly bindings and debug locations.
 
 ```mach
-#[inline]
+#[inline("always")]
 fun fast_path(x: i64) i64 {
     ret x * 2;
 }
 ```
 
-### `noinline` — forbid inlining
-
-The inverse of `inline`: forbids inlining a function into any caller, overriding
-the compiler's size- and use-count heuristics that would otherwise fold it in.
-Applies to functions only; takes no arguments.
+`inline("never")` forbids inlining a function into any caller, overriding the
+compiler's size- and use-count heuristics that would otherwise fold it in.
 
 ```mach
-#[noinline]
+#[inline("never")]
 fun cold_path(code: i64) i64 {
     ret code * 100;
 }
@@ -400,20 +411,23 @@ Use it to keep a function's frame and symbol real — for a profiler or stack
 sampler to attribute its cost correctly, to keep a cold path from bloating a hot
 caller's instruction cache, or to hold code size down on a constrained target.
 
-- `inline` and `noinline` on the same function is a direct contradiction and is
-  rejected in sema; neither wins silently.
-- `scalar` already declines inlining as a side effect, so pairing it
-  with `noinline` is legal but redundant.
+- A second `inline` on the same function is refused with `decorator.duplicate`,
+  so `"always"` and `"never"` never contradict each other.
+- `vectorize("never")` already declines inlining as a side effect, so pairing it
+  with `inline("never")` is legal but redundant.
 - Purely a hint to the inliner; it does not otherwise change codegen. It binds
   at every optimization level — the debug pipeline runs no inlining pass at
-  all, so `noinline` is inert (and unnecessary) there — and it will bind
+  all, so `inline("never")` is inert (and unnecessary) there — and it will bind
   identically when a callee body is available from another module. Recursive
-  peeling also respects `noinline` and `scalar`.
+  peeling also respects `inline("never")` and `vectorize("never")`.
+- v6's bare `#[inline]` is `#[inline("always")]`, and its `#[noinline]` is
+  `#[inline("never")]`. Each v6 spelling warns, naming its replacement (see
+  [v6 spellings](#v6-spellings)).
 
 ### `align(expr)` — alignment override
 
 Sets the alignment of a global variable, a record/union type, or a function's
-entry. `expr` must
+entry, which the object places at that boundary. `expr` must
 be a comptime integer — either a literal or a comptime expression such as
 `$size_of(T)` or `$align_of(T)`, in both positions.
 
@@ -580,7 +594,7 @@ disagree (`f32x3`, `f32x5`), so its footprint depends on its lane count through
 aggregate layout and ABI classification. Store the lanes as scalar fields, or drop
 `#[packed]` from the record.
 
-**Interface blocks.** `packed` cannot apply to a `#[uniform]`, `#[storage]` or `#[push]` block:
+**Interface blocks.** `packed` cannot apply to a `#[gpu.uniform]`, `#[gpu.storage]` or `#[gpu.push]` block:
 its member offsets are fixed by the std140 / std430 layout rules and emitted as
 explicit SPIR-V `Offset` decorations, which packing would contradict.
 
@@ -670,13 +684,60 @@ pub var g_sec: u64 = 100;
 ```
 
 The named section is created if absent, and the globals of one object that
-name it share that one section, each at its own aligned offset. Cross-section
-calls and accesses use ordinary relocations.
+name it share that one section, each at its own aligned offset. A function's
+section holds code, a `var`'s writable data, a `val`'s read-only data and a
+`#[thread]` var's thread-local template. Cross-section calls and accesses use
+ordinary relocations.
 
-### `oblivious` — constant-time boundary
+### `at(offset)` — placement in a flat image
 
-Marks a function as a constant-time boundary. Applies to functions only; takes
-no arguments. Inside it the backend must not introduce a secret-dependent
+Places a function or global at an integer offset in a flat bare-metal image.
+The name and its argument are fixed. Placement itself belongs to the bare-metal
+image work (mach#4890), and until it lands the decorator is refused where it is
+written.
+
+### `export` — a shared library's export
+
+Exports a function or global from a shared library under its symbol name. It
+requires `pub` and is refused with `decorator.requires` on a declaration that is
+not `pub`, and with `decorator.misplaced` on an `ext` declaration, which another
+image defines. `pub` alone states a module's interface to other Mach modules and
+never exports. Takes no arguments, and `#[testing]` cannot combine with it.
+
+```mach fragment
+#[export]
+pub fun version() u32 { ... }
+```
+
+### `thread` — a thread-local module var
+
+Gives each thread its own copy of a module-level `var`. Applies to a `var`
+only. Its initializer is a constant, as every module binding's is, and it is
+the template each thread's copy starts from. Nothing runs when a thread exits.
+
+```mach fragment
+#[thread]
+var depth: u32 = 0;
+```
+
+- An executable reaches its thread-locals at offsets its link fixes, the
+  local-exec model. A shared library reaches them at offsets its loader fixes
+  when the process starts, the initial-exec model, and a `pub` one is exported
+  with the library. General-dynamic access is never lowered, so a library that
+  uses thread-locals and is opened with `dlopen` after start draws on the
+  loader's small static thread-local reserve, and a loader that has none left
+  refuses to open it.
+- A thread-local an `ext` declaration names may live in another image, so it is
+  reached as a library's is.
+- The address of a thread-local is no constant, since each thread holds its
+  copy at its own address. A module binding whose initializer takes one is
+  refused with `address.thread_local`.
+- A shader interface role and `thread` are refused together.
+
+### `constant_time(mode)` — constant-time boundary
+
+Marks a function as a constant-time boundary. Applies to functions only, and
+takes one mode, `"soft"` or `"hard"`, which is required. Inside it the backend must not introduce a secret-dependent
 branch or select a variable-latency instruction on a secret operand; a
 translation validator re-derives the secret taint over the lowered MIR and
 rejects any such leak.
@@ -684,18 +745,18 @@ rejects any such leak.
 Inline `asm` inside such a function is **validated rather than rejected**: the
 block is parsed and walked for the same leaks, and refused only where a leak is
 found or where the construct cannot be modelled. See
-[secrecy.md](secrecy.md#oblivious--the-codegen-contract) for what is checked and
+[secrecy.md](secrecy.md#constant_time--the-codegen-contract) for what is checked and
 what is refused, including the x86-64 conditional-branch limitation.
 
 The **zeroizing-write** guarantee is *not* one of the decorator's obligations,
 and describing it as one understates it. A write into secret storage carries a
 taint applied at lowering, keyed on the storage's secrecy rather than on any
 decorator, so a zeroizing wipe is protected in a function carrying no
-`#[oblivious]` at all. See [secrecy.md](secrecy.md#the-zeroizing-write-guarantee)
+`#[constant_time]` at all. See [secrecy.md](secrecy.md#the-zeroizing-write-guarantee)
 for what that covers and what it does not.
 
 ```mach fragment
-#[oblivious]
+#[constant_time("hard")]
 fun ct_eq(a: ^[8]u8, b: ^[8]u8) u8 { ... }
 ```
 
@@ -708,22 +769,26 @@ It is rejected outright for a target whose back half emits a module for a
 downstream compiler rather than the executed instructions (the experimental
 SPIR-V backend): the contract cannot be validated or upheld there.
 
+v6 spelled it `#[oblivious]`, which warns naming `constant_time` and its two
+modes (see [v6 spellings](#v6-spellings)).
+
 > **Experimental preview.** The constant-time guarantee is not complete and has
 > not been audited — see [secrecy.md](secrecy.md#assurance) for the known open
 > holes. Do not build production cryptography on it at this version.
 
-### `scalar` — opt out of auto-vectorization
+### `vectorize("never")` — opt out of auto-vectorization
 
 Excludes a function from loop auto-vectorization, so its loops compile to scalar
 code even in the release pipeline on a vector-capable target. Applies to
-functions only; takes no arguments.
+functions only, and takes one mode, `"never"`. v6 spelled it `#[scalar]`, which
+warns naming its replacement.
 
 ```mach fragment
-#[scalar]
+#[vectorize("never")]
 fun reference_sum(a: *i64, n: usize) i64 { ... }
 ```
 
-A `#[scalar]` function is also declined by the inliner, so the opt-out survives
+A `#[vectorize("never")]` function is also declined by the inliner, so the opt-out survives
 inlining — it cannot be lost by the body moving into an unflagged caller. Use it
 for a scalar reference twin in a differential test, or where vectorized codegen
 is undesirable for a specific function. The project-wide equivalent is the
@@ -767,11 +832,11 @@ a thread entry point whose register state at entry *is* the interface.
 - **Parameters and the return type are still checked** at every call site, so a
   naked function is called like any other. No moves are emitted for them: the
   arguments arrive in the ABI's registers and the body reads them there.
-- **Mutually exclusive with `inline`** — there is no coherent winner between a
-  body spliced into a caller and one that owns its own frame — and with
-  `oblivious`, which already forbids inline asm because a type system cannot
-  check it. Both combinations are rejected in sema. `noinline` is redundant: the
-  inliner declines a naked function unconditionally.
+- **Mutually exclusive with `inline("always")`** — there is no coherent winner
+  between a body spliced into a caller and one that owns its own frame — and
+  with `constant_time`, which already forbids inline asm because a type system
+  cannot check it. Both combinations are rejected in sema. `inline("never")` is
+  redundant: the inliner declines a naked function unconditionally.
 - **Debug info carries no `DW_AT_frame_base`** for a naked subprogram. Every
   other function has a frame base the compiler established and can name; this
   one does not, so it declares none rather than pointing at a register the asm
@@ -786,15 +851,16 @@ also makes a call gets one, since an unaligned call boundary (x86-64) or a
 clobbered link register (aarch64, riscv64) is not something the author asked
 for by writing assembly.
 
-### `ext(names)` — an outlier function
+### `extension(names)` — an outlier function
 
 Lets one function use instruction-set extensions the target does not select.
-Applies to a function with a body; takes one or more bare extension names. v6
-named it `extensions`, which is refused naming `ext` and which `mach migrate`
-rewrites.
+Applies to a function with a body, once, and takes one or more extension names,
+each a string. v6 wrote `#[ext(sha)]` and `#[extensions(sha)]` with bare names,
+which warn naming `#[extension("sha")]`. The manifest's `ext` key and
+`$mach.build.ext` keep their names.
 
 ```mach fragment
-#[ext(sha, ssse3)]
+#[extension("sha", "ssse3")]
 fun compress_sha_ni(state: *[8]u32, block: *[64]u8) {
     asm x86_64 {
         # sha256msg1, sha256rnds2, pshufb, ...
@@ -822,7 +888,7 @@ processor's features and when that answer holds.
   the names the compiler emits against. A name a catalog holds that the compiler
   emits nothing against, or that another instruction set declares, admits
   nothing on this target and is not an error, so one
-  declaration serves a multi-arch source: `#[ext(sse41, sha2)]` admits
+  declaration serves a multi-arch source: `#[extension("sse41", "sha2")]` admits
   `sse41` on x86_64 and `sha2` on aarch64, and an `asm aarch64 {}` block in an
   x86_64 build still refuses `sha256h` because the tag, not the decorator, picks
   the isa. Each name may appear once. The names are those the manifest's
@@ -843,12 +909,12 @@ processor's features and when that answer holds.
 - **It is never inlined into a caller that admits less.** The inliner declines
   to move an outlier's body into a function whose admitted set does not hold
   every extension the outlier's does, so the extension instructions stay behind
-  the call the run-time check guards. `#[inline]` does not override this. A
+  the call the run-time check guards. `#[inline("always")]` does not override this. A
   caller carrying a superset of the outlier's extensions may still inline it,
   and any function may be inlined *into* an outlier. A generic function's
   instances carry the decorator's set.
-- **Nothing else changes.** The decorator composes with `inline`, `noinline`,
-  `symbol` and `section`. `#[oblivious]` already refuses the instructions a
+- **Nothing else changes.** The decorator composes with `inline`, `symbol`,
+  `section` and `align`. `#[constant_time]` already refuses the instructions a
   constant-time check cannot model, and an extension row it can model is
   checked like any other.
 
@@ -919,9 +985,12 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
 
 ### GPU decorators
 
-The decorators that shape a GPU module, a pipeline stage and its workgroup, the
-shader interface, specialization constants, the handle types a target mints and
-the functions that are target instructions, are described in [gpu.md](gpu.md).
+The `gpu.` decorators shape a pipeline stage and its workgroup, the shader
+interface and specialization constants. They, with the handle types a target
+mints (`handle`) and the functions that are target instructions (`intrinsic`),
+are described in [gpu.md](gpu.md). v6 spelled the GPU set without its prefix
+(`#[stage]`, `#[input]` and the rest) and the instruction decorator `#[op]`. Each
+warns naming its replacement, which takes the same arguments.
 
 ### `abi_type(name)` — a C type whose layout the target declares
 
@@ -934,7 +1003,7 @@ pub def VaList;
 ```
 
 `va_list` is the only name, and the set is closed in the front end for the reason
-`op`'s instruction names are: which target a module is built for is not a property
+`intrinsic`'s instruction names are: which target a module is built for is not a property
 of the source, so a typo checked only where it is acted on would go unreported on
 every other build of the same library. A target that declares no layout for the
 named type refuses the declaration rather than substituting a default.
@@ -960,33 +1029,52 @@ a further rule the decorator's own section states.
 | `symbol` | `fun`, `val`, `var` |  |
 | `section` | `fun`, `val`, `var` |  |
 | `library` | `ext` |  |
+| `export` | `fun`, `val`, `var` | a `pub` declaration that is not `ext` |
 | `inline` | `fun` |  |
-| `noinline` | `fun` |  |
 | `align` | `fun`, `rec`, `uni`, `tag`, `val`, `var` |  |
-| `packed` | `rec`, `uni`, `tag` | not a `uniform`, `storage` or `push` block |
+| `packed` | `rec`, `uni`, `tag` | not a `gpu.uniform`, `gpu.storage` or `gpu.push` block |
 | `volatile` | `rec`, `uni`, `tag` |  |
-| `oblivious` | `fun` |  |
-| `scalar` | `fun` |  |
+| `at` | `fun`, `val`, `var` | refused until mach#4890 |
+| `thread` | `var` | no shader interface role |
+| `constant_time` | `fun` |  |
+| `vectorize` | `fun` |  |
 | `naked` | `fun` |  |
-| `ext` | `fun` | a function with a body |
+| `extension` | `fun` | a function with a body |
 | `embed` | `val` | a `val` that is not `ext`, checked by `embed` itself |
-| `stage` | `fun` |  |
-| `workgroup` | `fun` | a function that also carries `#[stage("compute")]` |
-| `input` | `val`, `var` |  |
-| `output` | `val`, `var` |  |
-| `builtin` | `val`, `var` |  |
-| `uniform` | `val`, `var` |  |
-| `storage` | `val`, `var` |  |
-| `sampler` | `val`, `var` |  |
-| `push` | `val`, `var` |  |
-| `spec` | `val`, `var` | a `var` |
-| `shared` | `val`, `var` | a `var` |
-| `op` | `fun` | a function with no body |
+| `intrinsic` | `fun` | a function with no body |
 | `handle` | `def` | a `def` with no type, checked by `handle` itself |
 | `abi_type` | `def` | a `def` with no type, checked by `abi_type` itself |
+| `gpu.stage` | `fun` |  |
+| `gpu.workgroup` | `fun` | a function that also carries `#[gpu.stage("compute")]` |
+| `gpu.input` | `val`, `var` |  |
+| `gpu.output` | `val`, `var` |  |
+| `gpu.builtin` | `val`, `var` |  |
+| `gpu.uniform` | `val`, `var` |  |
+| `gpu.storage` | `val`, `var` |  |
+| `gpu.sampler` | `val`, `var` |  |
+| `gpu.push` | `val`, `var` |  |
+| `gpu.spec` | `val`, `var` | a `var` |
+| `gpu.shared` | `val`, `var` | a `var` |
 
 The set is closed. New decorators require a compiler change. A name outside it
 is refused with `decorator.unknown`, and the refusal lists every decorator.
+
+### v6 spellings
+
+A v6 spelling still reads as the decorator it names, with its v6 arguments, and
+each use warns with `decorator.renamed`, naming the v7 spelling. It becomes a
+refusal once std and the family's sources use the v7 spellings, and `mach
+migrate` rewrites each one.
+
+| v6 | v7 |
+|---|---|
+| `#[ext(a, b)]`, `#[extensions(a, b)]` | `#[extension("a", "b")]` |
+| `#[inline]` | `#[inline("always")]` |
+| `#[noinline]` | `#[inline("never")]` |
+| `#[scalar]` | `#[vectorize("never")]` |
+| `#[oblivious]` | `#[constant_time("soft")]` or `#[constant_time("hard")]` |
+| `#[op(tgt, set, name)]` | `#[intrinsic(tgt, set, name)]` |
+| `#[stage]` … `#[shared]` | `#[gpu.stage]` … `#[gpu.shared]` |
 
 ## See also
 
@@ -994,9 +1082,9 @@ is refused with `decorator.unknown`, and the refusal lists every decorator.
 - [ext-fun.md](ext-fun.md) — `ext` imports, `library` and `symbol` use cases
 - [visibility.md](visibility.md) — `pub` / `ext` visibility (not decorator-controlled)
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of` / `$align_of` as `align` arguments
-- [secrecy.md](secrecy.md) — `^` secret types and the `oblivious` constant-time contract
-- [asm.md](asm.md) — inline `asm`, the only body a `naked` function may have, and the extension instructions `ext` admits
+- [secrecy.md](secrecy.md) — `^` secret types and the `constant_time` contract
+- [asm.md](asm.md) — inline `asm`, the only body a `naked` function may have, and the extension instructions `extension` admits
 - [val-var.md](val-var.md) — `val` / `var` bindings, and the `embed` exemption to `val`'s initializer requirement
 - [grammar.md](grammar.md#types) — the `[_]` inferred array length `embed` introduces
-- [types.md](types.md) — the SIMD vector types a shader stage computes over and `op` operates on, and the handle types `handle` declares
-- [manifest.md](manifest.md) — the `vectorize` profile key `scalar` opts out of, and content-fingerprinted build inputs (`embed`, `[step]` `in`)
+- [types.md](types.md) — the SIMD vector types a shader stage computes over and `intrinsic` operates on, and the handle types `handle` declares
+- [manifest.md](manifest.md) — the `vectorize` profile key `vectorize("never")` opts out of, and content-fingerprinted build inputs (`embed`, `[step]` `in`)
