@@ -72,7 +72,9 @@ val EMPTY: Key = Key{id: 0}; # the same holds for a constant literal
 
 ## Layout
 
-By default the compiler may insert padding between fields for alignment. The
+By default the compiler may insert padding between fields for alignment. A
+record that holds a secret has its padding zeroed wherever a value of it is
+built (see [secrecy.md](secrecy.md#padding-of-secret-aggregates)). The
 `#[align(N)]` decorator on a record raises its minimum type alignment to `N`
 bytes (a power of two), and `#[packed]` lays the record out with no padding
 at all, for a shape whose layout is fixed elsewhere (a C struct, a file
