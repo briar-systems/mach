@@ -1278,6 +1278,10 @@ any of them (see [test.md](test.md#which-tests-run)).
     `#[symbol("name")]` sets the name an export carries without exporting it.
   - **Internals.** Every other definition still links inside the library but is
     seen from no other image.
+  - **Code model.** The library is built under mirl's `pic` code model unless its
+    target states a `code_model`. Each system's row says what that means there:
+    on ELF an export of default visibility may be preempted by another image, on
+    Mach-O only a weak one may, and a PE DLL reaches its own exports directly.
   - **Thread-locals.** A `#[thread]` var in a shared library is reached through
     the initial-exec model, at an offset its loader fixes when the process
     starts. General-dynamic access is never lowered.
