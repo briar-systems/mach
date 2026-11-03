@@ -1325,10 +1325,12 @@ run    = [".data", ".bss"]
 | `load` | absent: none | The output sections whose bytes load in the region and run in another, as `.data` loaded in flash and run in RAM. |
 
 A section that runs in two regions or loads in two is refused, and so is one that
-loads in a region and runs in none, or loads in the region it runs in. mach hands
-the regions, the section order, the size ceiling and every `#[at]` placement to
-mink as one link plan, and reports mink's refusals, an overflow, an overlap or a
-missing section, as mink names them. mink names the bounds of each section by
+loads in a region and runs in none, or loads in the region it runs in. A section
+named in `sections`, `run` or `load` that no object of the link holds is passed
+over, so one layout serves a program with no `.bss` as well as one with it. mach
+hands the regions, the section order, the size ceiling and every `#[at]`
+placement to mink as one link plan, and reports mink's refusals, an overflow or
+an overlap, as mink names them. mink names the bounds of each section by
 its load and run addresses, `__load_start_<section>`, `__load_stop_<section>`,
 `__run_start_<section>` and `__run_stop_<section>`, so startup code, such as
 copying `.data` out of its load region, is a library's and never the compiler's.
