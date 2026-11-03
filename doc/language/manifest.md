@@ -1342,9 +1342,13 @@ the stack the program starts on.
 | `load` | absent: none | The output sections whose bytes load in the region and run in another, as `.data` loaded in flash and run in RAM. |
 
 A section that runs in two regions or loads in two is refused, and so is one that
-loads in a region and runs in none, or loads in the region it runs in. A section
-named in `sections`, `run` or `load` that no object of the link holds is passed
-over, so one layout serves a program with no `.bss` as well as one with it. mach
+loads in a region and runs in none, or loads in the region it runs in. A name in
+`sections`, `run` or `load` is an output section, as mink's layout rules name the
+output section each object's section is laid into, so `.text` takes every
+`.text.*` section. A name no object's section is laid into is passed over, so one
+layout serves a program with no `.bss` as well as one with it. That includes an
+output section the link makes itself, such as an `.eh_frame` it writes of the
+objects' frame records, which a region does not place. mach
 hands the regions, the section order, the size ceiling and every `#[at]`
 placement to mink as one link plan, and reports mink's refusals, an overflow or
 an overlap, as mink names them. mink names the bounds of each section by
