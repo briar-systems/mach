@@ -27,11 +27,13 @@ use mach.lang.target.resolved;
 use masc_ct:    masc.core.ct;
 use mirl_stats: mirl.base.stats;
 use mct:        mirl.ct;
+use mirl.ir.id;
 use mirl.ir.id.Function;
 use mirl.ir.module.Module;
 use opcode_row:   mirl.ir.opcode.row;
 use opcode_table: mirl.ir.opcode.table;
 use mirl_machine: mirl.machine.compile;
+use mirl.machine.emit.handover;
 use mirl_inline:  mirl.machine.inline;
 use mirl_engine:  mirl.machine.select.engine;
 use pass_failure: mirl.pass.failure;
@@ -59,9 +61,9 @@ use mink_subsystem: mink.catalog.subsystem;
 use mink.format.ar.write.Variant;
 use mink.format.contract;
 use mink.format.registry;
-use mink.link.input.Source;
 use mink.link.options.Options;
-use mink.link.state;
+use mink.link.search;
+use mink.link.search.Request;
 use mink.link.write.Written;
 use mink.model.object;
 use mink.model.object.Object;
@@ -79,12 +81,15 @@ pub val OBJECT_EXT: str = "o";
 # machine:   what lowering builds its units for, borrowing `assembled`
 # format:    the object format the target writes
 # formats:   mink's format registry
+# prepared:  the target mirl made ready for the build, once, which every module's compile reads;
+#            on the heap, since it stays put until it is closed. nil before one is opened
 pub rec Back {
     assembled: *assembled.Assembled;
     machine:   lower_context.Machine;
     format:    *Format;
     formats:   registry.Registry;
     opened:    bool;
+    prepared:  *mirl_compile.Prepared;
 }
 
 # a back half that compiles nothing, for a project with no target yet
@@ -93,6 +98,7 @@ pub fun none() Back {
     b.assembled = nil;
     b.format    = nil;
     b.opened    = false;
+    b.prepared  = nil;
     ret b;
 }
 
@@ -116,10 +122,36 @@ pub fun open(a: *A.Allocator, t: *resolved.Target) res[Back, fail.Fail] {
     }
     b.machine = machine.ok;
     b.format  = t.format;
+    # mirl readies the target once for the build, its extensions with it; a target it cannot
+    # ready is refused for the build
+    val held: res[*mirl_compile.Prepared, A.Error] = A.allocate[mirl_compile.Prepared](a, 1::usize);
+    if (sel held.err) {
+        close(a, ?b);
+        ret res[Back, fail.Fail].err{fail.refused(held.err)};
+    }
+    val readied: err[mirl_compile.Error] = mirl_compile.open(held.ok, a, ?b.assembled.target, assembled.added(b.assembled));
+    if (sel readied.err) {
+        A.deallocate[mirl_compile.Prepared](a, held.ok, 1::usize);
+        val refused: fail.Fail = unopened(a, readied.err);
+        close(a, ?b);
+        ret res[Back, fail.Fail].err{refused};
+    }
+    b.prepared = held.ok;
     ret res[Back, fail.Fail].ok{b};
 }
 
+# why mirl could not ready the target for the build
+fun unopened(a: *A.Allocator, e: mirl_compile.Error) fail.Fail {
+    val block: opt[fail.Fail] = assembly_refused(a, "the target", e);
+    if (sel block.some) { ret block.some; }
+    ret fail.user(diagnostic_kind.TARGET_UNSUPPORTED, "mirl cannot ready the target for a build: no back end serves it, or its extensions do not open");
+}
+
 pub fun close(a: *A.Allocator, b: *Back) {
+    if (b.prepared != nil) {
+        mirl_compile.close(b.prepared);
+        A.deallocate[mirl_compile.Prepared](a, b.prepared, 1::usize);
+    }
     if (b.assembled != nil) { assembled.release(a, b.assembled); }
     if (b.opened)           { val released: err[Fail] = registry.release(?b.formats); }
     @b = none();
@@ -151,25 +183,25 @@ pub fun refused_by_mink(a: *A.Allocator, lead: str, f: Fail) fail.Fail {
 
 # the mirl module `m` compiled to mink's object at mirl's level `level`, its schedule's own checks
 # run with `checked`, the linker let relax its code with `relax` and the float relaxations `floats`
-# permitted, masc's listing of the object written to `listing` when there is one. the module is
-# the schedule's to rewrite, so it is spent here
+# permitted, masc's listing of the object written to `listing` when there is one, and its stages
+# timed and counted into `stats` when there is one. the module is the schedule's to rewrite, so
+# it is spent here
 pub fun compile(b: *Back, a: *A.Allocator, m: *Module, level: u8, checked: bool, relax: bool, floats: relaxation.Relaxations,
-    listing: opt[*std_writer.Writer], name: str) res[Object, fail.Fail] {
-    if (b.assembled == nil) { ret res[Object, fail.Fail].err{fail.message("no target is open, so the build has no back end")}; }
+    listing: opt[*std_writer.Writer], stats: opt[*mirl_stats.Stats], name: str) res[Object, fail.Fail] {
+    if (b.assembled == nil || b.prepared == nil) { ret res[Object, fail.Fail].err{fail.message("no target is open, so the build has no back end")}; }
     val o: mirl_compile.Options = mirl_compile.Options{
         output:   mirl_family.Output.object{},
         relax:    relax,
         floats:   floats,
         level:    level::mirl_pass.Level,
         checked:  checked,
-        added:    assembled.added(b.assembled),
         machine:  opt[*std_writer.Writer].none{},
         listing:  listing,
         warnings: opt[*std_writer.Writer].none{},
         apart:    mirl_compile.SHARED,
-        stats:    opt[*mirl_stats.Stats].none{}
+        stats:    stats
     };
-    val made: res[Object, mirl_compile.Error] = mirl_compile.compile(a, m, ?b.assembled.target, o);
+    val made: res[Object, mirl_compile.Error] = mirl_compile.compile(b.prepared, a, m, o);
     if (sel made.ok) { ret res[Object, fail.Fail].ok{made.ok}; }
     ret res[Object, fail.Fail].err{uncompiled(a, m, name, made.err)};
 }
@@ -263,6 +295,10 @@ fun register_refused(a: *A.Allocator, m: *Module, name: str, e: mirl_machine.Err
             ret fail.user_of(diagnostic_kind.SECRET_UNVERIFIABLE, fail.join(a, "'", sname.ok, "' of '", name, "' requires constant time, and its frame reads a slot no store of it reaches first, which may hold a secret an earlier frame left"));
         }
     }
+    if (sel e.emit) {
+        val emitted: handover.Error = e.emit;
+        if (sel emitted.listing) { ret unlisted(a, m, name, emitted.listing); }
+    }
     var why: str = "the register back end refused it";
     if (sel e.foreign)   { why = "the build was opened for another target"; }
     or (sel e.uncarried) { why = "masc's registry carries no record of the build's instruction set"; }
@@ -309,7 +345,7 @@ fun selection_named(s: mirl_machine.Stage) str {
     if (!(sel e.unmatched)) { ret ""; }
     val op: mirl_engine.Operation = e.unmatched.operation;
     if (!(sel op.opcode)) { ret ""; }
-    val row: opt[opcode_row.Row] = opcode_table.row(op.opcode);
+    val row: opt[*opcode_row.Row] = opcode_table.at(op.opcode);
     if (sel row.some) { ret row.some.name; }
     ret "";
 }
@@ -375,6 +411,24 @@ fun untimed(a: *A.Allocator, m: *Module, name: str, r: mct.Refused, by: str) fai
         ret fail.user_of(kind, fail.join(a, "'", fname.ok, "' of '", name, "' requires constant time, which ", by, " refused at ", at, ": ", masc_ct.message(?r.refusal), ", '", callee.ok, "'"));
     }
     ret fail.user_of(kind, fail.join(a, "'", fname.ok, "' of '", name, "' requires constant time, which ", by, " refused at ", at, ": ", masc_ct.message(?r.refusal)));
+}
+
+# masc's refusal to list the object, naming the function or global it is about when it names one
+fun unlisted(a: *A.Allocator, m: *Module, name: str, u: handover.Unlisted) fail.Fail {
+    if (sel u.symbol.none) { ret fail.message_of(fail.join(a, "masc did not list the object of '", name, "': ", u.refusal.message)); }
+    val sym:   id.Symbol           = u.symbol.some;
+    var sname: res[str, fail.Fail] = res[str, fail.Fail].err{fail.message("mirl refused a global its module does not hold")};
+    if (sel sym.function) { sname = function_name(a, m, sym.function); }
+    or (sel sym.global) {
+        if (sym.global.index::usize < m.globals.len) {
+            val v:      View               = m.globals.data[sym.global.index::usize].data.name;
+            val copied: res[str, StrError] = str_copy_slice(a, v.data, 0, v.len);
+            if (sel copied.err) { ret fail.str_refused(copied.err); }
+            sname = res[str, fail.Fail].ok{copied.ok};
+        }
+    }
+    if (sel sname.err) { ret sname.err; }
+    ret fail.message_of(fail.join(a, "masc did not list '", sname.ok, "' of '", name, "': ", u.refusal.message));
 }
 
 # the name a function of `m` is declared by, copied
@@ -558,16 +612,21 @@ pub fun symbol_name(o: *Object, i: usize) View {
 
 # what the build states of the image it links, beyond its kind and format
 # ---
-# base:      the address the image is laid out from, none for the host's
-# subsystem: the PE subsystem the image states, none for the host's
+# base:         the address the image is laid out from, none for the host's
+# subsystem:    the PE subsystem the image states, none for the host's
+# libdirs:      the directories a library named by name is searched in ahead of the system's
+# libdir_count: how many
 pub rec Image {
-    base:      opt[u64];
-    subsystem: opt[*mink_subsystem.Subsystem];
+    base:         opt[u64];
+    subsystem:    opt[*mink_subsystem.Subsystem];
+    libdirs:      *str;
+    libdir_count: usize;
 }
 
-# the image of `kind` in `format` mink links from the `count` sources at `sources`, named `output` where
-# its format records a name, its unreferenced sections left out with `gc`, laid out as `image` states
-pub fun link(b: *Back, a: *A.Allocator, kind: *output.Kind, format: *Format, sources: *Source, count: usize, output_path: str, gc: bool, image: *Image) res[Sink, fail.Fail] {
+# the image of `kind` in `format` mink links from the `count` requests at `requests`, a library
+# named by name found by mink's search, named `output` where its format records a name, its
+# unreferenced sections left out with `gc`, laid out as `image` states
+pub fun link(b: *Back, a: *A.Allocator, kind: *output.Kind, format: *Format, requests: *Request, count: usize, output_path: str, gc: bool, image: *Image) res[Sink, fail.Fail] {
     if (format == nil)      { ret res[Sink, fail.Fail].err{fail.message("the target's system states no image format mink links")}; }
     if (b.assembled == nil) { ret res[Sink, fail.Fail].err{fail.message("no target is open, so the build has no back end")}; }
     # the image runs on the system the cell's target names, which its objects do not state
@@ -592,11 +651,16 @@ pub fun link(b: *Back, a: *A.Allocator, kind: *output.Kind, format: *Format, sou
         keep_temporaries: opt[bool].none{},
         tail_merge:       opt[bool].none{},
         output:           output_path,
-        sign:             opt[bool].none{}
+        sign:             opt[bool].none{},
+        libdirs:          image.libdirs,
+        libdir_count:     image.libdir_count
     };
     var notes: Sink = sink.make(a, LITTLE);
     fin { val freed: err[Fail] = sink.release(?notes); }
-    val linked: res[Written, Fail] = state.link(a, ?b.formats, o, sources, count, ?notes);
+    # what the search loaded backs the names a refusal carries, so it goes once the refusal is told
+    var found: search.Found = search.make(a);
+    fin { val released: err[Fail] = search.release(?found); }
+    val linked: res[Written, Fail] = search.link(?found, ?b.formats, o, requests, count, ?notes);
     if (sel linked.err) { ret res[Sink, fail.Fail].err{fail.as_user(diagnostic_kind.LINK_INPUT_INVALID, refused_by_mink(a, "the link failed", linked.err))}; }
     var made: Written = linked.ok;
     # mach writes the image alone, so an interface file the format makes goes
