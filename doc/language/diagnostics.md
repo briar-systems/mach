@@ -92,7 +92,7 @@ modules or generic instances raise it.
 | `comptime`, `gate`, `each` | compile-time evaluation, intrinsics and descriptors, `$if` gates, `$each`, and the user's own `$error` (`comptime.user_error`) |
 | `decorator`, `expect`, `extension`, `embed`, `handle`, `abi_type`, `op`, `naked`, `fin`, `ext` | decorators and the declarations they shape |
 | `test`, `testing` | `test` blocks and `#[testing]` declarations |
-| `secret` | the secrecy rules, in the source and in the constant-time validation of emitted code (`secret.not_oblivious`) |
+| `secret` | the secrecy rules, in the source and in the constant-time validation of emitted code (`secret.branch`) |
 | `vector` | vector types and operations, including the scalar fallback (`vector.scalarize`) |
 | `asm` | inline assembly: syntax, instructions, operands, extensions, labels and locals |
 | `read` | reads the target forbids, such as a load from write-only storage (`read.writeonly_storage`) |

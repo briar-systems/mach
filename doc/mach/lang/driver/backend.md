@@ -4,6 +4,15 @@ the back half a build hands its lowered modules to: mirl compiles a unit to mink
 in memory, mink lays an object out in the target's format or reads one back, and mink links
 objects into an image. nothing here starts a process or writes a file between the stages
 
+## val OBJECT_EXT
+
+```mach
+pub val OBJECT_EXT: str = "o"
+```
+
+the extension mach names the object files of its work directory by, whatever the
+format: mink reads an object by its bytes, never its name
+
 ## rec Back
 
 ```mach
@@ -12,10 +21,12 @@ pub rec Back;
 
 the target a build compiles for and the formats it reads and writes
 
-assembled: the target the owners assemble for the cell, nil for a cell none assembles yet
+assembled: the target mirl assembled for the resolved target, nil before one is opened
 machine: what lowering builds its units for, borrowing `assembled`
-format: the object format of the target's system
+format: the object format the target writes
 formats: mink's format registry
+prepared: the target mirl made ready for the build, once, which every module's compile reads;
+           on the heap, since it stays put until it is closed. nil before one is opened
 
 ## fun none
 
@@ -31,7 +42,7 @@ a back half that compiles nothing, for a project with no target yet
 pub fun open(a: *A.Allocator, t: *resolved.Target) res[Back, fail.Fail];
 ```
 
-the back half of the resolved cell `t`, none assembled where no owner assembles the cell
+the back half of the resolved target `t`
 
 ## fun close
 
@@ -58,12 +69,15 @@ mink's failure `f` as mach's, under `lead`
 ## fun compile
 
 ```mach
-pub fun compile(b: *Back, a: *A.Allocator, m: *Module, level: u8, checked: bool, relax: bool, floats: relaxation.Relaxations, name: str) res[Object, fail.Fail];
+pub fun compile(b: *Back, a: *A.Allocator, m: *Module, level: u8, checked: bool, relax: bool, floats: relaxation.Relaxations,
+listing: opt[*std_writer.Writer], stats: opt[*mirl_stats.Stats], name: str) res[Object, fail.Fail];
 ```
 
 the mirl module `m` compiled to mink's object at mirl's level `level`, its schedule's own checks
 run with `checked`, the linker let relax its code with `relax` and the float relaxations `floats`
-permitted. the module is the schedule's to rewrite, so it is spent here
+permitted, masc's listing of the object written to `listing` when there is one, and its stages
+timed and counted into `stats` when there is one. the module is the schedule's to rewrite, so
+it is spent here
 
 ## fun object_bytes
 
@@ -138,6 +152,24 @@ pub fun weakened(a: *A.Allocator, o: *Object, name: str) res[opt[Object], fail.F
 a copy of `o` in which its definition of `name`, when it has a global one, yields to
 another as a weak definition; none when `o` defines no such symbol
 
+## fun archive_variant
+
+```mach
+pub fun archive_variant(b: *Back, a: *A.Allocator) res[*Variant, fail.Fail];
+```
+
+the variant mink writes a static library of the target's objects in, as its
+registry states it of the target's format
+
+## fun c_prefix
+
+```mach
+pub fun c_prefix(b: *Back, a: *A.Allocator) res[str, fail.Fail];
+```
+
+the prefix the target's format gives a C symbol's name on its architecture, empty
+for none, as mink's registry states it
+
 ## fun symbol_name
 
 ```mach
@@ -146,12 +178,28 @@ pub fun symbol_name(o: *Object, i: usize) View;
 
 the name of symbol `i` of `o`
 
+## rec Image
+
+```mach
+pub rec Image;
+```
+
+what the build states of the image it links, beyond its kind and format
+
+base: the address the image is laid out from, none for the host's
+subsystem: the PE subsystem the image states, none for the host's
+libdirs: the directories a library named by name is searched in ahead of the system's
+libdir_count: how many
+stack_reserve: the main stack's reserve, none for the format's default
+stack_commit: the main stack's commit, none for the format's default
+
 ## fun link
 
 ```mach
-pub fun link(b: *Back, a: *A.Allocator, kind: *output.Kind, format: *Format, sources: *Source, count: usize, output_path: str, gc: bool) res[Sink, fail.Fail];
+pub fun link(b: *Back, a: *A.Allocator, kind: *output.Kind, format: *Format, requests: *Request, count: usize, output_path: str, gc: bool, image: *Image) res[Sink, fail.Fail];
 ```
 
-the image of `kind` in `format` mink links from the `count` sources at `sources`, named `output` where
-its format records a name, its unreferenced sections left out with `gc`
+the image of `kind` in `format` mink links from the `count` requests at `requests`, a library
+named by name found by mink's search, named `output` where its format records a name, its
+unreferenced sections left out with `gc`, laid out as `image` states
 

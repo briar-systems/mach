@@ -1,16 +1,5 @@
 # mach.lang.ct
 
-## rec AsmRefusal
-
-```mach
-pub rec AsmRefusal;
-```
-
-an inline-asm block the constant-time scan refuses
-
-kind: the diagnostic kind the refusal is reported as
-message: what the block does with the secret
-
 ## def CtOp
 
 ```mach
@@ -47,15 +36,6 @@ pub val CT_OP_INT_MUL:    CtOp = 3
 pub val CT_OP_VAR_SHIFT:  CtOp = 4
 ```
 
-## val CT_OP_REP_STRING
-
-```mach
-pub val CT_OP_REP_STRING: CtOp = 5
-```
-
-a repeated string instruction: it runs once per element of its count, and a
-compare stops at the first element that differs, so its timing is its data
-
 ## def CtCap
 
 ```mach
@@ -90,27 +70,6 @@ the capability a target must provide for an operation to be constant-time,
 absent for an operation outside the catalog: an unknown operation is never
 answered with "no capability needed"
 
-## fun latency_refusal
-
-```mach
-pub fun latency_refusal(op: CtOp) opt[str];
-```
-
-what a secret operand of `op` does where the target does not provide its capability,
-worded to follow the name of the code that does it; every stage that refuses one reads
-it here. none for an operation outside the catalog
-
-## val DIT_REFUSAL
-
-```mach
-pub val DIT_REFUSAL: str =
-"uses a secret value in an integer multiply whose timing is data-independent only under;
-```
-
-the refusal of a secret multiply the instruction set declares data-independent only
-under a mode the operating system declares no guarantee for, formatted with the mode,
-the instruction set and the operating system
-
 ## fun cap_at_sema
 
 ```mach
@@ -123,7 +82,7 @@ pub fun cap_at_sema(cap: CtCap) bool;
 pub def CtMulOp: u8
 ```
 
-the multiply a machine instruction realizes: the low half of a same-width
+a multiply `$mach.build.ct_mul` asks about: the low half of a same-width
 product, the high half by operand signedness, or the full double-width
 product
 
@@ -175,77 +134,13 @@ pub val CT_MUL_WIDE_S:  CtMulOp = 6
 pub val CT_MUL_OP_COUNT: u32 = 7
 ```
 
-## def CtMulCond
-
-```mach
-pub def CtMulCond: u8
-```
-
-what a declared multiply row needs before its timing is data-independent
-
-## val CT_MUL_ALWAYS
-
-```mach
-pub val CT_MUL_ALWAYS:    CtMulCond = 0
-```
-
-## val CT_MUL_DIT_MODE
-
-```mach
-pub val CT_MUL_DIT_MODE:  CtMulCond = 1
-```
-
-## val CT_MUL_EXTENSION
-
-```mach
-pub val CT_MUL_EXTENSION: CtMulCond = 2
-```
-
-## val DIT_NEED_MARKER
-
-```mach
-pub val DIT_NEED_MARKER:   str = "__mach_needs_dit"
-```
-
-the DIT runtime contract between the compiler and the std start code.
-a module that multiplies a secret in a DIT_MODE cell carries the marker: a
-local absolute symbol, value 1, that names the need and reaches no linked
-image. on a target whose os declares the mode guaranteed, the linker defines
-the cell in every executable: a hidden one-byte read-only object, 1 when any
-input carries the marker, else 0. the start code reads the cell and, when it
-is set, turns PSTATE.DIT on or fails closed. the names and the byte are
-frozen: std builds against them
-
-## val DIT_REQUIRED_CELL
-
-```mach
-pub val DIT_REQUIRED_CELL: str = "__mach_dit_required"
-```
-
-## val DIT_NEED_VALUE
-
-```mach
-pub val DIT_NEED_VALUE:    u64 = 1
-```
-
-## rec CtMulForm
-
-```mach
-pub rec CtMulForm;
-```
-
-one declared row: this multiply at this operand width (and, for a lane
-multiply, this lane count) has data-independent timing under `cond`; `ext`
-names the ISA extension bits an EXTENSION row needs
-
 ## rec CtMulCell
 
 ```mach
 pub rec CtMulCell;
 ```
 
-the multiply an emitted instruction realizes, at an operand width in bits;
-`vector` for a lane multiply
+a multiply at an operand width in bits, `vector` for a lane multiply
 
 ## rec CtMulMask
 
@@ -253,7 +148,7 @@ the multiply an emitted instruction realizes, at an operand width in bits;
 pub rec CtMulMask;
 ```
 
-the admitted cells, one bit per (op, width) in a scalar and a vector plane
+the cells mirl runs in constant time, one bit per (op, width) in a scalar and a vector plane
 
 ## fun mul_cell
 
@@ -267,22 +162,13 @@ pub fun mul_cell(op: CtMulOp, width: u8, vector: bool) CtMulCell;
 pub fun mul_mask_none() CtMulMask;
 ```
 
-## fun mul_width_valid
-
-```mach
-pub fun mul_width_valid(width: u8) bool;
-```
-
-the operand widths a target may declare a row at
-
 ## fun mul_cell_width_valid
 
 ```mach
 pub fun mul_cell_width_valid(width: u8) bool;
 ```
 
-the operand widths a cell may have: a 128-bit cell is never declared, it is
-admitted through the cells that realize it
+the operand widths a cell may have
 
 ## fun mul_op_name
 
@@ -312,185 +198,5 @@ pub fun mul_mask_add(mask: *CtMulMask, cell: CtMulCell);
 pub fun mul_mask_has(mask: CtMulMask, cell: CtMulCell) bool;
 ```
 
-whether the admitted cells cover this multiply; an unknown cell never is
-
-## fun mul_forms_refusal
-
-```mach
-pub fun mul_forms_refusal(forms: *CtMulForm, len: u32, ext_domain: u64, has_mul: bool) opt[str];
-```
-
-why a row table is malformed: a malformed row, a cell declared twice, or any
-row on a machine with no multiply
-
-## fun target_provides
-
-```mach
-pub fun target_provides(mul: CtMulMask, cell: CtMulCell, trust_var_shift: bool, cap: CtCap) bool;
-```
-
-whether a target covers a capability; the multiply capability asks for the
-exact cell the site emits. false for every other capability, which no
-target provides (a partition, enumerated by its test)
-
-## fun ct_op_gates_count_only
-
-```mach
-pub fun ct_op_gates_count_only(op: CtOp) bool;
-```
-
-## rec BindSecrecy
-
-```mach
-pub rec BindSecrecy;
-```
-
-the two secrecy facts an inline-asm binding carries into the constant-time scan.
-`value` when the binding's own storage is secret (`^usize`, `^*T`): the register it is
-staged into holds a secret, so it is refused as an address. `pointee` when the binding is
-a pointer whose target reaches a secret (`*^T`): the register holds a public address, and a
-load through it produces a secret. a pointer to a secret is a public address and a secret
-load; a secret pointer is a secret address
-
-## fun bind_secrecy
-
-```mach
-pub fun bind_secrecy(value: bool, pointee: bool) BindSecrecy;
-```
-
-## fun bind_public
-
-```mach
-pub fun bind_public() BindSecrecy;
-```
-
-## fun bind_tracked
-
-```mach
-pub fun bind_tracked(b: BindSecrecy) bool;
-```
-
-true when the scan has anything to track for the binding
-
-## rec AsmSecret
-
-```mach
-pub rec AsmSecret;
-```
-
-a binding the scan tracks, by the name its `{name}` operand spells
-
-## fun asm_secret
-
-```mach
-pub fun asm_secret(name: str, secrecy: BindSecrecy) AsmSecret;
-```
-
-## rec AsmClass
-
-```mach
-pub rec AsmClass;
-```
-
-## fun asm_unknown
-
-```mach
-pub fun asm_unknown() AsmClass;
-```
-
-## fun flags_untouched
-
-```mach
-pub fun flags_untouched(a: AsmClass) AsmClass;
-```
-
-## fun flags_defined
-
-```mach
-pub fun flags_defined(a: AsmClass) AsmClass;
-```
-
-## fun flags_written
-
-```mach
-pub fun flags_written(a: AsmClass) AsmClass;
-```
-
-## fun flags_opaque
-
-```mach
-pub fun flags_opaque(a: AsmClass) AsmClass;
-```
-
-## fun flags_read
-
-```mach
-pub fun flags_read(a: AsmClass) AsmClass;
-```
-
-## fun asm_op
-
-```mach
-pub fun asm_op(op: CtOp) AsmClass;
-```
-
-## fun asm_mul
-
-```mach
-pub fun asm_mul(mul: CtMulOp) AsmClass;
-```
-
-a multiply instruction realizing `mul` at its first operand's width
-
-## fun asm_mul_forms
-
-```mach
-pub fun asm_mul_forms(mul: CtMulOp, one: CtMulOp) AsmClass;
-```
-
-a multiply realizing `mul` with two or more explicit operands and `one` with
-a single one
-
-## fun asm_mul_lanes
-
-```mach
-pub fun asm_mul_lanes(mul: CtMulOp, lane_bits: u8) AsmClass;
-```
-
-a lane multiply at a fixed lane width
-
-## fun asm_mul_width
-
-```mach
-pub fun asm_mul_width(mul: CtMulOp, bits: u8) AsmClass;
-```
-
-a fixed-width multiply, whatever its operands name
-
-## fun asm_mul_cell
-
-```mach
-pub fun asm_mul_cell(cls: AsmClass, explicit_ops: u32, op0_bytes: u8) CtMulCell;
-```
-
-the cell an emitted or assembled multiply realizes, from its class, its
-count of explicit operands and its first operand's byte width
-
-## fun asm_branch_flags
-
-```mach
-pub fun asm_branch_flags() AsmClass;
-```
-
-## fun asm_branch_reg
-
-```mach
-pub fun asm_branch_reg() AsmClass;
-```
-
-## fun untouched_branch_reg
-
-```mach
-pub fun untouched_branch_reg() AsmClass;
-```
+whether the cells cover this multiply, never for an unknown cell
 

@@ -69,28 +69,25 @@ substitutes a slower or leakier path.
   multiply cells it can execute in data-independent time and the condition
   each holds under (always, PSTATE.DIT on, or extensions selected), and the
   lowering gate, the `#[constant_time]` validators and `$mach.build.ct_mul` read
-  one admission function over those rows. An undeclared cell, an unmet
-  condition or an operating system that declares no guarantee for the mode
-  is a compile error naming what is missing. The compiler never emits a
+  one admission function over those rows. An undeclared cell, or a condition
+  a `hard` function's target does not guarantee, is a compile error naming
+  what is missing. The compiler never emits a
   bit-serial loop, a shift-add expansion or a call in its place, and it has
   no multiply strength reduction, so a secret square or a secret multiply by
   a constant is still the one instruction. A library that must build on
   every target picks its own serial path under `$if ($mach.build.ct_mul(...))`
   rather than being handed one.
-- **The stdlib owns the mode.** Where a row holds only under PSTATE.DIT, the
-  compiler marks the module and the linker writes one byte,
-  `__mach_dit_required`, into every executable linked for an OS that declares
-  the guarantee. std's start code reads it before `main` and at the entry of
-  every thread it creates: a zero byte touches nothing, a nonzero byte turns
-  the mode on when the OS reports the processor has it, and otherwise, or
-  when the answer cannot be read, std writes its refusal line and ends the
-  process with status 255 before any secret is multiplied. The decision is a
-  pure function of the byte and the availability answer, unit tested on any
-  processor.
+- **The function owns the mode.** Where a row holds only under PSTATE.DIT, a
+  `#[constant_time("soft")]` function has mirl set the mode around it where
+  the processor has it and runs without it where it does not, and a
+  `#[constant_time("hard")]` function builds only for a target whose baseline
+  guarantees the mode. Nothing is linked into the image for either, and no
+  program refuses to start for want of the mode. std keeps a manual API for
+  code that holds the mode by hand.
 
-The per-instruction-set table, the conditions and the runtime rule are in
+The per-instruction-set table, the conditions and the two modes are in
 [secrecy.md](secrecy.md#constant-time-multiply-by-instruction-set) and
-[PSTATE.DIT at run time](secrecy.md#pstatedit-at-run-time).
+[Soft and hard](secrecy.md#soft-and-hard).
 
 ## Why this works
 

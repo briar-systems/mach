@@ -3,7 +3,7 @@
 ## val PRIM_COUNT
 
 ```mach
-pub val PRIM_COUNT: u32 = 14
+pub val PRIM_COUNT: u32 = 18
 ```
 
 ## def PrimClass

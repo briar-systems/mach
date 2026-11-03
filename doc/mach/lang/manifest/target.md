@@ -53,7 +53,7 @@ the target `m` declares under `name`, nil when none is
 ## fun resolve_declared
 
 ```mach
-pub fun resolve_declared(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, d: *TargetDef) res[lang_target.Binding, fail.Fail];
+pub fun resolve_declared(alloc: *A.Allocator, itn: *intern.Interner, d: *TargetDef) res[resolved.Target, fail.Fail];
 ```
 
 resolve a declared target with every key it states: the one place a
@@ -61,23 +61,20 @@ resolve a declared target with every key it states: the one place a
 
 alloc: owns the `env` origin a refusal names
 itn: resolves the target's strings and holds that origin
-reg: the registry the target resolves against
 d: the target
-ret: the binding; err the registry's refusal of the request
+ret: the target; err the owners' refusal of the request
 
 ## fun target_matches_host
 
 ```mach
-pub fun target_matches_host(itn: *intern.Interner, d: *TargetDef, host_os: u32, host_arch: u32) bool;
+pub fun target_matches_host(itn: *intern.Interner, d: *TargetDef) bool;
 ```
 
-whether a target's `sys` and `arch` name the given host ids. the abi is not compared
+whether a target's `sys` and `arch` name the host the compiler runs on. the abi is not compared
 
 itn: resolves the target's strings
 d: the target
-host_os: an os id from `mach.lang.target.os`
-host_arch: an arch id from `mach.lang.target.isa`
-ret: true when both ids match
+ret: true when both names are the host's
 
 ## fun target_is_hosted
 
@@ -85,9 +82,9 @@ ret: true when both ids match
 pub fun target_is_hosted(itn: *intern.Interner, d: *TargetDef) bool;
 ```
 
-whether `native` could ever name the target: its os is one a build host runs. a
-target of any other os (freestanding, or a finished-module target such as spirv)
-is only ever selected by name
+whether `native` could ever name the target: its system has a host row whose
+environment and architecture the target states, so a build could run on one. a
+freestanding or vulkan target is only ever selected by name
 
 ## fun make_native_target
 

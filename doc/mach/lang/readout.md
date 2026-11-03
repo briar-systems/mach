@@ -86,6 +86,78 @@ pub val STEPS: Phase = 11
 
 the build steps a project and its dependencies declare
 
+## val VERIFY
+
+```mach
+pub val VERIFY: Phase = 12
+```
+
+the lowered modules held to mirl's verifier
+
+## val TEST_VERIFY
+
+```mach
+pub val TEST_VERIFY: Phase = 13
+```
+
+the lowered test objects held to mirl's verifier
+
+## val PASSES
+
+```mach
+pub val PASSES: Phase = 14
+```
+
+mirl's neutral passes of the schedule, over normal and test objects alike
+
+## val SELECT
+
+```mach
+pub val SELECT: Phase = 15
+```
+
+mirl's instruction selection
+
+## val ALLOC
+
+```mach
+pub val ALLOC: Phase = 16
+```
+
+mirl's register allocation
+
+## val FRAME
+
+```mach
+pub val FRAME: Phase = 17
+```
+
+mirl's frame and the steps that finish framed code
+
+## val MIRL_EMIT
+
+```mach
+pub val MIRL_EMIT: Phase = 18
+```
+
+mirl's block layout, variable ranges and texts, less masc's two
+
+## val LAYOUT
+
+```mach
+pub val LAYOUT: Phase = 19
+```
+
+masc laying out the object
+
+## val ENCODE
+
+```mach
+pub val ENCODE: Phase = 20
+```
+
+masc encoding the settled layout
+
 ## fun label_of
 
 ```mach
@@ -93,6 +165,94 @@ pub fun label_of(ph: Phase) str;
 ```
 
 the row label of phase ph
+
+## def Counter
+
+```mach
+pub def Counter: u32
+```
+
+a readout counter, an index into the counter table
+
+## val FUNCTIONS
+
+```mach
+pub val FUNCTIONS: Counter = 0
+```
+
+the functions of the lowered modules, as mirl's module holds them
+
+## val IR_INSTRUCTIONS
+
+```mach
+pub val IR_INSTRUCTIONS: Counter = 1
+```
+
+the instructions lowering built into the modules' bodies, as mirl's bodies hold them
+
+## val VERIFY_RUNS
+
+```mach
+pub val VERIFY_RUNS: Counter = 2
+```
+
+the runs of mirl's verifier over the lowered modules, mach's and mirl's own
+
+## val ALLOCATED_BLOCKS
+
+```mach
+pub val ALLOCATED_BLOCKS: Counter = 3
+```
+
+the blocks a step allocated from its heap while it lowered and compiled its module, as std's heap counts them
+
+## val ALLOCATED_BYTES
+
+```mach
+pub val ALLOCATED_BYTES: Counter = 4
+```
+
+the bytes of those allocations
+
+## val HEAP_PEAK
+
+```mach
+pub val HEAP_PEAK: Counter = 5
+```
+
+the most bytes a step's heap mapped while it lowered and compiled its module
+
+## val SELECTED
+
+```mach
+pub val SELECTED: Counter = 6
+```
+
+the machine instructions mirl's selection made
+
+## val ALLOCATED
+
+```mach
+pub val ALLOCATED: Counter = 7
+```
+
+the machine instructions after mirl's register allocation
+
+## val ALLOC_ROUNDS
+
+```mach
+pub val ALLOC_ROUNDS: Counter = 8
+```
+
+the rounds of mirl's register allocation
+
+## fun counter_label
+
+```mach
+pub fun counter_label(c: Counter) str;
+```
+
+the label of counter c
 
 ## val LEVEL_RESULTS
 
@@ -143,6 +303,15 @@ pub rec Item;
 ```
 
 one module or file a phase finished, when it finished
+
+## rec Tally
+
+```mach
+pub rec Tally;
+```
+
+a counter's value: one module's under LEVEL_ITEMS, named by it, or the unit's total
+under LEVEL_PHASES, with a nil name
 
 ## rec Summary
 
@@ -200,6 +369,7 @@ pub tag Event: u8 {
     unit:        Unit;
     phase:       PhaseEnd;
     item:        Item;
+    tally:       Tally;
     summary:     Summary;
     failure:     Failure;
     diagnostics: Diagnostics;
@@ -370,6 +540,14 @@ pub fun span_end(pr: *Progress, ph: Phase, host: Phase, start: Instant);
 
 the span from start belongs to ph, and leaves the phase host that ran it
 
+## fun carve
+
+```mach
+pub fun carve(pr: *Progress, ph: Phase, host: Phase, d: chrono_duration.Duration);
+```
+
+the time d belongs to ph, and leaves the phase host that spent it
+
 ## fun item_begin
 
 ```mach
@@ -385,6 +563,30 @@ pub fun item(pr: *Progress, ph: Phase, name: str, start: Instant);
 ```
 
 name finished phase ph, measured from start
+
+## fun item_spent
+
+```mach
+pub fun item_spent(pr: *Progress, ph: Phase, name: str, d: chrono_duration.Duration);
+```
+
+name spent d in phase ph, measured by its caller
+
+## fun count
+
+```mach
+pub fun count(pr: *Progress, c: Counter, name: str, value: u64);
+```
+
+the module name's value of counter c, added to the unit's total and sent under LEVEL_ITEMS
+
+## fun counts_end
+
+```mach
+pub fun counts_end(pr: *Progress);
+```
+
+send the unit's total of every counter posted since the last close, then start them over
 
 ## fun workers_begin
 

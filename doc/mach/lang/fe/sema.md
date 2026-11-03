@@ -26,6 +26,14 @@ fwd sema_product.result_dnit
 
 forwards [`mach.lang.fe.sema.product.result_dnit`](sema/product.md#fun-result_dnit)
 
+## fwd sema_product.result_shed
+
+```mach
+fwd sema_product.result_shed
+```
+
+forwards [`mach.lang.fe.sema.product.result_shed`](sema/product.md#fun-result_shed)
+
 ## fwd sema_product.TypeExport
 
 ```mach

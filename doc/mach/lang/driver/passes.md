@@ -23,7 +23,8 @@ step lowers and compiles the module, so no mirl module outlives its own codegen
 pub val LINK: query.Kind = query.Kind;
 ```
 
-the link's inputs as revisions, so a link reruns only when one moved
+the build's artifact, written by the link job from the current objects. its product is the
+artifact's path and the digest of the bytes written, and it reruns only when an input moved
 
 ## val LINK_CONFIG
 
@@ -32,6 +33,15 @@ pub val LINK_CONFIG: query.Kind = query.Kind;
 ```
 
 what the link is configured with beyond the build context, set by the build
+
+## val LINK_ARTIFACT
+
+```mach
+pub val LINK_ARTIFACT: query.Kind = query.Kind;
+```
+
+moves whenever the artifact on disk is not the one the link last wrote, so a missing or
+overwritten artifact is linked again
 
 ## fun run_resolve_pass
 
@@ -126,34 +136,23 @@ definition and its lowered surface. the codegen pass lowers each module in its s
 pub fun prepare_lower_pass(p: *project.Project) err[fail.Fail];
 ```
 
-## fun acquire_codegen_inputs
+## fun run_test_pass
 
 ```mach
-pub fun acquire_codegen_inputs(p: *project.Project) err[fail.Fail];
+pub fun run_test_pass(p: *project.Project) err[fail.Fail];
 ```
 
-the codegen operation's inputs: the typed definitions every step reads. the facts a
-module's step keeps are read from its product as the pass takes it
-
-## fun acquire_test_inputs
-
-```mach
-pub fun acquire_test_inputs(p: *project.Project) err[fail.Fail];
-```
-
-the test operation's inputs: the typed definitions every test object's step reads
-
-## fun run_test_object_pass
-
-```mach
-pub fun run_test_object_pass(p: *project.Project) err[fail.Fail];
-```
+the test stage's computation: each test object's typed inputs, then each test object
 
 ## fun run_codegen_pass
 
 ```mach
 pub fun run_codegen_pass(p: *project.Project) err[fail.Fail];
 ```
+
+each module in topological order, its front-end products given back once nothing after reads
+them: an importer's lowering reads the definitions of every module it reaches, so a module is
+held until the last module reaching it is lowered, and a test build lowers every module again
 
 ## fun test_codegen_reusable
 
@@ -175,8 +174,21 @@ allocator. compiling spends the module
 ## fun run_link_pass
 
 ```mach
-pub fun run_link_pass(p: *project.Project) res[bool, fail.Fail];
+pub fun run_link_pass(p: *project.Project) err[fail.Fail];
 ```
+
+the link stage's computation: the current objects, then the link the build's job names,
+which runs only when one of its inputs moved
+
+## fun prepare_link
+
+```mach
+pub fun prepare_link(p: *project.Project, artifact: str) err[fail.Fail];
+```
+
+before the link stage's operation: when the artifact on disk is not what the link last wrote
+to `artifact`, or nothing was linked yet, LINK_ARTIFACT moves to a value it never held, the
+database's next revision, so the link runs again
 
 ## fun prepare_object_cache
 

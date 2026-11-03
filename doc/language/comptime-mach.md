@@ -34,7 +34,7 @@ $mach.build.pointer_width       # live; integer count of bytes
 $mach.build.mode                # live; compared against $mach.mode.* tags
 $mach.build.pie                 # live; 1 when building position-independent, else 0
 $mach.build.platform            # live; the target's open platform tag as a string, "" when unset
-$mach.build.ct_mul(op, width)   # live; 1 when a secret multiply of that cell is admitted, else 0
+$mach.build.ct_mul(op, width)   # live; 1 when mirl runs that multiply in constant time on the target, else 0
 $mach.build.ext.<name>          # live; 1 when the target selects that instruction-set extension, else 0
 ```
 
@@ -61,11 +61,12 @@ val TRACING: u64 = $mach.build.TRACING;
 
 #### `$mach.build.ct_mul(op, width)` — the constant-time multiply catalog
 
-The one call-shaped fact. It folds to 1 exactly when the selected target admits
-a secret-operand multiply of that cell, and to 0 otherwise. The answer comes from
-the same decision the lowering gate and the `#[constant_time]` validators make, so a
-library can choose its hardware or bit-serial path without keeping a per-target
-list:
+The one call-shaped fact. It folds to 1 exactly when mirl runs that multiply on
+the selected target in time independent of its operands under the timing modes
+the build guarantees, the bar a `#[constant_time("hard")]` function is held to,
+and to 0 otherwise. mirl reads it off its selection table and masc's rows when
+the target is resolved, and mach states no table of its own, so a library can
+choose its hardware or bit-serial path without keeping a per-target list:
 
 ```mach
 $if ($mach.build.ct_mul(wide_u, 64) == 1) {
@@ -81,18 +82,20 @@ $or {
   - `high_u`, `high_s`, `high_su`: the high half, with unsigned, signed or mixed operands;
   - `wide_u`, `wide_s`: the full double-width product.
 - `width` is the operand width in bits, a comptime integer: 8, 16, 32, 64 or 128.
-- A cell is admitted when the target declares it and the row's condition holds:
-  - an always-safe instruction;
+- A widening cell is the low and the high half at that width, held when both
+  are. A cell holds when every row the selection emits for it is classified
+  constant time under a mode the build guarantees:
+  - always;
   - the extension it names, selected for the target;
-  - a data-independent-timing mode the target guarantees.
-- riscv64 with Zkt selected (`rv64gc_zkt`) admits `low` at every width and the
-  three high halves at 64. x86-64 admits `low`, `high_u`, `high_s` and `wide_u`
-  / `wide_s` at every width on every OS. aarch64 declares `low` at every width,
-  `high_u` and `high_s` at 64 and `wide_u` / `wide_s` at 32 under PSTATE.DIT,
-  which linux and darwin declare they guarantee, so the query folds to 1 there
-  and to 0 on aarch64-windows and freestanding aarch64 (see
-  [secrecy.md](secrecy.md#pstatedit-at-run-time)). Every other target folds to
-  0. Lane multiplies are not part of the query.
+  - a data-independent-timing mode the target's baseline holds.
+- riscv64 with Zkt selected (`rv64gc_zkt`) answers 1 for `low` at every width
+  and the three high halves at 64. x86-64 answers 1 for `low`, `high_u`,
+  `high_s` and `wide_u` / `wide_s` on every OS. aarch64 classifies its
+  multiplies under PSTATE.DIT, so it answers 1 only where the target's baseline
+  holds DIT, as darwin-arm64's does. A `soft` function sets the mode where the
+  processor has it, which the query does not count on (see
+  [secrecy.md](secrecy.md#soft-and-hard)). Every other target folds to 0. Lane
+  multiplies are not part of the query.
 - The result is a `u8`, like `$mach.build.pie`. An unknown `op` or `width`, a
   missing argument, or arguments on any other path is a compile error that names
   what is accepted.

@@ -12,7 +12,7 @@ build first named them
 pub rec Provider;
 ```
 
-a library the link is offered, and whether only its static form is
+a library the link is offered by name
 
 ## rec Linkage
 
@@ -103,11 +103,10 @@ the library the imported symbol `name` is pinned to, nil when it is pinned to no
 ## fun register_provider
 
 ```mach
-pub fun register_provider(l: *Linkage, name: intern.StrId, is_static: bool) err[fail.Fail];
+pub fun register_provider(l: *Linkage, name: intern.StrId) err[fail.Fail];
 ```
 
-offer the link the library `name`; a library offered again keeps its place,
-and is static only while every offer of it is
+offer the link the library `name`; a library offered again keeps its place
 
 ## fun provider
 

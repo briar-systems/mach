@@ -7,7 +7,7 @@ pub fun execute(bp: *build_plan.BuildPlan, backing: *A.Allocator, oa: *A.Allocat
 sink: *readout.Sink) res[outcome.BuildOutcome, fail.Fail];
 ```
 
-run every planned cell cold: each unit gets its own session and arena over `backing`
+run every planned cell cold: each unit gets its own session and heap over `backing`
 and is torn down when it finishes, so nothing of one unit's frontend survives into the
 next. a unit whose requirement failed is recorded as blocked and skipped; a unit that
 fails is recorded and the remaining units still run. ok is the outcome of the whole
@@ -15,30 +15,9 @@ plan, its severity the worst unit's; err is a failure of the engine itself, neve
 unit
 
 bp: the plan, its closure located; read only, and trusted as planned
-backing: the allocator each unit's arena grows from; released per unit
+backing: the allocator each unit's heap draws its spans from; released per unit
 oa: owns the returned outcome and every path and text in it
 sink: where every unit, failure, diagnostic and phase row is sent as it happens; nil for none
 ret: the outcome, released with outcome.outcome_dnit, or an engine failure whose text
          `oa` owns
-
-## fun execute_warm
-
-```mach
-pub fun execute_warm(bp: *build_plan.BuildPlan, unit_index: usize, s: *session.Session,
-published: *publication.Publications, oa: *A.Allocator, sink: *readout.Sink) res[outcome.BuildOutcome, fail.Fail];
-```
-
-run one planned cell through a caller-owned session, reusing its query cache, source
-overlays and typed surface across calls (the editor's build path). the session's
-diagnostic store is replaced for the call and its build allocator is a per-call arena
-restored on return, so every raw product a caller borrowed from the session before the
-call is expired by it
-
-bp: the plan, its closure located; read only, and trusted as planned: neither the manifest
-            nor the closure is read again, and a manifest the session reloaded since is refused
-unit_index: the cell to run; out of range is an internal failure
-s: the warm session; its sources and queries carry over between calls
-oa: owns the returned outcome
-sink: where the unit's failures, diagnostics and phase rows are sent as they happen; nil for none
-ret: the outcome of that one unit, released with outcome.outcome_dnit, or an engine failure
 

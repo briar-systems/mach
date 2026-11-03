@@ -144,12 +144,6 @@ pub fun type_to_str(sc: *sema_context.SemaContext, t: type.TypeId) res[str, fail
 pub fun type_str_free(sc: *sema_context.SemaContext, owned: str);
 ```
 
-## fun check_float_capability
-
-```mach
-pub fun check_float_capability(sc: *sema_context.SemaContext, tid: type.TypeId, span: lang_source.Span);
-```
-
 ## fun report_no_field
 
 ```mach

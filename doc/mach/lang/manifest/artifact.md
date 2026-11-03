@@ -1,5 +1,18 @@
 # mach.lang.manifest.artifact
 
+## fun subsystem_named
+
+```mach
+pub fun subsystem_named(a: *A.Allocator, name: str) res[*mink_subsystem.Subsystem, str];
+```
+
+the PE subsystem mink spells `name`, or why it names none: the spelling a previous major took
+for the graphical subsystem is refused naming mink's, and any other unknown name is refused
+listing mink's
+
+a: owns the refusal's text
+ret: mink's row, or the refusal's text
+
 ## fun parse_artifacts
 
 ```mach
@@ -47,8 +60,7 @@ whether a `need` entry of `a` selects `other`, a different artifact
 ## fun expand_artifact_output
 
 ```mach
-pub fun expand_artifact_output(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
-a: *ArtifactDef, project_work: str, vars: *template.Values) res[str, fail.Fail];
+pub fun expand_artifact_output(alloc: *A.Allocator, itn: *intern.Interner, a: *ArtifactDef, project_work: str, vars: *template.Values) res[str, fail.Fail];
 ```
 
 expand an artifact's `out` for the target `vars` names; a refusal points at the `out` value

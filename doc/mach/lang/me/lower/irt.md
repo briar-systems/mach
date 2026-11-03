@@ -316,3 +316,13 @@ pub fun stride(l: *mirl_target.Layout, ty: Type) res[u64, fail.Fail];
 
 the bytes from one element of the array `ty` to the next
 
+## fun padded
+
+```mach
+pub fun padded(l: *mirl_target.Layout, t: *types.Table, ty: Type) res[bool, fail.Fail];
+```
+
+whether `ty` lays out a byte no member or element of it covers: a gap between a
+structure's members or after its last, a union member shorter than the union, or such a
+byte inside any member or element
+

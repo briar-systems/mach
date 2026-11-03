@@ -1,6 +1,8 @@
 # mach.lang.fe.sema.op
 
-checking an `#[op]` function's signature against the instruction row it names
+an `#[intrinsic]` function names an instruction of an owner's operation catalog: mirl's
+capability op catalog and masc's SPIR-V rows state them. mach holds no table of
+its own, so an op of the selected target is refused until mach reads theirs
 
 ## fun validate_op
 

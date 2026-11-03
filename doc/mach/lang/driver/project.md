@@ -147,11 +147,29 @@ since: the first query operation this project ran; a product read between its
 context_digest: the fingerprint of the build context, once frozen
 context_frozen: the build context is frozen, so a change to it is refused
 
+## rec LinkJob
+
+```mach
+pub rec LinkJob;
+```
+
+the link a build asks of its link stage: the artifact it writes and the action that writes it
+from the stage's current objects. the stage decides whether it runs
+
+artifact: the path the action writes, whose bytes the stage records
+ctx: the build's state the action reads
+run: writes `artifact`
+
 ## fun link_name_for
 
 ```mach
 pub fun link_name_for(p: *Project, bare: intern.StrId) res[intern.StrId, fail.Fail];
 ```
+
+the name an `ext` symbol links by: its source name, which the object format's
+writer spells as the format names a C symbol
+the name a C symbol `bare` takes in the target's objects: the prefix mink's
+registry gives a C symbol of the target's format on its architecture, then `bare`
 
 ## fun release_staged
 

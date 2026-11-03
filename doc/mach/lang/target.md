@@ -1,107 +1,23 @@
 # mach.lang.target
 
-## fwd target_model.ENDIAN_LITTLE
+target resolution: a target request read against the owners' catalogs
+
+a request names an architecture and a system as mink spells them, the
+environment its manifest states, a calling convention, a baseline as masc
+spells one and the extensions it adds. each part is looked up in its owner's
+catalog: mink's architecture and system lists, the host mink states for them,
+masc's extension catalog of the architecture, and the target mirl assembles
+from the five. every fact the build reads of a target comes from those rows,
+and mach states none of them. what mach requires of the images it builds,
+where the manifest states nothing, is its own data (mach.lang.target.defaults)
+
+## fwd resolved.Target
 
 ```mach
-fwd target_model.ENDIAN_LITTLE
+fwd resolved.Target
 ```
 
-forwards [`mach.lang.target.model.ENDIAN_LITTLE`](target/model.md#val-endian_little)
-
-## fwd target_model.ENDIAN_BIG
-
-```mach
-fwd target_model.ENDIAN_BIG
-```
-
-forwards [`mach.lang.target.model.ENDIAN_BIG`](target/model.md#val-endian_big)
-
-## fwd binding.Binding
-
-```mach
-fwd binding.Binding
-```
-
-forwards [`mach.lang.target.binding.Binding`](target/binding.md#rec-binding)
-
-## fwd resolved.ct_mul_admitted
-
-```mach
-fwd resolved.ct_mul_admitted
-```
-
-forwards [`mach.lang.target.resolved.ct_mul_admitted`](target/resolved.md#fun-ct_mul_admitted)
-
-## fwd resolved.ct_mul_dit_cells
-
-```mach
-fwd resolved.ct_mul_dit_cells
-```
-
-forwards [`mach.lang.target.resolved.ct_mul_dit_cells`](target/resolved.md#fun-ct_mul_dit_cells)
-
-## fwd resolved.dit_mode_guaranteed
-
-```mach
-fwd resolved.dit_mode_guaranteed
-```
-
-forwards [`mach.lang.target.resolved.dit_mode_guaranteed`](target/resolved.md#fun-dit_mode_guaranteed)
-
-## fwd target_registry.TargetRegistry
-
-```mach
-fwd target_registry.TargetRegistry
-```
-
-forwards [`mach.lang.target.registry.TargetRegistry`](target/registry.md#rec-targetregistry)
-
-## fwd target_registry.registry_init_with_allocator
-
-```mach
-fwd target_registry.registry_init_with_allocator
-```
-
-forwards [`mach.lang.target.registry.registry_init_with_allocator`](target/registry.md#fun-registry_init_with_allocator)
-
-## fwd target_registry.registry_published
-
-```mach
-fwd target_registry.registry_published
-```
-
-forwards [`mach.lang.target.registry.registry_published`](target/registry.md#fun-registry_published)
-
-## fun host_os_id
-
-```mach
-pub fun host_os_id() u32;
-```
-
-## fun host_arch_id
-
-```mach
-pub fun host_arch_id() u32;
-```
-
-## fun host_abi_id
-
-```mach
-pub fun host_abi_id() u32;
-```
-
-## fun register_all
-
-```mach
-pub fun register_all(reg: *TargetRegistry, debug: *target_of.DebugVTable) err[fail.Fail];
-```
-
-fill an empty registry with the catalog and publish it; a published registry
-is left as it is. a registry refused part way holds nothing that needs
-undoing, and is dropped
-
-reg: the registry
-debug: the dwarf debug model, which the backend declares
+forwards [`mach.lang.target.resolved.Target`](target/resolved.md#rec-target)
 
 ## rec TargetRequest
 
@@ -112,13 +28,13 @@ pub rec TargetRequest;
 ## fun target_request
 
 ```mach
-pub fun target_request(isa_name: str, os_name: str, abi_name: str) TargetRequest;
+pub fun target_request(arch_name: str, sys_name: str, abi_name: str) TargetRequest;
 ```
 
-## fun with_baseline
+## fun with_isa
 
 ```mach
-pub fun with_baseline(req: *TargetRequest, baseline_name: str);
+pub fun with_isa(req: *TargetRequest, isa_name: str);
 ```
 
 ## fun with_extensions
@@ -145,50 +61,29 @@ pub fun with_env(req: *TargetRequest, env_name: str, origin: str);
 pub fun with_image(req: *TargetRequest, base: u64, stack_reserve: u64, stack_commit: u64);
 ```
 
-## fun select_of
+## fun host_arch_name
 
 ```mach
-pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str, of_name: str) res[binding.Binding, fail.Fail];
+pub fun host_arch_name() str;
 ```
 
-## fun resolve
+the architecture the compiler itself was built for, as its manifest names it
+
+## fun host_sys_name
 
 ```mach
-pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[binding.Binding, fail.Fail];
+pub fun host_sys_name() str;
 ```
 
-## fun registered_selection
+the system the compiler itself was built for, as its manifest names it
+
+## fun host_abi_name
 
 ```mach
-pub fun registered_selection(os_vt: *lang_target_os.OsVTable, arch_vt: *isa.IsaVTable, abi_vt: *abi.AbiVTable, model: *target_model.Machine) isa.IsaVTable;
+pub fun host_abi_name() str;
 ```
 
-the instruction set a [target.*] table selects by naming a registered isa and no
-baseline: the template narrowed to its host's floor, or the whole template
-where the host states none and a target names the baseline. model backs the
-returned vtable's model pointer and must outlive it
-
-## fun registered_tuple_capability
-
-```mach
-pub fun registered_tuple_capability(os_vt: *lang_target_os.OsVTable, arch_vt: *isa.IsaVTable, abi_vt: *abi.AbiVTable, of_vt: *target_of.OfVTable) u32;
-```
-
-the capability of one cell of the target matrix as a [target.*] table naming
-these four registered spellings composes it: the registered template alone
-overstates an isa whose default selection may lack the float registers an
-abi passes in
-
-## fun selection_spelling
-
-```mach
-pub fun selection_spelling(isa_vt: *isa.IsaVTable, model: *target_model.Machine, buf: *u8, cap: usize) str;
-```
-
-the selection an instruction set and the model selected on it hold (a resolved
-target's `model`, or the one registered_selection filled), written into buf: an
-isa whose catalog spells a selection gives masc's spelling of the extensions the
-model holds, every other isa its name
+the calling convention the compiler itself was built for, as its manifest names it
 
 ## fun host_request
 
@@ -196,19 +91,120 @@ model holds, every other isa its name
 pub fun host_request() TargetRequest;
 ```
 
-the request a `native` selection, or a [target.*] table naming the host
-without an object format, resolves: the host os, isa and abi by their
-registered names, the object format left to the os default
+the request a `native` selection resolves: the host's architecture, system and
+convention as the compiler's own manifest names them. no environment is filled
+in, since env comes from a manifest alone
 
-## fun select
+## fun set_of
 
 ```mach
-pub fun select(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str) res[binding.Binding, fail.Fail];
+pub fun set_of(arch: *mink_arch.Arch) opt[*masc_set.Set];
 ```
+
+masc's instruction set for `arch`, none where masc serves it with none
+
+## fun resolve
+
+```mach
+pub fun resolve(a: *A.Allocator, req: *TargetRequest) res[resolved.Target, fail.Fail];
+```
+
+the target a request names, every fact of it read from its owners
+
+## rec ArtifactName
+
+```mach
+pub rec ArtifactName;
+```
+
+the naming of an artifact's file, as mink's system names a file of its kind:
+prefix, then the artifact's name, then the extension
+
+prefix: written before its name
+suffix: written after its name, with its dot
+
+## fun executable_output
+
+```mach
+pub fun executable_output(t: *resolved.Target) *mink_output.Kind;
+```
+
+the executable mink builds on the target: a finished module for a format that
+finishes its modules, a position independent executable where the host runs one
+by default or its loader places every image, else a fixed-address executable
+
+## fun output_of
+
+```mach
+pub fun output_of(t: *resolved.Target, kind: catalog_artifact.Kind) opt[*mink_output.Kind];
+```
+
+the output mink builds for an artifact of `kind` on the target: its executable for
+an executable, a shared library, and for an object directory its relocatable
+objects. none for a static library, which mink archives rather than links
 
 ## fun artifact_naming
 
 ```mach
-pub fun artifact_naming(tgt: *binding.Binding, kind: catalog_artifact.Kind) res[target_of.ArtifactName, fail.Fail];
+pub fun artifact_naming(a: *A.Allocator, t: *resolved.Target, kind: catalog_artifact.Kind) res[ArtifactName, fail.Fail];
 ```
+
+the name an artifact of `kind` takes on the target, mink's system's name of the
+file: an archive for a static library, and for every other kind the kind of file
+its output reads back as. refused, with mink's reason, where the system builds none
+
+## fun finished_modules
+
+```mach
+pub fun finished_modules(t: *resolved.Target) bool;
+```
+
+whether the target's object format holds each module as its own artifact, as a
+SPIR-V module: mink builds a module of the format and no executable of it
+
+## fun flat_image
+
+```mach
+pub fun flat_image(t: *resolved.Target) bool;
+```
+
+whether the target's object format is a flat image, mink's flat format
+
+## fun states_subsystem
+
+```mach
+pub fun states_subsystem(t: *resolved.Target) bool;
+```
+
+whether the target's images state a subsystem, as mink's host of it names a
+default one, so an artifact's `subsystem`, icon and manifest mean something
+
+## fun carries_record
+
+```mach
+pub fun carries_record(t: *resolved.Target) bool;
+```
+
+whether a module's object is read again by a link or the cache, so it carries
+mach's record section: every object but a flat image's and a finished module's
+
+## rec Cell
+
+```mach
+pub rec Cell;
+```
+
+one target the new path builds: a host mink states, the convention and the floor
+it runs under, as mirl assembles them
+
+## fun cells
+
+```mach
+pub fun cells(a: *A.Allocator, out: *Vector[Cell]) err[fail.Fail];
+```
+
+every target the new path builds over its host's floor, in mink's system order: each
+host row of each system, under the convention it calls by default, else each its
+architecture's family names, that mirl assembles a target from. a host that states no
+floor is a target only with the `isa` its chip implements, so it is not listed
 

@@ -102,7 +102,7 @@ is_default: `default = true`: the artifact is in the default selection; false
               when the key is absent
 is_export: `export = true`: the library a bare `use <id>;` binds and whose
               requirements travel to consumers; at most one artifact sets it
-subsystem: the `subsystem` key, console when absent; only "console" and "gui" parse
+subsystem: the `subsystem` key as mink spells the PE subsystem, console when absent
 icon: the `icon` path, or STR_NIL when absent; `bin` artifacts only
 app_manifest: the `manifest` path, or STR_NIL when absent; `bin` artifacts only
 at: where the table's key is written
@@ -248,6 +248,18 @@ in_at: where each `in` entry is written, parallel to `in`
 out_at: where each `out` entry is written, parallel to `out`
 need_at: where each `need` entry is written, parallel to `need`
 
+## rec SourceRoot
+
+```mach
+pub rec SourceRoot;
+```
+
+a module prefix an entry build binds to a directory with `-s name=dir`: a package with
+no manifest, whose modules are the files under the directory
+
+name: the prefix, a portable identifier
+dir: the directory, as the command line wrote it
+
 ## rec Manifest
 
 ```mach
@@ -279,6 +291,9 @@ links: the `[link.*]` tables, nil when none
 link_count: length of `links`
 steps: the `[step.*]` tables, nil when none
 step_count: length of `steps`
+sources: the source roots an entry build binds with `-s`, each a package with no
+                manifest; nil for a manifest read from mach.toml, which states none
+source_count: length of `sources`
 
 ## fun empty
 

@@ -270,13 +270,3 @@ pub fun image_digest(alloc: *A.Allocator, out: *u8) err[Fault];
 the sha-256 of the running image's file, read through a handle checked to be
 the file the process maps
 
-## fun image_build_id
-
-```mach
-pub fun image_build_id(out: *u8) usize;
-```
-
-the build id the linker wrote into the running image, read from its mapped
-headers; 0 when the image carries none (a compiler linked by a seed that
-predates the note) or the host has no reader
-

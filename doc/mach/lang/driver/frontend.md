@@ -192,6 +192,18 @@ dropping the warnings a declaration's `#[expect]` acknowledges and the ones the
 profile's `allow` silences, then reporting each judged expectation nothing
 fulfilled. a warning replayed from the cache passes through here as a fresh one does
 
+## fun release_lowered
+
+```mach
+pub fun release_lowered(p: *project.Project, mid: session.ModuleId) err[fail.Fail];
+```
+
+give back a lowered module's front-end products, which nothing the build runs after its
+lowering reads: its syntax tree, its resolution, its lowering scope and what its typing holds
+beyond the interface its importers' lowerings read. its expectations are collected first and
+held, so a later refresh judges them as it would have. called inside the operation that
+lowered it, once its own products and every reader of them are done
+
 ## fun finish_query_phase
 
 ```mach

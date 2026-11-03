@@ -53,6 +53,8 @@ use mach.lang.type.query.subst;
 use mach.lang.textbuild;
 use masc_operand: masc.core.operand;
 use masc_row:     masc.core.row;
+use core_ct:      masc.core.ct;
+use core_set:     masc.core.set;
 use core_state:   masc.core.state;
 use mink.model.symbol;
 use mirl_slice:    mirl.base.slice;
@@ -90,13 +92,16 @@ pub rec LoopFrame {
 # the target lowering builds for: the tuple its modules are named for, the target mirl
 # assembled from it, and the context the build's selection opened, none for a target with
 # no baseline
-# slots: the address space the target's frame slots live in
+# slots:  the address space the target's frame slots live in
+# timing: how masc's instruction set for the target answers a constant-time requirement,
+#         none when masc serves the architecture with none
 pub rec Machine {
     tuple:    mirl_module.Tuple;
     target:   *mirl_target.Target;
     ctx:      opt[*core_state.Context];
     slots:    u32;
     directed: bool;
+    timing:   opt[core_ct.Timing];
 }
 
 # the machine of a target the owners assembled, borrowing it
@@ -105,7 +110,10 @@ pub fun machine_of(x: *assembled.Assembled) res[Machine, fail.Fail] {
     if (x.based) { ctx = opt[*core_state.Context].some{?x.basis.context}; }
     val slots: res[u32, mirl_record.Error] = mirl_record.slot_space(?x.target);
     if (sel slots.err) { ret res[Machine, fail.Fail].err{fail.message("mirl's target states no address space for its frame slots")}; }
-    ret res[Machine, fail.Fail].ok{Machine{tuple: x.tuple, target: ?x.target, ctx: ctx, slots: slots.ok, directed: false}};
+    var timing: opt[core_ct.Timing] = opt[core_ct.Timing].none{};
+    val set:    opt[*core_set.Set]  = mirl_target.set_of(?x.target);
+    if (sel set.some) { timing = opt[core_ct.Timing].some{set.some.ct}; }
+    ret res[Machine, fail.Fail].ok{Machine{tuple: x.tuple, target: ?x.target, ctx: ctx, slots: slots.ok, directed: false, timing: timing}};
 }
 
 # what the driver reads of a lowered module beside its mirl module: its name and, for
@@ -291,8 +299,6 @@ pub rec LowerContext {
     # the signature of the function being built, whose pointer parameters a copy of a
     # function takes in the classes its call sites pass
     fn_sig: Type;
-    # the source name of the function being built, which diagnostics name it by
-    fn_shown: lang_source.Span;
     # the function being built is `#[naked]`, its body asm that binds no local
     fn_naked: bool;
 
@@ -1067,7 +1073,6 @@ pub fun begin_function(lc: *LowerContext, fn_index: u32, ret_type: Type) {
     lc.ret_type   = ret_type;
     lc.fn_ret_sem = type.TYPE_NIL;
     lc.fn_sig     = irt.NONE;
-    lc.fn_shown   = lang_source.Span{offset: 0, len: 0};
     lc.fn_naked   = false;
 
     lc.pack_slots    = nil;
@@ -1861,6 +1866,157 @@ fun held_secret(lc: *LowerContext, tid: type.TypeId) bool {
     ret held.ok;
 }
 
+# the secret byte ranges of a value of source type `tid`, held in `ir`, laid out from
+# `base`, appended to `out` in no order: a secret's every byte, an aggregate's secret
+# members and elements, every case of a union or a tag's payload, and nothing of a tag's
+# discriminant or of padding
+pub fun secret_ranges(lc: *LowerContext, tid: type.TypeId, ir: Type, base: u64, out: *collections_vector.Vector[mirl_global.Range]) err[fail.Fail] {
+    if (stack.exhausted()) { ret err[fail.Fail].err{refuse_type_nesting(lc)}; }
+    val rtid: type.TypeId = substitute_type(lc, tid);
+    if (type.is_nil(rtid) || type.is_error(rtid) || !held_secret(lc, rtid)) { ret err[fail.Fail].ok{}; }
+    val t_opt: opt[*type.Type] = type.get(?lc.s.types, rtid);
+    if (sel t_opt.none) { ret err[fail.Fail].ok{}; }
+    val t:  *type.Type          = t_opt.some;
+    val k:  type.TypeKind       = t.kind;
+    val tt: *types.Table        = ?lc.m.types;
+    val l:  *mirl_target.Layout = ?lc.builder.layout;
+
+    if (k == type.TYPE_SECRET) {
+        val n: res[u64, fail.Fail] = irt.size(l, ir);
+        if (sel n.err) { ret err[fail.Fail].err{n.err}; }
+        ret range_add(out, base, n.ok);
+    }
+
+    if (k == type.TYPE_ARRAY) {
+        val count: u64 = irt.count(tt, ir);
+        if (count == 0) { ret err[fail.Fail].ok{}; }
+        val stride: res[u64, fail.Fail] = irt.stride(l, ir);
+        if (sel stride.err) { ret err[fail.Fail].err{stride.err}; }
+        # one element's ranges, repeated at each element's offset
+        var one: collections_vector.Vector[mirl_global.Range] = collections_vector.init[mirl_global.Range](lc.s.alloc);
+        fin { collections_vector.dnit[mirl_global.Range](?one); }
+        val walked: err[fail.Fail] = secret_ranges(lc, t.data.array.base, irt.element(tt, ir), 0, ?one);
+        if (sel walked.err) { ret walked; }
+        ranges_settle(?one);
+        var i: u64 = 0;
+        for (i < count) {
+            var j: usize = 0;
+            for (j < one.len) {
+                val added: err[fail.Fail] = range_add(out, base + i * stride.ok + one.data[j].offset, one.data[j].length);
+                if (sel added.err) { ret added; }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        ret err[fail.Fail].ok{};
+    }
+
+    val nominal: bool = k == type.TYPE_REC || k == type.TYPE_UNI || k == type.TYPE_TAG || k == type.TYPE_INSTANCE;
+    if (!nominal) { ret err[fail.Fail].ok{}; }
+    val fields: err[fail.Fail] = subst.ensure_fields(lc.s, rtid);
+    if (sel fields.err) { ret err[fail.Fail].err{refuse(lc, fields.err)}; }
+    val n: u32 = type.field_count(?lc.s.types, rtid);
+
+    if (k == type.TYPE_TAG || type.is_tag(?lc.s.types, rtid)) {
+        if (irt.member_count(tt, ir) < 2) { ret err[fail.Fail].ok{}; }
+        val payload: Type                = irt.member(tt, ir, 1);
+        val at:      res[u64, fail.Fail] = irt.offset(l, ir, 1);
+        if (sel at.err) { ret err[fail.Fail].err{at.err}; }
+        var c: u32 = 0;
+        for (c < n) {
+            val fe: opt[*type.FieldEntry] = type.field_at(?lc.s.types, rtid, c);
+            if (sel fe.some) {
+                val case_ty: type.TypeId = fe.some.ty;
+                if (!type.is_nil(case_ty)) {
+                    val walked: err[fail.Fail] = secret_ranges(lc, case_ty, irt.member(tt, payload, tag_payload_member(lc, rtid, c)), base + at.ok, out);
+                    if (sel walked.err) { ret walked; }
+                }
+            }
+            c = c + 1;
+        }
+        ret err[fail.Fail].ok{};
+    }
+
+    val is_union: bool = type.is_union(?lc.s.types, rtid);
+    var i:        u32  = 0;
+    for (i < n) {
+        val fe: opt[*type.FieldEntry] = type.field_at(?lc.s.types, rtid, i);
+        if (sel fe.none) { ret err[fail.Fail].err{fail.message("lower: the field table of a nominal type is missing an in-range field")}; }
+        var at: u64 = 0;
+        if (!is_union) {
+            val off: res[u64, fail.Fail] = irt.offset(l, ir, i);
+            if (sel off.err) { ret err[fail.Fail].err{off.err}; }
+            at = off.ok;
+        }
+        val walked: err[fail.Fail] = secret_ranges(lc, fe.some.ty, irt.member(tt, ir, i), base + at, out);
+        if (sel walked.err) { ret walked; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# `out` with the range of `length` bytes from `offset`, joined to the last range where it
+# touches it
+fun range_add(out: *collections_vector.Vector[mirl_global.Range], offset: u64, length: u64) err[fail.Fail] {
+    if (length == 0) { ret err[fail.Fail].ok{}; }
+    if (out.len > 0) {
+        val last: *mirl_global.Range = ?out.data[out.len - 1];
+        if (offset >= last.offset && offset <= last.offset + last.length) {
+            if (offset + length > last.offset + last.length) { last.length = offset + length - last.offset; }
+            ret err[fail.Fail].ok{};
+        }
+    }
+    val pushed: res[usize, A.Error] = collections_vector.push[mirl_global.Range](out, mirl_global.Range{offset: offset, length: length});
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# `ranges` sorted by offset with every overlapping or touching pair joined, the one spelling
+# mirl takes of a set of bytes
+fun ranges_settle(ranges: *collections_vector.Vector[mirl_global.Range]) {
+    var i: usize = 1;
+    for (i < ranges.len) {
+        val x: mirl_global.Range = ranges.data[i];
+        var j: usize             = i;
+        for (j > 0 && ranges.data[j - 1].offset > x.offset) {
+            ranges.data[j] = ranges.data[j - 1];
+            j              = j - 1;
+        }
+        ranges.data[j] = x;
+        i              = i + 1;
+    }
+    var kept: usize = 0;
+    i = 0;
+    for (i < ranges.len) {
+        val x: mirl_global.Range = ranges.data[i];
+        if (kept > 0 && x.offset <= ranges.data[kept - 1].offset + ranges.data[kept - 1].length) {
+            val last: *mirl_global.Range = ?ranges.data[kept - 1];
+            if (x.offset + x.length > last.offset + last.length) { last.length = x.offset + x.length - last.offset; }
+        }
+        or {
+            ranges.data[kept] = x;
+            kept              = kept + 1;
+        }
+        i = i + 1;
+    }
+    ranges.len = kept;
+}
+
+# how much of a global of source type `tid`, held in `ir`, is secret, its ranges held in
+# `ranges`, which must outlive the answer until the module copies it
+pub fun global_secrecy(lc: *LowerContext, tid: type.TypeId, ir: Type, ranges: *collections_vector.Vector[mirl_global.Range]) res[mirl_global.Secrecy, fail.Fail] {
+    val walked: err[fail.Fail] = secret_ranges(lc, tid, ir, 0, ranges);
+    if (sel walked.err) { ret res[mirl_global.Secrecy, fail.Fail].err{walked.err}; }
+    ranges_settle(ranges);
+    if (ranges.len == 0) { ret res[mirl_global.Secrecy, fail.Fail].ok{mirl_global.Secrecy.public{}}; }
+    val size: res[u64, fail.Fail] = irt.size(?lc.builder.layout, ir);
+    if (sel size.err) { ret res[mirl_global.Secrecy, fail.Fail].err{size.err}; }
+    if (ranges.len == 1 && ranges.data[0].offset == 0 && ranges.data[0].length == size.ok) {
+        ret res[mirl_global.Secrecy, fail.Fail].ok{mirl_global.Secrecy.whole{}};
+    }
+    ret res[mirl_global.Secrecy, fail.Fail].ok{mirl_global.Secrecy.ranges{Slice[mirl_global.Range]{data: ranges.data, size: ranges.len}}};
+}
+
 pub fun substitute_type(lc: *LowerContext, tid: type.TypeId) type.TypeId {
     if (lc.scope.subst == nil || lc.scope.subst_len == 0) { ret tid; }
     ret recover_type(lc, subst.substitute(lc.s, tid, ?lc.scope.subst_owner, lc.scope.subst, lc.scope.subst_len));
@@ -2109,6 +2265,24 @@ pub fun emit_dbg_birth(lc: *LowerContext, name_span: lang_source.Span, ty_sem: t
     ret builder.after_err_pub(?lc.builder);
 }
 
+# the source variable the module's global `g` is, named at `name_span` with source type
+# `ty_sem`, which a debugger reads its type and declaration line from; nothing when this
+# lowering keeps no debug information
+pub fun describe_global(lc: *LowerContext, g: u32, name_span: lang_source.Span, ty_sem: type.TypeId) err[fail.Fail] {
+    val debug_type: res[opt[mirl_debug.Type], fail.Fail] = debug_type_of(lc, substitute_type(lc, ty_sem));
+    if (sel debug_type.err)     { ret err[fail.Fail].err{debug_type.err}; }
+    if (sel debug_type.ok.none) { ret err[fail.Fail].ok{}; }
+    val declared: opt[mirl_debug.Location] = builder.location_of(?lc.builder, lang_source.location(lc.scope.a.file_id, name_span));
+    if (sel declared.none) { ret err[fail.Fail].ok{}; }
+    val name:  View                                      = View{data: (?lc.scope.source[name_span.offset])::str, len: name_span.len};
+    val bound: res[mirl_debug.Binding, mirl_debug.Error] = mirl_debug.bind(?lc.m.debug,
+        mirl_debug.Variable{name: name, type: debug_type.ok.some, declared: declared.some, parameter: opt[u32].none{}});
+    if (sel bound.err) { ret err[fail.Fail].err{debug_failed(bound.err)}; }
+    val described: err[mirl_module.Error] = mirl_module.describe_global(lc.m, id.Global{index: g}, opt[mirl_debug.Binding].some{bound.ok});
+    if (sel described.err) { ret err[fail.Fail].err{fail.message("lower: mirl refused a global's debug variable")}; }
+    ret err[fail.Fail].ok{};
+}
+
 pub fun symbol_of(lc: *LowerContext, sid: resolve.SymbolId) opt[*resolve.Symbol] {
     if (resolve.symbol_is_nil(sid))                            { ret opt[*resolve.Symbol].none{}; }
     if (resolve.symbol_index(sid) >= lc.scope.rr.symbol_count) { ret opt[*resolve.Symbol].none{}; }
@@ -2198,6 +2372,16 @@ pub fun define_global(lc: *LowerContext, g: GlobalData) res[u32, fail.Fail] {
     node.data.tls       = g.tls;
     node.data.linkage   = g.linkage;
     node.data.constant  = g.constant;
+    if (sel g.secret.ranges) {
+        val ranged: res[Slice[mirl_global.Range], A.Error] = mirl_slice.copy[mirl_global.Range](lc.m.a, g.secret.ranges);
+        if (sel ranged.err)              { ret res[u32, fail.Fail].err{fail.refused(ranged.err)}; }
+        if (sel node.data.secret.ranges) { val freed: err[A.Error] = mirl_slice.release[mirl_global.Range](lc.m.a, node.data.secret.ranges); }
+        node.data.secret = mirl_global.Secrecy.ranges{ranged.ok};
+    }
+    or {
+        if (sel node.data.secret.ranges) { val freed: err[A.Error] = mirl_slice.release[mirl_global.Range](lc.m.a, node.data.secret.ranges); }
+        node.data.secret = g.secret;
+    }
     if (sel g.section.some) {
         val named: res[View, A.Error] = mirl_slice.copy_view(lc.m.a, g.section.some.name);
         if (sel named.err) { ret res[u32, fail.Fail].err{fail.refused(named.err)}; }
@@ -2292,10 +2476,15 @@ fun class_copy_spell(out: *collections_vector.Vector[u8], a: str, b: str) err[A.
     ret err[A.Error].ok{};
 }
 
-# the module's global `name` of `ty`, declared here when another module defines it
-pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type, tls: opt[mirl_global.Tls]) res[u32, fail.Fail] {
+# the module's global `name` of `ty`, of source type `sem` (TYPE_NIL for bytes no source
+# type describes), declared here when another module defines it
+pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type, tls: opt[mirl_global.Tls], sem: type.TypeId) res[u32, fail.Fail] {
     val existing: opt[u32] = global_named(lc, name);
     if (sel existing.some) { ret res[u32, fail.Fail].ok{existing.some}; }
+    var ranges: collections_vector.Vector[mirl_global.Range] = collections_vector.init[mirl_global.Range](lc.s.alloc);
+    fin { collections_vector.dnit[mirl_global.Range](?ranges); }
+    val secret: res[mirl_global.Secrecy, fail.Fail] = global_secrecy(lc, sem, ty, ?ranges);
+    if (sel secret.err) { ret res[u32, fail.Fail].err{secret.err}; }
     var g: GlobalData;
     g.name      = view_text(lc, name);
     g.type      = ty;
@@ -2305,6 +2494,7 @@ pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type, tl
     g.tls       = tls;
     g.linkage   = external_linkage();
     g.constant  = false;
+    g.secret    = secret.ok;
     ret add_global(lc, g);
 }
 
