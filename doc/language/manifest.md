@@ -544,15 +544,15 @@ such an image is refused at link rather than silently dropped.
 
 | Axis  | Values |
 |-------|--------|
-| `arch` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv` |
-| `sys`  | `linux`, `windows`, `darwin`, `freestanding`, `vulkan` |
-| `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `spirv` |
-| `of`  | `elf`, `macho`, `coff`, `flat`, `spirv` |
-| `env` | `vulkan1.0`, `vulkan1.1`, `vulkan1.2`, `vulkan1.3` |
+| `arch` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv`, `wasm32` |
+| `sys`  | `linux`, `windows`, `darwin`, `freestanding`, `vulkan`, `wasi` |
+| `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `shader`, `basic` |
+| `of`  | `elf`, `macho`, `coff`, `flat`, `spirv`, `wasm` |
+| `env` | `vulkan1.0`, `vulkan1.1`, `vulkan1.2`, `vulkan1.3`, `preview1` |
 
 Each `arch`, `sys` and `of` value is the name of a row of mink's catalog: `arch` an
 architecture, `sys` a system and `of` a format. mach reads the spelling from that row,
-and the catalog's rows mach has no target for (`x86`, `wasm32`, `uefi`, `wasi`, ...)
+and the catalog's rows mach has no target for (`x86`, `uefi`, ...)
 are not values here. A spelling mink names otherwise is refused where it is written,
 naming the new spelling and carrying the rewrite `mach migrate` applies:
 
@@ -713,7 +713,7 @@ linker: the build publishes the entry module at the artifact's resolved `out` (o
 [target.gpu]
 arch = "spirv"
 sys  = "vulkan"
-abi = "spirv"
+abi = "shader"
 # no `of`: the finished-module format resolves on its own
 ```
 
@@ -860,7 +860,7 @@ class, which the 8-bit feature does not reach.
 [target.gpu]
 arch        = "spirv"
 sys         = "vulkan"
-abi        = "spirv"
+abi        = "shader"
 env        = "vulkan1.0"
 ext = ["int16", "int64", "float64"]
 ```
@@ -887,7 +887,7 @@ appendix's required version: 1.0, 1.3, 1.5 and 1.6.
 [target.gpu]
 arch = "spirv"
 sys  = "vulkan"
-abi = "spirv"
+abi = "shader"
 env = "vulkan1.2"
 ```
 

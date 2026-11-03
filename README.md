@@ -148,7 +148,7 @@ abi      = "ilp32"
 [target.gpu]
 arch = "spirv"
 sys  = "vulkan"
-abi = "spirv"
+abi = "shader"
 env = "vulkan1.3"
 ```
 
