@@ -46,13 +46,13 @@ format, its index naming each member's exported symbols
 ## fun link_image
 
 ```mach
-pub fun link_image(p: *project.Project, kind: *mink_output.Kind, flat: bool, objects: **Object, count: u32,
+pub fun link_image(p: *project.Project, kind: *mink_output.Kind, objects: **Object, count: u32,
 links: *input.Input, link_count: u32, destination: str, image: *LoadedImageOptions) err[fail.Fail];
 ```
 
 the image of `kind` mink links in memory from the `count` objects at `objects`, in link order,
 then the `link_count` inputs at `links`, written to `destination` with the resources
-`image` declares. a flat image is refused
+`image` declares, laid out as the artifact and its placed globals state
 
 ## fun ordered_objects
 

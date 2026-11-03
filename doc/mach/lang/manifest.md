@@ -96,6 +96,14 @@ fwd mach.lang.manifest.model.ArtifactDef
 
 forwards [`mach.lang.manifest.model.ArtifactDef`](manifest/model.md#rec-artifactdef)
 
+## fwd mach.lang.manifest.model.RegionDef
+
+```mach
+fwd mach.lang.manifest.model.RegionDef
+```
+
+forwards [`mach.lang.manifest.model.RegionDef`](manifest/model.md#rec-regiondef)
+
 ## fwd mach.lang.manifest.model.ProfileDef
 
 ```mach
@@ -504,13 +512,13 @@ fwd mach.lang.manifest.plan.scope_is_dependency
 
 forwards [`mach.lang.manifest.plan.scope_is_dependency`](manifest/plan.md#fun-scope_is_dependency)
 
-## fwd mach.lang.manifest.plan.local_path_demanded_by_step
+## fwd mach.lang.manifest.plan.local_path_demanded
 
 ```mach
-fwd mach.lang.manifest.plan.local_path_demanded_by_step
+fwd mach.lang.manifest.plan.local_path_demanded
 ```
 
-forwards [`mach.lang.manifest.plan.local_path_demanded_by_step`](manifest/plan.md#fun-local_path_demanded_by_step)
+forwards [`mach.lang.manifest.plan.local_path_demanded`](manifest/plan.md#fun-local_path_demanded)
 
 ## fwd mach.lang.manifest.plan.required_artifact_uses_target
 

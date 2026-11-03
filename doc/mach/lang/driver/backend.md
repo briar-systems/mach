@@ -121,6 +121,22 @@ pub fun section_bytes(o: *Object, name: str, len: *usize) *u8;
 
 the bytes of the first section of `o` named `name`, nil and zero for none
 
+## fun section_names
+
+```mach
+pub fun section_names(o: *Object, out: *Vector[View]) err[fail.Fail];
+```
+
+the names of the sections of `o` its producer named, borrowed from the object
+
+## fun symbols_in
+
+```mach
+pub fun symbols_in(o: *Object, name: View, out: *Vector[View]) err[fail.Fail];
+```
+
+the names of the symbols `o` places in its sections named `name`, borrowed from the object
+
 ## fun release_object
 
 ```mach
@@ -178,6 +194,21 @@ pub fun symbol_name(o: *Object, i: usize) View;
 
 the name of symbol `i` of `o`
 
+## rec Plan
+
+```mach
+pub rec Plan;
+```
+
+the layout an artifact states its image, which mink lays out as a linker script would
+
+sections: the output sections placed ahead of the rest, in order
+regions: the memory regions
+runs: the output sections that run in a region
+loads: the output sections whose bytes load in a region other than the one they run in
+offsets: the output sections placed at an offset, one per `#[at]` offset
+size: the most bytes the image loads from its base, none for no ceiling
+
 ## rec Image
 
 ```mach
@@ -192,6 +223,7 @@ libdirs: the directories a library named by name is searched in ahead of the sys
 libdir_count: how many
 stack_reserve: the main stack's reserve, none for the format's default
 stack_commit: the main stack's commit, none for the format's default
+plan: the layout the artifact states, nil where it states none
 
 ## fun link
 

@@ -158,6 +158,28 @@ pub val ENCODE: Phase = 20
 
 masc encoding the settled layout
 
+## val TARGET
+
+```mach
+pub val TARGET: Phase = 21
+```
+
+the build's target resolved and its back half opened: mink's formats, mirl's assembled and readied target
+
+## val STAGE_COUNT
+
+```mach
+pub val STAGE_COUNT: usize              = 7
+```
+
+mirl's and masc's stages, the rows a module's step carves out of its codegen row, in the order mirl runs them
+
+## val STAGES
+
+```mach
+pub val STAGES:      [STAGE_COUNT]Phase = [STAGE_COUNT]Phase;
+```
+
 ## fun label_of
 
 ```mach
@@ -539,6 +561,14 @@ pub fun span_end(pr: *Progress, ph: Phase, host: Phase, start: Instant);
 ```
 
 the span from start belongs to ph, and leaves the phase host that ran it
+
+## fun span_into
+
+```mach
+pub fun span_into(pr: *Progress, ph: Phase, start: Instant);
+```
+
+the span from start belongs to the hosted phase ph, and was spent outside every other row
 
 ## fun carve
 

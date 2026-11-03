@@ -138,6 +138,8 @@ origin: the module that declares the function
 decl: its declaration there
 name: the copy's linkage name, the function's own with the classes it takes
 sig: the copy's signature
+instance: the instance of the module's set the copy is of, fe_sema.instance.NONE for a
+          plain function
 
 ## rec LowerRequest
 
@@ -693,6 +695,15 @@ pub fun instance_of_call(lc: *LowerContext, eid: ast_id.ExprId) res[*fe_sema.ins
 the instance sema decided the call or generic reference `eid` names, in the frame the
 code is read through
 
+## fun instance_id_of_call
+
+```mach
+pub fun instance_id_of_call(lc: *LowerContext, eid: ast_id.ExprId) res[u32, fail.Fail];
+```
+
+the index in the module's set of the instance sema decided the call or generic reference
+`eid` names, in the frame the code is read through
+
 ## fun instance_link_name
 
 ```mach
@@ -916,12 +927,13 @@ the module's function `name`, declared here when another module defines it
 ## fun class_copy
 
 ```mach
-pub fun class_copy(lc: *LowerContext, origin: session.ModuleId, decl: ast_id.DeclId, base: intern.StrId, sig: Type) res[u32, fail.Fail];
+pub fun class_copy(lc: *LowerContext, origin: session.ModuleId, decl: ast_id.DeclId, base: intern.StrId, sig: Type, instance: u32) res[u32, fail.Fail];
 ```
 
 the copy of the function `decl` of `origin`, linked as `base`, whose pointer parameters
 take the classes `sig` states, declared here and lowered once the module's own
-declarations are. one name is one copy, so a copy asked for twice is asked for once
+declarations are, of the instance `instance` of the module's set where it is one. one
+name is one copy, so a copy asked for twice is asked for once
 
 ## fun ensure_extern_global
 

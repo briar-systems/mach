@@ -60,14 +60,15 @@ pub fun dependency_scope(root: *Manifest, owner: *Manifest) Scope;
 pub fun scope_is_dependency(s: *Scope) bool;
 ```
 
-## fun local_path_demanded_by_step
+## fun local_path_demanded
 
 ```mach
-pub fun local_path_demanded_by_step(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+pub fun local_path_demanded(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, t: *TargetDef,
 expanded_path: str, proj_out: str, v: *template.Values) res[bool, fail.Fail];
 ```
 
-whether some build step produces a path; `step_producing_out` as a bool
+whether the build makes a path for target `t`: some build step's output, or the output of
+an artifact built for `t`, as a shared library an executable of the project links
 
 ## fun required_artifact_uses_target
 

@@ -37,6 +37,21 @@ pub fun target_request(arch_name: str, sys_name: str, abi_name: str) TargetReque
 pub fun with_isa(req: *TargetRequest, isa_name: str);
 ```
 
+## fun with_code_model
+
+```mach
+pub fun with_code_model(req: *TargetRequest, code_model: str);
+```
+
+## val SHARED_CODE_MODEL
+
+```mach
+pub val SHARED_CODE_MODEL: str = "pic"
+```
+
+the code model mirl builds a shared object under, by its name for it, on every system
+with shared objects: each system's row states which symbols another image may preempt
+
 ## fun with_extensions
 
 ```mach
@@ -126,12 +141,13 @@ suffix: written after its name, with its dot
 ## fun executable_output
 
 ```mach
-pub fun executable_output(t: *resolved.Target) *mink_output.Kind;
+pub fun executable_output(t: *resolved.Target, imports: bool) *mink_output.Kind;
 ```
 
 the executable mink builds on the target: a finished module for a format that
 finishes its modules, a position independent executable where the host runs one
-by default or its loader places every image, else a fixed-address executable
+by default or its loader places every image, an executable mink binds libraries into
+where it `imports` from one and the format builds one, else a fixed-address executable
 
 ## fun output_of
 
@@ -141,7 +157,8 @@ pub fun output_of(t: *resolved.Target, kind: catalog_artifact.Kind) opt[*mink_ou
 
 the output mink builds for an artifact of `kind` on the target: its executable for
 an executable, a shared library, and for an object directory its relocatable
-objects. none for a static library, which mink archives rather than links
+objects. none for a static library, which mink archives rather than links. every
+executable kind reads back as the same file, so the executable here imports nothing
 
 ## fun artifact_naming
 

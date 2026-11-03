@@ -81,12 +81,6 @@ a structure whose members stand at the offsets mach states, as a packed record's
 pub fun union_of(t: *types.Table, members: *Type, n: u32) res[Type, fail.Fail];
 ```
 
-## fun handle
-
-```mach
-pub fun handle(t: *types.Table, kind: View) res[Type, fail.Fail];
-```
-
 ## fun signature
 
 ```mach
@@ -103,6 +97,15 @@ pub fun restated(t: *types.Table, sig: Type, params: *Type, n: u32) res[Type, fa
 
 the signature `sig` with its `n` parameters of the types at `params`, its results,
 extensions and convention kept
+
+## fun variadic
+
+```mach
+pub fun variadic(t: *types.Table, sig: Type) res[Type, fail.Fail];
+```
+
+the signature `sig` taking unnamed arguments after its parameters, as a C function
+declared with `...` does
 
 ## fun shape
 
@@ -169,6 +172,22 @@ pub fun is_function(t: *types.Table, ty: Type) bool;
 ```mach
 pub fun is_handle(t: *types.Table, ty: Type) bool;
 ```
+
+## fun handle
+
+```mach
+pub fun handle(t: *types.Table, kind: View, operands: *types.HandleOperand, n: u32) res[Type, fail.Fail];
+```
+
+the handle of the kind `kind`, as its family mints it, made of the `n` operands at `operands`
+
+## fun handle_of
+
+```mach
+pub fun handle_of(t: *types.Table, ty: Type, kind: View) bool;
+```
+
+whether `ty` is a handle of the kind `kind`
 
 ## fun is_struct
 

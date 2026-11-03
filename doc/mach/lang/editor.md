@@ -50,8 +50,8 @@ file: an open buffer's FileId, the root of the analysis
 phase: how far the frontend runs, PHASE_PARSE, PHASE_RESOLVE or PHASE_SEMA
 selection: the overrides of mach's selection for a file under a project's src, empty for
                    none; its request is composed from the manifest as a project snapshot's is
-standalone_target: for a file under no manifest, a borrowed resolved target whose
-                   registry-owned definitions outlive the Session; nil selects the registered host target.
+standalone_target: for a file under no manifest, a borrowed resolved target; nil selects
+                   the host target.
                    a project's target selection is never replaced by it
 standalone_build: for a file under no manifest, the options it is analyzed with, since no profile
                    composes them; a project's are never taken from it
