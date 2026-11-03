@@ -44,16 +44,37 @@ built out/app  48 modules  1 MiB  in 358ms
 Each module's object is made by a step that lowers it, holds it to mirl's
 verifier and has mirl compile it. The `lower` and `verify` rows are the sums of
 those stages over the modules, moved out of the `codegen` row, which keeps the
-rest. After the rows each counter prints its total over the unit's modules:
+rest. mirl times its own stages when a readout is shown, and each moves out of
+`codegen` into a row of its own:
+
+| Row | What it times | Read from |
+|---|---|---|
+| `verify` | mach's verifier run over the lowered module, and every run mirl makes in a checked compile | mach, mirl |
+| `passes` | the neutral passes of mirl's schedule | mirl |
+| `select` | instruction selection, with the constant-time check of selected code | mirl |
+| `alloc` | register allocation | mirl |
+| `frame` | the frame and the steps that finish framed code | mirl |
+| `mirl emit` | block layout, variable ranges and the texts asked for, less masc's two rows | mirl |
+| `layout` | masc laying out the object | masc |
+| `encode` | masc encoding the settled layout | masc |
+
+A test object's mirl and masc stages add to the same rows. When the clock
+refuses a read, the stage it would have timed comes up short, and the build
+reports `readout.clock_refused` naming the module instead of showing a zero.
+
+After the rows each counter prints its total over the unit's modules:
 
 | Counter | What it counts | Read from |
 |---|---|---|
 | `functions` | the functions of the lowered modules | mirl's module |
 | `ir instrs` | the instructions lowering built into their bodies | mirl's bodies |
-| `verify runs` | the runs of mirl's verifier mach made over them | mach |
+| `verify runs` | the runs of mirl's verifier over them, mach's and those mirl makes in a checked compile | mach, mirl |
 | `allocated blocks` | the blocks a step allocated from its heap while it lowered and compiled the module, a moved reallocation counting again | std's heap |
 | `allocated bytes` | the bytes of those allocations, which never go down | std's heap |
 | `heap peak` | the most bytes a step's heap mapped, the largest over the modules | std's heap |
+| `selected instrs` | the machine instructions selection made | mirl |
+| `allocated instrs` | the machine instructions after register allocation | mirl |
+| `alloc rounds` | the rounds of register allocation | mirl |
 
 Under `-vv` each module prints a line per stage and per counter as its step
 finishes.
