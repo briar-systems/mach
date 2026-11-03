@@ -237,10 +237,36 @@ pub val TYPE_F16: TypeKind = 27
 
 IEEE binary16, appended like the 128-bit integers
 
+## val TYPE_U256
+
+```mach
+pub val TYPE_U256: TypeKind = 28
+```
+
+the 256 and 512-bit integers, appended like the 128-bit integers
+
+## val TYPE_I256
+
+```mach
+pub val TYPE_I256: TypeKind = 29
+```
+
+## val TYPE_U512
+
+```mach
+pub val TYPE_U512: TypeKind = 30
+```
+
+## val TYPE_I512
+
+```mach
+pub val TYPE_I512: TypeKind = 31
+```
+
 ## val TYPE_KIND_COUNT
 
 ```mach
-pub val TYPE_KIND_COUNT: u32 = TYPE_F16::u32 + 1
+pub val TYPE_KIND_COUNT: u32 = TYPE_I512::u32 + 1
 ```
 
 one past the last kind, so an appended kind takes over this reference. the

@@ -66,6 +66,8 @@ sys: the required `sys` key
 abi: the required `abi` key
 of: the `of` object-format override, or STR_NIL when absent
 platform: the `platform` tag, or STR_NIL when absent
+code_model: the `code_model` key, mirl's psABI name of the code model, or STR_NIL
+               for mirl's default; mirl refuses a model the target does not offer
 base: the `base` load address, 0 when absent
 stack_reserve: the `stack_reserve` byte count, 0 when absent
 stack_commit: the `stack_commit` byte count, 0 when absent
@@ -91,7 +93,7 @@ name: the table key; a portable identifier
 kind: the required `kind` key, decoded through the artifact kind catalog
 entry: the required `entry` key, a project-relative path under `[project].src`
 out: the required `out` key, an unexpanded path template relative to the
-              project root; `{project.work}` places the output under the work directory
+               project root; `{project.work}` places the output under the work directory
 targets: the required `targets` array of declared target names or "*"; nil when empty
 target_count: length of `targets`
 link: the `link` array of `[link.<name>]` names; nil when absent or empty
@@ -99,12 +101,20 @@ link_count: length of `link`
 need: category-qualified step and artifact names or globs; nil when absent or empty
 need_count: length of `need`
 is_default: `default = true`: the artifact is in the default selection; false
-              when the key is absent
+               when the key is absent
 is_export: `export = true`: the library a bare `use <id>;` binds and whose
-              requirements travel to consumers; at most one artifact sets it
-subsystem: the `subsystem` key, console when absent; only "console" and "gui" parse
+               requirements travel to consumers; at most one artifact sets it
+subsystem: the `subsystem` key as mink spells the PE subsystem, console when absent
 icon: the `icon` path, or STR_NIL when absent; `bin` artifacts only
 app_manifest: the `manifest` path, or STR_NIL when absent; `bin` artifacts only
+sections: the `sections` key, the output sections the link places ahead of the
+               rest, in order; nil when absent
+section_count: length of `sections`
+size: the `size` key, the most bytes the image loads from its base, none
+               when absent
+regions: the `[artifact.X.region.<name>]` tables, the memory regions the link
+               lays sections into; nil when none is written
+region_count: length of `regions`
 at: where the table's key is written
 default_at: where its `default` value is written, the zero place when absent
 export_at: where its `export` value is written, the zero place when absent
@@ -113,6 +123,27 @@ out_at: where its `out` value is written
 targets_at: where its `targets` value is written
 link_at: where each `link` entry is written, parallel to `link`
 need_at: where each `need` entry is written, parallel to `need`
+
+## rec RegionDef
+
+```mach
+pub rec RegionDef;
+```
+
+one `[artifact.X.region.<name>]` memory region as parsed, laid out as a linker script's
+MEMORY lays one
+
+name: the table key; a portable identifier
+origin: the required `origin` key, the address it starts at
+length: the required `length` key, the bytes it spans
+access: the required `access` key, of mink's layout READABLE, WRITABLE and
+            EXECUTABLE, written as the letters r, w and x
+run: the `run` key, the output sections that run in it; nil when absent
+run_count: length of `run`
+load: the `load` key, the output sections whose bytes load in it and run in
+            another region; nil when absent
+load_count: length of `load`
+at: where the table's key is written
 
 ## rec ProfileDef
 
@@ -248,6 +279,18 @@ in_at: where each `in` entry is written, parallel to `in`
 out_at: where each `out` entry is written, parallel to `out`
 need_at: where each `need` entry is written, parallel to `need`
 
+## rec SourceRoot
+
+```mach
+pub rec SourceRoot;
+```
+
+a module prefix an entry build binds to a directory with `-s name=dir`: a package with
+no manifest, whose modules are the files under the directory
+
+name: the prefix, a portable identifier
+dir: the directory, as the command line wrote it
+
 ## rec Manifest
 
 ```mach
@@ -279,6 +322,9 @@ links: the `[link.*]` tables, nil when none
 link_count: length of `links`
 steps: the `[step.*]` tables, nil when none
 step_count: length of `steps`
+sources: the source roots an entry build binds with `-s`, each a package with no
+                manifest; nil for a manifest read from mach.toml, which states none
+source_count: length of `sources`
 
 ## fun empty
 

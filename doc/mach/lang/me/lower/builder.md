@@ -12,14 +12,6 @@ a comparison is widened to one and a condition is compared with zero
 pub rec Builder;
 ```
 
-## rec Computed
-
-```mach
-pub rec Computed;
-```
-
-a computation on a secret: where it is and its opcode
-
 ## fun init
 
 ```mach
@@ -304,6 +296,24 @@ pub fun set_secret(b: *Builder, s: bool);
 ```
 
 whether the next instructions are marked secret: a load, call or atomic read of a secret
+
+## fun set_access
+
+```mach
+pub fun set_access(b: *Builder, secret: bool);
+```
+
+the next reads through an address state the memory they read as the source type says:
+secret, which marks them so, or public. other reads state nothing, and the constant-time
+walk holds what they reach as it holds any access it cannot place
+
+## fun end_access
+
+```mach
+pub fun end_access(b: *Builder);
+```
+
+the next reads state nothing of the memory they read
 
 ## fun set_volatile
 
@@ -819,8 +829,18 @@ pub fun emit_fence(b: *Builder, order: Ordering) err[fail.Fail];
 pub fun emit_call(b: *Builder, callee: value.Value, sig: Type, args: *value.Value, n: u32) res[value.Value, fail.Fail];
 ```
 
-a call of `callee` through the signature `sig`. an aggregate argument is passed whole,
-read from the address it travels at, and an aggregate result lands in a slot of its own
+a call of `callee` through the signature `sig`, every argument named. an aggregate
+argument is passed whole, read from the address it travels at, and an aggregate result
+lands in a slot of its own
+
+## fun emit_call_named
+
+```mach
+pub fun emit_call_named(b: *Builder, callee: value.Value, sig: Type, args: *value.Value, n: u32, named: Named) res[value.Value, fail.Fail];
+```
+
+a call of `callee` through the signature `sig`, of which `named` states how many
+arguments are named, the rest being a C-variadic call's unnamed ones
 
 ## fun param
 

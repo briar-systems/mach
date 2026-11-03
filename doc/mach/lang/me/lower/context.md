@@ -15,12 +15,14 @@ pub rec Machine;
 the target lowering builds for: the tuple its modules are named for, the target mirl
 assembled from it, and the context the build's selection opened, none for a target with
 no baseline
-slots: the address space the target's frame slots live in
+slots:  the address space the target's frame slots live in
+timing: how masc's instruction set for the target answers a constant-time requirement,
+        none when masc serves the architecture with none
 
 ## fun machine_of
 
 ```mach
-pub fun machine_of(x: *target_owner.Assembled) res[Machine, fail.Fail];
+pub fun machine_of(x: *assembled.Assembled) res[Machine, fail.Fail];
 ```
 
 the machine of a target the owners assembled, borrowing it
@@ -136,6 +138,8 @@ origin: the module that declares the function
 decl: its declaration there
 name: the copy's linkage name, the function's own with the classes it takes
 sig: the copy's signature
+instance: the instance of the module's set the copy is of, fe_sema.instance.NONE for a
+          plain function
 
 ## rec LowerRequest
 
@@ -644,6 +648,26 @@ pub fun type_is_secret(lc: *LowerContext, tid: type.TypeId) bool;
 pub fun type_contains_secret(lc: *LowerContext, tid: type.TypeId) bool;
 ```
 
+## fun secret_ranges
+
+```mach
+pub fun secret_ranges(lc: *LowerContext, tid: type.TypeId, ir: Type, base: u64, out: *collections_vector.Vector[mirl_global.Range]) err[fail.Fail];
+```
+
+the secret byte ranges of a value of source type `tid`, held in `ir`, laid out from
+`base`, appended to `out` in no order: a secret's every byte, an aggregate's secret
+members and elements, every case of a union or a tag's payload, and nothing of a tag's
+discriminant or of padding
+
+## fun global_secrecy
+
+```mach
+pub fun global_secrecy(lc: *LowerContext, tid: type.TypeId, ir: Type, ranges: *collections_vector.Vector[mirl_global.Range]) res[mirl_global.Secrecy, fail.Fail];
+```
+
+how much of a global of source type `tid`, held in `ir`, is secret, its ranges held in
+`ranges`, which must outlive the answer until the module copies it
+
 ## fun substitute_type
 
 ```mach
@@ -670,6 +694,15 @@ pub fun instance_of_call(lc: *LowerContext, eid: ast_id.ExprId) res[*fe_sema.ins
 
 the instance sema decided the call or generic reference `eid` names, in the frame the
 code is read through
+
+## fun instance_id_of_call
+
+```mach
+pub fun instance_id_of_call(lc: *LowerContext, eid: ast_id.ExprId) res[u32, fail.Fail];
+```
+
+the index in the module's set of the instance sema decided the call or generic reference
+`eid` names, in the frame the code is read through
 
 ## fun instance_link_name
 
@@ -741,6 +774,24 @@ pub fun fn_sig_of_type(lc: *LowerContext, tid: type.TypeId) res[FnSig, fail.Fail
 
 the signature a value of the source function type `tid` is called through
 
+## fun c_variadic_fixed
+
+```mach
+pub fun c_variadic_fixed(lc: *LowerContext, tid: type.TypeId) opt[u32];
+```
+
+how many parameters the C-variadic function type `tid` names, none for any other type
+
+## fun variadic_sig_of_type
+
+```mach
+pub fun variadic_sig_of_type(lc: *LowerContext, tid: type.TypeId, tail: *type.TypeId, tail_len: u32) res[FnSig, fail.Fail];
+```
+
+the signature one call of the C-variadic function type `tid` is made through: its
+named parameters and then the `tail_len` types at `tail` of the arguments it passes
+unnamed, as mirl states a variadic call
+
 ## fun ext_of
 
 ```mach
@@ -781,14 +832,6 @@ pub fun module_source(lc: *LowerContext) str;
 
 the source of the module in scope, read when the scope was made
 
-## fun declared_op
-
-```mach
-pub fun declared_op(lc: *LowerContext, d: Declared) opt[*target_definition.Op];
-```
-
-the operation of the selected target an `#[op]` function stands for, none for any other
-
 ## fun emit_dbg_birth
 
 ```mach
@@ -799,6 +842,16 @@ slot: opt[value.Value]) err[fail.Fail];
 a source variable named at `name_span` begins: one held in a stack slot is bound to the
 slot, which describes it wherever it lives, and any other, a parameter, to its value
 from here on
+
+## fun describe_global
+
+```mach
+pub fun describe_global(lc: *LowerContext, g: u32, name_span: lang_source.Span, ty_sem: type.TypeId) err[fail.Fail];
+```
+
+the source variable the module's global `g` is, named at `name_span` with source type
+`ty_sem`, which a debugger reads its type and declaration line from; nothing when this
+lowering keeps no debug information
 
 ## fun symbol_of
 
@@ -874,20 +927,42 @@ the module's function `name`, declared here when another module defines it
 ## fun class_copy
 
 ```mach
-pub fun class_copy(lc: *LowerContext, origin: session.ModuleId, decl: ast_id.DeclId, base: intern.StrId, sig: Type) res[u32, fail.Fail];
+pub fun class_copy(lc: *LowerContext, origin: session.ModuleId, decl: ast_id.DeclId, base: intern.StrId, sig: Type, instance: u32) res[u32, fail.Fail];
 ```
 
 the copy of the function `decl` of `origin`, linked as `base`, whose pointer parameters
 take the classes `sig` states, declared here and lowered once the module's own
-declarations are. one name is one copy, so a copy asked for twice is asked for once
+declarations are, of the instance `instance` of the module's set where it is one. one
+name is one copy, so a copy asked for twice is asked for once
 
 ## fun ensure_extern_global
 
 ```mach
-pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type) res[u32, fail.Fail];
+pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type, tls: opt[mirl_global.Tls], sem: type.TypeId) res[u32, fail.Fail];
 ```
 
-the module's global `name` of `ty`, declared here when another module defines it
+the module's global `name` of `ty`, of source type `sem` (TYPE_NIL for bytes no source
+type describes), declared here when another module defines it
+
+## fun thread_model
+
+```mach
+pub fun thread_model(lc: *LowerContext, foreign_image: bool) opt[mirl_global.Tls];
+```
+
+how a thread-local of this lowering's image is reached: an executable's own block sits
+at an offset the link fixes, and a shared library's at one its loader fixes at start,
+so a library that loads after start has no static block to hold it (no general-dynamic
+access is lowered). a thread-local another image may define is reached as a library's
+
+## fun declared_thread
+
+```mach
+pub fun declared_thread(lc: *LowerContext, d: Declared) opt[mirl_global.Tls];
+```
+
+the thread model a reference to the module binding `d` declares takes, none for one
+that is not thread-local
 
 ## fun add_global
 

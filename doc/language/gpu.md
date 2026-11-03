@@ -327,7 +327,7 @@ queried with `OpImageQuerySizeLod` instead.
 Each is refused at the call with `op.operand_value`.
 
 ```mach fragment
-#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, MULTISAMPLED, SAMPLED, FORMAT_UNKNOWN)]
+#[handle("spirv", "image", f32, "2D", 0, 0, 1, 1, "Unknown")]
 pub def TextureMS;
 
 #[intrinsic("spirv", "core", "OpImageFetch")]
@@ -338,7 +338,7 @@ fun sample_count(img: TextureMS) i32;
 ```
 
 ```mach fragment
-#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, STORAGE, FORMAT_RGBA8)]
+#[handle("spirv", "image", f32, "2D", 0, 0, 0, 2, "Rgba8")]
 pub def Target2D;
 
 #[intrinsic("spirv", "core", "OpImageWrite")]
@@ -567,7 +567,7 @@ A bodyless `def` carrying this decorator declares a type whose representation is
 **not the program's**: the owning target mints it and the pipeline binds it.
 
 ```mach fragment
-#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
+#[handle("spirv", "image", f32, "2D", 0, 0, 0, 1, "Unknown")]
 pub def Texture2D;
 
 #[handle("spirv", "sampled_image", Texture2D)]
@@ -575,17 +575,21 @@ pub def Sampler2D;
 ```
 
 The first argument names the target and the second the type constructor within it.
-Both are constant strings matched against the target's own definition table.
+Both are constant strings, which name the kind the target mints as `target.constructor`, such as `spirv.image`, in mirl's handle catalog of the selected target.
 Everything after them is **operands to that
 constructor**, never rule knobs: the rules a handle carries are fixed and closed
 (see [types.md](types.md)) and never vary per declaration.
 
-An operand is an ordinary comptime constant, with one exception. A constructor that
-composes over another handle takes a **type name**, and that is the only place a
-decorator argument is read as a type rather than as a value. It exists so a
-composing declaration names what it wraps instead of restating it, which is what
-keeps the two from disagreeing. The named type must be a handle the same target
-mints, with the constructor that position requires.
+An operand is an ordinary comptime constant, an integer where the target's row
+takes a number and a string naming one of its grammar's enumerants where the row
+takes an enumerant (`"2D"`, `"Rgba8"`), except where the kind's part
+takes a **type**: there the operand is a type name, the only place a decorator
+argument is read as a type rather than as a value. An image's texel and a
+cooperative matrix's component are a scalar written as itself (`f32`), and a
+constructor that composes over another handle names that handle, so a composing
+declaration names what it wraps instead of restating it, which keeps the two from
+disagreeing. The named type must be a handle the same target mints, of the kind that
+position requires.
 
 A declaration addressed to a target this build did not select is **inert**: it
 still denotes a type and still sizes at the target's pointer width, so a library of

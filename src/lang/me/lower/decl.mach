@@ -11,8 +11,7 @@ use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_join;
 
-use A:          std.allocator;
-use std_format: std.format;
+use A: std.allocator;
 
 use mach.lang.diagnostic;
 use diagnostic_kind: mach.lang.diagnostic.kind;
@@ -35,16 +34,18 @@ use lower_context: mach.lang.me.lower.context;
 use lower_expr:    mach.lang.me.lower.expr;
 use mach.lang.me.lower.irt;
 use mach.lang.me.lower.mangle;
-use lower_oblivious: mach.lang.me.lower.oblivious;
-use lower_shader:    mach.lang.me.lower.shader;
-use lower_stmt:      mach.lang.me.lower.stmt;
+use lower_shader: mach.lang.me.lower.shader;
+use lower_stmt:   mach.lang.me.lower.stmt;
 use mach.lang.me.lower.value;
 use mach.lang.module;
+use mach.lang.placement;
 use mach.lang.session;
 use session_embed: mach.lang.session.embed;
 use lang_source:   mach.lang.source;
 use mach.lang.stack;
 use mach.lang.type;
+
+use core_ct: masc.core.ct;
 
 use mink_section: mink.model.section;
 use mink.model.symbol;
@@ -243,12 +244,24 @@ fun warn_reexport_has_instances(ctx: *lower_context.LowerContext, symbol: intern
 # a `pub` one of the root project is the library's surface
 fun defined_linkage(ctx: *lower_context.LowerContext, pub_decl: bool) Linkage {
     if (pub_decl && ctx.unit.root_project) { ret Linkage{binding: ?symbol.GLOBAL, visibility: ?symbol.DEFAULT}; }
-    ret Linkage{binding: ?symbol.GLOBAL, visibility: ?symbol.HIDDEN};
+    ret Linkage{binding: ?symbol.GLOBAL, visibility: internal_visibility(ctx)};
 }
 
 # an instance every instantiating module defines, of which the link keeps one
-fun weak_linkage() Linkage {
-    ret Linkage{binding: ?symbol.WEAKLY, visibility: ?symbol.HIDDEN};
+fun weak_linkage(ctx: *lower_context.LowerContext) Linkage {
+    ret Linkage{binding: ?symbol.WEAKLY, visibility: internal_visibility(ctx)};
+}
+
+# the visibility that keeps a definition inside its image: hidden, or the default where the
+# format exports only what its export directives name and states no visibility, as PE does
+fun internal_visibility(ctx: *lower_context.LowerContext) *symbol.Visibility {
+    if (ctx.machine.directed) { ret ?symbol.DEFAULT; }
+    ret ?symbol.HIDDEN;
+}
+
+# a class copy, local to the module whose call asked for it
+fun class_copy_linkage() Linkage {
+    ret Linkage{binding: ?symbol.LOCAL, visibility: ?symbol.DEFAULT};
 }
 
 # a linkage a `#[export]` declaration puts in a shared library's export table, which is always
@@ -286,6 +299,8 @@ fun lower_fun(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl
 
     val own: opt[*fe_sema.interface.Declaration] = fe_sema.interface.declaration_at(ctx.scope.iface, did);
     if (sel own.none) { ret err[fail.Fail].err{fail.message("lower: a function has no declaration in its module's interface")}; }
+    # an instruction of the target's catalog is no function: each call is the instruction
+    if (!intern.str_is_nil(own.some.op_set)) { ret err[fail.Fail].ok{}; }
     # a body the normal object defines is declared in the test object
     var declared_only: bool = (d.flags & ast_decl.DECL_FLAG_EXT) != 0 || ast_id.stmt_is_nil(d.data.fun_.body);
     if (lower_context.normal_defines(ctx, name)) { declared_only = true; }
@@ -315,27 +330,63 @@ fun constant_time(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) ConstantT
     ret ConstantTime.none{};
 }
 
-pub fun lower_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId) err[fail.Fail] {
-    ret lower_weak_instance(ctx, did, d, name, lower_context.decl_ret_sem(ctx, did));
+# a constant-time function on a target whose instruction set cannot hold it to its mark:
+# wasm's runtime decides the instructions that run, which a soft function is warned of at the
+# mark and a hard one is refused there, and spir-v classifies no timing at all, which is
+# refused there in either mode. mirl answers the same way, and the mark is where the source
+# says it
+fun timing_mark(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) err[fail.Fail] {
+    val found: opt[*ast_decl.Decorator] = decorator.get(ctx.scope.a, d, decorator.CONSTANT_TIME);
+    if (sel found.none) { ret err[fail.Fail].ok{}; }
+    val timing: opt[core_ct.Timing] = ctx.machine.timing;
+    if (sel timing.none) { ret err[fail.Fail].ok{}; }
+    val asked: core_ct.Required = core_ct.required(timing.some);
+    if (sel asked.unguaranteed) {
+        val mode: ConstantTime = constant_time(ctx, d);
+        if (sel mode.hard) {
+            ret err[fail.Fail].err{lower_context.report_gate(ctx, diagnostic_kind.SECRET_TARGET_UNVERIFIABLE, found.some.name,
+                "a hard constant-time function needs its target to guarantee its timing, and the target's instruction set guarantees no instruction's timing, as a later compiler schedules it")};
+        }
+        diagnostic.record(ctx.diags, diagnostic_kind.SECRET_TARGET_UNENFORCEABLE, ctx.scope.a.file_id, found.some.name, core_ct.UNGUARANTEED);
+        ret err[fail.Fail].ok{};
+    }
+    if (sel asked.refused) {
+        var refusal: core_ct.Refusal = asked.refused;
+        ret err[fail.Fail].err{lower_context.report_gate(ctx, diagnostic_kind.SECRET_TARGET_UNVERIFIABLE, found.some.name, core_ct.message(?refusal))};
+    }
+    ret err[fail.Fail].ok{};
 }
 
-pub fun lower_value_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId) err[fail.Fail] {
-    ret lower_weak_instance(ctx, did, d, name, lower_context.decl_ret_sem(ctx, did));
+# an instance, or with `copy` the class copy of it taking its pointers in the classes
+# `copy` states, under the name `name` either way
+pub fun lower_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId, copy: opt[Type]) err[fail.Fail] {
+    ret lower_weak_instance(ctx, did, d, name, lower_context.decl_ret_sem(ctx, did), copy);
+}
+
+pub fun lower_value_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId, copy: opt[Type]) err[fail.Fail] {
+    ret lower_weak_instance(ctx, did, d, name, lower_context.decl_ret_sem(ctx, did), copy);
 }
 
 pub fun lower_pack_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl,
-    name: intern.StrId, types: *type.TypeId, type_len: u32) err[fail.Fail] {
+    name: intern.StrId, types: *type.TypeId, type_len: u32, copy: opt[Type]) err[fail.Fail] {
     if (ast_id.stmt_is_nil(d.data.fun_.body)) { ret err[fail.Fail].ok{}; }
 
     val fixed_count: u32 = d.data.fun_.params_len - 1;
 
     val res_sig: res[lower_context.FnSig, fail.Fail] = lower_context.pack_instance_sig(ctx, lower_context.decl_type_of(ctx, did), types, type_len);
     if (sel res_sig.err) { ret err[fail.Fail].err{res_sig.err}; }
-    val sig: lower_context.FnSig = res_sig.ok;
+    var sig:     lower_context.FnSig = res_sig.ok;
+    var linkage: Linkage             = weak_linkage(ctx);
+    if (sel copy.some) {
+        sig     = lower_context.FnSig{sig: copy.some};
+        linkage = class_copy_linkage();
+    }
+    or {
+        if (lower_context.normal_defines(ctx, name))                                   { ret declare_instance(ctx, name, sig); }
+        if (builder.classes(?ctx.builder) && irt.takes_pointer(?ctx.m.types, sig.sig)) { ret err[fail.Fail].ok{}; }
+    }
 
-    if (lower_context.normal_defines(ctx, name)) { ret declare_instance(ctx, name, sig); }
-
-    val res_idx: res[u32, fail.Fail] = define_function(ctx, name, sig, weak_linkage(), d);
+    val res_idx: res[u32, fail.Fail] = define_function(ctx, name, sig, linkage, d);
     if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
     val fn_index: u32 = res_idx.ok;
 
@@ -399,14 +450,34 @@ fun function_section(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) opt[Se
     ret opt[Section].some{Section{name: View{data: text, len: str_len(text)}, kind: ?mink_section.TEXT}};
 }
 
-fun global_section(ctx: *lower_context.LowerContext, d: *ast_decl.Decl, is_mut: bool) opt[Section] {
-    val named: intern.StrId = decl_section_of(ctx, d);
-    if (intern.str_is_nil(named)) { ret opt[Section].none{}; }
-    val text: str                = intern.text(?ctx.s.interner, named);
+# a global's section, or the section of its own `#[at]` places, named for its offset
+fun global_section(ctx: *lower_context.LowerContext, d: *ast_decl.Decl, is_mut: bool) res[opt[Section], fail.Fail] {
     var kind: *mink_section.Kind = ?mink_section.RODATA;
     if (is_mut)                                          { kind = ?mink_section.DATA; }
     if (decorator.has(ctx.scope.a, d, decorator.THREAD)) { kind = ?mink_section.TLS_DATA; }
-    ret opt[Section].some{Section{name: View{data: text, len: str_len(text)}, kind: kind}};
+    val placed: res[opt[u64], fail.Fail] = decl_at_of(ctx, d);
+    if (sel placed.err) { ret res[opt[Section], fail.Fail].err{placed.err}; }
+    if (sel placed.ok.some) {
+        val at: opt[str] = placement.section_name(?ctx.s.interner, placed.ok.some);
+        if (sel at.none) { ret res[opt[Section], fail.Fail].err{fail.message("lower: a placed global's section name could not be held")}; }
+        ret res[opt[Section], fail.Fail].ok{opt[Section].some{Section{name: View{data: at.some, len: str_len(at.some)}, kind: kind}}};
+    }
+    val named: intern.StrId = decl_section_of(ctx, d);
+    if (intern.str_is_nil(named)) { ret res[opt[Section], fail.Fail].ok{opt[Section].none{}}; }
+    val text: str = intern.text(?ctx.s.interner, named);
+    ret res[opt[Section], fail.Fail].ok{opt[Section].some{Section{name: View{data: text, len: str_len(text)}, kind: kind}}};
+}
+
+# the offset a global's `#[at]` places it at, none without one
+fun decl_at_of(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) res[opt[u64], fail.Fail] {
+    val opt_arg: opt[ast_id.ExprId] = decorator_arg_eid(ctx, d, decorator.AT, 0);
+    if (sel opt_arg.none) { ret res[opt[u64], fail.Fail].ok{opt[u64].none{}}; }
+    val res_u64: res[Type, fail.Fail] = irt.int(?ctx.m.types, 64);
+    if (sel res_u64.err) { ret res[opt[u64], fail.Fail].err{res_u64.err}; }
+    val res_fold: res[value.Value, fail.Fail] = fold_global_init(ctx, ast_id.DECL_NIL, opt_arg.some, res_u64.ok, intern.STR_NIL);
+    if (sel res_fold.err)                  { ret res[opt[u64], fail.Fail].err{res_fold.err}; }
+    if (res_fold.ok.kind != value.VAL_INT) { ret res[opt[u64], fail.Fail].err{fail.message("lower: an `at` sema accepted did not fold to an integer")}; }
+    ret res[opt[u64], fail.Fail].ok{opt[u64].some{value.int_lit(res_fold.ok)}};
 }
 
 fun lower_global(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, is_mut: bool) err[fail.Fail] {
@@ -414,13 +485,6 @@ fun lower_global(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_d
     val res_gty: res[Type, fail.Fail] = lower_context.lower_type(ctx, sem);
     if (sel res_gty.err) { ret err[fail.Fail].err{res_gty.err}; }
     val gty: Type = res_gty.ok;
-
-    # mirl's globals state no secrecy, so a secret one would read as public to every
-    # constant-time walk
-    if (lower_context.type_contains_secret(ctx, sem)) {
-        ret err[fail.Fail].err{lower_context.report_gate(ctx, diagnostic_kind.SECRET_UNVERIFIABLE, d.data.bind.name,
-            "a module-level binding holding a secret waits for mirl to state a global's secrecy (mirl#441)")};
-    }
 
     val res_bare: res[intern.StrId, A.Error] = intern.range_add(?ctx.s.interner, lower_context.module_source(ctx), d.data.bind.name.offset, d.data.bind.name.len);
     if (sel res_bare.err) { ret err[fail.Fail].err{fail.refused(res_bare.err)}; }
@@ -434,7 +498,7 @@ fun lower_global(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_d
     if (lower_context.normal_defines(ctx, name)) { ret err[fail.Fail].ok{}; }
 
     if ((d.flags & ast_decl.DECL_FLAG_EXT) != 0) {
-        val declared: res[u32, fail.Fail] = lower_context.ensure_extern_global(ctx, name, gty, thread_of(ctx, d, true));
+        val declared: res[u32, fail.Fail] = lower_context.ensure_extern_global(ctx, name, gty, thread_of(ctx, d, true), sem);
         if (sel declared.err) { ret err[fail.Fail].err{declared.err}; }
         ret err[fail.Fail].ok{};
     }
@@ -471,26 +535,49 @@ fun lower_global(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_d
     g.initial = opt[id.Constant].some{initial};
     if (!lower_shader.initialized(ctx, d)) { g.initial = opt[id.Constant].none{}; }
     g.alignment = opt[u64].some{align};
-    g.section   = global_section(ctx, d, is_mut);
-    g.tls       = thread_of(ctx, d, false);
-    g.linkage   = exported(ctx, d, defined_linkage(ctx, (d.flags & ast_decl.DECL_FLAG_PUB) != 0));
-    g.constant  = !is_mut;
+    val section: res[opt[Section], fail.Fail] = global_section(ctx, d, is_mut);
+    if (sel section.err) { ret err[fail.Fail].err{section.err}; }
+    g.section  = section.ok;
+    g.tls      = thread_of(ctx, d, false);
+    g.linkage  = exported(ctx, d, defined_linkage(ctx, (d.flags & ast_decl.DECL_FLAG_PUB) != 0));
+    g.constant = !is_mut;
+
+    # how much of it is secret, from its source type, which every constant-time walk seeds
+    var ranges: collections_vector.Vector[mirl_global.Range] = collections_vector.init[mirl_global.Range](ctx.s.alloc);
+    fin { collections_vector.dnit[mirl_global.Range](?ranges); }
+    val secret: res[mirl_global.Secrecy, fail.Fail] = lower_context.global_secrecy(ctx, sem, gty, ?ranges);
+    if (sel secret.err) { ret err[fail.Fail].err{secret.err}; }
+    g.secret = secret.ok;
+
     val res_idx: res[u32, fail.Fail] = lower_context.define_global(ctx, g);
     if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
+    if (ctx.debug) {
+        val described: err[fail.Fail] = lower_context.describe_global(ctx, res_idx.ok, d.data.bind.name, sem);
+        if (sel described.err) { ret described; }
+    }
     ret lower_shader.global_attributes(ctx, d, res_idx.ok);
 }
 
-fun lower_weak_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId, ret_sem: type.TypeId) err[fail.Fail] {
+fun lower_weak_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId, ret_sem: type.TypeId, copy: opt[Type]) err[fail.Fail] {
     if (ast_id.stmt_is_nil(d.data.fun_.body)) { ret err[fail.Fail].ok{}; }
 
     val res_sig: res[lower_context.FnSig, fail.Fail] = lower_context.lower_fn_sig(ctx, did);
     if (sel res_sig.err) { ret err[fail.Fail].err{res_sig.err}; }
-    val sig: lower_context.FnSig = res_sig.ok;
-
-    if (lower_context.normal_defines(ctx, name)) { ret declare_instance(ctx, name, sig); }
-
+    var sig: lower_context.FnSig = res_sig.ok;
     # weak so each instantiating module's copy coalesces; not a `pub` declaration
-    val res_idx: res[u32, fail.Fail] = define_function(ctx, name, sig, weak_linkage(), d);
+    var linkage: Linkage = weak_linkage(ctx);
+    if (sel copy.some) {
+        sig     = lower_context.FnSig{sig: copy.some};
+        linkage = class_copy_linkage();
+    }
+    or {
+        if (lower_context.normal_defines(ctx, name)) { ret declare_instance(ctx, name, sig); }
+        # where pointers name a storage class, an instance taking one is lowered only as the
+        # copies its callers' classes ask for
+        if (builder.classes(?ctx.builder) && irt.takes_pointer(?ctx.m.types, sig.sig)) { ret err[fail.Fail].ok{}; }
+    }
+
+    val res_idx: res[u32, fail.Fail] = define_function(ctx, name, sig, linkage, d);
     if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
     ret emit_function_body(ctx, did, d, res_idx.ok, sig, ret_sem, lang_source.location(ctx.scope.a.file_id, d.data.fun_.name));
 }
@@ -500,7 +587,7 @@ fun lower_weak_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d:
 pub fun lower_class_copy(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId, sig: Type) err[fail.Fail] {
     if (ast_id.stmt_is_nil(d.data.fun_.body)) { ret err[fail.Fail].ok{}; }
     val copied:  lower_context.FnSig = lower_context.FnSig{sig: sig};
-    val res_idx: res[u32, fail.Fail] = define_function(ctx, name, copied, Linkage{binding: ?symbol.LOCAL, visibility: ?symbol.DEFAULT}, d);
+    val res_idx: res[u32, fail.Fail] = define_function(ctx, name, copied, class_copy_linkage(), d);
     if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
     ret emit_function_body(ctx, did, d, res_idx.ok, copied, lower_context.decl_ret_sem(ctx, did), lang_source.location(ctx.scope.a.file_id, d.data.fun_.name));
 }
@@ -522,6 +609,8 @@ fun function_bare_name(ctx: *lower_context.LowerContext, d: *ast_decl.Decl) res[
 # the module's definition of the function `name`, which a reference earlier in the module
 # may have declared
 fun define_function(ctx: *lower_context.LowerContext, name: intern.StrId, sig: lower_context.FnSig, linkage_of: Linkage, d: *ast_decl.Decl) res[u32, fail.Fail] {
+    val marked: err[fail.Fail] = timing_mark(ctx, d);
+    if (sel marked.err) { ret res[u32, fail.Fail].err{marked.err}; }
     val aligned: res[u32, fail.Fail] = decl_align_of(ctx, d);
     if (sel aligned.err) { ret res[u32, fail.Fail].err{aligned.err}; }
     var alignment: opt[u64] = opt[u64].none{};
@@ -631,7 +720,6 @@ fun enter_function(ctx: *lower_context.LowerContext, fn_index: u32, sig: lower_c
     lower_context.begin_function(ctx, fn_index, irt.result_of(t, sig.sig));
     ctx.fn_ret_sem = ret_sem;
     ctx.fn_sig     = sig.sig;
-    ctx.fn_shown   = at.span;
     builder.enter(?ctx.builder, id.Function{index: fn_index}, params.data, secrets.data, n);
     builder.set_loc(?ctx.builder, at);
     ret lower_context.builder_state(ctx);
@@ -781,7 +869,7 @@ fun lower_test(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_dec
 
     val text:    str                 = intern.text(?ctx.s.interner, name);
     val res_idx: res[u32, fail.Fail] = lower_context.define_function(ctx,
-        FunctionData{name: View{data: text, len: str_len(text)}, signature: sig.sig, linkage: Linkage{binding: ?symbol.GLOBAL, visibility: ?symbol.HIDDEN}, constant_time: ConstantTime.none{}, extensions: NO_EXTENSIONS, alignment: opt[u64].none{}, section: opt[Section].none{}},
+        FunctionData{name: View{data: text, len: str_len(text)}, signature: sig.sig, linkage: Linkage{binding: ?symbol.GLOBAL, visibility: internal_visibility(ctx)}, constant_time: ConstantTime.none{}, extensions: NO_EXTENSIONS, alignment: opt[u64].none{}, section: opt[Section].none{}},
         lower_context.FnInfo{name: name, line: line, test: true, noreturn: false, defined: true});
     if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
 
@@ -838,58 +926,8 @@ fun close_function(ctx: *lower_context.LowerContext) err[fail.Fail] {
     val sealed: err[fail.Fail] = builder.seal(?ctx.builder);
     var state:  err[fail.Fail] = lower_context.builder_state(ctx);
     if (sel sealed.err && !sel state.err) { state = sealed; }
-    val computed: opt[builder.Computed] = ctx.builder.computed;
     builder.leave(?ctx.builder);
-    if (sel state.err)     { ret state; }
-    if (sel computed.none) { ret state; }
-    ret report_not_oblivious(ctx, computed.some);
-}
-
-# a function that computes on a secret without declaring `#[constant_time]` is refused at its
-# first such computation; an instance is named by the instantiation as well
-fun report_not_oblivious(ctx: *lower_context.LowerContext, at: builder.Computed) err[fail.Fail] {
-    val node:  *FunctionData              = ?ctx.m.functions.data[ctx.fn_index].data;
-    val shown: res[intern.StrId, A.Error] = intern.range_add(?ctx.s.interner, lower_context.module_source(ctx), ctx.fn_shown.offset, ctx.fn_shown.len);
-    if (sel shown.err) { ret err[fail.Fail].err{fail.refused(shown.err)}; }
-    val name: str                              = intern.text(?ctx.s.interner, shown.ok);
-    val mr:   res[str, std_format.FormatError] = std_format.sprint(ctx.s.alloc,
-        "`{}` performs a constant-time {} on a secret value but is not declared `#[constant_time]`",
-        name, lower_oblivious.class_name(at.code));
-    if (sel mr.err) { ret err[fail.Fail].err{fail.format_refused(mr.err)}; }
-    val msg: str                                          = mr.ok;
-    val br:  res[diagnostic.DiagnosticBuilder, fail.Fail] = diagnostic.builder_init(ctx.s.alloc, diagnostic_kind.SECRET_NOT_OBLIVIOUS, at.loc.file, at.loc.span, msg);
-    A.deallocate[u8](ctx.s.alloc, msg::*u8, str_len(msg) + 1);
-    if (sel br.err) { ret err[fail.Fail].err{br.err}; }
-    var b:    diagnostic.DiagnosticBuilder = br.ok;
-    var info: opt[*lower_context.FnInfo]   = opt[*lower_context.FnInfo].none{};
-    if (node.linkage.binding == ?symbol.WEAKLY) { info = lower_context.fn_info(ctx.unit, ctx.fn_index); }
-    if (sel info.some) {
-        val nr: res[str, std_format.FormatError] = std_format.sprint(ctx.s.alloc, "in the instantiation `{}`", intern.text(?ctx.s.interner, info.some.name));
-        if (sel nr.err) {
-            diagnostic.builder_dnit(?b);
-            ret err[fail.Fail].err{fail.format_refused(nr.err)};
-        }
-        val noted: err[fail.Fail] = diagnostic.attach_note(?b, nr.ok);
-        A.deallocate[u8](ctx.s.alloc, nr.ok::*u8, str_len(nr.ok) + 1);
-        if (sel noted.err) {
-            diagnostic.builder_dnit(?b);
-            ret noted;
-        }
-    }
-    val helped: err[fail.Fail] = diagnostic.attach_help(?b,
-        "annotate the function with `#[constant_time(\"soft\")]` or `#[constant_time(\"hard\")]` to declare its constant-time contract; only a function that merely moves or stores secrets may omit it");
-    if (sel helped.err) {
-        diagnostic.builder_dnit(?b);
-        ret helped;
-    }
-    val committed: err[fail.Fail] = diagnostic.commit(?b, ctx.diags);
-    if (sel committed.err) {
-        diagnostic.builder_dnit(?b);
-        ret committed;
-    }
-    # the rest of the module is still lowered, so every such function is named
-    fail.reject(?ctx.status);
-    ret err[fail.Fail].ok{};
+    ret state;
 }
 
 fun emit_default_terminator(ctx: *lower_context.LowerContext) err[fail.Fail] {

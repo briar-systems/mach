@@ -76,6 +76,34 @@ pub fun char_scan(source: str, span: lang_source.Span) res[u8, Refusal];
 
 the byte a character literal names
 
+## fun str_multiline
+
+```mach
+pub fun str_multiline(text: View) bool;
+```
+
+whether the string literal `text` is the multiline form: lines each led by `\\`
+
+## rec MultilineLine
+
+```mach
+pub rec MultilineLine;
+```
+
+one line of a multiline string literal
+
+start: the first byte of its text, past its `\\`
+len: how many bytes its text holds, up to the line break
+next: where the next line's `\\` starts, the literal's length after the last line
+
+## fun multiline_line
+
+```mach
+pub fun multiline_line(text: View, at: usize) MultilineLine;
+```
+
+the line of the multiline string literal `text` whose `\\` starts at `at`
+
 ## fun str_scan
 
 ```mach

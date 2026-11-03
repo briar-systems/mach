@@ -296,6 +296,38 @@ fwd type_kind.TYPE_F16
 
 forwards [`mach.lang.type.kind.TYPE_F16`](type/kind.md#val-type_f16)
 
+## fwd type_kind.TYPE_U256
+
+```mach
+fwd type_kind.TYPE_U256
+```
+
+forwards [`mach.lang.type.kind.TYPE_U256`](type/kind.md#val-type_u256)
+
+## fwd type_kind.TYPE_I256
+
+```mach
+fwd type_kind.TYPE_I256
+```
+
+forwards [`mach.lang.type.kind.TYPE_I256`](type/kind.md#val-type_i256)
+
+## fwd type_kind.TYPE_U512
+
+```mach
+fwd type_kind.TYPE_U512
+```
+
+forwards [`mach.lang.type.kind.TYPE_U512`](type/kind.md#val-type_u512)
+
+## fwd type_kind.TYPE_I512
+
+```mach
+fwd type_kind.TYPE_I512
+```
+
+forwards [`mach.lang.type.kind.TYPE_I512`](type/kind.md#val-type_i512)
+
 ## fwd type_kind.TYPE_KIND_COUNT
 
 ```mach
@@ -618,6 +650,38 @@ pub rec TypeSecret;
 
 ```mach
 pub rec TypeHandle;
+```
+
+## val NO_HANDLE_CTOR
+
+```mach
+pub val NO_HANDLE_CTOR: u32 = 0xFFFFFFFF
+```
+
+the constructor of a handle no target mints in this build: its operands are its
+declaration's site, so its identity is the declaration's
+
+## val HANDLE_PART_WORD
+
+```mach
+pub val HANDLE_PART_WORD: u32 = 0
+```
+
+a minted handle's constructor is the interned name of the kind the target's family
+mints, as `spirv.image`, and its operands are pairs, the part then its value: a word
+is the number itself, a type operand the type's id, and a named one the interned name
+of an enumerant its row's grammar states
+
+## val HANDLE_PART_TYPE
+
+```mach
+pub val HANDLE_PART_TYPE: u32 = 1
+```
+
+## val HANDLE_PART_NAME
+
+```mach
+pub val HANDLE_PART_NAME: u32 = 2
 ```
 
 ## val ABI_TYPE_VA_LIST

@@ -29,6 +29,14 @@ pub val DECLARATION_BODY: DeclarationFlags = 2
 pub val DECLARATION_PACK: DeclarationFlags = 4
 ```
 
+## val DECLARATION_THREAD
+
+```mach
+pub val DECLARATION_THREAD: DeclarationFlags = 8
+```
+
+a `#[thread]` var: each thread holds its own copy, which every reference reaches through the thread
+
 ## rec Declaration
 
 ```mach
@@ -40,7 +48,7 @@ one module-level function, `val` or `var`
 decl: the declaration in its module, which keys the session's tables of it
 generics: how many type parameters a function declares
 params_start: where a function's parameters start in `params`
-op_set: the instruction set and operation an `#[op]` names, STR_NIL without one
+op_set: the instruction set and operation an `#[intrinsic]` names, STR_NIL without one
 value: the node in `values` of a `val`'s constant value, or of the value
               a `var`'s initializer gives it, NONE when it has none
 gated: the value is declared under a comptime condition; the one record sema reads for it, from the binding the module's context holds

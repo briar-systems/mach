@@ -96,6 +96,14 @@ fwd mach.lang.manifest.model.ArtifactDef
 
 forwards [`mach.lang.manifest.model.ArtifactDef`](manifest/model.md#rec-artifactdef)
 
+## fwd mach.lang.manifest.model.RegionDef
+
+```mach
+fwd mach.lang.manifest.model.RegionDef
+```
+
+forwards [`mach.lang.manifest.model.RegionDef`](manifest/model.md#rec-regiondef)
+
 ## fwd mach.lang.manifest.model.ProfileDef
 
 ```mach
@@ -168,6 +176,14 @@ fwd mach.lang.manifest.model.Manifest
 
 forwards [`mach.lang.manifest.model.Manifest`](manifest/model.md#rec-manifest)
 
+## fwd mach.lang.manifest.model.SourceRoot
+
+```mach
+fwd mach.lang.manifest.model.SourceRoot
+```
+
+forwards [`mach.lang.manifest.model.SourceRoot`](manifest/model.md#rec-sourceroot)
+
 ## fwd mach.lang.manifest.model.empty
 
 ```mach
@@ -223,6 +239,14 @@ fwd mach.lang.manifest.artifact.artifact_supports_target
 ```
 
 forwards [`mach.lang.manifest.artifact.artifact_supports_target`](manifest/artifact.md#fun-artifact_supports_target)
+
+## fwd mach.lang.manifest.artifact.subsystem_named
+
+```mach
+fwd mach.lang.manifest.artifact.subsystem_named
+```
+
+forwards [`mach.lang.manifest.artifact.subsystem_named`](manifest/artifact.md#fun-subsystem_named)
 
 ## fwd mach.lang.manifest.project.expand_project_work
 
@@ -488,13 +512,13 @@ fwd mach.lang.manifest.plan.scope_is_dependency
 
 forwards [`mach.lang.manifest.plan.scope_is_dependency`](manifest/plan.md#fun-scope_is_dependency)
 
-## fwd mach.lang.manifest.plan.local_path_demanded_by_step
+## fwd mach.lang.manifest.plan.local_path_demanded
 
 ```mach
-fwd mach.lang.manifest.plan.local_path_demanded_by_step
+fwd mach.lang.manifest.plan.local_path_demanded
 ```
 
-forwards [`mach.lang.manifest.plan.local_path_demanded_by_step`](manifest/plan.md#fun-local_path_demanded_by_step)
+forwards [`mach.lang.manifest.plan.local_path_demanded`](manifest/plan.md#fun-local_path_demanded)
 
 ## fwd mach.lang.manifest.plan.required_artifact_uses_target
 
@@ -695,12 +719,4 @@ fwd mach.lang.manifest.select.resolve_cells
 ```
 
 forwards [`mach.lang.manifest.select.resolve_cells`](manifest/select.md#fun-resolve_cells)
-
-## fwd mach.lang.manifest.select.check_stack_keys
-
-```mach
-fwd mach.lang.manifest.select.check_stack_keys
-```
-
-forwards [`mach.lang.manifest.select.check_stack_keys`](manifest/select.md#fun-check_stack_keys)
 

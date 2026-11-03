@@ -45,7 +45,7 @@ uses generic words such as `input` and `shared`.
 #[packed]            # lay a rec / uni / tag out with no padding (no arguments)
 #[volatile]          # every access to a rec / uni / tag is a volatile access (no arguments)
 #[section(".name")]  # place in a named object section
-#[at(offset)]        # place at an offset in a flat bare-metal image
+#[at(offset)]        # place a module global at an offset in the image
 #[thread]            # one copy of a module var per thread (no arguments)
 #[constant_time("soft")] # constant-time boundary; the mode is "soft" or "hard"
 #[vectorize("never")] # opt out of auto-vectorization
@@ -297,7 +297,7 @@ errors, and a key named twice are refused, since an error is never
 acknowledged:
 
 ```
-error[expect.error_key]: `secret.not_oblivious` names an error, and an error is never acknowledged
+error[expect.error_key]: `secret.branch` names an error, and an error is never acknowledged
 ```
 
 ### `symbol(str)` — linker name
@@ -689,12 +689,26 @@ section holds code, a `var`'s writable data, a `val`'s read-only data and a
 `#[thread]` var's thread-local template. Cross-section calls and accesses use
 ordinary relocations.
 
-### `at(offset)` — placement in a flat image
+### `at(offset)` — placement in the image
 
-Places a function or global at an integer offset in a flat bare-metal image.
-The name and its argument are fixed. Placement itself belongs to the bare-metal
-image work (mach#4890), and until it lands the decorator is refused where it is
-written.
+Places a module global at an integer offset in the image, counted from the start
+of the region it runs in, or from the image base where it runs in none (see
+[manifest.md](manifest.md#memory-regions)). The global becomes a section of its
+own, which the link places at the offset, so a boot signature, a header a loader
+looks for at a fixed byte or a page table at a known offset is stated in source.
+The link keeps a placed global whether or not anything references it.
+
+```mach fragment
+#[at(510)]
+val SIGNATURE: [2]u8 = [2]u8{0x55, 0xaa};
+```
+
+- It applies to a module `val` or `var` only, and takes one integer constant.
+- It cannot combine with `section`, since a placed global is a section of its
+  own, or with `thread`, since each thread's copy lies in its own block. An
+  `ext` declaration places nothing.
+- Two globals at one offset are refused at the link. A format whose loader maps
+  the image itself is refused by mink, which places the section.
 
 ### `export` — a shared library's export
 
@@ -702,7 +716,9 @@ Exports a function or global from a shared library under its symbol name. It
 requires `pub` and is refused with `decorator.requires` on a declaration that is
 not `pub`, and with `decorator.misplaced` on an `ext` declaration, which another
 image defines. `pub` alone states a module's interface to other Mach modules and
-never exports. Takes no arguments, and `#[testing]` cannot combine with it.
+never exports. Takes no arguments, and `#[testing]` cannot combine with it. An
+exported declaration is seen from outside the image wherever its project sits in
+the build, so a dependency's `#[export]` is exported as the root project's is.
 
 ```mach fragment
 #[export]
@@ -737,10 +753,22 @@ var depth: u32 = 0;
 ### `constant_time(mode)` — constant-time boundary
 
 Marks a function as a constant-time boundary. Applies to functions only, and
-takes one mode, `"soft"` or `"hard"`, which is required. Inside it the backend must not introduce a secret-dependent
-branch or select a variable-latency instruction on a secret operand; a
-translation validator re-derives the secret taint over the lowered MIR and
-rejects any such leak.
+takes one mode, `"soft"` or `"hard"`, which is required: a bare
+`#[constant_time]` is refused. Inside it, in either mode, the emitted code may
+not branch, index, address or divide on a secret, and a callee that receives a
+secret must be constant time itself. masc's walk proves this on the encoded
+code.
+
+- `"soft"`: mirl saves, sets and restores the processor's data-independent
+  timing mode (aarch64's DIT) around the function, guarded by std's
+  availability byte where the target does not guarantee the mode. Without it
+  the function runs anyway.
+- `"hard"`: decided at compile time. The target must guarantee data-independent
+  timing for every operation the function uses (aarch64 needs DIT in the
+  baseline, riscv needs Zkt in the selection, x86-64's scalar cells pass), or
+  the build is refused naming the missing feature.
+
+See [secrecy.md](secrecy.md#soft-and-hard) for both modes.
 
 Inline `asm` inside such a function is **validated rather than rejected**: the
 block is parsed and walked for the same leaks, and refused only where a leak is
@@ -760,21 +788,18 @@ for what that covers and what it does not.
 fun ct_eq(a: ^[8]u8, b: ^[8]u8) u8 { ... }
 ```
 
-The decorator is purely subtractive — on a secret-free function it is a no-op.
-A function instance that *computes* on a `^` secret (arithmetic, bitwise, shift,
-comparison, negation) is **required** to carry it; an instance that only moves,
-stores, or declassifies secrets stays annotation-free.
+No function is required to carry it. The secret gates hold in every function
+with or without it, and a function that computes on a secret without it compiles
+with no promise about the timing of its code.
 
-It is rejected outright for a target whose back half emits a module for a
-downstream compiler rather than the executed instructions (the experimental
-SPIR-V backend): the contract cannot be validated or upheld there.
+It is refused at the mark for a target whose instruction set classifies no
+instruction's timing (SPIR-V, whose module a downstream compiler translates),
+and warned at the mark for one that cannot guarantee any instruction's timing
+(wasm, whose runtime decides the instructions that run).
 
 v6 spelled it `#[oblivious]`, which warns naming `constant_time` and its two
 modes (see [v6 spellings](#v6-spellings)).
 
-> **Experimental preview.** The constant-time guarantee is not complete and has
-> not been audited — see [secrecy.md](secrecy.md#assurance) for the known open
-> holes. Do not build production cryptography on it at this version.
 
 ### `vectorize("never")` — opt out of auto-vectorization
 
@@ -1034,7 +1059,7 @@ a further rule the decorator's own section states.
 | `align` | `fun`, `rec`, `uni`, `tag`, `val`, `var` |  |
 | `packed` | `rec`, `uni`, `tag` | not a `gpu.uniform`, `gpu.storage` or `gpu.push` block |
 | `volatile` | `rec`, `uni`, `tag` |  |
-| `at` | `fun`, `val`, `var` | refused until mach#4890 |
+| `at` | `val`, `var` | not `ext`, `section` or `thread` |
 | `thread` | `var` | no shader interface role |
 | `constant_time` | `fun` |  |
 | `vectorize` | `fun` |  |

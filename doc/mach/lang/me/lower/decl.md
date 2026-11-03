@@ -9,20 +9,23 @@ pub fun lower_decl(ctx: *lower_context.LowerContext, did: ast_id.DeclId) err[fai
 ## fun lower_instance
 
 ```mach
-pub fun lower_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId) err[fail.Fail];
+pub fun lower_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId, copy: opt[Type]) err[fail.Fail];
 ```
+
+an instance, or with `copy` the class copy of it taking its pointers in the classes
+`copy` states, under the name `name` either way
 
 ## fun lower_value_instance
 
 ```mach
-pub fun lower_value_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId) err[fail.Fail];
+pub fun lower_value_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId, copy: opt[Type]) err[fail.Fail];
 ```
 
 ## fun lower_pack_instance
 
 ```mach
 pub fun lower_pack_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl,
-name: intern.StrId, types: *type.TypeId, type_len: u32) err[fail.Fail];
+name: intern.StrId, types: *type.TypeId, type_len: u32, copy: opt[Type]) err[fail.Fail];
 ```
 
 ## fun lower_class_copy

@@ -276,6 +276,7 @@ to whichever *declared* target matches the host.
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
 | `stack_reserve` | absent: the format's default | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
 | `stack_commit` | absent: the format's default | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
+| `code_model` | absent: mirl's default for the target | The code model the target's code is built under (string), by the psABI name mirl's catalog gives it, such as `medlow` or `medany` on `riscv64`. Any target may state it, and a model the target does not offer is refused with mirl's reason. `--code-model` states it for an entry build. |
 | `default` | removed | Refused as a removed key. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
 | `os`, `baseline`, `extensions` | removed | v6's names of `sys`, `isa` and `ext`, refused with the rename `mach migrate` writes. |
 | `ext` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the architecture's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
@@ -419,10 +420,10 @@ row such as a `dit` would admit `msr dit`, not set it.
 
 The `ext` list is the manifest's only lever over the constant-time multiply,
 and only on riscv64, where `zkt` is what admits a secret `*`. There is no key that
-declares or overrides a timing mode. On aarch64 the condition is PSTATE.DIT, which
-the operating system declares it guarantees (linux and darwin) and the linked
-program's start code turns on for a binary that needs it; a manifest cannot assert
-it for an OS that declares nothing. On x86-64 the multiply rows hold unconditionally
+declares or overrides a timing mode. On aarch64 the condition is PSTATE.DIT, which a
+`soft` constant-time function sets around itself where the processor has it and a
+`hard` one requires in the target's baseline
+([secrecy.md](secrecy.md#soft-and-hard)); a manifest cannot assert it. On x86-64 the multiply rows hold unconditionally
 on Intel and AMD, so nothing is there to declare, and Intel's DOITM is a kernel-owned
 model-specific register that hardens memory-side predictors rather than the
 multiplier, so mach offers no key for it either. The rows, their conditions and
@@ -543,15 +544,15 @@ such an image is refused at link rather than silently dropped.
 
 | Axis  | Values |
 |-------|--------|
-| `arch` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv` |
-| `sys`  | `linux`, `windows`, `darwin`, `freestanding`, `vulkan` |
-| `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `spirv` |
-| `of`  | `elf`, `macho`, `coff`, `flat`, `spirv` |
-| `env` | `vulkan1.0`, `vulkan1.1`, `vulkan1.2`, `vulkan1.3` |
+| `arch` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv`, `wasm32` |
+| `sys`  | `linux`, `windows`, `darwin`, `freestanding`, `vulkan`, `wasi` |
+| `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `shader`, `basic` |
+| `of`  | `elf`, `macho`, `coff`, `flat`, `spirv`, `wasm` |
+| `env` | `vulkan1.0`, `vulkan1.1`, `vulkan1.2`, `vulkan1.3`, `preview1` |
 
 Each `arch`, `sys` and `of` value is the name of a row of mink's catalog: `arch` an
 architecture, `sys` a system and `of` a format. mach reads the spelling from that row,
-and the catalog's rows mach has no target for (`x86`, `wasm32`, `uefi`, `wasi`, ...)
+and the catalog's rows mach has no target for (`x86`, `uefi`, ...)
 are not values here. A spelling mink names otherwise is refused where it is written,
 naming the new spelling and carrying the rewrite `mach migrate` applies:
 
@@ -712,7 +713,7 @@ linker: the build publishes the entry module at the artifact's resolved `out` (o
 [target.gpu]
 arch = "spirv"
 sys  = "vulkan"
-abi = "spirv"
+abi = "shader"
 # no `of`: the finished-module format resolves on its own
 ```
 
@@ -859,7 +860,7 @@ class, which the 8-bit feature does not reach.
 [target.gpu]
 arch        = "spirv"
 sys         = "vulkan"
-abi        = "spirv"
+abi        = "shader"
 env        = "vulkan1.0"
 ext = ["int16", "int64", "float64"]
 ```
@@ -886,7 +887,7 @@ appendix's required version: 1.0, 1.3, 1.5 and 1.6.
 [target.gpu]
 arch = "spirv"
 sys  = "vulkan"
-abi = "spirv"
+abi = "shader"
 env = "vulkan1.2"
 ```
 
@@ -1128,10 +1129,10 @@ unknown:
 
 | Key | Error |
 |---|---|
-| `secret.not_oblivious` | a function performs a constant-time operation on a secret value without `#[constant_time]` |
+| `secret.branch` | a secret value decides a branch or loop condition |
 
 ```
-error[allow.error_key]: mach.toml: [profile.release].allow entry "secret.not_oblivious" names an error; only a warning can be silenced
+error[allow.error_key]: mach.toml: [profile.release].allow entry "secret.branch" names an error; only a warning can be silenced
 ```
 
 Like the SIMD levers, `allow` is the consumer's: a dependency's profiles are
@@ -1248,6 +1249,9 @@ reads the selected artifact's name.
 | `manifest` | absent: no application manifest | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `default` | absent: not marked | Selection only. `true` puts the artifact in the [default selection](build.md#selection-and-the-build-matrix): with no `-a`, `mach build` and `mach check` take the marked artifacts among those supporting the selected target (every one of them when none is marked), and a command that needs one artifact (`mach test`, `mach run`, the editor's union build) takes the marked one. A command that needs one artifact refuses two marked candidates; an explicit `-a` always wins, and a sole candidate needs no marker. |
 | `export` | absent: not exported | `true` marks the library whose requirements travel to consumers (see [Dependency requirements travel](#dependency-requirements-travel)). It describes the prebuilt library only and never affects how a `use` path resolves. It applies to `static` and `shared` artifacts only, and a project exports at most one. |
+| `sections` | absent: the format's order | Array of output section names the link places ahead of the rest, in the order written, such as `[".boot", ".text", ".rodata", ".data", ".bss"]`. A named section the image does not hold is refused by the link, naming it. |
+| `size` | absent: no ceiling | The most bytes the image loads from its base, a positive integer. A flat image is padded to exactly `size`, and on any other format it is a ceiling. An image over it is refused by the link, naming the section that overflows. |
+| `region` | absent: no region | Named memory regions the link lays sections into, each an `[artifact.<name>.region.<region>]` table. See [Memory regions](#memory-regions). |
 
 `entry` is the build cell's source root. The build follows its active `use` and
 `fwd` edges transitively and compiles that reachable module set; another file under
@@ -1263,45 +1267,77 @@ any of them (see [test.md](test.md#which-tests-run)).
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
   as a `.a`.
-- **`shared`** links a dynamic library at the resolved `out`. Only ELF targets
-  write one today: `linux` on `x86_64`, `aarch64` and `riscv64` produce a `.so`
-  whose `SONAME` is its file name. mach writes no Mach-O `.dylib` or PE `.dll`,
-  so a `darwin` or `windows` target refuses with `link: object format cannot
-  write shared libraries`. A `freestanding` target never
-  writes one: its default `flat` format refuses with `a flat-image object format
-  produces only executables`, and setting `of = "elf"` moves the refusal to the
-  link, `link: a shared library needs a loader to map it, and os =
-  "freestanding" has none`, because a shared library only exists to be mapped by
-  a loader the os provides.
-  - **Exports.** The library exports the root project's `pub` functions and
-    variables and every name its modules re-export with `fwd`, including a
-    dependency's. A dependency's own `pub` surface is not exported unless it is
-    re-exported. `#[symbol("name")]` sets the name an export carries and does not
-    make anything visible: a `pub` function exports under its `#[symbol]` name,
-    and a non-`pub` one stays hidden whatever its name.
+- **`shared`** links a dynamic library at the resolved `out`, as mink's shared
+  output kind: a `.so` on ELF, a `.dll` on PE and a `.dylib` on Mach-O, named as
+  mink's system names the file. A system whose loader maps no library into
+  another image, such as `freestanding` or `wasi`, builds none, and the artifact
+  is refused with mink's reason when its name is formed.
+  - **Exports.** The library exports exactly the declarations marked
+    [`#[export]`](decorators.md#export--a-shared-librarys-export), in any project
+    of the build, each under its symbol name. `pub` alone exports nothing, and
+    `#[symbol("name")]` sets the name an export carries without exporting it.
   - **Internals.** Every other definition still links inside the library but is
-    absent from `.dynsym`. In the `.so` it is a `LOCAL` symbol in `.symtab`, and
-    in the per-module object it is a `GLOBAL` symbol whose visibility the
-    format spells its own way: ELF `STV_HIDDEN`, Mach-O `N_PEXT`, and COFF, which
-    has no visibility bit, a `.drectve` section listing every exported definition
-    as ` /EXPORT:<name>`, so a global definition the directives do not name is
-    hidden. A COFF object with no `.drectve` says nothing about visibility and
-    is read as it was. A `fwd` re-export of a dependency's symbol is a request
-    the object carries separately: on COFF it is one more `/EXPORT:` token, and
-    on ELF and Mach-O it rides in a non-loaded mach section (`.mach.exports`, or
-    `__MACH,__mach_exports`) the parser consumes. A relocatable object emitted
-    and parsed back therefore keeps the same visibility and the same requests.
-  - **Refusals.** A shared artifact that exports nothing is refused:
+    seen from no other image.
+  - **Code model.** The library is built under mirl's `pic` code model unless its
+    target states a `code_model`. Each system's row says what that means there:
+    on ELF an export of default visibility may be preempted by another image, on
+    Mach-O only a weak one may, and a PE DLL reaches its own exports directly.
+  - **Thread-locals.** A `#[thread]` var in a shared library is reached through
+    the initial-exec model, at an offset its loader fixes when the process
+    starts. General-dynamic access is never lowered.
+  - **Linking against one.** An executable names the library through a
+    `[link.X]` entry, a `local` path to the built file, and `need`s the artifact
+    that builds it. On a host whose loader neither runs executables position
+    independent by default nor places every image, as `linux`, an executable
+    that links a shared library is linked as mink's dynamic kind, so its loader
+    binds the library at start.
 
-    ```
-    link: shared library '<artifact>' exports nothing: a shared library needs at least one `pub` declaration in the project, or a `fwd` re-export of one
-    ```
+### Memory regions
 
-    A `freestanding` target is refused as well. With its default `flat` format
-    the artifact fails naming (`artifact naming: this object format has no
-    shared-library form`), and with `of = "elf"` the link refuses with
-    `link: a shared library needs a loader to map it, and sys = "freestanding"
-    has none`.
+An artifact may lay its image out as a linker script's `MEMORY` and `AT>` do.
+Each `[artifact.<name>.region.<region>]` table states one region, and each
+section runs in at most one region and loads in at most one other:
+
+```toml
+[artifact.firmware]
+kind     = "bin"
+entry    = "bin/main.mach"
+out      = "{project.work}/firmware{artifact.suffix}"
+targets  = ["*"]
+sections = [".text", ".rodata", ".data", ".bss"]
+
+[artifact.firmware.region.flash]
+origin = 0x08000000
+length = 0x40000
+access = "rx"
+run    = [".text", ".rodata"]
+load   = [".data"]
+
+[artifact.firmware.region.ram]
+origin = 0x20000000
+length = 0x8000
+access = "rw"
+run    = [".data", ".bss"]
+```
+
+| Key | Required | Meaning |
+|-----|----------|---------|
+| `origin` | yes | The address the region starts at. |
+| `length` | yes | The bytes it spans. |
+| `access` | yes | What it allows, the letters `r`, `w` and `x`, each at most once. |
+| `run` | absent: none | The output sections that run in the region. |
+| `load` | absent: none | The output sections whose bytes load in the region and run in another, as `.data` loaded in flash and run in RAM. |
+
+A section that runs in two regions or loads in two is refused, and so is one that
+loads in a region and runs in none, or loads in the region it runs in. A section
+named in `sections`, `run` or `load` that no object of the link holds is passed
+over, so one layout serves a program with no `.bss` as well as one with it. mach
+hands the regions, the section order, the size ceiling and every `#[at]`
+placement to mink as one link plan, and reports mink's refusals, an overflow or
+an overlap, as mink names them. mink names the bounds of each section by
+its load and run addresses, `__load_start_<section>`, `__load_stop_<section>`,
+`__run_start_<section>` and `__run_stop_<section>`, so startup code, such as
+copying `.data` out of its load region, is a library's and never the compiler's.
 
 Per-target extension or per-target entry is not a per-cell exception table — it is a
 second artifact stanza, so the condition stays visible like everything else.

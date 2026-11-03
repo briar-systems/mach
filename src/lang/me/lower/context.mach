@@ -10,6 +10,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use A: std.allocator;
@@ -49,7 +50,12 @@ use type_query: mach.lang.type.query;
 use mach.lang.type.query.expansive;
 use mach.lang.type.query.subst;
 
-use core_state: masc.core.state;
+use mach.lang.textbuild;
+use core_ct:      masc.core.ct;
+use masc_operand: masc.core.operand;
+use masc_row:     masc.core.row;
+use core_set:     masc.core.set;
+use core_state:   masc.core.state;
 use mink.model.symbol;
 use mirl_slice:    mirl.base.slice;
 use mbuild:        mirl.build;
@@ -69,8 +75,9 @@ use mirl_module: mirl.ir.module;
 use mirl_point:  mirl.ir.point;
 use types:       mirl.ir.type;
 use mirl.ir.type.Type;
-use mirl_target: mirl.target;
-use mirl_record: mirl.target.record;
+use mirl_target:     mirl.target;
+use mirl_capability: mirl.target.capability;
+use mirl_record:     mirl.target.record;
 use std.collections.slice.Slice;
 use std.types.view.View;
 
@@ -85,12 +92,16 @@ pub rec LoopFrame {
 # the target lowering builds for: the tuple its modules are named for, the target mirl
 # assembled from it, and the context the build's selection opened, none for a target with
 # no baseline
-# slots: the address space the target's frame slots live in
+# slots:  the address space the target's frame slots live in
+# timing: how masc's instruction set for the target answers a constant-time requirement,
+#         none when masc serves the architecture with none
 pub rec Machine {
-    tuple:  mirl_module.Tuple;
-    target: *mirl_target.Target;
-    ctx:    opt[*core_state.Context];
-    slots:  u32;
+    tuple:    mirl_module.Tuple;
+    target:   *mirl_target.Target;
+    ctx:      opt[*core_state.Context];
+    slots:    u32;
+    directed: bool;
+    timing:   opt[core_ct.Timing];
 }
 
 # the machine of a target the owners assembled, borrowing it
@@ -99,7 +110,10 @@ pub fun machine_of(x: *assembled.Assembled) res[Machine, fail.Fail] {
     if (x.based) { ctx = opt[*core_state.Context].some{?x.basis.context}; }
     val slots: res[u32, mirl_record.Error] = mirl_record.slot_space(?x.target);
     if (sel slots.err) { ret res[Machine, fail.Fail].err{fail.message("mirl's target states no address space for its frame slots")}; }
-    ret res[Machine, fail.Fail].ok{Machine{tuple: x.tuple, target: ?x.target, ctx: ctx, slots: slots.ok}};
+    var timing: opt[core_ct.Timing] = opt[core_ct.Timing].none{};
+    val set:    opt[*core_set.Set]  = mirl_target.set_of(?x.target);
+    if (sel set.some) { timing = opt[core_ct.Timing].some{set.some.ct}; }
+    ret res[Machine, fail.Fail].ok{Machine{tuple: x.tuple, target: ?x.target, ctx: ctx, slots: slots.ok, directed: false, timing: timing}};
 }
 
 # what the driver reads of a lowered module beside its mirl module: its name and, for
@@ -217,15 +231,18 @@ pub rec ScopeMark {
 # a copy of a function whose pointer parameters take the classes its call sites pass,
 # lowered into this module once the module's own declarations are
 # ---
-# origin: the module that declares the function
-# decl:   its declaration there
-# name:   the copy's linkage name, the function's own with the classes it takes
-# sig:    the copy's signature
+# origin:   the module that declares the function
+# decl:     its declaration there
+# name:     the copy's linkage name, the function's own with the classes it takes
+# sig:      the copy's signature
+# instance: the instance of the module's set the copy is of, fe_sema.instance.NONE for a
+#           plain function
 pub rec ClassCopy {
-    origin: session.ModuleId;
-    decl:   ast_id.DeclId;
-    name:   intern.StrId;
-    sig:    Type;
+    origin:   session.ModuleId;
+    decl:     ast_id.DeclId;
+    name:     intern.StrId;
+    sig:      Type;
+    instance: u32;
 }
 
 pub rec LowerRequest {
@@ -282,8 +299,6 @@ pub rec LowerContext {
     # the signature of the function being built, whose pointer parameters a copy of a
     # function takes in the classes its call sites pass
     fn_sig: Type;
-    # the source name of the function being built, which diagnostics name it by
-    fn_shown: lang_source.Span;
     # the function being built is `#[naked]`, its body asm that binds no local
     fn_naked: bool;
 
@@ -1058,7 +1073,6 @@ pub fun begin_function(lc: *LowerContext, fn_index: u32, ret_type: Type) {
     lc.ret_type   = ret_type;
     lc.fn_ret_sem = type.TYPE_NIL;
     lc.fn_sig     = irt.NONE;
-    lc.fn_shown   = lang_source.Span{offset: 0, len: 0};
     lc.fn_naked   = false;
 
     lc.pack_slots    = nil;
@@ -1219,10 +1233,172 @@ fun lower_abi_type(lc: *LowerContext, t: *type.Type) res[Type, fail.Fail] {
     ret irt.structure(?lc.m.types, ?field, 1);
 }
 
-# a target handle is minted by a constructor of the owners' catalog, which mach reads
-# none of yet, so no handle of the selected target reaches lowering
+# a target handle as the kind the target's family mints, held to that kind's parts in
+# mirl's handle catalog: as many operands as it states at least and at most, each a word
+# among the values its part lists or a type its part admits
 fun lower_handle_type(lc: *LowerContext, t: *type.Type) res[Type, fail.Fail] {
-    ret res[Type, fail.Fail].err{fail.message("lower: a handle type names a constructor no owner's catalog mach reads states")};
+    val h: type.TypeHandle = t.data.handle;
+    if (h.ctor == type.NO_HANDLE_CTOR) { ret res[Type, fail.Fail].err{fail.message("lower: a handle no target of this build mints reached the lowering")}; }
+    val name:   str                          = intern.text(?lc.s.interner, h.ctor::intern.StrId);
+    val kind:   View                         = View{data: name, len: str_len(name)};
+    val minted: opt[*mirl_capability.Minted] = mirl_capability.minted(lc.machine.target.caps.handles, kind);
+    if (sel minted.none) {
+        ret res[Type, fail.Fail].err{fail.formatted_user(lc.s.alloc, diagnostic_kind.HANDLE_UNKNOWN_CONSTRUCTOR,
+            "the selected target mints no handle of the kind `{}`", name)};
+    }
+    val m:     *mirl_capability.Minted = minted.some;
+    val count: u32                     = h.ops_len / 2;
+    if (count < m.least || count::usize > m.operands.size) {
+        ret res[Type, fail.Fail].err{fail.formatted_user(lc.s.alloc, diagnostic_kind.HANDLE_ARGUMENTS,
+            "a `{}` handle takes from {} to {} operands, and this one states {}", name, m.least, m.operands.size, count)};
+    }
+    var operands: collections_vector.Vector[types.HandleOperand] = collections_vector.init[types.HandleOperand](lc.s.alloc);
+    fin { collections_vector.dnit[types.HandleOperand](?operands); }
+    val grammar: Grammar = grammar_of(lc, m);
+    var i:       u32     = 0;
+    for (i < count) {
+        val part: u32                                 = lc.s.types.handle_ops[h.ops_start + i * 2];
+        val held: u32                                 = lc.s.types.handle_ops[h.ops_start + i * 2 + 1];
+        val own:  opt[*masc_operand.Operand]          = grammar_operand(grammar, i);
+        val made: res[types.HandleOperand, fail.Fail] = handle_operand(lc, name, i, ?m.operands.data[i], own, part, held);
+        if (sel made.err) { ret res[Type, fail.Fail].err{made.err}; }
+        val pushed: res[usize, A.Error] = collections_vector.push[types.HandleOperand](?operands, made.ok);
+        if (sel pushed.err) { ret res[Type, fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    ret irt.handle(?lc.m.types, kind, operands.data, count);
+}
+
+# the row of masc's set the target makes a kind's type by, and how many of its leading
+# operands the target supplies itself, as the result id. none where no set of the target's
+# catalog holds the row
+rec Grammar {
+    row:      opt[*masc_row.Row];
+    supplied: u32;
+}
+
+fun grammar_of(lc: *LowerContext, m: *mirl_capability.Minted) Grammar {
+    var out:  Grammar             = Grammar{row: opt[*masc_row.Row].none{}, supplied: 0};
+    val held: mirl_capability.Ops = lc.machine.target.caps.ops;
+    if (!(sel held.catalog)) { ret out; }
+    if (str_len(m.key) == 0) { ret out; }
+    val c:   *mirl_capability.Catalog = held.catalog;
+    val key: View                     = View{data: m.key, len: str_len(m.key)};
+    var i:   usize                    = 0;
+    for (i < c.sets.size) {
+        val set: *mirl_capability.OpSet = ?c.sets.data[i];
+        val row: opt[*masc_row.Row]     = mirl_capability.op_row(c, set, key);
+        i = i + 1;
+        if (sel row.none) { cnt; }
+        out.row      = row;
+        out.supplied = mirl_capability.supplies(set, row.some);
+        ret out;
+    }
+    ret out;
+}
+
+# the operand of the row the handle's operand `i` is, its row's own operands following the
+# ones the target supplies
+fun grammar_operand(g: Grammar, i: u32) opt[*masc_operand.Operand] {
+    if (sel g.row.none) { ret opt[*masc_operand.Operand].none{}; }
+    val r:  *masc_row.Row = g.row.some;
+    val at: u32           = g.supplied + i;
+    if (at >= r.operands.len) { ret opt[*masc_operand.Operand].none{}; }
+    ret opt[*masc_operand.Operand].some{?r.operands.at[at]};
+}
+
+# the enumerants an operand of a row's grammar names, none for one its row takes as a number
+fun enumerants_of(own: opt[*masc_operand.Operand]) opt[masc_operand.Enumeration] {
+    if (sel own.none) { ret opt[masc_operand.Enumeration].none{}; }
+    val shape: masc_operand.Shape = own.some.shape;
+    if (sel shape.enumerant) { ret opt[masc_operand.Enumeration].some{shape.enumerant}; }
+    ret opt[masc_operand.Enumeration].none{};
+}
+
+# the names an enumeration holds, listed for a refusal
+fun enumerant_names(lc: *LowerContext, e: masc_operand.Enumeration) str {
+    var b: textbuild.TextBuilder = textbuild.tb_init(lc.s.alloc);
+    var k: u32                   = 0;
+    for (k < e.count) {
+        if (k > 0) { val sep: err[textbuild.Error] = textbuild.tb_append(?b, ", "); }
+        val put: err[textbuild.Error] = textbuild.tb_append(?b, e.members[k].name);
+        k = k + 1;
+    }
+    val done: res[str, textbuild.Error] = textbuild.tb_finish(?b);
+    if (sel done.err) {
+        textbuild.tb_dnit(?b);
+        ret "";
+    }
+    ret done.ok;
+}
+
+# operand `i` of a `name` handle, the word, name or type `held` its `part` says, held to what
+# the kind's part `want` admits. an operand its row's grammar states as an enumerant is
+# written as the enumerant's name, and any other word as its number
+fun handle_operand(lc: *LowerContext, name: str, i: u32, want: *mirl_capability.HandlePart, own: opt[*masc_operand.Operand],
+    part: u32, held: u32) res[types.HandleOperand, fail.Fail] {
+    if (sel want.word) {
+        if (part == type.HANDLE_PART_TYPE) {
+            ret res[types.HandleOperand, fail.Fail].err{fail.formatted_user(lc.s.alloc, diagnostic_kind.HANDLE_ARGUMENTS,
+                "operand {} of a `{}` handle is a word, and this one names a type", i, name)};
+        }
+        val named: opt[masc_operand.Enumeration] = enumerants_of(own);
+        var value: u32                           = held;
+        if (sel named.some) {
+            val e: masc_operand.Enumeration = named.some;
+            if (part != type.HANDLE_PART_NAME) {
+                ret res[types.HandleOperand, fail.Fail].err{fail.formatted_user(lc.s.alloc, diagnostic_kind.HANDLE_ARGUMENTS,
+                    "operand {} of a `{}` handle is an enumerant of the target's grammar, written as its name: one of {}", i, name, enumerant_names(lc, e))};
+            }
+            val spelled: str  = intern.text(?lc.s.interner, held::intern.StrId);
+            var hit:     bool = false;
+            var k:       u32  = 0;
+            for (k < e.count && !hit) {
+                if (str_equals(e.members[k].name, spelled)) {
+                    value = e.members[k].value;
+                    hit   = true;
+                }
+                k = k + 1;
+            }
+            if (!hit) {
+                ret res[types.HandleOperand, fail.Fail].err{fail.formatted_user(lc.s.alloc, diagnostic_kind.HANDLE_ARGUMENTS,
+                    "operand {} of a `{}` handle names `{}`, which the target's grammar does not state: one of {}", i, name, spelled, enumerant_names(lc, e))};
+            }
+        }
+        or (part == type.HANDLE_PART_NAME) {
+            ret res[types.HandleOperand, fail.Fail].err{fail.formatted_user(lc.s.alloc, diagnostic_kind.HANDLE_ARGUMENTS,
+                "operand {} of a `{}` handle is a number the target's row takes as written, and this one is a name", i, name)};
+        }
+        val listed: Slice[u32] = want.word;
+        var found:  bool       = listed.size == 0;
+        var k:      usize      = 0;
+        for (k < listed.size && !found) {
+            found = listed.data[k] == value;
+            k     = k + 1;
+        }
+        if (!found) {
+            ret res[types.HandleOperand, fail.Fail].err{fail.formatted_user(lc.s.alloc, diagnostic_kind.HANDLE_ARGUMENTS,
+                "operand {} of a `{}` handle is {}, a value the target's row of the kind does not list", i, name, value)};
+        }
+        ret res[types.HandleOperand, fail.Fail].ok{types.HandleOperand.word{value}};
+    }
+    if (!(sel want.typed)) { ret res[types.HandleOperand, fail.Fail].err{fail.message("lower: mirl states a handle part of no case")}; }
+    if (part != type.HANDLE_PART_TYPE) {
+        ret res[types.HandleOperand, fail.Fail].err{fail.formatted_user(lc.s.alloc, diagnostic_kind.HANDLE_ARGUMENTS,
+            "operand {} of a `{}` handle is a type, and this one states a word", i, name)};
+    }
+    val lowered: res[Type, fail.Fail] = lower_type(lc, type.id(held));
+    if (sel lowered.err) { ret res[types.HandleOperand, fail.Fail].err{lowered.err}; }
+    val ty:       Type                   = lowered.ok;
+    val admits:   mirl_capability.Admits = want.typed;
+    var admitted: bool                   = sel admits.any;
+    if (sel admits.scalar) { admitted = irt.is_int(?lc.m.types, ty) || irt.is_float(?lc.m.types, ty); }
+    if (sel admits.handle) { admitted = irt.handle_of(?lc.m.types, ty, View{data: admits.handle, len: str_len(admits.handle)}); }
+    if (!admitted) {
+        ret res[types.HandleOperand, fail.Fail].err{fail.formatted_user(lc.s.alloc, diagnostic_kind.HANDLE_ARGUMENTS,
+            "operand {} of a `{}` handle names a type the target's row of the kind does not admit", i, name)};
+    }
+    ret res[types.HandleOperand, fail.Fail].ok{types.HandleOperand.typed{ty}};
 }
 
 # the cases of a tag that hold a payload, in case order, as the payload union's members
@@ -1690,6 +1866,157 @@ fun held_secret(lc: *LowerContext, tid: type.TypeId) bool {
     ret held.ok;
 }
 
+# the secret byte ranges of a value of source type `tid`, held in `ir`, laid out from
+# `base`, appended to `out` in no order: a secret's every byte, an aggregate's secret
+# members and elements, every case of a union or a tag's payload, and nothing of a tag's
+# discriminant or of padding
+pub fun secret_ranges(lc: *LowerContext, tid: type.TypeId, ir: Type, base: u64, out: *collections_vector.Vector[mirl_global.Range]) err[fail.Fail] {
+    if (stack.exhausted()) { ret err[fail.Fail].err{refuse_type_nesting(lc)}; }
+    val rtid: type.TypeId = substitute_type(lc, tid);
+    if (type.is_nil(rtid) || type.is_error(rtid) || !held_secret(lc, rtid)) { ret err[fail.Fail].ok{}; }
+    val t_opt: opt[*type.Type] = type.get(?lc.s.types, rtid);
+    if (sel t_opt.none) { ret err[fail.Fail].ok{}; }
+    val t:  *type.Type          = t_opt.some;
+    val k:  type.TypeKind       = t.kind;
+    val tt: *types.Table        = ?lc.m.types;
+    val l:  *mirl_target.Layout = ?lc.builder.layout;
+
+    if (k == type.TYPE_SECRET) {
+        val n: res[u64, fail.Fail] = irt.size(l, ir);
+        if (sel n.err) { ret err[fail.Fail].err{n.err}; }
+        ret range_add(out, base, n.ok);
+    }
+
+    if (k == type.TYPE_ARRAY) {
+        val count: u64 = irt.count(tt, ir);
+        if (count == 0) { ret err[fail.Fail].ok{}; }
+        val stride: res[u64, fail.Fail] = irt.stride(l, ir);
+        if (sel stride.err) { ret err[fail.Fail].err{stride.err}; }
+        # one element's ranges, repeated at each element's offset
+        var one: collections_vector.Vector[mirl_global.Range] = collections_vector.init[mirl_global.Range](lc.s.alloc);
+        fin { collections_vector.dnit[mirl_global.Range](?one); }
+        val walked: err[fail.Fail] = secret_ranges(lc, t.data.array.base, irt.element(tt, ir), 0, ?one);
+        if (sel walked.err) { ret walked; }
+        ranges_settle(?one);
+        var i: u64 = 0;
+        for (i < count) {
+            var j: usize = 0;
+            for (j < one.len) {
+                val added: err[fail.Fail] = range_add(out, base + i * stride.ok + one.data[j].offset, one.data[j].length);
+                if (sel added.err) { ret added; }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        ret err[fail.Fail].ok{};
+    }
+
+    val nominal: bool = k == type.TYPE_REC || k == type.TYPE_UNI || k == type.TYPE_TAG || k == type.TYPE_INSTANCE;
+    if (!nominal) { ret err[fail.Fail].ok{}; }
+    val fields: err[fail.Fail] = subst.ensure_fields(lc.s, rtid);
+    if (sel fields.err) { ret err[fail.Fail].err{refuse(lc, fields.err)}; }
+    val n: u32 = type.field_count(?lc.s.types, rtid);
+
+    if (k == type.TYPE_TAG || type.is_tag(?lc.s.types, rtid)) {
+        if (irt.member_count(tt, ir) < 2) { ret err[fail.Fail].ok{}; }
+        val payload: Type                = irt.member(tt, ir, 1);
+        val at:      res[u64, fail.Fail] = irt.offset(l, ir, 1);
+        if (sel at.err) { ret err[fail.Fail].err{at.err}; }
+        var c: u32 = 0;
+        for (c < n) {
+            val fe: opt[*type.FieldEntry] = type.field_at(?lc.s.types, rtid, c);
+            if (sel fe.some) {
+                val case_ty: type.TypeId = fe.some.ty;
+                if (!type.is_nil(case_ty)) {
+                    val walked: err[fail.Fail] = secret_ranges(lc, case_ty, irt.member(tt, payload, tag_payload_member(lc, rtid, c)), base + at.ok, out);
+                    if (sel walked.err) { ret walked; }
+                }
+            }
+            c = c + 1;
+        }
+        ret err[fail.Fail].ok{};
+    }
+
+    val is_union: bool = type.is_union(?lc.s.types, rtid);
+    var i:        u32  = 0;
+    for (i < n) {
+        val fe: opt[*type.FieldEntry] = type.field_at(?lc.s.types, rtid, i);
+        if (sel fe.none) { ret err[fail.Fail].err{fail.message("lower: the field table of a nominal type is missing an in-range field")}; }
+        var at: u64 = 0;
+        if (!is_union) {
+            val off: res[u64, fail.Fail] = irt.offset(l, ir, i);
+            if (sel off.err) { ret err[fail.Fail].err{off.err}; }
+            at = off.ok;
+        }
+        val walked: err[fail.Fail] = secret_ranges(lc, fe.some.ty, irt.member(tt, ir, i), base + at, out);
+        if (sel walked.err) { ret walked; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# `out` with the range of `length` bytes from `offset`, joined to the last range where it
+# touches it
+fun range_add(out: *collections_vector.Vector[mirl_global.Range], offset: u64, length: u64) err[fail.Fail] {
+    if (length == 0) { ret err[fail.Fail].ok{}; }
+    if (out.len > 0) {
+        val last: *mirl_global.Range = ?out.data[out.len - 1];
+        if (offset >= last.offset && offset <= last.offset + last.length) {
+            if (offset + length > last.offset + last.length) { last.length = offset + length - last.offset; }
+            ret err[fail.Fail].ok{};
+        }
+    }
+    val pushed: res[usize, A.Error] = collections_vector.push[mirl_global.Range](out, mirl_global.Range{offset: offset, length: length});
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# `ranges` sorted by offset with every overlapping or touching pair joined, the one spelling
+# mirl takes of a set of bytes
+fun ranges_settle(ranges: *collections_vector.Vector[mirl_global.Range]) {
+    var i: usize = 1;
+    for (i < ranges.len) {
+        val x: mirl_global.Range = ranges.data[i];
+        var j: usize             = i;
+        for (j > 0 && ranges.data[j - 1].offset > x.offset) {
+            ranges.data[j] = ranges.data[j - 1];
+            j              = j - 1;
+        }
+        ranges.data[j] = x;
+        i              = i + 1;
+    }
+    var kept: usize = 0;
+    i = 0;
+    for (i < ranges.len) {
+        val x: mirl_global.Range = ranges.data[i];
+        if (kept > 0 && x.offset <= ranges.data[kept - 1].offset + ranges.data[kept - 1].length) {
+            val last: *mirl_global.Range = ?ranges.data[kept - 1];
+            if (x.offset + x.length > last.offset + last.length) { last.length = x.offset + x.length - last.offset; }
+        }
+        or {
+            ranges.data[kept] = x;
+            kept              = kept + 1;
+        }
+        i = i + 1;
+    }
+    ranges.len = kept;
+}
+
+# how much of a global of source type `tid`, held in `ir`, is secret, its ranges held in
+# `ranges`, which must outlive the answer until the module copies it
+pub fun global_secrecy(lc: *LowerContext, tid: type.TypeId, ir: Type, ranges: *collections_vector.Vector[mirl_global.Range]) res[mirl_global.Secrecy, fail.Fail] {
+    val walked: err[fail.Fail] = secret_ranges(lc, tid, ir, 0, ranges);
+    if (sel walked.err) { ret res[mirl_global.Secrecy, fail.Fail].err{walked.err}; }
+    ranges_settle(ranges);
+    if (ranges.len == 0) { ret res[mirl_global.Secrecy, fail.Fail].ok{mirl_global.Secrecy.public{}}; }
+    val size: res[u64, fail.Fail] = irt.size(?lc.builder.layout, ir);
+    if (sel size.err) { ret res[mirl_global.Secrecy, fail.Fail].err{size.err}; }
+    if (ranges.len == 1 && ranges.data[0].offset == 0 && ranges.data[0].length == size.ok) {
+        ret res[mirl_global.Secrecy, fail.Fail].ok{mirl_global.Secrecy.whole{}};
+    }
+    ret res[mirl_global.Secrecy, fail.Fail].ok{mirl_global.Secrecy.ranges{Slice[mirl_global.Range]{data: ranges.data, size: ranges.len}}};
+}
+
 pub fun substitute_type(lc: *LowerContext, tid: type.TypeId) type.TypeId {
     if (lc.scope.subst == nil || lc.scope.subst_len == 0) { ret tid; }
     ret recover_type(lc, subst.substitute(lc.s, tid, ?lc.scope.subst_owner, lc.scope.subst, lc.scope.subst_len));
@@ -1714,12 +2041,20 @@ pub fun decl_type_of(lc: *LowerContext, did: ast_id.DeclId) type.TypeId {
 # the instance sema decided the call or generic reference `eid` names, in the frame the
 # code is read through
 pub fun instance_of_call(lc: *LowerContext, eid: ast_id.ExprId) res[*fe_sema.instance.Instance, fail.Fail] {
+    val id: res[u32, fail.Fail] = instance_id_of_call(lc, eid);
+    if (sel id.err) { ret res[*fe_sema.instance.Instance, fail.Fail].err{id.err}; }
+    ret res[*fe_sema.instance.Instance, fail.Fail].ok{fe_sema.instance.at(lc.instances, id.ok)};
+}
+
+# the index in the module's set of the instance sema decided the call or generic reference
+# `eid` names, in the frame the code is read through
+pub fun instance_id_of_call(lc: *LowerContext, eid: ast_id.ExprId) res[u32, fail.Fail] {
     if (lc.scope.frame == fe_sema.instance.NONE || lc.instances == nil) {
-        ret res[*fe_sema.instance.Instance, fail.Fail].err{fail.message("lower: an instantiating call read outside any typing frame")};
+        ret res[u32, fail.Fail].err{fail.message("lower: an instantiating call read outside any typing frame")};
     }
     val id: opt[u32] = fe_sema.instance.call_at(lc.instances, lc.scope.frame, eid);
-    if (sel id.none) { ret res[*fe_sema.instance.Instance, fail.Fail].err{fail.message("lower: sema recorded no instance for an instantiating call")}; }
-    ret res[*fe_sema.instance.Instance, fail.Fail].ok{fe_sema.instance.at(lc.instances, id.some)};
+    if (sel id.none) { ret res[u32, fail.Fail].err{fail.message("lower: sema recorded no instance for an instantiating call")}; }
+    ret res[u32, fail.Fail].ok{id.some};
 }
 
 # the symbol an instance is emitted and referenced under
@@ -1795,7 +2130,13 @@ pub fun fn_sig_of_type(lc: *LowerContext, tid: type.TypeId) res[FnSig, fail.Fail
     if (sel t_opt.none) { ret res[FnSig, fail.Fail].err{fail.message("lower: a signature asked of a type that is no function")}; }
     val fn: *type.Type = t_opt.some;
     if (fn.kind != type.TYPE_FUN) { ret res[FnSig, fail.Fail].err{fail.message("lower: a signature asked of a type that is no function")}; }
-    ret signature_of(lc, fn.data.fn.ret_type, fn, fn.data.fn.params_len, nil, 0);
+    val made: res[FnSig, fail.Fail] = signature_of(lc, fn.data.fn.ret_type, fn, fn.data.fn.params_len, nil, 0);
+    if (sel made.err)           { ret made; }
+    if (!fn.data.fn.c_variadic) { ret made; }
+    # a C-variadic function is declared variadic, and each call states the signature of what it passes
+    val declared: res[Type, fail.Fail] = irt.variadic(?lc.m.types, made.ok.sig);
+    if (sel declared.err) { ret res[FnSig, fail.Fail].err{declared.err}; }
+    ret res[FnSig, fail.Fail].ok{FnSig{sig: declared.ok}};
 }
 
 # the C-variadic function type `tid` stands for, none for any other type
@@ -1930,6 +2271,24 @@ pub fun emit_dbg_birth(lc: *LowerContext, name_span: lang_source.Span, ty_sem: t
     ret builder.after_err_pub(?lc.builder);
 }
 
+# the source variable the module's global `g` is, named at `name_span` with source type
+# `ty_sem`, which a debugger reads its type and declaration line from; nothing when this
+# lowering keeps no debug information
+pub fun describe_global(lc: *LowerContext, g: u32, name_span: lang_source.Span, ty_sem: type.TypeId) err[fail.Fail] {
+    val debug_type: res[opt[mirl_debug.Type], fail.Fail] = debug_type_of(lc, substitute_type(lc, ty_sem));
+    if (sel debug_type.err)     { ret err[fail.Fail].err{debug_type.err}; }
+    if (sel debug_type.ok.none) { ret err[fail.Fail].ok{}; }
+    val declared: opt[mirl_debug.Location] = builder.location_of(?lc.builder, lang_source.location(lc.scope.a.file_id, name_span));
+    if (sel declared.none) { ret err[fail.Fail].ok{}; }
+    val name:  View                                      = View{data: (?lc.scope.source[name_span.offset])::str, len: name_span.len};
+    val bound: res[mirl_debug.Binding, mirl_debug.Error] = mirl_debug.bind(?lc.m.debug,
+        mirl_debug.Variable{name: name, type: debug_type.ok.some, declared: declared.some, parameter: opt[u32].none{}});
+    if (sel bound.err) { ret err[fail.Fail].err{debug_failed(bound.err)}; }
+    val described: err[mirl_module.Error] = mirl_module.describe_global(lc.m, id.Global{index: g}, opt[mirl_debug.Binding].some{bound.ok});
+    if (sel described.err) { ret err[fail.Fail].err{fail.message("lower: mirl refused a global's debug variable")}; }
+    ret err[fail.Fail].ok{};
+}
+
 pub fun symbol_of(lc: *LowerContext, sid: resolve.SymbolId) opt[*resolve.Symbol] {
     if (resolve.symbol_is_nil(sid))                            { ret opt[*resolve.Symbol].none{}; }
     if (resolve.symbol_index(sid) >= lc.scope.rr.symbol_count) { ret opt[*resolve.Symbol].none{}; }
@@ -2019,6 +2378,16 @@ pub fun define_global(lc: *LowerContext, g: GlobalData) res[u32, fail.Fail] {
     node.data.tls       = g.tls;
     node.data.linkage   = g.linkage;
     node.data.constant  = g.constant;
+    if (sel g.secret.ranges) {
+        val ranged: res[Slice[mirl_global.Range], A.Error] = mirl_slice.copy[mirl_global.Range](lc.m.a, g.secret.ranges);
+        if (sel ranged.err)              { ret res[u32, fail.Fail].err{fail.refused(ranged.err)}; }
+        if (sel node.data.secret.ranges) { val freed: err[A.Error] = mirl_slice.release[mirl_global.Range](lc.m.a, node.data.secret.ranges); }
+        node.data.secret = mirl_global.Secrecy.ranges{ranged.ok};
+    }
+    or {
+        if (sel node.data.secret.ranges) { val freed: err[A.Error] = mirl_slice.release[mirl_global.Range](lc.m.a, node.data.secret.ranges); }
+        node.data.secret = g.secret;
+    }
     if (sel g.section.some) {
         val named: res[View, A.Error] = mirl_slice.copy_view(lc.m.a, g.section.some.name);
         if (sel named.err) { ret res[u32, fail.Fail].err{fail.refused(named.err)}; }
@@ -2045,15 +2414,16 @@ pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: FnSig
 
 # the copy of the function `decl` of `origin`, linked as `base`, whose pointer parameters
 # take the classes `sig` states, declared here and lowered once the module's own
-# declarations are. one name is one copy, so a copy asked for twice is asked for once
-pub fun class_copy(lc: *LowerContext, origin: session.ModuleId, decl: ast_id.DeclId, base: intern.StrId, sig: Type) res[u32, fail.Fail] {
+# declarations are, of the instance `instance` of the module's set where it is one. one
+# name is one copy, so a copy asked for twice is asked for once
+pub fun class_copy(lc: *LowerContext, origin: session.ModuleId, decl: ast_id.DeclId, base: intern.StrId, sig: Type, instance: u32) res[u32, fail.Fail] {
     val named: res[intern.StrId, fail.Fail] = class_copy_name(lc, base, sig);
     if (sel named.err) { ret res[u32, fail.Fail].err{named.err}; }
     val existing: opt[u32] = function_named(lc, named.ok);
     if (sel existing.some) { ret res[u32, fail.Fail].ok{existing.some}; }
     val declared: res[u32, fail.Fail] = ensure_extern_function(lc, named.ok, FnSig{sig: sig});
     if (sel declared.err) { ret declared; }
-    val queued: res[usize, A.Error] = collections_vector.push[ClassCopy](?lc.copies, ClassCopy{origin: origin, decl: decl, name: named.ok, sig: sig});
+    val queued: res[usize, A.Error] = collections_vector.push[ClassCopy](?lc.copies, ClassCopy{origin: origin, decl: decl, name: named.ok, sig: sig, instance: instance});
     if (sel queued.err) { ret res[u32, fail.Fail].err{fail.refused(queued.err)}; }
     ret declared;
 }
@@ -2112,10 +2482,15 @@ fun class_copy_spell(out: *collections_vector.Vector[u8], a: str, b: str) err[A.
     ret err[A.Error].ok{};
 }
 
-# the module's global `name` of `ty`, declared here when another module defines it
-pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type, tls: opt[mirl_global.Tls]) res[u32, fail.Fail] {
+# the module's global `name` of `ty`, of source type `sem` (TYPE_NIL for bytes no source
+# type describes), declared here when another module defines it
+pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type, tls: opt[mirl_global.Tls], sem: type.TypeId) res[u32, fail.Fail] {
     val existing: opt[u32] = global_named(lc, name);
     if (sel existing.some) { ret res[u32, fail.Fail].ok{existing.some}; }
+    var ranges: collections_vector.Vector[mirl_global.Range] = collections_vector.init[mirl_global.Range](lc.s.alloc);
+    fin { collections_vector.dnit[mirl_global.Range](?ranges); }
+    val secret: res[mirl_global.Secrecy, fail.Fail] = global_secrecy(lc, sem, ty, ?ranges);
+    if (sel secret.err) { ret res[u32, fail.Fail].err{secret.err}; }
     var g: GlobalData;
     g.name      = view_text(lc, name);
     g.type      = ty;
@@ -2125,6 +2500,7 @@ pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type, tl
     g.tls       = tls;
     g.linkage   = external_linkage();
     g.constant  = false;
+    g.secret    = secret.ok;
     ret add_global(lc, g);
 }
 

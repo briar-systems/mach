@@ -31,7 +31,8 @@ pub uni Maybe[T] {
 ```
 
 A `uni`'s size is the size of its largest field, plus any alignment
-padding.
+padding. A `uni` that holds a secret has that padding zeroed (see
+[secrecy.md](secrecy.md#padding-of-secret-aggregates)).
 
 A `uni`'s overlapping variants must agree on secrecy: every field is either
 secret (`^`) or every field is public. A mixed union would let the same storage

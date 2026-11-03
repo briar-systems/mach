@@ -387,6 +387,14 @@ fwd comptime_value.typed_int
 
 forwards [`mach.lang.fe.comptime.value.typed_int`](comptime/value.md#fun-typed_int)
 
+## fwd comptime_value.width_held
+
+```mach
+fwd comptime_value.width_held
+```
+
+forwards [`mach.lang.fe.comptime.value.width_held`](comptime/value.md#fun-width_held)
+
 ## fwd comptime_capability.FIELD_SEL_CODE
 
 ```mach

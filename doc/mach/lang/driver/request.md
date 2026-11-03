@@ -43,10 +43,9 @@ a lever or value left unset leaves the profile's
 
 output: the `-o` path, nil when absent
 work: the `-w` work directory, nil when absent
-subsystem: the declared subsystem, SUBSYSTEM_FLAG_NONE for the artifact's own
+subsystem: the declared subsystem as mink spells it, none for the artifact's own
 optimize: whether to optimize, or LEVER_PROFILE
 debug: whether to emit debug information, or LEVER_PROFILE
-simd: the vector lowering mode, none for the profile's
 jobs: the worker count, 0 for the host's
 
 ## fun overrides_init
@@ -57,32 +56,6 @@ pub fun overrides_init(a: *A.Allocator) Overrides;
 
 no override: the profile decides everything, with empty name lists and link
 inputs growable through `a`
-
-## def SubsystemFlag
-
-```mach
-pub def SubsystemFlag: u8
-```
-
-## val SUBSYSTEM_FLAG_CONSOLE
-
-```mach
-pub val SUBSYSTEM_FLAG_CONSOLE: SubsystemFlag = 1
-```
-
-## fun subsystem_flag_from_name
-
-```mach
-pub fun subsystem_flag_from_name(name: str) opt[SubsystemFlag];
-```
-
-the flag a subsystem name sets, none for a name no flag sets
-
-## fun subsystem_from_flag
-
-```mach
-pub fun subsystem_from_flag(f: SubsystemFlag) opt[catalog_subsystem.Subsystem];
-```
 
 ## val OPT_DEBUG
 
@@ -169,20 +142,6 @@ pub fun defaults() BuildRequest;
 pub fun test_goal(g: BuildGoal) bool;
 ```
 
-## fun goal_from_emit_name
-
-```mach
-pub fun goal_from_emit_name(name: str) opt[BuildGoal];
-```
-
-## fun goal_emit_name
-
-```mach
-pub fun goal_emit_name(goal: BuildGoal) str;
-```
-
-the name `--emit` gives a catalogued goal, "" for one it does not name
-
 ## fun goal_name
 
 ```mach
@@ -231,7 +190,7 @@ canonical path inside the project root, taken as written
 
 ```mach
 pub fun for_cell(base: *BuildRequest, owner: str, target: str, artifact: str,
-subsystem: catalog_subsystem.Subsystem, goal: BuildGoal) BuildRequest;
+subsystem: opt[*mink_subsystem.Subsystem], goal: BuildGoal) BuildRequest;
 ```
 
 ## fun workers

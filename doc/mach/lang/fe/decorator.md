@@ -10,6 +10,12 @@ may repeat, and whether it is a shader interface role; a rule no row expresses
 is the decorator's own check, keyed by its id. a new decorator is a row here and
 its consumer
 
+a name is lowercase, `snake_case` where it is several words, and dotted only in
+the `gpu.` set, whose generic words apply only to shader stages. every argument
+is a constant expression: a number is an integer, and every name, mode or path
+is a string, so no decorator takes a bare word. a mode is a string argument of
+one decorator, never a sibling decorator, and its row lists the modes it takes
+
 a string argument is a constant expression evaluated in its module's comptime
 context: a literal, a `val`, a gated `val`, or an imported constant. the load
 evaluates each once, after its walk has bound every constant, and records the
@@ -25,187 +31,199 @@ pub def Id: u8
 ## val NONE
 
 ```mach
-pub val NONE:       Id = 0
+pub val NONE:          Id = 0
 ```
 
 ## val DEPRECATED
 
 ```mach
-pub val DEPRECATED: Id = 1
+pub val DEPRECATED:    Id = 1
 ```
 
 ## val SYMBOL
 
 ```mach
-pub val SYMBOL:     Id = 2
+pub val SYMBOL:        Id = 2
 ```
 
 ## val SECTION
 
 ```mach
-pub val SECTION:    Id = 3
+pub val SECTION:       Id = 3
 ```
 
 ## val INLINE
 
 ```mach
-pub val INLINE:     Id = 4
+pub val INLINE:        Id = 4
 ```
 
-## val NOINLINE
+## val EXPORT
 
 ```mach
-pub val NOINLINE:   Id = 5
+pub val EXPORT:        Id = 5
 ```
 
 ## val ALIGN
 
 ```mach
-pub val ALIGN:      Id = 6
+pub val ALIGN:         Id = 6
 ```
 
 ## val PACKED
 
 ```mach
-pub val PACKED:     Id = 7
+pub val PACKED:        Id = 7
 ```
 
 ## val VOLATILE
 
 ```mach
-pub val VOLATILE:   Id = 8
+pub val VOLATILE:      Id = 8
 ```
 
 ## val LIBRARY
 
 ```mach
-pub val LIBRARY:    Id = 9
+pub val LIBRARY:       Id = 9
 ```
 
-## val OBLIVIOUS
+## val CONSTANT_TIME
 
 ```mach
-pub val OBLIVIOUS:  Id = 10
+pub val CONSTANT_TIME: Id = 10
 ```
 
-## val SCALAR
+## val VECTORIZE
 
 ```mach
-pub val SCALAR:     Id = 11
+pub val VECTORIZE:     Id = 11
 ```
 
 ## val NAKED
 
 ```mach
-pub val NAKED:      Id = 12
+pub val NAKED:         Id = 12
 ```
 
-## val EXT
+## val EXTENSION
 
 ```mach
-pub val EXT:        Id = 13
+pub val EXTENSION:     Id = 13
 ```
 
 ## val EMBED
 
 ```mach
-pub val EMBED:      Id = 14
+pub val EMBED:         Id = 14
 ```
 
-## val STAGE
+## val GPU_STAGE
 
 ```mach
-pub val STAGE:      Id = 15
+pub val GPU_STAGE:     Id = 15
 ```
 
-## val WORKGROUP
+## val GPU_WORKGROUP
 
 ```mach
-pub val WORKGROUP:  Id = 16
+pub val GPU_WORKGROUP: Id = 16
 ```
 
-## val INPUT
+## val GPU_INPUT
 
 ```mach
-pub val INPUT:      Id = 17
+pub val GPU_INPUT:     Id = 17
 ```
 
-## val OUTPUT
+## val GPU_OUTPUT
 
 ```mach
-pub val OUTPUT:     Id = 18
+pub val GPU_OUTPUT:    Id = 18
 ```
 
-## val BUILTIN
+## val GPU_BUILTIN
 
 ```mach
-pub val BUILTIN:    Id = 19
+pub val GPU_BUILTIN:   Id = 19
 ```
 
-## val UNIFORM
+## val GPU_UNIFORM
 
 ```mach
-pub val UNIFORM:    Id = 20
+pub val GPU_UNIFORM:   Id = 20
 ```
 
-## val STORAGE
+## val GPU_STORAGE
 
 ```mach
-pub val STORAGE:    Id = 21
+pub val GPU_STORAGE:   Id = 21
 ```
 
-## val SAMPLER
+## val GPU_SAMPLER
 
 ```mach
-pub val SAMPLER:    Id = 22
+pub val GPU_SAMPLER:   Id = 22
 ```
 
-## val PUSH
+## val GPU_PUSH
 
 ```mach
-pub val PUSH:       Id = 23
+pub val GPU_PUSH:      Id = 23
 ```
 
-## val SPEC
+## val GPU_SPEC
 
 ```mach
-pub val SPEC:       Id = 24
+pub val GPU_SPEC:      Id = 24
 ```
 
-## val SHARED
+## val GPU_SHARED
 
 ```mach
-pub val SHARED:     Id = 25
+pub val GPU_SHARED:    Id = 25
 ```
 
-## val OP
+## val INTRINSIC
 
 ```mach
-pub val OP:         Id = 26
+pub val INTRINSIC:     Id = 26
 ```
 
 ## val HANDLE
 
 ```mach
-pub val HANDLE:     Id = 27
+pub val HANDLE:        Id = 27
 ```
 
 ## val ABI_TYPE
 
 ```mach
-pub val ABI_TYPE:   Id = 28
+pub val ABI_TYPE:      Id = 28
 ```
 
 ## val TESTING
 
 ```mach
-pub val TESTING:    Id = 29
+pub val TESTING:       Id = 29
 ```
 
 ## val EXPECT
 
 ```mach
-pub val EXPECT:     Id = 30
+pub val EXPECT:        Id = 30
+```
+
+## val THREAD
+
+```mach
+pub val THREAD:        Id = 31
+```
+
+## val AT
+
+```mach
+pub val AT:            Id = 32
 ```
 
 ## def Places
@@ -241,7 +259,6 @@ what a row asks of its decorator beyond its arguments and places
 FLAG_ONCE: it stands at most once on a declaration
 FLAG_ROLE: it gives a module binding a shader interface role, and a binding has one
 FLAG_TESTING_EXCLUSIVE: it names a consumer outside Mach source, which `#[testing]` cannot confine
-FLAG_WORDS: its arguments are bare names that bind to nothing, never expressions
 FLAG_STRINGS_CHECKED: its string arguments are checked by the row, not by the decorator's own rule
 FLAG_PLACE_CHECKED: the decorator refuses a misplacement itself, in a diagnostic of its own kind
 FLAG_DEFINES: it supplies the type of a `def` that states none
@@ -262,12 +279,6 @@ pub val FLAG_ROLE:              Flags = 0x2
 
 ```mach
 pub val FLAG_TESTING_EXCLUSIVE: Flags = 0x4
-```
-
-## val FLAG_WORDS
-
-```mach
-pub val FLAG_WORDS:             Flags = 0x8
 ```
 
 ## val FLAG_STRINGS_CHECKED
@@ -301,6 +312,8 @@ args_min, args_max:           the argument count it takes, `arity` the refusal o
 strings_first, strings_count: the arguments that are strings the load records, none when the count is 0
 integers: one bit per argument the row checks as an integer constant, `argument`
            the refusal of a string or integer argument of the wrong kind
+modes: the values its first argument may take, `|`-separated, nil when any string is
+           its own; `argument` is the refusal of any other value too
 duplicate: the refusal of a second one where FLAG_ONCE holds
 
 ## fun row
@@ -317,7 +330,47 @@ the row of `id`; nil for NONE and any id no row declares
 pub fun id_of(source: str, name: lang_source.Span) Id;
 ```
 
-the decorator the name at `name` in `source` spells; NONE when it spells none
+the decorator the name at `name` in `source` spells, this major's or a previous one's;
+NONE when it spells none
+
+## def Form
+
+```mach
+pub def Form: u8
+```
+
+how a decorator is written: as this major spells it, or in a previous major's spelling,
+which is read with a `decorator.renamed` warning naming its replacement until the
+family's sources use this major's (#4894 makes it a refusal)
+
+FORM_V7: this major's name and arguments
+FORM_SAME: a previous name with this major's arguments
+FORM_BARE: a previous flag with no arguments, standing for its row's mode
+FORM_WORDS: a previous name whose arguments are bare names, which bind to nothing
+
+## val FORM_V7
+
+```mach
+pub val FORM_V7:    Form = 0
+```
+
+## val FORM_SAME
+
+```mach
+pub val FORM_SAME:  Form = 1
+```
+
+## val FORM_BARE
+
+```mach
+pub val FORM_BARE:  Form = 2
+```
+
+## val FORM_WORDS
+
+```mach
+pub val FORM_WORDS: Form = 3
+```
 
 ## fun renamed
 
@@ -326,16 +379,41 @@ pub fun renamed(source: str, name: lang_source.Span) str;
 ```
 
 the name this major gives the decorator the name at `name` in `source`
-spells, nil when no previous major named one so
+spells, nil when no previous major named one so or the rename changes its arguments too
+
+## fun form_of
+
+```mach
+pub fun form_of(source: str, name: lang_source.Span, args: u32) Form;
+```
+
+how the decorator named at `name` in `source` with `args` arguments is written
 
 ## fun renamed_note
 
 ```mach
-pub fun renamed_note(source: str, name: lang_source.Span) str;
+pub fun renamed_note(source: str, dec: *ast_decl.Decorator) str;
 ```
 
-the refusal of the previous major's name the name at `name` in `source`
-spells, nil when it spells none
+the warning on the previous spelling `dec` is written in, nil when it is written as
+this major spells it
+
+## fun mode_of
+
+```mach
+pub fun mode_of(itn: *intern.Interner, c: *comptime.ComptimeCtx, a: *ast.Ast, source: str, dec: *ast_decl.Decorator) opt[str];
+```
+
+the mode `dec` states: its first argument, or the mode a previous flag stands for
+
+## fun constant_time_mode
+
+```mach
+pub fun constant_time_mode(itn: *intern.Interner, c: *comptime.ComptimeCtx, a: *ast.Ast, source: str, d: *ast_decl.Decl) opt[str];
+```
+
+the constant-time mode `d` declares, "soft" or "hard", none when it declares none. a previous
+major's bare `#[oblivious]` is "soft". every reader of the mode asks here, so none disagree
 
 ## fun name_of
 
@@ -368,6 +446,14 @@ pub fun flagged(id: Id, flags: Flags) bool;
 ```
 
 whether `id`'s row carries every one of `flags`
+
+## fun mode_admits
+
+```mach
+pub fun mode_admits(modes: str, value: str) bool;
+```
+
+whether `value` is one of the `|`-separated `modes`
 
 ## fun list_get
 

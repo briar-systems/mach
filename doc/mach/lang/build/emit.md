@@ -1,14 +1,5 @@
 # mach.lang.build.emit
 
-## fun emit_asm
-
-```mach
-pub fun emit_asm() err[fail.Fail];
-```
-
-assembly listings come from masc's listing of the object mirl compiled, which masc
-does not offer yet (masc#484)
-
 ## fun artifact_product_name
 
 ```mach
@@ -20,6 +11,9 @@ pub fun artifact_product_name(p: *project.Project) *u8;
 ```mach
 pub rec LoadedImageOptions;
 ```
+
+the resources an executable declares: its icon and manifest, read, with the
+version and names an image's version resource states
 
 ## fun dnit_image_options
 
@@ -36,23 +30,29 @@ pub fun load_image_options(p: *project.Project, out_kind: catalog_artifact.Kind,
 exe_path: *u8) res[LoadedImageOptions, fail.Fail];
 ```
 
+the resources an executable declares, read where the target's images state a
+subsystem, as mink's host of it names; an image of another host carries none
+
 ## fun emit_static_archive
 
 ```mach
-pub fun emit_static_archive(p: *project.Project, destination: str, objects: **Object, inputs: *target_of.ObjectInput, out_path: **u8) err[fail.Fail];
+pub fun emit_static_archive(p: *project.Project, destination: str, objects: **Object, inputs: *contract.Input, out_path: **u8) err[fail.Fail];
 ```
+
+the archive of the emitted modules' objects, read back from `inputs`, as mink's
+archive writer lays one out in the variant its registry states for the target's
+format, its index naming each member's exported symbols
 
 ## fun link_image
 
 ```mach
-pub fun link_image(p: *project.Project, kind: *mink_output.Kind, flat: bool, objects: **Object, count: u32,
-ext: *target_of.ObjectInput, ext_count: u32, dynlib_len: u32, destination: str, image: *LoadedImageOptions) err[fail.Fail];
+pub fun link_image(p: *project.Project, kind: *mink_output.Kind, objects: **Object, count: u32,
+links: *input.Input, link_count: u32, destination: str, image: *LoadedImageOptions) err[fail.Fail];
 ```
 
 the image of `kind` mink links in memory from the `count` objects at `objects`, in link order,
-and the `ext_count` external inputs at `ext`, written to `destination`. a link against a
-library by name, a flat image, a position independent image and an executable carrying
-resources are refused
+then the `link_count` inputs at `links`, written to `destination` with the resources
+`image` declares, laid out as the artifact and its placed globals state
 
 ## fun ordered_objects
 
@@ -82,22 +82,15 @@ every emitted module's object at its module index, for a reader that walks modul
 pub fun release_indexed(p: *project.Project, objects: **Object);
 ```
 
-## fun append_external_inputs
+## fun external_inputs
 
 ```mach
-pub fun append_external_inputs(p: *project.Project, unit: *build_plan.BuildUnit,
-inputs: **target_of.ObjectInput, len: *u32,
-dynlibs: **target_of.DynLib, dynlib_len: *u32) err[fail.Fail];
+pub fun external_inputs(p: *project.Project, unit: *build_plan.BuildUnit) res[Vector[input.Input], fail.Fail];
 ```
 
-the unit's static link inputs, each the user's (RELOC_INPUT), appended to
-`inputs` after whatever it already holds
-
-## fun free_dynlibs
-
-```mach
-pub fun free_dynlibs(a: *A.Allocator, dynlibs: *target_of.DynLib, dynlib_len: u32);
-```
+the inputs the unit links beyond its objects, in link order: the manifest's link entries,
+those its dependencies cascade, then the command line's. an input named twice is linked
+once, and each library registers its provider and the symbols it claims
 
 ## rec ObjectWrite
 
@@ -114,7 +107,7 @@ pub fun write_object(w: *ObjectWrite, destination: str) err[fail.Fail];
 ## fun write_objects
 
 ```mach
-pub fun write_objects(p: *project.Project, destinations: *str, inputs_out: **target_of.ObjectInput) err[fail.Fail];
+pub fun write_objects(p: *project.Project, destinations: *str, inputs_out: **contract.Input) err[fail.Fail];
 ```
 
 every module's object reaches `obj/` through a sibling temporary, carrying its cache record,
@@ -133,7 +126,7 @@ destinations: per emitted module, its test object's path, nil for a module witho
 ## fun free_inputs
 
 ```mach
-pub fun free_inputs(a: *A.Allocator, inputs: *target_of.ObjectInput, n: u32, cap: u32);
+pub fun free_inputs(a: *A.Allocator, inputs: *contract.Input, n: u32, cap: u32);
 ```
 
 release `n` object inputs and their array of `cap`; a nil array owns nothing

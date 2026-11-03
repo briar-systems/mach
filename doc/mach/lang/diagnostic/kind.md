@@ -3015,6 +3015,26 @@ pub val COMPTIME_CAST_RANGE:              Kind = 510
 pub val COMPTIME_NAN_UNSPECIFIED:         Kind = 511
 ```
 
+## val ADDRESS_THREAD_LOCAL
+
+```mach
+pub val ADDRESS_THREAD_LOCAL:             Kind = 512
+```
+
+## val DECORATOR_RENAMED
+
+```mach
+pub val DECORATOR_RENAMED:                Kind = 513
+```
+
+## val READOUT_CLOCK_REFUSED
+
+```mach
+pub val READOUT_CLOCK_REFUSED: Kind = 514
+```
+
+mirl's stage clock refused a read, so a -vv stage row it would have timed is short
+
 ## rec Spec
 
 ```mach
@@ -3032,7 +3052,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 511
+pub val COUNT: usize       = 514
 ```
 
 ## fun at

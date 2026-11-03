@@ -8,10 +8,6 @@ the flow-typing rules and the `#[constant_time]` codegen contract. The grammar l
 in [grammar.md](grammar.md); the decorator reference is in
 [decorators.md](decorators.md).
 
-> **Experimental preview.** The constant-time support is incomplete and
-> unaudited. Read [Assurance](#assurance) before relying on any of this.
-> **Do not build production cryptography on it at this version.**
-
 ## Secrecy lattice
 
 There are two secrecy levels in a two-point lattice: public is the bottom,
@@ -111,32 +107,33 @@ fun leak(a: ^u32, t: *u8, p: ^*u8) u8 {
 }
 ```
 
-Three more gates decide against the target's constant-time capabilities rather
-than the source alone, so they are reported at lowering:
+A secret operand of a **floating-point** operation is refused as well: its
+latency is variable on every target.
 
-- a secret operand of a **floating-point** operation (always variable-latency,
-  gated on every target)
-- a secret operand of an **integer multiply**, unless the target declares the
-  exact multiply it emits (the low half, a high half or the widening product,
-  at that operand width) as data-independent-timing under a condition the
-  build meets. The declared cells are the table in [Constant-time multiply by
-  instruction set](#constant-time-multiply-by-instruction-set): x86-64 admits
-  every scalar cell unconditionally, aarch64 admits its cells only while
-  PSTATE.DIT is on and only on an operating system that guarantees the mode,
-  riscv64 admits its cells only when the selection holds `m` and `zkt`, and
-  riscv32, SPIR-V and every lane multiply are refused. The refusal names the
-  target and the condition it lacks. `$mach.build.ct_mul(op, width)` reads the
-  same decision at comptime (see `comptime-mach.md`). A secret 128-bit `/` or
-  `%` is refused like every secret division: the helper it would call is a
-  loop over the dividend's bits
-- a secret **variable shift count** on a target without a barrel shifter. Where
-  it is admitted, the saturation of a count at or above the operand width
-  ([operators.md](operators.md#bitwise)) is a compare to an all-ones-or-zero
-  mask and a mask on the count and the value, with no branch, so it reveals
-  nothing the shift itself would not
+Whether an integer **multiply** or a **variable shift** runs in time
+independent of a secret operand is the target's question, and it is asked
+inside a `#[constant_time]` function, where mirl reads the class masc gives
+each instruction it selects under the timing modes the function's mode admits
+(see [Constant-time multiply by instruction set](#constant-time-multiply-by-instruction-set)
+and [Soft and hard](#soft-and-hard)). A secret operand of an instruction whose
+latency depends on it there is refused, naming the function and the
+instruction set's reason. `$mach.build.ct_mul(op, width)` reads mirl's answer
+for a multiply at comptime (see `comptime-mach.md`). A secret 128-bit `/` or
+`%` is refused like every secret division: the helper it would call is a loop
+over the dividend's bits. Where a variable shift is admitted, the saturation
+of a count at or above the operand width ([operators.md](operators.md#bitwise))
+is a compare to an all-ones-or-zero mask and a mask on the count and the
+value, with no branch, so it reveals nothing the shift itself would not.
 
 A secret value passed to a variadic pack is also rejected, including a secret
 wrapped inside an aggregate.
+
+The gates hold in **every** function, whether or not it carries
+`#[constant_time]`. Branching, indexing, addressing or dividing on a `^` value
+needs a `:>T` downgrade first everywhere. Everything else is free everywhere: a
+secret moves through storage, arithmetic and calls in any function, and only a
+`#[constant_time]` function adds a guarantee about the code the compiler emits
+for it.
 
 The gates are checked against the types of the **instance**, not of the template.
 A generic's body is re-checked per instantiation under its concrete type
@@ -478,10 +475,20 @@ fun leak(a: ^*u8, b: ^*u8) u8 {
 
 ## `#[constant_time]` — the codegen contract
 
-The flow typing constrains the *source*; `#[constant_time]` carries the obligation
-through *codegen*. Inside a function carrying it, the backend must not introduce
-a secret-dependent branch or select a variable-latency instruction on a secret
-operand.
+The flow typing constrains the *source*. `#[constant_time(mode)]` carries the
+obligation through *codegen*, and its mode, `"soft"` or `"hard"`, is required:
+a bare `#[constant_time]` is refused. Inside a function carrying it, in either
+mode:
+
+- the code-level rules apply to the emitted code: no secret branch or loop
+  condition, short-circuit operand, index, address or division;
+- a callee that receives a secret must itself be constant time;
+- masc's walk proves all of this on the encoded code, so a secret the
+  compiler's own passes route to a branch, an address or a variable-latency
+  instruction is refused, never emitted.
+
+The two modes differ only in how the processor's data-independent-timing mode is
+held, which [Soft and hard](#soft-and-hard) describes.
 
 Inline `asm` inside such a function is **validated**, not rejected. The block is
 parsed into instructions and walked for the same three leaks the compiler checks
@@ -581,9 +588,12 @@ carry no divide, multiply or float instruction at all, so it reaches only their
 register-count shifts. riscv64's grammar admits the whole M-extension, so on that
 target the check is substantive.
 
-`#[constant_time]` remains a **per-function** contract. A call out to a non-oblivious
-function is not validated — that is the boundary the decorator draws, not a hole in
-it, and it applies to a callee containing `asm` exactly as it applies to any other.
+`#[constant_time]` is a **per-function** contract, and a call is where it meets
+another function: a constant-time function may pass a secret only to a callee that
+is constant time itself. masc's walk follows each call through the callee's
+convention and refuses a secret that reaches a callee it does not check constant
+time, naming the callee. A call that passes only public values needs nothing of
+its callee.
 
 The zeroizing-write guarantee is separate and broader; it is described below.
 
@@ -593,10 +603,10 @@ clone, instruction selection, and register-allocator copy. The one place taint
 stops is the declassify barrier a `:>T` cast lowers to. Secret-free code carries
 no taint and compiles byte-identically.
 
-A function instance that **computes** on a secret must carry `#[constant_time]`; one
-that only moves, stores, or declassifies secrets is transparent and stays
-annotation-free. The check runs per monomorphized instance, so a generic
-instantiated at a secret type is held to the concrete type's rules.
+No function is required to carry `#[constant_time]`. A function that computes on
+a secret without it compiles, held to the gates above and to nothing more: the
+compiler makes no promise about the timing of the code it emits for it. The
+decorator is how a function asks for that promise.
 
 ```mach
 #[constant_time("hard")]
@@ -682,16 +692,17 @@ masc registers no aarch64 set yet, so aarch64 keeps mach's own walk until it doe
 
 `*` on a secret operand means what it means on a public one: the wrapping,
 same-width product. What changes per target is whether the machine can execute
-it without a timing leak, and mach decides that from a catalog each instruction
-set declares, never from a guess. A **row** of the catalog names one cell (a
-multiply, an operand width) and the **condition** under which that cell has
-data-independent timing:
+it without a timing leak. mirl decides that from the class masc's instruction
+set gives each row its selection emits for the multiply, never from a guess,
+and mach states no table of its own. A **cell** is one multiply at one operand
+width, and the class of the rows that realize it says the **condition** under
+which it has data-independent timing:
 
 - **always**: nothing to check;
 - **PSTATE.DIT on**: the cell is data-independent only while the processor's
-  DIT mode is set, so the row is admitted only on an operating system that
-  declares it guarantees the mode (see [PSTATE.DIT at run
-  time](#pstatedit-at-run-time));
+  DIT mode is set, which a `soft` function sets where the processor has it and
+  a `hard` function requires in the target's baseline (see [Soft and
+  hard](#soft-and-hard));
 - **extensions selected**: the cell is data-independent only on a machine that
   has the named extensions, so the row is admitted only when the target selects
   every one of them (`ext` in the manifest, or the `isa`).
@@ -728,10 +739,11 @@ The declared rows, one line per multiply:
 | `riscv32` | none | | |
 | `spirv` | none | | |
 
-A test reads this table back against the compiler's catalog, so the two cannot
-drift. A cell the table does not hold is refused, as is every lane multiply
-(`i32x4 * i32x4` on a secret vector): the vector rows exist in the contract and
-no instruction set declares one.
+The table describes masc's rows, and masc's registration of each instruction
+set is the source. Inside a constant-time function a secret multiply whose
+rows are not classified constant time under the function's mode is refused, as
+is every lane multiply (`i32x4 * i32x4` on a secret vector), which no
+instruction set classifies.
 
 **Realized cells.** A cell no instruction executes directly is admitted exactly
 when every cell of its realization is, under the union of their conditions. On
@@ -744,9 +756,10 @@ and `wide_s` are admitted there through the 64-bit `low` and high rows. A
 one: `(a::^u128) * (b::^u128)` with 64-bit `a` and `b` is the 64-bit widening
 product, one instruction, and its high half `(... >> 64)::^u64` is that same
 instruction; a secret `^u128 * ^u128` low product is the schoolbook over the
-lanes, three 64-bit low products and the widening one. `$mach.build.ct_mul(low,
-128)` and `$mach.build.ct_mul(wide_u, 64)` answer for the realized cells the
-same way the gate does, so on aarch64 they need DIT like the 64-bit high half.
+lanes, three 64-bit low products and the widening one. `$mach.build.ct_mul(wide_u,
+64)` answers for the 64-bit low and high halves together, so on aarch64 it needs
+DIT like the 64-bit high half, and a 128-bit cell answers as mirl's selection
+covers a multiply of that width.
 
 **Why each row holds.** Every row cites its source beside the declaration in the
 instruction set's registration, and the kind of each claim is marked:
@@ -771,10 +784,9 @@ instruction set's registration, and the kind of each claim is marked:
   `umaddl` (`umull`), `umsubl` and `umulh` as data-independent while DIT is
   set. The 8- and 16-bit low halves are the 32-bit `madd`, the 64-bit high
   halves are `umulh` and `smulh`, and the 32-bit widening rows are `umaddl`
-  and `smaddl`. Whether a process can set and hold the mode is the operating
-  system's declaration, and on an OS that declares nothing (windows,
-  freestanding) the refusal names the instruction set that declares the rows
-  and the operating system that declares no guarantee.
+  and `smaddl`. A `soft` function sets the mode around itself where the
+  processor has it, and a `hard` one builds only where the target's baseline
+  holds DIT, and its refusal names the feature.
 - **riscv64, `m` and `zkt` selected.** The RISC-V Cryptography Extensions
   Volume I (scalar), chapter "Data Independent Execution Latency Subset: Zkt",
   table RVM, lists `mul`, `mulh`, `mulhsu`, `mulhu` and (rv64) `mulw`, and
@@ -793,32 +805,55 @@ offers a manifest key for it. A program that wants that hardening asks the
 operator for the kernel control, the same class as SMT and other side-channel
 mitigations.
 
-**Fail closed, never fall back.** A secret multiply the catalog does not admit
-is a compile error; the compiler never substitutes a bit-serial loop, a
-shift-add expansion or a call for it, and it has no multiply strength
-reduction, so a secret square and a secret multiply by a constant each reach
-the machine as the one multiply instruction. A per-ISA test decodes the emitted
-function and checks exactly that: one multiply, no call, branch or loop, on
-riscv64 through its Zkt rows, x86-64 through its unconditional rows and aarch64
-through its DIT rows on linux and darwin. A program that compiles
-through a `PSTATE.DIT on` row and reaches a processor without the mode is
-refused at start by the std runtime, before any secret is multiplied, as the
-next section describes.
+**Fail closed, never fall back.** In a constant-time function a secret
+multiply mirl's check does not clear is a compile error. The compiler never
+substitutes a bit-serial loop, a shift-add expansion or a call for it, so a
+secret square and a secret multiply by a constant each reach the machine as the
+multiply the selection emits, and masc's walk of the encoded code holds it to
+its row. How a constant-time function holds the mode those rows need is the
+next section.
 
-## PSTATE.DIT at run time
+## Soft and hard
 
 An aarch64 multiply has data-independent timing only while the processor's
 DIT mode is on (Arm ARM DDI 0487, "About PSTATE.DIT"; the DIT register page of
 DDI 0601 lists the instructions: `madd`, `msub`, `smaddl`, `smsubl`, `smulh`,
 `umaddl`, `umsubl`, `umulh`). The mode is per-thread processor state that user
 code turns on with `msr dit, 1`, and a processor without FEAT_DIT has no such
-bit. So admitting the aarch64 rows takes two facts the compiler does not own,
-and the design splits them:
+bit. On riscv the same promise is the Zkt extension, which changes no
+instruction and is assumed of every machine a binary built with it runs on. A
+constant-time function's mode says what happens when the build cannot be sure
+the promise holds.
 
-**The operating system declares the guarantee.** A target's OS table declares,
-per instruction set, whether a process can set the mode at start, learn whether
-the processor has it, and keep it. The declaration is read through one accessor
-and never derived, and each carries its citation beside it:
+**`soft`** holds the mode where it can and runs anyway where it cannot. mirl
+emits a save of the DIT bit, a set and a restore around the function. Where the
+target does not guarantee DIT, the set is guarded by std's byte that says
+whether the processor has the mode, and where it does, the set is
+unconditional. Without DIT the function still runs, with the code-level rules
+held and the instruction timing left to the processor. A call from one
+constant-time function to another does not toggle the mode again.
+
+**`hard`** is decided when the program is compiled, and never at run time. The
+build's target must guarantee data-independent timing for every operation the
+function uses, or the build is refused with a diagnostic naming the missing
+feature:
+
+- aarch64 needs DIT in the target's baseline, as darwin-arm64 has it;
+- riscv needs Zkt in the selection;
+- x86-64's scalar cells hold unconditionally, so they pass.
+
+Nothing is linked into the image for either mode: there is no object mark, no
+cell the linker writes and no start code that reads one, and a program never
+refuses to start for want of the mode. std keeps a manual DIT API (enable,
+disable, and run a function with the mode on) for code that holds the mode by
+hand, and `timing.mode()` answers what the hardware offers.
+
+The facts below are what each operating system declares about the mode, which
+std's availability byte reads:
+
+**The operating system declares what a process can learn and keep.** Whether a
+process can learn that the processor has the mode, and keep it once set, is the
+operating system's, and each declaration carries its citation beside it:
 
 - **aarch64-linux declares it.** The kernel exposes the processor's FEAT_DIT as
   `HWCAP_DIT` (`1 << 24`) in `AT_HWCAP` since v4.17 (commit 7206dc93a58f, "arm64:
@@ -831,40 +866,20 @@ and never derived, and each carries its citation beside it:
   documents the mode as per-thread state user code turns on with `msr dit, #1`
   and reads back as bit 24 of `mrs dit`, and names the sysctl
   `hw.optional.arm.FEAT_DIT` as the check for a processor that has it.
-- **aarch64-windows and freestanding aarch64 declare nothing**, so a `DIT_MODE`
-  row is refused there with a diagnostic that names the rows and the OS.
+- **aarch64-windows and freestanding aarch64 declare nothing**, so std's byte
+  reads no mode there: a `soft` function runs without it, and a `hard` one
+  builds only where the target's baseline holds DIT.
 
-**The compiler records the need and the runtime honours it.** The rows only say
-the instruction is safe *while the mode is on*; something must turn it on, and
-only for programs that need it. When a module's lowering admits a secret
-multiply through a `DIT_MODE` row, codegen marks the module: its object carries
-a local absolute symbol `__mach_needs_dit` (value 1) that reaches no linked
-image. When an executable is linked for a target whose OS declares the
-guarantee, the linker appends one synthetic input defining `__mach_dit_required`,
-a hidden one-byte read-only object that is `1` when any input carries the mark
-and `0` otherwise. The std start code reads that byte before `main`. When it is
-zero the program never touches DIT. When it is set, std checks that the
-processor has the mode (`HWCAP_DIT` on linux, `hw.optional.arm.FEAT_DIT` on
-darwin), turns it on with `msr dit, 1` followed by `dsb nsh; isb`, and does the
-same at the entry of every thread it creates, since the bit is per thread. A
-processor or kernel without the mode fails closed: std writes
+## Padding of secret aggregates
 
-```
-std.runtime: this program contains a constant-time multiply that requires the processor's data-independent-timing mode (PSTATE.DIT), and this processor or kernel does not provide it (aarch64-linux: HWCAP_DIT absent; aarch64-darwin: hw.optional.arm.FEAT_DIT is 0); refusing to start
-```
-
-to stderr and terminates through its panic path (exit status 255) before any
-secret is multiplied.
-
-Two consequences of the design are worth knowing. The mark is per module, so a
-module that contains such a multiply sets the byte even when the linker
-dead-strips the function; the cost is one unneeded `msr`. And "a binary without
-the need carries nothing DIT-related" holds up to that one byte: the language
-has no weak import, so std reads a cell that is always defined on a declaring
-target, and a binary without the need carries it as `0`. A shared library gets
-no cell, because no start code of std's runs in one, and an object built by
-another compiler carries no mark. `$mach.build.ct_mul(op, width)` answers `1`
-for the aarch64 rows exactly where the OS declares the guarantee.
+A secret aggregate's padding bytes are zero. A type holding a secret, a `^T` or
+an aggregate with a secret member or element, has every byte its layout leaves
+between or after its members zeroed wherever a value of it is built: a literal,
+a member-by-member construction and a default initialization. A copy moves the
+value whole, padding included, so the padding stays zero. A stale secret
+therefore never rides in the padding of a value that is later copied or written
+out whole. An aggregate that holds no secret is laid out and built as before,
+its padding unspecified.
 
 ## Trusted base
 
@@ -875,9 +890,8 @@ empirical.
 
 ## Assurance
 
-**The constant-time guarantee is incomplete. This support is an experimental
-preview and has not been audited. Do not build production cryptography on it at
-this version.**
+The constant-time guarantee is relative to the leakage model stated above and
+to the code-level rules masc's walk checks. It has not been independently audited.
 
 Secrecy holds for in-bounds accesses only. Indexing past the object a pointer
 addresses, including past a narrowed pointer cast, is outside the guarantee, the

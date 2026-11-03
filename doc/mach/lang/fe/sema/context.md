@@ -446,6 +446,8 @@ pub fun machine_of(sc: *SemaContext) layout.Machine;
 pub fun report(sc: *SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, message: str);
 ```
 
+a diagnostic of kind `k`; only an error rejects the module, a warning leaves it accepted
+
 ## fun refuse_nesting
 
 ```mach

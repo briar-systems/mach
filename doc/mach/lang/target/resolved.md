@@ -1,32 +1,104 @@
 # mach.lang.target.resolved
 
-the description of a resolved target: plain facts the front end, the
-middle end and every backend read, importing nothing from the backend. the
-member vtables the description was resolved from stay with the backend's
-binding (target.binding)
+the description of a resolved target: the owners' rows it names and the plain
+facts the front end, the middle end and the back half read of it
 
-## def AsmReturnsFn
+a target is a row of mink's architecture catalog, a row of its system catalog
+under the environment the manifest states, a member of the architecture's
+convention axis, and a baseline over masc's catalog of the architecture's
+extensions with the extensions the target adds. every fact here is read from
+those owners when the target resolves (mach.lang.target) and none is stated
+by mach
 
-```mach
-pub def AsmReturnsFn: fun(str) bool
-```
-
-whether an asm body returns from the function that holds it
-
-## def IntImmFitsFn
+## val MAX_ADDED
 
 ```mach
-pub def IntImmFitsFn: fun(u64, u32) bool
+pub val MAX_ADDED: u32 = 64
 ```
 
-whether one instruction materializes the integer `value`, read at `bits`
-(at most 64): the rule the middle end hoists a loop's constants by
+the most extensions a target adds over its baseline
+
+## tag VaList
+
+```mach
+pub tag VaList: u8 {
+    listed: layout.Extent;
+    unlisted;
+    refused: str;
+}
+```
+
+what mirl says of the `va_list` of the target's own convention
+
+listed: its size and alignment under the target's data layout
+unlisted: the convention has no `va_list`
+refused: mirl answers none for the target, with why
+
+## rec Selected
+
+```mach
+pub rec Selected;
+```
+
+a closed selection of masc's catalog of the target's architecture, held by value
+
+catalog: the catalog, nil where masc serves the architecture with none
+words: one bit per catalog row the selection holds
+
+## fun selected_none
+
+```mach
+pub fun selected_none() Selected;
+```
+
+no selection
+
+## fun selected_of
+
+```mach
+pub fun selected_of(s: *masc_extension.Selection) Selected;
+```
+
+`s` held by value, its rows past what a Selected holds dropped, as no masc catalog has
+
+## fun selected_has
+
+```mach
+pub fun selected_has(s: *Selected, id: requirement.Id) bool;
+```
+
+whether `s` holds the catalog row `id`
+
+## fun extension_named
+
+```mach
+pub fun extension_named(s: *Selected, name: str, len: usize) opt[requirement.Id];
+```
+
+the one extension of the selection's catalog `name[0..len]` names, none where the
+catalog has no such name or it names a level of many
 
 ## rec Target
 
 ```mach
 pub rec Target;
 ```
+
+## fun none
+
+```mach
+pub fun none() Target;
+```
+
+no target selected
+
+## fun is_selected
+
+```mach
+pub fun is_selected(t: *Target) bool;
+```
+
+whether a target is selected
 
 ## rec Nans
 
@@ -44,14 +116,6 @@ pub fun nans_none() Nans;
 ```
 
 no format's rule stated, as where no target is selected
-
-## fun nans_of_rule
-
-```mach
-pub fun nans_of_rule(r: float.NanRule) Nans;
-```
-
-the rule of a target cell no owner assembles yet, read from mach's own (#4779)
 
 ## fun nans_at
 
@@ -75,26 +139,7 @@ whether any format's rule is stated, as it is wherever a target is selected
 pub fun layout_machine(tgt: *Target) layout.Machine;
 ```
 
-the layout machine of a resolved target. total over what resolve produces,
-which always selects an instruction set: a nil target is a caller defect
-
-## fun dit_mode_guaranteed
-
-```mach
-pub fun dit_mode_guaranteed(tgt: *Target) bool;
-```
-
-whether the target guarantees the data-independent-timing mode a DIT_MODE
-row needs: mink's host of the target declares it
-
-## fun ct_mul_admitted
-
-```mach
-pub fun ct_mul_admitted(tgt: *Target) ct.CtMulMask;
-```
-
-the constant-time multiply cells this target admits: the one decision the
-lowering gate, the oblivious validators and `$mach.build.ct_mul` all read
+the layout machine of a target: mirl's extents for every primitive and vector
 
 ## rec Facts
 
@@ -102,35 +147,14 @@ lowering gate, the oblivious validators and `$mach.build.ct_mul` all read
 pub rec Facts;
 ```
 
-what a program may ask of its target while it compiles: the catalog ids, the machine's
-widths and float support, the va_list shape, the instruction and type table, the
-constant-time multiply cells it admits, the extensions it selects and every vocabulary
-they are read against, what a float conversion makes of a NaN, and whether `asm` reaches
-an assembler
+what a program may ask of its target while it compiles: the tag ids, the
+extents of its primitives and vectors, the selection its extensions are read
+against, what a float operation makes of a NaN, and whether `asm` reaches an
+assembler
 
 ## fun facts
 
 ```mach
 pub fun facts(tgt: *Target) Facts;
 ```
-
-## fun facts_none
-
-```mach
-pub fun facts_none() Facts;
-```
-
-the facts where no target is selected: an 8-byte pointer, 128-bit vectors, floats, and no
-table, extension, multiply cell or NaN rule to read
-
-## fun ct_mul_dit_cells
-
-```mach
-pub fun ct_mul_dit_cells(tgt: *Target) ct.CtMulMask;
-```
-
-the cells the instruction set declares only under its data-independent-timing
-mode, whether or not the os guarantees the mode: a secret multiply in one of
-them is what makes a program need the mode at start, and what the refusal
-names when the os declares nothing
 

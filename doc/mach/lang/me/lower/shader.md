@@ -31,7 +31,7 @@ host, the pipeline or the previous stage supplies an interface variable's
 pub fun specialized(lc: *lower_context.LowerContext, d: *ast_decl.Decl) bool;
 ```
 
-whether the declaration `d` is a `#[spec]` var on a target that states specialization
+whether the declaration `d` is a `#[gpu.spec]` var on a target that states specialization
 constants, which defines no global there: each read of it is the constant
 
 ## rec SpecVar
@@ -40,7 +40,7 @@ constants, which defines no global there: each read of it is the constant
 pub rec SpecVar;
 ```
 
-a `#[spec]` var as its specialization constant: the id the host sets it by and the
+a `#[gpu.spec]` var as its specialization constant: the id the host sets it by and the
 default its initializer gives
 
 ## fun spec_var
@@ -49,35 +49,8 @@ default its initializer gives
 pub fun spec_var(lc: *lower_context.LowerContext, sym: *resolve.Symbol) res[opt[SpecVar], fail.Fail];
 ```
 
-the `#[spec]` var `sym` names on a target that states specialization constants, read in
+the `#[gpu.spec]` var `sym` names on a target that states specialization constants, read in
 the scope it is written in, none for any other binding or target
-
-## fun refuse_core_op
-
-```mach
-pub fun refuse_core_op(lc: *lower_context.LowerContext, d: *ast_decl.Decl, op: *target_definition.Op) err[fail.Fail];
-```
-
-an `#[op]` function of spir-v's core set is refused where its decorator is written, since
-mirl's catalog holds no core op yet
-
-## fun core_op
-
-```mach
-pub fun core_op(op: *target_definition.Op) bool;
-```
-
-whether an operation is of spir-v's core set, which mirl's catalog holds no op of yet
-
-## val CORE_OP_REFUSED
-
-```mach
-pub val CORE_OP_REFUSED: str = "an `#[op]` of spir-v's core set waits for mirl's catalog to hold the core ops (mirl#436)";
-
-# the attributes of global `gix` its declaration `d` states, read in the scope `d` is
-# written in. a global that already carries attributes keeps them
-pub fun global_attributes(lc: *lower_context.LowerContext, d: *ast_decl.Decl, gix: u32) err[fail.Fail];
-```
 
 ## fun global_attributes
 

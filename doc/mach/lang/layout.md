@@ -57,18 +57,24 @@ pub val NODE_OPAQUE:    NodeKind = 7
 pub val NODE_TAG:       NodeKind = 8
 ```
 
-## val INTEGER_WIDTHS
+## val INTEGER_COUNT
 
 ```mach
-pub val INTEGER_WIDTHS: [5]u32 = [5]u32;
+pub val INTEGER_COUNT:  usize              = 7
 ```
 
 the integer and float widths a primitive takes, the rows of `Scalars`
 
+## val INTEGER_WIDTHS
+
+```mach
+pub val INTEGER_WIDTHS: [INTEGER_COUNT]u32 = [INTEGER_COUNT]u32;
+```
+
 ## val FLOAT_WIDTHS
 
 ```mach
-pub val FLOAT_WIDTHS:   [3]u32 = [3]u32;
+pub val FLOAT_WIDTHS:   [3]u32             = [3]u32;
 ```
 
 ## rec Scalars

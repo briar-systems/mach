@@ -33,7 +33,6 @@ identifier or module path, so it names no other symbol
 ```mach
 pub fun instance_name(
 s: *session.Session,
-defs: *target_definition.Table,
 fqn: intern.StrId,
 bare: intern.StrId,
 args: *type.TypeId,
@@ -56,7 +55,6 @@ val_len: u32) res[intern.StrId, fail.Fail];
 ```mach
 pub fun pack_instance_name(
 s: *session.Session,
-defs: *target_definition.Table,
 fqn: intern.StrId,
 bare: intern.StrId,
 args: *type.TypeId,
