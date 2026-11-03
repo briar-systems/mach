@@ -107,30 +107,23 @@ fun leak(a: ^u32, t: *u8, p: ^*u8) u8 {
 }
 ```
 
-Three more gates decide against the target's constant-time capabilities rather
-than the source alone, so they are reported at lowering:
+A secret operand of a **floating-point** operation is refused as well: its
+latency is variable on every target.
 
-- a secret operand of a **floating-point** operation (always variable-latency,
-  gated on every target)
-- a secret operand of an **integer multiply**, unless the target declares the
-  exact multiply it emits (the low half, a high half or the widening product,
-  at that operand width) as data-independent-timing under a condition the
-  build meets. The declared cells are the table in [Constant-time multiply by
-  instruction set](#constant-time-multiply-by-instruction-set): x86-64 admits
-  every scalar cell unconditionally, aarch64 admits its cells under PSTATE.DIT,
-  which a constant-time function holds as its mode says ([Soft and
-  hard](#soft-and-hard)),
-  riscv64 admits its cells only when the selection holds `m` and `zkt`, and
-  riscv32, SPIR-V and every lane multiply are refused. The refusal names the
-  target and the condition it lacks. `$mach.build.ct_mul(op, width)` reads the
-  same decision at comptime (see `comptime-mach.md`). A secret 128-bit `/` or
-  `%` is refused like every secret division: the helper it would call is a
-  loop over the dividend's bits
-- a secret **variable shift count** on a target without a barrel shifter. Where
-  it is admitted, the saturation of a count at or above the operand width
-  ([operators.md](operators.md#bitwise)) is a compare to an all-ones-or-zero
-  mask and a mask on the count and the value, with no branch, so it reveals
-  nothing the shift itself would not
+Whether an integer **multiply** or a **variable shift** runs in time
+independent of a secret operand is the target's question, and it is asked
+inside a `#[constant_time]` function, where mirl reads the class masc gives
+each instruction it selects under the timing modes the function's mode admits
+(see [Constant-time multiply by instruction set](#constant-time-multiply-by-instruction-set)
+and [Soft and hard](#soft-and-hard)). A secret operand of an instruction whose
+latency depends on it there is refused, naming the function and the
+instruction set's reason. `$mach.build.ct_mul(op, width)` reads mirl's answer
+for a multiply at comptime (see `comptime-mach.md`). A secret 128-bit `/` or
+`%` is refused like every secret division: the helper it would call is a loop
+over the dividend's bits. Where a variable shift is admitted, the saturation
+of a count at or above the operand width ([operators.md](operators.md#bitwise))
+is a compare to an all-ones-or-zero mask and a mask on the count and the
+value, with no branch, so it reveals nothing the shift itself would not.
 
 A secret value passed to a variadic pack is also rejected, including a secret
 wrapped inside an aggregate.
@@ -699,10 +692,11 @@ masc registers no aarch64 set yet, so aarch64 keeps mach's own walk until it doe
 
 `*` on a secret operand means what it means on a public one: the wrapping,
 same-width product. What changes per target is whether the machine can execute
-it without a timing leak, and mach decides that from a catalog each instruction
-set declares, never from a guess. A **row** of the catalog names one cell (a
-multiply, an operand width) and the **condition** under which that cell has
-data-independent timing:
+it without a timing leak. mirl decides that from the class masc's instruction
+set gives each row its selection emits for the multiply, never from a guess,
+and mach states no table of its own. A **cell** is one multiply at one operand
+width, and the class of the rows that realize it says the **condition** under
+which it has data-independent timing:
 
 - **always**: nothing to check;
 - **PSTATE.DIT on**: the cell is data-independent only while the processor's
@@ -745,10 +739,11 @@ The declared rows, one line per multiply:
 | `riscv32` | none | | |
 | `spirv` | none | | |
 
-A test reads this table back against the compiler's catalog, so the two cannot
-drift. A cell the table does not hold is refused, as is every lane multiply
-(`i32x4 * i32x4` on a secret vector): the vector rows exist in the contract and
-no instruction set declares one.
+The table describes masc's rows, and masc's registration of each instruction
+set is the source. Inside a constant-time function a secret multiply whose
+rows are not classified constant time under the function's mode is refused, as
+is every lane multiply (`i32x4 * i32x4` on a secret vector), which no
+instruction set classifies.
 
 **Realized cells.** A cell no instruction executes directly is admitted exactly
 when every cell of its realization is, under the union of their conditions. On
@@ -761,9 +756,10 @@ and `wide_s` are admitted there through the 64-bit `low` and high rows. A
 one: `(a::^u128) * (b::^u128)` with 64-bit `a` and `b` is the 64-bit widening
 product, one instruction, and its high half `(... >> 64)::^u64` is that same
 instruction; a secret `^u128 * ^u128` low product is the schoolbook over the
-lanes, three 64-bit low products and the widening one. `$mach.build.ct_mul(low,
-128)` and `$mach.build.ct_mul(wide_u, 64)` answer for the realized cells the
-same way the gate does, so on aarch64 they need DIT like the 64-bit high half.
+lanes, three 64-bit low products and the widening one. `$mach.build.ct_mul(wide_u,
+64)` answers for the 64-bit low and high halves together, so on aarch64 it needs
+DIT like the 64-bit high half, and a 128-bit cell answers as mirl's selection
+covers a multiply of that width.
 
 **Why each row holds.** Every row cites its source beside the declaration in the
 instruction set's registration, and the kind of each claim is marked:
@@ -809,15 +805,13 @@ offers a manifest key for it. A program that wants that hardening asks the
 operator for the kernel control, the same class as SMT and other side-channel
 mitigations.
 
-**Fail closed, never fall back.** A secret multiply the catalog does not admit
-is a compile error; the compiler never substitutes a bit-serial loop, a
-shift-add expansion or a call for it, and it has no multiply strength
-reduction, so a secret square and a secret multiply by a constant each reach
-the machine as the one multiply instruction. A per-ISA test decodes the emitted
-function and checks exactly that: one multiply, no call, branch or loop, on
-riscv64 through its Zkt rows, x86-64 through its unconditional rows and aarch64
-through its DIT rows. How a constant-time function holds the mode those rows
-need is the next section.
+**Fail closed, never fall back.** In a constant-time function a secret
+multiply mirl's check does not clear is a compile error. The compiler never
+substitutes a bit-serial loop, a shift-add expansion or a call for it, so a
+secret square and a secret multiply by a constant each reach the machine as the
+multiply the selection emits, and masc's walk of the encoded code holds it to
+its row. How a constant-time function holds the mode those rows need is the
+next section.
 
 ## Soft and hard
 
