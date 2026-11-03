@@ -274,8 +274,8 @@ to whichever *declared* target matches the host.
 | `of`  | absent: the system's format | Object-format override; defers to the system's format when omitted. See [Object-format override](#object-format-override). |
 | `base` | absent: the system's base | Load-address override (integer). Overrides the system's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
-| `stack_reserve` | absent: the format's default | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
-| `stack_commit` | absent: the format's default | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
+| `stack_reserve` | absent: the format's default, and no stack on an image no loader maps | Main stack size in bytes: the reserve a PE or Mach-O header records, or the size of the `.stack` section of a freestanding ELF or flat image. See [Image stack size](#image-stack-size). |
+| `stack_commit` | absent: the format's default | Main stack commit in bytes, on PE only. See [Image stack size](#image-stack-size). |
 | `code_model` | absent: mirl's default for the target | The code model the target's code is built under (string), by the psABI name mirl's catalog gives it, such as `medlow` or `medany` on `riscv64`. Any target may state it, and a model the target does not offer is refused with mirl's reason. `--code-model` states it for an entry build. |
 | `default` | removed | Refused as a removed key. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
 | `os`, `baseline`, `extensions` | removed | v6's names of `sys`, `isa` and `ext`, refused with the rename `mach migrate` writes. |
@@ -487,8 +487,9 @@ assumes is what the manifest declares.
 
 ### Image stack size
 
-`stack_reserve` and `stack_commit` set the thread stack an image asks its loader for,
-as byte counts:
+`stack_reserve` and `stack_commit` state an image's main stack, as byte counts. What
+they mean follows the object format, since the format decides who gives the image its
+stack.
 
 ```toml
 [target.windows]
@@ -499,46 +500,54 @@ stack_reserve = 0x800000        # 8 MiB
 stack_commit  = 0x1000          # 4 KiB
 ```
 
-Both are optional. Omitting them keeps the format's conventional default, so an image
-built without them is byte-identical to one built before the keys existed. On PE that
-default is a 1 MiB reserve and a 4 KiB commit.
-
-A **reserve** is address space, not committed memory, so raising it costs nothing until
-the stack is actually used. That is also why these live on the target rather than the
-artifact: two artifacts built for one target share the value, and a small tool
-inheriting a large program's reserve pays nothing for it.
-
-**Only some object formats carry a stack size.** PE keeps both in its optional header
-and Mach-O keeps a reserve in `LC_MAIN.stacksize`. ELF has nowhere to put one — a linux
-main thread's stack is the kernel's and `ulimit`'s business — and a raw flat image has
-no header at all. Either key on a target whose resolved object format carries no stack
-size is refused when the manifest is read, naming the key, the target and the format,
-before anything builds:
-
-```
-error[target.stack_size]: mach.toml: [target.lin].stack_reserve is not expressible on the `elf` object
-format, which carries no stack size in its image headers
-```
-
-Every declared target is checked, not only the one being built, so the mistake is found
-on the first build rather than whenever someone happens to build that cell.
-
-A function whose own stack frame exceeds the reserve is refused at build time, naming
-the function, its frame size and the reserve:
-
-```
-error[stack.reserve_exceeded]: `main` needs a 1107824-byte stack frame, which its target's
-1048576-byte stack reserve cannot hold; raise `stack_reserve` on the target, or move
-the large locals off the stack
-```
-
-That is a proof rather than an estimate - one frame against one reserve, with no call
-graph and no input dependence - so it is an error and has no false positives. Targets
-whose stack is not bounded by the image, such as every ELF target, are not checked.
+**On a mapped format** the keys are the stack the image asks its loader for. PE keeps
+both in its optional header, and Mach-O keeps a reserve in `LC_MAIN.stacksize`.
+Omitting them keeps the format's conventional default, which on PE is a 1 MiB reserve
+and a 4 KiB commit. A reserve is address space, not committed memory, so raising it
+costs nothing until the stack is used.
 
 On Mach-O the value reaches only a **position-independent** image. A non-PIE one enters
-through `LC_UNIXTHREAD`, which has no stacksize member, and a stack size requested for
-such an image is refused at link rather than silently dropped.
+through `LC_UNIXTHREAD`, which has no stacksize member, so a stack size requested for
+such an image is refused at link rather than silently dropped. A commit is refused on
+Mach-O, which records none.
+
+**On an image no loader maps**, a `freestanding` ELF image or a flat one, no loader
+gives the program a stack, so the link lays one out. `stack_reserve` is the size of a
+zero-filled `.stack` section, with no bytes in the file, which the artifact places like
+any other section, through [`sections`](#artifact) or a region's
+[`run`](#memory-regions). Its top is mink's bound name `__run_stop_.stack`, where
+std.runtime's freestanding entry points the stack pointer. The section is laid out
+whenever the key is stated, whether or not the program refers to it. Its size is a
+multiple of 16, the strictest stack alignment any target's psABI asks, so its top
+stays aligned, and another size is refused. The stack is wholly in the image, so `stack_commit` is refused there.
+
+```toml
+[target.board]
+arch          = "riscv64"
+isa           = "rv64imac"
+sys           = "freestanding"
+abi           = "lp64"
+stack_reserve = 0x10000         # 64 KiB
+```
+
+There is no default on an image no loader maps, since only the manifest knows how much
+memory the machine has to give. An image that refers to the stack's bounds,
+`__run_start_.stack` or `__run_stop_.stack`, as every program built on std.runtime's
+freestanding entry does, and whose target states no `stack_reserve` is refused, naming
+the key:
+
+```
+error[target.stack_size]: mach.toml: [target.board] states no `stack_reserve`, and the image
+needs a stack: it refers to the bounds of the `.stack` section, which an image no loader maps
+holds its stack in. state the stack's size in bytes as `stack_reserve`
+```
+
+**On a hosted ELF image**, as on `linux`, the main thread's stack is the kernel's and
+`ulimit`'s business and the format has nowhere to record a size, so either key is
+refused by the link, naming the format.
+
+The keys live on the target rather than the artifact: every artifact built for one
+target shares the value.
 
 ### Accepted tuple values
 
@@ -1317,8 +1326,12 @@ load   = [".data"]
 origin = 0x20000000
 length = 0x8000
 access = "rw"
-run    = [".data", ".bss"]
+run    = [".data", ".bss", ".stack"]
 ```
+
+The `.stack` section is the one the target's `stack_reserve` lays out (see
+[Image stack size](#image-stack-size)), so its top, `__run_stop_.stack`, is the top of
+the stack the program starts on.
 
 | Key | Required | Meaning |
 |-----|----------|---------|
@@ -1329,9 +1342,13 @@ run    = [".data", ".bss"]
 | `load` | absent: none | The output sections whose bytes load in the region and run in another, as `.data` loaded in flash and run in RAM. |
 
 A section that runs in two regions or loads in two is refused, and so is one that
-loads in a region and runs in none, or loads in the region it runs in. A section
-named in `sections`, `run` or `load` that no object of the link holds is passed
-over, so one layout serves a program with no `.bss` as well as one with it. mach
+loads in a region and runs in none, or loads in the region it runs in. A name in
+`sections`, `run` or `load` is an output section, as mink's layout rules name the
+output section each object's section is laid into, so `.text` takes every
+`.text.*` section. A name no object's section is laid into is passed over, so one
+layout serves a program with no `.bss` as well as one with it. That includes an
+output section the link makes itself, such as an `.eh_frame` it writes of the
+objects' frame records, which a region does not place. mach
 hands the regions, the section order, the size ceiling and every `#[at]`
 placement to mink as one link plan, and reports mink's refusals, an overflow or
 an overlap, as mink names them. mink names the bounds of each section by
