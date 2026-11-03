@@ -696,6 +696,7 @@ of the region it runs in, or from the image base where it runs in none (see
 [manifest.md](manifest.md#memory-regions)). The global becomes a section of its
 own, which the link places at the offset, so a boot signature, a header a loader
 looks for at a fixed byte or a page table at a known offset is stated in source.
+The link keeps a placed global whether or not anything references it.
 
 ```mach fragment
 #[at(510)]
