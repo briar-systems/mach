@@ -46,7 +46,8 @@ built out/app  48 modules  1 MiB  in 358ms
 Each module's object is made by a step that lowers it, holds it to mirl's
 verifier and has mirl compile it. The `lower` and `verify` rows are the sums of
 those stages over the modules, moved out of the `codegen` row, which keeps the
-rest. mirl times its own stages when a readout is shown, and each moves out of
+rest. `lower` also holds the preparation of the lowering's inputs before the
+first step runs. mirl times its own stages when a readout is shown, and each moves out of
 `codegen` into a row of its own:
 
 | Row | What it times | Read from |
