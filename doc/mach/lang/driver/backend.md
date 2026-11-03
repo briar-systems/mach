@@ -190,6 +190,8 @@ base: the address the image is laid out from, none for the host's
 subsystem: the PE subsystem the image states, none for the host's
 libdirs: the directories a library named by name is searched in ahead of the system's
 libdir_count: how many
+stack_reserve: the main stack's reserve, none for the format's default
+stack_commit: the main stack's commit, none for the format's default
 
 ## fun link
 

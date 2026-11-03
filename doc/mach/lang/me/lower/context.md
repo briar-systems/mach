@@ -763,6 +763,24 @@ pub fun fn_sig_of_type(lc: *LowerContext, tid: type.TypeId) res[FnSig, fail.Fail
 
 the signature a value of the source function type `tid` is called through
 
+## fun c_variadic_fixed
+
+```mach
+pub fun c_variadic_fixed(lc: *LowerContext, tid: type.TypeId) opt[u32];
+```
+
+how many parameters the C-variadic function type `tid` names, none for any other type
+
+## fun variadic_sig_of_type
+
+```mach
+pub fun variadic_sig_of_type(lc: *LowerContext, tid: type.TypeId, tail: *type.TypeId, tail_len: u32) res[FnSig, fail.Fail];
+```
+
+the signature one call of the C-variadic function type `tid` is made through: its
+named parameters and then the `tail_len` types at `tail` of the arguments it passes
+unnamed, as mirl states a variadic call
+
 ## fun ext_of
 
 ```mach

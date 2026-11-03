@@ -829,8 +829,18 @@ pub fun emit_fence(b: *Builder, order: Ordering) err[fail.Fail];
 pub fun emit_call(b: *Builder, callee: value.Value, sig: Type, args: *value.Value, n: u32) res[value.Value, fail.Fail];
 ```
 
-a call of `callee` through the signature `sig`. an aggregate argument is passed whole,
-read from the address it travels at, and an aggregate result lands in a slot of its own
+a call of `callee` through the signature `sig`, every argument named. an aggregate
+argument is passed whole, read from the address it travels at, and an aggregate result
+lands in a slot of its own
+
+## fun emit_call_named
+
+```mach
+pub fun emit_call_named(b: *Builder, callee: value.Value, sig: Type, args: *value.Value, n: u32, named: Named) res[value.Value, fail.Fail];
+```
+
+a call of `callee` through the signature `sig`, of which `named` states how many
+arguments are named, the rest being a C-variadic call's unnamed ones
 
 ## fun param
 

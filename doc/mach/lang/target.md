@@ -8,7 +8,8 @@ spells one and the extensions it adds. each part is looked up in its owner's
 catalog: mink's architecture and system lists, the host mink states for them,
 masc's extension catalog of the architecture, and the target mirl assembles
 from the five. every fact the build reads of a target comes from those rows,
-and mach states none of them
+and mach states none of them. what mach requires of the images it builds,
+where the manifest states nothing, is its own data (mach.lang.target.defaults)
 
 ## fwd resolved.Target
 
@@ -122,16 +123,25 @@ prefix, then the artifact's name, then the extension
 prefix: written before its name
 suffix: written after its name, with its dot
 
+## fun executable_output
+
+```mach
+pub fun executable_output(t: *resolved.Target) *mink_output.Kind;
+```
+
+the executable mink builds on the target: a finished module for a format that
+finishes its modules, a position independent executable where the host runs one
+by default or its loader places every image, else a fixed-address executable
+
 ## fun output_of
 
 ```mach
 pub fun output_of(t: *resolved.Target, kind: catalog_artifact.Kind) opt[*mink_output.Kind];
 ```
 
-the output mink builds for an artifact of `kind` on the target: a finished module
-for an executable of a format that finishes its modules, else a fixed-address
-executable, a shared library, and for an object directory its relocatable objects.
-none for a static library, which mink archives rather than links
+the output mink builds for an artifact of `kind` on the target: its executable for
+an executable, a shared library, and for an object directory its relocatable
+objects. none for a static library, which mink archives rather than links
 
 ## fun artifact_naming
 

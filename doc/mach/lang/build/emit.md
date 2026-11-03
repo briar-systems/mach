@@ -51,8 +51,8 @@ links: *input.Input, link_count: u32, destination: str, image: *LoadedImageOptio
 ```
 
 the image of `kind` mink links in memory from the `count` objects at `objects`, in link order,
-then the `link_count` inputs at `links`, written to `destination`. a flat image, a position
-independent image and an executable carrying resources are refused
+then the `link_count` inputs at `links`, written to `destination` with the resources
+`image` declares. a flat image is refused
 
 ## fun ordered_objects
 
