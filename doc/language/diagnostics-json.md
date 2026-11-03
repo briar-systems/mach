@@ -246,7 +246,7 @@ A **phase** record is a phase row:
 
 | Member | Type | Meaning |
 |---|---|---|
-| `name` | string | the row's label: `steps`, `load`, `resolve`, `sema`, `lower`, `verify`, `optimize`, `codegen`, `passes`, `select`, `alloc`, `frame`, `mirl emit`, `layout`, `encode`, `emit`, `link`, `cache`, `test lower`, `test verify`, `test codegen`, or `other` for the time no row accounts for |
+| `name` | string | the row's label: `steps`, `target`, `load`, `resolve`, `sema`, `lower`, `verify`, `optimize`, `codegen`, `passes`, `select`, `alloc`, `frame`, `mirl emit`, `layout`, `encode`, `emit`, `link`, `cache`, `test lower`, `test verify`, `test codegen`, or `other` for the time no row accounts for |
 | `count` | integer | what the phase processed; absent for `other` |
 | `unit` | string | the noun the count is in, singular for a count of one: `"modules"`, `"objects"` |
 | `time_us` | integer | the phase's time |
