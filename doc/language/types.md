@@ -368,7 +368,7 @@ The language knows only the machinery. A handle is a **bodyless `def`** carrying
 operands each takes, and what an operand means all belong to the named target:
 
 ```mach fragment
-#[handle("spirv", "image", f32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
+#[handle("spirv", "image", f32, "2D", 0, 0, 0, 1, "Unknown")]
 pub def Texture2D;
 
 #[handle("spirv", "sampled_image", Texture2D)]
@@ -384,8 +384,12 @@ body because the target supplies the definition.
 
 The spirv `image` constructor takes the seven operands of `OpTypeImage` in its
 order: the texel scalar, written as the type itself (`f32`, `i32`, `u32`, `i64` or `u64`), `Dim`, `Depth`, `Arrayed`, `MS`, `Sampled` and the
-`Image Format`. The format is required, and `0` (`Unknown`) is the usual choice for
-a sampled image. `Sampled` `1` is an image read through a sampler and `2` a storage
+`Image Format`, then the optional `Access Qualifier`. An operand SPIR-V defines as an
+enumerant, `Dim`, `Image Format` and `Access Qualifier`, is written as the string
+SPIR-V's grammar names it by, such as `"2D"`, `"Cube"`, `"Unknown"` or `"Rgba8"`, and a
+name the grammar does not state is refused with the names it does. `Depth`,
+`Arrayed`, `MS` and `Sampled` are numbers. The format is required, and `"Unknown"` is
+the usual choice for a sampled image. `Sampled` `1` is an image read through a sampler and `2` a storage
 image, read and written directly and bound through `#[gpu.storage]` (see
 [decorators.md](decorators.md)). A storage image of a known format needs no device
 feature to read or write, and a format other than `Rgba32f`, `Rgba16f`, `R32f`,
@@ -408,7 +412,7 @@ may declare `1` too, though no comparison reads it: a comparison samples through
 sampler. `2`, which states no indication either way, is refused.
 
 ```mach fragment
-#[handle("spirv", "image", f32, DIM_2D, DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
+#[handle("spirv", "image", f32, "2D", 1, 0, 0, 1, "Unknown")]
 pub def ShadowMap;
 
 #[handle("spirv", "sampled_image", ShadowMap)]
