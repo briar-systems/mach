@@ -124,7 +124,7 @@ out     = "{project.work}/bin/demo{artifact.suffix}"  # output path, under the w
 targets = ["*"]                        # which declared targets build it ("*" = all)
 # link  = ["kernel32"]                 # optional: [link.X] names this artifact links
 # need  = ["step.generate"]            # optional: step.X / artifact.X requirements
-# subsystem = "gui"                    # optional: windows console/GUI selector
+# subsystem = "windows"                # optional: the PE subsystem, as mink spells it
 # icon = "assets/demo.ico"             # optional: PE executable icon
 # manifest = "assets/demo.manifest"    # optional: PE application manifest
 
@@ -1244,7 +1244,7 @@ reads the selected artifact's name.
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | absent: links nothing | Array of `[link.X]` names this artifact links (see below). A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names no [link.*] table: 'nosuch' (declared: [link.kernel32])`). |
 | `need`    | absent: needs nothing | Array of category-qualified requirements such as `step.generate`, `artifact.support`, and `artifact.shader-*`. Each glob matches only its named category. See [Artifact requirements](#artifact-requirements). |
-| `subsystem` | absent: `"console"` | `"console"` or `"gui"` — the environment a windows executable declares it runs under; refused on a target whose image format has no subsystem (see below). |
+| `subsystem` | absent: `"console"` | A PE subsystem as mink spells it, such as `"console"` or `"windows"` — the environment a windows executable declares it runs under; refused on a target whose image format has no subsystem (see below). |
 | `icon` | absent: no icon | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `manifest` | absent: no application manifest | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `default` | absent: not marked | Selection only. `true` puts the artifact in the [default selection](build.md#selection-and-the-build-matrix): with no `-a`, `mach build` and `mach check` take the marked artifacts among those supporting the selected target (every one of them when none is marked), and a command that needs one artifact (`mach test`, `mach run`, the editor's union build) takes the marked one. A command that needs one artifact refuses two marked candidates; an explicit `-a` always wins, and a sole candidate needs no marker. |
@@ -1378,7 +1378,7 @@ Output collisions are checked after expansion among artifacts selected for the
 target. An explicit literal such as `bin/app.exe` can therefore collide with
 `bin/app{artifact.suffix}` on Windows.
 
-### `subsystem` — the windows console/GUI selector
+### `subsystem` — the PE subsystem
 
 ```toml
 [artifact.game]
@@ -1388,22 +1388,27 @@ out = "{project.work}/bin/game.exe"
 targets = ["*"]
 link = []
 need = []
-subsystem = "gui"
+subsystem = "windows"
 ```
 
 A PE executable records in its optional header which environment it wants, and the
 Windows loader honours it: `"console"` gets a console window attached to the
-process, `"gui"` does not. mach defaults to `"console"`, which is what every PE it
-has ever emitted declares, so an artifact that omits the key is byte-identical to
-one built before the key existed. A graphical application sets `"gui"` to stop an
-empty console from opening behind it on launch.
+process, `"windows"` does not. The names are mink's, its linkers' subsystem
+spellings: `"console"`, `"windows"`, `"native"`, `"posix"`, `"efi_application"`,
+`"efi_boot_service_driver"`, `"efi_runtime_driver"`, `"efi_rom"`, `"xbox"` and
+`"boot_application"`. mach defaults to `"console"`, so an artifact that omits the
+key declares the console subsystem. A graphical application sets `"windows"` to
+stop an empty console from opening behind it on launch.
+
+v6 spelled the graphical subsystem `"gui"`. v7 refuses it, naming `"windows"`,
+and `mach migrate` rewrites `subsystem = "gui"` to `subsystem = "windows"`.
 
 Only a PE image carries the field. A key written on an artifact that builds
 for a target whose format has none (ELF, Mach-O, a flat image) is refused as
 unsupported, naming the key, the target and the format:
 
 ```
-mach.toml: artifact.game.subsystem: Subsystem gui is unsupported by elf (target 'host' produces a elf image, which declares no subsystem)
+mach.toml: artifact.game.subsystem: Subsystem windows is unsupported by linux (target 'host' runs on linux, whose images state no subsystem)
 ```
 
 An omitted key is the console default and is never refused, so an artifact
@@ -1412,7 +1417,7 @@ key and also targets a non-windows cell declares two artifacts, one per format,
 the way `[link.X]` entries carry `sys`/`arch`/`abi` axes: the manifest never
 carries a declaration a build silently ignores.
 
-`--subsystem console|gui` overrides the key for one invocation and is refused
+`--subsystem <name>` overrides the key with one of mink's names for one invocation and is refused
 the same way on a target whose format has no subsystem (`mach help build`).
 
 ### `icon` / `manifest` — Windows executable resources
@@ -1556,17 +1561,17 @@ C-binding project declares them once.
 A symbol may be claimed only once per link: two selected entries claiming it, or a
 claim contradicting a `#[library]` decorator, is an error naming both claimants
 rather than an order-dependent win — repeating the *same* claim is fine. Listing a
-symbol twice within one entry is rejected, and so is a claim on an entry that
-resolves to a **static** input, which defines symbols rather than importing them.
+symbol twice within one entry is rejected.
 On ELF the key is accepted and validated but changes no emitted bytes, since that
 loader resolves imports by global search.
 
-Whether an input links **statically** or **dynamically** follows the resolved file
-— a loose `.o`/`.obj` or static `.a`/`.lib` links statically; ELF `.so`, Mach-O `.dylib`,
-and PE `.dll` inputs are recorded using their format's canonical loader name.
-An `@rpath/` Mach-O install name also retains the directory where resolution found
-the dylib, which the executable records as `LC_RPATH`. Darwin frameworks use a
-version-independent system framework path. See
+A `system` or `framework` entry is found by name through mink's library search
+as the link runs, the archive first, in each `-L` directory, then the working
+directory, then the system's directories the target's host row states. A `local`
+entry names its file. Whether an input links **statically** or **dynamically**
+follows the file found — a loose `.o`/`.obj` or static `.a`/`.lib` links
+statically, and an ELF `.so`, Mach-O `.dylib` or PE `.dll` is recorded by its
+format's canonical loader name. See
 [ext-fun.md](ext-fun.md#linking-external-objects) for the `ext fun` workflow
 that consumes these inputs.
 

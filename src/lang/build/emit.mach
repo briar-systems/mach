@@ -13,7 +13,6 @@ use std.types.result.res;
 use std.types.size.usize;
 use types_string: std.types.string;
 use std.types.string.str;
-use std.types.string.str_copy;
 use std.types.string.str_empty;
 use std.types.string.str_equals;
 use std.types.string.str_join;
@@ -23,13 +22,13 @@ use std.types.view.View;
 use A: std.allocator;
 
 use build_plan:      mach.lang.build.plan;
+use build_resource:  mach.lang.build.resource;
 use diagnostic_kind: mach.lang.diagnostic.kind;
 use mach.lang.driver;
 use mach.lang.driver.backend;
 use mach.lang.driver.cache;
 use mach.lang.driver.project;
 use mach.lang.fail;
-use mach.lang.growth;
 use mach.lang.intern;
 use mach.lang.linkage;
 use mach.lang.manifest;
@@ -37,10 +36,9 @@ use mach.lang.output;
 use mach.lang.placement;
 use mach.lang.readout;
 use mach.lang.session;
-use lang_source:       mach.lang.source;
-use lang_target:       mach.lang.target;
-use catalog_artifact:  mach.lang.target.catalog.artifact;
-use catalog_subsystem: mach.lang.target.catalog.subsystem;
+use lang_source:      mach.lang.source;
+use lang_target:      mach.lang.target;
+use catalog_artifact: mach.lang.target.catalog.artifact;
 use mach.lang.target.input;
 use mink_fail: mink.base.fail;
 use mink.base.store.Bytes;
@@ -51,11 +49,12 @@ use mink_ar:     mink.format.ar.write;
 use mink.format.contract;
 use mink.link.input.Given;
 use mink.link.input.Include;
-use mink.link.input.Included;
 use mink.link.input.Source;
 use mink.link.options.Area;
 use mink.link.options.Offset;
 use mink.link.options.Within;
+use mink.link.search;
+use mink.link.search.Request;
 use mink.model.object.Object;
 
 pub fun artifact_product_name(p: *project.Project) *u8 {
@@ -223,31 +222,35 @@ pub fun emit_static_archive(p: *project.Project, destination: str, objects: **Ob
     ret err[fail.Fail].ok{};
 }
 
-# a library the link names, as mink includes one: the manifest's name of it, the
-# library a provider is registered under, and its bytes once read
-pub rec Library {
-    name:     intern.StrId;
-    included: Included;
-}
-
-# an external input's bytes, read for the link and kept until it ends
-rec Held {
-    bytes: Vector[u8];
-}
-
-# the bytes of the input at `path`, read into `held`
-fun read_input(p: *project.Project, path: str, held: *Held) err[fail.Fail] {
-    val read: res[Vector[u8], fs.FsError] = fs.read_bytes(p.alloc, path);
-    if (sel read.err) {
-        ret err[fail.Fail].err{fail.user_of(diagnostic_kind.LINK_INPUT_UNREADABLE, fail.join(p.alloc, "cannot read link input '", path, "': ", fail.fs_text(read.err)))};
-    }
-    held.bytes = read.ok;
-    ret err[fail.Fail].ok{};
-}
-
 rec Image {
     data: *u8;
     len:  usize;
+}
+
+# the name the link gives the resource file mach writes of an executable's resources
+val RESOURCE_INPUT: str = "the artifact's resources";
+
+# the resource file of the resources `image` declares, owned by the caller
+fun resource_file(p: *project.Project, image: *LoadedImageOptions) res[Sink, fail.Fail] {
+    var d: build_resource.Declared = build_resource.Declared{
+        icon:              nil,
+        icon_len:          0,
+        manifest:          nil,
+        manifest_len:      0,
+        version:           image.version,
+        internal_name:     image.internal_name,
+        original_filename: image.original_filename,
+        product_name:      image.product_name
+    };
+    if (image.icon_path != nil) {
+        d.icon     = image.icon_bytes.data;
+        d.icon_len = image.icon_bytes.len;
+    }
+    if (image.manifest_path != nil) {
+        d.manifest     = image.manifest_bytes.data;
+        d.manifest_len = image.manifest_bytes.len;
+    }
+    ret build_resource.file_of(p.alloc, ?d);
 }
 
 fun write_image(img: *Image, path: str) err[fail.Fail] {
@@ -403,73 +406,89 @@ fun plan_holds(h: *PlanHeld, name: str) bool {
 }
 
 # the image of `kind` mink links in memory from the `count` objects at `objects`, in link order,
-# the `ext_count` external inputs at `ext` and the `library_count` libraries at `libraries`,
-# written to `destination`, laid out as the artifact and its placed globals state. a position
-# independent executable and an executable carrying resources are refused
+# then the `link_count` inputs at `links`, written to `destination` with the resources
+# `image` declares, laid out as the artifact and its placed globals state
 pub fun link_image(p: *project.Project, kind: *mink_output.Kind, objects: **Object, count: u32,
-    ext: *contract.Input, ext_count: u32, libraries: *Library, library_count: u32, destination: str, image: *LoadedImageOptions) err[fail.Fail] {
-    if (p.target.pie_default && kind != ?mink_output.SHARED) {
-        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_NO_LOADER, "a position independent executable is not yet linked through mink")};
-    }
-    if (image != nil && image.declared) {
-        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_SECTION_UNSUPPORTED, "an executable's icon and manifest wait for mink to write PE resources (mink#539)")};
-    }
+    links: *input.Input, link_count: u32, destination: str, image: *LoadedImageOptions) err[fail.Fail] {
     if (count == 0) { ret err[fail.Fail].err{fail.message("a link requires an object")}; }
 
-    val inputs: usize                 = ext_count::usize + library_count::usize;
-    val total:  usize                 = count::usize + inputs;
-    val made:   res[*Source, A.Error] = A.allocate[Source](p.alloc, total);
-    if (sel made.err) { ret err[fail.Fail].err{fail.refused(made.err)}; }
-    val sources: *Source = made.ok;
-    fin { A.deallocate[Source](p.alloc, sources, total); }
-    var heldv: res[*Held, A.Error] = A.zallocate[Held](p.alloc, inputs + 1);
-    if (sel heldv.err) { ret err[fail.Fail].err{fail.refused(heldv.err)}; }
-    val held: *Held = heldv.ok;
+    var resources: opt[Sink] = opt[Sink].none{};
     fin {
-        var k: usize = 0;
-        for (k < inputs) {
-            collections_vector.dnit[u8](?held[k].bytes);
-            k = k + 1;
-        }
-        A.deallocate[Held](p.alloc, held, inputs + 1);
+        if (sel resources.some) { val freed: err[mink_fail.Fail] = sink.release(?resources.some); }
     }
+    if (image != nil && image.declared) {
+        val made_res: res[Sink, fail.Fail] = resource_file(p, image);
+        if (sel made_res.err) { ret err[fail.Fail].err{made_res.err}; }
+        resources = opt[Sink].some{made_res.ok};
+    }
+    var carried: usize = 0;
+    if (sel resources.some) { carried = 1; }
+
+    val total: usize                  = count::usize + link_count::usize + carried;
+    val made:  res[*Request, A.Error] = A.allocate[Request](p.alloc, total);
+    if (sel made.err) { ret err[fail.Fail].err{fail.refused(made.err)}; }
+    val requests: *Request = made.ok;
+    fin { A.deallocate[Request](p.alloc, requests, total); }
     var i: u32 = 0;
     for (i < count) {
-        sources[i] = Source.object{Given{name: "", object: objects[i]}};
-        i          = i + 1;
+        requests[i] = Request.source{Source.object{Given{name: "", object: objects[i]}}};
+        i           = i + 1;
     }
     i = 0;
-    for (i < ext_count) {
-        val read: err[fail.Fail] = read_input(p, ext[i].file, ?held[i]);
-        if (sel read.err) { ret read; }
-        sources[count + i] = Source.bytes{contract.Input{file: ext[i].file, data: held[i].bytes.data, len: held[i].bytes.len}};
-        i                  = i + 1;
+    for (i < link_count) {
+        requests[count + i] = link_request(?links[i]);
+        i                   = i + 1;
     }
-    i = 0;
-    for (i < library_count) {
-        val at:   usize          = ext_count::usize + i::usize;
-        val lib:  *Library       = ?libraries[i];
-        val read: err[fail.Fail] = read_input(p, lib.included.input.file, ?held[at]);
-        if (sel read.err) { ret read; }
-        var included: Included = lib.included;
-        included.input.data        = held[at].bytes.data;
-        included.input.len         = held[at].bytes.len;
-        sources[count::usize + at] = Source.included{included};
-        i                          = i + 1;
+    if (sel resources.some) {
+        requests[count::usize + link_count::usize] = Request.source{Source.bytes{contract.Input{file: RESOURCE_INPUT, data: sink.data(?resources.some), len: sink.len(?resources.some)}}};
     }
+    # a library named by name is searched for in the `-L` directories, then the working
+    # directory, then the system's
+    val dir_count: usize              = p.req.lib_dirs.len + 1;
+    val dirs_r:    res[*str, A.Error] = A.allocate[str](p.alloc, dir_count);
+    if (sel dirs_r.err) { ret err[fail.Fail].err{fail.refused(dirs_r.err)}; }
+    val dirs: *str = dirs_r.ok;
+    fin { A.deallocate[str](p.alloc, dirs, dir_count); }
+    var d: usize = 0;
+    for (d < p.req.lib_dirs.len) {
+        dirs[d] = p.req.lib_dirs.data[d];
+        d       = d + 1;
+    }
+    dirs[d] = ".";
     var held_plan: PlanHeld = plan_init(p.alloc);
     fin { plan_dnit(?held_plan); }
     val planned: res[bool, fail.Fail] = plan_of(p, objects, count, ?held_plan);
     if (sel planned.err) { ret err[fail.Fail].err{planned.err}; }
-    var placed: backend.Image = backend.Image{base: opt[u64].none{}, subsystem: catalog_subsystem.image_of(p.req.subsystem), plan: nil};
-    if (planned.ok)         { placed.plan = ?held_plan.plan; }
-    if (p.target.base != 0) { placed.base = opt[u64].some{p.target.base}; }
-    val linked: res[Sink, fail.Fail] = backend.link(?p.back, p.alloc, kind, p.back.format, sources, total, destination, true, ?placed);
+    var placed: backend.Image = backend.Image{
+        base:          opt[u64].none{},
+        subsystem:     p.req.subsystem,
+        libdirs:       dirs,
+        libdir_count:  dir_count,
+        stack_reserve: opt[u64].none{},
+        stack_commit:  opt[u64].none{},
+        plan:          nil
+    };
+    if (planned.ok)                  { placed.plan = ?held_plan.plan; }
+    if (p.target.base != 0)          { placed.base = opt[u64].some{p.target.base}; }
+    if (p.target.stack_reserve != 0) { placed.stack_reserve = opt[u64].some{p.target.stack_reserve}; }
+    if (p.target.stack_commit != 0)  { placed.stack_commit = opt[u64].some{p.target.stack_commit}; }
+    val linked: res[Sink, fail.Fail] = backend.link(?p.back, p.alloc, kind, p.back.format, requests, total, destination, true, ?placed);
     if (sel linked.err) { ret err[fail.Fail].err{linked.err}; }
     var bytes: Sink = linked.ok;
     fin { val freed: err[mink_fail.Fail] = sink.release(?bytes); }
     var img: Image = Image{data: sink.data(?bytes), len: sink.len(?bytes)};
     ret output.through_temporary[Image](p.alloc, destination, ?img, write_image);
+}
+
+# how mink's link takes the input `li`: a file at its path, or a library or a framework mink
+# searches for by name, a library's archive first
+fun link_request(li: *input.Input) Request {
+    var include: Include = Include.always{};
+    if (li.include_referenced) { include = Include.referenced{}; }
+    if (li.form == input.FILE) { ret Request.file{search.File{path: li.text, include: include}}; }
+    var form: search.Form = search.Form.system{};
+    if (li.form == input.FRAMEWORK) { form = search.Form.framework{}; }
+    ret Request.library{search.Wanted{form: form, name: li.text, include: include, prefer: search.Prefer.static_first{}}};
 }
 
 # the emitted modules' objects in topological order, the link's order
@@ -516,196 +535,74 @@ pub fun release_indexed(p: *project.Project, objects: **Object) {
     A.deallocate[*Object](p.alloc, objects, project.module_count(p)::usize + 1);
 }
 
-fun count_external_tokens(p: *project.Project, unit: *build_plan.BuildUnit) u32 {
-    var n:  u32                  = 0;
-    val te: *project.TargetEntry = p.target_entry;
-    if (te != nil) { n = n + te.lib_count; }
-    n = n + p.config.cascade_lib_count;
-    n = n + unit.link_inputs.len::u32;
-    ret n;
-}
-
-# the unit's static link inputs appended to `inputs` after whatever it already
-# holds, and the libraries it links against in `libraries`
-pub fun append_external_inputs(p: *project.Project, unit: *build_plan.BuildUnit,
-    inputs: **contract.Input, len: *u32,
-    libraries: **Library, library_len: *u32) err[fail.Fail] {
-    @libraries   = nil;
-    @library_len = 0;
+# the inputs the unit links beyond its objects, in link order: the manifest's link entries,
+# those its dependencies cascade, then the command line's. an input named twice is linked
+# once, and each library registers its provider and the symbols it claims
+pub fun external_inputs(p: *project.Project, unit: *build_plan.BuildUnit) res[Vector[input.Input], fail.Fail] {
     linkage.providers_clear(?p.linkage);
-    val extra: u32 = count_external_tokens(p, unit);
-    if (extra == 0) { ret err[fail.Fail].ok{}; }
-
-    val base:     u32          = @len;
-    val grown:    u32          = base + extra;
-    var cap:      u32          = base;
-    val res_grow: err[A.Error] = growth.resize[contract.Input](p.alloc, inputs, ?cap, grown::usize);
-    if (sel res_grow.err) { ret err[fail.Fail].err{fail.refused(res_grow.err)}; }
-
-    var z: u32 = base;
-    for (z < grown) {
-        (@inputs)[z] = contract.Input{file: nil, data: nil, len: 0};
-        z            = z + 1;
+    var links:  Vector[input.Input] = collections_vector.init[input.Input](p.alloc);
+    var handed: bool                = false;
+    fin {
+        if (!handed) { collections_vector.dnit[input.Input](?links); }
     }
-    @len = grown;
-
-    var written: u32 = base;
-
     val te: *project.TargetEntry = p.target_entry;
     if (te != nil) {
         var i: u32 = 0;
         for (i < te.lib_count) {
-            val rc: err[fail.Fail] = resolve_and_store_input(p, ?te.libs[i],
-                @inputs, ?written, libraries, library_len);
-            if (sel rc.err) {
-                shrink_inputs(p, inputs, len, written, grown);
-                ret rc;
-            }
+            val added: err[fail.Fail] = requirement_add(p, ?te.libs[i], ?links);
+            if (sel added.err) { ret res[Vector[input.Input], fail.Fail].err{added.err}; }
             i = i + 1;
         }
     }
+    var c: u32 = 0;
+    for (c < p.config.cascade_lib_count) {
+        val added: err[fail.Fail] = requirement_add(p, ?p.config.cascade_libs[c], ?links);
+        if (sel added.err) { ret res[Vector[input.Input], fail.Fail].err{added.err}; }
+        c = c + 1;
+    }
+    var t: usize = 0;
+    for (t < unit.link_inputs.len) {
+        val added: err[fail.Fail] = input_add(p, unit.link_inputs.data[t], ?links);
+        if (sel added.err) { ret res[Vector[input.Input], fail.Fail].err{added.err}; }
+        t = t + 1;
+    }
+    handed = true;
+    ret res[Vector[input.Input], fail.Fail].ok{links};
+}
 
-    var i: u32 = 0;
-    for (i < p.config.cascade_lib_count) {
-        val rc: err[fail.Fail] = resolve_and_store_input(p, ?p.config.cascade_libs[i],
-            @inputs, ?written, libraries, library_len);
-        if (sel rc.err) {
-            shrink_inputs(p, inputs, len, written, grown);
-            ret rc;
-        }
+# the input a manifest link entry names joins `links`, its text held by the session's names,
+# and the symbols it claims are registered as imported from its library
+fun requirement_add(p: *project.Project, req: *manifest.LinkRequirement, links: *Vector[input.Input]) err[fail.Fail] {
+    val lr: res[input.Input, fail.Fail] = build_plan.requirement_input(p.alloc, ?p.s.interner, p.req.project_root, req);
+    if (sel lr.err) { ret err[fail.Fail].err{lr.err}; }
+    var li: input.Input = lr.ok;
+    if (li.form == input.FILE) {
+        val held: res[intern.StrId, A.Error] = intern.add(?p.s.interner, li.text);
+        str_free(p.alloc, li.text);
+        if (sel held.err) { ret err[fail.Fail].err{fail.refused(held.err)}; }
+        li.text = intern.text(?p.s.interner, held.ok);
+    }
+    val claimed: err[fail.Fail] = register_link_claims(p, req);
+    if (sel claimed.err) { ret claimed; }
+    ret input_add(p, li, links);
+}
+
+# `li` joins `links` unless an input of its form and text is there already, its library
+# registered as a provider
+fun input_add(p: *project.Project, li: input.Input, links: *Vector[input.Input]) err[fail.Fail] {
+    if (!str_empty(li.key)) {
+        val nr: res[intern.StrId, A.Error] = intern.add(?p.s.interner, li.key);
+        if (sel nr.err) { ret err[fail.Fail].err{fail.refused(nr.err)}; }
+        val rr: err[fail.Fail] = linkage.register_provider(?p.linkage, nr.ok);
+        if (sel rr.err) { ret rr; }
+    }
+    var i: usize = 0;
+    for (i < links.len) {
+        if (links.data[i].form == li.form && str_equals(links.data[i].text, li.text)) { ret err[fail.Fail].ok{}; }
         i = i + 1;
     }
-
-    var ti: usize = 0;
-    for (ti < unit.link_inputs.len) {
-        val rc: err[fail.Fail] = store_fact(p, ?unit.link_inputs.data[ti],
-            @inputs, ?written, libraries, library_len);
-        if (sel rc.err) {
-            shrink_inputs(p, inputs, len, written, grown);
-            ret rc;
-        }
-        ti = ti + 1;
-    }
-
-    shrink_inputs(p, inputs, len, written, grown);
-    ret err[fail.Fail].ok{};
-}
-
-fun store_fact(p: *project.Project, li: *input.Input, inputs: *contract.Input, written: *u32,
-    libraries: **Library, library_len: *u32) err[fail.Fail] {
-    val pr: err[fail.Fail] = register_link_provider(p, li);
-    if (sel pr.err) { ret pr; }
-    if (li.kind == input.DYNAMIC) {
-        ret append_library(p, li, libraries, library_len);
-    }
-    if (static_path_present(inputs, @written, li.text)) {
-        ret err[fail.Fail].ok{};
-    }
-    val dup_r: res[str, types_string.StrError] = str_copy(p.alloc, li.text::*u8);
-    if (sel dup_r.err) { ret err[fail.Fail].err{fail.str_refused(dup_r.err)}; }
-    inputs[@written] = contract.Input{file: dup_r.ok, data: nil, len: 0};
-    @written         = @written + 1;
-    ret err[fail.Fail].ok{};
-}
-
-fun shrink_inputs(p: *project.Project, inputs: **contract.Input, len: *u32, written: u32, grown: u32) {
-    var cap:        u32          = grown;
-    val res_shrink: err[A.Error] = growth.resize[contract.Input](p.alloc, inputs, ?cap, written::usize);
-    if (sel res_shrink.err) {
-        @len = grown;
-        ret;
-    }
-    @len = written;
-}
-
-# a library the input `li` names joins `libraries` once: the same name found as
-# another file is refused
-fun append_library(p: *project.Project, li: *input.Input,
-    libraries: **Library, library_len: *u32) err[fail.Fail] {
-    var name_text: str = li.text;
-    if (!str_empty(li.library)) { name_text = li.library; }
-    val name_r: res[intern.StrId, A.Error] = intern.add(?p.s.interner, name_text);
-    if (sel name_r.err) { ret err[fail.Fail].err{fail.refused(name_r.err)}; }
-    val name: intern.StrId = name_r.ok;
-
-    var i: u32 = 0;
-    for (i < @library_len) {
-        val had: *Library = ?(@libraries)[i];
-        if (intern.str_same(had.name, name)) {
-            if (str_equals(had.included.input.file, li.text)) { ret err[fail.Fail].ok{}; }
-            ret err[fail.Fail].err{fail.user_of(diagnostic_kind.LINK_LOADER_NAME_CONFLICT, library_conflict_message(
-                p, name, had.included.input.file, li.text))};
-        }
-        i = i + 1;
-    }
-
-    val path_r: res[intern.StrId, A.Error] = intern.add(?p.s.interner, li.text);
-    if (sel path_r.err) { ret err[fail.Fail].err{fail.refused(path_r.err)}; }
-    val path: str = intern.text(?p.s.interner, path_r.ok);
-
-    var include: Include = Include.always{};
-    if (li.include_referenced) { include = Include.referenced{}; }
-    val old:      u32          = @library_len;
-    var cap:      u32          = old;
-    val res_grow: err[A.Error] = growth.resize[Library](p.alloc, libraries, ?cap, old::usize + 1);
-    if (sel res_grow.err) { ret err[fail.Fail].err{fail.refused(res_grow.err)}; }
-    (@libraries)[old] = Library{
-        name:     name,
-        included: Included{input: contract.Input{file: path, data: nil, len: 0}, include: include, searched: !str_empty(li.library), path: path}
-    };
-    @library_len = old + 1;
-    ret err[fail.Fail].ok{};
-}
-
-fun library_conflict_message(p: *project.Project, name: intern.StrId, first: str, second: str) res[str, fail.Fail] {
-    val r: res[str, types_string.StrError] = str_join(p.alloc,
-        "link library '", intern.text(?p.s.interner, name), "' resolves to both '", first, "' and '", second, "'");
-    if (sel r.err) { ret res[str, fail.Fail].err{fail.str_refused(r.err)}; }
-    ret res[str, fail.Fail].ok{r.ok};
-}
-
-pub fun free_libraries(a: *A.Allocator, libraries: *Library, library_len: u32) {
-    if (libraries != nil && library_len > 0) {
-        A.deallocate[Library](a, libraries, library_len::usize);
-    }
-}
-
-fun resolve_and_store_input(p: *project.Project, req: *manifest.LinkRequirement,
-    inputs: *contract.Input, written: *u32,
-    libraries: **Library, library_len: *u32) err[fail.Fail] {
-    val lr: res[input.Input, fail.Fail] = build_plan.resolve_requirement(p.alloc, ?p.s.interner, ?p.target,
-        ?p.req.lib_dirs, p.req.project_root, req);
-    if (sel lr.err) {
-        ret err[fail.Fail].err{lr.err};
-    }
-    val li: input.Input    = lr.ok;
-    val pr: err[fail.Fail] = register_link_provider(p, ?li);
-    if (sel pr.err) { ret pr; }
-    if (li.kind == input.DYNAMIC) {
-        val cr: err[fail.Fail] = register_link_claims(p, req);
-        if (sel cr.err) { ret cr; }
-        ret append_library(p, ?li, libraries, library_len);
-    }
-    if (req.symbol_count > 0) {
-        ret err[fail.Fail].err{fail.user_of(diagnostic_kind.LINK_STATIC_CLAIMS_SYMBOLS, static_claim_message(p, req))};
-    }
-    if (static_path_present(inputs, @written, li.text)) {
-        A.deallocate[u8](p.alloc, li.text::*u8, str_len(li.text) + 1);
-        ret err[fail.Fail].ok{};
-    }
-    inputs[@written] = contract.Input{file: li.text, data: nil, len: 0};
-    @written         = @written + 1;
-    ret err[fail.Fail].ok{};
-}
-
-fun register_link_provider(p: *project.Project, li: *input.Input) err[fail.Fail] {
-    if (str_empty(li.library)) { ret err[fail.Fail].ok{}; }
-    val nr: res[intern.StrId, A.Error] = intern.add(?p.s.interner, li.library);
-    if (sel nr.err) {
-        ret err[fail.Fail].err{fail.refused(nr.err)};
-    }
-    val rr: err[fail.Fail] = linkage.register_provider(?p.linkage, nr.ok, li.kind == input.STATIC);
-    if (sel rr.err) { ret rr; }
+    val pushed: res[usize, A.Error] = collections_vector.push[input.Input](links, li);
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
     ret err[fail.Fail].ok{};
 }
 
@@ -742,24 +639,6 @@ fun claim_conflict_message(p: *project.Project, sym: intern.StrId,
         "'; a symbol may name only one providing library");
     if (sel r.err) { ret res[str, fail.Fail].err{fail.str_refused(r.err)}; }
     ret res[str, fail.Fail].ok{r.ok};
-}
-
-fun static_claim_message(p: *project.Project, req: *manifest.LinkRequirement) res[str, fail.Fail] {
-    val r: res[str, types_string.StrError] = str_join(p.alloc,
-        "link entry '", intern.text(?p.s.interner, req.text),
-        "' resolves to a static input, which defines symbols rather than importing them; ",
-        "remove its 'symbols' key");
-    if (sel r.err) { ret res[str, fail.Fail].err{fail.str_refused(r.err)}; }
-    ret res[str, fail.Fail].ok{r.ok};
-}
-
-fun static_path_present(inputs: *contract.Input, written: u32, candidate: str) bool {
-    var i: u32 = 0;
-    for (i < written) {
-        if (inputs[i].file != nil && str_equals(inputs[i].file, candidate)) { ret true; }
-        i = i + 1;
-    }
-    ret false;
 }
 
 pub rec ObjectWrite {

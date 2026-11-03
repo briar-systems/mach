@@ -536,7 +536,7 @@ mach build . path/to/libfoo.so
 mach build . path/to/libfoo.dylib
 mach build . foo.dll
 
-# search dir + library name: static candidates first, then the target's .so/.dylib spelling
+# search dir + library name, found by mink: the archive first, then the shared spelling
 mach build . -L build/libs -l foo
 
 # link against a system shared library (libc) dynamically
@@ -547,14 +547,13 @@ mach build . -l c
   or names a `.so`, `.dylib`, or `.dll` is treated as an explicit input. A
   relative path is tried first against the working directory, then against the
   project root.
-- `-l <name>` resolves to an object, archive, or shared library: each `-L <dir>`
-  is searched for `lib<name>.o`, `<name>.o`, `lib<name>.a`, then `<name>.a`;
-  finally the working directory is searched for the same four names (loose
-  objects preferred over archives). Only if no static candidate exists does it
-  fall back to the selected target's shared spelling: `lib<name>.so[.N]` for
-  ELF or `lib<name>[.<N>].dylib` for Mach-O. A resolved `@rpath/` dylib carries
-  its selected directory into the executable as `LC_RPATH`. `-L` and `-l` may
-  each be repeated.
+- `-l <name>` is handed to mink's library search, which finds it as the link
+  runs. The directories are each `-L <dir>` in order, then the working
+  directory, then the system's library directories the target's host row in
+  mink's catalog states. Each directory is tried for the archive spellings
+  first and the shared ones after (`lib<name>.a`, then `lib<name>.so` for ELF,
+  as mink's naming rows spell them), so a static library wins where both
+  exist. mach keeps no search of its own. `-L` and `-l` may each be repeated.
 
 ### Manifest
 
