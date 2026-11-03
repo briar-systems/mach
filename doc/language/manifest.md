@@ -1345,10 +1345,17 @@ A section that runs in two regions or loads in two is refused, and so is one tha
 loads in a region and runs in none, or loads in the region it runs in. A name in
 `sections`, `run` or `load` is an output section, as mink's layout rules name the
 output section each object's section is laid into, so `.text` takes every
-`.text.*` section. A name no object's section is laid into is passed over, so one
-layout serves a program with no `.bss` as well as one with it. That includes an
-output section the link makes itself, such as an `.eh_frame` it writes of the
-objects' frame records, which a region does not place. mach
+`.text.*` section. A name no object's section is laid into lays no bytes, so one
+layout serves a program with no `.bss` as well as one with it, and its bounds
+name the empty range where it would land.
+
+A loaded output section no region names, such as an `.eh_frame` the link writes
+of the objects' frame records or a `.rodata` left out of `run`, runs in the
+region whose `access` admits it and allows least beyond what it needs, laid
+after the sections the regions name. Of regions that tie, the one stated first
+takes it, which is why the example states `flash` before `ram`: a read-only
+section is admitted by both, each allowing one letter more. A section no region
+admits is refused, naming it. mach
 hands the regions, the section order, the size ceiling and every `#[at]`
 placement to mink as one link plan, and reports mink's refusals, an overflow or
 an overlap, as mink names them. mink names the bounds of each section by
