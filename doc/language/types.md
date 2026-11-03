@@ -368,7 +368,7 @@ The language knows only the machinery. A handle is a **bodyless `def`** carrying
 operands each takes, and what an operand means all belong to the named target:
 
 ```mach fragment
-#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
+#[handle("spirv", "image", f32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
 pub def Texture2D;
 
 #[handle("spirv", "sampled_image", Texture2D)]
@@ -383,7 +383,7 @@ promises no fields and no storage, which is exactly what a handle is. There is n
 body because the target supplies the definition.
 
 The spirv `image` constructor takes the seven operands of `OpTypeImage` in its
-order: the texel scalar (`0` `f32`, `1` `i32`, `2` `u32`, `3` `i64`, `4` `u64`), `Dim`, `Depth`, `Arrayed`, `MS`, `Sampled` and the
+order: the texel scalar, written as the type itself (`f32`, `i32`, `u32`, `i64` or `u64`), `Dim`, `Depth`, `Arrayed`, `MS`, `Sampled` and the
 `Image Format`. The format is required, and `0` (`Unknown`) is the usual choice for
 a sampled image. `Sampled` `1` is an image read through a sampler and `2` a storage
 image, read and written directly and bound through `#[gpu.storage]` (see
@@ -408,7 +408,7 @@ may declare `1` too, though no comparison reads it: a comparison samples through
 sampler. `2`, which states no indication either way, is refused.
 
 ```mach fragment
-#[handle("spirv", "image", TEXEL_F32, DIM_2D, DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
+#[handle("spirv", "image", f32, DIM_2D, DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
 pub def ShadowMap;
 
 #[handle("spirv", "sampled_image", ShadowMap)]
