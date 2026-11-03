@@ -168,6 +168,14 @@ fwd mach.lang.manifest.model.Manifest
 
 forwards [`mach.lang.manifest.model.Manifest`](manifest/model.md#rec-manifest)
 
+## fwd mach.lang.manifest.model.SourceRoot
+
+```mach
+fwd mach.lang.manifest.model.SourceRoot
+```
+
+forwards [`mach.lang.manifest.model.SourceRoot`](manifest/model.md#rec-sourceroot)
+
 ## fwd mach.lang.manifest.model.empty
 
 ```mach
@@ -223,6 +231,14 @@ fwd mach.lang.manifest.artifact.artifact_supports_target
 ```
 
 forwards [`mach.lang.manifest.artifact.artifact_supports_target`](manifest/artifact.md#fun-artifact_supports_target)
+
+## fwd mach.lang.manifest.artifact.subsystem_named
+
+```mach
+fwd mach.lang.manifest.artifact.subsystem_named
+```
+
+forwards [`mach.lang.manifest.artifact.subsystem_named`](manifest/artifact.md#fun-subsystem_named)
 
 ## fwd mach.lang.manifest.project.expand_project_work
 
@@ -695,12 +711,4 @@ fwd mach.lang.manifest.select.resolve_cells
 ```
 
 forwards [`mach.lang.manifest.select.resolve_cells`](manifest/select.md#fun-resolve_cells)
-
-## fwd mach.lang.manifest.select.check_stack_keys
-
-```mach
-fwd mach.lang.manifest.select.check_stack_keys
-```
-
-forwards [`mach.lang.manifest.select.check_stack_keys`](manifest/select.md#fun-check_stack_keys)
 

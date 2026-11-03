@@ -13,14 +13,75 @@ verbosity: 0, 1 or 2 from `-v` and `-vv`
 quiet: `--quiet`
 selectors: the `-a`, `-t` and `-p` patterns and `--all`
 overrides: everything else the command sets, typed
+emits: the EMIT_KIND_* bits `-e` names, 0 when it is absent
+entry: what the command line states of an entry build
+
+## rec EntryArgs
+
+```mach
+pub rec EntryArgs;
+```
+
+what an entry build's command line states: its entry, source roots, artifact kind, target
+and the levers its profile takes
+
+file: the entry operand, nil for a project build
+sources: every `-s` value, `name=dir` as written
+kind: the `-k` value, nil when absent
+settings: every target key given, in argv order
+optimize: the profile an entry build states optimizes
+debug: the profile an entry build states emits debug information
+
+## fun entry_stated
+
+```mach
+pub fun entry_stated(e: *EntryArgs) bool;
+```
+
+whether the command line states anything only an entry build takes
+
+e: the entry arguments
+ret: true when a source root, a kind or a target key is given
+
+## val EMIT_KIND_ASM
+
+```mach
+pub val EMIT_KIND_ASM: u8 = 1
+```
+
+masc's listing of each module, beside its object
+
+## val EMIT_KIND_IR
+
+```mach
+pub val EMIT_KIND_IR: u8 = 2
+```
+
+mirl's text of each module, beside its object
+
+## val EMIT_KIND_OBJ
+
+```mach
+pub val EMIT_KIND_OBJ: u8 = 4
+```
+
+the objects, with no link
+
+## val EMIT_KIND_EXE
+
+```mach
+pub val EMIT_KIND_EXE: u8 = 8
+```
+
+the linked artifact
 
 ## val EMIT_ERROR
 
 ```mach
-pub val EMIT_ERROR: str = "--emit expects 'obj' or 'exe'"
+pub val EMIT_ERROR: str = "-e expects asm, ir, obj or exe"
 ```
 
-the refusal of an `--emit` value no goal is named by
+the refusal of an `-e` value no product is named by
 
 ## val ARITY_FLAG
 
@@ -46,7 +107,7 @@ pub val ARITY_ATTACHED: OptionArity = 2
 ```
 
 the option carries an optional value in its own token after `=`; it never
-consumes the next one, so `--emit-ir` and `--emit-ir=listing` both parse
+consumes the next one, so `--name` and `--name=value` both parse
 
 ## rec FlagSpec
 
@@ -151,7 +212,7 @@ pub val QUIETNESS: [QUIETNESS_N]*FlagSpec = [QUIETNESS_N]*FlagSpec;
 ## val CGEN_N
 
 ```mach
-pub val CGEN_N: usize = 4
+pub val CGEN_N: usize = 2
 ```
 
 row count of CGEN
@@ -162,7 +223,7 @@ row count of CGEN
 pub val CGEN: [CGEN_N]*FlagSpec = [CGEN_N]*FlagSpec;
 ```
 
-the codegen options, consumed by build and test
+the codegen options, consumed by build, run and test
 
 ## val OPTIMIZE
 
@@ -183,7 +244,7 @@ pub val DEBUG: FlagSpec = FlagSpec;
 ## val LEVERS_N
 
 ```mach
-pub val LEVERS_N: usize = 7
+pub val LEVERS_N: usize = 6
 ```
 
 row count of LEVERS
@@ -196,6 +257,54 @@ pub val LEVERS: [LEVERS_N]*FlagSpec = [LEVERS_N]*FlagSpec;
 
 the profile levers, each over the selected profile for this invocation only,
 consumed by build and test
+
+## val SOURCE
+
+```mach
+pub val SOURCE: FlagSpec = FlagSpec;
+```
+
+`--source <name=dir>`, a source root of an entry build
+
+## val KIND
+
+```mach
+pub val KIND: FlagSpec = FlagSpec;
+```
+
+`--kind <kind>`, the kind of an entry build's artifact
+
+## val ENTRY_N
+
+```mach
+pub val ENTRY_N: usize = 4
+```
+
+row count of ENTRY
+
+## val ENTRY
+
+```mach
+pub val ENTRY: [ENTRY_N]*FlagSpec = [ENTRY_N]*FlagSpec;
+```
+
+the source roots and kind of an entry build, consumed by build
+
+## val TARGET_FLAGS_N
+
+```mach
+pub val TARGET_FLAGS_N: usize = TARGET_KEYS_N
+```
+
+row count of TARGET_FLAGS
+
+## val TARGET_FLAGS
+
+```mach
+pub val TARGET_FLAGS: [TARGET_FLAGS_N]*FlagSpec = [TARGET_FLAGS_N]*FlagSpec;
+```
+
+the target keys as flags, consumed by build
 
 ## val WORKDIR_N
 
@@ -219,12 +328,12 @@ pub val WORKDIR: [WORKDIR_N]*FlagSpec = [WORKDIR_N]*FlagSpec;
 pub val EMIT: FlagSpec = FlagSpec;
 ```
 
-`--emit <kind>`
+`--emit <kind>`, once per product
 
 ## val EMITS_N
 
 ```mach
-pub val EMITS_N: usize = 1
+pub val EMITS_N: usize = 2
 ```
 
 row count of EMITS
@@ -235,7 +344,7 @@ row count of EMITS
 pub val EMITS: [EMITS_N]*FlagSpec = [EMITS_N]*FlagSpec;
 ```
 
-`--emit`, consumed by build
+`--emit` and `-e`, consumed by build
 
 ## val WORKERS_N
 
@@ -603,7 +712,7 @@ pub rec Call;
 what dispatch hands a command's handler; dispatch owns every member and outlives the call
 
 a: an arena dispatch releases once the handler returns, for what lives as long as the command
-backing: the page allocator under a, for what the command frees itself before it returns
+backing: the heap under a, for what the command frees itself before it returns
 argv: the full process arguments
 inv: the parsed invocation
 report: where the command reports a failure it goes on past or that carries an origin, in the

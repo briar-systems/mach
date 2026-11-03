@@ -18,26 +18,13 @@ pub val INTERNAL:    u8 = host.FAULT_INTERNAL
 pub rec Error;
 ```
 
-## val SOURCE_BUILD_ID
-
-```mach
-pub val SOURCE_BUILD_ID: u8 = 1
-```
-
-where the identity came from: the build id the linker wrote into the running
-image, or the sha-256 of the image file when it carries none
-
-## val SOURCE_DIGEST
-
-```mach
-pub val SOURCE_DIGEST:   u8 = 2
-```
-
 ## rec Identity
 
 ```mach
 pub rec Identity;
 ```
+
+the sha-256 of the running image's file
 
 ## fun identity_clear
 
@@ -51,7 +38,7 @@ pub fun identity_clear(id: *Identity);
 pub fun identity(alloc: *A.Allocator, out: *Identity) err[Error];
 ```
 
-identifies the current executable, never argv[0], once per process: the
-linker's build id when the image carries one, else its sha-256
+identifies the current executable, never argv[0], once per process, by the
+sha-256 of its file
 success fills the identity, failure leaves the output and the memo untouched
 

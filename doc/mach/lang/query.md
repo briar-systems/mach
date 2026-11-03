@@ -495,3 +495,19 @@ key: the product's key
 since: the first operation the host's reads count; an input is current whenever it was set
 ret: a borrowed view, valid until the next operation, input change or retirement
 
+## fun release_value
+
+```mach
+pub fun release_value(db: *QueryDb, kind: *Kind, key: u64) err[fail.Fail];
+```
+
+give back the value of a derived product no reader of the build reads again: its finalizer
+runs and its bytes go, while the entry stays current, so a product computed from it still
+validates against its revision. a later read of it is a failure, and a recomputation, once
+what it read moves, serves a new value
+
+db: the database; the product is the owner thread's
+kind: the product's row, a derived one
+key: the product's key within the kind
+ret: ok, also when the product was never computed or is released already
+

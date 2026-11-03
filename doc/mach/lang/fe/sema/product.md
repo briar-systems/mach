@@ -16,6 +16,16 @@ pub fun result_dnit(r: *SemaResult);
 
 release a semantic result; a nil result holds nothing
 
+## fun result_shed
+
+```mach
+pub fun result_shed(r: *SemaResult);
+```
+
+give back what only the module's own lowering reads of a semantic result, once it is lowered:
+its typing, its bound constants, its instances and its growth. the interface every importer's
+lowering reads, the field graph and the status stay
+
 ## val INFERRED_LEN_NONE
 
 ```mach

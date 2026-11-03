@@ -12,14 +12,6 @@ a comparison is widened to one and a condition is compared with zero
 pub rec Builder;
 ```
 
-## rec Computed
-
-```mach
-pub rec Computed;
-```
-
-a computation on a secret: where it is and its opcode
-
 ## fun init
 
 ```mach
@@ -304,6 +296,24 @@ pub fun set_secret(b: *Builder, s: bool);
 ```
 
 whether the next instructions are marked secret: a load, call or atomic read of a secret
+
+## fun set_access
+
+```mach
+pub fun set_access(b: *Builder, secret: bool);
+```
+
+the next reads through an address state the memory they read as the source type says:
+secret, which marks them so, or public. other reads state nothing, and the constant-time
+walk holds what they reach as it holds any access it cannot place
+
+## fun end_access
+
+```mach
+pub fun end_access(b: *Builder);
+```
+
+the next reads state nothing of the memory they read
 
 ## fun set_volatile
 

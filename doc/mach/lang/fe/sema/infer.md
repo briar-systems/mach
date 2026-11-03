@@ -21,15 +21,6 @@ pub fun infer_expr(sc: *sema_context.SemaContext, eid: ast_id.ExprId) type.TypeI
 pub fun is_field_type_operand(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[bool, fail.Fail];
 ```
 
-## fun refuse_confined_flow
-
-```mach
-pub fun refuse_confined_flow(sc: *sema_context.SemaContext, eid: ast_id.ExprId, route: str);
-```
-
-refuses `eid` when it is a call to an `op` instruction whose result is confined to the
-operands of another `op` in its block, reached here where it would be `route`
-
 ## fun field_seq_owner
 
 ```mach

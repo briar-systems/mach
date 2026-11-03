@@ -45,31 +45,10 @@ pub fun record_tests(p: *project.Project, sc: *TestScope, exe: *u8, target: str,
 bo: *outcome.BuildOutcome, oa: *A.Allocator) err[fail.Fail];
 ```
 
-## rec DispatchInputs
-
-```mach
-pub rec DispatchInputs;
-```
-
-what the dispatcher links beside the build's images: the external objects and
-the dynamic libraries the artifact names
-
-## fun collect_dispatch_inputs
-
-```mach
-pub fun collect_dispatch_inputs(p: *project.Project, unit: *build_plan.BuildUnit) res[DispatchInputs, fail.Fail];
-```
-
-## fun free_dispatch_inputs
-
-```mach
-pub fun free_dispatch_inputs(p: *project.Project, di: *DispatchInputs);
-```
-
 ## fun link_dispatcher
 
 ```mach
-pub fun link_dispatcher(p: *project.Project, sc: *TestScope, di: *DispatchInputs,
+pub fun link_dispatcher(p: *project.Project, sc: *TestScope, links: *Vector[input.Input],
 modules: **Object, module_len: u32, dispatcher: str, artifact: str) err[fail.Fail];
 ```
 

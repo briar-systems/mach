@@ -42,7 +42,8 @@ release a collection; a nil collection holds nothing
 pub val MAIN_LINKAGE: str = "main"
 ```
 
-the dispatcher's entry: the name the runtime's start routine calls
+the dispatcher's entry as a C name: the name the runtime's start routine calls,
+which the target's objects spell with its C symbol prefix
 
 ## fun declares_tests
 
@@ -58,7 +59,7 @@ so one pass over the pool reads every branch at any depth without descending
 ## fun synthesize_dispatcher
 
 ```mach
-pub fun synthesize_dispatcher(s: *session.Session, machine: *lower_context.Machine, tests: *Test, count: u32) res[mirl_module.Module, fail.Fail];
+pub fun synthesize_dispatcher(s: *session.Session, machine: *lower_context.Machine, main: intern.StrId, tests: *Test, count: u32) res[mirl_module.Module, fail.Fail];
 ```
 
 synthesize the test dispatcher module: a `main(argc, argv)` that parses argv[1]
@@ -67,8 +68,9 @@ status protocol. a result in 0..255 is the exit code as is; any other result
 exits `TEST_STATUS_WIDE`; a missing or malformed index, or one past `count`,
 exits 2
 
-s: the session whose interner names the dispatcher and `main`
+s: the session whose interner names the dispatcher
 machine: the target the dispatcher is built for
+main: the entry's name in the target's objects, MAIN_LINKAGE with its prefix
 tests: the collected tests in dispatch order, indexed by argv[1]
 count: how many tests there are, at least one
 ret: the dispatcher's mirl module, owned by the caller, or why it could not be built

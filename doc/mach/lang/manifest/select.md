@@ -222,17 +222,3 @@ resolve selectors a command needs one cell of: `resolve_cells`, refused as
 what: what needs one cell, such as "mach doc renders one artifact"
 ret: the cell; the `resolve_cells` errors, or the refusal of several cells
 
-## fun check_stack_keys
-
-```mach
-pub fun check_stack_keys(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, m: *Manifest) err[fail.Fail];
-```
-
-refuse a target's stack size on an object format whose image headers carry
-none; a target the registry cannot resolve is left to the build that selects it
-
-alloc: owns a refusal's text
-itn: holds the manifest's names
-reg: the registry the targets resolve against
-m: the manifest
-

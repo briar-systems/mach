@@ -104,7 +104,7 @@ ret: true when the artifact marked `export = true` needs it
 ## fun resolve_artifact_reqs
 
 ```mach
-pub fun resolve_artifact_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, s: *Scope,
+pub fun resolve_artifact_reqs(alloc: *A.Allocator, itn: *intern.Interner, s: *Scope,
 consumer: *ArtifactDef, consumer_target: intern.StrId, profile: str,
 whole_project: bool,
 out_items: **template.Requirement, out_count: *u32) err[fail.Fail];
@@ -127,8 +127,7 @@ ret: ok; err from the output path expansion, with the array freed
 ## fun resolve_export_reqs
 
 ```mach
-pub fun resolve_export_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
-s: *Scope, profile: str, out_items: **template.Requirement, out_count: *u32) err[fail.Fail];
+pub fun resolve_export_reqs(alloc: *A.Allocator, itn: *intern.Interner, s: *Scope, profile: str, out_items: **template.Requirement, out_count: *u32) err[fail.Fail];
 ```
 
 list the artifacts a dependency's export library requires, the scope
@@ -193,7 +192,7 @@ ret: ok; the `plan_steps` errors
 ## fun resolve_build_unit
 
 ```mach
-pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, m: *Manifest, c: *Cell) res[BuildUnit, fail.Fail];
+pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, c: *Cell) res[BuildUnit, fail.Fail];
 ```
 
 resolve one cell into a `BuildUnit`. the cell names its artifact; with no
@@ -214,7 +213,7 @@ ret: the unit; err from target or profile resolution, for an artifact the
 ## fun resolve_scoped_build_unit
 
 ```mach
-pub fun resolve_scoped_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, s: *Scope, c: *Cell) res[BuildUnit, fail.Fail];
+pub fun resolve_scoped_build_unit(alloc: *A.Allocator, itn: *intern.Interner, s: *Scope, c: *Cell) res[BuildUnit, fail.Fail];
 ```
 
 `resolve_build_unit` for a cell of `s`: target, artifact and links resolve in
@@ -230,7 +229,7 @@ ret: as `resolve_build_unit`
 ## fun check_collisions
 
 ```mach
-pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, m: *Manifest,
+pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
 v: *template.Values) err[fail.Fail];
 ```
 

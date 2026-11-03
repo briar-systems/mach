@@ -201,33 +201,6 @@ pub val CT_MUL_DIT_MODE:  CtMulCond = 1
 pub val CT_MUL_EXTENSION: CtMulCond = 2
 ```
 
-## val DIT_NEED_MARKER
-
-```mach
-pub val DIT_NEED_MARKER:   str = "__mach_needs_dit"
-```
-
-the DIT runtime contract between the compiler and the std start code.
-a module that multiplies a secret in a DIT_MODE cell carries the marker: a
-local absolute symbol, value 1, that names the need and reaches no linked
-image. on a target whose os declares the mode guaranteed, the linker defines
-the cell in every executable: a hidden one-byte read-only object, 1 when any
-input carries the marker, else 0. the start code reads the cell and, when it
-is set, turns PSTATE.DIT on or fails closed. the names and the byte are
-frozen: std builds against them
-
-## val DIT_REQUIRED_CELL
-
-```mach
-pub val DIT_REQUIRED_CELL: str = "__mach_dit_required"
-```
-
-## val DIT_NEED_VALUE
-
-```mach
-pub val DIT_NEED_VALUE:    u64 = 1
-```
-
 ## rec CtMulForm
 
 ```mach

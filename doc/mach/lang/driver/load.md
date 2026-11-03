@@ -21,7 +21,7 @@ pub fun join_path(alloc: *A.Allocator, a: str, b: str) res[str, fail.Fail];
 ## fun target_context
 
 ```mach
-pub fun target_context(alloc: *A.Allocator, t: *lang_target.Binding, req: *request.BuildRequest,
+pub fun target_context(alloc: *A.Allocator, t: *resolved.Target, req: *request.BuildRequest,
 compiler_name: intern.StrId, compiler_ver: intern.StrId) comptime.ComptimeCtx;
 ```
 

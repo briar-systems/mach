@@ -156,6 +156,16 @@ pub fun cast_to_int(value: CTValue, width: u32, signed: bool) res[CTValue, compt
 an integer cast as a scalar cast computes it: a typed operand is read at its own width and sign,
 an untyped one as it stands, then the result is cut or extended to the destination
 
+## fun width_held
+
+```mach
+pub fun width_held(bits: u32) u8;
+```
+
+the width a comptime integer of a `bits`-bit type is held at: its own up to the 128-bit
+carrier, and untyped past it, exact to 128 bits with every overflow refused (mach#4803
+widens the carrier)
+
 ## fun typed_int
 
 ```mach

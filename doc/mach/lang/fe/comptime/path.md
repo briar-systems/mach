@@ -156,17 +156,23 @@ pub fun resolve_comptime_path(c: *comptime_scope.ComptimeCtx, source: str, file:
 pub fun sys_tag_for(name: View) res[u32, fail.Fail];
 ```
 
+the tag of `$mach.sys.<name>`: the position of mink's system of that name
+
 ## fun arch_tag_for
 
 ```mach
 pub fun arch_tag_for(name: View) res[u32, fail.Fail];
 ```
 
+the tag of `$mach.arch.<name>`: the position of mink's architecture of that name
+
 ## fun abi_tag_for
 
 ```mach
 pub fun abi_tag_for(name: View) res[u32, fail.Fail];
 ```
+
+the tag of `$mach.abi.<name>`: the spelling's place among mink's conventions
 
 ## val MODE_DEBUG
 

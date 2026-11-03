@@ -1,21 +1,5 @@
 # mach.lang.driver
 
-## fwd frontend.begin_query_phase
-
-```mach
-fwd frontend.begin_query_phase
-```
-
-forwards [`mach.lang.driver.frontend.begin_query_phase`](driver/frontend.md#fun-begin_query_phase)
-
-## fwd frontend.finish_query_phase
-
-```mach
-fwd frontend.finish_query_phase
-```
-
-forwards [`mach.lang.driver.frontend.finish_query_phase`](driver/frontend.md#fun-finish_query_phase)
-
 ## fwd frontend.refresh_diagnostics
 
 ```mach
@@ -48,22 +32,6 @@ fwd frontend.resolved
 
 forwards [`mach.lang.driver.frontend.resolved`](driver/frontend.md#fun-resolved)
 
-## fwd frontend.typed
-
-```mach
-fwd frontend.typed
-```
-
-forwards [`mach.lang.driver.frontend.typed`](driver/frontend.md#fun-typed)
-
-## fwd passes.codegen_reusable
-
-```mach
-fwd passes.codegen_reusable
-```
-
-forwards [`mach.lang.driver.passes.codegen_reusable`](driver/passes.md#fun-codegen_reusable)
-
 ## fwd passes.module_in_current_project
 
 ```mach
@@ -72,14 +40,6 @@ fwd passes.module_in_current_project
 
 forwards [`mach.lang.driver.passes.module_in_current_project`](driver/passes.md#fun-module_in_current_project)
 
-## fwd driver_load.entry_module_fqn
-
-```mach
-fwd driver_load.entry_module_fqn
-```
-
-forwards [`mach.lang.driver.load.entry_module_fqn`](driver/load.md#fun-entry_module_fqn)
-
 ## fwd config.resolve_run_artifact
 
 ```mach
@@ -87,14 +47,6 @@ fwd config.resolve_run_artifact
 ```
 
 forwards [`mach.lang.driver.config.resolve_run_artifact`](driver/config.md#fun-resolve_run_artifact)
-
-## fwd config.RunArtifact
-
-```mach
-fwd config.RunArtifact
-```
-
-forwards [`mach.lang.driver.config.RunArtifact`](driver/config.md#rec-runartifact)
 
 ## fun append_frontend_roots
 
@@ -141,20 +93,30 @@ pub fun run_sema_pass(p: *project.Project) err[fail.Fail];
 pub fun run_lower_pass(p: *project.Project) err[fail.Fail];
 ```
 
+## fun run_codegen_pass
+
+```mach
+pub fun run_codegen_pass(p: *project.Project) err[fail.Fail];
+```
+
+the codegen stage: each emitted module's object, made by its own step or restored from `obj/`
+
+## fun run_test_pass
+
+```mach
+pub fun run_test_pass(p: *project.Project) err[fail.Fail];
+```
+
+the test stage: each test object, lowered against its module's normal object
+
 ## fun run_link_pass
 
 ```mach
-pub fun run_link_pass(p: *project.Project) res[bool, fail.Fail];
+pub fun run_link_pass(p: *project.Project, job: *project.LinkJob) err[fail.Fail];
 ```
 
-## fun build_project
-
-```mach
-pub fun build_project(s: *session.Session, project_root: str, selectors: *manifest.Selectors) res[project.Project, fail.Fail];
-```
-
-load the manifest at `project_root`, begin the one cell `selectors` names in it and
-load its artifact's closure
+the link stage: the artifact `job` names, written by its action only when an input of the
+link moved since it last ran or the artifact on disk is not the one it wrote
 
 ## fun closure_locate
 
