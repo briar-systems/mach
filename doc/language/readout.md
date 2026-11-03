@@ -31,7 +31,9 @@ records, a test run's among them, and leaves stdout as it is.
 A phase row is written when the phase closes. A phase that runs inside another
 (optimization inside lowering) is timed by the spans moved out of the phase
 that hosts it, so no time is counted twice, and `other` is the unit's wall time
-that no row accounts for.
+that no row accounts for. The `target` row is the build's target resolved and
+its back half opened once for the unit: mink's formats and mirl's target,
+assembled and readied.
 
 ```
 load         48 modules     77ms
@@ -44,7 +46,8 @@ built out/app  48 modules  1 MiB  in 358ms
 Each module's object is made by a step that lowers it, holds it to mirl's
 verifier and has mirl compile it. The `lower` and `verify` rows are the sums of
 those stages over the modules, moved out of the `codegen` row, which keeps the
-rest. mirl times its own stages when a readout is shown, and each moves out of
+rest. `lower` also holds the preparation of the lowering's inputs before the
+first step runs. mirl times its own stages when a readout is shown, and each moves out of
 `codegen` into a row of its own:
 
 | Row | What it times | Read from |
