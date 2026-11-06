@@ -3,7 +3,7 @@
 ## val COMMAND
 
 ```mach
-pub val COMMAND: args.CommandSpec = args.CommandSpec;
+pub val COMMAND: std_args.CommandSpec = std_args.CommandSpec;
 ```
 
 `mach build`
@@ -11,7 +11,7 @@ pub val COMMAND: args.CommandSpec = args.CommandSpec;
 ## val CHECK
 
 ```mach
-pub val CHECK: args.CommandSpec = args.CommandSpec;
+pub val CHECK: std_args.CommandSpec = std_args.CommandSpec;
 ```
 
 `mach check`
