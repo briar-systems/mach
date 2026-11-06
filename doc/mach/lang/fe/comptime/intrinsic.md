@@ -121,6 +121,12 @@ pub val POINTEE_OF:      Id = 16
 pub val DISCRIMINANT_OF: Id = 17
 ```
 
+## val ZEROIZE
+
+```mach
+pub val ZEROIZE:         Id = 21
+```
+
 ## def Class
 
 ```mach
@@ -135,6 +141,7 @@ CLASS_GATE: a type compared inside a `$if` gate, never a value
 CLASS_CONSTRUCTOR: a type built from a type, written where a type is expected
 CLASS_ITERATION: the members a `$each` walks
 CLASS_DIRECTIVE: a compile-time refusal
+CLASS_EFFECT: a run-time operation only the compiler can state
 
 ## val CLASS_LAYOUT
 

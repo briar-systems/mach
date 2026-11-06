@@ -268,6 +268,14 @@ another file, so a `*SourceFile` held across the release stays valid and
 reads `present == false`. a future reuse of released slots must check the
 revision as a generation before trusting a stored FileId
 
+## fun find
+
+```mach
+pub fun find(m: *SourceMap, interner: *intern.Interner, path: str) res[FileId, A.Error];
+```
+
+the file loaded from `path`, FILE_NIL when none was
+
 ## fun get
 
 ```mach
@@ -314,7 +322,16 @@ placed at the end
 pub fun line_start(file: *SourceFile, line: usize) opt[usize];
 ```
 
-the offset line `line` (from 1) starts at; reached only by mach-lsp
+the offset line `line` (from 1) starts at
+
+## fun offset_of
+
+```mach
+pub fun offset_of(file: *SourceFile, at: Position) opt[usize];
+```
+
+the offset of `at` in the file, none for a line it does not hold; a column past the line
+stays where it falls
 
 ## fun line_bounds
 

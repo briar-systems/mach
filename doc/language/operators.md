@@ -93,7 +93,7 @@ use std.runtime;
 fun main(argc: i64, argv: **u8) i64 {
     val third: f16 = 1.0f16 / 3.0; # 0.333251953125, the nearest binary16
     val r:     f16 = 5.5f16 % 3.0; # 2.5, exact
-    val lt:    u8  = third < 0.3333333333333333f64; # 1: compared exactly, not rounded
+    val lt:    u1  = third < 0.3333333333333333f64; # 1: compared exactly, not rounded
     if (third:~u16 != 0x3555 || r != 2.5 || lt != 1) { ret 1; }
     ret 0;
 }
@@ -173,8 +173,8 @@ before the loop.
 
 ## Comparison
 
-`==` `!=` `<` `>` `<=` `>=` — produce `u8` (`1` or `0`). Mach has no compiler
-`bool`; `bool` is a stdlib alias for `u8`. Comparisons relate **mathematical
+`==` `!=` `<` `>` `<=` `>=` — produce `u1` (`1` or `0`). Mach has no compiler
+`bool`; `bool` is a stdlib alias. Comparisons relate **mathematical
 values**, so the result is identical in either operand order:
 
 - **integer vs integer** — any signedness and width mix is legal and compares
@@ -188,7 +188,7 @@ values**, so the result is identical in either operand order:
 - **pointer vs pointer** — every one of the six operators accepts two
   pointer-like operands (a pointer, a `ptr`, a function, or `nil`), whatever
   their pointee types and whatever their pointees' secrecy. Addresses order as
-  unsigned values of pointer width, and the result is a public `u8` even when
+  unsigned values of pointer width, and the result is a public `u1` even when
   both pointees are secret: ordering reveals no more than the `==` beside it,
   and no address comes back out of it. See
   [secrecy.md](secrecy.md#comparing-and-ordering-addresses).
@@ -210,18 +210,18 @@ equality, no payload equality and no ordering. Test which case is active with th
 
 ## Logical
 
-`&&` `||` `!` — short-circuiting. Operands are `u8` (`0` is false, nonzero is
-true); the result is `u8` (`1` or `0`).
+`&&` `||` `!` — short-circuiting. Operands are `u1`; the result is `u1` (`1` or
+`0`).
 
 ```mach fragment
-val ok: u8 = (x > 0) && (y < 100);
+val ok: u1 = (x > 0) && (y < 100);
 ```
 
 ## Unary
 
 - `-` numeric negation
 - `~` bitwise NOT (integer)
-- `!` logical NOT (`u8`)
+- `!` logical NOT (`u1`)
 
 On a float, `-` is the IEEE-754 sign-bit flip and is exact for every operand, so
 `-0.0` is negative zero — a constant distinct from `0.0`, whether it is folded at

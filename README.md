@@ -86,7 +86,7 @@ fun main(argc: i64, argv: **u8) i64 {
 
 ```mach
 pub fun halt() {
-    asm x86_64 {
+    asm x86-64 {
         cli
         hlt
     }
