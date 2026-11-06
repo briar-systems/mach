@@ -762,11 +762,12 @@ Notes:
 ### Inline assembly
 
 ```ebnf
-asm-stmt ::= "asm" IDENT "{" asm-body "}"
+asm-stmt ::= "asm" asm-head "{" asm-body "}"
 ```
 
-- The `IDENT` after `asm` is the mandatory **ISA tag**, one of a closed set
-  (see [asm.md](asm.md)). Bare `asm { ... }` is rejected.
+- `asm-head` is the mandatory **selection of masc's**: raw text from `asm` to the
+  body's `{`, handed to masc unchanged (see [asm.md](asm.md)). Bare `asm { ... }`
+  is rejected.
 - `asm-body` is **raw text**, not a token grammar: the parser captures the
   source span between the opening `{` and its brace-matched `}` and hands it
   to the backend verbatim. Nested `{ }` are balanced by depth. Local
@@ -775,6 +776,7 @@ asm-stmt ::= "asm" IDENT "{" asm-body "}"
   operand or clobber list. `#` introduces a line comment inside the body.
 
 ```ebnf
+asm-head ::= (* raw source text; masc's selection syntax *)
 asm-body ::= (* raw source text, brace-balanced; not tokenized *)
 ```
 

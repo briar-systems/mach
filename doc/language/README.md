@@ -86,3 +86,7 @@ The supported, source-stable surface of the compiler is the editor API
 `mach doc`), the command line, and the manifest schema. Everything else
 under `src/` is internal. Source API authors can mark deprecated declarations with
 [`#[deprecated]`](decorators.md#deprecated--deprecatedstr--source-use-notice), which warns on external use.
+
+## Migration
+
+- [migrate.md](migrate.md) - `mach migrate` and the changes from 6 to 7

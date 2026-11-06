@@ -126,10 +126,18 @@ pub fun load($order: Order, ptr: *i64) i64 {
 
     $if ($mach.build.arch == $mach.arch.aarch64) {
         $if (order == RELAXED) {
-            asm aarch64 { ldr {result}, [{ptr}] }
+            asm armv8-a {
+                ldr x9, {ptr}
+                ldr x9, [x9]
+                str x9, {result}
+            }
         }
         $or (order == ACQUIRE) {
-            asm aarch64 { ldar {result}, [{ptr}] }
+            asm armv8-a {
+                ldr x9, {ptr}
+                ldar x9, [x9]
+                str x9, {result}
+            }
         }
     }
 

@@ -1,14 +1,14 @@
 # Inline assembly
 
-Mach has one inline-assembly form: an ISA-tagged block of raw instructions
-with local-variable substitution. The compiler parses the instruction
-stream and infers operand direction and clobbers from the opcode semantics —
-no `in` / `out` declarations, no clobber list.
+Mach has one inline-assembly form: a block of raw instructions headed by a
+selection of masc's, with local-variable substitution. The compiler parses the
+instruction stream and infers operand direction and clobbers from the opcode
+semantics: no `in` / `out` declarations, no clobber list.
 
 ## Grammar
 
 ```mach fragment
-asm <isa> {
+asm <selection> {
     # raw instructions, one per line, # for comments
     mov rcx, {ptr}
     mov rax, [rcx]
@@ -16,10 +16,24 @@ asm <isa> {
 }
 ```
 
-- The ISA tag is mandatory. Bare `asm { ... }` does not exist.
-- The tag comes from a closed set: `x86_64`, `aarch64`, `riscv64`, `riscv32`. Each has a working assembler that emits native bytes; the first three run in CI (riscv64 under qemu, including a self-host smoke — riscv64 is a self-hosting target with a byte-identical fixpoint).
-- **The RISC-V tag names the machine, not the family.** An `asm riscv64` block is refused on a riscv32 target and the other way round, so a body reaching the assembler was written for the register width it is being assembled for. Guard the two with `$if ($mach.build.arch == $mach.arch.riscv32)` when a routine needs both. An RV64-only spelling (`ld`, `sd`, the `*W` group, the doubleword atomics) is refused under a `riscv32` tag, naming the instruction and the machine, because each instruction states the register widths it exists at and the assembler reads that rather than a second list of its own.
-- **A target with no assembler takes no `asm` block.** SPIR-V declares no assembly capability, so any `asm` block compiled for it, whatever its tag, is refused where it is written with `inline assembly is not available on instruction set 'spirv'`. Guard a routine shared with a shader behind `$if ($mach.build.arch != $mach.arch.spirv)`.
+- The head is mandatory. Bare `asm { ... }` does not exist.
+- **The head is a selection of masc's**, written in masc's own syntax for the
+  instruction set and handed to masc unchanged: `x86-64` or `sse41,avx2` on x86,
+  `armv8-a` or `armv8.2-a+sha2` on aarch64, `rv64i` or `rv64gc_zba` on RISC-V.
+  mach holds no table of these names, so a selection masc gains is a head with no
+  change here.
+- **Every block that survives comptime has its head read by masc for the compile
+  target**, and one masc refuses, or that names another architecture's selection,
+  is refused at the head with `asm.head` and masc's message. A block in a discarded
+  `$if` arm is never read, so a routine writes one block per target and `$if`
+  chooses among them (see [Multi-arch dispatch](#multi-arch-dispatch)).
+- **A head may add instruction extensions only.** It never sets execution state: an
+  x86 width, AArch64 streaming mode, `dit`, `doitm`, a RISC-V `xlen` other than the
+  target's. Those stay the function's, with `#[constant_time]` and the target, so a
+  head that sets one is refused with `asm.head`, naming them. A head that repeats
+  the state the target enters at, as `rv64i` does on riscv64, sets nothing.
+- There is no `asm ... or ...` chain. `$if` chooses the block per target.
+- **A target with no assembler takes no `asm` block.** SPIR-V declares no assembly capability, so any `asm` block compiled for it, whatever its head, is refused where it is written with `inline assembly is not available on instruction set 'spirv'`. Guard a routine shared with a shader behind `$if ($mach.build.arch != $mach.arch.spirv)`.
 - Each line is an instruction in the ISA's native syntax.
 - `#` introduces a line comment: everything from `#` to the end of the line is ignored, whatever it contains (`;`, `{}`, `%`, and so on are all inert inside a comment).
 
@@ -39,7 +53,7 @@ grammar untouched.
 ```mach fragment
 pub fun add_via_asm(a: i64, b: i64) i64 {
     var result: i64 = 0;
-    asm x86_64 {
+    asm x86-64 {
         mov rax, {a}
         add rax, {b}
         mov {result}, rax
@@ -59,7 +73,7 @@ block rather than assembling a wrong one:
 
 ```mach fragment
 var x: i64 = 0;
-asm aarch64 {
+asm armv8-a {
     ldr x9, {x}
     stp x1, x2, [sp, -16]!   # refused: this body binds {x}
 }
@@ -79,7 +93,7 @@ pointer, which is what a `#[naked]` function's hand-written prologue does.
 read off the operand:
 
 ```mach fragment
-asm x86_64 {
+asm x86-64 {
     call some_symbol     # direct: E8 rel32, relocated against the symbol
     call rax             # indirect through a register: FF /2, mod=11
     call [0x100018]      # indirect through an absolute address: ff 14 25 <disp32>
@@ -124,7 +138,7 @@ and needs nothing else. A memory operand states none, and where the instruction
 does not settle it either the width must be written out, in nasm's spelling:
 
 ```mach fragment
-asm x86_64 {
+asm x86-64 {
     movzx eax, word [rcx]     # a two-byte load, zero-extended into eax
     movsx rax, dword [rcx]    # a four-byte load, sign-extended (movsxd)
     mov dword [rcx], 1        # a four-byte store, not the machine word
@@ -158,7 +172,7 @@ zero-extending load was written.
 ## Bit scans, byte swap, multiply and double shifts (x86-64)
 
 ```mach fragment
-asm x86_64 {
+asm x86-64 {
     bsf rax, rcx              # index of the lowest set bit; zf set and rax undefined when rcx is 0
     bsr rdx, qword [rdi]      # index of the highest set bit
     tzcnt r8, r9              # trailing zeros, 64 for a zero source (bmi1)
@@ -189,7 +203,7 @@ immediate count is not.
 ## String instructions (x86-64)
 
 ```mach fragment
-asm x86_64 {
+asm x86-64 {
     mov rdi, {dst}
     mov rsi, {src}
     mov rcx, {n}
@@ -245,7 +259,7 @@ address is then relative to that segment's base, and the instruction carries the
 instruction that takes a memory operand accepts it, the vector forms included:
 
 ```mach fragment
-asm x86_64 {
+asm x86-64 {
     mov rax, fs:[0x28]            # an absolute offset from the fs base
     mov rax, qword gs:[rbx + 8]   # a register-relative one
     movdqu xmm0, gs:[16]
@@ -332,7 +346,7 @@ a secret through them.
 register, `, x9`. Either form writes the base register:
 
 ```mach fragment
-asm aarch64 {
+asm armv8-a {
     ld1 {v0.16b}, [x1], 16      # load 16 bytes, then x1 += 16
     ld1 {v1.16b}, [x1], 16
     eor v0.16b, v0.16b, v1.16b
@@ -359,8 +373,9 @@ admitted set is the target's selection plus what its `#[extension(...)]` names,
 each closed over what it implies. The encoder applies it to every row of an `asm`
 block, and the inliner applies the same predicate before moving one body into
 another, so an inlined body never carries an instruction its new home does not
-admit. An `asm` block has no spelling of its own: the tag is the isa, and the block
-inherits its function's set.
+admit. A block inherits its function's set: a head that names an extension past it
+admits nothing yet, so its instruction is refused as any other is, and
+`#[extension(...)]` admits it.
 
 | isa | extension | mnemonics |
 |---|---|---|
@@ -425,7 +440,7 @@ all of `eax`, `ebx`, `ecx` and `edx`:
 var b: u32 = 0;
 var c: u32 = 0;
 var d: u32 = 0;
-asm x86_64 {
+asm x86-64 {
     mov eax, 7
     xor ecx, ecx
     cpuid
@@ -441,7 +456,7 @@ val has_sha: bool = ((b >> 29) & 1) == 1;
 Beyond the ordinary surface, an OS-level block reaches:
 
 ```mach fragment
-asm x86_64 {
+asm x86-64 {
     cli / sti                 # the interrupt flag
     cld                       # clear DF before entering a program
     hlt                       # park the core
@@ -494,15 +509,15 @@ Four data directives emit their values verbatim, for an encoding the ISA's mnemo
 table does not name. They work on every target:
 
 ```mach fragment
-asm x86_64 {
+asm x86-64 {
     .byte 0x0f, 0x01, 0xd0    # xgetbv
 }
 
-asm aarch64 {
+asm armv8-a {
     .word 0xd53be040          # mrs x0, cntvct_el0
 }
 
-asm riscv64 {
+asm rv64i {
     .word 0xc0102573          # csrr a0, time
 }
 ```
@@ -539,17 +554,17 @@ callee-saved register the function could reach. A raw encoding may instead state
 writes, with a `::` clause on the directive:
 
 ```mach fragment
-asm x86_64 {
+asm x86-64 {
     mov dx, {port}
     .byte 0xee :: writes()                 # out dx, al - reads dx and al, writes nothing
     .byte 0x0f, 0x31 :: writes(rax, rdx)   # rdtsc - lands its result in EDX:EAX
 }
 
-asm aarch64 {
+asm armv8-a {
     .word 0xd4000002 :: writes(x0, x1, x2, x3)   # hvc #0, returning per SMCCC
 }
 
-asm riscv64 {
+asm rv64i {
     .word 0xc0102573 :: writes(a0)               # csrr a0, time
 }
 ```
@@ -617,7 +632,7 @@ every `asm` block is already assumed to modify arbitrary memory.
 `mrs` and `msr` name a system register by its architectural name, in either case:
 
 ```mach fragment
-asm aarch64 {
+asm armv8-a {
     mrs x0, cntvct_el0        # the virtual counter
     mrs x1, CNTFRQ_EL0        # ... and its frequency, capitalized as ARM spells it
     msr vbar_el1, x2          # install an exception vector base
@@ -633,7 +648,7 @@ GNU as spell it, which is what makes the surface complete rather than a list tha
 lags the architecture:
 
 ```mach fragment
-asm aarch64 {
+asm armv8-a {
     mrs x0, s3_3_c14_c0_2     # the same register as `mrs x0, cntvct_el0`
 }
 ```
@@ -650,7 +665,7 @@ block is: `#` opens a comment to the end of the line, so Arm's `#1` would leave 
 instruction without its operand.
 
 ```mach fragment
-asm aarch64 {
+asm armv8-a {
     msr dit, 1                # turn on data-independent timing for this thread
     dsb nsh                   # ... and make the write take effect before what follows
     isb
@@ -666,7 +681,7 @@ read-only at the current level traps at run time, as the architecture defines.
 The three architectural barriers take the Arm ARM's option vocabulary:
 
 ```mach fragment
-asm aarch64 {
+asm armv8-a {
     dmb ish                   # data memory barrier, inner shareable
     dsb nsh                   # data synchronization barrier, non-shareable
     isb                       # instruction synchronization barrier (`isb sy` spells the same word)
@@ -687,7 +702,7 @@ Three instructions generate an exception at a higher level, and they differ only
 which level answers:
 
 ```mach fragment
-asm aarch64 {
+asm armv8-a {
     svc 0                     # the kernel, at EL1
     hvc 0                     # the hypervisor, at EL2
     smc 0                     # the secure monitor, at EL3
@@ -708,7 +723,7 @@ payload is a stream the parser cannot read.
 The two waiting hints suspend the core until something wakes it:
 
 ```mach fragment
-asm aarch64 {
+asm armv8-a {
     wfi                       # ... until an interrupt: the correct idle loop
     wfe                       # ... until an event
 }
@@ -718,13 +733,19 @@ Neither writes anything, so an idle loop holds every live value across it. `yiel
 is the weaker hint of the three — it asks a hypervisor to schedule elsewhere and
 may do nothing at all, which is why `wfi` is what an idle loop should say.
 
+## Labels
+
+A block defines numbered labels only, as `1:`, named by its branches as `1b` and
+`1f`. A label defined by name is refused: a block can be inlined twice, and two
+copies would define one symbol twice.
+
 ## Jumps, calls and branches (riscv64)
 
 A jump or call target is a symbol or a numeric local label, and the row decides which
 it may be:
 
 ```mach fragment
-asm riscv64 {
+asm rv64i {
     j    some_symbol      # jal x0: one J-type word under R_RISCV_JAL, +-1 MiB
     jal  some_symbol      # jal ra, the same word and relocation
     jal  t0, some_symbol  # ... with a named link register
@@ -751,7 +772,7 @@ The Zicsr extension's six instructions — read-write, read-set and read-clear, 
 taking its source from a register or a five-bit immediate — reach a CSR by name:
 
 ```mach fragment
-asm riscv64 {
+asm rv64i {
     csrrw a0, mstatus, a1   # read mstatus into a0, write a1 into it
     csrr  a0, mtvec         # csrrs a0, mtvec, x0 - the read-only pseudo
     csrw  stvec, a1         # csrrw x0, stvec, a1 - install a trap vector
@@ -768,7 +789,7 @@ across three privilege levels, so **any** CSR is also reachable by its numeric a
 exactly as a name resolves to one:
 
 ```mach fragment
-asm riscv64 {
+asm rv64i {
     csrr a0, 0xc01   # the same register as `csrr a0, time`
 }
 ```
@@ -804,16 +825,24 @@ wrap each `asm` block in `$if` on `$mach.build.arch`:
 
 ```mach fragment
 $if ($mach.build.arch == $mach.arch.x86_64) {
-    asm x86_64 { ... }
+    asm x86-64 { ... }
 }
 $or ($mach.build.arch == $mach.arch.aarch64) {
-    asm aarch64 { ... }
+    asm armv8-a { ... }
 }
 ```
 
 The discarded branches don't compile (see
 [comptime-control.md](comptime-control.md)), so each `asm` block only needs
-to be valid for its tagged ISA.
+to be valid for the target its arm selects.
+
+## From a previous major
+
+A v6 head names an architecture: `x86_64`, `aarch64`, `riscv64` or `riscv32`. It
+warns with `asm.head_renamed` until the family's sources are migrated, and
+[`mach migrate`](migrate.md) writes `x86-64`, `armv8-a`, `rv64i` and `rv32i`, each
+the architecture's first level, which adds nothing to a target of it. It becomes a
+refusal once they are.
 
 ## When to use
 
