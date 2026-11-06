@@ -7,12 +7,13 @@ stream. `mach fmt` and `mach migrate` are two transforms over it
 ## def Transform
 
 ```mach
-pub def Transform: fun(*A.Allocator, str, *diagnostic.DiagnosticStore) res[str, fail.Fail]
+pub def Transform: fun(*A.Allocator, str, *diagnostic.DiagnosticStore, ptr) res[str, fail.Fail]
 ```
 
 the text a command makes of one source's text, such as its canonical layout;
 a refusal `fail.is_reported` holds was reported into the store and marks the
-source malformed, and any other ends the command
+source malformed, and any other ends the command. the last argument is the pass's
+`context`
 
 ## rec Report
 
@@ -27,6 +28,7 @@ differing: files the transform changed (rewritten, or listed by --check)
 malformed: files the transform refused as reported; each was left unchanged
 diagnostics: where a malformed file's diagnostics are rendered
 transform: the text each source becomes
+context: what the command hands its transform
 
 ## val CHECK
 
@@ -63,6 +65,7 @@ where the transformed text of one input goes
 file: replace the input file in place and name it on stdout
 stream: write the transformed text to stdout, whether or not it differs
 name: write no source; name the input on stdout when the transform changes it
+diff: write no source; name the input and print the lines the transform changes
 
 ## val SINK_FILE
 
@@ -81,6 +84,20 @@ pub val SINK_STREAM: Sink = 1
 ```mach
 pub val SINK_NAME:   Sink = 2
 ```
+
+## val SINK_DIFF
+
+```mach
+pub val SINK_DIFF:   Sink = 3
+```
+
+## fun text_of
+
+```mach
+pub fun text_of(a: *A.Allocator, path: str) opt[str];
+```
+
+the text of the file at `path`, none when it cannot be read as one
 
 ## fun source_dir_of
 

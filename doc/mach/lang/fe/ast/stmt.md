@@ -138,6 +138,8 @@ pub rec StmtDecl;
 pub rec StmtAsm;
 ```
 
+head: the text between `asm` and the body's `{`, masc's selection handed over unchanged
+
 ## rec StmtComptimeIf
 
 ```mach

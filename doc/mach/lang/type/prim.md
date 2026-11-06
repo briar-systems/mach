@@ -3,7 +3,7 @@
 ## val PRIM_COUNT
 
 ```mach
-pub val PRIM_COUNT: u32 = 18
+pub val PRIM_COUNT: u32 = 19
 ```
 
 ## def PrimClass
@@ -41,6 +41,10 @@ pub val PRIM_CLASS_PTR:   PrimClass = 3
 ```mach
 pub rec PrimDesc;
 ```
+
+bits:  what a value occupies, in memory and as an operand
+width: the bits that hold its value, the width of mirl's row of its layout. only `u1`
+       differs: a byte holding 0 or 1
 
 ## fun is_prim
 

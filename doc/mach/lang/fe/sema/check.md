@@ -121,6 +121,23 @@ pub fun check_return(sc: *sema_context.SemaContext, fn_ret: type.TypeId, value: 
 pub fun check_condition(sc: *sema_context.SemaContext, cond: type.TypeId, span: lang_source.Span) bool;
 ```
 
+## fun check_truth
+
+```mach
+pub fun check_truth(sc: *sema_context.SemaContext, t: type.TypeId, span: lang_source.Span) bool;
+```
+
+a truth value: a u1, or a previous major's u8, which `transition_read` warns of
+
+## fun transition_read
+
+```mach
+pub fun transition_read(sc: *sema_context.SemaContext, form: transition.Form, span: lang_source.Span) bool;
+```
+
+form `form` of a previous major written at `span`: true while this major reads it. it
+warns in the root project alone, since a dependency migrates as its own project
+
 ## fun byte_size
 
 ```mach

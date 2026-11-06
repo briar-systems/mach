@@ -322,6 +322,30 @@ pub val WORKDIR: [WORKDIR_N]*FlagSpec = [WORKDIR_N]*FlagSpec;
 
 `-w`, consumed by build and test
 
+## fun removed_count
+
+```mach
+pub fun removed_count() usize;
+```
+
+how many options a previous major took and this one refuses
+
+## fun removed_name
+
+```mach
+pub fun removed_name(i: usize) str;
+```
+
+the spelling of removed option `i`
+
+## fun removed_replacement
+
+```mach
+pub fun removed_replacement(i: usize) str;
+```
+
+what to do in place of removed option `i`
+
 ## val EMIT
 
 ```mach

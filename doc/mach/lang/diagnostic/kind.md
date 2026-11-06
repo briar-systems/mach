@@ -3035,6 +3035,30 @@ pub val READOUT_CLOCK_REFUSED: Kind = 514
 
 mirl's stage clock refused a read, so a -vv stage row it would have timed is short
 
+## val CONDITION_U8
+
+```mach
+pub val CONDITION_U8:          Kind = 515
+```
+
+## val U1_AS_U8
+
+```mach
+pub val U1_AS_U8:              Kind = 516
+```
+
+## val ASM_HEAD
+
+```mach
+pub val ASM_HEAD:              Kind = 517
+```
+
+## val ASM_HEAD_RENAMED
+
+```mach
+pub val ASM_HEAD_RENAMED:      Kind = 518
+```
+
 ## rec Spec
 
 ```mach
@@ -3052,7 +3076,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 514
+pub val COUNT: usize       = 518
 ```
 
 ## fun at
