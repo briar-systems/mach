@@ -44,8 +44,9 @@ use lang_source: mach.lang.source;
 
 # the text a command makes of one source's text, such as its canonical layout;
 # a refusal `fail.is_reported` holds was reported into the store and marks the
-# source malformed, and any other ends the command
-pub def Transform: fun(*A.Allocator, str, *diagnostic.DiagnosticStore) res[str, fail.Fail];
+# source malformed, and any other ends the command. the last argument is the pass's
+# `context`
+pub def Transform: fun(*A.Allocator, str, *diagnostic.DiagnosticStore, ptr) res[str, fail.Fail];
 
 # one command's pass over its inputs
 # ---
@@ -54,12 +55,14 @@ pub def Transform: fun(*A.Allocator, str, *diagnostic.DiagnosticStore) res[str, 
 # malformed:   files the transform refused as reported; each was left unchanged
 # diagnostics: where a malformed file's diagnostics are rendered
 # transform:   the text each source becomes
+# context:     what the command hands its transform
 pub rec Report {
     visited:     usize;
     differing:   usize;
     malformed:   usize;
     diagnostics: *io_writer.Writer;
     transform:   Transform;
+    context:     ptr;
 }
 
 # `--check`, which every command over this pass takes
@@ -67,7 +70,7 @@ pub val CHECK: args.FlagSpec = args.FlagSpec{name: "--check", value: "", arity: 
 
 # a pass with nothing read yet
 pub fun report(diagnostics: *io_writer.Writer, transform: Transform) Report {
-    ret Report{visited: 0, differing: 0, malformed: 0, diagnostics: diagnostics, transform: transform};
+    ret Report{visited: 0, differing: 0, malformed: 0, diagnostics: diagnostics, transform: transform, context: nil};
 }
 
 # the deepest source directory nesting the walk follows
@@ -81,10 +84,12 @@ pub val STREAM_NAME: str = "<stdin>";
 # file:   replace the input file in place and name it on stdout
 # stream: write the transformed text to stdout, whether or not it differs
 # name:   write no source; name the input on stdout when the transform changes it
+# diff:   write no source; name the input and print the lines the transform changes
 pub def Sink: u8;
 pub val SINK_FILE:   Sink = 0;
 pub val SINK_STREAM: Sink = 1;
 pub val SINK_NAME:   Sink = 2;
+pub val SINK_DIFF:   Sink = 3;
 
 # one input's destination; SINK_FILE reads dirfd, leaf and mode, SINK_STREAM
 # reads stream, and SINK_NAME reads none of them
@@ -222,10 +227,75 @@ fun replace_source(a: *A.Allocator, dirfd: usize, leaf: str, name: str, text: st
     ret err[fail.Fail].ok{};
 }
 
+# the offset of the line after the one at `at`, the end of `text` for the last
+fun line_after(text: str, at: usize) usize {
+    var i: usize = at;
+    for (text[i] != 0 && text[i] != '\n') { i = i + 1; }
+    if (text[i] == '\n') { ret i + 1; }
+    ret i;
+}
+
+# whether the line of `x` at `at` reads as the line of `y` at `to`
+fun same_line(x: str, at: usize, y: str, to: usize) bool {
+    var i: usize = 0;
+    for (x[at + i] == y[to + i]) {
+        if (x[at + i] == 0 || x[at + i] == '\n') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun print_line(a: *A.Allocator, mark: str, text: str, at: usize) {
+    var end: usize = line_after(text, at);
+    if (end > at && text[end - 1] == '\n') { end = end - 1; }
+    val shown: res[str, StrError] = str_copy_slice(a, text, at, end - at);
+    if (sel shown.err) { ret; }
+    print.printlnf("{}{}", mark, shown.ok);
+    str_free(a, shown.ok);
+}
+
+# the most lines one change is followed for before its next line is taken to differ too
+val DIFF_REACH: usize = 32;
+
+# the lines `before` and `after` differ in, `-` for a line of `before` and `+` for one of
+# `after`, read in step: a change resumes at the nearest line the two share again
+fun print_changes(a: *A.Allocator, before: str, after: str) {
+    var x: usize = 0;
+    var y: usize = 0;
+    for (before[x] != 0 || after[y] != 0) {
+        if (before[x] != 0 && after[y] != 0 && same_line(before, x, after, y)) {
+            x = line_after(before, x);
+            y = line_after(after, y);
+            cnt;
+        }
+        # the first line of `after` within reach that `before`'s line reads as, and the reverse
+        var dropped: usize = 0;
+        var at:      usize = x;
+        for (dropped < DIFF_REACH && before[at] != 0 && (after[y] == 0 || !same_line(before, at, after, y))) {
+            at      = line_after(before, at);
+            dropped = dropped + 1;
+        }
+        var added: usize = 0;
+        var to:    usize = y;
+        for (added < DIFF_REACH && after[to] != 0 && (before[x] == 0 || !same_line(before, x, after, to))) {
+            to    = line_after(after, to);
+            added = added + 1;
+        }
+        if (before[x] != 0 && (dropped <= added || after[y] == 0)) {
+            print_line(a, "-", before, x);
+            x = line_after(before, x);
+        }
+        or {
+            print_line(a, "+", after, y);
+            y = line_after(after, y);
+        }
+    }
+}
+
 # hand one input's transformed text to its destination. SINK_STREAM writes
 # every time, since a stream operand owes its caller the source whether or not
 # it changed; the other two sinks act only on a difference
-fun emit(a: *A.Allocator, dest: *Destination, name: str, output: str, differs: bool) err[fail.Fail] {
+fun emit(a: *A.Allocator, dest: *Destination, name: str, text: str, output: str, differs: bool) err[fail.Fail] {
     if (dest.sink == SINK_STREAM) {
         val failure: i64 = write_all(dest.stream, output);
         if (failure < 0) { ret err[fail.Fail].err{os_failure(a, name, failure)}; }
@@ -236,10 +306,33 @@ fun emit(a: *A.Allocator, dest: *Destination, name: str, output: str, differs: b
         print.println(name);
         ret err[fail.Fail].ok{};
     }
+    if (dest.sink == SINK_DIFF) {
+        print.printlnf("--- {}", name);
+        print_changes(a, text, output);
+        ret err[fail.Fail].ok{};
+    }
     val replaced: err[fail.Fail] = replace_source(a, dest.dirfd, dest.leaf, name, output, dest.mode);
     if (sel replaced.err) { ret replaced; }
     print.println(name);
     ret err[fail.Fail].ok{};
+}
+
+# the text of the file at `path`, none when it cannot be read as one
+pub fun text_of(a: *A.Allocator, path: str) opt[str] {
+    val parent: res[str, A.Error] = types_path.parent(a, path);
+    if (sel parent.err) { ret opt[str].none{}; }
+    fin { str_free(a, parent.ok); }
+    var dirfd:  usize = system_os.INVALID_HANDLE;
+    val opened: i64   = remove.open_path(parent.ok, ?dirfd);
+    if (opened < 0) { ret opt[str].none{}; }
+    fin { val closed: i64 = system_os.close(dirfd); }
+    var fd:   usize          = system_os.INVALID_HANDLE;
+    val open: err[fail.Fail] = open_file(a, dirfd, types_path.filename(path), path, ?fd);
+    if (sel open.err) { ret opt[str].none{}; }
+    fin { val closed: i64 = system_os.close(fd); }
+    val read: res[str, fail.Fail] = read_text(a, fd, path);
+    if (sel read.err) { ret opt[str].none{}; }
+    ret opt[str].some{read.ok};
 }
 
 # the one path every operand takes: named text in, transformed text to the
@@ -248,7 +341,7 @@ fun rewrite_text(a: *A.Allocator, name: str, text: str, dest: *Destination, repo
     report.visited = report.visited + 1;
     var diags: diagnostic.DiagnosticStore = diagnostic.store_init(a);
     fin { diagnostic.store_dnit(?diags); }
-    val formatted: res[str, fail.Fail] = report.transform(a, text, ?diags);
+    val formatted: res[str, fail.Fail] = report.transform(a, text, ?diags, report.context);
     if (sel formatted.err) {
         if (fail.is_reported(formatted.err)) {
             report.malformed = report.malformed + 1;
@@ -260,7 +353,7 @@ fun rewrite_text(a: *A.Allocator, name: str, text: str, dest: *Destination, repo
     fin { str_free(a, output); }
     val differs: bool = !str_equals(text, output);
     if (differs) { report.differing = report.differing + 1; }
-    ret emit(a, dest, name, output, differs);
+    ret emit(a, dest, name, text, output, differs);
 }
 
 # rewrite one open file; the replacement carries the original's permission bits
