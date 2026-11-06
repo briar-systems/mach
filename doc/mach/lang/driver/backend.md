@@ -64,7 +64,8 @@ the machine lowering builds for, refused for a cell no owner assembles yet
 pub fun refused_by_mink(a: *A.Allocator, lead: str, f: Fail) fail.Fail;
 ```
 
-mink's failure `f` as mach's, under `lead`
+mink's failure `f` as mach's, under `lead`: what mink does not do is the input's to change, and
+every other cause is the compiler's
 
 ## fun compile
 

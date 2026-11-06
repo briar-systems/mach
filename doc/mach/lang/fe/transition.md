@@ -46,6 +46,14 @@ pub val ASM_HEAD: Form = 3
 
 an `asm` block headed by a previous major's identifier
 
+## val U1_IN_PACK
+
+```mach
+pub val U1_IN_PACK: Form = 4
+```
+
+a u1 handed to a pack, whose instance a 6.x std renders and walks as a u8
+
 ## rec Row
 
 ```mach
