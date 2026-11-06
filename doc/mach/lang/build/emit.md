@@ -55,6 +55,16 @@ then the `link_count` inputs at `links`, written to `destination` with the resou
 `image` declares, laid out as the artifact and its placed globals state, what the link tells of
 itself reported to `diags`
 
+## fun binds_any
+
+```mach
+pub fun binds_any(p: *project.Project, links: *input.Input, count: usize) res[bool, fail.Fail];
+```
+
+whether any of the `count` inputs at `links` is one the image binds against when it
+loads: a library or framework named, which mink's search finds, or a file of a kind a
+link binds against. a relocatable object or an archive is linked in, not bound
+
 ## fun ordered_inputs
 
 ```mach
