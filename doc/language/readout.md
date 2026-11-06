@@ -109,7 +109,7 @@ several profiles.
 
 ## The test readout
 
-Tests run concurrently, up to `--jobs` at once, and each is written when it
+Tests run concurrently, up to `--threads` at once, and each is written when it
 finishes, so a slow test never holds back one that has finished. Without `-v`
 a module's roll-up is written once the last of its tests finishes, so a slow
 test holds back only its own module's line:

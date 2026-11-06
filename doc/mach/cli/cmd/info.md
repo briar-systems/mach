@@ -3,7 +3,7 @@
 ## val VERSION
 
 ```mach
-pub val VERSION: args.FlagSpec = args.FlagSpec;
+pub val VERSION: std_args.FlagSpec = std_args.FlagSpec;
 ```
 
 `--version`, which `mach --version` gives in place of a command word
@@ -11,7 +11,7 @@ pub val VERSION: args.FlagSpec = args.FlagSpec;
 ## val COMMAND
 
 ```mach
-pub val COMMAND: args.CommandSpec = args.CommandSpec;
+pub val COMMAND: std_args.CommandSpec = std_args.CommandSpec;
 ```
 
 `mach info`
