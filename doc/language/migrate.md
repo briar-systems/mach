@@ -35,6 +35,7 @@ Rewritten by `mach migrate`:
 | `asm x86_64`, `asm aarch64`, `asm riscv64`, `asm riscv32` | `asm x86-64`, `asm armv8-a`, `asm rv64i`, `asm rv32i` |
 | `def bool: u8;` | `def bool: u1;` |
 | `use id;`, `fwd id;` | the path of the dependency's exported artifact entry |
+| `--jobs`, `--jobs=n` in the `argv` of a `[step]` that runs mach | `--threads`, `--threads=n` |
 | `[project] mach` on the previous major | the running major |
 
 Reported, for you to change:
@@ -43,7 +44,7 @@ Reported, for you to change:
 |---|---|
 | a condition of type `u8`, as `if (flags & 1)` | a `u1`, as `if ((flags & 1) != 0)` |
 | a `u1` stored in a `u8` or under arithmetic | `value::u8`, or a `u1` destination |
-| `-g`, `-O0`, `-O2`, `--emit-asm`, `--emit-ir`, `--pie`, `--simd` in a script | the spelling the report names |
+| `-g`, `-O0`, `-O2`, `--emit-asm`, `--emit-ir`, `--pie`, `--simd`, `--jobs` in a script | the spelling the report names |
 
 The first two warn with `condition.u8` and `type.u1_as_u8` from the compiler while
 the family's sources move, and are refused after that.
