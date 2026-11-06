@@ -37,6 +37,7 @@ uses generic words such as `input` and `shared`.
 #[testing]           # exists only for tests; omitted from ordinary builds
 #[expect("key", ..)] # acknowledge the named warnings inside this declaration
 #[symbol("name")]    # linker name override
+#[weak("name")]      # a definition as a link-time default of that name
 #[library("dep")]    # dynamic import attribution (ext only)
 #[export]            # export from a shared library (pub only)
 #[inline("always")]  # force inlining
@@ -332,6 +333,53 @@ a mangled name always contains a `.` or a `#`, and a C identifier never can. Bot
 any emitted symbol can be named from `asm` — but the spelling is not a stability
 promise, and binding to one from C is not a supported use.
 
+### `weak(str)` — a definition as a link-time default
+
+Emits the function under the name given, as a weak definition: the program runs
+it unless the link holds a strong definition of the name.
+
+```mach fragment
+# file: src/spawn.mach
+#[weak("mach_thread_backend")]
+fun backend(entry: *u8) i64 {
+    ret -1;
+}
+
+# file: src/backend.mach, in the package that replaces it
+#[symbol("mach_thread_backend")]
+fun backend(entry: *u8) i64 { ... }
+```
+
+The replacement is an ordinary strong definition of the name: a
+`#[symbol("name")]` function, or a definition in a C or asm object the link
+takes. The name is spelled as `symbol` spells it, and it takes the target's C
+prefix the same way. A `#[weak]` definition has default visibility, whether or not
+it is `pub`, so on ELF and Mach-O a shared library exports it without `#[export]`
+and another image may replace it at load. A PE DLL still exports only what
+`#[export]` names. A COFF object states the definition as a weak external whose
+fallback is the body.
+
+The compiler does not check the pairing. It compares no signatures and matches
+no replacement to its default, so a replacement of another shape is the same
+fault it would be between C objects, and a default nothing replaces is never
+reported. Whichever definition the link keeps is the one every caller reaches,
+the module defining the default included. Every call is a call of the symbol: it
+is never inlined and never bound to the default's body, so the link's choice
+holds at each one.
+
+- A declaration is refused: an `ext` function or one with no body has nothing to
+  default to, and there are no weak imports.
+- One module cannot define a name twice, whichever decorators define it, so a
+  default and its replacement stand in two modules, and the build has to reach
+  the module holding the replacement.
+- The argument is required and is not empty. A second `weak` on a function is
+  refused with `decorator.duplicate`, and `weak` with `symbol` or with
+  `inline("always")` is refused with `decorator.conflict`.
+- A generic, comptime-parameter or pack function is refused: its instances have
+  no one symbol.
+- It applies to functions only, and it cannot stand with `testing`, as `symbol`
+  cannot.
+
 ### `library(str)` — dynamic import attribution
 
 Pins an `ext` import to a specific dependency in the link set. Applies to
@@ -379,8 +427,9 @@ without charging that budget, so the outcome never depends on what else the
 caller expanded first; across modules it is imported within the extraction and
 import limits like any other body. A
 `constant_time` function is expanded only into another `constant_time` function, so
-its instructions never leave a constant-time validated body; a `naked` or
-`inline("never")` function, a recursive cycle and an indirect call are never expanded.
+its instructions never leave a constant-time validated body; a `naked`,
+[`weak`](#weakstr--a-definition-as-a-link-time-default) or `inline("never")`
+function, a recursive cycle and an indirect call are never expanded.
 A remaining call or taken address still names the original defining function.
 Generic, comptime and pack specializations keep their existing shared weak
 linkage. When several modules materialize that same specialization, body import
