@@ -46,7 +46,7 @@ work: the `-w` work directory, nil when absent
 subsystem: the declared subsystem as mink spells it, none for the artifact's own
 optimize: whether to optimize, or LEVER_PROFILE
 debug: whether to emit debug information, or LEVER_PROFILE
-jobs: the worker count, 0 for the host's
+threads: the worker count, 0 for the host's
 
 ## fun overrides_init
 
@@ -199,7 +199,7 @@ subsystem: opt[*mink_subsystem.Subsystem], goal: BuildGoal) BuildRequest;
 pub fun workers(asked: u32) u32;
 ```
 
-the workers a run uses: the `--jobs` count, or the host's processor count when none was given
+the workers a run uses: the `--threads` count, or the host's processor count when none was given
 
 asked: the count, 0 when none was given
 ret: at least 1

@@ -19,7 +19,7 @@ each module's objects, one subdirectory per project id
 pub val IR: str = "ir"
 ```
 
-`--emit-ir` output
+`-e ir` output
 
 ## val ASM
 
@@ -27,7 +27,7 @@ pub val IR: str = "ir"
 pub val ASM: str = "asm"
 ```
 
-`--emit-asm` output
+`-e asm` output
 
 ## val TEST
 

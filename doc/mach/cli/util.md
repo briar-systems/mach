@@ -8,30 +8,6 @@ pub val PROJECT_CONFIG_NAME: str = manifest.MANIFEST_FILE
 
 the manifest file name, "mach.toml"
 
-## fun arg_is_flag
-
-```mach
-pub fun arg_is_flag(s: str) bool;
-```
-
-whether an argument starts with '-'; nil is not a flag, and a lone '-' is the
-conventional name of the standard stream rather than an option
-
-s: the argument
-ret: true for a leading '-' followed by anything
-
-## fun arg_separator_index
-
-```mach
-pub fun arg_separator_index(argc: usize, argv: *str) usize;
-```
-
-the index of the first "--" at or after argv[1]
-
-argc: number of entries
-argv: the arguments
-ret: the index, or argc when there is none
-
 ## rec ProjectLocation
 
 ```mach

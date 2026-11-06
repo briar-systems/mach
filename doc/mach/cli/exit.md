@@ -43,26 +43,6 @@ pub val TIMEOUT: i64 = 124
 `mach run` stopped the program at its --timeout; 124 as GNU timeout reports it,
 apart from ENVIRONMENT so a script can tell the two apart
 
-## val PASSTHROUGH
-
-```mach
-pub val PASSTHROUGH: i64 = -1
-```
-
-the note code of a command that forwards another process's exit code as its own
-
-## rec Note
-
-```mach
-pub rec Note;
-```
-
-one exit code as help documents it
-
-code: the process exit code, or PASSTHROUGH for the codes a command forwards; a
-         command note whose code is shared refines that code's meaning, never replaces it
-meaning: what the code reports
-
 ## val SHARED_N
 
 ```mach
@@ -74,18 +54,10 @@ length of SHARED
 ## val SHARED
 
 ```mach
-pub val SHARED: [SHARED_N]Note = [SHARED_N]Note;
+pub val SHARED: [SHARED_N]std_args.Exit = [SHARED_N]std_args.Exit;
 ```
 
 the codes every command can exit with, in ascending order
-
-## fun shared
-
-```mach
-pub fun shared(code: i64) bool;
-```
-
-whether `code` is one of SHARED
 
 ## fun of
 
@@ -106,16 +78,4 @@ pub fun worst(a: i64, b: i64) i64;
 
 the worse of two shared codes, as a run over several cells reports them:
 INTERNAL over ENVIRONMENT over USER over OK
-
-## fun notes_valid
-
-```mach
-pub fun notes_valid(notes: *Note, n: usize) bool;
-```
-
-whether a command's own notes keep to the shared contract: each has a meaning, a
-code that is PASSTHROUGH, shared, or a free code in 4..255, and no two share a code
-
-notes: the command's notes; nil when n is 0
-n: length of notes
 
