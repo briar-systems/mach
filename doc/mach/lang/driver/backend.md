@@ -317,10 +317,12 @@ plan: the layout the artifact states, nil where it states none
 ## fun link
 
 ```mach
-pub fun link(b: *Back, a: *A.Allocator, kind: *output.Kind, format: *Format, requests: *Request, count: usize, output_path: str, gc: bool, image: *Image) res[Sink, fail.Fail];
+pub fun link(b: *Back, a: *A.Allocator, diags: *diagnostic.DiagnosticStore, kind: *output.Kind, format: *Format, requests: *Request, count: usize, output_path: str, gc: bool, image: *Image) res[Sink, fail.Fail];
 ```
 
 the image of `kind` in `format` mink links from the `count` requests at `requests`, a library
 named by name found by mink's search, named `output` where its format records a name, its
-unreferenced sections left out with `gc`, laid out as `image` states
+unreferenced sections left out with `gc`, laid out as `image` states. mink's notes go to `diags`:
+a refused link's are notes of the refusal, which is reported there, and a finished link's are
+warnings
 
