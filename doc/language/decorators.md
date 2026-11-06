@@ -37,6 +37,7 @@ uses generic words such as `input` and `shared`.
 #[testing]           # exists only for tests; omitted from ordinary builds
 #[expect("key", ..)] # acknowledge the named warnings inside this declaration
 #[symbol("name")]    # linker name override
+#[weak("name")]      # a definition as a link-time default of that name
 #[library("dep")]    # dynamic import attribution (ext only)
 #[export]            # export from a shared library (pub only)
 #[inline("always")]  # force inlining
@@ -317,7 +318,8 @@ Without `symbol`, the compiler mangles the Mach name — except on an `ext`
 declaration, which names a C declaration and takes the target's C symbol name for
 it (Darwin's underscore prefix, nothing elsewhere; see
 [ext-fun.md](ext-fun.md)). `symbol` gives the exact name the linker sees, with no
-platform prefix applied to it.
+platform prefix applied to it. Two definitions in one module cannot state one
+name, and the second is refused with `name.duplicate`.
 
 A mangled name is the source FQN, dotted, with generic arguments after a `$`:
 `std.types.string.str_len`, `std.collections.vector.push$ptr`. Each argument is
@@ -331,6 +333,54 @@ a `pack` marker before its element list. A test's symbol is its qualified name,
 a mangled name always contains a `.` or a `#`, and a C identifier never can. Both `.` and `$` are legal in an inline-asm symbol, so
 any emitted symbol can be named from `asm` — but the spelling is not a stability
 promise, and binding to one from C is not a supported use.
+
+### `weak(str)` — a definition as a link-time default
+
+Emits the function under the name given, as a weak definition: the program runs
+it unless the link holds a strong definition of the name.
+
+```mach fragment
+# file: src/spawn.mach
+#[weak("mach_thread_backend")]
+fun backend(entry: *u8) i64 {
+    ret -1;
+}
+
+# file: src/backend.mach, in the package that replaces it
+#[symbol("mach_thread_backend")]
+fun backend(entry: *u8) i64 { ... }
+```
+
+The replacement is an ordinary strong definition of the name: a
+`#[symbol("name")]` function, or a definition in a C or asm object the link
+takes. The name is spelled as `symbol` spells it, and it takes the target's C
+prefix the same way. A `#[weak]` definition has default visibility, whether or not
+it is `pub`, so on ELF and Mach-O a shared library exports it without `#[export]`
+and another image may replace it at load. A PE DLL still exports only what
+`#[export]` names. A COFF object states the definition as a weak external whose
+fallback is the body.
+
+The compiler does not check the pairing. It compares no signatures and matches
+no replacement to its default, so a replacement of another shape is the same
+fault it would be between C objects, and a default nothing replaces is never
+reported. Whichever definition the link keeps is the one every caller reaches,
+the module defining the default included. Every call is a call of the symbol: it
+is never inlined and never bound to the default's body, so the link's choice
+holds at each one.
+
+- A declaration is refused: an `ext` function or one with no body has nothing to
+  default to, and there are no weak imports.
+- One module cannot define a name twice, whichever of `weak` and `symbol` state
+  it: a second definition is refused with `name.duplicate`, so a default and its
+  replacement stand in two modules, and the build has to reach the module holding
+  the replacement. Only the arms of a `$if` that are taken count.
+- The argument is required and is not empty. A second `weak` on a function is
+  refused with `decorator.duplicate`, and `weak` with `symbol` or with
+  `inline("always")` is refused with `decorator.conflict`.
+- A generic, comptime-parameter or pack function is refused: its instances have
+  no one symbol.
+- It applies to functions only, and it cannot stand with `testing`, as `symbol`
+  cannot.
 
 ### `library(str)` — dynamic import attribution
 
@@ -379,8 +429,9 @@ without charging that budget, so the outcome never depends on what else the
 caller expanded first; across modules it is imported within the extraction and
 import limits like any other body. A
 `constant_time` function is expanded only into another `constant_time` function, so
-its instructions never leave a constant-time validated body; a `naked` or
-`inline("never")` function, a recursive cycle and an indirect call are never expanded.
+its instructions never leave a constant-time validated body; a `naked`,
+[`weak`](#weakstr--a-definition-as-a-link-time-default) or `inline("never")`
+function, a recursive cycle and an indirect call are never expanded.
 A remaining call or taken address still names the original defining function.
 Generic, comptime and pack specializations keep their existing shared weak
 linkage. When several modules materialize that same specialization, body import
@@ -829,13 +880,13 @@ return. Applies to functions only; takes no arguments.
 #[naked] #[symbol("_start")]
 fun start() {
     $if ($mach.build.arch == $mach.arch.x86_64) {
-        asm x86_64 {
+        asm x86-64 {
             mov rdi, [rsp]        # argc, straight off the kernel-supplied stack
             lea rsi, [rsp+8]      # argv
             call main
         }
     }
-    $or { asm aarch64 { ... } }
+    $or { asm armv8-a { ... } }
 }
 ```
 
@@ -887,7 +938,7 @@ which warn naming `#[extension("sha")]`. The manifest's `ext` key and
 ```mach fragment
 #[extension("sha", "ssse3")]
 fun compress_sha_ni(state: *[8]u32, block: *[64]u8) {
-    asm x86_64 {
+    asm x86-64 {
         # sha256msg1, sha256rnds2, pshufb, ...
     }
 }
@@ -914,7 +965,7 @@ processor's features and when that answer holds.
   emits nothing against, or that another instruction set declares, admits
   nothing on this target and is not an error, so one
   declaration serves a multi-arch source: `#[extension("sse41", "sha2")]` admits
-  `sse41` on x86_64 and `sha2` on aarch64, and an `asm aarch64 {}` block in an
+  `sse41` on x86_64 and `sha2` on aarch64, and an `asm armv8-a {}` block in an
   x86_64 build still refuses `sha256h` because the tag, not the decorator, picks
   the isa. Each name may appear once. The names are those the manifest's
   [`ext`](manifest.md#instruction-set-extensions) key takes, closed over

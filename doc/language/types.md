@@ -9,6 +9,7 @@ are stdlib `def`s.
 
 | Family | Members |
 |---|---|
+| Truth value | `u1` |
 | Unsigned int | `u8`, `u16`, `u32`, `u64`, `u128`, `u256`, `u512` |
 | Signed int | `i8`, `i16`, `i32`, `i64`, `i128`, `i256`, `i512` |
 | Float | `f16`, `f32`, `f64` |
@@ -129,7 +130,14 @@ them):
 - Comptime evaluation reads a value of one of them as an untyped integer, exact
   to 128 bits, with any overflow past that refused.
 
-There is no compiler `bool`. `bool` is a stdlib `def bool: u8;` with `true` /
+`u1` is the truth value: one byte holding 0 or 1, with its layout read from mirl's
+row of the one-bit integer. Comparisons, `&&`, `||`, `!` and `sel` produce it, and a
+condition requires it. It has `&`, `|`, `^`, `==` and `<` but no arithmetic, so it stays
+0 or 1. `x::u1` asks whether the integer `x` is non-zero, and a float is compared
+instead. There is no `i1`.
+
+There is no compiler `bool`. `bool` is a stdlib alias, `def bool: u8;` until std is
+migrated and `def bool: u1;` after, with `true` /
 `false` as stdlib `val`s (`1` / `0`) — see [def.md](def.md).
 
 ## SIMD vectors

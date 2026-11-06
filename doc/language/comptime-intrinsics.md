@@ -859,9 +859,25 @@ $or ($type_of(arg) == str) { write_str(w, arg); }
 $or { $error("no writer for this argument type"); }    # compile error on an unhandled type
 ```
 
+## `$zeroize(p, count)` — a wipe no pass removes
+
+`$zeroize` writes zero to every byte of `count` values of the pointee of `p`. It is
+the one intrinsic that does its work at run time, because no function can state
+what it states: see [the zeroizing-write guarantee](secrecy.md#the-zeroizing-write-guarantee).
+
+```mach fragment
+var key: [32]^u8;
+# ...
+$zeroize(?key, 1);
+```
+
+`p` is a `*T` for any `T`: public, wholly secret or mixed, with no cast, since the
+wipe reads nothing and changes no qualifier. `count` is a public integer. It is an
+expression statement and gives no value.
+
 ## Not provided as intrinsics
 
-Code intrinsics — runtime-instruction emitters like `trap`, `fence`,
+Other code intrinsics — runtime-instruction emitters like `trap`, `fence`,
 `pause` — are not in the compiler-shipped set. They belong in stdlib as
 functions with per-arch `asm` bodies. See [policy.md](policy.md).
 

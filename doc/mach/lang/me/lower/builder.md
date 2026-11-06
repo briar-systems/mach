@@ -683,6 +683,15 @@ pub fun emit_memzero(b: *Builder, addr: value.Value, ty: Type) err[fail.Fail];
 
 zero the bytes of a `ty` at `addr`
 
+## fun emit_wipe
+
+```mach
+pub fun emit_wipe(b: *Builder, addr: value.Value, count: value.Value, signed: bool, ty: Type) err[fail.Fail];
+```
+
+zero the bytes of `count` of `ty` at `addr` through a kept fill: no pass removes or narrows
+it, and its length is the size of its target alone
+
 ## fun emit_offset
 
 ```mach

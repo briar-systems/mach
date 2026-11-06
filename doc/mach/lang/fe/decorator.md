@@ -226,6 +226,12 @@ pub val THREAD:        Id = 31
 pub val AT:            Id = 32
 ```
 
+## val WEAK
+
+```mach
+pub val WEAK:          Id = 33
+```
+
 ## def Places
 
 ```mach
@@ -380,6 +386,27 @@ pub fun renamed(source: str, name: lang_source.Span) str;
 
 the name this major gives the decorator the name at `name` in `source`
 spells, nil when no previous major named one so or the rename changes its arguments too
+
+## rec Rewrite
+
+```mach
+pub rec Rewrite;
+```
+
+what `mach migrate` writes for the previous spelling at `name` in `source`
+
+name: the name this major gives it
+mode: the argument a previous flag stood for, nil for none
+words: its arguments were bare names, which this major writes as strings
+
+## fun rewrite_of
+
+```mach
+pub fun rewrite_of(source: str, name: lang_source.Span, args: u32) Rewrite;
+```
+
+the rewrite of the decorator named at `name` in `source` with `args` arguments, nil name
+when it is written as this major spells it
 
 ## fun form_of
 

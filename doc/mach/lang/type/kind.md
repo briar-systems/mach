@@ -263,10 +263,16 @@ pub val TYPE_U512: TypeKind = 30
 pub val TYPE_I512: TypeKind = 31
 ```
 
+## val TYPE_U1
+
+```mach
+pub val TYPE_U1:   TypeKind = 32
+```
+
 ## val TYPE_KIND_COUNT
 
 ```mach
-pub val TYPE_KIND_COUNT: u32 = TYPE_I512::u32 + 1
+pub val TYPE_KIND_COUNT: u32 = TYPE_U1::u32 + 1
 ```
 
 one past the last kind, so an appended kind takes over this reference. the
