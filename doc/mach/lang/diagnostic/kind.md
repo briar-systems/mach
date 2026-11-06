@@ -3038,7 +3038,7 @@ mirl's stage clock refused a read, so a -vv stage row it would have timed is sho
 ## val LINK_REPORT
 
 ```mach
-pub val LINK_REPORT: Kind = 515
+pub val LINK_REPORT:      Kind = 515
 ```
 
 what a finished link reports of its inputs, as the traits it dropped
@@ -3046,25 +3046,25 @@ what a finished link reports of its inputs, as the traits it dropped
 ## val CONDITION_U8
 
 ```mach
-pub val CONDITION_U8:          Kind = 516
+pub val CONDITION_U8:     Kind = 516
 ```
 
 ## val U1_AS_U8
 
 ```mach
-pub val U1_AS_U8:              Kind = 517
+pub val U1_AS_U8:         Kind = 517
 ```
 
 ## val ASM_HEAD
 
 ```mach
-pub val ASM_HEAD:              Kind = 518
+pub val ASM_HEAD:         Kind = 518
 ```
 
 ## val ASM_HEAD_RENAMED
 
 ```mach
-pub val ASM_HEAD_RENAMED:      Kind = 519
+pub val ASM_HEAD_RENAMED: Kind = 519
 ```
 
 ## rec Spec
@@ -3084,8 +3084,6 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 515
-
 pub val COUNT: usize       = 519
 ```
 
