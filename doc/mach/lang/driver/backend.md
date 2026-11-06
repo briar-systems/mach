@@ -113,6 +113,50 @@ pub fun object_bytes_with(b: *Back, a: *A.Allocator, o: *Object, name: str, data
 the bytes of `o` with the section `name` holding the `len` bytes at `data` added, laid out in
 the target's format; `o` is left as it was
 
+## val STACK_SECTION
+
+```mach
+pub val STACK_SECTION: str = ".stack"
+```
+
+the section an image no loader maps holds its main stack in, whose top std's entry reads
+through mink's bound name `__run_stop_.stack`
+
+## val STACK_ALIGN
+
+```mach
+pub val STACK_ALIGN: u64 = 16
+```
+
+the alignment the laid stack keeps its base and size at, the strictest any target's psABI
+asks of its stack pointer
+
+## fun lays_stack
+
+```mach
+pub fun lays_stack(t: *resolved.Target) bool;
+```
+
+whether an image of `t` holds its main stack as a section of its own: an ELF or flat image
+no loader maps, so no loader gives it a stack and no header records one
+
+## fun stack_object
+
+```mach
+pub fun stack_object(b: *Back, a: *A.Allocator, size: u64) res[Object, fail.Fail];
+```
+
+an object holding the image's stack, `size` zero-filled bytes in STACK_SECTION, kept by the
+link whether referenced or not, so a stated stack is always laid out
+
+## fun refers
+
+```mach
+pub fun refers(o: *Object, name: str) bool;
+```
+
+whether `o` refers to the symbol `name` and leaves its definition to another object
+
 ## fun section_bytes
 
 ```mach
@@ -128,6 +172,50 @@ pub fun section_names(o: *Object, out: *Vector[View]) err[fail.Fail];
 ```
 
 the names of the sections of `o` its producer named, borrowed from the object
+
+## rec Laying
+
+```mach
+pub rec Laying;
+```
+
+how the target's link names the output section each input section is laid into, by mink's
+own layout rules, so a layout the artifact states is held to the sections the link lays out
+
+rules: the layout rules of the format the target's images link as
+arch: the architecture the link is for
+names: the output section names, owned
+
+## fun laying
+
+```mach
+pub fun laying(b: *Back, a: *A.Allocator) res[Laying, fail.Fail];
+```
+
+the laying of the target's link, refused for a format mink lays out no image of
+
+## fun laying_release
+
+```mach
+pub fun laying_release(l: *Laying);
+```
+
+## fun laid_name
+
+```mach
+pub fun laid_name(a: *A.Allocator, l: *Laying, o: *Object, i: usize) res[View, fail.Fail];
+```
+
+the name of the output section the link lays section `i` of `o` into, valid until the
+laying names another
+
+## fun section_count
+
+```mach
+pub fun section_count(o: *Object) usize;
+```
+
+how many sections `o` holds
 
 ## fun symbols_in
 
@@ -228,10 +316,12 @@ plan: the layout the artifact states, nil where it states none
 ## fun link
 
 ```mach
-pub fun link(b: *Back, a: *A.Allocator, kind: *output.Kind, format: *Format, requests: *Request, count: usize, output_path: str, gc: bool, image: *Image) res[Sink, fail.Fail];
+pub fun link(b: *Back, a: *A.Allocator, diags: *diagnostic.DiagnosticStore, kind: *output.Kind, format: *Format, requests: *Request, count: usize, output_path: str, gc: bool, image: *Image) res[Sink, fail.Fail];
 ```
 
 the image of `kind` in `format` mink links from the `count` requests at `requests`, a library
 named by name found by mink's search, named `output` where its format records a name, its
-unreferenced sections left out with `gc`, laid out as `image` states
+unreferenced sections left out with `gc`, laid out as `image` states. mink's notes go to `diags`:
+a refused link's are notes of the refusal, which is reported there, and a finished link's are
+warnings
 

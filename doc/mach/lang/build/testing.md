@@ -48,8 +48,8 @@ bo: *outcome.BuildOutcome, oa: *A.Allocator) err[fail.Fail];
 ## fun link_dispatcher
 
 ```mach
-pub fun link_dispatcher(p: *project.Project, sc: *TestScope, links: *Vector[input.Input],
-modules: **Object, module_len: u32, dispatcher: str, artifact: str) err[fail.Fail];
+pub fun link_dispatcher(p: *project.Project, diags: *diagnostic.DiagnosticStore, sc: *TestScope, links: *Vector[input.Input],
+modules: *Given, module_len: u32, dispatcher: str, artifact: str) err[fail.Fail];
 ```
 
 synthesize the dispatcher over the selected tests, write its object to `dispatcher`, and

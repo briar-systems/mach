@@ -3035,6 +3035,14 @@ pub val READOUT_CLOCK_REFUSED: Kind = 514
 
 mirl's stage clock refused a read, so a -vv stage row it would have timed is short
 
+## val LINK_REPORT
+
+```mach
+pub val LINK_REPORT: Kind = 515
+```
+
+what a finished link reports of its inputs, as the traits it dropped
+
 ## rec Spec
 
 ```mach
@@ -3052,7 +3060,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 514
+pub val COUNT: usize       = 515
 ```
 
 ## fun at
