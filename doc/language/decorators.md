@@ -318,7 +318,8 @@ Without `symbol`, the compiler mangles the Mach name — except on an `ext`
 declaration, which names a C declaration and takes the target's C symbol name for
 it (Darwin's underscore prefix, nothing elsewhere; see
 [ext-fun.md](ext-fun.md)). `symbol` gives the exact name the linker sees, with no
-platform prefix applied to it.
+platform prefix applied to it. Two definitions in one module cannot state one
+name, and the second is refused with `name.duplicate`.
 
 A mangled name is the source FQN, dotted, with generic arguments after a `$`:
 `std.types.string.str_len`, `std.collections.vector.push$ptr`. Each argument is
@@ -369,9 +370,10 @@ holds at each one.
 
 - A declaration is refused: an `ext` function or one with no body has nothing to
   default to, and there are no weak imports.
-- One module cannot define a name twice, whichever decorators define it, so a
-  default and its replacement stand in two modules, and the build has to reach
-  the module holding the replacement.
+- One module cannot define a name twice, whichever of `weak` and `symbol` state
+  it: a second definition is refused with `name.duplicate`, so a default and its
+  replacement stand in two modules, and the build has to reach the module holding
+  the replacement. Only the arms of a `$if` that are taken count.
 - The argument is required and is not empty. A second `weak` on a function is
   refused with `decorator.duplicate`, and `weak` with `symbol` or with
   `inline("always")` is refused with `decorator.conflict`.
