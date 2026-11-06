@@ -62,6 +62,12 @@ pub val TYPE_MEMO_NONE:     u8 = 0
 pub val TYPE_MEMO_RESOLVED: u8 = 1
 ```
 
+## val TYPE_MEMO_ACTIVE
+
+```mach
+pub val TYPE_MEMO_ACTIVE:   u8 = 2
+```
+
 ## val LAYOUT_PENDING
 
 ```mach
@@ -147,6 +153,8 @@ collect_insts: whether the walk records the instances it asks for
 subst_fn: substitutes an instance's type arguments into a type
 annotation_check_fn: the per-instance checks over one type annotation, run as each is resolved
 infer_fn: types one expression, as an array length is before it is evaluated
+type_fn: resolves one type node, as one the type prepass has yet to reach is
+                     where an expression reads it
 module: the stable id of the module being typed
 values: the store the module's constant values are built in, which its
                      interface publishes

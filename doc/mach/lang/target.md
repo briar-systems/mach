@@ -147,7 +147,8 @@ pub fun executable_output(t: *resolved.Target, imports: bool) *mink_output.Kind;
 the executable mink builds on the target: a finished module for a format that
 finishes its modules, a position independent executable where the host runs one
 by default or its loader places every image, an executable mink binds libraries into
-where it `imports` from one and the format builds one, else a fixed-address executable
+where it `imports` an input the image binds against when it loads and the format builds
+one, else a fixed-address executable
 
 ## fun output_of
 

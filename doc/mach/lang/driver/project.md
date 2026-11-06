@@ -158,7 +158,7 @@ from the stage's current objects. the stage decides whether it runs
 
 artifact: the path the action writes, whose bytes the stage records
 ctx: the build's state the action reads
-run: writes `artifact`
+run: writes `artifact`, reporting what the link tells of itself to the store it is given
 
 ## fun link_name_for
 

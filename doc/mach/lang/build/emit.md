@@ -46,27 +46,46 @@ format, its index naming each member's exported symbols
 ## fun link_image
 
 ```mach
-pub fun link_image(p: *project.Project, kind: *mink_output.Kind, objects: **Object, count: u32,
+pub fun link_image(p: *project.Project, diags: *diagnostic.DiagnosticStore, kind: *mink_output.Kind, inputs: *Given, count: u32,
 links: *input.Input, link_count: u32, destination: str, image: *LoadedImageOptions) err[fail.Fail];
 ```
 
-the image of `kind` mink links in memory from the `count` objects at `objects`, in link order,
+the image of `kind` mink links in memory from the `count` objects at `inputs`, in link order,
 then the `link_count` inputs at `links`, written to `destination` with the resources
-`image` declares, laid out as the artifact and its placed globals state
+`image` declares, laid out as the artifact and its placed globals state, what the link tells of
+itself reported to `diags`
 
-## fun ordered_objects
+## fun binds_any
 
 ```mach
-pub fun ordered_objects(p: *project.Project) res[**Object, fail.Fail];
+pub fun binds_any(p: *project.Project, links: *input.Input, count: usize) res[bool, fail.Fail];
 ```
 
-the emitted modules' objects in topological order, the link's order
+whether any of the `count` inputs at `links` is one the image binds against when it
+loads: a library or framework named, which mink's search finds, or a file of a kind a
+link binds against. a relocatable object or an archive is linked in, not bound
+
+## fun ordered_inputs
+
+```mach
+pub fun ordered_inputs(p: *project.Project) res[*Given, fail.Fail];
+```
+
+the emitted modules' objects as the link's inputs, in topological order, the link's order
 
 ## fun release_ordered
 
 ```mach
-pub fun release_ordered(p: *project.Project, objects: **Object);
+pub fun release_ordered(p: *project.Project, inputs: *Given);
 ```
+
+## fun input_name
+
+```mach
+pub fun input_name(p: *project.Project, m: *project.ModuleEntry) str;
+```
+
+what the link calls the objects of module `m`: its source file, which outlives the link
 
 ## fun indexed_objects
 
