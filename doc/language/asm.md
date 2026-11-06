@@ -150,7 +150,7 @@ asm x86-64 {
 nowhere else — on a register they would be redundant or contradictory, so
 `mov qword rax, rcx` is refused rather than ignored. GNU as's spelling with
 `ptr` (`mov dword ptr [rcx], 1`) means the same, and it is how the x86-64
-`--emit-asm` listing writes every sized memory operand, so a listed
+`-e asm` listing writes every sized memory operand, so a listed
 instruction pastes back into a block unchanged.
 
 **A prefix that contradicts the instruction is a build error, not a dropped

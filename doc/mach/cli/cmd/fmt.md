@@ -24,7 +24,7 @@ mach.toml, is a project; any other existing file is a single source
 ## val COMMAND
 
 ```mach
-pub val COMMAND: args.CommandSpec = args.CommandSpec;
+pub val COMMAND: std_args.CommandSpec = std_args.CommandSpec;
 ```
 
 `mach fmt`

@@ -157,9 +157,7 @@ least one
 name: the table key; a portable identifier
 is_default: `default = true`; false when the key is absent. more than one
               default is a parse error
-optimize: the required `optimize` key: whether the release pass set runs
-pass: the optional `pass` key: the optimization passes added to the set
-skip: the optional `skip` key: the optimization passes left out of it
+optimize: the required `optimize` key: whether the release passes run
 relax: the optional `relax` key: the departures from exact semantics
               the build permits
 linker_relax: the optional `linker_relax` key: whether the linker may relax the
