@@ -226,6 +226,12 @@ pub val THREAD:        Id = 31
 pub val AT:            Id = 32
 ```
 
+## val WEAK
+
+```mach
+pub val WEAK:          Id = 33
+```
+
 ## def Places
 
 ```mach
