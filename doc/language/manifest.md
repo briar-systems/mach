@@ -110,9 +110,7 @@ abi = "sysv64"
 [profile.debug]                        # a build variant; every manifest declares at least one
 optimize = false                       # run the optimization pass set
 debug = true                           # emit debug info for this profile
-simd  = "scalarize"                    # SIMD lever: "scalarize" | "require"
-# pass  = ["inline"]                   # optional: optimization passes added to the set
-# skip  = ["vectorize"]                # optional: optimization passes left out of it
+simd  = "scalarize"                    # SIMD lever: "scalarize"
 # relax = ["float-reassoc"]            # optional: departures from exact semantics
 # linker_relax = false                 # optional: whether the linker may relax the code
 # allow = ["import.unused"]            # optional: warning keys this profile silences
@@ -151,8 +149,8 @@ key, `name` and `description` included, is an unknown-key error
 (`mach.toml: unknown key 'name' in [project]`). The previous major's `out` is
 refused by name, with the rename to `work` as its fix, and so is `{project.work}`
 in any template, with `{project.work}` as its fix. `[profile.<name>]`
-likewise carries no `emit_ir` or `emit_asm`: emission is `--emit-ir`/`--emit-asm`
-on the command line.
+likewise carries no `emit_ir` or `emit_asm`: emission is `-e ir` and `-e asm` on
+the command line.
 
 ### The work directory
 
@@ -162,7 +160,7 @@ expanded `work`, in one layout:
 | Path | Holds |
 | --- | --- |
 | `obj/` | one object per module, each carrying its cache key; it is the [object cache](#stepname--build-steps) and is read by developers and tooling too |
-| `ir/`, `asm/` | the human-readable views `--emit-ir` and `--emit-asm` write |
+| `ir/`, `asm/` | the human-readable views `-e ir` and `-e asm` write |
 | `.cache/` | compiler-only state, read and written by nothing but the compiler |
 | `.cache/steps/` | one fingerprint stamp per [build step](#stepname--build-steps) |
 | `.stage/` | build step scratch space, one directory per step, reset before the step runs |
@@ -479,10 +477,7 @@ and the lowering reads those rows: a cell with a baseline row and a row gated on
 extension lowers to the gated instruction when the selected set holds it (`i32x4 *
 i32x4` is `pmulld` under `sse41` on x86_64 and the `pmuludq` pair without). A cell
 whose only packed row is gated scalarizes without the extension, and the warning at
-each such site names it (see `simd` below), and
-[`simd = "require"`](#profilename) judges against the selected set, so a kernel refused on
-the baseline is accepted once the target declares the extension it needs. SSE2 is the
-x86_64 baseline. A build never infers the build machine's features: what the binary
+each such site names it (see `simd` below). SSE2 is the x86_64 baseline. A build never infers the build machine's features: what the binary
 assumes is what the manifest declares.
 
 ### Image stack size
@@ -963,17 +958,16 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 
 | Key     | Type    | Meaning |
 |---------|---------|---------|
-| `optimize` | bool | Whether the optimization passes run. `true` runs the default set `mach info passes` lists with `default=optimize` over the passes every build runs (`default=always`); `false` runs only the latter. The legalization passes, which make the program something the target can execute, run at every setting. A non-boolean is a manifest error. |
-| `pass` | array of strings | **Optional.** Optimization passes added to the set this profile's `optimize` selects, each a name from [`mach info passes`](#passes), listed once. Absent, nothing is added. |
-| `skip` | array of strings | **Optional.** Optimization passes left out of the set, each listed once and never in `pass` too. Absent, nothing is left out. |
+| `optimize` | bool | Whether the build asks mirl for its release schedule of passes. `false` asks for the debug schedule, which keeps the passes every build needs. The legalization passes, which make the program something the target can execute, run at every setting. A non-boolean is a manifest error. |
 | `relax` | array of strings | **Optional.** The departures from exact semantics the build permits. The one there is, `"float-reassoc"`, is described under [Float reassociation](#float-reassociation). Absent, the build keeps exact semantics. |
 | `linker_relax` | bool | **Optional.** Whether the linker may relax the code, as RISC-V linker relaxation shortens a call or an address pair once the link has placed its target. The build hands it to mirl's `relax` build option on every target, and a target whose linker relaxes nothing takes it without effect. `false` keeps every instruction sequence at the length the compiler laid it out. Absent, it is `true`. It has no command-line form. A non-boolean is a manifest error. |
 | `debug` | bool    | Emit debug info for this profile: DWARF in ELF, Mach-O and COFF objects alike, and the core SPIR-V debug instructions on a `spirv` target (see [Finished-module targets](#finished-module-targets)). A PE image carries its DWARF in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
-| `simd`  | string  | SIMD scalarization lever. `"scalarize"` emits a defined unrolled scalar expansion wherever the target has no packed instruction for a vector operator, with one `vector.scalarize` warning at each such operation naming the operation, its lanes, the function, the target and the extension that would pack it (or that none would). `"require"` makes each of those sites a hard error with the same text. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. Any other string is a manifest error. |
+| `simd`  | string  | SIMD scalarization lever. `"scalarize"` is the one setting a build accepts: mirl legalizes every vector operation, so a target with no packed instruction for an operator gets a defined unrolled scalar expansion. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. `"require"` is refused, since mirl reports no operation it scalarizes and a build cannot be held to packed forms. Any other string is a manifest error. |
 | `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile requirement and selection](#profile-requirement-and-selection). |
 | `allow` | array of strings | **Optional.** The warnings this profile silences, each entry a key or a family of keys from the [warning key table](#silencing-warnings), named once. An unknown key, an entry that covers only errors, a repeated entry or a non-string entry is a manifest error. Absent, nothing is silenced. |
 | `opt` | removed | Refused as a removed key: write `optimize = true` or `optimize = false`. |
-| `vectorize` | removed | Refused as a removed key: vectorization is the `vectorize` pass of the set `optimize` selects, left out with `skip = ["vectorize"]`. |
+| `pass`, `skip` | removed | Refused as removed keys: mirl schedules its passes by optimization level, which `optimize` sets. |
+| `vectorize` | removed | Refused as a removed key: mirl schedules its passes by optimization level, which `optimize` sets. |
 | `float_reassoc` | removed | Refused as a removed key: reassociation is permitted with `relax = ["float-reassoc"]`. |
 
 Three keys (`optimize`, `debug`, `simd`) are required in every profile; the
@@ -984,20 +978,15 @@ manifest error naming the table and the key:
 error[manifest.missing_required]: mach.toml: [profile.debug] is missing required key 'simd'; a profile declares optimize, debug and simd
 ```
 
-A pass name that is no pass, or names a legalization pass, which every build
-runs and none can add or skip, is refused where it is written, and so is a
-relaxation that does not exist:
-
-```
-error[manifest.invalid_value]: mach.toml: [profile.release].skip names "vecsplit", a legalization pass, which every build runs and none can add or skip
-```
+A relaxation that does not exist is refused where it is written.
 
 The previous major's keys are refused by name, each with what replaced it, and
 with the rewrite `mach migrate` applies as a fix wherever the value has a
 mechanical one: `opt = 0` is `optimize = false`, `opt = 1` and `opt = 2` are
-`optimize = true`, `vectorize = true` is the default set and is removed,
-`vectorize = false` is `skip = ["vectorize"]`, `float_reassoc = false` is
-removed and `float_reassoc = true` is `relax = ["float-reassoc"]`:
+`optimize = true`, `vectorize = true` is what `optimize` schedules and is removed,
+`float_reassoc = false` is removed and `float_reassoc = true` is
+`relax = ["float-reassoc"]`. `vectorize = false`, `pass` and `skip` have no
+rewrite, since no key says which passes run:
 
 ```
 error[manifest.removed_key]: mach.toml: [profile.release] uses removed key 'opt'; write `optimize = true` or `optimize = false`
@@ -1009,23 +998,11 @@ error[manifest.removed_key]: mach.toml: [profile.release] uses removed key 'opt'
 
 ### Passes
 
-The middle end runs one schedule of passes, and `mach info passes` lists every
-one of them in the order it first runs, with its class and the setting that
-puts it in the default set:
-
-```
-mem2reg          class=optimization  default=always
-inline           class=optimization  default=optimize
-vectorize        class=optimization  default=optimize
-vecsplit         class=legalization  default=always
-```
-
-An **optimization** pass only improves the code: `optimize` selects it (or every
-build runs it, `default=always`), `pass` adds it at either setting and `skip`
-leaves it out. A **legalization** pass rewrites what the target cannot execute
-and runs in every build; no profile and no flag can add or skip one. Vectorizing
-a loop is the `vectorize` optimization pass, which a target without 128-bit
-vectors never runs.
+mirl schedules the middle end's passes by optimization level, and `optimize`
+sets the level for a whole build: `true` asks for the release schedule and
+`false` for the debug one. No key adds or leaves out a single pass. For a single
+function, the `#[vectorize("never")]` decorator is the finer-grained opt-out
+(see [decorators.md](decorators.md)).
 
 ### Profile requirement and selection
 
@@ -1055,21 +1032,11 @@ marks none is refused wherever a command must pick one:
 error[selection.ambiguous]: mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with -p
 ```
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
-concern — it is controlled only by the `--emit-ir` / `--emit-asm` flags of
-`mach build`.
-
-Skipping `vectorize` only ever *subtracts*. The pass runs when `optimize` selects it, on targets that report 128-bit vector support (SSE2 on x86-64, NEON on
-aarch64, and `OpTypeVector` on spirv) and rewrites counted, unit-stride loops whose dependence analysis proves
-independence — element-wise maps behind a runtime alias guard, and associative-exact
-integer reductions. A loop it cannot prove safe stays scalar, and a target without
-hardware vectors (riscv64) never enters the pass, so `skip = ["vectorize"]` changes
-performance and never semantics. For a single function, the `#[vectorize("never")]` decorator is
-the finer-grained opt-out (see [decorators.md](decorators.md)).
+concern: it is controlled only by the `-e ir` and `-e asm` flags of `mach build`.
 
 `relax = ["float-reassoc"]` is the one lever here that *adds*, and the only profile
 key that can change a program's computed answer. It widens that same pass to float
-reductions and does nothing else; skipping `vectorize` switches the pass off wholesale
-and so overrides it. A relaxation never rides on `optimize`.
+reductions and does nothing else. A relaxation never rides on `optimize`.
 
 Every lever of a profile is always the **consumer's**.
 As [Dependency manifests](#dependency-manifests) sets out, a dependency's `[profile.*]`
@@ -1211,21 +1178,17 @@ exactly.
 ### Levers on the command line
 
 `-p <name>` picks the profile, and every lever has its command-line form over
-it for one invocation. A binary fact is a `--key` and `--no-key` pair, a value
-is `--key value`, and a set takes repeatable add and remove flags:
+it for one invocation. The two levers are `--key` and `--no-key` pairs:
 
 | Key | Flags |
 |---|---|
 | `optimize` | `--optimize` (`-O`), `--no-optimize` |
 | `debug` | `--debug` (`-d`), `--no-debug` |
-| `simd` | `--simd scalarize`, `--simd require` |
-| `pass`, `skip` | `--pass NAME` adds a pass, `--skip NAME` leaves one out |
-| `relax` | `--relax NAME` permits, `--no-relax NAME` withdraws |
 
 The levers apply in one order: the built-in defaults, then the selected profile,
-then the command line. Both flags of a pair, or `--pass` and `--skip` of the
-same pass, are refused. The previous major's `-g`, `-O0` and `-O2` are refused
-naming `-d`, `--no-optimize` and `-O`.
+then the command line. Both flags of a pair are refused. The previous major's
+`-g`, `-O0`, `-O2`, `--emit-asm`, `--emit-ir` and `--jobs` are refused naming
+`-d`, `--no-optimize`, `-O`, `-e asm`, `-e ir` and `--threads`.
 
 A `mach build` whose flags change the selected profile writes a differently
 configured build, so it must say where: it names the artifact with `-o`, or a
