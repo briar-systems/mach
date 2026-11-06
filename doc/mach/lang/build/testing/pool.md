@@ -14,7 +14,7 @@ pub rec Config;
 how a run executes its tests
 
 runner: what each test is launched through, or nil for the test to run itself
-jobs: how many tests run at once, at least one
+threads: how many tests run at once, at least one
 timeout: each test's bound, 0 for none
 level: the readout level; a passing test's output is kept only at the items level
 bytes: whether a test's captured output is kept for the renderer

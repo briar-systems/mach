@@ -156,7 +156,7 @@ full flag reference is `mach help test`; the options that select and shape a
 run are:
 
 ```
---jobs <n>               run up to n test processes at once (default: host CPUs)
+--threads <n>            run up to n test processes at once (default: host CPUs)
 --filter <substr>        select only tests whose qualified name contains the substring
 --include-deps           also run tests declared in dependency modules
 --list                   list the collected tests and exit
@@ -275,7 +275,7 @@ as is when the result is in `0..255`, and `255` otherwise (see
 [Semantics](#semantics)). A missing, malformed, or out-of-range index exits
 `2`.
 
-`mach test` then keeps up to `--jobs` children in flight, each spawned as
+`mach test` then keeps up to `--threads` children in flight, each spawned as
 `<exe> <index>`, or through the target's runner (see [Which tests run](#which-tests-run)), captures each child's stdout and stderr to a per-test file
 under `log/` beside the dispatcher, `test/<artifact>/log/` unless `-o` moves
 the dispatcher, named by the test's position in the run (a passing or skipped

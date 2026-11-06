@@ -31,7 +31,7 @@ transform: the text each source becomes
 ## val CHECK
 
 ```mach
-pub val CHECK: args.FlagSpec = args.FlagSpec;
+pub val CHECK: std_args.FlagSpec = std_args.FlagSpec;
 ```
 
 `--check`, which every command over this pass takes
