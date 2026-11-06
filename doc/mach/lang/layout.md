@@ -60,7 +60,7 @@ pub val NODE_TAG:       NodeKind = 8
 ## val INTEGER_COUNT
 
 ```mach
-pub val INTEGER_COUNT:  usize              = 7
+pub val INTEGER_COUNT:  usize              = 8
 ```
 
 the integer and float widths a primitive takes, the rows of `Scalars`

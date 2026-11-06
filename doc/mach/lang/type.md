@@ -72,6 +72,14 @@ fwd type_kind.TypeKind
 
 forwards [`mach.lang.type.kind.TypeKind`](type/kind.md#def-typekind)
 
+## fwd type_kind.TYPE_U1
+
+```mach
+fwd type_kind.TYPE_U1
+```
+
+forwards [`mach.lang.type.kind.TYPE_U1`](type/kind.md#val-type_u1)
+
 ## fwd type_kind.TYPE_U8
 
 ```mach
@@ -899,6 +907,12 @@ pub fun shape_kind(ti: *TypeInterner, tid: TypeId) TypeKind;
 
 ```mach
 pub fun is_u8(ti: *TypeInterner, tid: TypeId) bool;
+```
+
+## fun is_u1
+
+```mach
+pub fun is_u1(ti: *TypeInterner, tid: TypeId) bool;
 ```
 
 ## fun carries_secret

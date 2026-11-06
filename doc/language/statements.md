@@ -20,6 +20,11 @@ if (cond) {
 - A trailing `or { ... }` is the catch-all.
 - Bodies are blocks; there is no one-statement-without-braces form.
 
+A condition has type `u1`, which comparisons and logical operators produce; any
+other type is refused, naming `u1`. A v6 condition of type `u8`, which is what std's
+`bool` is until std is migrated, warns with `condition.u8`, once in each module of
+the root project. It becomes a refusal once the family's sources are migrated.
+
 An `if`/`or` arm whose condition is exactly `sel P.c` guards the payload place
 `P.c` inside its block:
 

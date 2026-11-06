@@ -624,6 +624,13 @@ gates, not a replacement for them.
 
 ## The zeroizing-write guarantee
 
+[`$zeroize(p, count)`](comptime-intrinsics.md) is the operation that holds this
+guarantee itself, for any `*T`: public, wholly secret or mixed. It lowers to one of
+mirl's kept fills, so no pass removes, narrows or merges its stores, including at
+release when the target is dead afterwards. A kept fill never lowers to an external,
+preemptible `memset`, and its length and timing rest on the size of the target alone,
+so a secret `count` is refused.
+
 Wiping a secret is only useful if the wipe survives to run. That guarantee exists,
 but it is **not** provided by `#[constant_time]`, and it is scoped more broadly than the
 decorator is.

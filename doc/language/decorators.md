@@ -880,13 +880,13 @@ return. Applies to functions only; takes no arguments.
 #[naked] #[symbol("_start")]
 fun start() {
     $if ($mach.build.arch == $mach.arch.x86_64) {
-        asm x86_64 {
+        asm x86-64 {
             mov rdi, [rsp]        # argc, straight off the kernel-supplied stack
             lea rsi, [rsp+8]      # argv
             call main
         }
     }
-    $or { asm aarch64 { ... } }
+    $or { asm armv8-a { ... } }
 }
 ```
 
@@ -938,7 +938,7 @@ which warn naming `#[extension("sha")]`. The manifest's `ext` key and
 ```mach fragment
 #[extension("sha", "ssse3")]
 fun compress_sha_ni(state: *[8]u32, block: *[64]u8) {
-    asm x86_64 {
+    asm x86-64 {
         # sha256msg1, sha256rnds2, pshufb, ...
     }
 }
@@ -965,7 +965,7 @@ processor's features and when that answer holds.
   emits nothing against, or that another instruction set declares, admits
   nothing on this target and is not an error, so one
   declaration serves a multi-arch source: `#[extension("sse41", "sha2")]` admits
-  `sse41` on x86_64 and `sha2` on aarch64, and an `asm aarch64 {}` block in an
+  `sse41` on x86_64 and `sha2` on aarch64, and an `asm armv8-a {}` block in an
   x86_64 build still refuses `sha256h` because the tag, not the decorator, picks
   the isa. Each name may appear once. The names are those the manifest's
   [`ext`](manifest.md#instruction-set-extensions) key takes, closed over
