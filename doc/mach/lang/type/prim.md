@@ -113,7 +113,7 @@ pub fun prim_spelling_len(kind: TypeKind) usize;
 ## fun int_kind_for
 
 ```mach
-pub fun int_kind_for(bits: u32, signed: bool) opt[TypeKind];
+pub fun int_kind_for(width: u32, signed: bool) opt[TypeKind];
 ```
 
 the integer primitive of a width and signedness, absent when the catalog has

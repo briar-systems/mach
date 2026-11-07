@@ -885,10 +885,10 @@ pub val GATE_CYCLE:                       Kind = 141
 pub val GATE_NOT_CONSTANT:                Kind = 142
 ```
 
-## val GATE_NOT_U8
+## val GATE_NOT_U1
 
 ```mach
-pub val GATE_NOT_U8:                      Kind = 143
+pub val GATE_NOT_U1:                      Kind = 143
 ```
 
 ## val GATE_RUNTIME_VALUE

@@ -336,65 +336,7 @@ the row of `id`; nil for NONE and any id no row declares
 pub fun id_of(source: str, name: lang_source.Span) Id;
 ```
 
-the decorator the name at `name` in `source` spells, this major's or a previous one's;
-NONE when it spells none
-
-## def Form
-
-```mach
-pub def Form: u8
-```
-
-how a decorator is written: as this major spells it, or in a previous major's spelling,
-which is read with a `decorator.renamed` warning naming its replacement until the
-family's sources use this major's (#4894 makes it a refusal)
-
-FORM_V7: this major's name and arguments
-FORM_SAME: a previous name with this major's arguments
-FORM_BARE: a previous flag with no arguments, standing for its row's mode
-FORM_WORDS: a previous name whose arguments are bare names, which bind to nothing
-
-## val FORM_V7
-
-```mach
-pub val FORM_V7:    Form = 0
-```
-
-## val FORM_SAME
-
-```mach
-pub val FORM_SAME:  Form = 1
-```
-
-## val FORM_BARE
-
-```mach
-pub val FORM_BARE:  Form = 2
-```
-
-## val FORM_WORDS
-
-```mach
-pub val FORM_WORDS: Form = 3
-```
-
-## fun retired_note
-
-```mach
-pub fun retired_note(source: str, name: lang_source.Span) str;
-```
-
-the refusal of the retired decorator the name at `name` in `source` writes, nil when it
-writes none
-
-## fun renamed
-
-```mach
-pub fun renamed(source: str, name: lang_source.Span) str;
-```
-
-the name this major gives the decorator the name at `name` in `source`
-spells, nil when no previous major named one so or the rename changes its arguments too
+the decorator the name at `name` in `source` spells, NONE when it spells none
 
 ## rec Rewrite
 
@@ -417,35 +359,19 @@ pub fun rewrite_of(source: str, name: lang_source.Span, args: u32) Rewrite;
 the rewrite of the decorator named at `name` in `source` with `args` arguments, nil name
 when it is written as this major spells it
 
-## fun form_of
+## fun refusal_of
 
 ```mach
-pub fun form_of(source: str, name: lang_source.Span, args: u32) Form;
+pub fun refusal_of(source: str, name: lang_source.Span, args: u32) str;
 ```
 
-how the decorator named at `name` in `source` with `args` arguments is written
-
-## fun renamed_note
-
-```mach
-pub fun renamed_note(source: str, dec: *ast_decl.Decorator) str;
-```
-
-the warning on the previous spelling `dec` is written in, nil when it is written as
-this major spells it
-
-## fun mode_of
-
-```mach
-pub fun mode_of(itn: *intern.Interner, c: *comptime.ComptimeCtx, a: *ast.Ast, source: str, dec: *ast_decl.Decorator) opt[str];
-```
-
-the mode `dec` states: its first argument, or the mode a previous flag stands for
+the refusal of the previous spelling at `name` in `source` with `args` arguments, nil when
+it is none
 
 ## fun constant_time_mode
 
 ```mach
-pub fun constant_time_mode(itn: *intern.Interner, c: *comptime.ComptimeCtx, a: *ast.Ast, source: str, d: *ast_decl.Decl) opt[str];
+pub fun constant_time_mode(itn: *intern.Interner, c: *comptime.ComptimeCtx, a: *ast.Ast, d: *ast_decl.Decl) opt[str];
 ```
 
 the constant-time mode `d` declares, "soft" or "hard", none when it declares none. every

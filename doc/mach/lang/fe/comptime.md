@@ -307,13 +307,13 @@ fwd comptime_value.ct_type
 
 forwards [`mach.lang.fe.comptime.value.ct_type`](comptime/value.md#fun-ct_type)
 
-## fwd comptime_value.ct_u8
+## fwd comptime_value.ct_u1
 
 ```mach
-fwd comptime_value.ct_u8
+fwd comptime_value.ct_u1
 ```
 
-forwards [`mach.lang.fe.comptime.value.ct_u8`](comptime/value.md#fun-ct_u8)
+forwards [`mach.lang.fe.comptime.value.ct_u1`](comptime/value.md#fun-ct_u1)
 
 ## fwd comptime_value.ct_uint
 
