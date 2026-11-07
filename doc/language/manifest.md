@@ -940,9 +940,14 @@ runner = ["wasmtime", "{artifact.out}"]
 - **Traps.** The runtime ends the program on a trap and mach installs no handler. An
   integer division or remainder by zero, a signed overflow of one, and an access
   outside linear memory trap, as the IR states for every target. A cast from a float
-  saturates here as on every target (see [Float to integer](operators.md#float-to-integer)).
-- **What the target lacks.** An atomic access or a fence, which only a threaded
-  module has, is refused with `target.unsupported_op`. std gates
+  to an integer saturates as on every target (see [Float to integer](operators.md#float-to-integer)),
+  but today only under `ext = ["nontrapping-fptoint"]`: without it a run-time cast is refused
+  by masc as an internal error (`instruction not admitted by the selection`) and the module
+  is not built.
+- **What the target lacks.** The module runs one thread, so std's atomic operations
+  (`std.sync.atomic`) build and are the plain access, and its barrier and spin hint do
+  nothing. mirl refuses atomic IR in a threadless module with `target.unsupported_op`,
+  which std's operations never reach. std gates
   each of its modules on the capabilities its target provides
   (`std.system.capability`), so a module that needs threads or sockets is refused
   at build with an error that names the module and the capability. A std primitive
