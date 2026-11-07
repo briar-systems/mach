@@ -27,7 +27,7 @@ The condition must be a comptime expression. Common shapes:
 
 A condition is a `u8`, and a constant it reads has the width and sign its
 declaration gives it. A constant declared through a `def`, as std's `bool` is
-`def bool: u8`, takes the integer primitive the `def` chain ends at, followed
+`def bool: u1`, takes the integer primitive the `def` chain ends at, followed
 across `use` and `fwd`, so `$if (capability.HAS_FILES)` reads a `u8`. A chain
 that ends outside the integers (a record, a pointer, a float) is refused at the
 gate with a message naming the chain. A `def` declared inside a `$if` arm is not

@@ -136,8 +136,7 @@ condition requires it. It has `&`, `|`, `^`, `==` and `<` but no arithmetic, so 
 0 or 1. `x::u1` asks whether the integer `x` is non-zero, and a float is compared
 instead. There is no `i1`.
 
-There is no compiler `bool`. `bool` is a stdlib alias, `def bool: u8;` until std is
-migrated and `def bool: u1;` after, with `true` /
+There is no compiler `bool`. `bool` is a stdlib alias, `def bool: u1;`, with `true` /
 `false` as stdlib `val`s (`1` / `0`) — see [def.md](def.md).
 
 ## SIMD vectors

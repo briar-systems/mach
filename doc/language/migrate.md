@@ -46,8 +46,7 @@ Reported, for you to change:
 | a `u1` stored in a `u8` or under arithmetic | `value::u8`, or a `u1` destination |
 | `-g`, `-O0`, `-O2`, `--emit-asm`, `--emit-ir`, `--pie`, `--simd`, `--jobs` in a script | the spelling the report names |
 
-The first two warn with `condition.u8` and `type.u1_as_u8` from the compiler while
-the family's sources move, and are refused after that.
+The compiler refuses the first two, naming the replacement.
 
 New in 7, with nothing to migrate: [`u1`](types.md), [`$zeroize`](comptime-intrinsics.md)
 and the [selection heads](asm.md) of `asm`.

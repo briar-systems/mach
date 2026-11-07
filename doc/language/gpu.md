@@ -543,7 +543,7 @@ compiler treats it:
 
 The type must be a scalar integer or float. There is no boolean specialization
 constant, because mach has no boolean type the compiler knows: `bool` is an alias
-of `u8`. Write a flag as an integer spec var, which the host sets with the same 4
+of `u1`. Write a flag as an integer spec var, which the host sets with the same 4
 bytes as a `VkBool32`:
 
 ```mach

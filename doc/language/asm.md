@@ -848,11 +848,10 @@ to be valid for the target its arm selects.
 
 ## From a previous major
 
-A v6 head names an architecture: `x86_64`, `aarch64`, `riscv64` or `riscv32`. It
-warns with `asm.head_renamed` until the family's sources are migrated, and
-[`mach migrate`](migrate.md) writes `x86-64`, `armv8-a`, `rv64i` and `rv32i`, each
-the architecture's first level, which adds nothing to a target of it. It becomes a
-refusal once they are.
+A v6 head names an architecture: `x86_64`, `aarch64`, `riscv64` or `riscv32`. It is
+refused with `asm.head`, and [`mach migrate`](migrate.md) writes `x86-64`, `armv8-a`,
+`rv64i` and `rv32i`, each the architecture's first level, which adds nothing to a
+target of it.
 
 ## When to use
 
