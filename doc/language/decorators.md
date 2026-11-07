@@ -354,11 +354,11 @@ fun backend(entry: *u8) i64 { ... }
 The replacement is an ordinary strong definition of the name: a
 `#[symbol("name")]` function, or a definition in a C or asm object the link
 takes. The name is spelled as `symbol` spells it, and it takes the target's C
-prefix the same way. A `#[weak]` definition has default visibility, whether or not
-it is `pub`, so on ELF and Mach-O a shared library exports it without `#[export]`
-and another image may replace it at load. A PE DLL still exports only what
-`#[export]` names. A COFF object states the definition as a weak external whose
-fallback is the body.
+prefix the same way. The default is replaced at link time only: a `#[weak]`
+definition is hidden from other images, whether or not it is `pub`, so a shared
+library keeps its own default unless the override is in its link. `#[export]` still
+exports it, under the rule every export follows. A COFF object states the definition
+as a weak external whose fallback is the body.
 
 The compiler does not check the pairing. It compares no signatures and matches
 no replacement to its default, so a replacement of another shape is the same
@@ -848,7 +848,7 @@ instruction's timing (SPIR-V, whose module a downstream compiler translates),
 and warned at the mark for one that cannot guarantee any instruction's timing
 (wasm, whose runtime decides the instructions that run).
 
-v6 spelled it `#[oblivious]`, which warns naming `constant_time` and its two
+v6 spelled it `#[oblivious]`, which is refused naming `constant_time` and its two
 modes (see [v6 spellings](#v6-spellings)).
 
 
@@ -1148,9 +1148,12 @@ migrate` rewrites each one.
 | `#[inline]` | `#[inline("always")]` |
 | `#[noinline]` | `#[inline("never")]` |
 | `#[scalar]` | `#[vectorize("never")]` |
-| `#[oblivious]` | `#[constant_time("soft")]` or `#[constant_time("hard")]` |
 | `#[op(tgt, set, name)]` | `#[intrinsic(tgt, set, name)]` |
 | `#[stage]` … `#[shared]` | `#[gpu.stage]` … `#[gpu.shared]` |
+
+`#[oblivious]` no longer reads as anything. It is refused with `decorator.unknown`,
+naming `#[constant_time("soft")]` and `#[constant_time("hard")]`, and `mach migrate`
+writes the first.
 
 ## See also
 
