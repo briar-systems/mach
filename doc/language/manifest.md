@@ -941,9 +941,7 @@ runner = ["wasmtime", "{artifact.out}"]
   integer division or remainder by zero, a signed overflow of one, and an access
   outside linear memory trap, as the IR states for every target. A cast from a float
   to an integer saturates as on every target (see [Float to integer](operators.md#float-to-integer)),
-  but today only under `ext = ["nontrapping-fptoint"]`: without it a run-time cast is refused
-  by masc as an internal error (`instruction not admitted by the selection`) and the module
-  is not built.
+  under `wasm1` alone and with `nontrapping-fptoint` in `ext`.
 - **What the target lacks.** The module runs one thread, so std's atomic operations
   (`std.sync.atomic`) build and are the plain access, and its barrier and spin hint do
   nothing. mirl refuses atomic IR in a threadless module with `target.unsupported_op`,
