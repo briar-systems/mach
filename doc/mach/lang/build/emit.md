@@ -62,8 +62,9 @@ pub fun binds_any(p: *project.Project, links: *input.Input, count: usize) res[bo
 ```
 
 whether any of the `count` inputs at `links` is one the image binds against when it
-loads: a library or framework named, which mink's search finds, or a file of a kind a
-link binds against. a relocatable object or an archive is linked in, not bound
+loads: a framework, a shared library named, which mink's search finds, or a file of a
+kind a link binds against. a relocatable object, an archive or a static library named
+is linked in, not bound
 
 ## fun ordered_inputs
 

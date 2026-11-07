@@ -15,6 +15,7 @@ key: the link's table key, its identity
 symbols: an owned copy of the link's `symbols`, or nil when it has none
 symbol_count: length of `symbols`
 include_referenced: copied from the link
+kind: copied from the link
 
 ## fun parse_links
 
