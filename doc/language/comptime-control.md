@@ -25,10 +25,11 @@ The condition must be a comptime expression. Common shapes:
 - Comparisons of comptime constants (`pub val` declarations)
 - Comparisons of a comptime function parameter (`$mode`) — see below
 
-A condition is a `u8`, and a constant it reads has the width and sign its
+A condition is a `u1`, and a constant it reads has the width and sign its
 declaration gives it. A constant declared through a `def`, as std's `bool` is
 `def bool: u1`, takes the integer primitive the `def` chain ends at, followed
-across `use` and `fwd`, so `$if (capability.HAS_FILES)` reads a `u8`. A chain
+across `use` and `fwd`, so `$if (capability.HAS_FILES)` reads a `u1`. Any other integer is refused
+with `gate.not_u1`. A chain
 that ends outside the integers (a record, a pointer, a float) is refused at the
 gate with a message naming the chain. A `def` declared inside a `$if` arm is not
 read this way: a declaring gate on a constant typed through one is decided once
