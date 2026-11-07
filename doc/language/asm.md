@@ -18,20 +18,30 @@ asm <selection> {
 
 - The head is mandatory. Bare `asm { ... }` does not exist.
 - **The head is a selection of masc's**, written in masc's own syntax for the
-  instruction set and handed to masc unchanged: `x86-64` or `sse41,avx2` on x86,
-  `armv8-a` or `armv8.2-a+sha2` on aarch64, `rv64i` or `rv64gc_zba` on RISC-V.
-  mach holds no table of these names, so a selection masc gains is a head with no
-  change here.
+  instruction set and handed to masc unchanged: `x86-64` or `x86-64,avx2` on x86,
+  `armv8-a` or `armv8.2-a+sha2` on aarch64, `rv64i` or `rv64gc_zba` on RISC-V,
+  `mvp` or `wasm1,simd128` on WebAssembly. mach holds no table of these names, so a
+  selection masc gains is a head with no change here.
 - **Every block that survives comptime has its head read by masc for the compile
   target**, and one masc refuses, or that names another architecture's selection,
   is refused at the head with `asm.head` and masc's message. A block in a discarded
   `$if` arm is never read, so a routine writes one block per target and `$if`
   chooses among them (see [Multi-arch dispatch](#multi-arch-dispatch)).
+- **A head widens its block.** The block is read under its function's set with what
+  the head adds, closed over its implications, so what the function admits stays
+  admitted and a row past both is refused. The widening is the block's alone. It
+  admits no row to the function around it, and it never loosens a constant-time
+  verdict: a row's timing is read under the function's set, so a head lifts no row,
+  and an extension it adds that gates timing can only refuse more.
 - **A head may add instruction extensions only.** It never sets execution state: an
   x86 width, AArch64 streaming mode, `dit`, `doitm`, a RISC-V `xlen` other than the
   target's. Those stay the function's, with `#[constant_time]` and the target, so a
   head that sets one is refused with `asm.head`, naming them. A head that repeats
   the state the target enters at, as `rv64i` does on riscv64, sets nothing.
+- **WebAssembly reads a block as masc's wasm text.** The block starts and ends on an
+  empty stack, and a `{name}` is a pointer to the local's storage, reached with
+  `local.get`: `asm mvp { local.get {old}  local.get {pages}  i32.load  memory.grow  i32.store }`.
+  mirl reads the body, so a body it refuses is refused at the build, not at the head.
 - There is no `asm ... or ...` chain. `$if` chooses the block per target.
 - **A target with no assembler takes no `asm` block.** SPIR-V declares no assembly capability, so any `asm` block compiled for it, whatever its head, is refused where it is written with `inline assembly is not available on instruction set 'spirv'`. Guard a routine shared with a shader behind `$if ($mach.build.arch != $mach.arch.spirv)`.
 - Each line is an instruction in the ISA's native syntax.
@@ -368,14 +378,14 @@ function admits it with [`#[extension(...)]`](decorators.md#extnames--an-outlier
 The refusal names the instruction, the extension, and both ways to admit it.
 
 The one invariant behind every check: **an instruction that requires extension E
-is emitted only into a function whose admitted set holds E**, where a function's
-admitted set is the target's selection plus what its `#[extension(...)]` names,
-each closed over what it implies. The encoder applies it to every row of an `asm`
-block, and the inliner applies the same predicate before moving one body into
-another, so an inlined body never carries an instruction its new home does not
-admit. A block inherits its function's set: a head that names an extension past it
-admits nothing yet, so its instruction is refused as any other is, and
-`#[extension(...)]` admits it.
+is emitted only into a function whose admitted set holds E, or into a block whose
+head adds E**, where a function's admitted set is the target's selection plus what
+its `#[extension(...)]` names, each closed over what it implies. The encoder applies
+it to every row of an `asm` block, and the inliner applies the same predicate before
+moving one body into another, so an inlined body never carries an instruction its new
+home does not admit. A block reads under its function's set with its head added, so a
+head admits an extension to that block and `#[extension(...)]` admits it to the whole
+function.
 
 | isa | extension | mnemonics |
 |---|---|---|
