@@ -378,6 +378,15 @@ pub val FORM_BARE:  Form = 2
 pub val FORM_WORDS: Form = 3
 ```
 
+## fun retired_note
+
+```mach
+pub fun retired_note(source: str, name: lang_source.Span) str;
+```
+
+the refusal of the retired decorator the name at `name` in `source` writes, nil when it
+writes none
+
 ## fun renamed
 
 ```mach
@@ -439,8 +448,8 @@ the mode `dec` states: its first argument, or the mode a previous flag stands fo
 pub fun constant_time_mode(itn: *intern.Interner, c: *comptime.ComptimeCtx, a: *ast.Ast, source: str, d: *ast_decl.Decl) opt[str];
 ```
 
-the constant-time mode `d` declares, "soft" or "hard", none when it declares none. a previous
-major's bare `#[oblivious]` is "soft". every reader of the mode asks here, so none disagree
+the constant-time mode `d` declares, "soft" or "hard", none when it declares none. every
+reader of the mode asks here, so none disagree
 
 ## fun name_of
 
