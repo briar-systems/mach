@@ -35,15 +35,6 @@ pub fun default_abi(h: *mink_os.Host) opt[str];
 the calling convention the host calls by default, none where the architecture's
 family names none or the host derives it from an ISA string
 
-## fun caps
-
-```mach
-pub fun caps(a: *A.Allocator, h: *mink_os.Host) res[mink_os.Caps, fail.Fail];
-```
-
-the capabilities the host offers an image that states no oldest system version,
-so it runs on the oldest the system states
-
 ## fun floor
 
 ```mach
