@@ -23,7 +23,8 @@ Rewritten by `mach migrate`:
 
 | 6 | 7 |
 |---|---|
-| `opt`, `vectorize`, `float_reassoc` | `optimize`, the `vectorize` pass, `relax` |
+| `opt`, `float_reassoc` | `optimize`, `relax` |
+| `vectorize = true` or `vectorize = false` in a profile | removed: `optimize` schedules the pass, and `#[vectorize("never")]` opts one function out |
 | `[project] out`, `{project.out}` | `work`, `{project.work}` |
 | `os`, `baseline`, `extensions` | `sys`, `isa`, `ext` |
 | link `os`, `isa` | link `sys`, `arch` |

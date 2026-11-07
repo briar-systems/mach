@@ -696,6 +696,15 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
+### Function pointers on WebAssembly
+
+A wasm module has no code addresses, so a function's address is its slot in the
+module's indirect call table, and a call through a `fun(...)` value is a call
+through that slot. Slots start at 1, one for each function whose address the program
+takes. Two function values are equal when they name the same slot, and they order
+as the unsigned slot numbers, which carry no meaning beyond that. An address of a function at an offset
+has no slot and is refused.
+
 ## Record and union types
 
 `rec` and `uni` declarations produce named types. See [rec.md](rec.md) and

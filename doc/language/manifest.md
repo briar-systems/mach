@@ -279,7 +279,7 @@ to whichever *declared* target matches the host.
 | `os`, `baseline`, `extensions` | removed | v6's names of `sys`, `isa` and `ext`, refused with the rename `mach migrate` writes. |
 | `ext` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the architecture's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
 | `runner` | absent: the host runs its own programs, and no other target's | Array of argv templates the target's programs are launched through by `mach run` and `mach test`, whether or not the target is the host. See [Execution command](#execution-command). |
-| `env` | absent: none | The environment the target's system runs it under (string), such as `macos` on `darwin`, `msvc` on `windows` or `vulkan1.2` on `vulkan`. Any target may state it. The values are the system's, owned by mink's host rows and mirl's target record, and an `env` the system does not list is a manifest error. It is required where the system has no host without an environment, as on `darwin` and `windows`. An architecture that defines its own environments, today only `spirv`, also checks the value against them; see [Finished-module targets](#finished-module-targets). |
+| `env` | absent: none | The environment the target's system runs it under (string), such as `macos` on `darwin`, `msvc` on `windows`, `vulkan1.2` on `vulkan` or `preview1` on `wasi`. Any target may state it. The values are the system's, owned by mink's host rows and mirl's target record, and an `env` the system does not list is a manifest error. It is required where the system has no host without an environment, as on `darwin`, `windows` and `wasi`. An architecture that defines its own environments, today only `spirv`, also checks the value against them; see [Finished-module targets](#finished-module-targets). |
 
 ### Execution command
 
@@ -343,6 +343,7 @@ comptime member, `$mach.build.ext.<name>` (see [`$mach`](comptime-mach.md)):
 | `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul` |
 | `aarch64` | the target's `isa` | `FEAT_SHA1`, `FEAT_SB`, `FEAT_AES`, `FEAT_PMULL`, `FEAT_FP16` |
 | `riscv64`, `riscv32` | the target's `isa` | `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zfhmin`, `zfh`, `zkt` |
+| `wasm32` | `wasm1` | masc's wasm features, such as `simd128` and `multivalue` |
 | `spirv` | | `float16`, `int8`, `int16`, `int64`, `float64`, `zero_init_workgroup`, `storage_read_without_format`, `storage_write_without_format`, `vulkan_memory_model`, `vulkan_memory_model_device_scope`, `buffer_device_address`, `subgroup_arithmetic`, `subgroup_clustered`, `subgroup_vote`, `subgroup_ballot`, `subgroup_shuffle`, `subgroup_shuffle_relative`, `subgroup_quad`, `subgroup_graphics_stages`, `buffer_int64_atomics`, `shared_int64_atomics`, `buffer_float32_atomics`, `buffer_float32_atomic_add`, `buffer_float32_atomic_min_max`, `buffer_float64_atomics`, `buffer_float64_atomic_add`, `buffer_float64_atomic_min_max`, `shared_float32_atomics`, `shared_float32_atomic_add`, `shared_float32_atomic_min_max`, `shared_float64_atomics`, `shared_float64_atomic_add`, `shared_float64_atomic_min_max`, `buffer_float16_atomics`, `buffer_float16_atomic_add`, `buffer_float16_atomic_min_max`, `shared_float16_atomics`, `shared_float16_atomic_add`, `shared_float16_atomic_min_max`, `image_int64_atomics`, `image_float32_atomics`, `image_float32_atomic_add`, `image_float32_atomic_min_max`, `storage_image_multisample`, `resource_min_lod`, `image_gather_extended`, `maintenance8`, `storage_buffer_16bit_access`, `uniform_and_storage_buffer_16bit_access`, `storage_push_constant16`, `storage_input_output16`, `storage_buffer_8bit_access`, `uniform_and_storage_buffer_8bit_access`, `storage_push_constant8` |
 
 On `spirv` each name is a device feature a module may require.
@@ -571,7 +572,7 @@ naming the new spelling and carrying the rewrite `mach migrate` applies:
 error[target.retired_spelling]: mach.toml: [target.metal].of = "raw" is a retired spelling; write "flat", mink's name for it
 ```
 
-`env` is defined only by `spirv`.
+`vulkan1.0` through `vulkan1.3` are `vulkan`'s environments and `preview1` is `wasi`'s.
 
 A `[target.*]` naming an `arch`, `sys` or `abi` outside these lists is refused
 through the registry's own lookup (`no arch implementation registered for
@@ -587,7 +588,8 @@ bare-metal platform such as BareMetal (`bmos`) is a `freestanding` target plus a
 `platform` tag and `base` override (see [Platform targets](#platform-targets-bare-metal)),
 not an os of its own. `spirv` is not a machine at all — it
 emits a finished GPU module rather than machine code (see
-[Finished-module targets](#finished-module-targets)).
+[Finished-module targets](#finished-module-targets)). `wasi` builds a WebAssembly
+module that a host runtime instantiates (see [WebAssembly targets](#webassembly-targets)).
 
 ### RISC-V baselines
 
@@ -900,6 +902,59 @@ The artifact's `out` template and `-o` name that delivered module, so
 consumer that embeds it (see [Artifact requirements](#artifact-requirements)). A
 `static` or `shared` artifact kind, and `mach test`, are refused by name, since
 there is no archive, shared object, or executable form for a module.
+
+### WebAssembly targets
+
+A `wasi` target builds a wasm32 module that a host runtime instantiates, so its
+programs run under a command the manifest declares as the target's `runner`, since
+a wasm module is not a program the host runs itself. mach knows no runtime by name. The one `sys` is
+`wasi` under the one environment, `preview1`: the module imports its system
+interface from `wasi_snapshot_preview1`, starts at `_start`, and runs one thread.
+
+```toml
+[target.wasi-wasm32]
+arch   = "wasm32"
+sys    = "wasi"
+env    = "preview1"
+abi    = "basic"
+runner = ["wasmtime", "{artifact.out}"]
+```
+
+- **The tuple.** `env` is required (see [`[target.<name>]`](#targetname)). `abi =
+  "basic"` is the basic C ABI of the WebAssembly tool conventions, and the format is
+  `wasm`. Name `isa` and `ext` as on any target: with no `isa` the target stands on
+  `wasm1`, WebAssembly's core 1.0, and `ext` adds features from masc's wasm set (see
+  [Instruction-set extensions](#instruction-set-extensions)).
+- **Artifacts.** A `bin` artifact is a `.wasm` module and a `static` one a `.a`
+  archive of objects whose relocation records mink links. The module has no loader
+  to map it, so it is never position-independent and no `shared` artifact exists:
+  a `shared` artifact is refused with mink's reason, naming the system.
+- **No linker-side image options.** A wasm module has no PE subsystem, so
+  `subsystem` and `--subsystem` are refused as on any format without one. Its data
+  starts at the first page of linear memory past the stack, which grows down, so a
+  stack overflow traps below the data instead of corrupting it.
+- **Inline assembly** reads masc's wasm text under a `mvp` or `wasm1` head, as
+  [asm.md](asm.md) states.
+- **Function pointers** are table indices, as
+  [types.md](types.md#function-pointers-on-webassembly) states.
+- **Traps.** The runtime ends the program on a trap and mach installs no handler. An
+  integer division or remainder by zero, a signed overflow of one, and an access
+  outside linear memory trap, as the IR states for every target. A cast from a float
+  to an integer saturates as on every target (see [Float to integer](operators.md#float-to-integer)),
+  but today only under `ext = ["nontrapping-fptoint"]`: without it a run-time cast is refused
+  by masc as an internal error (`instruction not admitted by the selection`) and the module
+  is not built.
+- **What the target lacks.** The module runs one thread, so std's atomic operations
+  (`std.sync.atomic`) build and are the plain access, and its barrier and spin hint do
+  nothing. mirl refuses atomic IR in a threadless module with `target.unsupported_op`,
+  which std's operations never reach. std gates
+  each of its modules on the capabilities its target provides
+  (`std.system.capability`), so a module that needs threads or sockets is refused
+  at build with an error that names the module and the capability. A std primitive
+  the preview can compile but not do, such as spawning a process, returns
+  `ENOTSUP`, which std reports as its unsupported error kind. std's manifest declares
+  no `[link.*]` entry for the system interface, since the environment names the
+  module every import resolves from.
 
 ### Platform targets (bare metal)
 
@@ -1357,6 +1412,7 @@ inspection use the same expansion.
 | COFF/PE on Windows | `.exe` | `.lib` | `.dll` (not written) |
 | Raw image | empty | unsupported | unsupported |
 | SPIR-V module | `.spv` | unsupported | unsupported |
+| wasm module on wasi | `.wasm` | `.a` | refused |
 
 The selected object format supplies the naming rules, including explicit target
 format overrides. Unsupported library forms are errors. A SPIR-V `bin` artifact is
@@ -1395,7 +1451,7 @@ v6 spelled the graphical subsystem `"gui"`. v7 refuses it, naming `"windows"`,
 and `mach migrate` rewrites `subsystem = "gui"` to `subsystem = "windows"`.
 
 Only a PE image carries the field. A key written on an artifact that builds
-for a target whose format has none (ELF, Mach-O, a flat image) is refused as
+for a target whose format has none (ELF, Mach-O, a flat image, a wasm module) is refused as
 unsupported, naming the key, the target and the format:
 
 ```
