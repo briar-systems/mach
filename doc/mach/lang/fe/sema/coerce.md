@@ -94,11 +94,3 @@ ty: its final type; anything but a float type is left alone
 pub fun is_assignable(sc: *sema_context.SemaContext, from: type.TypeId, to: type.TypeId) bool;
 ```
 
-## fun widens_u1
-
-```mach
-pub fun widens_u1(sc: *sema_context.SemaContext, from: type.TypeId, to: type.TypeId) bool;
-```
-
-a u1 where a u8 is expected, which a previous major's truth value was, the same byte
-

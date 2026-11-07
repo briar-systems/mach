@@ -1,12 +1,9 @@
 # mach.lang.fe.transition
 
-the forms of the previous major this one still reads, until the family's sources are
-migrated
+the forms of the previous major and the tables that carry a project across them
 
-std and the libraries on it are spelled for 6.x and the seed compiles them, so this
-compiler reads both spellings: each form below is a warning, and the form this major
-spells works beside it. a row's `refused` is the whole of the flip once the seed rolls:
-set it and the form is refused at the same places, naming the same replacement
+each form is refused, its diagnostic naming what this major spells. the head, option
+and alias tables are what `mach migrate` rewrites with, and the next major deletes them
 
 ## def Form
 
@@ -20,7 +17,7 @@ pub def Form: u8
 pub val CONDITION_U8: Form = 0
 ```
 
-a condition, or an operand of `!`, `&&` or `||`, of type u8
+a condition of type u8
 
 ## val U1_AS_U8
 
@@ -28,31 +25,15 @@ a condition, or an operand of `!`, `&&` or `||`, of type u8
 pub val U1_AS_U8: Form = 1
 ```
 
-a u1 value read as a u8: stored in one, mixed with one, or under arithmetic
-
-## val U8_CONSTANT
-
-```mach
-pub val U8_CONSTANT: Form = 2
-```
-
-a u8 constant holding 0 or 1 where a u1 is expected, as std's `true` and `false`
+a u1 under arithmetic, a shift, or a bitwise operator beside a wider operand
 
 ## val ASM_HEAD
 
 ```mach
-pub val ASM_HEAD: Form = 3
+pub val ASM_HEAD: Form = 2
 ```
 
 an `asm` block headed by a previous major's identifier
-
-## val U1_IN_PACK
-
-```mach
-pub val U1_IN_PACK: Form = 4
-```
-
-a u1 handed to a pack, whose instance a 6.x std renders and walks as a u8
 
 ## rec Row
 
@@ -62,14 +43,7 @@ pub rec Row;
 
 one form
 
-form: the form
-warning: the kind it is warned with while it is read
-refusal: the kind it is refused with once the row is `refused`
-refused: the form is refused, the flip
-warned: it warns at all. a form every std `bool` reaches states nothing a project can
-         act on until std is migrated
-every: it warns at each place, not once per module. a form as common as `bool` is
-         warned once in each module of the root project
+refusal: the kind it is refused with
 message: what the diagnostic says
 note: the replacement it names
 

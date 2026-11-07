@@ -1248,9 +1248,6 @@ any of them (see [test.md](test.md#which-tests-run)).
     [`#[export]`](decorators.md#export--a-shared-librarys-export), in any project
     of the build, each under its symbol name. `pub` alone exports nothing, and
     `#[symbol("name")]` sets the name an export carries without exporting it.
-    Where exports follow visibility, as on ELF and Mach-O, a
-    [`#[weak]`](decorators.md#weakstr--a-definition-as-a-link-time-default)
-    definition is exported as well, so another image may replace it.
   - **Internals.** Every other definition still links inside the library but is
     seen from no other image.
   - **Code model.** The library is built under mirl's `pic` code model unless its

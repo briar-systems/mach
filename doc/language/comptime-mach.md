@@ -96,7 +96,7 @@ $or {
   processor has it, which the query does not count on (see
   [secrecy.md](secrecy.md#soft-and-hard)). Every other target folds to 0. Lane
   multiplies are not part of the query.
-- The result is a `u8`, like `$mach.build.pie`. An unknown `op` or `width`, a
+- The result is a `u1`, like `$mach.build.pie`. An unknown `op` or `width`, a
   missing argument, or arguments on any other path is a compile error that names
   what is accepted.
 

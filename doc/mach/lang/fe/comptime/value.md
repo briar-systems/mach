@@ -285,10 +285,10 @@ pub fun float_value(f: f64, w: float.FloatWidth) res[CTValue, comptime_failure.E
 pub fun ct_float(f: f64, w: float.FloatWidth) CTValue;
 ```
 
-## fun u8_value
+## fun u1_value
 
 ```mach
-pub fun u8_value(n: u8) res[CTValue, comptime_failure.EvalFail];
+pub fun u1_value(held: bool) res[CTValue, comptime_failure.EvalFail];
 ```
 
 ## fun str_value
@@ -348,28 +348,24 @@ pub fun node_ref(module: u32, node: u32, ty: u32) CTValue;
 pub fun ct_str(s: intern.StrId) CTValue;
 ```
 
-## fun ct_u8
+## fun ct_u1
 
 ```mach
-pub fun ct_u8(n: u8) CTValue;
+pub fun ct_u1(held: bool) CTValue;
 ```
 
-## fun is_u8
+the truth value `held`, a u1: a comparison's answer, and the type a condition requires
+
+## fun is_u1
 
 ```mach
-pub fun is_u8(v: CTValue) bool;
+pub fun is_u1(v: CTValue) bool;
 ```
 
 ## fun truth
 
 ```mach
 pub fun truth(v: CTValue) bool;
-```
-
-## fun if_u8
-
-```mach
-pub fun if_u8(v: bool) u8;
 ```
 
 ## fun ct_type

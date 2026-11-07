@@ -197,7 +197,6 @@ pub rec Decorator;
 
 `#[name(args)]`; `id` is the decorator registry's id the name spells, decoded
 once by the parser, and 0 when it spells none
-form: how it is written, a `decorator.Form`: this major's spelling or a previous one's
 
 ## rec Decl
 

@@ -9,7 +9,7 @@ environments are described in [manifest.md](manifest.md#finished-module-targets)
 
 The GPU set is dotted, `#[gpu.stage]`, `#[gpu.input]` and the rest, since its
 generic words apply only to shader stages. v6 spelled each without the prefix,
-and `intrinsic` as `op`. Each v6 spelling warns, naming its replacement.
+and `intrinsic` as `op`. Each v6 spelling is refused, naming its replacement.
 
 ## `gpu.stage(str)` — GPU pipeline stage
 
@@ -543,7 +543,7 @@ compiler treats it:
 
 The type must be a scalar integer or float. There is no boolean specialization
 constant, because mach has no boolean type the compiler knows: `bool` is an alias
-of `u8`. Write a flag as an integer spec var, which the host sets with the same 4
+of `u1`. Write a flag as an integer spec var, which the host sets with the same 4
 bytes as a `VkBool32`:
 
 ```mach
