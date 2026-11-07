@@ -1473,6 +1473,7 @@ the same entries, so nothing behaves differently as a dependency.
 | `abi`     | yes | Filter axis over `abi`, same forms. |
 | `export`  | absent: not exported | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
 | `include` | absent: `"always"` | `"always"` names the dynamic library in the linked image whether or not anything imports from it; `"referenced"` names it only when a live import references it, so an unused provider leaves no load command behind. Any other value is a manifest error (`[link.k].include must be "always" or "referenced"`). |
+| `kind`    | absent: `"shared"` | What a `source = "system"` library named by a bare name must be: `"shared"` or `"static"`, with no fallback in either direction (see below). Any other value is a manifest error (`[link.k].kind must be "shared" or "static"`). Refused on any other source, and on a `name` that names a file, whose contents state its kind. |
 | `library` | removed | Refused as a removed key. The table key is the library's identity, and `#[library]` names the entry by that key. |
 | `os`, `isa` | removed | v6's names of `sys` and `arch`, refused with the rename `mach migrate` writes. |
 
@@ -1557,12 +1558,38 @@ On ELF the key is accepted and validated but changes no emitted bytes, since tha
 loader resolves imports by global search.
 
 A `system` or `framework` entry is found by name through mink's library search
-as the link runs, the archive first, in each `-L` directory, then the working
-directory, then the system's directories the target's host row states. A `local`
-entry names its file. Whether an input links **statically** or **dynamically**
-follows the file found — a loose `.o`/`.obj` or static `.a`/`.lib` links
-statically, and an ELF `.so`, Mach-O `.dylib` or PE `.dll` is recorded by its
-format's canonical loader name. See
+as the link runs, in each `-L` directory, then the working directory, then the
+system's directories the target's host row states. A `local` entry names its
+file. Whether an input links **statically** or **dynamically** follows the file
+found — a loose `.o`/`.obj` or static `.a`/`.lib` links statically, and an ELF
+`.so`, Mach-O `.dylib` or PE `.dll` is recorded by its format's canonical loader
+name.
+
+A `system` entry whose `name` is a bare library name is looked for as one kind
+alone, `kind = "shared"` unless the entry says `kind = "static"`. There is no
+fallback in either direction: a file of the other kind is skipped and the search
+goes on, and a search that takes nothing is refused, naming the library looked
+for, the kind asked for, and any file of the other kind it passed over. The kind
+is read from what a file holds, never from its suffix. A linker script is shared
+when any file it names is shared, and static when it names only static files. A
+Windows `.lib` that holds any import member counts as shared, so a mixed `.lib`,
+holding both objects and import members, answers `kind = "shared"` and is refused
+for `kind = "static"`.
+
+`kind = "shared"` needs an image that imports, so a target that builds no such
+executable refuses it at once. An executable whose inputs are all linked in,
+`kind = "static"` entries included, is linked as one that imports nothing. A
+static library that needs a shared one its build also names may still fail to
+link: `libm.a` beside a shared `libc` is refused by the link, so name both of the
+same kind.
+
+A `name` that names a file, such as `kernel32.dll` or
+`/usr/lib/libSystem.B.dylib`, is taken as written and does not take the key:
+stating `kind` on it is refused, as is stating it on a `framework` or `local`
+entry. Two entries naming one library as different kinds are refused, as is a
+`-l` of a library an entry names `kind = "static"`.
+
+See
 [ext-fun.md](ext-fun.md#linking-external-objects) for the `ext fun` workflow
 that consumes these inputs.
 

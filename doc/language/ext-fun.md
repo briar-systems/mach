@@ -536,7 +536,7 @@ mach build . path/to/libfoo.so
 mach build . path/to/libfoo.dylib
 mach build . foo.dll
 
-# search dir + library name, found by mink: the archive first, then the shared spelling
+# search dir + library name, found by mink as a shared library
 mach build . -L build/libs -l foo
 
 # link against a system shared library (libc) dynamically
@@ -550,16 +550,20 @@ mach build . -l c
 - `-l <name>` is handed to mink's library search, which finds it as the link
   runs. The directories are each `-L <dir>` in order, then the working
   directory, then the system's library directories the target's host row in
-  mink's catalog states. Each directory is tried for the archive spellings
-  first and the shared ones after (`lib<name>.a`, then `lib<name>.so` for ELF,
-  as mink's naming rows spell them), so a static library wins where both
-  exist. mach keeps no search of its own. `-L` and `-l` may each be repeated.
+  mink's catalog states. A `-l` name is a shared library and nothing else: a
+  static library is skipped, and a search that finds no shared library is
+  refused. Link a static library by its path, or by a `[link.X]` entry with
+  `kind = "static"`. mach keeps no search of its own. `-L` and `-l` may each be
+  repeated.
 
 ### Manifest
 
 Artifacts name typed `[link.X]` requirements. Use `system` for a named library,
 `framework` for a Darwin framework, or `local` for an object/archive/shared
-library path. Filters select the applicable target:
+library path. A `system` entry naming a library by a bare name is shared unless
+it says `kind = "static"`, with no fallback in either direction (see
+[manifest.md](manifest.md#linkname--link-requirements)). Filters select the
+applicable target:
 
 ```toml
 [link.foo-unix]

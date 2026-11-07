@@ -244,6 +244,8 @@ abi: the `abi` filter axis, as `sys`
 abi_count: length of `abi`
 export: the `export` key; false when absent
 include_referenced: the `include` key: false for "always" (the default), true for "referenced"
+kind: the `kind` key, written only on a system source that names a library
+                    by a bare name; SHARED when absent
 at: where the table's key is written
 path_at: where the `path` value is written, the zero place when absent
 
