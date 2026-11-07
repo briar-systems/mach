@@ -9,7 +9,7 @@ environments are described in [manifest.md](manifest.md#finished-module-targets)
 
 The GPU set is dotted, `#[gpu.stage]`, `#[gpu.input]` and the rest, since its
 generic words apply only to shader stages. v6 spelled each without the prefix,
-and `intrinsic` as `op`. Each v6 spelling warns, naming its replacement.
+and `intrinsic` as `op`. Each v6 spelling is refused, naming its replacement.
 
 ## `gpu.stage(str)` — GPU pipeline stage
 

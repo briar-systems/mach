@@ -472,7 +472,7 @@ caller's instruction cache, or to hold code size down on a constrained target.
   identically when a callee body is available from another module. Recursive
   peeling also respects `inline("never")` and `vectorize("never")`.
 - v6's bare `#[inline]` is `#[inline("always")]`, and its `#[noinline]` is
-  `#[inline("never")]`. Each v6 spelling warns, naming its replacement (see
+  `#[inline("never")]`. Each v6 spelling is refused, naming its replacement (see
   [v6 spellings](#v6-spellings)).
 
 ### `align(expr)` — alignment override
@@ -857,7 +857,7 @@ modes (see [v6 spellings](#v6-spellings)).
 Excludes a function from loop auto-vectorization, so its loops compile to scalar
 code even in the release pipeline on a vector-capable target. Applies to
 functions only, and takes one mode, `"never"`. v6 spelled it `#[scalar]`, which
-warns naming its replacement.
+is refused naming its replacement.
 
 ```mach fragment
 #[vectorize("never")]
@@ -932,7 +932,7 @@ for by writing assembly.
 Lets one function use instruction-set extensions the target does not select.
 Applies to a function with a body, once, and takes one or more extension names,
 each a string. v6 wrote `#[ext(sha)]` and `#[extensions(sha)]` with bare names,
-which warn naming `#[extension("sha")]`. The manifest's `ext` key and
+which are refused naming `#[extension("sha")]`. The manifest's `ext` key and
 `$mach.build.ext` keep their names.
 
 ```mach fragment
@@ -1066,7 +1066,7 @@ interface and specialization constants. They, with the handle types a target
 mints (`handle`) and the functions that are target instructions (`intrinsic`),
 are described in [gpu.md](gpu.md). v6 spelled the GPU set without its prefix
 (`#[stage]`, `#[input]` and the rest) and the instruction decorator `#[op]`. Each
-warns naming its replacement, which takes the same arguments.
+is refused naming its replacement, which takes the same arguments.
 
 ### `abi_type(name)` — a C type whose layout the target declares
 
@@ -1137,10 +1137,9 @@ is refused with `decorator.unknown`, and the refusal lists every decorator.
 
 ### v6 spellings
 
-A v6 spelling still reads as the decorator it names, with its v6 arguments, and
-each use warns with `decorator.renamed`, naming the v7 spelling. It becomes a
-refusal once std and the family's sources use the v7 spellings, and `mach
-migrate` rewrites each one.
+A v6 spelling is refused with `decorator.unknown`, naming the v7 spelling, and
+`mach migrate` rewrites each one. A bare `#[inline]` is refused with
+`decorator.arity`, for the same reason.
 
 | v6 | v7 |
 |---|---|
@@ -1148,12 +1147,9 @@ migrate` rewrites each one.
 | `#[inline]` | `#[inline("always")]` |
 | `#[noinline]` | `#[inline("never")]` |
 | `#[scalar]` | `#[vectorize("never")]` |
+| `#[oblivious]` | `#[constant_time("soft")]` or `#[constant_time("hard")]`, and `mach migrate` writes the first |
 | `#[op(tgt, set, name)]` | `#[intrinsic(tgt, set, name)]` |
 | `#[stage]` … `#[shared]` | `#[gpu.stage]` … `#[gpu.shared]` |
-
-`#[oblivious]` no longer reads as anything. It is refused with `decorator.unknown`,
-naming `#[constant_time("soft")]` and `#[constant_time("hard")]`, and `mach migrate`
-writes the first.
 
 ## See also
 
