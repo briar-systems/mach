@@ -14,7 +14,7 @@ quiet: `--quiet`
 selectors: the `-a`, `-t` and `-p` patterns and `--all`
 overrides: everything else the command sets, typed
 settings: every `--set`, in argv order
-emits: the EMIT_KIND_* bits `-e` names, 0 when it is absent
+emits: the EMIT_KIND_* bits `--emit` names, 0 when it is absent
 entry: what the command line states of an entry build
 
 ## rec EntryArgs
@@ -27,8 +27,8 @@ what an entry build's command line states: its entry, source roots, artifact kin
 narrowing and the levers its profile takes
 
 file: the entry operand, nil for a project build
-sources: every `-s` value, `name=dir` as written
-kind: the `-k` value, nil when absent
+sources: every `--source` value, `name=dir` as written
+kind: the `--kind` value, nil when absent
 target: the `-t` value, the target as `<sys>-<arch>`, nil when absent
 narrowing: the narrowing flags, each as written
 exts: every `--ext` value, in argv order
@@ -81,23 +81,39 @@ the linked artifact
 ## val EMIT_ERROR
 
 ```mach
-pub val EMIT_ERROR: str = "-e expects asm, ir, obj or exe"
+pub val EMIT_ERROR: str = "--emit expects asm, ir, obj or exe"
 ```
 
-the refusal of an `-e` value no product is named by
+the refusal of an `--emit` value no product is named by
+
+## val ARTIFACT
+
+```mach
+pub val ARTIFACT: std_args.Flag = std_args.Flag;
+```
+
+`--artifact <pattern>`, `-a`, a selector
 
 ## val TARGET
 
 ```mach
-pub val TARGET: std_args.FlagSpec = std_args.FlagSpec;
+pub val TARGET: std_args.Flag = std_args.Flag;
 ```
 
-`--target <pattern>`, a selector
+`--target <pattern>`, `-t`, a selector, or an entry build's target
+
+## val PROFILE
+
+```mach
+pub val PROFILE: std_args.Flag = std_args.Flag;
+```
+
+`--profile <pattern>`, `-p`, a selector
 
 ## val ALL
 
 ```mach
-pub val ALL: std_args.FlagSpec = std_args.FlagSpec;
+pub val ALL: std_args.Flag = std_args.Flag;
 ```
 
 `--all`, which fills every selector not given with `*`
@@ -105,123 +121,65 @@ pub val ALL: std_args.FlagSpec = std_args.FlagSpec;
 ## val OUTPUT
 
 ```mach
-pub val OUTPUT: std_args.FlagSpec = std_args.FlagSpec;
+pub val OUTPUT: std_args.Flag = std_args.Flag;
 ```
 
 `-o <path>`, the linked-binary path
 
-## val SEL_N
+## val VERBOSE
 
 ```mach
-pub val SEL_N: usize = 8
+pub val VERBOSE: std_args.Flag = std_args.Flag;
 ```
 
-row count of SEL
-
-## val SEL
-
-```mach
-pub val SEL: [SEL_N]*std_args.FlagSpec = [SEL_N]*std_args.FlagSpec;
-```
-
-the selection options, consumed by build, check, run, test and doc. each
-selector takes an exact name or a glob and repeats. check hides `-o`, run
-hides `--all`, and doc accepts only `--artifact` and `--target`
-
-## val VERBOSITY_N
-
-```mach
-pub val VERBOSITY_N: usize = 1
-```
-
-row count of VERBOSITY
-
-## val VERBOSITY
-
-```mach
-pub val VERBOSITY: [VERBOSITY_N]*std_args.FlagSpec = [VERBOSITY_N]*std_args.FlagSpec;
-```
-
-the readout levels `-v` and `-vv`, consumed by build, check and test
+`-v`, once for each build phase's row and twice, as `-vv`, for each module or file as well; what
+each readout level shows is the readout contract, doc/language/readout.md
 
 ## val QUIET
 
 ```mach
-pub val QUIET: std_args.FlagSpec = std_args.FlagSpec;
+pub val QUIET: std_args.Flag = std_args.Flag;
 ```
 
-`--quiet`
+`--quiet`, `-q`
 
-## val QUIETNESS_N
+## val SET
 
 ```mach
-pub val QUIETNESS_N: usize = 2
+pub val SET: std_args.Flag = std_args.Flag;
 ```
 
-row count of QUIETNESS
+`--set <key=value>`, a manifest key over every table of its section
 
-## val QUIETNESS
+## val VERIFY
 
 ```mach
-pub val QUIETNESS: [QUIETNESS_N]*std_args.FlagSpec = [QUIETNESS_N]*std_args.FlagSpec;
+pub val VERIFY: std_args.Flag = std_args.Flag;
 ```
 
-`--quiet` and `-q`, consumed by build, check, test, doc, init and every dep action
-
-## val CGEN_N
-
-```mach
-pub val CGEN_N: usize = 2
-```
-
-row count of CGEN
-
-## val CGEN
-
-```mach
-pub val CGEN: [CGEN_N]*std_args.FlagSpec = [CGEN_N]*std_args.FlagSpec;
-```
-
-the codegen options, consumed by build and test and refused by run
+`--verify`, mach's and mirl's verifiers over every lowered module
 
 ## val OPTIMIZE
 
 ```mach
-pub val OPTIMIZE: std_args.FlagSpec = std_args.FlagSpec;
+pub val OPTIMIZE: std_args.Flag = std_args.Flag;
 ```
 
-`--optimize`, the profile's `optimize = true` for this invocation, and `--no-optimize`, its
-`optimize = false`
+`--optimize`, `-O`, the profile's `optimize = true` for this invocation, and `--no-optimize`,
+its `optimize = false`
 
 ## val DEBUG
 
 ```mach
-pub val DEBUG: std_args.FlagSpec = std_args.FlagSpec;
+pub val DEBUG: std_args.Flag = std_args.Flag;
 ```
 
 `--debug`, the profile's `debug = true` for this invocation, and `--no-debug`, its `debug = false`
 
-## val LEVERS_N
-
-```mach
-pub val LEVERS_N: usize = 4
-```
-
-row count of LEVERS
-
-## val LEVERS
-
-```mach
-pub val LEVERS: [LEVERS_N]*std_args.FlagSpec = [LEVERS_N]*std_args.FlagSpec;
-```
-
-the profile levers, each over the selected profile for this invocation only,
-consumed by build and test
-
 ## val SOURCE
 
 ```mach
-pub val SOURCE: std_args.FlagSpec = std_args.FlagSpec;
+pub val SOURCE: std_args.Flag = std_args.Flag;
 ```
 
 `--source <name=dir>`, a source root of an entry build
@@ -229,64 +187,180 @@ pub val SOURCE: std_args.FlagSpec = std_args.FlagSpec;
 ## val KIND
 
 ```mach
-pub val KIND: std_args.FlagSpec = std_args.FlagSpec;
+pub val KIND: std_args.Flag = std_args.Flag;
 ```
 
 `--kind <kind>`, the kind of an entry build's artifact
 
-## val ENTRY_N
+## val ENV
 
 ```mach
-pub val ENTRY_N: usize = 4
+pub val ENV: std_args.Flag = std_args.Flag;
 ```
 
-row count of ENTRY
+`--env <name>`
 
-## val ENTRY
+## val ABI
 
 ```mach
-pub val ENTRY: [ENTRY_N]*std_args.FlagSpec = [ENTRY_N]*std_args.FlagSpec;
+pub val ABI: std_args.Flag = std_args.Flag;
 ```
 
-the source roots and kind of an entry build, consumed by build
+`--abi <name>`
 
-## val NARROWING_N
+## val ISA
 
 ```mach
-pub val NARROWING_N: usize = 5
+pub val ISA: std_args.Flag = std_args.Flag;
 ```
 
-row count of NARROWING
+`--isa <selection>`
 
-## val NARROWING
+## val EXT
 
 ```mach
-pub val NARROWING: [NARROWING_N]*std_args.FlagSpec = [NARROWING_N]*std_args.FlagSpec;
+pub val EXT: std_args.Flag = std_args.Flag;
 ```
 
-the flags that narrow an entry build's `-t <sys>-<arch>`, consumed by build; each value left
-out is the target's own, as mink's catalog states it
+`--ext <name>`
 
-## val WORKDIR_N
+## val CODE_MODEL
 
 ```mach
-pub val WORKDIR_N: usize = 1
+pub val CODE_MODEL: std_args.Flag = std_args.Flag;
 ```
 
-row count of WORKDIR
+`--code-model <name>`
 
-## val WORKDIR
+## val WORK
 
 ```mach
-pub val WORKDIR: [WORKDIR_N]*std_args.FlagSpec = [WORKDIR_N]*std_args.FlagSpec;
+pub val WORK: std_args.Flag = std_args.Flag;
 ```
 
-`-w`, consumed by build and test
+`-w <path>`, the work directory
+
+## val EMIT
+
+```mach
+pub val EMIT: std_args.Flag = std_args.Flag;
+```
+
+`--emit <kind>`, once per product
+
+## val THREADS
+
+```mach
+pub val THREADS: std_args.Flag = std_args.Flag;
+```
+
+`--threads <n>`
+
+## val LIB_DIR
+
+```mach
+pub val LIB_DIR: std_args.Flag = std_args.Flag;
+```
+
+`-L <dir>`
+
+## val LIB
+
+```mach
+pub val LIB: std_args.Flag = std_args.Flag;
+```
+
+`-l <name>`
+
+## val NO_CACHE
+
+```mach
+pub val NO_CACHE: std_args.Flag = std_args.Flag;
+```
+
+`--no-cache`. a build reads `obj/` as the object cache by default: a module whose object there
+carries the build's key is reused instead of lowered and generated
+
+## val DIAGNOSTICS
+
+```mach
+pub val DIAGNOSTICS: std_args.Flag = std_args.Flag;
+```
+
+`--diagnostics <human|json>`: how diagnostics, failures and a test run's results reach stderr
+
+## val PLAN
+
+```mach
+pub val PLAN: std_args.Flag = std_args.Flag;
+```
+
+`--plan`
+
+## val HELP
+
+```mach
+pub val HELP: std_args.Flag = std_args.Flag;
+```
+
+`--help`, `-h`: the invocation asks for its command's page instead of running it, which takes
+precedence over every refusal but an unknown command
+
+## val VERSION
+
+```mach
+pub val VERSION: std_args.Flag = std_args.Flag;
+```
+
+`--version`, the compiler's version alone on one line
+
+## val RUNNER
+
+```mach
+pub val RUNNER: std_args.Flag = std_args.Flag;
+```
+
+`--runner <cmd>`
+
+## val TIMEOUT
+
+```mach
+pub val TIMEOUT: std_args.Flag = std_args.Flag;
+```
+
+`--timeout <duration>`
+
+## val ALLOW_UNRUNNABLE
+
+```mach
+pub val ALLOW_UNRUNNABLE: std_args.Flag = std_args.Flag;
+```
+
+`--allow-unrunnable`
+
+## val OFFLINE
+
+```mach
+pub val OFFLINE: std_args.Flag = std_args.Flag;
+```
+
+`--offline`
+
+## rec Removed
+
+```mach
+pub rec Removed;
+```
+
+a spelling an earlier version took, refused by name with what replaced it
+
+name: the spelling, `--name` or `-c`
+use: what to write instead
 
 ## val REMOVED_N
 
 ```mach
-pub val REMOVED_N: usize = 16
+pub val REMOVED_N: usize = 20
 ```
 
 row count of REMOVED
@@ -294,260 +368,73 @@ row count of REMOVED
 ## val REMOVED
 
 ```mach
-pub val REMOVED: [REMOVED_N]std_args.Removed = [REMOVED_N]std_args.Removed;
+pub val REMOVED: [REMOVED_N]Removed = [REMOVED_N]Removed;
 ```
 
 the options a previous major took, each refused by name with what to write instead
 
-## val EMIT
+## rec Conflict
 
 ```mach
-pub val EMIT: std_args.FlagSpec = std_args.FlagSpec;
+pub rec Conflict;
 ```
 
-`--emit <kind>`, once per product
+two flags a command refuses together
 
-## val EMITS_N
+## rec Policy
 
 ```mach
-pub val EMITS_N: usize = 2
+pub rec Policy;
 ```
 
-row count of EMITS
+what mach holds a command's line to beyond what std.args parses, and what its page adds
 
-## val EMITS
+summary: the command's one line in the overview
+exits: its own exit codes, beside the shared ones
+constraints: the rules its page prints after its options
+refused: flags it recognizes only to refuse, by refusal
+refusal: why it refuses them
+conflicts: pairs of its flags it refuses together
+
+## val NO_WORDS
 
 ```mach
-pub val EMITS: [EMITS_N]*std_args.FlagSpec = [EMITS_N]*std_args.FlagSpec;
+pub val NO_WORDS: Slice[str] = Slice[str];
 ```
 
-`--emit` and `-e`, consumed by build
+no words, for a command with no aliases or no constraints
 
-## val WORKERS_N
+## val NO_COMMANDS
 
 ```mach
-pub val WORKERS_N: usize = 1
+pub val NO_COMMANDS: Slice[*std_args.Command] = Slice[*std_args.Command];
 ```
 
-row count of WORKERS
+no commands, for a command nothing is nested under
 
-## val WORKERS
+## val NO_FLAGS
 
 ```mach
-pub val WORKERS: [WORKERS_N]*std_args.FlagSpec = [WORKERS_N]*std_args.FlagSpec;
+pub val NO_FLAGS: Slice[*std_args.Flag] = Slice[*std_args.Flag];
 ```
 
-`--threads`, consumed by build and test
+no flags
 
-## val LIB
+## val NO_EXITS
 
 ```mach
-pub val LIB: std_args.FlagSpec = std_args.FlagSpec;
+pub val NO_EXITS: Slice[exit.Exit] = Slice[exit.Exit];
 ```
 
-`-l <name>`
+no exit codes of a command's own
 
-## val LINKIN_N
+## val NO_CONFLICTS
 
 ```mach
-pub val LINKIN_N: usize = 2
+pub val NO_CONFLICTS: Slice[Conflict] = Slice[Conflict];
 ```
 
-row count of LINKIN
-
-## val LINKIN
-
-```mach
-pub val LINKIN: [LINKIN_N]*std_args.FlagSpec = [LINKIN_N]*std_args.FlagSpec;
-```
-
-the repeatable link inputs `-L` and `-l`, consumed by build and test
-
-## val CACHE_N
-
-```mach
-pub val CACHE_N: usize = 1
-```
-
-row count of CACHE
-
-## val CACHE
-
-```mach
-pub val CACHE: [CACHE_N]*std_args.FlagSpec = [CACHE_N]*std_args.FlagSpec;
-```
-
-`--no-cache`, consumed by build and test
-
-## val DIAG_N
-
-```mach
-pub val DIAG_N: usize = 1
-```
-
-row count of DIAG
-
-## val DIAG
-
-```mach
-pub val DIAG: [DIAG_N]*std_args.FlagSpec = [DIAG_N]*std_args.FlagSpec;
-```
-
-`--diagnostics`, consumed by build, check and test
-
-## val PLAN
-
-```mach
-pub val PLAN: std_args.FlagSpec = std_args.FlagSpec;
-```
-
-`--plan`
-
-## val PLANS_N
-
-```mach
-pub val PLANS_N: usize = 1
-```
-
-row count of PLANS
-
-## val PLANS
-
-```mach
-pub val PLANS: [PLANS_N]*std_args.FlagSpec = [PLANS_N]*std_args.FlagSpec;
-```
-
-`--plan`, consumed by build and refused by run
-
-## val HELP
-
-```mach
-pub val HELP: std_args.FlagSpec = std_args.FlagSpec;
-```
-
-`--help`: the invocation asks for its command's page, or its action's, instead of running it.
-it is the set's help flag, so every command accepts it and it takes precedence over every
-refusal but an unknown action
-
-## val HELP_TABLE
-
-```mach
-pub val HELP_TABLE: std_args.TableRef = std_args.TableRef;
-```
-
-the table every command accepts before its own
-
-## val RUNNER
-
-```mach
-pub val RUNNER: std_args.FlagSpec = std_args.FlagSpec;
-```
-
-`--runner <cmd>`
-
-## val RUNNERS_N
-
-```mach
-pub val RUNNERS_N: usize = 1
-```
-
-row count of RUNNERS
-
-## val RUNNERS
-
-```mach
-pub val RUNNERS: [RUNNERS_N]*std_args.FlagSpec = [RUNNERS_N]*std_args.FlagSpec;
-```
-
-`--runner`, consumed by run and test
-
-## val TIMEOUT
-
-```mach
-pub val TIMEOUT: std_args.FlagSpec = std_args.FlagSpec;
-```
-
-`--timeout <duration>`
-
-## val TIMEOUTS_N
-
-```mach
-pub val TIMEOUTS_N: usize = 1
-```
-
-row count of TIMEOUTS
-
-## val TIMEOUTS
-
-```mach
-pub val TIMEOUTS: [TIMEOUTS_N]*std_args.FlagSpec = [TIMEOUTS_N]*std_args.FlagSpec;
-```
-
-`--timeout`, consumed by run and test
-
-## val ALLOW_UNRUNNABLE
-
-```mach
-pub val ALLOW_UNRUNNABLE: std_args.FlagSpec = std_args.FlagSpec;
-```
-
-`--allow-unrunnable`
-
-## val ALLOW_UNRUNNABLES_N
-
-```mach
-pub val ALLOW_UNRUNNABLES_N: usize = 1
-```
-
-row count of ALLOW_UNRUNNABLES
-
-## val ALLOW_UNRUNNABLES
-
-```mach
-pub val ALLOW_UNRUNNABLES: [ALLOW_UNRUNNABLES_N]*std_args.FlagSpec = [ALLOW_UNRUNNABLES_N]*std_args.FlagSpec;
-```
-
-`--allow-unrunnable`, consumed by test
-
-## val OFFLINE
-
-```mach
-pub val OFFLINE: std_args.FlagSpec = std_args.FlagSpec;
-```
-
-`--offline`
-
-## val OFFLINES_N
-
-```mach
-pub val OFFLINES_N: usize = 1
-```
-
-row count of OFFLINES
-
-## val OFFLINES
-
-```mach
-pub val OFFLINES: [OFFLINES_N]*std_args.FlagSpec = [OFFLINES_N]*std_args.FlagSpec;
-```
-
-`--offline`, consumed by the dep actions that resolve releases
-
-## val RELATIONS_N
-
-```mach
-pub val RELATIONS_N: usize = 1
-```
-
-length of RELATIONS
-
-## val RELATIONS
-
-```mach
-pub val RELATIONS: [RELATIONS_N]std_args.Relation = [RELATIONS_N]std_args.Relation;
-```
-
-the relations among the shared rows, in force in every schema that accepts both rows
+no conflicts of a command's own
 
 ## val SELECTOR_CONSTRAINT
 
@@ -567,7 +454,7 @@ what dispatch hands a command's handler; dispatch owns every member and outlives
 
 a: an arena dispatch releases once the handler returns, for what lives as long as the command
 backing: the heap under a, for what the command frees itself before it returns
-inv: the invocation
+inv: the parsed command line
 report: where the command reports a failure it goes on past or that carries an origin, in the
          format `--diagnostics` selected
 environ: the environment the command runs in, which the processes it starts inherit
@@ -575,71 +462,88 @@ environ: the environment the command runs in, which the processes it starts inhe
 ## fun operand
 
 ```mach
-pub fun operand(inv: *std_args.Invocation, n: usize) *u8;
+pub fun operand(inv: *std_args.Parsed, n: usize) *u8;
 ```
 
-the operand at a position among an invocation's operands
+the operand at a position among a line's operands
 
-inv: the invocation
+inv: the parsed line
 n: the position, 0 the first
 ret: the operand, or nil when there are not that many
 
 ## fun value
 
 ```mach
-pub fun value(inv: *std_args.Invocation, row: *std_args.FlagSpec) opt[*u8];
+pub fun value(inv: *std_args.Parsed, flag: *std_args.Flag) opt[*u8];
 ```
 
-the value a row was given, which a row of a schema that does not list it never has
+the value a flag was last given
 
-inv: the invocation
-row: a canonical row that does not collect
-ret: the value, or none when the row did not occur or occurred without one
+inv: the parsed line
+flag: a flag that takes a value
+ret: the value, or none when the flag did not occur or occurred without one
 
 ## fun values
 
 ```mach
-pub fun values(a: *A.Allocator, inv: *std_args.Invocation, row: *std_args.FlagSpec) res[Vector[str], fail.Fail];
+pub fun values(a: *A.Allocator, inv: *std_args.Parsed, flag: *std_args.Flag) res[Vector[str], fail.Fail];
 ```
 
-every value a row was given, in argument order
+every value a flag was given, in argument order
 
 a: backs the vector
-inv: the invocation
-row: a canonical row
-ret: the values, empty for a row its schema does not list; err when the vector cannot grow
+inv: the parsed line
+flag: the flag
+ret: the values, empty for a flag the command does not take; err when the vector cannot grow
 
 ## fun refusal
 
 ```mach
-pub fun refusal(a: *A.Allocator, inv: *std_args.Invocation) fail.Fail;
+pub fun refusal(a: *A.Allocator, inv: *std_args.Parsed, policy: *Policy) fail.Fail;
 ```
 
-an invocation's refusal as a failure, in the engine's words
+a parsed line's refusal as a failure, in mach's words where mach knows more of the option than
+the parser and the parser's words otherwise
 
 a: owns the text
-inv: the invocation
-ret: the failure: a user failure of the refusal's kind, or an internal one for a malformed set
+inv: the parsed line, which holds a refusal
+policy: the matched command's policy
+ret: a user failure of the refusal's kind
 
 ## fun run
 
 ```mach
-pub fun run(a: *A.Allocator, inv: *std_args.Invocation, handler: fun(*Call) res[i64, fail.Fail]) i64;
+pub fun run(a: *A.Allocator, inv: *std_args.Parsed, policy: *Policy, handler: fun(*Call) res[i64, fail.Fail]) i64;
 ```
 
-run an invocation and report how it ended through one report, in the format `--diagnostics`
-selects, human when that format is itself malformed: its refusal when it holds one, otherwise
-the handler, given an arena this call owns. a failure the handler returns is reported here
+run a parsed line and report how it ended through one report, in the format `--diagnostics`
+selects, human when that format is itself malformed: its refusal when it holds one, then a flag
+combination the command refuses, otherwise the handler, given an arena this call owns. a
+failure the handler returns is reported here
 
 a: owns the refusal's text
-inv: the invocation; its command is not nil
+inv: the parsed line
+policy: the matched command's policy
+handler: what runs
+ret: the exit code
+
+## fun serve
+
+```mach
+pub fun serve(inv: *std_args.Parsed, handler: fun(*Call) res[i64, fail.Fail]) i64;
+```
+
+run a handler over a parsed line whatever it is refused for, reporting through one report in
+the format `--diagnostics` selects, as `--help` does in place of the command it follows
+
+inv: the parsed line
 handler: what runs
 ret: the exit code
 
 ## fun collect_selectors
 
 ```mach
-pub fun collect_selectors(a: *A.Allocator, inv: *std_args.Invocation) res[manifest.Selectors, fail.Fail];
+pub fun collect_selectors(a: *A.Allocator, inv: *std_args.Parsed) res[manifest.Selectors, fail.Fail];
 ```
 
 the `-a`, `-t` and `-p` patterns and `--all` an invocation was given
@@ -665,7 +569,7 @@ f: the failure resolving them
 ## fun build_cli_invocation
 
 ```mach
-pub fun build_cli_invocation(a: *A.Allocator, inv: *std_args.Invocation) res[CliArgs, fail.Fail];
+pub fun build_cli_invocation(a: *A.Allocator, inv: *std_args.Parsed) res[CliArgs, fail.Fail];
 ```
 
 the typed CliArgs of a build-shaped command: verbosity, quiet, the selectors,
@@ -681,7 +585,7 @@ ret: the arguments; err when a vector cannot grow or a value names nothing its f
 ## fun collect_link_inputs
 
 ```mach
-pub fun collect_link_inputs(a: *A.Allocator, c: *CliArgs, inv: *std_args.Invocation) err[fail.Fail];
+pub fun collect_link_inputs(a: *A.Allocator, c: *CliArgs, inv: *std_args.Parsed) err[fail.Fail];
 ```
 
 fill c.overrides.link_tokens and c.overrides.lib_dirs in command-line order: every `-l` value and every

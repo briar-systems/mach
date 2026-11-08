@@ -43,15 +43,6 @@ pub fun with_isa(req: *TargetRequest, isa_name: str);
 pub fun with_code_model(req: *TargetRequest, code_model: str);
 ```
 
-## val SHARED_CODE_MODEL
-
-```mach
-pub val SHARED_CODE_MODEL: str = "pic"
-```
-
-the code model mirl builds a shared object under, by its name for it, on every system
-with shared objects: each system's row states which symbols another image may preempt
-
 ## fun with_extensions
 
 ```mach

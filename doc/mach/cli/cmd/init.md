@@ -3,10 +3,18 @@
 ## val COMMAND
 
 ```mach
-pub val COMMAND: std_args.CommandSpec = std_args.CommandSpec;
+pub val COMMAND: std_args.Command = std_args.Command;
 ```
 
 `mach init`
+
+## val POLICY
+
+```mach
+pub val POLICY: args.Policy = args.Policy;
+```
+
+what mach holds `mach init` to beyond the parse
 
 ## fun run
 
