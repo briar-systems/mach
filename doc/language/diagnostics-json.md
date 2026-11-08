@@ -1,7 +1,7 @@
 # Machine-readable diagnostics
 
-`mach build`, `mach check` and `mach test` take `--diagnostics <human|json>`,
-or `--diagnostics=json`, as every long option that takes a value accepts it
+Every command takes `--diagnostics <human|json>`, or `--diagnostics=json`, and
+`mach` takes it before the command word too, as every long option that takes a value accepts it
 after `=` in its own word.
 `human`, the default, is the rendering shown in [diagnostics.md](diagnostics.md).
 `json` writes everything the command reports as JSON objects, one per line of
