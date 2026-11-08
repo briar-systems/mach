@@ -328,14 +328,6 @@ fwd mach.lang.manifest.link.expand_local_path
 
 forwards [`mach.lang.manifest.link.expand_local_path`](manifest/link.md#fun-expand_local_path)
 
-## fwd mach.lang.manifest.link.requirement_input
-
-```mach
-fwd mach.lang.manifest.link.requirement_input
-```
-
-forwards [`mach.lang.manifest.link.requirement_input`](manifest/link.md#fun-requirement_input)
-
 ## fwd mach.lang.manifest.edit.DepSource
 
 ```mach
