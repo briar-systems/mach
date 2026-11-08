@@ -37,7 +37,8 @@ pub rec EntryRequest;
 what the command line states of an entry build
 
 entry: the entry file, a canonical path under the current directory
-kind: the artifact kind's manifest spelling
+kind: the artifact's product, mink's spelling
+linkage: the `--linkage` spelling, nil for the target's default
 sources: each `-s` value, `name=dir` as written
 source_count: length of `sources`
 target: the `-t` spelling, nil for the host's system and architecture

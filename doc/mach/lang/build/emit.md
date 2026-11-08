@@ -26,7 +26,7 @@ release loaded image options; nil options own nothing
 ## fun load_image_options
 
 ```mach
-pub fun load_image_options(p: *project.Project, out_kind: catalog_artifact.Kind,
+pub fun load_image_options(p: *project.Project, out_kind: *Product,
 exe_path: *u8) res[LoadedImageOptions, fail.Fail];
 ```
 
@@ -54,17 +54,6 @@ the image of `kind` mink links in memory from the `count` objects at `inputs`, i
 then the `link_count` inputs at `links`, written to `destination` with the resources
 `image` declares, laid out as the artifact and its placed globals state, what the link tells of
 itself reported to `diags`
-
-## fun binds_any
-
-```mach
-pub fun binds_any(p: *project.Project, links: *input.Input, count: usize) res[bool, fail.Fail];
-```
-
-whether any of the `count` inputs at `links` is one the image binds against when it
-loads: a framework, a shared library named, which mink's search finds, or a file of a
-kind a link binds against. a relocatable object, an archive or a static library named
-is linked in, not bound
 
 ## fun ordered_inputs
 
