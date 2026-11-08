@@ -3,18 +3,34 @@
 ## val COMMAND
 
 ```mach
-pub val COMMAND: std_args.CommandSpec = std_args.CommandSpec;
+pub val COMMAND: std_args.Command = std_args.Command;
 ```
 
 `mach build`
 
+## val POLICY
+
+```mach
+pub val POLICY: args.Policy = args.Policy;
+```
+
+what mach holds `mach build` to beyond the parse
+
 ## val CHECK
 
 ```mach
-pub val CHECK: std_args.CommandSpec = std_args.CommandSpec;
+pub val CHECK: std_args.Command = std_args.Command;
 ```
 
 `mach check`
+
+## val CHECK_POLICY
+
+```mach
+pub val CHECK_POLICY: args.Policy = args.Policy;
+```
+
+what mach holds `mach check` to beyond the parse
 
 ## rec Planned
 

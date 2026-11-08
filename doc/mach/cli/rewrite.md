@@ -33,7 +33,7 @@ context: what the command hands its transform
 ## val CHECK
 
 ```mach
-pub val CHECK: std_args.FlagSpec = std_args.FlagSpec;
+pub val CHECK: std_args.Flag = std_args.Flag;
 ```
 
 `--check`, which every command over this pass takes

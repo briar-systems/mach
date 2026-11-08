@@ -1,9 +1,97 @@
 # mach.cli.cmd.dep
 
+## val LIST
+
+```mach
+pub val LIST: std_args.Command = std_args.Command;
+```
+
+`mach dep list`
+
+## val ADD
+
+```mach
+pub val ADD: std_args.Command = std_args.Command;
+```
+
+`mach dep add`
+
+## val REMOVE
+
+```mach
+pub val REMOVE: std_args.Command = std_args.Command;
+```
+
+`mach dep remove`
+
+## val UPDATE
+
+```mach
+pub val UPDATE: std_args.Command = std_args.Command;
+```
+
+`mach dep update`
+
+## val PULL
+
+```mach
+pub val PULL: std_args.Command = std_args.Command;
+```
+
+`mach dep pull`
+
+## val OUTDATED
+
+```mach
+pub val OUTDATED: std_args.Command = std_args.Command;
+```
+
+`mach dep outdated`
+
+## val VERIFY
+
+```mach
+pub val VERIFY: std_args.Command = std_args.Command;
+```
+
+`mach dep verify`
+
+## val ADD_POLICY
+
+```mach
+pub val ADD_POLICY: args.Policy = args.Policy;
+```
+
+what mach holds `mach dep add` to beyond the parse
+
+## val UPDATE_POLICY
+
+```mach
+pub val UPDATE_POLICY: args.Policy = args.Policy;
+```
+
+what mach holds `mach dep update` to beyond the parse
+
+## val VERIFY_POLICY
+
+```mach
+pub val VERIFY_POLICY: args.Policy = args.Policy;
+```
+
+what mach holds `mach dep verify` to beyond the parse
+
+## val POLICY
+
+```mach
+pub val POLICY: args.Policy = args.Policy;
+```
+
+what mach holds `mach dep` and its other actions to beyond the parse
+
 ## val COMMAND
 
 ```mach
-pub val COMMAND: std_args.CommandSpec = std_args.CommandSpec;
+pub val COMMAND: std_args.Command = std_args.Command;
 ```
 
 `mach dep`

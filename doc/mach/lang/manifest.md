@@ -80,6 +80,14 @@ fwd mach.lang.manifest.model.simd_named
 
 forwards [`mach.lang.manifest.model.simd_named`](manifest/model.md#fun-simd_named)
 
+## fwd mach.lang.manifest.model.Origin
+
+```mach
+fwd mach.lang.manifest.model.Origin
+```
+
+forwards [`mach.lang.manifest.model.Origin`](manifest/model.md#rec-origin)
+
 ## fwd mach.lang.manifest.model.TargetDef
 
 ```mach
@@ -359,6 +367,22 @@ fwd mach.lang.manifest.edit.dep_table_remove
 ```
 
 forwards [`mach.lang.manifest.edit.dep_table_remove`](manifest/edit.md#fun-dep_table_remove)
+
+## fwd mach.lang.manifest.setting.Assignment
+
+```mach
+fwd mach.lang.manifest.setting.Assignment
+```
+
+forwards [`mach.lang.manifest.setting.Assignment`](manifest/setting.md#rec-assignment)
+
+## fwd mach.lang.manifest.setting.apply
+
+```mach
+fwd mach.lang.manifest.setting.apply
+```
+
+forwards [`mach.lang.manifest.setting.apply`](manifest/setting.md#fun-apply)
 
 ## fwd mach.lang.manifest.target.host_tuple
 

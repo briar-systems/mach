@@ -80,6 +80,20 @@ runner_count: length of `runner`
 runner_at: where each `runner` entry is written
 at: where the table's key is written
 
+## rec Origin
+
+```mach
+pub rec Origin;
+```
+
+where a value a refusal names was written: in a manifest table, or by `--set` for one
+invocation. a refusal of the value leads with `named` and points at `at`, so it sends the user
+to the text that wrote it
+
+named: the value as a refusal names it, `mach.toml: [target.x].base` or `--set base`, nil
+       where the key was not written
+at: where the value is written, resolved in its manifest or in the `--set` text
+
 ## rec ArtifactDef
 
 ```mach

@@ -8,8 +8,6 @@ use std_format:         std.format;
 use std.text.string.str_dup_range;
 use std.text.string.str_free;
 use std.types.bool.bool;
-use std.types.bool.false;
-use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use types_path: std.types.path;
@@ -36,38 +34,57 @@ use lang_source: mach.lang.source;
 use lang_target: mach.lang.target;
 use target_host: mach.lang.target.host;
 use mach.lang.textbuild;
-use mink_os: mink.catalog.os;
+use mink_fail: mink.base.fail;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink_arch:      mink.catalog.arch;
+use mink_arch_list: mink.catalog.arch.list;
+use mink_os:        mink.catalog.os;
+use mink_os_list:   mink.catalog.os.list;
+use mink_target:    mink.catalog.target;
 
-# one `[target]` key an entry build's command line states
+# the flags that narrow an entry build's target, each as written and nil when absent
 # ---
-# key:     the manifest key, as `[target.<name>]` spells it
-# value:   the value as written
-# integer: the key takes an integer, written bare
-pub rec TargetSetting {
-    key:     str;
-    value:   str;
-    integer: bool;
+# env:        `--env`
+# abi:        `--abi`
+# isa:        `--isa`
+# exts:       every `--ext`, in argv order
+# ext_count:  length of `exts`
+# code_model: `--code-model`
+pub rec Narrowing {
+    env:        str;
+    abi:        str;
+    isa:        str;
+    exts:       *str;
+    ext_count:  usize;
+    code_model: str;
+}
+
+# whether any narrowing flag is given
+pub fun narrowed(n: *Narrowing) bool {
+    ret n.env != nil || n.abi != nil || n.isa != nil || n.ext_count > 0 || n.code_model != nil;
 }
 
 # what the command line states of an entry build
 # ---
-# entry:         the entry file, a canonical path under the current directory
-# kind:          the artifact kind's manifest spelling
-# sources:       each `-s` value, `name=dir` as written
-# source_count:  length of `sources`
-# settings:      the target keys the command line states, in its order
-# setting_count: length of `settings`
-# optimize:      the build runs the optimization pass set
-# debug:         the build emits debug information
+# entry:        the entry file, a canonical path under the current directory
+# kind:         the artifact kind's manifest spelling
+# sources:      each `-s` value, `name=dir` as written
+# source_count: length of `sources`
+# target:       the `-t` spelling, nil for the host's system and architecture
+# narrowing:    the flags that narrow the target
+# optimize:     the build runs the optimization pass set
+# debug:        the build emits debug information
 pub rec EntryRequest {
-    entry:         str;
-    kind:          str;
-    sources:       *str;
-    source_count:  usize;
-    settings:      *TargetSetting;
-    setting_count: usize;
-    optimize:      bool;
-    debug:         bool;
+    entry:        str;
+    kind:         str;
+    sources:      *str;
+    source_count: usize;
+    target:       str;
+    narrowing:    Narrowing;
+    optimize:     bool;
+    debug:        bool;
 }
 
 # the path an entry build's manifest text reads as in a refusal
@@ -252,23 +269,16 @@ fun manifest_text(a: *A.Allocator, r: *EntryRequest, id: str, src: str, entry: s
     flag(?b, r.debug);
     put(?b, "\nsimd = \"scalarize\"\n\n");
 
-    val cell: opt[lang_target.Cell] = cell_of(a, r);
-    if (r.setting_count > 0) {
-        val stated: err[fail.Fail] = target_text(a, ?b, r, cell);
-        if (sel stated.err) { ret res[str, fail.Fail].err{stated.err}; }
-    }
+    val target: res[mink_target.Target, fail.Fail] = target_of(a, r);
+    if (sel target.err) { ret res[str, fail.Fail].err{target.err}; }
+    val stated: err[fail.Fail] = target_text(a, ?b, ?target.ok);
+    if (sel stated.err) { ret res[str, fail.Fail].err{stated.err}; }
 
     var libraries: *str  = nil;
     var library_n: usize = 0;
-    val linked:    bool  = !str_equals(r.kind, "static");
-    if (sel cell.some) {
-        val host: res[*mink_os.Host, fail.Fail] = target_host.of(a, cell.some.sys, cell.some.env, cell.some.arch, cell.some.abi);
-        if (sel host.ok) {
-            if (linked) {
-                libraries = host.ok.libraries;
-                library_n = host.ok.library_count;
-            }
-        }
+    if (!str_equals(r.kind, "static")) {
+        libraries = target.ok.host.libraries;
+        library_n = target.ok.host.library_count;
     }
 
     put(?b, "[artifact.");
@@ -306,116 +316,80 @@ fun manifest_text(a: *A.Allocator, r: *EntryRequest, id: str, src: str, entry: s
     ret res[str, fail.Fail].ok{made.ok};
 }
 
-# the one `[target]` table the command line states: every key it names, and the arch, sys
-# and abi it leaves out taken from the first cell the owners build that agrees with it
-fun target_text(a: *A.Allocator, b: *textbuild.TextBuilder, r: *EntryRequest, cell: opt[lang_target.Cell]) err[fail.Fail] {
-    val arch: str = target_value(r, "arch", lang_target.host_arch_name(), cell);
-    val sys:  str = target_value(r, "sys", lang_target.host_sys_name(), cell);
+# the target the command line states, resolved by mink's catalog: `-t`, or the host's own system
+# and architecture where it is left out, narrowed by the narrowing flags. every part they leave
+# out is the catalog's
+fun target_of(a: *A.Allocator, r: *EntryRequest) res[mink_target.Target, fail.Fail] {
+    var spec: mink_target.Spec;
+    if (r.target != nil) {
+        val parsed: res[mink_target.Spec, mink_target.Refusal] = mink_target.parse(r.target);
+        if (sel parsed.err) { ret res[mink_target.Target, fail.Fail].err{refused(a, ?parsed.err)}; }
+        spec = parsed.ok;
+    }
+    or {
+        val sys: res[*mink_os.System, mink_fail.Fail] = mink_os_list.by_name(lang_target.host_sys_name());
+        if (sel sys.err) { ret res[mink_target.Target, fail.Fail].err{target_host.refusal(a, sys.err)}; }
+        val arch: res[*mink_arch.Arch, mink_fail.Fail] = mink_arch_list.by_name(lang_target.host_arch_name());
+        if (sel arch.err) { ret res[mink_target.Target, fail.Fail].err{target_host.refusal(a, arch.err)}; }
+        spec = mink_target.Spec{sys: sys.ok, arch: arch.ok};
+    }
+    val n:        *Narrowing                                   = ?r.narrowing;
+    var narrowed: mink_target.Narrowing                        = mink_target.Narrowing{env: n.env, abi: n.abi, isa: n.isa, ext: n.exts, ext_count: n.ext_count, code_model: n.code_model};
+    val resolved: res[mink_target.Target, mink_target.Refusal] = mink_target.resolve(spec, ?narrowed);
+    if (sel resolved.err) { ret res[mink_target.Target, fail.Fail].err{refused(a, ?resolved.err)}; }
+    ret res[mink_target.Target, fail.Fail].ok{resolved.ok};
+}
+
+# mink's refusal of a target as a user failure, in mink's words
+fun refused(a: *A.Allocator, r: *mink_target.Refusal) fail.Fail {
+    var out:     Sink                = sink.make(a, LITTLE);
+    val written: err[mink_fail.Fail] = mink_target.write(r, ?out);
+    if (sel written.err) {
+        val dropped: err[mink_fail.Fail] = sink.release(?out);
+        ret target_host.refusal(a, written.err);
+    }
+    val text:  res[str, A.Error]   = str_dup_range(a, sink.data(?out)::str, 0, sink.len(?out));
+    val freed: err[mink_fail.Fail] = sink.release(?out);
+    if (sel text.err) { ret fail.refused(text.err); }
+    ret fail.user(diagnostic_kind.CLI_FLAG_VALUE, text.ok);
+}
+
+# the one `[target]` table of an entry build, every key as mink's catalog resolved it. the object
+# format is the system's, so the table states none
+fun target_text(a: *A.Allocator, b: *textbuild.TextBuilder, t: *mink_target.Target) err[fail.Fail] {
+    val isa: res[str, mink_target.Refusal] = mink_target.isa(t);
+    if (sel isa.err) { ret err[fail.Fail].err{refused(a, ?isa.err)}; }
+    val abi: res[opt[*mink_arch.Abi], mink_target.Refusal] = mink_target.abi(t);
+    if (sel abi.err) { ret err[fail.Fail].err{refused(a, ?abi.err)}; }
     put(b, "[target.");
-    put_name(b, sys);
+    put_name(b, t.sys.name);
     put(b, "-");
-    put_name(b, arch);
-    put(b, "]\narch = ");
-    quoted(b, arch);
-    put(b, "\nsys = ");
-    quoted(b, sys);
-    put(b, "\nabi = ");
-    quoted(b, target_value(r, "abi", lang_target.host_abi_name(), cell));
-    put(b, "\n");
-    if (sel cell.some) {
-        if (sel cell.some.env.some) {
-            if (setting(r, "env") == nil) {
-                put(b, "env = ");
-                quoted(b, cell.some.env.some.name);
-                put(b, "\n");
-            }
-        }
-    }
-    var listed: bool  = false;
-    var i:      usize = 0;
-    for (i < r.setting_count) {
-        val t: *TargetSetting = ?r.settings[i];
+    put_name(b, t.arch.name);
+    put(b, "]\n");
+    key(b, "arch", t.arch.name);
+    key(b, "sys", t.sys.name);
+    if (sel abi.ok.some) { key(b, "abi", abi.ok.some.name); }
+    if (sel t.env.some)  { key(b, "env", t.env.some.name); }
+    key(b, "isa", isa.ok);
+    if (sel t.code_model.some) { key(b, "code_model", t.code_model.some.name); }
+    var i: usize = 0;
+    for (i < t.ext_count) {
+        if (i == 0) { put(b, "ext = ["); }
+        or          { put(b, ", "); }
+        quoted(b, t.ext[i]);
         i = i + 1;
-        if (str_equals(t.key, "arch") || str_equals(t.key, "sys") || str_equals(t.key, "abi")) { cnt; }
-        if (str_equals(t.key, "ext")) {
-            if (listed) { cnt; }
-            listed = true;
-            put(b, "ext = [");
-            var k:     usize = 0;
-            var first: bool  = true;
-            for (k < r.setting_count) {
-                if (str_equals(r.settings[k].key, "ext")) {
-                    if (!first) { put(b, ", "); }
-                    quoted(b, r.settings[k].value);
-                    first = false;
-                }
-                k = k + 1;
-            }
-            put(b, "]\n");
-            cnt;
-        }
-        put(b, t.key);
-        put(b, " = ");
-        if (t.integer) { put(b, t.value); }
-        or             { quoted(b, t.value); }
-        put(b, "\n");
     }
+    if (t.ext_count > 0) { put(b, "]\n"); }
     put(b, "\n");
     ret err[fail.Fail].ok{};
 }
 
-# the value the command line states for `key`, else the cell's, else `host`'s
-fun target_value(r: *EntryRequest, key: str, host: str, cell: opt[lang_target.Cell]) str {
-    val stated: *TargetSetting = setting(r, key);
-    if (stated != nil) { ret stated.value; }
-    if (sel cell.some) {
-        if (str_equals(key, "arch")) { ret cell.some.arch.name; }
-        if (str_equals(key, "sys"))  { ret cell.some.sys.name; }
-        if (str_equals(key, "abi"))  { ret cell.some.abi; }
-    }
-    ret host;
-}
-
-fun setting(r: *EntryRequest, key: str) *TargetSetting {
-    var i: usize = 0;
-    for (i < r.setting_count) {
-        if (str_equals(r.settings[i].key, key)) { ret ?r.settings[i]; }
-        i = i + 1;
-    }
-    ret nil;
-}
-
-# the first cell the owners build whose arch and sys are the stated ones, the host's where
-# none is stated, and whose abi and env agree with any the command line states. with nothing
-# stated it is the host's own cell
-fun cell_of(a: *A.Allocator, r: *EntryRequest) opt[lang_target.Cell] {
-    var all: Vector[lang_target.Cell] = collections_vector.init[lang_target.Cell](a);
-    fin { collections_vector.dnit[lang_target.Cell](?all); }
-    val listed: err[fail.Fail] = lang_target.cells(a, ?all);
-    if (sel listed.err) { ret opt[lang_target.Cell].none{}; }
-    var arch: str = lang_target.host_arch_name();
-    var sys:  str = lang_target.host_sys_name();
-    var abi:  str = nil;
-    var env:  str = nil;
-    if (setting(r, "arch") != nil) { arch = setting(r, "arch").value; }
-    if (setting(r, "sys") != nil)  { sys = setting(r, "sys").value; }
-    if (setting(r, "abi") != nil)  { abi = setting(r, "abi").value; }
-    if (setting(r, "env") != nil)  { env = setting(r, "env").value; }
-    if (r.setting_count == 0)      { abi = lang_target.host_abi_name(); }
-    var i: usize = 0;
-    for (i < all.len) {
-        val c: lang_target.Cell = all.data[i];
-        i = i + 1;
-        if (!str_equals(c.arch.name, arch) || !str_equals(c.sys.name, sys)) { cnt; }
-        if (abi != nil && !str_equals(c.abi, abi))                          { cnt; }
-        if (env != nil) {
-            var agrees: bool = false;
-            if (sel c.env.some) { agrees = str_equals(c.env.some.name, env); }
-            if (!agrees)        { cnt; }
-        }
-        ret opt[lang_target.Cell].some{c};
-    }
-    ret opt[lang_target.Cell].none{};
+# `name = "value"` on a line of its own
+fun key(b: *textbuild.TextBuilder, name: str, value: str) {
+    put(b, name);
+    put(b, " = ");
+    quoted(b, value);
+    put(b, "\n");
 }
 
 fun put(b: *textbuild.TextBuilder, text: str) {

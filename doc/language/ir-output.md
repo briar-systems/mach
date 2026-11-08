@@ -1,6 +1,6 @@
 # IR output
 
-`mach build -e ir` writes mirl's text of each module beside its object, as
+`mach build --emit ir` writes mirl's text of each module beside its object, as
 `<out>/ir/<artifact>/<module>.ir`. The text is the module mach hands mirl,
 written before mirl compiles it, in mirl's text form: its grammar, its version
 statement and what each instruction means are mirl's to state, in
@@ -17,7 +17,7 @@ mirl emit out/ir/demo/demo.main.ir --kind object
 An emitted build is never restored from the object cache, so every module's
 text is written each time.
 
-`-e asm` writes masc's listing of each module beside its object.
+`--emit asm` writes masc's listing of each module beside its object.
 
 ## See also
 

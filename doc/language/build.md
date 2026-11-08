@@ -152,6 +152,34 @@ The same rule applies to `[profile.*]` and to `[artifact.*]` when a command
 needs one artifact.
 
 
+## Entry builds
+
+`mach build <entry>.mach` builds one entry file that no manifest declares. The
+command line states the project: `--source <name>=<dir>` binds a source root,
+`--kind` sets the artifact's kind, and `-t <sys>-<arch>` names the one target,
+spelled as `mach info targets` prints it. The target is the host's when `-t` is left out.
+`-a`, `-p` and `--all` select nothing in an entry build and are refused.
+
+These flags narrow the target, each value left out taking the default of
+mink's catalog row, which `mach info targets` lists first and marks `*`:
+
+- `--env <name>` the environment;
+- `--abi <name>` the calling convention;
+- `--isa <selection>` the instruction set, which a target marked `needs --isa`
+  must name;
+- `--ext <name>`, once per extension, an extension the instruction set adds;
+- `--code-model <name>` the code model.
+
+mink's catalog parses and resolves the target and refuses a bad part by name,
+so `mach build main.mach -t freestanding-riscv32` is refused for naming no
+instruction set. A bare `linux-<arch>` is the raw-syscall host with no
+environment, so an entry build that links the C library names `--env gnu`. The
+previous major's `--arch` and `--sys` are refused naming `-t`, and `--of` is
+refused because the system implies the object format.
+`--set` writes a manifest key over the entry build's target or artifact as over
+a project's (see
+[Overriding a key for one build](manifest.md#overriding-a-key-for-one-build)).
+
 ## See also
 
 - [manifest.md](manifest.md) — the `[target]`, `[profile]` and `[artifact]` tables a selection reads

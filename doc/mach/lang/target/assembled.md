@@ -19,13 +19,14 @@ the tuple a resolved target names its owners' parts by
 ## fun made
 
 ```mach
-pub fun made(a: *A.Allocator, tuple: Tuple, code: str) res[mirl_target.Target, fail.Fail];
+pub fun made(a: *A.Allocator, tuple: Tuple, code: opt[*CodeModel], kind: opt[*mink_output.Kind]) res[mirl_target.Target, fail.Fail];
 ```
 
-the target mirl assembles from `tuple` under the code model `code`, by its psABI name, ""
-for mirl's default. refused when it assembles none: a baseline that does not hold what
-the convention requires, a code model the target does not offer, or parts the owners
-rule out. given back by mirl_target.release
+the target mirl assembles from `tuple` under the code model `code`, mink's row of it, none
+for the host's default, for an output of `kind`, none where no artifact is under build.
+refused when it assembles none: a baseline that does not hold what the convention requires,
+a code model the target does not offer, or parts the owners rule out. given back by
+mirl_target.release
 
 ## rec Assembled
 

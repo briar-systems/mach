@@ -5,17 +5,28 @@ stating the whole project. the project it states is written as manifest text and
 through the manifest's own parser, so an entry build is held to every rule a declared
 project is, and the build that follows cannot tell the two apart
 
-## rec TargetSetting
+## rec Narrowing
 
 ```mach
-pub rec TargetSetting;
+pub rec Narrowing;
 ```
 
-one `[target]` key an entry build's command line states
+the flags that narrow an entry build's target, each as written and nil when absent
 
-key: the manifest key, as `[target.<name>]` spells it
-value: the value as written
-integer: the key takes an integer, written bare
+env: `--env`
+abi: `--abi`
+isa: `--isa`
+exts: every `--ext`, in argv order
+ext_count: length of `exts`
+code_model: `--code-model`
+
+## fun narrowed
+
+```mach
+pub fun narrowed(n: *Narrowing) bool;
+```
+
+whether any narrowing flag is given
 
 ## rec EntryRequest
 
@@ -29,8 +40,8 @@ entry: the entry file, a canonical path under the current directory
 kind: the artifact kind's manifest spelling
 sources: each `-s` value, `name=dir` as written
 source_count: length of `sources`
-settings: the target keys the command line states, in its order
-setting_count: length of `settings`
+target: the `-t` spelling, nil for the host's system and architecture
+narrowing: the flags that narrow the target
 optimize: the build runs the optimization pass set
 debug: the build emits debug information
 

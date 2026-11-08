@@ -3,42 +3,57 @@
 ## val COMMAND
 
 ```mach
-pub val COMMAND: std_args.CommandSpec = std_args.CommandSpec;
+pub val COMMAND: std_args.Command = std_args.Command;
 ```
 
 `mach help`, and the page any command renders for `--help`
 
-## val OVERVIEW
+## val POLICY
 
 ```mach
-pub val OVERVIEW: std_help.Page = std_help.Page;
+pub val POLICY: args.Policy = args.Policy;
 ```
 
-the overview's page
+what mach holds `mach help` to beyond the parse
 
-## fun render
+## rec Row
 
 ```mach
-pub fun render(a: *A.Allocator, set: *std_args.CommandSet, p: std_help.Page) err[fail.Fail];
+pub rec Row;
 ```
 
-write a page of a set to stdout at the width COLUMNS names
+one command the overview lists
 
-a: owns the failure's text
-set: the commands
-p: the page
-ret: ok, or an internal failure for a malformed set, or the write that failed
+name: the command word
+summary: its one line
 
-## fun run
+## fun page
 
 ```mach
-pub fun run(cx: *args.Call) res[i64, fail.Fail];
+pub fun page(a: *A.Allocator, line: *std_args.Parsed, policy: *args.Policy) err[fail.Fail];
 ```
 
-`mach help`, and every command's `--help`: render the page the invocation asks for on stdout:
-what `mach help` names, or the page of the command or action that was given `--help`
+write the page of the command a parsed line matched to stdout: std.args' page of its usage,
+text, nested commands and flags, then the rules mach holds it to and its exit codes
 
-cx: the call
-ret: exit.OK once the page is written, or the failure naming an unknown command or action, or
-     the write that failed
+a: owns the exit codes' text
+line: a parsed line whose command is the page's
+policy: the command's policy
+ret: ok, or the write that failed
+
+## fun overview
+
+```mach
+pub fun overview(a: *A.Allocator, title: str, root: *std_args.Command, rows: Slice[Row], footer: str) err[fail.Fail];
+```
+
+write the overview to stdout: the title, every command with its summary, the options `mach`
+takes in place of a command, what follows, and the exit codes
+
+a: owns the text
+title: the first line
+root: the root command, whose flags are listed
+rows: the commands, in order
+footer: the text after them
+ret: ok, or the write that failed
 

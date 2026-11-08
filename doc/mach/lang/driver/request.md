@@ -43,7 +43,6 @@ a lever or value left unset leaves the profile's
 
 output: the `-o` path, nil when absent
 work: the `-w` work directory, nil when absent
-subsystem: the declared subsystem as mink spells it, none for the artifact's own
 optimize: whether to optimize, or LEVER_PROFILE
 debug: whether to emit debug information, or LEVER_PROFILE
 threads: the worker count, 0 for the host's

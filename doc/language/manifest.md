@@ -149,7 +149,7 @@ key, `name` and `description` included, is an unknown-key error
 (`mach.toml: unknown key 'name' in [project]`). The previous major's `out` is
 refused by name, with the rename to `work` as its fix, and so is `{project.work}`
 in any template, with `{project.work}` as its fix. `[profile.<name>]`
-likewise carries no `emit_ir` or `emit_asm`: emission is `-e ir` and `-e asm` on
+likewise carries no `emit_ir` or `emit_asm`: emission is `--emit ir` and `--emit asm` on
 the command line.
 
 ### The work directory
@@ -160,7 +160,7 @@ expanded `work`, in one layout:
 | Path | Holds |
 | --- | --- |
 | `obj/` | one object per module, each carrying its cache key; it is the [object cache](#stepname--build-steps) and is read by developers and tooling too |
-| `ir/`, `asm/` | the human-readable views `-e ir` and `-e asm` write |
+| `ir/`, `asm/` | the human-readable views `--emit ir` and `--emit asm` write |
 | `.cache/` | compiler-only state, read and written by nothing but the compiler |
 | `.cache/steps/` | one fingerprint stamp per [build step](#stepname--build-steps) |
 | `.stage/` | build step scratch space, one directory per step, reset before the step runs |
@@ -270,11 +270,11 @@ to whichever *declared* target matches the host.
 | `sys`  | yes      | System. Read by `$project.target.sys`. |
 | `abi` | yes      | Application binary interface. Read by `$project.target.abi`. |
 | `of`  | absent: the system's format | Object-format override; defers to the system's format when omitted. See [Object-format override](#object-format-override). |
-| `base` | absent: the system's base | Load-address override (integer). Overrides the system's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
+| `base` | absent: the system's base | Load-address override (integer, not negative). Overrides the system's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
-| `stack_reserve` | absent: the format's default, and no stack on an image no loader maps | Main stack size in bytes: the reserve a PE or Mach-O header records, or the size of the `.stack` section of a freestanding ELF or flat image. See [Image stack size](#image-stack-size). |
-| `stack_commit` | absent: the format's default | Main stack commit in bytes, on PE only. See [Image stack size](#image-stack-size). |
-| `code_model` | absent: mirl's default for the target | The code model the target's code is built under (string), by the psABI name mirl's catalog gives it, such as `medlow` or `medany` on `riscv64`. Any target may state it, and a model the target does not offer is refused with mirl's reason. `--code-model` states it for an entry build. |
+| `stack_reserve` | absent: the format's default, and no stack on an image no loader maps | Main stack size in bytes, not negative: the reserve a PE or Mach-O header records, or the size of the `.stack` section of a freestanding ELF or flat image. See [Image stack size](#image-stack-size). |
+| `stack_commit` | absent: the format's default | Main stack commit in bytes, not negative, on PE only. See [Image stack size](#image-stack-size). |
+| `code_model` | absent: the host's default for the target | The code model the target's code is built under (string), by the psABI name mink's catalog gives it, such as `medlow` or `medany` on `riscv64`. Any target may state it. A model the target's host does not offer is refused naming those it does, and one mirl does not carry is refused with mirl's reason. `mach info targets` lists each target's models, its default first, and `--code-model` narrows an entry build's target to one. |
 | `default` | removed | Refused as a removed key. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
 | `os`, `baseline`, `extensions` | removed | v6's names of `sys`, `isa` and `ext`, refused with the rename `mach migrate` writes. |
 | `ext` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the architecture's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
@@ -656,14 +656,16 @@ convention, must name it explicitly, since `abi` has no default of its own
 its kernel ABI is integer-only, whereas every operating system accepts only
 the conventions it declares per instruction set (`linux` and `darwin` refuse
 `win64` on `x86_64`, `windows` refuses `sysv64`) and `freestanding` accepts
-every convention the instruction set covers. `riscv32`
-currently only reaches a `freestanding` target — `mach info targets` lists
-`freestanding-riscv32` rows and no `linux`/`darwin` riscv32 row.
+every convention the instruction set covers.
 
-`mach info targets` prints every tuple this binary can actually build, one
-`(os, isa, abi, object)` cell per line with every dimension spelled; it is
-derived from the same declarations composition reads, so it never advertises a
-tuple that would fail to resolve. `mach info` alone prints the tuple the host
+`mach info targets` prints every target mink's catalog spells, one per line as
+`-t` takes it (`<sys>-<arch>`), then the environments, calling conventions and
+code models it accepts as `env=`, `abi=` and `code_model=` lists, the default
+first and marked `*`. `none` is the environment of a host that states none,
+such as bare `linux`, and `-` stands for a part the target has no choices of.
+It marks `needs --isa` beside each whose system bounds the machine not at all,
+such as `freestanding-riscv32`, so a target spelled that way names its
+instruction set. The list is the catalog's, so mach holds no table of its own. `mach info` alone prints the tuple the host
 resolves to.
 
 A value outside its axis's set is refused when the target resolves, so a typo is
@@ -930,7 +932,7 @@ runner = ["wasmtime", "{artifact.out}"]
   to map it, so it is never position-independent and no `shared` artifact exists:
   a `shared` artifact is refused with mink's reason, naming the system.
 - **No linker-side image options.** A wasm module has no PE subsystem, so
-  `subsystem` and `--subsystem` are refused as on any format without one. Its data
+  `subsystem` and `--set subsystem` are refused as on any format without one. Its data
   starts at the first page of linear memory past the stack, which grows down, so a
   stack overflow traps below the data instead of corrupting it.
 - **Inline assembly** reads masc's wasm text under a `mvp` or `wasm1` head, as
@@ -1085,7 +1087,7 @@ marks none is refused wherever a command must pick one:
 error[selection.ambiguous]: mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with -p
 ```
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
-concern: it is controlled only by the `-e ir` and `-e asm` flags of `mach build`.
+concern: it is controlled only by the `--emit ir` and `--emit asm` flags of `mach build`.
 
 `relax = ["float-reassoc"]` is the one lever here that *adds*, and the only profile
 key that can change a program's computed answer. It widens that same pass to float
@@ -1236,12 +1238,14 @@ it for one invocation. The two levers are `--key` and `--no-key` pairs:
 | Key | Flags |
 |---|---|
 | `optimize` | `--optimize` (`-O`), `--no-optimize` |
-| `debug` | `--debug` (`-d`), `--no-debug` |
+| `debug` | `--debug`, `--no-debug` |
 
 The levers apply in one order: the built-in defaults, then the selected profile,
 then the command line. Both flags of a pair are refused. The previous major's
 `-g`, `-O0`, `-O2`, `--emit-asm`, `--emit-ir` and `--jobs` are refused naming
-`-d`, `--no-optimize`, `-O`, `-e asm`, `-e ir` and `--threads`.
+`--debug`, `--no-optimize`, `-O`, `--emit asm`, `--emit ir` and `--threads`, and
+this major's short `-d`, `-e`, `-s` and `-k` naming `--debug`, `--emit`,
+`--source` and `--kind`.
 
 A `mach build` whose flags change the selected profile writes a differently
 configured build, so it must say where: it names the artifact with `-o`, or a
@@ -1255,6 +1259,38 @@ error[cli.flag_conflict]: these options would write a differently configured bui
 The object cache is keyed by the whole configuration, so only published
 artifacts can collide. `mach test` publishes none and takes the levers freely,
 and `mach check` and `mach run` build nothing.
+
+### Overriding a key for one build
+
+`mach build` and `mach test` take `--set <key>=<value>`, once per key, with the
+key spelled as this manifest spells it. It writes the value over every table of
+the key's section for one invocation, a later `--set` of the same key winning.
+`--set` writes `platform`, `base`, `stack_reserve` and `stack_commit` over every
+target, the `native` one included, and `subsystem` over every artifact.
+
+The value is read as the key is read here: a string-shaped key takes the value
+as written, and any other reads it as a TOML value, so `--set base=0x400000`
+is an integer. It is then checked by the same rules and refused with the same
+reasons as the key in `mach.toml`. A key no table holds is refused naming it,
+and so is a key `--set` does not write:
+
+```
+error[cli.flag_value]: --set does not apply to 'optimize'; it sets platform, base, stack_reserve, stack_commit, subsystem
+error[manifest.value_type]: --set base: must be an integer
+```
+
+A value `--set` wrote carries where it was written, so every later refusal of
+it, a target's system refusing a subsystem included, names `--set <key>` and
+points at the `--set` text rather than at a line of `mach.toml`:
+
+```
+error[catalog.unsupported]: --set subsystem: Subsystem windows is unsupported by linux (target 'linux-x86_64' runs on linux, whose images state no subsystem)
+ --> --set:1:13
+```
+
+The previous major's `--subsystem`, `--base`, `--stack-reserve`,
+`--stack-commit` and `--platform` are refused naming the `--set` that replaces
+each.
 
 ## `[artifact.<name>]`
 
@@ -1303,10 +1339,11 @@ any of them (see [test.md](test.md#which-tests-run)).
     `#[symbol("name")]` sets the name an export carries without exporting it.
   - **Internals.** Every other definition still links inside the library but is
     seen from no other image.
-  - **Code model.** The library is built under mirl's `pic` code model unless its
-    target states a `code_model`. Each system's row says what that means there:
-    on ELF an export of default visibility may be preempted by another image, on
-    Mach-O only a weak one may, and a PE DLL reaches its own exports directly.
+  - **Code model.** The library is built under its target's code model, and mirl
+    builds its code for a shared object, the output mink links it as. Each
+    system's row says what that means there: on ELF an export of default
+    visibility may be preempted by another image, on Mach-O only a weak one may,
+    and a PE DLL reaches its own exports directly.
   - **Thread-locals.** A `#[thread]` var in a shared library is reached through
     the initial-exec model, at an offset its loader fixes when the process
     starts. General-dynamic access is never lowered.
@@ -1462,8 +1499,9 @@ key and also targets a non-windows cell declares two artifacts, one per format,
 the way `[link.X]` entries carry `sys`/`arch`/`abi` axes: the manifest never
 carries a declaration a build silently ignores.
 
-`--subsystem <name>` overrides the key with one of mink's names for one invocation and is refused
-the same way on a target whose format has no subsystem (`mach help build`).
+`--set subsystem=<name>` writes the key over every artifact for one invocation, held to every
+rule the key keeps here, and is refused the same way on a target whose format has no subsystem
+(see [Overriding a key for one build](#overriding-a-key-for-one-build)).
 
 ### `icon` / `manifest` — Windows executable resources
 
