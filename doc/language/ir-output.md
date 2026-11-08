@@ -11,7 +11,7 @@ The text reads back. `mirl` reads a file mach wrote, so a module can be
 compiled, verified or optimised on its own:
 
 ```
-mirl emit out/ir/demo/demo.main.ir --kind object
+mirl emit out/ir/demo/demo.main.ir --emit object
 ```
 
 An emitted build is never restored from the object cache, so every module's

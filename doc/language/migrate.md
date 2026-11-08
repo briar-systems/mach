@@ -45,7 +45,7 @@ Reported, for you to change:
 |---|---|
 | a condition of type `u8`, as `if (flags & 1)` | a `u1`, as `if ((flags & 1) != 0)` |
 | a `u1` stored in a `u8` or under arithmetic | `value::u8`, or a `u1` destination |
-| `-g`, `-O0`, `-O2`, `--emit-asm`, `--emit-ir`, `--pie`, `--simd`, `--jobs`, `--arch`, `--sys`, `--of`, `--platform`, `--subsystem`, `--base`, `--stack-reserve`, `--stack-commit`, `-d`, `-e`, `-s`, `-k` in a script | the spelling the report names |
+| `-g`, `-O0`, `-O2`, `--emit-asm`, `--emit-ir`, `--pie`, `--simd`, `--jobs`, `--arch`, `--sys`, `--of`, `--platform`, `--subsystem`, `--base`, `--stack-reserve`, `--stack-commit`, `-d`, `-e`, `-s` in a script | the spelling the report names |
 
 The compiler refuses the first two, naming the replacement.
 
