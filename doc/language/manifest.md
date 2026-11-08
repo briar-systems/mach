@@ -274,7 +274,7 @@ to whichever *declared* target matches the host.
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
 | `stack_reserve` | absent: the format's default, and no stack on an image no loader maps | Main stack size in bytes: the reserve a PE or Mach-O header records, or the size of the `.stack` section of a freestanding ELF or flat image. See [Image stack size](#image-stack-size). |
 | `stack_commit` | absent: the format's default | Main stack commit in bytes, on PE only. See [Image stack size](#image-stack-size). |
-| `code_model` | absent: mirl's default for the target | The code model the target's code is built under (string), by the psABI name mirl's catalog gives it, such as `medlow` or `medany` on `riscv64`. Any target may state it, and a model the target does not offer is refused with mirl's reason. `--code-model` states it for an entry build. |
+| `code_model` | absent: mirl's default for the target | The code model the target's code is built under (string), by the psABI name mirl's catalog gives it, such as `medlow` or `medany` on `riscv64`. Any target may state it, and a model the target does not offer is refused with mirl's reason. `--code-model` narrows an entry build's target to one. |
 | `default` | removed | Refused as a removed key. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
 | `os`, `baseline`, `extensions` | removed | v6's names of `sys`, `isa` and `ext`, refused with the rename `mach migrate` writes. |
 | `ext` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the architecture's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
@@ -656,14 +656,13 @@ convention, must name it explicitly, since `abi` has no default of its own
 its kernel ABI is integer-only, whereas every operating system accepts only
 the conventions it declares per instruction set (`linux` and `darwin` refuse
 `win64` on `x86_64`, `windows` refuses `sysv64`) and `freestanding` accepts
-every convention the instruction set covers. `riscv32`
-currently only reaches a `freestanding` target — `mach info targets` lists
-`freestanding-riscv32` rows and no `linux`/`darwin` riscv32 row.
+every convention the instruction set covers.
 
-`mach info targets` prints every tuple this binary can actually build, one
-`(os, isa, abi, object)` cell per line with every dimension spelled; it is
-derived from the same declarations composition reads, so it never advertises a
-tuple that would fail to resolve. `mach info` alone prints the tuple the host
+`mach info targets` prints every target mink's catalog spells, one per line as
+`-t` takes it (`<sys>-<arch>`), and marks `needs --isa` beside each whose
+system bounds the machine not at all, such as `freestanding-riscv32`, so a
+target spelled that way names its instruction set. The list is the catalog's,
+so mach holds no table of its own. `mach info` alone prints the tuple the host
 resolves to.
 
 A value outside its axis's set is refused when the target resolves, so a typo is
@@ -930,7 +929,7 @@ runner = ["wasmtime", "{artifact.out}"]
   to map it, so it is never position-independent and no `shared` artifact exists:
   a `shared` artifact is refused with mink's reason, naming the system.
 - **No linker-side image options.** A wasm module has no PE subsystem, so
-  `subsystem` and `--subsystem` are refused as on any format without one. Its data
+  `subsystem` and `--set subsystem` are refused as on any format without one. Its data
   starts at the first page of linear memory past the stack, which grows down, so a
   stack overflow traps below the data instead of corrupting it.
 - **Inline assembly** reads masc's wasm text under a `mvp` or `wasm1` head, as
@@ -1256,6 +1255,29 @@ The object cache is keyed by the whole configuration, so only published
 artifacts can collide. `mach test` publishes none and takes the levers freely,
 and `mach check` and `mach run` build nothing.
 
+### Overriding a key for one build
+
+`mach build` and `mach test` take `--set <key>=<value>`, once per key, with the
+key spelled as this manifest spells it. It writes the value over every table of
+the key's section for one invocation, a later `--set` of the same key winning.
+`--set` writes `platform`, `base`, `stack_reserve` and `stack_commit` over every
+target, the `native` one included, and `subsystem` over every artifact.
+
+The value is read as the key is read here: a string-shaped key takes the value
+as written, and any other reads it as a TOML value, so `--set base=0x400000`
+is an integer. It is then checked by the same rules and refused with the same
+reasons as the key in `mach.toml`. A key no table holds is refused naming it,
+and so is a key `--set` does not write:
+
+```
+error[cli.flag_value]: --set does not apply to 'optimize'; it sets platform, base, stack_reserve, stack_commit, subsystem
+error[manifest.value_type]: --set base: must be an integer
+```
+
+The previous major's `--subsystem`, `--base`, `--stack-reserve`,
+`--stack-commit` and `--platform` are refused naming the `--set` that replaces
+each.
+
 ## `[artifact.<name>]`
 
 Every artifact is declared explicitly and named by its table key. `$bin.name`
@@ -1462,8 +1484,9 @@ key and also targets a non-windows cell declares two artifacts, one per format,
 the way `[link.X]` entries carry `sys`/`arch`/`abi` axes: the manifest never
 carries a declaration a build silently ignores.
 
-`--subsystem <name>` overrides the key with one of mink's names for one invocation and is refused
-the same way on a target whose format has no subsystem (`mach help build`).
+`--set subsystem=<name>` writes the key over every artifact for one invocation, held to every
+rule the key keeps here, and is refused the same way on a target whose format has no subsystem
+(see [Overriding a key for one build](#overriding-a-key-for-one-build)).
 
 ### `icon` / `manifest` — Windows executable resources
 
