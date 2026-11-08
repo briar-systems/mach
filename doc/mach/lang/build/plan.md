@@ -209,16 +209,6 @@ pub fun under_dir(path: str, dir: str) bool;
 
 whether `path` lies under the directory `dir`
 
-## fun requirement_input
-
-```mach
-pub fun requirement_input(a: *A.Allocator, itn: *intern.Interner, root: str,
-req: *manifest.LinkRequirement) res[input.Input, fail.Fail];
-```
-
-the input a manifest link requirement names: a framework or a library by
-name, or a file located as written or under `root`
-
 ## fun render
 
 ```mach

@@ -1327,7 +1327,12 @@ any of them (see [test.md](test.md#which-tests-run)).
   target such as `spirv` it is the entry module, written there unlinked.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
-  as a `.a`.
+  as a `.a`. The archive carries its link claims: every object mach emits states
+  each `[link.<name>]` requirement of its build, its own and those its
+  dependencies export, in a section the link leaves out of the image. A link that
+  pulls a member finds what its claims name, a library by its `kind` with no
+  fallback and a local file by its absolute path, so a consumer that takes the
+  archive by path restates none of them.
 - **`shared`** links a dynamic library at the resolved `out`, as mink's shared
   output kind: a `.so` on ELF, a `.dll` on PE and a `.dylib` on Mach-O, named as
   mink's system names the file. A system whose loader maps no library into

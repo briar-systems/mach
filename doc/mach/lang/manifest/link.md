@@ -120,3 +120,13 @@ expand a local link's `path` with `v`; a refusal points at the `path` value
 pub fun find_link_by_name(m: *Manifest, name: intern.StrId) *LinkDef;
 ```
 
+## fun requirement_input
+
+```mach
+pub fun requirement_input(a: *A.Allocator, itn: *intern.Interner, root: str,
+req: *LinkRequirement) res[input.Input, fail.Fail];
+```
+
+the input a manifest link requirement names: a framework or a library by
+name, or a file located as written or under `root`
+
