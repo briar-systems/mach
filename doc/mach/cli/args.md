@@ -13,6 +13,7 @@ verbosity: 0, 1 or 2 from `-v` and `-vv`
 quiet: `--quiet`
 selectors: the `-a`, `-t` and `-p` patterns and `--all`
 overrides: everything else the command sets, typed
+settings: every `--set`, in argv order
 emits: the EMIT_KIND_* bits `-e` names, 0 when it is absent
 entry: what the command line states of an entry build
 
@@ -23,12 +24,14 @@ pub rec EntryArgs;
 ```
 
 what an entry build's command line states: its entry, source roots, artifact kind, target
-and the levers its profile takes
+narrowing and the levers its profile takes
 
 file: the entry operand, nil for a project build
 sources: every `-s` value, `name=dir` as written
 kind: the `-k` value, nil when absent
-settings: every target key given, in argv order
+target: the `-t` value, the target as `<sys>-<arch>`, nil when absent
+narrowing: the narrowing flags, each as written
+exts: every `--ext` value, in argv order
 optimize: the profile an entry build states optimizes
 debug: the profile an entry build states emits debug information
 
@@ -41,7 +44,7 @@ pub fun entry_stated(e: *EntryArgs) bool;
 whether the command line states anything only an entry build takes
 
 e: the entry arguments
-ret: true when a source root, a kind or a target key is given
+ret: true when a source root, a kind or a narrowing flag is given
 
 ## val EMIT_KIND_ASM
 
@@ -179,7 +182,7 @@ row count of CGEN
 pub val CGEN: [CGEN_N]*std_args.FlagSpec = [CGEN_N]*std_args.FlagSpec;
 ```
 
-the codegen options, consumed by build, run and test
+the codegen options, consumed by build and test and refused by run
 
 ## val OPTIMIZE
 
@@ -247,21 +250,22 @@ pub val ENTRY: [ENTRY_N]*std_args.FlagSpec = [ENTRY_N]*std_args.FlagSpec;
 
 the source roots and kind of an entry build, consumed by build
 
-## val TARGET_FLAGS_N
+## val NARROWING_N
 
 ```mach
-pub val TARGET_FLAGS_N: usize = TARGET_KEYS_N
+pub val NARROWING_N: usize = 5
 ```
 
-row count of TARGET_FLAGS
+row count of NARROWING
 
-## val TARGET_FLAGS
+## val NARROWING
 
 ```mach
-pub val TARGET_FLAGS: [TARGET_FLAGS_N]*std_args.FlagSpec = [TARGET_FLAGS_N]*std_args.FlagSpec;
+pub val NARROWING: [NARROWING_N]*std_args.FlagSpec = [NARROWING_N]*std_args.FlagSpec;
 ```
 
-the target keys as flags, consumed by build
+the flags that narrow an entry build's `-t <sys>-<arch>`, consumed by build; each value left
+out is the target's own, as mink's catalog states it
 
 ## val WORKDIR_N
 
@@ -282,7 +286,7 @@ pub val WORKDIR: [WORKDIR_N]*std_args.FlagSpec = [WORKDIR_N]*std_args.FlagSpec;
 ## val REMOVED_N
 
 ```mach
-pub val REMOVED_N: usize = 8
+pub val REMOVED_N: usize = 16
 ```
 
 row count of REMOVED

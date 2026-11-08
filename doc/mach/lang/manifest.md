@@ -360,6 +360,22 @@ fwd mach.lang.manifest.edit.dep_table_remove
 
 forwards [`mach.lang.manifest.edit.dep_table_remove`](manifest/edit.md#fun-dep_table_remove)
 
+## fwd mach.lang.manifest.setting.Assignment
+
+```mach
+fwd mach.lang.manifest.setting.Assignment
+```
+
+forwards [`mach.lang.manifest.setting.Assignment`](manifest/setting.md#rec-assignment)
+
+## fwd mach.lang.manifest.setting.apply
+
+```mach
+fwd mach.lang.manifest.setting.apply
+```
+
+forwards [`mach.lang.manifest.setting.apply`](manifest/setting.md#fun-apply)
+
 ## fwd mach.lang.manifest.target.host_tuple
 
 ```mach

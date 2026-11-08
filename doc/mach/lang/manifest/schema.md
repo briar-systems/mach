@@ -57,6 +57,42 @@ alloc: owns the refusal's text
 doc: the document root
 ret: ok when the document has the schema's shape
 
+## rec Setting
+
+```mach
+pub rec Setting;
+```
+
+a `--set` key and value, read as the manifest reads the key
+
+section: the root key of the tables the key is written over, such as "target"
+doc: the document `<key> = <value>`, released with toml.dnit
+text: the document's text, which a refusal of the value points into
+
+## val SET_PATH
+
+```mach
+pub val SET_PATH: str = "--set"
+```
+
+the path a refusal of a `--set` value is placed in
+
+## fun setting
+
+```mach
+pub fun setting(alloc: *A.Allocator, key: str, value: str) res[Setting, fail.Fail];
+```
+
+a `--set` key and value checked against the row of the key: the key is one a row marks `set`,
+and the value has the row's shape. a string-shaped key takes the value as written, any other
+reads it as a TOML value
+
+alloc: owns the setting and a refusal's text
+key: the key, as a manifest writes it
+value: the value, as written
+ret: the setting; a user failure naming the key when no row names it, when its row is not
+       one `--set` writes, or when the value does not have its row's shape
+
 ## fun section_check
 
 ```mach

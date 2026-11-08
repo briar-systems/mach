@@ -88,6 +88,14 @@ pub fun input_name(p: *project.Project, m: *project.ModuleEntry) str;
 
 what the link calls the objects of module `m`: its source file, which outlives the link
 
+## fun test_input_name
+
+```mach
+pub fun test_input_name(p: *project.Project, m: *project.ModuleEntry) res[str, fail.Fail];
+```
+
+the name module m's test object goes to the link under, set apart from its object's
+
 ## fun indexed_objects
 
 ```mach

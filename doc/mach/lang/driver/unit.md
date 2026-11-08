@@ -47,9 +47,10 @@ verify: mirl's verifier over the lowered module
 functions: the module's functions, as mirl's module holds them
 ir: the instructions lowering built into its bodies, as mirl's bodies hold them
 verifies: the verifier runs mach made over it
-blocks: the blocks the step allocated from its heap over lowering and the compile, as std's heap counts them
+blocks: the blocks the step allocated from its own heap, which the lowered module lives on, as std's heap counts them
+           and not what the compile allocates on the object's allocator, which outlives the step
 bytes: the bytes of those allocations
-peak: the most bytes the step's heap mapped while it lowered and compiled the module
+peak: the most bytes the step's own heap mapped
 mirl: mirl's stages and counts, masc's beside them, all zero for an untimed job
 
 ## rec Made

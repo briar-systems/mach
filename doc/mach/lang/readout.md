@@ -226,7 +226,7 @@ the runs of mirl's verifier over the lowered modules, mach's and mirl's own
 pub val ALLOCATED_BLOCKS: Counter = 3
 ```
 
-the blocks a step allocated from its heap while it lowered and compiled its module, as std's heap counts them
+the blocks a step allocated from its own heap, which the lowered module lives on, as std's heap counts them
 
 ## val ALLOCATED_BYTES
 
@@ -242,7 +242,7 @@ the bytes of those allocations
 pub val HEAP_PEAK: Counter = 5
 ```
 
-the most bytes a step's heap mapped while it lowered and compiled its module
+the most bytes a step's own heap mapped, as for the blocks
 
 ## val SELECTED
 

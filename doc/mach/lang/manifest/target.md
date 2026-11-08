@@ -42,6 +42,20 @@ ret: the formatted tuple; err when the allocator refused it
 pub fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
 ```
 
+## fun target_set
+
+```mach
+pub fun target_set(itn: *intern.Interner, sub: *toml.Table, d: *TargetDef) err[fail.Fail];
+```
+
+every key `--set` writes over a target that the table `sub` holds, decoded over `d`; a key `sub`
+does not hold leaves `d` as it is
+
+itn: receives the strings
+sub: the table
+d: the target
+ret: ok, or a refused allocation
+
 ## fun find_target_by_name
 
 ```mach
