@@ -100,6 +100,15 @@ pub fun is_selected(t: *Target) bool;
 
 whether a target is selected
 
+## fun pie
+
+```mach
+pub fun pie(t: *Target) bool;
+```
+
+whether the target's executable is position independent: the linkage under build, else the
+host's default. false where the host runs no executable
+
 ## rec Nans
 
 ```mach
