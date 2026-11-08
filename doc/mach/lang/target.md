@@ -129,38 +129,61 @@ prefix, then the artifact's name, then the extension
 prefix: written before its name
 suffix: written after its name, with its dot
 
-## fun executable_output
+## fun linkage_of
 
 ```mach
-pub fun executable_output(t: *resolved.Target, imports: bool) *mink_output.Kind;
+pub fun linkage_of(a: *A.Allocator, t: *resolved.Target, given: str, kind: diagnostic_kind.Kind) res[*Linkage, fail.Fail];
 ```
 
-the executable mink builds on the target: a finished module for a format that
-finishes its modules, a position independent executable where the host runs one
-by default or its loader places every image, an executable mink binds libraries into
-where it `imports` an input the image binds against when it loads and the format builds
-one, else a fixed-address executable
+the linkage of an executable built for `t`, as mink's catalog resolves it against the host:
+the one `given` names in mink's spelling, or the host's default for nil. refused in mink's
+words, as a user failure of `kind`, where the host's loader runs no executable of it or none
+
+## fun is_library
+
+```mach
+pub fun is_library(p: *Product) bool;
+```
+
+whether `p` is a library, which a consumer links against rather than runs: an archive, or an
+image of a kind of file a link binds against
+
+## fun is_executable
+
+```mach
+pub fun is_executable(p: *Product) bool;
+```
+
+whether `p` is linked as an executable, of the image kind its linkage names
 
 ## fun output_of
 
 ```mach
-pub fun output_of(t: *resolved.Target, kind: catalog_artifact.Kind) opt[*mink_output.Kind];
+pub fun output_of(p: *Product, linkage: *Linkage) opt[*mink_output.Kind];
 ```
 
-the output mink builds for an artifact of `kind` on the target: its executable for
-an executable, a shared library, and for an object directory its relocatable
-objects. none for a static library, which mink archives rather than links. every
-executable kind reads back as the same file, so the executable here imports nothing
+the image kind mink builds for a product: an executable's from its linkage, an image product's
+its own. none for a static library, which mink archives rather than links
+
+## fun executable_output
+
+```mach
+pub fun executable_output(a: *A.Allocator, t: *resolved.Target) res[*mink_output.Kind, fail.Fail];
+```
+
+the image kind of the executable a build for `t` links: the linkage under build, else the
+host's default, refused where the host runs no executable
 
 ## fun artifact_naming
 
 ```mach
-pub fun artifact_naming(a: *A.Allocator, t: *resolved.Target, kind: catalog_artifact.Kind) res[ArtifactName, fail.Fail];
+pub fun artifact_naming(a: *A.Allocator, t: *resolved.Target, p: *Product, given: str) res[ArtifactName, fail.Fail];
 ```
 
-the name an artifact of `kind` takes on the target, mink's system's name of the
-file: an archive for a static library, and for every other kind the kind of file
-its output reads back as. refused, with mink's reason, where the system builds none
+the name an artifact of product `p` takes on the target, mink's system's name of the file:
+an archive for a static library, and for every other product the kind of file its image
+reads back as, an executable's under the linkage `given` names, nil for the host's default.
+refused, with mink's reason, where the system builds none
 
 ## fun finished_modules
 

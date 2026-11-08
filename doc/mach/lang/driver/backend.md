@@ -96,15 +96,6 @@ pub fun read_object(b: *Back, a: *A.Allocator, file: str, bytes: Vector[u8]) opt
 
 the object the bytes of the file `file` hold, none when mink reads no object from them
 
-## fun binds_at_load
-
-```mach
-pub fun binds_at_load(b: *Back, a: *A.Allocator, path: str) res[bool, fail.Fail];
-```
-
-whether the file at `path` is one a link binds against when the image loads, a kind
-of file mink states a link may bind against: a shared library or a stub
-
 ## val RECORD_SECTION
 
 ```mach

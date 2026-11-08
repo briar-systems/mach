@@ -156,9 +156,22 @@ needs one artifact.
 
 `mach build <entry>.mach` builds one entry file that no manifest declares. The
 command line states the project: `--source <name>=<dir>` binds a source root,
-`--kind` sets the artifact's kind, and `-t <sys>-<arch>` names the one target,
+`-k`/`--kind` names what it makes, and `-t <sys>-<arch>` names the one target,
 spelled as `mach info targets` prints it. The target is the host's when `-t` is left out.
 `-a`, `-p` and `--all` select nothing in an entry build and are refused.
+
+`-k` takes mink's product names, the values of an artifact's `kind`: `bin` (the
+default), `static`, `shared`, `object` or `module`. `--linkage` says how a `bin` is
+linked, by mink's linkage names: `pie`, `dynamic` or `static`. Left out, it is the
+target's default, which `mach info targets` lists first under `linkage=`. It is
+refused with any other `-k`, naming the kind, and a linkage the target's loader
+does not run is refused in mink's words, listing those it does:
+
+```
+mach build main.mach -k static                    # a static library
+mach build main.mach -k bin --linkage static      # a fully static executable
+mach build main.mach -k shared -t linux-x86_64    # a shared library
+```
 
 These flags narrow the target, each value left out taking the default of
 mink's catalog row, which `mach info targets` lists first and marks `*`:
