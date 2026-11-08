@@ -116,7 +116,8 @@ simd  = "scalarize"                    # SIMD lever: "scalarize"
 # allow = ["import.unused"]            # optional: warning keys this profile silences
 
 [artifact.demo]                        # a produced artifact
-kind    = "bin"                        # "bin" | "static" | "shared"
+kind    = "bin"                        # "bin" | "static" | "shared" | "object" | "module"
+# linkage = "static"                   # optional: "pie" | "dynamic" | "static", bin only
 entry   = "main.mach"                  # entry source, relative to src
 out     = "{project.work}/bin/demo{artifact.suffix}"  # output path, under the work directory
 targets = ["*"]                        # which declared targets build it ("*" = all)
@@ -274,7 +275,7 @@ to whichever *declared* target matches the host.
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
 | `stack_reserve` | absent: the format's default, and no stack on an image no loader maps | Main stack size in bytes, not negative: the reserve a PE or Mach-O header records, or the size of the `.stack` section of a freestanding ELF or flat image. See [Image stack size](#image-stack-size). |
 | `stack_commit` | absent: the format's default | Main stack commit in bytes, not negative, on PE only. See [Image stack size](#image-stack-size). |
-| `code_model` | absent: the host's default for the target | The code model the target's code is built under (string), by the psABI name mink's catalog gives it, such as `medlow` or `medany` on `riscv64`. Any target may state it. A model the target's host does not offer is refused naming those it does, and one mirl does not carry is refused with mirl's reason. `mach info targets` lists each target's models, its default first, and `--code-model` narrows an entry build's target to one. |
+| `code_model` | absent: the host's default for the target | The code model the target's code is built under (string), by the psABI name mink's catalog gives it, such as `medany` on linux `riscv64` or `medlow` on freestanding `riscv64`. Any target may state it. A model the target's host does not offer is refused naming those it does, and one mirl does not carry is refused with mirl's reason. `mach info targets` lists each target's models, its default first, and `--code-model` narrows an entry build's target to one. |
 | `default` | removed | Refused as a removed key. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
 | `os`, `baseline`, `extensions` | removed | v6's names of `sys`, `isa` and `ext`, refused with the rename `mach migrate` writes. |
 | `ext` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the architecture's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
@@ -659,9 +660,10 @@ the conventions it declares per instruction set (`linux` and `darwin` refuse
 every convention the instruction set covers.
 
 `mach info targets` prints every target mink's catalog spells, one per line as
-`-t` takes it (`<sys>-<arch>`), then the environments, calling conventions and
-code models it accepts as `env=`, `abi=` and `code_model=` lists, the default
-first and marked `*`. `none` is the environment of a host that states none,
+`-t` takes it (`<sys>-<arch>`), then the environments, calling conventions, code
+models and executable linkages it accepts as `env=`, `abi=`, `code_model=` and
+`linkage=` lists, the default first and marked `*`. A target that runs no
+executable, such as `vulkan-spirv`, lists `linkage=-`. `none` is the environment of a host that states none,
 such as bare `linux`, and `-` stands for a part the target has no choices of.
 It marks `needs --isa` beside each whose system bounds the machine not at all,
 such as `freestanding-riscv32`, so a target spelled that way names its
@@ -713,7 +715,7 @@ and a finished module (`spirv`) have no page and are laid out byte-tight.
 A `spirv` target's object output is a complete, self-contained module rather than
 a link input. Each module is written to `<out>/obj/<fqn-as-path>.spv` like any
 other target's objects, and the entry module already carries every function its
-stages reach, so it is the whole deliverable. A `bin` artifact therefore needs no
+stages reach, so it is the whole deliverable. Its artifact is a `module`, which needs no
 linker: the build publishes the entry module at the artifact's resolved `out` (or
 `-o`), and `--emit obj` stops at the module tree:
 
@@ -1244,8 +1246,9 @@ The levers apply in one order: the built-in defaults, then the selected profile,
 then the command line. Both flags of a pair are refused. The previous major's
 `-g`, `-O0`, `-O2`, `--emit-asm`, `--emit-ir` and `--jobs` are refused naming
 `--debug`, `--no-optimize`, `-O`, `--emit asm`, `--emit ir` and `--threads`, and
-this major's short `-d`, `-e`, `-s` and `-k` naming `--debug`, `--emit`,
-`--source` and `--kind`.
+this major's short `-d`, `-e` and `-s` naming `--debug`, `--emit` and `--source`.
+`-k` is the short form of `--kind`. The previous major's `--pie` is refused naming
+`--linkage pie` and the `linkage` key.
 
 A `mach build` whose flags change the selected profile writes a differently
 configured build, so it must say where: it names the artifact with `-o`, or a
@@ -1299,7 +1302,8 @@ reads the selected artifact's name.
 
 | Key       | Required | Meaning |
 |-----------|----------|---------|
-| `kind`    | yes | `"bin"`, `"static"`, or `"shared"` (see below). |
+| `kind`    | yes | What the artifact is, by mink's product name: `"bin"` (an executable), `"static"` (a static library), `"shared"` (a shared library), `"object"` (each module's object, for a later link) or `"module"` (a module a runtime instantiates, such as a SPIR-V module). Any other value is refused listing mink's products (see below). |
+| `linkage` | absent: the target's default | How a `bin` is linked, by mink's linkage name: `"pie"`, `"dynamic"` or `"static"`. A name mink has no linkage of is refused listing them, and the key is refused on any other `kind`, naming it. A linkage the target's loader does not run is refused when the target resolves, pointing at the key and listing those it runs, its default first, as `mach info targets` shows them. |
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
 | `out`     | yes | This artifact's output path, relative to the project root like every other path. Write `{project.work}/bin/demo` to place it under the build output, or any other project path to place it there. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
@@ -1323,11 +1327,22 @@ artifact's closure: a test build compiles and tests exactly the modules the arti
 under test reaches, so a module no selected artifact reaches is not loaded under
 any of them (see [test.md](test.md#which-tests-run)).
 
-- **`bin`** links an executable at the resolved `out` path. On a finished-module
-  target such as `spirv` it is the entry module, written there unlinked.
+- **`bin`** links an executable at the resolved `out` path, under its `linkage`,
+  the target's default when absent. A target whose loader runs no executable,
+  such as a finished-module `spirv` target, refuses it in mink's words.
+- **`module`** is a module a runtime instantiates. On a finished-module target
+  such as `spirv` it is the entry module, written at `out` unlinked. A format
+  mink builds no module in, such as ELF, refuses it.
+- **`object`** is each module's object, written under `obj/` for a later link,
+  as `--emit obj` writes them.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
-  as a `.a`.
+  as a `.a`. The archive carries its link claims: every object mach emits states
+  each `[link.<name>]` requirement of its build, its own and those its
+  dependencies export, in a section the link leaves out of the image. A link that
+  pulls a member finds what its claims name, a library by its `kind` with no
+  fallback and a local file by its absolute path, so a consumer that takes the
+  archive by path restates none of them.
 - **`shared`** links a dynamic library at the resolved `out`, as mink's shared
   output kind: a `.so` on ELF, a `.dll` on PE and a `.dylib` on Mach-O, named as
   mink's system names the file. A system whose loader maps no library into
@@ -1446,11 +1461,11 @@ inspection use the same expansion.
 | Mach-O on Darwin | empty | `.a` | `.dylib` (not written) |
 | COFF/PE on Windows | `.exe` | `.lib` | `.dll` (not written) |
 | Raw image | empty | unsupported | unsupported |
-| SPIR-V module | `.spv` | unsupported | unsupported |
+| SPIR-V module | refused, its artifact is a `module` (`.spv`) | unsupported | unsupported |
 | wasm module on wasi | `.wasm` | `.a` | refused |
 
 The selected object format supplies the naming rules, including explicit target
-format overrides. Unsupported library forms are errors. A SPIR-V `bin` artifact is
+format overrides. Unsupported library forms are errors. A SPIR-V `module` artifact is
 its entry module, delivered at `out` with the per-module objects still written under
 `obj/` (see [Finished-module targets](#finished-module-targets)).
 
@@ -1669,8 +1684,9 @@ holding both objects and import members, answers `kind = "shared"` and is refuse
 for `kind = "static"`.
 
 `kind = "shared"` needs an image that imports, so a target that builds no such
-executable refuses it at once. An executable whose inputs are all linked in,
-`kind = "static"` entries included, is linked as one that imports nothing. A
+executable refuses it at once. An executable is linked under its artifact's
+`linkage`, the target's default when absent, whatever its inputs are, so one that
+binds a shared library is linked `pie` or `dynamic`. A
 static library that needs a shared one its build also names may still fail to
 link: `libm.a` beside a shared `libc` is refused by the link, so name both of the
 same kind.
@@ -1935,7 +1951,7 @@ builds for several targets here and therefore has no single output.
 
 ```toml
 [artifact.shader-blur]
-kind    = "bin"
+kind    = "module"
 entry   = "shaders/blur.mach"
 out     = "{project.work}/shaders/blur.spv"
 targets = ["vulkan"]
@@ -2012,7 +2028,7 @@ link    = []
 need    = ["artifact.shader-frag"]
 
 [artifact.shader-frag]
-kind    = "bin"
+kind    = "module"
 entry   = "shaders/frag.mach"
 out     = "{project.work}/spv/frag{artifact.suffix}"
 targets = ["spirv"]

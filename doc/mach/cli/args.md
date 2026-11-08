@@ -44,7 +44,7 @@ pub fun entry_stated(e: *EntryArgs) bool;
 whether the command line states anything only an entry build takes
 
 e: the entry arguments
-ret: true when a source root, a kind or a narrowing flag is given
+ret: true when a source root, a kind, a linkage or a narrowing flag is given
 
 ## val EMIT_KIND_ASM
 
@@ -190,7 +190,15 @@ pub val SOURCE: std_args.Flag = std_args.Flag;
 pub val KIND: std_args.Flag = std_args.Flag;
 ```
 
-`--kind <kind>`, the kind of an entry build's artifact
+`--kind <product>`, `-k`, the product of an entry build's artifact, by mink's name for it
+
+## val LINKAGE
+
+```mach
+pub val LINKAGE: std_args.Flag = std_args.Flag;
+```
+
+`--linkage <linkage>`, how an entry build's executable is linked, by mink's name for it
 
 ## val ENV
 
@@ -360,7 +368,7 @@ use: what to write instead
 ## val REMOVED_N
 
 ```mach
-pub val REMOVED_N: usize = 20
+pub val REMOVED_N: usize = 19
 ```
 
 row count of REMOVED

@@ -21,7 +21,8 @@ compiler_id: *compiler.Identity, digest: *[32]u8) err[fail.Fail];
 
 what every module's key shares: the compiler identity, the configuration
 bytes the driver captured (target, platform, project identity), the request,
-the step outputs, the realized dependency closure and the link providers
+the step outputs, the realized dependency closure, the link providers and
+the link requirements
 
 ## fun test_object_path
 

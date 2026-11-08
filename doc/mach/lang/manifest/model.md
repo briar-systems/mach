@@ -104,7 +104,7 @@ one `[artifact.<name>]` table as parsed. the three arrays are owned by the
 manifest and freed by `dnit`
 
 name: the table key; a portable identifier
-kind: the required `kind` key, decoded through the artifact kind catalog
+kind: the required `kind` key, mink's product of that name
 entry: the required `entry` key, a project-relative path under `[project].src`
 out: the required `out` key, an unexpanded path template relative to the
                project root; `{project.work}` places the output under the work directory
@@ -118,6 +118,9 @@ is_default: `default = true`: the artifact is in the default selection; false
                when the key is absent
 is_export: `export = true`: the library a bare `use <id>;` binds and whose
                requirements travel to consumers; at most one artifact sets it
+linkage: the `linkage` key, mink's linkage of an executable of that name, none when
+               absent, which takes the target's default; `bin` artifacts only
+linkage_from: where `linkage` was written
 subsystem: the `subsystem` key as mink spells the PE subsystem, console when absent
 icon: the `icon` path, or STR_NIL when absent; `bin` artifacts only
 app_manifest: the `manifest` path, or STR_NIL when absent; `bin` artifacts only

@@ -16,6 +16,14 @@ stated nowhere in mach
 pub fun refusal(a: *A.Allocator, f: mink_fail.Fail) fail.Fail;
 ```
 
+## fun refused
+
+```mach
+pub fun refused(a: *A.Allocator, kind: diagnostic_kind.Kind, r: *mink_target.Refusal) fail.Fail;
+```
+
+mink's refusal of a part of a target as a user failure of `kind`, in mink's words
+
 ## fun of
 
 ```mach
