@@ -175,13 +175,29 @@ pub fun element_span(arr: *toml.Array, i: usize) toml.Span;
 
 the literal of an array's element `i`; the zero span when absent
 
+## fun origin
+
+```mach
+pub fun origin(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml.Table, lead: str, key: str) res[Origin, fail.Fail];
+```
+
+the literal of the value `key` names in a table; the zero span when absent
+where the table `sub` writes `key`, named for a refusal under `lead`, the table's label in
+mach.toml such as `[target.x]`, or under `--set` for a nil lead. the place stays unresolved
+until the manifest or the `--set` text resolves it
+
+alloc: owns the name's text until it is interned
+itn: holds the name for the session
+sub: the table, which writes `key`
+lead: the table's label, nil for a `--set` value
+key: the key
+ret: the origin, or a refused allocation
+
 ## fun value_span
 
 ```mach
 pub fun value_span(tab: *toml.Table, key: str) toml.Span;
 ```
-
-the literal of the value `key` names in a table; the zero span when absent
 
 ## fun value_text
 

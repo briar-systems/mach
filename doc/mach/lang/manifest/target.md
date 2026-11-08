@@ -45,16 +45,18 @@ pub fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table
 ## fun target_set
 
 ```mach
-pub fun target_set(itn: *intern.Interner, sub: *toml.Table, d: *TargetDef) err[fail.Fail];
+pub fun target_set(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml.Table, lead: str, d: *TargetDef) err[fail.Fail];
 ```
 
-every key `--set` writes over a target that the table `sub` holds, decoded over `d`; a key `sub`
-does not hold leaves `d` as it is
+every key `--set` writes over a target that the table `sub` holds, decoded over `d` with where
+it was written; a key `sub` does not hold leaves `d` as it is
 
+alloc: owns a refusal's text
 itn: receives the strings
 sub: the table
+lead: the table's label in mach.toml, nil for a `--set` value
 d: the target
-ret: ok, or a refused allocation
+ret: ok, or the refusal of a value its key does not take, or a refused allocation
 
 ## fun find_target_by_name
 

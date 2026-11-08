@@ -3,14 +3,15 @@
 ## fun artifact_set
 
 ```mach
-pub fun artifact_set(alloc: *A.Allocator, label: str, sub: *toml.Table, d: *ArtifactDef) err[fail.Fail];
+pub fun artifact_set(alloc: *A.Allocator, itn: *intern.Interner, lead: str, sub: *toml.Table, d: *ArtifactDef) err[fail.Fail];
 ```
 
-every key `--set` writes over an artifact that the table `sub` holds, decoded over `d`; a key
-`sub` does not hold leaves `d` as it is
+every key `--set` writes over an artifact that the table `sub` holds, decoded over `d` with
+where it was written; a key `sub` does not hold leaves `d` as it is
 
 alloc: owns a refusal's text
-label: the artifact table a refusal names, nil for a `--set` value
+itn: holds the name a refusal of the value leads with
+lead: the artifact table's label in mach.toml, nil for a `--set` value
 sub: the table
 d: the artifact
 ret: ok, or the refusal of a value the key does not accept

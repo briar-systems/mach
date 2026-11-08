@@ -270,10 +270,10 @@ to whichever *declared* target matches the host.
 | `sys`  | yes      | System. Read by `$project.target.sys`. |
 | `abi` | yes      | Application binary interface. Read by `$project.target.abi`. |
 | `of`  | absent: the system's format | Object-format override; defers to the system's format when omitted. See [Object-format override](#object-format-override). |
-| `base` | absent: the system's base | Load-address override (integer). Overrides the system's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
+| `base` | absent: the system's base | Load-address override (integer, not negative). Overrides the system's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
-| `stack_reserve` | absent: the format's default, and no stack on an image no loader maps | Main stack size in bytes: the reserve a PE or Mach-O header records, or the size of the `.stack` section of a freestanding ELF or flat image. See [Image stack size](#image-stack-size). |
-| `stack_commit` | absent: the format's default | Main stack commit in bytes, on PE only. See [Image stack size](#image-stack-size). |
+| `stack_reserve` | absent: the format's default, and no stack on an image no loader maps | Main stack size in bytes, not negative: the reserve a PE or Mach-O header records, or the size of the `.stack` section of a freestanding ELF or flat image. See [Image stack size](#image-stack-size). |
+| `stack_commit` | absent: the format's default | Main stack commit in bytes, not negative, on PE only. See [Image stack size](#image-stack-size). |
 | `code_model` | absent: the host's default for the target | The code model the target's code is built under (string), by the psABI name mink's catalog gives it, such as `medlow` or `medany` on `riscv64`. Any target may state it. A model the target's host does not offer is refused naming those it does, and one mirl does not carry is refused with mirl's reason. `mach info targets` lists each target's models, its default first, and `--code-model` narrows an entry build's target to one. |
 | `default` | removed | Refused as a removed key. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
 | `os`, `baseline`, `extensions` | removed | v6's names of `sys`, `isa` and `ext`, refused with the rename `mach migrate` writes. |
@@ -1277,6 +1277,15 @@ and so is a key `--set` does not write:
 ```
 error[cli.flag_value]: --set does not apply to 'optimize'; it sets platform, base, stack_reserve, stack_commit, subsystem
 error[manifest.value_type]: --set base: must be an integer
+```
+
+A value `--set` wrote carries where it was written, so every later refusal of
+it, a target's system refusing a subsystem included, names `--set <key>` and
+points at the `--set` text rather than at a line of `mach.toml`:
+
+```
+error[catalog.unsupported]: --set subsystem: Subsystem windows is unsupported by linux (target 'linux-x86_64' runs on linux, whose images state no subsystem)
+ --> --set:1:13
 ```
 
 The previous major's `--subsystem`, `--base`, `--stack-reserve`,

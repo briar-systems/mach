@@ -80,6 +80,14 @@ fwd mach.lang.manifest.model.simd_named
 
 forwards [`mach.lang.manifest.model.simd_named`](manifest/model.md#fun-simd_named)
 
+## fwd mach.lang.manifest.model.Origin
+
+```mach
+fwd mach.lang.manifest.model.Origin
+```
+
+forwards [`mach.lang.manifest.model.Origin`](manifest/model.md#rec-origin)
+
 ## fwd mach.lang.manifest.model.TargetDef
 
 ```mach
