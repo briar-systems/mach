@@ -61,21 +61,6 @@ pub fun vector(t: *types.Table, element: Type, lanes: u32) res[Type, fail.Fail];
 pub fun array(t: *types.Table, element: Type, count: u64) res[Type, fail.Fail];
 ```
 
-## fun structure
-
-```mach
-pub fun structure(t: *types.Table, members: *Type, n: u32) res[Type, fail.Fail];
-```
-
-## fun structure_laid
-
-```mach
-pub fun structure_laid(t: *types.Table, members: *Type, n: u32, align: opt[u64], packed: bool) res[Type, fail.Fail];
-```
-
-a structure laid out by the target with a stated alignment and packing: `align` raises its
-alignment, and a packed one places its members with no padding at an alignment of one
-
 ## fun structure_at
 
 ```mach
@@ -83,36 +68,6 @@ pub fun structure_at(t: *types.Table, members: *Type, offsets: *u64, n: u32) res
 ```
 
 a structure whose members stand at the offsets mach states, as a constant's byte runs do
-
-## fun union_of
-
-```mach
-pub fun union_of(t: *types.Table, members: *Type, n: u32) res[Type, fail.Fail];
-```
-
-## fun union_laid
-
-```mach
-pub fun union_laid(t: *types.Table, members: *Type, n: u32, align: opt[u64], packed: bool) res[Type, fail.Fail];
-```
-
-a union with a stated alignment and packing, as `structure_laid`
-
-## val NO_ALIGN
-
-```mach
-pub val NO_ALIGN: opt[u64] = opt[u64].none;
-```
-
-no stated alignment
-
-## fun stated_align
-
-```mach
-pub fun stated_align(align: u32) opt[u64];
-```
-
-an alignment a declaration states, none for 0
 
 ## fun signature
 
