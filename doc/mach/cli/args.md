@@ -124,7 +124,7 @@ pub val ALL: std_args.Flag = std_args.Flag;
 pub val OUTPUT: std_args.Flag = std_args.Flag;
 ```
 
-`-o <path>`, the linked-binary path
+`-o <path>`, the linked artifact's path
 
 ## val VERBOSE
 
@@ -132,8 +132,8 @@ pub val OUTPUT: std_args.Flag = std_args.Flag;
 pub val VERBOSE: std_args.Flag = std_args.Flag;
 ```
 
-`-v`, once for each build phase's row and twice, as `-vv`, for each module or file as well; what
-each readout level shows is the readout contract, doc/language/readout.md
+`--verbose`, `-v`, once for each build phase's row and twice, as `-vv`, for each module or file
+as well; what each readout level shows is the readout contract, doc/language/readout.md
 
 ## val QUIET
 
@@ -270,7 +270,7 @@ pub val THREADS: std_args.Flag = std_args.Flag;
 pub val LIB_DIR: std_args.Flag = std_args.Flag;
 ```
 
-`-L <dir>`
+`--library-dir <dir>`, `-L`
 
 ## val LIB
 
@@ -278,7 +278,7 @@ pub val LIB_DIR: std_args.Flag = std_args.Flag;
 pub val LIB: std_args.Flag = std_args.Flag;
 ```
 
-`-l <name>`
+`--library <name>`, `-l`
 
 ## val NO_CACHE
 
@@ -395,11 +395,8 @@ two flags a command refuses together
 pub rec Policy;
 ```
 
-what mach holds a command's line to beyond what std.args parses, and what its page adds
+what mach holds a command's line to beyond what std.args parses
 
-summary: the command's one line in the overview
-exits: its own exit codes, beside the shared ones
-constraints: the rules its page prints after its options
 refused: flags it recognizes only to refuse, by refusal
 refusal: why it refuses them
 conflicts: pairs of its flags it refuses together
@@ -410,7 +407,7 @@ conflicts: pairs of its flags it refuses together
 pub val NO_WORDS: Slice[str] = Slice[str];
 ```
 
-no words, for a command with no aliases or no constraints
+no words, for a command with no aliases
 
 ## val NO_COMMANDS
 
@@ -428,14 +425,6 @@ pub val NO_FLAGS: Slice[*std_args.Flag] = Slice[*std_args.Flag];
 
 no flags
 
-## val NO_EXITS
-
-```mach
-pub val NO_EXITS: Slice[exit.Exit] = Slice[exit.Exit];
-```
-
-no exit codes of a command's own
-
 ## val NO_CONFLICTS
 
 ```mach
@@ -443,14 +432,6 @@ pub val NO_CONFLICTS: Slice[Conflict] = Slice[Conflict];
 ```
 
 no conflicts of a command's own
-
-## val SELECTOR_CONSTRAINT
-
-```mach
-pub val SELECTOR_CONSTRAINT: str = "-a, -t and -p take an exact name, which must be declared, or a glob with * and ?, which must match
-```
-
-the rule every selector keeps, which the help of each command with selectors prints
 
 ## rec Call
 

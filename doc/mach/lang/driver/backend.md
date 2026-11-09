@@ -27,6 +27,8 @@ format: the object format the target writes
 formats: mink's format registry
 prepared: the target mirl made ready for the build, once, which every module's compile reads;
            on the heap, since it stays put until it is closed. nil before one is opened
+laying: what sema lays the build's types out by, over `machine`'s target. nil before one
+           is opened
 
 ## fun none
 

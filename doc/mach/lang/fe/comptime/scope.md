@@ -51,6 +51,9 @@ pub rec FrameMark;
 pub rec ComptimeEnv;
 ```
 
+laying: what the build lays its types out by, borrowed from its back end, nil where it
+        opened no target
+
 ## rec BuildFacts
 
 ```mach

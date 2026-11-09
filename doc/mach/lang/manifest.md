@@ -200,6 +200,38 @@ fwd mach.lang.manifest.model.empty
 
 forwards [`mach.lang.manifest.model.empty`](manifest/model.md#fun-empty)
 
+## fwd mach.lang.manifest.model.target_def
+
+```mach
+fwd mach.lang.manifest.model.target_def
+```
+
+forwards [`mach.lang.manifest.model.target_def`](manifest/model.md#fun-target_def)
+
+## fwd mach.lang.manifest.model.artifact_def
+
+```mach
+fwd mach.lang.manifest.model.artifact_def
+```
+
+forwards [`mach.lang.manifest.model.artifact_def`](manifest/model.md#fun-artifact_def)
+
+## fwd mach.lang.manifest.model.profile_def
+
+```mach
+fwd mach.lang.manifest.model.profile_def
+```
+
+forwards [`mach.lang.manifest.model.profile_def`](manifest/model.md#fun-profile_def)
+
+## fwd mach.lang.manifest.model.link_def
+
+```mach
+fwd mach.lang.manifest.model.link_def
+```
+
+forwards [`mach.lang.manifest.model.link_def`](manifest/model.md#fun-link_def)
+
 ## fwd mach.lang.manifest.model.dnit
 
 ```mach
@@ -263,6 +295,14 @@ fwd mach.lang.manifest.artifact.linkage_resolved
 ```
 
 forwards [`mach.lang.manifest.artifact.linkage_resolved`](manifest/artifact.md#fun-linkage_resolved)
+
+## fwd mach.lang.manifest.artifact.product_choices
+
+```mach
+fwd mach.lang.manifest.artifact.product_choices
+```
+
+forwards [`mach.lang.manifest.artifact.product_choices`](manifest/artifact.md#fun-product_choices)
 
 ## fwd mach.lang.manifest.project.expand_project_work
 
@@ -503,6 +543,14 @@ fwd mach.lang.manifest.load.read_at
 ```
 
 forwards [`mach.lang.manifest.load.read_at`](manifest/load.md#fun-read_at)
+
+## fwd mach.lang.manifest.load.check
+
+```mach
+fwd mach.lang.manifest.load.check
+```
+
+forwards [`mach.lang.manifest.load.check`](manifest/load.md#fun-check)
 
 ## fwd mach.lang.manifest.plan.BuildUnit
 

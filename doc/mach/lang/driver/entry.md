@@ -1,9 +1,8 @@
 # mach.lang.driver.entry
 
 an entry build: one artifact of one entry file built with no mach.toml, the command line
-stating the whole project. the project it states is written as manifest text and read
-through the manifest's own parser, so an entry build is held to every rule a declared
-project is, and the build that follows cannot tell the two apart
+stating the whole project. the project it states is made as the manifest's model and held to
+the checks every manifest passes, so the build that follows cannot tell the two apart
 
 ## rec Narrowing
 
@@ -52,10 +51,10 @@ debug: the build emits debug information
 pub fun entry_manifest(s: *session.Session, r: *EntryRequest) res[manifest.Manifest, fail.Fail];
 ```
 
-the project an entry build states, read as its manifest. the project root is the current
+the project an entry build states, made as its manifest. the project root is the current
 directory, so `-o` and `-w` keep the rules they keep in a project
 
-s: the session the manifest is read in, which holds its text
+s: the session whose build allocator owns the manifest and whose interner holds its names
 r: what the command line states
 ret: the manifest, owned by the session's build allocator; err as the command line names
      no buildable project

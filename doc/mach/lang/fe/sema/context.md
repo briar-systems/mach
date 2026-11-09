@@ -442,11 +442,13 @@ pub fun symbol_for_type(sc: *SemaContext, tid: ast_id.TypeId) opt[*resolve.Symbo
 
 the symbol a type names, none when it names none
 
-## fun machine_of
+## fun laying_of
 
 ```mach
-pub fun machine_of(sc: *SemaContext) layout.Machine;
+pub fun laying_of(sc: *SemaContext) *extent.Laying;
 ```
+
+what the build lays its types out by, nil where it opened no target
 
 ## fun report
 

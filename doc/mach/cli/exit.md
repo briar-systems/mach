@@ -6,8 +6,7 @@
 pub val OK: i64 = 0
 ```
 
-the command did what it was asked; help renders every shared code from SHARED and
-render_fail maps a failure to one through `of`, so the two cannot disagree
+the command did what it was asked
 
 ## val USER
 
@@ -42,41 +41,6 @@ pub val TIMEOUT: i64 = 124
 
 `mach run` stopped the program at its --timeout; 124 as GNU timeout reports it,
 apart from ENVIRONMENT so a script can tell the two apart
-
-## rec Exit
-
-```mach
-pub rec Exit;
-```
-
-one exit code a command's help documents
-
-code: the process exit code, or PASSTHROUGH
-meaning: what it means
-
-## val PASSTHROUGH
-
-```mach
-pub val PASSTHROUGH: i64 = -1
-```
-
-the code of an exit note for the codes a command forwards from another process
-
-## val SHARED_N
-
-```mach
-pub val SHARED_N: usize = 4
-```
-
-length of SHARED
-
-## val SHARED
-
-```mach
-pub val SHARED: [SHARED_N]Exit = [SHARED_N]Exit;
-```
-
-the codes every command can exit with, in ascending order
 
 ## fun of
 

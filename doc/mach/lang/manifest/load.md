@@ -119,3 +119,18 @@ pub fun doc_dnit(alloc: *A.Allocator, d: *Doc);
 
 release a doc and everything it owns
 
+## fun check
+
+```mach
+pub fun check(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[fail.Fail];
+```
+
+the checks every manifest model passes, whether decoded from mach.toml or made by an entry
+build: the rules that span its entries and values, then the host target it builds for where
+it declares none
+
+alloc: owns the model's arrays and a refusal's text
+itn: holds the model's strings
+m: the model, which gains its native target where it declares none
+ret: ok, or the first refusal
+

@@ -65,6 +65,15 @@ pub fun arch_name(id: u32) str;
 
 the name of the architecture tag `id`, "unknown" for NONE or an id past the list
 
+## fun abi_id
+
+```mach
+pub fun abi_id(row: *mink_arch.Abi) u32;
+```
+
+the id of mink's convention row `row`: the id of its spelling, which every row of that
+spelling shares, NONE for a row no family of mink's architectures names
+
 ## fun abi_named
 
 ```mach
