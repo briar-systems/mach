@@ -92,21 +92,6 @@ pub fun expand_artifact_output(alloc: *A.Allocator, itn: *intern.Interner, a: *A
 
 expand an artifact's `out` for the target `vars` names; a refusal points at the `out` value
 
-## fun linkage_resolved
-
-```mach
-pub fun linkage_resolved(a: *A.Allocator, t: *resolved.Target, named: opt[*Linkage], from: *Origin) res[*Linkage, fail.Fail];
-```
-
-the linkage of the executable an artifact stating `named`, none for the target's default,
-builds for `t`, as mink resolves it against the host. a refusal of a linkage the artifact
-names says where it was written and points at it
-
-a: owns the refusal's text
-t: the resolved target
-named: the artifact's `linkage`
-from: where it was written
-
 ## fun artifact_supports_target
 
 ```mach

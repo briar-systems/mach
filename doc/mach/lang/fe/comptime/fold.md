@@ -53,7 +53,7 @@ refused: the folder refused it otherwise, which no request comptime makes can do
 ## fun fold_op
 
 ```mach
-pub fun fold_op(op: Opcode, k: Kind, x: [3]wide.Wide, n: u32, to: opt[Kind], nans: resolved.Nans) Answer;
+pub fun fold_op(op: Opcode, k: Kind, x: [3]wide.Wide, n: u32, to: opt[Kind], nans: target_facts.Nans) Answer;
 ```
 
 fold `op` over `n` operands of kind `k`, the results read at `out`, with the
@@ -77,7 +77,7 @@ an integer operation at comptime's width over one or two operands
 ## fun flt
 
 ```mach
-pub fun flt(op: Opcode, w: float.FloatWidth, x: f64, y: f64, n: u32, nans: resolved.Nans) Answer;
+pub fun flt(op: Opcode, w: float.FloatWidth, x: f64, y: f64, n: u32, nans: target_facts.Nans) Answer;
 ```
 
 a float operation at width `w` over one or two operands, each the f64 that holds
@@ -86,7 +86,7 @@ its value at that width, a nan result made by the target's rule `nans`
 ## fun convert
 
 ```mach
-pub fun convert(op: Opcode, from: Kind, x: wide.Wide, to: Kind, nans: resolved.Nans) Answer;
+pub fun convert(op: Opcode, from: Kind, x: wide.Wide, to: Kind, nans: target_facts.Nans) Answer;
 ```
 
 a conversion of `x`, read as `from`, to `to` by mirl's conversion row `op`, a nan

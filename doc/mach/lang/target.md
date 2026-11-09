@@ -1,15 +1,10 @@
 # mach.lang.target
 
-target resolution: a target request read against the owners' catalogs
+what a target builds: the host the compiler names, mink's products and linkages, the
+name an artifact's file takes and what the target's object format holds
 
-a request names an architecture and a system as mink spells them, the
-environment its manifest states, a calling convention, a baseline as masc
-spells one and the extensions it adds. each part is looked up in its owner's
-catalog: mink's architecture and system lists, the host mink states for them,
-masc's extension catalog of the architecture, and the target mirl assembles
-from the five. every fact the build reads of a target comes from those rows,
-and mach states none of them. what mach requires of the images it builds,
-where the manifest states nothing, is its own data (mach.lang.target.defaults)
+a target is resolved through mink's catalog and masc's check (mach.lang.target.resolved),
+and every fact read here is read from that resolution's rows
 
 ## fwd resolved.Target
 
@@ -18,54 +13,6 @@ fwd resolved.Target
 ```
 
 forwards [`mach.lang.target.resolved.Target`](target/resolved.md#rec-target)
-
-## rec TargetRequest
-
-```mach
-pub rec TargetRequest;
-```
-
-## fun target_request
-
-```mach
-pub fun target_request(arch_name: str, sys_name: str, abi_name: str) TargetRequest;
-```
-
-## fun with_isa
-
-```mach
-pub fun with_isa(req: *TargetRequest, isa_name: str);
-```
-
-## fun with_code_model
-
-```mach
-pub fun with_code_model(req: *TargetRequest, code_model: str);
-```
-
-## fun with_extensions
-
-```mach
-pub fun with_extensions(req: *TargetRequest, names: *str, count: u32);
-```
-
-## fun with_of
-
-```mach
-pub fun with_of(req: *TargetRequest, of_name: str);
-```
-
-## fun with_env
-
-```mach
-pub fun with_env(req: *TargetRequest, env_name: str, origin: str);
-```
-
-## fun with_image
-
-```mach
-pub fun with_image(req: *TargetRequest, base: u64, stack_reserve: u64, stack_commit: u64);
-```
 
 ## fun host_arch_name
 
@@ -91,31 +38,14 @@ pub fun host_abi_name() str;
 
 the calling convention the compiler itself was built for, as its manifest names it
 
-## fun host_request
+## fun host
 
 ```mach
-pub fun host_request() TargetRequest;
+pub fun host(a: *A.Allocator) res[resolved.Target, fail.Fail];
 ```
 
-the request a `native` selection resolves: the host's architecture, system and
-convention as the compiler's own manifest names them. no environment is filled
-in, since env comes from a manifest alone
-
-## fun set_of
-
-```mach
-pub fun set_of(arch: *mink_arch.Arch) opt[*masc_set.Set];
-```
-
-masc's instruction set for `arch`, none where masc serves it with none
-
-## fun resolve
-
-```mach
-pub fun resolve(a: *A.Allocator, req: *TargetRequest) res[resolved.Target, fail.Fail];
-```
-
-the target a request names, every fact of it read from its owners
+the target a `native` selection resolves: the host's architecture, system and convention
+as the compiler's own manifest names them, every other part mink's default
 
 ## rec ArtifactName
 
@@ -132,12 +62,11 @@ suffix: written after its name, with its dot
 ## fun linkage_of
 
 ```mach
-pub fun linkage_of(a: *A.Allocator, t: *resolved.Target, given: str, kind: diagnostic_kind.Kind) res[*Linkage, fail.Fail];
+pub fun linkage_of(a: *A.Allocator, t: *resolved.Target, kind: diagnostic_kind.Kind) res[*Linkage, fail.Fail];
 ```
 
-the linkage of an executable built for `t`, as mink's catalog resolves it against the host:
-the one `given` names in mink's spelling, or the host's default for nil. refused in mink's
-words, as a user failure of `kind`, where the host's loader runs no executable of it or none
+the linkage of an executable built for `t`: the one its narrowing names, else the host's
+default. refused in mink's words, as a user failure of `kind`, where the host runs none
 
 ## fun is_library
 
@@ -171,19 +100,19 @@ its own. none for a static library, which mink archives rather than links
 pub fun executable_output(a: *A.Allocator, t: *resolved.Target) res[*mink_output.Kind, fail.Fail];
 ```
 
-the image kind of the executable a build for `t` links: the linkage under build, else the
-host's default, refused where the host runs no executable
+the image kind of the executable a build for `t` links, refused where the host runs no
+executable
 
 ## fun artifact_naming
 
 ```mach
-pub fun artifact_naming(a: *A.Allocator, t: *resolved.Target, p: *Product, given: str) res[ArtifactName, fail.Fail];
+pub fun artifact_naming(a: *A.Allocator, t: *resolved.Target, p: *Product) res[ArtifactName, fail.Fail];
 ```
 
 the name an artifact of product `p` takes on the target, mink's system's name of the file:
 an archive for a static library, and for every other product the kind of file its image
-reads back as, an executable's under the linkage `given` names, nil for the host's default.
-refused, with mink's reason, where the system builds none
+reads back as, an executable's under the linkage the target resolved to. refused, with
+mink's reason, where the system builds none
 
 ## fun finished_modules
 
@@ -219,24 +148,4 @@ pub fun carries_record(t: *resolved.Target) bool;
 
 whether a module's object is read again by a link or the cache, so it carries
 mach's record section: every object but a flat image's and a finished module's
-
-## rec Cell
-
-```mach
-pub rec Cell;
-```
-
-one target the new path builds: a host mink states, the convention and the floor
-it runs under, as mirl assembles them
-
-## fun cells
-
-```mach
-pub fun cells(a: *A.Allocator, out: *Vector[Cell]) err[fail.Fail];
-```
-
-every target the new path builds over its host's floor, in mink's system order: each
-host row of each system, under the convention it calls by default, else each its
-architecture's family names, that mirl assembles a target from. a host that states no
-floor is a target only with the `isa` its chip implements, so it is not listed
 

@@ -59,8 +59,8 @@ mirl: mirl's stages and counts, masc's beside them, all zero for an untimed job
 pub rec Made;
 ```
 
-a module's object and the facts its lowering kept, both owned by the caller, and what the
-step measured of it
+a module's object and the warnings mirl gave compiling it, the facts its lowering kept, all
+owned by the caller, and what the step measured of it
 
 ## fun make
 

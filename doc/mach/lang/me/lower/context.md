@@ -15,9 +15,7 @@ pub rec Machine;
 the target lowering builds for: the tuple its modules are named for, the target mirl
 assembled from it, and the context the build's selection opened, none for a target with
 no baseline
-slots:  the address space the target's frame slots live in
-timing: how masc's instruction set for the target answers a constant-time requirement,
-        none when masc serves the architecture with none
+slots: the address space the target's frame slots live in
 
 ## fun machine_of
 
@@ -181,7 +179,7 @@ comptime scope over its constants that this lowering owns, so what an instance b
 pub fun request(
 s: *session.Session,
 l: *linkage.Linkage,
-tgt: *resolved.Target,
+facts: *target_facts.Facts,
 machine: *Machine,
 malloc: *A.Allocator,
 a: *ast.Ast,
@@ -858,6 +856,15 @@ lowering keeps no debug information
 ```mach
 pub fun symbol_of(lc: *LowerContext, sid: resolve.SymbolId) opt[*resolve.Symbol];
 ```
+
+## fun symbol_name
+
+```mach
+pub fun symbol_name(lc: *LowerContext, name: intern.StrId) Id[Name];
+```
+
+the handle of the symbol name `name` in the module's names, interned once, by which its
+function or global is declared. a refusal faults the builder, which the declaration reports
 
 ## fun external_linkage
 

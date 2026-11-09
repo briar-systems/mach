@@ -211,6 +211,14 @@ pub fun sext(a: Wide, bits: u32) Wide;
 pub fun fits_unsigned(a: Wide, bits: u32) bool;
 ```
 
+## fun fits_signed
+
+```mach
+pub fun fits_signed(a: Wide, bits: u32) bool;
+```
+
+whether `a`, read as signed, lies in the range of a signed `bits`-wide integer, `bits` in 1..128
+
 ## fun bit_length
 
 ```mach

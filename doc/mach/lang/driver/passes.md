@@ -165,11 +165,11 @@ the test object's codegen product is current or cached, so no worker generates i
 ## fun compile_module
 
 ```mach
-pub fun compile_module(p: *project.Project, m: *Module, name: str) res[Object, fail.Fail];
+pub fun compile_module(p: *project.Project, diags: *diagnostic.DiagnosticStore, m: *Module, name: str) res[Object, fail.Fail];
 ```
 
 the mirl module `m` compiled into an object, which owns its storage in the session's backing
-allocator. compiling spends the module
+allocator, the warnings mirl gave reported on `diags`. compiling spends the module
 
 ## fun run_link_pass
 
