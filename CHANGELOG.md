@@ -16,7 +16,10 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 ### Changed
 - **Breaking:** a target names its parts as the whole toolchain does. `[target.*]` writes `arch` for the architecture (v6 `isa`), `isa` for the instruction set every machine of the target has (v6 `baseline`), `sys` for the system (v6 `os`) and `ext` for its extensions (v6 `extensions`), and `[link.*]` filters by `sys` and `arch`. Templates read `{target.arch}` and `{target.sys}`, comptime reads `$mach.sys.*`, `$mach.build.sys`, `$mach.build.ext.*` and `$project.target.sys`, the extension decorator is `#[ext(...)]`, a build step's environment carries `MACH_TARGET_ARCH` and `MACH_TARGET_SYS`, and `mach info` prints `sys`. Each v6 name is refused naming its v7 one and carries the rewrite `mach migrate` applies, and an `isa` that names an architecture is refused as v6's `arch`.
 
+- **Breaking:** an `object` artifact takes no `out`. Its objects stay under `obj/` for a later link, so an `out` nothing read is refused, and `mach migrate` removes it. Every other kind still requires `out`, and `{artifact.<id>.out}` naming an object artifact is refused.
+
 ### Fixed
+- An entry build's `-k object -o <path>` writes the build's one object to the path, and refuses a build that writes more than one, where it exited 0 having written nothing.
 - A second `mach build` of a wasi project over its work directory no longer links freed memory. The object read back from the cache owns the file bytes a wasm conversion borrows from, where the build freed them first and could fault in the link.
 - `mach test` on a wasi target links. A wasm function now counts as defined, so a module's test object no longer defines its module's functions a second time beside the module's object.
 - An expression that nests deeper than name resolution can descend reports its located `syntax.nesting_depth` refusal through the editor's project load, where sema then met the identifiers resolution never reached and replaced the refusal with an internal error.

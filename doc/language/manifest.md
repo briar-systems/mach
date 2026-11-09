@@ -1305,7 +1305,7 @@ reads the selected artifact's name.
 | `kind`    | yes | What the artifact is, by mink's product name: `"bin"` (an executable), `"static"` (a static library), `"shared"` (a shared library), `"object"` (each module's object, for a later link) or `"module"` (a module a runtime instantiates, such as a SPIR-V module). Any other value is refused listing mink's products (see below). |
 | `linkage` | absent: the target's default | How a `bin` is linked, by mink's linkage name: `"pie"`, `"dynamic"` or `"static"`. A name mink has no linkage of is refused listing them, and the key is refused on any other `kind`, naming it. A linkage the target's loader does not run is refused when the target resolves, pointing at the key and listing those it runs, its default first, as `mach info targets` shows them. |
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
-| `out`     | yes | This artifact's output path, relative to the project root like every other path. Write `{project.work}/bin/demo` to place it under the build output, or any other project path to place it there. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
+| `out`     | every kind but `object` | This artifact's output path, relative to the project root like every other path. An `object` artifact states none, since its objects stay under `obj/` for a later link: stating it is refused, and `mach migrate` removes it. Write `{project.work}/bin/demo` to place it under the build output, or any other project path to place it there. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | absent: links nothing | Array of `[link.X]` names this artifact links (see below). A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names no [link.*] table: 'nosuch' (declared: [link.kernel32])`). |
 | `need`    | absent: needs nothing | Array of category-qualified requirements such as `step.generate`, `artifact.support`, and `artifact.shader-*`. Each glob matches only its named category. See [Artifact requirements](#artifact-requirements). |
@@ -1334,7 +1334,9 @@ any of them (see [test.md](test.md#which-tests-run)).
   such as `spirv` it is the entry module, written at `out` unlinked. A format
   mink builds no module in, such as ELF, refuses it.
 - **`object`** is each module's object, written under `obj/` for a later link,
-  as `--emit obj` writes them.
+  as `--emit obj` writes them. It takes no `out`, and `{artifact.<id>.out}` names
+  none. An entry build's `-k object -o <path>` writes its object there when the
+  build writes exactly one.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
   as a `.a`. The archive carries its link claims: every object mach emits states
