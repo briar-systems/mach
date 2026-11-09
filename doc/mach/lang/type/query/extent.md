@@ -20,7 +20,7 @@ generation: the projection generation `mapped` was made under, since a later one
 ## fun open
 
 ```mach
-pub fun open(a: *A.Allocator, target: *mirl_target.Target, ctx: opt[*core_state.Context]) res[*Laying, fail.Fail];
+pub fun open(a: *A.Allocator, target: *mirl_record.Target, ctx: opt[*core_state.Context]) res[*Laying, fail.Fail];
 ```
 
 a laying over `target` under the context `ctx`, both borrowed. given back by close

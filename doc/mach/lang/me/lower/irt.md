@@ -294,7 +294,7 @@ parameter `i` of a signature, NONE past them
 ## fun size
 
 ```mach
-pub fun size(l: *mirl_target.Layout, ty: Type) res[u64, fail.Fail];
+pub fun size(l: *mirl_layout.Layout, ty: Type) res[u64, fail.Fail];
 ```
 
 the size in bytes the target's data layout gives `ty`
@@ -302,7 +302,7 @@ the size in bytes the target's data layout gives `ty`
 ## fun align
 
 ```mach
-pub fun align(l: *mirl_target.Layout, ty: Type) res[u64, fail.Fail];
+pub fun align(l: *mirl_layout.Layout, ty: Type) res[u64, fail.Fail];
 ```
 
 the alignment in bytes the target's data layout gives `ty`
@@ -310,7 +310,7 @@ the alignment in bytes the target's data layout gives `ty`
 ## fun offset
 
 ```mach
-pub fun offset(l: *mirl_target.Layout, ty: Type, i: u32) res[u64, fail.Fail];
+pub fun offset(l: *mirl_layout.Layout, ty: Type, i: u32) res[u64, fail.Fail];
 ```
 
 the byte offset of member `i` of a structure or union
@@ -318,7 +318,7 @@ the byte offset of member `i` of a structure or union
 ## fun stride
 
 ```mach
-pub fun stride(l: *mirl_target.Layout, ty: Type) res[u64, fail.Fail];
+pub fun stride(l: *mirl_layout.Layout, ty: Type) res[u64, fail.Fail];
 ```
 
 the bytes from one element of the array `ty` to the next
@@ -326,7 +326,7 @@ the bytes from one element of the array `ty` to the next
 ## fun padded
 
 ```mach
-pub fun padded(l: *mirl_target.Layout, t: *types.Table, ty: Type) res[bool, fail.Fail];
+pub fun padded(l: *mirl_layout.Layout, t: *types.Table, ty: Type) res[bool, fail.Fail];
 ```
 
 whether `ty` lays out a byte no member or element of it covers: a gap between a

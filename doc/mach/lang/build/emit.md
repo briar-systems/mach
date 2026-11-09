@@ -26,7 +26,7 @@ release loaded image options; nil options own nothing
 ## fun load_image_options
 
 ```mach
-pub fun load_image_options(p: *project.Project, out_kind: *Product,
+pub fun load_image_options(p: *project.Project, out_kind: Spelled,
 exe_path: *u8) res[LoadedImageOptions, fail.Fail];
 ```
 

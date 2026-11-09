@@ -64,7 +64,7 @@ release an outcome and everything it recorded; nil is a no-op
 ## fun record_artifact
 
 ```mach
-pub fun record_artifact(bo: *BuildOutcome, kind: *Product, path: str) err[A.Error];
+pub fun record_artifact(bo: *BuildOutcome, kind: Spelled, path: str) err[A.Error];
 ```
 
 every record_* copies what it stores into the outcome's allocator; a refused

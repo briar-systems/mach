@@ -56,7 +56,7 @@ a signless integer of `bits`, rounded up to a width mirl holds
 ## fun format
 
 ```mach
-pub fun format(bits: u32) opt[types.Format];
+pub fun format(bits: u32) opt[types_format.Format];
 ```
 
 the format of a float of `bits`, none for a width mirl has no format for

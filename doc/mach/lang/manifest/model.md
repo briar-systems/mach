@@ -104,7 +104,7 @@ one `[artifact.<name>]` table as parsed. the three arrays are owned by the
 manifest and freed by `dnit`
 
 name: the table key; a portable identifier
-kind: the required `kind` key, mink's product of that name
+kind: the required `kind` key, as mink's output kinds spell it
 entry: the required `entry` key, a project-relative path under `[project].src`
 out: the `out` key, an unexpanded path template relative to the project root;
                `{project.work}` places the output under the work directory. STR_NIL for an

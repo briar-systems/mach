@@ -15,7 +15,7 @@ pub rec Builder;
 ## fun init
 
 ```mach
-pub fun init(m: *module.Module, a: *A.Allocator, target: *mirl_target.Target, ctx: opt[*core_state.Context], slots: u32, sources: *lang_source.SourceMap, debug_info: bool) Builder;
+pub fun init(m: *module.Module, a: *A.Allocator, target: *mirl_record.Target, ctx: opt[*core_state.Context], slots: u32, sources: *lang_source.SourceMap, debug_info: bool) Builder;
 ```
 
 a builder over `m`, whose types the target's layout lays out under the build's context,
