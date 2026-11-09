@@ -67,6 +67,8 @@ target: mink's resolution, its rows nil where no target is selected. its `ext`
 added: the names of masc's catalog the target adds over its baseline
 added_count: how many
 selected: masc's closed selection of the instruction set with what the target adds
+code_model: the code model the narrowing names, none where the target takes its host's
+               default, which mirl reads as unpicked
 product: the product of the artifact under build, which mirl's address model reads:
                a shared object's exported definitions another image may preempt. none
                where no artifact selected the target
@@ -171,11 +173,11 @@ the system and the architecture named `sys` and `arch`, each a row's name, as a 
 ## fun resolve
 
 ```mach
-pub fun resolve(a: *A.Allocator, s: mink_target.Spec, n: *mink_target.Narrowing, of: str, image: Image) res[Target, Refused];
+pub fun resolve(a: *A.Allocator, s: mink_target.Spec, n: *mink_target.Narrowing, image: Image) res[Target, Refused];
 ```
 
-the target `s` narrowed by `n` resolves to, its objects in the format `of` names of
-those its system writes, nil for mink's, with the image keys `image` states. mink
-resolves every part, and masc checks the instruction set and the extensions the
-narrowing adds. the target holds the names of the extensions, so `n` need not outlive it
+the target `s` narrowed by `n` resolves to, with the image keys `image` states. mink
+resolves every part, the object format included, and masc checks the instruction set and
+the extensions the narrowing adds. the target holds the names of the extensions, and
+borrows the narrowing's other text
 
