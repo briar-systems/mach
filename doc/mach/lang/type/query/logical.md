@@ -52,7 +52,7 @@ the types a declaration is being spelled through, innermost first
 ## fun pointer_names
 
 ```mach
-pub fun pointer_names(q: *type_query.Query, path: *Path, ptr: type.TypeId) opt[type.TypeId];
+pub fun pointer_names(q: *type_query.Query, path: *Path, ptr: type_kind.TypeId) opt[type_kind.TypeId];
 ```
 
 the record or union a pointer to `ptr`'s base names instead of spelling it, when that
@@ -61,7 +61,7 @@ base lies on a cycle with the record or union `path` is spelling it inside
 ## fun on_cycle
 
 ```mach
-pub fun on_cycle(q: *type_query.Query, tid: type.TypeId) bool;
+pub fun on_cycle(q: *type_query.Query, tid: type_kind.TypeId) bool;
 ```
 
 whether record or union `tid` reaches itself through its members
@@ -69,7 +69,7 @@ whether record or union `tid` reaches itself through its members
 ## fun refusal
 
 ```mach
-pub fun refusal(q: *type_query.Query, tid: type.TypeId) Refusal;
+pub fun refusal(q: *type_query.Query, tid: type_kind.TypeId) Refusal;
 ```
 
 why a logical-addressing target cannot declare `tid`, REFUSAL_NONE when it can

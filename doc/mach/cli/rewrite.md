@@ -102,7 +102,7 @@ the text of the file at `path`, none when it cannot be read as one
 ## fun source_dir_of
 
 ```mach
-pub fun source_dir_of(a: *A.Allocator, doc: *manifest.Doc) res[str, fail.Fail];
+pub fun source_dir_of(a: *A.Allocator, doc: *manifest_load.Doc) res[str, fail.Fail];
 ```
 
 `source_dir` of a manifest already read

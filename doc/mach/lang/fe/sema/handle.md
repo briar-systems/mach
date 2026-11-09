@@ -45,7 +45,7 @@ pub fun validate(sc: *sema_context.SemaContext, d: *ast_decl.Decl, dec: *ast_dec
 ## fun type_of
 
 ```mach
-pub fun type_of(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl) type.TypeId;
+pub fun type_of(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl) type_kind.TypeId;
 ```
 
 ## fun check_annotation_handles_all
@@ -60,13 +60,13 @@ chain of defs each over the one before does, is walked once rather than once per
 ## fun type_carries_handle
 
 ```mach
-pub fun type_carries_handle(sc: *sema_context.SemaContext, t: type.TypeId) bool;
+pub fun type_carries_handle(sc: *sema_context.SemaContext, t: type_kind.TypeId) bool;
 ```
 
 ## fun annotation_refuses_indirection
 
 ```mach
-pub fun annotation_refuses_indirection(sc: *sema_context.SemaContext, ann: ast_id.TypeId, t: type.TypeId) bool;
+pub fun annotation_refuses_indirection(sc: *sema_context.SemaContext, ann: ast_id.TypeId, t: type_kind.TypeId) bool;
 ```
 
 a binding whose written annotation holds a chain of pointers over a handle has drawn that

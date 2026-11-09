@@ -176,7 +176,7 @@ pub fun module_dnit(a: *A.Allocator, m: *Module);
 ## fun module_find
 
 ```mach
-pub fun module_find(l: *Loader, fqn: intern.StrId) opt[session.ModuleId];
+pub fun module_find(l: *Loader, fqn: intern.StrId) opt[module.ModuleId];
 ```
 
 the id of the module named `fqn`, none when the load has not reached it
@@ -184,7 +184,7 @@ the id of the module named `fqn`, none when the load has not reached it
 ## fun module_of
 
 ```mach
-pub fun module_of(l: *Loader, sid: session.StableModuleId) session.ModuleId;
+pub fun module_of(l: *Loader, sid: module.StableModuleId) module.ModuleId;
 ```
 
 the id of the module a load product names by stable id, MODULE_NIL when the load has not reached it
@@ -198,7 +198,7 @@ pub fun module_count(l: *Loader) u32;
 ## fun module_open
 
 ```mach
-pub fun module_open(l: *Loader, fqn: intern.StrId) res[session.ModuleId, fail.Fail];
+pub fun module_open(l: *Loader, fqn: intern.StrId) res[module.ModuleId, fail.Fail];
 ```
 
 parse the module `fqn` names without walking it, as a root a later phase reads alone
@@ -206,7 +206,7 @@ parse the module `fqn` names without walking it, as a root a later phase reads a
 ## fun module_load
 
 ```mach
-pub fun module_load(l: *Loader, fqn: intern.StrId) res[session.ModuleId, fail.Fail];
+pub fun module_load(l: *Loader, fqn: intern.StrId) res[module.ModuleId, fail.Fail];
 ```
 
 load the module `fqn` names and everything it reaches: each is parsed, its gates decided and
@@ -215,7 +215,7 @@ its imports loaded first, then handed to the host as done
 ## fun module_reload
 
 ```mach
-pub fun module_reload(l: *Loader, mid: session.ModuleId) res[bool, fail.Fail];
+pub fun module_reload(l: *Loader, mid: module.ModuleId) res[bool, fail.Fail];
 ```
 
 reparse and re-walk one loaded module in place, after its text changed, and say whether its load
@@ -248,7 +248,7 @@ the record of what the import declaration `decl` binds, none when the load recor
 ## fun decorators_record
 
 ```mach
-pub fun decorators_record(l: *Loader, mid: session.ModuleId) err[fail.Fail];
+pub fun decorators_record(l: *Loader, mid: module.ModuleId) err[fail.Fail];
 ```
 
 records the load's reading of the module's decorator arguments, in the build target's frame the
@@ -257,7 +257,7 @@ walk bound: the string each argument that takes one evaluates to, and what each 
 ## fun embeds_record
 
 ```mach
-pub fun embeds_record(s: *session.Session, c: *comptime.ComptimeCtx, a: *ast.Ast, fqn: intern.StrId,
+pub fun embeds_record(s: *session.Session, c: *comptime_scope.ComptimeCtx, a: *ast.Ast, fqn: intern.StrId,
 reached: *bool) err[fail.Fail];
 ```
 

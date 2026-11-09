@@ -270,19 +270,19 @@ when it defines none, SYMBOL_AMBIGUOUS when more than one declaration does
 ## fun stable_of_module
 
 ```mach
-pub fun stable_of_module(s: *session.Session, mid: session.ModuleId) session.StableModuleId;
+pub fun stable_of_module(s: *session.Session, mid: module.ModuleId) module.StableModuleId;
 ```
 
 ## fun type_owner
 
 ```mach
-pub fun type_owner(s: *session.Session, mid: session.ModuleId, file: lang_source.FileId) type.TypeOwner;
+pub fun type_owner(s: *session.Session, mid: module.ModuleId, file: lang_source.FileId) type.TypeOwner;
 ```
 
 ## fun origin_of
 
 ```mach
-pub fun origin_of(s: *session.Session, sym: *Symbol) session.ModuleId;
+pub fun origin_of(s: *session.Session, sym: *Symbol) module.ModuleId;
 ```
 
 the module a symbol is defined in, as the current operation numbers it
@@ -290,7 +290,7 @@ the module a symbol is defined in, as the current operation numbers it
 ## fun foreign_to
 
 ```mach
-pub fun foreign_to(s: *session.Session, sym: *Symbol, own: session.ModuleId) bool;
+pub fun foreign_to(s: *session.Session, sym: *Symbol, own: module.ModuleId) bool;
 ```
 
 whether `sym` names a binding a module other than `own` declares: an import, or a `fwd` of one,
@@ -299,7 +299,7 @@ which carries the kind the binding is declared with there as its own
 ## fun use_target
 
 ```mach
-pub fun use_target(s: *session.Session, sym: *Symbol) session.ModuleId;
+pub fun use_target(s: *session.Session, sym: *Symbol) module.ModuleId;
 ```
 
 the module a `use` symbol names, as the current operation numbers it
@@ -307,7 +307,7 @@ the module a `use` symbol names, as the current operation numbers it
 ## fun use_stable
 
 ```mach
-pub fun use_stable(sym: *Symbol) session.StableModuleId;
+pub fun use_stable(sym: *Symbol) module.StableModuleId;
 ```
 
 the stable id of the module a `use` symbol names, nil for any other symbol
@@ -328,7 +328,7 @@ exports: what a module exports to an importer, its symbols allocated from the al
 
 ```mach
 pub fun result_exports(alloc: *A.Allocator, rr: *ResolveResult, path: intern.StrId,
-stable: session.StableModuleId) res[ModuleExports, fail.Fail];
+stable: module.StableModuleId) res[ModuleExports, fail.Fail];
 ```
 
 what a finished resolution of module `stable` exports to an importer
@@ -375,9 +375,9 @@ pub fun resolve(
 s: *session.Session,
 a: *ast.Ast,
 deps: *ResolveDeps,
-load: *comptime.ComptimeCtx,
-own_module: session.ModuleId,
-own_stable: session.StableModuleId,
+load: *comptime_scope.ComptimeCtx,
+own_module: module.ModuleId,
+own_stable: module.StableModuleId,
 diags: *diagnostic.DiagnosticStore) res[ResolveResult, fail.Fail];
 ```
 
@@ -387,7 +387,7 @@ resolve reads and never writes; what resolve binds is its result's
 ## fun decorators_deprecation
 
 ```mach
-pub fun decorators_deprecation(c: *comptime.ComptimeCtx, a: *ast.Ast, start: u32, len: u32) res[deprecation.Deprecation, fail.Fail];
+pub fun decorators_deprecation(c: *comptime_scope.ComptimeCtx, a: *ast.Ast, start: u32, len: u32) res[deprecation.Deprecation, fail.Fail];
 ```
 
 the message is the string the argument evaluates to; one that is not a

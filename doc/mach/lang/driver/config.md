@@ -16,7 +16,7 @@ runner: the runner the target declares, none when it declares none
 ## fun resolve_run_artifact
 
 ```mach
-pub fun resolve_run_artifact(alloc: *A.Allocator, project_root: str, selectors: *manifest.Selectors,
+pub fun resolve_run_artifact(alloc: *A.Allocator, project_root: str, selectors: *manifest_select.Selectors,
 output_override: str) res[RunArtifact, fail.Fail];
 ```
 
@@ -33,7 +33,7 @@ ret: the executable; err from the manifest or selection, when the selection
 ## fun load_config_manifest
 
 ```mach
-pub fun load_config_manifest(p: *project.Project, project_root: str, m: *manifest.Manifest, closure: *project.Closure, c: *manifest.Cell,
+pub fun load_config_manifest(p: *project.Project, project_root: str, m: *manifest_model.Manifest, closure: *project.Closure, c: *manifest_select.Cell,
 owner: str, for_union: bool) err[fail.Fail];
 ```
 

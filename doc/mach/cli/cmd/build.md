@@ -49,7 +49,7 @@ plans: one plan per profile; each plans that profile's cells
 
 ```mach
 pub fun plan_invocation(a: *A.Allocator, root: str, cli: *args.CliArgs, goal: request.BuildGoal,
-mode: manifest.ArtifactDefault, configure_deps: bool, ps: *session.Session) res[Planned, fail.Fail];
+mode: manifest_select.ArtifactDefault, configure_deps: bool, ps: *session.Session) res[Planned, fail.Fail];
 ```
 
 initialise a session, load the manifest, resolve the selectors and plan a
@@ -73,8 +73,8 @@ ret: the plans, or a Fail: internal for session or registry setup, user for mani
 ## fun plan_selection
 
 ```mach
-pub fun plan_selection(a: *A.Allocator, ps: *session.Session, m: *manifest.Manifest, root: str, cli: *args.CliArgs,
-goal: request.BuildGoal, mode: manifest.ArtifactDefault, configure_deps: bool,
+pub fun plan_selection(a: *A.Allocator, ps: *session.Session, m: *manifest_model.Manifest, root: str, cli: *args.CliArgs,
+goal: request.BuildGoal, mode: manifest_select.ArtifactDefault, configure_deps: bool,
 unrealized: driver_closure.Unrealized) res[Planned, fail.Fail];
 ```
 

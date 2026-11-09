@@ -6,14 +6,6 @@ name an artifact's file takes and what the target's object format holds
 a target is resolved through mink's catalog and masc's check (mach.lang.target.resolved),
 and every fact read here is read from that resolution's rows
 
-## fwd resolved.Target
-
-```mach
-fwd resolved.Target
-```
-
-forwards [`mach.lang.target.resolved.Target`](target/resolved.md#rec-target)
-
 ## fun host_arch_name
 
 ```mach
@@ -76,6 +68,15 @@ pub fun is_library(p: *Product) bool;
 
 whether `p` is a library, which a consumer links against rather than runs: an archive, or an
 image of a kind of file a link binds against
+
+## fun per_module
+
+```mach
+pub fun per_module(p: *Product) bool;
+```
+
+whether `p` is each module's object, written under the obj directory for a later link, so an
+artifact of it delivers no one file at an `out` path
 
 ## fun is_executable
 

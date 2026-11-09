@@ -46,7 +46,7 @@ pub fun dnit(graph: *Graph);
 
 ```mach
 pub fun capture[T](s: *session.Session, a: *A.Allocator, roots: *Roots, count: usize, mode: CaptureMode, ctx: *T,
-prepare: fun(*T, type.TypeId) err[fail.Fail]) res[Graph, fail.Fail];
+prepare: fun(*T, type_kind.TypeId) err[fail.Fail]) res[Graph, fail.Fail];
 ```
 
 ## fun install

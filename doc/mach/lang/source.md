@@ -301,12 +301,6 @@ pub fun copy_file(file: *SourceFile, a: *A.Allocator) res[SourceFile, Error];
 pub fun dnit_file(file: *SourceFile, a: *A.Allocator);
 ```
 
-## fun snapshot_from
-
-```mach
-pub fun snapshot_from(src: *SourceMap, a: *A.Allocator) res[*SourceMap, Error];
-```
-
 ## fun position
 
 ```mach

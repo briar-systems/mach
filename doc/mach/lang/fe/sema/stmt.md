@@ -5,7 +5,7 @@ typing statements, with the comptime `$if` and `$each` that stand among them
 ## fun test_return_type
 
 ```mach
-pub fun test_return_type(sc: *sema_context.SemaContext) type.TypeId;
+pub fun test_return_type(sc: *sema_context.SemaContext) type_kind.TypeId;
 ```
 
 ## fun gate_condition_check
@@ -35,7 +35,7 @@ pub fun gate_verdict_truth(v: comptime_gate.GateVerdict) bool;
 ## fun infer_stmt
 
 ```mach
-pub fun infer_stmt(sc: *sema_context.SemaContext, sid: ast_id.StmtId, fn_ret: type.TypeId) err[fail.Fail];
+pub fun infer_stmt(sc: *sema_context.SemaContext, sid: ast_id.StmtId, fn_ret: type_kind.TypeId) err[fail.Fail];
 ```
 
 ## fun eval_comptime_directive
@@ -47,6 +47,6 @@ pub fun eval_comptime_directive(sc: *sema_context.SemaContext, target: ast_id.Ex
 ## fun check_binding
 
 ```mach
-pub fun check_binding(sc: *sema_context.SemaContext, expected: type.TypeId, eid: ast_id.ExprId, actual: type.TypeId, span: lang_source.Span);
+pub fun check_binding(sc: *sema_context.SemaContext, expected: type_kind.TypeId, eid: ast_id.ExprId, actual: type_kind.TypeId, span: lang_source.Span);
 ```
 

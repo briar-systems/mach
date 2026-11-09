@@ -5,7 +5,7 @@ a generic's body under type arguments: substitution, and the field table an inst
 ## fun apply
 
 ```mach
-pub fun apply(q: *type_query.Query, body_type: type.TypeId, who: *type.GenericOwner, args: *type.TypeId, arg_count: u32) type.TypeId;
+pub fun apply(q: *type_query.Query, body_type: type_kind.TypeId, who: *type.GenericOwner, args: *type_kind.TypeId, arg_count: u32) type_kind.TypeId;
 ```
 
 `body_type` with `who`'s parameters replaced by `args`. the walk recurses as deep as the type
@@ -15,7 +15,7 @@ nests, so it asks for stack before it descends, and a type nested deeper refuses
 ## fun ensure
 
 ```mach
-pub fun ensure(q: *type_query.Query, tid: type.TypeId);
+pub fun ensure(q: *type_query.Query, tid: type_kind.TypeId);
 ```
 
 builds the field table of instance `tid` for the current projection, once
@@ -23,7 +23,7 @@ builds the field table of instance `tid` for the current projection, once
 ## fun apply_or_self
 
 ```mach
-pub fun apply_or_self(q: *type_query.Query, tid: type.TypeId, who: *type.GenericOwner, args: *type.TypeId, arg_len: u32) type.TypeId;
+pub fun apply_or_self(q: *type_query.Query, tid: type_kind.TypeId, who: *type.GenericOwner, args: *type_kind.TypeId, arg_len: u32) type_kind.TypeId;
 ```
 
 `tid` under `who`'s arguments, or itself when there are none
@@ -31,7 +31,7 @@ pub fun apply_or_self(q: *type_query.Query, tid: type.TypeId, who: *type.Generic
 ## fun substitute
 
 ```mach
-pub fun substitute(s: *session.Session, body_type: type.TypeId, who: *type.GenericOwner, args: *type.TypeId, arg_count: u32) res[type.TypeId, fail.Fail];
+pub fun substitute(s: *session.Session, body_type: type_kind.TypeId, who: *type.GenericOwner, args: *type_kind.TypeId, arg_count: u32) res[type_kind.TypeId, fail.Fail];
 ```
 
 replace `who`'s parameters in `body_type` with `args`, position for position;
@@ -41,6 +41,6 @@ instance) stays, so a substituted type reads as the identity under a second pass
 ## fun ensure_fields
 
 ```mach
-pub fun ensure_fields(s: *session.Session, tid: type.TypeId) err[fail.Fail];
+pub fun ensure_fields(s: *session.Session, tid: type_kind.TypeId) err[fail.Fail];
 ```
 

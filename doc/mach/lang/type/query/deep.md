@@ -6,7 +6,7 @@ the declarations so a generic that grows through a pointer still has a finite an
 ## fun public_leaf
 
 ```mach
-pub fun public_leaf(k: type.TypeKind) bool;
+pub fun public_leaf(k: type_kind.TypeKind) bool;
 ```
 
 the kinds that carry no secret of their own; false for every other kind, which a
@@ -15,7 +15,7 @@ walk descends (a partition, enumerated by its test)
 ## fun secret
 
 ```mach
-pub fun secret(q: *type_query.Query, tid: type.TypeId) bool;
+pub fun secret(q: *type_query.Query, tid: type_kind.TypeId) bool;
 ```
 
 whether `tid` reaches a secret
@@ -23,7 +23,7 @@ whether `tid` reaches a secret
 ## fun float
 
 ```mach
-pub fun float(q: *type_query.Query, tid: type.TypeId) bool;
+pub fun float(q: *type_query.Query, tid: type_kind.TypeId) bool;
 ```
 
 whether `tid` reaches a floating-point value, a lane of a vector included
@@ -31,12 +31,12 @@ whether `tid` reaches a floating-point value, a lane of a vector included
 ## fun contains_secret
 
 ```mach
-pub fun contains_secret(s: *session.Session, tid: type.TypeId) res[bool, fail.Fail];
+pub fun contains_secret(s: *session.Session, tid: type_kind.TypeId) res[bool, fail.Fail];
 ```
 
 ## fun contains_float
 
 ```mach
-pub fun contains_float(s: *session.Session, tid: type.TypeId) res[bool, fail.Fail];
+pub fun contains_float(s: *session.Session, tid: type_kind.TypeId) res[bool, fail.Fail];
 ```
 

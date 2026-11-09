@@ -93,7 +93,7 @@ and any other failure is internal
 ## fun scan_begin
 
 ```mach
-pub fun scan_begin(q: *Query, scan: *type.TypeScan) bool;
+pub fun scan_begin(q: *Query, scan: *type_scan.Scan) bool;
 ```
 
 opens `scan` over the store; false, with the failure recorded, when it cannot
@@ -101,13 +101,13 @@ opens `scan` over the store; false, with the failure recorded, when it cannot
 ## fun scan_end
 
 ```mach
-pub fun scan_end(q: *Query, scan: *type.TypeScan);
+pub fun scan_end(q: *Query, scan: *type_scan.Scan);
 ```
 
 ## fun scan_fresh
 
 ```mach
-pub fun scan_fresh(q: *Query, scan: *type.TypeScan, tid: type.TypeId) bool;
+pub fun scan_fresh(q: *Query, scan: *type_scan.Scan, tid: type_kind.TypeId) bool;
 ```
 
 whether `scan` meets `tid` for the first time; a mark that cannot be recorded is a
@@ -116,7 +116,7 @@ failure and reads as already seen, so no walk descends past it
 ## fun expansive_get
 
 ```mach
-pub fun expansive_get(q: *Query, nominal: type.TypeId) opt[bool];
+pub fun expansive_get(q: *Query, nominal: type_kind.TypeId) opt[bool];
 ```
 
 the recorded verdict on whether generic nominal `nominal` is expansive, none while undecided
@@ -124,7 +124,7 @@ the recorded verdict on whether generic nominal `nominal` is expansive, none whi
 ## fun expansive_set
 
 ```mach
-pub fun expansive_set(q: *Query, nominal: type.TypeId, expansive: bool);
+pub fun expansive_set(q: *Query, nominal: type_kind.TypeId, expansive: bool);
 ```
 
 records a verdict once; a nominal already decided keeps its first
@@ -132,7 +132,7 @@ records a verdict once; a nominal already decided keeps its first
 ## fun mentions_get
 
 ```mach
-pub fun mentions_get(q: *Query, nominal: type.TypeId) opt[bool];
+pub fun mentions_get(q: *Query, nominal: type_kind.TypeId) opt[bool];
 ```
 
 the recorded answer to whether `nominal`'s fields mention a type parameter
@@ -140,6 +140,6 @@ the recorded answer to whether `nominal`'s fields mention a type parameter
 ## fun mentions_set
 
 ```mach
-pub fun mentions_set(q: *Query, nominal: type.TypeId, mentions: bool);
+pub fun mentions_set(q: *Query, nominal: type_kind.TypeId, mentions: bool);
 ```
 

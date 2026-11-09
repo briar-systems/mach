@@ -9,13 +9,13 @@ inside itself, and satisfy every exact selector and version range the closure de
 
 ```mach
 pub fun requirer_selector_satisfied(s: *session.Session, gi: *git.Inspector, alias: str, chain: str, project_root: str,
-dir_dep: str, d: *manifest.DepDef, content: intern.StrId, root_own: bool) err[fail.Fail];
+dir_dep: str, d: *manifest_model.DepDef, content: intern.StrId, root_own: bool) err[fail.Fail];
 ```
 
 ## fun realized
 
 ```mach
 pub fun realized(s: *session.Session, gi: *git.Inspector, alias: str, parent_root: str,
-dep_dir: str, dir_dep: str, d: *manifest.DepDef) res[intern.StrId, fail.Fail];
+dep_dir: str, dir_dep: str, d: *manifest_model.DepDef) res[intern.StrId, fail.Fail];
 ```
 

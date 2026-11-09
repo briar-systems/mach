@@ -37,7 +37,7 @@ pub fun register_embed_inputs(p: *project.Project) err[fail.Fail];
 ## fun module_embeds
 
 ```mach
-pub fun module_embeds(p: *project.Project, mid: session.ModuleId, paths: *collections_vector.Vector[str]) err[fail.Fail];
+pub fun module_embeds(p: *project.Project, mid: lang_module.ModuleId, paths: *collections_vector.Vector[str]) err[fail.Fail];
 ```
 
 the resolved paths of the files module m embeds, each owned by the caller in p.s.alloc

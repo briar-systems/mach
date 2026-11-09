@@ -34,7 +34,7 @@ sink is left empty
 ## fun ct_value_encode
 
 ```mach
-pub fun ct_value_encode(s: *wire.Sink, value: *comptime.CTValue, origin: session.StableModuleId,
+pub fun ct_value_encode(s: *wire.Sink, value: *comptime_value.CTValue, origin: module.StableModuleId,
 definition_revision: query.Revision) err[fail.Fail];
 ```
 
@@ -43,7 +43,7 @@ a CONST_ELEM value names an element of its origin's definition, so it folds that
 ## fun public_surface_encode
 
 ```mach
-pub fun public_surface_encode(s: *wire.Sink, rr: *resolve.ResolveResult, origin: session.StableModuleId,
+pub fun public_surface_encode(s: *wire.Sink, rr: *resolve.ResolveResult, origin: module.StableModuleId,
 definition_revision: query.Revision) err[fail.Fail];
 ```
 
@@ -51,7 +51,7 @@ definition_revision: query.Revision) err[fail.Fail];
 
 ```mach
 pub fun public_symbols_decode(a: *A.Allocator, s: *session.Session, bytes: *u8, len: u32,
-path: intern.StrId, stable: session.StableModuleId) res[resolve.ModuleExports, fail.Fail];
+path: intern.StrId, stable: module.StableModuleId) res[resolve.ModuleExports, fail.Fail];
 ```
 
 what the exports product of module `stable` says an importer reads, its symbols allocated from `a`
@@ -59,13 +59,13 @@ what the exports product of module `stable` says an importer reads, its symbols 
 ## fun typed_surface_encode
 
 ```mach
-pub fun typed_surface_encode(s: *wire.Sink, surface: *fe_sema.ModuleSema) err[fail.Fail];
+pub fun typed_surface_encode(s: *wire.Sink, surface: *sema_product.ModuleSema) err[fail.Fail];
 ```
 
 ## fun typed_surface_decode
 
 ```mach
 pub fun typed_surface_decode(itn: *intern.Interner, a: *A.Allocator, bytes: *u8, len: u32,
-path: intern.StrId, mid: session.ModuleId) res[fe_sema.ModuleSema, fail.Fail];
+path: intern.StrId, mid: module.ModuleId) res[sema_product.ModuleSema, fail.Fail];
 ```
 

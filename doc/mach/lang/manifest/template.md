@@ -91,7 +91,9 @@ one artifact a template may name as `{artifact.<id>.out}`
 
 name: the required artifact's name
 out: its final output path when it builds for exactly one target here, or ""
-      when it builds for several, which makes `{artifact.<id>.out}` ambiguous
+         when it builds for several, which makes `{artifact.<id>.out}` ambiguous,
+         or when it is an object artifact
+objects: an object artifact, whose objects stay under obj/, so it has no out to name
 
 ## rec Requirements
 

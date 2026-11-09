@@ -25,22 +25,6 @@ pub fun symbol_definition(sc: *SemaContext, sym: *resolve.Symbol,
 phase: sema_product.DefinitionPhase) res[sema_product.DefinedSymbol, fail.Fail];
 ```
 
-## fwd type.FieldEntry
-
-```mach
-fwd type.FieldEntry
-```
-
-forwards [`mach.lang.type.field.Entry`](../../type/field.md#rec-entry)
-
-## fwd type.FieldTable
-
-```mach
-fwd type.FieldTable
-```
-
-forwards [`mach.lang.type.field.Table`](../../type/field.md#rec-table)
-
 ## rec InstWorklist
 
 ```mach
@@ -101,7 +85,7 @@ pub rec UniReports;
 ## fun uni_report_mark
 
 ```mach
-pub fun uni_report_mark(ur: *UniReports, key: type.TypeId) bool;
+pub fun uni_report_mark(ur: *UniReports, key: type_kind.TypeId) bool;
 ```
 
 whether a report about `key` goes out: the first time it is marked, or always with no record
@@ -280,7 +264,7 @@ pub fun report_deferred_type(sc: *SemaContext, ast_tid: ast_id.TypeId);
 ## fun resolved_type_of
 
 ```mach
-pub fun resolved_type_of(sc: *SemaContext, ast_tid: ast_id.TypeId) type.TypeId;
+pub fun resolved_type_of(sc: *SemaContext, ast_tid: ast_id.TypeId) type_kind.TypeId;
 ```
 
 ## fun expression
@@ -292,7 +276,7 @@ pub fun expression(sc: *SemaContext, eid: ast_id.ExprId) res[ast_expr.Expr, fail
 ## fun comptime_expression
 
 ```mach
-pub fun comptime_expression(sc: *SemaContext, a: *ast.Ast, eid: ast_id.ExprId) res[ast_expr.Expr, comptime.EvalFail];
+pub fun comptime_expression(sc: *SemaContext, a: *ast.Ast, eid: ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail];
 ```
 
 ## fun type_node
@@ -307,7 +291,7 @@ path's prefix and the case by the last segment; none, with the walk failed, when
 ## fun comptime_head
 
 ```mach
-pub fun comptime_head(sc: *SemaContext, a: *ast.Ast, tid: ast_id.TypeId) res[ast_type.Type, comptime.EvalFail];
+pub fun comptime_head(sc: *SemaContext, a: *ast.Ast, tid: ast_id.TypeId) res[ast_type.Type, comptime_failure.EvalFail];
 ```
 
 ## fun is_case_literal
@@ -321,13 +305,13 @@ whether the literal `eid` constructs a tag case, its head read as name resolutio
 ## fun apply_subst
 
 ```mach
-pub fun apply_subst(sc: *SemaContext, tid: type.TypeId) type.TypeId;
+pub fun apply_subst(sc: *SemaContext, tid: type_kind.TypeId) type_kind.TypeId;
 ```
 
 ## fun awaits_instance
 
 ```mach
-pub fun awaits_instance(sc: *SemaContext, tid: type.TypeId) bool;
+pub fun awaits_instance(sc: *SemaContext, tid: type_kind.TypeId) bool;
 ```
 
 true while a type still names a type parameter: no operand predicate has an answer
@@ -361,7 +345,7 @@ pub fun inst_worklist_dnit(sc: *SemaContext);
 ## fun expr_type_set
 
 ```mach
-pub fun expr_type_set(sc: *SemaContext, eid: ast_id.ExprId, ty: type.TypeId);
+pub fun expr_type_set(sc: *SemaContext, eid: ast_id.ExprId, ty: type_kind.TypeId);
 ```
 
 the type the walk gives expression `eid`, recorded in its frame when the frame is not
@@ -370,7 +354,7 @@ the module's own typing
 ## fun decl_type_set
 
 ```mach
-pub fun decl_type_set(sc: *SemaContext, did: ast_id.DeclId, ty: type.TypeId);
+pub fun decl_type_set(sc: *SemaContext, did: ast_id.DeclId, ty: type_kind.TypeId);
 ```
 
 ## fun walk_binds_values
@@ -401,7 +385,7 @@ the verdict the walk gives a comptime gate in its frame
 ## fun decl_type_for
 
 ```mach
-pub fun decl_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId;
+pub fun decl_type_for(sc: *SemaContext, sym: *resolve.Symbol) type_kind.TypeId;
 ```
 
 ## fun expr_in_view
@@ -488,7 +472,7 @@ refusal of the input under its own kind, any other failure as internal
 ## fun check_handle_in_array
 
 ```mach
-pub fun check_handle_in_array(sc: *SemaContext, ty: type.TypeId, span: lang_source.Span);
+pub fun check_handle_in_array(sc: *SemaContext, ty: type_kind.TypeId, span: lang_source.Span);
 ```
 
 ## fun report_internal
@@ -536,25 +520,25 @@ pub fun field_table_stage(sc: *SemaContext, additional: u32) res[u32, fail.Fail]
 ## fun field_table_stage_push_entry
 
 ```mach
-pub fun field_table_stage_push_entry(sc: *SemaContext, entry: type.FieldEntry) err[fail.Fail];
+pub fun field_table_stage_push_entry(sc: *SemaContext, entry: type_field.Entry) err[fail.Fail];
 ```
 
 ## fun field_table_publish
 
 ```mach
-pub fun field_table_publish(sc: *SemaContext, ty: type.TypeId, fields_start: u32, fields_len: u32) err[fail.Fail];
+pub fun field_table_publish(sc: *SemaContext, ty: type_kind.TypeId, fields_start: u32, fields_len: u32) err[fail.Fail];
 ```
 
 ## fun field_table_for
 
 ```mach
-pub fun field_table_for(sc: *SemaContext, ty: type.TypeId) opt[*FieldTable];
+pub fun field_table_for(sc: *SemaContext, ty: type_kind.TypeId) opt[*FieldTable];
 ```
 
 ## fun field_lookup
 
 ```mach
-pub fun field_lookup(sc: *SemaContext, ty: type.TypeId, name: intern.StrId) opt[type.TypeId];
+pub fun field_lookup(sc: *SemaContext, ty: type_kind.TypeId, name: intern.StrId) opt[type_kind.TypeId];
 ```
 
 ## fun type_store
@@ -568,7 +552,7 @@ the type store a comptime evaluation inside this walk reads
 ## fun resolve_type_comparison_operand
 
 ```mach
-pub fun resolve_type_comparison_operand(sc: *SemaContext, eid: ast_id.ExprId) res[opt[u32], comptime.EvalFail];
+pub fun resolve_type_comparison_operand(sc: *SemaContext, eid: ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail];
 ```
 
 the type of an operand of a type comparison, none when the walk has no typing of it
@@ -582,7 +566,7 @@ pub fun gated_member_const_message(sc: *SemaContext, name: intern.StrId, dep_pat
 ## fun resolve_module_member_const
 
 ```mach
-pub fun resolve_module_member_const(sc: *SemaContext, eid: ast_id.ExprId) res[opt[comptime.CTValue], comptime.EvalFail];
+pub fun resolve_module_member_const(sc: *SemaContext, eid: ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
 ```
 
 the value of a module member constant an expression names, none when it names none or the walk
@@ -597,7 +581,7 @@ pub fun own_nominal_declaration(sc: *SemaContext, nominal: *type.Type) res[ast_i
 ## fun interface_of
 
 ```mach
-pub fun interface_of(sc: *SemaContext, origin: session.ModuleId) res[*interface.Interface, fail.Fail];
+pub fun interface_of(sc: *SemaContext, origin: module.ModuleId) res[*interface.Interface, fail.Fail];
 ```
 
 the interface module `origin` published, read through the walk's acquisition of it
@@ -605,7 +589,7 @@ the interface module `origin` published, read through the walk's acquisition of 
 ## fun each_set
 
 ```mach
-pub fun each_set(sc: *SemaContext, sid: ast_id.StmtId, array: comptime.CTValue);
+pub fun each_set(sc: *SemaContext, sid: ast_id.StmtId, array: comptime_value.CTValue);
 ```
 
 the constant array the `$each` at `sid` reads in the walk's frame
@@ -613,7 +597,7 @@ the constant array the `$each` at `sid` reads in the walk's frame
 ## fun definition_ast
 
 ```mach
-pub fun definition_ast(sc: *SemaContext, origin: session.ModuleId) *ast.Ast;
+pub fun definition_ast(sc: *SemaContext, origin: module.ModuleId) *ast.Ast;
 ```
 
 the syntax of module `origin`, nil when it cannot be had, the reason recorded in the status
@@ -621,7 +605,7 @@ the syntax of module `origin`, nil when it cannot be had, the reason recorded in
 ## fun generic_owner_of_decl
 
 ```mach
-pub fun generic_owner_of_decl(s: *session.Session, a: *ast.Ast, origin: session.ModuleId,
+pub fun generic_owner_of_decl(s: *session.Session, a: *ast.Ast, origin: module.ModuleId,
 decl_id: ast_id.DeclId) res[type.GenericOwner, fail.Fail];
 ```
 
@@ -631,7 +615,7 @@ fields): the one key both interning a parameter and substituting for it use
 ## fun generic_param_type_for
 
 ```mach
-pub fun generic_param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId;
+pub fun generic_param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type_kind.TypeId;
 ```
 
 ## fun inferred_len_of
@@ -697,7 +681,7 @@ a query built by query_of whose walk refused the input, reported at `span`
 ## fun record_eval_result
 
 ```mach
-pub fun record_eval_result(sc: *SemaContext, r: res[comptime.CTValue, comptime.EvalFail]);
+pub fun record_eval_result(sc: *SemaContext, r: res[comptime_value.CTValue, comptime_failure.EvalFail]);
 ```
 
 ## fun decorator_string_arg

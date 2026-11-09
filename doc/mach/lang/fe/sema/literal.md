@@ -33,7 +33,7 @@ against that type's width once every body has been inferred
 ## fun check_instance_float_literals
 
 ```mach
-pub fun check_instance_float_literals(sc: *sema_context.SemaContext, generic: *type.TypeId);
+pub fun check_instance_float_literals(sc: *sema_context.SemaContext, generic: *type_kind.TypeId);
 ```
 
 the rule for the literals an instance retypes: those its generic body left at a type

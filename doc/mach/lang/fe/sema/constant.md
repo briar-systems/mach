@@ -20,7 +20,7 @@ no constant, for good, since its initializer needs a value no constant gives
 ## fun named
 
 ```mach
-pub fun named(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptime.CTValue], comptime.EvalFail];
+pub fun named(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
 ```
 
 the value of the module constant the bare name `eid` names: one of this module's, bound on
@@ -29,7 +29,7 @@ first read, or one an imported module published
 ## fun member
 
 ```mach
-pub fun member(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptime.CTValue], comptime.EvalFail];
+pub fun member(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
 ```
 
 the value of the module constant a path names, which for a path through a module is the
@@ -100,7 +100,7 @@ reports the union build's refusal of the imported constant `sym` a read at `span
 ## fun array_value
 
 ```mach
-pub fun array_value(sc: *sema_context.SemaContext, sym: *resolve.Symbol) res[opt[comptime.CTValue], fail.Fail];
+pub fun array_value(sc: *sema_context.SemaContext, sym: *resolve.Symbol) res[opt[comptime_value.CTValue], fail.Fail];
 ```
 
 the value of the array `sym` names that a `$each` reads: a module constant's, this module's
@@ -111,7 +111,7 @@ a binding with no array, record or case literal value
 ## fun store_of
 
 ```mach
-pub fun store_of(sc: *sema_context.SemaContext, module_index: u32) res[*comptime_deep.Store, comptime.EvalFail];
+pub fun store_of(sc: *sema_context.SemaContext, module_index: u32) res[*comptime_deep.Store, comptime_failure.EvalFail];
 ```
 
 the store of constant values of the module with stable id `module`: this module's, or the one
@@ -128,7 +128,7 @@ an array literal, or a record or case literal spelled with its head type
 ## fun type_at
 
 ```mach
-pub fun type_at(sc: *sema_context.SemaContext, eid: ast_id.ExprId) type.TypeId;
+pub fun type_at(sc: *sema_context.SemaContext, eid: ast_id.ExprId) type_kind.TypeId;
 ```
 
 the type the walk gave an expression
@@ -146,7 +146,7 @@ walk gave it
 ## fun zero_of
 
 ```mach
-pub fun zero_of(sc: *sema_context.SemaContext, ty: u32) res[comptime.CTValue, comptime.EvalFail];
+pub fun zero_of(sc: *sema_context.SemaContext, ty: u32) res[comptime_value.CTValue, comptime_failure.EvalFail];
 ```
 
 the zero of the type `ty` as a value, for an evaluation that holds a type and no expression

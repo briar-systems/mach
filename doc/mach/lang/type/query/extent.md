@@ -165,13 +165,13 @@ pub fun field(mz: *Measure, id: u32, index: u32) u32;
 ## fun size
 
 ```mach
-pub fun size(mz: *Measure, tid: type.TypeId) Extent;
+pub fun size(mz: *Measure, tid: type_kind.TypeId) Extent;
 ```
 
 ## fun offset
 
 ```mach
-pub fun offset(mz: *Measure, tid: type.TypeId, field_ix: u32) Extent;
+pub fun offset(mz: *Measure, tid: type_kind.TypeId, field_ix: u32) Extent;
 ```
 
 the byte offset of a record field, or of a tag's payload for any of its cases, in `size`.
@@ -180,13 +180,13 @@ a union's fields all stand at 0
 ## fun of
 
 ```mach
-pub fun of(s: *session.Session, laying: *Laying, tid: type.TypeId) res[Extent, fail.Fail];
+pub fun of(s: *session.Session, laying: *Laying, tid: type_kind.TypeId) res[Extent, fail.Fail];
 ```
 
 ## fun field_offset
 
 ```mach
-pub fun field_offset(s: *session.Session, laying: *Laying, tid: type.TypeId, field_ix: u32) res[Extent, fail.Fail];
+pub fun field_offset(s: *session.Session, laying: *Laying, tid: type_kind.TypeId, field_ix: u32) res[Extent, fail.Fail];
 ```
 
 the byte offset of a record field or tag payload from the same layout that sizes the type;

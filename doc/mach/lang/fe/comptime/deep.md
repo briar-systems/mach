@@ -261,7 +261,7 @@ pub val ZERO_UNKNOWN_MSG: str = "the zero of this field's type is not known"
 ## fun zero_defined
 
 ```mach
-pub fun zero_defined(types: *type.TypeInterner, ty: type.TypeId) bool;
+pub fun zero_defined(types: *type.TypeInterner, ty: type_kind.TypeId) bool;
 ```
 
 whether `ty` has a zero: every type the type store holds does, an unresolved or error type does not
@@ -269,7 +269,7 @@ whether `ty` has a zero: every type the type store holds does, an unresolved or 
 ## fun zero_node
 
 ```mach
-pub fun zero_node(s: *Store, types: *type.TypeInterner, pointer_width: u32, ty: type.TypeId) res[u32, fail.Fail];
+pub fun zero_node(s: *Store, types: *type.TypeInterner, pointer_width: u32, ty: type_kind.TypeId) res[u32, fail.Fail];
 ```
 
 the zero of `ty` in `s`, which a member a literal leaves out holds: a record, union or array

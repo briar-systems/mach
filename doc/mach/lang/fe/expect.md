@@ -10,7 +10,7 @@ exactly as a fresh one is
 ## fun key_of
 
 ```mach
-pub fun key_of(s: *session.Session, ctx: *comptime.ComptimeCtx, eid: ast_id.ExprId) opt[str];
+pub fun key_of(s: *session.Session, ctx: *comptime_scope.ComptimeCtx, eid: ast_id.ExprId) opt[str];
 ```
 
 the key an argument evaluates to; none when the argument is not a constant string
@@ -64,7 +64,7 @@ parse; a failed read leaves it unread, so the next one walks the module again
 ## fun collect
 
 ```mach
-pub fun collect(s: *session.Session, a: *ast.Ast, idx: *Index, ctx: *comptime.ComptimeCtx, checked: bool,
+pub fun collect(s: *session.Session, a: *ast.Ast, idx: *Index, ctx: *comptime_scope.ComptimeCtx, checked: bool,
 out: *Vector[diagnostic.Expectation]) err[fail.Fail];
 ```
 

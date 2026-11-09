@@ -105,12 +105,12 @@ located:  whether `closure` was located as a build needs it, every dependency
 ## fun plan
 
 ```mach
-pub fun plan(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest, owned_req: request.BuildRequest) res[BuildPlan, fail.Fail];
+pub fun plan(a: *A.Allocator, itn: *intern.Interner, m: *manifest_model.Manifest, owned_req: request.BuildRequest) res[BuildPlan, fail.Fail];
 ```
 
 plan the request's own selection: `req.artifact` on `req.target`, each an
 exact name or a glob, or empty for the manifest's default, as
-`manifest.resolve_cells` reads them. a test goal takes the one artifact the
+`manifest_select.resolve_cells` reads them. a test goal takes the one artifact the
 default selection holds, any other goal every one
 
 a: owns the plan
@@ -122,7 +122,7 @@ ret: the plan; err from request validation, selection or planning
 ## fun plan_to_run
 
 ```mach
-pub fun plan_to_run(a: *A.Allocator, s: *session.Session, m: *manifest.Manifest, owned_req: request.BuildRequest) res[BuildPlan, fail.Fail];
+pub fun plan_to_run(a: *A.Allocator, s: *session.Session, m: *manifest_model.Manifest, owned_req: request.BuildRequest) res[BuildPlan, fail.Fail];
 ```
 
 `plan`, with the plan's dependency closure located in `s` as
@@ -134,7 +134,7 @@ ret: the plan; err from planning or from locating the closure
 ## fun plan_cells
 
 ```mach
-pub fun plan_cells(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest, owned_req: request.BuildRequest, cells: *Vector[manifest.Cell]) res[BuildPlan, fail.Fail];
+pub fun plan_cells(a: *A.Allocator, itn: *intern.Interner, m: *manifest_model.Manifest, owned_req: request.BuildRequest, cells: *Vector[manifest_select.Cell]) res[BuildPlan, fail.Fail];
 ```
 
 plan resolved cells for one profile: each cell's artifact on its target, and
@@ -145,7 +145,7 @@ a: owns the plan
 itn: resolves names
 m: the root manifest
 owned_req: the request the cells share
-cells: the cells, from `manifest.resolve_cells`
+cells: the cells, from `manifest_select.resolve_cells`
 ret: the plan; err from validation or a cell's planning, or when `-o`
            names one output and several cells are selected
 
@@ -213,7 +213,7 @@ whether `path` lies under the directory `dir`
 
 ```mach
 pub fun requirement_input(a: *A.Allocator, itn: *intern.Interner, root: str,
-req: *manifest.LinkRequirement) res[input.Input, fail.Fail];
+req: *manifest_link.LinkRequirement) res[input.Input, fail.Fail];
 ```
 
 the input a manifest link requirement names: a framework or a library by

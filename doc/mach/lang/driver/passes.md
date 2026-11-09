@@ -74,7 +74,7 @@ open across builds, and then whatever no retainer holds is retired
 ## fun back_half_key
 
 ```mach
-pub fun back_half_key(stable: session.StableModuleId, test_object: bool) u64;
+pub fun back_half_key(stable: module.StableModuleId, test_object: bool) u64;
 ```
 
 a module's lowering and codegen products are keyed by its stable id, and by the
@@ -112,7 +112,7 @@ source declares a test or a `#[testing]` declaration
 ## fun codegen_reusable
 
 ```mach
-pub fun codegen_reusable(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail];
+pub fun codegen_reusable(p: *project.Project, mid: module.ModuleId) res[bool, fail.Fail];
 ```
 
 ## fun test_build
@@ -157,7 +157,7 @@ held until the last module reaching it is lowered, and a test build lowers every
 ## fun test_codegen_reusable
 
 ```mach
-pub fun test_codegen_reusable(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail];
+pub fun test_codegen_reusable(p: *project.Project, mid: module.ModuleId) res[bool, fail.Fail];
 ```
 
 the test object's codegen product is current or cached, so no worker generates it

@@ -106,8 +106,9 @@ manifest and freed by `dnit`
 name: the table key; a portable identifier
 kind: the required `kind` key, mink's product of that name
 entry: the required `entry` key, a project-relative path under `[project].src`
-out: the required `out` key, an unexpanded path template relative to the
-               project root; `{project.work}` places the output under the work directory
+out: the `out` key, an unexpanded path template relative to the project root;
+               `{project.work}` places the output under the work directory. STR_NIL for an
+               object artifact, whose objects stay under obj/
 targets: the required `targets` array of declared target names or "*"; nil when empty
 target_count: length of `targets`
 link: the `link` array of `[link.<name>]` names; nil when absent or empty

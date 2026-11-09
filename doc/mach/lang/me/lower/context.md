@@ -136,7 +136,7 @@ origin: the module that declares the function
 decl: its declaration there
 name: the copy's linkage name, the function's own with the classes it takes
 sig: the copy's signature
-instance: the instance of the module's set the copy is of, fe_sema.instance.NONE for a
+instance: the instance of the module's set the copy is of, sema_instance.NONE for a
           plain function
 
 ## rec LowerRequest
@@ -156,18 +156,18 @@ pub rec LowerContext;
 ```mach
 pub fun module_scope(
 s: *session.Session,
-own_module: session.ModuleId,
+own_module: module.ModuleId,
 a: *ast.Ast,
 fqn: intern.StrId,
-sema_result: *fe_sema.SemaResult,
+sema_result: *sema_product.SemaResult,
 rr: *resolve.ResolveResult,
-ctx: *comptime.ComptimeCtx) res[ModuleScope, fail.Fail];
+ctx: *comptime_scope.ComptimeCtx) res[ModuleScope, fail.Fail];
 ```
 
 ## fun origin_scope
 
 ```mach
-pub fun origin_scope(lc: *LowerContext, origin: session.ModuleId) res[ModuleScope, fail.Fail];
+pub fun origin_scope(lc: *LowerContext, origin: module.ModuleId) res[ModuleScope, fail.Fail];
 ```
 
 the scope another module's template is read in: the copy its interface publishes, with a
@@ -184,16 +184,16 @@ machine: *Machine,
 malloc: *A.Allocator,
 a: *ast.Ast,
 fqn: intern.StrId,
-own_module: session.ModuleId,
-sema_result: *fe_sema.SemaResult,
+own_module: module.ModuleId,
+sema_result: *sema_product.SemaResult,
 rr: *resolve.ResolveResult,
-ctx: *comptime.ComptimeCtx,
+ctx: *comptime_scope.ComptimeCtx,
 normal_object: *NormalObject,
 shared_artifact: bool,
 debug: bool,
 checks: bool,
 diags: *diagnostic.DiagnosticStore,
-interfaces: fe_sema.interface.Reader) res[LowerRequest, fail.Fail];
+interfaces: sema_interface.Reader) res[LowerRequest, fail.Fail];
 ```
 
 ## fun scope_enter
@@ -233,7 +233,7 @@ the element the innermost `$each` loop variable `name` names
 ## fun interface_of
 
 ```mach
-pub fun interface_of(lc: *LowerContext, origin: session.ModuleId) res[*fe_sema.interface.Interface, fail.Fail];
+pub fun interface_of(lc: *LowerContext, origin: module.ModuleId) res[*sema_interface.Interface, fail.Fail];
 ```
 
 the interface of the module `origin`: the one the lowering module published, or an import's
@@ -274,7 +274,7 @@ the store of constant values the module with stable id `module_index` publishes 
 ## fun declared_named
 
 ```mach
-pub fun declared_named(lc: *LowerContext, origin: session.ModuleId, kind: resolve.SymKind, canon: intern.StrId) res[Declared, fail.Fail];
+pub fun declared_named(lc: *LowerContext, origin: module.ModuleId, kind: resolve.SymKind, canon: intern.StrId) res[Declared, fail.Fail];
 ```
 
 the one declaration of `kind` the module `origin` defines under `canon`
@@ -282,7 +282,7 @@ the one declaration of `kind` the module `origin` defines under `canon`
 ## fun declared_scalar
 
 ```mach
-pub fun declared_scalar(lc: *LowerContext, d: Declared) opt[comptime.CTValue];
+pub fun declared_scalar(lc: *LowerContext, d: Declared) opt[comptime_value.CTValue];
 ```
 
 the scalar a module `val` holds, none when it holds no constant or an aggregate
@@ -329,7 +329,7 @@ its own kind at the node the lowering stands on; any other failure is the loweri
 ## fun record_eval_result
 
 ```mach
-pub fun record_eval_result(lc: *LowerContext, r: res[comptime.CTValue, comptime.EvalFail]);
+pub fun record_eval_result(lc: *LowerContext, r: res[comptime_value.CTValue, comptime_failure.EvalFail]);
 ```
 
 ## fun type_node
@@ -350,7 +350,7 @@ pub fun expression(lc: *LowerContext, eid: ast_id.ExprId) res[ast_expr.Expr, fai
 ## fun resolve_module_member_const
 
 ```mach
-pub fun resolve_module_member_const(lc: *LowerContext, eid: ast_id.ExprId) res[opt[comptime.CTValue], comptime.EvalFail];
+pub fun resolve_module_member_const(lc: *LowerContext, eid: ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
 ```
 
 a lowering capability; a nil context, which the capability check refuses before any call,
@@ -368,7 +368,7 @@ answers as an evaluation with no lowering would
 ## fun resolve_type_comparison_operand
 
 ```mach
-pub fun resolve_type_comparison_operand(lc: *LowerContext, eid: ast_id.ExprId) res[opt[u32], comptime.EvalFail];
+pub fun resolve_type_comparison_operand(lc: *LowerContext, eid: ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail];
 ```
 
 a lowering capability; a nil context, which the capability check refuses before any call,
@@ -377,7 +377,7 @@ answers as an evaluation with no lowering would
 ## fun resolve_type_query
 
 ```mach
-pub fun resolve_type_query(lc: *LowerContext, tid: u32, which: u8) res[opt[comptime.CTValue], comptime.EvalFail];
+pub fun resolve_type_query(lc: *LowerContext, tid: u32, which: u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
 ```
 
 a lowering capability; a nil context, which the capability check refuses before any call,
@@ -386,7 +386,7 @@ answers as an evaluation with no lowering would
 ## fun resolve_layout_intrinsic
 
 ```mach
-pub fun resolve_layout_intrinsic(lc: *LowerContext, eid: u32) res[opt[comptime.CTValue], comptime.EvalFail];
+pub fun resolve_layout_intrinsic(lc: *LowerContext, eid: u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
 ```
 
 a lowering capability; a nil context, which the capability check refuses before any call,
@@ -395,7 +395,7 @@ answers as an evaluation with no lowering would
 ## fun member_offset
 
 ```mach
-pub fun member_offset(lc: *LowerContext, tid: type.TypeId, ir: Type, index: u32) res[u64, fail.Fail];
+pub fun member_offset(lc: *LowerContext, tid: type_kind.TypeId, ir: Type, index: u32) res[u64, fail.Fail];
 ```
 
 the byte offset of field or case `index` of the source type `tid`, lowered as `ir`: a
@@ -404,7 +404,7 @@ record's field, a union's member at zero, or a tag case's payload
 ## fun field_offset
 
 ```mach
-pub fun field_offset(lc: *LowerContext, owner: u32, index: u32) res[opt[comptime.CTValue], comptime.EvalFail];
+pub fun field_offset(lc: *LowerContext, owner: u32, index: u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
 ```
 
 a field descriptor's offset, from the layout lowering gives the owning type
@@ -532,7 +532,7 @@ pub fun ptr_type(lc: *LowerContext) res[Type, fail.Fail];
 ## fun lower_type
 
 ```mach
-pub fun lower_type(lc: *LowerContext, tid: type.TypeId) res[Type, fail.Fail];
+pub fun lower_type(lc: *LowerContext, tid: type_kind.TypeId) res[Type, fail.Fail];
 ```
 
 the mirl type a value of the source type `tid` is held in
@@ -540,7 +540,7 @@ the mirl type a value of the source type `tid` is held in
 ## fun tag_case_has_payload
 
 ```mach
-pub fun tag_case_has_payload(lc: *LowerContext, tid: type.TypeId, i: u32) bool;
+pub fun tag_case_has_payload(lc: *LowerContext, tid: type_kind.TypeId, i: u32) bool;
 ```
 
 whether case `i` of the tag `tid` holds a payload
@@ -548,7 +548,7 @@ whether case `i` of the tag `tid` holds a payload
 ## fun tag_payload_member
 
 ```mach
-pub fun tag_payload_member(lc: *LowerContext, tid: type.TypeId, i: u32) u32;
+pub fun tag_payload_member(lc: *LowerContext, tid: type_kind.TypeId, i: u32) u32;
 ```
 
 the member of the payload union case `i` of the tag `tid` is laid out as
@@ -556,7 +556,7 @@ the member of the payload union case `i` of the tag `tid` is laid out as
 ## fun tag_disc_type
 
 ```mach
-pub fun tag_disc_type(lc: *LowerContext, tid: type.TypeId) res[Type, fail.Fail];
+pub fun tag_disc_type(lc: *LowerContext, tid: type_kind.TypeId) res[Type, fail.Fail];
 ```
 
 the integer a tag's discriminant is held in
@@ -573,7 +573,7 @@ layout of `ir`, which states a decorated record's alignment and packing
 ## fun slot_for
 
 ```mach
-pub fun slot_for(lc: *LowerContext, tid: type.TypeId, ir: Type) res[value.Value, fail.Fail];
+pub fun slot_for(lc: *LowerContext, tid: type_kind.TypeId, ir: Type) res[value.Value, fail.Fail];
 ```
 
 a stack slot for a value of the source type `tid`, held in `ir`
@@ -581,7 +581,7 @@ a stack slot for a value of the source type `tid`, held in `ir`
 ## fun debug_type_of
 
 ```mach
-pub fun debug_type_of(lc: *LowerContext, tid: type.TypeId) res[opt[mirl_debug.Type], fail.Fail];
+pub fun debug_type_of(lc: *LowerContext, tid: type_kind.TypeId) res[opt[mirl_debug.Type], fail.Fail];
 ```
 
 the debug type a debug record names for source type `tid`, as substituted for the code
@@ -614,7 +614,7 @@ pub fun is_void_ir(lc: *LowerContext, tid: Type) bool;
 ## fun expr_type_of
 
 ```mach
-pub fun expr_type_of(lc: *LowerContext, eid: ast_id.ExprId) type.TypeId;
+pub fun expr_type_of(lc: *LowerContext, eid: ast_id.ExprId) type_kind.TypeId;
 ```
 
 an expression's type inside an instance's scope is the instance's, never the template's:
@@ -637,19 +637,19 @@ pub fun expr_is_secret(lc: *LowerContext, eid: ast_id.ExprId) bool;
 ## fun type_is_secret
 
 ```mach
-pub fun type_is_secret(lc: *LowerContext, tid: type.TypeId) bool;
+pub fun type_is_secret(lc: *LowerContext, tid: type_kind.TypeId) bool;
 ```
 
 ## fun type_contains_secret
 
 ```mach
-pub fun type_contains_secret(lc: *LowerContext, tid: type.TypeId) bool;
+pub fun type_contains_secret(lc: *LowerContext, tid: type_kind.TypeId) bool;
 ```
 
 ## fun secret_ranges
 
 ```mach
-pub fun secret_ranges(lc: *LowerContext, tid: type.TypeId, ir: Type, base: u64, out: *collections_vector.Vector[mirl_global.Range]) err[fail.Fail];
+pub fun secret_ranges(lc: *LowerContext, tid: type_kind.TypeId, ir: Type, base: u64, out: *collections_vector.Vector[mirl_global.Range]) err[fail.Fail];
 ```
 
 the secret byte ranges of a value of source type `tid`, held in `ir`, laid out from
@@ -660,7 +660,7 @@ discriminant or of padding
 ## fun global_secrecy
 
 ```mach
-pub fun global_secrecy(lc: *LowerContext, tid: type.TypeId, ir: Type, ranges: *collections_vector.Vector[mirl_global.Range]) res[mirl_global.Secrecy, fail.Fail];
+pub fun global_secrecy(lc: *LowerContext, tid: type_kind.TypeId, ir: Type, ranges: *collections_vector.Vector[mirl_global.Range]) res[mirl_global.Secrecy, fail.Fail];
 ```
 
 how much of a global of source type `tid`, held in `ir`, is secret, its ranges held in
@@ -669,25 +669,25 @@ how much of a global of source type `tid`, held in `ir`, is secret, its ranges h
 ## fun substitute_type
 
 ```mach
-pub fun substitute_type(lc: *LowerContext, tid: type.TypeId) type.TypeId;
+pub fun substitute_type(lc: *LowerContext, tid: type_kind.TypeId) type_kind.TypeId;
 ```
 
 ## fun type_resolved_of
 
 ```mach
-pub fun type_resolved_of(lc: *LowerContext, tid: ast_id.TypeId) type.TypeId;
+pub fun type_resolved_of(lc: *LowerContext, tid: ast_id.TypeId) type_kind.TypeId;
 ```
 
 ## fun decl_type_of
 
 ```mach
-pub fun decl_type_of(lc: *LowerContext, did: ast_id.DeclId) type.TypeId;
+pub fun decl_type_of(lc: *LowerContext, did: ast_id.DeclId) type_kind.TypeId;
 ```
 
 ## fun instance_of_call
 
 ```mach
-pub fun instance_of_call(lc: *LowerContext, eid: ast_id.ExprId) res[*fe_sema.instance.Instance, fail.Fail];
+pub fun instance_of_call(lc: *LowerContext, eid: ast_id.ExprId) res[*sema_instance.Instance, fail.Fail];
 ```
 
 the instance sema decided the call or generic reference `eid` names, in the frame the
@@ -705,7 +705,7 @@ the index in the module's set of the instance sema decided the call or generic r
 ## fun instance_link_name
 
 ```mach
-pub fun instance_link_name(lc: *LowerContext, item: *fe_sema.instance.Instance) res[intern.StrId, fail.Fail];
+pub fun instance_link_name(lc: *LowerContext, item: *sema_instance.Instance) res[intern.StrId, fail.Fail];
 ```
 
 the symbol an instance is emitted and referenced under
@@ -721,7 +721,7 @@ the verdict sema gave a statement gate in the frame the code is read through
 ## fun each_array
 
 ```mach
-pub fun each_array(lc: *LowerContext, stmt: ast_id.StmtId) res[comptime.CTValue, fail.Fail];
+pub fun each_array(lc: *LowerContext, stmt: ast_id.StmtId) res[comptime_value.CTValue, fail.Fail];
 ```
 
 the published value of the array sema typed the `$each` at `stmt` over, in the frame the code
@@ -738,7 +738,7 @@ the frame of iteration `index` of the `$each` at `stmt` under the current frame
 ## fun decl_ret_sem
 
 ```mach
-pub fun decl_ret_sem(lc: *LowerContext, did: ast_id.DeclId) type.TypeId;
+pub fun decl_ret_sem(lc: *LowerContext, did: ast_id.DeclId) type_kind.TypeId;
 ```
 
 ## fun function_return_ir
@@ -767,7 +767,7 @@ the signature of the function `did` declares
 ## fun fn_sig_of_type
 
 ```mach
-pub fun fn_sig_of_type(lc: *LowerContext, tid: type.TypeId) res[FnSig, fail.Fail];
+pub fun fn_sig_of_type(lc: *LowerContext, tid: type_kind.TypeId) res[FnSig, fail.Fail];
 ```
 
 the signature a value of the source function type `tid` is called through
@@ -775,7 +775,7 @@ the signature a value of the source function type `tid` is called through
 ## fun c_variadic_fixed
 
 ```mach
-pub fun c_variadic_fixed(lc: *LowerContext, tid: type.TypeId) opt[u32];
+pub fun c_variadic_fixed(lc: *LowerContext, tid: type_kind.TypeId) opt[u32];
 ```
 
 how many parameters the C-variadic function type `tid` names, none for any other type
@@ -783,7 +783,7 @@ how many parameters the C-variadic function type `tid` names, none for any other
 ## fun variadic_sig_of_type
 
 ```mach
-pub fun variadic_sig_of_type(lc: *LowerContext, tid: type.TypeId, tail: *type.TypeId, tail_len: u32) res[FnSig, fail.Fail];
+pub fun variadic_sig_of_type(lc: *LowerContext, tid: type_kind.TypeId, tail: *type_kind.TypeId, tail_len: u32) res[FnSig, fail.Fail];
 ```
 
 the signature one call of the C-variadic function type `tid` is made through: its
@@ -793,7 +793,7 @@ unnamed, as mirl states a variadic call
 ## fun ext_of
 
 ```mach
-pub fun ext_of(lc: *LowerContext, sem: type.TypeId) types.Extension;
+pub fun ext_of(lc: *LowerContext, sem: type_kind.TypeId) types.Extension;
 ```
 
 the extension a convention gives an integer narrower than a register: its declared
@@ -802,7 +802,7 @@ signedness. a bool is a byte read unsigned
 ## fun pack_instance_sig
 
 ```mach
-pub fun pack_instance_sig(lc: *LowerContext, fn_ty: type.TypeId, elems: *type.TypeId, elem_len: u32) res[FnSig, fail.Fail];
+pub fun pack_instance_sig(lc: *LowerContext, fn_ty: type_kind.TypeId, elems: *type_kind.TypeId, elem_len: u32) res[FnSig, fail.Fail];
 ```
 
 the signature of a pack instance of the function typed `fn_ty`: its fixed parameters, then
@@ -811,7 +811,7 @@ one per element of the pack
 ## fun instance_ref_sig
 
 ```mach
-pub fun instance_ref_sig(lc: *LowerContext, item: *fe_sema.instance.Instance) res[FnSig, fail.Fail];
+pub fun instance_ref_sig(lc: *LowerContext, item: *sema_instance.Instance) res[FnSig, fail.Fail];
 ```
 
 the signature an instance is referenced under: the one sema settled when it asked for it
@@ -833,7 +833,7 @@ the source of the module in scope, read when the scope was made
 ## fun emit_dbg_birth
 
 ```mach
-pub fun emit_dbg_birth(lc: *LowerContext, name_span: lang_source.Span, ty_sem: type.TypeId, param: opt[u32], val_v: value.Value,
+pub fun emit_dbg_birth(lc: *LowerContext, name_span: lang_source.Span, ty_sem: type_kind.TypeId, param: opt[u32], val_v: value.Value,
 slot: opt[value.Value]) err[fail.Fail];
 ```
 
@@ -844,7 +844,7 @@ from here on
 ## fun describe_global
 
 ```mach
-pub fun describe_global(lc: *LowerContext, g: u32, name_span: lang_source.Span, ty_sem: type.TypeId) err[fail.Fail];
+pub fun describe_global(lc: *LowerContext, g: u32, name_span: lang_source.Span, ty_sem: type_kind.TypeId) err[fail.Fail];
 ```
 
 the source variable the module's global `g` is, named at `name_span` with source type
@@ -934,7 +934,7 @@ the module's function `name`, declared here when another module defines it
 ## fun class_copy
 
 ```mach
-pub fun class_copy(lc: *LowerContext, origin: session.ModuleId, decl: ast_id.DeclId, base: intern.StrId, sig: Type, instance: u32) res[u32, fail.Fail];
+pub fun class_copy(lc: *LowerContext, origin: module.ModuleId, decl: ast_id.DeclId, base: intern.StrId, sig: Type, instance: u32) res[u32, fail.Fail];
 ```
 
 the copy of the function `decl` of `origin`, linked as `base`, whose pointer parameters
@@ -945,7 +945,7 @@ name is one copy, so a copy asked for twice is asked for once
 ## fun ensure_extern_global
 
 ```mach
-pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type, tls: opt[mirl_global.Tls], sem: type.TypeId) res[u32, fail.Fail];
+pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type, tls: opt[mirl_global.Tls], sem: type_kind.TypeId) res[u32, fail.Fail];
 ```
 
 the module's global `name` of `ty`, of source type `sem` (TYPE_NIL for bytes no source

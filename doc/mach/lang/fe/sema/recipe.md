@@ -3,14 +3,14 @@
 ## fun anonymous
 
 ```mach
-pub fun anonymous(s: *session.Session, kind: type.TypeKind,
-fields: *type.FieldEntry, count: u32) res[intern.StrId, fail.Fail];
+pub fun anonymous(s: *session.Session, kind: type_kind.TypeKind,
+fields: *type_field.Entry, count: u32) res[intern.StrId, fail.Fail];
 ```
 
 ## fun identity
 
 ```mach
-pub fun identity(s: *session.Session, tid: type.TypeId) res[u64, fail.Fail];
+pub fun identity(s: *session.Session, tid: type_kind.TypeId) res[u64, fail.Fail];
 ```
 
 the first 64 bits of sha-256 over a domain tag and the type's canonical recipe; the recipe

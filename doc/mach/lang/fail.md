@@ -441,24 +441,6 @@ pub fun toml_text(e: toml.TomlError) str;
 pub fun env_text(e: env.EnvError) str;
 ```
 
-## fun format
-
-```mach
-pub fun format(a: *A.Allocator, fmt: str, va: ...) res[str, Fail];
-```
-
-`fmt` formatted with `va` into `a`, which owns the text; a refusal to format
-is the failure instead
-
-## fun join
-
-```mach
-pub fun join(a: *A.Allocator, va: ...) res[str, Fail];
-```
-
-the texts `va` joined into `a`, which owns the result; a refusal to join is
-the failure instead
-
 ## fun prefixed
 
 ```mach
@@ -515,33 +497,6 @@ pub fun environment_of(k: diagnostic_kind.Kind, made: res[str, Fail]) Fail;
 the environment failure under `k` carrying a made text, which it borrows, or
 the failure that refused to make it
 
-## fun text_retain
-
-```mach
-pub fun text_retain(itn: *intern.Interner, text: str) res[str, Fail];
-```
-
-the interner's copy of a borrowed `text`, which outlives the storage `text`
-came from
-
-## fun text_intern
-
-```mach
-pub fun text_intern(itn: *intern.Interner, a: *A.Allocator, text: str) res[str, Fail];
-```
-
-`text`, owned by `a`, moved into the interner: the interned copy outlives
-`a`'s storage, and `text` is released either way
-
-## fun format_intern
-
-```mach
-pub fun format_intern(itn: *intern.Interner, a: *A.Allocator, fmt: str, va: ...) res[str, Fail];
-```
-
-`fmt` formatted with `va` through `a` as scratch and interned, so the text
-outlives `a`'s storage
-
 ## fun refused
 
 ```mach
@@ -551,12 +506,6 @@ pub fun refused(e: A.Error) Fail;
 the refusals the compiler recovers from at no site, each an internal failure
 carrying its text: the allocator's, a write to a sink of its own, a string
 operation, a filesystem step and a format
-
-## fun write_refused
-
-```mach
-pub fun write_refused(e: io_writer.WriteError) Fail;
-```
 
 ## fun str_refused
 
@@ -600,161 +549,4 @@ pub fun toml_refused(e: toml.TomlError) Fail;
 
 a document that does not parse is the user's, pointing at the byte the parser
 refused; one the allocator refused is internal
-
-## tag PhaseKind
-
-```mach
-pub tag PhaseKind: u8 {
-    accepted;
-    rejected;
-    internal: str;
-}
-```
-
-phase status is independent of diagnostic storage and rendering: accepted,
-rejected through recorded diagnostics, or internally failed with the text
-of the first internal failure
-
-## rec PhaseStatus
-
-```mach
-pub rec PhaseStatus;
-```
-
-## fun accepted
-
-```mach
-pub fun accepted() PhaseStatus;
-```
-
-## fun reject
-
-```mach
-pub fun reject(s: *PhaseStatus);
-```
-
-## fun internal
-
-```mach
-pub fun internal(s: *PhaseStatus, text: str);
-```
-
-## fun is_accepted
-
-```mach
-pub fun is_accepted(s: PhaseStatus) bool;
-```
-
-## fun internal_text
-
-```mach
-pub fun internal_text(s: PhaseStatus) opt[str];
-```
-
-the internal failure's text, absent unless the phase failed internally
-
-## fun status_text
-
-```mach
-pub fun status_text(s: PhaseStatus) str;
-```
-
-the same as presentation text: a phase that did not fail internally has
-nothing to say
-
-## fun phase_failure
-
-```mach
-pub fun phase_failure(s: PhaseStatus) Fail;
-```
-
-## fun merge
-
-```mach
-pub fun merge(into: *PhaseStatus, from: PhaseStatus);
-```
-
-## tag Catalog
-
-```mach
-pub tag Catalog: u8 {
-    malformed:   Member;
-    unsupported: Unsupported;
-    internal:    Member;
-}
-```
-
-## fun malformed_member
-
-```mach
-pub fun malformed_member(catalog: str, tag: u32) Catalog;
-```
-
-a member read from input that the catalog does not declare
-
-## fun malformed_member_in
-
-```mach
-pub fun malformed_member_in(catalog: str, tag: u32, where: str) Catalog;
-```
-
-the same, named with where the input came from
-
-## fun unsupported_member
-
-```mach
-pub fun unsupported_member(catalog: str, member: str, by: str) Catalog;
-```
-
-a declared member that `by` (a target, format or phase) does not honor
-
-## fun unknown_member
-
-```mach
-pub fun unknown_member(catalog: str, tag: u32) Catalog;
-```
-
-a member the compiler produced that its own catalog does not declare
-
-## fun unknown_member_in
-
-```mach
-pub fun unknown_member_in(catalog: str, tag: u32, where: str) Catalog;
-```
-
-the same, named with the site that produced it
-
-## fun catalog_text
-
-```mach
-pub fun catalog_text(a: *A.Allocator, c: Catalog) res[str, std_format.FormatError];
-```
-
-the message, owned by the caller's allocator (extent str_len + 1, released
-with str_free); the only failure a literal format can meet is the allocator's
-
-## fun catalog_interned
-
-```mach
-pub fun catalog_interned(itn: *intern.Interner, a: *A.Allocator, c: Catalog) res[str, Fail];
-```
-
-the message, owned by the interner so it outlives temporary phase storage,
-with `a` as scratch
-
-## fun catalog
-
-```mach
-pub fun catalog(a: *A.Allocator, c: Catalog) Fail;
-```
-
-the closed-catalog policy as a failure: an input or capability fault is the
-user's, a compiler-produced member is internal. the failure owns the message
-through the caller's allocator
-
-## fun unknown_catalog
-
-```mach
-pub fun unknown_catalog(a: *A.Allocator, catalog_name: str, tag: u32) Fail;
-```
 

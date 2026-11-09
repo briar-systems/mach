@@ -3,19 +3,19 @@
 ## fun check_coercible
 
 ```mach
-pub fun check_coercible(sc: *sema_context.SemaContext, expected: type.TypeId, eid: ast_id.ExprId, actual: type.TypeId, span: lang_source.Span) bool;
+pub fun check_coercible(sc: *sema_context.SemaContext, expected: type_kind.TypeId, eid: ast_id.ExprId, actual: type_kind.TypeId, span: lang_source.Span) bool;
 ```
 
 ## fun check_call
 
 ```mach
-pub fun check_call(sc: *sema_context.SemaContext, callee_sig: type.TypeId, args_start: u32, args_len: u32, span: lang_source.Span, pack_to_c_tail: bool) bool;
+pub fun check_call(sc: *sema_context.SemaContext, callee_sig: type_kind.TypeId, args_start: u32, args_len: u32, span: lang_source.Span, pack_to_c_tail: bool) bool;
 ```
 
 ## fun check_comptime_call
 
 ```mach
-pub fun check_comptime_call(sc: *sema_context.SemaContext, eid: ast_id.ExprId, callee_sig: type.TypeId, callee: ast_id.ExprId, f: *ast_decl.DeclFun, args_start: u32, args_len: u32, span: lang_source.Span) bool;
+pub fun check_comptime_call(sc: *sema_context.SemaContext, eid: ast_id.ExprId, callee_sig: type_kind.TypeId, callee: ast_id.ExprId, f: *ast_decl.DeclFun, args_start: u32, args_len: u32, span: lang_source.Span) bool;
 ```
 
 ## fun imported_module_const_sym
@@ -27,13 +27,13 @@ pub fun imported_module_const_sym(sc: *sema_context.SemaContext, sym: *resolve.S
 ## fun check_index
 
 ```mach
-pub fun check_index(sc: *sema_context.SemaContext, object: type.TypeId, index: type.TypeId, span: lang_source.Span) opt[type.TypeId];
+pub fun check_index(sc: *sema_context.SemaContext, object: type_kind.TypeId, index: type_kind.TypeId, span: lang_source.Span) opt[type_kind.TypeId];
 ```
 
 ## fun check_const_index
 
 ```mach
-pub fun check_const_index(sc: *sema_context.SemaContext, object: type.TypeId, idx: ast_id.ExprId, span: lang_source.Span) bool;
+pub fun check_const_index(sc: *sema_context.SemaContext, object: type_kind.TypeId, idx: ast_id.ExprId, span: lang_source.Span) bool;
 ```
 
 ## fun check_range_count
@@ -48,7 +48,7 @@ reported at the count, when it is not
 ## fun check_const_range
 
 ```mach
-pub fun check_const_range(sc: *sema_context.SemaContext, object: type.TypeId, start: ast_id.ExprId, count: u32, span: lang_source.Span) bool;
+pub fun check_const_range(sc: *sema_context.SemaContext, object: type_kind.TypeId, start: ast_id.ExprId, count: u32, span: lang_source.Span) bool;
 ```
 
 a constant start must keep the whole range inside an array or a vector:
@@ -57,13 +57,13 @@ a constant start must keep the whole range inside an array or a vector:
 ## fun const_index_value
 
 ```mach
-pub fun const_index_value(sc: *sema_context.SemaContext, eid: ast_id.ExprId) opt[comptime.CTValue];
+pub fun const_index_value(sc: *sema_context.SemaContext, eid: ast_id.ExprId) opt[comptime_value.CTValue];
 ```
 
 ## fun check_shift_count
 
 ```mach
-pub fun check_shift_count(sc: *sema_context.SemaContext, span: lang_source.Span, lt: type.TypeId, count: ast_id.ExprId) bool;
+pub fun check_shift_count(sc: *sema_context.SemaContext, span: lang_source.Span, lt: type_kind.TypeId, count: ast_id.ExprId) bool;
 ```
 
 a shift whose count is a comptime constant must keep the count below the
@@ -73,19 +73,19 @@ value (0, or the sign fill), which a constant program never means
 ## fun check_secret_address
 
 ```mach
-pub fun check_secret_address(sc: *sema_context.SemaContext, ty: type.TypeId, span: lang_source.Span) bool;
+pub fun check_secret_address(sc: *sema_context.SemaContext, ty: type_kind.TypeId, span: lang_source.Span) bool;
 ```
 
 ## fun check_member
 
 ```mach
-pub fun check_member(sc: *sema_context.SemaContext, object: type.TypeId, name: intern.StrId, guarded: bool, span: lang_source.Span) opt[type.TypeId];
+pub fun check_member(sc: *sema_context.SemaContext, object: type_kind.TypeId, name: intern.StrId, guarded: bool, span: lang_source.Span) opt[type_kind.TypeId];
 ```
 
 ## fun check_cast
 
 ```mach
-pub fun check_cast(sc: *sema_context.SemaContext, from: type.TypeId, to: type.TypeId, span: lang_source.Span) opt[type.TypeId];
+pub fun check_cast(sc: *sema_context.SemaContext, from: type_kind.TypeId, to: type_kind.TypeId, span: lang_source.Span) opt[type_kind.TypeId];
 ```
 
 ## val GROWTH_NOTE
@@ -106,19 +106,19 @@ differ, or the instance that grows and what kept it from lining up with the othe
 ## fun check_reinterpret
 
 ```mach
-pub fun check_reinterpret(sc: *sema_context.SemaContext, from: type.TypeId, to: type.TypeId, span: lang_source.Span) opt[type.TypeId];
+pub fun check_reinterpret(sc: *sema_context.SemaContext, from: type_kind.TypeId, to: type_kind.TypeId, span: lang_source.Span) opt[type_kind.TypeId];
 ```
 
 ## fun check_return
 
 ```mach
-pub fun check_return(sc: *sema_context.SemaContext, fn_ret: type.TypeId, value: type.TypeId, span: lang_source.Span) bool;
+pub fun check_return(sc: *sema_context.SemaContext, fn_ret: type_kind.TypeId, value: type_kind.TypeId, span: lang_source.Span) bool;
 ```
 
 ## fun check_condition
 
 ```mach
-pub fun check_condition(sc: *sema_context.SemaContext, cond: type.TypeId, span: lang_source.Span) bool;
+pub fun check_condition(sc: *sema_context.SemaContext, cond: type_kind.TypeId, span: lang_source.Span) bool;
 ```
 
 ## fun refuse_form
@@ -132,7 +132,7 @@ form `form` of a previous major written at `span`, refused naming what this majo
 ## fun byte_size
 
 ```mach
-pub fun byte_size(sc: *sema_context.SemaContext, t: type.TypeId, span: lang_source.Span) u32;
+pub fun byte_size(sc: *sema_context.SemaContext, t: type_kind.TypeId, span: lang_source.Span) u32;
 ```
 
 the size of a value of `t`, 0 when it has none or does not fit 32 bits; an array is its
@@ -143,7 +143,7 @@ the input is reported there
 ## fun type_to_str
 
 ```mach
-pub fun type_to_str(sc: *sema_context.SemaContext, t: type.TypeId) res[str, fail.Fail];
+pub fun type_to_str(sc: *sema_context.SemaContext, t: type_kind.TypeId) res[str, fail.Fail];
 ```
 
 ## fun type_str_free
@@ -155,7 +155,7 @@ pub fun type_str_free(sc: *sema_context.SemaContext, owned: str);
 ## fun report_no_field
 
 ```mach
-pub fun report_no_field(sc: *sema_context.SemaContext, span: lang_source.Span, name: intern.StrId, record: type.TypeId);
+pub fun report_no_field(sc: *sema_context.SemaContext, span: lang_source.Span, name: intern.StrId, record: type_kind.TypeId);
 ```
 
 ## fun report_named
@@ -173,13 +173,13 @@ pub fun report_missing_type_args(sc: *sema_context.SemaContext, span: lang_sourc
 ## fun report_typed
 
 ```mach
-pub fun report_typed(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str, t: type.TypeId, suffix: str);
+pub fun report_typed(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str, t: type_kind.TypeId, suffix: str);
 ```
 
 ## fun report_typed2
 
 ```mach
-pub fun report_typed2(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str, a: type.TypeId, mid: str, b: type.TypeId, suffix: str);
+pub fun report_typed2(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span, prefix: str, a: type_kind.TypeId, mid: str, b: type_kind.TypeId, suffix: str);
 ```
 
 ## fun expr_span_of

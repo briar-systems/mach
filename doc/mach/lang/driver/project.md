@@ -27,7 +27,7 @@ pub rec TargetEntry;
 ## fun target_entry_of
 
 ```mach
-pub fun target_entry_of(bu: *manifest.BuildUnit) TargetEntry;
+pub fun target_entry_of(bu: *manifest_plan.BuildUnit) TargetEntry;
 ```
 
 the target entry a selected build unit describes: the one place a TargetEntry is
@@ -245,7 +245,7 @@ nothing
 ## fun module_named
 
 ```mach
-pub fun module_named(p: *Project, fqn: str) session.ModuleId;
+pub fun module_named(p: *Project, fqn: str) module.ModuleId;
 ```
 
 the module loaded under `fqn`, nil when none is
@@ -282,7 +282,7 @@ make room for one more entry so the next module_append cannot fail
 ## fun module_append
 
 ```mach
-pub fun module_append(p: *Project, m: ModuleEntry) session.ModuleId;
+pub fun module_append(p: *Project, m: ModuleEntry) module.ModuleId;
 ```
 
 publish an entry under the next ModuleId into the slot module_reserve made.
@@ -299,7 +299,7 @@ how many modules a loaded module imports
 ## fun dep_at
 
 ```mach
-pub fun dep_at(p: *Project, m: *ModuleEntry, i: u32) session.ModuleId;
+pub fun dep_at(p: *Project, m: *ModuleEntry, i: u32) module.ModuleId;
 ```
 
 the module a loaded module imports at `i`, as its load record names it
@@ -319,7 +319,7 @@ nested load and read the same entry afterwards
 ## fun module_by_file
 
 ```mach
-pub fun module_by_file(p: *Project, fid: lang_source.FileId) opt[session.ModuleId];
+pub fun module_by_file(p: *Project, fid: lang_source.FileId) opt[module.ModuleId];
 ```
 
 the loaded module a source file backs, by a scan of the module table: editor edits

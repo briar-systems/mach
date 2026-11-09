@@ -80,7 +80,7 @@ as its instances
 ## fun analyze
 
 ```mach
-pub fun analyze(s: *session.Session, a: *ast.Ast, rr: *resolve.ResolveResult, source: str, own: session.ModuleId,
+pub fun analyze(s: *session.Session, a: *ast.Ast, rr: *resolve.ResolveResult, source: str, own: module.ModuleId,
 alloc: *A.Allocator) res[Analysis, fail.Fail];
 ```
 
