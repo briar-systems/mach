@@ -432,7 +432,7 @@ release what a name list owns
 ## fun site_of
 
 ```mach
-pub fun site_of(sites: *fail.Place, i: u32) fail.Place;
+pub fun site_of(sites: *lang_source.Location, i: u32) lang_source.Location;
 ```
 
 the place `i` of a model's per-entry places, the zero place when none were recorded

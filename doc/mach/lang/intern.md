@@ -128,6 +128,15 @@ pub fun range_add(itn: *Interner, source: str, offset: usize, len: usize) res[St
 the `len` bytes of `source` from `offset`, interned. the bytes are taken as
 they are, so a NUL among them is part of the string
 
+## fun find
+
+```mach
+pub fun find(itn: *Interner, text: str) opt[StrId];
+```
+
+the id `text` was interned under, none when it never was; nothing is interned, so a reader
+that shares the interner may ask while no one adds
+
 ## rec Remap
 
 ```mach

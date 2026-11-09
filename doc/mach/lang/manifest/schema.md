@@ -80,7 +80,7 @@ the path a refusal of a `--set` value is placed in
 ## fun setting
 
 ```mach
-pub fun setting(alloc: *A.Allocator, key: str, value: str) res[Setting, fail.Fail];
+pub fun setting(alloc: *A.Allocator, sources: *lang_source.SourceMap, key: str, value: str) res[Setting, fail.Fail];
 ```
 
 a `--set` key and value checked against the row of the key: the key is one a row marks `set`,
@@ -88,10 +88,11 @@ and the value has the row's shape. a string-shaped key takes the value as writte
 reads it as a TOML value
 
 alloc: owns the setting and a refusal's text
+sources: receives the setting's text, a file of its own, which a refusal points into
 key: the key, as a manifest writes it
 value: the value, as written
 ret: the setting; a user failure naming the key when no row names it, when its row is not
-       one `--set` writes, or when the value does not have its row's shape
+         one `--set` writes, or when the value does not have its row's shape
 
 ## fun section_check
 

@@ -44,7 +44,7 @@ a failure pointing at `sp`, as `point_at` places it
 ## fun span_site
 
 ```mach
-pub fun span_site(sp: toml.Span) fail.Place;
+pub fun span_site(sp: toml.Span) lang_source.Location;
 ```
 
 where `sp` is written in the manifest being parsed, as a range whose file
@@ -54,7 +54,7 @@ parser did not write
 ## fun element_sites
 
 ```mach
-pub fun element_sites(alloc: *A.Allocator, arr: *toml.Array) res[*fail.Place, fail.Fail];
+pub fun element_sites(alloc: *A.Allocator, arr: *toml.Array) res[*lang_source.Location, fail.Fail];
 ```
 
 where each element of `arr` is written, in order, as `span_site` places it;
@@ -81,7 +81,7 @@ pub fun sites_init(alloc: *A.Allocator) Sites;
 ## fun sites_add
 
 ```mach
-pub fun sites_add(s: *Sites, p: fail.Place);
+pub fun sites_add(s: *Sites, p: lang_source.Location);
 ```
 
 ## fun sites_fail
@@ -96,7 +96,7 @@ gathered places are released
 ## fun at_sites
 
 ```mach
-pub fun at_sites(alloc: *A.Allocator, f: fail.Fail, sites: *fail.Place, n: usize) fail.Fail;
+pub fun at_sites(alloc: *A.Allocator, f: fail.Fail, sites: *lang_source.Location, n: usize) fail.Fail;
 ```
 
 `f` pointing at the first spanned place of the `n` at `sites`, naming the

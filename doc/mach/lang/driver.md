@@ -148,6 +148,8 @@ manifest and the selection as `mach check` composes it, with the modules of `fil
 loaded beside the root set
 
 root: the project's directory, the one holding its mach.toml
+manifest: the project's manifest when the caller already read it, nil to read it from
+            `root`
 selection: the artifact, target and profile selection, one cell of which is analyzed
 roots: the root set the frontend loads: `project.ROOT_ARTIFACT` is the selected
             artifact's closure, `project.ROOT_UNION` every artifact's with the modules

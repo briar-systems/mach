@@ -24,16 +24,28 @@ worked by its own module, and the generation of the views borrowed from them
 pub fun init(alloc: *A.Allocator) res[Session, fail.Fail];
 ```
 
+a session holding its own source map
+
+## fun init_in
+
+```mach
+pub fun init_in(alloc: *A.Allocator, sources: *lang_source.SourceMap) res[Session, fail.Fail];
+```
+
+a session whose texts go to `sources`, a map that outlives it, so a location it hands out
+still names its file once the session is released
+
 ## fun init_over
 
 ```mach
-pub fun init_over(alloc: *A.Allocator, base: *intern.Interner) res[Session, fail.Fail];
+pub fun init_over(alloc: *A.Allocator, base: *intern.Interner, sources: *lang_source.SourceMap) res[Session, fail.Fail];
 ```
 
-a session whose names are layered over `base`: every id `base` has issued
-names the same string here, so what was planned in another session, its
-manifests and its cells, is read here as it was planned. `base` outlives the
-session and takes no new names while it lives
+a session whose names are layered over `base` and whose texts go to `sources`: every id
+`base` has issued names the same string here and every file of `sources` the same text, so
+what was planned in another session, its manifests and its cells, is read and located here as
+it was planned. `base` and `sources` outlive the session, and `base` takes no new names while
+it lives
 
 ## fun dnit
 

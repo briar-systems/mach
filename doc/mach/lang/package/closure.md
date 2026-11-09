@@ -204,6 +204,6 @@ a string key as the dependency commands read it: absent reads as empty
 ## fun parse_file
 
 ```mach
-pub fun parse_file(a: *A.Allocator, p: str) res[manifest_load.Doc, fail.Fail];
+pub fun parse_file(a: *A.Allocator, sources: *lang_source.SourceMap, p: str) res[manifest_load.Doc, fail.Fail];
 ```
 

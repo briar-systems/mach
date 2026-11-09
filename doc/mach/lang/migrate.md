@@ -61,12 +61,13 @@ whether a dependency's `[project].mach` range stands on the major this release m
 ## fun dependencies
 
 ```mach
-pub fun dependencies(a: *A.Allocator, root: str, text: str, out: *Vector[Dependency]) err[fail.Fail];
+pub fun dependencies(a: *A.Allocator, sources: *lang_source.SourceMap, root: str, text: str, out: *Vector[Dependency]) err[fail.Fail];
 ```
 
 each dependency of the manifest `text`, whose project is at `root`, as dep/ holds it
 
 a: owns what `out` holds
+sources: receives the text of each dependency's manifest dep/ holds
 root: the project's directory
 text: its manifest's text
 out: receives the dependencies

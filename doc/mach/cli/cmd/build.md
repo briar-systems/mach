@@ -49,7 +49,8 @@ plans: one plan per profile; each plans that profile's cells
 
 ```mach
 pub fun plan_invocation(a: *A.Allocator, root: str, cli: *args.CliArgs, goal: request.BuildGoal,
-mode: manifest_select.ArtifactDefault, configure_deps: bool, ps: *session.Session) res[Planned, fail.Fail];
+mode: manifest_select.ArtifactDefault, configure_deps: bool, sources: *lang_source.SourceMap,
+ps: *session.Session) res[Planned, fail.Fail];
 ```
 
 initialise a session, load the manifest, resolve the selectors and plan a
@@ -64,6 +65,7 @@ configure_deps: also resolve every cell against the realized dependency closure,
                 filling in its exported dependency steps and export link requirements. a build
                 that goes on to execute resolves each cell as it runs it, so only a caller that
                 reports the plan instead of running it asks for this
+sources: the invocation's source map, which the session's texts go to
 ps: out; the session the plans refer to, initialised here; on an error it has already been
                 torn down and the returned failure message is owned by `a`
 ret: the plans, or a Fail: internal for session or registry setup, user for manifest,

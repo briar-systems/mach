@@ -99,24 +99,6 @@ pub val CHILD_HELP: ChildKind = 1
 pub rec Child;
 ```
 
-## rec Related
-
-```mach
-pub rec Related;
-```
-
-## rec Edit
-
-```mach
-pub rec Edit;
-```
-
-## rec Fix
-
-```mach
-pub rec Fix;
-```
-
 ## rec FixId
 
 ```mach

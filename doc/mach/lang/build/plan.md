@@ -101,6 +101,8 @@ closure:  the manifest's dependency closure, located once by
           `plan_dependency_requirements`; every cell borrows it
 located:  whether `closure` was located as a build needs it, every dependency
           realized, which running the plan requires
+sources:  the texts the manifest and closure were read into, the map of the session
+          that located the closure; every session running the plan shares it
 
 ## fun plan
 

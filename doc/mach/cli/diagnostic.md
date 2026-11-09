@@ -27,7 +27,7 @@ list: the diagnostics, rendered in order; nothing is written when it is empty
 ## fun render_fail
 
 ```mach
-pub fun render_fail(f: *fail.Fail) i64;
+pub fun render_fail(sources: *lang_source.SourceMap, f: *fail.Fail) i64;
 ```
 
 print a Fail to stderr as "error[<key>]: <message>", followed by the
@@ -35,30 +35,33 @@ print a Fail to stderr as "error[<key>]: <message>", followed by the
 line for each related place it names, and map it to an exit code
 a reported Fail prints nothing, its diagnostics having been rendered already
 
+sources: the source map the failure's places are in, nil when it can point at none
 f: the Fail
 ret: the exit code `exit.of` maps the failure to
 
 ## fun refuse
 
 ```mach
-pub fun refuse(f: fail.Fail) i64;
+pub fun refuse(sources: *lang_source.SourceMap, f: fail.Fail) i64;
 ```
 
 render_fail for a failure built in place
 
+sources: the source map the failure's places are in, nil when it can point at none
 f: the Fail
 ret: the exit code `exit.of` maps the failure to
 
 ## fun dependency_report
 
 ```mach
-pub fun dependency_report(a: *A.Allocator) report.Report;
+pub fun dependency_report(a: *A.Allocator, sources: *lang_source.SourceMap) report.Report;
 ```
 
 where a dependency command reports: progress on standard output, and notes and failures
 the command goes on past on standard error
 
 a: owns the report's effect notes
+sources: the source map a failure's places are in
 ret: the report, released with `report.dnit`
 
 ## fun dependency_outcome

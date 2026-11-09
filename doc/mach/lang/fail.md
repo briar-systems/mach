@@ -18,7 +18,8 @@ owns was broken, whose text must be preserved; the input was wrong or
 unsupported; or the machine refused rather than the input (a file that could
 not be read or written, a tool that could not be spawned). a user or
 environment failure names the diagnostic kind it is reported as and may
-point at a place; an internal one is always `compiler.internal`. the exit
+point at a place, a location of the source map its holder reads, which the
+failure is rendered through; an internal one is always `compiler.internal`. the exit
 code derives from the case: 1 for user, 2 for internal, 3 where a command
 distinguishes the environment. `reported` is declared first so a zero
 failure is one that invents no text. an allocation refusal is internal; the
@@ -26,56 +27,9 @@ compiler recovers from none of them at the site that met them. a failure
 that carries text records whether it owns it: owned text was allocated
 through the allocator `dnit` is given and is released there, borrowed text
 (a literal, an interned text, storage someone else releases) never is. a
-failure that points somewhere records whether it owns its places in the same
-way, all of them or none: `places_retain`, `retain` and the constructors that
-copy a place through an allocator own them, and every constructor that
-borrows a place leaves them borrowed
-
-## rec Fix
-
-```mach
-pub rec Fix;
-```
-
-a machine-applicable rewrite of the file a failure points into: the bytes at
-`at`, or at the failure's own place when `at` is the zero place, become
-`replacement`. a nil label is no fix. the label and the replacement share the
-failure's places' lifetime
-
-label: what the rewrite does, as a fix line names it
-at: the bytes it replaces
-replacement: the text it writes in their place
-
-## rec Related
-
-```mach
-pub rec Related;
-```
-
-the other places a failure names, in order, each in its own file: the other
-edges of a cycle, the other claims a collision is between. the array and
-each resolved place's path share the failure's lifetime as `at`'s path does
-
-items: the places, nil when there are none
-count: how many
-
-## rec Place
-
-```mach
-pub rec Place;
-```
-
-where a failure points: a span of the file at `path`, and the line and
-column its first byte and the byte just past it fall on. a place whose span
-is known before its file is `spanned` with a nil path until `placed` names
-the file. the path shares the message's lifetime: a copy of the failure that
-outlives its message copies both
-
-path: the file, nil until the place is resolved
-spanned: whether a span is known; false with a nil path is no place
-span: the bytes the failure points at
-start: the position of the span's first byte
-end: the position just past the span's last byte
+failure that names related places or a fix records whether it owns their
+storage in the same way, all of it or none: `places_retain`, `retain`,
+`with_related` and `with_fix` own it
 
 ## fun reported
 
@@ -146,103 +100,75 @@ module it emitted): whatever the check says of the input, it is the
 compiler's defect, an internal failure keeping the text. a reported failure
 stays reported
 
+## fun at
+
+```mach
+pub fun at(f: Fail, at: lang_source.Location) Fail;
+```
+
+the same failure pointing at `at`, a location of the source map its caller reads. a
+failure that already points somewhere keeps its place, the innermost site knowing best;
+one with no kind, or a nil `at`, points nowhere. a fix that names no place of its own
+rewrites the bytes the failure points at
+
 ## fun spanned
 
 ```mach
 pub fun spanned(f: Fail, s: lang_source.Span) Fail;
 ```
 
-the same failure pointing at the span `s` of the file that caused it, which
-`placed` names. a failure that already points somewhere keeps its place, the
-innermost site knowing best, and one with no kind points nowhere
-
-## fun span_only
-
-```mach
-pub fun span_only(s: lang_source.Span) Place;
-```
-
-a place whose span is known and whose file is not yet
+the same failure pointing at the span `s` of the file that caused it, which `placed`
+names, as `at` points it
 
 ## fun placed
 
 ```mach
-pub fun placed(a: *A.Allocator, f: Fail, path: str, text: str) Fail;
+pub fun placed(f: Fail, file: lang_source.FileId) Fail;
 ```
 
-the same failure with its ranges resolved in `text`, the file at `path`, as
-`located` places them: its own and each related one still without a file.
-the failure owns its places through `a` as `located` leaves them. a failure
-without a range, or one already resolved, is returned as it is
-
-## fun placed_bytes
-
-```mach
-pub fun placed_bytes(a: *A.Allocator, f: Fail, path: str, data: *u8, n: usize) Fail;
-```
-
-`placed` over the `n` bytes at `data`, for a file that may hold a NUL
-
-## fun at
-
-```mach
-pub fun at(a: *A.Allocator, f: Fail, p: Place) Fail;
-```
-
-the same failure pointing at `p`, a place a model recorded: one without a
-file is a range `placed` resolves, one with a file is copied as `located`
-copies it. a failure that already points somewhere keeps its place
+the same failure with every span still waiting for its file, its own, each related one and
+each fix edit's, placed in `file`
 
 ## fun with_related
 
 ```mach
-pub fun with_related(a: *A.Allocator, f: Fail, ps: *Place, n: usize) Fail;
+pub fun with_related(a: *A.Allocator, f: Fail, locs: *lang_source.Location, n: usize) Fail;
 ```
 
-the same failure naming the `n` places at `ps` as its related places, in
-order, each copied through `a`, the failure owning its places as `located`
-leaves them; an unspanned place is skipped. a failure that already names
-related places keeps them, and one whose copy is refused is that refusal
+the same failure naming the `n` locations at `locs` as its related places, in order, each
+unlabelled; a nil location is skipped. the failure owns its places through `a` as
+`places_retain` leaves them. a failure that already names related places keeps them, and one
+whose copy is refused is that refusal
 
 ## fun with_fix
 
 ```mach
-pub fun with_fix(f: Fail, label: str, s: opt[lang_source.Span], replacement: str) Fail;
+pub fun with_fix(a: *A.Allocator, f: Fail, label: str, s: opt[lang_source.Span], replacement: str) Fail;
 ```
 
-the same failure carrying the rewrite `label` names, which replaces the span
-`s` of the file it points into, or the bytes it points at when `s` is nil, with
-`replacement`, both borrowed, so the failure borrows its places: ones it owned
-before are the caller's to release. a failure with no kind carries none, and
-one that already carries a fix keeps it
+the same failure carrying the rewrite `label` names, which replaces the span `s` of the file
+the failure points into, or the bytes it points at when `s` is none, with `replacement`. the
+label and the replacement are copied, so the failure owns its places through `a` as
+`places_retain` leaves them. a failure with no kind carries none, one that already carries a
+fix keeps it, and one whose copy is refused is that refusal
 
 ## fun fix_of
 
 ```mach
-pub fun fix_of(f: Fail) opt[Fix];
+pub fun fix_of(f: Fail) opt[annotation.Fix];
 ```
 
-the rewrite a failure carries, none when it carries no fix. a resolved fix
-whose own place is the zero place is given the failure's place
+the rewrite a failure carries, none when it carries no fix; it shares the failure's places'
+lifetime
 
 ## fun related_of
 
 ```mach
-pub fun related_of(f: Fail) Related;
+pub fun related_of(f: Fail) Vector[annotation.Related];
 ```
 
-the related places a failure names, none for one that names no other
-
-## fun located
-
-```mach
-pub fun located(a: *A.Allocator, f: Fail, at: Place) Fail;
-```
-
-the same failure pointing at `at`, its path copied through `a`, so the failure
-owns its places through `a`: one that borrowed them owns copies of the rest
-too, and one that owned them releases the place `at` replaces. a failure with
-no kind points nowhere, and one whose copy is refused is that refusal
+the related places a failure names, empty for one that names no other; they share the
+failure's places' lifetime
 
 ## fun borrowing_places
 
@@ -253,22 +179,13 @@ pub fun borrowing_places(f: Fail) Fail;
 the same failure borrowing its places, for a view of places a holder owns:
 the places it owned before are the caller's to release
 
-## fun place
-
-```mach
-pub fun place(path: str, lines: *lang_source.Lines, s: lang_source.Span) Place;
-```
-
-the span `s` of the file at `path` whose line index is `lines`, as a place;
-a span past the end is clamped to it
-
 ## fun place_of
 
 ```mach
-pub fun place_of(f: Fail) opt[Place];
+pub fun place_of(f: Fail) opt[lang_source.Location];
 ```
 
-where the failure points, when it points at a file
+where the failure points, when it points at a file of the source map its caller reads
 
 ## fun kind_of
 
@@ -356,9 +273,8 @@ it owns them
 pub fun places_retain(a: *A.Allocator, f: Fail) res[Fail, A.Error];
 ```
 
-a copy of the failure whose places, its own path and every related place,
-and its fix are owned through `a`, its text left as it is; for a holder that
-keeps the text apart. released with `places_dnit`
+a copy of the failure whose places, every related place and its fix, are owned through `a`,
+its text left as it is; for a holder that keeps the text apart. released with `places_dnit`
 
 ## fun places_dnit
 
@@ -367,7 +283,7 @@ pub fun places_dnit(a: *A.Allocator, f: Fail);
 ```
 
 release the places a failure owns through `a`, as `places_retain` made them;
-borrowed places are left alone, and a failure carrying no fix owns no fix text
+borrowed places are left alone
 
 ## fun without_places
 
@@ -384,8 +300,8 @@ fix, for a holder whose places were released or never copied
 pub fun same_places(x: Fail, y: Fail) bool;
 ```
 
-whether two failures hold the same places: the same path storage and the
-same related array, as a holder that copied them once sees its own copy
+whether two failures hold the same places: the same location and the same related and fix
+storage, as a holder that copied them once sees its own copy
 
 ## fun unit
 

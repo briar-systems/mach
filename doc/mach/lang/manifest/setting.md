@@ -18,7 +18,8 @@ value: the value, as written
 ## fun apply
 
 ```mach
-pub fun apply(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, list: *Assignment, n: usize) err[fail.Fail];
+pub fun apply(alloc: *A.Allocator, itn: *intern.Interner, sources: *lang_source.SourceMap, m: *Manifest, list: *Assignment,
+n: usize) err[fail.Fail];
 ```
 
 write each assignment over every table of its key's section in `m`, in order, so a later
@@ -26,8 +27,10 @@ assignment of a key wins
 
 alloc: owns a refusal's text
 itn: receives the strings
+sources: receives each assignment's text, which a refusal points into
 m: the manifest, its native target included
 list: the assignments
 n: length of `list`
-ret: ok, or the refusal of the first key `--set` does not write or value its key does not accept
+ret: ok, or the refusal of the first key `--set` does not write or value its key does not
+         accept
 

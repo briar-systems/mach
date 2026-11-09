@@ -20,6 +20,15 @@ pub val FILE_NIL: FileId = FileId;
 
 no source: an unlocated diagnostic, or a node the build synthesized
 
+## val FILE_PENDING
+
+```mach
+pub val FILE_PENDING: FileId = FileId;
+```
+
+a span whose file is not known yet: a reader that meets its spans before it knows the file
+they are in places them once it does. no map issues it, so it names no file
+
 ## fun file_id
 
 ```mach
@@ -103,11 +112,21 @@ pub fun location(file: FileId, s: Span) Location;
 pub fun location_nil() Location;
 ```
 
+## fun location_is_nil
+
+```mach
+pub fun location_is_nil(l: Location) bool;
+```
+
+whether a location is nowhere; one whose file is pending is somewhere
+
 ## fun location_is_valid
 
 ```mach
 pub fun location_is_valid(l: Location) bool;
 ```
+
+whether a location names a span of a file the map can hold
 
 ## fun location_equals
 
@@ -181,7 +200,8 @@ fixed chunk and never moves or is reused, so a `*SourceFile` taken from
 `get` stays valid until `dnit`. slot 0 is the FILE_NIL sentinel. growing
 the map, updating a file's text or releasing its payload mutates the file
 in place and bumps its `revision`; a slot is never handed to a second file
-without a generation check on that revision
+without a generation check on that revision. the map names its paths in its own
+interner, so every session that shares it finds a file by the same path
 
 ## fun init
 
@@ -223,7 +243,7 @@ reserved slot of a new entry until commit or discard
 ## fun prepare_load
 
 ```mach
-pub fun prepare_load(m: *SourceMap, interner: *intern.Interner, path: str, text: str) res[PreparedLoad, Error];
+pub fun prepare_load(m: *SourceMap, path: str, text: str) res[PreparedLoad, Error];
 ```
 
 the caller exclusively borrows the map until commit or discard; a new entry
@@ -248,6 +268,15 @@ an existing file takes the staged payload in place; a new one lands in the
 slot prepare_load reserved. neither moves any other file. total: the staged
 file is the map's own, so its loss stops the compiler
 
+## fun load
+
+```mach
+pub fun load(m: *SourceMap, path: str, text: str) res[FileId, Error];
+```
+
+the file at `path` holding `text`: a path the map holds keeps its id and takes the text, a new
+one is added
+
 ## fun prepare_release
 
 ```mach
@@ -271,7 +300,7 @@ revision as a generation before trusting a stored FileId
 ## fun find
 
 ```mach
-pub fun find(m: *SourceMap, interner: *intern.Interner, path: str) res[FileId, A.Error];
+pub fun find(m: *SourceMap, path: str) FileId;
 ```
 
 the file loaded from `path`, FILE_NIL when none was
