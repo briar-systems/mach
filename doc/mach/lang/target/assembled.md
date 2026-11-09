@@ -101,13 +101,22 @@ pub fun va_list_of(a: *A.Allocator, x: *Assembled) resolved.VaList;
 the `va_list` of the assembled target's own convention, as mirl's row of the
 convention states it and its data layout lays it out
 
-## fun scalars_of
+## fun registers_of
 
 ```mach
-pub fun scalars_of(a: *A.Allocator, x: *Assembled) res[layout.Scalars, fail.Fail];
+pub fun registers_of(x: *Assembled) opt[resolved.Registers];
 ```
 
-the extents mirl's data layout of the assembled target gives every primitive under its
-build basis, and the vector registers it fits vectors to. a pointer mirl holds logically,
-or under an addressing model that holds no address of it, has none
+the vector registers mirl fits a vector to under the build basis, none where it states no
+register fit and a vector aligns to its element
+
+## fun pointer_width_of
+
+```mach
+pub fun pointer_width_of(a: *A.Allocator, x: *Assembled) res[opt[u32], fail.Fail];
+```
+
+the width of an address of the default space, mirl's layout of a pointer under the build
+basis. none for a pointer mirl holds logically, or under an addressing model that holds no
+address of it
 

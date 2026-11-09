@@ -566,11 +566,11 @@ the integer a tag's discriminant is held in
 ## fun storage_align
 
 ```mach
-pub fun storage_align(lc: *LowerContext, tid: type.TypeId, ir: Type) u64;
+pub fun storage_align(lc: *LowerContext, ir: Type) u64;
 ```
 
-the alignment a value of the source type `tid`, held in `ir`, is stored at: a decorated
-record's, else the target's
+the alignment a value held in `ir` is stored at: the target's
+layout of `ir`, which states a decorated record's alignment and packing
 
 ## fun slot_for
 

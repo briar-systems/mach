@@ -61,25 +61,13 @@ pub fun vector(t: *types.Table, element: Type, lanes: u32) res[Type, fail.Fail];
 pub fun array(t: *types.Table, element: Type, count: u64) res[Type, fail.Fail];
 ```
 
-## fun structure
-
-```mach
-pub fun structure(t: *types.Table, members: *Type, n: u32) res[Type, fail.Fail];
-```
-
 ## fun structure_at
 
 ```mach
 pub fun structure_at(t: *types.Table, members: *Type, offsets: *u64, n: u32) res[Type, fail.Fail];
 ```
 
-a structure whose members stand at the offsets mach states, as a packed record's do
-
-## fun union_of
-
-```mach
-pub fun union_of(t: *types.Table, members: *Type, n: u32) res[Type, fail.Fail];
-```
+a structure whose members stand at the offsets mach states, as a constant's byte runs do
 
 ## fun signature
 

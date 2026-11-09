@@ -343,6 +343,45 @@ sources: the source roots an entry build binds with `-s`, each a package with no
                 manifest; nil for a manifest read from mach.toml, which states none
 source_count: length of `sources`
 
+## fun target_def
+
+```mach
+pub fun target_def() TargetDef;
+```
+
+a target with every key a table may leave out at its default: no env, isa, object format,
+platform, code model, extension or runner, and a zero base and stack. the caller sets the
+name, arch, sys and abi
+
+## fun artifact_def
+
+```mach
+pub fun artifact_def() ArtifactDef;
+```
+
+an artifact with every key a table may leave out at its default: no list, linkage, icon,
+manifest, size or region, the console subsystem, neither default nor exported. the caller
+sets the name, kind, entry, out and targets
+
+## fun profile_def
+
+```mach
+pub fun profile_def() ProfileDef;
+```
+
+a profile with every key a table may leave out at its default: not the default, no relax
+and no allow, the linker free to relax, and vectors scalarized. the caller sets the name
+
+## fun link_def
+
+```mach
+pub fun link_def() LinkDef;
+```
+
+a link with every key a table may leave out at its default: no symbol or filter, not
+exported, always included, and a shared library. the caller sets the name, source and the
+name or path its source takes
+
 ## fun empty
 
 ```mach

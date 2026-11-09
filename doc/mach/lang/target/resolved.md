@@ -22,7 +22,7 @@ the most extensions a target adds over its baseline
 
 ```mach
 pub tag VaList: u8 {
-    listed: layout.Extent;
+    listed: Listed;
     unlisted;
     refused: str;
 }
@@ -33,6 +33,23 @@ what mirl says of the `va_list` of the target's own convention
 listed: its size and alignment under the target's data layout
 unlisted: the convention has no `va_list`
 refused: mirl answers none for the target, with why
+
+## rec Listed
+
+```mach
+pub rec Listed;
+```
+
+the size and alignment of a `va_list`
+
+## rec Registers
+
+```mach
+pub rec Registers;
+```
+
+the vector registers a vector aligns to: `narrow` the narrowest and `widest` the widest
+the build meets, in bits
 
 ## rec Selected
 
@@ -141,14 +158,6 @@ pub fun nans_held(n: *Nans) bool;
 ```
 
 whether any format's rule is stated, as it is wherever a target is selected
-
-## fun layout_machine
-
-```mach
-pub fun layout_machine(tgt: *Target) layout.Machine;
-```
-
-the layout machine of a target: mirl's extents for every primitive and vector
 
 ## rec Facts
 
