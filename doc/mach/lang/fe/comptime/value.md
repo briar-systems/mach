@@ -114,7 +114,7 @@ pub fun cast_int(bits: wide.Wide, width: u32, signed: bool) res[CTValue, comptim
 ## fun nan_unspecified
 
 ```mach
-pub fun nan_unspecified(itn: *intern.Interner, arch_id: u32, nans: resolved.Nans, w: float.FloatWidth) res[CTValue, comptime_failure.EvalFail];
+pub fun nan_unspecified(itn: *intern.Interner, arch_id: u32, nans: target_facts.Nans, w: float.FloatWidth) res[CTValue, comptime_failure.EvalFail];
 ```
 
 the refusal of a float operation whose result is a NaN at width `w` on the instruction
@@ -124,7 +124,7 @@ a rule stated unspecified is the target model's, and one not stated is a gap of 
 ## fun cast_scalar
 
 ```mach
-pub fun cast_scalar(types: *type.TypeInterner, itn: *intern.Interner, pointer_width: u32, nans: resolved.Nans, arch_id: u32,
+pub fun cast_scalar(types: *type.TypeInterner, itn: *intern.Interner, pointer_width: u32, nans: target_facts.Nans, arch_id: u32,
 value: CTValue, from_ty: type.TypeId, to_ty: type.TypeId, reinterpret: bool) res[CTValue, comptime_failure.EvalFail];
 ```
 
@@ -215,7 +215,7 @@ pub fun apply_compare(op: ast_expr.BinOp, lhs: CTValue, rhs: CTValue) res[CTValu
 ## fun apply_arith
 
 ```mach
-pub fun apply_arith(op: ast_expr.BinOp, lhs: CTValue, rhs: CTValue, nans: resolved.Nans) res[CTValue, comptime_failure.EvalFail];
+pub fun apply_arith(op: ast_expr.BinOp, lhs: CTValue, rhs: CTValue, nans: target_facts.Nans) res[CTValue, comptime_failure.EvalFail];
 ```
 
 `nans` is the target's rule for the nan a float operation returns, and a nan result it

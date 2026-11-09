@@ -1,8 +1,9 @@
 # mach.lang.driver.backend
 
-the back half a build hands its lowered modules to: mirl compiles a unit to mink's object
-in memory, mink lays an object out in the target's format or reads one back, and mink links
-objects into an image. nothing here starts a process or writes a file between the stages
+the back half a build hands its lowered modules to: the target mirl readies once for the
+build, on which driver/backend/compile has mirl compile each unit to mink's object in memory,
+mink laying an object out in the target's format or reading one back, and mink linking objects
+into an image. nothing here starts a process or writes a file between the stages
 
 ## val OBJECT_EXT
 
@@ -19,16 +20,17 @@ format: mink reads an object by its bytes, never its name
 pub rec Back;
 ```
 
-the target a build compiles for and the formats it reads and writes
+the back end a build opens once for its target, which sema and codegen both read
 
 assembled: the target mirl assembled for the resolved target, nil before one is opened
 machine: what lowering builds its units for, borrowing `assembled`
-format: the object format the target writes
+target: the target mink resolved, which a link is for
 formats: mink's format registry
 prepared: the target mirl made ready for the build, once, which every module's compile reads;
            on the heap, since it stays put until it is closed. nil before one is opened
 laying: what sema lays the build's types out by, over `machine`'s target. nil before one
            is opened
+facts: what a program reads of the target while it compiles
 
 ## fun none
 
@@ -68,19 +70,6 @@ pub fun refused_by_mink(a: *A.Allocator, lead: str, f: Fail) fail.Fail;
 
 mink's failure `f` as mach's, under `lead`: what mink does not do is the input's to change, and
 every other cause is the compiler's
-
-## fun compile
-
-```mach
-pub fun compile(b: *Back, a: *A.Allocator, m: *Module, level: u8, checked: bool, relax: bool, floats: relaxation.Relaxations,
-listing: opt[*std_writer.Writer], stats: opt[*mirl_stats.Stats], name: str) res[Object, fail.Fail];
-```
-
-the mirl module `m` compiled to mink's object at mirl's level `level`, its schedule's own checks
-run with `checked`, the linker let relax its code with `relax` and the float relaxations `floats`
-permitted, masc's listing of the object written to `listing` when there is one, and its stages
-timed and counted into `stats` when there is one. the module is the schedule's to rewrite, so
-it is spent here
 
 ## fun object_bytes
 
@@ -319,10 +308,10 @@ plan: the layout the artifact states, nil where it states none
 ## fun link
 
 ```mach
-pub fun link(b: *Back, a: *A.Allocator, diags: *diagnostic.DiagnosticStore, kind: *output.Kind, format: *Format, requests: *Request, count: usize, output_path: str, gc: bool, image: *Image) res[Sink, fail.Fail];
+pub fun link(b: *Back, a: *A.Allocator, diags: *diagnostic.DiagnosticStore, kind: *output.Kind, requests: *Request, count: usize, output_path: str, gc: bool, image: *Image) res[Sink, fail.Fail];
 ```
 
-the image of `kind` in `format` mink links from the `count` requests at `requests`, a library
+the image of `kind` in the target's format mink links from the `count` requests at `requests`, a library
 named by name found by mink's search, named `output` where its format records a name, its
 unreferenced sections left out with `gc`, laid out as `image` states. mink's notes go to `diags`:
 a refused link's are notes of the refusal, which is reported there, and a finished link's are

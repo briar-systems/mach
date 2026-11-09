@@ -288,14 +288,6 @@ fwd mach.lang.manifest.artifact.subsystem_named
 
 forwards [`mach.lang.manifest.artifact.subsystem_named`](manifest/artifact.md#fun-subsystem_named)
 
-## fwd mach.lang.manifest.artifact.linkage_resolved
-
-```mach
-fwd mach.lang.manifest.artifact.linkage_resolved
-```
-
-forwards [`mach.lang.manifest.artifact.linkage_resolved`](manifest/artifact.md#fun-linkage_resolved)
-
 ## fwd mach.lang.manifest.artifact.product_choices
 
 ```mach

@@ -1,17 +1,5 @@
 # mach.lang.manifest.target
 
-## fun host_arch_name
-
-```mach
-pub fun host_arch_name() str;
-```
-
-## fun host_sys_name
-
-```mach
-pub fun host_sys_name() str;
-```
-
 ## fun host_tuple
 
 ```mach
@@ -69,16 +57,19 @@ the target `m` declares under `name`, nil when none is
 ## fun resolve_declared
 
 ```mach
-pub fun resolve_declared(alloc: *A.Allocator, itn: *intern.Interner, d: *TargetDef) res[resolved.Target, fail.Fail];
+pub fun resolve_declared(alloc: *A.Allocator, itn: *intern.Interner, d: *TargetDef, linkage: opt[*Linkage], linkage_from: *Origin) res[resolved.Target, fail.Fail];
 ```
 
-resolve a declared target with every key it states: the one place a
-`[target.<name>]` table becomes a target request
+resolve a declared target with every key it states: the one place a `[target.<name>]`
+table becomes mink's spelling and narrowing
 
-alloc: owns the `env` origin a refusal names
-itn: resolves the target's strings and holds that origin
+alloc: owns a refusal's text
+itn: resolves the target's strings
 d: the target
-ret: the target; err the owners' refusal of the request
+linkage: the linkage of the executable under build, none for the host's default
+linkage_from: where `linkage` was written, which a refusal of it names and points at;
+              nil where it was written nowhere
+ret: the target; err the owners' refusal, naming the target
 
 ## fun target_matches_host
 

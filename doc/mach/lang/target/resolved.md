@@ -1,14 +1,13 @@
 # mach.lang.target.resolved
 
-the description of a resolved target: the owners' rows it names and the plain
-facts the front end, the middle end and the back half read of it
+a resolved target: mink's resolution of a spelling and its narrowing, masc's closed
+selection of the instruction set and the extensions it adds, and what mach states of
+the images it builds
 
-a target is a row of mink's architecture catalog, a row of its system catalog
-under the environment the manifest states, a member of the architecture's
-convention axis, and a baseline over masc's catalog of the architecture's
-extensions with the extensions the target adds. every fact here is read from
-those owners when the target resolves (mach.lang.target) and none is stated
-by mach
+mink's catalog resolves every part of a target and supplies every default, masc checks
+the instruction set and the extensions once and returns the closed selection, and mach
+keeps only its own data beside them: the image keys a manifest states, else its stack
+defaults (mach.lang.target.defaults), and the product under build
 
 ## val MAX_ADDED
 
@@ -17,39 +16,6 @@ pub val MAX_ADDED: u32 = 64
 ```
 
 the most extensions a target adds over its baseline
-
-## tag VaList
-
-```mach
-pub tag VaList: u8 {
-    listed: Listed;
-    unlisted;
-    refused: str;
-}
-```
-
-what mirl says of the `va_list` of the target's own convention
-
-listed: its size and alignment under the target's data layout
-unlisted: the convention has no `va_list`
-refused: mirl answers none for the target, with why
-
-## rec Listed
-
-```mach
-pub rec Listed;
-```
-
-the size and alignment of a `va_list`
-
-## rec Registers
-
-```mach
-pub rec Registers;
-```
-
-the vector registers a vector aligns to: `narrow` the narrowest and `widest` the widest
-the build meets, in bits
 
 ## rec Selected
 
@@ -69,14 +35,6 @@ pub fun selected_none() Selected;
 ```
 
 no selection
-
-## fun selected_of
-
-```mach
-pub fun selected_of(s: *masc_extension.Selection) Selected;
-```
-
-`s` held by value, its rows past what a Selected holds dropped, as no masc catalog has
 
 ## fun selected_has
 
@@ -101,6 +59,30 @@ catalog has no such name or it names a level of many
 pub rec Target;
 ```
 
+a target mink resolved and masc checked
+
+target: mink's resolution, its rows nil where no target is selected. its `ext`
+               is borrowed from the narrowing, which a resolved target outlives, so it
+               is cleared and the names are held in `added`
+added: the names of masc's catalog the target adds over its baseline
+added_count: how many
+selected: masc's closed selection of the instruction set with what the target adds
+product: the product of the artifact under build, which mirl's address model reads:
+               a shared object's exported definitions another image may preempt. none
+               where no artifact selected the target
+base: the image base the manifest states, 0 for none
+stack_reserve: the main stack's reserve the manifest states, else mach's default for the
+               system (mach.lang.target.defaults), 0 for none
+stack_commit: the main stack's commit the manifest states, 0 for none
+
+## rec Image
+
+```mach
+pub rec Image;
+```
+
+the image keys a manifest states of a target, 0 for each it leaves out
+
 ## fun none
 
 ```mach
@@ -117,62 +99,83 @@ pub fun is_selected(t: *Target) bool;
 
 whether a target is selected
 
+## fun abi
+
+```mach
+pub fun abi(t: *Target) *mink_arch.Abi;
+```
+
+the calling convention row of the target, nil where its family names none
+
+## fun abi_name
+
+```mach
+pub fun abi_name(t: *Target) str;
+```
+
+mink's psABI name of the target's calling convention, "" where its family names none
+
+## fun isa
+
+```mach
+pub fun isa(t: *Target) str;
+```
+
+the instruction set the target stands on, in masc's spelling
+
 ## fun pie
 
 ```mach
 pub fun pie(t: *Target) bool;
 ```
 
-whether the target's executable is position independent: the linkage under build, else the
-host's default. false where the host runs no executable
+whether the target's executable is position independent: the linkage the target
+resolved to. false where the host runs no executable
 
-## rec Nans
-
-```mach
-pub rec Nans;
-```
-
-the nan a target's float operations return in each format, binary16, binary32
-and binary64 at the index of mirl's format, which mirl's folder reads
-
-## fun nans_none
+## rec Refused
 
 ```mach
-pub fun nans_none() Nans;
+pub rec Refused;
 ```
 
-no format's rule stated, as where no target is selected
+a refusal of a target and the part of it refused
 
-## fun nans_at
+part: the part, as mink names it
+why: the refusal, worded
+
+## fun refusal
 
 ```mach
-pub fun nans_at(n: *Nans, w: float.FloatWidth) mirl_capability.Nans;
+pub fun refusal(a: *A.Allocator, f: mink_fail.Fail) fail.Fail;
 ```
 
-the rule of the format of width `w`, binary64 for any other width
+mink's failure `f` as mach's
 
-## fun nans_held
+## fun refused
 
 ```mach
-pub fun nans_held(n: *Nans) bool;
+pub fun refused(a: *A.Allocator, kind: diagnostic_kind.Kind, r: *mink_target.Refusal) fail.Fail;
 ```
 
-whether any format's rule is stated, as it is wherever a target is selected
+mink's refusal of a part of a target as a user failure of `kind`, in mink's words
 
-## rec Facts
+## fun spec_of
 
 ```mach
-pub rec Facts;
+pub fun spec_of(sys: str, arch: str) res[mink_target.Spec, mink_target.Refusal];
 ```
 
-what a program may ask of its target while it compiles: the tag ids, the
-extents of its primitives and vectors, the selection its extensions are read
-against, what a float operation makes of a NaN, and whether `asm` reaches an
-assembler
+the system and the architecture named `sys` and `arch`, each a row's name, as a spelling
+`<sys>-<arch>` names them
 
-## fun facts
+## fun resolve
 
 ```mach
-pub fun facts(tgt: *Target) Facts;
+pub fun resolve(a: *A.Allocator, s: mink_target.Spec, n: *mink_target.Narrowing, of: str, image: Image) res[Target, Refused];
 ```
+
+the target `s` narrowed by `n` resolves to, its objects in the format `of` names of
+those its system writes, nil for mink's, with the image keys `image` states. mink
+resolves every part, and masc checks the instruction set and the extensions the
+narrowing adds. the target holds the names of the extensions, so `n` need not outlive it
 

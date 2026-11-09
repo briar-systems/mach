@@ -21,13 +21,13 @@ pub fun join_path(alloc: *A.Allocator, a: str, b: str) res[str, fail.Fail];
 ## fun target_context
 
 ```mach
-pub fun target_context(alloc: *A.Allocator, t: *resolved.Target, req: *request.BuildRequest,
+pub fun target_context(alloc: *A.Allocator, t: *resolved.Target, facts: target_facts.Facts, req: *request.BuildRequest,
 compiler_name: intern.StrId, compiler_ver: intern.StrId) comptime.ComptimeCtx;
 ```
 
-the comptime context of a build for `t` under `req`: every fact comptime reads from
-the target and the build options, and nothing of a project, so the build and the
-editor fold the same program the same way
+the comptime context of a build for `t` under `req`, whose back end states `facts`: every
+fact comptime reads from the target and the build options, and nothing of a project, so
+the build and the editor fold the same program the same way
 
 ## fun module_load
 

@@ -207,7 +207,7 @@ pub fun environment(c: *ComptimeCtx) ComptimeEnv;
 ## fun init
 
 ```mach
-pub fun init(alloc: *A.Allocator, target: resolved.Facts, build: BuildFacts) ComptimeCtx;
+pub fun init(alloc: *A.Allocator, target: target_facts.Facts, build: BuildFacts) ComptimeCtx;
 ```
 
 a load scope over the target and build `target` and `build` describe, with no module yet
