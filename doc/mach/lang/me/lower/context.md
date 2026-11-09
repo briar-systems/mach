@@ -857,6 +857,15 @@ lowering keeps no debug information
 pub fun symbol_of(lc: *LowerContext, sid: resolve.SymbolId) opt[*resolve.Symbol];
 ```
 
+## fun symbol_name
+
+```mach
+pub fun symbol_name(lc: *LowerContext, name: intern.StrId) Id[Name];
+```
+
+the handle of the symbol name `name` in the module's names, interned once, by which its
+function or global is declared. a refusal faults the builder, which the declaration reports
+
 ## fun external_linkage
 
 ```mach
