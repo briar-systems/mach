@@ -1,24 +1,17 @@
-use std.collections.map;
-use collections_vector: std.collections.vector;
-use std.collections.vector.Vector;
 use std.process.exec;
-use std.text.string.str_dup;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
-use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use A:          std.allocator;
 use types_path: std.types.path;
 
-use lang_alloc: mach.lang.alloc;
 use mach.lang.diagnostic;
 use mach.lang.fail;
 use mach.lang.intern;
@@ -27,24 +20,16 @@ use mach.lang.query;
 use mach.lang.retention;
 use session_embed: mach.lang.session.embed;
 use lang_source:   mach.lang.source;
+use mach.lang.source.provider.overlay;
 use mach.lang.type;
 use type_query: mach.lang.type.query;
-
-fwd module.ModuleId;
-fwd module.MODULE_NIL;
-fwd module.StableModuleId;
-fwd module.STABLE_MODULE_NIL;
 
 # a file's text as the session loaded it, keyed by the file's index. the source map and the
 # editor hold it across builds, so no released module takes it
 pub val FILE_TEXT: query.Kind = query.Kind{name: "file text", role: query.INPUT, owner: query.KEY_UNOWNED};
 
-# an open buffer's text, standing in for the file at `path` (cleaned) on disk
-rec Overlay {
-    path: str;
-    text: str;
-}
-
+# the compiler's state across builds: the stores the phases read and write, each owned and
+# worked by its own module, and the generation of the views borrowed from them
 pub rec Session {
     view_generation: u64;
     alloc:           *A.Allocator;
@@ -52,40 +37,25 @@ pub rec Session {
     # the freeing allocator scratch work draws from and returns to: it outlives
     # the session and is shared by its codegen workers, so it is safe across
     # threads. `alloc` unless the session's owner names its root
-    backing:  *A.Allocator;
-    sources:  lang_source.SourceMap;
-    diags:    diagnostic.DiagnosticStore;
-    interner: intern.Interner;
-    types:    type.TypeInterner;
+    backing: *A.Allocator;
+    # the texts every location the session hands out names: its own, or one it shares with
+    # the other sessions of an invocation, which outlives them
+    sources:      *lang_source.SourceMap;
+    owns_sources: bool;
+    diags:        diagnostic.DiagnosticStore;
+    interner:     intern.Interner;
+    types:        type.TypeInterner;
     # the facts derived from the type store, read and written only by mach.lang.type.query
     type_facts: type_query.Facts;
 
-    queries:               query.QueryDb;
-    query_presentation:    *query.Presentation;
-    query_failure_message: str;
-    # the last query failure's places, owned through the query arena's allocator
-    query_failure_places: fail.Fail;
-    parse_sequence:       u64;
+    queries:        query.QueryDb;
+    parse_sequence: u64;
 
-    # one past the highest project module id the session has an identity for;
-    # below module.BUFFER_BASE, so it never wraps
-    module_count: u32;
+    # the identities of the modules the session has loaded
+    modules: module.Registry;
 
-    module_fqns: map.Map[module.ModuleId, intern.StrId];
-    # which loaded modules belong to the root project rather than a dependency,
-    # part of a module's identity: the loader declares it when it gives the
-    # module its id, and the export surface of a shared library is drawn from
-    # these modules alone
-    module_root_project: map.Map[module.ModuleId, bool];
-
-    stable_ids:     map.Map[intern.StrId, module.StableModuleId];
-    stable_id_next: module.StableModuleId;
-
-    stable_to_mid: map.Map[module.StableModuleId, module.ModuleId];
-
-    # the open buffers, one per file however its path is spelled; scanned by
-    # path, as an editor holds a handful
-    overlays: Vector[Overlay];
+    # the open buffers' texts, standing in for their files
+    overlays: overlay.Store;
 
     embeds: session_embed.EmbedCache;
 
@@ -97,39 +67,40 @@ pub rec Session {
     environ: exec.Environment;
 }
 
+# a session holding its own source map
 pub fun init(alloc: *A.Allocator) res[Session, fail.Fail] {
-    ret made(alloc, intern.init(alloc));
+    ret made(alloc, intern.init(alloc), nil);
 }
 
-# a session whose names are layered over `base`: every id `base` has issued
-# names the same string here, so what was planned in another session, its
-# manifests and its cells, is read here as it was planned. `base` outlives the
-# session and takes no new names while it lives
-pub fun init_over(alloc: *A.Allocator, base: *intern.Interner) res[Session, fail.Fail] {
-    ret made(alloc, intern.child_init(base, alloc));
+# a session whose texts go to `sources`, a map that outlives it, so a location it hands out
+# still names its file once the session is released
+pub fun init_in(alloc: *A.Allocator, sources: *lang_source.SourceMap) res[Session, fail.Fail] {
+    ret made(alloc, intern.init(alloc), sources);
 }
 
-fun made(alloc: *A.Allocator, names: intern.Interner) res[Session, fail.Fail] {
+# a session whose names are layered over `base` and whose texts go to `sources`: every id
+# `base` has issued names the same string here and every file of `sources` the same text, so
+# what was planned in another session, its manifests and its cells, is read and located here as
+# it was planned. `base` and `sources` outlive the session, and `base` takes no new names while
+# it lives
+pub fun init_over(alloc: *A.Allocator, base: *intern.Interner, sources: *lang_source.SourceMap) res[Session, fail.Fail] {
+    ret made(alloc, intern.child_init(base, alloc), sources);
+}
+
+fun made(alloc: *A.Allocator, names: intern.Interner, shared: *lang_source.SourceMap) res[Session, fail.Fail] {
     var s: Session;
-    s.alloc                 = alloc;
-    s.parse_sequence        = 0;
-    s.build_alloc           = alloc;
-    s.backing               = alloc;
-    s.view_generation       = 1;
-    s.environ               = exec.Environment.inherit{};
-    s.sources               = lang_source.init(alloc);
-    s.diags                 = diagnostic.store_init(alloc);
-    s.query_presentation    = nil;
-    s.query_failure_message = nil;
-    s.query_failure_places  = fail.reported();
+    s.alloc           = alloc;
+    s.parse_sequence  = 0;
+    s.build_alloc     = alloc;
+    s.backing         = alloc;
+    s.view_generation = 1;
+    s.environ         = exec.Environment.inherit{};
+    s.sources         = shared;
+    s.owns_sources    = false;
+    s.diags           = diagnostic.store_init(alloc);
 
-    s.interner            = names;
-    s.module_count        = 0;
-    s.module_fqns         = map.init[module.ModuleId, intern.StrId](alloc);
-    s.module_root_project = map.init[module.ModuleId, bool](alloc);
-    s.stable_ids          = map.init[intern.StrId, module.StableModuleId](alloc);
-    s.stable_id_next      = module.stable_id(0);
-    s.stable_to_mid       = map.init[module.StableModuleId, module.ModuleId](alloc);
+    s.interner = names;
+    s.modules  = module.registry_init(alloc);
     # each part made so far is released when init does not complete
     var complete:    bool = false;
     var has_types:   bool = false;
@@ -140,11 +111,18 @@ fun made(alloc: *A.Allocator, names: intern.Interner) res[Session, fail.Fail] {
             if (has_types)   { type.dnit(?s.types); }
             intern.dnit(?s.interner);
             diagnostic.store_dnit(?s.diags);
-            lang_source.dnit(?s.sources);
+            sources_dnit(?s);
         }
     }
+    if (shared == nil) {
+        val held: res[*lang_source.SourceMap, A.Error] = A.allocate[lang_source.SourceMap](alloc, 1);
+        if (sel held.err) { ret res[Session, fail.Fail].err{fail.refused(held.err)}; }
+        s.sources      = held.ok;
+        @s.sources     = lang_source.init(alloc);
+        s.owns_sources = true;
+    }
 
-    s.overlays   = collections_vector.init[Overlay](alloc);
+    s.overlays   = overlay.store_init(alloc);
     s.embeds     = session_embed.init(alloc);
     s.type_facts = type_query.facts_init(alloc);
 
@@ -165,97 +143,14 @@ fun made(alloc: *A.Allocator, names: intern.Interner) res[Session, fail.Fail] {
     ret res[Session, fail.Fail].ok{s};
 }
 
-# release the text and the places of the last query failure the session holds
-pub fun drop_query_failure(s: *Session) {
-    if (s.query_failure_message != nil) {
-        str_free(s.queries.a, s.query_failure_message);
-        s.query_failure_message = nil;
-    }
-    fail.places_dnit(s.queries.a, s.query_failure_places);
-    s.query_failure_places = fail.reported();
-}
-
-# hold the text an operation handed back, allocated from the query database, as the held
-# failure's text; the session owns it from here
-pub fun adopt_failure_text(s: *Session, text: str) {
-    if (s.query_failure_message != nil && s.query_failure_message != text) { str_free(s.queries.a, s.query_failure_message); }
-    s.query_failure_message = text;
-}
-
-# hold a failure where the session presents it: its text and the places it points at are
-# copied into the session's slot, replacing what the slot held, and the failure returned reads
-# the held copies. text the presentation already owns stays there. a copy the allocator
-# refused leaves the failure without that part and sets `lost`
-# ---
-# s:       the session
-# failure: the failure to hold; one with no text or places empties the slot
-# lost:    set when part of the failure could not be held
-# ret:     the failure as the session holds it
-pub fun hold_failure(s: *Session, failure: fail.Fail, lost: *bool) fail.Fail {
-    var held:    fail.Fail = failure;
-    val carried: opt[str]  = fail.text(failure);
-    var keep:    bool      = false;
-    if (sel carried.some) {
-        val text: str = carried.some;
-        keep = text == s.query_failure_message;
-        if (!keep && (s.query_presentation == nil || text != s.query_presentation.message)) {
-            val copied: res[str, A.Error] = str_dup(s.queries.a, text);
-            if (sel copied.err) {
-                held  = fail.with_text(failure, lang_alloc.text(copied.err));
-                @lost = true;
-            }
-            if (sel copied.ok) {
-                if (s.query_failure_message != nil) { str_free(s.queries.a, s.query_failure_message); }
-                s.query_failure_message = copied.ok;
-                held                    = fail.with_text(failure, copied.ok);
-                keep                    = true;
-            }
-        }
-    }
-    if (!keep && s.query_failure_message != nil) {
-        str_free(s.queries.a, s.query_failure_message);
-        s.query_failure_message = nil;
-    }
-    if (!fail.same_places(held, s.query_failure_places)) {
-        val copied: res[fail.Fail, A.Error] = fail.places_retain(s.queries.a, held);
-        fail.places_dnit(s.queries.a, s.query_failure_places);
-        s.query_failure_places = fail.reported();
-        if (sel copied.err) {
-            held  = fail.without_places(held);
-            @lost = true;
-        }
-        if (sel copied.ok) {
-            s.query_failure_places = copied.ok;
-            held                   = fail.borrowing_places(copied.ok);
-        }
-    }
-    ret held;
-}
-
 # release a session and everything it owns; a nil session holds nothing
 pub fun dnit(s: *Session) {
     if (s == nil) { ret; }
 
-    var oi: usize = 0;
-    for (oi < s.overlays.len) {
-        str_free(s.alloc, s.overlays.data[oi].path);
-        str_free(s.alloc, s.overlays.data[oi].text);
-        oi = oi + 1;
-    }
-    collections_vector.dnit[Overlay](?s.overlays);
+    overlay.store_dnit(?s.overlays);
 
-    s.module_count = 0;
+    module.registry_dnit(?s.modules);
 
-    map.dnit[module.ModuleId, intern.StrId](?s.module_fqns);
-    map.dnit[module.ModuleId, bool](?s.module_root_project);
-    map.dnit[intern.StrId, module.StableModuleId](?s.stable_ids);
-    map.dnit[module.StableModuleId, module.ModuleId](?s.stable_to_mid);
-
-    if (s.query_presentation != nil) {
-        query.presentation_dnit(s.query_presentation);
-        s.query_presentation = nil;
-    }
-    drop_query_failure(s);
     retention.dnit(?s.retention);
     query.dnit(?s.queries);
     session_embed.dnit(?s.embeds);
@@ -264,100 +159,22 @@ pub fun dnit(s: *Session) {
     intern.dnit(?s.interner);
 
     diagnostic.store_dnit(?s.diags);
-    lang_source.dnit(?s.sources);
+    sources_dnit(s);
 }
 
-# exhaustion permanently refuses new borrowed views while teardown remains infallible
-fun expire_views(s: *Session) {
+# release the source map a session owns; a shared one is its invocation's
+fun sources_dnit(s: *Session) {
+    if (!s.owns_sources || s.sources == nil) { ret; }
+    lang_source.dnit(s.sources);
+    A.deallocate[lang_source.SourceMap](s.alloc, s.sources, 1);
+    s.sources      = nil;
+    s.owns_sources = false;
+}
+
+# a change to the session's inputs or module identities expires every view borrowed from it. exhaustion
+# permanently refuses new borrowed views while teardown remains infallible
+pub fun expire_views(s: *Session) {
     if (s.view_generation != ~(0::u64)) { s.view_generation = s.view_generation + 1; }
-}
-
-pub fun reset_module_registry(s: *Session) {
-    if (s == nil) { ret; }
-    expire_views(s);
-
-    s.module_count = 0;
-
-    map.clear[module.ModuleId, intern.StrId](?s.module_fqns);
-    map.clear[module.ModuleId, bool](?s.module_root_project);
-
-    map.clear[module.StableModuleId, module.ModuleId](?s.stable_to_mid);
-}
-
-# one past the highest project module id the session has an identity for
-pub fun module_count(s: *Session) u32 {
-    ret s.module_count;
-}
-
-fun register_module_fqn(s: *Session, mid: module.ModuleId, fqn: intern.StrId) err[fail.Fail] {
-    val insert_r: res[bool, A.Error] = map.insert[module.ModuleId, intern.StrId](?s.module_fqns, mid, fqn);
-    if (sel insert_r.err) { ret err[fail.Fail].err{fail.refused(insert_r.err)}; }
-    ret err[fail.Fail].ok{};
-}
-
-pub fun register_module_root_project(s: *Session, mid: module.ModuleId, root: bool) err[fail.Fail] {
-    val insert_r: res[bool, A.Error] = map.insert[module.ModuleId, bool](?s.module_root_project, mid, root);
-    if (sel insert_r.err) { ret err[fail.Fail].err{fail.refused(insert_r.err)}; }
-    ret err[fail.Fail].ok{};
-}
-
-# a module the loader never declared is not the root project's: a dependency's
-# module, or one loaded outside a project, exports nothing of its own
-pub fun module_is_root_project(s: *Session, mid: module.ModuleId) bool {
-    if (module.is_nil(mid)) { ret false; }
-    val res_get: opt[*bool] = map.get[module.ModuleId, bool](?s.module_root_project, ?mid);
-    if (sel res_get.some) { ret @res_get.some; }
-    ret false;
-}
-
-pub fun module_fqn(s: *Session, mid: module.ModuleId) intern.StrId {
-    if (module.is_nil(mid)) { ret intern.STR_NIL; }
-    val res_get: opt[*intern.StrId] = map.get[module.ModuleId, intern.StrId](?s.module_fqns, ?mid);
-    if (sel res_get.some) {
-        ret @res_get.some;
-    }
-    ret intern.STR_NIL;
-}
-
-pub fun stable_module_id(s: *Session, fqn: intern.StrId) res[module.StableModuleId, fail.Fail] {
-    val res_get: opt[*module.StableModuleId] = map.get[intern.StrId, module.StableModuleId](?s.stable_ids, ?fqn);
-    if (sel res_get.some) {
-        ret res[module.StableModuleId, fail.Fail].ok{@res_get.some};
-    }
-
-    if (module.stable_is_nil(s.stable_id_next)) {
-        ret res[module.StableModuleId, fail.Fail].err{fail.message("stable module identities are exhausted")};
-    }
-    val id:         module.StableModuleId = s.stable_id_next;
-    val res_insert: res[bool, A.Error]    = map.insert[intern.StrId, module.StableModuleId](?s.stable_ids, fqn, id);
-    if (sel res_insert.err) {
-        ret res[module.StableModuleId, fail.Fail].err{fail.refused(res_insert.err)};
-    }
-    s.stable_id_next = module.stable_id(module.stable_index(s.stable_id_next) + 1);
-    ret res[module.StableModuleId, fail.Fail].ok{id};
-}
-
-pub fun stable_module_id_lookup(s: *Session, fqn: intern.StrId) module.StableModuleId {
-    val res_get: opt[*module.StableModuleId] = map.get[intern.StrId, module.StableModuleId](?s.stable_ids, ?fqn);
-    if (sel res_get.some) {
-        ret @res_get.some;
-    }
-    ret module.STABLE_MODULE_NIL;
-}
-
-pub fun register_stable_mid(s: *Session, stable: module.StableModuleId, mid: module.ModuleId) err[fail.Fail] {
-    val insert_r: res[bool, A.Error] = map.insert[module.StableModuleId, module.ModuleId](?s.stable_to_mid, stable, mid);
-    if (sel insert_r.err) { ret err[fail.Fail].err{fail.refused(insert_r.err)}; }
-    ret err[fail.Fail].ok{};
-}
-
-pub fun module_id_for_stable(s: *Session, stable: module.StableModuleId) module.ModuleId {
-    if (module.stable_is_nil(stable)) { ret module.MODULE_NIL; }
-    val res_get: opt[*module.ModuleId] = map.get[module.StableModuleId, module.ModuleId](?s.stable_to_mid, ?stable);
-    if (sel res_get.some) {
-        ret @res_get.some;
-    }
-    ret module.MODULE_NIL;
 }
 
 pub fun reset_type_projection(s: *Session) err[fail.Fail] {
@@ -367,32 +184,6 @@ pub fun reset_type_projection(s: *Session) err[fail.Fail] {
     expire_views(s);
     type.field_projection_reset(?s.types);
     ret err[fail.Fail].ok{};
-}
-
-# give the module `mid` its name and stable identity; a project's module also
-# counts toward module_count, a standalone buffer's does not
-pub fun register_module_identity(s: *Session, mid: module.ModuleId, fqn: intern.StrId, stable: module.StableModuleId) err[fail.Fail] {
-    if (module.is_nil(mid)) { ret err[fail.Fail].err{fail.message("a module identity needs a module id")}; }
-    var key: module.ModuleId = mid;
-    expire_views(s);
-    val rf: err[fail.Fail] = register_module_fqn(s, mid, fqn);
-    if (sel rf.err) { ret rf; }
-    val rm: err[fail.Fail] = register_stable_mid(s, stable, mid);
-    if (sel rm.err) {
-        map.remove[module.ModuleId, intern.StrId](?s.module_fqns, ?key);
-        ret rm;
-    }
-    val buffer: opt[u32] = module.buffer_file(mid);
-    if (sel buffer.none && module.index(mid) >= s.module_count) { s.module_count = module.index(mid) + 1; }
-    ret err[fail.Fail].ok{};
-}
-
-pub fun unregister_module_identity(s: *Session, mid: module.ModuleId, stable: module.StableModuleId) {
-    var key:  module.ModuleId       = mid;
-    var skey: module.StableModuleId = stable;
-    map.remove[module.ModuleId, intern.StrId](?s.module_fqns, ?key);
-    map.remove[module.ModuleId, bool](?s.module_root_project, ?key);
-    map.remove[module.StableModuleId, module.ModuleId](?s.stable_to_mid, ?skey);
 }
 
 pub fun next_parse_incarnation(s: *Session) res[u64, fail.Fail] {
@@ -410,7 +201,7 @@ pub fun load_source(s: *Session, path: str, text: str) res[lang_source.FileId, f
     val key: str = key_r.ok;
     fin { str_free(s.alloc, key); }
     if (str_len(text) > 0xFFFFFFFF::usize) { ret res[lang_source.FileId, fail.Fail].err{fail.message("source input exceeds the query byte extent")}; }
-    val staged: res[lang_source.PreparedLoad, lang_source.Error] = lang_source.prepare_load(?s.sources, ?s.interner, key, text);
+    val staged: res[lang_source.PreparedLoad, lang_source.Error] = lang_source.prepare_load(s.sources, key, text);
     if (sel staged.err) { ret res[lang_source.FileId, fail.Fail].err{fail.source_refused(staged.err)}; }
     var prepared: lang_source.PreparedLoad = staged.ok;
     fin { lang_source.discard_load(?prepared); }
@@ -418,123 +209,6 @@ pub fun load_source(s: *Session, path: str, text: str) res[lang_source.FileId, f
     if (sel input.err)    { ret res[lang_source.FileId, fail.Fail].err{input.err}; }
     if (prepared.changed) { expire_views(s); }
     ret res[lang_source.FileId, fail.Fail].ok{lang_source.commit_load(?prepared)};
-}
-
-pub rec PreparedOverlay {
-    owner:   *Session;
-    key:     str;
-    text:    str;
-    index:   usize;
-    remove:  bool;
-    changed: bool;
-}
-
-# the caller exclusively borrows overlay state through commit or discard
-pub fun prepare_overlay(s: *Session, path: str, text: str, remove: bool) res[PreparedOverlay, fail.Fail] {
-    val canonical: res[str, fail.Fail] = source_key(s, path);
-    if (sel canonical.err) { ret res[PreparedOverlay, fail.Fail].err{canonical.err}; }
-    var prepared: PreparedOverlay = PreparedOverlay{
-        owner: s, key: canonical.ok, index: s.overlays.len, remove: remove
-    };
-    var complete: bool = false;
-    fin {
-        if (!complete) { discard_overlay(?prepared); }
-    }
-    var i: usize = 0;
-    for (i < s.overlays.len) {
-        if (str_equals(s.overlays.data[i].path, prepared.key)) {
-            prepared.index = i;
-            brk;
-        }
-        i = i + 1;
-    }
-    if (remove) { prepared.changed = prepared.index < s.overlays.len; }
-    or {
-        prepared.changed = prepared.index == s.overlays.len || !str_equals(s.overlays.data[prepared.index].text, text);
-        if (prepared.changed) {
-            val copied: res[str, A.Error] = str_dup(s.alloc, text);
-            if (sel copied.err) { ret res[PreparedOverlay, fail.Fail].err{fail.refused(copied.err)}; }
-            prepared.text = copied.ok;
-            if (prepared.index == s.overlays.len) {
-                val reserved: res[usize, A.Error] = collections_vector.reserve[Overlay](?s.overlays, 1);
-                if (sel reserved.err) { ret res[PreparedOverlay, fail.Fail].err{fail.refused(reserved.err)}; }
-            }
-        }
-    }
-    complete = true;
-    ret res[PreparedOverlay, fail.Fail].ok{prepared};
-}
-
-# release an overlay that was prepared and not committed; one already committed or
-# discarded owns nothing
-pub fun discard_overlay(prepared: *PreparedOverlay) {
-    if (prepared.owner == nil) { ret; }
-    str_free(prepared.owner.alloc, prepared.key);
-    str_free(prepared.owner.alloc, prepared.text);
-    prepared.owner = nil;
-    prepared.key   = nil;
-    prepared.text  = nil;
-}
-
-pub fun commit_overlay(prepared: *PreparedOverlay) bool {
-    val s:       *Session = prepared.owner;
-    val changed: bool     = prepared.changed;
-    if (changed) {
-        expire_views(s);
-        val i: usize = prepared.index;
-        if (prepared.remove) {
-            str_free(s.alloc, s.overlays.data[i].path);
-            str_free(s.alloc, s.overlays.data[i].text);
-            val last: opt[Overlay] = collections_vector.pop[Overlay](?s.overlays);
-            # the last entry fills the removed one's place
-            if (sel last.some) {
-                if (i != s.overlays.len) { s.overlays.data[i] = last.some; }
-            }
-        }
-        or {
-            # prepare reserved the new entry's room
-            if (i == s.overlays.len) {
-                collections_vector.push[Overlay](?s.overlays, Overlay{path: prepared.key, text: prepared.text});
-                prepared.key = nil;
-            }
-            or {
-                str_free(s.alloc, s.overlays.data[i].text);
-                s.overlays.data[i].text = prepared.text;
-            }
-            prepared.text = nil;
-        }
-    }
-    discard_overlay(prepared);
-    ret changed;
-}
-
-pub fun set_overlay(s: *Session, path: str, text: str) err[fail.Fail] {
-    val staged: res[PreparedOverlay, fail.Fail] = prepare_overlay(s, path, text, false);
-    if (sel staged.err) { ret err[fail.Fail].err{staged.err}; }
-    var prepared: PreparedOverlay = staged.ok;
-    commit_overlay(?prepared);
-    ret err[fail.Fail].ok{};
-}
-
-pub fun clear_overlay(s: *Session, path: str) res[bool, fail.Fail] {
-    val staged: res[PreparedOverlay, fail.Fail] = prepare_overlay(s, path, nil, true);
-    if (sel staged.err) { ret res[bool, fail.Fail].err{staged.err}; }
-    var prepared: PreparedOverlay = staged.ok;
-    ret res[bool, fail.Fail].ok{commit_overlay(?prepared)};
-}
-
-pub fun overlay_get(s: *Session, path: str) opt[str] {
-    val key_r: res[str, fail.Fail] = source_key(s, path);
-    if (sel key_r.err) { ret opt[str].none{}; }
-    val key: str = key_r.ok;
-    fin { str_free(s.alloc, key); }
-
-    var i: usize = 0;
-    for (i < s.overlays.len) {
-        if (str_equals(s.overlays.data[i].path, key)) { ret opt[str].some{s.overlays.data[i].text}; }
-        i = i + 1;
-    }
-    ret opt[str].none{};
 }
 
 fun source_key(s: *Session, path: str) res[str, fail.Fail] {

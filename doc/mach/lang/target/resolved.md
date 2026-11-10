@@ -7,7 +7,7 @@ the images it builds
 mink's catalog resolves every part of a target and supplies every default, masc checks
 the instruction set and the extensions once and returns the closed selection, and mach
 keeps only its own data beside them: the image keys a manifest states, else its stack
-defaults (mach.lang.target.defaults), and the product under build
+defaults (mach.lang.target.defaults), and the output kind under build
 
 ## val MAX_ADDED
 
@@ -69,9 +69,9 @@ added_count: how many
 selected: masc's closed selection of the instruction set with what the target adds
 code_model: the code model the narrowing names, none where the target takes its host's
                default, which mirl reads as unpicked
-product: the product of the artifact under build, which mirl's address model reads:
-               a shared object's exported definitions another image may preempt. none
-               where no artifact selected the target
+output: the output kind of the artifact under build, which mirl's address model
+               reads: a shared object's exported definitions another image may preempt.
+               none where no artifact selected the target
 base: the image base the manifest states, 0 for none
 stack_reserve: the main stack's reserve the manifest states, else mach's default for the
                system (mach.lang.target.defaults), 0 for none
@@ -142,7 +142,7 @@ pub rec Refused;
 
 a refusal of a target and the part of it refused
 
-part: the part, as mink names it
+part: the part, as mink names it (mink_target.part_name)
 why: the refusal, worded
 
 ## fun refusal
@@ -156,19 +156,20 @@ mink's failure `f` as mach's
 ## fun refused
 
 ```mach
-pub fun refused(a: *A.Allocator, kind: diagnostic_kind.Kind, r: *mink_target.Refusal) fail.Fail;
+pub fun refused(a: *A.Allocator, kind: diagnostic_kind.Kind, f: mink_fail.Fail) fail.Fail;
 ```
 
-mink's refusal of a part of a target as a user failure of `kind`, in mink's words
+mink's refusal `f` of a part of a target as a user failure of `kind`, in mink's words; a
+failure that refuses no part is mink's own, as `refusal` words it
 
 ## fun spec_of
 
 ```mach
-pub fun spec_of(sys: str, arch: str) res[mink_target.Spec, mink_target.Refusal];
+pub fun spec_of(a: *A.Allocator, kind: diagnostic_kind.Kind, sys: str, arch: str) res[mink_target.Spec, fail.Fail];
 ```
 
-the system and the architecture named `sys` and `arch`, each a row's name, as a spelling
-`<sys>-<arch>` names them
+the system and the architecture named `sys` and `arch`, each a row's name, refused as mink
+refuses them, as a user failure of `kind`
 
 ## fun resolve
 

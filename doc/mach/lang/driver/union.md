@@ -3,13 +3,13 @@
 ## fun populate_union_tuples
 
 ```mach
-pub fun populate_union_tuples(p: *project.Project, m: *manifest.Manifest) err[fail.Fail];
+pub fun populate_union_tuples(p: *project.Project, m: *manifest_model.Manifest) err[fail.Fail];
 ```
 
 ## fun populate_union_entries
 
 ```mach
-pub fun populate_union_entries(p: *project.Project, m: *manifest.Manifest) err[fail.Fail];
+pub fun populate_union_entries(p: *project.Project, m: *manifest_model.Manifest) err[fail.Fail];
 ```
 
 the artifact entries of this project, split by whether the selected target builds them:

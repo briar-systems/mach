@@ -3,7 +3,7 @@
 ## fun type_to_str
 
 ```mach
-pub fun type_to_str(s: *session.Session, t: type.TypeId) res[str, fail.Fail];
+pub fun type_to_str(s: *session.Session, t: type_kind.TypeId) res[str, fail.Fail];
 ```
 
 ## fun type_str_free

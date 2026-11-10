@@ -5,7 +5,7 @@ which type parameters a type mentions, and the declaration that owns them
 ## fun mentioned
 
 ```mach
-pub fun mentioned(q: *type_query.Query, tid: type.TypeId) bool;
+pub fun mentioned(q: *type_query.Query, tid: type_kind.TypeId) bool;
 ```
 
 whether `tid` mentions a type parameter anywhere it is spelled
@@ -13,7 +13,7 @@ whether `tid` mentions a type parameter anywhere it is spelled
 ## fun owner
 
 ```mach
-pub fun owner(q: *type_query.Query, tid: type.TypeId) opt[type.GenericOwner];
+pub fun owner(q: *type_query.Query, tid: type_kind.TypeId) opt[type.GenericOwner];
 ```
 
 the declaration whose parameters a nominal's fields mention: the nominal itself for a
@@ -23,7 +23,7 @@ none when the fields mention no parameter
 ## fun has_param
 
 ```mach
-pub fun has_param(q: *type_query.Query, tid: type.TypeId) bool;
+pub fun has_param(q: *type_query.Query, tid: type_kind.TypeId) bool;
 ```
 
 whether a nominal's fields mention a type parameter, which a nominal with no field

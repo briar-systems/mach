@@ -8,36 +8,6 @@ pub rec EditorSession;
 
 one serial facade over a borrowed session, with compact open-buffer slots
 
-## def AnalysisPhase
-
-```mach
-pub def AnalysisPhase: driver.FrontendPhase
-```
-
-reached only by mach-lsp
-
-## val PHASE_PARSE
-
-```mach
-pub val PHASE_PARSE: AnalysisPhase = driver.FRONTEND_PARSE
-```
-
-## val PHASE_RESOLVE
-
-```mach
-pub val PHASE_RESOLVE: AnalysisPhase = driver.FRONTEND_RESOLVE
-```
-
-reached only by mach-lsp
-
-## val PHASE_SEMA
-
-```mach
-pub val PHASE_SEMA: AnalysisPhase = driver.FRONTEND_SEMA
-```
-
-reached only by mach-lsp
-
 ## rec AnalysisRequest
 
 ```mach
@@ -47,7 +17,7 @@ pub rec AnalysisRequest;
 what one analyze call asks for
 
 file: an open buffer's FileId, the root of the analysis
-phase: how far the frontend runs, PHASE_PARSE, PHASE_RESOLVE or PHASE_SEMA
+phase: how far the frontend runs, driver.FRONTEND_PARSE, driver.FRONTEND_RESOLVE or driver.FRONTEND_SEMA
 selection: the overrides of mach's selection for a file under a project's src, empty for
                    none; its request is composed from the manifest as a project snapshot's is
 standalone_target: for a file under no manifest, a borrowed resolved target; nil selects
@@ -82,7 +52,7 @@ tree: the owned tree of a parse_text result; nil for an analysis of a buffer
 ## fun analysis_request
 
 ```mach
-pub fun analysis_request(file: lang_source.FileId, phase: AnalysisPhase) AnalysisRequest;
+pub fun analysis_request(file: lang_source.FileId, phase: driver.FrontendPhase) AnalysisRequest;
 ```
 
 a request for one buffer at one phase on mach's own selection
@@ -123,7 +93,7 @@ pub fun resolve_of(result: *AnalysisResult) res[*resolve.ResolveResult, fail.Fai
 ```
 
 the resolve product, under ast_of's view rules; the phase must be at least
-PHASE_RESOLVE. symbols may be SYMBOL_NIL or SYMBOL_REJECTED and must be checked before
+driver.FRONTEND_RESOLVE. symbols may be SYMBOL_NIL or SYMBOL_REJECTED and must be checked before
 indexing the symbol array
 reached only by mach-lsp
 
@@ -132,10 +102,10 @@ ret: the borrowed product, or the expiry or phase failure
 ## fun sema_of
 
 ```mach
-pub fun sema_of(result: *AnalysisResult) res[*fe_sema.SemaResult, fail.Fail];
+pub fun sema_of(result: *AnalysisResult) res[*sema_product.SemaResult, fail.Fail];
 ```
 
-the sema product, under ast_of's view rules; the phase must be PHASE_SEMA
+the sema product, under ast_of's view rules; the phase must be driver.FRONTEND_SEMA
 reached only by mach-lsp
 
 ret: the borrowed product, or the expiry or phase failure
@@ -154,7 +124,7 @@ during the call. an envelope that cannot be allocated is an operational failure 
 by the editor session, released with fail_dnit
 
 es: the editor session
-req: the request; its file must be open and its phase at most PHASE_SEMA
+req: the request; its file must be open and its phase at most driver.FRONTEND_SEMA
 ret: the owned result, released with analysis_dnit, or the operational failure
 
 ## rec ProjectSelection
@@ -191,7 +161,7 @@ during the call
 reached only by mach-lsp
 
 root: the project's directory, the one holding its mach.toml
-phase: how far the frontend runs, PHASE_PARSE, PHASE_RESOLVE or PHASE_SEMA
+phase: how far the frontend runs, driver.FRONTEND_PARSE, driver.FRONTEND_RESOLVE or driver.FRONTEND_SEMA
 selection: the overrides of mach's selection, empty for none
 buffers: the open buffers, nil with buffer_count 0
 buffer_count: how many buffers
@@ -223,7 +193,7 @@ key: the owned copies of the request's selection strings, which the loaded proje
 ## fun project_request
 
 ```mach
-pub fun project_request(root: str, phase: AnalysisPhase) ProjectRequest;
+pub fun project_request(root: str, phase: driver.FrontendPhase) ProjectRequest;
 ```
 
 a request for the project at `root` to `phase`, on mach's own selection and with no buffers
@@ -327,7 +297,7 @@ reached only by mach-lsp
 ## fun project_sema_of
 
 ```mach
-pub fun project_sema_of(snap: *ProjectSnapshot, index: u32) res[*fe_sema.SemaResult, fail.Fail];
+pub fun project_sema_of(snap: *ProjectSnapshot, index: u32) res[*sema_product.SemaResult, fail.Fail];
 ```
 
 a module's sema product, under sema_of's rules; nil when the module was not type checked
@@ -336,7 +306,7 @@ reached only by mach-lsp
 ## fun project_module_status
 
 ```mach
-pub fun project_module_status(snap: *ProjectSnapshot, index: u32) res[fail.PhaseStatus, fail.Fail];
+pub fun project_module_status(snap: *ProjectSnapshot, index: u32) res[lang_phase.PhaseStatus, fail.Fail];
 ```
 
 a module's own phase standing, as the snapshot's analysis left it

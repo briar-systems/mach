@@ -72,7 +72,7 @@ pub fun dnit(p: *Places);
 ## fun settle
 
 ```mach
-pub fun settle(p: *Places, generic: type.TypeId) bool;
+pub fun settle(p: *Places, generic: type_kind.TypeId) bool;
 ```
 
 settles the places of `generic` and every generic it reaches; false when they cannot be
@@ -81,7 +81,7 @@ known, because a generic it reaches has no fields yet or the walk failed
 ## fun bits
 
 ```mach
-pub fun bits(p: *Places, generic: type.TypeId, param: u32) u8;
+pub fun bits(p: *Places, generic: type_kind.TypeId, param: u32) u8;
 ```
 
 the places parameter `param` of a settled generic takes
@@ -89,7 +89,7 @@ the places parameter `param` of a settled generic takes
 ## fun reached
 
 ```mach
-pub fun reached(p: *Places, generic: type.TypeId, param: u32) bool;
+pub fun reached(p: *Places, generic: type_kind.TypeId, param: u32) bool;
 ```
 
 whether parameter `param` of a settled generic is reached, through storage or not
@@ -97,7 +97,7 @@ whether parameter `param` of a settled generic is reached, through storage or no
 ## fun via
 
 ```mach
-pub fun via(p: *Places, generic: type.TypeId, param: u32, place: Place) u32;
+pub fun via(p: *Places, generic: type_kind.TypeId, param: u32, place: Place) u32;
 ```
 
 the field of `generic` through which `param` first took place `place`, which it must take

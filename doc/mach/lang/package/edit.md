@@ -101,7 +101,7 @@ ret: err naming the failure
 ## fun change
 
 ```mach
-pub fun change(s: *session.Session, a: *A.Allocator, root: str, spec: *manifest.DepTableSpec, name: str, adding: bool,
+pub fun change(s: *session.Session, a: *A.Allocator, root: str, spec: *manifest_edit.DepTableSpec, name: str, adding: bool,
 purge: bool, quiet: bool, realize: bool, offline: bool, rep: *report.Report) err[fail.Fail];
 ```
 
@@ -123,7 +123,7 @@ ret: err naming the failure
 ## fun apply
 
 ```mach
-pub fun apply(edit: *Edit, op: *package_closure.Operation, mode: u8, spec: *manifest.DepTableSpec, name: str, adding: bool,
+pub fun apply(edit: *Edit, op: *package_closure.Operation, mode: u8, spec: *manifest_edit.DepTableSpec, name: str, adding: bool,
 purge: bool, quiet: bool, realize: bool, offline: bool) err[fail.Fail];
 ```
 

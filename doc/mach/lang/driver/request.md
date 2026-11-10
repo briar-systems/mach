@@ -172,14 +172,14 @@ pub fun is_release(r: *BuildRequest) bool;
 ## fun compose
 
 ```mach
-pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
+pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest_model.Manifest,
 o: *Overrides, root: str, goal: BuildGoal, profile: str) res[BuildRequest, fail.Fail];
 ```
 
 ## fun work_apply
 
 ```mach
-pub fun work_apply(itn: *intern.Interner, work: str, m: *manifest.Manifest) err[fail.Fail];
+pub fun work_apply(itn: *intern.Interner, work: str, m: *manifest_model.Manifest) err[fail.Fail];
 ```
 
 `work`, a `-w` value, in place of the root manifest `m`'s `[project].work`: a

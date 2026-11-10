@@ -3,7 +3,7 @@
 the target mirl assembles from a resolved target
 
 mirl assembles a target from the target mink resolved, masc's check of its baseline and
-the product under build, reading no text, and opens the build the target's added
+the output kind under build, reading no text, and opens the build the target's added
 extensions select over it. the tuple of the target's parts names the modules built for it
 
 ## fun tuple_of
@@ -47,7 +47,7 @@ the names the target adds over its baseline
 ## fun basis_of
 
 ```mach
-pub fun basis_of(x: *Assembled) opt[*mirl_target.Basis];
+pub fun basis_of(x: *Assembled) opt[*mirl_basis.Basis];
 ```
 
 the build basis the added extensions opened, none for a target that states no baseline

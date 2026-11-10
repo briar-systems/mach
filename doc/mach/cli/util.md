@@ -1,13 +1,5 @@
 # mach.cli.util
 
-## val PROJECT_CONFIG_NAME
-
-```mach
-pub val PROJECT_CONFIG_NAME: str = manifest.MANIFEST_FILE
-```
-
-the manifest file name, "mach.toml"
-
 ## rec ProjectLocation
 
 ```mach

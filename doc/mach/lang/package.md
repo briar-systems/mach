@@ -41,7 +41,7 @@ requested: the selector the chain asked for, in the same form
 ## fun ref_of
 
 ```mach
-pub fun ref_of(s: *session.Session, d: *manifest.DepDef) str;
+pub fun ref_of(s: *session.Session, d: *manifest_model.DepDef) str;
 ```
 
 the ref a git line names, empty when it names none

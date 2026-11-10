@@ -25,7 +25,7 @@ pub fun lower_value_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclI
 
 ```mach
 pub fun lower_pack_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl,
-name: intern.StrId, types: *type.TypeId, type_len: u32, copy: opt[Type]) err[fail.Fail];
+name: intern.StrId, types: *type_kind.TypeId, type_len: u32, copy: opt[Type]) err[fail.Fail];
 ```
 
 ## fun lower_class_copy

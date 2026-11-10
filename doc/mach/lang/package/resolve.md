@@ -23,7 +23,7 @@ pub fun pick_index(picks: *Vector[resolver.Choice], id: str) i64;
 ## fun versions
 
 ```mach
-pub fun versions(op: *package_closure.Operation, doc: *manifest.Doc, lowest: bool, lock: bool, unlocked: str,
+pub fun versions(op: *package_closure.Operation, doc: *manifest_load.Doc, lowest: bool, lock: bool, unlocked: str,
 root_notes: bool, walk: *package_closure.Walk) res[Resolution, fail.Fail];
 ```
 
@@ -61,7 +61,7 @@ releases by version, and a row for each that does
 ## fun outdated
 
 ```mach
-pub fun outdated(op: *package_closure.Operation, doc: *manifest.Doc, offline: bool) res[Outdated, fail.Fail];
+pub fun outdated(op: *package_closure.Operation, doc: *manifest_load.Doc, offline: bool) res[Outdated, fail.Fail];
 ```
 
 each version-selected identity's pinned release, the highest this compiler and every range

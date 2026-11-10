@@ -371,7 +371,7 @@ it is none
 ## fun constant_time_mode
 
 ```mach
-pub fun constant_time_mode(itn: *intern.Interner, c: *comptime.ComptimeCtx, a: *ast.Ast, d: *ast_decl.Decl) opt[str];
+pub fun constant_time_mode(itn: *intern.Interner, c: *comptime_scope.ComptimeCtx, a: *ast.Ast, d: *ast_decl.Decl) opt[str];
 ```
 
 the constant-time mode `d` declares, "soft" or "hard", none when it declares none. every
@@ -478,7 +478,7 @@ whether argument `ord` of `dec` is a string the load records
 ## fun string_id
 
 ```mach
-pub fun string_id(c: *comptime.ComptimeCtx, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) intern.StrId;
+pub fun string_id(c: *comptime_scope.ComptimeCtx, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) intern.StrId;
 ```
 
 the string argument `ord` of `dec` evaluated to in the scope `c`; STR_NIL when it is not a constant string
@@ -486,7 +486,7 @@ the string argument `ord` of `dec` evaluated to in the scope `c`; STR_NIL when i
 ## fun string_of
 
 ```mach
-pub fun string_of(itn: *intern.Interner, c: *comptime.ComptimeCtx, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) opt[str];
+pub fun string_of(itn: *intern.Interner, c: *comptime_scope.ComptimeCtx, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) opt[str];
 ```
 
 the text of `string_id`
@@ -494,8 +494,8 @@ the text of `string_id`
 ## fun strings_record
 
 ```mach
-pub fun strings_record[T](itn: *intern.Interner, into: *comptime.ComptimeCtx, a: *ast.Ast, source: str,
-c: *comptime.ComptimeCtx, cap_ctx: *T, caps: comptime.PhaseCapabilities[T], reached: *bool) err[fail.Fail];
+pub fun strings_record[T](itn: *intern.Interner, into: *comptime_scope.ComptimeCtx, a: *ast.Ast, source: str,
+c: *comptime_scope.ComptimeCtx, cap_ctx: *T, caps: comptime_capability.PhaseCapabilities[T], reached: *bool) err[fail.Fail];
 ```
 
 records into `into` the string every string argument of a module's decorators evaluates to, with

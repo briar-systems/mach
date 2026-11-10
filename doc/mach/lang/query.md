@@ -206,6 +206,47 @@ torn down with dnit, which runs every owned product's finalizer
 
 a: owns the db, its shards and every derived product's bytes
 
+## fun drop_failure
+
+```mach
+pub fun drop_failure(db: *QueryDb);
+```
+
+release the text and the places of the last failure the database holds
+
+## fun adopt_failure_text
+
+```mach
+pub fun adopt_failure_text(db: *QueryDb, text: str);
+```
+
+hold the text an operation handed back, allocated from the query database, as the held
+failure's text; the database owns it from here
+
+## fun hold_failure
+
+```mach
+pub fun hold_failure(db: *QueryDb, failure: fail.Fail, lost: *bool) fail.Fail;
+```
+
+hold a failure where the database presents it: its text and the places it points at are
+copied into the database's slot, replacing what the slot held, and the failure returned reads
+the held copies. text the presentation already owns stays there. a copy the allocator
+refused leaves the failure without that part and sets `lost`
+
+db: the database
+failure: the failure to hold; one with no text or places empties the slot
+lost: set when part of the failure could not be held
+ret: the failure as the database holds it
+
+## fun drop_presented
+
+```mach
+pub fun drop_presented(db: *QueryDb);
+```
+
+release the last operation's presentation and the failure held beside it
+
 ## fun dnit
 
 ```mach

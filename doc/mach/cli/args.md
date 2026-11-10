@@ -532,7 +532,7 @@ ret: the exit code
 ## fun collect_selectors
 
 ```mach
-pub fun collect_selectors(a: *A.Allocator, inv: *std_args.Parsed) res[manifest.Selectors, fail.Fail];
+pub fun collect_selectors(a: *A.Allocator, inv: *std_args.Parsed) res[manifest_select.Selectors, fail.Fail];
 ```
 
 the `-a`, `-t` and `-p` patterns and `--all` an invocation was given
@@ -544,7 +544,7 @@ ret: the selectors; err when a vector cannot grow
 ## fun selection_hint
 
 ```mach
-pub fun selection_hint(a: *A.Allocator, selectors: *manifest.Selectors, f: fail.Fail) fail.Fail;
+pub fun selection_hint(a: *A.Allocator, selectors: *manifest_select.Selectors, f: fail.Fail) fail.Fail;
 ```
 
 a selection refusal whose unknown value names a path in the working directory,

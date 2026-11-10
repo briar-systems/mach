@@ -56,7 +56,7 @@ a signless integer of `bits`, rounded up to a width mirl holds
 ## fun format
 
 ```mach
-pub fun format(bits: u32) opt[types.Format];
+pub fun format(bits: u32) opt[types_format.Format];
 ```
 
 the format of a float of `bits`, none for a width mirl has no format for
@@ -64,7 +64,7 @@ the format of a float of `bits`, none for a width mirl has no format for
 ## fun scalar
 
 ```mach
-pub fun scalar(t: *types.Table, d: type.PrimDesc) res[Type, Unshaped];
+pub fun scalar(t: *types.Table, d: type_prim.PrimDesc) res[Type, Unshaped];
 ```
 
 an integer or float primitive
@@ -80,7 +80,7 @@ an opaque type of `size` bytes at the alignment `align`
 ## fun of
 
 ```mach
-pub fun of[T](t: *types.Table, ti: *type.TypeInterner, tid: type.TypeId, r: *Reach[T]) res[Type, Unshaped];
+pub fun of[T](t: *types.Table, ti: *type.TypeInterner, tid: type_kind.TypeId, r: *Reach[T]) res[Type, Unshaped];
 ```
 
 the shape of the source type `tid`, its secrecy and its substitution already the caller's.

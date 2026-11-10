@@ -19,12 +19,6 @@ any project in the closure declares is pinned there:
 - a range with neither a pin nor a checkout under the root is refused with `run mach dep
   update <root> <id>`, which pins it whether the root or a dependency declares it
 
-## val MANIFEST
-
-```mach
-pub val MANIFEST: str = manifest.MANIFEST_FILE
-```
-
 ## rec Operation
 
 ```mach
@@ -185,7 +179,7 @@ manifest writer would write them
 ## fun preflight
 
 ```mach
-pub fun preflight(op: *Operation, doc: *manifest.Doc, reqs: *Vector[Request], inspect_git: bool, walk: *Walk) err[fail.Fail];
+pub fun preflight(op: *Operation, doc: *manifest_load.Doc, reqs: *Vector[Request], inspect_git: bool, walk: *Walk) err[fail.Fail];
 ```
 
 a fixed git dependency's manifest, and the pins it commits for its ranges, are read at the
@@ -210,6 +204,6 @@ a string key as the dependency commands read it: absent reads as empty
 ## fun parse_file
 
 ```mach
-pub fun parse_file(a: *A.Allocator, p: str) res[manifest.Doc, fail.Fail];
+pub fun parse_file(a: *A.Allocator, sources: *lang_source.SourceMap, p: str) res[manifest_load.Doc, fail.Fail];
 ```
 

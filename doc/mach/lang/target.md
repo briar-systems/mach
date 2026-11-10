@@ -1,18 +1,11 @@
 # mach.lang.target
 
-what a target builds: the host the compiler names, mink's products and linkages, the
-name an artifact's file takes and what the target's object format holds
+what a target builds: the host the compiler names, mink's output kinds as an artifact and a
+linkage select them, the name an artifact's file takes and what the target's object format
+holds
 
 a target is resolved through mink's catalog and masc's check (mach.lang.target.resolved),
 and every fact read here is read from that resolution's rows
-
-## fwd resolved.Target
-
-```mach
-fwd resolved.Target
-```
-
-forwards [`mach.lang.target.resolved.Target`](target/resolved.md#rec-target)
 
 ## fun host_arch_name
 
@@ -62,37 +55,62 @@ suffix: written after its name, with its dot
 ## fun linkage_of
 
 ```mach
-pub fun linkage_of(a: *A.Allocator, t: *resolved.Target, kind: diagnostic_kind.Kind) res[*Linkage, fail.Fail];
+pub fun linkage_of(a: *A.Allocator, t: *resolved.Target, kind: diagnostic_kind.Kind) res[*mink_output.Kind, fail.Fail];
 ```
 
-the linkage of an executable built for `t`: the one its narrowing names, else the host's
-default. refused in mink's words, as a user failure of `kind`, where the host runs none
+the linkage of an executable built for `t`, one of mink's executable output kinds: the one
+its narrowing names, else the host's default. refused in mink's words, as a user failure of
+`kind`, where the host runs none
 
 ## fun is_library
 
 ```mach
-pub fun is_library(p: *Product) bool;
+pub fun is_library(k: Spelled) bool;
 ```
 
-whether `p` is a library, which a consumer links against rather than runs: an archive, or an
-image of a kind of file a link binds against
+whether `k` is a library, which a consumer links against rather than runs: an archive, or an
+image a loader binds into another
+
+## fun per_module
+
+```mach
+pub fun per_module(k: Spelled) bool;
+```
+
+whether `k` is each module's object, written under the obj directory for a later link, so an
+artifact of it delivers no one file at an `out` path
 
 ## fun is_executable
 
 ```mach
-pub fun is_executable(p: *Product) bool;
+pub fun is_executable(k: Spelled) bool;
 ```
 
-whether `p` is linked as an executable, of the image kind its linkage names
+whether `k` is linked as an executable, of the output kind its linkage names
+
+## fun kind_name
+
+```mach
+pub fun kind_name(k: Spelled) str;
+```
+
+the name `--kind` and a manifest's `kind` spell `k` by
+
+## fun is_row
+
+```mach
+pub fun is_row(k: Spelled, row: *mink_output.Kind) bool;
+```
+
+whether `k` is the one output kind `row`
 
 ## fun output_of
 
 ```mach
-pub fun output_of(p: *Product, linkage: *Linkage) opt[*mink_output.Kind];
+pub fun output_of(k: Spelled, linkage: *mink_output.Kind) *mink_output.Kind;
 ```
 
-the image kind mink builds for a product: an executable's from its linkage, an image product's
-its own. none for a static library, which mink archives rather than links
+the output kind mink makes of `k`: an executable's from its linkage, every other its own row
 
 ## fun executable_output
 
@@ -100,18 +118,17 @@ its own. none for a static library, which mink archives rather than links
 pub fun executable_output(a: *A.Allocator, t: *resolved.Target) res[*mink_output.Kind, fail.Fail];
 ```
 
-the image kind of the executable a build for `t` links, refused where the host runs no
+the output kind of the executable a build for `t` links, refused where the host runs no
 executable
 
 ## fun artifact_naming
 
 ```mach
-pub fun artifact_naming(a: *A.Allocator, t: *resolved.Target, p: *Product) res[ArtifactName, fail.Fail];
+pub fun artifact_naming(a: *A.Allocator, t: *resolved.Target, k: Spelled) res[ArtifactName, fail.Fail];
 ```
 
-the name an artifact of product `p` takes on the target, mink's system's name of the file:
-an archive for a static library, and for every other product the kind of file its image
-reads back as, an executable's under the linkage the target resolved to. refused, with
+the name an artifact of kind `k` takes on the target, mink's system's name of the file of
+its output kind, an executable's under the linkage the target resolved to. refused, with
 mink's reason, where the system builds none
 
 ## fun finished_modules

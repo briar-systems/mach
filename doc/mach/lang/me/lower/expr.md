@@ -49,12 +49,12 @@ pub fun condition_value(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v:
 ## fun const_value_of_init
 
 ```mach
-pub fun const_value_of_init(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: comptime.CTValue) res[value.Value, fail.Fail];
+pub fun const_value_of_init(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: comptime_value.CTValue) res[value.Value, fail.Fail];
 ```
 
 ## fun type_is_volatile_record
 
 ```mach
-pub fun type_is_volatile_record(ctx: *lower_context.LowerContext, sem_ty: type.TypeId) bool;
+pub fun type_is_volatile_record(ctx: *lower_context.LowerContext, sem_ty: type_kind.TypeId) bool;
 ```
 

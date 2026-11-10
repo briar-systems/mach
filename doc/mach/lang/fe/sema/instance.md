@@ -190,13 +190,13 @@ an iteration's frame, rather than an instance's or the module's
 ## fun expr_record
 
 ```mach
-pub fun expr_record(set: *Set, frame: u32, eid: ast_id.ExprId, ty: type.TypeId) err[fail.Fail];
+pub fun expr_record(set: *Set, frame: u32, eid: ast_id.ExprId, ty: type_kind.TypeId) err[fail.Fail];
 ```
 
 ## fun decl_record
 
 ```mach
-pub fun decl_record(set: *Set, frame: u32, did: ast_id.DeclId, ty: type.TypeId) err[fail.Fail];
+pub fun decl_record(set: *Set, frame: u32, did: ast_id.DeclId, ty: type_kind.TypeId) err[fail.Fail];
 ```
 
 ## fun call_record
@@ -214,7 +214,7 @@ pub fun gate_record(set: *Set, frame: u32, cond: ast_id.ExprId, active: bool) er
 ## fun each_record
 
 ```mach
-pub fun each_record(set: *Set, frame: u32, sid: ast_id.StmtId, array: comptime.CTValue) err[fail.Fail];
+pub fun each_record(set: *Set, frame: u32, sid: ast_id.StmtId, array: comptime_value.CTValue) err[fail.Fail];
 ```
 
 the published constant value of the array the `$each` at `sid` reads
@@ -222,13 +222,13 @@ the published constant value of the array the `$each` at `sid` reads
 ## fun expr_type_at
 
 ```mach
-pub fun expr_type_at(set: *Set, frame: u32, eid: ast_id.ExprId) opt[type.TypeId];
+pub fun expr_type_at(set: *Set, frame: u32, eid: ast_id.ExprId) opt[type_kind.TypeId];
 ```
 
 ## fun decl_type_at
 
 ```mach
-pub fun decl_type_at(set: *Set, frame: u32, did: ast_id.DeclId) opt[type.TypeId];
+pub fun decl_type_at(set: *Set, frame: u32, did: ast_id.DeclId) opt[type_kind.TypeId];
 ```
 
 ## fun call_at
@@ -248,7 +248,7 @@ pub fun gate_at(set: *Set, frame: u32, cond: ast_id.ExprId) opt[bool];
 ## fun each_at
 
 ```mach
-pub fun each_at(set: *Set, frame: u32, sid: ast_id.StmtId) opt[comptime.CTValue];
+pub fun each_at(set: *Set, frame: u32, sid: ast_id.StmtId) opt[comptime_value.CTValue];
 ```
 
 ## fun edge_add

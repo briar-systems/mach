@@ -35,7 +35,7 @@ pub fun instance_name(
 s: *session.Session,
 fqn: intern.StrId,
 bare: intern.StrId,
-args: *type.TypeId,
+args: *type_kind.TypeId,
 arg_count: u32) res[intern.StrId, fail.Fail];
 ```
 
@@ -46,7 +46,7 @@ pub fun value_instance_name(
 s: *session.Session,
 fqn: intern.StrId,
 bare: intern.StrId,
-vals: *comptime.CTValue,
+vals: *comptime_value.CTValue,
 val_len: u32) res[intern.StrId, fail.Fail];
 ```
 
@@ -57,9 +57,9 @@ pub fun pack_instance_name(
 s: *session.Session,
 fqn: intern.StrId,
 bare: intern.StrId,
-args: *type.TypeId,
+args: *type_kind.TypeId,
 arg_len: u32,
-types: *type.TypeId,
+types: *type_kind.TypeId,
 type_len: u32) res[intern.StrId, fail.Fail];
 ```
 

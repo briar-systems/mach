@@ -33,7 +33,7 @@ pub fun validate(sc: *sema_context.SemaContext, d: *ast_decl.Decl, dec: *ast_dec
 ## fun type_of
 
 ```mach
-pub fun type_of(sc: *sema_context.SemaContext, d: *ast_decl.Decl) type.TypeId;
+pub fun type_of(sc: *sema_context.SemaContext, d: *ast_decl.Decl) type_kind.TypeId;
 ```
 
 ## fun exclusion_message
@@ -45,7 +45,7 @@ pub fun exclusion_message() str;
 ## fun type_carries_abi_type
 
 ```mach
-pub fun type_carries_abi_type(sc: *sema_context.SemaContext, t: type.TypeId) bool;
+pub fun type_carries_abi_type(sc: *sema_context.SemaContext, t: type_kind.TypeId) bool;
 ```
 
 ## fun check_abi_type_placement

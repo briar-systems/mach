@@ -109,7 +109,7 @@ front end was skipped
 ## fun typed
 
 ```mach
-pub fun typed(p: *project.Project, m: *project.ModuleEntry) *fe_sema.SemaResult;
+pub fun typed(p: *project.Project, m: *project.ModuleEntry) *sema_product.SemaResult;
 ```
 
 a module's types as this project's operations last published them, nil when none did or its
@@ -118,7 +118,7 @@ front end was skipped
 ## fun load_status
 
 ```mach
-pub fun load_status(p: *project.Project) fail.PhaseStatus;
+pub fun load_status(p: *project.Project) lang_phase.PhaseStatus;
 ```
 
 the standing of the load walk alone, over every module it reached
@@ -126,7 +126,7 @@ the standing of the load walk alone, over every module it reached
 ## fun module_status
 
 ```mach
-pub fun module_status(p: *project.Project, m: *project.ModuleEntry) fail.PhaseStatus;
+pub fun module_status(p: *project.Project, m: *project.ModuleEntry) lang_phase.PhaseStatus;
 ```
 
 the standing of one module: its load's and that of each product this project's operations
@@ -135,7 +135,7 @@ published for it
 ## fun frontend_status
 
 ```mach
-pub fun frontend_status(p: *project.Project) fail.PhaseStatus;
+pub fun frontend_status(p: *project.Project) lang_phase.PhaseStatus;
 ```
 
 the standing of the front end over every module
@@ -151,7 +151,7 @@ a parse product: the syntax tree it owns and how the parse stood
 ## fun read_definition
 
 ```mach
-pub fun read_definition(raw: ptr, mid: session.ModuleId, phase: fe_sema.DefinitionPhase) res[fe_sema.Definition, fail.Fail];
+pub fun read_definition(raw: ptr, mid: module.ModuleId, phase: sema_product.DefinitionPhase) res[sema_product.Definition, fail.Fail];
 ```
 
 a module's definition as far as a phase reads it, through the products of this operation
@@ -159,7 +159,7 @@ a module's definition as far as a phase reads it, through the products of this o
 ## fun acquire_sema
 
 ```mach
-pub fun acquire_sema(p: *project.Project, mid: session.ModuleId) res[*fe_sema.SemaResult, fail.Fail];
+pub fun acquire_sema(p: *project.Project, mid: module.ModuleId) res[*sema_product.SemaResult, fail.Fail];
 ```
 
 a module's sema product in the open operation, its field graph installed in the projection
@@ -195,7 +195,7 @@ fulfilled. a warning replayed from the cache passes through here as a fresh one 
 ## fun release_lowered
 
 ```mach
-pub fun release_lowered(p: *project.Project, mid: session.ModuleId) err[fail.Fail];
+pub fun release_lowered(p: *project.Project, mid: module.ModuleId) err[fail.Fail];
 ```
 
 give back a lowered module's front-end products, which nothing the build runs after its

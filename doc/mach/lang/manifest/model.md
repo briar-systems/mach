@@ -104,10 +104,11 @@ one `[artifact.<name>]` table as parsed. the three arrays are owned by the
 manifest and freed by `dnit`
 
 name: the table key; a portable identifier
-kind: the required `kind` key, mink's product of that name
+kind: the required `kind` key, as mink's output kinds spell it
 entry: the required `entry` key, a project-relative path under `[project].src`
-out: the required `out` key, an unexpanded path template relative to the
-               project root; `{project.work}` places the output under the work directory
+out: the `out` key, an unexpanded path template relative to the project root;
+               `{project.work}` places the output under the work directory. STR_NIL for an
+               object artifact, whose objects stay under obj/
 targets: the required `targets` array of declared target names or "*"; nil when empty
 target_count: length of `targets`
 link: the `link` array of `[link.<name>]` names; nil when absent or empty
@@ -118,8 +119,9 @@ is_default: `default = true`: the artifact is in the default selection; false
                when the key is absent
 is_export: `export = true`: the library a bare `use <id>;` binds and whose
                requirements travel to consumers; at most one artifact sets it
-linkage: the `linkage` key, mink's linkage of an executable of that name, none when
-               absent, which takes the target's default; `bin` artifacts only
+linkage: the `linkage` key, the name of mink's executable output kind, which mink
+               resolves against the target's host; nil when absent, which takes the
+               target's default; `bin` artifacts only
 linkage_from: where `linkage` was written
 subsystem: the `subsystem` key as mink spells the PE subsystem, console when absent
 icon: the `icon` path, or STR_NIL when absent; `bin` artifacts only
@@ -431,7 +433,7 @@ release what a name list owns
 ## fun site_of
 
 ```mach
-pub fun site_of(sites: *fail.Place, i: u32) fail.Place;
+pub fun site_of(sites: *lang_source.Location, i: u32) lang_source.Location;
 ```
 
 the place `i` of a model's per-entry places, the zero place when none were recorded

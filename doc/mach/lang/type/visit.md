@@ -121,7 +121,7 @@ pub rec Walk[C];
 ## fun reaches
 
 ```mach
-pub fun reaches[C](w: *Walk[C], tid: type.TypeId) bool;
+pub fun reaches[C](w: *Walk[C], tid: type_kind.TypeId) bool;
 ```
 
 whether the property holds at `tid` or below it; false once the walk has failed. the walk

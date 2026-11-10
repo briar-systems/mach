@@ -12,7 +12,7 @@ growing edge mints a fresh instance at every trip, so its generics are expansive
 ## fun nominal
 
 ```mach
-pub fun nominal(q: *type_query.Query, generic: type.TypeId) bool;
+pub fun nominal(q: *type_query.Query, generic: type_kind.TypeId) bool;
 ```
 
 whether generic nominal `generic` lies on an instantiation cycle that grows an
@@ -22,7 +22,7 @@ generic the cycle could pass through has no fields yet
 ## fun holds
 
 ```mach
-pub fun holds(q: *type_query.Query, tid: type.TypeId) bool;
+pub fun holds(q: *type_query.Query, tid: type_kind.TypeId) bool;
 ```
 
 whether `tid` holds, by value, an instance of an expansive generic
@@ -30,7 +30,7 @@ whether `tid` holds, by value, an instance of an expansive generic
 ## fun instance_is
 
 ```mach
-pub fun instance_is(types: *type.TypeInterner, facts: *type_query.Facts, tid: type.TypeId) res[bool, fail.Fail];
+pub fun instance_is(types: *type.TypeInterner, facts: *type_query.Facts, tid: type_kind.TypeId) res[bool, fail.Fail];
 ```
 
 whether `tid` is an instance of an expansive generic
@@ -38,7 +38,7 @@ whether `tid` is an instance of an expansive generic
 ## fun holds_instance
 
 ```mach
-pub fun holds_instance(types: *type.TypeInterner, facts: *type_query.Facts, tid: type.TypeId) res[bool, fail.Fail];
+pub fun holds_instance(types: *type.TypeInterner, facts: *type_query.Facts, tid: type_kind.TypeId) res[bool, fail.Fail];
 ```
 
 whether `tid` holds, by value, an instance of an expansive generic

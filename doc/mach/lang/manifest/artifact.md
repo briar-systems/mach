@@ -35,17 +35,6 @@ ret: mink's row, or the refusal's text
 pub fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
 ```
 
-## fun product_choices
-
-```mach
-pub fun product_choices(alloc: *A.Allocator) res[str, fail.Fail];
-```
-
-mink's products, quoted and joined as a list a refusal of an unknown product offers
-
-alloc: owns the list
-ret: the list; err a refused allocation
-
 ## fun export_validate
 
 ```mach

@@ -48,7 +48,7 @@ debug: the build emits debug information
 ## fun entry_manifest
 
 ```mach
-pub fun entry_manifest(s: *session.Session, r: *EntryRequest) res[manifest.Manifest, fail.Fail];
+pub fun entry_manifest(s: *session.Session, r: *EntryRequest) res[manifest_model.Manifest, fail.Fail];
 ```
 
 the project an entry build states, made as its manifest. the project root is the current

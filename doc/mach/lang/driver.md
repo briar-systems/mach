@@ -1,53 +1,5 @@
 # mach.lang.driver
 
-## fwd frontend.refresh_diagnostics
-
-```mach
-fwd frontend.refresh_diagnostics
-```
-
-forwards [`mach.lang.driver.frontend.refresh_diagnostics`](driver/frontend.md#fun-refresh_diagnostics)
-
-## fwd frontend.frontend_status
-
-```mach
-fwd frontend.frontend_status
-```
-
-forwards [`mach.lang.driver.frontend.frontend_status`](driver/frontend.md#fun-frontend_status)
-
-## fwd frontend.syntax
-
-```mach
-fwd frontend.syntax
-```
-
-forwards [`mach.lang.driver.frontend.syntax`](driver/frontend.md#fun-syntax)
-
-## fwd frontend.resolved
-
-```mach
-fwd frontend.resolved
-```
-
-forwards [`mach.lang.driver.frontend.resolved`](driver/frontend.md#fun-resolved)
-
-## fwd passes.module_in_current_project
-
-```mach
-fwd passes.module_in_current_project
-```
-
-forwards [`mach.lang.driver.passes.module_in_current_project`](driver/passes.md#fun-module_in_current_project)
-
-## fwd config.resolve_run_artifact
-
-```mach
-fwd config.resolve_run_artifact
-```
-
-forwards [`mach.lang.driver.config.resolve_run_artifact`](driver/config.md#fun-resolve_run_artifact)
-
 ## fun append_frontend_roots
 
 ```mach
@@ -121,7 +73,7 @@ link moved since it last ran or the artifact on disk is not the one it wrote
 ## fun closure_locate
 
 ```mach
-pub fun closure_locate(s: *session.Session, m: *manifest.Manifest, project_root: str,
+pub fun closure_locate(s: *session.Session, m: *manifest_model.Manifest, project_root: str,
 unrealized: driver_closure.Unrealized) res[project.Closure, fail.Fail];
 ```
 
@@ -138,7 +90,7 @@ ret: the closure, released with `project.closure_dnit`
 ## fun closure_checked
 
 ```mach
-pub fun closure_checked(s: *session.Session, m: *manifest.Manifest, project_root: str,
+pub fun closure_checked(s: *session.Session, m: *manifest_model.Manifest, project_root: str,
 check: *driver_closure.Check) res[project.Closure, fail.Fail];
 ```
 
@@ -151,7 +103,7 @@ ret: the closure; err naming the first edge that does not locate or does not hol
 ## fun begin_build
 
 ```mach
-pub fun begin_build(s: *session.Session, m: *manifest.Manifest, closure: *project.Closure, req: *request.BuildRequest,
+pub fun begin_build(s: *session.Session, m: *manifest_model.Manifest, closure: *project.Closure, req: *request.BuildRequest,
 progress: *readout.Progress) res[project.Project, fail.Fail];
 ```
 
@@ -185,32 +137,45 @@ pub val FRONTEND_RESOLVE: FrontendPhase = 1
 pub val FRONTEND_SEMA:    FrontendPhase = 2
 ```
 
-## fun analyze_project_tolerant
+## rec Analysis
 
 ```mach
-pub fun analyze_project_tolerant(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest,
-roots: project.RootSet, extra_roots: *intern.StrId, extra_root_count: u32, phase: FrontendPhase) res[project.Project, fail.Fail];
+pub rec Analysis;
 ```
 
-frontend analysis for tools: the project comes back whenever the frontend
-ran, whatever its phases decided, so a consumer can read the trees, resolve
-results and sema results beside the diagnostics. every module that reached
-a phase carries that phase's product on its ModuleEntry even when the
-module's own query was rejected; the standing is frontend.frontend_status(p).
-a rejected phase ends the analysis at that phase; err is an operational
-failure only (an unreadable manifest, allocation, I/O)
+one frontend analysis for a tool: the project at a root, its request composed from the
+manifest and the selection as `mach check` composes it, with the modules of `files`
+loaded beside the root set
+
+root: the project's directory, the one holding its mach.toml
+manifest: the project's manifest when the caller already read it, nil to read it from
+            `root`
+selection: the artifact, target and profile selection, one cell of which is analyzed
+roots: the root set the frontend loads: `project.ROOT_ARTIFACT` is the selected
+            artifact's closure, `project.ROOT_UNION` every artifact's with the modules
+            only a foreign target reaches gated out and `{artifact.<id>.out}` resolving
+            over every artifact some artifact needs
+files: source files whose modules load beside the root set, nil with count 0; a
+            file of another project, or outside the root's source directory, is skipped
+file_count: how many files
+phase: the last frontend phase to run
+
+## fun analyze
+
+```mach
+pub fun analyze(s: *session.Session, an: *Analysis) res[project.Project, fail.Fail];
+```
+
+the frontend analysis tools share: the project comes back whenever the frontend ran,
+whatever its phases decided, so a consumer can read the trees, resolve results and sema
+results beside the diagnostics. every module that reached a phase carries that phase's
+product on its ModuleEntry even when the module's own query was rejected; the standing is
+frontend.frontend_status(p). a rejected phase ends the analysis at that phase; err is an
+operational failure only (an unreadable manifest, a selection naming no cell, allocation,
+I/O). every string `an` holds is borrowed for the call, and the project borrows `root`
 
 s: the session
-m: the loaded manifest
-req: the build request selecting target, profile and artifact
-roots: the root set the frontend loads: `project.ROOT_ARTIFACT` is the
-                  selected artifact's closure, `project.ROOT_UNION` every artifact's
-                  with the modules only a foreign target reaches gated out and
-                  `{artifact.<id>.out}` resolving over every artifact some artifact
-                  needs
-extra_roots: module fqns loaded beside the root set's entries, nil with count 0
-extra_root_count: how many extra roots
-phase: the last frontend phase to run
+an: what to analyze
 ret: the project, released by the caller with project.dnit_project
 
 ## fun run_load_phase
@@ -222,7 +187,7 @@ pub fun run_load_phase(p: *project.Project) err[fail.Fail];
 ## fun refresh_frontend
 
 ```mach
-pub fun refresh_frontend(p: *project.Project, mid: session.ModuleId, phase: FrontendPhase) res[bool, fail.Fail];
+pub fun refresh_frontend(p: *project.Project, mid: module.ModuleId, phase: FrontendPhase) res[bool, fail.Fail];
 ```
 
 re-derive a loaded project's frontend after one module's text changed, without
@@ -241,7 +206,7 @@ ret: ok(true) when refreshed, a rejection included since the project's standing 
 ## fun load_manifest
 
 ```mach
-pub fun load_manifest(s: *session.Session, project_root: str) res[manifest.Manifest, fail.Fail];
+pub fun load_manifest(s: *session.Session, project_root: str) res[manifest_model.Manifest, fail.Fail];
 ```
 
 the root manifest of the project at `project_root`, read once: its text, an
@@ -251,6 +216,41 @@ records the input and the revision it was read at
 
 s: the session; its build allocator owns the manifest
 project_root: the project root
-ret: the manifest, released with `manifest.dnit`; err when it cannot be
+ret: the manifest, released with `manifest_model.dnit`; err when it cannot be
               read, does not parse or fails a check
+
+## fun project_root_of
+
+```mach
+pub fun project_root_of(alloc: *A.Allocator, file_path: str) res[opt[str], fail.Fail];
+```
+
+the root of the project a file belongs to: the nearest directory above it holding a
+mach.toml, none when no directory does
+
+## fun module_under
+
+```mach
+pub fun module_under(alloc: *A.Allocator, itn: *intern.Interner, path: str, root: str, id_text: str,
+src_text: str) res[opt[intern.StrId], fail.Fail];
+```
+
+the module the file at `path` is under the project at `root`: none when it lies outside the
+source directory
+
+id_text: the project id, the module path's first segment
+src_text: the manifest's source directory, relative to `root`
+
+## fun file_module
+
+```mach
+pub fun file_module(alloc: *A.Allocator, itn: *intern.Interner, path: str, root: str, id_text: str,
+src_text: str) res[opt[intern.StrId], fail.Fail];
+```
+
+the module the file at `path` is loaded as beside the project at `root`: none when the
+file belongs to another project or lies outside the source directory
+
+id_text: the project id, the module path's first segment
+src_text: the manifest's source directory, relative to `root`
 

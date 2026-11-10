@@ -9,9 +9,9 @@ its type annotations
 pub fun instantiate(
 sc: *sema_context.SemaContext,
 sym: *resolve.Symbol,
-args: *type.TypeId,
+args: *type_kind.TypeId,
 arg_count: u32,
-span: lang_source.Span) res[type.TypeId, fail.Fail];
+span: lang_source.Span) res[type_kind.TypeId, fail.Fail];
 ```
 
 ## fun check_arity

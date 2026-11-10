@@ -67,7 +67,7 @@ that key over the first `indexed` of them
 ## fun module_sema_init
 
 ```mach
-pub fun module_sema_init(a: *A.Allocator, path: intern.StrId, module: session.ModuleId) ModuleSema;
+pub fun module_sema_init(a: *A.Allocator, path: intern.StrId, module: lang_module.ModuleId) ModuleSema;
 ```
 
 ## fun module_sema_dnit
@@ -79,7 +79,7 @@ pub fun module_sema_dnit(module: *ModuleSema);
 ## fun module_export_for
 
 ```mach
-pub fun module_export_for(module: *ModuleSema, origin: session.StableModuleId, canon: intern.StrId) res[opt[TypeExport], A.Error];
+pub fun module_export_for(module: *ModuleSema, origin: lang_module.StableModuleId, canon: intern.StrId) res[opt[TypeExport], A.Error];
 ```
 
 the export of `module` keyed (origin, canon), bringing the index up to the current exports
@@ -128,7 +128,7 @@ pub rec DefinitionReader;
 ## fun reader_init
 
 ```mach
-pub fun reader_init(ctx: ptr, read: fun(ptr, session.ModuleId, DefinitionPhase) res[Definition, fail.Fail],
+pub fun reader_init(ctx: ptr, read: fun(ptr, lang_module.ModuleId, DefinitionPhase) res[Definition, fail.Fail],
 a: *A.Allocator) DefinitionReader;
 ```
 
@@ -151,14 +151,14 @@ pub rec DefinedSymbol;
 ## fun acquire_definition
 
 ```mach
-pub fun acquire_definition(reader: *DefinitionReader, origin: session.ModuleId,
+pub fun acquire_definition(reader: *DefinitionReader, origin: lang_module.ModuleId,
 phase: DefinitionPhase) res[Definition, fail.Fail];
 ```
 
 ## fun acquire_symbol
 
 ```mach
-pub fun acquire_symbol(reader: *DefinitionReader, requested: *resolve.Symbol, origin: session.ModuleId,
+pub fun acquire_symbol(reader: *DefinitionReader, requested: *resolve.Symbol, origin: lang_module.ModuleId,
 phase: DefinitionPhase) res[DefinedSymbol, fail.Fail];
 ```
 

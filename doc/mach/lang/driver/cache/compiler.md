@@ -1,17 +1,5 @@
 # mach.lang.driver.cache.compiler
 
-## val UNAVAILABLE
-
-```mach
-pub val UNAVAILABLE: u8 = host.FAULT_UNAVAILABLE
-```
-
-## val INTERNAL
-
-```mach
-pub val INTERNAL:    u8 = host.FAULT_INTERNAL
-```
-
 ## rec Error
 
 ```mach

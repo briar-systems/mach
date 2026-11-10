@@ -303,7 +303,7 @@ pub val UN_DEREF:   UnOp = 4
 ## val LIT_SUFFIX_NONE
 
 ```mach
-pub val LIT_SUFFIX_NONE: type.TypeKind = 0xFF
+pub val LIT_SUFFIX_NONE: type_kind.TypeKind = 0xFF
 ```
 
 ## rec ByteRange

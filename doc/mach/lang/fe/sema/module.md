@@ -10,8 +10,8 @@ s: *session.Session,
 a: *ast.Ast,
 rr: *resolve.ResolveResult,
 deps: *sema_product.SemaDeps,
-load: *comptime.ComptimeCtx,
-own_module: session.ModuleId,
+load: *comptime_scope.ComptimeCtx,
+own_module: module.ModuleId,
 diags: *diagnostic.DiagnosticStore) res[sema_product.SemaResult, fail.Fail];
 ```
 

@@ -10,7 +10,7 @@ artifact cascades, and the template variables a manifest reads
 ## fun root_dependency
 
 ```mach
-pub fun root_dependency(root_m: *manifest.Manifest, name: intern.StrId) *manifest.DepDef;
+pub fun root_dependency(root_m: *manifest_model.Manifest, name: intern.StrId) *manifest_model.DepDef;
 ```
 
 ## rec Check
@@ -74,7 +74,7 @@ was built, as clean does, locates this way; such a closure never configures a bu
 ## fun locate
 
 ```mach
-pub fun locate(s: *session.Session, alloc: *A.Allocator, m: *manifest.Manifest, project_root: str,
+pub fun locate(s: *session.Session, alloc: *A.Allocator, m: *manifest_model.Manifest, project_root: str,
 check: *Check, unrealized: Unrealized) res[project.Closure, fail.Fail];
 ```
 
@@ -121,7 +121,7 @@ ret: ok; err when the closure holds no such dependency
 ## fun resolve_requirement_scopes
 
 ```mach
-pub fun resolve_requirement_scopes(p: *project.Project, root: *manifest.Manifest, profile: str) err[fail.Fail];
+pub fun resolve_requirement_scopes(p: *project.Project, root: *manifest_model.Manifest, profile: str) err[fail.Fail];
 ```
 
 the requirement scope of each project a configured cell compiles: the declaring
@@ -137,7 +137,7 @@ ret: ok with `p.config.req_scopes` set; err from output expansion
 
 ```mach
 pub fun resolve_cascade_libs(p: *project.Project, isa: intern.StrId, os: intern.StrId, abi: intern.StrId,
-own_libs: *manifest.LinkRequirement, own_count: u32) err[fail.Fail];
+own_libs: *manifest_link.LinkRequirement, own_count: u32) err[fail.Fail];
 ```
 
 ## fun build_dep_root

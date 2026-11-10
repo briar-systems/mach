@@ -99,24 +99,6 @@ pub val CHILD_HELP: ChildKind = 1
 pub rec Child;
 ```
 
-## rec Related
-
-```mach
-pub rec Related;
-```
-
-## rec Edit
-
-```mach
-pub rec Edit;
-```
-
-## rec Fix
-
-```mach
-pub rec Fix;
-```
-
 ## rec FixId
 
 ```mach
@@ -281,11 +263,47 @@ format the allocator refuses is a failure, never a substitute message
 ## fun format
 
 ```mach
-pub fun format(a: *A.Allocator, fmt: str, args: ...) res[str, fail.Fail];
+pub fun format(a: *A.Allocator, fmt: str, va: ...) res[str, fail.Fail];
 ```
 
-the text of a message, `fmt` formatted with `args` and owned by the caller: the one place
-a refused format becomes a failure
+`fmt` formatted with `va` into `a`, which owns the text; a refusal to format
+is the failure instead
+
+## fun join
+
+```mach
+pub fun join(a: *A.Allocator, va: ...) res[str, fail.Fail];
+```
+
+the texts `va` joined into `a`, which owns the result; a refusal to join is
+the failure instead
+
+## fun text_retain
+
+```mach
+pub fun text_retain(itn: *intern.Interner, text: str) res[str, fail.Fail];
+```
+
+the interner's copy of a borrowed `text`, which outlives the storage `text`
+came from
+
+## fun text_intern
+
+```mach
+pub fun text_intern(itn: *intern.Interner, a: *A.Allocator, text: str) res[str, fail.Fail];
+```
+
+`text`, owned by `a`, moved into the interner: the interned copy outlives
+`a`'s storage, and `text` is released either way
+
+## fun format_intern
+
+```mach
+pub fun format_intern(itn: *intern.Interner, a: *A.Allocator, fmt: str, va: ...) res[str, fail.Fail];
+```
+
+`fmt` formatted with `va` through `a` as scratch and interned, so the text
+outlives `a`'s storage
 
 ## fun builder_dnit
 
@@ -435,11 +453,13 @@ pub fun content_equal(left: *DiagnosticStore, right: *DiagnosticStore) res[bool,
 
 compare observable diagnostic content without allocation or store identity
 
-## fun snapshot_from
+## fun copy
 
 ```mach
-pub fun snapshot_from(src: *DiagnosticStore, from: usize, a: *A.Allocator) res[*DiagnosticStore, fail.Fail];
+pub fun copy(src: *DiagnosticStore, a: *A.Allocator) res[DiagnosticStore, fail.Fail];
 ```
+
+an owned copy of `src` from `a`, every diagnostic and its lost count kept, released with store_dnit
 
 ## fun replay_into
 

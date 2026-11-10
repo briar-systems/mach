@@ -18,15 +18,15 @@ warnings alone with `release_warnings` once the object has moved on
 ## fun compile
 
 ```mach
-pub fun compile(b: *Back, a: *A.Allocator, m: *Module, level: u8, checked: bool, relax: bool, floats: relaxation.Relaxations,
+pub fun compile(b: *Back, a: *A.Allocator, sources: *lang_source.SourceMap, m: *Module, level: u8, checked: bool, relax: bool, floats: relaxation.Relaxations,
 listing: opt[*std_writer.Writer], stats: opt[*mirl_stats.Stats], name: str) res[Compiled, fail.Fail];
 ```
 
 the mirl module `m` compiled to mink's object at mirl's level `level`, its schedule's own checks
 run with `checked`, the linker let relax its code with `relax` and the float relaxations `floats`
 permitted, masc's listing of the object written to `listing` when there is one, and its stages
-timed and counted into `stats` when there is one. the module is the schedule's to rewrite, so
-it is spent here
+timed and counted into `stats` when there is one. a failure or warning points at the file of
+`sources` mirl's location names. the module is the schedule's to rewrite, so it is spent here
 
 ## fun release_warnings
 

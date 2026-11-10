@@ -125,7 +125,7 @@ a rule stated unspecified is the target model's, and one not stated is a gap of 
 
 ```mach
 pub fun cast_scalar(types: *type.TypeInterner, itn: *intern.Interner, pointer_width: u32, nans: target_facts.Nans, arch_id: u32,
-value: CTValue, from_ty: type.TypeId, to_ty: type.TypeId, reinterpret: bool) res[CTValue, comptime_failure.EvalFail];
+value: CTValue, from_ty: type_kind.TypeId, to_ty: type_kind.TypeId, reinterpret: bool) res[CTValue, comptime_failure.EvalFail];
 ```
 
 a numeric conversion folds through mirl's conversion rows. a float to int cast

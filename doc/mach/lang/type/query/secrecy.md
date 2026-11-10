@@ -54,7 +54,7 @@ pub val UNBOUNDED_CAST_MSG:     str = "cannot prove that the two types agree on 
 ## fun cast_allowed
 
 ```mach
-pub fun cast_allowed(s: *session.Session, laying: *extent.Laying, from: type.TypeId, to: type.TypeId) res[Verdict, fail.Fail];
+pub fun cast_allowed(s: *session.Session, laying: *extent.Laying, from: type_kind.TypeId, to: type_kind.TypeId) res[Verdict, fail.Fail];
 ```
 
 whether a `::` or `:~` from `from` to `to` keeps every byte's secrecy class or only makes public bytes secret in a value
@@ -62,7 +62,7 @@ whether a `::` or `:~` from `from` to `to` keeps every byte's secrecy class or o
 ## fun overlay_agrees
 
 ```mach
-pub fun overlay_agrees(s: *session.Session, laying: *extent.Laying, a: type.TypeId, b: type.TypeId) res[Verdict, fail.Fail];
+pub fun overlay_agrees(s: *session.Session, laying: *extent.Laying, a: type_kind.TypeId, b: type_kind.TypeId) res[Verdict, fail.Fail];
 ```
 
 whether two union variants overlaying one storage agree on every byte they share

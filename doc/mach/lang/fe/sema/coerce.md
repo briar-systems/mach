@@ -21,19 +21,19 @@ pub rec CoerceResult;
 ## fun out_of_range
 
 ```mach
-pub fun out_of_range(to: type.TypeId, value: wide.Wide, negated: bool, bounds: type.IntRange, literal: bool) CoerceResult;
+pub fun out_of_range(to: type_kind.TypeId, value: wide.Wide, negated: bool, bounds: type_prim.IntRange, literal: bool) CoerceResult;
 ```
 
 ## fun try_coerce_literal
 
 ```mach
-pub fun try_coerce_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type.TypeId) res[CoerceResult, fail.Fail];
+pub fun try_coerce_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type_kind.TypeId) res[CoerceResult, fail.Fail];
 ```
 
 ## fun probe_literal_range
 
 ```mach
-pub fun probe_literal_range(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type.TypeId) res[CoerceResult, fail.Fail];
+pub fun probe_literal_range(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type_kind.TypeId) res[CoerceResult, fail.Fail];
 ```
 
 ask whether a literal-shaped expression fits the integer range of `to` without
@@ -61,7 +61,7 @@ ret: true when every leaf is an unsuffixed integer literal, or the failure of a 
 ## fun fit_ct_int
 
 ```mach
-pub fun fit_ct_int(sc: *sema_context.SemaContext, ctval: comptime.CTValue, to: type.TypeId) CoerceResult;
+pub fun fit_ct_int(sc: *sema_context.SemaContext, ctval: comptime_value.CTValue, to: type_kind.TypeId) CoerceResult;
 ```
 
 whether a comptime integer value fits integer type `to`, retyping nothing:
@@ -70,13 +70,13 @@ not applicable unless both are integers
 ## fun int_bounds_of
 
 ```mach
-pub fun int_bounds_of(sc: *sema_context.SemaContext, to: type.TypeId) opt[type.IntRange];
+pub fun int_bounds_of(sc: *sema_context.SemaContext, to: type_kind.TypeId) opt[type_prim.IntRange];
 ```
 
 ## fun check_float_literal
 
 ```mach
-pub fun check_float_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, ty: type.TypeId);
+pub fun check_float_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, ty: type_kind.TypeId);
 ```
 
 the float literal rule, applied once the literal's type is final. the literal rounds to
@@ -91,6 +91,6 @@ ty: its final type; anything but a float type is left alone
 ## fun is_assignable
 
 ```mach
-pub fun is_assignable(sc: *sema_context.SemaContext, from: type.TypeId, to: type.TypeId) bool;
+pub fun is_assignable(sc: *sema_context.SemaContext, from: type_kind.TypeId, to: type_kind.TypeId) bool;
 ```
 

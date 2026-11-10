@@ -27,7 +27,7 @@ pub fun check_annotation_uni_secrecy(sc: *sema_context.SemaContext, w: *sema_con
 ## fun check_type
 
 ```mach
-pub fun check_type(sc: *sema_context.SemaContext, w: *sema_context.SecrecyWalk, tid: type.TypeId, span: lang_source.Span);
+pub fun check_type(sc: *sema_context.SemaContext, w: *sema_context.SecrecyWalk, tid: type_kind.TypeId, span: lang_source.Span);
 ```
 
 the check of `tid`, an annotation's type at `span`, under the scope's own substitution
