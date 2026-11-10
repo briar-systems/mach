@@ -57,7 +57,7 @@ the target `m` declares under `name`, nil when none is
 ## fun resolve_declared
 
 ```mach
-pub fun resolve_declared(alloc: *A.Allocator, itn: *intern.Interner, d: *TargetDef, linkage: opt[*mink_output.Kind], linkage_from: *Origin) res[resolved.Target, fail.Fail];
+pub fun resolve_declared(alloc: *A.Allocator, itn: *intern.Interner, d: *TargetDef, linkage: intern.StrId, linkage_from: *Origin) res[resolved.Target, fail.Fail];
 ```
 
 resolve a declared target with every key it states: the one place a `[target.<name>]`
@@ -66,7 +66,8 @@ table becomes mink's spelling and narrowing
 alloc: owns a refusal's text
 itn: resolves the target's strings
 d: the target
-linkage: the linkage of the executable under build, none for the host's default
+linkage: the name of the linkage of the executable under build, nil for the host's
+              default, which mink resolves against the host
 linkage_from: where `linkage` was written, which a refusal of it names and points at;
               nil where it was written nowhere
 ret: the target; err the owners' refusal, naming the target

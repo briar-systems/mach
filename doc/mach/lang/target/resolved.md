@@ -168,8 +168,8 @@ failure that refuses no part is mink's own, as `refusal` words it
 pub fun spec_of(a: *A.Allocator, kind: diagnostic_kind.Kind, sys: str, arch: str) res[mink_target.Spec, fail.Fail];
 ```
 
-the system and the architecture named `sys` and `arch`, each a row's name, as the spelling
-`<sys>-<arch>` names them, refused as mink refuses that spelling, as a user failure of `kind`
+the system and the architecture named `sys` and `arch`, each a row's name, refused as mink
+refuses them, as a user failure of `kind`
 
 ## fun resolve
 
