@@ -1,9 +1,9 @@
 # mach.lang.fe.resolve
 
-## rec SymbolId
+## def SymbolId
 
 ```mach
-pub rec SymbolId;
+pub def SymbolId: u32
 ```
 
 a symbol's slot in the resolve context's symbol table
@@ -11,7 +11,7 @@ a symbol's slot in the resolve context's symbol table
 ## val SYMBOL_NIL
 
 ```mach
-pub val SYMBOL_NIL: SymbolId = SymbolId;
+pub val SYMBOL_NIL: SymbolId = 0xFFFFFFFF
 ```
 
 ## fun symbol_id
@@ -55,7 +55,7 @@ pub fun symbol_is_rejected(id: SymbolId) bool;
 ## val SYMBOL_DEFERRED_TYPE
 
 ```mach
-pub val SYMBOL_DEFERRED_TYPE: SymbolId = SymbolId;
+pub val SYMBOL_DEFERRED_TYPE: SymbolId = 0xFFFFFFFC
 ```
 
 ## fun symbol_deferred
@@ -182,6 +182,24 @@ pub val SYM_FLAG_COMPTIME: u8 = 2
 pub val SYM_FLAG_MODULE: u8 = 4
 ```
 
+## val SYM_FLAG_STORED
+
+```mach
+pub val SYM_FLAG_STORED: u8 = 8
+```
+
+something stores to the local or parameter, takes its address or names it in an asm block,
+so it has storage of its own. one without the flag is only ever read
+
+## val SYM_FLAG_REACHED
+
+```mach
+pub val SYM_FLAG_REACHED: u8 = 16
+```
+
+the address of something reached from the local or parameter by name, a field or an element,
+is taken. where it is an aggregate held by value, a pointer into it then exists
+
 ## rec Symbol
 
 ```mach
@@ -253,7 +271,7 @@ pub fun param_symbol(r: *ResolveResult, decl: ast_id.DeclId, slot: u32) SymbolId
 ## val SYMBOL_AMBIGUOUS
 
 ```mach
-pub val SYMBOL_AMBIGUOUS: SymbolId = SymbolId;
+pub val SYMBOL_AMBIGUOUS: SymbolId = 0xFFFFFFFD
 ```
 
 a nominal the module defines named by more than one declaration
@@ -266,6 +284,15 @@ pub fun own_nominal(r: *ResolveResult, kind: SymKind, canon: intern.StrId) Symbo
 
 the symbol of the record, union or tag of `kind` the module defines under `canon`: SYMBOL_NIL
 when it defines none, SYMBOL_AMBIGUOUS when more than one declaration does
+
+## fun own_declared
+
+```mach
+pub fun own_declared(r: *ResolveResult, kind: SymKind, canon: intern.StrId) SymbolId;
+```
+
+the symbol of `kind` the module declares under `canon`, the last of them: SYMBOL_NIL when it
+declares none, SYMBOL_AMBIGUOUS when more than one declaration does
 
 ## fun stable_of_module
 

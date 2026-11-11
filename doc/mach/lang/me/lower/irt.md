@@ -6,7 +6,7 @@ target's data layout and never by mach
 ## val NONE
 
 ```mach
-pub val NONE: Type = Type;
+pub val NONE: Type = 0xFFFFFFFF
 ```
 
 no type: what a function that gives nothing returns
@@ -98,8 +98,10 @@ declared with `...` does
 ## fun shape
 
 ```mach
-pub fun shape(t: *types.Table, ty: Type) opt[types.Shape];
+pub fun shape(t: *types.Table, ty: Type) opt[*types.Shape];
 ```
+
+the shape of `ty` as the table holds it, valid until the table next interns a type
 
 ## fun is_int
 

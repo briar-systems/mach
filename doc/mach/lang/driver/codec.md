@@ -40,32 +40,3 @@ definition_revision: query.Revision) err[fail.Fail];
 
 a CONST_ELEM value names an element of its origin's definition, so it folds that definition's revision
 
-## fun public_surface_encode
-
-```mach
-pub fun public_surface_encode(s: *wire.Sink, rr: *resolve.ResolveResult, origin: module.StableModuleId,
-definition_revision: query.Revision) err[fail.Fail];
-```
-
-## fun public_symbols_decode
-
-```mach
-pub fun public_symbols_decode(a: *A.Allocator, s: *session.Session, bytes: *u8, len: u32,
-path: intern.StrId, stable: module.StableModuleId) res[resolve.ModuleExports, fail.Fail];
-```
-
-what the exports product of module `stable` says an importer reads, its symbols allocated from `a`
-
-## fun typed_surface_encode
-
-```mach
-pub fun typed_surface_encode(s: *wire.Sink, surface: *sema_product.ModuleSema) err[fail.Fail];
-```
-
-## fun typed_surface_decode
-
-```mach
-pub fun typed_surface_decode(itn: *intern.Interner, a: *A.Allocator, bytes: *u8, len: u32,
-path: intern.StrId, mid: module.ModuleId) res[sema_product.ModuleSema, fail.Fail];
-```
-

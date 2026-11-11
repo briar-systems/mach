@@ -28,6 +28,7 @@ lower: the module's lowering request; its `malloc` holds the facts and any refus
 back: the assembled target, shared by every step and never written
 codegen: how mirl compiles the module
 out: where the object lives, which outlives the step
+spans: the pool the module's own heap draws its spans from
 ir_path: where mirl's text of the module is written before it compiles, "" for nowhere
 asm_path: where masc's listing of the object is written as it compiles, "" for nowhere
 name: the module's name, for refusals

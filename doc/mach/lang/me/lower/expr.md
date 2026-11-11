@@ -40,6 +40,16 @@ the value a store consumes. when `in_place` holds, nothing writes memory between
 and the store, so an aggregate place is read where it lies and the store copies from it:
 the aggregate copy is overlap-safe, so no snapshot sits between them
 
+## fun branch_on
+
+```mach
+pub fun branch_on(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, then_b: id.Block, else_b: id.Block) err[fail.Fail];
+```
+
+branch to `then_b` where the condition `eid` holds, else to `else_b`. a logical and, or and
+not that holds no secret branches on its operands in turn, so no bool is made for it and
+its right operand runs only where the left does not decide
+
 ## fun condition_value
 
 ```mach

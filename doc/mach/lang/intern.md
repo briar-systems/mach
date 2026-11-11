@@ -1,9 +1,9 @@
 # mach.lang.intern
 
-## rec StrId
+## def StrId
 
 ```mach
-pub rec StrId;
+pub def StrId: u32
 ```
 
 the identity of one interned string
@@ -14,7 +14,7 @@ id or a bare integer is meant. absence is `STR_NIL`, never an `opt[StrId]`.
 ## val STR_NIL
 
 ```mach
-pub val STR_NIL: StrId = StrId;
+pub val STR_NIL: StrId = 0xFFFFFFFF
 ```
 
 ## fun str_id

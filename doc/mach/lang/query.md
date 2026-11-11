@@ -2,16 +2,14 @@
 
 the query database: every product is of one kind, a `Kind` row its owner
 declares beside the computation. a row says how its bytes are owned (an input
-the host sets, derived bytes the database owns, an owned handle released by its
-finalizer, or a metadata revision sampled from outside), what its keys name and
-how a derived product is computed; the database takes a row on its first use and
-knows no kind of its own. a product records its dependencies by reading them
-inside its compute (`get`, `depend`, `observe`), and owns the diagnostic store
-its compute wrote into. validation is transitive and depth first; equal bytes
-on recomputation keep the previous revision and stop propagation; a failed
-dependency fails the product and the previous value is never served. all reads
-happen inside one operation, and `end` refuses success when a sampled metadata
-revision moved
+the host sets, derived bytes the database owns, or an owned handle released by
+its finalizer), what its keys name and how a derived product is computed; the
+database takes a row on its first use and knows no kind of its own. a product
+records its dependencies by reading them inside its compute (`get`, `depend`),
+and owns the diagnostic store its compute wrote into. validation is transitive
+and depth first; equal bytes on recomputation keep the previous revision and
+stop propagation; a failed dependency fails the product and the previous value
+is never served. all reads happen inside one operation
 
 ## def KeyOwner
 
@@ -54,7 +52,7 @@ pub def Revision: u64
 pub def Role: u8
 ```
 
-how a kind's products come to be: set by the host, computed, or sampled from outside
+how a kind's products come to be: set by the host or computed
 reached through Kind.role
 
 ## val INPUT
@@ -269,8 +267,8 @@ pub fun begin(db: *QueryDb) res[Operation, fail.Fail];
 ```
 
 open an operation. one is open at a time, and the previous one's presentation must
-have been collected or discarded first; the validated set and metadata samples of the
-last operation are cleared
+have been collected or discarded first; the validated set of the last operation is
+cleared
 
 db: the database
 ret: the handle every get, prepare and end of this operation takes
@@ -283,8 +281,8 @@ pub fun end(db: *QueryDb, operation: Operation) err[fail.Fail];
 
 close an operation: no computation may be on the stack and no prepared product may be
 unfinished. the operation's presentation becomes pending and must be collected or
-discarded before the next begin. err carries the failure the operation recorded, or a
-metadata provider that changed under it; the presentation is pending either way
+discarded before the next begin. err carries the failure the operation recorded; the
+presentation is pending either way
 
 db: the database
 operation: the handle begin returned
@@ -346,7 +344,9 @@ release a presentation, its store and its failure text; nil is a no-op
 pub fun set_input(db: *QueryDb, kind: *Kind, key: u64, value: *u8, value_len: u32) err[fail.Fail];
 ```
 
-set an input product's bytes, copied into the database. equal bytes keep the revision
+set an input product's bytes, copied into the database. equal bytes keep the revision. an open
+operation takes an input no computation in it has read, since nothing it holds observed the old
+value; one it has read is refused
 
 kind: an INPUT row
 

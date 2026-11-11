@@ -1,41 +1,41 @@
 # mach.lang.fe.ast.id
 
-## rec ExprId
+## def ExprId
 
 ```mach
-pub rec ExprId;
+pub def ExprId: u32
 ```
 
 an expression node
 
-## rec StmtId
+## def StmtId
 
 ```mach
-pub rec StmtId;
+pub def StmtId: u32
 ```
 
 a statement node
 
-## rec DeclId
+## def DeclId
 
 ```mach
-pub rec DeclId;
+pub def DeclId: u32
 ```
 
 a declaration node
 
-## rec TypeId
+## def TypeId
 
 ```mach
-pub rec TypeId;
+pub def TypeId: u32
 ```
 
 a type-syntax node, distinct from the semantic type.TypeId
 
-## rec ModuleNodeId
+## def ModuleNodeId
 
 ```mach
-pub rec ModuleNodeId;
+pub def ModuleNodeId: u32
 ```
 
 a module node
@@ -43,31 +43,31 @@ a module node
 ## val EXPR_NIL
 
 ```mach
-pub val EXPR_NIL:        ExprId       = ExprId;
+pub val EXPR_NIL:        ExprId       = 0xFFFFFFFF
 ```
 
 ## val STMT_NIL
 
 ```mach
-pub val STMT_NIL:        StmtId       = StmtId;
+pub val STMT_NIL:        StmtId       = 0xFFFFFFFF
 ```
 
 ## val DECL_NIL
 
 ```mach
-pub val DECL_NIL:        DeclId       = DeclId;
+pub val DECL_NIL:        DeclId       = 0xFFFFFFFF
 ```
 
 ## val TYPE_NIL
 
 ```mach
-pub val TYPE_NIL:        TypeId       = TypeId;
+pub val TYPE_NIL:        TypeId       = 0xFFFFFFFF
 ```
 
 ## val MODULE_NODE_NIL
 
 ```mach
-pub val MODULE_NODE_NIL: ModuleNodeId = ModuleNodeId;
+pub val MODULE_NODE_NIL: ModuleNodeId = 0xFFFFFFFF
 ```
 
 ## fun expr

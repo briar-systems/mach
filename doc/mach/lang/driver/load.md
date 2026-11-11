@@ -63,7 +63,8 @@ the module is dropped, since each is keyed by the old syntax tree
 pub fun decorators_record(p: *project.Project, mid: module.ModuleId) err[fail.Fail];
 ```
 
-record the strings a module's decorator arguments evaluate to
+record the strings a module's decorator arguments evaluate to, from the syntax the project's
+operations last published
 
 ## fun rebuild_topo
 

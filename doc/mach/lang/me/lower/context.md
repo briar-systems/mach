@@ -429,6 +429,31 @@ pub fun begin_function(lc: *LowerContext, fn_index: u32, ret_type: Type);
 pub fun bind_local(lc: *LowerContext, sym: resolve.SymbolId, v: value.Value) err[fail.Fail];
 ```
 
+## fun binds_direct
+
+```mach
+pub fun binds_direct(lc: *LowerContext, sym: resolve.SymbolId, tid: type_kind.TypeId, ir: Type) bool;
+```
+
+whether a local of source type `tid`, held in `ir`, is bound to its value and has no slot:
+a scalar that holds no secret, which nothing stores to, takes the address of or names in an
+asm block. a `val` or a parameter is then the value it began as wherever it is read
+
+## fun bind_direct
+
+```mach
+pub fun bind_direct(lc: *LowerContext, sym: resolve.SymbolId, v: value.Value) err[fail.Fail];
+```
+
+bind a local to the value it is. a bool is read as its byte, since the test it came from
+may stand in another block
+
+## fun lookup_direct
+
+```mach
+pub fun lookup_direct(lc: *LowerContext, sym: resolve.SymbolId) opt[value.Value];
+```
+
 ## fun lookup_local
 
 ```mach
@@ -570,6 +595,39 @@ pub fun storage_align(lc: *LowerContext, ir: Type) u64;
 the alignment a value held in `ir` is stored at: the target's
 layout of `ir`, which states a decorated record's alignment and packing
 
+## fun leave
+
+```mach
+pub fun leave(lc: *LowerContext, v: value.Value) err[fail.Fail];
+```
+
+return `v` from the function, none for no value. every return branches to one exit block,
+which holds the function's only `ret`, so the frame is undone in one place however many
+returns the source has. a scalar result travels as the exit's parameter
+
+## fun close_exit
+
+```mach
+pub fun close_exit(lc: *LowerContext) err[fail.Fail];
+```
+
+write the one exit the function's returns branch to, where it has one
+
+## fun result_slot
+
+```mach
+pub fun result_slot(lc: *LowerContext) res[value.Value, fail.Fail];
+```
+
+## fun take_into
+
+```mach
+pub fun take_into(lc: *LowerContext, ir: Type) opt[value.Value];
+```
+
+the armed destination, taken once, when the expression being lowered is the armed one and
+builds an aggregate of `ir`, which the destination holds; none for any other
+
 ## fun slot_for
 
 ```mach
@@ -584,8 +642,8 @@ a stack slot for a value of the source type `tid`, held in `ir`
 pub fun debug_type_of(lc: *LowerContext, tid: type_kind.TypeId) res[opt[mirl_debug.Type], fail.Fail];
 ```
 
-the debug type a debug record names for source type `tid`, as substituted for the code
-being lowered; none when this lowering keeps no debug information
+the debug type a debug record names for source type `tid`; none when this lowering keeps
+no debug information
 
 ## fun debug_types_finish
 
@@ -671,6 +729,9 @@ how much of a global of source type `tid`, held in `ir`, is secret, its ranges h
 ```mach
 pub fun substitute_type(lc: *LowerContext, tid: type_kind.TypeId) type_kind.TypeId;
 ```
+
+a template's type as the instance being lowered holds it, applied once where a type is read
+from sema's tables, so every type the lowering passes on is already the instance's
 
 ## fun type_resolved_of
 

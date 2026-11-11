@@ -44,7 +44,7 @@ a module's resolution, keyed by its stable id
 pub val EXPORTS: query.Kind = query.Kind;
 ```
 
-what a module's resolution exports to an importer, as bytes, keyed by its stable id
+what a module's resolution exports to an importer, keyed by its stable id
 
 ## val SEMA
 
@@ -60,7 +60,7 @@ a module's types, keyed by its stable id
 pub val TYPED_EXPORTS: query.Kind = query.Kind;
 ```
 
-the typed surface a module exports to an importer, as bytes, keyed by its stable id
+the typed surface a module exports to its importers, shared by every one, keyed by its stable id
 
 ## fun parse
 
@@ -212,13 +212,14 @@ roots: *query.QueryKey, count: usize,
 result: err[fail.Fail]) err[fail.Fail];
 ```
 
-close a query operation over the project: end it, hold its failure where the session presents
-it, collect the diagnostics of every product the roots reach into the session's presentation
-and refresh the session's store from it
+close a query operation over the project and show it: end it, hold its failure where the
+session presents it, collect the diagnostics of every product the roots reach into the
+session's presentation and refresh the session's store from it
 
 p: the project
 operation: the operation begin_query_phase opened
 roots: the products whose diagnostics the phase presents
 count: how many roots
-result: the phase's own result; an operation failure that is a message displaces it
+result: the phase's own result; an operation failure that is a message displaces it; given
+           back unless it is ok and the refresh fails
 

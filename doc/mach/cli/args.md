@@ -439,15 +439,6 @@ no conflicts of a command's own
 pub rec Call;
 ```
 
-what dispatch hands a command's handler; dispatch owns every member and outlives the call
-
-a: an arena dispatch releases once the handler returns, for what lives as long as the command
-backing: the heap under a, for what the command frees itself before it returns
-inv: the parsed command line
-report: where the command reports a failure it goes on past or that carries an origin, in the
-         format `--diagnostics` selected
-environ: the environment the command runs in, which the processes it starts inherit
-
 ## fun operand
 
 ```mach

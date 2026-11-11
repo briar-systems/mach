@@ -99,10 +99,10 @@ pub val CHILD_HELP: ChildKind = 1
 pub rec Child;
 ```
 
-## rec FixId
+## def FixId
 
 ```mach
-pub rec FixId;
+pub def FixId: usize
 ```
 
 a fix's position in its diagnostic's fix list

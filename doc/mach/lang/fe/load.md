@@ -91,7 +91,7 @@ binders: where a demand finds each name a declaration list binds, built once per
 pub rec Row;
 ```
 
-a module as the load's host holds it: its identity, its syntax as parsed, and its load record
+a module as the load's host holds it: its identity and its load record
 
 ## rec Host
 
@@ -99,16 +99,17 @@ a module as the load's host holds it: its identity, its syntax as parsed, and it
 pub rec Host;
 ```
 
-what the load asks of the program that runs it, which owns the module table and the parses
+what the load asks of the program that runs it, which owns the module table and the parses.
+the host runs each of the load's entries (module_load, module_open, module_reload and
+decorators_record) whole, and replaces no module's syntax while one runs but through `parse`
 
 ctx: the host's own state
 add: make a row for a module with this name and stable id, with no file or syntax yet, and
          give its id; ids are given in order from zero
 row: a module's row; the load record it points at stays where it is
+syntax: a module's current syntax, nil where it has none
 parse: give the module this file and make its syntax current; `reported` says the load
          reached it by walking, so a progress readout lists it
-refresh: make a module's syntax current; a nonzero incarnation is the one it must still have
-epoch: a number that changes whenever any module's syntax may have been replaced
 context: the comptime context of a module of `artifact` under the build target, with nothing
          of the module itself
 done: a module and everything it imports finished loading
@@ -129,6 +130,10 @@ diags: where the load reports, bound before each use
 by_name: each module's id by its fqn
 by_stable: each module's id by its stable id
 states: how far each module is loaded, by id
+held: what the loader holds of each module, by id
+entry: the entry running now, numbering each from 1
+named: whether each path a `use` or `fwd` spells names a module, as the provider answered
+           the entry it was asked in
 demands: the gates and constants the load is deciding, innermost last
 union: the build decides every gate under each of `tuples` as well as its own target
 filter: the tuples the walk is under now, nil for all of them

@@ -150,6 +150,8 @@ pub rec Bindings;
 what one stage binds over one module, which that stage alone writes and every later stage reads
 
 entries: its constants, innermost last
+shadows: per entry, one past the index of the entry of its name it shadows, 0 where none
+latest: by name, one past the index of its innermost entry
 deferred: the names whose float width only type checking can read
 gate_states: the gates it decided, by condition
 strings: the string each decorator argument evaluates to, by argument; only the load records them

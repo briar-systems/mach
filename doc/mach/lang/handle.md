@@ -62,6 +62,15 @@ pub fun chunk_at[T](s: *StableChunks[T], index: usize) opt[*T];
 
 the element at `index`, absent past the end or on a nil store
 
+## fun chunk_get
+
+```mach
+pub fun chunk_get[T](s: *StableChunks[T], index: usize) *T;
+```
+
+the element at `index`, which the store handed out and so lies before its end; any
+other index is a broken precondition of the caller, and it stops the compiler
+
 ## fun chunk_editor
 
 ```mach

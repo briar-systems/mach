@@ -117,6 +117,39 @@ pub fun param_owned_by(p: *TypeGenericParam, who: *GenericOwner) bool;
 pub rec Type;
 ```
 
+## val FACT_PARAM
+
+```mach
+pub val FACT_PARAM: u8 = 1
+```
+
+a generic parameter is spelled in the type: itself, or under a pointer, secret or array, in
+a signature or as an instance's argument
+
+## val FACT_CARRIES_SECRET
+
+```mach
+pub val FACT_CARRIES_SECRET: u8 = 2
+```
+
+the type is secret, or reaches a secret through pointers and array elements alone
+
+## val FACT_CARRIES_HANDLE
+
+```mach
+pub val FACT_CARRIES_HANDLE: u8 = 4
+```
+
+the type is a handle, or reaches one through pointers, arrays and secrets alone
+
+## fun facts_of
+
+```mach
+pub fun facts_of(ti: *TypeInterner, tid: TypeId) u8;
+```
+
+the facts of `tid`, none for the nil and error types
+
 ## rec TypeInterner
 
 ```mach
@@ -245,9 +278,7 @@ pub fun strip_secret(ti: *TypeInterner, tid: TypeId) TypeId;
 pub fun mentions_generic_param(ti: *TypeInterner, tid: TypeId) res[bool, fail.Fail];
 ```
 
-whether `tid` mentions a type parameter anywhere it is spelled. the walk keeps the types it
-has yet to visit on a worklist rather than the stack, so a type nested through flat defs
-deeper than any stack is still answered; a worklist that cannot grow is the failure
+whether `tid` mentions a type parameter anywhere it is spelled; it never fails
 
 ## fun shape_kind
 
@@ -284,7 +315,8 @@ pub fun contains_secret(ti: *TypeInterner, tid: TypeId) res[bool, fail.Fail];
 true when any byte of a value of this type may be secret: the type itself, an element, a field or a case
 payload; a pointer's pointee is not the object's storage and does not count. the walk keeps the
 fields it has yet to visit on a worklist, so a type nested deeper than any stack is still
-answered; a worklist that cannot grow is the failure
+answered; a worklist that cannot grow is the failure. an aggregate with no table yet adds
+nothing, so a clear answer that met one is not recorded
 
 ## fun type_scan_begin
 
@@ -497,10 +529,54 @@ pub fun type_equals_signatures(ti: *TypeInterner, a: TypeId, b: TypeId) bool;
 pub fun field_projection_reset(ti: *TypeInterner);
 ```
 
-## fun field_epoch
+## def Projected
 
 ```mach
-pub fun field_epoch(ti: *TypeInterner) u32;
+pub def Projected: u8
+```
+
+a fact of a type that reads the field tables, so it holds for one projection. it is recorded
+only once every table it read was published. a reset of the projection drops them all, and
+so does a table published over one that held other fields. each takes two bits: settled, then its answer
+
+## val PROJECTED_HELD_SECRET
+
+```mach
+pub val PROJECTED_HELD_SECRET: Projected = 0
+```
+
+a value of the type holds a secret in its own storage (`contains_secret`)
+
+## val PROJECTED_REACHES_SECRET
+
+```mach
+pub val PROJECTED_REACHES_SECRET: Projected = 1
+```
+
+the type reaches a secret anywhere, through pointers, with an instance's arguments counted
+where its generic places them (`query.deep.secret`)
+
+## val PROJECTED_SPELLS_SECRET
+
+```mach
+pub val PROJECTED_SPELLS_SECRET: Projected = 2
+```
+
+a secret is spelled anywhere the type reaches, through every edge and every instance
+argument (`query.reach.module_secret`)
+
+## fun projected_get
+
+```mach
+pub fun projected_get(ti: *TypeInterner, tid: TypeId, which: Projected) opt[bool];
+```
+
+the settled answer to projected fact `which` of `tid`, none while it is unsettled
+
+## fun projected_set
+
+```mach
+pub fun projected_set(ti: *TypeInterner, tid: TypeId, which: Projected, answer: bool) err[fail.Fail];
 ```
 
 ## fun field_table_stage
@@ -526,6 +602,9 @@ pub fun field_table_stage_push_entry(ti: *TypeInterner, fe: FieldEntry) err[fail
 ```mach
 pub fun field_table_publish(ti: *TypeInterner, ty: TypeId, fields_start: u32, fields_len: u32) err[fail.Fail];
 ```
+
+a table published over one holding other fields drops every projected fact, since any of
+them may have read the old one
 
 ## fun decoration_of
 

@@ -17,9 +17,10 @@ pub fun check_default_literals(sc: *sema_context.SemaContext) err[fail.Fail];
 ```
 
 a literal its context did not type took the i64 default, where the range rule has
-not yet run: each outermost expression of untyped literals is checked at its final
-type once every body has been inferred. one its context typed was checked when it
-was coerced, and fits
+not yet run: each outermost expression of untyped literals still at that default is
+checked once every body has been inferred. one its context typed was checked when it
+was coerced, and fits or was refused, so only an expression typed i64 is asked about.
+a refused one leaves its literals at the default, so they are marked inner all the same
 
 ## fun check_literal_shifts
 

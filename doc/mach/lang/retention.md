@@ -6,10 +6,10 @@ module's products stay while any retainer holds it. a build records the modules 
 its retainer in rounds; a module no retainer holds any more is released, and its products are
 retired the next time the session is idle
 
-## rec RetainerId
+## def RetainerId
 
 ```mach
-pub rec RetainerId;
+pub def RetainerId: u32
 ```
 
 a retainer's slot in the retention table
@@ -17,7 +17,7 @@ a retainer's slot in the retention table
 ## val RETAINER_SESSION
 
 ```mach
-pub val RETAINER_SESSION: RetainerId = RetainerId;
+pub val RETAINER_SESSION: RetainerId = 0
 ```
 
 the retainer a session records under until a caller names another

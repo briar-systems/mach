@@ -1,9 +1,9 @@
 # mach.lang.module
 
-## rec ModuleId
+## def ModuleId
 
 ```mach
-pub rec ModuleId;
+pub def ModuleId: u32
 ```
 
 a module's index in the session's module table
@@ -11,13 +11,13 @@ a module's index in the session's module table
 ## val MODULE_NIL
 
 ```mach
-pub val MODULE_NIL: ModuleId = ModuleId;
+pub val MODULE_NIL: ModuleId = 0xFFFFFFFF
 ```
 
-## rec StableModuleId
+## def StableModuleId
 
 ```mach
-pub rec StableModuleId;
+pub def StableModuleId: u32
 ```
 
 a module's identity across sessions, keyed by its fully qualified name
@@ -25,7 +25,7 @@ a module's identity across sessions, keyed by its fully qualified name
 ## val STABLE_MODULE_NIL
 
 ```mach
-pub val STABLE_MODULE_NIL: StableModuleId = StableModuleId;
+pub val STABLE_MODULE_NIL: StableModuleId = 0xFFFFFFFF
 ```
 
 ## val BUFFER_BASE

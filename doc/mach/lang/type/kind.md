@@ -1,9 +1,9 @@
 # mach.lang.type.kind
 
-## rec TypeId
+## def TypeId
 
 ```mach
-pub rec TypeId;
+pub def TypeId: u32
 ```
 
 the identity of one type in the type table
@@ -11,13 +11,13 @@ the identity of one type in the type table
 ## val TYPE_NIL
 
 ```mach
-pub val TYPE_NIL:   TypeId = TypeId;
+pub val TYPE_NIL:   TypeId = 0xFFFFFFFF
 ```
 
 ## val TYPE_ERROR
 
 ```mach
-pub val TYPE_ERROR: TypeId = TypeId;
+pub val TYPE_ERROR: TypeId = 0xFFFFFFFE
 ```
 
 ## fun id

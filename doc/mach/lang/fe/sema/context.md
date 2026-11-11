@@ -183,6 +183,8 @@ site: where the instance was asked for, while `site_set`
 subst: the type arguments that replace the parameters of `subst_owner`, position
             for position; a parameter of any other declaration is left alone
 secrecy: the union-secrecy walk the instance's annotations share; nil outside one
+handles: the types the handle checks of the instance's annotations have walked; nil
+            outside one
 
 ## rec Walk
 
@@ -540,6 +542,15 @@ pub fun field_table_for(sc: *SemaContext, ty: type_kind.TypeId) opt[*FieldTable]
 ```mach
 pub fun field_lookup(sc: *SemaContext, ty: type_kind.TypeId, name: intern.StrId) opt[type_kind.TypeId];
 ```
+
+## fun field_index
+
+```mach
+pub fun field_index(sc: *SemaContext, ft: *FieldTable, name: intern.StrId, from: u32) opt[u32];
+```
+
+the position of field `name` in table `ft`, looked for from position `from` on and then from
+the first: a literal mostly names its fields in declaration order
 
 ## fun type_store
 

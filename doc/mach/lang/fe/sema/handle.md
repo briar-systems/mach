@@ -57,6 +57,12 @@ pub fun check_annotation_handles_all(sc: *sema_context.SemaContext);
 every annotation's check shares one walk, so a type that several annotations spell, as a
 chain of defs each over the one before does, is walked once rather than once per annotation
 
+## fun scan_open
+
+```mach
+pub fun scan_open(sc: *sema_context.SemaContext, scan: *type_scan.Scan) bool;
+```
+
 ## fun type_carries_handle
 
 ```mach
@@ -96,11 +102,12 @@ pub fun check_handle_decl(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: 
 ## fun check_annotation_handles
 
 ```mach
-pub fun check_annotation_handles(sc: *sema_context.SemaContext, ast_tid: ast_id.TypeId);
+pub fun check_annotation_handles(sc: *sema_context.SemaContext, walked: *type_scan.Scan, ast_tid: ast_id.TypeId);
 ```
 
 a generic record, union or tag instantiated so that a field or payload holds a handle,
 directly or through a pointer, array or secret: the instance is the declaration its
 arguments spell, and the same declaration written out is refused for that field. a
-pointer to a pointer to a handle is refused at the annotation that spells or forms it
+pointer to a pointer to a handle is refused at the annotation that spells or forms it. the
+check of one annotation, whose walk skips the types `walked` holds and adds those it walks
 

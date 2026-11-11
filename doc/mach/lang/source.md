@@ -1,9 +1,9 @@
 # mach.lang.source
 
-## rec FileId
+## def FileId
 
 ```mach
-pub rec FileId;
+pub def FileId: u32
 ```
 
 a file's slot in the source map
@@ -15,7 +15,7 @@ that carry one are blank when zeroed. slot 0 of the map is never issued.
 ## val FILE_NIL
 
 ```mach
-pub val FILE_NIL: FileId = FileId;
+pub val FILE_NIL: FileId = 0
 ```
 
 no source: an unlocated diagnostic, or a node the build synthesized
@@ -23,7 +23,7 @@ no source: an unlocated diagnostic, or a node the build synthesized
 ## val FILE_PENDING
 
 ```mach
-pub val FILE_PENDING: FileId = FileId;
+pub val FILE_PENDING: FileId = 0xFFFFFFFF
 ```
 
 a span whose file is not known yet: a reader that meets its spans before it knows the file
@@ -380,7 +380,8 @@ byte. the one rule every line count follows
 pub fun lines_init(a: *A.Allocator, data: *u8, n: usize) res[Lines, A.Error];
 ```
 
-the line index of the `n` bytes at `data`; released with `lines_dnit`
+the line index of the `n` bytes at `data`; released with `lines_dnit`. a break is `\n`, `\r\n` or a
+lone `\r`, as line_break_len reads it
 
 ## fun lines_dnit
 

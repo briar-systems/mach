@@ -49,12 +49,6 @@ pub fun projection_dnit(p: *Projection);
 pub fun projection_reset(p: *Projection);
 ```
 
-## fun epoch
-
-```mach
-pub fun epoch(p: *Projection) u32;
-```
-
 ## fun stage
 
 ```mach
@@ -72,8 +66,11 @@ pub fun entry_push(p: *Projection, fe: Entry) err[fail.Fail];
 ## fun publish
 
 ```mach
-pub fun publish(p: *Projection, ty: TypeId, fields_start: u32, fields_len: u32) err[fail.Fail];
+pub fun publish(p: *Projection, ty: TypeId, fields_start: u32, fields_len: u32) res[bool, fail.Fail];
 ```
+
+publish the staged run as the fields of `ty`. true when `ty` already had a table and this
+one holds other fields, which makes every fact read from the old table stale
 
 ## fun table_for
 
@@ -81,13 +78,15 @@ pub fun publish(p: *Projection, ty: TypeId, fields_start: u32, fields_len: u32) 
 pub fun table_for(p: *Projection, ty: TypeId) opt[*Table];
 ```
 
-the table published for `ty` under the current epoch
+the table published for `ty`
 
 ## fun entry_at
 
 ```mach
 pub fun entry_at(p: *Projection, ft: *Table, ix: u32) *Entry;
 ```
+
+entry `ix` of the published table `ft`, which holds more than `ix` entries
 
 ## fun discriminator_of
 

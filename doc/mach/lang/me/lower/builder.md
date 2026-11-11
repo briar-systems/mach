@@ -851,6 +851,14 @@ pub fun emit_call_named(b: *Builder, callee: value.Value, sig: Type, args: *valu
 a call of `callee` through the signature `sig`, of which `named` states how many
 arguments are named, the rest being a C-variadic call's unnamed ones
 
+## fun result_into
+
+```mach
+pub fun result_into(b: *Builder, slot: value.Value);
+```
+
+land the next call's aggregate result in `slot`, storage of the result's type nothing reads yet
+
 ## fun param
 
 ```mach

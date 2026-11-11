@@ -305,10 +305,10 @@ a token the source spells with fixed punctuation
 ## fun spelling_at
 
 ```mach
-pub fun spelling_at(source: str, pos: usize) opt[Spelling];
+pub fun spelling_at(source: str, pos: usize) opt[Token];
 ```
 
-the fixed spelling that starts at `pos` in NUL-terminated `source`, the longest one
+the fixed spelling that starts at `pos` in NUL-terminated `source`, the longest one, as a token
 
 ## fun infix_precedence
 
