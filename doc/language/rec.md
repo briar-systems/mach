@@ -57,8 +57,9 @@ is zero in every byte. This holds for secret (`^`) fields and secret-welded
 pointers (`*^T`) as well, for a literal built at runtime from non-constant
 values, for one built from constants inside a function, and for a constant
 literal that initializes a module-level `val`. `T{}` names no field and so is
-all zero. The guarantee is a contract, not an accident of the stack: a literal
-never exposes what the storage held before.
+all zero. The guarantee is a contract, not an accident of the stack: no field
+of a literal exposes what the storage held before. Padding between fields is
+not a field. It is unspecified, unless the record holds a secret (see below).
 
 ```mach
 rec Key { id: u64; material: ^[32]u8; buf: *^u8; }

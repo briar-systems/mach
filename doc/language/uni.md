@@ -31,7 +31,9 @@ pub uni Maybe[T] {
 ```
 
 A `uni`'s size is the size of its largest field, plus any alignment
-padding. A `uni` that holds a secret has that padding zeroed (see
+padding. A literal writes the field it names and nothing else, so the bytes
+past that field are unspecified. A `uni` that holds a secret has those bytes
+and its padding zeroed (see
 [secrecy.md](secrecy.md#padding-of-secret-aggregates)).
 
 A `uni`'s overlapping variants must agree on secrecy: every field is either

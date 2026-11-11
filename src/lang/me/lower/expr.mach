@@ -76,6 +76,10 @@ pub fun lower_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[v
     val saved_borrow: bool = ctx.borrow_now;
     ctx.borrow_now = ctx.borrow_armed && ast_id.expr_same(eid, ctx.borrow_eid);
     fin { ctx.borrow_now = saved_borrow; }
+    # only the armed expression itself may build its value in the armed destination
+    val saved_into: bool = ctx.into_now;
+    ctx.into_now = ctx.into_armed && ast_id.expr_same(eid, ctx.into_eid);
+    fin { ctx.into_now = saved_into; }
 
     val res_: res[value.Value, fail.Fail] = lower_rvalue_kind(ctx, eid, e);
     if (sel res_.err) { ret res_; }
@@ -219,6 +223,9 @@ fun lower_ident_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res
     if (sel opt_elem.some) {
         ret element_value(ctx, eid, opt_elem.some);
     }
+
+    val opt_held: opt[value.Value] = lower_context.lookup_direct(ctx, sid);
+    if (sel opt_held.some) { ret res[value.Value, fail.Fail].ok{opt_held.some}; }
 
     val opt_local: opt[value.Value] = lower_context.lookup_local(ctx, sid);
     if (sel opt_local.some) {
@@ -504,6 +511,8 @@ fun lower_ident_lvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res
     if (sel opt_local.some) {
         ret res[value.Value, fail.Fail].ok{opt_local.some};
     }
+    val opt_held: opt[value.Value] = lower_context.lookup_direct(ctx, sid);
+    if (sel opt_held.some) { ret res[value.Value, fail.Fail].err{fail.message("lower: the place of a local bound to its value is taken")}; }
     ret symbol_lvalue(ctx, eid, sid);
 }
 
@@ -1189,6 +1198,9 @@ fun lower_call(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_exp
 
     # a call whose result holds a secret gives a secret result
     builder.set_secret(?ctx.builder, lower_context.type_contains_secret(ctx, lower_context.expr_type_of(ctx, eid)));
+    # an aggregate result lands in the armed destination, when this call is the armed expression
+    val into: opt[value.Value] = lower_context.take_into(ctx, irt.result_of(?ctx.m.types, sig));
+    if (sel into.some) { builder.result_into(?ctx.builder, into.some); }
     val res_call: res[value.Value, fail.Fail] = builder.emit_call_named(?ctx.builder, callee, sig, args, rtc, named);
     builder.set_secret(?ctx.builder, false);
     ret res_call;
@@ -2046,6 +2058,38 @@ fun lower_unary(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_ex
     ret res[value.Value, fail.Fail].err{fail.message("lower: unsupported unary operator")};
 }
 
+# branch to `then_b` where the condition `eid` holds, else to `else_b`. a logical and, or and
+# not that holds no secret branches on its operands in turn, so no bool is made for it and
+# its right operand runs only where the left does not decide
+pub fun branch_on(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, then_b: id.Block, else_b: id.Block) err[fail.Fail] {
+    val e_opt: res[ast_expr.Expr, fail.Fail] = lower_context.expression(ctx, eid);
+    if (sel e_opt.ok) {
+        var e_value: ast_expr.Expr  = e_opt.ok;
+        val e:       *ast_expr.Expr = ?e_value;
+        if (!stack.exhausted() && !lower_context.expr_is_secret(ctx, eid)) {
+            if (e.kind == ast_expr.EXPR_KIND_BINARY && (e.data.binary.op == ast_expr.BIN_AND || e.data.binary.op == ast_expr.BIN_OR)) {
+                val res_mid: res[id.Block, fail.Fail] = builder.new_block(?ctx.builder);
+                if (sel res_mid.err) { ret err[fail.Fail].err{res_mid.err}; }
+                val mid:     id.Block       = res_mid.ok;
+                var res_lhs: err[fail.Fail] = err[fail.Fail].ok{};
+                if (e.data.binary.op == ast_expr.BIN_AND) { res_lhs = branch_on(ctx, e.data.binary.lhs, mid, else_b); }
+                or                                        { res_lhs = branch_on(ctx, e.data.binary.lhs, then_b, mid); }
+                if (sel res_lhs.err)                      { ret res_lhs; }
+                builder.set_block(?ctx.builder, mid);
+                ret branch_on(ctx, e.data.binary.rhs, then_b, else_b);
+            }
+            if (e.kind == ast_expr.EXPR_KIND_UNARY && e.data.unary.op == ast_expr.UN_NOT) {
+                ret branch_on(ctx, e.data.unary.operand, else_b, then_b);
+            }
+        }
+    }
+    val res_cond: res[value.Value, fail.Fail] = lower_rvalue(ctx, eid);
+    if (sel res_cond.err) { ret err[fail.Fail].err{res_cond.err}; }
+    val res_condition: res[value.Value, fail.Fail] = condition_value(ctx, eid, res_cond.ok);
+    if (sel res_condition.err) { ret err[fail.Fail].err{res_condition.err}; }
+    ret builder.emit_cbr(?ctx.builder, res_condition.ok, then_b, else_b);
+}
+
 pub fun condition_value(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: value.Value) res[value.Value, fail.Fail] {
     val e_opt: res[ast_expr.Expr, fail.Fail] = lower_context.expression(ctx, eid);
     if (sel e_opt.ok) {
@@ -2381,19 +2425,26 @@ fun lower_tag_case_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: 
     val tag_ir:  Type = res_tag_ir.ok;
     val disc_ir: Type = disc_type(ctx, tag_ir);
 
-    val res_slot: res[value.Value, fail.Fail] = lower_context.slot_for(ctx, tag_ty, tag_ir);
-    if (sel res_slot.err) { ret res_slot; }
-    val slot: value.Value = res_slot.ok;
+    var slot: value.Value      = value.none();
+    val into: opt[value.Value] = lower_context.take_into(ctx, tag_ir);
+    if (sel into.some) { slot = into.some; }
+    or {
+        val res_slot: res[value.Value, fail.Fail] = lower_context.slot_for(ctx, tag_ty, tag_ir);
+        if (sel res_slot.err) { ret res_slot; }
+        slot = res_slot.ok;
+    }
 
-    val res_mz: err[fail.Fail] = builder.emit_memzero(?ctx.builder, slot, tag_ir);
-    if (sel res_mz.err) { ret res[value.Value, fail.Fail].err{res_mz.err}; }
+    # a tag that holds a secret has every byte its case does not write zeroed, so no stale
+    # secret rides in them. any other tag is its discriminator and its active payload alone
+    if (lower_context.type_contains_secret(ctx, tag_ty)) {
+        val res_mz: err[fail.Fail] = builder.emit_memzero(?ctx.builder, slot, tag_ir);
+        if (sel res_mz.err) { ret res[value.Value, fail.Fail].err{res_mz.err}; }
+    }
 
     if (e.data.struct_lit.elems_len == 1) {
-        val res_payload: res[value.Value, fail.Fail] = lower_rvalue(ctx, ctx.scope.a.expr_ids.data[e.data.struct_lit.elems_start]);
-        if (sel res_payload.err) { ret res_payload; }
         val res_at: res[value.Value, fail.Fail] = field_gep(ctx, slot, tag_ty, case_ix);
         if (sel res_at.err) { ret res_at; }
-        val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, res_payload.ok, res_at.ok);
+        val res_store: err[fail.Fail] = store_member(ctx, ctx.scope.a.expr_ids.data[e.data.struct_lit.elems_start], res_at.ok);
         if (sel res_store.err) { ret res[value.Value, fail.Fail].err{res_store.err}; }
     }
 
@@ -2403,6 +2454,40 @@ fun lower_tag_case_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: 
     if (sel res_code.err) { ret res[value.Value, fail.Fail].err{res_code.err}; }
 
     ret res[value.Value, fail.Fail].ok{value.retype(slot, tag_ir)};
+}
+
+# store the value of `eid` at `at`, a member of the literal being built, which nothing reads
+# yet: an aggregate literal or a call's result is built there, an aggregate place is copied
+# from where it lies, since the store follows its read at once, and any other value is stored
+fun store_member(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, at: value.Value) err[fail.Fail] {
+    val sem:    type_kind.TypeId     = lower_context.expr_type_of(ctx, eid);
+    val res_ir: res[Type, fail.Fail] = ir_type_of_expr(ctx, eid);
+    var dest:   value.Value          = at;
+    var armed:  bool                 = false;
+    if (sel res_ir.ok) {
+        if (is_aggregate_ir(ctx, res_ir.ok) && !type_is_volatile_record(ctx, sem) && !lower_context.type_contains_secret(ctx, sem)) {
+            dest.held = res_ir.ok;
+            armed     = true;
+        }
+    }
+    val saved_armed: bool          = ctx.into_armed;
+    val saved_eid:   ast_id.ExprId = ctx.into_eid;
+    val saved_slot:  value.Value   = ctx.into_slot;
+    val saved_hit:   bool          = ctx.into_hit;
+    ctx.into_armed = armed;
+    ctx.into_eid   = eid;
+    ctx.into_slot  = dest;
+    ctx.into_hit   = false;
+    var borrowed: bool                        = false;
+    val res_v:    res[value.Value, fail.Fail] = lower_stored_rvalue(ctx, eid, true, ?borrowed);
+    val built:    bool                        = ctx.into_hit;
+    ctx.into_armed = saved_armed;
+    ctx.into_eid   = saved_eid;
+    ctx.into_slot  = saved_slot;
+    ctx.into_hit   = saved_hit;
+    if (sel res_v.err) { ret err[fail.Fail].err{res_v.err}; }
+    if (built)         { ret err[fail.Fail].ok{}; }
+    ret builder.emit_store(?ctx.builder, res_v.ok, at);
 }
 
 # whether a value of source type `tid`, held in `ir`, holds a secret and padding, whose
@@ -2429,15 +2514,38 @@ fun lower_struct_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *a
     if (sel res_rec_ir.err) { ret res[value.Value, fail.Fail].err{res_rec_ir.err}; }
     val rec_ir: Type = res_rec_ir.ok;
 
-    val res_slot: res[value.Value, fail.Fail] = lower_context.slot_for(ctx, rec_ty, rec_ir);
-    if (sel res_slot.err) { ret res_slot; }
-    val slot: value.Value = res_slot.ok;
+    var slot: value.Value      = value.none();
+    val into: opt[value.Value] = lower_context.take_into(ctx, rec_ir);
+    if (sel into.some) { slot = into.some; }
+    or {
+        val res_slot: res[value.Value, fail.Fail] = lower_context.slot_for(ctx, rec_ty, rec_ir);
+        if (sel res_slot.err) { ret res_slot; }
+        slot = res_slot.ok;
+    }
 
+    # a value that holds a secret has every byte the literal does not write zeroed. any other
+    # record has each field the literal leaves out zeroed and nothing else, and any other
+    # union is the member it names alone. a record literal that names no field is all zero
     val res_pad: res[bool, fail.Fail] = secret_padding(ctx, rec_ty, rec_ir);
     if (sel res_pad.err) { ret res[value.Value, fail.Fail].err{res_pad.err}; }
-    if (res_pad.ok || e.data.struct_lit.fields_len < type.field_count(?ctx.s.types, rec_ty)) {
+    val count:   u32  = type.field_count(?ctx.s.types, rec_ty);
+    val partial: bool = e.data.struct_lit.fields_len < count;
+    val overlap: bool = type.is_union(?ctx.s.types, type.strip_secret(?ctx.s.types, lower_context.substitute_type(ctx, rec_ty)));
+    if (res_pad.ok || (partial && lower_context.type_contains_secret(ctx, rec_ty)) || (e.data.struct_lit.fields_len == 0 && !overlap)) {
         val res_mz: err[fail.Fail] = builder.emit_memzero(?ctx.builder, slot, rec_ir);
         if (sel res_mz.err) { ret res[value.Value, fail.Fail].err{res_mz.err}; }
+    }
+    or (partial && !overlap) {
+        var k: u32 = 0;
+        for (k < count) {
+            if (!literal_names(ctx, e, rec_ty, k)) {
+                val res_gap: res[value.Value, fail.Fail] = field_gep(ctx, slot, rec_ty, k);
+                if (sel res_gap.err) { ret res_gap; }
+                val res_mz: err[fail.Fail] = builder.emit_memzero(?ctx.builder, res_gap.ok, irt.member(?ctx.m.types, rec_ir, k));
+                if (sel res_mz.err) { ret res[value.Value, fail.Fail].err{res_mz.err}; }
+            }
+            k = k + 1;
+        }
     }
 
     var i: u32 = 0;
@@ -2447,18 +2555,27 @@ fun lower_struct_lit(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *a
             ret res[value.Value, fail.Fail].err{fail.message("lower: struct literal field index out of range")};
         }
         val fi:        *ast_expr.FieldInit         = ?ctx.scope.a.field_inits.data[pool_ix];
-        val field_ix:  u32                         = field_index_in_type(ctx, rec_ty, fi.name);
-        val res_field: res[value.Value, fail.Fail] = lower_rvalue(ctx, fi.value);
-        if (sel res_field.err) { ret res_field; }
-
-        val res_at: res[value.Value, fail.Fail] = field_gep(ctx, slot, rec_ty, field_ix);
+        val field_ix: u32                         = field_index_in_type(ctx, rec_ty, fi.name);
+        val res_at:   res[value.Value, fail.Fail] = field_gep(ctx, slot, rec_ty, field_ix);
         if (sel res_at.err) { ret res_at; }
-        val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, res_field.ok, res_at.ok);
+        val res_store: err[fail.Fail] = store_member(ctx, fi.value, res_at.ok);
         if (sel res_store.err) { ret res[value.Value, fail.Fail].err{res_store.err}; }
         i = i + 1;
     }
 
     ret res[value.Value, fail.Fail].ok{value.retype(slot, rec_ir)};
+}
+
+# whether a record literal names field `k` of its type
+fun literal_names(ctx: *lower_context.LowerContext, e: *ast_expr.Expr, rec_ty: type_kind.TypeId, k: u32) bool {
+    var i: u32 = 0;
+    for (i < e.data.struct_lit.fields_len) {
+        val pool_ix: u32 = e.data.struct_lit.fields_start + i;
+        if (pool_ix::usize >= ctx.scope.a.field_inits.len) { ret true; }
+        if (field_index_in_type(ctx, rec_ty, ctx.scope.a.field_inits.data[pool_ix].name) == k) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 fun const_value_of(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: comptime_value.CTValue) res[value.Value, fail.Fail] {

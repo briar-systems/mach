@@ -382,9 +382,14 @@ case at the common payload offset. `tag` is a keyword, so no case can take that
 name.
 
 Construction captures the active payload before overwriting the destination and
-zeroes tag-owned gaps, inactive payload suffix bytes, and tail padding. Active
-payload representation rules remain unchanged, including raw union bytes.
-Replacing a larger case clears the bytes that become inactive.
+writes the discriminator and the active payload. Nothing else is written: the
+tag-owned gaps, the payload bytes past the active case and the tail padding are
+unspecified, and replacing a larger case leaves the bytes that become inactive
+as they were. A tag that holds a secret is the exception, as every secret
+aggregate is: those bytes are zeroed wherever a value of it is built (see
+[secrecy.md](secrecy.md#padding-of-secret-aggregates)). Zeroing any other tag
+is an explicit action, `std.memory.zero`. Active payload representation rules
+remain unchanged, including raw union bytes.
 
 Representation-changing `::` and `:~` casts are rejected when either by-value
 representation contains a tag, including through records, arrays, or unions.
