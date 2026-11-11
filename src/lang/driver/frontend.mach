@@ -15,7 +15,9 @@ use std.types.string.str;
 
 use A:                  std.allocator;
 use collections_vector: std.collections.vector;
+use std.memory;
 
+use mach.lang.deprecation;
 use mach.lang.diagnostic;
 use mach.lang.fail;
 use mach.lang.fe.ast;
@@ -27,6 +29,7 @@ use fe_parser: mach.lang.fe.parser;
 use mach.lang.fe.parser.state;
 use mach.lang.fe.resolve;
 use lang_fingerprint: mach.lang.fingerprint;
+use mach.lang.float;
 use mach.lang.growth;
 use mach.lang.intern;
 use mach.lang.module;
@@ -47,6 +50,7 @@ use sema_module:    mach.lang.fe.sema.module;
 use sema_product:   mach.lang.fe.sema.product;
 use sema_surface:   mach.lang.fe.sema.surface;
 use lang_phase:     mach.lang.phase;
+use type_field:     mach.lang.type.field;
 
 # a file's parse: the syntax tree and how the parse stood, keyed by the file
 pub val PARSE: query.Kind = query.Kind{
@@ -60,22 +64,19 @@ pub val MODULE_NUMBER: query.Kind = query.Kind{name: "module number", role: quer
 pub val RESOLVE: query.Kind = query.Kind{
     name: "resolve", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_RESOLVE, compute: resolve_compute, finalize: resolve_finalize
 };
-# what a module's resolution exports to an importer, as bytes, keyed by its stable id
+# what a module's resolution exports to an importer, keyed by its stable id
 pub val EXPORTS: query.Kind = query.Kind{
-    name: "exports", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_RESOLVE, compute: exports_compute
+    name:     "exports", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_RESOLVE, compute: exports_compute,
+    finalize: exports_finalize, equal: exports_equal
 };
 # a module's types, keyed by its stable id
 pub val SEMA: query.Kind = query.Kind{
     name: "sema", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_SEMA, compute: sema_compute, finalize: sema_finalize
 };
-# the typed surface a module exports to an importer, as bytes, keyed by its stable id
+# the typed surface a module exports to its importers, shared by every one, keyed by its stable id
 pub val TYPED_EXPORTS: query.Kind = query.Kind{
-    name: "typed exports", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_SEMA, compute: typed_exports_compute
-};
-# the typed surface decoded for the importers that read it, keyed by its stable id
-val TYPED_SURFACE: query.Kind = query.Kind{
-    name:     "typed surface", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_SEMA, compute: typed_surface_compute,
-    finalize: surface_finalize
+    name:     "typed exports", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_SEMA, compute: typed_exports_compute,
+    finalize: surface_finalize, equal: surface_equal
 };
 
 # a module's parse in the open operation
@@ -268,6 +269,19 @@ fun ast_handle_decode(e: query.QueryView) *ast.Ast {
     ret (codec.handle_bytes(e.value, e.value_len, $size_of(ParsedModule))::ptr::*ParsedModule).a;
 }
 
+# what a module's resolution exports: the symbols and refusal an importer's resolution reads, and
+# the constants the module publishes, a change of which is a change of its interface
+# ---
+# symbols:    the importer's view, its path and module named by the reader
+# constants:  the published constants, each a plain value
+# definition: the revision of the module's parse when a constant names an element of it, else 0
+rec Exports {
+    symbols:        resolve.ModuleExports;
+    constants:      *resolve.ExportConstant;
+    constant_count: u32;
+    definition:     query.Revision;
+}
+
 fun exports_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
     val p:   *project.Project                = raw::*project.Project;
     val e_r: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?RESOLVE, key);
@@ -289,11 +303,132 @@ fun exports_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, 
         }
         i = i + 1;
     }
-    var fb: wire.Sink = wire.grown(alloc);
-    fin { wire.dnit(?fb); }
-    val wr: err[fail.Fail] = codec.public_surface_encode(?fb, rr, key::u32::module.StableModuleId, definition_revision);
-    if (sel wr.err) { ret res[query.QueryOutput, fail.Fail].err{wr.err}; }
-    ret codec.output(?fb);
+    i = 0;
+    for (i < rr.public_constant_count) {
+        val refused: opt[str] = constant_refusal(?rr.public_constants[i], definition_revision);
+        if (sel refused.some) { ret res[query.QueryOutput, fail.Fail].err{fail.message(refused.some)}; }
+        i = i + 1;
+    }
+    val boxed: res[*Exports, A.Error] = A.allocate[Exports](alloc, 1);
+    if (sel boxed.err) { ret res[query.QueryOutput, fail.Fail].err{fail.refused(boxed.err)}; }
+    val ex: *Exports = boxed.ok;
+    @ex = Exports{definition: definition_revision};
+    var handed: bool = false;
+    fin {
+        if (!handed) { exports_release(ex, alloc); }
+    }
+    val symbols: res[resolve.ModuleExports, fail.Fail] = resolve.result_exports(alloc, rr, intern.STR_NIL, key::u32::module.StableModuleId);
+    if (sel symbols.err) { ret res[query.QueryOutput, fail.Fail].err{symbols.err}; }
+    ex.symbols = symbols.ok;
+    if (rr.public_constant_count != 0) {
+        val constants: res[*resolve.ExportConstant, A.Error] = A.allocate[resolve.ExportConstant](alloc, rr.public_constant_count::usize);
+        if (sel constants.err) { ret res[query.QueryOutput, fail.Fail].err{fail.refused(constants.err)}; }
+        memory.raw_copy(constants.ok::ptr, rr.public_constants::ptr, rr.public_constant_count::usize * $size_of(resolve.ExportConstant));
+        ex.constants      = constants.ok;
+        ex.constant_count = rr.public_constant_count;
+    }
+    val out: res[query.QueryOutput, fail.Fail] = pointer_output(alloc, ex::ptr);
+    if (sel out.ok) { handed = true; }
+    ret out;
+}
+
+fun exports_of(value: *u8, value_len: u32) *Exports {
+    ret (codec.handle_bytes(value, value_len, $size_of(ptr))::ptr::*ptr)[0]::*Exports;
+}
+
+fun exports_release(ex: *Exports, alloc: *A.Allocator) {
+    if (ex.symbols.count != 0) { A.deallocate[resolve.PublicSymbol](alloc, ex.symbols.symbols, ex.symbols.count::usize); }
+    if (ex.constant_count != 0) { A.deallocate[resolve.ExportConstant](alloc, ex.constants, ex.constant_count::usize); }
+    A.deallocate[Exports](alloc, ex, 1);
+}
+
+fun exports_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
+    exports_release(exports_of(value, value_len), alloc);
+}
+
+# two exports are the same when an importer reads the same symbols and refusal and the module
+# publishes the same constants
+fun exports_equal(left: *u8, left_len: u32, right: *u8, right_len: u32) bool {
+    val l: *Exports = exports_of(left, left_len);
+    val r: *Exports = exports_of(right, right_len);
+    if (l.symbols.count != r.symbols.count || l.symbols.refused != r.symbols.refused) { ret false; }
+    if (l.constant_count != r.constant_count || l.definition != r.definition)         { ret false; }
+    var i: u32 = 0;
+    for (i < l.symbols.count) {
+        if (!symbol_same(?l.symbols.symbols[i], ?r.symbols.symbols[i])) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < l.constant_count) {
+        if (!constant_same(?l.constants[i], ?r.constants[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun symbol_same(l: *resolve.PublicSymbol, r: *resolve.PublicSymbol) bool {
+    ret l.kind == r.kind && l.name::u32 == r.name::u32 && l.canon::u32 == r.canon::u32 && l.file::u32 == r.file::u32
+        && l.generic_arity == r.generic_arity && l.has_comptime_params == r.has_comptime_params
+        && l.has_pack_param == r.has_pack_param && deprecation_same(l.deprecation, r.deprecation)
+        && l.testing == r.testing && l.slot == r.slot && l.origin::u32 == r.origin::u32;
+}
+
+fun deprecation_same(l: deprecation.Deprecation, r: deprecation.Deprecation) bool {
+    ret l.present == r.present && l.owner::u32 == r.owner::u32 && l.message::u32 == r.message::u32;
+}
+
+fun constant_same(l: *resolve.ExportConstant, r: *resolve.ExportConstant) bool {
+    if (l.name::u32 != r.name::u32 || l.present != r.present) { ret false; }
+    ret !l.present || value_same(?l.value, ?r.value);
+}
+
+# two published constant values are the same when they hold the same value of the same kind;
+# a constant element is the same element of the same revision of its definition, which the
+# owner compares beside it
+fun value_same(l: *comptime_value.CTValue, r: *comptime_value.CTValue) bool {
+    if (l.kind != r.kind) { ret false; }
+    val k: comptime_value.CTKind = l.kind;
+    if (k == comptime_value.CT_KIND_INT) {
+        ret l.data.w.lo == r.data.w.lo && l.data.w.hi == r.data.w.hi && l.int_width == r.int_width && l.int_unsigned == r.int_unsigned;
+    }
+    if (k == comptime_value.CT_KIND_FLOAT) { ret float.f64_bits(l.data.f) == float.f64_bits(r.data.f) && l.float_width == r.float_width; }
+    if (k == comptime_value.CT_KIND_STR || k == comptime_value.CT_KIND_NON_INTEGER) { ret l.data.s::u32 == r.data.s::u32; }
+    if (k == comptime_value.CT_KIND_TYPE) { ret l.data.t == r.data.t; }
+    if (k == comptime_value.CT_KIND_FIELD || k == comptime_value.CT_KIND_CASE) {
+        ret l.data.fld.owner == r.data.fld.owner && l.data.fld.index == r.data.fld.index;
+    }
+    if (k == comptime_value.CT_KIND_PACK_ELEM) { ret l.data.pelem.index == r.data.pelem.index && l.data.pelem.ty == r.data.pelem.ty; }
+    if (k == comptime_value.CT_KIND_NODE) {
+        ret l.data.node.module == r.data.node.module && l.data.node.node == r.data.node.node && l.data.node.ty == r.data.node.ty;
+    }
+    if (k == comptime_value.CT_KIND_CONST_ELEM) { ret l.data.celem.elem == r.data.celem.elem && l.data.celem.ty == r.data.celem.ty; }
+    ret false;
+}
+
+# why a constant cannot be published, none when it can: its value is of a kind an interface
+# holds, and a constant element names a definition whose revision is known
+fun constant_refusal(item: *resolve.ExportConstant, definition: query.Revision) opt[str] {
+    if (!item.present) { ret opt[str].none{}; }
+    val k: comptime_value.CTKind = item.value.kind;
+    if (k == comptime_value.CT_KIND_CONST_ELEM) {
+        if (definition == 0) { ret opt[str].some{"constant element surface requires its current definition revision"}; }
+        ret opt[str].none{};
+    }
+    if (k == comptime_value.CT_KIND_INT || k == comptime_value.CT_KIND_FLOAT || k == comptime_value.CT_KIND_STR
+        || k == comptime_value.CT_KIND_NON_INTEGER || k == comptime_value.CT_KIND_TYPE || k == comptime_value.CT_KIND_FIELD
+        || k == comptime_value.CT_KIND_CASE || k == comptime_value.CT_KIND_PACK_ELEM || k == comptime_value.CT_KIND_NODE) {
+        ret opt[str].none{};
+    }
+    ret opt[str].some{"constant surface has an unknown CTKind"};
+}
+
+# a product whose bytes are one pointer to what it owns
+fun pointer_output(alloc: *A.Allocator, owned: ptr) res[query.QueryOutput, fail.Fail] {
+    val bytes: res[*u8, A.Error] = A.allocate[u8](alloc, $size_of(ptr));
+    if (sel bytes.err) { ret res[query.QueryOutput, fail.Fail].err{fail.refused(bytes.err)}; }
+    val slot: *ptr = bytes.ok::ptr::*ptr;
+    slot[0] = owned;
+    ret res[query.QueryOutput, fail.Fail].ok{query.QueryOutput{bytes: bytes.ok, len: $size_of(ptr)::u32}};
 }
 
 rec LowerClosure {
@@ -411,7 +546,15 @@ fun exporter_exports(raw: ptr, mid: module.ModuleId, a: *A.Allocator) res[resolv
     val m:       *project.ModuleEntry            = project.module_at(p, mid::u32);
     val surface: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?EXPORTS, module.stable_index(m.stable_id)::u64);
     if (sel surface.err) { ret res[resolve.ModuleExports, fail.Fail].err{surface.err}; }
-    ret codec.public_symbols_decode(a, p.s, surface.ok.value, surface.ok.value_len, m.fqn, m.stable_id);
+    val ex:  *Exports              = exports_of(surface.ok.value, surface.ok.value_len);
+    var out: resolve.ModuleExports = resolve.ModuleExports{path: m.fqn, module: m.stable_id, refused: ex.symbols.refused};
+    if (ex.symbols.count == 0) { ret res[resolve.ModuleExports, fail.Fail].ok{out}; }
+    val symbols: res[*resolve.PublicSymbol, A.Error] = A.allocate[resolve.PublicSymbol](a, ex.symbols.count::usize);
+    if (sel symbols.err) { ret res[resolve.ModuleExports, fail.Fail].err{fail.refused(symbols.err)}; }
+    memory.raw_copy(symbols.ok::ptr, ex.symbols.symbols::ptr, ex.symbols.count::usize * $size_of(resolve.PublicSymbol));
+    out.symbols = symbols.ok;
+    out.count   = ex.symbols.count;
+    ret res[resolve.ModuleExports, fail.Fail].ok{out};
 }
 
 fun exporter_path(raw: ptr, mid: module.ModuleId) intern.StrId {
@@ -564,46 +707,17 @@ fun free_sema_deps_query(alloc: *A.Allocator, deps: *sema_product.SemaDeps) {
     deps.count   = 0;
 }
 
-# a module's typed surface, decoded once per typed-exports revision and shared by every importer,
-# its field graph installed in the projection on each read
+# a module's typed surface, shared by every importer, its field graph installed in the projection
+# on each read
 fun typed_surface_of(p: *project.Project, mid: module.ModuleId) res[*sema_product.ModuleSema, fail.Fail] {
     if (module.is_nil(mid) || mid::u32 >= project.module_count(p)) { ret res[*sema_product.ModuleSema, fail.Fail].err{fail.message("typed surface module is not loaded")}; }
     val m:        *project.ModuleEntry            = project.module_at(p, mid::u32);
-    val acquired: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?TYPED_SURFACE, module.stable_index(m.stable_id)::u64);
+    val acquired: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?TYPED_EXPORTS, module.stable_index(m.stable_id)::u64);
     if (sel acquired.err) { ret res[*sema_product.ModuleSema, fail.Fail].err{acquired.err}; }
-    val surface: *sema_product.ModuleSema = surface_handle_decode(acquired.ok);
-    if (surface == nil) { ret res[*sema_product.ModuleSema, fail.Fail].err{fail.message("typed surface query produced no surface")}; }
-    val installed: err[fail.Fail] = sema_fields.install(p.s, ?surface.graph);
+    val surface:   *sema_product.ModuleSema = surface_handle_decode(acquired.ok);
+    val installed: err[fail.Fail]           = sema_fields.install(p.s, ?surface.graph);
     if (sel installed.err) { ret res[*sema_product.ModuleSema, fail.Fail].err{installed.err}; }
     ret res[*sema_product.ModuleSema, fail.Fail].ok{surface};
-}
-
-# a cached surface outlives the operation that numbered the modules, so it names its module by
-# path alone
-fun typed_surface_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
-    val p:   *project.Project = raw::*project.Project;
-    val mid: module.ModuleId  = module.module_id_for_stable(?p.s.modules, key::u32::module.StableModuleId);
-    if (module.is_nil(mid)) { ret res[query.QueryOutput, fail.Fail].err{fail.message("typed surface: the stable id is not loaded this build")}; }
-    val acquired: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?TYPED_EXPORTS, key);
-    if (sel acquired.err) { ret res[query.QueryOutput, fail.Fail].err{acquired.err}; }
-    val decoded: res[sema_product.ModuleSema, fail.Fail] = codec.typed_surface_decode(?p.s.interner, alloc, acquired.ok.value, acquired.ok.value_len,
-        project.module_at(p, mid::u32).fqn, module.MODULE_NIL);
-    if (sel decoded.err) { ret res[query.QueryOutput, fail.Fail].err{decoded.err}; }
-    var owned: sema_product.ModuleSema                = decoded.ok;
-    val boxed: res[*sema_product.ModuleSema, A.Error] = A.allocate[sema_product.ModuleSema](alloc, 1::usize);
-    if (sel boxed.err) {
-        sema_product.module_sema_dnit(?owned);
-        ret res[query.QueryOutput, fail.Fail].err{fail.refused(boxed.err)};
-    }
-    boxed.ok[0] = owned;
-    val bytes: res[*u8, A.Error] = A.allocate[u8](alloc, $size_of(ptr));
-    if (sel bytes.err) {
-        surface_release(boxed.ok, alloc);
-        ret res[query.QueryOutput, fail.Fail].err{fail.refused(bytes.err)};
-    }
-    val slot: *ptr = bytes.ok::ptr::*ptr;
-    slot[0] = boxed.ok::ptr;
-    ret res[query.QueryOutput, fail.Fail].ok{query.QueryOutput{bytes: bytes.ok, len: $size_of(ptr)::u32}};
 }
 
 fun surface_handle_decode(e: query.QueryView) *sema_product.ModuleSema {
@@ -619,24 +733,88 @@ fun surface_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
     surface_release(surface_handle_decode(query.QueryView{value: value, value_len: value_len}), alloc);
 }
 
+# two typed surfaces are the same when they export the same rows and reach the same field recipes;
+# the index a reader builds and where the graph was installed are not part of either
+fun surface_equal(left: *u8, left_len: u32, right: *u8, right_len: u32) bool {
+    val l: *sema_product.ModuleSema = surface_handle_decode(query.QueryView{value: left, value_len: left_len});
+    val r: *sema_product.ModuleSema = surface_handle_decode(query.QueryView{value: right, value_len: right_len});
+    if (l.exports.len != r.exports.len || l.graph.nodes.len != r.graph.nodes.len) { ret false; }
+    var i: usize = 0;
+    for (i < l.exports.len) {
+        val lr: *sema_product.TypeExport = ?l.exports.data[i];
+        val rr: *sema_product.TypeExport = ?r.exports.data[i];
+        if (lr.origin::u32 != rr.origin::u32 || lr.canon::u32 != rr.canon::u32 || lr.ty::u32 != rr.ty::u32) { ret false; }
+        if (!constant_same(?lr.constant, ?rr.constant))                                                    { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < l.graph.nodes.len) {
+        val ln: *sema_fields.Node = ?l.graph.nodes.data[i];
+        val rn: *sema_fields.Node = ?r.graph.nodes.data[i];
+        if (ln.ty::u32 != rn.ty::u32 || ln.disc::u32 != rn.disc::u32 || ln.entries.len != rn.entries.len) { ret false; }
+        if (ln.decoration.align != rn.decoration.align || ln.decoration.packed != rn.decoration.packed
+            || ln.decoration.volatile_ != rn.decoration.volatile_) { ret false; }
+        var j: usize = 0;
+        for (j < ln.entries.len) {
+            val le: *type_field.Entry = ?ln.entries.data[j];
+            val re: *type_field.Entry = ?rn.entries.data[j];
+            if (le.name::u32 != re.name::u32 || le.ty::u32 != re.ty::u32 || !deprecation_same(le.deprecation, re.deprecation)) { ret false; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a module's typed surface copied for a reader that owns it, under the id this build numbers the
+# module with, its field graph installed in the projection
 fun read_typed_surface(p: *project.Project, mid: module.ModuleId, a: *A.Allocator) res[sema_product.ModuleSema, fail.Fail] {
     if (module.is_nil(mid) || mid::u32 >= project.module_count(p)) { ret res[sema_product.ModuleSema, fail.Fail].err{fail.message("typed surface module is not loaded")}; }
     val acquired: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p,
         ?TYPED_EXPORTS, module.stable_index(project.module_at(p, mid::u32).stable_id)::u64);
     if (sel acquired.err) { ret res[sema_product.ModuleSema, fail.Fail].err{acquired.err}; }
-    ret surface_from_bytes(p, mid, acquired.ok.value, acquired.ok.value_len, a);
-}
-
-fun surface_from_bytes(p: *project.Project, mid: module.ModuleId, bytes: *u8, len: u32, a: *A.Allocator) res[sema_product.ModuleSema, fail.Fail] {
-    val decoded: res[sema_product.ModuleSema, fail.Fail] = codec.typed_surface_decode(?p.s.interner, a, bytes, len, project.module_at(p, mid::u32).fqn, mid);
-    if (sel decoded.err) { ret decoded; }
-    var owned:     sema_product.ModuleSema = decoded.ok;
-    val installed: err[fail.Fail]          = sema_fields.install(p.s, ?owned.graph);
+    var owned:  sema_product.ModuleSema = sema_product.module_sema_init(a, project.module_at(p, mid::u32).fqn, mid);
+    val copied: err[fail.Fail]          = surface_copy(surface_handle_decode(acquired.ok), ?owned);
+    if (sel copied.err) {
+        sema_product.module_sema_dnit(?owned);
+        ret res[sema_product.ModuleSema, fail.Fail].err{copied.err};
+    }
+    val installed: err[fail.Fail] = sema_fields.install(p.s, ?owned.graph);
     if (sel installed.err) {
         sema_product.module_sema_dnit(?owned);
         ret res[sema_product.ModuleSema, fail.Fail].err{installed.err};
     }
     ret res[sema_product.ModuleSema, fail.Fail].ok{owned};
+}
+
+# the rows and field recipes of `from` appended to `into`, from `into`'s allocator
+fun surface_copy(from: *sema_product.ModuleSema, into: *sema_product.ModuleSema) err[fail.Fail] {
+    val rows: res[usize, A.Error] = collections_vector.reserve[sema_product.TypeExport](?into.exports, from.exports.len);
+    if (sel rows.err) { ret err[fail.Fail].err{fail.refused(rows.err)}; }
+    var i: usize = 0;
+    for (i < from.exports.len) {
+        collections_vector.push[sema_product.TypeExport](?into.exports, from.exports.data[i]);
+        i = i + 1;
+    }
+    val nodes: res[usize, A.Error] = collections_vector.reserve[sema_fields.Node](?into.graph.nodes, from.graph.nodes.len);
+    if (sel nodes.err) { ret err[fail.Fail].err{fail.refused(nodes.err)}; }
+    i = 0;
+    for (i < from.graph.nodes.len) {
+        val source: *sema_fields.Node = ?from.graph.nodes.data[i];
+        var node:   sema_fields.Node  = sema_fields.Node{
+            ty: source.ty, entries: collections_vector.init[type_field.Entry](into.exports.a), decoration: source.decoration, disc: source.disc
+        };
+        val entries: res[usize, A.Error] = collections_vector.reserve[type_field.Entry](?node.entries, source.entries.len);
+        if (sel entries.err) { ret err[fail.Fail].err{fail.refused(entries.err)}; }
+        var j: usize = 0;
+        for (j < source.entries.len) {
+            collections_vector.push[type_field.Entry](?node.entries, source.entries.data[j]);
+            j = j + 1;
+        }
+        collections_vector.push[sema_fields.Node](?into.graph.nodes, node);
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
 }
 
 # resolve reads the dep list, the gate states and the bound constants from the load walk, not through a
@@ -759,15 +937,28 @@ fun typed_exports_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Alloc
     val captured: res[sema_product.ModuleSema, fail.Fail] = sema_surface.exports(s, ?owner, rr, sr, ?origins, alloc);
     if (sel captured.err) { ret res[query.QueryOutput, fail.Fail].err{captured.err}; }
     var surface: sema_product.ModuleSema = captured.ok;
-    fin { sema_product.module_sema_dnit(?surface); }
+    var handed:  bool                    = false;
+    fin {
+        if (!handed) { sema_product.module_sema_dnit(?surface); }
+    }
+    var j: usize = 0;
+    for (j < surface.exports.len) {
+        val refused: opt[str] = constant_refusal(?surface.exports.data[j].constant, 0);
+        if (sel refused.some) { ret res[query.QueryOutput, fail.Fail].err{fail.message(refused.some)}; }
+        j = j + 1;
+    }
     val graph: res[sema_fields.Graph, fail.Fail] = sema_surface.graph(s, ?owner, ?surface);
     if (sel graph.err) { ret res[query.QueryOutput, fail.Fail].err{graph.err}; }
     surface.graph = graph.ok;
-    var fb: wire.Sink = wire.grown(alloc);
-    fin { wire.dnit(?fb); }
-    val wr: err[fail.Fail] = codec.typed_surface_encode(?fb, ?surface);
-    if (sel wr.err) { ret res[query.QueryOutput, fail.Fail].err{wr.err}; }
-    ret codec.output(?fb);
+    # a shared surface outlives the build that numbered the modules, so it names its module by path alone
+    surface.module = module.MODULE_NIL;
+    val boxed: res[*sema_product.ModuleSema, A.Error] = A.allocate[sema_product.ModuleSema](alloc, 1::usize);
+    if (sel boxed.err) { ret res[query.QueryOutput, fail.Fail].err{fail.refused(boxed.err)}; }
+    boxed.ok[0] = surface;
+    handed      = true;
+    val out: res[query.QueryOutput, fail.Fail] = pointer_output(alloc, boxed.ok::ptr);
+    if (sel out.err) { surface_release(boxed.ok, alloc); }
+    ret out;
 }
 
 fun lower_visit_reserve(p: *project.Project, needed: u32) err[fail.Fail] {
