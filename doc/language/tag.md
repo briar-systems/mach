@@ -351,8 +351,10 @@ raw-memory obligation below.
 A payload read whose case is no longer selected is undefined behavior of the
 same class as a stale pointer read. A raw pointer to a payload does not pin a
 case or extend a lifetime. There is no borrow checker, proof analysis or runtime
-validator. In the debug profile only, each guarded payload access compares the
-discriminator and traps on mismatch.
+validator. In the debug profile only, a guarded payload access compares the
+discriminator and traps on mismatch. The comparison is left out where the value
+is a local or parameter that nothing takes the address of, in whole or in part,
+since no pointer to it exists and a write by name under the guard is refused.
 
 ## Layout and representation
 
