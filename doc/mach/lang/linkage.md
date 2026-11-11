@@ -2,9 +2,10 @@
 
 what a build declares about linkage, owned by the build's project and read
 by the lowering that names declarations and the linker that binds imports:
-each declaration's export name and library, the library each imported
-symbol is pinned to, and the libraries the link is offered in the order the
-build first named them
+each declaration's export name and library, the name each declaration links
+under once the lowering has named it, the library each imported symbol is
+pinned to, and the libraries the link is offered in the order the build
+first named them
 
 ## rec Provider
 
@@ -50,14 +51,15 @@ module registry is reset
 pub fun register_export_name(l: *Linkage, mid: module.ModuleId, did: u32, name: intern.StrId) err[fail.Fail];
 ```
 
-## fun forget_export_names
+## fun forget_names
 
 ```mach
-pub fun forget_export_names(l: *Linkage, mid: module.ModuleId, decl_count: u32);
+pub fun forget_names(l: *Linkage, mid: module.ModuleId, decl_count: u32);
 ```
 
-drop every export name one module registered, before its syntax tree is
-replaced and its declaration ids no longer name the same declarations
+drop every export name and linkage name of one module's declarations, before
+its syntax tree is replaced and its declaration ids no longer name the same
+declarations
 
 mid: the module whose names go
 decl_count: the declaration count of the syntax tree they were registered against
@@ -69,6 +71,23 @@ pub fun export_name(l: *Linkage, mid: module.ModuleId, did: u32) intern.StrId;
 ```
 
 the name declaration `did` of `mid` is exported under, nil when it names none
+
+## fun register_name
+
+```mach
+pub fun register_name(l: *Linkage, mid: module.ModuleId, did: u32, name: intern.StrId) err[fail.Fail];
+```
+
+record the name declaration `did` of `mid` links under, as the lowering
+first names it
+
+## fun name
+
+```mach
+pub fun name(l: *Linkage, mid: module.ModuleId, did: u32) intern.StrId;
+```
+
+the name declaration `did` of `mid` links under, nil before the lowering has named it
 
 ## fun register_export_library
 

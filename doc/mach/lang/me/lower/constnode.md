@@ -30,5 +30,6 @@ pub fun string_global(ctx: *lower_context.LowerContext, text: intern.StrId) res[
 ```
 
 the read-only global holding an interned string's bytes, NULs included, and the terminator
-the interner keeps after them; its address is the value
+the interner keeps after them; its address is the value. the bytes are never written, so
+every use of one text in a module shares one global
 

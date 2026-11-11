@@ -148,6 +148,10 @@ null-terminated bytes in the data segment:
 val msg: *u8 = "hello, mach\n";
 ```
 
+The bytes are read-only. Two literals with the same text in one module may be
+the same bytes at the same address, so the address of a literal says nothing
+about which literal it came from.
+
 String escapes: the same set.
 
 A quoted string literal is a single line. Text of several lines is a

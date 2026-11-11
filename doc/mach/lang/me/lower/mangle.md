@@ -17,7 +17,7 @@ pub fun declaration_linkage_name(l: *linkage.Linkage, s: *session.Session, mid: 
 ```
 
 the linkage name of the declaration `decl` of module `mid`, whose canonical name is `canon`,
-exported under the name `l` declares for it
+exported under the name `l` declares for it, made once and kept in `l`
 
 ## fun test_name
 
