@@ -185,7 +185,10 @@ rec TypeCaseSelector {
 
 pub rec Type {
     kind: TypeKind;
-    data: uni {
+    # what the type spells, read from its parts when it is interned (`FACT_*`); never
+    # part of its identity
+    facts: u8;
+    data:  uni {
         pointer: TypePointer;
         secret: TypeSecret;
         array: TypeArray;
@@ -198,6 +201,47 @@ pub rec Type {
         instance: TypeInstance;
         case_selector: TypeCaseSelector;
     };
+}
+
+# a generic parameter is spelled in the type: itself, or under a pointer, secret or array, in
+# a signature or as an instance's argument
+pub val FACT_PARAM: u8 = 1;
+# the type is secret, or reaches a secret through pointers and array elements alone
+pub val FACT_CARRIES_SECRET: u8 = 2;
+# the type is a handle, or reaches one through pointers, arrays and secrets alone
+pub val FACT_CARRIES_HANDLE: u8 = 4;
+
+# the facts of `tid`, none for the nil and error types
+pub fun facts_of(ti: *TypeInterner, tid: TypeId) u8 {
+    if (is_nil(tid) || is_error(tid)) { ret 0; }
+    val found: opt[*Type] = get(ti, tid);
+    if (sel found.none) { ret 0; }
+    ret found.some.facts;
+}
+
+# the facts of a type about to be interned, from its parts', which are interned before it
+fun facts_from(ti: *TypeInterner, t: *Type) u8 {
+    val k: TypeKind = t.kind;
+    if (k == TYPE_GENERIC_PARAM) { ret FACT_PARAM; }
+    if (k == TYPE_HANDLE)        { ret FACT_CARRIES_HANDLE; }
+    if (k == TYPE_SECRET)        { ret facts_of(ti, t.data.secret.base) | FACT_CARRIES_SECRET; }
+    if (k == TYPE_POINTER)       { ret facts_of(ti, t.data.pointer.base); }
+    if (k == TYPE_ARRAY)         { ret facts_of(ti, t.data.array.base); }
+    if (k == TYPE_FUN) {
+        ret (pool_facts(ti, t.data.fn.params_start, t.data.fn.params_len) | facts_of(ti, t.data.fn.ret_type)) & FACT_PARAM;
+    }
+    if (k == TYPE_INSTANCE) { ret pool_facts(ti, t.data.instance.args_start, t.data.instance.args_len) & FACT_PARAM; }
+    ret 0;
+}
+
+fun pool_facts(ti: *TypeInterner, start: u32, len: u32) u8 {
+    var facts: u8  = 0;
+    var i:     u32 = 0;
+    for (i < len) {
+        facts = facts | facts_of(ti, ti.params[start + i]);
+        i     = i + 1;
+    }
+    ret facts;
 }
 
 pub rec TypeInterner {
@@ -232,6 +276,9 @@ pub rec TypeInterner {
     # published tables never change otherwise
     projection_generation: u64;
 
+    # by type index, the projected facts settled under the current projection (`PROJECTED_*`)
+    projected: Vector[u8];
+
     scans: type_scan.Sets;
 }
 
@@ -255,6 +302,7 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) err[fail.Fail] {
 
     ti.fields                = type_field.projection_init(a);
     ti.projection_generation = 0;
+    ti.projected             = collections_vector.init[u8](a);
     ti.scans                 = type_scan.sets_init(a);
 
     ti.dedup          = map.init_by[Type, TypeId](a, hash_type, eq_type);
@@ -323,6 +371,7 @@ pub fun dnit(ti: *TypeInterner) {
         A.deallocate[u32](ti.a, ti.handle_ops, ti.handle_ops_cap::usize);
     }
     type_field.projection_dnit(?ti.fields);
+    collections_vector.dnit[u8](?ti.projected);
     type_scan.sets_dnit(?ti.scans);
 
     map.dnit_by[Type, TypeId](?ti.dedup);
@@ -464,55 +513,9 @@ pub fun strip_secret(ti: *TypeInterner, tid: TypeId) TypeId {
     ret t.data.secret.base;
 }
 
-# whether `tid` mentions a type parameter anywhere it is spelled. the walk keeps the types it
-# has yet to visit on a worklist rather than the stack, so a type nested through flat defs
-# deeper than any stack is still answered; a worklist that cannot grow is the failure
+# whether `tid` mentions a type parameter anywhere it is spelled; it never fails
 pub fun mentions_generic_param(ti: *TypeInterner, tid: TypeId) res[bool, fail.Fail] {
-    var work: Vector[TypeId] = collections_vector.init[TypeId](ti.a);
-    fin { collections_vector.dnit[TypeId](?work); }
-    var at: TypeId = tid;
-    for {
-        var next: TypeId = TYPE_NIL;
-        if (!is_error(at) && !is_nil(at)) {
-            val t_opt: opt[*Type] = get(ti, at);
-            if (sel t_opt.some) {
-                val t: *Type = t_opt.some;
-                if (t.kind == TYPE_GENERIC_PARAM) { ret res[bool, fail.Fail].ok{true}; }
-                or (t.kind == TYPE_POINTER)       { next = t.data.pointer.base; }
-                or (t.kind == TYPE_SECRET)        { next = t.data.secret.base; }
-                or (t.kind == TYPE_ARRAY)         { next = t.data.array.base; }
-                or (t.kind == TYPE_FUN) {
-                    val queued: err[fail.Fail] = params_queue(ti, ?work, t.data.fn.params_start, t.data.fn.params_len);
-                    if (sel queued.err) { ret res[bool, fail.Fail].err{queued.err}; }
-                    next = t.data.fn.ret_type;
-                }
-                or (t.kind == TYPE_INSTANCE) {
-                    val queued: err[fail.Fail] = params_queue(ti, ?work, t.data.instance.args_start, t.data.instance.args_len);
-                    if (sel queued.err) { ret res[bool, fail.Fail].err{queued.err}; }
-                }
-            }
-        }
-        if (is_nil(next)) {
-            val popped: opt[TypeId] = collections_vector.pop[TypeId](?work);
-            if (sel popped.none) { ret res[bool, fail.Fail].ok{false}; }
-            next = popped.some;
-        }
-        at = next;
-    }
-}
-
-# queues the `len` types of the parameter pool from `start` for a walk to visit
-fun params_queue(ti: *TypeInterner, work: *Vector[TypeId], start: u32, len: u32) err[fail.Fail] {
-    var i: u32 = 0;
-    for (i < len) {
-        val p: opt[TypeId] = get_param(ti, start + i);
-        if (sel p.some) {
-            val pushed: res[usize, A.Error] = collections_vector.push[TypeId](work, p.some);
-            if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
-        }
-        i = i + 1;
-    }
-    ret err[fail.Fail].ok{};
+    ret res[bool, fail.Fail].ok{(facts_of(ti, tid) & FACT_PARAM) != 0};
 }
 
 pub fun shape_kind(ti: *TypeInterner, tid: TypeId) TypeKind {
@@ -548,49 +551,66 @@ pub fun is_u1(ti: *TypeInterner, tid: TypeId) bool {
 
 # whether `tid` is secret or reaches a secret through pointers and array elements alone
 pub fun carries_secret(ti: *TypeInterner, tid: TypeId) bool {
-    var at: TypeId = tid;
-    for {
-        val opt_type: opt[*Type] = get(ti, at);
-        if (!sel opt_type.some) { ret false; }
-        val t: *Type = opt_type.some;
-        if (t.kind == TYPE_SECRET)  { ret true; }
-        if (t.kind == TYPE_POINTER) { at = t.data.pointer.base; }
-        or (t.kind == TYPE_ARRAY)   { at = t.data.array.base; }
-        or                          { ret false; }
-    }
+    ret (facts_of(ti, tid) & FACT_CARRIES_SECRET) != 0;
 }
 
 # true when any byte of a value of this type may be secret: the type itself, an element, a field or a case
 # payload; a pointer's pointee is not the object's storage and does not count. the walk keeps the
 # fields it has yet to visit on a worklist, so a type nested deeper than any stack is still
-# answered; a worklist that cannot grow is the failure
+# answered; a worklist that cannot grow is the failure. an aggregate with no table yet adds
+# nothing, so a clear answer that met one is not recorded
 pub fun contains_secret(ti: *TypeInterner, tid: TypeId) res[bool, fail.Fail] {
+    val known: opt[bool] = projected_get(ti, tid, PROJECTED_HELD_SECRET);
+    if (sel known.some) { ret res[bool, fail.Fail].ok{known.some}; }
+    val walked: res[Held, fail.Fail] = held_walk(ti, tid);
+    if (sel walked.err) { ret res[bool, fail.Fail].err{walked.err}; }
+    val held: Held = walked.ok;
+    if (held.secret || held.settled) {
+        val kept: err[fail.Fail] = projected_set(ti, tid, PROJECTED_HELD_SECRET, held.secret);
+        if (sel kept.err) { ret res[bool, fail.Fail].err{kept.err}; }
+    }
+    ret res[bool, fail.Fail].ok{held.secret};
+}
+
+# what a walk for a held secret found, and whether every aggregate it entered had its table
+rec Held {
+    secret:  bool;
+    settled: bool;
+}
+
+fun held_walk(ti: *TypeInterner, tid: TypeId) res[Held, fail.Fail] {
     var work: Vector[TypeId] = collections_vector.init[TypeId](ti.a);
     fin { collections_vector.dnit[TypeId](?work); }
-    var at: TypeId = tid;
+    var settled: bool   = true;
+    var at:      TypeId = tid;
     for {
         var next:     TypeId     = TYPE_NIL;
+        val known:    opt[bool]  = projected_get(ti, at, PROJECTED_HELD_SECRET);
         val opt_type: opt[*Type] = get(ti, at);
-        if (sel opt_type.some) {
+        if (sel known.some) {
+            if (known.some) { ret res[Held, fail.Fail].ok{Held{secret: true, settled: true}}; }
+        }
+        or (sel opt_type.some) {
             val t: *Type = opt_type.some;
-            if (t.kind == TYPE_SECRET) { ret res[bool, fail.Fail].ok{true}; }
+            if (t.kind == TYPE_SECRET) { ret res[Held, fail.Fail].ok{Held{secret: true, settled: true}}; }
             or (t.kind == TYPE_ARRAY)  { next = t.data.array.base; }
             or (t.kind == TYPE_REC || t.kind == TYPE_UNI || t.kind == TYPE_TAG || t.kind == TYPE_INSTANCE) {
-                val n: u32 = field_count(ti, at);
-                var i: u32 = 0;
-                for (i < n) {
-                    val fe: opt[*FieldEntry] = field_at(ti, at, i);
-                    if (sel fe.some) {
-                        val pushed: res[usize, A.Error] = collections_vector.push[TypeId](?work, fe.some.ty);
-                        if (sel pushed.err) { ret res[bool, fail.Fail].err{fail.refused(pushed.err)}; }
+                val table: opt[*FieldTable] = field_table_for(ti, at);
+                if (sel table.none) { settled = false; }
+                or (sel table.some) {
+                    val ft: *FieldTable = table.some;
+                    var i:  u32         = 0;
+                    for (i < ft.fields_len) {
+                        val pushed: res[usize, A.Error] = collections_vector.push[TypeId](?work, type_field.entry_at(?ti.fields, ft, i).ty);
+                        if (sel pushed.err) { ret res[Held, fail.Fail].err{fail.refused(pushed.err)}; }
+                        i = i + 1;
                     }
-                    i = i + 1;
                 }
             }
         }
         if (is_nil(next)) {
             val popped: opt[TypeId] = collections_vector.pop[TypeId](?work);
-            if (sel popped.none) { ret res[bool, fail.Fail].ok{false}; }
+            if (sel popped.none) { ret res[Held, fail.Fail].ok{Held{secret: false, settled: settled}}; }
             next = popped.some;
         }
         at = next;
@@ -733,18 +753,7 @@ pub fun is_handle(ti: *TypeInterner, tid: TypeId) bool {
 # a handle, or a pointer, array or secret over one: every shape that places a handle
 # where the program would own its storage
 pub fun carries_handle(ti: *TypeInterner, tid: TypeId) bool {
-    var at: TypeId = tid;
-    for {
-        if (is_nil(at) || is_error(at)) { ret false; }
-        val opt_type: opt[*Type] = get(ti, at);
-        if (!sel opt_type.some) { ret false; }
-        val t: *Type = opt_type.some;
-        if (t.kind == TYPE_HANDLE)  { ret true; }
-        if (t.kind == TYPE_SECRET)  { at = t.data.secret.base; }
-        or (t.kind == TYPE_POINTER) { at = t.data.pointer.base; }
-        or (t.kind == TYPE_ARRAY)   { at = t.data.array.base; }
-        or                          { ret false; }
-    }
+    ret (facts_of(ti, tid) & FACT_CARRIES_HANDLE) != 0;
 }
 
 # an array whose elements carry a handle, reached directly or through a pointer or secret
@@ -1074,11 +1083,43 @@ pub fun type_equals_signatures(ti: *TypeInterner, a: TypeId, b: TypeId) bool {
 
 pub fun field_projection_reset(ti: *TypeInterner) {
     type_field.projection_reset(?ti.fields);
+    collections_vector.clear[u8](?ti.projected);
     ti.projection_generation = ti.projection_generation + 1;
 }
 
-pub fun field_epoch(ti: *TypeInterner) u32 {
-    ret type_field.epoch(?ti.fields);
+# a fact of a type that reads the field tables, so it holds for one projection. it is recorded
+# only once every table it read was published. a reset of the projection drops them all, and
+# so does a table published over one that held other fields. each takes two bits: settled, then its answer
+pub def Projected: u8;
+# a value of the type holds a secret in its own storage (`contains_secret`)
+pub val PROJECTED_HELD_SECRET: Projected = 0;
+# the type reaches a secret anywhere, through pointers, with an instance's arguments counted
+# where its generic places them (`query.deep.secret`)
+pub val PROJECTED_REACHES_SECRET: Projected = 1;
+# a secret is spelled anywhere the type reaches, through every edge and every instance
+# argument (`query.reach.module_secret`)
+pub val PROJECTED_SPELLS_SECRET: Projected = 2;
+
+# the settled answer to projected fact `which` of `tid`, none while it is unsettled
+pub fun projected_get(ti: *TypeInterner, tid: TypeId, which: Projected) opt[bool] {
+    val at: usize = index(tid)::usize;
+    if (at >= ti.projected.len) { ret opt[bool].none{}; }
+    val bits: u8 = ti.projected.data[at] >> (which * 2);
+    if ((bits & 1) == 0) { ret opt[bool].none{}; }
+    ret opt[bool].some{(bits & 2) != 0};
+}
+
+pub fun projected_set(ti: *TypeInterner, tid: TypeId, which: Projected, answer: bool) err[fail.Fail] {
+    if (is_nil(tid) || is_error(tid)) { ret err[fail.Fail].ok{}; }
+    val at: usize = index(tid)::usize;
+    for (ti.projected.len <= at) {
+        val grown: res[usize, A.Error] = collections_vector.push[u8](?ti.projected, 0);
+        if (sel grown.err) { ret err[fail.Fail].err{fail.refused(grown.err)}; }
+    }
+    var bits: u8 = 1;
+    if (answer) { bits = 3; }
+    ti.projected.data[at] = ti.projected.data[at] | (bits << (which * 2));
+    ret err[fail.Fail].ok{};
 }
 
 pub fun field_table_stage(ti: *TypeInterner, additional: u32) res[u32, fail.Fail] {
@@ -1093,8 +1134,13 @@ pub fun field_table_stage_push_entry(ti: *TypeInterner, fe: FieldEntry) err[fail
     ret type_field.entry_push(?ti.fields, fe);
 }
 
+# a table published over one holding other fields drops every projected fact, since any of
+# them may have read the old one
 pub fun field_table_publish(ti: *TypeInterner, ty: TypeId, fields_start: u32, fields_len: u32) err[fail.Fail] {
-    ret type_field.publish(?ti.fields, ty, fields_start, fields_len);
+    val published: res[bool, fail.Fail] = type_field.publish(?ti.fields, ty, fields_start, fields_len);
+    if (sel published.err) { ret err[fail.Fail].err{published.err}; }
+    if (published.ok)      { collections_vector.clear[u8](?ti.projected); }
+    ret err[fail.Fail].ok{};
 }
 
 # the layout decorations nominal `tid` declares under the current projection
@@ -1222,13 +1268,15 @@ fun append_type(ti: *TypeInterner, t: Type) res[TypeId, fail.Fail] {
     if (count >= index(TYPE_ERROR)::usize) { ret res[TypeId, fail.Fail].err{fail.message("type identities are exhausted")}; }
     val tid: TypeId = id(count::u32);
 
+    var stored: Type = t;
+    stored.facts = facts_from(ti, ?stored);
     val ce_r: res[handle.ChunkEditor[Type], handle.Error] = handle.chunk_editor[Type](?ti.types);
     if (sel ce_r.err) {
         ret res[TypeId, fail.Fail].err{fail.message(handle.text(ce_r.err))};
     }
     var ce: handle.ChunkEditor[Type] = ce_r.ok;
 
-    val push_r: res[*Type, handle.Error] = handle.chunk_append[Type](?ce, t);
+    val push_r: res[*Type, handle.Error] = handle.chunk_append[Type](?ce, stored);
     handle.chunk_editor_finish[Type](?ce);
     if (sel push_r.err) {
         ret res[TypeId, fail.Fail].err{fail.message(handle.text(push_r.err))};
