@@ -170,11 +170,13 @@ pub rec Module {
 # ---
 # names:   the first `val` or `use` that binds a name in a declaration list, by demand_key of the
 #          list's first pool position and the name, as its position in the declaration pool
+# uses:    the first `use` that binds a name in a declaration list, keyed and placed as `names`
 # chains:  the pool position of every `$if` chain in the module, ascending; a chain before the
 #          binder may bind the name first in the arm it selects
-# indexed: the two above describe the current syntax
+# indexed: the maps and chains above describe the current syntax
 rec DemandIndex {
     names:   map.Map[u64, u32];
+    uses:    map.Map[u64, u32];
     chains:  collections_vector.Vector[u32];
     indexed: bool;
 }
@@ -187,17 +189,17 @@ pub rec Row {
     load:   *Module;
 }
 
-# what the load asks of the program that runs it, which owns the module table and the parses
+# what the load asks of the program that runs it, which owns the module table and the parses.
+# the host runs each of the load's entries (module_load, module_open, module_reload and
+# decorators_record) whole, and replaces no module's syntax while one runs but through `parse`
 # ---
 # ctx:     the host's own state
 # add:     make a row for a module with this name and stable id, with no file or syntax yet, and
 #          give its id; ids are given in order from zero
 # row:     a module's row; the load record it points at stays where it is
-# syntax:  a module's syntax as last made current, nil where it has none
+# syntax:  a module's current syntax, nil where it has none
 # parse:   give the module this file and make its syntax current; `reported` says the load
 #          reached it by walking, so a progress readout lists it
-# refresh: make a module's syntax current; a nonzero incarnation is the one it must still have
-# epoch:   a number that changes whenever any module's syntax may have been replaced
 # context: the comptime context of a module of `artifact` under the build target, with nothing
 #          of the module itself
 # done:    a module and everything it imports finished loading
@@ -207,10 +209,29 @@ pub rec Host {
     row:     fun(ptr, module.ModuleId) Row;
     syntax:  fun(ptr, module.ModuleId) *ast.Ast;
     parse:   fun(ptr, module.ModuleId, lang_source.FileId, bool) err[fail.Fail];
-    refresh: fun(ptr, module.ModuleId, u64) err[fail.Fail];
-    epoch:   fun(ptr) u64;
     context: fun(ptr, intern.StrId) res[comptime_scope.ComptimeCtx, fail.Fail];
     done:    fun(ptr, module.ModuleId) err[fail.Fail];
+}
+
+# what the provider answered an entry about a path
+rec Named {
+    entry:  u64;
+    module: bool;
+}
+
+# what the loader holds of one module
+# ---
+# load:   its load record, which stays where it is (Host.row)
+# entry:  the entry its syntax and text were read in, 0 for none; they hold for that entry alone
+# a:      its syntax as that entry read it
+# source: its text as that entry read it
+# known:  the session holds its file, so `source` is its text
+rec Held {
+    load:   *Module;
+    entry:  u64;
+    a:      *ast.Ast;
+    source: str;
+    known:  bool;
 }
 
 # the front end's loading stage: from the modules it is asked for, it finds every module they
@@ -223,6 +244,10 @@ pub rec Host {
 # by_name:   each module's id by its fqn
 # by_stable: each module's id by its stable id
 # states:    how far each module is loaded, by id
+# held:      what the loader holds of each module, by id
+# entry:     the entry running now, numbering each from 1
+# named:     whether each path a `use` or `fwd` spells names a module, as the provider answered
+#            the entry it was asked in
 # demands:   the gates and constants the load is deciding, innermost last
 # union:     the build decides every gate under each of `tuples` as well as its own target
 # filter:    the tuples the walk is under now, nil for all of them
@@ -239,6 +264,9 @@ pub rec Loader {
     by_name:     map.Map[intern.StrId, module.ModuleId];
     by_stable:   map.Map[module.StableModuleId, module.ModuleId];
     states:      collections_vector.Vector[State];
+    held:        collections_vector.Vector[Held];
+    entry:       u64;
+    named:       map.Map[intern.StrId, Named];
     demands:     collections_vector.Vector[Demand];
     union:       bool;
     tuples:      *Tuple;
@@ -260,6 +288,9 @@ pub fun init(s: *session.Session, a: *A.Allocator) Loader {
     l.by_name     = map.init[intern.StrId, module.ModuleId](a);
     l.by_stable   = map.init[module.StableModuleId, module.ModuleId](a);
     l.states      = collections_vector.init[State](a);
+    l.held        = collections_vector.init[Held](a);
+    l.entry       = 0;
+    l.named       = map.init[intern.StrId, Named](a);
     l.demands     = collections_vector.init[Demand](a);
     l.union       = false;
     l.tuples      = nil;
@@ -277,6 +308,8 @@ pub fun dnit(l: *Loader) {
     map.dnit[intern.StrId, module.ModuleId](?l.by_name);
     map.dnit[module.StableModuleId, module.ModuleId](?l.by_stable);
     collections_vector.dnit[State](?l.states);
+    collections_vector.dnit[Held](?l.held);
+    map.dnit[intern.StrId, Named](?l.named);
     collections_vector.dnit[Demand](?l.demands);
     if (l.tuples != nil && l.tuple_cap > 0) { A.deallocate[Tuple](l.alloc, l.tuples, l.tuple_cap::usize); }
     l.tuples      = nil;
@@ -319,6 +352,7 @@ pub fun module_dnit(a: *A.Allocator, m: *Module) {
     collections_vector.dnit[Const](?m.consts);
     collections_vector.dnit[Binding](?m.bindings);
     map.dnit[u64, u32](?m.binders.names);
+    map.dnit[u64, u32](?m.binders.uses);
     collections_vector.dnit[u32](?m.binders.chains);
 }
 
@@ -345,11 +379,46 @@ fun row(l: *Loader, mid: module.ModuleId) Row {
 }
 
 fun module_at(l: *Loader, mid: module.ModuleId) *Module {
-    ret row(l, mid).load;
+    ret l.held.data[module.index(mid)::usize].load;
+}
+
+# a module's syntax and text as the running entry holds them, read on its first ask
+fun held_now(l: *Loader, mid: module.ModuleId) *Held {
+    val h: *Held = ?l.held.data[module.index(mid)::usize];
+    if (h.entry == l.entry) { ret h; }
+    h.entry  = l.entry;
+    h.a      = l.host.syntax(l.host.ctx, mid);
+    h.source = nil;
+    h.known  = false;
+    val file: opt[*lang_source.SourceFile] = lang_source.get(l.s.sources, file_of(l, mid));
+    if (sel file.some) {
+        h.source = file.some.text;
+        h.known  = true;
+    }
+    ret h;
 }
 
 fun syntax_of(l: *Loader, mid: module.ModuleId) *ast.Ast {
-    ret l.host.syntax(l.host.ctx, mid);
+    ret held_now(l, mid).a;
+}
+
+# whether a path names a module: one entry asks the provider once for each path, so every
+# declaration that spells it is decided alike
+fun names_module(l: *Loader, fqn: intern.StrId) res[bool, fail.Fail] {
+    val known: opt[*Named] = map.get[intern.StrId, Named](?l.named, ?fqn);
+    if (sel known.some) {
+        if (known.some.entry == l.entry) { ret res[bool, fail.Fail].ok{known.some.module}; }
+    }
+    val asked: res[bool, fail.Fail] = provider.module_exists(?l.sources, l.alloc, fqn);
+    if (sel asked.err) { ret asked; }
+    val kept: res[bool, A.Error] = map.insert[intern.StrId, Named](?l.named, fqn, Named{entry: l.entry, module: asked.ok});
+    if (sel kept.err) { ret res[bool, fail.Fail].err{fail.refused(kept.err)}; }
+    ret asked;
+}
+
+# open one of the load's entries: what an earlier one read no longer holds
+fun entry_open(l: *Loader) {
+    l.entry = l.entry + 1;
 }
 
 fun file_of(l: *Loader, mid: module.ModuleId) lang_source.FileId {
@@ -362,14 +431,6 @@ fun fqn_of(l: *Loader, mid: module.ModuleId) intern.StrId {
 
 fun stable_of(l: *Loader, mid: module.ModuleId) module.StableModuleId {
     ret row(l, mid).stable;
-}
-
-fun epoch(l: *Loader) u64 {
-    ret l.host.epoch(l.host.ctx);
-}
-
-fun syntax_refresh(l: *Loader, mid: module.ModuleId, incarnation: u64) err[fail.Fail] {
-    ret l.host.refresh(l.host.ctx, mid, incarnation);
 }
 
 # the comptime context a module's gates and bodies evaluate in, under the build target
@@ -403,6 +464,8 @@ fun module_parse(l: *Loader, mid: module.ModuleId, fqn: intern.StrId, reported: 
     val fid:  res[lang_source.FileId, fail.Fail] = session.load_source(l.s, origin.path, text.data);
     provider.text_dnit(l.alloc, ?text);
     if (sel fid.err) { ret err[fail.Fail].err{fid.err}; }
+    # the module's syntax and text are replaced here, so what the entry held of them goes
+    l.held.data[module.index(mid)::usize].entry = 0;
     ret l.host.parse(l.host.ctx, mid, fid.ok, reported);
 }
 
@@ -429,12 +492,14 @@ fun module_add(l: *Loader, fqn: intern.StrId) res[module.ModuleId, fail.Fail] {
     val added: res[module.ModuleId, fail.Fail] = l.host.add(l.host.ctx, fqn, sid_r.ok);
     if (sel added.err) { ret added; }
     val mid: module.ModuleId = added.ok;
-    if (module.index(mid)::usize != l.states.len) {
+    if (module.index(mid)::usize != l.states.len || l.held.len != l.states.len) {
         ret res[module.ModuleId, fail.Fail].err{fail.message("the load host numbered a module out of order")};
     }
+    val slot:  *Module             = row(l, mid).load;
+    val holds: res[usize, A.Error] = collections_vector.push[Held](?l.held, Held{load: slot, entry: 0, a: nil, source: nil, known: false});
+    if (sel holds.err) { ret res[module.ModuleId, fail.Fail].err{fail.refused(holds.err)}; }
     # a module first reached from an artifact this target does not build belongs to that
     # artifact's target, not this one
-    val slot: *Module = module_at(l, mid);
     handed = true;
     @slot  = Module{
         status:   lang_phase.accepted(), home: origin.home, artifact: l.artifact, gated: l.foreign, outcome: comptime_gate.GATE_ACTIVE,
@@ -442,7 +507,7 @@ fun module_add(l: *Loader, fqn: intern.StrId) res[module.ModuleId, fail.Fail] {
         reached:  nil, reach_count: 0,
         deps:     collections_vector.init[module.StableModuleId](l.alloc), consts: collections_vector.init[Const](l.alloc),
         bindings: collections_vector.init[Binding](l.alloc),
-        binders:  DemandIndex{names: map.init[u64, u32](l.alloc), chains: collections_vector.init[u32](l.alloc), indexed: false}
+        binders:  DemandIndex{names: map.init[u64, u32](l.alloc), uses: map.init[u64, u32](l.alloc), chains: collections_vector.init[u32](l.alloc), indexed: false}
     };
     val pushed: res[usize, A.Error] = collections_vector.push[State](?l.states, STATE_LOADING);
     if (sel pushed.err) { ret res[module.ModuleId, fail.Fail].err{fail.refused(pushed.err)}; }
@@ -517,6 +582,7 @@ fun rewalk_under_tuples(l: *Loader, mid: module.ModuleId, gained: *bool) err[fai
 
 # parse the module `fqn` names without walking it, as a root a later phase reads alone
 pub fun module_open(l: *Loader, fqn: intern.StrId) res[module.ModuleId, fail.Fail] {
+    entry_open(l);
     val existing: opt[module.ModuleId] = module_find(l, fqn);
     if (sel existing.some) { ret res[module.ModuleId, fail.Fail].ok{existing.some}; }
     val added: res[module.ModuleId, fail.Fail] = module_add(l, fqn);
@@ -530,6 +596,11 @@ pub fun module_open(l: *Loader, fqn: intern.StrId) res[module.ModuleId, fail.Fai
 # load the module `fqn` names and everything it reaches: each is parsed, its gates decided and
 # its imports loaded first, then handed to the host as done
 pub fun module_load(l: *Loader, fqn: intern.StrId) res[module.ModuleId, fail.Fail] {
+    entry_open(l);
+    ret load_module(l, fqn);
+}
+
+fun load_module(l: *Loader, fqn: intern.StrId) res[module.ModuleId, fail.Fail] {
     val existing: opt[module.ModuleId] = module_find(l, fqn);
     if (sel existing.some) {
         val mid:      module.ModuleId       = existing.some;
@@ -586,6 +657,7 @@ pub fun module_load(l: *Loader, fqn: intern.StrId) res[module.ModuleId, fail.Fai
 # ret: ok(true) when the surface is unchanged; ok(false) when the caller must reload; or the
 #      parse or walk failure
 pub fun module_reload(l: *Loader, mid: module.ModuleId) res[bool, fail.Fail] {
+    entry_open(l);
     val m:           *Module                   = module_at(l, mid);
     val fqn:         intern.StrId              = fqn_of(l, mid);
     val old_modules: u32                       = module_count(l);
@@ -682,9 +754,8 @@ fun same_consts(a: *collections_vector.Vector[Const], b: *collections_vector.Vec
 }
 
 fun walk_module_for_load(l: *Loader, mid: module.ModuleId) res[comptime_gate.GateOutcome, fail.Fail] {
-    val acquired: err[fail.Fail] = syntax_refresh(l, mid, 0);
-    if (sel acquired.err) { ret res[comptime_gate.GateOutcome, fail.Fail].err{acquired.err}; }
-    val a:     *ast.Ast                = syntax_of(l, mid);
+    val a: *ast.Ast = syntax_of(l, mid);
+    if (a == nil) { ret res[comptime_gate.GateOutcome, fail.Fail].err{fail.message("the load walk reached a module with no syntax")}; }
     val m_opt: opt[*ast_module.Module] = ast.get_module(a, a.root_module);
     if (sel m_opt.none) { ret res[comptime_gate.GateOutcome, fail.Fail].err{fail.message("module root not set on Ast")}; }
     val mod_node: *ast_module.Module = m_opt.some;
@@ -692,30 +763,13 @@ fun walk_module_for_load(l: *Loader, mid: module.ModuleId) res[comptime_gate.Gat
 }
 
 fun walk_decl_list_for_load(l: *Loader, mid: module.ModuleId, start: u32, len: u32) res[comptime_gate.GateOutcome, fail.Fail] {
-    val refreshed: err[fail.Fail] = syntax_refresh(l, mid, 0);
-    if (sel refreshed.err) { ret res[comptime_gate.GateOutcome, fail.Fail].err{refreshed.err}; }
-    val a:           *ast.Ast = syntax_of(l, mid);
-    val incarnation: u64      = a.incarnation;
+    val a: *ast.Ast = syntax_of(l, mid);
     if (start::usize > a.decl_ids.len || len::usize > a.decl_ids.len - start::usize) {
         ret res[comptime_gate.GateOutcome, fail.Fail].err{fail.message("load declaration list exceeds its parsed owner")};
     }
-    var work: collections_vector.Vector[ast_id.DeclId] = collections_vector.init[ast_id.DeclId](l.alloc);
-    fin { collections_vector.dnit[ast_id.DeclId](?work); }
-    var wi: u32 = 0;
-    for (wi < len) {
-        val saved: res[usize, A.Error] = collections_vector.push[ast_id.DeclId](?work, a.decl_ids.data[start + wi]);
-        if (sel saved.err) { ret res[comptime_gate.GateOutcome, fail.Fail].err{fail.refused(saved.err)}; }
-        wi = wi + 1;
-    }
-    var sequence: u64 = epoch(l);
-    var i:        u32 = 0;
+    var i: u32 = 0;
     for (i < len) {
-        if (epoch(l) != sequence) {
-            val current: err[fail.Fail] = syntax_refresh(l, mid, incarnation);
-            if (sel current.err) { ret res[comptime_gate.GateOutcome, fail.Fail].err{current.err}; }
-            sequence = epoch(l);
-        }
-        val r: res[comptime_gate.GateOutcome, fail.Fail] = walk_one_decl_for_load(l, mid, work.data[i]);
+        val r: res[comptime_gate.GateOutcome, fail.Fail] = walk_one_decl_for_load(l, mid, a.decl_ids.data[start + i]);
         if (sel r.err)                         { ret r; }
         if (r.ok != comptime_gate.GATE_ACTIVE) { ret r; }
         i = i + 1;
@@ -874,16 +928,9 @@ fun walk_comptime_if_union(l: *Loader, mid: module.ModuleId, did: ast_id.DeclId,
         ret res[comptime_gate.GateOutcome, fail.Fail].ok{refused};
     }
 
-    val incarnation: u64 = syntax_of(l, mid).incarnation;
-    var sequence:    u64 = epoch(l);
-    var bi:          u32 = 0;
+    var bi: u32 = 0;
     for (bi < n) {
         if (taken[bi] || bi == built_arm) {
-            if (epoch(l) != sequence) {
-                val current: err[fail.Fail] = syntax_refresh(l, mid, incarnation);
-                if (sel current.err) { ret res[comptime_gate.GateOutcome, fail.Fail].err{current.err}; }
-                sequence = epoch(l);
-            }
             var frame: u32 = FRAME_BUILD;
             if (bi != built_arm) { frame = first_tuple_of(?coverage[bi::usize * tuple_count], l.tuple_count); }
             val br:           *ast_decl.ComptimeBranch = ?syntax_of(l, mid).comptime_branches.data[ci.branches_start + bi];
@@ -1333,11 +1380,19 @@ fun demand_names(l: *Loader, mid: module.ModuleId, eid: ast_id.ExprId, walk: boo
     var w:      NameWalk             = NameWalk{l: l, source: source_r.ok, a: syntax_of(l, mid), out: ?names};
     val walked: res[bool, fail.Fail] = comptime_gate.gate_walk[NameWalk](w.a, w.source, ?w, name_walk_node, name_walk_expression, eid);
     if (sel walked.err) { ret res[Verdict, fail.Fail].err{refuse_expr(l, mid, eid, walked.err)}; }
+    # a name the expression repeats is demanded once: its first demand left every walk it needs
+    # done, so a second finds what the first did
+    var seen: map.Map[u64, u8] = map.init[u64, u8](l.alloc);
+    fin { map.dnit[u64, u8](?seen); }
     var i: usize = 0;
     for (i < names.len) {
         val r: NameRef = names.data[i];
         val m: *Module = module_at(l, mid);
         i = i + 1;
+        val pair:  u64                = (intern.str_index(r.name)::u64 << 32) | intern.str_index(r.member)::u64;
+        val fresh: res[bool, A.Error] = map.insert[u64, u8](?seen, pair, 0);
+        if (sel fresh.err) { ret res[Verdict, fail.Fail].err{fail.refused(fresh.err)}; }
+        if (!fresh.ok) { cnt; }
         var v:     Verdict                        = verdict(VERDICT_BOUND);
         val bound: opt[comptime_scope.NamedConst] = comptime_scope.lookup(frame_ctx(m), r.name);
         if (intern.str_is_nil(r.member)) {
@@ -1470,6 +1525,7 @@ fun demand_index(l: *Loader, mid: module.ModuleId, source: str) err[fail.Fail] {
     val listed: err[fail.Fail] = demand_index_list(l, ?m.binders, a, source, m_opt.some.decls_start, m_opt.some.decls_len);
     if (sel listed.err) {
         map.clear[u64, u32](?m.binders.names);
+        map.clear[u64, u32](?m.binders.uses);
         collections_vector.clear[u32](?m.binders.chains);
         ret listed;
     }
@@ -1500,6 +1556,10 @@ fun demand_index_list(l: *Loader, ix: *DemandIndex, a: *ast.Ast, source: str, st
             if (!map.contains[u64, u32](?ix.names, ?key)) {
                 val added: res[bool, A.Error] = map.insert[u64, u32](?ix.names, key, at);
                 if (sel added.err) { ret err[fail.Fail].err{fail.refused(added.err)}; }
+            }
+            if (d.kind == ast_decl.DECL_KIND_USE && !map.contains[u64, u32](?ix.uses, ?key)) {
+                val used: res[bool, A.Error] = map.insert[u64, u32](?ix.uses, key, at);
+                if (sel used.err) { ret err[fail.Fail].err{fail.refused(used.err)}; }
             }
         }
         if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
@@ -1898,6 +1958,7 @@ fun walked_drop(a: *A.Allocator, m: *Module) {
     m.frame_walked = nil;
     m.decl_count   = 0;
     map.clear[u64, u32](?m.binders.names);
+    map.clear[u64, u32](?m.binders.uses);
     collections_vector.clear[u32](?m.binders.chains);
     m.binders.indexed = false;
 }
@@ -1988,7 +2049,7 @@ fun walk_use_for_load(l: *Loader, mid: module.ModuleId, did: ast_id.DeclId, du: 
     }
     val aliased: bool = du.alias.len > 0;
 
-    val dep_r: res[module.ModuleId, fail.Fail] = module_load(l, ut.module_fqn);
+    val dep_r: res[module.ModuleId, fail.Fail] = load_module(l, ut.module_fqn);
     if (sel dep_r.err) { ret err[fail.Fail].err{dep_r.err}; }
     val dep_mid: module.ModuleId = dep_r.ok;
 
@@ -2023,7 +2084,7 @@ fun walk_fwd_for_load(l: *Loader, mid: module.ModuleId, did: ast_id.DeclId, df: 
     }
     val ut: UseTarget = tgt_r.ok;
 
-    val dep_r: res[module.ModuleId, fail.Fail] = module_load(l, ut.module_fqn);
+    val dep_r: res[module.ModuleId, fail.Fail] = load_module(l, ut.module_fqn);
     if (sel dep_r.err) { ret err[fail.Fail].err{dep_r.err}; }
     val dep_mid: module.ModuleId = dep_r.ok;
 
@@ -2070,7 +2131,7 @@ fun use_target(l: *Loader, source: str, path: lang_source.Span) res[UseTarget, f
         ret res[UseTarget, fail.Fail].err{fail.user_of(diagnostic_kind.USE_UNRESOLVED, unresolvable_use_msg(l, source, path, full_id))};
     }
 
-    val names_file: res[bool, fail.Fail] = provider.module_exists(?l.sources, l.alloc, full_id);
+    val names_file: res[bool, fail.Fail] = names_module(l, full_id);
     if (sel names_file.err) { ret res[UseTarget, fail.Fail].err{names_file.err}; }
     if (names_file.ok)      { ret res[UseTarget, fail.Fail].ok{UseTarget{module_fqn: full_id, leaf: leaf, binds_module: true}}; }
 
@@ -2081,7 +2142,7 @@ fun use_target(l: *Loader, source: str, path: lang_source.Span) res[UseTarget, f
         val pid_r: res[intern.StrId, A.Error] = fe_path.intern_path(?l.s.interner, source, prefix);
         if (sel pid_r.err) { ret res[UseTarget, fail.Fail].err{fail.refused(pid_r.err)}; }
         val pid:               intern.StrId         = pid_r.ok;
-        val prefix_names_file: res[bool, fail.Fail] = provider.module_exists(?l.sources, l.alloc, pid);
+        val prefix_names_file: res[bool, fail.Fail] = names_module(l, pid);
         if (sel prefix_names_file.err)      { ret res[UseTarget, fail.Fail].err{prefix_names_file.err}; }
         if (prefix_names_file.ok && direct) { ret res[UseTarget, fail.Fail].ok{UseTarget{module_fqn: pid, leaf: leaf, binds_module: false}}; }
         if (prefix_names_file.ok) {
@@ -2175,27 +2236,30 @@ fun frame_mod_ref(l: *Loader, mid: module.ModuleId, name: intern.StrId) res[opt[
     if (sel source_r.err) { ret res[opt[module.ModuleId], fail.Fail].err{source_r.err}; }
     val text: opt[str] = intern.get(?l.s.interner, name);
     if (sel text.none) { ret res[opt[module.ModuleId], fail.Fail].err{fail.message("module name is not interned")}; }
-    ret mod_ref_in_list(l, mid, m_opt.some.decls_start, m_opt.some.decls_len, source_r.ok, text.some);
+    val indexed: err[fail.Fail] = demand_index(l, mid, source_r.ok);
+    if (sel indexed.err) { ret res[opt[module.ModuleId], fail.Fail].err{indexed.err}; }
+    ret mod_ref_in_list(l, mid, m_opt.some.decls_start, m_opt.some.decls_len, source_r.ok, name, text.some);
 }
 
-fun mod_ref_in_list(l: *Loader, mid: module.ModuleId, start: u32, len: u32, source: str, text: str) res[opt[module.ModuleId], fail.Fail] {
-    val m: *Module  = module_at(l, mid);
-    val a: *ast.Ast = syntax_of(l, mid);
-    var i: u32      = 0;
-    for (i < len) {
-        val did:   ast_id.DeclId       = a.decl_ids.data[start + i];
-        val d_opt: opt[*ast_decl.Decl] = ast.get_decl(a, did);
+# the chains of a list before its first `use` of the name, each of which may bind it in its arm
+# first, then that `use`, found through the module's demand index
+fun mod_ref_in_list(l: *Loader, mid: module.ModuleId, start: u32, len: u32, source: str, name: intern.StrId, text: str) res[opt[module.ModuleId], fail.Fail] {
+    val m:      *Module   = module_at(l, mid);
+    val a:      *ast.Ast  = syntax_of(l, mid);
+    val end:    u32       = start + len;
+    var binder: u32       = end;
+    val key:    u64       = demand_key(start, name);
+    val found:  opt[*u32] = map.get[u64, u32](?m.binders.uses, ?key);
+    if (sel found.some) { binder = @found.some; }
+    var ci: usize = chain_from(?m.binders.chains, start);
+    for (ci < m.binders.chains.len) {
+        val at: u32 = m.binders.chains.data[ci];
+        ci = ci + 1;
+        if (at >= binder) { brk; }
+        val d_opt: opt[*ast_decl.Decl] = ast.get_decl(a, a.decl_ids.data[at]);
         if (sel d_opt.none) { ret res[opt[module.ModuleId], fail.Fail].err{fail.message("DeclId out of range during a module lookup")}; }
         var copied: ast_decl.Decl = @d_opt.some;
-        i = i + 1;
         if (stack.exhausted()) { ret res[opt[module.ModuleId], fail.Fail].err{refuse_nesting(l, mid, copied.span)}; }
-        if (copied.kind == ast_decl.DECL_KIND_USE && use_binds(source, ?copied.data.use_, text)) {
-            val b: opt[*Binding] = binding_for(m, did);
-            if (sel b.some) {
-                if (b.some.kind == BINDING_MODULE) { ret res[opt[module.ModuleId], fail.Fail].ok{opt[module.ModuleId].some{module_of(l, b.some.module)}}; }
-            }
-            ret res[opt[module.ModuleId], fail.Fail].ok{opt[module.ModuleId].none{}};
-        }
         val binds: res[bool, fail.Fail] = chain_may_bind(l, mid, ?copied, source, text, false, false);
         if (sel binds.err) { ret res[opt[module.ModuleId], fail.Fail].err{binds.err}; }
         if (binds.ok) {
@@ -2203,11 +2267,20 @@ fun mod_ref_in_list(l: *Loader, mid: module.ModuleId, start: u32, len: u32, sour
             if (sel arm_r.err) { ret res[opt[module.ModuleId], fail.Fail].err{arm_r.err}; }
             if (arm_r.ok.branch < copied.data.comptime_if.branches_len) {
                 val br:    ast_decl.ComptimeBranch              = a.comptime_branches.data[copied.data.comptime_if.branches_start + arm_r.ok.branch];
-                val found: res[opt[module.ModuleId], fail.Fail] = mod_ref_in_list(l, mid, br.body_start, br.body_len, source, text);
-                if (sel found.err)     { ret found; }
-                if (sel found.ok.some) { ret found; }
+                val inner: res[opt[module.ModuleId], fail.Fail] = mod_ref_in_list(l, mid, br.body_start, br.body_len, source, name, text);
+                if (sel inner.err)     { ret inner; }
+                if (sel inner.ok.some) { ret inner; }
             }
         }
+    }
+    if (binder >= end) { ret res[opt[module.ModuleId], fail.Fail].ok{opt[module.ModuleId].none{}}; }
+    val did:   ast_id.DeclId       = a.decl_ids.data[binder];
+    val d_opt: opt[*ast_decl.Decl] = ast.get_decl(a, did);
+    if (sel d_opt.none) { ret res[opt[module.ModuleId], fail.Fail].err{fail.message("DeclId out of range during a module lookup")}; }
+    if (stack.exhausted()) { ret res[opt[module.ModuleId], fail.Fail].err{refuse_nesting(l, mid, d_opt.some.span)}; }
+    val b: opt[*Binding] = binding_for(m, did);
+    if (sel b.some) {
+        if (b.some.kind == BINDING_MODULE) { ret res[opt[module.ModuleId], fail.Fail].ok{opt[module.ModuleId].some{module_of(l, b.some.module)}}; }
     }
     ret res[opt[module.ModuleId], fail.Fail].ok{opt[module.ModuleId].none{}};
 }
@@ -2234,9 +2307,9 @@ fun resolve_module_member_const_load(lc: *LoadMemberCtx, eid: ast_id.ExprId) res
     val obj: *ast_expr.Expr = o_opt.some;
     if (obj.kind != ast_expr.EXPR_KIND_IDENT) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}}; }
 
-    val src_opt: opt[*lang_source.SourceFile] = lang_source.get(l.s.sources, file_of(l, mid));
-    if (sel src_opt.none) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}}; }
-    val source: str = src_opt.some.text;
+    val src_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel src_r.err) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}}; }
+    val source: str = src_r.ok;
 
     val obj_r: res[intern.StrId, A.Error] = intern.range_add(?l.s.interner, source, obj.data.ident.tok.offset, obj.data.ident.tok.len);
     if (sel obj_r.err) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].err{comptime_failure.eval_error(comptime_failure.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, lang_alloc.text(obj_r.err))}; }
@@ -2259,6 +2332,7 @@ fun resolve_module_member_const_load(lc: *LoadMemberCtx, eid: ast_id.ExprId) res
 # records the load's reading of the module's decorator arguments, in the build target's frame the
 # walk bound: the string each argument that takes one evaluates to, and what each `embed` argument names
 pub fun decorators_record(l: *Loader, mid: module.ModuleId) err[fail.Fail] {
+    entry_open(l);
     val m: *Module  = module_at(l, mid);
     val a: *ast.Ast = syntax_of(l, mid);
     if (a == nil) { ret err[fail.Fail].ok{}; }
@@ -2441,9 +2515,9 @@ fun meaning(kind: MeaningKind) Meaning {
 }
 
 fun module_source(l: *Loader, mid: module.ModuleId) res[str, fail.Fail] {
-    val src_opt: opt[*lang_source.SourceFile] = lang_source.get(l.s.sources, file_of(l, mid));
-    if (sel src_opt.none) { ret res[str, fail.Fail].err{fail.message("module file_id not found in SourceMap")}; }
-    ret res[str, fail.Fail].ok{src_opt.some.text};
+    val h: *Held = held_now(l, mid);
+    if (!h.known) { ret res[str, fail.Fail].err{fail.message("module file_id not found in SourceMap")}; }
+    ret res[str, fail.Fail].ok{h.source};
 }
 
 fun declared_value(l: *Loader, mid: module.ModuleId, name: intern.StrId, ty: ast_id.TypeId, value: comptime_value.CTValue) res[comptime_value.CTValue, fail.Fail] {
@@ -2573,14 +2647,14 @@ fun qualifier_module(l: *Loader, mid: module.ModuleId, source: str, prefix: lang
 # read in the arm its chain selects: decided now in the module being walked (`local`), or from
 # the states its walk left in a module already loaded, where an undecided chain binds nothing
 fun module_meaning(l: *Loader, mid: module.ModuleId, name: intern.StrId, local: bool) res[Meaning, fail.Fail] {
-    val acquired: err[fail.Fail] = syntax_refresh(l, mid, 0);
-    if (sel acquired.err) { ret res[Meaning, fail.Fail].err{acquired.err}; }
+    val a: *ast.Ast = syntax_of(l, mid);
+    if (a == nil) { ret res[Meaning, fail.Fail].err{fail.message("a def chain reached a module with no syntax")}; }
     val m:        *Module             = module_at(l, mid);
     val source_r: res[str, fail.Fail] = module_source(l, mid);
     if (sel source_r.err) { ret res[Meaning, fail.Fail].err{source_r.err}; }
     val text: opt[str] = intern.get(?l.s.interner, name);
     if (sel text.none) { ret res[Meaning, fail.Fail].err{fail.message("def chain name is not interned")}; }
-    val m_opt: opt[*ast_module.Module] = ast.get_module(syntax_of(l, mid), syntax_of(l, mid).root_module);
+    val m_opt: opt[*ast_module.Module] = ast.get_module(a, a.root_module);
     if (sel m_opt.none) { ret res[Meaning, fail.Fail].err{fail.message("module root not set on Ast")}; }
     val saved_frame: u32 = m.frame;
     if (!local) { m.frame = FRAME_BUILD; }

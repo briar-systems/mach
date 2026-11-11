@@ -106,24 +106,60 @@ fun packages_set(p: *project.Project) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
-# the project's loader, pointed at the project where it is now: the project is a value its
-# callers move, so what the loader holds of it is bound again before each use
-fun loader_of(p: *project.Project) res[*fe_load.Loader, fail.Fail] {
+# one entry of the load, run in one query operation, which the walk's parses and every syntax it
+# reads belong to; a parse that fails in it is the root whose diagnostics the entry presents
+# ---
+# p:         the project
+# operation: the operation the entry runs in
+# failed:    the parse of each module whose parse failed in the entry
+rec Walk {
+    p:         *project.Project;
+    operation: query.Operation;
+    failed:    collections_vector.Vector[query.QueryKey];
+}
+
+fun walk_init(p: *project.Project) Walk {
+    ret Walk{p: p, operation: query.Operation{}, failed: collections_vector.init[query.QueryKey](p.alloc)};
+}
+
+fun walk_dnit(w: *Walk) {
+    collections_vector.dnit[query.QueryKey](?w.failed);
+}
+
+# the project's loader, pointed at the project where it is now and run for `w`: the project is a
+# value its callers move, so what the loader holds of it is bound again before each use
+fun loader_of(w: *Walk) res[*fe_load.Loader, fail.Fail] {
+    val p: *project.Project = w.p;
     if (p.disk.packages.len == 0) {
         val placed: err[fail.Fail] = packages_set(p);
         if (sel placed.err) { ret res[*fe_load.Loader, fail.Fail].err{placed.err}; }
     }
     p.overlay = overlay.init(disk.provider_of(?p.disk), ?p.s.overlays);
     val host: fe_load.Host = fe_load.Host{
-        ctx:     p::ptr, add: host_add, row: host_row, syntax: host_syntax, parse: host_parse,
-        refresh: host_refresh, epoch: host_epoch, context: host_context, done: host_done
+        ctx:     w::ptr, add: host_add, row: host_row, syntax: host_syntax, parse: host_parse,
+        context: host_context, done: host_done
     };
     fe_load.bind(?p.loader, host, overlay.provider_of(?p.overlay), ?p.diags);
     ret res[*fe_load.Loader, fail.Fail].ok{?p.loader};
 }
 
+# open the operation an entry runs in, with the loader bound to it
+fun walk_begin(w: *Walk) res[*fe_load.Loader, fail.Fail] {
+    val l: res[*fe_load.Loader, fail.Fail] = loader_of(w);
+    if (sel l.err) { ret l; }
+    val begun: res[query.Operation, fail.Fail] = frontend.begin_query_phase(w.p);
+    if (sel begun.err) { ret res[*fe_load.Loader, fail.Fail].err{begun.err}; }
+    w.operation = begun.ok;
+    ret l;
+}
+
+# close an entry's operation and show what it collected
+fun walk_end(w: *Walk, result: err[fail.Fail]) err[fail.Fail] {
+    ret frontend.finish_query_phase(w.p, w.operation, w.failed.data, w.failed.len, result);
+}
+
 fun host_add(ctx: ptr, fqn: intern.StrId, sid: module.StableModuleId) res[module.ModuleId, fail.Fail] {
-    val p:    *project.Project = ctx::*project.Project;
+    val p:    *project.Project = (ctx::*Walk).p;
     val slot: err[fail.Fail]   = project.module_reserve(p);
     if (sel slot.err) { ret res[module.ModuleId, fail.Fail].err{slot.err}; }
     var m: project.ModuleEntry;
@@ -155,62 +191,68 @@ fun host_add(ctx: ptr, fqn: intern.StrId, sid: module.StableModuleId) res[module
 }
 
 fun host_row(ctx: ptr, mid: module.ModuleId) fe_load.Row {
-    val p: *project.Project     = ctx::*project.Project;
-    val m: *project.ModuleEntry = project.module_at(p, mid::u32);
+    val m: *project.ModuleEntry = project.module_at((ctx::*Walk).p, mid::u32);
     ret fe_load.Row{name: m.fqn, stable: m.stable_id, file: m.file_id, load: ?m.load};
 }
 
 fun host_syntax(ctx: ptr, mid: module.ModuleId) *ast.Ast {
-    val p: *project.Project = ctx::*project.Project;
+    val p: *project.Project = (ctx::*Walk).p;
     ret frontend.syntax(p, project.module_at(p, mid::u32));
 }
 
+# a module's parse in the entry's operation; a failed one is kept as a root the entry presents
 fun host_parse(ctx: ptr, mid: module.ModuleId, file: lang_source.FileId, reported: bool) err[fail.Fail] {
-    val p:      *project.Project     = ctx::*project.Project;
+    val w:      *Walk                = ctx::*Walk;
+    val p:      *project.Project     = w.p;
     val t_load: readout.Instant      = readout.item_begin(p.progress);
     val m:      *project.ModuleEntry = project.module_at(p, mid::u32);
     m.file_id = file;
-    val acquired: err[fail.Fail] = acquire_load_view(p, mid, 0);
-    if (sel acquired.err) { ret acquired; }
-    if (reported)         { readout.item(p.progress, readout.LOAD, intern.text(?p.s.interner, m.fqn), t_load); }
+    val acquired: res[frontend.ParsedModule, fail.Fail] = acquire_parse_view(p, mid);
+    if (sel acquired.err) {
+        val kept: res[usize, A.Error] = collections_vector.push[query.QueryKey](?w.failed, query.QueryKey{kind: ?frontend.PARSE, key: lang_source.file_index(file)::u64});
+        if (sel kept.err) {
+            diagnostic.note_lost(?p.diags);
+            diagnostic.note_lost(?p.s.diags);
+        }
+        ret err[fail.Fail].err{acquired.err};
+    }
+    if (reported) { readout.item(p.progress, readout.LOAD, intern.text(?p.s.interner, m.fqn), t_load); }
     ret err[fail.Fail].ok{};
 }
 
-fun host_refresh(ctx: ptr, mid: module.ModuleId, incarnation: u64) err[fail.Fail] {
-    ret acquire_load_view(ctx::*project.Project, mid, incarnation);
-}
-
-fun host_epoch(ctx: ptr) u64 {
-    ret (ctx::*project.Project).s.queries.operation_sequence;
-}
-
 fun host_context(ctx: ptr, artifact: intern.StrId) res[comptime_scope.ComptimeCtx, fail.Fail] {
-    ret artifact_context(ctx::*project.Project, artifact);
+    ret artifact_context((ctx::*Walk).p, artifact);
 }
 
 fun host_done(ctx: ptr, mid: module.ModuleId) err[fail.Fail] {
-    ret topo_push(ctx::*project.Project, mid);
+    ret topo_push((ctx::*Walk).p, mid);
 }
 
 # load the module `fqn` names and everything it reaches
 pub fun module_load(p: *project.Project, fqn: intern.StrId) res[module.ModuleId, fail.Fail] {
-    val l: res[*fe_load.Loader, fail.Fail] = loader_of(p);
+    var w: Walk = walk_init(p);
+    fin { walk_dnit(?w); }
+    val l: res[*fe_load.Loader, fail.Fail] = walk_begin(?w);
     if (sel l.err) { ret res[module.ModuleId, fail.Fail].err{l.err}; }
     val loaded: res[module.ModuleId, fail.Fail] = fe_load.module_load(l.ok, fqn);
-    val shown:  err[fail.Fail]                  = frontend.show_query_phase(p, err[fail.Fail].ok{});
-    if (sel loaded.err) { ret loaded; }
-    if (sel shown.err)  { ret res[module.ModuleId, fail.Fail].err{shown.err}; }
+    var result: err[fail.Fail]                  = err[fail.Fail].ok{};
+    if (sel loaded.err) { result = err[fail.Fail].err{loaded.err}; }
+    val shown: err[fail.Fail] = walk_end(?w, result);
+    if (sel shown.err) { ret res[module.ModuleId, fail.Fail].err{shown.err}; }
     ret loaded;
 }
 
 # parse the module `fqn` names as a root, without walking it
 pub fun module_open(p: *project.Project, fqn: intern.StrId) res[module.ModuleId, fail.Fail] {
-    val l: res[*fe_load.Loader, fail.Fail] = loader_of(p);
+    var w: Walk = walk_init(p);
+    fin { walk_dnit(?w); }
+    val l: res[*fe_load.Loader, fail.Fail] = walk_begin(?w);
     if (sel l.err) { ret res[module.ModuleId, fail.Fail].err{l.err}; }
     val opened: res[module.ModuleId, fail.Fail] = fe_load.module_open(l.ok, fqn);
-    val shown:  err[fail.Fail]                  = frontend.show_query_phase(p, err[fail.Fail].ok{});
-    if (sel opened.err) { ret opened; }
-    if (sel shown.err)  { ret res[module.ModuleId, fail.Fail].err{shown.err}; }
+    var result: err[fail.Fail]                  = err[fail.Fail].ok{};
+    if (sel opened.err) { result = err[fail.Fail].err{opened.err}; }
+    val shown: err[fail.Fail] = walk_end(?w, result);
+    if (sel shown.err) { ret res[module.ModuleId, fail.Fail].err{shown.err}; }
     ret opened;
 }
 
@@ -225,7 +267,9 @@ pub fun module_unread(p: *project.Project, fqn: intern.StrId) bool {
 # survived, so the project's other modules stand as they are; every product the project holds of
 # the module is dropped, since each is keyed by the old syntax tree
 pub fun module_reload(p: *project.Project, mid: module.ModuleId) res[bool, fail.Fail] {
-    val l: res[*fe_load.Loader, fail.Fail] = loader_of(p);
+    var w: Walk = walk_init(p);
+    fin { walk_dnit(?w); }
+    val l: res[*fe_load.Loader, fail.Fail] = walk_begin(?w);
     if (sel l.err) { ret res[bool, fail.Fail].err{l.err}; }
     val m: *project.ModuleEntry = project.module_at(p, mid::u32);
     project.lower_scope_drop(m);
@@ -243,18 +287,22 @@ pub fun module_reload(p: *project.Project, mid: module.ModuleId) res[bool, fail.
     m.test.staged        = nil;
     m.test.cache_checked = false;
     m.test.cache_hit     = false;
-    val kept:  res[bool, fail.Fail] = fe_load.module_reload(l.ok, mid);
-    val shown: err[fail.Fail]       = frontend.show_query_phase(p, err[fail.Fail].ok{});
-    if (sel kept.err)  { ret kept; }
+    val kept:   res[bool, fail.Fail] = fe_load.module_reload(l.ok, mid);
+    var result: err[fail.Fail]       = err[fail.Fail].ok{};
+    if (sel kept.err) { result = err[fail.Fail].err{kept.err}; }
+    val shown: err[fail.Fail] = walk_end(?w, result);
     if (sel shown.err) { ret res[bool, fail.Fail].err{shown.err}; }
     ret kept;
 }
 
-# record the strings a module's decorator arguments evaluate to
+# record the strings a module's decorator arguments evaluate to, from the syntax the project's
+# operations last published
 pub fun decorators_record(p: *project.Project, mid: module.ModuleId) err[fail.Fail] {
-    val l: res[*fe_load.Loader, fail.Fail] = loader_of(p);
+    var w: Walk = walk_init(p);
+    fin { walk_dnit(?w); }
+    val l: res[*fe_load.Loader, fail.Fail] = loader_of(?w);
     if (sel l.err) { ret err[fail.Fail].err{l.err}; }
-    ret frontend.show_query_phase(p, fe_load.decorators_record(l.ok, mid));
+    ret fe_load.decorators_record(l.ok, mid);
 }
 
 # a module's parse in the open operation; a parse that published nothing is the load's
@@ -268,26 +316,6 @@ fun acquire_parse_view(p: *project.Project, mid: module.ModuleId) res[frontend.P
         or                        { lang_phase.internal(?m.load.status, fail.describe(failure)); }
     }
     ret acquired;
-}
-
-fun acquire_load_view(p: *project.Project, mid: module.ModuleId, incarnation: u64) err[fail.Fail] {
-    val begun: res[query.Operation, fail.Fail] = frontend.begin_query_phase(p);
-    if (sel begun.err) { ret err[fail.Fail].err{begun.err}; }
-    val operation: query.Operation                       = begun.ok;
-    var result:    err[fail.Fail]                        = err[fail.Fail].ok{};
-    val acquired:  res[frontend.ParsedModule, fail.Fail] = acquire_parse_view(p, mid);
-    if (sel acquired.err) { result = err[fail.Fail].err{acquired.err}; }
-    if (sel acquired.ok) {
-        if (incarnation != 0 && acquired.ok.a.incarnation != incarnation) {
-            result = err[fail.Fail].err{fail.message("module syntax changed during dependency discovery")};
-        }
-    }
-    var root:  query.QueryKey = query.QueryKey{kind: ?frontend.PARSE, key: lang_source.file_index(project.module_at(p, mid::u32).file_id)::u64};
-    var count: usize          = 0;
-    if (sel result.err) { count = 1; }
-    val finished: err[fail.Fail] = frontend.close_query_phase(p, operation, ?root, count, result);
-    if (sel finished.err) { ret err[fail.Fail].err{finished.err}; }
-    ret err[fail.Fail].ok{};
 }
 
 pub fun rebuild_topo(p: *project.Project, emit_roots: *module.ModuleId, emit_root_count: u32) err[fail.Fail] {
