@@ -3067,6 +3067,14 @@ pub val ASM_HEAD:         Kind = 518
 pub val ASM_HEAD_RENAMED: Kind = 519
 ```
 
+## val SECRET_TARGET_UNGUARANTEED
+
+```mach
+pub val SECRET_TARGET_UNGUARANTEED: Kind = 520
+```
+
+a hard constant-time function on a target that does not guarantee the timing its code needs
+
 ## rec Spec
 
 ```mach
@@ -3084,7 +3092,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 519
+pub val COUNT: usize       = 520
 ```
 
 ## fun at
