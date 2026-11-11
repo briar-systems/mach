@@ -425,8 +425,7 @@ declares or overrides a timing mode. On aarch64 the condition is PSTATE.DIT, whi
 `hard` one requires in the target's baseline
 ([secrecy.md](secrecy.md#soft-and-hard)); a manifest cannot assert it. On x86-64 the multiply rows hold unconditionally
 on Intel and AMD, so nothing is there to declare, and Intel's DOITM is a kernel-owned
-model-specific register that hardens memory-side predictors rather than the
-multiplier, so mach offers no key for it either. The rows, their conditions and
+model-specific register user space cannot set, so mach offers no key for it either. The rows, their conditions and
 the DOITM note are in
 [secrecy.md](secrecy.md#constant-time-multiply-by-instruction-set).
 

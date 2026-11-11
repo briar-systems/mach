@@ -911,8 +911,9 @@ a thread entry point whose register state at entry *is* the interface.
   arguments arrive in the ABI's registers and the body reads them there.
 - **Mutually exclusive with `inline("always")`** — there is no coherent winner
   between a body spliced into a caller and one that owns its own frame — and
-  with `constant_time`, which already forbids inline asm because a type system
-  cannot check it. Both combinations are rejected in sema. `inline("never")` is
+  with `constant_time`, since the compiler builds a constant-time function's
+  entry and returns, where it switches the timing mode, and a naked body writes
+  its own. Both combinations are rejected in sema. `inline("never")` is
   redundant: the inliner declines a naked function unconditionally.
 - **Debug info carries no `DW_AT_frame_base`** for a naked subprogram. Every
   other function has a frame base the compiler established and can name; this

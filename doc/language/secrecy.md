@@ -615,13 +615,6 @@ fun ct_select(mask: ^u32, a: ^u32, b: ^u32) ^u32 {
 }
 ```
 
-A **translation validator** re-derives the taint over the lowered,
-target-independent MIR as a monotone dataflow fixpoint and independently
-re-checks the leakage conditions, so a secret reaching a branch condition, a
-memory address, or a forbidden variable-latency op is a compile error naming the
-function and the offending operation. It is a backstop behind the compile-time
-gates, not a replacement for them.
-
 ## The zeroizing-write guarantee
 
 [`$zeroize(p, count)`](comptime-intrinsics.md) is the operation that holds this
@@ -675,15 +668,14 @@ it.
 **Today the guarantee holds trivially.** mach has no dead-store elimination, so
 nothing removes a store: an entirely dead fill of a *public* local also survives at
 release. The guarantee becomes load-bearing only if such a pass is added, and the
-taint is what would hold that pass to it. `mach.lang.driver:secret_store_taint_survives_lower`
-pins the taint.
+taint is what would hold that pass to it.
 
 What a target offers is read at the `#[constant_time]` mark from masc's instruction
 set for the target's architecture, which says whether its rows classify their
 timing, whether it cannot guarantee timing at all, or whether it classifies none:
 
-- **Its rows classify their timing** (x86_64, riscv64, riscv32): the walk below
-  validates the function.
+- **Its rows classify their timing** (x86_64, aarch64, riscv64, riscv32): masc's
+  walk of the encoded code validates the function.
 - **It cannot guarantee timing** (wasm, whose runtime decides the instructions that
   execute): the function compiles, with the warning `secret.target_unenforceable`
   at the mark that the target cannot practically enforce constant-time execution.
@@ -692,8 +684,6 @@ timing, whether it cannot guarantee timing at all, or whether it classifies none
   that translation nor the device's timing behaviour is covered by the leakage
   model. Compile constant-time code for a machine target and pass such a target
   only public data.
-
-masc registers no aarch64 set yet, so aarch64 keeps mach's own walk until it does.
 
 ## Constant-time multiply by instruction set
 
@@ -802,13 +792,14 @@ instruction set's registration, and the kind of each claim is marked:
   machine the binary runs on. riscv32 declares no rows yet.
 - **SPIR-V** has no timing model and declares nothing.
 
-**DOITM is not a multiply condition.** Intel's Data Operand Independent Timing
-Mode (`IA32_UARCH_MISC_CTL[0]`) hardens the data dependent prefetcher and the
-fast store forwarding predictor, memory-side predictors keyed on data values;
-it does not touch the multiplier, which is why the x86-64 rows hold without it.
-It is a model-specific register the kernel owns, user space cannot set
-it, and Linux does not enable it by default, so mach neither declares it nor
-offers a manifest key for it. A program that wants that hardening asks the
+**DOITM.** masc's x86-64 rows state the timing Intel lists under its Data
+Operand Independent Timing Mode (`IA32_UARCH_MISC_CTL[0]`), and mirl checks
+every x86-64 constant-time function under that mode. It is a model-specific
+register the kernel owns and user space cannot set, so mach neither switches it
+nor offers a manifest key for it. Intel states that a processor which does not
+enumerate DOITM behaves as if it were on for the listed instructions. On one
+that enumerates it and runs with it off, the code still runs, and the listed
+instructions' timing is not promised. A program that wants the mode asks the
 operator for the kernel control, the same class as SMT and other side-channel
 mitigations.
 
@@ -851,31 +842,30 @@ feature:
 
 Nothing is linked into the image for either mode: there is no object mark, no
 cell the linker writes and no start code that reads one, and a program never
-refuses to start for want of the mode. std keeps a manual DIT API (enable,
-disable, and run a function with the mode on) for code that holds the mode by
-hand, and `timing.mode()` answers what the hardware offers.
+refuses to start for want of the mode. For code that holds the mode by hand,
+std keeps a manual DIT API: `std.system.dit.enable`, `disable` and `read` on
+aarch64, and `std.crypto.ct.begin`, which turns the mode on for the calling
+thread where the processor has it. `std.system.timing.mode()` answers what the
+hardware offers.
 
-The facts below are what each operating system declares about the mode, which
-std's availability byte reads:
+std's availability byte, `__mach_timing_available`, is set once before `main`
+and before any thread starts, from what the system reports:
 
-**The operating system declares what a process can learn and keep.** Whether a
-process can learn that the processor has the mode, and keep it once set, is the
-operating system's, and each declaration carries its citation beside it:
-
-- **aarch64-linux declares it.** The kernel exposes the processor's FEAT_DIT as
-  `HWCAP_DIT` (`1 << 24`) in `AT_HWCAP` since v4.17 (commit 7206dc93a58f, "arm64:
-  Expose Arm v8.4 features"; `Documentation/arch/arm64/elf_hwcaps.rst`:
-  "Functionality implied by ID_AA64PFR0_EL1.DIT == 0b0001"). PSTATE is saved to
-  `SPSR_EL1` on every exception entry and restored on return, so the bit
-  outlives a context switch.
-- **aarch64-darwin declares it.** Apple's "Writing ARM64 code for Apple
-  platforms", section "Enable DIT for constant-time cryptographic operations",
-  documents the mode as per-thread state user code turns on with `msr dit, #1`
-  and reads back as bit 24 of `mrs dit`, and names the sysctl
-  `hw.optional.arm.FEAT_DIT` as the check for a processor that has it.
-- **aarch64-windows and freestanding aarch64 declare nothing**, so std's byte
-  reads no mode there: a `soft` function runs without it, and a `hard` one
-  builds only where the target's baseline holds DIT.
+- **aarch64-linux** reads `HWCAP_DIT` (`1 << 24`) in `AT_HWCAP`, which the
+  kernel exposes since v4.17 (commit 7206dc93a58f, "arm64: Expose Arm v8.4
+  features"; `Documentation/arch/arm64/elf_hwcaps.rst`: "Functionality implied
+  by ID_AA64PFR0_EL1.DIT == 0b0001"). PSTATE is saved to `SPSR_EL1` on every
+  exception entry and restored on return, so the bit outlives a context switch.
+- **aarch64-darwin** reads the sysctl `hw.optional.arm.FEAT_DIT`. Apple's
+  "Writing ARM64 code for Apple platforms", section "Enable DIT for
+  constant-time cryptographic operations", documents the mode as per-thread
+  state user code turns on with `msr dit, #1` and reads back as bit 24 of
+  `mrs dit`.
+- **freestanding aarch64** reads `ID_AA64PFR0_EL1.DIT` when it runs at EL1, and
+  leaves the byte 0 where it may not ask.
+- **aarch64-windows** leaves the byte 0, so a `soft` function runs without the
+  mode there, and a `hard` one builds only where the target's baseline holds
+  DIT.
 
 ## Padding of secret aggregates
 
@@ -890,122 +880,70 @@ its padding unspecified.
 
 ## Trusted base
 
-The only secret-to-public crossings are the explicit `:>T` cast and inline `asm`
-blocks (which a type system cannot check). Everything else is enforced. A proof
-is always relative to a leakage model. Its fidelity to real silicon is
-empirical.
+The guarantee rests on four parts:
+
+- mach's secrecy check, the flow typing and gates above, which hold for the
+  source,
+- mirl's lowering, which carries each secret through selection, allocation,
+  spilling and framing to the emitted instructions and adds the timing switch
+  of a `soft` function,
+- masc's check of the final program, the walk of each constant-time
+  function's encoded code against the timing class of every row it executes,
+- the hardware timing mode, DIT on aarch64 and DOITM on x86-64, where the rows
+  need it.
+
+The only secret-to-public crossings are the explicit `:>T` cast and inline
+`asm`, which masc's walk validates but a type system cannot check. A proof is
+always relative to a leakage model. Its fidelity to real silicon is empirical.
 
 ## Assurance
 
-The constant-time guarantee is relative to the leakage model stated above and
-to the code-level rules masc's walk checks. It has not been independently audited.
+**The guarantee.** For code marked `#[constant_time]` and compiled for a
+covered target, the emitted machine code's branches and memory addresses never
+depend on secret values, and no instruction whose timing depends on its
+operands receives a secret. masc's walk proves this on the encoded code of each
+such function, after selection, register allocation, spilling and frame
+layout, and a build that cannot prove it is refused.
 
-Secrecy holds for in-bounds accesses only. Indexing past the object a pointer
-addresses, including past a narrowed pointer cast, is outside the guarantee, the
-same as any other out-of-bounds access.
+**Covered targets.** Constant time is a working feature on linux x86-64 and
+linux aarch64. Every other target is experimental, which covers linux riscv64
+and riscv32, darwin x86-64 and aarch64, windows, uefi and every freestanding
+target: the same checks run there, but the targets have not been cross-checked
+to the standard the covered ones have. wasm targets compile a constant-time
+function with the warning `secret.target_unenforceable`, since the runtime
+chooses the instructions that execute, and SPIR-V refuses one under
+`secret.target_unverifiable`.
 
-What holds today: the type system checks that the source respects the leakage
-model, `#[constant_time]` carries the obligation through codegen, and the translation
-validator independently re-checks the lowered MIR. All three are static. Two
-host-executed measurements sit under them, and each only means anything on the
-machine it runs on, which is why both are unit tests rather than build checks.
+**Soft and hard.** A `soft` function switches the hardware timing mode on
+around itself where the processor has it and runs without it where it does
+not. A `hard` function builds only where the target guarantees the timing of
+every instruction it uses, and the refusal, `secret.target_unguaranteed`,
+names the missing feature. Arm promises an instruction's timing only while DIT
+is on, and the linux aarch64
+baseline holds no DIT, so there a `hard` function builds only when the target
+selects `dit` in its `isa` or `ext`, and a `soft` one switches DIT on when the
+processor has it. On linux riscv64 the same holds of Zkt.
+[Soft and hard](#soft-and-hard) has the details.
 
-**The timing harness is a tool, not a gate.** `mach.lang.ct.probe` is a
-dudect-style harness in the tree. `mach test` runs it at deliberately tiny sample
-counts and prints its table. It asserts the harness's structure: every batch it
-was asked for is timed in both classes, and every statistic it reports is a
-finite, non-negative number. It asserts **nothing about the numbers** - not a
-threshold, not positivity - because even "a mean is positive" proved to be a
-property of the host's clock resolution rather than of the harness. **No
-property of a measured time gates anything**, here or anywhere else in the suite.
+**Out of scope.** Cache and power side channels are not covered. Neither is an
+access past the object a pointer addresses, including past a narrowed pointer
+cast: secrecy holds for in-bounds accesses only.
 
-That is deliberate and it is not a gap. A dudect score is a statistic over
-wall-clock time on hardware nobody controls, so any threshold over it has a
-false-failure rate that belongs to the machine rather than to the code. A required
-check that can fail nondeterministically is worse than no check: it teaches a
-reader to re-run a red constant-time result until it turns green. An earlier form
-of this harness did assert on such thresholds, and failed a release gate on
-`x86_64-darwin` and then passed a re-run of the identical commit.
+**The x86-64 caveat.** masc's x86-64 timing rows come from Intel's "Data
+Operand Independent Timing Instructions" list (intel.com developer article
+768547, updated 2026-02-23, 840 entries). A listed instruction's timing is
+independent of its data operands while DOITM is on, and
+[DOITM](#constant-time-multiply-by-instruction-set) says when that holds. AMD
+publishes no equivalent list, so on AMD processors the guarantee rests on
+Intel's list with no statement from AMD behind it.
 
-**So the claims below are measurements, taken deliberately, not properties this
-suite enforces.** Raising the counts in `mach.lang.ct.probe` and reading the
-printed table is how they are re-taken, on a quiet machine, by a person who then
-reads the numbers. Performance and timing work belongs in
-[mach-bench](https://github.com/briar-systems/mach-bench), which is built for it,
-rather than in a correctness suite that must be deterministic.
-
-What such a measurement can establish is bounded. It works by refutation, because
-that is all a timing measurement can do: a clean score is consistent with a leak
-the instrument cannot see, so each mode carries a *planted* leak that must be
-detected and a constant-time reference that must not separate the way the planted
-one does. Read separations between the two class means, never `|t|` -- Welch's
-statistic divides by the sample variance, and concurrent load inflates the variance
-without moving the means, so `|t|` collapses under load while the leak is plainly
-still there. Measured at load average 27, six consecutive runs of one binary gave
-`|t|` between 7.51 and 11.24 against a threshold of 10 while the mean ratio never
-fell below 3.4.
-
-A third probe leaks nothing at all and says whether a run counts at all. Any
-separation *it* shows is the machine rather than the code, so a run in which it is
-not flat has no discriminating power and its verdict means nothing in either
-direction. Note that a flat null is necessary and not sufficient: it must also be
-sampled at a comparable cost to the probe it is bounding, or a quiet control at one
-magnitude certifies nothing about noise at another.
-
-**The x86-64 inline-asm flags table is measured, not inferred.** The twenty-two-row
-classification the `#[constant_time]` asm model rests on, naming which instructions
-*define* ZF and CF, which merely write them, and which read them, is re-derived on x86-64
-hosts by `mach.lang.target.isa.x64.probe`, which runs each instruction twice with
-RFLAGS preset all-set and all-clear and compares what the CPU did against the
-transcription. `defines_flags` is the only fact that clears a taint, so a row that
-drifts from the silicon is a permission rather than a refusal. Three rows are
-exempt and classified by reasoning instead: `popfq`, `iretq` and `syscall` pass the
-writer probe cleanly and are still not definers, because the flags came from the
-stack, the interrupt frame, or an existing value masked through `IA32_FMASK`, and
-where a value came *from* is structural rather than measurable. A non-x86-64 host
-declines the probe by name, and an extension row runs only on a host whose cpuid
-reports the extension.
-
-**What a timing harness can and cannot assure.** The leakage model has three
-channels and no single sampling regime covers them:
-
-| channel | assured by |
-|---|---|
-| control-flow trace | the source-level branch gate; a latency-mode measurement can corroborate |
-| variable-latency operands | the sema/lowering gates; a latency-mode measurement can corroborate |
-| memory-address trace | the source-level **secret-index and secret-address gates**; only an address-mode measurement can corroborate |
-
-The two modes need opposite sampling and neither substitutes for the other. Latency
-mode times a large batch of calls per sample, which is what lifts a running-time
-difference above clock resolution. That same batching *hides* an address-trace leak:
-every call in a batch is handed the same input, so after the first call both input
-classes are reading a warm cache line and the single cache miss carrying the signal
-is averaged away. Measured on one function — a secret-indexed read over a table
-larger than the last-level cache — latency mode scored |t| ≈ 1–15 across runs
-(straddling its own threshold, so it neither confirmed nor denied) while address
-mode, at one call per sample, scored in the hundreds.
-
-Two consequences worth stating plainly:
-
-- A clean latency-mode number for a table lookup is **not** evidence of
-  address-trace safety. It is the wrong instrument for that channel.
-- An address-trace leak is only *measurable* when the table exceeds the
-  last-level cache. A cache-resident table leaks its index just as truly and no
-  timing harness will see it. For small tables the property rests entirely on
-  the secret-index gate and on reading the emitted code.
-
-**Where the check runs.** The constant-time contract is checked at the **IR
-level**: the validator runs over the lowered, target-independent
-MIR before width legalization, instruction selection, register allocation,
-spilling, frame insertion, and encoding, and trusts those stages to be
-timing-preserving. What it refuses, it refuses closed: an operation it does not
-know, an out-of-range register reference, and inline assembly without a
-complete effect declaration are rejected, never defaulted to public. A proof
-over the final allocated machine program — after selection, allocation, spills
-and frame insertion, over physical registers and flags — is not something
-this version claims. Where mach does not own
-the later stages at all — a whole-module emitter such as SPIR-V — the contract
-is refused rather than assumed.
+**Independent checking.** The guarantee calls for two independent analyzers to
+cross-check the emitted binaries, BINSEC's checkct and valgrind's memcheck with
+the secret marked undefined (ctgrind), whose harness is mirl's `test/ct`. For the v7
+toolchain only ctgrind has been run, on linux x86-64, over a binary built from
+std's SHA-256 and `std.crypto.ct` functions with two planted leaks: it reported
+nothing on the constant-time code and flagged the secret branch and the secret
+index. checkct has not been run, and no analyzer has been run on linux aarch64.
 
 ## See also
 

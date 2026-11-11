@@ -93,7 +93,7 @@ pub fun halt() {
 }
 ```
 
-**Constant-time cryptography** (experimental preview). Mark a value [secret](doc/language/secrecy.md) and the compiler refuses to let it steer a branch, an index or a timing. Constant-time code, checked instead of hoped for.
+**Constant-time cryptography** (linux x86-64 and aarch64, experimental on other targets). Mark a value [secret](doc/language/secrecy.md) and the compiler refuses to let it steer a branch, an index or a timing. Constant-time code, checked instead of hoped for.
 
 ```mach
 #[constant_time("hard")]
