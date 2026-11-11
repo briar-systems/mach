@@ -335,6 +335,24 @@ what a finished resolution of module `stable` exports to an importer
 
 alloc: owns the returned symbols, released with the ModuleExports they are in
 
+## fun exports_copy
+
+```mach
+pub fun exports_copy(alloc: *A.Allocator, from: *ModuleExports, path: intern.StrId, stable: module.StableModuleId) res[ModuleExports, fail.Fail];
+```
+
+an importer's own copy of `from`, under the importer's path for it
+
+alloc: owns the copy, released with exports_dnit
+
+## fun exports_dnit
+
+```mach
+pub fun exports_dnit(alloc: *A.Allocator, mx: *ModuleExports);
+```
+
+release what an exports record owns
+
 ## fun deps_of
 
 ```mach

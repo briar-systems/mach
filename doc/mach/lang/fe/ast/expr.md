@@ -354,6 +354,8 @@ pub fun is_range(ix: *ExprIndex) bool;
 pub rec ExprMember;
 ```
 
+`name_id` is `name` as the parse interned it, STR_NIL for a member with no name
+
 ## rec ExprProject
 
 ```mach
@@ -407,6 +409,8 @@ pub val INIT_POSITIONAL: u8 = 2
 ```mach
 pub rec FieldInit;
 ```
+
+`name_id` is `name` as the parse interned it, STR_NIL for a positional element
 
 ## rec ExprStructLit
 

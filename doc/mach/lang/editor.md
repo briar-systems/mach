@@ -48,6 +48,8 @@ diagnostics: the owned store, with related locations, fix edits and lost-diagnos
 sources: the owned source versions every diagnostic location refers to; analysis_source
                   finds one by FileId
 tree: the owned tree of a parse_text result; nil for an analysis of a buffer
+names: the owned interner the names of a parse_text result's tree are ids in; nil for
+                  an analysis of a buffer, whose tree's names are its session's
 
 ## fun analysis_request
 

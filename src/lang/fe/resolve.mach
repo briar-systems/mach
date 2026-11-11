@@ -1,6 +1,8 @@
 use lang_alloc: mach.lang.alloc;
 use T:          std.allocator.testing;
 use std.collections.map;
+use std.collections.natural;
+use std.collections.sort;
 use collections_vector: std.collections.vector;
 use std.memory;
 use std.text.string.str_free;
@@ -152,7 +154,8 @@ fun imported_hash(k: *ImportedKey) u64 {
     var h: u64 = module.stable_index(k.origin)::u64 ^ (intern.str_index(k.canon)::u64 << 32);
     if (k.notice.present) { h = h ^ (lang_source.file_index(k.notice.owner)::u64 * 1099511628211) ^ intern.str_index(k.notice.message)::u64 ^ 1; }
     if (k.testing)        { h = h ^ 0x9e3779b97f4a7c15; }
-    ret h;
+    # the probe reads the low bits, which the origin alone would fill
+    ret natural.hash[u64](?h);
 }
 
 fun imported_equal(x: *ImportedKey, y: *ImportedKey) bool {
@@ -200,6 +203,8 @@ pub rec ModuleExports {
     module:  module.StableModuleId;
     symbols: *PublicSymbol;
     count:   u32;
+    # `(name << 32) | index` of each symbol, ascending, which find_export searches
+    by_name: *u64;
     # the module refused itself, and that refusal is its diagnostic, so a missing name is not one
     refused: bool;
 }
@@ -538,7 +543,50 @@ pub fun result_exports(alloc: *A.Allocator, rr: *ResolveResult, path: intern.Str
     }
     mx.symbols = syms;
     mx.count   = rr.pub_count;
+    val keys: res[*u64, A.Error] = A.allocate[u64](alloc, mx.count::usize);
+    if (sel keys.err) {
+        A.deallocate[PublicSymbol](alloc, syms, mx.count::usize);
+        ret res[ModuleExports, fail.Fail].err{fail.refused(keys.err)};
+    }
+    i = 0;
+    for (i < mx.count) {
+        keys.ok[i] = (intern.str_index(syms[i].name)::u64 << 32) | i::u64;
+        i          = i + 1;
+    }
+    sort.sort[u64](keys.ok, mx.count::usize);
+    mx.by_name = keys.ok;
     ret res[ModuleExports, fail.Fail].ok{mx};
+}
+
+# an importer's own copy of `from`, under the importer's path for it
+# ---
+# alloc: owns the copy, released with exports_dnit
+pub fun exports_copy(alloc: *A.Allocator, from: *ModuleExports, path: intern.StrId, stable: module.StableModuleId) res[ModuleExports, fail.Fail] {
+    var mx: ModuleExports = ModuleExports{path: path, module: stable, refused: from.refused};
+    if (from.count == 0) { ret res[ModuleExports, fail.Fail].ok{mx}; }
+    val syms: res[*PublicSymbol, A.Error] = A.allocate[PublicSymbol](alloc, from.count::usize);
+    if (sel syms.err) { ret res[ModuleExports, fail.Fail].err{fail.refused(syms.err)}; }
+    val keys: res[*u64, A.Error] = A.allocate[u64](alloc, from.count::usize);
+    if (sel keys.err) {
+        A.deallocate[PublicSymbol](alloc, syms.ok, from.count::usize);
+        ret res[ModuleExports, fail.Fail].err{fail.refused(keys.err)};
+    }
+    memory.raw_copy(syms.ok::ptr, from.symbols::ptr, from.count::usize * $size_of(PublicSymbol));
+    memory.raw_copy(keys.ok::ptr, from.by_name::ptr, from.count::usize * $size_of(u64));
+    mx.symbols = syms.ok;
+    mx.by_name = keys.ok;
+    mx.count   = from.count;
+    ret res[ModuleExports, fail.Fail].ok{mx};
+}
+
+# release what an exports record owns
+pub fun exports_dnit(alloc: *A.Allocator, mx: *ModuleExports) {
+    if (mx.count == 0) { ret; }
+    A.deallocate[PublicSymbol](alloc, mx.symbols, mx.count::usize);
+    A.deallocate[u64](alloc, mx.by_name, mx.count::usize);
+    mx.symbols = nil;
+    mx.by_name = nil;
+    mx.count   = 0;
 }
 
 # the exports module `m` of loader `l` reads: each loaded module it imports and every module a
@@ -617,8 +665,7 @@ pub fun deps_of(alloc: *A.Allocator, s: *session.Session, l: *fe_load.Loader, m:
 fun deps_release(alloc: *A.Allocator, deps: *ResolveDeps, cap: u32) {
     var i: u32 = 0;
     for (i < deps.count) {
-        val mx: *ModuleExports = ?deps.entries[i];
-        if (mx.symbols != nil && mx.count > 0) { A.deallocate[PublicSymbol](alloc, mx.symbols, mx.count::usize); }
+        exports_dnit(alloc, ?deps.entries[i]);
         i = i + 1;
     }
     A.deallocate[ModuleExports](alloc, deps.entries, cap::usize);
@@ -631,8 +678,7 @@ pub fun deps_dnit(alloc: *A.Allocator, deps: *ResolveDeps) {
     if (deps.entries == nil) { ret; }
     var i: u32 = 0;
     for (i < deps.count) {
-        val mx: *ModuleExports = ?deps.entries[i];
-        if (mx.symbols != nil && mx.count > 0) { A.deallocate[PublicSymbol](alloc, mx.symbols, mx.count::usize); }
+        exports_dnit(alloc, ?deps.entries[i]);
         i = i + 1;
     }
     A.deallocate[ModuleExports](alloc, deps.entries, deps.count::usize);
@@ -1978,12 +2024,9 @@ fun bind_member_qualified(rc: *ResolveContext, eid: ast_id.ExprId, member: *ast_
         ret err[fail.Fail].ok{};
     }
 
-    val r_leaf: res[intern.StrId, A.Error] = intern.range_add(?rc.s.interner, rc.source, member.name.offset, member.name.len);
-    if (sel r_leaf.err) {
-        lang_phase.internal(?rc.status, lang_alloc.text(r_leaf.err));
-        ret err[fail.Fail].err{fail.refused(r_leaf.err)};
-    }
-    val leaf_id: intern.StrId = r_leaf.ok;
+    # a member with no name was reported by the parse
+    val leaf_id: intern.StrId = member.name_id;
+    if (intern.str_is_nil(leaf_id)) { ret err[fail.Fail].ok{}; }
 
     val ps: *PublicSymbol = find_export(mx, leaf_id);
     if (ps == nil && mx.refused) {
@@ -2035,14 +2078,18 @@ fun resolve_prefix_module(rc: *ResolveContext, prefix: lang_source.Span) *Module
     ret find_module_exports(rc, prefix_id);
 }
 
+# the first symbol `mx` exports under `name`, nil when none
 fun find_export(mx: *ModuleExports, name: intern.StrId) *PublicSymbol {
-    var i: u32 = 0;
-    for (i < mx.count) {
-        val ps: *PublicSymbol = ?mx.symbols[i];
-        if (intern.str_same(ps.name, name)) { ret ps; }
-        i = i + 1;
+    val key:  u64 = intern.str_index(name)::u64 << 32;
+    var low:  u32 = 0;
+    var high: u32 = mx.count;
+    for (low < high) {
+        val mid: u32 = (low + high) >> 1;
+        if (mx.by_name[mid] < key) { low = mid + 1; }
+        or                         { high = mid; }
     }
-    ret nil;
+    if (low >= mx.count || (mx.by_name[low] >> 32) != (key >> 32)) { ret nil; }
+    ret ?mx.symbols[(mx.by_name[low] & 0xFFFFFFFF)::u32];
 }
 
 fun bind_decl_list(rc: *ResolveContext, start: u32, len: u32) err[fail.Fail] {
@@ -2275,12 +2322,7 @@ fun gate_probe_ident_is_comptime_param(rc: *ResolveContext, eid: ast_id.ExprId) 
     val e_opt: opt[*ast_expr.Expr] = ast.get_expr(rc.a, eid);
     if (!sel e_opt.some)                             { ret false; }
     if (e_opt.some.kind != ast_expr.EXPR_KIND_IDENT) { ret false; }
-    val r: res[intern.StrId, A.Error] = intern.range_add(?rc.s.interner, rc.source, e_opt.some.data.ident.tok.offset, e_opt.some.data.ident.tok.len);
-    if (sel r.err) {
-        lang_phase.internal(?rc.status, lang_alloc.text(r.err));
-        ret false;
-    }
-    val sid: SymbolId = scope_lookup_chain(rc, rc.current_scope, r.ok);
+    val sid: SymbolId = scope_lookup_chain(rc, rc.current_scope, e_opt.some.data.ident.name);
     if (symbol_is_nil(sid)) { ret false; }
     val sym: *Symbol = ?rc.symbols[symbol_index(sid)];
     ret sym.kind == SYM_PARAM && (sym.flags & SYM_FLAG_COMPTIME) != 0;
@@ -2290,7 +2332,7 @@ fun gate_probe_ident_is_each_loopvar(rc: *ResolveContext, eid: ast_id.ExprId) bo
     val e_opt: opt[*ast_expr.Expr] = ast.get_expr(rc.a, eid);
     if (!sel e_opt.some)                             { ret false; }
     if (e_opt.some.kind != ast_expr.EXPR_KIND_IDENT) { ret false; }
-    ret ident_is_each_loopvar(rc, e_opt.some.data.ident.tok);
+    ret ident_is_each_loopvar(rc, e_opt.some.data.ident.name);
 }
 
 fun gate_probe_member_is_field_loopvar(rc: *ResolveContext, eid: ast_id.ExprId) bool {
@@ -2905,7 +2947,7 @@ fun bind_expr(rc: *ResolveContext, eid: ast_id.ExprId) err[fail.Fail] {
     if (stack.exhausted()) { ret refuse_nesting(rc, e.span); }
 
     if (e.kind == ast_expr.EXPR_KIND_IDENT) {
-        ret bind_ident(rc, eid, e.data.ident.tok);
+        ret bind_ident(rc, eid, e.data.ident.tok, e.data.ident.name);
     }
     if (e.kind == ast_expr.EXPR_KIND_BINARY) {
         if (intrinsic.is_type_comparison_binary(rc.a, rc.source, ?e.data.binary,
@@ -2992,9 +3034,7 @@ fun bind_expr(rc: *ResolveContext, eid: ast_id.ExprId) err[fail.Fail] {
         for (fi < e.data.struct_lit.fields_len) {
             val finit: *ast_expr.FieldInit = ?rc.a.field_inits.data[e.data.struct_lit.fields_start + fi];
             if (finit.form == ast_expr.INIT_BARE) {
-                val name: res[intern.StrId, A.Error] = intern.range_add(?rc.s.interner, rc.source, finit.name.offset, finit.name.len);
-                if (sel name.err) { ret err[fail.Fail].err{fail.refused(name.err)}; }
-                rc.expr_resolved[ast_id.expr_index(finit.value)] = scope_lookup_chain(rc, rc.current_scope, name.ok);
+                rc.expr_resolved[ast_id.expr_index(finit.value)] = scope_lookup_chain(rc, rc.current_scope, finit.name_id);
             }
             or {
                 val rf: err[fail.Fail] = bind_expr(rc, finit.value);
@@ -3192,14 +3232,8 @@ fun callee_accepts_type_args(rc: *ResolveContext, callee: ast_id.ExprId) bool {
         || kind == SYM_DEF || kind == SYM_GENERIC || kind == SYM_PRIM;
 }
 
-fun bind_ident(rc: *ResolveContext, eid: ast_id.ExprId, span: lang_source.Span) err[fail.Fail] {
-    val r: res[intern.StrId, A.Error] = intern.range_add(?rc.s.interner, rc.source, span.offset, span.len);
-    if (sel r.err) {
-        lang_phase.internal(?rc.status, lang_alloc.text(r.err));
-        ret err[fail.Fail].err{fail.refused(r.err)};
-    }
-    val name: intern.StrId = r.ok;
-    val sid:  SymbolId     = scope_lookup_chain(rc, rc.current_scope, name);
+fun bind_ident(rc: *ResolveContext, eid: ast_id.ExprId, span: lang_source.Span, name: intern.StrId) err[fail.Fail] {
+    val sid: SymbolId = scope_lookup_chain(rc, rc.current_scope, name);
     if (symbol_is_nil(sid)) {
         var mark: SymbolId = SYMBOL_REJECTED;
         if (report_unresolved(rc, span, "unresolved identifier `", name, true)) { mark = SYMBOL_DEFERRED_NAME; }
@@ -3428,14 +3462,8 @@ fun bind_type_name_expr(rc: *ResolveContext, eid: ast_id.ExprId) err[fail.Fail] 
     val e: *ast_expr.Expr = e_opt.some;
 
     if (e.kind == ast_expr.EXPR_KIND_IDENT) {
-        val r: res[intern.StrId, A.Error] = intern.range_add(?rc.s.interner, rc.source, e.data.ident.tok.offset, e.data.ident.tok.len);
-        if (sel r.err) {
-            lang_phase.internal(?rc.status, lang_alloc.text(r.err));
-            ret err[fail.Fail].err{fail.refused(r.err)};
-        }
-        val name: intern.StrId = r.ok;
-
-        val rs: res[TypeSpelling, fail.Fail] = type_spelling(rc, name);
+        val name: intern.StrId                 = e.data.ident.name;
+        val rs:   res[TypeSpelling, fail.Fail] = type_spelling(rc, name);
         if (sel rs.err) {
             lang_phase.internal(?rc.status, fail.describe(rs.err));
             ret err[fail.Fail].err{rs.err};
@@ -3482,24 +3510,14 @@ fun member_object_is_field_loopvar(rc: *ResolveContext, eid: ast_id.ExprId) bool
     if (!sel o_opt.some) { ret false; }
     val oe: *ast_expr.Expr = o_opt.some;
     if (oe.kind != ast_expr.EXPR_KIND_IDENT) { ret false; }
-    val r: res[intern.StrId, A.Error] = intern.range_add(?rc.s.interner, rc.source, oe.data.ident.tok.offset, oe.data.ident.tok.len);
-    if (sel r.err) {
-        lang_phase.internal(?rc.status, lang_alloc.text(r.err));
-        ret false;
-    }
-    val sid: SymbolId = scope_lookup_chain(rc, rc.current_scope, r.ok);
+    val sid: SymbolId = scope_lookup_chain(rc, rc.current_scope, oe.data.ident.name);
     if (symbol_is_nil(sid)) { ret false; }
     val sym: *Symbol = ?rc.symbols[symbol_index(sid)];
     ret sym.kind == SYM_VAL && (sym.flags & SYM_FLAG_COMPTIME) != 0;
 }
 
-fun ident_is_each_loopvar(rc: *ResolveContext, span: lang_source.Span) bool {
-    val r: res[intern.StrId, A.Error] = intern.range_add(?rc.s.interner, rc.source, span.offset, span.len);
-    if (sel r.err) {
-        lang_phase.internal(?rc.status, lang_alloc.text(r.err));
-        ret false;
-    }
-    val sid: SymbolId = scope_lookup_chain(rc, rc.current_scope, r.ok);
+fun ident_is_each_loopvar(rc: *ResolveContext, name: intern.StrId) bool {
+    val sid: SymbolId = scope_lookup_chain(rc, rc.current_scope, name);
     if (symbol_is_nil(sid)) { ret false; }
     val sym: *Symbol = ?rc.symbols[symbol_index(sid)];
     ret sym.kind == SYM_VAL && (sym.flags & SYM_FLAG_COMPTIME) != 0 && ast_id.decl_is_nil(sym.decl);
@@ -3549,32 +3567,29 @@ fun split_case_head(rc: *ResolveContext, tid: ast_id.TypeId) {
     val leaf: lang_source.Span = fe_path.leaf(rc.source, path);
     if (leaf.len == 0) { ret; }
 
-    val sid: SymbolId = path_tail_symbol(rc, pre);
+    val sid: SymbolId = path_tail_symbol(rc, pre, t.data.named.segments);
     if (symbol_is_nil(sid))                            { ret; }
     if (rc.symbols[symbol_index(sid)].kind == SYM_USE) { ret; }
 
     rc.type_heads[ast_id.type_index(tid)] = interpretation.HEAD_CASE;
 }
 
-# the tail symbol of a dotted path, without reporting a name it does not know: SYMBOL_NIL when any
-# segment is unknown, or when a segment cannot be interned, a refusal recorded in the status
-fun path_tail_symbol(rc: *ResolveContext, path: lang_source.Span) SymbolId {
+# the tail symbol of a dotted path whose segment ids start at `segments` in the tree's path names,
+# without reporting a name it does not know: SYMBOL_NIL when any segment is unknown
+fun path_tail_symbol(rc: *ResolveContext, path: lang_source.Span, segments: u32) SymbolId {
     if (path.len == 0) { ret SYMBOL_NIL; }
     var cursor:         usize                 = path.offset;
     val end:            usize                 = path.offset + path.len;
     var current_module: module.StableModuleId = module.STABLE_MODULE_NIL;
     var current_sym:    SymbolId              = SYMBOL_NIL;
     var first:          bool                  = true;
+    var segment:        u32                   = segments;
 
     for (cursor < end) {
         val seg_span: lang_source.Span = fe_path.next(rc.source, path, ?cursor);
         if (seg_span.len == 0) { brk; }
-        val r: res[intern.StrId, A.Error] = intern.range_add(?rc.s.interner, rc.source, seg_span.offset, seg_span.len);
-        if (sel r.err) {
-            lang_phase.internal(?rc.status, fail.describe(fail.refused(r.err)));
-            ret SYMBOL_NIL;
-        }
-        val seg_name: intern.StrId = r.ok;
+        val seg_name: intern.StrId = rc.a.path_names.data[segment];
+        segment = segment + 1;
 
         if (first) {
             current_sym = scope_lookup_chain(rc, rc.current_scope, seg_name);
@@ -3699,17 +3714,13 @@ fun resolve_type_path(rc: *ResolveContext, named: *ast_type.TypeNamed, full: lan
     var current_module: module.StableModuleId = module.STABLE_MODULE_NIL;
     var current_sym:    SymbolId              = SYMBOL_NIL;
     var first:          bool                  = true;
+    var segment:        u32                   = named.segments;
 
     for (cursor < end) {
         val seg_span: lang_source.Span = fe_path.next(rc.source, path, ?cursor);
         if (seg_span.len == 0) { brk; }
-
-        val r: res[intern.StrId, A.Error] = intern.range_add(?rc.s.interner, rc.source, seg_span.offset, seg_span.len);
-        if (sel r.err) {
-            lang_phase.internal(?rc.status, lang_alloc.text(r.err));
-            ret SYMBOL_NIL;
-        }
-        val seg_name: intern.StrId = r.ok;
+        val seg_name: intern.StrId = rc.a.path_names.data[segment];
+        segment = segment + 1;
 
         if (first) {
             val is_single: bool = cursor >= end;

@@ -42,6 +42,9 @@ pub rec ParseFail;
 pub rec Parser;
 ```
 
+names: the interner every name the tree holds an id of is interned in. it outlives the tree
+       and never takes a string back, so each id stays the name's for as long as the tree lives
+
 ## val MAX_NEST_DEPTH
 
 ```mach
@@ -59,7 +62,7 @@ source and the standard library reach 14.
 ## fun make
 
 ```mach
-pub fun make(tokens: *fe_lexer.TokenStream, out: *ast.Ast, diags: *diagnostic.DiagnosticStore) Parser;
+pub fun make(tokens: *fe_lexer.TokenStream, out: *ast.Ast, names: *intern.Interner, diags: *diagnostic.DiagnosticStore) Parser;
 ```
 
 ## fun current
@@ -79,6 +82,14 @@ pub fun peek(p: *Parser, offset: usize) token.Token;
 ```mach
 pub fun advance(p: *Parser) token.Token;
 ```
+
+## fun name_id
+
+```mach
+pub fun name_id(p: *Parser, span: lang_source.Span) intern.StrId;
+```
+
+the id of the name `span` covers; a refused intern is fatal, and its name is STR_NIL
 
 ## fun at
 

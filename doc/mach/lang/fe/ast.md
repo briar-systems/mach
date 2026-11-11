@@ -131,6 +131,14 @@ reached only by mach-lsp
 pub fun add_generic_name(a: *Ast, name: lang_source.Span) res[u32, fail.Fail];
 ```
 
+## fun add_path_name
+
+```mach
+pub fun add_path_name(a: *Ast, name: intern.StrId) res[u32, fail.Fail];
+```
+
+the id of one segment of a named type's path, after the segments before it
+
 ## fun add_decorator
 
 ```mach
