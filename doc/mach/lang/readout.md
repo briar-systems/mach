@@ -108,7 +108,7 @@ the lowered test objects held to mirl's verifier
 pub val PASSES: Phase = 14
 ```
 
-mirl's neutral passes of the schedule, over normal and test objects alike
+mirl's pass schedule, the target's lowering rows and the neutral ones, over normal and test objects alike
 
 ## val SELECT
 

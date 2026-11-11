@@ -53,7 +53,7 @@ first step runs. mirl times its own stages when a readout is shown, and each mov
 | Row | What it times | Read from |
 |---|---|---|
 | `verify` | mach's verifier run over the lowered module, and every run mirl makes in a checked compile | mach, mirl |
-| `passes` | the neutral passes of mirl's schedule | mirl |
+| `passes` | mirl's pass schedule: the target's lowering rows (calling convention, addresses, aggregates) and the neutral passes | mirl |
 | `select` | instruction selection, with the constant-time check of selected code | mirl |
 | `alloc` | register allocation | mirl |
 | `frame` | the frame and the steps that finish framed code | mirl |
