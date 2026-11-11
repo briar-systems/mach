@@ -326,7 +326,8 @@ A mangled name is the source FQN, dotted, with generic arguments after a `$`:
 introduced by a run of `$` whose length is its nesting depth, so a nested
 argument closes without a bracket — `f[Map[Vec[i64], str], u8]` is
 `m.f$m.Map$$m.Vec$$$i64$$str$u8`. `p$u8` is `*u8`, `sec$u32` is `^u32`,
-`arr4$u8` is `[4]u8`, `fn$$i64$$u8` is `fun(u8) i64`, a record is its own dotted
+`arr4$u8` is `[4]u8`, `fn$$i64$$u8` is `fun(u8) i64`, `fnv$$i64$$u8` is the
+C-variadic `fun(u8, ...) i64`, a record is its own dotted
 origin FQN, a comptime value is its literal, and a variadic-pack instance carries
 a `pack` marker before its element list. A test's symbol is its qualified name,
 `<module path>#<identifier>` (see [test.md](test.md#grammar)). There is no prefix:
