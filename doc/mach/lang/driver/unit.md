@@ -101,7 +101,8 @@ pub fun lower(lowering: Lowering, back: *backend.Back, spans: *heap.Pool, out: *
 ```
 
 the unit `lowering` names lowered for `back`'s target onto a heap drawing its spans from
-`spans`, the value held in `out` until `release`, or why it was not lowered
+`spans`, which the unit owns alone and so takes no lock, the value held in `out` until
+`release`, or why it was not lowered
 
 ## fun release
 
