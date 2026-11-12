@@ -153,11 +153,41 @@ through `m#instances.7`, and which one depends on its name alone.
   mangled-name order, and unit objects follow every module object in the link,
   ordered by module name and then bucket. Adding or dropping a use of an
   instance changes at most the one unit that holds it.
-- **Linkage.** An instance is weak, so two static libraries built apart that each
-  hold it still link together, and hidden, so no shared library exports it,
-  `#[export]` or not. A private declaration an instance body reaches, such as a
-  helper or a table of the generic's module, is reached from the unit as a hidden
-  symbol of the same image.
+- **Linkage.** An instance is a merged definition, hidden, so no shared library
+  exports it, `#[export]` or not. Every object that holds it holds a copy, and the
+  link keeps the first copy in link order. Each copy carries the instance's
+  **identity** in two parts. Its source is a digest of what it was made from:
+  its mangled name and the source of every module its typing reads (its
+  declarations and generic bodies, the files it embeds and the same of every
+  module it imports). Its settings are the profile's float relaxations (`relax`)
+  and the target's instruction set and extensions (`ext`), the two settings
+  that change what the code computes or where it can run. The compiler, the
+  optimization level, debug information and paths are left out. So two static
+  libraries built from the same source and settings link together whatever
+  profile or compiler build made each. Two built from different source, such as
+  two versions of a dependency, are refused at link as built from different
+  sources, with both inputs named, and the remedy is one version. Two built
+  from the same source with a different `relax` or `ext` are refused as built
+  with different settings, naming both inputs and the setting, and the remedy
+  is building both with the same one. ELF, COFF and wasm linkers refuse either
+  kind as a plain duplicate symbol. On Mach-O only mink refuses, since the
+  format has no groups and other linkers coalesce weak definitions without a
+  check. One build compiles one copy of each instance: a function's
+  `#[extension]` admits instructions in its own inline `asm` only, so an
+  instance it calls is compiled for the target's selection, or with the
+  generic's own `#[extension]`, which is part of its source. A private declaration
+  an instance body reaches, such as a helper or a table of the generic's module,
+  is reached from the unit as a hidden symbol of the same image.
+- **What the identity does not catch.** It is no authentication. An object made
+  by hand with another toolchain that copies a real identity onto other code
+  merges silently with the copies it imitates when it comes first in link order.
+  Mach source cannot make one: a `#[symbol]` name that collides with an instance
+  is refused at link as a definition beside the copies.
+- **Debugging a merged instance.** The copy that runs is the one the link kept,
+  built with the settings of the library that held it. When that library was
+  built under another profile, a debugger steps through code optimized, or
+  described, as that library was built, not as your own objects were. To choose
+  the copy, put the library whose build you want first in link order.
 - **Constant time.** A `constant_time` function's code is verified only against the
   callees its own object holds. So an instance it calls is also compiled into the
   caller's object, as a local copy under the same name, and the caller calls that

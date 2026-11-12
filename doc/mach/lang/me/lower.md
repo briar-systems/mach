@@ -13,8 +13,8 @@ the module to mirl's verifier is verify_module's, a stage of its own
 ## fun lower_unit
 
 ```mach
-pub fun lower_unit(req: *lower_context.LowerRequest, name: intern.StrId, members: **sema_product.InstanceResult, count: u32,
-m: *mirl_module.Module) res[lower_context.Unit, fail.Fail];
+pub fun lower_unit(req: *lower_context.LowerRequest, name: intern.StrId, members: **sema_product.InstanceResult, defining: *lower_context.Defining,
+count: u32, m: *mirl_module.Module) res[lower_context.Unit, fail.Fail];
 ```
 
 the instance unit `name` lowered into the mirl module `m`: each member, in the order given,

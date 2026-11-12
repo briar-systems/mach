@@ -48,6 +48,15 @@ pub fun open(a: *A.Allocator, t: *resolved.Target) res[Back, fail.Fail];
 
 the back half of the resolved target `t`
 
+## fun merges
+
+```mach
+pub fun merges(b: *Back) bool;
+```
+
+whether the objects the back half writes hold merged definitions (mink.model.merged), the
+copies of one a link keeps one of: false for a format masc writes none in
+
 ## fun close
 
 ```mach

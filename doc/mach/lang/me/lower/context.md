@@ -139,6 +139,25 @@ sig: the copy's signature
 instance: the instance of `set` the copy is of, sema_instance.NONE for a plain function
 set: the instance set whose frames the code asking for the copy was read through
 
+## tag Defining
+
+```mach
+pub tag Defining: u8 {
+    local;
+    instance;
+    merged: u64;
+}
+```
+
+how an instance's definition is bound
+
+local: the copy constant-time code of this object calls, local to it
+instance: defined by its unit, weak, every definition of its name equivalent,
+          for a target whose objects hold no merged definitions
+merged: defined by its unit, a merged definition of this source identity
+          (mink.model.merged), every copy of its name and identity made from
+          the same source
+
 ## rec UnitMember
 
 ```mach
