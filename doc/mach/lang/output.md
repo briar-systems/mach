@@ -8,7 +8,7 @@ object: the object cache reads it back, so it goes through
 write a sibling temporary and rename it over the destination, so an
 interrupted write leaves the original intact. the build owns its output
 layout: `directory` and `reserve` replace a stale entry of the wrong kind,
-and every failure names the path and the operation
+and every failure names the path and the operation through `fail.refusal`
 
 ## fun directory
 
@@ -36,20 +36,22 @@ symlink there is left for the write to follow
 ## fun bytes
 
 ```mach
-pub fun bytes(itn: *intern.Interner, a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32, op: str) err[fail.Fail];
+pub fun bytes(itn: *intern.Interner, a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32, role: str) err[fail.Fail];
 ```
 
-write `buf` to `path`, whose parent exists
+write `buf` to `path`, whose parent exists, a refusal naming it as `role`, nil
+for a product its path names
 
 ## fun writer
 
 ```mach
 pub fun writer[W](itn: *intern.Interner, a: *A.Allocator, path: str, ctx: *W,
-write_cb: fun(*W, *io_writer.Writer) err[io_writer.WriteError], mode: i32, op: str) err[fail.Fail];
+write_cb: fun(*W, *io_writer.Writer) err[io_writer.WriteError], mode: i32, role: str) err[fail.Fail];
 ```
 
 stream `path`, whose parent exists, through `write_cb`, staged in `a` so a writer of many small
-pieces makes few writes to the file
+pieces makes few writes to the file; a refusal names it as `role`, nil for a product its path
+names
 
 ## fun replace
 
@@ -88,7 +90,8 @@ destination: the file the temporary is renamed over
 pub fun fill(t: *Temporary, buf: *u8, len: usize, mode: i32) err[fail.Fail];
 ```
 
-write `buf` to the temporary `t`, a refusal named as the write of its destination
+write `buf` to the temporary `t`, a refusal naming the destination and the temporary it was
+written through
 
 ## fun read_back
 

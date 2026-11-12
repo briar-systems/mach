@@ -19,12 +19,13 @@ what mach holds `mach help` to beyond the parse
 ## fun page
 
 ```mach
-pub fun page(line: *std_args.Parsed) err[fail.Fail];
+pub fun page(a: *A.Allocator, line: *std_args.Parsed) err[fail.Fail];
 ```
 
 write the page of the command a parsed line matched to stdout: std.args' page of its usage,
 text, nested commands and flags. the root's page is the overview
 
+a: holds the text of a refusal
 line: a parsed line whose command is the page's
 ret: ok, or the write that failed
 

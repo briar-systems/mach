@@ -220,6 +220,12 @@ pub fun is_reported(f: Fail) bool;
 pub fun is_message(f: Fail) bool;
 ```
 
+## fun is_environment
+
+```mach
+pub fun is_environment(f: Fail) bool;
+```
+
 ## fun text
 
 ```mach
@@ -323,27 +329,80 @@ pub fun unit[V](r: res[V, Fail]) err[Fail];
 
 the unit outcome of an operation whose value is not needed
 
-## fun io_text
+## rec Op
 
 ```mach
-pub fun io_text(e: io_error.Error) str;
+pub rec Op;
 ```
 
-the text each std refusal renders as, one copy each. an operation that meets
-one keeps its own classification (user, internal, environment) and names the
-cause once through these; the allocator's is `alloc.text`
+an operation the machine was asked to carry out, as a refusal of it names it:
+`cannot <verb>[ <role>][ '<path>'][ <link> '<other>']: <cause>`. a path the
+user never typed (a temporary, a cache entry, a scratch directory) carries the
+role it plays, so the failure says what it is for and not only where it is; a
+move or a copy names its second path after `link` ("to"); a spawned process
+names its command as the path and its working directory as the other, linked
+by "in". of two paths the one the user asked about comes first, and a path the
+compiler derived (a temporary, a staged copy) is the other; a subject with no path (an environment variable, a stream) is named
+by its role alone, and a variable's name is its path
 
-## fun write_text
+verb: what was being done, without "cannot"
+role: what the path is for, nil when the path speaks for itself
+path: the path the operation acted on, nil when the subject has none
+link: how `other` relates to `path`, nil when there is no second path
+other: the second path
+given: whether the user named `path`, so a path that is not there, is not the
+       kind of entry the operation needs, or is too long, is the user's input
+       and not the machine's refusal
+
+## tag Cause
 
 ```mach
-pub fun write_text(e: io_writer.WriteError) str;
+pub tag Cause: u8 {
+    io:     io_error.Error;
+    fs:     fs.FsError;
+    native: i64;
+    env:    env.EnvError;
+    write:  io_writer.WriteError;
+    text:   str;
+}
 ```
 
-## fun fs_text
+what refused an operation, as the std operation reported it; `text` is a cause
+its own module renders (a subprocess, a contained removal)
+
+## fun refusal
 
 ```mach
-pub fun fs_text(e: fs.FsError) str;
+pub fun refusal(a: *A.Allocator, k: diagnostic_kind.Kind, op: Op, cause: Cause) Fail;
 ```
+
+the failure of `op`, refused by `cause`, reported under `k` with the text `op`
+names, allocated in `a`, which the failure borrows. an allocation refusal is
+internal whatever the operation; a path the user named that is missing or the
+wrong kind of entry is the user's; every other refusal is the environment's.
+this is the one way a refusal of the machine becomes a failure
+
+## fun charged
+
+```mach
+pub fun charged(k: diagnostic_kind.Kind, given: bool, cause: Cause, text: str) Fail;
+```
+
+the failure under `k` carrying `text`, which it borrows, for a refusal of
+`cause` that a module words itself because its text names more than one
+operation does (a contained walk names the path, the component and the
+policy): charged as `refusal` charges it, `given` saying whether the user
+named the path. a failure of a path goes through `refusal` unless its wording
+needs this
+
+## fun cause_text
+
+```mach
+pub fun cause_text(c: Cause) str;
+```
+
+the text of what refused an operation, for a note or a report line that is not
+itself a failure; a failure goes through `refusal`, which names the operation
 
 ## fun str_text
 
@@ -361,12 +420,6 @@ pub fun format_text(e: std_format.FormatError) str;
 
 ```mach
 pub fun toml_text(e: toml.TomlError) str;
-```
-
-## fun env_text
-
-```mach
-pub fun env_text(e: env.EnvError) str;
 ```
 
 ## fun prefixed
@@ -432,19 +485,12 @@ pub fun refused(e: A.Error) Fail;
 ```
 
 the refusals the compiler recovers from at no site, each an internal failure
-carrying its text: the allocator's, a write to a sink of its own, a string
-operation, a filesystem step and a format
+carrying its text: the allocator's, a string operation and a format
 
 ## fun str_refused
 
 ```mach
 pub fun str_refused(e: StrError) Fail;
-```
-
-## fun fs_refused
-
-```mach
-pub fun fs_refused(e: fs.FsError) Fail;
 ```
 
 ## fun format_refused
@@ -458,16 +504,6 @@ pub fun format_refused(e: std_format.FormatError) Fail;
 ```mach
 pub fun source_refused(e: lang_source.Error) Fail;
 ```
-
-## fun fs_environment
-
-```mach
-pub fun fs_environment(k: diagnostic_kind.Kind, e: fs.FsError) Fail;
-```
-
-a filesystem operation on a file the build was handed (an object, an
-archive, a library) that the machine refused: the environment's under `k`,
-save an allocation refusal, which stays internal
 
 ## fun toml_refused
 

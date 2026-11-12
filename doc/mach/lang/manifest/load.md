@@ -84,7 +84,7 @@ pub fun doc_read(alloc: *A.Allocator, sources: *lang_source.SourceMap, path: str
 ```
 
 the manifest file at `path` read and parsed as `doc_parse` parses it; a file
-that cannot be read is the environment's
+that cannot be read is refused as a path the project names
 
 ## val MANIFEST_FILE
 

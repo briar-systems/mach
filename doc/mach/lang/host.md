@@ -100,7 +100,7 @@ the refusal of a native text conversion as text
 ## fun compare_env_names
 
 ```mach
-pub fun compare_env_names(left: *Unit, left_length: usize, right: *Unit, right_length: usize) res[i32, fail.Fail];
+pub fun compare_env_names(a: *A.Allocator, left: *Unit, left_length: usize, right: *Unit, right_length: usize) res[i32, fail.Fail];
 ```
 
 compare two environment variable names in native units by the host's
@@ -174,6 +174,8 @@ pub val PROBE_OTHER:  ProbeKind = 5
 pub rec Probe;
 ```
 
+cause: what refused the probe, read only for PROBE_ABSENT and PROBE_FAILED
+
 ## rec Cursor
 
 ```mach
@@ -207,7 +209,7 @@ the component's kind; windows resolves the prefix against the root
 ## fun cursor_make
 
 ```mach
-pub fun cursor_make(c: *Cursor, component: str, prefix: str) opt[str];
+pub fun cursor_make(c: *Cursor, component: str, prefix: str) opt[fail.Cause];
 ```
 
 a directory for a missing component; one a concurrent writer made first is as good
@@ -215,7 +217,7 @@ a directory for a missing component; one a concurrent writer made first is as go
 ## fun cursor_unlink
 
 ```mach
-pub fun cursor_unlink(c: *Cursor, component: str, prefix: str) opt[str];
+pub fun cursor_unlink(c: *Cursor, component: str, prefix: str) opt[fail.Cause];
 ```
 
 remove a stale non-directory component, never following it

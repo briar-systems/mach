@@ -23,11 +23,20 @@ pub fun message(r: Removal) str;
 ## fun with_cleanup
 
 ```mach
-pub fun with_cleanup(a: *A.Allocator, f: fail.Fail, r: Removal) fail.Fail;
+pub fun with_cleanup(a: *A.Allocator, f: fail.Fail, r: Removal, tree: str) fail.Fail;
 ```
 
-the failure `f` reported for removal `r`, also naming the close that failed
-on the way out when there was one
+the failure `f` reported for removal `r` of `tree`, also naming the close that
+failed on the way out when there was one
+
+## fun refusal
+
+```mach
+pub fun refusal(a: *A.Allocator, k: diagnostic_kind.Kind, op: fail.Op, r: Removal) fail.Fail;
+```
+
+the failure of removing `op`'s path, which `r` refused outside containment, also
+naming the close that failed on the way out
 
 ## fun open_dir
 

@@ -72,23 +72,24 @@ pub fun failure(identity: str, cause: Cause) Error;
 
 the refusal `cause`, named by `identity`
 
-## fun cause_text
-
-```mach
-pub fun cause_text(c: Cause) str;
-```
-
-the text of what refused, static
-
 ## fun refusal
 
 ```mach
-pub fun refusal(a: *A.Allocator, k: diagnostic_kind.Kind, e: Error) fail.Fail;
+pub fun refusal(a: *A.Allocator, k: diagnostic_kind.Kind, verb: str, e: Error, cwd: str) fail.Fail;
 ```
 
-the machine's refusal `e` as an environment failure under `k`, its text
-"identity: cause" owned by `a`; a refusal to format the text is the failure
-instead
+the machine's refusal `e` to `verb` the child, an environment failure under `k`
+naming the child and, when `cwd` is given, the directory it runs in; an
+allocation refusal is internal
+
+## fun refusal_of
+
+```mach
+pub fun refusal_of(a: *A.Allocator, k: diagnostic_kind.Kind, op: fail.Op, e: Error) fail.Fail;
+```
+
+the machine's refusal `e` of `op`, which names the child as its caller knows it
+(a runner, a build step); an allocation refusal is internal
 
 ## rec SubprocessTerminal
 

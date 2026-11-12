@@ -305,6 +305,15 @@ pub fun format_intern(itn: *intern.Interner, a: *A.Allocator, fmt: str, va: ...)
 `fmt` formatted with `va` through `a` as scratch and interned, so the text
 outlives `a`'s storage
 
+## fun refusal_interned
+
+```mach
+pub fun refusal_interned(itn: *intern.Interner, a: *A.Allocator, k: diagnostic_kind.Kind, op: fail.Op, cause: fail.Cause) fail.Fail;
+```
+
+`fail.refusal` of `op` with its text interned, so the failure outlives `a`'s
+storage; an internal failure carries a static text and is returned as it is
+
 ## fun builder_dnit
 
 ```mach

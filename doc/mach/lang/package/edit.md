@@ -14,10 +14,14 @@ pub rec Edit;
 the project root held open for an edit: the manifest is replaced through a sibling
 temporary and the dependency root is reached through it
 
+a: holds the text of a refusal
+root: the project root, as a refusal names it
+root_fd: the project root held open
+
 ## fun begin
 
 ```mach
-pub fun begin(edit: *Edit, root: str) err[fail.Fail];
+pub fun begin(edit: *Edit, a: *A.Allocator, root: str) err[fail.Fail];
 ```
 
 ## fun finish

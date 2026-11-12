@@ -81,17 +81,20 @@ pub val DOMAIN_FS_POLICY:    Domain = 12
 ## fun file_sha256
 
 ```mach
-pub fun file_sha256(path: str, digest: *u8) err[fail.Fail];
+pub fun file_sha256(path: str, digest: *u8) err[fail.Cause];
 ```
+
+the sha-256 of the file at `path` into `digest`, or what refused it, which the
+caller names with the path
 
 ## fun held_file_sha256
 
 ```mach
-pub fun held_file_sha256(f: fs.File, digest: *u8) err[fail.Fail];
+pub fun held_file_sha256(f: fs.File, digest: *u8) err[fail.Cause];
 ```
 
 borrows the file and exclusive seek/read access, rewinds first and leaves it at eof
-failure does not publish a digest, the caller retains close ownership
+failure does not publish a digest, the caller retains close ownership and names the file
 
 ## fun put_domain_u8
 
@@ -152,8 +155,9 @@ there are none
 ## fun put_file
 
 ```mach
-pub fun put_file(s: *wire.Sink, path: str);
+pub fun put_file(s: *wire.Sink, itn: *intern.Interner, a: *A.Allocator, path: str);
 ```
 
-a file by the digest of its contents, as put_content puts bytes
+a link input by the digest of its contents, as put_content puts bytes; a refusal names the
+input, its text interned through `a` into `itn`
 

@@ -40,10 +40,11 @@ or realizes the closure refuses it through this one check
 ## fun check_dep_root
 
 ```mach
-pub fun check_dep_root(project_root: str) res[bool, fail.Fail];
+pub fun check_dep_root(a: *A.Allocator, project_root: str) res[bool, fail.Fail];
 ```
 
-whether the dependency root exists; err when it is anything but a physical directory
+whether the dependency root exists; err when it is anything but a physical directory. a
+refusal's text is allocated in `a`
 
 ## def Unrealized
 
