@@ -14,22 +14,36 @@ what a build lays its types out by: mirl's target and the context its selection 
 borrowed from the build's back end, and the type table each source type is interned in
 
 mapped: the table's type of each source type interned, under `generation`
-generation: the projection generation `mapped` was made under, since a later one may
-            give a nominal other fields
+generation: the projection generation `mapped` and `placed` were made under, since a
+            later one may give a nominal other fields
+place: how a tag's cases are placed on this target, which mach.lang.type.query.areas
+            decides from the secrecy of their bytes, a query above this one
+placed: each tag placed, its cases at `start` in `cases`, under `generation`
 
 ## fun open
 
 ```mach
-pub fun open(a: *A.Allocator, target: *mirl_record.Target, ctx: opt[*core_state.Context]) res[*Laying, fail.Fail];
+pub fun open(a: *A.Allocator, target: *mirl_record.Target, ctx: opt[*core_state.Context],
+place: fun(*Measure, type_kind.TypeId, *collections_vector.Vector[shape.Carried]) res[u32, fail.Fail]) res[*Laying, fail.Fail];
 ```
 
-a laying over `target` under the context `ctx`, both borrowed. given back by close
+a laying over `target` under the context `ctx`, both borrowed, placing tags by `place`.
+given back by close
 
 ## fun close
 
 ```mach
 pub fun close(l: *Laying);
 ```
+
+## fun placement
+
+```mach
+pub fun placement(mz: *Measure, tid: type_kind.TypeId) res[shape.Placement, fail.Fail];
+```
+
+where the tag `tid`, its secrecy stripped, holds each case's payload on the laying's target.
+the cases it gives are the laying's, good until the next tag is placed
 
 ## def Cause
 
@@ -174,8 +188,8 @@ pub fun size(mz: *Measure, tid: type_kind.TypeId) Extent;
 pub fun offset(mz: *Measure, tid: type_kind.TypeId, field_ix: u32) Extent;
 ```
 
-the byte offset of a record field, or of a tag's payload for any of its cases, in `size`.
-a union's fields all stand at 0
+the byte offset of a record field, or of a tag case's payload, in `size`; a case with no
+payload has none. a union's fields all stand at 0
 
 ## fun of
 

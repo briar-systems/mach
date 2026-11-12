@@ -371,8 +371,32 @@ maximum of discriminator alignment, payload alignment, and any explicit
 `#[align(N)]` decorator. Total size is the aligned extent of the common payload
 area. Tags with no payloads contain only the discriminator and trailing padding.
 
+A byte of a tag is never public under one case and secret under another. Two
+cases share bytes only where they agree on the class of every byte both cover,
+the comparison a `uni`'s variants must pass: secret against secret, public
+against public, a pointer that reaches a secret only against a pointer to the
+same storage, and padding counting as public, since a public payload's padding
+can be read through a pointer to it. The payloads are placed in areas after the
+discriminator: taking the cases in declaration order, each joins the first area
+whose every case it agrees with, or opens a new one, and the areas follow the
+discriminator in ascending order of alignment, ties in the order they were
+opened. Each area holds its payloads at its own offset, sized and aligned as the
+largest of them. A payloadless case is in no area, a generic case typed by a
+parameter is placed at each instance, and a nested tag's bytes are classed by
+its own layout. A tag whose payloads all agree, which is every tag with no
+secret anywhere below it, has the single payload area described above.
+
+The rule costs size only where payloads disagree: `res[^u64, E]` with a
+one-byte `E` stays 16 bytes (the error at offset 1, the secret at 8), while
+`tag T: u8 { p: u64; s: ^u64; }` grows from 16 to 24 bytes and
+`res[[4]^u64, u64]` from 40 to 48. At worst every payload has an area of its
+own, which is no larger than laying the payloads out one after another in any
+order, and merging agreeing payloads into one area never makes it larger, as
+long as no payload with no bytes is aligned past one byte. A by-value tag is passed and returned like any aggregate of its size.
+
 Packing with `#[packed]` places the payload immediately after the discriminator
-at offset `D` with base alignment 1. Explicit alignment raises object alignment
+at offset `D` with base alignment 1, and each further area immediately after the
+one before it, in the order they were opened. Explicit alignment raises object alignment
 and rounds total size without repacking nested payloads. Packed value access
 uses legal unaligned operations. A typed payload pointer must not promise
 stronger alignment than its storage provides.
@@ -380,8 +404,8 @@ stronger alignment than its storage provides.
 Debug information describes a tag as a structure laid out the same way. Its
 first member, `tag`, holds the discriminator as an enumeration that names every
 case by its code, and each case with a payload follows as a member named for the
-case at the common payload offset. `tag` is a keyword, so no case can take that
-name.
+case at the offset of the payload area that holds it. `tag` is a keyword, so no
+case can take that name.
 
 Construction captures the active payload before overwriting the destination and
 writes the discriminator and the active payload. Nothing else is written: the
@@ -406,7 +430,13 @@ payload qualifiers.
 ## Secrecy and ownership
 
 A public tag has a public discriminator, while each payload retains its declared
-secrecy. Outer `^Tag` also protects the active case. Secret-dependent case tests
+secrecy. A tag may mix public and secret payloads, unlike a `uni`, because no
+two of its cases share a byte at two classes (see
+[Layout and representation](#layout-and-representation)): a stale pointer to a
+payload, kept past a write that switched the tag to another case, reads only
+bytes of the class its type states. Building a value of a tag that holds a
+secret zeroes it whole, so a new case leaves none of the old case's bytes behind.
+Outer `^Tag` also protects the active case. Secret-dependent case tests
 must obey the constant-time rules. Copies preserve potentially
 secret storage across all cases and use the fixed public type extent, rather
 than choosing a copy size from a secret active case.

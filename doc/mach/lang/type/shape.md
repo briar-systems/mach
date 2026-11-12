@@ -5,9 +5,10 @@ type table, which lowering interns into its module's table and sema into the tab
 types out over, so the size sema answers and the type codegen builds cannot disagree
 
 a record or union is its fields in order at the alignment and packing it declares, a tag
-its discriminator then the union of its cases' payloads, an opaque abi type a structure of
-its bytes at its alignment. what reaching a member type means, substitution, a memo, a
-cycle on the path, is the caller's, through `Reach`
+its discriminator then a union of payloads per area its placement gives, an opaque abi
+type a structure of its bytes at its alignment. what reaching a member type means,
+substitution, a memo, a cycle on the path, and how a tag's cases are placed, is the
+caller's, through `Reach`
 
 ## tag Unshaped
 
@@ -19,6 +20,7 @@ pub tag Unshaped: u8 {
     discriminator;
     table: types.Error;
     alloc: A.Error;
+    placement;
 }
 ```
 
@@ -30,6 +32,7 @@ empty_tag: a tag with no cases
 discriminator: a tag with no discriminator type
 table: mirl's type table refused a type
 alloc: no storage for a member list
+placement: placing a tag's cases was refused, the caller's reason held by its context
 
 ## rec Reach
 
@@ -43,6 +46,8 @@ ctx: the caller's context
 member: the type of a member, element or payload, interned in the same table, none when
          the caller refuses it with a reason it holds
 handle: the type of a target handle
+place: the placement of a tag's cases, none when the caller refuses it with a reason it
+         holds
 pointer: the type a pointer is held in
 
 ## fun integer
@@ -85,4 +90,57 @@ pub fun of[T](t: *types.Table, ti: *type.TypeInterner, tid: type_kind.TypeId, r:
 
 the shape of the source type `tid`, its secrecy and its substitution already the caller's.
 a nil type is an empty structure
+
+## val TAG_DISCRIMINANT
+
+```mach
+pub val TAG_DISCRIMINANT: u32 = 0
+```
+
+the member of a tag's structure that holds its discriminator. the areas of its payloads
+follow it, the first at member 1
+
+## val TAG_AREA
+
+```mach
+pub val TAG_AREA:         u32 = 1
+```
+
+## rec Carried
+
+```mach
+pub rec Carried;
+```
+
+where a tag holds the payload of a case
+
+area: the member of the tag's structure that is the union of the payloads it shares,
+        NO_AREA for a case with no payload
+member: the member of that union the payload is laid out as
+
+## val NO_AREA
+
+```mach
+pub val NO_AREA: u32 = 0
+```
+
+## rec Placement
+
+```mach
+pub rec Placement;
+```
+
+how a tag's cases share bytes: two cases share an area only where they agree on the
+secrecy of every byte both cover, which mach.lang.type.query.areas decides for the target
+
+cases: where each case's payload is held, in case order
+areas: the count of areas
+
+## fun carried
+
+```mach
+pub fun carried(p: Placement, i: u32) opt[Carried];
+```
+
+where case `i` holds its payload, none for a case with no payload
 

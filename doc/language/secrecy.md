@@ -276,6 +276,10 @@ public/secret aliasing leak unconstructable with no alias analysis:
   downgrade)
 - a secret-welded pointer cannot be erased to the untyped `ptr`
 - a `uni`'s overlapping variants must agree on secrecy
+- a `tag`'s cases share a byte only where they agree on its class, by the same
+  comparison, so a tag whose payloads disagree lays them out in separate areas
+  (it may be larger than one area would be; see
+  [tag.md](tag.md#layout-and-representation))
 
 ```mach error union variants must agree on secrecy
 fun erase(p: *^u8) ptr {

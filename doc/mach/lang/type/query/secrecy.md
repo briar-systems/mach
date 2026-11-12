@@ -39,6 +39,15 @@ shape. `owner` is TYPE_NIL when no field is known
 pub val NO_FIELD: u32 = 0xFFFFFFFF
 ```
 
+## fun overlay_walk
+
+```mach
+pub fun overlay_walk(mz: *extent.Measure, a: type_kind.TypeId, b: type_kind.TypeId) Verdict;
+```
+
+two types laid over one storage from offset 0, as union variants are: every
+byte both cover has one class on both sides
+
 ## val UNBOUNDED_VARIANTS_MSG
 
 ```mach

@@ -39,7 +39,9 @@ and its padding zeroed (see
 A `uni`'s overlapping variants must agree on secrecy: every field is either
 secret (`^`) or every field is public. A mixed union would let the same storage
 be read at two secrecy classifications, the aliasing leak the welded-storage
-rules forbid. See [secrecy.md](secrecy.md).
+rules forbid. See [secrecy.md](secrecy.md). A `tag` may mix secret and public
+payloads because it lays cases that disagree out in separate areas, at the cost
+of size (see [tag.md](tag.md#layout-and-representation)).
 
 ## Raw unions versus tagged values
 

@@ -199,6 +199,7 @@ s: *session.Session,
 l: *linkage.Linkage,
 facts: *target_facts.Facts,
 machine: *Machine,
+laying: *extent.Laying,
 malloc: *A.Allocator,
 a: *ast.Ast,
 fqn: intern.StrId,
@@ -224,6 +225,7 @@ s: *session.Session,
 l: *linkage.Linkage,
 facts: *target_facts.Facts,
 machine: *Machine,
+laying: *extent.Laying,
 malloc: *A.Allocator,
 debug: bool,
 standalone: bool,
@@ -449,7 +451,8 @@ pub fun member_offset(lc: *LowerContext, tid: type_kind.TypeId, ir: Type, index:
 ```
 
 the byte offset of field or case `index` of the source type `tid`, lowered as `ir`: a
-record's field, a union's member at zero, or a tag case's payload
+record's field, a union's member at zero, or a tag case's payload, which a case with none
+does not have
 
 ## fun field_offset
 
@@ -554,21 +557,6 @@ pub fun fin_at(lc: *LowerContext, i: u32) ast_id.StmtId;
 pub fun pop_fins_to(lc: *LowerContext, mark: u32);
 ```
 
-## val TAG_DISCRIMINANT
-
-```mach
-pub val TAG_DISCRIMINANT: u32 = 0
-```
-
-a tag lowers to a structure of its discriminant and, when a case holds a payload, the
-union of the payloads, which every payload starts at
-
-## val TAG_PAYLOAD
-
-```mach
-pub val TAG_PAYLOAD:      u32 = 1
-```
-
 ## fun ptr_or_none
 
 ```mach
@@ -622,21 +610,14 @@ pub fun tag_case_has_payload(lc: *LowerContext, tid: type_kind.TypeId, i: u32) b
 
 whether case `i` of the tag `tid` holds a payload
 
-## fun tag_payload_member
+## fun tag_carried
 
 ```mach
-pub fun tag_payload_member(lc: *LowerContext, tid: type_kind.TypeId, i: u32) u32;
+pub fun tag_carried(lc: *LowerContext, tid: type_kind.TypeId, i: u32) res[shape.Carried, fail.Fail];
 ```
 
-the member of the payload union case `i` of the tag `tid` is laid out as
-
-## fun tag_disc_type
-
-```mach
-pub fun tag_disc_type(lc: *LowerContext, tid: type_kind.TypeId) res[Type, fail.Fail];
-```
-
-the integer a tag's discriminant is held in
+where the tag `tid` holds the payload of case `i`, which has one: the area of the tag's
+structure and the member of that area's union, as its placement gives it
 
 ## fun storage_align
 
