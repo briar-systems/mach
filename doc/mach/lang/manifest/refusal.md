@@ -33,6 +33,15 @@ pub fun point_at(f: fail.Fail, sp: toml.Span) fail.Fail;
 the same failure pointing at `sp` in the manifest being parsed; the zero span
 of a value the parser did not write points nowhere
 
+## fun point_at_file
+
+```mach
+pub fun point_at_file(f: fail.Fail) fail.Fail;
+```
+
+the same failure pointing at the manifest being parsed as a whole, at its start, for what is
+missing from the file itself
+
 ## fun fail_at
 
 ```mach

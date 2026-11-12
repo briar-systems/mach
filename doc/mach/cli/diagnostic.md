@@ -30,9 +30,7 @@ list: the diagnostics, rendered in order; nothing is written when it is empty
 pub fun render_fail(sources: *lang_source.SourceMap, f: *fail.Fail) i64;
 ```
 
-print a Fail to stderr as "error[<key>]: <message>", followed by the
-" --> <file>:<line>:<column>" it points at when it names one and one such
-line for each related place it names, and map it to an exit code
+print a Fail to stderr as the diagnostic it reads as, and map it to an exit code
 a reported Fail prints nothing, its diagnostics having been rendered already
 
 sources: the source map the failure's places are in, nil when it can point at none
@@ -132,10 +130,10 @@ pub fun readout_close(rd: *Readout);
 ```
 
 close a plan's rendering: one summary line under human text closes every
-failure and diagnostic the plan rendered, a failure record printed as its own
-`error:` line (an encoder or rules refusal that reached no store) counted in it
-beside every store's diagnostics, so the tally never reads `0 errors` above a
-nonzero exit. json closes in report_close
+failure and diagnostic the plan rendered, a carried failure (an encoder or
+rules refusal that reached no store) counted in it beside every store's
+diagnostics, so the tally never reads `0 errors` above a nonzero exit. json
+closes in report_close
 
 ## fun has_capture
 
@@ -209,9 +207,8 @@ format: the format the command writes
 pub fun report_fail(r: *Report, f: fail.Fail, origin: diagnostic.Origin) i64;
 ```
 
-report a failure raised outside a diagnostic store: `error[<key>]: <message>`
-as text, or a failure record under json. a reported failure writes nothing,
-its diagnostics having been rendered already
+report a carried failure as the diagnostic it reads as, in text or as a diagnostic record
+under json. a reported failure writes nothing, its diagnostics having been rendered already
 
 r: the command's report
 f: the failure

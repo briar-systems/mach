@@ -313,6 +313,28 @@ libdir_count: how many
 stack_reserve: the main stack's reserve, none for the format's default
 stack_commit: the main stack's commit, none for the format's default
 plan: the layout the artifact states, nil where it states none
+stated: where the build stated each option it hands mink
+
+## rec Stated
+
+```mach
+pub rec Stated;
+```
+
+where the build stated each option of the link it hands mink, a location of the source map
+its diagnostics read, so mink's refusal of an option points there. a nil location where the
+option was not written or names no place
+
+kind: the output kind
+target: the target
+subsystem: the PE subsystem
+base: the image base
+size: the size ceiling
+stack_reserve: the stack's reserve
+stack_commit: the stack's commit
+sections: each section the plan places ahead of the rest, parallel to its sections
+regions: each memory region, parallel to the plan's regions, which the plan's runs and
+               loads name
 
 ## fun link
 

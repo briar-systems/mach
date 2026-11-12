@@ -134,14 +134,13 @@ pub rec PreparedQuery {
 # ---
 # alloc:   owns the presentation and its store
 # diags:   the collected diagnostics, in dependency order, each product once
-# failure: the operation's failure; absent when every product computed
-# message: the failure's text when one was recorded, owned by the db's allocator
+# failure: the operation's failure, owning its text and places through `failure_alloc`; absent
+#          when every product computed
 pub rec Presentation {
     alloc:         *A.Allocator;
     diags:         diagnostic.DiagnosticStore;
     failure:       opt[fail.Fail];
-    message:       str;
-    message_alloc: *A.Allocator;
+    failure_alloc: *A.Allocator;
 }
 
 rec Attempt {
@@ -236,12 +235,18 @@ pub rec QueryDb {
     operation_sequence:   u64;
     operation_active:     bool;
     presentation_pending: bool;
-    operation_failure:    opt[fail.Fail];
-    operation_message:    str;
     rejections:           u64;
     attempts:             Vector[Attempt];
     attempt_index:        Map[Slot, usize];
     validated:            Map[Slot, Revision];
+    # the failure the operation stands on, its text and places copied into and owned through `a`.
+    # a failure the engine hands out borrows them until the operation's presentation is collected
+    # or discarded, when the presentation takes the failure over or it is freed
+    operation_failure: opt[fail.Fail];
+    # the failure the standing one displaced, owned like it and freed only with it, since a
+    # computation may still read the copy it was handed. precedence keeps it to one: only a
+    # defect displaces, and only a user's or the environment's failure
+    operation_displaced: fail.Fail;
     # the last operation's presentation, kept for its reader
     presentation: *Presentation;
     # the last held failure's text and places, owned through `a`
@@ -275,7 +280,7 @@ pub fun init(a: *A.Allocator) res[QueryDb, fail.Fail] {
     db.operation_active     = false;
     db.presentation_pending = false;
     db.operation_failure    = opt[fail.Fail].none{};
-    db.operation_message    = nil;
+    db.operation_displaced  = fail.reported();
     db.rejections           = 0;
     db.attempts             = collections_vector.init[Attempt](a);
     db.attempt_index        = map.init[Slot, usize](a);
@@ -296,11 +301,13 @@ pub fun drop_failure(db: *QueryDb) {
     db.failure_places = fail.reported();
 }
 
-# hold the text an operation handed back, allocated from the query database, as the held
-# failure's text; the database owns it from here
-pub fun adopt_failure_text(db: *QueryDb, text: str) {
-    if (db.failure_message != nil && db.failure_message != text) { str_free(db.a, db.failure_message); }
-    db.failure_message = text;
+# hold the failure an operation handed back, its text and places owned through the query
+# database, as the held failure, replacing what the slot held; the database owns it from here
+pub fun adopt_failure(db: *QueryDb, failure: fail.Fail) {
+    drop_failure(db);
+    val carried: opt[str] = fail.text(failure);
+    if (sel carried.some) { db.failure_message = carried.some; }
+    db.failure_places = fail.with_text(failure, nil);
 }
 
 # hold a failure where the database presents it: its text and the places it points at are
@@ -319,7 +326,7 @@ pub fun hold_failure(db: *QueryDb, failure: fail.Fail, lost: *bool) fail.Fail {
     if (sel carried.some) {
         val text: str = carried.some;
         keep = text == db.failure_message;
-        if (!keep && (db.presentation == nil || text != db.presentation.message)) {
+        if (!keep && !presented(db, text)) {
             val copied: res[str, A.Error] = str_dup(db.a, text);
             if (sel copied.err) {
                 held  = fail.with_text(failure, lang_alloc.text(copied.err));
@@ -353,6 +360,15 @@ pub fun hold_failure(db: *QueryDb, failure: fail.Fail, lost: *bool) fail.Fail {
     ret held;
 }
 
+# whether `text` is the text of the failure the last presentation owns
+fun presented(db: *QueryDb, text: str) bool {
+    if (db.presentation == nil)           { ret false; }
+    if (sel db.presentation.failure.none) { ret false; }
+    val owned: opt[str] = fail.text(db.presentation.failure.some);
+    if (sel owned.some) { ret owned.some == text; }
+    ret false;
+}
+
 # release the last operation's presentation and the failure held beside it
 pub fun drop_presented(db: *QueryDb) {
     if (db.presentation != nil) {
@@ -370,10 +386,7 @@ pub fun dnit(db: *QueryDb) {
     drop_presented(db);
 
     attempts_clear(db);
-    if (db.operation_message != nil) {
-        str_free(db.a, db.operation_message);
-        db.operation_message = nil;
-    }
+    operation_release(db);
     collections_vector.dnit[Attempt](?db.attempts);
     map.dnit[Slot, usize](?db.attempt_index);
 
@@ -440,33 +453,51 @@ pub fun end(db: *QueryDb, operation: Operation) err[fail.Fail] {
         db.operation_active     = false;
         db.presentation_pending = true;
     }
-    if (sel db.operation_failure.some) { ret err[fail.Fail].err{db.operation_failure.some}; }
+    if (sel db.operation_failure.some) { ret err[fail.Fail].err{borrowed(db.operation_failure.some)}; }
     ret err[fail.Fail].ok{};
 }
 
-# records the operation's failure (the first message wins over a later one,
-# a reported failure never displaces a message) and answers the failure the
-# operation carries: a reported one as it is, any other as the defect it names,
-# its text copied into the operation and its place kept
+# records the operation's failure and answers the failure the operation carries, borrowing the
+# operation's copy of it: its class, kind, text, place, related places and fix. a defect stands
+# over the user's and the environment's failures, either of which stands over a reported one,
+# and of two alike the first stands
 fun operation_fail(db: *QueryDb, failure: fail.Fail) fail.Fail {
-    if (sel db.operation_failure.some) {
-        if (fail.is_message(db.operation_failure.some)) { ret db.operation_failure.some; }
-        if (sel failure.reported)                       { ret db.operation_failure.some; }
-    }
-    if (sel failure.reported) {
-        db.operation_failure = opt[fail.Fail].some{failure};
-        ret failure;
-    }
-    val copied: res[str, A.Error] = str_dup(db.a, fail.describe(failure));
-    if (sel copied.err) {
-        val refused: fail.Fail = fail.refused(copied.err);
-        db.operation_failure = opt[fail.Fail].some{refused};
-        ret refused;
-    }
-    db.operation_message = copied.ok;
-    val recorded: fail.Fail = fail.with_text(fail.defect(failure), db.operation_message);
-    db.operation_failure = opt[fail.Fail].some{recorded};
-    ret recorded;
+    val stands: opt[fail.Fail] = standing_over(db, failure);
+    if (sel stands.some) { ret borrowed(stands.some); }
+    val copied: res[fail.Fail, A.Error] = fail.retain(db.a, failure);
+    if (sel copied.err) { ret operation_stand(db, fail.refused(copied.err)); }
+    ret operation_stand(db, copied.ok);
+}
+
+# the failure the operation stands on, when it stands over `failure`
+fun standing_over(db: *QueryDb, failure: fail.Fail) opt[fail.Fail] {
+    if (sel db.operation_failure.none) { ret opt[fail.Fail].none{}; }
+    val held: fail.Fail = db.operation_failure.some;
+    if (fail.is_message(held) || sel failure.reported)        { ret opt[fail.Fail].some{held}; }
+    if (!fail.is_reported(held) && !fail.is_message(failure)) { ret opt[fail.Fail].some{held}; }
+    ret opt[fail.Fail].none{};
+}
+
+# make the owned `failure` the one the operation stands on, the one it displaces kept until the
+# operation's state is released; answers the borrowing copy
+fun operation_stand(db: *QueryDb, failure: fail.Fail) fail.Fail {
+    if (sel db.operation_failure.some) { db.operation_displaced = db.operation_failure.some; }
+    db.operation_failure = opt[fail.Fail].some{failure};
+    ret borrowed(failure);
+}
+
+# the copy of a failure the engine owns that a caller is handed: it reads the text and places
+# and owns neither
+fun borrowed(f: fail.Fail) fail.Fail {
+    ret fail.borrowing_places(fail.with_text(f, fail.describe(f)));
+}
+
+# free the operation's failures; nothing may still read them
+fun operation_release(db: *QueryDb) {
+    if (sel db.operation_failure.some) { fail.dnit(db.a, db.operation_failure.some); }
+    fail.dnit(db.a, db.operation_displaced);
+    db.operation_failure   = opt[fail.Fail].none{};
+    db.operation_displaced = fail.reported();
 }
 
 # an internal failure leaves the database in a state no later read of the
@@ -475,7 +506,7 @@ fun operation_fail(db: *QueryDb, failure: fail.Fail) fail.Fail {
 # computes, and the operation's standing is the fold of its roots'
 fun operation_poison(db: *QueryDb) opt[fail.Fail] {
     if (sel db.operation_failure.some) {
-        if (fail.is_message(db.operation_failure.some)) { ret db.operation_failure; }
+        if (fail.is_message(db.operation_failure.some)) { ret opt[fail.Fail].some{borrowed(db.operation_failure.some)}; }
     }
     ret opt[fail.Fail].none{};
 }
@@ -536,34 +567,31 @@ pub fun discard(db: *QueryDb, operation: Operation) err[fail.Fail] {
         ret err[fail.Fail].err{fail.message("query presentation is stale or not ready")};
     }
     attempts_clear(db);
-    if (db.operation_message != nil) {
-        str_free(db.a, db.operation_message);
-        db.operation_message = nil;
-    }
+    operation_release(db);
     map.clear[Slot, Revision](?db.validated);
-    db.operation_failure    = opt[fail.Fail].none{};
     db.presentation_pending = false;
     ret err[fail.Fail].ok{};
 }
 
-# take ownership of the ended operation's failure text before discarding it; the string
-# is allocated by the db's allocator and the caller frees it. nil when none was recorded
+# take ownership of the ended operation's failure before discarding it: its text and places are
+# owned through the db's allocator and the caller frees them, and what borrowed them stays valid.
+# none when none was recorded
 # ---
 # db:        the database
 # operation: the ended operation's handle
-pub fun take_failure_message(db: *QueryDb, operation: Operation) res[str, fail.Fail] {
+pub fun take_failure(db: *QueryDb, operation: Operation) res[opt[fail.Fail], fail.Fail] {
     if (db == nil || operation.owner != db::ptr || operation.sequence != db.operation_sequence
         || db.operation_active || !db.presentation_pending) {
-        ret res[str, fail.Fail].err{fail.message("query failure message is stale or not ready")};
+        ret res[opt[fail.Fail], fail.Fail].err{fail.message("query failure is stale or not ready")};
     }
-    val message: str = db.operation_message;
-    db.operation_message = nil;
-    ret res[str, fail.Fail].ok{message};
+    val failure: opt[fail.Fail] = db.operation_failure;
+    db.operation_failure = opt[fail.Fail].none{};
+    ret res[opt[fail.Fail], fail.Fail].ok{failure};
 }
 
 # collect the ended operation's presentation: the diagnostics of every product reachable
-# from the roots through recorded dependencies, each once, plus the operation's failure
-# and message, then discard the pending state. on success the operation is over; on a
+# from the roots through recorded dependencies, each once, plus the operation's failure,
+# then discard the pending state. on success the operation is over; on a
 # failure nothing was released and the presentation is still pending
 # ---
 # db:        the database
@@ -585,8 +613,7 @@ pub fun collect(db: *QueryDb, operation: Operation, roots: *QueryKey, count: usi
     result.alloc         = a;
     result.diags         = diagnostic.store_init(a);
     result.failure       = opt[fail.Fail].none{};
-    result.message       = nil;
-    result.message_alloc = db.a;
+    result.failure_alloc = db.a;
     val store:    *diagnostic.DiagnosticStore = ?result.diags;
     var complete: bool                        = false;
     fin {
@@ -607,8 +634,7 @@ pub fun collect(db: *QueryDb, operation: Operation, roots: *QueryKey, count: usi
         i = i + 1;
     }
     result.failure       = db.operation_failure;
-    result.message       = db.operation_message;
-    db.operation_message = nil;
+    db.operation_failure = opt[fail.Fail].none{};
     val released: err[fail.Fail] = discard(db, operation);
     if (sel released.err) { ret res[*Presentation, fail.Fail].err{released.err}; }
     complete = true;
@@ -620,7 +646,7 @@ pub fun presentation_dnit(p: *Presentation) {
     if (p == nil) { ret; }
     val a: *A.Allocator = p.alloc;
     diagnostic.store_dnit(?p.diags);
-    if (p.message != nil) { str_free(p.message_alloc, p.message); }
+    if (sel p.failure.some) { fail.dnit(p.failure_alloc, p.failure.some); }
     A.deallocate[Presentation](a, p, 1);
 }
 
@@ -1463,20 +1489,17 @@ fun missing_input(db: *QueryDb, sh: *QueryShard, key: u64) fail.Fail {
     ret text_failure(db, res[str, fail.Fail].ok{built.ok});
 }
 
-# the operation's failure, its text owned by the operation; an earlier message failure stands
+# the operation's failure, a defect whose text, made through the db's allocator, the operation
+# owns; an earlier defect stands
 fun text_failure(db: *QueryDb, built: res[str, fail.Fail]) fail.Fail {
     if (sel built.err) { ret operation_fail(db, built.err); }
-    val text: str = built.ok;
-    if (sel db.operation_failure.some) {
-        if (fail.is_message(db.operation_failure.some)) {
-            str_free(db.a, text);
-            ret db.operation_failure.some;
-        }
+    val failure: fail.Fail      = fail.owning(fail.message(built.ok));
+    val stands:  opt[fail.Fail] = standing_over(db, failure);
+    if (sel stands.some) {
+        fail.dnit(db.a, failure);
+        ret borrowed(stands.some);
     }
-    db.operation_message = text;
-    val recorded: fail.Fail = fail.message(text);
-    db.operation_failure = opt[fail.Fail].some{recorded};
-    ret recorded;
+    ret operation_stand(db, failure);
 }
 
 fun cycle_message(db: *QueryDb, kind: KindIndex, key: u64) res[str, fail.Fail] {

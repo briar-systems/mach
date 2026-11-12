@@ -47,15 +47,19 @@ the key takes, and a string key never takes the empty string:
 error[manifest.value_type]: mach.toml: [target.windows-x86_64].stack_reserve must be an integer
 ```
 
-A manifest refusal points at what it refuses, on the line after the message:
-the value it rejects, the key token of a name or key it rejects, or the table a
-required key is missing from, in the manifest that states it, a dependency's
-own included. [`--diagnostics json`](diagnostics-json.md#failure-records)
+A manifest refusal points at what it refuses, after the message: the value it
+rejects, the key token of a name or key it rejects, the table a required key is
+missing from, or the start of the file when a required table is missing from
+it, in the manifest that states it, a dependency's own included.
+[`--diagnostics json`](diagnostics-json.md#failures)
 carries the same place as the failure's `primary` span.
 
 ```
 error[manifest.invalid_value]: mach.toml: profile 'debug': simd must be "scalarize" or "require" (got "fast")
- --> mach.toml:15:8
+  --> mach.toml:15:8
+   |
+15 | simd = "fast"
+   |        ^^^^^^
 ```
 
 Unknown sections and unknown keys are always errors. A path value is always
@@ -197,6 +201,9 @@ error[mach.version_unaccepted]: this is mach 5.2.1, and the dependency closure d
     app (mach.toml) requires mach ^5.3
     app -> gfx -> glfw requires mach >=5.4, <6
  --> mach.toml:2:11
+  |
+2 | mach    = "^5.3"
+  |           ^^^^^^
 ```
 
 Every manifest must state `mach`, a dependency's included. One without it is
@@ -1052,10 +1059,14 @@ removed and `float_reassoc = true` is `relax = ["float-reassoc"]`. `pass` and
 
 ```
 error[manifest.removed_key]: mach.toml: [profile.release] uses removed key 'opt'; write `optimize = true` or `optimize = false`
- --> mach.toml:12:1
- = fix: write `optimize = true`
- --> mach.toml:12:1
-   -> replace with `optimize = true`
+  --> mach.toml:12:1
+   |
+12 | opt = 2
+   | ^^^
+   |
+   = fix: write `optimize = true`
+  --> mach.toml:12:1
+     -> replace with `optimize = true`
 ```
 
 ### Passes
@@ -1069,10 +1080,14 @@ function, the `#[vectorize("never")]` decorator is the finer-grained opt-out
 ### Profile requirement and selection
 
 Every manifest declares at least one `[profile.*]` table, a dependency's
-included. One that declares none is refused:
+included. One that declares none is refused, pointing at the start of the file:
 
 ```
 error[manifest.missing_required]: mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring optimize, debug and simd
+ --> mach.toml:1:1
+  |
+1 | [project]
+  | ^
 ```
 
 `mach init` writes `debug` (`optimize = false`, `debug = true`, `default = true`) and
@@ -1294,6 +1309,9 @@ points at the `--set` text rather than at a line of `mach.toml`:
 ```
 error[catalog.unsupported]: --set subsystem: Subsystem windows is unsupported by linux (target 'linux-x86_64' runs on linux, whose images state no subsystem)
  --> --set:1:13
+  |
+1 | subsystem = windows
+  |             ^^^^^^^
 ```
 
 The previous major's `--subsystem`, `--base`, `--stack-reserve`,

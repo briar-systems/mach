@@ -129,12 +129,15 @@ app_manifest: the `manifest` path, or STR_NIL when absent; `bin` artifacts only
 sections: the `sections` key, the output sections the link places ahead of the
                rest, in order; nil when absent
 section_count: length of `sections`
+sections_at: where each `sections` entry is written, parallel to `sections`
 size: the `size` key, the most bytes the image loads from its base, none
                when absent
+size_at: where its `size` value is written, the zero place when absent
 regions: the `[artifact.X.region.<name>]` tables, the memory regions the link
                lays sections into; nil when none is written
 region_count: length of `regions`
 at: where the table's key is written
+kind_at: where its `kind` value is written
 default_at: where its `default` value is written, the zero place when absent
 export_at: where its `export` value is written, the zero place when absent
 entry_at: where its `entry` value is written

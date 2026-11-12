@@ -163,8 +163,8 @@ operation's failure if it had one. released with presentation_dnit, exactly once
 
 alloc: owns the presentation and its store
 diags: the collected diagnostics, in dependency order, each product once
-failure: the operation's failure; absent when every product computed
-message: the failure's text when one was recorded, owned by the db's allocator
+failure: the operation's failure, owning its text and places through `failure_alloc`; absent
+         when every product computed
 
 ## rec QueryOutput
 
@@ -220,14 +220,14 @@ pub fun drop_failure(db: *QueryDb);
 
 release the text and the places of the last failure the database holds
 
-## fun adopt_failure_text
+## fun adopt_failure
 
 ```mach
-pub fun adopt_failure_text(db: *QueryDb, text: str);
+pub fun adopt_failure(db: *QueryDb, failure: fail.Fail);
 ```
 
-hold the text an operation handed back, allocated from the query database, as the held
-failure's text; the database owns it from here
+hold the failure an operation handed back, its text and places owned through the query
+database, as the held failure, replacing what the slot held; the database owns it from here
 
 ## fun hold_failure
 
@@ -307,14 +307,15 @@ its message are dropped and the db accepts the next begin
 db: the database
 operation: the ended operation's handle
 
-## fun take_failure_message
+## fun take_failure
 
 ```mach
-pub fun take_failure_message(db: *QueryDb, operation: Operation) res[str, fail.Fail];
+pub fun take_failure(db: *QueryDb, operation: Operation) res[opt[fail.Fail], fail.Fail];
 ```
 
-take ownership of the ended operation's failure text before discarding it; the string
-is allocated by the db's allocator and the caller frees it. nil when none was recorded
+take ownership of the ended operation's failure before discarding it: its text and places are
+owned through the db's allocator and the caller frees them, and what borrowed them stays valid.
+none when none was recorded
 
 db: the database
 operation: the ended operation's handle
@@ -327,8 +328,8 @@ a: *A.Allocator) res[*Presentation, fail.Fail];
 ```
 
 collect the ended operation's presentation: the diagnostics of every product reachable
-from the roots through recorded dependencies, each once, plus the operation's failure
-and message, then discard the pending state. on success the operation is over; on a
+from the roots through recorded dependencies, each once, plus the operation's failure,
+then discard the pending state. on success the operation is over; on a
 failure nothing was released and the presentation is still pending
 
 db: the database

@@ -5,9 +5,9 @@ Every command takes `--diagnostics <human|json>`, or `--diagnostics=json`, and
 after `=` in its own word.
 `human`, the default, is the rendering shown in [diagnostics.md](diagnostics.md).
 `json` writes everything the command reports as JSON objects, one per line of
-stderr (NDJSON), for editors, CI and other tools: each diagnostic, each failure
+stderr (NDJSON), for editors, CI and other tools: each diagnostic, a failure
 raised outside the compiler's diagnostics (a manifest, dependency, build-step,
-link or command-line refusal), each test result under `mach test`, the build
+link or command-line refusal) included, each test result under `mach test`, the build
 readout under `-v` and `-vv`, and a closing summary. The records are the contract: the human text may change from
 release to release, and a record changes only under the
 [stability rule](#stability). The flag changes no exit code.
@@ -38,20 +38,20 @@ and `-vv` write the [readout](readout.md) as [readout records](#readout-records)
 ## A record
 
 ```json
-{"schema":1,"record":"diagnostic","severity":"error","code":"name.unresolved","message":"unresolved identifier `helpr`","origin":"resolve","primary":{"file":"src/main.mach","line":5,"column":18,"end_line":5,"end_column":23,"byte_start":107,"byte_end":112},"related":[],"notes":[],"help":["did you mean `helper`?"],"fixes":[{"label":"replace with `helper`","edits":[{"file":"src/main.mach","line":5,"column":18,"end_line":5,"end_column":23,"byte_start":107,"byte_end":112,"replacement":"helper"}]}]}
+{"schema":2,"record":"diagnostic","severity":"error","code":"name.unresolved","message":"unresolved identifier `helpr`","origin":"resolve","primary":{"file":"src/main.mach","line":5,"column":18,"end_line":5,"end_column":23,"byte_start":107,"byte_end":112},"related":[],"notes":[],"help":["did you mean `helper`?"],"fixes":[{"label":"replace with `helper`","edits":[{"file":"src/main.mach","line":5,"column":18,"end_line":5,"end_column":23,"byte_start":107,"byte_end":112,"replacement":"helper"}]}]}
 ```
 
 A type error in a generic instance, whose primary span covers two lines and
 whose related site is in another file:
 
 ```json
-{"schema":1,"record":"diagnostic","severity":"error","code":"operator.operand_mismatch","message":"type mismatch: incompatible operand types `R` and `i64`","origin":"sema","primary":{"file":"src/main.mach","line":6,"column":16,"end_line":7,"end_column":11,"byte_start":111,"byte_end":127},"related":[{"file":"src/lib.mach","line":3,"column":9,"end_line":3,"end_column":14,"byte_start":53,"byte_end":58,"label":"in this generic body, checked against this instance's type arguments"}],"notes":[],"help":[],"fixes":[]}
+{"schema":2,"record":"diagnostic","severity":"error","code":"operator.operand_mismatch","message":"type mismatch: incompatible operand types `R` and `i64`","origin":"sema","primary":{"file":"src/main.mach","line":6,"column":16,"end_line":7,"end_column":11,"byte_start":111,"byte_end":127},"related":[{"file":"src/lib.mach","line":3,"column":9,"end_line":3,"end_column":14,"byte_start":53,"byte_end":58,"label":"in this generic body, checked against this instance's type arguments"}],"notes":[],"help":[],"fixes":[]}
 ```
 
 | Member | Type | Meaning |
 |---|---|---|
 | `schema` | integer | the schema version, `1` |
-| `record` | string | the record type, `"diagnostic"`, or `"failure"` for a [failure](#failure-records) |
+| `record` | string | the record type, `"diagnostic"`, a [failure](#failures) included |
 | `severity` | string | `"error"`, `"warning"` or `"note"` |
 | `code` | string | the diagnostic's key from the [registry](diagnostics.md#the-registry), such as `name.unresolved`; the stable identity of the kind |
 | `message` | string | the primary text; its wording may change, the `code` does not |
@@ -104,30 +104,30 @@ A key names a rule, not a phase, so one key can arrive from two origins:
 `secret.branch` is `sema` when the type checker finds it and `codegen` when
 the constant-time validator does.
 
-## Failure records
+## Failures
 
-A failure raised outside the compiler's diagnostics, the ones the human
-rendering prints as an `error[<key>]: <message>` line with no source excerpt,
-is a record with `"record": "failure"` and the members of a diagnostic record.
-Its `severity` is `"error"`, its `code` the failure's key, and `notes`, `help`
-and `fixes` are empty.
+A failure raised outside the compiler's diagnostics is a diagnostic record, as
+the human rendering shows it as a diagnostic: the snippet at its place, its
+related places and its fix. Its `severity` is `"error"`, its `code` the
+failure's key, and its `notes` and `help` are empty.
 
 ```json
-{"schema":1,"record":"failure","severity":"error","code":"link.entry_missing","message":"undefined entry symbol '_start'; ensure the target startup library is linked","origin":"link","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
+{"schema":2,"record":"diagnostic","severity":"error","code":"link.entry_missing","message":"undefined entry symbol '_start'; ensure the target startup library is linked","origin":"link","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
 ```
 
 `primary` is the span in the file that caused the failure, or `null` when no
 file did. A manifest refusal points into the `mach.toml` that made the claim it
-refuses: a value it rejects, the key token of a name or key it rejects, or the
-table a required key is missing from. A dependency's refusal points into the
+refuses: a value it rejects, the key token of a name or key it rejects, the
+table a required key is missing from, or the start of the file when a required
+table is missing from it. A dependency's refusal points into the
 dependency's own manifest, not the root that imported it. Its `file` follows
 the rule for every span, so a dependency's manifest is `dep/libx/mach.toml`,
-and `dep\libx\mach.toml` on Windows. The human rendering shows the same place on
-the line after the headline, as `--> <file>:<line>:<column>`, naming the file by
-the path it was read at, as it names a source file.
+and `dep\libx\mach.toml` on Windows. The human rendering shows the same place
+after the headline, as `--> <file>:<line>:<column>` and the snippet, naming the
+file by the path it was read at, as it names a source file.
 
 ```json
-{"schema":1,"record":"failure","severity":"error","code":"version.invalid_range","message":"mach.toml: [project].mach = \"^x\": expected a number (clause 1)","origin":"build","primary":{"file":"mach.toml","line":2,"column":8,"end_line":2,"end_column":12,"byte_start":17,"byte_end":21},"related":[],"notes":[],"help":[],"fixes":[]}
+{"schema":2,"record":"diagnostic","severity":"error","code":"version.invalid_range","message":"mach.toml: [project].mach = \"^x\": expected a number (clause 1)","origin":"build","primary":{"file":"mach.toml","line":2,"column":8,"end_line":2,"end_column":12,"byte_start":17,"byte_end":21},"related":[],"notes":[],"help":[],"fixes":[]}
 ```
 
 A refusal raised later from the parsed manifest, while a build is laid out or
@@ -156,12 +156,12 @@ A refusal between several entries points at the first and lists the others in
 - a cycle among `need` entries, at the entry of its first edge, the entries of
   the other edges related
 
-The human rendering shows each related place on its own `-->` line after the
-primary's. A target or profile named on the command line that the manifest does
+The human rendering shows each related place with its own `-->` line and
+snippet after the primary's. A target or profile named on the command line that the manifest does
 not declare is caused by no entry in it, so its refusal has no `primary`.
 
 ```json
-{"schema":1,"record":"failure","severity":"error","code":"need.cycle","message":"mach.toml: 'need' cycle: step.a -> step.b -> step.a","origin":"build","primary":{"file":"mach.toml","line":12,"column":9,"end_line":12,"end_column":17,"byte_start":141,"byte_end":149},"related":[{"file":"mach.toml","line":18,"column":9,"end_line":18,"end_column":17,"byte_start":216,"byte_end":224,"label":null}],"notes":[],"help":[],"fixes":[]}
+{"schema":2,"record":"diagnostic","severity":"error","code":"need.cycle","message":"mach.toml: 'need' cycle: step.a -> step.b -> step.a","origin":"build","primary":{"file":"mach.toml","line":12,"column":9,"end_line":12,"end_column":17,"byte_start":141,"byte_end":149},"related":[{"file":"mach.toml","line":18,"column":9,"end_line":18,"end_column":17,"byte_start":216,"byte_end":224,"label":null}],"notes":[],"help":[],"fixes":[]}
 ```
 
 `origin` names the phase the failure came from: `build` for the manifest,
@@ -179,9 +179,9 @@ a `test` record per test in the order the tests finish, and closes with a
 `skip` record, and under `--list` each collected test is a `case` record.
 
 ```json
-{"schema":1,"record":"run_start","tests":14}
-{"schema":1,"record":"test","name":"app.main#parses","module":"app.main","file":"src/main.mach","line":10,"index":4,"target":"linux","profile":"debug","outcome":"exit","code":3,"timeout_ns":0,"duration_ns":1204000,"exe":"out/linux/debug/test/app/app","output":"out/linux/debug/test/app/log/4.log","origin":"test"}
-{"schema":1,"record":"run_end","passed":13,"failed":1,"skipped":0,"total":14,"duration_ns":61000000,"mismatch":1,"unsupported":0,"target_unavailable":0,"infrastructure_failure":0,"resource_exhaustion":0,"timed_out":0,"invalid_injection":0,"origin":"test"}
+{"schema":2,"record":"run_start","tests":14}
+{"schema":2,"record":"test","name":"app.main#parses","module":"app.main","file":"src/main.mach","line":10,"index":4,"target":"linux","profile":"debug","outcome":"exit","code":3,"timeout_ns":0,"duration_ns":1204000,"exe":"out/linux/debug/test/app/app","output":"out/linux/debug/test/app/log/4.log","origin":"test"}
+{"schema":2,"record":"run_end","passed":13,"failed":1,"skipped":0,"total":14,"duration_ns":61000000,"mismatch":1,"unsupported":0,"target_unavailable":0,"infrastructure_failure":0,"resource_exhaustion":0,"timed_out":0,"invalid_injection":0,"origin":"test"}
 ```
 
 A `test` or `case` record names its test with these members:
@@ -225,10 +225,10 @@ stderr is a record, written when the line would be and in the same order. Times
 are integer microseconds.
 
 ```json
-{"schema":1,"record":"unit","verb":"building","artifact":"app","target":"linux","profile":"debug"}
-{"schema":1,"record":"phase","name":"load","count":48,"unit":"modules","time_us":77012}
-{"schema":1,"record":"phase","name":"codegen","count":48,"unit":"modules","time_us":75012,"threads":16,"slowest":"std.filesystem","slowest_us":9104}
-{"schema":1,"record":"phase","name":"other","time_us":32007}
+{"schema":2,"record":"unit","verb":"building","artifact":"app","target":"linux","profile":"debug"}
+{"schema":2,"record":"phase","name":"load","count":48,"unit":"modules","time_us":77012}
+{"schema":2,"record":"phase","name":"codegen","count":48,"unit":"modules","time_us":75012,"threads":16,"slowest":"std.filesystem","slowest_us":9104}
+{"schema":2,"record":"phase","name":"other","time_us":32007}
 ```
 
 A **unit** record opens each unit, before its rows. It is written for every
@@ -262,7 +262,7 @@ Under `-vv` a **phase_item** record is each module or file a phase processed,
 written as it finishes, before its phase's record:
 
 ```json
-{"schema":1,"record":"phase_item","phase":"load","name":"std.filesystem","time_us":2013}
+{"schema":2,"record":"phase_item","phase":"load","name":"std.filesystem","time_us":2013}
 ```
 
 | Member | Type | Meaning |
@@ -276,8 +276,8 @@ of the phase that counted it, and under `-vv` one is also written for each modul
 named by it, as its step finishes:
 
 ```json
-{"schema":1,"record":"counter","counter":"ir instrs","name":"std.filesystem","value":20811}
-{"schema":1,"record":"counter","counter":"ir instrs","value":412093}
+{"schema":2,"record":"counter","counter":"ir instrs","name":"std.filesystem","value":20811}
+{"schema":2,"record":"counter","counter":"ir instrs","value":412093}
 ```
 
 | Member | Type | Meaning |
@@ -290,7 +290,7 @@ Under `-v` a **growth** record is a growing cycle of instances, written each tim
 instance count doubles:
 
 ```json
-{"schema":1,"record":"growth","module":"app.main","members":"peel","instances":32}
+{"schema":2,"record":"growth","module":"app.main","members":"peel","instances":32}
 ```
 
 | Member | Type | Meaning |
@@ -307,12 +307,12 @@ A unit's `built` line is not a record of its own: it is carried by the
 Every run ends with one summary record, the last line on stderr:
 
 ```json
-{"schema":1,"record":"summary","errors":1,"warnings":0,"notes":0,"outcome":"failure","exit_code":1}
+{"schema":2,"record":"summary","errors":1,"warnings":0,"notes":0,"outcome":"failure","exit_code":1}
 ```
 
 | Member | Type | Meaning |
 |---|---|---|
-| `errors` | integer | the diagnostic and failure records before it with severity `"error"` |
+| `errors` | integer | the diagnostic records before it with severity `"error"` |
 | `warnings` | integer | those with severity `"warning"` |
 | `notes` | integer | those with severity `"note"` |
 | `outcome` | string | `"success"` when the command exits 0, otherwise `"failure"` |
@@ -324,12 +324,13 @@ A `built` object has the unit's `out` (string), `modules` (integer), `bytes`
 (integer, present when the line shows a size) and `time_us` (integer).
 
 ```json
-{"schema":1,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"success","exit_code":0,"time_us":358120,"built":[{"out":"out/linux/debug/bin/app","modules":48,"bytes":1048576,"time_us":358120}]}
+{"schema":2,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"success","exit_code":0,"time_us":358120,"built":[{"out":"out/linux/debug/bin/app","modules":48,"bytes":1048576,"time_us":358120}]}
 ```
 
 ## Stability
 
-- Every record carries `"schema": 1`.
+- Every record carries `"schema": 2`. Schema 2 writes a failure as a
+  diagnostic record, where schema 1 wrote it as a `"failure"` record.
 - **Compatible changes keep the version:** a new member in a record or a span,
   a new record type, and a new value of an enumerated member (`severity`,
   `origin`, `record`). A tool ignores members it does not know, skips records
