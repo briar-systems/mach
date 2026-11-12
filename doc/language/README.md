@@ -8,7 +8,7 @@ doc with grammar, examples, and neighboring links. Start from the index below.
 
 ## Files and structure
 
-- [files.md](files.md) — extensions, `lib.mach` / `main.mach` conventions
+- [files.md](files.md) — extensions, the `src/bin/` / `src/lib/` entry conventions
 - [modules.md](modules.md) — module tree, path separator, shadow-module pattern
 - [use.md](use.md) — imports
 - [fwd.md](fwd.md) — re-exports

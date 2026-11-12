@@ -75,8 +75,8 @@ error[manifest.missing_required]: dep 'gfx': mach.toml: missing [profile] table;
 ```
 
 What a consumer *uses* from a dependency's manifest is its export surface: the
-project id, the module a bare `use <id>;` binds (see
-[modules.md](modules.md#bare-project-id-imports)), its
+project id, its source modules, which a consumer imports by source path (see
+[modules.md](modules.md#a-use-path-is-a-project-id-and-a-source-path)), its
 `export = true` link entries, the steps those entries demand, and what its
 `export = true` library artifact requires — the artifacts and steps named in
 that artifact's `need` (see

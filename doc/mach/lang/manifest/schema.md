@@ -94,6 +94,15 @@ value: the value, as written
 ret: the setting; a user failure naming the key when no row names it, when its row is not
          one `--set` writes, or when the value does not have its row's shape
 
+## fun toml_string
+
+```mach
+pub fun toml_string(b: *textbuild.TextBuilder, text: str);
+```
+
+`text` as a TOML basic string: a quote and a backslash escaped by a backslash, and a control
+byte, which a basic string cannot hold, as its `\u00XX` escape
+
 ## fun section_check
 
 ```mach

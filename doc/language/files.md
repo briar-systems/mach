@@ -3,9 +3,11 @@
 Source files use the `.mach` extension. A project has a `mach.toml` at its
 root, a source directory the manifest names (`src` by convention), and one
 entry module per artifact, named by the artifact's `entry` key. The
-compiler attaches no meaning to any file name: `mach init` scaffolds
-`src/main.mach` for a binary and `src/lib.mach` for a library, and either
-basename is arbitrary.
+compiler attaches no meaning to any file name. By convention an entry sits
+in a directory of its own, so nothing else under `src` reads as one:
+`src/bin/` for an executable and `src/lib/` for a library. `mach init`
+scaffolds `src/bin/main.mach` for a binary and `src/lib/<id>.mach` for a
+library.
 
 An artifact's build is rooted at its entry module and follows `use` and `fwd`
 edges from there; a file under `src` that no entry reaches is not part of that
@@ -41,39 +43,55 @@ is irrelevant, so `fun entry(...)` tagged `#[symbol("main")]` works identically.
 
 The project manifest. It declares the project's identity, its targets, its
 profiles, its artifacts, and its dependencies; every table is required to be
-complete. The full reference is [manifest.md](manifest.md). A minimal
-binary project, as `mach init` writes it for one target:
+complete. The full reference is [manifest.md](manifest.md). A binary
+project as `mach init` writes it, shown with one of the six targets it
+declares (`linux-x86_64`, `linux-aarch64`, `linux-riscv64`, `darwin-x86_64`,
+`darwin-aarch64`, `windows-x86_64`), each stating every part mink's catalog
+gives it, the instruction set its floor:
 
 ```toml
 [project]
 id = "myproj"
 version = "0.1.0"
-mach = "^5.3"
+mach = "^7.0"
 src = "src"
 work = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
 arch = "x86_64"
+isa  = "cmov,cx8,x87,fxsr,osfxsr,mmx,sce,sse,sse2"
 sys  = "linux"
-abi = "sysv64"
+abi  = "sysv64"
 
 [artifact.myproj]
 kind = "bin"
-entry = "main.mach"
+entry = "bin/main.mach"
 out = "{project.work}/bin/myproj{artifact.suffix}"
 targets = ["*"]
-link = []
-need = []
 
 [profile.debug]
+default = true
 optimize = false
 debug = true
 simd = "scalarize"
 
+[profile.release]
+optimize = true
+debug = false
+simd = "scalarize"
+
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "branch/main"
+version = "^X.Y.Z"
 ```
+
+The manifest declares no `[link.*]` table: the system libraries a program
+needs on darwin and windows are std's `export = true` entries, which travel to
+every project that uses it. A library project (`mach init --lib`) differs only
+in its artifact, a `static` one with `entry = "lib/<id>.mach"` and
+`export = true`. The `[dep.std]` range is the one `mach dep add` writes, with
+`X.Y.Z` the std release resolution picks for the running compiler (see
+[dependencies.md](dependencies.md#releases-and-resolution)).
 
 The `id` is the root of every module path the project exposes. A file at
 `src/foo/bar.mach` is reachable as `myproj.foo.bar`. The dependency `std` is
