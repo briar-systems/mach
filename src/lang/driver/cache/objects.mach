@@ -1,0 +1,238 @@
+# the digests of the objects a cell's builds wrote into `obj/`: for each object, by its path under
+# `obj/`, the sha-256 of its bytes as they were written. a restored object must be the object that
+# was written, so a restore hashes the bytes it reads and reuses the object only when they match
+# what its path's entry holds; an object with no entry, or whose bytes differ, is rebuilt. the
+# digests live at `<out>/.cache/objects`, written after the objects they describe are in place, so
+# an interrupted build leaves an entry that names the old bytes or none, never one naming bytes
+# that were not written. a store that is missing, truncated or damaged reads as empty. the layout
+# is `"MOD1"`, the entry count, the entries, then the sha-256 of everything before it. an entry is
+# its path (length then bytes) then its 32-byte digest, every number a little-endian u32
+use mach.lang.fail;
+use mach.lang.output;
+use mach.lang.wire;
+use A: std.allocator;
+use std.collections.map;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.crypto.hash.fnv1a;
+use std.crypto.hash.sha256;
+use fs: std.filesystem;
+use std.memory;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+val MAGIC:       u32   = 0x31444F4D;
+val HEADER:      usize = 8;
+val ENTRY_FIXED: usize = 4 + 1 + 32;
+val TRAILER:     usize = 32;
+
+rec Entry {
+    path:   str;
+    digest: [32]u8;
+}
+
+pub rec Store {
+    alloc:   *A.Allocator;
+    entries: Vector[Entry];
+    index:   map.Map[u64, u32];
+    dirty:   bool;
+}
+
+pub fun init(a: *A.Allocator) Store {
+    ret Store{alloc: a, entries: collections_vector.init[Entry](a), index: map.init[u64, u32](a)};
+}
+
+pub fun dnit(st: *Store) {
+    var i: usize = 0;
+    for (i < st.entries.len) {
+        str_free(st.alloc, st.entries.data[i].path);
+        i = i + 1;
+    }
+    collections_vector.dnit[Entry](?st.entries);
+    map.dnit[u64, u32](?st.index);
+}
+
+fun path_hash(bytes: *u8, len: usize) u64 {
+    ret fnv1a.step_bytes(fnv1a.FNV_INIT, bytes, len);
+}
+
+fun find(st: *Store, path: str) opt[u32] {
+    var h:         u64       = path_hash(path::*u8, str_len(path));
+    val opt_found: opt[*u32] = map.get[u64, u32](?st.index, ?h);
+    if (sel opt_found.none) { ret opt[u32].none{}; }
+    val at: u32 = @opt_found.some;
+    if (!str_equals(st.entries.data[at].path, path)) { ret opt[u32].none{}; }
+    ret opt[u32].some{at};
+}
+
+# the digest of the object written at `path` under `obj/`, none when no build recorded one
+pub fun written(st: *Store, path: str) opt[[32]u8] {
+    val opt_at: opt[u32] = find(st, path);
+    if (sel opt_at.none) { ret opt[[32]u8].none{}; }
+    ret opt[[32]u8].some{st.entries.data[opt_at.some].digest};
+}
+
+# the object at `path` under `obj/` was written as the `len` bytes at `bytes`
+pub fun put(st: *Store, path: str, bytes: *u8, len: usize) err[A.Error] {
+    var sum: [32]u8;
+    sha256.hash(bytes, len, ?sum[0]);
+    val opt_at: opt[u32] = find(st, path);
+    if (sel opt_at.some) {
+        st.entries.data[opt_at.some].digest = sum;
+        st.dirty                            = true;
+        ret err[A.Error].ok{};
+    }
+    var h:         u64       = path_hash(path::*u8, str_len(path));
+    val opt_taken: opt[*u32] = map.get[u64, u32](?st.index, ?h);
+    # a path whose hash another path holds is not recorded, so its object is always rebuilt
+    if (sel opt_taken.some) { ret err[A.Error].ok{}; }
+    val res_copy: res[str, A.Error] = dup_bytes(st.alloc, path::*u8, str_len(path));
+    if (sel res_copy.err) { ret err[A.Error].err{res_copy.err}; }
+    val res_push: res[usize, A.Error] = collections_vector.push[Entry](?st.entries, Entry{path: res_copy.ok, digest: sum});
+    if (sel res_push.err) {
+        str_free(st.alloc, res_copy.ok);
+        ret err[A.Error].err{res_push.err};
+    }
+    val res_insert: res[bool, A.Error] = map.insert[u64, u32](?st.index, h, (st.entries.len - 1)::u32);
+    if (sel res_insert.err) { ret err[A.Error].err{res_insert.err}; }
+    st.dirty = true;
+    ret err[A.Error].ok{};
+}
+
+fun holds_nul(bytes: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (bytes[i] == 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun dup_bytes(a: *A.Allocator, bytes: *u8, len: usize) res[str, A.Error] {
+    val res_allocate: res[*u8, A.Error] = A.allocate[u8](a, len + 1);
+    if (sel res_allocate.err) { ret res[str, A.Error].err{res_allocate.err}; }
+    val buf: *u8 = res_allocate.ok;
+    memory.raw_copy(buf::ptr, bytes::ptr, len);
+    buf[len] = 0;
+    ret res[str, A.Error].ok{buf::str};
+}
+
+# the store `bytes` hold: every entry, or none at all when the bytes are not a complete store.
+# err only when allocation fails
+pub fun decode(a: *A.Allocator, bytes: *u8, len: usize) res[Store, A.Error] {
+    var st:     Store = init(a);
+    var handed: bool  = false;
+    fin {
+        if (!handed) { dnit(?st); }
+    }
+    if (bytes == nil || len < HEADER + TRAILER) {
+        handed = true;
+        ret res[Store, A.Error].ok{st};
+    }
+    var sum: [32]u8;
+    sha256.hash(bytes, len - TRAILER, ?sum[0]);
+    if (!memory.raw_equal((?sum[0])::ptr, (bytes::usize + len - TRAILER)::ptr, 32)) {
+        handed = true;
+        ret res[Store, A.Error].ok{st};
+    }
+    var r: wire.Source = wire.source(bytes, len - TRAILER);
+    if (wire.take_u32(?r) != MAGIC) {
+        handed = true;
+        ret res[Store, A.Error].ok{st};
+    }
+    val count: u32 = wire.take_count(?r, ENTRY_FIXED);
+    var i:     u32 = 0;
+    for (i < count && !r.bad) {
+        var path_len: usize = 0;
+        val path_at:  *u8   = wire.take_sized(?r, ?path_len);
+        var digest:   [32]u8;
+        wire.take_into(?r, ?digest[0], 32);
+        if (r.bad || path_len == 0 || holds_nul(path_at, path_len)) {
+            wire.reject(?r);
+            brk;
+        }
+        var h:         u64       = path_hash(path_at, path_len);
+        val opt_clash: opt[*u32] = map.get[u64, u32](?st.index, ?h);
+        if (sel opt_clash.some) {
+            wire.reject(?r);
+            brk;
+        }
+        val res_copy: res[str, A.Error] = dup_bytes(a, path_at, path_len);
+        if (sel res_copy.err) { ret res[Store, A.Error].err{res_copy.err}; }
+        val res_push: res[usize, A.Error] = collections_vector.push[Entry](?st.entries, Entry{path: res_copy.ok, digest: digest});
+        if (sel res_push.err) {
+            str_free(a, res_copy.ok);
+            ret res[Store, A.Error].err{res_push.err};
+        }
+        val res_insert: res[bool, A.Error] = map.insert[u64, u32](?st.index, h, (st.entries.len - 1)::u32);
+        if (sel res_insert.err) { ret res[Store, A.Error].err{res_insert.err}; }
+        i = i + 1;
+    }
+    if (r.bad || !wire.done(?r)) {
+        dnit(?st);
+        st = init(a);
+    }
+    handed = true;
+    ret res[Store, A.Error].ok{st};
+}
+
+# the store at `file`, empty when there is none or it cannot be read
+pub fun load(a: *A.Allocator, file: str) res[Store, A.Error] {
+    val res_read: res[Vector[u8], fs.FsError] = fs.read_bytes(a, file);
+    if (sel res_read.err) { ret res[Store, A.Error].ok{init(a)}; }
+    var bytes: Vector[u8] = res_read.ok;
+    fin { collections_vector.dnit[u8](?bytes); }
+    ret decode(a, bytes.data, bytes.len);
+}
+
+fun put_store(w: *wire.Sink, st: *Store) {
+    wire.put_u32(w, MAGIC);
+    wire.put_u32(w, st.entries.len::u32);
+    var i: usize = 0;
+    for (i < st.entries.len) {
+        val e: *Entry = ?st.entries.data[i];
+        wire.put_sized(w, e.path::*u8, str_len(e.path));
+        wire.put_bytes(w, ?e.digest[0], 32);
+        i = i + 1;
+    }
+}
+
+rec StoreWrite {
+    bytes: *u8;
+    len:   usize;
+}
+
+fun write_store(w: *StoreWrite, t: *output.Temporary) err[fail.Fail] {
+    ret output.fill(t, w.bytes, w.len, 0o644);
+}
+
+# write the store to `file` through a sibling temporary when an entry changed
+pub fun store(st: *Store, out_dir: str, file: str) err[fail.Fail] {
+    if (!st.dirty) { ret err[fail.Fail].ok{}; }
+    val err_reserve: err[fail.Fail] = output.reserve(st.alloc, out_dir, file);
+    if (sel err_reserve.err) { ret err_reserve; }
+    var measure: wire.Sink = wire.measure();
+    put_store(?measure, st);
+    val total:        usize             = measure.len + TRAILER;
+    val res_allocate: res[*u8, A.Error] = A.allocate[u8](st.alloc, total);
+    if (sel res_allocate.err) { ret err[fail.Fail].err{fail.refused(res_allocate.err)}; }
+    val buf: *u8 = res_allocate.ok;
+    fin { A.deallocate[u8](st.alloc, buf, total); }
+    var w: wire.Sink = wire.fixed(buf, measure.len);
+    put_store(?w, st);
+    sha256.hash(buf, w.len, (buf::usize + w.len)::*u8);
+    var write:     StoreWrite     = StoreWrite{bytes: buf, len: total};
+    val err_write: err[fail.Fail] = output.through_temporary[StoreWrite](st.alloc, file, ?write, write_store);
+    if (sel err_write.err) { ret err_write; }
+    st.dirty = false;
+    ret err[fail.Fail].ok{};
+}

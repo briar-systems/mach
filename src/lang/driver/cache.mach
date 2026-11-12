@@ -16,8 +16,11 @@
 # symbol and the surfaces of the modules it reads, so an instance whose record
 # stands is not typed. a skipped module, or an instance only records name, is
 # typed only when something that must be rebuilt from its typed form needs it.
-# source digests come from the per-file digest memo in the cell's `.cache`
-# directory (driver/cache/memo)
+# nothing about a file but its bytes decides anything: every source text load
+# read is hashed each build, and the digest memo in the cell's `.cache`
+# directory (driver/cache/memo) keeps only what a text's digest names. an
+# object is reused only when its bytes hash to what the build that wrote it
+# recorded (driver/cache/objects)
 use cache_key: mach.lang.driver.cache.key;
 use mach.lang.diagnostic;
 use mach.lang.driver.frontend;
@@ -47,7 +50,8 @@ use mach.lang.driver.backend;
 use mach.lang.driver.cache.compiler;
 use cache_instances: mach.lang.driver.cache.instances;
 use mach.lang.driver.cache.memo;
-use cache_record: mach.lang.driver.cache.record;
+use cache_objects: mach.lang.driver.cache.objects;
+use cache_record:  mach.lang.driver.cache.record;
 use mach.lang.driver.declared;
 use mach.lang.driver.demand;
 use mach.lang.driver.surface;
@@ -64,7 +68,6 @@ use mach.lang.host;
 use manifest_link: mach.lang.manifest.link;
 use mach.lang.wire;
 use mink.model.object.Object;
-use std.chrono.time;
 use collections_vector: std.collections.vector;
 use std.collections.vector.Vector;
 use std.crypto.hash.sha256;
@@ -367,13 +370,82 @@ rec Cached {
     facts:  cache_record.Facts;
 }
 
-# the object at `location` when its record says it was built under `expected`, none on a
-# miss: an object that is missing, unreadable, carries no record or a damaged one, or was
-# built under another key is rebuilt, never reused. err only when allocation fails
+# where the cell keeps the digests of the objects its builds wrote: `<out>/.cache/objects`, none
+# for a build without such a directory
+fun objects_path(p: *project.Project, scratch: *A.Allocator) res[opt[str], fail.Fail] {
+    if (p.cache_dir == nil) { ret res[opt[str], fail.Fail].ok{opt[str].none{}}; }
+    val res_join: res[str, A.Error] = types_path.join(scratch, p.cache_dir, "objects");
+    if (sel res_join.err) { ret res[opt[str], fail.Fail].err{fail.refused(res_join.err)}; }
+    ret res[opt[str], fail.Fail].ok{opt[str].some{res_join.ok}};
+}
+
+# the path of `location` under `obj/`, which names its digest, borrowed from `location`; nil when
+# it lies elsewhere
+fun under_objects(p: *project.Project, location: str) str {
+    if (p.object_dir == nil || location == nil) { ret nil; }
+    var n: usize = str_len(p.object_dir);
+    if (str_len(location) <= n || !memory.raw_equal(location::ptr, p.object_dir::ptr, n)) { ret nil; }
+    if (n > 0 && p.object_dir[n - 1] == '/')                                              { ret (location::usize + n)::str; }
+    if (location[n] != '/')                                                               { ret nil; }
+    ret (location::usize + n + 1)::str;
+}
+
+# read the digests of the objects the cell's builds wrote, empty when there are none
+fun read_written(p: *project.Project) err[fail.Fail] {
+    cache_objects.dnit(?p.object_digests);
+    p.object_digests = cache_objects.init(p.alloc);
+    val res_path: res[opt[str], fail.Fail] = objects_path(p, p.s.backing);
+    if (sel res_path.err)     { ret err[fail.Fail].err{res_path.err}; }
+    if (sel res_path.ok.none) { ret err[fail.Fail].ok{}; }
+    val res_load: res[cache_objects.Store, A.Error] = cache_objects.load(p.alloc, res_path.ok.some);
+    str_free(p.s.backing, res_path.ok.some);
+    if (sel res_load.err) { ret err[fail.Fail].err{fail.refused(res_load.err)}; }
+    p.object_digests = res_load.ok;
+    ret err[fail.Fail].ok{};
+}
+
+# the object written to `location` was the `len` bytes at `bytes`: a keyed object under `obj/`
+# is remembered by its digest for the restore that reads it back
+pub fun note_written(p: *project.Project, location: str, bytes: *u8, len: usize) err[fail.Fail] {
+    if (!p.cache_ready) { ret err[fail.Fail].ok{}; }
+    val rel: str = under_objects(p, location);
+    if (rel == nil) { ret err[fail.Fail].ok{}; }
+    val err_put: err[A.Error] = cache_objects.put(?p.object_digests, rel, bytes, len);
+    if (sel err_put.err) { ret err[fail.Fail].err{fail.refused(err_put.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# store the digests of the objects this build wrote, once they are in place
+pub fun store_written(p: *project.Project) err[fail.Fail] {
+    if (!p.cache_ready) { ret err[fail.Fail].ok{}; }
+    val res_path: res[opt[str], fail.Fail] = objects_path(p, p.s.backing);
+    if (sel res_path.err)     { ret err[fail.Fail].err{res_path.err}; }
+    if (sel res_path.ok.none) { ret err[fail.Fail].ok{}; }
+    val err_store: err[fail.Fail] = cache_objects.store(?p.object_digests, p.out_dir, res_path.ok.some);
+    str_free(p.s.backing, res_path.ok.some);
+    ret err_store;
+}
+
+# the object at `location` when its bytes are the bytes a build wrote there and its record says
+# it was built under `expected`, none on a miss: an object that is missing, unreadable, not the
+# bytes written, carries no record or a damaged one, or was built under another key is rebuilt,
+# never reused. err only when allocation fails
 pub fun read(p: *project.Project, location: str, expected: *[32]u8) res[opt[Cached], fail.Fail] {
-    val loaded: res[collections_vector.Vector[u8], fs.FsError] = fs.read_bytes(p.s.backing, location);
-    if (sel loaded.err) { ret res[opt[Cached], fail.Fail].ok{opt[Cached].none{}}; }
-    val read_back: opt[Object] = backend.read_object(?p.back, p.s.alloc, location, loaded.ok);
+    val rel: str = under_objects(p, location);
+    if (rel == nil) { ret res[opt[Cached], fail.Fail].ok{opt[Cached].none{}}; }
+    val opt_written: opt[[32]u8] = cache_objects.written(?p.object_digests, rel);
+    if (sel opt_written.none) { ret res[opt[Cached], fail.Fail].ok{opt[Cached].none{}}; }
+    val res_read: res[collections_vector.Vector[u8], fs.FsError] = fs.read_bytes(p.s.backing, location);
+    if (sel res_read.err) { ret res[opt[Cached], fail.Fail].ok{opt[Cached].none{}}; }
+    var recorded: [32]u8 = opt_written.some;
+    var held:     [32]u8;
+    sha256.hash(res_read.ok.data, res_read.ok.len, ?held[0]);
+    if (!cache_key.equal(?held, ?recorded)) {
+        var dropped: collections_vector.Vector[u8] = res_read.ok;
+        collections_vector.dnit[u8](?dropped);
+        ret res[opt[Cached], fail.Fail].ok{opt[Cached].none{}};
+    }
+    val read_back: opt[Object] = backend.read_object(?p.back, p.s.alloc, location, res_read.ok);
     if (sel read_back.none) { ret res[opt[Cached], fail.Fail].ok{opt[Cached].none{}}; }
     var object: Object = read_back.some;
     var handed: bool   = false;
@@ -500,7 +572,6 @@ rec Keying {
     cwd:     str;
     config:  [32]u8;
     memo:    memo.Memo;
-    now:     opt[time.Time];
     # which surface digest an importer's key reads
     variant: u8;
     # each module's surface digest, 32 bytes at 32 times its module number
@@ -513,8 +584,7 @@ val SURFACE_BARE:   u8 = 0;
 val SURFACE_PLACED: u8 = 1;
 val SURFACE_WHOLE:  u8 = 2;
 
-fun compute_digests(k: *Keying, syn: *ast.Ast, text: str, out: *memo.Digests) err[fail.Fail] {
-    sha256.hash(text::*u8, str_len(text), ?out.content[0]);
+fun compute_surfaces(k: *Keying, syn: *ast.Ast, text: str, out: *memo.Digests) err[fail.Fail] {
     collections_vector.clear[lang_source.Span](?k.spans);
     val found: err[fail.Fail] = surface.omitted(syn, text, ?k.spans);
     if (sel found.err) { ret found; }
@@ -527,45 +597,16 @@ fun compute_digests(k: *Keying, syn: *ast.Ast, text: str, out: *memo.Digests) er
     ret err[fail.Fail].ok{};
 }
 
-fun bytes_equal(a: *u8, a_len: usize, text: str) bool {
-    if (a_len != str_len(text)) { ret false; }
-    ret memory.raw_equal(a::ptr, text::ptr, a_len);
-}
-
-# the digests of the module's text: from the memo when the file still looks
-# as it did when it was hashed, else hashed now and remembered when the file
-# provably holds the text that was hashed
-fun source_digests(k: *Keying, syn: *ast.Ast, file: str, text: str, out: *memo.Digests) res[bool, fail.Fail] {
-    val observed: opt[memo.Stamp] = memo.stamp(file);
-    if (sel observed.none) {
-        val computed: err[fail.Fail] = compute_digests(k, syn, text, out);
-        if (sel computed.err) { ret res[bool, fail.Fail].err{computed.err}; }
-        ret res[bool, fail.Fail].ok{true};
-    }
-    var first: memo.Stamp = observed.some;
-    if (first.size == str_len(text)::u64) {
-        val got: opt[memo.Digests] = memo.lookup(?k.memo, file, ?first);
-        if (sel got.some) {
-            @out = got.some;
-            ret res[bool, fail.Fail].ok{true};
-        }
-    }
-    val computed: err[fail.Fail] = compute_digests(k, syn, text, out);
-    if (sel computed.err) { ret res[bool, fail.Fail].err{computed.err}; }
-    if (sel k.now.none)   { ret res[bool, fail.Fail].ok{true}; }
-    val read: res[Vector[u8], fs.FsError] = fs.read_bytes(k.scratch, file);
-    if (sel read.err) { ret res[bool, fail.Fail].ok{true}; }
-    var bytes: Vector[u8] = read.ok;
-    fin { collections_vector.dnit[u8](?bytes); }
-    if (!bytes_equal(bytes.data, bytes.len, text)) { ret res[bool, fail.Fail].ok{true}; }
-    val again: opt[memo.Stamp] = memo.stamp(file);
-    if (sel again.none) { ret res[bool, fail.Fail].ok{true}; }
-    var second: memo.Stamp = again.some;
-    if (first.size != second.size || first.sec != second.sec || first.nsec != second.nsec
-        || !memory.raw_equal((?first.identity[0])::ptr, (?second.identity[0])::ptr, 41)) { ret res[bool, fail.Fail].ok{true}; }
-    val recorded: err[A.Error] = memo.record(?k.memo, file, ?first, out, k.now.some);
-    if (sel recorded.err) { ret res[bool, fail.Fail].err{fail.refused(recorded.err)}; }
-    ret res[bool, fail.Fail].ok{true};
+# the digests of the module's text, the text load read: its own digest, then its
+# surfaces from the memo under that digest, else computed and remembered
+fun source_digests(k: *Keying, syn: *ast.Ast, text: str, out: *memo.Digests) err[fail.Fail] {
+    sha256.hash(text::*u8, str_len(text), ?out.content[0]);
+    if (memo.lookup(?k.memo, out)) { ret err[fail.Fail].ok{}; }
+    val computed: err[fail.Fail] = compute_surfaces(k, syn, text, out);
+    if (sel computed.err) { ret computed; }
+    val recorded: err[A.Error] = memo.record(?k.memo, out);
+    if (sel recorded.err) { ret err[fail.Fail].err{fail.refused(recorded.err)}; }
+    ret err[fail.Fail].ok{};
 }
 
 # the files a module embeds, by path, status, length and digest
@@ -639,13 +680,9 @@ fun key_module(k: *Keying, p: *project.Project, mid: u32) err[fail.Fail] {
         if (dep >= project.module_count(p) || !k.ready[dep]) { ret err[fail.Fail].ok{}; }
         d = d + 1;
     }
-    val canon: res[str, fail.Fail] = canonical(k.scratch, k.cwd, f.path);
-    if (sel canon.err) { ret err[fail.Fail].err{canon.err}; }
     var digests: memo.Digests;
-    val known:   res[bool, fail.Fail] = source_digests(k, syn, canon.ok, f.text, ?digests);
-    str_free(k.scratch, canon.ok);
+    val known:   err[fail.Fail] = source_digests(k, syn, f.text, ?digests);
     if (sel known.err) { ret err[fail.Fail].err{fail.placed(known.err, m.file_id)}; }
-    if (!known.ok)     { ret err[fail.Fail].ok{}; }
 
     var iface: cache_key.Builder = cache_key.begin("mach.module-surface");
     val named: err[fail.Fail]    = key_module_identity(?iface, k, p, mid, f.path);
@@ -700,9 +737,6 @@ fun key_modules(p: *project.Project, scratch: *A.Allocator, config: *u8, config_
     k.variant      = SURFACE_BARE;
     if (p.req.opt == request.OPT_RELEASE) { k.variant = SURFACE_WHOLE; }
     or (p.req.debug)                      { k.variant = SURFACE_PLACED; }
-    val clock: time.Clock = time.now();
-    k.now = opt[time.Time].none{};
-    if (sel clock.ok) { k.now = opt[time.Time].some{clock.ok}; }
 
     var owner: [32]u8;
     val owned: err[fail.Fail] = memo_compiler(?p.compiler_identity, ?owner);
@@ -978,6 +1012,8 @@ pub fun prepare(p: *project.Project, config: *u8, config_len: usize, ph: readout
     p.cache_ready = true;
     val published: err[fail.Fail] = publish_keys(p);
     if (sel published.err) { ret published; }
+    val err_written: err[fail.Fail] = read_written(p);
+    if (sel err_written.err) { ret err_written; }
     val fresh_r: res[*bool, A.Error] = A.zallocate[bool](p.s.backing, p.emit_len::usize + 1);
     if (sel fresh_r.err) { ret err[fail.Fail].err{fail.refused(fresh_r.err)}; }
     val fresh: *bool = fresh_r.ok;
