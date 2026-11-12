@@ -49,6 +49,7 @@ use std.types.string.str_len;
 use mach.lang.driver.backend;
 use mach.lang.driver.cache.compiler;
 use cache_instances: mach.lang.driver.cache.instances;
+use cache_link:      mach.lang.driver.cache.link;
 use mach.lang.driver.cache.memo;
 use cache_objects: mach.lang.driver.cache.objects;
 use cache_record:  mach.lang.driver.cache.record;
@@ -64,6 +65,7 @@ use mach.lang.output;
 use mach.lang.query;
 use mach.lang.readout;
 
+use lang_fingerprint: mach.lang.fingerprint;
 use mach.lang.host;
 use manifest_link: mach.lang.manifest.link;
 use mach.lang.wire;
@@ -1467,4 +1469,147 @@ pub fun store_records(p: *project.Project, d: *demand.Demand) err[fail.Fail] {
     }
     if (!changed && kept == p.instance_records.records.len) { ret err[fail.Fail].ok{}; }
     ret cache_instances.store(?out, ?p.s.interner, p.out_dir, file);
+}
+
+# where the cell keeps its link records: `<out>/.cache/link`, none for a build without such a
+# directory
+fun link_records_path(p: *project.Project, scratch: *A.Allocator) res[opt[str], fail.Fail] {
+    if (p.cache_dir == nil) { ret res[opt[str], fail.Fail].ok{opt[str].none{}}; }
+    val res_join: res[str, A.Error] = types_path.join(scratch, p.cache_dir, "link");
+    if (sel res_join.err) { ret res[opt[str], fail.Fail].err{fail.refused(res_join.err)}; }
+    ret res[opt[str], fail.Fail].ok{opt[str].some{res_join.ok}};
+}
+
+# the key of the link this build runs: the configuration (the compiler's identity among it, and
+# so the linker's), the link configuration the build published, and the key of every object the
+# link takes, in its order: each emitted module's, its test object's when the build links tests,
+# then each instance unit's. false when an object is not keyed, or the link takes an input found
+# by name, whose file the key cannot cover
+fun link_key(p: *project.Project, out: *[32]u8) res[bool, fail.Fail] {
+    if (!p.cache_ready || !p.link_config_keyed || p.link_by_name) { ret res[bool, fail.Fail].ok{false}; }
+    var b: cache_key.Builder = cache_key.begin("mach.link-image");
+    cache_key.bytes(?b, ?p.cache_config[0], 32);
+    cache_key.bytes(?b, ?p.link_config[0], 32);
+    cache_key.number(?b, p.emit_len::u64);
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val m: *project.ModuleEntry = project.module_at(p, p.topo[i]::u32);
+        if (!m.cache_keyed) { ret res[bool, fail.Fail].ok{false}; }
+        var object:     [32]u8;
+        val err_object: err[fail.Fail] = object_key(p, m, ?object);
+        if (sel err_object.err) { ret res[bool, fail.Fail].err{err_object.err}; }
+        cache_key.bytes(?b, ?object[0], 32);
+        val tested: bool = has_test_object(p, m);
+        cache_key.number(?b, tested::u64);
+        if (tested) {
+            var test:     [32]u8;
+            val err_test: err[fail.Fail] = test_object_key(p, m, ?test);
+            if (sel err_test.err) { ret res[bool, fail.Fail].err{err_test.err}; }
+            cache_key.bytes(?b, ?test[0], 32);
+        }
+        i = i + 1;
+    }
+    cache_key.number(?b, p.units.len::u64);
+    var u: usize = 0;
+    for (u < p.units.len) {
+        val unit: *project.InstanceUnit = ?p.units.data[u];
+        if (!unit.keyed) { ret res[bool, fail.Fail].ok{false}; }
+        cache_key.bytes(?b, ?unit.object_key[0], 32);
+        u = u + 1;
+    }
+    val err_finish: err[fail.Fail] = cache_key.finish(?b, out);
+    if (sel err_finish.err) { ret res[bool, fail.Fail].err{err_finish.err}; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# every object the link takes was restored, none compiled by this build
+fun compiled_nothing(p: *project.Project) bool {
+    if (generated_count(p) != 0 || units_compiled(p) != 0) { ret false; }
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val m: *project.ModuleEntry = project.module_at(p, p.topo[i]::u32);
+        if (has_test_object(p, m) && !test_restored(p, m)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the link records of the cell and the canonical path of `artifact`, which names its record
+rec LinkRecords {
+    store: cache_link.Store;
+    path:  str;
+    file:  opt[str];
+}
+
+fun link_records(p: *project.Project, artifact: str) res[LinkRecords, fail.Fail] {
+    val res_cwd: res[OwnedString, fail.Fail] = current_dir(p.s.backing);
+    if (sel res_cwd.err) { ret res[LinkRecords, fail.Fail].err{res_cwd.err}; }
+    var cwd: OwnedString = res_cwd.ok;
+    fin { owned_release(?cwd); }
+    val res_canon: res[str, fail.Fail] = canonical(p.s.backing, cwd.data, artifact);
+    if (sel res_canon.err) { ret res[LinkRecords, fail.Fail].err{res_canon.err}; }
+    val res_file: res[opt[str], fail.Fail] = link_records_path(p, p.s.backing);
+    if (sel res_file.err) {
+        str_free(p.s.backing, res_canon.ok);
+        ret res[LinkRecords, fail.Fail].err{res_file.err};
+    }
+    var records: LinkRecords = LinkRecords{store: cache_link.init(p.s.backing), path: res_canon.ok, file: res_file.ok};
+    if (sel res_file.ok.some) {
+        val res_load: res[cache_link.Store, A.Error] = cache_link.load(p.s.backing, res_file.ok.some);
+        if (sel res_load.err) {
+            link_records_dnit(p, ?records);
+            ret res[LinkRecords, fail.Fail].err{fail.refused(res_load.err)};
+        }
+        cache_link.dnit(?records.store);
+        records.store = res_load.ok;
+    }
+    ret res[LinkRecords, fail.Fail].ok{records};
+}
+
+fun link_records_dnit(p: *project.Project, records: *LinkRecords) {
+    cache_link.dnit(?records.store);
+    str_free(p.s.backing, records.path);
+    if (sel records.file.some) { str_free(p.s.backing, records.file.some); }
+}
+
+# the link that would write `artifact` need not run: this build compiled nothing, the link reads
+# no input found by name, its key is the key the record of the artifact's path holds, and the file
+# there hashes to the digest that record holds. the file is read and hashed every time, never
+# trusted from its metadata
+pub fun link_stands(p: *project.Project, artifact: str) res[bool, fail.Fail] {
+    if (!compiled_nothing(p)) { ret res[bool, fail.Fail].ok{false}; }
+    var key:       [32]u8;
+    val res_keyed: res[bool, fail.Fail] = link_key(p, ?key);
+    if (sel res_keyed.err) { ret res_keyed; }
+    if (!res_keyed.ok)     { ret res[bool, fail.Fail].ok{false}; }
+    val res_records: res[LinkRecords, fail.Fail] = link_records(p, artifact);
+    if (sel res_records.err) { ret res[bool, fail.Fail].err{res_records.err}; }
+    var records: LinkRecords = res_records.ok;
+    fin { link_records_dnit(p, ?records); }
+    val opt_written: opt[cache_link.Written] = cache_link.written(?records.store, records.path);
+    if (sel opt_written.none) { ret res[bool, fail.Fail].ok{false}; }
+    var written: cache_link.Written = opt_written.some;
+    if (!cache_key.equal(?written.key, ?key)) { ret res[bool, fail.Fail].ok{false}; }
+    var now:        [32]u8;
+    val err_digest: err[fail.Cause] = lang_fingerprint.file_sha256(artifact, ?now[0]);
+    if (sel err_digest.err) { ret res[bool, fail.Fail].ok{false}; }
+    ret res[bool, fail.Fail].ok{cache_key.equal(?now, ?written.digest)};
+}
+
+# the link that wrote `artifact` as the bytes `digest` names is recorded under its key, so a later
+# build that compiles nothing and keys its link the same leaves the artifact as it is
+pub fun note_link(p: *project.Project, artifact: str, digest: *[32]u8) err[fail.Fail] {
+    var key:       [32]u8;
+    val res_keyed: res[bool, fail.Fail] = link_key(p, ?key);
+    if (sel res_keyed.err) { ret err[fail.Fail].err{res_keyed.err}; }
+    if (!res_keyed.ok)     { ret err[fail.Fail].ok{}; }
+    val res_records: res[LinkRecords, fail.Fail] = link_records(p, artifact);
+    if (sel res_records.err) { ret err[fail.Fail].err{res_records.err}; }
+    var records: LinkRecords = res_records.ok;
+    fin { link_records_dnit(p, ?records); }
+    if (sel records.file.none) { ret err[fail.Fail].ok{}; }
+    var written: cache_link.Written = cache_link.Written{key: key, digest: @digest};
+    val err_put: err[A.Error]       = cache_link.put(?records.store, records.path, ?written);
+    if (sel err_put.err) { ret err[fail.Fail].err{fail.refused(err_put.err)}; }
+    ret cache_link.store(?records.store, p.out_dir, records.file.some);
 }
