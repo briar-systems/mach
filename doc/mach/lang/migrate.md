@@ -3,13 +3,20 @@
 a project written for the previous major, rewritten into this one's spelling,
 which `mach migrate` applies
 
-every rule is data its owner already holds: a manifest key a major removed or
-retired is a row of the manifest schema with a rewrite, a template variable's
+a renamed spelling is data its owner already holds: a manifest key a major
+removed or retired is a row of the manifest schema with a rewrite, a target
+value's retired spelling is a row of the target reader's, a template variable's
 previous name is a row of the template's renamed table, a comptime path's is a
 row of the comptime path registry's, a decorator's is a row of the decorator
-registry's, and an `asm` head's and a truth alias's are rows of the transition
-table's. so a name a later major retires is migrated by the row that retires
-it, and this module names none of them
+registry's, and an `asm` head's, a truth alias's and a step option's are rows
+of the transition table's. so a name a later major retires is migrated by the
+row that retires it, and no rule here spells one
+
+what changed meaning rather than spelling has no owner's row, so its rule here
+names what it reads: `[project].mach` for the range, a step's `argv` for which
+step runs mach, `[project].out` and each artifact's `out` for the output a
+previous major rooted, and a dependency's `[artifact.*]` `export`, `default`,
+`kind` and `entry` for the module a bare `use` bound
 
 the rules are rows themselves, each tagged with the major it migrates from. a
 release carries the rows of the major before it: 8.0.0 deletes every row tagged
@@ -80,6 +87,14 @@ pub fun word_in(text: str, at: usize, end: usize, word: str) usize;
 
 the offset of `word` standing as a word in `text` from `at` to `end`, `end` when it does
 not: after a quote, a space or a path's `/`, and before a quote, a space or an `=`
+
+## fun runs_mach
+
+```mach
+pub fun runs_mach(text: str, args: *toml.Array) bool;
+```
+
+whether a step's `argv`, its literals in `text`, runs mach
 
 ## fun source
 

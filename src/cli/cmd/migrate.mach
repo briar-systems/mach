@@ -1,18 +1,31 @@
 use std_args: std.args;
 use std.collections.slice.Slice;
+use std.collections.sort;
 use collections_vector: std.collections.vector;
 use std.collections.vector.Vector;
+use std.data.toml;
 use fs:        std.filesystem;
+use io_error:  std.io.error;
 use io_writer: std.io.writer;
 use std.print;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.StrError;
 use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_copy_slice;
+use std.types.string.str_empty;
+use std.types.string.str_ends_with;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_region_equals;
+use std.types.string.str_starts_with;
 
 use A: std.allocator;
 
@@ -21,8 +34,12 @@ use mach.cli.exit;
 use mach.cli.rewrite;
 use mach.cli.util;
 use mach.lang.diagnostic;
+use diagnostic_kind: mach.lang.diagnostic.kind;
 use mach.lang.fail;
+use mach.lang.fe.transition;
+use mach.lang.listing;
 use manifest_load: mach.lang.manifest.load;
+use mach.lang.manifest.schema;
 use mach.lang.migrate;
 use lang_source: mach.lang.source;
 
@@ -36,44 +53,360 @@ fun spelled(a: *A.Allocator, text: str, diags: *diagnostic.DiagnosticStore, cont
     ret migrate.source(a, text, context::*Vector[migrate.Dependency]);
 }
 
-# the files that run a build beside the source, read for removed options. a script is
-# reported, never rewritten: what it runs is its author's
-val SCRIPT_COUNT: usize             = 6;
-val SCRIPTS:      [SCRIPT_COUNT]str = [SCRIPT_COUNT]str{"Makefile", "makefile", "GNUmakefile", "build.sh", ".github/workflows/ci.yml", ".github/workflows/cd.yml"};
+# a script is a file that may run a build beside the source, read for removed options. it is
+# reported, never rewritten: what it runs is its author's. a file is a script by its name, its
+# suffix, its place among the CI workflows, or a `#!` line on an executable file
+val SCRIPT_NAME_COUNT:   usize                    = 3;
+val SCRIPT_NAMES:        [SCRIPT_NAME_COUNT]str   = [SCRIPT_NAME_COUNT]str{"Makefile", "makefile", "GNUmakefile"};
+val SCRIPT_SUFFIX_COUNT: usize                    = 6;
+val SCRIPT_SUFFIXES:     [SCRIPT_SUFFIX_COUNT]str = [SCRIPT_SUFFIX_COUNT]str{".sh", ".bash", ".mk", ".ps1", ".bat", ".cmd"};
+val WORKFLOWS:           str                      = ".github/workflows/";
 
-# whether `word` stands in the line of `text` from `start` to `end`, at a word's edges
-fun line_names(text: str, start: usize, end: usize, word: str) bool {
+# the deepest directory nesting the search for scripts follows
+val SCRIPT_DEPTH: usize = 64;
+
+# where a project's directories stand, relative to its root, as the migration leaves its manifest
+# ---
+# src:  the source directory, which holds no script
+# work: the leading directories of the work directory, which hold only what builds write; nil
+#       when the work directory starts with a variable
+rec Dirs {
+    src:  str;
+    work: str;
+}
+
+# whether `word` stands in `text` from `start` to `end`, at a word's edges
+fun names_in(text: str, start: usize, end: usize, word: str) bool {
     ret migrate.word_in(text, start, end, word) != end;
 }
 
-# each removed option a line of the script `name` runs `mach` with, located
-fun script_report(a: *A.Allocator, root: str, name: str) res[usize, fail.Fail] {
-    val path: res[str, fail.Fail] = diagnostic.join(a, root, "/", name);
-    if (sel path.err) { ret res[usize, fail.Fail].err{path.err}; }
-    val read: opt[str] = rewrite.text_of(a, path.ok);
-    if (sel read.none) { ret res[usize, fail.Fail].ok{0}; }
-    val text: str   = read.some;
-    var at:   usize = 0;
-    var line: usize = 1;
-    var hits: usize = 0;
-    for (text[at] != 0) {
-        var end: usize = at;
-        for (text[end] != 0 && text[end] != '\n') { end = end + 1; }
-        if (line_names(text, at, end, "mach")) {
-            var i: usize = 0;
+# a cursor over a script's text from `at` to `end`, `line` the line `at` stands on
+rec Scan {
+    text: str;
+    at:   usize;
+    end:  usize;
+    line: usize;
+}
+
+# one word of a script: its bytes from `at` for `len`, and the line it starts on
+rec Word {
+    at:   usize;
+    len:  usize;
+    line: usize;
+}
+
+fun blank(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\r';
+}
+
+# whether the byte at `i` ends a word: a blank, a line break, or a byte that separates commands
+fun word_ends(s: *Scan, i: usize) bool {
+    val c: u8 = s.text[i];
+    if (blank(c) || c == '\n' || c == ';' || c == '(' || c == ')' || c == '`' || c == '|') { ret true; }
+    ret c == '&' && i + 1 < s.end && s.text[i + 1] == '&';
+}
+
+# the next word of the simple command at the cursor into `w`; false when the command ends there,
+# the cursor then past what ended it: `&&`, `||`, `|`, `;`, `(`, `)`, a backquote, or a line break
+# no `\` continues. a `#` where a word would start comments out the rest of the line
+fun next_word(s: *Scan, w: *Word) bool {
+    for (s.at < s.end) {
+        val c: u8 = s.text[s.at];
+        if (blank(c)) { s.at = s.at + 1; }
+        or (c == '\\' && s.at + 1 < s.end && s.text[s.at + 1] == '\n') {
+            s.at   = s.at + 2;
+            s.line = s.line + 1;
+        }
+        or (c == '\\' && s.at + 2 < s.end && s.text[s.at + 1] == '\r' && s.text[s.at + 2] == '\n') {
+            s.at   = s.at + 3;
+            s.line = s.line + 1;
+        }
+        or { brk; }
+    }
+    if (s.at >= s.end) { ret false; }
+    val c: u8 = s.text[s.at];
+    if (c == '#') {
+        for (s.at < s.end && s.text[s.at] != '\n') { s.at = s.at + 1; }
+        ret false;
+    }
+    if (c == '\n') {
+        s.at   = s.at + 1;
+        s.line = s.line + 1;
+        ret false;
+    }
+    if (c == '&' || c == '|') {
+        s.at = s.at + 1;
+        if (s.at < s.end && s.text[s.at] == c) { s.at = s.at + 1; }
+        ret false;
+    }
+    if (word_ends(s, s.at)) {
+        s.at = s.at + 1;
+        ret false;
+    }
+    w.at   = s.at;
+    w.line = s.line;
+    var quote: u8 = 0;
+    for (s.at < s.end) {
+        val b: u8 = s.text[s.at];
+        if (quote != 0) {
+            if (b == quote) { quote = 0; }
+            or (b == '\n')  { s.line = s.line + 1; }
+            s.at = s.at + 1;
+            cnt;
+        }
+        if (b == '"' || b == '\'') {
+            quote = b;
+            s.at  = s.at + 1;
+            cnt;
+        }
+        if (b == '\\') {
+            # a continued line ends the word, and any other escape is part of it
+            if (s.at + 1 < s.end && s.text[s.at + 1] == '\n')                             { brk; }
+            if (s.at + 2 < s.end && s.text[s.at + 1] == '\r' && s.text[s.at + 2] == '\n') { brk; }
+            s.at = s.at + 2;
+            if (s.at > s.end) { s.at = s.end; }
+            cnt;
+        }
+        if (word_ends(s, s.at)) { brk; }
+        s.at = s.at + 1;
+    }
+    w.len = s.at - w.at;
+    ret true;
+}
+
+# the bytes of `w` inside one pair of quotes around the whole word, if it has them
+fun unquoted(text: str, w: Word) Word {
+    if (w.len < 2) { ret w; }
+    val q: u8 = text[w.at];
+    if ((q != '"' && q != '\'') || text[w.at + w.len - 1] != q) { ret w; }
+    ret Word{at: w.at + 1, len: w.len - 2, line: w.line};
+}
+
+fun word_is(text: str, w: Word, s: str) bool {
+    ret w.len == str_len(s) && str_region_equals(text, w.at, w.len, s);
+}
+
+# whether `w` is the option `name`, alone or with its value after `=`
+fun word_option(text: str, w: Word, name: str) bool {
+    val n: usize = str_len(name);
+    if (w.len < n || !str_region_equals(text, w.at, n, name)) { ret false; }
+    ret w.len == n || text[w.at + n] == '=';
+}
+
+# whether `w`, a word in a command's place, names mach: `mach`, a path ending in `/mach`, or
+# `$MACH` or `${MACH}`, any of them quoted, after the `@`, `-` and `+` a make recipe may lead with
+fun runs_mach_word(text: str, word: Word) bool {
+    var w: Word = unquoted(text, word);
+    for (w.len > 1 && (text[w.at] == '@' || text[w.at] == '-' || text[w.at] == '+')) {
+        w.at  = w.at + 1;
+        w.len = w.len - 1;
+    }
+    if (word_is(text, w, "mach") || word_is(text, w, "$MACH") || word_is(text, w, "${MACH}")) { ret true; }
+    ret w.len > 5 && str_region_equals(text, w.at + w.len - 5, 5, "/mach");
+}
+
+# whether `w` stands before a command's word without being it: an assignment to a variable, or
+# a workflow step's `-` and `run:`
+fun command_prefix(text: str, w: Word) bool {
+    if (word_is(text, w, "-") || word_is(text, w, "run:")) { ret true; }
+    var i: usize = 0;
+    for (i < w.len) {
+        val c: u8 = text[w.at + i];
+        if (c == '=')                                                                                  { ret i > 0; }
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) { ret false; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# each removed option a mach invocation in the script `name` writes, from `at` to `end` of its
+# text, located on its own line. only the words of the simple command whose command word names
+# mach are read, so another program's options are never taken for mach's. a workflow's
+# `run: '...'` is read inside its quotes
+fun script_report(name: str, text: str, at: usize, end: usize, line: usize) {
+    var s: Scan = Scan{text: text, at: at, end: end, line: line};
+    for (s.at < s.end) {
+        var w:      Word;
+        var placed: bool = false;
+        var runs:   bool = false;
+        var after:  bool = false;
+        for (next_word(?s, ?w)) {
+            if (!placed) {
+                if (after) {
+                    val inner: Word = unquoted(text, w);
+                    if (inner.len != w.len) {
+                        script_report(name, text, inner.at, inner.at + inner.len, w.line);
+                        cnt;
+                    }
+                }
+                after = word_is(text, w, "run:");
+                if (command_prefix(text, w)) { cnt; }
+                placed = true;
+                runs   = runs_mach_word(text, w);
+                cnt;
+            }
+            if (!runs) { cnt; }
+            val option: Word  = unquoted(text, w);
+            var i:      usize = 0;
             for (i < args.REMOVED_N) {
-                if (line_names(text, at, end, args.REMOVED[i].name)) {
-                    print.printlnf("{}:{}: option '{}' was removed; use {}", name, line, args.REMOVED[i].name, args.REMOVED[i].use);
-                    hits = hits + 1;
+                if (word_option(text, option, args.REMOVED[i].name)) {
+                    print.printlnf("{}:{}: option '{}' was removed; use {}", name, w.line, args.REMOVED[i].name, args.REMOVED[i].use);
                 }
                 i = i + 1;
             }
         }
-        at = end;
-        if (text[at] == '\n') { at = at + 1; }
-        line = line + 1;
     }
-    ret res[usize, fail.Fail].ok{hits};
+}
+
+# whether the file at `rel`, its name `leaf`, is a script by its name, suffix or place
+fun script_named(rel: str, leaf: str) bool {
+    var i: usize = 0;
+    for (i < SCRIPT_NAME_COUNT) {
+        if (str_equals(leaf, SCRIPT_NAMES[i])) { ret true; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < SCRIPT_SUFFIX_COUNT) {
+        if (str_ends_with(leaf, SCRIPT_SUFFIXES[i])) { ret true; }
+        i = i + 1;
+    }
+    ret str_starts_with(rel, WORKFLOWS) && (str_ends_with(leaf, ".yml") || str_ends_with(leaf, ".yaml"));
+}
+
+# each script under the directory `rel` of the project at `root`, `rel` empty for the root itself,
+# reported. dep/, the source and the work directory hold no script of the project's, a `.git`
+# directory none at all, and a link is not followed
+fun scripts_in(a: *A.Allocator, root: str, rel: str, dirs: *Dirs, depth: usize) err[fail.Fail] {
+    if (depth >= SCRIPT_DEPTH) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.SOURCE_NESTING_DEPTH, "project directory nesting exceeds 64 in the search for scripts")}; }
+    var dir: str = root;
+    if (!str_empty(rel)) {
+        val joined: res[str, fail.Fail] = diagnostic.join(a, root, "/", rel);
+        if (sel joined.err) { ret err[fail.Fail].err{joined.err}; }
+        dir = joined.ok;
+    }
+    fin {
+        if (dir != root) { str_free(a, dir); }
+    }
+    val listed: res[Vector[fs.Listed], fs.FsError] = fs.read_dir(a, dir);
+    if (sel listed.err) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.fs_text(listed.err))}; }
+    var entries: Vector[fs.Listed] = listed.ok;
+    fin { fs.listed_free(?entries); }
+    val names_r: res[Vector[str], fail.Fail] = listing.names(a, dir, ?entries);
+    if (sel names_r.err) { ret err[fail.Fail].err{names_r.err}; }
+    var names: Vector[str] = names_r.ok;
+    fin { collections_vector.dnit[str](?names); }
+    sort.sort_by[str](names.data, names.len, by_name);
+    var i: usize = 0;
+    for (i < names.len) {
+        val leaf: str = names.data[i];
+        i = i + 1;
+        var child: str = leaf;
+        if (!str_empty(rel)) {
+            val joined: res[str, fail.Fail] = diagnostic.join(a, rel, "/", leaf);
+            if (sel joined.err) { ret err[fail.Fail].err{joined.err}; }
+            child = joined.ok;
+        }
+        fin {
+            if (child != leaf) { str_free(a, child); }
+        }
+        val path: res[str, fail.Fail] = diagnostic.join(a, root, "/", child);
+        if (sel path.err) { ret err[fail.Fail].err{path.err}; }
+        fin { str_free(a, path.ok); }
+        val meta: res[fs.Metadata, io_error.Error] = fs.metadata_link(path.ok);
+        if (sel meta.err) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.io_text(meta.err))}; }
+        if (fs.meta_is_dir(?meta.ok)) {
+            if (str_equals(leaf, ".git") || str_equals(child, "dep") || str_equals(child, dirs.src)) { cnt; }
+            if (dirs.work != nil && str_equals(child, dirs.work))                                    { cnt; }
+            val inner: err[fail.Fail] = scripts_in(a, root, child, dirs, depth + 1);
+            if (sel inner.err) { ret inner; }
+            cnt;
+        }
+        if (!fs.meta_is_file(?meta.ok)) { cnt; }
+        val named:      bool = script_named(child, leaf);
+        val executable: bool = (meta.ok.mode & 0o111) != 0;
+        if (!named && !executable) { cnt; }
+        val read: opt[str] = rewrite.text_of(a, path.ok);
+        if (sel read.none)                             { cnt; }
+        if (named || str_starts_with(read.some, "#!")) { script_report(child, read.some, 0, str_len(read.some), 1); }
+        str_free(a, read.some);
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun by_name(x: *str, y: *str) i64 {
+    ret str_compare(@x, @y);
+}
+
+# each removed option the `argv` of a step that runs mach writes, located in the manifest `doc`.
+# an option the migration rewrites in a step is not one
+fun step_report(doc: *manifest_load.Doc) {
+    val steps: opt[*toml.Table] = toml.get_table(?doc.table, "step");
+    if (sel steps.none) { ret; }
+    var s: usize = 0;
+    for (s < toml.table_len(steps.some)) {
+        val step: opt[*toml.Value] = toml.table_value(steps.some, s);
+        s = s + 1;
+        if (sel step.none)                    { cnt; }
+        if (step.some.tag != toml.TYPE_TABLE) { cnt; }
+        val argv: opt[*toml.Value] = toml.get(?step.some.data.table, "argv");
+        if (sel argv.none)                                       { cnt; }
+        if (argv.some.tag != toml.TYPE_ARRAY)                    { cnt; }
+        if (!migrate.runs_mach(doc.text, ?argv.some.data.array)) { cnt; }
+        var k: usize = 0;
+        for (k < toml.array_len(?argv.some.data.array)) {
+            val arg: opt[*toml.Value] = toml.array_get(?argv.some.data.array, k);
+            k = k + 1;
+            if (sel arg.none) { cnt; }
+            val end: usize = arg.some.span.at + arg.some.span.len;
+            var i:   usize = 0;
+            for (i < args.REMOVED_N) {
+                val removed: *args.Removed = ?args.REMOVED[i];
+                i = i + 1;
+                if (step_rewrites(removed.name))                              { cnt; }
+                if (!names_in(doc.text, arg.some.span.at, end, removed.name)) { cnt; }
+                print.printlnf("{}:{}: option '{}' was removed; use {}", manifest_load.MANIFEST_FILE, line_of(doc.text, arg.some.span.at), removed.name, removed.use);
+            }
+        }
+    }
+}
+
+# each removed key the manifest `doc` writes that no rewrite migrates, located: what replaces it
+# is its author's decision, and the manifest is refused until it is made
+fun leftover_report(a: *A.Allocator, doc: *manifest_load.Doc) res[usize, fail.Fail] {
+    var left: Vector[schema.Leftover] = collections_vector.init[schema.Leftover](a);
+    fin { collections_vector.dnit[schema.Leftover](?left); }
+    val found: err[A.Error] = schema.leftovers(?doc.table, ?left);
+    if (sel found.err) { ret res[usize, fail.Fail].err{fail.refused(found.err)}; }
+    var i: usize = 0;
+    for (i < left.len) {
+        val k:    *schema.Leftover = ?left.data[i];
+        val line: usize            = line_of(doc.text, k.at.at);
+        i = i + 1;
+        if (str_empty(k.name)) { print.printlnf("{}:{}: [{}] writes removed key '{}', which has no rewrite; {}", manifest_load.MANIFEST_FILE, line, k.section, k.key, k.note); }
+        or                     { print.printlnf("{}:{}: [{}.{}] writes removed key '{}', which has no rewrite; {}", manifest_load.MANIFEST_FILE, line, k.section, k.name, k.key, k.note); }
+    }
+    ret res[usize, fail.Fail].ok{left.len};
+}
+
+# whether the migration rewrites the option `name` in a step's `argv`
+fun step_rewrites(name: str) bool {
+    var f: usize = 0;
+    for (f < transition.FLAG_COUNT) {
+        if (str_equals(transition.flag_at(f).from, name)) { ret true; }
+        f = f + 1;
+    }
+    ret false;
+}
+
+# the line of `text` the byte `at` stands on, from 1
+fun line_of(text: str, at: usize) usize {
+    var line: usize = 1;
+    var i:    usize = 0;
+    for (i < at) {
+        if (text[i] == '\n') { line = line + 1; }
+        i = i + 1;
+    }
+    ret line;
 }
 
 # each dependency the root project does not migrate: dep/ does not hold it, or it stands
@@ -88,21 +421,38 @@ fun dependency_report(deps: *Vector[migrate.Dependency]) {
     }
 }
 
-# the project's source directory, read from its manifest as the migration
-# leaves it, so a check reads the source a migrated manifest names
-fun migrated_source(a: *A.Allocator, sources: *lang_source.SourceMap, manifest_path: str) res[str, fail.Fail] {
+# the project's directories, read from its manifest as the migration leaves it, so a check
+# reads the source a migrated manifest names
+fun migrated_dirs(a: *A.Allocator, sources: *lang_source.SourceMap, manifest_path: str) res[Dirs, fail.Fail] {
     val doc_r: res[manifest_load.Doc, fail.Fail] = manifest_load.doc_read(a, sources, manifest_path);
-    if (sel doc_r.err) { ret res[str, fail.Fail].err{doc_r.err}; }
+    if (sel doc_r.err) { ret res[Dirs, fail.Fail].err{doc_r.err}; }
     var doc: manifest_load.Doc = doc_r.ok;
     fin { manifest_load.doc_dnit(a, ?doc); }
     val text: res[str, fail.Fail] = migrate.manifest(a, doc.text);
-    if (sel text.err) { ret res[str, fail.Fail].err{text.err}; }
+    if (sel text.err) { ret res[Dirs, fail.Fail].err{text.err}; }
     fin { str_free(a, text.ok); }
     val moved_r: res[manifest_load.Doc, fail.Fail] = manifest_load.doc_parse(a, sources, manifest_path, text.ok);
-    if (sel moved_r.err) { ret res[str, fail.Fail].err{moved_r.err}; }
+    if (sel moved_r.err) { ret res[Dirs, fail.Fail].err{moved_r.err}; }
     var moved: manifest_load.Doc = moved_r.ok;
     fin { manifest_load.doc_dnit(a, ?moved); }
-    ret rewrite.source_dir_of(a, ?moved);
+    val src: res[str, fail.Fail] = rewrite.source_dir_of(a, ?moved);
+    if (sel src.err) { ret res[Dirs, fail.Fail].err{src.err}; }
+    var dirs: Dirs     = Dirs{src: src.ok, work: nil};
+    val work: opt[str] = toml.get_str(?moved.table, "project.work");
+    if (sel work.none) { ret res[Dirs, fail.Fail].ok{dirs}; }
+    # the directories before the first variable, which no expansion moves
+    var cut: usize = 0;
+    var i:   usize = 0;
+    for (work.some[i] != 0 && work.some[i] != '{') {
+        if (work.some[i] == '/') { cut = i; }
+        i = i + 1;
+    }
+    if (work.some[i] == 0) { cut = i; }
+    if (cut == 0)          { ret res[Dirs, fail.Fail].ok{dirs}; }
+    val lead: res[str, StrError] = str_copy_slice(a, work.some, 0, cut);
+    if (sel lead.err) { ret res[Dirs, fail.Fail].err{fail.str_refused(lead.err)}; }
+    dirs.work = lead.ok;
+    ret res[Dirs, fail.Fail].ok{dirs};
 }
 
 # length of FLAGS
@@ -119,7 +469,9 @@ pub val POLICY: args.Policy = args.Policy{refused: args.NO_FLAGS, refusal: "", c
 # ---
 # cx:  the call
 # ret: exit.OK when the project is in this major's spelling (or was made so), exit.USER when a
-#      file would change under --check, otherwise the failure
+#      file would change under --check, or in either mode when the manifest still writes a
+#      removed key no rewrite migrates or a source could not be read as one; a script's or a
+#      step's removed option is reported and fails nothing. otherwise the failure
 pub fun run(cx: *args.Call) res[i64, fail.Fail] {
     val arg:   *u8                                  = args.operand(cx.inv, 0);
     val loc_r: res[util.ProjectLocation, fail.Fail] = util.resolve_project_location(cx.a, arg);
@@ -132,10 +484,13 @@ pub fun run(cx: *args.Call) res[i64, fail.Fail] {
     var keys:       rewrite.Report = rewrite.report(?diagnostics, cx.sources, keyed);
     val manifested: err[fail.Fail] = rewrite.file(cx.a, cx.backing, loc.manifest, sink, ?keys);
     if (sel manifested.err) { ret res[i64, fail.Fail].err{manifested.err}; }
-    val rel_r: res[str, fail.Fail] = migrated_source(cx.a, cx.sources, loc.manifest);
-    if (sel rel_r.err) { ret res[i64, fail.Fail].err{rel_r.err}; }
-    val rel: str = rel_r.ok;
-    fin { str_free(cx.a, rel); }
+    val dirs_r: res[Dirs, fail.Fail] = migrated_dirs(cx.a, cx.sources, loc.manifest);
+    if (sel dirs_r.err) { ret res[i64, fail.Fail].err{dirs_r.err}; }
+    var dirs: Dirs = dirs_r.ok;
+    fin {
+        str_free(cx.a, dirs.src);
+        if (dirs.work != nil) { str_free(cx.a, dirs.work); }
+    }
     var deps: Vector[migrate.Dependency] = collections_vector.init[migrate.Dependency](cx.a);
     fin { collections_vector.dnit[migrate.Dependency](?deps); }
     val doc_r: res[manifest_load.Doc, fail.Fail] = manifest_load.doc_read(cx.a, cx.sources, loc.manifest);
@@ -146,15 +501,16 @@ pub fun run(cx: *args.Call) res[i64, fail.Fail] {
     if (sel read.err) { ret res[i64, fail.Fail].err{read.err}; }
     var sources: rewrite.Report = rewrite.report(?diagnostics, cx.sources, spelled);
     sources.context = (?deps)::ptr;
-    val walked: err[fail.Fail] = rewrite.tree(cx.a, cx.backing, loc.root, rel, sink, ?sources);
+    val walked: err[fail.Fail] = rewrite.tree(cx.a, cx.backing, loc.root, dirs.src, sink, ?sources);
     if (sel walked.err) { ret res[i64, fail.Fail].err{walked.err}; }
-    var s: usize = 0;
-    for (s < SCRIPT_COUNT) {
-        val reported: res[usize, fail.Fail] = script_report(cx.a, loc.root, SCRIPTS[s]);
-        if (sel reported.err) { ret res[i64, fail.Fail].err{reported.err}; }
-        s = s + 1;
-    }
+    val stated: res[usize, fail.Fail] = leftover_report(cx.a, ?doc);
+    if (sel stated.err) { ret res[i64, fail.Fail].err{stated.err}; }
+    step_report(?doc);
+    val searched: err[fail.Fail] = scripts_in(cx.a, loc.root, "", ?dirs, 0);
+    if (sel searched.err) { ret res[i64, fail.Fail].err{searched.err}; }
     dependency_report(?deps);
-    if (check && keys.differing + sources.differing != 0) { ret res[i64, fail.Fail].ok{exit.USER}; }
+    # a key no rewrite migrates or a source the rewrite refused leaves a project the reader refuses
+    if (stated.ok != 0 || keys.malformed + sources.malformed != 0) { ret res[i64, fail.Fail].ok{exit.USER}; }
+    if (check && keys.differing + sources.differing != 0)          { ret res[i64, fail.Fail].ok{exit.USER}; }
     ret res[i64, fail.Fail].ok{exit.OK};
 }

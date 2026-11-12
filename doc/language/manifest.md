@@ -148,7 +148,7 @@ ref = "branch/main"
 `[project]` is exactly the five keys with a type, and every one is required. Any other
 key, `name` and `description` included, is an unknown-key error
 (`mach.toml: unknown key 'name' in [project]`). The previous major's `out` is
-refused by name, with the rename to `work` as its fix, and so is `{project.work}`
+refused by name, with the rename to `work` as its fix, and so is `{project.out}`
 in any template, with `{project.work}` as its fix. `[profile.<name>]`
 likewise carries no `emit_ir` or `emit_asm`: emission is `--emit ir` and `--emit asm` on
 the command line.
@@ -276,7 +276,7 @@ to whichever *declared* target matches the host.
 | `stack_reserve` | absent: the format's default, and no stack on an image no loader maps | Main stack size in bytes, not negative: the reserve a PE or Mach-O header records, or the size of the `.stack` section of a freestanding ELF or flat image. See [Image stack size](#image-stack-size). |
 | `stack_commit` | absent: the format's default | Main stack commit in bytes, not negative, on PE only. See [Image stack size](#image-stack-size). |
 | `code_model` | absent: the host's default for the target | The code model the target's code is built under (string), by the psABI name mink's catalog gives it, such as `medany` on linux `riscv64` or `medlow` on freestanding `riscv64`. Any target may state it. A model the target's host does not offer is refused naming those it does, and one mirl does not carry is refused with mirl's reason. `mach info targets` lists each target's models, its default first, and `--code-model` narrows an entry build's target to one. |
-| `default` | removed | Refused as a removed key. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
+| `default` | removed | Refused as a removed key, with its removal as the fix `mach migrate` applies. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
 | `os`, `baseline`, `extensions` | removed | v6's names of `sys`, `isa` and `ext`, refused with the rename `mach migrate` writes. |
 | `ext` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the architecture's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
 | `runner` | absent: the host runs its own programs, and no other target's | Array of argv templates the target's programs are launched through by `mach run` and `mach test`, whether or not the target is the host. See [Execution command](#execution-command). |
@@ -566,7 +566,11 @@ naming the new spelling and carrying the rewrite `mach migrate` applies:
 | `of` | `raw` | `flat` |
 | `of` | `spv` | `spirv` |
 | `sys` (on `arch = "spirv"`) | `freestanding` | `vulkan` |
+| `abi` (on `arch = "spirv"`) | `spirv` | `shader` |
 | `arch` | a RISC-V selection such as `rv32imc` | `arch = "riscv32"` and `isa = "rv32imc"` |
+
+v6 wrote a RISC-V selection as `isa = "rv32imc"` with no architecture at all, and
+`mach migrate` writes the `arch` that enters it beside it.
 
 ```
 error[target.retired_spelling]: mach.toml: [target.metal].of = "raw" is a retired spelling; write "flat", mink's name for it
@@ -1040,9 +1044,10 @@ The previous major's keys are refused by name, each with what replaced it, and
 with the rewrite `mach migrate` applies as a fix wherever the value has a
 mechanical one: `opt = 0` is `optimize = false`, `opt = 1` and `opt = 2` are
 `optimize = true`, `vectorize = true` is what `optimize` schedules and is removed,
-`float_reassoc = false` is removed and `float_reassoc = true` is
-`relax = ["float-reassoc"]`. `vectorize = false`, `pass` and `skip` have no
-rewrite, since no key says which passes run:
+`vectorize = false` is an opt-out no profile key states and is removed too, with
+`#[vectorize("never")]` still opting one function out, `float_reassoc = false` is
+removed and `float_reassoc = true` is `relax = ["float-reassoc"]`. `pass` and
+`skip` have no rewrite, since no key says which passes run:
 
 ```
 error[manifest.removed_key]: mach.toml: [profile.release] uses removed key 'opt'; write `optimize = true` or `optimize = false`
@@ -1304,7 +1309,7 @@ reads the selected artifact's name.
 | `kind`    | yes | What the artifact is, by mink's product name: `"bin"` (an executable), `"static"` (a static library), `"shared"` (a shared library), `"object"` (each module's object, for a later link) or `"module"` (a module a runtime instantiates, such as a SPIR-V module). Any other value is refused listing mink's products (see below). |
 | `linkage` | absent: the target's default | How a `bin` is linked, by mink's linkage name: `"pie"`, `"dynamic"` or `"static"`. A name mink has no linkage of is refused listing them, and the key is refused on any other `kind`, naming it. A linkage the target's loader does not run is refused when the target resolves, pointing at the key and listing those it runs, its default first, as `mach info targets` shows them. |
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
-| `out`     | every kind but `object` | This artifact's output path, relative to the project root like every other path. An `object` artifact states none, since its objects stay under `obj/` for a later link: stating it is refused, and `mach migrate` removes it. Write `{project.work}/bin/demo` to place it under the build output, or any other project path to place it there. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
+| `out`     | every kind but `object` | This artifact's output path, relative to the project root like every other path. An `object` artifact states none, since its objects stay under `obj/` for a later link: stating it is refused, and `mach migrate` removes it. Write `{project.work}/bin/demo` to place it under the build output, or any other project path to place it there. v6 rooted it under the expanded `[project].out` without saying so, so `mach migrate` writes `{project.work}/` before each `out` of a manifest that still writes `[project].out`. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | absent: links nothing | Array of `[link.X]` names this artifact links (see below). A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names no [link.*] table: 'nosuch' (declared: [link.kernel32])`). |
 | `need`    | absent: needs nothing | Array of category-qualified requirements such as `step.generate`, `artifact.support`, and `artifact.shader-*`. Each glob matches only its named category. See [Artifact requirements](#artifact-requirements). |

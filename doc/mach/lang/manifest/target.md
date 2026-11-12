@@ -30,6 +30,22 @@ ret: the formatted tuple; err when the allocator refused it
 pub fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
 ```
 
+## fun rewrites
+
+```mach
+pub fun rewrites(alloc: *A.Allocator, doc: *toml.Table, out: *Vector[Fix]) err[fail.Fail];
+```
+
+every rewrite of a target spelling the previous major wrote, as fixes of the manifest's text,
+which `mach migrate` applies: each retired spelling and each `arch` written as an instruction
+set, as the refusals above fix them, and the previous major's `isa` written as an instruction
+set where the table writes no `arch`, which names the architecture that enters it beside it
+
+alloc: owns the fixes' text and storage
+doc: the document root, a manifest of either major
+out: receives the fixes, in no order
+ret: ok, or the refusal of an allocation
+
 ## fun target_set
 
 ```mach

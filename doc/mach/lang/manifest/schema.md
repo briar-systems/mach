@@ -142,6 +142,34 @@ doc: the document root
 out: receives the fixes, in no order
 ret: ok, or the allocator's refusal
 
+## rec Leftover
+
+```mach
+pub rec Leftover;
+```
+
+a removed key a manifest writes that no rewrite migrates, which the check refuses until its
+author decides what replaces it
+
+section: the root key of its table, "" for the document root
+name: its table's name under a section of named tables, "" for a section itself
+key: the key
+note: what replaces it, as its refusal says
+at: the key token as written
+
+## fun leftovers
+
+```mach
+pub fun leftovers(doc: *toml.Table, out: *Vector[Leftover]) err[A.Error];
+```
+
+every removed key a parsed manifest document writes that no rewrite migrates, in every table
+the schema holds
+
+doc: the document root
+out: receives the keys, in document order; its strings are borrowed from `doc` and the rows
+ret: ok, or the allocator's refusal
+
 ## fun key_text
 
 ```mach
