@@ -184,7 +184,8 @@ failures:
 
 The exit code of `mach test`:
 
-- `0` — every test that ran passed or skipped.
+- `0` — every test that ran passed or skipped. A project that declares no
+  test runs none, reports `0 passed, 0 failed, 0 total` and exits `0`.
 - `1` — at least one test failed, was killed by a signal, or timed out; also a
   user error such as an unknown flag.
 - `2` — a build or internal error before the tests could run, or a test that
@@ -192,8 +193,8 @@ The exit code of `mach test`:
 - `3` — an environment failure before the tests could run: a file, directory
   or process operation the machine refused.
 
-These are the codes every `mach` command shares (`mach help <command>` lists
-them under `exit:`); `test` only adds what `1` also means.
+These are the codes every `mach` command shares. `test` only adds what `1`
+also means.
 
 `--list` prints each selected test's qualified name and the test object that
 holds it, and exits without linking or running anything:
