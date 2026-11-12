@@ -1369,7 +1369,9 @@ any of them (see [test.md](test.md#which-tests-run)).
   dependencies export, in a section the link leaves out of the image. A link that
   pulls a member finds what its claims name, a library by its `kind` with no
   fallback and a local file by its absolute path, so a consumer that takes the
-  archive by path restates none of them.
+  archive by path restates none of them. A file the claims name that the
+  consumer's own entries name too is linked once (see
+  [One file is one input](#one-file-is-one-input)).
 - **`shared`** links a dynamic library at the resolved `out`, as mink's shared
   output kind: a `.so` on ELF, a `.dll` on PE and a `.dylib` on Mach-O, named as
   mink's system names the file. A system whose loader maps no library into
@@ -1628,6 +1630,20 @@ library is validated for the selected target before it is recorded: an ELF
 linker script, a foreign-architecture file) is refused (`'<file>' is not a
 loadable ELF shared object for the selected architecture`).
 
+### One file is one input
+
+A link reads each file once, however many times and however it is named: by
+an artifact's `link` list, by two entries, through `{project.work}`, and by the
+claims of the objects it links, which name a `local` file by its absolute path
+(every object mach emits carries a claim per entry, so an artifact's own
+`local` entry always reaches its link twice). mink knows a file by its
+absolute path, lexically cleaned, and a file named again adds nothing. When the
+namings disagree on `include`, the library is named in the image if any of them
+says `"always"`, and otherwise as the first naming says. A symbolic link is not
+followed: a file named through a symbolic link and by its own path, or by two
+hard links, is two inputs, and an object read twice that way is refused as a
+symbol defined in more than one input.
+
 An entry's table key is its identity: `[link.vulkan]` answers to
 `#[library("vulkan")]` and to nothing else. A loader name such as
 `kernel32.dll` does not bind, and an import attributed to one is refused with a
@@ -1875,19 +1891,23 @@ being deleted by hand.
 
 **A link whose inputs did not change is not run again.** After each link the
 build records, in `{project.work}/.cache/link` under the output's canonical
-path, the link's key and the SHA-256 of the bytes it wrote. The key covers the
-whole configuration (the compiler binary's digest among it, and so the
-linker's), the link configuration (the artifact's kind, its output path and
-product name, its resources by content, every link input given as a file by its
-digest, the library search directories and the layout) and the key of every
-object the link takes, in link order. A build that compiled nothing, whose key
-equals the record of its output, and whose output file still hashes to the
-recorded digest leaves the output as it is: same bytes, same modification time,
-same file. The output's bytes are read and hashed every time; its size and
-times decide nothing. A link that takes a library found by name in a search
-directory (a `system` or `framework` entry linked from a file, or `-l`) always
-runs, since the key names such a library and not its contents. Anything else, a
-missing or changed output, another key or a damaged record, links as before.
+path, the link's key, the SHA-256 of the bytes it wrote and the other files it
+read. The key covers the whole configuration (the compiler binary's digest among
+it, and so the linker's), the link configuration (the artifact's kind, its
+output path and product name, its resources by content, every link input given
+as a file by its digest, the library search directories and the layout), the
+key of every object the link takes, in link order, and every other file the
+link read, such as a `local` file the claims of a static archive name or a file
+a linker script names, by its path and the digest of its bytes. A build that
+compiled nothing, whose key equals the record of its output, with every file
+read and hashed again, and whose output file still hashes to the recorded
+digest leaves the output as it is: same bytes, same modification time, same
+file. Every file's bytes are read and hashed every time; sizes and times decide
+nothing. A link that reads a library found by name in a search directory always
+runs, since the key names such a library and not its contents: a `system` or
+`framework` entry linked from a file, `-l`, or a claim of an archive's member
+naming a library found that way. Anything else, a missing or changed output,
+another key or a damaged record, links as before.
 
 `--no-cache` forces an uncached
 build: it reuses no object and writes each one without a key, and `mach clean`

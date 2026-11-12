@@ -47,13 +47,13 @@ registry states for the target's format, its index naming each member's exported
 
 ```mach
 pub fun link_image(p: *project.Project, diags: *diagnostic.DiagnosticStore, kind: *mink_output.Kind, inputs: *Given, count: u32,
-links: *input.Input, link_count: u32, destination: str, image: *LoadedImageOptions) err[fail.Fail];
+links: *input.Input, link_count: u32, destination: str, image: *LoadedImageOptions) res[backend.LinkRead, fail.Fail];
 ```
 
 the image of `kind` mink links in memory from the `count` objects at `inputs`, in link order,
 then the `link_count` inputs at `links`, written to `destination` with the resources
 `image` declares, laid out as the artifact and its placed globals state, what the link tells of
-itself reported to `diags`
+itself reported to `diags`, answering what the link read
 
 ## fun object_count
 

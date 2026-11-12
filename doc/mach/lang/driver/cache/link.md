@@ -1,14 +1,16 @@
 # mach.lang.driver.cache.link
 
 the link records of a cell: for each output a link wrote, by its canonical path, the key of the
-link that wrote it and the sha-256 of the bytes it wrote. a build that compiled nothing and keys
-its link as the record of its output does skips the link when the file there still hashes to the
-recorded digest. the records live at `<out>/.cache/link`, written after the output they describe
-is in place, so an interrupted build leaves a record naming the old bytes, never one naming bytes
-that were not written. a store that is missing, truncated or damaged reads as empty. the layout
-is `"MLK1"`, the record count, the records, then the sha-256 of everything before it. a record is
-its path (length then bytes), its 32-byte link key and its 32-byte digest, every number a
-little-endian u32
+link that wrote it, the sha-256 of the bytes it wrote, the files beyond its keyed inputs it read
+and whether it read a file a search found. a build that compiled nothing and keys its link as the
+record of its output does skips the link when the file there still hashes to the recorded
+digest. the records live at `<out>/.cache/link`, written after the output they describe is in
+place, so an interrupted build leaves a record naming the old bytes, never one naming bytes that
+were not written. a store that is missing, truncated or damaged reads as empty. the layout is
+`"MLK2"`, the record count, the records, then the sha-256 of everything before it. a record is
+its path (length then bytes), its 32-byte link key, its 32-byte digest, a byte that is one when
+the link read a file a search found, the count of the files it read and each file's path
+(length then bytes), every number a little-endian u32
 
 ## rec Written
 
@@ -16,7 +18,9 @@ little-endian u32
 pub rec Written;
 ```
 
-what wrote the output at a path: the link's key and the digest of the bytes it wrote
+what wrote the output at a path: the link's key, the digest of the bytes it wrote, whether it
+read a file a search found, and the files beyond its keyed inputs it read, which a record owns
+and a caller's lends
 
 ## rec Store
 
@@ -42,7 +46,8 @@ pub fun dnit(st: *Store);
 pub fun written(st: *Store, path: str) opt[Written];
 ```
 
-what the record of `path` says wrote it, none when no link is recorded there
+what the record of `path` says wrote it, its files the store's, none when no link is recorded
+there
 
 ## fun put
 
@@ -50,8 +55,8 @@ what the record of `path` says wrote it, none when no link is recorded there
 pub fun put(st: *Store, path: str, w: *Written) err[A.Error];
 ```
 
-the record of `path` set to `w`; a path whose hash another path holds is not recorded, so its
-link always runs
+the record of `path` set to `w`, a copy of its files the store's; a path whose hash another path
+holds is not recorded, so its link always runs
 
 ## fun decode
 

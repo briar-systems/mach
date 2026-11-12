@@ -49,11 +49,12 @@ bo: *outcome.BuildOutcome, oa: *A.Allocator) err[fail.Fail];
 
 ```mach
 pub fun link_dispatcher(p: *project.Project, diags: *diagnostic.DiagnosticStore, sc: *TestScope, links: *Vector[input.Input],
-modules: *Given, module_len: u32, dispatcher: str, artifact: str) err[fail.Fail];
+modules: *Given, module_len: u32, dispatcher: str, artifact: str) res[backend.LinkRead, fail.Fail];
 ```
 
 synthesize the dispatcher over the selected tests, write its object to `dispatcher`, and
-link it with the test objects and the normal objects into `artifact`
+link it with the test objects and the normal objects into `artifact`, answering what the link
+read
 
 modules: the build's current objects: test and normal objects in topological order
 

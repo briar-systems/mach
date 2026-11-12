@@ -345,15 +345,46 @@ sections: each section the plan places ahead of the rest, parallel to its sectio
 regions: each memory region, parallel to the plan's regions, which the plan's runs and
                loads name
 
+## rec LinkRead
+
+```mach
+pub rec LinkRead;
+```
+
+what a link read beyond the objects and the files it was handed by path
+
+files: each other file it read and no search found, by its identity, a copy the read owns
+searched: it read a file a search found, which no digest of the file's bytes stands for
+
+## fun link_read_init
+
+```mach
+pub fun link_read_init(a: *A.Allocator) LinkRead;
+```
+
+## fun link_read_dnit
+
+```mach
+pub fun link_read_dnit(a: *A.Allocator, r: *LinkRead);
+```
+
+## rec Linked
+
+```mach
+pub rec Linked;
+```
+
+a linked image and what its link read
+
 ## fun link
 
 ```mach
-pub fun link(b: *Back, a: *A.Allocator, diags: *diagnostic.DiagnosticStore, kind: *output.Kind, requests: *Request, count: usize, output_path: str, gc: bool, image: *Image) res[Sink, fail.Fail];
+pub fun link(b: *Back, a: *A.Allocator, diags: *diagnostic.DiagnosticStore, kind: *output.Kind, requests: *Request, count: usize, output_path: str, gc: bool, image: *Image) res[Linked, fail.Fail];
 ```
 
 the image of `kind` in the target's format mink links from the `count` requests at `requests`, a library
 named by name found by mink's search, named `output` where its format records a name, its
-unreferenced sections left out with `gc`, laid out as `image` states. mink's notes go to `diags`:
-a refused link's are notes of the refusal, which is reported there, and a finished link's are
-warnings
+unreferenced sections left out with `gc`, laid out as `image` states, with what the link read.
+mink's notes go to `diags`: a refused link's are notes of the refusal, which is reported there,
+and a finished link's are warnings
 

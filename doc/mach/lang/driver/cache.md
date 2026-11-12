@@ -367,16 +367,19 @@ pub fun link_stands(p: *project.Project, artifact: str) res[bool, fail.Fail];
 ```
 
 the link that would write `artifact` need not run: this build compiled nothing, the link reads
-no input found by name, its key is the key the record of the artifact's path holds, and the file
-there hashes to the digest that record holds. the file is read and hashed every time, never
+no input found by name and its last run read no file a search found, its key and the files that
+run read beyond its keyed inputs key it as the record of the artifact's path does, and the file
+there hashes to the digest that record holds. every file is read and hashed every time, never
 trusted from its metadata
 
 ## fun note_link
 
 ```mach
-pub fun note_link(p: *project.Project, artifact: str, digest: *[32]u8) err[fail.Fail];
+pub fun note_link(p: *project.Project, artifact: str, digest: *[32]u8, read: *backend.LinkRead) err[fail.Fail];
 ```
 
-the link that wrote `artifact` as the bytes `digest` names is recorded under its key, so a later
-build that compiles nothing and keys its link the same leaves the artifact as it is
+the link that wrote `artifact` as the bytes `digest` names, having read `read`, is recorded under
+its key and the files it read, so a later build that compiles nothing, keys its link the same and
+finds those files holding the same bytes leaves the artifact as it is. a link that read a file a
+search found is recorded as one that always runs
 
