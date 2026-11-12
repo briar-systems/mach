@@ -6,7 +6,6 @@ use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.char.char;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
@@ -21,6 +20,7 @@ use mach.lang.diagnostic;
 use diagnostic_kind: mach.lang.diagnostic.kind;
 use mach.lang.fail;
 use mach.lang.fe.ast;
+use ast_decl: mach.lang.fe.ast.decl;
 use ast_expr: mach.lang.fe.ast.expr;
 use ast_id:   mach.lang.fe.ast.id;
 use ast_type: mach.lang.fe.ast.type;
@@ -285,7 +285,10 @@ pub rec LowerRequest {
     # exports nothing is worth a warning
     shared_artifact: bool;
     debug:           bool;
-    checks:          bool;
+    # the objects are an archive's members, which a link takes only some of, so each
+    # describes every type it names (see debug_describe)
+    standalone: bool;
+    checks:     bool;
 }
 
 pub rec LowerContext {
@@ -308,6 +311,7 @@ pub rec LowerContext {
     caps:             comptime_capability.PhaseCapabilities[LowerContext];
     shared_artifact:  bool;
     debug:            bool;
+    standalone:       bool;
     # debug-profile runtime checks: the release pipeline emits none
     checks:  bool;
     unit:    *Unit;
@@ -336,7 +340,14 @@ pub rec LowerContext {
     # the read-only global holding each string's bytes, by its text: one per module
     strings: map.Map[intern.StrId, value.Value];
     # the pointees the debug types name by key, described once every other type is
-    debug_pointees: collections_vector.Vector[DebugPointee];
+    debug_pointees: collections_vector.Vector[type_kind.TypeId];
+    # the records, unions and tags this object describes for every other, in the order the
+    # module declares them, and each by its type (see debug_own_types)
+    debug_owns:  collections_vector.Vector[type_kind.TypeId];
+    debug_owned: map.Map[type_kind.TypeId, bool];
+    # where the first of them is declared, which states the module's file to an object
+    # whose code states none
+    debug_owned_at: lang_source.Span;
 
     loops:    *LoopFrame;
     loop_len: u32;
@@ -516,6 +527,7 @@ pub fun request(
     normal_object: *NormalObject,
     shared_artifact: bool,
     debug: bool,
+    standalone: bool,
     checks: bool,
     diags: *diagnostic.DiagnosticStore,
     interfaces: sema_interface.Reader,
@@ -546,6 +558,7 @@ pub fun request(
     req.normal_object   = normal_object;
     req.shared_artifact = shared_artifact;
     req.debug           = debug;
+    req.standalone      = standalone;
     req.checks          = checks;
     ret res[LowerRequest, fail.Fail].ok{req};
 }
@@ -559,6 +572,7 @@ pub fun unit_request(
     machine: *Machine,
     malloc: *A.Allocator,
     debug: bool,
+    standalone: bool,
     checks: bool,
     diags: *diagnostic.DiagnosticStore,
     interfaces: sema_interface.Reader,
@@ -585,6 +599,7 @@ pub fun unit_request(
     req.normal_object     = nil;
     req.shared_artifact   = false;
     req.debug             = debug;
+    req.standalone        = standalone;
     req.checks            = checks;
     ret res[LowerRequest, fail.Fail].ok{req};
 }
@@ -645,6 +660,7 @@ pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *mirl_module.Modu
     lc.normal_object    = req.normal_object;
     lc.shared_artifact  = req.shared_artifact;
     lc.debug            = req.debug;
+    lc.standalone       = req.standalone;
     lc.checks           = req.checks;
     lc.unit             = unit;
     lc.m                = m;
@@ -727,7 +743,9 @@ pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *mirl_module.Modu
     lc.held           = map.init[type_kind.TypeId, u8](s.alloc);
     lc.lowered        = map.init[type_kind.TypeId, Type](s.alloc);
     lc.strings        = map.init[intern.StrId, value.Value](s.alloc);
-    lc.debug_pointees = collections_vector.init[DebugPointee](s.alloc);
+    lc.debug_pointees = collections_vector.init[type_kind.TypeId](s.alloc);
+    lc.debug_owns     = collections_vector.init[type_kind.TypeId](s.alloc);
+    lc.debug_owned    = map.init[type_kind.TypeId, bool](s.alloc);
 
     built = true;
     ret err[fail.Fail].ok{};
@@ -799,7 +817,9 @@ pub fun dnit_context(lc: *LowerContext) {
     map.dnit[type_kind.TypeId, u8](?lc.held);
     map.dnit[type_kind.TypeId, Type](?lc.lowered);
     map.dnit[intern.StrId, value.Value](?lc.strings);
-    collections_vector.dnit[DebugPointee](?lc.debug_pointees);
+    collections_vector.dnit[type_kind.TypeId](?lc.debug_pointees);
+    collections_vector.dnit[type_kind.TypeId](?lc.debug_owns);
+    map.dnit[type_kind.TypeId, bool](?lc.debug_owned);
 }
 
 # the element the innermost `$each` loop variable `name` names
@@ -1195,11 +1215,6 @@ pub fun type_store(lc: *LowerContext) *type.TypeInterner {
 }
 
 # a pointer's debug type whose pointee waits for the module's other debug types
-rec DebugPointee {
-    key: str;
-    ty:  type_kind.TypeId;
-}
-
 pub fun begin_function(lc: *LowerContext, fn_index: u32, ret_type: Type) {
     map.clear[resolve.SymbolId, value.Value](?lc.locals);
     map.clear[resolve.SymbolId, value.Value](?lc.values);
@@ -1692,16 +1707,27 @@ pub fun debug_type_of(lc: *LowerContext, tid: type_kind.TypeId) res[opt[mirl_deb
     ret res[opt[mirl_debug.Type], fail.Fail].ok{opt[mirl_debug.Type].some{made.ok}};
 }
 
-# the key a source type is described under in every module: its identity
-fun debug_key(lc: *LowerContext, tid: type_kind.TypeId) res[str, fail.Fail] {
+# the bytes of a debug key: `mach.` and sixteen hex digits
+val DEBUG_KEY_LEN: usize = 21;
+
+# the key a source type is described under in every module: its identity, which the type
+# table keeps once worked out, spelled into `buf` of DEBUG_KEY_LEN bytes
+fun debug_key(lc: *LowerContext, tid: type_kind.TypeId, buf: *u8) res[View, fail.Fail] {
     val ident: res[u64, fail.Fail] = recipe.identity(lc.s, tid);
-    if (sel ident.err) { ret res[str, fail.Fail].err{ident.err}; }
-    val text: res[str, fail.Fail] = diagnostic.format(lc.s.alloc, "mach.{}", ident.ok);
-    if (sel text.err) { ret text; }
-    val kept: res[intern.StrId, A.Error] = intern.add(?lc.s.interner, text.ok);
-    A.deallocate[char](lc.s.alloc, text.ok, str_len(text.ok) + 1);
-    if (sel kept.err) { ret res[str, fail.Fail].err{fail.refused(kept.err)}; }
-    ret res[str, fail.Fail].ok{intern.text(?lc.s.interner, kept.ok)};
+    if (sel ident.err) { ret res[View, fail.Fail].err{ident.err}; }
+    buf[0] = 'm';
+    buf[1] = 'a';
+    buf[2] = 'c';
+    buf[3] = 'h';
+    buf[4] = '.';
+    var i: usize = 0;
+    for (i < 16) {
+        val nibble: u8 = ((ident.ok >> ((60 - 4 * i)::u64)) & 0xf)::u8;
+        if (nibble < 10) { buf[5 + i] = '0' + nibble; }
+        or               { buf[5 + i] = 'a' + nibble - 10; }
+        i = i + 1;
+    }
+    ret res[View, fail.Fail].ok{View{data: buf, len: DEBUG_KEY_LEN}};
 }
 
 fun view_of(s: str) View {
@@ -1765,7 +1791,51 @@ fun debug_name(lc: *LowerContext, t: *type.Type, tid: type_kind.TypeId) res[View
     ret res[View, fail.Fail].ok{view_of(type_prim.prim_name(k))};
 }
 
-# describe the source type `tid` in the module's debug table, once
+# whether `t` is a record, union or tag a module declares by name, which the object
+# that emits its declaration describes for every other
+fun debug_declared(t: *type.Type) bool {
+    val k: type_kind.TypeKind = t.kind;
+    if (k != type_kind.TYPE_REC && k != type_kind.TYPE_UNI && k != type_kind.TYPE_TAG) { ret false; }
+    ret t.data.nominal.incarnation == 0;
+}
+
+# the types this object describes for every other: each record, union and tag the module
+# declares that the object emits the declaration of, the test object a `#[testing]` one
+# and the normal object any other. a generic is described by its instances, in every
+# module that names one
+pub fun debug_own_types(lc: *LowerContext) err[fail.Fail] {
+    if (!lc.debug || lc.standalone) { ret err[fail.Fail].ok{}; }
+    val a:           *ast.Ast = lc.scope.a;
+    val test_object: bool     = lc.normal_object != nil;
+    var d:           u32      = 0;
+    for (d < a.decls.len::u32) {
+        val did: ast_id.DeclId = ast_id.decl(d);
+        d = d + 1;
+        val got: opt[*ast_decl.Decl] = ast.get_decl(a, did);
+        if (sel got.none) { cnt; }
+        val k:        ast_decl.DeclKind = got.some.kind;
+        var generics: u32               = 1;
+        if (k == ast_decl.DECL_KIND_REC)                        { generics = got.some.data.rec_.generics_len; }
+        or (k == ast_decl.DECL_KIND_UNI)                        { generics = got.some.data.uni_.generics_len; }
+        or (k == ast_decl.DECL_KIND_TAG)                        { generics = got.some.data.tag_.generics_len; }
+        if (generics != 0)                                      { cnt; }
+        if (resolve.declaration_testing(a, did) != test_object) { cnt; }
+        val tid: type_kind.TypeId = decl_type_of(lc, did);
+        if (type_kind.is_nil(tid) || type_kind.is_error(tid)) { cnt; }
+        if (lc.debug_owns.len == 0)                           { lc.debug_owned_at = got.some.span; }
+        val pushed: res[usize, A.Error] = collections_vector.push[type_kind.TypeId](?lc.debug_owns, tid);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        val kept: res[bool, A.Error] = map.insert[type_kind.TypeId, bool](?lc.debug_owned, tid, true);
+        if (sel kept.err) { ret err[fail.Fail].err{fail.refused(kept.err)}; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# describe the source type `tid` in the module's debug table, once. a record, union or tag
+# a module declares is described by the object that emits its declaration and named by
+# its key alone in every other; any other type is described alike by each module that
+# names it, as every type is when the objects are an archive's members, since a link of
+# an archive takes only the members it needs and the owner may not be one
 fun debug_describe(lc: *LowerContext, tid: type_kind.TypeId) res[mirl_debug.Type, fail.Fail] {
     val found: opt[*mirl_debug.Type] = map.get[type_kind.TypeId, mirl_debug.Type](?lc.debug_types, ?tid);
     if (sel found.some)    { ret res[mirl_debug.Type, fail.Fail].ok{@found.some}; }
@@ -1776,12 +1846,12 @@ fun debug_describe(lc: *LowerContext, tid: type_kind.TypeId) res[mirl_debug.Type
     val t: *type.Type         = to.some;
     val k: type_kind.TypeKind = t.kind;
 
-    val key: res[str, fail.Fail] = debug_key(lc, tid);
+    var keyed: [DEBUG_KEY_LEN]u8;
+    val key:   res[View, fail.Fail] = debug_key(lc, tid, ?keyed[0]);
     if (sel key.err) { ret res[mirl_debug.Type, fail.Fail].err{key.err}; }
-    val name: res[View, fail.Fail] = debug_name(lc, t, tid);
-    if (sel name.err) { ret res[mirl_debug.Type, fail.Fail].err{name.err}; }
     val layout: res[Type, fail.Fail] = lower_type(lc, tid);
     if (sel layout.err) { ret res[mirl_debug.Type, fail.Fail].err{layout.err}; }
+    val shared: mirl_debug.Home = mirl_debug.Home.shared{};
 
     val d: type_prim.PrimDesc = type_prim.prim_desc(k);
     if (d.class != type_prim.PRIM_CLASS_NONE || k == type_kind.TYPE_FUN) {
@@ -1794,21 +1864,22 @@ fun debug_describe(lc: *LowerContext, tid: type_kind.TypeId) res[mirl_debug.Type
         }
         or (d.signed)   { enc = mirl_debug.Encoding.signed{}; }
         if (width == 0) { width = 8; }
-        val made: res[mirl_debug.Declared, fail.Fail] = declare_debug(lc, tid, mirl_debug.Entry{key: view_of(key.ok), name: name.ok,
-            head: mirl_debug.Head.base{mirl_debug.Base{encoding: enc, width: width}}});
+        val made: res[mirl_debug.Declared, fail.Fail] = declare_debug(lc, tid, mirl_debug.Entry{key: key.ok, name: view_of(type_prim.prim_name(k)),
+            head: mirl_debug.Head.base{mirl_debug.Base{encoding: enc, width: width}}, home: shared});
         if (sel made.err) { ret res[mirl_debug.Type, fail.Fail].err{made.err}; }
         ret res[mirl_debug.Type, fail.Fail].ok{declared_type(made.ok)};
     }
 
     if (k == type_kind.TYPE_POINTER) {
-        val pointee: type_kind.TypeId    = type.strip_secret(?lc.s.types, t.data.pointer.base);
-        val pkey:    res[str, fail.Fail] = debug_key(lc, pointee);
+        val pointee: type_kind.TypeId     = type.strip_secret(?lc.s.types, t.data.pointer.base);
+        var pkeyed:  [DEBUG_KEY_LEN]u8;
+        val pkey:    res[View, fail.Fail] = debug_key(lc, pointee, ?pkeyed[0]);
         if (sel pkey.err) { ret res[mirl_debug.Type, fail.Fail].err{pkey.err}; }
-        val made: res[mirl_debug.Declared, fail.Fail] = declare_debug(lc, tid, mirl_debug.Entry{key: view_of(key.ok), name: view_of(nil),
-            head: mirl_debug.Head.pointer{view_of(pkey.ok)}});
+        val made: res[mirl_debug.Declared, fail.Fail] = declare_debug(lc, tid, mirl_debug.Entry{key: key.ok, name: view_of(nil),
+            head: mirl_debug.Head.pointer{pkey.ok}, home: shared});
         if (sel made.err) { ret res[mirl_debug.Type, fail.Fail].err{made.err}; }
-        val waiting: err[fail.Fail] = debug_pointee_note(lc, pkey.ok, pointee);
-        if (sel waiting.err) { ret res[mirl_debug.Type, fail.Fail].err{waiting.err}; }
+        val pushed: res[usize, A.Error] = collections_vector.push[type_kind.TypeId](?lc.debug_pointees, pointee);
+        if (sel pushed.err) { ret res[mirl_debug.Type, fail.Fail].err{fail.refused(pushed.err)}; }
         ret res[mirl_debug.Type, fail.Fail].ok{declared_type(made.ok)};
     }
 
@@ -1821,7 +1892,7 @@ fun debug_describe(lc: *LowerContext, tid: type_kind.TypeId) res[mirl_debug.Type
             elem_tid = lane.some;
             count    = t.data.vector.lanes::u64;
         }
-        val made: res[mirl_debug.Declared, fail.Fail] = declare_debug(lc, tid, mirl_debug.Entry{key: view_of(key.ok), name: view_of(nil), head: mirl_debug.Head.array{}});
+        val made: res[mirl_debug.Declared, fail.Fail] = declare_debug(lc, tid, mirl_debug.Entry{key: key.ok, name: view_of(nil), head: mirl_debug.Head.array{}, home: shared});
         if (sel made.err)      { ret res[mirl_debug.Type, fail.Fail].err{made.err}; }
         if (sel made.ok.known) { ret res[mirl_debug.Type, fail.Fail].ok{made.ok.known}; }
         val elem: res[mirl_debug.Type, fail.Fail] = debug_describe(lc, type.strip_secret(?lc.s.types, elem_tid));
@@ -1832,8 +1903,8 @@ fun debug_describe(lc: *LowerContext, tid: type_kind.TypeId) res[mirl_debug.Type
     }
 
     if (k != type_kind.TYPE_REC && k != type_kind.TYPE_UNI && k != type_kind.TYPE_TAG && k != type_kind.TYPE_INSTANCE) {
-        val made: res[mirl_debug.Declared, fail.Fail] = declare_debug(lc, tid, mirl_debug.Entry{key: view_of(key.ok), name: name.ok,
-            head: mirl_debug.Head.base{mirl_debug.Base{encoding: mirl_debug.Encoding.unsigned{}, width: 8}}});
+        val made: res[mirl_debug.Declared, fail.Fail] = declare_debug(lc, tid, mirl_debug.Entry{key: key.ok, name: view_of(type_prim.prim_name(k)),
+            head: mirl_debug.Head.base{mirl_debug.Base{encoding: mirl_debug.Encoding.unsigned{}, width: 8}}, home: shared});
         if (sel made.err) { ret res[mirl_debug.Type, fail.Fail].err{made.err}; }
         ret res[mirl_debug.Type, fail.Fail].ok{declared_type(made.ok)};
     }
@@ -1843,7 +1914,18 @@ fun debug_describe(lc: *LowerContext, tid: type_kind.TypeId) res[mirl_debug.Type
     var head:     mirl_debug.Head = mirl_debug.Head.structure{layout.ok};
     if (is_tag)   { head = mirl_debug.Head.tagged{layout.ok}; }
     or (is_union) { head = mirl_debug.Head.union{layout.ok}; }
-    val made: res[mirl_debug.Declared, fail.Fail] = declare_debug(lc, tid, mirl_debug.Entry{key: view_of(key.ok), name: name.ok, head: head});
+    var home: mirl_debug.Home = shared;
+    if (debug_declared(t) && !lc.standalone) {
+        if (!map.contains[type_kind.TypeId, bool](?lc.debug_owned, ?tid)) {
+            val named: res[mirl_debug.Declared, fail.Fail] = declare_debug(lc, tid, mirl_debug.Entry{key: key.ok, name: view_of(nil), head: head, home: mirl_debug.Home.outside{}});
+            if (sel named.err) { ret res[mirl_debug.Type, fail.Fail].err{named.err}; }
+            ret res[mirl_debug.Type, fail.Fail].ok{declared_type(named.ok)};
+        }
+        home = mirl_debug.Home.own{};
+    }
+    val name: res[View, fail.Fail] = debug_name(lc, t, tid);
+    if (sel name.err) { ret res[mirl_debug.Type, fail.Fail].err{name.err}; }
+    val made: res[mirl_debug.Declared, fail.Fail] = declare_debug(lc, tid, mirl_debug.Entry{key: key.ok, name: name.ok, head: head, home: home});
     if (sel made.err)      { ret res[mirl_debug.Type, fail.Fail].err{made.err}; }
     if (sel made.ok.known) { ret res[mirl_debug.Type, fail.Fail].ok{made.ok.known}; }
     val self: mirl_debug.Type = made.ok.fresh;
@@ -1907,38 +1989,68 @@ fun declared_type(d: mirl_debug.Declared) mirl_debug.Type {
     ret d.known;
 }
 
-# a pointer names its pointee by key, which is described once the module's types are
-fun debug_pointee_note(lc: *LowerContext, key: str, pointee: type_kind.TypeId) err[fail.Fail] {
-    val pushed: res[usize, A.Error] = collections_vector.push[DebugPointee](?lc.debug_pointees, DebugPointee{key: key, ty: pointee});
-    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
-    ret err[fail.Fail].ok{};
-}
-
-# describe every pointee left waiting, then link the table. an instance of an expansive
-# generic the module describes no value of stays undescribed past its pointer, since such
-# a generic has unboundedly many instances behind its pointers, and is described opaque
+# describe the types this object owns, then every pointee left waiting, then link the
+# table. a pointee holding by value an instance of an expansive generic the module
+# describes no value of is not described past its pointer, since such a generic has
+# unboundedly many instances behind its pointers: a record, union, tag or instance is
+# named by its key alone, as another object describes it, and any other is opaque
 pub fun debug_types_finish(lc: *LowerContext) err[fail.Fail] {
     if (!lc.debug) { ret err[fail.Fail].ok{}; }
+    if (lc.debug_owns.len > 0 && lc.m.debug.files.len == 0) {
+        val stated: opt[mirl_debug.Location] = builder.location_of(?lc.builder, lang_source.location(lc.scope.a.file_id, lc.debug_owned_at));
+        if (sel stated.none) { ret err[fail.Fail].err{fail.message("lower: the debug table refused the file of a module's own types")}; }
+    }
     var i: usize = 0;
-    for (i < lc.debug_pointees.len) {
-        val waiting: DebugPointee         = lc.debug_pointees.data[i];
-        val bounded: res[bool, fail.Fail] = debug_pointee_bounded(lc, waiting.ty);
-        if (sel bounded.err) { ret err[fail.Fail].err{bounded.err}; }
-        if (bounded.ok) {
-            val described: res[mirl_debug.Type, fail.Fail] = debug_describe(lc, waiting.ty);
-            if (sel described.err) { ret err[fail.Fail].err{described.err}; }
-        }
+    for (i < lc.debug_owns.len) {
+        val owned: res[mirl_debug.Type, fail.Fail] = debug_describe(lc, lc.debug_owns.data[i]);
+        if (sel owned.err) { ret err[fail.Fail].err{owned.err}; }
         i = i + 1;
     }
-    for (true) {
-        val open: opt[View] = mirl_debug_entry.pending(?lc.m.debug);
-        if (sel open.none) { brk; }
-        val opaque: res[mirl_debug.Declared, mirl_debug_table.Error] = mirl_debug_entry.declare(?lc.m.debug, ?lc.m.types,
-            mirl_debug.Entry{key: open.some, name: view_of(nil), head: mirl_debug.Head.base{mirl_debug.Base{encoding: mirl_debug.Encoding.unsigned{}, width: 8}}});
-        if (sel opaque.err) { ret err[fail.Fail].err{debug_failed(lc, opaque.err)}; }
+    i = 0;
+    for (i < lc.debug_pointees.len) {
+        val waiting: type_kind.TypeId = lc.debug_pointees.data[i];
+        i = i + 1;
+        if (map.contains[type_kind.TypeId, mirl_debug.Type](?lc.debug_types, ?waiting)) { cnt; }
+        val to: opt[*type.Type] = type.get(?lc.s.types, waiting);
+        if (sel to.none) { ret err[fail.Fail].err{fail.message("lower: a described type is not in the type table")}; }
+        var bounded: bool = true;
+        if (!debug_declared(to.some) || lc.standalone) {
+            val b: res[bool, fail.Fail] = debug_pointee_bounded(lc, waiting);
+            if (sel b.err) { ret err[fail.Fail].err{b.err}; }
+            bounded = b.ok;
+        }
+        if (bounded) {
+            val described: res[mirl_debug.Type, fail.Fail] = debug_describe(lc, waiting);
+            if (sel described.err) { ret err[fail.Fail].err{described.err}; }
+            cnt;
+        }
+        val opaque: err[fail.Fail] = debug_opaque(lc, waiting, to.some);
+        if (sel opaque.err) { ret opaque; }
     }
     val linked: err[mirl_debug_table.Error] = mirl_debug_entry.finish(?lc.m.debug);
     if (sel linked.err) { ret err[fail.Fail].err{debug_failed(lc, linked.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# a pointee left undescribed: a record, union, tag or instance named by its key alone,
+# and any other an opaque scalar under its key
+fun debug_opaque(lc: *LowerContext, tid: type_kind.TypeId, t: *type.Type) err[fail.Fail] {
+    var keyed: [DEBUG_KEY_LEN]u8;
+    val key:   res[View, fail.Fail] = debug_key(lc, tid, ?keyed[0]);
+    if (sel key.err) { ret err[fail.Fail].err{key.err}; }
+    val k:    type_kind.TypeKind = t.kind;
+    var head: mirl_debug.Head    = mirl_debug.Head.base{mirl_debug.Base{encoding: mirl_debug.Encoding.unsigned{}, width: 8}};
+    var home: mirl_debug.Home    = mirl_debug.Home.shared{};
+    if (k == type_kind.TYPE_REC || k == type_kind.TYPE_UNI || k == type_kind.TYPE_TAG || k == type_kind.TYPE_INSTANCE) {
+        val layout: res[Type, fail.Fail] = lower_type(lc, tid);
+        if (sel layout.err) { ret err[fail.Fail].err{layout.err}; }
+        head = mirl_debug.Head.structure{layout.ok};
+        if (type.is_tag(?lc.s.types, tid))   { head = mirl_debug.Head.tagged{layout.ok}; }
+        or (type.is_union(?lc.s.types, tid)) { head = mirl_debug.Head.union{layout.ok}; }
+        home = mirl_debug.Home.outside{};
+    }
+    val made: res[mirl_debug.Declared, fail.Fail] = declare_debug(lc, tid, mirl_debug.Entry{key: key.ok, name: view_of(nil), head: head, home: home});
+    if (sel made.err) { ret err[fail.Fail].err{made.err}; }
     ret err[fail.Fail].ok{};
 }
 
