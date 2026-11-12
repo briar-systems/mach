@@ -47,7 +47,7 @@ complete. The full reference is [manifest.md](manifest.md). A binary
 project as `mach init` writes it, shown with one of the six targets it
 declares (`linux-x86_64`, `linux-aarch64`, `linux-riscv64`, `darwin-x86_64`,
 `darwin-aarch64`, `windows-x86_64`), each stating every part mink's catalog
-gives it, the instruction set its floor:
+gives it but `isa`, which is left to the system's floor:
 
 ```toml
 [project]
@@ -59,7 +59,6 @@ work = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
 arch = "x86_64"
-isa  = "cmov,cx8,x87,fxsr,osfxsr,mmx,sce,sse,sse2"
 sys  = "linux"
 abi  = "sysv64"
 

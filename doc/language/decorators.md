@@ -668,9 +668,10 @@ shows no cost whether or not real silicon would. If the cost turns out to matter
 answer is byte-wise lowering of packed field access on faulting targets, which is
 codegen work and not part of `#[packed]` as it stands.
 
-x86-64 and aarch64 do unaligned scalar access in hardware. The aarch64 answer is
-measured on real hardware rather than assumed — `int`'s `linux-arm64` leg runs
-natively.
+x86-64 and aarch64 do unaligned scalar access in hardware. Both architectures define an
+unaligned load or store to ordinary memory, and Linux runs aarch64 programs with alignment
+checking off, so a packed field access there is one ordinary load or store. Its cost on
+aarch64 hardware has not been measured either.
 
 ### `volatile` — every access to the type is a volatile access
 

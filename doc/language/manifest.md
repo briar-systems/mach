@@ -274,7 +274,7 @@ to whichever *declared* target matches the host.
 | Key   | Required | Meaning |
 |-------|----------|---------|
 | `arch` | yes      | Architecture, such as `x86_64` or `riscv64`. Read by `$project.target.arch`. |
-| `isa` | absent: the system's floor; required on `freestanding` | The instruction set every machine of the target has, spelled as masc's catalog for the architecture spells a selection, such as `rv32imc`. Only an architecture whose catalog spells selections takes it, and an `isa` that names an architecture is v6's spelling of `arch`, refused with the rename `mach migrate` writes. See [RISC-V baselines](#risc-v-baselines). |
+| `isa` | absent: the system's floor; required on `freestanding` | The instruction set every machine of the target has, spelled as masc's catalog for the architecture spells a selection, such as `rv32imc` or `x86-64-v2`. Every architecture takes it, and masc refuses a selection its catalog does not spell. An `isa` that names an architecture is v6's spelling of `arch`, refused with the rename `mach migrate` writes. See [RISC-V baselines](#risc-v-baselines). |
 | `sys`  | yes      | System. Read by `$project.target.sys`. |
 | `abi` | yes      | Application binary interface. Read by `$project.target.abi`. |
 | `of`  | absent: the system's format | Object-format override; defers to the system's format when omitted. See [Object-format override](#object-format-override). |
@@ -545,9 +545,11 @@ needs a stack: it refers to the bounds of the `.stack` section, which an image n
 holds its stack in. state the stack's size in bytes as `stack_reserve`
 ```
 
-**On a hosted ELF image**, as on `linux`, the main thread's stack is the kernel's and
-`ulimit`'s business and the format has nowhere to record a size, so either key is
-refused by the link, naming the format.
+**On a hosted ELF image**, as on `linux`, the system sizes the main thread's stack from
+the process's stack limit (`ulimit -s`), not from the executable, and the format has
+nowhere to record a size, so either key is refused by the link, naming the format. Remove
+the key. A program that needs a larger stack runs that work on a thread it creates with
+the stack size it wants.
 
 The keys live on the target rather than the artifact: every artifact built for one
 target shares the value.
@@ -1854,14 +1856,40 @@ object links exactly as it would without it. The section also carries the image
 the compiler generated for the module, and a reused module links that image
 rather than what the object format spells, since COFF and Mach-O cannot spell
 everything a link reads, such as symbol sizes. A warm build therefore links the
-binary a cold one links, byte for byte. An object that is missing, has no
-key, a damaged one or another key is rebuilt, never linked stale. `obj/` holds one
-object per module, the latest, and each object is written to a sibling temporary
-and renamed into place, so an interrupted build leaves the previous object or the
-new one, never a torn file. The digests of the sources the keys read are
-remembered in `{project.work}/.cache/digests` under each file's path, size,
-modification time and identity, so an unchanged file is not hashed again for its
-key; a missing or damaged memo is rebuilt. `--no-cache` forces an uncached
+binary a cold one links, byte for byte. Each object's SHA-256 as written is kept
+in `{project.work}/.cache/objects` under its path in `obj/`, and a build reuses an
+object only when the bytes it reads hash to that digest: an object that is missing,
+has no recorded digest, holds other bytes than were written (one flipped bit
+included), has no key, a damaged one or another key is rebuilt, never linked
+stale. `obj/` holds one object per module, the latest, and each object is written
+to a sibling temporary and renamed into place, so an interrupted build leaves the
+previous object or the new one, never a torn file, and the digests are stored only
+after the objects they describe are in place. No timestamp decides anything: every
+source file is read and hashed on every build, and a file's modification time,
+size and identity are never consulted. The surface digests of a source text are
+remembered in `{project.work}/.cache/digests` under the SHA-256 of the text, so a
+text the build has seen is not walked again for its key. Every file under
+`.cache/` reads as empty when it is missing, truncated, damaged or written by
+another compiler, which costs only rework: the build recovers without anything
+being deleted by hand.
+
+**A link whose inputs did not change is not run again.** After each link the
+build records, in `{project.work}/.cache/link` under the output's canonical
+path, the link's key and the SHA-256 of the bytes it wrote. The key covers the
+whole configuration (the compiler binary's digest among it, and so the
+linker's), the link configuration (the artifact's kind, its output path and
+product name, its resources by content, every link input given as a file by its
+digest, the library search directories and the layout) and the key of every
+object the link takes, in link order. A build that compiled nothing, whose key
+equals the record of its output, and whose output file still hashes to the
+recorded digest leaves the output as it is: same bytes, same modification time,
+same file. The output's bytes are read and hashed every time; its size and
+times decide nothing. A link that takes a library found by name in a search
+directory (a `system` or `framework` entry linked from a file, or `-l`) always
+runs, since the key names such a library and not its contents. Anything else, a
+missing or changed output, another key or a damaged record, links as before.
+
+`--no-cache` forces an uncached
 build: it reuses no object and writes each one without a key, and `mach clean`
 removes the tree with the rest of the output.
 

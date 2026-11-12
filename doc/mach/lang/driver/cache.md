@@ -18,8 +18,11 @@ instance records (driver/cache/instances), keyed by the configuration, its
 symbol and the surfaces of the modules it reads, so an instance whose record
 stands is not typed. a skipped module, or an instance only records name, is
 typed only when something that must be rebuilt from its typed form needs it.
-source digests come from the per-file digest memo in the cell's `.cache`
-directory (driver/cache/memo)
+nothing about a file but its bytes decides anything: every source text load
+read is hashed each build, and the digest memo in the cell's `.cache`
+directory (driver/cache/memo) keeps only what a text's digest names. an
+object is reused only when its bytes hash to what the build that wrote it
+recorded (driver/cache/objects)
 
 ## fun configuration
 
@@ -133,15 +136,33 @@ pub fun forget(p: *project.Project) err[fail.Fail];
 every key, skip decision and record of the previous load is dropped: the next load
 keys again, and a project that is not keyed processes every module
 
+## fun note_written
+
+```mach
+pub fun note_written(p: *project.Project, location: str, bytes: *u8, len: usize) err[fail.Fail];
+```
+
+the object written to `location` was the `len` bytes at `bytes`: a keyed object under `obj/`
+is remembered by its digest for the restore that reads it back
+
+## fun store_written
+
+```mach
+pub fun store_written(p: *project.Project) err[fail.Fail];
+```
+
+store the digests of the objects this build wrote, once they are in place
+
 ## fun read
 
 ```mach
 pub fun read(p: *project.Project, location: str, expected: *[32]u8) res[opt[Cached], fail.Fail];
 ```
 
-the object at `location` when its record says it was built under `expected`, none on a
-miss: an object that is missing, unreadable, carries no record or a damaged one, or was
-built under another key is rebuilt, never reused. err only when allocation fails
+the object at `location` when its bytes are the bytes a build wrote there and its record says
+it was built under `expected`, none on a miss: an object that is missing, unreadable, not the
+bytes written, carries no record or a damaged one, or was built under another key is rebuilt,
+never reused. err only when allocation fails
 
 ## val TEST_KEY_BIT
 
@@ -338,4 +359,24 @@ pub fun store_records(p: *project.Project, d: *demand.Demand) err[fail.Fail];
 the cell's instance records after a demand settled: each instance of its closure keeps the
 record this build made of it, or else the one that stood in for its typing, and an instance the
 closure no longer holds drops out. a store that would hold what it holds is left as it is
+
+## fun link_stands
+
+```mach
+pub fun link_stands(p: *project.Project, artifact: str) res[bool, fail.Fail];
+```
+
+the link that would write `artifact` need not run: this build compiled nothing, the link reads
+no input found by name, its key is the key the record of the artifact's path holds, and the file
+there hashes to the digest that record holds. the file is read and hashed every time, never
+trusted from its metadata
+
+## fun note_link
+
+```mach
+pub fun note_link(p: *project.Project, artifact: str, digest: *[32]u8) err[fail.Fail];
+```
+
+the link that wrote `artifact` as the bytes `digest` names is recorded under its key, so a later
+build that compiles nothing and keys its link the same leaves the artifact as it is
 

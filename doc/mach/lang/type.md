@@ -579,6 +579,20 @@ the settled answer to projected fact `which` of `tid`, none while it is unsettle
 pub fun projected_set(ti: *TypeInterner, tid: TypeId, which: Projected, answer: bool) err[fail.Fail];
 ```
 
+## fun identity_get
+
+```mach
+pub fun identity_get(ti: *TypeInterner, tid: TypeId) opt[u64];
+```
+
+the identity recipe gave `tid`, none until it is asked for
+
+## fun identity_set
+
+```mach
+pub fun identity_set(ti: *TypeInterner, tid: TypeId, identity: u64) err[fail.Fail];
+```
+
 ## fun field_table_stage
 
 ```mach

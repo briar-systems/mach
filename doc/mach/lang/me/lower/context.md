@@ -209,6 +209,7 @@ ctx: *comptime_scope.ComptimeCtx,
 normal_object: *NormalObject,
 shared_artifact: bool,
 debug: bool,
+standalone: bool,
 checks: bool,
 diags: *diagnostic.DiagnosticStore,
 interfaces: sema_interface.Reader,
@@ -225,6 +226,7 @@ facts: *target_facts.Facts,
 machine: *Machine,
 malloc: *A.Allocator,
 debug: bool,
+standalone: bool,
 checks: bool,
 diags: *diagnostic.DiagnosticStore,
 interfaces: sema_interface.Reader,
@@ -471,6 +473,8 @@ the type store a comptime evaluation during lowering reads
 pub fun begin_function(lc: *LowerContext, fn_index: u32, ret_type: Type);
 ```
 
+a pointer's debug type whose pointee waits for the module's other debug types
+
 ## fun bind_local
 
 ```mach
@@ -693,15 +697,28 @@ pub fun debug_type_of(lc: *LowerContext, tid: type_kind.TypeId) res[opt[mirl_deb
 the debug type a debug record names for source type `tid`; none when this lowering keeps
 no debug information
 
+## fun debug_own_types
+
+```mach
+pub fun debug_own_types(lc: *LowerContext) err[fail.Fail];
+```
+
+the types this object describes for every other: each record, union and tag the module
+declares that the object emits the declaration of, the test object a `#[testing]` one
+and the normal object any other. a generic is described by its instances, in every
+module that names one
+
 ## fun debug_types_finish
 
 ```mach
 pub fun debug_types_finish(lc: *LowerContext) err[fail.Fail];
 ```
 
-describe every pointee left waiting, then link the table. an instance of an expansive
-generic the module describes no value of stays undescribed past its pointer, since such
-a generic has unboundedly many instances behind its pointers, and is described opaque
+describe the types this object owns, then every pointee left waiting, then link the
+table. a pointee holding by value an instance of an expansive generic the module
+describes no value of is not described past its pointer, since such a generic has
+unboundedly many instances behind its pointers: a record, union, tag or instance is
+named by its key alone, as another object describes it, and any other is opaque
 
 ## fun block_terminated
 

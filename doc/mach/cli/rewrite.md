@@ -26,7 +26,7 @@ one command's pass over its inputs
 visited: source files read
 differing: files the transform changed (rewritten, or listed by --check)
 malformed: files the transform refused as reported; each was left unchanged
-diagnostics: where a malformed file's diagnostics are rendered
+diagnostics: the command's report, which a malformed file's diagnostics go through
 sources: the source map a refused file's text is loaded into, which its failure points into
 transform: the text each source becomes
 context: what the command hands its transform
@@ -42,7 +42,7 @@ pub val CHECK: std_args.Flag = std_args.Flag;
 ## fun report
 
 ```mach
-pub fun report(diagnostics: *io_writer.Writer, sources: *lang_source.SourceMap, transform: Transform) Report;
+pub fun report(diagnostics: *cli_diagnostic.Report, sources: *lang_source.SourceMap, transform: Transform) Report;
 ```
 
 a pass with nothing read yet

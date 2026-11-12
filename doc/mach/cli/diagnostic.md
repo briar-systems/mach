@@ -24,6 +24,19 @@ out: the destination
 sources: the SourceMap that locates each diagnostic
 list: the diagnostics, rendered in order; nothing is written when it is empty
 
+## fun report_store
+
+```mach
+pub fun report_store(r: *Report, sources: *lang_source.SourceMap, list: *diagnostic.DiagnosticStore);
+```
+
+render every diagnostic of a store through a command's report: as text with its tally line,
+or a record each under json
+
+r: the command's report
+sources: the SourceMap that locates each diagnostic
+list: the diagnostics, in order
+
 ## fun render_fail
 
 ```mach
@@ -52,14 +65,14 @@ ret: the exit code `exit.of` maps the failure to
 ## fun dependency_report
 
 ```mach
-pub fun dependency_report(a: *A.Allocator, sources: *lang_source.SourceMap) report.Report;
+pub fun dependency_report(a: *A.Allocator, r: *Report) report.Report;
 ```
 
-where a dependency command reports: progress on standard output, and notes and failures
-the command goes on past on standard error
+where a dependency command reports: progress on standard output, notes on standard error,
+and failures, the ones the command goes on past too, through the command's report
 
 a: owns the report's effect notes
-sources: the source map a failure's places are in
+r: the command's report, in the format `--diagnostics` selected
 ret: the report, released with `report.dnit`
 
 ## fun dependency_outcome

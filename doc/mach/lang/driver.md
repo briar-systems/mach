@@ -63,7 +63,9 @@ pub fun run_link_pass(p: *project.Project, job: *project.LinkJob) err[fail.Fail]
 ```
 
 the link stage: the artifact `job` names, written by its action only when an input of the
-link moved since it last ran or the artifact on disk is not the one it wrote
+link moved since it last ran or the artifact on disk is not the one it wrote. a build that
+compiled nothing leaves the artifact as it is when the cell's link record says this link wrote
+the bytes it holds (driver/cache)
 
 ## fun closure_locate
 
