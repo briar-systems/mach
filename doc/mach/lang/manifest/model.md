@@ -265,8 +265,24 @@ export: the `export` key; false when absent
 include_referenced: the `include` key: false for "always" (the default), true for "referenced"
 kind: the `kind` key, written only on a system source that names a library
                     by a bare name; SHARED when absent
+versions: the `current_version` and `compatibility_version` keys, written only
+                    on a system source of the shared kind; unstated when absent
 at: where the table's key is written
 path_at: where the `path` value is written, the zero place when absent
+
+## rec LinkVersions
+
+```mach
+pub rec LinkVersions;
+```
+
+the versions a shared library is stated at, as a Mach-O load command names them, each
+encoded as the command holds it: the major version in the high 16 bits, then the minor
+and the patch in 8 bits each
+
+stated: the entry states them; when it does not, both are zero
+current: the version the image is linked against
+compat: the oldest version the image may load instead
 
 ## rec StepDef
 

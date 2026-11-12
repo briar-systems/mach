@@ -618,8 +618,9 @@ masc reads the `isa`, closes it over the catalog's implications (`g` is IMAFD
 plus Zicsr and Zifencei, D brings F and F brings Zicsr) and says whether the
 architecture enters it. An `isa` masc's catalog refuses, or one of the other
 width (`rv64gc` on `riscv32`) or the E base, is refused naming the `isa` and the
-architecture. An architecture whose catalog spells no selection (`x86_64`, `spirv`)
-refuses `isa` outright, naming the architecture: name what it adds with `ext`.
+architecture. On `x86_64` the `isa` is a comma separated list in masc's x86
+catalog, of extension names and levels (`x86-64-v3`, `x86-64-v2,sha`), closed over
+the same implications, and a name the catalog does not hold is refused naming it.
 
 mach emits against I, M, A, F, D, C, Zicond, Zicsr, Zifencei, Zfhmin, Zfh and Zkt.
 Zicond adds `czero.eqz` and `czero.nez`, which a branch-free select compiles to
@@ -1586,6 +1587,7 @@ the same entries, so nothing behaves differently as a dependency.
 | `abi`     | yes | Filter axis over `abi`, same forms. |
 | `export`  | absent: not exported | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
 | `include` | absent: `"always"` | `"always"` names the dynamic library in the linked image whether or not anything imports from it; `"referenced"` names it only when a live import references it, so an unused provider leaves no load command behind. Any other value is a manifest error (`[link.k].include must be "always" or "referenced"`). |
+| `current_version`, `compatibility_version` | absent: `0.0.0` | The versions a Mach-O load command records for this library, each `X`, `X.Y` or `X.Y.Z` with `X` below 65536 and `Y` and `Z` below 256. Both or neither, and only on a `source = "system"` entry of the shared kind. dyld compares the compatibility version against the loaded library's current version. Other formats ignore them. |
 | `kind`    | absent: `"shared"` | What a `source = "system"` library named by a bare name must be: `"shared"` or `"static"`, with no fallback in either direction (see below). Any other value is a manifest error (`[link.k].kind must be "shared" or "static"`). Refused on any other source, and on a `name` that names a file, whose contents state its kind. |
 | `library` | removed | Refused as a removed key. The table key is the library's identity, and `#[library]` names the entry by that key. |
 | `os`, `isa` | removed | v6's names of `sys` and `arch`, refused with the rename `mach migrate` writes. |
@@ -1658,9 +1660,7 @@ prefixed" is not something a spelling can be checked for. Writing the mangled
 form yourself therefore does not work — on darwin `symbols = ["_Sleep"]` claims
 `__Sleep`, which nothing imports.
 
-Nothing reads a library's export table to derive this, so the claim is what makes
-cross-linking a PE from a Linux host work with no target DLL present. Claims
-travel with the entry, so `export = true` cascades them to consumers and a
+Claims travel with the entry, so `export = true` cascades them to consumers and a
 C-binding project declares them once.
 
 A symbol may be claimed only once per link: two selected entries claiming it, or a
@@ -1670,8 +1670,30 @@ symbol twice within one entry is rejected.
 On ELF the key is accepted and validated but changes no emitted bytes, since that
 loader resolves imports by global search.
 
-A `system` or `framework` entry is found by name through mink's library search
-as the link runs, in each `-L` directory, then the working directory, then the
+### Libraries linked from their claims
+
+On PE and Mach-O a `system` entry of the shared kind is linked from its claim,
+and no file is searched for or read. Every object mach emits carries a claim
+record (`.mink.claims`) per entry it links: the library's loader name as the
+entry writes it, its versions, and each symbol the object takes from it, by its
+link name and whether it is code or data. Those symbols are the entry's
+`symbols` and every `#[library]` import of the entry the object references. mink
+builds the library's interface from the record alone: on PE an import directory
+entry for the DLL with each symbol imported by name, and on Mach-O a load command
+with the install name and the entry's versions, each symbol bound to that
+library's ordinal. A Windows or macOS program therefore cross-links from any host
+with no import library, SDK or `-L`. A symbol two records give to two different
+libraries is refused, naming the symbol and both libraries.
+
+Everything else is a file: a `static` entry, a `local` entry, a `framework`, and
+every entry on ELF and wasm. ELF stays file based because only the `.so` states
+what an import needs there, its symbol versions and the size of data a copy
+relocation moves. A shared library whose symbols the build does not know, one
+whose imports come from C objects with no claim, is linked from its import
+library with a `local` entry.
+
+A `system` entry that is not linked from its claim, and a `framework` entry, is
+found by name through mink's library search as the link runs, in each `-L` directory, then the working directory, then the
 system's directories the target's host row states. A `local` entry names its
 file. Whether an input links **statically** or **dynamically** follows the file
 found — a loose `.o`/`.obj` or static `.a`/`.lib` links statically, and an ELF
@@ -1698,7 +1720,8 @@ link: `libm.a` beside a shared `libc` is refused by the link, so name both of th
 same kind.
 
 A `name` that names a file, such as `kernel32.dll` or
-`/usr/lib/libSystem.B.dylib`, is taken as written and does not take the key:
+`/usr/lib/libSystem.B.dylib`, is taken as written, as the loader name its claim
+records, and does not take the key:
 stating `kind` on it is refused, as is stating it on a `framework` or `local`
 entry. Two entries naming one library as different kinds are refused, as is a
 `-l` of a library an entry names `kind = "static"`.

@@ -354,10 +354,13 @@ Override the symbol outright with the `symbol` decorator:
 pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
 
-An overridden name is taken **literally**: it is the object symbol, so no
-platform prefix is applied to it and you spell the exact name the object carries
-(`_write` on Darwin, `write` elsewhere). That is what lets inline asm and the
-runtime entry points name a symbol exactly.
+An overridden name is the C name, and the target's C symbol prefix is applied
+to it just as it is to a declaration's own name: `#[symbol("write")]` binds the
+`_write` a Darwin object carries and the `write` it carries elsewhere, and
+`#[symbol("main")]` defines the entry every target's runtime calls. Writing the
+prefix yourself does not work: on Darwin `#[symbol("_write")]` binds `__write`.
+The prefix is only ever added, never stripped, as for a manifest claim. Inline
+asm names the object symbol, so it spells the prefix (`call _main` on Darwin).
 
 Common reasons to rename:
 

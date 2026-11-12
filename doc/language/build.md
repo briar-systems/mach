@@ -160,6 +160,14 @@ command line states the project: `--source <name>=<dir>` binds a source root,
 spelled as `mach info targets` prints it. The target is the host's when `-t` is left out.
 `-a`, `-p` and `--all` select nothing in an entry build and are refused.
 
+A directory a `--source` binds may be a project, holding a `mach.toml`. Its `id`
+must be the name it is bound to, it may declare no dependencies, and its sources
+are its `src`. Its exported `[link]` entries then apply to the entry build as they
+apply to a project that depends on it, so `--source std=<std checkout>` links the
+libraries std's bindings name on every target. A directory with no `mach.toml` is
+a source root alone and brings no link entry. The entry build states no link entry
+of its own: the libraries it links are the ones its bound projects export.
+
 `-k` takes mink's product names, the values of an artifact's `kind`: `bin` (the
 default), `static`, `shared`, `object` or `module`. `--linkage` says how a `bin` is
 linked, by mink's linkage names: `pie`, `dynamic` or `static`. Left out, it is the

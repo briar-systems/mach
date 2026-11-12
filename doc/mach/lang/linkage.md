@@ -15,6 +15,50 @@ pub rec Provider;
 
 a library the link is offered by name
 
+## def Sort
+
+```mach
+pub def Sort: u8
+```
+
+what the build knows an imported symbol to be
+
+## val UNSTATED
+
+```mach
+pub val UNSTATED: Sort = 0
+```
+
+nothing, as of a name a manifest entry claims for an archive
+
+## val CODE
+
+```mach
+pub val CODE: Sort = 1
+```
+
+a function, as an `ext fun` declares
+
+## val DATA
+
+```mach
+pub val DATA: Sort = 2
+```
+
+a variable, as an `ext val` or `ext var` declares
+
+## rec Import
+
+```mach
+pub rec Import;
+```
+
+an imported symbol pinned to a library
+
+name: its link name
+lib: the library's key
+sort: what the build knows it to be
+
 ## rec Linkage
 
 ```mach
@@ -23,6 +67,8 @@ pub rec Linkage;
 
 keyed by declaration: a module's index in the high 32 bits, its declaration
 index in the low
+imports holds every pinned import in the order it was first pinned, and import_at its index
+there by link name
 
 ## fun init
 
@@ -106,10 +152,11 @@ the library declaration `did` of `mid` is imported from, nil when it names none
 ## fun register_import_library
 
 ```mach
-pub fun register_import_library(l: *Linkage, name: intern.StrId, lib: intern.StrId) err[fail.Fail];
+pub fun register_import_library(l: *Linkage, name: intern.StrId, lib: intern.StrId, sort: Sort) err[fail.Fail];
 ```
 
-pin the imported symbol `name` to the library `lib`
+pin the imported symbol `name`, known as `sort`, to the library `lib`. a symbol pinned
+again takes the later pin, a sort the earlier one left unstated included
 
 ## fun import_library
 

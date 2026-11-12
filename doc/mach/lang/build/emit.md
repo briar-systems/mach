@@ -107,7 +107,8 @@ pub fun external_inputs(p: *project.Project, unit: *build_plan.BuildUnit) res[Ve
 
 the inputs the unit links beyond its objects, in link order: the manifest's link entries,
 those its dependencies cascade, then the command line's. an input named twice is linked
-once, and each library registers its provider and the symbols it claims
+once, and each library registers its provider and the symbols it claims. a library the
+link makes from the claims the objects carry is no input of its own
 
 ## rec ObjectWrite
 

@@ -266,6 +266,15 @@ pub fun c_prefix(b: *Back, a: *A.Allocator) res[str, fail.Fail];
 the prefix the target's format gives a C symbol's name on its architecture, empty
 for none, as mink's registry states it
 
+## fun describes_claims
+
+```mach
+pub fun describes_claims(b: *Back, a: *A.Allocator) res[bool, fail.Fail];
+```
+
+whether the target's link makes a shared system library from the claim that names it,
+with no file, as a two-level namespace format does
+
 ## fun symbol_name
 
 ```mach
