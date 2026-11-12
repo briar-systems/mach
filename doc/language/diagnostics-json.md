@@ -100,6 +100,12 @@ the human rendering shows after `-->`.
 | `link` | linking an executable or library |
 | `test` | the test runner of `mach test`: running the collected tests |
 
+A report takes the origin of the part of the compiler whose work raised it,
+whichever part asked for that work, and a diagnostic and a failure follow the
+same rule: a failure in lowering is `lower` even when code generation asked for
+the lowering. A report raised outside that work, by the build driving a phase,
+takes the phase the build was in.
+
 A key names a rule, not a phase, so one key can arrive from two origins:
 `secret.branch` is `sema` when the type checker finds it and `codegen` when
 the constant-time validator does.
@@ -164,9 +170,10 @@ not declare is caused by no entry in it, so its refusal has no `primary`.
 {"schema":2,"record":"diagnostic","severity":"error","code":"need.cycle","message":"mach.toml: 'need' cycle: step.a -> step.b -> step.a","origin":"build","primary":{"file":"mach.toml","line":12,"column":9,"end_line":12,"end_column":17,"byte_start":141,"byte_end":149},"related":[{"file":"mach.toml","line":18,"column":9,"end_line":18,"end_column":17,"byte_start":216,"byte_end":224,"label":null}],"notes":[],"help":[],"fixes":[]}
 ```
 
-`origin` names the phase the failure came from: `build` for the manifest,
-dependency resolution and build steps, the phase that failed for a failure
-inside the compiler (`link` for the linker), and `test` for the test runner. A
+`origin` names the phase the failure came from, by the rule of
+[Origins](#origins): `build` for the manifest, dependency resolution and build
+steps, the phase whose work raised a failure inside the compiler, and `test` for
+the test runner. A
 refusal of the command line itself, such as an unknown flag or a project path
 that names nothing, has no `origin`.
 

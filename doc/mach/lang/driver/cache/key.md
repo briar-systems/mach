@@ -62,11 +62,11 @@ the key of a module's object: the module's key and its name
 ## fun test_object
 
 ```mach
-pub fun test_object(object_key: *[32]u8, source: *[32]u8, out: *[32]u8) err[fail.Fail];
+pub fun test_object(object_key: *[32]u8, out: *[32]u8) err[fail.Fail];
 ```
 
 the key of a module's test object: the key of the normal object it is lowered
-against, and the digest of the module's whole source, tests included
+against, which covers the module's whole source, tests included
 
 ## fun step
 

@@ -122,7 +122,7 @@ pub rec ObjectWrite;
 ## fun write_object
 
 ```mach
-pub fun write_object(w: *ObjectWrite, destination: str) err[fail.Fail];
+pub fun write_object(w: *ObjectWrite, t: *output.Temporary) err[fail.Fail];
 ```
 
 ## fun write_objects

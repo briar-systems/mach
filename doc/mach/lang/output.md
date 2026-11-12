@@ -69,14 +69,44 @@ pub fun mirror_fqn(a: *A.Allocator, base: *u8, fqn: str, suffix: str) res[str, f
 the file a module's output takes under `base`: its dotted name as a path,
 with `suffix` as the extension
 
+## rec Temporary
+
+```mach
+pub rec Temporary;
+```
+
+the sibling temporary a `through_temporary` write fills, and the destination a
+refused write of it is named by
+
+a: owns the text of a refusal
+path: the temporary
+destination: the file the temporary is renamed over
+
+## fun fill
+
+```mach
+pub fun fill(t: *Temporary, buf: *u8, len: usize, mode: i32) err[fail.Fail];
+```
+
+write `buf` to the temporary `t`, a refusal named as the write of its destination
+
+## fun read_back
+
+```mach
+pub fun read_back(a: *A.Allocator, path: str) res[Vector[u8], fail.Fail];
+```
+
+read the whole of a file the build wrote, a refusal naming `path`
+
 ## fun through_temporary
 
 ```mach
 pub fun through_temporary[C](a: *A.Allocator, destination: str, ctx: *C,
-write: fun(*C, str) err[fail.Fail]) err[fail.Fail];
+write: fun(*C, *Temporary) err[fail.Fail]) err[fail.Fail];
 ```
 
-`write` fills a sibling temporary of `destination`, which is then renamed
-over it: a reader sees the previous file or the complete new one, never a
-torn one, and a failed write leaves the previous file and no temporary
+`write` fills a sibling temporary of `destination` through `fill`, which is
+then renamed over it: a reader sees the previous file or the complete new
+one, never a torn one, and a failed write leaves the previous file and no
+temporary
 

@@ -253,8 +253,9 @@ the name of a declared build phase, absent for an unknown catalog member
 pub fun phase_origin(k: PhaseKind) diagnostic.Origin;
 ```
 
-the origin a failure of the phase is reported under: a build step is the
-build's, a test build's test objects are generated code
+the origin a failure of the phase is reported under when no product raised it, the phase's
+own work outside every computation: a step, a file it reads or writes, the engine itself. a
+build step is the build's, and a test build's test objects are generated code
 
 ## fun unknown_phase
 

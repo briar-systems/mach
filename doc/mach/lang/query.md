@@ -165,6 +165,8 @@ alloc: owns the presentation and its store
 diags: the collected diagnostics, in dependency order, each product once
 failure: the operation's failure, owning its text and places through `failure_alloc`; absent
          when every product computed
+origin: the origin of the product whose computation raised the failure, ORIGIN_NONE for one
+         the operation raised outside every computation
 
 ## rec QueryOutput
 
@@ -244,6 +246,16 @@ db: the database
 failure: the failure to hold; one with no text or places empties the slot
 lost: set when part of the failure could not be held
 ret: the failure as the database holds it
+
+## fun origin_of
+
+```mach
+pub fun origin_of(db: *QueryDb, f: fail.Fail) diagnostic.Origin;
+```
+
+the origin of the product that raised `f`: the operation's, the held failure's or the last
+presentation's when `f` reads that failure's text, ORIGIN_NONE for any other failure and for
+one raised outside every computation
 
 ## fun drop_presented
 
