@@ -30,34 +30,30 @@ pub val PH_STEPS: PhaseKind = 2
 pub val PH_SEMA: PhaseKind = 3
 ```
 
-## val PH_LOWER
-
-```mach
-pub val PH_LOWER: PhaseKind = 4
-```
-
 ## val PH_CODEGEN
 
 ```mach
-pub val PH_CODEGEN: PhaseKind = 5
+pub val PH_CODEGEN: PhaseKind = 4
 ```
+
+each unit lowered and compiled, or its object restored
 
 ## val PH_EMIT
 
 ```mach
-pub val PH_EMIT: PhaseKind = 6
+pub val PH_EMIT: PhaseKind = 5
 ```
 
 ## val PH_LINK
 
 ```mach
-pub val PH_LINK: PhaseKind = 7
+pub val PH_LINK: PhaseKind = 6
 ```
 
 ## val PH_TEST
 
 ```mach
-pub val PH_TEST: PhaseKind = 8
+pub val PH_TEST: PhaseKind = 7
 ```
 
 a test build's test objects, after the normal objects they are lowered against

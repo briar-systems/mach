@@ -413,6 +413,11 @@ ext fun wsa_startup(ver: u16, data: *u8) i32;
 Takes one mode, `"always"` or `"never"`, and applies to functions only. It may
 stand once on a function, so the two modes never meet.
 
+v7 has no inliner yet. The compiler checks the decorator where it is written,
+with the conflicts listed on this page, and nothing else reads it. The inlining
+rules here and wherever this page speaks of the inliner are where v7's inliner
+starts from. They are not what the compiler does now.
+
 `inline("always")` marks a function for inlining at every direct call site,
 overriding the compiler's size and use-count heuristics and exempt from the
 caller's expansion budget. The optimization

@@ -12,7 +12,7 @@ pub fun append_frontend_roots(p: *project.Project, roots: *Vector[query.QueryKey
 pub fun append_test_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[fail.Fail];
 ```
 
-the backend's roots and each test object's codegen
+the codegen roots and each test object's lowering and codegen
 
 ## fun phase_finish
 
@@ -39,19 +39,14 @@ what read the old one is computed again, and nothing reads a context no freeze c
 pub fun run_sema_pass(p: *project.Project) err[fail.Fail];
 ```
 
-## fun run_lower_pass
-
-```mach
-pub fun run_lower_pass(p: *project.Project) err[fail.Fail];
-```
-
 ## fun run_codegen_pass
 
 ```mach
 pub fun run_codegen_pass(p: *project.Project) err[fail.Fail];
 ```
 
-the codegen stage: each emitted module's object, made by its own step or restored from `obj/`
+the codegen stage: each emitted module and instance unit lowered and compiled, or its object
+restored from `obj/`
 
 ## fun run_test_pass
 

@@ -1,12 +1,26 @@
 # mach.lang.driver.passes
 
-## val LOWERED_SURFACE
+## val LOWER
 
 ```mach
-pub val LOWERED_SURFACE: query.Kind = query.Kind;
+pub val LOWER: query.Kind = query.Kind;
 ```
 
-a module's source with what lowering omits cut away, keyed by its stable id
+a module's code lowered into a mirl module on a heap of its own, with the facts its lowering
+kept, keyed by its back-half key. its codegen takes it, compiles it and gives its value back,
+so it is read once
+
+## val DEFINED
+
+```mach
+pub val DEFINED: query.Kind = query.Kind;
+```
+
+the symbols a module's lowered code defines under a binding other objects see, keyed by its
+back-half key: each one's session id, a little-endian u32, and none for a module that declares
+no tests. read from its lowering before its codegen spends it, or from the record of the object
+the cache restored, so the module's test object, which declares them, reads its normal module's
+lowering and never its compiled object
 
 ## val CODEGEN
 
@@ -14,8 +28,8 @@ a module's source with what lowering omits cut away, keyed by its stable id
 pub val CODEGEN: query.Kind = query.Kind;
 ```
 
-a module's object, mink's, and the facts its lowering kept, keyed by its back-half key. one
-step lowers and compiles the module, so no mirl module outlives its own codegen
+a module's object, mink's, and the facts its lowering kept, keyed by its back-half key: its
+lowered module compiled
 
 ## val INSTANCE_SEMA
 
@@ -50,14 +64,23 @@ one instance unit's members, keyed by the unit's key: each member's symbol, in t
 unit lowers them. equal bytes keep the revision, so the demand moving elsewhere leaves the
 unit's object alone
 
+## val UNIT_LOWER
+
+```mach
+pub val UNIT_LOWER: query.Kind = query.Kind;
+```
+
+an instance unit's members lowered from their own typing into a mirl module, keyed by the
+unit's key, read once by its codegen as a module's lowering is
+
 ## val UNIT_CODEGEN
 
 ```mach
 pub val UNIT_CODEGEN: query.Kind = query.Kind;
 ```
 
-an instance unit's object and the facts its lowering kept, keyed by the unit's key: one step
-lowers its members from their own typing and compiles them, as a module's codegen does
+an instance unit's object and the facts its lowering kept, keyed by the unit's key: its
+lowered unit compiled, as a module's codegen does
 
 ## val LINK
 
@@ -163,20 +186,13 @@ pub fun codegen_reusable(p: *project.Project, mid: module.ModuleId) res[bool, fa
 pub fun test_build(p: *project.Project) bool;
 ```
 
-## fun run_lower_pass
+## fun prepare_codegen_pass
 
 ```mach
-pub fun run_lower_pass(p: *project.Project) err[fail.Fail];
+pub fun prepare_codegen_pass(p: *project.Project) err[fail.Fail];
 ```
 
-the lowering's inputs, acquired before any module is lowered: each module's typed
-definition and its lowered surface. the codegen pass lowers each module in its step
-
-## fun prepare_lower_pass
-
-```mach
-pub fun prepare_lower_pass(p: *project.Project) err[fail.Fail];
-```
+the import libraries the declarations name, which every lowering reads, registered before any is
 
 ## fun run_test_pass
 

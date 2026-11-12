@@ -11,61 +11,55 @@ a readout phase, an index into the phase table
 ## val LOAD
 
 ```mach
-pub val LOAD:     Phase = 0
+pub val LOAD:    Phase = 0
 ```
 
 ## val RESOLVE
 
 ```mach
-pub val RESOLVE:  Phase = 1
+pub val RESOLVE: Phase = 1
 ```
 
 ## val SEMA
 
 ```mach
-pub val SEMA:     Phase = 2
+pub val SEMA:    Phase = 2
 ```
 
 ## val LOWER
 
 ```mach
-pub val LOWER:    Phase = 3
-```
-
-## val OPTIMIZE
-
-```mach
-pub val OPTIMIZE: Phase = 4
+pub val LOWER:   Phase = 3
 ```
 
 ## val CODEGEN
 
 ```mach
-pub val CODEGEN:  Phase = 5
+pub val CODEGEN: Phase = 4
 ```
 
 ## val EMIT
 
 ```mach
-pub val EMIT:     Phase = 6
+pub val EMIT:    Phase = 5
 ```
 
 ## val LINK
 
 ```mach
-pub val LINK:     Phase = 7
+pub val LINK:    Phase = 6
 ```
 
 ## val CACHE
 
 ```mach
-pub val CACHE:    Phase = 8
+pub val CACHE:   Phase = 7
 ```
 
 ## val TEST_LOWER
 
 ```mach
-pub val TEST_LOWER: Phase = 9
+pub val TEST_LOWER: Phase = 8
 ```
 
 a test build's test objects, lowered against their modules' normal objects
@@ -73,7 +67,7 @@ a test build's test objects, lowered against their modules' normal objects
 ## val TEST_CODEGEN
 
 ```mach
-pub val TEST_CODEGEN: Phase = 10
+pub val TEST_CODEGEN: Phase = 9
 ```
 
 a test build's test objects, generated
@@ -81,7 +75,7 @@ a test build's test objects, generated
 ## val STEPS
 
 ```mach
-pub val STEPS: Phase = 11
+pub val STEPS: Phase = 10
 ```
 
 the build steps a project and its dependencies declare
@@ -89,7 +83,7 @@ the build steps a project and its dependencies declare
 ## val VERIFY
 
 ```mach
-pub val VERIFY: Phase = 12
+pub val VERIFY: Phase = 11
 ```
 
 the lowered modules held to mirl's verifier
@@ -97,7 +91,7 @@ the lowered modules held to mirl's verifier
 ## val TEST_VERIFY
 
 ```mach
-pub val TEST_VERIFY: Phase = 13
+pub val TEST_VERIFY: Phase = 12
 ```
 
 the lowered test objects held to mirl's verifier
@@ -105,7 +99,7 @@ the lowered test objects held to mirl's verifier
 ## val PASSES
 
 ```mach
-pub val PASSES: Phase = 14
+pub val PASSES: Phase = 13
 ```
 
 mirl's pass schedule, the target's lowering rows and the neutral ones, over normal and test objects alike
@@ -113,7 +107,7 @@ mirl's pass schedule, the target's lowering rows and the neutral ones, over norm
 ## val SELECT
 
 ```mach
-pub val SELECT: Phase = 15
+pub val SELECT: Phase = 14
 ```
 
 mirl's instruction selection
@@ -121,7 +115,7 @@ mirl's instruction selection
 ## val ALLOC
 
 ```mach
-pub val ALLOC: Phase = 16
+pub val ALLOC: Phase = 15
 ```
 
 mirl's register allocation
@@ -129,7 +123,7 @@ mirl's register allocation
 ## val FRAME
 
 ```mach
-pub val FRAME: Phase = 17
+pub val FRAME: Phase = 16
 ```
 
 mirl's frame and the steps that finish framed code
@@ -137,7 +131,7 @@ mirl's frame and the steps that finish framed code
 ## val MIRL_EMIT
 
 ```mach
-pub val MIRL_EMIT: Phase = 18
+pub val MIRL_EMIT: Phase = 17
 ```
 
 mirl's block layout, variable ranges and texts, less masc's two
@@ -145,7 +139,7 @@ mirl's block layout, variable ranges and texts, less masc's two
 ## val LAYOUT
 
 ```mach
-pub val LAYOUT: Phase = 19
+pub val LAYOUT: Phase = 18
 ```
 
 masc laying out the object
@@ -153,7 +147,7 @@ masc laying out the object
 ## val ENCODE
 
 ```mach
-pub val ENCODE: Phase = 20
+pub val ENCODE: Phase = 19
 ```
 
 masc encoding the settled layout
@@ -161,7 +155,7 @@ masc encoding the settled layout
 ## val TARGET
 
 ```mach
-pub val TARGET: Phase = 21
+pub val TARGET: Phase = 20
 ```
 
 the build's target resolved and its back half opened: mink's formats, mirl's assembled and readied target

@@ -4,13 +4,14 @@ the record an `obj/` object carries for the object cache in its `.mach.cache`
 section: the key the object was built under and what the engine reads from a
 module's lowered unit besides its object, so a module whose object is reused
 never has to lower. the object itself is what mink reads back from the file.
-the layout is `"MCR8"`, the 32-byte key, the 32-byte digest of the module
+the layout is `"MCR9"`, the 32-byte key, the 32-byte digest of the module
 source it was built from, the test count, then per test its qualified name and
 its line, then the length and bytes of the module's warnings (driver/cache
 encodes them), then the count of the instances the module's code asks for and
 per instance its symbol, its reach and the offset and length of where the
-module's source asks for it, every number a little-endian u32 and every name
-its length then its bytes
+module's source asks for it, then the count of the symbols the module defines
+for its test object to declare and per symbol its name, every number a
+little-endian u32 and every name its length then its bytes
 
 ## rec TestFact
 

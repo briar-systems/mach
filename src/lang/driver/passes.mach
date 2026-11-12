@@ -35,15 +35,22 @@ use mach.lang.retention;
 use mach.lang.session;
 use lang_source: mach.lang.source;
 use mach.lang.wire;
+use mink_intern: mink.base.intern;
+use mink_table:  mink.base.table;
 use mink_output: mink.catalog.output;
 use mink.model.object.Object;
-use mirl_stats: mirl.base.stats;
+use mink_symbol:   mink.model.symbol;
+use mirl_stats:    mirl.base.stats;
+use mirl_function: mirl.ir.function;
+use mirl_global:   mirl.ir.global;
+use mirl_module:   mirl.ir.module;
 use mirl.ir.module.Module;
 
 use mach.lang.driver.backend;
 use backend_compile: mach.lang.driver.backend.compile;
 use mach.lang.driver.cache;
 use cache_instances: mach.lang.driver.cache.instances;
+use cache_record:    mach.lang.driver.cache.record;
 use mach.lang.driver.claims;
 use mach.lang.driver.codec;
 use mach.lang.driver.context;
@@ -51,7 +58,6 @@ use mach.lang.driver.declared;
 use mach.lang.driver.demand;
 use mach.lang.driver.frontend;
 use mach.lang.driver.project;
-use mach.lang.driver.surface;
 use driver_unit: mach.lang.driver.unit;
 use mach.lang.fail;
 use sema_instance:  mach.lang.fe.sema.instance;
@@ -59,18 +65,27 @@ use sema_interface: mach.lang.fe.sema.interface;
 use sema_module:    mach.lang.fe.sema.module;
 use sema_product:   mach.lang.fe.sema.product;
 use lower_context:  mach.lang.me.lower.context;
+use mach.lang.me.lower.testrunner;
 use mach.lang.module;
 use mach.lang.output;
 use lang_phase:  mach.lang.phase;
 use lang_target: mach.lang.target;
 
-# a module's source with what lowering omits cut away, keyed by its stable id
-pub val LOWERED_SURFACE: query.Kind = query.Kind{
-    name:   "lowered surface", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_LOWER, compute: lowered_surface_compute,
-    replay: true
+# a module's code lowered into a mirl module on a heap of its own, with the facts its lowering
+# kept, keyed by its back-half key. its codegen takes it, compiles it and gives its value back,
+# so it is read once
+pub val LOWER: query.Kind = query.Kind{
+    name:     "lower", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_LOWER, compute: lower_compute,
+    finalize: lowered_finalize, replay: true
 };
-# a module's object, mink's, and the facts its lowering kept, keyed by its back-half key. one
-# step lowers and compiles the module, so no mirl module outlives its own codegen
+# the symbols a module's lowered code defines under a binding other objects see, keyed by its
+# back-half key: each one's session id, a little-endian u32, and none for a module that declares
+# no tests. read from its lowering before its codegen spends it, or from the record of the object
+# the cache restored, so the module's test object, which declares them, reads its normal module's
+# lowering and never its compiled object
+pub val DEFINED: query.Kind = query.Kind{name: "defined", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_LOWER, compute: defined_compute};
+# a module's object, mink's, and the facts its lowering kept, keyed by its back-half key: its
+# lowered module compiled
 pub val CODEGEN: query.Kind = query.Kind{
     name:     "codegen", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_CODEGEN, compute: codegen_compute,
     finalize: codegen_finalize, replay: true
@@ -96,8 +111,14 @@ pub val INSTANCE_DEMAND: query.Kind = query.Kind{
 # unit lowers them. equal bytes keep the revision, so the demand moving elsewhere leaves the
 # unit's object alone
 pub val UNIT_DEMAND: query.Kind = query.Kind{name: "unit demand", role: query.DERIVED, owner: query.KEY_UNIT, origin: diagnostic.ORIGIN_LOWER, compute: unit_demand_compute};
-# an instance unit's object and the facts its lowering kept, keyed by the unit's key: one step
-# lowers its members from their own typing and compiles them, as a module's codegen does
+# an instance unit's members lowered from their own typing into a mirl module, keyed by the
+# unit's key, read once by its codegen as a module's lowering is
+pub val UNIT_LOWER: query.Kind = query.Kind{
+    name:     "unit lower", role: query.DERIVED, owner: query.KEY_UNIT, origin: diagnostic.ORIGIN_LOWER, compute: unit_lower_compute,
+    finalize: lowered_finalize, replay: true
+};
+# an instance unit's object and the facts its lowering kept, keyed by the unit's key: its
+# lowered unit compiled, as a module's codegen does
 pub val UNIT_CODEGEN: query.Kind = query.Kind{
     name:     "unit codegen", role: query.DERIVED, owner: query.KEY_UNIT, origin: diagnostic.ORIGIN_CODEGEN, compute: unit_codegen_compute,
     finalize: codegen_finalize
@@ -266,16 +287,10 @@ fun shared_artifact_build(p: *project.Project) bool {
     ret lang_target.is_row(p.target_entry.kind, ?mink_output.SHARED);
 }
 
-# the lowering's inputs, acquired before any module is lowered: each module's typed
-# definition and its lowered surface. the codegen pass lowers each module in its step
-pub fun run_lower_pass(p: *project.Project) err[fail.Fail] {
-    ret acquire_lower_inputs(p);
-}
-
-pub fun prepare_lower_pass(p: *project.Project) err[fail.Fail] {
+# the import libraries the declarations name, which every lowering reads, registered before any is
+pub fun prepare_codegen_pass(p: *project.Project) err[fail.Fail] {
     val imports: err[fail.Fail] = declared.register_import_libraries(p);
     if (sel imports.err) { ret err[fail.Fail].err{fail.as_user(diagnostic_kind.LINK_IMPORT_LIBRARY, imports.err)}; }
-
     ret err[fail.Fail].ok{};
 }
 
@@ -296,122 +311,239 @@ fun acquire_frontend_inputs(p: *project.Project) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
-fun acquire_lower_inputs(p: *project.Project) err[fail.Fail] {
-    val frontend: err[fail.Fail] = acquire_frontend_inputs(p);
-    if (sel frontend.err) { ret frontend; }
-    var i: u32 = 0;
-    for (i < p.emit_len) {
-        val m: *project.ModuleEntry = project.module_at(p, p.topo[i]::u32);
-        if (m.frontend_skipped) {
-            i = i + 1;
-            cnt;
-        }
-        val sf_r: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?LOWERED_SURFACE, module.stable_index(m.stable_id)::u64);
-        if (sel sf_r.err) {
-            ret err[fail.Fail].err{sf_r.err};
-        }
-        i = i + 1;
-    }
-    ret err[fail.Fail].ok{};
-}
-
-fun lowered_surface_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
-    val p:  *project.Project = raw::*project.Project;
-    val db: *query.QueryDb   = ?p.s.queries;
-    val s:  *session.Session = p.s;
-
-    val stable: module.StableModuleId = key::u32::module.StableModuleId;
-    val mid:    module.ModuleId       = module.module_id_for_stable(?s.modules, stable);
-    if (module.is_nil(mid)) { ret res[query.QueryOutput, fail.Fail].err{fail.message("lowered surface: stable id not loaded this build")}; }
-    val m:          *project.ModuleEntry                    = project.module_at(p, mid::u32);
-    val definition: res[sema_product.Definition, fail.Fail] = frontend.read_definition(p::ptr, mid, sema_product.DEFINITION_RESOLVED);
-    if (sel definition.err) { ret res[query.QueryOutput, fail.Fail].err{definition.err}; }
-    val a: *ast.Ast = definition.ok.parsed.a;
-
-    val sf_o: opt[*lang_source.SourceFile] = lang_source.get(s.sources, a.file_id);
-    if (sel sf_o.none) { ret res[query.QueryOutput, fail.Fail].err{fail.message("lowered surface: module source not loaded")}; }
-    val text: str = sf_o.some.text;
-
-    var spans: collections_vector.Vector[lang_source.Span] = collections_vector.init[lang_source.Span](p.s.alloc);
-    fin { collections_vector.dnit[lang_source.Span](?spans); }
-    val omitted: err[fail.Fail] = surface.omitted(a, text, ?spans);
-    if (sel omitted.err) { ret res[query.QueryOutput, fail.Fail].err{fail.placed(omitted.err, a.file_id)}; }
-    var fb: wire.Sink = wire.grown(alloc);
-    fin { wire.dnit(?fb); }
-    surface.write(?fb, text, ?spans);
-    ret codec.output(?fb);
-}
-
-# the inputs a module's lowering reads: its typed definition and the target
-fun lower_inputs(p: *project.Project, key: u64) res[module.ModuleId, fail.Fail] {
+# the module the back-half key `key` names, loaded this build
+fun keyed_module(p: *project.Project, key: u64) res[module.ModuleId, fail.Fail] {
     val stable: module.StableModuleId = key::u32::module.StableModuleId;
     val mid:    module.ModuleId       = module.module_id_for_stable(?p.s.modules, stable);
     if (module.is_nil(mid)) { ret res[module.ModuleId, fail.Fail].err{fail.message("lower: stable id not loaded this build")}; }
-    val definition: res[sema_product.Definition, fail.Fail] = frontend.read_definition(p::ptr, mid, sema_product.DEFINITION_TYPED);
-    if (sel definition.err) { ret res[module.ModuleId, fail.Fail].err{definition.err}; }
-    val rt: err[fail.Fail] = query.depend[project.Project](?p.queries, p, ?context.TARGET, 0);
-    if (sel rt.err) { ret res[module.ModuleId, fail.Fail].err{rt.err}; }
     ret res[module.ModuleId, fail.Fail].ok{mid};
 }
 
-# every global symbol the module's normal object defines, read from its codegen product, which
-# this lowering then depends on
+# the symbols the module's normal object defines, which its test object declares
 fun normal_object_of(p: *project.Project, m: *project.ModuleEntry) res[lower_context.NormalObject, fail.Fail] {
-    val got: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?CODEGEN, back_half_key_for(p, m));
-    if (sel got.err) { ret res[lower_context.NormalObject, fail.Fail].err{got.err}; }
-    val made: *Product = product_decode(got.ok);
-    if (made == nil) { ret res[lower_context.NormalObject, fail.Fail].err{fail.message("a test object requires its normal object")}; }
-    val o:      *Object                    = ?made.object;
+    var names: collections_vector.Vector[intern.StrId] = collections_vector.init[intern.StrId](p.s.backing);
+    fin { collections_vector.dnit[intern.StrId](?names); }
+    val read: err[fail.Fail] = defined_of(p, m, ?names);
+    if (sel read.err) { ret res[lower_context.NormalObject, fail.Fail].err{read.err}; }
     var normal: lower_context.NormalObject = lower_context.NormalObject{defined: map.init[intern.StrId, bool](p.s.alloc)};
     var i:      usize                      = 0;
-    for (i < backend.symbol_count(o)) {
-        if (backend.exported(o, i)) {
-            val name:  View                       = backend.symbol_name(o, i);
-            val named: res[intern.StrId, A.Error] = intern.bytes_add(?p.s.interner, name.data::str, name.len);
-            var added: res[bool, A.Error]         = res[bool, A.Error].ok{true};
-            if (sel named.ok) { added = map.insert[intern.StrId, bool](?normal.defined, named.ok, true); }
-            or                { added = res[bool, A.Error].err{named.err}; }
-            if (sel added.err) {
-                map.dnit[intern.StrId, bool](?normal.defined);
-                ret res[lower_context.NormalObject, fail.Fail].err{fail.refused(added.err)};
-            }
+    for (i < names.len) {
+        val added: res[bool, A.Error] = map.insert[intern.StrId, bool](?normal.defined, names.data[i], true);
+        if (sel added.err) {
+            map.dnit[intern.StrId, bool](?normal.defined);
+            ret res[lower_context.NormalObject, fail.Fail].err{fail.refused(added.err)};
         }
         i = i + 1;
     }
     ret res[lower_context.NormalObject, fail.Fail].ok{normal};
 }
 
-# the object of the module `mid` and the facts kept of its lowering, made by its own step,
-# against its normal object when it is the module's test object
-fun made_for(p: *project.Project, mid: module.ModuleId, normal: *lower_context.NormalObject, diags: *diagnostic.DiagnosticStore) res[driver_unit.Made, fail.Fail] {
-    val s:       *session.Session                       = p.s;
-    val m:       *project.ModuleEntry                   = project.module_at(p, mid::u32);
-    val machine: res[*lower_context.Machine, fail.Fail] = backend.machine(?p.back);
-    if (sel machine.err) { ret res[driver_unit.Made, fail.Fail].err{machine.err}; }
+# the symbols the module `m` defines, as its DEFINED product holds them, pushed onto `into`
+fun defined_of(p: *project.Project, m: *project.ModuleEntry, into: *collections_vector.Vector[intern.StrId]) err[fail.Fail] {
+    val got: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?DEFINED, back_half_key_for(p, m));
+    if (sel got.err) { ret err[fail.Fail].err{got.err}; }
+    var r: wire.Source = wire.source(got.ok.value, got.ok.value_len::usize);
+    var i: u32         = 0;
+    for (i < got.ok.value_len / 4) {
+        val pushed: res[usize, A.Error] = collections_vector.push[intern.StrId](into, intern.str_id(wire.take_u32(?r)));
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
 
+# a module's defined symbols: its restored object's record's, or its lowering's when it declares
+# tests. a lowering already compiled has given its module back, so this is read before its codegen
+fun defined_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
+    val p:     *project.Project                = raw::*project.Project;
+    val keyed: res[module.ModuleId, fail.Fail] = keyed_module(p, key);
+    if (sel keyed.err) { ret res[query.QueryOutput, fail.Fail].err{keyed.err}; }
+    val m:  *project.ModuleEntry = project.module_at(p, keyed.ok::u32);
+    var fb: wire.Sink            = wire.grown(alloc);
+    fin { wire.dnit(?fb); }
+    if (cache.restored(p, m)) {
+        var i: u32 = 0;
+        for (i < m.staged_facts.defined_count) {
+            wire.put_u32(?fb, intern.str_index(m.staged_facts.defined[i]));
+            i = i + 1;
+        }
+        ret codec.output(?fb);
+    }
+    val got: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?LOWER, key);
+    if (sel got.err) { ret res[query.QueryOutput, fail.Fail].err{got.err}; }
+    val l: *Lowering = handle_decode(got.ok)::*Lowering;
+    if (l.taken)  { ret res[query.QueryOutput, fail.Fail].err{fail.message("defined: the module's lowering was compiled before its symbols were read")}; }
+    if (!l.tests) { ret codec.output(?fb); }
+    var names: collections_vector.Vector[intern.StrId] = collections_vector.init[intern.StrId](p.s.backing);
+    fin { collections_vector.dnit[intern.StrId](?names); }
+    val gathered: err[fail.Fail] = gather_defined(p, ?l.lowered.m, ?names);
+    if (sel gathered.err) { ret res[query.QueryOutput, fail.Fail].err{gathered.err}; }
+    var i: usize = 0;
+    for (i < names.len) {
+        wire.put_u32(?fb, intern.str_index(names.data[i]));
+        i = i + 1;
+    }
+    ret codec.output(?fb);
+}
+
+# a lowering product: the unit lowered and what its lowering kept of the module's typing for its
+# cache record, until its codegen takes them
+# ---
+# asked: every instance the module's code asks for, as its typing found them; none for a test object or a unit
+# tests: the module declares tests, so DEFINED reads the symbols its lowered module defines
+# taken: its codegen took the facts and the instances, and compiling spent the module
+rec Lowering {
+    lowered: *driver_unit.Lowered;
+    asked:   collections_vector.Vector[cache_record.Asked];
+    tests:   bool;
+    taken:   bool;
+}
+
+fun lowering_release(raw: ptr, alloc: *A.Allocator) {
+    val l: *Lowering = raw::*Lowering;
+    if (!l.taken) {
+        lower_context.unit_dnit(?l.lowered.facts);
+        collections_vector.dnit[cache_record.Asked](?l.asked);
+    }
+    driver_unit.release(alloc, l.lowered);
+    A.deallocate[Lowering](alloc, l, 1);
+}
+
+fun lowered_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
+    lowering_release(handle_decode(query.QueryView{value: value, value_len: value_len}), alloc);
+}
+
+# the unit `lowered` made into a lowering product, the instances kept beside it
+fun lowering_encode(p: *project.Project, alloc: *A.Allocator, lowered: *driver_unit.Lowered, asked: collections_vector.Vector[cache_record.Asked],
+    tests: bool) res[query.QueryOutput, fail.Fail] {
+    val boxed: res[*Lowering, A.Error] = A.allocate[Lowering](p.s.alloc, 1);
+    if (sel boxed.err) {
+        var a: collections_vector.Vector[cache_record.Asked] = asked;
+        collections_vector.dnit[cache_record.Asked](?a);
+        lower_context.unit_dnit(?lowered.facts);
+        driver_unit.release(p.s.alloc, lowered);
+        ret res[query.QueryOutput, fail.Fail].err{fail.refused(boxed.err)};
+    }
+    @boxed.ok = Lowering{lowered: lowered, asked: asked, tests: tests, taken: false};
+    ret handle_encode(alloc, boxed.ok::ptr, lowering_release, p.s.alloc);
+}
+
+# the instances the module's code asks for, from its typing, as its record keeps them
+fun gather_asked(p: *project.Project, m: *project.ModuleEntry, sr: *sema_product.SemaResult, into: *collections_vector.Vector[cache_record.Asked]) err[fail.Fail] {
+    val n: u32 = sema_instance.count(?sr.instances);
+    var i: u32 = 0;
+    for (i < n) {
+        val item: *sema_instance.Instance = sema_instance.at(?sr.instances, i);
+        if (item.site_file != m.file_id) { ret err[fail.Fail].err{fail.message("cache publication: a module asks for an instance outside its own source")}; }
+        val named: res[intern.StrId, fail.Fail] = demand.register(?p.instances, p.s, item);
+        if (sel named.err) { ret err[fail.Fail].err{named.err}; }
+        val pushed: res[usize, A.Error] = collections_vector.push[cache_record.Asked](into, cache_record.Asked{name: named.ok, reach: item.reach::u8, span: item.site});
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# every symbol the lowered module `m` defines, a function with a body or a global with a value,
+# under a binding other objects see
+fun gather_defined(p: *project.Project, m: *Module, into: *collections_vector.Vector[intern.StrId]) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < m.functions.len) {
+        val f: *mirl_function.Node = ?m.functions.data[i];
+        if (f.data.linkage.binding != ?mink_symbol.LOCAL && f.body.blocks.len != 0) {
+            val kept: err[fail.Fail] = defined_add(p, m, f.data.name, into);
+            if (sel kept.err) { ret kept; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < m.globals.len) {
+        val g: *mirl_global.Node = ?m.globals.data[i];
+        if (g.data.linkage.binding != ?mink_symbol.LOCAL && sel g.data.initial.some) {
+            val kept: err[fail.Fail] = defined_add(p, m, g.data.name, into);
+            if (sel kept.err) { ret kept; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun defined_add(p: *project.Project, m: *Module, n: mink_table.Id[mink_intern.Name], into: *collections_vector.Vector[intern.StrId]) err[fail.Fail] {
+    val name:  View                       = mirl_module.name_of(m, n);
+    val named: res[intern.StrId, A.Error] = intern.bytes_add(?p.s.interner, name.data::str, name.len);
+    if (sel named.err) { ret err[fail.Fail].err{fail.refused(named.err)}; }
+    val pushed: res[usize, A.Error] = collections_vector.push[intern.StrId](into, named.ok);
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# a module's lowering, against its normal object's symbols when it is the module's test object:
+# its typed definition and the target are its inputs. a normal module keeps the instances its code
+# asks for, and whether it declares tests
+fun lower_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
+    val p:           *project.Project                = raw::*project.Project;
+    val s:           *session.Session                = p.s;
+    val t_lower:     readout.Instant                 = readout.span_begin(p.progress);
+    val test_object: bool                            = back_half_key_is_test(key);
+    val keyed:       res[module.ModuleId, fail.Fail] = keyed_module(p, key);
+    if (sel keyed.err) { ret res[query.QueryOutput, fail.Fail].err{keyed.err}; }
+    val mid:        module.ModuleId                         = keyed.ok;
+    val m:          *project.ModuleEntry                    = project.module_at(p, mid::u32);
     val definition: res[sema_product.Definition, fail.Fail] = frontend.read_definition(p::ptr, mid, sema_product.DEFINITION_TYPED);
-    if (sel definition.err) { ret res[driver_unit.Made, fail.Fail].err{definition.err}; }
-    val d:     sema_product.Definition                    = definition.ok;
+    if (sel definition.err) { ret res[query.QueryOutput, fail.Fail].err{definition.err}; }
+    val d:  sema_product.Definition = definition.ok;
+    val rt: err[fail.Fail]          = query.depend[project.Project](?p.queries, p, ?context.TARGET, 0);
+    if (sel rt.err) { ret res[query.QueryOutput, fail.Fail].err{rt.err}; }
+
+    # a test object declares what its normal object defines, so it lowers against those symbols
+    var normal:      lower_context.NormalObject;
+    var normal_from: *lower_context.NormalObject = nil;
+    if (test_object) {
+        val defined: res[lower_context.NormalObject, fail.Fail] = normal_object_of(p, m);
+        if (sel defined.err) { ret res[query.QueryOutput, fail.Fail].err{defined.err}; }
+        normal      = defined.ok;
+        normal_from = ?normal;
+    }
+    fin {
+        if (normal_from != nil) { map.dnit[intern.StrId, bool](?normal.defined); }
+    }
+    val machine: res[*lower_context.Machine, fail.Fail] = backend.machine(?p.back);
+    if (sel machine.err) { ret res[query.QueryOutput, fail.Fail].err{machine.err}; }
     val req_r: res[lower_context.LowerRequest, fail.Fail] = lower_context.request(s, ?p.linkage, ?p.back.facts, machine.ok, s.backing, d.parsed.a, m.fqn, mid,
-        d.sr, d.rr, d.ctx, normal, shared_artifact_build(p), p.req.debug, p.req.opt != request.OPT_RELEASE, diags,
+        d.sr, d.rr, d.ctx, normal_from, shared_artifact_build(p), p.req.debug, p.req.opt != request.OPT_RELEASE, diags,
         sema_interface.Reader{ctx: p::ptr, read: read_interface}, lower_context.InstanceReader{ctx: p::ptr, read: read_instance});
-    if (sel req_r.err) { ret res[driver_unit.Made, fail.Fail].err{req_r.err}; }
-    var req:      lower_context.LowerRequest = req_r.ok;
-    var ir_path:  str                        = "";
-    var asm_path: str                        = "";
-    if (normal == nil) {
-        ir_path  = m.ir_output;
-        asm_path = m.asm_output;
+    if (sel req_r.err) { ret res[query.QueryOutput, fail.Fail].err{req_r.err}; }
+    var req:     lower_context.LowerRequest           = req_r.ok;
+    val lowered: res[*driver_unit.Lowered, fail.Fail] = driver_unit.lower(driver_unit.Lowering.module{?req}, ?p.back, s.spans, p.s.alloc);
+    if (sel lowered.err) { ret res[query.QueryOutput, fail.Fail].err{rejected(diags, lower_stable_fail(p, lowered.err))}; }
+    val l: *driver_unit.Lowered = lowered.ok;
+
+    var asked: collections_vector.Vector[cache_record.Asked] = collections_vector.init[cache_record.Asked](s.backing);
+    var kept:  err[fail.Fail]                                = err[fail.Fail].ok{};
+    if (!test_object) { kept = gather_asked(p, m, d.sr, ?asked); }
+    if (sel kept.err) {
+        collections_vector.dnit[cache_record.Asked](?asked);
+        lower_context.unit_dnit(?l.facts);
+        driver_unit.release(p.s.alloc, l);
+        ret res[query.QueryOutput, fail.Fail].err{kept.err};
     }
-    var name: str = intern.text(?s.interner, m.fqn);
-    if (normal != nil) {
-        val named: res[str, fail.Fail] = test_object_name(p, m.fqn);
-        if (sel named.err) { ret res[driver_unit.Made, fail.Fail].err{named.err}; }
-        name = named.ok;
+    read_out_lowering(p, test_object, intern.text(?s.interner, m.fqn), l, t_lower);
+    ret lowering_encode(p, alloc, l, asked, !test_object && testrunner.declares_tests(d.parsed.a));
+}
+
+# what lowering a unit measured: its own row, carved out of the codegen row it runs inside
+# while each unit is lowered just before it is compiled, and the counts of its module
+fun read_out_lowering(p: *project.Project, test_object: bool, name: str, l: *driver_unit.Lowered, t_lower: readout.Instant) {
+    var lower:   readout.Phase = readout.LOWER;
+    var codegen: readout.Phase = readout.CODEGEN;
+    if (test_object) {
+        lower   = readout.TEST_LOWER;
+        codegen = readout.TEST_CODEGEN;
     }
-    var job: driver_unit.Job = driver_unit.Job{lower: driver_unit.Lowering.module{?req}, back: ?p.back, sources: s.sources, codegen: codegen_of(p), out: s.backing, spans: s.spans, ir_path: ir_path, asm_path: asm_path, name: name,
-        timed: p.progress != nil};
-    ret driver_unit.make(?job);
+    readout.span_end(p.progress, lower, codegen, t_lower);
+    readout.item_spent(p.progress, lower, name, l.lower);
+    readout.count(p.progress, readout.FUNCTIONS, name, l.functions);
+    readout.count(p.progress, readout.IR_INSTRUCTIONS, name, l.ir_count);
 }
 
 # a module's test object's name, `<module path>#tests`: `#` is in no module path, so it names no module, and its
@@ -649,7 +781,11 @@ fun run_unit_pass(p: *project.Project) err[fail.Fail] {
     }
     i = 0;
     for (i < p.units.len) {
-        val u: *project.InstanceUnit           = ?p.units.data[i];
+        val u: *project.InstanceUnit = ?p.units.data[i];
+        if (!u.hit) {
+            val ahead: err[fail.Fail] = lower_ahead(p, ?UNIT_LOWER, ?UNIT_CODEGEN, u.key);
+            if (sel ahead.err) { ret ahead; }
+        }
         val e: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?UNIT_CODEGEN, u.key);
         if (sel e.err) { ret err[fail.Fail].err{e.err}; }
         val made: *Product = product_decode(e.ok);
@@ -724,7 +860,7 @@ fun unit_codegen_restored(p: *project.Project, u: *project.InstanceUnit, alloc: 
     if (staged == nil) { ret res[query.QueryOutput, fail.Fail].err{fail.message("unit codegen: restored product left the unit")}; }
     val o: Object = @staged;
     A.deallocate[Object](p.s.alloc, staged, 1);
-    ret product_encode(alloc, o, opt[lower_context.Unit].none{}, p.s.alloc);
+    ret product_encode(alloc, o, opt[Kept].none{}, p.s.alloc);
 }
 
 # the unit `du` joins the project's units, named, with the paths its text and listing go to
@@ -937,14 +1073,13 @@ fun unit_demand_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocat
 # the bytes of one member in a unit demand product
 val MEMBER_BYTES: u32 = 4;
 
-# an instance unit's object: its members' own typing, which it then depends on, lowered in symbol
-# order and compiled. it reads no module's typing, so only what its members read reaches it
-fun unit_codegen_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
-    val p:    *project.Project      = raw::*project.Project;
-    val s:    *session.Session      = p.s;
-    val held: *project.InstanceUnit = unit_held(p, key);
-    if (held != nil && held.hit && held.staged != nil) { ret unit_codegen_restored(p, held, alloc); }
-    val got: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?UNIT_DEMAND, key);
+# an instance unit's lowering: its members' own typing, which it then depends on, lowered in
+# symbol order. it reads no module's typing, so only what its members read reaches it
+fun unit_lower_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
+    val p:       *project.Project                = raw::*project.Project;
+    val s:       *session.Session                = p.s;
+    val t_lower: readout.Instant                 = readout.span_begin(p.progress);
+    val got:     res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?UNIT_DEMAND, key);
     if (sel got.err) { ret res[query.QueryOutput, fail.Fail].err{got.err}; }
     val count:   u32                                                     = got.ok.value_len / MEMBER_BYTES;
     var members: collections_vector.Vector[*sema_product.InstanceResult] = collections_vector.init[*sema_product.InstanceResult](s.alloc);
@@ -963,7 +1098,7 @@ fun unit_codegen_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Alloca
 
     val stable: module.StableModuleId = demand.key_stable(key);
     val origin: module.ModuleId       = module.module_id_for_stable(?s.modules, stable);
-    if (module.is_nil(origin)) { ret res[query.QueryOutput, fail.Fail].err{fail.message("unit codegen: the unit's origin is not loaded this build")}; }
+    if (module.is_nil(origin)) { ret res[query.QueryOutput, fail.Fail].err{fail.message("unit lower: the unit's origin is not loaded this build")}; }
     val named: res[intern.StrId, fail.Fail] = unit_name(p, origin, demand.key_bucket(key));
     if (sel named.err) { ret res[query.QueryOutput, fail.Fail].err{named.err}; }
     val machine: res[*lower_context.Machine, fail.Fail] = backend.machine(?p.back);
@@ -971,40 +1106,24 @@ fun unit_codegen_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Alloca
     val req_r: res[lower_context.LowerRequest, fail.Fail] = lower_context.unit_request(s, ?p.linkage, ?p.back.facts, machine.ok, s.backing,
         p.req.debug, p.req.opt != request.OPT_RELEASE, diags, sema_interface.Reader{ctx: p::ptr, read: read_interface}, lower_context.InstanceReader{ctx: p::ptr, read: read_instance});
     if (sel req_r.err) { ret res[query.QueryOutput, fail.Fail].err{req_r.err}; }
-    var req:      lower_context.LowerRequest = req_r.ok;
-    var ir_path:  str                        = nil;
-    var asm_path: str                        = nil;
-    var k:        usize                      = 0;
-    for (k < p.units.len) {
-        if (p.units.data[k].key == key) {
-            ir_path  = p.units.data[k].ir_output;
-            asm_path = p.units.data[k].asm_output;
-        }
-        k = k + 1;
-    }
-    val name: str             = intern.text(?s.interner, named.ok);
-    var job:  driver_unit.Job = driver_unit.Job{
-        lower: driver_unit.Lowering.unit{driver_unit.UnitLowering{req: ?req, name: named.ok, members: members.data, count: members.len::u32}},
-        back:  ?p.back, sources: s.sources, codegen: codegen_of(p), out: s.backing, spans: s.spans, ir_path: ir_path, asm_path: asm_path, name: name,
-        timed: p.progress != nil
-    };
-    val t_cg: readout.Instant                  = readout.item_begin(p.progress);
-    var made: res[driver_unit.Made, fail.Fail] = driver_unit.make(?job);
-    if (sel made.err) { ret res[query.QueryOutput, fail.Fail].err{rejected(diags, lower_stable_fail(p, made.err))}; }
-    val warned: err[fail.Fail] = warn(p, diags, ?made.ok.compiled);
-    if (sel warned.err) {
-        backend.release_object(?made.ok.compiled.object);
-        lower_context.unit_dnit(?made.ok.facts);
-        ret res[query.QueryOutput, fail.Fail].err{warned.err};
-    }
-    val claimed: err[fail.Fail] = claims.state(p, ?made.ok.compiled.object);
-    if (sel claimed.err) {
-        backend.release_object(?made.ok.compiled.object);
-        lower_context.unit_dnit(?made.ok.facts);
-        ret res[query.QueryOutput, fail.Fail].err{rejected(diags, claimed.err)};
-    }
-    read_out_step(p, false, name, ?made.ok.stats, readout.elapsed(t_cg));
-    ret product_encode(alloc, made.ok.compiled.object, opt[lower_context.Unit].some{made.ok.facts}, p.s.alloc);
+    var req:      lower_context.LowerRequest           = req_r.ok;
+    val lowering: driver_unit.Lowering                 = driver_unit.Lowering.unit{driver_unit.UnitLowering{req: ?req, name: named.ok, members: members.data, count: members.len::u32}};
+    val lowered:  res[*driver_unit.Lowered, fail.Fail] = driver_unit.lower(lowering, ?p.back, s.spans, p.s.alloc);
+    if (sel lowered.err) { ret res[query.QueryOutput, fail.Fail].err{rejected(diags, lower_stable_fail(p, lowered.err))}; }
+    read_out_lowering(p, false, intern.text(?s.interner, named.ok), lowered.ok, t_lower);
+    ret lowering_encode(p, alloc, lowered.ok, collections_vector.init[cache_record.Asked](s.backing), false);
+}
+
+# an instance unit's object: its lowering, which it then depends on, compiled
+fun unit_codegen_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
+    val p:    *project.Project      = raw::*project.Project;
+    val s:    *session.Session      = p.s;
+    val held: *project.InstanceUnit = unit_held(p, key);
+    if (held != nil && held.hit && held.staged != nil) { ret unit_codegen_restored(p, held, alloc); }
+    if (held == nil)                                   { ret res[query.QueryOutput, fail.Fail].err{fail.message("unit codegen: the unit is not one of this build's")}; }
+    var job: driver_unit.Job = driver_unit.Job{back: ?p.back, codegen: codegen_of(p), out: s.backing, ir_path: held.ir_output, asm_path: held.asm_output,
+        name: intern.text(?s.interner, held.name), timed: p.progress != nil, sources: s.sources};
+    ret compiled_from(p, ?UNIT_LOWER, key, ?job, false, alloc, diags);
 }
 
 # the topological position of the last emitted module whose lowering may read each module's
@@ -1036,8 +1155,28 @@ fun last_readers(p: *project.Project, last: *u32, count: u32) {
 
 val NO_READER: u32 = 0xFFFFFFFF;
 
+# the unit `key` names lowered just before it is compiled, unless its object is current or
+# restored, whose codegen reads no lowering
+fun lower_ahead(p: *project.Project, lowering: *query.Kind, codegen: *query.Kind, key: u64) err[fail.Fail] {
+    val reusable: res[bool, fail.Fail] = query.reusable[project.Project](?p.queries, p, codegen, key);
+    if (sel reusable.err) { ret err[fail.Fail].err{reusable.err}; }
+    if (reusable.ok)      { ret err[fail.Fail].ok{}; }
+    val lowered: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, lowering, key);
+    if (sel lowered.err) { ret err[fail.Fail].err{lowered.err}; }
+    ret err[fail.Fail].ok{};
+}
+
 fun run_codegen_one(p: *project.Project, mid: module.ModuleId) err[fail.Fail] {
-    val m:   *project.ModuleEntry            = project.module_at(p, mid::u32);
+    val m: *project.ModuleEntry = project.module_at(p, mid::u32);
+    # the symbols the module defines are read from its lowering before its codegen spends it
+    var defined: collections_vector.Vector[intern.StrId] = collections_vector.init[intern.StrId](p.s.backing);
+    fin { collections_vector.dnit[intern.StrId](?defined); }
+    if (!cache.restored(p, m)) {
+        val ahead: err[fail.Fail] = lower_ahead(p, ?LOWER, ?CODEGEN, back_half_key_for(p, m));
+        if (sel ahead.err) { ret ahead; }
+        val read: err[fail.Fail] = defined_of(p, m, ?defined);
+        if (sel read.err) { ret read; }
+    }
     val e_r: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?CODEGEN, back_half_key_for(p, m));
     if (sel e_r.err) { ret err[fail.Fail].err{e_r.err}; }
     val made: *Product = product_decode(e_r.ok);
@@ -1047,12 +1186,18 @@ fun run_codegen_one(p: *project.Project, mid: module.ModuleId) err[fail.Fail] {
     val o: *Object = m.object;
     # a generated object, or one this session held, carries the key of the current snapshot
     # into `obj/`
-    ret cache.publish(p, m, o, query.QueryKey{kind: ?CODEGEN, key: back_half_key_for(p, m)});
+    if (!made.lowered) { ret cache.publish(p, m, o, nil, 0, nil, 0, query.QueryKey{kind: ?CODEGEN, key: back_half_key_for(p, m)}); }
+    ret cache.publish(p, m, o, made.kept.asked.data, made.kept.asked.len::u32, defined.data, defined.len::u32,
+        query.QueryKey{kind: ?CODEGEN, key: back_half_key_for(p, m)});
 }
 
 # the module's test object, lowered against its normal object and compiled
 fun run_test_object_one(p: *project.Project, mid: module.ModuleId) err[fail.Fail] {
-    val m:   *project.ModuleEntry            = project.module_at(p, mid::u32);
+    val m: *project.ModuleEntry = project.module_at(p, mid::u32);
+    if (!cache.test_restored(p, m)) {
+        val ahead: err[fail.Fail] = lower_ahead(p, ?LOWER, ?CODEGEN, test_key_for(m));
+        if (sel ahead.err) { ret ahead; }
+    }
     val e_r: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?CODEGEN, test_key_for(m));
     if (sel e_r.err) { ret err[fail.Fail].err{e_r.err}; }
     val made: *Product = product_decode(e_r.ok);
@@ -1072,66 +1217,81 @@ pub fun test_codegen_reusable(p: *project.Project, mid: module.ModuleId) res[boo
     ret res[bool, fail.Fail].ok{cache.test_restored(p, m)};
 }
 
-# a module's object: made by its step from the module's typed definition, or the object the
-# object cache staged for it
+# a module's object: its lowering, which it then depends on, compiled, or the object the object
+# cache staged for it
 fun codegen_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
-    val p: *project.Project = raw::*project.Project;
-    val s: *session.Session = p.s;
-
-    val stable: module.StableModuleId = key::u32::module.StableModuleId;
-    val mid:    module.ModuleId       = module.module_id_for_stable(?s.modules, stable);
-    if (module.is_nil(mid)) { ret res[query.QueryOutput, fail.Fail].err{fail.message("codegen: stable id not loaded this build")}; }
+    val p:     *project.Project                = raw::*project.Project;
+    val s:     *session.Session                = p.s;
+    val keyed: res[module.ModuleId, fail.Fail] = keyed_module(p, key);
+    if (sel keyed.err) { ret res[query.QueryOutput, fail.Fail].err{keyed.err}; }
+    val mid:         module.ModuleId      = keyed.ok;
     val m:           *project.ModuleEntry = project.module_at(p, mid::u32);
     val test_object: bool                 = back_half_key_is_test(key);
     if (!test_object && cache.staged_restored(p, m))     { ret q_codegen_restored(p, mid, false, alloc); }
     if (test_object && cache.test_staged_restored(p, m)) { ret q_codegen_restored(p, mid, true, alloc); }
-    val inputs: res[module.ModuleId, fail.Fail] = lower_inputs(p, key);
-    if (sel inputs.err) { ret res[query.QueryOutput, fail.Fail].err{inputs.err}; }
-
-    # a test object declares what its normal object defines, so it lowers against that object
-    var normal:      lower_context.NormalObject;
-    var normal_from: *lower_context.NormalObject = nil;
-    if (test_object) {
-        val defined: res[lower_context.NormalObject, fail.Fail] = normal_object_of(p, m);
-        if (sel defined.err) { ret res[query.QueryOutput, fail.Fail].err{defined.err}; }
-        normal      = defined.ok;
-        normal_from = ?normal;
+    var job: driver_unit.Job = driver_unit.Job{back: ?p.back, codegen: codegen_of(p), out: s.backing, ir_path: "", asm_path: "", name: intern.text(?s.interner, m.fqn),
+        timed: p.progress != nil, sources: s.sources};
+    if (!test_object) {
+        job.ir_path  = m.ir_output;
+        job.asm_path = m.asm_output;
     }
-    fin {
-        if (normal_from != nil) { map.dnit[intern.StrId, bool](?normal.defined); }
+    or {
+        val named: res[str, fail.Fail] = test_object_name(p, m.fqn);
+        if (sel named.err) { ret res[query.QueryOutput, fail.Fail].err{named.err}; }
+        job.name = named.ok;
     }
+    ret compiled_from(p, ?LOWER, key, ?job, test_object, alloc, diags);
+}
 
-    val t_cg: readout.Instant                  = readout.item_begin(p.progress);
-    var made: res[driver_unit.Made, fail.Fail] = made_for(p, mid, normal_from, diags);
-    if (sel made.err) { ret res[query.QueryOutput, fail.Fail].err{rejected(diags, lower_stable_fail(p, made.err))}; }
+# the object of the lowering `lowering` keys under `key`, compiled as `job` says: the codegen takes
+# what the lowering kept, and the lowering's value is given back once its module is compiled
+fun compiled_from(p: *project.Project, lowering: *query.Kind, key: u64, job: *driver_unit.Job, test_object: bool, alloc: *A.Allocator,
+    diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
+    val got: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, lowering, key);
+    if (sel got.err) { ret res[query.QueryOutput, fail.Fail].err{got.err}; }
+    val l:     *Lowering                                     = handle_decode(got.ok)::*Lowering;
+    val t_cg:  readout.Instant                               = readout.item_begin(p.progress);
+    var made:  res[driver_unit.Made, fail.Fail]              = driver_unit.compile(job, l.lowered);
+    val facts: lower_context.Unit                            = l.lowered.facts;
+    val asked: collections_vector.Vector[cache_record.Asked] = l.asked;
+    l.taken = true;
+    val released: err[fail.Fail] = query.release_value(?p.s.queries, lowering, key);
+    var kept:     Kept           = Kept{facts: facts, asked: asked};
+    if (sel released.err) {
+        if (sel made.ok) { backend.release_object(?made.ok.compiled.object); }
+        kept_dnit(?kept);
+        ret res[query.QueryOutput, fail.Fail].err{released.err};
+    }
+    if (sel made.err) {
+        kept_dnit(?kept);
+        ret res[query.QueryOutput, fail.Fail].err{rejected(diags, lower_stable_fail(p, made.err))};
+    }
     val warned: err[fail.Fail] = warn(p, diags, ?made.ok.compiled);
     if (sel warned.err) {
         backend.release_object(?made.ok.compiled.object);
-        lower_context.unit_dnit(?made.ok.facts);
+        kept_dnit(?kept);
         ret res[query.QueryOutput, fail.Fail].err{warned.err};
     }
     # the object carries its unit's link claims, so an archive of it carries them to its link
     val claimed: err[fail.Fail] = claims.state(p, ?made.ok.compiled.object);
     if (sel claimed.err) {
         backend.release_object(?made.ok.compiled.object);
-        lower_context.unit_dnit(?made.ok.facts);
+        kept_dnit(?kept);
         ret res[query.QueryOutput, fail.Fail].err{rejected(diags, claimed.err)};
     }
-    read_out_step(p, test_object, intern.text(?p.s.interner, m.fqn), ?made.ok.stats, readout.elapsed(t_cg));
-    ret product_encode(alloc, made.ok.compiled.object, opt[lower_context.Unit].some{made.ok.facts}, p.s.alloc);
+    read_out_step(p, test_object, intern.text(?p.s.interner, facts.name), ?made.ok.stats, readout.elapsed(t_cg));
+    ret product_encode(alloc, made.ok.compiled.object, opt[Kept].some{kept}, p.s.alloc);
 }
 
-# what the step that made the module `name` measured: its lower and verify stages, and mirl's
-# and masc's, move out of the codegen row into rows of their own, the rest of the step is
-# codegen's, and each count adds to the unit's total. mirl's verifier runs add to mach's, and
-# mirl's emit row is its emit less masc's layout and encoding, which it holds. a refused clock
-# read leaves its stage short, and is reported rather than shown as a zero
+# what compiling the unit `name` measured: its verify stage and mirl's and masc's move out of
+# the codegen row into rows of their own, the rest of the compile is codegen's, and each count
+# adds to the unit's total. mirl's verifier runs add to mach's, and mirl's emit row is its emit
+# less masc's layout and encoding, which it holds. a refused clock read leaves its stage short,
+# and is reported rather than shown as a zero
 fun read_out_step(p: *project.Project, test_object: bool, name: str, st: *driver_unit.Stats, spent: chrono_duration.Duration) {
-    var lower:   readout.Phase = readout.LOWER;
     var verify:  readout.Phase = readout.VERIFY;
     var codegen: readout.Phase = readout.CODEGEN;
     if (test_object) {
-        lower   = readout.TEST_LOWER;
         verify  = readout.TEST_VERIFY;
         codegen = readout.TEST_CODEGEN;
     }
@@ -1141,10 +1301,9 @@ fun read_out_step(p: *project.Project, test_object: bool, name: str, st: *driver
     val masc_encode: u64                      = ms.masc.encode;
     var mirl_emit:   u64                      = 0;
     if (ms.emit > masc_layout + masc_encode) { mirl_emit = ms.emit - masc_layout - masc_encode; }
-    readout.carve(p.progress, lower, codegen, st.lower);
     readout.carve(p.progress, verify, codegen, verified);
     var times:  [readout.STAGE_COUNT]u64 = [readout.STAGE_COUNT]u64{ms.lower + ms.passes, ms.select, ms.alloc, ms.frame, mirl_emit, masc_layout, masc_encode};
-    var carved: chrono_duration.Duration = st.lower + verified;
+    var carved: chrono_duration.Duration = verified;
     var i:      usize                    = 0;
     for (i < readout.STAGE_COUNT) {
         readout.carve(p.progress, readout.STAGES[i], codegen, ns(times[i]));
@@ -1154,11 +1313,8 @@ fun read_out_step(p: *project.Project, test_object: bool, name: str, st: *driver
     }
     var rest: chrono_duration.Duration = spent - carved;
     if (rest < 0) { rest = 0; }
-    readout.item_spent(p.progress, lower, name, st.lower);
     readout.item_spent(p.progress, verify, name, verified);
     readout.item_spent(p.progress, codegen, name, rest);
-    readout.count(p.progress, readout.FUNCTIONS, name, st.functions);
-    readout.count(p.progress, readout.IR_INSTRUCTIONS, name, st.ir);
     readout.count(p.progress, readout.VERIFY_RUNS, name, st.verifies + ms.verified);
     readout.count(p.progress, readout.SELECTED, name, ms.selected);
     readout.count(p.progress, readout.ALLOCATED, name, ms.allocated);
@@ -1231,38 +1387,50 @@ fun q_codegen_restored(p: *project.Project, mid: module.ModuleId, test_object: b
     if (staged == nil) { ret res[query.QueryOutput, fail.Fail].err{fail.message("codegen: restored product left the module")}; }
     val o: Object = @staged;
     A.deallocate[Object](p.s.alloc, staged, 1);
-    ret product_encode(alloc, o, opt[lower_context.Unit].none{}, p.s.alloc);
+    ret product_encode(alloc, o, opt[Kept].none{}, p.s.alloc);
 }
 
-# a codegen product: the module's object, and the facts its step kept, none for an object
+# what a unit's codegen keeps of its lowering once the module is compiled: the facts mach reads of
+# it, and for a module the instances its code asks for (see Lowering)
+rec Kept {
+    facts: lower_context.Unit;
+    asked: collections_vector.Vector[cache_record.Asked];
+}
+
+fun kept_dnit(k: *Kept) {
+    lower_context.unit_dnit(?k.facts);
+    collections_vector.dnit[cache_record.Asked](?k.asked);
+}
+
+# a codegen product: the unit's object, and what it kept of its lowering, none for an object
 # the cache restored
 rec Product {
     object:  Object;
-    facts:   lower_context.Unit;
+    kept:    Kept;
     lowered: bool;
 }
 
 fun product_release(raw: ptr, alloc: *A.Allocator) {
     val made: *Product = raw::*Product;
     backend.release_object(?made.object);
-    if (made.lowered) { lower_context.unit_dnit(?made.facts); }
+    if (made.lowered) { kept_dnit(?made.kept); }
     A.deallocate[Product](alloc, made, 1);
 }
 
-fun product_encode(alloc: *A.Allocator, o: Object, facts: opt[lower_context.Unit], owner: *A.Allocator) res[query.QueryOutput, fail.Fail] {
+fun product_encode(alloc: *A.Allocator, o: Object, kept: opt[Kept], owner: *A.Allocator) res[query.QueryOutput, fail.Fail] {
     var held:  Object                 = o;
     val boxed: res[*Product, A.Error] = A.allocate[Product](owner, 1);
     if (sel boxed.err) {
         backend.release_object(?held);
-        if (sel facts.some) {
-            var kept: lower_context.Unit = facts.some;
-            lower_context.unit_dnit(?kept);
+        if (sel kept.some) {
+            var k: Kept = kept.some;
+            kept_dnit(?k);
         }
         ret res[query.QueryOutput, fail.Fail].err{fail.refused(boxed.err)};
     }
     boxed.ok.object  = held;
-    boxed.ok.lowered = sel facts.some;
-    if (sel facts.some) { boxed.ok.facts = facts.some; }
+    boxed.ok.lowered = sel kept.some;
+    if (sel kept.some) { boxed.ok.kept = kept.some; }
     ret handle_encode(alloc, boxed.ok::ptr, product_release, owner);
 }
 
@@ -1270,10 +1438,10 @@ fun product_decode(e: query.QueryView) *Product {
     ret handle_decode(e)::*Product;
 }
 
-# the facts a product's step kept, nil for a restored object
+# the facts a product's lowering kept, nil for a restored object
 fun product_facts(made: *Product) *lower_context.Unit {
     if (!made.lowered) { ret nil; }
-    ret ?made.facts;
+    ret ?made.kept.facts;
 }
 
 fun codegen_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
@@ -1283,8 +1451,6 @@ fun codegen_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
 # the link stage's computation: the current objects, then the link the build's job names,
 # which runs only when one of its inputs moved
 pub fun run_link_pass(p: *project.Project) err[fail.Fail] {
-    val images: err[fail.Fail] = run_codegen_pass(p);
-    if (sel images.err) { ret images; }
     val linked: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?LINK, 0);
     if (sel linked.err) { ret err[fail.Fail].err{linked.err}; }
     ret err[fail.Fail].ok{};

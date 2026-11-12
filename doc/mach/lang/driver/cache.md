@@ -233,12 +233,13 @@ the session's files named by path, as a recorded store names them
 ## fun publish
 
 ```mach
-pub fun publish(p: *project.Project, m: *project.ModuleEntry, o: *Object, object: query.QueryKey) err[fail.Fail];
+pub fun publish(p: *project.Project, m: *project.ModuleEntry, o: *Object, asked: *cache_record.Asked, asked_count: u32,
+defined: *intern.StrId, defined_count: u32, object: query.QueryKey) err[fail.Fail];
 ```
 
-a compiled object carries its record into `obj/`: the key it was built under, the facts its
-lowered unit holds and the warnings building it reported. the record waits on the module
-until its object is written
+a generated object carries its record into `obj/`: its key, the source it was built from, its
+warnings, and what its lowering kept: the instances its code asks for and, for a module that
+declares tests, the symbols it defines, which its test object declares
 
 ## fun publish_test
 

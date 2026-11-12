@@ -48,7 +48,8 @@ pub fun writer[W](itn: *intern.Interner, a: *A.Allocator, path: str, ctx: *W,
 write_cb: fun(*W, *io_writer.Writer) err[io_writer.WriteError], mode: i32, op: str) err[fail.Fail];
 ```
 
-stream `path`, whose parent exists, through `write_cb`
+stream `path`, whose parent exists, through `write_cb`, staged in `a` so a writer of many small
+pieces makes few writes to the file
 
 ## fun replace
 
