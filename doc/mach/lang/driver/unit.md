@@ -51,7 +51,8 @@ out: where the object lives, which outlives the step
 spans: the pool the module's own heap draws its spans from
 ir_path: where mirl's text of the module is written before it compiles, "" for nowhere
 asm_path: where masc's listing of the object is written as it compiles, "" for nowhere
-name: the module's or unit's name, for refusals
+name: the name of the object it makes, the module's, its test object's or the unit's, no other object's in a link, which
+refusals name and the object's format may name symbols after
 timed: whether mirl times and counts its stages, which only a readout reads
 
 ## rec Stats

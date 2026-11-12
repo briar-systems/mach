@@ -26,7 +26,8 @@ the mirl module `m` compiled to mink's object at mirl's level `level`, its sched
 run with `checked`, the linker let relax its code with `relax` and the float relaxations `floats`
 permitted, masc's listing of the object written to `listing` when there is one, and its stages
 timed and counted into `stats` when there is one. a failure or warning points at the file of
-`sources` mirl's location names. the module is the schedule's to rewrite, so it is spent here
+`sources` mirl's location names. `name` is the object's, no other object's in a link. the module is the schedule's
+to rewrite, so it is spent here
 
 ## fun release_warnings
 
