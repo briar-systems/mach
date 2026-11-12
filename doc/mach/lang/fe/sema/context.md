@@ -488,8 +488,11 @@ pub fun check_handle_in_array(sc: *SemaContext, ty: type_kind.TypeId, span: lang
 ## fun report_internal
 
 ```mach
-pub fun report_internal(sc: *SemaContext, span: lang_source.Span, message: str);
+pub fun report_internal(sc: *SemaContext, span: lang_source.Span, f: fail.Fail);
 ```
+
+fail the phase internally with `f`, a defect met at `span` of the syntax in view; a failure
+that names a place of its own keeps it
 
 ## fun report_note
 

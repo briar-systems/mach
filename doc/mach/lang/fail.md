@@ -17,9 +17,10 @@ diagnostic and there is nothing further to say; an invariant the compiler
 owns was broken, whose text must be preserved; the input was wrong or
 unsupported; or the machine refused rather than the input (a file that could
 not be read or written, a tool that could not be spawned). a user or
-environment failure names the diagnostic kind it is reported as and may
-point at a place, a location of the source map its holder reads, which the
-failure is rendered through; an internal one is always `compiler.internal`. the exit
+environment failure names the diagnostic kind it is reported as, an internal
+one is always `compiler.internal`, and any of them may point at a place, a
+location of the source map its holder reads, which the failure is rendered
+through. the exit
 code derives from the case: 1 for user, 2 for internal, 3 where a command
 distinguishes the environment. `reported` is declared first so a zero
 failure is one that invents no text. an allocation refusal is internal; the
@@ -97,8 +98,19 @@ pub fun as_internal(f: Fail) Fail;
 
 a failure met on input the compiler produced itself (an object it wrote, a
 module it emitted): whatever the check says of the input, it is the
-compiler's defect, an internal failure keeping the text. a reported failure
-stays reported
+compiler's defect, an internal failure keeping the text and the place. a
+reported failure stays reported
+
+## fun defect
+
+```mach
+pub fun defect(f: Fail) Fail;
+```
+
+the compiler's defect a failure names, borrowing its text and keeping its place, for a
+holder of the first defect a phase met: an internal failure as it is, a keyed one as the
+defect its text names, and a reported one as the defect of being handed one, since its
+diagnostics name no defect of their own
 
 ## fun at
 
@@ -108,7 +120,7 @@ pub fun at(f: Fail, at: lang_source.Location) Fail;
 
 the same failure pointing at `at`, a location of the source map its caller reads. a
 failure that already points somewhere keeps its place, the innermost site knowing best;
-one with no kind, or a nil `at`, points nowhere. a fix that names no place of its own
+a reported one, or a nil `at`, points nowhere. a fix that names no place of its own
 rewrites the bytes the failure points at
 
 ## fun spanned

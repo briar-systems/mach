@@ -6,13 +6,13 @@
 pub tag PhaseKind: u8 {
     accepted;
     rejected;
-    internal: str;
+    internal: fail.Fail;
 }
 ```
 
 phase status is independent of diagnostic storage and rendering: accepted,
-rejected through recorded diagnostics, or internally failed with the text
-of the first internal failure
+rejected through recorded diagnostics, or internally failed with the first
+internal failure, which borrows its text and keeps where it points
 
 ## rec PhaseStatus
 
@@ -35,8 +35,10 @@ pub fun reject(s: *PhaseStatus);
 ## fun internal
 
 ```mach
-pub fun internal(s: *PhaseStatus, text: str);
+pub fun internal(s: *PhaseStatus, f: fail.Fail);
 ```
+
+fail the phase internally with the defect `f` names, unless it failed internally already
 
 ## fun is_accepted
 
@@ -44,13 +46,13 @@ pub fun internal(s: *PhaseStatus, text: str);
 pub fun is_accepted(s: PhaseStatus) bool;
 ```
 
-## fun internal_text
+## fun internal_failure
 
 ```mach
-pub fun internal_text(s: PhaseStatus) opt[str];
+pub fun internal_failure(s: PhaseStatus) opt[fail.Fail];
 ```
 
-the internal failure's text, absent unless the phase failed internally
+the internal failure, absent unless the phase failed internally
 
 ## fun phase_failure
 

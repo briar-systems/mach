@@ -332,6 +332,15 @@ the scalar a module `val` holds, none when it holds no constant or an aggregate
 pub fun gated_lower_member_const_message(lc: *LowerContext, name: intern.StrId, dep_fqn: intern.StrId) res[str, fail.Fail];
 ```
 
+## fun internal
+
+```mach
+pub fun internal(lc: *LowerContext, f: fail.Fail);
+```
+
+fail the lowering internally with `f`, a defect met at the node the lowering stands on; a
+failure that names a place of its own keeps it
+
 ## fun report_gate
 
 ```mach
