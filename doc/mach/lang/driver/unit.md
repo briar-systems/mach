@@ -1,10 +1,10 @@
 # mach.lang.driver.unit
 
-one module's object, made by a step that owns everything it works in: the module is
-lowered into a mirl module on a heap of the step's own, verified, written as text when
-asked, compiled, and the heap torn down before the step returns. the step reads its
-job and writes only what it returns, so steps for different modules can run side by
-side on one shared target (mirl#406). it times the stages it runs and keeps the counts
+one object, of a module or an instance unit, made by a step that owns everything it works
+in: its code is lowered into a mirl module on a heap of the step's own, verified, written
+as text when asked, compiled, and the heap torn down before the step returns. the step
+reads its job and writes only what it returns, so steps for different objects can run side
+by side on one shared target (mirl#406). it times the stages it runs and keeps the counts
 each owner holds of the module, for the readout
 
 ## rec Codegen
@@ -16,22 +16,42 @@ pub rec Codegen;
 how mirl compiles a module: its level, whether the schedule's own checks run, whether
 the linker may relax the code, and the float relaxations permitted
 
+## rec UnitLowering
+
+```mach
+pub rec UnitLowering;
+```
+
+an instance unit's lowering: its request, its name and its members in the order they lower
+
+## tag Lowering
+
+```mach
+pub tag Lowering: u8 {
+    module: *lower_context.LowerRequest;
+    unit:   UnitLowering;
+}
+```
+
+what a step lowers: a module, or an instance unit. the request's `malloc` holds the facts
+and any refusal
+
 ## rec Job
 
 ```mach
 pub rec Job;
 ```
 
-what one module's object is made from, all of it read only to the step
+what one object is made from, all of it read only to the step
 
-lower: the module's lowering request; its `malloc` holds the facts and any refusal
+lower: what the step lowers
 back: the assembled target, shared by every step and never written
 codegen: how mirl compiles the module
 out: where the object lives, which outlives the step
 spans: the pool the module's own heap draws its spans from
 ir_path: where mirl's text of the module is written before it compiles, "" for nowhere
 asm_path: where masc's listing of the object is written as it compiles, "" for nowhere
-name: the module's name, for refusals
+name: the module's or unit's name, for refusals
 timed: whether mirl times and counts its stages, which only a readout reads
 
 ## rec Stats

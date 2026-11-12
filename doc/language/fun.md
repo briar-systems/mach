@@ -106,9 +106,11 @@ error[operator.operand_type]: `Point` has no ordering: `<`, `<=`, `>` and `>=` o
    |         ----- in this generic body, checked against this instance's type arguments
 ```
 
-The template itself reports nothing. It types the body so each instance and the
-lowering have an expression table to read, and every judgement is the instance's,
-which is what keeps one bad instantiation to one refusal at one site.
+The template itself reports nothing past name resolution. It types the body so
+each instance and the lowering have an expression table to read, and every type
+judgement is the instance's, even one no type argument changes: an unresolved name
+in a generic body is reported in the generic's own file, and `val q: i64 = "s";`
+in one is reported only where an instance of it is asked for.
 
 **A generic nothing instantiates is not checked.** `fun never_used[T](a: T) T {
 ret a + a; }` compiles, because there is no type to decide `+` against and no
@@ -137,6 +139,49 @@ a cycle of calls through such an argument asks for a new instance at every step.
 ```
 error[generic.growing_cycle]: `g` instantiates `f` here at an argument that grows, on a cycle of instances no comptime gate can stop (f, g), so its instances never end
 ```
+
+### Where an instance's code lives
+
+Every instance is compiled once per build, whichever modules call it. A module's
+object only declares the instances it calls. The code goes into an **instance
+unit**: one object per generic's module and bucket, where the bucket is a fixed
+hash (FNV-1a) of the instance's mangled name modulo 8. A generic, comptime-value
+or pack instance of `m.f` therefore lands in one of the objects `m#instances.0`
+through `m#instances.7`, and which one depends on its name alone.
+
+- **Nothing in a unit depends on build order.** A unit lowers its instances in
+  mangled-name order, and unit objects follow every module object in the link,
+  ordered by module name and then bucket. Adding or dropping a use of an
+  instance changes at most the one unit that holds it.
+- **Linkage.** An instance is weak, so two static libraries built apart that each
+  hold it still link together, and hidden, so no shared library exports it,
+  `#[export]` or not. A private declaration an instance body reaches, such as a
+  helper or a table of the generic's module, is reached from the unit as a hidden
+  symbol of the same image.
+- **Constant time.** A `constant_time` function's code is verified only against the
+  callees its own object holds. So an instance it calls is also compiled into the
+  caller's object, as a local copy under the same name, and the caller calls that
+  copy.
+- **Typed once, reported by every caller.** An instance is type checked once per
+  build, against its generic's module and the modules declaring its type arguments,
+  never against a caller, and its refusals are made and kept once. Each module whose
+  own code reaches an instance with a refusal, directly or through other instances,
+  reports it as its own, at its first call site by offset that leads there, with the
+  body's own span as the related site. A module that reaches it through several
+  call sites reports it once, so `mach check` shows a refusal once for each module
+  that must change, and every file that asks for a broken instance shows it.
+- **Reused across builds.** A unit's object stays in `obj/` beside its generic
+  module's, keyed by its members and the surfaces of the modules they name, so a
+  rebuild that changes none of those reuses it. A module's object record lists the
+  instances its code asks for, and the cache directory keeps a record of each
+  instance's typing (`.cache/instances`: the instances its body asks for and what
+  it reported), keyed by the surfaces of the modules it reads. A rebuild reads the
+  demand from those records, so a module whose object is reused and that nothing
+  rebuilt imports runs no front end, and an instance whose record stands is not
+  typed again. Changing a generic's body still rebuilds the modules that import it.
+- **Every program of a build links every unit**, test programs included, and a
+  `kind = "static"` library holds the unit objects next to its module objects.
+- `-vv` lists units as `<module>#instances.<bucket>` beside the modules.
 
 ## Comptime value parameters
 

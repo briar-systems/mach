@@ -1,0 +1,380 @@
+# the instance records of a cell: what each instance's typing found when a build last typed it,
+# so a later build reads an instance's demand and reports from its record instead of typing it.
+# the records live at `<out>/.cache/instances`. whether a record stands is decided per load
+# (driver/cache): its key covers the configuration, the instance's symbol and the surfaces of the
+# modules it reads, and its places stand while its declaring module's file places what that
+# module's surface keeps where it did. a store that is missing, truncated or damaged reads as
+# empty. the layout is `"MIR1"`, the record count, the records, then the sha-256 of everything
+# before it. a record is its symbol, its declaring module's name, its 32-byte key, the 32-byte
+# placed digest of its declaring module's file, the count and names of the modules it reads, the
+# count of the instances its body asks for and per instance its symbol and the offset and length
+# of where in the declaring module's source the body asks for it, then the length and bytes of
+# its reports (diagnostic.encode), every number a little-endian u32 and every name its length then
+# its bytes
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.module;
+use mach.lang.output;
+use lang_source: mach.lang.source;
+use mach.lang.wire;
+use A: std.allocator;
+use std.collections.map;
+use std.collections.map.Map;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.crypto.hash.sha256;
+use fs: std.filesystem;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+val MAGIC:   u32   = 0x3152494D;
+val TRAILER: usize = 32;
+# a record's symbol, origin, key, placed digest and its three counts take at least this much
+val RECORD_FIXED: usize = 4 + 1 + 4 + 1 + 32 + 32 + 4 + 4 + 4;
+
+# no record
+pub val NONE: u32 = 0xFFFFFFFF;
+
+# an instance an instance's body asks for: its symbol and where in the body's declaring module's
+# source it is asked for
+pub rec Child {
+    name: intern.StrId;
+    span: lang_source.Span;
+}
+
+# one instance's typing as a build recorded it
+# ---
+# name:       its symbol
+# origin:     the name of the module declaring its generic
+# key:        what its typing read, as driver/cache keys it
+# placed:     the placed digest of the declaring module's file, which says where its places lie
+# reads:      the first of the modules it reads in the store's reads, the declaring module first
+# children:   the first of the instances its body asks for in the store's children, in the order
+#             asked
+# diags:      its reports, a report placed where it is asked for placed nowhere
+# current:    this load keys it as it was recorded, so its demand and reports stand
+# positional: its places stand as well
+# origin_id:  the declaring module in this load, when it is loaded
+# file:       the declaring module's file, where its places lie
+pub rec Record {
+    name:           intern.StrId;
+    origin:         intern.StrId;
+    key:            [32]u8;
+    placed:         [32]u8;
+    reads:          u32;
+    reads_count:    u32;
+    children:       u32;
+    children_count: u32;
+    diags:          *u8;
+    diags_len:      u32;
+    current:        bool;
+    positional:     bool;
+    origin_id:      module.ModuleId;
+    file:           lang_source.FileId;
+}
+
+# records by symbol, the modules each reads by name and as this load numbers them, and what each
+# body asks for
+pub rec Store {
+    alloc:    *A.Allocator;
+    records:  Vector[Record];
+    reads:    Vector[intern.StrId];
+    read_ids: Vector[module.ModuleId];
+    children: Vector[Child];
+    index:    Map[intern.StrId, u32];
+}
+
+pub fun init(a: *A.Allocator) Store {
+    ret Store{
+        alloc:    a, records: collections_vector.init[Record](a), reads: collections_vector.init[intern.StrId](a), read_ids: collections_vector.init[module.ModuleId](a),
+        children: collections_vector.init[Child](a), index: map.init[intern.StrId, u32](a)
+    };
+}
+
+pub fun dnit(st: *Store) {
+    var i: usize = 0;
+    for (i < st.records.len) {
+        val r: *Record = ?st.records.data[i];
+        if (r.diags != nil && r.diags_len != 0) { A.deallocate[u8](st.alloc, r.diags, r.diags_len::usize); }
+        i = i + 1;
+    }
+    collections_vector.dnit[Record](?st.records);
+    collections_vector.dnit[intern.StrId](?st.reads);
+    collections_vector.dnit[module.ModuleId](?st.read_ids);
+    collections_vector.dnit[Child](?st.children);
+    map.dnit[intern.StrId, u32](?st.index);
+}
+
+# the record of the instance `name`, NONE when the store holds none
+pub fun find(st: *Store, name: intern.StrId) u32 {
+    var key:   intern.StrId = name;
+    val found: opt[*u32]    = map.get[intern.StrId, u32](?st.index, ?key);
+    if (sel found.none) { ret NONE; }
+    ret @found.some;
+}
+
+pub fun at(st: *Store, record: u32) *Record {
+    ret ?st.records.data[record::usize];
+}
+
+# the `i`th module the record reads, by name
+pub fun read_name(st: *Store, r: *Record, i: u32) intern.StrId {
+    ret st.reads.data[(r.reads + i)::usize];
+}
+
+# the `i`th module the record reads, as this load numbers it
+pub fun read_id(st: *Store, r: *Record, i: u32) module.ModuleId {
+    ret st.read_ids.data[(r.reads + i)::usize];
+}
+
+pub fun set_read_id(st: *Store, r: *Record, i: u32, mid: module.ModuleId) {
+    st.read_ids.data[(r.reads + i)::usize] = mid;
+}
+
+pub fun child_at(st: *Store, r: *Record, i: u32) *Child {
+    ret ?st.children.data[(r.children + i)::usize];
+}
+
+# a record of the instance `name` added, its reads, children and report bytes copied in. a store
+# holds one record per symbol
+pub fun add(st: *Store, name: intern.StrId, origin: intern.StrId, key: *[32]u8, placed: *[32]u8,
+    reads: *intern.StrId, reads_count: u32, children: *Child, children_count: u32, diags: *u8, diags_len: u32) res[u32, fail.Fail] {
+    if (find(st, name) != NONE) { ret res[u32, fail.Fail].err{fail.message("instance records: a symbol is recorded twice")}; }
+    var r: Record = Record{
+        name: name, origin: origin, key: @key, placed: @placed, reads: st.reads.len::u32, reads_count: reads_count, children: st.children.len::u32, children_count: children_count,
+        file: lang_source.FILE_NIL, origin_id: module.MODULE_NIL
+    };
+    var i: u32 = 0;
+    for (i < reads_count) {
+        val pushed: res[usize, A.Error] = collections_vector.push[intern.StrId](?st.reads, reads[i]);
+        if (sel pushed.err) { ret res[u32, fail.Fail].err{fail.refused(pushed.err)}; }
+        val numbered: res[usize, A.Error] = collections_vector.push[module.ModuleId](?st.read_ids, module.MODULE_NIL);
+        if (sel numbered.err) { ret res[u32, fail.Fail].err{fail.refused(numbered.err)}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < children_count) {
+        val pushed: res[usize, A.Error] = collections_vector.push[Child](?st.children, children[i]);
+        if (sel pushed.err) { ret res[u32, fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    if (diags_len != 0) {
+        val kept: res[*u8, A.Error] = A.allocate[u8](st.alloc, diags_len::usize);
+        if (sel kept.err) { ret res[u32, fail.Fail].err{fail.refused(kept.err)}; }
+        memory.raw_copy(kept.ok::ptr, diags::ptr, diags_len::usize);
+        r.diags     = kept.ok;
+        r.diags_len = diags_len;
+    }
+    val at_r: u32                 = st.records.len::u32;
+    val held: res[usize, A.Error] = collections_vector.push[Record](?st.records, r);
+    if (sel held.err) {
+        if (r.diags != nil) { A.deallocate[u8](st.alloc, r.diags, r.diags_len::usize); }
+        ret res[u32, fail.Fail].err{fail.refused(held.err)};
+    }
+    val indexed: res[bool, A.Error] = map.insert[intern.StrId, u32](?st.index, name, at_r);
+    if (sel indexed.err) { ret res[u32, fail.Fail].err{fail.refused(indexed.err)}; }
+    ret res[u32, fail.Fail].ok{at_r};
+}
+
+# the record `record` of `from` added to `into`
+pub fun copy(into: *Store, from: *Store, record: u32) res[u32, fail.Fail] {
+    val r:     *Record       = at(from, record);
+    var reads: *intern.StrId = nil;
+    if (r.reads_count != 0) { reads = ?from.reads.data[r.reads::usize]; }
+    var children: *Child = nil;
+    if (r.children_count != 0) { children = ?from.children.data[r.children::usize]; }
+    ret add(into, r.name, r.origin, ?r.key, ?r.placed, reads, r.reads_count, children, r.children_count, r.diags, r.diags_len);
+}
+
+# a name as the store writes it
+fun put_name(w: *wire.Sink, itn: *intern.Interner, id: intern.StrId) {
+    val text: opt[str] = intern.get(itn, id);
+    if (sel text.none) {
+        wire.refuse(w, fail.message("instance records: a name is absent from its interner"));
+        ret;
+    }
+    wire.put_sized(w, text.some::*u8, str_len(text.some));
+}
+
+fun put_store(w: *wire.Sink, itn: *intern.Interner, st: *Store) {
+    wire.put_u32(w, MAGIC);
+    wire.put_u32(w, st.records.len::u32);
+    var i: usize = 0;
+    for (i < st.records.len) {
+        val r: *Record = ?st.records.data[i];
+        put_name(w, itn, r.name);
+        put_name(w, itn, r.origin);
+        wire.put_bytes(w, ?r.key[0], 32);
+        wire.put_bytes(w, ?r.placed[0], 32);
+        wire.put_u32(w, r.reads_count);
+        var k: u32 = 0;
+        for (k < r.reads_count) {
+            put_name(w, itn, read_name(st, r, k));
+            k = k + 1;
+        }
+        wire.put_u32(w, r.children_count);
+        k = 0;
+        for (k < r.children_count) {
+            val c: *Child = child_at(st, r, k);
+            if (c.span.offset > 0xFFFFFFFF || c.span.len > 0xFFFFFFFF) {
+                wire.refuse(w, fail.message("instance records: a place lies past the store's reach"));
+                ret;
+            }
+            put_name(w, itn, c.name);
+            wire.put_u32(w, c.span.offset::u32);
+            wire.put_u32(w, c.span.len::u32);
+            k = k + 1;
+        }
+        wire.put_sized(w, r.diags, r.diags_len::usize);
+        i = i + 1;
+    }
+}
+
+# a recorded name, nonempty and free of nul bytes, interned; a malformed one rejects the read
+fun take_name(r: *wire.Source, itn: *intern.Interner, oom: *bool) intern.StrId {
+    var len:   usize = 0;
+    val bytes: *u8   = wire.take_sized(r, ?len);
+    if (bytes == nil || len == 0) {
+        wire.reject(r);
+        ret intern.STR_NIL;
+    }
+    var i: usize = 0;
+    for (i < len) {
+        if (bytes[i] == 0) {
+            wire.reject(r);
+            ret intern.STR_NIL;
+        }
+        i = i + 1;
+    }
+    val id: res[intern.StrId, A.Error] = intern.bytes_add(itn, bytes, len);
+    if (sel id.err) {
+        @oom = true;
+        wire.reject(r);
+        ret intern.STR_NIL;
+    }
+    ret id.ok;
+}
+
+# the store `bytes` hold, empty when they are not a complete store. err only when allocation fails
+pub fun decode(a: *A.Allocator, itn: *intern.Interner, bytes: *u8, len: usize) res[Store, fail.Fail] {
+    var st:     Store = init(a);
+    var handed: bool  = false;
+    fin {
+        if (!handed) { dnit(?st); }
+    }
+    if (bytes == nil || len < 8 + TRAILER) {
+        handed = true;
+        ret res[Store, fail.Fail].ok{st};
+    }
+    var sum: [32]u8;
+    sha256.hash(bytes, len - TRAILER, ?sum[0]);
+    if (!memory.raw_equal((?sum[0])::ptr, (bytes::usize + len - TRAILER)::ptr, 32)) {
+        handed = true;
+        ret res[Store, fail.Fail].ok{st};
+    }
+    var r: wire.Source = wire.source(bytes, len - TRAILER);
+    if (wire.take_u32(?r) != MAGIC) {
+        handed = true;
+        ret res[Store, fail.Fail].ok{st};
+    }
+    val count: u32                  = wire.take_count(?r, RECORD_FIXED);
+    var reads: Vector[intern.StrId] = collections_vector.init[intern.StrId](a);
+    fin { collections_vector.dnit[intern.StrId](?reads); }
+    var children: Vector[Child] = collections_vector.init[Child](a);
+    fin { collections_vector.dnit[Child](?children); }
+    var oom: bool = false;
+    var i:   u32  = 0;
+    for (i < count && !r.bad) {
+        val name:   intern.StrId = take_name(?r, itn, ?oom);
+        val origin: intern.StrId = take_name(?r, itn, ?oom);
+        var key:    [32]u8;
+        var placed: [32]u8;
+        wire.take_into(?r, ?key[0], 32);
+        wire.take_into(?r, ?placed[0], 32);
+        collections_vector.clear[intern.StrId](?reads);
+        collections_vector.clear[Child](?children);
+        val reads_count: u32 = wire.take_count(?r, 5);
+        var k:           u32 = 0;
+        for (k < reads_count && !r.bad) {
+            val pushed: res[usize, A.Error] = collections_vector.push[intern.StrId](?reads, take_name(?r, itn, ?oom));
+            if (sel pushed.err) { ret res[Store, fail.Fail].err{fail.refused(pushed.err)}; }
+            k = k + 1;
+        }
+        val children_count: u32 = wire.take_count(?r, 13);
+        k = 0;
+        for (k < children_count && !r.bad) {
+            val child:  intern.StrId        = take_name(?r, itn, ?oom);
+            val offset: u32                 = wire.take_u32(?r);
+            val span:   u32                 = wire.take_u32(?r);
+            val pushed: res[usize, A.Error] = collections_vector.push[Child](?children, Child{name: child, span: lang_source.Span{offset: offset::usize, len: span::usize}});
+            if (sel pushed.err) { ret res[Store, fail.Fail].err{fail.refused(pushed.err)}; }
+            k = k + 1;
+        }
+        var diags_len: usize = 0;
+        val diags:     *u8   = wire.take_sized(?r, ?diags_len);
+        if (r.bad) { brk; }
+        if (find(?st, name) != NONE) {
+            wire.reject(?r);
+            brk;
+        }
+        val added: res[u32, fail.Fail] = add(?st, name, origin, ?key, ?placed, reads.data, reads.len::u32, children.data, children.len::u32, diags, diags_len::u32);
+        if (sel added.err) { ret res[Store, fail.Fail].err{added.err}; }
+        i = i + 1;
+    }
+    if (oom) { ret res[Store, fail.Fail].err{fail.message("out of memory reading the instance records")}; }
+    if (r.bad || !wire.done(?r)) {
+        dnit(?st);
+        st = init(a);
+    }
+    handed = true;
+    ret res[Store, fail.Fail].ok{st};
+}
+
+# the store at `file`, empty when there is none or it cannot be read
+pub fun load(a: *A.Allocator, itn: *intern.Interner, file: str) res[Store, fail.Fail] {
+    val read: res[Vector[u8], fs.FsError] = fs.read_bytes(a, file);
+    if (sel read.err) { ret res[Store, fail.Fail].ok{init(a)}; }
+    var bytes: Vector[u8] = read.ok;
+    fin { collections_vector.dnit[u8](?bytes); }
+    ret decode(a, itn, bytes.data, bytes.len);
+}
+
+rec StoreWrite {
+    bytes: *u8;
+    len:   usize;
+}
+
+fun write_store(w: *StoreWrite, destination: str) err[fail.Fail] {
+    val written: err[fs.FsError] = fs.write_bytes(destination, w.bytes, w.len, 0o644);
+    if (sel written.err) { ret err[fail.Fail].err{fail.message("the instance records could not be written")}; }
+    ret err[fail.Fail].ok{};
+}
+
+# write the store to `file` through a sibling temporary; the encoding passes through the store's
+# allocator
+pub fun store(st: *Store, itn: *intern.Interner, out_dir: str, file: str) err[fail.Fail] {
+    val reserved: err[fail.Fail] = output.reserve(st.alloc, out_dir, file);
+    if (sel reserved.err) { ret reserved; }
+    var measure: wire.Sink = wire.measure();
+    put_store(?measure, itn, st);
+    val refused: opt[fail.Fail] = wire.failure(?measure);
+    if (sel refused.some) { ret err[fail.Fail].err{refused.some}; }
+    val total:     usize             = measure.len + TRAILER;
+    val allocated: res[*u8, A.Error] = A.allocate[u8](st.alloc, total);
+    if (sel allocated.err) { ret err[fail.Fail].err{fail.refused(allocated.err)}; }
+    val buf: *u8 = allocated.ok;
+    fin { A.deallocate[u8](st.alloc, buf, total); }
+    var w: wire.Sink = wire.fixed(buf, measure.len);
+    put_store(?w, itn, st);
+    sha256.hash(buf, w.len, (buf::usize + w.len)::*u8);
+    var write: StoreWrite = StoreWrite{bytes: buf, len: total};
+    ret output.through_temporary[StoreWrite](st.alloc, file, ?write, write_store);
+}

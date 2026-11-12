@@ -1,5 +1,6 @@
 use std.collections.map;
 use collections_vector: std.collections.vector;
+use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -42,19 +43,24 @@ use mirl.ir.module.Module;
 use mach.lang.driver.backend;
 use backend_compile: mach.lang.driver.backend.compile;
 use mach.lang.driver.cache;
+use cache_instances: mach.lang.driver.cache.instances;
 use mach.lang.driver.claims;
 use mach.lang.driver.codec;
 use mach.lang.driver.context;
 use mach.lang.driver.declared;
+use mach.lang.driver.demand;
 use mach.lang.driver.frontend;
 use mach.lang.driver.project;
 use mach.lang.driver.surface;
 use driver_unit: mach.lang.driver.unit;
 use mach.lang.fail;
+use sema_instance:  mach.lang.fe.sema.instance;
 use sema_interface: mach.lang.fe.sema.interface;
+use sema_module:    mach.lang.fe.sema.module;
 use sema_product:   mach.lang.fe.sema.product;
 use lower_context:  mach.lang.me.lower.context;
 use mach.lang.module;
+use mach.lang.output;
 use lang_phase:  mach.lang.phase;
 use lang_target: mach.lang.target;
 
@@ -68,6 +74,33 @@ pub val LOWERED_SURFACE: query.Kind = query.Kind{
 pub val CODEGEN: query.Kind = query.Kind{
     name:     "codegen", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_CODEGEN, compute: codegen_compute,
     finalize: codegen_finalize, replay: true
+};
+# one instance typed on its own (sema_product.InstanceResult), keyed by the session's id of its
+# symbol, which is its identity: it reads its declaring module's typed definition and the typed
+# surfaces instance_deps names, never a module that asks for it
+pub val INSTANCE_SEMA: query.Kind = query.Kind{
+    name:     "instance sema", role: query.DERIVED, owner: query.KEY_UNOWNED, origin: diagnostic.ORIGIN_SEMA, compute: instance_sema_compute,
+    finalize: instance_sema_finalize
+};
+# every instance the build's modules ask for, closed through what each instance's body asks for,
+# and the instance unit each emitted one falls in (driver/demand): an instance is emitted when the
+# code of a module the build compiles reaches it, and in a test build when its tests do. the
+# reports of every instance it typed are placed and reported here. a demand equal to the last
+# keeps its revision, so a module that starts or stops using an instance another module also
+# uses changes no unit. it reads the cell's records as well (cache.DEMAND_RECORDS)
+pub val INSTANCE_DEMAND: query.Kind = query.Kind{
+    name:     "instance demand", role: query.DERIVED, owner: query.KEY_UNOWNED, origin: diagnostic.ORIGIN_SEMA, compute: instance_demand_compute,
+    finalize: instance_demand_finalize, equal: instance_demand_equal
+};
+# one instance unit's members, keyed by the unit's key: each member's symbol, in the order the
+# unit lowers them. equal bytes keep the revision, so the demand moving elsewhere leaves the
+# unit's object alone
+pub val UNIT_DEMAND: query.Kind = query.Kind{name: "unit demand", role: query.DERIVED, owner: query.KEY_UNIT, origin: diagnostic.ORIGIN_LOWER, compute: unit_demand_compute};
+# an instance unit's object and the facts its lowering kept, keyed by the unit's key: one step
+# lowers its members from their own typing and compiles them, as a module's codegen does
+pub val UNIT_CODEGEN: query.Kind = query.Kind{
+    name:     "unit codegen", role: query.DERIVED, owner: query.KEY_UNIT, origin: diagnostic.ORIGIN_CODEGEN, compute: unit_codegen_compute,
+    finalize: codegen_finalize
 };
 # the build's artifact, written by the link job from the current objects. its product is the
 # artifact's path and the digest of the bytes written, and it reruns only when an input moved
@@ -127,13 +160,23 @@ pub fun run_sema_pass(p: *project.Project) err[fail.Fail] {
             i = i + 1;
             cnt;
         }
-
         val r: err[fail.Fail] = run_sema_one(p, mid);
         if (sel r.err) {
             if (!fail.is_reported(r.err)) { ret err[fail.Fail].err{r.err}; }
             rejected = true;
         }
         i = i + 1;
+    }
+    # every instance the modules ask for is typed once they are all typed, and the instance
+    # records follow what the demand found
+    val demanded: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?INSTANCE_DEMAND, 0);
+    if (sel demanded.err) {
+        if (!fail.is_reported(demanded.err)) { ret err[fail.Fail].err{demanded.err}; }
+        rejected = true;
+    }
+    if (sel demanded.ok) {
+        val stored: err[fail.Fail] = cache.store_records(p, handle_decode(demanded.ok)::*demand.Demand);
+        if (sel stored.err) { ret stored; }
     }
     readout.phase_end(p.progress, readout.SEMA, cache.frontend_count(p), "module", "modules");
     if (rejected) { ret err[fail.Fail].err{fail.reported()}; }
@@ -351,7 +394,7 @@ fun made_for(p: *project.Project, mid: module.ModuleId, normal: *lower_context.N
     val d:     sema_product.Definition                    = definition.ok;
     val req_r: res[lower_context.LowerRequest, fail.Fail] = lower_context.request(s, ?p.linkage, ?p.back.facts, machine.ok, s.backing, d.parsed.a, m.fqn, mid,
         d.sr, d.rr, d.ctx, normal, shared_artifact_build(p), p.req.debug, p.req.opt != request.OPT_RELEASE, diags,
-        sema_interface.Reader{ctx: p::ptr, read: read_interface});
+        sema_interface.Reader{ctx: p::ptr, read: read_interface}, lower_context.InstanceReader{ctx: p::ptr, read: read_instance});
     if (sel req_r.err) { ret res[driver_unit.Made, fail.Fail].err{req_r.err}; }
     var req:      lower_context.LowerRequest = req_r.ok;
     var ir_path:  str                        = "";
@@ -360,7 +403,7 @@ fun made_for(p: *project.Project, mid: module.ModuleId, normal: *lower_context.N
         ir_path  = m.ir_output;
         asm_path = m.asm_output;
     }
-    var job: driver_unit.Job = driver_unit.Job{lower: ?req, back: ?p.back, sources: s.sources, codegen: codegen_of(p), out: s.backing, spans: s.spans, ir_path: ir_path, asm_path: asm_path, name: intern.text(?s.interner, m.fqn),
+    var job: driver_unit.Job = driver_unit.Job{lower: driver_unit.Lowering.module{?req}, back: ?p.back, sources: s.sources, codegen: codegen_of(p), out: s.backing, spans: s.spans, ir_path: ir_path, asm_path: asm_path, name: intern.text(?s.interner, m.fqn),
         timed: p.progress != nil};
     ret driver_unit.make(?job);
 }
@@ -368,6 +411,69 @@ fun made_for(p: *project.Project, mid: module.ModuleId, normal: *lower_context.N
 # how this build's request has mirl compile each module
 fun codegen_of(p: *project.Project) driver_unit.Codegen {
     ret driver_unit.Codegen{level: p.req.opt, checked: p.req.verify, relax: p.req.linker_relax, floats: p.req.floats};
+}
+
+# the typing of the instance `item` describes, which the lowering asking for it then depends on
+fun read_instance(raw: ptr, item: *sema_instance.Instance) res[*sema_product.InstanceResult, fail.Fail] {
+    val p:     *project.Project             = raw::*project.Project;
+    val named: res[intern.StrId, fail.Fail] = demand.register(?p.instances, p.s, item);
+    if (sel named.err) { ret res[*sema_product.InstanceResult, fail.Fail].err{named.err}; }
+    ret instance_typed(p, named.ok);
+}
+
+# the typing of the instance named `name`, which the registry describes
+fun instance_typed(p: *project.Project, name: intern.StrId) res[*sema_product.InstanceResult, fail.Fail] {
+    val got: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?INSTANCE_SEMA, intern.str_index(name)::u64);
+    if (sel got.err) { ret res[*sema_product.InstanceResult, fail.Fail].err{got.err}; }
+    ret res[*sema_product.InstanceResult, fail.Fail].ok{handle_decode(got.ok)::*sema_product.InstanceResult};
+}
+
+fun typer_typed(raw: ptr, name: intern.StrId, item: *sema_instance.Instance) res[*sema_product.InstanceResult, fail.Fail] {
+    ret instance_typed(raw::*project.Project, name);
+}
+
+# the instances a module whose record stood in for its typing asks for, its front end run for it
+fun typer_asked(raw: ptr, mid: module.ModuleId) res[*sema_instance.Set, fail.Fail] {
+    val acquired: res[*sema_product.SemaResult, fail.Fail] = frontend.acquire_sema(raw::*project.Project, mid);
+    if (sel acquired.err) { ret res[*sema_instance.Set, fail.Fail].err{acquired.err}; }
+    ret res[*sema_instance.Set, fail.Fail].ok{?acquired.ok.instances};
+}
+
+# how the build's demand types an instance and has a module typed for it
+fun typer_of(p: *project.Project) demand.Typer {
+    ret demand.Typer{ctx: p::ptr, typed: typer_typed, asked: typer_asked};
+}
+
+fun instance_sema_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
+    val p:     *project.Project             = raw::*project.Project;
+    val about: opt[*sema_instance.Instance] = demand.described(?p.instances, intern.str_id(key::u32));
+    if (sel about.none) { ret res[query.QueryOutput, fail.Fail].err{fail.message("instance sema: the instance has no description")}; }
+    val rt: err[fail.Fail] = query.depend[project.Project](?p.queries, p, ?context.TARGET, 0);
+    if (sel rt.err) { ret res[query.QueryOutput, fail.Fail].err{rt.err}; }
+    val deps_r: res[sema_product.SemaDeps, fail.Fail] = frontend.instance_deps(p, about.some);
+    if (sel deps_r.err) { ret res[query.QueryOutput, fail.Fail].err{deps_r.err}; }
+    var deps:  sema_product.SemaDeps                       = deps_r.ok;
+    val typed: res[sema_product.InstanceResult, fail.Fail] = sema_module.instance_sema(p.s, about.some, ?deps);
+    frontend.free_instance_deps(p, ?deps);
+    if (sel typed.err) { ret res[query.QueryOutput, fail.Fail].err{typed.err}; }
+    val boxed: res[*sema_product.InstanceResult, A.Error] = A.allocate[sema_product.InstanceResult](p.s.alloc, 1);
+    if (sel boxed.err) {
+        var kept: sema_product.InstanceResult = typed.ok;
+        sema_product.instance_dnit(?kept);
+        ret res[query.QueryOutput, fail.Fail].err{fail.refused(boxed.err)};
+    }
+    @boxed.ok = typed.ok;
+    ret handle_encode(alloc, boxed.ok::ptr, instance_release, p.s.alloc);
+}
+
+fun instance_release(raw: ptr, alloc: *A.Allocator) {
+    val r: *sema_product.InstanceResult = raw::*sema_product.InstanceResult;
+    sema_product.instance_dnit(r);
+    A.deallocate[sema_product.InstanceResult](alloc, r, 1);
+}
+
+fun instance_sema_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
+    instance_release(handle_decode(query.QueryView{value: value, value_len: value_len}), alloc);
 }
 
 # the interface the module `mid` published, which is all an importer's lowering reads of it
@@ -458,6 +564,8 @@ fun run_test_object_pass(p: *project.Project) err[fail.Fail] {
 pub fun run_codegen_pass(p: *project.Project) err[fail.Fail] {
     val inputs: err[fail.Fail] = acquire_codegen_inputs(p);
     if (sel inputs.err) { ret inputs; }
+    val units: err[fail.Fail] = run_unit_pass(p);
+    if (sel units.err) { ret units; }
     if (test_build(p)) {
         var t: u32 = 0;
         for (t < p.emit_len) {
@@ -488,6 +596,398 @@ pub fun run_codegen_pass(p: *project.Project) err[fail.Fail] {
         i = i + 1;
     }
     ret err[fail.Fail].ok{};
+}
+
+# the build's instance units, from its instance demand, each unit's object made by its own step
+fun run_unit_pass(p: *project.Project) err[fail.Fail] {
+    val got: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?INSTANCE_DEMAND, 0);
+    if (sel got.err) { ret err[fail.Fail].err{got.err}; }
+    val d: *demand.Demand = handle_decode(got.ok)::*demand.Demand;
+    project.units_clear(p);
+    var i: usize = 0;
+    for (i < d.units.len) {
+        val listed: err[fail.Fail] = unit_add(p, ?d.units.data[i]);
+        if (sel listed.err) { ret listed; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < p.units.len) {
+        val restored: err[fail.Fail] = unit_restore(p, d, ?d.units.data[i], ?p.units.data[i]);
+        if (sel restored.err) { ret restored; }
+        i = i + 1;
+    }
+    # a unit that lowers needs each member's typing, so a member only records name is described
+    i = 0;
+    for (i < p.units.len) {
+        if (!p.units.data[i].hit) {
+            val du: *demand.Unit = ?d.units.data[i];
+            var j:  u32          = 0;
+            for (j < du.count) {
+                val described_r: err[fail.Fail] = demand.describe_named(d, ?p.instances, p.s, typer_of(p), d.members.data[(du.first + j)::usize].name);
+                if (sel described_r.err) { ret described_r; }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < p.units.len) {
+        val u: *project.InstanceUnit           = ?p.units.data[i];
+        val e: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?UNIT_CODEGEN, u.key);
+        if (sel e.err) { ret err[fail.Fail].err{e.err}; }
+        val made: *Product = product_decode(e.ok);
+        if (made == nil) { ret err[fail.Fail].err{fail.message("the unit codegen query produced no result handle")}; }
+        u.object = ?made.object;
+        u.unit   = product_facts(made);
+        val published: err[fail.Fail] = cache.publish_unit(p, u, query.QueryKey{kind: ?UNIT_CODEGEN, key: u.key});
+        if (sel published.err) { ret published; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# key unit u from its members and the modules each names, from a member's description or else
+# from the record that stood in for its typing, then read its object from `obj/` under that key
+fun unit_restore(p: *project.Project, d: *demand.Demand, du: *demand.Unit, u: *project.InstanceUnit) err[fail.Fail] {
+    var k:     cache.UnitKeying                           = cache.unit_begin(p, u.name);
+    var reads: collections_vector.Vector[module.ModuleId] = collections_vector.init[module.ModuleId](p.s.alloc);
+    fin { collections_vector.dnit[module.ModuleId](?reads); }
+    var j: u32 = 0;
+    for (j < du.count) {
+        val member: *demand.Member               = ?d.members.data[(du.first + j)::usize];
+        val about:  opt[*sema_instance.Instance] = demand.described(?p.instances, member.name);
+        collections_vector.clear[module.ModuleId](?reads);
+        if (sel about.some) {
+            val named: err[fail.Fail] = frontend.instance_reads(p, about.some, ?reads);
+            if (sel named.err) { ret named; }
+        }
+        or {
+            val at: u32 = demand.recorded(d, member.name);
+            if (at == cache_instances.NONE) { ret err[fail.Fail].err{fail.message("unit key: a member has neither a description nor a record")}; }
+            val rec: *cache_instances.Record = cache_instances.at(?p.instance_records, at);
+            var r:   u32                     = 0;
+            for (r < rec.reads_count) {
+                val pushed: res[usize, A.Error] = collections_vector.push[module.ModuleId](?reads, cache_instances.read_id(?p.instance_records, rec, r));
+                if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+                r = r + 1;
+            }
+        }
+        cache.unit_member(p, ?k, member.name, reads.data, reads.len);
+        j = j + 1;
+    }
+    val finished: err[fail.Fail] = cache.unit_finish(p, ?k, u);
+    if (sel finished.err) { ret finished; }
+    if (!u.keyed)         { ret err[fail.Fail].ok{}; }
+    val located: res[str, fail.Fail] = unit_output(p, p.object_dir, u.origin, u.bucket, backend.OBJECT_EXT);
+    if (sel located.err) { ret err[fail.Fail].err{located.err}; }
+    val found: res[bool, fail.Fail] = cache.restore_unit(p, u, located.ok);
+    str_free(p.alloc, located.ok);
+    if (sel found.err) { ret err[fail.Fail].err{found.err}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the unit of this build's units whose query key is `key`, nil when none is
+fun unit_held(p: *project.Project, key: u64) *project.InstanceUnit {
+    var i: usize = 0;
+    for (i < p.units.len) {
+        if (p.units.data[i].key == key) { ret ?p.units.data[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# a unit object restored from `obj/` becomes the unit's codegen product with the target and the
+# unit's object key as its edges, so a change to any member or to a module one reads advances it
+fun unit_codegen_restored(p: *project.Project, u: *project.InstanceUnit, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail] {
+    val rt: err[fail.Fail] = query.depend[project.Project](?p.queries, p, ?context.TARGET, 0);
+    if (sel rt.err) { ret res[query.QueryOutput, fail.Fail].err{rt.err}; }
+    val keyed: err[fail.Fail] = query.depend[project.Project](?p.queries, p, ?cache.UNIT_OBJECT_KEY, u.key);
+    if (sel keyed.err) { ret res[query.QueryOutput, fail.Fail].err{keyed.err}; }
+    val staged: *Object = cache.take_staged_unit(u);
+    if (staged == nil) { ret res[query.QueryOutput, fail.Fail].err{fail.message("unit codegen: restored product left the unit")}; }
+    val o: Object = @staged;
+    A.deallocate[Object](p.s.alloc, staged, 1);
+    ret product_encode(alloc, o, opt[lower_context.Unit].none{}, p.s.alloc);
+}
+
+# the unit `du` joins the project's units, named, with the paths its text and listing go to
+fun unit_add(p: *project.Project, du: *demand.Unit) err[fail.Fail] {
+    val named: res[intern.StrId, fail.Fail] = unit_name(p, du.origin, du.bucket);
+    if (sel named.err) { ret err[fail.Fail].err{named.err}; }
+    var u: project.InstanceUnit = project.InstanceUnit{key: du.key, origin: du.origin, bucket: du.bucket, name: named.ok};
+    if (p.req.emit_ir) {
+        val placed: res[str, fail.Fail] = unit_output(p, p.ir_dir, du.origin, du.bucket, "ir");
+        if (sel placed.err) { ret err[fail.Fail].err{placed.err}; }
+        u.ir_output = placed.ok;
+    }
+    if (p.req.emit_asm) {
+        val placed: res[str, fail.Fail] = unit_output(p, p.asm_dir, du.origin, du.bucket, "s");
+        if (sel placed.err) {
+            if (u.ir_output != nil) { str_free(p.alloc, u.ir_output); }
+            ret err[fail.Fail].err{placed.err};
+        }
+        u.asm_output = placed.ok;
+    }
+    val pushed: res[usize, A.Error] = collections_vector.push[project.InstanceUnit](?p.units, u);
+    if (sel pushed.err) {
+        if (u.ir_output != nil)  { str_free(p.alloc, u.ir_output); }
+        if (u.asm_output != nil) { str_free(p.alloc, u.asm_output); }
+        ret err[fail.Fail].err{fail.refused(pushed.err)};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a unit's name, `<origin>#instances.<bucket>`: `#` is in no module path, so it names no module
+fun unit_name(p: *project.Project, origin: module.ModuleId, bucket: u32) res[intern.StrId, fail.Fail] {
+    var buf:    [demand.SUFFIX_CAP]u8;
+    val suffix: str                 = demand.unit_suffix(bucket, ?buf[0]);
+    val joined: res[str, fail.Fail] = diagnostic.join(p.alloc, intern.text(?p.s.interner, module.module_fqn(?p.s.modules, origin)), "#", suffix);
+    if (sel joined.err) { ret res[intern.StrId, fail.Fail].err{joined.err}; }
+    val held: res[intern.StrId, A.Error] = intern.add(?p.s.interner, joined.ok);
+    str_free(p.alloc, joined.ok);
+    if (sel held.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(held.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{held.ok};
+}
+
+# where a unit's file of kind `ext` goes under `base`: beside its origin's, as
+# `<module path>.instances.<bucket>.<ext>`, its directory made. the project owns the path
+pub fun unit_output(p: *project.Project, base: str, origin: module.ModuleId, bucket: u32, ext: str) res[str, fail.Fail] {
+    var buf:    [demand.SUFFIX_CAP]u8;
+    val suffix: res[str, fail.Fail] = diagnostic.join(p.alloc, demand.unit_suffix(bucket, ?buf[0]), ".", ext);
+    if (sel suffix.err) { ret suffix; }
+    fin { str_free(p.alloc, suffix.ok); }
+    val named: res[str, fail.Fail] = output.mirror_fqn(p.alloc, base::*u8, intern.text(?p.s.interner, module.module_fqn(?p.s.modules, origin)), suffix.ok);
+    if (sel named.err) { ret named; }
+    val reserved: err[fail.Fail] = output.reserve(p.alloc, p.out_dir, named.ok);
+    if (sel reserved.err) {
+        str_free(p.alloc, named.ok);
+        ret res[str, fail.Fail].err{reserved.err};
+    }
+    ret named;
+}
+
+# the build's demand: what every module asks for, each typed module's own and an emitted one's
+# reaching what its code reaches, closed through every instance's own typing, the instances'
+# reports placed, then settled into units. a demand any instance of which does not type check is
+# reported, after its reports
+fun instance_demand_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
+    val p:      *project.Project    = raw::*project.Project;
+    var wanted: sema_instance.Reach = sema_instance.REACH_NORMAL;
+    if (test_build(p)) { wanted = wanted | sema_instance.REACH_TESTING; }
+    val boxed: res[*demand.Demand, A.Error] = A.allocate[demand.Demand](p.s.alloc, 1);
+    if (sel boxed.err) { ret res[query.QueryOutput, fail.Fail].err{fail.refused(boxed.err)}; }
+    val d: *demand.Demand = boxed.ok;
+    @d = demand.init(p.s.alloc);
+    var handed: bool = false;
+    fin {
+        if (!handed) { demand_release(d::ptr, p.s.alloc); }
+    }
+    val recorded: err[fail.Fail] = query.depend[project.Project](?p.queries, p, ?cache.DEMAND_RECORDS, 0);
+    if (sel recorded.err) { ret res[query.QueryOutput, fail.Fail].err{recorded.err}; }
+    if (p.cache_ready)    { d.records = ?p.instance_records; }
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: module.ModuleId      = p.topo[i];
+        val m:   *project.ModuleEntry = project.module_at(p, mid::u32);
+        # a skipped module's record says what its code asks for
+        if (m.frontend_skipped) {
+            val listed: err[fail.Fail] = demand.offer_recorded(d, p.s, mid, m.file_id, m.staged_facts.asked, m.staged_facts.asked_count, i < p.emit_len);
+            if (sel listed.err) { ret res[query.QueryOutput, fail.Fail].err{listed.err}; }
+            i = i + 1;
+            cnt;
+        }
+        val typed: res[*sema_product.SemaResult, fail.Fail] = frontend.acquire_sema(p, mid);
+        if (sel typed.err) {
+            if (!fail.is_reported(typed.err)) { ret res[query.QueryOutput, fail.Fail].err{typed.err}; }
+            d.rejected = true;
+            i          = i + 1;
+            cnt;
+        }
+        val offered: err[fail.Fail] = demand.offer_module(d, ?p.instances, p.s, ?typed.ok.instances, i < p.emit_len);
+        if (sel offered.err) { ret res[query.QueryOutput, fail.Fail].err{offered.err}; }
+        i = i + 1;
+    }
+    val closed: err[fail.Fail] = demand.close(d, ?p.instances, p.s, typer_of(p));
+    if (sel closed.err) { ret res[query.QueryOutput, fail.Fail].err{closed.err}; }
+    var sources:  diagnostic.SourceTable = cache.source_table(p);
+    val reported: err[fail.Fail]         = demand.report(d, p.s, ?sources, diags);
+    if (sel reported.err) { ret res[query.QueryOutput, fail.Fail].err{reported.err}; }
+    if (d.rejected)       { ret res[query.QueryOutput, fail.Fail].err{fail.reported()}; }
+    if (p.cache_ready) {
+        val kept: err[fail.Fail] = record_typed(p, d, ?sources);
+        if (sel kept.err) { ret res[query.QueryOutput, fail.Fail].err{kept.err}; }
+    }
+    val settled: err[fail.Fail] = demand.settle(d, p.s, wanted);
+    if (sel settled.err) { ret res[query.QueryOutput, fail.Fail].err{settled.err}; }
+    handed = true;
+    ret handle_encode(alloc, d::ptr, demand_release, p.s.alloc);
+}
+
+# a record of each instance the demand typed, for the cell's instance records: what its typing
+# asked for and reported, under the key of what it read. an instance whose body asks for an
+# instance outside its declaring module's file, or that reads a module this load did not key, is
+# not recorded, and is typed in every build
+fun record_typed(p: *project.Project, d: *demand.Demand, sources: *diagnostic.SourceTable) err[fail.Fail] {
+    var reads: collections_vector.Vector[module.ModuleId] = collections_vector.init[module.ModuleId](p.s.alloc);
+    fin { collections_vector.dnit[module.ModuleId](?reads); }
+    var names: collections_vector.Vector[intern.StrId] = collections_vector.init[intern.StrId](p.s.alloc);
+    fin { collections_vector.dnit[intern.StrId](?names); }
+    var children: collections_vector.Vector[cache_instances.Child] = collections_vector.init[cache_instances.Child](p.s.alloc);
+    fin { collections_vector.dnit[cache_instances.Child](?children); }
+    var j: usize = 0;
+    for (j < d.entries.len) {
+        val e: *demand.Entry = ?d.entries.data[j];
+        j = j + 1;
+        if (e.typed == nil || !sel e.typed.status.kind.accepted || module.is_nil(e.origin)) { cnt; }
+        val about: opt[*sema_instance.Instance] = demand.described(?p.instances, e.name);
+        if (sel about.none) { ret err[fail.Fail].err{fail.message("instance records: a typed instance has no description")}; }
+        val origin: *project.ModuleEntry = project.module_at(p, e.origin::u32);
+        collections_vector.clear[module.ModuleId](?reads);
+        val named: err[fail.Fail] = frontend.instance_reads(p, about.some, ?reads);
+        if (sel named.err) { ret named; }
+        var key:   [32]u8;
+        val keyed: res[bool, fail.Fail] = cache.instance_key(p, e.name, reads.data, reads.len, ?key);
+        if (sel keyed.err) { ret err[fail.Fail].err{keyed.err}; }
+        if (!keyed.ok)     { cnt; }
+        collections_vector.clear[cache_instances.Child](?children);
+        var placeable: bool = true;
+        val n:         u32  = sema_instance.count(?e.typed.set);
+        var k:         u32  = 1;
+        for (placeable && k < n) {
+            val item: *sema_instance.Instance = sema_instance.at(?e.typed.set, k);
+            placeable = item.site_file == origin.file_id;
+            val asked: res[intern.StrId, fail.Fail] = demand.register(?p.instances, p.s, item);
+            if (sel asked.err) { ret err[fail.Fail].err{asked.err}; }
+            val pushed: res[usize, A.Error] = collections_vector.push[cache_instances.Child](?children, cache_instances.Child{name: asked.ok, span: item.site});
+            if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+            k = k + 1;
+        }
+        if (!placeable) { cnt; }
+        collections_vector.clear[intern.StrId](?names);
+        var r: usize = 0;
+        for (r < reads.len) {
+            val pushed: res[usize, A.Error] = collections_vector.push[intern.StrId](?names, project.module_at(p, reads.data[r]::u32).fqn);
+            if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+            r = r + 1;
+        }
+        var w: wire.Sink = wire.grown(p.s.backing);
+        fin { wire.dnit(?w); }
+        if (diagnostic.len(?e.typed.diags) > 0) { diagnostic.encode(?w, ?e.typed.diags, sources); }
+        if (w.failed || w.len > 0xFFFFFFF0)     { ret err[fail.Fail].err{fail.message("instance records: an instance's reports exceed a record")}; }
+        val added: res[u32, fail.Fail] = cache_instances.add(?d.fresh, e.name, origin.fqn, ?key, ?origin.placed_digest, names.data, names.len::u32,
+            children.data, children.len::u32, wire.bytes(?w), w.len::u32);
+        if (sel added.err) { ret err[fail.Fail].err{added.err}; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun demand_release(raw: ptr, alloc: *A.Allocator) {
+    val d: *demand.Demand = raw::*demand.Demand;
+    demand.dnit(d);
+    A.deallocate[demand.Demand](alloc, d, 1);
+}
+
+fun instance_demand_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
+    demand_release(handle_decode(query.QueryView{value: value, value_len: value_len}), alloc);
+}
+
+fun instance_demand_equal(left: *u8, left_len: u32, right: *u8, right_len: u32) bool {
+    val l: *demand.Demand = handle_decode(query.QueryView{value: left, value_len: left_len})::*demand.Demand;
+    val r: *demand.Demand = handle_decode(query.QueryView{value: right, value_len: right_len})::*demand.Demand;
+    ret demand.same(l, r);
+}
+
+# a unit's members as the demand holds them, none once nothing demands the unit
+fun unit_demand_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
+    val p:   *project.Project                = raw::*project.Project;
+    val got: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?INSTANCE_DEMAND, 0);
+    if (sel got.err) { ret res[query.QueryOutput, fail.Fail].err{got.err}; }
+    val d:  *demand.Demand = handle_decode(got.ok)::*demand.Demand;
+    var fb: wire.Sink      = wire.grown(alloc);
+    fin { wire.dnit(?fb); }
+    val found: opt[*demand.Unit] = demand.unit_of(d, key);
+    if (sel found.some) {
+        val u: *demand.Unit = found.some;
+        var i: u32          = 0;
+        for (i < u.count) {
+            wire.put_u32(?fb, intern.str_index(d.members.data[(u.first + i)::usize].name));
+            i = i + 1;
+        }
+    }
+    ret codec.output(?fb);
+}
+
+# the bytes of one member in a unit demand product
+val MEMBER_BYTES: u32 = 4;
+
+# an instance unit's object: its members' own typing, which it then depends on, lowered in symbol
+# order and compiled. it reads no module's typing, so only what its members read reaches it
+fun unit_codegen_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
+    val p:    *project.Project      = raw::*project.Project;
+    val s:    *session.Session      = p.s;
+    val held: *project.InstanceUnit = unit_held(p, key);
+    if (held != nil && held.hit && held.staged != nil) { ret unit_codegen_restored(p, held, alloc); }
+    val got: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?UNIT_DEMAND, key);
+    if (sel got.err) { ret res[query.QueryOutput, fail.Fail].err{got.err}; }
+    val count:   u32                                                     = got.ok.value_len / MEMBER_BYTES;
+    var members: collections_vector.Vector[*sema_product.InstanceResult] = collections_vector.init[*sema_product.InstanceResult](s.alloc);
+    fin { collections_vector.dnit[*sema_product.InstanceResult](?members); }
+    var r: wire.Source = wire.source(got.ok.value, got.ok.value_len::usize);
+    var i: u32         = 0;
+    for (i < count) {
+        val typed: res[*sema_product.InstanceResult, fail.Fail] = instance_typed(p, intern.str_id(wire.take_u32(?r)));
+        if (sel typed.err) { ret res[query.QueryOutput, fail.Fail].err{typed.err}; }
+        val pushed: res[usize, A.Error] = collections_vector.push[*sema_product.InstanceResult](?members, typed.ok);
+        if (sel pushed.err) { ret res[query.QueryOutput, fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    val rt: err[fail.Fail] = query.depend[project.Project](?p.queries, p, ?context.TARGET, 0);
+    if (sel rt.err) { ret res[query.QueryOutput, fail.Fail].err{rt.err}; }
+
+    val stable: module.StableModuleId = demand.key_stable(key);
+    val origin: module.ModuleId       = module.module_id_for_stable(?s.modules, stable);
+    if (module.is_nil(origin)) { ret res[query.QueryOutput, fail.Fail].err{fail.message("unit codegen: the unit's origin is not loaded this build")}; }
+    val named: res[intern.StrId, fail.Fail] = unit_name(p, origin, demand.key_bucket(key));
+    if (sel named.err) { ret res[query.QueryOutput, fail.Fail].err{named.err}; }
+    val machine: res[*lower_context.Machine, fail.Fail] = backend.machine(?p.back);
+    if (sel machine.err) { ret res[query.QueryOutput, fail.Fail].err{machine.err}; }
+    val req_r: res[lower_context.LowerRequest, fail.Fail] = lower_context.unit_request(s, ?p.linkage, ?p.back.facts, machine.ok, s.backing,
+        p.req.debug, p.req.opt != request.OPT_RELEASE, diags, sema_interface.Reader{ctx: p::ptr, read: read_interface}, lower_context.InstanceReader{ctx: p::ptr, read: read_instance});
+    if (sel req_r.err) { ret res[query.QueryOutput, fail.Fail].err{req_r.err}; }
+    var req:      lower_context.LowerRequest = req_r.ok;
+    var ir_path:  str                        = nil;
+    var asm_path: str                        = nil;
+    var k:        usize                      = 0;
+    for (k < p.units.len) {
+        if (p.units.data[k].key == key) {
+            ir_path  = p.units.data[k].ir_output;
+            asm_path = p.units.data[k].asm_output;
+        }
+        k = k + 1;
+    }
+    val name: str             = intern.text(?s.interner, named.ok);
+    var job:  driver_unit.Job = driver_unit.Job{
+        lower: driver_unit.Lowering.unit{driver_unit.UnitLowering{req: ?req, name: named.ok, members: members.data, count: members.len::u32}},
+        back:  ?p.back, sources: s.sources, codegen: codegen_of(p), out: s.backing, spans: s.spans, ir_path: ir_path, asm_path: asm_path, name: name,
+        timed: p.progress != nil
+    };
+    val t_cg: readout.Instant                  = readout.item_begin(p.progress);
+    var made: res[driver_unit.Made, fail.Fail] = driver_unit.make(?job);
+    if (sel made.err) { ret res[query.QueryOutput, fail.Fail].err{rejected(diags, lower_stable_fail(p, made.err))}; }
+    val warned: err[fail.Fail] = warn(p, diags, ?made.ok.compiled);
+    if (sel warned.err) {
+        backend.release_object(?made.ok.compiled.object);
+        lower_context.unit_dnit(?made.ok.facts);
+        ret res[query.QueryOutput, fail.Fail].err{warned.err};
+    }
+    val claimed: err[fail.Fail] = claims.state(p, ?made.ok.compiled.object);
+    if (sel claimed.err) {
+        backend.release_object(?made.ok.compiled.object);
+        lower_context.unit_dnit(?made.ok.facts);
+        ret res[query.QueryOutput, fail.Fail].err{rejected(diags, claimed.err)};
+    }
+    read_out_step(p, false, name, ?made.ok.stats, readout.elapsed(t_cg));
+    ret product_encode(alloc, made.ok.compiled.object, opt[lower_context.Unit].some{made.ok.facts}, p.s.alloc);
 }
 
 # the topological position of the last emitted module whose lowering may read each module's
@@ -845,6 +1345,15 @@ fun link_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, dia
         }
         i = i + 1;
     }
+    # and every instance unit the demand names
+    val rdem: err[fail.Fail] = query.depend[project.Project](?p.queries, p, ?INSTANCE_DEMAND, 0);
+    if (sel rdem.err) { ret res[query.QueryOutput, fail.Fail].err{rdem.err}; }
+    var u: usize = 0;
+    for (u < p.units.len) {
+        val ru: err[fail.Fail] = query.depend[project.Project](?p.queries, p, ?UNIT_CODEGEN, p.units.data[u].key);
+        if (sel ru.err) { ret res[query.QueryOutput, fail.Fail].err{ru.err}; }
+        u = u + 1;
+    }
 
     val linked: err[fail.Fail] = job.run(job.ctx, p, diags);
     if (sel linked.err) { ret res[query.QueryOutput, fail.Fail].err{rejected(diags, linked.err)}; }
@@ -879,10 +1388,7 @@ fun rejected_at(f: fail.Fail) lang_source.Location {
 # key the loaded modules and read `obj/` under their keys (driver/cache),
 # reported as the cache phase carved out of resolve, which it precedes
 pub fun prepare_object_cache(p: *project.Project) err[fail.Fail] {
-    if (!p.req.object_cache) {
-        cache.forget(p);
-        ret err[fail.Fail].ok{};
-    }
+    if (!p.req.object_cache) { ret cache.forget(p); }
     readout.phase_begin(p.progress, readout.CACHE);
     val t_cache:  readout.Instant                   = readout.span_begin(p.progress);
     val captured: res[query.QueryOutput, fail.Fail] = context.capture_configuration_identity(p, p.s.backing);

@@ -287,3 +287,12 @@ pub val SCRATCH_MODULE: u32 = 0xFFFFFFFF
 
 the module index a scratch store of zeros answers to when a node of it is read as a value
 
+## val INSTANCE_MODULE
+
+```mach
+pub val INSTANCE_MODULE: u32 = 0xFFFFFFFE
+```
+
+the module index the store of the instance being typed or lowered answers to: the values its
+body builds belong to the instance, not to any module
+

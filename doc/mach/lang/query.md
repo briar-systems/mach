@@ -19,8 +19,10 @@ pub def KeyOwner: u8
 
 what a kind's keys name, so a session can release every product a module or file left behind.
 a kind keyed by a module carries its stable module id in the key's low 32 bits, whatever the
-higher bits add (a test build), and a kind keyed by a file is keyed by its file id alone. a row
-left at KEY_UNDECLARED is refused on its first use, so a kind cannot leak by omission
+higher bits add (a test build), and a kind keyed by a file is keyed by its file id alone. a kind
+keyed by an instance unit carries the stable id of the unit's origin module in the low 32 bits
+and its bucket above them, and goes with that module; no key of it names a module's own product.
+a row left at KEY_UNDECLARED is refused on its first use, so a kind cannot leak by omission
 
 ## val KEY_UNOWNED
 
@@ -38,6 +40,12 @@ pub val KEY_MODULE:     KeyOwner = 2
 
 ```mach
 pub val KEY_FILE:       KeyOwner = 3
+```
+
+## val KEY_UNIT
+
+```mach
+pub val KEY_UNIT:       KeyOwner = 4
 ```
 
 ## def Revision

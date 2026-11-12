@@ -28,6 +28,14 @@ pub fun test_name(s: *session.Session, fqn: intern.StrId, ident: intern.StrId) r
 a test's qualified name and symbol, `<module path>#<identifier>`: `#` is in no
 identifier or module path, so it names no other symbol
 
+## fun instance_link_name
+
+```mach
+pub fun instance_link_name(s: *session.Session, item: *sema_instance.Instance) res[intern.StrId, fail.Fail];
+```
+
+the symbol the instance `item` is defined and referenced under, a function of its identity alone
+
 ## fun instance_name
 
 ```mach

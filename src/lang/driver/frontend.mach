@@ -46,11 +46,14 @@ use mach.lang.driver.project;
 use comptime_scope: mach.lang.fe.comptime.scope;
 use comptime_value: mach.lang.fe.comptime.value;
 use sema_fields:    mach.lang.fe.sema.fields;
+use sema_instance:  mach.lang.fe.sema.instance;
 use sema_module:    mach.lang.fe.sema.module;
 use sema_product:   mach.lang.fe.sema.product;
 use sema_surface:   mach.lang.fe.sema.surface;
 use lang_phase:     mach.lang.phase;
-use type_field:     mach.lang.type.field;
+use mach.lang.type;
+use type_field: mach.lang.type.field;
+use type_kind:  mach.lang.type.kind;
 
 # a file's parse: the syntax tree and how the parse stood, keyed by the file
 pub val PARSE: query.Kind = query.Kind{
@@ -77,6 +80,13 @@ pub val SEMA: query.Kind = query.Kind{
 pub val TYPED_EXPORTS: query.Kind = query.Kind{
     name:     "typed exports", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_SEMA, compute: typed_exports_compute,
     finalize: surface_finalize, equal: surface_equal
+};
+# the typed surfaces of every module a module imports, transitively, keyed by its stable id: what
+# an instance of the module's templates reads of the modules around it. every instance of the
+# module shares the one list, so each depends on it once rather than on each surface in it
+pub val INSTANCE_SURFACES: query.Kind = query.Kind{
+    name:     "instance surfaces", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_SEMA, compute: instance_surfaces_compute,
+    finalize: instance_surfaces_finalize
 };
 
 # a module's parse in the open operation
@@ -124,19 +134,15 @@ pub fun parsed(p: *project.Project, m: *project.ModuleEntry) opt[ParsedModule] {
     ret opt[ParsedModule].some{@(codec.handle_bytes(view.value, view.value_len, $size_of(ParsedModule))::ptr::*ParsedModule)};
 }
 
-# a module's resolution as this project's operations last published it, nil when none did or its
-# front end was skipped
+# a module's resolution as this project's operations last published it, nil when none did
 pub fun resolved(p: *project.Project, m: *project.ModuleEntry) *resolve.ResolveResult {
-    if (m.frontend_skipped) { ret nil; }
     val shown: opt[query.QueryView] = query.published(?p.s.queries, ?RESOLVE, module.stable_index(m.stable_id)::u64, p.since);
     if (sel shown.none) { ret nil; }
     ret codec.resolve_handle_decode(shown.some);
 }
 
-# a module's types as this project's operations last published them, nil when none did or its
-# front end was skipped
+# a module's types as this project's operations last published them, nil when none did
 pub fun typed(p: *project.Project, m: *project.ModuleEntry) *sema_product.SemaResult {
-    if (m.frontend_skipped) { ret nil; }
     val shown: opt[query.QueryView] = query.published(?p.s.queries, ?SEMA, module.stable_index(m.stable_id)::u64, p.since);
     if (sel shown.none) { ret nil; }
     ret sema_handle_decode(shown.some);
@@ -586,6 +592,9 @@ fun sema_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, dia
     val m:      *project.ModuleEntry                     = project.module_at(p, mid::u32);
     val parsed: res[resolve.ParsedDefinition, fail.Fail] = parsed_definition(p::ptr, mid);
     if (sel parsed.err) { ret res[query.QueryOutput, fail.Fail].err{parsed.err}; }
+    # whatever asked for it, the module's front end runs: the build reads its typing and presents
+    # its own reports from here on, not its record's
+    m.frontend_skipped = false;
     val definition: resolve.ParsedDefinition = parsed.ok;
     if (sel definition.status.kind.internal) { ret res[query.QueryOutput, fail.Fail].err{lang_phase.phase_failure(definition.status)}; }
     val a:      *ast.Ast       = definition.a;
@@ -674,6 +683,12 @@ fun build_sema_deps_query(p: *project.Project, m: *project.ModuleEntry) res[sema
     if (sel closure.err) { ret res[sema_product.SemaDeps, fail.Fail].err{closure.err}; }
     var imports: LowerClosure = closure.ok;
     fin { free_lower_closure(p.s.alloc, ?imports); }
+    ret deps_of_closure(p, deps, ?imports);
+}
+
+# `deps` reading the typed surface of every module `imports` holds
+fun deps_of_closure(p: *project.Project, held: sema_product.SemaDeps, imports: *LowerClosure) res[sema_product.SemaDeps, fail.Fail] {
+    var deps: sema_product.SemaDeps = held;
     if (imports.count == 0) { ret res[sema_product.SemaDeps, fail.Fail].ok{deps}; }
     val allocated: res[**sema_product.ModuleSema, A.Error] = A.allocate[*sema_product.ModuleSema](p.s.alloc, imports.count::usize);
     if (sel allocated.err) { ret res[sema_product.SemaDeps, fail.Fail].err{fail.refused(allocated.err)}; }
@@ -1018,6 +1033,181 @@ fun collect_lower_closure(p: *project.Project, m: *project.ModuleEntry) res[Lowe
     ret res[LowerClosure, fail.Fail].ok{cl};
 }
 
+# what typing the instance `item` reads besides its declaring module's definition: the typed
+# surfaces of every module the declaring module imports, and of every module declaring a type
+# its arguments or pack name with what each of those imports, transitively, each field graph
+# installed. reading them is what makes the instance's typing depend on them
+pub fun instance_deps(p: *project.Project, item: *sema_instance.Instance) res[sema_product.SemaDeps, fail.Fail] {
+    if (module.is_nil(item.origin) || item.origin::u32 >= project.module_count(p)) {
+        ret res[sema_product.SemaDeps, fail.Fail].err{fail.message("instance typing: the declaring module is not loaded")};
+    }
+    var owners: collections_vector.Vector[module.ModuleId] = collections_vector.init[module.ModuleId](p.s.alloc);
+    fin { collections_vector.dnit[module.ModuleId](?owners); }
+    val named: err[fail.Fail] = instance_reads(p, item, ?owners);
+    if (sel named.err) { ret res[sema_product.SemaDeps, fail.Fail].err{named.err}; }
+    var read: collections_vector.Vector[*sema_product.ModuleSema] = collections_vector.init[*sema_product.ModuleSema](p.s.alloc);
+    fin { collections_vector.dnit[*sema_product.ModuleSema](?read); }
+    val around: err[fail.Fail] = surfaces_into(p, item.origin, ?read);
+    if (sel around.err) { ret res[sema_product.SemaDeps, fail.Fail].err{around.err}; }
+    var k: usize = 1;
+    for (k < owners.len) {
+        var seen: bool  = false;
+        var j:    usize = 0;
+        for (j < k) {
+            if (owners.data[j]::u32 == owners.data[k]::u32) { seen = true; }
+            j = j + 1;
+        }
+        if (!seen) {
+            val own: res[*sema_product.ModuleSema, fail.Fail] = typed_surface_of(p, owners.data[k]);
+            if (sel own.err) { ret res[sema_product.SemaDeps, fail.Fail].err{own.err}; }
+            val pushed: res[usize, A.Error] = collections_vector.push[*sema_product.ModuleSema](?read, own.ok);
+            if (sel pushed.err) { ret res[sema_product.SemaDeps, fail.Fail].err{fail.refused(pushed.err)}; }
+            val beyond: err[fail.Fail] = surfaces_into(p, owners.data[k], ?read);
+            if (sel beyond.err) { ret res[sema_product.SemaDeps, fail.Fail].err{beyond.err}; }
+        }
+        k = k + 1;
+    }
+    var deps: sema_product.SemaDeps = sema_product.SemaDeps{};
+    deps.definitions = sema_product.reader_init(p::ptr, read_definition, p.s.alloc);
+    if (read.len == 0) { ret res[sema_product.SemaDeps, fail.Fail].ok{deps}; }
+    val allocated: res[**sema_product.ModuleSema, A.Error] = A.allocate[*sema_product.ModuleSema](p.s.alloc, read.len);
+    if (sel allocated.err) {
+        sema_product.reader_dnit(?deps.definitions);
+        ret res[sema_product.SemaDeps, fail.Fail].err{fail.refused(allocated.err)};
+    }
+    deps.entries = allocated.ok;
+    deps.count   = read.len::u32;
+    k            = 0;
+    for (k < read.len) {
+        deps.entries[k] = read.data[k];
+        k               = k + 1;
+    }
+    ret res[sema_product.SemaDeps, fail.Fail].ok{deps};
+}
+
+# the modules the instance `item` names: its declaring module first, then every module declaring
+# a type its arguments or pack name
+pub fun instance_reads(p: *project.Project, item: *sema_instance.Instance, out: *collections_vector.Vector[module.ModuleId]) err[fail.Fail] {
+    val pushed: res[usize, A.Error] = collections_vector.push[module.ModuleId](out, item.origin);
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    var i: u32 = 0;
+    for (i < item.arg_len) {
+        val named: err[fail.Fail] = type_owners(p, item.args[i], out, 0);
+        if (sel named.err) { ret named; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < item.pack_len) {
+        val named: err[fail.Fail] = type_owners(p, item.pack[i], out, 0);
+        if (sel named.err) { ret named; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# release what instance_deps made
+pub fun free_instance_deps(p: *project.Project, deps: *sema_product.SemaDeps) {
+    free_sema_deps_query(p.s.alloc, deps);
+}
+
+# the surfaces around module `mid`, its INSTANCE_SURFACES, pushed onto `out`, each graph installed
+fun surfaces_into(p: *project.Project, mid: module.ModuleId, out: *collections_vector.Vector[*sema_product.ModuleSema]) err[fail.Fail] {
+    val m:   *project.ModuleEntry            = project.module_at(p, mid::u32);
+    val got: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?INSTANCE_SURFACES, module.stable_index(m.stable_id)::u64);
+    if (sel got.err) { ret err[fail.Fail].err{got.err}; }
+    val held: *Surfaces = (codec.handle_bytes(got.ok.value, got.ok.value_len, $size_of(ptr))::ptr::*ptr)[0]::*Surfaces;
+    var i:    u32       = 0;
+    for (i < held.count) {
+        val installed: err[fail.Fail] = sema_fields.install(p.s, ?held.entries[i].graph);
+        if (sel installed.err) { ret installed; }
+        val pushed: res[usize, A.Error] = collections_vector.push[*sema_product.ModuleSema](out, held.entries[i]);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the typed surfaces INSTANCE_SURFACES holds, borrowed from their own products, which it depends on
+rec Surfaces {
+    entries: **sema_product.ModuleSema;
+    count:   u32;
+}
+
+fun instance_surfaces_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
+    val p:   *project.Project = raw::*project.Project;
+    val mid: module.ModuleId  = module.module_id_for_stable(?p.s.modules, key::u32::module.StableModuleId);
+    if (module.is_nil(mid)) { ret res[query.QueryOutput, fail.Fail].err{fail.message("instance surfaces: the stable id is not loaded this build")}; }
+    val made: res[sema_product.SemaDeps, fail.Fail] = build_sema_deps_query(p, project.module_at(p, mid::u32));
+    if (sel made.err) { ret res[query.QueryOutput, fail.Fail].err{made.err}; }
+    var deps:    sema_product.SemaDeps     = made.ok;
+    val entries: **sema_product.ModuleSema = deps.entries;
+    val count:   u32                       = deps.count;
+    deps.entries = nil;
+    deps.count   = 0;
+    free_sema_deps_query(p.s.alloc, ?deps);
+    val boxed: res[*Surfaces, A.Error] = A.allocate[Surfaces](p.s.alloc, 1);
+    if (sel boxed.err) {
+        if (entries != nil) { A.deallocate[*sema_product.ModuleSema](p.s.alloc, entries, count::usize); }
+        ret res[query.QueryOutput, fail.Fail].err{fail.refused(boxed.err)};
+    }
+    @boxed.ok = Surfaces{entries: entries, count: count};
+    val out: res[query.QueryOutput, fail.Fail] = pointer_output(alloc, boxed.ok::ptr);
+    if (sel out.err) { surfaces_release(boxed.ok, p.s.alloc); }
+    ret out;
+}
+
+fun surfaces_release(held: *Surfaces, alloc: *A.Allocator) {
+    if (held.entries != nil) { A.deallocate[*sema_product.ModuleSema](alloc, held.entries, held.count::usize); }
+    A.deallocate[Surfaces](alloc, held, 1);
+}
+
+fun instance_surfaces_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
+    surfaces_release((codec.handle_bytes(value, value_len, $size_of(ptr))::ptr::*ptr)[0]::*Surfaces, alloc);
+}
+
+# the modules declaring a nominal type `ty` names, through pointers, arrays, signatures and the
+# arguments of other instances, each pushed onto `out`
+fun type_owners(p: *project.Project, ty: type_kind.TypeId, out: *collections_vector.Vector[module.ModuleId], depth: u32) err[fail.Fail] {
+    if (depth > 64 || type_kind.is_nil(ty) || type_kind.is_error(ty)) { ret err[fail.Fail].ok{}; }
+    val found: opt[*type.Type] = type.get(?p.s.types, ty);
+    if (sel found.none) { ret err[fail.Fail].ok{}; }
+    val t: *type.Type = found.some;
+    if (t.kind == type_kind.TYPE_REC || t.kind == type_kind.TYPE_UNI || t.kind == type_kind.TYPE_TAG) {
+        val mid: module.ModuleId = module.module_id_for_stable(?p.s.modules, t.data.nominal.owner.module);
+        if (module.is_nil(mid)) { ret err[fail.Fail].ok{}; }
+        val pushed: res[usize, A.Error] = collections_vector.push[module.ModuleId](out, mid);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        ret err[fail.Fail].ok{};
+    }
+    if (t.kind == type_kind.TYPE_POINTER) { ret type_owners(p, t.data.pointer.base, out, depth + 1); }
+    if (t.kind == type_kind.TYPE_SECRET)  { ret type_owners(p, t.data.secret.base, out, depth + 1); }
+    if (t.kind == type_kind.TYPE_ARRAY)   { ret type_owners(p, t.data.array.base, out, depth + 1); }
+    if (t.kind == type_kind.TYPE_FUN) {
+        val r: err[fail.Fail] = type_owners(p, t.data.fn.ret_type, out, depth + 1);
+        if (sel r.err) { ret r; }
+        ret pool_owners(p, t.data.fn.params_start, t.data.fn.params_len, out, depth);
+    }
+    if (t.kind == type_kind.TYPE_INSTANCE) {
+        val r: err[fail.Fail] = type_owners(p, t.data.instance.nominal, out, depth + 1);
+        if (sel r.err) { ret r; }
+        ret pool_owners(p, t.data.instance.args_start, t.data.instance.args_len, out, depth);
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun pool_owners(p: *project.Project, start: u32, len: u32, out: *collections_vector.Vector[module.ModuleId], depth: u32) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < len) {
+        val param: opt[type_kind.TypeId] = type.get_param(?p.s.types, start + i);
+        if (sel param.some) {
+            val r: err[fail.Fail] = type_owners(p, param.some, out, depth + 1);
+            if (sel r.err) { ret r; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
 # release a lowering closure; an empty one owns no list
 fun free_lower_closure(alloc: *A.Allocator, cl: *LowerClosure) {
     if (cl.list == nil || cl.cap == 0) { ret; }
@@ -1076,11 +1266,28 @@ pub fun refresh_diagnostics(p: *project.Project) err[fail.Fail] {
         copied = diagnostic.replay_into(?staged, ?p.s.queries.presentation.diags);
     }
     if (sel copied.err) { ret err[fail.Fail].err{copied.err}; }
+    val recorded: err[fail.Fail] = replay_recorded(p, ?staged);
+    if (sel recorded.err) { ret recorded; }
     diagnostic.report_unfulfilled(?staged);
     diagnostic.set_origin(?staged, p.s.diags.origin);
     diagnostic.store_dnit(?p.s.diags);
     p.s.diags = staged;
     handed    = true;
+    ret err[fail.Fail].ok{};
+}
+
+# the front end's warnings of every module whose front end the build skipped, from its record: a
+# module typed after all is no longer skipped, and reports its own
+fun replay_recorded(p: *project.Project, into: *diagnostic.DiagnosticStore) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < project.module_count(p)) {
+        val m: *project.ModuleEntry = project.module_at(p, i);
+        if (m.frontend_skipped && m.recorded_held) {
+            val replayed: err[fail.Fail] = diagnostic.replay_into(into, ?m.recorded);
+            if (sel replayed.err) { ret replayed; }
+        }
+        i = i + 1;
+    }
     ret err[fail.Fail].ok{};
 }
 

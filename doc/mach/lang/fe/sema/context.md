@@ -31,8 +31,8 @@ phase: sema_product.DefinitionPhase) res[sema_product.DefinedSymbol, fail.Fail];
 pub rec InstWorklist;
 ```
 
-the instances a module's typing asks for, typed in the order they were first asked for;
-the set is the module's product, published with its result
+the instances a typing asks for, in the order they were first asked for: a module's, published
+with its result, or an instance's, its own set headed by the instance
 
 ## val TYPE_MEMO_NONE
 
@@ -337,6 +337,14 @@ signature and site; the rest is the set's
 ```mach
 pub fun inst_worklist_new(alloc: *A.Allocator) res[*InstWorklist, fail.Fail];
 ```
+
+## fun inst_worklist_take
+
+```mach
+pub fun inst_worklist_take(wl: *InstWorklist, into: *sema_instance.Set);
+```
+
+the set a worklist collected, handed to `into`, and the worklist released
 
 ## fun inst_worklist_dnit
 

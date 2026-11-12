@@ -467,6 +467,25 @@ an owned copy of `src` from `a`, every diagnostic and its lost count kept, relea
 pub fun replay_into(dst: *DiagnosticStore, src: *DiagnosticStore) err[fail.Fail];
 ```
 
+## fun replay_located
+
+```mach
+pub fun replay_located(dst: *DiagnosticStore, src: *DiagnosticStore) err[fail.Fail];
+```
+
+replay into `dst` only the diagnostics of `src` placed somewhere, with its lost count: what a
+report placed nowhere waits for a requester to place does not come along
+
+## fun replay_unplaced
+
+```mach
+pub fun replay_unplaced(dst: *DiagnosticStore, src: *DiagnosticStore, at: lang_source.Location) err[fail.Fail];
+```
+
+replay into `dst` only the diagnostics of `src` placed nowhere (their file lang_source.FILE_NIL),
+each reported at `at`. the lost count comes along with replay_located, so a store replayed at
+several places counts what it lost once
+
 ## rec SourceTable
 
 ```mach

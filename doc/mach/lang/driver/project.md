@@ -135,6 +135,20 @@ a module's test object, beside its normal object and never changing it: the
 module's tests and what they reach that the normal object does not define. the
 fields mirror the normal object's on ModuleEntry
 
+## rec InstanceUnit
+
+```mach
+pub rec InstanceUnit;
+```
+
+an instance unit the build compiles (driver/demand): its key, its origin and bucket, its name,
+where its step writes its text and listing, and its object and facts as its codegen product
+holds them, borrowed like a module's
+
+name: `<origin>#instances.<bucket>`, which reports and readout rows name it by
+ir_output: where its step writes mirl's text of it, nil for nowhere; owned by the project
+asm_output: where its step writes masc's listing of it, nil for nowhere; owned by the project
+
 ## rec Project
 
 ```mach
@@ -201,6 +215,23 @@ a restored product stays staged across operations: it is keyed by the key
 it was read under and the next load discards it if that changed. a freshly
 generated image staged by a codegen worker belongs to the operation that
 generated it and leaves with it
+
+## fun units_clear
+
+```mach
+pub fun units_clear(p: *Project);
+```
+
+forget the instance units, giving back the paths, staged objects and records the project owns
+of them; their objects are their codegen products'
+
+## fun recorded_drop
+
+```mach
+pub fun recorded_drop(m: *ModuleEntry);
+```
+
+give back the front end's warnings a module's record held
 
 ## fun lower_scope_drop
 

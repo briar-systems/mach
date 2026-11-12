@@ -26,6 +26,29 @@ give back what only the module's own lowering reads of a semantic result, once i
 its typing, its bound constants, its instances and its growth. the interface every importer's
 lowering reads, the field graph and the status stay
 
+## rec InstanceResult
+
+```mach
+pub rec InstanceResult;
+```
+
+one instance typed on its own, which every user of it reads
+
+status: whether its body type checks
+set: the instance at its head (id 0), its typing in the head's frames, and after it every
+        instance its body asks for, with where each is asked
+values: the constants its body builds, which answer to comptime_deep.INSTANCE_MODULE
+diags: what typing it reported; a report the instance raises where it is asked for is placed
+        nowhere (lang_source.FILE_NIL), for the build's demand to place at the site it chose
+
+## fun instance_dnit
+
+```mach
+pub fun instance_dnit(r: *InstanceResult);
+```
+
+release a typed instance; a nil one holds nothing
+
 ## val INFERRED_LEN_NONE
 
 ```mach
@@ -154,6 +177,15 @@ pub rec DefinedSymbol;
 pub fun acquire_definition(reader: *DefinitionReader, origin: lang_module.ModuleId,
 phase: DefinitionPhase) res[Definition, fail.Fail];
 ```
+
+## fun acquire_template
+
+```mach
+pub fun acquire_template(reader: *DefinitionReader, origin: lang_module.ModuleId) res[Definition, fail.Fail];
+```
+
+the typed definition of a generic's declaring module, as far as its typing got: an instance is
+checked against its declaration even where another declaration of the module was refused
 
 ## fun acquire_symbol
 

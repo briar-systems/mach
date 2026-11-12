@@ -17,6 +17,48 @@ pub val CODEGEN: query.Kind = query.Kind;
 a module's object, mink's, and the facts its lowering kept, keyed by its back-half key. one
 step lowers and compiles the module, so no mirl module outlives its own codegen
 
+## val INSTANCE_SEMA
+
+```mach
+pub val INSTANCE_SEMA: query.Kind = query.Kind;
+```
+
+one instance typed on its own (sema_product.InstanceResult), keyed by the session's id of its
+symbol, which is its identity: it reads its declaring module's typed definition and the typed
+surfaces instance_deps names, never a module that asks for it
+
+## val INSTANCE_DEMAND
+
+```mach
+pub val INSTANCE_DEMAND: query.Kind = query.Kind;
+```
+
+every instance the build's modules ask for, closed through what each instance's body asks for,
+and the instance unit each emitted one falls in (driver/demand): an instance is emitted when the
+code of a module the build compiles reaches it, and in a test build when its tests do. the
+reports of every instance it typed are placed and reported here. a demand equal to the last
+keeps its revision, so a module that starts or stops using an instance another module also
+uses changes no unit. it reads the cell's records as well (cache.DEMAND_RECORDS)
+
+## val UNIT_DEMAND
+
+```mach
+pub val UNIT_DEMAND: query.Kind = query.Kind;
+```
+
+one instance unit's members, keyed by the unit's key: each member's symbol, in the order the
+unit lowers them. equal bytes keep the revision, so the demand moving elsewhere leaves the
+unit's object alone
+
+## val UNIT_CODEGEN
+
+```mach
+pub val UNIT_CODEGEN: query.Kind = query.Kind;
+```
+
+an instance unit's object and the facts its lowering kept, keyed by the unit's key: one step
+lowers its members from their own typing and compiles them, as a module's codegen does
+
 ## val LINK
 
 ```mach
@@ -153,6 +195,15 @@ pub fun run_codegen_pass(p: *project.Project) err[fail.Fail];
 each module in topological order, its front-end products given back once nothing after reads
 them: an importer's lowering reads the definitions of every module it reaches, so a module is
 held until the last module reaching it is lowered, and a test build lowers every module again
+
+## fun unit_output
+
+```mach
+pub fun unit_output(p: *project.Project, base: str, origin: module.ModuleId, bucket: u32, ext: str) res[str, fail.Fail];
+```
+
+where a unit's file of kind `ext` goes under `base`: beside its origin's, as
+`<module path>.instances.<bucket>.<ext>`, its directory made. the project owns the path
 
 ## fun test_codegen_reusable
 

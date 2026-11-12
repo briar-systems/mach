@@ -36,12 +36,12 @@ subsystem, as mink's host of it names; an image of another host carries none
 ## fun emit_static_archive
 
 ```mach
-pub fun emit_static_archive(p: *project.Project, destination: str, objects: **Object, inputs: *contract.Input, out_path: **u8) err[fail.Fail];
+pub fun emit_static_archive(p: *project.Project, destination: str, inputs: *contract.Input, out_path: **u8) err[fail.Fail];
 ```
 
-the archive of the emitted modules' objects, read back from `inputs`, as mink's
-archive writer lays one out in the variant its registry states for the target's
-format, its index naming each member's exported symbols
+the archive of the build's objects, the emitted modules' and then the instance units', read
+back from `inputs` in that order, as mink's archive writer lays one out in the variant its
+registry states for the target's format, its index naming each member's exported symbols
 
 ## fun link_image
 
@@ -55,19 +55,36 @@ then the `link_count` inputs at `links`, written to `destination` with the resou
 `image` declares, laid out as the artifact and its placed globals state, what the link tells of
 itself reported to `diags`
 
+## fun object_count
+
+```mach
+pub fun object_count(p: *project.Project) u32;
+```
+
+the objects every program of the build links: each emitted module's, then each instance unit's
+
 ## fun ordered_inputs
 
 ```mach
 pub fun ordered_inputs(p: *project.Project) res[*Given, fail.Fail];
 ```
 
-the emitted modules' objects as the link's inputs, in topological order, the link's order
+the build's objects as the link's inputs, in the link's order: the emitted modules' in
+topological order, then the instance units' in theirs, by origin name and bucket
 
 ## fun release_ordered
 
 ```mach
 pub fun release_ordered(p: *project.Project, inputs: *Given);
 ```
+
+## fun objects_into
+
+```mach
+pub fun objects_into(p: *project.Project, into: *Given) err[fail.Fail];
+```
+
+the build's objects in the link's order into `into`, which holds object_count of them
 
 ## fun input_name
 
@@ -84,20 +101,6 @@ pub fun test_input_name(p: *project.Project, m: *project.ModuleEntry) res[str, f
 ```
 
 the name module m's test object goes to the link under, set apart from its object's
-
-## fun indexed_objects
-
-```mach
-pub fun indexed_objects(p: *project.Project) res[**Object, fail.Fail];
-```
-
-every emitted module's object at its module index, for a reader that walks modules by id
-
-## fun release_indexed
-
-```mach
-pub fun release_indexed(p: *project.Project, objects: **Object);
-```
 
 ## fun external_inputs
 
@@ -129,7 +132,8 @@ pub fun write_objects(p: *project.Project, destinations: *str, inputs_out: **con
 ```
 
 every module's object reaches `obj/` through a sibling temporary, carrying its cache record,
-since the object cache reads it back; a module the cache restored is already there
+since the object cache reads it back; a module the cache restored is already there. each
+instance unit's follows, beside its origin's, as `<module path>.instances.<bucket>`, the same way
 
 ## fun write_test_objects
 

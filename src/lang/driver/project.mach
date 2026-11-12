@@ -15,7 +15,9 @@ use A: std.allocator;
 use mach.lang.diagnostic;
 use mach.lang.driver.backend;
 use mach.lang.driver.cache.compiler;
-use cache_record: mach.lang.driver.cache.record;
+use cache_instances: mach.lang.driver.cache.instances;
+use cache_record:    mach.lang.driver.cache.record;
+use mach.lang.driver.demand;
 use mach.lang.driver.request;
 use mach.lang.fail;
 use comptime_scope: mach.lang.fe.comptime.scope;
@@ -214,9 +216,18 @@ pub rec ModuleEntry {
     cache_key:     [32]u8;
     cache_keyed:   bool;
     source_digest: [32]u8;
-    # the module's object is reused and nothing the build still compiles
-    # imports it, so it is not resolved, typed or lowered
+    # the digest of the module's surface for its importers, beside cache_key: what an instance
+    # unit's key reads of the module. placed_digest is the digest of where the module's file puts
+    # what that surface keeps, which says whether places recorded in the file still stand
+    surface_digest: [32]u8;
+    placed_digest:  [32]u8;
+    # the module's object is reused, its record stands for its whole source, and nothing the
+    # build compiles imports it, so the build does not ask for its front end: its record stands
+    # in for its demand and its front end's warnings, which `recorded` holds. something that must
+    # be rebuilt from its typed form can still have it typed
     frontend_skipped: bool;
+    recorded:         diagnostic.DiagnosticStore;
+    recorded_held:    bool;
     stable_id:        module.StableModuleId;
     # what the load decided for the module and the imports it records
     load: fe_load.Module;
@@ -259,6 +270,32 @@ pub rec TestObject {
     cache_under:   [32]u8;
 }
 
+# an instance unit the build compiles (driver/demand): its key, its origin and bucket, its name,
+# where its step writes its text and listing, and its object and facts as its codegen product
+# holds them, borrowed like a module's
+# ---
+# name:       `<origin>#instances.<bucket>`, which reports and readout rows name it by
+# ir_output:  where its step writes mirl's text of it, nil for nowhere; owned by the project
+# asm_output: where its step writes masc's listing of it, nil for nowhere; owned by the project
+pub rec InstanceUnit {
+    key:        u64;
+    origin:     module.ModuleId;
+    bucket:     u32;
+    name:       intern.StrId;
+    ir_output:  str;
+    asm_output: str;
+    unit:       *lower_context.Unit;
+    object:     *Object;
+    # the key this load built for the unit's object, when every module its members read is
+    # keyed, and the object `obj/` held under it, staged for the unit's codegen product
+    object_key:   [32]u8;
+    keyed:        bool;
+    hit:          bool;
+    staged:       *Object;
+    staged_facts: cache_record.Facts;
+    record:       Record;
+}
+
 # ---
 # since:          the first query operation this project ran; a product read between its
 #                 operations counts only when one of them reached it
@@ -288,7 +325,9 @@ pub rec Project {
     compiler_ver:  intern.StrId;
     step_digest:   [32]u8;
     # the modules are keyed and `obj/` is read under those keys, until the next load
-    cache_ready:                   bool;
+    cache_ready: bool;
+    # the configuration digest every key this load built shares
+    cache_config:                  [32]u8;
     compiler_identity:             compiler.Identity;
     compiler_identity_initialized: bool;
     compiler_identity_available:   bool;
@@ -319,6 +358,17 @@ pub rec Project {
     lower_visit_epoch: u32;
 
     emit_len: u32;
+    # the instance units the build compiles, ordered by origin name and bucket, the link's order
+    # after the modules; set by each codegen operation from the build's instance demand
+    units: collections_vector.Vector[InstanceUnit];
+    # every instance the build's demand met, described for its typing
+    instances: demand.Registry;
+    # the cell's instance records as this load read and judged them (driver/cache)
+    instance_records: cache_instances.Store;
+    # the cell's ir and asm directories, borrowed from its plan, where an instance unit's text
+    # and listing go when the build emits them
+    ir_dir:  str;
+    asm_dir: str;
 
     roots: RootSet;
 
@@ -422,6 +472,31 @@ pub fun release_fresh_staged(p: *Project) {
     }
 }
 
+# forget the instance units, giving back the paths, staged objects and records the project owns
+# of them; their objects are their codegen products'
+pub fun units_clear(p: *Project) {
+    var i: usize = 0;
+    for (i < p.units.len) {
+        val u: *InstanceUnit = ?p.units.data[i];
+        if (u.ir_output != nil)  { str_free(p.alloc, u.ir_output); }
+        if (u.asm_output != nil) { str_free(p.alloc, u.asm_output); }
+        if (u.staged != nil) {
+            backend.release_object(u.staged);
+            A.deallocate[Object](p.s.alloc, u.staged, 1);
+        }
+        cache_record.facts_dnit(p.s.alloc, ?u.staged_facts);
+        record_release(p, ?u.record);
+        i = i + 1;
+    }
+    collections_vector.truncate[InstanceUnit](?p.units, 0);
+}
+
+# give back the front end's warnings a module's record held
+pub fun recorded_drop(m: *ModuleEntry) {
+    if (m.recorded_held) { diagnostic.store_dnit(?m.recorded); }
+    m.recorded_held = false;
+}
+
 # release the scope lowering bound a module's constants in
 pub fun lower_scope_drop(m: *ModuleEntry) {
     if (m.lower_scoped) { comptime_scope.dnit(?m.lower_scope); }
@@ -439,11 +514,16 @@ pub fun dnit_project(p: *Project) {
         lower_scope_drop(m);
         record_release(p, ?m.record);
         record_release(p, ?m.test.record);
+        recorded_drop(m);
         expect.index_dnit(?m.expects);
         if (m.released) { collections_vector.dnit[diagnostic.Expectation](?m.held_expects); }
         fe_load.module_dnit(p.alloc, ?m.load);
         i = i + 1;
     }
+    units_clear(p);
+    collections_vector.dnit[InstanceUnit](?p.units);
+    demand.registry_dnit(?p.instances);
+    cache_instances.dnit(?p.instance_records);
     handle.chunk_dnit[ModuleEntry](?p.modules);
     if (p.topo != nil && p.topo_cap > 0) {
         A.deallocate[module.ModuleId](p.alloc, p.topo, p.topo_cap::usize);
@@ -511,6 +591,11 @@ pub fun init_project(p: *Project, s: *session.Session) {
     p.object_dir                    = nil;
     p.cache_dir                     = nil;
     p.out_dir                       = nil;
+    p.ir_dir                        = nil;
+    p.asm_dir                       = nil;
+    p.units                         = collections_vector.init[InstanceUnit](p.alloc);
+    p.instances                     = demand.registry_init(p.alloc);
+    p.instance_records              = cache_instances.init(p.alloc);
     p.config.id                     = intern.STR_NIL;
     p.config.version                = intern.STR_NIL;
     p.config.bin_name               = intern.STR_NIL;

@@ -136,8 +136,26 @@ origin: the module that declares the function
 decl: its declaration there
 name: the copy's linkage name, the function's own with the classes it takes
 sig: the copy's signature
-instance: the instance of the module's set the copy is of, sema_instance.NONE for a
-          plain function
+instance: the instance of `set` the copy is of, sema_instance.NONE for a plain function
+set: the instance set whose frames the code asking for the copy was read through
+
+## rec UnitMember
+
+```mach
+pub rec UnitMember;
+```
+
+an instance as a set being read names it: the set and its id there. the code lowered for it is
+read through the instance's own typing, which the request's reader gives
+
+## rec InstanceReader
+
+```mach
+pub rec InstanceReader;
+```
+
+how lowering reads an instance's own typing: the instance product of the instance a set names,
+which the reader's owner keeps alive for the lowering's life
 
 ## rec LowerRequest
 
@@ -193,8 +211,28 @@ shared_artifact: bool,
 debug: bool,
 checks: bool,
 diags: *diagnostic.DiagnosticStore,
-interfaces: sema_interface.Reader) res[LowerRequest, fail.Fail];
+interfaces: sema_interface.Reader,
+typed: InstanceReader) res[LowerRequest, fail.Fail];
 ```
+
+## fun unit_request
+
+```mach
+pub fun unit_request(
+s: *session.Session,
+l: *linkage.Linkage,
+facts: *target_facts.Facts,
+machine: *Machine,
+malloc: *A.Allocator,
+debug: bool,
+checks: bool,
+diags: *diagnostic.DiagnosticStore,
+interfaces: sema_interface.Reader,
+typed: InstanceReader) res[LowerRequest, fail.Fail];
+```
+
+a lowering request for an instance unit, which has no module of its own: each member is read
+in its origin's published template, through the frames of its own typing
 
 ## fun scope_enter
 
@@ -269,7 +307,8 @@ its kind and canonical name
 pub fun constant_store(lc: *LowerContext, module_index: u32) res[*comptime_deep.Store, fail.Fail];
 ```
 
-the store of constant values the module with stable id `module_index` publishes in its interface
+the store of constant values the module with stable id `module_index` publishes in its interface,
+or the store of the instance being lowered
 
 ## fun declared_named
 
@@ -745,22 +784,15 @@ pub fun type_resolved_of(lc: *LowerContext, tid: ast_id.TypeId) type_kind.TypeId
 pub fun decl_type_of(lc: *LowerContext, did: ast_id.DeclId) type_kind.TypeId;
 ```
 
-## fun instance_of_call
-
-```mach
-pub fun instance_of_call(lc: *LowerContext, eid: ast_id.ExprId) res[*sema_instance.Instance, fail.Fail];
-```
-
-the instance sema decided the call or generic reference `eid` names, in the frame the
-code is read through
-
 ## fun instance_id_of_call
 
 ```mach
 pub fun instance_id_of_call(lc: *LowerContext, eid: ast_id.ExprId) res[u32, fail.Fail];
 ```
 
-the index in the module's set of the instance sema decided the call or generic reference
+the instance sema decided the call or generic reference `eid` names, in the frame the
+code is read through
+the index in the set being read of the instance sema decided the call or generic reference
 `eid` names, in the frame the code is read through
 
 ## fun instance_link_name
@@ -935,6 +967,24 @@ pub fun external_linkage() Linkage;
 
 the linkage of a symbol another module defines, or a definition every module sees
 
+## fun image_linkage
+
+```mach
+pub fun image_linkage(lc: *LowerContext) Linkage;
+```
+
+the linkage of a symbol another object of this image defines and keeps inside it: a private
+declaration or an instance, which an instance unit and its callers reach across objects
+
+## fun internal_visibility
+
+```mach
+pub fun internal_visibility(lc: *LowerContext) *symbol.Visibility;
+```
+
+the visibility that keeps a definition inside its image: hidden, or the default where the
+format exports only what its export directives name and states no visibility, as PE does
+
 ## fun add_function
 
 ```mach
@@ -987,10 +1037,10 @@ the module's definition of a global, in place of a declaration a reference made
 ## fun ensure_extern_function
 
 ```mach
-pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: FnSig) res[u32, fail.Fail];
+pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: FnSig, linkage: Linkage) res[u32, fail.Fail];
 ```
 
-the module's function `name`, declared here when another module defines it
+the module's function `name`, declared here with `linkage` when another object defines it
 
 ## fun class_copy
 
@@ -1000,17 +1050,43 @@ pub fun class_copy(lc: *LowerContext, origin: module.ModuleId, decl: ast_id.Decl
 
 the copy of the function `decl` of `origin`, linked as `base`, whose pointer parameters
 take the classes `sig` states, declared here and lowered once the module's own
-declarations are, of the instance `instance` of the module's set where it is one. one
+declarations are, of the instance `instance` of the set being read where it is one. one
 name is one copy, so a copy asked for twice is asked for once
+
+## fun building_constant_time
+
+```mach
+pub fun building_constant_time(lc: *LowerContext) bool;
+```
+
+the function being built requires constant time
+
+## fun local_instance
+
+```mach
+pub fun local_instance(lc: *LowerContext, id: u32, name: intern.StrId) err[fail.Fail];
+```
+
+the instance `id` of the set being read, named `name`, is called from constant-time code: it is
+lowered into this object as a local copy once the object's own code is, since the walk that
+verifies the caller reads only the code its object holds. asked for twice, it is asked once
+
+## fun defines
+
+```mach
+pub fun defines(lc: *LowerContext, name: intern.StrId) bool;
+```
+
+whether this object already defines the function `name`
 
 ## fun ensure_extern_global
 
 ```mach
-pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type, tls: opt[mirl_global.Tls], sem: type_kind.TypeId) res[u32, fail.Fail];
+pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type, tls: opt[mirl_global.Tls], sem: type_kind.TypeId, linkage: Linkage) res[u32, fail.Fail];
 ```
 
 the module's global `name` of `ty`, of source type `sem` (TYPE_NIL for bytes no source
-type describes), declared here when another module defines it
+type describes), declared here with `linkage` when another object defines it
 
 ## fun thread_model
 

@@ -1,0 +1,853 @@
+# the build's demand for generic instances and the instance units it falls into. every module
+# asks for the instances its own code calls, and every instance for those its body calls; the
+# build's demand is the closure of the first through the second, each instance typed once, by
+# itself. a module whose code reaches an instance only declares it: the instance is lowered and
+# compiled once per build, in the unit its identity alone names, the module declaring the
+# generic and a fixed hash of the instance's mangled name modulo UNIT_BUCKETS. adding or
+# dropping one instance changes exactly one unit, and nothing the demand holds depends on the
+# order modules were loaded, typed or compiled in: the closure of a set is the same however it
+# is walked, reach is its least fixed point, members are ordered by mangled name, units by
+# their origin's name and bucket, a report goes to every module whose code reaches its instance,
+# at that module's first call site leading there, and no dense id reaches a name. a module whose front end the build skips offers what its
+# cache record lists, and an instance whose record stands is met through what the record lists,
+# typed only when it must place a report its declaring file moved
+use std.collections.map;
+use std.collections.map.Map;
+use std.collections.sort;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.crypto.hash.fnv1a;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+use mach.lang.diagnostic;
+use cache_instances: mach.lang.driver.cache.instances;
+use cache_record:    mach.lang.driver.cache.record;
+use mach.lang.fail;
+use sema_instance: mach.lang.fe.sema.instance;
+use sema_product:  mach.lang.fe.sema.product;
+use mach.lang.intern;
+use mach.lang.me.lower.mangle;
+use mach.lang.module;
+use mach.lang.session;
+use lang_source: mach.lang.source;
+use mach.lang.wire;
+
+# how many units the instances of one generic's module spread over
+pub val UNIT_BUCKETS: u32 = 8;
+
+# the bytes a unit's suffix needs at most
+pub val SUFFIX_CAP: usize = 24;
+
+val NONE: u32 = 0xFFFFFFFF;
+
+# every instance a build has met, by its symbol: its identity as whoever asked for it last
+# described it, which the instance's typing reads. it lives as long as the project, since an
+# instance is typed again in a later operation of the build when what it reads moved
+pub rec Registry {
+    set:   sema_instance.Set;
+    names: Map[intern.StrId, u32];
+}
+
+# a registry holding nothing yet: its set is made on the first instance it keeps
+pub fun registry_init(a: *A.Allocator) Registry {
+    ret Registry{names: map.init[intern.StrId, u32](a)};
+}
+
+pub fun registry_dnit(r: *Registry) {
+    sema_instance.dnit(?r.set);
+    map.dnit[intern.StrId, u32](?r.names);
+}
+
+# the symbol of the instance `item` describes, its description kept under it
+pub fun register(r: *Registry, s: *session.Session, item: *sema_instance.Instance) res[intern.StrId, fail.Fail] {
+    val named: res[intern.StrId, fail.Fail] = mangle.instance_link_name(s, item);
+    if (sel named.err) { ret named; }
+    if (r.set.alloc == nil) {
+        val made: res[sema_instance.Set, fail.Fail] = sema_instance.init(s.alloc);
+        if (sel made.err) { ret res[intern.StrId, fail.Fail].err{made.err}; }
+        r.set = made.ok;
+    }
+    val added: res[sema_instance.Added, fail.Fail] = sema_instance.add(?r.set, @item);
+    if (sel added.err) { ret res[intern.StrId, fail.Fail].err{added.err}; }
+    val put: res[bool, A.Error] = map.insert[intern.StrId, u32](?r.names, named.ok, added.ok.id);
+    if (sel put.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(put.err)}; }
+    ret named;
+}
+
+# the instance the symbol `name` names, none when nothing described it
+pub fun described(r: *Registry, name: intern.StrId) opt[*sema_instance.Instance] {
+    var key:   intern.StrId = name;
+    val found: opt[*u32]    = map.get[intern.StrId, u32](?r.names, ?key);
+    if (sel found.none) { ret opt[*sema_instance.Instance].none{}; }
+    ret opt[*sema_instance.Instance].some{sema_instance.at(?r.set, @found.some)};
+}
+
+# how the demand types an instance, and has a module typed for an instance only that module's
+# record names
+# ---
+# typed: the typing of the instance a symbol and its description name
+# asked: the instance set of a module whose record stood in for its typing, its front end run for
+#        it, nil where no record stands in for a module
+pub rec Typer {
+    ctx:   ptr;
+    typed: fun(ptr, intern.StrId, *sema_instance.Instance) res[*sema_product.InstanceResult, fail.Fail];
+    asked: fun(ptr, module.ModuleId) res[*sema_instance.Set, fail.Fail];
+}
+
+# one demanded instance
+# ---
+# name:   its symbol
+# text:   the symbol's text, which orders a unit's members
+# origin: the module that declares the generic
+# fqn:    the origin's name, which orders units
+# stable: the origin's stable id
+# bucket: the unit of the origin it falls in
+pub rec Member {
+    name:   intern.StrId;
+    text:   str;
+    origin: module.ModuleId;
+    fqn:    str;
+    stable: module.StableModuleId;
+    bucket: u32;
+}
+
+# one instance unit: its query key and the run of members it holds
+pub rec Unit {
+    key:    u64;
+    origin: module.ModuleId;
+    bucket: u32;
+    first:  u32;
+    count:  u32;
+}
+
+# one instance the closure reached
+# ---
+# origin: the module that declares the generic, nil until its description or its record names it
+# typed:  its typing this build, nil where its record stood in for it or it could not be typed;
+#         held only while the closure is walked
+# record: its record in the demand's records when that stood in for its typing, NONE otherwise
+# reach:  the objects that reach it, the least fixed point over every edge into it
+# asker:  the first module whose record asks for it, nil when none does
+# parent: the first entry whose body asks for it, NONE when none does
+pub rec Entry {
+    name:   intern.StrId;
+    text:   str;
+    origin: module.ModuleId;
+    typed:  *sema_product.InstanceResult;
+    record: u32;
+    reach:  sema_instance.Reach;
+    asker:  module.ModuleId;
+    parent: u32;
+}
+
+# `from` asks for `to`: entry indices
+rec Edge {
+    from: u32;
+    to:   u32;
+}
+
+# a module's own code asks for the entry `to` at `span` of its source `file`
+rec Ask {
+    file: lang_source.FileId;
+    span: lang_source.Span;
+    to:   u32;
+}
+
+# the closure while it is walked, and its members grouped into units once settled. the entries
+# stay with the demand, so an instance a unit must lower can be described after it
+# ---
+# rejected: an instance in the closure does not type check, or could not be typed
+# records:  the instance records this build reads, nil for none (borrowed)
+# fresh:    a record of each instance this build typed whose typing can be recorded, made by the
+#           demand's owner
+pub rec Demand {
+    members:  Vector[Member];
+    units:    Vector[Unit];
+    entries:  Vector[Entry];
+    edges:    Vector[Edge];
+    asks:     Vector[Ask];
+    index:    Map[intern.StrId, u32];
+    rejected: bool;
+    records:  *cache_instances.Store;
+    fresh:    cache_instances.Store;
+}
+
+pub fun init(a: *A.Allocator) Demand {
+    ret Demand{
+        members: collections_vector.init[Member](a), units: collections_vector.init[Unit](a), entries: collections_vector.init[Entry](a),
+        edges:   collections_vector.init[Edge](a), asks: collections_vector.init[Ask](a), index: map.init[intern.StrId, u32](a), fresh: cache_instances.init(a)
+    };
+}
+
+pub fun dnit(d: *Demand) {
+    collections_vector.dnit[Member](?d.members);
+    collections_vector.dnit[Unit](?d.units);
+    collections_vector.dnit[Entry](?d.entries);
+    collections_vector.dnit[Edge](?d.edges);
+    collections_vector.dnit[Ask](?d.asks);
+    map.dnit[intern.StrId, u32](?d.index);
+    cache_instances.dnit(?d.fresh);
+}
+
+# a unit's query key: its origin's stable id in the low bits, its bucket above them
+pub fun unit_key(stable: module.StableModuleId, bucket: u32) u64 {
+    ret module.stable_index(stable)::u64 | (bucket::u64 << 32);
+}
+
+pub fun key_stable(key: u64) module.StableModuleId {
+    ret (key & 0xFFFFFFFF)::u32::module.StableModuleId;
+}
+
+pub fun key_bucket(key: u64) u32 {
+    ret (key >> 32)::u32;
+}
+
+# the bucket of an instance's symbol: fnv-1a over its text, fixed across builds and compilers
+pub fun bucket_of(text: str) u32 {
+    ret (fnv1a.step_bytes(fnv1a.FNV_INIT, text::*u8, str_len(text)) % UNIT_BUCKETS::u64)::u32;
+}
+
+# what a unit is called after its origin's name, `instances.<bucket>`, written into `buf`, which
+# holds SUFFIX_CAP bytes
+pub fun unit_suffix(bucket: u32, buf: *u8) str {
+    val head: str   = "instances.";
+    var k:    usize = 0;
+    for (head[k] != 0) {
+        buf[k] = head[k];
+        k      = k + 1;
+    }
+    var digits: [10]u8;
+    var n:      usize = 0;
+    var rest:   u32   = bucket;
+    for {
+        digits[n] = '0' + (rest % 10)::u8;
+        n         = n + 1;
+        rest      = rest / 10;
+        if (rest == 0) { brk; }
+    }
+    for (n > 0) {
+        n      = n - 1;
+        buf[k] = digits[n];
+        k      = k + 1;
+    }
+    buf[k] = 0;
+    ret buf::str;
+}
+
+# every instance the module's `set` asks for, each reaching what the module's own code reaches it
+# from when `emitted`, the build compiling the module, and nothing otherwise: a module the build
+# only types still has its instances typed
+pub fun offer_module(d: *Demand, r: *Registry, s: *session.Session, set: *sema_instance.Set, emitted: bool) err[fail.Fail] {
+    val n: u32 = sema_instance.count(set);
+    var i: u32 = 0;
+    for (i < n) {
+        val item:  *sema_instance.Instance = sema_instance.at(set, i);
+        var reach: sema_instance.Reach     = sema_instance.REACH_NONE;
+        if (emitted) { reach = item.reach; }
+        val named: res[intern.StrId, fail.Fail] = register(r, s, item);
+        if (sel named.err) { ret err[fail.Fail].err{named.err}; }
+        val met: res[u32, fail.Fail] = meet(d, s, named.ok, item.origin, reach);
+        if (sel met.err) { ret err[fail.Fail].err{met.err}; }
+        val asked: err[fail.Fail] = ask(d, item.site_file, item.site, met.ok);
+        if (sel asked.err) { ret asked; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# every instance the record of module `mid`, whose source is `file`, says its code asks for, as
+# offer_module offers a typed module's: the record stands in for the module's typing, and the
+# module is typed only when an instance it asks for must be described
+pub fun offer_recorded(d: *Demand, s: *session.Session, mid: module.ModuleId, file: lang_source.FileId, asked: *cache_record.Asked, count: u32, emitted: bool) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < count) {
+        val a:     *cache_record.Asked = ?asked[i];
+        var reach: sema_instance.Reach = sema_instance.REACH_NONE;
+        if (emitted) { reach = a.reach::sema_instance.Reach; }
+        val met: res[u32, fail.Fail] = meet(d, s, a.name, module.MODULE_NIL, reach);
+        if (sel met.err)                                        { ret err[fail.Fail].err{met.err}; }
+        if (module.is_nil(d.entries.data[met.ok::usize].asker)) { d.entries.data[met.ok::usize].asker = mid; }
+        val asked: err[fail.Fail] = ask(d, file, a.span, met.ok);
+        if (sel asked.err) { ret asked; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the entry of the instance `name`, made the first time it is met, its origin and its reach joined
+# with what this meeting brings
+fun meet(d: *Demand, s: *session.Session, name: intern.StrId, origin: module.ModuleId, reach: sema_instance.Reach) res[u32, fail.Fail] {
+    var key:   intern.StrId = name;
+    var at:    u32          = 0;
+    val found: opt[*u32]    = map.get[intern.StrId, u32](?d.index, ?key);
+    if (sel found.some) { at = @found.some; }
+    or {
+        at = d.entries.len::u32;
+        val pushed: res[usize, A.Error] = collections_vector.push[Entry](?d.entries, Entry{
+            name: name, text: intern.text(?s.interner, name), origin: module.MODULE_NIL, record: NONE, asker: module.MODULE_NIL, parent: NONE
+        });
+        if (sel pushed.err) { ret res[u32, fail.Fail].err{fail.refused(pushed.err)}; }
+        val put: res[bool, A.Error] = map.insert[intern.StrId, u32](?d.index, name, at);
+        if (sel put.err) { ret res[u32, fail.Fail].err{fail.refused(put.err)}; }
+    }
+    val e: *Entry = ?d.entries.data[at::usize];
+    if (module.is_nil(e.origin)) { e.origin = origin; }
+    e.reach = e.reach | reach;
+    ret res[u32, fail.Fail].ok{at};
+}
+
+fun ask(d: *Demand, file: lang_source.FileId, span: lang_source.Span, to: u32) err[fail.Fail] {
+    val pushed: res[usize, A.Error] = collections_vector.push[Ask](?d.asks, Ask{file: file, span: span, to: to});
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun path_of(s: *session.Session, file: lang_source.FileId) str {
+    if (lang_source.file_is_nil(file)) { ret nil; }
+    val found: opt[*lang_source.SourceFile] = lang_source.get(s.sources, file);
+    if (sel found.none) { ret nil; }
+    ret found.some.path;
+}
+
+# the entry `from` asks for the entry `to`
+fun link(d: *Demand, from: u32, to: u32) err[fail.Fail] {
+    val pushed: res[usize, A.Error] = collections_vector.push[Edge](?d.edges, Edge{from: from, to: to});
+    if (sel pushed.err)                                         { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    if (d.entries.data[to::usize].parent == NONE && to != from) { d.entries.data[to::usize].parent = from; }
+    ret err[fail.Fail].ok{};
+}
+
+# the record that stands in for the typing of the instance `name`, NONE when none does
+fun standing(d: *Demand, name: intern.StrId) u32 {
+    if (d.records == nil) { ret NONE; }
+    val at: u32 = cache_instances.find(d.records, name);
+    if (at == cache_instances.NONE)                 { ret NONE; }
+    if (!cache_instances.at(d.records, at).current) { ret NONE; }
+    ret at;
+}
+
+# the closure: every entry met, in the order met, its demand read from the record that stands in
+# for its typing or else from its typing, and every instance it asks for met in turn. an instance
+# that could not be typed, its declaring module rejected, asks for nothing more. then places: an
+# instance with reports whose record's places no longer stand is typed, so its reports point into
+# its body where the body now is
+pub fun close(d: *Demand, r: *Registry, s: *session.Session, t: Typer) err[fail.Fail] {
+    var j: usize = 0;
+    for (j < d.entries.len) {
+        val at: u32 = standing(d, d.entries.data[j].name);
+        if (at != NONE) {
+            val rec: *cache_instances.Record = cache_instances.at(d.records, at);
+            d.entries.data[j].record = at;
+            if (module.is_nil(d.entries.data[j].origin)) { d.entries.data[j].origin = rec.origin_id; }
+            var c: u32 = 0;
+            for (c < rec.children_count) {
+                val child: *cache_instances.Child = cache_instances.child_at(d.records, rec, c);
+                val met:   res[u32, fail.Fail]    = meet(d, s, child.name, module.MODULE_NIL, sema_instance.REACH_NONE);
+                if (sel met.err) { ret err[fail.Fail].err{met.err}; }
+                val linked: err[fail.Fail] = link(d, j::u32, met.ok);
+                if (sel linked.err) { ret linked; }
+                c = c + 1;
+            }
+            j = j + 1;
+            cnt;
+        }
+        val typed: res[*sema_product.InstanceResult, fail.Fail] = type_entry(d, r, s, t, j::u32);
+        if (sel typed.err) {
+            if (!fail.is_reported(typed.err)) { ret err[fail.Fail].err{typed.err}; }
+            d.rejected = true;
+            j          = j + 1;
+            cnt;
+        }
+        val got: *sema_product.InstanceResult = typed.ok;
+        val n:   u32                          = sema_instance.count(?got.set);
+        var k:   u32                          = 1;
+        for (k < n) {
+            val item:  *sema_instance.Instance      = sema_instance.at(?got.set, k);
+            val named: res[intern.StrId, fail.Fail] = register(r, s, item);
+            if (sel named.err) { ret err[fail.Fail].err{named.err}; }
+            val met: res[u32, fail.Fail] = meet(d, s, named.ok, item.origin, sema_instance.REACH_NONE);
+            if (sel met.err) { ret err[fail.Fail].err{met.err}; }
+            val linked: err[fail.Fail] = link(d, j::u32, met.ok);
+            if (sel linked.err) { ret linked; }
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    ret place(d, r, s, t);
+}
+
+# the places close leaves to settle once every entry is met
+fun place(d: *Demand, r: *Registry, s: *session.Session, t: Typer) err[fail.Fail] {
+    var j: usize = 0;
+    for (j < d.entries.len) {
+        val e: *Entry = ?d.entries.data[j];
+        if (e.typed == nil && e.record != NONE) {
+            val rec: *cache_instances.Record = cache_instances.at(d.records, e.record);
+            if (rec.diags_len != 0 && !rec.positional) {
+                val typed: res[*sema_product.InstanceResult, fail.Fail] = type_entry(d, r, s, t, j::u32);
+                if (sel typed.err) {
+                    if (!fail.is_reported(typed.err)) { ret err[fail.Fail].err{typed.err}; }
+                    d.rejected = true;
+                }
+            }
+        }
+        j = j + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# whether the entry has reports, from its typing or its record
+fun reports(d: *Demand, e: *Entry) bool {
+    if (e.typed != nil)   { ret diagnostic.len(?e.typed.diags) > 0; }
+    if (e.record == NONE) { ret false; }
+    ret cache_instances.at(d.records, e.record).diags_len != 0;
+}
+
+# the entry `at` typed, once per walk: an instance whose typing does not type check rejects the
+# demand. an entry whose record stands is typed only for its places, and its typing must ask for
+# what its record says, in the same order: anything else is a record keyed short of what the
+# typing read
+fun type_entry(d: *Demand, r: *Registry, s: *session.Session, t: Typer, at: u32) res[*sema_product.InstanceResult, fail.Fail] {
+    if (d.entries.data[at::usize].typed != nil) { ret res[*sema_product.InstanceResult, fail.Fail].ok{d.entries.data[at::usize].typed}; }
+    val typed: res[*sema_product.InstanceResult, fail.Fail] = typing(d, r, s, t, at);
+    if (sel typed.err) { ret typed; }
+    val got: *sema_product.InstanceResult = typed.ok;
+    d.entries.data[at::usize].typed = got;
+    if (!sel got.status.kind.accepted) { d.rejected = true; }
+    val recorded: u32 = d.entries.data[at::usize].record;
+    if (recorded != NONE) {
+        val rec:  *cache_instances.Record = cache_instances.at(d.records, recorded);
+        val n:    u32                     = sema_instance.count(?got.set);
+        var same: bool                    = n == rec.children_count + 1;
+        var k:    u32                     = 1;
+        for (same && k < n) {
+            val named: res[intern.StrId, fail.Fail] = register(r, s, sema_instance.at(?got.set, k));
+            if (sel named.err) { ret res[*sema_product.InstanceResult, fail.Fail].err{named.err}; }
+            same = intern.str_same(named.ok, cache_instances.child_at(d.records, rec, k - 1).name);
+            k    = k + 1;
+        }
+        if (!same) { ret res[*sema_product.InstanceResult, fail.Fail].err{fail.message("instance demand: an instance's typing does not ask for what its record does")}; }
+    }
+    ret typed;
+}
+
+# the typing of the entry `at`, described first
+fun typing(d: *Demand, r: *Registry, s: *session.Session, t: Typer, at: u32) res[*sema_product.InstanceResult, fail.Fail] {
+    val described_r: err[fail.Fail] = describe(d, r, s, t, at);
+    if (sel described_r.err) { ret res[*sema_product.InstanceResult, fail.Fail].err{described_r.err}; }
+    val name:  intern.StrId                 = d.entries.data[at::usize].name;
+    val about: opt[*sema_instance.Instance] = described(r, name);
+    if (sel about.none) { ret res[*sema_product.InstanceResult, fail.Fail].err{fail.message("instance demand: a demanded instance has no description")}; }
+    ret t.typed(t.ctx, name, about.some);
+}
+
+# the entry `at` described in the registry: an instance only records name is described by the
+# typing of the first module whose record asks for it, that module's front end run for it, or
+# failing that by the typing of the first instance whose body asks for it, itself described first
+fun describe(d: *Demand, r: *Registry, s: *session.Session, t: Typer, at: u32) err[fail.Fail] {
+    val name:  intern.StrId                 = d.entries.data[at::usize].name;
+    val known: opt[*sema_instance.Instance] = described(r, name);
+    if (sel known.some) { ret err[fail.Fail].ok{}; }
+    val asker:  module.ModuleId = d.entries.data[at::usize].asker;
+    val parent: u32             = d.entries.data[at::usize].parent;
+    if (!module.is_nil(asker) && t.asked != nil) {
+        val set: res[*sema_instance.Set, fail.Fail] = t.asked(t.ctx, asker);
+        if (sel set.err) { ret err[fail.Fail].err{set.err}; }
+        val n: u32 = sema_instance.count(set.ok);
+        var k: u32 = 0;
+        for (k < n) {
+            val named: res[intern.StrId, fail.Fail] = register(r, s, sema_instance.at(set.ok, k));
+            if (sel named.err) { ret err[fail.Fail].err{named.err}; }
+            k = k + 1;
+        }
+    }
+    or (parent != NONE) {
+        val typed: res[*sema_product.InstanceResult, fail.Fail] = typing(d, r, s, t, parent);
+        if (sel typed.err) { ret err[fail.Fail].err{typed.err}; }
+        val n: u32 = sema_instance.count(?typed.ok.set);
+        var k: u32 = 1;
+        for (k < n) {
+            val named: res[intern.StrId, fail.Fail] = register(r, s, sema_instance.at(?typed.ok.set, k));
+            if (sel named.err) { ret err[fail.Fail].err{named.err}; }
+            k = k + 1;
+        }
+    }
+    val now: opt[*sema_instance.Instance] = described(r, name);
+    if (sel now.none) { ret err[fail.Fail].err{fail.message("instance demand: a record names an instance its asker's typing does not ask for")}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the instance `name` of a settled demand described in the registry, for a unit that must lower it
+pub fun describe_named(d: *Demand, r: *Registry, s: *session.Session, t: Typer, name: intern.StrId) err[fail.Fail] {
+    var key:   intern.StrId = name;
+    val found: opt[*u32]    = map.get[intern.StrId, u32](?d.index, ?key);
+    if (sel found.none) { ret err[fail.Fail].err{fail.message("instance demand: a member is not in the demand")}; }
+    ret describe(d, r, s, t, @found.some);
+}
+
+# the record that stood in for the typing of the instance `name`, NONE when it was typed
+pub fun recorded(d: *Demand, name: intern.StrId) u32 {
+    var key:   intern.StrId = name;
+    val found: opt[*u32]    = map.get[intern.StrId, u32](?d.index, ?key);
+    if (sel found.none) { ret NONE; }
+    ret d.entries.data[(@found.some)::usize].record;
+}
+
+# each instance's reports, from its typing or its record. a report its body places itself goes
+# out once, in the order of the instances' symbols. a report placed nowhere waits for a requester:
+# every module whose own code reaches the instance, directly or through other instances, reports
+# it once, at its first call site by offset whose closure reaches it. modules go by their file's
+# path and, at one site, instances by their symbols, so the order is the sources' alone. a recorded
+# report reads its places through `sources`, which may be nil when no record stood in
+pub fun report(d: *Demand, s: *session.Session, sources: *diagnostic.SourceTable, into: *diagnostic.DiagnosticStore) err[fail.Fail] {
+    var stores: Vector[*diagnostic.DiagnosticStore] = collections_vector.init[*diagnostic.DiagnosticStore](s.alloc);
+    var read:   Vector[diagnostic.DiagnosticStore]  = collections_vector.init[diagnostic.DiagnosticStore](s.alloc);
+    fin {
+        var k: usize = 0;
+        for (k < read.len) {
+            diagnostic.store_dnit(?read.data[k]);
+            k = k + 1;
+        }
+        collections_vector.dnit[diagnostic.DiagnosticStore](?read);
+        collections_vector.dnit[*diagnostic.DiagnosticStore](?stores);
+    }
+    var order: Vector[u32] = collections_vector.init[u32](s.alloc);
+    fin { collections_vector.dnit[u32](?order); }
+    val reserved: err[fail.Fail] = reports_read(d, s, sources, into.a, ?stores, ?read, ?order);
+    if (sel reserved.err) { ret reserved; }
+    if (order.len == 0)   { ret err[fail.Fail].ok{}; }
+    val sorted: err[fail.Fail] = sort_entries(d, s.alloc, ?order);
+    if (sel sorted.err) { ret sorted; }
+    var i: usize = 0;
+    for (i < order.len) {
+        val placed: err[fail.Fail] = diagnostic.replay_located(into, stores.data[order.data[i]::usize]);
+        if (sel placed.err) { ret placed; }
+        i = i + 1;
+    }
+    if (!any_unplaced(?stores)) { ret err[fail.Fail].ok{}; }
+    ret report_requested(d, s, ?stores, into);
+}
+
+# the reports of every entry, by entry, nil for one with none, a record's read back into `read`;
+# `order` gains each entry with reports
+fun reports_read(d: *Demand, s: *session.Session, sources: *diagnostic.SourceTable, a: *A.Allocator, stores: *Vector[*diagnostic.DiagnosticStore],
+    read: *Vector[diagnostic.DiagnosticStore], order: *Vector[u32]) err[fail.Fail] {
+    var held: usize = 0;
+    var i:    usize = 0;
+    for (i < d.entries.len) {
+        if (reports(d, ?d.entries.data[i]) && d.entries.data[i].typed == nil) { held = held + 1; }
+        i = i + 1;
+    }
+    # the stores read back stay where they are, so their pointers do
+    val room: res[usize, A.Error] = collections_vector.reserve[diagnostic.DiagnosticStore](read, held);
+    if (sel room.err) { ret err[fail.Fail].err{fail.refused(room.err)}; }
+    i = 0;
+    for (i < d.entries.len) {
+        val e:     *Entry                      = ?d.entries.data[i];
+        var store: *diagnostic.DiagnosticStore = nil;
+        if (reports(d, e)) {
+            if (e.typed != nil) { store = ?e.typed.diags; }
+            or {
+                val pushed: res[usize, A.Error] = collections_vector.push[diagnostic.DiagnosticStore](read, diagnostic.store_init(a));
+                if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+                store = ?read.data[pushed.ok];
+                val got: err[fail.Fail] = recorded_reports(cache_instances.at(d.records, e.record), sources, store);
+                if (sel got.err) { ret got; }
+            }
+            val listed: res[usize, A.Error] = collections_vector.push[u32](order, i::u32);
+            if (sel listed.err) { ret err[fail.Fail].err{fail.refused(listed.err)}; }
+        }
+        val pushed: res[usize, A.Error] = collections_vector.push[*diagnostic.DiagnosticStore](stores, store);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a record's reports, read back as its typing made them
+fun recorded_reports(rec: *cache_instances.Record, sources: *diagnostic.SourceTable, into: *diagnostic.DiagnosticStore) err[fail.Fail] {
+    if (sources == nil) { ret err[fail.Fail].err{fail.message("instance demand: a recorded report has no source table to read it through")}; }
+    var r:   wire.Source          = wire.source(rec.diags, rec.diags_len::usize);
+    val got: res[bool, fail.Fail] = diagnostic.decode(?r, sources, into);
+    if (sel got.err) { ret err[fail.Fail].err{got.err}; }
+    if (!got.ok)     { ret err[fail.Fail].err{fail.message("instance demand: an instance's recorded reports do not read back")}; }
+    ret err[fail.Fail].ok{};
+}
+
+# an entry index with its instance's symbol, to order by
+rec Named {
+    text: str;
+    at:   u32;
+}
+
+# entry indices in the order of their instances' symbols
+fun sort_entries(d: *Demand, a: *A.Allocator, order: *Vector[u32]) err[fail.Fail] {
+    if (order.len < 2) { ret err[fail.Fail].ok{}; }
+    val keyed_r: res[*Named, A.Error] = A.allocate[Named](a, order.len);
+    if (sel keyed_r.err) { ret err[fail.Fail].err{fail.refused(keyed_r.err)}; }
+    val keyed: *Named = keyed_r.ok;
+    fin { A.deallocate[Named](a, keyed, order.len); }
+    var i: usize = 0;
+    for (i < order.len) {
+        keyed[i] = Named{text: d.entries.data[order.data[i]::usize].text, at: order.data[i]};
+        i        = i + 1;
+    }
+    sort.sort_by[Named](keyed, order.len, named_order);
+    i = 0;
+    for (i < order.len) {
+        order.data[i] = keyed[i].at;
+        i             = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun named_order(a: *Named, b: *Named) i64 {
+    ret str_compare(a.text, b.text);
+}
+
+# whether any store holds a report placed nowhere
+fun any_unplaced(stores: *Vector[*diagnostic.DiagnosticStore]) bool {
+    var i: usize = 0;
+    for (i < stores.len) {
+        val st: *diagnostic.DiagnosticStore = stores.data[i];
+        if (st != nil) {
+            var k: usize = 0;
+            for (k < st.items.len) {
+                if (lang_source.file_is_nil(st.items.data[k].loc.file)) { ret true; }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# each module's own report of every instance with reports placed nowhere that its code reaches
+fun report_requested(d: *Demand, s: *session.Session, stores: *Vector[*diagnostic.DiagnosticStore], into: *diagnostic.DiagnosticStore) err[fail.Fail] {
+    val n: usize = d.entries.len;
+    # what each entry asks for, edges grouped by the entry they leave
+    var edges: Vector[Edge] = collections_vector.init[Edge](s.alloc);
+    fin { collections_vector.dnit[Edge](?edges); }
+    var k: usize = 0;
+    for (k < d.edges.len) {
+        val pushed: res[usize, A.Error] = collections_vector.push[Edge](?edges, d.edges.data[k]);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        k = k + 1;
+    }
+    sort.sort_by[Edge](edges.data, edges.len, edge_order);
+    val first_r: res[*u32, A.Error] = A.zallocate[u32](s.alloc, n + 1);
+    if (sel first_r.err) { ret err[fail.Fail].err{fail.refused(first_r.err)}; }
+    val first: *u32 = first_r.ok;
+    fin { A.deallocate[u32](s.alloc, first, n + 1); }
+    k = 0;
+    for (k < edges.len) {
+        first[edges.data[k].from::usize + 1] = first[edges.data[k].from::usize + 1] + 1;
+        k                                    = k + 1;
+    }
+    k = 0;
+    for (k < n) {
+        first[k + 1] = first[k + 1] + first[k];
+        k            = k + 1;
+    }
+    var asks: Vector[Placed] = collections_vector.init[Placed](s.alloc);
+    fin { collections_vector.dnit[Placed](?asks); }
+    k = 0;
+    for (k < d.asks.len) {
+        val q:      Ask                 = d.asks.data[k];
+        val pushed: res[usize, A.Error] = collections_vector.push[Placed](?asks, Placed{path: path_of(s, q.file), text: d.entries.data[q.to::usize].text, ask: q});
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        k = k + 1;
+    }
+    sort.sort_by[Placed](asks.data, asks.len, placed_order);
+    # seen: the last ask that walked to an entry; told: the last module that reported it, as one
+    # more than the index of its first ask
+    val seen_r: res[*u32, A.Error] = A.zallocate[u32](s.alloc, n);
+    if (sel seen_r.err) { ret err[fail.Fail].err{fail.refused(seen_r.err)}; }
+    val seen: *u32 = seen_r.ok;
+    fin { A.deallocate[u32](s.alloc, seen, n); }
+    val told_r: res[*u32, A.Error] = A.zallocate[u32](s.alloc, n);
+    if (sel told_r.err) { ret err[fail.Fail].err{fail.refused(told_r.err)}; }
+    val told: *u32 = told_r.ok;
+    fin { A.deallocate[u32](s.alloc, told, n); }
+    var walk: Vector[u32] = collections_vector.init[u32](s.alloc);
+    fin { collections_vector.dnit[u32](?walk); }
+    var found: Vector[u32] = collections_vector.init[u32](s.alloc);
+    fin { collections_vector.dnit[u32](?found); }
+    var module_mark: u32   = 0;
+    var a:           usize = 0;
+    for (a < asks.len) {
+        val q: *Ask = ?asks.data[a].ask;
+        if (a == 0 || !lang_source.file_same(q.file, asks.data[a - 1].ask.file)) { module_mark = (a + 1)::u32; }
+        val stamp: u32 = (a + 1)::u32;
+        collections_vector.clear[u32](?walk);
+        collections_vector.clear[u32](?found);
+        val started: res[usize, A.Error] = collections_vector.push[u32](?walk, q.to);
+        if (sel started.err) { ret err[fail.Fail].err{fail.refused(started.err)}; }
+        seen[q.to::usize] = stamp;
+        var w: usize = 0;
+        for (w < walk.len) {
+            val at: u32 = walk.data[w];
+            w = w + 1;
+            if (stores.data[at::usize] != nil && told[at::usize] != module_mark) {
+                told[at::usize] = module_mark;
+                val kept: res[usize, A.Error] = collections_vector.push[u32](?found, at);
+                if (sel kept.err) { ret err[fail.Fail].err{fail.refused(kept.err)}; }
+            }
+            var e: u32 = first[at::usize];
+            for (e < first[at::usize + 1]) {
+                val to: u32 = edges.data[e::usize].to;
+                if (seen[to::usize] != stamp) {
+                    seen[to::usize] = stamp;
+                    val next: res[usize, A.Error] = collections_vector.push[u32](?walk, to);
+                    if (sel next.err) { ret err[fail.Fail].err{fail.refused(next.err)}; }
+                }
+                e = e + 1;
+            }
+        }
+        val sorted: err[fail.Fail] = sort_entries(d, s.alloc, ?found);
+        if (sel sorted.err) { ret sorted; }
+        var f: usize = 0;
+        for (f < found.len) {
+            val placed: err[fail.Fail] = diagnostic.replay_unplaced(into, stores.data[found.data[f]::usize], lang_source.Location{file: q.file, span: q.span});
+            if (sel placed.err) { ret placed; }
+            f = f + 1;
+        }
+        a = a + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun edge_order(a: *Edge, b: *Edge) i64 {
+    if (a.from != b.from) {
+        if (a.from < b.from) { ret -1; }
+        ret 1;
+    }
+    if (a.to < b.to) { ret -1; }
+    if (a.to > b.to) { ret 1; }
+    ret 0;
+}
+
+# an ask with its file's path, to order by
+rec Placed {
+    path: str;
+    text: str;
+    ask:  Ask;
+}
+
+# asks by their file's path, then their offset and length, then the instance's symbol
+fun placed_order(a: *Placed, b: *Placed) i64 {
+    if (a.path == nil || b.path == nil) {
+        if (a.path != nil) { ret -1; }
+        if (b.path != nil) { ret 1; }
+    }
+    or {
+        val by_path: i64 = str_compare(a.path, b.path);
+        if (by_path != 0) { ret by_path; }
+    }
+    if (a.ask.span.offset != b.ask.span.offset) {
+        if (a.ask.span.offset < b.ask.span.offset) { ret -1; }
+        ret 1;
+    }
+    if (a.ask.span.len != b.ask.span.len) {
+        if (a.ask.span.len < b.ask.span.len) { ret -1; }
+        ret 1;
+    }
+    ret str_compare(a.text, b.text);
+}
+
+# reach carried along every edge to its least fixed point, then the instances that reach meets
+# `wanted` in, ordered by origin name, bucket and symbol and grouped into units. the typing the
+# walk held is the operation's, and no later reader holds it
+pub fun settle(d: *Demand, s: *session.Session, wanted: sema_instance.Reach) err[fail.Fail] {
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var i: usize = 0;
+        for (i < d.edges.len) {
+            val e:   Edge                = d.edges.data[i];
+            val now: sema_instance.Reach = d.entries.data[e.to::usize].reach | d.entries.data[e.from::usize].reach;
+            if (now != d.entries.data[e.to::usize].reach) {
+                d.entries.data[e.to::usize].reach = now;
+                changed                           = true;
+            }
+            i = i + 1;
+        }
+    }
+    var k: usize = 0;
+    for (k < d.entries.len) {
+        val e: *Entry = ?d.entries.data[k];
+        e.typed = nil;
+        if ((e.reach & wanted) != 0) {
+            if (module.is_nil(e.origin)) { ret err[fail.Fail].err{fail.message("instance demand: an emitted instance has no declaring module")}; }
+            val fqn:    intern.StrId          = module.module_fqn(?s.modules, e.origin);
+            val stable: module.StableModuleId = module.stable_module_id_lookup(?s.modules, fqn);
+            if (module.stable_is_nil(stable)) { ret err[fail.Fail].err{fail.message("instance demand: an instance's origin has no stable id")}; }
+            val pushed: res[usize, A.Error] = collections_vector.push[Member](?d.members, Member{
+                name: e.name, text: e.text, origin: e.origin, fqn: intern.text(?s.interner, fqn), stable: stable, bucket: bucket_of(e.text)
+            });
+            if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        }
+        k = k + 1;
+    }
+    sort.sort_by[Member](d.members.data, d.members.len, member_order);
+    var i: usize = 0;
+    for (i < d.members.len) {
+        val m: *Member = ?d.members.data[i];
+        if (d.units.len == 0 || d.units.data[d.units.len - 1].key != unit_key(m.stable, m.bucket)) {
+            val pushed: res[usize, A.Error] = collections_vector.push[Unit](?d.units, Unit{key: unit_key(m.stable, m.bucket), origin: m.origin, bucket: m.bucket, first: i::u32});
+            if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        }
+        d.units.data[d.units.len - 1].count = d.units.data[d.units.len - 1].count + 1;
+        i                                   = i + 1;
+    }
+    collections_vector.clear[Edge](?d.edges);
+    collections_vector.clear[Ask](?d.asks);
+    ret err[fail.Fail].ok{};
+}
+
+fun member_order(a: *Member, b: *Member) i64 {
+    val origin: i64 = str_compare(a.fqn, b.fqn);
+    if (origin != 0) { ret origin; }
+    if (a.bucket != b.bucket) {
+        if (a.bucket < b.bucket) { ret -1; }
+        ret 1;
+    }
+    ret str_compare(a.text, b.text);
+}
+
+# the unit keyed `key`, none when the demand holds no instance of it
+pub fun unit_of(d: *Demand, key: u64) opt[*Unit] {
+    var i: usize = 0;
+    for (i < d.units.len) {
+        if (d.units.data[i].key == key) { ret opt[*Unit].some{?d.units.data[i]}; }
+        i = i + 1;
+    }
+    ret opt[*Unit].none{};
+}
+
+# whether two settled demands hold the same members in the same units
+pub fun same(a: *Demand, b: *Demand) bool {
+    if (a.members.len != b.members.len || a.units.len != b.units.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.units.len) {
+        if (a.units.data[i].key != b.units.data[i].key || a.units.data[i].count != b.units.data[i].count) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < a.members.len) {
+        if (!intern.str_same(a.members.data[i].name, b.members.data[i].name)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}

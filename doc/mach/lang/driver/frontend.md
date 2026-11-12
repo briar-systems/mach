@@ -62,6 +62,16 @@ pub val TYPED_EXPORTS: query.Kind = query.Kind;
 
 the typed surface a module exports to its importers, shared by every one, keyed by its stable id
 
+## val INSTANCE_SURFACES
+
+```mach
+pub val INSTANCE_SURFACES: query.Kind = query.Kind;
+```
+
+the typed surfaces of every module a module imports, transitively, keyed by its stable id: what
+an instance of the module's templates reads of the modules around it. every instance of the
+module shares the one list, so each depends on it once rather than on each surface in it
+
 ## fun parse
 
 ```mach
@@ -103,8 +113,7 @@ a module's parse as this project's operations last published it
 pub fun resolved(p: *project.Project, m: *project.ModuleEntry) *resolve.ResolveResult;
 ```
 
-a module's resolution as this project's operations last published it, nil when none did or its
-front end was skipped
+a module's resolution as this project's operations last published it, nil when none did
 
 ## fun typed
 
@@ -112,8 +121,7 @@ front end was skipped
 pub fun typed(p: *project.Project, m: *project.ModuleEntry) *sema_product.SemaResult;
 ```
 
-a module's types as this project's operations last published them, nil when none did or its
-front end was skipped
+a module's types as this project's operations last published them, nil when none did
 
 ## fun load_status
 
@@ -171,6 +179,34 @@ pub fun record_load_views(p: *project.Project) err[fail.Fail];
 ```
 
 set each module's load view from what the walk left it; an unchanged view is no change
+
+## fun instance_deps
+
+```mach
+pub fun instance_deps(p: *project.Project, item: *sema_instance.Instance) res[sema_product.SemaDeps, fail.Fail];
+```
+
+what typing the instance `item` reads besides its declaring module's definition: the typed
+surfaces of every module the declaring module imports, and of every module declaring a type
+its arguments or pack name with what each of those imports, transitively, each field graph
+installed. reading them is what makes the instance's typing depend on them
+
+## fun instance_reads
+
+```mach
+pub fun instance_reads(p: *project.Project, item: *sema_instance.Instance, out: *collections_vector.Vector[module.ModuleId]) err[fail.Fail];
+```
+
+the modules the instance `item` names: its declaring module first, then every module declaring
+a type its arguments or pack name
+
+## fun free_instance_deps
+
+```mach
+pub fun free_instance_deps(p: *project.Project, deps: *sema_product.SemaDeps);
+```
+
+release what instance_deps made
 
 ## fun begin_query_phase
 

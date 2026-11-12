@@ -434,10 +434,9 @@ its instructions never leave a constant-time validated body; a `naked`,
 [`weak`](#weakstr--a-definition-as-a-link-time-default) or `inline("never")`
 function, a recursive cycle and an indirect call are never expanded.
 A remaining call or taken address still names the original defining function.
-Generic, comptime and pack specializations keep their existing shared weak
-linkage. When several modules materialize that same specialization, body import
-uses an already available definition or the first acquired provider of that
-linkage, and tracks that provider as a query dependency.
+Generic, comptime and pack specializations are weak and hidden, and each is
+defined once per build, in its instance unit (see
+[fun.md](fun.md#where-an-instances-code-lives)).
 Helpers referencing compiler-local literal pools retain their calls because those
 objects have module-local identity. Named globals keep their original symbols,
 and copied instructions preserve effects, assembly bindings and debug locations.
