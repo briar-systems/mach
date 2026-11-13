@@ -1807,13 +1807,23 @@ named variable that is unset keys differently from one set to the empty string.
 The child still inherits the whole environment, but an inherited variable the step
 does not name in `env_in` is not an input, exactly as a file missing from `in` is
 not: changing it does not invalidate the step. `PATH` reaches the fingerprint only
-through the executable it resolves `argv[0]` to. An unchanged step whose outputs
-still exist is skipped.
+through the executable it resolves `argv[0]` to.
 
-The fingerprint of the last successful run is kept as a stamp in
-`{project.work}/.cache/steps/`, and a step's outputs under `{project.work}` are
-written into scratch space in `{project.work}/.stage/<name>/` and published only
-once the step succeeds. Both belong
+The stamp of the last successful run records the fingerprint and the content
+digest of each declared output (a directory output by every path, kind and file
+beneath it). A step is skipped when its fingerprint is unchanged and every declared
+output still holds the bytes the stamp records; an output that is missing,
+modified or replaced since the step ran runs the step again. A step that runs
+again invalidates only what consumes its outputs, and only when their bytes
+changed: a module that embeds an output is keyed by that file's digest, a link
+that takes an output as a `local` input is keyed by that file's digest, and a
+generated source is keyed like any other source. No step's fingerprint is part
+of any module's key, so a step that runs again and writes the same bytes
+rebuilds nothing.
+
+The stamp is kept in `{project.work}/.cache/steps/`, and a step's outputs under
+`{project.work}` are written into scratch space in `{project.work}/.stage/<name>/`
+and published only once the step succeeds. Both belong
 to the compiler: a declared `out` inside `{project.work}/.cache/` or
 `{project.work}/.stage/` fails at manifest load, naming the step and the path.
 `mach clean` removes both, so the next build runs every demanded step again.
