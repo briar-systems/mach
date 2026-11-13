@@ -7,7 +7,7 @@ after `=` in its own word.
 `json` writes everything the command reports as JSON objects, one per line of
 stderr (NDJSON), for editors, CI and other tools: each diagnostic, a failure
 raised outside the compiler's diagnostics (a manifest, dependency, build-step,
-link or command-line refusal) included, each test result under `mach test`, the build
+link or command-line refusal) included, each [note](#notes) a command writes, each test result under `mach test`, the build
 readout under `-v` and `-vv`, and a closing summary. The records are the contract: the human text may change from
 release to release, and a record changes only under the
 [stability rule](#stability). The flag changes no exit code.
@@ -50,7 +50,7 @@ whose related site is in another file:
 
 | Member | Type | Meaning |
 |---|---|---|
-| `schema` | integer | the schema version, `1` |
+| `schema` | integer | the schema version, `2` |
 | `record` | string | the record type, `"diagnostic"`, a [failure](#failures) included |
 | `severity` | string | `"error"`, `"warning"` or `"note"` |
 | `code` | string | the diagnostic's key from the [registry](diagnostics.md#the-registry), such as `name.unresolved`; the stable identity of the kind |
@@ -176,6 +176,24 @@ steps, the phase whose work raised a failure inside the compiler, and `test` for
 the test runner. A
 refusal of the command line itself, such as an unknown flag or a project path
 that names nothing, has no `origin`.
+
+## Notes
+
+A note says what a command did or found, without failing it, and is a diagnostic
+record with `severity` `"note"`, its `code` the note's key, and a `null`
+`primary`. The human rendering writes the same note as `note: <message>`.
+
+| `code` | Written by |
+|---|---|
+| `dep.note` | a dependency command as it works: an overridden requirement, a directory left under `dep/`, a copy or checkout that stopped part way |
+| `dep.effect` | a dependency command that failed, once for each change it made before the failure, after the failure's record |
+| `project.created` | `mach init`, for the project it made |
+| `dep.realized` | `mach init`, for each dependency it declared and realized |
+| `dep.declared` | `mach init --no-deps`, for each dependency it declared without a checkout, naming the command that realizes it |
+
+```json
+{"schema":2,"record":"diagnostic","severity":"note","code":"project.created","message":"created project 'app'","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
+```
 
 ## Test records
 
