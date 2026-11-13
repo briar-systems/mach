@@ -280,7 +280,7 @@ to whichever *declared* target matches the host.
 | `of`  | absent: the system's format | Object-format override; defers to the system's format when omitted. See [Object-format override](#object-format-override). |
 | `base` | absent: the system's base | Load-address override (integer, not negative). Overrides the system's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
-| `stack_reserve` | absent: the format's default, and no stack on an image no loader maps | Main stack size in bytes, not negative: the reserve a PE or Mach-O header records, or the size of the `.stack` section of a freestanding ELF or flat image. See [Image stack size](#image-stack-size). |
+| `stack_reserve` | absent: the format's default (8 MiB on PE), and no stack on an image no loader maps | Main stack size in bytes, not negative: the reserve a PE or Mach-O header records, or the size of the `.stack` section of a freestanding ELF or flat image. See [Image stack size](#image-stack-size). |
 | `stack_commit` | absent: the format's default | Main stack commit in bytes, not negative, on PE only. See [Image stack size](#image-stack-size). |
 | `code_model` | absent: the host's default for the target | The code model the target's code is built under (string), by the psABI name mink's catalog gives it, such as `medany` on linux `riscv64` or `medlow` on freestanding `riscv64`. Any target may state it. A model the target's host does not offer is refused naming those it does, and one mirl does not carry is refused with mirl's reason. `mach info targets` lists each target's models, its default first, and `--code-model` narrows an entry build's target to one. |
 | `default` | removed | Refused as a removed key, with its removal as the fix `mach migrate` applies. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
@@ -505,9 +505,9 @@ stack_commit  = 0x1000          # 4 KiB
 
 **On a mapped format** the keys are the stack the image asks its loader for. PE keeps
 both in its optional header, and Mach-O keeps a reserve in `LC_MAIN.stacksize`.
-Omitting them keeps the format's conventional default, which on PE is a 1 MiB reserve
-and a 4 KiB commit. A reserve is address space, not committed memory, so raising it
-costs nothing until the stack is used.
+Omitting them keeps the format's default. On PE the default `stack_reserve` is 8 MiB
+(`0x800000`) and the default `stack_commit` is 4 KiB. A reserve is address space, not
+committed memory, so raising it costs nothing until the stack is used.
 
 On Mach-O the value reaches only a **position-independent** image. A non-PIE one enters
 through `LC_UNIXTHREAD`, which has no stacksize member, so a stack size requested for
