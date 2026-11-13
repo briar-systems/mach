@@ -1172,7 +1172,6 @@ reused for a different kind: see [the registry](diagnostics.md#the-registry).
 | `decl.deprecated` | code outside a `#[deprecated]` declaration's module uses it | yes |
 | `doc.lint` | a doc comment's component list names no parameter, field, generic or `ret` of its declaration, leaves a component undescribed, or lists them out of declaration order | yes |
 | `float.inexact` | a float literal is not exact at its type and its digits are not the shortest spelling of the value stored | yes |
-| `fwd.instances` | a shared library `fwd`s a generic, comptime-parameter or pack declaration, which exports no symbol | no |
 | `debug.dropped` | the linker leaves out an object's debug info that it cannot merge | no |
 | `target.skipped` | multi-target analysis skips a declared target this build does not support | no |
 | `vector.scalarize` | a vector operation falls back to scalar code on the target (see `simd`); portable code silences it | no |
@@ -1389,12 +1388,19 @@ any of them (see [test.md](test.md#which-tests-run)).
     of the build, each under its symbol name. `pub` alone exports nothing, and
     `#[symbol("name")]` sets the name an export carries without exporting it.
   - **Internals.** Every other definition still links inside the library but is
-    seen from no other image.
+    seen from no other image, and the library's calls and accesses to it bind
+    inside the library. On ELF it is `STV_HIDDEN` in each object and a `LOCAL`
+    symbol absent from `.dynsym` in the library, on Mach-O a private extern
+    left out of the export trie, and on PE a definition no `/EXPORT` directive
+    names, absent from the export table.
   - **Code model.** The library is built under its target's code model, and mirl
     builds its code for a shared object, the output mink links it as. Each
     system's row says what that means there: on ELF an export of default
-    visibility may be preempted by another image, on Mach-O only a weak one may,
-    and a PE DLL reaches its own exports directly.
+    visibility may be preempted by another image, the library's own calls to it
+    included, while mink's Mach-O dylib binds its own exports directly, weak
+    ones included, and a PE DLL reaches its own exports directly. An exported constant-time function that is not `#[weak]` is
+    protected on ELF, so no other image preempts the code its callers in the
+    library were checked against.
   - **Thread-locals.** A `#[thread]` var in a shared library is reached through
     the initial-exec model, at an offset its loader fixes when the process
     starts. General-dynamic access is never lowered.

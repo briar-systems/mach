@@ -15,7 +15,9 @@ pub rec Machine;
 the target lowering builds for: the tuple its modules are named for, the target mirl
 assembled from it, and the context the build's selection opened, none for a target with
 no baseline
-slots: the address space the target's frame slots live in
+slots:    the address space the target's frame slots live in
+directed: the format exports only what export directives name
+sealed:   the visibility an exported definition no load may preempt takes
 
 ## fun machine_of
 
@@ -47,13 +49,10 @@ pub rec Unit;
 what mach keeps of a lowered module once its mirl module is compiled and gone: its name
 and the facts of its functions
 
-exports: the linkage names a root-project `fwd` puts on a shared library's surface,
-         which another module of the image defines
-
 ## fun unit_init
 
 ```mach
-pub fun unit_init(a: *A.Allocator, name: intern.StrId, root_project: bool) Unit;
+pub fun unit_init(a: *A.Allocator, name: intern.StrId) Unit;
 ```
 
 an empty unit named `name`, its facts held in `a`
@@ -999,8 +998,9 @@ the linkage of a symbol another module defines, or a definition every module see
 pub fun image_linkage(lc: *LowerContext) Linkage;
 ```
 
-the linkage of a symbol another object of this image defines and keeps inside it: a private
-declaration or an instance, which an instance unit and its callers reach across objects
+the linkage of a definition every module of the image may reach and no other image sees,
+`pub` or not, unless `#[export]` says so, and of a reference to a private declaration or an
+instance another object of the image defines, which an instance unit and its callers reach
 
 ## fun internal_visibility
 
@@ -1034,14 +1034,6 @@ pub fun global_named(lc: *LowerContext, name: intern.StrId) opt[u32];
 ```
 
 the global of the module named `name`, none when no global is
-
-## fun export_add
-
-```mach
-pub fun export_add(lc: *LowerContext, name: intern.StrId) err[fail.Fail];
-```
-
-put `name` on the shared library's export surface
 
 ## fun define_function
 

@@ -62,40 +62,25 @@ declarations do not exist.
 
 ## What a shared library exports
 
-A `kind = "shared"` artifact exports the **root project's** `pub` declarations
-and nothing else. A dependency's `pub` surface is that dependency's ABI, not
-this library's, so a `pub fun` in a dependency is reachable from your code and
-absent from your library's export table. Every other definition — anything
-without `pub`, and every definition the compiler synthesizes, such as a generic
-or pack instance — is hidden: other modules in the same link resolve it
-normally, and no consumer of the linked library can bind to it.
+A `kind = "shared"` artifact exports exactly the declarations marked
+[`#[export]`](decorators.md#export--a-shared-librarys-export), in any project of
+the build, and nothing else. `pub` states a module's interface to other Mach
+modules and never exports, so a `pub fun` is reachable from your code and absent
+from the library's export table. Every other definition, with or without `pub`,
+and every definition the compiler synthesizes, such as a generic or pack
+instance, is hidden: other modules in the same link resolve it normally, and no
+consumer of the linked library can bind to it.
 
-`#[symbol("name")]` chooses the linker name, not the visibility. A non-`pub`
-declaration with a `#[symbol]` name is still hidden, so a C program cannot link
-against it; a function a C caller links against is `pub`.
+`#[symbol("name")]` chooses the linker name, not the visibility. A declaration
+with a `#[symbol]` name and no `#[export]` is still hidden, so a C program cannot
+link against it. A function a C caller links against is `#[export]`.
 
-A `fwd` re-export is a declaration of surface, so what a root-project module
-re-exports is exported, wherever it is defined:
+A `fwd` re-export is a declaration of Mach surface and exports nothing from a
+library. A generic, comptime-parameter or pack declaration has instances rather
+than one definition, so the way to export one instantiation is an `#[export]`
+non-generic wrapper around it.
 
-```mach fragment
-# file: src/lib.mach
-fwd impl.helper;        # exported: this module published it
-fwd other.module;       # exported: that module's whole public surface
-```
-
-A `fwd` of a module exports that module's whole public surface, following its
-own `fwd`s in turn. A `fwd` of a generic, comptime-parameter or pack
-declaration exports nothing, because such a declaration has instances rather
-than one definition and each consumer instantiates its own. A shared library
-build warns at such a `fwd`, naming the declaration; the way to export one
-instantiation is a `pub` non-generic wrapper around it. A `fwd` of a module
-that holds generics warns for none of them, since it asked for the module's
-exportable surface, and the same `fwd` in an executable or static library build
-says nothing. A `fwd` of a type or of an `ext` import exports nothing either,
-since neither defines a symbol in the image.
-
-A shared library that exports nothing is refused: it would be callable by
-nobody, and dead-code elimination would leave it empty.
+A shared library that exports nothing is built: its export table is empty.
 
 An executable exports nothing at all, so `pub` makes no difference to one.
 

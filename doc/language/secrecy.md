@@ -599,6 +599,14 @@ convention and refuses a secret that reaches a callee it does not check constant
 time, naming the callee. A call that passes only public values needs nothing of
 its callee.
 
+The walk reads the callee's code as the image links it, so a callee another image
+could replace when it loads would void the check. In a shared library no
+definition is seen from another image unless it is `#[export]`, and an exported
+constant-time function that is not `#[weak]` is protected on ELF, as PE and
+Mach-O libraries bind their calls to their own exports at link. A call inside the
+image therefore runs the code the walk read. A `#[weak]` default is never
+trusted, since another definition of its name may replace it.
+
 The zeroizing-write guarantee is separate and broader; it is described below.
 
 A secret-taint bit is threaded from sema's flow typing through IR and MIR to the
@@ -844,16 +852,21 @@ feature:
 - riscv needs Zkt in the selection;
 - x86-64's scalar cells hold unconditionally, so they pass.
 
-Nothing is linked into the image for either mode: there is no object mark, no
-cell the linker writes and no start code that reads one, and a program never
-refuses to start for want of the mode. For code that holds the mode by hand,
+A `hard` function needs nothing linked into the image, and a `soft` one needs
+only the availability byte below and, in a shared library, the probe that sets
+it. There is no object mark the linker checks, and a program never refuses to
+start for want of the mode. For code that holds the mode by hand,
 std keeps a manual DIT API: `std.system.dit.enable`, `disable` and `read` on
 aarch64, and `std.crypto.ct.begin`, which turns the mode on for the calling
 thread where the processor has it. `std.system.timing.mode()` answers what the
 hardware offers.
 
-std's availability byte, `__mach_timing_available`, is set once before `main`
-and before any thread starts, from what the system reports:
+The availability byte, `__mach_timing_available`, is one byte in each image,
+hidden, so no image reads another's. Every object whose `soft` functions read
+it defines it, weak and zero, and `std.system.dit` holds the strong definition
+that stands for those where the image reaches it, so an image links whether or
+not it imports std. std's program start sets it once before `main` and before
+any thread starts, from what the system reports:
 
 - **aarch64-linux** reads `HWCAP_DIT` (`1 << 24`) in `AT_HWCAP`, which the
   kernel exposes since v4.17 (commit 7206dc93a58f, "arm64: Expose Arm v8.4
@@ -870,6 +883,45 @@ and before any thread starts, from what the system reports:
 - **aarch64-windows** leaves the byte 0, so a `soft` function runs without the
   mode there, and a `hard` one builds only where the target's baseline holds
   DIT.
+
+A shared library runs no program start, so on Linux each object that reads the
+byte also holds `__mach_timing_probe`, a merged hidden function, and an entry
+for it in the image's table of load-time functions at priority 0
+(`.init_array.00000`) in the probe's own group, so the image keeps one probe and
+one entry. The loader runs the table before `dlopen` returns and before any
+library that depends on this one runs its own, and mink lays the entries of a
+table by priority, a lower one first and every entry that states none after,
+so the probe runs before any other load-time function of the image, one that
+calls a `soft` function included. An executable keeps std's start: it has no
+table its loader runs before `_start`, so the entry would never run there, and
+a library initialiser can reach an executable's `soft` function before `main`
+only through a pointer the executable gave it, in which case that call runs
+without the mode, as `soft` allows.
+
+The probe reads `ID_AA64PFR0_EL1` with `mrs` and sets the byte to 1 where its DIT
+field, bits 51 to 48 read signed, is at least 1. At EL0 that read traps, and
+Linux emulates it from v4.11, which advertises the emulation as `HWCAP_CPUID`,
+showing the DIT field from v4.17 and reading it as 0 before
+(`Documentation/arch/arm64/cpu-feature-registers.rst`: "the kernel emulates
+the operation if the source belongs to the supported system register space",
+and an unexposed register "causes SIGILL"). A kernel older than v4.11 has no
+emulation and sends SIGILL, so a library with a `soft` function fails to load
+there. That is accepted: a library has no other source of the answer, since it
+runs no start that is handed the auxiliary vector and mach links no C library to
+ask, and v4.9, the last kernel without the emulation, left long-term support
+in January 2023. Windows gives user code no read of the ID registers, so no
+probe is delivered there and the byte stays 0.
+
+An image that runs no table of load-time functions and no std start, such as
+a freestanding image with its own entry, keeps the byte 0, so its `soft`
+functions run without the mode, as `soft` promises and `hard` exists to
+refuse. Such an image sets the byte by calling the probe once before any
+`soft` function runs, declared as
+`#[symbol("__mach_timing_probe")] ext fun probe();`, at EL1 where the read
+is the processor's own. The probe is present in every image that holds a `soft`
+function reading the byte. `std.system.dit.available` and
+`std.crypto.ct.begin` read the same byte. A `hard` function reads no byte and
+behaves in a library as in a program.
 
 ## Padding of secret aggregates
 

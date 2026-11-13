@@ -777,6 +777,17 @@ never exports. Takes no arguments, and `#[testing]` cannot combine with it. An
 exported declaration is seen from outside the image wherever its project sits in
 the build, so a dependency's `#[export]` is exported as the root project's is.
 
+Every definition without it is seen from no other image, and a call or access to
+it from inside its own image binds there. On ELF an export takes default
+visibility, so another image loaded ahead of the library, as `LD_PRELOAD` loads
+one, may preempt it, the library's own calls to it included, except an exported
+`#[constant_time]` function that is not `#[weak]`, which takes protected
+visibility: no other image replaces the code its callers in the library were
+checked against. A PE DLL and a Mach-O dylib bind a library's calls to its own
+exports when the library is linked, weak ones included, so nothing preempts them
+there.
+See [manifest.md](manifest.md#artifactname) for how each format spells it.
+
 ```mach fragment
 #[export]
 pub fun version() u32 { ... }
@@ -795,8 +806,8 @@ var depth: u32 = 0;
 
 - An executable reaches its thread-locals at offsets its link fixes, the
   local-exec model. A shared library reaches them at offsets its loader fixes
-  when the process starts, the initial-exec model, and a `pub` one is exported
-  with the library. General-dynamic access is never lowered, so a library that
+  when the process starts, the initial-exec model, and an `#[export]` one is
+  exported with the library. General-dynamic access is never lowered, so a library that
   uses thread-locals and is opened with `dlopen` after start draws on the
   loader's small static thread-local reserve, and a loader that has none left
   refuses to open it.
