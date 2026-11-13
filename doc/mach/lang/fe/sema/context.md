@@ -203,6 +203,27 @@ offer: a fix the next error raised offers, set by a check that knows one and
 write_place: the place under a store or an address-of, whose root is written or
                addressed rather than read
 in_test: inside a `test` body, where a `ret` value is a status in 0..255
+timed: the constant-time mode of the function whose body is walked, `TIMED_NONE` outside one
+
+## val TIMED_NONE
+
+```mach
+pub val TIMED_NONE: u8 = 0
+```
+
+the constant-time modes a walked body may hold, as `Walk.timed`
+
+## val TIMED_SOFT
+
+```mach
+pub val TIMED_SOFT: u8 = 1
+```
+
+## val TIMED_HARD
+
+```mach
+pub val TIMED_HARD: u8 = 2
+```
 
 ## rec SemaContext
 

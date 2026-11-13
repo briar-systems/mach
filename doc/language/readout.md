@@ -23,8 +23,10 @@ banners and the `profile <name>:` headers.
 
 The build's readout goes to stderr: banners, phase rows, items, `built` lines,
 diagnostics, failures and the tally. A test run goes to stdout: the roll-ups or
-per-test lines and the closing summary. `--diagnostics json` turns stderr into
-records, a test run's among them, and leaves stdout as it is.
+per-test lines and the closing summary, and so does the listing `mach check
+--declassified` writes ([secrecy.md](secrecy.md#declassification)).
+`--diagnostics json` turns stderr into records, a test run's among them, and
+leaves stdout as it is.
 
 ## The build readout
 

@@ -21,6 +21,14 @@ pub fun infer_expr(sc: *sema_context.SemaContext, eid: ast_id.ExprId) type_kind.
 pub fun is_field_type_operand(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[bool, fail.Fail];
 ```
 
+## fun timed_of
+
+```mach
+pub fun timed_of(sc: *sema_context.SemaContext, c: *comptime_scope.ComptimeCtx, a: *ast.Ast, d: *ast_decl.Decl) u8;
+```
+
+the constant-time mode `#[constant_time]` gives declaration `d` of syntax `a`, read under the decorator scope `c`
+
 ## fun field_seq_owner
 
 ```mach

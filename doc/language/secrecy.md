@@ -486,7 +486,8 @@ mode:
 
 - the code-level rules apply to the emitted code: no secret branch or loop
   condition, short-circuit operand, index, address or division;
-- a callee that receives a secret must itself be constant time;
+- a callee that receives a secret must itself be declared constant time, as
+  [Calls](#calls) states;
 - masc's walk proves all of this on the encoded code, so a secret the
   compiler's own passes route to a branch, an address or a variable-latency
   instruction is refused, never emitted.
@@ -495,109 +496,131 @@ The two modes differ only in how the processor's data-independent-timing mode is
 held, which [Soft and hard](#soft-and-hard) describes.
 
 Inline `asm` inside such a function is **validated**, not rejected. The block is
-parsed into instructions and walked for the same three leaks the compiler checks
-everywhere else — a secret reaching a branch condition, a memory address, or a
-variable-latency operation the target cannot do in constant time. Taint enters
-through the block's `{name}` bindings, whose secrecy is stamped from the local's
-declared type. A pointer to a secret (`*^u32`) is a public address and a secret
-load: the register it is staged into may address memory, and what a load through
-it produces is secret, while a secret pointer (`^*u32`) is a secret address. What
-the walk cannot model, it refuses:
+encoded with the rest of the function and masc's walk reads its bytes as it reads
+every other instruction, in one pass over the function's code, so nothing about a
+block is taken on trust from its text: a data directive is walked as the
+instructions its bytes decode to. The walk holds the same state through a block
+as anywhere else.
 
-| construct | why |
-|---|---|
-| a body that does not parse | nothing to analyze |
-| a data directive (`.byte`, `.word`, `.long`, `.quad`) | its payload can encode any instruction |
-| a mnemonic the target has not classified | its timing behaviour is unknown |
-| **a flags-conditioned branch on a secret** (x86-64 `jcc`, aarch64 `b.<cond>`) | the flags it reads were filled from a secret |
+- **Registers.** Every register is seeded at the function's entry: an argument
+  register as the declaration says, a register the convention holds public at
+  every entry (the stack pointer, the timing mode's register, a reserved one no
+  instruction adds to, as the thread pointer) public, and every other one, the
+  frame pointer and the flags a caller's arithmetic accrued included, as possibly
+  holding the caller's secret. A block that leaves a secret in a register held
+  public at entry is refused there. The walk holds a register's secrecy whole,
+  so a register or argument slot that carries a secret member of a record
+  passed by value together with a public one is secret whole, and a branch on
+  that public member is refused, naming the parameter and the bytes that share
+  the slot. Take such a record by reference, or order its members so secret
+  and public ones fall in different 8-byte pieces. A record holding a secret
+  that the convention itself passes by reference, as aarch64 and riscv64 pass
+  one larger than 16 bytes and windows one larger than 8, is refused the same
+  way when a public member decides a branch.
+- **Flags.** Each instruction reads and writes each flag bit as masc's tables
+  state it, so a branch on flags a secret compare filled is refused, and an
+  instruction that writes only some of them, as `inc` leaves carry, leaves the
+  rest as they were.
+- **Timing.** An instruction whose timing depends on an input under the target's
+  timing mode is refused when that input may hold a secret, by the target's own
+  list: Intel's data operand independent timing instructions on x86-64, the
+  instructions Arm marks data-independent-time on aarch64, Zkt's on riscv64.
+  Every grammar parses divides, multiplies and float instructions, and the list
+  decides each.
+- **Memory.** The walk places each access as an extent off a register's value or
+  a symbol, follows the frame exactly where the producer states a slot's address
+  never leaves the code, and keeps what each extent may hold. A secret spilled and
+  reloaded comes back secret. A store of a secret is admitted only into memory
+  something states may hold one: a frame slot the walk places, a global whose type
+  holds a secret, or memory reached through a pointer the block loaded from a
+  `{name}` binding whose pointee is secret in every byte. A binding whose pointee
+  holds no secret states its memory public, and every other destination is memory
+  nothing states the secrecy of. A secret stored to either is refused
+  ([asm.md](asm.md) has the binding rules and an example).
+- **The timing mode.** A block may not turn the timing mode off: aarch64's
+  `msr dit` from a register and `msr pstate.dit, #0` are refused whatever encodes
+  them. Only the read, set and restore the frame code places are admitted.
 
-That last row is a per-target asymmetry worth stating precisely, because getting it
-wrong was a real hole. A branch whose condition is a **register operand** is
-visible to the walk and is checked: aarch64's `cbz`/`cbnz`, and every riscv64 branch,
-which compares two registers — RISC-V has no flags register at all. A branch whose
-condition rides the **flags register** is checked against a separate flags-taint
-state: a `cmp` of a secret marks the flags secret-derived, and a later `jcc`
-reading them is refused, while a compare-and-branch over public data is accepted.
-x86-64's `jcc` family is flags-conditioned, and so is **aarch64's `b.<cond>`** —
-which is easy to miss, because `b.<cond>` does not appear in aarch64's mnemonic table
-at all. It is admitted by the grammar's *decode hook*, carrying the unconditional
-branch's own opcode with the condition in its flags.
+What the walk cannot read, it refuses: bytes that decode to no instruction, an
+instruction whose effects masc's tables leave undecided, and control that leaves
+the block where the walk cannot follow it.
 
-The flags model is deliberately more than a single "writes flags" bit, because one
-bit has no correct value for two families. `inc` and `dec` write every status flag
-**except** carry, and the shifts write nothing at all when the count is zero — so
-neither can be taken to have refreshed the flags. A secret `cmp`, a public `inc`, and
-a `jc` is therefore still refused: the carry the branch reads is the secret one. Only
-an instruction that unconditionally overwrites every flag this grammar can read
-(`add`, `sub`, `cmp`, `test`, `and`, `or`, `xor`, `neg`, `cmpxchg`, `xadd`) clears
-the taint. `popfq`, `iretq` and `syscall` load or mask flags from somewhere the model
-does not represent, so they taint unconditionally and never clear.
+`{name}` bindings carry the local's declared type into the walk. A pointer to a
+secret (`*^u32`) is a public address and a secret load: the register it is
+staged into may address memory, and what a load through it produces is secret,
+while a secret pointer (`^*u32`) is a secret address.
 
-A `setcc` **consumes** a flag into a register, so with secret-derived flags its
-destination is secret too — otherwise a secret could be laundered out of the flags
-and used as a memory index, which the address check would then miss.
+On a typed stream (wasm) the producer states no store, so the store rule above
+does not apply there, and a stream's walk takes a secret stored at an address it
+does not place as possibly anywhere.
 
-On a target whose grammar has no flag reader at all, every one of these facts is
-vacuous, and that vacuity is asserted per target rather than assumed: adding an
-aarch64 `cset` later has to state its facts deliberately.
-
-The rows whose facts could wrongly *permit* a leak were measured against the CPU
-rather than asserted from a manual: each instruction was run twice with the flags
-preset all-set and all-clear, and what it actually defines, preserves and reads was
-read off the hardware and written into the table. Three rows are exempt and stay a
-reasoned classification: `popfq`, `iretq` and `syscall` take their flags from the
-stack, the interrupt frame, or a masked prior RFLAGS, and no experiment of that
-shape can tell you where a value came *from*.
-
-**Nothing re-measures the table today.** It is a recorded classification, and a CPU
-whose behaviour stops matching it is a silent divergence. Re-establishing it is a
-job for a unit test that runs the probe on the host it is running on, not for a
-cross-compilation suite: the experiment only means anything on the ISA it executes.
-
-**Memory is the third taint domain**, beside the register set and the flags bit.
-A secret spilled to the stack and reloaded comes back **secret**:
-
-```
-mov rax, {r}
-mov [rsp], rax
-mov rbx, [rsp]
-mov rcx, [rbx]     # error: addresses memory with a secret value
-```
-
-Before this domain existed the reload came back in a register the walk believed
-public, and all three checks downstream of it were defeated at once — a branch
-condition, a memory address, and a variable-latency operand alike. The direct form
-(`mov rax, {r}` then `mov rbx, [rax]`) was always refused, which made the gate look
-sound while an ordinary spill walked straight through it.
-
-The domain is **one bit covering all of memory**: either a secret has been stored in
-this body or it has not. That is coarser than it could be, and deliberately so. The
-obvious refinement — taint individual `[base + literal]` slots — is not sound here,
-because `[rsp + k]` and `[rbp + j]` can name the same byte with nothing in the walk
-relating two base registers, and because a slot key is an address rather than an
-extent, so an 8-byte store and an overlapping 4-byte load compare as different slots.
-Both would be laundering paths again.
-
-The bit is **monotone**: a later store of a public value does not clear it, since
-"the same slot" is precisely the question the domain cannot answer. So a body loses
-by this only if it stores a secret, later reloads some *other* public value, and then
-branches on, addresses with, or variable-latency operates on what it reloaded. The
-failure direction is refusal, never acceptance.
-
-A store through an address the walk cannot resolve needs no special case: there is no
-slot to fail to identify.
-
-The variable-latency check also bites unevenly: x86-64's and aarch64's asm grammars
-carry no divide, multiply or float instruction at all, so it reaches only their
-register-count shifts. riscv64's grammar admits the whole M-extension, so on that
-target the check is substantive.
+### Calls
 
 `#[constant_time]` is a **per-function** contract, and a call is where it meets
-another function: a constant-time function may pass a secret only to a callee that
-is constant time itself. masc's walk follows each call through the callee's
-convention and refuses a secret that reaches a callee it does not check constant
-time, naming the callee. A call that passes only public values needs nothing of
-its callee.
+another function. A call trusts the callee's declaration and never reads its
+body: the callee's mode and which bytes of each of its parameters and of its
+result are secret, all read from its declaration, are all the caller's check
+knows of it. The
+callee's own build holds its body to that declaration, wherever the callee is
+compiled, so a definition that breaks it fails its own module and the program
+never links with it. This works the same within a module and across modules, a
+generic instance included.
+
+A constant-time function may pass a secret only to a callee that
+
+- it names directly, since a function type states no mode: a secret passed
+  through a function value is refused, whatever the value points at;
+- is declared `#[constant_time("soft")]` or `#[constant_time("hard")]`, a generic
+  included, whose instances take its mode. An unmarked function is refused
+  whether it is generic or not, in the same module or another: mark it;
+- is not `#[weak]`, since a definition elsewhere may replace its body at link
+  time with code nothing here checked. An `ext` function never qualifies, as
+  `#[constant_time]` on an `ext` declaration is refused;
+- is hard where the caller is hard, since a soft callee's timing holds only
+  where the processor has the mode it asks for.
+
+"Passing a secret" reaches through pointers: an argument whose type holds a
+secret anywhere it reaches, as `*^u8` or a record with a `^` field, as
+`$holds_secret` answers, counts, and the refusal is `secret.call_untrusted`,
+naming the type. masc's walk checks the same at the machine level from the
+callee's declaration and the calling convention: a secret in a register or
+stack slot the callee's declaration says is public is refused, and so is any
+secret a call to a callee it does not trust could reach, in a register, an
+argument on the stack or memory the callee could reach through a pointer,
+naming the callee. So a call to a callee that is not constant time, even one
+passing only public values, is refused while a secret sits in memory the callee
+could reach.
+
+A trusted callee may read any memory a pointer it is given reaches. What makes
+that safe is the rule its own walk holds it to: every read outside its own
+frame and its module's globals takes what it reads as the type it reads through
+says, secret through a pointer to a secret and public through a pointer to
+public storage, which welded storage keeps free of secrets, and as secret where
+the compiler states nothing, as inside an `asm` block. So a callee never takes
+a secret its caller holds as public, and the caller takes everything the callee
+may have written as possibly secret after the call.
+
+A trusted callee's result is what its declaration says it is. The bytes of the
+result its type declares public are public in the caller, so a constant-time
+caller may branch on a public status a trusted callee returns even when it
+passed that callee a secret, and the bytes it declares secret are secret. The
+callee's own build holds it to that at every return: no secret is left in a
+part of the result its type declares public. A value declassified with `:>T`
+is public, so a constant-time function may return `x:>u64` as a public `u64`
+([Declassification](#declassification)). A result returned through memory, as a
+large record is, is held to the same contract: the callee's build holds that it
+leaves no secret in a byte its type declares public, and the caller takes those
+bytes as holding what they held before the call.
+
+A callee that a shared library exports stays the definition its callers in the
+library were checked against: an exported constant-time function that is not
+`#[weak]` takes protected visibility on ELF, so no other image preempts it. A
+PE DLL reaches its own exports directly, and on Mach-O only a weak definition
+is coalesced across images, so neither needs it.
+
+A call that passes no secret and reaches none needs nothing of its callee, so a
+constant-time function may call any function with public values while no
+secret sits where that callee could reach.
 
 The walk reads the callee's code as the image links it, so a callee another image
 could replace when it loads would void the check. In a shared library no
@@ -609,10 +632,50 @@ trusted, since another definition of its name may replace it.
 
 The zeroizing-write guarantee is separate and broader; it is described below.
 
+### Declassification
+
+`:>T` is the declassification everywhere, a constant-time function included. A
+value that went through `:>T` is public for every purpose there: it may decide
+a branch or a loop, form an index, an address or a length, be stored into
+public memory, be returned in a public result and be passed where a callee
+declares a public parameter. The promise of `#[constant_time]` is that nothing
+secret that was not explicitly declassified decides timing or reaches public
+storage or a public result.
+
+What stays refused is everything else: a secret that did not go through `:>T`
+reaching a branch, an index, a variable-latency instruction, public memory, a
+public result or a public argument. A value declassified in part is public only
+in that part: a declassified field leaves the record's other fields as secret
+as they were, and the low half of a wide value declassified leaves the high
+half secret. A declassify of a pointer makes the address public and nothing it
+points to (`^*^u8` to `*^u8`). A record or array secret whole (`^R`) declassified
+whole is public whole. The value a declassify copies from keeps its secrecy, so
+a later use of the source is checked as the secret it is.
+
+The checker cannot judge what the author declared public. A parser that
+declassifies each byte of a secret key file to decide whether it is a padding
+character or part of the alphabet branches on a fact of every secret byte, and
+the build accepts it, since the author said that fact is public. Each `:>T` in
+a constant-time function is a claim the author makes and a reviewer checks.
+
+`mach check --declassified` lists those claims for the reviewer. Once the
+project checks, it writes every `:>T` of the project's own modules to stdout,
+one a line, as `file:line:column: function: type`: the function the cast
+stands in, `test <name>` for a test and `<module>` outside both, and the type of
+the value declassified as sema typed it. A cast in the body of a generic is
+listed once, at its place in the source, whatever instances the module makes:
+its type as the body spells it, `T` for a type parameter, and `<each
+expansion's>` for an operand only a `$each` expansion types. It lists what the source states, so a
+declassification the compiler makes itself, as the test of a division's
+divisor for zero, is not listed. The flag belongs to `check` alone. The listing
+stays plain lines on stdout under `--diagnostics json`, which turns only stderr
+into records ([readout.md](readout.md#streams)).
+
 A secret-taint bit is threaded from sema's flow typing through IR and MIR to the
 emitted instruction stream, preserved across every value replacement, inline
 clone, instruction selection, and register-allocator copy. The one place taint
-stops is the declassify barrier a `:>T` cast lowers to. Secret-free code carries
+stops is the declassification a `:>T` cast lowers to: a copy the walk of the
+encoded code takes as leaving its destination public, and nothing else. Secret-free code carries
 no taint and compiles byte-identically.
 
 No function is required to carry `#[constant_time]`. A function that computes on
@@ -640,11 +703,18 @@ Wiping a secret is only useful if the wipe survives to run. That guarantee exist
 but it is **not** provided by `#[constant_time]`, and it is scoped more broadly than the
 decorator is.
 
-A store into secret storage is tainted at lowering, from two composing sources: the
-stored **value**'s secrecy, and — for a public value written into secret storage, the
-shape a wipe takes — the **destination**'s secrecy, read from the lvalue's semantic
-type. Either one marks the store. That taint is the thing an optimization must
-consult, and it is keyed on the storage, not on any decorator, so:
+A store states the secrecy of the storage it writes from the place's type, never
+from its value: secret where the type holds a secret, public where it holds none.
+Its value's secrecy is the value's, which the back end follows from register to
+memory, and a store of a value that holds a secret not declassified into storage
+stated public is refused in a constant-time function. A store of a public value
+into secret storage, the shape a wipe takes, writes a public value. A copy is marked when
+the bytes it moves are secret, and the zeroing fill that clears a secret aggregate's
+padding writes zeros and is not marked. A constant-time function's copy or fill of a
+secret needs a length known at compile time, and one whose length is known only at run
+time is refused at the copy or fill on every target, a `$zeroize` excepted. What keeps a wipe in place is that no pass
+removes a store, and that a `$zeroize` is a kept fill, which no pass may remove even
+once one does, keyed on the write, not on any decorator, so:
 
 ```mach
 use std.types.size.usize;
@@ -660,8 +730,7 @@ fun clear(p: *^u8, n: usize) {
 ```
 
 **What it covers.** Memory, reached through a pointer that escapes the function — the
-shape `crypto.ct.zeroize` has. Such a store cannot be promoted out of memory, and the
-taint is present for any future pass to read.
+shape `crypto.ct.zeroize` has. Such a store cannot be promoted out of memory.
 
 **What it does not cover.** A value the compiler keeps in a **register**. Writing to a
 promoted local is not a memory write, so wiping one is not preserved:
@@ -679,8 +748,9 @@ it.
 
 **Today the guarantee holds trivially.** mach has no dead-store elimination, so
 nothing removes a store: an entirely dead fill of a *public* local also survives at
-release. The guarantee becomes load-bearing only if such a pass is added, and the
-taint is what would hold that pass to it.
+release. The guarantee becomes load-bearing only if such a pass is added: a kept
+fill holds that pass to it, and a plain store into secret storage carries the
+secret statement of the place it writes, which such a pass would have to honour.
 
 What a target offers is read at the `#[constant_time]` mark from masc's instruction
 set for the target's architecture, which says whether its rows classify their
@@ -836,7 +906,11 @@ constant-time function's mode says what happens when the build cannot be sure
 the promise holds.
 
 **`soft`** holds the mode where it can and runs anyway where it cannot. mirl
-emits a save of the DIT bit, a set and a restore around the function. Where the
+emits a save of the DIT bit, a set and a restore around the function. The set
+is `msr dit, #1` followed by `dsb nsh` and `isb sy`, as `std.system.dit.enable`
+writes it, so no instruction after it runs speculatively under the timing from
+before it (Apple's "Writing ARM64 code for Apple platforms" asks for a
+speculation barrier after turning the mode on). The restore needs none. Where the
 target does not guarantee DIT, the set is guarded by std's byte that says
 whether the processor has the mode, and where it does, the set is
 unconditional. Without DIT the function still runs, with the code-level rules
@@ -932,7 +1006,23 @@ a member-by-member construction and a default initialization. A copy moves the
 value whole, padding included, so the padding stays zero. A stale secret
 therefore never rides in the padding of a value that is later copied or written
 out whole. An aggregate that holds no secret is laid out and built as before,
-its padding unspecified.
+its padding unspecified, except a literal in a constant-time function, whose
+padding is zeroed too: the function's check refuses a read of stack no store
+reached, and a load of the whole value reads its padding.
+
+## What is promised about memory
+
+The compiler promises two things of secret data: a constant-time function
+processes it in constant time, and no value typed secret reaches a public one
+without a `:>`. It does not promise memory hygiene. A function's stack slots,
+spills and registers are not wiped when it returns, so a secret's bytes can
+remain in dead stack memory after the function that held them. Bytes nothing
+wrote, as a public record's padding or the unused bytes of a union or tag of a
+public type, are unspecified and may hold whatever was there before, a dead
+frame's secret included. A program that sends or stores a record by its raw
+bytes sends those bytes too. A long-lived buffer holding a secret is wiped by
+its author with std's helpers, `std.crypto.ct.zeroize` or
+`std.memory.secret.borrow_wipe`.
 
 ## Trusted base
 
@@ -951,6 +1041,18 @@ The guarantee rests on four parts:
 The only secret-to-public crossings are the explicit `:>T` cast and inline
 `asm`, which masc's walk validates but a type system cannot check. A proof is
 always relative to a leakage model. Its fidelity to real silicon is empirical.
+
+What is checked and what is trusted: the checker verifies the functions marked
+`#[constant_time]`, their `asm` included. Code that is not marked is trusted to
+follow the type system and its declared signatures, and `asm` outside a
+constant-time function is not checked. Three consequences of that statement are
+known and accepted under it, each awaiting a ruling:
+
+- an untrusted callee that reads a register its declaration does not pass, and
+  so a secret the caller left there;
+- an untrusted callee whose `asm` reads its caller's frame;
+- untrusted code whose `asm` moves a secret it reaches through a global into
+  public storage it was given, directly or through a trusted callee.
 
 ## Assurance
 

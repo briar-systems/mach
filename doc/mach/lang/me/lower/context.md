@@ -685,7 +685,7 @@ builds an aggregate of `ir`, which the destination holds; none for any other
 pub fun slot_for(lc: *LowerContext, tid: type_kind.TypeId, ir: Type) res[value.Value, fail.Fail];
 ```
 
-a stack slot for a value of the source type `tid`, held in `ir`
+a stack slot for a value of the source type `tid`, held in `ir`, stated public where `tid` holds no secret
 
 ## fun debug_type_of
 
@@ -873,6 +873,22 @@ pub rec FnSig;
 
 a function's signature: its parameters and result, each narrow integer stating the
 extension its source type's signedness gives it
+a function's ir signature and the source types it was lowered from
+
+sig: its ir signature
+sem: the source function type, type_kind.TYPE_NIL for a signature no source type states, as a class copy's
+fixed: how many of its parameters are the source type's own
+extra: the source type of each parameter past those, a pack instance's element types
+extra_len: how many there are
+ret: the source type of its result, type_kind.TYPE_NIL where no source type states it
+
+## fun bare_sig
+
+```mach
+pub fun bare_sig(sig: Type) FnSig;
+```
+
+the ir signature `sig` with no source types
 
 ## fun lower_fn_sig
 
@@ -916,6 +932,19 @@ pub fun ext_of(lc: *LowerContext, sem: type_kind.TypeId) types.Extension;
 
 the extension a convention gives an integer narrower than a register: its declared
 signedness. a bool is a byte read unsigned
+
+## fun declared_secrets
+
+```mach
+pub fun declared_secrets(lc: *LowerContext, sig: FnSig, out: *collections_vector.Vector[mirl_global.Secrecy], result: *mirl_global.Secrecy, ranges: *collections_vector.Vector[mirl_global.Range], pointers: *collections_vector.Vector[u32]) err[fail.Fail];
+```
+
+the secret parameters a function of signature `sig` declares, into `out`, its secret result, into `result`, and the
+positions of its parameters that point to storage holding no secret, into `pointers`: each as secret as its source
+type holds a secret in its own bytes, the bytes a pointer reaches being its pointee's and never the pointer's. `out`
+holds none where no parameter is secret, and their ranges are `ranges`, which must outlive them until the module
+copies them. this is the one place a declaration's secrecy is made, of a definition and of a declaration alike, so a
+caller and the definition it calls state one contract
 
 ## fun pack_instance_sig
 
@@ -1055,10 +1084,28 @@ the module's definition of a global, in place of a declaration a reference made
 ## fun ensure_extern_function
 
 ```mach
-pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: FnSig, linkage: Linkage) res[u32, fail.Fail];
+pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: FnSig, linkage: Linkage, timed: ConstantTime) res[u32, fail.Fail];
 ```
 
-the module's function `name`, declared here with `linkage` when another object defines it
+the module's function `name`, declared here with `linkage` when another object defines it, with the mode `timed`
+its declaration states and the secret parameters and result its signature does, which are what a caller may trust of it
+
+## fun declaration_mode
+
+```mach
+pub fun declaration_mode(d: *sema_interface.Declaration) ConstantTime;
+```
+
+the mode the declaration `d` states its function holds constant time in: none for one a definition elsewhere may
+replace, as a `#[weak]` default, since what runs need not be the body that was checked
+
+## fun mode_of
+
+```mach
+pub fun mode_of(lc: *LowerContext, origin: module.ModuleId, decl: ast_id.DeclId) res[ConstantTime, fail.Fail];
+```
+
+the mode the function `decl` of module `origin` is declared with, as its module's interface publishes it
 
 ## fun class_copy
 
@@ -1100,11 +1147,12 @@ whether this object already defines the function `name`
 ## fun ensure_extern_global
 
 ```mach
-pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type, tls: opt[mirl_global.Tls], sem: type_kind.TypeId, linkage: Linkage) res[u32, fail.Fail];
+pub fun ensure_extern_global(lc: *LowerContext, name: intern.StrId, ty: Type, tls: opt[mirl_global.Tls], sem: type_kind.TypeId, linkage: Linkage, constant: bool) res[u32, fail.Fail];
 ```
 
 the module's global `name` of `ty`, of source type `sem` (TYPE_NIL for bytes no source
-type describes), declared here with `linkage` when another object defines it
+type describes), declared here with `linkage` when another object defines it, which the
+program never writes where `constant` holds
 
 ## fun thread_model
 

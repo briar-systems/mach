@@ -61,6 +61,15 @@ pub fun bind_storage(b: *Builder, slot: value.Value, binding: debug.Binding) err
 
 bind a variable to the stack slot `slot` holds it in: the slot's alloca names it
 
+## fun state_public
+
+```mach
+pub fun state_public(b: *Builder, slot: value.Value) err[fail.Fail];
+```
+
+state that the stack slot `slot` holds no secret, as the source type of what it holds says: the public flag on its
+alloca, which the walk of a constant-time function's code takes as a typed frame extent
+
 ## fun bind_value
 
 ```mach
@@ -303,9 +312,9 @@ whether the next instructions are marked secret: a load, call or atomic read of 
 pub fun set_access(b: *Builder, secret: bool);
 ```
 
-the next reads through an address state the memory they read as the source type says:
-secret, which marks them so, or public. other reads state nothing, and the constant-time
-walk holds what they reach as it holds any access it cannot place
+the next accesses through an address state the memory they read or write as the source
+type says: secret, which marks them so, or public. other accesses state nothing, and the
+constant-time walk holds what they reach as it holds any access it cannot place
 
 ## fun end_access
 
@@ -313,7 +322,7 @@ walk holds what they reach as it holds any access it cannot place
 pub fun end_access(b: *Builder);
 ```
 
-the next reads state nothing of the memory they read
+the next accesses state nothing of the memory they reach
 
 ## fun set_volatile
 
@@ -657,7 +666,16 @@ pub fun emit_load(b: *Builder, addr: value.Value, ty: Type) res[value.Value, fai
 ```
 
 a value of `ty` read from `addr`: an aggregate is copied into a slot of its own, whose
-address is the value
+address is the value, as secret as the read or `addr`
+
+## fun emit_load_as
+
+```mach
+pub fun emit_load_as(b: *Builder, addr: value.Value, ty: Type, secret: bool) res[value.Value, fail.Fail];
+```
+
+a value of `ty` read from `addr` that is as secret as `secret`, whatever the reads around
+it are marked
 
 ## fun emit_store
 
@@ -665,7 +683,8 @@ address is the value
 pub fun emit_store(b: *Builder, v: value.Value, addr: value.Value) err[fail.Fail];
 ```
 
-write `v` to `addr`: an aggregate, held at an address, is copied
+write `v` to `addr`: an aggregate, held at an address, is copied. a store where the access is stated states the
+memory it writes as the access does, secret with its mark and public with the public flag
 
 ## fun emit_copy
 
@@ -673,24 +692,29 @@ write `v` to `addr`: an aggregate, held at an address, is copied
 pub fun emit_copy(b: *Builder, dst: value.Value, src: value.Value, ty: Type) err[fail.Fail];
 ```
 
-copy the bytes of a `ty` from `src` to `dst`
+copy the bytes of a `ty` from `src` to `dst`, marked secret where the read is or `src` is. a copy
+whose access is stated, as a store of an aggregate states the place it writes, states the bytes
+it moves: secret with its mark, or public where the place's type holds no secret, which sema
+holds the source's type to as well
 
 ## fun emit_memzero
 
 ```mach
-pub fun emit_memzero(b: *Builder, addr: value.Value, ty: Type) err[fail.Fail];
+pub fun emit_memzero(b: *Builder, addr: value.Value, ty: Type, secret: bool) err[fail.Fail];
 ```
 
-zero the bytes of a `ty` at `addr`
+zero the bytes of a `ty` at `addr`, a place whose type holds a secret where `secret` holds, which
+the fill states of the memory it writes
 
 ## fun emit_wipe
 
 ```mach
-pub fun emit_wipe(b: *Builder, addr: value.Value, count: value.Value, signed: bool, ty: Type) err[fail.Fail];
+pub fun emit_wipe(b: *Builder, addr: value.Value, count: value.Value, signed: bool, ty: Type, secret: bool) err[fail.Fail];
 ```
 
-zero the bytes of `count` of `ty` at `addr` through a kept fill: no pass removes or narrows
-it, and its length is the size of its target alone
+zero the bytes of `count` of `ty` at `addr`, a place whose type holds a secret where `secret`
+holds, through a kept fill: no pass removes or narrows it, and its length is the size of its
+target alone
 
 ## fun emit_offset
 
@@ -839,8 +863,8 @@ pub fun emit_call(b: *Builder, callee: value.Value, sig: Type, args: *value.Valu
 ```
 
 a call of `callee` through the signature `sig`, every argument named. an aggregate
-argument is passed whole, read from the address it travels at, and an aggregate result
-lands in a slot of its own
+argument is passed whole, read from the address it travels at as secret as the argument
+is, and an aggregate result lands in a slot of its own
 
 ## fun emit_call_named
 
@@ -903,7 +927,8 @@ strictly increasing values, one per target
 pub fun emit_ret(b: *Builder, v: value.Value) err[fail.Fail];
 ```
 
-return `v` from the function being built: an aggregate is read whole from its address
+return `v` from the function being built: an aggregate is read whole from its address, as
+secret as `v` is
 
 ## fun emit_ret_void
 

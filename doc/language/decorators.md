@@ -820,8 +820,10 @@ var depth: u32 = 0;
 
 ### `constant_time(mode)` — constant-time boundary
 
-Marks a function as a constant-time boundary. Applies to functions only, and
-takes one mode, `"soft"` or `"hard"`, which is required: a bare
+Marks a function as a constant-time boundary. Applies only to a function with a
+body, since the build proves the mark by walking the code it compiles: an `ext`
+declaration's code is compiled elsewhere and checked by nothing here, so the mark
+is refused there (`decorator.misplaced`). It takes one mode, `"soft"` or `"hard"`, which is required: a bare
 `#[constant_time]` is refused. Inside it, in either mode, the emitted code may
 not branch, index, address or divide on a secret, and a callee that receives a
 secret must be constant time itself. masc's walk proves this on the encoded
@@ -845,9 +847,9 @@ found or where the construct cannot be modelled. See
 what is refused, including the x86-64 conditional-branch limitation.
 
 The **zeroizing-write** guarantee is *not* one of the decorator's obligations,
-and describing it as one understates it. A write into secret storage carries a
-taint applied at lowering, keyed on the storage's secrecy rather than on any
-decorator, so a zeroizing wipe is protected in a function carrying no
+and describing it as one understates it. It rests on the write, not on any
+decorator: no pass removes a store, and `$zeroize` is a kept fill no pass may
+remove, so a zeroizing wipe is protected in a function carrying no
 `#[constant_time]` at all. See [secrecy.md](secrecy.md#the-zeroizing-write-guarantee)
 for what that covers and what it does not.
 

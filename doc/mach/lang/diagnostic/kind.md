@@ -3123,6 +3123,22 @@ pub val MEMORY_REFUSED: Kind = 526
 
 the allocator refused storage the command needed
 
+## val SECRET_CALL_UNTRUSTED
+
+```mach
+pub val SECRET_CALL_UNTRUSTED: Kind = 527
+```
+
+a constant-time function passing what holds a secret to a callee whose declaration does not make it constant time
+
+## val NAME_RESERVED
+
+```mach
+pub val NAME_RESERVED: Kind = 528
+```
+
+a symbol the source defines under a name the compiler delivers a symbol of its own under, as a helper's
+
 ## rec Spec
 
 ```mach
@@ -3140,7 +3156,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 526
+pub val COUNT: usize       = 528
 ```
 
 ## fun at

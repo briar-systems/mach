@@ -37,6 +37,29 @@ pub val DECLARATION_THREAD: DeclarationFlags = 8
 
 a `#[thread]` var: each thread holds its own copy, which every reference reaches through the thread
 
+## val DECLARATION_SOFT
+
+```mach
+pub val DECLARATION_SOFT: DeclarationFlags = 16
+```
+
+a function declared `#[constant_time("soft")]` or `#[constant_time("hard")]`: what a constant-time caller may trust of
+it, from its declaration alone
+
+## val DECLARATION_HARD
+
+```mach
+pub val DECLARATION_HARD: DeclarationFlags = 32
+```
+
+## val DECLARATION_WEAK
+
+```mach
+pub val DECLARATION_WEAK: DeclarationFlags = 64
+```
+
+a `#[weak]` function, a link-time default another definition may replace
+
 ## rec Declaration
 
 ```mach

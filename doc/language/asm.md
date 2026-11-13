@@ -297,6 +297,45 @@ secret load, so `mov rax, {p}` then `mov ecx, [rax]` is admitted and `ecx` is a
 secret from then on, while a secret pointer (`^*u32`) is a secret address and is
 refused as one.
 
+The binding also states what the pointer reaches, and that is what lets a block
+store a secret at all. A store of a secret is admitted only where something
+states the destination may hold one: a frame slot the check places exactly, a
+global whose type holds a secret, or memory reached through a pointer the block
+loaded straight from a `{name}` binding whose pointee type is secret in every
+byte (`*^u64`, `*[16]^u8`). A pointer binding whose pointee holds no secret
+(`*u64`) states that memory public, and a secret stored through it is refused.
+Every other destination, an address the block formed itself, a pointer it loaded
+from anywhere else, or one to a record that mixes secret and public members, is
+memory nothing states the secrecy of, and a secret stored there is refused.
+
+```mach fragment
+#[constant_time("soft")]
+fun copy(src: *^u64, dst: *^u64, count: *u64) {
+    asm x86-64 {
+        mov rax, {src}
+        mov rcx, [rax]            # a secret
+        mov rdx, {dst}
+        mov [rdx], rcx            # admitted: dst's pointee is secret
+        mov rdx, {count}
+        mov qword [rdx], 1        # admitted: a public value
+    }
+}
+```
+
+The statement follows the register the block loads the pointer into, from that
+load until the register is written again. A pointer copied to another register,
+offset with `add`, or spilled and reloaded is no longer the loaded one, so a
+store through it states nothing. Index from the loaded register in the address
+instead (`[rdx + 8]`, `[rdx + rcx*8]` with a public `rcx`).
+
+A block may not turn the processor's timing mode off inside a constant-time
+function: aarch64's `msr dit, xN` and `msr pstate.dit, #0` are refused. `msr
+pstate.dit, #1` is admitted when written as the mnemonic, as it
+sets what the function's own switch already set. The read, set and restore the
+frame code places around the body are the only other writes admitted. x86-64's
+DOITM is a model-specific register only the system writes, and RISC-V's Zkt is a
+promise with no mode to change, so neither has an instruction a block can use.
+
 ## Vector registers
 
 Both grammars take vector registers as operands. A vector register belongs to the
@@ -554,7 +593,10 @@ instruction after it. x86-64 has no such constraint.
 A raw encoding is an instruction stream the parser cannot read, so by default the
 block's clobber set becomes **every register in every bank**, and an `#[constant_time]`
 function may not contain one at all — which is why a real mnemonic is always preferable
-where one exists.
+where one exists. Data directives are not allowed in a constant-time function's `asm`:
+the check of the function's code tells a block's instructions apart from the compiler's
+by counting the instructions the block wrote, and a directive's bytes are no count of
+instructions, so a `.word` that encodes `msr pstate.dit, #1` is refused like any other.
 
 ## Declaring a raw encoding's effects
 

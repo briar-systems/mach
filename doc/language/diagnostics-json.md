@@ -24,7 +24,8 @@ and `-vv` write the [readout](readout.md) as [readout records](#readout-records)
 
 - Records go to stderr, one per line, in the order the human rendering shows
   the same reports. Stdout keeps what the command writes there, such as a test
-  run's human readout or a build step's banner.
+  run's human readout, a build step's banner or the listing `mach check
+  --declassified` writes, which stays plain lines.
 - Every line mach writes to stderr is a record, a JSON object on a line of its
   own, and the last one is the [summary](#the-summary-record). Output a build
   step or a test writes itself is not mach's and is not a record.

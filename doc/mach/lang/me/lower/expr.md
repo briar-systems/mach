@@ -56,6 +56,14 @@ its right operand runs only where the left does not decide
 pub fun condition_value(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: value.Value) res[value.Value, fail.Fail];
 ```
 
+## fun store_stated
+
+```mach
+pub fun store_stated(ctx: *lower_context.LowerContext, v: value.Value, ptr: value.Value, ty: type_kind.TypeId, vol: bool) err[fail.Fail];
+```
+
+write `v` to `ptr`, a place of source type `ty`, stating the memory it writes as secret or public as `ty` is
+
 ## fun const_value_of_init
 
 ```mach

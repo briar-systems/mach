@@ -44,6 +44,21 @@ way, failures and diagnostics included, went to the build's readout sink
 severity: the worst standing recorded, BUILD_OK to BUILD_INTERNAL; ordered, compared with >
 artifacts: the outputs written, in build order
 tests: the test dispatchers built, for the runner
+declassified: the declassifications a check listed, in module then source order
+
+## rec Declassified
+
+```mach
+pub rec Declassified;
+```
+
+one declassification of the source, a `:>T`
+
+file: the path of its file
+line: its line, from 1
+column: its column, from 1
+function: the function it stands in, "" at module scope
+secret: the type of the value it declassifies, as the source spells it
 
 ## fun outcome_init
 
@@ -78,6 +93,14 @@ pub fun record_test(bo: *BuildOutcome, t: testrun.TestArtifact) err[A.Error];
 ```
 
 t's text is borrowed; the outcome keeps its own copy. a nil text stays nil
+
+## fun record_declassified
+
+```mach
+pub fun record_declassified(bo: *BuildOutcome, d: Declassified) err[A.Error];
+```
+
+d's texts are borrowed; the outcome keeps its own copies
 
 ## fun severity_of
 

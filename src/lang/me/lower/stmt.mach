@@ -41,6 +41,7 @@ use mach.lang.type.query.subst;
 use masc_operand:  masc.core.operand;
 use masc_inline:   masc.inline;
 use mirl_assembly: mirl.ir.assembly;
+use mirl_global:   mirl.ir.global;
 use mirl.ir.id;
 use mirl.ir.type.table.Type;
 
@@ -428,7 +429,7 @@ fun lower_decl_stmt(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt) err[fai
             init = res_init.ok;
         }
         if (!built) {
-            val res_store: err[fail.Fail] = builder.emit_store_marked(?ctx.builder, init, slot, lower_expr.type_is_volatile_record(ctx, lower_context.decl_type_of(ctx, did)));
+            val res_store: err[fail.Fail] = lower_expr.store_stated(ctx, init, slot, lower_context.decl_type_of(ctx, did), lower_expr.type_is_volatile_record(ctx, lower_context.decl_type_of(ctx, did)));
             if (sel res_store.err) { ret res_store; }
         }
         birth_val = init;
@@ -436,13 +437,13 @@ fun lower_decl_stmt(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt) err[fai
         if (irt.is_aggregate(?ctx.m.types, storage_ty)) { birth_val = slot; }
     }
     or (irt.is_aggregate(?ctx.m.types, storage_ty) || irt.is_vector(?ctx.m.types, storage_ty)) {
-        val res_mz: err[fail.Fail] = builder.emit_memzero(?ctx.builder, slot, storage_ty);
+        val res_mz: err[fail.Fail] = builder.emit_memzero(?ctx.builder, slot, storage_ty, lower_context.type_contains_secret(ctx, lower_context.decl_type_of(ctx, did)));
         if (sel res_mz.err) { ret res_mz; }
         birth_val = slot;
     }
     or {
         val zc:        value.Value    = zero_const(ctx, slot_ty);
-        val res_store: err[fail.Fail] = builder.emit_store(?ctx.builder, zc, slot);
+        val res_store: err[fail.Fail] = lower_expr.store_stated(ctx, zc, slot, lower_context.decl_type_of(ctx, did), false);
         if (sel res_store.err) { ret res_store; }
         birth_val = zc;
     }
@@ -460,6 +461,41 @@ fun lower_decl_stmt(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt) err[fai
 fun head_selection(source: str, head: lang_source.Span) View {
     if (head.len == 0) { ret View{data: nil, len: 0}; }
     ret View{data: (?source[head.offset])::str, len: head.len::usize};
+}
+
+# the source type of the local or parameter `sym` an asm block binds, as the instance being lowered holds it
+fun bound_type(ctx: *lower_context.LowerContext, sym: resolve.SymbolId) type_kind.TypeId {
+    val opt_sym: opt[*resolve.Symbol] = lower_context.symbol_of(ctx, sym);
+    if (sel opt_sym.none) { ret type_kind.TYPE_NIL; }
+    val one: *resolve.Symbol = opt_sym.some;
+    if (one.kind != resolve.SYM_PARAM)                                                               { ret lower_context.decl_type_of(ctx, one.decl); }
+    if (ast_id.decl_is_nil(one.decl) || ast_id.decl_index(one.decl)::usize >= ctx.scope.a.decls.len) { ret type_kind.TYPE_NIL; }
+    val d:       *ast_decl.Decl = ?ctx.scope.a.decls.data[ast_id.decl_index(one.decl)];
+    val pool_ix: u32            = d.data.fun_.params_start + one.slot;
+    if (pool_ix::usize >= ctx.scope.a.typed_names.len) { ret type_kind.TYPE_NIL; }
+    ret lower_context.type_resolved_of(ctx, ctx.scope.a.typed_names.data[pool_ix].ty);
+}
+
+# what the binding of `sym` states of the storage the pointer its slot holds reaches, the walk's statement of an access
+# off an address the block loads from the slot: public where the pointee holds no secret, secret where every byte of
+# it is one, and nothing for a local that is no pointer, a secret pointer or a pointee secret in part
+fun bound_points(ctx: *lower_context.LowerContext, sym: resolve.SymbolId) res[mirl_assembly.Points, fail.Fail] {
+    val unstated: mirl_assembly.Points = mirl_assembly.Points.unstated{};
+    val tid:      type_kind.TypeId     = bound_type(ctx, sym);
+    if (type_kind.is_nil(tid) || type_kind.is_error(tid)) { ret res[mirl_assembly.Points, fail.Fail].ok{unstated}; }
+    val t_opt: opt[*type.Type] = type.get(?ctx.s.types, tid);
+    if (sel t_opt.none)                            { ret res[mirl_assembly.Points, fail.Fail].ok{unstated}; }
+    if (t_opt.some.kind != type_kind.TYPE_POINTER) { ret res[mirl_assembly.Points, fail.Fail].ok{unstated}; }
+    val base: type_kind.TypeId = t_opt.some.data.pointer.base;
+    if (!lower_context.type_contains_secret(ctx, base)) { ret res[mirl_assembly.Points, fail.Fail].ok{mirl_assembly.Points.public{}}; }
+    val ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, base);
+    if (sel ir.err) { ret res[mirl_assembly.Points, fail.Fail].err{ir.err}; }
+    var ranges: collections_vector.Vector[mirl_global.Range] = collections_vector.init[mirl_global.Range](ctx.s.alloc);
+    fin { collections_vector.dnit[mirl_global.Range](?ranges); }
+    val held: res[mirl_global.Secrecy, fail.Fail] = lower_context.global_secrecy(ctx, base, ir.ok, ?ranges);
+    if (sel held.err)      { ret res[mirl_assembly.Points, fail.Fail].err{held.err}; }
+    if (sel held.ok.whole) { ret res[mirl_assembly.Points, fail.Fail].ok{mirl_assembly.Points.secret{}}; }
+    ret res[mirl_assembly.Points, fail.Fail].ok{unstated};
 }
 
 fun lower_asm(ctx: *lower_context.LowerContext, sid: ast_id.StmtId, s: *ast_stmt.Stmt) err[fail.Fail] {
@@ -494,12 +530,15 @@ fun lower_asm(ctx: *lower_context.LowerContext, sid: ast_id.StmtId, s: *ast_stmt
         val b:    *resolve.AsmBind = ?binds.data[i];
         val slot: opt[value.Value] = lower_context.lookup_local(ctx, b.symbol);
         if (sel slot.none) { ret err[fail.Fail].err{fail.message("lower: an asm block names a local lowering never bound")}; }
-        val name: str                   = intern.text(?ctx.s.interner, b.name);
-        val op:   mirl_assembly.Operand = mirl_assembly.Operand{
+        val name:   str                                  = intern.text(?ctx.s.interner, b.name);
+        val points: res[mirl_assembly.Points, fail.Fail] = bound_points(ctx, b.symbol);
+        if (sel points.err) { ret err[fail.Fail].err{points.err}; }
+        val op: mirl_assembly.Operand = mirl_assembly.Operand{
             name:       View{data: name::*u8, len: str_len(name)},
             role:       masc_operand.READ_WRITE,
             constraint: masc_inline.Constraint.memory{},
-            ty:         builder.ptr_type(?ctx.builder)
+            ty:         builder.ptr_type(?ctx.builder),
+            points:     points.ok
         };
         val pushed: res[usize, A.Error] = collections_vector.push[mirl_assembly.Operand](?operands, op);
         if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
