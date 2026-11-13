@@ -151,7 +151,8 @@ why: the refusal, worded
 pub fun refusal(a: *A.Allocator, f: mink_fail.Fail) fail.Fail;
 ```
 
-mink's failure `f` as mach's
+mink's failure `f` as mach's: an allocation it was refused is the machine's, and anything
+else the compiler's
 
 ## fun refused
 

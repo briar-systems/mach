@@ -293,16 +293,19 @@ compat: the oldest version the image may load instead
 pub rec StepDef;
 ```
 
-one `[step.<name>]` table as parsed. the six arrays are owned by the manifest
+one `[step.<name>]` table as parsed. the seven arrays are owned by the manifest
 and freed by `dnit`. the removed keys `cmd` and `shell` are rejected by name
 
 name: the table key; an identifier
 argv: the required, non-empty `argv` array; `argv[0]` is non-empty
 argv_count: length of `argv`
 env_keys: keys of the `env` table, sorted case-insensitively then bytewise;
-            every key non-empty, free of '=', and unique ignoring case. nil when absent
+              every key non-empty, free of '=', and unique ignoring case. nil when absent
 env_values: the string value of each key, parallel to `env_keys`
 env_count: length of both `env` arrays
+env_in: the `env_in` array: names of inherited variables the step reads, each
+              non-empty, free of '=', and distinct by host name identity. nil when absent
+env_in_count: length of `env_in`
 in: the required `in` array of project-relative paths
 in_count: length of `in`
 out: the required `out` array of project-relative paths; a '*' is rejected
@@ -313,6 +316,7 @@ timeout: the `timeout` key, a duration such as "30s"; 0 when absent
 at: where the table's key is written
 argv_at: where each `argv` entry is written, parallel to `argv`
 env_at: where each `env` value is written, parallel to `env_values`
+env_in_at: where each `env_in` entry is written, parallel to `env_in`
 in_at: where each `in` entry is written, parallel to `in`
 out_at: where each `out` entry is written, parallel to `out`
 need_at: where each `need` entry is written, parallel to `need`

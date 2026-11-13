@@ -68,8 +68,8 @@ ret: the exit code `exit.of` maps the failure to
 pub fun dependency_report(a: *A.Allocator, r: *Report) report.Report;
 ```
 
-where a dependency command reports: progress on standard output, notes on standard error,
-and failures, the ones the command goes on past too, through the command's report
+where a dependency command reports: progress on standard output, and notes and failures,
+the ones the command goes on past too, through the command's report
 
 a: owns the report's effect notes
 r: the command's report, in the format `--diagnostics` selected
@@ -116,7 +116,6 @@ r: the command's report
 units: the plan's unit count; a banner prints only when it is more than one
 quiet: `--quiet`, which suppresses the banners
 tally: the human tally, counted as the events pass
-out: where a test run renders, stdout
 run: the running test run's results, from its run_start to its run_end
 count: how many results run holds
 mod_w: the module column's width
@@ -201,6 +200,8 @@ warnings: the warning records written
 made: whether the arena record paths are built in, and the base they are
           measured from, have been made; they are on first use
 built: under json, each unit's `built` line, which the summary record carries
+out: stdout as the command writes it, its first refused write kept as the
+          report's refusal
 
 ## fun report_init
 
@@ -213,6 +214,28 @@ until `report_close`
 
 r: the report
 format: the format the command writes
+
+## fun out
+
+```mach
+pub fun out(r: *Report) *io_writer.Writer;
+```
+
+where a command writes its output, stdout through the report, so a refused write fails the
+command as the system's
+
+## fun report_note
+
+```mach
+pub fun report_note(r: *Report, k: diagnostic_kind.Kind, text: str);
+```
+
+report a note of kind `k`, which points at nothing: `note: text` in human text, or a
+diagnostic record of note severity under json
+
+r: the command's report
+k: the note's kind, a row of note level
+text: what the note says
 
 ## fun report_fail
 
@@ -260,10 +283,11 @@ reason: why its tests did not run
 pub fun report_close(r: *Report, code: i64) i64;
 ```
 
-end the run: under json the summary record, the last line the command writes;
-the report's arena is released either way
+end the run: a refusal kept while it ran, such as a refused write to stdout,
+reported, then under json the summary record, the last line the command
+writes; the report's arena is released either way
 
 r: the command's report
 code: the exit code the command returns
-ret: code
+ret: the worse of code and the kept refusal's
 

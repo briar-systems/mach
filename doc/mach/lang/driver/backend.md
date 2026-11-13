@@ -87,8 +87,8 @@ the machine lowering builds for, refused for a cell no owner assembles yet
 pub fun refused_by_mink(a: *A.Allocator, lead: str, f: Fail) fail.Fail;
 ```
 
-mink's failure `f` as mach's, under `lead`: what mink does not do is the input's to change, and
-every other cause is the compiler's
+mink's failure `f` as mach's, under `lead`: what mink does not do is the input's to change, an
+allocation it was refused is the machine's, and every other cause is the compiler's
 
 ## fun object_bytes
 
@@ -200,10 +200,11 @@ names: the output section names, owned
 ## fun laying
 
 ```mach
-pub fun laying(b: *Back, a: *A.Allocator) res[Laying, fail.Fail];
+pub fun laying(b: *Back, a: *A.Allocator) res[opt[Laying], fail.Fail];
 ```
 
-the laying of the target's link, refused for a format mink lays out no image of
+the laying of the target's link, none for a format whose link lays out no sections, as a
+SPIR-V module's gives each id its index, and refused for a format mink links no image of
 
 ## fun laying_release
 

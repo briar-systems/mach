@@ -23,7 +23,7 @@ manifest or source, a failure already reported through diagnostics
 pub val INTERNAL: i64 = 2
 ```
 
-the compiler failed, whatever the input: a bug or an exhausted allocator
+the compiler failed, whatever the input: a bug
 
 ## val ENVIRONMENT
 
@@ -31,7 +31,7 @@ the compiler failed, whatever the input: a bug or an exhausted allocator
 pub val ENVIRONMENT: i64 = 3
 ```
 
-the machine refused: a file, directory, process or network operation failed
+the machine refused: storage, or a file, directory, process or network operation failed
 
 ## val TIMEOUT
 

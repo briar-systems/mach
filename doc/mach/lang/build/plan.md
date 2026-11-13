@@ -229,15 +229,9 @@ link requirements. a plan the caller never configured says so instead of
 claiming an empty dependency closure. a phase outside the catalog is an
 internal failure whose message `a` owns
 
-w: the sink; `explain` passes stdout
+w: the sink; `mach build --plan` passes the command's stdout
 p: the plan
 itn: resolves interned names
-
-## fun explain
-
-```mach
-pub fun explain(a: *A.Allocator, p: *BuildPlan, itn: *intern.Interner) err[fail.Fail];
-```
 
 ## fun phase_name
 

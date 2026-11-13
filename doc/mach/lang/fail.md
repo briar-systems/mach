@@ -23,8 +23,9 @@ location of the source map its holder reads, which the failure is rendered
 through. the exit
 code derives from the case: 1 for user, 2 for internal, 3 where a command
 distinguishes the environment. `reported` is declared first so a zero
-failure is one that invents no text. an allocation refusal is internal; the
-compiler recovers from none of them at the site that met them. a failure
+failure is one that invents no text. an allocation refusal is the
+environment's; the compiler recovers from none of them at the site that met
+them. a failure
 that carries text records whether it owns it: owned text was allocated
 through the allocator `dnit` is given and is released there, borrowed text
 (a literal, an interned text, storage someone else releases) never is. a
@@ -484,8 +485,9 @@ the failure that refused to make it
 pub fun refused(e: A.Error) Fail;
 ```
 
-the refusals the compiler recovers from at no site, each an internal failure
-carrying its text: the allocator's, a string operation and a format
+the refusals the compiler recovers from at no site, each carrying its text: the
+allocator's, which is the environment's, and a string operation, a format and
+the source map, each internal unless the allocator refused it
 
 ## fun str_refused
 
@@ -512,5 +514,5 @@ pub fun toml_refused(e: toml_error.TomlError) Fail;
 ```
 
 a document that does not parse is the user's, pointing at the byte the parser
-refused; one the allocator refused is internal
+refused; one the allocator refused is the environment's
 

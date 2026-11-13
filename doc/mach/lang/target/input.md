@@ -63,10 +63,9 @@ pub rec Input;
 ```
 
 a link input: a file at the path `text`, located, or a library or framework
-of the name `text`. `key` is the library a provider is registered under, ""
-for none, `include_referenced` whether the image loads it only when a live
-import references it, and `kind` what a library by name must be, SHARED for
-any other input
+of the name `text`. `include_referenced` whether the image loads it only
+when a live import references it, and `kind` what a library by name must be,
+SHARED for any other input
 
 ## fun token_is_path
 

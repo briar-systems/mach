@@ -33,8 +33,9 @@ compiler_id: *compiler.Identity, digest: *[32]u8) err[fail.Fail];
 
 what every module's key shares: the compiler identity, the configuration
 bytes the driver captured (target, platform, project identity), the request,
-the step outputs, the realized dependency closure, the link providers and
-the link requirements
+the realized dependency closure and the link requirements.
+a step's output reaches a module only as a file it embeds or a source it
+loads, each keyed by its bytes, so no step is part of the configuration
 
 ## fun test_object_path
 

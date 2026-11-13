@@ -68,9 +68,3 @@ pub fun test_object(object_key: *[32]u8, out: *[32]u8) err[fail.Fail];
 the key of a module's test object: the key of the normal object it is lowered
 against, which covers the module's whole source, tests included
 
-## fun step
-
-```mach
-pub fun step(prior: *[32]u8, owner: str, name: str, inputs: *[32]u8) err[fail.Fail];
-```
-

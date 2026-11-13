@@ -3075,6 +3075,54 @@ pub val SECRET_TARGET_UNGUARANTEED: Kind = 520
 
 a hard constant-time function on a target that does not guarantee the timing its code needs
 
+## val DEP_NOTE
+
+```mach
+pub val DEP_NOTE: Kind = 521
+```
+
+a note a dependency command writes as it works
+
+## val DEP_EFFECT
+
+```mach
+pub val DEP_EFFECT: Kind = 522
+```
+
+a change a dependency command made before it failed, written after the failure
+
+## val PROJECT_CREATED
+
+```mach
+pub val PROJECT_CREATED: Kind = 523
+```
+
+`mach init` made the project
+
+## val DEP_REALIZED
+
+```mach
+pub val DEP_REALIZED: Kind = 524
+```
+
+`mach init` realized a dependency it declared
+
+## val DEP_DECLARED
+
+```mach
+pub val DEP_DECLARED: Kind = 525
+```
+
+`mach init --no-deps` declared a dependency without realizing it
+
+## val MEMORY_REFUSED
+
+```mach
+pub val MEMORY_REFUSED: Kind = 526
+```
+
+the allocator refused storage the command needed
+
 ## rec Spec
 
 ```mach
@@ -3092,7 +3140,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 520
+pub val COUNT: usize       = 526
 ```
 
 ## fun at
@@ -3119,6 +3167,14 @@ pub fun is_error(k: Kind) bool;
 
 a diagnostic of kind `k` is an error: severity is the row's level, and a kind
 no row declares is a defect, raised as an error if at all
+
+## fun is_note
+
+```mach
+pub fun is_note(k: Kind) bool;
+```
+
+a diagnostic of kind `k` is a note
 
 ## fun live
 

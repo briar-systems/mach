@@ -83,6 +83,15 @@ pub fun put(values: *Environment, name: str, value: str, replace: bool) err[fail
 
 entries own both strings and use host identity before any overlay is applied
 
+## fun find
+
+```mach
+pub fun find(values: *Environment, name: str) res[opt[usize], fail.Fail];
+```
+
+the index of the entry named `name` by the host's name identity, none when the
+environment does not hold it
+
 ## fun remove
 
 ```mach
