@@ -61,6 +61,10 @@ rec RawPacket {
 }
 ```
 
+Variants overlap, so assigning one variant to another at a different offset
+copies through overlapping storage, which an assignment does correctly whatever
+the overlap ([statements.md](statements.md#expression-statements)).
+
 With manual composition, the compiler does not verify that `kind` and `data`
 agree. Keeping them consistent is the programmer's responsibility. In ordinary
 Mach code, prefer first-class `tag` declarations.

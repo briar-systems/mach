@@ -201,6 +201,16 @@ compute();
 Assignment is an expression (`x = y;` is an expression statement whose top
 operator is `=`), and so is a call whose result is discarded.
 
+An assignment gives the place the value the right side had before the
+assignment, always. A record, array, tag or union is copied byte for byte, and
+the storage on the two sides may overlap: two members of a `uni` at different
+offsets assigned to each other, or two pointers into one buffer, copy as if the
+whole right side were read before any of the left side is written. So
+`@(p::*[16]u64) = @((p + 8)::*[16]u64);` moves sixteen words down by one word,
+and its mirror moves them up. The one limit on "always" is a pointer that
+reaches a local in a way the language does not define
+([operators.md](operators.md#where-locals-lie)).
+
 ## Failure handling
 
 A function that can fail returns a tag. The caller tests the case with `sel`

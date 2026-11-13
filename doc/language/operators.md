@@ -267,6 +267,18 @@ Each of those reads, in full, `cannot take the address of a call result: `?`
 applies to a place (a binding, a field, an element, or a dereference)`. Bind
 the temporary to a `var` and take that binding's address.
 
+### Where locals lie
+
+A program cannot know where a call's locals are placed. A pointer to a local
+comes only from taking its address with `?`, and a pointer value that existed
+before a call began does not point into that call's locals. So a program may
+not reach a local by arithmetic on another address: a pointer made from an
+integer, from another local's address or from a parameter, that happens to land
+on a local whose address was never taken or on a local of a call that began
+after the pointer was made, has no defined result. The compiler may keep such a
+local in a register, or copy to and from it as though nothing else could
+overlap it.
+
 ## Index
 
 - `x[i]`: one element of an array, an element through a pointer, or one lane of
