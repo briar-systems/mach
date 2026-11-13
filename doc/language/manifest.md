@@ -725,12 +725,14 @@ and a finished module (`spirv`) have no page and are laid out byte-tight.
 
 ### Finished-module targets
 
-A `spirv` target's object output is a complete, self-contained module rather than
-a link input. Each module is written to `<out>/obj/<fqn-as-path>.spv` like any
-other target's objects, and the entry module already carries every function its
-stages reach, so it is the whole deliverable. Its artifact is a `module`, which needs no
-linker: the build publishes the entry module at the artifact's resolved `out` (or
-`-o`), and `--emit obj` stops at the module tree:
+A `spirv` target's artifact is a `module`. Each source module is written to
+`<out>/obj/<fqn-as-path>.o` like any other target's objects, and each generic instance
+the stages reach is compiled in an object of its own beside them, so an object is a
+link input that carries the `Linkage` capability and is not a module a Vulkan consumer
+takes. mink's SPIR-V link joins them into one module at the artifact's resolved `out`
+(or `-o`), giving each id its index and laying out no sections, and drops the
+`Linkage` capability and every linkage decoration, so the module it writes is the
+deliverable. `--emit obj` stops at the objects:
 
 ```toml
 [target.gpu]
@@ -741,7 +743,7 @@ abi = "shader"
 ```
 
 ```
-mach build . --target gpu     # writes the entry module at the artifact's out, and out/gpu/<profile>/obj/<module>.spv
+mach build . --target gpu     # links the module at the artifact's out, from the objects under out/gpu/<profile>/obj
 ```
 
 With `debug` on, each module carries its debug information inside it, written as core
@@ -1356,7 +1358,8 @@ any of them (see [test.md](test.md#which-tests-run)).
   the target's default when absent. A target whose loader runs no executable,
   such as a finished-module `spirv` target, refuses it in mink's words.
 - **`module`** is a module a runtime instantiates. On a finished-module target
-  such as `spirv` it is the entry module, written at `out` unlinked. A format
+  such as `spirv` it is the module mink's link joins from the build's objects,
+  written at `out`. A format
   mink builds no module in, such as ELF, refuses it.
 - **`object`** is each module's object, written under `obj/` for a later link,
   as `--emit obj` writes them. It takes no `out`, and `{artifact.<id>.out}` names
@@ -1495,8 +1498,8 @@ inspection use the same expansion.
 
 The selected object format supplies the naming rules, including explicit target
 format overrides. Unsupported library forms are errors. A SPIR-V `module` artifact is
-its entry module, delivered at `out` with the per-module objects still written under
-`obj/` (see [Finished-module targets](#finished-module-targets)).
+linked from the build's objects and delivered at `out`, with the objects still written
+under `obj/` (see [Finished-module targets](#finished-module-targets)).
 
 `{artifact.suffix}` is available only in an artifact output template. It does not
 expand in project output roots, link paths, step arguments or source embeds.
