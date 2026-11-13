@@ -1776,6 +1776,7 @@ plain identifier — it keys the step's stamp file.
 |--------|----------|---------|
 | `argv` | yes | Nonempty array of strings, spawned directly with no shell. `argv[0]` names the executable, by path or resolved on the planner `PATH`. Templates expand in every element. To use a shell, spell it: `["sh", "-c", "…"]`. |
 | `env`  | absent: nothing added | Table of string values added to the step process's environment. |
+| `env_in` | absent: none | Declared input variable list: names of inherited environment variables the step reads, such as `CC`. Each name is nonempty, holds no `=`, and is distinct from every other under the rules for `env` names. |
 | `in`   | yes | Declared input file list. Accepts globs (`*`, `**`), expanded sorted for a stable fingerprint; a glob that matches nothing is a hard error. |
 | `out`  | yes | Declared output file list. Concrete paths only — a glob here is an error, since the demand match and cache key expand `out` verbatim. |
 | `need` | absent: needs nothing | Array of `step.<name>` requirements or `step.<pattern>` globs this step must run after. Steps may require only steps. Cycles are manifest errors. |
@@ -1799,9 +1800,15 @@ link entry that demands it: on a build cell where that entry filters out, the st
 is never demanded and never runs.
 
 A step is cached by content: its declared inputs, resolved executable, expanded
-arguments, and effective environment contribute to its fingerprint. An unchanged
-step whose outputs still exist is skipped. Changing an inherited environment
-value received by the child also invalidates the step.
+arguments, and declared environment contribute to its fingerprint. The declared
+environment is the `env` table as expanded, the three `MACH_TARGET_*` values, and
+the value of each inherited variable `env_in` names, as the child receives it; a
+named variable that is unset keys differently from one set to the empty string.
+The child still inherits the whole environment, but an inherited variable the step
+does not name in `env_in` is not an input, exactly as a file missing from `in` is
+not: changing it does not invalidate the step. `PATH` reaches the fingerprint only
+through the executable it resolves `argv[0]` to. An unchanged step whose outputs
+still exist is skipped.
 
 The fingerprint of the last successful run is kept as a stamp in
 `{project.work}/.cache/steps/`, and a step's outputs under `{project.work}` are
