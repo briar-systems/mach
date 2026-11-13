@@ -746,13 +746,17 @@ abi = "shader"
 mach build . --target gpu     # links the module at the artifact's out, from the objects under out/gpu/<profile>/obj
 ```
 
-With `debug` on, each module carries its debug information inside it, written as core
-instructions that need no capability or extension and so fit every `env`: `OpString`
-and `OpSource` name the source files, `OpName` names functions, interface variables and
-locals, `OpName` and `OpMemberName` name a uniform or storage block's record and its
-fields, and `OpLine` attributes each instruction to its source line and column. A
-required shader artifact built for a consumer's debug profile therefore builds, and
-validation layers and capture tools report names and source lines.
+With `debug` on, each module carries its debug information inside it, written only with
+what its `env` holds, so it fits every `env`: `OpString` and `OpSource` name the source
+files, `OpName` names functions, interface variables and locals, `OpName` and
+`OpMemberName` name a uniform or storage block's record and its fields, and each
+instruction is attributed to its source line and column. Where the environment holds
+non-semantic instructions, SPIR-V 1.6 (`vulkan1.3` and later) or the
+`SPV_KHR_non_semantic_info` extension, the lines are `NonSemantic.Shader.DebugInfo.100`
+`DebugLine` instructions under a `DebugCompilationUnit` and a `DebugSource` per file.
+Elsewhere they are core `OpLine` instructions. A required shader artifact built for a
+consumer's debug profile therefore builds, and validation layers and capture tools report
+names and source lines.
 
 `env` is a general target key whose values are owned by the target's isa; a
 `spirv` target uses it to declare the environment its modules are consumed in.
@@ -1033,7 +1037,7 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 | `optimize` | bool | Whether the build asks mirl for its release schedule of passes. `false` asks for the debug schedule, which keeps the passes every build needs. The legalization passes, which make the program something the target can execute, run at every setting. A non-boolean is a manifest error. |
 | `relax` | array of strings | **Optional.** The departures from exact semantics the build permits. The one there is, `"float-reassoc"`, is described under [Float reassociation](#float-reassociation). Absent, the build keeps exact semantics. |
 | `linker_relax` | bool | **Optional.** Whether the linker may relax the code, as RISC-V linker relaxation shortens a call or an address pair once the link has placed its target. The build hands it to mirl's `relax` build option on every target, and a target whose linker relaxes nothing takes it without effect. `false` keeps every instruction sequence at the length the compiler laid it out. Absent, it is `true`. It has no command-line form. A non-boolean is a manifest error. |
-| `debug` | bool    | Emit debug info for this profile: DWARF in ELF, Mach-O and COFF objects alike, and the core SPIR-V debug instructions on a `spirv` target (see [Finished-module targets](#finished-module-targets)). A PE image carries its DWARF in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
+| `debug` | bool    | Emit debug info for this profile: DWARF in ELF, Mach-O and COFF objects alike, and the SPIR-V debug instructions its `env` holds on a `spirv` target (see [Finished-module targets](#finished-module-targets)). A PE image carries its DWARF in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
 | `simd`  | string  | SIMD scalarization lever. `"scalarize"` is the one setting a build accepts: mirl legalizes every vector operation, so a target with no packed instruction for an operator gets a defined unrolled scalar expansion. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. `"require"` is refused, since mirl reports no operation it scalarizes and a build cannot be held to packed forms. Any other string is a manifest error. |
 | `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile requirement and selection](#profile-requirement-and-selection). |
 | `allow` | array of strings | **Optional.** The warnings this profile silences, each entry a key or a family of keys from the [warning key table](#silencing-warnings), named once. An unknown key, an entry that covers only errors, a repeated entry or a non-string entry is a manifest error. Absent, nothing is silenced. |
