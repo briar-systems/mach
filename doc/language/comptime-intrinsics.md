@@ -394,7 +394,7 @@ that type prints `^Pair`.
 ## `$type_id(T)` — a type's identity
 
 ```mach fragment
-$type_id(T)             # a u64 unique to T
+$type_id(T)             # a u64 that identifies T
 ```
 
 A value, like `$type_name`, and a compile-time constant: it folds wherever the layout
@@ -403,15 +403,18 @@ so it can gate a `$if`, initialize a `val`, or be compared at run time against a
 stored one. Its type is `u64`. It never adopts a narrower binding by value, because
 an identity cut to 32 bits is not one: `val id: u32 = $type_id(T)` is a type mismatch.
 
-The contract:
+The id is the first 64 bits of a hash over the type's canonical recipe, which spells
+a nominal type by its module path and name and every other type by its parts. So:
 
-- **Distinct for distinct types.** Types are nominal, so two records named `Point`
-  in two modules have two identities. `^T` differs from `T`, and `*T`, `[N]T`,
-  a function type and each instance of a generic differ by their parts:
-  `$type_id(Box[u64])` is not `$type_id(Box[u32])`.
 - **Equal for the same type** wherever it is named: in any module, at any
   instantiation site of a generic, and in every compilation unit and library of one
   program. A `def` is a transparent alias, so `def Id: Point;` has `Point`'s identity.
+- **Changed by a rename or a move.** Renaming the type, renaming its module or moving
+  it to another module gives it a different id.
+- **Different types almost always differ, but are not guaranteed to.** `^T` and `T`,
+  two records named `Point` in two modules, and `Box[u64]` and `Box[u32]` have
+  different recipes, but two distinct types can in principle hash to the same id,
+  and the compiler does not detect it.
 - **Unaffected by optimization and linking.** It is a constant the compiler folds,
   not an address, so no folding of identical code or data can merge two identities.
 
@@ -435,20 +438,6 @@ fun main() i32 {
     ret 0;
 }
 ```
-
-**Why a hash, and how often it collides.** A program's units are compiled
-separately, and a library may be compiled long before the program that links it, so
-no unit can see every type that will share the program. A numbering with no
-collisions needs that global view, and an address needs the linker and breaks at a
-shared library, whose internal symbols are hidden. So the identity is derived from
-the type alone: the first 64 bits of SHA-256 over the type's canonical recipe, which
-spells a nominal type by its owning module and name and every other type by its
-parts. Two distinct types of one program share an identity only by collision. For
-`n` distinct types that chance is at most `n(n-1)/2^65`: about `2^-26` for a million
-types, and far less for any real program. A check that pins a value to one type is
-defeated only when the two colliding types are the very pair it compares, and a
-source author aiming for that must find a SHA-256 match on 64 bits, about `2^64`
-work, while naming only types of their own program.
 
 The value is the same for every build of one program by one compiler. It is not
 promised across compiler versions, so a stored identity is a check inside a
