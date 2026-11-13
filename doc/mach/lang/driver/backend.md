@@ -101,10 +101,10 @@ the bytes of `o` laid out in the target's object format, given back with sink.re
 ## fun read_object
 
 ```mach
-pub fun read_object(b: *Back, a: *A.Allocator, file: str, bytes: Vector[u8]) opt[Object];
+pub fun read_object(b: *Back, a: *A.Allocator, file: str, bytes: Vector[u8]) res[Object, fail.Fail];
 ```
 
-the object the bytes of the file `file` hold, none when mink reads no object from them
+the object the bytes of the file `file` hold, which owns the bytes, or mink's refusal to read one
 
 ## val RECORD_SECTION
 
