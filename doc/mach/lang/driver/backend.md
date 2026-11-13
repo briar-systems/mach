@@ -57,6 +57,16 @@ pub fun merges(b: *Back) bool;
 whether the objects the back half writes hold merged definitions (mink.model.merged), the
 copies of one a link keeps one of: false for a format masc writes none in
 
+## fun unlisted
+
+```mach
+pub fun unlisted(b: *Back) opt[str];
+```
+
+whether an image of format `f` exports only what its inputs' export directives name, so a
+definition states no visibility; false for a format mink links no image of
+the name of the mirl family that compiles the build when it writes no listing of its objects, none when it writes one
+
 ## fun close
 
 ```mach

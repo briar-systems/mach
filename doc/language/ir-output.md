@@ -17,7 +17,7 @@ mirl emit out/ir/demo/demo.main.ir --emit object
 An emitted build is never restored from the object cache, so every module's
 text is written each time.
 
-`--emit asm` writes masc's listing of each module beside its object.
+`--emit asm` writes masc's listing of each module beside its object. A target whose objects mirl writes without masc's builder, wasm and SPIR-V, has no listing, and the flag is refused for it before anything compiles.
 
 ## See also
 
