@@ -3,7 +3,7 @@
 ## fun artifact_set
 
 ```mach
-pub fun artifact_set(alloc: *A.Allocator, itn: *intern.Interner, lead: str, sub: *toml.Table, d: *ArtifactDef) err[fail.Fail];
+pub fun artifact_set(alloc: *A.Allocator, itn: *intern.Interner, lead: str, sub: *toml_value.Table, d: *ArtifactDef) err[fail.Fail];
 ```
 
 every key `--set` writes over an artifact that the table `sub` holds, decoded over `d` with
@@ -32,7 +32,7 @@ ret: mink's row, or the refusal's text
 ## fun parse_artifacts
 
 ```mach
-pub fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
+pub fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail];
 ```
 
 ## fun export_validate

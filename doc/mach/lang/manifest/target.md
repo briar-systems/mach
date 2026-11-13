@@ -27,13 +27,13 @@ ret: the formatted tuple; err when the allocator refused it
 ## fun parse_targets
 
 ```mach
-pub fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
+pub fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail];
 ```
 
 ## fun rewrites
 
 ```mach
-pub fun rewrites(alloc: *A.Allocator, doc: *toml.Table, out: *Vector[Fix]) err[fail.Fail];
+pub fun rewrites(alloc: *A.Allocator, doc: *toml_value.Table, out: *Vector[Fix]) err[fail.Fail];
 ```
 
 every rewrite of a target spelling the previous major wrote, as fixes of the manifest's text,
@@ -49,7 +49,7 @@ ret: ok, or the refusal of an allocation
 ## fun target_set
 
 ```mach
-pub fun target_set(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml.Table, lead: str, d: *TargetDef) err[fail.Fail];
+pub fun target_set(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml_value.Table, lead: str, d: *TargetDef) err[fail.Fail];
 ```
 
 every key `--set` writes over a target that the table `sub` holds, decoded over `d` with where

@@ -105,7 +105,7 @@ a release-selected git dependency: its requirements are the chosen release's
 
 ```mach
 pub fun realize(op: *Operation, reqs: *Vector[Request], quiet: bool, offline: bool, verify_only: bool,
-candidate: *toml.Table, picks: *Vector[resolver.Choice]) err[fail.Fail];
+candidate: *toml_value.Table, picks: *Vector[resolver.Choice]) err[fail.Fail];
 ```
 
 walk and realize the closure into `reqs`, the root's manifest read from `candidate` when
@@ -162,7 +162,7 @@ pub fun free_requests(a: *A.Allocator, requests: *Vector[Request]);
 ## fun declared
 
 ```mach
-pub fun declared(a: *A.Allocator, reqs: *Vector[Request], root: str, mt: *toml.Table) err[fail.Fail];
+pub fun declared(a: *A.Allocator, reqs: *Vector[Request], root: str, mt: *toml_value.Table) err[fail.Fail];
 ```
 
 the root's own declarations in the manifest table `mt`, appended to `reqs`
@@ -196,7 +196,7 @@ a note for each change made before a failure, which the caller shows after it
 ## fun key_text
 
 ```mach
-pub fun key_text(t: *toml.Table, key: str) str;
+pub fun key_text(t: *toml_value.Table, key: str) str;
 ```
 
 a string key as the dependency commands read it: absent reads as empty

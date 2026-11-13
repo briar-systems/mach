@@ -12,7 +12,7 @@ more than one `default = true` profile is refused, pointing at the first
 ## fun parse_profiles
 
 ```mach
-pub fun parse_profiles(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
+pub fun parse_profiles(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail];
 ```
 
 the `[profile.*]` tables; the schema check admits no manifest without one

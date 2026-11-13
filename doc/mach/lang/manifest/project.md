@@ -3,7 +3,7 @@
 ## fun parse_project
 
 ```mach
-pub fun parse_project(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
+pub fun parse_project(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail];
 ```
 
 ## fun expand_project_work

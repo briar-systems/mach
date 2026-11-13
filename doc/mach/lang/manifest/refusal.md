@@ -27,7 +27,7 @@ by `alloc`; a refused allocation is the failure instead
 ## fun point_at
 
 ```mach
-pub fun point_at(f: fail.Fail, sp: toml.Span) fail.Fail;
+pub fun point_at(f: fail.Fail, sp: toml_value.Span) fail.Fail;
 ```
 
 the same failure pointing at `sp` in the manifest being parsed; the zero span
@@ -45,7 +45,7 @@ missing from the file itself
 ## fun fail_at
 
 ```mach
-pub fun fail_at(f: fail.Fail, sp: toml.Span) err[fail.Fail];
+pub fun fail_at(f: fail.Fail, sp: toml_value.Span) err[fail.Fail];
 ```
 
 a failure pointing at `sp`, as `point_at` places it
@@ -53,7 +53,7 @@ a failure pointing at `sp`, as `point_at` places it
 ## fun span_site
 
 ```mach
-pub fun span_site(sp: toml.Span) lang_source.Location;
+pub fun span_site(sp: toml_value.Span) lang_source.Location;
 ```
 
 where `sp` is written in the manifest being parsed, as a range whose file
@@ -63,7 +63,7 @@ parser did not write
 ## fun element_sites
 
 ```mach
-pub fun element_sites(alloc: *A.Allocator, arr: *toml.Array) res[*lang_source.Location, fail.Fail];
+pub fun element_sites(alloc: *A.Allocator, arr: *toml_value.Array) res[*lang_source.Location, fail.Fail];
 ```
 
 where each element of `arr` is written, in order, as `span_site` places it;

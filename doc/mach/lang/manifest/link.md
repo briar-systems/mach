@@ -21,7 +21,7 @@ versions: copied from the link
 ## fun parse_links
 
 ```mach
-pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
+pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail];
 ```
 
 ## fun free_link_claims

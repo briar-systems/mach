@@ -91,7 +91,7 @@ not: after a quote, a space or a path's `/`, and before a quote, a space or an `
 ## fun runs_mach
 
 ```mach
-pub fun runs_mach(text: str, args: *toml.Array) bool;
+pub fun runs_mach(text: str, args: *toml_value.Array) bool;
 ```
 
 whether a step's `argv`, its literals in `text`, runs mach

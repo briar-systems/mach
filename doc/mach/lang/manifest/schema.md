@@ -44,7 +44,7 @@ the row of `key` among `rows`, nil when no row names it
 ## fun check
 
 ```mach
-pub fun check(alloc: *A.Allocator, doc: *toml.Table) err[fail.Fail];
+pub fun check(alloc: *A.Allocator, doc: *toml_value.Table) err[fail.Fail];
 ```
 
 check a parsed manifest document against the schema: every key it writes is a
@@ -66,7 +66,7 @@ pub rec Setting;
 a `--set` key and value, read as the manifest reads the key
 
 section: the root key of the tables the key is written over, such as "target"
-doc: the document `<key> = <value>`, released with toml.dnit
+doc: the document `<key> = <value>`, released with toml_tree.dnit
 text: the document's text, which a refusal of the value points into
 
 ## val SET_PATH
@@ -106,7 +106,7 @@ byte, which a basic string cannot hold, as its `\u00XX` escape
 ## fun section_check
 
 ```mach
-pub fun section_check(alloc: *A.Allocator, doc: *toml.Table, key: str) err[fail.Fail];
+pub fun section_check(alloc: *A.Allocator, doc: *toml_value.Table, key: str) err[fail.Fail];
 ```
 
 check one section of the document root, as `check` holds it, for a reader
@@ -129,7 +129,7 @@ one replacement of the bytes `at` to `at + len` of a manifest's text by
 ## fun rewrites
 
 ```mach
-pub fun rewrites(alloc: *A.Allocator, doc: *toml.Table, out: *Vector[Fix]) err[A.Error];
+pub fun rewrites(alloc: *A.Allocator, doc: *toml_value.Table, out: *Vector[Fix]) err[A.Error];
 ```
 
 every rewrite the schema's rows call for in a parsed manifest document, as
@@ -160,7 +160,7 @@ at: the key token as written
 ## fun leftovers
 
 ```mach
-pub fun leftovers(doc: *toml.Table, out: *Vector[Leftover]) err[A.Error];
+pub fun leftovers(doc: *toml_value.Table, out: *Vector[Leftover]) err[A.Error];
 ```
 
 every removed key a parsed manifest document writes that no rewrite migrates, in every table
@@ -173,7 +173,7 @@ ret: ok, or the allocator's refusal
 ## fun key_text
 
 ```mach
-pub fun key_text(t: *toml.Table, key: str) str;
+pub fun key_text(t: *toml_value.Table, key: str) str;
 ```
 
 a string key as the manifest reads it: absent and empty are the same err
@@ -182,7 +182,7 @@ a string key as the manifest reads it: absent and empty are the same err
 ## fun flag
 
 ```mach
-pub fun flag(t: *toml.Table, key: str) bool;
+pub fun flag(t: *toml_value.Table, key: str) bool;
 ```
 
 a boolean key's value, false when it is not written; the schema check has
@@ -191,7 +191,7 @@ refused any other shape
 ## fun written_value
 
 ```mach
-pub fun written_value(t: *toml.Table, key: str) *toml.Value;
+pub fun written_value(t: *toml_value.Table, key: str) *toml_value.Value;
 ```
 
 the value of a key the schema check has seen written with its row's shape, nil
@@ -200,7 +200,7 @@ when it is not written
 ## fun key_span
 
 ```mach
-pub fun key_span(tab: *toml.Table, i: usize) toml.Span;
+pub fun key_span(tab: *toml_value.Table, i: usize) toml_value.Span;
 ```
 
 the key token of a table's entry `i` as written; the zero span when absent
@@ -208,7 +208,7 @@ the key token of a table's entry `i` as written; the zero span when absent
 ## fun element_span
 
 ```mach
-pub fun element_span(arr: *toml.Array, i: usize) toml.Span;
+pub fun element_span(arr: *toml_value.Array, i: usize) toml_value.Span;
 ```
 
 the literal of an array's element `i`; the zero span when absent
@@ -216,7 +216,7 @@ the literal of an array's element `i`; the zero span when absent
 ## fun origin
 
 ```mach
-pub fun origin(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml.Table, lead: str, key: str) res[Origin, fail.Fail];
+pub fun origin(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml_value.Table, lead: str, key: str) res[Origin, fail.Fail];
 ```
 
 the literal of the value `key` names in a table; the zero span when absent
@@ -234,13 +234,13 @@ ret: the origin, or a refused allocation
 ## fun value_span
 
 ```mach
-pub fun value_span(tab: *toml.Table, key: str) toml.Span;
+pub fun value_span(tab: *toml_value.Table, key: str) toml_value.Span;
 ```
 
 ## fun value_text
 
 ```mach
-pub fun value_text(alloc: *A.Allocator, v: *toml.Value) res[str, fail.Fail];
+pub fun value_text(alloc: *A.Allocator, v: *toml_value.Value) res[str, fail.Fail];
 ```
 
 a scalar value as a refusal quotes it; a refused allocation is the failure
@@ -282,7 +282,7 @@ the rule `-o` keeps wherever it names an output, which the cli prints and build 
 ## fun check_path
 
 ```mach
-pub fun check_path(alloc: *A.Allocator, value: str, field: str, sp: toml.Span) err[fail.Fail];
+pub fun check_path(alloc: *A.Allocator, value: str, field: str, sp: toml_value.Span) err[fail.Fail];
 ```
 
 refuse a path that `is_project_path` does not admit, naming it as `field`
@@ -303,7 +303,7 @@ present: the key is written
 ## fun ids_of
 
 ```mach
-pub fun ids_of(alloc: *A.Allocator, itn: *intern.Interner, arr: *toml.Array, label: str, key: str) res[StrArr, fail.Fail];
+pub fun ids_of(alloc: *A.Allocator, itn: *intern.Interner, arr: *toml_value.Array, label: str, key: str) res[StrArr, fail.Fail];
 ```
 
 intern every element of an array of strings the schema check has admitted

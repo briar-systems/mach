@@ -27,7 +27,7 @@ ret: the manifest, or the first error as a "mach.toml: ..." message pointing at
 ## fun project_parse
 
 ```mach
-pub fun project_parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
+pub fun project_parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail];
 ```
 
 the `[project]` table of a parsed TOML document alone, held to its rows as

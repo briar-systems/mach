@@ -419,7 +419,7 @@ pub fun format_text(e: std_format.FormatError) str;
 ## fun toml_text
 
 ```mach
-pub fun toml_text(e: toml.TomlError) str;
+pub fun toml_text(e: toml_error.TomlError) str;
 ```
 
 ## fun prefixed
@@ -508,7 +508,7 @@ pub fun source_refused(e: lang_source.Error) Fail;
 ## fun toml_refused
 
 ```mach
-pub fun toml_refused(e: toml.TomlError) Fail;
+pub fun toml_refused(e: toml_error.TomlError) Fail;
 ```
 
 a document that does not parse is the user's, pointing at the byte the parser
