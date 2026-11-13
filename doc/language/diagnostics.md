@@ -107,7 +107,7 @@ modules or generic instances raise it.
 | `dep`, `mach`, `git` | dependencies: declaration, resolution, realization and pins, the compiler range the closure accepts, and the Git operations behind them, and the notes a dependency command writes (`dep.note`, `dep.effect`, `dep.realized`, `dep.declared`) |
 | `test` | the test runner, alongside `test` blocks |
 | `cli`, `editor` | command-line flags, commands and operands, and the editor analysis entry points |
-| `fs`, `process`, `env` | the machine: a file, process or environment operation that failed |
+| `fs`, `process`, `env`, `memory` | the machine: a file, process or environment operation that failed, or storage the allocator refused (`memory.refused`) |
 | `link`, `object`, `resource`, `debug` | the link: its declared inputs, undefined and duplicate symbols, relocations that overflow or are unsupported, images over a format limit, and input objects, archives, libraries or resources that are malformed, unsupported or of another format, and the debug info it cannot merge (`debug.dropped`) |
 | `catalog` | a member of a closed catalog read from input that is malformed or that the target cannot honor |
 | `compiler` | `compiler.internal`, a defect in mach |
