@@ -9,6 +9,9 @@ with three options, one per axis:
 - `-t, --target <pattern>` selects `[target.<name>]` entries;
 - `-p, --profile <pattern>` selects `[profile.<name>]` entries.
 
+`-t` names which targets: in a project, a name or glob over the manifest's target
+names, and in an [entry build](#entry-builds), a `<sys>-<arch>`.
+
 A pattern is an exact name, which must be declared, or a glob in which `*`
 matches any run of characters and `?` any one character, which must match at
 least one entry. Each option repeats, and the axis takes every entry any of its
@@ -91,6 +94,9 @@ matrix, so a bare `mach build <path>` never widens into a target it was not aske
 for.
 
 ## `-o` names one output
+
+`-o` names the build's output, and `mach run -o <path>` names the same output, the
+program it launches.
 
 `-o` is accepted exactly when the selection resolves to a single (artifact, target,
 profile), and refused otherwise, naming the cells it resolved to. Two artifacts
