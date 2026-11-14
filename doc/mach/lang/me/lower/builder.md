@@ -61,14 +61,15 @@ pub fun bind_storage(b: *Builder, slot: value.Value, binding: debug.Binding) err
 
 bind a variable to the stack slot `slot` holds it in: the slot's alloca names it
 
-## fun state_public
+## fun state_publics
 
 ```mach
-pub fun state_public(b: *Builder, slot: value.Value) err[fail.Fail];
+pub fun state_publics(b: *Builder, slot: value.Value, ranges: Slice[mirl_global.Range]) err[fail.Fail];
 ```
 
-state that the stack slot `slot` holds no secret, as the source type of what it holds says: the public flag on its
-alloca, which the walk of a constant-time function's code takes as a typed frame extent
+state the bytes of the stack slot `slot` that the source type of what it holds lays out as public, `ranges` as the
+module takes them: the public ranges of its alloca, which the walk of a constant-time function's code takes as typed
+frame extents, and every other byte of it as of a secret type. none states every byte so
 
 ## fun bind_value
 
@@ -741,6 +742,17 @@ copy the bytes of a `ty` from `src` to `dst`, marked secret where the read is or
 whose access is stated, as a store of an aggregate states the place it writes, states the bytes
 it moves: secret with its mark, or public where the place's type holds no secret, which sema
 holds the source's type to as well
+
+## fun copy_publics
+
+```mach
+pub fun copy_publics(b: *Builder, dst: value.Value, src: value.Value, ty: Type, ranges: Slice[mirl_global.Range]) err[fail.Fail];
+```
+
+the bytes of each of `ranges` of an aggregate of `ty` at `src`, which its type lays out as public, copied again to
+the same bytes at `dst` after the whole copy, each copy stated public, so the walk of a constant-time function sees
+those bytes of `dst` written with what public storage held where the whole copy, stated secret, moved them in words
+that also held a secret
 
 ## fun emit_memzero
 

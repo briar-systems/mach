@@ -706,7 +706,27 @@ builds an aggregate of `ir`, which the destination holds; none for any other
 pub fun slot_for(lc: *LowerContext, tid: type_kind.TypeId, ir: Type) res[value.Value, fail.Fail];
 ```
 
-a stack slot for a value of the source type `tid`, held in `ir`, stated public where `tid` holds no secret
+a stack slot for a value of the source type `tid`, held in `ir`, with the bytes `tid` lays out as public stated
+
+## fun state_slot
+
+```mach
+pub fun state_slot(lc: *LowerContext, slot: value.Value, tid: type_kind.TypeId, ir: Type) err[fail.Fail];
+```
+
+state on the alloca of `slot`, which holds a value of source type `tid` held in `ir`, the bytes `tid` lays out as
+public (`public_ranges`), nothing for a type that is no type
+
+## fun public_ranges
+
+```mach
+pub fun public_ranges(lc: *LowerContext, tid: type_kind.TypeId, ir: Type, out: *collections_vector.Vector[mirl_global.Range]) err[fail.Fail];
+```
+
+the public byte ranges of a value of source type `tid`, held in `ir`, into `out`, ascending and none touching
+another: every byte its secret ranges leave, a tag's discriminant and padding included. padding of a type that holds
+a secret is written zero wherever a value of it is made or stored whole, and nothing types a part of it, so it holds
+no secret
 
 ## fun debug_type_of
 
