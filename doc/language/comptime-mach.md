@@ -131,22 +131,22 @@ refused on aarch64 although the left side is false. Write the nested form:
 ```mach fragment
 $if ($mach.build.arch == $mach.arch.x86_64) {
     $if ($mach.build.ext.sha == 1) {
-        use backend: std.crypto.hash.sha256.x86_sha;
+        use backend: crypto.hash.sha256.x86_sha;
     }
     $or {
-        use backend: std.crypto.hash.sha256.portable;
+        use backend: crypto.hash.sha256.portable;
     }
 }
 $or ($mach.build.arch == $mach.arch.aarch64) {
     $if ($mach.build.ext.sha2 == 1) {
-        use backend: std.crypto.hash.sha256.arm_sha2;
+        use backend: crypto.hash.sha256.arm_sha2;
     }
     $or {
-        use backend: std.crypto.hash.sha256.portable;
+        use backend: crypto.hash.sha256.portable;
     }
 }
 $or {
-    use backend: std.crypto.hash.sha256.portable;
+    use backend: crypto.hash.sha256.portable;
 }
 ```
 
