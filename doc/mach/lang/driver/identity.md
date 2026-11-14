@@ -3,11 +3,12 @@
 source identity: what a merged definition was made from, independent of how
 it was compiled (mink.model.merged)
 
-a module's identity folds its fully qualified name, the digest of its bare
-surface (driver/surface: its text without the bodies no importer compiles,
-free of paths and positions), the digests of the files it embeds and the
-identities of the modules it imports, so it covers every declaration and
-every generic or comptime body an instance of it can read, transitively. an
+a module's identity folds its fully qualified name, the digest of its
+template text (driver/surface: its text without the bodies of tests and of
+functions that are not templates, free of paths and positions), the digests
+of the files it embeds and the identities of the modules it imports, so it
+covers every declaration and every template body an instance of it can
+read, transitively. an
 instance's identity has the parts mink.model.merged states: its source, a
 digest of its symbol and the identities of the modules its typing reads
 (frontend.instance_reads), then the float relaxations the build permits and

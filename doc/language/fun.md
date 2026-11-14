@@ -158,8 +158,8 @@ through `m#instances.7`, and which one depends on its name alone.
   link keeps the first copy in link order. Each copy carries the instance's
   **identity** in two parts. Its source is a digest of what it was made from:
   its mangled name and the source of every module its typing reads (its
-  declarations and generic bodies, the files it embeds and the same of every
-  module it imports). Its settings are the profile's float relaxations (`relax`)
+  declarations and the bodies of its generic, comptime-value and pack
+  functions, the files it embeds and the same of every module it imports). Its settings are the profile's float relaxations (`relax`)
   and the target's instruction set and extensions (`ext`), the two settings
   that change what the code computes or where it can run. The compiler, the
   optimization level, debug information and paths are left out. So two static
@@ -200,15 +200,23 @@ through `m#instances.7`, and which one depends on its name alone.
   body's own span as the related site. A module that reaches it through several
   call sites reports it once, so `mach check` shows a refusal once for each module
   that must change, and every file that asks for a broken instance shows it.
-- **Reused across builds.** A unit's object stays in `obj/` beside its generic
-  module's, keyed by its members and the surfaces of the modules they name, so a
+- **Reused across builds.** An instance is keyed by its mangled name, the text
+  of its generic's module without the bodies of its plain functions and tests,
+  and the declarations of every module its typing reads (their text without any
+  function body, and the same of every module each imports). A unit's object
+  stays in `obj/` beside its generic module's, keyed by its members' keys, so a
   rebuild that changes none of those reuses it. A module's object record lists the
   instances its code asks for, and the cache directory keeps a record of each
   instance's typing (`.cache/instances`: the instances its body asks for and what
-  it reported), keyed by the surfaces of the modules it reads. A rebuild reads the
-  demand from those records, so a module whose object is reused and that nothing
-  rebuilt imports runs no front end, and an instance whose record stands is not
-  typed again. Changing a generic's body still rebuilds the modules that import it.
+  it reported), keyed by the instance's key. A rebuild reads the demand from those
+  records, so a module whose object is reused and that nothing rebuilt imports
+  runs no front end, and an instance whose record stands is not typed again. A
+  module's object is keyed by its own source and the declarations of the modules
+  it imports, never their function bodies, so changing a generic's body rebuilds
+  that generic's units and not the modules that call it. The one exception is the
+  local copy constant-time code calls: an object's record lists each instance it
+  holds a copy of under the instance's key, and the object is rebuilt when one of
+  those keys changes. The same holds in every profile, `optimize` included.
 - **Every program of a build links every unit**, test programs included, and a
   `kind = "static"` library holds the unit objects next to its module objects.
 - `-vv` lists units as `<module>#instances.<bucket>` beside the modules.

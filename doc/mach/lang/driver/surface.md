@@ -1,20 +1,30 @@
 # mach.lang.driver.surface
 
-a module's lowered surface: its source text without the bodies no importer
-compiles, which are the bodies of test declarations and of functions that
-are neither generic nor take a comptime parameter. what remains is every
-declaration an importer reads, and every body an importer instantiates.
-the in-process lowered-surface query and the persistent cache key read it.
-the same walk also finds a module's test declarations, which only its test
-object compiles, so its normal object is keyed without them
+what of a module's source text a reader of it depends on, as the spans a walk of its syntax
+omits. an importer's object holds none of the module's function bodies: its code calls them,
+and an instance's code lives in its unit, so an importer reads the text without any function
+or test body. an instance reads its declaring module's template text: the text without the
+bodies of tests and of functions that are not templates (generic, comptime-parameter or pack,
+growth.fun_is_template), since the instance is that body typed. the same walk also finds a
+module's test declarations, which only its test object compiles, so its normal object is keyed
+without them
 
-## fun omitted
+## fun bodies
 
 ```mach
-pub fun omitted(a: *ast.Ast, text: str, out: *Vector[lang_source.Span]) err[fail.Fail];
+pub fun bodies(a: *ast.Ast, text: str, out: *Vector[lang_source.Span]) err[fail.Fail];
 ```
 
-the omitted bodies of `a`, in source order
+every function and test body of `a`, in source order: what its importers do not read
+
+## fun plain_bodies
+
+```mach
+pub fun plain_bodies(a: *ast.Ast, text: str, out: *Vector[lang_source.Span]) err[fail.Fail];
+```
+
+the bodies of `a`'s tests and of its functions that are not templates, in source order: what
+an instance of one of its templates does not read
 
 ## fun tests
 
@@ -24,22 +34,13 @@ pub fun tests(a: *ast.Ast, text: str, out: *Vector[lang_source.Span]) err[fail.F
 
 the test declarations of `a`, whole, in source order
 
-## fun write
-
-```mach
-pub fun write(fb: *wire.Sink, text: str, spans: *Vector[lang_source.Span]);
-```
-
-the surface's bytes: the text with every omitted span removed
-
 ## fun digest
 
 ```mach
 pub fun digest(text: str, spans: *Vector[lang_source.Span], placed: bool, out: *[32]u8);
 ```
 
-the digest of the surface. `placed` also takes each omitted span's line
-count and the length of its last line, so the digest moves whenever a
-retained declaration moves to another line or column: debug information an
-importer generates from a retained body names where that body is
+the digest of the text without `spans`. `placed` also takes each omitted span's line count and
+the length of its last line, so the digest moves whenever retained text moves to another line
+or column: debug information an object generates from a retained body names where it is
 

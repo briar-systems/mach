@@ -2,13 +2,13 @@
 
 the digest memo: the surface digests of a source text, remembered under the
 sha-256 of that text, so a text the build has seen costs one hash and not
-the walk and three hashes its surfaces take. nothing about the file decides
+the walks and three hashes its surfaces take. nothing about the file decides
 anything: the text load read is hashed every build and only its digest finds
 an entry. the memo lives at `<out>/.cache/digests` and belongs to one
 compiler identity, whose parser decides the surface digests; a memo written
 by another compiler, or one that is missing, truncated or damaged, reads as
 empty. a stored memo holds the texts the build that stored it keyed. the
-layout is `"MDM4"`, the 32-byte compiler digest, the entry count, the
+layout is `"MDM5"`, the 32-byte compiler digest, the entry count, the
 entries, then the sha-256 of everything before it. an entry is the text's
 digest then its three surface digests, every number little endian
 
@@ -18,9 +18,8 @@ digest then its three surface digests, every number little endian
 pub rec Digests;
 ```
 
-what a source text digests to: its bytes, its surface without positions, its
-surface with the positions of what it omits, and its code without its test
-declarations, with their positions
+what a source text digests to (driver/surface): its bytes, its text without any function or test
+body, and its template text without positions and with the positions of what it omits
 
 ## rec Memo
 

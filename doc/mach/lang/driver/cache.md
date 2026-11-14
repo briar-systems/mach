@@ -4,20 +4,21 @@ the persistent object cache. every module the build emits is keyed once per
 load, after the load walk and before anything is resolved: its key covers
 the build configuration and compiler identity, the module's own source and
 embedded files, and the surface of every module it imports, transitively.
-an import's surface is its source without the bodies no importer compiles
-(see driver/surface), so an edit inside such a body keys only its own
-module. a release build inlines bodies across modules, so there an import's
-whole source is its surface. a module whose `obj/` object carries its key
-is reused: it is not lowered or compiled, and when its record stands for its
-whole source and nothing the build still compiles imports it, its front end
-is skipped: its record stands in for the instances its code asks for and for
-its front end's warnings. an instance unit is keyed by its members and the
-surfaces of the modules they read, and its object is kept in `obj/` beside
-its origin's under that key. each instance's typing is recorded in the cell's
-instance records (driver/cache/instances), keyed by the configuration, its
-symbol and the surfaces of the modules it reads, so an instance whose record
-stands is not typed. a skipped module, or an instance only records name, is
-typed only when something that must be rebuilt from its typed form needs it.
+an import's surface is its source without any function body (see
+driver/surface and key_module), so an edit inside a body keys only its own
+module and the instances of its templates. the body of an instance an
+object holds a copy of is held to the object by the object's record, which
+lists each such instance under its key (read). a module whose `obj/` object
+carries its key is reused: it is not lowered or compiled, and when its record
+stands for its whole source and nothing the build still compiles imports it,
+its front end is skipped: its record stands in for the instances its code
+asks for and for its front end's warnings. an instance unit is keyed by its
+members and what they read (instance_key), and its object is kept in `obj/`
+beside its origin's under that key. each instance's typing is recorded in the
+cell's instance records (driver/cache/instances) under its instance key, so
+an instance whose record stands is not typed. a skipped module, or an
+instance only records name, is typed only when something that must be
+rebuilt from its typed form needs it.
 nothing about a file but its bytes decides anything: every source text load
 read is hashed each build, and the digest memo in the cell's `.cache`
 directory (driver/cache/memo) keeps only what a text's digest names. an
@@ -160,10 +161,11 @@ store the digests of the objects this build wrote, once they are in place
 pub fun read(p: *project.Project, location: str, expected: *[32]u8) res[opt[Cached], fail.Fail];
 ```
 
-the object at `location` when its bytes are the bytes a build wrote there and its record says
-it was built under `expected`, none on a miss: an object that is missing, unreadable, not the
-bytes written, carries no record or a damaged one, or was built under another key is rebuilt,
-never reused. err only when allocation fails
+the object at `location` when its bytes are the bytes a build wrote there, its record says it
+was built under `expected` and every copy it holds stands (copies_stand), none on a miss: an
+object that is missing, unreadable, not the bytes written, carries no record or a damaged one,
+was built under another key or holds a copy that no longer stands is rebuilt, never reused.
+err only when allocation fails
 
 ## val TEST_KEY_BIT
 
@@ -205,10 +207,9 @@ instance record and what the load decided of it. a load that is not keyed reads 
 pub fun instance_key(p: *project.Project, name: intern.StrId, reads: *module.ModuleId, count: usize, out: *[32]u8) res[bool, fail.Fail];
 ```
 
-the key an instance's record stands under: the configuration, the instance's symbol, and the
-surface for importers of each module it reads, its declaring module first. a surface folds the
-surfaces of what its module imports, so the key covers every typed surface the instance's
-typing reads (frontend.instance_deps). false when a module it reads is not keyed
+the key of an instance: the configuration, its symbol and what it reads. its record stands under
+it, and an object holding a copy of it lists it under it. false when a module it reads is not
+keyed
 
 ## fun prepare
 
@@ -256,17 +257,17 @@ the session's files named by path, as a recorded store names them
 
 ```mach
 pub fun publish(p: *project.Project, m: *project.ModuleEntry, o: *Object, asked: *cache_record.Asked, asked_count: u32,
-defined: *intern.StrId, defined_count: u32, object: query.QueryKey) err[fail.Fail];
+defined: *intern.StrId, defined_count: u32, copied: *intern.StrId, copied_count: u32, object: query.QueryKey) err[fail.Fail];
 ```
 
 a generated object carries its record into `obj/`: its key, the source it was built from, its
-warnings, and what its lowering kept: the instances its code asks for and, for a module that
-declares tests, the symbols it defines, which its test object declares
+warnings, and what its lowering kept: the instances its code asks for, those it holds a copy of
+and, for a module that declares tests, the symbols it defines, which its test object declares
 
 ## fun publish_test
 
 ```mach
-pub fun publish_test(p: *project.Project, m: *project.ModuleEntry, o: *Object, object: query.QueryKey) err[fail.Fail];
+pub fun publish_test(p: *project.Project, m: *project.ModuleEntry, o: *Object, copied: *intern.StrId, copied_count: u32, object: query.QueryKey) err[fail.Fail];
 ```
 
 the same for the module's test object, which records only its own back half's warnings:
@@ -304,9 +305,8 @@ the unit's name. a load that keyed nothing keys no unit
 pub fun unit_member(p: *project.Project, k: *UnitKeying, name: intern.StrId, reads: *module.ModuleId, count: usize);
 ```
 
-add the member named `name`, reading the modules `reads` holds, its declaring module first:
-their surfaces for importers cover what its typing and lowering read of them, transitively. a
-member reading a module this load did not key leaves the unit unkeyed
+add the member named `name`, reading the modules `reads` holds, its declaring module first
+(key_reads). a member reading a module this load did not key leaves the unit unkeyed
 
 ## fun unit_finish
 
@@ -337,11 +337,12 @@ hand unit u's staged object to the product that publishes it
 ## fun publish_unit
 
 ```mach
-pub fun publish_unit(p: *project.Project, u: *project.InstanceUnit, object: query.QueryKey) err[fail.Fail];
+pub fun publish_unit(p: *project.Project, u: *project.InstanceUnit, copied: *intern.StrId, copied_count: u32, object: query.QueryKey) err[fail.Fail];
 ```
 
-a compiled unit's object carries its record into `obj/`: its key and the warnings its own
-codegen product reported, which are its lowering's and its back end's
+a compiled unit's object carries its record into `obj/`: its key, the warnings its own codegen
+product reported, which are its lowering's and its back end's, and the instances beside its
+members it holds a copy of
 
 ## fun units_compiled
 
