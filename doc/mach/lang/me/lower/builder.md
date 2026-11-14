@@ -659,6 +659,42 @@ a stack slot of `ty`, made in the entry block so every path reaches it
 pub fun alloca_aligned(b: *Builder, ty: Type, align: u64) res[value.Value, fail.Fail];
 ```
 
+## fun emit_whole
+
+```mach
+pub fun emit_whole(b: *Builder, v: value.Value) res[value.Value, fail.Fail];
+```
+
+the aggregate `v` held whole: itself where it is, a constant as its own value, and one at
+an address read from it whole, as secret as `v` and stated as its type
+
+## fun emit_extract
+
+```mach
+pub fun emit_extract(b: *Builder, v: value.Value, k: u32) res[value.Value, fail.Fail];
+```
+
+member `k` of the aggregate `v` held whole: a structure's member, an array's element or a
+union's member read from its first byte. an aggregate member is held whole in turn
+
+## fun emit_insert
+
+```mach
+pub fun emit_insert(b: *Builder, v: value.Value, part: value.Value, k: u32) res[value.Value, fail.Fail];
+```
+
+the aggregate `v` held whole with member `k` replaced by `part`, held whole where it is an
+aggregate
+
+## fun emit_spill
+
+```mach
+pub fun emit_spill(b: *Builder, v: value.Value) res[value.Value, fail.Fail];
+```
+
+the aggregate `v` held whole written to a stack slot of its own, whose address is the value:
+what a read of its bytes as another type needs
+
 ## fun emit_load
 
 ```mach
@@ -875,6 +911,14 @@ pub fun emit_call_named(b: *Builder, callee: value.Value, sig: Type, args: *valu
 a call of `callee` through the signature `sig`, of which `named` states how many
 arguments are named, the rest being a C-variadic call's unnamed ones
 
+## fun result_whole
+
+```mach
+pub fun result_whole(b: *Builder);
+```
+
+hold the next call's aggregate result whole, with no slot, unless it lands in a destination
+
 ## fun result_into
 
 ```mach
@@ -886,11 +930,11 @@ land the next call's aggregate result in `slot`, storage of the result's type no
 ## fun param
 
 ```mach
-pub fun param(b: *Builder, i: u32, ty: Type) res[value.Value, fail.Fail];
+pub fun param(b: *Builder, i: u32, ty: Type, whole: bool) res[value.Value, fail.Fail];
 ```
 
-parameter `i` of the function being built, of `ty`: an aggregate lands in a slot of its
-own, whose address is the value
+parameter `i` of the function being built, of `ty`: an aggregate held `whole` is the
+parameter itself, and any other lands in a slot of its own, whose address is the value
 
 ## fun emit_br
 

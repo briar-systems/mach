@@ -509,8 +509,29 @@ pub fun binds_direct(lc: *LowerContext, sym: resolve.SymbolId, tid: type_kind.Ty
 ```
 
 whether a local of source type `tid`, held in `ir`, is bound to its value and has no slot:
-a scalar that holds no secret, which nothing stores to, takes the address of or names in an
-asm block. a `val` or a parameter is then the value it began as wherever it is read
+a scalar that holds no secret, or an aggregate held whole, which nothing stores to, takes the
+address of or names in an asm block, and, for an aggregate, whose parts nothing writes or
+takes the address of. a `val` or a parameter is then the value it began as wherever it is read
+
+## fun holds_whole
+
+```mach
+pub fun holds_whole(lc: *LowerContext, tid: type_kind.TypeId, ir: Type) bool;
+```
+
+whether a value of source type `tid`, held in the aggregate `ir`, is held whole, a mirl value
+with no storage: a record, tag or union of at most two pointer widths that holds no secret,
+is not volatile and has no array or vector in it, so each of its members is reached by a
+constant path, on a target whose memory a value's bytes can be reinterpreted in
+
+## fun returns_whole
+
+```mach
+pub fun returns_whole(lc: *LowerContext) bool;
+```
+
+whether the function being lowered returns an aggregate held whole, which its returns pass to
+its one exit as the exit's parameter
 
 ## fun bind_direct
 

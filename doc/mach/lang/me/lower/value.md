@@ -2,7 +2,8 @@
 
 a value lowering holds: a mirl value of the function being built, or a constant, a
 function or a global the builder makes a value of where an instruction uses it. a
-value of an aggregate type is the address of storage holding it, typed as the aggregate
+value of an aggregate type is the address of storage holding it, typed as the aggregate,
+or, where it is `whole`, a mirl value of the aggregate itself with no storage
 
 ## def ValueKind
 
@@ -76,6 +77,7 @@ pub rec Value;
 space: the address space of the storage an address points into, which a value retyped
        as its aggregate keeps
 held:  what a stack slot was made to hold, none for any other value
+whole: an aggregate held as a mirl value of its own type, which has no address
 
 ## fun none
 
@@ -88,6 +90,22 @@ pub fun none() Value;
 ```mach
 pub fun ssa(at: id.Value, ty: Type, secret: bool) Value;
 ```
+
+## fun whole
+
+```mach
+pub fun whole(at: id.Value, ty: Type, secret: bool) Value;
+```
+
+the aggregate mirl value `at` of `ty`, held whole with no storage
+
+## fun zero_whole
+
+```mach
+pub fun zero_whole(ty: Type) Value;
+```
+
+the aggregate of `ty` every byte of which is zero, held whole
 
 ## fun const_int
 

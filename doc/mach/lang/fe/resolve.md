@@ -200,6 +200,15 @@ pub val SYM_FLAG_REACHED: u8 = 16
 the address of something reached from the local or parameter by name, a field or an element,
 is taken. where it is an aggregate held by value, a pointer into it then exists
 
+## val SYM_FLAG_WRITTEN
+
+```mach
+pub val SYM_FLAG_WRITTEN: u8 = 32
+```
+
+an assignment writes a field or element reached from the local or parameter by name, so
+what it holds changes in part where nothing stores to it whole
+
 ## rec Symbol
 
 ```mach

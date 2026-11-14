@@ -76,6 +76,8 @@ pub rec Builder {
     # the slot the next call's aggregate result lands in, in place of one of its own
     into:     value.Value;
     into_set: bool;
+    # the next call's aggregate result is held whole, with no slot
+    whole:    bool;
     ended:    vector.Vector[bool];
     secret:   bool;
     stated:   bool;
@@ -106,6 +108,7 @@ pub fun init(m: *module.Module, a: *A.Allocator, target: *mirl_record.Target, ct
     b.allocas  = 0;
     b.into     = value.none();
     b.into_set = false;
+    b.whole    = false;
     b.ended    = vector.init[bool](a);
     b.secret   = false;
     b.stated   = false;
@@ -1024,6 +1027,7 @@ pub fun emit_declassify(b: *Builder, x: value.Value) res[value.Value, fail.Fail]
 # written to a slot of its own, whose address is the value. the address alone is never what is declassified, as a
 # declassify of a pointer leaves what it points to as it was
 fun declassify_aggregate(b: *Builder, x: value.Value) res[value.Value, fail.Fail] {
+    if (unaddressed(b, x)) { ret after(b, value.none()); }
     val ty:   Type                        = x.ty;
     val n:    u64                         = size_of(b, ty);
     val slot: res[value.Value, fail.Fail] = emit_alloca(b, ty);
@@ -1076,9 +1080,67 @@ pub fun alloca_aligned(b: *Builder, ty: Type, align: u64) res[value.Value, fail.
     ret after(b, slot);
 }
 
+# whether `v` is an aggregate held whole where an address was asked for, which the lowering
+# never asks of one: a defect, held as the builder's failure
+fun unaddressed(b: *Builder, v: value.Value) bool {
+    if (!v.whole) { ret false; }
+    fault(b, fail.message("lower: an aggregate held whole was used as an address"));
+    ret true;
+}
+
+# the aggregate `v` held whole: itself where it is, a constant as its own value, and one at
+# an address read from it whole, as secret as `v` and stated as its type
+pub fun emit_whole(b: *Builder, v: value.Value) res[value.Value, fail.Fail] {
+    if (v.whole) { ret ok(v); }
+    if (value.is_constant(v)) {
+        var held: value.Value = v;
+        held.whole = true;
+        ret ok(held);
+    }
+    val read: res[value.Value, fail.Fail] = load_whole_as(b, v, v.ty, v.secret);
+    if (sel read.err) { ret read; }
+    ret ok(value.whole(read.ok.id, v.ty, read.ok.secret || v.secret));
+}
+
+# member `k` of the aggregate `v` held whole: a structure's member, an array's element or a
+# union's member read from its first byte. an aggregate member is held whole in turn
+pub fun emit_extract(b: *Builder, v: value.Value, k: u32) res[value.Value, fail.Fail] {
+    var ops: [1]id.Value  = [1]id.Value{use(b, v)};
+    var imm: [1]Immediate = [1]Immediate{Immediate.member{k}};
+    var out: value.Value  = made(b, opcode.EXTRACT, ?ops[0], 1, ?imm[0], 1);
+    out.whole = irt.is_aggregate(?b.m.types, out.ty);
+    ret after(b, out);
+}
+
+# the aggregate `v` held whole with member `k` replaced by `part`, held whole where it is an
+# aggregate
+pub fun emit_insert(b: *Builder, v: value.Value, part: value.Value, k: u32) res[value.Value, fail.Fail] {
+    var ops: [2]id.Value  = [2]id.Value{use(b, v), use(b, part)};
+    var imm: [1]Immediate = [1]Immediate{Immediate.member{k}};
+    var out: value.Value  = made(b, opcode.INSERT, ?ops[0], 2, ?imm[0], 1);
+    out.whole = true;
+    ret after(b, out);
+}
+
+# the aggregate `v` held whole written to a stack slot of its own, whose address is the value:
+# what a read of its bytes as another type needs
+pub fun emit_spill(b: *Builder, v: value.Value) res[value.Value, fail.Fail] {
+    val slot: res[value.Value, fail.Fail] = emit_alloca(b, v.ty);
+    if (sel slot.err) { ret slot; }
+    val held: bool = b.secret;
+    set_secret(b, held || v.secret);
+    val stored: err[fail.Fail] = emit_store(b, v, slot.ok);
+    set_secret(b, held);
+    if (sel stored.err) { ret res[value.Value, fail.Fail].err{stored.err}; }
+    var out: value.Value = value.retype(slot.ok, v.ty);
+    out.secret = v.secret;
+    ret ok(out);
+}
+
 # a value of `ty` read from `addr`: an aggregate is copied into a slot of its own, whose
 # address is the value, as secret as the read or `addr`
 pub fun emit_load(b: *Builder, addr: value.Value, ty: Type) res[value.Value, fail.Fail] {
+    if (unaddressed(b, addr)) { ret after(b, value.none()); }
     if (irt.is_aggregate(?b.m.types, ty)) {
         val slot: res[value.Value, fail.Fail] = emit_alloca(b, ty);
         if (sel slot.err) { ret slot; }
@@ -1118,6 +1180,7 @@ fun load_whole_as(b: *Builder, addr: value.Value, ty: Type, secret: bool) res[va
 # a value of `ty` read whole, an aggregate as one mirl value, as a call or a return passes it.
 # a pointer read from a slot is of the pointer the slot was made to hold
 fun load_whole(b: *Builder, addr: value.Value, ty: Type) res[value.Value, fail.Fail] {
+    if (unaddressed(b, addr)) { ret after(b, value.none()); }
     var read: Type = ty;
     if (irt.is_ptr(?b.m.types, ty) && irt.is_ptr(?b.m.types, addr.held)) { read = addr.held; }
     var ops: [1]id.Value  = [1]id.Value{use(b, addr)};
@@ -1128,7 +1191,8 @@ fun load_whole(b: *Builder, addr: value.Value, ty: Type) res[value.Value, fail.F
 # write `v` to `addr`: an aggregate, held at an address, is copied. a store where the access is stated states the
 # memory it writes as the access does, secret with its mark and public with the public flag
 pub fun emit_store(b: *Builder, v: value.Value, addr: value.Value) err[fail.Fail] {
-    if (irt.is_aggregate(?b.m.types, v.ty)) { ret emit_copy(b, addr, v, v.ty); }
+    if (unaddressed(b, addr))                           { ret after_err(b); }
+    if (irt.is_aggregate(?b.m.types, v.ty) && !v.whole) { ret emit_copy(b, addr, v, v.ty); }
     var ops: [2]id.Value  = [2]id.Value{use(b, addr), use(b, v)};
     var imm: [1]Immediate = [1]Immediate{Immediate.alignment{align_of(b, v.ty)}};
     if (!b.stated || b.secret) { ret placed(b, opcode.STORE, ?ops[0], 2, ?imm[0], 1); }
@@ -1154,6 +1218,14 @@ fun store_whole(b: *Builder, whole: id.Value, ty: Type, addr: value.Value, publi
 # it moves: secret with its mark, or public where the place's type holds no secret, which sema
 # holds the source's type to as well
 pub fun emit_copy(b: *Builder, dst: value.Value, src: value.Value, ty: Type) err[fail.Fail] {
+    if (src.whole) {
+        val held: bool = b.secret;
+        set_secret(b, held || src.secret);
+        val stored: err[fail.Fail] = emit_store(b, src, dst);
+        set_secret(b, held);
+        ret stored;
+    }
+    if (unaddressed(b, dst) || unaddressed(b, src)) { ret after_err(b); }
     val n: u64 = size_of(b, ty);
     if (n == 0) { ret err[fail.Fail].ok{}; }
     var ops: [3]id.Value  = [3]id.Value{use(b, dst), use(b, src), use(b, value.const_int(n, index_type(b)))};
@@ -1180,6 +1252,7 @@ fun stated_placed(b: *Builder, public: bool, code: Opcode, ops: *id.Value, n: u3
 # zero the bytes of a `ty` at `addr`, a place whose type holds a secret where `secret` holds, which
 # the fill states of the memory it writes
 pub fun emit_memzero(b: *Builder, addr: value.Value, ty: Type, secret: bool) err[fail.Fail] {
+    if (unaddressed(b, addr)) { ret after_err(b); }
     val n: u64 = size_of(b, ty);
     if (n == 0) { ret err[fail.Fail].ok{}; }
     var ops: [3]id.Value  = [3]id.Value{use(b, addr), use(b, value.const_int(0, i8(b))), use(b, value.const_int(n, index_type(b)))};
@@ -1214,6 +1287,7 @@ pub fun emit_wipe(b: *Builder, addr: value.Value, count: value.Value, signed: bo
 
 # the address `bytes` past `addr`
 pub fun emit_offset(b: *Builder, addr: value.Value, bytes: value.Value) res[value.Value, fail.Fail] {
+    if (unaddressed(b, addr)) { ret after(b, value.none()); }
     var ops: [2]id.Value = [2]id.Value{use(b, addr), use(b, bytes)};
     ret after(b, made(b, opcode.PTR_ADD, ?ops[0], 2, nil, 0));
 }
@@ -1221,6 +1295,7 @@ pub fun emit_offset(b: *Builder, addr: value.Value, bytes: value.Value) res[valu
 # the address of member `k` of the aggregate `agg` at `addr`: a structure's member, an
 # array's or vector's element, and a union's every member, which all start where it does
 pub fun emit_member(b: *Builder, addr: value.Value, agg: Type, k: u32) res[value.Value, fail.Fail] {
+    if (unaddressed(b, addr)) { ret after(b, value.none()); }
     val t: *types.Table = ?b.m.types;
     if (irt.is_union(t, agg)) { ret ok(value.retype(addr, ptr_in(b, addr.space))); }
     if (irt.is_struct(t, agg)) {
@@ -1233,6 +1308,7 @@ pub fun emit_member(b: *Builder, addr: value.Value, agg: Type, k: u32) res[value
 
 # the address of element `ix` of the array or vector `agg` at `addr`
 pub fun emit_element(b: *Builder, addr: value.Value, agg: Type, ix: value.Value) res[value.Value, fail.Fail] {
+    if (unaddressed(b, addr)) { ret after(b, value.none()); }
     val t:     *types.Table = ?b.m.types;
     var array: Type         = agg;
     if (irt.is_vector(t, agg)) { array = take_type(b, irt.array(t, irt.element(t, agg), irt.lanes(t, agg)::u64)); }
@@ -1387,7 +1463,9 @@ pub fun emit_call_named(b: *Builder, callee: value.Value, sig: Type, args: *valu
     # the destination is this call's alone, whatever becomes of the call
     val into:     value.Value = b.into;
     val into_set: bool        = b.into_set;
+    val held:     bool        = b.whole;
     b.into_set = false;
+    b.whole    = false;
     if (irt.param_count(t, sig) != n) { ret bad("lower: a call passes a count of arguments its signature does not take"); }
     var ops: vector.Vector[id.Value] = vector.init[id.Value](b.a);
     fin { vector.dnit[id.Value](?ops); }
@@ -1400,7 +1478,7 @@ pub fun emit_call_named(b: *Builder, callee: value.Value, sig: Type, args: *valu
     for (i < n) {
         val p: Type     = irt.param_of(t, sig, i);
         var a: id.Value = 0xFFFFFFFF;
-        if (irt.is_aggregate(t, p)) {
+        if (irt.is_aggregate(t, p) && !args[i].whole) {
             val whole: res[value.Value, fail.Fail] = load_whole_as(b, args[i], p, args[i].secret);
             if (sel whole.err) { ret whole; }
             a = whole.ok.id;
@@ -1416,6 +1494,7 @@ pub fun emit_call_named(b: *Builder, callee: value.Value, sig: Type, args: *valu
     val rt: Type = irt.result_of(t, sig);
     if (irt.is_none(rt)) { ret ok(value.none()); }
     val r: id.Value = mbuild.result(?b.mb, call, 0);
+    if (irt.is_aggregate(t, rt) && held && !into_set) { ret ok(value.whole(r, rt, secret_of(b, r))); }
     if (irt.is_aggregate(t, rt)) {
         var slot: res[value.Value, fail.Fail] = res[value.Value, fail.Fail].ok{into};
         if (!into_set || !irt.same(into.held, rt)) { slot = emit_alloca(b, rt); }
@@ -1429,17 +1508,23 @@ pub fun emit_call_named(b: *Builder, callee: value.Value, sig: Type, args: *valu
     ret after(b, value.ssa(r, rt, secret_of(b, r)));
 }
 
+# hold the next call's aggregate result whole, with no slot, unless it lands in a destination
+pub fun result_whole(b: *Builder) {
+    b.whole = true;
+}
+
 # land the next call's aggregate result in `slot`, storage of the result's type nothing reads yet
 pub fun result_into(b: *Builder, slot: value.Value) {
     b.into     = slot;
     b.into_set = true;
 }
 
-# parameter `i` of the function being built, of `ty`: an aggregate lands in a slot of its
-# own, whose address is the value
-pub fun param(b: *Builder, i: u32, ty: Type) res[value.Value, fail.Fail] {
+# parameter `i` of the function being built, of `ty`: an aggregate held `whole` is the
+# parameter itself, and any other lands in a slot of its own, whose address is the value
+pub fun param(b: *Builder, i: u32, ty: Type, whole: bool) res[value.Value, fail.Fail] {
     val v: id.Value = mbuild.parameter(?b.mb, b.entry, i);
-    if (mbuild.failed(?b.mb)) { ret after(b, value.none()); }
+    if (mbuild.failed(?b.mb))                      { ret after(b, value.none()); }
+    if (irt.is_aggregate(?b.m.types, ty) && whole) { ret ok(value.whole(v, ty, secret_of(b, v))); }
     if (irt.is_aggregate(?b.m.types, ty)) {
         val slot: res[value.Value, fail.Fail] = emit_alloca(b, ty);
         if (sel slot.err) { ret slot; }
@@ -1515,7 +1600,7 @@ pub fun emit_switch(b: *Builder, selector: value.Value, otherwise: id.Block, cas
 pub fun emit_ret(b: *Builder, v: value.Value) err[fail.Fail] {
     if (value.is_none(v)) { ret emit_ret_void(b); }
     var r: id.Value = 0xFFFFFFFF;
-    if (irt.is_aggregate(?b.m.types, v.ty)) {
+    if (irt.is_aggregate(?b.m.types, v.ty) && !v.whole) {
         val whole: res[value.Value, fail.Fail] = load_whole_as(b, v, v.ty, v.secret);
         if (sel whole.err) { ret err[fail.Fail].err{whole.err}; }
         r = whole.ok.id;
