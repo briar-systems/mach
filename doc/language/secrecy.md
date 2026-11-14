@@ -110,6 +110,16 @@ fun leak(a: ^u32, t: *u8, p: ^*u8) u8 {
 A secret operand of a **floating-point** operation is refused as well: its
 latency is variable on every target.
 
+Moving a secret float, and its `:>`, are not operations, but inside a
+`#[constant_time]` function each instruction that moves it must be one the
+target's vendor lists as data-independent:
+
+| target | moving and declassifying a secret `f32` or `f64` |
+|---|---|
+| x86-64 | admitted: loads and stores go through `movss` and `movq`, register moves through `movaps`, and `:>` zeroes the register above the value (`movq` for `f64`, `pslldq` and `psrldq` for `f32`), each on Intel's list (article 768547, Table 1). SSE `movsd` is not on it, so a `f64` never moves through it |
+| aarch64 | admitted under DIT: loads, stores and `:>` go through rows on Arm's DIT list |
+| riscv64 | refused: Zkt excludes floating point from its listings, every float load, store and move among them, so a secret float cannot be moved in a constant-time function |
+
 Whether an integer **multiply** or a **variable shift** runs in time
 independent of a secret operand is the target's question, and it is asked
 inside a `#[constant_time]` function, where mirl reads the class masc gives
@@ -126,7 +136,12 @@ is a compare to an all-ones-or-zero mask and a mask on the count and the
 value, with no branch, so it reveals nothing the shift itself would not.
 
 A secret value passed to a variadic pack is also rejected, including a secret
-wrapped inside an aggregate.
+wrapped inside an aggregate. A pointer to secret storage (`*^u8`) is accepted:
+the pack's instance keeps its type, so its body reads `^u8` through it and every
+gate below holds there. A pack function that wipes several buffers is written so.
+A C variadic accepts neither, as its callee is untyped foreign code. Printing a
+pointer to secret storage through `std.format` is refused at the call, since its
+type has no rendering there: the weld keeps it from becoming a `ptr`.
 
 The gates hold in **every** function, whether or not it carries
 `#[constant_time]`. Branching, indexing, addressing or dividing on a `^` value
@@ -552,11 +567,16 @@ as anywhere else.
   so a register or argument slot that carries a secret member of a record
   passed by value together with a public one is secret whole, and a branch on
   that public member is refused, naming the parameter and the bytes that share
-  the slot. Take such a record by reference, or order its members so secret
-  and public ones fall in different 8-byte pieces. A record holding a secret
-  that the convention itself passes by reference, as aarch64 and riscv64 pass
-  one larger than 16 bytes and windows one larger than 8, is refused the same
-  way when a public member decides a branch.
+  the slot. Take such a record or tag through a pointer, which reads each
+  member by its own type and a tag's discriminator as public, or, for a
+  record, order its members so secret and public ones fall in different 8-byte
+  pieces. A tag has no such order: its discriminator and its payload share a
+  piece whenever they fit in one. A record or tag holding a secret that the
+  convention itself passes by reference, as aarch64 and riscv64 pass one larger
+  than 16 bytes and windows one larger than 8, is copied into the callee word by
+  word, each word public where no secret member covers any of its bytes, so a
+  public member or a discriminator in a word of its own decides a branch, and
+  one sharing a word with a secret member is refused.
 - **Flags.** Each instruction reads and writes each flag bit as masc's tables
   state it, so a branch on flags a secret compare filled is refused, and an
   instruction that writes only some of them, as `inc` leaves carry, leaves the
@@ -584,6 +604,21 @@ as anywhere else.
 What the walk cannot read, it refuses: bytes that decode to no instruction, an
 instruction whose effects masc's tables leave undecided, and control that leaves
 the block where the walk cannot follow it.
+
+A `#[thread]` variable is reached in such a function as a global is, and holds
+what its type states: a secret one stays secret, and a public one cannot be given
+a secret. Its address is public, formed from the thread pointer, which no
+function may change, and from what the system alone writes: the link's offset,
+the offset the loader puts in its global offset table slot, the thread control
+block's own address at `fs:0` on x86-64, and on Windows the module's index and
+its entry in the thread's table of blocks. Where the target reaches a
+thread-local through a call of the runtime's resolver, as every darwin target
+does, the check cannot see into that call, and a constant-time function naming
+the variable is refused, naming it.
+
+Debug information describes a secret scalar under a name carrying its `^`
+(`^u64`), which is all a debugger can be told: neither DWARF nor CodeView has a
+qualifier for secrecy. A secret aggregate is described as its base type.
 
 `{name}` bindings carry the local's declared type into the walk. A pointer to a
 secret (`*^u32`) is a public address and a secret load: the register it is

@@ -817,6 +817,10 @@ var depth: u32 = 0;
   copy at its own address. A module binding whose initializer takes one is
   refused with `address.thread_local`.
 - A shader interface role and `thread` are refused together.
+- A `constant_time` function reaches a thread-local as it does a global, on
+  every target but darwin, whose thread-locals are reached through a resolver
+  call the constant-time check cannot see into, so there it is refused (see
+  [secrecy.md](secrecy.md#constant_time--the-codegen-contract)).
 
 ### `constant_time(mode)` — constant-time boundary
 
