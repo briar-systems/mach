@@ -348,12 +348,6 @@ pub fun declared_scalar(lc: *LowerContext, d: Declared) opt[comptime_value.CTVal
 
 the scalar a module `val` holds, none when it holds no constant or an aggregate
 
-## fun gated_lower_member_const_message
-
-```mach
-pub fun gated_lower_member_const_message(lc: *LowerContext, name: intern.StrId, dep_fqn: intern.StrId) res[str, fail.Fail];
-```
-
 ## fun internal
 
 ```mach

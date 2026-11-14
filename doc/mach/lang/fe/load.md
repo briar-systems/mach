@@ -71,7 +71,8 @@ stable id
 status: the standing of the module's load
 home: the package that owns it and its file there
 artifact: the artifact whose walk first reached it, what `$bin.name` reads
-gated: it was first reached from an artifact this target does not build
+gated: it was first reached from an artifact this target does not build, or a union
+              reached it only under another target's arms (see build_reach)
 outcome: the outcome of its module-scope gates
 ctx: its build target's frame, which every later phase reads
 frame: the frame the walk is in: FRAME_BUILD or a union tuple
@@ -194,6 +195,14 @@ pub fun module_of(l: *Loader, sid: module.StableModuleId) module.ModuleId;
 
 the id of the module a load product names by stable id, MODULE_NIL when the load has not reached it
 
+## fun gated_at
+
+```mach
+pub fun gated_at(l: *Loader, mid: module.ModuleId) bool;
+```
+
+whether the module is gated out of this build
+
 ## fun module_count
 
 ```mach
@@ -241,6 +250,16 @@ pub fun walked(m: *Module, did: ast_id.DeclId) bool;
 ```
 
 whether the walk reached a declaration in the module's build target's frame
+
+## fun build_reach
+
+```mach
+pub fun build_reach(l: *Loader, reached: *bool) err[fail.Fail];
+```
+
+mark in `reached`, by module index, every module the build target's own frame reaches from the
+modules marked there already: through each import declaration at module scope and in each arm
+its frame selected. a module the union loaded only under another tuple's arms stays unmarked
 
 ## fun binding_for
 

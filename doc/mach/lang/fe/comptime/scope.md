@@ -61,8 +61,7 @@ pub rec BuildFacts;
 ```
 
 the build a program is compiled by and for: its mode, the compiler, the project, the
-names its target entry gives the os, isa, abi and platform, the binary, and whether it
-is a union build
+names its target entry gives the os, isa, abi and platform, and the binary
 
 ## fun build_facts
 
@@ -330,12 +329,6 @@ pub fun float_width_deferred(c: *ComptimeCtx, name: intern.StrId) bool;
 
 ```mach
 pub fun bind(c: *ComptimeCtx, name: intern.StrId, value: comptime_value.CTValue) err[fail.Fail];
-```
-
-## fun bind_gated
-
-```mach
-pub fun bind_gated(c: *ComptimeCtx, name: intern.StrId, value: comptime_value.CTValue, gated: bool) err[fail.Fail];
 ```
 
 ## fun frame_open

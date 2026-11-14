@@ -174,18 +174,11 @@ pub rec DefinedSymbol;
 ## fun acquire_definition
 
 ```mach
-pub fun acquire_definition(reader: *DefinitionReader, origin: lang_module.ModuleId,
-phase: DefinitionPhase) res[Definition, fail.Fail];
+pub fun acquire_definition(reader: *DefinitionReader, origin: lang_module.ModuleId, phase: DefinitionPhase) res[Definition, fail.Fail];
 ```
 
-## fun acquire_template
-
-```mach
-pub fun acquire_template(reader: *DefinitionReader, origin: lang_module.ModuleId) res[Definition, fail.Fail];
-```
-
-the typed definition of a generic's declaring module, as far as its typing got: an instance is
-checked against its declaration even where another declaration of the module was refused
+the definition of module `origin` as far as each phase got: an importer is checked against
+what a rejected module resolved and typed, since what it refused carries the error type
 
 ## fun acquire_symbol
 

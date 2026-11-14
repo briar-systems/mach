@@ -59,15 +59,9 @@ val STATE_LOADING: State = 1;
 val STATE_DONE:    State = 2;
 
 # a public constant a module binds in its build frame, exported to the gates of its importers
-# ---
-# gated: it is bound under a gate, so a union build cannot read one value for every tuple. the
-#        declaration's DECL_FLAG_GATED, which the parser set where it first saw the declaration.
-#        the load never reads such a constant in a union build and says nothing of it: the gate
-#        that needs it waits for sema, which refuses the read
 rec Const {
     name:  intern.StrId;
     value: comptime_value.CTValue;
-    gated: bool;
 }
 
 # what an import declaration binds, as the load decided it
@@ -130,7 +124,8 @@ pub rec Tuple {
 # status:       the standing of the module's load
 # home:         the package that owns it and its file there
 # artifact:     the artifact whose walk first reached it, what `$bin.name` reads
-# gated:        it was first reached from an artifact this target does not build
+# gated:        it was first reached from an artifact this target does not build, or a union
+#               reached it only under another target's arms (see build_reach)
 # outcome:      the outcome of its module-scope gates
 # ctx:          its build target's frame, which every later phase reads
 # frame:        the frame the walk is in: FRAME_BUILD or a union tuple
@@ -367,6 +362,11 @@ pub fun module_of(l: *Loader, sid: module.StableModuleId) module.ModuleId {
     val found: opt[*module.ModuleId] = map.get[module.StableModuleId, module.ModuleId](?l.by_stable, ?sid);
     if (sel found.none) { ret module.MODULE_NIL; }
     ret @found.some;
+}
+
+# whether the module is gated out of this build
+pub fun gated_at(l: *Loader, mid: module.ModuleId) bool {
+    ret module_at(l, mid).gated;
 }
 
 pub fun module_count(l: *Loader) u32 {
@@ -746,7 +746,7 @@ fun same_consts(a: *collections_vector.Vector[Const], b: *collections_vector.Vec
     for (i < a.len) {
         val x: *Const = ?a.data[i];
         val y: *Const = ?b.data[i];
-        if (!intern.str_same(x.name, y.name) || x.gated != y.gated || !same_ct_value(?x.value, ?y.value)) { ret false; }
+        if (!intern.str_same(x.name, y.name) || !same_ct_value(?x.value, ?y.value)) { ret false; }
         i = i + 1;
     }
     ret true;
@@ -1767,8 +1767,7 @@ fun bind_val(l: *Loader, mid: module.ModuleId, d: *ast_decl.Decl, source: str, n
     val deps: res[Verdict, fail.Fail] = demand_names(l, mid, d.data.bind.init, true);
     if (sel deps.err)                    { ret deps; }
     if (deps.ok.kind == VERDICT_REFUSED) { ret deps; }
-    val m:     *Module = module_at(l, mid);
-    val gated: bool    = (d.flags & ast_decl.DECL_FLAG_GATED) != 0;
+    val m: *Module = module_at(l, mid);
     # a constant tag is bound as its own literal, which a gate's `sel` reads; it points into this
     # module's syntax, so no importer reads it
     val tag_r: res[bool, fail.Fail] = constant_tag(l, mid, d.data.bind.init, source);
@@ -1778,7 +1777,7 @@ fun bind_val(l: *Loader, mid: module.ModuleId, d: *ast_decl.Decl, source: str, n
     if (tag_r.ok) {
         var elem: comptime_value.CTValue = comptime_value.const_elem_untyped(d.data.bind.init::u32);
         elem.secret = secret_r.ok;
-        val tagged: err[fail.Fail] = comptime_scope.bind_gated(frame_ctx(m), name, elem, gated);
+        val tagged: err[fail.Fail] = comptime_scope.bind(frame_ctx(m), name, elem);
         if (sel tagged.err) { ret res[Verdict, fail.Fail].err{tagged.err}; }
         ret res[Verdict, fail.Fail].ok{verdict(VERDICT_BOUND)};
     }
@@ -1796,11 +1795,11 @@ fun bind_val(l: *Loader, mid: module.ModuleId, d: *ast_decl.Decl, source: str, n
         ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)};
     }
 
-    val rr: err[fail.Fail] = comptime_scope.bind_gated(frame_ctx(m), name, v, gated);
+    val rr: err[fail.Fail] = comptime_scope.bind(frame_ctx(m), name, v);
     if (sel rr.err) { ret res[Verdict, fail.Fail].err{rr.err}; }
 
     if ((d.flags & ast_decl.DECL_FLAG_PUB) != 0 && m.frame == FRAME_BUILD) {
-        val added: err[fail.Fail] = const_add(l, m, name, v, gated);
+        val added: err[fail.Fail] = const_add(l, m, name, v);
         if (sel added.err) { ret res[Verdict, fail.Fail].err{added.err}; }
     }
     ret res[Verdict, fail.Fail].ok{verdict(VERDICT_BOUND)};
@@ -1993,6 +1992,73 @@ fun walked_mark(m: *Module, did: ast_id.DeclId) {
 # whether the walk reached a declaration in the module's build target's frame
 pub fun walked(m: *Module, did: ast_id.DeclId) bool {
     ret walked_at(m, FRAME_BUILD, did);
+}
+
+# mark in `reached`, by module index, every module the build target's own frame reaches from the
+# modules marked there already: through each import declaration at module scope and in each arm
+# its frame selected. a module the union loaded only under another tuple's arms stays unmarked
+pub fun build_reach(l: *Loader, reached: *bool) err[fail.Fail] {
+    var work: collections_vector.Vector[module.ModuleId] = collections_vector.init[module.ModuleId](l.alloc);
+    fin { collections_vector.dnit[module.ModuleId](?work); }
+    var i: u32 = 0;
+    for (i < module_count(l)) {
+        if (reached[i]) {
+            val pushed: res[usize, A.Error] = collections_vector.push[module.ModuleId](?work, i::module.ModuleId);
+            if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        }
+        i = i + 1;
+    }
+    for (work.len > 0) {
+        val mid: module.ModuleId = work.data[work.len - 1];
+        collections_vector.truncate[module.ModuleId](?work, work.len - 1);
+        val a: *ast.Ast = syntax_of(l, mid);
+        if (a == nil) { cnt; }
+        val m_opt: opt[*ast_module.Module] = ast.get_module(a, a.root_module);
+        if (sel m_opt.none) { cnt; }
+        val walked_r: err[fail.Fail] = reach_in_list(l, mid, m_opt.some.decls_start, m_opt.some.decls_len, reached, ?work);
+        if (sel walked_r.err) { ret walked_r; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun reach_in_list(l: *Loader, mid: module.ModuleId, start: u32, len: u32, reached: *bool, work: *collections_vector.Vector[module.ModuleId]) err[fail.Fail] {
+    val m: *Module  = module_at(l, mid);
+    val a: *ast.Ast = syntax_of(l, mid);
+    var i: u32      = 0;
+    for (i < len) {
+        val did:   ast_id.DeclId       = a.decl_ids.data[start + i];
+        val d_opt: opt[*ast_decl.Decl] = ast.get_decl(a, did);
+        i = i + 1;
+        if (sel d_opt.none) { cnt; }
+        val d: *ast_decl.Decl = d_opt.some;
+        if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+            if (stack.exhausted()) { ret err[fail.Fail].err{refuse_nesting(l, mid, d.span)}; }
+            val ci: *ast_decl.DeclComptimeIf = ?d.data.comptime_if;
+            var bi: u32                      = 0;
+            for (bi < ci.branches_len) {
+                val br:    *ast_decl.ComptimeBranch = ?a.comptime_branches.data[ci.branches_start + bi];
+                val state: comptime_scope.GateState = comptime_scope.gate_state(?m.ctx, br.cond);
+                if (ast_id.expr_is_nil(br.cond) || state == comptime_scope.GATE_STATE_TRUE) {
+                    val inner: err[fail.Fail] = reach_in_list(l, mid, br.body_start, br.body_len, reached, work);
+                    if (sel inner.err) { ret inner; }
+                    brk;
+                }
+                if (state != comptime_scope.GATE_STATE_FALSE) { brk; }
+                bi = bi + 1;
+            }
+            cnt;
+        }
+        if (d.kind != ast_decl.DECL_KIND_USE && d.kind != ast_decl.DECL_KIND_FWD) { cnt; }
+        val b: opt[*Binding] = binding_for(m, did);
+        if (sel b.none)                     { cnt; }
+        if (b.some.kind == BINDING_UNBOUND) { cnt; }
+        val dep: module.ModuleId = module_of(l, b.some.module);
+        if (module.is_nil(dep) || reached[module.index(dep)]) { cnt; }
+        reached[module.index(dep)] = true;
+        val pushed: res[usize, A.Error] = collections_vector.push[module.ModuleId](work, dep);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    }
+    ret err[fail.Fail].ok{};
 }
 
 # release a module's walked frames; a module with no frames owns none
@@ -2201,12 +2267,10 @@ fun dep_record(l: *Loader, mid: module.ModuleId, dep_mid: module.ModuleId) err[f
     ret err[fail.Fail].ok{};
 }
 
-# binds the constant `leaf` a `use` imports in the module's frame; a union build leaves a gated one
-# unbound, for sema to refuse where it is read
+# binds the constant `leaf` a `use` imports in the module's frame
 fun const_merge(l: *Loader, mid: module.ModuleId, dep_mid: module.ModuleId, leaf: intern.StrId) err[fail.Fail] {
     val v: opt[*Const] = const_find(module_at(l, dep_mid), leaf);
-    if (sel v.none)              { ret err[fail.Fail].ok{}; }
-    if (v.some.gated && l.union) { ret err[fail.Fail].ok{}; }
+    if (sel v.none) { ret err[fail.Fail].ok{}; }
     ret comptime_scope.bind(frame_ctx(module_at(l, mid)), leaf, v.some.value);
 }
 
@@ -2319,8 +2383,6 @@ fun resolve_module_member_const_load(lc: *LoadMemberCtx, eid: ast_id.ExprId) res
 
     val v: opt[*Const] = const_find(module_at(l, dep_opt.some), node.data.member.name_id);
     if (sel v.none) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}}; }
-    # a union build reads no gated constant here: sema refuses the read
-    if (v.some.gated && l.union) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}}; }
     ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].some{v.some.value}};
 }
 
@@ -2886,8 +2948,8 @@ fun non_integer_message(l: *Loader, name: intern.StrId, steps: *collections_vect
     ret res[intern.StrId, fail.Fail].ok{interned.ok};
 }
 
-fun const_add(l: *Loader, m: *Module, name: intern.StrId, value: comptime_value.CTValue, gated: bool) err[fail.Fail] {
-    val pushed: res[usize, A.Error] = collections_vector.push[Const](?m.consts, Const{name: name, value: value, gated: gated});
+fun const_add(l: *Loader, m: *Module, name: intern.StrId, value: comptime_value.CTValue) err[fail.Fail] {
+    val pushed: res[usize, A.Error] = collections_vector.push[Const](?m.consts, Const{name: name, value: value});
     if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
     ret err[fail.Fail].ok{};
 }

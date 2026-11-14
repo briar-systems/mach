@@ -623,12 +623,6 @@ pub fun resolve_type_comparison_operand(sc: *SemaContext, eid: ast_id.ExprId) re
 
 the type of an operand of a type comparison, none when the walk has no typing of it
 
-## fun gated_member_const_message
-
-```mach
-pub fun gated_member_const_message(sc: *SemaContext, name: intern.StrId, dep_path: intern.StrId) res[str, fail.Fail];
-```
-
 ## fun resolve_module_member_const
 
 ```mach
