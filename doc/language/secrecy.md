@@ -463,7 +463,7 @@ determine a layout it declines, which rejects.
 
 `==`, `!=`, `<`, `<=`, `>` and `>=` all accept two pointer-like operands
 whatever their pointees' secrecy, including `*^T` against `*^T` and `*^T`
-against a public `*U`. The result is a public `bool` — `u8`, per
+against a public `*U`. The result is a public `bool` — `u1`, per
 [operators.md](operators.md) — so it branches, feeds `&&`, and returns like any
 other public value:
 
@@ -1130,6 +1130,30 @@ bytes sends those bytes too. A long-lived buffer holding a secret is wiped by
 its author with std's helpers, `std.crypto.ct.zeroize` or
 `std.memory.secret.borrow_wipe`.
 
+The constant-time check takes such bytes as their type states them. A
+constant-time function that reads a union member other than the one last
+written, or looks at padding or at a tag's unused bytes through a pointer cast,
+and branches on what it finds, branches on whatever was there:
+
+```mach
+uni U { a: u8; b: [6]u64; }
+
+fun make() U { ret U{a: 1}; }       # writes one byte of the 48
+
+#[constant_time("soft")]
+fun look(u: *U) u64 {
+    if (u.b[1] != 0) { ret 1; }     # reads bytes nothing wrote
+    ret 0;
+}
+```
+
+`look` builds, and what it branches on is what the stack held when `make` ran.
+Reading bytes nothing wrote is the program's to avoid, in marked code as in any
+other: read the member that was written, and write or send a record member by
+member. One such read is taken care of: where a constant-time function
+receives a record returned through memory, the padding of that result is
+zeroed after the call.
+
 ## Trusted base
 
 The guarantee rests on four parts:
@@ -1152,7 +1176,7 @@ What is checked and what is trusted: the checker verifies the functions marked
 `#[constant_time]`, their `asm` included. Code that is not marked is trusted to
 follow the type system and its declared signatures, and `asm` outside a
 constant-time function is not checked. Three consequences of that statement are
-known and accepted under it, each awaiting a ruling:
+known and accepted under it:
 
 - an untrusted callee that reads a register its declaration does not pass, and
   so a secret the caller left there;
