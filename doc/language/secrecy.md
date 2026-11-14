@@ -563,20 +563,36 @@ as anywhere else.
   instruction adds to, as the thread pointer) public, and every other one, the
   frame pointer and the flags a caller's arithmetic accrued included, as possibly
   holding the caller's secret. A block that leaves a secret in a register held
-  public at entry is refused there. The walk holds a register's secrecy whole,
-  so a register or argument slot that carries a secret member of a record
-  passed by value together with a public one is secret whole, and a branch on
-  that public member is refused, naming the parameter and the bytes that share
-  the slot. Take such a record or tag through a pointer, which reads each
-  member by its own type and a tag's discriminator as public, or, for a
-  record, order its members so secret and public ones fall in different 8-byte
-  pieces. A tag has no such order: its discriminator and its payload share a
-  piece whenever they fit in one. A record or tag holding a secret that the
-  convention itself passes by reference, as aarch64 and riscv64 pass one larger
-  than 16 bytes and windows one larger than 8, is copied into the callee word by
-  word, each word public where no secret member covers any of its bytes, so a
-  public member or a discriminator in a word of its own decides a branch, and
-  one sharing a word with a secret member is refused.
+  public at entry is refused there. The walk holds a general register's secrecy
+  byte by byte, so a register or argument slot that carries a secret member of
+  a record or tag passed by value together with a public one is secret only in
+  the secret member's bytes, and a branch on the public member is admitted.
+  The bytes past a piece the convention leaves undefined are secret where any
+  byte of the piece is. Past a public piece they are public, as the declaration
+  states the piece: mach's own callers zero them, and a function whose `asm`
+  reads the whole register of a narrower argument reads bits its caller left.
+  Moves, loads and stores of each width, zero and sign extension, writes of a
+  narrower view by these forms (x86's 32-bit writes zero the rest of the
+  register, its 8 and 16-bit writes keep it, aarch64's `w` writes zero it),
+  shifts and rotates by a constant, byte swaps of a 32-bit or 64-bit register,
+  bit-field extracts, and `and`, `or` and `xor` with a constant or with another
+  register carry each byte to where the instruction puts it. Every other
+  instruction, an add, a multiply, an exchange, a shift by a register or a
+  conditional move among them, makes every byte it writes secret if any byte it
+  reads is. A compare of a narrow view reads only
+  that view's bytes. A refusal of a store, a result or an argument names the
+  bytes of it that hold the secret. A floating-point or vector register is held
+  whole, so a piece carrying a secret and a public member in one is secret
+  whole and a branch on the public member is refused, naming the parameter and
+  the bytes that share the register: take such a record through a pointer, or
+  order its members so secret and public ones fall in different pieces. A
+  record or tag holding a secret that the convention itself passes by
+  reference, as aarch64 and riscv64 pass one larger than 16 bytes and windows
+  one of any size but 1, 2, 4 or 8 bytes, is copied into the callee in steps of
+  up to a word, each step public where no secret member covers any of its
+  bytes, so a public member or a discriminator moved in a step of its own
+  decides a branch, and one moved in the same step as a secret member is
+  refused.
 - **Flags.** Each instruction reads and writes each flag bit as masc's tables
   state it, so a branch on flags a secret compare filled is refused, and an
   instruction that writes only some of them, as `inc` leaves carry, leaves the
