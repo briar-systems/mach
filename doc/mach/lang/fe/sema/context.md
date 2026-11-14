@@ -200,6 +200,7 @@ deferred_hits: how many deferred names type resolution has met, so a consumer ca
                type that failed on one from a type that failed on its own
 offer: a fix the next error raised offers, set by a check that knows one and
                cleared by it once the check is done; nil offers none
+arm: which walk reports a `$error` the comptime arm walked reaches, as `ARM_*`
 write_place: the place under a store or an address-of, whose root is written or
                addressed rather than read
 in_test: inside a `test` body, where a `ret` value is a status in 0..255
@@ -223,6 +224,28 @@ pub val TIMED_SOFT: u8 = 1
 
 ```mach
 pub val TIMED_HARD: u8 = 2
+```
+
+## val ARM_DECIDED
+
+```mach
+pub val ARM_DECIDED:  u8 = 0
+```
+
+which walk reports a `$error` a comptime arm reaches, as `Walk.arm`: this one; none, in
+an arm this walk cannot select; or this value instance, in an arm it selected that its
+template could not, whether or not the instance is quiet
+
+## val ARM_DEFERRED
+
+```mach
+pub val ARM_DEFERRED: u8 = 1
+```
+
+## val ARM_SELECTED
+
+```mach
+pub val ARM_SELECTED: u8 = 2
 ```
 
 ## rec SemaContext

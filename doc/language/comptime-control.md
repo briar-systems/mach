@@ -252,6 +252,30 @@ type checking run over **all** arms structurally, and only the selected arm is
 emitted into each instance. Each arm must therefore be independently
 resolvable and type-checkable.
 
+What only a value can decide waits for the instance. Each instance evaluates
+the gates against its own arguments, and a gate that fails there (an
+`integer division by zero` in `8 / (n - 2)` when `n` is 2) is reported for
+that instance. A `$error` reached in the arm an instance selects, directly or
+under a nested `$if`, `$or` or `$each`, is reported once for each distinct
+instance that selects it, at the call that asked for the instance, with the
+`$error` itself as the related site. A `$error` in an arm no instance selects
+never fires, and neither does one in a function nothing calls. A `$error`
+outside any gated arm is reported once, at the `$error`, without waiting for
+a call.
+
+```mach error no two
+fun shifted($n: u8, x: u64) u64 {
+    $if (n == 2) {
+        $error("no two");
+    }
+    ret x << n;
+}
+
+fun use_it(x: u64) u64 {
+    ret shifted(1, x) + shifted(2, x);   # shifted(2, ..) is refused, shifted(1, ..) is not
+}
+```
+
 A `$if` gated on a `$type_of` type comparison is *not* such an exception: at
 monomorphization the operand's concrete type is known, so the provably-dead arms
 are **pruned** and only the selected arm is type-checked (and emitted). Each arm
@@ -273,7 +297,7 @@ the only thing a reader has to hold.
 
 | the question | when it is answered | what is checked |
 |---|---|---|
-| a `$if` gated on a comptime **value parameter** | per call site | **all** arms, structurally, before any is selected |
+| a `$if` gated on a comptime **value parameter** | per call site | **all** arms, structurally, before any is selected; its gates and the `$error`s of the selected arm, per instance |
 | a `$if` gated on a `$type_of` or a type predicate | per instantiation | only the arm that instantiation selects |
 | an operator, cast, `:~`, literal or condition on a **type parameter** | per instantiation | the whole body, once per distinct instantiation |
 
