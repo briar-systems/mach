@@ -713,6 +713,15 @@ pub fun emit_load_as(b: *Builder, addr: value.Value, ty: Type, secret: bool) res
 a value of `ty` read from `addr` that is as secret as `secret`, whatever the reads around
 it are marked
 
+## fun emit_load_discriminator
+
+```mach
+pub fun emit_load_discriminator(b: *Builder, addr: value.Value, ty: Type) res[value.Value, fail.Fail];
+```
+
+a tag's discriminator of `ty` read from `addr`, stated public: the layout keeps it apart from the bytes of every
+case, so it is public whatever the cases hold
+
 ## fun emit_store
 
 ```mach

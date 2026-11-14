@@ -31,6 +31,13 @@ pub val COMPTIME_DESCRIPTOR_LAYOUT_MSG: str =
 "this descriptor's offset has no answer: the layout of its owning type could not be determined"
 ```
 
+## val COMPTIME_SECRET_MSG
+
+```mach
+pub val COMPTIME_SECRET_MSG: str =
+"a value whose type holds a secret has no compile-time value
+```
+
 ## fun evaluate
 
 ```mach
@@ -57,6 +64,23 @@ e: ast_id.ExprId,
 interner: *intern.Interner,
 fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail];
 ```
+
+## fun evaluate_secret_at_float_width
+
+```mach
+pub fun evaluate_secret_at_float_width[T](
+c: *comptime_scope.ComptimeCtx,
+cap_ctx: *T,
+caps: comptime_capability.PhaseCapabilities[T],
+a: *ast.Ast,
+source: str,
+e: ast_id.ExprId,
+interner: *intern.Interner,
+fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail];
+```
+
+the value of the initializer of a constant whose declared type holds a secret, which may read
+other secret constants: the value it binds is secret in turn
 
 ## fun declared_float_width
 

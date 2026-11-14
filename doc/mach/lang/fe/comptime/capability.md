@@ -194,6 +194,7 @@ member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure
 constant: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
 store: fun(*T, u32) res[*comptime_deep.Store, comptime_failure.EvalFail],
 ident: fun(*T, ast_id.ExprId) bool,
+secret: fun(*T, ast_id.ExprId) bool,
 expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail],
 head: fun(*T, *ast.Ast, ast_id.TypeId) res[ast_type.Type, comptime_failure.EvalFail]) res[PhaseCapabilities[T], fail.Fail];
 ```
@@ -214,6 +215,7 @@ layout: fun(*T, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail]
 cast: fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail],
 scalar: fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail],
 ident: fun(*T, ast_id.ExprId) bool,
+secret: fun(*T, ast_id.ExprId) bool,
 expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail],
 head: fun(*T, *ast.Ast, ast_id.TypeId) res[ast_type.Type, comptime_failure.EvalFail]) res[PhaseCapabilities[T], fail.Fail];
 ```
@@ -268,6 +270,14 @@ the store holding the node a value names, which only a phase that reads interfac
 ```mach
 pub fun capabilities_have_types[T](ctx: *T, caps: PhaseCapabilities[T]) bool;
 ```
+
+## fun capabilities_lowering
+
+```mach
+pub fun capabilities_lowering[T](caps: PhaseCapabilities[T]) bool;
+```
+
+whether the phase is lowering, which materializes only values an earlier phase asked for
 
 ## fun capabilities_cast
 

@@ -687,14 +687,21 @@ pub fun query_of(sc: *SemaContext) type_query.Query;
 
 a question to the type store whose internal failures land in this context
 
+## fun holds_secret
+
+```mach
+pub fun holds_secret(sc: *SemaContext, ty: type_kind.TypeId) bool;
+```
+
+the answer of a query that cannot refuse the input, or `recovery` once it failed, which
+fails the phase as internal
+whether a value of type `ty` holds a secret, which gives it no compile-time value
+
 ## fun recover
 
 ```mach
 pub fun recover[T](sc: *SemaContext, r: res[T, fail.Fail], recovery: T) T;
 ```
-
-the answer of a query that cannot refuse the input, or `recovery` once it failed, which
-fails the phase as internal
 
 ## fun recover_at
 

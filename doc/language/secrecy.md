@@ -267,6 +267,46 @@ whether `u32` is `U` stripped, so it checks only that the target is public and
 each instance settles the equality under its concrete arguments, the way every
 other secrecy gate is checked against the instance.
 
+## Secrets have no compile-time value
+
+A module constant whose type holds a secret (`val K: ^u64 = 7;`, a `^[N]u8`
+array, a record or tag with a secret field) is a run-time value like any other
+secret. It has no compile-time value: wherever the compiler asks for one, a
+read of it is refused as `secret.comptime`. That covers every comptime
+argument (`take(K)` for `fun take($c: u64)`), an array, window or field length
+(`[K]u8`, `a[0, K]`), `$size_of`, `$align_of` and `$length_of` of a type that
+spells one, a `$if` gate in a function or at module scope, a `$each` over a
+secret constant array, a decorator argument (`#[align(K)]`), and a public field
+or element read of a secret constant (`K[0]`). A literal is public, and a public
+field of a constant that holds a secret elsewhere keeps its compile-time value
+(`C.count` of `R{count: 4, key: 9}`).
+
+`:>` of a constant is itself compile-time evaluable, so an author who means the
+value writes the declassification where it is used, as anywhere else:
+
+```mach
+val K: ^u64 = 7;
+
+fun take($c: u64) u64 {
+    ret c;
+}
+
+fun main_value() u64 {
+    ret take(K:>u64); # a compile-time 7, declassified here
+}
+```
+
+Inside a `#[constant_time]` function that cast is listed by
+`mach check --declassified` like any other. A constant's own initializer may
+read secret constants when its declared type holds a secret
+(`val K2: ^u64 = K + 1;`), and the value it binds is secret in turn. A comptime
+parameter declared with a type that holds a secret (`$c: ^u64`) is a
+contradiction, and its declaration is refused. Mach has no explicit tag
+discriminator values and no field defaults, so neither can name a secret.
+`#[embed]` cannot produce a secret array: the embedded bytes are public by
+type (`[_]u8`), so a key compiled into an image is embedded public and copied
+into secret storage, `val` to `var` of a `^` type, where it is used.
+
 ## Welded-storage pointers
 
 Secrecy is fixed at declaration and is non-launderable, which makes the
@@ -576,8 +616,11 @@ A constant-time function may pass a secret only to a callee that
 - is not `#[weak]`, since a definition elsewhere may replace its body at link
   time with code nothing here checked. An `ext` function never qualifies, as
   `#[constant_time]` on an `ext` declaration is refused;
-- is hard where the caller is hard, since a soft callee's timing holds only
-  where the processor has the mode it asks for.
+- is in a mode the caller may rely on: a soft caller may call either mode,
+  and a hard caller a hard callee, or a soft one where the build guarantees
+  every timing mode a soft function's code may be held under (see
+  [Soft and hard](#soft-and-hard)), which is every x86-64 build, an aarch64
+  build with `dit` and a riscv64 build with `zkt`.
 
 "Passing a secret" reaches through pointers: an argument whose type holds a
 secret anywhere it reaches, as `*^u8` or a record with a `^` field, as
@@ -665,7 +708,9 @@ stands in, `test <name>` for a test and `<module>` outside both, and the type of
 the value declassified as sema typed it. A cast in the body of a generic is
 listed once, at its place in the source, whatever instances the module makes:
 its type as the body spells it, `T` for a type parameter, and `<each
-expansion's>` for an operand only a `$each` expansion types. It lists what the source states, so a
+expansion's>` for an operand no frame of the build types: one only a `$each`
+expansion types, and one in a `$if` or `$or` arm the build does not select,
+which is listed though the build compiles none of it. It lists what the source states, so a
 declassification the compiler makes itself, as the test of a division's
 divisor for zero, is not listed. The flag belongs to `check` alone. The listing
 stays plain lines on stdout under `--diagnostics json`, which turns only stderr
@@ -783,8 +828,11 @@ which it has data-independent timing:
   a `hard` function requires in the target's baseline (see [Soft and
   hard](#soft-and-hard));
 - **extensions selected**: the cell is data-independent only on a machine that
-  has the named extensions, so the row is admitted only when the target selects
-  every one of them (`ext` in the manifest, or the `isa`).
+  has the named extensions. A `hard` function admits the row only when the
+  target selects every one of them (`ext` in the manifest, or the `isa`). A
+  `soft` function admits it without them and leaves the timing to the
+  processor, as it does an aarch64 row without DIT: riscv64's `mul` rows build
+  in a soft function on a target without `zkt`.
 
 The multiply column is the spelling `$mach.build.ct_mul` takes: `low` is the
 same-width product, `high_u` and `high_s` the upper half of the unsigned and
@@ -926,6 +974,21 @@ feature:
 - riscv needs Zkt in the selection;
 - x86-64's scalar cells hold unconditionally, so they pass.
 
+**Calls between the modes.** Both modes do the same at entry and at every
+exit (`mirl.legal.timing`): a function entered with the mode on switches
+nothing and leaves it on, and one entered with it off switches it on and
+restores it before it returns. They differ only in what the check admits. A
+soft function's code is held under every mode the processor may offer, the
+switched and the promised ones included, and a hard function's only under the
+modes the build guarantees. So a soft caller may call either mode, and a hard
+caller may rely on a soft callee exactly where the build guarantees every mode
+a soft function's code may be held under, as the hard callee's own check would
+have required: every x86-64 build, whose one mode the system sets for every
+process, an aarch64 build that selects `dit` and a riscv64 build that selects
+`zkt`. Elsewhere a hard function passing a secret to a soft one is refused
+(`secret.call_untrusted`), and masc's walk takes the soft callee as one it does
+not trust.
+
 A `hard` function needs nothing linked into the image, and a `soft` one needs
 only the availability byte below and, in a shared library, the probe that sets
 it. There is no object mark the linker checks, and a program never refuses to
@@ -1009,6 +1072,14 @@ out whole. An aggregate that holds no secret is laid out and built as before,
 its padding unspecified, except a literal in a constant-time function, whose
 padding is zeroed too: the function's check refuses a read of stack no store
 reached, and a load of the whole value reads its padding.
+
+A tag or union literal writes the same way. Where its type holds a secret, or
+the literal is in a constant-time function, every byte the case or member it
+names leaves unwritten is zeroed before the discriminator and the payload are
+stored, so `ret opt[u64].none{}` in a constant-time function returns a value
+whose payload bytes are zero rather than stale. Anywhere else a tag literal
+writes its discriminator and its payload alone, and a union literal its
+member alone.
 
 ## What is promised about memory
 

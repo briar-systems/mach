@@ -844,7 +844,7 @@ Inline `asm` inside such a function is **validated rather than rejected**: the
 block is parsed and walked for the same leaks, and refused only where a leak is
 found or where the construct cannot be modelled. See
 [secrecy.md](secrecy.md#constant_time--the-codegen-contract) for what is checked and
-what is refused, including the x86-64 conditional-branch limitation.
+what is refused.
 
 The **zeroizing-write** guarantee is *not* one of the decorator's obligations,
 and describing it as one understates it. It rests on the write, not on any

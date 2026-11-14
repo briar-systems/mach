@@ -101,14 +101,22 @@ a failure a walk with no place of its own returned to an evaluation: a refusal o
 is rejected under its own kind, which the evaluation reports at the node it stands on, and
 any other failure reads as eval_from_fail reads it
 
+## fun stands_alone
+
+```mach
+pub fun stands_alone(f: EvalFail) bool;
+```
+
+whether a failure of a global initializer's own evaluation means it is no constant: it needs a
+value, a member, the types or a layout no constant gives it
+a refusal reported as itself wherever a compile-time value was asked for, since it says why no
+value exists better than the asker can: a secret, or a constant bound per target tuple
+
 ## fun not_constant
 
 ```mach
 pub fun not_constant(kind: EvalFailKind) bool;
 ```
-
-whether a failure of a global initializer's own evaluation means it is no constant: it needs a
-value, a member, the types or a layout no constant gives it
 
 ## fun init_not_constant_report
 

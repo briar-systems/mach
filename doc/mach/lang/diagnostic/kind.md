@@ -3139,6 +3139,14 @@ pub val NAME_RESERVED: Kind = 528
 
 a symbol the source defines under a name the compiler delivers a symbol of its own under, as a helper's
 
+## val SECRET_COMPTIME
+
+```mach
+pub val SECRET_COMPTIME: Kind = 529
+```
+
+a value whose type holds a secret, read where a compile-time value is asked for
+
 ## rec Spec
 
 ```mach
@@ -3156,7 +3164,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 528
+pub val COUNT: usize       = 529
 ```
 
 ## fun at
