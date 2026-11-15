@@ -214,10 +214,10 @@ torn down with dnit, which runs every owned product's finalizer
 
 a: owns the db, its shards and every derived product's bytes
 
-## fun drop_failure
+## fun failure_dnit
 
 ```mach
-pub fun drop_failure(db: *QueryDb);
+pub fun failure_dnit(db: *QueryDb);
 ```
 
 release the text and the places of the last failure the database holds
@@ -257,10 +257,10 @@ the origin of the product that raised `f`: the operation's, the held failure's o
 presentation's when `f` reads that failure's text, ORIGIN_NONE for any other failure and for
 one raised outside every computation
 
-## fun drop_presented
+## fun presented_dnit
 
 ```mach
-pub fun drop_presented(db: *QueryDb);
+pub fun presented_dnit(db: *QueryDb);
 ```
 
 release the last operation's presentation and the failure held beside it
@@ -557,10 +557,10 @@ key: the product's key
 since: the first operation the host's reads count; an input is current whenever it was set
 ret: a borrowed view, valid until the next operation, input change or retirement
 
-## fun release_value
+## fun value_dnit
 
 ```mach
-pub fun release_value(db: *QueryDb, kind: *Kind, key: u64) err[fail.Fail];
+pub fun value_dnit(db: *QueryDb, kind: *Kind, key: u64) err[fail.Fail];
 ```
 
 give back the value of a derived product no reader of the build reads again: its finalizer

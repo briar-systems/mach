@@ -258,9 +258,9 @@ fun vformat(fmt: str, va: ...) res[usize, FormatError] {
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    val hi: str                     = "hi";
-    val r:  res[usize, FormatError] = vformat("n={} s={}\n", 7, hi);
-    if (sel r.err) { ret 1; }
+    val hi:            str                     = "hi";
+    val res_formatted: res[usize, FormatError] = vformat("n={} s={}\n", 7, hi);
+    if (sel res_formatted.err) { ret 1; }
     ret 0;
 }
 ```

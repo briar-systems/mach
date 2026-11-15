@@ -78,7 +78,7 @@ the command launching `out` through `r` with the `n` arguments at `args`: the
 override's program then `out`, or each declared template expanded with
 `{artifact.out}` as `out` and its first word resolved as a program
 
-a: owns the command, released with `command_free`
+a: owns the command, released with `command_dnit`
 ret: the command; err when a template does not expand or the first word names no
      program
 
@@ -91,10 +91,10 @@ pub fun line(a: *A.Allocator, c: *Command) res[str, fail.Fail];
 the command's leading words joined by spaces, as a person would retype them
 before the run's own arguments
 
-## fun command_free
+## fun command_dnit
 
 ```mach
-pub fun command_free(a: *A.Allocator, c: *Command);
+pub fun command_dnit(a: *A.Allocator, c: *Command);
 ```
 
 release the words a command owns; the run's own arguments are the caller's

@@ -32,10 +32,10 @@ pub fun collect_scope(p: *project.Project, col: testrunner.Collected, sc: *TestS
 
 col is the unit's test declarations in module order; the scope owns it from here
 
-## fun free_scope
+## fun scope_dnit
 
 ```mach
-pub fun free_scope(p: *project.Project, sc: *TestScope);
+pub fun scope_dnit(p: *project.Project, sc: *TestScope);
 ```
 
 ## fun record_tests

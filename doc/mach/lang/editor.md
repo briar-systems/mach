@@ -158,7 +158,7 @@ reached only by mach-lsp
 pub rec ProjectRequest;
 ```
 
-what one project_open call asks for; every string and the buffer array are borrowed only
+what one project_init call asks for; every string and the buffer array are borrowed only
 during the call
 reached only by mach-lsp
 
@@ -201,10 +201,10 @@ pub fun project_request(root: str, phase: driver.FrontendPhase) ProjectRequest;
 a request for the project at `root` to `phase`, on mach's own selection and with no buffers
 reached only by mach-lsp
 
-## fun project_open
+## fun project_init
 
 ```mach
-pub fun project_open(s: *session.Session, req: *ProjectRequest) res[ProjectSnapshot, fail.Fail];
+pub fun project_init(s: *session.Session, req: *ProjectRequest) res[ProjectSnapshot, fail.Fail];
 ```
 
 analyze the project at a root on the cell mach selects for it, over the union of its artifacts,

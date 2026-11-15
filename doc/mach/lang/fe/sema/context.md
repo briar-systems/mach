@@ -263,25 +263,25 @@ instance: Instance) SemaContext;
 
 the one way a walk is made: over `view`, typing `instance`, sharing `typing`, with a fresh walk
 
-## fun walk_init
+## fun walk_make
 
 ```mach
-pub fun walk_init() Walk;
+pub fun walk_make() Walk;
 ```
 
-## fun walk_open
+## fun walk_begin
 
 ```mach
-pub fun walk_open(sc: *SemaContext) Walk;
+pub fun walk_begin(sc: *SemaContext) Walk;
 ```
 
 a construct that sets walk state opens the walk and closes it on the way out, which
 undoes everything the construct set; the count of deferred names met carries out
 
-## fun walk_close
+## fun walk_end
 
 ```mach
-pub fun walk_close(sc: *SemaContext, outer: Walk);
+pub fun walk_end(sc: *SemaContext, outer: Walk);
 ```
 
 ## fun instance_none
@@ -376,10 +376,10 @@ settled until the caller is itself instantiated, and that caller's walk asks for
 closed instance. `item` carries the kind, the declaration, its arguments, name,
 signature and site; the rest is the set's
 
-## fun inst_worklist_new
+## fun inst_worklist_init
 
 ```mach
-pub fun inst_worklist_new(alloc: *A.Allocator) res[*InstWorklist, fail.Fail];
+pub fun inst_worklist_init(alloc: *A.Allocator) res[*InstWorklist, fail.Fail];
 ```
 
 ## fun inst_worklist_take

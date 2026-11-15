@@ -59,10 +59,10 @@ fe/sema/infer.mach) with a message that says what to do about it, so the
 parser must sit above that or sema never gets to speak. the compiler's own
 source and the standard library reach 14.
 
-## fun make
+## fun init
 
 ```mach
-pub fun make(tokens: *fe_lexer.TokenStream, out: *ast.Ast, names: *intern.Interner, diags: *diagnostic.DiagnosticStore) Parser;
+pub fun init(tokens: *fe_lexer.TokenStream, out: *ast.Ast, names: *intern.Interner, diags: *diagnostic.DiagnosticStore) Parser;
 ```
 
 ## fun current
@@ -341,10 +341,10 @@ a list gathered while its length is unknown, then flushed into its AST table in 
 pub fun list_push[T](p: *Parser, b: *Vector[T], x: T);
 ```
 
-## fun list_free
+## fun list_dnit
 
 ```mach
-pub fun list_free[T](p: *Parser, b: *Vector[T]);
+pub fun list_dnit[T](p: *Parser, b: *Vector[T]);
 ```
 
 ## fun list_flush

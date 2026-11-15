@@ -43,10 +43,10 @@ pub fun inspector_dnit(alloc: *A.Allocator, gi: *Inspector);
 pub rec Bytes;
 ```
 
-## fun bytes_free
+## fun bytes_dnit
 
 ```mach
-pub fun bytes_free(alloc: *A.Allocator, bytes: *Bytes);
+pub fun bytes_dnit(alloc: *A.Allocator, bytes: *Bytes);
 ```
 
 ## fun count_nil_terminated

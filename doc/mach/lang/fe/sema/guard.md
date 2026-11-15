@@ -6,16 +6,16 @@
 pub fun push(sc: *sema_context.SemaContext, frame: *sema_context.Guard, place: ast_id.ExprId, case_name: intern.StrId);
 ```
 
-## fun close
+## fun end
 
 ```mach
-pub fun close(sc: *sema_context.SemaContext, frame: *sema_context.Guard);
+pub fun end(sc: *sema_context.SemaContext, frame: *sema_context.Guard);
 ```
 
-## fun open_sel
+## fun sel_begin
 
 ```mach
-pub fun open_sel(sc: *sema_context.SemaContext, cond: ast_id.ExprId, frame: *sema_context.Guard) res[bool, fail.Fail];
+pub fun sel_begin(sc: *sema_context.SemaContext, cond: ast_id.ExprId, frame: *sema_context.Guard) res[bool, fail.Fail];
 ```
 
 opens a guard for `P.c` when the condition is exactly `sel P.c`
@@ -26,19 +26,19 @@ opens a guard for `P.c` when the condition is exactly `sel P.c`
 pub fun guarded(sc: *sema_context.SemaContext, place: ast_id.ExprId, case_name: intern.StrId) res[bool, fail.Fail];
 ```
 
-## fun open_exit_chain
+## fun exit_chain_begin
 
 ```mach
-pub fun open_exit_chain(sc: *sema_context.SemaContext, sid: ast_id.StmtId, frame: *sema_context.Guard) res[bool, fail.Fail];
+pub fun exit_chain_begin(sc: *sema_context.SemaContext, sid: ast_id.StmtId, frame: *sema_context.Guard) res[bool, fail.Fail];
 ```
 
 a chain whose arms all test one place with `sel` or `!sel` and all exit leaves the block knowing
 which cases remain; when exactly one remains the rest of the block is guarded for it
 
-## fun open_final_or
+## fun final_or_begin
 
 ```mach
-pub fun open_final_or(sc: *sema_context.SemaContext, sid: ast_id.StmtId, frame: *sema_context.Guard) res[bool, fail.Fail];
+pub fun final_or_begin(sc: *sema_context.SemaContext, sid: ast_id.StmtId, frame: *sema_context.Guard) res[bool, fail.Fail];
 ```
 
 a chain whose arms all test one place with `sel` or `!sel` reaches its final bare `or` knowing

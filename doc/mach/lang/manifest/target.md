@@ -110,9 +110,9 @@ whether `native` could ever name the target: its system has a host row whose
 environment and architecture the target states, so a build could run on one. a
 freestanding or vulkan target is only ever selected by name
 
-## fun make_native_target
+## fun native_target_init
 
 ```mach
-pub fun make_native_target(alloc: *A.Allocator, itn: *intern.Interner) res[*TargetDef, fail.Fail];
+pub fun native_target_init(alloc: *A.Allocator, itn: *intern.Interner) res[*TargetDef, fail.Fail];
 ```
 

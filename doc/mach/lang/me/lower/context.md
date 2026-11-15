@@ -671,10 +671,10 @@ return `v` from the function, none for no value. every return branches to one ex
 which holds the function's only `ret`, so the frame is undone in one place however many
 returns the source has. a scalar result travels as the exit's parameter
 
-## fun close_exit
+## fun emit_exit
 
 ```mach
-pub fun close_exit(lc: *LowerContext) err[fail.Fail];
+pub fun emit_exit(lc: *LowerContext) err[fail.Fail];
 ```
 
 write the one exit the function's returns branch to, where it has one

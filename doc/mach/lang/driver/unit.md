@@ -3,7 +3,7 @@
 one object, of a module or an instance unit, made in two steps. `lower` lowers the unit's
 code into a mirl module on a heap of its own and hands both back as one value, which its
 owner keeps until `compile` has verified it, written it as text when asked and compiled it
-into an object; `release` then tears the heap down. compiling reads the lowered unit and its
+into an object; `dnit` then tears the heap down. compiling reads the lowered unit and its
 job and writes only what it returns, so compiles of different units can run side by side on
 one shared target (mirl#406). each step times the stages it runs and keeps the counts each
 owner holds of the module, for the readout
@@ -45,7 +45,7 @@ pub rec Lowered;
 
 a unit lowered and not yet compiled: the heap its module lives on, the module, the facts
 its lowering kept and what lowering it measured. it lives where `lower` was told to put it
-until `release`
+until `dnit`
 
 lower: lowering the module into mirl
 functions: the module's functions, as mirl's module holds them
@@ -102,12 +102,12 @@ pub fun lower(lowering: Lowering, back: *backend.Back, spans: *heap.Pool, out: *
 
 the unit `lowering` names lowered for `back`'s target onto a heap drawing its spans from
 `spans`, which the unit owns alone and so takes no lock, the value held in `out` until
-`release`, or why it was not lowered
+`dnit`, or why it was not lowered
 
-## fun release
+## fun dnit
 
 ```mach
-pub fun release(out: *A.Allocator, l: *Lowered);
+pub fun dnit(out: *A.Allocator, l: *Lowered);
 ```
 
 tear down what `lower` made in `out`: the heap and the module on it. the facts are the

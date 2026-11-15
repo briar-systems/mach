@@ -101,7 +101,7 @@ pub rec Host;
 ```
 
 what the load asks of the program that runs it, which owns the module table and the parses.
-the host runs each of the load's entries (module_load, module_open, module_reload and
+the host runs each of the load's entries (module_load, module_load_one, module_reload and
 decorators_record) whole, and replaces no module's syntax while one runs but through `parse`
 
 ctx: the host's own state
@@ -209,10 +209,10 @@ whether the module is gated out of this build
 pub fun module_count(l: *Loader) u32;
 ```
 
-## fun module_open
+## fun module_load_one
 
 ```mach
-pub fun module_open(l: *Loader, fqn: intern.StrId) res[module.ModuleId, fail.Fail];
+pub fun module_load_one(l: *Loader, fqn: intern.StrId) res[module.ModuleId, fail.Fail];
 ```
 
 parse the module `fqn` names without walking it, as a root a later phase reads alone

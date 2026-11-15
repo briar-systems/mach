@@ -12,8 +12,8 @@ pub rec Compiled;
 ```
 
 a module's object and the warnings mirl gave compiling it, each a failure of its warning's kind
-located where mirl states, both owned by the caller and given back with `release`, or the
-warnings alone with `release_warnings` once the object has moved on
+located where mirl states, both owned by the caller and given back with `dnit`, or the
+warnings alone with `warnings_dnit` once the object has moved on
 
 ## fun compile
 
@@ -29,19 +29,19 @@ timed and counted into `stats` when there is one. a failure or warning points at
 `sources` mirl's location names. `name` is the object's, no other object's in a link. the module is the schedule's
 to rewrite, so it is spent here
 
-## fun release_warnings
+## fun warnings_dnit
 
 ```mach
-pub fun release_warnings(a: *A.Allocator, c: *Compiled);
+pub fun warnings_dnit(a: *A.Allocator, c: *Compiled);
 ```
 
 give back the warnings of what `compile` made, which own their text and places through `a`, the
 allocator it was given
 
-## fun release
+## fun dnit
 
 ```mach
-pub fun release(a: *A.Allocator, c: *Compiled);
+pub fun dnit(a: *A.Allocator, c: *Compiled);
 ```
 
 give back what `compile` made: its object and its warnings

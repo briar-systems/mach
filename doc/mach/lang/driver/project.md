@@ -52,10 +52,10 @@ and owns its own
 
 alloc: owns the entries, their manifests and their edges
 
-## fun closure_empty
+## fun closure_init
 
 ```mach
-pub fun closure_empty(alloc: *A.Allocator) Closure;
+pub fun closure_init(alloc: *A.Allocator) Closure;
 ```
 
 a closure that holds no dependency
@@ -117,10 +117,10 @@ pub rec Record;
 
 the cache record a compiled object carries into `obj/`, nil until the cache publishes one
 
-## fun record_release
+## fun record_dnit
 
 ```mach
-pub fun record_release(p: *Project, r: *Record);
+pub fun record_dnit(p: *Project, r: *Record);
 ```
 
 give back a record's bytes
@@ -186,30 +186,30 @@ writer spells as the format names a C symbol
 the name a C symbol `bare` takes in the target's objects: the prefix mink's
 registry gives a C symbol of the target's format on its architecture, then `bare`
 
-## fun release_staged
+## fun staged_dnit
 
 ```mach
-pub fun release_staged(p: *Project, m: *ModuleEntry);
+pub fun staged_dnit(p: *Project, m: *ModuleEntry);
 ```
 
 a staged object is the project's until a query takes it, and `object` is borrowed
 
-## fun release_staged_test
+## fun staged_test_dnit
 
 ```mach
-pub fun release_staged_test(p: *Project, m: *ModuleEntry);
+pub fun staged_test_dnit(p: *Project, m: *ModuleEntry);
 ```
 
-## fun release_all_staged
+## fun all_staged_dnit
 
 ```mach
-pub fun release_all_staged(p: *Project);
+pub fun all_staged_dnit(p: *Project);
 ```
 
-## fun release_fresh_staged
+## fun fresh_staged_dnit
 
 ```mach
-pub fun release_fresh_staged(p: *Project);
+pub fun fresh_staged_dnit(p: *Project);
 ```
 
 a restored product stays staged across operations: it is keyed by the key
@@ -226,18 +226,18 @@ pub fun units_clear(p: *Project);
 forget the instance units, giving back the paths, staged objects and records the project owns
 of them; their objects are their codegen products'
 
-## fun recorded_drop
+## fun recorded_dnit
 
 ```mach
-pub fun recorded_drop(m: *ModuleEntry);
+pub fun recorded_dnit(m: *ModuleEntry);
 ```
 
 give back the front end's warnings a module's record held
 
-## fun lower_scope_drop
+## fun lower_scope_dnit
 
 ```mach
-pub fun lower_scope_drop(m: *ModuleEntry);
+pub fun lower_scope_dnit(m: *ModuleEntry);
 ```
 
 release the scope lowering bound a module's constants in
@@ -265,10 +265,10 @@ phase now running: both the project's store and the session's
 pub fun init_project(p: *Project, s: *session.Session);
 ```
 
-## fun free_dep_entries
+## fun dep_entries_dnit
 
 ```mach
-pub fun free_dep_entries(alloc: *A.Allocator, deps: *DepEntry, count: u32, capacity: usize);
+pub fun dep_entries_dnit(alloc: *A.Allocator, deps: *DepEntry, count: u32, capacity: usize);
 ```
 
 release `count` dependency entries and their array of `capacity`; a nil array owns

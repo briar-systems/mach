@@ -235,10 +235,10 @@ pub fun readable(v: CTValue, interner: *intern.Interner) res[CTValue, comptime_f
 
 a named constant's value as a reader sees it: a non-integer constant fails with its refusal
 
-## fun make_int_wide
+## fun int_wide_make
 
 ```mach
-pub fun make_int_wide(bits: wide.Wide, unsigned: bool) res[CTValue, comptime_failure.EvalFail];
+pub fun int_wide_make(bits: wide.Wide, unsigned: bool) res[CTValue, comptime_failure.EvalFail];
 ```
 
 ## fun int_value

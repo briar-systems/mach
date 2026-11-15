@@ -67,7 +67,7 @@ pub fun element_sites(alloc: *A.Allocator, arr: *toml_value.Array) res[*lang_sou
 ```
 
 where each element of `arr` is written, in order, as `span_site` places it;
-nil for an empty array. freed with `model.free_sites`
+nil for an empty array. freed with `model.sites_free`
 
 ## rec Sites
 

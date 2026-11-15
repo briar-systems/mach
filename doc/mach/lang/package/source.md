@@ -102,9 +102,9 @@ acquires only what a pin or an existing checkout already names
 pub rec Checkouts;
 ```
 
-## fun releases_free
+## fun releases_dnit
 
 ```mach
-pub fun releases_free(a: *A.Allocator, list: *Vector[Release]);
+pub fun releases_dnit(a: *A.Allocator, list: *Vector[Release]);
 ```
 

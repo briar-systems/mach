@@ -30,10 +30,10 @@ pub val MAX_COMPOSE_DEPTH: u32 = 8
 pub fun read(sc: *sema_context.SemaContext, d: *ast_decl.Decl, dec: *ast_decl.Decorator, report: bool, depth: u32) Read;
 ```
 
-## fun release
+## fun read_dnit
 
 ```mach
-pub fun release(sc: *sema_context.SemaContext, r: Read);
+pub fun read_dnit(sc: *sema_context.SemaContext, r: Read);
 ```
 
 ## fun validate
@@ -57,10 +57,10 @@ pub fun check_annotation_handles_all(sc: *sema_context.SemaContext);
 every annotation's check shares one walk, so a type that several annotations spell, as a
 chain of defs each over the one before does, is walked once rather than once per annotation
 
-## fun scan_open
+## fun scan_begin
 
 ```mach
-pub fun scan_open(sc: *sema_context.SemaContext, scan: *type_scan.Scan) bool;
+pub fun scan_begin(sc: *sema_context.SemaContext, scan: *type_scan.Scan) bool;
 ```
 
 ## fun type_carries_handle

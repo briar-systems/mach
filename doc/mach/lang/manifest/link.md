@@ -7,7 +7,7 @@ pub rec LinkRequirement;
 ```
 
 a `[link.<name>]` entry resolved for one target, as the linker consumes it.
-the symbol array is owned; release it with `free_link_claims`
+the symbol array is owned; release it with `link_claims_dnit`
 
 source: copied from the link
 text: for a local source, the `path` expanded and interned; otherwise the link's `name`
@@ -24,10 +24,10 @@ versions: copied from the link
 pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail];
 ```
 
-## fun free_link_claims
+## fun link_claims_dnit
 
 ```mach
-pub fun free_link_claims(alloc: *A.Allocator, items: *LinkRequirement, count: u32);
+pub fun link_claims_dnit(alloc: *A.Allocator, items: *LinkRequirement, count: u32);
 ```
 
 free the symbol arrays of `count` requirements and nil them. the `items` array

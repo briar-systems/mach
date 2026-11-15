@@ -20,20 +20,20 @@ place: how a tag's cases are placed on this target, which mach.lang.type.query.a
             decides from the secrecy of their bytes, a query above this one
 placed: each tag placed, its cases at `start` in `cases`, under `generation`
 
-## fun open
+## fun init
 
 ```mach
-pub fun open(a: *A.Allocator, target: *mirl_record.Target, ctx: opt[*core_state.Context],
+pub fun init(a: *A.Allocator, target: *mirl_record.Target, ctx: opt[*core_state.Context],
 place: fun(*Measure, type_kind.TypeId, *collections_vector.Vector[shape.Carried]) res[u32, fail.Fail]) res[*Laying, fail.Fail];
 ```
 
 a laying over `target` under the context `ctx`, both borrowed, placing tags by `place`.
 given back by close
 
-## fun close
+## fun dnit
 
 ```mach
-pub fun close(l: *Laying);
+pub fun dnit(l: *Laying);
 ```
 
 ## fun placement

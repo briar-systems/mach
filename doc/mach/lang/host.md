@@ -77,14 +77,14 @@ pub fun native_text(a: *A.Allocator, text: str) res[NativeName, NativeTextError]
 `text` in std.runtime.native units, owned and terminated: converted from
 UTF-8 once on windows, the bytes as they are elsewhere
 
-a: allocator for the units, which native_text_free releases
+a: allocator for the units, which native_text_dnit releases
 text: the UTF-8 text, nil read as empty
 ret: the units and their length, or the refusal
 
-## fun native_text_free
+## fun native_text_dnit
 
 ```mach
-pub fun native_text_free(a: *A.Allocator, name: *NativeName);
+pub fun native_text_dnit(a: *A.Allocator, name: *NativeName);
 ```
 
 release a native text; an empty one owns no units

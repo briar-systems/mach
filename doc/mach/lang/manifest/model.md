@@ -407,10 +407,10 @@ a link with every key a table may leave out at its default: no symbol or filter,
 exported, always included, and a shared library. the caller sets the name, source and the
 name or path its source takes
 
-## fun empty
+## fun init
 
 ```mach
-pub fun empty() Manifest;
+pub fun init() Manifest;
 ```
 
 a manifest with every array nil and every count 0. the scalar ids are left
@@ -425,7 +425,7 @@ pub fun dnit(m: *Manifest, alloc: *A.Allocator);
 ```
 
 free every array a parsed manifest owns and zero the counts. safe on the
-result of `empty` and on a manifest already released
+result of `init` and on a manifest already released
 
 m: the manifest
 alloc: the allocator `parse` was given
@@ -445,10 +445,10 @@ the step itself is its owner's
 pub fun free_strarr(alloc: *A.Allocator, items: *intern.StrId, count: u32);
 ```
 
-## fun names_free
+## fun names_dnit
 
 ```mach
-pub fun names_free(alloc: *A.Allocator, l: *NameList);
+pub fun names_dnit(alloc: *A.Allocator, l: *NameList);
 ```
 
 release what a name list owns

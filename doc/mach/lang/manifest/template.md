@@ -164,10 +164,10 @@ req_count: length of `reqs`
 dependency: the dependency whose default library requirements they are, "" for
             the artifact being built
 
-## fun values_empty
+## fun values_make
 
 ```mach
-pub fun values_empty() Values;
+pub fun values_make() Values;
 ```
 
 values that name nothing, each field set by the caller that has it

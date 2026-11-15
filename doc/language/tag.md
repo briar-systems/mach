@@ -159,14 +159,14 @@ use std.types.result.res;
 
 tag ParseError: u8 { invalid; overflow; }
 
-val good: res[i64, ParseError] = res[i64, ParseError].ok{42};
-val bad:  res[i64, ParseError] = res[i64, ParseError].err{ParseError.invalid{}};
+val res_good: res[i64, ParseError] = res[i64, ParseError].ok{42};
+val res_bad:  res[i64, ParseError] = res[i64, ParseError].err{ParseError.invalid{}};
 
-val present: opt[i64] = opt[i64].some{42};
-val absent:  opt[i64] = opt[i64].none{};
+val opt_present: opt[i64] = opt[i64].some{42};
+val opt_absent:  opt[i64] = opt[i64].none{};
 
-val finished: err[ParseError] = err[ParseError].ok{};
-val failed:   err[ParseError] = err[ParseError].err{ParseError.overflow{}};
+val err_finished: err[ParseError] = err[ParseError].ok{};
+val err_failed:   err[ParseError] = err[ParseError].err{ParseError.overflow{}};
 ```
 
 Default initialization of `opt[T]` selects `none`. Default initialization of

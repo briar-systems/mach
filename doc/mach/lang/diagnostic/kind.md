@@ -3230,10 +3230,10 @@ the kind whose key is exactly `key`, retired or not
 pub rec KindSet;
 ```
 
-## fun set_empty
+## fun set_make
 
 ```mach
-pub fun set_empty() KindSet;
+pub fun set_make() KindSet;
 ```
 
 ## fun set_has
@@ -3276,10 +3276,10 @@ pub fun selection_unknown(s: *Selection) bool;
 
 the selection covers no row
 
-## fun selection_empty
+## fun selection_is_empty
 
 ```mach
-pub fun selection_empty(s: *Selection) bool;
+pub fun selection_is_empty(s: *Selection) bool;
 ```
 
 the selection covers no warning row

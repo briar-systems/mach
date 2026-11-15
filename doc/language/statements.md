@@ -232,11 +232,11 @@ fun parse(input: u8) res[i64, WriteError] {
 }
 
 fun increment(input: u8) res[i64, WriteError] {
-    val flushed: err[WriteError] = flush();
-    if (sel flushed.err) { ret res[i64, WriteError].err{flushed.err}; }
-    val r: res[i64, WriteError] = parse(input);
-    if (sel r.err) { ret res[i64, WriteError].err{r.err}; }
-    ret res[i64, WriteError].ok{r.ok + 1}; # r.ok is guarded: the chain above exits
+    val err_flushed: err[WriteError]     = flush();
+    if (sel err_flushed.err) { ret res[i64, WriteError].err{err_flushed.err}; }
+    val res_parsed: res[i64, WriteError] = parse(input);
+    if (sel res_parsed.err) { ret res[i64, WriteError].err{res_parsed.err}; }
+    ret res[i64, WriteError].ok{res_parsed.ok + 1}; # res_parsed.ok is guarded: the chain above exits
 }
 ```
 

@@ -12,16 +12,16 @@ the network
 pub rec Remotes;
 ```
 
-## fun open
+## fun init
 
 ```mach
-pub fun open(s: *session.Session, offline: bool, local: str) res[Remotes, fail.Fail];
+pub fun init(s: *session.Session, offline: bool, local: str) res[Remotes, fail.Fail];
 ```
 
-## fun close
+## fun dnit
 
 ```mach
-pub fun close(c: *Remotes) err[fail.Fail];
+pub fun dnit(c: *Remotes) err[fail.Fail];
 ```
 
 release the table; a candidate scratch that stays is the failure, once

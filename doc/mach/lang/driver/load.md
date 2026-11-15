@@ -31,10 +31,10 @@ pub fun module_load(p: *project.Project, fqn: intern.StrId) res[module.ModuleId,
 
 load the module `fqn` names and everything it reaches
 
-## fun module_open
+## fun module_load_one
 
 ```mach
-pub fun module_open(p: *project.Project, fqn: intern.StrId) res[module.ModuleId, fail.Fail];
+pub fun module_load_one(p: *project.Project, fqn: intern.StrId) res[module.ModuleId, fail.Fail];
 ```
 
 parse the module `fqn` names as a root, without walking it

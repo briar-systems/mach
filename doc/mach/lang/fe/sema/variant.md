@@ -3,19 +3,19 @@
 the generic unions an annotation instantiates must have variants agreeing on secrecy
 under their arguments, which no check of the generic declaration can answer
 
-## fun walk_open
+## fun walk_begin
 
 ```mach
-pub fun walk_open(sc: *sema_context.SemaContext, w: *sema_context.SecrecyWalk);
+pub fun walk_begin(sc: *sema_context.SemaContext, w: *sema_context.SecrecyWalk);
 ```
 
 opens the walk the checks of one scope's annotations share, which stays closed when the
 module holds no secret, so its checks have nothing to find
 
-## fun walk_close
+## fun walk_end
 
 ```mach
-pub fun walk_close(sc: *sema_context.SemaContext, w: *sema_context.SecrecyWalk);
+pub fun walk_end(sc: *sema_context.SemaContext, w: *sema_context.SecrecyWalk);
 ```
 
 ## fun check_annotation_uni_secrecy

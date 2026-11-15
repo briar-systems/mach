@@ -72,10 +72,10 @@ pub fun ordered_inputs(p: *project.Project) res[*Given, fail.Fail];
 the build's objects as the link's inputs, in the link's order: the emitted modules' in
 topological order, then the instance units' in theirs, by origin name and bucket
 
-## fun release_ordered
+## fun ordered_inputs_free
 
 ```mach
-pub fun release_ordered(p: *project.Project, inputs: *Given);
+pub fun ordered_inputs_free(p: *project.Project, inputs: *Given);
 ```
 
 ## fun objects_into
@@ -145,10 +145,10 @@ each test object reaches `obj/` beside its module's object, the same way
 
 destinations: per emitted module, its test object's path, nil for a module without one
 
-## fun free_inputs
+## fun inputs_dnit
 
 ```mach
-pub fun free_inputs(a: *A.Allocator, inputs: *contract.Input, n: u32, cap: u32);
+pub fun inputs_dnit(a: *A.Allocator, inputs: *contract.Input, n: u32, cap: u32);
 ```
 
 release `n` object inputs and their array of `cap`; a nil array owns nothing

@@ -200,10 +200,10 @@ pub fun instance_reads(p: *project.Project, item: *sema_instance.Instance, out: 
 the modules the instance `item` names: its declaring module first, then every module declaring
 a type its arguments or pack name
 
-## fun free_instance_deps
+## fun instance_deps_dnit
 
 ```mach
-pub fun free_instance_deps(p: *project.Project, deps: *sema_product.SemaDeps);
+pub fun instance_deps_dnit(p: *project.Project, deps: *sema_product.SemaDeps);
 ```
 
 release what instance_deps made
@@ -228,10 +228,10 @@ dropping the warnings a declaration's `#[expect]` acknowledges and the ones the
 profile's `allow` silences, then reporting each judged expectation nothing
 fulfilled. a warning replayed from the cache passes through here as a fresh one does
 
-## fun release_lowered
+## fun products_dnit
 
 ```mach
-pub fun release_lowered(p: *project.Project, mid: module.ModuleId) err[fail.Fail];
+pub fun products_dnit(p: *project.Project, mid: module.ModuleId) err[fail.Fail];
 ```
 
 give back a lowered module's front-end products, which nothing the build runs after its

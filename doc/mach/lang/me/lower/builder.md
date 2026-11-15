@@ -223,16 +223,16 @@ pub fun function(b: *Builder) id.Function;
 pub fun entry_block(b: *Builder) id.Block;
 ```
 
-## fun new_block
+## fun block_make
 
 ```mach
-pub fun new_block(b: *Builder) res[id.Block, fail.Fail];
+pub fun block_make(b: *Builder) res[id.Block, fail.Fail];
 ```
 
-## fun new_block_with
+## fun block_make_with
 
 ```mach
-pub fun new_block_with(b: *Builder, params: *Type, secrets: *bool, n: u32) id.Block;
+pub fun block_make_with(b: *Builder, params: *Type, secrets: *bool, n: u32) id.Block;
 ```
 
 a block whose parameters are `params`, which every edge into it passes

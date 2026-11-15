@@ -40,10 +40,10 @@ pub fun none() Back;
 
 a back half that compiles nothing, for a project with no target yet
 
-## fun open
+## fun init
 
 ```mach
-pub fun open(a: *A.Allocator, t: *resolved.Target) res[Back, fail.Fail];
+pub fun init(a: *A.Allocator, t: *resolved.Target) res[Back, fail.Fail];
 ```
 
 the back half of the resolved target `t`
@@ -67,10 +67,10 @@ whether an image of format `f` exports only what its inputs' export directives n
 definition states no visibility; false for a format mink links no image of
 the name of the mirl family that compiles the build when it writes no listing of its objects, none when it writes one
 
-## fun close
+## fun dnit
 
 ```mach
-pub fun close(a: *A.Allocator, b: *Back);
+pub fun dnit(a: *A.Allocator, b: *Back);
 ```
 
 ## fun machine
@@ -96,7 +96,7 @@ allocation it was refused is the machine's, and every other cause is the compile
 pub fun object_bytes(b: *Back, a: *A.Allocator, o: *Object) res[Sink, fail.Fail];
 ```
 
-the bytes of `o` laid out in the target's object format, given back with sink.release
+the bytes of `o` laid out in the target's object format, given back with sink.dnit
 
 ## fun read_object
 
@@ -206,10 +206,10 @@ pub fun laying(b: *Back, a: *A.Allocator) res[opt[Laying], fail.Fail];
 the laying of the target's link, none for a format whose link lays out no sections, as a
 SPIR-V module's gives each id its index, and refused for a format mink links no image of
 
-## fun laying_release
+## fun laying_dnit
 
 ```mach
-pub fun laying_release(l: *Laying);
+pub fun laying_dnit(l: *Laying);
 ```
 
 ## fun laid_name
@@ -237,10 +237,10 @@ pub fun symbols_in(o: *Object, name: View, out: *Vector[View]) err[fail.Fail];
 
 the names of the symbols `o` places in its sections named `name`, borrowed from the object
 
-## fun release_object
+## fun object_dnit
 
 ```mach
-pub fun release_object(o: *Object);
+pub fun object_dnit(o: *Object);
 ```
 
 ## fun symbol_count

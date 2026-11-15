@@ -132,10 +132,10 @@ the context of an evaluation that holds no phase capability
 pub rec PhaseCapabilities[T];
 ```
 
-## fun capabilities_empty
+## fun capabilities_make
 
 ```mach
-pub fun capabilities_empty[T](kind: PhaseCapabilityKind) PhaseCapabilities[T];
+pub fun capabilities_make[T](kind: PhaseCapabilityKind) PhaseCapabilities[T];
 ```
 
 ## fun parsed_expression

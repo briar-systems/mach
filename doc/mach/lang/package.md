@@ -17,10 +17,10 @@ git, under package/git, is the member of the first two and the one outside tool 
 runs; path.mach realizes a dependency declared by a local path. this module holds what
 every part shares: the slot layout under dep/ and the identity rule
 
-## fun free_name_vector
+## fun name_vector_dnit
 
 ```mach
-pub fun free_name_vector(alloc: *A.Allocator, names: *Vector[str]);
+pub fun name_vector_dnit(alloc: *A.Allocator, names: *Vector[str]);
 ```
 
 ## fun override_note

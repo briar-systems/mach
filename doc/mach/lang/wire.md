@@ -154,10 +154,10 @@ pub fun put_sized(s: *Sink, data: *u8, len: usize);
 
 a byte run's u32 length, then its bytes
 
-## fun release
+## fun take
 
 ```mach
-pub fun release(s: *Sink) res[*u8, fail.Fail];
+pub fun take(s: *Sink) res[*u8, fail.Fail];
 ```
 
 hand off a grown sink's bytes, exactly its length, owned by the caller in

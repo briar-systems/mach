@@ -28,10 +28,10 @@ pub fun collect_module(s: *session.Session, c: *Collected, unit: *lower_context.
 
 the test declarations of one lowered module, in function order
 
-## fun free
+## fun collected_dnit
 
 ```mach
-pub fun free(s: *session.Session, c: *Collected);
+pub fun collected_dnit(s: *session.Session, c: *Collected);
 ```
 
 release a collection; a nil collection holds nothing

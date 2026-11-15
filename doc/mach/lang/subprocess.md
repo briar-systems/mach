@@ -290,7 +290,7 @@ read the capture of a finished child back and close it, once
 
 retain: keep the captured bytes for capture_bytes, else only count them
 ret: what happened to the capture, or the refusal while the child runs or
-        after release_capture
+        after capture_dnit
 
 ## fun abandon_capture
 
@@ -311,10 +311,10 @@ the captured bytes retained by finish_capture, borrowed from `p`
 len: receives the byte count, 0 when nothing is retained
 ret: the bytes, or nil when nothing is retained
 
-## fun release_capture
+## fun capture_dnit
 
 ```mach
-pub fun release_capture(a: *A.Allocator, p: *OwnedSubprocess) err[Error];
+pub fun capture_dnit(a: *A.Allocator, p: *OwnedSubprocess) err[Error];
 ```
 
 free the captured bytes and the capture identity of a finished capture, once

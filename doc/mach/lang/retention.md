@@ -51,10 +51,10 @@ pub fun init(a: *A.Allocator) res[Retention, fail.Fail];
 pub fun dnit(t: *Retention);
 ```
 
-## fun open
+## fun acquire
 
 ```mach
-pub fun open(t: *Retention) res[RetainerId, fail.Fail];
+pub fun acquire(t: *Retention) res[RetainerId, fail.Fail];
 ```
 
 a new retainer holding nothing, in a free slot when one exists

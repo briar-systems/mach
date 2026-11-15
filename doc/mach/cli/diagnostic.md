@@ -103,7 +103,7 @@ pub rec Readout;
 every command's events rendered the moment each arrives: the renderer of the
 readout contract (doc/language/readout.md). the report's stream, stderr,
 carries the build: human text renders unit banners, phase rows, items, the
-unit summary, failures and diagnostics, and readout_close writes the closing
+unit summary, failures and diagnostics, and readout_end writes the closing
 tally; json renders each diagnostic and failure as a record, and under -v
 each unit, phase row, item and unit summary as unit, phase and phase_item
 records. stdout carries a test run in human text: each test as it finishes, a
@@ -121,10 +121,10 @@ count: how many results run holds
 mod_w: the module column's width
 name_w: the test column's width
 
-## fun readout_init
+## fun readout_begin
 
 ```mach
-pub fun readout_init(rd: *Readout, r: *Report, units: usize, quiet: bool, level: u8);
+pub fun readout_begin(rd: *Readout, r: *Report, units: usize, quiet: bool, level: u8);
 ```
 
 start rendering a command's events to r, a test run in human text to stdout
@@ -135,17 +135,17 @@ units: the plan's unit count
 quiet: `--quiet`
 level: the readout level the command asked for, LEVEL_RESULTS to LEVEL_ITEMS
 
-## fun readout_close
+## fun readout_end
 
 ```mach
-pub fun readout_close(rd: *Readout);
+pub fun readout_end(rd: *Readout);
 ```
 
 close a plan's rendering: one summary line under human text closes every
 failure and diagnostic the plan rendered, a carried failure (an encoder or
 rules refusal that reached no store) counted in it beside every store's
 diagnostics, so the tally never reads `0 errors` above a nonzero exit. json
-closes in report_close
+closes in report_dnit
 
 ## fun has_capture
 
@@ -188,7 +188,7 @@ pub rec Report;
 ```
 
 how a build-shaped command reports to stderr, and what it has reported. under
-json every line it writes is a record and `report_close` ends the run with the
+json every line it writes is a record and `report_dnit` ends the run with the
 summary record, whose counts are the severities of the records before it
 
 format: human text or json records
@@ -210,7 +210,7 @@ pub fun report_init(r: *Report, format: Format);
 ```
 
 start a report in place; it holds its own arena, so it stays where it was made
-until `report_close`
+until `report_dnit`
 
 r: the report
 format: the format the command writes
@@ -277,10 +277,10 @@ target: the declared target name
 profile: the profile name
 reason: why its tests did not run
 
-## fun report_close
+## fun report_dnit
 
 ```mach
-pub fun report_close(r: *Report, code: i64) i64;
+pub fun report_dnit(r: *Report, code: i64) i64;
 ```
 
 end the run: a refusal kept while it ran, such as a refused write to stdout,

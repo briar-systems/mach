@@ -28,18 +28,18 @@ pub rec Operation;
 one operation on a project's dependencies: the session and storage it works in, the
 project root, the tables of the source and pin members, and where it reports
 
-## fun open
+## fun init
 
 ```mach
-pub fun open(s: *session.Session, a: *A.Allocator, root: str, rep: *report.Report) res[Operation, fail.Fail];
+pub fun init(s: *session.Session, a: *A.Allocator, root: str, rep: *report.Report) res[Operation, fail.Fail];
 ```
 
-open an operation on the project at `root`, released with `close`
+open an operation on the project at `root`, released with `dnit`
 
-## fun close
+## fun dnit
 
 ```mach
-pub fun close(op: *Operation);
+pub fun dnit(op: *Operation);
 ```
 
 ## rec Request
@@ -153,10 +153,10 @@ pin or an existing checkout realizes
 pub fun index(reqs: *Vector[Request], id: str) i64;
 ```
 
-## fun free_requests
+## fun requests_dnit
 
 ```mach
-pub fun free_requests(a: *A.Allocator, requests: *Vector[Request]);
+pub fun requests_dnit(a: *A.Allocator, requests: *Vector[Request]);
 ```
 
 ## fun declared

@@ -36,10 +36,10 @@ exec.NativeEnvironment.given
 pub fun init(a: *A.Allocator) Environment;
 ```
 
-## fun entry_free
+## fun entry_dnit
 
 ```mach
-pub fun entry_free(a: *A.Allocator, entry: *Entry);
+pub fun entry_dnit(a: *A.Allocator, entry: *Entry);
 ```
 
 release an entry's native text; an empty entry owns none
@@ -119,10 +119,10 @@ pub fun units_length(units: *Unit) usize;
 
 the length of a native entry in units
 
-## fun strings_free
+## fun strings_dnit
 
 ```mach
-pub fun strings_free(a: *A.Allocator, strings: *Strings);
+pub fun strings_dnit(a: *A.Allocator, strings: *Strings);
 ```
 
 release a list of native strings; an empty list owns nothing

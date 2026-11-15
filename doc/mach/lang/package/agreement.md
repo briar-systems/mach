@@ -20,7 +20,7 @@ one line per pin that differs from the first one seen for its identity, in closu
 
 op: the operation
 reqs: the realized closure
-out: receives the lines, owned by `op.a`; free with `free_lines`
+out: receives the lines, owned by `op.a`; free with `lines_dnit`
 ret: err naming the first failure to read a manifest or a pin
 
 ## fun refused
@@ -33,9 +33,9 @@ the refusal of a closure that pins a package at more than one commit, ok when `l
 empty: every line past the first is reported to the operation's report and the first is the
 failure, so every command that walks a closure refuses a disagreement alike
 
-## fun free_lines
+## fun lines_dnit
 
 ```mach
-pub fun free_lines(a: *A.Allocator, lines: *Vector[str]);
+pub fun lines_dnit(a: *A.Allocator, lines: *Vector[str]);
 ```
 

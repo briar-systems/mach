@@ -158,9 +158,9 @@ pub fun intern_span_or_nil(sc: *sema_context.SemaContext, span: lang_source.Span
 pub fun allocate_params(sc: *sema_context.SemaContext, count: u32) res[*type_kind.TypeId, fail.Fail];
 ```
 
-## fun free_params
+## fun params_free
 
 ```mach
-pub fun free_params(sc: *sema_context.SemaContext, params: *type_kind.TypeId, count: u32);
+pub fun params_free(sc: *sema_context.SemaContext, params: *type_kind.TypeId, count: u32);
 ```
 

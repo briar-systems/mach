@@ -331,16 +331,16 @@ pub fun float_width_deferred(c: *ComptimeCtx, name: intern.StrId) bool;
 pub fun bind(c: *ComptimeCtx, name: intern.StrId, value: comptime_value.CTValue) err[fail.Fail];
 ```
 
-## fun frame_open
+## fun frame_begin
 
 ```mach
-pub fun frame_open(c: *ComptimeCtx) res[FrameMark, fail.Fail];
+pub fun frame_begin(c: *ComptimeCtx) res[FrameMark, fail.Fail];
 ```
 
-## fun frame_close
+## fun frame_end
 
 ```mach
-pub fun frame_close(c: *ComptimeCtx, mark: FrameMark) err[fail.Fail];
+pub fun frame_end(c: *ComptimeCtx, mark: FrameMark) err[fail.Fail];
 ```
 
 ## fun lookup

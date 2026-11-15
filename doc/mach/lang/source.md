@@ -285,10 +285,10 @@ pub fun prepare_release(m: *SourceMap, id: FileId) err[Error];
 
 preflight completes before query and editor owners are retired
 
-## fun release_payload
+## fun payload_dnit
 
 ```mach
-pub fun release_payload(m: *SourceMap, id: FileId);
+pub fun payload_dnit(m: *SourceMap, id: FileId);
 ```
 
 free a file's text and line index in place and bump its revision. the slot

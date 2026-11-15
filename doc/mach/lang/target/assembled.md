@@ -52,9 +52,9 @@ pub fun basis_of(x: *Assembled) opt[*mirl_basis.Basis];
 
 the build basis the added extensions opened, none for a target that states no baseline
 
-## fun release
+## fun dnit
 
 ```mach
-pub fun release(a: *A.Allocator, x: *Assembled);
+pub fun dnit(a: *A.Allocator, x: *Assembled);
 ```
 
