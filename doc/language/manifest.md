@@ -278,7 +278,7 @@ to whichever *declared* target matches the host.
 | `sys`  | yes      | System. Read by `$project.target.sys`. |
 | `abi` | yes      | Application binary interface. Read by `$project.target.abi`. |
 | `of`  | absent: the system's format | Object-format override; defers to the system's format when omitted. See [Object-format override](#object-format-override). |
-| `base` | absent: the system's base | Load-address override (integer, not negative). Overrides the system's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
+| `base` | absent: the system's base | Load-address override (integer, not negative). Overrides the system's default base virtual address; defers to it when omitted, which mink's catalog states per architecture (on `freestanding`, `0x100000` on `x86_64`, `0x40000000` on `aarch64` and `0x80000000` on `riscv64` and `riscv32`). |
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
 | `stack_reserve` | absent: the format's default (8 MiB on PE), and no stack on an image no loader maps | Main stack size in bytes, not negative: the reserve a PE or Mach-O header records, or the size of the `.stack` section of a freestanding ELF or flat image. See [Image stack size](#image-stack-size). |
 | `stack_commit` | absent: the format's default | Main stack commit in bytes, not negative, on PE only. See [Image stack size](#image-stack-size). |
@@ -723,6 +723,20 @@ and `riscv32`) where the os has no loader of its own, which is what `freestandin
 with `of = "elf"` gives a bootloader such as Limine or GRUB. A flat image (`flat`)
 and a finished module (`spirv`) have no page and are laid out byte-tight.
 
+A flat image is the bytes the image's sections load, from the lowest address any
+of them loads at to the last byte one loads from the file, every byte between
+them zero, as GNU `objcopy -O binary` writes an ELF image. It holds no header,
+no section and no entry record. Its objects are ELF objects, linked as an ELF
+image is, so what an ELF header's flags record of the code, such as the float
+ABI and compressed instructions on `riscv`, is checked across the objects by the
+link and then has nowhere to go. An image laid out from its base starts at the
+base. One laid into [memory regions](#memory-regions) starts at the lowest
+address a region loads anything at, so a flash and RAM split gives the bytes
+that load in flash, `.data`'s load copy included, and nothing of `.bss` or
+`.stack`. A section with no file bytes, as `.bss` or `.stack`, takes bytes in
+the image only where a loaded section follows it, as an `.eh_frame` no region
+names does when it is laid after them.
+
 ### Finished-module targets
 
 A `spirv` target's artifact is a `module`. Each source module is written to
@@ -1002,7 +1016,11 @@ platform = "bmos"               # selects the mach-bmos backend
 - Execution begins at the **first byte of the image**, which the loader reaches
   with a `call`. The entry function is marked `#[symbol("_start")]`, and it must
   be the only function or the first one emitted, since a flat image cannot say
-  where else to enter. An entry anywhere but the base is refused at link.
+  where else to enter. std.runtime's freestanding entry puts its `_start` in a
+  section of its own, `.start`, for this: name it first in `sections`, or in the
+  `run` of the region the image starts in. The link records no entry and checks none, since another
+  loader of a flat image may start it elsewhere, as a vector table at its first
+  byte names where a microcontroller starts.
 - A program **exits by returning**: the entry function's `ret` goes back to its
   caller. There is no exit syscall.
 
@@ -1016,10 +1034,11 @@ One fact the kernel leaves to the program: **the stack is not guaranteed 16-byte
 aligned at entry**, so a startup shim must align it before calling anything that
 may use SSE. BareMetal's own `crt0.c` does exactly this.
 
-Zero-initialized data needs no such step. A flat image spans its whole memory
-extent, so `.bss` is stored as the zero bytes it is and arrives zeroed with the
-rest of the image — an image costs its bss size in file bytes, and nothing
-has to zero anything at startup.
+Zero-initialized data is the program's to zero. A flat image ends at the last
+byte a section loads from the file, so a `.bss` laid after every loaded section
+takes no bytes in it and arrives as whatever the memory held, and the startup
+code zeroes it between its `__run_start_.bss` and `__run_stop_.bss`, as
+std.runtime's freestanding entry does.
 
 ## `[profile.<name>]`
 

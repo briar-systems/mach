@@ -19,6 +19,17 @@ integer literal that takes that default must fit `i64`: one that does not,
 such as `10000000000000000000::f64`, is refused, and a suffix
 (`10000000000000000000u64`) or a typed context gives it the type it needs.
 
+A cast is such a context. Under `::` to an integer type, an unsuffixed integer
+literal takes the first of `i64`, `u64`, `i128` and `u128` that holds its value,
+and the cast converts that value. Every other cast reinterprets an operand of
+the destination's size, `:~` always and `::` to a type that is not a number,
+such as a pointer, so the literal takes the first of the signed and the unsigned
+integer of that size that holds it: `0x10000000::*Uart` reads `0x10000000` as a
+`u32` on a 32-bit target and as an `i64` on a 64-bit one, and `0x3f800000:~f32`
+is `1.0`. A literal neither holds is refused, naming the range it missed and
+the destination's size. A destination of a size no integer has leaves the
+literal its default.
+
 ### Typed suffixes
 
 A suffix is the spelling of the primitive type the literal has: an integer
