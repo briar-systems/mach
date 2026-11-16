@@ -37,7 +37,7 @@ exception is the ring described below the table.
 | --- | --- |
 | `base/` | What every other area is written in: the allocation refusal, failures and diagnostics, interned strings and handles, source locations and the providers source text comes from, and plain utilities (array growth, checked arithmetic, 128-bit integers, floats, the binary codec, fingerprints, durations, the compiler's version). Nothing here knows the language or a build. |
 | `report/` | How running work reports itself: the status a phase ends with, the progress readout a command renders, and the results of a test run. |
-| `host/`, `host.mach` | The operating-system boundary: the primitives whose spelling differs by host, supervised child processes, directory listings, and how an output file reaches its final name. |
+| `host/`, `host.mach` | The operating-system boundary: the primitives whose spelling differs by host, supervised child processes and their environment, directory listings, and how an output file reaches its final name. |
 | `session/`, `session.mach` | The state one compiler process keeps across its work: the session, the module table, the query database, what is retained between builds, and the files a build embeds. |
 | `type/`, `type.mach` | The type system: types, their kinds, fields and shapes, the queries over them, and deprecation notices. |
 | `target/`, `target.mach` | What a target is: its inputs and defaults, the resolved target, its facts, tags and baselines, and the capability each constant-time operation needs of it. |
