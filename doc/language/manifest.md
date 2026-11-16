@@ -720,8 +720,19 @@ page where the os declares one (`linux` on `aarch64` lays out at 64 KiB, the
 largest page a kernel may use, `darwin` on `aarch64` at 16 KiB, 4 KiB elsewhere),
 and the instruction set's hardware page (4 KiB on `x86_64`, `aarch64`, `riscv64`
 and `riscv32`) where the os has no loader of its own, which is what `freestanding`
-with `of = "elf"` gives a bootloader such as Limine or GRUB. A flat image (`flat`)
-and a finished module (`spirv`) have no page and are laid out byte-tight.
+with `of = "elf"` gives a bootloader such as Limine or GRUB. Every load segment's
+alignment is that page and its file offset agrees with its address modulo the
+page, as a loader that maps by page needs. A `freestanding` ELF image maps no
+headers, so its first segment starts at its base. A flat image (`flat`) and a
+finished module (`spirv`) have no page and are laid out byte-tight.
+
+[Memory regions](#memory-regions) are the image's memory map, so the sections a
+region runs lie in it at their own alignment, one after another, and segments
+of different permissions in one region may share a page: a region is not
+padded to the page, which on a machine with no paging would spend its memory.
+Each segment's offset still agrees with its address modulo the page, so a
+loader that maps by page maps the image, and an author who wants code and data
+on pages of their own states regions that start on page boundaries.
 
 A flat image is the bytes the image's sections load, from the lowest address any
 of them loads at to the last byte one loads from the file, every byte between
@@ -1481,7 +1492,26 @@ name the empty range where it would land.
 A loaded output section no region names, such as an `.eh_frame` the link writes
 of the objects' frame records or a `.rodata` left out of `run`, runs in the
 region whose `access` admits it and allows least beyond what it needs, laid
-after the sections the regions name. Of regions that tie, the one stated first
+after the sections the regions name that hold file bytes.
+
+Every section with file bytes is laid before every section with none, `.bss`
+and `.stack` among them, in each region and in an image with no regions, so no
+file stores the zeros of a section laid ahead of one with bytes: a flat image
+ends at the last byte a section loads. Among the sections with bytes, and among
+those without, the order `sections` and `run` state is kept, the sections they
+name first. A section with no bytes named ahead of one with bytes is laid after
+it. A thread-local section keeps its place beside its template.
+
+A global placed with [`#[at]`](decorators.md#atoffset--placement-in-the-image)
+runs in the region its access chooses, as any section no region names does,
+unless a region names its section, and its offset counts from that region's
+start, or from the image base where the image states no regions. The other
+sections are laid around it: one that would overlap it starts after it. A
+placement no layout can honour, two globals that overlap or one past its
+region's end, is refused, naming both parties. A placed global lies at the address its offset
+names whatever page that is, so in an image with no regions it may share a
+page with the sections laid at the base: the author's placement outranks the
+page rule. Of regions that tie, the one stated first
 takes it, which is why the example states `flash` before `ram`: a read-only
 section is admitted by both, each allowing one letter more. A section no region
 admits is refused, naming it. mach

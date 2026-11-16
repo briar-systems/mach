@@ -768,8 +768,14 @@ val SIGNATURE: [2]u8 = [2]u8{0x55, 0xaa};
 - It cannot combine with `section`, since a placed global is a section of its
   own, or with `thread`, since each thread's copy lies in its own block. An
   `ext` declaration places nothing.
-- Two globals at one offset are refused at the link. A format whose loader maps
-  the image itself is refused by mink, which places the section.
+- The link lays the image's other sections around a placed global, so none of
+  their bytes overlap it. Two globals that overlap are refused at the link,
+  naming both.
+- It works on a flat image and on a `freestanding` ELF image, where the offset
+  is the same address: from the start of the global's region, or from the base,
+  where the image's first loaded byte lies. A system whose loader maps the
+  image places it where it chooses, so an offset means nothing there, and mink
+  refuses it.
 
 ### `export` — a shared library's export
 
