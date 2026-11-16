@@ -37,7 +37,7 @@ exception is the ring described below the table.
 
 | Area | What it is |
 | --- | --- |
-| `base/` | What every other area is written in: the allocation refusal, failures and diagnostics, interned strings and handles, source locations and the providers source text comes from, and plain utilities (array growth, checked arithmetic, 128-bit integers, floats, the binary codec, fingerprints, durations, the compiler's version). Nothing here knows the language or a build. |
+| `base/` | What every other area is written in: the allocation refusal, failures and diagnostics, interned strings and stores whose elements never move, source locations and the providers source text comes from, and plain utilities (array growth, checked arithmetic, 128-bit integers, floats, the binary codec, fingerprints, durations, the compiler's version). Nothing here knows the language or a build. |
 | `report/` | How running work reports itself: the status a phase ends with, the progress readout a command renders, and the results of a test run. |
 | `host/`, `host.mach` | The operating-system boundary: the primitives whose spelling differs by host, supervised child processes and their environment, directory listings, and how an output file reaches its final name. |
 | `session/`, `session.mach` | The state one compiler process keeps across its work: the session, the module table, the query database, what is retained between builds, and the files a build embeds. |

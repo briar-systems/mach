@@ -1,23 +1,34 @@
-# the command a target's programs are launched through. a target may declare a
-# `runner`, argv templates the launch expands, and `--runner <cmd>` replaces it
-# for one invocation with `<cmd> <program>`. mach knows no runner by name: the
-# command is the manifest's, and its exit status is the program's
+# the command a target's programs are launched through, and the executable `mach run`
+# launches. a target may declare a `runner`, argv templates the launch expands, and
+# `--runner <cmd>` replaces it for one invocation with `<cmd> <program>`. mach knows no
+# runner by name: the command is the manifest's, and its exit status is the program's
 use std.text.string.str_dup;
 use std.text.string.str_free;
 use std.types.bool.bool;
+use types_path: std.types.path;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_is_empty;
 use std.types.string.str_len;
 
 use A: std.allocator;
 
+use base_alloc: mach.base.alloc;
 use mach.base.diagnostic;
+use diagnostic_kind: mach.base.diagnostic.kind;
 use mach.base.fail;
 use mach.base.intern;
+use base_source: mach.base.source;
 use mach.host;
+use manifest_load:  mach.manifest.load;
+use manifest_model: mach.manifest.model;
 use mach.manifest.model.TargetDef;
+use manifest_plan:   mach.manifest.plan;
+use manifest_select: mach.manifest.select;
+use mach.manifest.target.target_matches_host;
 use mach.manifest.template;
+use mach_target: mach.target;
 
 # how one (target, profile)'s programs are launched
 # ---
@@ -71,6 +82,86 @@ pub fun overriding(program: *u8, target: str) Runner {
     r.program = program;
     r.target  = target;
     ret r;
+}
+
+# the program `mach run` launches
+# ---
+# path:          the built executable, or `-o`
+# host_runnable: the target's os and isa are the host's
+# target_name:   the target's declared name
+# runner:        the runner the target declares, none when it declares none
+pub rec RunArtifact {
+    path:          str;
+    host_runnable: bool;
+    target_name:   str;
+    runner:        Runner;
+}
+
+# the built executable `mach run` launches: the one (artifact, target, profile)
+# the selectors name, which must be a `bin`
+# ---
+# alloc:           owns the result and every message
+# project_root:    the project root
+# selectors:       the `-a`, `-t` and `-p` patterns; an artifact axis given none takes the sole `bin`
+# output_override: `-o`, the path to run instead of the artifact's output, or nil
+# sources:         receives the manifest's text, which a refusal points into
+# ret:             the executable; err from the manifest or selection, when the selection
+#                  names several cells or a library, or for an unusable `-o`
+pub fun resolve_run_artifact(alloc: *A.Allocator, project_root: str, selectors: *manifest_select.Selectors,
+    output_override: str, sources: *base_source.SourceMap) res[RunArtifact, fail.Fail] {
+    var itn:         intern.Interner                         = intern.init(alloc);
+    val res_read_at: res[manifest_model.Manifest, fail.Fail] = manifest_load.read_at(alloc, ?itn, sources, project_root);
+    if (sel res_read_at.err) { ret res[RunArtifact, fail.Fail].err{res_read_at.err}; }
+    var m: manifest_model.Manifest = res_read_at.ok;
+    fin { manifest_model.dnit(?m, alloc); }
+
+    val res_picked: res[manifest_select.Cell, fail.Fail] = manifest_select.resolve_cell(alloc, ?itn, ?m, selectors,
+        manifest_select.ARTIFACT_DEFAULT_EXECUTABLE, "mach run executes one artifact");
+    if (sel res_picked.err) { ret res[RunArtifact, fail.Fail].err{res_picked.err}; }
+    var cell: manifest_select.Cell = res_picked.ok;
+
+    val res_resolve_build_unit: res[manifest_plan.BuildUnit, fail.Fail] = manifest_plan.resolve_build_unit(alloc, ?itn, ?m, ?cell);
+    if (sel res_resolve_build_unit.err) { ret res[RunArtifact, fail.Fail].err{res_resolve_build_unit.err}; }
+    val bu: manifest_plan.BuildUnit = res_resolve_build_unit.ok;
+
+    if (!mach_target.is_executable(bu.artifact.kind)) {
+        val refusal: fail.Fail = fail.formatted_user(alloc, diagnostic_kind.ARTIFACT_NOT_RUNNABLE,
+            "selected artifact '{}' is kind = \"{}\"; run executes only bin artifacts", intern.text(?itn, bu.artifact.name), mach_target.kind_name(bu.artifact.kind));
+        ret res[RunArtifact, fail.Fail].err{refusal};
+    }
+
+    var ra: RunArtifact;
+    ra.host_runnable = target_matches_host(?itn, bu.target);
+    ra.target_name   = intern.text(?itn, bu.target.name);
+    val res_work: res[types_path.Path, A.Error] = types_path.join(alloc, project_root, intern.text(?itn, bu.out_root));
+    if (sel res_work.err) { ret res[RunArtifact, fail.Fail].err{fail.refused(res_work.err)}; }
+    val res_declared: res[Runner, fail.Fail] = declared(alloc, ?itn, bu.target, intern.text(?itn, bu.profile_name), res_work.ok);
+    if (sel res_declared.err) { ret res[RunArtifact, fail.Fail].err{res_declared.err}; }
+    ra.runner = res_declared.ok;
+
+    if (output_override != nil) {
+        if (str_is_empty(output_override)) {
+            ret res[RunArtifact, fail.Fail].err{fail.user(diagnostic_kind.CLI_OUTPUT_PATH, "-o requires a non-empty path")};
+        }
+        val res_resolved: res[types_path.Path, A.Error] = types_path.resolve(alloc, project_root, output_override);
+        if (sel res_resolved.err) {
+            ret res[RunArtifact, fail.Fail].err{fail.formatted_user(alloc, diagnostic_kind.CLI_OUTPUT_PATH, "-o '{}': {}", output_override, base_alloc.text(res_resolved.err))};
+        }
+        val res_cleaned: res[types_path.Path, A.Error] = types_path.clean(alloc, res_resolved.ok);
+        if (sel res_cleaned.err) {
+            ret res[RunArtifact, fail.Fail].err{fail.formatted_user(alloc, diagnostic_kind.CLI_OUTPUT_PATH, "-o '{}': {}", output_override, base_alloc.text(res_cleaned.err))};
+        }
+        ra.path = res_cleaned.ok;
+        ret res[RunArtifact, fail.Fail].ok{ra};
+    }
+
+    if (intern.str_is_nil(bu.bin_path)) {
+        ret res[RunArtifact, fail.Fail].err{fail.user(diagnostic_kind.ARTIFACT_NO_OUTPUT, "the selected artifact is an object artifact, whose objects stay under obj/ for a later link, so nothing runs")};
+    }
+    val res_abs: res[types_path.Path, A.Error] = types_path.join(alloc, project_root, intern.text(?itn, bu.bin_path));
+    if (sel res_abs.err) { ret res[RunArtifact, fail.Fail].err{fail.refused(res_abs.err)}; }
+    ra.path = res_abs.ok;
+    ret res[RunArtifact, fail.Fail].ok{ra};
 }
 
 # the runner `t` declares for `profile`, copied out of `itn` into `a`; no runner
