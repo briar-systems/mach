@@ -1,0 +1,589 @@
+use std.collections.map;
+use std.system.panic.panic;
+use std.text.string.str_dup;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view;
+
+use A: std.allocator;
+
+use base_alloc: mach.base.alloc;
+use mach.base.handle;
+use mach.base.intern;
+
+# a file's slot in the source map
+#
+# every other id's nil is all ones. a file id's nil is 0, beside the register
+# ids the second such exception: a zero-filled location is nowhere, so records
+# that carry one are blank when zeroed. slot 0 of the map is never issued.
+pub def FileId: u32;
+
+# no source: an unlocated diagnostic, or a node the build synthesized
+pub val FILE_NIL: FileId = 0;
+
+# a span whose file is not known yet: a reader that meets its spans before it knows the file
+# they are in places them once it does. no map issues it, so it names no file
+pub val FILE_PENDING: FileId = 0xFFFFFFFF;
+
+pub fun file_id(index: u32) FileId {
+    var f: FileId;
+    f = index;
+    ret f;
+}
+
+pub fun file_index(f: FileId) u32 {
+    ret f;
+}
+
+pub fun file_same(left: FileId, right: FileId) bool {
+    ret left == right;
+}
+
+pub fun file_is_nil(f: FileId) bool {
+    ret f == FILE_NIL;
+}
+
+# the bytes [offset, offset + len) of one text
+pub rec Span {
+    offset: usize;
+    len:    usize;
+}
+
+# where in the compilation something is: a span of the file `file`, or
+# nowhere when `file` is FILE_NIL
+pub rec Location {
+    file: FileId;
+    span: Span;
+}
+
+pub fun span(offset: usize, len: usize) Span {
+    ret Span{offset: offset, len: len};
+}
+
+# the bytes [offset, end) as a span; an end before the offset is empty
+pub fun span_between(offset: usize, end: usize) Span {
+    if (end < offset) { ret Span{offset: offset, len: 0}; }
+    ret Span{offset: offset, len: end - offset};
+}
+
+# the offset just past the span's last byte
+pub fun span_end(s: Span) usize {
+    ret s.offset + s.len;
+}
+
+# the bytes of `text` the span covers
+pub fun span_view(text: str, s: Span) View {
+    ret view(?text[s.offset], s.len);
+}
+
+pub fun location(file: FileId, s: Span) Location {
+    ret Location{file: file, span: s};
+}
+
+pub fun location_nil() Location {
+    ret location(FILE_NIL, span(0, 0));
+}
+
+# whether a location is nowhere; one whose file is pending is somewhere
+pub fun location_is_nil(l: Location) bool {
+    ret file_is_nil(l.file);
+}
+
+# whether a location names a span of a file the map can hold
+pub fun location_is_valid(l: Location) bool {
+    ret !file_is_nil(l.file) && !file_same(l.file, FILE_PENDING);
+}
+
+pub fun location_equals(x: Location, y: Location) bool {
+    ret file_same(x.file, y.file) && x.span.offset == y.span.offset && x.span.len == y.span.len;
+}
+
+# a line and a column, each from 1, the column counted in UTF-8 bytes
+pub rec Position {
+    line: usize;
+    col:  usize;
+}
+
+# the line index of one text: where each line starts, for mapping an offset
+# to its line and column in time logarithmic in the text's lines. a line ends
+# at a newline byte
+# ---
+# starts: the offset of each line's first byte, the first line's 0
+# len:    how many lines, at least 1 once built
+# n:      the text's length in bytes
+pub rec Lines {
+    starts: *usize;
+    len:    usize;
+    n:      usize;
+}
+
+# a refusal of the source map: the allocator's or the file store's, every
+# file identity issued, a file revised as often as its revision counts, an
+# identity the map never issued, a path indexed without its file, or a
+# snapshot asked of no map or allocator
+pub tag Error: u8 {
+    alloc: A.Error;
+    store: handle.Error;
+    exhausted;
+    revision;
+    absent;
+    unindexed;
+    unsupplied;
+}
+
+pub fun text(e: Error) str {
+    if (sel e.alloc)     { ret base_alloc.text(e.alloc); }
+    or (sel e.store)     { ret handle.text(e.store); }
+    or (sel e.exhausted) { ret "source file identities are exhausted"; }
+    or (sel e.revision)  { ret "source revision exhausted"; }
+    or (sel e.absent)    { ret "source identity is absent"; }
+    or (sel e.unindexed) { ret "source path index has no file owner"; }
+    ret "source snapshot requires a map and allocator";
+}
+
+pub rec SourceFile {
+    present:  bool;
+    revision: u64;
+    path:     str;
+    text:     str;
+    lines:    Lines;
+}
+
+# the files of one compilation, addressed by FileId
+#
+# the store is a handle.StableChunks: a SourceFile is written once into a
+# fixed chunk and never moves or is reused, so a `*SourceFile` taken from
+# `get` stays valid until `dnit`. slot 0 is the FILE_NIL sentinel. growing
+# the map, updating a file's text or releasing its payload mutates the file
+# in place and bumps its `revision`; a slot is never handed to a second file
+# without a generation check on that revision. the map names its paths in its own
+# interner, so every session that shares it finds a file by the same path
+pub rec SourceMap {
+    a:       *A.Allocator;
+    files:   handle.StableChunks[SourceFile];
+    paths:   intern.Interner;
+    by_path: map.Map[intern.StrId, FileId];
+}
+
+pub fun init(a: *A.Allocator) SourceMap {
+    var m: SourceMap;
+    m.a       = a;
+    m.files   = handle.chunk_init[SourceFile](a);
+    m.paths   = intern.init(a);
+    m.by_path = map.init[intern.StrId, FileId](a);
+    ret m;
+}
+
+# release a source map and its files; a nil map holds nothing
+pub fun dnit(m: *SourceMap) {
+    if (m == nil) { ret; }
+
+    var i: usize = 1;
+    for (i < count(m)) {
+        val opt_file: opt[*SourceFile] = handle.chunk_at[SourceFile](?m.files, i);
+        if (sel opt_file.some) {
+            val file: *SourceFile = opt_file.some;
+            str_free(m.a, file.path);
+            str_free(m.a, file.text);
+            lines_dnit(m.a, ?file.lines);
+        }
+        i = i + 1;
+    }
+
+    handle.chunk_dnit[SourceFile](?m.files);
+    map.dnit[intern.StrId, FileId](?m.by_path);
+    intern.dnit(?m.paths);
+}
+
+# the slot count including the FILE_NIL sentinel; the next FileId to be issued
+pub fun count(m: *SourceMap) usize {
+    ret handle.chunk_count[SourceFile](?m.files);
+}
+
+fun identities_exhausted(m: *SourceMap) bool {
+    val len: usize = count(m);
+    ret len::u64 >= 0xFFFFFFFF || len == ~(0::usize);
+}
+
+# the slots a publication needs: the file and, on an empty map, the sentinel first
+fun slots_needed(m: *SourceMap) usize {
+    if (count(m) == 0) { ret 2; }
+    ret 1;
+}
+
+# publish a file into reserved capacity; the caller holds the editor and has
+# grown the store by slots_needed, so the append cannot allocate or contend.
+# total: a caller that reserved nothing stops the compiler
+fun publish(e: *handle.ChunkEditor[SourceFile], file: SourceFile) *SourceFile {
+    if (handle.chunk_count[SourceFile](e.store) == 0) {
+        val res_sentinel: res[*SourceFile, handle.Error] = handle.chunk_append[SourceFile](e, SourceFile{});
+        if (sel res_sentinel.err) { panic("source: reserved sentinel slot refused the append\n"); }
+    }
+    val res_placed: res[*SourceFile, handle.Error] = handle.chunk_append[SourceFile](e, file);
+    if (sel res_placed.err) {
+        panic("source: reserved file slot refused the append\n");
+        ret nil;
+    }
+    ret res_placed.ok;
+}
+
+pub fun add(m: *SourceMap, path: str, text: str) res[FileId, Error] {
+    if (identities_exhausted(m)) {
+        ret res[FileId, Error].err{Error.exhausted{}};
+    }
+    val res_editor: res[handle.ChunkEditor[SourceFile], handle.Error] = handle.chunk_editor[SourceFile](?m.files);
+    if (sel res_editor.err) { ret res[FileId, Error].err{Error.store{res_editor.err}}; }
+    var editor: handle.ChunkEditor[SourceFile] = res_editor.ok;
+    fin { handle.chunk_editor_finish[SourceFile](?editor); }
+    val err_reserved: err[handle.Error] = handle.chunk_grow[SourceFile](?editor, slots_needed(m));
+    if (sel err_reserved.err) { ret res[FileId, Error].err{Error.store{err_reserved.err}}; }
+    val res_lines: res[Lines, A.Error] = lines_init(m.a, text::*u8, str_len(text));
+    if (sel res_lines.err) { ret res[FileId, Error].err{Error.alloc{res_lines.err}}; }
+    var lines:  Lines = res_lines.ok;
+    var handed: bool  = false;
+    fin {
+        if (!handed) { lines_dnit(m.a, ?lines); }
+    }
+
+    val res_path: res[str, A.Error] = str_dup(m.a, path);
+    if (sel res_path.err) { ret res[FileId, Error].err{Error.alloc{res_path.err}}; }
+    val path_copy: str = res_path.ok;
+    fin {
+        if (!handed) { str_free(m.a, path_copy); }
+    }
+
+    val res_text: res[str, A.Error] = str_dup(m.a, text);
+    if (sel res_text.err) { ret res[FileId, Error].err{Error.alloc{res_text.err}}; }
+    val text_copy: str = res_text.ok;
+
+    var file: SourceFile;
+    file.present  = true;
+    file.revision = 1;
+    file.path     = path_copy;
+    file.text     = text_copy;
+    file.lines    = lines;
+
+    var id: FileId = file_id(count(m)::u32);
+    if (count(m) == 0) { id = file_id(1); }
+    handed = true;
+    publish(?editor, file);
+
+    ret res[FileId, Error].ok{id};
+}
+
+# a staged publication; `editor` holds the store's exclusive editor over the
+# reserved slot of a new entry until commit or discard
+pub rec PreparedLoad {
+    owner:     *SourceMap;
+    id:        FileId;
+    key:       intern.StrId;
+    file:      SourceFile;
+    changed:   bool;
+    new_entry: bool;
+    editor:    handle.ChunkEditor[SourceFile];
+}
+
+# the caller exclusively borrows the map until commit or discard; a new entry
+# reserves its slot here so commit_load cannot fail
+pub fun prepare_load(m: *SourceMap, path: str, text: str) res[PreparedLoad, Error] {
+    val res_interned: res[intern.StrId, A.Error] = intern.add(?m.paths, path);
+    if (sel res_interned.err) { ret res[PreparedLoad, Error].err{Error.alloc{res_interned.err}}; }
+    val key:          intern.StrId = res_interned.ok;
+    var prepared:     PreparedLoad = PreparedLoad{owner: m, key: key};
+    val opt_existing: opt[*FileId] = map.get[intern.StrId, FileId](?m.by_path, ?key);
+    if (sel opt_existing.some) {
+        prepared.id = @opt_existing.some;
+        val opt_current: opt[*SourceFile] = get(m, prepared.id);
+        if (sel opt_current.none) { ret res[PreparedLoad, Error].err{Error.unindexed{}}; }
+        val file: *SourceFile = opt_current.some;
+        if (file.present && str_equals(file.text, text)) { ret res[PreparedLoad, Error].ok{prepared}; }
+        if (file.revision == ~(0::u64))                  { ret res[PreparedLoad, Error].err{Error.revision{}}; }
+        prepared.file.path     = file.path;
+        prepared.file.revision = file.revision + 1;
+    }
+    or (sel opt_existing.none) {
+        if (identities_exhausted(m)) { ret res[PreparedLoad, Error].err{Error.exhausted{}}; }
+        prepared.id = file_id(count(m)::u32);
+        if (count(m) == 0) { prepared.id = file_id(1); }
+        val res_editor: res[handle.ChunkEditor[SourceFile], handle.Error] = handle.chunk_editor[SourceFile](?m.files);
+        if (sel res_editor.err) { ret res[PreparedLoad, Error].err{Error.store{res_editor.err}}; }
+        prepared.editor        = res_editor.ok;
+        prepared.new_entry     = true;
+        prepared.file.revision = 1;
+    }
+    prepared.file.present = true;
+    var transferred: bool = false;
+    fin {
+        if (!transferred) {
+            if (prepared.new_entry) { str_free(m.a, prepared.file.path); }
+            str_free(m.a, prepared.file.text);
+            lines_dnit(m.a, ?prepared.file.lines);
+            handle.chunk_editor_finish[SourceFile](?prepared.editor);
+        }
+    }
+    if (prepared.new_entry) {
+        val err_reserved: err[handle.Error] = handle.chunk_grow[SourceFile](?prepared.editor, slots_needed(m));
+        if (sel err_reserved.err) { ret res[PreparedLoad, Error].err{Error.store{err_reserved.err}}; }
+        val res_copied_path: res[str, A.Error] = str_dup(m.a, path);
+        if (sel res_copied_path.err) { ret res[PreparedLoad, Error].err{Error.alloc{res_copied_path.err}}; }
+        prepared.file.path = res_copied_path.ok;
+    }
+    val res_lines: res[Lines, A.Error] = lines_init(m.a, text::*u8, str_len(text));
+    if (sel res_lines.err) { ret res[PreparedLoad, Error].err{Error.alloc{res_lines.err}}; }
+    prepared.file.lines = res_lines.ok;
+    val res_copied: res[str, A.Error] = str_dup(m.a, text);
+    if (sel res_copied.err) { ret res[PreparedLoad, Error].err{Error.alloc{res_copied.err}}; }
+    prepared.file.text = res_copied.ok;
+    if (prepared.new_entry) {
+        val res_indexed: res[bool, A.Error] = map.insert[intern.StrId, FileId](?m.by_path, key, prepared.id);
+        if (sel res_indexed.err) { ret res[PreparedLoad, Error].err{Error.alloc{res_indexed.err}}; }
+    }
+    prepared.changed = true;
+    transferred      = true;
+    ret res[PreparedLoad, Error].ok{prepared};
+}
+
+# release a load that was prepared and not committed; one already committed or discarded
+# owns nothing
+pub fun discard_load(prepared: *PreparedLoad) {
+    if (prepared.owner == nil) { ret; }
+    val m: *SourceMap = prepared.owner;
+    if (prepared.changed) {
+        if (prepared.new_entry) {
+            map.remove[intern.StrId, FileId](?m.by_path, ?prepared.key);
+            str_free(m.a, prepared.file.path);
+        }
+        str_free(m.a, prepared.file.text);
+        lines_dnit(m.a, ?prepared.file.lines);
+    }
+    handle.chunk_editor_finish[SourceFile](?prepared.editor);
+    prepared.owner = nil;
+    prepared.file  = SourceFile{};
+}
+
+# an existing file takes the staged payload in place; a new one lands in the
+# slot prepare_load reserved. neither moves any other file. total: the staged
+# file is the map's own, so its loss stops the compiler
+pub fun commit_load(prepared: *PreparedLoad) FileId {
+    val m:  *SourceMap = prepared.owner;
+    val id: FileId     = prepared.id;
+    if (prepared.changed) {
+        if (prepared.new_entry) {
+            publish(?prepared.editor, prepared.file);
+        }
+        or {
+            val opt_file: opt[*SourceFile] = get(m, id);
+            if (sel opt_file.none) { panic("source: a staged update lost its file\n"); }
+            or (sel opt_file.some) {
+                val file: *SourceFile = opt_file.some;
+                str_free(m.a, file.text);
+                lines_dnit(m.a, ?file.lines);
+                @file = prepared.file;
+            }
+        }
+    }
+    handle.chunk_editor_finish[SourceFile](?prepared.editor);
+    prepared.owner = nil;
+    prepared.file  = SourceFile{};
+    ret id;
+}
+
+# the file at `path` holding `text`: a path the map holds keeps its id and takes the text, a new
+# one is added
+pub fun load(m: *SourceMap, path: str, text: str) res[FileId, Error] {
+    val res_staged: res[PreparedLoad, Error] = prepare_load(m, path, text);
+    if (sel res_staged.err) { ret res[FileId, Error].err{res_staged.err}; }
+    var prepared: PreparedLoad = res_staged.ok;
+    ret res[FileId, Error].ok{commit_load(?prepared)};
+}
+
+# preflight completes before query and editor owners are retired
+pub fun prepare_release(m: *SourceMap, id: FileId) err[Error] {
+    val opt_file: opt[*SourceFile] = get(m, id);
+    if (sel opt_file.none) { ret err[Error].err{Error.absent{}}; }
+    val file: *SourceFile = opt_file.some;
+    if (file.present && file.revision == ~(0::u64)) { ret err[Error].err{Error.revision{}}; }
+    ret err[Error].ok{};
+}
+
+# free a file's text and line index in place and bump its revision. the slot
+# keeps its path and identity: it is never moved, compacted or reissued to
+# another file, so a `*SourceFile` held across the release stays valid and
+# reads `present == false`. a future reuse of released slots must check the
+# revision as a generation before trusting a stored FileId
+pub fun payload_dnit(m: *SourceMap, id: FileId) {
+    val opt_file: opt[*SourceFile] = get(m, id);
+    if (sel opt_file.none) { ret; }
+    val file: *SourceFile = opt_file.some;
+    if (!file.present) { ret; }
+    str_free(m.a, file.text);
+    lines_dnit(m.a, ?file.lines);
+    file.text     = nil;
+    file.lines    = Lines{};
+    file.present  = false;
+    file.revision = file.revision + 1;
+}
+
+# the file loaded from `path`, FILE_NIL when none was
+pub fun find(m: *SourceMap, path: str) FileId {
+    val opt_named: opt[intern.StrId] = intern.find(?m.paths, path);
+    if (sel opt_named.none) { ret FILE_NIL; }
+    var key:       intern.StrId = opt_named.some;
+    val opt_found: opt[*FileId] = map.get[intern.StrId, FileId](?m.by_path, ?key);
+    if (sel opt_found.some) { ret @opt_found.some; }
+    ret FILE_NIL;
+}
+
+# the file behind an id; none for FILE_NIL or an id the map never issued
+#
+# the returned `*SourceFile` is stable until `dnit`: the store never moves a
+# file when the map grows, and a released slot keeps its address. the pointer
+# may be held across later loads; `present` and `revision` tell the holder
+# whether the payload behind it changed
+pub fun get(m: *SourceMap, id: FileId) opt[*SourceFile] {
+    if (file_is_nil(id) || file_same(id, FILE_PENDING)) { ret opt[*SourceFile].none{}; }
+    ret handle.chunk_at[SourceFile](?m.files, file_index(id)::usize);
+}
+
+pub fun copy_file(file: *SourceFile, a: *A.Allocator) res[SourceFile, Error] {
+    var copied:   SourceFile = SourceFile{present: file.present, revision: file.revision};
+    var complete: bool       = false;
+    fin {
+        if (!complete) { dnit_file(?copied, a); }
+    }
+    val res_path: res[str, A.Error] = str_dup(a, file.path);
+    if (sel res_path.err) { ret res[SourceFile, Error].err{Error.alloc{res_path.err}}; }
+    copied.path = res_path.ok;
+    if (file.present) {
+        val res_text: res[str, A.Error] = str_dup(a, file.text);
+        if (sel res_text.err) { ret res[SourceFile, Error].err{Error.alloc{res_text.err}}; }
+        copied.text = res_text.ok;
+        val res_lines: res[Lines, A.Error] = lines_init(a, copied.text::*u8, str_len(copied.text));
+        if (sel res_lines.err) { ret res[SourceFile, Error].err{Error.alloc{res_lines.err}}; }
+        copied.lines = res_lines.ok;
+    }
+    complete = true;
+    ret res[SourceFile, Error].ok{copied};
+}
+
+pub fun dnit_file(file: *SourceFile, a: *A.Allocator) {
+    str_free(a, file.path);
+    str_free(a, file.text);
+    lines_dnit(a, ?file.lines);
+    @file = SourceFile{};
+}
+
+# the line and column of `offset` in the file; an offset past the end is
+# placed at the end
+pub fun position(file: *SourceFile, offset: usize) Position {
+    ret lines_position(?file.lines, offset);
+}
+
+# the offset line `line` (from 1) starts at
+pub fun line_start(file: *SourceFile, line: usize) opt[usize] {
+    if (line == 0 || line > file.lines.len) { ret opt[usize].none{}; }
+    ret opt[usize].some{file.lines.starts[line - 1]};
+}
+
+# the offset of `at` in the file, none for a line it does not hold; a column past the line
+# stays where it falls
+pub fun offset_of(file: *SourceFile, at: Position) opt[usize] {
+    val opt_start: opt[usize] = line_start(file, at.line);
+    if (sel opt_start.none) { ret opt_start; }
+    if (at.col == 0)        { ret opt[usize].none{}; }
+    ret opt[usize].some{opt_start.some + at.col - 1};
+}
+
+# the bytes of line `line` (from 1) without its line ending
+pub fun line_bounds(file: *SourceFile, line: usize) opt[Span] {
+    if (line == 0 || line > file.lines.len) { ret opt[Span].none{}; }
+
+    val start: usize = file.lines.starts[line - 1];
+    var end:   usize = str_len(file.text);
+    if (line < file.lines.len) { end = file.lines.starts[line]; }
+
+    for (end > start && (file.text[end - 1] == '\n' || file.text[end - 1] == '\r')) {
+        end = end - 1;
+    }
+    ret opt[Span].some{span_between(start, end)};
+}
+
+# the bytes of a line break that starts with byte `c`, `next` being the byte after it: a
+# line feed, a carriage return and line feed, or a carriage return alone; 0 for any other
+# byte. the one rule every line count follows
+pub fun line_break_len(c: u8, next: u8) usize {
+    if (c == '\n')                 { ret 1; }
+    if (c == '\r' && next == '\n') { ret 2; }
+    if (c == '\r')                 { ret 1; }
+    ret 0;
+}
+
+# the line index of the `n` bytes at `data`; released with `lines_dnit`. a break is `\n`, `\r\n` or a
+# lone `\r`, as line_break_len reads it
+pub fun lines_init(a: *A.Allocator, data: *u8, n: usize) res[Lines, A.Error] {
+    var count: usize = 1;
+    var i:     usize = 0;
+    for (i < n) {
+        val c: u8 = data[i];
+        i = i + 1;
+        if (c > '\r')  { cnt; }
+        if (c == '\n') { count = count + 1; }
+        or (c == '\r') {
+            if (i < n && data[i] == '\n') { i = i + 1; }
+            count = count + 1;
+        }
+    }
+
+    val res_starts: res[*usize, A.Error] = A.allocate[usize](a, count);
+    if (sel res_starts.err) { ret res[Lines, A.Error].err{res_starts.err}; }
+    val starts: *usize = res_starts.ok;
+
+    starts[0] = 0;
+    var at: usize = 1;
+    i = 0;
+    for (i < n) {
+        val c: u8 = data[i];
+        i = i + 1;
+        if (c > '\r') { cnt; }
+        if (c == '\n') {
+            starts[at] = i;
+            at         = at + 1;
+        }
+        or (c == '\r') {
+            if (i < n && data[i] == '\n') { i = i + 1; }
+            starts[at] = i;
+            at         = at + 1;
+        }
+    }
+    ret res[Lines, A.Error].ok{Lines{starts: starts, len: count, n: n}};
+}
+
+pub fun lines_dnit(a: *A.Allocator, l: *Lines) {
+    if (l.starts != nil && l.len > 0) { A.deallocate[usize](a, l.starts, l.len); }
+    @l = Lines{};
+}
+
+# the line and column of `offset`, clamped to the text's end
+pub fun lines_position(l: *Lines, offset: usize) Position {
+    var at: usize = offset;
+    if (at > l.n)   { at = l.n; }
+    if (l.len == 0) { ret Position{line: 1, col: 1}; }
+    var lo: usize = 0;
+    var hi: usize = l.len;
+    for (hi - lo > 1) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (l.starts[mid] <= at) { lo = mid; }
+        or                       { hi = mid; }
+    }
+    ret Position{line: lo + 1, col: at - l.starts[lo] + 1};
+}

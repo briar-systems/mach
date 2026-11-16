@@ -1,0 +1,253 @@
+# mach.front.ast
+
+## rec Ast
+
+```mach
+pub rec Ast;
+```
+
+one parsed file: each node kind and each side list lives in its own table, and a
+node is named by its index in that table
+
+## fun init
+
+```mach
+pub fun init(a: *A.Allocator, file_id: base_source.FileId) Ast;
+```
+
+## fun dnit
+
+```mach
+pub fun dnit(a: *Ast);
+```
+
+release a tree; a nil tree holds nothing
+
+## fun copy
+
+```mach
+pub fun copy(src: *Ast, alloc: *A.Allocator) res[Ast, fail.Fail];
+```
+
+an owned copy of `src` from `alloc`, every node at the id it has in `src`
+
+## fun table_push
+
+```mach
+pub fun table_push[T](v: *Vector[T], value: T) res[u32, fail.Fail];
+```
+
+appends `value` to an AST table and answers the index it takes
+
+## fun add_module
+
+```mach
+pub fun add_module(a: *Ast, m: ast_module.Module) res[ast_id.ModuleNodeId, fail.Fail];
+```
+
+## fun get_module
+
+```mach
+pub fun get_module(a: *Ast, id_: ast_id.ModuleNodeId) opt[*ast_module.Module];
+```
+
+## fun add_expr
+
+```mach
+pub fun add_expr(a: *Ast, e: ast_expr.Expr) res[ast_id.ExprId, fail.Fail];
+```
+
+## fun get_expr
+
+```mach
+pub fun get_expr(a: *Ast, id_: ast_id.ExprId) opt[*ast_expr.Expr];
+```
+
+## fun expr_place_kind
+
+```mach
+pub fun expr_place_kind(e: *ast_expr.Expr) ast_expr.ExprKind;
+```
+
+## fun add_stmt
+
+```mach
+pub fun add_stmt(a: *Ast, s: ast_stmt.Stmt) res[ast_id.StmtId, fail.Fail];
+```
+
+## fun get_stmt
+
+```mach
+pub fun get_stmt(a: *Ast, id_: ast_id.StmtId) opt[*ast_stmt.Stmt];
+```
+
+## fun add_decl
+
+```mach
+pub fun add_decl(a: *Ast, d: ast_decl.Decl) res[ast_id.DeclId, fail.Fail];
+```
+
+## fun get_decl
+
+```mach
+pub fun get_decl(a: *Ast, id_: ast_id.DeclId) opt[*ast_decl.Decl];
+```
+
+## fun decl_name_span
+
+```mach
+pub fun decl_name_span(a: *Ast, id_: ast_id.DeclId) base_source.Span;
+```
+
+## fun add_type
+
+```mach
+pub fun add_type(a: *Ast, t: ast_type.Type) res[ast_id.TypeId, fail.Fail];
+```
+
+## fun get_type
+
+```mach
+pub fun get_type(a: *Ast, id_: ast_id.TypeId) opt[*ast_type.Type];
+```
+
+## fun add_typed_name
+
+```mach
+pub fun add_typed_name(a: *Ast, tn: ast_decl.TypedName) res[u32, fail.Fail];
+```
+
+## fun add_field_init
+
+```mach
+pub fun add_field_init(a: *Ast, fi: ast_expr.FieldInit) res[u32, fail.Fail];
+```
+
+reached only by mach-lsp
+
+## fun add_generic_name
+
+```mach
+pub fun add_generic_name(a: *Ast, name: base_source.Span) res[u32, fail.Fail];
+```
+
+## fun add_path_name
+
+```mach
+pub fun add_path_name(a: *Ast, name: intern.StrId) res[u32, fail.Fail];
+```
+
+the id of one segment of a named type's path, after the segments before it
+
+## fun add_decorator
+
+```mach
+pub fun add_decorator(a: *Ast, d: ast_decl.Decorator) res[u32, fail.Fail];
+```
+
+## fun literal_bytes_reserve
+
+```mach
+pub fun literal_bytes_reserve(a: *Ast, n: usize) res[*u8, fail.Fail];
+```
+
+a table over storage the caller owns, for a test that builds nodes in place
+room for `n` more bytes at the end of the literal byte table, which literal_bytes_take
+then claims
+
+## fun literal_bytes_take
+
+```mach
+pub fun literal_bytes_take(a: *Ast, n: usize) ast_expr.ByteRange;
+```
+
+claims the first `n` reserved bytes as one literal's value
+
+## fun lit_str_value
+
+```mach
+pub fun lit_str_value(a: *Ast, e: *ast_expr.Expr) View;
+```
+
+the decoded bytes a string literal names
+
+## rec AstMark
+
+```mach
+pub rec AstMark;
+```
+
+the length of every table, to roll a failed parse back to
+
+## fun mark
+
+```mach
+pub fun mark(a: *Ast) AstMark;
+```
+
+## fun rollback
+
+```mach
+pub fun rollback(a: *Ast, m: AstMark) bool;
+```
+
+## fun same_shape
+
+```mach
+pub fun same_shape(x: *Ast, y: *Ast) bool;
+```
+
+whether two trees have the same shape: the same number of every node, and the same
+expression, statement, declaration and type kinds, and declaration flags, in the same
+order. spans, names and literal values are not compared
+
+## fun span_contains
+
+```mach
+pub fun span_contains(span: base_source.Span, offset: usize) bool;
+```
+
+reached only by mach-lsp
+
+## fun offset_to_expr
+
+```mach
+pub fun offset_to_expr(a: *Ast, offset: usize) ast_id.ExprId;
+```
+
+the tightest expression enclosing a byte offset
+a linear scan of every expression; among equal spans the later one wins;
+an empty span never matches
+
+a: the tree
+offset: byte offset into the tree's source text
+ret: the ExprId with the smallest span containing offset, or EXPR_NIL when none does
+
+## fun offset_to_decl
+
+```mach
+pub fun offset_to_decl(a: *Ast, offset: usize) ast_id.DeclId;
+```
+
+the tightest declaration enclosing a byte offset
+a linear scan of every declaration; among equal spans the later one wins;
+an empty span never matches
+
+a: the tree
+offset: byte offset into the tree's source text
+ret: the DeclId with the smallest span containing offset, or DECL_NIL when none does
+
+## fun offset_to_type
+
+```mach
+pub fun offset_to_type(a: *Ast, offset: usize) ast_id.TypeId;
+```
+
+the tightest type expression enclosing a byte offset
+a linear scan of every type node; among equal spans the later one wins;
+an empty span never matches
+
+a: the tree
+offset: byte offset into the tree's source text
+ret: the TypeId with the smallest span containing offset, or TYPE_NIL when none does
+

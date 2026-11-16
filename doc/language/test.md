@@ -248,7 +248,7 @@ readout stays on stdout.
 A test build compiles every module's object exactly as `mach build` does and
 shares it: after `mach build`, `mach test` recompiles no module object. A module
 that declares tests or `#[testing]` declarations also gets a **test object**,
-`obj/<project>/<module>.test.o`. The compiler (`mach.lang.me.lower.testrunner`)
+`obj/<project>/<module>.test.o`. The compiler (`mach.lower.testrunner`)
 lowers each of its tests to a zero-parameter, `i32`-returning function under
 its qualified name, a symbol that never collides with, reserves, or rewrites a
 user symbol.

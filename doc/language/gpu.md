@@ -906,11 +906,10 @@ part, not a property of the decorator: a decorated function may have a body, and
 it does, that body is what every non-`spirv` target runs while `spirv` substitutes
 the instruction. A `spirv` build never emits the body at all.
 
-The set of accepted instructions is the table in
-`src/lang/target/isa/spirv/defs.mach`, where each row carries its operand kinds, its
-result, its requirements, its typing and the enumerations of its literals. The capabilities, with
-the SPIR-V version and extension each needs, are the table in
-`src/lang/target/isa/spirv.mach`. Adding an instruction is a row in it.
+The set of accepted instructions is masc's SPIR-V table (`src/isa/spirv/gen_row.mach`
+in masc), which masc's generator writes from the SPIR-V grammar and the overlay under
+`gen/data/spirv/`. The capabilities, with the SPIR-V version and extension each needs,
+are masc's extension catalog (`src/isa/spirv/extension.mach`).
 
 
 ## See also

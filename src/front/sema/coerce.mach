@@ -1,0 +1,446 @@
+use mach.base.diagnostic;
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+
+use mach.base.float;
+use base_source: mach.base.source;
+use mach.base.stack;
+use mach.base.wide;
+use ast_expr: mach.front.ast.expr;
+use ast_id:   mach.front.ast.id;
+use mach.front.comptime;
+use comptime_failure: mach.front.comptime.failure;
+use mach.front.comptime.intrinsic;
+use comptime_value: mach.front.comptime.value;
+use front_literal:  mach.front.literal;
+use sema_context:   mach.front.sema.context;
+use report_phase:   mach.report.phase;
+use mach.type;
+use type_kind: mach.type.kind;
+use type_prim: mach.type.prim;
+use mach.type.query.deep;
+
+def CoerceKind: u8;
+
+val     COERCE_NOT_APPLICABLE: CoerceKind = 0;
+pub val COERCE_COERCED:        CoerceKind = 1;
+pub val COERCE_OUT_OF_RANGE:   CoerceKind = 2;
+
+pub rec CoerceResult {
+    kind:    CoerceKind;
+    ty:      type_kind.TypeId;
+    value:   wide.Wide;
+    negated: bool;
+    bounds:  type_prim.IntRange;
+
+    literal: bool;
+}
+
+fun not_applicable() CoerceResult {
+    ret CoerceResult{kind: COERCE_NOT_APPLICABLE, ty: type_kind.TYPE_ERROR};
+}
+
+fun applicable(to: type_kind.TypeId) CoerceResult {
+    ret CoerceResult{kind: COERCE_COERCED, ty: to};
+}
+
+pub fun out_of_range(to: type_kind.TypeId, value: wide.Wide, negated: bool, bounds: type_prim.IntRange, literal: bool) CoerceResult {
+    var r: CoerceResult;
+    r.kind    = COERCE_OUT_OF_RANGE;
+    r.ty      = to;
+    r.value   = value;
+    r.negated = negated;
+    r.bounds  = bounds;
+    r.literal = literal;
+    ret r;
+}
+
+pub fun try_coerce_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type_kind.TypeId) res[CoerceResult, fail.Fail] {
+    if (type_kind.is_nil(to) || type_kind.is_error(to) || ast_id.expr_is_nil(eid)) { ret res[CoerceResult, fail.Fail].ok{not_applicable()}; }
+    val res_expression: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, eid);
+    if (sel res_expression.err) { ret res[CoerceResult, fail.Fail].err{res_expression.err}; }
+    var e_value: ast_expr.Expr    = res_expression.ok;
+    val e:       *ast_expr.Expr   = ?e_value;
+    val pub_to:  type_kind.TypeId = type.strip_secret(?sc.s.types, to);
+    # an operator commits its operands as it walks them, so it is probed whole first; a leaf
+    # commits only once it fits
+    var r:    CoerceResult = not_applicable();
+    var fits: bool         = true;
+    if (e.kind == ast_expr.EXPR_KIND_UNARY || e.kind == ast_expr.EXPR_KIND_BINARY) {
+        val res_probed: res[CoerceResult, fail.Fail] = coerce_at(sc, eid, e, pub_to, false, true);
+        if (sel res_probed.err) { ret res_probed; }
+        r    = res_probed.ok;
+        fits = r.kind == COERCE_COERCED;
+    }
+    if (fits) {
+        val res_committed: res[CoerceResult, fail.Fail] = coerce_at(sc, eid, e, pub_to, false, false);
+        if (sel res_committed.err) { ret res_committed; }
+        r = res_committed.ok;
+    }
+    # its caller refuses it, so the literal is left with no default type to be checked at
+    if (r.kind == COERCE_OUT_OF_RANGE) { commit(sc, eid, type_kind.TYPE_ERROR, false); }
+    if (!type_kind.same(pub_to, to) && r.kind == COERCE_OUT_OF_RANGE) {
+        var rr: CoerceResult = r;
+        rr.ty = to;
+        ret res[CoerceResult, fail.Fail].ok{rr};
+    }
+    ret res[CoerceResult, fail.Fail].ok{r};
+}
+
+# ask whether a literal-shaped expression fits the integer range of `to` without
+# retyping anything: `COERCE_OUT_OF_RANGE` carries the offending leaf's value and
+# sign, and any other kind means the shape is not a literal or it fits
+# ---
+# sc:  the semantic context
+# eid: the expression to probe
+# to:  the integer type whose range is asked about
+# ret: the probe result, or the failure of a refused read; never commits an expression type
+pub fun probe_literal_range(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type_kind.TypeId) res[CoerceResult, fail.Fail] {
+    if (type_kind.is_nil(to) || type_kind.is_error(to)) { ret res[CoerceResult, fail.Fail].ok{not_applicable()}; }
+    ret coerce_to(sc, eid, type.strip_secret(?sc.s.types, to), false, true);
+}
+
+# whether an expression is built only from unsuffixed integer literals under the
+# operators a literal coerces through, so its exact value is still untyped
+# ---
+# sc:  the semantic context
+# eid: the expression to ask about
+# ret: true when every leaf is an unsuffixed integer literal, or the failure of a refused read
+pub fun is_untyped_int_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[bool, fail.Fail] {
+    if (ast_id.expr_is_nil(eid)) { ret res[bool, fail.Fail].ok{false}; }
+    val res_expression: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, eid);
+    if (sel res_expression.err) { ret res[bool, fail.Fail].err{res_expression.err}; }
+    val e: ast_expr.Expr = res_expression.ok;
+    if (stack.exhausted())                    { ret res[bool, fail.Fail].err{refused(sc, e.span)}; }
+    if (e.kind == ast_expr.EXPR_KIND_LIT_INT) { ret res[bool, fail.Fail].ok{e.data.lit_int.suffix == ast_expr.LIT_SUFFIX_NONE}; }
+    if (e.kind == ast_expr.EXPR_KIND_UNARY) {
+        if (e.data.unary.op != ast_expr.UN_NEG && e.data.unary.op != ast_expr.UN_BIT_NOT) { ret res[bool, fail.Fail].ok{false}; }
+        ret is_untyped_int_literal(sc, e.data.unary.operand);
+    }
+    if (e.kind == ast_expr.EXPR_KIND_BINARY) {
+        if (!is_value_preserving_binop(e.data.binary.op)) { ret res[bool, fail.Fail].ok{false}; }
+        val res_lhs: res[bool, fail.Fail] = is_untyped_int_literal(sc, e.data.binary.lhs);
+        if (sel res_lhs.err) { ret res_lhs; }
+        if (!res_lhs.ok)     { ret res_lhs; }
+        ret is_untyped_int_literal(sc, e.data.binary.rhs);
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+fun coerce_to(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type_kind.TypeId, negated: bool, probe: bool) res[CoerceResult, fail.Fail] {
+    if (ast_id.expr_is_nil(eid)) { ret res[CoerceResult, fail.Fail].ok{not_applicable()}; }
+
+    val res_expression: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, eid);
+    if (sel res_expression.err) { ret res[CoerceResult, fail.Fail].err{res_expression.err}; }
+    var e_value: ast_expr.Expr = res_expression.ok;
+    ret coerce_at(sc, eid, ?e_value, to, negated, probe);
+}
+
+# coerce_to on expression `e`, the node `eid` names
+fun coerce_at(sc: *sema_context.SemaContext, eid: ast_id.ExprId, e: *ast_expr.Expr, to: type_kind.TypeId, negated: bool, probe: bool) res[CoerceResult, fail.Fail] {
+    if (stack.exhausted()) { ret res[CoerceResult, fail.Fail].err{refused(sc, e.span)}; }
+    if (!coerces(e))       { ret res[CoerceResult, fail.Fail].ok{not_applicable()}; }
+
+    if (sema_context.awaits_instance(sc, to)) { ret coerce_to_parameter(sc, eid, e, to, negated, probe); }
+
+    if (e.kind == ast_expr.EXPR_KIND_LIT_INT) {
+        if (e.data.lit_int.suffix != ast_expr.LIT_SUFFIX_NONE) {
+            ret res[CoerceResult, fail.Fail].ok{coerce_suffixed_literal(sc, eid, e.data.lit_int.suffix, to, probe)};
+        }
+        ret res[CoerceResult, fail.Fail].ok{coerce_int_literal(sc, eid, e.data.lit_int.value, to, negated, true, probe)};
+    }
+    if (e.kind == ast_expr.EXPR_KIND_LIT_CHAR) {
+        ret res[CoerceResult, fail.Fail].ok{coerce_int_literal(sc, eid, wide.from_u64(e.data.lit_char.value::u64), to, negated, true, probe)};
+    }
+    if (e.kind == ast_expr.EXPR_KIND_LIT_FLOAT) {
+        if (e.data.lit_float.suffix != ast_expr.LIT_SUFFIX_NONE) {
+            ret res[CoerceResult, fail.Fail].ok{coerce_suffixed_literal(sc, eid, e.data.lit_float.suffix, to, probe)};
+        }
+        val opt_type: opt[*type.Type] = type.get(?sc.s.types, to);
+        if (!sel opt_type.some)                                                 { ret res[CoerceResult, fail.Fail].ok{not_applicable()}; }
+        if (type_prim.float_width_of(opt_type.some.kind) == float.FLOAT_W_NONE) { ret res[CoerceResult, fail.Fail].ok{not_applicable()}; }
+        ret res[CoerceResult, fail.Fail].ok{commit(sc, eid, to, probe)};
+    }
+    if (e.kind == ast_expr.EXPR_KIND_LIT_NIL) {
+        if (!type.is_pointer_like(?sc.s.types, to)) { ret res[CoerceResult, fail.Fail].ok{not_applicable()}; }
+        ret res[CoerceResult, fail.Fail].ok{commit(sc, eid, to, probe)};
+    }
+    if (e.kind == ast_expr.EXPR_KIND_COMPTIME_IDENT || e.kind == ast_expr.EXPR_KIND_MEMBER) {
+        ret res[CoerceResult, fail.Fail].ok{coerce_comptime_int_path(sc, eid, to, negated, probe)};
+    }
+    if (e.kind == ast_expr.EXPR_KIND_CALL && intrinsic.is_path_call(sc.view.a, eid)) {
+        ret res[CoerceResult, fail.Fail].ok{coerce_comptime_int_path(sc, eid, to, negated, probe)};
+    }
+    if (e.kind == ast_expr.EXPR_KIND_CALL) {
+        ret res[CoerceResult, fail.Fail].ok{coerce_layout_intrinsic(sc, eid, to, negated, probe)};
+    }
+    if (e.kind == ast_expr.EXPR_KIND_UNARY) {
+        ret coerce_unary(sc, eid, ?e.data.unary, to, negated, probe);
+    }
+    if (e.kind == ast_expr.EXPR_KIND_BINARY) {
+        ret coerce_binary(sc, eid, ?e.data.binary, to, probe);
+    }
+
+    ret res[CoerceResult, fail.Fail].ok{not_applicable()};
+}
+
+# whether `e` has a form a literal coerces through: anything else is never retyped, at any type
+fun coerces(e: *ast_expr.Expr) bool {
+    val k: ast_expr.ExprKind = e.kind;
+    if (k == ast_expr.EXPR_KIND_UNARY)  { ret e.data.unary.op == ast_expr.UN_NEG || e.data.unary.op == ast_expr.UN_BIT_NOT; }
+    if (k == ast_expr.EXPR_KIND_BINARY) { ret is_value_preserving_binop(e.data.binary.op); }
+    ret k == ast_expr.EXPR_KIND_LIT_INT || k == ast_expr.EXPR_KIND_LIT_CHAR || k == ast_expr.EXPR_KIND_LIT_FLOAT || k == ast_expr.EXPR_KIND_LIT_NIL
+        || k == ast_expr.EXPR_KIND_COMPTIME_IDENT || k == ast_expr.EXPR_KIND_MEMBER || k == ast_expr.EXPR_KIND_CALL;
+}
+
+# an unsuffixed literal carries no type of its own, so against a type parameter it takes
+# that parameter and its range is checked where there is a range: the instance. a
+# suffixed literal already has a type and is left for the instance to agree or refuse
+# the nesting refusal a walk returns, already reported against the node it stands on
+fun refused(sc: *sema_context.SemaContext, span: base_source.Span) fail.Fail {
+    sema_context.refuse_nesting(sc, span);
+    ret fail.reported();
+}
+
+fun coerce_to_parameter(sc: *sema_context.SemaContext, eid: ast_id.ExprId, e: *ast_expr.Expr, to: type_kind.TypeId, negated: bool, probe: bool) res[CoerceResult, fail.Fail] {
+    if (e.kind == ast_expr.EXPR_KIND_LIT_INT && e.data.lit_int.suffix == ast_expr.LIT_SUFFIX_NONE)     { ret res[CoerceResult, fail.Fail].ok{commit(sc, eid, to, probe)}; }
+    if (e.kind == ast_expr.EXPR_KIND_LIT_FLOAT && e.data.lit_float.suffix == ast_expr.LIT_SUFFIX_NONE) { ret res[CoerceResult, fail.Fail].ok{commit(sc, eid, to, probe)}; }
+    if (e.kind == ast_expr.EXPR_KIND_LIT_CHAR)                                                         { ret res[CoerceResult, fail.Fail].ok{commit(sc, eid, to, probe)}; }
+    if (e.kind == ast_expr.EXPR_KIND_LIT_NIL)                                                          { ret res[CoerceResult, fail.Fail].ok{commit(sc, eid, to, probe)}; }
+    if (e.kind == ast_expr.EXPR_KIND_UNARY)                                                            { ret coerce_unary(sc, eid, ?e.data.unary, to, negated, probe); }
+    if (e.kind == ast_expr.EXPR_KIND_BINARY)                                                           { ret coerce_binary(sc, eid, ?e.data.binary, to, probe); }
+    ret res[CoerceResult, fail.Fail].ok{not_applicable()};
+}
+
+fun coerce_suffixed_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, suffix: type_kind.TypeKind, to: type_kind.TypeId, probe: bool) CoerceResult {
+    val opt_type: opt[*type.Type] = type.get(?sc.s.types, to);
+    if (!sel opt_type.some)           { ret not_applicable(); }
+    if (opt_type.some.kind != suffix) { ret not_applicable(); }
+    ret commit(sc, eid, to, probe);
+}
+
+fun coerce_int_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, v: wide.Wide, to: type_kind.TypeId, negated: bool, literal: bool, probe: bool) CoerceResult {
+    val opt_bounds: opt[type_prim.IntRange] = int_bounds_of(sc, to);
+    if (!sel opt_bounds.some) { ret not_applicable(); }
+    val bounds: type_prim.IntRange = opt_bounds.some;
+    if (!type_prim.int_fits(v, negated, bounds)) { ret out_of_range(to, v, negated, bounds, literal); }
+    ret commit(sc, eid, to, probe);
+}
+
+fun coerce_comptime_int_path(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type_kind.TypeId, negated: bool, probe: bool) CoerceResult {
+    if (!intrinsic.is_comptime_value(sc.view.a, eid)) { ret not_applicable(); }
+
+    val res_eval: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime.evaluate[sema_context.SemaContext](sc.view.ctx, sc, sc.typing.caps, sc.view.a, sc.view.source, eid, ?sc.s.interner);
+
+    sema_context.record_eval_result(sc, res_eval);
+    if (sel res_eval.err) { ret not_applicable(); }
+    val ctval: comptime_value.CTValue = res_eval.ok;
+
+    ret coerce_ct_int(sc, eid, ctval, to, negated, probe);
+}
+
+# whether a comptime integer value fits integer type `to`, retyping nothing:
+# not applicable unless both are integers
+pub fun fit_ct_int(sc: *sema_context.SemaContext, ctval: comptime_value.CTValue, to: type_kind.TypeId) CoerceResult {
+    if (ctval.kind != comptime_value.CT_KIND_INT) { ret not_applicable(); }
+    val opt_bounds: opt[type_prim.IntRange] = int_bounds_of(sc, to);
+    if (!sel opt_bounds.some) { ret not_applicable(); }
+    var mag:     wide.Wide = ctval.data.w;
+    var negated: bool      = false;
+    if (comptime_value.ct_is_negative(ctval)) {
+        mag     = wide.neg(mag);
+        negated = true;
+    }
+    if (!type_prim.int_fits(mag, negated, opt_bounds.some)) { ret out_of_range(to, mag, negated, opt_bounds.some, false); }
+    ret applicable(to);
+}
+
+fun coerce_ct_int(sc: *sema_context.SemaContext, eid: ast_id.ExprId, ctval: comptime_value.CTValue, to: type_kind.TypeId, negated: bool, probe: bool) CoerceResult {
+    if (ctval.kind != comptime_value.CT_KIND_INT) { ret not_applicable(); }
+
+    var mag:           wide.Wide = ctval.data.w;
+    var value_negated: bool      = false;
+    if (comptime_value.ct_is_negative(ctval)) {
+        mag           = wide.neg(mag);
+        value_negated = true;
+    }
+
+    var negated_total: bool = negated;
+    if (value_negated) { negated_total = !negated; }
+
+    ret coerce_int_literal(sc, eid, mag, to, negated_total, false, probe);
+}
+
+fun coerce_layout_intrinsic(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type_kind.TypeId, negated: bool, probe: bool) CoerceResult {
+    if (!intrinsic.is_layout_intrinsic_call(sc.view.a, sc.view.source, eid)) { ret not_applicable(); }
+    # an identity keeps all 64 bits, so it never adopts a narrower binding by value
+    if (intrinsic.is_type_id_call(sc.view.a, sc.view.source, eid)) { ret not_applicable(); }
+
+    val opt_bounds: opt[type_prim.IntRange] = int_bounds_of(sc, to);
+    if (!sel opt_bounds.some) { ret not_applicable(); }
+
+    val outer: sema_context.Walk = sema_context.walk_begin(sc);
+    sc.walk.silent = true;
+    val res_eval: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime.evaluate[sema_context.SemaContext](sc.view.ctx, sc, sc.typing.caps, sc.view.a, sc.view.source, eid, ?sc.s.interner);
+    sema_context.record_eval_result(sc, res_eval);
+    sema_context.walk_end(sc, outer);
+
+    if (sel res_eval.ok) {
+        val ctval: comptime_value.CTValue = res_eval.ok;
+        if (ctval.kind == comptime_value.CT_KIND_INT) {
+            ret coerce_ct_int(sc, eid, ctval, to, negated, probe);
+        }
+    }
+
+    ret commit(sc, eid, to, probe);
+}
+
+fun coerce_unary(sc: *sema_context.SemaContext, eid: ast_id.ExprId, u: *ast_expr.ExprUnary, to: type_kind.TypeId, negated: bool, probe: bool) res[CoerceResult, fail.Fail] {
+    if (u.op != ast_expr.UN_NEG && u.op != ast_expr.UN_BIT_NOT) { ret res[CoerceResult, fail.Fail].ok{not_applicable()}; }
+
+    var operand_negated: bool = negated;
+    if (u.op == ast_expr.UN_NEG) { operand_negated = !negated; }
+
+    val res_coerce_to: res[CoerceResult, fail.Fail] = coerce_to(sc, u.operand, to, operand_negated, probe);
+    if (sel res_coerce_to.err)                   { ret res_coerce_to; }
+    if (res_coerce_to.ok.kind != COERCE_COERCED) { ret res_coerce_to; }
+    ret res[CoerceResult, fail.Fail].ok{commit(sc, eid, to, probe)};
+}
+
+fun coerce_binary(sc: *sema_context.SemaContext, eid: ast_id.ExprId, b: *ast_expr.ExprBinary, to: type_kind.TypeId, probe: bool) res[CoerceResult, fail.Fail] {
+    if (!is_value_preserving_binop(b.op)) { ret res[CoerceResult, fail.Fail].ok{not_applicable()}; }
+
+    val res_lhs: res[CoerceResult, fail.Fail] = coerce_to(sc, b.lhs, to, false, probe);
+    if (sel res_lhs.err)                   { ret res_lhs; }
+    if (res_lhs.ok.kind != COERCE_COERCED) { ret res_lhs; }
+    val res_rhs: res[CoerceResult, fail.Fail] = coerce_to(sc, b.rhs, to, false, probe);
+    if (sel res_rhs.err)                   { ret res_rhs; }
+    if (res_rhs.ok.kind != COERCE_COERCED) { ret res_rhs; }
+    ret res[CoerceResult, fail.Fail].ok{commit(sc, eid, to, probe)};
+}
+
+# the operators whose result coerces with their operands; false for every
+# other operator (a partition, enumerated by its test)
+fun is_value_preserving_binop(op: ast_expr.BinOp) bool {
+    if (op == ast_expr.BIN_ADD || op == ast_expr.BIN_SUB || op == ast_expr.BIN_MUL
+        || op == ast_expr.BIN_DIV || op == ast_expr.BIN_MOD) { ret true; }
+    if (op == ast_expr.BIN_BIT_AND || op == ast_expr.BIN_BIT_OR || op == ast_expr.BIN_BIT_XOR
+        || op == ast_expr.BIN_SHL || op == ast_expr.BIN_SHR) { ret true; }
+    ret false;
+}
+
+pub fun int_bounds_of(sc: *sema_context.SemaContext, to: type_kind.TypeId) opt[type_prim.IntRange] {
+    val opt_type: opt[*type.Type] = type.get(?sc.s.types, type.strip_secret(?sc.s.types, to));
+    if (!sel opt_type.some) { ret opt[type_prim.IntRange].none{}; }
+    ret type_prim.int_range(opt_type.some.kind);
+}
+
+fun commit(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type_kind.TypeId, probe: bool) CoerceResult {
+    if (!probe) { sema_context.expr_type_set(sc, eid, to); }
+    ret applicable(to);
+}
+
+# the float literal rule, applied once the literal's type is final. the literal rounds to
+# nearest; one that rounds to infinity, or whose nonzero value rounds to zero, is refused,
+# and an inexact one whose written digits are not the shortest spelling of the value stored
+# warns with that value. an exact literal never warns
+# ---
+# sc:  the semantic context the literal was typed in
+# eid: a float literal
+# ty:  its final type; anything but a float type is left alone
+pub fun check_float_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, ty: type_kind.TypeId) {
+    if (sc.walk.silent || type_kind.is_nil(ty) || type_kind.is_error(ty)) { ret; }
+    val opt_type: opt[*type.Type] = type.get(?sc.s.types, type.strip_secret(?sc.s.types, ty));
+    if (!sel opt_type.some) { ret; }
+    val w: float.FloatWidth = type_prim.float_width_of(opt_type.some.kind);
+    if (w == float.FLOAT_W_NONE) { ret; }
+
+    val res_expression: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, eid);
+    if (sel res_expression.err) { ret; }
+    val span:    base_source.Span              = res_expression.ok.data.lit_float.tok;
+    val res_lit: res[float.Rounded, fail.Fail] = front_literal.float_at(sc.view.source, span, w);
+    if (sel res_lit.err) { ret; }
+    val fit: float.Fit = res_lit.ok.fit;
+    if (fit == float.FIT_EXACT) { ret; }
+
+    if (fit == float.FIT_OVERFLOW || fit == float.FIT_UNDERFLOW) {
+        if (fit == float.FIT_OVERFLOW) { sema_context.reportf(sc, diagnostic_kind.LITERAL_OUT_OF_RANGE, span, "float literal overflows `{}`: it rounds to infinity", float.width_name(w)); }
+        or                             { sema_context.reportf(sc, diagnostic_kind.LITERAL_OUT_OF_RANGE, span, "float literal underflows `{}`: its nonzero value rounds to zero", float.width_name(w)); }
+        ret;
+    }
+
+    var s: float.Shortest = float.shortest(res_lit.ok.value, w);
+    if (front_literal.float_spells(sc.view.source, span, ?s)) { ret; }
+    var text:              [float.SHORTEST_TEXT_CAP]u8;
+    val res_builder_initf: res[diagnostic.DiagnosticBuilder, fail.Fail] = diagnostic.builder_initf(sc.diags.a, diagnostic_kind.FLOAT_INEXACT, sc.view.a.file_id, span,
+        "float literal is not exact in `{}`: the value stored is `{}`", float.width_name(w), float.shortest_text(?s, ?text[0]));
+    if (sel res_builder_initf.err) {
+        sema_context.report_internal(sc, span, res_builder_initf.err);
+        ret;
+    }
+    var b: diagnostic.DiagnosticBuilder = res_builder_initf.ok;
+    # a generic body warns once per site, however many instances or modules type
+    # it: the store keeps one copy of a report
+    val err_committed: err[fail.Fail] = diagnostic.commit(?b, sc.diags);
+    if (sel err_committed.err) { sema_context.report_internal(sc, span, err_committed.err); }
+}
+
+pub fun is_assignable(sc: *sema_context.SemaContext, from: type_kind.TypeId, to: type_kind.TypeId) bool {
+    if (type_kind.same(from, to))                           { ret true; }
+    if (type_kind.is_error(from) || type_kind.is_error(to)) { ret true; }
+
+    val to_secret:   bool = type.is_secret(?sc.s.types, to);
+    val from_secret: bool = type.is_secret(?sc.s.types, from);
+    if (to_secret) {
+        ret is_assignable(sc, type.strip_secret(?sc.s.types, from), type.strip_secret(?sc.s.types, to));
+    }
+    if (from_secret) { ret spreads_secret(sc, from, to); }
+
+    if (ptr_compatible(sc, from, to)) { ret true; }
+    ret type.type_equals_signatures(?sc.s.types, from, to);
+}
+
+# `^[N]T` reads as `[N]^T`, at every array level: the secret moves onto each element, which
+# keeps every element secret and declassifies nothing
+fun spreads_secret(sc: *sema_context.SemaContext, from: type_kind.TypeId, to: type_kind.TypeId) bool {
+    var a: type_kind.TypeId = from;
+    var b: type_kind.TypeId = to;
+    for {
+        if (type_kind.same(a, b)) { ret true; }
+        val opt_types_entry: opt[*type.Type] = type.get(?sc.s.types, type.strip_secret(?sc.s.types, a));
+        val opt_b_type:      opt[*type.Type] = type.get(?sc.s.types, b);
+        if (sel opt_types_entry.none)                                                                          { ret false; }
+        if (sel opt_b_type.none)                                                                               { ret false; }
+        if (opt_types_entry.some.kind != type_kind.TYPE_ARRAY || opt_b_type.some.kind != type_kind.TYPE_ARRAY) { ret false; }
+        if (opt_types_entry.some.data.array.count != opt_b_type.some.data.array.count)                         { ret false; }
+        val res_element: res[type_kind.TypeId, fail.Fail] = type.intern_secret(?sc.s.types, opt_types_entry.some.data.array.base);
+        if (sel res_element.err) {
+            report_phase.internal(?sc.status, res_element.err);
+            ret false;
+        }
+        a = res_element.ok;
+        b = opt_b_type.some.data.array.base;
+    }
+}
+
+fun ptr_compatible(sc: *sema_context.SemaContext, from: type_kind.TypeId, to: type_kind.TypeId) bool {
+    if (type_kind.same(from, type_kind.id(type_kind.TYPE_PTR::u32)) && is_typed_pointer(sc, to)) {
+        ret !sema_context.recover[bool](sc, deep.contains_secret(sc.s, to), false);
+    }
+    if (type_kind.same(to, type_kind.id(type_kind.TYPE_PTR::u32)) && is_typed_pointer(sc, from)) {
+        ret !sema_context.recover[bool](sc, deep.contains_secret(sc.s, from), false);
+    }
+    ret false;
+}
+
+fun is_typed_pointer(sc: *sema_context.SemaContext, t: type_kind.TypeId) bool {
+    val opt_type: opt[*type.Type] = type.get(?sc.s.types, t);
+    if (!sel opt_type.some) { ret false; }
+    ret opt_type.some.kind == type_kind.TYPE_POINTER;
+}

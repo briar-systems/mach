@@ -1,0 +1,278 @@
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mach.base.diagnostic;
+use mach.base.fail;
+use mach.base.intern;
+use mach.front.ast;
+use ast_decl:       mach.front.ast.decl;
+use ast_id:         mach.front.ast.id;
+use ast_module:     mach.front.ast.module;
+use comptime_deep:  mach.front.comptime.deep;
+use comptime_scope: mach.front.comptime.scope;
+use comptime_value: mach.front.comptime.value;
+use sema_context:   mach.front.sema.context;
+use sema_instance:  mach.front.sema.instance;
+use sema_product:   mach.front.sema.product;
+use lower_context:  mach.lower.context;
+use lower_decl:     mach.lower.decl;
+use report_phase:   mach.report.phase;
+use mach.session;
+use mach.type;
+use mirl_module:       mirl.ir.module;
+use mirl_type:         mirl.ir.type.table;
+use mirl_verify:       mirl.verify.failure;
+use mirl_verify_table: mirl.verify.table;
+
+# the module `req` names lowered into the mirl module `m`, and the unit of facts kept of it. an
+# instance its code calls is only declared: its instance unit defines it (lower_unit). holding
+# the module to mirl's verifier is verify_module's, a stage of its own
+pub fun lower_module(req: *lower_context.LowerRequest, m: *mirl_module.Module) res[lower_context.Unit, fail.Fail] {
+    if (req == nil) { ret res[lower_context.Unit, fail.Fail].err{fail.message("lower: lower_module requires a lowering request")}; }
+    val a: *ast.Ast = req.module.a;
+
+    var u: lower_context.Unit = lower_context.unit_init(req.malloc, req.module.fqn);
+
+    var lc:       lower_context.LowerContext;
+    val err_init: err[fail.Fail] = lower_context.init_context(?lc, req, m, ?u);
+    if (sel err_init.err) {
+        lower_context.unit_dnit(?u);
+        ret res[lower_context.Unit, fail.Fail].err{err_init.err};
+    }
+
+    val opt_module: opt[*ast_module.Module] = ast.get_module(a, a.root_module);
+    if (sel opt_module.none) {
+        ret lower_module_fail(?lc, ?u, fail.message("lower: root_module is not set on this Ast"));
+    }
+    val mnode:     *ast_module.Module = opt_module.some;
+    val err_owned: err[fail.Fail]     = lower_context.debug_own_types(?lc);
+    if (sel err_owned.err) { ret lower_module_fail(?lc, ?u, err_owned.err); }
+
+    var i: u32 = 0;
+    for (i < mnode.decls_len) {
+        val pool_ix: u32 = mnode.decls_start + i;
+        if (pool_ix::usize >= a.decl_ids.len) {
+            ret lower_module_fail(?lc, ?u, fail.message("lower: module decl index out of range"));
+        }
+        val did:      ast_id.DeclId  = a.decl_ids.data[pool_ix];
+        val err_decl: err[fail.Fail] = lower_decl.lower_decl(?lc, did);
+        if (sel err_decl.err) {
+            val failure:         fail.Fail           = err_decl.err;
+            val opt_declaration: opt[*ast_decl.Decl] = ast.get_decl(a, did);
+            if (!sel failure.reported)    { ret lower_module_fail(?lc, ?u, failure); }
+            if (sel opt_declaration.none) { ret lower_module_fail(?lc, ?u, failure); }
+            val kind: ast_decl.DeclKind = opt_declaration.some.kind;
+            if (kind != ast_decl.DECL_KIND_VAL && kind != ast_decl.DECL_KIND_VAR) {
+                ret lower_module_fail(?lc, ?u, failure);
+            }
+            if (sel lc.status.kind.accepted) { report_phase.reject(?lc.status); }
+        }
+        i = i + 1;
+    }
+
+    if (!sel lc.status.kind.accepted) { ret lower_module_fail(?lc, ?u, report_phase.phase_failure(lc.status)); }
+    val err_queued: err[fail.Fail] = emit_queued(?lc);
+    if (sel err_queued.err) {
+        ret lower_module_fail(?lc, ?u, err_queued.err);
+    }
+    val err_described: err[fail.Fail] = lower_context.debug_types_finish(?lc);
+    if (sel err_described.err) {
+        ret lower_module_fail(?lc, ?u, err_described.err);
+    }
+
+    if (!sel lc.status.kind.accepted) { ret lower_module_fail(?lc, ?u, report_phase.phase_failure(lc.status)); }
+    lower_context.dnit_context(?lc);
+    ret res[lower_context.Unit, fail.Fail].ok{u};
+}
+
+# the instance unit `name` lowered into the mirl module `m`: each member, in the order given,
+# read through the frames of its own typing, and the unit of facts kept of it. the order is the
+# members' mangled names, so the module does not depend on the order anything was typed in
+pub fun lower_unit(req: *lower_context.LowerRequest, name: intern.StrId, members: **sema_product.InstanceResult, defining: *lower_context.Defining,
+    count: u32, m: *mirl_module.Module) res[lower_context.Unit, fail.Fail] {
+    if (req == nil) { ret res[lower_context.Unit, fail.Fail].err{fail.message("lower: lower_unit requires a lowering request")}; }
+    var u:        lower_context.Unit = lower_context.unit_init(req.malloc, name);
+    var lc:       lower_context.LowerContext;
+    val err_init: err[fail.Fail]     = lower_context.init_context(?lc, req, m, ?u);
+    if (sel err_init.err) {
+        lower_context.unit_dnit(?u);
+        ret res[lower_context.Unit, fail.Fail].err{err_init.err};
+    }
+    var i: u32 = 0;
+    for (i < count) {
+        val err_emitted: err[fail.Fail] = emit_instance(?lc, members[i], defining[i], opt[lower_context.ClassCopy].none{});
+        if (sel err_emitted.err) { ret lower_module_fail(?lc, ?u, err_emitted.err); }
+        i = i + 1;
+    }
+    val err_queued: err[fail.Fail] = emit_queued(?lc);
+    if (sel err_queued.err) {
+        ret lower_module_fail(?lc, ?u, err_queued.err);
+    }
+    val err_described: err[fail.Fail] = lower_context.debug_types_finish(?lc);
+    if (sel err_described.err) {
+        ret lower_module_fail(?lc, ?u, err_described.err);
+    }
+    if (!sel lc.status.kind.accepted) { ret lower_module_fail(?lc, ?u, report_phase.phase_failure(lc.status)); }
+    lower_context.dnit_context(?lc);
+    ret res[lower_context.Unit, fail.Fail].ok{u};
+}
+
+# the lowered module `m` named `name`, held to mirl's verifier on `machine`. a module the
+# verifier refuses is the lowering's own fault, never the source's
+pub fun verify_module(machine: *lower_context.Machine, a: *A.Allocator, name: str, m: *mirl_module.Module) err[fail.Fail] {
+    val err_checked: err[mirl_verify.Error] = mirl_verify_table.against(m, machine.target, machine.ctx, mirl_verify.Stage.open{}, mirl_verify.Scope.whole{});
+    if (sel err_checked.ok) { ret err[fail.Fail].ok{}; }
+    val e: mirl_verify.Error = err_checked.err;
+    if (sel e.alloc) { ret err[fail.Fail].err{fail.refused(e.alloc)}; }
+    val f: mirl_verify.Failure = e.refused;
+    ret err[fail.Fail].err{fail.message_of(diagnostic.join(a, "lower: mirl's verifier refuses the lowered module '", name, "': ", f.what))};
+}
+
+fun lower_module_fail(lc: *lower_context.LowerContext, u: *lower_context.Unit, f: fail.Fail) res[lower_context.Unit, fail.Fail] {
+    var result: fail.Fail = f;
+    if (sel lc.status.kind.internal) { result = report_phase.phase_failure(lc.status); }
+    lower_context.dnit_context(lc);
+    lower_context.unit_dnit(u);
+    ret res[lower_context.Unit, fail.Fail].err{result};
+}
+
+# emits every local instance and class copy the code lowered asked for, and those they ask for
+# in turn. a local instance this object already defines, as a unit's member, is that definition
+fun emit_queued(lc: *lower_context.LowerContext) err[fail.Fail] {
+    var local: usize = 0;
+    var k:     usize = 0;
+    for (local < lc.local_instances.len || k < lc.copies.len) {
+        if (local < lc.local_instances.len) {
+            val wanted: lower_context.UnitMember = lc.local_instances.data[local];
+            local = local + 1;
+            val item:      *sema_instance.Instance      = sema_instance.at(wanted.set, wanted.id);
+            val res_named: res[intern.StrId, fail.Fail] = lower_context.instance_link_name(lc, item);
+            if (sel res_named.err) { ret err[fail.Fail].err{res_named.err}; }
+            if (!lower_context.defines(lc, res_named.ok)) {
+                val res_typed: res[*sema_product.InstanceResult, fail.Fail] = lc.typed.read(lc.typed.ctx, item);
+                if (sel res_typed.err) { ret err[fail.Fail].err{res_typed.err}; }
+                val err_emitted: err[fail.Fail] = emit_instance(lc, res_typed.ok, lower_context.Defining.local{}, opt[lower_context.ClassCopy].none{});
+                if (sel err_emitted.err) { ret err_emitted; }
+            }
+            cnt;
+        }
+        val c:           lower_context.ClassCopy = lc.copies.data[k];
+        val err_emitted: err[fail.Fail]          = emit_class_copy(lc, c);
+        if (sel err_emitted.err) { ret err_emitted; }
+        k = k + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun emit_class_copy(lc: *lower_context.LowerContext, c: lower_context.ClassCopy) err[fail.Fail] {
+    if (c.instance != sema_instance.NONE) {
+        val res_typed: res[*sema_product.InstanceResult, fail.Fail] = lc.typed.read(lc.typed.ctx, sema_instance.at(c.set, c.instance));
+        if (sel res_typed.err) { ret err[fail.Fail].err{res_typed.err}; }
+        ret emit_instance(lc, res_typed.ok, lower_context.Defining.local{}, opt[lower_context.ClassCopy].some{c});
+    }
+    val res_acquired: res[lower_context.ModuleScope, fail.Fail] = lower_context.origin_scope(lc, c.origin);
+    if (sel res_acquired.err) { ret err[fail.Fail].err{res_acquired.err}; }
+    val res_mark: res[lower_context.ScopeMark, fail.Fail] = lower_context.scope_enter(lc, res_acquired.ok);
+    if (sel res_mark.err) { ret err[fail.Fail].err{res_mark.err}; }
+    var err_lowered: err[fail.Fail]      = err[fail.Fail].err{fail.message("lower: a class copy's declaration is not a function")};
+    val opt_decl:    opt[*ast_decl.Decl] = ast.get_decl(lc.scope.a, c.decl);
+    if (sel opt_decl.some) {
+        if (opt_decl.some.kind == ast_decl.DECL_KIND_FUN) { err_lowered = lower_decl.lower_class_copy(lc, c.decl, opt_decl.some, c.name, c.sig); }
+    }
+    val err_leave: err[fail.Fail] = lower_context.scope_leave(lc, res_mark.ok);
+    if (sel err_lowered.err) { ret err_lowered; }
+    ret err_leave;
+}
+
+# the instance `typed` heads, read through its own frames: bound as `defining` states, or with
+# `copy` the class copy of it `copy` names
+fun emit_instance(lc: *lower_context.LowerContext, typed: *sema_product.InstanceResult, defining: lower_context.Defining, copy: opt[lower_context.ClassCopy]) err[fail.Fail] {
+    val reading: *sema_instance.Set   = lc.instances;
+    val values:  *comptime_deep.Store = lc.instance_values;
+    lc.instances       = ?typed.set;
+    lc.instance_values = ?typed.values;
+    fin {
+        lc.instances       = reading;
+        lc.instance_values = values;
+    }
+    val s:            *session.Session                          = lc.s;
+    val item:         *sema_instance.Instance                   = sema_instance.at(?typed.set, 0);
+    val res_acquired: res[lower_context.ModuleScope, fail.Fail] = lower_context.origin_scope(lc, item.origin);
+    if (sel res_acquired.err) { ret err[fail.Fail].err{res_acquired.err}; }
+    var sc: lower_context.ModuleScope = res_acquired.ok;
+
+    val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(sc.a, item.decl);
+    if (sel opt_decl.none) { ret err[fail.Fail].err{fail.message("lower: instance origin declaration not found")}; }
+    val d: *ast_decl.Decl = opt_decl.some;
+    if (d.kind != ast_decl.DECL_KIND_FUN) { ret err[fail.Fail].err{fail.message("lower: instance origin declaration is not a function")}; }
+    if (item.arg_len > 0) {
+        val res_who: res[type.GenericOwner, fail.Fail] = sema_context.generic_owner_of_decl(s, sc.a, item.origin, item.decl);
+        if (sel res_who.err) { ret err[fail.Fail].err{res_who.err}; }
+        sc.subst       = item.args;
+        sc.subst_len   = item.arg_len;
+        sc.subst_owner = res_who.ok;
+    }
+    sc.frame = item.frame;
+
+    val res_linked: res[intern.StrId, fail.Fail] = lower_context.instance_link_name(lc, item);
+    if (sel res_linked.err) { ret err[fail.Fail].err{res_linked.err}; }
+    var name:        intern.StrId        = res_linked.ok;
+    var opt_as_copy: opt[mirl_type.Type] = opt[mirl_type.Type].none{};
+    if (sel copy.some) {
+        name        = copy.some.name;
+        opt_as_copy = opt[mirl_type.Type].some{copy.some.sig};
+    }
+
+    val res_mark: res[lower_context.ScopeMark, fail.Fail] = lower_context.scope_enter(lc, sc);
+    if (sel res_mark.err) { ret err[fail.Fail].err{res_mark.err}; }
+
+    var err_lower: err[fail.Fail] = err[fail.Fail].ok{};
+    if (item.kind == sema_instance.KIND_PACK) {
+        err_lower = lower_decl.lower_pack_instance(lc, item.decl, d, name, item.pack, item.pack_len, defining, opt_as_copy);
+    }
+    or (item.kind == sema_instance.KIND_VALUE) {
+        err_lower = lower_bound_value_instance(lc, item.decl, d, name, item.values, item.names, item.value_len, defining, opt_as_copy);
+    }
+    or {
+        err_lower = lower_decl.lower_instance(lc, item.decl, d, name, defining, opt_as_copy);
+    }
+
+    val err_leave: err[fail.Fail] = lower_context.scope_leave(lc, res_mark.ok);
+    if (sel err_leave.err) { ret err_leave; }
+    ret err_lower;
+}
+
+fun lower_bound_value_instance(lc: *lower_context.LowerContext, decl_id: ast_id.DeclId, d: *ast_decl.Decl,
+    name: intern.StrId, vals: *comptime_value.CTValue,
+    names: *intern.StrId, val_len: u32, defining: lower_context.Defining, copy: opt[mirl_type.Type]) err[fail.Fail] {
+    val octx:     *comptime_scope.ComptimeCtx              = lc.scope.ctx;
+    val res_mark: res[comptime_scope.FrameMark, fail.Fail] = comptime_scope.frame_begin(octx);
+    if (sel res_mark.err) {
+        ret err[fail.Fail].err{res_mark.err};
+    }
+    val mark: comptime_scope.FrameMark = res_mark.ok;
+
+    var err_bound: err[fail.Fail] = err[fail.Fail].ok{};
+    var i:         u32            = 0;
+    for (i < val_len) {
+        val err_bind: err[fail.Fail] = comptime_scope.bind(octx, names[i], vals[i]);
+        if (sel err_bind.err) {
+            err_bound = err_bind;
+            i         = val_len;
+        }
+        or { i = i + 1; }
+    }
+    var err_lowered: err[fail.Fail] = err_bound;
+    if (sel err_bound.ok) {
+        err_lowered = lower_decl.lower_instance(lc, decl_id, d, name, defining, copy);
+    }
+
+    val err_close: err[fail.Fail] = comptime_scope.frame_end(octx, mark);
+    if (sel err_close.err) { ret err_close; }
+    ret err_lowered;
+}

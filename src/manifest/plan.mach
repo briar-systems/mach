@@ -1,0 +1,791 @@
+use std.text.string.str_dup_range;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_is_empty;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A:                  std.allocator;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use mach.base.intern;
+
+use mach.host.output.layout;
+
+use mach.manifest.artifact.artifact_needs_artifact;
+use mach.manifest.artifact.artifact_supports_target;
+use mach.manifest.artifact.expand_artifact_output;
+use mach.manifest.artifact.export_artifact;
+use mach.manifest.artifact.find_artifact;
+use mach.manifest.artifact.find_artifact_by_name;
+use mach.manifest.link.LinkRequirement;
+use mach.manifest.link.expand_local_path;
+use mach.manifest.link.find_link_by_name;
+use mach.manifest.link.finish_link_requirements;
+use mach.manifest.link.link_claims_dnit;
+use mach.manifest.link.link_matches_target;
+use mach.manifest.link.link_requirement;
+use mach.manifest.model.ArtifactDef;
+use mach.manifest.model.LINK_LOCAL;
+use mach.manifest.model.LinkDef;
+use mach.manifest.model.Manifest;
+use mach.manifest.model.SimdMode;
+use mach.manifest.model.StepDef;
+use mach.manifest.model.TargetDef;
+use mach.manifest.model.id_of;
+use mach.manifest.need;
+use mach.manifest.project.expand_project_work;
+use mach.manifest.refusal.Sites;
+use mach.manifest.refusal.refuse;
+use mach.manifest.refusal.sfmt;
+use mach.manifest.refusal.sites_add;
+use mach.manifest.refusal.sites_fail;
+use mach.manifest.refusal.sites_init;
+use mach.manifest.select.Cell;
+use mach.manifest.select.ResolvedProfile;
+use mach.manifest.select.ResolvedTarget;
+use mach.manifest.select.resolve_profile;
+use mach.manifest.select.resolve_target;
+use mach.manifest.template;
+
+# one resolved build cell: a target, a profile, and an artifact with every path
+# expanded. produced by `resolve_build_unit`; `libs` is owned by the unit
+# ---
+# target:       the resolved target; points into the manifest, except for the host
+#               target synthesized when the manifest declares no targets
+# artifact:     the resolved artifact, pointing into the manifest
+# target_name:  `target.name`
+# profile_name: the resolved profile's name
+# entry:        the artifact's `entry`
+# bin_path:     the artifact's output: the expanded `[project].work` joined with the
+#               expanded artifact `out`
+# out_root:     `<expanded project work>`, whose layout beneath it the build owns
+#               (mach.host.output.layout)
+# optimize:     from the resolved profile
+# debug:        from the resolved profile
+# simd:         from the resolved profile
+# libs:         the artifact's `link` entries that match the target, resolved in `link`
+#               order and sized exactly; a `link` name matching no `[link.*]` table is skipped
+# lib_count:    length of `libs`
+pub rec BuildUnit {
+    target:       *TargetDef;
+    artifact:     *ArtifactDef;
+    target_name:  intern.StrId;
+    profile_name: intern.StrId;
+    entry:        intern.StrId;
+    bin_path:     intern.StrId;
+    out_root:     intern.StrId;
+    optimize:     bool;
+    debug:        bool;
+    simd:         SimdMode;
+    libs:         *LinkRequirement;
+    lib_count:    u32;
+}
+
+# the manifest that declares a build cell, and the root project the cell is built
+# for. a root cell has `owner == root`. a dependency's cell is one of the
+# requirements its export library carries: it resolves its artifact, targets and
+# links in `owner`, its profile in `root`, expands the root's `[project].work`, and
+# reads `{project.work}` in its artifact outputs as `dep/<owner id>` of that out,
+# so identically named artifacts of two dependencies never share a path
+# ---
+# root:  the manifest of the project being built
+# owner: the manifest declaring the cell's artifact; `root` for the root's own
+pub rec Scope {
+    root:  *Manifest;
+    owner: *Manifest;
+}
+
+pub fun root_scope(m: *Manifest) Scope {
+    ret Scope{root: m, owner: m};
+}
+
+pub fun dependency_scope(root: *Manifest, owner: *Manifest) Scope {
+    ret Scope{root: root, owner: owner};
+}
+
+pub fun scope_is_dependency(s: *Scope) bool {
+    ret s.owner != s.root;
+}
+
+# the value `{project.work}` takes in an artifact output of the scope
+# ---
+# alloc:    owns the returned path
+# itn:      resolves the owner id
+# s:        the scope
+# proj_out: the expanded root `[project].work`
+# ret:      `proj_out` for the root, `<proj_out>/dep/<owner id>` for a dependency
+fun scope_artifact_root(alloc: *A.Allocator, itn: *intern.Interner, s: *Scope, proj_out: str) res[str, fail.Fail] {
+    if (!scope_is_dependency(s)) { ret path_dup(alloc, proj_out, 0, str_len(proj_out)); }
+    val res_home: res[str, fail.Fail] = path_join(alloc, proj_out, layout.DEPENDENCY);
+    if (sel res_home.err) { ret res_home; }
+    val res_owned: res[str, fail.Fail] = path_join(alloc, res_home.ok, intern.text(itn, s.owner.id));
+    str_free(alloc, res_home.ok);
+    ret res_owned;
+}
+
+# release `count` path strings; a nil list owns nothing
+fun free_path_strings(alloc: *A.Allocator, paths: *str, count: u32) {
+    if (paths == nil) { ret; }
+    var i: u32 = 0;
+    for (i < count) {
+        if (paths[i] != nil) { str_free(alloc, paths[i]); }
+        i = i + 1;
+    }
+}
+
+# the bytes [start, end) of `text` as a string `alloc` owns
+fun path_dup(alloc: *A.Allocator, text: str, start: usize, end: usize) res[str, fail.Fail] {
+    val res_str_dup_range: res[str, A.Error] = str_dup_range(alloc, text, start, end - start);
+    if (sel res_str_dup_range.err) { ret res[str, fail.Fail].err{fail.refused(res_str_dup_range.err)}; }
+    ret res[str, fail.Fail].ok{res_str_dup_range.ok};
+}
+
+# `a` and `b` joined by one '/', whatever separators they end and start with
+fun path_join(alloc: *A.Allocator, a: str, b: str) res[str, fail.Fail] {
+    if (str_is_empty(a)) { ret path_dup(alloc, b, 0, str_len(b)); }
+    if (str_is_empty(b)) { ret path_dup(alloc, a, 0, str_len(a)); }
+    var end_a: usize = str_len(a);
+    if (a[end_a - 1] == '/') { end_a = end_a - 1; }
+    var start_b: usize = 0;
+    if (b[0] == '/') { start_b = 1; }
+    val res_a_sub: res[str, fail.Fail] = path_dup(alloc, a, 0, end_a);
+    if (sel res_a_sub.err) { ret res_a_sub; }
+    fin { str_free(alloc, res_a_sub.ok); }
+    val res_b_sub: res[str, fail.Fail] = path_dup(alloc, b, start_b, str_len(b));
+    if (sel res_b_sub.err) { ret res_b_sub; }
+    fin { str_free(alloc, res_b_sub.ok); }
+    ret sfmt(alloc, "{}/{}", res_a_sub.ok, res_b_sub.ok);
+}
+
+# the names of the targets `a` supports, comma separated
+fun artifact_target_names(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, a: *ArtifactDef) res[str, fail.Fail] {
+    var s: str = "";
+    var i: u32 = 0;
+    for (i < m.target_count) {
+        if (artifact_supports_target(itn, a, m.targets[i].name)) {
+            var sep: str = "";
+            if (!str_is_empty(s)) { sep = ", "; }
+            val res_longer: res[str, fail.Fail] = sfmt(alloc, "{}{}{}", s, sep, intern.text(itn, m.targets[i].name));
+            if (sel res_longer.err) { ret res_longer; }
+            s = res_longer.ok;
+        }
+        i = i + 1;
+    }
+    ret res[str, fail.Fail].ok{s};
+}
+
+# the build step whose expanded `out` list holds a path
+# ---
+# alloc:         owns temporary expansions
+# itn:           resolves step strings
+# m:             the manifest
+# expanded_path: the path to match, already expanded
+# proj_out:      the expanded `[project].work`
+# v:             the template values
+# ret:           the index into `m.steps` of the first producing step, or -1; err
+#                when a step output does not expand
+fun step_producing_out(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+    expanded_path: str, proj_out: str, v: *template.Values) res[i64, fail.Fail] {
+    var si: u32 = 0;
+    for (si < m.step_count) {
+        val s:  *StepDef = ?m.steps[si];
+        var oi: u32      = 0;
+        for (oi < s.out_count) {
+            val res_exp: res[str, fail.Fail] = template.path_expand(alloc, intern.text(itn, s.out[oi]), template.CONTEXT_PATH, proj_out, v, "a build step output");
+            if (sel res_exp.err) { ret res[i64, fail.Fail].err{res_exp.err}; }
+            val eq: bool = str_equals(res_exp.ok, expanded_path);
+            str_free(alloc, res_exp.ok);
+            if (eq) { ret res[i64, fail.Fail].ok{si::i64}; }
+            oi = oi + 1;
+        }
+        si = si + 1;
+    }
+    ret res[i64, fail.Fail].ok{-1};
+}
+
+# whether the build makes a path for target `t`: some build step's output, or the output of
+# an artifact built for `t`, as a shared library an executable of the project links
+pub fun local_path_demanded(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, t: *TargetDef,
+    expanded_path: str, proj_out: str, v: *template.Values) res[bool, fail.Fail] {
+    val res_step_producing_out: res[i64, fail.Fail] = step_producing_out(alloc, itn, m, expanded_path, proj_out, v);
+    if (sel res_step_producing_out.err) { ret res[bool, fail.Fail].err{res_step_producing_out.err}; }
+    if (res_step_producing_out.ok >= 0) { ret res[bool, fail.Fail].ok{true}; }
+    var i: u32 = 0;
+    for (i < m.artifact_count) {
+        val a: *ArtifactDef = ?m.artifacts[i];
+        i = i + 1;
+        if (!artifact_supports_target(itn, a, t.name)) { cnt; }
+        if (intern.str_is_nil(a.out))                  { cnt; }
+        val res_out: res[str, fail.Fail] = expand_artifact_output(alloc, itn, a, proj_out, v);
+        if (sel res_out.err) { ret res[bool, fail.Fail].err{res_out.err}; }
+        val eq: bool = str_equals(res_out.ok, expanded_path);
+        str_free(alloc, res_out.ok);
+        if (eq) { ret res[bool, fail.Fail].ok{true}; }
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+# whether a required artifact is built for a target when its consumer builds for
+# `consumer_target`: only that target when `req` supports it, otherwise every
+# target `req` supports
+# ---
+# itn:             resolves the names
+# req:             the required artifact
+# consumer_target: the consumer's target name, or STR_NIL for a consumer outside
+#                  `req`'s manifest, which admits every target `req` supports
+# t:               the target asked about
+# ret:             true when `req` is built for `t` on behalf of that consumer
+pub fun required_artifact_uses_target(itn: *intern.Interner, req: *ArtifactDef,
+    consumer_target: intern.StrId, t: *TargetDef) bool {
+    if (!intern.str_is_nil(consumer_target) && artifact_supports_target(itn, req, consumer_target)) {
+        ret intern.str_same(t.name, consumer_target);
+    }
+    ret artifact_supports_target(itn, req, t.name);
+}
+
+# how many declared targets `required_artifact_uses_target` admits for a requirement
+fun required_artifact_target_count(itn: *intern.Interner, m: *Manifest, req: *ArtifactDef,
+    consumer_target: intern.StrId) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < m.target_count) {
+        if (required_artifact_uses_target(itn, req, consumer_target, ?m.targets[i])) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun artifact_out_for_target(alloc: *A.Allocator, itn: *intern.Interner, s: *Scope,
+    a: *ArtifactDef, t: *TargetDef, profile: str) res[str, fail.Fail] {
+    var v: template.Values = template.values_of(itn, t, profile);
+
+    val res_proj_out: res[str, fail.Fail] = expand_project_work(alloc, itn, s.root, ?v);
+    if (sel res_proj_out.err) { ret res_proj_out; }
+    val proj_out: str = res_proj_out.ok;
+    fin { str_free(alloc, proj_out); }
+
+    ret scoped_artifact_output(alloc, itn, s, a, proj_out, ?v);
+}
+
+# whether any artifact's `need` selects `ra`
+# ---
+# itn: resolves the names
+# m:   the manifest
+# ra:  the candidate requirement
+# ret: true when some other artifact needs it
+fun artifact_required_by_any(itn: *intern.Interner, m: *Manifest, ra: *ArtifactDef) bool {
+    var i: u32 = 0;
+    for (i < m.artifact_count) {
+        if (artifact_needs_artifact(itn, ?m.artifacts[i], ra)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether the export library selects `ra` in its `need`: the requirements a
+# dependency's export library carries to every consumer
+# ---
+# itn: resolves the names
+# m:   the manifest
+# ra:  the candidate requirement
+# ret: true when the artifact marked `export = true` needs it
+pub fun export_requires(itn: *intern.Interner, m: *Manifest, ra: *ArtifactDef) bool {
+    val a: *ArtifactDef = export_artifact(m);
+    ret a != nil && artifact_needs_artifact(itn, a, ra);
+}
+
+# which artifacts a requirement list names
+def ReqSource: u8;
+
+# the artifacts one consumer artifact needs
+val REQS_OF_CONSUMER: ReqSource = 0;
+# every artifact some artifact needs; the editor's union of every artifact
+val REQS_OF_PROJECT: ReqSource = 1;
+# the artifacts the export library needs; a dependency's export surface
+val REQS_OF_EXPORT: ReqSource = 2;
+
+fun req_selected(itn: *intern.Interner, m: *Manifest, consumer: *ArtifactDef,
+    ra: *ArtifactDef, source: ReqSource) bool {
+    if (source == REQS_OF_PROJECT) { ret artifact_required_by_any(itn, m, ra); }
+    if (source == REQS_OF_EXPORT)  { ret export_requires(itn, m, ra); }
+    if (consumer == nil)           { ret false; }
+    ret artifact_needs_artifact(itn, consumer, ra);
+}
+
+# list the artifacts a consumer requires, each with its output path when that
+# path is unique, for `{artifact.<id>.out}` expansion
+# ---
+# alloc:           owns the returned array and each non-empty `out` string
+# itn:             resolves names
+# s:               the scope; the requirements are declared by `s.owner`
+# consumer:        the requiring artifact; nil with `whole_project` false yields nothing
+# consumer_target: the consumer's target name
+# profile:         the profile name the outputs expand with
+# whole_project:   select every artifact some artifact needs instead of `consumer`'s
+# out_items:       receives the array, or nil when nothing is required
+# out_count:       receives its length
+# ret:             ok; err from the output path expansion, with the array freed
+pub fun resolve_artifact_reqs(alloc: *A.Allocator, itn: *intern.Interner, s: *Scope,
+    consumer: *ArtifactDef, consumer_target: intern.StrId, profile: str,
+    whole_project: bool,
+    out_items: **template.Requirement, out_count: *u32) err[fail.Fail] {
+    @out_items = nil;
+    @out_count = 0;
+    if (consumer == nil && !whole_project) { ret err[fail.Fail].ok{}; }
+    var source: ReqSource = REQS_OF_CONSUMER;
+    if (whole_project) { source = REQS_OF_PROJECT; }
+    ret collect_artifact_reqs(alloc, itn, s, consumer, consumer_target, profile, source, out_items, out_count);
+}
+
+# list the artifacts a dependency's export library requires, the scope
+# `{artifact.<id>.out}` resolves in for that dependency's modules. each requirement
+# builds for every target it names in the dependency's manifest
+# ---
+# alloc:     owns the returned array and each non-empty `out` string
+# itn:       resolves names
+# s:         a dependency scope
+# profile:   the root's profile name the outputs expand with
+# out_items: receives the array, or nil when nothing is required
+# out_count: receives its length
+# ret:       ok; err from the output path expansion, with the array freed
+pub fun resolve_export_reqs(alloc: *A.Allocator, itn: *intern.Interner, s: *Scope, profile: str, out_items: **template.Requirement, out_count: *u32) err[fail.Fail] {
+    @out_items = nil;
+    @out_count = 0;
+    ret collect_artifact_reqs(alloc, itn, s, nil, intern.STR_NIL, profile, REQS_OF_EXPORT,
+        out_items, out_count);
+}
+
+fun collect_artifact_reqs(alloc: *A.Allocator, itn: *intern.Interner, s: *Scope,
+    consumer: *ArtifactDef, consumer_target: intern.StrId, profile: str, source: ReqSource,
+    out_items: **template.Requirement, out_count: *u32) err[fail.Fail] {
+    val m: *Manifest = s.owner;
+    if (m.artifact_count == 0) { ret err[fail.Fail].ok{}; }
+
+    var n: u32 = 0;
+    var j: u32 = 0;
+    for (j < m.artifact_count) {
+        if (req_selected(itn, m, consumer, ?m.artifacts[j], source)) { n = n + 1; }
+        j = j + 1;
+    }
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+
+    val res_allocate: res[*template.Requirement, A.Error] = A.allocate[template.Requirement](alloc, n::usize);
+    if (sel res_allocate.err) { ret err[fail.Fail].err{fail.refused(res_allocate.err)}; }
+    val items: *template.Requirement = res_allocate.ok;
+
+    var w: u32 = 0;
+    j = 0;
+    for (j < m.artifact_count) {
+        val ra: *ArtifactDef = ?m.artifacts[j];
+        if (req_selected(itn, m, consumer, ra, source)) {
+            var item: template.Requirement;
+            item.name    = intern.text(itn, ra.name);
+            item.out     = "";
+            item.objects = intern.str_is_nil(ra.out);
+            if (!item.objects && required_artifact_target_count(itn, m, ra, consumer_target) == 1) {
+                var ti: u32 = 0;
+                for (ti < m.target_count) {
+                    if (required_artifact_uses_target(itn, ra, consumer_target, ?m.targets[ti])) {
+                        val res_artifact_out_for_target: res[str, fail.Fail] = artifact_out_for_target(alloc, itn, s, ra, ?m.targets[ti], profile);
+                        if (sel res_artifact_out_for_target.err) {
+                            var prior: u32 = 0;
+                            for (prior < w) {
+                                if (!str_is_empty(items[prior].out)) { str_free(alloc, items[prior].out); }
+                                prior = prior + 1;
+                            }
+                            A.deallocate[template.Requirement](alloc, items, n::usize);
+                            ret err[fail.Fail].err{res_artifact_out_for_target.err};
+                        }
+                        item.out = res_artifact_out_for_target.ok;
+                        brk;
+                    }
+                    ti = ti + 1;
+                }
+            }
+            items[w] = item;
+            w        = w + 1;
+        }
+        j = j + 1;
+    }
+    @out_items = items;
+    @out_count = w;
+    ret err[fail.Fail].ok{};
+}
+
+# order the build steps the named artifacts demand: a step producing a local
+# link path that matches the target, every step a `need` names (globs match
+# step names), and transitively each step's own `need`, dependencies first
+# ---
+# alloc:     owns the returned order
+# itn:       resolves names
+# m:         the manifest
+# art_names: the artifacts to plan for; unknown names are skipped
+# art_count: length of `art_names`
+# t:         the target
+# proj_out:  the expanded `[project].work`
+# v:         the template values
+# out_order: receives the step indices in run order, sized exactly; nil when none
+# out_count: receives the length
+# ret:       ok; err on a step `need` cycle or a local link path that fails to expand
+pub fun plan_steps(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+    art_names: *intern.StrId, art_count: u32, t: *TargetDef,
+    proj_out: str, v: *template.Values,
+    out_order: **u32, out_count: *u32) err[fail.Fail] {
+    var seeds: Vector[Seed] = collections_vector.init[Seed](alloc);
+    fin { collections_vector.dnit[Seed](?seeds); }
+    var ai: u32 = 0;
+    for (ai < art_count) {
+        val a: *ArtifactDef = find_artifact_by_name(m, art_names[ai]);
+        ai = ai + 1;
+        if (a == nil) { cnt; }
+        var li: u32 = 0;
+        for (li < a.link_count) {
+            val l: *LinkDef = find_link_by_name(m, a.link[li]);
+            if (l != nil) {
+                val err_added: err[fail.Fail] = seed_add(?seeds, Seed{link: l, artifact: nil});
+                if (sel err_added.err) { ret err_added; }
+            }
+            li = li + 1;
+        }
+        val err_added: err[fail.Fail] = seed_add(?seeds, Seed{link: nil, artifact: a});
+        if (sel err_added.err) { ret err_added; }
+    }
+    ret steps_from(alloc, itn, m, ?seeds, t, proj_out, v, out_order, out_count);
+}
+
+# order the build steps that produce an exported local link path matching the
+# target and the steps the export library's `need` names, with their
+# transitive step `need`s; the steps a consumer of this manifest must run
+# ---
+# alloc:     owns the returned order
+# itn:       resolves names
+# m:         the manifest
+# t:         the target
+# proj_out:  the expanded `[project].work`
+# v:         the template values
+# out_order: receives the step indices in run order, sized exactly; nil when none
+# out_count: receives the length
+# ret:       ok; the `plan_steps` errors
+pub fun plan_export_steps(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+    t: *TargetDef, proj_out: str, v: *template.Values,
+    out_order: **u32, out_count: *u32) err[fail.Fail] {
+    var seeds: Vector[Seed] = collections_vector.init[Seed](alloc);
+    fin { collections_vector.dnit[Seed](?seeds); }
+    var li: u32 = 0;
+    for (li < m.link_count) {
+        if (m.links[li].export) {
+            val err_added: err[fail.Fail] = seed_add(?seeds, Seed{link: ?m.links[li], artifact: nil});
+            if (sel err_added.err) { ret err_added; }
+        }
+        li = li + 1;
+    }
+    var ai: u32 = 0;
+    for (ai < m.artifact_count) {
+        val a: *ArtifactDef = ?m.artifacts[ai];
+        if (a.is_export) {
+            val err_added: err[fail.Fail] = seed_add(?seeds, Seed{link: nil, artifact: a});
+            if (sel err_added.err) { ret err_added; }
+        }
+        ai = ai + 1;
+    }
+    ret steps_from(alloc, itn, m, ?seeds, t, proj_out, v, out_order, out_count);
+}
+
+# where a step plan starts: a link whose local path a step may produce, or an
+# artifact whose `need` names steps; exactly one is set
+rec Seed {
+    link:     *LinkDef;
+    artifact: *ArtifactDef;
+}
+
+fun seed_add(seeds: *Vector[Seed], seed: Seed) err[fail.Fail] {
+    val res_pushed: res[usize, A.Error] = collections_vector.push[Seed](seeds, seed);
+    if (sel res_pushed.err) { ret err[fail.Fail].err{fail.refused(res_pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the one step planner: walk the need graph from the step producing each seed
+# link's local path for the target and from each step a seed artifact's `need`
+# names, and order the steps reached, each after the steps it needs
+fun steps_from(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, seeds: *Vector[Seed],
+    t: *TargetDef, proj_out: str, v: *template.Values,
+    out_order: **u32, out_count: *u32) err[fail.Fail] {
+    @out_order = nil;
+    @out_count = 0;
+    if (m.step_count == 0) { ret err[fail.Fail].ok{}; }
+    val res_walk_init: res[need.Walk, fail.Fail] = need.walk_init(alloc, itn, m);
+    if (sel res_walk_init.err) { ret err[fail.Fail].err{res_walk_init.err}; }
+    var w: need.Walk = res_walk_init.ok;
+    fin { need.walk_dnit(?w); }
+
+    var i: usize = 0;
+    for (i < seeds.len) {
+        val seed:        Seed           = seeds.data[i];
+        var err_visited: err[fail.Fail] = err[fail.Fail].ok{};
+        if (seed.link != nil)    { err_visited = link_seed_visit(alloc, itn, m, ?w, seed.link, t, proj_out, v); }
+        or                       { err_visited = artifact_seed_visit(itn, m, ?w, seed.artifact); }
+        if (sel err_visited.err) { ret err_visited; }
+        i = i + 1;
+    }
+
+    if (w.order.len == 0) { ret err[fail.Fail].ok{}; }
+    val res_allocate: res[*u32, A.Error] = A.allocate[u32](alloc, w.order.len);
+    if (sel res_allocate.err) { ret err[fail.Fail].err{fail.refused(res_allocate.err)}; }
+    var k: usize = 0;
+    for (k < w.order.len) {
+        res_allocate.ok[k] = w.order.data[k].index;
+        k                  = k + 1;
+    }
+    @out_order = res_allocate.ok;
+    @out_count = w.order.len::u32;
+    ret err[fail.Fail].ok{};
+}
+
+# visit the step producing `l`'s local path for `t`, when one does
+fun link_seed_visit(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, w: *need.Walk, l: *LinkDef,
+    t: *TargetDef, proj_out: str, v: *template.Values) err[fail.Fail] {
+    if (l.source != LINK_LOCAL || !link_matches_target(itn, l, t)) { ret err[fail.Fail].ok{}; }
+    val res_exp: res[str, fail.Fail] = expand_local_path(alloc, itn, l, proj_out, v);
+    if (sel res_exp.err) { ret err[fail.Fail].err{res_exp.err}; }
+    val res_sidx: res[i64, fail.Fail] = step_producing_out(alloc, itn, m, res_exp.ok, proj_out, v);
+    str_free(alloc, res_exp.ok);
+    if (sel res_sidx.err) { ret err[fail.Fail].err{res_sidx.err}; }
+    if (res_sidx.ok < 0)  { ret err[fail.Fail].ok{}; }
+    ret need.visit(w, need.step_node(res_sidx.ok::u32));
+}
+
+# visit every step a `need` entry of `a` selects
+fun artifact_seed_visit(itn: *intern.Interner, m: *Manifest, w: *need.Walk, a: *ArtifactDef) err[fail.Fail] {
+    var ni: u32 = 0;
+    for (ni < a.need_count) {
+        var si: u32 = 0;
+        for (si < m.step_count) {
+            if (need.selects(itn, a.need[ni], need.CATEGORY_STEP, m.steps[si].name)) {
+                val err_visited: err[fail.Fail] = need.visit(w, need.step_node(si));
+                if (sel err_visited.err) { ret err_visited; }
+            }
+            si = si + 1;
+        }
+        ni = ni + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# resolve one cell into a `BuildUnit`. the cell names its artifact; with no
+# target named, an artifact that supports exactly one declared target, or exactly
+# one host-matching target, pins it, except that a sole hosted target the host
+# cannot run is refused as `native` refuses it; otherwise `native` resolution
+# applies. the profile comes from `resolve_profile`, and every path is expanded
+# through the template engine
+# ---
+# alloc: owns `libs` and temporary strings
+# itn:   interns the expanded paths
+# m:     the manifest
+# c:     the cell, as `resolve_cells` resolves it or as `cell_of` names it
+# ret:   the unit; err from target or profile resolution, for an artifact the
+#        manifest does not declare, when the artifact does not support the target
+#        (naming the artifact's targets when none was selected), or from path expansion
+pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, c: *Cell) res[BuildUnit, fail.Fail] {
+    var s: Scope = root_scope(m);
+    ret resolve_scoped_build_unit(alloc, itn, ?s, c);
+}
+
+# `resolve_build_unit` for a cell of `s`: target, artifact and links resolve in
+# `s.owner`, the profile and `[project].work` in `s.root`, and `{project.work}` in
+# the artifact output names the scope's artifact root
+# ---
+# alloc: owns `libs` and temporary strings
+# itn:   interns the expanded paths
+# s:     the scope
+# c:     the cell, naming a target and an artifact of `s.owner` and a profile of `s.root`
+# ret:   as `resolve_build_unit`
+pub fun resolve_scoped_build_unit(alloc: *A.Allocator, itn: *intern.Interner, s: *Scope, c: *Cell) res[BuildUnit, fail.Fail] {
+    val m: *Manifest    = s.owner;
+    val a: *ArtifactDef = find_artifact(itn, m, c.artifact);
+    if (a == nil) {
+        ret res[BuildUnit, fail.Fail].err{refuse(alloc, diagnostic_kind.SELECTION_UNKNOWN, "mach.toml: no artifact named '{}'", c.artifact)};
+    }
+
+    val res_target: res[ResolvedTarget, fail.Fail] = resolve_target(alloc, itn, m, c.target, a);
+    if (sel res_target.err) { ret res[BuildUnit, fail.Fail].err{res_target.err}; }
+    val rt: ResolvedTarget = res_target.ok;
+
+    val res_profile: res[ResolvedProfile, fail.Fail] = resolve_profile(alloc, itn, s.root, c.profile);
+    if (sel res_profile.err) { ret res[BuildUnit, fail.Fail].err{res_profile.err}; }
+    val rp: ResolvedProfile = res_profile.ok;
+
+    if (!artifact_supports_target(itn, a, rt.target.name)) {
+        val art_name: str = intern.text(itn, a.name);
+        if (str_is_empty(c.target)) {
+            val res_names: res[str, fail.Fail] = artifact_target_names(alloc, itn, m, a);
+            if (sel res_names.err) { ret res[BuildUnit, fail.Fail].err{res_names.err}; }
+            ret res[BuildUnit, fail.Fail].err{fail.at(refuse(alloc, diagnostic_kind.SELECTION_UNSUPPORTED_TARGET,
+                "mach.toml: artifact '{}' declares no target for this host; select one with -t ({})", art_name, res_names.ok), a.targets_at)};
+        }
+        ret res[BuildUnit, fail.Fail].err{fail.at(refuse(alloc, diagnostic_kind.SELECTION_UNSUPPORTED_TARGET,
+            "mach.toml: artifact '{}' does not support target '{}'", art_name, intern.text(itn, rt.target.name)), a.targets_at)};
+    }
+
+    var u: BuildUnit;
+    u.target       = rt.target;
+    u.artifact     = a;
+    u.target_name  = rt.target.name;
+    u.profile_name = rp.name;
+    u.optimize     = rp.optimize;
+    u.debug        = rp.debug;
+    u.simd         = rp.simd;
+    u.entry        = a.entry;
+
+    var v: template.Values = template.values_of(itn, rt.target, intern.text(itn, rp.name));
+
+    val res_project_work: res[str, fail.Fail] = expand_project_work(alloc, itn, s.root, ?v);
+    if (sel res_project_work.err) { ret res[BuildUnit, fail.Fail].err{res_project_work.err}; }
+    val proj_out: str = res_project_work.ok;
+    fin { str_free(alloc, proj_out); }
+
+    val err_libs: err[fail.Fail] = unit_libs(alloc, itn, m, a, rt.target, proj_out, ?v, ?u);
+    if (sel err_libs.err) { ret res[BuildUnit, fail.Fail].err{err_libs.err}; }
+    var handed: bool = false;
+    fin {
+        if (!handed) { link_claims_dnit(alloc, u.libs, u.lib_count); }
+    }
+
+    val res_out_root: res[intern.StrId, fail.Fail] = id_of(itn, proj_out);
+    if (sel res_out_root.err) { ret res[BuildUnit, fail.Fail].err{res_out_root.err}; }
+    u.out_root = res_out_root.ok;
+
+    # an object artifact delivers no one file, its objects staying under obj/
+    u.bin_path = intern.STR_NIL;
+    if (!intern.str_is_nil(a.out)) {
+        val res_bin_alloc: res[str, fail.Fail] = scoped_artifact_output(alloc, itn, s, a, proj_out, ?v);
+        if (sel res_bin_alloc.err) { ret res[BuildUnit, fail.Fail].err{res_bin_alloc.err}; }
+        val res_bin: res[intern.StrId, fail.Fail] = id_of(itn, res_bin_alloc.ok);
+        str_free(alloc, res_bin_alloc.ok);
+        if (sel res_bin.err) { ret res[BuildUnit, fail.Fail].err{res_bin.err}; }
+        u.bin_path = res_bin.ok;
+    }
+    handed = true;
+    ret res[BuildUnit, fail.Fail].ok{u};
+}
+
+# the artifact's `link` entries that match the target, resolved in order into
+# `u.libs`, sized exactly; a name no `[link.*]` declares is skipped
+fun unit_libs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, a: *ArtifactDef, t: *TargetDef,
+    proj_out: str, v: *template.Values, u: *BuildUnit) err[fail.Fail] {
+    u.libs      = nil;
+    u.lib_count = 0;
+    if (a.link_count == 0) { ret err[fail.Fail].ok{}; }
+    val res_match_arr: res[*LinkRequirement, A.Error] = A.allocate[LinkRequirement](alloc, a.link_count::usize);
+    if (sel res_match_arr.err) { ret err[fail.Fail].err{fail.refused(res_match_arr.err)}; }
+    val matched: *LinkRequirement = res_match_arr.ok;
+    var count:   u32              = 0;
+    var li:      u32              = 0;
+    for (li < a.link_count) {
+        val l: *LinkDef = find_link_by_name(m, a.link[li]);
+        li = li + 1;
+        if (l == nil || !link_matches_target(itn, l, t)) { cnt; }
+        val res_req: res[LinkRequirement, fail.Fail] = link_requirement(alloc, itn, l, proj_out, v);
+        if (sel res_req.err) {
+            link_claims_dnit(alloc, matched, count);
+            A.deallocate[LinkRequirement](alloc, matched, a.link_count::usize);
+            ret err[fail.Fail].err{res_req.err};
+        }
+        matched[count] = res_req.ok;
+        count          = count + 1;
+    }
+    ret finish_link_requirements(alloc, matched, a.link_count, count, ?u.libs, ?u.lib_count);
+}
+
+# an artifact's output: its expanded `out`, with `{project.work}` naming the
+# scope's artifact root. a dependency's output must lie under that root: a path
+# beside it would write into the consuming project's own tree
+fun scoped_artifact_output(alloc: *A.Allocator, itn: *intern.Interner, s: *Scope,
+    a: *ArtifactDef, proj_out: str, v: *template.Values) res[str, fail.Fail] {
+    val res_art_root: res[str, fail.Fail] = scope_artifact_root(alloc, itn, s, proj_out);
+    if (sel res_art_root.err) { ret res_art_root; }
+    fin { str_free(alloc, res_art_root.ok); }
+    val res_out: res[str, fail.Fail] = expand_artifact_output(alloc, itn, a, res_art_root.ok, v);
+    if (sel res_out.err)         { ret res_out; }
+    if (!scope_is_dependency(s)) { ret res_out; }
+    val path: str   = res_out.ok;
+    val n:    usize = str_len(res_art_root.ok);
+    if (str_len(path) > n && str_starts_with(path, res_art_root.ok) && path[n] == '/') { ret res_out; }
+    val refused: fail.Fail = fail.at(refuse(alloc, diagnostic_kind.MANIFEST_PATH,
+        "mach.toml: artifact '{}' of dependency '{}' writes '{}' outside its build output; a dependency's artifact out begins with {{project.work}}",
+        intern.text(itn, a.name), intern.text(itn, s.owner.id), path), a.out_at);
+    str_free(alloc, path);
+    ret res[str, fail.Fail].err{refused};
+}
+
+# reject two artifacts whose `out` expands to the same path under one set of
+# template values
+# ---
+# alloc: owns temporary strings
+# itn:   resolves names
+# m:     the manifest; fewer than two artifacts always pass
+# v:     the template values
+# ret:   ok; err "mach.toml: artifacts 'a' and 'b' collide on output path '<p>'",
+#        or an expansion error
+pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+    v: *template.Values) err[fail.Fail] {
+    if (m.artifact_count < 2) { ret err[fail.Fail].ok{}; }
+    val res_target_id: res[intern.StrId, fail.Fail] = id_of(itn, v.target);
+    if (sel res_target_id.err) { ret err[fail.Fail].err{res_target_id.err}; }
+
+    val res_paths: res[*str, A.Error] = A.allocate[str](alloc, m.artifact_count::usize);
+    if (sel res_paths.err) { ret err[fail.Fail].err{fail.refused(res_paths.err)}; }
+    val paths: *str = res_paths.ok;
+    var i:     u32  = 0;
+    for (i < m.artifact_count) {
+        paths[i] = nil;
+        i        = i + 1;
+    }
+    fin {
+        free_path_strings(alloc, paths, m.artifact_count);
+        A.deallocate[str](alloc, paths, m.artifact_count::usize);
+    }
+
+    val res_project_work: res[str, fail.Fail] = expand_project_work(alloc, itn, m, v);
+    if (sel res_project_work.err) { ret err[fail.Fail].err{res_project_work.err}; }
+    val proj_out: str = res_project_work.ok;
+    fin { str_free(alloc, proj_out); }
+
+    i = 0;
+    for (i < m.artifact_count) {
+        val a: *ArtifactDef = ?m.artifacts[i];
+        i = i + 1;
+        if (!artifact_supports_target(itn, a, res_target_id.ok)) { cnt; }
+        if (intern.str_is_nil(a.out))                            { cnt; }
+        val res_art_out: res[str, fail.Fail] = expand_artifact_output(alloc, itn, a, proj_out, v);
+        if (sel res_art_out.err) { ret err[fail.Fail].err{res_art_out.err}; }
+        paths[i - 1] = res_art_out.ok;
+    }
+
+    i = 0;
+    for (i < m.artifact_count) {
+        var j: u32 = i + 1;
+        for (j < m.artifact_count) {
+            if (paths[i] != nil && paths[j] != nil && str_equals(paths[i], paths[j])) {
+                var claims: Sites = sites_init(alloc);
+                sites_add(?claims, m.artifacts[i].out_at);
+                sites_add(?claims, m.artifacts[j].out_at);
+                ret err[fail.Fail].err{sites_fail(alloc, ?claims, refuse(alloc, diagnostic_kind.OUTPUT_COLLISION,
+                    "mach.toml: artifacts '{}' and '{}' collide on output path '{}'", intern.text(itn, m.artifacts[i].name), intern.text(itn, m.artifacts[j].name), paths[i]))};
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}

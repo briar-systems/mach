@@ -1,0 +1,821 @@
+use std.system.panic.panic;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use types_string: std.types.string;
+use std.types.string.str;
+use std.types.string.str_is_empty;
+
+use A: std.allocator;
+
+use mach.base.diagnostic;
+use mach.base.fail;
+use mach.base.handle;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.base.source.provider.disk;
+use mach.base.source.provider.overlay;
+use mach.compile.backend;
+use mach.compile.cache.compiler;
+use cache_instances: mach.compile.cache.instances;
+use cache_objects:   mach.compile.cache.objects;
+use cache_record:    mach.compile.cache.record;
+use mach.compile.demand;
+use mach.compile.request;
+use comptime_scope: mach.front.comptime.scope;
+use mach.front.expect;
+use front_load:    mach.front.load;
+use lower_context: mach.lower.context;
+use mach.lower.linkage;
+use manifest_link:  mach.manifest.link;
+use manifest_model: mach.manifest.model;
+use manifest_plan:  mach.manifest.plan;
+use mach.manifest.template;
+use mach.report.readout;
+use mach.session;
+use mach.session.module;
+use mach.session.query;
+use mach.target.resolved;
+use mink.catalog.output.Spelled;
+use mink.model.object.Object;
+use collections_vector: std.collections.vector;
+
+pub def RootSet: u8;
+
+pub val ROOT_ARTIFACT: RootSet = 0;
+
+pub val ROOT_UNION: RootSet = 1;
+
+pub rec TargetEntry {
+    name:          intern.StrId;
+    os_name:       intern.StrId;
+    isa_name:      intern.StrId;
+    abi_name:      intern.StrId;
+    of_name:       intern.StrId;
+    platform_name: intern.StrId;
+    # the declared target the entry selects, with every key the manifest states
+    declared:   manifest_model.TargetDef;
+    entrypoint: intern.StrId;
+    # where the artifact's `entry` is written in the manifest
+    entry_at: base_source.Location;
+    # the artifact's kind, as mink's output kinds spell it
+    kind: Spelled;
+    # the name of the artifact's `linkage`, nil for the target's default, and where it was
+    # written
+    linkage:      intern.StrId;
+    linkage_from: manifest_model.Origin;
+    # the selected profile's `optimize`
+    optimize:  bool;
+    libs:      *manifest_link.LinkRequirement;
+    lib_count: u32;
+}
+
+# the target entry a selected build unit describes: the one place a TargetEntry is
+# built, so every field is carried wherever an entry is made
+pub fun target_entry_of(bu: *manifest_plan.BuildUnit) TargetEntry {
+    ret TargetEntry{
+        name:          bu.target_name,
+        os_name:       bu.target.sys,
+        isa_name:      bu.target.arch,
+        abi_name:      bu.target.abi,
+        of_name:       bu.target.of,
+        platform_name: bu.target.platform,
+        declared:      @bu.target,
+        entrypoint:    bu.entry,
+        entry_at:      bu.artifact.entry_at,
+        kind:          bu.artifact.kind,
+        linkage:       bu.artifact.linkage,
+        linkage_from:  bu.artifact.linkage_from,
+        optimize:      bu.optimize,
+        libs:          bu.libs,
+        lib_count:     bu.lib_count,
+    };
+}
+
+pub rec DepEntry {
+    alias:           intern.StrId;
+    project_id:      intern.StrId;
+    project_dir_src: intern.StrId;
+    vendor_root:     intern.StrId;
+    source:          intern.StrId;
+    ref:             intern.StrId;
+    chain:           intern.StrId;
+    root_declared:   bool;
+    # the project each of its dependency declarations reaches, nil for one
+    # left out as never realized
+    direct:       *intern.StrId;
+    direct_count: u32;
+    manifest:     manifest_model.Manifest;
+}
+
+# a root manifest's located dependency closure: every dependency realized under
+# dep/, its manifest read once, and its direct edges. a plan locates it once and
+# every cell it configures borrows it; a project configured without one locates
+# and owns its own
+# ---
+# alloc: owns the entries, their manifests and their edges
+pub rec Closure {
+    alloc: *A.Allocator;
+    deps:  *DepEntry;
+    count: u32;
+}
+
+# a closure that holds no dependency
+pub fun closure_init(alloc: *A.Allocator) Closure {
+    ret Closure{alloc: alloc, deps: nil, count: 0};
+}
+
+pub fun closure_dnit(c: *Closure) {
+    dep_entries_dnit(c.alloc, c.deps, c.count, c.count::usize);
+    c.deps  = nil;
+    c.count = 0;
+}
+
+# what a configured build cell compiles and where it writes
+# ---
+# project_root:     the directory of the project that declares the cell: the root
+#                   project, or for a dependency's cell the dependency's realization
+# home_root:        the root project's directory; `project_work` is rooted here
+# owner:            the dependency that declares the cell, as the closure holds it;
+#                   meaningful only with `dependency_owned`
+# dependency_owned: the cell is a requirement of a dependency's default library
+#                   artifacts, built for the root project
+# closure:          the closure this project located itself, when it was configured
+#                   without one to borrow; empty otherwise
+# deps:             the realized closure the cell compiles against: the root's whole
+#                   closure, or a dependency cell's own transitive closure. the array
+#                   is the project's, each entry borrowed from the closure
+# art_reqs:         the requirements of the cell's artifact, in its declaring manifest
+# req_scopes:       one requirement scope per project the cell compiles, the declaring
+#                   project's first
+pub rec ProjectConfig {
+    id:           intern.StrId;
+    version:      intern.StrId;
+    bin_name:     intern.StrId;
+    icon:         intern.StrId;
+    app_manifest: intern.StrId;
+    # the cell's artifact as its manifest declares it, borrowed, nil for a cell of none
+    artifact:          *manifest_model.ArtifactDef;
+    module:            intern.StrId;
+    dir_src:           intern.StrId;
+    project_root:      intern.StrId;
+    home_root:         intern.StrId;
+    owner:             DepEntry;
+    dependency_owned:  bool;
+    closure:           Closure;
+    targets:           *TargetEntry;
+    target_count:      u32;
+    deps:              *DepEntry;
+    dep_count:         u32;
+    cascade_libs:      *manifest_link.LinkRequirement;
+    cascade_lib_count: u32;
+    profile:           intern.StrId;
+    project_work:      intern.StrId;
+    steps:             *manifest_model.StepDef;
+    step_count:        u32;
+    step_order:        *u32;
+    step_order_count:  u32;
+    art_reqs:          *template.Requirement;
+    art_req_count:     u32;
+    req_scopes:        *template.Requirements;
+    req_scope_count:   u32;
+}
+
+# an artifact entry the union walk loads: the entry module, the artifact it is of and
+# where the artifact's `entry` is written in the manifest
+pub rec ArtifactEntry {
+    fqn:      intern.StrId;
+    artifact: intern.StrId;
+    at:       base_source.Location;
+}
+
+# a module the project loaded: its identity, what the load decided for it, and the codegen
+# staging of its objects. its front-end products are the query engine's, keyed by its file and
+# its stable id, and read through mach.compile.frontend
+pub rec ModuleEntry {
+    fqn:     intern.StrId;
+    file_id: base_source.FileId;
+    unit:    *lower_context.Unit;
+    object:  *Object;
+    # where its step writes mirl's text of the module, "" for nowhere
+    ir_output: str;
+    # where its step writes masc's listing of the module's object, "" for nowhere
+    asm_output:    str;
+    staged:        *Object;
+    staged_facts:  cache_record.Facts;
+    record:        Record;
+    cache_checked: bool;
+    cache_hit:     bool;
+    cache_under:   [32]u8;
+    # the key this load built for the module's object, when it has one. the key
+    # leaves the module's tests out, so the digest of its whole source keys its
+    # test object and says whether the object's recorded warnings still stand
+    cache_key:     [32]u8;
+    cache_keyed:   bool;
+    source_digest: [32]u8;
+    # what the module's readers' keys read of it, beside cache_key (compile/cache, key_module):
+    # surface_digest its importers', template_digest an instance's of its declaring module.
+    # placed_digest is the digest of where the module's file puts its template text, which says
+    # whether places recorded in the file still stand
+    surface_digest:  [32]u8;
+    template_digest: [32]u8;
+    placed_digest:   [32]u8;
+    # the module's object is reused, its record stands for its whole source, and nothing the
+    # build compiles imports it, so the build does not ask for its front end: its record stands
+    # in for its demand and its front end's warnings, which `recorded` holds. something that must
+    # be rebuilt from its typed form can still have it typed
+    frontend_skipped: bool;
+    recorded:         diagnostic.DiagnosticStore;
+    recorded_held:    bool;
+    stable_id:        module.StableModuleId;
+    # what the load decided for the module and the imports it records
+    load: front_load.Module;
+    # the scope lowering binds the module's constants in, once a lowering made it
+    lower_scope:  comptime_scope.ComptimeCtx;
+    lower_scoped: bool;
+    # where the module's `#[expect]` declarations stand, read once per parse of it
+    expects: expect.Index;
+    test:    TestObject;
+    # its front-end products were given back once it was lowered, and its expectations,
+    # collected then, are what a later refresh reads of it
+    released:     bool;
+    held_expects: collections_vector.Vector[diagnostic.Expectation];
+}
+
+# the cache record a compiled object carries into `obj/`, nil until the cache publishes one
+pub rec Record {
+    bytes: *u8;
+    len:   u32;
+}
+
+# give back a record's bytes
+pub fun record_dnit(p: *Project, r: *Record) {
+    if (r.bytes != nil) { A.deallocate[u8](p.s.alloc, r.bytes, r.len::usize); }
+    r.bytes = nil;
+    r.len   = 0;
+}
+
+# a module's test object, beside its normal object and never changing it: the
+# module's tests and what they reach that the normal object does not define. the
+# fields mirror the normal object's on ModuleEntry
+pub rec TestObject {
+    unit:          *lower_context.Unit;
+    object:        *Object;
+    staged:        *Object;
+    staged_facts:  cache_record.Facts;
+    record:        Record;
+    cache_checked: bool;
+    cache_hit:     bool;
+    cache_under:   [32]u8;
+}
+
+# an instance unit the build compiles (compile/demand): its key, its origin and bucket, its name,
+# where its step writes its text and listing, and its object and facts as its codegen product
+# holds them, borrowed like a module's
+# ---
+# name:       `<origin>#instances.<bucket>`, which reports and readout rows name it by
+# ir_output:  where its step writes mirl's text of it, nil for nowhere; owned by the project
+# asm_output: where its step writes masc's listing of it, nil for nowhere; owned by the project
+pub rec InstanceUnit {
+    key:        u64;
+    origin:     module.ModuleId;
+    bucket:     u32;
+    name:       intern.StrId;
+    ir_output:  str;
+    asm_output: str;
+    unit:       *lower_context.Unit;
+    object:     *Object;
+    # the key this load built for the unit's object, when every module its members read is
+    # keyed, and the object `obj/` held under it, staged for the unit's codegen product
+    object_key:   [32]u8;
+    keyed:        bool;
+    hit:          bool;
+    staged:       *Object;
+    staged_facts: cache_record.Facts;
+    record:       Record;
+}
+
+# ---
+# since:          the first query operation this project ran; a product read between its
+#                 operations counts only when one of them reached it
+# context_digest: the fingerprint of the build context, once frozen
+# context_frozen: the build context is frozen, so a change to it is refused
+pub rec Project {
+    s:            *session.Session;
+    alloc:        *A.Allocator;
+    req:          request.BuildRequest;
+    queries:      query.QueryRuntime[Project];
+    diags:        diagnostic.DiagnosticStore;
+    config:       ProjectConfig;
+    target_entry: *TargetEntry;
+    target:       resolved.Target;
+    # mirl's target for the cell and mink's formats, which compile and link the build
+    back: backend.Back;
+
+    union_entries:     *ArtifactEntry;
+    union_entry_count: u32;
+
+    # the entries of artifacts this target does not build, loaded so the modules only they
+    # reach are known and left out of the compiled set
+    foreign_entries:     *ArtifactEntry;
+    foreign_entry_count: u32;
+
+    compiler_name: intern.StrId;
+    compiler_ver:  intern.StrId;
+    # the modules are keyed and `obj/` is read under those keys, until the next load
+    cache_ready: bool;
+    # the configuration digest every key this load built shares
+    cache_config:                  [32]u8;
+    compiler_identity:             compiler.Identity;
+    compiler_identity_initialized: bool;
+    compiler_identity_available:   bool;
+    cache_hits:                    u32;
+    cache_misses:                  u32;
+    # the build cell's obj directory, borrowed from its plan: where each
+    # module's object is written and where the object cache reads it back
+    object_dir: str;
+    # the cell's compiler-only state directory, `<out>/.cache`, borrowed from
+    # its plan: where the object cache keeps its digest memo
+    cache_dir: str;
+    # the cell's expanded `[project].work`, borrowed from its plan: the build
+    # owns the layout beneath it
+    out_dir: str;
+
+    modules: handle.StableChunks[ModuleEntry];
+    # the front end's load over the cell's packages, read through the session's open buffers
+    loader:  front_load.Loader;
+    disk:    disk.Disk;
+    overlay: overlay.Overlay;
+
+    topo:     *module.ModuleId;
+    topo_len: u32;
+    topo_cap: u32;
+
+    lower_visit_gen:   *u32;
+    lower_visit_cap:   u32;
+    lower_visit_epoch: u32;
+
+    emit_len: u32;
+    # the instance units the build compiles, ordered by origin name and bucket, the link's order
+    # after the modules; set by each codegen operation from the build's instance demand
+    units: collections_vector.Vector[InstanceUnit];
+    # every instance the build's demand met, described for its typing
+    instances: demand.Registry;
+    # the cell's instance records as this load read and judged them (compile/cache)
+    instance_records: cache_instances.Store;
+    # the digests of the objects the cell's builds wrote into `obj/` (compile/cache/objects)
+    object_digests: cache_objects.Store;
+    # the cell's ir and asm directories, borrowed from its plan, where an instance unit's text
+    # and listing go when the build emits them
+    ir_dir:  str;
+    asm_dir: str;
+
+    roots: RootSet;
+
+    # what the load declares about linkage and the link phase offers the linker
+    linkage: linkage.Linkage;
+
+    # the unit's phase rows, nil when nothing reads them
+    progress: *readout.Progress;
+
+    since:          u64;
+    context_digest: [32]u8;
+    context_frozen: bool;
+
+    # what the link stage writes and how, set by the build for the span of its link stage
+    link: *LinkJob;
+    # the digest of the link configuration this build published, which the link's key reads,
+    # and whether the link takes an input found by name, whose file no key covers
+    link_config:       [32]u8;
+    link_config_keyed: bool;
+    link_by_name:      bool;
+}
+
+# the link a build asks of its link stage: the artifact it writes and the action that writes it
+# from the stage's current objects. the stage decides whether it runs
+# ---
+# artifact: the path the action writes, whose bytes the stage records
+# ctx:      the build's state the action reads
+# run:      writes `artifact`, reporting what the link tells of itself to the store it is given,
+#           answering what the link read
+pub rec LinkJob {
+    artifact: str;
+    ctx:      ptr;
+    run:      fun(ptr, *Project, *diagnostic.DiagnosticStore) res[backend.LinkRead, fail.Fail];
+}
+
+# the name an `ext` symbol links by: its source name, which the object format's
+# writer spells as the format names a C symbol
+# the name a C symbol `bare` takes in the target's objects: the prefix mink's
+# registry gives a C symbol of the target's format on its architecture, then `bare`
+pub fun link_name_for(p: *Project, bare: intern.StrId) res[intern.StrId, fail.Fail] {
+    if (!resolved.is_selected(?p.target)) {
+        ret res[intern.StrId, fail.Fail].err{fail.message("internal: link name needs a resolved target")};
+    }
+    val res_prefix: res[str, fail.Fail] = backend.c_prefix(?p.back, p.s.build_alloc);
+    if (sel res_prefix.err)          { ret res[intern.StrId, fail.Fail].err{res_prefix.err}; }
+    if (str_is_empty(res_prefix.ok)) { ret res[intern.StrId, fail.Fail].ok{bare}; }
+
+    val opt_bare: opt[str] = intern.get(?p.s.interner, bare);
+    if (sel opt_bare.none) {
+        ret res[intern.StrId, fail.Fail].err{fail.message("internal: link name source is not interned")};
+    }
+    val res_joined: res[str, types_string.StrError] = types_string.str_join(p.s.build_alloc, res_prefix.ok, opt_bare.some);
+    if (sel res_joined.err) {
+        ret res[intern.StrId, fail.Fail].err{fail.str_refused(res_joined.err)};
+    }
+    val joined:             str                        = res_joined.ok;
+    val res_interner_added: res[intern.StrId, A.Error] = intern.add(?p.s.interner, joined);
+    str_free(p.s.build_alloc, joined);
+    if (sel res_interner_added.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(res_interner_added.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{res_interner_added.ok};
+}
+
+# a staged object is the project's until a query takes it, and `object` is borrowed
+pub fun staged_dnit(p: *Project, m: *ModuleEntry) {
+    if (m.staged != nil) {
+        backend.object_dnit(m.staged);
+        A.deallocate[Object](p.s.alloc, m.staged, 1);
+        m.staged = nil;
+    }
+    cache_record.facts_dnit(p.s.alloc, ?m.staged_facts);
+    m.cache_checked = false;
+    m.cache_hit     = false;
+}
+
+pub fun staged_test_dnit(p: *Project, m: *ModuleEntry) {
+    val t: *TestObject = ?m.test;
+    if (t.staged != nil) {
+        backend.object_dnit(t.staged);
+        A.deallocate[Object](p.s.alloc, t.staged, 1);
+        t.staged = nil;
+    }
+    cache_record.facts_dnit(p.s.alloc, ?t.staged_facts);
+    t.cache_checked = false;
+    t.cache_hit     = false;
+}
+
+pub fun all_staged_dnit(p: *Project) {
+    var i: u32 = 0;
+    for (i < module_count(p)) {
+        staged_dnit(p, module_at(p, i));
+        staged_test_dnit(p, module_at(p, i));
+        i = i + 1;
+    }
+}
+
+# a restored product stays staged across operations: it is keyed by the key
+# it was read under and the next load discards it if that changed. a freshly
+# generated image staged by a codegen worker belongs to the operation that
+# generated it and leaves with it
+pub fun fresh_staged_dnit(p: *Project) {
+    var i: u32 = 0;
+    for (i < module_count(p)) {
+        val m: *ModuleEntry = module_at(p, i);
+        if (m.staged != nil && !m.cache_hit)           { staged_dnit(p, m); }
+        if (m.test.staged != nil && !m.test.cache_hit) { staged_test_dnit(p, m); }
+        i = i + 1;
+    }
+}
+
+# forget the instance units, giving back the paths, staged objects and records the project owns
+# of them; their objects are their codegen products'
+pub fun units_clear(p: *Project) {
+    var i: usize = 0;
+    for (i < p.units.len) {
+        val u: *InstanceUnit = ?p.units.data[i];
+        if (u.ir_output != nil)  { str_free(p.alloc, u.ir_output); }
+        if (u.asm_output != nil) { str_free(p.alloc, u.asm_output); }
+        if (u.staged != nil) {
+            backend.object_dnit(u.staged);
+            A.deallocate[Object](p.s.alloc, u.staged, 1);
+        }
+        cache_record.facts_dnit(p.s.alloc, ?u.staged_facts);
+        record_dnit(p, ?u.record);
+        i = i + 1;
+    }
+    collections_vector.truncate[InstanceUnit](?p.units, 0);
+}
+
+# give back the front end's warnings a module's record held
+pub fun recorded_dnit(m: *ModuleEntry) {
+    if (m.recorded_held) { diagnostic.store_dnit(?m.recorded); }
+    m.recorded_held = false;
+}
+
+# release the scope lowering bound a module's constants in
+pub fun lower_scope_dnit(m: *ModuleEntry) {
+    if (m.lower_scoped) { comptime_scope.dnit(?m.lower_scope); }
+    m.lower_scoped = false;
+}
+
+# release a project and everything it owns; a nil project holds nothing
+pub fun dnit_project(p: *Project) {
+    if (p == nil) { ret; }
+    fresh_staged_dnit(p);
+    all_staged_dnit(p);
+    var i: u32 = 0;
+    for (i < module_count(p)) {
+        val m: *ModuleEntry = module_at(p, i);
+        lower_scope_dnit(m);
+        record_dnit(p, ?m.record);
+        record_dnit(p, ?m.test.record);
+        recorded_dnit(m);
+        expect.index_dnit(?m.expects);
+        if (m.released) { collections_vector.dnit[diagnostic.Expectation](?m.held_expects); }
+        front_load.module_dnit(p.alloc, ?m.load);
+        i = i + 1;
+    }
+    units_clear(p);
+    collections_vector.dnit[InstanceUnit](?p.units);
+    demand.registry_dnit(?p.instances);
+    cache_instances.dnit(?p.instance_records);
+    cache_objects.dnit(?p.object_digests);
+    handle.chunk_dnit[ModuleEntry](?p.modules);
+    if (p.topo != nil && p.topo_cap > 0) {
+        A.deallocate[module.ModuleId](p.alloc, p.topo, p.topo_cap::usize);
+    }
+    if (p.lower_visit_gen != nil && p.lower_visit_cap > 0) {
+        A.deallocate[u32](p.alloc, p.lower_visit_gen, p.lower_visit_cap::usize);
+    }
+    if (p.union_entries != nil && p.union_entry_count > 0) {
+        A.deallocate[ArtifactEntry](p.alloc, p.union_entries, p.union_entry_count::usize);
+    }
+    if (p.foreign_entries != nil && p.foreign_entry_count > 0) {
+        A.deallocate[ArtifactEntry](p.alloc, p.foreign_entries, p.foreign_entry_count::usize);
+    }
+    front_load.dnit(?p.loader);
+    disk.dnit(?p.disk);
+    diagnostic.store_dnit(?p.diags);
+    deallocate_config(?p.config, p.alloc);
+    linkage.dnit(?p.linkage);
+    backend.dnit(p.alloc, ?p.back);
+
+    session.expire_views(p.s);
+    module.reset_module_registry(?p.s.modules);
+}
+
+# attribute what the project's phases report directly, outside a query, to the
+# phase now running: both the project's store and the session's
+pub fun set_origin(p: *Project, o: diagnostic.Origin) {
+    diagnostic.set_origin(?p.diags, o);
+    diagnostic.set_origin(?p.s.diags, o);
+}
+
+pub fun init_project(p: *Project, s: *session.Session) {
+    query.presented_dnit(?s.queries);
+    diagnostic.store_dnit(?s.diags);
+    s.diags               = diagnostic.store_init(s.alloc);
+    p.s                   = s;
+    p.alloc               = s.build_alloc;
+    p.req                 = request.defaults();
+    p.back                = backend.none();
+    p.queries             = query.QueryRuntime[Project]{db: ?s.queries};
+    p.since               = s.queries.operation_sequence + 1;
+    p.context_frozen      = false;
+    p.link                = nil;
+    p.diags               = diagnostic.store_init(p.alloc);
+    p.linkage             = linkage.init(p.alloc);
+    p.target_entry        = nil;
+    p.union_entries       = nil;
+    p.union_entry_count   = 0;
+    p.foreign_entries     = nil;
+    p.foreign_entry_count = 0;
+    p.target              = resolved.none();
+    p.compiler_name       = intern.STR_NIL;
+    p.compiler_ver        = intern.STR_NIL;
+    compiler.identity_clear(?p.compiler_identity);
+    p.cache_ready                   = false;
+    p.compiler_identity_initialized = false;
+    p.compiler_identity_available   = false;
+    p.cache_hits                    = 0;
+    p.cache_misses                  = 0;
+    p.object_dir                    = nil;
+    p.cache_dir                     = nil;
+    p.out_dir                       = nil;
+    p.ir_dir                        = nil;
+    p.asm_dir                       = nil;
+    p.units                         = collections_vector.init[InstanceUnit](p.alloc);
+    p.instances                     = demand.registry_init(p.alloc);
+    p.instance_records              = cache_instances.init(p.alloc);
+    p.object_digests                = cache_objects.init(p.alloc);
+    p.config.id                     = intern.STR_NIL;
+    p.config.version                = intern.STR_NIL;
+    p.config.bin_name               = intern.STR_NIL;
+    p.config.icon                   = intern.STR_NIL;
+    p.config.app_manifest           = intern.STR_NIL;
+    p.config.artifact               = nil;
+    p.config.module                 = intern.STR_NIL;
+    p.config.targets                = nil;
+    p.config.target_count           = 0;
+    p.config.closure                = closure_init(p.alloc);
+    p.config.deps                   = nil;
+    p.config.dep_count              = 0;
+    p.config.cascade_libs           = nil;
+    p.config.cascade_lib_count      = 0;
+    p.config.art_reqs               = nil;
+    p.config.art_req_count          = 0;
+    p.config.req_scopes             = nil;
+    p.config.req_scope_count        = 0;
+    p.config.home_root              = intern.STR_NIL;
+    p.config.dependency_owned       = false;
+    p.modules                       = handle.chunk_init[ModuleEntry](p.alloc);
+    p.loader                        = front_load.init(s, p.alloc);
+    p.disk                          = disk.init(p.alloc, ?s.interner);
+    p.topo                          = nil;
+    p.topo_len                      = 0;
+    p.topo_cap                      = 0;
+    p.lower_visit_gen               = nil;
+    p.lower_visit_cap               = 0;
+    p.lower_visit_epoch             = 0;
+    p.emit_len                      = 0;
+    p.roots                         = ROOT_ARTIFACT;
+    p.progress                      = nil;
+    set_origin(p, diagnostic.ORIGIN_BUILD);
+}
+
+fun deallocate_config(c: *ProjectConfig, alloc: *A.Allocator) {
+    if (c.targets != nil && c.target_count > 0) {
+        var i: u32 = 0;
+        for (i < c.target_count) {
+            val te: *TargetEntry = ?c.targets[i];
+            if (te.libs != nil && te.lib_count > 0) {
+                manifest_link.link_claims_dnit(alloc, te.libs, te.lib_count);
+                A.deallocate[manifest_link.LinkRequirement](alloc, te.libs, te.lib_count::usize);
+            }
+            i = i + 1;
+        }
+        A.deallocate[TargetEntry](alloc, c.targets, c.target_count::usize);
+    }
+    if (c.deps != nil && c.dep_count > 0) { A.deallocate[DepEntry](alloc, c.deps, c.dep_count::usize); }
+    if (c.cascade_libs != nil && c.cascade_lib_count > 0) {
+        manifest_link.link_claims_dnit(alloc, c.cascade_libs, c.cascade_lib_count);
+        A.deallocate[manifest_link.LinkRequirement](alloc, c.cascade_libs, c.cascade_lib_count::usize);
+    }
+    if (c.steps != nil && c.step_count > 0) {
+        var si: u32 = 0;
+        for (si < c.step_count) {
+            manifest_model.step_dnit(alloc, ?c.steps[si]);
+            si = si + 1;
+        }
+        A.deallocate[manifest_model.StepDef](alloc, c.steps, c.step_count::usize);
+    }
+    if (c.step_order != nil && c.step_order_count > 0) {
+        A.deallocate[u32](alloc, c.step_order, c.step_order_count::usize);
+    }
+    artifact_reqs_dnit(alloc, c.art_reqs, c.art_req_count);
+    if (c.req_scopes != nil && c.req_scope_count > 0) {
+        var si: u32 = 0;
+        for (si < c.req_scope_count) {
+            if (c.req_scopes[si].dependency) {
+                artifact_reqs_dnit(alloc, c.req_scopes[si].reqs, c.req_scopes[si].req_count);
+            }
+            si = si + 1;
+        }
+        A.deallocate[template.Requirements](alloc, c.req_scopes, c.req_scope_count::usize);
+    }
+    closure_dnit(?c.closure);
+    c.dependency_owned  = false;
+    c.req_scopes        = nil;
+    c.req_scope_count   = 0;
+    c.art_reqs          = nil;
+    c.art_req_count     = 0;
+    c.targets           = nil;
+    c.target_count      = 0;
+    c.deps              = nil;
+    c.dep_count         = 0;
+    c.cascade_libs      = nil;
+    c.cascade_lib_count = 0;
+    c.steps             = nil;
+    c.step_count        = 0;
+    c.step_order        = nil;
+    c.step_order_count  = 0;
+}
+
+# release `count` dependency entries and their array of `capacity`; a nil array owns
+# nothing
+pub fun dep_entries_dnit(alloc: *A.Allocator, deps: *DepEntry, count: u32, capacity: usize) {
+    if (deps == nil) { ret; }
+    var i: u32 = 0;
+    for (i < count) {
+        if (deps[i].direct != nil && deps[i].direct_count > 0) {
+            A.deallocate[intern.StrId](alloc, deps[i].direct, deps[i].direct_count::usize);
+        }
+        manifest_model.dnit(?deps[i].manifest, alloc);
+        i = i + 1;
+    }
+    A.deallocate[DepEntry](alloc, deps, capacity);
+}
+
+# release `count` artifact requirements; an empty list owns nothing
+fun artifact_reqs_dnit(alloc: *A.Allocator, reqs: *template.Requirement, count: u32) {
+    if (reqs == nil || count == 0) { ret; }
+    var ri: u32 = 0;
+    for (ri < count) {
+        if (!str_is_empty(reqs[ri].out)) { str_free(alloc, reqs[ri].out); }
+        ri = ri + 1;
+    }
+    A.deallocate[template.Requirement](alloc, reqs, count::usize);
+}
+
+# the module loaded under `fqn`, nil when none is
+pub fun module_named(p: *Project, fqn: str) module.ModuleId {
+    val res_interner_added: res[intern.StrId, A.Error] = intern.add(?p.s.interner, fqn);
+    if (sel res_interner_added.err) { ret module.MODULE_NIL; }
+    val opt_found: opt[module.ModuleId] = front_load.module_find(?p.loader, res_interner_added.ok);
+    if (sel opt_found.none) { ret module.MODULE_NIL; }
+    ret opt_found.some;
+}
+
+# the loaded module count; the next ModuleId to be issued
+pub fun module_count(p: *Project) u32 {
+    ret handle.chunk_count[ModuleEntry](?p.modules)::u32;
+}
+
+# the entry behind a ModuleId the project has issued
+#
+# the store is a handle.StableChunks: an entry is written once into a fixed
+# chunk and never moves, so the pointer stays valid until dnit_project however
+# many modules load after it. total: an id the project never issued stops the
+# compiler
+pub fun module_at(p: *Project, mid: u32) *ModuleEntry {
+    val opt_slot: opt[*ModuleEntry] = handle.chunk_at[ModuleEntry](?p.modules, mid::usize);
+    if (sel opt_slot.some) { ret opt_slot.some; }
+    panic("project: module index is past the loaded modules\n");
+    ret nil;
+}
+
+fun store_fail(e: handle.Error) fail.Fail {
+    if (sel e.alloc) { ret fail.refused(e.alloc); }
+    ret fail.message(handle.text(e));
+}
+
+# make room for one more entry so the next module_append cannot fail
+pub fun module_reserve(p: *Project) err[fail.Fail] {
+    if (module_count(p) >= module.BUFFER_BASE) { ret err[fail.Fail].err{fail.message("a project numbers at most 2^31 modules")}; }
+    val res_editor: res[handle.ChunkEditor[ModuleEntry], handle.Error] = handle.chunk_editor[ModuleEntry](?p.modules);
+    if (sel res_editor.err) { ret err[fail.Fail].err{store_fail(res_editor.err)}; }
+    var editor: handle.ChunkEditor[ModuleEntry] = res_editor.ok;
+    fin { handle.chunk_editor_finish[ModuleEntry](?editor); }
+    val err_grown: err[handle.Error] = handle.chunk_grow[ModuleEntry](?editor, 1);
+    if (sel err_grown.err) { ret err[fail.Fail].err{store_fail(err_grown.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# publish an entry under the next ModuleId into the slot module_reserve made.
+# total: a caller that reserved nothing first stops the compiler
+pub fun module_append(p: *Project, m: ModuleEntry) module.ModuleId {
+    val mid:        module.ModuleId                                    = module.id(module_count(p));
+    val res_editor: res[handle.ChunkEditor[ModuleEntry], handle.Error] = handle.chunk_editor[ModuleEntry](?p.modules);
+    if (sel res_editor.err) {
+        panic("project: module_append while the module table is being edited\n");
+        ret mid;
+    }
+    var editor: handle.ChunkEditor[ModuleEntry] = res_editor.ok;
+    fin { handle.chunk_editor_finish[ModuleEntry](?editor); }
+    val res_placed: res[*ModuleEntry, handle.Error] = handle.chunk_append[ModuleEntry](?editor, m);
+    if (sel res_placed.err) { panic("project: reserved module slot refused the append\n"); }
+    ret mid;
+}
+
+# how many modules a loaded module imports
+pub fun dep_count(m: *ModuleEntry) u32 {
+    ret m.load.deps.len::u32;
+}
+
+# the module a loaded module imports at `i`, as its load record names it
+pub fun dep_at(p: *Project, m: *ModuleEntry, i: u32) module.ModuleId {
+    ret front_load.module_of(?p.loader, m.load.deps.data[i::usize]);
+}
+
+# the entry loaded under a fully qualified name
+#
+# the returned `*ModuleEntry` is stable until dnit_project: the store never
+# moves an entry when more modules load, so a holder may keep it across a
+# nested load and read the same entry afterwards
+pub fun module_by_fqn(p: *Project, fqn: intern.StrId) opt[*ModuleEntry] {
+    val opt_module_find: opt[module.ModuleId] = front_load.module_find(?p.loader, fqn);
+    if (sel opt_module_find.none) { ret opt[*ModuleEntry].none{}; }
+    val mid: module.ModuleId = opt_module_find.some;
+    if (mid::u32 >= module_count(p)) { ret opt[*ModuleEntry].none{}; }
+    ret opt[*ModuleEntry].some{module_at(p, mid::u32)};
+}
+
+# the loaded module a source file backs, by a scan of the module table: editor edits
+# arrive as file ids and the table is small beside the work a refresh saves
+# ---
+# p:   the project
+# fid: the file
+# ret: the module's id, or none when no loaded module reads that file
+pub fun module_by_file(p: *Project, fid: base_source.FileId) opt[module.ModuleId] {
+    var i: u32 = 0;
+    for (i < module_count(p)) {
+        if (base_source.file_same(module_at(p, i).file_id, fid)) { ret opt[module.ModuleId].some{i::module.ModuleId}; }
+        i = i + 1;
+    }
+    ret opt[module.ModuleId].none{};
+}

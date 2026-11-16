@@ -15,7 +15,7 @@ list: the diagnostics, rendered in order; nothing is written when it is empty
 ## fun flush_sources
 
 ```mach
-pub fun flush_sources(out: *io_writer.Writer, sources: *lang_source.SourceMap, list: *diagnostic.DiagnosticStore);
+pub fun flush_sources(out: *io_writer.Writer, sources: *base_source.SourceMap, list: *diagnostic.DiagnosticStore);
 ```
 
 render every diagnostic of a store to a writer, then an "N errors / M warnings" line
@@ -27,7 +27,7 @@ list: the diagnostics, rendered in order; nothing is written when it is empty
 ## fun report_store
 
 ```mach
-pub fun report_store(r: *Report, sources: *lang_source.SourceMap, list: *diagnostic.DiagnosticStore);
+pub fun report_store(r: *Report, sources: *base_source.SourceMap, list: *diagnostic.DiagnosticStore);
 ```
 
 render every diagnostic of a store through a command's report: as text with its tally line,
@@ -40,7 +40,7 @@ list: the diagnostics, in order
 ## fun render_fail
 
 ```mach
-pub fun render_fail(sources: *lang_source.SourceMap, f: *fail.Fail) i64;
+pub fun render_fail(sources: *base_source.SourceMap, f: *fail.Fail) i64;
 ```
 
 print a Fail to stderr as the diagnostic it reads as, and map it to an exit code
@@ -53,7 +53,7 @@ ret: the exit code `exit.of` maps the failure to
 ## fun refuse
 
 ```mach
-pub fun refuse(sources: *lang_source.SourceMap, f: fail.Fail) i64;
+pub fun refuse(sources: *base_source.SourceMap, f: fail.Fail) i64;
 ```
 
 render_fail for a failure built in place

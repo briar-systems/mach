@@ -1,0 +1,969 @@
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_is_empty;
+
+use A:          std.allocator;
+use fs:         std.filesystem;
+use types_path: std.types.path;
+
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+
+use mach.base.diagnostic;
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.compile.request;
+use mach.front.ast;
+use front_load: mach.front.load;
+use mach.lower.linkage;
+use mach.report.readout;
+use mach.session;
+use mach.session.query;
+
+use base_catalog: mach.base.catalog;
+use mach.base.fail;
+use mach.base.source.provider.overlay;
+use mach.compile.cache;
+use compile_closure: mach.compile.closure;
+use mach.compile.config;
+use mach.compile.context;
+use mach.compile.declared;
+use mach.compile.frontend;
+use compile_load: mach.compile.load;
+use mach.compile.passes;
+use mach.compile.project;
+use manifest_load:   mach.manifest.load;
+use manifest_model:  mach.manifest.model;
+use manifest_select: mach.manifest.select;
+use report_phase:    mach.report.phase;
+use mach.session.module;
+use io_error:     std.io.error;
+use system_os:    std.system.os;
+use types_string: std.types.string;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+# each module's product of one kind, keyed as the kind's owner says: a file-keyed kind by the
+# module's file, a module-keyed one by its stable id (a normal object's back-half key). a module
+# whose front end the build skipped has only its parse and its restored object
+fun append_phase_roots(p: *project.Project, roots: *Vector[query.QueryKey],
+    kind: *query.Kind, count: u32) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < count) {
+        val m: *project.ModuleEntry = project.module_at(p, p.topo[i]::u32);
+        if (m.frontend_skipped && kind != ?frontend.PARSE && kind != ?passes.CODEGEN) {
+            i = i + 1;
+            cnt;
+        }
+        var key: u64 = module.stable_index(m.stable_id)::u64;
+        if (kind.owner == query.KEY_FILE) { key = base_source.file_index(m.file_id)::u64; }
+        val res_added: res[usize, A.Error] = collections_vector.push[query.QueryKey](roots, query.QueryKey{kind: kind, key: key});
+        if (sel res_added.err) {
+            ret err[fail.Fail].err{fail.refused(res_added.err)};
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun append_frontend_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[fail.Fail] {
+    val err_parsed: err[fail.Fail] = append_phase_roots(p, roots, ?frontend.PARSE, p.topo_len);
+    if (sel err_parsed.err) { ret err_parsed; }
+    val err_resolved: err[fail.Fail] = append_phase_roots(p, roots, ?frontend.RESOLVE, p.topo_len);
+    if (sel err_resolved.err) { ret err_resolved; }
+    val err_typed: err[fail.Fail] = append_phase_roots(p, roots, ?frontend.SEMA, p.topo_len);
+    if (sel err_typed.err) { ret err_typed; }
+    # the instances every module asks for, typed and reported once the modules are
+    val res_demanded: res[usize, A.Error] = collections_vector.push[query.QueryKey](roots, query.QueryKey{kind: ?passes.INSTANCE_DEMAND, key: 0});
+    if (sel res_demanded.err) { ret err[fail.Fail].err{fail.refused(res_demanded.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the front end's roots, and each emitted module's lowering and object and each instance unit's.
+# a lowering reports what lowering it found, which its object's product does not hold
+fun append_codegen_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[fail.Fail] {
+    val err_frontend: err[fail.Fail] = append_frontend_roots(p, roots);
+    if (sel err_frontend.err) { ret err_frontend; }
+    val err_lowered: err[fail.Fail] = append_phase_roots(p, roots, ?passes.LOWER, p.emit_len);
+    if (sel err_lowered.err) { ret err_lowered; }
+    val err_emitted: err[fail.Fail] = append_phase_roots(p, roots, ?passes.CODEGEN, p.emit_len);
+    if (sel err_emitted.err) { ret err_emitted; }
+    ret append_unit_roots(p, roots);
+}
+
+# the codegen roots and each test object's lowering and codegen
+pub fun append_test_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[fail.Fail] {
+    val err_backend: err[fail.Fail] = append_codegen_roots(p, roots);
+    if (sel err_backend.err) { ret err_backend; }
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val m: *project.ModuleEntry = project.module_at(p, p.topo[i]::u32);
+        if (passes.has_test_object(p, m)) {
+            val res_lowered: res[usize, A.Error] = collections_vector.push[query.QueryKey](roots, query.QueryKey{kind: ?passes.LOWER, key: passes.test_key_for(m)});
+            if (sel res_lowered.err) { ret err[fail.Fail].err{fail.refused(res_lowered.err)}; }
+            val res_emitted: res[usize, A.Error] = collections_vector.push[query.QueryKey](roots, query.QueryKey{kind: ?passes.CODEGEN, key: passes.test_key_for(m)});
+            if (sel res_emitted.err) { ret err[fail.Fail].err{fail.refused(res_emitted.err)}; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the codegen roots and the link
+fun append_link_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[fail.Fail] {
+    val err_backend: err[fail.Fail] = append_codegen_roots(p, roots);
+    if (sel err_backend.err) { ret err_backend; }
+    val res_linked: res[usize, A.Error] = collections_vector.push[query.QueryKey](roots, query.QueryKey{kind: ?passes.LINK, key: 0});
+    if (sel res_linked.err) { ret err[fail.Fail].err{fail.refused(res_linked.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun append_unit_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < p.units.len) {
+        val res_lowered: res[usize, A.Error] = collections_vector.push[query.QueryKey](roots, query.QueryKey{kind: ?passes.UNIT_LOWER, key: p.units.data[i].key});
+        if (sel res_lowered.err) { ret err[fail.Fail].err{fail.refused(res_lowered.err)}; }
+        val res_added: res[usize, A.Error] = collections_vector.push[query.QueryKey](roots, query.QueryKey{kind: ?passes.UNIT_CODEGEN, key: p.units.data[i].key});
+        if (sel res_added.err) { ret err[fail.Fail].err{fail.refused(res_added.err)}; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# one query operation running `run`, whose diagnostics are those of the products `rooted` names
+# once it ran: only running a pass says which units the build has and which modules' front ends
+# it ran
+fun run_query_pass(p: *project.Project, rooted: fun(*project.Project, *Vector[query.QueryKey]) err[fail.Fail],
+    run: fun(*project.Project) err[fail.Fail]) err[fail.Fail] {
+    val res_begun: res[query.Operation, fail.Fail] = frontend.begin_query_phase(p);
+    if (sel res_begun.err) {
+        ret err[fail.Fail].err{res_begun.err};
+    }
+    var err_run: err[fail.Fail]         = run(p);
+    var roots:   Vector[query.QueryKey] = collections_vector.init[query.QueryKey](p.alloc);
+    fin { collections_vector.dnit[query.QueryKey](?roots); }
+    val err_named: err[fail.Fail] = rooted(p, ?roots);
+    val ran:       bool           = sel err_run.ok;
+    if (ran) { err_run = err_named; }
+    ret frontend.finish_query_phase(p, res_begun.ok, roots.data, roots.len, err_run);
+}
+
+# a phase the query engine does not run is published as one it does: the
+# project's diagnostics are refreshed beside its result
+pub fun phase_finish(p: *project.Project,
+    result: err[fail.Fail]) err[fail.Fail] {
+    val err_refreshed: err[fail.Fail] = frontend.refresh_diagnostics(p);
+    if (sel err_refreshed.err) {
+        diagnostic.note_lost(?p.diags);
+        diagnostic.note_lost(?p.s.diags);
+        if (sel result.ok) { ret err_refreshed; }
+    }
+    ret result;
+}
+
+# a loaded project under another request from its host: the build context is frozen again, so
+# what read the old one is computed again, and nothing reads a context no freeze captured
+pub fun reconfigure(p: *project.Project, req: request.BuildRequest) err[fail.Fail] {
+    p.req = req;
+    ret context.freeze(p);
+}
+
+# a project that failed is released, its failure kept where the session presents it
+fun project_failure(p: *project.Project, failure: fail.Fail) res[project.Project, fail.Fail] {
+    var lost:   bool      = false;
+    val stable: fail.Fail = query.hold_failure(?p.s.queries, failure, ?lost);
+    if (lost) { diagnostic.note_lost(?p.diags); }
+    val err_published: err[fail.Fail] = phase_finish(p, err[fail.Fail].err{stable});
+    project.dnit_project(p);
+    if (sel err_published.err) { ret res[project.Project, fail.Fail].err{err_published.err}; }
+    ret res[project.Project, fail.Fail].err{stable};
+}
+
+pub fun run_sema_pass(p: *project.Project) err[fail.Fail] {
+    project.set_origin(p, diagnostic.ORIGIN_SEMA);
+    ret run_query_pass(p, append_frontend_roots, passes.run_sema_pass);
+}
+
+# the codegen stage: each emitted module and instance unit lowered and compiled, or its object
+# restored from `obj/`
+pub fun run_codegen_pass(p: *project.Project) err[fail.Fail] {
+    project.set_origin(p, diagnostic.ORIGIN_CODEGEN);
+    val err_prepared: err[fail.Fail] = passes.prepare_codegen_pass(p);
+    if (sel err_prepared.err) { ret err_prepared; }
+    ret run_query_pass(p, append_codegen_roots, passes.run_codegen_pass);
+}
+
+# the test stage: each test object, lowered against its module's normal object
+pub fun run_test_pass(p: *project.Project) err[fail.Fail] {
+    project.set_origin(p, diagnostic.ORIGIN_CODEGEN);
+    ret run_query_pass(p, append_test_roots, passes.run_test_pass);
+}
+
+# the link stage: the artifact `job` names, written by its action only when an input of the
+# link moved since it last ran or the artifact on disk is not the one it wrote. a build that
+# compiled nothing leaves the artifact as it is when the cell's link record says this link wrote
+# the bytes it holds (compile/cache)
+pub fun run_link_pass(p: *project.Project, job: *project.LinkJob) err[fail.Fail] {
+    project.set_origin(p, diagnostic.ORIGIN_LINK);
+    val res_stands: res[bool, fail.Fail] = cache.link_stands(p, job.artifact);
+    if (sel res_stands.err) { ret err[fail.Fail].err{res_stands.err}; }
+    if (res_stands.ok)      { ret err[fail.Fail].ok{}; }
+    val err_prepared: err[fail.Fail] = passes.prepare_link(p, job.artifact);
+    if (sel err_prepared.err) { ret err_prepared; }
+    p.link = job;
+    fin { p.link = nil; }
+    ret run_query_pass(p, append_link_roots, passes.run_link_pass);
+}
+
+# locate a root manifest's dependency closure with no build cell configured, as a
+# build locates it: every dependency under dep/, its manifest and its direct
+# edges, and nothing is checked against git or the pins
+# ---
+# s:            the session; its build allocator owns the closure
+# m:            the root manifest
+# project_root: the root project's directory
+# unrealized:   what a dependency nothing is realized for is
+# ret:          the closure, released with `project.closure_dnit`
+pub fun closure_locate(s: *session.Session, m: *manifest_model.Manifest, project_root: str,
+    unrealized: compile_closure.Unrealized) res[project.Closure, fail.Fail] {
+    ret closure_of(s, m, project_root, nil, unrealized);
+}
+
+# locate a root manifest's dependency closure as `closure_locate` does, holding every edge
+# to `check` as it is located, as `mach dep verify` does
+# ---
+# check: what each located edge is held to
+# ret:   the closure; err naming the first edge that does not locate or does not hold
+pub fun closure_checked(s: *session.Session, m: *manifest_model.Manifest, project_root: str,
+    check: *compile_closure.Check) res[project.Closure, fail.Fail] {
+    ret closure_of(s, m, project_root, check, compile_closure.UNREALIZED_REFUSED);
+}
+
+fun closure_of(s: *session.Session, m: *manifest_model.Manifest, project_root: str,
+    check: *compile_closure.Check, unrealized: compile_closure.Unrealized) res[project.Closure, fail.Fail] {
+    ret compile_closure.locate(s, s.build_alloc, m, project_root, check, unrealized);
+}
+
+# begin the build the request names: every goal, a test goal included, loads the
+# selected artifact's closure
+# ---
+# m:       the root manifest the cell was planned from
+# closure: `m`'s closure as the plan located it, which the project borrows
+pub fun begin_build(s: *session.Session, m: *manifest_model.Manifest, closure: *project.Closure, req: *request.BuildRequest,
+    progress: *readout.Progress) res[project.Project, fail.Fail] {
+    ret begin_build_roots(s, m, closure, req, progress, project.ROOT_ARTIFACT);
+}
+
+fun begin_build_roots(s: *session.Session, m: *manifest_model.Manifest, closure: *project.Closure, req: *request.BuildRequest,
+    progress: *readout.Progress, roots: project.RootSet) res[project.Project, fail.Fail] {
+    val res_cell: res[manifest_select.Cell, fail.Fail] = request_cell(s, m, req);
+    if (sel res_cell.err) { ret res[project.Project, fail.Fail].err{res_cell.err}; }
+    var c: manifest_select.Cell = res_cell.ok;
+    ret begin_build_impl(s, ?c, m, closure, req, progress, roots);
+}
+
+# the cell a request names: a dependency's cell exactly as its plan named it, and
+# a root cell resolved from the request's names, so a request naming no artifact
+# takes the one the default selection holds
+fun request_cell(s: *session.Session, m: *manifest_model.Manifest, req: *request.BuildRequest) res[manifest_select.Cell, fail.Fail] {
+    if (!str_is_empty(req.owner)) { ret res[manifest_select.Cell, fail.Fail].ok{manifest_select.cell_of(req.artifact, req.target, req.profile)}; }
+    val res_made: res[manifest_select.Selectors, fail.Fail] = manifest_select.selectors_of(s.alloc, req.artifact, req.target, req.profile);
+    if (sel res_made.err) { ret res[manifest_select.Cell, fail.Fail].err{res_made.err}; }
+    var selectors: manifest_select.Selectors = res_made.ok;
+    fin { manifest_select.selectors_dnit(?selectors); }
+    ret manifest_select.resolve_cell(s.alloc, ?s.interner, m, ?selectors, manifest_select.ARTIFACT_DEFAULT_ONE, "this command builds one artifact");
+}
+
+pub def FrontendPhase: u8;
+pub val FRONTEND_PARSE:   FrontendPhase = 0;
+pub val FRONTEND_RESOLVE: FrontendPhase = 1;
+pub val FRONTEND_SEMA:    FrontendPhase = 2;
+
+# one frontend analysis for a tool: the project at a root, its request composed from the
+# manifest and the selection as `mach check` composes it, with the modules of `files`
+# loaded beside the root set
+# ---
+# root:       the project's directory, the one holding its mach.toml
+# manifest:   the project's manifest when the caller already read it, nil to read it from
+#             `root`
+# selection:  the artifact, target and profile selection, one cell of which is analyzed
+# roots:      the root set the frontend loads: `project.ROOT_ARTIFACT` is the selected
+#             artifact's closure, `project.ROOT_UNION` every artifact's with the modules
+#             only a foreign target reaches gated out and `{artifact.<id>.out}` resolving
+#             over every artifact some artifact needs
+# files:      source files whose modules load beside the root set, nil with count 0; a
+#             file of another project, or outside the root's source directory, is skipped
+# file_count: how many files
+# phase:      the last frontend phase to run
+pub rec Analysis {
+    root:       str;
+    manifest:   *manifest_model.Manifest;
+    selection:  *manifest_select.Selectors;
+    roots:      project.RootSet;
+    files:      *str;
+    file_count: u32;
+    phase:      FrontendPhase;
+}
+
+# the frontend analysis tools share: the project comes back whenever the frontend ran,
+# whatever its phases decided, so a consumer can read the trees, resolve results and sema
+# results beside the diagnostics. every module that reached a phase carries that phase's
+# product on its ModuleEntry even when the module's own query was rejected; the standing is
+# frontend.frontend_status(p). a rejected phase ends the analysis at that phase; err is an
+# operational failure only (an unreadable manifest, a selection naming no cell, allocation,
+# I/O). every string `an` holds is borrowed for the call, and the project borrows `root`
+# ---
+# s:   the session
+# an:  what to analyze
+# ret: the project, released by the caller with project.dnit_project
+pub fun analyze(s: *session.Session, an: *Analysis) res[project.Project, fail.Fail] {
+    if (an.phase > FRONTEND_SEMA) { ret res[project.Project, fail.Fail].err{fail.message("unknown frontend analysis phase")}; }
+    if (an.roots != project.ROOT_ARTIFACT && an.roots != project.ROOT_UNION) {
+        ret res[project.Project, fail.Fail].err{base_catalog.unknown_catalog(s.alloc, "RootSet", an.roots::u32)};
+    }
+    if (an.file_count > 0 && an.files == nil) {
+        ret res[project.Project, fail.Fail].err{fail.message("driver: frontend analysis file count requires a file array")};
+    }
+    var read:           manifest_model.Manifest;
+    var m:              *manifest_model.Manifest = an.manifest;
+    val manifest_alloc: *A.Allocator             = s.build_alloc;
+    if (m == nil) {
+        val res_loaded: res[manifest_model.Manifest, fail.Fail] = load_manifest(s, an.root);
+        if (sel res_loaded.err) { ret res[project.Project, fail.Fail].err{res_loaded.err}; }
+        read = res_loaded.ok;
+        m    = ?read;
+    }
+    fin {
+        if (an.manifest == nil) { manifest_model.dnit(?read, manifest_alloc); }
+    }
+
+    val res_cell: res[manifest_select.Cell, fail.Fail] = manifest_select.resolve_cell(s.alloc, ?s.interner, m, an.selection,
+        manifest_select.ARTIFACT_DEFAULT_ONE, "this command builds one artifact");
+    if (sel res_cell.err) { ret res[project.Project, fail.Fail].err{res_cell.err}; }
+    var overrides:    request.Overrides                    = request.overrides_init(s.alloc);
+    val res_composed: res[request.BuildRequest, fail.Fail] = request.compose(s.alloc, ?s.interner, m, ?overrides, an.root,
+        request.GOAL_CHECK, res_cell.ok.profile);
+    if (sel res_composed.err) { ret res[project.Project, fail.Fail].err{res_composed.err}; }
+    var req: request.BuildRequest = res_composed.ok;
+    fin {
+        collections_vector.dnit[request.LinkToken](?req.link_tokens);
+        collections_vector.dnit[str](?req.lib_dirs);
+    }
+    req.artifact = res_cell.ok.artifact;
+    req.target   = res_cell.ok.target;
+
+    val res_named: res[Vector[intern.StrId], fail.Fail] = file_modules(s, m, an.root, an.files, an.file_count);
+    if (sel res_named.err) { ret res[project.Project, fail.Fail].err{res_named.err}; }
+    var extra: Vector[intern.StrId] = res_named.ok;
+    fin { collections_vector.dnit[intern.StrId](?extra); }
+
+    diagnostic.store_dnit(?s.diags);
+    s.diags = diagnostic.store_init(s.alloc);
+
+    val res_begin: res[project.Project, fail.Fail] = begin_build_roots(s, m, nil, ?req, nil, an.roots);
+    if (sel res_begin.err) { ret res_begin; }
+    var p: project.Project = res_begin.ok;
+
+    if (an.phase == FRONTEND_PARSE) {
+        val err_parsed: err[fail.Fail] = parse_project_roots(?p, extra.data, extra.len::u32);
+        if (sel err_parsed.err) { ret phase_decided(?p, err_parsed.err); }
+        ret res[project.Project, fail.Fail].ok{p};
+    }
+
+    val err_load: err[fail.Fail] = run_load_phase_roots(?p, extra.data, extra.len::u32);
+    if (sel err_load.err) { ret phase_decided(?p, err_load.err); }
+
+    if (an.phase == FRONTEND_RESOLVE) {
+        val err_current: err[fail.Fail] = resolve_query_phase(?p);
+        if (sel err_current.err) { ret phase_decided(?p, err_current.err); }
+        ret res[project.Project, fail.Fail].ok{p};
+    }
+
+    val err_sema: err[fail.Fail] = run_sema_pass(?p);
+    if (sel err_sema.err) { ret phase_decided(?p, err_sema.err); }
+
+    ret res[project.Project, fail.Fail].ok{p};
+}
+
+# the modules `files` are loaded as beside the project at `root` whose manifest is `m`, in
+# order, skipping a file of another project or outside the source directory
+fun file_modules(s: *session.Session, m: *manifest_model.Manifest, root: str, files: *str,
+    count: u32) res[Vector[intern.StrId], fail.Fail] {
+    var out: Vector[intern.StrId] = collections_vector.init[intern.StrId](s.alloc);
+    if (count == 0) { ret res[Vector[intern.StrId], fail.Fail].ok{out}; }
+    var complete: bool = false;
+    fin {
+        if (!complete) { collections_vector.dnit[intern.StrId](?out); }
+    }
+    val opt_id_text:  opt[str] = intern.get(?s.interner, m.id);
+    val opt_src_text: opt[str] = intern.get(?s.interner, m.src);
+    if (sel opt_id_text.none)  { ret res[Vector[intern.StrId], fail.Fail].err{fail.message("driver: manifest project id or src dir not interned")}; }
+    if (sel opt_src_text.none) { ret res[Vector[intern.StrId], fail.Fail].err{fail.message("driver: manifest project id or src dir not interned")}; }
+    var i: u32 = 0;
+    for (i < count) {
+        val res_name: res[opt[intern.StrId], fail.Fail] = file_module(s.alloc, ?s.interner, files[i], root, opt_id_text.some, opt_src_text.some);
+        if (sel res_name.err) { ret res[Vector[intern.StrId], fail.Fail].err{res_name.err}; }
+        if (sel res_name.ok.some) {
+            val res_pushed: res[usize, A.Error] = collections_vector.push[intern.StrId](?out, res_name.ok.some);
+            if (sel res_pushed.err) { ret res[Vector[intern.StrId], fail.Fail].err{fail.refused(res_pushed.err)}; }
+        }
+        i = i + 1;
+    }
+    complete = true;
+    ret res[Vector[intern.StrId], fail.Fail].ok{out};
+}
+
+# a phase that did not finish: a rejection keeps the project, everything else
+# releases it
+fun phase_decided(p: *project.Project, failure: fail.Fail) res[project.Project, fail.Fail] {
+    if (fail.is_reported(failure)) {
+        ret res[project.Project, fail.Fail].ok{@p};
+    }
+    ret project_failure(p, failure);
+}
+
+fun parse_project_roots(p: *project.Project, roots: *intern.StrId, count: u32) err[fail.Fail] {
+    val err_selected: err[fail.Fail] = config.select_target(p, p.target_entry);
+    if (sel err_selected.err) { ret phase_finish(p, err[fail.Fail].err{err_selected.err}); }
+    var entry:          intern.StrId  = intern.STR_NIL;
+    var selected_roots: *intern.StrId = roots;
+    var selected_count: u32           = count;
+    if (selected_count == 0) {
+        val res_name: res[intern.StrId, fail.Fail] = compile_load.entry_module_fqn(p, p.target_entry);
+        if (sel res_name.err) { ret phase_finish(p, err[fail.Fail].err{res_name.err}); }
+        entry          = res_name.ok;
+        selected_roots = ?entry;
+        selected_count = 1;
+    }
+    var i: u32 = 0;
+    for (i < selected_count) {
+        val res_loaded: res[module.ModuleId, fail.Fail] = compile_load.module_load_one(p, selected_roots[i]);
+        if (sel res_loaded.err) {
+            var failure: fail.Fail = load_failure_of(p, res_loaded.err);
+            if (count == 0) { failure = entry_failure(p, entry, p.config.bin_name, p.target_entry.entry_at, failure); }
+            ret retain_loaded(p, compile_load.collect_loaded_parses(p, err[fail.Fail].err{failure}));
+        }
+        i = i + 1;
+    }
+    ret retain_loaded(p, compile_load.collect_loaded_parses(p, err[fail.Fail].ok{}));
+}
+
+fun begin_build_impl(s: *session.Session, c: *manifest_select.Cell, m: *manifest_model.Manifest, closure: *project.Closure,
+    req: *request.BuildRequest, progress: *readout.Progress, roots: project.RootSet) res[project.Project, fail.Fail] {
+    val err_valid: err[fail.Fail] = request.validate(s.alloc, req);
+    if (sel err_valid.err) {
+        ret res[project.Project, fail.Fail].err{err_valid.err};
+    }
+    var p: project.Project;
+    project.init_project(?p, s);
+    p.req      = @req;
+    p.progress = progress;
+    p.roots    = roots;
+
+    val for_union: bool = roots == project.ROOT_UNION;
+
+    val err_cfg: err[fail.Fail] = config.load_config_manifest(?p, req.project_root, m, closure, c, req.owner, for_union);
+    if (sel err_cfg.err) {
+        ret project_failure(?p, err_cfg.err);
+    }
+
+    val te: *project.TargetEntry = p.target_entry;
+    if (te == nil) {
+        ret project_failure(?p, fail.message("internal: manifest selected no target"));
+    }
+
+    val err_published: err[fail.Fail] = phase_finish(?p, err[fail.Fail].ok{});
+    if (sel err_published.err) {
+        ret project_failure(?p, err_published.err);
+    }
+
+    ret res[project.Project, fail.Fail].ok{p};
+}
+
+pub fun run_load_phase(p: *project.Project) err[fail.Fail] {
+    ret run_load_phase_roots(p, nil, 0);
+}
+
+fun run_load_phase_roots(p: *project.Project, extra_roots: *intern.StrId,
+    extra_root_count: u32) err[fail.Fail] {
+    ret phase_finish(p, retain_loaded(p, load_phase_impl(p, extra_roots, extra_root_count)));
+}
+
+# whatever the load decided, the session keeps what it reached and retires what nothing holds any more
+# a load the walk finished but rejected (a `use` that names nothing) is a rejected
+# round like a failed one: the last accepted build's holdings stay
+fun retain_loaded(p: *project.Project, result: err[fail.Fail]) err[fail.Fail] {
+    val standing: report_phase.PhaseStatus = frontend.load_status(p);
+    val rejected: bool                     = sel result.err || !sel standing.kind.accepted;
+    val err_kept: err[fail.Fail]           = passes.retain_modules(p, rejected);
+    # a rejected load reports its own failure first; a retention failure beside it only keeps products
+    # longer than needed, never serves a wrong one, so it is counted as a lost report rather than replacing it
+    if (sel result.err) {
+        if (sel err_kept.err) {
+            diagnostic.note_lost(?p.diags);
+            diagnostic.note_lost(?p.s.diags);
+        }
+        ret result;
+    }
+    if (sel err_kept.err) { ret err[fail.Fail].err{err_kept.err}; }
+    ret result;
+}
+
+fun load_phase_impl(p: *project.Project, extra_roots: *intern.StrId,
+    extra_root_count: u32) err[fail.Fail] {
+    val te: *project.TargetEntry = p.target_entry;
+
+    val err_select_target: err[fail.Fail] = config.select_target(p, te);
+    if (sel err_select_target.err) {
+        ret err[fail.Fail].err{err_select_target.err};
+    }
+
+    val res_entry_path: res[intern.StrId, fail.Fail] = compile_load.entry_module_fqn(p, te);
+    if (sel res_entry_path.err) {
+        ret err[fail.Fail].err{res_entry_path.err};
+    }
+    val entry_fqn: intern.StrId = res_entry_path.ok;
+
+    readout.phase_begin(p.progress, readout.LOAD);
+    project.set_origin(p, diagnostic.ORIGIN_LOAD);
+    val res_load: res[module.ModuleId, fail.Fail] = compile_load.module_load(p, entry_fqn);
+    if (sel res_load.err) {
+        val failure: fail.Fail = entry_failure(p, entry_fqn, p.config.bin_name, te.entry_at, load_failure_of(p, res_load.err));
+        ret compile_load.collect_loaded_parses(p, err[fail.Fail].err{failure});
+    }
+
+    if (p.roots == project.ROOT_UNION) {
+        # under the union each artifact's walk attributes the modules it reaches first, so
+        # a module of `shaded` reads `$bin.name == "shaded"` in a session rooted at `hello`;
+        # the primary entry loaded first, so a module its walk reaches is the primary's
+        val cell_artifact: intern.StrId = p.loader.artifact;
+        var ei:            u32          = 0;
+        for (ei < p.union_entry_count) {
+            p.loader.artifact = p.union_entries[ei].artifact;
+            val ue:      *project.ArtifactEntry          = ?p.union_entries[ei];
+            val res_ear: res[module.ModuleId, fail.Fail] = compile_load.module_load(p, ue.fqn);
+            if (sel res_ear.err) {
+                p.loader.artifact = cell_artifact;
+                val failure: fail.Fail = entry_failure(p, ue.fqn, ue.artifact, ue.at, load_failure_of(p, res_ear.err));
+                ret compile_load.collect_loaded_parses(p, err[fail.Fail].err{failure});
+            }
+            ei = ei + 1;
+        }
+        # the artifacts this target does not build come next, so a module both reach is
+        # this build's and one only they reach is gated out of it
+        p.loader.foreign = true;
+        var fi_: u32 = 0;
+        for (fi_ < p.foreign_entry_count) {
+            p.loader.artifact = p.foreign_entries[fi_].artifact;
+            val fo:      *project.ArtifactEntry          = ?p.foreign_entries[fi_];
+            val res_far: res[module.ModuleId, fail.Fail] = compile_load.module_load(p, fo.fqn);
+            if (sel res_far.err) {
+                p.loader.foreign  = false;
+                p.loader.artifact = cell_artifact;
+                val failure: fail.Fail = entry_failure(p, fo.fqn, fo.artifact, fo.at, load_failure_of(p, res_far.err));
+                ret compile_load.collect_loaded_parses(p, err[fail.Fail].err{failure});
+            }
+            fi_ = fi_ + 1;
+        }
+        p.loader.foreign  = false;
+        p.loader.artifact = cell_artifact;
+    }
+
+    p.emit_len = p.topo_len;
+
+    var xi: u32 = 0;
+    for (xi < extra_root_count) {
+        val res_module_load: res[module.ModuleId, fail.Fail] = compile_load.module_load(p, extra_roots[xi]);
+        if (sel res_module_load.err) {
+            ret compile_load.collect_loaded_parses(p, err[fail.Fail].err{load_failure_of(p, res_module_load.err)});
+        }
+        xi = xi + 1;
+    }
+
+    if (passes.test_build(p)) { p.emit_len = p.topo_len; }
+
+    if (p.roots == project.ROOT_UNION) {
+        val err_kept: err[fail.Fail] = union_keep_built(p, res_load.ok, extra_roots, extra_root_count);
+        if (sel err_kept.err) { ret err_kept; }
+    }
+
+    if (p.loader.dirty) {
+        val err_ordered: err[fail.Fail] = reorder_topo(p);
+        if (sel err_ordered.err) { ret err_ordered; }
+    }
+
+    val err_reg: err[fail.Fail] = compile_load.register_module_asts(p);
+    if (sel err_reg.err) {
+        ret err[fail.Fail].err{err_reg.err};
+    }
+
+    val err_cfg_in: err[fail.Fail] = context.freeze(p);
+    if (sel err_cfg_in.err) {
+        ret err[fail.Fail].err{err_cfg_in.err};
+    }
+
+    load_row_end(p);
+
+    val err_strings: err[fail.Fail] = declared.decorator_strings_register(p);
+    if (sel err_strings.err) {
+        ret err[fail.Fail].err{err_strings.err};
+    }
+    val err_emb: err[fail.Fail] = declared.register_embed_inputs(p);
+    if (sel err_emb.err) {
+        ret err[fail.Fail].err{err_emb.err};
+    }
+
+    {
+        readout.phase_begin(p.progress, readout.RESOLVE);
+        fin { resolve_row_end(p); }
+        val err_cached: err[fail.Fail] = passes.prepare_object_cache(p);
+        if (sel err_cached.err) { ret err[fail.Fail].err{err_cached.err}; }
+        val err_final_resolve: err[fail.Fail] = resolve_query_phase(p);
+        if (sel err_final_resolve.err) { ret err[fail.Fail].err{err_final_resolve.err}; }
+    }
+
+    val err_exp: err[fail.Fail] = declared.register_export_names(p);
+    if (sel err_exp.err) {
+        ret err[fail.Fail].err{err_exp.err};
+    }
+
+    ret err[fail.Fail].ok{};
+}
+
+# re-derive a loaded project's frontend after one module's text changed, without
+# reloading its closure. the module is reparsed and re-walked in place; when its load
+# surface survived (compile_load.module_reload), the module set and topo are as loaded and
+# the query phases rerun over them, so every unchanged module's resolve and sema are
+# hits and only the edited module and its dependents recompute. a surface that did
+# not survive is reported as ok(false): the caller reloads
+# ---
+# p:     the loaded project, at least at FRONTEND_RESOLVE
+# mid:   the module whose text changed
+# phase: the frontend phase to re-derive to, at most the one the project was loaded to
+# ret:   ok(true) when refreshed, a rejection included since the project's standing carries it;
+#        ok(false) when the caller must reload; or the internal failure
+pub fun refresh_frontend(p: *project.Project, mid: module.ModuleId, phase: FrontendPhase) res[bool, fail.Fail] {
+    if (phase > FRONTEND_SEMA) { ret res[bool, fail.Fail].err{fail.message("unknown frontend analysis phase")}; }
+    if (module.is_nil(mid) || mid::u32 >= project.module_count(p)) {
+        ret res[bool, fail.Fail].err{fail.message("driver: refresh names a module outside the loaded project")};
+    }
+    val s: *session.Session     = p.s;
+    val m: *project.ModuleEntry = project.module_at(p, mid::u32);
+    diagnostic.store_dnit(?s.diags);
+    s.diags = diagnostic.store_init(s.alloc);
+    diagnostic.drop_file(?p.diags, m.file_id);
+    val syn: *ast.Ast = frontend.syntax(p, m);
+    if (syn != nil) { linkage.forget_names(?p.linkage, mid, syn.decls.len::u32); }
+
+    project.set_origin(p, diagnostic.ORIGIN_LOAD);
+    val res_kept: res[bool, fail.Fail] = compile_load.module_reload(p, mid);
+    if (sel res_kept.err) { ret res[bool, fail.Fail].err{res_kept.err}; }
+    if (!res_kept.ok)     { ret res[bool, fail.Fail].ok{false}; }
+
+    val err_derived: err[fail.Fail] = refresh_phases(p, phase);
+    val err_kept:    err[fail.Fail] = retain_loaded(p, err_derived);
+    val err_fin:     err[fail.Fail] = phase_finish(p, err_kept);
+    # a rejection is a refreshed project whose diagnostics say so, as under the tolerant load
+    if (sel err_fin.err) {
+        if (!fail.is_reported(err_fin.err)) { ret res[bool, fail.Fail].err{err_fin.err}; }
+    }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# the phases after the load walk, over a project whose module set is settled
+fun refresh_phases(p: *project.Project, phase: FrontendPhase) err[fail.Fail] {
+    val err_forgot: err[fail.Fail] = cache.forget(p);
+    if (sel err_forgot.err) { ret err_forgot; }
+    val err_reg: err[fail.Fail] = compile_load.register_module_asts(p);
+    if (sel err_reg.err) { ret err[fail.Fail].err{err_reg.err}; }
+    val err_strings: err[fail.Fail] = declared.decorator_strings_register(p);
+    if (sel err_strings.err) { ret err[fail.Fail].err{err_strings.err}; }
+    val err_emb: err[fail.Fail] = declared.register_embed_inputs(p);
+    if (sel err_emb.err) { ret err[fail.Fail].err{err_emb.err}; }
+    val err_resolved: err[fail.Fail] = resolve_query_phase(p);
+    if (sel err_resolved.err) { ret err[fail.Fail].err{err_resolved.err}; }
+    val err_exp: err[fail.Fail] = declared.register_export_names(p);
+    if (sel err_exp.err)        { ret err[fail.Fail].err{err_exp.err}; }
+    if (phase == FRONTEND_SEMA) { ret run_sema_pass(p); }
+    ret err[fail.Fail].ok{};
+}
+
+fun resolve_query_phase(p: *project.Project) err[fail.Fail] {
+    project.set_origin(p, diagnostic.ORIGIN_RESOLVE);
+    # what the load walk decided for each module is an input the resolution reads
+    val err_viewed: err[fail.Fail] = frontend.record_load_views(p);
+    if (sel err_viewed.err) { ret err_viewed; }
+    var roots: Vector[query.QueryKey] = collections_vector.init[query.QueryKey](p.alloc);
+    fin { collections_vector.dnit[query.QueryKey](?roots); }
+    var i: u32 = 0;
+    for (i < project.module_count(p)) {
+        val m: *project.ModuleEntry = project.module_at(p, i);
+        if (base_source.file_is_nil(m.file_id)) {
+            i = i + 1;
+            cnt;
+        }
+        val res_added: res[usize, A.Error] = collections_vector.push[query.QueryKey](?roots,
+            query.QueryKey{kind: ?frontend.PARSE, key: base_source.file_index(m.file_id)::u64});
+        if (sel res_added.err) {
+            ret err[fail.Fail].err{fail.refused(res_added.err)};
+        }
+        i = i + 1;
+    }
+    val err_resolved: err[fail.Fail] = append_phase_roots(p, ?roots, ?frontend.RESOLVE, p.topo_len);
+    if (sel err_resolved.err) { ret err_resolved; }
+    val err_exported: err[fail.Fail] = append_phase_roots(p, ?roots, ?frontend.EXPORTS, p.topo_len);
+    if (sel err_exported.err) { ret err_exported; }
+    val res_begun: res[query.Operation, fail.Fail] = frontend.begin_query_phase(p);
+    if (sel res_begun.err) {
+        ret err[fail.Fail].err{res_begun.err};
+    }
+    var err_computed: err[fail.Fail] = compile_load.acquire_loaded_parses(p);
+    val computed_ok:  bool           = sel err_computed.ok;
+    if (computed_ok) { err_computed = passes.run_resolve_pass(p); }
+    var err_phase_resolved: err[fail.Fail] = err[fail.Fail].ok{};
+    if (sel err_computed.err) {
+        err_phase_resolved = err[fail.Fail].err{err_computed.err};
+    }
+    ret frontend.finish_query_phase(p, res_begun.ok, roots.data, roots.len, err_phase_resolved);
+}
+
+# the union's resolve and sema run in the build target's frame, so a module only another target's
+# arms reach is gated out of them as a module only a foreign artifact reaches is: typed in this
+# frame it would be checked against a target it is not for
+fun union_keep_built(p: *project.Project, entry: module.ModuleId, extra_roots: *intern.StrId, extra_root_count: u32) err[fail.Fail] {
+    val n:           usize               = project.module_count(p)::usize;
+    val res_reached: res[*bool, A.Error] = A.zallocate[bool](p.alloc, n + 1);
+    if (sel res_reached.err) { ret err[fail.Fail].err{fail.refused(res_reached.err)}; }
+    val reached: *bool = res_reached.ok;
+    fin { A.deallocate[bool](p.alloc, reached, n + 1); }
+    reached[module.index(entry)] = true;
+    var ei: u32 = 0;
+    for (ei < p.union_entry_count) {
+        val opt_found: opt[module.ModuleId] = front_load.module_find(?p.loader, p.union_entries[ei].fqn);
+        if (sel opt_found.some) { reached[module.index(opt_found.some)] = true; }
+        ei = ei + 1;
+    }
+    var xi: u32 = 0;
+    for (xi < extra_root_count) {
+        val opt_found: opt[module.ModuleId] = front_load.module_find(?p.loader, extra_roots[xi]);
+        if (sel opt_found.some) { reached[module.index(opt_found.some)] = true; }
+        xi = xi + 1;
+    }
+    val err_walked: err[fail.Fail] = front_load.build_reach(?p.loader, reached);
+    if (sel err_walked.err) { ret err_walked; }
+    var kept:      u32 = 0;
+    var kept_emit: u32 = 0;
+    var i:         u32 = 0;
+    for (i < p.topo_len) {
+        val mid: module.ModuleId = p.topo[i];
+        if (reached[module.index(mid)]) {
+            p.topo[kept] = mid;
+            kept         = kept + 1;
+            if (i < p.emit_len) { kept_emit = kept_emit + 1; }
+        }
+        or { project.module_at(p, mid::u32).load.gated = true; }
+        i = i + 1;
+    }
+    p.topo_len = kept;
+    p.emit_len = kept_emit;
+    ret err[fail.Fail].ok{};
+}
+
+# a module walked again under a union tuple it was reached under late can import one the topo
+# placed after it, so the topo is ordered again, the modules the build emits first
+fun reorder_topo(p: *project.Project) err[fail.Fail] {
+    var emit_roots:      *module.ModuleId = nil;
+    val emit_root_count: u32              = p.emit_len;
+    if (emit_root_count > 0) {
+        val res_allocate: res[*module.ModuleId, A.Error] = A.allocate[module.ModuleId](p.alloc, emit_root_count::usize);
+        if (sel res_allocate.err) { ret err[fail.Fail].err{fail.refused(res_allocate.err)}; }
+        emit_roots = res_allocate.ok;
+        var ei: u32 = 0;
+        for (ei < emit_root_count) {
+            emit_roots[ei] = p.topo[ei];
+            ei             = ei + 1;
+        }
+    }
+    val err_rebuild_topo: err[fail.Fail] = compile_load.rebuild_topo(p, emit_roots, emit_root_count);
+    if (emit_roots != nil) { A.deallocate[module.ModuleId](p.alloc, emit_roots, emit_root_count::usize); }
+    ret err_rebuild_topo;
+}
+
+fun load_row_end(p: *project.Project) {
+    readout.phase_dropped(p.progress, readout.LOAD, project.module_count(p) - p.topo_len);
+    readout.phase_end(p.progress, readout.LOAD, project.module_count(p), "module", "modules");
+}
+
+fun resolve_row_end(p: *project.Project) {
+    readout.phase_end(p.progress, readout.RESOLVE, cache.frontend_count(p), "module", "modules");
+}
+
+# the root manifest of the project at `project_root`, read once: its text, an
+# open buffer's when the session holds one, becomes the session's input for the
+# file, so a warm session sees an edit to it as an input change, and the manifest
+# records the input and the revision it was read at
+# ---
+# s:            the session; its build allocator owns the manifest
+# project_root: the project root
+# ret:          the manifest, released with `manifest_model.dnit`; err when it cannot be
+#               read, does not parse or fails a check
+pub fun load_manifest(s: *session.Session, project_root: str) res[manifest_model.Manifest, fail.Fail] {
+    val res_path: res[str, A.Error] = types_path.join(s.build_alloc, project_root, manifest_load.MANIFEST_FILE);
+    if (sel res_path.err) { ret res[manifest_model.Manifest, fail.Fail].err{fail.refused(res_path.err)}; }
+    val path: str = res_path.ok;
+    fin { str_free(s.build_alloc, path); }
+
+    # the text read off disk is this call's; the session and the parse each keep their own copy
+    var text:         str      = nil;
+    var read_off:     bool     = false;
+    val opt_buffered: opt[str] = overlay.get(?s.overlays, path);
+    if (sel opt_buffered.some) { text = opt_buffered.some; }
+    or {
+        val res_read: res[str, fs.FsError] = fs.read_string(s.build_alloc, path);
+        if (sel res_read.err) { ret res[manifest_model.Manifest, fail.Fail].err{fail.refusal(s.build_alloc, diagnostic_kind.FS_READ, fail.Op{verb: "read", path: path, given: true}, fail.Cause.fs{res_read.err})}; }
+        text     = res_read.ok;
+        read_off = true;
+    }
+    fin {
+        if (read_off) { str_free(s.build_alloc, text); }
+    }
+    val res_loaded: res[base_source.FileId, fail.Fail] = session.load_source(s, path, text);
+    if (sel res_loaded.err) { ret res[manifest_model.Manifest, fail.Fail].err{res_loaded.err}; }
+
+    val res_parsed: res[manifest_model.Manifest, fail.Fail] = manifest_load.parse_text(s.build_alloc, ?s.interner, s.sources, path, text);
+    if (sel res_parsed.err) { ret res_parsed; }
+    var m: manifest_model.Manifest = res_parsed.ok;
+    m.source          = res_loaded.ok;
+    m.source_revision = query.peek_revision(?s.queries, ?session.FILE_TEXT, base_source.file_index(res_loaded.ok)::u64);
+
+    ret res[manifest_model.Manifest, fail.Fail].ok{m};
+}
+
+# a load that failed: the frontend's recorded status wins over the loader's
+# own failure, and a loader message is the user's
+fun load_failure_of(p: *project.Project, f: fail.Fail) fail.Fail {
+    val status: report_phase.PhaseStatus = frontend.frontend_status(p);
+    if (!sel status.kind.accepted) { ret report_phase.phase_failure(status); }
+    ret fail.as_user(diagnostic_kind.SOURCE_LOAD, f);
+}
+
+# a load failure of the module an artifact's `entry` names: when the entry's own file could
+# not be read, the failure names the key and points at where the manifest writes it. an entry
+# build states its entry on the command line, has no manifest to point into, and keeps the
+# failure as it is
+fun entry_failure(p: *project.Project, fqn: intern.StrId, artifact: intern.StrId, at: base_source.Location, f: fail.Fail) fail.Fail {
+    if (fail.kind_of(f) != diagnostic_kind.SOURCE_LOAD) { ret f; }
+    if (base_source.file_is_nil(at.file))               { ret f; }
+    if (!compile_load.module_unread(p, fqn))            { ret f; }
+    val res_text: res[str, fail.Fail] = diagnostic.format_intern(?p.s.interner, p.alloc, "mach.toml: [artifact.{}].entry: {}", intern.text(?p.s.interner, artifact), fail.describe(f));
+    if (sel res_text.err) { ret res_text.err; }
+    ret fail.at(fail.with_text(f, res_text.ok), at);
+}
+
+# the root of the project a file belongs to: the nearest directory above it holding a
+# mach.toml, none when no directory does
+pub fun project_root_of(alloc: *A.Allocator, file_path: str) res[opt[str], fail.Fail] {
+    val res_start: res[str, A.Error] = types_path.parent(alloc, file_path);
+    if (sel res_start.err) { ret res[opt[str], fail.Fail].err{fail.refused(res_start.err)}; }
+    var dir: str = res_start.ok;
+    fin { str_free(alloc, dir); }
+    for (true) {
+        val res_join_path: res[str, fail.Fail] = compile_load.join_path(alloc, dir, manifest_load.MANIFEST_FILE);
+        if (sel res_join_path.err) { ret res[opt[str], fail.Fail].err{res_join_path.err}; }
+        val mf: str = res_join_path.ok;
+        fin { str_free(alloc, mf); }
+        val res_opened: res[fs.File, io_error.Error] = fs.open(mf);
+        if (sel res_opened.ok) {
+            var file:         fs.File                          = res_opened.ok;
+            val res_metadata: res[fs.Metadata, io_error.Error] = fs.stat_of(file);
+            val err_closed:   err[io_error.Error]              = fs.close(?file);
+            # a manifest opened read-only loses nothing to a refused close, so the failure going out stands alone
+            if (sel res_metadata.err) { ret res[opt[str], fail.Fail].err{fail.refusal(alloc, diagnostic_kind.FS_STAT, fail.Op{verb: "inspect", role: "the project manifest", path: mf}, fail.Cause.io{res_metadata.err})}; }
+            if (sel err_closed.err)   { ret res[opt[str], fail.Fail].err{fail.refusal(alloc, diagnostic_kind.FS_CLOSE, fail.Op{verb: "close", role: "the project manifest", path: mf}, fail.Cause.io{err_closed.err})}; }
+            if (res_metadata.ok.kind != fs.KIND_FILE) {
+                ret res[opt[str], fail.Fail].err{fail.formatted_user(alloc, diagnostic_kind.FS_READ, "project manifest '{}' is not a regular file", mf)};
+            }
+            val found: str = dir;
+            dir = nil;
+            ret res[opt[str], fail.Fail].ok{opt[str].some{found}};
+        }
+        if (system_os.error_kind(res_opened.err.code) != io_error.NOT_FOUND) {
+            ret res[opt[str], fail.Fail].err{fail.refusal(alloc, diagnostic_kind.FS_OPEN, fail.Op{verb: "open", role: "the project manifest", path: mf}, fail.Cause.io{res_opened.err})};
+        }
+        val res_parent: res[str, A.Error] = types_path.parent(alloc, dir);
+        if (sel res_parent.err) { ret res[opt[str], fail.Fail].err{fail.refused(res_parent.err)}; }
+        val next: str = res_parent.ok;
+        if (str_equals(next, dir)) {
+            str_free(alloc, next);
+            ret res[opt[str], fail.Fail].ok{opt[str].none{}};
+        }
+        str_free(alloc, dir);
+        dir = next;
+    }
+    ret res[opt[str], fail.Fail].ok{opt[str].none{}};
+}
+
+fun relative_under(alloc: *A.Allocator, file_path: str, root: str, src_text: str) res[opt[str], fail.Fail] {
+    val res_prefix: res[str, fail.Fail] = compile_load.join_path(alloc, root, src_text);
+    if (sel res_prefix.err) { ret res[opt[str], fail.Fail].err{res_prefix.err}; }
+    val prefix: str = res_prefix.ok;
+    fin { str_free(alloc, prefix); }
+    val plen: usize = str_len(prefix);
+    val flen: usize = str_len(file_path);
+    if (flen <= plen || !types_path.is_separator(file_path[plen])) {
+        ret res[opt[str], fail.Fail].ok{opt[str].none{}};
+    }
+    var i: usize = 0;
+    for (i < plen) {
+        if (file_path[i] != prefix[i] && !(types_path.is_separator(file_path[i]) && types_path.is_separator(prefix[i]))) {
+            ret res[opt[str], fail.Fail].ok{opt[str].none{}};
+        }
+        i = i + 1;
+    }
+    val res_rel: res[str, types_string.StrError] = str_copy_slice(alloc, file_path, plen + 1, flen - plen - 1);
+    if (sel res_rel.err) { ret res[opt[str], fail.Fail].err{fail.str_refused(res_rel.err)}; }
+    ret res[opt[str], fail.Fail].ok{opt[str].some{res_rel.ok}};
+}
+
+# the module the file at `path` is under the project at `root`: none when it lies outside the
+# source directory
+# ---
+# id_text:  the project id, the module path's first segment
+# src_text: the manifest's source directory, relative to `root`
+pub fun module_under(alloc: *A.Allocator, itn: *intern.Interner, path: str, root: str, id_text: str,
+    src_text: str) res[opt[intern.StrId], fail.Fail] {
+    val res_relative: res[opt[str], fail.Fail] = relative_under(alloc, path, root, src_text);
+    if (sel res_relative.err)     { ret res[opt[intern.StrId], fail.Fail].err{res_relative.err}; }
+    if (sel res_relative.ok.none) { ret res[opt[intern.StrId], fail.Fail].ok{opt[intern.StrId].none{}}; }
+    val rel:      str                          = res_relative.ok.some;
+    val res_name: res[intern.StrId, fail.Fail] = module.compose_fqn(alloc, itn, id_text, rel);
+    str_free(alloc, rel);
+    if (sel res_name.err) { ret res[opt[intern.StrId], fail.Fail].err{res_name.err}; }
+    ret res[opt[intern.StrId], fail.Fail].ok{opt[intern.StrId].some{res_name.ok}};
+}
+
+# the module the file at `path` is loaded as beside the project at `root`: none when the
+# file belongs to another project or lies outside the source directory
+# ---
+# id_text:  the project id, the module path's first segment
+# src_text: the manifest's source directory, relative to `root`
+pub fun file_module(alloc: *A.Allocator, itn: *intern.Interner, path: str, root: str, id_text: str,
+    src_text: str) res[opt[intern.StrId], fail.Fail] {
+    val res_owner: res[opt[str], fail.Fail] = project_root_of(alloc, path);
+    if (sel res_owner.err) { ret res[opt[intern.StrId], fail.Fail].err{res_owner.err}; }
+    val opt_owner: opt[str] = res_owner.ok;
+    if (sel opt_owner.none) { ret res[opt[intern.StrId], fail.Fail].ok{opt[intern.StrId].none{}}; }
+    val same: bool = str_equals(opt_owner.some, root);
+    str_free(alloc, opt_owner.some);
+    if (!same) { ret res[opt[intern.StrId], fail.Fail].ok{opt[intern.StrId].none{}}; }
+    ret module_under(alloc, itn, path, root, id_text, src_text);
+}

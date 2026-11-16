@@ -1,0 +1,1148 @@
+# the comptime evaluator: an expression's value under the capabilities of the phase that
+# asks, over the scope it runs in
+use base_alloc:   mach.base.alloc;
+use base_catalog: mach.base.catalog;
+use mach.base.diagnostic;
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use mach.base.float;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.base.stack;
+use mach.base.wide;
+use mach.front.ast;
+use ast_expr:            mach.front.ast.expr;
+use ast_id:              mach.front.ast.id;
+use ast_type:            mach.front.ast.type;
+use comptime_capability: mach.front.comptime.capability;
+use comptime_deep:       mach.front.comptime.deep;
+use comptime_failure:    mach.front.comptime.failure;
+use mach.front.comptime.intrinsic;
+use comptime_path:  mach.front.comptime.path;
+use comptime_scope: mach.front.comptime.scope;
+use comptime_value: mach.front.comptime.value;
+use front_literal:  mach.front.literal;
+use mach.target.ct;
+use mach.target.resolved;
+use type_kind: mach.type.kind;
+use type_prim: mach.type.prim;
+use A:         std.allocator;
+use T:         std.allocator.testing;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view_eq_str;
+
+val COMPTIME_IDENT_UNBOUND_MSG: str =
+    "identifier is not a comptime constant in scope";
+
+val COMPTIME_LAYOUT_NO_RESOLVER_MSG: str =
+    "a layout intrinsic is only comptime-evaluable after type checking: an arm of this `$if` declares something, so the gate selects DECLARATIONS and is decided during name resolution, before any type is laid out. a `$if` whose every arm declares nothing is decided during type checking and can measure a type";
+
+val COMPTIME_MEMBER_NO_RESOLVER_MSG: str =
+    "a module-qualified member path is only comptime-evaluable after name resolution";
+
+val COMPTIME_TYPE_NO_RESOLVER_MSG: str =
+    "a type comparison is only comptime-evaluable after type checking";
+
+val COMPTIME_TYPE_UNRESOLVED_MSG: str =
+    "type comparison operand does not name a type";
+
+pub val COMPTIME_TYPE_NEEDS_INSTANCE_MSG: str =
+    "a type comparison on an unsubstituted generic parameter is only decidable at an instantiation";
+
+val COMPTIME_SEL_NOT_CONSTANT_MSG: str =
+    "`sel` at compile time tests a constant tag: a module `val` constructed as `Type.case{...}` or a `$each` element of a constant array; this place is not one";
+
+val COMPTIME_SEL_DESCRIPTOR_NEEDS_TYPES_MSG: str =
+    "a case descriptor names its case only once the tag's fields are known, so this `sel` is decided during type checking";
+
+val COMPTIME_CASE_DESCRIPTOR_OPERAND_MSG: str =
+    "a bracketed case operand is not a comptime case descriptor";
+
+val COMPTIME_ELEMENT_INDEX_MSG: str =
+    "an index into a constant must be a non-negative integer";
+
+val COMPTIME_CASE_PAYLOAD_MISSING_MSG: str =
+    "this tag case takes no payload";
+
+val COMPTIME_IDENT_RUNTIME_MSG: str =
+    "identifier names a runtime binding, so it has no comptime value";
+
+val COMPTIME_ALIAS_FLOAT_MSG: str =
+    "the width of a float constant whose type comes through an alias is not readable before type checking, so it has no comptime value here. spell the type as `f32` or `f64` on the declaration to fold it at this position";
+
+val COMPTIME_TYPE_QUERY_NO_RESOLVER_MSG: str =
+    "a comptime type predicate is only evaluable after type checking";
+
+val COMPTIME_FIELD_NO_RESOLVER_MSG: str =
+    "a field descriptor member is only comptime-evaluable after type checking";
+
+pub val COMPTIME_FIELD_UNKNOWN_MEMBER_MSG: str =
+    "a field descriptor has only `.name`, `.type`, and `.offset`";
+
+pub val COMPTIME_CASE_UNKNOWN_MEMBER_MSG: str =
+    "a case descriptor has only `.name`, `.has_payload`, `.type`, `.offset`, and `.code`";
+
+pub val COMPTIME_DESCRIPTOR_LAYOUT_MSG: str =
+    "this descriptor's offset has no answer: the layout of its owning type could not be determined";
+
+val COMPTIME_FIELD_UNAVAILABLE_MSG: str =
+    "this field descriptor member is not available until lowering";
+
+val COMPTIME_MEMBER_NOT_CONST_MSG: str =
+    "module-qualified member does not name a module-level constant";
+
+pub val COMPTIME_SECRET_MSG: str =
+    "a value whose type holds a secret has no compile-time value; declassify it where a compile-time value is meant, as in `K:>u64`";
+
+pub fun evaluate[T](
+    c: *comptime_scope.ComptimeCtx,
+    cap_ctx: *T,
+    caps: comptime_capability.PhaseCapabilities[T],
+    a: *ast.Ast,
+    source: str,
+    e: ast_id.ExprId,
+    interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    ret evaluate_at_float_width[T](c, cap_ctx, caps, a, source, e, interner, float.FLOAT_W_NONE);
+}
+
+pub fun evaluate_at_float_width[T](
+    c: *comptime_scope.ComptimeCtx,
+    cap_ctx: *T,
+    caps: comptime_capability.PhaseCapabilities[T],
+    a: *ast.Ast,
+    source: str,
+    e: ast_id.ExprId,
+    interner: *intern.Interner,
+    fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    # lowering materializes only what an earlier phase asked for and checked
+    var ev: Evaluation[T] = Evaluation[T]{c: c, cap_ctx: cap_ctx, caps: caps, a: a, source: source, interner: interner, secret_ok: comptime_capability.capabilities_lowering[T](caps)};
+    ret evaluate_in[T](?ev, e, fw);
+}
+
+# the value of the initializer of a constant whose declared type holds a secret, which may read
+# other secret constants: the value it binds is secret in turn
+pub fun evaluate_secret_at_float_width[T](
+    c: *comptime_scope.ComptimeCtx,
+    cap_ctx: *T,
+    caps: comptime_capability.PhaseCapabilities[T],
+    a: *ast.Ast,
+    source: str,
+    e: ast_id.ExprId,
+    interner: *intern.Interner,
+    fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    var ev: Evaluation[T] = Evaluation[T]{c: c, cap_ctx: cap_ctx, caps: caps, a: a, source: source, interner: interner, secret_ok: true};
+    ret evaluate_in[T](?ev, e, fw);
+}
+
+# one evaluation: the scope it reads and binds in, the phase it asks, the syntax and source
+# text it walks, the interner its strings live in, and whether it may read a secret: under a
+# `:>`, in the initializer of a secret constant, or in lowering
+rec Evaluation[T] {
+    c:         *comptime_scope.ComptimeCtx;
+    cap_ctx:   *T;
+    caps:      comptime_capability.PhaseCapabilities[T];
+    a:         *ast.Ast;
+    source:    str;
+    interner:  *intern.Interner;
+    secret_ok: bool;
+}
+
+fun evaluate_in[T](ev: *Evaluation[T], e: ast_id.ExprId, fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    ret checked_value(ev.interner, evaluate_expression[T](ev, e, fw));
+}
+
+fun checked_value(interner: *intern.Interner, result: res[comptime_value.CTValue, comptime_failure.EvalFail]) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (sel result.err) { ret result; }
+    val value: comptime_value.CTValue = result.ok;
+    if (value.kind > comptime_value.CT_KIND_CASE && value.kind != comptime_value.CT_KIND_NODE) { ret unknown_catalog(interner, "CTKind", value.kind::u32); }
+    ret result;
+}
+
+# the one closed-catalog policy, owned by the interner that outlives this evaluation
+fun unknown_catalog(interner: *intern.Interner, catalog: str, tag: u32) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (interner == nil) { ret comptime_value.internal_failure("comptime catalog diagnostic requires its interner"); }
+    val res_made: res[str, fail.Fail] = base_catalog.catalog_interned(interner, interner.a, base_catalog.unknown_member(catalog, tag));
+    if (sel res_made.err) { ret comptime_value.internal_failure(fail.describe(res_made.err)); }
+    ret comptime_value.internal_failure(res_made.ok);
+}
+
+fun evaluate_expression[T](ev: *Evaluation[T], e: ast_id.ExprId, fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (ast_id.expr_is_nil(e)) { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "missing expression"); }
+
+    val res_expression: res[ast_expr.Expr, comptime_failure.EvalFail] = comptime_capability.read_expression[T](ev.cap_ctx, ev.caps, ev.a, e);
+    if (sel res_expression.err) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_expression.err}; }
+    var node_value: ast_expr.Expr     = res_expression.ok;
+    val node:       *ast_expr.Expr    = ?node_value;
+    val k:          ast_expr.ExprKind = node.kind;
+    # the evaluation recurses as deep as the expression nests, so it asks for stack before it descends
+    if (stack.exhausted()) {
+        ret comptime_value.reject(diagnostic_kind.SYNTAX_NESTING_DEPTH, "input nests deeper than compile-time evaluation descends; the stack has no room left to go deeper");
+    }
+
+    if (k == ast_expr.EXPR_KIND_LIT_INT) { ret eval_lit_int(node.data.lit_int.value, node.data.lit_int.suffix); }
+    if (k == ast_expr.EXPR_KIND_LIT_FLOAT) {
+        var at: float.FloatWidth = fw;
+        if (node.data.lit_float.suffix != ast_expr.LIT_SUFFIX_NONE) { at = type_prim.float_width_of(node.data.lit_float.suffix); }
+        val res_lit: res[float.Rounded, fail.Fail] = front_literal.float_at(ev.source, node.data.lit_float.tok, at);
+        if (sel res_lit.err) { ret comptime_value.reject(diagnostic_kind.LITERAL_MALFORMED, fail.describe(res_lit.err)); }
+        ret comptime_value.float_value(res_lit.ok.value, at);
+    }
+    if (k == ast_expr.EXPR_KIND_LIT_CHAR) { ret eval_lit_char(node.data.lit_char.value); }
+    if (k == ast_expr.EXPR_KIND_LIT_STR)  { ret eval_lit_str(ev.a, node, ev.interner); }
+    if (k == ast_expr.EXPR_KIND_LIT_NIL)  { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "nil is not comptime-evaluable"); }
+
+    if (k == ast_expr.EXPR_KIND_BINARY) { ret eval_binary[T](ev, e, ?node.data.binary, fw); }
+    if (k == ast_expr.EXPR_KIND_UNARY)  { ret eval_unary[T](ev, ?node.data.unary, fw); }
+    if (k == ast_expr.EXPR_KIND_SEL)    { ret eval_sel[T](ev, ?node.data.sel, fw); }
+
+    if (k == ast_expr.EXPR_KIND_MEMBER && intrinsic.is_comptime_path(ev.a, e)) { ret comptime_path.eval_path(ev.c, ev.a, ev.source, e, ev.interner); }
+    if (k == ast_expr.EXPR_KIND_IDENT || k == ast_expr.EXPR_KIND_MEMBER || k == ast_expr.EXPR_KIND_INDEX) {
+        ret public_read[T](ev, e, evaluate_place[T](ev, e, node, fw));
+    }
+
+    if (k == ast_expr.EXPR_KIND_COMPTIME_IDENT) {
+        ret comptime_value.reject(diagnostic_kind.COMPTIME_PATH_ROOT, comptime_path.COMPTIME_BARE_IDENT_MSG);
+    }
+    if (k == ast_expr.EXPR_KIND_CALL) {
+        if (intrinsic.is_path_call(ev.a, e)) { ret eval_path_call[T](ev, e); }
+        val opt_eval_type_query: opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] = eval_type_query[T](ev, e);
+        if (sel opt_eval_type_query.some)                           { ret opt_eval_type_query.some; }
+        if (intrinsic.is_layout_intrinsic_call(ev.a, ev.source, e)) { ret eval_layout_intrinsic[T](ev, e); }
+        ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "function calls are not comptime-evaluable");
+    }
+    if (k == ast_expr.EXPR_KIND_CAST) {
+        if (!comptime_capability.capabilities_cast[T](ev.cap_ctx, ev.caps)) {
+            ret comptime_value.awaiting(comptime_failure.EVAL_FAIL_NEEDS_TYPES, diagnostic_kind.COMPTIME_TOO_EARLY, "a comptime cast requires its resolved source and destination types");
+        }
+        val res_operand: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, node.data.cast.value, float.FLOAT_W_NONE);
+        if (sel res_operand.err) { ret res_operand; }
+        ret ev.caps.cast(ev.cap_ctx, e, res_operand.ok);
+    }
+    if (k == ast_expr.EXPR_KIND_STRIP)      { ret eval_strip[T](ev, node.data.strip.value, fw); }
+    if (k == ast_expr.EXPR_KIND_ARRAY_LIT)  { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "array literals are not comptime-evaluable"); }
+    if (k == ast_expr.EXPR_KIND_STRUCT_LIT) { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "struct literals are not comptime-evaluable"); }
+    if (k == ast_expr.EXPR_KIND_VECTOR_LIT) { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "vector literals are not comptime-evaluable"); }
+    if (k == ast_expr.EXPR_KIND_ERROR)      { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "expression has a parse error"); }
+
+    if (k == ast_expr.EXPR_KIND_PROJECT || k == ast_expr.EXPR_KIND_SPREAD
+        || k == ast_expr.EXPR_KIND_TYPE_REF
+        || k == ast_expr.EXPR_KIND_GENERIC_INSTANCE) { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "expression is not comptime-evaluable"); }
+    ret unknown_catalog(ev.interner, "ExprKind", k::u32);
+}
+
+# a name, a member path or an element read: the constant or descriptor member it reads
+fun evaluate_place[T](ev: *Evaluation[T], e: ast_id.ExprId, node: *ast_expr.Expr, fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (node.kind == ast_expr.EXPR_KIND_IDENT) {
+        val res_eval_ident: res[comptime_value.CTValue, comptime_failure.EvalFail] = eval_ident[T](ev, e, node.data.ident.name);
+        if (sel res_eval_ident.err) { ret res_eval_ident; }
+        val v_id: comptime_value.CTValue = res_eval_ident.ok;
+        if (v_id.kind == comptime_value.CT_KIND_CONST_ELEM) {
+            ret evaluate_in[T](ev, v_id.data.celem.elem::ast_id.ExprId, fw);
+        }
+        ret node_read[T](ev, v_id);
+    }
+    if (node.kind == ast_expr.EXPR_KIND_INDEX) {
+        val opt_element: opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] = eval_const_elem_index[T](ev, e, ?node.data.index);
+        if (sel opt_element.some) { ret opt_element.some; }
+        ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "index expressions are not comptime-evaluable");
+    }
+    val opt_cel: opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] =
+        eval_const_elem_member[T](ev, e, node.data.member.object, node.data.member.name_id, fw);
+    if (sel opt_cel.some) { ret opt_cel.some; }
+    val opt_fld: opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] =
+        eval_field_member[T](ev, node.data.member.object, node.data.member.name);
+    if (sel opt_fld.some) { ret opt_fld.some; }
+    val res_member: res[comptime_value.CTValue, comptime_failure.EvalFail] = eval_module_member[T](ev.cap_ctx, ev.caps, e);
+    if (sel res_member.err) { ret res_member; }
+    val res_read: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime_value.readable(res_member.ok, ev.interner);
+    if (sel res_read.err) { ret res_read; }
+    ret node_read[T](ev, res_read.ok);
+}
+
+# a value whose type holds a secret has no compile-time value: a place reading one is refused
+# unless the evaluation may read a secret. the phase that holds types answers from the type it
+# gives the place, and an earlier phase from what the binding of the constant records
+fun public_read[T](ev: *Evaluation[T], e: ast_id.ExprId, r: res[comptime_value.CTValue, comptime_failure.EvalFail]) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (sel r.err)                               { ret r; }
+    if (ev.secret_ok || !holds_value(r.ok.kind)) { ret r; }
+    var secret: bool = r.ok.secret;
+    if (!secret && ev.caps.secret != nil) { secret = ev.caps.secret(ev.cap_ctx, e); }
+    if (!secret)                          { ret r; }
+    ret comptime_value.reject(diagnostic_kind.SECRET_COMPTIME, COMPTIME_SECRET_MSG);
+}
+
+# whether a value of this kind is data a program declared, which a secret can be, rather than a
+# type or a descriptor, which never is
+fun holds_value(k: comptime_value.CTKind) bool {
+    ret k != comptime_value.CT_KIND_TYPE && k != comptime_value.CT_KIND_FIELD && k != comptime_value.CT_KIND_CASE && k != comptime_value.CT_KIND_PACK_ELEM;
+}
+
+# `v:>T` of a constant: the operand read as a secret may be, and its value public
+fun eval_strip[T](ev: *Evaluation[T], operand: ast_id.ExprId, fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    val outer: bool = ev.secret_ok;
+    ev.secret_ok = true;
+    val res_evaluate_in: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, operand, fw);
+    ev.secret_ok = outer;
+    if (sel res_evaluate_in.err) { ret res_evaluate_in; }
+    var v: comptime_value.CTValue = res_evaluate_in.ok;
+    v.secret = false;
+    ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{v};
+}
+
+fun eval_layout_intrinsic[T](ev: *Evaluation[T], e: ast_id.ExprId) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (!comptime_capability.capabilities_have_types[T](ev.cap_ctx, ev.caps) || ev.caps.layout == nil) {
+        ret comptime_value.awaiting(comptime_failure.EVAL_FAIL_NEEDS_LAYOUT, diagnostic_kind.COMPTIME_TOO_EARLY, COMPTIME_LAYOUT_NO_RESOLVER_MSG);
+    }
+    val res_layout: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = ev.caps.layout(ev.cap_ctx, e::u32);
+    if (sel res_layout.err) {
+        ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_layout.err};
+    }
+    val opt_ans: opt[comptime_value.CTValue] = res_layout.ok;
+    if (sel opt_ans.none) {
+        ret comptime_value.reject(diagnostic_kind.COMPTIME_TOO_EARLY, "this layout intrinsic has no value in this phase");
+    }
+    ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{opt_ans.some};
+}
+
+# an integer literal's value and suffix as the parser read them
+fun eval_lit_int(value: wide.Wide, suffix: type_kind.TypeKind) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (suffix != ast_expr.LIT_SUFFIX_NONE && !type_prim.int_fits_either_sign(value, suffix)) {
+        ret comptime_value.reject(diagnostic_kind.LITERAL_OUT_OF_RANGE, front_literal.SUFFIX_RANGE_MSG);
+    }
+
+    # an unsuffixed literal is as wide as it must be: 64 bits when it fits
+    # them, 128 otherwise; it reads unsigned once it exceeds that width's
+    # signed maximum
+    var width: u32 = 64;
+    if (!wide.fits_unsigned(value, 64)) { width = 128; }
+    val res_make_int_wide: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime_value.int_wide_make(value, wide.bit_length(value) == width);
+    if (sel res_make_int_wide.err) { ret res_make_int_wide; }
+    var out: comptime_value.CTValue = res_make_int_wide.ok;
+    out.int_width = width::u8;
+    if (suffix != ast_expr.LIT_SUFFIX_NONE) {
+        val d: type_prim.PrimDesc = type_prim.prim_desc(suffix);
+        out.int_width    = comptime_value.width_held(d.width);
+        out.int_unsigned = !d.signed;
+    }
+    ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{out};
+}
+
+fun eval_lit_char(value: u32) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    var v: comptime_value.CTValue;
+    v.kind         = comptime_value.CT_KIND_INT;
+    v.int_unsigned = true;
+    v.int_width    = 8;
+    v.data.w       = wide.from_u64(value::u64);
+    ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{v};
+}
+
+fun eval_lit_str(a: *ast.Ast, e: *ast_expr.Expr, interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    val bytes:         View                       = ast.lit_str_value(a, e);
+    val res_bytes_add: res[intern.StrId, A.Error] = intern.bytes_add(interner, bytes.data::str, bytes.len);
+    if (sel res_bytes_add.err) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{comptime_failure.eval_internal(base_alloc.text(res_bytes_add.err))}; }
+    var v: comptime_value.CTValue;
+    v.kind   = comptime_value.CT_KIND_STR;
+    v.data.s = res_bytes_add.ok;
+    ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{v};
+}
+
+fun eval_binary[T](ev: *Evaluation[T], eid: ast_id.ExprId, bin: *ast_expr.ExprBinary, fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (bin.op > ast_expr.BIN_ASSIGN)  { ret unknown_catalog(ev.interner, "BinOp", bin.op::u32); }
+    if (bin.op == ast_expr.BIN_ASSIGN) { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "assignment is not comptime-evaluable"); }
+
+    if (bin.op == ast_expr.BIN_AND || bin.op == ast_expr.BIN_OR) {
+        ret eval_logical[T](ev, bin);
+    }
+
+    if (bin.op == ast_expr.BIN_EQ || bin.op == ast_expr.BIN_NEQ) {
+        var type_comparison: bool = intrinsic.is_type_comparison(ev.a, ev.source, bin);
+        if (!type_comparison) {
+            val res_field_type_eval_operand: res[bool, comptime_failure.EvalFail] = field_type_eval_operand[T](ev, bin.lhs);
+            if (sel res_field_type_eval_operand.err) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_field_type_eval_operand.err}; }
+            type_comparison = res_field_type_eval_operand.ok;
+        }
+        if (!type_comparison) {
+            val res_field_type_eval_operand: res[bool, comptime_failure.EvalFail] = field_type_eval_operand[T](ev, bin.rhs);
+            if (sel res_field_type_eval_operand.err) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_field_type_eval_operand.err}; }
+            type_comparison = res_field_type_eval_operand.ok;
+        }
+        if (type_comparison) { ret eval_type_comparison[T](ev, bin); }
+    }
+
+    var operand_fw: float.FloatWidth = fw;
+    if (bin.op == ast_expr.BIN_EQ || bin.op == ast_expr.BIN_NEQ
+        || bin.op == ast_expr.BIN_LT || bin.op == ast_expr.BIN_LEQ
+        || bin.op == ast_expr.BIN_GT || bin.op == ast_expr.BIN_GEQ) {
+        operand_fw = float.FLOAT_W_NONE;
+    }
+
+    val res_lhs: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, bin.lhs, operand_fw);
+    if (sel res_lhs.err) { ret res_lhs; }
+    val res_rhs: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, bin.rhs, operand_fw);
+    if (sel res_rhs.err) { ret res_rhs; }
+
+    var lhs: comptime_value.CTValue = res_lhs.ok;
+    val rhs: comptime_value.CTValue = res_rhs.ok;
+
+    # an unsuffixed literal is shifted at the width its context gave it, not the i64 default
+    if ((bin.op == ast_expr.BIN_SHL || bin.op == ast_expr.BIN_SHR) && comptime_capability.capabilities_have_types[T](ev.cap_ctx, ev.caps)
+        && is_unsuffixed_int(ev.a, bin.lhs)) {
+        val res_typed: res[comptime_value.CTValue, comptime_failure.EvalFail] = checked_value(ev.interner, ev.caps.scalar(ev.cap_ctx, bin.lhs, lhs));
+        if (sel res_typed.err) { ret res_typed; }
+        lhs = res_typed.ok;
+    }
+
+    if (bin.op == ast_expr.BIN_EQ || bin.op == ast_expr.BIN_NEQ) {
+        ret comptime_value.apply_equality(bin.op, lhs, rhs);
+    }
+    if (bin.op == ast_expr.BIN_LT || bin.op == ast_expr.BIN_LEQ
+        || bin.op == ast_expr.BIN_GT || bin.op == ast_expr.BIN_GEQ) {
+        ret comptime_value.apply_compare(bin.op, lhs, rhs);
+    }
+    val res_apply_arith: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime_value.apply_arith(bin.op, lhs, rhs, ev.c.env.target.nans);
+    if (sel res_apply_arith.err) {
+        # a NaN result folds only where the target states the NaN it computes
+        if (res_apply_arith.err.diag == diagnostic_kind.COMPTIME_NAN_UNSPECIFIED) {
+            ret comptime_value.nan_unspecified(ev.interner, ev.c.env.target.arch_id, ev.c.env.target.nans, float.unify_width(lhs.float_width, rhs.float_width));
+        }
+        ret res_apply_arith;
+    }
+    if ((bin.op == ast_expr.BIN_BIT_AND || bin.op == ast_expr.BIN_BIT_OR || bin.op == ast_expr.BIN_BIT_XOR)
+        && comptime_capability.capabilities_have_types[T](ev.cap_ctx, ev.caps)) {
+        ret ev.caps.scalar(ev.cap_ctx, eid, res_apply_arith.ok);
+    }
+    ret res_apply_arith;
+}
+
+fun is_unsuffixed_int(a: *ast.Ast, eid: ast_id.ExprId) bool {
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(a, eid);
+    if (!sel opt_expr.some) { ret false; }
+    ret opt_expr.some.kind == ast_expr.EXPR_KIND_LIT_INT && opt_expr.some.data.lit_int.suffix == ast_expr.LIT_SUFFIX_NONE;
+}
+
+fun eval_unary[T](ev: *Evaluation[T], un: *ast_expr.ExprUnary, fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (un.op > ast_expr.UN_DEREF) { ret unknown_catalog(ev.interner, "UnOp", un.op::u32); }
+    if (un.op == ast_expr.UN_ADDR || un.op == ast_expr.UN_DEREF) {
+        ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "address-of and dereference are not comptime-evaluable");
+    }
+
+    val res_evaluate_in: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, un.operand, fw);
+    if (sel res_evaluate_in.err) { ret res_evaluate_in; }
+    var v: comptime_value.CTValue = res_evaluate_in.ok;
+    if (un.op == ast_expr.UN_BIT_NOT && comptime_capability.capabilities_have_types[T](ev.cap_ctx, ev.caps)) {
+        val res_typed: res[comptime_value.CTValue, comptime_failure.EvalFail] = checked_value(ev.interner, ev.caps.scalar(ev.cap_ctx, un.operand, v));
+        if (sel res_typed.err) { ret res_typed; }
+        v = res_typed.ok;
+    }
+
+    if (un.op == ast_expr.UN_NEG) {
+        if (v.kind == comptime_value.CT_KIND_INT)   { ret comptime_value.ct_negate(v); }
+        if (v.kind == comptime_value.CT_KIND_FLOAT) { ret comptime_value.float_value(comptime_value.float_negated(v.data.f, v.float_width), v.float_width); }
+        ret comptime_value.reject(diagnostic_kind.COMPTIME_OPERAND_TYPE, "unary - requires a numeric operand");
+    }
+    if (un.op == ast_expr.UN_NOT) {
+        if (v.kind != comptime_value.CT_KIND_INT || (v.int_width != 0 && !comptime_value.is_u1(v))) {
+            ret comptime_value.reject(diagnostic_kind.COMPTIME_OPERAND_TYPE, "unary ! requires a u1 operand");
+        }
+        var out: comptime_value.CTValue = comptime_value.ct_u1(!comptime_value.truth(v));
+        if (v.int_width == 0) { out.int_width = 0; }
+        ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{out};
+    }
+    if (un.op == ast_expr.UN_BIT_NOT) {
+        if (v.kind != comptime_value.CT_KIND_INT) { ret comptime_value.reject(diagnostic_kind.COMPTIME_OPERAND_TYPE, "unary ~ requires an integer operand"); }
+        if (v.int_width == 0)                     { ret comptime_value.int_wide_make(comptime_value.complement(v.data.w), v.int_unsigned); }
+        ret comptime_value.cast_int(comptime_value.complement(v.data.w), v.int_width::u32, !v.int_unsigned);
+    }
+    ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "unsupported unary operator");
+}
+
+fun eval_logical[T](ev: *Evaluation[T], bin: *ast_expr.ExprBinary) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    val res_lhs: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, bin.lhs, float.FLOAT_W_NONE);
+    if (sel res_lhs.err) { ret res_lhs; }
+    val lhs: comptime_value.CTValue = res_lhs.ok;
+    if (lhs.kind != comptime_value.CT_KIND_INT || (lhs.int_width != 0 && !comptime_value.is_u1(lhs))) {
+        ret comptime_value.reject(diagnostic_kind.COMPTIME_OPERAND_TYPE, "logical operator requires u1 operands");
+    }
+
+    if ((bin.op == ast_expr.BIN_AND && !comptime_value.truth(lhs)) || (bin.op == ast_expr.BIN_OR && comptime_value.truth(lhs))) {
+        ret short_circuit[T](ev, bin, lhs);
+    }
+
+    val res_rhs: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, bin.rhs, float.FLOAT_W_NONE);
+    if (sel res_rhs.err) { ret res_rhs; }
+    val rhs: comptime_value.CTValue = res_rhs.ok;
+    if (rhs.kind != comptime_value.CT_KIND_INT || (rhs.int_width != 0 && !comptime_value.is_u1(rhs))) {
+        ret comptime_value.reject(diagnostic_kind.COMPTIME_OPERAND_TYPE, "logical operator requires u1 operands");
+    }
+
+    var out: comptime_value.CTValue = comptime_value.ct_u1(comptime_value.truth(rhs));
+    if (lhs.int_width == 0 || rhs.int_width == 0) { out.int_width = 0; }
+    ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{out};
+}
+
+fun short_circuit[T](ev: *Evaluation[T], bin: *ast_expr.ExprBinary, lhs: comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    var out: comptime_value.CTValue = comptime_value.ct_u1(bin.op == ast_expr.BIN_OR);
+    out.int_width = lhs.int_width;
+    val res_rhs: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, bin.rhs, float.FLOAT_W_NONE);
+    if (sel res_rhs.err) {
+        if (res_rhs.err.kind == comptime_failure.EVAL_FAIL_INTERNAL) { ret res_rhs; }
+        ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{out};
+    }
+    val rhs: comptime_value.CTValue = res_rhs.ok;
+    if (rhs.kind != comptime_value.CT_KIND_INT || (rhs.int_width != 0 && !comptime_value.is_u1(rhs))) {
+        ret comptime_value.reject(diagnostic_kind.COMPTIME_OPERAND_TYPE, "logical operator requires u1 operands");
+    }
+    if (rhs.int_width == 0) { out.int_width = 0; }
+    ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{out};
+}
+
+pub fun declared_float_width(a: *ast.Ast, source: str, t: ast_id.TypeId) float.FloatWidth {
+    if (ast_id.type_is_nil(t)) { ret float.FLOAT_W_NONE; }
+    val opt_found: opt[*ast_type.Type] = ast.get_type(a, t);
+    if (!sel opt_found.some) { ret float.FLOAT_W_NONE; }
+    val ty: *ast_type.Type = opt_found.some;
+
+    if (ty.kind == ast_type.TYPE_KIND_SECRET) {
+        ret declared_float_width(a, source, ty.data.secret.inner);
+    }
+    if (ty.kind != ast_type.TYPE_KIND_NAMED) { ret float.FLOAT_W_NONE; }
+    if (ty.data.named.args_len != 0)         { ret float.FLOAT_W_NONE; }
+
+    val opt_kind: opt[type_kind.TypeKind] = type_prim.prim_from_view(base_source.span_view(source, ty.data.named.name));
+    if (!sel opt_kind.some) { ret float.FLOAT_W_NONE; }
+    ret type_prim.float_width_of(opt_kind.some);
+}
+
+pub fun error_message[T](
+    c: *comptime_scope.ComptimeCtx,
+    cap_ctx: *T,
+    caps: comptime_capability.PhaseCapabilities[T],
+    a: *ast.Ast,
+    source: str,
+    eid: ast_id.ExprId,
+    interner: *intern.Interner) res[str, comptime_failure.EvalFail] {
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(a, eid);
+    if (sel opt_expr.none) { ret res[str, comptime_failure.EvalFail].err{comptime_failure.eval_error(comptime_failure.EVAL_FAIL_REJECTED, diagnostic_kind.COMPTIME_ERROR_DIRECTIVE, "comptime `$error` directive is malformed")}; }
+    val node: *ast_expr.Expr = opt_expr.some;
+    if (node.kind != ast_expr.EXPR_KIND_CALL || node.data.call.args_len != 1) {
+        ret res[str, comptime_failure.EvalFail].err{comptime_failure.eval_error(comptime_failure.EVAL_FAIL_REJECTED, diagnostic_kind.COMPTIME_ERROR_DIRECTIVE, "comptime `$error` takes one string-literal message")};
+    }
+    val arg:          ast_id.ExprId                                          = a.expr_ids.data[node.data.call.args_start];
+    val res_evaluate: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate[T](c, cap_ctx, caps, a, source, arg, interner);
+    if (sel res_evaluate.err) { ret res[str, comptime_failure.EvalFail].err{res_evaluate.err}; }
+    val v: comptime_value.CTValue = res_evaluate.ok;
+    if (v.kind != comptime_value.CT_KIND_STR) { ret res[str, comptime_failure.EvalFail].err{comptime_failure.eval_error(comptime_failure.EVAL_FAIL_REJECTED, diagnostic_kind.COMPTIME_ERROR_DIRECTIVE, "comptime `$error` message must be a string")}; }
+    val opt_txt: opt[str] = intern.get(interner, v.data.s);
+    if (sel opt_txt.none) { ret res[str, comptime_failure.EvalFail].err{comptime_failure.eval_internal("comptime `$error` message could not be read")}; }
+    ret res[str, comptime_failure.EvalFail].ok{opt_txt.some};
+}
+
+fun field_type_eval_operand[T](ev: *Evaluation[T], eid: ast_id.ExprId) res[bool, comptime_failure.EvalFail] {
+    if (!intrinsic.is_field_type_member(ev.a, ev.source, eid)) { ret res[bool, comptime_failure.EvalFail].ok{false}; }
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(ev.a, eid);
+    if (sel opt_expr.none) { ret res[bool, comptime_failure.EvalFail].ok{false}; }
+    val node:    *ast_expr.Expr                                         = opt_expr.some;
+    val res_obj: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, node.data.member.object, float.FLOAT_W_NONE);
+    if (sel res_obj.err) {
+        val f: comptime_failure.EvalFail = res_obj.err;
+        if (f.kind == comptime_failure.EVAL_FAIL_INTERNAL) { ret res[bool, comptime_failure.EvalFail].err{f}; }
+        ret res[bool, comptime_failure.EvalFail].ok{false};
+    }
+    ret res[bool, comptime_failure.EvalFail].ok{comptime_value.is_descriptor(res_obj.ok)};
+}
+
+fun eval_type_comparison[T](ev: *Evaluation[T], bin: *ast_expr.ExprBinary) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    val res_eval_type_operand: res[comptime_value.CTValue, comptime_failure.EvalFail] = eval_type_operand[T](ev, bin.lhs);
+    if (sel res_eval_type_operand.err) { ret res_eval_type_operand; }
+    val res_eval_type_operand_rhs: res[comptime_value.CTValue, comptime_failure.EvalFail] = eval_type_operand[T](ev, bin.rhs);
+    if (sel res_eval_type_operand_rhs.err) { ret res_eval_type_operand_rhs; }
+    ret comptime_value.apply_equality(bin.op, res_eval_type_operand.ok, res_eval_type_operand_rhs.ok);
+}
+
+fun eval_type_query[T](ev: *Evaluation[T], e: ast_id.ExprId) opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] {
+    val id:    intrinsic.Id = intrinsic.call_intrinsic(ev.a, ev.source, e);
+    var which: u8           = comptime_capability.TYPE_QUERY_IS_RECORD;
+    if (id == intrinsic.IS_RECORD)    { which = comptime_capability.TYPE_QUERY_IS_RECORD; }
+    or (id == intrinsic.IS_UNION)     { which = comptime_capability.TYPE_QUERY_IS_UNION; }
+    or (id == intrinsic.IS_TAG)       { which = comptime_capability.TYPE_QUERY_IS_TAG; }
+    or (id == intrinsic.IS_POINTER)   { which = comptime_capability.TYPE_QUERY_IS_POINTER; }
+    or (id == intrinsic.IS_SECRET)    { which = comptime_capability.TYPE_QUERY_IS_SECRET; }
+    or (id == intrinsic.HOLDS_SECRET) { which = comptime_capability.TYPE_QUERY_HOLDS_SECRET; }
+    or (id == intrinsic.IS_INTEGER)   { which = comptime_capability.TYPE_QUERY_IS_INTEGER; }
+    or (id == intrinsic.IS_FLOAT)     { which = comptime_capability.TYPE_QUERY_IS_FLOAT; }
+    or (id == intrinsic.TYPE_NAME)    { which = comptime_capability.TYPE_QUERY_NAME; }
+    or                                { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+
+    val arg: ast_id.ExprId = intrinsic.first_call_arg(ev.a, e);
+    if (ast_id.expr_is_nil(arg)) {
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{
+            comptime_value.reject(diagnostic_kind.COMPTIME_TYPE_OPERAND, "a comptime type query takes one type argument")
+        };
+    }
+
+    val res_eval_type_operand: res[comptime_value.CTValue, comptime_failure.EvalFail] = eval_type_operand[T](ev, arg);
+    if (sel res_eval_type_operand.err) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res_eval_type_operand}; }
+    val t: comptime_value.CTValue = res_eval_type_operand.ok;
+    if (t.kind != comptime_value.CT_KIND_TYPE) {
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{
+            comptime_value.reject(diagnostic_kind.COMPTIME_TYPE_OPERAND, "a comptime type query's argument must name a type")
+        };
+    }
+
+    if (!comptime_capability.capabilities_have_types[T](ev.cap_ctx, ev.caps) || ev.caps.query == nil) {
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{comptime_value.awaiting(comptime_failure.EVAL_FAIL_NEEDS_TYPES, diagnostic_kind.COMPTIME_TOO_EARLY, COMPTIME_TYPE_QUERY_NO_RESOLVER_MSG)};
+    }
+    val res_query: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = ev.caps.query(ev.cap_ctx, t.data.t, which);
+    if (sel res_query.err) {
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_query.err}};
+    }
+    val opt_ans: opt[comptime_value.CTValue] = res_query.ok;
+    if (sel opt_ans.none) {
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{comptime_value.awaiting(comptime_failure.EVAL_FAIL_NEEDS_TYPES, diagnostic_kind.COMPTIME_TOO_EARLY, COMPTIME_TYPE_QUERY_NO_RESOLVER_MSG)};
+    }
+    ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].ok{opt_ans.some}};
+}
+
+fun eval_type_operand[T](ev: *Evaluation[T], operand: ast_id.ExprId) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (intrinsic.is_field_type_member(ev.a, ev.source, operand)) {
+        val res_direct: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, operand, float.FLOAT_W_NONE);
+        if (sel res_direct.err)                                { ret res_direct; }
+        if (res_direct.ok.kind == comptime_value.CT_KIND_TYPE) { ret res_direct; }
+    }
+    if (!comptime_capability.capabilities_have_types[T](ev.cap_ctx, ev.caps) || ev.caps.type_ == nil) { ret comptime_value.awaiting(comptime_failure.EVAL_FAIL_NEEDS_TYPES, diagnostic_kind.COMPTIME_TOO_EARLY, COMPTIME_TYPE_NO_RESOLVER_MSG); }
+    val value_eid: ast_id.ExprId                            = intrinsic.type_operand_value(ev.a, ev.source, operand);
+    val res_type_: res[opt[u32], comptime_failure.EvalFail] = ev.caps.type_(ev.cap_ctx, value_eid);
+    if (sel res_type_.err) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_type_.err}; }
+    val opt_evaluated: opt[u32] = res_type_.ok;
+    if (sel opt_evaluated.none) { ret comptime_value.reject(diagnostic_kind.COMPTIME_TYPE_OPERAND, COMPTIME_TYPE_UNRESOLVED_MSG); }
+    ret comptime_value.type_value(opt_evaluated.some);
+}
+
+fun eval_ident[T](ev: *Evaluation[T], e: ast_id.ExprId, name: intern.StrId) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (comptime_capability.capabilities_have_ident[T](ev.cap_ctx, ev.caps)) {
+        if (ev.caps.ident(ev.cap_ctx, e)) { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_CONSTANT, COMPTIME_IDENT_RUNTIME_MSG); }
+    }
+
+    val opt_lookup: opt[comptime_scope.NamedConst] = comptime_scope.lookup(ev.c, name);
+    if (!sel opt_lookup.some) {
+        if (comptime_scope.float_width_deferred(ev.c, name)) {
+            ret comptime_value.reject(diagnostic_kind.COMPTIME_TOO_EARLY, COMPTIME_ALIAS_FLOAT_MSG);
+        }
+        if (comptime_capability.capabilities_have_constant[T](ev.cap_ctx, ev.caps)) {
+            val res_bound: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = ev.caps.constant(ev.cap_ctx, e);
+            if (sel res_bound.err) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_bound.err}; }
+            val opt_value: opt[comptime_value.CTValue] = res_bound.ok;
+            if (sel opt_value.some) { ret comptime_value.readable(opt_value.some, ev.interner); }
+        }
+        ret comptime_value.awaiting(comptime_failure.EVAL_FAIL_UNBOUND, diagnostic_kind.COMPTIME_NOT_CONSTANT, COMPTIME_IDENT_UNBOUND_MSG);
+    }
+    if (opt_lookup.some.value.kind == comptime_value.CT_KIND_CONST_ELEM && comptime_capability.capabilities_have_constant[T](ev.cap_ctx, ev.caps)) {
+        # a phase that builds published values reads an aggregate constant as that value
+        val res_published: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = ev.caps.constant(ev.cap_ctx, e);
+        if (sel res_published.err) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_published.err}; }
+        val opt_value: opt[comptime_value.CTValue] = res_published.ok;
+        if (sel opt_value.some) { ret comptime_value.readable(opt_value.some, ev.interner); }
+    }
+    ret comptime_value.readable(opt_lookup.some.value, ev.interner);
+}
+
+fun eval_module_member[T](cap_ctx: *T, caps: comptime_capability.PhaseCapabilities[T], e: ast_id.ExprId) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (!comptime_capability.capabilities_have_member[T](cap_ctx, caps)) { ret comptime_value.awaiting(comptime_failure.EVAL_FAIL_NEEDS_MEMBER, diagnostic_kind.COMPTIME_TOO_EARLY, COMPTIME_MEMBER_NO_RESOLVER_MSG); }
+    val res_member: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = caps.member(cap_ctx, e);
+    if (sel res_member.err) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_member.err}; }
+    val opt_evaluated: opt[comptime_value.CTValue] = res_member.ok;
+    if (sel opt_evaluated.some) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{opt_evaluated.some}; }
+    ret comptime_value.awaiting(comptime_failure.EVAL_FAIL_NEEDS_MEMBER, diagnostic_kind.COMPTIME_NOT_CONSTANT, COMPTIME_MEMBER_NOT_CONST_MSG);
+}
+
+fun eval_field_member[T](ev: *Evaluation[T], object_eid: ast_id.ExprId, member_span: base_source.Span) opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] {
+    val res_obj: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, object_eid, float.FLOAT_W_NONE);
+    if (sel res_obj.err) {
+        if (res_obj.err.kind == comptime_failure.EVAL_FAIL_INTERNAL) {
+            ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res_obj};
+        }
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{};
+    }
+    val obj: comptime_value.CTValue = res_obj.ok;
+    if (!comptime_value.is_descriptor(obj)) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+
+    val mtext: View = base_source.span_view(ev.source, member_span);
+    var pick:  u8   = comptime_capability.FIELD_SEL_NAME;
+    if (view_eq_str(mtext, "name"))                                                   { pick = comptime_capability.FIELD_SEL_NAME; }
+    or (view_eq_str(mtext, "type"))                                                   { pick = comptime_capability.FIELD_SEL_TYPE; }
+    or (view_eq_str(mtext, "offset"))                                                 { pick = comptime_capability.FIELD_SEL_OFFSET; }
+    or (obj.kind == comptime_value.CT_KIND_CASE && view_eq_str(mtext, "has_payload")) { pick = comptime_capability.FIELD_SEL_HAS_PAYLOAD; }
+    or (obj.kind == comptime_value.CT_KIND_CASE && view_eq_str(mtext, "code"))        { pick = comptime_capability.FIELD_SEL_CODE; }
+    or (obj.kind == comptime_value.CT_KIND_CASE)                                      { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{comptime_value.reject(diagnostic_kind.COMPTIME_DESCRIPTOR_MEMBER, COMPTIME_CASE_UNKNOWN_MEMBER_MSG)}; }
+    or                                                                                { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{comptime_value.reject(diagnostic_kind.COMPTIME_DESCRIPTOR_MEMBER, COMPTIME_FIELD_UNKNOWN_MEMBER_MSG)}; }
+
+    if (!comptime_capability.capabilities_have_types[T](ev.cap_ctx, ev.caps) || ev.caps.offset == nil) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{comptime_value.reject(diagnostic_kind.COMPTIME_TOO_EARLY, COMPTIME_FIELD_NO_RESOLVER_MSG)}; }
+    val res_field_of: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = comptime_capability.field_of[T](ev.cap_ctx, ev.caps, obj.data.fld.owner, obj.data.fld.index, pick);
+    if (sel res_field_of.err) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_field_of.err}}; }
+    val opt_evaluated: opt[comptime_value.CTValue] = res_field_of.ok;
+    if (sel opt_evaluated.none) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{comptime_value.reject(diagnostic_kind.COMPTIME_TOO_EARLY, COMPTIME_FIELD_UNAVAILABLE_MSG)}; }
+    ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].ok{opt_evaluated.some}};
+}
+
+fun eval_const_elem_member[T](ev: *Evaluation[T], eid: ast_id.ExprId, object_eid: ast_id.ExprId, mname: intern.StrId, fw: float.FloatWidth) opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] {
+    # a member with no name was reported by the parse, and names no element
+    if (intern.str_is_nil(mname)) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+    val res_obj_read: res[ast_expr.Expr, comptime_failure.EvalFail] = comptime_capability.read_expression[T](ev.cap_ctx, ev.caps, ev.a, object_eid);
+    if (sel res_obj_read.err) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_obj_read.err}}; }
+    var obj_node: ast_expr.Expr  = res_obj_read.ok;
+    val obj:      *ast_expr.Expr = ?obj_node;
+
+    val res_obj: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = eval_const_elem_object[T](ev, object_eid, fw);
+    if (sel res_obj.err) {
+        val kind: comptime_failure.EvalFailKind = res_obj.err.kind;
+        # a nested constant read that was refused (the case it does not hold) is the answer; a plain
+        # identifier that is not a constant falls through to the other member readers as before
+        if (kind == comptime_failure.EVAL_FAIL_INTERNAL || (kind == comptime_failure.EVAL_FAIL_REJECTED && is_constant_path(obj))) {
+            ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_obj.err}};
+        }
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{};
+    }
+    val opt_obj_r: opt[comptime_value.CTValue] = res_obj.ok;
+    if (sel opt_obj_r.none) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+    val ov: comptime_value.CTValue = opt_obj_r.some;
+
+    if (ov.kind == comptime_value.CT_KIND_NODE) { ret node_member[T](ev, eid, ov, mname); }
+    val opt_read: opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] = const_elem_member[T](ev, ov, mname, fw);
+    if (sel opt_read.none) { ret opt_read; }
+    val res_read: res[comptime_value.CTValue, comptime_failure.EvalFail] = opt_read.some;
+    if (sel res_read.err) { ret opt_read; }
+    # a member of a secret constant element is secret as the element is, to a phase without types
+    var member: comptime_value.CTValue = res_read.ok;
+    member.secret = member.secret || ov.secret;
+    ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].ok{member}};
+}
+
+# member `mname` of the constant element `ov`: the payload of the case its literal holds, or a field
+# of its record literal; none for a member it does not answer
+fun const_elem_member[T](ev: *Evaluation[T], ov: comptime_value.CTValue, mname: intern.StrId, fw: float.FloatWidth) opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] {
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(ev.a, ov.data.celem.elem::ast_id.ExprId);
+    if (sel opt_expr.none) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+    val el: *ast_expr.Expr = opt_expr.some;
+    if (ast_id.type_is_nil(literal_head_type(el))) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+
+    val res_head: res[intern.StrId, comptime_failure.EvalFail] = case_literal_head[T](ev, el);
+    if (sel res_head.err) {
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_head.err}};
+    }
+    val head: intern.StrId = res_head.ok;
+    if (!intern.str_is_nil(head)) {
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{constant_payload[T](ev, el, ov.data.celem.ty, head, mname, fw)};
+    }
+    if (el.kind != ast_expr.EXPR_KIND_STRUCT_LIT) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+
+    var i: u32 = 0;
+    for (i < el.data.struct_lit.fields_len) {
+        val pool_ix: usize = (el.data.struct_lit.fields_start + i)::usize;
+        if (pool_ix >= ev.a.field_inits.len) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+        val fi: *ast_expr.FieldInit = ?ev.a.field_inits.data[pool_ix];
+        if (intern.str_same(fi.name_id, mname)) {
+            ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{constant_leaf[T](ev, fi.value, ov.data.celem.ty, mname, fw)};
+        }
+        i = i + 1;
+    }
+
+    ret field_zero[T](ev, ov.data.celem.ty, mname);
+}
+
+# the zero of field `name` of `owner`, which a constant that leaves it out holds, from a phase
+# that holds types; none for a phase that holds none or a name the owner does not declare
+fun field_zero[T](ev: *Evaluation[T], owner: u32, name: intern.StrId) opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] {
+    if (!comptime_capability.capabilities_have_types[T](ev.cap_ctx, ev.caps)) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+    val res_field_of: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = comptime_capability.field_of[T](ev.cap_ctx, ev.caps, owner, name::u32, comptime_capability.FIELD_SEL_TYPE_BY_NAME);
+    if (sel res_field_of.err)     { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_field_of.err}}; }
+    if (sel res_field_of.ok.none) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+    ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{ev.caps.zero(ev.cap_ctx, res_field_of.ok.some.data.t)};
+}
+
+# the constant element an expression names: a module `val` constructed as a case literal or an
+# element of a published constant value, spelled as the binding itself or as a member path into
+# it; ok(none) when the expression evaluates to something else, err when evaluating it fails
+fun eval_const_elem_object[T](ev: *Evaluation[T], eid: ast_id.ExprId, fw: float.FloatWidth) res[opt[comptime_value.CTValue], comptime_failure.EvalFail] {
+    val res_none: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}};
+    # the expression as name resolution read it, so `A[N]` with a named index is an element read
+    val res_read: res[ast_expr.Expr, comptime_failure.EvalFail] = comptime_capability.read_expression[T](ev.cap_ctx, ev.caps, ev.a, eid);
+    if (sel res_read.err) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].err{res_read.err}; }
+    var node:           ast_expr.Expr  = res_read.ok;
+    val e:              *ast_expr.Expr = ?node;
+    var res_eval_ident: res[comptime_value.CTValue, comptime_failure.EvalFail];
+    if (e.kind == ast_expr.EXPR_KIND_IDENT) { res_eval_ident = eval_ident[T](ev, eid, e.data.ident.name); }
+    or (e.kind == ast_expr.EXPR_KIND_MEMBER) {
+        val opt_nested: opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] =
+            eval_const_elem_member[T](ev, eid, e.data.member.object, e.data.member.name_id, fw);
+        if (sel opt_nested.some) { res_eval_ident = opt_nested.some; }
+        or {
+            # a constant another module declares, spelled through the module
+            res_eval_ident = eval_module_member[T](ev.cap_ctx, ev.caps, eid);
+        }
+    }
+    or (e.kind == ast_expr.EXPR_KIND_INDEX && !ast_expr.is_range(?e.data.index)) {
+        val opt_nested: opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] = eval_const_elem_index[T](ev, eid, ?e.data.index);
+        if (sel opt_nested.none) { ret res_none; }
+        res_eval_ident = opt_nested.some;
+    }
+    or                          { ret res_none; }
+    if (sel res_eval_ident.err) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].err{res_eval_ident.err}; }
+    val v: comptime_value.CTValue = res_eval_ident.ok;
+    if (v.kind != comptime_value.CT_KIND_CONST_ELEM && v.kind != comptime_value.CT_KIND_NODE) { ret res_none; }
+    ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].some{v}};
+}
+
+# whether an expression is spelled as a path into a constant: a member or an element read
+fun is_constant_path(e: *ast_expr.Expr) bool {
+    ret e.kind == ast_expr.EXPR_KIND_MEMBER || (e.kind == ast_expr.EXPR_KIND_INDEX && !ast_expr.is_range(?e.data.index));
+}
+
+# element `[i]` of a published constant array: the element's value, refused past the end of the
+# array, and none when the object is no published constant array. an element the literal leaves
+# out reads as its zero when that is a scalar and is refused otherwise
+fun eval_const_elem_index[T](ev: *Evaluation[T], eid: ast_id.ExprId, ix: *ast_expr.ExprIndex) opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] {
+    if (ast_expr.is_range(ix)) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+    val res_obj_read: res[ast_expr.Expr, comptime_failure.EvalFail] = comptime_capability.read_expression[T](ev.cap_ctx, ev.caps, ev.a, ix.object);
+    if (sel res_obj_read.err) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_obj_read.err}}; }
+    var obj_node: ast_expr.Expr  = res_obj_read.ok;
+    val obj:      *ast_expr.Expr = ?obj_node;
+
+    val res_obj: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = eval_const_elem_object[T](ev, ix.object, float.FLOAT_W_NONE);
+    if (sel res_obj.err) {
+        # an object this phase cannot read yet is the answer, so a later phase decides the read
+        val kind: comptime_failure.EvalFailKind = res_obj.err.kind;
+        if (kind == comptime_failure.EVAL_FAIL_REJECTED && !is_constant_path(obj)) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_obj.err}};
+    }
+    val opt_obj_r: opt[comptime_value.CTValue] = res_obj.ok;
+    if (sel opt_obj_r.none) {
+        # an element of a window reads through the member capability, which reaches the window itself
+        if (obj.kind != ast_expr.EXPR_KIND_INDEX || !comptime_capability.capabilities_have_member[T](ev.cap_ctx, ev.caps)) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+        val res_through: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = ev.caps.member(ev.cap_ctx, eid);
+        if (sel res_through.err)     { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_through.err}}; }
+        if (sel res_through.ok.none) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].ok{res_through.ok.some}};
+    }
+    val ov: comptime_value.CTValue = opt_obj_r.some;
+    if (ov.kind != comptime_value.CT_KIND_NODE) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+
+    val res_store: res[*comptime_deep.Store, comptime_failure.EvalFail] = comptime_capability.store_of[T](ev.cap_ctx, ev.caps, ov.data.node.module);
+    if (sel res_store.err) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_store.err}}; }
+    val store: *comptime_deep.Store = res_store.ok;
+    if (comptime_deep.node_at(store, ov.data.node.node).kind != comptime_deep.NODE_ARRAY) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+
+    val res_evaluate_in: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, ix.index, float.FLOAT_W_NONE);
+    if (sel res_evaluate_in.err) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res_evaluate_in}; }
+    val opt_index: opt[u64] = comptime_value.ct_int_u64(res_evaluate_in.ok);
+    if (sel opt_index.none) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{comptime_value.reject(diagnostic_kind.COMPTIME_NOT_CONSTANT, COMPTIME_ELEMENT_INDEX_MSG)}; }
+    val element: comptime_deep.Element = comptime_deep.element(store, ov.data.node.node, opt_index.some);
+    if (element.kind == comptime_deep.ELEMENT_PAST_END) {
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{comptime_value.reject(diagnostic_kind.COMPTIME_NOT_CONSTANT, comptime_deep.INDEX_PAST_END_MSG)};
+    }
+    if (element.kind == comptime_deep.ELEMENT_MEMBER) {
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{comptime_deep.read(store, ev.interner, ov.data.node.module, element.node)};
+    }
+    # an element the literal leaves out holds the zero of its type, which the member capability answers
+    ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{eval_module_member[T](ev.cap_ctx, ev.caps, eid)};
+}
+
+# what an expression naming a published constant value reads: a scalar node's value, a refused
+# leaf's refusal, or an aggregate as it is
+fun node_read[T](ev: *Evaluation[T], v: comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (v.kind != comptime_value.CT_KIND_NODE) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{v}; }
+    val res_store: res[*comptime_deep.Store, comptime_failure.EvalFail] = comptime_capability.store_of[T](ev.cap_ctx, ev.caps, v.data.node.module);
+    if (sel res_store.err) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_store.err}; }
+    ret comptime_deep.read(res_store.ok, ev.interner, v.data.node.module, v.data.node.node);
+}
+
+# member `name` of a published constant value: a record field, or the payload of the case a case
+# literal holds; a field the literal leaves out reads as its zero, and none is a member the
+# value does not answer
+fun node_member[T](ev: *Evaluation[T], eid: ast_id.ExprId, ov: comptime_value.CTValue, name: intern.StrId) opt[res[comptime_value.CTValue, comptime_failure.EvalFail]] {
+    val res_store: res[*comptime_deep.Store, comptime_failure.EvalFail] = comptime_capability.store_of[T](ev.cap_ctx, ev.caps, ov.data.node.module);
+    if (sel res_store.err) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_store.err}}; }
+    val store: *comptime_deep.Store     = res_store.ok;
+    val p:     comptime_deep.Projection = comptime_deep.project(store, ov.data.node.node, name);
+    if (p.kind == comptime_deep.PROJECT_MEMBER) {
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{comptime_deep.read(store, ev.interner, ov.data.node.module, p.node)};
+    }
+    if (p.kind == comptime_deep.PROJECT_UNSELECTED) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{unselected_payload(ev.interner, p.head, name)}; }
+    if (p.kind == comptime_deep.PROJECT_NO_PAYLOAD) {
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{comptime_value.reject(diagnostic_kind.COMPTIME_CASE_PAYLOAD, COMPTIME_CASE_PAYLOAD_MISSING_MSG)};
+    }
+    if (p.kind != comptime_deep.PROJECT_OMITTED) { ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].none{}; }
+    # a phase with no types asks the member capability for the field's zero
+    if (!comptime_capability.capabilities_have_types[T](ev.cap_ctx, ev.caps)) {
+        ret opt[res[comptime_value.CTValue, comptime_failure.EvalFail]].some{eval_module_member[T](ev.cap_ctx, ev.caps, eid)};
+    }
+    ret field_zero[T](ev, ov.data.node.ty, name);
+}
+
+# a literal head names a tag case, `T.c{...}` or `T.[c]{...}`, read as its phase reads it: the
+# parser records the case only for a head with generic arguments, and name resolution splits the
+# others, so the answer is complete once the literal's head has been bound
+pub fun names_case(head: ast_type.Type) bool {
+    if (head.kind != ast_type.TYPE_KIND_NAMED) { ret false; }
+    ret !ast_id.expr_is_nil(head.data.named.case_desc) || head.data.named.case_name.len != 0;
+}
+
+# the head type of a literal in either parsed spelling: the parser emits a positional `T.c{x}` as a
+# lane list, which name resolution reads as a case construction once it learns the head names a case
+pub fun literal_head_type(e: *ast_expr.Expr) ast_id.TypeId {
+    if (e.kind == ast_expr.EXPR_KIND_STRUCT_LIT) { ret e.data.struct_lit.ty; }
+    if (e.kind == ast_expr.EXPR_KIND_VECTOR_LIT) { ret e.data.vector_lit.ty; }
+    ret ast_id.TYPE_NIL;
+}
+
+fun literal_elems_start(e: *ast_expr.Expr) u32 {
+    if (e.kind == ast_expr.EXPR_KIND_VECTOR_LIT) { ret e.data.vector_lit.elems_start; }
+    ret e.data.struct_lit.elems_start;
+}
+
+fun literal_elems_len(e: *ast_expr.Expr) u32 {
+    if (e.kind == ast_expr.EXPR_KIND_VECTOR_LIT) { ret e.data.vector_lit.elems_len; }
+    ret e.data.struct_lit.elems_len;
+}
+
+# the case the head of the literal `e` selects, STR_NIL for a record literal or any other expression
+pub fun literal_case[T](
+    c: *comptime_scope.ComptimeCtx,
+    cap_ctx: *T,
+    caps: comptime_capability.PhaseCapabilities[T],
+    a: *ast.Ast,
+    source: str,
+    e: ast_id.ExprId,
+    interner: *intern.Interner) res[intern.StrId, comptime_failure.EvalFail] {
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(a, e);
+    if (sel opt_expr.none) { ret res[intern.StrId, comptime_failure.EvalFail].ok{intern.STR_NIL}; }
+    var ev: Evaluation[T] = Evaluation[T]{c: c, cap_ctx: cap_ctx, caps: caps, a: a, source: source, interner: interner};
+    ret case_literal_head[T](?ev, opt_expr.some);
+}
+
+# the case a literal's head selects, none for a record literal
+fun case_literal_head[T](ev: *Evaluation[T], lit: *ast_expr.Expr) res[intern.StrId, comptime_failure.EvalFail] {
+    val tid: ast_id.TypeId = literal_head_type(lit);
+    if (ast_id.type_is_nil(tid)) { ret res[intern.StrId, comptime_failure.EvalFail].ok{intern.STR_NIL}; }
+    val res_read_head: res[ast_type.Type, comptime_failure.EvalFail] = comptime_capability.read_head[T](ev.cap_ctx, ev.caps, ev.a, tid);
+    if (sel res_read_head.err) { ret res[intern.StrId, comptime_failure.EvalFail].err{res_read_head.err}; }
+    var head: ast_type.Type  = res_read_head.ok;
+    val t:    *ast_type.Type = ?head;
+    if (t.kind != ast_type.TYPE_KIND_NAMED) { ret res[intern.StrId, comptime_failure.EvalFail].ok{intern.STR_NIL}; }
+    if (!ast_id.expr_is_nil(t.data.named.case_desc)) {
+        ret descriptor_case_name[T](ev, t.data.named.case_desc);
+    }
+    if (t.data.named.case_name.len == 0) { ret res[intern.StrId, comptime_failure.EvalFail].ok{intern.STR_NIL}; }
+    val res_name: res[intern.StrId, A.Error] = intern.range_add(ev.interner, ev.source, t.data.named.case_name.offset, t.data.named.case_name.len);
+    if (sel res_name.err) { ret res[intern.StrId, comptime_failure.EvalFail].err{comptime_failure.eval_internal(base_alloc.text(res_name.err))}; }
+    ret res[intern.StrId, comptime_failure.EvalFail].ok{res_name.ok};
+}
+
+# the case name a comptime case descriptor stands for; the tag's fields must be known
+fun descriptor_case_name[T](ev: *Evaluation[T], desc_eid: ast_id.ExprId) res[intern.StrId, comptime_failure.EvalFail] {
+    val res_evaluate_in: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, desc_eid, float.FLOAT_W_NONE);
+    if (sel res_evaluate_in.err) { ret res[intern.StrId, comptime_failure.EvalFail].err{res_evaluate_in.err}; }
+    val d: comptime_value.CTValue = res_evaluate_in.ok;
+    if (d.kind != comptime_value.CT_KIND_CASE) { ret res[intern.StrId, comptime_failure.EvalFail].err{comptime_failure.eval_error(comptime_failure.EVAL_FAIL_REJECTED, diagnostic_kind.COMPTIME_CASE_DESCRIPTOR, COMPTIME_CASE_DESCRIPTOR_OPERAND_MSG)}; }
+    if (!comptime_capability.capabilities_have_types[T](ev.cap_ctx, ev.caps) || ev.caps.offset == nil) {
+        ret res[intern.StrId, comptime_failure.EvalFail].err{comptime_failure.eval_error(comptime_failure.EVAL_FAIL_NEEDS_TYPES, diagnostic_kind.COMPTIME_TOO_EARLY, COMPTIME_SEL_DESCRIPTOR_NEEDS_TYPES_MSG)};
+    }
+    val res_field_of: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = comptime_capability.field_of[T](ev.cap_ctx, ev.caps, d.data.fld.owner, d.data.fld.index, comptime_capability.FIELD_SEL_NAME);
+    if (sel res_field_of.err) { ret res[intern.StrId, comptime_failure.EvalFail].err{res_field_of.err}; }
+    val opt_evaluated: opt[comptime_value.CTValue] = res_field_of.ok;
+    if (sel opt_evaluated.none) {
+        ret res[intern.StrId, comptime_failure.EvalFail].err{comptime_failure.eval_error(comptime_failure.EVAL_FAIL_REJECTED, diagnostic_kind.COMPTIME_CASE_DESCRIPTOR, COMPTIME_CASE_DESCRIPTOR_OPERAND_MSG)};
+    }
+    if (opt_evaluated.some.kind != comptime_value.CT_KIND_STR) {
+        ret res[intern.StrId, comptime_failure.EvalFail].err{comptime_failure.eval_error(comptime_failure.EVAL_FAIL_REJECTED, diagnostic_kind.COMPTIME_CASE_DESCRIPTOR, COMPTIME_CASE_DESCRIPTOR_OPERAND_MSG)};
+    }
+    ret res[intern.StrId, comptime_failure.EvalFail].ok{opt_evaluated.some.data.s};
+}
+
+# `sel place.case` on a constant tag compares the literal's head case with the tested case
+fun eval_sel[T](ev: *Evaluation[T], s: *ast_expr.ExprSel, fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    val res_obj: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = eval_const_elem_object[T](ev, s.place, fw);
+    if (sel res_obj.err) {
+        val f: comptime_failure.EvalFail = res_obj.err;
+        # a runtime binding is not a constant; a nested refusal and every transient failure keep their own reason
+        if (f.kind == comptime_failure.EVAL_FAIL_REJECTED && !place_is_member(ev.a, s.place)) { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_CONSTANT, COMPTIME_SEL_NOT_CONSTANT_MSG); }
+        ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{f};
+    }
+    val opt_obj_r: opt[comptime_value.CTValue] = res_obj.ok;
+    if (sel opt_obj_r.none) { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_CONSTANT, COMPTIME_SEL_NOT_CONSTANT_MSG); }
+    val res_head: res[intern.StrId, comptime_failure.EvalFail] = held_case[T](ev, opt_obj_r.some);
+    if (sel res_head.err) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_head.err}; }
+    val head: intern.StrId = res_head.ok;
+    if (intern.str_is_nil(head)) { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_CONSTANT, COMPTIME_SEL_NOT_CONSTANT_MSG); }
+
+    var tested: intern.StrId = intern.STR_NIL;
+    if (!ast_id.expr_is_nil(s.case_desc)) {
+        val res_descriptor_case_name: res[intern.StrId, comptime_failure.EvalFail] = descriptor_case_name[T](ev, s.case_desc);
+        if (sel res_descriptor_case_name.err) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_descriptor_case_name.err}; }
+        val t: intern.StrId = res_descriptor_case_name.ok;
+        if (intern.str_is_nil(t)) { ret comptime_value.reject(diagnostic_kind.COMPTIME_CASE_DESCRIPTOR, COMPTIME_CASE_DESCRIPTOR_OPERAND_MSG); }
+        tested = t;
+    }
+    or {
+        val res_name: res[intern.StrId, A.Error] = intern.range_add(ev.interner, ev.source, s.case_name.offset, s.case_name.len);
+        if (sel res_name.err) { ret comptime_value.internal_failure(base_alloc.text(res_name.err)); }
+        tested = res_name.ok;
+    }
+    ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{comptime_value.ct_u1(intern.str_same(head, tested))};
+}
+
+# the case a constant tag holds, STR_NIL for a constant that is no case literal
+fun held_case[T](ev: *Evaluation[T], ov: comptime_value.CTValue) res[intern.StrId, comptime_failure.EvalFail] {
+    if (ov.kind == comptime_value.CT_KIND_NODE) {
+        val res_store: res[*comptime_deep.Store, comptime_failure.EvalFail] = comptime_capability.store_of[T](ev.cap_ctx, ev.caps, ov.data.node.module);
+        if (sel res_store.err) { ret res[intern.StrId, comptime_failure.EvalFail].err{res_store.err}; }
+        val n: *comptime_deep.Node = comptime_deep.node_at(res_store.ok, ov.data.node.node);
+        if (n.kind != comptime_deep.NODE_LITERAL) { ret res[intern.StrId, comptime_failure.EvalFail].ok{intern.STR_NIL}; }
+        ret res[intern.StrId, comptime_failure.EvalFail].ok{n.head};
+    }
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(ev.a, ov.data.celem.elem::ast_id.ExprId);
+    if (!sel opt_expr.some) { ret res[intern.StrId, comptime_failure.EvalFail].err{comptime_failure.eval_internal("comptime: a constant element names no expression")}; }
+    val el: *ast_expr.Expr = opt_expr.some;
+    if (ast_id.type_is_nil(literal_head_type(el))) { ret res[intern.StrId, comptime_failure.EvalFail].ok{intern.STR_NIL}; }
+    ret case_literal_head[T](ev, el);
+}
+
+fun place_is_member(a: *ast.Ast, eid: ast_id.ExprId) bool {
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(a, eid);
+    if (!sel opt_expr.some) { ret false; }
+    ret opt_expr.some.kind == ast_expr.EXPR_KIND_MEMBER;
+}
+
+# the payload of a constant case literal: the literal's single element when the read names the
+# case it holds. reading the case it does not hold is refused, which is the comptime form of the
+# debug discriminator trap: constant state is never stale, so the mismatch is a compile-time error
+fun constant_payload[T](ev: *Evaluation[T], lit: *ast_expr.Expr, owner_ty: u32, head: intern.StrId, name: intern.StrId, fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (!intern.str_same(head, name))                         { ret unselected_payload(ev.interner, head, name); }
+    if (literal_elems_len(lit) == 0)                          { ret comptime_value.reject(diagnostic_kind.COMPTIME_CASE_PAYLOAD, COMPTIME_CASE_PAYLOAD_MISSING_MSG); }
+    if (literal_elems_start(lit)::usize >= ev.a.expr_ids.len) { ret comptime_value.internal_failure("comptime: case literal payload index out of range"); }
+    ret constant_leaf[T](ev, ev.a.expr_ids.data[literal_elems_start(lit)], owner_ty, name, fw);
+}
+
+fun unselected_payload(interner: *intern.Interner, head: intern.StrId, name: intern.StrId) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    if (interner == nil) { ret comptime_value.internal_failure("comptime payload diagnostic requires its interner"); }
+    val opt_head_s: opt[str] = intern.get(interner, head);
+    val opt_name_s: opt[str] = intern.get(interner, name);
+    if (!sel opt_head_s.some) { ret comptime_value.internal_failure("comptime payload diagnostic names an uninterned case"); }
+    if (!sel opt_name_s.some) { ret comptime_value.internal_failure("comptime payload diagnostic names an uninterned case"); }
+    val res_formatted: res[str, fail.Fail] = diagnostic.format(interner.a,
+        "this constant holds its `{}` case, so its `{}` payload is never selected", opt_head_s.some, opt_name_s.some);
+    if (sel res_formatted.err) { ret comptime_value.internal_failure(fail.describe(res_formatted.err)); }
+    val text: str = res_formatted.ok;
+    fin { str_free(interner.a, text); }
+    val res_saved: res[intern.StrId, A.Error] = intern.add(interner, text);
+    if (sel res_saved.err) { ret comptime_value.internal_failure(base_alloc.text(res_saved.err)); }
+    val opt_owned: opt[str] = intern.get(interner, res_saved.ok);
+    if (!sel opt_owned.some) { ret comptime_value.internal_failure("comptime payload diagnostic is absent from its interner"); }
+    ret comptime_value.reject(diagnostic_kind.COMPTIME_CASE_PAYLOAD, opt_owned.some);
+}
+
+# a leaf of a constant aggregate: a nested literal stays a constant element, carrying the
+# member's checked type when the phase can name it; anything else evaluates as a value
+fun constant_leaf[T](ev: *Evaluation[T], value_eid: ast_id.ExprId, owner_ty: u32, name: intern.StrId, fw: float.FloatWidth) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(ev.a, value_eid);
+    if (sel opt_expr.some) {
+        if (!ast_id.type_is_nil(literal_head_type(opt_expr.some))) {
+            var nested_ty: u32 = type_kind.index(type_kind.TYPE_NIL);
+            if (owner_ty != type_kind.index(type_kind.TYPE_NIL) && comptime_capability.capabilities_have_types[T](ev.cap_ctx, ev.caps) && ev.caps.offset != nil) {
+                val res_field_of: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = comptime_capability.field_of[T](ev.cap_ctx, ev.caps, owner_ty, name::u32, comptime_capability.FIELD_SEL_TYPE_BY_NAME);
+                if (sel res_field_of.err) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_field_of.err}; }
+                val opt_evaluated: opt[comptime_value.CTValue] = res_field_of.ok;
+                if (sel opt_evaluated.some) {
+                    if (opt_evaluated.some.kind == comptime_value.CT_KIND_TYPE) { nested_ty = opt_evaluated.some.data.t; }
+                }
+            }
+            ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{comptime_value.const_elem_value(value_eid::u32, nested_ty)};
+        }
+    }
+    ret evaluate_in[T](ev, value_eid, fw);
+}
+
+val CT_MUL_USAGE: str = "`$mach.build.ct_mul` takes a multiply and an operand width, as in `$mach.build.ct_mul(low, 64)`";
+
+# `$mach.build.ct_mul(op, width)`: 1 when mirl runs that scalar multiply in time
+# independent of its operands under the timing modes the build guarantees
+fun eval_path_call[T](ev: *Evaluation[T], e: ast_id.ExprId) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    val opt_node: opt[*ast_expr.Expr] = ast.get_expr(ev.a, e);
+    if (!sel opt_node.some) { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "ExprId out of range during comptime call evaluation"); }
+    val node:  *ast_expr.Expr = opt_node.some;
+    var stack: [16]base_source.Span;
+    var depth: u32            = 0;
+    var cur:   ast_id.ExprId  = node.data.call.callee;
+    for (true) {
+        if (depth >= 16) { ret comptime_value.reject(diagnostic_kind.COMPTIME_PATH_UNKNOWN, "comptime path is too deeply nested"); }
+        val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(ev.a, cur);
+        if (!sel opt_expr.some) { ret comptime_value.reject(diagnostic_kind.COMPTIME_NOT_EVALUABLE, "ExprId out of range during comptime member walk"); }
+        val step: *ast_expr.Expr = opt_expr.some;
+        if (step.kind == ast_expr.EXPR_KIND_MEMBER) {
+            stack[depth] = step.data.member.name;
+            depth        = depth + 1;
+            cur          = step.data.member.object;
+            cnt;
+        }
+        if (step.kind != ast_expr.EXPR_KIND_COMPTIME_IDENT) { ret comptime_value.reject(diagnostic_kind.COMPTIME_PATH_UNKNOWN, "comptime path must start with a `$` identifier"); }
+        stack[depth] = intrinsic.comptime_ident_name(step.data.comptime_ident.tok);
+        depth        = depth + 1;
+        brk;
+    }
+    val row: *comptime_path.Row = comptime_path.lookup(ev.source, ?stack[0], depth, true);
+    if (row == nil || row.read != comptime_path.READ_BUILD_CT_MUL)         { ret comptime_value.reject(diagnostic_kind.COMPTIME_PATH_UNKNOWN, "this comptime path takes no arguments; `$mach.build.ct_mul(op, width)` is the one that does"); }
+    if (node.data.call.args_len != 2 || node.data.call.type_args_len != 0) { ret comptime_value.reject(diagnostic_kind.COMPTIME_CT_MUL, CT_MUL_USAGE); }
+
+    val op_eid:   ast_id.ExprId       = ev.a.expr_ids.data[node.data.call.args_start];
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(ev.a, op_eid);
+    if (!sel opt_expr.some) { ret reject_ct_mul_op(ev.c, ""); }
+    val op_node: *ast_expr.Expr = opt_expr.some;
+    if (op_node.kind != ast_expr.EXPR_KIND_IDENT) { ret reject_ct_mul_op(ev.c, ""); }
+    val word: View       = base_source.span_view(ev.source, op_node.data.ident.tok);
+    var op:   ct.CtMulOp = ct.CT_MUL_NONE;
+    var i:    u32        = 1;
+    for (i < ct.CT_MUL_OP_COUNT) {
+        val opt_name: opt[str] = ct.mul_op_name(i::ct.CtMulOp);
+        if (sel opt_name.some && view_eq_str(word, opt_name.some)) { op = i::ct.CtMulOp; }
+        i = i + 1;
+    }
+    if (op == ct.CT_MUL_NONE) {
+        val res_range_add: res[intern.StrId, A.Error] = intern.range_add(ev.interner, ev.source, op_node.data.ident.tok.offset, op_node.data.ident.tok.len);
+        var spelled:       str                        = "";
+        if (sel res_range_add.ok) {
+            val opt_interner_entry: opt[str] = intern.get(ev.interner, res_range_add.ok);
+            if (sel opt_interner_entry.some) { spelled = opt_interner_entry.some; }
+        }
+        ret reject_ct_mul_op(ev.c, spelled);
+    }
+
+    val width_eid: ast_id.ExprId                                          = ev.a.expr_ids.data[node.data.call.args_start + 1];
+    val res_width: res[comptime_value.CTValue, comptime_failure.EvalFail] = evaluate_in[T](ev, width_eid, float.FLOAT_W_NONE);
+    if (sel res_width.err) { ret res_width; }
+    val wv:        comptime_value.CTValue = res_width.ok;
+    val opt_width: opt[u64]               = comptime_value.ct_int_u64(wv);
+    var width:     u64                    = 0;
+    if (sel opt_width.some) { width = opt_width.some; }
+    if (!sel opt_width.some || width > 128 || !ct.mul_cell_width_valid(width::u8)) {
+        ret comptime_value.reject(diagnostic_kind.COMPTIME_CT_MUL, "`$mach.build.ct_mul`: the operand width must be 8, 16, 32, 64 or 128");
+    }
+    # mirl's answer, read when the target was resolved
+    ret comptime_value.u1_value(ct.mul_mask_has(ev.c.env.target.multiplies, ct.mul_cell(op, width::u8, false)));
+}
+
+fun reject_ct_mul_op(c: *comptime_scope.ComptimeCtx, spelled: str) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    val bare: str = "`$mach.build.ct_mul`: the multiply is a bare word, one of low, high_u, high_s, high_su, wide_u, wide_s";
+    if (spelled == nil || str_len(spelled) == 0) { ret comptime_value.reject(diagnostic_kind.COMPTIME_CT_MUL, bare); }
+    val res_format: res[str, fail.Fail] = diagnostic.format(c.env.alloc,
+        "`$mach.build.ct_mul`: unknown multiply `{}`; expected one of {}", spelled, ct.MUL_OP_SPELLINGS);
+    if (sel res_format.err) { ret comptime_value.internal_failure(fail.describe(res_format.err)); }
+    ret comptime_value.reject(diagnostic_kind.COMPTIME_CT_MUL, res_format.ok);
+}

@@ -82,7 +82,7 @@ doc with grammar, examples, and neighboring links. Start from the index below.
 - `mach --help` and `mach help <command>` — the command-line reference
 
 The supported, source-stable surface of the compiler is the editor API
-(`mach.lang.editor`, documented by its docstrings and rendered by
+(`mach.editor`, documented by its docstrings and rendered by
 `mach doc`), the command line, and the manifest schema. Everything else
 under `src/` is internal. Source API authors can mark deprecated declarations with
 [`#[deprecated]`](decorators.md#deprecated--deprecatedstr--source-use-notice), which warns on external use.

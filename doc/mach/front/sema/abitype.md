@@ -1,0 +1,56 @@
+# mach.front.sema.abitype
+
+## def ReadStatus
+
+```mach
+pub def ReadStatus: u8
+```
+
+## val READ_OK
+
+```mach
+pub val READ_OK:      ReadStatus = 0
+```
+
+## fun declares_abi_type
+
+```mach
+pub fun declares_abi_type(sc: *sema_context.SemaContext, d: *ast_decl.Decl) bool;
+```
+
+## fun read
+
+```mach
+pub fun read(sc: *sema_context.SemaContext, d: *ast_decl.Decl, dec: *ast_decl.Decorator, report: bool) Read;
+```
+
+## fun validate
+
+```mach
+pub fun validate(sc: *sema_context.SemaContext, d: *ast_decl.Decl, dec: *ast_decl.Decorator);
+```
+
+## fun type_of
+
+```mach
+pub fun type_of(sc: *sema_context.SemaContext, d: *ast_decl.Decl) type_kind.TypeId;
+```
+
+## fun exclusion_message
+
+```mach
+pub fun exclusion_message() str;
+```
+
+## fun type_carries_abi_type
+
+```mach
+pub fun type_carries_abi_type(sc: *sema_context.SemaContext, t: type_kind.TypeId) bool;
+```
+
+## fun check_abi_type_placement
+
+```mach
+pub fun check_abi_type_placement(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl);
+```
+

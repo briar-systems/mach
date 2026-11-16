@@ -1,0 +1,951 @@
+# the module constants sema binds: every module `val` whose initializer evaluates at compile
+# time, bound once in sema's own bindings, which its result publishes to lowering and to every
+# importer. a constant is bound where it is first read while declarations are typed, and every
+# other one once they all are, before any body or instance is. the deep value of a constant,
+# its array, record or case literal evaluated member by member, is built in the module's store
+# of constant values, which its interface publishes
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use mach.base.float;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.base.stack;
+use mach.front.ast;
+use ast_decl: mach.front.ast.decl;
+use ast_expr: mach.front.ast.expr;
+use ast_id:   mach.front.ast.id;
+use mach.front.comptime;
+use comptime_deep: mach.front.comptime.deep;
+use mach.front.decorator;
+use mach.front.resolve;
+use sema_context:  mach.front.sema.context;
+use sema_declared: mach.front.sema.declared;
+use mach.front.sema.infer;
+use mach.front.sema.interface;
+use mach.session.module;
+use mach.type;
+use collections_vector: std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use comptime_failure: mach.front.comptime.failure;
+use comptime_scope:   mach.front.comptime.scope;
+use comptime_value:   mach.front.comptime.value;
+use report_phase:     mach.report.phase;
+use type_field:       mach.type.field;
+use type_kind:        mach.type.kind;
+use type_prim:        mach.type.prim;
+use A:                std.allocator;
+
+# pending: not bound yet, and tried again on the next read; none: no constant, for good;
+# refused: no constant, for good, since the evaluator rejected its initializer; unevaluable:
+# no constant, for good, since its initializer needs a value no constant gives
+pub val CONSTANT_PENDING:     u8 = 0;
+val     CONSTANT_ACTIVE:      u8 = 1;
+val     CONSTANT_BOUND:       u8 = 2;
+val     CONSTANT_NONE:        u8 = 3;
+val     CONSTANT_REFUSED:     u8 = 4;
+val     CONSTANT_UNEVALUABLE: u8 = 5;
+
+# the value of the module constant the bare name `eid` names: one of this module's, bound on
+# first read, or one an imported module published
+pub fun named(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail] {
+    if (sc == nil) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}}; }
+    val opt_found: opt[*resolve.Symbol] = sema_context.symbol_for_expr(sc, eid);
+    if (!sel opt_found.some) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}}; }
+    val sym:           *resolve.Symbol                                             = opt_found.some;
+    val res_aggregate: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = aggregate_value(sc, sym);
+    if (sel res_aggregate.err)         { ret res_aggregate; }
+    if (sel res_aggregate.ok.some)     { ret res_aggregate; }
+    if (sema_context.foreign(sc, sym)) { ret sema_context.resolve_module_member_const(sc, eid); }
+    if (sym.kind != resolve.SYM_VAL || (sym.flags & resolve.SYM_FLAG_MODULE) == 0 || ast_id.decl_is_nil(sym.decl)) {
+        ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}};
+    }
+    ret bound_of(sc, sym.decl);
+}
+
+# the value of the module constant a path names, which for a path through a module is the
+# imported constant itself
+pub fun member(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail] {
+    if (sc == nil) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}}; }
+    val opt_found: opt[*resolve.Symbol] = sema_context.symbol_for_expr(sc, eid);
+    if (!sel opt_found.some) {
+        val res_projected: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = projected_value(sc, eid);
+        if (sel res_projected.err)     { ret res_projected; }
+        if (sel res_projected.ok.some) { ret res_projected; }
+    }
+    if (sel opt_found.some) {
+        val res_aggregate: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = aggregate_value(sc, opt_found.some);
+        if (sel res_aggregate.err)     { ret res_aggregate; }
+        if (sel res_aggregate.ok.some) { ret res_aggregate; }
+    }
+    ret sema_context.resolve_module_member_const(sc, eid);
+}
+
+# the value a field or element path into a constant reads, which includes the zero of a member
+# its literal leaves out: the same answer a typed read gets, since it needs only the types the
+# constant records on its nodes
+fun projected_value(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail] {
+    val res_none:     res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}};
+    val res_resolved: res[ast_expr.Expr, fail.Fail]                               = resolve.expression(sc.view.rr, sc.view.a, eid);
+    if (sel res_resolved.err) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].err{comptime_failure.eval_from_fail(res_resolved.err, diagnostic_kind.COMPTIME_NOT_CONSTANT, "")}; }
+    var node: ast_expr.Expr  = res_resolved.ok;
+    val e:    *ast_expr.Expr = ?node;
+    if (e.kind != ast_expr.EXPR_KIND_MEMBER && !(e.kind == ast_expr.EXPR_KIND_INDEX && !ast_expr.is_range(?e.data.index))) { ret res_none; }
+    val res_reached: res[Reach, fail.Fail] = reach(sc, eid, 0);
+    if (sel res_reached.err)                  { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].err{comptime_failure.eval_from_fail(res_reached.err, diagnostic_kind.COMPTIME_NOT_CONSTANT, "")}; }
+    if (res_reached.ok.kind == REACH_REFUSED) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].err{res_reached.ok.why}; }
+    if (res_reached.ok.kind != REACH_NODE)    { ret res_none; }
+    val own:         u32                 = module.stable_index(sc.typing.module);
+    val res_adopted: res[u32, fail.Fail] = adopt(sc, res_reached.ok.store, res_reached.ok.node, e.span);
+    if (sel res_adopted.err) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].err{comptime_failure.eval_from_fail(res_adopted.err, diagnostic_kind.COMPTIME_NOT_CONSTANT, "")}; }
+    val res_read: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime_deep.read(sc.typing.values, ?sc.s.interner, own, res_adopted.ok);
+    if (sel res_read.err) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].err{res_read.err}; }
+    ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].some{res_read.ok}};
+}
+
+# the value of the record, array or case constant `sym` names, as the store of values holds it:
+# this module's built on first ask and another module's as it published it; none for any other
+# symbol
+fun aggregate_value(sc: *sema_context.SemaContext, sym: *resolve.Symbol) res[opt[comptime_value.CTValue], comptime_failure.EvalFail] {
+    val res_none: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}};
+    if (!names_constant(sc, sym)) { ret res_none; }
+    if (!sema_context.foreign(sc, sym)) {
+        if (!reads_published(sc, sym)) { ret res_none; }
+        type_initializer(sc, sym);
+    }
+    if (sema_context.foreign(sc, sym)) {
+        val res_found: res[opt[Published], fail.Fail] = published(sc, sym);
+        if (sel res_found.err)     { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].err{comptime_failure.eval_from_fail(res_found.err, diagnostic_kind.COMPTIME_NOT_CONSTANT, "")}; }
+        if (sel res_found.ok.none) { ret res_none; }
+        val p: Published = res_found.ok.some;
+        if (p.declaration.value == interface.NONE) { ret res_none; }
+        val kind: comptime_deep.NodeKind = comptime_deep.node_at(p.store, p.declaration.value).kind;
+        if (kind != comptime_deep.NODE_LITERAL && kind != comptime_deep.NODE_ARRAY) { ret res_none; }
+    }
+    val res_value: res[opt[comptime_value.CTValue], fail.Fail] = array_value(sc, sym);
+    if (sel res_value.err) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].err{comptime_failure.eval_from_fail(res_value.err, diagnostic_kind.COMPTIME_NOT_CONSTANT, "")}; }
+    ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{res_value.ok};
+}
+
+# types the initializer of the module `val` `sym` if no walk has yet, quietly: the declaration
+# reports what is wrong with it when it is typed in turn. a value is built at the types its
+# expressions were given
+fun type_initializer(sc: *sema_context.SemaContext, sym: *resolve.Symbol) {
+    val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, sym.decl);
+    if (sel opt_decl.none) { ret; }
+    val init: ast_id.ExprId = opt_decl.some.data.bind.init;
+    if (!type_kind.is_nil(type_at(sc, init))) { ret; }
+    val outer: sema_context.Walk = sema_context.walk_begin(sc);
+    sc.walk.silent = true;
+    infer.infer_expr(sc, init);
+    sema_context.walk_end(sc, outer);
+}
+
+# whether the module `val` `sym` is an aggregate whose value this module's typing builds
+fun reads_published(sc: *sema_context.SemaContext, sym: *resolve.Symbol) bool {
+    if (sc.view.constant_node == nil || ast_id.decl_is_nil(sym.decl)) { ret false; }
+    val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, sym.decl);
+    if (sel opt_decl.none) { ret false; }
+    val init: ast_id.ExprId = opt_decl.some.data.bind.init;
+    ret opt_decl.some.kind == ast_decl.DECL_KIND_VAL && !ast_id.expr_is_nil(init) && is_aggregate(sc, init);
+}
+
+# binds the module `val` `did` declares when its initializer is a compile-time constant. this
+# is the last try, so an initializer the evaluator rejects is marked refused, which its
+# published value reports, and one that is no constant is marked unevaluable
+pub fun bind(sc: *sema_context.SemaContext, did: ast_id.DeclId) err[fail.Fail] {
+    val res_made: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = bound_or_refused(sc, did);
+    if (sel res_made.ok) { ret err[fail.Fail].ok{}; }
+    val failure: comptime_failure.EvalFail = res_made.err;
+    if (failure.kind == comptime_failure.EVAL_FAIL_INTERNAL) { ret err[fail.Fail].err{fail.message(failure.message)}; }
+    if (failure.kind == comptime_failure.EVAL_FAIL_REJECTED) { sc.view.constant_state[ast_id.decl_index(did)] = CONSTANT_REFUSED; }
+    or (comptime_failure.not_constant(failure.kind))         { sc.view.constant_state[ast_id.decl_index(did)] = CONSTANT_UNEVALUABLE; }
+    ret err[fail.Fail].ok{};
+}
+
+# whether the evaluator rejected the initializer of the module `val` `did` when it was bound
+pub fun rejected(sc: *sema_context.SemaContext, did: ast_id.DeclId) bool {
+    if (sc.view.constant_state == nil || !sema_context.decl_in_view(sc, did)) { ret false; }
+    ret sc.view.constant_state[ast_id.decl_index(did)] == CONSTANT_REFUSED;
+}
+
+# whether the initializer of the module `val` `did` was no constant when it was bound
+pub fun unevaluable(sc: *sema_context.SemaContext, did: ast_id.DeclId) bool {
+    if (sc.view.constant_state == nil || !sema_context.decl_in_view(sc, did)) { ret false; }
+    ret sc.view.constant_state[ast_id.decl_index(did)] == CONSTANT_UNEVALUABLE;
+}
+
+# the constant `did` binds, none while it reads as no constant: a reader reports that it read
+# none, so only an internal failure is returned
+fun bound_of(sc: *sema_context.SemaContext, did: ast_id.DeclId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail] {
+    val res_made: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = bound_or_refused(sc, did);
+    if (sel res_made.err) {
+        if (res_made.err.kind != comptime_failure.EVAL_FAIL_INTERNAL) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}}; }
+    }
+    ret res_made;
+}
+
+fun bound_or_refused(sc: *sema_context.SemaContext, did: ast_id.DeclId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail] {
+    val res_none: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].none{}};
+    # a module read only through an instance of it is bound by its own typing
+    if (sc.view.constant_state == nil || !sema_context.decl_in_view(sc, did)) { ret res_none; }
+    val ix: u32 = ast_id.decl_index(did);
+    val st: u8  = sc.view.constant_state[ix];
+    if (st == CONSTANT_ACTIVE || st == CONSTANT_NONE || st == CONSTANT_REFUSED || st == CONSTANT_UNEVALUABLE) { ret res_none; }
+
+    val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, did);
+    if (!sel opt_decl.some) { ret res_none; }
+    val d: *ast_decl.Decl = opt_decl.some;
+    if (d.kind != ast_decl.DECL_KIND_VAL || (d.flags & ast_decl.DECL_FLAG_EXT) != 0 || ast_id.expr_is_nil(d.data.bind.init)
+        || decorator.has(sc.view.a, d, decorator.EMBED)) {
+        sc.view.constant_state[ix] = CONSTANT_NONE;
+        ret res_none;
+    }
+    val res_name: res[intern.StrId, A.Error] = intern.range_add(?sc.s.interner, sc.view.source, d.data.bind.name.offset, d.data.bind.name.len);
+    if (sel res_name.err) { ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].err{comptime_failure.eval_error(comptime_failure.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, "out of memory naming a module constant")}; }
+    val name: intern.StrId = res_name.ok;
+    # what an earlier stage bound, a constant tag over its literal included, stands
+    val opt_prior: opt[comptime_scope.NamedConst] = comptime_scope.lookup(sc.view.ctx, name);
+    if (st == CONSTANT_BOUND || sel opt_prior.some) {
+        sc.view.constant_state[ix] = CONSTANT_BOUND;
+        if (!sel opt_prior.some) { ret res_none; }
+        ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].some{opt_prior.some.value}};
+    }
+
+    sc.view.constant_state[ix] = CONSTANT_ACTIVE;
+    # typed and evaluated quietly: the declaration reports what is wrong with it when it is
+    # typed in turn, and a reader reports that it read no constant. the evaluator refuses a
+    # literal by its form alone, so one is left for its declaration's typing
+    val outer: sema_context.Walk = sema_context.walk_begin(sc);
+    sc.walk.silent = true;
+    if (!is_literal(sc, d.data.bind.init)) { infer.infer_expr(sc, d.data.bind.init); }
+    val secret:        bool                                                   = sema_context.holds_secret(sc, sema_context.resolved_type_of(sc, d.data.bind.ty));
+    var res_evaluated: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime.evaluate_at_float_width[sema_context.SemaContext](sc.view.ctx, sc,
+        sc.typing.type_caps, sc.view.a, sc.view.source, d.data.bind.init, ?sc.s.interner,
+        comptime.declared_float_width(sc.view.a, sc.view.source, d.data.bind.ty));
+    if (secret) {
+        res_evaluated = comptime.evaluate_secret_at_float_width[sema_context.SemaContext](sc.view.ctx, sc,
+            sc.typing.type_caps, sc.view.a, sc.view.source, d.data.bind.init, ?sc.s.interner,
+            comptime.declared_float_width(sc.view.a, sc.view.source, d.data.bind.ty));
+    }
+    sema_context.walk_end(sc, outer);
+    if (sel res_evaluated.err) {
+        sc.view.constant_state[ix] = CONSTANT_PENDING;
+        ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].err{res_evaluated.err};
+    }
+    # an aggregate is a value of the store, built from its initializer, and binds no scalar
+    if (res_evaluated.ok.kind == comptime_value.CT_KIND_NODE) {
+        sc.view.constant_state[ix] = CONSTANT_NONE;
+        ret res_none;
+    }
+    var value: comptime_value.CTValue = comptime_value.apply_declared_int_type(sc.view.a, sc.view.source, d.data.bind.ty, res_evaluated.ok);
+    value.secret = secret;
+    val err_put: err[fail.Fail] = comptime_scope.bind(sc.view.ctx, name, value);
+    if (sel err_put.err) {
+        sc.view.constant_state[ix] = CONSTANT_NONE;
+        ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].err{comptime_failure.eval_error(comptime_failure.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, fail.describe(err_put.err))};
+    }
+    sc.view.constant_state[ix] = CONSTANT_BOUND;
+    ret res[opt[comptime_value.CTValue], comptime_failure.EvalFail].ok{opt[comptime_value.CTValue].some{value}};
+}
+
+# every constant still unbound once all are tried is none, so no later read, inside a body or
+# an instance, evaluates one again
+pub fun settle(sc: *sema_context.SemaContext) {
+    if (sc.view.constant_state == nil) { ret; }
+    var i: u32 = 0;
+    for (i < sc.view.a.decls.len::u32) {
+        if (sc.view.constant_state[i] == CONSTANT_PENDING) { sc.view.constant_state[i] = CONSTANT_NONE; }
+        i = i + 1;
+    }
+}
+
+# the node of a constant while its value is built, so a value that names the constant itself
+# is refused rather than built forever
+val NODE_BUILDING: u32 = 0xFFFFFFFE;
+
+# the node of the value the module `val` `sym` declares, built in the module's store on first
+# ask: the constant sema bound, or its initializer evaluated member by member; NONE for a
+# declaration with no initializer of its own
+pub fun own_value(sc: *sema_context.SemaContext, sym: *resolve.Symbol) res[u32, fail.Fail] {
+    val ix: u32 = ast_id.decl_index(sym.decl);
+    if (sc.view.constant_node == nil || ix >= sc.view.a.decls.len::u32) {
+        ret res[u32, fail.Fail].err{fail.message("sema: a module constant's value is built outside its module's typing")};
+    }
+    val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, sym.decl);
+    if (sel opt_decl.none) { ret res[u32, fail.Fail].err{fail.message("sema: a module constant has no declaration")}; }
+    val d: *ast_decl.Decl = opt_decl.some;
+    if (sc.view.constant_node[ix] == NODE_BUILDING) {
+        ret refused_add(sc, type_at(sc, d.data.bind.init), comptime_failure.eval_error(comptime_failure.EVAL_FAIL_REJECTED, diagnostic_kind.COMPTIME_NOT_CONSTANT,
+            "the value of this constant names the constant itself"), d.data.bind.init);
+    }
+    if (sc.view.constant_node[ix] != interface.NONE) { ret res[u32, fail.Fail].ok{sc.view.constant_node[ix]}; }
+    if ((d.flags & ast_decl.DECL_FLAG_EXT) != 0 || ast_id.expr_is_nil(d.data.bind.init) || decorator.has(sc.view.a, d, decorator.EMBED)) {
+        ret res[u32, fail.Fail].ok{interface.NONE};
+    }
+    var ty: type_kind.TypeId = type_kind.TYPE_NIL;
+    if (sc.view.decl_type != nil) { ty = sc.view.decl_type[ix]; }
+    val opt_bound: opt[comptime_scope.NamedConst] = comptime_scope.lookup(sc.view.ctx, sym.name);
+    if (sel opt_bound.some) {
+        if (opt_bound.some.value.kind != comptime_value.CT_KIND_CONST_ELEM) {
+            val res_scalar: res[u32, fail.Fail] = comptime_deep.node_add(sc.typing.values, comptime_deep.Node{kind: comptime_deep.NODE_SCALAR, ty: ty, value: opt_bound.some.value});
+            if (sel res_scalar.ok) { sc.view.constant_node[ix] = res_scalar.ok; }
+            ret res_scalar;
+        }
+    }
+    type_initializer(sc, sym);
+    sc.view.constant_node[ix] = NODE_BUILDING;
+    val res_built: res[u32, fail.Fail] = node_build(sc, d.data.bind.init);
+    if (sel res_built.err) {
+        sc.view.constant_node[ix] = interface.NONE;
+        ret res_built;
+    }
+    sc.view.constant_node[ix] = res_built.ok;
+    ret res_built;
+}
+
+# the published value of the module `val` `sym` names: the declaration in its module's interface
+# that holds it, with the store it is a node of
+rec Published {
+    store:       *comptime_deep.Store;
+    module:      u32;
+    declaration: *interface.Declaration;
+}
+
+fun published(sc: *sema_context.SemaContext, sym: *resolve.Symbol) res[opt[Published], fail.Fail] {
+    val res_acquired: res[*interface.Interface, fail.Fail] = sema_context.interface_of(sc, resolve.origin_of(sc.s, sym));
+    if (sel res_acquired.err) { ret res[opt[Published], fail.Fail].err{res_acquired.err}; }
+    val iface: *interface.Interface = res_acquired.ok;
+    var decl:  ast_id.DeclId        = sym.decl;
+    if (sema_context.foreign(sc, sym)) {
+        val res_named: res[*interface.Declaration, fail.Fail] = interface.declaration_for(iface, sym.definition_kind, sym.canon);
+        if (sel res_named.err) {
+            report_phase.internal(?sc.status, res_named.err);
+            ret res[opt[Published], fail.Fail].err{res_named.err};
+        }
+        decl = res_named.ok.decl;
+    }
+    val opt_found: opt[*interface.Declaration] = interface.declaration_at(iface, decl);
+    if (sel opt_found.none) { ret res[opt[Published], fail.Fail].ok{opt[Published].none{}}; }
+    ret res[opt[Published], fail.Fail].ok{opt[Published].some{Published{store: ?iface.values,
+        module: module.stable_index(resolve.stable_of_module(sc.s, resolve.origin_of(sc.s, sym))), declaration: opt_found.some}}};
+}
+
+# the value of the array `sym` names that a `$each` reads: a module constant's, this module's
+# built once and another module's as it published it, or the value of a `val` local to a body,
+# built in the walk that reads it since each instance of the body may give it another; none for
+# a binding with no array, record or case literal value
+pub fun array_value(sc: *sema_context.SemaContext, sym: *resolve.Symbol) res[opt[comptime_value.CTValue], fail.Fail] {
+    val res_none: res[opt[comptime_value.CTValue], fail.Fail] = res[opt[comptime_value.CTValue], fail.Fail].ok{opt[comptime_value.CTValue].none{}};
+    val own:      u32                                         = module.stable_index(sc.typing.module);
+    if (sym.kind == resolve.SYM_VAL && (sym.flags & resolve.SYM_FLAG_MODULE) == 0 && !sema_context.foreign(sc, sym)) {
+        val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, sym.decl);
+        if (sel opt_decl.none) { ret res_none; }
+        val init: ast_id.ExprId = opt_decl.some.data.bind.init;
+        if (opt_decl.some.kind != ast_decl.DECL_KIND_VAL || ast_id.expr_is_nil(init) || !is_aggregate(sc, init)) { ret res_none; }
+        val res_local: res[u32, fail.Fail] = node_build(sc, init);
+        if (sel res_local.err) { ret res[opt[comptime_value.CTValue], fail.Fail].err{res_local.err}; }
+        ret res[opt[comptime_value.CTValue], fail.Fail].ok{opt[comptime_value.CTValue].some{comptime_value.node_ref(own, res_local.ok, type_kind.index(type_at(sc, init)))}};
+    }
+    if (!sema_context.foreign(sc, sym) && sc.view.constant_node != nil) {
+        val res_built: res[u32, fail.Fail] = own_value(sc, sym);
+        if (sel res_built.err)              { ret res[opt[comptime_value.CTValue], fail.Fail].err{res_built.err}; }
+        if (res_built.ok == interface.NONE) { ret res_none; }
+        ret res[opt[comptime_value.CTValue], fail.Fail].ok{opt[comptime_value.CTValue].some{comptime_value.node_ref(own, res_built.ok,
+            type_kind.index(comptime_deep.node_at(sc.typing.values, res_built.ok).ty))}};
+    }
+    val res_found: res[opt[Published], fail.Fail] = published(sc, sym);
+    if (sel res_found.err)                                     { ret res[opt[comptime_value.CTValue], fail.Fail].err{res_found.err}; }
+    if (sel res_found.ok.none)                                 { ret res_none; }
+    if (res_found.ok.some.declaration.value == interface.NONE) { ret res_none; }
+    val p:    Published = res_found.ok.some;
+    val node: u32       = p.declaration.value;
+    ret res[opt[comptime_value.CTValue], fail.Fail].ok{opt[comptime_value.CTValue].some{comptime_value.node_ref(p.module, node, type_kind.index(comptime_deep.node_at(p.store, node).ty))}};
+}
+
+# the store of constant values of the module with stable id `module`: this module's, or the one
+# another module's interface publishes
+pub fun store_of(sc: *sema_context.SemaContext, module_index: u32) res[*comptime_deep.Store, comptime_failure.EvalFail] {
+    if (sc.typing.values != nil && module_index == module.stable_index(sc.typing.module)) {
+        ret res[*comptime_deep.Store, comptime_failure.EvalFail].ok{sc.typing.values};
+    }
+    val mid:          module.ModuleId                      = module.module_id_for_stable(?sc.s.modules, module.stable_id(module_index));
+    val res_acquired: res[*interface.Interface, fail.Fail] = sema_context.interface_of(sc, mid);
+    if (sel res_acquired.err) {
+        ret res[*comptime_deep.Store, comptime_failure.EvalFail].err{comptime_failure.eval_from_fail(res_acquired.err, diagnostic_kind.COMPTIME_NOT_CONSTANT,
+            "the module that publishes this constant was rejected")};
+    }
+    ret res[*comptime_deep.Store, comptime_failure.EvalFail].ok{?res_acquired.ok.values};
+}
+
+# an array literal, or a record or case literal spelled with its head type
+pub fun is_aggregate(sc: *sema_context.SemaContext, eid: ast_id.ExprId) bool {
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(sc.view.a, eid);
+    if (sel opt_expr.none) { ret false; }
+    val e: *ast_expr.Expr = opt_expr.some;
+    if (e.kind == ast_expr.EXPR_KIND_ARRAY_LIT)  { ret true; }
+    if (e.kind == ast_expr.EXPR_KIND_STRUCT_LIT) { ret !ast_id.type_is_nil(e.data.struct_lit.ty); }
+    if (e.kind == ast_expr.EXPR_KIND_VECTOR_LIT) { ret !ast_id.type_is_nil(e.data.vector_lit.ty); }
+    ret false;
+}
+
+# an array, record, case or vector literal, with or without its head type
+fun is_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId) bool {
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(sc.view.a, eid);
+    if (sel opt_expr.none) { ret false; }
+    val k: ast_expr.ExprKind = opt_expr.some.kind;
+    ret k == ast_expr.EXPR_KIND_ARRAY_LIT || k == ast_expr.EXPR_KIND_STRUCT_LIT || k == ast_expr.EXPR_KIND_VECTOR_LIT;
+}
+
+# the type the walk gave an expression
+pub fun type_at(sc: *sema_context.SemaContext, eid: ast_id.ExprId) type_kind.TypeId {
+    if (sc.view.expr_type == nil || ast_id.expr_is_nil(eid) || !sema_context.expr_in_view(sc, eid)) { ret type_kind.TYPE_NIL; }
+    ret sema_context.apply_subst(sc, sc.view.expr_type[ast_id.expr_index(eid)]);
+}
+
+# the node of the expression `eid`: an aggregate literal member by member, the value of the
+# constant it names, an address, or anything else as the evaluator answers it at the type the
+# walk gave it
+pub fun node_build(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[u32, fail.Fail] {
+    val ty: type_kind.TypeId = type_at(sc, eid);
+    if (!is_aggregate(sc, eid)) { ret leaf_build(sc, eid, ty); }
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(sc.view.a, eid);
+    if (sel opt_expr.none) { ret res[u32, fail.Fail].err{fail.message("sema: a constant names no expression")}; }
+    val e: *ast_expr.Expr = opt_expr.some;
+    if (stack.exhausted()) { ret res[u32, fail.Fail].err{refused_nesting(sc, e.span)}; }
+
+    var head:      intern.StrId           = intern.STR_NIL;
+    var named:     u32                    = 0;
+    var elems:     u32                    = 0;
+    var elems_at:  u32                    = 0;
+    var fields_at: u32                    = 0;
+    var kind:      comptime_deep.NodeKind = comptime_deep.NODE_ARRAY;
+    if (e.kind == ast_expr.EXPR_KIND_ARRAY_LIT) {
+        elems    = e.data.array_lit.elems_len;
+        elems_at = e.data.array_lit.elems_start;
+    }
+    or {
+        kind = comptime_deep.NODE_LITERAL;
+        val res_case: res[intern.StrId, comptime_failure.EvalFail] = comptime.literal_case[sema_context.SemaContext](sc.view.ctx, sc,
+            sc.typing.type_caps, sc.view.a, sc.view.source, eid, ?sc.s.interner);
+        if (sel res_case.err) { ret refused_add(sc, ty, res_case.err, eid); }
+        head = res_case.ok;
+        # a record literal's values are its named fields, and a case literal's its payload; the
+        # parsed element list repeats the fields' values in order
+        if (e.kind == ast_expr.EXPR_KIND_STRUCT_LIT && intern.str_is_nil(head)) {
+            named     = e.data.struct_lit.fields_len;
+            fields_at = e.data.struct_lit.fields_start;
+        }
+        or (e.kind == ast_expr.EXPR_KIND_STRUCT_LIT) {
+            elems    = e.data.struct_lit.elems_len;
+            elems_at = e.data.struct_lit.elems_start;
+        }
+        or {
+            elems    = e.data.vector_lit.elems_len;
+            elems_at = e.data.vector_lit.elems_start;
+        }
+    }
+
+    var declared: u32 = elems;
+    if (kind == comptime_deep.NODE_ARRAY) {
+        val opt_count: opt[u32] = type.element_count(?sc.s.types, ty);
+        if (sel opt_count.some) { declared = opt_count.some; }
+    }
+    val res_node: res[u32, fail.Fail] = comptime_deep.node_add(sc.typing.values, comptime_deep.Node{kind: kind, ty: ty, head: head, declared: declared});
+    if (sel res_node.err) { ret res_node; }
+    val total: u32 = named + elems;
+    if (total == 0) { ret res_node; }
+    val res_allocated: res[*comptime_deep.Member, A.Error] = A.allocate[comptime_deep.Member](sc.s.alloc, total::usize);
+    if (sel res_allocated.err) { ret res[u32, fail.Fail].err{fail.refused(res_allocated.err)}; }
+    val members: *comptime_deep.Member = res_allocated.ok;
+    fin { A.deallocate[comptime_deep.Member](sc.s.alloc, members, total::usize); }
+
+    var i: u32 = 0;
+    for (i < named) {
+        val fi:        *ast_expr.FieldInit = ?sc.view.a.field_inits.data[fields_at + i];
+        val res_child: res[u32, fail.Fail] = node_build(sc, fi.value);
+        if (sel res_child.err) { ret res_child; }
+        members[i] = comptime_deep.Member{name: fi.name_id, node: res_child.ok};
+        i          = i + 1;
+    }
+    i = 0;
+    for (i < elems) {
+        val res_child: res[u32, fail.Fail] = node_build(sc, sc.view.a.expr_ids.data[elems_at + i]);
+        if (sel res_child.err) { ret res_child; }
+        members[named + i] = comptime_deep.Member{name: intern.STR_NIL, node: res_child.ok};
+        i                  = i + 1;
+    }
+    val err_linked: err[fail.Fail] = comptime_deep.members_add(sc.typing.values, res_node.ok, members, total);
+    if (sel err_linked.err) { ret res[u32, fail.Fail].err{err_linked.err}; }
+    ret res_node;
+}
+
+# a leaf's value at its type: a float read at the type's width, and an integer or float held
+# as one of the type
+fun leaf_value(sc: *sema_context.SemaContext, eid: ast_id.ExprId, ty: type_kind.TypeId) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    var fw:        float.FloatWidth    = float.FLOAT_W_NONE;
+    var class:     type_prim.PrimClass = type_prim.PRIM_CLASS_NONE;
+    val opt_found: opt[*type.Type]     = type.get(?sc.s.types, type.strip_secret(?sc.s.types, ty));
+    if (sel opt_found.some) {
+        class = type_prim.prim_desc(opt_found.some.kind).class;
+        if (class == type_prim.PRIM_CLASS_FLOAT) { fw = type_prim.float_width_of(opt_found.some.kind); }
+    }
+    var res_evaluated: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime.evaluate_at_float_width[sema_context.SemaContext](sc.view.ctx, sc,
+        sc.typing.type_caps, sc.view.a, sc.view.source, eid, ?sc.s.interner, fw);
+    if (sema_context.holds_secret(sc, ty)) {
+        res_evaluated = comptime.evaluate_secret_at_float_width[sema_context.SemaContext](sc.view.ctx, sc,
+            sc.typing.type_caps, sc.view.a, sc.view.source, eid, ?sc.s.interner, fw);
+    }
+    if (sel res_evaluated.err) { ret res_evaluated; }
+    val v: comptime_value.CTValue = res_evaluated.ok;
+    if ((v.kind != comptime_value.CT_KIND_INT && v.kind != comptime_value.CT_KIND_FLOAT) || (class != type_prim.PRIM_CLASS_INT && class != type_prim.PRIM_CLASS_FLOAT)) { ret res_evaluated; }
+    ret comptime_value.cast_scalar(?sc.s.types, ?sc.s.interner, sc.view.ctx.env.target.pointer_width, sc.view.ctx.env.target.nans, sc.view.ctx.env.target.arch_id, v, ty, ty, false);
+}
+
+# a leaf with no compile-time value keeps the refusal reading it gives, at the leaf; an internal
+# failure is the build's own
+fun refused_add(sc: *sema_context.SemaContext, ty: type_kind.TypeId, why: comptime_failure.EvalFail, eid: ast_id.ExprId) res[u32, fail.Fail] {
+    if (why.kind == comptime_failure.EVAL_FAIL_INTERNAL) { ret res[u32, fail.Fail].err{fail.message(why.message)}; }
+    val res_message: res[intern.StrId, A.Error] = intern.add(?sc.s.interner, why.message);
+    if (sel res_message.err) { ret res[u32, fail.Fail].err{fail.refused(res_message.err)}; }
+    var span:     base_source.Span    = base_source.span(0, 0);
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(sc.view.a, eid);
+    if (sel opt_expr.some) { span = opt_expr.some.span; }
+    ret comptime_deep.node_add(sc.typing.values, comptime_deep.Node{kind: comptime_deep.NODE_REFUSED, ty: ty,
+        refusal: comptime_deep.Refusal{kind: why.kind, diag: why.diag, message: res_message.ok, at: base_source.location(sc.view.a.file_id, span)}});
+}
+
+# a value nested deeper than the stack lets a walk descend, reported against the node it stands on
+fun refused_nesting(sc: *sema_context.SemaContext, span: base_source.Span) fail.Fail {
+    sema_context.refuse_nesting(sc, span);
+    ret fail.reported();
+}
+
+fun refused(message: str) comptime_failure.EvalFail {
+    ret comptime_failure.eval_error(comptime_failure.EVAL_FAIL_REJECTED, diagnostic_kind.COMPTIME_NOT_CONSTANT, message);
+}
+
+# a leaf: the value of the constant it names, an address, or what the evaluator answers
+fun leaf_build(sc: *sema_context.SemaContext, eid: ast_id.ExprId, ty: type_kind.TypeId) res[u32, fail.Fail] {
+    val opt_expr: opt[*ast_expr.Expr] = ast.get_expr(sc.view.a, eid);
+    if (sel opt_expr.none) { ret res[u32, fail.Fail].err{fail.message("sema: a constant's leaf has no expression")}; }
+    val span: base_source.Span = opt_expr.some.span;
+    if (!spells_value(opt_expr.some.kind)) {
+        val res_reached: res[Reach, fail.Fail] = reach(sc, eid, 0);
+        if (sel res_reached.err)                  { ret res[u32, fail.Fail].err{res_reached.err}; }
+        if (res_reached.ok.kind == REACH_NODE)    { ret adopt(sc, res_reached.ok.store, res_reached.ok.node, span); }
+        if (res_reached.ok.kind == REACH_REFUSED) { ret refused_add(sc, ty, res_reached.ok.why, eid); }
+    }
+    val res_address: res[opt[u32], fail.Fail] = address_build(sc, eid, opt_expr.some, ty);
+    if (sel res_address.err)     { ret res[u32, fail.Fail].err{res_address.err}; }
+    if (sel res_address.ok.some) { ret res[u32, fail.Fail].ok{res_address.ok.some}; }
+    val res_evaluated: res[comptime_value.CTValue, comptime_failure.EvalFail] = leaf_value(sc, eid, ty);
+    if (sel res_evaluated.err) { ret refused_add(sc, ty, res_evaluated.err, eid); }
+    if (res_evaluated.ok.kind == comptime_value.CT_KIND_NODE) {
+        val res_store: res[*comptime_deep.Store, comptime_failure.EvalFail] = store_of(sc, res_evaluated.ok.data.node.module);
+        if (sel res_store.err) { ret refused_add(sc, ty, res_store.err, eid); }
+        ret adopt(sc, res_store.ok, res_evaluated.ok.data.node.node, span);
+    }
+    ret comptime_deep.node_add(sc.typing.values, comptime_deep.Node{kind: comptime_deep.NODE_SCALAR, ty: ty, value: res_evaluated.ok});
+}
+
+# a literal or an operator spells its value itself and names no constant
+fun spells_value(k: ast_expr.ExprKind) bool {
+    ret k == ast_expr.EXPR_KIND_LIT_INT || k == ast_expr.EXPR_KIND_LIT_FLOAT || k == ast_expr.EXPR_KIND_LIT_CHAR || k == ast_expr.EXPR_KIND_LIT_STR
+        || k == ast_expr.EXPR_KIND_LIT_NIL || k == ast_expr.EXPR_KIND_UNARY || k == ast_expr.EXPR_KIND_BINARY;
+}
+
+# node `node` of `store` as a node of this module's store: itself when the store is this
+# module's, and otherwise a copy, so every tree of a store lies wholly in it
+fun adopt(sc: *sema_context.SemaContext, store: *comptime_deep.Store, node: u32, span: base_source.Span) res[u32, fail.Fail] {
+    if (store == sc.typing.values) { ret res[u32, fail.Fail].ok{node}; }
+    val res_copied: res[u32, fail.Fail] = comptime_deep.clone(sc.typing.values, store, node);
+    if (sel res_copied.err) { ret res[u32, fail.Fail].err{placed(sc, span, res_copied.err)}; }
+    ret res_copied;
+}
+
+# a failure a walk with no place of its own returned, at `span`: a refusal of the input is
+# reported there and reads as reported, and any other failure is returned as it is
+fun placed(sc: *sema_context.SemaContext, span: base_source.Span, f: fail.Fail) fail.Fail {
+    val k: diagnostic_kind.Kind = fail.kind_of(f);
+    if (k == diagnostic_kind.NONE || k == diagnostic_kind.COMPILER_INTERNAL) { ret f; }
+    sema_context.refuse(sc, span, f);
+    ret fail.reported();
+}
+
+def ReachKind: u8;
+# the expression names no constant
+val REACH_NONE: ReachKind = 0;
+# it names node `node` of `store`
+val REACH_NODE: ReachKind = 1;
+# it names a constant that holds no value there, for the reason `why`
+val REACH_REFUSED: ReachKind = 2;
+
+rec Reach {
+    kind:  ReachKind;
+    store: *comptime_deep.Store;
+    node:  u32;
+    why:   comptime_failure.EvalFail;
+}
+
+# a constant may name another constant; the chain is finite in a checked program, and the bound
+# only keeps a malformed one from recursing forever
+val REACH_DEPTH: u32 = 64;
+
+fun reach_node(store: *comptime_deep.Store, node: u32) res[Reach, fail.Fail] {
+    ret res[Reach, fail.Fail].ok{Reach{kind: REACH_NODE, store: store, node: node}};
+}
+
+fun reach_refused(why: comptime_failure.EvalFail) res[Reach, fail.Fail] {
+    ret res[Reach, fail.Fail].ok{Reach{kind: REACH_REFUSED, why: why}};
+}
+
+# the value a constant-valued expression names: a module `val`, a field or an element of one, a
+# window of one's elements, or an identity cast of one
+fun reach(sc: *sema_context.SemaContext, eid: ast_id.ExprId, depth: u32) res[Reach, fail.Fail] {
+    val res_none: res[Reach, fail.Fail] = res[Reach, fail.Fail].ok{Reach{kind: REACH_NONE}};
+    if (depth >= REACH_DEPTH) { ret res_none; }
+    # the expression as name resolution read it, so `A[N]` with a named index is an element read
+    val res_read: res[ast_expr.Expr, fail.Fail] = resolve.expression(sc.view.rr, sc.view.a, eid);
+    if (sel res_read.err) { ret res[Reach, fail.Fail].err{res_read.err}; }
+    val e: ast_expr.Expr = res_read.ok;
+    if (stack.exhausted()) { ret res[Reach, fail.Fail].err{refused_nesting(sc, e.span)}; }
+    val opt_named: opt[*resolve.Symbol] = sema_context.symbol_for_expr(sc, eid);
+    if (sel opt_named.some) {
+        if (names_constant(sc, opt_named.some)) { ret reach_constant(sc, opt_named.some); }
+        ret res_none;
+    }
+    if (e.kind == ast_expr.EXPR_KIND_CAST) {
+        val from: type_kind.TypeId = type.strip_secret(?sc.s.types, type_at(sc, e.data.cast.value));
+        val to:   type_kind.TypeId = type.strip_secret(?sc.s.types, type_at(sc, eid));
+        if (type_kind.is_nil(from) || type_kind.is_error(from)) { ret res_none; }
+        # `::` between `[N]T` and `TxN` keeps every element as it is
+        val same_elements: bool = !e.data.cast.reinterpret && ((is_array(sc, from) && type.is_vector(?sc.s.types, to))
+            || (type.is_vector(?sc.s.types, from) && is_array(sc, to)));
+        if (!type_kind.same(from, to) && !same_elements) { ret res_none; }
+        ret reach(sc, e.data.cast.value, depth + 1);
+    }
+    if (e.kind == ast_expr.EXPR_KIND_MEMBER) { ret reach_member(sc, eid, ?e, depth); }
+    if (e.kind == ast_expr.EXPR_KIND_INDEX)  { ret reach_index(sc, eid, ?e, depth); }
+    ret res_none;
+}
+
+fun names_constant(sc: *sema_context.SemaContext, sym: *resolve.Symbol) bool {
+    if (sema_context.foreign(sc, sym)) { ret sym.definition_kind == resolve.SYM_VAL; }
+    ret sym.kind == resolve.SYM_VAL && (sym.flags & resolve.SYM_FLAG_MODULE) != 0 && !ast_id.decl_is_nil(sym.decl);
+}
+
+# the value of the module `val` `sym`: this module's, built on first ask, or the one another
+# module published
+fun reach_constant(sc: *sema_context.SemaContext, sym: *resolve.Symbol) res[Reach, fail.Fail] {
+    val res_none: res[Reach, fail.Fail] = res[Reach, fail.Fail].ok{Reach{kind: REACH_NONE}};
+    if (!sema_context.foreign(sc, sym)) {
+        val res_built: res[u32, fail.Fail] = own_value(sc, sym);
+        if (sel res_built.err)              { ret res[Reach, fail.Fail].err{res_built.err}; }
+        if (res_built.ok == interface.NONE) { ret res_none; }
+        ret reach_node(sc.typing.values, res_built.ok);
+    }
+    val res_found: res[opt[Published], fail.Fail] = published(sc, sym);
+    if (sel res_found.err)     { ret res[Reach, fail.Fail].err{res_found.err}; }
+    if (sel res_found.ok.none) { ret res_none; }
+    val p: Published = res_found.ok.some;
+    if (p.declaration.value == interface.NONE) { ret res_none; }
+    ret reach_node(p.store, p.declaration.value);
+}
+
+# the constant a member or an element is read from, whose refusal is the read's
+fun reach_aggregate(sc: *sema_context.SemaContext, eid: ast_id.ExprId, depth: u32) res[Reach, fail.Fail] {
+    val res_inner: res[Reach, fail.Fail] = reach(sc, eid, depth);
+    if (sel res_inner.err)               { ret res_inner; }
+    if (res_inner.ok.kind != REACH_NODE) { ret res_inner; }
+    val n: *comptime_deep.Node = comptime_deep.node_at(res_inner.ok.store, res_inner.ok.node);
+    if (n.kind != comptime_deep.NODE_REFUSED) { ret res_inner; }
+    ret reach_refused(comptime_deep.refusal_of(?sc.s.interner, n.refusal));
+}
+
+# a field of a record constant, or the payload of the case a case constant holds; a field the
+# literal leaves out holds its zero
+fun reach_member(sc: *sema_context.SemaContext, eid: ast_id.ExprId, e: *ast_expr.Expr, depth: u32) res[Reach, fail.Fail] {
+    val res_inner: res[Reach, fail.Fail] = reach_aggregate(sc, e.data.member.object, depth + 1);
+    if (sel res_inner.err)               { ret res_inner; }
+    if (res_inner.ok.kind != REACH_NODE) { ret res_inner; }
+    val res_name: res[intern.StrId, A.Error] = intern.range_add(?sc.s.interner, sc.view.source, e.data.member.name.offset, e.data.member.name.len);
+    if (sel res_name.err) { ret res[Reach, fail.Fail].err{fail.refused(res_name.err)}; }
+    val p: comptime_deep.Projection = comptime_deep.project(res_inner.ok.store, res_inner.ok.node, res_name.ok);
+    if (p.kind == comptime_deep.PROJECT_MEMBER) { ret reach_node(res_inner.ok.store, p.node); }
+    if (p.kind == comptime_deep.PROJECT_OMITTED) {
+        val owner: type_kind.TypeId = comptime_deep.node_at(res_inner.ok.store, res_inner.ok.node).ty;
+        if (!intern.str_is_nil(sema_declared.ensure_layout_ready(sc, owner))) { ret reach_refused(refused(LAYOUT_PENDING_MSG)); }
+        val opt_field: opt[type_kind.TypeId] = sema_context.field_lookup(sc, type.strip_secret(?sc.s.types, owner), res_name.ok);
+        if (sel opt_field.none) { ret reach_refused(refused(comptime_deep.ZERO_UNKNOWN_MSG)); }
+        ret reach_zero_at(sc, opt_field.some, e.span);
+    }
+    if (p.kind == comptime_deep.PROJECT_UNSELECTED) {
+        ret reach_refused(refused("this reads the payload of a case the constant does not hold"));
+    }
+    if (p.kind == comptime_deep.PROJECT_NO_PAYLOAD) {
+        ret reach_refused(refused("this reads a payload, but the case the constant holds has none"));
+    }
+    ret res[Reach, fail.Fail].ok{Reach{kind: REACH_NONE}};
+}
+
+# an element of an array constant, or a window `A[start, n]` of its elements; an element the
+# literal leaves out holds its zero
+fun reach_index(sc: *sema_context.SemaContext, eid: ast_id.ExprId, e: *ast_expr.Expr, depth: u32) res[Reach, fail.Fail] {
+    val res_inner: res[Reach, fail.Fail] = reach_aggregate(sc, e.data.index.object, depth + 1);
+    if (sel res_inner.err)               { ret res_inner; }
+    if (res_inner.ok.kind != REACH_NODE) { ret res_inner; }
+    val array: *comptime_deep.Node = comptime_deep.node_at(res_inner.ok.store, res_inner.ok.node);
+    if (array.kind != comptime_deep.NODE_ARRAY) { ret res[Reach, fail.Fail].ok{Reach{kind: REACH_NONE}}; }
+    val res_evaluate: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime.evaluate[sema_context.SemaContext](sc.view.ctx, sc,
+        sc.typing.type_caps, sc.view.a, sc.view.source, e.data.index.index, ?sc.s.interner);
+    if (sel res_evaluate.err) { ret reach_refused(res_evaluate.err); }
+    val opt_start: opt[u64] = comptime_value.ct_int_u64(res_evaluate.ok);
+    if (sel opt_start.none) { ret reach_refused(refused("an index into a constant must be a non-negative integer")); }
+    val start: u64 = opt_start.some;
+    if (!ast_expr.is_range(?e.data.index)) {
+        val element: comptime_deep.Element = comptime_deep.element(res_inner.ok.store, res_inner.ok.node, start);
+        if (element.kind == comptime_deep.ELEMENT_PAST_END) { ret reach_refused(refused(comptime_deep.INDEX_PAST_END_MSG)); }
+        if (element.kind == comptime_deep.ELEMENT_MEMBER)   { ret reach_node(res_inner.ok.store, element.node); }
+        val opt_element_type: opt[type_kind.TypeId] = element_type(sc, array.ty);
+        if (sel opt_element_type.none) { ret res[Reach, fail.Fail].err{fail.message("sema: an array constant's node has no array or vector type")}; }
+        ret reach_zero_at(sc, opt_element_type.some, e.span);
+    }
+    val res_width: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime.evaluate[sema_context.SemaContext](sc.view.ctx, sc,
+        sc.typing.type_caps, sc.view.a, sc.view.source, e.data.index.count, ?sc.s.interner);
+    if (sel res_width.err) { ret reach_refused(res_width.err); }
+    val opt_width: opt[u64] = comptime_value.ct_int_u64(res_width.ok);
+    if (sel opt_width.none) { ret reach_refused(refused(WINDOW_WIDTH_MSG)); }
+    val wide: u64 = opt_width.some;
+    if (wide > array.declared::u64 || start > array.declared::u64 - wide) { ret reach_refused(refused("this window runs past the end of the constant it reads")); }
+    val count:     u32                              = wide::u32;
+    val res_built: res[type_kind.TypeId, fail.Fail] = type.intern_window(?sc.s.types, array.ty, count);
+    if (sel res_built.err) { ret res[Reach, fail.Fail].err{res_built.err}; }
+    val ty:   type_kind.TypeId = res_built.ok;
+    var held: u32              = 0;
+    if (start < array.len::u64) { held = array.len - start::u32; }
+    if (held > count)           { held = count; }
+    val res_window: res[u32, fail.Fail] = comptime_deep.node_add(sc.typing.values, comptime_deep.Node{kind: comptime_deep.NODE_ARRAY, ty: ty, declared: count});
+    if (sel res_window.err) { ret res[Reach, fail.Fail].err{res_window.err}; }
+    if (held == 0)          { ret reach_node(sc.typing.values, res_window.ok); }
+    val res_allocated: res[*comptime_deep.Member, A.Error] = A.allocate[comptime_deep.Member](sc.s.alloc, held::usize);
+    if (sel res_allocated.err) { ret res[Reach, fail.Fail].err{fail.refused(res_allocated.err)}; }
+    val members: *comptime_deep.Member = res_allocated.ok;
+    fin { A.deallocate[comptime_deep.Member](sc.s.alloc, members, held::usize); }
+    val first: u32 = array.first + start::u32;
+    var i:     u32 = 0;
+    for (i < held) {
+        val res_element: res[u32, fail.Fail] = adopt(sc, res_inner.ok.store, res_inner.ok.store.members.data[first + i].node, e.span);
+        if (sel res_element.err) { ret res[Reach, fail.Fail].err{res_element.err}; }
+        members[i] = comptime_deep.Member{name: intern.STR_NIL, node: res_element.ok};
+        i          = i + 1;
+    }
+    val err_linked: err[fail.Fail] = comptime_deep.members_add(sc.typing.values, res_window.ok, members, held);
+    if (sel err_linked.err) { ret res[Reach, fail.Fail].err{err_linked.err}; }
+    ret reach_node(sc.typing.values, res_window.ok);
+}
+
+val WINDOW_WIDTH_MSG: str = "the length of a window into a constant must be a non-negative integer";
+
+# the element type of the array or vector constant type `ty`, which the constant records itself so
+# a read no walk has typed still knows the zero of an element
+fun element_type(sc: *sema_context.SemaContext, ty: type_kind.TypeId) opt[type_kind.TypeId] {
+    val types:     *type.TypeInterner = ?sc.s.types;
+    val opt_found: opt[*type.Type]    = type.get(types, type.strip_secret(types, ty));
+    if (sel opt_found.none)                           { ret opt[type_kind.TypeId].none{}; }
+    if (opt_found.some.kind == type_kind.TYPE_ARRAY)  { ret opt[type_kind.TypeId].some{opt_found.some.data.array.base}; }
+    if (opt_found.some.kind != type_kind.TYPE_VECTOR) { ret opt[type_kind.TypeId].none{}; }
+    ret type.prim(types, type.vector_element(types, ty));
+}
+
+# a constant whose member's zero is read while its layout is decided is read by that layout, as an
+# array length in the record reading the constant is, which no order of reading settles
+val LAYOUT_PENDING_MSG: str = "the zero of this member needs a layout that reads the constant";
+
+# whether the zero of `ty` can be built now: a tag's cases are declared once the layout of what
+# it holds by value is decided, which the rest of the types need nothing of
+fun zero_ready(sc: *sema_context.SemaContext, ty: type_kind.TypeId) bool {
+    if (!type.is_tag(?sc.s.types, type.strip_secret(?sc.s.types, ty))) { ret true; }
+    ret intern.str_is_nil(sema_declared.ensure_layout_ready(sc, type.strip_secret(?sc.s.types, ty)));
+}
+
+# the zero of `ty` read at `span`, where a refusal of the input is reported
+fun reach_zero_at(sc: *sema_context.SemaContext, ty: type_kind.TypeId, span: base_source.Span) res[Reach, fail.Fail] {
+    val res_zero: res[Reach, fail.Fail] = reach_zero(sc, ty);
+    if (sel res_zero.err) { ret res[Reach, fail.Fail].err{placed(sc, span, res_zero.err)}; }
+    ret res_zero;
+}
+
+# the zero of `ty` in the module's store, which a member a literal leaves out holds, built once per
+# type and shared by every read of it
+fun reach_zero(sc: *sema_context.SemaContext, ty: type_kind.TypeId) res[Reach, fail.Fail] {
+    if (!comptime_deep.zero_defined(?sc.s.types, ty)) { ret reach_refused(refused(comptime_deep.ZERO_UNKNOWN_MSG)); }
+    if (!zero_ready(sc, ty))                          { ret reach_refused(refused(LAYOUT_PENDING_MSG)); }
+    val res_added: res[u32, fail.Fail] = comptime_deep.zero_node(sc.typing.values, ?sc.s.types, sc.view.ctx.env.target.pointer_width, ty);
+    if (sel res_added.err) { ret res[Reach, fail.Fail].err{res_added.err}; }
+    ret reach_node(sc.typing.values, res_added.ok);
+}
+
+# the zero of the type `ty` as a value, for an evaluation that holds a type and no expression
+pub fun zero_of(sc: *sema_context.SemaContext, ty: u32) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    val res_zero: res[Reach, fail.Fail] = reach_zero(sc, ty::type_kind.TypeId);
+    if (sel res_zero.err)                  { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{comptime_failure.eval_from_refusal(res_zero.err, diagnostic_kind.COMPTIME_NOT_CONSTANT, "the zero of this type is not known")}; }
+    if (res_zero.ok.kind == REACH_REFUSED) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{res_zero.ok.why}; }
+    ret comptime_deep.read(res_zero.ok.store, ?sc.s.interner, module.stable_index(sc.typing.module), res_zero.ok.node);
+}
+
+fun is_array(sc: *sema_context.SemaContext, ty: type_kind.TypeId) bool {
+    val opt_found: opt[*type.Type] = type.get(?sc.s.types, type.strip_secret(?sc.s.types, ty));
+    if (sel opt_found.none) { ret false; }
+    ret opt_found.some.kind == type_kind.TYPE_ARRAY;
+}
+
+# the address leaf `eid` spells: `nil`, the address of a place in a module-level binding, or a
+# function named bare; none for any other leaf
+fun address_build(sc: *sema_context.SemaContext, eid: ast_id.ExprId, e: *ast_expr.Expr, ty: type_kind.TypeId) res[opt[u32], fail.Fail] {
+    val res_none: res[opt[u32], fail.Fail] = res[opt[u32], fail.Fail].ok{opt[u32].none{}};
+    if (e.kind == ast_expr.EXPR_KIND_LIT_NIL) {
+        val res_null: res[u32, fail.Fail] = comptime_deep.node_add(sc.typing.values, comptime_deep.Node{kind: comptime_deep.NODE_SCALAR, ty: ty,
+            value: comptime_value.ct_zero_int(true, (sc.view.ctx.env.target.pointer_width * 8)::u8)});
+        if (sel res_null.err) { ret res[opt[u32], fail.Fail].err{res_null.err}; }
+        ret res[opt[u32], fail.Fail].ok{opt[u32].some{res_null.ok}};
+    }
+    var place: ast_id.ExprId = eid;
+    if (e.kind == ast_expr.EXPR_KIND_UNARY && e.data.unary.op == ast_expr.UN_ADDR) { place = e.data.unary.operand; }
+    or (spells_value(e.kind))                                                      { ret res_none; }
+    or {
+        val opt_named: opt[*resolve.Symbol] = sema_context.symbol_for_expr(sc, eid);
+        if (sel opt_named.none)              { ret res_none; }
+        if (!names_function(opt_named.some)) { ret res_none; }
+    }
+    var steps: collections_vector.Vector[comptime_deep.Member] = collections_vector.init[comptime_deep.Member](sc.s.alloc);
+    fin { collections_vector.dnit[comptime_deep.Member](?steps); }
+    val res_root: res[Root, fail.Fail] = address_root(sc, place, ?steps, 0);
+    if (sel res_root.err) { ret res[opt[u32], fail.Fail].err{res_root.err}; }
+    if (res_root.ok.refused) {
+        val res_refusal: res[u32, fail.Fail] = refused_add(sc, ty, res_root.ok.why, place);
+        if (sel res_refusal.err) { ret res[opt[u32], fail.Fail].err{res_refusal.err}; }
+        ret res[opt[u32], fail.Fail].ok{opt[u32].some{res_refusal.ok}};
+    }
+    val res_node: res[u32, fail.Fail] = comptime_deep.node_add(sc.typing.values, comptime_deep.Node{kind: comptime_deep.NODE_ADDRESS, ty: ty, symbol: res_root.ok.symbol});
+    if (sel res_node.err) { ret res[opt[u32], fail.Fail].err{res_node.err}; }
+    if (steps.len > 0) {
+        val err_linked: err[fail.Fail] = comptime_deep.members_add(sc.typing.values, res_node.ok, steps.data, steps.len::u32);
+        if (sel err_linked.err) { ret res[opt[u32], fail.Fail].err{err_linked.err}; }
+    }
+    ret res[opt[u32], fail.Fail].ok{opt[u32].some{res_node.ok}};
+}
+
+fun names_function(sym: *resolve.Symbol) bool {
+    ret sym.definition_kind == resolve.SYM_FUN;
+}
+
+# the binding an address points into, or why the place it spells has no fixed address
+rec Root {
+    symbol:  comptime_deep.Symbol;
+    refused: bool;
+    why:     comptime_failure.EvalFail;
+}
+
+fun root_refused(message: str) res[Root, fail.Fail] {
+    ret res[Root, fail.Fail].ok{Root{refused: true, why: refused(message)}};
+}
+
+# the binding the place `eid` names, with the field and element steps from it to the place
+# appended to `steps` in order: each a scalar holding the step's ordinal at the type it steps into
+fun address_root(sc: *sema_context.SemaContext, eid: ast_id.ExprId, steps: *collections_vector.Vector[comptime_deep.Member], depth: u32) res[Root, fail.Fail] {
+    if (depth >= REACH_DEPTH) { ret root_refused("this address steps too deep into its binding to be a constant"); }
+    val opt_named: opt[*resolve.Symbol] = sema_context.symbol_for_expr(sc, eid);
+    if (sel opt_named.some) { ret root_of(sc, opt_named.some); }
+    val res_read: res[ast_expr.Expr, fail.Fail] = resolve.expression(sc.view.rr, sc.view.a, eid);
+    if (sel res_read.err) { ret res[Root, fail.Fail].err{res_read.err}; }
+    val e:      ast_expr.Expr = res_read.ok;
+    var object: ast_id.ExprId = ast_id.EXPR_NIL;
+    if (e.kind == ast_expr.EXPR_KIND_MEMBER)                                     { object = e.data.member.object; }
+    or (e.kind == ast_expr.EXPR_KIND_INDEX && !ast_expr.is_range(?e.data.index)) { object = e.data.index.object; }
+    or                                                                           { ret root_refused("only the address of a module-level function, `val` or `var`, or of a place in one, is a constant"); }
+    val res_root: res[Root, fail.Fail] = address_root(sc, object, steps, depth + 1);
+    if (sel res_root.err)    { ret res_root; }
+    if (res_root.ok.refused) { ret res_root; }
+
+    val owner:   type_kind.TypeId = type.strip_secret(?sc.s.types, type_at(sc, object));
+    var ordinal: u64              = 0;
+    var name:    intern.StrId     = intern.STR_NIL;
+    if (e.kind == ast_expr.EXPR_KIND_MEMBER) {
+        if (!type.is_record(?sc.s.types, owner) && !type.is_union(?sc.s.types, owner)) {
+            ret root_refused("this address reaches through a pointer, and what a pointer points at is fixed only when the program runs");
+        }
+        val res_field: res[intern.StrId, A.Error] = intern.range_add(?sc.s.interner, sc.view.source, e.data.member.name.offset, e.data.member.name.len);
+        if (sel res_field.err) { ret res[Root, fail.Fail].err{fail.refused(res_field.err)}; }
+        name = res_field.ok;
+        val count: u32 = type.field_count(?sc.s.types, owner);
+        ordinal = count::u64;
+        var i: u32 = 0;
+        for (i < count) {
+            val opt_entry: opt[*type_field.Entry] = type.field_at(?sc.s.types, owner, i);
+            if (sel opt_entry.some && intern.str_same(opt_entry.some.name, name)) {
+                ordinal = i::u64;
+                brk;
+            }
+            i = i + 1;
+        }
+        if (ordinal == count::u64) { ret res[Root, fail.Fail].err{fail.message("sema: an address names a field its record does not declare")}; }
+    }
+    or {
+        val opt_elements: opt[u32] = type.element_count(?sc.s.types, owner);
+        if (sel opt_elements.none) {
+            ret root_refused("this address reaches through a pointer, and what a pointer points at is fixed only when the program runs");
+        }
+        val res_evaluate: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime.evaluate[sema_context.SemaContext](sc.view.ctx, sc,
+            sc.typing.type_caps, sc.view.a, sc.view.source, e.data.index.index, ?sc.s.interner);
+        if (sel res_evaluate.err) { ret res[Root, fail.Fail].ok{Root{refused: true, why: res_evaluate.err}}; }
+        val opt_index: opt[u64] = comptime_value.ct_int_u64(res_evaluate.ok);
+        if (sel opt_index.none)                       { ret root_refused("an index into a constant address must be a non-negative integer"); }
+        if (opt_index.some >= opt_elements.some::u64) { ret root_refused("this index is past the end of the binding it addresses"); }
+        ordinal = opt_index.some;
+    }
+    val res_step: res[u32, fail.Fail] = comptime_deep.node_add(sc.typing.values, comptime_deep.Node{kind: comptime_deep.NODE_SCALAR, ty: owner,
+        value: comptime_value.ct_uint(ordinal)});
+    if (sel res_step.err) { ret res[Root, fail.Fail].err{res_step.err}; }
+    val res_pushed: res[usize, A.Error] = collections_vector.push[comptime_deep.Member](steps, comptime_deep.Member{name: name, node: res_step.ok});
+    if (sel res_pushed.err) { ret res[Root, fail.Fail].err{fail.refused(res_pushed.err)}; }
+    ret res_root;
+}
+
+# the binding `sym` names as an address leaf points into it: a module-level function, `val` or
+# `var`, this module's or another's
+fun root_of(sc: *sema_context.SemaContext, sym: *resolve.Symbol) res[Root, fail.Fail] {
+    val elsewhere:    bool            = sema_context.foreign(sc, sym);
+    val kind:         resolve.SymKind = sym.definition_kind;
+    val module_level: bool            = elsewhere || (sym.flags & resolve.SYM_FLAG_MODULE) != 0;
+    if (kind != resolve.SYM_FUN && !((kind == resolve.SYM_VAL || kind == resolve.SYM_VAR) && module_level)) {
+        ret root_refused("only the address of a module-level function, `val` or `var`, or of a place in one, is a constant");
+    }
+    var decl:   ast_id.DeclId = sym.decl;
+    var thread: bool          = false;
+    if (elsewhere) {
+        val res_found: res[opt[Published], fail.Fail] = published(sc, sym);
+        if (sel res_found.err)     { ret res[Root, fail.Fail].err{res_found.err}; }
+        if (sel res_found.ok.none) { ret res[Root, fail.Fail].err{fail.message("sema: an imported binding has no declaration in its module's interface")}; }
+        decl   = res_found.ok.some.declaration.decl;
+        thread = (res_found.ok.some.declaration.flags & interface.DECLARATION_THREAD) != 0;
+    }
+    if (ast_id.decl_is_nil(decl)) { ret root_refused("only the address of a module-level function, `val` or `var`, or of a place in one, is a constant"); }
+    if (!elsewhere) {
+        val opt_own: opt[*ast_decl.Decl] = ast.get_decl(sc.view.a, decl);
+        if (sel opt_own.some) { thread = decorator.has(sc.view.a, opt_own.some, decorator.THREAD); }
+    }
+    if (thread) {
+        ret res[Root, fail.Fail].ok{Root{refused: true, why: comptime_failure.eval_error(comptime_failure.EVAL_FAIL_REJECTED, diagnostic_kind.ADDRESS_THREAD_LOCAL,
+            "the address of a `#[thread]` var is no constant: each thread holds its copy at its own address, known only when the thread runs")}};
+    }
+    ret res[Root, fail.Fail].ok{Root{symbol: comptime_deep.Symbol{module: module.stable_index(resolve.stable_of_module(sc.s, resolve.origin_of(sc.s, sym))),
+        decl: ast_id.decl_index(decl), canon: sym.canon, function: kind == resolve.SYM_FUN}}};
+}

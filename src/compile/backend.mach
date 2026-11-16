@@ -1,0 +1,815 @@
+# the back half a build hands its lowered modules to: the target mirl readies once for the
+# build, on which compile/backend/compile has mirl compile each unit to mink's object in memory,
+# mink laying an object out in the target's format or reading one back, and mink linking objects
+# into an image. nothing here starts a process or writes a file between the stages
+use std.text.string.str_dup;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.View;
+use std.types.view.view_eq_str;
+
+use A: std.allocator;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.memory;
+
+use mach.base.diagnostic;
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use base_source:   mach.base.source;
+use lower_context: mach.lower.context;
+use mach.target.assembled;
+use target_facts: mach.target.facts;
+use mach.target.resolved;
+use mach.type.query.areas;
+use mach.type.query.extent;
+
+use mirl_compile: mirl.target.compile;
+use mirl_family:  mirl.target.family;
+
+use masc_dialect: masc.format.dialect;
+use mink.base.diag;
+use mink_fail: mink.base.fail;
+use mink.base.fail.Fail;
+use mink_intern: mink.base.intern;
+use mink.base.intern.Interner;
+use mink.base.intern.Name;
+use mink.base.store.Bytes;
+use mink.base.table;
+use mink.base.table.Id;
+use mink.bytes.reader.LITTLE;
+use mink.bytes.sink;
+use mink.bytes.sink.Sink;
+use mink_arch:   mink.catalog.arch;
+use mink_format: mink.catalog.format;
+use mink.catalog.format.Format;
+use mink_kind: mink.catalog.kind;
+use mink_os:   mink.catalog.os;
+use mink.catalog.output;
+use mink_subsystem: mink.catalog.subsystem;
+use mink_target:    mink.catalog.target;
+use mink.format.ar.write.Variant;
+use mink.format.contract;
+use mink.format.layout.Rules;
+use mink.format.registration;
+use mink.format.registration.Registration;
+use mink.format.registry;
+use mink.link.formats;
+use mink.link.input.Request;
+use mink.link.layout;
+use mink.link.linking;
+use mink_options: mink.link.options;
+use mink.link.options.Area;
+use mink.link.options.Offset;
+use mink.link.options.Options;
+use mink.link.options.Within;
+use mink.link.search;
+use mink.link.state;
+use mink.link.write.Written;
+use mink.model.object;
+use mink.model.object.Object;
+use mink.model.section;
+use mink.model.symbol;
+
+# the extension mach names the object files of its work directory by, whatever the
+# format: mink reads an object by its bytes, never its name
+pub val OBJECT_EXT: str = "o";
+
+# the back end a build opens once for its target, which sema and codegen both read
+# ---
+# assembled: the target mirl assembled for the resolved target, nil before one is opened
+# machine:   what lowering builds its units for, borrowing `assembled`
+# target:    the target mink resolved, which a link is for
+# formats:   mink's format registry
+# prepared:  the target mirl made ready for the build, once, which every module's compile reads;
+#            on the heap, since it stays put until it is closed. nil before one is opened
+# laying:    what sema lays the build's types out by, over `machine`'s target. nil before one
+#            is opened
+# facts:     what a program reads of the target while it compiles
+pub rec Back {
+    assembled: *assembled.Assembled;
+    machine:   lower_context.Machine;
+    target:    mink_target.Target;
+    formats:   *registry.Registry;
+    prepared:  *mirl_compile.Prepared;
+    laying:    *extent.Laying;
+    facts:     target_facts.Facts;
+}
+
+# a back half that compiles nothing, for a project with no target yet
+pub fun none() Back {
+    var b: Back;
+    b.assembled = nil;
+    b.target    = resolved.none().target;
+    b.formats   = registry.builtin();
+    b.prepared  = nil;
+    b.laying    = nil;
+    b.facts     = target_facts.none();
+    ret b;
+}
+
+# the back half of the resolved target `t`
+pub fun init(a: *A.Allocator, t: *resolved.Target) res[Back, fail.Fail] {
+    var b: Back = none();
+    b.target = t.target;
+    val res_made: res[*assembled.Assembled, fail.Fail] = assembled.assemble(a, t);
+    if (sel res_made.err) { ret res[Back, fail.Fail].err{res_made.err}; }
+    b.assembled = res_made.ok;
+    val res_machine: res[lower_context.Machine, fail.Fail] = lower_context.machine_of(b.assembled);
+    if (sel res_machine.err) {
+        dnit(a, ?b);
+        ret res[Back, fail.Fail].err{res_machine.err};
+    }
+    b.machine          = res_machine.ok;
+    b.machine.directed = directs_exports(b.formats, t.target.format);
+    b.machine.sealed   = sealed(b.formats, t.target.format);
+    val res_facts: res[target_facts.Facts, fail.Fail] = target_facts.of(a, b.assembled, t);
+    if (sel res_facts.err) {
+        dnit(a, ?b);
+        ret res[Back, fail.Fail].err{res_facts.err};
+    }
+    b.facts = res_facts.ok;
+    val res_laying: res[*extent.Laying, fail.Fail] = extent.init(a, b.machine.target, b.machine.ctx, areas.place);
+    if (sel res_laying.err) {
+        dnit(a, ?b);
+        ret res[Back, fail.Fail].err{res_laying.err};
+    }
+    b.laying = res_laying.ok;
+    # mirl readies the target once for the build, its extensions with it; a target it cannot
+    # ready is refused for the build
+    val res_held: res[*mirl_compile.Prepared, A.Error] = A.allocate[mirl_compile.Prepared](a, 1::usize);
+    if (sel res_held.err) {
+        dnit(a, ?b);
+        ret res[Back, fail.Fail].err{fail.refused(res_held.err)};
+    }
+    val err_readied: err[mirl_family.Error] = mirl_compile.init(res_held.ok, a, ?b.assembled.target, assembled.added(b.assembled));
+    if (sel err_readied.err) {
+        A.deallocate[mirl_compile.Prepared](a, res_held.ok, 1::usize);
+        dnit(a, ?b);
+        ret res[Back, fail.Fail].err{fail.user(diagnostic_kind.TARGET_UNSUPPORTED, "mirl cannot ready the target for a build: no back end serves it, or its extensions do not open")};
+    }
+    b.prepared = res_held.ok;
+    ret res[Back, fail.Fail].ok{b};
+}
+
+# whether the objects the back half writes hold merged definitions (mink.model.merged), the
+# copies of one a link keeps one of: false for a format masc writes none in
+pub fun merges(b: *Back) bool {
+    if (b.target.format == nil) { ret false; }
+    val opt_format_of: opt[*masc_dialect.Dialect] = masc_dialect.of(b.target.format, b.target.arch);
+    if (sel opt_format_of.none) { ret false; }
+    val held: masc_dialect.Copies = opt_format_of.some.copies;
+    ret !(sel held.none);
+}
+
+# the visibility a definition of format `f` exports by that no load may preempt from inside its
+# image: protected where the format meets it, as ELF's STV_PROTECTED and PE's default, whose
+# definitions no load preempts, and default where it carries none that does, as Mach-O and wasm,
+# whose images mink links let no load interpose (`mink.link.dynamic.preemptible`)
+fun sealed(g: *registry.Registry, f: *Format) *symbol.Visibility {
+    if (f == nil) { ret ?symbol.DEFAULT; }
+    val res_registered: res[*Registration, Fail] = registry.by_format(g, f);
+    if (sel res_registered.err) { ret ?symbol.DEFAULT; }
+    val opt_neutral: opt[*contract.Neutral] = registration.neutral(res_registered.ok);
+    if (sel opt_neutral.none) { ret ?symbol.DEFAULT; }
+    val opt_carried: opt[*symbol.Visibilities] = opt_neutral.some.visibility;
+    if (sel opt_carried.none) { ret ?symbol.DEFAULT; }
+    val opt_written: opt[*symbol.Visibility] = symbol.written_as(opt_carried.some, ?symbol.PROTECTED);
+    if (sel opt_written.none) { ret ?symbol.DEFAULT; }
+    ret ?symbol.PROTECTED;
+}
+
+# whether an image of format `f` exports only what its inputs' export directives name, so a
+# definition states no visibility; false for a format mink links no image of
+# the name of the mirl family that compiles the build when it writes no listing of its objects, none when it writes one
+pub fun unlisted(b: *Back) opt[str] {
+    if (b.prepared == nil || b.prepared.family.lists) { ret opt[str].none{}; }
+    ret opt[str].some{b.prepared.family.name};
+}
+
+fun directs_exports(g: *registry.Registry, f: *Format) bool {
+    if (f == nil) { ret false; }
+    val res_by_format: res[*Registration, Fail] = registry.by_format(g, f);
+    if (sel res_by_format.err) { ret false; }
+    val res_built: res[*formats.Entry, Fail] = formats.builder(f);
+    if (sel res_built.err) { ret false; }
+    ret (res_built.ok.linking.caps & linking.DIRECTED_EXPORTS) != 0;
+}
+
+pub fun dnit(a: *A.Allocator, b: *Back) {
+    extent.dnit(b.laying);
+    if (b.prepared != nil) {
+        mirl_compile.dnit(b.prepared);
+        A.deallocate[mirl_compile.Prepared](a, b.prepared, 1::usize);
+    }
+    if (b.assembled != nil) { assembled.dnit(a, b.assembled); }
+    @b = none();
+}
+
+# the machine lowering builds for, refused for a cell no owner assembles yet
+pub fun machine(b: *Back) res[*lower_context.Machine, fail.Fail] {
+    if (b.assembled == nil) { ret res[*lower_context.Machine, fail.Fail].err{fail.message("no target is open, so the build has no back end")}; }
+    ret res[*lower_context.Machine, fail.Fail].ok{?b.machine};
+}
+
+# mink's failure `f` as mach's, under `lead`: what mink does not do is the input's to change, an
+# allocation it was refused is the machine's, and every other cause is the compiler's
+pub fun refused_by_mink(a: *A.Allocator, lead: str, f: Fail) fail.Fail {
+    var out:        Sink      = sink.init(a, LITTLE);
+    val err_render: err[Fail] = diag.render(diag.PREFIX, f, ?out);
+    var text:       str       = "";
+    if (sel err_render.ok && sink.len(?out) > 0) {
+        val n:          usize             = sink.len(?out) - 1;
+        val res_copied: res[*u8, A.Error] = A.allocate[u8](a, n + 1);
+        if (sel res_copied.ok) {
+            memory.copy[u8](res_copied.ok, sink.data(?out), n);
+            res_copied.ok[n] = 0;
+            text             = res_copied.ok::str;
+        }
+    }
+    val err_freed: err[Fail] = sink.dnit(?out);
+    if (sel f.cause.unsupported) { ret fail.user_of(diagnostic_kind.LINK_INPUT_INVALID, diagnostic.join(a, lead, ": ", text)); }
+    if (sel f.cause.refused)     { ret fail.environment_of(diagnostic_kind.MEMORY_REFUSED, diagnostic.join(a, lead, ": ", text)); }
+    ret fail.message_of(diagnostic.join(a, lead, ": ", text));
+}
+
+# the bytes of `o` laid out in the target's object format, given back with sink.dnit
+pub fun object_bytes(b: *Back, a: *A.Allocator, o: *Object) res[Sink, fail.Fail] {
+    if (b.target.format == nil) { ret res[Sink, fail.Fail].err{fail.message("the target's system states no object format mink lays out")}; }
+    val res_built: res[contract.Model, Fail] = registry.from_neutral(b.formats, a, b.target.format, o);
+    if (sel res_built.err) { ret res[Sink, fail.Fail].err{refused_by_mink(a, "mink did not lay the object out", res_built.err)}; }
+    var model: contract.Model = res_built.ok;
+    fin { val err_dropped: err[Fail] = contract.dnit(?model); }
+    val res_laid: res[Sink, Fail] = contract.write(?model);
+    if (sel res_laid.err) { ret res[Sink, fail.Fail].err{refused_by_mink(a, "mink did not write the object", res_laid.err)}; }
+    ret res[Sink, fail.Fail].ok{res_laid.ok};
+}
+
+# the object the bytes of the file `file` hold, which owns the bytes, or mink's refusal to read one
+pub fun read_object(b: *Back, a: *A.Allocator, file: str, bytes: Vector[u8]) res[Object, fail.Fail] {
+    var held:  Vector[u8] = bytes;
+    var owned: bool       = true;
+    fin {
+        if (owned) { vector.dnit[u8](?held); }
+    }
+    var input:    contract.Input            = contract.Input{file: file, data: held.data, len: held.len};
+    val res_read: res[contract.Model, Fail] = registry.read(b.formats, a, ?input);
+    if (sel res_read.err) { ret res[Object, fail.Fail].err{refused_by_mink(a, "mink did not read the object", res_read.err)}; }
+    var model: contract.Model = res_read.ok;
+    fin { val err_dropped: err[Fail] = contract.dnit(?model); }
+    var o:             Object    = object.init(a, nil, nil);
+    val err_converted: err[Fail] = registry.to_neutral(b.formats, ?model, ?o);
+    if (sel err_converted.err) {
+        val err_released: err[Fail] = object.dnit(?o);
+        ret res[Object, fail.Fail].err{refused_by_mink(a, "mink did not convert the object it read", err_converted.err)};
+    }
+    # a format's conversion may borrow from the file's bytes, so the object owns them
+    val err_adopted: err[Fail] = object.adopt(?o, held);
+    if (sel err_adopted.err) {
+        val err_released: err[Fail] = object.dnit(?o);
+        ret res[Object, fail.Fail].err{refused_by_mink(a, "mink did not keep the object's bytes", err_adopted.err)};
+    }
+    owned = false;
+    ret res[Object, fail.Fail].ok{o};
+}
+
+# the section an object carries mach's cache record in. mink states no flag a link drops a
+# section by (mink#538), so the section is unreferenced and the link's collection leaves it out
+pub val RECORD_SECTION: str = ".mach.cache";
+
+# the bytes of `o` with the section `name` holding the `len` bytes at `data` added, laid out in
+# the target's format; `o` is left as it was
+pub fun object_bytes_with(b: *Back, a: *A.Allocator, o: *Object, name: str, data: *u8, len: usize) res[Sink, fail.Fail] {
+    val res_copied: res[Object, Fail] = object.copy(a, o);
+    if (sel res_copied.err) { ret res[Sink, fail.Fail].err{refused_by_mink(a, "mink did not copy the object", res_copied.err)}; }
+    var c: Object = res_copied.ok;
+    fin { object_dnit(?c); }
+    val res_named: res[Id[Name], Fail] = object.name_str(?c, name);
+    if (sel res_named.err) { ret res[Sink, fail.Fail].err{refused_by_mink(a, "mink did not name the section", res_named.err)}; }
+    val res_held: res[object.Contents, Fail] = object.own(?c, data, len);
+    if (sel res_held.err) { ret res[Sink, fail.Fail].err{refused_by_mink(a, "mink did not hold the section", res_held.err)}; }
+    val res_added: res[Id[object.Section], Fail] = object.add_section(?c, object.Section{
+        name:        opt[Id[Name]].some{res_named.ok},
+        kind:        ?section.METADATA,
+        flags:       0,
+        align:       1,
+        entsize:     0,
+        contents:    res_held.ok,
+        owner:       opt[Id[object.Section]].none{},
+        group:       opt[Id[object.Group]].none{},
+        disposition: ?section.WHOLE,
+        priority:    opt[u32].none{}
+    });
+    if (sel res_added.err) { ret res[Sink, fail.Fail].err{refused_by_mink(a, "mink did not add the section", res_added.err)}; }
+    ret object_bytes(b, a, ?c);
+}
+
+# the section an image no loader maps holds its main stack in, whose top std's entry reads
+# through mink's bound name `__run_stop_.stack`
+pub val STACK_SECTION: str = ".stack";
+
+# the alignment the laid stack keeps its base and size at, the strictest any target's psABI
+# asks of its stack pointer
+pub val STACK_ALIGN: u64 = 16;
+
+# whether an image of `t` holds its main stack as a section of its own: an ELF or flat image
+# no loader maps, so no loader gives it a stack and no header records one
+pub fun lays_stack(t: *resolved.Target) bool {
+    val m: *mink_target.Target = ?t.target;
+    if (m.sys == nil || m.sys.mapped) { ret false; }
+    ret m.format == ?mink_format.ELF || m.format == ?mink_format.FLAT;
+}
+
+# an object holding the image's stack, `size` zero-filled bytes in STACK_SECTION, kept by the
+# link whether referenced or not, so a stated stack is always laid out
+pub fun stack_object(b: *Back, a: *A.Allocator, size: u64) res[Object, fail.Fail] {
+    if (b.assembled == nil) { ret res[Object, fail.Fail].err{fail.message("no target is open, so the build lays no stack")}; }
+    var o:         Object              = object.init(a, b.target.arch, ?mink_kind.RELOCATABLE);
+    val res_named: res[Id[Name], Fail] = object.name_str(?o, STACK_SECTION);
+    if (sel res_named.err) {
+        object_dnit(?o);
+        ret res[Object, fail.Fail].err{refused_by_mink(a, "mink did not name the stack's section", res_named.err)};
+    }
+    val res_added: res[Id[object.Section], Fail] = object.add_section(?o, object.Section{
+        name:        opt[Id[Name]].some{res_named.ok},
+        kind:        ?section.BSS,
+        flags:       section.BSS.flags | section.RETAIN,
+        align:       STACK_ALIGN,
+        entsize:     0,
+        contents:    object.Contents.zero{size},
+        owner:       opt[Id[object.Section]].none{},
+        group:       opt[Id[object.Group]].none{},
+        disposition: ?section.WHOLE,
+        priority:    opt[u32].none{}
+    });
+    if (sel res_added.err) {
+        object_dnit(?o);
+        ret res[Object, fail.Fail].err{refused_by_mink(a, "mink did not add the stack's section", res_added.err)};
+    }
+    ret res[Object, fail.Fail].ok{o};
+}
+
+# whether `o` refers to the symbol `name` and leaves its definition to another object
+pub fun refers(o: *Object, name: str) bool {
+    val n: usize = table.count[object.Symbol](?o.symbols);
+    var i: usize = 0;
+    for (i < n) {
+        val y: *object.Symbol = ?table.items[object.Symbol](?o.symbols)[i];
+        i = i + 1;
+        if (sel y.def.undefined && view_eq_str(object.name_of(o, y.name), name)) { ret true; }
+    }
+    ret false;
+}
+
+# the bytes of the first section of `o` named `name`, nil and zero for none
+pub fun section_bytes(o: *Object, name: str, len: *usize) *u8 {
+    @len = 0;
+    val n: usize = table.count[object.Section](?o.sections);
+    var i: usize = 0;
+    for (i < n) {
+        val sec: *object.Section = ?table.items[object.Section](?o.sections)[i];
+        if (sel sec.name.some) {
+            val spelled: View = object.name_of(o, sec.name.some);
+            if (view_eq_str(spelled, name)) {
+                val held: Bytes = object.bytes(o, ?sec.contents);
+                @len = held.len;
+                ret held.data;
+            }
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the names of the sections of `o` its producer named, borrowed from the object
+pub fun section_names(o: *Object, out: *Vector[View]) err[fail.Fail] {
+    val n: usize = table.count[object.Section](?o.sections);
+    var i: usize = 0;
+    for (i < n) {
+        val sec: *object.Section = ?table.items[object.Section](?o.sections)[i];
+        if (sel sec.name.some) {
+            val res_pushed: res[usize, A.Error] = vector.push[View](out, object.name_of(o, sec.name.some));
+            if (sel res_pushed.err) { ret err[fail.Fail].err{fail.refused(res_pushed.err)}; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# how the target's link names the output section each input section is laid into, by mink's
+# own layout rules, so a layout the artifact states is held to the sections the link lays out
+# ---
+# rules: the layout rules of the format the target's images link as
+# arch:  the architecture the link is for
+# names: the output section names, owned
+pub rec Laying {
+    rules: *Rules;
+    arch:  *mink_arch.Arch;
+    names: Interner;
+}
+
+# the laying of the target's link, none for a format whose link lays out no sections, as a
+# SPIR-V module's gives each id its index, and refused for a format mink links no image of
+pub fun laying(b: *Back, a: *A.Allocator) res[opt[Laying], fail.Fail] {
+    if (b.target.format == nil || b.assembled == nil) { ret res[opt[Laying], fail.Fail].err{fail.message("no target is open, so the build lays out no image")}; }
+    val res_by_format: res[*Registration, Fail] = registry.by_format(b.formats, b.target.format);
+    if (sel res_by_format.err) { ret res[opt[Laying], fail.Fail].err{refused_by_mink(a, "the target's format is not registered", res_by_format.err)}; }
+    val res_built: res[*formats.Entry, Fail] = formats.builder(b.target.format);
+    if (sel res_built.err) { ret res[opt[Laying], fail.Fail].err{refused_by_mink(a, "the target's format links no image", res_built.err)}; }
+    val opt_laid: opt[*Rules] = res_built.ok.linking.layout;
+    if (sel opt_laid.none) { ret res[opt[Laying], fail.Fail].ok{opt[Laying].none{}}; }
+    ret res[opt[Laying], fail.Fail].ok{opt[Laying].some{Laying{rules: opt_laid.some, arch: b.target.arch, names: mink_intern.init(a)}}};
+}
+
+pub fun laying_dnit(l: *Laying) {
+    val err_released: err[Fail] = mink_intern.dnit(?l.names);
+}
+
+# the name of the output section the link lays section `i` of `o` into, valid until the
+# laying names another
+pub fun laid_name(a: *A.Allocator, l: *Laying, o: *Object, i: usize) res[View, fail.Fail] {
+    val sec:       *object.Section         = ?table.items[object.Section](?o.sections)[i];
+    val res_named: res[layout.Named, Fail] = layout.named(?l.names, l.rules, l.arch, o, sec);
+    if (sel res_named.err) { ret res[View, fail.Fail].err{refused_by_mink(a, "mink names no output section of an object's section", res_named.err)}; }
+    ret res[View, fail.Fail].ok{mink_intern.bytes_of(?l.names, res_named.ok.name)};
+}
+
+# how many sections `o` holds
+pub fun section_count(o: *Object) usize {
+    ret table.count[object.Section](?o.sections);
+}
+
+# the names of the symbols `o` places in its sections named `name`, borrowed from the object
+pub fun symbols_in(o: *Object, name: View, out: *Vector[View]) err[fail.Fail] {
+    val n: usize = table.count[object.Symbol](?o.symbols);
+    var i: usize = 0;
+    for (i < n) {
+        val y: *object.Symbol = object.symbol_at(o, Id[object.Symbol]{index: i::u32});
+        i = i + 1;
+        if (!sel y.def.placed) { cnt; }
+        val sec: *object.Section = object.section_at(o, y.def.placed.section);
+        if (sel sec.name.none) { cnt; }
+        val held: View = object.name_of(o, sec.name.some);
+        if (held.len != name.len || !memory.equal[u8](held.data::*u8, name.data::*u8, name.len)) { cnt; }
+        val res_pushed: res[usize, A.Error] = vector.push[View](out, object.name_of(o, y.name));
+        if (sel res_pushed.err) { ret err[fail.Fail].err{fail.refused(res_pushed.err)}; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun object_dnit(o: *Object) {
+    val err_released: err[Fail] = object.dnit(o);
+}
+
+# how many symbols `o` holds
+pub fun symbol_count(o: *Object) usize {
+    ret table.count[object.Symbol](?o.symbols);
+}
+
+# whether symbol `i` of `o` is one the object defines and links outside it
+pub fun exported(o: *Object, i: usize) bool {
+    val s: *object.Symbol = ?table.items[object.Symbol](?o.symbols)[i];
+    if (s.binding == ?symbol.LOCAL) { ret false; }
+    ret object.holds(?s.def);
+}
+
+# a copy of `o` in which its definition of `name`, when it has a global one, yields to
+# another as a weak definition; none when `o` defines no such symbol
+pub fun weakened(a: *A.Allocator, o: *Object, name: str) res[opt[Object], fail.Fail] {
+    var at: usize = symbol_count(o);
+    var i:  usize = 0;
+    for (i < symbol_count(o)) {
+        val s: *object.Symbol = ?table.items[object.Symbol](?o.symbols)[i];
+        if (s.binding == ?symbol.GLOBAL && object.holds(?s.def) && view_eq_str(symbol_name(o, i), name)) {
+            at = i;
+            brk;
+        }
+        i = i + 1;
+    }
+    if (at == symbol_count(o)) { ret res[opt[Object], fail.Fail].ok{opt[Object].none{}}; }
+    val res_copied: res[Object, Fail] = object.copy(a, o);
+    if (sel res_copied.err) { ret res[opt[Object], fail.Fail].err{refused_by_mink(a, "mink did not copy the object", res_copied.err)}; }
+    var c: Object = res_copied.ok;
+    table.items[object.Symbol](?c.symbols)[at].binding = ?symbol.WEAKLY;
+    ret res[opt[Object], fail.Fail].ok{opt[Object].some{c}};
+}
+
+# the variant mink writes a static library of the target's objects in, as its
+# registry states it of the target's format
+pub fun archive_variant(b: *Back, a: *A.Allocator) res[*Variant, fail.Fail] {
+    if (b.target.format == nil) { ret res[*Variant, fail.Fail].err{fail.message("no target is open, so the build archives no objects")}; }
+    val res_archive: res[*Variant, Fail] = formats.archive(b.formats, b.target.format);
+    if (sel res_archive.err) { ret res[*Variant, fail.Fail].err{refused_by_mink(a, "the target's objects are archived in no variant", res_archive.err)}; }
+    ret res[*Variant, fail.Fail].ok{res_archive.ok};
+}
+
+# the prefix the target's format gives a C symbol's name on its architecture, empty
+# for none, as mink's registry states it
+pub fun c_prefix(b: *Back, a: *A.Allocator) res[str, fail.Fail] {
+    if (b.target.format == nil || b.assembled == nil) { ret res[str, fail.Fail].err{fail.message("no target is open, so no C symbol is named")}; }
+    val res_c_prefix: res[str, Fail] = formats.c_prefix(b.formats, b.target.format, b.target.arch);
+    if (sel res_c_prefix.err) { ret res[str, fail.Fail].err{refused_by_mink(a, "the target's format states no C symbol prefix", res_c_prefix.err)}; }
+    ret res[str, fail.Fail].ok{res_c_prefix.ok};
+}
+
+# whether the target's link makes a shared system library from the claim that names it,
+# with no file, as a two-level namespace format does
+pub fun describes_claims(b: *Back, a: *A.Allocator) res[bool, fail.Fail] {
+    if (b.target.format == nil) { ret res[bool, fail.Fail].err{fail.message("no target is open, so no link is named")}; }
+    val res_describes: res[bool, Fail] = formats.describes(b.target.format);
+    if (sel res_describes.err) { ret res[bool, fail.Fail].err{refused_by_mink(a, "the target's format states no linking rules", res_describes.err)}; }
+    ret res[bool, fail.Fail].ok{res_describes.ok};
+}
+
+# the name of symbol `i` of `o`
+pub fun symbol_name(o: *Object, i: usize) View {
+    ret object.name_of(o, table.items[object.Symbol](?o.symbols)[i].name);
+}
+
+# the layout an artifact states its image, which mink lays out as a linker script would
+# ---
+# sections: the output sections placed ahead of the rest, in order
+# regions:  the memory regions
+# runs:     the output sections that run in a region
+# loads:    the output sections whose bytes load in a region other than the one they run in
+# offsets:  the output sections placed at an offset, one per `#[at]` offset
+# size:     the most bytes the image loads from its base, none for no ceiling
+pub rec Plan {
+    keep:          *str;
+    keep_count:    usize;
+    sections:      *str;
+    section_count: usize;
+    regions:       *Area;
+    region_count:  usize;
+    runs:          *Within;
+    run_count:     usize;
+    loads:         *Within;
+    load_count:    usize;
+    offsets:       *Offset;
+    offset_count:  usize;
+    size:          opt[u64];
+}
+
+# what the build states of the image it links, beyond its kind and format
+# ---
+# base:          the address the image is laid out from, none for the host's
+# subsystem:     the PE subsystem the image states, none for the host's
+# libdirs:       the directories a library named by name is searched in ahead of the system's
+# libdir_count:  how many
+# stack_reserve: the main stack's reserve, none for the format's default
+# stack_commit:  the main stack's commit, none for the format's default
+# plan:          the layout the artifact states, nil where it states none
+# stated:        where the build stated each option it hands mink
+pub rec Image {
+    base:          opt[u64];
+    subsystem:     opt[*mink_subsystem.Subsystem];
+    libdirs:       *str;
+    libdir_count:  usize;
+    stack_reserve: opt[u64];
+    stack_commit:  opt[u64];
+    plan:          *Plan;
+    stated:        Stated;
+}
+
+# where the build stated each option of the link it hands mink, a location of the source map
+# its diagnostics read, so mink's refusal of an option points there. a nil location where the
+# option was not written or names no place
+# ---
+# kind:          the output kind
+# target:        the target
+# subsystem:     the PE subsystem
+# base:          the image base
+# size:          the size ceiling
+# stack_reserve: the stack's reserve
+# stack_commit:  the stack's commit
+# sections:      each section the plan places ahead of the rest, parallel to its sections
+# regions:       each memory region, parallel to the plan's regions, which the plan's runs and
+#                loads name
+pub rec Stated {
+    kind:          base_source.Location;
+    target:        base_source.Location;
+    subsystem:     base_source.Location;
+    base:          base_source.Location;
+    size:          base_source.Location;
+    stack_reserve: base_source.Location;
+    stack_commit:  base_source.Location;
+    sections:      *base_source.Location;
+    regions:       *base_source.Location;
+}
+
+# where the build stated the option mink's refusal `f` is of, nil for a refusal of no option
+# or of one the build states nowhere
+fun stated_at(image: *Image, f: Fail) base_source.Location {
+    val s:      *Stated              = ?image.stated;
+    val row:    mink_fail.Option     = f.option.row;
+    val i:      u64                  = f.option.index;
+    val nil_at: base_source.Location = base_source.location_nil();
+    if (row == mink_options.KIND)          { ret s.kind; }
+    if (row == mink_options.TARGET)        { ret s.target; }
+    if (row == mink_options.SUBSYSTEM)     { ret s.subsystem; }
+    if (row == mink_options.BASE)          { ret s.base; }
+    if (row == mink_options.SIZE)          { ret s.size; }
+    if (row == mink_options.STACK_RESERVE) { ret s.stack_reserve; }
+    if (row == mink_options.STACK_COMMIT)  { ret s.stack_commit; }
+    val plan: *Plan = image.plan;
+    if (plan == nil || !f.option.indexed)                                                 { ret nil_at; }
+    if (row == mink_options.SECTIONS && s.sections != nil && i < plan.section_count::u64) { ret s.sections[i]; }
+    if (s.regions == nil)                                                                 { ret nil_at; }
+    if (row == mink_options.REGIONS && i < plan.region_count::u64)                        { ret s.regions[i]; }
+    if (row == mink_options.RUNS && i < plan.run_count::u64)                              { ret s.regions[plan.runs[i].region]; }
+    if (row == mink_options.LOADS && i < plan.load_count::u64)                            { ret s.regions[plan.loads[i].region]; }
+    ret nil_at;
+}
+
+# what a link read beyond the objects and the files it was handed by path
+# ---
+# files:    each other file it read and no search found, by its identity, a copy the read owns
+# searched: it read a file a search found, which no digest of the file's bytes stands for
+pub rec LinkRead {
+    files:    Vector[str];
+    searched: bool;
+}
+
+pub fun link_read_init(a: *A.Allocator) LinkRead {
+    ret LinkRead{files: vector.init[str](a)};
+}
+
+pub fun link_read_dnit(a: *A.Allocator, r: *LinkRead) {
+    var i: usize = 0;
+    for (i < r.files.len) {
+        str_free(a, r.files.data[i]);
+        i = i + 1;
+    }
+    vector.dnit[str](?r.files);
+}
+
+# a linked image and what its link read
+pub rec Linked {
+    image: Sink;
+    read:  LinkRead;
+}
+
+# what the link's search `found` read beyond what the requests named by path, into `out`
+fun read_of(a: *A.Allocator, found: *search.Found, out: *LinkRead) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < found.read.len) {
+        val read: *search.Read = ?found.read.data[i];
+        i = i + 1;
+        if (read.searched) {
+            out.searched = true;
+            cnt;
+        }
+        if (read.requested) { cnt; }
+        val res_copy: res[str, A.Error] = str_dup(a, read.path);
+        if (sel res_copy.err) { ret err[fail.Fail].err{fail.refused(res_copy.err)}; }
+        val res_push: res[usize, A.Error] = vector.push[str](?out.files, res_copy.ok);
+        if (sel res_push.err) {
+            str_free(a, res_copy.ok);
+            ret err[fail.Fail].err{fail.refused(res_push.err)};
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the image of `kind` in the target's format mink links from the `count` requests at `requests`, a library
+# named by name found by mink's search, named `output` where its format records a name, its
+# unreferenced sections left out with `gc`, laid out as `image` states, with what the link read.
+# mink's notes go to `diags`: a refused link's are notes of the refusal, which is reported there,
+# and a finished link's are warnings
+pub fun link(b: *Back, a: *A.Allocator, diags: *diagnostic.DiagnosticStore, kind: *output.Kind, requests: *Request, count: usize, output_path: str, gc: bool, image: *Image) res[Linked, fail.Fail] {
+    if (b.target.format == nil) { ret res[Linked, fail.Fail].err{fail.message("the target's system states no image format mink links")}; }
+    if (b.assembled == nil)     { ret res[Linked, fail.Fail].err{fail.message("no target is open, so the build has no back end")}; }
+    var o: Options = Options{
+        kind:             kind,
+        target:           b.target,
+        version:          opt[mink_os.Version].none{},
+        sdk:              opt[mink_os.Version].none{},
+        subsystem:        image.subsystem,
+        entry:            nil,
+        keep:             nil,
+        keep_count:       0,
+        base:             image.base,
+        gc_sections:      opt[bool].some{gc},
+        keep_temporaries: opt[bool].none{},
+        tail_merge:       opt[bool].none{},
+        output:           output_path,
+        sign:             opt[bool].none{},
+        libdirs:          image.libdirs,
+        libdir_count:     image.libdir_count,
+        stack_reserve:    image.stack_reserve,
+        stack_commit:     image.stack_commit
+    };
+    if (image.plan != nil) {
+        val plan: *Plan = image.plan;
+        o.keep          = plan.keep;
+        o.keep_count    = plan.keep_count;
+        o.sections      = plan.sections;
+        o.section_count = plan.section_count;
+        o.regions       = plan.regions;
+        o.region_count  = plan.region_count;
+        o.runs          = plan.runs;
+        o.run_count     = plan.run_count;
+        o.loads         = plan.loads;
+        o.load_count    = plan.load_count;
+        o.offsets       = plan.offsets;
+        o.offset_count  = plan.offset_count;
+        o.size          = plan.size;
+    }
+    var notes: Sink = sink.init(a, LITTLE);
+    fin { val err_freed: err[Fail] = sink.dnit(?notes); }
+    # what the search loaded backs the names a refusal carries, so it goes once the refusal is told
+    var found: search.Found = search.init(a);
+    fin { val err_released: err[Fail] = search.dnit(?found); }
+    var res_linked: res[Written, Fail] = state.link(?found, b.formats, o, requests, count, ?notes);
+    if (sel res_linked.err) {
+        val refused: fail.Fail = fail.at(fail.as_user(diagnostic_kind.LINK_INPUT_INVALID, refused_by_mink(a, "the link failed", res_linked.err)), stated_at(image, res_linked.err));
+        ret res[Linked, fail.Fail].err{link_refused(a, diags, refused, ?notes)};
+    }
+    var made: Written = res_linked.ok;
+    # mach writes the image alone, so an interface file the format makes goes
+    if (sel made.interface.some) {
+        val err_dropped: err[Fail] = sink.dnit(?made.interface.some);
+        if (sel err_dropped.err) {
+            val err_freed: err[Fail] = sink.dnit(?made.image);
+            ret res[Linked, fail.Fail].err{refused_by_mink(a, "the link's interface file could not be released", err_dropped.err)};
+        }
+    }
+    var read:     LinkRead       = link_read_init(a);
+    val err_read: err[fail.Fail] = read_of(a, ?found, ?read);
+    var err_told: err[fail.Fail] = err_read;
+    if (sel err_read.ok) { err_told = link_told(diags, ?notes); }
+    if (sel err_told.err) {
+        link_read_dnit(a, ?read);
+        val err_freed: err[Fail] = sink.dnit(?made.image);
+        ret res[Linked, fail.Fail].err{err_told.err};
+    }
+    ret res[Linked, fail.Fail].ok{Linked{image: made.image, read: read}};
+}
+
+# a line of mink's notes, named without its prefix and its newline
+# ---
+# text: the line, in the notes' own bytes
+# next: where the next line starts
+rec NoteLine {
+    text: str;
+    next: usize;
+}
+
+# the line of `notes` starting at `at`, its newline overwritten to end it, as every note ends in one
+fun note_line(notes: *Sink, at: usize) NoteLine {
+    val bytes: *u8   = sink.data(notes);
+    var end:   usize = at;
+    for (end + 1 < sink.len(notes) && bytes[end] != '\n') { end = end + 1; }
+    bytes[end] = 0;
+    val prefix: str   = diag.PREFIX::str;
+    var start:  usize = at;
+    if (end - at >= str_len(prefix) && view_eq_str(View{data: ?bytes[at], len: str_len(prefix)}, prefix)) { start = at + str_len(prefix); }
+    ret NoteLine{text: (?bytes[start])::str, next: end + 1};
+}
+
+# the refusal `refused` reported to `diags` under its own kind, at the place it points, each line
+# of mink's `notes` a note of it, so the link answers `reported`
+fun link_refused(a: *A.Allocator, diags: *diagnostic.DiagnosticStore, refused: fail.Fail, notes: *Sink) fail.Fail {
+    val opt_text: opt[str] = fail.text(refused);
+    if (sel opt_text.none) { ret refused; }
+    var place:      base_source.Location      = base_source.location_nil();
+    val opt_placed: opt[base_source.Location] = fail.place_of(refused);
+    if (sel opt_placed.some) { place = opt_placed.some; }
+    val res_made: res[diagnostic.DiagnosticBuilder, fail.Fail] = diagnostic.builder_init(diags.a, fail.kind_of(refused), place.file, place.span, opt_text.some);
+    if (sel res_made.err) { ret res_made.err; }
+    var built: diagnostic.DiagnosticBuilder = res_made.ok;
+    var at:    usize                        = 0;
+    for (at < sink.len(notes)) {
+        val line:         NoteLine       = note_line(notes, at);
+        val err_attached: err[fail.Fail] = diagnostic.attach_note(?built, line.text);
+        if (sel err_attached.err) {
+            diagnostic.builder_dnit(?built);
+            ret err_attached.err;
+        }
+        at = line.next;
+    }
+    val err_committed: err[fail.Fail] = diagnostic.commit(?built, diags);
+    if (sel err_committed.err) { ret err_committed.err; }
+    fail.dnit(a, refused);
+    ret fail.reported();
+}
+
+# each line of mink's `notes` on a link that finished, a warning about the build as a whole
+fun link_told(diags: *diagnostic.DiagnosticStore, notes: *Sink) err[fail.Fail] {
+    var at: usize = 0;
+    for (at < sink.len(notes)) {
+        val line:         NoteLine       = note_line(notes, at);
+        val err_reported: err[fail.Fail] = diagnostic.report(diags, diagnostic_kind.LINK_REPORT, base_source.FILE_NIL, base_source.span(0, 0), line.text);
+        if (sel err_reported.err) { ret err_reported; }
+        at = line.next;
+    }
+    ret err[fail.Fail].ok{};
+}

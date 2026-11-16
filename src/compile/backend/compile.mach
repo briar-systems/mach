@@ -1,0 +1,807 @@
+# one mirl module compiled on the back half's prepared target, and what mirl and masc said of it
+# in mach's terms: a refusal as the failure it is reported under, at the source location mirl
+# states for it, and each warning mirl returns as a failure of the warning's kind, located the
+# same way, which the caller reports
+use std.types.bool.bool;
+use std.text.string.str_free;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+use std.collections.slice.Slice;
+use std.collections.vector;
+use std_writer: std.io.writer;
+
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use base_source: mach.base.source;
+use mach.compile.backend.Back;
+use mach.compile.backend.refused_by_mink;
+
+use masc_ct:          masc.core.ct;
+use mirl_stats:       mirl.base.stats;
+use mct:              mirl.ct;
+use mirl_debug_place: mirl.ir.debug.place;
+use mirl_debug:       mirl.ir.debug.record;
+use mirl_debug_table: mirl.ir.debug.table;
+use mirl_function:    mirl.ir.function;
+use mirl_global:      mirl.ir.global;
+use mirl.ir.id;
+use mirl.ir.id.Function;
+use mirl_module: mirl.ir.module;
+use mirl.ir.module.Module;
+use opcode_row:   mirl.ir.opcode.row;
+use opcode_table: mirl.ir.opcode.table;
+use mirl_types:   mirl.ir.type.table;
+use mirl_machine: mirl.machine.compile;
+use mirl.machine.emit.handover;
+use frame_finish: mirl.machine.frame.finish;
+use mirl_inline:  mirl.machine.inline;
+use mirl_engine:  mirl.machine.select.engine;
+use pass_failure: mirl.pass.failure;
+use mirl.pass.refusal;
+use mirl.pass.relaxation;
+use mirl_pass:    mirl.pass.schedule;
+use mirl_compile: mirl.target.compile;
+use mirl_family:  mirl.target.family;
+use mirl_options: mirl.target.options;
+use mirl_spirv:   mirl.target.spirv.error;
+use mirl.target.warning.Warning;
+use mirl_wasm: mirl.target.wasm.error;
+
+use mach.base.diagnostic;
+use mink_fail: mink.base.fail;
+use mink.model.object;
+use mink.model.object.Object;
+
+# a module's object and the warnings mirl gave compiling it, each a failure of its warning's kind
+# located where mirl states, both owned by the caller and given back with `dnit`, or the
+# warnings alone with `warnings_dnit` once the object has moved on
+pub rec Compiled {
+    object:   Object;
+    warnings: vector.Vector[fail.Fail];
+}
+
+# the mirl module `m` compiled to mink's object at mirl's level `level`, its schedule's own checks
+# run with `checked`, the linker let relax its code with `relax` and the float relaxations `floats`
+# permitted, masc's listing of the object written to `listing` when there is one, and its stages
+# timed and counted into `stats` when there is one. a failure or warning points at the file of
+# `sources` mirl's location names. `name` is the object's, no other object's in a link. the module is the schedule's
+# to rewrite, so it is spent here
+pub fun compile(b: *Back, a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, level: u8, checked: bool, relax: bool, floats: relaxation.Relaxations,
+    listing: opt[*std_writer.Writer], stats: opt[*mirl_stats.Stats], name: str) res[Compiled, fail.Fail] {
+    if (b.assembled == nil || b.prepared == nil) { ret res[Compiled, fail.Fail].err{fail.message("no target is open, so the build has no back end")}; }
+    val o: mirl_options.Options = mirl_options.Options{
+        output:  mirl_options.Output.object{},
+        relax:   relax,
+        floats:  floats,
+        level:   level::mirl_pass.Level,
+        checked: checked,
+        machine: opt[*std_writer.Writer].none{},
+        listing: listing,
+        apart:   mirl_options.SHARED,
+        stats:   stats,
+        name:    name
+    };
+    # mirl lends the module's names to the object it makes, so it compiles under the module's
+    # allocator, and the object is copied into `a` where the module's storage does not outlive it
+    val res_made: res[mirl_compile.Compiled, mirl_family.Error] = mirl_compile.compile(b.prepared, m.a, m, o);
+    if (sel res_made.err) { ret res[Compiled, fail.Fail].err{uncompiled(a, sources, m, name, res_made.err)}; }
+    var given: mirl_compile.Compiled = res_made.ok;
+    fin { vector.dnit[Warning](?given.warnings); }
+    # the object keeps the module's names, so a warning names its function through it, and the
+    # module names nothing once the warnings are read
+    mirl_module.lent_to(m, ?given.object.names);
+    var out: Compiled = Compiled{object: given.object, warnings: vector.init[fail.Fail](a)};
+    var i:   usize    = 0;
+    for (i < given.warnings.len) {
+        val res_said: res[fail.Fail, fail.Fail] = warned(a, sources, m, name, given.warnings.data[i]);
+        if (sel res_said.err) {
+            mirl_module.spent(m);
+            dnit(a, ?out);
+            ret res[Compiled, fail.Fail].err{res_said.err};
+        }
+        val res_pushed: res[usize, A.Error] = vector.push[fail.Fail](?out.warnings, res_said.ok);
+        if (sel res_pushed.err) {
+            fail.dnit(a, res_said.ok);
+            mirl_module.spent(m);
+            dnit(a, ?out);
+            ret res[Compiled, fail.Fail].err{fail.refused(res_pushed.err)};
+        }
+        i = i + 1;
+    }
+    mirl_module.spent(m);
+    if (m.a != a) {
+        val res_copied:  res[Object, mink_fail.Fail] = object.copy(a, ?out.object);
+        val err_dropped: err[mink_fail.Fail]         = object.dnit(?out.object);
+        if (sel res_copied.err) {
+            warnings_dnit(a, ?out);
+            ret res[Compiled, fail.Fail].err{refused_by_mink(a, "mink did not copy the compiled object", res_copied.err)};
+        }
+        out.object = res_copied.ok;
+    }
+    ret res[Compiled, fail.Fail].ok{out};
+}
+
+# give back the warnings of what `compile` made, which own their text and places through `a`, the
+# allocator it was given
+pub fun warnings_dnit(a: *A.Allocator, c: *Compiled) {
+    var i: usize = 0;
+    for (i < c.warnings.len) {
+        fail.dnit(a, c.warnings.data[i]);
+        i = i + 1;
+    }
+    vector.dnit[fail.Fail](?c.warnings);
+}
+
+# give back what `compile` made: its object and its warnings
+pub fun dnit(a: *A.Allocator, c: *Compiled) {
+    val err_released: err[mink_fail.Fail] = object.dnit(?c.object);
+    warnings_dnit(a, c);
+}
+
+# a warning mirl gave compiling the module `name`, as the failure of its kind at the source
+# location mirl states for it
+fun warned(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, w: Warning) res[fail.Fail, fail.Fail] {
+    if (sel w.unheld) { ret unheld(a, sources, m, name, w.unheld); }
+    ret res[fail.Fail, fail.Fail].err{fail.message_of(diagnostic.join(a, "mirl gave a warning of '", name, "' of a case mach does not read"))};
+}
+
+# a soft constant-time function of the module `name` on a set that guarantees no instruction's
+# timing, compiled with its timing not held, naming what the walk could not follow of it when it
+# could not
+fun unheld(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, u: mct.Unheld) res[fail.Fail, fail.Fail] {
+    val res_fname: res[str, fail.Fail] = function_name(a, m, u.function);
+    if (sel res_fname.err) { ret res[fail.Fail, fail.Fail].err{res_fname.err}; }
+    var res_said: res[str, fail.Fail] = diagnostic.join(a, "'", res_fname.ok, "' of '", name, "': ", masc_ct.UNGUARANTEED);
+    if (sel u.unread.some) { res_said = diagnostic.join(a, "'", res_fname.ok, "' of '", name, "': ", masc_ct.UNGUARANTEED, ", and mirl could not follow its encoded code to verify the rest: ", u.unread.some.message); }
+    if (sel res_said.err)  { ret res[fail.Fail, fail.Fail].err{res_said.err}; }
+    ret res[fail.Fail, fail.Fail].ok{sourced(a, sources, m, fail.owning(fail.user(diagnostic_kind.SECRET_TARGET_UNENFORCEABLE, res_said.ok)), u.location)};
+}
+
+# why mirl did not compile the module `name`. which of mirl's and masc's refusals the source can
+# clear is decided here, by their own cases: such a refusal is a user failure under its row of the
+# diagnostic table, at the source location mirl states for it when it states one, and every other
+# refusal is the compiler's, which `fail.user_of` keeps internal for a case that names no row
+fun uncompiled(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, e: mirl_family.Error) fail.Fail {
+    if (sel e.timing)   { ret untimed(a, sources, m, name, e.timing, "the ir's constant-time check"); }
+    if (sel e.register) { ret register_refused(a, sources, m, name, e.register); }
+    if (sel e.spirv)    { ret spirv_refused(a, sources, m, name, e.spirv); }
+    if (sel e.wasm)     { ret wasm_refused(a, sources, m, name, e.wasm); }
+    var why: str = "its back end refused it";
+    if (sel e.foreign)    { ret foreign_refused(a, sources, m, name, e.foreign); }
+    if (sel e.unserved)   { why = "no family of mirl serves the target"; }
+    or (sel e.several)    { why = "several families of mirl serve the target"; }
+    or (sel e.open)       { why = "mirl opened no build of the target's selection"; }
+    or (sel e.schedule)   { ret schedule_refused(a, sources, m, name, e.schedule); }
+    or (sel e.introduced) { why = "mirl's schedule left an operation the target's family does not serve"; }
+    or (sel e.unlisted)   { why = "the target's family writes no listing"; }
+    or (sel e.alloc)      { ret fail.refused(e.alloc); }
+    ret fail.message_of(diagnostic.join(a, "mirl did not compile '", name, "': ", why));
+}
+
+# the same failure at the source location `at` of the debug table of `m`, which holds a line and a
+# column and no extent, so it points at the one byte there in the file of `sources` the table
+# names. a location mirl does not state, or one in a file `sources` does not hold, leaves it
+# pointing nowhere
+fun sourced(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, f: fail.Fail, at: opt[mirl_debug.Location]) fail.Fail {
+    if (sel at.none) { ret f; }
+    val res_position: res[mirl_debug.Position, mirl_debug_table.Error] = mirl_debug_place.position(?m.debug, at.some);
+    if (sel res_position.err) { ret f; }
+    val res_path: res[View, mirl_debug_table.Error] = mirl_debug_place.path(?m.debug, res_position.ok.file);
+    if (sel res_path.err) { ret f; }
+    val res_copied: res[str, StrError] = str_copy_slice(a, res_path.ok.data, 0, res_path.ok.len);
+    if (sel res_copied.err) { ret fail.str_refused(res_copied.err); }
+    val file: base_source.FileId = base_source.find(sources, res_copied.ok);
+    str_free(a, res_copied.ok);
+    val opt_loaded: opt[*base_source.SourceFile] = base_source.get(sources, file);
+    if (sel opt_loaded.none) { ret f; }
+    val start:      base_source.Position = base_source.Position{line: res_position.ok.line::usize, col: res_position.ok.column::usize};
+    val opt_offset: opt[usize]           = base_source.offset_of(opt_loaded.some, start);
+    if (sel opt_offset.none) { ret f; }
+    ret fail.at(f, base_source.location(file, base_source.span(opt_offset.some, 1)));
+}
+
+# a function of the module `name` holding an operation the target's family does not serve
+fun foreign_refused(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, e: mirl_family.Foreign) fail.Fail {
+    val res_fname: res[str, fail.Fail] = function_name(a, m, e.function);
+    if (sel res_fname.err) { ret res_fname.err; }
+    ret fail.user_of(diagnostic_kind.TARGET_UNSUPPORTED_OP, diagnostic.join(a, "'", res_fname.ok, "' of '", name, "' holds the operation ", e.row.name, ", which the target's family does not serve"));
+}
+
+# what mirl's pass schedule refused of the module `name`: the pass, the function and why, as
+# mirl's error states them
+fun schedule_refused(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, e: pass_failure.Error) fail.Fail {
+    if (sel e.alloc) { ret fail.refused(e.alloc); }
+    if (sel e.input) { ret fail.message_of(diagnostic.join(a, "mirl's schedule refused '", name, "' before any pass ran: ", e.input.what)); }
+    if (sel e.unverified) {
+        val u:    pass_failure.Unverified = e.unverified;
+        var what: str                     = "the verifier ran out of storage";
+        if (sel u.error.refused) { what = u.error.refused.what; }
+        ret fail.message_of(diagnostic.join(a, "mirl's verifier refused '", name, "' after the pass ", u.pass, ": ", what));
+    }
+    if (sel e.refused) {
+        val r:     pass_failure.Refusal = e.refused;
+        var where: str                  = "the module";
+        if (sel r.function.some) {
+            val res_fname: res[str, fail.Fail] = function_name(a, m, r.function.some);
+            if (sel res_fname.err) { ret res_fname.err; }
+            where = res_fname.ok;
+        }
+        if (sel r.why.taken)    { ret taken_refused(a, sources, m, name, where, r.why.taken); }
+        if (sel r.why.resolved) { ret resolved_refused(a, sources, m, name, r.why.resolved); }
+        val refused: fail.Fail = fail.user_of(pass_kind(r.why), diagnostic.join(a, "mirl's pass ", r.pass, " refused '", where, "' of '", name, "': ", pass_why(r.why)));
+        if (sel r.why.slot) { ret sourced(a, sources, m, refused, r.why.slot.location); }
+        ret refused;
+    }
+    if (sel e.schedule) { ret fail.message_of(diagnostic.join(a, "mirl's schedule for '", name, "' is malformed at the pass ", e.schedule.pass)); }
+    ret fail.message_of(diagnostic.join(a, "mirl's schedule for '", name, "' was given a machine opened for another target"));
+}
+
+# a symbol of the module `name` defined under a name mirl delivers a symbol of its own under, as
+# the code of `asking` asked for it, at the place the source defines it
+fun taken_refused(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, asking: str, t: refusal.Taken) fail.Fail {
+    var res_symbol: res[str, fail.Fail] = res[str, fail.Fail].err{fail.message("mirl refused a symbol its module does not hold")};
+    if (sel t.symbol.function) { res_symbol = function_name(a, m, t.symbol.function); }
+    or (sel t.symbol.global)   { res_symbol = global_name(a, m, t.symbol.global); }
+    if (sel res_symbol.err)    { ret res_symbol.err; }
+    val res_said: res[str, fail.Fail] = diagnostic.join(a, "'", res_symbol.ok, "' of '", name, "' has the name mirl gives ", t.wanted, " that '", asking, "' needs, and mirl never takes the source's symbol for its own: rename it");
+    if (sel res_said.err) { ret res_said.err; }
+    ret sourced(a, sources, m, fail.owning(fail.user(diagnostic_kind.NAME_RESERVED, res_said.ok)), t.location);
+}
+
+# a function of the module `name` that requires constant time and reaches a thread-local global through a call of
+# the runtime's resolver, at the function's first source location
+fun resolved_refused(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, r: refusal.Resolved) fail.Fail {
+    val res_fname: res[str, fail.Fail] = function_name(a, m, r.function);
+    if (sel res_fname.err) { ret res_fname.err; }
+    val res_gname: res[str, fail.Fail] = global_name(a, m, r.global);
+    if (sel res_gname.err) { ret res_gname.err; }
+    val res_said: res[str, fail.Fail] = diagnostic.join(a, "'", res_fname.ok, "' of '", name, "' requires constant time and reaches the thread-local '", res_gname.ok, "', which the target reaches through a call of the runtime's resolver, whose code the constant-time check cannot see into");
+    if (sel res_said.err) { ret res_said.err; }
+    ret sourced(a, sources, m, fail.owning(fail.user(diagnostic_kind.SECRET_UNVERIFIABLE, res_said.ok)), mct.location(m, r.function));
+}
+
+# the row a pass's refusal of the source is reported under, NONE for one that is the compiler's
+fun pass_kind(w: refusal.Error) diagnostic_kind.Kind {
+    if (sel w.timing)      { ret diagnostic_kind.SECRET_UNVERIFIABLE; }
+    if (sel w.unheld)      { ret diagnostic_kind.TARGET_NO_FLOAT; }
+    if (sel w.threaded)    { ret diagnostic_kind.TARGET_UNSUPPORTED_OP; }
+    if (sel w.indexed)     { ret diagnostic_kind.TARGET_UNSUPPORTED_OP; }
+    if (sel w.exported)    { ret diagnostic_kind.TARGET_UNSUPPORTED_OP; }
+    if (sel w.resolved)    { ret diagnostic_kind.SECRET_UNVERIFIABLE; }
+    if (sel w.specialized) { ret diagnostic_kind.TARGET_UNSUPPORTED_OP; }
+    if (sel w.slot)        { ret diagnostic_kind.TARGET_UNSUPPORTED_OP; }
+    if (sel w.taken)       { ret diagnostic_kind.NAME_RESERVED; }
+    ret diagnostic_kind.NONE;
+}
+
+# why a pass refused, in the words of its case
+fun pass_why(w: refusal.Error) str {
+    if (sel w.reason)      { ret w.reason; }
+    if (sel w.alloc)       { ret "the allocator refused storage"; }
+    if (sel w.ir)          { ret "the module or a body refused an edit or a read"; }
+    if (sel w.cfg)         { ret "a graph edit or a copy was refused"; }
+    if (sel w.build)       { ret "the builder stopped"; }
+    if (sel w.convention)  { ret "a call, an entry or a return was not classified"; }
+    if (sel w.pieces)      { ret "an assignment is not carried in pieces of the ir"; }
+    if (sel w.text)        { ret "a function delivered in the text form was not read"; }
+    if (sel w.timing)      { ret "a function that requires constant time would take a time that depends on a secret"; }
+    if (sel w.condition)   { ret "a capability's condition was not read on the build's machine"; }
+    if (sel w.unheld)      { ret "a float type the target holds no unit for"; }
+    if (sel w.threaded)    { ret "a thread-local global the build's threads reach no variable of yet"; }
+    if (sel w.indexed)     { ret "a thread-local global reached through the runtime's index, which no selection forms yet"; }
+    if (sel w.specialized) { ret "a specialization constant, on a target that holds none"; }
+    if (sel w.exported)    { ret "an exported thread-local global, on a target whose build runs one thread"; }
+    if (sel w.resolved)    { ret "a thread-local global a constant-time function reaches through a call of the runtime's resolver"; }
+    if (sel w.taken)       { ret "a symbol of the source has a name mirl delivers a symbol of its own under"; }
+    ret "a pointer slot the target holds no pointer in";
+}
+
+# why mirl's emission refused the laid out functions, by its case, in masc's words where masc
+# refused
+fun emit_refused(a: *A.Allocator, e: handover.Error) res[str, fail.Fail] {
+    val lead: str = "emission refused the laid out functions: ";
+    if (sel e.builder)                                                { ret diagnostic.join(a, lead, "masc refused: ", e.builder.message); }
+    if (sel e.unmapped)                                               { ret diagnostic.join(a, lead, "the object's format maps no relocation of a kind the object needs: ", e.unmapped.refusal.message); }
+    if (sel e.inline)                                                 { ret diagnostic.join(a, lead, "masc refused an asm block: ", e.inline.message); }
+    if (sel e.alloc)                                                  { ret diagnostic.join(a, lead, "the allocator refused storage"); }
+    if (sel e.symbol)                                                 { ret diagnostic.join(a, lead, "an operand names a symbol the module does not have"); }
+    if (sel e.convention)                                             { ret diagnostic.join(a, lead, "the target's calling convention is not stated"); }
+    if (sel e.abi)                                                    { ret diagnostic.join(a, lead, "the convention names no psABI row of mink's catalog for the architecture"); }
+    if (sel e.fill)                                                   { ret diagnostic.join(a, lead, "the target's code fill is not one byte repeated"); }
+    if (sel e.section)                                                { ret diagnostic.join(a, lead, "a section is named with two kinds"); }
+    if (sel e.contents || sel e.model || sel e.layout || sel e.width) { ret diagnostic.join(a, lead, "a global cannot be placed"); }
+    if (sel e.dialect)                                                { ret diagnostic.join(a, lead, "masc states no assembly dialect of the format"); }
+    if (sel e.listing)                                                { ret diagnostic.join(a, lead, "masc refused to list the object"); }
+    if (sel e.debug)                                                  { ret diagnostic.join(a, lead, "the module's debug records were not stated on the object"); }
+    if (sel e.lowering)                                               { ret diagnostic.join(a, lead, "mink states no registration of the object's format to lower its debug records for"); }
+    if (sel e.export)                                                 { ret diagnostic.join(a, lead, "the object refused to export a function or global the module marks exported"); }
+    if (sel e.declassify)                                             { ret diagnostic.join(a, lead, "a declassify of a constant-time function left no declassify point"); }
+    ret diagnostic.join(a, lead, "an instruction cannot be handed over");
+}
+
+# what the object's sections refuse of the module `name`, and what masc refused of an asm block as
+# its operands were placed, which the source states; none for any other refusal of emission
+fun emit_rejected(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, e: handover.Error) opt[fail.Fail] {
+    if (sel e.section) {
+        val sym: id.Symbol = e.section;
+        if (sel sym.function) {
+            val res_fname: res[str, fail.Fail] = function_name(a, m, sym.function);
+            if (sel res_fname.err) { ret opt[fail.Fail].some{res_fname.err}; }
+            ret opt[fail.Fail].some{fail.user_of(diagnostic_kind.LINK_SECTION_UNSUPPORTED, diagnostic.join(a, "'", res_fname.ok, "' of '", name, "' names a section a global or another function names with another kind"))};
+        }
+        val res_gname: res[str, fail.Fail] = global_name(a, m, sym.global);
+        if (sel res_gname.err) { ret opt[fail.Fail].some{res_gname.err}; }
+        ret opt[fail.Fail].some{fail.user_of(diagnostic_kind.LINK_SECTION_UNSUPPORTED, diagnostic.join(a, "'", res_gname.ok, "' of '", name, "' names a section a function or another global names with another kind"))};
+    }
+    if (sel e.inline) {
+        val res_fname: res[str, fail.Fail] = function_name(a, m, e.inline.at.function);
+        if (sel res_fname.err) { ret opt[fail.Fail].some{res_fname.err}; }
+        val text: fail.Fail = fail.user_of(diagnostic_kind.ASM_OPERAND, diagnostic.join(a, "an asm block of '", res_fname.ok, "' of '", name, "': ", e.inline.message));
+        ret opt[fail.Fail].some{sourced(a, sources, m, text, e.inline.at.location)};
+    }
+    ret opt[fail.Fail].none{};
+}
+
+# what mirl's register back end refused of the module `name`: a constant-time walk of the encoded
+# code, an asm block, a naked body and what `emit_rejected` names are the source's, and every other
+# case is the compiler's, named by its case
+fun register_refused(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, failed: mirl_machine.Failed) fail.Fail {
+    if (sel failed.function.some) { ret function_refused(a, sources, m, name, failed, failed.function.some); }
+    val e: mirl_machine.Error = failed.error;
+    if (sel e.alloc) { ret fail.refused(e.alloc); }
+    if (sel e.walked) {
+        val every: Slice[mct.Error] = e.walked;
+        if (every.size > 0) { ret walk_refused(a, sources, m, name, every); }
+    }
+    if (sel e.emit) {
+        val emitted: handover.Error = e.emit;
+        if (sel emitted.listing) { ret unlisted(a, m, name, emitted.listing); }
+        val opt_source: opt[fail.Fail] = emit_rejected(a, sources, m, name, emitted);
+        if (sel opt_source.some) { ret opt_source.some; }
+        val res_said: res[str, fail.Fail] = emit_refused(a, emitted);
+        if (sel res_said.err) { ret res_said.err; }
+        ret fail.message_of(diagnostic.join(a, "mirl did not compile '", name, "': ", res_said.ok));
+    }
+    var why: str = stage_refusal(e);
+    if (sel e.foreign)   { why = "the build was opened for another target"; }
+    or (sel e.uncarried) { why = "masc's registry carries no record of the build's instruction set"; }
+    or (sel e.locations) { why = "the target's register and memory locations were refused"; }
+    or (sel e.table)     { why = "the selection table was refused for the target"; }
+    or (sel e.moves)     { why = "the instruction set's moves were refused for the target"; }
+    or (sel e.code)      { why = "the frame code was not bound to the target's selection"; }
+    or (sel e.widening)  { why = "the extensions a function names past the build's were not opened"; }
+    or (sel e.machine)   { why = "the machine form text was not printed"; }
+    or (sel e.write)     { why = "the listing was not written"; }
+    ret fail.message_of(diagnostic.join(a, "mirl did not compile '", name, "': ", why));
+}
+
+# every function of the module `name` the walk of its encoded code refused, each with its place: the first one's
+# failure, its text naming what refused each other one as well, at that one's place among its related places, in the
+# order mirl emitted them
+fun walk_refused(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, every: Slice[mct.Error]) fail.Fail {
+    val first: fail.Fail = walk_one(a, sources, m, name, every.data[0]);
+    if (every.size == 1) { ret first; }
+    val opt_head: opt[str] = fail.text(first);
+    if (sel opt_head.none) { ret first; }
+    var text:   str                                 = opt_head.some;
+    var places: vector.Vector[base_source.Location] = vector.init[base_source.Location](a);
+    fin { vector.dnit[base_source.Location](?places); }
+    var i: usize = 1;
+    for (i < every.size) {
+        val other:    fail.Fail = walk_one(a, sources, m, name, every.data[i]);
+        val opt_said: opt[str]  = fail.text(other);
+        if (sel opt_said.some) {
+            val res_joined: res[str, fail.Fail] = diagnostic.join(a, text, "; and ", opt_said.some);
+            if (sel res_joined.err) { ret res_joined.err; }
+            text = res_joined.ok;
+        }
+        val opt_place: opt[base_source.Location] = fail.place_of(other);
+        if (sel opt_place.some) {
+            val res_placed: res[usize, A.Error] = vector.push[base_source.Location](?places, opt_place.some);
+            if (sel res_placed.err) { ret fail.refused(res_placed.err); }
+        }
+        i = i + 1;
+    }
+    ret fail.with_related(a, fail.owning(fail.with_text(first, text)), places.data, places.len);
+}
+
+# what the walk of a constant-time function's encoded code found of it
+fun walk_one(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, unmet: mct.Error) fail.Fail {
+    if (sel unmet.refused)      { ret untimed(a, sources, m, name, unmet.refused, "the walk of its encoded code"); }
+    if (sel unmet.unfollowed)   { ret unfollowed(a, sources, m, name, unmet.unfollowed); }
+    if (sel unmet.unguaranteed) { ret unguaranteed(a, sources, m, name, unmet.unguaranteed); }
+    if (sel unmet.stale)        { ret stale(a, sources, m, name, unmet.stale); }
+    ret fail.message("the walk of a constant-time function refused it in a case mach does not read");
+}
+
+# what refused the function `function` of the module `name` at a stage of the register back end,
+# at the source location of the instruction it names
+fun function_refused(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, failed: mirl_machine.Failed, function: Function) fail.Fail {
+    val res_fname: res[str, fail.Fail] = function_name(a, m, function);
+    if (sel res_fname.err) { ret res_fname.err; }
+    val stage: mirl_machine.Error = failed.error;
+    if (sel stage.timing) {
+        val found: fail.Fail = fail.user_of(timing_kind(?stage.timing.refusal), diagnostic.join(a, "'", res_fname.ok, "' of '", name, "' requires constant time, which the machine form's check refused at an instruction of it: ", masc_ct.message(?stage.timing.refusal)));
+        ret sourced(a, sources, m, found, failed.location);
+    }
+    if (sel stage.select) {
+        val selection: mirl_engine.Error = stage.select;
+        if (sel selection.assembly) { ret sourced(a, sources, m, block_refused(a, res_fname.ok, selection.assembly.refusal), failed.location); }
+        if (sel selection.naked) {
+            ret sourced(a, sources, m, fail.user_of(diagnostic_kind.NAKED_BODY, diagnostic.join(a, "'", res_fname.ok, "' of '", name, "' is naked, and holds an instruction other than an asm block that binds nothing")), failed.location);
+        }
+    }
+    if (sel stage.frame) {
+        val framed: frame_finish.Error = stage.frame;
+        if (sel framed.moved) {
+            ret sourced(a, sources, m, fail.user_of(diagnostic_kind.ASM_UNSUPPORTED, diagnostic.join(a, "an asm block of '", res_fname.ok, "' binds a name off the stack pointer and moves the stack pointer, a call's push included, which moves the name's address out from under it; push and pop around the block, or stage the address into a register before the block")), failed.location);
+        }
+    }
+    var step: str = "before its steps";
+    if (sel failed.step.some) { step = failed.step.some; }
+    ret fail.message_of(diagnostic.join(a, "mirl did not compile '", res_fname.ok, "' of '", name, "': ", stage_refusal(stage), " (", step, ")", selection_lead(stage), selection_named(stage)));
+}
+
+# what selection could not select, as a clause after its stage, "" for any other stage
+fun selection_lead(s: mirl_machine.Error) str {
+    if (!(sel s.select)) { ret ""; }
+    val e: mirl_engine.Error = s.select;
+    if (sel e.unmatched) {
+        val op: mirl_engine.Operation = e.unmatched.operation;
+        if (sel op.opcode) { ret ": no rule selects "; }
+        ret ": no rule materialises a constant";
+    }
+    if (sel e.unheld)    { ret ": no register class holds a value of its type"; }
+    if (sel e.ambiguous) { ret ": two register classes hold a value of its type"; }
+    if (sel e.aggregate) { ret ": a value of an aggregate type, which no register holds"; }
+    if (sel e.unplaced)  { ret ": an entry whose parameters the abi legalisation did not place"; }
+    if (sel e.placed)    { ret ": a piece at a place selection does not carry"; }
+    if (sel e.unchecked) { ret ": a division without the checked mark"; }
+    if (sel e.switched)  { ret ": a timing switch the set states no way to place"; }
+    ret "";
+}
+
+# the opcode selection found no rule for, "" when it refused anything else
+fun selection_named(s: mirl_machine.Error) str {
+    if (!(sel s.select)) { ret ""; }
+    val e: mirl_engine.Error = s.select;
+    if (!(sel e.unmatched)) { ret ""; }
+    val op: mirl_engine.Operation = e.unmatched.operation;
+    if (!(sel op.opcode)) { ret ""; }
+    val opt_row: opt[*opcode_row.Row] = opcode_table.at(op.opcode);
+    if (sel opt_row.some) { ret opt_row.some.name; }
+    ret "";
+}
+
+# what refused a function at a stage of the register back end, by the stage's case, and the
+# register back end as a whole for any other case
+fun stage_refusal(s: mirl_machine.Error) str {
+    if (sel s.select)     { ret "selection refused an operation"; }
+    if (sel s.timing)     { ret "a timing check refused it"; }
+    if (sel s.alloc)      { ret "the allocator refused storage"; }
+    if (sel s.effects)    { ret "what its instructions read and write was not read"; }
+    if (sel s.pointer)    { ret "the frame pointer was refused"; }
+    if (sel s.allowed)    { ret "a register the function may not use was asked for"; }
+    if (sel s.allocate)   { ret "register allocation refused it"; }
+    if (sel s.frame)      { ret "the frame was not finished"; }
+    if (sel s.copies)     { ret "its copies were not lowered"; }
+    if (sel s.configure)  { ret "the configuration step refused it"; }
+    if (sel s.loops)      { ret "a loop was not expanded"; }
+    if (sel s.layout)     { ret "its layout was refused"; }
+    if (sel s.ranges)     { ret "a branch range was refused"; }
+    if (sel s.verify)     { ret "the machine verifier refused it"; }
+    if (sel s.watched)    { ret "a watched step refused it"; }
+    if (sel s.misplaced)  { ret "an instruction was misplaced"; }
+    if (sel s.unfinished) { ret "it was left unfinished"; }
+    if (sel s.convention) { ret "its calling convention was refused"; }
+    ret "the register back end refused it";
+}
+
+# what mirl's spir-v back end refused of the module `name`, at the source location of the
+# instruction it names
+fun spirv_refused(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, q: mirl_spirv.Error) fail.Fail {
+    if (sel q.alloc)    { ret fail.refused(q.alloc); }
+    if (sel q.unmet)    { ret fail.user_of(diagnostic_kind.SPIRV_CAPABILITY, diagnostic.join(a, "mirl did not compile '", name, "': it needs ", q.unmet, ", which the target's selection does not hold")); }
+    if (sel q.encoding) { ret fail.message_of(diagnostic.join(a, "mirl did not compile '", name, "': masc refused an instruction: ", q.encoding.message)); }
+    if (sel q.builder)  { ret fail.message_of(diagnostic.join(a, "mirl did not compile '", name, "': masc's builder refused the module: ", q.builder.message)); }
+    ret sourced(a, sources, m, fail.user_of(spirv_kind(q), diagnostic.join(a, "mirl did not compile '", name, "': ", spirv_refusal(q))), spirv_at(q));
+}
+
+# the row a spir-v refusal of the source is reported under, NONE for one that is the compiler's:
+# logical addressing and the shape of an entry are the source's to change
+fun spirv_kind(q: mirl_spirv.Error) diagnostic_kind.Kind {
+    if (sel q.unstructured) { ret diagnostic_kind.SPIRV_CONTROL_FLOW; }
+    if (sel q.entry)        { ret diagnostic_kind.SPIRV_STAGE_SIGNATURE; }
+    if (sel q.workgroup)    { ret diagnostic_kind.SPIRV_STAGE_SIGNATURE; }
+    if (sel q.imported)     { ret diagnostic_kind.SPIRV_INTERFACE; }
+    if (sel q.unselected || sel q.untyped || sel q.unpointed || sel q.reinterpreted || sel q.variable || sel q.storage || sel q.slot) {
+        ret diagnostic_kind.SPIRV_UNSUPPORTED;
+    }
+    ret diagnostic_kind.NONE;
+}
+
+# the source location of the instruction a spir-v refusal names, none for any other
+fun spirv_at(q: mirl_spirv.Error) opt[mirl_debug.Location] {
+    if (sel q.unselected)    { ret q.unselected.location; }
+    if (sel q.unpointed)     { ret q.unpointed.location; }
+    if (sel q.reinterpreted) { ret q.reinterpreted.location; }
+    if (sel q.variable)      { ret q.variable.location; }
+    if (sel q.slot)          { ret q.slot.location; }
+    ret opt[mirl_debug.Location].none{};
+}
+
+# what mirl's spir-v back end refused of a module, in the words of its error's cases
+fun spirv_refusal(e: mirl_spirv.Error) str {
+    if (sel e.ir)            { ret "the spir-v back end could not read the module"; }
+    if (sel e.layout)        { ret "the spir-v data layout gave a type no extent"; }
+    if (sel e.basis)         { ret "the selection a spir-v unit is read under was not opened"; }
+    if (sel e.analysis)      { ret "a function's structure was not read"; }
+    if (sel e.unselected)    { ret "an instruction spir-v has no form of yet"; }
+    if (sel e.untyped)       { ret "a type spir-v has no form of here"; }
+    if (sel e.unpointed)     { ret "a pointer whose pointee no definition or use states"; }
+    if (sel e.reinterpreted) { ret "an access through a pointer at a type other than what it points to"; }
+    if (sel e.variable)      { ret "a pointer chosen at run time, which logical addressing reaches only through variable pointers"; }
+    if (sel e.storage)       { ret "a global whose address is used in another storage class than its own"; }
+    if (sel e.slot)          { ret "a stack slot whose pointer is not into the Function class"; }
+    if (sel e.entry)         { ret "an entry point that takes or returns a value"; }
+    if (sel e.workgroup)     { ret "an entry point whose workgroup names a dimension by a specialization constant the module has no 32-bit integer of"; }
+    if (sel e.imported)      { ret "an image that imports a function or a global"; }
+    if (sel e.unmet)         { ret "a capability, extension or version the module needs that the selection does not hold"; }
+    if (sel e.unstructured)  { ret "a function whose region tree the emitter cannot follow"; }
+    if (sel e.encoding)      { ret "masc refused an instruction"; }
+    if (sel e.builder)       { ret "masc's builder refused the module"; }
+    if (sel e.container)     { ret "mink's object refused the module"; }
+    ret "the spir-v back end refused it";
+}
+
+# what mirl's webassembly back end refused of the module `name`: the constant-time refusals read
+# as the register back end's, what wasm has no form of is the source's at the instruction it
+# names, and every other case is the compiler's
+fun wasm_refused(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, q: mirl_wasm.Error) fail.Fail {
+    if (sel q.alloc)        { ret fail.refused(q.alloc); }
+    if (sel q.timing)       { ret untimed(a, sources, m, name, q.timing, "the walk of its encoded code"); }
+    if (sel q.unfollowed)   { ret unfollowed(a, sources, m, name, q.unfollowed); }
+    if (sel q.stale)        { ret stale(a, sources, m, name, q.stale); }
+    if (sel q.unguaranteed) { ret unguaranteed(a, sources, m, name, q.unguaranteed); }
+    if (sel q.encoding)     { ret fail.message_of(diagnostic.join(a, "mirl did not compile '", name, "': masc refused an instruction or a definition: ", q.encoding.message)); }
+    if (sel q.unselected)   { ret sourced(a, sources, m, fail.user_of(diagnostic_kind.TARGET_UNSUPPORTED_OP, diagnostic.join(a, "mirl did not compile '", name, "': an instruction wasm has no form of")), q.unselected.location); }
+    if (sel q.threads)      { ret sourced(a, sources, m, fail.user_of(diagnostic_kind.TARGET_UNSUPPORTED_OP, diagnostic.join(a, "mirl did not compile '", name, "': an atomic access or a fence on a build that runs threads")), q.threads.location); }
+    ret fail.message_of(diagnostic.join(a, "mirl did not compile '", name, "': ", wasm_refusal(q)));
+}
+
+# what mirl's webassembly back end refused of a module, in the words of its error's cases
+fun wasm_refusal(q: mirl_wasm.Error) str {
+    if (sel q.ir)           { ret "the wasm back end could not read the module"; }
+    if (sel q.layout)       { ret "the wasm data layout gave a type no extent"; }
+    if (sel q.analysis)     { ret "a function's structure or liveness was not read"; }
+    if (sel q.placement)    { ret "a signature was not placed"; }
+    if (sel q.unvalued)     { ret "a value of a type no value type of wasm holds"; }
+    if (sel q.invariant)    { ret "an instruction in a shape no verified module brings to the back end"; }
+    if (sel q.offset)       { ret "an address of a function at an offset, which a table slot has none"; }
+    if (sel q.width)        { ret "an address in a global's initial value of a width no relocation of an object writes"; }
+    if (sel q.unstructured) { ret "a function whose graph lays out in no regions its code can follow"; }
+    if (sel q.image)        { ret "a global's initial value was not laid out"; }
+    if (sel q.object)       { ret "mink refused a record of the object"; }
+    ret "the wasm back end refused it";
+}
+
+# a function of the module `name` that requires constant time, refused as mirl words it: a
+# set that classifies no timing is the target's, and a secret where the code may hold none is
+# the source's
+fun untimed(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, r: mct.Refused, by: str) fail.Fail {
+    val res_fname: res[str, fail.Fail] = function_name(a, m, r.function);
+    if (sel res_fname.err) { ret res_fname.err; }
+    var at: str = "the function as a whole";
+    if (sel r.at.instruction) { at = "an instruction of it"; }
+    or (sel r.at.offset)      { at = "a byte of its encoded code"; }
+    val kind:     diagnostic_kind.Kind = timing_kind(?r.refusal);
+    val res_said: res[str, fail.Fail]  = refusal_words(a, ?r.refusal);
+    if (sel res_said.err) { ret res_said.err; }
+    var refused: fail.Fail = fail.user_of(kind, diagnostic.join(a, "'", res_fname.ok, "' of '", name, "' requires constant time, which ", by, " refused at ", at, ": ", res_said.ok));
+    if (r.refusal.reason == masc_ct.RESULT) {
+        # a secret not declassified reached a public result
+        refused = fail.user_of(kind, diagnostic.join(a, "'", res_fname.ok, "' of '", name, "' requires constant time, which ", by, " refused at ", at, ": ", res_said.ok,
+            ", so return the secret type, or declassify it with `:>` where it is meant public"));
+    }
+    if (r.refusal.reason == masc_ct.STORED) {
+        refused = fail.user_of(kind, diagnostic.join(a, "'", res_fname.ok, "' of '", name, "' requires constant time, which ", by, " refused at ", at, ": ", res_said.ok,
+            ", so keep it in storage of a secret type, or declassify it with `:>` where it is meant public"));
+    }
+    if (sel r.callee.some) {
+        val res_callee: res[str, fail.Fail] = function_name(a, m, r.callee.some);
+        if (sel res_callee.err) { ret res_callee.err; }
+        refused = fail.user_of(kind, diagnostic.join(a, "'", res_fname.ok, "' of '", name, "' requires constant time, which ", by, " refused at ", at, ": ", res_said.ok, ", '", res_callee.ok, "'"));
+    }
+    if (sel r.shared.some) {
+        val opt_said: opt[str]            = fail.text(refused);
+        val res_note: res[str, fail.Fail] = shared_note(a, m, res_fname.ok, r.function, r.shared.some);
+        if (sel res_note.err) { ret res_note.err; }
+        if (sel opt_said.some) {
+            val res_joined: res[str, fail.Fail] = diagnostic.join(a, opt_said.some, res_note.ok);
+            if (sel res_joined.err) { ret res_joined.err; }
+            refused = fail.owning(fail.with_text(refused, res_joined.ok));
+        }
+    }
+    ret sourced(a, sources, m, refused, r.location);
+}
+
+# the words of refusal `r`: its message, and where the walk held the value byte by byte the bytes of it that hold the
+# secret, as "bytes 0 to 3 of the 8-byte store"
+fun refusal_words(a: *A.Allocator, r: *masc_ct.Refusal) res[str, fail.Fail] {
+    val message: str = masc_ct.message(r);
+    if (r.width == 0 || r.bytes == 0) { ret res[str, fail.Fail].ok{message}; }
+    var what: str = "value";
+    if (r.reason == masc_ct.STORED)                                      { what = "store"; }
+    or (r.reason == masc_ct.RESULT)                                      { what = "result piece"; }
+    or (r.reason == masc_ct.UNCHECKED || r.reason == masc_ct.UNDECLARED) { what = "argument piece"; }
+    var low:  u64 = 64;
+    var high: u64 = 0;
+    var k:    u64 = 0;
+    for (k < r.width::u64 && k < 64) {
+        if (((r.bytes >> k) & 1) != 0) {
+            if (low == 64) { low = k; }
+            high = k;
+        }
+        k = k + 1;
+    }
+    if (low == high) { ret diagnostic.format(a, "{} (byte {} of the {}-byte {})", message, low, r.width, what); }
+    ret diagnostic.format(a, "{} (bytes {} to {} of the {}-byte {})", message, low, high, r.width, what);
+}
+
+# what an author can act on when the walk refused function `f`, named `fname`, which takes a record by value whose
+# piece `s` carries secret and public bytes in one register of no general class: the walk holds such a register's
+# secrecy whole, so a public member there reads as secret. names the record and its members where the module names them
+fun shared_note(a: *A.Allocator, m: *Module, fname: str, f: Function, s: mct.Shared) res[str, fail.Fail] {
+    val last:       u64                                        = s.offset + s.length - 1;
+    var res_record: res[str, fail.Fail]                        = diagnostic.format(a, "parameter {}", s.parameter + 1);
+    var res_inside: res[str, fail.Fail]                        = diagnostic.format(a, "bytes {} to {} of it", s.offset, last);
+    val res_sig:    res[mirl_types.Function, mirl_types.Error] = mirl_types.signature(?m.types, m.functions.data[f].data.signature);
+    if (sel res_sig.ok) {
+        if (s.parameter::usize < res_sig.ok.params.size) {
+            val ty:        mirl_types.Type                         = res_sig.ok.params.data[s.parameter];
+            val opt_named: opt[mirl_types.Naming]                  = mirl_types.naming(?m.types, ty);
+            val res_shape: res[mirl_types.Shape, mirl_types.Error] = mirl_types.shape(?m.types, ty);
+            if (sel opt_named.some) {
+                val res_title: res[str, StrError] = str_copy_slice(a, opt_named.some.name.data, 0, opt_named.some.name.len);
+                if (sel res_title.err) { ret res[str, fail.Fail].err{fail.str_refused(res_title.err)}; }
+                res_record = diagnostic.format(a, "parameter {} of record '{}'", s.parameter + 1, res_title.ok);
+                if (sel res_shape.ok) {
+                    val res_members: res[str, fail.Fail] = shared_members(a, ?m.functions.data[f].data, s, opt_named.some, res_shape.ok);
+                    if (sel res_members.err)          { ret res_members; }
+                    if (str_len(res_members.ok) != 0) { res_inside = res_members; }
+                }
+            }
+        }
+    }
+    if (sel res_record.err) { ret res_record; }
+    if (sel res_inside.err) { ret res_inside; }
+    ret diagnostic.join(a, ". '", fname, "' takes its ", res_record.ok, " by value, and ", res_inside.ok,
+        " travel together in one floating-point or vector register, whose secrecy the walk holds whole, so a public member there reads as secret: take it through a pointer, which reads each member by its own type and a tag's discriminator as public, or order its members so secret and public ones fall in different pieces");
+}
+
+# the members of a record named `named` of shape `shape` lying in piece `s`, each with whether the declaration of `d`
+# states it secret, "" where the record states no member offsets
+fun shared_members(a: *A.Allocator, d: *mirl_function.FunctionData, s: mct.Shared, named: mirl_types.Naming, shape: mirl_types.Shape) res[str, fail.Fail] {
+    if (!(sel shape.structure)) { ret res[str, fail.Fail].ok{""}; }
+    val st: mirl_types.Structure = shape.structure;
+    if (sel st.offsets.none) { ret res[str, fail.Fail].ok{""}; }
+    val offs: Slice[u64]          = st.offsets.some;
+    val held: mirl_global.Secrecy = mirl_function.parameter_secrecy(d, s.parameter::usize);
+    var out:  str                 = "its members";
+    var k:    usize               = 0;
+    for (k < offs.size && k < named.members.size) {
+        val at: u64 = offs.data[k];
+        k = k + 1;
+        if (at < s.offset || at >= s.offset + s.length) { cnt; }
+        var kind: str = "public";
+        if (sel held.ranges) {
+            var n: usize = 0;
+            for (n < held.ranges.size) {
+                val r: mirl_global.Range = held.ranges.data[n];
+                if (at >= r.offset && at < r.offset + r.length) { kind = "secret"; }
+                n = n + 1;
+            }
+        }
+        val member:    View               = named.members.data[k - 1];
+        val res_spelt: res[str, StrError] = str_copy_slice(a, member.data, 0, member.len);
+        if (sel res_spelt.err) { ret res[str, fail.Fail].err{fail.str_refused(res_spelt.err)}; }
+        var gap: str = ", ";
+        if (str_len(out) == 11) { gap = " "; }
+        val res_grown: res[str, fail.Fail] = diagnostic.format(a, "{}{}'{}' ({})", out, gap, res_spelt.ok, kind);
+        if (sel res_grown.err) { ret res_grown; }
+        out = res_grown.ok;
+    }
+    if (str_len(out) == 11) { ret res[str, fail.Fail].ok{""}; }
+    ret res[str, fail.Fail].ok{out};
+}
+
+# the row masc's constant-time refusal is reported under: a set that classifies no timing is the
+# target's, and anything else the source's
+fun timing_kind(r: *masc_ct.Refusal) diagnostic_kind.Kind {
+    if (r.reason == masc_ct.UNCLASSIFIED) { ret diagnostic_kind.SECRET_TARGET_UNVERIFIABLE; }
+    ret diagnostic_kind.SECRET_UNVERIFIABLE;
+}
+
+# a constant-time function of the module `name` whose encoded code mirl could not follow
+fun unfollowed(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, u: mct.Unfollowed) fail.Fail {
+    val res_fname: res[str, fail.Fail] = function_name(a, m, u.function);
+    if (sel res_fname.err) { ret res_fname.err; }
+    ret sourced(a, sources, m, fail.user_of(diagnostic_kind.SECRET_UNVERIFIABLE, diagnostic.join(a, "'", res_fname.ok, "' of '", name, "' requires constant time, and mirl could not follow its encoded code: ", u.unread.message)), u.location);
+}
+
+# a constant-time function of the module `name` whose frame reads a slot no store reaches first
+fun stale(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, s: mct.Stale) fail.Fail {
+    val res_fname: res[str, fail.Fail] = function_name(a, m, s.function);
+    if (sel res_fname.err) { ret res_fname.err; }
+    ret sourced(a, sources, m, fail.user_of(diagnostic_kind.SECRET_UNVERIFIABLE, diagnostic.join(a, "'", res_fname.ok, "' of '", name, "' requires constant time, and its frame reads a slot no store of it reaches first, which may hold a secret an earlier frame left")), s.location);
+}
+
+# a hard constant-time function of the module `name` whose code holds only under timing modes the
+# build does not guarantee, named by the features a target selects to guarantee them
+fun unguaranteed(a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, name: str, u: mct.Unguaranteed) fail.Fail {
+    val res_fname: res[str, fail.Fail] = function_name(a, m, u.function);
+    if (sel res_fname.err) { ret res_fname.err; }
+    if (u.needs == mct.NO_NEEDS) {
+        ret sourced(a, sources, m, fail.user_of(diagnostic_kind.SECRET_TARGET_UNGUARANTEED, diagnostic.join(a, "'", res_fname.ok, "' of '", name,
+            "' requires hard constant time, and the target's instruction set guarantees no instruction's timing")), u.location);
+    }
+    var features: vector.Vector[u8] = vector.init[u8](a);
+    fin { vector.dnit[u8](?features); }
+    val err_spelled: err[A.Error] = mct.missing(u.set, u.needs, ?features);
+    if (sel err_spelled.err) { ret fail.refused(err_spelled.err); }
+    val res_nul: res[usize, A.Error] = vector.push[u8](?features, 0);
+    if (sel res_nul.err) { ret fail.refused(res_nul.err); }
+    ret sourced(a, sources, m, fail.user_of(diagnostic_kind.SECRET_TARGET_UNGUARANTEED, diagnostic.join(a, "'", res_fname.ok, "' of '", name,
+        "' requires hard constant time, and its code runs in constant time only under ", features.data::str,
+        ", which the build's target does not guarantee; select it in the target's `isa` or `ext`, or mark the function soft")), u.location);
+}
+
+# masc's refusal to list the object, naming the function or global it is about when it names one
+fun unlisted(a: *A.Allocator, m: *Module, name: str, u: handover.Unlisted) fail.Fail {
+    if (sel u.symbol.none) { ret fail.message_of(diagnostic.join(a, "masc did not list the object of '", name, "': ", u.refusal.failure.text)); }
+    val sym:       id.Symbol           = u.symbol.some;
+    var res_sname: res[str, fail.Fail] = res[str, fail.Fail].err{fail.message("mirl refused a global its module does not hold")};
+    if (sel sym.function)  { res_sname = function_name(a, m, sym.function); }
+    or (sel sym.global)    { res_sname = global_name(a, m, sym.global); }
+    if (sel res_sname.err) { ret res_sname.err; }
+    ret fail.message_of(diagnostic.join(a, "masc did not list '", res_sname.ok, "' of '", name, "': ", u.refusal.failure.text));
+}
+
+# the name a function of `m` is declared by, copied
+fun function_name(a: *A.Allocator, m: *Module, f: Function) res[str, fail.Fail] {
+    if (f::usize >= m.functions.len) { ret res[str, fail.Fail].err{fail.message("mirl refused a function its module does not hold")}; }
+    val v:          View               = mirl_module.name_of(m, m.functions.data[f::usize].data.name);
+    val res_copied: res[str, StrError] = str_copy_slice(a, v.data, 0, v.len);
+    if (sel res_copied.err) { ret res[str, fail.Fail].err{fail.str_refused(res_copied.err)}; }
+    ret res[str, fail.Fail].ok{res_copied.ok};
+}
+
+# the name a global of `m` is declared by, copied
+fun global_name(a: *A.Allocator, m: *Module, g: id.Global) res[str, fail.Fail] {
+    if (g::usize >= m.globals.len) { ret res[str, fail.Fail].err{fail.message("mirl refused a global its module does not hold")}; }
+    val v:          View               = mirl_module.name_of(m, m.globals.data[g::usize].data.name);
+    val res_copied: res[str, StrError] = str_copy_slice(a, v.data, 0, v.len);
+    if (sel res_copied.err) { ret res[str, fail.Fail].err{fail.str_refused(res_copied.err)}; }
+    ret res[str, fail.Fail].ok{res_copied.ok};
+}
+
+# why mirl compiles no asm block of the module `name` as it is written
+fun block_refused(a: *A.Allocator, name: str, r: mirl_inline.Error) fail.Fail {
+    if (sel r.alloc)  { ret fail.refused(r.alloc); }
+    if (sel r.parsed) { ret fail.user_of(diagnostic_kind.ASM_SYNTAX, diagnostic.join(a, "an asm block of '", name, "': ", r.parsed)); }
+    if (sel r.returns) {
+        ret fail.user_of(diagnostic_kind.ASM_UNSUPPORTED, diagnostic.join(a, "an asm block of '", name, "' may return from its function, which would skip the epilogue that restores the caller's frame; return from a `#[naked]` function's body instead"));
+    }
+    if (sel r.operands) { ret fail.user_of(diagnostic_kind.ASM_OPERAND, diagnostic.join(a, "an asm block of '", name, "' binds more names than one block may")); }
+    if (sel r.class)    { ret fail.user_of(diagnostic_kind.ASM_OPERAND, diagnostic.join(a, "an asm block of '", name, "' binds a name in another register class than its operand takes")); }
+    ret fail.user_of(diagnostic_kind.ASM_UNSUPPORTED, diagnostic.join(a, "an asm block of '", name, "' binds an address as an immediate, which mirl carries no relocation for yet"));
+}

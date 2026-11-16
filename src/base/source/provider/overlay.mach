@@ -1,0 +1,216 @@
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.text.string.str_dup;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+
+use mach.base.fail;
+use mach.base.intern;
+use mach.base.source.provider;
+
+# the provider an editor reads through: the session's open buffers stand in front of the
+# provider under them, so a buffer is read for its file and a buffer whose file is not on
+# disk yet still names a module
+# ---
+# base: the provider the buffers stand in front of
+# s:    the buffers, keyed by the path the base locates
+pub rec Overlay {
+    base: provider.Provider;
+    s:    *Store;
+}
+
+pub fun init(base: provider.Provider, s: *Store) Overlay {
+    ret Overlay{base: base, s: s};
+}
+
+pub fun provider_of(o: *Overlay) provider.Provider {
+    ret provider.Provider{ctx: o::ptr, locate: locate, exists: exists, read: read, package: package};
+}
+
+fun locate(ctx: ptr, a: *A.Allocator, fqn: intern.StrId) res[opt[provider.Origin], fail.Fail] {
+    val o: *Overlay = ctx::*Overlay;
+    ret provider.module_locate(?o.base, a, fqn);
+}
+
+fun exists(ctx: ptr, a: *A.Allocator, fqn: intern.StrId) res[bool, fail.Fail] {
+    val o:         *Overlay                             = ctx::*Overlay;
+    val res_found: res[opt[provider.Origin], fail.Fail] = provider.module_locate(?o.base, a, fqn);
+    if (sel res_found.err) { ret res[bool, fail.Fail].err{res_found.err}; }
+    if (sel res_found.ok.some) {
+        var origin:   provider.Origin = res_found.ok.some;
+        val opt_open: opt[str]        = get(o.s, origin.path);
+        provider.origin_dnit(a, ?origin);
+        if (sel opt_open.some) { ret res[bool, fail.Fail].ok{true}; }
+    }
+    ret provider.module_exists(?o.base, a, fqn);
+}
+
+fun read(ctx: ptr, a: *A.Allocator, path: str) res[provider.Text, fail.Fail] {
+    val o:        *Overlay = ctx::*Overlay;
+    val opt_open: opt[str] = get(o.s, path);
+    if (sel opt_open.some) { ret res[provider.Text, fail.Fail].ok{provider.Text{data: opt_open.some, owned: false}}; }
+    ret provider.module_read(?o.base, a, path);
+}
+
+fun package(ctx: ptr, id: intern.StrId) bool {
+    val o: *Overlay = ctx::*Overlay;
+    ret provider.package_known(?o.base, id);
+}
+
+# the open buffers, one per file however its path is spelled; scanned by path, as an
+# editor holds a handful
+# ---
+# a:     owns every entry's path and text
+# items: the buffers
+pub rec Store {
+    a:     *A.Allocator;
+    items: Vector[Entry];
+}
+
+# an open buffer's text, standing in for the file at `path` (cleaned) on disk
+rec Entry {
+    path: str;
+    text: str;
+}
+
+pub fun store_init(a: *A.Allocator) Store {
+    ret Store{a: a, items: collections_vector.init[Entry](a)};
+}
+
+pub fun store_dnit(s: *Store) {
+    var i: usize = 0;
+    for (i < s.items.len) {
+        str_free(s.a, s.items.data[i].path);
+        str_free(s.a, s.items.data[i].text);
+        i = i + 1;
+    }
+    collections_vector.dnit[Entry](?s.items);
+}
+
+pub rec Prepared {
+    owner:   *Store;
+    key:     str;
+    text:    str;
+    index:   usize;
+    remove:  bool;
+    changed: bool;
+}
+
+# the caller exclusively borrows overlay state through commit or discard
+pub fun prepare(s: *Store, path: str, text: str, remove: bool) res[Prepared, fail.Fail] {
+    val res_canonical: res[str, fail.Fail] = clean_path(s.a, path);
+    if (sel res_canonical.err) { ret res[Prepared, fail.Fail].err{res_canonical.err}; }
+    var prepared: Prepared = Prepared{
+        owner: s, key: res_canonical.ok, index: s.items.len, remove: remove
+    };
+    var complete: bool = false;
+    fin {
+        if (!complete) { discard(?prepared); }
+    }
+    var i: usize = 0;
+    for (i < s.items.len) {
+        if (str_equals(s.items.data[i].path, prepared.key)) {
+            prepared.index = i;
+            brk;
+        }
+        i = i + 1;
+    }
+    if (remove) { prepared.changed = prepared.index < s.items.len; }
+    or {
+        prepared.changed = prepared.index == s.items.len || !str_equals(s.items.data[prepared.index].text, text);
+        if (prepared.changed) {
+            val res_copied: res[str, A.Error] = str_dup(s.a, text);
+            if (sel res_copied.err) { ret res[Prepared, fail.Fail].err{fail.refused(res_copied.err)}; }
+            prepared.text = res_copied.ok;
+            if (prepared.index == s.items.len) {
+                val res_reserved: res[usize, A.Error] = collections_vector.reserve[Entry](?s.items, 1);
+                if (sel res_reserved.err) { ret res[Prepared, fail.Fail].err{fail.refused(res_reserved.err)}; }
+            }
+        }
+    }
+    complete = true;
+    ret res[Prepared, fail.Fail].ok{prepared};
+}
+
+# release an overlay that was prepared and not committed; one already committed or
+# discarded owns nothing
+pub fun discard(prepared: *Prepared) {
+    if (prepared.owner == nil) { ret; }
+    str_free(prepared.owner.a, prepared.key);
+    str_free(prepared.owner.a, prepared.text);
+    prepared.owner = nil;
+    prepared.key   = nil;
+    prepared.text  = nil;
+}
+
+# the prepared change made, and whether it changed the texts; a change expires the views borrowed
+# from the session holding the store
+pub fun commit(prepared: *Prepared) bool {
+    val s:       *Store = prepared.owner;
+    val changed: bool   = prepared.changed;
+    if (changed) {
+        val i: usize = prepared.index;
+        if (prepared.remove) {
+            str_free(s.a, s.items.data[i].path);
+            str_free(s.a, s.items.data[i].text);
+            val opt_last: opt[Entry] = collections_vector.pop[Entry](?s.items);
+            # the last entry fills the removed one's place
+            if (sel opt_last.some) {
+                if (i != s.items.len) { s.items.data[i] = opt_last.some; }
+            }
+        }
+        or {
+            # prepare reserved the new entry's room
+            if (i == s.items.len) {
+                collections_vector.push[Entry](?s.items, Entry{path: prepared.key, text: prepared.text});
+                prepared.key = nil;
+            }
+            or {
+                str_free(s.a, s.items.data[i].text);
+                s.items.data[i].text = prepared.text;
+            }
+            prepared.text = nil;
+        }
+    }
+    discard(prepared);
+    ret changed;
+}
+
+# set the text standing in for `path`; true when it changed the texts
+pub fun set(s: *Store, path: str, text: str) res[bool, fail.Fail] {
+    val res_staged: res[Prepared, fail.Fail] = prepare(s, path, text, false);
+    if (sel res_staged.err) { ret res[bool, fail.Fail].err{res_staged.err}; }
+    var prepared: Prepared = res_staged.ok;
+    ret res[bool, fail.Fail].ok{commit(?prepared)};
+}
+
+# the text standing in for `path`, none when no buffer does
+pub fun get(s: *Store, path: str) opt[str] {
+    val res_key: res[str, fail.Fail] = clean_path(s.a, path);
+    if (sel res_key.err) { ret opt[str].none{}; }
+    val key: str = res_key.ok;
+    fin { str_free(s.a, key); }
+
+    var i: usize = 0;
+    for (i < s.items.len) {
+        if (str_equals(s.items.data[i].path, key)) { ret opt[str].some{s.items.data[i].text}; }
+        i = i + 1;
+    }
+    ret opt[str].none{};
+}
+
+fun clean_path(a: *A.Allocator, path: str) res[str, fail.Fail] {
+    val res_cleaned: res[str, A.Error] = types_path.clean(a, path);
+    if (sel res_cleaned.err) { ret res[str, fail.Fail].err{fail.refused(res_cleaned.err)}; }
+    ret res[str, fail.Fail].ok{res_cleaned.ok};
+}

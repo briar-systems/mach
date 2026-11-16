@@ -1160,7 +1160,7 @@ build, put [`#[expect]`](decorators.md#expectkey--acknowledge-a-warning) on the
 declaration that raises it.
 
 Every diagnostic kind has one row in one table in the compiler
-(`src/lang/diagnostic/kind.mach`). Each warning names its row where it is
+(`src/base/diagnostic/kind.mach`). Each warning names its row where it is
 raised, and `allow`, `#[expect]` and the printed key read the same rows, so a
 key here is exactly the kind the warning carries. The list is closed: a key no
 row declares is refused, naming the warning keys there are. A key is never

@@ -1,0 +1,198 @@
+# comptime arithmetic through mirl's constant folder: every operation a constant
+# expression computes is one row of mirl's opcode table folded on constants, so a
+# constant means at compile time what the same operation means at run time and no
+# fold rule is stated here. comptime keeps only the language's own rules over the
+# folded results: which operations it admits, and when a result is out of range
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use std.allocator.fixed;
+use std.collections.slice.Slice;
+
+use fold_eval: mirl.fold.eval;
+use fold:      mirl.fold.record;
+use mirl.ir.constant.Bits;
+use mirl.ir.opcode.row.Immediate;
+use mirl.ir.opcode.row.Opcode;
+use opcodes:         mirl.ir.opcode.table;
+use types_format:    mirl.ir.type.format;
+use types:           mirl.ir.type.table;
+use mirl_capability: mirl.target.capability;
+
+use mach.base.float;
+use mach.base.wide;
+use target_facts: mach.target.facts;
+
+# the storage one fold draws its type table and results from, on the caller's stack
+val ARENA: usize = 16384;
+
+# the width comptime integers are computed at: the widest integer the language admits
+pub val WIDTH: u32 = 128;
+
+# the type an operand or a result is read at
+# ---
+# integer: an integer of this many bits
+# float:   a float of this width
+pub tag Kind: u8 {
+    integer: u32;
+    float:   float.FloatWidth;
+}
+
+# what one fold gives
+# ---
+# folded:   its results, at most two, each as the low 128 bits of its value: a float's
+#           are its own encoding at its width
+# zero:     the folder refused it by a division or remainder by zero
+# overflow: the folder refused it by a quotient that does not fit
+# nan:      the folder refused it by a nan result whose bits the target's rule for
+#           its format leaves unknown
+# refused:  the folder refused it otherwise, which no request comptime makes can do
+pub tag Answer: u8 {
+    folded: [2]wide.Wide;
+    zero;
+    overflow;
+    nan;
+    refused;
+}
+
+# the mirl type of `k`, interned in `t`
+fun type_of(t: *types.Table, k: Kind) res[types.Type, types.Error] {
+    if (sel k.float) {
+        var f: types_format.Format = types_format.BINARY64;
+        if (k.float == float.FLOAT_W_16) { f = types_format.BINARY16; }
+        or (k.float == float.FLOAT_W_32) { f = types_format.BINARY32; }
+        ret types.intern(t, types.Shape.float{types.Float{format: f}});
+    }
+    ret types.intern(t, types.Shape.integer{types.Integer{width: k.integer}});
+}
+
+# the words of `w` as the folder reads a lane of `k`: two for 128 bits, one below
+fun words_of(k: Kind) usize {
+    if (sel k.integer) {
+        if (k.integer > 64) { ret 2; }
+    }
+    ret 1;
+}
+
+# fold `op` over `n` operands of kind `k`, the results read at `out`, with the
+# immediate type `to` where the row takes one
+# ---
+# op:   the operation
+# k:    the kind of every operand
+# x:    the operands' bits
+# n:    how many, at most three
+# to:   the kind the row's type immediate states, none for a row with no immediate
+# nans: the nan the target's float operations return in each format
+pub fun fold_op(op: Opcode, k: Kind, x: [3]wide.Wide, n: u32, to: opt[Kind], nans: target_facts.Nans) Answer {
+    var buf:      [ARENA]u8;
+    var state:    fixed.FixedState;
+    var a:        A.Allocator;
+    val err_made: err[A.Error] = fixed.make(?a, ?state, ?buf[0], ARENA);
+    if (sel err_made.err) { ret Answer.refused{}; }
+    var t: types.Table = types.init(?a);
+    fin { types.dnit(?t); }
+    val res_type_of: res[types.Type, types.Error] = type_of(?t, k);
+    if (sel res_type_of.err) { ret Answer.refused{}; }
+
+    var words:    [3][2]u64;
+    var bits:     [3]Bits;
+    var operands: [3]fold.Operand;
+    var imm:      [1]Immediate;
+    var req:      fold.Request;
+    req.opcode     = op;
+    req.operands   = Slice[fold.Operand]{data: ?operands[0], size: n::usize};
+    req.immediates = Slice[Immediate]{data: ?imm[0], size: 0};
+    if (sel to.some) {
+        val res_target: res[types.Type, types.Error] = type_of(?t, to.some);
+        if (sel res_target.err) { ret Answer.refused{}; }
+        imm[0]         = Immediate.ty{res_target.ok};
+        req.immediates = Slice[Immediate]{data: ?imm[0], size: 1};
+    }
+    var i: u32 = 0;
+    for (i < n) {
+        words[i][0] = x[i].lo;
+        words[i][1] = x[i].hi;
+        bits[i]     = Bits{type: res_type_of.ok, words: Slice[u64]{data: ?words[i][0], size: words_of(k)}};
+        operands[i] = fold.Operand{value: fold.Value{type: res_type_of.ok, lanes: Slice[Bits]{data: ?bits[i], size: 1}}, secret: false};
+        i           = i + 1;
+    }
+
+    var rules: target_facts.Nans = nans;
+    val out:   fold.Outcome      = fold_eval.fold(?a, ?t, Slice[mirl_capability.Nans]{data: ?rules.formats[0], size: 3}, req);
+    if (sel out.refused) {
+        val why: fold.Error = out.refused;
+        if (sel why.trap) {
+            if (sel why.trap.zero)     { ret Answer.zero{}; }
+            if (sel why.trap.overflow) { ret Answer.overflow{}; }
+        }
+        if (sel why.nan) { ret Answer.nan{}; }
+        ret Answer.refused{};
+    }
+    var got:     [2]wide.Wide      = [2]wide.Wide{wide.zero(), wide.zero()};
+    val results: Slice[fold.Value] = out.folded.results;
+    var r:       usize             = 0;
+    for (r < results.size && r < 2) {
+        val ws: Slice[u64] = results.data[r].lanes.data[0].words;
+        var lo: u64        = 0;
+        var hi: u64        = 0;
+        if (ws.size > 0) { lo = ws.data[0]; }
+        if (ws.size > 1) { hi = ws.data[1]; }
+        got[r] = wide.make(lo, hi);
+        r      = r + 1;
+    }
+    ret Answer.folded{got};
+}
+
+# an integer operation at comptime's width over one or two operands
+pub fun int(op: Opcode, x: wide.Wide, y: wide.Wide, n: u32) Answer {
+    ret fold_op(op, Kind.integer{WIDTH}, [3]wide.Wide{x, y, wide.zero()}, n, opt[Kind].none{}, target_facts.nans_none());
+}
+
+# a float operation at width `w` over one or two operands, each the f64 that holds
+# its value at that width, a nan result made by the target's rule `nans`
+pub fun flt(op: Opcode, w: float.FloatWidth, x: f64, y: f64, n: u32, nans: target_facts.Nans) Answer {
+    val xb: wide.Wide = wide.from_u64(float.bits_at(x, w));
+    val yb: wide.Wide = wide.from_u64(float.bits_at(y, w));
+    ret fold_op(op, Kind.float{w}, [3]wide.Wide{xb, yb, wide.zero()}, n, opt[Kind].none{}, nans);
+}
+
+# a conversion of `x`, read as `from`, to `to` by mirl's conversion row `op`, a nan
+# result made by the target's rule `nans`
+pub fun convert(op: Opcode, from: Kind, x: wide.Wide, to: Kind, nans: target_facts.Nans) Answer {
+    ret fold_op(op, from, [3]wide.Wide{x, wide.zero(), wide.zero()}, 1, opt[Kind].some{to}, nans);
+}
+
+# the first result of a fold the caller knows cannot trap
+pub fun first(a: Answer) wide.Wide {
+    if (sel a.folded) { ret a.folded[0]; }
+    ret wide.zero();
+}
+
+# whether a one-bit result is set
+pub fun holds(a: Answer, index: u32) bool {
+    if (sel a.folded) { ret !wide.is_zero(a.folded[index]); }
+    ret false;
+}
+
+# the float a fold at width `w` gave
+pub fun float_of(a: Answer, w: float.FloatWidth) f64 {
+    ret float.value_of_bits(first(a).lo, w);
+}
+
+# the bits of `x` cut to `width` and extended back to comptime's width: sign
+# extended for a signed width, zero extended otherwise
+pub fun at_width(x: wide.Wide, width: u32, signed: bool) wide.Wide {
+    if (width >= WIDTH) { ret x; }
+    # a value already in the width's range is its own cut, so no fold is asked for it
+    if (signed && wide.fits_signed(x, width))    { ret x; }
+    if (!signed && wide.fits_unsigned(x, width)) { ret x; }
+    val cut:  Answer = fold_op(opcodes.TRUNC, Kind.integer{WIDTH}, [3]wide.Wide{x, wide.zero(), wide.zero()}, 1, opt[Kind].some{Kind.integer{width}}, target_facts.nans_none());
+    var back: Opcode = opcodes.EXT_U;
+    if (signed) { back = opcodes.EXT_S; }
+    ret first(fold_op(back, Kind.integer{width}, [3]wide.Wide{first(cut), wide.zero(), wide.zero()}, 1, opt[Kind].some{Kind.integer{WIDTH}}, target_facts.nans_none()));
+}

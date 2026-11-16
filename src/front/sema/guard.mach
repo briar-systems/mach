@@ -1,0 +1,499 @@
+use A: std.allocator;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.fail;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.base.stack;
+use mach.base.wide;
+use mach.front.ast;
+use ast_decl: mach.front.ast.decl;
+use ast_expr: mach.front.ast.expr;
+use ast_id:   mach.front.ast.id;
+use ast_stmt: mach.front.ast.stmt;
+use mach.front.comptime;
+use comptime_failure: mach.front.comptime.failure;
+use comptime_value:   mach.front.comptime.value;
+use mach.front.resolve;
+use sema_context: mach.front.sema.context;
+use report_phase: mach.report.phase;
+use mach.type;
+use type_field: mach.type.field;
+use type_kind:  mach.type.kind;
+
+# a tag payload place `P.c` is readable, writable and addressable only inside a lexical guard for
+# that place and case. guards are frames on the caller's stack linked through the sema context;
+# the walker that opens one closes it when its lexical region ends, so no flow fact is ever kept.
+
+pub fun push(sc: *sema_context.SemaContext, frame: *sema_context.Guard, place: ast_id.ExprId, case_name: intern.StrId) {
+    frame.place     = place;
+    frame.case_name = case_name;
+    frame.prev      = sc.walk.guards;
+    sc.walk.guards  = frame;
+}
+
+pub fun end(sc: *sema_context.SemaContext, frame: *sema_context.Guard) {
+    sc.walk.guards = frame.prev;
+}
+
+# opens a guard for `P.c` when the condition is exactly `sel P.c`
+pub fun sel_begin(sc: *sema_context.SemaContext, cond: ast_id.ExprId, frame: *sema_context.Guard) res[bool, fail.Fail] {
+    var neg:        bool                 = false;
+    var place:      ast_id.ExprId        = ast_id.EXPR_NIL;
+    var case_name:  intern.StrId         = intern.STR_NIL;
+    val res_tested: res[bool, fail.Fail] = sel_test(sc, cond, ?neg, ?place, ?case_name);
+    if (sel res_tested.err)    { ret res_tested; }
+    if (!res_tested.ok || neg) { ret res[bool, fail.Fail].ok{false}; }
+    push(sc, frame, place, case_name);
+    ret res[bool, fail.Fail].ok{true};
+}
+
+pub fun guarded(sc: *sema_context.SemaContext, place: ast_id.ExprId, case_name: intern.StrId) res[bool, fail.Fail] {
+    var g: *sema_context.Guard = sc.walk.guards;
+    for (g != nil) {
+        if (intern.str_same(g.case_name, case_name)) {
+            val res_same: res[bool, fail.Fail] = place_equal(sc, g.place, place);
+            if (sel res_same.err) { ret res_same; }
+            if (res_same.ok)      { ret res_same; }
+        }
+        g = g.prev;
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+# a chain whose arms all test one place with `sel` or `!sel` and all exit leaves the block knowing
+# which cases remain; when exactly one remains the rest of the block is guarded for it
+pub fun exit_chain_begin(sc: *sema_context.SemaContext, sid: ast_id.StmtId, frame: *sema_context.Guard) res[bool, fail.Fail] {
+    var place:           ast_id.ExprId        = ast_id.EXPR_NIL;
+    var tail:            ast_id.StmtId        = ast_id.STMT_NIL;
+    val res_chain_place: res[bool, fail.Fail] = chain_place(sc, sid, true, ?place, ?tail);
+    if (sel res_chain_place.err)                          { ret res_chain_place; }
+    if (!res_chain_place.ok || !ast_id.stmt_is_nil(tail)) { ret res[bool, fail.Fail].ok{false}; }
+    ret remaining_begin(sc, sid, place, frame);
+}
+
+# a chain whose arms all test one place with `sel` or `!sel` reaches its final bare `or` knowing
+# which cases remain, exiting or not; when exactly one remains the `or` body is guarded for it,
+# as the rest of the block is after a chain that exits
+pub fun final_or_begin(sc: *sema_context.SemaContext, sid: ast_id.StmtId, frame: *sema_context.Guard) res[bool, fail.Fail] {
+    var place:           ast_id.ExprId        = ast_id.EXPR_NIL;
+    var tail:            ast_id.StmtId        = ast_id.STMT_NIL;
+    val res_chain_place: res[bool, fail.Fail] = chain_place(sc, sid, false, ?place, ?tail);
+    if (sel res_chain_place.err)                         { ret res_chain_place; }
+    if (!res_chain_place.ok || ast_id.stmt_is_nil(tail)) { ret res[bool, fail.Fail].ok{false}; }
+    ret remaining_begin(sc, sid, place, frame);
+}
+
+# the place every arm of the chain from `sid` tests with `sel` or `!sel`, each arm exiting when
+# `exiting`; `tail` is the body of the chain's final bare `or`, nil when it has none. false when
+# an arm tests anything else, tests another place, or falls through where it must exit
+fun chain_place(sc: *sema_context.SemaContext, sid: ast_id.StmtId, exiting: bool, place: *ast_id.ExprId, tail: *ast_id.StmtId) res[bool, fail.Fail] {
+    @place = ast_id.EXPR_NIL;
+    @tail  = ast_id.STMT_NIL;
+    var cur: ast_id.StmtId = sid;
+    for (!ast_id.stmt_is_nil(cur)) {
+        val opt_stmt: opt[*ast_stmt.Stmt] = ast.get_stmt(sc.view.a, cur);
+        if (!sel opt_stmt.some) { ret res[bool, fail.Fail].ok{false}; }
+        val s: *ast_stmt.Stmt = opt_stmt.some;
+        if (s.kind != ast_stmt.STMT_KIND_IF) {
+            # only an `or` can follow an arm, so a statement that is not an arm is the chain's bare `or`
+            if (ast_id.stmt_same(cur, sid)) { ret res[bool, fail.Fail].ok{false}; }
+            @tail = cur;
+            brk;
+        }
+        var neg:        bool                 = false;
+        var arm_place:  ast_id.ExprId        = ast_id.EXPR_NIL;
+        var arm_case:   intern.StrId         = intern.STR_NIL;
+        val res_tested: res[bool, fail.Fail] = sel_test(sc, s.data.if_.cond, ?neg, ?arm_place, ?arm_case);
+        if (sel res_tested.err)         { ret res_tested; }
+        if (!res_tested.ok)             { ret res[bool, fail.Fail].ok{false}; }
+        if (ast_id.expr_is_nil(@place)) { @place = arm_place; }
+        or {
+            val res_same: res[bool, fail.Fail] = place_equal(sc, @place, arm_place);
+            if (sel res_same.err) { ret res_same; }
+            if (!res_same.ok)     { ret res[bool, fail.Fail].ok{false}; }
+        }
+        if (exiting && !stmt_exits(sc, s.data.if_.then_block, 0)) { ret res[bool, fail.Fail].ok{false}; }
+        cur = s.data.if_.else_block;
+    }
+    ret res[bool, fail.Fail].ok{!ast_id.expr_is_nil(@place)};
+}
+
+# guards `place` for the one case of its tag the chain from `sid` leaves untested, if exactly one
+fun remaining_begin(sc: *sema_context.SemaContext, sid: ast_id.StmtId, place: ast_id.ExprId, frame: *sema_context.Guard) res[bool, fail.Fail] {
+    val tag_ty: type_kind.TypeId = type.strip_secret(?sc.s.types, tested_type(sc, place));
+    if (!type.is_tag(?sc.s.types, tag_ty)) { ret res[bool, fail.Fail].ok{false}; }
+    val count: u32 = type.field_count(?sc.s.types, tag_ty);
+
+    var remaining: u32          = 0;
+    var last:      intern.StrId = intern.STR_NIL;
+    var k:         u32          = 0;
+    for (k < count) {
+        val opt_field_at: opt[*type_field.Entry] = type.field_at(?sc.s.types, tag_ty, k);
+        if (!sel opt_field_at.some) { ret res[bool, fail.Fail].ok{false}; }
+        val name:         intern.StrId         = opt_field_at.some.name;
+        val res_possible: res[bool, fail.Fail] = case_possible(sc, sid, name);
+        if (sel res_possible.err) { ret res_possible; }
+        if (res_possible.ok) {
+            remaining = remaining + 1;
+            last      = name;
+        }
+        k = k + 1;
+    }
+    if (remaining != 1) { ret res[bool, fail.Fail].ok{false}; }
+    push(sc, frame, place, last);
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# whole-value assignment to a guarded place, or to an object it is reached through, replaces the case
+pub fun check_assign(sc: *sema_context.SemaContext, lhs: ast_id.ExprId, span: base_source.Span) {
+    var g: *sema_context.Guard = sc.walk.guards;
+    for (g != nil) {
+        val res_covered: res[bool, fail.Fail] = covers(sc, lhs, g.place);
+        if (sel res_covered.err) { ret; }
+        if (res_covered.ok) {
+            val opt_name: opt[str] = intern.get(?sc.s.interner, g.case_name);
+            if (sel opt_name.none) {
+                sema_context.report_internal(sc, span, fail.message("a guard's case name is not interned"));
+                ret;
+            }
+            sema_context.reportf(sc, diagnostic_kind.GUARD_ASSIGN, span,
+                "cannot assign to this place inside a guard for its `{}` payload; rebind the new value to a new name", opt_name.some);
+            ret;
+        }
+        g = g.prev;
+    }
+}
+
+fun covers(sc: *sema_context.SemaContext, lhs: ast_id.ExprId, place: ast_id.ExprId) res[bool, fail.Fail] {
+    # a pointer place guards its pointee, so reassigning the pointer or anything it hangs off
+    # does not replace the case, exactly as with an explicit dereference
+    if (type.is_pointer(?sc.s.types, place_type(sc, place))) { ret res[bool, fail.Fail].ok{false}; }
+    # a range writes every element it spans, so it covers any element of its object
+    val res_spanned: res[ast_id.ExprId, fail.Fail] = range_object(sc, lhs);
+    if (sel res_spanned.err) { ret res[bool, fail.Fail].err{res_spanned.err}; }
+    var cur: ast_id.ExprId = place;
+    for (!ast_id.expr_is_nil(cur)) {
+        val res_same: res[bool, fail.Fail] = place_equal(sc, lhs, cur);
+        if (sel res_same.err) { ret res_same; }
+        if (res_same.ok)      { ret res_same; }
+        val res_obj: res[ast_id.ExprId, fail.Fail] = object_of(sc, cur);
+        if (sel res_obj.err) { ret res[bool, fail.Fail].err{res_obj.err}; }
+        if (!ast_id.expr_is_nil(res_spanned.ok) && !ast_id.expr_is_nil(res_obj.ok)) {
+            val res_indexed: res[bool, fail.Fail] = index_of(sc, cur);
+            if (sel res_indexed.err) { ret res_indexed; }
+            if (res_indexed.ok) {
+                val res_spans: res[bool, fail.Fail] = place_equal(sc, res_spanned.ok, res_obj.ok);
+                if (sel res_spans.err) { ret res_spans; }
+                if (res_spans.ok)      { ret res_spans; }
+            }
+        }
+        cur = res_obj.ok;
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+# the object a range `x[i, n]` spans, nil for any other expression
+fun range_object(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[ast_id.ExprId, fail.Fail] {
+    val res_expr: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, eid);
+    if (sel res_expr.err) { ret res[ast_id.ExprId, fail.Fail].err{res_expr.err}; }
+    var e: ast_expr.Expr = res_expr.ok;
+    if (e.kind != ast_expr.EXPR_KIND_INDEX || !ast_expr.is_range(?e.data.index)) { ret res[ast_id.ExprId, fail.Fail].ok{ast_id.EXPR_NIL}; }
+    ret res[ast_id.ExprId, fail.Fail].ok{e.data.index.object};
+}
+
+fun index_of(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[bool, fail.Fail] {
+    val res_expr: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, eid);
+    if (sel res_expr.err) { ret res[bool, fail.Fail].err{res_expr.err}; }
+    ret res[bool, fail.Fail].ok{res_expr.ok.kind == ast_expr.EXPR_KIND_INDEX};
+}
+
+# the object a field, projection or index is reached through; a dereference, explicit or the
+# implicit one of a pointer receiver, ends the chain because reassigning the pointer does not
+# write the tag
+fun object_of(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[ast_id.ExprId, fail.Fail] {
+    val res_expr: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, eid);
+    if (sel res_expr.err) { ret res[ast_id.ExprId, fail.Fail].err{res_expr.err}; }
+    val e:      ast_expr.Expr = res_expr.ok;
+    var object: ast_id.ExprId = ast_id.EXPR_NIL;
+    if (e.kind == ast_expr.EXPR_KIND_MEMBER)                                                 { object = e.data.member.object; }
+    if (e.kind == ast_expr.EXPR_KIND_PROJECT)                                                { object = e.data.project.object; }
+    if (e.kind == ast_expr.EXPR_KIND_INDEX)                                                  { object = e.data.index.object; }
+    if (!ast_id.expr_is_nil(object) && type.is_pointer(?sc.s.types, place_type(sc, object))) { ret res[ast_id.ExprId, fail.Fail].ok{ast_id.EXPR_NIL}; }
+    ret res[ast_id.ExprId, fail.Fail].ok{object};
+}
+
+fun sel_test(sc: *sema_context.SemaContext, cond: ast_id.ExprId, neg: *bool, place: *ast_id.ExprId, case_name: *intern.StrId) res[bool, fail.Fail] {
+    if (ast_id.expr_is_nil(cond)) { ret res[bool, fail.Fail].ok{false}; }
+    val res_cond: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, cond);
+    if (sel res_cond.err) { ret res[bool, fail.Fail].err{res_cond.err}; }
+    var e: ast_expr.Expr = res_cond.ok;
+    @neg = false;
+    if (e.kind == ast_expr.EXPR_KIND_UNARY && e.data.unary.op == ast_expr.UN_NOT) {
+        val res_inner: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, e.data.unary.operand);
+        if (sel res_inner.err) { ret res[bool, fail.Fail].err{res_inner.err}; }
+        e    = res_inner.ok;
+        @neg = true;
+    }
+    if (e.kind != ast_expr.EXPR_KIND_SEL) { ret res[bool, fail.Fail].ok{false}; }
+    val name: intern.StrId = sel_case_name(sc, ?e.data.sel);
+    if (intern.str_is_nil(name)) { ret res[bool, fail.Fail].ok{false}; }
+    @place     = e.data.sel.place;
+    @case_name = name;
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# the case a `sel` names, spelled directly or through a comptime case descriptor; STR_NIL when the
+# descriptor does not evaluate, which type checking reports at the `sel` itself
+fun sel_case_name(sc: *sema_context.SemaContext, s: *ast_expr.ExprSel) intern.StrId {
+    if (ast_id.expr_is_nil(s.case_desc)) { ret case_id(sc, s.case_name); }
+    val res_evaluate: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime.evaluate[sema_context.SemaContext](sc.view.ctx, sc, sc.typing.caps, sc.view.a, sc.view.source, s.case_desc, ?sc.s.interner);
+    sema_context.record_eval_result(sc, res_evaluate);
+    if (sel res_evaluate.err) { ret intern.STR_NIL; }
+    val desc: comptime_value.CTValue = res_evaluate.ok;
+    if (desc.kind != comptime_value.CT_KIND_CASE) { ret intern.STR_NIL; }
+    val opt_field_at: opt[*type_field.Entry] = type.field_at(?sc.s.types, desc.data.fld.owner::type_kind.TypeId, desc.data.fld.index);
+    if (!sel opt_field_at.some) { ret intern.STR_NIL; }
+    ret opt_field_at.some.name;
+}
+
+fun case_possible(sc: *sema_context.SemaContext, chain: ast_id.StmtId, name: intern.StrId) res[bool, fail.Fail] {
+    var cur: ast_id.StmtId = chain;
+    for (!ast_id.stmt_is_nil(cur)) {
+        val opt_stmt: opt[*ast_stmt.Stmt] = ast.get_stmt(sc.view.a, cur);
+        if (!sel opt_stmt.some) { ret res[bool, fail.Fail].ok{false}; }
+        val s: *ast_stmt.Stmt = opt_stmt.some;
+        # the chain's arms end at its bare `or`
+        if (s.kind != ast_stmt.STMT_KIND_IF) { brk; }
+        var neg:        bool                 = false;
+        var arm_place:  ast_id.ExprId        = ast_id.EXPR_NIL;
+        var arm_case:   intern.StrId         = intern.STR_NIL;
+        val res_tested: res[bool, fail.Fail] = sel_test(sc, s.data.if_.cond, ?neg, ?arm_place, ?arm_case);
+        if (sel res_tested.err)                      { ret res_tested; }
+        if (!res_tested.ok)                          { ret res[bool, fail.Fail].ok{false}; }
+        if (!neg && intern.str_same(arm_case, name)) { ret res[bool, fail.Fail].ok{false}; }
+        if (neg && !intern.str_same(arm_case, name)) { ret res[bool, fail.Fail].ok{false}; }
+        cur = s.data.if_.else_block;
+    }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# every reachable path through the statement leaves by `ret`, or by `brk`/`cnt` targeting a loop
+# outside it; `loops` counts the loops entered since the statement of interest
+fun stmt_exits(sc: *sema_context.SemaContext, sid: ast_id.StmtId, loops: u32) bool {
+    if (ast_id.stmt_is_nil(sid)) { ret false; }
+    val opt_stmt: opt[*ast_stmt.Stmt] = ast.get_stmt(sc.view.a, sid);
+    if (!sel opt_stmt.some) { ret false; }
+    val s: *ast_stmt.Stmt    = opt_stmt.some;
+    val k: ast_stmt.StmtKind = s.kind;
+    if (stack.exhausted()) {
+        sema_context.refuse_nesting(sc, s.span);
+        ret false;
+    }
+    if (k == ast_stmt.STMT_KIND_RET)                                { ret true; }
+    if (k == ast_stmt.STMT_KIND_BRK || k == ast_stmt.STMT_KIND_CNT) { ret loops == 0; }
+    if (k == ast_stmt.STMT_KIND_BLOCK)                              { ret list_exits(sc, s.data.block.stmts_start, s.data.block.stmts_len, loops); }
+    if (k == ast_stmt.STMT_KIND_FOR) {
+        # a conditional loop runs zero times when its condition starts false and falls through, so
+        # only an unconditional one can exit; inside it a `brk` or `cnt` targets the loop, not the chain
+        if (!ast_id.expr_is_nil(s.data.for_.cond)) { ret false; }
+        ret stmt_exits(sc, s.data.for_.body, loops + 1);
+    }
+    if (k == ast_stmt.STMT_KIND_IF) {
+        if (ast_id.stmt_is_nil(s.data.if_.else_block)) { ret false; }
+        ret stmt_exits(sc, s.data.if_.then_block, loops) && stmt_exits(sc, s.data.if_.else_block, loops);
+    }
+    if (k == ast_stmt.STMT_KIND_COMPTIME_IF) {
+        var closed: bool = false;
+        var b:      u32  = 0;
+        for (b < s.data.comptime_if.branches_len) {
+            val br: *ast_decl.ComptimeBranch = ?sc.view.a.comptime_branches.data[s.data.comptime_if.branches_start + b];
+            if (ast_id.expr_is_nil(br.cond))                        { closed = true; }
+            if (!list_exits(sc, br.body_start, br.body_len, loops)) { ret false; }
+            b = b + 1;
+        }
+        ret closed;
+    }
+    ret false;
+}
+
+fun list_exits(sc: *sema_context.SemaContext, start: u32, len: u32, loops: u32) bool {
+    var i: u32 = 0;
+    for (i < len) {
+        if (stmt_exits(sc, sc.view.a.stmt_ids.data[start + i], loops)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the spelling rule `place_equal` implements, enforced where a guard place is written so an
+# unmatchable place is rejected at the `sel` rather than at every read inside the region
+pub fun check_stable(sc: *sema_context.SemaContext, place: ast_id.ExprId, span: base_source.Span) bool {
+    val res_unstable: res[ast_id.ExprId, fail.Fail] = unstable_part(sc, place);
+    if (sel res_unstable.err) { ret false; }
+    val bad: ast_id.ExprId = res_unstable.ok;
+    if (ast_id.expr_is_nil(bad)) { ret true; }
+    val res_bad_expr: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, bad);
+    if (sel res_bad_expr.err) { ret false; }
+    val opt_text: opt[str] = span_text(sc, res_bad_expr.ok.span);
+    if (!sel opt_text.some) {
+        if (!sel sc.status.kind.internal) {
+            sema_context.report(sc, diagnostic_kind.GUARD_UNSTABLE_PLACE, span, "`sel` names a place matched by its spelling; bind any computed part of it to a name first");
+        }
+        ret false;
+    }
+    sema_context.reportf(sc, diagnostic_kind.GUARD_UNSTABLE_PLACE, span,
+        "`sel` names a place matched by its spelling, so `{}` cannot appear in it; bind it to a name and write the place over that name",
+        opt_text.some);
+    ret false;
+}
+
+# the first sub-expression of a place that `place_equal` can never match, or nil when the whole
+# place is a path: an identifier, field, projection, dereference, or an index by a name or a literal
+fun unstable_part(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[ast_id.ExprId, fail.Fail] {
+    if (ast_id.expr_is_nil(eid)) { ret res[ast_id.ExprId, fail.Fail].ok{ast_id.EXPR_NIL}; }
+    val res_expr: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, eid);
+    if (sel res_expr.err) { ret res[ast_id.ExprId, fail.Fail].err{res_expr.err}; }
+    val e: ast_expr.Expr     = res_expr.ok;
+    val k: ast_expr.ExprKind = e.kind;
+    if (stack.exhausted())                                              { ret res[ast_id.ExprId, fail.Fail].err{refused(sc, e.span)}; }
+    if (k == ast_expr.EXPR_KIND_IDENT || k == ast_expr.EXPR_KIND_ERROR) { ret res[ast_id.ExprId, fail.Fail].ok{ast_id.EXPR_NIL}; }
+    if (k == ast_expr.EXPR_KIND_MEMBER)                                 { ret unstable_part(sc, e.data.member.object); }
+    if (k == ast_expr.EXPR_KIND_PROJECT) {
+        val res_unstable_subscript: res[ast_id.ExprId, fail.Fail] = unstable_subscript(sc, e.data.project.field);
+        if (sel res_unstable_subscript.err)                 { ret res_unstable_subscript; }
+        if (!ast_id.expr_is_nil(res_unstable_subscript.ok)) { ret res_unstable_subscript; }
+        ret unstable_part(sc, e.data.project.object);
+    }
+    if (k == ast_expr.EXPR_KIND_INDEX) {
+        val res_unstable_subscript: res[ast_id.ExprId, fail.Fail] = unstable_subscript(sc, e.data.index.index);
+        if (sel res_unstable_subscript.err)                 { ret res_unstable_subscript; }
+        if (!ast_id.expr_is_nil(res_unstable_subscript.ok)) { ret res_unstable_subscript; }
+        val res_unstable_subscript_count: res[ast_id.ExprId, fail.Fail] = unstable_subscript(sc, e.data.index.count);
+        if (sel res_unstable_subscript_count.err)                 { ret res_unstable_subscript_count; }
+        if (!ast_id.expr_is_nil(res_unstable_subscript_count.ok)) { ret res_unstable_subscript_count; }
+        ret unstable_part(sc, e.data.index.object);
+    }
+    if (k == ast_expr.EXPR_KIND_UNARY && e.data.unary.op == ast_expr.UN_DEREF) { ret unstable_part(sc, e.data.unary.operand); }
+    ret res[ast_id.ExprId, fail.Fail].ok{eid};
+}
+
+# a subscript is compared by spelling too, so only a name or a literal can stand in one
+fun unstable_subscript(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[ast_id.ExprId, fail.Fail] {
+    if (ast_id.expr_is_nil(eid)) { ret res[ast_id.ExprId, fail.Fail].ok{ast_id.EXPR_NIL}; }
+    val res_expr: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, eid);
+    if (sel res_expr.err) { ret res[ast_id.ExprId, fail.Fail].err{res_expr.err}; }
+    val k: ast_expr.ExprKind = res_expr.ok.kind;
+    if (k == ast_expr.EXPR_KIND_IDENT || k == ast_expr.EXPR_KIND_LIT_INT || k == ast_expr.EXPR_KIND_ERROR) { ret res[ast_id.ExprId, fail.Fail].ok{ast_id.EXPR_NIL}; }
+    ret res[ast_id.ExprId, fail.Fail].ok{eid};
+}
+
+# the nesting refusal a place walk returns, already reported against the node it stands on
+fun refused(sc: *sema_context.SemaContext, span: base_source.Span) fail.Fail {
+    sema_context.refuse_nesting(sc, span);
+    ret fail.reported();
+}
+
+fun span_text(sc: *sema_context.SemaContext, span: base_source.Span) opt[str] {
+    if (span.len == 0) { ret opt[str].none{}; }
+    val res_range_add: res[intern.StrId, A.Error] = intern.range_add(?sc.s.interner, sc.view.source, span.offset, span.len);
+    if (sel res_range_add.err) {
+        sema_context.report_internal(sc, span, fail.refused(res_range_add.err));
+        ret opt[str].none{};
+    }
+    ret intern.get(?sc.s.interner, res_range_add.ok);
+}
+
+# two place expressions name the same storage when they are spelled the same way over the same
+# bindings; this is lexical identity, exactly what a guard region is
+fun place_equal(sc: *sema_context.SemaContext, a: ast_id.ExprId, b: ast_id.ExprId) res[bool, fail.Fail] {
+    if (ast_id.expr_same(a, b))                         { ret res[bool, fail.Fail].ok{true}; }
+    if (ast_id.expr_is_nil(a) || ast_id.expr_is_nil(b)) { ret res[bool, fail.Fail].ok{false}; }
+    val res_expression: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, a);
+    if (sel res_expression.err) { ret res[bool, fail.Fail].err{res_expression.err}; }
+    val res_expr: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, b);
+    if (sel res_expr.err) { ret res[bool, fail.Fail].err{res_expr.err}; }
+    var ea: ast_expr.Expr = res_expression.ok;
+    var eb: ast_expr.Expr = res_expr.ok;
+    if (stack.exhausted())  { ret res[bool, fail.Fail].err{refused(sc, ea.span)}; }
+    if (ea.kind != eb.kind) { ret res[bool, fail.Fail].ok{false}; }
+    val k: ast_expr.ExprKind = ea.kind;
+    if (k == ast_expr.EXPR_KIND_IDENT) { ret res[bool, fail.Fail].ok{same_symbol(sc, a, b)}; }
+    if (k == ast_expr.EXPR_KIND_MEMBER) {
+        if (!span_text_equal(sc, ea.data.member.name, eb.data.member.name)) { ret res[bool, fail.Fail].ok{false}; }
+        ret place_equal(sc, ea.data.member.object, eb.data.member.object);
+    }
+    if (k == ast_expr.EXPR_KIND_PROJECT) {
+        val res_field: res[bool, fail.Fail] = place_equal(sc, ea.data.project.field, eb.data.project.field);
+        if (sel res_field.err) { ret res_field; }
+        if (!res_field.ok)     { ret res_field; }
+        ret place_equal(sc, ea.data.project.object, eb.data.project.object);
+    }
+    if (k == ast_expr.EXPR_KIND_INDEX) {
+        if (ast_expr.is_range(?ea.data.index) != ast_expr.is_range(?eb.data.index)) { ret res[bool, fail.Fail].ok{false}; }
+        if (ast_expr.is_range(?ea.data.index)) {
+            val res_count: res[bool, fail.Fail] = place_equal(sc, ea.data.index.count, eb.data.index.count);
+            if (sel res_count.err) { ret res_count; }
+            if (!res_count.ok)     { ret res_count; }
+        }
+        val res_index: res[bool, fail.Fail] = place_equal(sc, ea.data.index.index, eb.data.index.index);
+        if (sel res_index.err) { ret res_index; }
+        if (!res_index.ok)     { ret res_index; }
+        ret place_equal(sc, ea.data.index.object, eb.data.index.object);
+    }
+    if (k == ast_expr.EXPR_KIND_UNARY) {
+        if (ea.data.unary.op != ast_expr.UN_DEREF || eb.data.unary.op != ast_expr.UN_DEREF) { ret res[bool, fail.Fail].ok{false}; }
+        ret place_equal(sc, ea.data.unary.operand, eb.data.unary.operand);
+    }
+    if (k == ast_expr.EXPR_KIND_LIT_INT) { ret res[bool, fail.Fail].ok{wide.eq(ea.data.lit_int.value, eb.data.lit_int.value)}; }
+    # a `$name` is the base of a comptime path or an intrinsic callee, so it names a compile-time
+    # value and never storage; every remaining kind is not a place and matches nothing
+    ret res[bool, fail.Fail].ok{false};
+}
+
+fun same_symbol(sc: *sema_context.SemaContext, a: ast_id.ExprId, b: ast_id.ExprId) bool {
+    val opt_symbol_for_expr: opt[*resolve.Symbol] = sema_context.symbol_for_expr(sc, a);
+    val opt_b_symbol:        opt[*resolve.Symbol] = sema_context.symbol_for_expr(sc, b);
+    if (!sel opt_symbol_for_expr.some) { ret false; }
+    if (!sel opt_b_symbol.some)        { ret false; }
+    ret opt_symbol_for_expr.some == opt_b_symbol.some;
+}
+
+pub fun span_text_equal(sc: *sema_context.SemaContext, a: base_source.Span, b: base_source.Span) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (sc.view.source[a.offset + i] != sc.view.source[b.offset + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun case_id(sc: *sema_context.SemaContext, span: base_source.Span) intern.StrId {
+    if (span.len == 0) { ret intern.STR_NIL; }
+    val res_range_add: res[intern.StrId, A.Error] = intern.range_add(?sc.s.interner, sc.view.source, span.offset, span.len);
+    if (sel res_range_add.err) {
+        sema_context.report_internal(sc, span, fail.refused(res_range_add.err));
+        ret intern.STR_NIL;
+    }
+    ret res_range_add.ok;
+}
+
+fun place_type(sc: *sema_context.SemaContext, eid: ast_id.ExprId) type_kind.TypeId {
+    if (sc.view.expr_type == nil || ast_id.expr_is_nil(eid) || !sema_context.expr_in_view(sc, eid)) { ret type_kind.TYPE_ERROR; }
+    ret sc.view.expr_type[ast_id.expr_index(eid)];
+}
+
+# the type `sel` tests: a pointer place tests its pointee
+fun tested_type(sc: *sema_context.SemaContext, eid: ast_id.ExprId) type_kind.TypeId {
+    val t: type_kind.TypeId = place_type(sc, eid);
+    if (type.is_pointer(?sc.s.types, t)) { ret type.deref_one(?sc.s.types, t); }
+    ret t;
+}

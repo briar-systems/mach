@@ -1,0 +1,220 @@
+use std.allocator.heap;
+use std.process.exec;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A:          std.allocator;
+use types_path: std.types.path;
+
+use mach.base.diagnostic;
+use mach.base.fail;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.base.source.provider.overlay;
+use session_embed: mach.session.embed;
+use mach.session.module;
+use mach.session.query;
+use mach.session.retention;
+use mach.type;
+use type_query: mach.type.query;
+
+# a file's text as the session loaded it, keyed by the file's index. the source map and the
+# editor hold it across builds, so no released module takes it
+pub val FILE_TEXT: query.Kind = query.Kind{name: "file text", role: query.INPUT, owner: query.KEY_UNOWNED};
+
+# the compiler's state across builds: the stores the phases read and write, each owned and
+# worked by its own module, and the generation of the views borrowed from them
+pub rec Session {
+    view_generation: u64;
+    alloc:           *A.Allocator;
+    build_alloc:     *A.Allocator;
+    # the freeing allocator scratch work draws from and returns to: it outlives
+    # the session and is shared by its codegen workers, so it is safe across
+    # threads. `alloc` unless the session's owner names its root
+    backing: *A.Allocator;
+    # the spans a module's own heap draws from and gives back to, which the session's
+    # owner names for a session that compiles; nil for one that never does
+    spans: *heap.Pool;
+    # the texts every location the session hands out names: its own, or one it shares with
+    # the other sessions of an invocation, which outlives them
+    sources:      *base_source.SourceMap;
+    owns_sources: bool;
+    diags:        diagnostic.DiagnosticStore;
+    interner:     intern.Interner;
+    types:        type.TypeInterner;
+    # the facts derived from the type store, read and written only by mach.type.query
+    type_facts: type_query.Facts;
+
+    queries:        query.QueryDb;
+    parse_sequence: u64;
+
+    # the identities of the modules the session has loaded
+    modules: module.Registry;
+
+    # the open buffers' texts, standing in for their files
+    overlays: overlay.Store;
+
+    embeds: session_embed.EmbedCache;
+
+    # which modules the session keeps products for between builds
+    retention: retention.Retention;
+
+    # the environment the processes the session starts inherit: the process's own unless the
+    # session's owner names another
+    environ: exec.Environment;
+}
+
+# a session holding its own source map
+pub fun init(alloc: *A.Allocator) res[Session, fail.Fail] {
+    ret made(alloc, intern.init(alloc), nil);
+}
+
+# a session whose texts go to `sources`, a map that outlives it, so a location it hands out
+# still names its file once the session is released
+pub fun init_in(alloc: *A.Allocator, sources: *base_source.SourceMap) res[Session, fail.Fail] {
+    ret made(alloc, intern.init(alloc), sources);
+}
+
+# a session whose names are layered over `base` and whose texts go to `sources`: every id
+# `base` has issued names the same string here and every file of `sources` the same text, so
+# what was planned in another session, its manifests and its cells, is read and located here as
+# it was planned. `base` and `sources` outlive the session, and `base` takes no new names while
+# it lives
+pub fun init_over(alloc: *A.Allocator, base: *intern.Interner, sources: *base_source.SourceMap) res[Session, fail.Fail] {
+    ret made(alloc, intern.child_init(base, alloc), sources);
+}
+
+fun made(alloc: *A.Allocator, names: intern.Interner, shared: *base_source.SourceMap) res[Session, fail.Fail] {
+    var s: Session;
+    s.alloc           = alloc;
+    s.parse_sequence  = 0;
+    s.build_alloc     = alloc;
+    s.backing         = alloc;
+    s.spans           = nil;
+    s.view_generation = 1;
+    s.environ         = exec.Environment.inherit{};
+    s.sources         = shared;
+    s.owns_sources    = false;
+    s.diags           = diagnostic.store_init(alloc);
+
+    s.interner = names;
+    s.modules  = module.registry_init(alloc);
+    # each part made so far is released when init does not complete
+    var complete:    bool = false;
+    var has_types:   bool = false;
+    var has_queries: bool = false;
+    fin {
+        if (!complete) {
+            if (has_queries) { query.dnit(?s.queries); }
+            if (has_types)   { type.dnit(?s.types); }
+            intern.dnit(?s.interner);
+            diagnostic.store_dnit(?s.diags);
+            sources_dnit(?s);
+        }
+    }
+    if (shared == nil) {
+        val res_held: res[*base_source.SourceMap, A.Error] = A.allocate[base_source.SourceMap](alloc, 1);
+        if (sel res_held.err) { ret res[Session, fail.Fail].err{fail.refused(res_held.err)}; }
+        s.sources      = res_held.ok;
+        @s.sources     = base_source.init(alloc);
+        s.owns_sources = true;
+    }
+
+    s.overlays   = overlay.store_init(alloc);
+    s.embeds     = session_embed.init(alloc);
+    s.type_facts = type_query.facts_init(alloc);
+
+    val err_types: err[fail.Fail] = type.init(?s.types, alloc);
+    if (sel err_types.err) { ret res[Session, fail.Fail].err{err_types.err}; }
+    has_types = true;
+
+    val res_queries: res[query.QueryDb, fail.Fail] = query.init(alloc);
+    if (sel res_queries.err) { ret res[Session, fail.Fail].err{res_queries.err}; }
+    s.queries   = res_queries.ok;
+    has_queries = true;
+
+    val res_retention: res[retention.Retention, fail.Fail] = retention.init(alloc);
+    if (sel res_retention.err) { ret res[Session, fail.Fail].err{res_retention.err}; }
+    s.retention = res_retention.ok;
+
+    complete = true;
+    ret res[Session, fail.Fail].ok{s};
+}
+
+# release a session and everything it owns; a nil session holds nothing
+pub fun dnit(s: *Session) {
+    if (s == nil) { ret; }
+
+    overlay.store_dnit(?s.overlays);
+
+    module.registry_dnit(?s.modules);
+
+    retention.dnit(?s.retention);
+    query.dnit(?s.queries);
+    session_embed.dnit(?s.embeds);
+    type_query.facts_dnit(?s.type_facts);
+    type.dnit(?s.types);
+    intern.dnit(?s.interner);
+
+    diagnostic.store_dnit(?s.diags);
+    sources_dnit(s);
+}
+
+# release the source map a session owns; a shared one is its invocation's
+fun sources_dnit(s: *Session) {
+    if (!s.owns_sources || s.sources == nil) { ret; }
+    base_source.dnit(s.sources);
+    A.deallocate[base_source.SourceMap](s.alloc, s.sources, 1);
+    s.sources      = nil;
+    s.owns_sources = false;
+}
+
+# a change to the session's inputs or module identities expires every view borrowed from it. exhaustion
+# permanently refuses new borrowed views while teardown remains infallible
+pub fun expire_views(s: *Session) {
+    if (s.view_generation != ~(0::u64)) { s.view_generation = s.view_generation + 1; }
+}
+
+pub fun reset_type_projection(s: *Session) err[fail.Fail] {
+    if (s.queries.operation_active || s.queries.presentation_pending) {
+        ret err[fail.Fail].err{fail.message("cannot replace type projections while query products are borrowed")};
+    }
+    expire_views(s);
+    type.field_projection_reset(?s.types);
+    ret err[fail.Fail].ok{};
+}
+
+pub fun next_parse_incarnation(s: *Session) res[u64, fail.Fail] {
+    if (s.parse_sequence == ~(0::u64)) { ret res[u64, fail.Fail].err{fail.message("parsed source incarnations are exhausted")}; }
+    s.parse_sequence = s.parse_sequence + 1;
+    ret res[u64, fail.Fail].ok{s.parse_sequence};
+}
+
+pub fun load_source(s: *Session, path: str, text: str) res[base_source.FileId, fail.Fail] {
+    val res_key: res[str, fail.Fail] = source_key(s, path);
+    if (sel res_key.err) { ret res[base_source.FileId, fail.Fail].err{res_key.err}; }
+    val key: str = res_key.ok;
+    fin { str_free(s.alloc, key); }
+    if (str_len(text) > 0xFFFFFFFF::usize) { ret res[base_source.FileId, fail.Fail].err{fail.message("source input exceeds the query byte extent")}; }
+    val res_staged: res[base_source.PreparedLoad, base_source.Error] = base_source.prepare_load(s.sources, key, text);
+    if (sel res_staged.err) { ret res[base_source.FileId, fail.Fail].err{fail.source_refused(res_staged.err)}; }
+    var prepared: base_source.PreparedLoad = res_staged.ok;
+    fin { base_source.discard_load(?prepared); }
+    val err_input: err[fail.Fail] = query.set_input(?s.queries, ?FILE_TEXT, base_source.file_index(prepared.id)::u64, text::*u8, str_len(text)::u32);
+    if (sel err_input.err) { ret res[base_source.FileId, fail.Fail].err{err_input.err}; }
+    if (prepared.changed)  { expire_views(s); }
+    ret res[base_source.FileId, fail.Fail].ok{base_source.commit_load(?prepared)};
+}
+
+fun source_key(s: *Session, path: str) res[str, fail.Fail] {
+    val res_cleaned: res[str, A.Error] = types_path.clean(s.alloc, path);
+    if (sel res_cleaned.err) { ret res[str, fail.Fail].err{fail.refused(res_cleaned.err)}; }
+    ret res[str, fail.Fail].ok{res_cleaned.ok};
+}

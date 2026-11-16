@@ -1,0 +1,358 @@
+# mach.front.parser.state
+
+## def ParseFailKind
+
+```mach
+pub def ParseFailKind: u8
+```
+
+## val PARSE_FAIL_OOM
+
+```mach
+pub val PARSE_FAIL_OOM:   ParseFailKind = 0
+```
+
+## val PARSE_FAIL_ICE
+
+```mach
+pub val PARSE_FAIL_ICE:   ParseFailKind = 1
+```
+
+## val PARSE_FAIL_DIAG
+
+```mach
+pub val PARSE_FAIL_DIAG:  ParseFailKind = 2
+```
+
+## val PARSE_FAIL_DEPTH
+
+```mach
+pub val PARSE_FAIL_DEPTH: ParseFailKind = 3
+```
+
+## rec ParseFail
+
+```mach
+pub rec ParseFail;
+```
+
+## rec Parser
+
+```mach
+pub rec Parser;
+```
+
+names: the interner every name the tree holds an id of is interned in. it outlives the tree
+       and never takes a string back, so each id stays the name's for as long as the tree lives
+
+## val MAX_NEST_DEPTH
+
+```mach
+pub val MAX_NEST_DEPTH: usize = 2048
+```
+
+the deepest nesting the parser will descend into, a sanity limit. the stack
+is guarded by the margin check in descend (mach.base.stack), which refuses
+first wherever the stack runs short of this. it is not the semantic limit:
+the recursive-type checker refuses at 1024 (REACHES_MAX_DEPTH in
+front/sema/infer.mach) with a message that says what to do about it, so the
+parser must sit above that or sema never gets to speak. the compiler's own
+source and the standard library reach 14.
+
+## fun init
+
+```mach
+pub fun init(tokens: *front_lexer.TokenStream, out: *ast.Ast, names: *intern.Interner, diags: *diagnostic.DiagnosticStore) Parser;
+```
+
+## fun current
+
+```mach
+pub fun current(p: *Parser) token.Token;
+```
+
+## fun peek
+
+```mach
+pub fun peek(p: *Parser, offset: usize) token.Token;
+```
+
+## fun advance
+
+```mach
+pub fun advance(p: *Parser) token.Token;
+```
+
+## fun name_id
+
+```mach
+pub fun name_id(p: *Parser, span: base_source.Span) intern.StrId;
+```
+
+the id of the name `span` covers; a refused intern is fatal, and its name is STR_NIL
+
+## fun at
+
+```mach
+pub fun at(p: *Parser, kind: token.Kind) bool;
+```
+
+## fun at_kw
+
+```mach
+pub fun at_kw(p: *Parser, kw: str) bool;
+```
+
+## fun at_eof
+
+```mach
+pub fun at_eof(p: *Parser) bool;
+```
+
+## fun at_decl_start
+
+```mach
+pub fun at_decl_start(p: *Parser) bool;
+```
+
+## fun eat
+
+```mach
+pub fun eat(p: *Parser, kind: token.Kind) bool;
+```
+
+## fun eat_kw
+
+```mach
+pub fun eat_kw(p: *Parser, kw: str) bool;
+```
+
+## fun expect
+
+```mach
+pub fun expect(p: *Parser, kind: token.Kind, message: str) bool;
+```
+
+## fun previous
+
+```mach
+pub fun previous(p: *Parser) token.Token;
+```
+
+## fun expect_end
+
+```mach
+pub fun expect_end(p: *Parser, kind: token.Kind, message: str) token.Token;
+```
+
+## fun failure
+
+```mach
+pub fun failure(f: ParseFail) fail.Fail;
+```
+
+## fun diag_mark
+
+```mach
+pub fun diag_mark(p: *Parser) usize;
+```
+
+## fun diag_discard
+
+```mach
+pub fun diag_discard(p: *Parser, m: usize);
+```
+
+## fun diag_flush
+
+```mach
+pub fun diag_flush(p: *Parser, m: usize);
+```
+
+the reading that recorded these is the parse, so they are real. inside an
+enclosing deciding walk they stay in the buffer, because that walk may yet
+lose and take them with it; at the top they go to the sink, in order.
+
+## fun diag_dnit
+
+```mach
+pub fun diag_dnit(p: *Parser, alloc: *A.Allocator);
+```
+
+## fun error_at_current
+
+```mach
+pub fun error_at_current(p: *Parser, k: diagnostic_kind.Kind, message: str);
+```
+
+## fun error_recover_advance
+
+```mach
+pub fun error_recover_advance(p: *Parser, k: diagnostic_kind.Kind, message: str);
+```
+
+## fun error_at
+
+```mach
+pub fun error_at(p: *Parser, k: diagnostic_kind.Kind, span: base_source.Span, message: str);
+```
+
+## fun error_naming
+
+```mach
+pub fun error_naming(p: *Parser, k: diagnostic_kind.Kind, span: base_source.Span, fmt: str, name: base_source.Span);
+```
+
+an error at `span` whose text fills the one `{}` of `fmt` with the source
+text of `name`. it leaves panic alone, so the reading goes on where it
+stands. the text is released once the store holds its own copy, so it is
+never buffered: a caller reads outside every deciding walk
+
+## fun fatal_oom_at
+
+```mach
+pub fun fatal_oom_at(p: *Parser, span: base_source.Span);
+```
+
+## fun fatal_ice_at
+
+```mach
+pub fun fatal_ice_at(p: *Parser, span: base_source.Span, message: str);
+```
+
+## fun probed_init
+
+```mach
+pub fun probed_init(p: *Parser, alloc: *A.Allocator);
+```
+
+a token position where the index reading of `name[` has already been tried
+and did not parse. the verdict is about tokens alone, so it survives any
+rollback, and without it a malformed chain re-derives the same failure at
+every level and doubles with depth.
+
+## fun probed_dnit
+
+```mach
+pub fun probed_dnit(p: *Parser, alloc: *A.Allocator);
+```
+
+## fun index_reading_failed_here
+
+```mach
+pub fun index_reading_failed_here(p: *Parser, at: usize) bool;
+```
+
+## fun record_index_reading_failed
+
+```mach
+pub fun record_index_reading_failed(p: *Parser, at: usize);
+```
+
+## fun descend
+
+```mach
+pub fun descend(p: *Parser) bool;
+```
+
+## fun ascend
+
+```mach
+pub fun ascend(p: *Parser);
+```
+
+## fun ast_mark
+
+```mach
+pub fun ast_mark(p: *Parser) ast.AstMark;
+```
+
+## fun ast_rollback
+
+```mach
+pub fun ast_rollback(p: *Parser, m: ast.AstMark);
+```
+
+## fun sync_to
+
+```mach
+pub fun sync_to(p: *Parser, k0: token.Kind, k1: token.Kind, k2: token.Kind);
+```
+
+## fun sync_to_body
+
+```mach
+pub fun sync_to_body(p: *Parser, k0: token.Kind, k1: token.Kind, k2: token.Kind);
+```
+
+## fun sync_to_decl
+
+```mach
+pub fun sync_to_decl(p: *Parser);
+```
+
+## fun span_of
+
+```mach
+pub fun span_of(start: base_source.Span, end: base_source.Span) base_source.Span;
+```
+
+## fun push_expr
+
+```mach
+pub fun push_expr(p: *Parser, e: ast_expr.Expr) ast_id.ExprId;
+```
+
+## fun push_stmt
+
+```mach
+pub fun push_stmt(p: *Parser, s: ast_stmt.Stmt) ast_id.StmtId;
+```
+
+## fun push_decl
+
+```mach
+pub fun push_decl(p: *Parser, d: ast_decl.Decl) ast_id.DeclId;
+```
+
+## fun push_type
+
+```mach
+pub fun push_type(p: *Parser, t: ast_type.Type) ast_id.TypeId;
+```
+
+## fun push_module
+
+```mach
+pub fun push_module(p: *Parser, m: ast_module.Module) ast_id.ModuleNodeId;
+```
+
+## fun list_init
+
+```mach
+pub fun list_init[T](p: *Parser) Vector[T];
+```
+
+a list gathered while its length is unknown, then flushed into its AST table in one run
+
+## fun list_push
+
+```mach
+pub fun list_push[T](p: *Parser, b: *Vector[T], x: T);
+```
+
+## fun list_dnit
+
+```mach
+pub fun list_dnit[T](p: *Parser, b: *Vector[T]);
+```
+
+## fun list_flush
+
+```mach
+pub fun list_flush[T](p: *Parser, b: *Vector[T], table: *Vector[T], out_len: *u32) u32;
+```
+
+appends the gathered list to `table`, frees it, and answers where it starts in the
+table, with its length in `out_len`
+

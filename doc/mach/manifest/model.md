@@ -1,0 +1,479 @@
+# mach.manifest.model
+
+## rec NameList
+
+```mach
+pub rec NameList;
+```
+
+the names one of a profile's set keys lists, as written: the build checks
+each against the catalog it names into
+
+items: the names, nil when the key is absent or empty
+sites: where each is written, parallel to `items`
+count: how many
+
+## def SimdMode
+
+```mach
+pub def SimdMode: u8
+```
+
+what happens when a vector operator has no packed instruction on the target,
+decoded from `[profile.<name>].simd`
+
+## val SIMD_SCALARIZE
+
+```mach
+pub val SIMD_SCALARIZE: SimdMode = 0
+```
+
+`simd = "scalarize"`: emit the scalar expansion
+
+## val SIMD_REQUIRE
+
+```mach
+pub val SIMD_REQUIRE: SimdMode = 1
+```
+
+`simd = "require"`: a missing packed instruction is a build error
+
+## fun simd_named
+
+```mach
+pub fun simd_named(name: str) opt[SimdMode];
+```
+
+the mode `name` names, as a manifest and the command line write it; none for
+any other name
+
+## rec TargetDef
+
+```mach
+pub rec TargetDef;
+```
+
+one `[target.<name>]` table as parsed; the string fields hold interned copies of
+the manifest text, unvalidated against the target registry
+
+name: the table key; a portable identifier, never `native`
+env: the `env` key, or STR_NIL when absent; parse checks only that it is a
+               non-empty string, the architecture validates the value later
+arch: the required `arch` key
+isa: the `isa` key, the instruction set every machine of the target has,
+               or STR_NIL for the architecture's default
+sys: the required `sys` key
+abi: the required `abi` key
+of: the `of` object-format override, or STR_NIL when absent
+platform: the `platform` tag, or STR_NIL when absent
+code_model: the `code_model` key, mirl's psABI name of the code model, or STR_NIL
+               for mirl's default; mirl refuses a model the target does not offer
+base: the `base` load address, 0 when absent
+stack_reserve: the `stack_reserve` byte count, 0 when absent
+stack_commit: the `stack_commit` byte count, 0 when absent
+ext: the `ext` names, each an identifier and listed once; the architecture
+               refuses a name its vocabulary does not hold when the target resolves
+ext_count: how many of `ext` are set
+runner: the `runner` argv templates the target's programs are launched
+               through; nil when absent. freed by `dnit`
+runner_count: length of `runner`
+runner_at: where each `runner` entry is written
+at: where the table's key is written
+
+## rec Origin
+
+```mach
+pub rec Origin;
+```
+
+where a value a refusal names was written: in a manifest table, or by `--set` for one
+invocation. a refusal of the value leads with `named` and points at `at`, so it sends the user
+to the text that wrote it
+
+named: the value as a refusal names it, `mach.toml: [target.x].base` or `--set base`, nil
+       where the key was not written
+at: where the value is written, resolved in its manifest or in the `--set` text
+
+## rec ArtifactDef
+
+```mach
+pub rec ArtifactDef;
+```
+
+one `[artifact.<name>]` table as parsed. the three arrays are owned by the
+manifest and freed by `dnit`
+
+name: the table key; a portable identifier
+kind: the required `kind` key, as mink's output kinds spell it
+entry: the required `entry` key, a project-relative path under `[project].src`
+out: the `out` key, an unexpanded path template relative to the project root;
+               `{project.work}` places the output under the work directory. STR_NIL for an
+               object artifact, whose objects stay under obj/
+targets: the required `targets` array of declared target names or "*"; nil when empty
+target_count: length of `targets`
+link: the `link` array of `[link.<name>]` names; nil when absent or empty
+link_count: length of `link`
+need: category-qualified step and artifact names or globs; nil when absent or empty
+need_count: length of `need`
+is_default: `default = true`: the artifact is in the default selection; false
+               when the key is absent
+is_export: `export = true`: the library a bare `use <id>;` binds and whose
+               requirements travel to consumers; at most one artifact sets it
+linkage: the `linkage` key, the name of mink's executable output kind, which mink
+               resolves against the target's host; nil when absent, which takes the
+               target's default; `bin` artifacts only
+linkage_from: where `linkage` was written
+subsystem: the `subsystem` key as mink spells the PE subsystem, console when absent
+icon: the `icon` path, or STR_NIL when absent; `bin` artifacts only
+app_manifest: the `manifest` path, or STR_NIL when absent; `bin` artifacts only
+sections: the `sections` key, the output sections the link places ahead of the
+               rest, in order; nil when absent
+section_count: length of `sections`
+sections_at: where each `sections` entry is written, parallel to `sections`
+size: the `size` key, the most bytes the image loads from its base, none
+               when absent
+size_at: where its `size` value is written, the zero place when absent
+regions: the `[artifact.X.region.<name>]` tables, the memory regions the link
+               lays sections into; nil when none is written
+region_count: length of `regions`
+at: where the table's key is written
+kind_at: where its `kind` value is written
+default_at: where its `default` value is written, the zero place when absent
+export_at: where its `export` value is written, the zero place when absent
+entry_at: where its `entry` value is written
+out_at: where its `out` value is written
+targets_at: where its `targets` value is written
+link_at: where each `link` entry is written, parallel to `link`
+need_at: where each `need` entry is written, parallel to `need`
+
+## rec RegionDef
+
+```mach
+pub rec RegionDef;
+```
+
+one `[artifact.X.region.<name>]` memory region as parsed, laid out as a linker script's
+MEMORY lays one
+
+name: the table key; a portable identifier
+origin: the required `origin` key, the address it starts at
+length: the required `length` key, the bytes it spans
+access: the required `access` key, of mink's layout READABLE, WRITABLE and
+            EXECUTABLE, written as the letters r, w and x
+run: the `run` key, the output sections that run in it; nil when absent
+run_count: length of `run`
+load: the `load` key, the output sections whose bytes load in it and run in
+            another region; nil when absent
+load_count: length of `load`
+at: where the table's key is written
+
+## rec ProfileDef
+
+```mach
+pub rec ProfileDef;
+```
+
+one `[profile.<name>]` compilation policy as parsed. every manifest declares at
+least one
+
+name: the table key; a portable identifier
+is_default: `default = true`; false when the key is absent. more than one
+              default is a parse error
+optimize: the required `optimize` key: whether the release passes run
+relax: the optional `relax` key: the departures from exact semantics
+              the build permits
+linker_relax: the optional `linker_relax` key: whether the linker may relax the
+              code, true when the key is absent
+debug: the required `debug` key
+simd: the required `simd` key
+allow: the optional `allow` key: the warning kinds the profile silences,
+              empty when the key is absent
+at: where the table's key is written
+default_at: where its `default` value is written, the zero place when absent
+
+## rec DepDef
+
+```mach
+pub rec DepDef;
+```
+
+one `[dep.<name>]` table as parsed. exactly one of `git` and `path` is set
+
+name: the table key; a portable identifier
+git: the `git` clone URL, or STR_NIL for a path dependency
+path: the `path` directory, or STR_NIL for a git dependency
+ref: the `ref` key, required with `git` and rejected with `path`; one of
+      `branch/<name>`, `tag/<name>`, `commit/<40 or 64 lowercase hex digits>`.
+      STR_NIL for a path dependency
+a git dependency names exactly one of `ref` (an exact or branch selector) and `version`
+(a release range); STR_NIL marks the one it does not
+
+## def LinkSource
+
+```mach
+pub def LinkSource: u8
+```
+
+where a `[link.<name>]` entry is resolved from, decoded from its `source` key
+
+## val LINK_LOCAL
+
+```mach
+pub val LINK_LOCAL: LinkSource = 0
+```
+
+`source = "local"`: a file at a project-relative `path`
+
+## val LINK_SYSTEM
+
+```mach
+pub val LINK_SYSTEM: LinkSource = 1
+```
+
+`source = "system"`: a system library found by `name`
+
+## val LINK_FRAMEWORK
+
+```mach
+pub val LINK_FRAMEWORK: LinkSource = 2
+```
+
+`source = "framework"`: a macOS framework found by `name`
+
+## rec LinkDef
+
+```mach
+pub rec LinkDef;
+```
+
+one `[link.<name>]` table as parsed. the four arrays are owned by the manifest
+and freed by `dnit`
+
+name: the table key: the entry's identity, which a `#[library]` attribution names
+source: the required `source` key
+lib_name: the `name` key, required for system and framework sources and rejected
+                    for local; STR_NIL for local
+path: the `path` key, required for a local source and rejected otherwise; a
+                    project-relative path template, STR_NIL for non-local
+symbols: the `symbols` array; every entry non-empty and unique; nil when absent
+symbol_count: length of `symbols`
+sys: the required `sys` filter axis, each value canonical or "*"; nil for `[]`,
+                    which matches no target
+sys_count: length of `sys`
+arch: the `arch` filter axis, as `sys`
+arch_count: length of `arch`
+abi: the `abi` filter axis, as `sys`
+abi_count: length of `abi`
+export: the `export` key; false when absent
+include_referenced: the `include` key: false for "always" (the default), true for "referenced"
+kind: the `kind` key, written only on a system source that names a library
+                    by a bare name; SHARED when absent
+versions: the `current_version` and `compatibility_version` keys, written only
+                    on a system source of the shared kind; unstated when absent
+at: where the table's key is written
+path_at: where the `path` value is written, the zero place when absent
+
+## rec LinkVersions
+
+```mach
+pub rec LinkVersions;
+```
+
+the versions a shared library is stated at, as a Mach-O load command names them, each
+encoded as the command holds it: the major version in the high 16 bits, then the minor
+and the patch in 8 bits each
+
+stated: the entry states them; when it does not, both are zero
+current: the version the image is linked against
+compat: the oldest version the image may load instead
+
+## rec StepDef
+
+```mach
+pub rec StepDef;
+```
+
+one `[step.<name>]` table as parsed. the seven arrays are owned by the manifest
+and freed by `dnit`. the removed keys `cmd` and `shell` are rejected by name
+
+name: the table key; an identifier
+argv: the required, non-empty `argv` array; `argv[0]` is non-empty
+argv_count: length of `argv`
+env_keys: keys of the `env` table, sorted case-insensitively then bytewise;
+              every key non-empty, free of '=', and unique ignoring case. nil when absent
+env_values: the string value of each key, parallel to `env_keys`
+env_count: length of both `env` arrays
+env_in: the `env_in` array: names of inherited variables the step reads, each
+              non-empty, free of '=', and distinct by host name identity. nil when absent
+env_in_count: length of `env_in`
+in: the required `in` array of project-relative paths
+in_count: length of `in`
+out: the required `out` array of project-relative paths; a '*' is rejected
+out_count: length of `out`
+need: the `need` array of step-qualified names or globs; nil when absent or empty
+need_count: length of `need`
+timeout: the `timeout` key, a duration such as "30s"; 0 when absent
+at: where the table's key is written
+argv_at: where each `argv` entry is written, parallel to `argv`
+env_at: where each `env` value is written, parallel to `env_values`
+env_in_at: where each `env_in` entry is written, parallel to `env_in`
+in_at: where each `in` entry is written, parallel to `in`
+out_at: where each `out` entry is written, parallel to `out`
+need_at: where each `need` entry is written, parallel to `need`
+
+## rec SourceRoot
+
+```mach
+pub rec SourceRoot;
+```
+
+a module prefix an entry build binds to a directory with `-s name=dir`: a package with
+no manifest, whose modules are the files under the directory
+
+name: the prefix, a portable identifier
+dir: the directory, as the command line wrote it
+
+## rec Manifest
+
+```mach
+pub rec Manifest;
+```
+
+a parsed `mach.toml`. every string is an interned id; every array is owned and
+freed by `dnit`, so the counts are the allocation extents. every place a
+definition records is resolved in the file the manifest was read from, its
+path the interner's, so a refusal made from the model points at the entry
+that caused it
+
+id: the required `[project].id`, a portable identifier
+version: the required `[project].version`, carried verbatim
+src: the required `[project].src`, a project-relative path
+work_tmpl: the required `[project].work`, an unexpanded path template for
+                the work directory
+work_at: where `[project].work` is written
+targets: the `[target.*]` tables, nil when none
+target_count: length of `targets`
+native_target: the owned synthesized host definition when no targets are declared
+artifacts: the `[artifact.*]` tables, nil when none
+artifact_count: length of `artifacts`
+profiles: the `[profile.*]` tables, at least one
+profile_count: length of `profiles`
+deps: the `[dep.*]` tables, nil when none
+dep_count: length of `deps`
+links: the `[link.*]` tables, nil when none
+link_count: length of `links`
+steps: the `[step.*]` tables, nil when none
+step_count: length of `steps`
+sources: the source roots an entry build binds with `-s`, each a package with no
+                manifest; nil for a manifest read from mach.toml, which states none
+source_count: length of `sources`
+
+## fun target_def
+
+```mach
+pub fun target_def() TargetDef;
+```
+
+a target with every key a table may leave out at its default: no env, isa, object format,
+platform, code model, extension or runner, and a zero base and stack. the caller sets the
+name, arch, sys and abi
+
+## fun artifact_def
+
+```mach
+pub fun artifact_def() ArtifactDef;
+```
+
+an artifact with every key a table may leave out at its default: no list, linkage, icon,
+manifest, size or region, the console subsystem, neither default nor exported. the caller
+sets the name, kind, entry, out and targets
+
+## fun profile_def
+
+```mach
+pub fun profile_def() ProfileDef;
+```
+
+a profile with every key a table may leave out at its default: not the default, no relax
+and no allow, the linker free to relax, and vectors scalarized. the caller sets the name
+
+## fun link_def
+
+```mach
+pub fun link_def() LinkDef;
+```
+
+a link with every key a table may leave out at its default: no symbol or filter, not
+exported, always included, and a shared library. the caller sets the name, source and the
+name or path its source takes
+
+## fun init
+
+```mach
+pub fun init() Manifest;
+```
+
+a manifest with every array nil and every count 0. the scalar ids are left
+unset, so only `dnit` is safe on the result
+
+ret: the empty manifest
+
+## fun dnit
+
+```mach
+pub fun dnit(m: *Manifest, alloc: *A.Allocator);
+```
+
+free every array a parsed manifest owns and zero the counts. safe on the
+result of `init` and on a manifest already released
+
+m: the manifest
+alloc: the allocator `parse` was given
+
+## fun step_dnit
+
+```mach
+pub fun step_dnit(alloc: *A.Allocator, s: *StepDef);
+```
+
+free every array a step owns, its entries and the places they are written at;
+the step itself is its owner's
+
+## fun free_strarr
+
+```mach
+pub fun free_strarr(alloc: *A.Allocator, items: *intern.StrId, count: u32);
+```
+
+## fun names_dnit
+
+```mach
+pub fun names_dnit(alloc: *A.Allocator, l: *NameList);
+```
+
+release what a name list owns
+
+## fun site_of
+
+```mach
+pub fun site_of(sites: *base_source.Location, i: u32) base_source.Location;
+```
+
+the place `i` of a model's per-entry places, the zero place when none were recorded
+
+## fun id_of
+
+```mach
+pub fun id_of(itn: *intern.Interner, text: str) res[intern.StrId, fail.Fail];
+```
+
+the id of `text`, interned in `itn`; a refused allocation is the failure
+
+## fun optional_id_of
+
+```mach
+pub fun optional_id_of(itn: *intern.Interner, text: str) res[intern.StrId, fail.Fail];
+```
+
+`id_of` for an optional key's value: STR_NIL for the empty text an absent key reads as
+

@@ -53,7 +53,7 @@ object too small`.
 ## The registry
 
 The keys are rows of one table in the compiler,
-`src/lang/diagnostic/kind.mach`. Each row gives the key and its severity, the
+`src/base/diagnostic/kind.mach`. Each row gives the key and its severity, the
 only place a diagnostic's severity is decided, and
 every site that raises a diagnostic names its row. A diagnostic that names no
 row is refused before it is recorded, so every diagnostic the compiler can

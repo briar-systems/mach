@@ -1,8 +1,8 @@
 # Mach grammar (EBNF)
 
 A formal grammar for the Mach dialect, written against the lexer
-(`src/lang/fe/lexer.mach`, `src/lang/fe/token.mach`) and the parser
-(`src/lang/fe/parser/`). Where the parser accepts more than a doc states, the
+(`src/front/lexer.mach`, `src/front/token.mach`) and the parser
+(`src/front/parser/`). Where the parser accepts more than a doc states, the
 difference is called out inline.
 
 The lists the compiler keeps as tables are held to those tables by tests that
@@ -174,11 +174,9 @@ ml-line  ::= "\\" { any-char-except-newline }   (* "\\" is two backslash charact
 
 The lexer captures the raw span between the quotes and treats `\` as an
 escape that consumes the next character (so an escaped quote does not
-terminate the literal). Escape decoding happens later — in
-`comptime.eval_lit_char` / `comptime.eval_lit_str` for a comptime-evaluated
-literal, and in `me/lower/expr.lit_decode_escape` (an intentional mirror of the
-same table) for one lowered as ordinary runtime code. The recognized
-escapes are:
+terminate the literal). Escape decoding happens once, as the parser
+scans the literal (`char_scan` and `str_scan` in `src/front/literal.mach`).
+The recognized escapes are:
 
 ```
 escapes:  \n  \t  \r  \\  \'  \"  \0  \xHH

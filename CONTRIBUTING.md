@@ -4,6 +4,9 @@ Thank you for your interest in contributing to Mach. Be respectful,
 constructive, and professional: treat Mach like a passion project and its
 community like family.
 
+[`doc/project.md`](doc/project.md) describes how the source is laid out and
+where a new module goes.
+
 
 ## Building
 
@@ -159,7 +162,7 @@ Mach adheres strictly to [semantic versioning](https://semver.org/) (`vMAJOR.MIN
 - `MINOR`: backward-compatible new language features, compiler flags, target additions, and optimizations.
 - `PATCH`: backward-compatible bug fixes, documentation, and internal refactors.
 
-The standard library is versioned separately in its own repository. SemVer impact is tracked directly on issues and pull requests via conventional commit types and issue tags. A release bump updates both `[project].version` in `mach.toml` and `MACH_VERSION` in `src/lang/version.mach`. Tags are created on `main` after the integration merge from `dev`.
+The standard library is versioned separately in its own repository. SemVer impact is tracked directly on issues and pull requests via conventional commit types and issue tags. A release bump updates both `[project].version` in `mach.toml` and `MACH_VERSION` in `src/base/version.mach`. Tags are created on `main` after the integration merge from `dev`.
 
 
 ## License

@@ -1,0 +1,1081 @@
+use mach.base.fail;
+use std.print;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains_char;
+use std.types.string.str_equals;
+use std.types.string.str_is_empty;
+use std.types.string.str_len;
+use toml_error:  toml.error;
+use toml_lookup: toml.lookup;
+use toml_parse:  toml.parse;
+use toml_tree:   toml.tree;
+use toml_value:  toml.value;
+
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+
+use A:          std.allocator;
+use std_format: std.format;
+
+use mink_fail:   mink.base.fail;
+use mink_output: mink.catalog.output;
+use mink.catalog.output.Spelled;
+
+use diagnostic_kind: mach.base.diagnostic.kind;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.base.textbuild;
+use mach_target: mach.target;
+use target_tags: mach.target.tags;
+
+use mach.manifest.model.Origin;
+use mach.manifest.model.id_of;
+use mach.manifest.refusal.fail_at;
+use mach.manifest.refusal.point_at_file;
+use mach.manifest.refusal.refuse;
+use mach.manifest.refusal.span_site;
+
+# the TOML shape a manifest key's value must have; a value of any other shape is
+# refused where it is written
+pub def Shape: u8;
+
+# a string, never empty
+val SHAPE_STRING: Shape = 0;
+# an integer
+val SHAPE_INTEGER: Shape = 1;
+# a boolean
+val SHAPE_BOOL: Shape = 2;
+# an array whose every element is a string
+val SHAPE_STRINGS: Shape = 3;
+# a table whose keys are the author's own, such as a step's `env`
+val SHAPE_TABLE: Shape = 4;
+# a table checked against the rows of its own key, such as `[project]`
+val SHAPE_SECTION: Shape = 5;
+# a table of named tables, each checked against the rows of the key, such as `[target.*]`
+val SHAPE_ENTRIES: Shape = 6;
+
+# whether a manifest must write a key. a key may be left out only when leaving it
+# out safely means that it does not apply, and one rule holds in every manifest,
+# whoever reads it
+pub def Rule: u8;
+
+# every manifest writes it
+val RULE_REQUIRED: Rule = 0;
+# a manifest may leave it out; the row's note says what its absence means
+val RULE_OPTIONAL: Rule = 1;
+# another value of the same table decides whether it is written; the row's note
+# names that value
+val RULE_DERIVED: Rule = 2;
+# no longer read and refused by name; the row's note says what replaces it
+val RULE_REMOVED: Rule = 3;
+
+# one key of a manifest table
+# ---
+# key:     the key as written
+# shape:   the shape its value must have
+# rule:    whether a manifest must write it
+# note:    for a required key, a hint added to the refusal of its absence, "" for
+#          none; for an optional key, what its absence means; for a derived key, the
+#          value that decides it; for a removed key, what replaces it
+# migrate: the rewrite of the key as a previous major wrote it, which
+#          `mach migrate` applies: for a removed key, the rewrite its refusal
+#          carries as a fix; for any other key, a rewrite its value as written
+#          calls for, which refuses the key as written; nil for none
+# set:     `--set` writes the key over every table of its section for one invocation
+rec KeyRow {
+    key:     str;
+    shape:   Shape;
+    rule:    Rule;
+    note:    str;
+    migrate: Migrate;
+    set:     bool;
+}
+
+# the mechanical rewrite of a key as a previous major wrote it
+# ---
+# label:       what the rewrite does; nil when the value as written has none
+# whole:       the rewrite replaces the key and its value, not the key alone
+# replacement: the text written in their place
+# why:         for a key this major still reads, why the key as written is
+#              refused; nil for a removed key, whose row's note says it
+pub rec Rewrite {
+    label:       str;
+    whole:       bool;
+    replacement: str;
+    why:         str;
+}
+
+# the rewrite of the key `v` of `tab`
+def Migrate: fun(*toml_value.Table, *toml_value.Value) Rewrite;
+
+val NO_REWRITE: Rewrite = Rewrite{label: nil, whole: false, replacement: "", why: nil};
+
+# a key renamed with no change to its value
+fun renamed(label: str, to: str) Rewrite {
+    ret Rewrite{label: label, whole: false, replacement: to, why: nil};
+}
+
+# `opt = 0` is `optimize = false`, `opt = 1` and `opt = 2` are `optimize = true`
+fun opt_migrate(tab: *toml_value.Table, v: *toml_value.Value) Rewrite {
+    if (v.tag != toml_value.TYPE_INTEGER)           { ret NO_REWRITE; }
+    if (v.data.integer == 0)                        { ret Rewrite{label: "write `optimize = false`", whole: true, replacement: "optimize = false", why: nil}; }
+    if (v.data.integer == 1 || v.data.integer == 2) { ret Rewrite{label: "write `optimize = true`", whole: true, replacement: "optimize = true", why: nil}; }
+    ret NO_REWRITE;
+}
+
+# `vectorize = true` is what `optimize` schedules and `vectorize = false` is an opt-out v7 has no profile key for, so the profile no longer states either
+fun vectorize_migrate(tab: *toml_value.Table, v: *toml_value.Value) Rewrite {
+    if (v.tag != toml_value.TYPE_BOOL) { ret NO_REWRITE; }
+    ret Rewrite{label: "remove `vectorize`, which the profile no longer states", whole: true, replacement: "", why: nil};
+}
+
+# `float_reassoc = false` is no relaxation, `float_reassoc = true` relaxes float reassociation
+fun float_reassoc_migrate(tab: *toml_value.Table, v: *toml_value.Value) Rewrite {
+    if (v.tag != toml_value.TYPE_BOOL) { ret NO_REWRITE; }
+    if (!v.data.boolean)               { ret Rewrite{label: "remove `float_reassoc = false`, which no relaxation means", whole: true, replacement: "", why: nil}; }
+    val opt_relax: opt[*toml_value.Value] = toml_lookup.get(tab, "relax");
+    if (sel opt_relax.some) { ret NO_REWRITE; }
+    ret Rewrite{label: "relax float reassociation", whole: true, replacement: "relax = [\"float-reassoc\"]", why: nil};
+}
+
+# an object artifact's `out`, which v7 reads for no object artifact since its objects stay
+# under obj/ for a later link
+fun artifact_out_migrate(tab: *toml_value.Table, v: *toml_value.Value) Rewrite {
+    val opt_kind: opt[*toml_value.Value] = toml_lookup.get(tab, "kind");
+    if (sel opt_kind.none)                           { ret NO_REWRITE; }
+    if (opt_kind.some.tag != toml_value.TYPE_STRING) { ret NO_REWRITE; }
+    val res_product: res[Spelled, mink_fail.Fail] = mink_output.spelled(opt_kind.some.data.string);
+    if (sel res_product.err)                     { ret NO_REWRITE; }
+    if (!mach_target.per_module(res_product.ok)) { ret NO_REWRITE; }
+    ret Rewrite{label: "remove `out`, which no object artifact reads", whole: true, replacement: "",
+        why: "names a path a kind = \"object\" artifact never writes, as its objects stay under obj/ for a later link"};
+}
+
+# `[project].out` is `[project].work`
+fun out_migrate(tab: *toml_value.Table, v: *toml_value.Value) Rewrite {
+    ret renamed("rename `out` to `work`", "work");
+}
+
+# a target's `default` selects nothing since v7, where a command with no -t takes the target
+# matching the host, so the target no longer states it
+fun target_default_migrate(tab: *toml_value.Table, v: *toml_value.Value) Rewrite {
+    if (v.tag != toml_value.TYPE_BOOL) { ret NO_REWRITE; }
+    ret Rewrite{label: "remove `default`, which no target states", whole: true, replacement: "", why: nil};
+}
+
+# a target's `os` is its `sys`
+fun os_migrate(tab: *toml_value.Table, v: *toml_value.Value) Rewrite {
+    ret renamed("rename `os` to `sys`", "sys");
+}
+
+# a target's `baseline` is its `isa`
+fun baseline_migrate(tab: *toml_value.Table, v: *toml_value.Value) Rewrite {
+    ret renamed("rename `baseline` to `isa`", "isa");
+}
+
+# a target's `extensions` is its `ext`
+fun extensions_migrate(tab: *toml_value.Table, v: *toml_value.Value) Rewrite {
+    ret renamed("rename `extensions` to `ext`", "ext");
+}
+
+# a link's `isa` filter is its `arch` filter
+fun link_isa_migrate(tab: *toml_value.Table, v: *toml_value.Value) Rewrite {
+    ret renamed("rename `isa` to `arch`", "arch");
+}
+
+# a target's `isa` that names an architecture, where the table writes no
+# `arch`, is the previous major's `isa`, the architecture this one names `arch`
+fun isa_migrate(tab: *toml_value.Table, v: *toml_value.Value) Rewrite {
+    if (v.tag != toml_value.TYPE_STRING) { ret NO_REWRITE; }
+    val opt_arch: opt[*toml_value.Value] = toml_lookup.get(tab, "arch");
+    if (sel opt_arch.some)                                         { ret NO_REWRITE; }
+    if (target_tags.arch_named(v.data.string) == target_tags.NONE) { ret NO_REWRITE; }
+    ret Rewrite{label: "rename `isa` to `arch`", whole: false, replacement: "arch",
+        why: "names an architecture, which v7 writes as `arch`; `isa` is the instruction set every machine of the target has"};
+}
+
+# `subsystem = "gui"` is `subsystem = "windows"`, as mink spells the graphical PE subsystem
+fun subsystem_migrate(tab: *toml_value.Table, v: *toml_value.Value) Rewrite {
+    if (v.tag != toml_value.TYPE_STRING || !str_equals(v.data.string, "gui")) { ret NO_REWRITE; }
+    ret Rewrite{label: "write `subsystem = \"windows\"`", whole: true, replacement: "subsystem = \"windows\"",
+        why: "names the graphical subsystem as v6 spelled it, which v7 writes as mink does, \"windows\""};
+}
+
+# the rows of one table
+# ---
+# rows:  the first row
+# count: how many rows there are
+# noun:  what one entry of an `SHAPE_ENTRIES` table is called in a refusal
+rec Rows {
+    rows:  *KeyRow;
+    count: usize;
+    noun:  str;
+}
+
+val ROOT_KEY_COUNT: usize     = 7;
+val ROOT_KEYS:      [7]KeyRow = [7]KeyRow{
+    KeyRow{key: "project", shape: SHAPE_SECTION, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "profile", shape: SHAPE_ENTRIES, rule: RULE_REQUIRED, note: "a build needs an explicit [profile.<name>] declaring optimize, debug and simd"},
+    KeyRow{key: "target", shape: SHAPE_ENTRIES, rule: RULE_OPTIONAL, note: "the host is the only target, named native"},
+    KeyRow{key: "artifact", shape: SHAPE_ENTRIES, rule: RULE_OPTIONAL, note: "nothing to build"},
+    KeyRow{key: "dep", shape: SHAPE_ENTRIES, rule: RULE_OPTIONAL, note: "no dependencies"},
+    KeyRow{key: "link", shape: SHAPE_ENTRIES, rule: RULE_OPTIONAL, note: "no libraries to link"},
+    KeyRow{key: "step", shape: SHAPE_ENTRIES, rule: RULE_OPTIONAL, note: "no build steps"},
+};
+
+val PROJECT_KEY_COUNT: usize     = 6;
+val PROJECT_KEYS:      [6]KeyRow = [6]KeyRow{
+    KeyRow{key: "id", shape: SHAPE_STRING, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "version", shape: SHAPE_STRING, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "src", shape: SHAPE_STRING, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "work", shape: SHAPE_STRING, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "mach", shape: SHAPE_STRING, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "out", shape: SHAPE_STRING, rule: RULE_REMOVED, note: "the work directory is `work`, written from `{project.work}` in a template", migrate: out_migrate},
+};
+
+val TARGET_KEY_COUNT: usize      = 17;
+val TARGET_KEYS:      [17]KeyRow = [17]KeyRow{
+    KeyRow{key: "arch", shape: SHAPE_STRING, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "isa", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "the architecture's default instruction set", migrate: isa_migrate},
+    KeyRow{key: "sys", shape: SHAPE_STRING, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "abi", shape: SHAPE_STRING, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "env", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "no environment"},
+    KeyRow{key: "of", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "the system's object format"},
+    KeyRow{key: "platform", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "no platform", set: true},
+    KeyRow{key: "base", shape: SHAPE_INTEGER, rule: RULE_OPTIONAL, note: "the object format's load address", set: true},
+    KeyRow{key: "stack_reserve", shape: SHAPE_INTEGER, rule: RULE_OPTIONAL, note: "the object format's stack reserve", set: true},
+    KeyRow{key: "stack_commit", shape: SHAPE_INTEGER, rule: RULE_OPTIONAL, note: "the object format's stack commit", set: true},
+    KeyRow{key: "code_model", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "mirl's default code model for the target"},
+    KeyRow{key: "ext", shape: SHAPE_STRINGS, rule: RULE_OPTIONAL, note: "no extension selected"},
+    KeyRow{key: "runner", shape: SHAPE_STRINGS, rule: RULE_OPTIONAL, note: "the host runs its own programs, and no other target's"},
+    KeyRow{key: "default", shape: SHAPE_BOOL, rule: RULE_REMOVED, note: "with no -t a command takes the target matching the host; select another with -t", migrate: target_default_migrate},
+    KeyRow{key: "os", shape: SHAPE_STRING, rule: RULE_REMOVED, note: "the system is `sys` since v7, which `mach migrate` writes", migrate: os_migrate},
+    KeyRow{key: "baseline", shape: SHAPE_STRING, rule: RULE_REMOVED, note: "the instruction set is `isa` since v7, which `mach migrate` writes", migrate: baseline_migrate},
+    KeyRow{key: "extensions", shape: SHAPE_STRINGS, rule: RULE_REMOVED, note: "the extensions are `ext` since v7, which `mach migrate` writes", migrate: extensions_migrate},
+};
+
+val PROFILE_KEY_COUNT: usize      = 12;
+val PROFILE_KEYS:      [12]KeyRow = [12]KeyRow{
+    KeyRow{key: "optimize", shape: SHAPE_BOOL, rule: RULE_REQUIRED, note: "a profile declares optimize, debug and simd"},
+    KeyRow{key: "debug", shape: SHAPE_BOOL, rule: RULE_REQUIRED, note: "a profile declares optimize, debug and simd"},
+    KeyRow{key: "simd", shape: SHAPE_STRING, rule: RULE_REQUIRED, note: "a profile declares optimize, debug and simd"},
+    KeyRow{key: "pass", shape: SHAPE_STRINGS, rule: RULE_REMOVED, note: "mirl schedules its passes by optimization level, which `optimize` sets"},
+    KeyRow{key: "skip", shape: SHAPE_STRINGS, rule: RULE_REMOVED, note: "mirl schedules its passes by optimization level, which `optimize` sets"},
+    KeyRow{key: "relax", shape: SHAPE_STRINGS, rule: RULE_OPTIONAL, note: "exact semantics"},
+    KeyRow{key: "linker_relax", shape: SHAPE_BOOL, rule: RULE_OPTIONAL, note: "the linker relaxes the code"},
+    KeyRow{key: "default", shape: SHAPE_BOOL, rule: RULE_OPTIONAL, note: "not the default profile"},
+    KeyRow{key: "allow", shape: SHAPE_STRINGS, rule: RULE_OPTIONAL, note: "no warning silenced"},
+    KeyRow{key: "opt", shape: SHAPE_INTEGER, rule: RULE_REMOVED, note: "write `optimize = true` or `optimize = false`", migrate: opt_migrate},
+    KeyRow{key: "vectorize", shape: SHAPE_BOOL, rule: RULE_REMOVED, note: "mirl schedules its passes by optimization level, which `optimize` sets", migrate: vectorize_migrate},
+    KeyRow{key: "float_reassoc", shape: SHAPE_BOOL, rule: RULE_REMOVED, note: "permit reassociation with `relax = [\"float-reassoc\"]`", migrate: float_reassoc_migrate},
+};
+
+val ARTIFACT_KEY_COUNT: usize      = 15;
+val ARTIFACT_KEYS:      [15]KeyRow = [15]KeyRow{
+    KeyRow{key: "kind", shape: SHAPE_STRING, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "entry", shape: SHAPE_STRING, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "out", shape: SHAPE_STRING, rule: RULE_DERIVED, note: "kind: written for every kind but object, whose objects stay under obj/", migrate: artifact_out_migrate},
+    KeyRow{key: "targets", shape: SHAPE_STRINGS, rule: RULE_REQUIRED, note: "use [\"*\"] for every declared target"},
+    KeyRow{key: "link", shape: SHAPE_STRINGS, rule: RULE_OPTIONAL, note: "links nothing"},
+    KeyRow{key: "need", shape: SHAPE_STRINGS, rule: RULE_OPTIONAL, note: "needs nothing"},
+    KeyRow{key: "default", shape: SHAPE_BOOL, rule: RULE_OPTIONAL, note: "not built by default"},
+    KeyRow{key: "export", shape: SHAPE_BOOL, rule: RULE_OPTIONAL, note: "not the library a bare `use` binds"},
+    KeyRow{key: "linkage", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "the target's default linkage"},
+    KeyRow{key: "subsystem", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "console", migrate: subsystem_migrate, set: true},
+    KeyRow{key: "icon", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "no icon"},
+    KeyRow{key: "manifest", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "no application manifest"},
+    KeyRow{key: "sections", shape: SHAPE_STRINGS, rule: RULE_OPTIONAL, note: "the format's section order"},
+    KeyRow{key: "size", shape: SHAPE_INTEGER, rule: RULE_OPTIONAL, note: "no size ceiling"},
+    KeyRow{key: "region", shape: SHAPE_ENTRIES, rule: RULE_OPTIONAL, note: "no memory region"},
+};
+
+val REGION_KEY_COUNT: usize     = 5;
+val REGION_KEYS:      [5]KeyRow = [5]KeyRow{
+    KeyRow{key: "origin", shape: SHAPE_INTEGER, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "length", shape: SHAPE_INTEGER, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "access", shape: SHAPE_STRING, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "run", shape: SHAPE_STRINGS, rule: RULE_OPTIONAL, note: "no section runs in the region"},
+    KeyRow{key: "load", shape: SHAPE_STRINGS, rule: RULE_OPTIONAL, note: "no section loads in the region"},
+};
+
+val DEP_KEY_COUNT: usize     = 4;
+val DEP_KEYS:      [4]KeyRow = [4]KeyRow{
+    KeyRow{key: "git", shape: SHAPE_STRING, rule: RULE_DERIVED, note: "the source: exactly one of git and path"},
+    KeyRow{key: "path", shape: SHAPE_STRING, rule: RULE_DERIVED, note: "the source: exactly one of git and path"},
+    KeyRow{key: "ref", shape: SHAPE_STRING, rule: RULE_DERIVED, note: "a git source names one of ref and version, a path source neither"},
+    KeyRow{key: "version", shape: SHAPE_STRING, rule: RULE_DERIVED, note: "a git source names one of ref and version, a path source neither"},
+};
+
+val LINK_KEY_COUNT: usize      = 15;
+val LINK_KEYS:      [15]KeyRow = [15]KeyRow{
+    KeyRow{key: "source", shape: SHAPE_STRING, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "name", shape: SHAPE_STRING, rule: RULE_DERIVED, note: "source: written for a system or framework source, refused for local"},
+    KeyRow{key: "path", shape: SHAPE_STRING, rule: RULE_DERIVED, note: "source: written for a local source, refused otherwise"},
+    KeyRow{key: "sys", shape: SHAPE_STRINGS, rule: RULE_REQUIRED, note: "use [\"*\"] for any"},
+    KeyRow{key: "arch", shape: SHAPE_STRINGS, rule: RULE_REQUIRED, note: "use [\"*\"] for any"},
+    KeyRow{key: "abi", shape: SHAPE_STRINGS, rule: RULE_REQUIRED, note: "use [\"*\"] for any"},
+    KeyRow{key: "export", shape: SHAPE_BOOL, rule: RULE_OPTIONAL, note: "not exported to consumers"},
+    KeyRow{key: "include", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "always"},
+    KeyRow{key: "kind", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "shared"},
+    KeyRow{key: "symbols", shape: SHAPE_STRINGS, rule: RULE_OPTIONAL, note: "no symbols claimed"},
+    KeyRow{key: "current_version", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "0.0.0, with compatibility_version"},
+    KeyRow{key: "compatibility_version", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "0.0.0, with current_version"},
+    KeyRow{key: "library", shape: SHAPE_STRING, rule: RULE_REMOVED, note: "the table key is the library's identity, and #[library] names the entry by that key"},
+    KeyRow{key: "os", shape: SHAPE_STRINGS, rule: RULE_REMOVED, note: "the system filter is `sys` since v7, which `mach migrate` writes", migrate: os_migrate},
+    KeyRow{key: "isa", shape: SHAPE_STRINGS, rule: RULE_REMOVED, note: "the architecture filter is `arch` since v7, which `mach migrate` writes", migrate: link_isa_migrate},
+};
+
+val STEP_KEY_COUNT: usize     = 9;
+val STEP_KEYS:      [9]KeyRow = [9]KeyRow{
+    KeyRow{key: "argv", shape: SHAPE_STRINGS, rule: RULE_REQUIRED, note: ""},
+    KeyRow{key: "in", shape: SHAPE_STRINGS, rule: RULE_REQUIRED, note: "use [] for none"},
+    KeyRow{key: "out", shape: SHAPE_STRINGS, rule: RULE_REQUIRED, note: "use [] for none"},
+    KeyRow{key: "need", shape: SHAPE_STRINGS, rule: RULE_OPTIONAL, note: "needs nothing"},
+    KeyRow{key: "env", shape: SHAPE_TABLE, rule: RULE_OPTIONAL, note: "the inherited environment"},
+    KeyRow{key: "env_in", shape: SHAPE_STRINGS, rule: RULE_OPTIONAL, note: "no inherited variable is an input"},
+    KeyRow{key: "timeout", shape: SHAPE_STRING, rule: RULE_OPTIONAL, note: "no limit"},
+    KeyRow{key: "cmd", shape: SHAPE_STRING, rule: RULE_REMOVED, note: "use a nonempty 'argv' array"},
+    KeyRow{key: "shell", shape: SHAPE_STRING, rule: RULE_REMOVED, note: "put the shell executable and its arguments in 'argv'"},
+};
+
+# the rows of the document root
+fun root_rows() Rows {
+    ret Rows{rows: ?ROOT_KEYS[0], count: ROOT_KEY_COUNT, noun: ""};
+}
+
+# the rows of the table a root key names, the empty set for any other key
+# ---
+# key: a key of the document root
+fun rows_of(key: str) Rows {
+    if (str_equals(key, "project"))  { ret Rows{rows: ?PROJECT_KEYS[0], count: PROJECT_KEY_COUNT, noun: "project"}; }
+    if (str_equals(key, "target"))   { ret Rows{rows: ?TARGET_KEYS[0], count: TARGET_KEY_COUNT, noun: "target"}; }
+    if (str_equals(key, "profile"))  { ret Rows{rows: ?PROFILE_KEYS[0], count: PROFILE_KEY_COUNT, noun: "profile"}; }
+    if (str_equals(key, "artifact")) { ret Rows{rows: ?ARTIFACT_KEYS[0], count: ARTIFACT_KEY_COUNT, noun: "artifact"}; }
+    if (str_equals(key, "dep"))      { ret Rows{rows: ?DEP_KEYS[0], count: DEP_KEY_COUNT, noun: "dependency"}; }
+    if (str_equals(key, "link"))     { ret Rows{rows: ?LINK_KEYS[0], count: LINK_KEY_COUNT, noun: "link"}; }
+    if (str_equals(key, "step"))     { ret Rows{rows: ?STEP_KEYS[0], count: STEP_KEY_COUNT, noun: "step"}; }
+    if (str_equals(key, "region"))   { ret Rows{rows: ?REGION_KEYS[0], count: REGION_KEY_COUNT, noun: "region"}; }
+    ret Rows{rows: nil, count: 0, noun: ""};
+}
+
+# the row of `key` among `rows`, nil when no row names it
+pub fun row_of(rows: Rows, key: str) *KeyRow {
+    var i: usize = 0;
+    for (i < rows.count) {
+        if (str_equals(rows.rows[i].key, key)) { ret ?rows.rows[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# check a parsed manifest document against the schema: every key it writes is a
+# row of its table, every value has its row's shape, every required key is
+# written and no removed one is. one rule holds for every key whoever reads the
+# manifest. the first violation is refused, pointing at the key or value it
+# concerns, or at the table a missing key belongs to
+# ---
+# alloc: owns the refusal's text
+# doc:   the document root
+# ret:   ok when the document has the schema's shape
+pub fun check(alloc: *A.Allocator, doc: *toml_value.Table) err[fail.Fail] {
+    var none: toml_value.Span;
+    ret table_check(alloc, doc, TableName{section: "", name: ""}, root_rows(), none);
+}
+
+# which table a refusal names, spelled only when one is made, so a manifest that
+# passes allocates nothing
+# ---
+# section: the root key the table is under, "" for the document root
+# name:    the entry's name under a `SHAPE_ENTRIES` section, "" for a section itself
+# set:     the value is a `--set` value, which no table of a manifest holds
+rec TableName {
+    section: str;
+    name:    str;
+    set:     bool;
+}
+
+# a `--set` key and value, read as the manifest reads the key
+# ---
+# section: the root key of the tables the key is written over, such as "target"
+# doc:     the document `<key> = <value>`, released with toml_tree.dnit
+# text:    the document's text, which a refusal of the value points into
+pub rec Setting {
+    section: str;
+    doc:     toml_value.Table;
+    text:    str;
+    file:    base_source.FileId;
+}
+
+# the path a refusal of a `--set` value is placed in
+pub val SET_PATH: str = "--set";
+
+# length of TABLE_SECTIONS
+val TABLE_SECTIONS_N: usize = 8;
+# every key whose rows a table of a manifest is checked against, in the order `--set` looks a key
+# up in them
+val TABLE_SECTIONS: [TABLE_SECTIONS_N]str = [TABLE_SECTIONS_N]str{"target", "artifact", "project", "profile", "dep", "link", "step", "region"};
+
+# a `--set` key and value checked against the row of the key: the key is one a row marks `set`,
+# and the value has the row's shape. a string-shaped key takes the value as written, any other
+# reads it as a TOML value
+# ---
+# alloc:   owns the setting and a refusal's text
+# sources: receives the setting's text, a file of its own, which a refusal points into
+# key:     the key, as a manifest writes it
+# value:   the value, as written
+# ret:     the setting; a user failure naming the key when no row names it, when its row is not
+#          one `--set` writes, or when the value does not have its row's shape
+pub fun setting(alloc: *A.Allocator, sources: *base_source.SourceMap, key: str, value: str) res[Setting, fail.Fail] {
+    var row:     *KeyRow = nil;
+    var section: str     = nil;
+    var known:   bool    = false;
+    var i:       usize   = 0;
+    for (i < TABLE_SECTIONS_N) {
+        val found: *KeyRow = row_of(rows_of(TABLE_SECTIONS[i]), key);
+        if (found != nil) {
+            known = true;
+            if (found.set && row == nil) {
+                row     = found;
+                section = TABLE_SECTIONS[i];
+            }
+        }
+        i = i + 1;
+    }
+    if (row == nil) {
+        if (!known) { ret res[Setting, fail.Fail].err{refuse(alloc, diagnostic_kind.CLI_FLAG_VALUE, "--set: '{}' is no manifest key", key)}; }
+        val res_listed: res[str, fail.Fail] = settable_keys(alloc);
+        if (sel res_listed.err) { ret res[Setting, fail.Fail].err{res_listed.err}; }
+        ret res[Setting, fail.Fail].err{refuse(alloc, diagnostic_kind.CLI_FLAG_VALUE, "--set does not apply to '{}'; it sets {}", key, res_listed.ok)};
+    }
+
+    var b: textbuild.TextBuilder = textbuild.tb_init(alloc);
+    fin { textbuild.tb_dnit(?b); }
+    textbuild.tb_append(?b, key);
+    textbuild.tb_append(?b, " = ");
+    if (row.shape == SHAPE_STRING) { toml_string(?b, value); }
+    or                             { textbuild.tb_append(?b, value); }
+    textbuild.tb_append(?b, "\n");
+    val res_made: res[str, textbuild.Error] = textbuild.tb_finish(?b);
+    if (sel res_made.err) { ret res[Setting, fail.Fail].err{fail.message(textbuild.text(res_made.err))}; }
+    val text:      str                                        = res_made.ok;
+    val res_added: res[base_source.FileId, base_source.Error] = base_source.add(sources, SET_PATH, text);
+    if (sel res_added.err) {
+        str_free(alloc, text);
+        ret res[Setting, fail.Fail].err{fail.source_refused(res_added.err)};
+    }
+
+    val res_parsed: res[toml_value.Table, toml_error.TomlError] = toml_parse.parse_bytes(alloc, text::*u8, str_len(text));
+    if (sel res_parsed.err) {
+        ret res[Setting, fail.Fail].err{refuse(alloc, diagnostic_kind.MANIFEST_VALUE_TYPE, "--set {}: must be {}", key, shape_text(row.shape))};
+    }
+    var doc:           toml_value.Table       = res_parsed.ok;
+    val opt_doc_entry: opt[*toml_value.Value] = toml_lookup.get(?doc, key);
+    var err_checked:   err[fail.Fail]         = err[fail.Fail].ok{};
+    if (sel opt_doc_entry.some) { err_checked = value_check(alloc, TableName{section: section, name: "", set: true}, row, opt_doc_entry.some); }
+    or                          { err_checked = err[fail.Fail].err{refuse(alloc, diagnostic_kind.MANIFEST_VALUE_TYPE, "--set {}: must be {}", key, shape_text(row.shape))}; }
+    if (sel err_checked.err) {
+        toml_tree.dnit(alloc, ?doc);
+        ret res[Setting, fail.Fail].err{fail.placed(err_checked.err, res_added.ok)};
+    }
+    ret res[Setting, fail.Fail].ok{Setting{section: section, doc: doc, text: text, file: res_added.ok}};
+}
+
+# every key a row marks `set`, as a refusal lists them
+fun settable_keys(alloc: *A.Allocator) res[str, fail.Fail] {
+    var b: textbuild.TextBuilder = textbuild.tb_init(alloc);
+    fin { textbuild.tb_dnit(?b); }
+    var first: bool  = true;
+    var i:     usize = 0;
+    for (i < TABLE_SECTIONS_N) {
+        val rows: Rows  = rows_of(TABLE_SECTIONS[i]);
+        var k:    usize = 0;
+        for (k < rows.count) {
+            if (rows.rows[k].set) {
+                if (!first) { textbuild.tb_append(?b, ", "); }
+                textbuild.tb_append(?b, rows.rows[k].key);
+                first = false;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    val res_made: res[str, textbuild.Error] = textbuild.tb_finish(?b);
+    if (sel res_made.err) { ret res[str, fail.Fail].err{fail.message(textbuild.text(res_made.err))}; }
+    ret res[str, fail.Fail].ok{res_made.ok};
+}
+
+# `text` as a TOML basic string: a quote and a backslash escaped by a backslash, and a control
+# byte, which a basic string cannot hold, as its `\u00XX` escape
+pub fun toml_string(b: *textbuild.TextBuilder, text: str) {
+    var one: [7]u8;
+    textbuild.tb_append(b, "\"");
+    var i: usize = 0;
+    for (text[i] != 0) {
+        val c: u8 = text[i];
+        one[0] = c;
+        one[1] = 0;
+        if (c == '"' || c == '\\') {
+            one[0] = '\\';
+            one[1] = c;
+            one[2] = 0;
+        }
+        or (c < 0x20 || c == 0x7f) {
+            one[0] = '\\';
+            one[1] = 'u';
+            one[2] = '0';
+            one[3] = '0';
+            one[4] = HEX[(c >> 4)::usize];
+            one[5] = HEX[(c & 15)::usize];
+            one[6] = 0;
+        }
+        textbuild.tb_append(b, (?one[0])::str);
+        i = i + 1;
+    }
+    textbuild.tb_append(b, "\"");
+}
+
+val HEX: str = "0123456789ABCDEF";
+
+# check one section of the document root, as `check` holds it, for a reader
+# that needs only that section
+# ---
+# alloc: owns the refusal's text
+# doc:   the document root
+# key:   a key of the document root, such as "project"
+# ret:   ok when the section has the schema's shape
+pub fun section_check(alloc: *A.Allocator, doc: *toml_value.Table, key: str) err[fail.Fail] {
+    val row: *KeyRow = row_of(root_rows(), key);
+    if (row == nil) { ret err[fail.Fail].err{fail.message("internal: no row of the document root is named for the section")}; }
+    val opt_doc_entry: opt[*toml_value.Value] = toml_lookup.get(doc, key);
+    if (sel opt_doc_entry.none) {
+        var none: toml_value.Span;
+        if (row.rule == RULE_REQUIRED) { ret missing_in(alloc, TableName{section: "", name: ""}, row, none); }
+        ret err[fail.Fail].ok{};
+    }
+    ret value_check(alloc, TableName{section: "", name: ""}, row, opt_doc_entry.some);
+}
+
+# check `tab`, the table at `at`, against `rows`; `where` is the table's own
+# span, where the refusal of a missing key points unless the table is the document root
+fun table_check(alloc: *A.Allocator, tab: *toml_value.Table, at: TableName, rows: Rows, where: toml_value.Span) err[fail.Fail] {
+    val n: usize = toml_lookup.table_len(tab);
+    var i: usize = 0;
+    for (i < n) {
+        val opt_table_key:   opt[str]               = toml_lookup.table_key(tab, i);
+        val opt_table_value: opt[*toml_value.Value] = toml_lookup.table_value(tab, i);
+        if (sel opt_table_key.none)   { brk; }
+        if (sel opt_table_value.none) { brk; }
+        val k:   str               = opt_table_key.some;
+        val v:   *toml_value.Value = opt_table_value.some;
+        val row: *KeyRow           = row_of(rows, k);
+        if (row == nil)               { ret fail_at(unknown(alloc, at, k), v.key); }
+        if (row.rule == RULE_REMOVED) { ret fail_at(migrated(alloc, removed(alloc, at, k, row.note), row, tab, v), v.key); }
+        val err_shaped: err[fail.Fail] = value_check(alloc, at, row, v);
+        if (sel err_shaped.err) { ret err_shaped; }
+        val err_aged: err[fail.Fail] = retired(alloc, at, k, row, tab, v);
+        if (sel err_aged.err) { ret err_aged; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < rows.count) {
+        val row: *KeyRow = ?rows.rows[i];
+        i = i + 1;
+        if (row.rule != RULE_REQUIRED) { cnt; }
+        val opt_tab_entry: opt[*toml_value.Value] = toml_lookup.get(tab, row.key);
+        if (sel opt_tab_entry.none) { ret missing_in(alloc, at, row, where); }
+        if (row.shape == SHAPE_ENTRIES && toml_lookup.table_len(?opt_tab_entry.some.data.table) == 0) {
+            ret fail_at(missing(alloc, at, row), opt_tab_entry.some.span);
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# check one value against its row, and a table it holds against its own rows
+fun value_check(alloc: *A.Allocator, at: TableName, row: *KeyRow, v: *toml_value.Value) err[fail.Fail] {
+    val shape: Shape = row.shape;
+    if (shape == SHAPE_STRING) {
+        if (v.tag != toml_value.TYPE_STRING) { ret shape_refused(alloc, diagnostic_kind.MANIFEST_VALUE_TYPE, at, row, v.span); }
+        if (str_is_empty(v.data.string))     { ret shape_refused(alloc, diagnostic_kind.MANIFEST_INVALID_VALUE, at, row, v.span); }
+        ret err[fail.Fail].ok{};
+    }
+    if (shape == SHAPE_INTEGER) {
+        if (v.tag != toml_value.TYPE_INTEGER) { ret shape_refused(alloc, diagnostic_kind.MANIFEST_VALUE_TYPE, at, row, v.span); }
+        ret err[fail.Fail].ok{};
+    }
+    if (shape == SHAPE_BOOL) {
+        if (v.tag != toml_value.TYPE_BOOL) { ret shape_refused(alloc, diagnostic_kind.MANIFEST_VALUE_TYPE, at, row, v.span); }
+        ret err[fail.Fail].ok{};
+    }
+    if (shape == SHAPE_STRINGS) {
+        if (v.tag != toml_value.TYPE_ARRAY) { ret shape_refused(alloc, diagnostic_kind.MANIFEST_VALUE_TYPE, at, row, v.span); }
+        val arr: *toml_value.Array = ?v.data.array;
+        var i:   usize             = 0;
+        for (i < toml_lookup.array_len(arr)) {
+            val opt_array_get: opt[*toml_value.Value] = toml_lookup.array_get(arr, i);
+            if (sel opt_array_get.some) {
+                if (opt_array_get.some.tag != toml_value.TYPE_STRING) { ret shape_refused(alloc, diagnostic_kind.MANIFEST_VALUE_TYPE, at, row, opt_array_get.some.span); }
+            }
+            i = i + 1;
+        }
+        ret err[fail.Fail].ok{};
+    }
+    if (v.tag != toml_value.TYPE_TABLE) { ret shape_refused(alloc, diagnostic_kind.MANIFEST_VALUE_TYPE, at, row, v.span); }
+    if (shape == SHAPE_TABLE)           { ret err[fail.Fail].ok{}; }
+    val inner: Rows = rows_of(row.key);
+    if (shape == SHAPE_SECTION) { ret table_check(alloc, ?v.data.table, TableName{section: row.key, name: ""}, inner, v.span); }
+    ret entries_check(alloc, ?v.data.table, row.key, inner);
+}
+
+# check every entry of a `SHAPE_ENTRIES` table: a portable name holding a table
+# that has the shape of `rows`
+fun entries_check(alloc: *A.Allocator, tab: *toml_value.Table, key: str, rows: Rows) err[fail.Fail] {
+    val n: usize = toml_lookup.table_len(tab);
+    var i: usize = 0;
+    for (i < n) {
+        val opt_name:        opt[str]               = toml_lookup.table_key(tab, i);
+        val opt_table_value: opt[*toml_value.Value] = toml_lookup.table_value(tab, i);
+        if (sel opt_name.none)        { brk; }
+        if (sel opt_table_value.none) { brk; }
+        val name: str               = opt_name.some;
+        val v:    *toml_value.Value = opt_table_value.some;
+        if (!is_valid_id(name)) {
+            ret fail_at(refuse(alloc, diagnostic_kind.MANIFEST_INVALID_NAME, "mach.toml: {} name '{}' must be a portable identifier (letters, digits, '_', '-')", rows.noun, name), v.key);
+        }
+        val at: TableName = TableName{section: key, name: name};
+        if (v.tag != toml_value.TYPE_TABLE) { ret fail_at(refuse(alloc, diagnostic_kind.MANIFEST_VALUE_TYPE, "mach.toml: [{}.{}] must be a table", key, name), v.span); }
+        val err_checked: err[fail.Fail] = table_check(alloc, ?v.data.table, at, rows, v.span);
+        if (sel err_checked.err) { ret err_checked; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun shape_refused(alloc: *A.Allocator, kind: diagnostic_kind.Kind, at: TableName, row: *KeyRow, sp: toml_value.Span) err[fail.Fail] {
+    val shape: str = shape_text(row.shape);
+    if (at.set)                   { ret fail_at(refuse(alloc, kind, "--set {}: must be {}", row.key, shape), sp); }
+    if (str_is_empty(at.section)) { ret fail_at(refuse(alloc, kind, "mach.toml: [{}] must be {}", row.key, shape), sp); }
+    if (str_is_empty(at.name))    { ret fail_at(refuse(alloc, kind, "mach.toml: [{}].{} must be {}", at.section, row.key, shape), sp); }
+    ret fail_at(refuse(alloc, kind, "mach.toml: [{}.{}].{} must be {}", at.section, at.name, row.key, shape), sp);
+}
+
+# what a value of `shape` is, as a refusal names it
+fun shape_text(shape: Shape) str {
+    if (shape == SHAPE_STRING)  { ret "a non-empty string"; }
+    if (shape == SHAPE_INTEGER) { ret "an integer"; }
+    if (shape == SHAPE_BOOL)    { ret "a boolean"; }
+    if (shape == SHAPE_STRINGS) { ret "an array of strings"; }
+    ret "a table";
+}
+
+fun unknown(alloc: *A.Allocator, at: TableName, key: str) fail.Fail {
+    val k: diagnostic_kind.Kind = diagnostic_kind.MANIFEST_UNKNOWN_KEY;
+    if (str_is_empty(at.section)) { ret refuse(alloc, k, "mach.toml: unknown table or key '{}' at the document root", key); }
+    if (str_is_empty(at.name))    { ret refuse(alloc, k, "mach.toml: unknown key '{}' in [{}]", key, at.section); }
+    ret refuse(alloc, k, "mach.toml: unknown key '{}' in [{}.{}]", key, at.section, at.name);
+}
+
+fun removed(alloc: *A.Allocator, at: TableName, key: str, note: str) fail.Fail {
+    val k: diagnostic_kind.Kind = diagnostic_kind.MANIFEST_REMOVED_KEY;
+    if (str_is_empty(at.name)) { ret refuse(alloc, k, "mach.toml: [{}] uses removed key '{}'; {}", at.section, key, note); }
+    ret refuse(alloc, k, "mach.toml: [{}.{}] uses removed key '{}'; {}", at.section, at.name, key, note);
+}
+
+# `f` carrying the rewrite `row` migrates the removed key `v` of `tab` by, when
+# the value as written has one
+fun migrated(alloc: *A.Allocator, f: fail.Fail, row: *KeyRow, tab: *toml_value.Table, v: *toml_value.Value) fail.Fail {
+    if (row.migrate == nil) { ret f; }
+    val rw: Rewrite = row.migrate(tab, v);
+    if (rw.label == nil) { ret f; }
+    var span: base_source.Span = base_source.span(v.key.at, v.key.len);
+    if (rw.whole) { span = base_source.span_between(v.key.at, v.span.at + v.span.len); }
+    ret fail.with_fix(alloc, f, rw.label, opt[base_source.Span].some{span}, rw.replacement);
+}
+
+# the refusal of a key this major reads whose value as written is a previous
+# major's, carrying its rewrite; ok for any other
+fun retired(alloc: *A.Allocator, at: TableName, key: str, row: *KeyRow, tab: *toml_value.Table, v: *toml_value.Value) err[fail.Fail] {
+    if (row.migrate == nil) { ret err[fail.Fail].ok{}; }
+    val rw: Rewrite = row.migrate(tab, v);
+    if (rw.label == nil) { ret err[fail.Fail].ok{}; }
+    val k: diagnostic_kind.Kind = diagnostic_kind.MANIFEST_REMOVED_KEY;
+    var f: fail.Fail            = refuse(alloc, k, "mach.toml: [{}].{} = \"{}\" {}", at.section, key, v.data.string, rw.why);
+    if (!str_is_empty(at.name)) { f = refuse(alloc, k, "mach.toml: [{}.{}].{} = \"{}\" {}", at.section, at.name, key, v.data.string, rw.why); }
+    ret fail_at(migrated(alloc, f, row, tab, v), v.key);
+}
+
+# one replacement of the bytes `at` to `at + len` of a manifest's text by
+# `text` and `pad` spaces after it
+pub rec Fix {
+    at:   usize;
+    len:  usize;
+    text: str;
+    pad:  usize;
+}
+
+# every rewrite the schema's rows call for in a parsed manifest document, as
+# fixes of its text: each removed key's rewrite and each retired value's, in
+# every table the schema holds. a key no row names or of the wrong shape adds
+# none, since the check refuses it as it stands
+# ---
+# alloc: owns the fixes' storage
+# doc:   the document root
+# out:   receives the fixes, in no order
+# ret:   ok, or the allocator's refusal
+pub fun rewrites(alloc: *A.Allocator, doc: *toml_value.Table, out: *Vector[Fix]) err[A.Error] {
+    ret table_walk(doc, root_rows(), TableName{section: "", name: ""}, rewrite_visit, out::ptr);
+}
+
+fun rewrite_visit(context: ptr, at: TableName, row: *KeyRow, tab: *toml_value.Table, v: *toml_value.Value) err[A.Error] {
+    if (row.migrate == nil) { ret err[A.Error].ok{}; }
+    val rw: Rewrite = row.migrate(tab, v);
+    if (rw.label == nil) { ret err[A.Error].ok{}; }
+    var fix: Fix = Fix{at: v.key.at, len: v.key.len, text: rw.replacement, pad: 0};
+    if (rw.whole) { fix.len = v.span.at + v.span.len - v.key.at; }
+    val res_pushed: res[usize, A.Error] = collections_vector.push[Fix](context::*Vector[Fix], fix);
+    if (sel res_pushed.err) { ret err[A.Error].err{res_pushed.err}; }
+    ret err[A.Error].ok{};
+}
+
+# a removed key a manifest writes that no rewrite migrates, which the check refuses until its
+# author decides what replaces it
+# ---
+# section: the root key of its table, "" for the document root
+# name:    its table's name under a section of named tables, "" for a section itself
+# key:     the key
+# note:    what replaces it, as its refusal says
+# at:      the key token as written
+pub rec Leftover {
+    section: str;
+    name:    str;
+    key:     str;
+    note:    str;
+    at:      toml_value.Span;
+}
+
+# every removed key a parsed manifest document writes that no rewrite migrates, in every table
+# the schema holds
+# ---
+# doc: the document root
+# out: receives the keys, in document order; its strings are borrowed from `doc` and the rows
+# ret: ok, or the allocator's refusal
+pub fun leftovers(doc: *toml_value.Table, out: *Vector[Leftover]) err[A.Error] {
+    ret table_walk(doc, root_rows(), TableName{section: "", name: ""}, leftover_visit, out::ptr);
+}
+
+fun leftover_visit(context: ptr, at: TableName, row: *KeyRow, tab: *toml_value.Table, v: *toml_value.Value) err[A.Error] {
+    if (row.rule != RULE_REMOVED) { ret err[A.Error].ok{}; }
+    if (row.migrate != nil) {
+        val rw: Rewrite = row.migrate(tab, v);
+        if (rw.label != nil) { ret err[A.Error].ok{}; }
+    }
+    val res_pushed: res[usize, A.Error] = collections_vector.push[Leftover](context::*Vector[Leftover], Leftover{section: at.section, name: at.name, key: row.key, note: row.note, at: v.key});
+    if (sel res_pushed.err) { ret err[A.Error].err{res_pushed.err}; }
+    ret err[A.Error].ok{};
+}
+
+# what a walk does at one key of a manifest table that a row names: its context, the table
+# it stands in, its row, the table and its value
+def KeyVisit: fun(ptr, TableName, *KeyRow, *toml_value.Table, *toml_value.Value) err[A.Error];
+
+# `visit` at every key of `tab`, the table at `at`, that a row of `rows` names, and at every
+# key of each table it holds the schema checks. a key no row names visits nothing, since the
+# check refuses it as it stands
+fun table_walk(tab: *toml_value.Table, rows: Rows, at: TableName, visit: KeyVisit, context: ptr) err[A.Error] {
+    var i: usize = 0;
+    for (i < toml_lookup.table_len(tab)) {
+        val opt_table_key:   opt[str]               = toml_lookup.table_key(tab, i);
+        val opt_table_value: opt[*toml_value.Value] = toml_lookup.table_value(tab, i);
+        i = i + 1;
+        if (sel opt_table_key.none)   { brk; }
+        if (sel opt_table_value.none) { brk; }
+        val row: *KeyRow = row_of(rows, opt_table_key.some);
+        if (row == nil) { cnt; }
+        val err_visited: err[A.Error] = visit(context, at, row, tab, opt_table_value.some);
+        if (sel err_visited.err)                               { ret err_visited; }
+        if (opt_table_value.some.tag != toml_value.TYPE_TABLE) { cnt; }
+        if (row.shape == SHAPE_SECTION) {
+            val err_inner: err[A.Error] = table_walk(?opt_table_value.some.data.table, rows_of(row.key), TableName{section: row.key, name: ""}, visit, context);
+            if (sel err_inner.err) { ret err_inner; }
+            cnt;
+        }
+        if (row.shape != SHAPE_ENTRIES) { cnt; }
+        val err_entries: err[A.Error] = entries_walk(?opt_table_value.some.data.table, row.key, rows_of(row.key), visit, context);
+        if (sel err_entries.err) { ret err_entries; }
+    }
+    ret err[A.Error].ok{};
+}
+
+fun entries_walk(tab: *toml_value.Table, key: str, rows: Rows, visit: KeyVisit, context: ptr) err[A.Error] {
+    var i: usize = 0;
+    for (i < toml_lookup.table_len(tab)) {
+        val opt_name:        opt[str]               = toml_lookup.table_key(tab, i);
+        val opt_table_value: opt[*toml_value.Value] = toml_lookup.table_value(tab, i);
+        i = i + 1;
+        if (sel opt_name.none)                                 { brk; }
+        if (sel opt_table_value.none)                          { brk; }
+        if (opt_table_value.some.tag != toml_value.TYPE_TABLE) { cnt; }
+        val err_inner: err[A.Error] = table_walk(?opt_table_value.some.data.table, rows, TableName{section: key, name: opt_name.some}, visit, context);
+        if (sel err_inner.err) { ret err_inner; }
+    }
+    ret err[A.Error].ok{};
+}
+
+# the refusal of a required key missing from the table at `at`, pointing at that table, `where`,
+# or at the file when the table is the document root
+fun missing_in(alloc: *A.Allocator, at: TableName, row: *KeyRow, where: toml_value.Span) err[fail.Fail] {
+    if (str_is_empty(at.section)) { ret err[fail.Fail].err{point_at_file(missing(alloc, at, row))}; }
+    ret fail_at(missing(alloc, at, row), where);
+}
+
+fun missing(alloc: *A.Allocator, at: TableName, row: *KeyRow) fail.Fail {
+    val k: diagnostic_kind.Kind = diagnostic_kind.MANIFEST_MISSING_REQUIRED;
+    if (str_is_empty(at.section)) {
+        if (str_is_empty(row.note)) { ret refuse(alloc, k, "mach.toml: missing [{}] table", row.key); }
+        ret refuse(alloc, k, "mach.toml: missing [{}] table; {}", row.key, row.note);
+    }
+    if (!str_is_empty(at.name)) {
+        if (str_is_empty(row.note)) { ret refuse(alloc, k, "mach.toml: [{}.{}] is missing required key '{}'", at.section, at.name, row.key); }
+        ret refuse(alloc, k, "mach.toml: [{}.{}] is missing required key '{}'; {}", at.section, at.name, row.key, row.note);
+    }
+    if (str_is_empty(row.note)) { ret refuse(alloc, k, "mach.toml: [{}] is missing required key '{}'", at.section, row.key); }
+    ret refuse(alloc, k, "mach.toml: [{}] is missing required key '{}'; {}", at.section, row.key, row.note);
+}
+
+# a string key as the manifest reads it: absent and empty are the same err
+# (`is missing required key`), so both read as the empty string
+pub fun key_text(t: *toml_value.Table, key: str) str {
+    val opt_str: opt[str] = toml_lookup.get_str(t, key);
+    if (sel opt_str.some) { ret opt_str.some; }
+    ret "";
+}
+
+# a boolean key's value, false when it is not written; the schema check has
+# refused any other shape
+pub fun flag(t: *toml_value.Table, key: str) bool {
+    val opt_bool: opt[bool] = toml_lookup.get_bool(t, key);
+    if (sel opt_bool.some) { ret opt_bool.some; }
+    ret false;
+}
+
+# the value of a key the schema check has seen written with its row's shape, nil
+# when it is not written
+pub fun written_value(t: *toml_value.Table, key: str) *toml_value.Value {
+    val opt_key_entry: opt[*toml_value.Value] = toml_lookup.get(t, key);
+    if (sel opt_key_entry.none) { ret nil; }
+    ret opt_key_entry.some;
+}
+
+# the key token of a table's entry `i` as written; the zero span when absent
+pub fun key_span(tab: *toml_value.Table, i: usize) toml_value.Span {
+    val opt_table_value: opt[*toml_value.Value] = toml_lookup.table_value(tab, i);
+    if (sel opt_table_value.some) { ret opt_table_value.some.key; }
+    var none: toml_value.Span;
+    ret none;
+}
+
+# the literal of an array's element `i`; the zero span when absent
+pub fun element_span(arr: *toml_value.Array, i: usize) toml_value.Span {
+    val opt_array_get: opt[*toml_value.Value] = toml_lookup.array_get(arr, i);
+    if (sel opt_array_get.some) { ret opt_array_get.some.span; }
+    var none: toml_value.Span;
+    ret none;
+}
+
+# the literal of the value `key` names in a table; the zero span when absent
+# where the table `sub` writes `key`, named for a refusal under `lead`, the table's label in
+# mach.toml such as `[target.x]`, or under `--set` for a nil lead. the place stays unresolved
+# until the manifest or the `--set` text resolves it
+# ---
+# alloc: owns the name's text until it is interned
+# itn:   holds the name for the session
+# sub:   the table, which writes `key`
+# lead:  the table's label, nil for a `--set` value
+# key:   the key
+# ret:   the origin, or a refused allocation
+pub fun origin(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml_value.Table, lead: str, key: str) res[Origin, fail.Fail] {
+    var res_said: res[str, std_format.FormatError];
+    if (lead == nil)      { res_said = std_format.sprint(alloc, "{} {}", SET_PATH, key); }
+    or                    { res_said = std_format.sprint(alloc, "mach.toml: {}.{}", lead, key); }
+    if (sel res_said.err) { ret res[Origin, fail.Fail].err{fail.format_refused(res_said.err)}; }
+    val res_id_of: res[intern.StrId, fail.Fail] = id_of(itn, res_said.ok);
+    str_free(alloc, res_said.ok);
+    if (sel res_id_of.err) { ret res[Origin, fail.Fail].err{res_id_of.err}; }
+    ret res[Origin, fail.Fail].ok{Origin{named: intern.text(itn, res_id_of.ok), at: span_site(value_span(sub, key))}};
+}
+
+pub fun value_span(tab: *toml_value.Table, key: str) toml_value.Span {
+    val opt_tab_entry: opt[*toml_value.Value] = toml_lookup.get(tab, key);
+    if (sel opt_tab_entry.some) { ret opt_tab_entry.some.span; }
+    var none: toml_value.Span;
+    ret none;
+}
+
+# a scalar value as a refusal quotes it; a refused allocation is the failure
+pub fun value_text(alloc: *A.Allocator, v: *toml_value.Value) res[str, fail.Fail] {
+    if (v.tag == toml_value.TYPE_INTEGER) {
+        val res_sprint: res[str, std_format.FormatError] = std_format.sprint(alloc, "{}", v.data.integer);
+        if (sel res_sprint.err) { ret res[str, fail.Fail].err{fail.format_refused(res_sprint.err)}; }
+        ret res[str, fail.Fail].ok{res_sprint.ok};
+    }
+    if (v.tag == toml_value.TYPE_STRING) {
+        val res_sprint: res[str, std_format.FormatError] = std_format.sprint(alloc, "\"{}\"", v.data.string);
+        if (sel res_sprint.err) { ret res[str, fail.Fail].err{fail.format_refused(res_sprint.err)}; }
+        ret res[str, fail.Fail].ok{res_sprint.ok};
+    }
+    if (v.tag == toml_value.TYPE_BOOL) {
+        if (v.data.boolean) { ret res[str, fail.Fail].ok{"true"}; }
+        ret res[str, fail.Fail].ok{"false"};
+    }
+    if (v.tag == toml_value.TYPE_FLOAT) { ret res[str, fail.Fail].ok{"a float"}; }
+    if (v.tag == toml_value.TYPE_ARRAY) { ret res[str, fail.Fail].ok{"an array"}; }
+    if (v.tag == toml_value.TYPE_TABLE) { ret res[str, fail.Fail].ok{"a table"}; }
+    ret res[str, fail.Fail].ok{"a value"};
+}
+
+# whether `s` is a portable identifier: non-empty, only ASCII letters, digits,
+# '_' and '-'. the rule for project, target, artifact, profile, dependency,
+# link and step names
+# ---
+# s:   the candidate
+# ret: true when every byte is allowed
+pub fun is_valid_id(s: str) bool {
+    if (str_is_empty(s)) { ret false; }
+    val n: usize = str_len(s);
+    var i: usize = 0;
+    for (i < n) {
+        val c: u8 = s[i];
+        if (!((c >= 'A' && c <= 'Z')
+            || (c >= 'a' && c <= 'z')
+            || (c >= '0' && c <= '9')
+            || c == '_' || c == '-')) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+def PathViolation: u8;
+val PATH_CANONICAL: PathViolation = 0;
+val PATH_EMPTY:     PathViolation = 1;
+val PATH_BACKSLASH: PathViolation = 2;
+val PATH_ABSOLUTE:  PathViolation = 3;
+val PATH_DRIVE:     PathViolation = 4;
+val PATH_COMPONENT: PathViolation = 5;
+val PATH_DOT:       PathViolation = 6;
+
+fun path_violation(value: str) PathViolation {
+    if (str_contains_char(value, '\\')) { ret PATH_BACKSLASH; }
+    val n: usize = str_len(value);
+    if (n == 0)          { ret PATH_EMPTY; }
+    if (value[0] == '/') { ret PATH_ABSOLUTE; }
+    if (n >= 2 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':') {
+        ret PATH_DRIVE;
+    }
+    var start: usize = 0;
+    var i:     usize = 0;
+    for (i <= n) {
+        if (i == n || value[i] == '/') {
+            val len: usize = i - start;
+            if (len == 0) { ret PATH_COMPONENT; }
+            if ((len == 1 && value[start] == '.')
+                || (len == 2 && value[start] == '.' && value[start + 1] == '.')) {
+                ret PATH_DOT;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    ret PATH_CANONICAL;
+}
+
+# whether `value` is a canonical strict descendant of the project root: non-empty,
+# '/'-separated, no '\', not absolute, no drive letter, no empty component, no
+# '.' or '..' component
+# ---
+# value: the candidate path
+# ret:   true when every rule holds
+pub fun is_project_path(value: str) bool {
+    ret path_violation(value) == PATH_CANONICAL;
+}
+
+# the rule `-o` keeps wherever it names an output, which the cli prints and build refuses by
+pub val OUTPUT_CONSTRAINT: str = "-o must name a canonical path inside the project root: relative, with no . or .. component";
+
+# refuse a path that `is_project_path` does not admit, naming it as `field`
+# and pointing at `sp`, the value as written
+pub fun check_path(alloc: *A.Allocator, value: str, field: str, sp: toml_value.Span) err[fail.Fail] {
+    val k:         diagnostic_kind.Kind = diagnostic_kind.MANIFEST_PATH;
+    val violation: PathViolation        = path_violation(value);
+    if (violation == PATH_BACKSLASH) { ret fail_at(refuse(alloc, k, "mach.toml: {} contains a '\\\\'; manifest paths use '/'", field), sp); }
+    if (violation == PATH_EMPTY)     { ret fail_at(refuse(alloc, k, "mach.toml: {} must be a non-empty project-relative path", field), sp); }
+    if (violation == PATH_ABSOLUTE)  { ret fail_at(refuse(alloc, k, "mach.toml: {} must be relative to the project root", field), sp); }
+    if (violation == PATH_DRIVE)     { ret fail_at(refuse(alloc, k, "mach.toml: {} must not use an absolute drive path", field), sp); }
+    if (violation == PATH_COMPONENT) { ret fail_at(refuse(alloc, k, "mach.toml: {} contains an empty path component", field), sp); }
+    if (violation == PATH_DOT)       { ret fail_at(refuse(alloc, k, "mach.toml: {} must not contain '.' or '..' path components", field), sp); }
+    ret err[fail.Fail].ok{};
+}
+
+# a decoded array of strings, each interned
+# ---
+# items:   the ids, nil when the array is absent or empty
+# count:   how many
+# present: the key is written
+pub rec StrArr {
+    items:   *intern.StrId;
+    count:   u32;
+    present: bool;
+}
+
+# intern every element of an array of strings the schema check has admitted
+# ---
+# alloc: owns the id array, freed with `model.free_strarr`
+# itn:   receives the strings
+# arr:   the array, nil when the key is absent
+# label: the table, as a refusal names it
+# key:   the key the array is written under
+# ret:   the ids; err for an array too long to count, or a refused allocation
+pub fun ids_of(alloc: *A.Allocator, itn: *intern.Interner, arr: *toml_value.Array, label: str, key: str) res[StrArr, fail.Fail] {
+    var out: StrArr;
+    out.items   = nil;
+    out.count   = 0;
+    out.present = arr != nil;
+    if (arr == nil) { ret res[StrArr, fail.Fail].ok{out}; }
+
+    val n: usize = toml_lookup.array_len(arr);
+    if (n == 0) { ret res[StrArr, fail.Fail].ok{out}; }
+    if (n > 0xFFFFFFFF::usize) {
+        ret res[StrArr, fail.Fail].err{refuse(alloc, diagnostic_kind.MANIFEST_TOO_MANY_ENTRIES, "mach.toml: {}.{} has too many entries", label, key)};
+    }
+
+    val res_items: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](alloc, n);
+    if (sel res_items.err) { ret res[StrArr, fail.Fail].err{fail.refused(res_items.err)}; }
+    out.items = res_items.ok;
+    out.count = n::u32;
+    var handed: bool = false;
+    fin {
+        if (!handed) { A.deallocate[intern.StrId](alloc, out.items, n); }
+    }
+
+    var i: usize = 0;
+    for (i < n) {
+        val opt_array_get: opt[*toml_value.Value] = toml_lookup.array_get(arr, i);
+        var text:          str                    = nil;
+        if (sel opt_array_get.some) {
+            if (opt_array_get.some.tag == toml_value.TYPE_STRING) { text = opt_array_get.some.data.string; }
+        }
+        if (text == nil) { ret res[StrArr, fail.Fail].err{fail.message("internal: an array passed its schema check with an element that is not a string")}; }
+        val res_id_of: res[intern.StrId, fail.Fail] = id_of(itn, text);
+        if (sel res_id_of.err) { ret res[StrArr, fail.Fail].err{res_id_of.err}; }
+        out.items[i] = res_id_of.ok;
+        i            = i + 1;
+    }
+    handed = true;
+    ret res[StrArr, fail.Fail].ok{out};
+}

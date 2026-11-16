@@ -1,0 +1,310 @@
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.system.panic.panic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use base_alloc: mach.base.alloc;
+
+# a chunk holds a power of two of elements, so an index splits into chunk and offset by its bits
+val CHUNK_SHIFT:    usize = 6;
+val CHUNK_CAPACITY: usize = 1 << CHUNK_SHIFT;
+val CHUNK_MASK:     usize = CHUNK_CAPACITY - 1;
+
+# a store's refusal: the allocator's, a store or editor that is not live, an
+# identifier that belongs to another store, one whose slot was reused since
+# it was issued, or a second exclusive editor
+pub tag Error: u8 {
+    alloc: A.Error;
+    absent;
+    foreign;
+    stale;
+    busy;
+}
+
+pub fun text(e: Error) str {
+    if (sel e.alloc)   { ret base_alloc.text(e.alloc); }
+    or (sel e.absent)  { ret "store is not live"; }
+    or (sel e.foreign) { ret "identifier belongs to a different store"; }
+    or (sel e.stale)   { ret "identifier is stale"; }
+    ret "store already has an exclusive editor";
+}
+
+pub rec StableChunks[T] {
+    a:       *A.Allocator;
+    chunks:  Vector[*T];
+    len:     usize;
+    editing: bool;
+}
+
+pub rec ChunkEditor[T] {
+    store: *StableChunks[T];
+}
+
+pub fun chunk_init[T](a: *A.Allocator) StableChunks[T] {
+    var s: StableChunks[T];
+    s.a       = a;
+    s.chunks  = collections_vector.init[*T](a);
+    s.len     = 0;
+    s.editing = false;
+    ret s;
+}
+
+# release a store and its chunks; a nil store holds nothing
+pub fun chunk_dnit[T](s: *StableChunks[T]) {
+    if (s == nil) { ret; }
+    var i: usize = 0;
+    for (i < s.chunks.len) {
+        A.deallocate[T](s.a, s.chunks.data[i], CHUNK_CAPACITY);
+        i = i + 1;
+    }
+    collections_vector.dnit[*T](?s.chunks);
+    s.len     = 0;
+    s.editing = false;
+}
+
+pub fun chunk_count[T](s: *StableChunks[T]) usize {
+    if (s == nil) { ret 0; }
+    ret s.len;
+}
+
+# the element at `index`, absent past the end or on a nil store
+pub fun chunk_at[T](s: *StableChunks[T], index: usize) opt[*T] {
+    if (s == nil)       { ret opt[*T].none{}; }
+    if (index >= s.len) { ret opt[*T].none{}; }
+    val chunk: *T = s.chunks.data[index >> CHUNK_SHIFT];
+    ret opt[*T].some{?chunk[index & CHUNK_MASK]};
+}
+
+# the element at `index`, which the store handed out and so lies before its end; any
+# other index is a broken precondition of the caller, and it stops the compiler
+pub fun chunk_get[T](s: *StableChunks[T], index: usize) *T {
+    if (index >= s.len) { panic("handle: chunk read past the end of its store\n"); }
+    val chunk: *T = s.chunks.data[index >> CHUNK_SHIFT];
+    ret ?chunk[index & CHUNK_MASK];
+}
+
+pub fun chunk_editor[T](s: *StableChunks[T]) res[ChunkEditor[T], Error] {
+    if (s == nil)  { ret res[ChunkEditor[T], Error].err{Error.absent{}}; }
+    if (s.editing) { ret res[ChunkEditor[T], Error].err{Error.busy{}}; }
+    s.editing = true;
+    var e: ChunkEditor[T];
+    e.store = s;
+    ret res[ChunkEditor[T], Error].ok{e};
+}
+
+# end an edit of a store; an editor that opened no store ends nothing
+pub fun chunk_editor_finish[T](e: *ChunkEditor[T]) {
+    if (e == nil || e.store == nil) { ret; }
+    e.store.editing = false;
+    e.store         = nil;
+}
+
+fun chunk_grow_one[T](s: *StableChunks[T]) err[Error] {
+    val res_alloc: res[*T, A.Error] = A.zallocate[T](s.a, CHUNK_CAPACITY);
+    if (sel res_alloc.err) { ret err[Error].err{Error.alloc{res_alloc.err}}; }
+    val new_chunk: *T = res_alloc.ok;
+
+    val res_push: res[usize, A.Error] = collections_vector.push[*T](?s.chunks, new_chunk);
+    if (sel res_push.err) {
+        A.deallocate[T](s.a, new_chunk, CHUNK_CAPACITY);
+        ret err[Error].err{Error.alloc{res_push.err}};
+    }
+    ret err[Error].ok{};
+}
+
+pub fun chunk_grow[T](e: *ChunkEditor[T], additional: usize) err[Error] {
+    if (e == nil || e.store == nil) { ret err[Error].err{Error.absent{}}; }
+    val s: *StableChunks[T] = e.store;
+
+    val needed:   usize = s.len + additional;
+    var capacity: usize = s.chunks.len * CHUNK_CAPACITY;
+    var grown:    usize = 0;
+
+    for (capacity < needed) {
+        val err_grow: err[Error] = chunk_grow_one[T](s);
+        if (sel err_grow.err) {
+            var u: usize = 0;
+            for (u < grown) {
+                val opt_popped: opt[*T] = collections_vector.pop[*T](?s.chunks);
+                if (sel opt_popped.some) {
+                    A.deallocate[T](s.a, opt_popped.some, CHUNK_CAPACITY);
+                }
+                u = u + 1;
+            }
+            ret err_grow;
+        }
+        grown    = grown + 1;
+        capacity = capacity + CHUNK_CAPACITY;
+    }
+
+    ret err[Error].ok{};
+}
+
+pub fun chunk_append[T](e: *ChunkEditor[T], value: T) res[*T, Error] {
+    if (e == nil || e.store == nil) { ret res[*T, Error].err{Error.absent{}}; }
+    val s:        *StableChunks[T] = e.store;
+    val capacity: usize            = s.chunks.len * CHUNK_CAPACITY;
+
+    if (s.len == capacity) {
+        val err_grow: err[Error] = chunk_grow_one[T](s);
+        if (sel err_grow.err) { ret res[*T, Error].err{err_grow.err}; }
+    }
+
+    val offset: usize = s.len & CHUNK_MASK;
+    val chunk:  *T    = s.chunks.data[s.len >> CHUNK_SHIFT];
+    chunk[offset] = value;
+    s.len         = s.len + 1;
+    ret res[*T, Error].ok{?chunk[offset]};
+}
+
+rec HandleSlot[T] {
+    value:      T;
+    generation: u32;
+}
+
+pub rec HandleId[Domain] {
+    index:        usize;
+    generation:   u32;
+    instance_tag: usize;
+}
+
+pub rec HandleTable[T, Domain] {
+    a:         *A.Allocator;
+    slots:     StableChunks[HandleSlot[T]];
+    free_list: Vector[usize];
+    identity:  *u8;
+    editing:   bool;
+}
+
+pub rec HandleEditor[T, Domain] {
+    table: *HandleTable[T, Domain];
+}
+
+pub fun table_init[T, Domain](a: *A.Allocator) res[HandleTable[T, Domain], Error] {
+    val res_allocate: res[*u8, A.Error] = A.allocate[u8](a, 1);
+    if (sel res_allocate.err) { ret res[HandleTable[T, Domain], Error].err{Error.alloc{res_allocate.err}}; }
+    var t: HandleTable[T, Domain];
+    t.a         = a;
+    t.slots     = chunk_init[HandleSlot[T]](a);
+    t.free_list = collections_vector.init[usize](a);
+    t.identity  = res_allocate.ok;
+    t.editing   = false;
+    ret res[HandleTable[T, Domain], Error].ok{t};
+}
+
+# release a table and its slots; a nil table holds nothing
+pub fun table_dnit[T, Domain](t: *HandleTable[T, Domain]) {
+    if (t == nil) { ret; }
+    chunk_dnit[HandleSlot[T]](?t.slots);
+    collections_vector.dnit[usize](?t.free_list);
+    if (t.identity != nil) {
+        A.deallocate[u8](t.a, t.identity, 1);
+        t.identity = nil;
+    }
+    t.editing = false;
+}
+
+fun resolve[T, Domain](t: *HandleTable[T, Domain], id: HandleId[Domain]) res[*HandleSlot[T], Error] {
+    if (t == nil) { ret res[*HandleSlot[T], Error].err{Error.absent{}}; }
+    if (id.instance_tag != t.identity::usize) {
+        ret res[*HandleSlot[T], Error].err{Error.foreign{}};
+    }
+    val opt_slot: opt[*HandleSlot[T]] = chunk_at[HandleSlot[T]](?t.slots, id.index);
+    if (sel opt_slot.none) { ret res[*HandleSlot[T], Error].err{Error.stale{}}; }
+    val slot: *HandleSlot[T] = opt_slot.some;
+    if (slot.generation != id.generation) {
+        ret res[*HandleSlot[T], Error].err{Error.stale{}};
+    }
+    ret res[*HandleSlot[T], Error].ok{slot};
+}
+
+pub fun get[T, Domain](t: *HandleTable[T, Domain], id: HandleId[Domain]) res[*T, Error] {
+    val res_slot: res[*HandleSlot[T], Error] = resolve[T, Domain](t, id);
+    if (sel res_slot.err) { ret res[*T, Error].err{res_slot.err}; }
+    ret res[*T, Error].ok{?res_slot.ok.value};
+}
+
+pub fun edit[T, Domain](t: *HandleTable[T, Domain]) res[HandleEditor[T, Domain], Error] {
+    if (t == nil)  { ret res[HandleEditor[T, Domain], Error].err{Error.absent{}}; }
+    if (t.editing) { ret res[HandleEditor[T, Domain], Error].err{Error.busy{}}; }
+    t.editing = true;
+    var e: HandleEditor[T, Domain];
+    e.table = t;
+    ret res[HandleEditor[T, Domain], Error].ok{e};
+}
+
+# end an edit of a table; an editor that opened no table ends nothing
+pub fun editor_finish[T, Domain](e: *HandleEditor[T, Domain]) {
+    if (e == nil || e.table == nil) { ret; }
+    e.table.editing = false;
+    e.table         = nil;
+}
+
+pub fun editor_insert[T, Domain](e: *HandleEditor[T, Domain], value: T) res[HandleId[Domain], Error] {
+    if (e == nil || e.table == nil) { ret res[HandleId[Domain], Error].err{Error.absent{}}; }
+    val t: *HandleTable[T, Domain] = e.table;
+
+    if (t.free_list.len > 0) {
+        val opt_popped: opt[usize] = collections_vector.pop[usize](?t.free_list);
+        if (sel opt_popped.none) { ret res[HandleId[Domain], Error].err{Error.absent{}}; }
+        val idx:      usize               = opt_popped.some;
+        val opt_slot: opt[*HandleSlot[T]] = chunk_at[HandleSlot[T]](?t.slots, idx);
+        if (sel opt_slot.none) { ret res[HandleId[Domain], Error].err{Error.stale{}}; }
+        val slot: *HandleSlot[T] = opt_slot.some;
+        slot.value = value;
+
+        var id: HandleId[Domain];
+        id.index        = idx;
+        id.generation   = slot.generation;
+        id.instance_tag = t.identity::usize;
+        ret res[HandleId[Domain], Error].ok{id};
+    }
+
+    val idx: usize = chunk_count[HandleSlot[T]](?t.slots);
+
+    val res_chunk_editor: res[ChunkEditor[HandleSlot[T]], Error] = chunk_editor[HandleSlot[T]](?t.slots);
+    if (sel res_chunk_editor.err) { ret res[HandleId[Domain], Error].err{res_chunk_editor.err}; }
+    var ce: ChunkEditor[HandleSlot[T]] = res_chunk_editor.ok;
+
+    var fresh: HandleSlot[T];
+    fresh.value      = value;
+    fresh.generation = 0;
+    val res_push: res[*HandleSlot[T], Error] = chunk_append[HandleSlot[T]](?ce, fresh);
+    chunk_editor_finish[HandleSlot[T]](?ce);
+    if (sel res_push.err) { ret res[HandleId[Domain], Error].err{res_push.err}; }
+
+    var id: HandleId[Domain];
+    id.index        = idx;
+    id.generation   = 0;
+    id.instance_tag = t.identity::usize;
+    ret res[HandleId[Domain], Error].ok{id};
+}
+
+pub fun editor_remove[T, Domain](e: *HandleEditor[T, Domain], id: HandleId[Domain]) res[T, Error] {
+    if (e == nil || e.table == nil) { ret res[T, Error].err{Error.absent{}}; }
+    val t:        *HandleTable[T, Domain]    = e.table;
+    val res_slot: res[*HandleSlot[T], Error] = resolve[T, Domain](t, id);
+    if (sel res_slot.err) { ret res[T, Error].err{res_slot.err}; }
+    val slot: *HandleSlot[T] = res_slot.ok;
+
+    val value: T = slot.value;
+    slot.generation = slot.generation + 1;
+
+    val res_push: res[usize, A.Error] = collections_vector.push[usize](?t.free_list, id.index);
+    if (sel res_push.err) {
+        slot.generation = slot.generation - 1;
+        ret res[T, Error].err{Error.alloc{res_push.err}};
+    }
+
+    ret res[T, Error].ok{value};
+}

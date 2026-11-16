@@ -42,7 +42,7 @@ pub val CHECK: std_args.Flag = std_args.Flag;
 ## fun report
 
 ```mach
-pub fun report(diagnostics: *cli_diagnostic.Report, sources: *lang_source.SourceMap, transform: Transform) Report;
+pub fun report(diagnostics: *cli_diagnostic.Report, sources: *base_source.SourceMap, transform: Transform) Report;
 ```
 
 a pass with nothing read yet
