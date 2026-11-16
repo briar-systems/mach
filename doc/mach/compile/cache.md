@@ -46,7 +46,7 @@ recorded (compile/cache/objects)
 | [`configuration`](#configuration) | what every module's key shares: the compiler identity, the configuration bytes the driver captured (target, platform, project identity), the request, the realized dependency closure and the link requirements |
 | [`test_object_path`](#test_object_path) | where the build writes module m's test object: `obj/<project>/<module path>.test.<ext>` |
 | [`has_test_object`](#has_test_object) | the module gets a test object in this build: a test build, and a module whose source declares a test or a `#[testing]` declaration |
-| [`early_restore_enabled`](#early_restore_enabled) | a module whose object is cached skips lowering when nothing else needs its unit: the ir and asm emitters read it |
+| [`early_restore_enabled`](#early_restore_enabled) | an object is restored from the cache only when no emitter is on: the ir text and the listing are written as a module or an instance unit compiles, so under `--emit ir` or `--emit asm` every one of them compiles |
 | [`restored`](#restored) | the module's codegen product is its cached object under the key this load built, whether it is still staged or a query already took it |
 | [`staged_restored`](#staged_restored) | restored and still staged, which is what the codegen query publishes |
 | [`test_restored`](#test_restored) | the module's test object is its cached object under the key this load built |
@@ -160,8 +160,9 @@ source declares a test or a `#[testing]` declaration
 pub fun early_restore_enabled(p: *project.Project) bool
 ```
 
-a module whose object is cached skips lowering when nothing else needs its
-unit: the ir and asm emitters read it
+an object is restored from the cache only when no emitter is on: the ir text and the
+listing are written as a module or an instance unit compiles, so under `--emit ir` or
+`--emit asm` every one of them compiles
 
 ### restored
 
