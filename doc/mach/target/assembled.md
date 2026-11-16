@@ -8,9 +8,9 @@ mirl assembles a target from the target mink resolved, masc's check of its basel
 the output kind under build, reading no text, and opens the build the target's added
 extensions select over it. the tuple of the target's parts names the modules built for it
 
-<sub>source: [`src/target/assembled.mach`](../../../src/target/assembled.mach) · imported by 4 modules</sub>
+Source: [`src/target/assembled.mach`](../../../src/target/assembled.mach)
 
-<sub>`mirl_record` is `mirl.target.record` · `mirl_basis` is `mirl.target.basis` · `A` is `std.allocator` · `resolved` is [`mach.target.resolved`](resolved.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.target.resolved`](resolved.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -34,8 +34,8 @@ extensions select over it. the tuple of the target's parts names the modules bui
 ```mach
 pub rec Assembled {
     tuple:  Tuple;
-    target: mirl_record.Target;
-    basis:  mirl_basis.Basis;
+    target: mirl.target.record.Target;
+    basis:  mirl.target.basis.Basis;
     based:  bool;
     names:  [resolved.MAX_ADDED]str;
     count:  usize;
@@ -54,7 +54,7 @@ added names to
 ### assemble
 
 ```mach
-pub fun assemble(a: *A.Allocator, t: *resolved.Target) res[*Assembled, fail.Fail]
+pub fun assemble(a: *std.allocator.Allocator, t: *mach.target.resolved.Target) res[*Assembled, mach.base.fail.Fail]
 ```
 
 the target mirl assembles for `t`, with the build its added extensions select
@@ -71,7 +71,7 @@ the names the target adds over its baseline
 ### basis_of
 
 ```mach
-pub fun basis_of(x: *Assembled) opt[*mirl_basis.Basis]
+pub fun basis_of(x: *Assembled) opt[*mirl.target.basis.Basis]
 ```
 
 the build basis the added extensions opened, none for a target that states no baseline
@@ -79,7 +79,7 @@ the build basis the added extensions opened, none for a target that states no ba
 ### dnit
 
 ```mach
-pub fun dnit(a: *A.Allocator, x: *Assembled)
+pub fun dnit(a: *std.allocator.Allocator, x: *Assembled)
 ```
 
 ## Functions
@@ -87,7 +87,7 @@ pub fun dnit(a: *A.Allocator, x: *Assembled)
 ### tuple_of
 
 ```mach
-pub fun tuple_of(t: *resolved.Target) Tuple
+pub fun tuple_of(t: *mach.target.resolved.Target) Tuple
 ```
 
 the tuple a resolved target names its owners' parts by

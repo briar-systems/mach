@@ -7,9 +7,9 @@ of them at once, each bounded by the run's timeout and its output captured to
 a log beside the dispatcher. a test is classified and reported to the readout
 the moment it is reaped, and the run closes with its summary
 
-<sub>source: [`src/build/testing/pool.mach`](../../../../src/build/testing/pool.mach) · imported by 1 module</sub>
+Source: [`src/build/testing/pool.mach`](../../../../src/build/testing/pool.mach)
 
-<sub>`runner` is [`mach.manifest.runner`](../../manifest/runner.md) · `chrono_duration` is `std.chrono.duration` · `A` is `std.allocator` · `readout` is [`mach.report.readout`](../../report/readout.md) · `testrun` is [`mach.report.testrun`](../../report/testrun.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.manifest.runner`](../../manifest/runner.md), [`mach.report.readout`](../../report/readout.md), [`mach.report.testrun`](../../report/testrun.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -26,9 +26,9 @@ the moment it is reaped, and the run closes with its summary
 
 ```mach
 pub rec Config {
-    runner:  *runner.Runner;
+    runner:  *mach.manifest.runner.Runner;
     threads: u32;
-    timeout: chrono_duration.Duration;
+    timeout: std.chrono.duration.Duration;
     level:   u8;
     bytes:   bool;
 }
@@ -38,16 +38,16 @@ how a run executes its tests
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `runner` | `*runner.Runner` | what each test is launched through, or nil for the test to run itself |
+| `runner` | `*mach.manifest.runner.Runner` | what each test is launched through, or nil for the test to run itself |
 | `threads` | `u32` | how many tests run at once, at least one |
-| `timeout` | `chrono_duration.Duration` | each test's bound, 0 for none |
+| `timeout` | `std.chrono.duration.Duration` | each test's bound, 0 for none |
 | `level` | `u8` | the readout level; a passing test's output is kept only at the items level |
 | `bytes` | `bool` | whether a test's captured output is kept for the renderer |
 
 ### run
 
 ```mach
-pub fun run(a: *A.Allocator, sink: *readout.Sink, arts: *testrun.TestArtifact, n: u32, config: *Config) res[Counts, fail.Fail]
+pub fun run(a: *std.allocator.Allocator, sink: *mach.report.readout.Sink, arts: *mach.report.testrun.TestArtifact, n: u32, config: *Config) res[Counts, mach.base.fail.Fail]
 ```
 
 run one set of tests, each reported to sink as it finishes, and close the run

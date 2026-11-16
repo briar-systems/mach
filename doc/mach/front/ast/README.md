@@ -8,7 +8,7 @@ each node kind and each side list lives in its own table, and a node is named by
 in that table (`mach.front.ast.id`). a tree can be copied, marked and rolled back past a
 failed parse, compared by shape, and searched for the node that encloses a byte offset.
 
-<sub>[`mach.front.ast`](../ast.md) · 7 modules · imports [`base`](../../base/README.md), [`type`](../../type/README.md) · imported by [`build`](../../build/README.md), [`compile`](../../compile/README.md), [`lower`](../../lower/README.md), [`tool`](../../tool/README.md)</sub>
+The directory's root module is [`mach.front.ast`](../ast.md).
 
 | Module | |
 | :--- | :--- |

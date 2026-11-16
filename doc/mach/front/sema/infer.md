@@ -5,13 +5,13 @@
 typing expressions: each expression's type, the checks on its operands, and the instances
 its calls ask for
 
-<sub>source: [`src/front/sema/infer.mach`](../../../../src/front/sema/infer.mach) · imported by 5 modules</sub>
+Source: [`src/front/sema/infer.mach`](../../../../src/front/sema/infer.mach)
 
-<sub>`sema_context` is [`mach.front.sema.context`](context.md) · `ast_id` is [`mach.front.ast.id`](../ast/id.md) · `type_kind` is [`mach.type.kind`](../../type/kind.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `comptime_scope` is [`mach.front.comptime.scope`](../comptime/scope.md) · `ast` is [`mach.front.ast`](../ast.md) · `ast_decl` is [`mach.front.ast.decl`](../ast/decl.md) · `base_source` is [`mach.base.source`](../../base/source.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../../base/source.md), [`mach.front.ast`](../ast.md), [`mach.front.ast.decl`](../ast/decl.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.comptime.scope`](../comptime/scope.md), [`mach.front.sema.context`](context.md), [`mach.type.kind`](../../type/kind.md).
 
 | Functions | |
 | :--- | :--- |
-| [`infer_decl`](#infer_decl) · [`infer_expr`](#infer_expr) · [`is_field_type_operand`](#is_field_type_operand) | |
+| [`infer_decl`](#infer_decl), [`infer_expr`](#infer_expr), [`is_field_type_operand`](#is_field_type_operand) | |
 | [`timed_of`](#timed_of) | the constant-time mode `#[constant_time]` gives declaration `d` of syntax `a`, read under the decorator scope `c` |
 | [`field_seq_owner`](#field_seq_owner) | |
 | [`case_seq_owner`](#case_seq_owner) | `$cases(T)` enumerates the cases of one public tag; a secret shape is refused because outer secrecy protects the active case, and a generic parameter defers to its instantiation |
@@ -24,25 +24,25 @@ its calls ask for
 ### infer_decl
 
 ```mach
-pub fun infer_decl(sc: *sema_context.SemaContext, did: ast_id.DeclId) type_kind.TypeId
+pub fun infer_decl(sc: *mach.front.sema.context.SemaContext, did: mach.front.ast.id.DeclId) mach.type.kind.TypeId
 ```
 
 ### infer_expr
 
 ```mach
-pub fun infer_expr(sc: *sema_context.SemaContext, eid: ast_id.ExprId) type_kind.TypeId
+pub fun infer_expr(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId) mach.type.kind.TypeId
 ```
 
 ### is_field_type_operand
 
 ```mach
-pub fun is_field_type_operand(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[bool, fail.Fail]
+pub fun is_field_type_operand(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId) res[bool, mach.base.fail.Fail]
 ```
 
 ### timed_of
 
 ```mach
-pub fun timed_of(sc: *sema_context.SemaContext, c: *comptime_scope.ComptimeCtx, a: *ast.Ast, d: *ast_decl.Decl) u8
+pub fun timed_of(sc: *mach.front.sema.context.SemaContext, c: *mach.front.comptime.scope.ComptimeCtx, a: *mach.front.ast.Ast, d: *mach.front.ast.decl.Decl) u8
 ```
 
 the constant-time mode `#[constant_time]` gives declaration `d` of syntax `a`, read under the decorator scope `c`
@@ -50,13 +50,13 @@ the constant-time mode `#[constant_time]` gives declaration `d` of syntax `a`, r
 ### field_seq_owner
 
 ```mach
-pub fun field_seq_owner(sc: *sema_context.SemaContext, seq_eid: ast_id.ExprId, span: base_source.Span) type_kind.TypeId
+pub fun field_seq_owner(sc: *mach.front.sema.context.SemaContext, seq_eid: mach.front.ast.id.ExprId, span: mach.base.source.Span) mach.type.kind.TypeId
 ```
 
 ### case_seq_owner
 
 ```mach
-pub fun case_seq_owner(sc: *sema_context.SemaContext, seq_eid: ast_id.ExprId, span: base_source.Span) type_kind.TypeId
+pub fun case_seq_owner(sc: *mach.front.sema.context.SemaContext, seq_eid: mach.front.ast.id.ExprId, span: mach.base.source.Span) mach.type.kind.TypeId
 ```
 
 `$cases(T)` enumerates the cases of one public tag; a secret shape is refused because outer
@@ -65,6 +65,6 @@ secrecy protects the active case, and a generic parameter defers to its instanti
 ### type_is_generic_param
 
 ```mach
-pub fun type_is_generic_param(sc: *sema_context.SemaContext, ty: type_kind.TypeId) bool
+pub fun type_is_generic_param(sc: *mach.front.sema.context.SemaContext, ty: mach.type.kind.TypeId) bool
 ```
 

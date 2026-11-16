@@ -18,9 +18,9 @@ time less every row.
 a counter is a number an owner keeps of what it made, posted per module and closed into the
 unit's total, a sum or the most any module reached.
 
-<sub>source: [`src/report/readout.mach`](../../../src/report/readout.mach) · imported by 13 modules</sub>
+Source: [`src/report/readout.mach`](../../../src/report/readout.mach)
 
-<sub>`chrono_duration` is `std.chrono.duration` · `testrun` is [`mach.report.testrun`](testrun.md) · `Failure` is private · `Diagnostics` is private · `TestEnd` is private · `fail` is [`mach.base.fail`](../base/fail.md) · `diagnostic` is [`mach.base.diagnostic`](../base/diagnostic.md) · `base_source` is [`mach.base.source`](../base/source.md) · `time` is `std.chrono.time` · `PhaseState` is private · `Posted` is private · `A` is `std.allocator`</sub>
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.report.testrun`](testrun.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -42,7 +42,7 @@ unit's total, a sum or the most any module reached.
 
 | On `Phase` | |
 | :--- | :--- |
-| [`LOAD`](#phase) · [`RESOLVE`](#phase) · [`SEMA`](#phase) · [`LOWER`](#phase) · [`CODEGEN`](#phase) · [`EMIT`](#phase) · [`LINK`](#phase) · [`CACHE`](#phase) | |
+| [`LOAD`](#phase), [`RESOLVE`](#phase), [`SEMA`](#phase), [`LOWER`](#phase), [`CODEGEN`](#phase), [`EMIT`](#phase), [`LINK`](#phase), [`CACHE`](#phase) | |
 | [`TEST_LOWER`](#phase) | a test build's test objects, lowered against their modules' normal objects |
 | [`TEST_CODEGEN`](#phase) | a test build's test objects, generated |
 | [`STEPS`](#phase) | the build steps a project and its dependencies declare |
@@ -112,7 +112,7 @@ unit's total, a sum or the most any module reached.
 | [`STAGE_COUNT`](#constants) | mirl's and masc's stages, the rows a module's step carves out of its codegen row, in the order mirl runs them |
 | [`STAGES`](#constants) | |
 | [`LEVEL_RESULTS`](#constants) | what a sink asks to receive |
-| [`LEVEL_PHASES`](#constants) · [`LEVEL_ITEMS`](#constants) | |
+| [`LEVEL_PHASES`](#constants), [`LEVEL_ITEMS`](#constants) | |
 
 ---
 
@@ -206,11 +206,11 @@ pub rec PhaseEnd {
     count:           u32;
     noun_one:        str;
     noun_many:       str;
-    elapsed:         chrono_duration.Duration;
+    elapsed:         std.chrono.duration.Duration;
     workers:         u32;
     dropped:         u32;
     slowest:         str;
-    slowest_elapsed: chrono_duration.Duration;
+    slowest_elapsed: std.chrono.duration.Duration;
 }
 ```
 
@@ -224,7 +224,7 @@ LEVEL_ITEMS its slowest item, nil when it had fewer than two
 pub rec Item {
     phase:   Phase;
     name:    str;
-    elapsed: chrono_duration.Duration;
+    elapsed: std.chrono.duration.Duration;
 }
 ```
 
@@ -251,8 +251,8 @@ pub rec Summary {
     modules:  u32;
     bytes:    usize;
     has_size: bool;
-    other:    chrono_duration.Duration;
-    total:    chrono_duration.Duration;
+    other:    std.chrono.duration.Duration;
+    total:    std.chrono.duration.Duration;
 }
 ```
 
@@ -263,12 +263,12 @@ the output is one file, the time no row accounts for, and the unit's wall time
 
 ```mach
 pub rec TestResult {
-    art:       *testrun.TestArtifact;
+    art:       *mach.report.testrun.TestArtifact;
     done:      bool;
-    result:    testrun.GateResult;
+    result:    mach.report.testrun.GateResult;
     code:      i32;
-    elapsed:   chrono_duration.Duration;
-    bound:     chrono_duration.Duration;
+    elapsed:   std.chrono.duration.Duration;
+    bound:     std.chrono.duration.Duration;
     out:       *u8;
     out_len:   usize;
     truncated: bool;
@@ -305,8 +305,8 @@ pub rec RunEnd {
     failed:    u32;
     skipped:   u32;
     timed_out: u32;
-    wall:      chrono_duration.Duration;
-    tally:     *testrun.GateTally;
+    wall:      std.chrono.duration.Duration;
+    tally:     *mach.report.testrun.GateTally;
 }
 ```
 
@@ -373,7 +373,7 @@ a unit starts; a nil sink is a no-op
 ### failure
 
 ```mach
-pub fun failure(sink: *Sink, f: *fail.Fail, origin: diagnostic.Origin)
+pub fun failure(sink: *Sink, f: *mach.base.fail.Fail, origin: mach.base.diagnostic.Origin)
 ```
 
 a failure reached no store; a nil sink is a no-op
@@ -381,7 +381,7 @@ a failure reached no store; a nil sink is a no-op
 ### diagnostics
 
 ```mach
-pub fun diagnostics(sink: *Sink, sources: *base_source.SourceMap, diags: *diagnostic.DiagnosticStore)
+pub fun diagnostics(sink: *Sink, sources: *mach.base.source.SourceMap, diags: *mach.base.diagnostic.DiagnosticStore)
 ```
 
 a unit's diagnostics, sent when it has any; a nil sink is a no-op
@@ -423,7 +423,7 @@ a test run ended; a nil sink is a no-op
 ## Instant
 
 ```mach
-pub def Instant: opt[time.Instant]
+pub def Instant: opt[std.chrono.time.Instant]
 ```
 
 an instant a readout measures from: absent when the platform clock refused
@@ -440,7 +440,7 @@ the instant now, or none when the clock refused
 ### elapsed
 
 ```mach
-pub fun elapsed(start: Instant) chrono_duration.Duration
+pub fun elapsed(start: Instant) std.chrono.duration.Duration
 ```
 
 the time since start, zero when either sample is absent
@@ -451,7 +451,7 @@ the time since start, zero when either sample is absent
 pub rec Progress {
     sink:       *Sink;
     unit_start: Instant;
-    unit_rows:  chrono_duration.Duration;
+    unit_rows:  std.chrono.duration.Duration;
     phases:     [PHASE_COUNT]PhaseState;
     posted:     *Posted;
     post_cap:   usize;
@@ -533,7 +533,7 @@ the span from start belongs to the hosted phase ph, and was spent outside every 
 ### carve
 
 ```mach
-pub fun carve(pr: *Progress, ph: Phase, host: Phase, d: chrono_duration.Duration)
+pub fun carve(pr: *Progress, ph: Phase, host: Phase, d: std.chrono.duration.Duration)
 ```
 
 the time d belongs to ph, and leaves the phase host that spent it
@@ -557,7 +557,7 @@ name finished phase ph, measured from start
 ### item_spent
 
 ```mach
-pub fun item_spent(pr: *Progress, ph: Phase, name: str, d: chrono_duration.Duration)
+pub fun item_spent(pr: *Progress, ph: Phase, name: str, d: std.chrono.duration.Duration)
 ```
 
 name spent d in phase ph, measured by its caller
@@ -581,7 +581,7 @@ send the unit's total of every counter posted since the last close, then start t
 ### workers_begin
 
 ```mach
-pub fun workers_begin(pr: *Progress, a: *A.Allocator, n: usize) err[fail.Fail]
+pub fun workers_begin(pr: *Progress, a: *std.allocator.Allocator, n: usize) err[mach.base.fail.Fail]
 ```
 
 open the item queue of a parallel section that posts at most n items. the
@@ -590,7 +590,7 @@ queue's storage is drawn from a and returned by workers_end
 ### item_post
 
 ```mach
-pub fun item_post(pr: *Progress, ph: Phase, name: str, d: chrono_duration.Duration)
+pub fun item_post(pr: *Progress, ph: Phase, name: str, d: std.chrono.duration.Duration)
 ```
 
 a worker thread's item: queued, then delivered by this thread unless another
@@ -599,7 +599,7 @@ holds the drain, which then delivers it. name must outlive the section
 ### workers_end
 
 ```mach
-pub fun workers_end(pr: *Progress, a: *A.Allocator, ph: Phase, n: u32)
+pub fun workers_end(pr: *Progress, a: *std.allocator.Allocator, ph: Phase, n: u32)
 ```
 
 close a parallel section of phase ph that ran on n workers, after every worker

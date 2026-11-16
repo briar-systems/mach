@@ -14,9 +14,9 @@ layout is `"MDM5"`, the 32-byte compiler digest, the entry count, the
 entries, then the sha-256 of everything before it. an entry is the text's
 digest then its three surface digests, every number little endian
 
-<sub>source: [`src/compile/cache/memo.mach`](../../../../src/compile/cache/memo.mach) · imported by 1 module</sub>
+Source: [`src/compile/cache/memo.mach`](../../../../src/compile/cache/memo.mach)
 
-<sub>`A` is `std.allocator` · `Entry` is private · `map` is `std.collections.map` · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -25,7 +25,7 @@ digest then its three surface digests, every number little endian
 
 | On `Memo` | |
 | :--- | :--- |
-| [`init`](#init) · [`dnit`](#dnit) | |
+| [`init`](#init), [`dnit`](#dnit) | |
 | [`lookup`](#lookup) | the surface digests remembered for the text whose digest `out.content` holds, written into `out`; false when the memo holds none |
 | [`record`](#record) | remember the digests of a text, under its digest |
 | [`decode`](#decode) | the memo `bytes` hold for `compiler`: every entry, or none at all when the bytes are not a complete memo of that compiler |
@@ -53,10 +53,10 @@ body, and its template text without positions and with the positions of what it 
 
 ```mach
 pub rec Memo {
-    alloc:    *A.Allocator;
+    alloc:    *std.allocator.Allocator;
     compiler: [32]u8;
     entries:  Vector[Entry];
-    index:    map.Map[u64, u32];
+    index:    std.collections.map.Map[u64, u32];
     dirty:    bool;
 }
 ```
@@ -64,7 +64,7 @@ pub rec Memo {
 ### init
 
 ```mach
-pub fun init(a: *A.Allocator, compiler: *[32]u8) Memo
+pub fun init(a: *std.allocator.Allocator, compiler: *[32]u8) Memo
 ```
 
 ### dnit
@@ -85,7 +85,7 @@ written into `out`; false when the memo holds none
 ### record
 
 ```mach
-pub fun record(m: *Memo, d: *Digests) err[A.Error]
+pub fun record(m: *Memo, d: *Digests) err[std.allocator.Error]
 ```
 
 remember the digests of a text, under its digest
@@ -93,7 +93,7 @@ remember the digests of a text, under its digest
 ### decode
 
 ```mach
-pub fun decode(a: *A.Allocator, compiler: *[32]u8, bytes: *u8, len: usize) res[Memo, A.Error]
+pub fun decode(a: *std.allocator.Allocator, compiler: *[32]u8, bytes: *u8, len: usize) res[Memo, std.allocator.Error]
 ```
 
 the memo `bytes` hold for `compiler`: every entry, or none at all when the
@@ -102,7 +102,7 @@ bytes are not a complete memo of that compiler. err only when allocation fails
 ### encode
 
 ```mach
-pub fun encode(m: *Memo, a: *A.Allocator, out_len: *usize) res[*u8, A.Error]
+pub fun encode(m: *Memo, a: *std.allocator.Allocator, out_len: *usize) res[*u8, std.allocator.Error]
 ```
 
 the memo's used entries as bytes, res_allocate in a and owned by the caller
@@ -110,7 +110,7 @@ the memo's used entries as bytes, res_allocate in a and owned by the caller
 ### load
 
 ```mach
-pub fun load(a: *A.Allocator, compiler: *[32]u8, file: str) res[Memo, A.Error]
+pub fun load(a: *std.allocator.Allocator, compiler: *[32]u8, file: str) res[Memo, std.allocator.Error]
 ```
 
 the memo stored at `file`, empty when there is none or it cannot be read;
@@ -119,7 +119,7 @@ the file's bytes pass through `a` and are released before return
 ### store
 
 ```mach
-pub fun store(m: *Memo, out_dir: str, file: str) err[fail.Fail]
+pub fun store(m: *Memo, out_dir: str, file: str) err[mach.base.fail.Fail]
 ```
 
 write the memo to `file` through a sibling temporary when it would change: an

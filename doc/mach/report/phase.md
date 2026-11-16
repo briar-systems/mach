@@ -7,9 +7,9 @@ the status a phase ends with: accepted, rejected through diagnostics, or failed
 a status counts its rejections, keeps the first failure that is not the input's, and merges
 into another.
 
-<sub>source: [`src/report/phase.mach`](../../../src/report/phase.mach) · imported by 45 modules</sub>
+Source: [`src/report/phase.mach`](../../../src/report/phase.mach)
 
-<sub>`fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -18,11 +18,11 @@ into another.
 
 | On `PhaseStatus` | |
 | :--- | :--- |
-| [`accepted`](#accepted) · [`reject`](#reject) | |
+| [`accepted`](#accepted), [`reject`](#reject) | |
 | [`internal`](#internal) | fail the phase with the defect `f` names, or with `f` itself when the machine refused, which is no defect, unless it failed so already |
 | [`is_accepted`](#is_accepted) | |
 | [`internal_failure`](#internal_failure) | the internal failure, absent unless the phase failed internally |
-| [`phase_failure`](#phase_failure) · [`merge`](#merge) | |
+| [`phase_failure`](#phase_failure), [`merge`](#merge) | |
 
 ---
 
@@ -32,7 +32,7 @@ into another.
 pub tag PhaseKind: u8 {
     accepted;
     rejected;
-    internal: fail.Fail;
+    internal: mach.base.fail.Fail;
 }
 ```
 
@@ -65,7 +65,7 @@ pub fun reject(s: *PhaseStatus)
 ### internal
 
 ```mach
-pub fun internal(s: *PhaseStatus, f: fail.Fail)
+pub fun internal(s: *PhaseStatus, f: mach.base.fail.Fail)
 ```
 
 fail the phase with the defect `f` names, or with `f` itself when the machine refused, which
@@ -80,7 +80,7 @@ pub fun is_accepted(s: PhaseStatus) bool
 ### internal_failure
 
 ```mach
-pub fun internal_failure(s: PhaseStatus) opt[fail.Fail]
+pub fun internal_failure(s: PhaseStatus) opt[mach.base.fail.Fail]
 ```
 
 the internal failure, absent unless the phase failed internally
@@ -88,7 +88,7 @@ the internal failure, absent unless the phase failed internally
 ### phase_failure
 
 ```mach
-pub fun phase_failure(s: PhaseStatus) fail.Fail
+pub fun phase_failure(s: PhaseStatus) mach.base.fail.Fail
 ```
 
 ### merge

@@ -8,9 +8,9 @@ a test binary's `main` reads its first argument as a test's index, calls that te
 with its result: a result outside 0 to 255 exits `TEST_STATUS_WIDE`, and a missing or bad index
 exits 2. a test's name and symbol is `<module path>#<identifier>`.
 
-<sub>source: [`src/lower/testrunner.mach`](../../../src/lower/testrunner.mach) · imported by 4 modules</sub>
+Source: [`src/lower/testrunner.mach`](../../../src/lower/testrunner.mach)
 
-<sub>`intern` is [`mach.base.intern`](../base/intern.md) · `session` is [`mach.session`](../session.md) · `lower_context` is [`mach.lower.context`](context.md) · `mirl_module` is `mirl.ir.module` · `fail` is [`mach.base.fail`](../base/fail.md) · `ast` is [`mach.front.ast`](../front/ast.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.front.ast`](../front/ast.md), [`mach.lower.context`](context.md), [`mach.session`](../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -42,7 +42,7 @@ exits 2. a test's name and symbol is `<module path>#<identifier>`.
 
 ```mach
 pub rec Test {
-    name:    intern.StrId;
+    name:    mach.base.intern.StrId;
     line:    u32;
     mod_idx: u32;
 }
@@ -53,7 +53,7 @@ name: the qualified name `<module path>#<identifier>`, which is also the test's 
 ### synthesize_dispatcher
 
 ```mach
-pub fun synthesize_dispatcher(s: *session.Session, machine: *lower_context.Machine, main: intern.StrId, tests: *Test, count: u32) res[mirl_module.Module, fail.Fail]
+pub fun synthesize_dispatcher(s: *mach.session.Session, machine: *mach.lower.context.Machine, main: mach.base.intern.StrId, tests: *Test, count: u32) res[mirl.ir.module.Module, mach.base.fail.Fail]
 ```
 
 synthesize the test dispatcher module: a `main(argc, argv)` that parses argv[1]
@@ -90,7 +90,7 @@ pub fun collected_init() Collected
 ### collect_module
 
 ```mach
-pub fun collect_module(s: *session.Session, c: *Collected, unit: *lower_context.Unit, mod_idx: u32) err[fail.Fail]
+pub fun collect_module(s: *mach.session.Session, c: *Collected, unit: *mach.lower.context.Unit, mod_idx: u32) err[mach.base.fail.Fail]
 ```
 
 the test declarations of one lowered module, in function order
@@ -98,7 +98,7 @@ the test declarations of one lowered module, in function order
 ### collected_dnit
 
 ```mach
-pub fun collected_dnit(s: *session.Session, c: *Collected)
+pub fun collected_dnit(s: *mach.session.Session, c: *Collected)
 ```
 
 release a collection; a nil collection holds nothing
@@ -106,7 +106,7 @@ release a collection; a nil collection holds nothing
 ### push
 
 ```mach
-pub fun push(s: *session.Session, c: *Collected, t: Test) err[fail.Fail]
+pub fun push(s: *mach.session.Session, c: *Collected, t: Test) err[mach.base.fail.Fail]
 ```
 
 ## Functions
@@ -114,7 +114,7 @@ pub fun push(s: *session.Session, c: *Collected, t: Test) err[fail.Fail]
 ### declares_tests
 
 ```mach
-pub fun declares_tests(a: *ast.Ast) bool
+pub fun declares_tests(a: *mach.front.ast.Ast) bool
 ```
 
 the module has a test object: its source declares a test or a `#[testing]`

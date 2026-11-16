@@ -8,9 +8,9 @@ expansiveness, each a module under this one. the facts worth keeping are cached 
 record that only this module reads or writes, stamped with the projection generation
 they were derived under
 
-<sub>source: [`src/type/query.mach`](../../../src/type/query.mach) · imported by 16 modules</sub>
+Source: [`src/type/query.mach`](../../../src/type/query.mach)
 
-<sub>`map` is `std.collections.map` · `type_kind` is [`mach.type.kind`](kind.md) · `A` is `std.allocator` · `type` is [`mach.type`](../type.md) · `report_phase` is [`mach.report.phase`](../report/phase.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `type_scan` is [`mach.type.scan`](scan.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.report.phase`](../report/phase.md), [`mach.type`](../type.md), [`mach.type.kind`](kind.md), [`mach.type.scan`](scan.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -19,14 +19,14 @@ they were derived under
 
 | On `Facts` | |
 | :--- | :--- |
-| [`facts_init`](#facts_init) · [`facts_dnit`](#facts_dnit) | |
+| [`facts_init`](#facts_init), [`facts_dnit`](#facts_dnit) | |
 
 | On `Query` | |
 | :--- | :--- |
 | [`descend`](#descend) | whether a walk that builds types may descend another level: false once the stack has no room left, which refuses the query and unwinds every walk under it |
 | [`answer`](#answer) | a query's answer, or the internal failure it met, or its refusal of the input |
 | [`settled`](#settled) | a query that answers nothing but whether it met an internal failure or refused the input |
-| [`refused`](#refused) · [`failed`](#failed) | |
+| [`refused`](#refused), [`failed`](#failed) | |
 | [`inherit`](#inherit) | a failure a query asked under this one returned: its refusal of the input is this query's, and any other failure is internal |
 | [`scan_begin`](#scan_begin) | opens `scan` over the store; false, with the failure recorded, when it cannot |
 | [`scan_end`](#scan_end) | |
@@ -47,8 +47,8 @@ they were derived under
 ```mach
 pub rec Facts {
     generation: u64;
-    expansive:  map.Map[type_kind.TypeId, bool];
-    mentions:   map.Map[type_kind.TypeId, bool];
+    expansive:  std.collections.map.Map[mach.type.kind.TypeId, bool];
+    mentions:   std.collections.map.Map[mach.type.kind.TypeId, bool];
 }
 ```
 
@@ -58,7 +58,7 @@ fields mention a type parameter. a lookup under a later generation drops them fi
 ### facts_init
 
 ```mach
-pub fun facts_init(a: *A.Allocator) Facts
+pub fun facts_init(a: *std.allocator.Allocator) Facts
 ```
 
 ### facts_dnit
@@ -71,9 +71,9 @@ pub fun facts_dnit(f: *Facts)
 
 ```mach
 pub rec Query {
-    types:  *type.TypeInterner;
+    types:  *mach.type.TypeInterner;
     facts:  *Facts;
-    status: *report_phase.PhaseStatus;
+    status: *mach.report.phase.PhaseStatus;
     # a walk that builds types met one nested deeper than the stack lets it descend, so
     # the query has no answer and refuses the input (`nesting`), which the node that asked
     # reports
@@ -96,7 +96,7 @@ room left, which refuses the query and unwinds every walk under it
 ### answer
 
 ```mach
-pub fun answer[T](q: *Query, value: T) res[T, fail.Fail]
+pub fun answer[T](q: *Query, value: T) res[T, mach.base.fail.Fail]
 ```
 
 a query's answer, or the internal failure it met, or its refusal of the input
@@ -104,7 +104,7 @@ a query's answer, or the internal failure it met, or its refusal of the input
 ### settled
 
 ```mach
-pub fun settled(q: *Query) err[fail.Fail]
+pub fun settled(q: *Query) err[mach.base.fail.Fail]
 ```
 
 a query that answers nothing but whether it met an internal failure or refused the input
@@ -112,19 +112,19 @@ a query that answers nothing but whether it met an internal failure or refused t
 ### refused
 
 ```mach
-pub fun refused(q: *Query, e: A.Error)
+pub fun refused(q: *Query, e: std.allocator.Error)
 ```
 
 ### failed
 
 ```mach
-pub fun failed(q: *Query, f: fail.Fail)
+pub fun failed(q: *Query, f: mach.base.fail.Fail)
 ```
 
 ### inherit
 
 ```mach
-pub fun inherit(q: *Query, f: fail.Fail)
+pub fun inherit(q: *Query, f: mach.base.fail.Fail)
 ```
 
 a failure a query asked under this one returned: its refusal of the input is this query's,
@@ -133,7 +133,7 @@ and any other failure is internal
 ### scan_begin
 
 ```mach
-pub fun scan_begin(q: *Query, scan: *type_scan.Scan) bool
+pub fun scan_begin(q: *Query, scan: *mach.type.scan.Scan) bool
 ```
 
 opens `scan` over the store; false, with the failure recorded, when it cannot
@@ -141,13 +141,13 @@ opens `scan` over the store; false, with the failure recorded, when it cannot
 ### scan_end
 
 ```mach
-pub fun scan_end(q: *Query, scan: *type_scan.Scan)
+pub fun scan_end(q: *Query, scan: *mach.type.scan.Scan)
 ```
 
 ### scan_fresh
 
 ```mach
-pub fun scan_fresh(q: *Query, scan: *type_scan.Scan, tid: type_kind.TypeId) bool
+pub fun scan_fresh(q: *Query, scan: *mach.type.scan.Scan, tid: mach.type.kind.TypeId) bool
 ```
 
 whether `scan` meets `tid` for the first time; a mark that cannot be recorded is a
@@ -156,7 +156,7 @@ failure and reads as already seen, so no walk descends past it
 ### expansive_get
 
 ```mach
-pub fun expansive_get(q: *Query, nominal: type_kind.TypeId) opt[bool]
+pub fun expansive_get(q: *Query, nominal: mach.type.kind.TypeId) opt[bool]
 ```
 
 the recorded verdict on whether generic nominal `nominal` is expansive, none while undecided
@@ -164,7 +164,7 @@ the recorded verdict on whether generic nominal `nominal` is expansive, none whi
 ### expansive_set
 
 ```mach
-pub fun expansive_set(q: *Query, nominal: type_kind.TypeId, expansive: bool)
+pub fun expansive_set(q: *Query, nominal: mach.type.kind.TypeId, expansive: bool)
 ```
 
 records a verdict once; a nominal already decided keeps its first
@@ -172,7 +172,7 @@ records a verdict once; a nominal already decided keeps its first
 ### mentions_get
 
 ```mach
-pub fun mentions_get(q: *Query, nominal: type_kind.TypeId) opt[bool]
+pub fun mentions_get(q: *Query, nominal: mach.type.kind.TypeId) opt[bool]
 ```
 
 the recorded answer to whether `nominal`'s fields mention a type parameter
@@ -180,7 +180,7 @@ the recorded answer to whether `nominal`'s fields mention a type parameter
 ### mentions_set
 
 ```mach
-pub fun mentions_set(q: *Query, nominal: type_kind.TypeId, mentions: bool)
+pub fun mentions_set(q: *Query, nominal: mach.type.kind.TypeId, mentions: bool)
 ```
 
 ## Functions
@@ -188,7 +188,7 @@ pub fun mentions_set(q: *Query, nominal: type_kind.TypeId, mentions: bool)
 ### nesting
 
 ```mach
-pub fun nesting() fail.Fail
+pub fun nesting() mach.base.fail.Fail
 ```
 
 the refusal of a query whose walk ran out of stack

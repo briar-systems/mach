@@ -2,14 +2,14 @@
 
 # mach.lower
 
-lowering of a checked module, or a unit of instances, into one mirl module
+lowering of a checked module into one mirl module
 
-a module lowers its top-level declarations, then the local instances and class copies its code
-asked for. an instance it calls is only declared there and is defined by its instance unit,
-whose members lower in the order of their mangled names. `verify_module` holds the result to
-mirl's verifier, and a refusal there is the lowering's own fault, never the source's.
+a module lowers its top-level declarations, then every instance and class copy its code reaches,
+directly or through other instances, so its object holds each instance its code calls and the
+link keeps one copy. `verify_module` holds the result to mirl's verifier, and a refusal there is
+the lowering's own fault, never the source's.
 
-<sub>[`mach.lower`](../lower.md) · 13 modules · imports [`base`](../base/README.md), [`front`](../front/README.md), [`report`](../report/README.md), [`session`](../session/README.md), [`target`](../target/README.md), [`type`](../type/README.md) · imported by [`build`](../build/README.md), [`compile`](../compile/README.md)</sub>
+The directory's root module is [`mach.lower`](../lower.md).
 
 | Module | |
 | :--- | :--- |

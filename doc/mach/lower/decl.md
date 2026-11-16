@@ -9,9 +9,9 @@ identity, or weak where the target's objects merge none, a `#[weak]` default, an
 the export table, a class copy local to the module that asked for it, and a global's section and
 `#[at]` offset. a global's initial bytes come from the value its module's interface publishes.
 
-<sub>source: [`src/lower/decl.mach`](../../../src/lower/decl.mach) · imported by 1 module</sub>
+Source: [`src/lower/decl.mach`](../../../src/lower/decl.mach)
 
-<sub>`lower_context` is [`mach.lower.context`](context.md) · `ast_id` is [`mach.front.ast.id`](../front/ast/id.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `ast_decl` is [`mach.front.ast.decl`](../front/ast/decl.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `type_kind` is [`mach.type.kind`](../type/kind.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.front.ast.decl`](../front/ast/decl.md), [`mach.front.ast.id`](../front/ast/id.md), [`mach.lower.context`](context.md), [`mach.type.kind`](../type/kind.md).
 
 | Functions | |
 | :--- | :--- |
@@ -27,13 +27,13 @@ the export table, a class copy local to the module that asked for it, and a glob
 ### lower_decl
 
 ```mach
-pub fun lower_decl(ctx: *lower_context.LowerContext, did: ast_id.DeclId) err[fail.Fail]
+pub fun lower_decl(ctx: *mach.lower.context.LowerContext, did: mach.front.ast.id.DeclId) err[mach.base.fail.Fail]
 ```
 
 ### lower_instance
 
 ```mach
-pub fun lower_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId, defining: lower_context.Defining, copy: opt[Type]) err[fail.Fail]
+pub fun lower_instance(ctx: *mach.lower.context.LowerContext, did: mach.front.ast.id.DeclId, d: *mach.front.ast.decl.Decl, name: mach.base.intern.StrId, defining: mach.lower.context.Defining, copy: opt[Type]) err[mach.base.fail.Fail]
 ```
 
 an instance bound as `defining` states, or with `copy` the class copy of it taking its
@@ -44,14 +44,14 @@ scope's
 ### lower_pack_instance
 
 ```mach
-pub fun lower_pack_instance(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl,
-    name: intern.StrId, types: *type_kind.TypeId, type_len: u32, defining: lower_context.Defining, copy: opt[Type]) err[fail.Fail]
+pub fun lower_pack_instance(ctx: *mach.lower.context.LowerContext, did: mach.front.ast.id.DeclId, d: *mach.front.ast.decl.Decl,
+    name: mach.base.intern.StrId, types: *mach.type.kind.TypeId, type_len: u32, defining: mach.lower.context.Defining, copy: opt[Type]) err[mach.base.fail.Fail]
 ```
 
 ### lower_class_copy
 
 ```mach
-pub fun lower_class_copy(ctx: *lower_context.LowerContext, did: ast_id.DeclId, d: *ast_decl.Decl, name: intern.StrId, sig: Type) err[fail.Fail]
+pub fun lower_class_copy(ctx: *mach.lower.context.LowerContext, did: mach.front.ast.id.DeclId, d: *mach.front.ast.decl.Decl, name: mach.base.intern.StrId, sig: Type) err[mach.base.fail.Fail]
 ```
 
 a copy of the function `did` whose pointer parameters take the classes `sig` states,

@@ -6,14 +6,13 @@ the document model `mach doc` renders: one project, its directories, its modules
 and the entries each module exports
 
 the model is the contract between the builder (`mach.tool.doc.build`) and a
-renderer (`mach.tool.doc.markdown`). it holds what the source declares and how
-the declarations relate, as text taken verbatim from the source's syntax tree, and
-nothing of how a page shows it: headings, anchors, links and escaping are a
-renderer's. modules are ordered by path and directories by path, the project's
+renderer (`mach.tool.doc.markdown`). it holds what the source files declare and how
+the declarations relate, read from their syntax trees alone, and nothing of how a
+page shows it: headings, anchors, links and escaping are a renderer's. modules are ordered by path and directories by path, the project's
 root directory first; entries are in source order. every string and vector lives
 in the arena the model was built in
 
-<sub>source: [`src/tool/doc/model.mach`](../../../../src/tool/doc/model.mach) · imported by 3 modules</sub>
+Source: [`src/tool/doc/model.mach`](../../../../src/tool/doc/model.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,20 +20,21 @@ in the arena the model was built in
 | [`Component`](#component) | `rec` | one component line of a doc comment: the name as written (`x`, `$order`, `[T]`, `ret`) and its description |
 | [`Doc`](#doc) | `rec` | a doc comment without its comment marks: its summary, the first sentence of its first paragraph as `mach.front.doc.summary_len` reads it, every paragraph of its prose, the first included, and its components; all empty when there is none |
 | [`Clause`](#clause) | `rec` | one `$if` or `$or` arm a declaration sits in: its condition as written, "" for a final bare `$or`, and the conditions of the arms before it in its chain, none of which holds where it applies |
+| [`Piece`](#piece) | `rec` | one run of source text: as written, or, where `path` is not "", an import alias the source spells as `text` that names the module at `path` |
+| [`Text`](#text) | `rec` | source text in pieces, every import alias in it marked with what it names; the layout (line breaks, alignment) is the source's |
 | [`Arm`](#arm) | `rec` | one declaration of an entry |
-| [`Element`](#element) | `rec` | an element a component line can document: a parameter (`$name` when it is comptime), a generic (`[T]`), a field or a case, with its type as written, "" for a generic or a case with no payload; a binding's one element is itself, with its declared type |
-| [`Alias`](#alias) | `rec` | a name an entry's types use that the reader cannot look up on the page: an import alias with the module path it names and that module's index when the project has it, or a type this module keeps private (target "", module NONE) |
-| [`Forward`](#forward) | `rec` | what a `fwd` forwards, as name resolution decided it for the target analyzed |
+| [`Element`](#element) | `rec` | an element a component line can document: a parameter (`$name` when it is comptime), a generic (`[T]`), a field or a case, with its type, empty for a generic or a case with no payload; a binding's one element is itself, with its declared type |
+| [`Provider`](#provider) | `rec` | one module a `fwd` takes its declaration from: the arms that select it (the forward's own and those of the `use` that binds its alias, outermost first), the dotted path it names, the module of this project that path lies in or NONE, and the entry there it names, NONE for a whole module or a name that module does not document |
 | [`Entry`](#entry) | `rec` | one public name of a module |
 | [`Group`](#group) | `rec` | the entries shown together: a type with the functions and constants that belong to it (owner is the type's entry), or the entries of one kind that belong to no type (owner NONE, kind theirs); members in source order |
-| [`Module`](#module) | `rec` | one module of the project |
+| [`Module`](#module) | `rec` | one module of the project, one source file under its source root |
 | [`Dir`](#dir) | `rec` | one directory of the project's source tree |
-| [`Artifact`](#artifact) | `rec` | one artifact of the manifest: its kind as the manifest spells it, the path of its entry module and that module's index, NONE when it is not documented |
-| [`Project`](#project) | `rec` | the whole project: its id and version, its artifacts in manifest order, the ids of its dependencies, every module some artifact reaches, and every directory holding one |
+| [`Artifact`](#artifact) | `rec` | one artifact of the manifest: its kind as the manifest spells it, the path of its entry module and that module's index, NONE when the project has no such file |
+| [`Project`](#project) | `rec` | the whole project: its id and version, its artifacts in manifest order, the ids of its dependencies, every module its source root holds, and every directory holding one |
 
 | On `Kind` | |
 | :--- | :--- |
-| [`KIND_FUN`](#kind) · [`KIND_REC`](#kind) · [`KIND_UNI`](#kind) · [`KIND_TAG`](#kind) · [`KIND_DEF`](#kind) · [`KIND_VAL`](#kind) · [`KIND_VAR`](#kind) · [`KIND_FWD`](#kind) | |
+| [`KIND_FUN`](#kind), [`KIND_REC`](#kind), [`KIND_UNI`](#kind), [`KIND_TAG`](#kind), [`KIND_DEF`](#kind), [`KIND_VAL`](#kind), [`KIND_VAR`](#kind), [`KIND_FWD`](#kind) | |
 | [`is_type`](#is_type) | whether an entry of kind `k` is a type |
 
 | Constants | |
@@ -109,13 +109,36 @@ one `$if` or `$or` arm a declaration sits in: its condition as written, "" for a
 final bare `$or`, and the conditions of the arms before it in its chain, none of
 which holds where it applies
 
+## Piece
+
+```mach
+pub rec Piece {
+    text: str;
+    path: str;
+}
+```
+
+one run of source text: as written, or, where `path` is not "", an import alias the
+source spells as `text` that names the module at `path`
+
+## Text
+
+```mach
+pub rec Text {
+    pieces: Vector[Piece];
+}
+```
+
+source text in pieces, every import alias in it marked with what it names; the
+layout (line breaks, alignment) is the source's
+
 ## Arm
 
 ```mach
 pub rec Arm {
     clauses:    Vector[Clause];
     decorators: Vector[str];
-    signature:  str;
+    signature:  Text;
     value:      str;
 }
 ```
@@ -126,7 +149,7 @@ one declaration of an entry
 | :--- | :--- | :--- |
 | `clauses` | `Vector[Clause]` | the arms it sits in, outermost first; none at the top level |
 | `decorators` | `Vector[str]` | each `#[...]` as written but `#[deprecated]`, which is the entry's deprecation |
-| `signature` | `str` | the declaration as written without its decorators: a function without its body, a record, union or tag with its fields or cases, a `def` with its base, a binding without its value, a `fwd` with its path |
+| `signature` | `Text` | the declaration without its decorators: a function without its body, a record, union or tag with its fields or cases, a `def` with its base, a binding without its value, a `fwd` with its path |
 | `value` | `str` | a binding's initializer as written, "" for every other kind |
 
 ## Element
@@ -134,50 +157,29 @@ one declaration of an entry
 ```mach
 pub rec Element {
     name: str;
-    ty:   str;
+    ty:   Text;
 }
 ```
 
 an element a component line can document: a parameter (`$name` when it is comptime), a
-generic (`[T]`), a field or a case, with its type as written, "" for a generic or a
-case with no payload; a binding's one element is itself, with its declared type
+generic (`[T]`), a field or a case, with its type, empty for a generic or a case with no
+payload; a binding's one element is itself, with its declared type
 
-## Alias
+## Provider
 
 ```mach
-pub rec Alias {
-    name:    str;
+pub rec Provider {
+    clauses: Vector[Clause];
     target:  str;
     module:  u32;
-    private: bool;
+    entry:   u32;
 }
 ```
 
-a name an entry's types use that the reader cannot look up on the page: an import
-alias with the module path it names and that module's index when the project has it,
-or a type this module keeps private (target "", module NONE)
-
-## Forward
-
-```mach
-pub rec Forward {
-    resolved: bool;
-    whole:    bool;
-    target:   str;
-    module:   u32;
-    entry:    u32;
-}
-```
-
-what a `fwd` forwards, as name resolution decided it for the target analyzed
-
-| Field | Type | |
-| :--- | :--- | :--- |
-| `resolved` | `bool` | resolution decided the target; false when the arms that declare it were not selected, and every other field is then empty |
-| `whole` | `bool` | it forwards a whole module |
-| `target` | `str` | the target's module path, then `.name` unless it is a whole module |
-| `module` | `u32` | the target's module when the project has it, else NONE |
-| `entry` | `u32` | the target's entry in that module, NONE for a whole module or one not there |
+one module a `fwd` takes its declaration from: the arms that select it (the forward's
+own and those of the `use` that binds its alias, outermost first), the dotted path it
+names, the module of this project that path lies in or NONE, and the entry there it
+names, NONE for a whole module or a name that module does not document
 
 ## Entry
 
@@ -191,8 +193,7 @@ pub rec Entry {
     deprecation: str;
     arms:        Vector[Arm];
     elements:    Vector[Element];
-    aliases:     Vector[Alias];
-    forward:     Forward;
+    providers:   Vector[Provider];
     owner:       u32;
 }
 ```
@@ -206,7 +207,7 @@ one public name of a module
 | `deprecation` | `str` | the message of `#[deprecated]`, "" without one; deprecated says it is there |
 | `arms` | `Vector[Arm]` | one per declaration, in source order: a name several `$if` arms declare is one entry |
 | `elements` | `Vector[Element]` | what its first declaration's component lines can name |
-| `aliases` | `Vector[Alias]` | what its declarations' types name through an import or privately, in order of first use |
+| `providers` | `Vector[Provider]` | for a `fwd`, every module it may take its declaration from, one per module its alias is bound to in some arm |
 | `owner` | `u32` | the type entry it is grouped under, NONE for none |
 
 ## Group
@@ -227,20 +228,20 @@ NONE, kind theirs); members in source order
 
 ```mach
 pub rec Module {
-    path:      str;
-    rel:       str;
-    leaf:      str;
-    file:      str;
-    dir:       u32;
-    doc:       Doc;
-    entries:   Vector[Entry];
-    groups:    Vector[Group];
-    imports:   Vector[u32];
-    importers: Vector[u32];
+    path:     str;
+    rel:      str;
+    leaf:     str;
+    file:     str;
+    dir:      u32;
+    declares: bool;
+    doc:      Doc;
+    entries:  Vector[Entry];
+    groups:   Vector[Group];
+    mentions: Vector[u32];
 }
 ```
 
-one module of the project
+one module of the project, one source file under its source root
 
 | Field | Type | |
 | :--- | :--- | :--- |
@@ -249,23 +250,20 @@ one module of the project
 | `leaf` | `str` | its last segment |
 | `file` | `str` | its source file relative to the project root |
 | `dir` | `u32` | the directory holding it |
+| `declares` | `bool` | it declares anything but `use` lines; a module that does not has no page, and its docstring describes the directory of its name |
 | `groups` | `Vector[Group]` | every type first, in declaration order, then what belongs to no type: functions, constants, variables, forwards |
-| `imports` | `Vector[u32]` | the project's modules it imports, by index, ascending |
-| `importers` | `Vector[u32]` | the project's modules importing it, ascending |
+| `mentions` | `Vector[u32]` | the modules of this project its entries' signatures name, ascending |
 
 ## Dir
 
 ```mach
 pub rec Dir {
-    rel:       str;
-    leaf:      str;
-    parent:    u32;
-    root:      u32;
-    modules:   Vector[u32];
-    dirs:      Vector[u32];
-    total:     u32;
-    imports:   Vector[u32];
-    importers: Vector[u32];
+    rel:     str;
+    leaf:    str;
+    parent:  u32;
+    root:    u32;
+    modules: Vector[u32];
+    dirs:    Vector[u32];
 }
 ```
 
@@ -279,9 +277,6 @@ one directory of the project's source tree
 | `root` | `u32` | its root module, the file beside it of the same name, NONE when it has none |
 | `modules` | `Vector[u32]` | the modules directly in it |
 | `dirs` | `Vector[u32]` | the directories directly in it |
-| `total` | `u32` | the modules in it and below it |
-| `imports` | `Vector[u32]` | the other top-level directories its modules import, by index |
-| `importers` | `Vector[u32]` | the other top-level directories whose modules import its modules |
 
 ## Artifact
 
@@ -295,7 +290,7 @@ pub rec Artifact {
 ```
 
 one artifact of the manifest: its kind as the manifest spells it, the path of its entry
-module and that module's index, NONE when it is not documented
+module and that module's index, NONE when the project has no such file
 
 ## Project
 
@@ -311,7 +306,7 @@ pub rec Project {
 ```
 
 the whole project: its id and version, its artifacts in manifest order, the ids of its
-dependencies, every module some artifact reaches, and every directory holding one
+dependencies, every module its source root holds, and every directory holding one
 
 ## Constants
 

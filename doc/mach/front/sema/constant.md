@@ -9,9 +9,9 @@ other one once they all are, before any body or instance is. the deep value of a
 its array, record or case literal evaluated member by member, is built in the module's store
 of constant values, which its interface publishes
 
-<sub>source: [`src/front/sema/constant.mach`](../../../../src/front/sema/constant.mach) · imported by 4 modules</sub>
+Source: [`src/front/sema/constant.mach`](../../../../src/front/sema/constant.mach)
 
-<sub>`sema_context` is [`mach.front.sema.context`](context.md) · `ast_id` is [`mach.front.ast.id`](../ast/id.md) · `comptime_value` is [`mach.front.comptime.value`](../comptime/value.md) · `comptime_failure` is [`mach.front.comptime.failure`](../comptime/failure.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `resolve` is [`mach.front.resolve`](../resolve.md) · `comptime_deep` is [`mach.front.comptime.deep`](../comptime/deep.md) · `type_kind` is [`mach.type.kind`](../../type/kind.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.comptime.deep`](../comptime/deep.md), [`mach.front.comptime.failure`](../comptime/failure.md), [`mach.front.comptime.value`](../comptime/value.md), [`mach.front.resolve`](../resolve.md), [`mach.front.sema.context`](context.md), [`mach.type.kind`](../../type/kind.md).
 
 | Functions | |
 | :--- | :--- |
@@ -40,7 +40,7 @@ of constant values, which its interface publishes
 ### named
 
 ```mach
-pub fun named(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail]
+pub fun named(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail]
 ```
 
 the value of the module constant the bare name `eid` names: one of this module's, bound on
@@ -49,7 +49,7 @@ first read, or one an imported module published
 ### member
 
 ```mach
-pub fun member(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail]
+pub fun member(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail]
 ```
 
 the value of the module constant a path names, which for a path through a module is the
@@ -58,7 +58,7 @@ imported constant itself
 ### bind
 
 ```mach
-pub fun bind(sc: *sema_context.SemaContext, did: ast_id.DeclId) err[fail.Fail]
+pub fun bind(sc: *mach.front.sema.context.SemaContext, did: mach.front.ast.id.DeclId) err[mach.base.fail.Fail]
 ```
 
 binds the module `val` `did` declares when its initializer is a compile-time constant. this
@@ -68,7 +68,7 @@ published value reports, and one that is no constant is marked unevaluable
 ### rejected
 
 ```mach
-pub fun rejected(sc: *sema_context.SemaContext, did: ast_id.DeclId) bool
+pub fun rejected(sc: *mach.front.sema.context.SemaContext, did: mach.front.ast.id.DeclId) bool
 ```
 
 whether the evaluator rejected the initializer of the module `val` `did` when it was bound
@@ -76,7 +76,7 @@ whether the evaluator rejected the initializer of the module `val` `did` when it
 ### unevaluable
 
 ```mach
-pub fun unevaluable(sc: *sema_context.SemaContext, did: ast_id.DeclId) bool
+pub fun unevaluable(sc: *mach.front.sema.context.SemaContext, did: mach.front.ast.id.DeclId) bool
 ```
 
 whether the initializer of the module `val` `did` was no constant when it was bound
@@ -84,7 +84,7 @@ whether the initializer of the module `val` `did` was no constant when it was bo
 ### settle
 
 ```mach
-pub fun settle(sc: *sema_context.SemaContext)
+pub fun settle(sc: *mach.front.sema.context.SemaContext)
 ```
 
 every constant still unbound once all are tried is none, so no later read, inside a body or
@@ -93,7 +93,7 @@ an instance, evaluates one again
 ### own_value
 
 ```mach
-pub fun own_value(sc: *sema_context.SemaContext, sym: *resolve.Symbol) res[u32, fail.Fail]
+pub fun own_value(sc: *mach.front.sema.context.SemaContext, sym: *mach.front.resolve.Symbol) res[u32, mach.base.fail.Fail]
 ```
 
 the node of the value the module `val` `sym` declares, built in the module's store on first
@@ -103,7 +103,7 @@ declaration with no initializer of its own
 ### array_value
 
 ```mach
-pub fun array_value(sc: *sema_context.SemaContext, sym: *resolve.Symbol) res[opt[comptime_value.CTValue], fail.Fail]
+pub fun array_value(sc: *mach.front.sema.context.SemaContext, sym: *mach.front.resolve.Symbol) res[opt[mach.front.comptime.value.CTValue], mach.base.fail.Fail]
 ```
 
 the value of the array `sym` names that a `$each` reads: a module constant's, this module's
@@ -114,7 +114,7 @@ a binding with no array, record or case literal value
 ### store_of
 
 ```mach
-pub fun store_of(sc: *sema_context.SemaContext, module_index: u32) res[*comptime_deep.Store, comptime_failure.EvalFail]
+pub fun store_of(sc: *mach.front.sema.context.SemaContext, module_index: u32) res[*mach.front.comptime.deep.Store, mach.front.comptime.failure.EvalFail]
 ```
 
 the store of constant values of the module with stable id `module`: this module's, or the one
@@ -123,7 +123,7 @@ another module's interface publishes
 ### is_aggregate
 
 ```mach
-pub fun is_aggregate(sc: *sema_context.SemaContext, eid: ast_id.ExprId) bool
+pub fun is_aggregate(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId) bool
 ```
 
 an array literal, or a record or case literal spelled with its head type
@@ -131,7 +131,7 @@ an array literal, or a record or case literal spelled with its head type
 ### type_at
 
 ```mach
-pub fun type_at(sc: *sema_context.SemaContext, eid: ast_id.ExprId) type_kind.TypeId
+pub fun type_at(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId) mach.type.kind.TypeId
 ```
 
 the type the walk gave an expression
@@ -139,7 +139,7 @@ the type the walk gave an expression
 ### node_build
 
 ```mach
-pub fun node_build(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[u32, fail.Fail]
+pub fun node_build(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId) res[u32, mach.base.fail.Fail]
 ```
 
 the node of the expression `eid`: an aggregate literal member by member, the value of the
@@ -149,7 +149,7 @@ walk gave it
 ### zero_of
 
 ```mach
-pub fun zero_of(sc: *sema_context.SemaContext, ty: u32) res[comptime_value.CTValue, comptime_failure.EvalFail]
+pub fun zero_of(sc: *mach.front.sema.context.SemaContext, ty: u32) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail]
 ```
 
 the zero of the type `ty` as a value, for an evaluation that holds a type and no expression

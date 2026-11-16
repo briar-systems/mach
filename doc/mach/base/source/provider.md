@@ -9,9 +9,9 @@ package ids it holds. a member answers a name it does not hold by saying so, nev
 so one provider can stand in front of another, as the editor's overlay stands in front of the
 disk.
 
-<sub>source: [`src/base/source/provider.mach`](../../../../src/base/source/provider.mach) · imported by 3 modules</sub>
+Source: [`src/base/source/provider.mach`](../../../../src/base/source/provider.mach)
 
-<sub>`intern` is [`mach.base.intern`](../intern.md) · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../fail.md)</sub>
+Uses types from [`mach.base.fail`](../fail.md), [`mach.base.intern`](../intern.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -30,7 +30,7 @@ disk.
 
 | On `Provider` | |
 | :--- | :--- |
-| [`module_locate`](#module_locate) · [`module_exists`](#module_exists) · [`module_read`](#module_read) · [`package_known`](#package_known) | |
+| [`module_locate`](#module_locate), [`module_exists`](#module_exists), [`module_read`](#module_read), [`package_known`](#package_known) | |
 
 ---
 
@@ -38,9 +38,9 @@ disk.
 
 ```mach
 pub rec Home {
-    file:    intern.StrId;
-    package: intern.StrId;
-    version: intern.StrId;
+    file:    mach.base.intern.StrId;
+    package: mach.base.intern.StrId;
+    version: mach.base.intern.StrId;
     root:    bool;
 }
 ```
@@ -49,9 +49,9 @@ the package that owns a module and the file it is read from inside that package
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `file` | `intern.StrId` | the module's file relative to its package, `/`-separated on every host, what `$mach.source.file` reads |
-| `package` | `intern.StrId` | the owning package's id, what `$mach.project.id` reads |
-| `version` | `intern.StrId` | the owning package's version |
+| `file` | `mach.base.intern.StrId` | the module's file relative to its package, `/`-separated on every host, what `$mach.source.file` reads |
+| `package` | `mach.base.intern.StrId` | the owning package's id, what `$mach.project.id` reads |
+| `version` | `mach.base.intern.StrId` | the owning package's version |
 | `root` | `bool` | the package being built owns it, not one of its dependencies |
 
 ## Origin
@@ -73,7 +73,7 @@ where a module's text is read from
 ### origin_dnit
 
 ```mach
-pub fun origin_dnit(a: *A.Allocator, o: *Origin)
+pub fun origin_dnit(a: *std.allocator.Allocator, o: *Origin)
 ```
 
 ## Text
@@ -90,7 +90,7 @@ a module's text: borrowed from the provider, or owned by the reader when `owned`
 ### text_dnit
 
 ```mach
-pub fun text_dnit(a: *A.Allocator, t: *Text)
+pub fun text_dnit(a: *std.allocator.Allocator, t: *Text)
 ```
 
 ## Provider
@@ -98,10 +98,10 @@ pub fun text_dnit(a: *A.Allocator, t: *Text)
 ```mach
 pub rec Provider {
     ctx:     ptr;
-    locate:  fun(ptr, *A.Allocator, intern.StrId) res[opt[Origin], fail.Fail];
-    exists:  fun(ptr, *A.Allocator, intern.StrId) res[bool, fail.Fail];
-    read:    fun(ptr, *A.Allocator, str) res[Text, fail.Fail];
-    package: fun(ptr, intern.StrId) bool;
+    locate:  fun(ptr, *std.allocator.Allocator, mach.base.intern.StrId) res[opt[Origin], mach.base.fail.Fail];
+    exists:  fun(ptr, *std.allocator.Allocator, mach.base.intern.StrId) res[bool, mach.base.fail.Fail];
+    read:    fun(ptr, *std.allocator.Allocator, str) res[Text, mach.base.fail.Fail];
+    package: fun(ptr, mach.base.intern.StrId) bool;
 }
 ```
 
@@ -112,32 +112,32 @@ saying so, never by failing, so a provider can stand in front of another one
 | Field | Type | |
 | :--- | :--- | :--- |
 | `ctx` | `ptr` | the member's own state |
-| `locate` | `fun(ptr, *A.Allocator, intern.StrId) res[opt[Origin], fail.Fail]` | where the module an fqn names would be read from, none when no package owns the fqn's head segment; it does not say the module exists |
-| `exists` | `fun(ptr, *A.Allocator, intern.StrId) res[bool, fail.Fail]` | whether the fqn names a module, spelled exactly as the provider holds it |
-| `read` | `fun(ptr, *A.Allocator, str) res[Text, fail.Fail]` | the text at a path `locate` gave |
-| `package` | `fun(ptr, intern.StrId) bool` | whether a package has the id |
+| `locate` | `fun(ptr, *std.allocator.Allocator, mach.base.intern.StrId) res[opt[Origin], mach.base.fail.Fail]` | where the module an fqn names would be read from, none when no package owns the fqn's head segment; it does not say the module exists |
+| `exists` | `fun(ptr, *std.allocator.Allocator, mach.base.intern.StrId) res[bool, mach.base.fail.Fail]` | whether the fqn names a module, spelled exactly as the provider holds it |
+| `read` | `fun(ptr, *std.allocator.Allocator, str) res[Text, mach.base.fail.Fail]` | the text at a path `locate` gave |
+| `package` | `fun(ptr, mach.base.intern.StrId) bool` | whether a package has the id |
 
 ### module_locate
 
 ```mach
-pub fun module_locate(p: *Provider, a: *A.Allocator, fqn: intern.StrId) res[opt[Origin], fail.Fail]
+pub fun module_locate(p: *Provider, a: *std.allocator.Allocator, fqn: mach.base.intern.StrId) res[opt[Origin], mach.base.fail.Fail]
 ```
 
 ### module_exists
 
 ```mach
-pub fun module_exists(p: *Provider, a: *A.Allocator, fqn: intern.StrId) res[bool, fail.Fail]
+pub fun module_exists(p: *Provider, a: *std.allocator.Allocator, fqn: mach.base.intern.StrId) res[bool, mach.base.fail.Fail]
 ```
 
 ### module_read
 
 ```mach
-pub fun module_read(p: *Provider, a: *A.Allocator, path: str) res[Text, fail.Fail]
+pub fun module_read(p: *Provider, a: *std.allocator.Allocator, path: str) res[Text, mach.base.fail.Fail]
 ```
 
 ### package_known
 
 ```mach
-pub fun package_known(p: *Provider, id: intern.StrId) bool
+pub fun package_known(p: *Provider, id: mach.base.intern.StrId) bool
 ```
 

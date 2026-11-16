@@ -7,9 +7,9 @@ allocator, where in the file it points, and the other places it names. a
 refused allocation while a refusal is made is the failure instead, never an
 empty or placeholder text
 
-<sub>source: [`src/manifest/refusal.mach`](../../../src/manifest/refusal.mach) · imported by 15 modules</sub>
+Source: [`src/manifest/refusal.mach`](../../../src/manifest/refusal.mach)
 
-<sub>`base_source` is [`mach.base.source`](../base/source.md) · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md) · `diagnostic_kind` is [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md) · `toml_value` is `toml.value`</sub>
+Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -17,7 +17,7 @@ empty or placeholder text
 
 | On `Sites` | |
 | :--- | :--- |
-| [`sites_init`](#sites_init) · [`sites_add`](#sites_add) | |
+| [`sites_init`](#sites_init), [`sites_add`](#sites_add) | |
 | [`sites_fail`](#sites_fail) | `f` pointing at the first place gathered, naming the others as related; the gathered places are released |
 
 | Functions | |
@@ -37,8 +37,8 @@ empty or placeholder text
 
 ```mach
 pub rec Sites {
-    list:    Vector[base_source.Location];
-    refused: opt[A.Error];
+    list:    Vector[mach.base.source.Location];
+    refused: opt[std.allocator.Error];
 }
 ```
 
@@ -47,25 +47,25 @@ names the rest as related
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `list` | `Vector[base_source.Location]` | the places, an unspanned one skipped |
-| `refused` | `opt[A.Error]` | the allocator refused to hold one, which the refusal becomes |
+| `list` | `Vector[mach.base.source.Location]` | the places, an unspanned one skipped |
+| `refused` | `opt[std.allocator.Error]` | the allocator refused to hold one, which the refusal becomes |
 
 ### sites_init
 
 ```mach
-pub fun sites_init(alloc: *A.Allocator) Sites
+pub fun sites_init(alloc: *std.allocator.Allocator) Sites
 ```
 
 ### sites_add
 
 ```mach
-pub fun sites_add(s: *Sites, p: base_source.Location)
+pub fun sites_add(s: *Sites, p: mach.base.source.Location)
 ```
 
 ### sites_fail
 
 ```mach
-pub fun sites_fail(alloc: *A.Allocator, s: *Sites, f: fail.Fail) fail.Fail
+pub fun sites_fail(alloc: *std.allocator.Allocator, s: *Sites, f: mach.base.fail.Fail) mach.base.fail.Fail
 ```
 
 `f` pointing at the first place gathered, naming the others as related; the
@@ -76,7 +76,7 @@ gathered places are released
 ### sfmt
 
 ```mach
-pub fun sfmt(alloc: *A.Allocator, fmt: str, va: ...) res[str, fail.Fail]
+pub fun sfmt(alloc: *std.allocator.Allocator, fmt: str, va: ...) res[str, mach.base.fail.Fail]
 ```
 
 `fmt` formatted with `va` into `alloc`, which owns the text
@@ -88,7 +88,7 @@ pub fun sfmt(alloc: *A.Allocator, fmt: str, va: ...) res[str, fail.Fail]
 ### refuse
 
 ```mach
-pub fun refuse(alloc: *A.Allocator, k: diagnostic_kind.Kind, fmt: str, va: ...) fail.Fail
+pub fun refuse(alloc: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kind, fmt: str, va: ...) mach.base.fail.Fail
 ```
 
 the input is refused under `k` with the text `fmt` formats from `va`, owned
@@ -97,7 +97,7 @@ by `alloc`; a refused allocation is the failure instead
 ### point_at
 
 ```mach
-pub fun point_at(f: fail.Fail, sp: toml_value.Span) fail.Fail
+pub fun point_at(f: mach.base.fail.Fail, sp: toml.value.Span) mach.base.fail.Fail
 ```
 
 the same failure pointing at `sp` in the manifest being parsed; the zero span
@@ -106,7 +106,7 @@ of a value the parser did not write points nowhere
 ### point_at_file
 
 ```mach
-pub fun point_at_file(f: fail.Fail) fail.Fail
+pub fun point_at_file(f: mach.base.fail.Fail) mach.base.fail.Fail
 ```
 
 the same failure pointing at the manifest being parsed as a whole, at its start, for what is
@@ -115,7 +115,7 @@ missing from the file itself
 ### fail_at
 
 ```mach
-pub fun fail_at(f: fail.Fail, sp: toml_value.Span) err[fail.Fail]
+pub fun fail_at(f: mach.base.fail.Fail, sp: toml.value.Span) err[mach.base.fail.Fail]
 ```
 
 a failure pointing at `sp`, as `point_at` places it
@@ -123,7 +123,7 @@ a failure pointing at `sp`, as `point_at` places it
 ### span_site
 
 ```mach
-pub fun span_site(sp: toml_value.Span) base_source.Location
+pub fun span_site(sp: toml.value.Span) mach.base.source.Location
 ```
 
 where `sp` is written in the manifest being parsed, as a range whose file
@@ -133,7 +133,7 @@ parser did not write
 ### element_sites
 
 ```mach
-pub fun element_sites(alloc: *A.Allocator, arr: *toml_value.Array) res[*base_source.Location, fail.Fail]
+pub fun element_sites(alloc: *std.allocator.Allocator, arr: *toml.value.Array) res[*mach.base.source.Location, mach.base.fail.Fail]
 ```
 
 where each element of `arr` is written, in order, as `span_site` places it;
@@ -142,7 +142,7 @@ nil for an empty array. freed with `model.sites_free`
 ### at_sites
 
 ```mach
-pub fun at_sites(alloc: *A.Allocator, f: fail.Fail, sites: *base_source.Location, n: usize) fail.Fail
+pub fun at_sites(alloc: *std.allocator.Allocator, f: mach.base.fail.Fail, sites: *mach.base.source.Location, n: usize) mach.base.fail.Fail
 ```
 
 `f` pointing at the first spanned place of the `n` at `sites`, naming the

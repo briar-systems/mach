@@ -4,9 +4,9 @@
 
 the object cache's key builder, and the keys of a module's normal and test objects
 
-<sub>source: [`src/compile/cache/key.mach`](../../../../src/compile/cache/key.mach) · imported by 2 modules</sub>
+Source: [`src/compile/cache/key.mach`](../../../../src/compile/cache/key.mach)
 
-<sub>`wire` is [`mach.base.wire`](../../base/wire.md) · `intern` is [`mach.base.intern`](../../base/intern.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.base.wire`](../../base/wire.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -14,7 +14,7 @@ the object cache's key builder, and the keys of a module's normal and test objec
 
 | On `Builder` | |
 | :--- | :--- |
-| [`begin`](#begin) · [`number`](#number) · [`bytes`](#bytes) · [`text`](#text) · [`name`](#name) · [`finish`](#finish) | |
+| [`begin`](#begin), [`number`](#number), [`bytes`](#bytes), [`text`](#text), [`name`](#name), [`finish`](#finish) | |
 
 | Functions | |
 | :--- | :--- |
@@ -28,7 +28,7 @@ the object cache's key builder, and the keys of a module's normal and test objec
 
 ```mach
 pub rec Builder {
-    sink: wire.Sink;
+    sink: mach.base.wire.Sink;
 }
 ```
 
@@ -62,13 +62,13 @@ pub fun text(b: *Builder, value: str)
 ### name
 
 ```mach
-pub fun name(b: *Builder, itn: *intern.Interner, id: intern.StrId)
+pub fun name(b: *Builder, itn: *mach.base.intern.Interner, id: mach.base.intern.StrId)
 ```
 
 ### finish
 
 ```mach
-pub fun finish(b: *Builder, digest: *[32]u8) err[fail.Fail]
+pub fun finish(b: *Builder, digest: *[32]u8) err[mach.base.fail.Fail]
 ```
 
 ## Functions
@@ -82,7 +82,7 @@ pub fun equal(left: *[32]u8, right: *[32]u8) bool
 ### object
 
 ```mach
-pub fun object(module_key: *[32]u8, module: str, out: *[32]u8) err[fail.Fail]
+pub fun object(module_key: *[32]u8, module: str, out: *[32]u8) err[mach.base.fail.Fail]
 ```
 
 the key of a module's object: the module's key and its name
@@ -90,7 +90,7 @@ the key of a module's object: the module's key and its name
 ### test_object
 
 ```mach
-pub fun test_object(object_key: *[32]u8, out: *[32]u8) err[fail.Fail]
+pub fun test_object(object_key: *[32]u8, out: *[32]u8) err[mach.base.fail.Fail]
 ```
 
 the key of a module's test object: the key of the normal object it is lowered

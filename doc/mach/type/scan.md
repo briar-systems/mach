@@ -8,9 +8,9 @@ each open scan takes the next nesting level and marks a type, or a pair of types
 that scan. a level's set is reused from scan to scan by bumping its epoch rather than clearing
 it.
 
-<sub>source: [`src/type/scan.mach`](../../../src/type/scan.mach) · imported by 14 modules</sub>
+Source: [`src/type/scan.mach`](../../../src/type/scan.mach)
 
-<sub>`A` is `std.allocator` · `VisitSet` is private · `PairSet` is private · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,11 +21,11 @@ it.
 
 | On `Sets` | |
 | :--- | :--- |
-| [`sets_init`](#sets_init) · [`sets_dnit`](#sets_dnit) · [`begin`](#begin) · [`end`](#end) · [`mark`](#mark) · [`pair_begin`](#pair_begin) · [`pair_end`](#pair_end) · [`pair_mark`](#pair_mark) | |
+| [`sets_init`](#sets_init), [`sets_dnit`](#sets_dnit), [`begin`](#begin), [`end`](#end), [`mark`](#mark), [`pair_begin`](#pair_begin), [`pair_end`](#pair_end), [`pair_mark`](#pair_mark) | |
 
 | On `Mark` | |
 | :--- | :--- |
-| [`VISIT_FRESH`](#mark-1) · [`VISIT_SEEN`](#mark-1) | |
+| [`VISIT_FRESH`](#mark-1), [`VISIT_SEEN`](#mark-1) | |
 
 ---
 
@@ -33,7 +33,7 @@ it.
 
 ```mach
 pub rec Sets {
-    a: *A.Allocator;
+    a: *std.allocator.Allocator;
 
     visits:     *VisitSet;
     visits_len: u32;
@@ -51,7 +51,7 @@ reused from scan to scan by bumping the level's epoch
 ### sets_init
 
 ```mach
-pub fun sets_init(a: *A.Allocator) Sets
+pub fun sets_init(a: *std.allocator.Allocator) Sets
 ```
 
 ### sets_dnit
@@ -63,7 +63,7 @@ pub fun sets_dnit(sets: *Sets)
 ### begin
 
 ```mach
-pub fun begin(sets: *Sets, scan: *Scan) err[fail.Fail]
+pub fun begin(sets: *Sets, scan: *Scan) err[mach.base.fail.Fail]
 ```
 
 ### end
@@ -75,13 +75,13 @@ pub fun end(sets: *Sets, scan: *Scan)
 ### mark
 
 ```mach
-pub fun mark(sets: *Sets, scan: *Scan, tid: TypeId) res[Mark, fail.Fail]
+pub fun mark(sets: *Sets, scan: *Scan, tid: TypeId) res[Mark, mach.base.fail.Fail]
 ```
 
 ### pair_begin
 
 ```mach
-pub fun pair_begin(sets: *Sets, scan: *Pair) err[fail.Fail]
+pub fun pair_begin(sets: *Sets, scan: *Pair) err[mach.base.fail.Fail]
 ```
 
 ### pair_end
@@ -93,7 +93,7 @@ pub fun pair_end(sets: *Sets, scan: *Pair)
 ### pair_mark
 
 ```mach
-pub fun pair_mark(sets: *Sets, scan: *Pair, a: TypeId, b: TypeId) res[Mark, fail.Fail]
+pub fun pair_mark(sets: *Sets, scan: *Pair, a: TypeId, b: TypeId) res[Mark, mach.base.fail.Fail]
 ```
 
 ## Scan

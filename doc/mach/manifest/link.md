@@ -7,9 +7,9 @@ the `[link.<name>]` tables: their decoding, and their resolution for one target
 an entry applies to a target its `sys`, `arch` and `abi` filters all admit, and a
 `LinkRequirement` owns its copy of the entry's symbols.
 
-<sub>source: [`src/manifest/link.mach`](../../../src/manifest/link.mach) · imported by 9 modules</sub>
+Source: [`src/manifest/link.mach`](../../../src/manifest/link.mach)
 
-<sub>`intern` is [`mach.base.intern`](../base/intern.md) · `input` is [`mach.target.input`](../target/input.md) · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md) · `template` is [`mach.manifest.template`](template.md) · `toml_value` is `toml.value`</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.manifest.template`](template.md), [`mach.target.input`](../target/input.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -36,13 +36,13 @@ an entry applies to a target its `sys`, `arch` and `abi` filters all admit, and 
 ```mach
 pub rec LinkRequirement {
     source: LinkSource;
-    text:   intern.StrId;
-    key:    intern.StrId;
+    text:   mach.base.intern.StrId;
+    key:    mach.base.intern.StrId;
 
-    symbols:            *intern.StrId;
+    symbols:            *mach.base.intern.StrId;
     symbol_count:       u32;
     include_referenced: bool;
-    kind:               input.Kind;
+    kind:               mach.target.input.Kind;
     versions:           LinkVersions;
 }
 ```
@@ -53,18 +53,18 @@ the symbol array is owned; release it with `link_claims_dnit`
 | Field | Type | |
 | :--- | :--- | :--- |
 | `source` | `LinkSource` | copied from the link |
-| `text` | `intern.StrId` | for a local source, the `path` expanded and interned; otherwise the link's `name` |
-| `key` | `intern.StrId` | the link's table key, its identity |
-| `symbols` | `*intern.StrId` | an owned copy of the link's `symbols`, or nil when it has none |
+| `text` | `mach.base.intern.StrId` | for a local source, the `path` expanded and interned; otherwise the link's `name` |
+| `key` | `mach.base.intern.StrId` | the link's table key, its identity |
+| `symbols` | `*mach.base.intern.StrId` | an owned copy of the link's `symbols`, or nil when it has none |
 | `symbol_count` | `u32` | length of `symbols` |
 | `include_referenced` | `bool` | copied from the link |
-| `kind` | `input.Kind` | copied from the link |
+| `kind` | `mach.target.input.Kind` | copied from the link |
 | `versions` | `LinkVersions` | copied from the link |
 
 ### link_claims_dnit
 
 ```mach
-pub fun link_claims_dnit(alloc: *A.Allocator, items: *LinkRequirement, count: u32)
+pub fun link_claims_dnit(alloc: *std.allocator.Allocator, items: *LinkRequirement, count: u32)
 ```
 
 free the symbol arrays of `count` requirements and nil them. the `items` array
@@ -79,10 +79,10 @@ itself is not freed
 ### finish_link_requirements
 
 ```mach
-pub fun finish_link_requirements(alloc: *A.Allocator, items: *LinkRequirement,
+pub fun finish_link_requirements(alloc: *std.allocator.Allocator, items: *LinkRequirement,
     capacity: u32, count: u32,
     out_items: **LinkRequirement,
-    out_count: *u32) err[fail.Fail]
+    out_count: *u32) err[mach.base.fail.Fail]
 ```
 
 turn a partially filled requirement buffer into an exactly sized result, taking
@@ -101,8 +101,8 @@ ownership of the buffer
 ### merge_link_claims
 
 ```mach
-pub fun merge_link_claims(alloc: *A.Allocator, dst: *LinkRequirement,
-    src: *LinkRequirement) err[fail.Fail]
+pub fun merge_link_claims(alloc: *std.allocator.Allocator, dst: *LinkRequirement,
+    src: *LinkRequirement) err[mach.base.fail.Fail]
 ```
 
 add every symbol of `src` that `dst` lacks to `dst`, keeping `dst` order first
@@ -118,8 +118,8 @@ and the new entries in `src` order. `src` is not modified
 ### link_requirement
 
 ```mach
-pub fun link_requirement(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef,
-    proj_out: str, v: *template.Values) res[LinkRequirement, fail.Fail]
+pub fun link_requirement(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, l: *LinkDef,
+    proj_out: str, v: *mach.manifest.template.Values) res[LinkRequirement, mach.base.fail.Fail]
 ```
 
 resolve a link entry for one target into a `LinkRequirement`. a local `path`
@@ -140,13 +140,13 @@ into an owned array
 ### parse_links
 
 ```mach
-pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail]
+pub fun parse_links(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, t: *toml.value.Table, m: *Manifest) err[mach.base.fail.Fail]
 ```
 
 ### link_matches_target
 
 ```mach
-pub fun link_matches_target(itn: *intern.Interner, l: *LinkDef, t: *TargetDef) bool
+pub fun link_matches_target(itn: *mach.base.intern.Interner, l: *LinkDef, t: *TargetDef) bool
 ```
 
 whether a link's `sys`, `arch` and `abi` filters all admit a target. an empty
@@ -162,8 +162,8 @@ axis admits nothing, "*" everything
 ### expand_local_path
 
 ```mach
-pub fun expand_local_path(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef,
-    proj_out: str, v: *template.Values) res[str, fail.Fail]
+pub fun expand_local_path(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, l: *LinkDef,
+    proj_out: str, v: *mach.manifest.template.Values) res[str, mach.base.fail.Fail]
 ```
 
 expand a local link's `path` with `v`; a refusal points at the `path` value
@@ -171,6 +171,6 @@ expand a local link's `path` with `v`; a refusal points at the `path` value
 ### find_link_by_name
 
 ```mach
-pub fun find_link_by_name(m: *Manifest, name: intern.StrId) *LinkDef
+pub fun find_link_by_name(m: *Manifest, name: mach.base.intern.StrId) *LinkDef
 ```
 

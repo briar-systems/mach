@@ -8,9 +8,9 @@ toolchain spawns it, and a build never does. every git process starts here, with
 environment that keeps the user's configuration and drops whatever would redirect git to
 another repository, and every failure names the command, how it ended and what git printed
 
-<sub>source: [`src/package/git.mach`](../../../src/package/git.mach) · imported by 8 modules</sub>
+Source: [`src/package/git.mach`](../../../src/package/git.mach)
 
-<sub>`exec` is `std.process.exec` · `A` is `std.allocator` · `host_environment` is [`mach.host.environment`](../host/environment.md) · `Tree` is private · `fail` is [`mach.base.fail`](../base/fail.md) · `session` is [`mach.session`](../session.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.host.environment`](../host/environment.md), [`mach.session`](../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,11 +21,11 @@ another repository, and every failure names the command, how it ended and what g
 | On `Inspector` | |
 | :--- | :--- |
 | [`inspector_init`](#inspector_init) | an inspector whose git processes inherit `environ`, a session's environment |
-| [`inspector_dnit`](#inspector_dnit) · [`query_capture`](#query_capture) · [`query`](#query) · [`query_raw`](#query_raw) · [`op`](#op) | |
+| [`inspector_dnit`](#inspector_dnit), [`query_capture`](#query_capture), [`query`](#query), [`query_raw`](#query_raw), [`op`](#op) | |
 | [`path_mode`](#path_mode) | the committed mode of `<prefix><rel>` at HEAD, or "" when HEAD has no such entry |
 | [`inspector_pending`](#inspector_pending) | an inspector that resolves git on first use, its processes inheriting `environ` |
 | [`inspector_require`](#inspector_require) | start a pending inspector; one already started is left as it is |
-| [`query_named`](#query_named) · [`require_root`](#require_root) · [`project_root_authority`](#project_root_authority) · [`declaring_prefix`](#declaring_prefix) · [`index_entry_field`](#index_entry_field) · [`require_matches_index`](#require_matches_index) · [`require_tracked`](#require_tracked) | |
+| [`query_named`](#query_named), [`require_root`](#require_root), [`project_root_authority`](#project_root_authority), [`declaring_prefix`](#declaring_prefix), [`index_entry_field`](#index_entry_field), [`require_matches_index`](#require_matches_index), [`require_tracked`](#require_tracked) | |
 | [`is_work_tree`](#is_work_tree) | whether `dir` lies inside a git work tree: git answers by its exit, so a refusing exit is false, and a failure to run git or read its answer is the failure |
 
 | On `Bytes` | |
@@ -34,11 +34,11 @@ another repository, and every failure names the command, how it ended and what g
 
 | Functions | |
 | :--- | :--- |
-| [`count_nil_terminated`](#count_nil_terminated) · [`object_id_valid`](#object_id_valid) | |
+| [`count_nil_terminated`](#count_nil_terminated), [`object_id_valid`](#object_id_valid) | |
 
 | Constants | |
 | :--- | :--- |
-| [`AUTHORITY_REPO`](#constants) · [`AUTHORITY_NESTED`](#constants) | |
+| [`AUTHORITY_REPO`](#constants), [`AUTHORITY_NESTED`](#constants) | |
 
 ---
 
@@ -56,11 +56,11 @@ pub rec Entry {
 ```mach
 pub rec Inspector {
     program:       str;
-    inherited_env: exec.Environment;
-    alloc:         *A.Allocator;
+    inherited_env: std.process.exec.Environment;
+    alloc:         *std.allocator.Allocator;
     env_ready:     bool;
-    env_inherited: exec.Environment;
-    env:           host_environment.Strings;
+    env_inherited: std.process.exec.Environment;
+    env:           mach.host.environment.Strings;
     trees:         Vector[Tree];
     trees_ready:   bool;
 }
@@ -74,7 +74,7 @@ a checkout drops the listings.
 ### inspector_init
 
 ```mach
-pub fun inspector_init(alloc: *A.Allocator, environ: exec.Environment) res[Inspector, fail.Fail]
+pub fun inspector_init(alloc: *std.allocator.Allocator, environ: std.process.exec.Environment) res[Inspector, mach.base.fail.Fail]
 ```
 
 an inspector whose git processes inherit `environ`, a session's environment
@@ -82,39 +82,39 @@ an inspector whose git processes inherit `environ`, a session's environment
 ### inspector_dnit
 
 ```mach
-pub fun inspector_dnit(alloc: *A.Allocator, gi: *Inspector)
+pub fun inspector_dnit(alloc: *std.allocator.Allocator, gi: *Inspector)
 ```
 
 ### query_capture
 
 ```mach
-pub fun query_capture(alloc: *A.Allocator, gi: *Inspector, dir: str, args: *str, count: usize,
-    trim_line_end: bool, extra_env: **u8, stdin_fd: usize, capture_stderr: bool) res[Bytes, fail.Fail]
+pub fun query_capture(alloc: *std.allocator.Allocator, gi: *Inspector, dir: str, args: *str, count: usize,
+    trim_line_end: bool, extra_env: **u8, stdin_fd: usize, capture_stderr: bool) res[Bytes, mach.base.fail.Fail]
 ```
 
 ### query
 
 ```mach
-pub fun query(alloc: *A.Allocator, gi: *Inspector, dir: str, args: *str, count: usize) res[str, fail.Fail]
+pub fun query(alloc: *std.allocator.Allocator, gi: *Inspector, dir: str, args: *str, count: usize) res[str, mach.base.fail.Fail]
 ```
 
 ### query_raw
 
 ```mach
-pub fun query_raw(alloc: *A.Allocator, gi: *Inspector, dir: str, args: *str, count: usize) res[str, fail.Fail]
+pub fun query_raw(alloc: *std.allocator.Allocator, gi: *Inspector, dir: str, args: *str, count: usize) res[str, mach.base.fail.Fail]
 ```
 
 ### op
 
 ```mach
-pub fun op(alloc: *A.Allocator, gi: *Inspector, dir: str, args: *str, count: usize, extra_env: **u8) res[str, fail.Fail]
+pub fun op(alloc: *std.allocator.Allocator, gi: *Inspector, dir: str, args: *str, count: usize, extra_env: **u8) res[str, mach.base.fail.Fail]
 ```
 
 ### path_mode
 
 ```mach
-pub fun path_mode(s: *session.Session, gi: *Inspector, alias: str,
-    git_dir: str, git_prefix: str, rel: str) res[str, fail.Fail]
+pub fun path_mode(s: *mach.session.Session, gi: *Inspector, alias: str,
+    git_dir: str, git_prefix: str, rel: str) res[str, mach.base.fail.Fail]
 ```
 
 the committed mode of `<prefix><rel>` at HEAD, or "" when HEAD has no such entry
@@ -122,7 +122,7 @@ the committed mode of `<prefix><rel>` at HEAD, or "" when HEAD has no such entry
 ### inspector_pending
 
 ```mach
-pub fun inspector_pending(environ: exec.Environment) Inspector
+pub fun inspector_pending(environ: std.process.exec.Environment) Inspector
 ```
 
 an inspector that resolves git on first use, its processes inheriting `environ`
@@ -130,7 +130,7 @@ an inspector that resolves git on first use, its processes inheriting `environ`
 ### inspector_require
 
 ```mach
-pub fun inspector_require(alloc: *A.Allocator, gi: *Inspector) err[fail.Fail]
+pub fun inspector_require(alloc: *std.allocator.Allocator, gi: *Inspector) err[mach.base.fail.Fail]
 ```
 
 start a pending inspector; one already started is left as it is
@@ -138,55 +138,55 @@ start a pending inspector; one already started is left as it is
 ### query_named
 
 ```mach
-pub fun query_named(s: *session.Session, gi: *Inspector, alias: str, dir: str,
-    args: *str, count: usize, fact: str) res[str, fail.Fail]
+pub fun query_named(s: *mach.session.Session, gi: *Inspector, alias: str, dir: str,
+    args: *str, count: usize, fact: str) res[str, mach.base.fail.Fail]
 ```
 
 ### require_root
 
 ```mach
-pub fun require_root(s: *session.Session, gi: *Inspector, alias: str, dir: str,
-    subject: str) err[fail.Fail]
+pub fun require_root(s: *mach.session.Session, gi: *Inspector, alias: str, dir: str,
+    subject: str) err[mach.base.fail.Fail]
 ```
 
 ### project_root_authority
 
 ```mach
-pub fun project_root_authority(s: *session.Session, gi: *Inspector, alias: str,
-    project_root: str) res[u8, fail.Fail]
+pub fun project_root_authority(s: *mach.session.Session, gi: *Inspector, alias: str,
+    project_root: str) res[u8, mach.base.fail.Fail]
 ```
 
 ### declaring_prefix
 
 ```mach
-pub fun declaring_prefix(s: *session.Session, gi: *Inspector, alias: str, dir: str) res[str, fail.Fail]
+pub fun declaring_prefix(s: *mach.session.Session, gi: *Inspector, alias: str, dir: str) res[str, mach.base.fail.Fail]
 ```
 
 ### index_entry_field
 
 ```mach
-pub fun index_entry_field(s: *session.Session, gi: *Inspector, alias: str, root: str,
-    rel: str, field: usize, fact: str) res[str, fail.Fail]
+pub fun index_entry_field(s: *mach.session.Session, gi: *Inspector, alias: str, root: str,
+    rel: str, field: usize, fact: str) res[str, mach.base.fail.Fail]
 ```
 
 ### require_matches_index
 
 ```mach
-pub fun require_matches_index(s: *session.Session, gi: *Inspector, alias: str, root: str,
-    rel: str, subject: str) err[fail.Fail]
+pub fun require_matches_index(s: *mach.session.Session, gi: *Inspector, alias: str, root: str,
+    rel: str, subject: str) err[mach.base.fail.Fail]
 ```
 
 ### require_tracked
 
 ```mach
-pub fun require_tracked(s: *session.Session, gi: *Inspector, alias: str, root: str,
-    rel: str, subject: str) err[fail.Fail]
+pub fun require_tracked(s: *mach.session.Session, gi: *Inspector, alias: str, root: str,
+    rel: str, subject: str) err[mach.base.fail.Fail]
 ```
 
 ### is_work_tree
 
 ```mach
-pub fun is_work_tree(alloc: *A.Allocator, gi: *Inspector, dir: str) res[bool, fail.Fail]
+pub fun is_work_tree(alloc: *std.allocator.Allocator, gi: *Inspector, dir: str) res[bool, mach.base.fail.Fail]
 ```
 
 whether `dir` lies inside a git work tree: git answers by its exit, so a refusing exit is
@@ -204,7 +204,7 @@ pub rec Bytes {
 ### bytes_dnit
 
 ```mach
-pub fun bytes_dnit(alloc: *A.Allocator, bytes: *Bytes)
+pub fun bytes_dnit(alloc: *std.allocator.Allocator, bytes: *Bytes)
 ```
 
 ## Functions

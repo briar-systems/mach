@@ -12,9 +12,9 @@ that select differently are the root's override or a conflict, which the closure
 already notes or refuses, and a version range is reconciled by resolution, so a
 requirer's pin of it is only a seed
 
-<sub>source: [`src/package/agreement.mach`](../../../src/package/agreement.mach) · imported by 2 modules</sub>
+Source: [`src/package/agreement.mach`](../../../src/package/agreement.mach)
 
-<sub>`package_closure` is [`mach.package.closure`](closure.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `A` is `std.allocator`</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.package.closure`](closure.md).
 
 | Functions | |
 | :--- | :--- |
@@ -29,7 +29,7 @@ requirer's pin of it is only a seed
 ### disagreements
 
 ```mach
-pub fun disagreements(op: *package_closure.Operation, reqs: *Vector[package_closure.Request], out: *Vector[str]) err[fail.Fail]
+pub fun disagreements(op: *mach.package.closure.Operation, reqs: *Vector[mach.package.closure.Request], out: *Vector[str]) err[mach.base.fail.Fail]
 ```
 
 one line per pin that differs from the first one seen for its identity, in closure order
@@ -44,7 +44,7 @@ one line per pin that differs from the first one seen for its identity, in closu
 ### refused
 
 ```mach
-pub fun refused(op: *package_closure.Operation, lines: *Vector[str]) err[fail.Fail]
+pub fun refused(op: *mach.package.closure.Operation, lines: *Vector[str]) err[mach.base.fail.Fail]
 ```
 
 the refusal of a closure that pins a package at more than one commit, ok when `lines` is
@@ -54,6 +54,6 @@ failure, so every command that walks a closure refuses a disagreement alike
 ### lines_dnit
 
 ```mach
-pub fun lines_dnit(a: *A.Allocator, lines: *Vector[str])
+pub fun lines_dnit(a: *std.allocator.Allocator, lines: *Vector[str])
 ```
 

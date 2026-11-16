@@ -8,7 +8,7 @@ range, a git ref or a path; the root's dep/ holds every identity once, and a ver
 any project in the closure declares is pinned there:
 
 - a range's pin is the pin the project records. for a repository root it is the root's own
-  gitlink at dep/&lt;id>; for a subproject, a project in a subdirectory of a repository, it is
+  gitlink at dep/\<id>; for a subproject, a project in a subdirectory of a repository, it is
   the gitlink the enclosing repository commits under the subproject's prefix. pull realizes
   the pin on a fresh clone and restores a checkout that drifted from it, and update records
   the moved pin. a subproject with no pin for a dependency gets a plain clone, as a project
@@ -21,9 +21,9 @@ any project in the closure declares is pinned there:
 - a range with neither a pin nor a checkout under the root is refused with `run mach dep
   update <root> <id>`, which pins it whether the root or a dependency declares it
 
-<sub>source: [`src/package/closure.mach`](../../../src/package/closure.mach) · imported by 8 modules</sub>
+Source: [`src/package/closure.mach`](../../../src/package/closure.mach)
 
-<sub>`session` is [`mach.session`](../session.md) · `A` is `std.allocator` · `package_source` is [`mach.package.source`](source.md) · `package_pin` is [`mach.package.pin`](pin.md) · `report` is [`mach.package.report`](report.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `toml_value` is `toml.value` · `resolver` is [`mach.package.resolver`](resolver.md) · `manifest_load` is [`mach.manifest.load`](../manifest/load.md) · `RangeDecl` is private · `base_source` is [`mach.base.source`](../base/source.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.manifest.load`](../manifest/load.md), [`mach.package.pin`](pin.md), [`mach.package.report`](report.md), [`mach.package.resolver`](resolver.md), [`mach.package.source`](source.md), [`mach.session`](../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -44,7 +44,7 @@ any project in the closure declares is pinned there:
 | On `Request` | |
 | :--- | :--- |
 | [`selects_release`](#selects_release) | a release-selected git dependency: its requirements are the chosen release's |
-| [`index`](#index) · [`requests_dnit`](#requests_dnit) | |
+| [`index`](#index), [`requests_dnit`](#requests_dnit) | |
 | [`declared`](#declared) | the root's own declarations in the manifest table `mt`, appended to `reqs` |
 | [`conflict_text`](#conflict_text) | the example table is valid TOML as printed: values are escaped as the manifest writer would write them |
 
@@ -57,7 +57,7 @@ any project in the closure declares is pinned there:
 
 | Constants | |
 | :--- | :--- |
-| [`COPY_NONE`](#constants) · [`COPY_REFRESHED`](#constants) · [`COPY_REUSED`](#constants) | |
+| [`COPY_NONE`](#constants), [`COPY_REFRESHED`](#constants), [`COPY_REUSED`](#constants) | |
 
 ---
 
@@ -65,12 +65,12 @@ any project in the closure declares is pinned there:
 
 ```mach
 pub rec Operation {
-    s:         *session.Session;
-    a:         *A.Allocator;
+    s:         *mach.session.Session;
+    a:         *std.allocator.Allocator;
     root:      str;
-    checkouts: package_source.Checkouts;
-    pins:      package_pin.Pin;
-    rep:       *report.Report;
+    checkouts: mach.package.source.Checkouts;
+    pins:      mach.package.pin.Pin;
+    rep:       *mach.package.report.Report;
 }
 ```
 
@@ -80,7 +80,7 @@ project root, the tables of the source and pin members, and where it reports
 ### init
 
 ```mach
-pub fun init(s: *session.Session, a: *A.Allocator, root: str, rep: *report.Report) res[Operation, fail.Fail]
+pub fun init(s: *mach.session.Session, a: *std.allocator.Allocator, root: str, rep: *mach.package.report.Report) res[Operation, mach.base.fail.Fail]
 ```
 
 open an operation on the project at `root`, released with `dnit`
@@ -95,7 +95,7 @@ pub fun dnit(op: *Operation)
 
 ```mach
 pub fun realize(op: *Operation, reqs: *Vector[Request], quiet: bool, offline: bool, verify_only: bool,
-    candidate: *toml_value.Table, picks: *Vector[resolver.Choice]) err[fail.Fail]
+    candidate: *toml.value.Table, picks: *Vector[mach.package.resolver.Choice]) err[mach.base.fail.Fail]
 ```
 
 walk and realize the closure into `reqs`, the root's manifest read from `candidate` when
@@ -117,7 +117,7 @@ directory under dep/ outside the closure, where a realizing walk notes and retai
 
 ```mach
 pub fun acquire(op: *Operation, r: *Request, mode: u8, accept: bool, quiet: bool, offline: bool,
-    pinned_only: bool, effect: *u8) err[fail.Fail]
+    pinned_only: bool, effect: *u8) err[mach.base.fail.Fail]
 ```
 
 acquire a git dependency's slot through the source and report what changed; `accept` is
@@ -127,7 +127,7 @@ pin or an existing checkout realizes
 ### preflight
 
 ```mach
-pub fun preflight(op: *Operation, doc: *manifest_load.Doc, reqs: *Vector[Request], inspect_git: bool, walk: *Walk) err[fail.Fail]
+pub fun preflight(op: *Operation, doc: *mach.manifest.load.Doc, reqs: *Vector[Request], inspect_git: bool, walk: *Walk) err[mach.base.fail.Fail]
 ```
 
 a fixed git dependency's manifest, and the pins it commits for its ranges, are read at the
@@ -189,13 +189,13 @@ pub fun index(reqs: *Vector[Request], id: str) i64
 ### requests_dnit
 
 ```mach
-pub fun requests_dnit(a: *A.Allocator, requests: *Vector[Request])
+pub fun requests_dnit(a: *std.allocator.Allocator, requests: *Vector[Request])
 ```
 
 ### declared
 
 ```mach
-pub fun declared(a: *A.Allocator, reqs: *Vector[Request], root: str, mt: *toml_value.Table) err[fail.Fail]
+pub fun declared(a: *std.allocator.Allocator, reqs: *Vector[Request], root: str, mt: *toml.value.Table) err[mach.base.fail.Fail]
 ```
 
 the root's own declarations in the manifest table `mt`, appended to `reqs`
@@ -203,7 +203,7 @@ the root's own declarations in the manifest table `mt`, appended to `reqs`
 ### conflict_text
 
 ```mach
-pub fun conflict_text(a: *A.Allocator, subject: *Request, x: *Request, y: *Request) res[str, fail.Fail]
+pub fun conflict_text(a: *std.allocator.Allocator, subject: *Request, x: *Request, y: *Request) res[str, mach.base.fail.Fail]
 ```
 
 the example table is valid TOML as printed: values are escaped as the
@@ -240,7 +240,7 @@ identity `name` names
 ### pin_command
 
 ```mach
-pub fun pin_command(a: *A.Allocator, root: str, id: str) res[str, fail.Fail]
+pub fun pin_command(a: *std.allocator.Allocator, root: str, id: str) res[str, mach.base.fail.Fail]
 ```
 
 the command that pins and realizes a version-selected dependency with no checkout yet;
@@ -249,13 +249,13 @@ pull's refusal and init's --no-deps hint both name it
 ### unpinned_refusal
 
 ```mach
-pub fun unpinned_refusal(a: *A.Allocator, root: str, id: str, version: str) res[str, fail.Fail]
+pub fun unpinned_refusal(a: *std.allocator.Allocator, root: str, id: str, version: str) res[str, mach.base.fail.Fail]
 ```
 
 ### key_text
 
 ```mach
-pub fun key_text(t: *toml_value.Table, key: str) str
+pub fun key_text(t: *toml.value.Table, key: str) str
 ```
 
 a string key as the dependency commands read it: absent reads as empty
@@ -263,7 +263,7 @@ a string key as the dependency commands read it: absent reads as empty
 ### parse_file
 
 ```mach
-pub fun parse_file(a: *A.Allocator, sources: *base_source.SourceMap, p: str) res[manifest_load.Doc, fail.Fail]
+pub fun parse_file(a: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, p: str) res[mach.manifest.load.Doc, mach.base.fail.Fail]
 ```
 
 ## Constants

@@ -8,9 +8,9 @@ constant means at compile time what the same operation means at run time and no
 fold rule is stated here. comptime keeps only the language's own rules over the
 folded results: which operations it admits, and when a result is out of range
 
-<sub>source: [`src/front/comptime/fold.mach`](../../../../src/front/comptime/fold.mach) · imported by 1 module</sub>
+Source: [`src/front/comptime/fold.mach`](../../../../src/front/comptime/fold.mach)
 
-<sub>`float` is [`mach.base.float`](../../base/float.md) · `wide` is [`mach.base.wide`](../../base/wide.md) · `target_facts` is [`mach.target.facts`](../../target/facts.md)</sub>
+Uses types from [`mach.base.float`](../../base/float.md), [`mach.base.wide`](../../base/wide.md), [`mach.target.facts`](../../target/facts.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -45,7 +45,7 @@ folded results: which operations it admits, and when a result is out of range
 ```mach
 pub tag Kind: u8 {
     integer: u32;
-    float:   float.FloatWidth;
+    float:   mach.base.float.FloatWidth;
 }
 ```
 
@@ -54,12 +54,12 @@ the type an operand or a result is read at
 | Case | Payload | |
 | :--- | :--- | :--- |
 | `integer` | `u32` | an integer of this many bits |
-| `float` | `float.FloatWidth` | a float of this width |
+| `float` | `mach.base.float.FloatWidth` | a float of this width |
 
 ### fold_op
 
 ```mach
-pub fun fold_op(op: Opcode, k: Kind, x: [3]wide.Wide, n: u32, to: opt[Kind], nans: target_facts.Nans) Answer
+pub fun fold_op(op: Opcode, k: Kind, x: [3]mach.base.wide.Wide, n: u32, to: opt[Kind], nans: mach.target.facts.Nans) Answer
 ```
 
 fold `op` over `n` operands of kind `k`, the results read at `out`, with the
@@ -77,7 +77,7 @@ immediate type `to` where the row takes one
 ### convert
 
 ```mach
-pub fun convert(op: Opcode, from: Kind, x: wide.Wide, to: Kind, nans: target_facts.Nans) Answer
+pub fun convert(op: Opcode, from: Kind, x: mach.base.wide.Wide, to: Kind, nans: mach.target.facts.Nans) Answer
 ```
 
 a conversion of `x`, read as `from`, to `to` by mirl's conversion row `op`, a nan
@@ -87,7 +87,7 @@ result made by the target's rule `nans`
 
 ```mach
 pub tag Answer: u8 {
-    folded: [2]wide.Wide;
+    folded: [2]mach.base.wide.Wide;
     zero;
     overflow;
     nan;
@@ -99,7 +99,7 @@ what one fold gives
 
 | Case | Payload | |
 | :--- | :--- | :--- |
-| `folded` | `[2]wide.Wide` | its results, at most two, each as the low 128 bits of its value: a float's are its own encoding at its width |
+| `folded` | `[2]mach.base.wide.Wide` | its results, at most two, each as the low 128 bits of its value: a float's are its own encoding at its width |
 | `zero` |  | the folder refused it by a division or remainder by zero |
 | `overflow` |  | the folder refused it by a quotient that does not fit |
 | `nan` |  | the folder refused it by a nan result whose bits the target's rule for its format leaves unknown |
@@ -108,7 +108,7 @@ what one fold gives
 ### int
 
 ```mach
-pub fun int(op: Opcode, x: wide.Wide, y: wide.Wide, n: u32) Answer
+pub fun int(op: Opcode, x: mach.base.wide.Wide, y: mach.base.wide.Wide, n: u32) Answer
 ```
 
 an integer operation at comptime's width over one or two operands
@@ -116,7 +116,7 @@ an integer operation at comptime's width over one or two operands
 ### flt
 
 ```mach
-pub fun flt(op: Opcode, w: float.FloatWidth, x: f64, y: f64, n: u32, nans: target_facts.Nans) Answer
+pub fun flt(op: Opcode, w: mach.base.float.FloatWidth, x: f64, y: f64, n: u32, nans: mach.target.facts.Nans) Answer
 ```
 
 a float operation at width `w` over one or two operands, each the f64 that holds
@@ -125,7 +125,7 @@ its value at that width, a nan result made by the target's rule `nans`
 ### first
 
 ```mach
-pub fun first(a: Answer) wide.Wide
+pub fun first(a: Answer) mach.base.wide.Wide
 ```
 
 the first result of a fold the caller knows cannot trap
@@ -141,7 +141,7 @@ whether a one-bit result is set
 ### float_of
 
 ```mach
-pub fun float_of(a: Answer, w: float.FloatWidth) f64
+pub fun float_of(a: Answer, w: mach.base.float.FloatWidth) f64
 ```
 
 the float a fold at width `w` gave
@@ -151,7 +151,7 @@ the float a fold at width `w` gave
 ### at_width
 
 ```mach
-pub fun at_width(x: wide.Wide, width: u32, signed: bool) wide.Wide
+pub fun at_width(x: mach.base.wide.Wide, width: u32, signed: bool) mach.base.wide.Wide
 ```
 
 the bits of `x` cut to `width` and extended back to comptime's width: sign

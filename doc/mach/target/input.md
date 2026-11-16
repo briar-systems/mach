@@ -9,9 +9,9 @@ mink's search finds when the link runs: the search its host row states for the
 target's system, environment and architecture. mach looks for no library of
 its own
 
-<sub>source: [`src/target/input.mach`](../../../src/target/input.mach) · imported by 8 modules</sub>
+Source: [`src/target/input.mach`](../../../src/target/input.mach)
 
-<sub>`A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,11 +21,11 @@ its own
 
 | On `Form` | |
 | :--- | :--- |
-| [`FILE`](#form) · [`LIBRARY`](#form) · [`FRAMEWORK`](#form) | |
+| [`FILE`](#form), [`LIBRARY`](#form), [`FRAMEWORK`](#form) | |
 
 | On `Kind` | |
 | :--- | :--- |
-| [`SHARED`](#kind) · [`STATIC`](#kind) | |
+| [`SHARED`](#kind), [`STATIC`](#kind) | |
 
 | On `Input` | |
 | :--- | :--- |
@@ -88,7 +88,7 @@ SHARED for any other input
 ### token_input
 
 ```mach
-pub fun token_input(a: *A.Allocator, root: str, tok: *u8) res[Input, fail.Fail]
+pub fun token_input(a: *std.allocator.Allocator, root: str, tok: *u8) res[Input, mach.base.fail.Fail]
 ```
 
 the input a link token names: a path, located as written or under `root`,

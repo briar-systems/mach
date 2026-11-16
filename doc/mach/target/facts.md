@@ -6,9 +6,9 @@ what a program may ask of its target while it compiles, read once from the back 
 build opens: the tag ids of mink's rows, masc's selection, and what mirl's assembled
 target lays out and guarantees
 
-<sub>source: [`src/target/facts.mach`](../../../src/target/facts.mach) · imported by 9 modules</sub>
+Source: [`src/target/facts.mach`](../../../src/target/facts.mach)
 
-<sub>`mirl_capability` is `mirl.target.capability` · `float` is [`mach.base.float`](../base/float.md) · `resolved` is [`mach.target.resolved`](resolved.md) · `ct` is [`mach.target.ct`](ct.md) · `A` is `std.allocator` · `assembled` is [`mach.target.assembled`](assembled.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.float`](../base/float.md), [`mach.target.assembled`](assembled.md), [`mach.target.ct`](ct.md), [`mach.target.resolved`](resolved.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -76,7 +76,7 @@ the build meets, in bits
 
 ```mach
 pub rec Nans {
-    formats: [3]mirl_capability.Nans;
+    formats: [3]mirl.target.capability.Nans;
 }
 ```
 
@@ -94,7 +94,7 @@ no format's rule stated, as where no target is selected
 ### nans_at
 
 ```mach
-pub fun nans_at(n: *Nans, w: float.FloatWidth) mirl_capability.Nans
+pub fun nans_at(n: *Nans, w: mach.base.float.FloatWidth) mirl.target.capability.Nans
 ```
 
 the rule of the format of width `w`, binary64 for any other width
@@ -117,7 +117,7 @@ pub rec Facts {
     pointer_width: u32;
     vector_bits:   u32;
     register_bits: u32;
-    selected:      resolved.Selected;
+    selected:      mach.target.resolved.Selected;
     has_assembly:  bool;
     # whether a pointer is an address, or on a logical target a reference to a declared type
     flat_addressing: bool;
@@ -127,7 +127,7 @@ pub rec Facts {
     va_list: VaList;
     # the scalar multiplies mirl runs in time independent of their operands, which
     # `$mach.build.ct_mul` reads
-    multiplies: ct.CtMulMask;
+    multiplies: mach.target.ct.CtMulMask;
     # the build guarantees every timing mode a soft constant-time function's code may be held
     # under, so a hard function may call a soft one
     soft_guaranteed: bool;
@@ -142,7 +142,7 @@ assembler
 ### of
 
 ```mach
-pub fun of(a: *A.Allocator, x: *assembled.Assembled, t: *resolved.Target) res[Facts, fail.Fail]
+pub fun of(a: *std.allocator.Allocator, x: *mach.target.assembled.Assembled, t: *mach.target.resolved.Target) res[Facts, mach.base.fail.Fail]
 ```
 
 the facts of the target `t` mirl assembled as `x`: mink's rows by their tag ids, masc's

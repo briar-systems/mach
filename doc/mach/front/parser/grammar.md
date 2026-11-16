@@ -2,9 +2,9 @@
 
 # mach.front.parser.grammar
 
-<sub>source: [`src/front/parser/grammar.mach`](../../../../src/front/parser/grammar.mach) · imported by 1 module</sub>
+Source: [`src/front/parser/grammar.mach`](../../../../src/front/parser/grammar.mach)
 
-<sub>`state` is [`mach.front.parser.state`](state.md) · `ast_id` is [`mach.front.ast.id`](../ast/id.md)</sub>
+Uses types from [`mach.front.ast.id`](../ast/id.md), [`mach.front.parser.state`](state.md).
 
 | Functions | |
 | :--- | :--- |
@@ -17,6 +17,6 @@
 ### parse_module
 
 ```mach
-pub fun parse_module(p: *state.Parser) ast_id.ModuleNodeId
+pub fun parse_module(p: *mach.front.parser.state.Parser) mach.front.ast.id.ModuleNodeId
 ```
 

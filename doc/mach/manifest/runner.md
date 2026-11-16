@@ -2,19 +2,20 @@
 
 # mach.manifest.runner
 
-the command a target's programs are launched through. a target may declare a
-`runner`, argv templates the launch expands, and `--runner <cmd>` replaces it
-for one invocation with `<cmd> <program>`. mach knows no runner by name: the
-command is the manifest's, and its exit status is the program's
+the command a target's programs are launched through, and the executable `mach run`
+launches. a target may declare a `runner`, argv templates the launch expands, and
+`--runner <cmd>` replaces it for one invocation with `<cmd> <program>`. mach knows no
+runner by name: the command is the manifest's, and its exit status is the program's
 
-<sub>source: [`src/manifest/runner.mach`](../../../src/manifest/runner.mach) · imported by 4 modules</sub>
+Source: [`src/manifest/runner.mach`](../../../src/manifest/runner.mach)
 
-<sub>`template` is [`mach.manifest.template`](template.md) · `A` is `std.allocator` · `intern` is [`mach.base.intern`](../base/intern.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.manifest.select`](select.md), [`mach.manifest.template`](template.md).
 
 | Type | | |
 | :--- | :--- | :--- |
 | [`Runner`](#runner) | `rec` | how one (target, profile)'s programs are launched |
 | [`Command`](#command-1) | `rec` | a launch command: `argv` is nil-terminated, its first `lead` entries the runner's and the program's, the rest the run's own arguments |
+| [`RunArtifact`](#runartifact) | `rec` | the program `mach run` launches |
 
 | On `Runner` | |
 | :--- | :--- |
@@ -29,6 +30,10 @@ command is the manifest's, and its exit status is the program's
 | [`line`](#line) | the command's leading words joined by spaces, as a person would retype them before the run's own arguments |
 | [`command_dnit`](#command_dnit) | release the words a command owns; the run's own arguments are the caller's |
 
+| On `RunArtifact` | |
+| :--- | :--- |
+| [`resolve_run_artifact`](#resolve_run_artifact) | the built executable `mach run` launches: the one (artifact, target, profile) the selectors name, which must be a `bin` |
+
 ---
 
 ## Runner
@@ -40,7 +45,7 @@ pub rec Runner {
     count:   u32;
     target:  str;
     work:    str;
-    values:  template.Values;
+    values:  mach.manifest.template.Values;
 }
 ```
 
@@ -53,7 +58,7 @@ how one (target, profile)'s programs are launched
 | `count` | `u32` | length of `words` |
 | `target` | `str` | the target's name, for a refusal |
 | `work` | `str` | `{project.work}`, joined to the project root |
-| `values` | `template.Values` | the target's and profile's template values, owned |
+| `values` | `mach.manifest.template.Values` | the target's and profile's template values, owned |
 
 ### none
 
@@ -87,7 +92,7 @@ the runner `--runner` names for one invocation, replacing the declared one
 ### declared
 
 ```mach
-pub fun declared(a: *A.Allocator, itn: *intern.Interner, t: *TargetDef, profile: str, work: str) res[Runner, fail.Fail]
+pub fun declared(a: *std.allocator.Allocator, itn: *mach.base.intern.Interner, t: *TargetDef, profile: str, work: str) res[Runner, mach.base.fail.Fail]
 ```
 
 the runner `t` declares for `profile`, copied out of `itn` into `a`; no runner
@@ -100,7 +105,7 @@ when it declares none
 ### command
 
 ```mach
-pub fun command(a: *A.Allocator, r: *Runner, out: str, args: **u8, n: usize) res[Command, fail.Fail]
+pub fun command(a: *std.allocator.Allocator, r: *Runner, out: str, args: **u8, n: usize) res[Command, mach.base.fail.Fail]
 ```
 
 the command launching `out` through `r` with the `n` arguments at `args`: the
@@ -128,7 +133,7 @@ runner's and the program's, the rest the run's own arguments
 ### line
 
 ```mach
-pub fun line(a: *A.Allocator, c: *Command) res[str, fail.Fail]
+pub fun line(a: *std.allocator.Allocator, c: *Command) res[str, mach.base.fail.Fail]
 ```
 
 the command's leading words joined by spaces, as a person would retype them
@@ -137,8 +142,47 @@ before the run's own arguments
 ### command_dnit
 
 ```mach
-pub fun command_dnit(a: *A.Allocator, c: *Command)
+pub fun command_dnit(a: *std.allocator.Allocator, c: *Command)
 ```
 
 release the words a command owns; the run's own arguments are the caller's
+
+## RunArtifact
+
+```mach
+pub rec RunArtifact {
+    path:          str;
+    host_runnable: bool;
+    target_name:   str;
+    runner:        Runner;
+}
+```
+
+the program `mach run` launches
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `path` | `str` | the built executable, or `-o` |
+| `host_runnable` | `bool` | the target's os and isa are the host's |
+| `target_name` | `str` | the target's declared name |
+| `runner` | `Runner` | the runner the target declares, none when it declares none |
+
+### resolve_run_artifact
+
+```mach
+pub fun resolve_run_artifact(alloc: *std.allocator.Allocator, project_root: str, selectors: *mach.manifest.select.Selectors,
+    output_override: str, sources: *mach.base.source.SourceMap) res[RunArtifact, mach.base.fail.Fail]
+```
+
+the built executable `mach run` launches: the one (artifact, target, profile)
+the selectors name, which must be a `bin`
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | owns the result and every message |
+| `project_root` | the project root |
+| `selectors` | the `-a`, `-t` and `-p` patterns; an artifact axis given none takes the sole `bin` |
+| `output_override` | `-o`, the path to run instead of the artifact's output, or nil |
+| `sources` | receives the manifest's text, which a refusal points into |
+| **returns** | the executable; err from the manifest or selection, when the selection names several cells or a library, or for an unusable `-o` |
 

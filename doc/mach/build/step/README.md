@@ -7,7 +7,7 @@ invocation expanded, its outputs staged and published, and its stamp kept, so
 a step runs again only when what it reads changed. the build engine runs a
 project's own steps and its dependencies' steps as phases of a unit
 
-<sub>[`mach.build.step`](../step.md) · 2 modules · imports [`base`](../../base/README.md), [`compile`](../../compile/README.md), [`host`](../../host/README.md), [`manifest`](../../manifest/README.md), [`report`](../../report/README.md)</sub>
+The directory's root module is [`mach.build.step`](../step.md).
 
 | Module | |
 | :--- | :--- |

@@ -8,9 +8,9 @@ a placed global is a section of its own, named for its offset, so the link plan 
 places it reads the offset back from the object and needs no other record of it. the
 lowering writes the name and the link reads it, and nothing else spells it
 
-<sub>source: [`src/lower/placement.mach`](../../../src/lower/placement.mach) · imported by 2 modules</sub>
+Source: [`src/lower/placement.mach`](../../../src/lower/placement.mach)
 
-<sub>`intern` is [`mach.base.intern`](../base/intern.md)</sub>
+Uses types from [`mach.base.intern`](../base/intern.md).
 
 | Functions | |
 | :--- | :--- |
@@ -24,7 +24,7 @@ lowering writes the name and the link reads it, and nothing else spells it
 ### section_name
 
 ```mach
-pub fun section_name(itn: *intern.Interner, offset: u64) opt[str]
+pub fun section_name(itn: *mach.base.intern.Interner, offset: u64) opt[str]
 ```
 
 the name of the section a global placed at `offset` is, held by `itn`

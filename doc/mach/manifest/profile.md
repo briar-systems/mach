@@ -4,9 +4,9 @@
 
 the decoding of the `[profile.<name>]` tables, and the rule of at most one default
 
-<sub>source: [`src/manifest/profile.mach`](../../../src/manifest/profile.mach) · imported by 1 module</sub>
+Source: [`src/manifest/profile.mach`](../../../src/manifest/profile.mach)
 
-<sub>`A` is `std.allocator` · `intern` is [`mach.base.intern`](../base/intern.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `toml_value` is `toml.value`</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md).
 
 | Functions | |
 | :--- | :--- |
@@ -20,7 +20,7 @@ the decoding of the `[profile.<name>]` tables, and the rule of at most one defau
 ### default_validate
 
 ```mach
-pub fun default_validate(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[fail.Fail]
+pub fun default_validate(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest) err[mach.base.fail.Fail]
 ```
 
 more than one `default = true` profile is refused, pointing at the first
@@ -29,7 +29,7 @@ more than one `default = true` profile is refused, pointing at the first
 ### parse_profiles
 
 ```mach
-pub fun parse_profiles(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail]
+pub fun parse_profiles(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, t: *toml.value.Table, m: *Manifest) err[mach.base.fail.Fail]
 ```
 
 the `[profile.*]` tables; the schema check admits no manifest without one

@@ -5,9 +5,9 @@
 whether two types laid over one storage keep every byte's secrecy class: a cast or
 retype from one to the other, or two union variants
 
-<sub>source: [`src/type/query/secrecy.mach`](../../../../src/type/query/secrecy.mach) · imported by 4 modules</sub>
+Source: [`src/type/query/secrecy.mach`](../../../../src/type/query/secrecy.mach)
 
-<sub>`Agreement` is private · `type_kind` is [`mach.type.kind`](../kind.md) · `extent` is [`mach.type.query.extent`](extent.md) · `session` is [`mach.session`](../../session.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.session`](../../session.md), [`mach.type.kind`](../kind.md), [`mach.type.query.extent`](extent.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,7 +21,7 @@ retype from one to the other, or two union variants
 
 | Constants | |
 | :--- | :--- |
-| [`AGREE`](#constants) · [`DISAGREE`](#constants) · [`UNDECIDABLE`](#constants) · [`NO_FIELD`](#constants) · [`UNBOUNDED_VARIANTS_MSG`](#constants) · [`UNBOUNDED_CAST_MSG`](#constants) | |
+| [`AGREE`](#constants), [`DISAGREE`](#constants), [`UNDECIDABLE`](#constants), [`NO_FIELD`](#constants), [`UNBOUNDED_VARIANTS_MSG`](#constants), [`UNBOUNDED_CAST_MSG`](#constants) | |
 
 ---
 
@@ -30,7 +30,7 @@ retype from one to the other, or two union variants
 ```mach
 pub rec Verdict {
     agreement: Agreement;
-    owner:     type_kind.TypeId;
+    owner:     mach.type.kind.TypeId;
     field:     u32;
 }
 ```
@@ -44,7 +44,7 @@ shape. `owner` is TYPE_NIL when no field is known
 ### overlay_walk
 
 ```mach
-pub fun overlay_walk(mz: *extent.Measure, a: type_kind.TypeId, b: type_kind.TypeId) Verdict
+pub fun overlay_walk(mz: *mach.type.query.extent.Measure, a: mach.type.kind.TypeId, b: mach.type.kind.TypeId) Verdict
 ```
 
 two types laid over one storage from offset 0, as union variants are: every
@@ -53,7 +53,7 @@ byte both cover has one class on both sides
 ### cast_allowed
 
 ```mach
-pub fun cast_allowed(s: *session.Session, laying: *extent.Laying, from: type_kind.TypeId, to: type_kind.TypeId) res[Verdict, fail.Fail]
+pub fun cast_allowed(s: *mach.session.Session, laying: *mach.type.query.extent.Laying, from: mach.type.kind.TypeId, to: mach.type.kind.TypeId) res[Verdict, mach.base.fail.Fail]
 ```
 
 whether a `::` or `:~` from `from` to `to` keeps every byte's secrecy class or only makes public bytes secret in a value
@@ -61,7 +61,7 @@ whether a `::` or `:~` from `from` to `to` keeps every byte's secrecy class or o
 ### overlay_agrees
 
 ```mach
-pub fun overlay_agrees(s: *session.Session, laying: *extent.Laying, a: type_kind.TypeId, b: type_kind.TypeId) res[Verdict, fail.Fail]
+pub fun overlay_agrees(s: *mach.session.Session, laying: *mach.type.query.extent.Laying, a: mach.type.kind.TypeId, b: mach.type.kind.TypeId) res[Verdict, mach.base.fail.Fail]
 ```
 
 whether two union variants overlaying one storage agree on every byte they share

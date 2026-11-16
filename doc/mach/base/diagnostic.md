@@ -10,9 +10,9 @@ fulfilled. a store replays into another and encodes to bytes that name files by 
 another session can decode it. the texts a diagnostic or failure carries are interned here
 when they must outlive the scratch storage they were made in.
 
-<sub>source: [`src/base/diagnostic.mach`](../../../src/base/diagnostic.mach) · imported by 78 modules</sub>
+Source: [`src/base/diagnostic.mach`](../../../src/base/diagnostic.mach)
 
-<sub>`diagnostic_kind` is [`mach.base.diagnostic.kind`](diagnostic/kind.md) · `base_source` is [`mach.base.source`](source.md) · `annotation` is [`mach.base.diagnostic.annotation`](diagnostic/annotation.md) · `A` is `std.allocator` · `map` is `std.collections.map` · `ExpectRun` is private · `fail` is [`mach.base.fail`](fail.md) · `wire` is [`mach.base.wire`](wire.md) · `intern` is [`mach.base.intern`](intern.md)</sub>
+Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [`mach.base.diagnostic.kind`](diagnostic/kind.md), [`mach.base.fail`](fail.md), [`mach.base.intern`](intern.md), [`mach.base.source`](source.md), [`mach.base.wire`](wire.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -28,12 +28,12 @@ when they must outlive the scratch storage they were made in.
 
 | On `Origin` | |
 | :--- | :--- |
-| [`ORIGIN_NONE`](#origin) · [`ORIGIN_BUILD`](#origin) · [`ORIGIN_LOAD`](#origin) · [`ORIGIN_RESOLVE`](#origin) · [`ORIGIN_SEMA`](#origin) · [`ORIGIN_LOWER`](#origin) · [`ORIGIN_CODEGEN`](#origin) · [`ORIGIN_LINK`](#origin) · [`ORIGIN_TEST`](#origin) | |
+| [`ORIGIN_NONE`](#origin), [`ORIGIN_BUILD`](#origin), [`ORIGIN_LOAD`](#origin), [`ORIGIN_RESOLVE`](#origin), [`ORIGIN_SEMA`](#origin), [`ORIGIN_LOWER`](#origin), [`ORIGIN_CODEGEN`](#origin), [`ORIGIN_LINK`](#origin), [`ORIGIN_TEST`](#origin) | |
 | [`origin_name`](#origin_name) | the stable name of an origin |
 
 | On `ChildKind` | |
 | :--- | :--- |
-| [`CHILD_NOTE`](#childkind) · [`CHILD_HELP`](#childkind) | |
+| [`CHILD_NOTE`](#childkind), [`CHILD_HELP`](#childkind) | |
 
 | On `Diagnostic` | |
 | :--- | :--- |
@@ -69,7 +69,7 @@ when they must outlive the scratch storage they were made in.
 | [`builder_init`](#builder_init) | a builder for a diagnostic of kind `k` |
 | [`builder_initf`](#builder_initf) | a builder for a diagnostic of kind `k` whose message is `fmt` formatted with `args`; a format the allocator refuses is a failure, never a substitute message |
 | [`builder_dnit`](#builder_dnit) | release what a builder owns; a nil builder, or one already committed or released, owns nothing |
-| [`attach_note`](#attach_note) · [`attach_help`](#attach_help) | |
+| [`attach_note`](#attach_note), [`attach_help`](#attach_help) | |
 | [`attach_related`](#attach_related) | a related place; a nil or empty label shows the place without one |
 | [`attach_fix`](#attach_fix) | a fix of one edit, which `attach_fix_edit` extends |
 | [`attach_fix_edit`](#attach_fix_edit) | a further edit of fix `fix`, which may not overlap one it already makes |
@@ -88,7 +88,7 @@ when they must outlive the scratch storage they were made in.
 | [`text_intern`](#text_intern) | `text`, owned by `a`, moved into the interner: the interned copy outlives `a`'s storage, and `text` is released either way |
 | [`format_intern`](#format_intern) | `fmt` formatted with `va` through `a` as scratch and interned, so the text outlives `a`'s storage |
 | [`refusal_interned`](#refusal_interned) | `fail.refusal` of `op` with its text interned, so the failure outlives `a`'s storage; an internal failure carries a static text and is returned as it is |
-| [`suggestion_build`](#suggestion_build) · [`fix_label_replace`](#fix_label_replace) | |
+| [`suggestion_build`](#suggestion_build), [`fix_label_replace`](#fix_label_replace) | |
 
 ---
 
@@ -159,13 +159,13 @@ a fix's position in its diagnostic's fix list
 
 ```mach
 pub rec Diagnostic {
-    kind:     diagnostic_kind.Kind;
+    kind:     mach.base.diagnostic.kind.Kind;
     origin:   Origin;
-    loc:      base_source.Location;
+    loc:      mach.base.source.Location;
     message:  str;
     children: Vector[Child];
-    related:  Vector[annotation.Related];
-    fixes:    Vector[annotation.Fix];
+    related:  Vector[mach.base.diagnostic.annotation.Related];
+    fixes:    Vector[mach.base.diagnostic.annotation.Fix];
 }
 ```
 
@@ -183,24 +183,24 @@ the diagnostic is an error: its kind's row declares it one
 
 ```mach
 pub rec DiagnosticStore {
-    a:     *A.Allocator;
+    a:     *std.allocator.Allocator;
     items: Vector[Diagnostic];
     # the digest of each held report, to the first item that carries it
-    reports:     map.Map[u64, usize];
+    reports:     std.collections.map.Map[u64, usize];
     error_count: usize;
     lost:        usize;
     epoch:       u64;
     # the origin a diagnostic committed here takes when its builder names none
     origin: Origin;
     # warnings of these kinds are dropped as they reach the store
-    silenced: diagnostic_kind.KindSet;
+    silenced: mach.base.diagnostic.kind.KindSet;
     # the `#[expect]` acknowledgements a warning is matched against before it
     # is silenced or kept, in the order they were gathered
     expects: Vector[Expectation];
     # each file's expectations: positions in `expects`, grouped by file in
     # gathering order, and the run of them each file owns
     expect_order:   Vector[usize];
-    expect_by_file: map.Map[u32, ExpectRun];
+    expect_by_file: std.collections.map.Map[u32, ExpectRun];
     # how many expectations warnings have been matched against
     expect_examined: u64;
 }
@@ -213,7 +213,7 @@ its origin, is dropped
 ### store_init
 
 ```mach
-pub fun store_init(a: *A.Allocator) DiagnosticStore
+pub fun store_init(a: *std.allocator.Allocator) DiagnosticStore
 ```
 
 ### set_origin
@@ -228,7 +228,7 @@ names no origin to `o`; a diagnostic already committed keeps its own
 ### silence
 
 ```mach
-pub fun silence(store: *DiagnosticStore, set: diagnostic_kind.KindSet)
+pub fun silence(store: *DiagnosticStore, set: mach.base.diagnostic.kind.KindSet)
 ```
 
 drop every warning of a kind in `set` that reaches the store from now on
@@ -236,7 +236,7 @@ drop every warning of a kind in `set` that reaches the store from now on
 ### expect
 
 ```mach
-pub fun expect(store: *DiagnosticStore, list: Vector[Expectation]) err[fail.Fail]
+pub fun expect(store: *DiagnosticStore, list: Vector[Expectation]) err[mach.base.fail.Fail]
 ```
 
 acknowledge every warning an expectation in `list` covers as it reaches the
@@ -256,7 +256,7 @@ stamps otherwise
 ### drop_file
 
 ```mach
-pub fun drop_file(store: *DiagnosticStore, file_id: base_source.FileId)
+pub fun drop_file(store: *DiagnosticStore, file_id: mach.base.source.FileId)
 ```
 
 drop every diagnostic located in one file, keeping the rest in order. a module refreshed
@@ -296,7 +296,7 @@ how many errors `store` counts; a nil store counts none
 ### report
 
 ```mach
-pub fun report(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: base_source.FileId, span: base_source.Span, message: str) err[fail.Fail]
+pub fun report(store: *DiagnosticStore, k: mach.base.diagnostic.kind.Kind, file_id: mach.base.source.FileId, span: mach.base.source.Span, message: str) err[mach.base.fail.Fail]
 ```
 
 a diagnostic of kind `k` with no attachments
@@ -304,7 +304,7 @@ a diagnostic of kind `k` with no attachments
 ### reportf
 
 ```mach
-pub fun reportf(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: base_source.FileId, span: base_source.Span, fmt: str, args: ...) err[fail.Fail]
+pub fun reportf(store: *DiagnosticStore, k: mach.base.diagnostic.kind.Kind, file_id: mach.base.source.FileId, span: mach.base.source.Span, fmt: str, args: ...) err[mach.base.fail.Fail]
 ```
 
 a diagnostic of kind `k` with no attachments, its message `fmt` formatted with `args`
@@ -312,7 +312,7 @@ a diagnostic of kind `k` with no attachments, its message `fmt` formatted with `
 ### record
 
 ```mach
-pub fun record(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: base_source.FileId, span: base_source.Span, message: str)
+pub fun record(store: *DiagnosticStore, k: mach.base.diagnostic.kind.Kind, file_id: mach.base.source.FileId, span: mach.base.source.Span, message: str)
 ```
 
 a diagnostic of kind `k` reported where the reporter has no failure to
@@ -322,7 +322,7 @@ store is live, as `live` holds
 ### record_unlocated
 
 ```mach
-pub fun record_unlocated(store: *DiagnosticStore, k: diagnostic_kind.Kind, message: str)
+pub fun record_unlocated(store: *DiagnosticStore, k: mach.base.diagnostic.kind.Kind, message: str)
 ```
 
 a diagnostic about the build as a whole, located at no source
@@ -330,7 +330,7 @@ a diagnostic about the build as a whole, located at no source
 ### reject
 
 ```mach
-pub fun reject(store: *DiagnosticStore, k: diagnostic_kind.Kind, loc: base_source.Location, text: str) fail.Fail
+pub fun reject(store: *DiagnosticStore, k: mach.base.diagnostic.kind.Kind, loc: mach.base.source.Location, text: str) mach.base.fail.Fail
 ```
 
 a pass past the front end rejects the program: the refusal is an error
@@ -360,7 +360,7 @@ how many diagnostics `store` could not take; a nil store lost none
 ### content_equal
 
 ```mach
-pub fun content_equal(left: *DiagnosticStore, right: *DiagnosticStore) res[bool, fail.Fail]
+pub fun content_equal(left: *DiagnosticStore, right: *DiagnosticStore) res[bool, mach.base.fail.Fail]
 ```
 
 compare observable diagnostic content without allocation or store identity
@@ -368,7 +368,7 @@ compare observable diagnostic content without allocation or store identity
 ### copy
 
 ```mach
-pub fun copy(src: *DiagnosticStore, a: *A.Allocator) res[DiagnosticStore, fail.Fail]
+pub fun copy(src: *DiagnosticStore, a: *std.allocator.Allocator) res[DiagnosticStore, mach.base.fail.Fail]
 ```
 
 an owned copy of `src` from `a`, every diagnostic and its lost count kept, released with store_dnit
@@ -376,13 +376,13 @@ an owned copy of `src` from `a`, every diagnostic and its lost count kept, relea
 ### replay_into
 
 ```mach
-pub fun replay_into(dst: *DiagnosticStore, src: *DiagnosticStore) err[fail.Fail]
+pub fun replay_into(dst: *DiagnosticStore, src: *DiagnosticStore) err[mach.base.fail.Fail]
 ```
 
 ### replay_located
 
 ```mach
-pub fun replay_located(dst: *DiagnosticStore, src: *DiagnosticStore) err[fail.Fail]
+pub fun replay_located(dst: *DiagnosticStore, src: *DiagnosticStore) err[mach.base.fail.Fail]
 ```
 
 replay into `dst` only the diagnostics of `src` placed somewhere, with its lost count: what a
@@ -391,7 +391,7 @@ report placed nowhere waits for a requester to place does not come along
 ### replay_unplaced
 
 ```mach
-pub fun replay_unplaced(dst: *DiagnosticStore, src: *DiagnosticStore, at: base_source.Location) err[fail.Fail]
+pub fun replay_unplaced(dst: *DiagnosticStore, src: *DiagnosticStore, at: mach.base.source.Location) err[mach.base.fail.Fail]
 ```
 
 replay into `dst` only the diagnostics of `src` placed nowhere (their file base_source.FILE_NIL),
@@ -401,7 +401,7 @@ several places counts what it lost once
 ### encode
 
 ```mach
-pub fun encode(w: *wire.Sink, store: *DiagnosticStore, sources: *SourceTable)
+pub fun encode(w: *mach.base.wire.Sink, store: *DiagnosticStore, sources: *SourceTable)
 ```
 
 write the store's diagnostics as bytes: their count, then per diagnostic its
@@ -414,12 +414,12 @@ little endian. a kind travels by its key, which never changes meaning
 
 ```mach
 pub rec Expectation {
-    file_id:   base_source.FileId;
+    file_id:   mach.base.source.FileId;
     start:     usize;
     end:       usize;
-    key:       base_source.Span;
+    key:       mach.base.source.Span;
     text:      str;
-    kinds:     diagnostic_kind.KindSet;
+    kinds:     mach.base.diagnostic.kind.KindSet;
     judged:    bool;
     fulfilled: bool;
 }
@@ -443,16 +443,16 @@ fulfilled: a warning matched it
 
 ```mach
 pub rec DiagnosticBuilder {
-    a:    *A.Allocator;
+    a:    *std.allocator.Allocator;
     live: bool;
-    kind: diagnostic_kind.Kind;
+    kind: mach.base.diagnostic.kind.Kind;
     # ORIGIN_NONE takes the store's origin at commit
     origin:   Origin;
-    loc:      base_source.Location;
+    loc:      mach.base.source.Location;
     message:  str;
     children: Vector[Child];
-    related:  Vector[annotation.Related];
-    fixes:    Vector[annotation.Fix];
+    related:  Vector[mach.base.diagnostic.annotation.Related];
+    fixes:    Vector[mach.base.diagnostic.annotation.Fix];
 }
 ```
 
@@ -462,7 +462,7 @@ here, and `commit` hands the whole to a store
 ### builder_init
 
 ```mach
-pub fun builder_init(a: *A.Allocator, k: diagnostic_kind.Kind, file_id: base_source.FileId, span: base_source.Span, message: str) res[DiagnosticBuilder, fail.Fail]
+pub fun builder_init(a: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kind, file_id: mach.base.source.FileId, span: mach.base.source.Span, message: str) res[DiagnosticBuilder, mach.base.fail.Fail]
 ```
 
 a builder for a diagnostic of kind `k`
@@ -470,7 +470,7 @@ a builder for a diagnostic of kind `k`
 ### builder_initf
 
 ```mach
-pub fun builder_initf(a: *A.Allocator, k: diagnostic_kind.Kind, file_id: base_source.FileId, span: base_source.Span, fmt: str, args: ...) res[DiagnosticBuilder, fail.Fail]
+pub fun builder_initf(a: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kind, file_id: mach.base.source.FileId, span: mach.base.source.Span, fmt: str, args: ...) res[DiagnosticBuilder, mach.base.fail.Fail]
 ```
 
 a builder for a diagnostic of kind `k` whose message is `fmt` formatted with `args`; a
@@ -488,19 +488,19 @@ nothing
 ### attach_note
 
 ```mach
-pub fun attach_note(b: *DiagnosticBuilder, text: str) err[fail.Fail]
+pub fun attach_note(b: *DiagnosticBuilder, text: str) err[mach.base.fail.Fail]
 ```
 
 ### attach_help
 
 ```mach
-pub fun attach_help(b: *DiagnosticBuilder, text: str) err[fail.Fail]
+pub fun attach_help(b: *DiagnosticBuilder, text: str) err[mach.base.fail.Fail]
 ```
 
 ### attach_related
 
 ```mach
-pub fun attach_related(b: *DiagnosticBuilder, file_id: base_source.FileId, span: base_source.Span, label: str) err[fail.Fail]
+pub fun attach_related(b: *DiagnosticBuilder, file_id: mach.base.source.FileId, span: mach.base.source.Span, label: str) err[mach.base.fail.Fail]
 ```
 
 a related place; a nil or empty label shows the place without one
@@ -508,7 +508,7 @@ a related place; a nil or empty label shows the place without one
 ### attach_fix
 
 ```mach
-pub fun attach_fix(b: *DiagnosticBuilder, label: str, file_id: base_source.FileId, span: base_source.Span, replacement: str) res[FixId, fail.Fail]
+pub fun attach_fix(b: *DiagnosticBuilder, label: str, file_id: mach.base.source.FileId, span: mach.base.source.Span, replacement: str) res[FixId, mach.base.fail.Fail]
 ```
 
 a fix of one edit, which `attach_fix_edit` extends
@@ -516,7 +516,7 @@ a fix of one edit, which `attach_fix_edit` extends
 ### attach_fix_edit
 
 ```mach
-pub fun attach_fix_edit(b: *DiagnosticBuilder, fix: FixId, file_id: base_source.FileId, span: base_source.Span, replacement: str) err[fail.Fail]
+pub fun attach_fix_edit(b: *DiagnosticBuilder, fix: FixId, file_id: mach.base.source.FileId, span: mach.base.source.Span, replacement: str) err[mach.base.fail.Fail]
 ```
 
 a further edit of fix `fix`, which may not overlap one it already makes
@@ -524,7 +524,7 @@ a further edit of fix `fix`, which may not overlap one it already makes
 ### withdraw_fix
 
 ```mach
-pub fun withdraw_fix(b: *DiagnosticBuilder, fix: FixId) err[fail.Fail]
+pub fun withdraw_fix(b: *DiagnosticBuilder, fix: FixId) err[mach.base.fail.Fail]
 ```
 
 drop the most recently attached fix, as a fix whose later edit could not be
@@ -533,7 +533,7 @@ attached is withdrawn whole
 ### commit
 
 ```mach
-pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) err[fail.Fail]
+pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) err[mach.base.fail.Fail]
 ```
 
 hand the builder's diagnostic to the store; the builder is consumed whatever
@@ -545,8 +545,8 @@ dropped, and so is a report the store already holds
 ```mach
 pub rec SourceTable {
     ctx:     ptr;
-    path_of: fun(ptr, base_source.FileId) str;
-    file_at: fun(ptr, str) res[base_source.FileId, fail.Fail];
+    path_of: fun(ptr, mach.base.source.FileId) str;
+    file_at: fun(ptr, str) res[mach.base.source.FileId, mach.base.fail.Fail];
 }
 ```
 
@@ -561,7 +561,7 @@ file_at: the file the reading session loaded from `path`, FILE_NIL when it
 ### decode
 
 ```mach
-pub fun decode(r: *wire.Source, sources: *SourceTable, into: *DiagnosticStore) res[bool, fail.Fail]
+pub fun decode(r: *mach.base.wire.Source, sources: *SourceTable, into: *DiagnosticStore) res[bool, mach.base.fail.Fail]
 ```
 
 read one store `encode` wrote and commit its diagnostics to `into`: false
@@ -573,7 +573,7 @@ which ends the read where it stands
 ### format
 
 ```mach
-pub fun format(a: *A.Allocator, fmt: str, va: ...) res[str, fail.Fail]
+pub fun format(a: *std.allocator.Allocator, fmt: str, va: ...) res[str, mach.base.fail.Fail]
 ```
 
 `fmt` formatted with `va` into `a`, which owns the text; a refusal to format
@@ -582,7 +582,7 @@ is the failure instead
 ### join
 
 ```mach
-pub fun join(a: *A.Allocator, va: ...) res[str, fail.Fail]
+pub fun join(a: *std.allocator.Allocator, va: ...) res[str, mach.base.fail.Fail]
 ```
 
 the texts `va` joined into `a`, which owns the result; a refusal to join is
@@ -591,7 +591,7 @@ the failure instead
 ### text_retain
 
 ```mach
-pub fun text_retain(itn: *intern.Interner, text: str) res[str, fail.Fail]
+pub fun text_retain(itn: *mach.base.intern.Interner, text: str) res[str, mach.base.fail.Fail]
 ```
 
 the interner's copy of a borrowed `text`, which outlives the storage `text`
@@ -600,7 +600,7 @@ came from
 ### text_intern
 
 ```mach
-pub fun text_intern(itn: *intern.Interner, a: *A.Allocator, text: str) res[str, fail.Fail]
+pub fun text_intern(itn: *mach.base.intern.Interner, a: *std.allocator.Allocator, text: str) res[str, mach.base.fail.Fail]
 ```
 
 `text`, owned by `a`, moved into the interner: the interned copy outlives
@@ -609,7 +609,7 @@ pub fun text_intern(itn: *intern.Interner, a: *A.Allocator, text: str) res[str, 
 ### format_intern
 
 ```mach
-pub fun format_intern(itn: *intern.Interner, a: *A.Allocator, fmt: str, va: ...) res[str, fail.Fail]
+pub fun format_intern(itn: *mach.base.intern.Interner, a: *std.allocator.Allocator, fmt: str, va: ...) res[str, mach.base.fail.Fail]
 ```
 
 `fmt` formatted with `va` through `a` as scratch and interned, so the text
@@ -618,7 +618,7 @@ outlives `a`'s storage
 ### refusal_interned
 
 ```mach
-pub fun refusal_interned(itn: *intern.Interner, a: *A.Allocator, k: diagnostic_kind.Kind, op: fail.Op, cause: fail.Cause) fail.Fail
+pub fun refusal_interned(itn: *mach.base.intern.Interner, a: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kind, op: mach.base.fail.Op, cause: mach.base.fail.Cause) mach.base.fail.Fail
 ```
 
 `fail.refusal` of `op` with its text interned, so the failure outlives `a`'s
@@ -627,12 +627,12 @@ storage; an internal failure carries a static text and is returned as it is
 ### suggestion_build
 
 ```mach
-pub fun suggestion_build(a: *A.Allocator, name: str) res[str, fail.Fail]
+pub fun suggestion_build(a: *std.allocator.Allocator, name: str) res[str, mach.base.fail.Fail]
 ```
 
 ### fix_label_replace
 
 ```mach
-pub fun fix_label_replace(a: *A.Allocator, name: str) res[str, fail.Fail]
+pub fun fix_label_replace(a: *std.allocator.Allocator, name: str) res[str, mach.base.fail.Fail]
 ```
 

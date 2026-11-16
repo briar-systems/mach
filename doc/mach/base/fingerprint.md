@@ -9,9 +9,9 @@ two domains never share bytes. a name goes by its spelling, so fingerprints agre
 interners, and content goes by its digest. a file's digest is refused when the file changed
 while it was read.
 
-<sub>source: [`src/base/fingerprint.mach`](../../../src/base/fingerprint.mach) · imported by 10 modules</sub>
+Source: [`src/base/fingerprint.mach`](../../../src/base/fingerprint.mach)
 
-<sub>`wire` is [`mach.base.wire`](wire.md) · `fail` is [`mach.base.fail`](fail.md) · `fs` is `std.filesystem` · `intern` is [`mach.base.intern`](intern.md) · `A` is `std.allocator`</sub>
+Uses types from [`mach.base.fail`](fail.md), [`mach.base.intern`](intern.md), [`mach.base.wire`](wire.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -19,7 +19,7 @@ while it was read.
 
 | On `Domain` | |
 | :--- | :--- |
-| [`DOMAIN_SUBSYSTEM`](#domain) · [`DOMAIN_BUILD_GOAL`](#domain) · [`DOMAIN_ARCH`](#domain) · [`DOMAIN_ABI`](#domain) · [`DOMAIN_OS`](#domain) · [`DOMAIN_BUILD_STEP`](#domain) · [`DOMAIN_OF`](#domain) · [`DOMAIN_DEBUG`](#domain) · [`DOMAIN_TARGET_MODEL`](#domain) · [`DOMAIN_BACKEND`](#domain) · [`DOMAIN_IMAGE`](#domain) · [`DOMAIN_FS_POLICY`](#domain) · [`put_domain_u8`](#put_domain_u8) · [`put_domain_u32`](#put_domain_u32) · [`put_domain_u64`](#put_domain_u64) · [`put_domain_bytes`](#put_domain_bytes) · [`put_domain_str`](#put_domain_str) | |
+| [`DOMAIN_SUBSYSTEM`](#domain), [`DOMAIN_BUILD_GOAL`](#domain), [`DOMAIN_ARCH`](#domain), [`DOMAIN_ABI`](#domain), [`DOMAIN_OS`](#domain), [`DOMAIN_BUILD_STEP`](#domain), [`DOMAIN_OF`](#domain), [`DOMAIN_DEBUG`](#domain), [`DOMAIN_TARGET_MODEL`](#domain), [`DOMAIN_BACKEND`](#domain), [`DOMAIN_IMAGE`](#domain), [`DOMAIN_FS_POLICY`](#domain), [`put_domain_u8`](#put_domain_u8), [`put_domain_u32`](#put_domain_u32), [`put_domain_u64`](#put_domain_u64), [`put_domain_bytes`](#put_domain_bytes), [`put_domain_str`](#put_domain_str) | |
 
 | Functions | |
 | :--- | :--- |
@@ -56,31 +56,31 @@ pub def Domain: u16
 ### put_domain_u8
 
 ```mach
-pub fun put_domain_u8(s: *wire.Sink, domain: Domain, schema_version: u8, value: u8)
+pub fun put_domain_u8(s: *mach.base.wire.Sink, domain: Domain, schema_version: u8, value: u8)
 ```
 
 ### put_domain_u32
 
 ```mach
-pub fun put_domain_u32(s: *wire.Sink, domain: Domain, schema_version: u8, value: u32)
+pub fun put_domain_u32(s: *mach.base.wire.Sink, domain: Domain, schema_version: u8, value: u32)
 ```
 
 ### put_domain_u64
 
 ```mach
-pub fun put_domain_u64(s: *wire.Sink, domain: Domain, schema_version: u8, value: u64)
+pub fun put_domain_u64(s: *mach.base.wire.Sink, domain: Domain, schema_version: u8, value: u64)
 ```
 
 ### put_domain_bytes
 
 ```mach
-pub fun put_domain_bytes(s: *wire.Sink, domain: Domain, schema_version: u8, p: *u8, len: usize)
+pub fun put_domain_bytes(s: *mach.base.wire.Sink, domain: Domain, schema_version: u8, p: *u8, len: usize)
 ```
 
 ### put_domain_str
 
 ```mach
-pub fun put_domain_str(s: *wire.Sink, domain: Domain, schema_version: u8, text: str)
+pub fun put_domain_str(s: *mach.base.wire.Sink, domain: Domain, schema_version: u8, text: str)
 ```
 
 ## Functions
@@ -88,7 +88,7 @@ pub fun put_domain_str(s: *wire.Sink, domain: Domain, schema_version: u8, text: 
 ### file_sha256
 
 ```mach
-pub fun file_sha256(path: str, digest: *u8) err[fail.Cause]
+pub fun file_sha256(path: str, digest: *u8) err[mach.base.fail.Cause]
 ```
 
 the sha-256 of the file at `path` into `digest`, or what refused it, which the
@@ -97,7 +97,7 @@ caller names with the path
 ### held_file_sha256
 
 ```mach
-pub fun held_file_sha256(f: fs.File, digest: *u8) err[fail.Cause]
+pub fun held_file_sha256(f: std.filesystem.File, digest: *u8) err[mach.base.fail.Cause]
 ```
 
 borrows the file and exclusive seek/read access, rewinds first and leaves it at eof
@@ -106,7 +106,7 @@ failure does not publish a digest, the caller retains close ownership and names 
 ### put_text
 
 ```mach
-pub fun put_text(s: *wire.Sink, text: str)
+pub fun put_text(s: *mach.base.wire.Sink, text: str)
 ```
 
 a text as its u32 length then its bytes; nil and empty both put the length 0
@@ -114,7 +114,7 @@ a text as its u32 length then its bytes; nil and empty both put the length 0
 ### put_name
 
 ```mach
-pub fun put_name(s: *wire.Sink, itn: *intern.Interner, name: intern.StrId)
+pub fun put_name(s: *mach.base.wire.Sink, itn: *mach.base.intern.Interner, name: mach.base.intern.StrId)
 ```
 
 an interned name by its spelling, so fingerprints agree across interners:
@@ -123,7 +123,7 @@ a u8 1 then its text, or a u8 0 for no name
 ### put_content
 
 ```mach
-pub fun put_content(s: *wire.Sink, bytes: *u8, len: usize)
+pub fun put_content(s: *mach.base.wire.Sink, bytes: *u8, len: usize)
 ```
 
 bytes by their sha-256 digest, a u32 32 then the digest, or the u32 0 when
@@ -132,7 +132,7 @@ there are none
 ### put_file
 
 ```mach
-pub fun put_file(s: *wire.Sink, itn: *intern.Interner, a: *A.Allocator, path: str)
+pub fun put_file(s: *mach.base.wire.Sink, itn: *mach.base.intern.Interner, a: *std.allocator.Allocator, path: str)
 ```
 
 a link input by the digest of its contents, as put_content puts bytes; a refusal names the

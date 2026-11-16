@@ -6,9 +6,9 @@ an entry build: one artifact of one entry file built with no mach.toml, the comm
 stating the whole project. the project it states is made as the manifest's model and held to
 the checks every manifest passes, so the build that follows cannot tell the two apart
 
-<sub>source: [`src/compile/entry.mach`](../../../src/compile/entry.mach) · imported by 2 modules</sub>
+Source: [`src/compile/entry.mach`](../../../src/compile/entry.mach)
 
-<sub>`session` is [`mach.session`](../session.md) · `manifest_model` is [`mach.manifest.model`](../manifest/model.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.manifest.model`](../manifest/model.md), [`mach.session`](../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -90,7 +90,7 @@ what the command line states of an entry build
 ### entry_manifest
 
 ```mach
-pub fun entry_manifest(s: *session.Session, r: *EntryRequest) res[manifest_model.Manifest, fail.Fail]
+pub fun entry_manifest(s: *mach.session.Session, r: *EntryRequest) res[mach.manifest.model.Manifest, mach.base.fail.Fail]
 ```
 
 the project an entry build states, made as its manifest. the project root is the current

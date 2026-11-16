@@ -9,9 +9,7 @@ isa string such as `rv32imc` on riscv)
 masc reads and spells the selection, closes it over the catalog's implications
 and says whether the architecture enters it, so mach states none of the grammar
 
-<sub>source: [`src/target/baseline.mach`](../../../src/target/baseline.mach) · imported by 2 modules</sub>
-
-<sub>`A` is `std.allocator` · `mink_arch` is `mink.catalog.arch`</sub>
+Source: [`src/target/baseline.mach`](../../../src/target/baseline.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -47,7 +45,7 @@ masc's answer on a selection an `asm` head names
 ### head_read
 
 ```mach
-pub fun head_read(a: *A.Allocator, arch: str, spelling: str) Head
+pub fun head_read(a: *std.allocator.Allocator, arch: str, spelling: str) Head
 ```
 
 whether a head of `spelling` names a selection masc's set for the architecture called
@@ -59,7 +57,7 @@ one the architecture enters. masc reads the spelling, so mach holds none of its 
 ### spells
 
 ```mach
-pub fun spells(arch: *mink_arch.Arch) bool
+pub fun spells(arch: *mink.catalog.arch.Arch) bool
 ```
 
 whether masc's catalog for mink's architecture `arch` spells a selection, as
@@ -68,7 +66,7 @@ riscv's isa strings do, so a target of it takes a `baseline`
 ### entered_by
 
 ```mach
-pub fun entered_by(a: *A.Allocator, spelling: str) *mink_arch.Arch
+pub fun entered_by(a: *std.allocator.Allocator, spelling: str) *mink.catalog.arch.Arch
 ```
 
 mink's architecture of the first instruction set whose masc catalog reads

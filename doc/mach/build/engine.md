@@ -8,9 +8,9 @@ each unit runs cold, on a session and a heap of its own torn down when it finish
 unit whose requirement failed is recorded as blocked and skipped, a unit that fails does
 not stop the rest, and the plan's outcome carries the worst unit's severity.
 
-<sub>source: [`src/build/engine.mach`](../../../src/build/engine.mach) · imported by 2 modules</sub>
+Source: [`src/build/engine.mach`](../../../src/build/engine.mach)
 
-<sub>`build_plan` is [`mach.build.plan`](plan.md) · `A` is `std.allocator` · `heap` is `std.allocator.heap` · `readout` is [`mach.report.readout`](../report/readout.md) · `outcome` is [`mach.build.outcome`](outcome.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.build.outcome`](outcome.md), [`mach.build.plan`](plan.md), [`mach.report.readout`](../report/readout.md).
 
 | Functions | |
 | :--- | :--- |
@@ -23,8 +23,8 @@ not stop the rest, and the plan's outcome carries the worst unit's severity.
 ### execute
 
 ```mach
-pub fun execute(bp: *build_plan.BuildPlan, backing: *A.Allocator, spans: *heap.Pool, oa: *A.Allocator,
-    sink: *readout.Sink) res[outcome.BuildOutcome, fail.Fail]
+pub fun execute(bp: *mach.build.plan.BuildPlan, backing: *std.allocator.Allocator, spans: *std.allocator.heap.Pool, oa: *std.allocator.Allocator,
+    sink: *mach.report.readout.Sink) res[mach.build.outcome.BuildOutcome, mach.base.fail.Fail]
 ```
 
 run every planned cell cold: each unit gets its own session and heap over `spans`

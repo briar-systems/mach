@@ -6,9 +6,9 @@ descriptor-relative removal beneath a project root: every component is
 opened without following symlinks so no part of the path is resolved as a
 string and a link out of the tree is refused rather than followed
 
-<sub>source: [`src/host/output/remove.mach`](../../../../src/host/output/remove.mach) · imported by 4 modules</sub>
+Source: [`src/host/output/remove.mach`](../../../../src/host/output/remove.mach)
 
-<sub>`io_error` is `std.io.error` · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../../base/fail.md) · `diagnostic_kind` is [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md)</sub>
+Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`mach.base.fail`](../../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -34,7 +34,7 @@ string and a link out of the tree is refused rather than followed
 pub rec Removal {
     removed:      usize;
     failed:       bool;
-    kind:         io_error.Kind;
+    kind:         std.io.error.Kind;
     code:         i64;
     containment:  bool;
     cleanup_code: i64;
@@ -54,7 +54,7 @@ pub fun message(r: Removal) str
 ### with_cleanup
 
 ```mach
-pub fun with_cleanup(a: *A.Allocator, f: fail.Fail, r: Removal, tree: str) fail.Fail
+pub fun with_cleanup(a: *std.allocator.Allocator, f: mach.base.fail.Fail, r: Removal, tree: str) mach.base.fail.Fail
 ```
 
 the failure `f` reported for removal `r` of `tree`, also naming the close that
@@ -63,7 +63,7 @@ failed on the way out when there was one
 ### refusal
 
 ```mach
-pub fun refusal(a: *A.Allocator, k: diagnostic_kind.Kind, op: fail.Op, r: Removal) fail.Fail
+pub fun refusal(a: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kind, op: mach.base.fail.Op, r: Removal) mach.base.fail.Fail
 ```
 
 the failure of removing `op`'s path, which `r` refused outside containment, also

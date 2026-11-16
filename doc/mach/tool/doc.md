@@ -5,16 +5,18 @@
 the documentation generator: a project's reference, written as markdown pages into
 the one directory the generator owns, `<dir>/<project id>/`
 
-the document model is built from the analyzed project (`mach.tool.doc.build`) and
-rendered to pages (`mach.tool.doc.markdown`); this module writes the pages and
-keeps the directory to them. a page whose text is unchanged is left as it is, and
-whatever the directory holds that this run did not write is removed, a directory
-left empty with it, so a module that is gone takes its page along. nothing outside
-the directory is touched
+every `.mach` file under the project's source root is parsed and nothing more is
+run: no target, no name resolution, no dependency. the document model is built from
+the syntax trees (`mach.tool.doc.build`) and rendered to pages
+(`mach.tool.doc.markdown`); this module reads the files, writes the pages and keeps
+the directory to them. a page whose text is unchanged is left as it is, and whatever
+the directory holds that this run did not write is removed, a directory left empty
+with it, so a file that is gone takes its page along. nothing outside the directory
+is touched
 
-<sub>source: [`src/tool/doc.mach`](../../../src/tool/doc.mach) · imported by 1 module</sub>
+Source: [`src/tool/doc.mach`](../../../src/tool/doc.mach)
 
-<sub>`A` is `std.allocator` · `project` is [`mach.compile.project`](../compile/project.md) · `manifest_model` is [`mach.manifest.model`](../manifest/model.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.manifest.model`](../manifest/model.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -22,7 +24,7 @@ the directory is touched
 
 | On `Outcome` | |
 | :--- | :--- |
-| [`generate`](#generate) | write the reference of `p` under `<root>/<leaf>/<project id>` |
+| [`generate`](#generate) | parse every source file of the project at `root` and write its reference under `<root>/<leaf>/<project id>` |
 
 ---
 
@@ -43,7 +45,7 @@ what a run did
 | Field | Type | |
 | :--- | :--- | :--- |
 | `dir` | `str` | the directory it owns, `<dir>/<project id>` |
-| `modules` | `u32` | the modules documented |
+| `modules` | `u32` | the source files it read |
 | `pages` | `u32` | the pages it wrote or found already current |
 | `changed` | `u32` | the pages whose text it wrote |
 | `removed` | `u32` | the files and directories it removed |
@@ -51,18 +53,22 @@ what a run did
 ### generate
 
 ```mach
-pub fun generate(alloc: *A.Allocator, p: *project.Project, m: *manifest_model.Manifest, root: str, leaf: str, out: *Outcome) err[fail.Fail]
+pub fun generate(alloc: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, diags: *mach.base.diagnostic.DiagnosticStore, itn: *mach.base.intern.Interner,
+    m: *mach.manifest.model.Manifest, root: str, leaf: str, out: *Outcome) err[mach.base.fail.Fail]
 ```
 
-write the reference of `p` under `<root>/<leaf>/<project id>`
+parse every source file of the project at `root` and write its reference under
+`<root>/<leaf>/<project id>`
 
 | Parameter | |
 | :--- | :--- |
 | `alloc` | owns the outcome's path and every failure |
-| `p` | the project, analyzed through name resolution over every artifact |
-| `m` | its manifest |
+| `sources` | receives every file read, so a diagnostic can name it |
+| `diags` | receives the lexer's and parser's diagnostics, the doc linter's warnings among them |
+| `itn` | the interner the manifest's names are in |
+| `m` | the project's manifest |
 | `root` | the project's directory |
 | `leaf` | the directory below `root` the reference's directory is made in, such as `doc` |
 | `out` | what the run did |
-| **returns** | ok, or the first failure: allocation, or a directory or page that cannot be read, made, written or removed |
+| **returns** | ok; a reported failure when a file does not parse, its diagnostics on `diags`; or the first failure of allocation, or of a file or directory that cannot be read, made, written or removed |
 

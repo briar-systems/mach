@@ -11,9 +11,9 @@ type node and declaration its symbol, records how each ambiguous bracket and lit
 what the module exports to its importers. it reports a name that resolves to nothing and a
 symbol import nothing uses.
 
-<sub>source: [`src/front/resolve.mach`](../../../src/front/resolve.mach) · imported by 30 modules</sub>
+Source: [`src/front/resolve.mach`](../../../src/front/resolve.mach)
 
-<sub>`base_source` is [`mach.base.source`](../base/source.md) · `deprecation` is [`mach.type.deprecation`](../type/deprecation.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `ast_id` is [`mach.front.ast.id`](ast/id.md) · `module` is [`mach.session.module`](../session/module.md) · `session` is [`mach.session`](../session.md) · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md) · `comptime_value` is [`mach.front.comptime.value`](comptime/value.md) · `ast` is [`mach.front.ast`](ast.md) · `report_phase` is [`mach.report.phase`](../report/phase.md) · `type` is [`mach.type`](../type.md) · `front_load` is [`mach.front.load`](load.md) · `comptime_scope` is [`mach.front.comptime.scope`](comptime/scope.md) · `diagnostic` is [`mach.base.diagnostic`](../base/diagnostic.md) · `map` is `std.collections.map` · `interpretation` is [`mach.front.ast.interpretation`](ast/interpretation.md) · `collections_vector` is `std.collections.vector` · `ast_expr` is [`mach.front.ast.expr`](ast/expr.md) · `ast_type` is [`mach.front.ast.type`](ast/type.md)</sub>
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.front.ast`](ast.md), [`mach.front.ast.expr`](ast/expr.md), [`mach.front.ast.id`](ast/id.md), [`mach.front.ast.interpretation`](ast/interpretation.md), [`mach.front.ast.type`](ast/type.md), [`mach.front.comptime.scope`](comptime/scope.md), [`mach.front.comptime.value`](comptime/value.md), [`mach.front.load`](load.md), [`mach.report.phase`](../report/phase.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.type`](../type.md), [`mach.type.deprecation`](../type/deprecation.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -31,16 +31,16 @@ symbol import nothing uses.
 
 | On `SymbolId` | |
 | :--- | :--- |
-| [`SYMBOL_NIL`](#symbolid) · [`symbol_id`](#symbol_id) · [`symbol_index`](#symbol_index) · [`symbol_same`](#symbol_same) | |
+| [`SYMBOL_NIL`](#symbolid), [`symbol_id`](#symbol_id), [`symbol_index`](#symbol_index), [`symbol_same`](#symbol_same) | |
 | [`symbol_is_sentinel`](#symbol_is_sentinel) | whether an id is one of the sentinels, which name no symbol |
-| [`symbol_is_nil`](#symbol_is_nil) · [`symbol_is_rejected`](#symbol_is_rejected) · [`SYMBOL_DEFERRED_TYPE`](#symbolid) · [`symbol_deferred`](#symbol_deferred) | |
+| [`symbol_is_nil`](#symbol_is_nil), [`symbol_is_rejected`](#symbol_is_rejected), [`SYMBOL_DEFERRED_TYPE`](#symbolid), [`symbol_deferred`](#symbol_deferred) | |
 | [`SYMBOL_AMBIGUOUS`](#symbolid) | a nominal the module defines named by more than one declaration |
 
 | On `SymKind` | |
 | :--- | :--- |
-| [`SYM_FUN`](#symkind) · [`SYM_REC`](#symkind) · [`SYM_DEF`](#symkind) · [`SYM_VAL`](#symkind) · [`SYM_VAR`](#symkind) · [`SYM_PARAM`](#symkind) · [`SYM_GENERIC`](#symkind) · [`SYM_USE`](#symkind) · [`SYM_IMPORTED`](#symkind) | |
+| [`SYM_FUN`](#symkind), [`SYM_REC`](#symkind), [`SYM_DEF`](#symkind), [`SYM_VAL`](#symkind), [`SYM_VAR`](#symkind), [`SYM_PARAM`](#symkind), [`SYM_GENERIC`](#symkind), [`SYM_USE`](#symkind), [`SYM_IMPORTED`](#symkind) | |
 | [`SYM_TEST`](#symkind) | reached only by mach-lsp |
-| [`SYM_UNI`](#symkind) · [`SYM_PRIM`](#symkind) · [`SYM_VECTOR`](#symkind) · [`SYM_TAG`](#symkind) · [`sym_kind_valid`](#sym_kind_valid) | |
+| [`SYM_UNI`](#symkind), [`SYM_PRIM`](#symkind), [`SYM_VECTOR`](#symkind), [`SYM_TAG`](#symkind), [`sym_kind_valid`](#sym_kind_valid) | |
 
 | On `Symbol` | |
 | :--- | :--- |
@@ -79,7 +79,7 @@ symbol import nothing uses.
 
 | Functions | |
 | :--- | :--- |
-| [`stable_of_module`](#stable_of_module) · [`type_owner`](#type_owner) | |
+| [`stable_of_module`](#stable_of_module), [`type_owner`](#type_owner) | |
 | [`decorators_deprecation`](#decorators_deprecation) | the message is the string the argument evaluates to; one that is not a constant string is reported by type checking and leaves the notice bare |
 | [`declaration_testing`](#declaration_testing) | whether a declaration carries `#[testing]`, which confines every reference to it to test code |
 | [`unknown_catalog`](#unknown_catalog) | the internal failure naming a member its catalog lacks; the text belongs to the session interner, not a resolver candidate |
@@ -87,7 +87,7 @@ symbol import nothing uses.
 | Constants | |
 | :--- | :--- |
 | [`SYM_FLAG_PUB`](#constants) | reached only by mach-lsp |
-| [`SYM_FLAG_COMPTIME`](#constants) · [`SYM_FLAG_MODULE`](#constants) | |
+| [`SYM_FLAG_COMPTIME`](#constants), [`SYM_FLAG_MODULE`](#constants) | |
 | [`SYM_FLAG_STORED`](#constants) | something stores to the local or parameter, takes its address or names it in an asm block, so it has storage of its own |
 | [`SYM_FLAG_REACHED`](#constants) | the address of something reached from the local or parameter by name, a field or an element, is taken |
 | [`SYM_FLAG_WRITTEN`](#constants) | an assignment writes a field or element reached from the local or parameter by name, so what it holds changes in part where nothing stores to it whole |
@@ -187,28 +187,28 @@ pub fun sym_kind_valid(kind: SymKind) bool
 pub rec Symbol {
     kind:                SymKind;
     definition_kind:     SymKind;
-    definition_file:     base_source.FileId;
+    definition_file:     mach.base.source.FileId;
     generic_arity:       u32;
     has_comptime_params: bool;
     has_pack_param:      bool;
-    deprecation:         deprecation.Deprecation;
+    deprecation:         mach.type.deprecation.Deprecation;
     testing:             bool;
     flags:               u8;
-    name:                intern.StrId;
-    canon:               intern.StrId;
-    decl:                ast_id.DeclId;
+    name:                mach.base.intern.StrId;
+    canon:               mach.base.intern.StrId;
+    decl:                mach.front.ast.id.DeclId;
     # a `use` symbol's slot is the stable id of the module it names
     slot: u32;
     # the module the symbol is defined in. a result outlives the operation that numbered the
     # modules, so it names modules by stable id and a reader numbers them through origin_of
-    origin: module.StableModuleId;
+    origin: mach.session.module.StableModuleId;
 }
 ```
 
 ### origin_of
 
 ```mach
-pub fun origin_of(s: *session.Session, sym: *Symbol) module.ModuleId
+pub fun origin_of(s: *mach.session.Session, sym: *Symbol) mach.session.module.ModuleId
 ```
 
 the module a symbol is defined in, as the current operation numbers it
@@ -216,7 +216,7 @@ the module a symbol is defined in, as the current operation numbers it
 ### foreign_to
 
 ```mach
-pub fun foreign_to(s: *session.Session, sym: *Symbol, own: module.ModuleId) bool
+pub fun foreign_to(s: *mach.session.Session, sym: *Symbol, own: mach.session.module.ModuleId) bool
 ```
 
 whether `sym` names a binding a module other than `own` declares: an import, or a `fwd` of one,
@@ -225,7 +225,7 @@ which carries the kind the binding is declared with there as its own
 ### use_target
 
 ```mach
-pub fun use_target(s: *session.Session, sym: *Symbol) module.ModuleId
+pub fun use_target(s: *mach.session.Session, sym: *Symbol) mach.session.module.ModuleId
 ```
 
 the module a `use` symbol names, as the current operation numbers it
@@ -233,7 +233,7 @@ the module a `use` symbol names, as the current operation numbers it
 ### use_stable
 
 ```mach
-pub fun use_stable(sym: *Symbol) module.StableModuleId
+pub fun use_stable(sym: *Symbol) mach.session.module.StableModuleId
 ```
 
 the stable id of the module a `use` symbol names, nil for any other symbol
@@ -249,17 +249,17 @@ pub fun symbol_is_runtime(sym: *Symbol) bool
 ```mach
 pub rec PublicSymbol {
     kind:                SymKind;
-    name:                intern.StrId;
-    canon:               intern.StrId;
-    file:                base_source.FileId;
+    name:                mach.base.intern.StrId;
+    canon:               mach.base.intern.StrId;
+    file:                mach.base.source.FileId;
     generic_arity:       u32;
     has_comptime_params: bool;
     has_pack_param:      bool;
-    deprecation:         deprecation.Deprecation;
+    deprecation:         mach.type.deprecation.Deprecation;
     testing:             bool;
     # a `use` symbol's slot is the stable id of the module it names
     slot:   u32;
-    origin: module.StableModuleId;
+    origin: mach.session.module.StableModuleId;
 }
 ```
 
@@ -267,8 +267,8 @@ pub rec PublicSymbol {
 
 ```mach
 pub rec ModuleExports {
-    path:    intern.StrId;
-    module:  module.StableModuleId;
+    path:    mach.base.intern.StrId;
+    module:  mach.session.module.StableModuleId;
     symbols: *PublicSymbol;
     count:   u32;
     # `(name << 32) | index` of each symbol, ascending, which find_export searches
@@ -283,7 +283,7 @@ what a module exports to an importer, every module it names by stable id
 ### exports_copy
 
 ```mach
-pub fun exports_copy(alloc: *A.Allocator, from: *ModuleExports, path: intern.StrId, stable: module.StableModuleId) res[ModuleExports, fail.Fail]
+pub fun exports_copy(alloc: *std.allocator.Allocator, from: *ModuleExports, path: mach.base.intern.StrId, stable: mach.session.module.StableModuleId) res[ModuleExports, mach.base.fail.Fail]
 ```
 
 an importer's own copy of `from`, under the importer's path for it
@@ -295,7 +295,7 @@ an importer's own copy of `from`, under the importer's path for it
 ### exports_dnit
 
 ```mach
-pub fun exports_dnit(alloc: *A.Allocator, mx: *ModuleExports)
+pub fun exports_dnit(alloc: *std.allocator.Allocator, mx: *ModuleExports)
 ```
 
 release what an exports record owns
@@ -304,9 +304,9 @@ release what an exports record owns
 
 ```mach
 pub rec ExportConstant {
-    name:    intern.StrId;
+    name:    mach.base.intern.StrId;
     present: bool;
-    value:   comptime_value.CTValue;
+    value:   mach.front.comptime.value.CTValue;
 }
 ```
 
@@ -316,9 +316,9 @@ a constant an importer reads, whose per-tuple gate is the published declaration'
 
 ```mach
 pub rec ParsedDefinition {
-    a:           *ast.Ast;
-    status:      report_phase.PhaseStatus;
-    owner:       type.TypeOwner;
+    a:           *mach.front.ast.Ast;
+    status:      mach.report.phase.PhaseStatus;
+    owner:       mach.type.TypeOwner;
     incarnation: u64;
 }
 ```
@@ -329,7 +329,7 @@ pub rec ParsedDefinition {
 pub rec ResolveDeps {
     entries:       *ModuleExports;
     count:         u32;
-    bindings:      *front_load.Binding;
+    bindings:      *mach.front.load.Binding;
     binding_count: u32;
 }
 ```
@@ -339,13 +339,13 @@ what a module's resolve reads of the modules it imports
 | Field | Type | |
 | :--- | :--- | :--- |
 | `entries` | `*ModuleExports` | the public surface of each module it may name |
-| `bindings` | `*front_load.Binding` | the load's record of each of its import declarations, which resolve binds from rather than reading their paths; a declaration with none is bound by its path |
+| `bindings` | `*mach.front.load.Binding` | the load's record of each of its import declarations, which resolve binds from rather than reading their paths; a declaration with none is bound by its path |
 | `binding_count` | `u32` | how many records `bindings` holds |
 
 ### deps_dnit
 
 ```mach
-pub fun deps_dnit(alloc: *A.Allocator, deps: *ResolveDeps)
+pub fun deps_dnit(alloc: *std.allocator.Allocator, deps: *ResolveDeps)
 ```
 
 release what deps_of allocated; a list it left empty owns nothing
@@ -354,13 +354,13 @@ release what deps_of allocated; a list it left empty owns nothing
 
 ```mach
 pub fun resolve(
-    s: *session.Session,
-    a: *ast.Ast,
+    s: *mach.session.Session,
+    a: *mach.front.ast.Ast,
     deps: *ResolveDeps,
-    load: *comptime_scope.ComptimeCtx,
-    own_module: module.ModuleId,
-    own_stable: module.StableModuleId,
-    diags: *diagnostic.DiagnosticStore) res[ResolveResult, fail.Fail]
+    load: *mach.front.comptime.scope.ComptimeCtx,
+    own_module: mach.session.module.ModuleId,
+    own_stable: mach.session.module.StableModuleId,
+    diags: *mach.base.diagnostic.DiagnosticStore) res[ResolveResult, mach.base.fail.Fail]
 ```
 
 resolve a module's names in a scope over the load's, `load`, whose constants and gate decisions
@@ -370,8 +370,8 @@ resolve reads and never writes; what resolve binds is its result's
 
 ```mach
 pub rec ResolveResult {
-    status:        report_phase.PhaseStatus;
-    alloc:         *A.Allocator;
+    status:        mach.report.phase.PhaseStatus;
+    alloc:         *std.allocator.Allocator;
     symbols:       *Symbol;
     symbol_count:  u32;
     pub_count:     u32;
@@ -382,26 +382,26 @@ pub rec ResolveResult {
     type_count:    u32;
     decl_count:    u32;
 
-    param_index: map.Map[u64, SymbolId];
+    param_index: std.collections.map.Map[u64, SymbolId];
     # the record, union and tag symbols the module defines, by nominal_key (see own_nominal)
-    nominals: map.Map[u64, SymbolId];
+    nominals: std.collections.map.Map[u64, SymbolId];
     # every symbol the module declares, by nominal_key (see own_declared)
-    declared: map.Map[u64, SymbolId];
+    declared: std.collections.map.Map[u64, SymbolId];
 
     public_constants:      *ExportConstant;
     public_constant_count: u32;
 
     # the constants resolve bound and the gates it decided, over the load's
-    constants: comptime_scope.Bindings;
+    constants: mach.front.comptime.scope.Bindings;
 
-    expr_choices:       *interpretation.Choice;
+    expr_choices:       *mach.front.ast.interpretation.Choice;
     expr_choices_count: usize;
     # how each literal head's path reads, `type_count` of them: as written, or as a type and the
     # tag case its last segment selects
-    type_heads: *interpretation.Head;
+    type_heads: *mach.front.ast.interpretation.Head;
 
     # the local each `{name}` of an asm block binds
-    asm_binds: collections_vector.Vector[AsmBind];
+    asm_binds: std.collections.vector.Vector[AsmBind];
 
     # a module-scope `$error` in a decided arm refused the module, so nothing else was resolved
     refused: bool;
@@ -411,13 +411,13 @@ pub rec ResolveResult {
 ### param_symbol
 
 ```mach
-pub fun param_symbol(r: *ResolveResult, decl: ast_id.DeclId, slot: u32) SymbolId
+pub fun param_symbol(r: *ResolveResult, decl: mach.front.ast.id.DeclId, slot: u32) SymbolId
 ```
 
 ### own_nominal
 
 ```mach
-pub fun own_nominal(r: *ResolveResult, kind: SymKind, canon: intern.StrId) SymbolId
+pub fun own_nominal(r: *ResolveResult, kind: SymKind, canon: mach.base.intern.StrId) SymbolId
 ```
 
 the symbol of the record, union or tag of `kind` the module defines under `canon`: SYMBOL_NIL
@@ -426,7 +426,7 @@ when it defines none, SYMBOL_AMBIGUOUS when more than one declaration does
 ### own_declared
 
 ```mach
-pub fun own_declared(r: *ResolveResult, kind: SymKind, canon: intern.StrId) SymbolId
+pub fun own_declared(r: *ResolveResult, kind: SymKind, canon: mach.base.intern.StrId) SymbolId
 ```
 
 the symbol of `kind` the module declares under `canon`, the last of them: SYMBOL_NIL when it
@@ -435,8 +435,8 @@ declares none, SYMBOL_AMBIGUOUS when more than one declaration does
 ### result_exports
 
 ```mach
-pub fun result_exports(alloc: *A.Allocator, rr: *ResolveResult, path: intern.StrId,
-    stable: module.StableModuleId) res[ModuleExports, fail.Fail]
+pub fun result_exports(alloc: *std.allocator.Allocator, rr: *ResolveResult, path: mach.base.intern.StrId,
+    stable: mach.session.module.StableModuleId) res[ModuleExports, mach.base.fail.Fail]
 ```
 
 what a finished resolution of module `stable` exports to an importer
@@ -456,7 +456,7 @@ release a resolution; a nil result holds nothing
 ### result_copy
 
 ```mach
-pub fun result_copy(r: *ResolveResult, alloc: *A.Allocator) res[ResolveResult, fail.Fail]
+pub fun result_copy(r: *ResolveResult, alloc: *std.allocator.Allocator) res[ResolveResult, mach.base.fail.Fail]
 ```
 
 an owned copy of `r` from `alloc`, every entry at the id it has in `r`
@@ -464,7 +464,7 @@ an owned copy of `r` from `alloc`, every entry at the id it has in `r`
 ### asm_binds_at
 
 ```mach
-pub fun asm_binds_at(r: *ResolveResult, sid: ast_id.StmtId, out: *collections_vector.Vector[AsmBind]) err[fail.Fail]
+pub fun asm_binds_at(r: *ResolveResult, sid: mach.front.ast.id.StmtId, out: *std.collections.vector.Vector[AsmBind]) err[mach.base.fail.Fail]
 ```
 
 the locals an asm block binds, in the order its body names them
@@ -472,7 +472,7 @@ the locals an asm block binds, in the order its body names them
 ### expr_is_runtime
 
 ```mach
-pub fun expr_is_runtime(rr: *ResolveResult, eid: ast_id.ExprId) bool
+pub fun expr_is_runtime(rr: *ResolveResult, eid: mach.front.ast.id.ExprId) bool
 ```
 
 whether a resolved expression names a runtime binding, a local or a parameter
@@ -481,13 +481,13 @@ whose value no comptime evaluation sees; false for a name that resolved to none
 ### expression
 
 ```mach
-pub fun expression(rr: *ResolveResult, a: *ast.Ast, eid: ast_id.ExprId) res[ast_expr.Expr, fail.Fail]
+pub fun expression(rr: *ResolveResult, a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.base.fail.Fail]
 ```
 
 ### type_node
 
 ```mach
-pub fun type_node(rr: *ResolveResult, a: *ast.Ast, source: str, tid: ast_id.TypeId) res[ast_type.Type, fail.Fail]
+pub fun type_node(rr: *ResolveResult, a: *mach.front.ast.Ast, source: str, tid: mach.front.ast.id.TypeId) res[mach.front.ast.type.Type, mach.base.fail.Fail]
 ```
 
 the type node `tid` of `a`, whose text is `source`, as name resolution read it: a literal head
@@ -497,8 +497,8 @@ it split names the type by its path's prefix and the case by the last segment
 
 ```mach
 pub rec AsmBind {
-    stmt:   ast_id.StmtId;
-    name:   intern.StrId;
+    stmt:   mach.front.ast.id.StmtId;
+    name:   mach.base.intern.StrId;
     symbol: SymbolId;
 }
 ```
@@ -511,8 +511,8 @@ one `{name}` of an asm block and the local it binds
 pub rec Exporters {
     ctx:     ptr;
     count:   u32;
-    exports: fun(ptr, module.ModuleId, *A.Allocator) res[ModuleExports, fail.Fail];
-    path:    fun(ptr, module.ModuleId) intern.StrId;
+    exports: fun(ptr, mach.session.module.ModuleId, *std.allocator.Allocator) res[ModuleExports, mach.base.fail.Fail];
+    path:    fun(ptr, mach.session.module.ModuleId) mach.base.intern.StrId;
 }
 ```
 
@@ -521,12 +521,12 @@ what each one exports, and the path it is imported by
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `exports` | `fun(ptr, module.ModuleId, *A.Allocator) res[ModuleExports, fail.Fail]` | what a module exports to an importer, its symbols allocated from the allocator given; reading it is what makes the importer's resolution depend on the exporter's surface |
+| `exports` | `fun(ptr, mach.session.module.ModuleId, *std.allocator.Allocator) res[ModuleExports, mach.base.fail.Fail]` | what a module exports to an importer, its symbols allocated from the allocator given; reading it is what makes the importer's resolution depend on the exporter's surface |
 
 ### deps_of
 
 ```mach
-pub fun deps_of(alloc: *A.Allocator, s: *session.Session, l: *front_load.Loader, m: *front_load.Module, from: *Exporters) res[ResolveDeps, fail.Fail]
+pub fun deps_of(alloc: *std.allocator.Allocator, s: *mach.session.Session, l: *mach.front.load.Loader, m: *mach.front.load.Module, from: *Exporters) res[ResolveDeps, mach.base.fail.Fail]
 ```
 
 the exports module `m` of loader `l` reads: each loaded module it imports and every module a
@@ -537,19 +537,19 @@ reached one re-exports, each once, allocated from `alloc` and released with deps
 ### stable_of_module
 
 ```mach
-pub fun stable_of_module(s: *session.Session, mid: module.ModuleId) module.StableModuleId
+pub fun stable_of_module(s: *mach.session.Session, mid: mach.session.module.ModuleId) mach.session.module.StableModuleId
 ```
 
 ### type_owner
 
 ```mach
-pub fun type_owner(s: *session.Session, mid: module.ModuleId, file: base_source.FileId) type.TypeOwner
+pub fun type_owner(s: *mach.session.Session, mid: mach.session.module.ModuleId, file: mach.base.source.FileId) mach.type.TypeOwner
 ```
 
 ### decorators_deprecation
 
 ```mach
-pub fun decorators_deprecation(c: *comptime_scope.ComptimeCtx, a: *ast.Ast, start: u32, len: u32) res[deprecation.Deprecation, fail.Fail]
+pub fun decorators_deprecation(c: *mach.front.comptime.scope.ComptimeCtx, a: *mach.front.ast.Ast, start: u32, len: u32) res[mach.type.deprecation.Deprecation, mach.base.fail.Fail]
 ```
 
 the message is the string the argument evaluates to; one that is not a
@@ -558,7 +558,7 @@ constant string is reported by type checking and leaves the notice bare
 ### declaration_testing
 
 ```mach
-pub fun declaration_testing(a: *ast.Ast, did: ast_id.DeclId) bool
+pub fun declaration_testing(a: *mach.front.ast.Ast, did: mach.front.ast.id.DeclId) bool
 ```
 
 whether a declaration carries `#[testing]`, which confines every reference to it to test code
@@ -566,7 +566,7 @@ whether a declaration carries `#[testing]`, which confines every reference to it
 ### unknown_catalog
 
 ```mach
-pub fun unknown_catalog(s: *session.Session, catalog: str, tag: u32) fail.Fail
+pub fun unknown_catalog(s: *mach.session.Session, catalog: str, tag: u32) mach.base.fail.Fail
 ```
 
 the internal failure naming a member its catalog lacks; the text belongs to

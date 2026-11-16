@@ -18,9 +18,9 @@ one only as far as its gates let it run, which is as far as the program asks. a 
 another module's template cannot come back, since modules do not import each other in a
 cycle
 
-<sub>source: [`src/front/sema/growth.mach`](../../../../src/front/sema/growth.mach) · imported by 5 modules</sub>
+Source: [`src/front/sema/growth.mach`](../../../../src/front/sema/growth.mach)
 
-<sub>`intern` is [`mach.base.intern`](../../base/intern.md) · `base_source` is [`mach.base.source`](../../base/source.md) · `A` is `std.allocator` · `module` is [`mach.session.module`](../../session/module.md) · `map` is `std.collections.map` · `collections_vector` is `std.collections.vector` · `ast_id` is [`mach.front.ast.id`](../ast/id.md) · `session` is [`mach.session`](../../session.md) · `ast` is [`mach.front.ast`](../ast.md) · `resolve` is [`mach.front.resolve`](../resolve.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `ast_decl` is [`mach.front.ast.decl`](../ast/decl.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.base.source`](../../base/source.md), [`mach.front.ast`](../ast.md), [`mach.front.ast.decl`](../ast/decl.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.resolve`](../resolve.md), [`mach.session`](../../session.md), [`mach.session.module`](../../session/module.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -49,11 +49,11 @@ cycle
 
 ```mach
 pub rec Cycle {
-    members: intern.StrId;
+    members: mach.base.intern.StrId;
     refused: bool;
-    site:    base_source.Span;
-    caller:  intern.StrId;
-    callee:  intern.StrId;
+    site:    mach.base.source.Span;
+    caller:  mach.base.intern.StrId;
+    callee:  mach.base.intern.StrId;
 }
 ```
 
@@ -64,12 +64,12 @@ its ungated part and the templates that call joins
 
 ```mach
 pub rec Analysis {
-    alloc:     *A.Allocator;
-    module:    module.ModuleId;
-    cycle_of:  map.Map[u32, u32];
-    cycles:    collections_vector.Vector[Cycle];
+    alloc:     *std.allocator.Allocator;
+    module:    mach.session.module.ModuleId;
+    cycle_of:  std.collections.map.Map[u32, u32];
+    cycles:    std.collections.vector.Vector[Cycle];
     nested:    bool;
-    nested_at: base_source.Span;
+    nested_at: mach.base.source.Span;
 }
 ```
 
@@ -79,7 +79,7 @@ and left the rest of that body unwalked
 ### init
 
 ```mach
-pub fun init(alloc: *A.Allocator) Analysis
+pub fun init(alloc: *std.allocator.Allocator) Analysis
 ```
 
 ### dnit
@@ -93,7 +93,7 @@ release an analysis; a nil one, or one never made, holds nothing
 ### cycle_of
 
 ```mach
-pub fun cycle_of(an: *Analysis, decl: ast_id.DeclId) opt[u32]
+pub fun cycle_of(an: *Analysis, decl: mach.front.ast.id.DeclId) opt[u32]
 ```
 
 the growing cycle declaration `decl` lies on, if any
@@ -107,8 +107,8 @@ pub fun cycle_at(an: *Analysis, id: u32) *Cycle
 ### analyze
 
 ```mach
-pub fun analyze(s: *session.Session, a: *ast.Ast, rr: *resolve.ResolveResult, source: str, own: module.ModuleId,
-    alloc: *A.Allocator) res[Analysis, fail.Fail]
+pub fun analyze(s: *mach.session.Session, a: *mach.front.ast.Ast, rr: *mach.front.resolve.ResolveResult, source: str, own: mach.session.module.ModuleId,
+    alloc: *std.allocator.Allocator) res[Analysis, mach.base.fail.Fail]
 ```
 
 the growing cycles of module `own`, parsed as `a` and resolved as `rr`
@@ -118,7 +118,7 @@ the growing cycles of module `own`, parsed as `a` and resolved as `rr`
 ### fun_is_template
 
 ```mach
-pub fun fun_is_template(a: *ast.Ast, d: *ast_decl.Decl) bool
+pub fun fun_is_template(a: *mach.front.ast.Ast, d: *mach.front.ast.decl.Decl) bool
 ```
 
 a generic, a function with a comptime value parameter, or one with a pack: emitted only

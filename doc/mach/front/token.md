@@ -4,9 +4,9 @@
 
 the tokens of the language: their kinds, fixed punctuation spellings and infix precedence
 
-<sub>source: [`src/front/token.mach`](../../../src/front/token.mach) · imported by 7 modules</sub>
+Source: [`src/front/token.mach`](../../../src/front/token.mach)
 
-<sub>`base_source` is [`mach.base.source`](../base/source.md)</sub>
+Uses types from [`mach.base.source`](../base/source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -16,7 +16,7 @@ the tokens of the language: their kinds, fixed punctuation spellings and infix p
 
 | On `Kind` | |
 | :--- | :--- |
-| [`KIND_IDENT`](#kind) · [`KIND_LIT_INT`](#kind) · [`KIND_LIT_FLOAT`](#kind) · [`KIND_LIT_CHAR`](#kind) · [`KIND_LIT_STR`](#kind) · [`KIND_LPAREN`](#kind) · [`KIND_RPAREN`](#kind) · [`KIND_LBRACE`](#kind) · [`KIND_RBRACE`](#kind) · [`KIND_LBRACKET`](#kind) · [`KIND_RBRACKET`](#kind) · [`KIND_SEMI`](#kind) · [`KIND_COLON`](#kind) · [`KIND_COMMA`](#kind) · [`KIND_DOT`](#kind) · [`KIND_QUESTION`](#kind) · [`KIND_AT`](#kind) · [`KIND_DOLLAR`](#kind) · [`KIND_PLUS`](#kind) · [`KIND_MINUS`](#kind) · [`KIND_STAR`](#kind) · [`KIND_SLASH`](#kind) · [`KIND_PERCENT`](#kind) · [`KIND_AMP`](#kind) · [`KIND_PIPE`](#kind) · [`KIND_CARET`](#kind) · [`KIND_TILDE`](#kind) · [`KIND_EQ`](#kind) · [`KIND_EQ_EQ`](#kind) · [`KIND_BANG`](#kind) · [`KIND_BANG_EQ`](#kind) · [`KIND_LT`](#kind) · [`KIND_LT_EQ`](#kind) · [`KIND_LT_LT`](#kind) · [`KIND_GT`](#kind) · [`KIND_GT_EQ`](#kind) · [`KIND_GT_GT`](#kind) · [`KIND_AMP_AMP`](#kind) · [`KIND_PIPE_PIPE`](#kind) · [`KIND_COLON_COLON`](#kind) · [`KIND_DOT_DOT_DOT`](#kind) · [`KIND_COLON_TILDE`](#kind) · [`KIND_DECORATOR_OPEN`](#kind) · [`KIND_COLON_GT`](#kind) · [`KIND_EOF`](#kind) · [`KIND_ERROR`](#kind) · [`make`](#make) | |
+| [`KIND_IDENT`](#kind), [`KIND_LIT_INT`](#kind), [`KIND_LIT_FLOAT`](#kind), [`KIND_LIT_CHAR`](#kind), [`KIND_LIT_STR`](#kind), [`KIND_LPAREN`](#kind), [`KIND_RPAREN`](#kind), [`KIND_LBRACE`](#kind), [`KIND_RBRACE`](#kind), [`KIND_LBRACKET`](#kind), [`KIND_RBRACKET`](#kind), [`KIND_SEMI`](#kind), [`KIND_COLON`](#kind), [`KIND_COMMA`](#kind), [`KIND_DOT`](#kind), [`KIND_QUESTION`](#kind), [`KIND_AT`](#kind), [`KIND_DOLLAR`](#kind), [`KIND_PLUS`](#kind), [`KIND_MINUS`](#kind), [`KIND_STAR`](#kind), [`KIND_SLASH`](#kind), [`KIND_PERCENT`](#kind), [`KIND_AMP`](#kind), [`KIND_PIPE`](#kind), [`KIND_CARET`](#kind), [`KIND_TILDE`](#kind), [`KIND_EQ`](#kind), [`KIND_EQ_EQ`](#kind), [`KIND_BANG`](#kind), [`KIND_BANG_EQ`](#kind), [`KIND_LT`](#kind), [`KIND_LT_EQ`](#kind), [`KIND_LT_LT`](#kind), [`KIND_GT`](#kind), [`KIND_GT_EQ`](#kind), [`KIND_GT_GT`](#kind), [`KIND_AMP_AMP`](#kind), [`KIND_PIPE_PIPE`](#kind), [`KIND_COLON_COLON`](#kind), [`KIND_DOT_DOT_DOT`](#kind), [`KIND_COLON_TILDE`](#kind), [`KIND_DECORATOR_OPEN`](#kind), [`KIND_COLON_GT`](#kind), [`KIND_EOF`](#kind), [`KIND_ERROR`](#kind), [`make`](#make) | |
 | [`infix_precedence`](#infix_precedence) | the binding power of an infix operator token; 0 for every other kind, which is not an operator (a partition, enumerated by its test) |
 | [`is_right_assoc`](#is_right_assoc) | |
 
@@ -106,7 +106,7 @@ pub fun is_right_assoc(kind: Kind) bool
 
 ```mach
 pub rec Token {
-    span: base_source.Span;
+    span: mach.base.source.Span;
     kind: Kind;
 }
 ```

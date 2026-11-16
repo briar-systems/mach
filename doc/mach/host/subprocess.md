@@ -13,9 +13,9 @@ is never reused under a stale owner. wait, wait_any, timeout and cancel are
 the ways to reach the terminal. a capture, when the spawn asked for one, is
 a file the child writes and the owner reads back after the child is done.
 
-<sub>source: [`src/host/subprocess.mach`](../../../src/host/subprocess.mach) · imported by 5 modules</sub>
+Source: [`src/host/subprocess.mach`](../../../src/host/subprocess.mach)
 
-<sub>`Cause` is private · `A` is `std.allocator` · `diagnostic_kind` is [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `SubprocessState` is private · `exec` is `std.process.exec` · `OwnedCapture` is private · `time` is `std.chrono.time` · `chrono_duration` is `std.chrono.duration` · `sync_cancel` is `std.sync.cancel` · `events` is `std.process.events`</sub>
+Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -99,7 +99,7 @@ the refusal `cause`, named by `identity`
 ### refusal
 
 ```mach
-pub fun refusal(a: *A.Allocator, k: diagnostic_kind.Kind, verb: str, e: Error, cwd: str) fail.Fail
+pub fun refusal(a: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kind, verb: str, e: Error, cwd: str) mach.base.fail.Fail
 ```
 
 the machine's refusal `e` to `verb` the child, an environment failure under `k`
@@ -109,7 +109,7 @@ allocation refusal is internal
 ### refusal_of
 
 ```mach
-pub fun refusal_of(a: *A.Allocator, k: diagnostic_kind.Kind, op: fail.Op, e: Error) fail.Fail
+pub fun refusal_of(a: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kind, op: mach.base.fail.Op, e: Error) mach.base.fail.Fail
 ```
 
 the machine's refusal `e` of `op`, which names the child as its caller knows it
@@ -163,7 +163,7 @@ what happened to a capture file
 
 ```mach
 pub rec OwnedSubprocess {
-    child:           exec.Child;
+    child:           std.process.exec.Child;
     state:           SubprocessState;
     terminal:        SubprocessTerminal;
     requested:       Request;
@@ -173,8 +173,8 @@ pub rec OwnedSubprocess {
     reap_count:      u8;
     pathname:        *u8;
     has_deadline:    bool;
-    deadline:        time.Instant;
-    timeout:         chrono_duration.Duration;
+    deadline:        std.chrono.time.Instant;
+    timeout:         std.chrono.duration.Duration;
 }
 ```
 
@@ -182,7 +182,7 @@ the owner of one supervised child, made by init and released by dnit
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `child` | `exec.Child` | the child's handle while it runs |
+| `child` | `std.process.exec.Child` | the child's handle while it runs |
 | `state` | `SubprocessState` | where the owner is in its lifecycle (see STATE_UNSTARTED) |
 | `terminal` | `SubprocessTerminal` | how the child ended, once observed |
 | `requested` | `Request` | the termination a supervisor asked for |
@@ -192,8 +192,8 @@ the owner of one supervised child, made by init and released by dnit
 | `reap_count` | `u8` | times the child was reaped, never more than one |
 | `pathname` | `*u8` | the owned copy of the child's pathname, naming its errors |
 | `has_deadline` | `bool` | bound set a deadline |
-| `deadline` | `time.Instant` | the instant wait_any times the child out |
-| `timeout` | `chrono_duration.Duration` | the bound the deadline came from |
+| `deadline` | `std.chrono.time.Instant` | the instant wait_any times the child out |
+| `timeout` | `std.chrono.duration.Duration` | the bound the deadline came from |
 
 ### init
 
@@ -206,7 +206,7 @@ make `p` a fresh owner with nothing spawned
 ### bound
 
 ```mach
-pub fun bound(p: *OwnedSubprocess, timeout: chrono_duration.Duration) err[Error]
+pub fun bound(p: *OwnedSubprocess, timeout: std.chrono.duration.Duration) err[Error]
 ```
 
 give `p` a deadline `timeout` from now, which wait_any enforces
@@ -226,7 +226,7 @@ whether the child was terminated for outliving its deadline
 ### dnit
 
 ```mach
-pub fun dnit(a: *A.Allocator, p: *OwnedSubprocess)
+pub fun dnit(a: *std.allocator.Allocator, p: *OwnedSubprocess)
 ```
 
 release what `p` owns: its pathname, and its capture file and identity. a
@@ -235,7 +235,7 @@ second call releases nothing. it does not reap a running child
 ### spawn
 
 ```mach
-pub fun spawn(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: exec.Environment,
+pub fun spawn(a: *std.allocator.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: std.process.exec.Environment,
     options: SpawnOptions) err[Error]
 ```
 
@@ -259,7 +259,7 @@ its errors. on failure the owner is in STATE_SPAWN_FAILURE and owns nothing.
 ### spawn_native
 
 ```mach
-pub fun spawn_native(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: exec.NativeEnvironment,
+pub fun spawn_native(a: *std.allocator.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: std.process.exec.NativeEnvironment,
     options: SpawnOptions) err[Error]
 ```
 
@@ -283,7 +283,7 @@ whether `p` holds a child that has not ended, which a cancel or a timeout can st
 ### wait
 
 ```mach
-pub fun wait(a: *A.Allocator, p: *OwnedSubprocess) res[SubprocessTerminal, Error]
+pub fun wait(a: *std.allocator.Allocator, p: *OwnedSubprocess) res[SubprocessTerminal, Error]
 ```
 
 block until the running child of `p` ends, and reap it
@@ -295,7 +295,7 @@ block until the running child of `p` ends, and reap it
 ### wait_any
 
 ```mach
-pub fun wait_any(a: *A.Allocator, owners: *OwnedSubprocess, count: u32, scope: *sync_cancel.Scope, source: *events.Source) res[*OwnedSubprocess, Error]
+pub fun wait_any(a: *std.allocator.Allocator, owners: *OwnedSubprocess, count: u32, scope: *std.sync.cancel.Scope, source: *std.process.events.Source) res[*OwnedSubprocess, Error]
 ```
 
 supervise `count` owners until one of them reaches its terminal, and return
@@ -317,7 +317,7 @@ cancelled. a terminate, interrupt, console-close or service-stop event from
 ### finish_capture
 
 ```mach
-pub fun finish_capture(a: *A.Allocator, p: *OwnedSubprocess, retain: bool) res[CaptureIoResult, Error]
+pub fun finish_capture(a: *std.allocator.Allocator, p: *OwnedSubprocess, retain: bool) res[CaptureIoResult, Error]
 ```
 
 read the capture of a finished child back and close it, once
@@ -351,7 +351,7 @@ the captured bytes retained by finish_capture, borrowed from `p`
 ### capture_dnit
 
 ```mach
-pub fun capture_dnit(a: *A.Allocator, p: *OwnedSubprocess) err[Error]
+pub fun capture_dnit(a: *std.allocator.Allocator, p: *OwnedSubprocess) err[Error]
 ```
 
 free the captured bytes and the capture identity of a finished capture, once
@@ -359,7 +359,7 @@ free the captured bytes and the capture identity of a finished capture, once
 ### timeout
 
 ```mach
-pub fun timeout(a: *A.Allocator, p: *OwnedSubprocess, grace: chrono_duration.Duration) res[SubprocessTerminal, Error]
+pub fun timeout(a: *std.allocator.Allocator, p: *OwnedSubprocess, grace: std.chrono.duration.Duration) res[SubprocessTerminal, Error]
 ```
 
 terminate the running child for outliving its deadline and reap it
@@ -375,7 +375,7 @@ the child is asked to stop, its whole group when it has one, and given
 ### cancel
 
 ```mach
-pub fun cancel(a: *A.Allocator, p: *OwnedSubprocess, grace: chrono_duration.Duration) res[SubprocessTerminal, Error]
+pub fun cancel(a: *std.allocator.Allocator, p: *OwnedSubprocess, grace: std.chrono.duration.Duration) res[SubprocessTerminal, Error]
 ```
 
 terminate the running child as cancelled and reap it, as timeout does

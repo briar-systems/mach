@@ -7,9 +7,9 @@ function or a global the builder makes a value of where an instruction uses it. 
 value of an aggregate type is the address of storage holding it, typed as the aggregate,
 or, where it is `whole`, a mirl value of the aggregate itself with no storage
 
-<sub>source: [`src/lower/value.mach`](../../../src/lower/value.mach) · imported by 8 modules</sub>
+Source: [`src/lower/value.mach`](../../../src/lower/value.mach)
 
-<sub>`id` is `mirl.ir.id` · `wide` is [`mach.base.wide`](../base/wide.md)</sub>
+Uses types from [`mach.base.wide`](../base/wide.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -19,21 +19,21 @@ or, where it is `whole`, a mirl value of the aggregate itself with no storage
 | On `ValueKind` | |
 | :--- | :--- |
 | [`VAL_NONE`](#valuekind) | none:   no value, what a call of a function that gives nothing yields ssa:    a mirl value of the function being built int:    an integer constant, its bits in `bits` float:  a float constant, the bits of its binary64 encoding in `bits` null:   every bit zero fn:     function `index` of the module, called by name or taken as an address global: the address of global `index` of the module const:  constant `index` of the module, a scalar or an aggregate laid out as its type |
-| [`VAL_SSA`](#valuekind) · [`VAL_INT`](#valuekind) · [`VAL_FLOAT`](#valuekind) · [`VAL_NULL`](#valuekind) · [`VAL_FN`](#valuekind) · [`VAL_GLOBAL`](#valuekind) · [`VAL_CONST`](#valuekind) | |
+| [`VAL_SSA`](#valuekind), [`VAL_INT`](#valuekind), [`VAL_FLOAT`](#valuekind), [`VAL_NULL`](#valuekind), [`VAL_FN`](#valuekind), [`VAL_GLOBAL`](#valuekind), [`VAL_CONST`](#valuekind) | |
 
 | On `Value` | |
 | :--- | :--- |
-| [`none`](#none) · [`ssa`](#ssa) | |
+| [`none`](#none), [`ssa`](#ssa) | |
 | [`whole`](#whole) | the aggregate mirl value `at` of `ty`, held whole with no storage |
 | [`zero_whole`](#zero_whole) | the aggregate of `ty` every byte of which is zero, held whole |
 | [`const_int`](#const_int) | |
 | [`const_int_wide`](#const_int_wide) | a constant up to 128 bits wide; a narrower type reads its low bits |
-| [`const_float`](#const_float) · [`const_null`](#const_null) | |
+| [`const_float`](#const_float), [`const_null`](#const_null) | |
 | [`fn`](#fn) | function `index`, an address of `ptr` called through `sig` |
 | [`global`](#global) | the address of global `index`, of `ty`, into storage of `space` |
-| [`constant`](#constant) · [`retype`](#retype) · [`is_none`](#is_none) | |
+| [`constant`](#constant), [`retype`](#retype), [`is_none`](#is_none) | |
 | [`int_lit`](#int_lit) | an integer constant's low 64 bits |
-| [`is_int_const`](#is_int_const) · [`is_constant`](#is_constant) | |
+| [`is_int_const`](#is_int_const), [`is_constant`](#is_constant) | |
 | [`float_lit`](#float_lit) | a float constant's value |
 
 ---
@@ -62,15 +62,15 @@ pub rec Value {
     kind:   ValueKind;
     ty:     Type;
     secret: bool;
-    id:     id.Value;
-    bits:   wide.Wide;
+    id:     mirl.ir.id.Value;
+    bits:   mach.base.wide.Wide;
     index:  u32;
     # the signature a function is called through
     sig:   Type;
     space: u32;
     held:  Type;
     # the i1 a bool byte was widened from, which a branch or a select reads in its place
-    truth:  id.Value;
+    truth:  mirl.ir.id.Value;
     truthy: bool;
     whole:  bool;
 }
@@ -90,13 +90,13 @@ pub fun none() Value
 ### ssa
 
 ```mach
-pub fun ssa(at: id.Value, ty: Type, secret: bool) Value
+pub fun ssa(at: mirl.ir.id.Value, ty: Type, secret: bool) Value
 ```
 
 ### whole
 
 ```mach
-pub fun whole(at: id.Value, ty: Type, secret: bool) Value
+pub fun whole(at: mirl.ir.id.Value, ty: Type, secret: bool) Value
 ```
 
 the aggregate mirl value `at` of `ty`, held whole with no storage
@@ -118,7 +118,7 @@ pub fun const_int(bits: u64, ty: Type) Value
 ### const_int_wide
 
 ```mach
-pub fun const_int_wide(bits: wide.Wide, ty: Type) Value
+pub fun const_int_wide(bits: mach.base.wide.Wide, ty: Type) Value
 ```
 
 a constant up to 128 bits wide; a narrower type reads its low bits
@@ -154,7 +154,7 @@ the address of global `index`, of `ty`, into storage of `space`
 ### constant
 
 ```mach
-pub fun constant(c: id.Constant, ty: Type) Value
+pub fun constant(c: mirl.ir.id.Constant, ty: Type) Value
 ```
 
 ### retype

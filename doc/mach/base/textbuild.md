@@ -7,9 +7,7 @@ a text builder that keeps its first failure
 every later append and the finish refuse with that failure, so a writer appends a run of
 pieces and checks once.
 
-<sub>source: [`src/base/textbuild.mach`](../../../src/base/textbuild.mach) · imported by 12 modules</sub>
-
-<sub>`A` is `std.allocator`</sub>
+Source: [`src/base/textbuild.mach`](../../../src/base/textbuild.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -22,9 +20,9 @@ pieces and checks once.
 
 | On `TextBuilder` | |
 | :--- | :--- |
-| [`tb_init`](#tb_init) · [`tb_append`](#tb_append) | |
+| [`tb_init`](#tb_init), [`tb_append`](#tb_append) | |
 | [`tb_fault`](#tb_fault) | the builder's first failure, or ok when every append so far held |
-| [`tb_len`](#tb_len) · [`tb_finish`](#tb_finish) · [`tb_dnit`](#tb_dnit) | |
+| [`tb_len`](#tb_len), [`tb_finish`](#tb_finish), [`tb_dnit`](#tb_dnit) | |
 
 ---
 
@@ -32,7 +30,7 @@ pieces and checks once.
 
 ```mach
 pub tag Error: u8 {
-    alloc: A.Error;
+    alloc: std.allocator.Error;
     overflow;
 }
 ```
@@ -49,7 +47,7 @@ pub fun text(e: Error) str
 
 ```mach
 pub rec TextBuilder {
-    alloc: *A.Allocator;
+    alloc: *std.allocator.Allocator;
     data:  *u8;
     len:   usize;
     cap:   usize;
@@ -64,7 +62,7 @@ the failure once at `tb_finish` or `tb_fault`
 ### tb_init
 
 ```mach
-pub fun tb_init(a: *A.Allocator) TextBuilder
+pub fun tb_init(a: *std.allocator.Allocator) TextBuilder
 ```
 
 ### tb_append

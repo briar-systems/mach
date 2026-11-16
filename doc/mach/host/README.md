@@ -7,7 +7,7 @@ operating system the compiler itself was built for. a compiler module calls
 these and holds no host conditional of its own. the target a build produces
 is the target module's concern, not this one's
 
-<sub>[`mach.host`](../host.md) · 6 modules · imports [`base`](../base/README.md) · imported by [`build`](../build/README.md), [`cli`](../cli/README.md), [`compile`](../compile/README.md), [`manifest`](../manifest/README.md), [`package`](../package/README.md), [`tool`](../tool/README.md)</sub>
+The directory's root module is [`mach.host`](../host.md).
 
 | Module | |
 | :--- | :--- |
@@ -16,7 +16,7 @@ is the target module's concern, not this one's
 | [`output`](output.md) | output: how a compiler-controlled file reaches its final name |
 | [`subprocess`](subprocess.md) | supervised child processes |
 
-| Directory | Modules | |
-| :--- | ---: | :--- |
-| [`output/`](output/README.md) | 2 | output: how a compiler-controlled file reaches its final name |
+| Directory | |
+| :--- | :--- |
+| [`output/`](output/README.md) | output: how a compiler-controlled file reaches its final name |
 

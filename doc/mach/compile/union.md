@@ -8,9 +8,9 @@ a target whose facts cannot be assembled is skipped with a warning. an artifact 
 selected target does not build is foreign: its entry loads so the modules only it
 reaches are known and left out of the compiled set.
 
-<sub>source: [`src/compile/union.mach`](../../../src/compile/union.mach) · imported by 1 module</sub>
+Source: [`src/compile/union.mach`](../../../src/compile/union.mach)
 
-<sub>`project` is [`mach.compile.project`](project.md) · `manifest_model` is [`mach.manifest.model`](../manifest/model.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](project.md), [`mach.manifest.model`](../manifest/model.md).
 
 | Functions | |
 | :--- | :--- |
@@ -24,13 +24,13 @@ reaches are known and left out of the compiled set.
 ### populate_union_tuples
 
 ```mach
-pub fun populate_union_tuples(p: *project.Project, m: *manifest_model.Manifest) err[fail.Fail]
+pub fun populate_union_tuples(p: *mach.compile.project.Project, m: *mach.manifest.model.Manifest) err[mach.base.fail.Fail]
 ```
 
 ### populate_union_entries
 
 ```mach
-pub fun populate_union_entries(p: *project.Project, m: *manifest_model.Manifest) err[fail.Fail]
+pub fun populate_union_entries(p: *mach.compile.project.Project, m: *mach.manifest.model.Manifest) err[mach.base.fail.Fail]
 ```
 
 the artifact entries of this project, split by whether the selected target builds them:

@@ -7,7 +7,7 @@ the table of commands and the dispatch that routes a `mach` invocation to one of
 a command is its own file's `std_args.Command` and policy and its row here, and nothing
 else registers it.
 
-<sub>source: [`src/cli/cmd.mach`](../../../src/cli/cmd.mach) · imported by 1 module</sub>
+Source: [`src/cli/cmd.mach`](../../../src/cli/cmd.mach)
 
 | Functions | |
 | :--- | :--- |

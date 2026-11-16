@@ -12,9 +12,9 @@ interrupted write leaves the original intact. the build owns its output
 layout: `directory` and `reserve` replace a stale entry of the wrong kind,
 and every failure names the path and the operation through `fail.refusal`
 
-<sub>source: [`src/host/output.mach`](../../../src/host/output.mach) · imported by 16 modules</sub>
+Source: [`src/host/output.mach`](../../../src/host/output.mach)
 
-<sub>`A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `io_writer` is `std.io.writer`</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -41,7 +41,7 @@ and every failure names the path and the operation through `fail.refusal`
 
 ```mach
 pub rec Temporary {
-    a:           *A.Allocator;
+    a:           *std.allocator.Allocator;
     path:        str;
     destination: str;
 }
@@ -52,14 +52,14 @@ refused write of it is named by
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `a` | `*A.Allocator` | owns the text of a refusal |
+| `a` | `*std.allocator.Allocator` | owns the text of a refusal |
 | `path` | `str` | the temporary |
 | `destination` | `str` | the file the temporary is renamed over |
 
 ### fill
 
 ```mach
-pub fun fill(t: *Temporary, buf: *u8, len: usize, mode: i32) err[fail.Fail]
+pub fun fill(t: *Temporary, buf: *u8, len: usize, mode: i32) err[mach.base.fail.Fail]
 ```
 
 write `buf` to the temporary `t`, a refusal naming the destination and the temporary it was
@@ -70,7 +70,7 @@ written through
 ### directory
 
 ```mach
-pub fun directory(a: *A.Allocator, root: str, dir: str) err[fail.Fail]
+pub fun directory(a: *std.allocator.Allocator, root: str, dir: str) err[mach.base.fail.Fail]
 ```
 
 the build owns the layout beneath its output root: `dir` and each missing
@@ -83,7 +83,7 @@ symlink to a directory is used as it stands
 ### reserve
 
 ```mach
-pub fun reserve(a: *A.Allocator, root: str, file: str) err[fail.Fail]
+pub fun reserve(a: *std.allocator.Allocator, root: str, file: str) err[mach.base.fail.Fail]
 ```
 
 ready `file` to be written: its parent is a directory as `directory` makes
@@ -93,7 +93,7 @@ symlink there is left for the write to follow
 ### bytes
 
 ```mach
-pub fun bytes(itn: *intern.Interner, a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32, role: str) err[fail.Fail]
+pub fun bytes(itn: *mach.base.intern.Interner, a: *std.allocator.Allocator, path: str, buf: *u8, len: usize, mode: i32, role: str) err[mach.base.fail.Fail]
 ```
 
 write `buf` to `path`, whose parent exists, a refusal naming it as `role`, nil
@@ -102,8 +102,8 @@ for a product its path names
 ### writer
 
 ```mach
-pub fun writer[W](itn: *intern.Interner, a: *A.Allocator, path: str, ctx: *W,
-    write_cb: fun(*W, *io_writer.Writer) err[io_writer.WriteError], mode: i32, role: str) err[fail.Fail]
+pub fun writer[W](itn: *mach.base.intern.Interner, a: *std.allocator.Allocator, path: str, ctx: *W,
+    write_cb: fun(*W, *std.io.writer.Writer) err[std.io.writer.WriteError], mode: i32, role: str) err[mach.base.fail.Fail]
 ```
 
 stream `path`, whose parent exists, through `write_cb`, staged in `a` so a writer of many small
@@ -113,7 +113,7 @@ names
 ### replace
 
 ```mach
-pub fun replace(a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32) err[fail.Fail]
+pub fun replace(a: *std.allocator.Allocator, path: str, buf: *u8, len: usize, mode: i32) err[mach.base.fail.Fail]
 ```
 
 replace a source-tree file through a sibling temporary and rename, so the
@@ -122,7 +122,7 @@ destination is either the old content or the complete new content
 ### mirror_fqn
 
 ```mach
-pub fun mirror_fqn(a: *A.Allocator, base: *u8, fqn: str, suffix: str) res[str, fail.Fail]
+pub fun mirror_fqn(a: *std.allocator.Allocator, base: *u8, fqn: str, suffix: str) res[str, mach.base.fail.Fail]
 ```
 
 the file a module's output takes under `base`: its dotted name as a path,
@@ -131,7 +131,7 @@ with `suffix` as the extension
 ### read_back
 
 ```mach
-pub fun read_back(a: *A.Allocator, path: str) res[Vector[u8], fail.Fail]
+pub fun read_back(a: *std.allocator.Allocator, path: str) res[Vector[u8], mach.base.fail.Fail]
 ```
 
 read the whole of a file the build wrote, a refusal naming `path`
@@ -139,8 +139,8 @@ read the whole of a file the build wrote, a refusal naming `path`
 ### through_temporary
 
 ```mach
-pub fun through_temporary[C](a: *A.Allocator, destination: str, ctx: *C,
-    write: fun(*C, *Temporary) err[fail.Fail]) err[fail.Fail]
+pub fun through_temporary[C](a: *std.allocator.Allocator, destination: str, ctx: *C,
+    write: fun(*C, *Temporary) err[mach.base.fail.Fail]) err[mach.base.fail.Fail]
 ```
 
 `write` fills a sibling temporary of `destination` through `fill`, which is

@@ -7,14 +7,14 @@ the table of commands and the dispatch that routes a `mach` invocation to one of
 a command is its own file's `std_args.Command` and policy and its row here, and nothing
 else registers it.
 
-<sub>[`mach.cli.cmd`](../cmd.md) · 11 modules · imports [`base`](../../base/README.md), [`build`](../../build/README.md), [`compile`](../../compile/README.md), [`front`](../../front/README.md), [`host`](../../host/README.md), [`manifest`](../../manifest/README.md), [`package`](../../package/README.md), [`report`](../../report/README.md), [`session`](../../session/README.md), [`target`](../../target/README.md), [`tool`](../../tool/README.md) · imported by [`bin`](../../bin/README.md)</sub>
+The directory's root module is [`mach.cli.cmd`](../cmd.md).
 
 | Module | |
 | :--- | :--- |
 | [`build`](build.md) | `mach build` and `mach check`, and the planning of a selection other commands share |
 | [`clean`](clean.md) | `mach clean`, which removes every path a build of every cell of the project writes |
 | [`dep`](dep.md) | `mach dep` and its actions: list, add, remove, update, pull, outdated and verify |
-| [`doc`](doc.md) | `mach doc`: the project's reference, every module some artifact reaches, written by the documentation generator (`mach.tool.doc`) into `doc/<project id>/` |
+| [`doc`](doc.md) | `mach doc`: the project's reference, every module its source root holds, written by the documentation generator (`mach.tool.doc`) into `doc/<project id>/` |
 | [`fmt`](fmt.md) | `mach fmt`, which rewrites source into the canonical layout |
 | [`help`](help.md) | `mach help`, and the page any command renders for `--help` |
 | [`info`](info.md) | `mach info`: the version and the host target, or with `targets` every target mink spells |

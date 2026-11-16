@@ -5,9 +5,9 @@
 scanning and decoding a literal's spelling: the value an integer, float, character or
 string literal names and the suffix it carries, or why it does not scan
 
-<sub>source: [`src/front/literal.mach`](../../../src/front/literal.mach) · imported by 5 modules</sub>
+Source: [`src/front/literal.mach`](../../../src/front/literal.mach)
 
-<sub>`wide` is [`mach.base.wide`](../base/wide.md) · `type_kind` is [`mach.type.kind`](../type/kind.md) · `base_source` is [`mach.base.source`](../base/source.md) · `diagnostic_kind` is [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md) · `float` is [`mach.base.float`](../base/float.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.float`](../base/float.md), [`mach.base.source`](../base/source.md), [`mach.base.wide`](../base/wide.md), [`mach.type.kind`](../type/kind.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -49,8 +49,8 @@ string literal names and the suffix it carries, or why it does not scan
 
 ```mach
 pub rec Int {
-    value:    wide.Wide;
-    suffix:   type_kind.TypeKind;
+    value:    mach.base.wide.Wide;
+    suffix:   mach.type.kind.TypeKind;
     in_range: bool;
 }
 ```
@@ -58,7 +58,7 @@ pub rec Int {
 ### int_scan
 
 ```mach
-pub fun int_scan(source: str, span: base_source.Span) res[Int, Refusal]
+pub fun int_scan(source: str, span: mach.base.source.Span) res[Int, Refusal]
 ```
 
 ## Float
@@ -66,14 +66,14 @@ pub fun int_scan(source: str, span: base_source.Span) res[Int, Refusal]
 ```mach
 pub rec Float {
     value:  f64;
-    suffix: type_kind.TypeKind;
+    suffix: mach.type.kind.TypeKind;
 }
 ```
 
 ### float_scan
 
 ```mach
-pub fun float_scan(source: str, span: base_source.Span) res[Float, Refusal]
+pub fun float_scan(source: str, span: mach.base.source.Span) res[Float, Refusal]
 ```
 
 a literal's value at the width its suffix names, binary64 when it has none
@@ -82,7 +82,7 @@ a literal's value at the width its suffix names, binary64 when it has none
 
 ```mach
 pub rec Refusal {
-    diag:    diagnostic_kind.Kind;
+    diag:    mach.base.diagnostic.kind.Kind;
     message: str;
 }
 ```
@@ -92,7 +92,7 @@ why a literal does not scan: the diagnostic it reports and what it says
 ### char_scan
 
 ```mach
-pub fun char_scan(source: str, span: base_source.Span) res[u8, Refusal]
+pub fun char_scan(source: str, span: mach.base.source.Span) res[u8, Refusal]
 ```
 
 the byte a character literal names
@@ -100,7 +100,7 @@ the byte a character literal names
 ### str_scan
 
 ```mach
-pub fun str_scan(source: str, span: base_source.Span, out: *u8) res[usize, Refusal]
+pub fun str_scan(source: str, span: mach.base.source.Span, out: *u8) res[usize, Refusal]
 ```
 
 the bytes a string literal names, its escapes decoded, written to `out`
@@ -143,7 +143,7 @@ the line of the multiline string literal `text` whose `\\` starts at `at`
 ### float_at
 
 ```mach
-pub fun float_at(source: str, span: base_source.Span, w: float.FloatWidth) res[float.Rounded, fail.Fail]
+pub fun float_at(source: str, span: mach.base.source.Span, w: mach.base.float.FloatWidth) res[mach.base.float.Rounded, mach.base.fail.Fail]
 ```
 
 a literal rounded once its type is known: at its suffix's width when it has one, else at
@@ -160,7 +160,7 @@ comptime evaluator, lowering, and the rule sema applies, reads it from here
 ### float_spells
 
 ```mach
-pub fun float_spells(source: str, span: base_source.Span, s: *float.Shortest) bool
+pub fun float_spells(source: str, span: mach.base.source.Span, s: *mach.base.float.Shortest) bool
 ```
 
 true when the literal's significant digits, leading and trailing zeros and exponent

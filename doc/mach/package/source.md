@@ -7,7 +7,7 @@ each a table of operations a source member fills:
 
 - Releases: the releases published at a url and the manifest each ships, which version
   resolution reads
-- Checkouts: how dep/&lt;id> holds a source's content: bringing it to a selection, saying what
+- Checkouts: how dep/\<id> holds a source's content: bringing it to a selection, saying what
   it holds, and checking it against what selected it
 
 git is the member today: its releases are `v`-prefixed semver tags and its checkouts are
@@ -16,16 +16,16 @@ release archive into the same slot, filling the same two tables. a selector beyo
 release (a `ref` naming a branch, a tag or a commit) is a source's own vocabulary, and a
 member without one refuses it
 
-<sub>source: [`src/package/source.mach`](../../../src/package/source.mach) · imported by 8 modules</sub>
+Source: [`src/package/source.mach`](../../../src/package/source.mach)
 
-<sub>`manifest_version` is [`mach.manifest.version`](../manifest/version.md) · `A` is `std.allocator` · `manifest_model` is [`mach.manifest.model`](../manifest/model.md) · `ListFn` is private · `ShippedFn` is private · `ReleaseOfFn` is private · `RememberFn` is private · `ReleasesCloseFn` is private · `AcquireFn` is private · `RevisionFn` is private · `AdvanceFn` is private · `HydrateFn` is private · `SelectionFn` is private · `ManifestOfFn` is private · `ReleaseAtFn` is private · `AtReleaseFn` is private · `HasReleasesFn` is private · `HoldsFn` is private · `VerifyFn` is private · `SatisfiesFn` is private · `CloseFn` is private</sub>
+Uses types from [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.version`](../manifest/version.md).
 
 | Type | | |
 | :--- | :--- | :--- |
 | [`Release`](#release) | `rec` | one release: its version (whose pre-release text borrows from `text`), the tag that names it and the commit it points at, all owned by the list's allocator |
 | [`Shipped`](#shipped) | `rec` | a release's manifest as resolution reads it: `manifest` when the release is a candidate, and otherwise `excluded` says why it is not one, its manifest not loading or naming another version |
 | [`Releases`](#releases) | `rec` |  |
-| [`Acquisition`](#acquisition) | `rec` | one acquisition of dep/&lt;id>: bring it to `selector` from `url` and record its pin as the project records pins (`mode`, a pin.mach mode) |
+| [`Acquisition`](#acquisition) | `rec` | one acquisition of dep/\<id>: bring it to `selector` from `url` and record its pin as the project records pins (`mode`, a pin.mach mode) |
 | [`Checkouts`](#checkouts) | `rec` |  |
 
 | On `Release` | |
@@ -34,8 +34,8 @@ member without one refuses it
 
 | Constants | |
 | :--- | :--- |
-| [`REALIZED_NOTHING`](#constants) | what acquiring dep/&lt;id> changed |
-| [`REALIZED_INITIALIZED`](#constants) · [`REALIZED_PINNED`](#constants) · [`REALIZED_REGISTERED`](#constants) · [`REALIZED_ADOPTED`](#constants) · [`REALIZED_CLONED`](#constants) | |
+| [`REALIZED_NOTHING`](#constants) | what acquiring dep/\<id> changed |
+| [`REALIZED_INITIALIZED`](#constants), [`REALIZED_PINNED`](#constants), [`REALIZED_REGISTERED`](#constants), [`REALIZED_ADOPTED`](#constants), [`REALIZED_CLONED`](#constants) | |
 | [`REALIZED_UNPINNED`](#constants) | nothing pins the dependency and nothing holds it, so a selection by range alone has nothing to realize |
 
 ---
@@ -44,7 +44,7 @@ member without one refuses it
 
 ```mach
 pub rec Release {
-    version: manifest_version.Version;
+    version: mach.manifest.version.Version;
     text:    str;
     tag:     str;
     commit:  str;
@@ -57,14 +57,14 @@ names it and the commit it points at, all owned by the list's allocator
 ### releases_dnit
 
 ```mach
-pub fun releases_dnit(a: *A.Allocator, list: *Vector[Release])
+pub fun releases_dnit(a: *std.allocator.Allocator, list: *Vector[Release])
 ```
 
 ## Shipped
 
 ```mach
 pub rec Shipped {
-    manifest: manifest_model.Manifest;
+    manifest: mach.manifest.model.Manifest;
     excluded: str;
 }
 ```
@@ -101,7 +101,7 @@ pub rec Acquisition {
 }
 ```
 
-one acquisition of dep/&lt;id>: bring it to `selector` from `url` and record its pin as the
+one acquisition of dep/\<id>: bring it to `selector` from `url` and record its pin as the
 project records pins (`mode`, a pin.mach mode). `accept` takes an existing checkout as the
 dependency, as `mach dep add` does; `pinned_only` is a selection by range alone, which
 acquires only what a pin or an existing checkout already names
@@ -131,7 +131,7 @@ pub rec Checkouts {
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `REALIZED_NOTHING` | `u8` | `0` | what acquiring dep/&lt;id> changed |
+| `REALIZED_NOTHING` | `u8` | `0` | what acquiring dep/\<id> changed |
 | `REALIZED_INITIALIZED` | `u8` | `1` |  |
 | `REALIZED_PINNED` | `u8` | `2` |  |
 | `REALIZED_REGISTERED` | `u8` | `3` |  |

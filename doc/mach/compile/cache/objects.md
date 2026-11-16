@@ -12,9 +12,9 @@ that were not written. a store that is missing, truncated or damaged reads as em
 is `"MOD1"`, the entry count, the entries, then the sha-256 of everything before it. an entry is
 its path (length then bytes) then its 32-byte digest, every number a little-endian u32
 
-<sub>source: [`src/compile/cache/objects.mach`](../../../../src/compile/cache/objects.mach) · imported by 2 modules</sub>
+Source: [`src/compile/cache/objects.mach`](../../../../src/compile/cache/objects.mach)
 
-<sub>`A` is `std.allocator` · `Entry` is private · `map` is `std.collections.map` · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -22,7 +22,7 @@ its path (length then bytes) then its 32-byte digest, every number a little-endi
 
 | On `Store` | |
 | :--- | :--- |
-| [`init`](#init) · [`dnit`](#dnit) | |
+| [`init`](#init), [`dnit`](#dnit) | |
 | [`written`](#written) | the digest of the object written at `path` under `obj/`, none when no build recorded one |
 | [`put`](#put) | the object at `path` under `obj/` was written as the `len` bytes at `bytes` |
 | [`decode`](#decode) | the store `bytes` hold: every entry, or none at all when the bytes are not a complete store |
@@ -35,9 +35,9 @@ its path (length then bytes) then its 32-byte digest, every number a little-endi
 
 ```mach
 pub rec Store {
-    alloc:   *A.Allocator;
+    alloc:   *std.allocator.Allocator;
     entries: Vector[Entry];
-    index:   map.Map[u64, u32];
+    index:   std.collections.map.Map[u64, u32];
     dirty:   bool;
 }
 ```
@@ -45,7 +45,7 @@ pub rec Store {
 ### init
 
 ```mach
-pub fun init(a: *A.Allocator) Store
+pub fun init(a: *std.allocator.Allocator) Store
 ```
 
 ### dnit
@@ -65,7 +65,7 @@ the digest of the object written at `path` under `obj/`, none when no build reco
 ### put
 
 ```mach
-pub fun put(st: *Store, path: str, bytes: *u8, len: usize) err[A.Error]
+pub fun put(st: *Store, path: str, bytes: *u8, len: usize) err[std.allocator.Error]
 ```
 
 the object at `path` under `obj/` was written as the `len` bytes at `bytes`
@@ -73,7 +73,7 @@ the object at `path` under `obj/` was written as the `len` bytes at `bytes`
 ### decode
 
 ```mach
-pub fun decode(a: *A.Allocator, bytes: *u8, len: usize) res[Store, A.Error]
+pub fun decode(a: *std.allocator.Allocator, bytes: *u8, len: usize) res[Store, std.allocator.Error]
 ```
 
 the store `bytes` hold: every entry, or none at all when the bytes are not a complete store.
@@ -82,7 +82,7 @@ err only when allocation fails
 ### load
 
 ```mach
-pub fun load(a: *A.Allocator, file: str) res[Store, A.Error]
+pub fun load(a: *std.allocator.Allocator, file: str) res[Store, std.allocator.Error]
 ```
 
 the store at `file`, empty when there is none or it cannot be read
@@ -90,7 +90,7 @@ the store at `file`, empty when there is none or it cannot be read
 ### store
 
 ```mach
-pub fun store(st: *Store, out_dir: str, file: str) err[fail.Fail]
+pub fun store(st: *Store, out_dir: str, file: str) err[mach.base.fail.Fail]
 ```
 
 write the store to `file` through a sibling temporary when an entry changed

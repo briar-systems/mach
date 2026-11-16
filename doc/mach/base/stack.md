@@ -12,7 +12,7 @@ the host has threads the driver runs on a thread whose stack it sizes itself
 reserve or ulimit -s. a threadless host runs on the calling thread and the
 margin alone holds the bound.
 
-<sub>source: [`src/base/stack.mach`](../../../src/base/stack.mach) · imported by 29 modules</sub>
+Source: [`src/base/stack.mach`](../../../src/base/stack.mach)
 
 | Functions | |
 | :--- | :--- |

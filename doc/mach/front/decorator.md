@@ -24,9 +24,9 @@ evaluates each once, after its walk has bound every constant, and records the
 string in its own bindings; every later stage reads it there, so resolution,
 type checking, lowering and the link all read one value
 
-<sub>source: [`src/front/decorator.mach`](../../../src/front/decorator.mach) · imported by 19 modules</sub>
+Source: [`src/front/decorator.mach`](../../../src/front/decorator.mach)
 
-<sub>`base_source` is [`mach.base.source`](../base/source.md) · `ast_decl` is [`mach.front.ast.decl`](ast/decl.md) · `ast` is [`mach.front.ast`](ast.md) · `textbuild` is [`mach.base.textbuild`](../base/textbuild.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `comptime_scope` is [`mach.front.comptime.scope`](comptime/scope.md) · `comptime_capability` is [`mach.front.comptime.capability`](comptime/capability.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.base.textbuild`](../base/textbuild.md), [`mach.front.ast`](ast.md), [`mach.front.ast.decl`](ast/decl.md), [`mach.front.comptime.capability`](comptime/capability.md), [`mach.front.comptime.scope`](comptime/scope.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -38,7 +38,7 @@ type checking, lowering and the link all read one value
 
 | On `Id` | |
 | :--- | :--- |
-| [`NONE`](#id) · [`DEPRECATED`](#id) · [`SYMBOL`](#id) · [`SECTION`](#id) · [`INLINE`](#id) · [`EXPORT`](#id) · [`ALIGN`](#id) · [`PACKED`](#id) · [`VOLATILE`](#id) · [`LIBRARY`](#id) · [`CONSTANT_TIME`](#id) · [`VECTORIZE`](#id) · [`NAKED`](#id) · [`EXTENSION`](#id) · [`EMBED`](#id) · [`GPU_STAGE`](#id) · [`GPU_WORKGROUP`](#id) · [`GPU_INPUT`](#id) · [`GPU_OUTPUT`](#id) · [`GPU_BUILTIN`](#id) · [`GPU_UNIFORM`](#id) · [`GPU_STORAGE`](#id) · [`GPU_SAMPLER`](#id) · [`GPU_PUSH`](#id) · [`GPU_SPEC`](#id) · [`GPU_SHARED`](#id) · [`INTRINSIC`](#id) · [`HANDLE`](#id) · [`ABI_TYPE`](#id) · [`TESTING`](#id) · [`EXPECT`](#id) · [`THREAD`](#id) · [`AT`](#id) · [`WEAK`](#id) | |
+| [`NONE`](#id), [`DEPRECATED`](#id), [`SYMBOL`](#id), [`SECTION`](#id), [`INLINE`](#id), [`EXPORT`](#id), [`ALIGN`](#id), [`PACKED`](#id), [`VOLATILE`](#id), [`LIBRARY`](#id), [`CONSTANT_TIME`](#id), [`VECTORIZE`](#id), [`NAKED`](#id), [`EXTENSION`](#id), [`EMBED`](#id), [`GPU_STAGE`](#id), [`GPU_WORKGROUP`](#id), [`GPU_INPUT`](#id), [`GPU_OUTPUT`](#id), [`GPU_BUILTIN`](#id), [`GPU_UNIFORM`](#id), [`GPU_STORAGE`](#id), [`GPU_SAMPLER`](#id), [`GPU_PUSH`](#id), [`GPU_SPEC`](#id), [`GPU_SHARED`](#id), [`INTRINSIC`](#id), [`HANDLE`](#id), [`ABI_TYPE`](#id), [`TESTING`](#id), [`EXPECT`](#id), [`THREAD`](#id), [`AT`](#id), [`WEAK`](#id) | |
 | [`row`](#row) | the row of `id`; nil for NONE and any id no row declares |
 | [`id_of`](#id_of) | the decorator the name at `name` in `source` spells, NONE when it spells none |
 | [`name_of`](#name_of) | the name of `id`; nil for NONE |
@@ -51,12 +51,12 @@ type checking, lowering and the link all read one value
 
 | On `Places` | |
 | :--- | :--- |
-| [`PLACE_CASE`](#places) · [`PLACES_ANY`](#places) | |
+| [`PLACE_CASE`](#places), [`PLACES_ANY`](#places) | |
 | [`places_of`](#places_of) | where the declaration `d` stands, for a row's `places` |
 
 | On `Flags` | |
 | :--- | :--- |
-| [`FLAG_ONCE`](#flags) · [`FLAG_ROLE`](#flags) · [`FLAG_TESTING_EXCLUSIVE`](#flags) · [`FLAG_STRINGS_CHECKED`](#flags) · [`FLAG_PLACE_CHECKED`](#flags) · [`FLAG_DEFINES`](#flags) | |
+| [`FLAG_ONCE`](#flags), [`FLAG_ROLE`](#flags), [`FLAG_TESTING_EXCLUSIVE`](#flags), [`FLAG_STRINGS_CHECKED`](#flags), [`FLAG_PLACE_CHECKED`](#flags), [`FLAG_DEFINES`](#flags) | |
 | [`count_flagged`](#count_flagged) | how many of the declaration's decorators carry every one of `flags` |
 | [`names_append`](#names_append) | appends the names of the rows that carry every one of `flags` and stand somewhere in `places`, `, `-separated in row order |
 
@@ -130,7 +130,7 @@ the row of `id`; nil for NONE and any id no row declares
 ### id_of
 
 ```mach
-pub fun id_of(source: str, name: base_source.Span) Id
+pub fun id_of(source: str, name: mach.base.source.Span) Id
 ```
 
 the decorator the name at `name` in `source` spells, NONE when it spells none
@@ -146,7 +146,7 @@ the name of `id`; nil for NONE
 ### admits
 
 ```mach
-pub fun admits(id: Id, d: *ast_decl.Decl) bool
+pub fun admits(id: Id, d: *mach.front.ast.decl.Decl) bool
 ```
 
 whether `id` may stand on the declaration `d`
@@ -162,7 +162,7 @@ whether `id`'s row carries every one of `flags`
 ### list_get
 
 ```mach
-pub fun list_get(a: *ast.Ast, start: u32, len: u32, id: Id) opt[*ast_decl.Decorator]
+pub fun list_get(a: *mach.front.ast.Ast, start: u32, len: u32, id: Id) opt[*mach.front.ast.decl.Decorator]
 ```
 
 the first decorator `id` among the `len` decorators from `start`
@@ -170,7 +170,7 @@ the first decorator `id` among the `len` decorators from `start`
 ### list_has
 
 ```mach
-pub fun list_has(a: *ast.Ast, start: u32, len: u32, id: Id) bool
+pub fun list_has(a: *mach.front.ast.Ast, start: u32, len: u32, id: Id) bool
 ```
 
 whether the decorator `id` is among the `len` decorators from `start`
@@ -178,7 +178,7 @@ whether the decorator `id` is among the `len` decorators from `start`
 ### get
 
 ```mach
-pub fun get(a: *ast.Ast, d: *ast_decl.Decl, id: Id) opt[*ast_decl.Decorator]
+pub fun get(a: *mach.front.ast.Ast, d: *mach.front.ast.decl.Decl, id: Id) opt[*mach.front.ast.decl.Decorator]
 ```
 
 the declaration's decorator `id`, the first when it repeats
@@ -186,7 +186,7 @@ the declaration's decorator `id`, the first when it repeats
 ### has
 
 ```mach
-pub fun has(a: *ast.Ast, d: *ast_decl.Decl, id: Id) bool
+pub fun has(a: *mach.front.ast.Ast, d: *mach.front.ast.decl.Decl, id: Id) bool
 ```
 
 whether the declaration carries the decorator `id`
@@ -209,7 +209,7 @@ PLACES_ANY is every declaration; a tag case admits only a row that names it
 ### places_of
 
 ```mach
-pub fun places_of(d: *ast_decl.Decl) Places
+pub fun places_of(d: *mach.front.ast.decl.Decl) Places
 ```
 
 where the declaration `d` stands, for a row's `places`
@@ -243,7 +243,7 @@ what a row asks of its decorator beyond its arguments and places
 ### count_flagged
 
 ```mach
-pub fun count_flagged(a: *ast.Ast, d: *ast_decl.Decl, flags: Flags) u32
+pub fun count_flagged(a: *mach.front.ast.Ast, d: *mach.front.ast.decl.Decl, flags: Flags) u32
 ```
 
 how many of the declaration's decorators carry every one of `flags`
@@ -251,7 +251,7 @@ how many of the declaration's decorators carry every one of `flags`
 ### names_append
 
 ```mach
-pub fun names_append(b: *textbuild.TextBuilder, flags: Flags, places: Places, conjunction: str) err[textbuild.Error]
+pub fun names_append(b: *mach.base.textbuild.TextBuilder, flags: Flags, places: Places, conjunction: str) err[mach.base.textbuild.Error]
 ```
 
 appends the names of the rows that carry every one of `flags` and stand somewhere
@@ -309,7 +309,7 @@ what `mach migrate` writes for the previous spelling at `name` in `source`
 ### rewrite_of
 
 ```mach
-pub fun rewrite_of(source: str, name: base_source.Span, args: u32) Rewrite
+pub fun rewrite_of(source: str, name: mach.base.source.Span, args: u32) Rewrite
 ```
 
 the rewrite of the decorator named at `name` in `source` with `args` arguments, nil name
@@ -320,7 +320,7 @@ when it is written as this major spells it
 ### refusal_of
 
 ```mach
-pub fun refusal_of(source: str, name: base_source.Span, args: u32) str
+pub fun refusal_of(source: str, name: mach.base.source.Span, args: u32) str
 ```
 
 the refusal of the previous spelling at `name` in `source` with `args` arguments, nil when
@@ -329,7 +329,7 @@ it is none
 ### constant_time_mode
 
 ```mach
-pub fun constant_time_mode(itn: *intern.Interner, c: *comptime_scope.ComptimeCtx, a: *ast.Ast, d: *ast_decl.Decl) opt[str]
+pub fun constant_time_mode(itn: *mach.base.intern.Interner, c: *mach.front.comptime.scope.ComptimeCtx, a: *mach.front.ast.Ast, d: *mach.front.ast.decl.Decl) opt[str]
 ```
 
 the constant-time mode `d` declares, "soft" or "hard", none when it declares none. every
@@ -346,7 +346,7 @@ whether `value` is one of the `|`-separated `modes`
 ### takes_string
 
 ```mach
-pub fun takes_string(dec: *ast_decl.Decorator, ord: u32) bool
+pub fun takes_string(dec: *mach.front.ast.decl.Decorator, ord: u32) bool
 ```
 
 whether argument `ord` of `dec` is a string the load records
@@ -354,7 +354,7 @@ whether argument `ord` of `dec` is a string the load records
 ### string_id
 
 ```mach
-pub fun string_id(c: *comptime_scope.ComptimeCtx, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) intern.StrId
+pub fun string_id(c: *mach.front.comptime.scope.ComptimeCtx, a: *mach.front.ast.Ast, dec: *mach.front.ast.decl.Decorator, ord: u32) mach.base.intern.StrId
 ```
 
 the string argument `ord` of `dec` evaluated to in the scope `c`; STR_NIL when it is not a constant string
@@ -362,7 +362,7 @@ the string argument `ord` of `dec` evaluated to in the scope `c`; STR_NIL when i
 ### string_of
 
 ```mach
-pub fun string_of(itn: *intern.Interner, c: *comptime_scope.ComptimeCtx, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) opt[str]
+pub fun string_of(itn: *mach.base.intern.Interner, c: *mach.front.comptime.scope.ComptimeCtx, a: *mach.front.ast.Ast, dec: *mach.front.ast.decl.Decorator, ord: u32) opt[str]
 ```
 
 the text of `string_id`
@@ -370,8 +370,8 @@ the text of `string_id`
 ### strings_record
 
 ```mach
-pub fun strings_record[T](itn: *intern.Interner, into: *comptime_scope.ComptimeCtx, a: *ast.Ast, source: str,
-    c: *comptime_scope.ComptimeCtx, cap_ctx: *T, caps: comptime_capability.PhaseCapabilities[T], reached: *bool) err[fail.Fail]
+pub fun strings_record[T](itn: *mach.base.intern.Interner, into: *mach.front.comptime.scope.ComptimeCtx, a: *mach.front.ast.Ast, source: str,
+    c: *mach.front.comptime.scope.ComptimeCtx, cap_ctx: *T, caps: mach.front.comptime.capability.PhaseCapabilities[T], reached: *bool) err[mach.base.fail.Fail]
 ```
 
 records into `into` the string every string argument of a module's decorators evaluates to, with

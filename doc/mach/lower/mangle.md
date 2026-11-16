@@ -9,9 +9,9 @@ declares a link name for it. an instance appends each type argument or comptime 
 `$`, so its symbol is a function of its identity alone, and a test is
 `<module path>#<identifier>`. the root module's path is spelled `main`.
 
-<sub>source: [`src/lower/mangle.mach`](../../../src/lower/mangle.mach) · imported by 5 modules</sub>
+Source: [`src/lower/mangle.mach`](../../../src/lower/mangle.mach)
 
-<sub>`session` is [`mach.session`](../session.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `linkage` is [`mach.lower.linkage`](linkage.md) · `module` is [`mach.session.module`](../session/module.md) · `sema_instance` is [`mach.front.sema.instance`](../front/sema/instance.md) · `type_kind` is [`mach.type.kind`](../type/kind.md) · `comptime_value` is [`mach.front.comptime.value`](../front/comptime/value.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.front.comptime.value`](../front/comptime/value.md), [`mach.front.sema.instance`](../front/sema/instance.md), [`mach.lower.linkage`](linkage.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.type.kind`](../type/kind.md).
 
 | Functions | |
 | :--- | :--- |
@@ -19,7 +19,7 @@ declares a link name for it. an instance appends each type argument or comptime 
 | [`declaration_linkage_name`](#declaration_linkage_name) | the linkage name of the declaration `decl` of module `mid`, whose canonical name is `canon`, exported under the name `l` declares for it, made once and kept in `l` |
 | [`test_name`](#test_name) | a test's qualified name and symbol, `<module path>#<identifier>`: `#` is in no identifier or module path, so it names no other symbol |
 | [`instance_link_name`](#instance_link_name) | the symbol the instance `item` is defined and referenced under, a function of its identity alone |
-| [`instance_name`](#instance_name) · [`value_instance_name`](#value_instance_name) · [`pack_instance_name`](#pack_instance_name) | |
+| [`instance_name`](#instance_name), [`value_instance_name`](#value_instance_name), [`pack_instance_name`](#pack_instance_name) | |
 
 ---
 
@@ -29,16 +29,16 @@ declares a link name for it. an instance appends each type argument or comptime 
 
 ```mach
 pub fun linkage_name(
-    s: *session.Session,
-    fqn: intern.StrId,
-    bare: intern.StrId,
-    export: intern.StrId) res[intern.StrId, fail.Fail]
+    s: *mach.session.Session,
+    fqn: mach.base.intern.StrId,
+    bare: mach.base.intern.StrId,
+    export: mach.base.intern.StrId) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
 ### declaration_linkage_name
 
 ```mach
-pub fun declaration_linkage_name(l: *linkage.Linkage, s: *session.Session, mid: module.ModuleId, canon: intern.StrId, decl: u32) res[intern.StrId, fail.Fail]
+pub fun declaration_linkage_name(l: *mach.lower.linkage.Linkage, s: *mach.session.Session, mid: mach.session.module.ModuleId, canon: mach.base.intern.StrId, decl: u32) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
 the linkage name of the declaration `decl` of module `mid`, whose canonical name is `canon`,
@@ -47,7 +47,7 @@ exported under the name `l` declares for it, made once and kept in `l`
 ### test_name
 
 ```mach
-pub fun test_name(s: *session.Session, fqn: intern.StrId, ident: intern.StrId) res[intern.StrId, fail.Fail]
+pub fun test_name(s: *mach.session.Session, fqn: mach.base.intern.StrId, ident: mach.base.intern.StrId) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
 a test's qualified name and symbol, `<module path>#<identifier>`: `#` is in no
@@ -56,7 +56,7 @@ identifier or module path, so it names no other symbol
 ### instance_link_name
 
 ```mach
-pub fun instance_link_name(s: *session.Session, item: *sema_instance.Instance) res[intern.StrId, fail.Fail]
+pub fun instance_link_name(s: *mach.session.Session, item: *mach.front.sema.instance.Instance) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
 the symbol the instance `item` is defined and referenced under, a function of its identity alone
@@ -65,34 +65,34 @@ the symbol the instance `item` is defined and referenced under, a function of it
 
 ```mach
 pub fun instance_name(
-    s: *session.Session,
-    fqn: intern.StrId,
-    bare: intern.StrId,
-    args: *type_kind.TypeId,
-    arg_count: u32) res[intern.StrId, fail.Fail]
+    s: *mach.session.Session,
+    fqn: mach.base.intern.StrId,
+    bare: mach.base.intern.StrId,
+    args: *mach.type.kind.TypeId,
+    arg_count: u32) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
 ### value_instance_name
 
 ```mach
 pub fun value_instance_name(
-    s: *session.Session,
-    fqn: intern.StrId,
-    bare: intern.StrId,
-    vals: *comptime_value.CTValue,
-    val_len: u32) res[intern.StrId, fail.Fail]
+    s: *mach.session.Session,
+    fqn: mach.base.intern.StrId,
+    bare: mach.base.intern.StrId,
+    vals: *mach.front.comptime.value.CTValue,
+    val_len: u32) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
 ### pack_instance_name
 
 ```mach
 pub fun pack_instance_name(
-    s: *session.Session,
-    fqn: intern.StrId,
-    bare: intern.StrId,
-    args: *type_kind.TypeId,
+    s: *mach.session.Session,
+    fqn: mach.base.intern.StrId,
+    bare: mach.base.intern.StrId,
+    args: *mach.type.kind.TypeId,
     arg_len: u32,
-    types: *type_kind.TypeId,
-    type_len: u32) res[intern.StrId, fail.Fail]
+    types: *mach.type.kind.TypeId,
+    type_len: u32) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 

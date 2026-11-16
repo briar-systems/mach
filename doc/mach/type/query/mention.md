@@ -4,9 +4,9 @@
 
 which type parameters a type mentions, and the declaration that owns them
 
-<sub>source: [`src/type/query/mention.mach`](../../../../src/type/query/mention.mach) · imported by 6 modules</sub>
+Source: [`src/type/query/mention.mach`](../../../../src/type/query/mention.mach)
 
-<sub>`type_query` is [`mach.type.query`](../query.md) · `type_kind` is [`mach.type.kind`](../kind.md) · `type` is [`mach.type`](../../type.md)</sub>
+Uses types from [`mach.type`](../../type.md), [`mach.type.kind`](../kind.md), [`mach.type.query`](../query.md).
 
 | Functions | |
 | :--- | :--- |
@@ -21,7 +21,7 @@ which type parameters a type mentions, and the declaration that owns them
 ### mentioned
 
 ```mach
-pub fun mentioned(q: *type_query.Query, tid: type_kind.TypeId) bool
+pub fun mentioned(q: *mach.type.query.Query, tid: mach.type.kind.TypeId) bool
 ```
 
 whether `tid` mentions a type parameter anywhere it is spelled
@@ -29,7 +29,7 @@ whether `tid` mentions a type parameter anywhere it is spelled
 ### owner
 
 ```mach
-pub fun owner(q: *type_query.Query, tid: type_kind.TypeId) opt[type.GenericOwner]
+pub fun owner(q: *mach.type.query.Query, tid: mach.type.kind.TypeId) opt[mach.type.GenericOwner]
 ```
 
 the declaration whose parameters a nominal's fields mention: the nominal itself for a
@@ -39,7 +39,7 @@ none when the fields mention no parameter
 ### has_param
 
 ```mach
-pub fun has_param(q: *type_query.Query, tid: type_kind.TypeId) bool
+pub fun has_param(q: *mach.type.query.Query, tid: mach.type.kind.TypeId) bool
 ```
 
 whether a nominal's fields mention a type parameter, which a nominal with no field

@@ -4,9 +4,9 @@
 
 the exit codes of `mach`, and the code each kind of failure maps to
 
-<sub>source: [`src/cli/exit.mach`](../../../src/cli/exit.mach) · imported by 12 modules</sub>
+Source: [`src/cli/exit.mach`](../../../src/cli/exit.mach)
 
-<sub>`fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md).
 
 | Functions | |
 | :--- | :--- |
@@ -28,7 +28,7 @@ the exit codes of `mach`, and the code each kind of failure maps to
 ### of
 
 ```mach
-pub fun of(f: fail.Fail) i64
+pub fun of(f: mach.base.fail.Fail) i64
 ```
 
 the exit code a failure maps to

@@ -9,9 +9,9 @@ instructions, members and tag payloads, a guarded payload checked by a trap in t
 profile, vector ranges, comptime intrinsics, the elements of a `$each`, and the constant a
 global's initializer folds to.
 
-<sub>source: [`src/lower/expr.mach`](../../../src/lower/expr.mach) · imported by 2 modules</sub>
+Source: [`src/lower/expr.mach`](../../../src/lower/expr.mach)
 
-<sub>`lower_context` is [`mach.lower.context`](context.md) · `ast_id` is [`mach.front.ast.id`](../front/ast/id.md) · `value` is [`mach.lower.value`](value.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `ast_expr` is [`mach.front.ast.expr`](../front/ast/expr.md) · `base_source` is [`mach.base.source`](../base/source.md) · `id` is `mirl.ir.id` · `type_kind` is [`mach.type.kind`](../type/kind.md) · `comptime_value` is [`mach.front.comptime.value`](../front/comptime/value.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.front.ast.expr`](../front/ast/expr.md), [`mach.front.ast.id`](../front/ast/id.md), [`mach.front.comptime.value`](../front/comptime/value.md), [`mach.lower.context`](context.md), [`mach.lower.value`](value.md), [`mach.type.kind`](../type/kind.md).
 
 | Functions | |
 | :--- | :--- |
@@ -23,7 +23,7 @@ global's initializer folds to.
 | [`branch_on`](#branch_on) | branch to `then_b` where the condition `eid` holds, else to `else_b` |
 | [`condition_value`](#condition_value) | |
 | [`store_stated`](#store_stated) | write `v` to `ptr`, a place of source type `ty`, stating the memory it writes as secret or public as `ty` is |
-| [`const_value_of_init`](#const_value_of_init) · [`type_is_volatile_record`](#type_is_volatile_record) | |
+| [`const_value_of_init`](#const_value_of_init), [`type_is_volatile_record`](#type_is_volatile_record) | |
 
 ---
 
@@ -32,13 +32,13 @@ global's initializer folds to.
 ### lower_rvalue
 
 ```mach
-pub fun lower_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[value.Value, fail.Fail]
+pub fun lower_rvalue(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
 ### symbol_linkage_name
 
 ```mach
-pub fun symbol_linkage_name(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[intern.StrId, fail.Fail]
+pub fun symbol_linkage_name(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
 the linkage name of the module-level binding `eid` names, nil when it names a binding with
@@ -47,13 +47,13 @@ none
 ### try_lower_comptime_intrinsic
 
 ```mach
-pub fun try_lower_comptime_intrinsic(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) opt[res[value.Value, fail.Fail]]
+pub fun try_lower_comptime_intrinsic(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId, e: *mach.front.ast.expr.Expr) opt[res[mach.lower.value.Value, mach.base.fail.Fail]]
 ```
 
 ### expr_span_of
 
 ```mach
-pub fun expr_span_of(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) base_source.Span
+pub fun expr_span_of(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId) mach.base.source.Span
 ```
 
 where expression `eid` is written; an expression its syntax lacks records an internal failure
@@ -62,7 +62,7 @@ and has the empty span
 ### lower_stored_rvalue
 
 ```mach
-pub fun lower_stored_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, in_place: bool, borrowed: *bool) res[value.Value, fail.Fail]
+pub fun lower_stored_rvalue(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId, in_place: bool, borrowed: *bool) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
 the value a store consumes. when `in_place` holds, nothing writes memory between this read
@@ -72,7 +72,7 @@ the aggregate copy is overlap-safe, so no snapshot sits between them
 ### branch_on
 
 ```mach
-pub fun branch_on(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, then_b: id.Block, else_b: id.Block) err[fail.Fail]
+pub fun branch_on(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId, then_b: mirl.ir.id.Block, else_b: mirl.ir.id.Block) err[mach.base.fail.Fail]
 ```
 
 branch to `then_b` where the condition `eid` holds, else to `else_b`. a logical and, or and
@@ -82,13 +82,13 @@ its right operand runs only where the left does not decide
 ### condition_value
 
 ```mach
-pub fun condition_value(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: value.Value) res[value.Value, fail.Fail]
+pub fun condition_value(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId, v: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
 ### store_stated
 
 ```mach
-pub fun store_stated(ctx: *lower_context.LowerContext, v: value.Value, ptr: value.Value, ty: type_kind.TypeId, vol: bool) err[fail.Fail]
+pub fun store_stated(ctx: *mach.lower.context.LowerContext, v: mach.lower.value.Value, ptr: mach.lower.value.Value, ty: mach.type.kind.TypeId, vol: bool) err[mach.base.fail.Fail]
 ```
 
 write `v` to `ptr`, a place of source type `ty`, stating the memory it writes as secret or public as `ty` is
@@ -96,12 +96,12 @@ write `v` to `ptr`, a place of source type `ty`, stating the memory it writes as
 ### const_value_of_init
 
 ```mach
-pub fun const_value_of_init(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: comptime_value.CTValue) res[value.Value, fail.Fail]
+pub fun const_value_of_init(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId, v: mach.front.comptime.value.CTValue) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
 ### type_is_volatile_record
 
 ```mach
-pub fun type_is_volatile_record(ctx: *lower_context.LowerContext, sem_ty: type_kind.TypeId) bool
+pub fun type_is_volatile_record(ctx: *mach.lower.context.LowerContext, sem_ty: mach.type.kind.TypeId) bool
 ```
 

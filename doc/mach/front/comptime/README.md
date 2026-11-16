@@ -5,7 +5,7 @@
 the comptime evaluator: an expression's value under the capabilities of the phase that
 asks, over the scope it runs in
 
-<sub>[`mach.front.comptime`](../comptime.md) · 9 modules · imports [`base`](../../base/README.md), [`target`](../../target/README.md), [`type`](../../type/README.md) · imported by [`compile`](../../compile/README.md), [`lower`](../../lower/README.md), [`tool`](../../tool/README.md)</sub>
+The directory's root module is [`mach.front.comptime`](../comptime.md).
 
 | Module | |
 | :--- | :--- |

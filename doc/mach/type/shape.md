@@ -12,9 +12,9 @@ type a structure of its bytes at its alignment. what reaching a member type mean
 substitution, a memo, a cycle on the path, and how a tag's cases are placed, is the
 caller's, through `Reach`
 
-<sub>source: [`src/type/shape.mach`](../../../src/type/shape.mach) · imported by 7 modules</sub>
+Source: [`src/type/shape.mach`](../../../src/type/shape.mach)
 
-<sub>`types` is `mirl.ir.type.table` · `A` is `std.allocator` · `type_prim` is [`mach.type.prim`](prim.md) · `type_kind` is [`mach.type.kind`](kind.md) · `type` is [`mach.type`](../type.md) · `types_format` is `mirl.ir.type.format`</sub>
+Uses types from [`mach.type`](../type.md), [`mach.type.kind`](kind.md), [`mach.type.prim`](prim.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -44,7 +44,7 @@ caller's, through `Reach`
 | Constants | |
 | :--- | :--- |
 | [`TAG_DISCRIMINANT`](#constants) | the member of a tag's structure that holds its discriminator |
-| [`TAG_AREA`](#constants) · [`NO_AREA`](#constants) | |
+| [`TAG_AREA`](#constants), [`NO_AREA`](#constants) | |
 
 ---
 
@@ -56,8 +56,8 @@ pub tag Unshaped: u8 {
     unknown;
     empty_tag;
     discriminator;
-    table: types.Error;
-    alloc: A.Error;
+    table: mirl.ir.type.table.Error;
+    alloc: std.allocator.Error;
     placement;
 }
 ```
@@ -70,14 +70,14 @@ why a source type has no shape
 | `unknown` |  | a kind that has no shape: a type parameter, a pack, an unresolved nominal |
 | `empty_tag` |  | a tag with no cases |
 | `discriminator` |  | a tag with no discriminator type |
-| `table` | `types.Error` | mirl's type table refused a type |
-| `alloc` | `A.Error` | no storage for a member list |
+| `table` | `mirl.ir.type.table.Error` | mirl's type table refused a type |
+| `alloc` | `std.allocator.Error` | no storage for a member list |
 | `placement` |  | placing a tag's cases was refused, the caller's reason held by its context |
 
 ### integer
 
 ```mach
-pub fun integer(t: *types.Table, bits: u32) res[Type, Unshaped]
+pub fun integer(t: *mirl.ir.type.table.Table, bits: u32) res[Type, Unshaped]
 ```
 
 a signless integer of `bits`, rounded up to a width mirl holds
@@ -85,7 +85,7 @@ a signless integer of `bits`, rounded up to a width mirl holds
 ### scalar
 
 ```mach
-pub fun scalar(t: *types.Table, d: type_prim.PrimDesc) res[Type, Unshaped]
+pub fun scalar(t: *mirl.ir.type.table.Table, d: mach.type.prim.PrimDesc) res[Type, Unshaped]
 ```
 
 an integer or float primitive
@@ -93,7 +93,7 @@ an integer or float primitive
 ### opaque
 
 ```mach
-pub fun opaque(t: *types.Table, size: u32, align: u32) res[Type, Unshaped]
+pub fun opaque(t: *mirl.ir.type.table.Table, size: u32, align: u32) res[Type, Unshaped]
 ```
 
 an opaque type of `size` bytes at the alignment `align`
@@ -103,9 +103,9 @@ an opaque type of `size` bytes at the alignment `align`
 ```mach
 pub rec Reach[T] {
     ctx:     *T;
-    member:  fun(*T, type_kind.TypeId) opt[Type];
-    handle:  fun(*T, *type.Type) opt[Type];
-    place:   fun(*T, type_kind.TypeId) opt[Placement];
+    member:  fun(*T, mach.type.kind.TypeId) opt[Type];
+    handle:  fun(*T, *mach.type.Type) opt[Type];
+    place:   fun(*T, mach.type.kind.TypeId) opt[Placement];
     pointer: Type;
 }
 ```
@@ -115,15 +115,15 @@ how a caller reaches what the shape of a type is made of
 | Field | Type | |
 | :--- | :--- | :--- |
 | `ctx` | `*T` | the caller's context |
-| `member` | `fun(*T, type_kind.TypeId) opt[Type]` | the type of a member, element or payload, interned in the same table, none when the caller refuses it with a reason it holds |
-| `handle` | `fun(*T, *type.Type) opt[Type]` | the type of a target handle |
-| `place` | `fun(*T, type_kind.TypeId) opt[Placement]` | the placement of a tag's cases, none when the caller refuses it with a reason it holds |
+| `member` | `fun(*T, mach.type.kind.TypeId) opt[Type]` | the type of a member, element or payload, interned in the same table, none when the caller refuses it with a reason it holds |
+| `handle` | `fun(*T, *mach.type.Type) opt[Type]` | the type of a target handle |
+| `place` | `fun(*T, mach.type.kind.TypeId) opt[Placement]` | the placement of a tag's cases, none when the caller refuses it with a reason it holds |
 | `pointer` | `Type` | the type a pointer is held in |
 
 ### of
 
 ```mach
-pub fun of[T](t: *types.Table, ti: *type.TypeInterner, tid: type_kind.TypeId, r: *Reach[T]) res[Type, Unshaped]
+pub fun of[T](t: *mirl.ir.type.table.Table, ti: *mach.type.TypeInterner, tid: mach.type.kind.TypeId, r: *Reach[T]) res[Type, Unshaped]
 ```
 
 the shape of the source type `tid`, its secrecy and its substitution already the caller's.
@@ -175,7 +175,7 @@ where case `i` holds its payload, none for a case with no payload
 ### format
 
 ```mach
-pub fun format(bits: u32) opt[types_format.Format]
+pub fun format(bits: u32) opt[mirl.ir.type.format.Format]
 ```
 
 the format of a float of `bits`, none for a width mirl has no format for

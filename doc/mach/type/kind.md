@@ -8,7 +8,7 @@ a `TypeId` is a type's index in the type table, with two reserved values for no 
 error type. a new kind is appended after the last, the catalog of `mach.type.prim` decides
 which kinds are primitive, and `TYPE_KIND_COUNT` bounds them.
 
-<sub>source: [`src/type/kind.mach`](../../../src/type/kind.mach) · imported by 57 modules</sub>
+Source: [`src/type/kind.mach`](../../../src/type/kind.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -17,16 +17,16 @@ which kinds are primitive, and `TYPE_KIND_COUNT` bounds them.
 
 | On `TypeId` | |
 | :--- | :--- |
-| [`TYPE_NIL`](#typeid) · [`TYPE_ERROR`](#typeid) · [`id`](#id) · [`index`](#index) · [`same`](#same) · [`is_nil`](#is_nil) · [`is_error`](#is_error) | |
+| [`TYPE_NIL`](#typeid), [`TYPE_ERROR`](#typeid), [`id`](#id), [`index`](#index), [`same`](#same), [`is_nil`](#is_nil), [`is_error`](#is_error) | |
 
 | On `TypeKind` | |
 | :--- | :--- |
-| [`TYPE_U8`](#typekind) · [`TYPE_U16`](#typekind) · [`TYPE_U32`](#typekind) · [`TYPE_U64`](#typekind) · [`TYPE_I8`](#typekind) · [`TYPE_I16`](#typekind) · [`TYPE_I32`](#typekind) · [`TYPE_I64`](#typekind) · [`TYPE_F32`](#typekind) · [`TYPE_F64`](#typekind) · [`TYPE_PTR`](#typekind) · [`TYPE_POINTER`](#typekind) · [`TYPE_ARRAY`](#typekind) · [`TYPE_FUN`](#typekind) · [`TYPE_REC`](#typekind) · [`TYPE_UNI`](#typekind) · [`TYPE_GENERIC_PARAM`](#typekind) · [`TYPE_INSTANCE`](#typekind) · [`TYPE_PACK`](#typekind) · [`TYPE_SECRET`](#typekind) · [`TYPE_VECTOR`](#typekind) · [`TYPE_HANDLE`](#typekind) · [`TYPE_ABI`](#typekind) · [`TYPE_TAG`](#typekind) · [`TYPE_CASE_SELECTOR`](#typekind) | |
+| [`TYPE_U8`](#typekind), [`TYPE_U16`](#typekind), [`TYPE_U32`](#typekind), [`TYPE_U64`](#typekind), [`TYPE_I8`](#typekind), [`TYPE_I16`](#typekind), [`TYPE_I32`](#typekind), [`TYPE_I64`](#typekind), [`TYPE_F32`](#typekind), [`TYPE_F64`](#typekind), [`TYPE_PTR`](#typekind), [`TYPE_POINTER`](#typekind), [`TYPE_ARRAY`](#typekind), [`TYPE_FUN`](#typekind), [`TYPE_REC`](#typekind), [`TYPE_UNI`](#typekind), [`TYPE_GENERIC_PARAM`](#typekind), [`TYPE_INSTANCE`](#typekind), [`TYPE_PACK`](#typekind), [`TYPE_SECRET`](#typekind), [`TYPE_VECTOR`](#typekind), [`TYPE_HANDLE`](#typekind), [`TYPE_ABI`](#typekind), [`TYPE_TAG`](#typekind), [`TYPE_CASE_SELECTOR`](#typekind) | |
 | [`TYPE_U128`](#typekind) | the 128-bit integers are appended kinds: the catalog, never the numbering, decides what is primitive |
 | [`TYPE_I128`](#typekind) | |
 | [`TYPE_F16`](#typekind) | IEEE binary16, appended like the 128-bit integers |
 | [`TYPE_U256`](#typekind) | the 256 and 512-bit integers, appended like the 128-bit integers |
-| [`TYPE_I256`](#typekind) · [`TYPE_U512`](#typekind) · [`TYPE_I512`](#typekind) · [`TYPE_U1`](#typekind) | |
+| [`TYPE_I256`](#typekind), [`TYPE_U512`](#typekind), [`TYPE_I512`](#typekind), [`TYPE_U1`](#typekind) | |
 
 | Constants | |
 | :--- | :--- |

@@ -5,9 +5,9 @@
 typing one module: its declarations and bodies, the instances they ask for, and the result it
 publishes; and typing one instance on its own (instance_sema)
 
-<sub>source: [`src/front/sema/module.mach`](../../../../src/front/sema/module.mach) · imported by 3 modules</sub>
+Source: [`src/front/sema/module.mach`](../../../../src/front/sema/module.mach)
 
-<sub>`session` is [`mach.session`](../../session.md) · `ast` is [`mach.front.ast`](../ast.md) · `resolve` is [`mach.front.resolve`](../resolve.md) · `sema_product` is [`mach.front.sema.product`](product.md) · `comptime_scope` is [`mach.front.comptime.scope`](../comptime/scope.md) · `module` is [`mach.session.module`](../../session/module.md) · `diagnostic` is [`mach.base.diagnostic`](../../base/diagnostic.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `sema_instance` is [`mach.front.sema.instance`](instance.md)</sub>
+Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.fail`](../../base/fail.md), [`mach.front.ast`](../ast.md), [`mach.front.comptime.scope`](../comptime/scope.md), [`mach.front.resolve`](../resolve.md), [`mach.front.sema.instance`](instance.md), [`mach.front.sema.product`](product.md), [`mach.session`](../../session.md), [`mach.session.module`](../../session/module.md).
 
 | Functions | |
 | :--- | :--- |
@@ -22,13 +22,13 @@ publishes; and typing one instance on its own (instance_sema)
 
 ```mach
 pub fun sema(
-    s: *session.Session,
-    a: *ast.Ast,
-    rr: *resolve.ResolveResult,
-    deps: *sema_product.SemaDeps,
-    load: *comptime_scope.ComptimeCtx,
-    own_module: module.ModuleId,
-    diags: *diagnostic.DiagnosticStore) res[sema_product.SemaResult, fail.Fail]
+    s: *mach.session.Session,
+    a: *mach.front.ast.Ast,
+    rr: *mach.front.resolve.ResolveResult,
+    deps: *mach.front.sema.product.SemaDeps,
+    load: *mach.front.comptime.scope.ComptimeCtx,
+    own_module: mach.session.module.ModuleId,
+    diags: *mach.base.diagnostic.DiagnosticStore) res[mach.front.sema.product.SemaResult, mach.base.fail.Fail]
 ```
 
 type a module in a scope over the load's, `load`, and resolve's bindings in `rr`, which sema
@@ -37,7 +37,7 @@ reads and never writes; what sema binds is its result's
 ### instance_sema
 
 ```mach
-pub fun instance_sema(s: *session.Session, item: *sema_instance.Instance, deps: *sema_product.SemaDeps) res[sema_product.InstanceResult, fail.Fail]
+pub fun instance_sema(s: *mach.session.Session, item: *mach.front.sema.instance.Instance, deps: *mach.front.sema.product.SemaDeps) res[mach.front.sema.product.InstanceResult, mach.base.fail.Fail]
 ```
 
 types the instance `item` on its own: a generic under its type arguments, a function with

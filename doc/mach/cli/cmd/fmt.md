@@ -8,9 +8,9 @@ the operand is a project, one source file formatted with no manifest read, or `-
 standard input. under `--check` nothing is written and a source that is not canonical
 fails the command.
 
-<sub>source: [`src/cli/cmd/fmt.mach`](../../../../src/cli/cmd/fmt.mach) · imported by 1 module</sub>
+Source: [`src/cli/cmd/fmt.mach`](../../../../src/cli/cmd/fmt.mach)
 
-<sub>`A` is `std.allocator` · `fail` is [`mach.base.fail`](../../base/fail.md) · `args` is [`mach.cli.args`](../args.md) · `std_args` is `std.args`</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.cli.args`](../args.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -48,7 +48,7 @@ how the operand names its input
 ### classify
 
 ```mach
-pub fun classify(a: *A.Allocator, operand: str) res[Operand, fail.Fail]
+pub fun classify(a: *std.allocator.Allocator, operand: str) res[Operand, mach.base.fail.Fail]
 ```
 
 which form the operand takes. `-` is the stream; a directory, or a file named
@@ -59,7 +59,7 @@ mach.toml, is a project; any other existing file is a single source
 ### run
 
 ```mach
-pub fun run(cx: *args.Call) res[i64, fail.Fail]
+pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 ```
 
 `mach fmt <path>|<file>|- [--check]`
@@ -73,6 +73,6 @@ pub fun run(cx: *args.Call) res[i64, fail.Fail]
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COMMAND` | `std_args.Command` | `std_args.Command{name: "fmt", aliases: args.NO_WORDS, help: "format source in the canonical layout", usage: "<path>\|<file>\|-", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach fmt` |
-| `POLICY` | `args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach fmt` to beyond the parse |
+| `COMMAND` | `std.args.Command` | `std_args.Command{name: "fmt", aliases: args.NO_WORDS, help: "format source in the canonical layout", usage: "<path>\|<file>\|-", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach fmt` |
+| `POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach fmt` to beyond the parse |
 

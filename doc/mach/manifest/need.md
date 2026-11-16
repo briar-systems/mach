@@ -8,9 +8,9 @@ need whose name the entry selects. one walker follows the edges: it refuses a
 cycle wherever it meets one, and orders what it visits after what each needs,
 for validation and planning alike
 
-<sub>source: [`src/manifest/need.mach`](../../../src/manifest/need.mach) · imported by 4 modules</sub>
+Source: [`src/manifest/need.mach`](../../../src/manifest/need.mach)
 
-<sub>`Category` is private · `A` is `std.allocator` · `intern` is [`mach.base.intern`](../base/intern.md) · `Edge` is private · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -23,7 +23,7 @@ for validation and planning alike
 
 | On `Walk` | |
 | :--- | :--- |
-| [`walk_init`](#walk_init) · [`walk_dnit`](#walk_dnit) | |
+| [`walk_init`](#walk_init), [`walk_dnit`](#walk_dnit) | |
 | [`visit`](#visit) | visit `n` and every declaration its `need` reaches, adding each to `order` after what it needs; reaching a declaration again while its own visit is open is a cycle, refused at the first edge of the cycle with the others related |
 
 | Functions | |
@@ -61,8 +61,8 @@ pub fun step_node(index: u32) Node
 
 ```mach
 pub rec Walk {
-    alloc: *A.Allocator;
-    itn:   *intern.Interner;
+    alloc: *std.allocator.Allocator;
+    itn:   *mach.base.intern.Interner;
     m:     *Manifest;
     state: *u8;
     trail: *Edge;
@@ -84,7 +84,7 @@ a walk of the need graph of one manifest
 ### walk_init
 
 ```mach
-pub fun walk_init(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) res[Walk, fail.Fail]
+pub fun walk_init(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest) res[Walk, mach.base.fail.Fail]
 ```
 
 ### walk_dnit
@@ -96,7 +96,7 @@ pub fun walk_dnit(w: *Walk)
 ### visit
 
 ```mach
-pub fun visit(w: *Walk, n: Node) err[fail.Fail]
+pub fun visit(w: *Walk, n: Node) err[mach.base.fail.Fail]
 ```
 
 visit `n` and every declaration its `need` reaches, adding each to `order`
@@ -124,7 +124,7 @@ whether `pat` matches all of `name`, `*` matching any run of bytes and `?` any o
 ### selects
 
 ```mach
-pub fun selects(itn: *intern.Interner, entry: intern.StrId, c: Category, name: intern.StrId) bool
+pub fun selects(itn: *mach.base.intern.Interner, entry: mach.base.intern.StrId, c: Category, name: mach.base.intern.StrId) bool
 ```
 
 whether the `need` entry `entry` selects the declaration of category `c` named `name`
@@ -132,7 +132,7 @@ whether the `need` entry `entry` selects the declaration of category `c` named `
 ### validate
 
 ```mach
-pub fun validate(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[fail.Fail]
+pub fun validate(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest) err[mach.base.fail.Fail]
 ```
 
 the rules every `need` entry holds to: it selects a category its declaration

@@ -10,9 +10,7 @@ row is keyed by mink's system and states a value only where mach requires
 one. a target whose manifest states the key keeps its own value, and a
 system no row names states none, so mink writes its format's default
 
-<sub>source: [`src/target/defaults.mach`](../../../src/target/defaults.mach) · imported by 1 module</sub>
-
-<sub>`mink_os` is `mink.catalog.os`</sub>
+Source: [`src/target/defaults.mach`](../../../src/target/defaults.mach)
 
 | Functions | |
 | :--- | :--- |
@@ -25,7 +23,7 @@ system no row names states none, so mink writes its format's default
 ### stack_reserve
 
 ```mach
-pub fun stack_reserve(sys: *mink_os.System) opt[u64]
+pub fun stack_reserve(sys: *mink.catalog.os.System) opt[u64]
 ```
 
 the main stack reserve mach states for an image of `sys`, none where it states none

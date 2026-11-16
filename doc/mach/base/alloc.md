@@ -7,9 +7,7 @@ something the compiler recovers from at the site that met it; it is reported
 through the failure type (fail.refused) and the build stops. the text is
 presentation only and no site branches on it.
 
-<sub>source: [`src/base/alloc.mach`](../../../src/base/alloc.mach) · imported by 16 modules</sub>
-
-<sub>`A` is `std.allocator`</sub>
+Source: [`src/base/alloc.mach`](../../../src/base/alloc.mach)
 
 | Functions | |
 | :--- | :--- |
@@ -22,7 +20,7 @@ presentation only and no site branches on it.
 ### text
 
 ```mach
-pub fun text(e: A.Error) str
+pub fun text(e: std.allocator.Error) str
 ```
 
 the refusal as text: `exhausted` is the message the compiler has always

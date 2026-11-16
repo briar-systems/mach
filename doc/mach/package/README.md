@@ -2,7 +2,7 @@
 
 # mach.package
 
-package: the dependency manager behind `mach dep` and `mach init`. it reads a project's
+the dependency manager behind `mach dep` and `mach init`. it reads a project's
 dependency closure from its manifests, resolves version ranges against the releases a
 source publishes, realizes every dependency flat under dep/ and records its pin, and
 checks a realized closure against all of it. a build never reaches it: the driver only
@@ -19,7 +19,7 @@ git, under package/git, is the member of the first two and the one outside tool 
 runs; path.mach realizes a dependency declared by a local path. this module holds what
 every part shares: the slot layout under dep/ and the identity rule
 
-<sub>[`mach.package`](../package.md) · 18 modules · imports [`base`](../base/README.md), [`compile`](../compile/README.md), [`host`](../host/README.md), [`manifest`](../manifest/README.md), [`session`](../session/README.md) · imported by [`cli`](../cli/README.md)</sub>
+The directory's root module is [`mach.package`](../package.md).
 
 | Module | |
 | :--- | :--- |
@@ -37,7 +37,7 @@ every part shares: the slot layout under dep/ and the identity rule
 | [`source`](source.md) | the source contract: where a dependency named by a url comes from |
 | [`verify`](verify.md) | verify: `mach dep verify`, which checks a realized closure without changing it |
 
-| Directory | Modules | |
-| :--- | ---: | :--- |
-| [`git/`](git/README.md) | 5 | git: the one outside tool mach runs |
+| Directory | |
+| :--- | :--- |
+| [`git/`](git/README.md) | git: the one outside tool mach runs |
 

@@ -10,9 +10,9 @@ qualifiers to the global, each the number spir-v gives it, read from masc's gram
 its spir-v name. only a target whose family's schema is spir-v's takes them, so a machine
 target compiles a staged function as any other
 
-<sub>source: [`src/lower/shader.mach`](../../../src/lower/shader.mach) · imported by 2 modules</sub>
+Source: [`src/lower/shader.mach`](../../../src/lower/shader.mach)
 
-<sub>`comptime_value` is [`mach.front.comptime.value`](../front/comptime/value.md) · `lower_context` is [`mach.lower.context`](context.md) · `resolve` is [`mach.front.resolve`](../front/resolve.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `ast_decl` is [`mach.front.ast.decl`](../front/ast/decl.md) · `intern` is [`mach.base.intern`](../base/intern.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.front.ast.decl`](../front/ast/decl.md), [`mach.front.comptime.value`](../front/comptime/value.md), [`mach.front.resolve`](../front/resolve.md), [`mach.lower.context`](context.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -38,7 +38,7 @@ target compiles a staged function as any other
 ```mach
 pub rec SpecVar {
     id:      u32;
-    default: comptime_value.CTValue;
+    default: mach.front.comptime.value.CTValue;
 }
 ```
 
@@ -48,7 +48,7 @@ default its initializer gives
 ### spec_var
 
 ```mach
-pub fun spec_var(lc: *lower_context.LowerContext, sym: *resolve.Symbol) res[opt[SpecVar], fail.Fail]
+pub fun spec_var(lc: *mach.lower.context.LowerContext, sym: *mach.front.resolve.Symbol) res[opt[SpecVar], mach.base.fail.Fail]
 ```
 
 the `#[gpu.spec]` var `sym` names on a target that states specialization constants, read in
@@ -59,7 +59,7 @@ the scope it is written in, none for any other binding or target
 ### attaching
 
 ```mach
-pub fun attaching(lc: *lower_context.LowerContext) bool
+pub fun attaching(lc: *mach.lower.context.LowerContext) bool
 ```
 
 whether the target reads shader attributes
@@ -67,7 +67,7 @@ whether the target reads shader attributes
 ### initialized
 
 ```mach
-pub fun initialized(lc: *lower_context.LowerContext, d: *ast_decl.Decl) bool
+pub fun initialized(lc: *mach.lower.context.LowerContext, d: *mach.front.ast.decl.Decl) bool
 ```
 
 whether a global of the declaration `d` holds the initial value it is written with: the
@@ -76,7 +76,7 @@ host, the pipeline or the previous stage supplies an interface variable's
 ### specialized
 
 ```mach
-pub fun specialized(lc: *lower_context.LowerContext, d: *ast_decl.Decl) bool
+pub fun specialized(lc: *mach.lower.context.LowerContext, d: *mach.front.ast.decl.Decl) bool
 ```
 
 whether the declaration `d` is a `#[gpu.spec]` var on a target that states specialization
@@ -85,7 +85,7 @@ constants, which defines no global there: each read of it is the constant
 ### global_attributes
 
 ```mach
-pub fun global_attributes(lc: *lower_context.LowerContext, d: *ast_decl.Decl, gix: u32) err[fail.Fail]
+pub fun global_attributes(lc: *mach.lower.context.LowerContext, d: *mach.front.ast.decl.Decl, gix: u32) err[mach.base.fail.Fail]
 ```
 
 the attributes of global `gix` its declaration `d` states, read in the scope `d` is
@@ -94,7 +94,7 @@ written in. a global that already carries attributes keeps them
 ### extern_global_attributes
 
 ```mach
-pub fun extern_global_attributes(lc: *lower_context.LowerContext, sym: *resolve.Symbol, gix: u32) err[fail.Fail]
+pub fun extern_global_attributes(lc: *mach.lower.context.LowerContext, sym: *mach.front.resolve.Symbol, gix: u32) err[mach.base.fail.Fail]
 ```
 
 the attributes of the global `gix` declared here for another module's declaration of
@@ -103,7 +103,7 @@ the attributes of the global `gix` declared here for another module's declaratio
 ### function_attributes
 
 ```mach
-pub fun function_attributes(lc: *lower_context.LowerContext, d: *ast_decl.Decl, fix: u32, bare: intern.StrId) err[fail.Fail]
+pub fun function_attributes(lc: *mach.lower.context.LowerContext, d: *mach.front.ast.decl.Decl, fix: u32, bare: mach.base.intern.StrId) err[mach.base.fail.Fail]
 ```
 
 the entry point function `fix` is: its stage, the bare source name a pipeline finds it

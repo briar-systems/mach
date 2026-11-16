@@ -7,9 +7,9 @@ its syntax tree: the facts of each module-level function and binding, the deep v
 each module constant, and the public surface a `fwd` re-exports. it owns everything it
 holds and points into no syntax tree, scope or other product
 
-<sub>source: [`src/front/sema/interface.mach`](../../../../src/front/sema/interface.mach) · imported by 11 modules</sub>
+Source: [`src/front/sema/interface.mach`](../../../../src/front/sema/interface.mach)
 
-<sub>`resolve` is [`mach.front.resolve`](../resolve.md) · `intern` is [`mach.base.intern`](../../base/intern.md) · `ast_id` is [`mach.front.ast.id`](../ast/id.md) · `DeclarationFlags` is private · `session_module` is [`mach.session.module`](../../session/module.md) · `A` is `std.allocator` · `collections_vector` is `std.collections.vector` · `map` is `std.collections.map` · `comptime_deep` is [`mach.front.comptime.deep`](../comptime/deep.md) · `sema_template` is [`mach.front.sema.template`](template.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.comptime.deep`](../comptime/deep.md), [`mach.front.resolve`](../resolve.md), [`mach.front.sema.template`](template.md), [`mach.session.module`](../../session/module.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -26,14 +26,14 @@ holds and points into no syntax tree, scope or other product
 | [`declaration_add`](#declaration_add) | adds `d` with the parameters `params[0 .. params_len]`; a second declaration of one kind and canonical name leaves that name ambiguous, which a lookup by name refuses |
 | [`declaration_at`](#declaration_at) | the declaration `decl` of the module, none for one the interface does not describe |
 | [`declaration_for`](#declaration_for) | the one declaration of `kind` the module defines under `canon` |
-| [`param_at`](#param_at) · [`declaration_has_comptime_param`](#declaration_has_comptime_param) | |
+| [`param_at`](#param_at), [`declaration_has_comptime_param`](#declaration_has_comptime_param) | |
 | [`declaration_has_instances`](#declaration_has_instances) | a generic, comptime-parameter or pack function has instances in place of one definition |
 | [`template_of`](#template_of) | the template part, none for a module with no generic, comptime-parameter or pack function |
-| [`exported_add`](#exported_add) · [`exported_count`](#exported_count) · [`exported_at`](#exported_at) | |
+| [`exported_add`](#exported_add), [`exported_count`](#exported_count), [`exported_at`](#exported_at) | |
 
 | Constants | |
 | :--- | :--- |
-| [`NONE`](#constants) · [`DECLARATION_EXT`](#constants) · [`DECLARATION_BODY`](#constants) · [`DECLARATION_PACK`](#constants) | |
+| [`NONE`](#constants), [`DECLARATION_EXT`](#constants), [`DECLARATION_BODY`](#constants), [`DECLARATION_PACK`](#constants) | |
 | [`DECLARATION_THREAD`](#constants) | a `#[thread]` var: each thread holds its own copy, which every reference reaches through the thread |
 | [`DECLARATION_SOFT`](#constants) | a function declared `#[constant_time("soft")]` or `#[constant_time("hard")]`: what a constant-time caller may trust of it, from its declaration alone |
 | [`DECLARATION_HARD`](#constants) | |
@@ -45,15 +45,15 @@ holds and points into no syntax tree, scope or other product
 
 ```mach
 pub rec Declaration {
-    kind:         resolve.SymKind;
-    canon:        intern.StrId;
-    decl:         ast_id.DeclId;
+    kind:         mach.front.resolve.SymKind;
+    canon:        mach.base.intern.StrId;
+    decl:         mach.front.ast.id.DeclId;
     flags:        DeclarationFlags;
     generics:     u32;
     params_start: u32;
     params_len:   u32;
-    op_set:       intern.StrId;
-    op_name:      intern.StrId;
+    op_set:       mach.base.intern.StrId;
+    op_name:      mach.base.intern.StrId;
     value:        u32;
 }
 ```
@@ -62,10 +62,10 @@ one module-level function, `val` or `var`
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `decl` | `ast_id.DeclId` | the declaration in its module, which keys the session's tables of it |
+| `decl` | `mach.front.ast.id.DeclId` | the declaration in its module, which keys the session's tables of it |
 | `generics` | `u32` | how many type parameters a function declares |
 | `params_start` | `u32` | where a function's parameters start in `params` |
-| `op_set` | `intern.StrId` | the instruction set and operation an `#[intrinsic]` names, STR_NIL without one |
+| `op_set` | `mach.base.intern.StrId` | the instruction set and operation an `#[intrinsic]` names, STR_NIL without one |
 | `value` | `u32` | the node in `values` of a `val`'s constant value, or of the value a `var`'s initializer gives it, NONE when it has none |
 
 ## Param
@@ -80,11 +80,11 @@ pub rec Param {
 
 ```mach
 pub rec Exported {
-    kind:                resolve.SymKind;
-    name:                intern.StrId;
-    canon:               intern.StrId;
-    origin:              session_module.StableModuleId;
-    module:              session_module.StableModuleId;
+    kind:                mach.front.resolve.SymKind;
+    name:                mach.base.intern.StrId;
+    canon:               mach.base.intern.StrId;
+    origin:              mach.session.module.StableModuleId;
+    module:              mach.session.module.StableModuleId;
     generic_arity:       u32;
     has_comptime_params: bool;
     has_pack_param:      bool;
@@ -95,31 +95,31 @@ one symbol on the module's public surface, as an importer of it names it
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `origin` | `session_module.StableModuleId` | the module that declares it, which may be one this module re-exports |
-| `module` | `session_module.StableModuleId` | the module a `pub use` names, for a module symbol |
+| `origin` | `mach.session.module.StableModuleId` | the module that declares it, which may be one this module re-exports |
+| `module` | `mach.session.module.StableModuleId` | the module a `pub use` names, for a module symbol |
 
 ## Interface
 
 ```mach
 pub rec Interface {
-    alloc:        *A.Allocator;
-    declarations: collections_vector.Vector[Declaration];
-    params:       collections_vector.Vector[Param];
-    surface:      collections_vector.Vector[Exported];
-    by_decl:      map.Map[u32, u32];
-    by_canon:     map.Map[u64, u32];
+    alloc:        *std.allocator.Allocator;
+    declarations: std.collections.vector.Vector[Declaration];
+    params:       std.collections.vector.Vector[Param];
+    surface:      std.collections.vector.Vector[Exported];
+    by_decl:      std.collections.map.Map[u32, u32];
+    by_canon:     std.collections.map.Map[u64, u32];
     # the deep value of each of the module's constants, and of each array a `$each` of its
     # typing reads
-    values: comptime_deep.Store;
+    values: mach.front.comptime.deep.Store;
     # what an importer emits the module's instances from
-    template: sema_template.Template;
+    template: mach.front.sema.template.Template;
 }
 ```
 
 ### init
 
 ```mach
-pub fun init(alloc: *A.Allocator) Interface
+pub fun init(alloc: *std.allocator.Allocator) Interface
 ```
 
 ### dnit
@@ -133,7 +133,7 @@ release an interface; a nil one, or one never made, holds nothing
 ### declaration_add
 
 ```mach
-pub fun declaration_add(iface: *Interface, d: Declaration, params: *Param, params_len: u32) err[fail.Fail]
+pub fun declaration_add(iface: *Interface, d: Declaration, params: *Param, params_len: u32) err[mach.base.fail.Fail]
 ```
 
 adds `d` with the parameters `params[0 .. params_len]`; a second declaration of one kind and
@@ -142,7 +142,7 @@ canonical name leaves that name ambiguous, which a lookup by name refuses
 ### declaration_at
 
 ```mach
-pub fun declaration_at(iface: *Interface, decl: ast_id.DeclId) opt[*Declaration]
+pub fun declaration_at(iface: *Interface, decl: mach.front.ast.id.DeclId) opt[*Declaration]
 ```
 
 the declaration `decl` of the module, none for one the interface does not describe
@@ -150,7 +150,7 @@ the declaration `decl` of the module, none for one the interface does not descri
 ### declaration_for
 
 ```mach
-pub fun declaration_for(iface: *Interface, kind: resolve.SymKind, canon: intern.StrId) res[*Declaration, fail.Fail]
+pub fun declaration_for(iface: *Interface, kind: mach.front.resolve.SymKind, canon: mach.base.intern.StrId) res[*Declaration, mach.base.fail.Fail]
 ```
 
 the one declaration of `kind` the module defines under `canon`
@@ -178,7 +178,7 @@ a generic, comptime-parameter or pack function has instances in place of one def
 ### template_of
 
 ```mach
-pub fun template_of(iface: *Interface) opt[*sema_template.Template]
+pub fun template_of(iface: *Interface) opt[*mach.front.sema.template.Template]
 ```
 
 the template part, none for a module with no generic, comptime-parameter or pack function
@@ -186,7 +186,7 @@ the template part, none for a module with no generic, comptime-parameter or pack
 ### exported_add
 
 ```mach
-pub fun exported_add(iface: *Interface, e: Exported) err[fail.Fail]
+pub fun exported_add(iface: *Interface, e: Exported) err[mach.base.fail.Fail]
 ```
 
 ### exported_count
@@ -206,7 +206,7 @@ pub fun exported_at(iface: *Interface, ord: u32) *Exported
 ```mach
 pub rec Reader {
     ctx:  ptr;
-    read: fun(ptr, session_module.ModuleId) res[*Interface, fail.Fail];
+    read: fun(ptr, mach.session.module.ModuleId) res[*Interface, mach.base.fail.Fail];
 }
 ```
 

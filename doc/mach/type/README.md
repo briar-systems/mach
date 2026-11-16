@@ -9,7 +9,7 @@ its parts spell, read when it is interned. the field tables, tag discriminators 
 decorations belong to the current projection (`mach.type.field`), and a fact read from them is
 kept until the projection resets or a table is published over one that held other fields.
 
-<sub>[`mach.type`](../type.md) · 18 modules · imports [`base`](../base/README.md), [`report`](../report/README.md), [`session`](../session/README.md) · imported by [`build`](../build/README.md), [`compile`](../compile/README.md), [`front`](../front/README.md), [`lower`](../lower/README.md), [`session`](../session/README.md), [`target`](../target/README.md)</sub>
+The directory's root module is [`mach.type`](../type.md).
 
 | Module | |
 | :--- | :--- |
@@ -22,7 +22,7 @@ kept until the projection resets or a table is published over one that held othe
 | [`shape`](shape.md) | the mirl shape of a source type: the one place mach decides how a type is held in mirl's type table, which lowering interns into its module's table and sema into the table it lays types out over, so the size sema answers and the type codegen builds cannot disagree |
 | [`visit`](visit.md) | one walk over the type graph: a property is a leaf predicate, and the walk follows the edges the property names from a type to the types it is built from |
 
-| Directory | Modules | |
-| :--- | ---: | :--- |
-| [`query/`](query/README.md) | 10 | questions about the types in the store whose answers derive from the field tables: substitution, the deep properties, extent, secrecy agreement, containment and expansiveness, each a module under this one |
+| Directory | |
+| :--- | :--- |
+| [`query/`](query/README.md) | questions about the types in the store whose answers derive from the field tables: substitution, the deep properties, extent, secrecy agreement, containment and expansiveness, each a module under this one |
 

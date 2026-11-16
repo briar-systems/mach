@@ -4,9 +4,9 @@
 
 the decoding of the `[step.<name>]` tables
 
-<sub>source: [`src/manifest/step.mach`](../../../src/manifest/step.mach) · imported by 1 module</sub>
+Source: [`src/manifest/step.mach`](../../../src/manifest/step.mach)
 
-<sub>`A` is `std.allocator` · `intern` is [`mach.base.intern`](../base/intern.md) · `toml_value` is `toml.value` · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md).
 
 | Functions | |
 | :--- | :--- |
@@ -19,6 +19,6 @@ the decoding of the `[step.<name>]` tables
 ### parse_steps
 
 ```mach
-pub fun parse_steps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail]
+pub fun parse_steps(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, t: *toml.value.Table, m: *Manifest) err[mach.base.fail.Fail]
 ```
 

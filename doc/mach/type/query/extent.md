@@ -6,9 +6,9 @@ the size, alignment and member offsets of a type, as mirl's data layout of the b
 target lays it out: each source type is interned in a type table the laying holds, no
 module's, and mirl answers every question of it, so mach computes no layout of its own
 
-<sub>source: [`src/type/query/extent.mach`](../../../../src/type/query/extent.mach) · imported by 8 modules</sub>
+Source: [`src/type/query/extent.mach`](../../../../src/type/query/extent.mach)
 
-<sub>`A` is `std.allocator` · `mirl_record` is `mirl.target.record` · `core_state` is `masc.core.state` · `types` is `mirl.ir.type.table` · `map` is `std.collections.map` · `type_kind` is [`mach.type.kind`](../kind.md) · `collections_vector` is `std.collections.vector` · `shape` is [`mach.type.shape`](../shape.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `Placed` is private · `session` is [`mach.session`](../../session.md) · `NodeKind` is private · `type_query` is [`mach.type.query`](../query.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.session`](../../session.md), [`mach.type.kind`](../kind.md), [`mach.type.query`](../query.md), [`mach.type.shape`](../shape.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,23 +21,23 @@ module's, and mirl answers every question of it, so mach computes no layout of i
 | On `Laying` | |
 | :--- | :--- |
 | [`init`](#init) | a laying over `target` under the context `ctx`, both borrowed, placing tags by `place` |
-| [`dnit`](#dnit) · [`of`](#of) | |
+| [`dnit`](#dnit), [`of`](#of) | |
 | [`field_offset`](#field_offset) | the byte offset of a record field or tag payload from the same layout that sizes the type; `size` carries the offset when `ok` |
 
 | On `Cause` | |
 | :--- | :--- |
-| [`CAUSE_UNKNOWN`](#cause) · [`CAUSE_FIELD_RANGE`](#cause) · [`unknown`](#unknown) | |
+| [`CAUSE_UNKNOWN`](#cause), [`CAUSE_FIELD_RANGE`](#cause), [`unknown`](#unknown) | |
 | [`cause_name`](#cause_name) | the text of a cause; absent for one outside the catalog |
 
 | On `Measure` | |
 | :--- | :--- |
 | [`placement`](#placement) | where the tag `tid`, its secrecy stripped, holds each case's payload on the laying's target |
-| [`describe`](#describe) · [`field`](#field) · [`size`](#size) | |
+| [`describe`](#describe), [`field`](#field), [`size`](#size) | |
 | [`offset`](#offset) | the byte offset of a record field, or of a tag case's payload, in `size`; a case with no payload has none |
 
 | Constants | |
 | :--- | :--- |
-| [`NODE_UNKNOWN`](#constants) · [`NODE_SCALAR`](#constants) · [`NODE_POINTER`](#constants) · [`NODE_VECTOR`](#constants) · [`NODE_ARRAY`](#constants) · [`NODE_AGGREGATE`](#constants) · [`NODE_ZERO`](#constants) · [`NODE_OPAQUE`](#constants) · [`NODE_TAG`](#constants) | |
+| [`NODE_UNKNOWN`](#constants), [`NODE_SCALAR`](#constants), [`NODE_POINTER`](#constants), [`NODE_VECTOR`](#constants), [`NODE_ARRAY`](#constants), [`NODE_AGGREGATE`](#constants), [`NODE_ZERO`](#constants), [`NODE_OPAQUE`](#constants), [`NODE_TAG`](#constants) | |
 
 ---
 
@@ -45,15 +45,15 @@ module's, and mirl answers every question of it, so mach computes no layout of i
 
 ```mach
 pub rec Laying {
-    alloc:      *A.Allocator;
-    target:     *mirl_record.Target;
-    ctx:        opt[*core_state.Context];
-    table:      types.Table;
-    mapped:     map.Map[type_kind.TypeId, Type];
+    alloc:      *std.allocator.Allocator;
+    target:     *mirl.target.record.Target;
+    ctx:        opt[*masc.core.state.Context];
+    table:      mirl.ir.type.table.Table;
+    mapped:     std.collections.map.Map[mach.type.kind.TypeId, Type];
     generation: u64;
-    place:      fun(*Measure, type_kind.TypeId, *collections_vector.Vector[shape.Carried]) res[u32, fail.Fail];
-    placed:     map.Map[type_kind.TypeId, Placed];
-    cases:      collections_vector.Vector[shape.Carried];
+    place:      fun(*Measure, mach.type.kind.TypeId, *std.collections.vector.Vector[mach.type.shape.Carried]) res[u32, mach.base.fail.Fail];
+    placed:     std.collections.map.Map[mach.type.kind.TypeId, Placed];
+    cases:      std.collections.vector.Vector[mach.type.shape.Carried];
 }
 ```
 
@@ -62,16 +62,16 @@ borrowed from the build's back end, and the type table each source type is inter
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `mapped` | `map.Map[type_kind.TypeId, Type]` | the table's type of each source type interned, under `generation` |
+| `mapped` | `std.collections.map.Map[mach.type.kind.TypeId, Type]` | the table's type of each source type interned, under `generation` |
 | `generation` | `u64` | the projection generation `mapped` and `placed` were made under, since a later one may give a nominal other fields |
-| `place` | `fun(*Measure, type_kind.TypeId, *collections_vector.Vector[shape.Carried]) res[u32, fail.Fail]` | how a tag's cases are placed on this target, which mach.type.query.areas decides from the secrecy of their bytes, a query above this one |
-| `placed` | `map.Map[type_kind.TypeId, Placed]` | each tag placed, its cases at `start` in `cases`, under `generation` |
+| `place` | `fun(*Measure, mach.type.kind.TypeId, *std.collections.vector.Vector[mach.type.shape.Carried]) res[u32, mach.base.fail.Fail]` | how a tag's cases are placed on this target, which mach.type.query.areas decides from the secrecy of their bytes, a query above this one |
+| `placed` | `std.collections.map.Map[mach.type.kind.TypeId, Placed]` | each tag placed, its cases at `start` in `cases`, under `generation` |
 
 ### init
 
 ```mach
-pub fun init(a: *A.Allocator, target: *mirl_record.Target, ctx: opt[*core_state.Context],
-    place: fun(*Measure, type_kind.TypeId, *collections_vector.Vector[shape.Carried]) res[u32, fail.Fail]) res[*Laying, fail.Fail]
+pub fun init(a: *std.allocator.Allocator, target: *mirl.target.record.Target, ctx: opt[*masc.core.state.Context],
+    place: fun(*Measure, mach.type.kind.TypeId, *std.collections.vector.Vector[mach.type.shape.Carried]) res[u32, mach.base.fail.Fail]) res[*Laying, mach.base.fail.Fail]
 ```
 
 a laying over `target` under the context `ctx`, both borrowed, placing tags by `place`.
@@ -86,13 +86,13 @@ pub fun dnit(l: *Laying)
 ### of
 
 ```mach
-pub fun of(s: *session.Session, laying: *Laying, tid: type_kind.TypeId) res[Extent, fail.Fail]
+pub fun of(s: *mach.session.Session, laying: *Laying, tid: mach.type.kind.TypeId) res[Extent, mach.base.fail.Fail]
 ```
 
 ### field_offset
 
 ```mach
-pub fun field_offset(s: *session.Session, laying: *Laying, tid: type_kind.TypeId, field_ix: u32) res[Extent, fail.Fail]
+pub fun field_offset(s: *mach.session.Session, laying: *Laying, tid: mach.type.kind.TypeId, field_ix: u32) res[Extent, mach.base.fail.Fail]
 ```
 
 the byte offset of a record field or tag payload from the same layout that sizes the type;
@@ -167,7 +167,7 @@ what a source type is made of, as its layout is asked
 
 ```mach
 pub rec Measure {
-    q:      *type_query.Query;
+    q:      *mach.type.query.Query;
     laying: *Laying;
 }
 ```
@@ -178,7 +178,7 @@ laying, nil where the build opened no target
 ### placement
 
 ```mach
-pub fun placement(mz: *Measure, tid: type_kind.TypeId) res[shape.Placement, fail.Fail]
+pub fun placement(mz: *Measure, tid: mach.type.kind.TypeId) res[mach.type.shape.Placement, mach.base.fail.Fail]
 ```
 
 where the tag `tid`, its secrecy stripped, holds each case's payload on the laying's target.
@@ -199,13 +199,13 @@ pub fun field(mz: *Measure, id: u32, index: u32) u32
 ### size
 
 ```mach
-pub fun size(mz: *Measure, tid: type_kind.TypeId) Extent
+pub fun size(mz: *Measure, tid: mach.type.kind.TypeId) Extent
 ```
 
 ### offset
 
 ```mach
-pub fun offset(mz: *Measure, tid: type_kind.TypeId, field_ix: u32) Extent
+pub fun offset(mz: *Measure, tid: mach.type.kind.TypeId, field_ix: u32) Extent
 ```
 
 the byte offset of a record field, or of a tag case's payload, in `size`; a case with no

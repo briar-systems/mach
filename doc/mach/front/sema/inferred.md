@@ -8,9 +8,9 @@ a pass over a module's syntax before any type resolves: it gives a literal's own
 annotation of a `val` or `var` one initializes, the literal's element count. a `[_]` left unset
 is refused where it resolves.
 
-<sub>source: [`src/front/sema/inferred.mach`](../../../../src/front/sema/inferred.mach) · imported by 1 module</sub>
+Source: [`src/front/sema/inferred.mach`](../../../../src/front/sema/inferred.mach)
 
-<sub>`sema_context` is [`mach.front.sema.context`](context.md)</sub>
+Uses types from [`mach.front.sema.context`](context.md).
 
 | Functions | |
 | :--- | :--- |
@@ -23,7 +23,7 @@ is refused where it resolves.
 ### record_all
 
 ```mach
-pub fun record_all(sc: *sema_context.SemaContext)
+pub fun record_all(sc: *mach.front.sema.context.SemaContext)
 ```
 
 the one owner of "the length of an array literal" is its element count, which the

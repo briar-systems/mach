@@ -7,9 +7,9 @@ the source provider that reads an editor's open buffers in front of another prov
 the buffers are kept by cleaned path, so a buffer is read in place of its file, and a buffer
 whose file is not on disk yet still names a module.
 
-<sub>source: [`src/base/source/provider/overlay.mach`](../../../../../src/base/source/provider/overlay.mach) · imported by 5 modules</sub>
+Source: [`src/base/source/provider/overlay.mach`](../../../../../src/base/source/provider/overlay.mach)
 
-<sub>`provider` is [`mach.base.source.provider`](../provider.md) · `A` is `std.allocator` · `Entry` is private · `fail` is [`mach.base.fail`](../../fail.md)</sub>
+Uses types from [`mach.base.fail`](../../fail.md), [`mach.base.source.provider`](../provider.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -23,7 +23,7 @@ whose file is not on disk yet still names a module.
 
 | On `Store` | |
 | :--- | :--- |
-| [`init`](#init) · [`store_init`](#store_init) · [`store_dnit`](#store_dnit) | |
+| [`init`](#init), [`store_init`](#store_init), [`store_dnit`](#store_dnit) | |
 | [`prepare`](#prepare) | the caller exclusively borrows overlay state through commit or discard |
 | [`set`](#set) | set the text standing in for `path`; true when it changed the texts |
 | [`get`](#get) | the text standing in for `path`, none when no buffer does |
@@ -39,7 +39,7 @@ whose file is not on disk yet still names a module.
 
 ```mach
 pub rec Overlay {
-    base: provider.Provider;
+    base: mach.base.source.provider.Provider;
     s:    *Store;
 }
 ```
@@ -50,20 +50,20 @@ disk yet still names a module
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `base` | `provider.Provider` | the provider the buffers stand in front of |
+| `base` | `mach.base.source.provider.Provider` | the provider the buffers stand in front of |
 | `s` | `*Store` | the buffers, keyed by the path the base locates |
 
 ### provider_of
 
 ```mach
-pub fun provider_of(o: *Overlay) provider.Provider
+pub fun provider_of(o: *Overlay) mach.base.source.provider.Provider
 ```
 
 ## Store
 
 ```mach
 pub rec Store {
-    a:     *A.Allocator;
+    a:     *std.allocator.Allocator;
     items: Vector[Entry];
 }
 ```
@@ -73,19 +73,19 @@ editor holds a handful
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `a` | `*A.Allocator` | owns every entry's path and text |
+| `a` | `*std.allocator.Allocator` | owns every entry's path and text |
 | `items` | `Vector[Entry]` | the buffers |
 
 ### init
 
 ```mach
-pub fun init(base: provider.Provider, s: *Store) Overlay
+pub fun init(base: mach.base.source.provider.Provider, s: *Store) Overlay
 ```
 
 ### store_init
 
 ```mach
-pub fun store_init(a: *A.Allocator) Store
+pub fun store_init(a: *std.allocator.Allocator) Store
 ```
 
 ### store_dnit
@@ -97,7 +97,7 @@ pub fun store_dnit(s: *Store)
 ### prepare
 
 ```mach
-pub fun prepare(s: *Store, path: str, text: str, remove: bool) res[Prepared, fail.Fail]
+pub fun prepare(s: *Store, path: str, text: str, remove: bool) res[Prepared, mach.base.fail.Fail]
 ```
 
 the caller exclusively borrows overlay state through commit or discard
@@ -105,7 +105,7 @@ the caller exclusively borrows overlay state through commit or discard
 ### set
 
 ```mach
-pub fun set(s: *Store, path: str, text: str) res[bool, fail.Fail]
+pub fun set(s: *Store, path: str, text: str) res[bool, mach.base.fail.Fail]
 ```
 
 set the text standing in for `path`; true when it changed the texts

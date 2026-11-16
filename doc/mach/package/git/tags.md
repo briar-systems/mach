@@ -8,9 +8,9 @@ release is read from a scratch bare repository after a shallow fetch of its tag.
 both come from a local repository, a realized checkout of the url, and nothing reaches
 the network
 
-<sub>source: [`src/package/git/tags.mach`](../../../../src/package/git/tags.mach) · imported by 1 module</sub>
+Source: [`src/package/git/tags.mach`](../../../../src/package/git/tags.mach)
 
-<sub>`session` is [`mach.session`](../../session.md) · `git` is [`mach.package.git`](../git.md) · `CachedListing` is private · `LocalRepo` is private · `fail` is [`mach.base.fail`](../../base/fail.md) · `package_source` is [`mach.package.source`](../source.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.package.git`](../git.md), [`mach.package.source`](../source.md), [`mach.session`](../../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -25,7 +25,7 @@ the network
 
 | Functions | |
 | :--- | :--- |
-| [`releases`](#releases) · [`shipped`](#shipped) | |
+| [`releases`](#releases), [`shipped`](#shipped) | |
 
 ---
 
@@ -33,8 +33,8 @@ the network
 
 ```mach
 pub rec Remotes {
-    s:             *session.Session;
-    gi:            git.Inspector;
+    s:             *mach.session.Session;
+    gi:            mach.package.git.Inspector;
     listings:      Vector[CachedListing];
     locals:        Vector[LocalRepo];
     offline:       bool;
@@ -47,13 +47,13 @@ pub rec Remotes {
 ### init
 
 ```mach
-pub fun init(s: *session.Session, offline: bool, local: str) res[Remotes, fail.Fail]
+pub fun init(s: *mach.session.Session, offline: bool, local: str) res[Remotes, mach.base.fail.Fail]
 ```
 
 ### dnit
 
 ```mach
-pub fun dnit(c: *Remotes) err[fail.Fail]
+pub fun dnit(c: *Remotes) err[mach.base.fail.Fail]
 ```
 
 release the table; a candidate scratch that stays is the failure, once
@@ -62,7 +62,7 @@ everything else is released
 ### remember
 
 ```mach
-pub fun remember(c: *Remotes, url: str, dir: str) err[fail.Fail]
+pub fun remember(c: *Remotes, url: str, dir: str) err[mach.base.fail.Fail]
 ```
 
 the local repository offline resolution reads `url`'s releases from; the first existing one
@@ -71,7 +71,7 @@ named wins, so a url with no checkout yet is refused by offline_dir and not by g
 ### release_of
 
 ```mach
-pub fun release_of(c: *Remotes, url: str, commit: str) res[str, fail.Fail]
+pub fun release_of(c: *Remotes, url: str, commit: str) res[str, mach.base.fail.Fail]
 ```
 
 the release of `url` whose commit is `commit`, as its version text owned by the
@@ -83,12 +83,12 @@ gitlink is a commit, and resolution deals in releases
 ### releases
 
 ```mach
-pub fun releases(ctx: ptr, url: str, out: *Vector[package_source.Release]) err[fail.Fail]
+pub fun releases(ctx: ptr, url: str, out: *Vector[mach.package.source.Release]) err[mach.base.fail.Fail]
 ```
 
 ### shipped
 
 ```mach
-pub fun shipped(ctx: ptr, url: str, rel: *package_source.Release) res[package_source.Shipped, fail.Fail]
+pub fun shipped(ctx: ptr, url: str, rel: *mach.package.source.Release) res[mach.package.source.Shipped, mach.base.fail.Fail]
 ```
 

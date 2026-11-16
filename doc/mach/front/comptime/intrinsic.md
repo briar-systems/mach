@@ -9,9 +9,9 @@ each phase decodes a comptime call's `$name` to the id it spells and decides by
 the id and its row, never by the name. a new intrinsic is a row here and the
 consumers that answer it
 
-<sub>source: [`src/front/comptime/intrinsic.mach`](../../../../src/front/comptime/intrinsic.mach) · imported by 12 modules</sub>
+Source: [`src/front/comptime/intrinsic.mach`](../../../../src/front/comptime/intrinsic.mach)
 
-<sub>`base_source` is [`mach.base.source`](../../base/source.md) · `ast` is [`mach.front.ast`](../ast.md) · `ast_id` is [`mach.front.ast.id`](../ast/id.md) · `A` is `std.allocator` · `textbuild` is [`mach.base.textbuild`](../../base/textbuild.md) · `ast_expr` is [`mach.front.ast.expr`](../ast/expr.md)</sub>
+Uses types from [`mach.base.source`](../../base/source.md), [`mach.base.textbuild`](../../base/textbuild.md), [`mach.front.ast`](../ast.md), [`mach.front.ast.expr`](../ast/expr.md), [`mach.front.ast.id`](../ast/id.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,7 +21,7 @@ consumers that answer it
 
 | On `Id` | |
 | :--- | :--- |
-| [`NONE`](#id) · [`SIZE_OF`](#id) · [`ALIGN_OF`](#id) · [`OFFSET_OF`](#id) · [`LENGTH_OF`](#id) · [`TYPE_ID`](#id) · [`TYPE_NAME`](#id) · [`IS_RECORD`](#id) · [`IS_UNION`](#id) · [`IS_TAG`](#id) · [`IS_POINTER`](#id) · [`IS_SECRET`](#id) · [`HOLDS_SECRET`](#id) · [`IS_INTEGER`](#id) · [`IS_FLOAT`](#id) · [`TYPE_OF`](#id) · [`POINTEE_OF`](#id) · [`DISCRIMINANT_OF`](#id) · [`ZEROIZE`](#id) | |
+| [`NONE`](#id), [`SIZE_OF`](#id), [`ALIGN_OF`](#id), [`OFFSET_OF`](#id), [`LENGTH_OF`](#id), [`TYPE_ID`](#id), [`TYPE_NAME`](#id), [`IS_RECORD`](#id), [`IS_UNION`](#id), [`IS_TAG`](#id), [`IS_POINTER`](#id), [`IS_SECRET`](#id), [`HOLDS_SECRET`](#id), [`IS_INTEGER`](#id), [`IS_FLOAT`](#id), [`TYPE_OF`](#id), [`POINTEE_OF`](#id), [`DISCRIMINANT_OF`](#id), [`ZEROIZE`](#id) | |
 | [`row`](#row) | the row of `id`; nil for NONE and any id no row declares |
 | [`id_of`](#id_of) | the intrinsic the name at `name` in `source` spells, without its `$`; NONE when it spells none |
 | [`in_class`](#in_class) | whether `id` answers within `class` |
@@ -30,16 +30,16 @@ consumers that answer it
 
 | On `Class` | |
 | :--- | :--- |
-| [`CLASS_LAYOUT`](#class) · [`CLASS_QUERY`](#class) | |
+| [`CLASS_LAYOUT`](#class), [`CLASS_QUERY`](#class) | |
 
 | Functions | |
 | :--- | :--- |
 | [`constructor_refusal`](#constructor_refusal) | the refusal of a `$` in a type that names no type constructor, listing the ones there are |
-| [`first_call_arg`](#first_call_arg) · [`intrinsic_takes_type_operand`](#intrinsic_takes_type_operand) · [`is_type_of_call`](#is_type_of_call) · [`type_of_arg`](#type_of_arg) · [`is_fields_call`](#is_fields_call) · [`is_cases_call`](#is_cases_call) · [`is_layout_intrinsic_call`](#is_layout_intrinsic_call) · [`is_type_id_call`](#is_type_id_call) · [`is_length_of_call`](#is_length_of_call) · [`is_offset_of_call`](#is_offset_of_call) · [`is_size_of_call`](#is_size_of_call) · [`is_align_of_call`](#is_align_of_call) · [`layout_intrinsic_type_arg`](#layout_intrinsic_type_arg) · [`fields_type_arg`](#fields_type_arg) · [`is_error_call`](#is_error_call) · [`type_operand_value`](#type_operand_value) · [`is_type_comparison`](#is_type_comparison) · [`is_type_comparison_binary`](#is_type_comparison_binary) · [`is_field_type_member`](#is_field_type_member) · [`is_field_descriptor_member`](#is_field_descriptor_member) · [`is_type_query_call`](#is_type_query_call) | |
+| [`first_call_arg`](#first_call_arg), [`intrinsic_takes_type_operand`](#intrinsic_takes_type_operand), [`is_type_of_call`](#is_type_of_call), [`type_of_arg`](#type_of_arg), [`is_fields_call`](#is_fields_call), [`is_cases_call`](#is_cases_call), [`is_layout_intrinsic_call`](#is_layout_intrinsic_call), [`is_type_id_call`](#is_type_id_call), [`is_length_of_call`](#is_length_of_call), [`is_offset_of_call`](#is_offset_of_call), [`is_size_of_call`](#is_size_of_call), [`is_align_of_call`](#is_align_of_call), [`layout_intrinsic_type_arg`](#layout_intrinsic_type_arg), [`fields_type_arg`](#fields_type_arg), [`is_error_call`](#is_error_call), [`type_operand_value`](#type_operand_value), [`is_type_comparison`](#is_type_comparison), [`is_type_comparison_binary`](#is_type_comparison_binary), [`is_field_type_member`](#is_field_type_member), [`is_field_descriptor_member`](#is_field_descriptor_member), [`is_type_query_call`](#is_type_query_call) | |
 | [`is_type_question_call`](#is_type_question_call) | a call that asks about a type: its layout, its identity, or a predicate over it |
 | [`is_path_call`](#is_path_call) | a call whose callee is a rooted comptime path: `$mach.build.ct_mul(low, 64)` |
 | [`is_comptime_value`](#is_comptime_value) | a rooted comptime path, or a call on one: both fold to a constant |
-| [`is_comptime_path`](#is_comptime_path) · [`comptime_ident_name`](#comptime_ident_name) | |
+| [`is_comptime_path`](#is_comptime_path), [`comptime_ident_name`](#comptime_ident_name) | |
 
 ---
 
@@ -82,7 +82,7 @@ the row of `id`; nil for NONE and any id no row declares
 ### id_of
 
 ```mach
-pub fun id_of(source: str, name: base_source.Span) Id
+pub fun id_of(source: str, name: mach.base.source.Span) Id
 ```
 
 the intrinsic the name at `name` in `source` spells, without its `$`; NONE when it spells none
@@ -98,7 +98,7 @@ whether `id` answers within `class`
 ### call_intrinsic
 
 ```mach
-pub fun call_intrinsic(a: *ast.Ast, source: str, eid: ast_id.ExprId) Id
+pub fun call_intrinsic(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) Id
 ```
 
 the intrinsic a comptime call `$name(...)` names; NONE for any other expression
@@ -106,7 +106,7 @@ the intrinsic a comptime call `$name(...)` names; NONE for any other expression
 ### ident_intrinsic
 
 ```mach
-pub fun ident_intrinsic(source: str, full: base_source.Span) Id
+pub fun ident_intrinsic(source: str, full: mach.base.source.Span) Id
 ```
 
 the intrinsic a `$name` token spells
@@ -158,7 +158,7 @@ one intrinsic
 ### constructor_refusal
 
 ```mach
-pub fun constructor_refusal(a: *A.Allocator) res[str, textbuild.Error]
+pub fun constructor_refusal(a: *std.allocator.Allocator) res[str, mach.base.textbuild.Error]
 ```
 
 the refusal of a `$` in a type that names no type constructor, listing the ones there are
@@ -166,134 +166,134 @@ the refusal of a `$` in a type that names no type constructor, listing the ones 
 ### first_call_arg
 
 ```mach
-pub fun first_call_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId
+pub fun first_call_arg(a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) mach.front.ast.id.ExprId
 ```
 
 ### intrinsic_takes_type_operand
 
 ```mach
-pub fun intrinsic_takes_type_operand(source: str, full: base_source.Span) bool
+pub fun intrinsic_takes_type_operand(source: str, full: mach.base.source.Span) bool
 ```
 
 ### is_type_of_call
 
 ```mach
-pub fun is_type_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_type_of_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 ### type_of_arg
 
 ```mach
-pub fun type_of_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId
+pub fun type_of_arg(a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) mach.front.ast.id.ExprId
 ```
 
 ### is_fields_call
 
 ```mach
-pub fun is_fields_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_fields_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 ### is_cases_call
 
 ```mach
-pub fun is_cases_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_cases_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 ### is_layout_intrinsic_call
 
 ```mach
-pub fun is_layout_intrinsic_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_layout_intrinsic_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 ### is_type_id_call
 
 ```mach
-pub fun is_type_id_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_type_id_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 ### is_length_of_call
 
 ```mach
-pub fun is_length_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_length_of_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 ### is_offset_of_call
 
 ```mach
-pub fun is_offset_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_offset_of_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 ### is_size_of_call
 
 ```mach
-pub fun is_size_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_size_of_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 ### is_align_of_call
 
 ```mach
-pub fun is_align_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_align_of_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 ### layout_intrinsic_type_arg
 
 ```mach
-pub fun layout_intrinsic_type_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId
+pub fun layout_intrinsic_type_arg(a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) mach.front.ast.id.ExprId
 ```
 
 ### fields_type_arg
 
 ```mach
-pub fun fields_type_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId
+pub fun fields_type_arg(a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) mach.front.ast.id.ExprId
 ```
 
 ### is_error_call
 
 ```mach
-pub fun is_error_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_error_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 ### type_operand_value
 
 ```mach
-pub fun type_operand_value(a: *ast.Ast, source: str, operand: ast_id.ExprId) ast_id.ExprId
+pub fun type_operand_value(a: *mach.front.ast.Ast, source: str, operand: mach.front.ast.id.ExprId) mach.front.ast.id.ExprId
 ```
 
 ### is_type_comparison
 
 ```mach
-pub fun is_type_comparison(a: *ast.Ast, source: str, bin: *ast_expr.ExprBinary) bool
+pub fun is_type_comparison(a: *mach.front.ast.Ast, source: str, bin: *mach.front.ast.expr.ExprBinary) bool
 ```
 
 ### is_type_comparison_binary
 
 ```mach
-pub fun is_type_comparison_binary(a: *ast.Ast, source: str, bin: *ast_expr.ExprBinary,
+pub fun is_type_comparison_binary(a: *mach.front.ast.Ast, source: str, bin: *mach.front.ast.expr.ExprBinary,
     lhs_is_field_type: bool, rhs_is_field_type: bool) bool
 ```
 
 ### is_field_type_member
 
 ```mach
-pub fun is_field_type_member(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_field_type_member(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 ### is_field_descriptor_member
 
 ```mach
-pub fun is_field_descriptor_member(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_field_descriptor_member(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 ### is_type_query_call
 
 ```mach
-pub fun is_type_query_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_type_query_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 ### is_type_question_call
 
 ```mach
-pub fun is_type_question_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool
+pub fun is_type_question_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
 a call that asks about a type: its layout, its identity, or a predicate over it
@@ -301,7 +301,7 @@ a call that asks about a type: its layout, its identity, or a predicate over it
 ### is_path_call
 
 ```mach
-pub fun is_path_call(a: *ast.Ast, e: ast_id.ExprId) bool
+pub fun is_path_call(a: *mach.front.ast.Ast, e: mach.front.ast.id.ExprId) bool
 ```
 
 a call whose callee is a rooted comptime path: `$mach.build.ct_mul(low, 64)`
@@ -309,7 +309,7 @@ a call whose callee is a rooted comptime path: `$mach.build.ct_mul(low, 64)`
 ### is_comptime_value
 
 ```mach
-pub fun is_comptime_value(a: *ast.Ast, e: ast_id.ExprId) bool
+pub fun is_comptime_value(a: *mach.front.ast.Ast, e: mach.front.ast.id.ExprId) bool
 ```
 
 a rooted comptime path, or a call on one: both fold to a constant
@@ -317,12 +317,12 @@ a rooted comptime path, or a call on one: both fold to a constant
 ### is_comptime_path
 
 ```mach
-pub fun is_comptime_path(a: *ast.Ast, e: ast_id.ExprId) bool
+pub fun is_comptime_path(a: *mach.front.ast.Ast, e: mach.front.ast.id.ExprId) bool
 ```
 
 ### comptime_ident_name
 
 ```mach
-pub fun comptime_ident_name(full: base_source.Span) base_source.Span
+pub fun comptime_ident_name(full: mach.base.source.Span) mach.base.source.Span
 ```
 

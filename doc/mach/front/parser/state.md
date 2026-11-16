@@ -8,9 +8,9 @@ the grammar reads tokens and pushes nodes through it. it holds the nesting limit
 failure that ends a parse, the rollback of a reading that lost, and the buffer that keeps what a
 walk deciding between the two readings of `name[` reports until its reading becomes the parse.
 
-<sub>source: [`src/front/parser/state.mach`](../../../../src/front/parser/state.mach) · imported by 8 modules</sub>
+Source: [`src/front/parser/state.mach`](../../../../src/front/parser/state.mach)
 
-<sub>`fail` is [`mach.base.fail`](../../base/fail.md) · `front_lexer` is [`mach.front.lexer`](../lexer.md) · `ast` is [`mach.front.ast`](../ast.md) · `intern` is [`mach.base.intern`](../../base/intern.md) · `diagnostic` is [`mach.base.diagnostic`](../../base/diagnostic.md) · `report_phase` is [`mach.report.phase`](../../report/phase.md) · `PendingDiag` is private · `token` is [`mach.front.token`](../token.md) · `base_source` is [`mach.base.source`](../../base/source.md) · `A` is `std.allocator` · `diagnostic_kind` is [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md) · `ast_expr` is [`mach.front.ast.expr`](../ast/expr.md) · `ast_id` is [`mach.front.ast.id`](../ast/id.md) · `ast_stmt` is [`mach.front.ast.stmt`](../ast/stmt.md) · `ast_decl` is [`mach.front.ast.decl`](../ast/decl.md) · `ast_type` is [`mach.front.ast.type`](../ast/type.md) · `ast_module` is [`mach.front.ast.module`](../ast/module.md)</sub>
+Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.base.source`](../../base/source.md), [`mach.front.ast`](../ast.md), [`mach.front.ast.decl`](../ast/decl.md), [`mach.front.ast.expr`](../ast/expr.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.ast.module`](../ast/module.md), [`mach.front.ast.stmt`](../ast/stmt.md), [`mach.front.ast.type`](../ast/type.md), [`mach.front.lexer`](../lexer.md), [`mach.front.token`](../token.md), [`mach.report.phase`](../../report/phase.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -20,7 +20,7 @@ walk deciding between the two readings of `name[` reports until its reading beco
 
 | On `ParseFailKind` | |
 | :--- | :--- |
-| [`PARSE_FAIL_OOM`](#parsefailkind) · [`PARSE_FAIL_ICE`](#parsefailkind) · [`PARSE_FAIL_DIAG`](#parsefailkind) · [`PARSE_FAIL_DEPTH`](#parsefailkind) | |
+| [`PARSE_FAIL_OOM`](#parsefailkind), [`PARSE_FAIL_ICE`](#parsefailkind), [`PARSE_FAIL_DIAG`](#parsefailkind), [`PARSE_FAIL_DEPTH`](#parsefailkind) | |
 
 | On `ParseFail` | |
 | :--- | :--- |
@@ -28,17 +28,17 @@ walk deciding between the two readings of `name[` reports until its reading beco
 
 | On `Parser` | |
 | :--- | :--- |
-| [`init`](#init) · [`current`](#current) · [`peek`](#peek) · [`advance`](#advance) | |
+| [`init`](#init), [`current`](#current), [`peek`](#peek), [`advance`](#advance) | |
 | [`name_id`](#name_id) | the id of the name `span` covers; a refused intern is fatal, and its name is STR_NIL |
-| [`at`](#at) · [`at_kw`](#at_kw) · [`at_eof`](#at_eof) · [`at_decl_start`](#at_decl_start) · [`eat`](#eat) · [`eat_kw`](#eat_kw) · [`expect`](#expect) · [`previous`](#previous) · [`expect_end`](#expect_end) · [`diag_mark`](#diag_mark) · [`diag_discard`](#diag_discard) | |
+| [`at`](#at), [`at_kw`](#at_kw), [`at_eof`](#at_eof), [`at_decl_start`](#at_decl_start), [`eat`](#eat), [`eat_kw`](#eat_kw), [`expect`](#expect), [`previous`](#previous), [`expect_end`](#expect_end), [`diag_mark`](#diag_mark), [`diag_discard`](#diag_discard) | |
 | [`diag_flush`](#diag_flush) | the reading that recorded these is the parse, so they are real |
-| [`diag_dnit`](#diag_dnit) · [`error_at_current`](#error_at_current) · [`error_recover_advance`](#error_recover_advance) · [`error_at`](#error_at) | |
+| [`diag_dnit`](#diag_dnit), [`error_at_current`](#error_at_current), [`error_recover_advance`](#error_recover_advance), [`error_at`](#error_at) | |
 | [`error_naming`](#error_naming) | an error at `span` whose text fills the one `{}` of `fmt` with the source text of `name` |
-| [`fatal_oom_at`](#fatal_oom_at) · [`fatal_ice_at`](#fatal_ice_at) | |
+| [`fatal_oom_at`](#fatal_oom_at), [`fatal_ice_at`](#fatal_ice_at) | |
 | [`probed_init`](#probed_init) | a token position where the index reading of `name[` has already been tried and did not parse |
-| [`probed_dnit`](#probed_dnit) · [`index_reading_failed_here`](#index_reading_failed_here) · [`record_index_reading_failed`](#record_index_reading_failed) · [`descend`](#descend) · [`ascend`](#ascend) · [`ast_mark`](#ast_mark) · [`ast_rollback`](#ast_rollback) · [`sync_to`](#sync_to) · [`sync_to_body`](#sync_to_body) · [`sync_to_decl`](#sync_to_decl) · [`push_expr`](#push_expr) · [`push_stmt`](#push_stmt) · [`push_decl`](#push_decl) · [`push_type`](#push_type) · [`push_module`](#push_module) | |
+| [`probed_dnit`](#probed_dnit), [`index_reading_failed_here`](#index_reading_failed_here), [`record_index_reading_failed`](#record_index_reading_failed), [`descend`](#descend), [`ascend`](#ascend), [`ast_mark`](#ast_mark), [`ast_rollback`](#ast_rollback), [`sync_to`](#sync_to), [`sync_to_body`](#sync_to_body), [`sync_to_decl`](#sync_to_decl), [`push_expr`](#push_expr), [`push_stmt`](#push_stmt), [`push_decl`](#push_decl), [`push_type`](#push_type), [`push_module`](#push_module) | |
 | [`list_init`](#list_init) | a list gathered while its length is unknown, then flushed into its AST table in one run |
-| [`list_push`](#list_push) · [`list_dnit`](#list_dnit) | |
+| [`list_push`](#list_push), [`list_dnit`](#list_dnit) | |
 | [`list_flush`](#list_flush) | appends the gathered list to `table`, frees it, and answers where it starts in the table, with its length in `out_len` |
 
 | Functions | |
@@ -76,19 +76,19 @@ pub rec ParseFail {
 ### failure
 
 ```mach
-pub fun failure(f: ParseFail) fail.Fail
+pub fun failure(f: ParseFail) mach.base.fail.Fail
 ```
 
 ## Parser
 
 ```mach
 pub rec Parser {
-    tokens:        *front_lexer.TokenStream;
+    tokens:        *mach.front.lexer.TokenStream;
     pos:           usize;
-    ast:           *ast.Ast;
-    names:         *intern.Interner;
-    diags:         *diagnostic.DiagnosticStore;
-    status:        report_phase.PhaseStatus;
+    ast:           *mach.front.ast.Ast;
+    names:         *mach.base.intern.Interner;
+    diags:         *mach.base.diagnostic.DiagnosticStore;
+    status:        mach.report.phase.PhaseStatus;
     panic:         bool;
     fatal:         bool;
     fatal_kind:    ParseFailKind;
@@ -112,31 +112,31 @@ names: the interner every name the tree holds an id of is interned in. it outliv
 ### init
 
 ```mach
-pub fun init(tokens: *front_lexer.TokenStream, out: *ast.Ast, names: *intern.Interner, diags: *diagnostic.DiagnosticStore) Parser
+pub fun init(tokens: *mach.front.lexer.TokenStream, out: *mach.front.ast.Ast, names: *mach.base.intern.Interner, diags: *mach.base.diagnostic.DiagnosticStore) Parser
 ```
 
 ### current
 
 ```mach
-pub fun current(p: *Parser) token.Token
+pub fun current(p: *Parser) mach.front.token.Token
 ```
 
 ### peek
 
 ```mach
-pub fun peek(p: *Parser, offset: usize) token.Token
+pub fun peek(p: *Parser, offset: usize) mach.front.token.Token
 ```
 
 ### advance
 
 ```mach
-pub fun advance(p: *Parser) token.Token
+pub fun advance(p: *Parser) mach.front.token.Token
 ```
 
 ### name_id
 
 ```mach
-pub fun name_id(p: *Parser, span: base_source.Span) intern.StrId
+pub fun name_id(p: *Parser, span: mach.base.source.Span) mach.base.intern.StrId
 ```
 
 the id of the name `span` covers; a refused intern is fatal, and its name is STR_NIL
@@ -144,7 +144,7 @@ the id of the name `span` covers; a refused intern is fatal, and its name is STR
 ### at
 
 ```mach
-pub fun at(p: *Parser, kind: token.Kind) bool
+pub fun at(p: *Parser, kind: mach.front.token.Kind) bool
 ```
 
 ### at_kw
@@ -168,7 +168,7 @@ pub fun at_decl_start(p: *Parser) bool
 ### eat
 
 ```mach
-pub fun eat(p: *Parser, kind: token.Kind) bool
+pub fun eat(p: *Parser, kind: mach.front.token.Kind) bool
 ```
 
 ### eat_kw
@@ -180,19 +180,19 @@ pub fun eat_kw(p: *Parser, kw: str) bool
 ### expect
 
 ```mach
-pub fun expect(p: *Parser, kind: token.Kind, message: str) bool
+pub fun expect(p: *Parser, kind: mach.front.token.Kind, message: str) bool
 ```
 
 ### previous
 
 ```mach
-pub fun previous(p: *Parser) token.Token
+pub fun previous(p: *Parser) mach.front.token.Token
 ```
 
 ### expect_end
 
 ```mach
-pub fun expect_end(p: *Parser, kind: token.Kind, message: str) token.Token
+pub fun expect_end(p: *Parser, kind: mach.front.token.Kind, message: str) mach.front.token.Token
 ```
 
 ### diag_mark
@@ -220,31 +220,31 @@ lose and take them with it; at the top they go to the sink, in order.
 ### diag_dnit
 
 ```mach
-pub fun diag_dnit(p: *Parser, alloc: *A.Allocator)
+pub fun diag_dnit(p: *Parser, alloc: *std.allocator.Allocator)
 ```
 
 ### error_at_current
 
 ```mach
-pub fun error_at_current(p: *Parser, k: diagnostic_kind.Kind, message: str)
+pub fun error_at_current(p: *Parser, k: mach.base.diagnostic.kind.Kind, message: str)
 ```
 
 ### error_recover_advance
 
 ```mach
-pub fun error_recover_advance(p: *Parser, k: diagnostic_kind.Kind, message: str)
+pub fun error_recover_advance(p: *Parser, k: mach.base.diagnostic.kind.Kind, message: str)
 ```
 
 ### error_at
 
 ```mach
-pub fun error_at(p: *Parser, k: diagnostic_kind.Kind, span: base_source.Span, message: str)
+pub fun error_at(p: *Parser, k: mach.base.diagnostic.kind.Kind, span: mach.base.source.Span, message: str)
 ```
 
 ### error_naming
 
 ```mach
-pub fun error_naming(p: *Parser, k: diagnostic_kind.Kind, span: base_source.Span, fmt: str, name: base_source.Span)
+pub fun error_naming(p: *Parser, k: mach.base.diagnostic.kind.Kind, span: mach.base.source.Span, fmt: str, name: mach.base.source.Span)
 ```
 
 an error at `span` whose text fills the one `{}` of `fmt` with the source
@@ -255,19 +255,19 @@ never buffered: a caller reads outside every deciding walk
 ### fatal_oom_at
 
 ```mach
-pub fun fatal_oom_at(p: *Parser, span: base_source.Span)
+pub fun fatal_oom_at(p: *Parser, span: mach.base.source.Span)
 ```
 
 ### fatal_ice_at
 
 ```mach
-pub fun fatal_ice_at(p: *Parser, span: base_source.Span, message: str)
+pub fun fatal_ice_at(p: *Parser, span: mach.base.source.Span, message: str)
 ```
 
 ### probed_init
 
 ```mach
-pub fun probed_init(p: *Parser, alloc: *A.Allocator)
+pub fun probed_init(p: *Parser, alloc: *std.allocator.Allocator)
 ```
 
 a token position where the index reading of `name[` has already been tried
@@ -278,7 +278,7 @@ every level and doubles with depth.
 ### probed_dnit
 
 ```mach
-pub fun probed_dnit(p: *Parser, alloc: *A.Allocator)
+pub fun probed_dnit(p: *Parser, alloc: *std.allocator.Allocator)
 ```
 
 ### index_reading_failed_here
@@ -308,25 +308,25 @@ pub fun ascend(p: *Parser)
 ### ast_mark
 
 ```mach
-pub fun ast_mark(p: *Parser) ast.AstMark
+pub fun ast_mark(p: *Parser) mach.front.ast.AstMark
 ```
 
 ### ast_rollback
 
 ```mach
-pub fun ast_rollback(p: *Parser, m: ast.AstMark)
+pub fun ast_rollback(p: *Parser, m: mach.front.ast.AstMark)
 ```
 
 ### sync_to
 
 ```mach
-pub fun sync_to(p: *Parser, k0: token.Kind, k1: token.Kind, k2: token.Kind)
+pub fun sync_to(p: *Parser, k0: mach.front.token.Kind, k1: mach.front.token.Kind, k2: mach.front.token.Kind)
 ```
 
 ### sync_to_body
 
 ```mach
-pub fun sync_to_body(p: *Parser, k0: token.Kind, k1: token.Kind, k2: token.Kind)
+pub fun sync_to_body(p: *Parser, k0: mach.front.token.Kind, k1: mach.front.token.Kind, k2: mach.front.token.Kind)
 ```
 
 ### sync_to_decl
@@ -338,31 +338,31 @@ pub fun sync_to_decl(p: *Parser)
 ### push_expr
 
 ```mach
-pub fun push_expr(p: *Parser, e: ast_expr.Expr) ast_id.ExprId
+pub fun push_expr(p: *Parser, e: mach.front.ast.expr.Expr) mach.front.ast.id.ExprId
 ```
 
 ### push_stmt
 
 ```mach
-pub fun push_stmt(p: *Parser, s: ast_stmt.Stmt) ast_id.StmtId
+pub fun push_stmt(p: *Parser, s: mach.front.ast.stmt.Stmt) mach.front.ast.id.StmtId
 ```
 
 ### push_decl
 
 ```mach
-pub fun push_decl(p: *Parser, d: ast_decl.Decl) ast_id.DeclId
+pub fun push_decl(p: *Parser, d: mach.front.ast.decl.Decl) mach.front.ast.id.DeclId
 ```
 
 ### push_type
 
 ```mach
-pub fun push_type(p: *Parser, t: ast_type.Type) ast_id.TypeId
+pub fun push_type(p: *Parser, t: mach.front.ast.type.Type) mach.front.ast.id.TypeId
 ```
 
 ### push_module
 
 ```mach
-pub fun push_module(p: *Parser, m: ast_module.Module) ast_id.ModuleNodeId
+pub fun push_module(p: *Parser, m: mach.front.ast.module.Module) mach.front.ast.id.ModuleNodeId
 ```
 
 ### list_init
@@ -399,7 +399,7 @@ table, with its length in `out_len`
 ### span_of
 
 ```mach
-pub fun span_of(start: base_source.Span, end: base_source.Span) base_source.Span
+pub fun span_of(start: mach.base.source.Span, end: mach.base.source.Span) mach.base.source.Span
 ```
 
 ## Constants

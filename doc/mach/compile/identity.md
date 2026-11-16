@@ -26,9 +26,9 @@ the parts are digests cut to 32 and 16 bits: ample against accident, and no
 authentication. an object made by hand that copies an identity onto other
 code merges with the copies it imitates
 
-<sub>source: [`src/compile/identity.mach`](../../../src/compile/identity.mach) · imported by 1 module</sub>
+Source: [`src/compile/identity.mach`](../../../src/compile/identity.mach)
 
-<sub>`project` is [`mach.compile.project`](project.md) · `module` is [`mach.session.module`](../session/module.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `sema_instance` is [`mach.front.sema.instance`](../front/sema/instance.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `query` is [`mach.session.query`](../session/query.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.compile.project`](project.md), [`mach.front.sema.instance`](../front/sema/instance.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md).
 
 | Functions | |
 | :--- | :--- |
@@ -46,7 +46,7 @@ code merges with the copies it imitates
 ### of_module
 
 ```mach
-pub fun of_module(p: *project.Project, mid: module.ModuleId, out: *[32]u8) err[fail.Fail]
+pub fun of_module(p: *mach.compile.project.Project, mid: mach.session.module.ModuleId, out: *[32]u8) err[mach.base.fail.Fail]
 ```
 
 the source identity of module `mid`
@@ -54,7 +54,7 @@ the source identity of module `mid`
 ### of_instance
 
 ```mach
-pub fun of_instance(p: *project.Project, item: *sema_instance.Instance, name: intern.StrId) res[u64, fail.Fail]
+pub fun of_instance(p: *mach.compile.project.Project, item: *mach.front.sema.instance.Instance, name: mach.base.intern.StrId) res[u64, mach.base.fail.Fail]
 ```
 
 the identity of the instance `item` of symbol `name`
@@ -63,5 +63,5 @@ the identity of the instance `item` of symbol `name`
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `SOURCE_IDENTITY` | `query.Kind` | `query.Kind{ name: "source identity", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_LOWER, compute: module_compute }` | a module's source identity, keyed by its stable id |
+| `SOURCE_IDENTITY` | `mach.session.query.Kind` | `query.Kind{ name: "source identity", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_LOWER, compute: module_compute }` | a module's source identity, keyed by its stable id |
 

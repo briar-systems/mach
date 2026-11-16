@@ -2,7 +2,8 @@
 
 # mach.report
 
-<sub>3 modules · imports [`base`](../base/README.md) · imported by [`build`](../build/README.md), [`cli`](../cli/README.md), [`compile`](../compile/README.md), [`front`](../front/README.md), [`lower`](../lower/README.md), [`tool`](../tool/README.md), [`type`](../type/README.md)</sub>
+how running work reports itself: the status a phase ends with, the progress readout a
+command renders, and the results of a test run
 
 | Module | |
 | :--- | :--- |

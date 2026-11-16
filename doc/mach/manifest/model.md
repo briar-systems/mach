@@ -8,9 +8,9 @@ every place a definition records is resolved in the file it was read from, so a
 refusal made from the model points at the entry that caused it. an entry build makes
 its model directly, with source roots in place of dependencies.
 
-<sub>source: [`src/manifest/model.mach`](../../../src/manifest/model.mach) · imported by 43 modules</sub>
+Source: [`src/manifest/model.mach`](../../../src/manifest/model.mach)
 
-<sub>`intern` is [`mach.base.intern`](../base/intern.md) · `base_source` is [`mach.base.source`](../base/source.md) · `A` is `std.allocator` · `mink_subsystem` is `mink.catalog.subsystem` · `diagnostic_kind` is [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md) · `input` is [`mach.target.input`](../target/input.md) · `chrono_duration` is `std.chrono.duration` · `query` is [`mach.session.query`](../session/query.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.session.query`](../session/query.md), [`mach.target.input`](../target/input.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -83,8 +83,8 @@ its model directly, with source roots in place of dependencies.
 
 ```mach
 pub rec NameList {
-    items: *intern.StrId;
-    sites: *base_source.Location;
+    items: *mach.base.intern.StrId;
+    sites: *mach.base.source.Location;
     count: u32;
 }
 ```
@@ -94,14 +94,14 @@ each against the catalog it names into
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `items` | `*intern.StrId` | the names, nil when the key is absent or empty |
-| `sites` | `*base_source.Location` | where each is written, parallel to `items` |
+| `items` | `*mach.base.intern.StrId` | the names, nil when the key is absent or empty |
+| `sites` | `*mach.base.source.Location` | where each is written, parallel to `items` |
 | `count` | `u32` | how many |
 
 ### names_dnit
 
 ```mach
-pub fun names_dnit(alloc: *A.Allocator, l: *NameList)
+pub fun names_dnit(alloc: *std.allocator.Allocator, l: *NameList)
 ```
 
 release what a name list owns
@@ -133,15 +133,15 @@ any other name
 
 ```mach
 pub rec TargetDef {
-    name:          intern.StrId;
-    env:           intern.StrId;
-    arch:          intern.StrId;
-    isa:           intern.StrId;
-    sys:           intern.StrId;
-    abi:           intern.StrId;
-    of:            intern.StrId;
-    platform:      intern.StrId;
-    code_model:    intern.StrId;
+    name:          mach.base.intern.StrId;
+    env:           mach.base.intern.StrId;
+    arch:          mach.base.intern.StrId;
+    isa:           mach.base.intern.StrId;
+    sys:           mach.base.intern.StrId;
+    abi:           mach.base.intern.StrId;
+    of:            mach.base.intern.StrId;
+    platform:      mach.base.intern.StrId;
+    code_model:    mach.base.intern.StrId;
     base:          u64;
     stack_reserve: u64;
     stack_commit:  u64;
@@ -151,12 +151,12 @@ pub rec TargetDef {
     base_from:          Origin;
     stack_reserve_from: Origin;
     stack_commit_from:  Origin;
-    ext:                [resolved.MAX_ADDED]intern.StrId;
+    ext:                [resolved.MAX_ADDED]mach.base.intern.StrId;
     ext_count:          u32;
-    runner:             *intern.StrId;
+    runner:             *mach.base.intern.StrId;
     runner_count:       u32;
-    runner_at:          *base_source.Location;
-    at:                 base_source.Location;
+    runner_at:          *mach.base.source.Location;
+    at:                 mach.base.source.Location;
 }
 ```
 
@@ -165,24 +165,24 @@ the manifest text, unvalidated against the target registry
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `name` | `intern.StrId` | the table key; a portable identifier, never `native` |
-| `env` | `intern.StrId` | the `env` key, or STR_NIL when absent; parse checks only that it is a non-empty string, the architecture validates the value later |
-| `arch` | `intern.StrId` | the required `arch` key |
-| `isa` | `intern.StrId` | the `isa` key, the instruction set every machine of the target has, or STR_NIL for the architecture's default |
-| `sys` | `intern.StrId` | the required `sys` key |
-| `abi` | `intern.StrId` | the required `abi` key |
-| `of` | `intern.StrId` | the `of` object-format override, or STR_NIL when absent |
-| `platform` | `intern.StrId` | the `platform` tag, or STR_NIL when absent |
-| `code_model` | `intern.StrId` | the `code_model` key, mirl's psABI name of the code model, or STR_NIL for mirl's default; mirl refuses a model the target does not offer |
+| `name` | `mach.base.intern.StrId` | the table key; a portable identifier, never `native` |
+| `env` | `mach.base.intern.StrId` | the `env` key, or STR_NIL when absent; parse checks only that it is a non-empty string, the architecture validates the value later |
+| `arch` | `mach.base.intern.StrId` | the required `arch` key |
+| `isa` | `mach.base.intern.StrId` | the `isa` key, the instruction set every machine of the target has, or STR_NIL for the architecture's default |
+| `sys` | `mach.base.intern.StrId` | the required `sys` key |
+| `abi` | `mach.base.intern.StrId` | the required `abi` key |
+| `of` | `mach.base.intern.StrId` | the `of` object-format override, or STR_NIL when absent |
+| `platform` | `mach.base.intern.StrId` | the `platform` tag, or STR_NIL when absent |
+| `code_model` | `mach.base.intern.StrId` | the `code_model` key, mirl's psABI name of the code model, or STR_NIL for mirl's default; mirl refuses a model the target does not offer |
 | `base` | `u64` | the `base` load address, 0 when absent |
 | `stack_reserve` | `u64` | the `stack_reserve` byte count, 0 when absent |
 | `stack_commit` | `u64` | the `stack_commit` byte count, 0 when absent |
-| `ext` | `[resolved.MAX_ADDED]intern.StrId` | the `ext` names, each an identifier and listed once; the architecture refuses a name its vocabulary does not hold when the target resolves |
+| `ext` | `[resolved.MAX_ADDED]mach.base.intern.StrId` | the `ext` names, each an identifier and listed once; the architecture refuses a name its vocabulary does not hold when the target resolves |
 | `ext_count` | `u32` | how many of `ext` are set |
-| `runner` | `*intern.StrId` | the `runner` argv templates the target's programs are launched through; nil when absent. freed by `dnit` |
+| `runner` | `*mach.base.intern.StrId` | the `runner` argv templates the target's programs are launched through; nil when absent. freed by `dnit` |
 | `runner_count` | `u32` | length of `runner` |
-| `runner_at` | `*base_source.Location` | where each `runner` entry is written |
-| `at` | `base_source.Location` | where the table's key is written |
+| `runner_at` | `*mach.base.source.Location` | where each `runner` entry is written |
+| `at` | `mach.base.source.Location` | where the table's key is written |
 
 ### target_def
 
@@ -199,7 +199,7 @@ name, arch, sys and abi
 ```mach
 pub rec Origin {
     named: str;
-    at:    base_source.Location;
+    at:    mach.base.source.Location;
 }
 ```
 
@@ -210,50 +210,50 @@ to the text that wrote it
 | Field | Type | |
 | :--- | :--- | :--- |
 | `named` | `str` | the value as a refusal names it, `mach.toml: [target.x].base` or `--set base`, nil where the key was not written |
-| `at` | `base_source.Location` | where the value is written, resolved in its manifest or in the `--set` text |
+| `at` | `mach.base.source.Location` | where the value is written, resolved in its manifest or in the `--set` text |
 
 ## ArtifactDef
 
 ```mach
 pub rec ArtifactDef {
-    name:         intern.StrId;
+    name:         mach.base.intern.StrId;
     kind:         Spelled;
-    entry:        intern.StrId;
-    out:          intern.StrId;
-    targets:      *intern.StrId;
+    entry:        mach.base.intern.StrId;
+    out:          mach.base.intern.StrId;
+    targets:      *mach.base.intern.StrId;
     target_count: u32;
-    link:         *intern.StrId;
+    link:         *mach.base.intern.StrId;
     link_count:   u32;
-    need:         *intern.StrId;
+    need:         *mach.base.intern.StrId;
     need_count:   u32;
     is_default:   bool;
     is_export:    bool;
-    linkage:      intern.StrId;
+    linkage:      mach.base.intern.StrId;
     linkage_from: Origin;
-    subsystem:    *mink_subsystem.Subsystem;
+    subsystem:    *mink.catalog.subsystem.Subsystem;
     # the key was written; an omitted key is the console default, which a
     # format without the field does not refuse
     subsystem_declared: bool;
     # where `subsystem` was written, by mach.toml or by `--set`
     subsystem_from: Origin;
-    icon:           intern.StrId;
-    app_manifest:   intern.StrId;
-    sections:       *intern.StrId;
+    icon:           mach.base.intern.StrId;
+    app_manifest:   mach.base.intern.StrId;
+    sections:       *mach.base.intern.StrId;
     section_count:  u32;
-    sections_at:    *base_source.Location;
+    sections_at:    *mach.base.source.Location;
     size:           opt[u64];
-    size_at:        base_source.Location;
+    size_at:        mach.base.source.Location;
     regions:        *RegionDef;
     region_count:   u32;
-    at:             base_source.Location;
-    kind_at:        base_source.Location;
-    default_at:     base_source.Location;
-    export_at:      base_source.Location;
-    entry_at:       base_source.Location;
-    out_at:         base_source.Location;
-    targets_at:     base_source.Location;
-    link_at:        *base_source.Location;
-    need_at:        *base_source.Location;
+    at:             mach.base.source.Location;
+    kind_at:        mach.base.source.Location;
+    default_at:     mach.base.source.Location;
+    export_at:      mach.base.source.Location;
+    entry_at:       mach.base.source.Location;
+    out_at:         mach.base.source.Location;
+    targets_at:     mach.base.source.Location;
+    link_at:        *mach.base.source.Location;
+    need_at:        *mach.base.source.Location;
 }
 ```
 
@@ -262,39 +262,39 @@ manifest and freed by `dnit`
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `name` | `intern.StrId` | the table key; a portable identifier |
+| `name` | `mach.base.intern.StrId` | the table key; a portable identifier |
 | `kind` | `Spelled` | the required `kind` key, as mink's output kinds spell it |
-| `entry` | `intern.StrId` | the required `entry` key, a project-relative path under `[project].src` |
-| `out` | `intern.StrId` | the `out` key, an unexpanded path template relative to the project root; `{project.work}` places the output under the work directory. STR_NIL for an object artifact, whose objects stay under obj/ |
-| `targets` | `*intern.StrId` | the required `targets` array of declared target names or "*"; nil when empty |
+| `entry` | `mach.base.intern.StrId` | the required `entry` key, a project-relative path under `[project].src` |
+| `out` | `mach.base.intern.StrId` | the `out` key, an unexpanded path template relative to the project root; `{project.work}` places the output under the work directory. STR_NIL for an object artifact, whose objects stay under obj/ |
+| `targets` | `*mach.base.intern.StrId` | the required `targets` array of declared target names or "*"; nil when empty |
 | `target_count` | `u32` | length of `targets` |
-| `link` | `*intern.StrId` | the `link` array of `[link.<name>]` names; nil when absent or empty |
+| `link` | `*mach.base.intern.StrId` | the `link` array of `[link.<name>]` names; nil when absent or empty |
 | `link_count` | `u32` | length of `link` |
-| `need` | `*intern.StrId` | category-qualified step and artifact names or globs; nil when absent or empty |
+| `need` | `*mach.base.intern.StrId` | category-qualified step and artifact names or globs; nil when absent or empty |
 | `need_count` | `u32` | length of `need` |
 | `is_default` | `bool` | `default = true`: the artifact is in the default selection; false when the key is absent |
 | `is_export` | `bool` | `export = true`: the library a bare `use <id>;` binds and whose requirements travel to consumers; at most one artifact sets it |
-| `linkage` | `intern.StrId` | the `linkage` key, the name of mink's executable output kind, which mink resolves against the target's host; nil when absent, which takes the target's default; `bin` artifacts only |
+| `linkage` | `mach.base.intern.StrId` | the `linkage` key, the name of mink's executable output kind, which mink resolves against the target's host; nil when absent, which takes the target's default; `bin` artifacts only |
 | `linkage_from` | `Origin` | where `linkage` was written |
-| `subsystem` | `*mink_subsystem.Subsystem` | the `subsystem` key as mink spells the PE subsystem, console when absent |
-| `icon` | `intern.StrId` | the `icon` path, or STR_NIL when absent; `bin` artifacts only |
-| `app_manifest` | `intern.StrId` | the `manifest` path, or STR_NIL when absent; `bin` artifacts only |
-| `sections` | `*intern.StrId` | the `sections` key, the output sections the link places ahead of the rest, in order; nil when absent |
+| `subsystem` | `*mink.catalog.subsystem.Subsystem` | the `subsystem` key as mink spells the PE subsystem, console when absent |
+| `icon` | `mach.base.intern.StrId` | the `icon` path, or STR_NIL when absent; `bin` artifacts only |
+| `app_manifest` | `mach.base.intern.StrId` | the `manifest` path, or STR_NIL when absent; `bin` artifacts only |
+| `sections` | `*mach.base.intern.StrId` | the `sections` key, the output sections the link places ahead of the rest, in order; nil when absent |
 | `section_count` | `u32` | length of `sections` |
-| `sections_at` | `*base_source.Location` | where each `sections` entry is written, parallel to `sections` |
+| `sections_at` | `*mach.base.source.Location` | where each `sections` entry is written, parallel to `sections` |
 | `size` | `opt[u64]` | the `size` key, the most bytes the image loads from its base, none when absent |
-| `size_at` | `base_source.Location` | where its `size` value is written, the zero place when absent |
+| `size_at` | `mach.base.source.Location` | where its `size` value is written, the zero place when absent |
 | `regions` | `*RegionDef` | the `[artifact.X.region.<name>]` tables, the memory regions the link lays sections into; nil when none is written |
 | `region_count` | `u32` | length of `regions` |
-| `at` | `base_source.Location` | where the table's key is written |
-| `kind_at` | `base_source.Location` | where its `kind` value is written |
-| `default_at` | `base_source.Location` | where its `default` value is written, the zero place when absent |
-| `export_at` | `base_source.Location` | where its `export` value is written, the zero place when absent |
-| `entry_at` | `base_source.Location` | where its `entry` value is written |
-| `out_at` | `base_source.Location` | where its `out` value is written |
-| `targets_at` | `base_source.Location` | where its `targets` value is written |
-| `link_at` | `*base_source.Location` | where each `link` entry is written, parallel to `link` |
-| `need_at` | `*base_source.Location` | where each `need` entry is written, parallel to `need` |
+| `at` | `mach.base.source.Location` | where the table's key is written |
+| `kind_at` | `mach.base.source.Location` | where its `kind` value is written |
+| `default_at` | `mach.base.source.Location` | where its `default` value is written, the zero place when absent |
+| `export_at` | `mach.base.source.Location` | where its `export` value is written, the zero place when absent |
+| `entry_at` | `mach.base.source.Location` | where its `entry` value is written |
+| `out_at` | `mach.base.source.Location` | where its `out` value is written |
+| `targets_at` | `mach.base.source.Location` | where its `targets` value is written |
+| `link_at` | `*mach.base.source.Location` | where each `link` entry is written, parallel to `link` |
+| `need_at` | `*mach.base.source.Location` | where each `need` entry is written, parallel to `need` |
 
 ### artifact_def
 
@@ -310,15 +310,15 @@ sets the name, kind, entry, out and targets
 
 ```mach
 pub rec RegionDef {
-    name:       intern.StrId;
+    name:       mach.base.intern.StrId;
     origin:     u64;
     length:     u64;
     access:     u8;
-    run:        *intern.StrId;
+    run:        *mach.base.intern.StrId;
     run_count:  u32;
-    load:       *intern.StrId;
+    load:       *mach.base.intern.StrId;
     load_count: u32;
-    at:         base_source.Location;
+    at:         mach.base.source.Location;
 }
 ```
 
@@ -327,30 +327,30 @@ MEMORY lays one
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `name` | `intern.StrId` | the table key; a portable identifier |
+| `name` | `mach.base.intern.StrId` | the table key; a portable identifier |
 | `origin` | `u64` | the required `origin` key, the address it starts at |
 | `length` | `u64` | the required `length` key, the bytes it spans |
 | `access` | `u8` | the required `access` key, of mink's layout READABLE, WRITABLE and EXECUTABLE, written as the letters r, w and x |
-| `run` | `*intern.StrId` | the `run` key, the output sections that run in it; nil when absent |
+| `run` | `*mach.base.intern.StrId` | the `run` key, the output sections that run in it; nil when absent |
 | `run_count` | `u32` | length of `run` |
-| `load` | `*intern.StrId` | the `load` key, the output sections whose bytes load in it and run in another region; nil when absent |
+| `load` | `*mach.base.intern.StrId` | the `load` key, the output sections whose bytes load in it and run in another region; nil when absent |
 | `load_count` | `u32` | length of `load` |
-| `at` | `base_source.Location` | where the table's key is written |
+| `at` | `mach.base.source.Location` | where the table's key is written |
 
 ## ProfileDef
 
 ```mach
 pub rec ProfileDef {
-    name:         intern.StrId;
+    name:         mach.base.intern.StrId;
     is_default:   bool;
     optimize:     bool;
     relax:        NameList;
     linker_relax: bool;
     debug:        bool;
     simd:         SimdMode;
-    allow:        diagnostic_kind.KindSet;
-    at:           base_source.Location;
-    default_at:   base_source.Location;
+    allow:        mach.base.diagnostic.kind.KindSet;
+    at:           mach.base.source.Location;
+    default_at:   mach.base.source.Location;
 }
 ```
 
@@ -359,16 +359,16 @@ least one
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `name` | `intern.StrId` | the table key; a portable identifier |
+| `name` | `mach.base.intern.StrId` | the table key; a portable identifier |
 | `is_default` | `bool` | `default = true`; false when the key is absent. more than one default is a parse error |
 | `optimize` | `bool` | the required `optimize` key: whether the release passes run |
 | `relax` | `NameList` | the optional `relax` key: the departures from exact semantics the build permits |
 | `linker_relax` | `bool` | the optional `linker_relax` key: whether the linker may relax the code, true when the key is absent |
 | `debug` | `bool` | the required `debug` key |
 | `simd` | `SimdMode` | the required `simd` key |
-| `allow` | `diagnostic_kind.KindSet` | the optional `allow` key: the warning kinds the profile silences, empty when the key is absent |
-| `at` | `base_source.Location` | where the table's key is written |
-| `default_at` | `base_source.Location` | where its `default` value is written, the zero place when absent |
+| `allow` | `mach.base.diagnostic.kind.KindSet` | the optional `allow` key: the warning kinds the profile silences, empty when the key is absent |
+| `at` | `mach.base.source.Location` | where the table's key is written |
+| `default_at` | `mach.base.source.Location` | where its `default` value is written, the zero place when absent |
 
 ### profile_def
 
@@ -383,11 +383,11 @@ and no allow, the linker free to relax, and vectors scalarized. the caller sets 
 
 ```mach
 pub rec DepDef {
-    name:    intern.StrId;
-    git:     intern.StrId;
-    path:    intern.StrId;
-    ref:     intern.StrId;
-    version: intern.StrId;
+    name:    mach.base.intern.StrId;
+    git:     mach.base.intern.StrId;
+    path:    mach.base.intern.StrId;
+    ref:     mach.base.intern.StrId;
+    version: mach.base.intern.StrId;
 }
 ```
 
@@ -395,10 +395,10 @@ one `[dep.<name>]` table as parsed. exactly one of `git` and `path` is set
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `name` | `intern.StrId` | the table key; a portable identifier |
-| `git` | `intern.StrId` | the `git` clone URL, or STR_NIL for a path dependency |
-| `path` | `intern.StrId` | the `path` directory, or STR_NIL for a git dependency |
-| `ref` | `intern.StrId` | the `ref` key, required with `git` and rejected with `path`; one of `branch/<name>`, `tag/<name>`, `commit/<40 or 64 lowercase hex digits>`. STR_NIL for a path dependency a git dependency names exactly one of `ref` (an exact or branch selector) and `version` (a release range); STR_NIL marks the one it does not |
+| `name` | `mach.base.intern.StrId` | the table key; a portable identifier |
+| `git` | `mach.base.intern.StrId` | the `git` clone URL, or STR_NIL for a path dependency |
+| `path` | `mach.base.intern.StrId` | the `path` directory, or STR_NIL for a git dependency |
+| `ref` | `mach.base.intern.StrId` | the `ref` key, required with `git` and rejected with `path`; one of `branch/<name>`, `tag/<name>`, `commit/<40 or 64 lowercase hex digits>`. STR_NIL for a path dependency a git dependency names exactly one of `ref` (an exact or branch selector) and `version` (a release range); STR_NIL marks the one it does not |
 
 ## LinkSource
 
@@ -418,24 +418,24 @@ where a `[link.<name>]` entry is resolved from, decoded from its `source` key
 
 ```mach
 pub rec LinkDef {
-    name:               intern.StrId;
+    name:               mach.base.intern.StrId;
     source:             LinkSource;
-    lib_name:           intern.StrId;
-    path:               intern.StrId;
-    symbols:            *intern.StrId;
+    lib_name:           mach.base.intern.StrId;
+    path:               mach.base.intern.StrId;
+    symbols:            *mach.base.intern.StrId;
     symbol_count:       u32;
-    sys:                *intern.StrId;
+    sys:                *mach.base.intern.StrId;
     sys_count:          u32;
-    arch:               *intern.StrId;
+    arch:               *mach.base.intern.StrId;
     arch_count:         u32;
-    abi:                *intern.StrId;
+    abi:                *mach.base.intern.StrId;
     abi_count:          u32;
     export:             bool;
     include_referenced: bool;
-    kind:               input.Kind;
+    kind:               mach.target.input.Kind;
     versions:           LinkVersions;
-    at:                 base_source.Location;
-    path_at:            base_source.Location;
+    at:                 mach.base.source.Location;
+    path_at:            mach.base.source.Location;
 }
 ```
 
@@ -444,24 +444,24 @@ and freed by `dnit`
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `name` | `intern.StrId` | the table key: the entry's identity, which a `#[library]` attribution names |
+| `name` | `mach.base.intern.StrId` | the table key: the entry's identity, which a `#[library]` attribution names |
 | `source` | `LinkSource` | the required `source` key |
-| `lib_name` | `intern.StrId` | the `name` key, required for system and framework sources and rejected for local; STR_NIL for local |
-| `path` | `intern.StrId` | the `path` key, required for a local source and rejected otherwise; a project-relative path template, STR_NIL for non-local |
-| `symbols` | `*intern.StrId` | the `symbols` array; every entry non-empty and unique; nil when absent |
+| `lib_name` | `mach.base.intern.StrId` | the `name` key, required for system and framework sources and rejected for local; STR_NIL for local |
+| `path` | `mach.base.intern.StrId` | the `path` key, required for a local source and rejected otherwise; a project-relative path template, STR_NIL for non-local |
+| `symbols` | `*mach.base.intern.StrId` | the `symbols` array; every entry non-empty and unique; nil when absent |
 | `symbol_count` | `u32` | length of `symbols` |
-| `sys` | `*intern.StrId` | the required `sys` filter axis, each value canonical or "*"; nil for `[]`, which matches no target |
+| `sys` | `*mach.base.intern.StrId` | the required `sys` filter axis, each value canonical or "*"; nil for `[]`, which matches no target |
 | `sys_count` | `u32` | length of `sys` |
-| `arch` | `*intern.StrId` | the `arch` filter axis, as `sys` |
+| `arch` | `*mach.base.intern.StrId` | the `arch` filter axis, as `sys` |
 | `arch_count` | `u32` | length of `arch` |
-| `abi` | `*intern.StrId` | the `abi` filter axis, as `sys` |
+| `abi` | `*mach.base.intern.StrId` | the `abi` filter axis, as `sys` |
 | `abi_count` | `u32` | length of `abi` |
 | `export` | `bool` | the `export` key; false when absent |
 | `include_referenced` | `bool` | the `include` key: false for "always" (the default), true for "referenced" |
-| `kind` | `input.Kind` | the `kind` key, written only on a system source that names a library by a bare name; SHARED when absent |
+| `kind` | `mach.target.input.Kind` | the `kind` key, written only on a system source that names a library by a bare name; SHARED when absent |
 | `versions` | `LinkVersions` | the `current_version` and `compatibility_version` keys, written only on a system source of the shared kind; unstated when absent |
-| `at` | `base_source.Location` | where the table's key is written |
-| `path_at` | `base_source.Location` | where the `path` value is written, the zero place when absent |
+| `at` | `mach.base.source.Location` | where the table's key is written |
+| `path_at` | `mach.base.source.Location` | where the `path` value is written, the zero place when absent |
 
 ### link_def
 
@@ -497,28 +497,28 @@ and the patch in 8 bits each
 
 ```mach
 pub rec StepDef {
-    name:         intern.StrId;
-    argv:         *intern.StrId;
+    name:         mach.base.intern.StrId;
+    argv:         *mach.base.intern.StrId;
     argv_count:   u32;
-    env_keys:     *intern.StrId;
-    env_values:   *intern.StrId;
+    env_keys:     *mach.base.intern.StrId;
+    env_values:   *mach.base.intern.StrId;
     env_count:    u32;
-    env_in:       *intern.StrId;
+    env_in:       *mach.base.intern.StrId;
     env_in_count: u32;
-    in:           *intern.StrId;
+    in:           *mach.base.intern.StrId;
     in_count:     u32;
-    out:          *intern.StrId;
+    out:          *mach.base.intern.StrId;
     out_count:    u32;
-    need:         *intern.StrId;
+    need:         *mach.base.intern.StrId;
     need_count:   u32;
-    timeout:      chrono_duration.Duration;
-    at:           base_source.Location;
-    argv_at:      *base_source.Location;
-    env_at:       *base_source.Location;
-    env_in_at:    *base_source.Location;
-    in_at:        *base_source.Location;
-    out_at:       *base_source.Location;
-    need_at:      *base_source.Location;
+    timeout:      std.chrono.duration.Duration;
+    at:           mach.base.source.Location;
+    argv_at:      *mach.base.source.Location;
+    env_at:       *mach.base.source.Location;
+    env_in_at:    *mach.base.source.Location;
+    in_at:        *mach.base.source.Location;
+    out_at:       *mach.base.source.Location;
+    need_at:      *mach.base.source.Location;
 }
 ```
 
@@ -527,33 +527,33 @@ and freed by `dnit`. the removed keys `cmd` and `shell` are rejected by name
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `name` | `intern.StrId` | the table key; an identifier |
-| `argv` | `*intern.StrId` | the required, non-empty `argv` array; `argv[0]` is non-empty |
+| `name` | `mach.base.intern.StrId` | the table key; an identifier |
+| `argv` | `*mach.base.intern.StrId` | the required, non-empty `argv` array; `argv[0]` is non-empty |
 | `argv_count` | `u32` | length of `argv` |
-| `env_keys` | `*intern.StrId` | keys of the `env` table, sorted case-insensitively then bytewise; every key non-empty, free of '=', and unique ignoring case. nil when absent |
-| `env_values` | `*intern.StrId` | the string value of each key, parallel to `env_keys` |
+| `env_keys` | `*mach.base.intern.StrId` | keys of the `env` table, sorted case-insensitively then bytewise; every key non-empty, free of '=', and unique ignoring case. nil when absent |
+| `env_values` | `*mach.base.intern.StrId` | the string value of each key, parallel to `env_keys` |
 | `env_count` | `u32` | length of both `env` arrays |
-| `env_in` | `*intern.StrId` | the `env_in` array: names of inherited variables the step reads, each non-empty, free of '=', and distinct by host name identity. nil when absent |
+| `env_in` | `*mach.base.intern.StrId` | the `env_in` array: names of inherited variables the step reads, each non-empty, free of '=', and distinct by host name identity. nil when absent |
 | `env_in_count` | `u32` | length of `env_in` |
-| `in` | `*intern.StrId` | the required `in` array of project-relative paths |
+| `in` | `*mach.base.intern.StrId` | the required `in` array of project-relative paths |
 | `in_count` | `u32` | length of `in` |
-| `out` | `*intern.StrId` | the required `out` array of project-relative paths; a '*' is rejected |
+| `out` | `*mach.base.intern.StrId` | the required `out` array of project-relative paths; a '*' is rejected |
 | `out_count` | `u32` | length of `out` |
-| `need` | `*intern.StrId` | the `need` array of step-qualified names or globs; nil when absent or empty |
+| `need` | `*mach.base.intern.StrId` | the `need` array of step-qualified names or globs; nil when absent or empty |
 | `need_count` | `u32` | length of `need` |
-| `timeout` | `chrono_duration.Duration` | the `timeout` key, a duration such as "30s"; 0 when absent |
-| `at` | `base_source.Location` | where the table's key is written |
-| `argv_at` | `*base_source.Location` | where each `argv` entry is written, parallel to `argv` |
-| `env_at` | `*base_source.Location` | where each `env` value is written, parallel to `env_values` |
-| `env_in_at` | `*base_source.Location` | where each `env_in` entry is written, parallel to `env_in` |
-| `in_at` | `*base_source.Location` | where each `in` entry is written, parallel to `in` |
-| `out_at` | `*base_source.Location` | where each `out` entry is written, parallel to `out` |
-| `need_at` | `*base_source.Location` | where each `need` entry is written, parallel to `need` |
+| `timeout` | `std.chrono.duration.Duration` | the `timeout` key, a duration such as "30s"; 0 when absent |
+| `at` | `mach.base.source.Location` | where the table's key is written |
+| `argv_at` | `*mach.base.source.Location` | where each `argv` entry is written, parallel to `argv` |
+| `env_at` | `*mach.base.source.Location` | where each `env` value is written, parallel to `env_values` |
+| `env_in_at` | `*mach.base.source.Location` | where each `env_in` entry is written, parallel to `env_in` |
+| `in_at` | `*mach.base.source.Location` | where each `in` entry is written, parallel to `in` |
+| `out_at` | `*mach.base.source.Location` | where each `out` entry is written, parallel to `out` |
+| `need_at` | `*mach.base.source.Location` | where each `need` entry is written, parallel to `need` |
 
 ### step_dnit
 
 ```mach
-pub fun step_dnit(alloc: *A.Allocator, s: *StepDef)
+pub fun step_dnit(alloc: *std.allocator.Allocator, s: *StepDef)
 ```
 
 free every array a step owns, its entries and the places they are written at;
@@ -563,8 +563,8 @@ the step itself is its owner's
 
 ```mach
 pub rec SourceRoot {
-    name: intern.StrId;
-    dir:  intern.StrId;
+    name: mach.base.intern.StrId;
+    dir:  mach.base.intern.StrId;
 }
 ```
 
@@ -573,24 +573,24 @@ no manifest, whose modules are the files under the directory
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `name` | `intern.StrId` | the prefix, a portable identifier |
-| `dir` | `intern.StrId` | the directory, as the command line wrote it |
+| `name` | `mach.base.intern.StrId` | the prefix, a portable identifier |
+| `dir` | `mach.base.intern.StrId` | the directory, as the command line wrote it |
 
 ## Manifest
 
 ```mach
 pub rec Manifest {
-    id:      intern.StrId;
-    version: intern.StrId;
+    id:      mach.base.intern.StrId;
+    version: mach.base.intern.StrId;
     # the compiler range [project].mach states, STR_NIL when the key is absent
-    mach: intern.StrId;
+    mach: mach.base.intern.StrId;
     # where the `[project]` table and its `mach` value are written, each place's
     # path the interner's; the zero place when not written
-    project_at:     base_source.Location;
-    mach_at:        base_source.Location;
-    src:            intern.StrId;
-    work_tmpl:      intern.StrId;
-    work_at:        base_source.Location;
+    project_at:     mach.base.source.Location;
+    mach_at:        mach.base.source.Location;
+    src:            mach.base.intern.StrId;
+    work_tmpl:      mach.base.intern.StrId;
+    work_at:        mach.base.source.Location;
     targets:        *TargetDef;
     target_count:   u32;
     native_target:  *TargetDef;
@@ -608,8 +608,8 @@ pub rec Manifest {
     source_count:   u32;
     # the session input the manifest was read from and the revision it had,
     # FILE_NIL when no session input states it, as for an entry build or text no session holds
-    source:          base_source.FileId;
-    source_revision: query.Revision;
+    source:          mach.base.source.FileId;
+    source_revision: mach.session.query.Revision;
 }
 ```
 
@@ -621,11 +621,11 @@ that caused it
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `id` | `intern.StrId` | the required `[project].id`, a portable identifier |
-| `version` | `intern.StrId` | the required `[project].version`, carried verbatim |
-| `src` | `intern.StrId` | the required `[project].src`, a project-relative path |
-| `work_tmpl` | `intern.StrId` | the required `[project].work`, an unexpanded path template for the work directory |
-| `work_at` | `base_source.Location` | where `[project].work` is written |
+| `id` | `mach.base.intern.StrId` | the required `[project].id`, a portable identifier |
+| `version` | `mach.base.intern.StrId` | the required `[project].version`, carried verbatim |
+| `src` | `mach.base.intern.StrId` | the required `[project].src`, a project-relative path |
+| `work_tmpl` | `mach.base.intern.StrId` | the required `[project].work`, an unexpanded path template for the work directory |
+| `work_at` | `mach.base.source.Location` | where `[project].work` is written |
 | `targets` | `*TargetDef` | the `[target.*]` tables, nil when none |
 | `target_count` | `u32` | length of `targets` |
 | `native_target` | `*TargetDef` | the owned synthesized host definition when no targets are declared |
@@ -658,7 +658,7 @@ unset, so only `dnit` is safe on the result
 ### dnit
 
 ```mach
-pub fun dnit(m: *Manifest, alloc: *A.Allocator)
+pub fun dnit(m: *Manifest, alloc: *std.allocator.Allocator)
 ```
 
 free every array a parsed manifest owns and zero the counts. safe on the
@@ -674,13 +674,13 @@ result of `init` and on a manifest already released
 ### free_strarr
 
 ```mach
-pub fun free_strarr(alloc: *A.Allocator, items: *intern.StrId, count: u32)
+pub fun free_strarr(alloc: *std.allocator.Allocator, items: *mach.base.intern.StrId, count: u32)
 ```
 
 ### site_of
 
 ```mach
-pub fun site_of(sites: *base_source.Location, i: u32) base_source.Location
+pub fun site_of(sites: *mach.base.source.Location, i: u32) mach.base.source.Location
 ```
 
 the place `i` of a model's per-entry places, the zero place when none were recorded
@@ -688,7 +688,7 @@ the place `i` of a model's per-entry places, the zero place when none were recor
 ### id_of
 
 ```mach
-pub fun id_of(itn: *intern.Interner, text: str) res[intern.StrId, fail.Fail]
+pub fun id_of(itn: *mach.base.intern.Interner, text: str) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
 the id of `text`, interned in `itn`; a refused allocation is the failure
@@ -696,7 +696,7 @@ the id of `text`, interned in `itn`; a refused allocation is the failure
 ### optional_id_of
 
 ```mach
-pub fun optional_id_of(itn: *intern.Interner, text: str) res[intern.StrId, fail.Fail]
+pub fun optional_id_of(itn: *mach.base.intern.Interner, text: str) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
 `id_of` for an optional key's value: STR_NIL for the empty text an absent key reads as

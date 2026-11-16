@@ -5,9 +5,9 @@
 the scope a comptime evaluation runs in: the description of the build, the stages'
 bindings over a module, its frames and the gates it decided
 
-<sub>source: [`src/front/comptime/scope.mach`](../../../../src/front/comptime/scope.mach) · imported by 28 modules</sub>
+Source: [`src/front/comptime/scope.mach`](../../../../src/front/comptime/scope.mach)
 
-<sub>`intern` is [`mach.base.intern`](../../base/intern.md) · `comptime_value` is [`mach.front.comptime.value`](value.md) · `A` is `std.allocator` · `target_facts` is [`mach.target.facts`](../../target/facts.md) · `extent` is [`mach.type.query.extent`](../../type/query/extent.md) · `SourceFacts` is private · `map` is `std.collections.map` · `fail` is [`mach.base.fail`](../../base/fail.md) · `Stage` is private · `base_source` is [`mach.base.source`](../../base/source.md) · `ast_id` is [`mach.front.ast.id`](../ast/id.md) · `comptime_capability` is [`mach.front.comptime.capability`](capability.md) · `comptime_failure` is [`mach.front.comptime.failure`](failure.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.base.source`](../../base/source.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.comptime.capability`](capability.md), [`mach.front.comptime.failure`](failure.md), [`mach.front.comptime.value`](value.md), [`mach.target.facts`](../../target/facts.md), [`mach.type.query.extent`](../../type/query/extent.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -23,7 +23,7 @@ bindings over a module, its frames and the gates it decided
 
 | On `GateState` | |
 | :--- | :--- |
-| [`GATE_STATE_UNKNOWN`](#gatestate) · [`GATE_STATE_TRUE`](#gatestate) · [`GATE_STATE_FALSE`](#gatestate) · [`GATE_STATE_REJECTED`](#gatestate) | |
+| [`GATE_STATE_UNKNOWN`](#gatestate), [`GATE_STATE_TRUE`](#gatestate), [`GATE_STATE_FALSE`](#gatestate), [`GATE_STATE_REJECTED`](#gatestate) | |
 
 | On `ComptimeEnv` | |
 | :--- | :--- |
@@ -36,7 +36,7 @@ bindings over a module, its frames and the gates it decided
 
 | On `EmbedPathKind` | |
 | :--- | :--- |
-| [`EMBED_PATH_RESOLVED`](#embedpathkind) · [`EMBED_PATH_NO_LOCATION`](#embedpathkind) · [`EMBED_PATH_REFUSED`](#embedpathkind) · [`EMBED_PATH_ESCAPED`](#embedpathkind) | |
+| [`EMBED_PATH_RESOLVED`](#embedpathkind), [`EMBED_PATH_NO_LOCATION`](#embedpathkind), [`EMBED_PATH_REFUSED`](#embedpathkind), [`EMBED_PATH_ESCAPED`](#embedpathkind) | |
 
 | On `Bindings` | |
 | :--- | :--- |
@@ -57,7 +57,7 @@ bindings over a module, its frames and the gates it decided
 | [`dnit`](#dnit) | release the scope's own bindings; what it reads below belongs to the stages that made it |
 | [`prepare_gates`](#prepare_gates) | size the scope's own gate decisions for a module tree of `expr_count` expressions |
 | [`gate_state`](#gate_state) | the decision on a gate: the scope's own, else the latest stage's below it that made one |
-| [`set_gate_state`](#set_gate_state) · [`defer_float_width`](#defer_float_width) · [`float_width_deferred`](#float_width_deferred) · [`bind`](#bind) · [`frame_begin`](#frame_begin) · [`frame_end`](#frame_end) | |
+| [`set_gate_state`](#set_gate_state), [`defer_float_width`](#defer_float_width), [`float_width_deferred`](#float_width_deferred), [`bind`](#bind), [`frame_begin`](#frame_begin), [`frame_end`](#frame_end) | |
 | [`lookup`](#lookup) | the constant `name` is bound to: the scope's own latest binding, else the latest stage's below it |
 | [`decorator_string_set`](#decorator_string_set) | record the string the decorator argument `arg` evaluates to |
 | [`decorator_string_at`](#decorator_string_at) | the string the decorator argument `arg` evaluates to, as the load recorded it; STR_NIL when it is not a constant string |
@@ -69,7 +69,7 @@ bindings over a module, its frames and the gates it decided
 
 | Constants | |
 | :--- | :--- |
-| [`STAGE_LOAD`](#constants) · [`STAGE_RESOLVE`](#constants) · [`STAGE_SEMA`](#constants) · [`STAGE_LOWER`](#constants) | |
+| [`STAGE_LOAD`](#constants), [`STAGE_RESOLVE`](#constants), [`STAGE_SEMA`](#constants), [`STAGE_LOWER`](#constants) | |
 
 ---
 
@@ -90,8 +90,8 @@ pub def GateState: u8
 
 ```mach
 pub rec NamedConst {
-    name:  intern.StrId;
-    value: comptime_value.CTValue;
+    name:  mach.base.intern.StrId;
+    value: mach.front.comptime.value.CTValue;
 }
 ```
 
@@ -111,9 +111,9 @@ pub rec FrameMark {
 
 ```mach
 pub rec ComptimeEnv {
-    alloc:  *A.Allocator;
-    target: target_facts.Facts;
-    laying: *extent.Laying;
+    alloc:  *std.allocator.Allocator;
+    target: mach.target.facts.Facts;
+    laying: *mach.type.query.extent.Laying;
     build:  BuildFacts;
     source: SourceFacts;
 }
@@ -125,7 +125,7 @@ laying: what the build lays its types out by, borrowed from its back end, nil wh
 ### lowering_over
 
 ```mach
-pub fun lowering_over(env: ComptimeEnv, load: *Bindings, resolved: *Bindings, typed: *Bindings, alloc: *A.Allocator) ComptimeCtx
+pub fun lowering_over(env: ComptimeEnv, load: *Bindings, resolved: *Bindings, typed: *Bindings, alloc: *std.allocator.Allocator) ComptimeCtx
 ```
 
 a lowering scope over the description `env` that reads the bindings the load, resolve and sema
@@ -137,15 +137,15 @@ made, and binds its own from `alloc`; nothing it binds reaches the bindings it r
 pub rec BuildFacts {
     mode_id:       u32;
     pie:           u32;
-    compiler_name: intern.StrId;
-    compiler_ver:  intern.StrId;
-    project_id:    intern.StrId;
-    project_ver:   intern.StrId;
-    os_name:       intern.StrId;
-    isa_name:      intern.StrId;
-    abi_name:      intern.StrId;
-    platform_name: intern.StrId;
-    bin_name:      intern.StrId;
+    compiler_name: mach.base.intern.StrId;
+    compiler_ver:  mach.base.intern.StrId;
+    project_id:    mach.base.intern.StrId;
+    project_ver:   mach.base.intern.StrId;
+    os_name:       mach.base.intern.StrId;
+    isa_name:      mach.base.intern.StrId;
+    abi_name:      mach.base.intern.StrId;
+    platform_name: mach.base.intern.StrId;
+    bin_name:      mach.base.intern.StrId;
 }
 ```
 
@@ -155,7 +155,7 @@ names its target entry gives the os, isa, abi and platform, and the binary
 ### build_facts
 
 ```mach
-pub fun build_facts(mode_id: u32, pie: u32, compiler_name: intern.StrId, compiler_ver: intern.StrId) BuildFacts
+pub fun build_facts(mode_id: u32, pie: u32, compiler_name: mach.base.intern.StrId, compiler_ver: mach.base.intern.StrId) BuildFacts
 ```
 
 the build facts of a build that names no project, artifact or target entry
@@ -163,7 +163,7 @@ the build facts of a build that names no project, artifact or target entry
 ### init
 
 ```mach
-pub fun init(alloc: *A.Allocator, target: target_facts.Facts, build: BuildFacts) ComptimeCtx
+pub fun init(alloc: *std.allocator.Allocator, target: mach.target.facts.Facts, build: BuildFacts) ComptimeCtx
 ```
 
 a load scope over the target and build `target` and `build` describe, with no module yet
@@ -195,8 +195,8 @@ what the load made of an `embed` argument
 ```mach
 pub rec EmbedPath {
     kind:     EmbedPathKind;
-    text:     intern.StrId;
-    artifact: intern.StrId;
+    text:     mach.base.intern.StrId;
+    artifact: mach.base.intern.StrId;
 }
 ```
 
@@ -206,20 +206,20 @@ artifact: the artifact whose output a resolved template names, nil when it names
 
 ```mach
 pub rec Bindings {
-    alloc:        *A.Allocator;
+    alloc:        *std.allocator.Allocator;
     entries:      *NamedConst;
     entries_len:  u32;
     entries_cap:  u32;
     shadows:      *u32;
     shadows_cap:  u32;
-    latest:       map.Map[intern.StrId, u32];
-    deferred:     *intern.StrId;
+    latest:       std.collections.map.Map[mach.base.intern.StrId, u32];
+    deferred:     *mach.base.intern.StrId;
     deferred_len: u32;
     deferred_cap: u32;
     gate_states:  *GateState;
     gate_count:   u32;
-    strings:      map.Map[u32, intern.StrId];
-    embeds:       map.Map[u32, EmbedPath];
+    strings:      std.collections.map.Map[u32, mach.base.intern.StrId];
+    embeds:       std.collections.map.Map[u32, EmbedPath];
 }
 ```
 
@@ -229,16 +229,16 @@ what one stage binds over one module, which that stage alone writes and every la
 | :--- | :--- | :--- |
 | `entries` | `*NamedConst` | its constants, innermost last |
 | `shadows` | `*u32` | per entry, one past the index of the entry of its name it shadows, 0 where none |
-| `latest` | `map.Map[intern.StrId, u32]` | by name, one past the index of its innermost entry |
-| `deferred` | `*intern.StrId` | the names whose float width only type checking can read |
+| `latest` | `std.collections.map.Map[mach.base.intern.StrId, u32]` | by name, one past the index of its innermost entry |
+| `deferred` | `*mach.base.intern.StrId` | the names whose float width only type checking can read |
 | `gate_states` | `*GateState` | the gates it decided, by condition |
-| `strings` | `map.Map[u32, intern.StrId]` | the string each decorator argument evaluates to, by argument; only the load records them |
-| `embeds` | `map.Map[u32, EmbedPath]` | what each `embed` argument names, by argument; only the load records them |
+| `strings` | `std.collections.map.Map[u32, mach.base.intern.StrId]` | the string each decorator argument evaluates to, by argument; only the load records them |
+| `embeds` | `std.collections.map.Map[u32, EmbedPath]` | what each `embed` argument names, by argument; only the load records them |
 
 ### bindings_init
 
 ```mach
-pub fun bindings_init(alloc: *A.Allocator) Bindings
+pub fun bindings_init(alloc: *std.allocator.Allocator) Bindings
 ```
 
 ### bindings_dnit
@@ -252,7 +252,7 @@ release a binding list; a nil list, or one never made, holds nothing
 ### bindings_copy
 
 ```mach
-pub fun bindings_copy(b: *Bindings, alloc: *A.Allocator) res[Bindings, fail.Fail]
+pub fun bindings_copy(b: *Bindings, alloc: *std.allocator.Allocator) res[Bindings, mach.base.fail.Fail]
 ```
 
 an owned copy of `b` from `alloc`, which reads as `b` does
@@ -287,7 +287,7 @@ pub fun environment(c: *ComptimeCtx) ComptimeEnv
 ### stage_init
 
 ```mach
-pub fun stage_init(load: *ComptimeCtx, stage: Stage, alloc: *A.Allocator) ComptimeCtx
+pub fun stage_init(load: *ComptimeCtx, stage: Stage, alloc: *std.allocator.Allocator) ComptimeCtx
 ```
 
 the scope `stage` evaluates a module in, over the load's scope of the module: the load's
@@ -298,7 +298,7 @@ binds is allocated from `alloc`, which outlives the product the bindings are pub
 
 ```mach
 pub fun lowering_prepare(scope: *ComptimeCtx, made: *bool, load: *ComptimeCtx, expr_count: u32,
-    resolved: *Bindings, typed: *Bindings) err[fail.Fail]
+    resolved: *Bindings, typed: *Bindings) err[mach.base.fail.Fail]
 ```
 
 make or bring up to date the scope lowering binds a module's constants in, over what the
@@ -342,8 +342,8 @@ hand the bindings the scope's stage made to its product; the scope keeps none
 ### set_source_context
 
 ```mach
-pub fun set_source_context(c: *ComptimeCtx, sources: *base_source.SourceMap, module: intern.StrId, file: intern.StrId,
-    owner_id: intern.StrId, owner_ver: intern.StrId)
+pub fun set_source_context(c: *ComptimeCtx, sources: *mach.base.source.SourceMap, module: mach.base.intern.StrId, file: mach.base.intern.StrId,
+    owner_id: mach.base.intern.StrId, owner_ver: mach.base.intern.StrId)
 ```
 
 the module a context compiles, what `$mach.source.*` and `$mach.project.*` read
@@ -367,7 +367,7 @@ a nil scope holds nothing
 ### prepare_gates
 
 ```mach
-pub fun prepare_gates(c: *ComptimeCtx, expr_count: u32) err[fail.Fail]
+pub fun prepare_gates(c: *ComptimeCtx, expr_count: u32) err[mach.base.fail.Fail]
 ```
 
 size the scope's own gate decisions for a module tree of `expr_count` expressions
@@ -375,7 +375,7 @@ size the scope's own gate decisions for a module tree of `expr_count` expression
 ### gate_state
 
 ```mach
-pub fun gate_state(c: *ComptimeCtx, eid: ast_id.ExprId) GateState
+pub fun gate_state(c: *ComptimeCtx, eid: mach.front.ast.id.ExprId) GateState
 ```
 
 the decision on a gate: the scope's own, else the latest stage's below it that made one
@@ -383,43 +383,43 @@ the decision on a gate: the scope's own, else the latest stage's below it that m
 ### set_gate_state
 
 ```mach
-pub fun set_gate_state(c: *ComptimeCtx, eid: ast_id.ExprId, state: GateState)
+pub fun set_gate_state(c: *ComptimeCtx, eid: mach.front.ast.id.ExprId, state: GateState)
 ```
 
 ### defer_float_width
 
 ```mach
-pub fun defer_float_width(c: *ComptimeCtx, name: intern.StrId) err[fail.Fail]
+pub fun defer_float_width(c: *ComptimeCtx, name: mach.base.intern.StrId) err[mach.base.fail.Fail]
 ```
 
 ### float_width_deferred
 
 ```mach
-pub fun float_width_deferred(c: *ComptimeCtx, name: intern.StrId) bool
+pub fun float_width_deferred(c: *ComptimeCtx, name: mach.base.intern.StrId) bool
 ```
 
 ### bind
 
 ```mach
-pub fun bind(c: *ComptimeCtx, name: intern.StrId, value: comptime_value.CTValue) err[fail.Fail]
+pub fun bind(c: *ComptimeCtx, name: mach.base.intern.StrId, value: mach.front.comptime.value.CTValue) err[mach.base.fail.Fail]
 ```
 
 ### frame_begin
 
 ```mach
-pub fun frame_begin(c: *ComptimeCtx) res[FrameMark, fail.Fail]
+pub fun frame_begin(c: *ComptimeCtx) res[FrameMark, mach.base.fail.Fail]
 ```
 
 ### frame_end
 
 ```mach
-pub fun frame_end(c: *ComptimeCtx, mark: FrameMark) err[fail.Fail]
+pub fun frame_end(c: *ComptimeCtx, mark: FrameMark) err[mach.base.fail.Fail]
 ```
 
 ### lookup
 
 ```mach
-pub fun lookup(c: *ComptimeCtx, name: intern.StrId) opt[NamedConst]
+pub fun lookup(c: *ComptimeCtx, name: mach.base.intern.StrId) opt[NamedConst]
 ```
 
 the constant `name` is bound to: the scope's own latest binding, else the latest stage's below it
@@ -427,7 +427,7 @@ the constant `name` is bound to: the scope's own latest binding, else the latest
 ### decorator_string_set
 
 ```mach
-pub fun decorator_string_set(c: *ComptimeCtx, arg: ast_id.ExprId, value: intern.StrId) err[fail.Fail]
+pub fun decorator_string_set(c: *ComptimeCtx, arg: mach.front.ast.id.ExprId, value: mach.base.intern.StrId) err[mach.base.fail.Fail]
 ```
 
 record the string the decorator argument `arg` evaluates to
@@ -435,7 +435,7 @@ record the string the decorator argument `arg` evaluates to
 ### decorator_string_at
 
 ```mach
-pub fun decorator_string_at(c: *ComptimeCtx, arg: ast_id.ExprId) intern.StrId
+pub fun decorator_string_at(c: *ComptimeCtx, arg: mach.front.ast.id.ExprId) mach.base.intern.StrId
 ```
 
 the string the decorator argument `arg` evaluates to, as the load recorded it; STR_NIL when it is
@@ -444,7 +444,7 @@ not a constant string
 ### decorator_embed_set
 
 ```mach
-pub fun decorator_embed_set(c: *ComptimeCtx, arg: ast_id.ExprId, path: EmbedPath) err[fail.Fail]
+pub fun decorator_embed_set(c: *ComptimeCtx, arg: mach.front.ast.id.ExprId, path: EmbedPath) err[mach.base.fail.Fail]
 ```
 
 record what the `embed` argument `arg` names
@@ -452,7 +452,7 @@ record what the `embed` argument `arg` names
 ### decorator_embed_at
 
 ```mach
-pub fun decorator_embed_at(c: *ComptimeCtx, arg: ast_id.ExprId) opt[EmbedPath]
+pub fun decorator_embed_at(c: *ComptimeCtx, arg: mach.front.ast.id.ExprId) opt[EmbedPath]
 ```
 
 what the `embed` argument `arg` names, as the load recorded it; none when it recorded nothing
@@ -460,7 +460,7 @@ what the `embed` argument `arg` names, as the load recorded it; none when it rec
 ### decorator_embed_file
 
 ```mach
-pub fun decorator_embed_file(c: *ComptimeCtx, arg: ast_id.ExprId) intern.StrId
+pub fun decorator_embed_file(c: *ComptimeCtx, arg: mach.front.ast.id.ExprId) mach.base.intern.StrId
 ```
 
 the file the `embed` argument `arg` names, as the load resolved it; STR_NIL when it names none
@@ -477,7 +477,7 @@ drop every decorator record of the scope's own, before they are recorded again
 ### field_type_of_binding
 
 ```mach
-pub fun field_type_of_binding[T](c: *ComptimeCtx, cap_ctx: *T, caps: comptime_capability.PhaseCapabilities[T], name: intern.StrId) res[opt[u32], comptime_failure.EvalFail]
+pub fun field_type_of_binding[T](c: *ComptimeCtx, cap_ctx: *T, caps: mach.front.comptime.capability.PhaseCapabilities[T], name: mach.base.intern.StrId) res[opt[u32], mach.front.comptime.failure.EvalFail]
 ```
 
 ## Constants

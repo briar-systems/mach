@@ -6,9 +6,9 @@ one walk over the type graph: a property is a leaf predicate, and the walk follo
 the edges the property names from a type to the types it is built from. an aggregate is
 entered once per scan, and a type id the store does not hold is an internal failure
 
-<sub>source: [`src/type/visit.mach`](../../../src/type/visit.mach) · imported by 5 modules</sub>
+Source: [`src/type/visit.mach`](../../../src/type/visit.mach)
 
-<sub>`type` is [`mach.type`](../type.md) · `report_phase` is [`mach.report.phase`](../report/phase.md) · `type_scan` is [`mach.type.scan`](scan.md) · `type_kind` is [`mach.type.kind`](kind.md)</sub>
+Uses types from [`mach.report.phase`](../report/phase.md), [`mach.type`](../type.md), [`mach.type.kind`](kind.md), [`mach.type.scan`](scan.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -76,24 +76,24 @@ what a leaf predicate says of one type
 
 ```mach
 pub rec Walk[C] {
-    types:  *type.TypeInterner;
-    status: *report_phase.PhaseStatus;
+    types:  *mach.type.TypeInterner;
+    status: *mach.report.phase.PhaseStatus;
     # the aggregates already entered; nil enters each every time it is met
-    scan: *type_scan.Scan;
+    scan: *mach.type.scan.Scan;
     # with a scan, every type is entered once, not only an aggregate: for a property whose
     # answer below a type does not depend on the path the walk took to it, so a scan shared
     # across many roots visits each type once in all
     once:  bool;
     edges: Edges;
     ctx:   *C;
-    leaf:  fun(*C, type_kind.TypeId, *type.Type) Verdict;
+    leaf:  fun(*C, mach.type.kind.TypeId, *mach.type.Type) Verdict;
 }
 ```
 
 ### reaches
 
 ```mach
-pub fun reaches[C](w: *Walk[C], tid: type_kind.TypeId) bool
+pub fun reaches[C](w: *Walk[C], tid: mach.type.kind.TypeId) bool
 ```
 
 whether the property holds at `tid` or below it; false once the walk has failed. the walk

@@ -5,9 +5,9 @@
 pull: `mach dep pull`, which realizes a project's dependency closure and refuses one that
 pins a package at more than one commit
 
-<sub>source: [`src/package/pull.mach`](../../../src/package/pull.mach) · imported by 1 module</sub>
+Source: [`src/package/pull.mach`](../../../src/package/pull.mach)
 
-<sub>`session` is [`mach.session`](../session.md) · `A` is `std.allocator` · `report` is [`mach.package.report`](report.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.package.report`](report.md), [`mach.session`](../session.md).
 
 | Functions | |
 | :--- | :--- |
@@ -20,7 +20,7 @@ pins a package at more than one commit
 ### project_closure
 
 ```mach
-pub fun project_closure(s: *session.Session, a: *A.Allocator, root: str, quiet: bool, rep: *report.Report) err[fail.Fail]
+pub fun project_closure(s: *mach.session.Session, a: *std.allocator.Allocator, root: str, quiet: bool, rep: *mach.package.report.Report) err[mach.base.fail.Fail]
 ```
 
 realize the dependency closure of a project: acquire every declared dependency

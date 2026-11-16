@@ -2,10 +2,11 @@
 
 # mach.front.parser
 
-the parser's entry: one token stream parsed into a syntax tree, then its docstrings
-linted, the tree handed back only when the parse completed
+the parser's entry: one token stream parsed into a syntax tree, handed back only when
+the parse completed. its docstrings are linted by name resolution, for the project's
+own modules only
 
-<sub>[`mach.front.parser`](../parser.md) · 3 modules · imports [`base`](../../base/README.md), [`report`](../../report/README.md) · imported by [`compile`](../../compile/README.md), [`tool`](../../tool/README.md)</sub>
+The directory's root module is [`mach.front.parser`](../parser.md).
 
 | Module | |
 | :--- | :--- |

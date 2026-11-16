@@ -8,9 +8,9 @@ module's products stay while any retainer holds it. a build records the modules 
 its retainer in rounds; a module no retainer holds any more is released, and its products are
 retired the next time the session is idle
 
-<sub>source: [`src/session/retention.mach`](../../../src/session/retention.mach) · imported by 3 modules</sub>
+Source: [`src/session/retention.mach`](../../../src/session/retention.mach)
 
-<sub>`A` is `std.allocator` · `Retainer` is private · `Held` is private · `fail` is [`mach.base.fail`](../base/fail.md) · `module` is [`mach.session.module`](module.md) · `base_source` is [`mach.base.source`](../base/source.md) · `query` is [`mach.session.query`](query.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.session.module`](module.md), [`mach.session.query`](query.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -24,7 +24,7 @@ retired the next time the session is idle
 
 | On `Retention` | |
 | :--- | :--- |
-| [`init`](#init) · [`dnit`](#dnit) | |
+| [`init`](#init), [`dnit`](#dnit) | |
 | [`acquire`](#acquire) | a new retainer holding nothing, in a free slot when one exists |
 | [`record`](#record) | a module the open round loaded; held from now on, so nothing retires it under the build |
 | [`reject`](#reject) | the rejected flag of the open round, for a load that ended before it reached any module |
@@ -56,7 +56,7 @@ pub fun retainer_same(left: RetainerId, right: RetainerId) bool
 
 ```mach
 pub rec Retention {
-    a:         *A.Allocator;
+    a:         *std.allocator.Allocator;
     retainers: Vector[Retainer];
     active:    RetainerId;
     modules:   Map[u32, u32];
@@ -73,7 +73,7 @@ pending: modules released since the last retirement, possibly held again since
 ### init
 
 ```mach
-pub fun init(a: *A.Allocator) res[Retention, fail.Fail]
+pub fun init(a: *std.allocator.Allocator) res[Retention, mach.base.fail.Fail]
 ```
 
 ### dnit
@@ -85,7 +85,7 @@ pub fun dnit(t: *Retention)
 ### acquire
 
 ```mach
-pub fun acquire(t: *Retention) res[RetainerId, fail.Fail]
+pub fun acquire(t: *Retention) res[RetainerId, mach.base.fail.Fail]
 ```
 
 a new retainer holding nothing, in a free slot when one exists
@@ -93,7 +93,7 @@ a new retainer holding nothing, in a free slot when one exists
 ### record
 
 ```mach
-pub fun record(t: *Retention, id: RetainerId, stable: module.StableModuleId, file: base_source.FileId, rejected: bool) err[fail.Fail]
+pub fun record(t: *Retention, id: RetainerId, stable: mach.session.module.StableModuleId, file: mach.base.source.FileId, rejected: bool) err[mach.base.fail.Fail]
 ```
 
 a module the open round loaded; held from now on, so nothing retires it under the build
@@ -113,7 +113,7 @@ the rejected flag of the open round, for a load that ended before it reached any
 ### end_round
 
 ```mach
-pub fun end_round(t: *Retention, id: RetainerId, finished: bool) err[fail.Fail]
+pub fun end_round(t: *Retention, id: RetainerId, finished: bool) err[mach.base.fail.Fail]
 ```
 
 close the open round. an accepted round keeps exactly what it loaded. a rejected or unfinished one
@@ -128,7 +128,7 @@ at a time cannot pile modules up
 ### release
 
 ```mach
-pub fun release(t: *Retention, id: RetainerId) err[fail.Fail]
+pub fun release(t: *Retention, id: RetainerId) err[mach.base.fail.Fail]
 ```
 
 a retainer that holds nothing any more; its modules no other retainer holds are released
@@ -136,7 +136,7 @@ a retainer that holds nothing any more; its modules no other retainer holds are 
 ### retire
 
 ```mach
-pub fun retire(t: *Retention, db: *query.QueryDb) err[fail.Fail]
+pub fun retire(t: *Retention, db: *mach.session.query.QueryDb) err[mach.base.fail.Fail]
 ```
 
 retire every product of the released modules no retainer holds again, and of the files no held module

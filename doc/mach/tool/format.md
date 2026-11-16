@@ -12,9 +12,9 @@ its description column aligned. the rendered lines are then aligned in runs, `us
 sorted, and a `use` alias that repeats the last path segment is dropped. the output is checked
 to mean what the input means before it is returned.
 
-<sub>source: [`src/tool/format.mach`](../../../src/tool/format.mach) · imported by 1 module</sub>
+Source: [`src/tool/format.mach`](../../../src/tool/format.mach)
 
-<sub>`A` is `std.allocator` · `base_source` is [`mach.base.source`](../base/source.md) · `diagnostic` is [`mach.base.diagnostic`](../base/diagnostic.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md).
 
 | Functions | |
 | :--- | :--- |
@@ -27,7 +27,7 @@ to mean what the input means before it is returned.
 ### format_source
 
 ```mach
-pub fun format_source(a: *A.Allocator, text: str, file_id: base_source.FileId, diags: *diagnostic.DiagnosticStore) res[str, fail.Fail]
+pub fun format_source(a: *std.allocator.Allocator, text: str, file_id: mach.base.source.FileId, diags: *mach.base.diagnostic.DiagnosticStore) res[str, mach.base.fail.Fail]
 ```
 
 format one source file. success transfers one nul-terminated string to the

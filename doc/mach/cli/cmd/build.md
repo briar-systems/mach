@@ -9,9 +9,9 @@ build states its whole project on the command line. `mach check` plans the same 
 and runs only the front end. `mach clean` and `mach test` plan through
 `plan_selection` and `plan_invocation`.
 
-<sub>source: [`src/cli/cmd/build.mach`](../../../../src/cli/cmd/build.mach) · imported by 4 modules</sub>
+Source: [`src/cli/cmd/build.mach`](../../../../src/cli/cmd/build.mach)
 
-<sub>`manifest_model` is [`mach.manifest.model`](../../manifest/model.md) · `manifest_select` is [`mach.manifest.select`](../../manifest/select.md) · `build_plan` is [`mach.build.plan`](../../build/plan.md) · `A` is `std.allocator` · `args` is [`mach.cli.args`](../args.md) · `request` is [`mach.compile.request`](../../compile/request.md) · `base_source` is [`mach.base.source`](../../base/source.md) · `session` is [`mach.session`](../../session.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `compile_closure` is [`mach.compile.closure`](../../compile/closure.md) · `cli_diagnostic` is [`mach.cli.diagnostic`](../diagnostic.md) · `std_args` is `std.args`</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../../base/source.md), [`mach.build.plan`](../../build/plan.md), [`mach.cli.args`](../args.md), [`mach.cli.diagnostic`](../diagnostic.md), [`mach.compile.closure`](../../compile/closure.md), [`mach.compile.request`](../../compile/request.md), [`mach.manifest.model`](../../manifest/model.md), [`mach.manifest.select`](../../manifest/select.md), [`mach.session`](../../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -41,9 +41,9 @@ and runs only the front end. `mach clean` and `mach test` plan through
 
 ```mach
 pub rec Planned {
-    manifest: *manifest_model.Manifest;
-    cells:    Vector[manifest_select.Cell];
-    plans:    Vector[build_plan.BuildPlan];
+    manifest: *mach.manifest.model.Manifest;
+    cells:    Vector[mach.manifest.select.Cell];
+    plans:    Vector[mach.build.plan.BuildPlan];
 }
 ```
 
@@ -52,16 +52,16 @@ plan per selected profile in the order the cells name them
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `manifest` | `*manifest_model.Manifest` | the root manifest the plans were made from, in the planning session |
-| `cells` | `Vector[manifest_select.Cell]` | the resolved (artifact, target, profile) cells |
-| `plans` | `Vector[build_plan.BuildPlan]` | one plan per profile; each plans that profile's cells |
+| `manifest` | `*mach.manifest.model.Manifest` | the root manifest the plans were made from, in the planning session |
+| `cells` | `Vector[mach.manifest.select.Cell]` | the resolved (artifact, target, profile) cells |
+| `plans` | `Vector[mach.build.plan.BuildPlan]` | one plan per profile; each plans that profile's cells |
 
 ### plan_invocation
 
 ```mach
-pub fun plan_invocation(a: *A.Allocator, root: str, cli: *args.CliArgs, goal: request.BuildGoal,
-    mode: manifest_select.ArtifactDefault, configure_deps: bool, sources: *base_source.SourceMap,
-    ps: *session.Session) res[Planned, fail.Fail]
+pub fun plan_invocation(a: *std.allocator.Allocator, root: str, cli: *mach.cli.args.CliArgs, goal: mach.compile.request.BuildGoal,
+    mode: mach.manifest.select.ArtifactDefault, configure_deps: bool, sources: *mach.base.source.SourceMap,
+    ps: *mach.session.Session) res[Planned, mach.base.fail.Fail]
 ```
 
 initialise a session, load the manifest, resolve the selectors and plan a
@@ -82,9 +82,9 @@ build of every resolved cell, one plan per profile
 ### plan_selection
 
 ```mach
-pub fun plan_selection(a: *A.Allocator, ps: *session.Session, m: *manifest_model.Manifest, root: str, cli: *args.CliArgs,
-    goal: request.BuildGoal, mode: manifest_select.ArtifactDefault, configure_deps: bool,
-    unrealized: compile_closure.Unrealized) res[Planned, fail.Fail]
+pub fun plan_selection(a: *std.allocator.Allocator, ps: *mach.session.Session, m: *mach.manifest.model.Manifest, root: str, cli: *mach.cli.args.CliArgs,
+    goal: mach.compile.request.BuildGoal, mode: mach.manifest.select.ArtifactDefault, configure_deps: bool,
+    unrealized: mach.compile.closure.Unrealized) res[Planned, mach.base.fail.Fail]
 ```
 
 resolve the selectors against a loaded manifest and plan every resolved cell,
@@ -102,7 +102,7 @@ each other: a caller that runs them all checks they write disjoint outputs
 ### announce_profile
 
 ```mach
-pub fun announce_profile(r: *cli_diagnostic.Report, planned: *Planned, bp: *build_plan.BuildPlan, quiet: bool)
+pub fun announce_profile(r: *mach.cli.diagnostic.Report, planned: *Planned, bp: *mach.build.plan.BuildPlan, quiet: bool)
 ```
 
 name the profile a plan builds before its progress lines, when a selection
@@ -120,7 +120,7 @@ spans several profiles and the report is for a person
 ### run
 
 ```mach
-pub fun run(cx: *args.Call) res[i64, fail.Fail]
+pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 ```
 
 `mach build`: plan and execute a build of the project operand, rendering diagnostics to
@@ -136,7 +136,7 @@ each phase row as the phase finishes, and `-vv` each module or file as it finish
 ### check
 
 ```mach
-pub fun check(cx: *args.Call) res[i64, fail.Fail]
+pub fun check(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 ```
 
 `mach check`: plan the same cells `mach build` would and run each through the
@@ -154,8 +154,8 @@ error naming it rather than a reason to run the step
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COMMAND` | `std_args.Command` | `std_args.Command{name: "build", aliases: args.NO_WORDS, help: "compile a project or one entry file", usage: "<path\|entry.mach> [inputs...]", flags: Slice[*std_args.Flag]{data: ?BUILD_FLAGS[0], size: BUILD_FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: false}` | `mach build` |
-| `POLICY` | `args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: Slice[args.Conflict]{data: ?BUILD_CONFLICTS[0], size: BUILD_CONFLICTS_N}}` | what mach holds `mach build` to beyond the parse |
-| `CHECK` | `std_args.Command` | `std_args.Command{name: "check", aliases: args.NO_WORDS, help: "check project source without building", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?CHECK_FLAGS[0], size: CHECK_FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach check` |
-| `CHECK_POLICY` | `args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach check` to beyond the parse |
+| `COMMAND` | `std.args.Command` | `std_args.Command{name: "build", aliases: args.NO_WORDS, help: "compile a project or one entry file", usage: "<path\|entry.mach> [inputs...]", flags: Slice[*std_args.Flag]{data: ?BUILD_FLAGS[0], size: BUILD_FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: false}` | `mach build` |
+| `POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: Slice[args.Conflict]{data: ?BUILD_CONFLICTS[0], size: BUILD_CONFLICTS_N}}` | what mach holds `mach build` to beyond the parse |
+| `CHECK` | `std.args.Command` | `std_args.Command{name: "check", aliases: args.NO_WORDS, help: "check project source without building", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?CHECK_FLAGS[0], size: CHECK_FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach check` |
+| `CHECK_POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach check` to beyond the parse |
 

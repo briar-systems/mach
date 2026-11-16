@@ -9,9 +9,9 @@ reads it. `run` reports a refused line or flag combination in the format `--diag
 selects, or runs the command's handler, and an option a previous major took is refused
 by name with what replaced it.
 
-<sub>source: [`src/cli/args.mach`](../../../src/cli/args.mach) · imported by 12 modules</sub>
+Source: [`src/cli/args.mach`](../../../src/cli/args.mach)
 
-<sub>`manifest_select` is [`mach.manifest.select`](../manifest/select.md) · `request` is [`mach.compile.request`](../compile/request.md) · `manifest_setting` is [`mach.manifest.setting`](../manifest/setting.md) · `A` is `std.allocator` · `std_args` is `std.args` · `fail` is [`mach.base.fail`](../base/fail.md) · `compile_entry` is [`mach.compile.entry`](../compile/entry.md) · `heap` is `std.allocator.heap` · `cli_diagnostic` is [`mach.cli.diagnostic`](diagnostic.md) · `exec` is `std.process.exec` · `base_source` is [`mach.base.source`](../base/source.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.cli.diagnostic`](diagnostic.md), [`mach.compile.entry`](../compile/entry.md), [`mach.compile.request`](../compile/request.md), [`mach.manifest.select`](../manifest/select.md), [`mach.manifest.setting`](../manifest/setting.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -100,9 +100,9 @@ by name with what replaced it.
 pub rec CliArgs {
     verbosity: u8;
     quiet:     bool;
-    selectors: manifest_select.Selectors;
-    overrides: request.Overrides;
-    settings:  Vector[manifest_setting.Assignment];
+    selectors: mach.manifest.select.Selectors;
+    overrides: mach.compile.request.Overrides;
+    settings:  Vector[mach.manifest.setting.Assignment];
     emits:     u8;
     entry:     EntryArgs;
 }
@@ -115,16 +115,16 @@ what it sets over the profile it builds
 | :--- | :--- | :--- |
 | `verbosity` | `u8` | 0, 1 or 2 from `-v` and `-vv` |
 | `quiet` | `bool` | `--quiet` |
-| `selectors` | `manifest_select.Selectors` | the `-a`, `-t` and `-p` patterns and `--all` |
-| `overrides` | `request.Overrides` | everything else the command sets, typed |
-| `settings` | `Vector[manifest_setting.Assignment]` | every `--set`, in argv order |
+| `selectors` | `mach.manifest.select.Selectors` | the `-a`, `-t` and `-p` patterns and `--all` |
+| `overrides` | `mach.compile.request.Overrides` | everything else the command sets, typed |
+| `settings` | `Vector[mach.manifest.setting.Assignment]` | every `--set`, in argv order |
 | `emits` | `u8` | the EMIT_KIND_* bits `--emit` names, 0 when it is absent |
 | `entry` | `EntryArgs` | what the command line states of an entry build |
 
 ### build_cli_invocation
 
 ```mach
-pub fun build_cli_invocation(a: *A.Allocator, inv: *std_args.Parsed) res[CliArgs, fail.Fail]
+pub fun build_cli_invocation(a: *std.allocator.Allocator, inv: *std.args.Parsed) res[CliArgs, mach.base.fail.Fail]
 ```
 
 the typed CliArgs of a build-shaped command: verbosity, quiet, the selectors,
@@ -142,7 +142,7 @@ left empty for collect_link_inputs
 ### collect_link_inputs
 
 ```mach
-pub fun collect_link_inputs(a: *A.Allocator, c: *CliArgs, inv: *std_args.Parsed) err[fail.Fail]
+pub fun collect_link_inputs(a: *std.allocator.Allocator, c: *CliArgs, inv: *std.args.Parsed) err[mach.base.fail.Fail]
 ```
 
 fill c.overrides.link_tokens and c.overrides.lib_dirs in command-line order: every `-l` value and every
@@ -165,7 +165,7 @@ pub rec EntryArgs {
     kind:      str;
     linkage:   str;
     target:    str;
-    narrowing: compile_entry.Narrowing;
+    narrowing: mach.compile.entry.Narrowing;
     exts:      Vector[str];
     optimize:  bool;
     debug:     bool;
@@ -181,7 +181,7 @@ narrowing and the levers its profile takes
 | `sources` | `Vector[str]` | every `--source` value, `name=dir` as written |
 | `kind` | `str` | the `--kind` value, nil when absent |
 | `target` | `str` | the `-t` value, the target as `<sys>-<arch>`, nil when absent |
-| `narrowing` | `compile_entry.Narrowing` | the narrowing flags, each as written |
+| `narrowing` | `mach.compile.entry.Narrowing` | the narrowing flags, each as written |
 | `exts` | `Vector[str]` | every `--ext` value, in argv order |
 | `optimize` | `bool` | the profile an entry build states optimizes |
 | `debug` | `bool` | the profile an entry build states emits debug information |
@@ -219,8 +219,8 @@ a spelling an earlier version took, refused by name with what replaced it
 
 ```mach
 pub rec Conflict {
-    flag:  *std_args.Flag;
-    other: *std_args.Flag;
+    flag:  *std.args.Flag;
+    other: *std.args.Flag;
 }
 ```
 
@@ -230,7 +230,7 @@ two flags a command refuses together
 
 ```mach
 pub rec Policy {
-    refused:   Slice[*std_args.Flag];
+    refused:   Slice[*std.args.Flag];
     refusal:   str;
     conflicts: Slice[Conflict];
 }
@@ -240,14 +240,14 @@ what mach holds a command's line to beyond what std.args parses
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `refused` | `Slice[*std_args.Flag]` | flags it recognizes only to refuse, by refusal |
+| `refused` | `Slice[*std.args.Flag]` | flags it recognizes only to refuse, by refusal |
 | `refusal` | `str` | why it refuses them |
 | `conflicts` | `Slice[Conflict]` | pairs of its flags it refuses together |
 
 ### refusal
 
 ```mach
-pub fun refusal(a: *A.Allocator, inv: *std_args.Parsed, policy: *Policy) fail.Fail
+pub fun refusal(a: *std.allocator.Allocator, inv: *std.args.Parsed, policy: *Policy) mach.base.fail.Fail
 ```
 
 a parsed line's refusal as a failure, in mach's words where mach knows more of the option than
@@ -263,7 +263,7 @@ the parser and the parser's words otherwise
 ### run
 
 ```mach
-pub fun run(a: *A.Allocator, inv: *std_args.Parsed, policy: *Policy, handler: fun(*Call) res[i64, fail.Fail]) i64
+pub fun run(a: *std.allocator.Allocator, inv: *std.args.Parsed, policy: *Policy, handler: fun(*Call) res[i64, mach.base.fail.Fail]) i64
 ```
 
 run a parsed line and report how it ended through one report, in the format `--diagnostics`
@@ -283,14 +283,14 @@ failure the handler returns is reported here
 
 ```mach
 pub rec Call {
-    a:       *A.Allocator;
-    backing: *A.Allocator;
-    spans:   *heap.Pool;
-    inv:     *std_args.Parsed;
-    report:  *cli_diagnostic.Report;
-    environ: exec.Environment;
+    a:       *std.allocator.Allocator;
+    backing: *std.allocator.Allocator;
+    spans:   *std.allocator.heap.Pool;
+    inv:     *std.args.Parsed;
+    report:  *mach.cli.diagnostic.Report;
+    environ: std.process.exec.Environment;
     # the texts the command's sessions read, which the failure it returns is located in
-    sources: *base_source.SourceMap;
+    sources: *mach.base.source.SourceMap;
 }
 ```
 
@@ -299,7 +299,7 @@ pub rec Call {
 ### operand
 
 ```mach
-pub fun operand(inv: *std_args.Parsed, n: usize) *u8
+pub fun operand(inv: *std.args.Parsed, n: usize) *u8
 ```
 
 the operand at a position among a line's operands
@@ -313,7 +313,7 @@ the operand at a position among a line's operands
 ### value
 
 ```mach
-pub fun value(inv: *std_args.Parsed, flag: *std_args.Flag) opt[*u8]
+pub fun value(inv: *std.args.Parsed, flag: *std.args.Flag) opt[*u8]
 ```
 
 the value a flag was last given
@@ -327,7 +327,7 @@ the value a flag was last given
 ### values
 
 ```mach
-pub fun values(a: *A.Allocator, inv: *std_args.Parsed, flag: *std_args.Flag) res[Vector[str], fail.Fail]
+pub fun values(a: *std.allocator.Allocator, inv: *std.args.Parsed, flag: *std.args.Flag) res[Vector[str], mach.base.fail.Fail]
 ```
 
 every value a flag was given, in argument order
@@ -342,7 +342,7 @@ every value a flag was given, in argument order
 ### serve
 
 ```mach
-pub fun serve(inv: *std_args.Parsed, handler: fun(*Call) res[i64, fail.Fail]) i64
+pub fun serve(inv: *std.args.Parsed, handler: fun(*Call) res[i64, mach.base.fail.Fail]) i64
 ```
 
 run a handler over a parsed line whatever it is refused for, reporting through one report in
@@ -357,7 +357,7 @@ the format `--diagnostics` selects, as `--help` does in place of the command it 
 ### collect_selectors
 
 ```mach
-pub fun collect_selectors(a: *A.Allocator, inv: *std_args.Parsed) res[manifest_select.Selectors, fail.Fail]
+pub fun collect_selectors(a: *std.allocator.Allocator, inv: *std.args.Parsed) res[mach.manifest.select.Selectors, mach.base.fail.Fail]
 ```
 
 the `-a`, `-t` and `-p` patterns and `--all` an invocation was given
@@ -371,7 +371,7 @@ the `-a`, `-t` and `-p` patterns and `--all` an invocation was given
 ### selection_hint
 
 ```mach
-pub fun selection_hint(a: *A.Allocator, selectors: *manifest_select.Selectors, f: fail.Fail) fail.Fail
+pub fun selection_hint(a: *std.allocator.Allocator, selectors: *mach.manifest.select.Selectors, f: mach.base.fail.Fail) mach.base.fail.Fail
 ```
 
 a selection refusal whose unknown value names a path in the working directory,
@@ -393,43 +393,43 @@ any other failure is returned as given
 | `EMIT_KIND_OBJ` | `u8` | `4` | the objects, with no link |
 | `EMIT_KIND_EXE` | `u8` | `8` | the linked artifact |
 | `EMIT_ERROR` | `str` | `"--emit expects asm, ir, obj or exe"` | the refusal of an `--emit` value no product is named by |
-| `ARTIFACT` | `std_args.Flag` | `std_args.Flag{long: "artifact", short: 'a', value: "pattern", repeat: true, negatable: false, help: "select artifacts by name or glob (default: the default selection)"}` | `--artifact <pattern>`, `-a`, a selector |
-| `TARGET` | `std_args.Flag` | `std_args.Flag{long: "target", short: 't', value: "pattern", repeat: true, negatable: false, help: "which targets: a name or glob of the manifest's targets in a project, a <sys>-<arch> in an entry build (default: the host's)"}` | `--target <pattern>`, `-t`, a selector, or an entry build's target |
-| `PROFILE` | `std_args.Flag` | `std_args.Flag{long: "profile", short: 'p', value: "pattern", repeat: true, negatable: false, help: "select profiles by name or glob (default: the default profile)"}` | `--profile <pattern>`, `-p`, a selector |
-| `ALL` | `std_args.Flag` | `std_args.Flag{long: "all", short: 0, value: nil, repeat: false, negatable: false, help: "select every artifact, target and profile no selector narrows"}` | `--all`, which fills every selector not given with `*` |
-| `OUTPUT` | `std_args.Flag` | `std_args.Flag{long: "output", short: 'o', value: "path", repeat: false, negatable: false, help: "write the linked artifact to this path"}` | `-o <path>`, the linked artifact's path |
-| `VERBOSE` | `std_args.Flag` | `std_args.Flag{long: "verbose", short: 'v', value: nil, repeat: true, negatable: false, help: "show each phase as it closes, -vv each module too"}` | `--verbose`, `-v`, once for each build phase's row and twice, as `-vv`, for each module or file as well; what each readout level shows is the readout contract, doc/language/readout.md |
-| `QUIET` | `std_args.Flag` | `std_args.Flag{long: "quiet", short: 'q', value: nil, repeat: false, negatable: false, help: "suppress non-error output"}` | `--quiet`, `-q` |
-| `SET` | `std_args.Flag` | `std_args.Flag{long: "set", short: 0, value: "key=value", repeat: true, negatable: false, help: "set a manifest key for this invocation"}` | `--set <key=value>`, a manifest key over every table of its section |
-| `VERIFY` | `std_args.Flag` | `std_args.Flag{long: "verify", short: 0, value: nil, repeat: false, negatable: false, help: "run the module and code generation verifiers"}` | `--verify`, mach's and mirl's verifiers over every lowered module |
-| `OPTIMIZE` | `std_args.Flag` | `std_args.Flag{long: "optimize", short: 'O', value: nil, repeat: false, negatable: true, help: "optimize, or not with --no-optimize (default: the profile's)"}` | `--optimize`, `-O`, the profile's `optimize = true` for this invocation, and `--no-optimize`, its `optimize = false` |
-| `DEBUG` | `std_args.Flag` | `std_args.Flag{long: "debug", short: 0, value: nil, repeat: false, negatable: true, help: "emit debug information, or not with --no-debug (default: the profile's)"}` | `--debug`, the profile's `debug = true` for this invocation, and `--no-debug`, its `debug = false` |
-| `SOURCE` | `std_args.Flag` | `std_args.Flag{long: "source", short: 0, value: "name=dir", repeat: true, negatable: false, help: "bind a module prefix to a directory (default: the entry's directory)"}` | `--source <name=dir>`, a source root of an entry build |
-| `KIND` | `std_args.Flag` | `std_args.Flag{long: "kind", short: 'k', value: "bin\|static\|shared\|object\|module", repeat: false, negatable: false, help: "the product to make (default: bin)"}` | `--kind <product>`, `-k`, the product of an entry build's artifact, by mink's name for it |
-| `LINKAGE` | `std_args.Flag` | `std_args.Flag{long: "linkage", short: 0, value: "pie\|dynamic\|static", repeat: false, negatable: false, help: "how the executable links (default: the target's)"}` | `--linkage <linkage>`, how an entry build's executable is linked, by mink's name for it |
-| `ENV` | `std_args.Flag` | `std_args.Flag{long: "env", short: 0, value: "name", repeat: false, negatable: false, help: "the environment (default: the target's)"}` | `--env <name>` |
-| `ABI` | `std_args.Flag` | `std_args.Flag{long: "abi", short: 0, value: "name", repeat: false, negatable: false, help: "the calling convention (default: the target's)"}` | `--abi <name>` |
-| `ISA` | `std_args.Flag` | `std_args.Flag{long: "isa", short: 0, value: "selection", repeat: false, negatable: false, help: "the instruction set (default: the target's)"}` | `--isa <selection>` |
-| `EXT` | `std_args.Flag` | `std_args.Flag{long: "ext", short: 0, value: "name", repeat: true, negatable: false, help: "add an instruction set extension, once each"}` | `--ext <name>` |
-| `CODE_MODEL` | `std_args.Flag` | `std_args.Flag{long: "code-model", short: 0, value: "name", repeat: false, negatable: false, help: "the code model (default: the target's)"}` | `--code-model <name>` |
-| `WORK` | `std_args.Flag` | `std_args.Flag{long: "work-dir", short: 'w', value: "path", repeat: false, negatable: false, help: "the work directory (default: the project's)"}` | `-w <path>`, the work directory |
-| `EMIT` | `std_args.Flag` | `std_args.Flag{long: "emit", short: 0, value: "asm\|ir\|obj\|exe", repeat: true, negatable: false, help: "a product to write, once each (default: exe)"}` | `--emit <kind>`, once per product |
-| `THREADS` | `std_args.Flag` | `std_args.Flag{long: "threads", short: 0, value: "n", repeat: false, negatable: false, help: "how many test processes run at once (default: host CPUs); a build runs on one thread"}` | `--threads <n>` |
-| `LIB_DIR` | `std_args.Flag` | `std_args.Flag{long: "library-dir", short: 'L', value: "dir", repeat: true, negatable: false, help: "add a library search directory"}` | `--library-dir <dir>`, `-L` |
-| `LIB` | `std_args.Flag` | `std_args.Flag{long: "library", short: 'l', value: "name", repeat: true, negatable: false, help: "link a library, object or archive by name"}` | `--library <name>`, `-l` |
-| `NO_CACHE` | `std_args.Flag` | `std_args.Flag{long: "no-cache", short: 0, value: nil, repeat: false, negatable: false, help: "rebuild without reusing cached objects or steps"}` | `--no-cache` |
-| `DIAGNOSTICS` | `std_args.Flag` | `std_args.Flag{long: "diagnostics", short: 0, value: "human\|json", repeat: false, negatable: false, help: "diagnostics as human text or NDJSON (default: human)"}` | `--diagnostics <human\|json>`: how diagnostics, failures and a test run's results reach stderr |
-| `PLAN` | `std_args.Flag` | `std_args.Flag{long: "plan", short: 0, value: nil, repeat: false, negatable: false, help: "print the build plan without building"}` | `--plan` |
-| `HELP` | `std_args.Flag` | `std_args.Flag{long: "help", short: 'h', value: nil, repeat: false, negatable: false, help: "show help"}` | `--help`, `-h`: the invocation asks for its command's page instead of running it, which takes precedence over every refusal but an unknown command |
-| `VERSION` | `std_args.Flag` | `std_args.Flag{long: "version", short: 0, value: nil, repeat: false, negatable: false, help: "print the version"}` | `--version`, the compiler's version alone on one line |
-| `RUNNER` | `std_args.Flag` | `std_args.Flag{long: "runner", short: 0, value: "cmd", repeat: false, negatable: false, help: "run through this command (default: the target's)"}` | `--runner <cmd>` |
-| `TIMEOUT` | `std_args.Flag` | `std_args.Flag{long: "timeout", short: 0, value: "duration", repeat: false, negatable: false, help: "stop after a duration such as 30s"}` | `--timeout <duration>` |
-| `ALLOW_UNRUNNABLE` | `std_args.Flag` | `std_args.Flag{long: "allow-unrunnable", short: 0, value: nil, repeat: false, negatable: false, help: "succeed when nothing selected can run on this host"}` | `--allow-unrunnable` |
-| `OFFLINE` | `std_args.Flag` | `std_args.Flag{long: "offline", short: 0, value: nil, repeat: false, negatable: false, help: "resolve from releases already fetched"}` | `--offline` |
+| `ARTIFACT` | `std.args.Flag` | `std_args.Flag{long: "artifact", short: 'a', value: "pattern", repeat: true, negatable: false, help: "select artifacts by name or glob (default: the default selection)"}` | `--artifact <pattern>`, `-a`, a selector |
+| `TARGET` | `std.args.Flag` | `std_args.Flag{long: "target", short: 't', value: "pattern", repeat: true, negatable: false, help: "which targets: a name or glob of the manifest's targets in a project, a <sys>-<arch> in an entry build (default: the host's)"}` | `--target <pattern>`, `-t`, a selector, or an entry build's target |
+| `PROFILE` | `std.args.Flag` | `std_args.Flag{long: "profile", short: 'p', value: "pattern", repeat: true, negatable: false, help: "select profiles by name or glob (default: the default profile)"}` | `--profile <pattern>`, `-p`, a selector |
+| `ALL` | `std.args.Flag` | `std_args.Flag{long: "all", short: 0, value: nil, repeat: false, negatable: false, help: "select every artifact, target and profile no selector narrows"}` | `--all`, which fills every selector not given with `*` |
+| `OUTPUT` | `std.args.Flag` | `std_args.Flag{long: "output", short: 'o', value: "path", repeat: false, negatable: false, help: "write the linked artifact to this path"}` | `-o <path>`, the linked artifact's path |
+| `VERBOSE` | `std.args.Flag` | `std_args.Flag{long: "verbose", short: 'v', value: nil, repeat: true, negatable: false, help: "show each phase as it closes, -vv each module too"}` | `--verbose`, `-v`, once for each build phase's row and twice, as `-vv`, for each module or file as well; what each readout level shows is the readout contract, doc/language/readout.md |
+| `QUIET` | `std.args.Flag` | `std_args.Flag{long: "quiet", short: 'q', value: nil, repeat: false, negatable: false, help: "suppress non-error output"}` | `--quiet`, `-q` |
+| `SET` | `std.args.Flag` | `std_args.Flag{long: "set", short: 0, value: "key=value", repeat: true, negatable: false, help: "set a manifest key for this invocation"}` | `--set <key=value>`, a manifest key over every table of its section |
+| `VERIFY` | `std.args.Flag` | `std_args.Flag{long: "verify", short: 0, value: nil, repeat: false, negatable: false, help: "run the module and code generation verifiers"}` | `--verify`, mach's and mirl's verifiers over every lowered module |
+| `OPTIMIZE` | `std.args.Flag` | `std_args.Flag{long: "optimize", short: 'O', value: nil, repeat: false, negatable: true, help: "optimize, or not with --no-optimize (default: the profile's)"}` | `--optimize`, `-O`, the profile's `optimize = true` for this invocation, and `--no-optimize`, its `optimize = false` |
+| `DEBUG` | `std.args.Flag` | `std_args.Flag{long: "debug", short: 0, value: nil, repeat: false, negatable: true, help: "emit debug information, or not with --no-debug (default: the profile's)"}` | `--debug`, the profile's `debug = true` for this invocation, and `--no-debug`, its `debug = false` |
+| `SOURCE` | `std.args.Flag` | `std_args.Flag{long: "source", short: 0, value: "name=dir", repeat: true, negatable: false, help: "bind a module prefix to a directory (default: the entry's directory)"}` | `--source <name=dir>`, a source root of an entry build |
+| `KIND` | `std.args.Flag` | `std_args.Flag{long: "kind", short: 'k', value: "bin\|static\|shared\|object\|module", repeat: false, negatable: false, help: "the product to make (default: bin)"}` | `--kind <product>`, `-k`, the product of an entry build's artifact, by mink's name for it |
+| `LINKAGE` | `std.args.Flag` | `std_args.Flag{long: "linkage", short: 0, value: "pie\|dynamic\|static", repeat: false, negatable: false, help: "how the executable links (default: the target's)"}` | `--linkage <linkage>`, how an entry build's executable is linked, by mink's name for it |
+| `ENV` | `std.args.Flag` | `std_args.Flag{long: "env", short: 0, value: "name", repeat: false, negatable: false, help: "the environment (default: the target's)"}` | `--env <name>` |
+| `ABI` | `std.args.Flag` | `std_args.Flag{long: "abi", short: 0, value: "name", repeat: false, negatable: false, help: "the calling convention (default: the target's)"}` | `--abi <name>` |
+| `ISA` | `std.args.Flag` | `std_args.Flag{long: "isa", short: 0, value: "selection", repeat: false, negatable: false, help: "the instruction set (default: the target's)"}` | `--isa <selection>` |
+| `EXT` | `std.args.Flag` | `std_args.Flag{long: "ext", short: 0, value: "name", repeat: true, negatable: false, help: "add an instruction set extension, once each"}` | `--ext <name>` |
+| `CODE_MODEL` | `std.args.Flag` | `std_args.Flag{long: "code-model", short: 0, value: "name", repeat: false, negatable: false, help: "the code model (default: the target's)"}` | `--code-model <name>` |
+| `WORK` | `std.args.Flag` | `std_args.Flag{long: "work-dir", short: 'w', value: "path", repeat: false, negatable: false, help: "the work directory (default: the project's)"}` | `-w <path>`, the work directory |
+| `EMIT` | `std.args.Flag` | `std_args.Flag{long: "emit", short: 0, value: "asm\|ir\|obj\|exe", repeat: true, negatable: false, help: "a product to write, once each (default: exe)"}` | `--emit <kind>`, once per product |
+| `THREADS` | `std.args.Flag` | `std_args.Flag{long: "threads", short: 0, value: "n", repeat: false, negatable: false, help: "how many test processes run at once (default: host CPUs); a build runs on one thread"}` | `--threads <n>` |
+| `LIB_DIR` | `std.args.Flag` | `std_args.Flag{long: "library-dir", short: 'L', value: "dir", repeat: true, negatable: false, help: "add a library search directory"}` | `--library-dir <dir>`, `-L` |
+| `LIB` | `std.args.Flag` | `std_args.Flag{long: "library", short: 'l', value: "name", repeat: true, negatable: false, help: "link a library, object or archive by name"}` | `--library <name>`, `-l` |
+| `NO_CACHE` | `std.args.Flag` | `std_args.Flag{long: "no-cache", short: 0, value: nil, repeat: false, negatable: false, help: "rebuild without reusing cached objects or steps"}` | `--no-cache` |
+| `DIAGNOSTICS` | `std.args.Flag` | `std_args.Flag{long: "diagnostics", short: 0, value: "human\|json", repeat: false, negatable: false, help: "diagnostics as human text or NDJSON (default: human)"}` | `--diagnostics <human\|json>`: how diagnostics, failures and a test run's results reach stderr |
+| `PLAN` | `std.args.Flag` | `std_args.Flag{long: "plan", short: 0, value: nil, repeat: false, negatable: false, help: "print the build plan without building"}` | `--plan` |
+| `HELP` | `std.args.Flag` | `std_args.Flag{long: "help", short: 'h', value: nil, repeat: false, negatable: false, help: "show help"}` | `--help`, `-h`: the invocation asks for its command's page instead of running it, which takes precedence over every refusal but an unknown command |
+| `VERSION` | `std.args.Flag` | `std_args.Flag{long: "version", short: 0, value: nil, repeat: false, negatable: false, help: "print the version"}` | `--version`, the compiler's version alone on one line |
+| `RUNNER` | `std.args.Flag` | `std_args.Flag{long: "runner", short: 0, value: "cmd", repeat: false, negatable: false, help: "run through this command (default: the target's)"}` | `--runner <cmd>` |
+| `TIMEOUT` | `std.args.Flag` | `std_args.Flag{long: "timeout", short: 0, value: "duration", repeat: false, negatable: false, help: "stop after a duration such as 30s"}` | `--timeout <duration>` |
+| `ALLOW_UNRUNNABLE` | `std.args.Flag` | `std_args.Flag{long: "allow-unrunnable", short: 0, value: nil, repeat: false, negatable: false, help: "succeed when nothing selected can run on this host"}` | `--allow-unrunnable` |
+| `OFFLINE` | `std.args.Flag` | `std_args.Flag{long: "offline", short: 0, value: nil, repeat: false, negatable: false, help: "resolve from releases already fetched"}` | `--offline` |
 | `REMOVED_N` | `usize` | `19` | row count of REMOVED |
 | `REMOVED` | `[REMOVED_N]Removed` | `[REMOVED_N]Removed{ Removed{name: "-g", use: "--debug"}, Removed{name: "-d", use: "--debug"}, Removed{name: "-s", use: "--source"}, Removed{name: "-e", use: "--emit"}, Removed{name: "-O0", use: "--no-optimize"}, Removed{name: "-O2", use: "-O or --optimize"}, Removed{name: "--emit-asm", use: "--emit asm"}, Removed{name: "--emit-ir", use: "--emit ir"}, Removed{name: "--jobs", use: "--threads"}, Removed{name: "--pie", use: "--linkage pie, or the linkage key of a bin artifact"}, Removed{name: "--simd", use: "no option in its place: mirl legalizes every vector operation, so a build has no vector mode to choose"}, Removed{name: "--arch", use: "-t <sys>-<arch>"}, Removed{name: "--sys", use: "-t <sys>-<arch>"}, Removed{name: "--of", use: "the target's system, which implies the object format"}, Removed{name: "--platform", use: "--set platform=<name>"}, Removed{name: "--subsystem", use: "--set subsystem=<name>"}, Removed{name: "--base", use: "--set base=<address>"}, Removed{name: "--stack-reserve", use: "--set stack_reserve=<bytes>"}, Removed{name: "--stack-commit", use: "--set stack_commit=<bytes>"}, }` | the options a previous major took, each refused by name with what to write instead |
 | `NO_WORDS` | `Slice[str]` | `Slice[str]{data: nil, size: 0}` | no words, for a command with no aliases |
-| `NO_COMMANDS` | `Slice[*std_args.Command]` | `Slice[*std_args.Command]{data: nil, size: 0}` | no commands, for a command nothing is nested under |
-| `NO_FLAGS` | `Slice[*std_args.Flag]` | `Slice[*std_args.Flag]{data: nil, size: 0}` | no flags |
+| `NO_COMMANDS` | `Slice[*std.args.Command]` | `Slice[*std_args.Command]{data: nil, size: 0}` | no commands, for a command nothing is nested under |
+| `NO_FLAGS` | `Slice[*std.args.Flag]` | `Slice[*std_args.Flag]{data: nil, size: 0}` | no flags |
 | `NO_CONFLICTS` | `Slice[Conflict]` | `Slice[Conflict]{data: nil, size: 0}` | no conflicts of a command's own |
 

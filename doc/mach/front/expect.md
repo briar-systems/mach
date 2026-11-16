@@ -9,9 +9,9 @@ keys back out of a parsed module into the expectations a diagnostic store
 matches warnings against, so a warning replayed from the cache is matched
 exactly as a fresh one is
 
-<sub>source: [`src/front/expect.mach`](../../../src/front/expect.mach) · imported by 4 modules</sub>
+Source: [`src/front/expect.mach`](../../../src/front/expect.mach)
 
-<sub>`ast` is [`mach.front.ast`](ast.md) · `Site` is private · `Step` is private · `session` is [`mach.session`](../session.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `comptime_scope` is [`mach.front.comptime.scope`](comptime/scope.md) · `diagnostic` is [`mach.base.diagnostic`](../base/diagnostic.md) · `ast_id` is [`mach.front.ast.id`](ast/id.md) · `base_source` is [`mach.base.source`](../base/source.md)</sub>
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.front.ast`](ast.md), [`mach.front.ast.id`](ast/id.md), [`mach.front.comptime.scope`](comptime/scope.md), [`mach.session`](../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -35,7 +35,7 @@ exactly as a fresh one is
 
 ```mach
 pub rec Index {
-    syntax:      *ast.Ast;
+    syntax:      *mach.front.ast.Ast;
     incarnation: u64;
     sites:       Vector[Site];
     steps:       Vector[Step];
@@ -48,7 +48,7 @@ refresh of the diagnostics walks none of the module's declarations
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `syntax` | `*ast.Ast` | the parsed module the sites were read from, nil before the first read |
+| `syntax` | `*mach.front.ast.Ast` | the parsed module the sites were read from, nil before the first read |
 | `incarnation` | `u64` | that parse's incarnation |
 | `sites` | `Vector[Site]` | each declaration that carries `#[expect]`, in source order |
 | `steps` | `Vector[Step]` | the `$if` arms each site stands in, outermost first, as the sites' ranges name them |
@@ -71,7 +71,7 @@ how many declarations in the module the index holds carry `#[expect]`
 ### index
 
 ```mach
-pub fun index(s: *session.Session, a: *ast.Ast, idx: *Index) err[fail.Fail]
+pub fun index(s: *mach.session.Session, a: *mach.front.ast.Ast, idx: *Index) err[mach.base.fail.Fail]
 ```
 
 bring the index up to the parsed module `a`, reading its sites when it was read from another
@@ -80,8 +80,8 @@ parse; a failed read leaves it unread, so the next one walks the module again
 ### collect
 
 ```mach
-pub fun collect(s: *session.Session, a: *ast.Ast, idx: *Index, ctx: *comptime_scope.ComptimeCtx, checked: bool,
-    out: *Vector[diagnostic.Expectation]) err[fail.Fail]
+pub fun collect(s: *mach.session.Session, a: *mach.front.ast.Ast, idx: *Index, ctx: *mach.front.comptime.scope.ComptimeCtx, checked: bool,
+    out: *Vector[mach.base.diagnostic.Expectation]) err[mach.base.fail.Fail]
 ```
 
 every `#[expect]` key at the sites the index read from `a`, one expectation each
@@ -99,7 +99,7 @@ out:     the list the expectations are appended to
 ### key_of
 
 ```mach
-pub fun key_of(s: *session.Session, ctx: *comptime_scope.ComptimeCtx, eid: ast_id.ExprId) opt[str]
+pub fun key_of(s: *mach.session.Session, ctx: *mach.front.comptime.scope.ComptimeCtx, eid: mach.front.ast.id.ExprId) opt[str]
 ```
 
 the key an argument evaluates to; none when the argument is not a constant string
@@ -107,7 +107,7 @@ the key an argument evaluates to; none when the argument is not a constant strin
 ### arg_span
 
 ```mach
-pub fun arg_span(a: *ast.Ast, eid: ast_id.ExprId, fallback: base_source.Span) base_source.Span
+pub fun arg_span(a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId, fallback: mach.base.source.Span) mach.base.source.Span
 ```
 
 the span an argument occupies, where a refused or unfulfilled key is reported

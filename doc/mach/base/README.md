@@ -2,7 +2,8 @@
 
 # mach.base
 
-<sub>23 modules · imported by [`bin`](../bin/README.md), [`build`](../build/README.md), [`cli`](../cli/README.md), [`compile`](../compile/README.md), [`front`](../front/README.md), [`host`](../host/README.md), [`lower`](../lower/README.md), [`manifest`](../manifest/README.md), [`package`](../package/README.md), [`report`](../report/README.md), [`session`](../session/README.md), [`target`](../target/README.md), [`tool`](../tool/README.md), [`type`](../type/README.md)</sub>
+what every other area is written in: the allocation refusal, failures and diagnostics,
+interned strings and handles, source locations, and plain utilities
 
 | Module | |
 | :--- | :--- |
@@ -15,7 +16,7 @@
 | [`fingerprint`](fingerprint.md) | domain-separated fingerprint encoding, and the sha-256 digests of bytes and files |
 | [`float`](float.md) | binary floating point as the compiler computes it: formats, rounding, NaNs and decimals |
 | [`growth`](growth.md) | the compiler's one growth routine for arrays it keeps as a pointer and a capacity beside its own count |
-| [`handle`](handle.md) | stores whose elements never move, and handle tables with generation-checked ids |
+| [`handle`](handle.md) | stores whose elements never move |
 | [`intern`](intern.md) | interned strings: one stable id per distinct byte string |
 | [`scc`](scc.md) | strongly connected components of a directed graph over numbered nodes |
 | [`source`](source.md) | the source map: the files of a compilation and the spans, locations and lines in them |
@@ -25,8 +26,8 @@
 | [`wide`](wide.md) | 128-bit integer carrier over two u64 limbs |
 | [`wire`](wire.md) | the compiler's one binary codec |
 
-| Directory | Modules | |
-| :--- | ---: | :--- |
-| [`diagnostic/`](diagnostic/README.md) | 2 | diagnostics, the builder that assembles one and the store that collects them |
-| [`source/`](source/README.md) | 3 | the source map: the files of a compilation and the spans, locations and lines in them |
+| Directory | |
+| :--- | :--- |
+| [`diagnostic/`](diagnostic/README.md) | diagnostics, the builder that assembles one and the store that collects them |
+| [`source/`](source/README.md) | the source map: the files of a compilation and the spans, locations and lines in them |
 

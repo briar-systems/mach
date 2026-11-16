@@ -11,9 +11,9 @@ message of the most specific family it falls in, or, when a previous major
 named its leading segments, with the name this one gives them, which
 `mach migrate` writes. a new path is a row here and its read
 
-<sub>source: [`src/front/comptime/path.mach`](../../../../src/front/comptime/path.mach) · imported by 3 modules</sub>
+Source: [`src/front/comptime/path.mach`](../../../../src/front/comptime/path.mach)
 
-<sub>`base_source` is [`mach.base.source`](../../base/source.md) · `comptime_scope` is [`mach.front.comptime.scope`](scope.md) · `ast` is [`mach.front.ast`](../ast.md) · `ast_id` is [`mach.front.ast.id`](../ast/id.md) · `intern` is [`mach.base.intern`](../../base/intern.md) · `comptime_value` is [`mach.front.comptime.value`](value.md) · `comptime_failure` is [`mach.front.comptime.failure`](failure.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.base.source`](../../base/source.md), [`mach.front.ast`](../ast.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.comptime.failure`](failure.md), [`mach.front.comptime.scope`](scope.md), [`mach.front.comptime.value`](value.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -23,7 +23,7 @@ named its leading segments, with the name this one gives them, which
 
 | On `Read` | |
 | :--- | :--- |
-| [`READ_SYS_TAG`](#read) · [`READ_ARCH_TAG`](#read) · [`READ_ABI_TAG`](#read) · [`READ_MODE_TAG`](#read) · [`READ_BUILD_CT_MUL`](#read) · [`READ_REFUSED`](#read) · [`READ_RESERVED`](#read) | |
+| [`READ_SYS_TAG`](#read), [`READ_ARCH_TAG`](#read), [`READ_ABI_TAG`](#read), [`READ_MODE_TAG`](#read), [`READ_BUILD_CT_MUL`](#read), [`READ_REFUSED`](#read), [`READ_RESERVED`](#read) | |
 
 | On `Row` | |
 | :--- | :--- |
@@ -38,14 +38,14 @@ named its leading segments, with the name this one gives them, which
 | Functions | |
 | :--- | :--- |
 | [`unknown`](#unknown) | the refusal of a path no row matches; nil when its root names no family |
-| [`eval_path`](#eval_path) · [`resolve_comptime_path`](#resolve_comptime_path) | |
+| [`eval_path`](#eval_path), [`resolve_comptime_path`](#resolve_comptime_path) | |
 | [`sys_tag_for`](#sys_tag_for) | the tag of `$mach.sys.<name>`: the position of mink's system of that name |
 | [`arch_tag_for`](#arch_tag_for) | the tag of `$mach.arch.<name>`: the position of mink's architecture of that name |
 | [`abi_tag_for`](#abi_tag_for) | the tag of `$mach.abi.<name>`: the spelling's place among mink's conventions |
 
 | Constants | |
 | :--- | :--- |
-| [`COMPTIME_BARE_IDENT_MSG`](#constants) · [`MODE_DEBUG`](#constants) · [`MODE_RELEASE`](#constants) | |
+| [`COMPTIME_BARE_IDENT_MSG`](#constants), [`MODE_DEBUG`](#constants), [`MODE_RELEASE`](#constants) | |
 | [`MODE_COUNT`](#constants) | the `$mach.mode.*` tags, each at its mode's value |
 
 ---
@@ -100,7 +100,7 @@ the row at `i` in declaration order, nil past the end
 ### lookup
 
 ```mach
-pub fun lookup(source: str, stack: *base_source.Span, depth: u32, call: bool) *Row
+pub fun lookup(source: str, stack: *mach.base.source.Span, depth: u32, call: bool) *Row
 ```
 
 the row a written path matches, called or not; nil when none does. `stack`
@@ -127,7 +127,7 @@ leading segments a previous major named, and the name this one gives them
 ### renamed
 
 ```mach
-pub fun renamed(source: str, stack: *base_source.Span, depth: u32) *Renamed
+pub fun renamed(source: str, stack: *mach.base.source.Span, depth: u32) *Renamed
 ```
 
 the renamed row whose segments lead the written path, nil when none does.
@@ -146,7 +146,7 @@ how many segments a renamed row's `from` spans
 ### unknown
 
 ```mach
-pub fun unknown(source: str, stack: *base_source.Span, depth: u32) str
+pub fun unknown(source: str, stack: *mach.base.source.Span, depth: u32) str
 ```
 
 the refusal of a path no row matches; nil when its root names no family
@@ -155,23 +155,23 @@ the refusal of a path no row matches; nil when its root names no family
 
 ```mach
 pub fun eval_path(
-    c: *comptime_scope.ComptimeCtx,
-    a: *ast.Ast,
+    c: *mach.front.comptime.scope.ComptimeCtx,
+    a: *mach.front.ast.Ast,
     source: str,
-    e: ast_id.ExprId,
-    interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail]
+    e: mach.front.ast.id.ExprId,
+    interner: *mach.base.intern.Interner) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail]
 ```
 
 ### resolve_comptime_path
 
 ```mach
-pub fun resolve_comptime_path(c: *comptime_scope.ComptimeCtx, source: str, file: base_source.FileId, stack: *base_source.Span, depth: u32, interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail]
+pub fun resolve_comptime_path(c: *mach.front.comptime.scope.ComptimeCtx, source: str, file: mach.base.source.FileId, stack: *mach.base.source.Span, depth: u32, interner: *mach.base.intern.Interner) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail]
 ```
 
 ### sys_tag_for
 
 ```mach
-pub fun sys_tag_for(name: View) res[u32, fail.Fail]
+pub fun sys_tag_for(name: View) res[u32, mach.base.fail.Fail]
 ```
 
 the tag of `$mach.sys.<name>`: the position of mink's system of that name
@@ -179,7 +179,7 @@ the tag of `$mach.sys.<name>`: the position of mink's system of that name
 ### arch_tag_for
 
 ```mach
-pub fun arch_tag_for(name: View) res[u32, fail.Fail]
+pub fun arch_tag_for(name: View) res[u32, mach.base.fail.Fail]
 ```
 
 the tag of `$mach.arch.<name>`: the position of mink's architecture of that name
@@ -187,7 +187,7 @@ the tag of `$mach.arch.<name>`: the position of mink's architecture of that name
 ### abi_tag_for
 
 ```mach
-pub fun abi_tag_for(name: View) res[u32, fail.Fail]
+pub fun abi_tag_for(name: View) res[u32, mach.base.fail.Fail]
 ```
 
 the tag of `$mach.abi.<name>`: the spelling's place among mink's conventions

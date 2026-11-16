@@ -6,9 +6,9 @@ builds a module's interface once sema has typed it: every module-level function 
 binding as its declaration says, every module constant evaluated to its deep value, and the
 public surface its resolution published
 
-<sub>source: [`src/front/sema/publish.mach`](../../../../src/front/sema/publish.mach) · imported by 1 module</sub>
+Source: [`src/front/sema/publish.mach`](../../../../src/front/sema/publish.mach)
 
-<sub>`sema_context` is [`mach.front.sema.context`](context.md) · `interface` is [`mach.front.sema.interface`](interface.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.sema.context`](context.md), [`mach.front.sema.interface`](interface.md).
 
 | Functions | |
 | :--- | :--- |
@@ -22,7 +22,7 @@ public surface its resolution published
 ### interface_of
 
 ```mach
-pub fun interface_of(sc: *sema_context.SemaContext) res[interface.Interface, fail.Fail]
+pub fun interface_of(sc: *mach.front.sema.context.SemaContext) res[mach.front.sema.interface.Interface, mach.base.fail.Fail]
 ```
 
 the interface takes over the module's store of constant values, which its typing built in
@@ -30,7 +30,7 @@ the interface takes over the module's store of constant values, which its typing
 ### refusals_report
 
 ```mach
-pub fun refusals_report(sc: *sema_context.SemaContext, iface: *interface.Interface)
+pub fun refusals_report(sc: *mach.front.sema.context.SemaContext, iface: *mach.front.sema.interface.Interface)
 ```
 
 reports the refusal each module `val` and `var` the interface publishes holds, as lowering

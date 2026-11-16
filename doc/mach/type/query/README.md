@@ -8,7 +8,7 @@ expansiveness, each a module under this one. the facts worth keeping are cached 
 record that only this module reads or writes, stamped with the projection generation
 they were derived under
 
-<sub>[`mach.type.query`](../query.md) · 10 modules · imports [`base`](../../base/README.md), [`report`](../../report/README.md), [`session`](../../session/README.md) · imported by [`compile`](../../compile/README.md), [`front`](../../front/README.md), [`lower`](../../lower/README.md), [`session`](../../session/README.md)</sub>
+The directory's root module is [`mach.type.query`](../query.md).
 
 | Module | |
 | :--- | :--- |

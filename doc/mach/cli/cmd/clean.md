@@ -8,9 +8,9 @@ the paths come from planning the project as `mach build --all` plans it. they ar
 removed inside the project root, and a path that escapes it or crosses a symlink is
 refused.
 
-<sub>source: [`src/cli/cmd/clean.mach`](../../../../src/cli/cmd/clean.mach) · imported by 1 module</sub>
+Source: [`src/cli/cmd/clean.mach`](../../../../src/cli/cmd/clean.mach)
 
-<sub>`args` is [`mach.cli.args`](../args.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `std_args` is `std.args`</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.cli.args`](../args.md).
 
 | Functions | |
 | :--- | :--- |
@@ -28,7 +28,7 @@ refused.
 ### run
 
 ```mach
-pub fun run(cx: *args.Call) res[i64, fail.Fail]
+pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 ```
 
 `mach clean`: remove every path a build of every cell writes, as the build
@@ -48,6 +48,6 @@ not an error; "nothing to clean" prints when nothing was removed
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COMMAND` | `std_args.Command` | `std_args.Command{name: "clean", aliases: args.NO_WORDS, help: "remove project build output", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: 2}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: false}` | `mach clean` |
-| `POLICY` | `args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach clean` to beyond the parse |
+| `COMMAND` | `std.args.Command` | `std_args.Command{name: "clean", aliases: args.NO_WORDS, help: "remove project build output", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: 2}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: false}` | `mach clean` |
+| `POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach clean` to beyond the parse |
 

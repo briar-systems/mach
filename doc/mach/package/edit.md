@@ -7,9 +7,9 @@ manifest's [dep] tables, update moves selectors and pins. each is a transaction 
 project root held open: the manifest is published only after the closure it declares is
 realized, and a failure names, through the report's effects, every change it leaves behind
 
-<sub>source: [`src/package/edit.mach`](../../../src/package/edit.mach) · imported by 2 modules</sub>
+Source: [`src/package/edit.mach`](../../../src/package/edit.mach)
 
-<sub>`A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md) · `package_closure` is [`mach.package.closure`](closure.md) · `manifest_edit` is [`mach.manifest.edit`](../manifest/edit.md) · `session` is [`mach.session`](../session.md) · `report` is [`mach.package.report`](report.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.manifest.edit`](../manifest/edit.md), [`mach.package.closure`](closure.md), [`mach.package.report`](report.md), [`mach.session`](../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -36,7 +36,7 @@ realized, and a failure names, through the report's effects, every change it lea
 
 ```mach
 pub rec Edit {
-    a:       *A.Allocator;
+    a:       *std.allocator.Allocator;
     root:    str;
     root_fd: usize;
 }
@@ -47,20 +47,20 @@ temporary and the dependency root is reached through it
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `a` | `*A.Allocator` | holds the text of a refusal |
+| `a` | `*std.allocator.Allocator` | holds the text of a refusal |
 | `root` | `str` | the project root, as a refusal names it |
 | `root_fd` | `usize` | the project root held open |
 
 ### begin
 
 ```mach
-pub fun begin(edit: *Edit, a: *A.Allocator, root: str) err[fail.Fail]
+pub fun begin(edit: *Edit, a: *std.allocator.Allocator, root: str) err[mach.base.fail.Fail]
 ```
 
 ### finish
 
 ```mach
-pub fun finish(edit: *Edit) err[fail.Fail]
+pub fun finish(edit: *Edit) err[mach.base.fail.Fail]
 ```
 
 release the project root; err when closing it fails
@@ -68,8 +68,8 @@ release the project root; err when closing it fails
 ### apply
 
 ```mach
-pub fun apply(edit: *Edit, op: *package_closure.Operation, mode: u8, spec: *manifest_edit.DepTableSpec, name: str, adding: bool,
-    purge: bool, quiet: bool, realize: bool, offline: bool) err[fail.Fail]
+pub fun apply(edit: *Edit, op: *mach.package.closure.Operation, mode: u8, spec: *mach.manifest.edit.DepTableSpec, name: str, adding: bool,
+    purge: bool, quiet: bool, realize: bool, offline: bool) err[mach.base.fail.Fail]
 ```
 
 add or remove a declaration within an open edit. realize false only declares: the manifest
@@ -80,7 +80,7 @@ gains the table (a git one at its resolved range) and nothing is checked out
 ### start
 
 ```mach
-pub fun start(s: *session.Session, root: str) err[fail.Fail]
+pub fun start(s: *mach.session.Session, root: str) err[mach.base.fail.Fail]
 ```
 
 start recording pins for a new project at `root`, as `mach init` does before it adds the
@@ -89,8 +89,8 @@ project's dependencies; a root that records them already is left as it is
 ### update
 
 ```mach
-pub fun update(s: *session.Session, a: *A.Allocator, root: str, all: bool, name: str, quiet: bool, lowest: bool, offline: bool,
-    rep: *report.Report) err[fail.Fail]
+pub fun update(s: *mach.session.Session, a: *std.allocator.Allocator, root: str, all: bool, name: str, quiet: bool, lowest: bool, offline: bool,
+    rep: *mach.package.report.Report) err[mach.base.fail.Fail]
 ```
 
 `mach dep update`: move one root-declared or transitive identity, or every one under `all`
@@ -111,8 +111,8 @@ pub fun update(s: *session.Session, a: *A.Allocator, root: str, all: bool, name:
 ### update_apply
 
 ```mach
-pub fun update_apply(op: *package_closure.Operation, mode: u8, all: bool, name: str, quiet: bool, lowest: bool,
-    offline: bool, closure: *Vector[package_closure.Request]) err[fail.Fail]
+pub fun update_apply(op: *mach.package.closure.Operation, mode: u8, all: bool, name: str, quiet: bool, lowest: bool,
+    offline: bool, closure: *Vector[mach.package.closure.Request]) err[mach.base.fail.Fail]
 ```
 
 update: the fixed git selectors move first (a ref is fetched and checked out), so their
@@ -124,7 +124,7 @@ realized and the closure is pulled, which syncs every path copy once and reports
 ### notes
 
 ```mach
-pub fun notes(rep: *report.Report, lines: *Vector[str])
+pub fun notes(rep: *mach.package.report.Report, lines: *Vector[str])
 ```
 
 a resolution's notes, as a command shows them unless --quiet
@@ -132,8 +132,8 @@ a resolution's notes, as a command shows them unless --quiet
 ### add_release
 
 ```mach
-pub fun add_release(s: *session.Session, a: *A.Allocator, root: str, name: str, url: str, quiet: bool, realize: bool,
-    rep: *report.Report) err[fail.Fail]
+pub fun add_release(s: *mach.session.Session, a: *std.allocator.Allocator, root: str, name: str, url: str, quiet: bool, realize: bool,
+    rep: *mach.package.report.Report) err[mach.base.fail.Fail]
 ```
 
 declare a git dependency at the caret range of the release resolution picks for the running
@@ -154,8 +154,8 @@ compiler and realize the closure, as `mach dep add <root> <name> --git <url>` do
 ### change
 
 ```mach
-pub fun change(s: *session.Session, a: *A.Allocator, root: str, spec: *manifest_edit.DepTableSpec, name: str, adding: bool,
-    purge: bool, quiet: bool, realize: bool, offline: bool, rep: *report.Report) err[fail.Fail]
+pub fun change(s: *mach.session.Session, a: *std.allocator.Allocator, root: str, spec: *mach.manifest.edit.DepTableSpec, name: str, adding: bool,
+    purge: bool, quiet: bool, realize: bool, offline: bool, rep: *mach.package.report.Report) err[mach.base.fail.Fail]
 ```
 
 add or remove the [dep] table `spec` describes and realize the closure it leaves
@@ -168,7 +168,7 @@ add or remove the [dep] table `spec` describes and realize the closure it leaves
 | `spec` | the table to add, or the name to remove |
 | `name` | the dependency identity |
 | `adding` | add the table; false removes it |
-| `purge` | on remove, delete dep/&lt;name> as well |
+| `purge` | on remove, delete dep/\<name> as well |
 | `quiet` | report no progress lines |
 | `realize` | realize the closure; false only writes the table |
 | `offline` | fetch nothing |

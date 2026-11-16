@@ -2,7 +2,7 @@
 
 # mach.bin
 
-<sub>1 module · imports [`base`](../base/README.md), [`cli`](../cli/README.md)</sub>
+the entry of the `mach` executable
 
 | Module | |
 | :--- | :--- |

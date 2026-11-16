@@ -9,9 +9,7 @@ width, which is exact for every narrower format. a target states what a conversi
 NaN (`NanRule`). a decimal is parsed with its fit reported, and a value is printed back as the
 shortest decimal that rounds to it in its own format.
 
-<sub>source: [`src/base/float.mach`](../../../src/base/float.mach) · imported by 20 modules</sub>
-
-<sub>`bignum` is `std.math.bignum`</sub>
+Source: [`src/base/float.mach`](../../../src/base/float.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -24,13 +22,13 @@ shortest decimal that rounds to it in its own format.
 
 | On `FloatWidth` | |
 | :--- | :--- |
-| [`FLOAT_W_NONE`](#floatwidth) · [`FLOAT_W_16`](#floatwidth) · [`FLOAT_W_32`](#floatwidth) · [`FLOAT_W_64`](#floatwidth) | |
+| [`FLOAT_W_NONE`](#floatwidth), [`FLOAT_W_16`](#floatwidth), [`FLOAT_W_32`](#floatwidth), [`FLOAT_W_64`](#floatwidth) | |
 | [`width_name`](#width_name) | the float type a width names, as its source spelling |
 | [`width_of_bits`](#width_of_bits) | the width of a float `bits` wide, FLOAT_W_NONE for a width no float type has |
 | [`round_at`](#round_at) | `f` rounded once, to nearest with ties to even, to the format of `w`, and carried back exactly in an f64 |
 | [`bits_at`](#bits_at) | the encoding at `w` of `v`, a value already representable at `w`: the bits `:~` reads |
 | [`value_of_bits`](#value_of_bits) | the value an encoding at `w` holds, carried exactly in an f64: the value `:~` makes |
-| [`widths_agree`](#widths_agree) · [`unify_width`](#unify_width) | |
+| [`widths_agree`](#widths_agree), [`unify_width`](#unify_width) | |
 | [`parse_decimal`](#parse_decimal) | the decimal `s`, its first `len` bytes, rounded once to nearest with ties to even at `w` by std's parse and carried exactly in an f64, none when the parse refuses the text |
 | [`shortest`](#shortest) | the shortest round-trip decimal of a positive finite nonzero value representable in the format of `w`, by exact bignum arithmetic (Steele and White's dragon4) over that format's own neighbours, ties read the way round-to-nearest-even reads them back |
 
@@ -44,7 +42,7 @@ shortest decimal that rounds to it in its own format.
 
 | On `Fit` | |
 | :--- | :--- |
-| [`FIT_EXACT`](#fit) · [`FIT_INEXACT`](#fit) · [`FIT_OVERFLOW`](#fit) · [`FIT_UNDERFLOW`](#fit) | |
+| [`FIT_EXACT`](#fit), [`FIT_INEXACT`](#fit), [`FIT_OVERFLOW`](#fit), [`FIT_UNDERFLOW`](#fit) | |
 
 | On `Rounded` | |
 | :--- | :--- |
@@ -56,7 +54,7 @@ shortest decimal that rounds to it in its own format.
 
 | Functions | |
 | :--- | :--- |
-| [`f64_bits`](#f64_bits) · [`bits_f64`](#bits_f64) · [`f64_neg`](#f64_neg) · [`f64_signbit`](#f64_signbit) | |
+| [`f64_bits`](#f64_bits), [`bits_f64`](#bits_f64), [`f64_neg`](#f64_neg), [`f64_signbit`](#f64_signbit) | |
 | [`f64_to_f32_bits`](#f64_to_f32_bits) | the binary32 encoding of binary64 bits that carry a binary32 value: rounded to nearest even, a NaN keeping every bit binary32 has |
 | [`f32_bits_to_f64_bits`](#f32_bits_to_f64_bits) | |
 
@@ -221,7 +219,7 @@ an overflow carries +inf and an underflow of a nonzero decimal carries +0
 ### fit_of
 
 ```mach
-pub fun fit_of(value: f64, mant: *bignum.Big, exp10: i64, trunc: bool) Rounded
+pub fun fit_of(value: f64, mant: *std.math.bignum.Big, exp10: i64, trunc: bool) Rounded
 ```
 
 how the decimal mant * 10^exp10 fit `value`, the value it was rounded to: exact when the two are

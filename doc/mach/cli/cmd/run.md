@@ -8,9 +8,9 @@ a runner the target declares, or `--runner`, launches it instead, and a target t
 not the host's and has neither is refused. under `--timeout` the program runs in its
 own process group and is stopped when the time is up.
 
-<sub>source: [`src/cli/cmd/run.mach`](../../../../src/cli/cmd/run.mach) · imported by 1 module</sub>
+Source: [`src/cli/cmd/run.mach`](../../../../src/cli/cmd/run.mach)
 
-<sub>`args` is [`mach.cli.args`](../args.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `std_args` is `std.args`</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.cli.args`](../args.md).
 
 | Functions | |
 | :--- | :--- |
@@ -28,7 +28,7 @@ own process group and is stopped when the time is up.
 ### run
 
 ```mach
-pub fun run(cx: *args.Call) res[i64, fail.Fail]
+pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 ```
 
 `mach run`: execute the project's already-built binary, forwarding the arguments after
@@ -47,6 +47,6 @@ after the duration
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COMMAND` | `std_args.Command` | `std_args.Command{name: "run", aliases: args.NO_WORDS, help: "run a built executable, passing arguments after --", usage: "<path> [-- args...]", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: true}` | `mach run` |
-| `POLICY` | `args.Policy` | `args.Policy{refused: Slice[*std_args.Flag]{data: ?REFUSED[0], size: REFUSED_N}, refusal: "run executes an existing artifact", conflicts: args.NO_CONFLICTS}` | what mach holds `mach run` to beyond the parse |
+| `COMMAND` | `std.args.Command` | `std_args.Command{name: "run", aliases: args.NO_WORDS, help: "run a built executable, passing arguments after --", usage: "<path> [-- args...]", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: true}` | `mach run` |
+| `POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: Slice[*std_args.Flag]{data: ?REFUSED[0], size: REFUSED_N}, refusal: "run executes an existing artifact", conflicts: args.NO_CONFLICTS}` | what mach holds `mach run` to beyond the parse |
 

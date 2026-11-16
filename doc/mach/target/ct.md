@@ -9,7 +9,7 @@ runs in constant time, division, remainder or a float operation. a multiply is a
 cell, an operation at an operand width, and a target's facts hold the cells mirl runs in
 constant time as a mask, which `$mach.build.ct_mul` reads.
 
-<sub>source: [`src/target/ct.mach`](../../../src/target/ct.mach) · imported by 3 modules</sub>
+Source: [`src/target/ct.mach`](../../../src/target/ct.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,21 +21,21 @@ constant time as a mask, which `$mach.build.ct_mul` reads.
 
 | On `CtOp` | |
 | :--- | :--- |
-| [`CT_OP_NONE`](#ctop) · [`CT_OP_INT_DIVMOD`](#ctop) · [`CT_OP_FLOAT`](#ctop) · [`CT_OP_INT_MUL`](#ctop) · [`CT_OP_VAR_SHIFT`](#ctop) | |
+| [`CT_OP_NONE`](#ctop), [`CT_OP_INT_DIVMOD`](#ctop), [`CT_OP_FLOAT`](#ctop), [`CT_OP_INT_MUL`](#ctop), [`CT_OP_VAR_SHIFT`](#ctop) | |
 | [`ct_cap`](#ct_cap) | the capability a target must provide for an operation to be constant-time, absent for an operation outside the catalog: an unknown operation is never answered with "no capability needed" |
 
 | On `CtCap` | |
 | :--- | :--- |
-| [`CT_CAP_OK`](#ctcap) · [`CT_CAP_ALWAYS`](#ctcap) · [`CT_CAP_MUL`](#ctcap) · [`cap_at_sema`](#cap_at_sema) | |
+| [`CT_CAP_OK`](#ctcap), [`CT_CAP_ALWAYS`](#ctcap), [`CT_CAP_MUL`](#ctcap), [`cap_at_sema`](#cap_at_sema) | |
 
 | On `CtMulOp` | |
 | :--- | :--- |
-| [`CT_MUL_NONE`](#ctmulop) · [`CT_MUL_LOW`](#ctmulop) · [`CT_MUL_HIGH_U`](#ctmulop) · [`CT_MUL_HIGH_S`](#ctmulop) · [`CT_MUL_HIGH_SU`](#ctmulop) · [`CT_MUL_WIDE_U`](#ctmulop) · [`CT_MUL_WIDE_S`](#ctmulop) · [`mul_cell`](#mul_cell) | |
+| [`CT_MUL_NONE`](#ctmulop), [`CT_MUL_LOW`](#ctmulop), [`CT_MUL_HIGH_U`](#ctmulop), [`CT_MUL_HIGH_S`](#ctmulop), [`CT_MUL_HIGH_SU`](#ctmulop), [`CT_MUL_WIDE_U`](#ctmulop), [`CT_MUL_WIDE_S`](#ctmulop), [`mul_cell`](#mul_cell) | |
 | [`mul_op_name`](#mul_op_name) | the spelling `$mach.build.ct_mul` reads, absent for NONE or an unknown tag |
 
 | On `CtMulMask` | |
 | :--- | :--- |
-| [`mul_mask_none`](#mul_mask_none) · [`mul_mask_add`](#mul_mask_add) | |
+| [`mul_mask_none`](#mul_mask_none), [`mul_mask_add`](#mul_mask_add) | |
 | [`mul_mask_has`](#mul_mask_has) | whether the cells cover this multiply, never for an unknown cell |
 
 | Functions | |

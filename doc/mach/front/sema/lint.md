@@ -5,9 +5,9 @@
 the lints over a typed module: uses of deprecated declarations, and testing
 declarations reached from code outside a test
 
-<sub>source: [`src/front/sema/lint.mach`](../../../../src/front/sema/lint.mach) · imported by 1 module</sub>
+Source: [`src/front/sema/lint.mach`](../../../../src/front/sema/lint.mach)
 
-<sub>`sema_context` is [`mach.front.sema.context`](context.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.sema.context`](context.md).
 
 | Functions | |
 | :--- | :--- |
@@ -21,13 +21,13 @@ declarations reached from code outside a test
 ### warn_deprecated_uses
 
 ```mach
-pub fun warn_deprecated_uses(sc: *sema_context.SemaContext) err[fail.Fail]
+pub fun warn_deprecated_uses(sc: *mach.front.sema.context.SemaContext) err[mach.base.fail.Fail]
 ```
 
 ### check_testing_uses
 
 ```mach
-pub fun check_testing_uses(sc: *sema_context.SemaContext) err[fail.Fail]
+pub fun check_testing_uses(sc: *mach.front.sema.context.SemaContext) err[mach.base.fail.Fail]
 ```
 
 a reference to a `#[testing]` declaration is legal only inside a test body or another

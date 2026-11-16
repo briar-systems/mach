@@ -5,9 +5,9 @@
 why a comptime evaluation has no value: refused for good, waiting on a later phase or
 an instance, or failed inside the compiler
 
-<sub>source: [`src/front/comptime/failure.mach`](../../../../src/front/comptime/failure.mach) · imported by 25 modules</sub>
+Source: [`src/front/comptime/failure.mach`](../../../../src/front/comptime/failure.mach)
 
-<sub>`diagnostic_kind` is [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `A` is `std.allocator` · `diagnostic` is [`mach.base.diagnostic`](../../base/diagnostic.md) · `base_source` is [`mach.base.source`](../../base/source.md)</sub>
+Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../../base/source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -16,7 +16,7 @@ an instance, or failed inside the compiler
 
 | On `EvalFailKind` | |
 | :--- | :--- |
-| [`EVAL_FAIL_NONE`](#evalfailkind) · [`EVAL_FAIL_REJECTED`](#evalfailkind) · [`EVAL_FAIL_UNBOUND`](#evalfailkind) · [`EVAL_FAIL_NEEDS_MEMBER`](#evalfailkind) · [`EVAL_FAIL_NEEDS_TYPES`](#evalfailkind) · [`EVAL_FAIL_NEEDS_LAYOUT`](#evalfailkind) · [`EVAL_FAIL_INTERNAL`](#evalfailkind) · [`EVAL_FAIL_NEEDS_INSTANCE`](#evalfailkind) · [`EVAL_FAIL_NOT_INTEGER`](#evalfailkind) · [`eval_error`](#eval_error) · [`not_constant`](#not_constant) | |
+| [`EVAL_FAIL_NONE`](#evalfailkind), [`EVAL_FAIL_REJECTED`](#evalfailkind), [`EVAL_FAIL_UNBOUND`](#evalfailkind), [`EVAL_FAIL_NEEDS_MEMBER`](#evalfailkind), [`EVAL_FAIL_NEEDS_TYPES`](#evalfailkind), [`EVAL_FAIL_NEEDS_LAYOUT`](#evalfailkind), [`EVAL_FAIL_INTERNAL`](#evalfailkind), [`EVAL_FAIL_NEEDS_INSTANCE`](#evalfailkind), [`EVAL_FAIL_NOT_INTEGER`](#evalfailkind), [`eval_error`](#eval_error), [`not_constant`](#not_constant) | |
 
 | On `EvalFail` | |
 | :--- | :--- |
@@ -52,7 +52,7 @@ pub def EvalFailKind: u8
 ### eval_error
 
 ```mach
-pub fun eval_error(kind: EvalFailKind, diag: diagnostic_kind.Kind, message: str) EvalFail
+pub fun eval_error(kind: EvalFailKind, diag: mach.base.diagnostic.kind.Kind, message: str) EvalFail
 ```
 
 ### not_constant
@@ -66,7 +66,7 @@ pub fun not_constant(kind: EvalFailKind) bool
 ```mach
 pub rec EvalFail {
     kind:    EvalFailKind;
-    diag:    diagnostic_kind.Kind;
+    diag:    mach.base.diagnostic.kind.Kind;
     message: str;
 }
 ```
@@ -84,13 +84,13 @@ an internal failure of the evaluator, a compiler defect wherever it surfaces
 ### eval_from_fail
 
 ```mach
-pub fun eval_from_fail(f: fail.Fail, diag: diagnostic_kind.Kind, rejected_message: str) EvalFail
+pub fun eval_from_fail(f: mach.base.fail.Fail, diag: mach.base.diagnostic.kind.Kind, rejected_message: str) EvalFail
 ```
 
 ### eval_from_refusal
 
 ```mach
-pub fun eval_from_refusal(f: fail.Fail, diag: diagnostic_kind.Kind, rejected_message: str) EvalFail
+pub fun eval_from_refusal(f: mach.base.fail.Fail, diag: mach.base.diagnostic.kind.Kind, rejected_message: str) EvalFail
 ```
 
 a failure a walk with no place of its own returned to an evaluation: a refusal of the input
@@ -113,7 +113,7 @@ value exists better than the asker can: a secret
 ### init_not_constant_report
 
 ```mach
-pub fun init_not_constant_report(alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore, file: base_source.FileId, span: base_source.Span, name: opt[str]) err[fail.Fail]
+pub fun init_not_constant_report(alloc: *std.allocator.Allocator, diags: *mach.base.diagnostic.DiagnosticStore, file: mach.base.source.FileId, span: mach.base.source.Span, name: opt[str]) err[mach.base.fail.Fail]
 ```
 
 reports the initializer at `span` of the global `name` as no constant, the one report check

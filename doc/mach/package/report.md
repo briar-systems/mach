@@ -7,9 +7,9 @@ failure the operation goes on past stream to the caller as they happen; `effects
 a note for each change an operation made before it failed, which the caller shows after
 the failure, so a failed command still names the state it left
 
-<sub>source: [`src/package/report.mach`](../../../src/package/report.mach) · imported by 14 modules</sub>
+Source: [`src/package/report.mach`](../../../src/package/report.mach)
 
-<sub>`LineFn` is private · `NoteFn` is private · `FaultFn` is private · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -18,7 +18,7 @@ the failure, so a failed command still names the state it left
 | On `Report` | |
 | :--- | :--- |
 | [`init`](#init) | a report over the given sink, whose effects `a` owns |
-| [`dnit`](#dnit) · [`line`](#line) · [`note`](#note) · [`fault`](#fault) | |
+| [`dnit`](#dnit), [`line`](#line), [`note`](#note), [`fault`](#fault) | |
 | [`effectf`](#effectf) | keep an effect note formatted as std.format formats it; a note that cannot be kept is dropped, since it only explains a failure already reported |
 | [`linef`](#linef) | a progress line formatted as std.format formats it, through storage `a` lends for the call |
 | [`notef`](#notef) | a note formatted as std.format formats it, through storage `a` lends for the call |
@@ -41,7 +41,7 @@ pub rec Report {
 ### init
 
 ```mach
-pub fun init(a: *A.Allocator, ctx: ptr, on_line: LineFn, on_note: NoteFn, on_fault: FaultFn) Report
+pub fun init(a: *std.allocator.Allocator, ctx: ptr, on_line: LineFn, on_note: NoteFn, on_fault: FaultFn) Report
 ```
 
 a report over the given sink, whose effects `a` owns
@@ -67,7 +67,7 @@ pub fun note(r: *Report, text: str)
 ### fault
 
 ```mach
-pub fun fault(r: *Report, f: fail.Fail)
+pub fun fault(r: *Report, f: mach.base.fail.Fail)
 ```
 
 ### effectf
@@ -82,7 +82,7 @@ dropped, since it only explains a failure already reported
 ### linef
 
 ```mach
-pub fun linef(r: *Report, a: *A.Allocator, fmt: str, va: ...)
+pub fun linef(r: *Report, a: *std.allocator.Allocator, fmt: str, va: ...)
 ```
 
 a progress line formatted as std.format formats it, through storage `a` lends for the call
@@ -90,7 +90,7 @@ a progress line formatted as std.format formats it, through storage `a` lends fo
 ### notef
 
 ```mach
-pub fun notef(r: *Report, a: *A.Allocator, fmt: str, va: ...)
+pub fun notef(r: *Report, a: *std.allocator.Allocator, fmt: str, va: ...)
 ```
 
 a note formatted as std.format formats it, through storage `a` lends for the call
@@ -98,7 +98,7 @@ a note formatted as std.format formats it, through storage `a` lends for the cal
 ### discard
 
 ```mach
-pub fun discard(a: *A.Allocator) Report
+pub fun discard(a: *std.allocator.Allocator) Report
 ```
 
 a report that keeps nothing, for work that has nothing to say or a test that checks state

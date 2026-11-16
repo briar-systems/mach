@@ -7,9 +7,9 @@ closure is located as a build locates it, and every edge is held to its pin and 
 through the source's checkouts table, to the identity and flat layout rules, and to the
 release rule; a root override of a requirer's selector is reported, not refused
 
-<sub>source: [`src/package/verify.mach`](../../../src/package/verify.mach) · imported by 1 module</sub>
+Source: [`src/package/verify.mach`](../../../src/package/verify.mach)
 
-<sub>`intern` is [`mach.base.intern`](../base/intern.md) · `session` is [`mach.session`](../session.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `A` is `std.allocator` · `report` is [`mach.package.report`](report.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.package.report`](report.md), [`mach.session`](../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -30,10 +30,10 @@ release rule; a root override of a requirer's selector is reported, not refused
 
 ```mach
 pub rec RootOverride {
-    name:      intern.StrId;
-    chain:     intern.StrId;
-    requested: intern.StrId;
-    declared:  intern.StrId;
+    name:      mach.base.intern.StrId;
+    chain:     mach.base.intern.StrId;
+    requested: mach.base.intern.StrId;
+    declared:  mach.base.intern.StrId;
 }
 ```
 
@@ -43,15 +43,15 @@ wins over every requirer with no check that the dependency supports it; a root
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `name` | `intern.StrId` | the dependency key both declarations use |
-| `chain` | `intern.StrId` | the requiring chain, ending at the dependency |
-| `requested` | `intern.StrId` | the requirer's selector, as `ref = "..."`, `version = "..."` or `path = "..."` |
-| `declared` | `intern.StrId` | the root's selector, in the same form |
+| `name` | `mach.base.intern.StrId` | the dependency key both declarations use |
+| `chain` | `mach.base.intern.StrId` | the requiring chain, ending at the dependency |
+| `requested` | `mach.base.intern.StrId` | the requirer's selector, as `ref = "..."`, `version = "..."` or `path = "..."` |
+| `declared` | `mach.base.intern.StrId` | the root's selector, in the same form |
 
 ### root_override_text
 
 ```mach
-pub fun root_override_text(s: *session.Session, o: *RootOverride) res[str, fail.Fail]
+pub fun root_override_text(s: *mach.session.Session, o: *RootOverride) res[str, mach.base.fail.Fail]
 ```
 
 the note `mach dep verify` prints for one override
@@ -59,8 +59,8 @@ the note `mach dep verify` prints for one override
 ### dependencies
 
 ```mach
-pub fun dependencies(s: *session.Session, project_root: str, release_rule: bool,
-    overrides: *Vector[RootOverride]) err[fail.Fail]
+pub fun dependencies(s: *mach.session.Session, project_root: str, release_rule: bool,
+    overrides: *Vector[RootOverride]) err[mach.base.fail.Fail]
 ```
 
 check a project's realized dependency closure without changing it
@@ -78,7 +78,7 @@ check a project's realized dependency closure without changing it
 ### project_closure
 
 ```mach
-pub fun project_closure(s: *session.Session, a: *A.Allocator, root: str, release_rule: bool, rep: *report.Report) err[fail.Fail]
+pub fun project_closure(s: *mach.session.Session, a: *std.allocator.Allocator, root: str, release_rule: bool, rep: *mach.package.report.Report) err[mach.base.fail.Fail]
 ```
 
 `mach dep verify`: check that every dependency of a project is realized and consistent

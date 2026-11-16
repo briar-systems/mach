@@ -4,9 +4,9 @@
 
 what sema publishes for a module, and how one module reads another's
 
-<sub>source: [`src/front/sema/product.mach`](../../../../src/front/sema/product.mach) · imported by 18 modules</sub>
+Source: [`src/front/sema/product.mach`](../../../../src/front/sema/product.mach)
 
-<sub>`fields` is [`mach.front.sema.fields`](fields.md) · `report_phase` is [`mach.report.phase`](../../report/phase.md) · `A` is `std.allocator` · `type_kind` is [`mach.type.kind`](../../type/kind.md) · `intern` is [`mach.base.intern`](../../base/intern.md) · `comptime_scope` is [`mach.front.comptime.scope`](../comptime/scope.md) · `sema_instance` is [`mach.front.sema.instance`](instance.md) · `sema_growth` is [`mach.front.sema.growth`](growth.md) · `interface` is [`mach.front.sema.interface`](interface.md) · `comptime_deep` is [`mach.front.comptime.deep`](../comptime/deep.md) · `diagnostic` is [`mach.base.diagnostic`](../../base/diagnostic.md) · `session_module` is [`mach.session.module`](../../session/module.md) · `resolve` is [`mach.front.resolve`](../resolve.md) · `collections_vector` is `std.collections.vector` · `map` is `std.collections.map` · `fail` is [`mach.base.fail`](../../base/fail.md) · `AcquiredDefinition` is private</sub>
+Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.front.comptime.deep`](../comptime/deep.md), [`mach.front.comptime.scope`](../comptime/scope.md), [`mach.front.resolve`](../resolve.md), [`mach.front.sema.fields`](fields.md), [`mach.front.sema.growth`](growth.md), [`mach.front.sema.instance`](instance.md), [`mach.front.sema.interface`](interface.md), [`mach.report.phase`](../../report/phase.md), [`mach.session.module`](../../session/module.md), [`mach.type.kind`](../../type/kind.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -32,12 +32,12 @@ what sema publishes for a module, and how one module reads another's
 
 | On `ModuleSema` | |
 | :--- | :--- |
-| [`module_sema_init`](#module_sema_init) · [`module_sema_dnit`](#module_sema_dnit) | |
+| [`module_sema_init`](#module_sema_init), [`module_sema_dnit`](#module_sema_dnit) | |
 | [`module_export_for`](#module_export_for) | the export of `module` keyed (origin, canon), bringing the index up to the current exports |
 
 | On `DefinitionPhase` | |
 | :--- | :--- |
-| [`DEFINITION_PARSED`](#definitionphase) · [`DEFINITION_RESOLVED`](#definitionphase) · [`DEFINITION_TYPED`](#definitionphase) | |
+| [`DEFINITION_PARSED`](#definitionphase), [`DEFINITION_RESOLVED`](#definitionphase), [`DEFINITION_TYPED`](#definitionphase) | |
 
 | On `DefinitionReader` | |
 | :--- | :--- |
@@ -48,7 +48,7 @@ what sema publishes for a module, and how one module reads another's
 
 | Constants | |
 | :--- | :--- |
-| [`INFERRED_LEN_NONE`](#constants) · [`INFERRED_LEN_FAILED`](#constants) | |
+| [`INFERRED_LEN_NONE`](#constants), [`INFERRED_LEN_FAILED`](#constants) | |
 | [`INFERRED_LEN_NEEDS_LITERAL`](#constants) | a `[_]T` annotation on a binding whose initializer is absent or not an array literal |
 
 ---
@@ -57,31 +57,31 @@ what sema publishes for a module, and how one module reads another's
 
 ```mach
 pub rec SemaResult {
-    field_graph:      fields.Graph;
-    status:           report_phase.PhaseStatus;
-    alloc:            *A.Allocator;
-    expr_type:        *type_kind.TypeId;
-    type_resolved_ty: *type_kind.TypeId;
-    decl_type:        *type_kind.TypeId;
+    field_graph:      mach.front.sema.fields.Graph;
+    status:           mach.report.phase.PhaseStatus;
+    alloc:            *std.allocator.Allocator;
+    expr_type:        *mach.type.kind.TypeId;
+    type_resolved_ty: *mach.type.kind.TypeId;
+    decl_type:        *mach.type.kind.TypeId;
     expr_count:       u32;
     type_count:       u32;
     decl_count:       u32;
-    embed_paths:      *intern.StrId;
+    embed_paths:      *mach.base.intern.StrId;
     embed_path_count: u32;
     embed_path_cap:   u32;
     # the constants sema bound and the gates it decided, over the load's and resolve's
-    constants: comptime_scope.Bindings;
+    constants: mach.front.comptime.scope.Bindings;
     # every instance the module's own code asks for, with where and from what each is asked,
     # and the calls and gates of its own typing (frame 0); each instance is typed by itself
     # (InstanceResult), not here
-    instances: sema_instance.Set;
+    instances: mach.front.sema.instance.Set;
     # whether the module's annotations reach a secret, which an instance of its templates
     # starts its own answer from
     has_secret: bool;
     # the growing cycles among the module's templates
-    growth: sema_growth.Analysis;
+    growth: mach.front.sema.growth.Analysis;
     # what the lowering of every importer reads of the module
-    interface: interface.Interface;
+    interface: mach.front.sema.interface.Interface;
 }
 ```
 
@@ -107,10 +107,10 @@ lowering reads, the field graph and the status stay
 
 ```mach
 pub rec InstanceResult {
-    status: report_phase.PhaseStatus;
-    set:    sema_instance.Set;
-    values: comptime_deep.Store;
-    diags:  diagnostic.DiagnosticStore;
+    status: mach.report.phase.PhaseStatus;
+    set:    mach.front.sema.instance.Set;
+    values: mach.front.comptime.deep.Store;
+    diags:  mach.base.diagnostic.DiagnosticStore;
 }
 ```
 
@@ -118,10 +118,10 @@ one instance typed on its own, which every user of it reads
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `status` | `report_phase.PhaseStatus` | whether its body type checks |
-| `set` | `sema_instance.Set` | the instance at its head (id 0), its typing in the head's frames, and after it every instance its body asks for, with where each is asked |
-| `values` | `comptime_deep.Store` | the constants its body builds, which answer to comptime_deep.INSTANCE_MODULE |
-| `diags` | `diagnostic.DiagnosticStore` | what typing it reported; a report the instance raises where it is asked for is placed nowhere (base_source.FILE_NIL), for the build's demand to place at the site it chose |
+| `status` | `mach.report.phase.PhaseStatus` | whether its body type checks |
+| `set` | `mach.front.sema.instance.Set` | the instance at its head (id 0), its typing in the head's frames, and after it every instance its body asks for, with where each is asked |
+| `values` | `mach.front.comptime.deep.Store` | the constants its body builds, which answer to comptime_deep.INSTANCE_MODULE |
+| `diags` | `mach.base.diagnostic.DiagnosticStore` | what typing it reported; a report the instance raises where it is asked for is placed nowhere (base_source.FILE_NIL), for the demand of each module reaching it to place |
 
 ### instance_dnit
 
@@ -135,10 +135,10 @@ release a typed instance; a nil one holds nothing
 
 ```mach
 pub rec TypeExport {
-    origin:   session_module.StableModuleId;
-    canon:    intern.StrId;
-    ty:       type_kind.TypeId;
-    constant: resolve.ExportConstant;
+    origin:   mach.session.module.StableModuleId;
+    canon:    mach.base.intern.StrId;
+    ty:       mach.type.kind.TypeId;
+    constant: mach.front.resolve.ExportConstant;
 }
 ```
 
@@ -149,11 +149,11 @@ module's interface publishes
 
 ```mach
 pub rec ModuleSema {
-    path:    intern.StrId;
-    module:  session_module.ModuleId;
-    exports: collections_vector.Vector[TypeExport];
-    graph:   fields.Graph;
-    index:   map.Map[u64, u32];
+    path:    mach.base.intern.StrId;
+    module:  mach.session.module.ModuleId;
+    exports: std.collections.vector.Vector[TypeExport];
+    graph:   mach.front.sema.fields.Graph;
+    index:   std.collections.map.Map[u64, u32];
     indexed: usize;
 }
 ```
@@ -164,7 +164,7 @@ that key over the first `indexed` of them
 ### module_sema_init
 
 ```mach
-pub fun module_sema_init(a: *A.Allocator, path: intern.StrId, module: session_module.ModuleId) ModuleSema
+pub fun module_sema_init(a: *std.allocator.Allocator, path: mach.base.intern.StrId, module: mach.session.module.ModuleId) ModuleSema
 ```
 
 ### module_sema_dnit
@@ -176,7 +176,7 @@ pub fun module_sema_dnit(module: *ModuleSema)
 ### module_export_for
 
 ```mach
-pub fun module_export_for(module: *ModuleSema, origin: session_module.StableModuleId, canon: intern.StrId) res[opt[TypeExport], A.Error]
+pub fun module_export_for(module: *ModuleSema, origin: mach.session.module.StableModuleId, canon: mach.base.intern.StrId) res[opt[TypeExport], std.allocator.Error]
 ```
 
 the export of `module` keyed (origin, canon), bringing the index up to the current exports
@@ -197,12 +197,12 @@ pub def DefinitionPhase: u8
 
 ```mach
 pub rec Definition {
-    parsed:     resolve.ParsedDefinition;
-    origin:     session_module.ModuleId;
-    rr:         *resolve.ResolveResult;
+    parsed:     mach.front.resolve.ParsedDefinition;
+    origin:     mach.session.module.ModuleId;
+    rr:         *mach.front.resolve.ResolveResult;
     sr:         *SemaResult;
-    ctx:        *comptime_scope.ComptimeCtx;
-    decorators: *comptime_scope.ComptimeCtx;
+    ctx:        *mach.front.comptime.scope.ComptimeCtx;
+    decorators: *mach.front.comptime.scope.ComptimeCtx;
 }
 ```
 
@@ -210,24 +210,24 @@ a module's definition as far as a phase acquired it
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `ctx` | `*comptime_scope.ComptimeCtx` | the scope its constants are read in, once typed |
-| `decorators` | `*comptime_scope.ComptimeCtx` | a scope that reads the load's records of its decorators, at every phase |
+| `ctx` | `*mach.front.comptime.scope.ComptimeCtx` | the scope its constants are read in, once typed |
+| `decorators` | `*mach.front.comptime.scope.ComptimeCtx` | a scope that reads the load's records of its decorators, at every phase |
 
 ## DefinitionReader
 
 ```mach
 pub rec DefinitionReader {
     ctx:      ptr;
-    read:     fun(ptr, session_module.ModuleId, DefinitionPhase) res[Definition, fail.Fail];
-    acquired: collections_vector.Vector[AcquiredDefinition];
+    read:     fun(ptr, mach.session.module.ModuleId, DefinitionPhase) res[Definition, mach.base.fail.Fail];
+    acquired: std.collections.vector.Vector[AcquiredDefinition];
 }
 ```
 
 ### reader_init
 
 ```mach
-pub fun reader_init(ctx: ptr, read: fun(ptr, session_module.ModuleId, DefinitionPhase) res[Definition, fail.Fail],
-    a: *A.Allocator) DefinitionReader
+pub fun reader_init(ctx: ptr, read: fun(ptr, mach.session.module.ModuleId, DefinitionPhase) res[Definition, mach.base.fail.Fail],
+    a: *std.allocator.Allocator) DefinitionReader
 ```
 
 a reader lives for one computation, which acquires the same current definition once per origin
@@ -243,7 +243,7 @@ release a reader; a nil reader holds nothing
 ### acquire_definition
 
 ```mach
-pub fun acquire_definition(reader: *DefinitionReader, origin: session_module.ModuleId, phase: DefinitionPhase) res[Definition, fail.Fail]
+pub fun acquire_definition(reader: *DefinitionReader, origin: mach.session.module.ModuleId, phase: DefinitionPhase) res[Definition, mach.base.fail.Fail]
 ```
 
 the definition of module `origin` as far as each phase got: an importer is checked against
@@ -252,8 +252,8 @@ what a rejected module resolved and typed, since what it refused carries the err
 ### acquire_symbol
 
 ```mach
-pub fun acquire_symbol(reader: *DefinitionReader, requested: *resolve.Symbol, origin: session_module.ModuleId,
-    phase: DefinitionPhase) res[DefinedSymbol, fail.Fail]
+pub fun acquire_symbol(reader: *DefinitionReader, requested: *mach.front.resolve.Symbol, origin: mach.session.module.ModuleId,
+    phase: DefinitionPhase) res[DefinedSymbol, mach.base.fail.Fail]
 ```
 
 the current definition of `requested`, which module `origin` defines as this operation numbers it
@@ -263,7 +263,7 @@ the current definition of `requested`, which module `origin` defines as this ope
 ```mach
 pub rec DefinedSymbol {
     definition: Definition;
-    symbol:     resolve.Symbol;
+    symbol:     mach.front.resolve.Symbol;
 }
 ```
 
@@ -286,7 +286,7 @@ between every importer in a pass
 ```mach
 pub rec GrowthWatch {
     ctx:      ptr;
-    expanded: fun(ptr, intern.StrId, intern.StrId, u32);
+    expanded: fun(ptr, mach.base.intern.StrId, mach.base.intern.StrId, u32);
 }
 ```
 

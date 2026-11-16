@@ -9,7 +9,7 @@ holds
 a target is resolved through mink's catalog and masc's check (mach.target.resolved),
 and every fact read here is read from that resolution's rows
 
-<sub>[`mach.target`](../target.md) · 9 modules · imports [`base`](../base/README.md), [`type`](../type/README.md) · imported by [`build`](../build/README.md), [`cli`](../cli/README.md), [`compile`](../compile/README.md), [`front`](../front/README.md), [`lower`](../lower/README.md), [`manifest`](../manifest/README.md)</sub>
+The directory's root module is [`mach.target`](../target.md).
 
 | Module | |
 | :--- | :--- |

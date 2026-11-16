@@ -7,9 +7,9 @@ in mach's terms: a refusal as the failure it is reported under, at the source lo
 states for it, and each warning mirl returns as a failure of the warning's kind, located the
 same way, which the caller reports
 
-<sub>source: [`src/compile/backend/compile.mach`](../../../../src/compile/backend/compile.mach) · imported by 2 modules</sub>
+Source: [`src/compile/backend/compile.mach`](../../../../src/compile/backend/compile.mach)
 
-<sub>`vector` is `std.collections.vector` · `fail` is [`mach.base.fail`](../../base/fail.md) · `A` is `std.allocator` · `base_source` is [`mach.base.source`](../../base/source.md) · `relaxation` is `mirl.pass.relaxation` · `std_writer` is `std.io.writer` · `mirl_stats` is `mirl.base.stats`</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../../base/source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -28,7 +28,7 @@ same way, which the caller reports
 ```mach
 pub rec Compiled {
     object:   Object;
-    warnings: vector.Vector[fail.Fail];
+    warnings: std.collections.vector.Vector[mach.base.fail.Fail];
 }
 ```
 
@@ -39,8 +39,8 @@ warnings alone with `warnings_dnit` once the object has moved on
 ### compile
 
 ```mach
-pub fun compile(b: *Back, a: *A.Allocator, sources: *base_source.SourceMap, m: *Module, level: u8, checked: bool, relax: bool, floats: relaxation.Relaxations,
-    listing: opt[*std_writer.Writer], stats: opt[*mirl_stats.Stats], name: str) res[Compiled, fail.Fail]
+pub fun compile(b: *Back, a: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, m: *Module, level: u8, checked: bool, relax: bool, floats: mirl.pass.relaxation.Relaxations,
+    listing: opt[*std.io.writer.Writer], stats: opt[*mirl.base.stats.Stats], name: str) res[Compiled, mach.base.fail.Fail]
 ```
 
 the mirl module `m` compiled to mink's object at mirl's level `level`, its schedule's own checks
@@ -53,7 +53,7 @@ to rewrite, so it is spent here
 ### warnings_dnit
 
 ```mach
-pub fun warnings_dnit(a: *A.Allocator, c: *Compiled)
+pub fun warnings_dnit(a: *std.allocator.Allocator, c: *Compiled)
 ```
 
 give back the warnings of what `compile` made, which own their text and places through `a`, the
@@ -62,7 +62,7 @@ allocator it was given
 ### dnit
 
 ```mach
-pub fun dnit(a: *A.Allocator, c: *Compiled)
+pub fun dnit(a: *std.allocator.Allocator, c: *Compiled)
 ```
 
 give back what `compile` made: its object and its warnings

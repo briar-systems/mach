@@ -4,9 +4,9 @@
 
 the type-syntax nodes of the syntax tree: types as they are written, before they resolve
 
-<sub>source: [`src/front/ast/type.mach`](../../../../src/front/ast/type.mach) · imported by 24 modules</sub>
+Source: [`src/front/ast/type.mach`](../../../../src/front/ast/type.mach)
 
-<sub>`base_source` is [`mach.base.source`](../../base/source.md) · `ast_id` is [`mach.front.ast.id`](id.md)</sub>
+Uses types from [`mach.base.source`](../../base/source.md), [`mach.front.ast.id`](id.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -25,7 +25,7 @@ the type-syntax nodes of the syntax tree: types as they are written, before they
 
 | On `TypeKind` | |
 | :--- | :--- |
-| [`TYPE_KIND_NAMED`](#typekind) · [`TYPE_KIND_PTR`](#typekind) · [`TYPE_KIND_ARRAY`](#typekind) · [`TYPE_KIND_FUN`](#typekind) · [`TYPE_KIND_REC`](#typekind) · [`TYPE_KIND_UNI`](#typekind) · [`TYPE_KIND_PACK`](#typekind) · [`TYPE_KIND_SECRET`](#typekind) · [`TYPE_KIND_FIELD_TYPE`](#typekind) · [`TYPE_KIND_POINTEE_OF`](#typekind) · [`TYPE_KIND_DISCRIMINANT_OF`](#typekind) · [`TYPE_KIND_ERROR`](#typekind) | |
+| [`TYPE_KIND_NAMED`](#typekind), [`TYPE_KIND_PTR`](#typekind), [`TYPE_KIND_ARRAY`](#typekind), [`TYPE_KIND_FUN`](#typekind), [`TYPE_KIND_REC`](#typekind), [`TYPE_KIND_UNI`](#typekind), [`TYPE_KIND_PACK`](#typekind), [`TYPE_KIND_SECRET`](#typekind), [`TYPE_KIND_FIELD_TYPE`](#typekind), [`TYPE_KIND_POINTEE_OF`](#typekind), [`TYPE_KIND_DISCRIMINANT_OF`](#typekind), [`TYPE_KIND_ERROR`](#typekind) | |
 
 ---
 
@@ -54,16 +54,16 @@ pub def TypeKind: u8
 
 ```mach
 pub rec TypeNamed {
-    name:       base_source.Span;
+    name:       mach.base.source.Span;
     args_start: u32;
     args_len:   u32;
     operand:    bool;
     # in a literal head after generic arguments, `T[A].c{...}`, the tag case written; length zero
     # otherwise. a bare `T.c` keeps its whole path in `name`, and name resolution's head
     # interpretation reads it as type and case
-    case_name: base_source.Span;
+    case_name: mach.base.source.Span;
     # in a literal head `T.[c]{...}`, the comptime case descriptor; EXPR_NIL otherwise
-    case_desc: ast_id.ExprId;
+    case_desc: mach.front.ast.id.ExprId;
     # where the tree's path names hold the id of each segment of `name`, in order
     segments: u32;
 }
@@ -73,7 +73,7 @@ pub rec TypeNamed {
 
 ```mach
 pub rec TypePtr {
-    pointee: ast_id.TypeId;
+    pointee: mach.front.ast.id.TypeId;
 }
 ```
 
@@ -81,7 +81,7 @@ pub rec TypePtr {
 
 ```mach
 pub rec TypeSecret {
-    inner: ast_id.TypeId;
+    inner: mach.front.ast.id.TypeId;
 }
 ```
 
@@ -89,8 +89,8 @@ pub rec TypeSecret {
 
 ```mach
 pub rec TypeArray {
-    length:  ast_id.ExprId;
-    element: ast_id.TypeId;
+    length:  mach.front.ast.id.ExprId;
+    element: mach.front.ast.id.TypeId;
 }
 ```
 
@@ -100,7 +100,7 @@ pub rec TypeArray {
 pub rec TypeFun {
     params_start: u32;
     params_len:   u32;
-    ret_type:     ast_id.TypeId;
+    ret_type:     mach.front.ast.id.TypeId;
     c_variadic:   bool;
 }
 ```
@@ -127,7 +127,7 @@ pub rec TypeUni {
 
 ```mach
 pub rec TypeFieldType {
-    var_name: base_source.Span;
+    var_name: mach.base.source.Span;
 }
 ```
 
@@ -135,7 +135,7 @@ pub rec TypeFieldType {
 
 ```mach
 pub rec TypePointeeOf {
-    inner: ast_id.TypeId;
+    inner: mach.front.ast.id.TypeId;
 }
 ```
 
@@ -143,7 +143,7 @@ pub rec TypePointeeOf {
 
 ```mach
 pub rec TypeDiscriminantOf {
-    inner: ast_id.TypeId;
+    inner: mach.front.ast.id.TypeId;
 }
 ```
 
@@ -151,7 +151,7 @@ pub rec TypeDiscriminantOf {
 
 ```mach
 pub rec Type {
-    span: base_source.Span;
+    span: mach.base.source.Span;
     kind: TypeKind;
     data: uni {
         named: TypeNamed;

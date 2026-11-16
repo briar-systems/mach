@@ -8,9 +8,9 @@ one rule holds for every key whoever reads the manifest, so a dependency's manif
 held to exactly the rules of the project being built. a refusal points at the key or
 value it concerns.
 
-<sub>source: [`src/manifest/load.mach`](../../../src/manifest/load.mach) · imported by 22 modules</sub>
+Source: [`src/manifest/load.mach`](../../../src/manifest/load.mach)
 
-<sub>`base_source` is [`mach.base.source`](../base/source.md) · `toml_value` is `toml.value` · `A` is `std.allocator` · `intern` is [`mach.base.intern`](../base/intern.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -44,8 +44,8 @@ value it concerns.
 pub rec Doc {
     path:  str;
     text:  str;
-    file:  base_source.FileId;
-    table: toml_value.Table;
+    file:  mach.base.source.FileId;
+    table: toml.value.Table;
 }
 ```
 
@@ -56,7 +56,7 @@ released with `doc_dnit`. a failure that names a key points into `file`
 ### parse
 
 ```mach
-pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, doc: *Doc) res[Manifest, fail.Fail]
+pub fun parse(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, doc: *Doc) res[Manifest, mach.base.fail.Fail]
 ```
 
 build a `Manifest` from a parsed TOML document, in three stages. the schema
@@ -80,7 +80,7 @@ built. on any error every array allocated so far is freed
 ### doc_parse
 
 ```mach
-pub fun doc_parse(alloc: *A.Allocator, sources: *base_source.SourceMap, path: str, text: str) res[Doc, fail.Fail]
+pub fun doc_parse(alloc: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, path: str, text: str) res[Doc, mach.base.fail.Fail]
 ```
 
 `text`, the manifest at `path`, as a doc whose text is loaded into `sources`:
@@ -90,7 +90,7 @@ at the byte refused. the doc keeps its own copies of both
 ### doc_parse_bytes
 
 ```mach
-pub fun doc_parse_bytes(alloc: *A.Allocator, sources: *base_source.SourceMap, path: str, data: *u8, n: usize) res[Doc, fail.Fail]
+pub fun doc_parse_bytes(alloc: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, path: str, data: *u8, n: usize) res[Doc, mach.base.fail.Fail]
 ```
 
 `doc_parse` over the `n` bytes at `data`, which need not end in a NUL and may
@@ -99,7 +99,7 @@ hold one, which is refused where it is written
 ### doc_read
 
 ```mach
-pub fun doc_read(alloc: *A.Allocator, sources: *base_source.SourceMap, path: str) res[Doc, fail.Fail]
+pub fun doc_read(alloc: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, path: str) res[Doc, mach.base.fail.Fail]
 ```
 
 the manifest file at `path` read and parsed as `doc_parse` parses it; a file
@@ -108,7 +108,7 @@ that cannot be read is refused as a path the project names
 ### doc_dnit
 
 ```mach
-pub fun doc_dnit(alloc: *A.Allocator, d: *Doc)
+pub fun doc_dnit(alloc: *std.allocator.Allocator, d: *Doc)
 ```
 
 release a doc and everything it owns
@@ -118,7 +118,7 @@ release a doc and everything it owns
 ### project_parse
 
 ```mach
-pub fun project_parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail]
+pub fun project_parse(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, t: *toml.value.Table, m: *Manifest) err[mach.base.fail.Fail]
 ```
 
 the `[project]` table of a parsed TOML document alone, held to its rows as
@@ -135,7 +135,7 @@ the `[project]` table of a parsed TOML document alone, held to its rows as
 ### source_load
 
 ```mach
-pub fun source_load(alloc: *A.Allocator, sources: *base_source.SourceMap, path: str, data: *u8, n: usize) res[base_source.FileId, fail.Fail]
+pub fun source_load(alloc: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, path: str, data: *u8, n: usize) res[mach.base.source.FileId, mach.base.fail.Fail]
 ```
 
 the `n` bytes at `data`, the file at `path`, loaded into `sources` so a refusal can point
@@ -144,7 +144,7 @@ into them; a NUL ends the text the map holds, and a refusal at it points at its 
 ### parse_text
 
 ```mach
-pub fun parse_text(alloc: *A.Allocator, itn: *intern.Interner, sources: *base_source.SourceMap, path: str, text: str) res[Manifest, fail.Fail]
+pub fun parse_text(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, sources: *mach.base.source.SourceMap, path: str, text: str) res[Manifest, mach.base.fail.Fail]
 ```
 
 the manifest `text`, read from `path`, parsed and checked
@@ -159,7 +159,7 @@ the manifest `text`, read from `path`, parsed and checked
 ### read_at
 
 ```mach
-pub fun read_at(alloc: *A.Allocator, itn: *intern.Interner, sources: *base_source.SourceMap, dir: str) res[Manifest, fail.Fail]
+pub fun read_at(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, sources: *mach.base.source.SourceMap, dir: str) res[Manifest, mach.base.fail.Fail]
 ```
 
 the manifest of the project rooted at `dir`, read off disk and parsed
@@ -175,7 +175,7 @@ the manifest of the project rooted at `dir`, read off disk and parsed
 ### check
 
 ```mach
-pub fun check(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[fail.Fail]
+pub fun check(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest) err[mach.base.fail.Fail]
 ```
 
 the checks every manifest model passes, whether decoded from mach.toml or made by an entry

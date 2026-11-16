@@ -7,7 +7,7 @@ build, on which compile/backend/compile has mirl compile each unit to mink's obj
 mink laying an object out in the target's format or reading one back, and mink linking objects
 into an image. nothing here starts a process or writes a file between the stages
 
-<sub>[`mach.compile.backend`](../backend.md) · 1 module · imports [`base`](../../base/README.md), [`lower`](../../lower/README.md), [`target`](../../target/README.md), [`type`](../../type/README.md) · imported by [`build`](../../build/README.md)</sub>
+The directory's root module is [`mach.compile.backend`](../backend.md).
 
 | Module | |
 | :--- | :--- |

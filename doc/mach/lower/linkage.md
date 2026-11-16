@@ -8,9 +8,9 @@ each declaration's export name and library, the name each declaration links
 under once the lowering has named it, and the library each imported symbol is
 pinned to
 
-<sub>source: [`src/lower/linkage.mach`](../../../src/lower/linkage.mach) · imported by 7 modules</sub>
+Source: [`src/lower/linkage.mach`](../../../src/lower/linkage.mach)
 
-<sub>`intern` is [`mach.base.intern`](../base/intern.md) · `map` is `std.collections.map` · `A` is `std.allocator` · `module` is [`mach.session.module`](../session/module.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.session.module`](../session/module.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -26,7 +26,7 @@ pinned to
 
 | On `Linkage` | |
 | :--- | :--- |
-| [`init`](#init) · [`dnit`](#dnit) | |
+| [`init`](#init), [`dnit`](#dnit) | |
 | [`clear`](#clear) | forget every declaration and import, as a project does when its module registry is reset |
 | [`register_export_name`](#register_export_name) | |
 | [`forget_names`](#forget_names) | drop every export name and linkage name of one module's declarations, before its syntax tree is replaced and its declaration ids no longer name the same declarations |
@@ -58,8 +58,8 @@ what the build knows an imported symbol to be
 
 ```mach
 pub rec Import {
-    name: intern.StrId;
-    lib:  intern.StrId;
+    name: mach.base.intern.StrId;
+    lib:  mach.base.intern.StrId;
     sort: Sort;
 }
 ```
@@ -68,19 +68,19 @@ an imported symbol pinned to a library
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `name` | `intern.StrId` | its link name |
-| `lib` | `intern.StrId` | the library's key |
+| `name` | `mach.base.intern.StrId` | its link name |
+| `lib` | `mach.base.intern.StrId` | the library's key |
 | `sort` | `Sort` | what the build knows it to be |
 
 ## Linkage
 
 ```mach
 pub rec Linkage {
-    export_names:     map.Map[u64, intern.StrId];
-    names:            map.Map[u64, intern.StrId];
-    export_libraries: map.Map[u64, intern.StrId];
+    export_names:     std.collections.map.Map[u64, mach.base.intern.StrId];
+    names:            std.collections.map.Map[u64, mach.base.intern.StrId];
+    export_libraries: std.collections.map.Map[u64, mach.base.intern.StrId];
     imports:          Vector[Import];
-    import_at:        map.Map[intern.StrId, usize];
+    import_at:        std.collections.map.Map[mach.base.intern.StrId, usize];
 }
 ```
 
@@ -92,7 +92,7 @@ there by link name
 ### init
 
 ```mach
-pub fun init(alloc: *A.Allocator) Linkage
+pub fun init(alloc: *std.allocator.Allocator) Linkage
 ```
 
 ### dnit
@@ -113,13 +113,13 @@ module registry is reset
 ### register_export_name
 
 ```mach
-pub fun register_export_name(l: *Linkage, mid: module.ModuleId, did: u32, name: intern.StrId) err[fail.Fail]
+pub fun register_export_name(l: *Linkage, mid: mach.session.module.ModuleId, did: u32, name: mach.base.intern.StrId) err[mach.base.fail.Fail]
 ```
 
 ### forget_names
 
 ```mach
-pub fun forget_names(l: *Linkage, mid: module.ModuleId, decl_count: u32)
+pub fun forget_names(l: *Linkage, mid: mach.session.module.ModuleId, decl_count: u32)
 ```
 
 drop every export name and linkage name of one module's declarations, before
@@ -134,7 +134,7 @@ declarations
 ### export_name
 
 ```mach
-pub fun export_name(l: *Linkage, mid: module.ModuleId, did: u32) intern.StrId
+pub fun export_name(l: *Linkage, mid: mach.session.module.ModuleId, did: u32) mach.base.intern.StrId
 ```
 
 the name declaration `did` of `mid` is exported under, nil when it names none
@@ -142,7 +142,7 @@ the name declaration `did` of `mid` is exported under, nil when it names none
 ### register_name
 
 ```mach
-pub fun register_name(l: *Linkage, mid: module.ModuleId, did: u32, name: intern.StrId) err[fail.Fail]
+pub fun register_name(l: *Linkage, mid: mach.session.module.ModuleId, did: u32, name: mach.base.intern.StrId) err[mach.base.fail.Fail]
 ```
 
 record the name declaration `did` of `mid` links under, as the lowering
@@ -151,7 +151,7 @@ first names it
 ### name
 
 ```mach
-pub fun name(l: *Linkage, mid: module.ModuleId, did: u32) intern.StrId
+pub fun name(l: *Linkage, mid: mach.session.module.ModuleId, did: u32) mach.base.intern.StrId
 ```
 
 the name declaration `did` of `mid` links under, nil before the lowering has named it
@@ -159,13 +159,13 @@ the name declaration `did` of `mid` links under, nil before the lowering has nam
 ### register_export_library
 
 ```mach
-pub fun register_export_library(l: *Linkage, mid: module.ModuleId, did: u32, lib: intern.StrId) err[fail.Fail]
+pub fun register_export_library(l: *Linkage, mid: mach.session.module.ModuleId, did: u32, lib: mach.base.intern.StrId) err[mach.base.fail.Fail]
 ```
 
 ### export_library
 
 ```mach
-pub fun export_library(l: *Linkage, mid: module.ModuleId, did: u32) intern.StrId
+pub fun export_library(l: *Linkage, mid: mach.session.module.ModuleId, did: u32) mach.base.intern.StrId
 ```
 
 the library declaration `did` of `mid` is imported from, nil when it names none
@@ -173,7 +173,7 @@ the library declaration `did` of `mid` is imported from, nil when it names none
 ### register_import_library
 
 ```mach
-pub fun register_import_library(l: *Linkage, name: intern.StrId, lib: intern.StrId, sort: Sort) err[fail.Fail]
+pub fun register_import_library(l: *Linkage, name: mach.base.intern.StrId, lib: mach.base.intern.StrId, sort: Sort) err[mach.base.fail.Fail]
 ```
 
 pin the imported symbol `name`, known as `sort`, to the library `lib`. a symbol pinned
@@ -182,7 +182,7 @@ again takes the later pin, a sort the earlier one left unstated included
 ### import_library
 
 ```mach
-pub fun import_library(l: *Linkage, name: intern.StrId) intern.StrId
+pub fun import_library(l: *Linkage, name: mach.base.intern.StrId) mach.base.intern.StrId
 ```
 
 the library the imported symbol `name` is pinned to, nil when it is pinned to none

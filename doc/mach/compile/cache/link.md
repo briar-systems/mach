@@ -14,9 +14,9 @@ its path (length then bytes), its 32-byte link key, its 32-byte digest, a byte t
 the link read a file a search found, the count of the files it read and each file's path
 (length then bytes), every number a little-endian u32
 
-<sub>source: [`src/compile/cache/link.mach`](../../../../src/compile/cache/link.mach) · imported by 1 module</sub>
+Source: [`src/compile/cache/link.mach`](../../../../src/compile/cache/link.mach)
 
-<sub>`A` is `std.allocator` · `Record` is private · `map` is `std.collections.map` · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -25,7 +25,7 @@ the link read a file a search found, the count of the files it read and each fil
 
 | On `Store` | |
 | :--- | :--- |
-| [`init`](#init) · [`dnit`](#dnit) | |
+| [`init`](#init), [`dnit`](#dnit) | |
 | [`written`](#written-1) | what the record of `path` says wrote it, its files the store's, none when no link is recorded there |
 | [`put`](#put) | the record of `path` set to `w`, a copy of its files the store's; a path whose hash another path holds is not recorded, so its link always runs |
 | [`decode`](#decode) | the store `bytes` hold: every record, or none at all when the bytes are not a complete store |
@@ -53,16 +53,16 @@ and a caller's lends
 
 ```mach
 pub rec Store {
-    alloc:   *A.Allocator;
+    alloc:   *std.allocator.Allocator;
     records: Vector[Record];
-    index:   map.Map[u64, u32];
+    index:   std.collections.map.Map[u64, u32];
 }
 ```
 
 ### init
 
 ```mach
-pub fun init(a: *A.Allocator) Store
+pub fun init(a: *std.allocator.Allocator) Store
 ```
 
 ### dnit
@@ -83,7 +83,7 @@ there
 ### put
 
 ```mach
-pub fun put(st: *Store, path: str, w: *Written) err[A.Error]
+pub fun put(st: *Store, path: str, w: *Written) err[std.allocator.Error]
 ```
 
 the record of `path` set to `w`, a copy of its files the store's; a path whose hash another path
@@ -92,7 +92,7 @@ holds is not recorded, so its link always runs
 ### decode
 
 ```mach
-pub fun decode(a: *A.Allocator, bytes: *u8, len: usize) res[Store, A.Error]
+pub fun decode(a: *std.allocator.Allocator, bytes: *u8, len: usize) res[Store, std.allocator.Error]
 ```
 
 the store `bytes` hold: every record, or none at all when the bytes are not a complete store.
@@ -101,7 +101,7 @@ err only when allocation fails
 ### load
 
 ```mach
-pub fun load(a: *A.Allocator, file: str) res[Store, A.Error]
+pub fun load(a: *std.allocator.Allocator, file: str) res[Store, std.allocator.Error]
 ```
 
 the store at `file`, empty when there is none or it cannot be read
@@ -109,7 +109,7 @@ the store at `file`, empty when there is none or it cannot be read
 ### store
 
 ```mach
-pub fun store(st: *Store, out_dir: str, file: str) err[fail.Fail]
+pub fun store(st: *Store, out_dir: str, file: str) err[mach.base.fail.Fail]
 ```
 
 write the store to `file` through a sibling temporary

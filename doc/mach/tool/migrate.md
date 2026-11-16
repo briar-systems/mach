@@ -24,9 +24,9 @@ the rules are rows themselves, each tagged with the major it migrates from. a
 release carries the rows of the major before it: 8.0.0 deletes every row tagged
 6 and adds its own
 
-<sub>source: [`src/tool/migrate.mach`](../../../src/tool/migrate.mach) · imported by 1 module</sub>
+Source: [`src/tool/migrate.mach`](../../../src/tool/migrate.mach)
 
-<sub>`A` is `std.allocator` · `base_source` is [`mach.base.source`](../base/source.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `toml_value` is `toml.value`</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -71,7 +71,7 @@ a dependency of the root project, as `mach migrate` reads it
 ### dependencies
 
 ```mach
-pub fun dependencies(a: *A.Allocator, sources: *base_source.SourceMap, root: str, text: str, out: *Vector[Dependency]) err[fail.Fail]
+pub fun dependencies(a: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, root: str, text: str, out: *Vector[Dependency]) err[mach.base.fail.Fail]
 ```
 
 each dependency of the manifest `text`, whose project is at `root`, as dep/ holds it
@@ -87,7 +87,7 @@ each dependency of the manifest `text`, whose project is at `root`, as dep/ hold
 ### source
 
 ```mach
-pub fun source(a: *A.Allocator, text: str, deps: *Vector[Dependency]) res[str, fail.Fail]
+pub fun source(a: *std.allocator.Allocator, text: str, deps: *Vector[Dependency]) res[str, mach.base.fail.Fail]
 ```
 
 a source's text in this major's spelling: each comptime path whose leading
@@ -107,7 +107,7 @@ are read, so a comment or a string that spells one is left as written
 ### manifest
 
 ```mach
-pub fun manifest(a: *A.Allocator, text: str) res[str, fail.Fail]
+pub fun manifest(a: *std.allocator.Allocator, text: str) res[str, mach.base.fail.Fail]
 ```
 
 a manifest's text in this major's spelling: each key the schema retires with
@@ -141,7 +141,7 @@ not: after a quote, a space or a path's `/`, and before a quote, a space or an `
 ### runs_mach
 
 ```mach
-pub fun runs_mach(text: str, args: *toml_value.Array) bool
+pub fun runs_mach(text: str, args: *toml.value.Array) bool
 ```
 
 whether a step's `argv`, its literals in `text`, runs mach

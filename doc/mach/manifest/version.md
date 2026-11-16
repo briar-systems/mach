@@ -8,9 +8,7 @@ a range is an intersection of clauses that each name their operator, so it denot
 interval plus the releases whose pre-releases it names. a parsed value borrows its
 pre-release text from the string it was parsed from.
 
-<sub>source: [`src/manifest/version.mach`](../../../src/manifest/version.mach) · imported by 10 modules</sub>
-
-<sub>`Bound` is private</sub>
+Source: [`src/manifest/version.mach`](../../../src/manifest/version.mach)
 
 | Type | | |
 | :--- | :--- | :--- |

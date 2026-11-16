@@ -8,9 +8,9 @@ a cell resolves in a scope: the root's own, or a dependency's, whose artifact, t
 and links are the dependency's and whose profile and work directory are the root's. the
 steps a cell runs first and the artifacts it requires are ordered here too.
 
-<sub>source: [`src/manifest/plan.mach`](../../../src/manifest/plan.mach) · imported by 5 modules</sub>
+Source: [`src/manifest/plan.mach`](../../../src/manifest/plan.mach)
 
-<sub>`intern` is [`mach.base.intern`](../base/intern.md) · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md) · `template` is [`mach.manifest.template`](template.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.manifest.template`](template.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -23,7 +23,7 @@ steps a cell runs first and the artifacts it requires are ordered here too.
 
 | On `Scope` | |
 | :--- | :--- |
-| [`root_scope`](#root_scope) · [`dependency_scope`](#dependency_scope) · [`scope_is_dependency`](#scope_is_dependency) | |
+| [`root_scope`](#root_scope), [`dependency_scope`](#dependency_scope), [`scope_is_dependency`](#scope_is_dependency) | |
 | [`resolve_artifact_reqs`](#resolve_artifact_reqs) | list the artifacts a consumer requires, each with its output path when that path is unique, for `{artifact.<id>.out}` expansion |
 | [`resolve_export_reqs`](#resolve_export_reqs) | list the artifacts a dependency's export library requires, the scope `{artifact.<id>.out}` resolves in for that dependency's modules |
 | [`resolve_scoped_build_unit`](#resolve_scoped_build_unit) | `resolve_build_unit` for a cell of `s`: target, artifact and links resolve in `s.owner`, the profile and `[project].work` in `s.root`, and `{project.work}` in the artifact output names the scope's artifact root |
@@ -45,11 +45,11 @@ steps a cell runs first and the artifacts it requires are ordered here too.
 pub rec BuildUnit {
     target:       *TargetDef;
     artifact:     *ArtifactDef;
-    target_name:  intern.StrId;
-    profile_name: intern.StrId;
-    entry:        intern.StrId;
-    bin_path:     intern.StrId;
-    out_root:     intern.StrId;
+    target_name:  mach.base.intern.StrId;
+    profile_name: mach.base.intern.StrId;
+    entry:        mach.base.intern.StrId;
+    bin_path:     mach.base.intern.StrId;
+    out_root:     mach.base.intern.StrId;
     optimize:     bool;
     debug:        bool;
     simd:         SimdMode;
@@ -65,11 +65,11 @@ expanded. produced by `resolve_build_unit`; `libs` is owned by the unit
 | :--- | :--- | :--- |
 | `target` | `*TargetDef` | the resolved target; points into the manifest, except for the host target synthesized when the manifest declares no targets |
 | `artifact` | `*ArtifactDef` | the resolved artifact, pointing into the manifest |
-| `target_name` | `intern.StrId` | `target.name` |
-| `profile_name` | `intern.StrId` | the resolved profile's name |
-| `entry` | `intern.StrId` | the artifact's `entry` |
-| `bin_path` | `intern.StrId` | the artifact's output: the expanded `[project].work` joined with the expanded artifact `out` |
-| `out_root` | `intern.StrId` | `<expanded project work>`, whose layout beneath it the build owns (mach.host.output.layout) |
+| `target_name` | `mach.base.intern.StrId` | `target.name` |
+| `profile_name` | `mach.base.intern.StrId` | the resolved profile's name |
+| `entry` | `mach.base.intern.StrId` | the artifact's `entry` |
+| `bin_path` | `mach.base.intern.StrId` | the artifact's output: the expanded `[project].work` joined with the expanded artifact `out` |
+| `out_root` | `mach.base.intern.StrId` | `<expanded project work>`, whose layout beneath it the build owns (mach.host.output.layout) |
 | `optimize` | `bool` | from the resolved profile |
 | `debug` | `bool` | from the resolved profile |
 | `simd` | `SimdMode` | from the resolved profile |
@@ -79,7 +79,7 @@ expanded. produced by `resolve_build_unit`; `libs` is owned by the unit
 ### resolve_build_unit
 
 ```mach
-pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, c: *Cell) res[BuildUnit, fail.Fail]
+pub fun resolve_build_unit(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest, c: *Cell) res[BuildUnit, mach.base.fail.Fail]
 ```
 
 resolve one cell into a `BuildUnit`. the cell names its artifact; with no
@@ -139,10 +139,10 @@ pub fun scope_is_dependency(s: *Scope) bool
 ### resolve_artifact_reqs
 
 ```mach
-pub fun resolve_artifact_reqs(alloc: *A.Allocator, itn: *intern.Interner, s: *Scope,
-    consumer: *ArtifactDef, consumer_target: intern.StrId, profile: str,
+pub fun resolve_artifact_reqs(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, s: *Scope,
+    consumer: *ArtifactDef, consumer_target: mach.base.intern.StrId, profile: str,
     whole_project: bool,
-    out_items: **template.Requirement, out_count: *u32) err[fail.Fail]
+    out_items: **mach.manifest.template.Requirement, out_count: *u32) err[mach.base.fail.Fail]
 ```
 
 list the artifacts a consumer requires, each with its output path when that
@@ -164,7 +164,7 @@ path is unique, for `{artifact.<id>.out}` expansion
 ### resolve_export_reqs
 
 ```mach
-pub fun resolve_export_reqs(alloc: *A.Allocator, itn: *intern.Interner, s: *Scope, profile: str, out_items: **template.Requirement, out_count: *u32) err[fail.Fail]
+pub fun resolve_export_reqs(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, s: *Scope, profile: str, out_items: **mach.manifest.template.Requirement, out_count: *u32) err[mach.base.fail.Fail]
 ```
 
 list the artifacts a dependency's export library requires, the scope
@@ -184,7 +184,7 @@ builds for every target it names in the dependency's manifest
 ### resolve_scoped_build_unit
 
 ```mach
-pub fun resolve_scoped_build_unit(alloc: *A.Allocator, itn: *intern.Interner, s: *Scope, c: *Cell) res[BuildUnit, fail.Fail]
+pub fun resolve_scoped_build_unit(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, s: *Scope, c: *Cell) res[BuildUnit, mach.base.fail.Fail]
 ```
 
 `resolve_build_unit` for a cell of `s`: target, artifact and links resolve in
@@ -204,8 +204,8 @@ the artifact output names the scope's artifact root
 ### local_path_demanded
 
 ```mach
-pub fun local_path_demanded(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, t: *TargetDef,
-    expanded_path: str, proj_out: str, v: *template.Values) res[bool, fail.Fail]
+pub fun local_path_demanded(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest, t: *TargetDef,
+    expanded_path: str, proj_out: str, v: *mach.manifest.template.Values) res[bool, mach.base.fail.Fail]
 ```
 
 whether the build makes a path for target `t`: some build step's output, or the output of
@@ -214,8 +214,8 @@ an artifact built for `t`, as a shared library an executable of the project link
 ### required_artifact_uses_target
 
 ```mach
-pub fun required_artifact_uses_target(itn: *intern.Interner, req: *ArtifactDef,
-    consumer_target: intern.StrId, t: *TargetDef) bool
+pub fun required_artifact_uses_target(itn: *mach.base.intern.Interner, req: *ArtifactDef,
+    consumer_target: mach.base.intern.StrId, t: *TargetDef) bool
 ```
 
 whether a required artifact is built for a target when its consumer builds for
@@ -233,7 +233,7 @@ target `req` supports
 ### export_requires
 
 ```mach
-pub fun export_requires(itn: *intern.Interner, m: *Manifest, ra: *ArtifactDef) bool
+pub fun export_requires(itn: *mach.base.intern.Interner, m: *Manifest, ra: *ArtifactDef) bool
 ```
 
 whether the export library selects `ra` in its `need`: the requirements a
@@ -249,10 +249,10 @@ dependency's export library carries to every consumer
 ### plan_steps
 
 ```mach
-pub fun plan_steps(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
-    art_names: *intern.StrId, art_count: u32, t: *TargetDef,
-    proj_out: str, v: *template.Values,
-    out_order: **u32, out_count: *u32) err[fail.Fail]
+pub fun plan_steps(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest,
+    art_names: *mach.base.intern.StrId, art_count: u32, t: *TargetDef,
+    proj_out: str, v: *mach.manifest.template.Values,
+    out_order: **u32, out_count: *u32) err[mach.base.fail.Fail]
 ```
 
 order the build steps the named artifacts demand: a step producing a local
@@ -276,9 +276,9 @@ step names), and transitively each step's own `need`, dependencies first
 ### plan_export_steps
 
 ```mach
-pub fun plan_export_steps(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
-    t: *TargetDef, proj_out: str, v: *template.Values,
-    out_order: **u32, out_count: *u32) err[fail.Fail]
+pub fun plan_export_steps(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest,
+    t: *TargetDef, proj_out: str, v: *mach.manifest.template.Values,
+    out_order: **u32, out_count: *u32) err[mach.base.fail.Fail]
 ```
 
 order the build steps that produce an exported local link path matching the
@@ -300,8 +300,8 @@ transitive step `need`s; the steps a consumer of this manifest must run
 ### check_collisions
 
 ```mach
-pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
-    v: *template.Values) err[fail.Fail]
+pub fun check_collisions(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest,
+    v: *mach.manifest.template.Values) err[mach.base.fail.Fail]
 ```
 
 reject two artifacts whose `out` expands to the same path under one set of
@@ -313,5 +313,5 @@ template values
 | `itn` | resolves names |
 | `m` | the manifest; fewer than two artifacts always pass |
 | `v` | the template values |
-| **returns** | ok; err "mach.toml: artifacts 'a' and 'b' collide on output path '&lt;p>'", or an expansion error |
+| **returns** | ok; err "mach.toml: artifacts 'a' and 'b' collide on output path '\<p>'", or an expansion error |
 

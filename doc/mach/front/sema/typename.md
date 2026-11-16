@@ -4,9 +4,9 @@
 
 a semantic type spelled as a program writes it, for diagnostics and debug names
 
-<sub>source: [`src/front/sema/typename.mach`](../../../../src/front/sema/typename.mach) · imported by 6 modules</sub>
+Source: [`src/front/sema/typename.mach`](../../../../src/front/sema/typename.mach)
 
-<sub>`session` is [`mach.session`](../../session.md) · `type_kind` is [`mach.type.kind`](../../type/kind.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `intern` is [`mach.base.intern`](../../base/intern.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.session`](../../session.md), [`mach.type.kind`](../../type/kind.md).
 
 | Functions | |
 | :--- | :--- |
@@ -21,13 +21,13 @@ a semantic type spelled as a program writes it, for diagnostics and debug names
 ### type_to_str
 
 ```mach
-pub fun type_to_str(s: *session.Session, t: type_kind.TypeId) res[str, fail.Fail]
+pub fun type_to_str(s: *mach.session.Session, t: mach.type.kind.TypeId) res[str, mach.base.fail.Fail]
 ```
 
 ### type_str_free
 
 ```mach
-pub fun type_str_free(s: *session.Session, owned: str)
+pub fun type_str_free(s: *mach.session.Session, owned: str)
 ```
 
 release a spelled type; a nil spelling owns nothing
@@ -35,7 +35,7 @@ release a spelled type; a nil spelling owns nothing
 ### name_str
 
 ```mach
-pub fun name_str(s: *session.Session, name: intern.StrId) str
+pub fun name_str(s: *mach.session.Session, name: mach.base.intern.StrId) str
 ```
 
 the spelling of a type's name; an anonymous type, whose name is absent or

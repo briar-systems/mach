@@ -7,9 +7,9 @@ objects, IR, assembly, tests, compiler state, step staging and dependency
 artifacts go. the manifest names the work directory; everything under it is
 placed here, and `trees` is what a build of a cell writes there
 
-<sub>source: [`src/host/output/layout.mach`](../../../../src/host/output/layout.mach) · imported by 5 modules</sub>
+Source: [`src/host/output/layout.mach`](../../../../src/host/output/layout.mach)
 
-<sub>`A` is `std.allocator` · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md).
 
 | Functions | |
 | :--- | :--- |
@@ -36,7 +36,7 @@ placed here, and `trees` is what a build of a cell writes there
 ### under
 
 ```mach
-pub fun under(a: *A.Allocator, work: str, tree: str) res[str, fail.Fail]
+pub fun under(a: *std.allocator.Allocator, work: str, tree: str) res[str, mach.base.fail.Fail]
 ```
 
 `tree` beneath the work directory `work`
@@ -49,7 +49,7 @@ pub fun under(a: *A.Allocator, work: str, tree: str) res[str, fail.Fail]
 ### within
 
 ```mach
-pub fun within(a: *A.Allocator, work: str, tree: str, name: str) res[str, fail.Fail]
+pub fun within(a: *std.allocator.Allocator, work: str, tree: str, name: str) res[str, mach.base.fail.Fail]
 ```
 
 `name` within `tree` beneath `work`: a project's objects, a tested artifact's

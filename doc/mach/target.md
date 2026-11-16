@@ -9,9 +9,9 @@ holds
 a target is resolved through mink's catalog and masc's check (mach.target.resolved),
 and every fact read here is read from that resolution's rows
 
-<sub>source: [`src/target.mach`](../../src/target.mach) · imported by 13 modules</sub>
+Source: [`src/target.mach`](../../src/target.mach)
 
-<sub>`A` is `std.allocator` · `resolved` is [`mach.target.resolved`](target/resolved.md) · `fail` is [`mach.base.fail`](base/fail.md) · `diagnostic_kind` is [`mach.base.diagnostic.kind`](base/diagnostic/kind.md) · `mink_output` is `mink.catalog.output`</sub>
+Uses types from [`mach.base.diagnostic.kind`](base/diagnostic/kind.md), [`mach.base.fail`](base/fail.md), [`mach.target.resolved`](target/resolved.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -38,6 +38,7 @@ and every fact read here is read from that resolution's rows
 | [`finished_modules`](#finished_modules) | whether the target's object format holds each module as its own artifact, as a SPIR-V module: mink builds a module of the format and no executable of it |
 | [`flat_image`](#flat_image) | whether the target's object format is a flat image, mink's flat format |
 | [`states_subsystem`](#states_subsystem) | whether the target's images state a subsystem, as mink's host of it names a default one, so an artifact's `subsystem`, icon and manifest mean something |
+| [`admits_subsystem`](#admits_subsystem) | whether the target's images may state the subsystem `s`, as mink's host of it admits |
 | [`carries_record`](#carries_record) | whether a module's object is read again by a link or the cache, so it carries mach's record section: every object but a flat image's and a finished module's |
 
 ---
@@ -62,7 +63,7 @@ prefix, then the artifact's name, then the extension
 ### artifact_naming
 
 ```mach
-pub fun artifact_naming(a: *A.Allocator, t: *resolved.Target, k: Spelled) res[ArtifactName, fail.Fail]
+pub fun artifact_naming(a: *std.allocator.Allocator, t: *mach.target.resolved.Target, k: Spelled) res[ArtifactName, mach.base.fail.Fail]
 ```
 
 the name an artifact of kind `k` takes on the target, mink's system's name of the file of
@@ -98,7 +99,7 @@ the calling convention the compiler itself was built for, as its manifest names 
 ### host
 
 ```mach
-pub fun host(a: *A.Allocator) res[resolved.Target, fail.Fail]
+pub fun host(a: *std.allocator.Allocator) res[mach.target.resolved.Target, mach.base.fail.Fail]
 ```
 
 the target a `native` selection resolves: the host's architecture, system and convention
@@ -107,7 +108,7 @@ as the compiler's own manifest names them, every other part mink's default
 ### linkage_of
 
 ```mach
-pub fun linkage_of(a: *A.Allocator, t: *resolved.Target, kind: diagnostic_kind.Kind) res[*mink_output.Kind, fail.Fail]
+pub fun linkage_of(a: *std.allocator.Allocator, t: *mach.target.resolved.Target, kind: mach.base.diagnostic.kind.Kind) res[*mink.catalog.output.Kind, mach.base.fail.Fail]
 ```
 
 the linkage of an executable built for `t`, one of mink's executable output kinds: the one
@@ -151,7 +152,7 @@ the name `--kind` and a manifest's `kind` spell `k` by
 ### is_row
 
 ```mach
-pub fun is_row(k: Spelled, row: *mink_output.Kind) bool
+pub fun is_row(k: Spelled, row: *mink.catalog.output.Kind) bool
 ```
 
 whether `k` is the one output kind `row`
@@ -159,7 +160,7 @@ whether `k` is the one output kind `row`
 ### output_of
 
 ```mach
-pub fun output_of(k: Spelled, linkage: *mink_output.Kind) *mink_output.Kind
+pub fun output_of(k: Spelled, linkage: *mink.catalog.output.Kind) *mink.catalog.output.Kind
 ```
 
 the output kind mink makes of `k`: an executable's from its linkage, every other its own row
@@ -167,7 +168,7 @@ the output kind mink makes of `k`: an executable's from its linkage, every other
 ### executable_output
 
 ```mach
-pub fun executable_output(a: *A.Allocator, t: *resolved.Target) res[*mink_output.Kind, fail.Fail]
+pub fun executable_output(a: *std.allocator.Allocator, t: *mach.target.resolved.Target) res[*mink.catalog.output.Kind, mach.base.fail.Fail]
 ```
 
 the output kind of the executable a build for `t` links, refused where the host runs no
@@ -176,7 +177,7 @@ executable
 ### finished_modules
 
 ```mach
-pub fun finished_modules(t: *resolved.Target) bool
+pub fun finished_modules(t: *mach.target.resolved.Target) bool
 ```
 
 whether the target's object format holds each module as its own artifact, as a
@@ -185,7 +186,7 @@ SPIR-V module: mink builds a module of the format and no executable of it
 ### flat_image
 
 ```mach
-pub fun flat_image(t: *resolved.Target) bool
+pub fun flat_image(t: *mach.target.resolved.Target) bool
 ```
 
 whether the target's object format is a flat image, mink's flat format
@@ -193,16 +194,24 @@ whether the target's object format is a flat image, mink's flat format
 ### states_subsystem
 
 ```mach
-pub fun states_subsystem(t: *resolved.Target) bool
+pub fun states_subsystem(t: *mach.target.resolved.Target) bool
 ```
 
 whether the target's images state a subsystem, as mink's host of it names a
 default one, so an artifact's `subsystem`, icon and manifest mean something
 
+### admits_subsystem
+
+```mach
+pub fun admits_subsystem(t: *mach.target.resolved.Target, s: *mink.catalog.subsystem.Subsystem) bool
+```
+
+whether the target's images may state the subsystem `s`, as mink's host of it admits
+
 ### carries_record
 
 ```mach
-pub fun carries_record(t: *resolved.Target) bool
+pub fun carries_record(t: *mach.target.resolved.Target) bool
 ```
 
 whether a module's object is read again by a link or the cache, so it carries

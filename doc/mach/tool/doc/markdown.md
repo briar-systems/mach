@@ -9,12 +9,13 @@ a page's path is relative to the directory the reference is written in, and ever
 link on it is relative to the page. anchors follow GitHub's rule for headings, a
 repeated heading on one page taking `-1`, `-2` and so on, and every page's anchors
 are planned before any page is written, so a link to another page's entry names
-the heading that page will carry. prose is escaped so `<` and `&` outside code
-spans read as written
+the heading that page will carry. pages are plain markdown and ASCII: no HTML, no
+site-only syntax, and prose keeps `<`, `&` and `\` readable by a backslash, never an
+entity
 
-<sub>source: [`src/tool/doc/markdown.mach`](../../../../src/tool/doc/markdown.mach) · imported by 1 module</sub>
+Source: [`src/tool/doc/markdown.mach`](../../../../src/tool/doc/markdown.mach)
 
-<sub>`A` is `std.allocator` · `model` is [`mach.tool.doc.model`](model.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.tool.doc.model`](model.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -40,7 +41,7 @@ one page: its path below the reference's directory and its text
 ### render
 
 ```mach
-pub fun render(a: *A.Allocator, m: *model.Project, root: str, out: *Vector[Page]) err[fail.Fail]
+pub fun render(a: *std.allocator.Allocator, m: *mach.tool.doc.model.Project, root: str, out: *Vector[Page]) err[mach.base.fail.Fail]
 ```
 
 every page of `m`

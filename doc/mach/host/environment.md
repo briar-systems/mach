@@ -7,9 +7,9 @@ a child process's environment, held in the host's native units with one entry pe
 an inherited variable with no UTF-8 spelling is carried unit for unit, and a name is
 matched by the host's own name identity.
 
-<sub>source: [`src/host/environment.mach`](../../../src/host/environment.mach) · imported by 2 modules</sub>
+Source: [`src/host/environment.mach`](../../../src/host/environment.mach)
 
-<sub>`A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md) · `exec` is `std.process.exec`</sub>
+Uses types from [`mach.base.fail`](../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -25,7 +25,7 @@ matched by the host's own name identity.
 
 | On `Environment` | |
 | :--- | :--- |
-| [`init`](#init) · [`dnit`](#dnit) | |
+| [`init`](#init), [`dnit`](#dnit) | |
 | [`put_owned`](#put_owned) | add `entry`, which the environment takes: a name already present keeps its value unless `replace`, and the entry not kept is released |
 | [`put`](#put) | entries own both strings and use host identity before any overlay is applied |
 | [`find`](#find) | the index of the entry named `name` by the host's name identity, none when the environment does not hold it |
@@ -65,7 +65,7 @@ variable with no UTF-8 spelling is carried as it is
 ### entry_dnit
 
 ```mach
-pub fun entry_dnit(a: *A.Allocator, entry: *Entry)
+pub fun entry_dnit(a: *std.allocator.Allocator, entry: *Entry)
 ```
 
 release an entry's native text; an empty entry owns none
@@ -73,7 +73,7 @@ release an entry's native text; an empty entry owns none
 ### entry_native
 
 ```mach
-pub fun entry_native(a: *A.Allocator, units: *Unit) res[Entry, fail.Fail]
+pub fun entry_native(a: *std.allocator.Allocator, units: *Unit) res[Entry, mach.base.fail.Fail]
 ```
 
 a native entry copied from `units`, nul-terminated
@@ -81,7 +81,7 @@ a native entry copied from `units`, nul-terminated
 ### entry_text
 
 ```mach
-pub fun entry_text(a: *A.Allocator, text: str) res[Entry, fail.Fail]
+pub fun entry_text(a: *std.allocator.Allocator, text: str) res[Entry, mach.base.fail.Fail]
 ```
 
 a UTF-8 NAME=value entry in native units
@@ -99,7 +99,7 @@ a child's environment, one entry per name by the host's name identity
 ### init
 
 ```mach
-pub fun init(a: *A.Allocator) Environment
+pub fun init(a: *std.allocator.Allocator) Environment
 ```
 
 ### dnit
@@ -111,7 +111,7 @@ pub fun dnit(values: *Environment)
 ### put_owned
 
 ```mach
-pub fun put_owned(values: *Environment, entry: Entry, replace: bool) err[fail.Fail]
+pub fun put_owned(values: *Environment, entry: Entry, replace: bool) err[mach.base.fail.Fail]
 ```
 
 add `entry`, which the environment takes: a name already present keeps its
@@ -120,7 +120,7 @@ value unless `replace`, and the entry not kept is released
 ### put
 
 ```mach
-pub fun put(values: *Environment, name: str, value: str, replace: bool) err[fail.Fail]
+pub fun put(values: *Environment, name: str, value: str, replace: bool) err[mach.base.fail.Fail]
 ```
 
 entries own both strings and use host identity before any overlay is applied
@@ -128,7 +128,7 @@ entries own both strings and use host identity before any overlay is applied
 ### find
 
 ```mach
-pub fun find(values: *Environment, name: str) res[opt[usize], fail.Fail]
+pub fun find(values: *Environment, name: str) res[opt[usize], mach.base.fail.Fail]
 ```
 
 the index of the entry named `name` by the host's name identity, none when the
@@ -145,7 +145,7 @@ drop the entry at `index`, keeping the order of the rest
 ### capture
 
 ```mach
-pub fun capture(a: *A.Allocator, e: exec.Environment) res[Environment, fail.Fail]
+pub fun capture(a: *std.allocator.Allocator, e: std.process.exec.Environment) res[Environment, mach.base.fail.Fail]
 ```
 
 the environment `e` describes, in native units: a given UTF-8 array, or this
@@ -156,7 +156,7 @@ matching native lookup
 ### to_strings
 
 ```mach
-pub fun to_strings(values: *Environment) res[Strings, fail.Fail]
+pub fun to_strings(values: *Environment) res[Strings, mach.base.fail.Fail]
 ```
 
 the entries sorted by name, each copied, for a child
@@ -176,7 +176,7 @@ exec.NativeEnvironment.given
 ### strings_dnit
 
 ```mach
-pub fun strings_dnit(a: *A.Allocator, strings: *Strings)
+pub fun strings_dnit(a: *std.allocator.Allocator, strings: *Strings)
 ```
 
 release a list of native strings; an empty list owns nothing

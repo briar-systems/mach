@@ -10,9 +10,9 @@ refusal. a failure may point at a source location and carry related places and a
 records whether it owns its text and its places. `refusal` is the one way a refused std
 operation becomes a failure, naming the operation and the path it acted on.
 
-<sub>source: [`src/base/fail.mach`](../../../src/base/fail.mach) · imported by 201 modules</sub>
+Source: [`src/base/fail.mach`](../../../src/base/fail.mach)
 
-<sub>`Message` is private · `Keyed` is private · `diagnostic_kind` is [`mach.base.diagnostic.kind`](diagnostic/kind.md) · `base_source` is [`mach.base.source`](source.md) · `A` is `std.allocator` · `annotation` is [`mach.base.diagnostic.annotation`](diagnostic/annotation.md) · `std_format` is `std.format` · `toml_error` is `toml.error` · `io_error` is `std.io.error` · `fs` is `std.filesystem` · `env` is `std.process.env` · `io_writer` is `std.io.writer`</sub>
+Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [`mach.base.diagnostic.kind`](diagnostic/kind.md), [`mach.base.source`](source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -40,7 +40,7 @@ operation becomes a failure, naming the operation and the path it acted on.
 | [`borrowing_places`](#borrowing_places) | the same failure borrowing its places, for a view of places a holder owns: the places it owned before are the caller's to release |
 | [`place_of`](#place_of) | where the failure points, when it points at a file of the source map its caller reads |
 | [`kind_of`](#kind_of) | the kind the failure is reported as, NONE for a reported one, whose diagnostics carry their own |
-| [`is_reported`](#is_reported) · [`is_message`](#is_message) · [`is_environment`](#is_environment) | |
+| [`is_reported`](#is_reported), [`is_message`](#is_message), [`is_environment`](#is_environment) | |
 | [`text`](#text) | the text a failure carries, absent for a reported one |
 | [`describe`](#describe) | |
 | [`with_text`](#with_text) | the same failure carrying `text` instead, which it borrows: the class, the kind and the places are kept |
@@ -59,7 +59,7 @@ operation becomes a failure, naming the operation and the path it acted on.
 | [`user_of`](#user_of) | the user failure under `k` carrying a made text, which it borrows, or the failure that refused to make it |
 | [`environment_of`](#environment_of) | the environment failure under `k` carrying a made text, which it borrows, or the failure that refused to make it |
 | [`refused`](#refused) | the refusals the compiler recovers from at no site, each carrying its text: the allocator's, which is the environment's, and a string operation, a format and the source map, each internal unless the allocator refused it |
-| [`str_refused`](#str_refused) · [`format_refused`](#format_refused) · [`source_refused`](#source_refused) | |
+| [`str_refused`](#str_refused), [`format_refused`](#format_refused), [`source_refused`](#source_refused) | |
 | [`toml_refused`](#toml_refused) | a document that does not parse is the user's, pointing at the byte the parser refused; one the allocator refused is the environment's |
 
 | On `Op` | |
@@ -73,7 +73,7 @@ operation becomes a failure, naming the operation and the path it acted on.
 
 | Functions | |
 | :--- | :--- |
-| [`str_text`](#str_text) · [`format_text`](#format_text) · [`toml_text`](#toml_text) | |
+| [`str_text`](#str_text), [`format_text`](#format_text), [`toml_text`](#toml_text) | |
 
 ---
 
@@ -132,7 +132,7 @@ the failure borrows `text`; `owning` hands it text it owns
 ### user
 
 ```mach
-pub fun user(k: diagnostic_kind.Kind, text: str) Fail
+pub fun user(k: mach.base.diagnostic.kind.Kind, text: str) Fail
 ```
 
 the input is wrong or unsupported. a failure names a live row of the
@@ -142,7 +142,7 @@ becomes an internal failure. the failure borrows `text`
 ### environment
 
 ```mach
-pub fun environment(k: diagnostic_kind.Kind, text: str) Fail
+pub fun environment(k: mach.base.diagnostic.kind.Kind, text: str) Fail
 ```
 
 the machine refused: a file could not be read or written, a tool could not
@@ -160,7 +160,7 @@ its holder releases it with (`dnit`); a reported failure carries none
 ### as_user
 
 ```mach
-pub fun as_user(k: diagnostic_kind.Kind, f: Fail) Fail
+pub fun as_user(k: mach.base.diagnostic.kind.Kind, f: Fail) Fail
 ```
 
 a failure the user caused met by a phase that cannot classify it (target
@@ -193,7 +193,7 @@ diagnostics name no defect of their own
 ### at
 
 ```mach
-pub fun at(f: Fail, at: base_source.Location) Fail
+pub fun at(f: Fail, at: mach.base.source.Location) Fail
 ```
 
 the same failure pointing at `at`, a location of the source map its caller reads. a
@@ -204,7 +204,7 @@ rewrites the bytes the failure points at
 ### spanned
 
 ```mach
-pub fun spanned(f: Fail, s: base_source.Span) Fail
+pub fun spanned(f: Fail, s: mach.base.source.Span) Fail
 ```
 
 the same failure pointing at the span `s` of the file that caused it, which `placed`
@@ -213,7 +213,7 @@ names, as `at` points it
 ### placed
 
 ```mach
-pub fun placed(f: Fail, file: base_source.FileId) Fail
+pub fun placed(f: Fail, file: mach.base.source.FileId) Fail
 ```
 
 the same failure with every span still waiting for its file, its own, each related one and
@@ -222,7 +222,7 @@ each fix edit's, placed in `file`
 ### with_related
 
 ```mach
-pub fun with_related(a: *A.Allocator, f: Fail, locs: *base_source.Location, n: usize) Fail
+pub fun with_related(a: *std.allocator.Allocator, f: Fail, locs: *mach.base.source.Location, n: usize) Fail
 ```
 
 the same failure naming the `n` locations at `locs` as its related places, in order, each
@@ -233,7 +233,7 @@ whose copy is refused is that refusal
 ### with_fix
 
 ```mach
-pub fun with_fix(a: *A.Allocator, f: Fail, label: str, s: opt[base_source.Span], replacement: str) Fail
+pub fun with_fix(a: *std.allocator.Allocator, f: Fail, label: str, s: opt[mach.base.source.Span], replacement: str) Fail
 ```
 
 the same failure carrying the rewrite `label` names, which replaces the span `s` of the file
@@ -245,7 +245,7 @@ fix keeps it, and one whose copy is refused is that refusal
 ### fix_of
 
 ```mach
-pub fun fix_of(f: Fail) opt[annotation.Fix]
+pub fun fix_of(f: Fail) opt[mach.base.diagnostic.annotation.Fix]
 ```
 
 the rewrite a failure carries, none when it carries no fix; it shares the failure's places'
@@ -254,7 +254,7 @@ lifetime
 ### related_of
 
 ```mach
-pub fun related_of(f: Fail) Vector[annotation.Related]
+pub fun related_of(f: Fail) Vector[mach.base.diagnostic.annotation.Related]
 ```
 
 the related places a failure names, empty for one that names no other; they share the
@@ -272,7 +272,7 @@ the places it owned before are the caller's to release
 ### place_of
 
 ```mach
-pub fun place_of(f: Fail) opt[base_source.Location]
+pub fun place_of(f: Fail) opt[mach.base.source.Location]
 ```
 
 where the failure points, when it points at a file of the source map its caller reads
@@ -280,7 +280,7 @@ where the failure points, when it points at a file of the source map its caller 
 ### kind_of
 
 ```mach
-pub fun kind_of(f: Fail) diagnostic_kind.Kind
+pub fun kind_of(f: Fail) mach.base.diagnostic.kind.Kind
 ```
 
 the kind the failure is reported as, NONE for a reported one, whose
@@ -331,7 +331,7 @@ kind and the places are kept. text the failure is to own goes through
 ### with_secondary
 
 ```mach
-pub fun with_secondary(a: *A.Allocator, f: Fail, secondary: Fail) Fail
+pub fun with_secondary(a: *std.allocator.Allocator, f: Fail, secondary: Fail) Fail
 ```
 
 the same failure also naming `secondary`, a failure met while releasing what
@@ -347,7 +347,7 @@ secondary never takes the failure's place. the joined text is owned through
 ### retain
 
 ```mach
-pub fun retain(a: *A.Allocator, f: Fail) res[Fail, A.Error]
+pub fun retain(a: *std.allocator.Allocator, f: Fail) res[Fail, std.allocator.Error]
 ```
 
 a copy of the failure that owns its text and its places through `a`, for a
@@ -357,7 +357,7 @@ failure that outlives the storage its message was made in; released with
 ### dnit
 
 ```mach
-pub fun dnit(a: *A.Allocator, f: Fail)
+pub fun dnit(a: *std.allocator.Allocator, f: Fail)
 ```
 
 release what a failure owns through `a`: its text and its places, each when
@@ -366,7 +366,7 @@ it owns them
 ### places_retain
 
 ```mach
-pub fun places_retain(a: *A.Allocator, f: Fail) res[Fail, A.Error]
+pub fun places_retain(a: *std.allocator.Allocator, f: Fail) res[Fail, std.allocator.Error]
 ```
 
 a copy of the failure whose places, every related place and its fix, are owned through `a`,
@@ -375,7 +375,7 @@ its text left as it is; for a holder that keeps the text apart. released with `p
 ### places_dnit
 
 ```mach
-pub fun places_dnit(a: *A.Allocator, f: Fail)
+pub fun places_dnit(a: *std.allocator.Allocator, f: Fail)
 ```
 
 release the places a failure owns through `a`, as `places_retain` made them;
@@ -410,7 +410,7 @@ the unit outcome of an operation whose value is not needed
 ### prefixed
 
 ```mach
-pub fun prefixed(a: *A.Allocator, context: str, cause: Fail) Fail
+pub fun prefixed(a: *std.allocator.Allocator, context: str, cause: Fail) Fail
 ```
 
 `cause` with `context` in front of its text, joined into `a`, which owns the
@@ -421,7 +421,7 @@ ownership it had, so the context never takes the cause's place
 ### formatted
 
 ```mach
-pub fun formatted(a: *A.Allocator, fmt: str, va: ...) Fail
+pub fun formatted(a: *std.allocator.Allocator, fmt: str, va: ...) Fail
 ```
 
 an internal failure whose text is `fmt` formatted with `va` into `a`, which
@@ -430,7 +430,7 @@ the failure owns; a refusal to format is the failure instead
 ### formatted_user
 
 ```mach
-pub fun formatted_user(a: *A.Allocator, k: diagnostic_kind.Kind, fmt: str, va: ...) Fail
+pub fun formatted_user(a: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kind, fmt: str, va: ...) Fail
 ```
 
 a user failure under `k` whose text is `fmt` formatted with `va` into `a`,
@@ -448,7 +448,7 @@ be interned), or the failure that refused to make it
 ### user_of
 
 ```mach
-pub fun user_of(k: diagnostic_kind.Kind, made: res[str, Fail]) Fail
+pub fun user_of(k: mach.base.diagnostic.kind.Kind, made: res[str, Fail]) Fail
 ```
 
 the user failure under `k` carrying a made text, which it borrows, or the
@@ -457,7 +457,7 @@ failure that refused to make it
 ### environment_of
 
 ```mach
-pub fun environment_of(k: diagnostic_kind.Kind, made: res[str, Fail]) Fail
+pub fun environment_of(k: mach.base.diagnostic.kind.Kind, made: res[str, Fail]) Fail
 ```
 
 the environment failure under `k` carrying a made text, which it borrows, or
@@ -466,7 +466,7 @@ the failure that refused to make it
 ### refused
 
 ```mach
-pub fun refused(e: A.Error) Fail
+pub fun refused(e: std.allocator.Error) Fail
 ```
 
 the refusals the compiler recovers from at no site, each carrying its text: the
@@ -482,19 +482,19 @@ pub fun str_refused(e: StrError) Fail
 ### format_refused
 
 ```mach
-pub fun format_refused(e: std_format.FormatError) Fail
+pub fun format_refused(e: std.format.FormatError) Fail
 ```
 
 ### source_refused
 
 ```mach
-pub fun source_refused(e: base_source.Error) Fail
+pub fun source_refused(e: mach.base.source.Error) Fail
 ```
 
 ### toml_refused
 
 ```mach
-pub fun toml_refused(e: toml_error.TomlError) Fail
+pub fun toml_refused(e: toml.error.TomlError) Fail
 ```
 
 a document that does not parse is the user's, pointing at the byte the parser
@@ -535,7 +535,7 @@ by its role alone, and a variable's name is its path
 ### refusal
 
 ```mach
-pub fun refusal(a: *A.Allocator, k: diagnostic_kind.Kind, op: Op, cause: Cause) Fail
+pub fun refusal(a: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kind, op: Op, cause: Cause) Fail
 ```
 
 the failure of `op`, refused by `cause`, reported under `k` with the text `op`
@@ -548,11 +548,11 @@ this is the one way a refusal of the machine becomes a failure
 
 ```mach
 pub tag Cause: u8 {
-    io:     io_error.Error;
-    fs:     fs.FsError;
+    io:     std.io.error.Error;
+    fs:     std.filesystem.FsError;
     native: i64;
-    env:    env.EnvError;
-    write:  io_writer.WriteError;
+    env:    std.process.env.EnvError;
+    write:  std.io.writer.WriteError;
     text:   str;
 }
 ```
@@ -563,7 +563,7 @@ its own module renders (a subprocess, a contained removal)
 ### charged
 
 ```mach
-pub fun charged(k: diagnostic_kind.Kind, given: bool, cause: Cause, text: str) Fail
+pub fun charged(k: mach.base.diagnostic.kind.Kind, given: bool, cause: Cause, text: str) Fail
 ```
 
 the failure under `k` carrying `text`, which it borrows, for a refusal of
@@ -593,12 +593,12 @@ pub fun str_text(e: StrError) str
 ### format_text
 
 ```mach
-pub fun format_text(e: std_format.FormatError) str
+pub fun format_text(e: std.format.FormatError) str
 ```
 
 ### toml_text
 
 ```mach
-pub fun toml_text(e: toml_error.TomlError) str
+pub fun toml_text(e: toml.error.TomlError) str
 ```
 

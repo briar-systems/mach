@@ -4,9 +4,9 @@
 
 the statement nodes of the syntax tree
 
-<sub>source: [`src/front/ast/stmt.mach`](../../../../src/front/ast/stmt.mach) · imported by 14 modules</sub>
+Source: [`src/front/ast/stmt.mach`](../../../../src/front/ast/stmt.mach)
 
-<sub>`ast_id` is [`mach.front.ast.id`](id.md) · `base_source` is [`mach.base.source`](../../base/source.md)</sub>
+Uses types from [`mach.base.source`](../../base/source.md), [`mach.front.ast.id`](id.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -26,7 +26,7 @@ the statement nodes of the syntax tree
 
 | On `StmtKind` | |
 | :--- | :--- |
-| [`STMT_KIND_EXPR`](#stmtkind) · [`STMT_KIND_BLOCK`](#stmtkind) · [`STMT_KIND_IF`](#stmtkind) · [`STMT_KIND_FOR`](#stmtkind) · [`STMT_KIND_RET`](#stmtkind) · [`STMT_KIND_BRK`](#stmtkind) · [`STMT_KIND_CNT`](#stmtkind) · [`STMT_KIND_FIN`](#stmtkind) · [`STMT_KIND_DECL`](#stmtkind) · [`STMT_KIND_ASM`](#stmtkind) · [`STMT_KIND_COMPTIME_IF`](#stmtkind) · [`STMT_KIND_COMPTIME_EACH`](#stmtkind) · [`STMT_KIND_COMPTIME_DIRECTIVE`](#stmtkind) · [`STMT_KIND_ERROR`](#stmtkind) | |
+| [`STMT_KIND_EXPR`](#stmtkind), [`STMT_KIND_BLOCK`](#stmtkind), [`STMT_KIND_IF`](#stmtkind), [`STMT_KIND_FOR`](#stmtkind), [`STMT_KIND_RET`](#stmtkind), [`STMT_KIND_BRK`](#stmtkind), [`STMT_KIND_CNT`](#stmtkind), [`STMT_KIND_FIN`](#stmtkind), [`STMT_KIND_DECL`](#stmtkind), [`STMT_KIND_ASM`](#stmtkind), [`STMT_KIND_COMPTIME_IF`](#stmtkind), [`STMT_KIND_COMPTIME_EACH`](#stmtkind), [`STMT_KIND_COMPTIME_DIRECTIVE`](#stmtkind), [`STMT_KIND_ERROR`](#stmtkind) | |
 
 ---
 
@@ -57,7 +57,7 @@ pub def StmtKind: u8
 
 ```mach
 pub rec StmtExpr {
-    expr: ast_id.ExprId;
+    expr: mach.front.ast.id.ExprId;
 }
 ```
 
@@ -74,9 +74,9 @@ pub rec StmtBlock {
 
 ```mach
 pub rec StmtIf {
-    cond:       ast_id.ExprId;
-    then_block: ast_id.StmtId;
-    else_block: ast_id.StmtId;
+    cond:       mach.front.ast.id.ExprId;
+    then_block: mach.front.ast.id.StmtId;
+    else_block: mach.front.ast.id.StmtId;
 }
 ```
 
@@ -84,8 +84,8 @@ pub rec StmtIf {
 
 ```mach
 pub rec StmtFor {
-    cond: ast_id.ExprId;
-    body: ast_id.StmtId;
+    cond: mach.front.ast.id.ExprId;
+    body: mach.front.ast.id.StmtId;
 }
 ```
 
@@ -93,7 +93,7 @@ pub rec StmtFor {
 
 ```mach
 pub rec StmtRet {
-    value: ast_id.ExprId;
+    value: mach.front.ast.id.ExprId;
 }
 ```
 
@@ -101,7 +101,7 @@ pub rec StmtRet {
 
 ```mach
 pub rec StmtFin {
-    body: ast_id.StmtId;
+    body: mach.front.ast.id.StmtId;
 }
 ```
 
@@ -109,7 +109,7 @@ pub rec StmtFin {
 
 ```mach
 pub rec StmtDecl {
-    decl: ast_id.DeclId;
+    decl: mach.front.ast.id.DeclId;
 }
 ```
 
@@ -117,8 +117,8 @@ pub rec StmtDecl {
 
 ```mach
 pub rec StmtAsm {
-    head: base_source.Span;
-    body: base_source.Span;
+    head: mach.base.source.Span;
+    body: mach.base.source.Span;
 }
 ```
 
@@ -137,8 +137,8 @@ pub rec StmtComptimeIf {
 
 ```mach
 pub rec StmtComptimeEach {
-    var_name:   base_source.Span;
-    seq:        ast_id.ExprId;
+    var_name:   mach.base.source.Span;
+    seq:        mach.front.ast.id.ExprId;
     body_start: u32;
     body_len:   u32;
 }
@@ -148,7 +148,7 @@ pub rec StmtComptimeEach {
 
 ```mach
 pub rec StmtComptimeDirective {
-    target: ast_id.ExprId;
+    target: mach.front.ast.id.ExprId;
 }
 ```
 
@@ -156,7 +156,7 @@ pub rec StmtComptimeDirective {
 
 ```mach
 pub rec Stmt {
-    span: base_source.Span;
+    span: mach.base.source.Span;
     kind: StmtKind;
     data: uni {
         expr: StmtExpr;

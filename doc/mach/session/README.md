@@ -10,7 +10,7 @@ registry, the open buffers, the embedded files and what is retained between buil
 file's text as an input of the query database, and expires every view borrowed from it when an
 input changes.
 
-<sub>[`mach.session`](../session.md) · 4 modules · imports [`base`](../base/README.md), [`manifest`](../manifest/README.md), [`type`](../type/README.md) · imported by [`build`](../build/README.md), [`cli`](../cli/README.md), [`compile`](../compile/README.md), [`front`](../front/README.md), [`lower`](../lower/README.md), [`manifest`](../manifest/README.md), [`package`](../package/README.md), [`tool`](../tool/README.md), [`type`](../type/README.md)</sub>
+The directory's root module is [`mach.session`](../session.md).
 
 | Module | |
 | :--- | :--- |

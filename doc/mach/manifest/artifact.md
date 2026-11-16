@@ -7,9 +7,9 @@ the `[artifact.<name>]` tables: their decoding, `--set` over them, and lookups
 at most one artifact is `export = true`, an artifact's `out` expands through the
 template engine, and its PE subsystem is named as mink spells it.
 
-<sub>source: [`src/manifest/artifact.mach`](../../../src/manifest/artifact.mach) · imported by 7 modules</sub>
+Source: [`src/manifest/artifact.mach`](../../../src/manifest/artifact.mach)
 
-<sub>`A` is `std.allocator` · `intern` is [`mach.base.intern`](../base/intern.md) · `toml_value` is `toml.value` · `fail` is [`mach.base.fail`](../base/fail.md) · `mink_subsystem` is `mink.catalog.subsystem` · `template` is [`mach.manifest.template`](template.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.manifest.template`](template.md).
 
 | Functions | |
 | :--- | :--- |
@@ -31,7 +31,7 @@ template engine, and its PE subsystem is named as mink spells it.
 ### artifact_set
 
 ```mach
-pub fun artifact_set(alloc: *A.Allocator, itn: *intern.Interner, lead: str, sub: *toml_value.Table, d: *ArtifactDef) err[fail.Fail]
+pub fun artifact_set(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, lead: str, sub: *toml.value.Table, d: *ArtifactDef) err[mach.base.fail.Fail]
 ```
 
 every key `--set` writes over an artifact that the table `sub` holds, decoded over `d` with
@@ -49,7 +49,7 @@ where it was written; a key `sub` does not hold leaves `d` as it is
 ### subsystem_named
 
 ```mach
-pub fun subsystem_named(a: *A.Allocator, name: str) res[*mink_subsystem.Subsystem, str]
+pub fun subsystem_named(a: *std.allocator.Allocator, name: str) res[*mink.catalog.subsystem.Subsystem, str]
 ```
 
 the PE subsystem mink spells `name`, or why it names none: the spelling a previous major took
@@ -64,13 +64,13 @@ listing mink's
 ### parse_artifacts
 
 ```mach
-pub fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail]
+pub fun parse_artifacts(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, t: *toml.value.Table, m: *Manifest) err[mach.base.fail.Fail]
 ```
 
 ### export_validate
 
 ```mach
-pub fun export_validate(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[fail.Fail]
+pub fun export_validate(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest) err[mach.base.fail.Fail]
 ```
 
 more than one `export = true` artifact is refused, pointing at each `export` value
@@ -86,7 +86,7 @@ the export library: the one artifact marked `export = true`, nil when none is
 ### find_artifact
 
 ```mach
-pub fun find_artifact(itn: *intern.Interner, m: *Manifest, name: str) *ArtifactDef
+pub fun find_artifact(itn: *mach.base.intern.Interner, m: *Manifest, name: str) *ArtifactDef
 ```
 
 the artifact `m` declares under `name`, nil when none is
@@ -94,13 +94,13 @@ the artifact `m` declares under `name`, nil when none is
 ### find_artifact_by_name
 
 ```mach
-pub fun find_artifact_by_name(m: *Manifest, name: intern.StrId) *ArtifactDef
+pub fun find_artifact_by_name(m: *Manifest, name: mach.base.intern.StrId) *ArtifactDef
 ```
 
 ### artifact_needs_artifact
 
 ```mach
-pub fun artifact_needs_artifact(itn: *intern.Interner, a: *ArtifactDef, other: *ArtifactDef) bool
+pub fun artifact_needs_artifact(itn: *mach.base.intern.Interner, a: *ArtifactDef, other: *ArtifactDef) bool
 ```
 
 whether a `need` entry of `a` selects `other`, a different artifact
@@ -108,7 +108,7 @@ whether a `need` entry of `a` selects `other`, a different artifact
 ### expand_artifact_output
 
 ```mach
-pub fun expand_artifact_output(alloc: *A.Allocator, itn: *intern.Interner, a: *ArtifactDef, project_work: str, vars: *template.Values) res[str, fail.Fail]
+pub fun expand_artifact_output(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, a: *ArtifactDef, project_work: str, vars: *mach.manifest.template.Values) res[str, mach.base.fail.Fail]
 ```
 
 expand an artifact's `out` for the target `vars` names; a refusal points at the `out` value
@@ -116,7 +116,7 @@ expand an artifact's `out` for the target `vars` names; a refusal points at the 
 ### artifact_supports_target
 
 ```mach
-pub fun artifact_supports_target(itn: *intern.Interner, a: *ArtifactDef, tname: intern.StrId) bool
+pub fun artifact_supports_target(itn: *mach.base.intern.Interner, a: *ArtifactDef, tname: mach.base.intern.StrId) bool
 ```
 
 whether an artifact's `targets` lists a target name or "*"

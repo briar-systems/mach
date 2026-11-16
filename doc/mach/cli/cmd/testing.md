@@ -8,9 +8,9 @@ tests are run by target and profile through the test pool, launched through the 
 a target declares. a target and profile whose tests cannot run here are built and
 reported as not run, and `--list` prints the collected tests and stops.
 
-<sub>source: [`src/cli/cmd/testing.mach`](../../../../src/cli/cmd/testing.mach) · imported by 1 module</sub>
+Source: [`src/cli/cmd/testing.mach`](../../../../src/cli/cmd/testing.mach)
 
-<sub>`args` is [`mach.cli.args`](../args.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `std_args` is `std.args`</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.cli.args`](../args.md).
 
 | Functions | |
 | :--- | :--- |
@@ -28,7 +28,7 @@ reported as not run, and `--list` prints the collected tests and stops.
 ### run
 
 ```mach
-pub fun run(cx: *args.Call) res[i64, fail.Fail]
+pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 ```
 
 `mach test`: build the project's test dispatcher and run the collected tests. `--emit` is
@@ -46,6 +46,6 @@ root, so runs in one tree with different `-o` do not collide
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COMMAND` | `std_args.Command` | `std_args.Command{name: "test", aliases: args.NO_WORDS, help: "build and run project tests", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: false}` | `mach test` |
-| `POLICY` | `args.Policy` | `args.Policy{refused: Slice[*std_args.Flag]{data: ?REFUSED[0], size: REFUSED_N}, refusal: "test always builds its internal test dispatcher", conflicts: args.NO_CONFLICTS}` | what mach holds `mach test` to beyond the parse |
+| `COMMAND` | `std.args.Command` | `std_args.Command{name: "test", aliases: args.NO_WORDS, help: "build and run project tests", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: false}` | `mach test` |
+| `POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: Slice[*std_args.Flag]{data: ?REFUSED[0], size: REFUSED_N}, refusal: "test always builds its internal test dispatcher", conflicts: args.NO_CONFLICTS}` | what mach holds `mach test` to beyond the parse |
 

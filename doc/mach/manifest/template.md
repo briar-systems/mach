@@ -10,9 +10,9 @@ table, each naming the contexts that admit it. the engine walks a template
 twice, once to size the result and refuse what the context does not admit,
 once to write it, and the load-time check is the first walk without values
 
-<sub>source: [`src/manifest/template.mach`](../../../src/manifest/template.mach) · imported by 14 modules</sub>
+Source: [`src/manifest/template.mach`](../../../src/manifest/template.mach)
 
-<sub>`A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md) · `intern` is [`mach.base.intern`](../base/intern.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -74,7 +74,7 @@ where a template is written, which decides the variables it may name
 ### expand
 
 ```mach
-pub fun expand(alloc: *A.Allocator, tmpl: str, ctx: Context, project_work: str, v: *Values) res[str, fail.Fail]
+pub fun expand(alloc: *std.allocator.Allocator, tmpl: str, ctx: Context, project_work: str, v: *Values) res[str, mach.base.fail.Fail]
 ```
 
 expand `tmpl`, written in `ctx`
@@ -91,7 +91,7 @@ expand `tmpl`, written in `ctx`
 ### path_expand
 
 ```mach
-pub fun path_expand(alloc: *A.Allocator, tmpl: str, ctx: Context, project_work: str, v: *Values, field: str) res[str, fail.Fail]
+pub fun path_expand(alloc: *std.allocator.Allocator, tmpl: str, ctx: Context, project_work: str, v: *Values, field: str) res[str, mach.base.fail.Fail]
 ```
 
 `expand`, then require the result to be a canonical strict descendant of the
@@ -104,7 +104,7 @@ project root
 ### check
 
 ```mach
-pub fun check(alloc: *A.Allocator, tmpl: str, ctx: Context) err[fail.Fail]
+pub fun check(alloc: *std.allocator.Allocator, tmpl: str, ctx: Context) err[mach.base.fail.Fail]
 ```
 
 refuse what `expand` would refuse in `ctx` before any value is known: an
@@ -152,7 +152,7 @@ one artifact a template may name as `{artifact.<id>.out}`
 ### values_with
 
 ```mach
-pub fun values_with(itn: *intern.Interner, t: *TargetDef, pn: str, reqs: *Requirement, req_count: u32) Values
+pub fun values_with(itn: *mach.base.intern.Interner, t: *TargetDef, pn: str, reqs: *Requirement, req_count: u32) Values
 ```
 
 `values_of` with the requirements `{artifact.<id>.out}` may name
@@ -175,7 +175,7 @@ the values an `#[embed]` path expands with: the requirements of one scope
 
 ```mach
 pub rec Requirements {
-    owner:      intern.StrId;
+    owner:      mach.base.intern.StrId;
     dependency: bool;
     reqs:       *Requirement;
     req_count:  u32;
@@ -186,7 +186,7 @@ the artifacts the modules of one project may name as `{artifact.<id>.out}`
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `owner` | `intern.StrId` | the id of the project whose modules resolve in this scope |
+| `owner` | `mach.base.intern.StrId` | the id of the project whose modules resolve in this scope |
 | `dependency` | `bool` | the requirements are a dependency's default library artifacts', not the requirements of the artifact being built |
 | `reqs` | `*Requirement` | the requirements; nil when none |
 | `req_count` | `u32` | length of `reqs` |
@@ -230,7 +230,7 @@ the values a template expands with
 ### values_of
 
 ```mach
-pub fun values_of(itn: *intern.Interner, t: *TargetDef, pn: str) Values
+pub fun values_of(itn: *mach.base.intern.Interner, t: *TargetDef, pn: str) Values
 ```
 
 the values for one target and profile, with no requirements
@@ -254,7 +254,7 @@ values that name nothing, each field set by the caller that has it
 ### artifact_id
 
 ```mach
-pub fun artifact_id(alloc: *A.Allocator, tmpl: str) res[opt[str], fail.Fail]
+pub fun artifact_id(alloc: *std.allocator.Allocator, tmpl: str) res[opt[str], mach.base.fail.Fail]
 ```
 
 the id the first `{artifact.<id>.out}` group in `tmpl` names, owned by

@@ -10,9 +10,9 @@ names and globs (`*` any run, `?` any one byte); an axis given no pattern is
 `ArtifactDefault` modes, `resolve_target` and `resolve_profile` decide. no cell
 is chosen by table order
 
-<sub>source: [`src/manifest/select.mach`](../../../src/manifest/select.mach) · imported by 12 modules</sub>
+Source: [`src/manifest/select.mach`](../../../src/manifest/select.mach)
 
-<sub>`A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `diagnostic_kind` is [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md)</sub>
+Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -88,7 +88,7 @@ the selector axes as a command gave them
 ### selectors_init
 
 ```mach
-pub fun selectors_init(alloc: *A.Allocator) Selectors
+pub fun selectors_init(alloc: *std.allocator.Allocator) Selectors
 ```
 
 empty selectors: every axis takes the manifest's default
@@ -108,7 +108,7 @@ release the pattern vectors of selectors; the patterns themselves are borrowed
 ### selectors_of
 
 ```mach
-pub fun selectors_of(alloc: *A.Allocator, artifact: str, target: str, profile: str) res[Selectors, fail.Fail]
+pub fun selectors_of(alloc: *std.allocator.Allocator, artifact: str, target: str, profile: str) res[Selectors, mach.base.fail.Fail]
 ```
 
 selectors naming at most one pattern per axis: each non-empty value is its
@@ -125,8 +125,8 @@ axis's one pattern, and an empty value leaves the axis to the manifest's default
 ### resolve_cells
 
 ```mach
-pub fun resolve_cells(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, s: *Selectors,
-    mode: ArtifactDefault) res[Vector[Cell], fail.Fail]
+pub fun resolve_cells(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest, s: *Selectors,
+    mode: ArtifactDefault) res[Vector[Cell], mach.base.fail.Fail]
 ```
 
 resolve selectors against a manifest into the cells they cover, profiles
@@ -147,8 +147,8 @@ other unsupported pair is left out. an empty selection is refused
 ### resolve_cell
 
 ```mach
-pub fun resolve_cell(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, s: *Selectors,
-    mode: ArtifactDefault, what: str) res[Cell, fail.Fail]
+pub fun resolve_cell(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest, s: *Selectors,
+    mode: ArtifactDefault, what: str) res[Cell, mach.base.fail.Fail]
 ```
 
 resolve selectors a command needs one cell of: `resolve_cells`, refused as
@@ -199,7 +199,7 @@ dependency's requirement, or a cell carried from an earlier plan
 ### single_selection_fail
 
 ```mach
-pub fun single_selection_fail(alloc: *A.Allocator, k: diagnostic_kind.Kind, what: str, cells: *Vector[Cell]) fail.Fail
+pub fun single_selection_fail(alloc: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kind, what: str, cells: *Vector[Cell]) mach.base.fail.Fail
 ```
 
 the refusal of an option or command that needs one (artifact, target, profile)
@@ -230,8 +230,8 @@ the outcome of target resolution for a selection
 ### resolve_target
 
 ```mach
-pub fun resolve_target(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, selector: str,
-    art: *ArtifactDef) res[ResolvedTarget, fail.Fail]
+pub fun resolve_target(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest, selector: str,
+    art: *ArtifactDef) res[ResolvedTarget, mach.base.fail.Fail]
 ```
 
 the target a selector names: a declared name, `native` for the declared
@@ -242,13 +242,13 @@ otherwise `native`
 
 ```mach
 pub rec ResolvedProfile {
-    name:         intern.StrId;
+    name:         mach.base.intern.StrId;
     optimize:     bool;
     relax:        NameList;
     linker_relax: bool;
     debug:        bool;
     simd:         SimdMode;
-    allow:        diagnostic_kind.KindSet;
+    allow:        mach.base.diagnostic.kind.KindSet;
 }
 ```
 
@@ -256,18 +256,18 @@ the profile a selection resolves to, copied out of its `ProfileDef`
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `name` | `intern.StrId` | the profile's name |
+| `name` | `mach.base.intern.StrId` | the profile's name |
 | `optimize` | `bool` | as `ProfileDef` |
 | `relax` | `NameList` | as `ProfileDef`, borrowed from the manifest |
 | `linker_relax` | `bool` | as `ProfileDef` |
 | `debug` | `bool` | as `ProfileDef` |
 | `simd` | `SimdMode` | as `ProfileDef` |
-| `allow` | `diagnostic_kind.KindSet` | as `ProfileDef` |
+| `allow` | `mach.base.diagnostic.kind.KindSet` | as `ProfileDef` |
 
 ### resolve_profile
 
 ```mach
-pub fun resolve_profile(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, pick: str) res[ResolvedProfile, fail.Fail]
+pub fun resolve_profile(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest, pick: str) res[ResolvedProfile, mach.base.fail.Fail]
 ```
 
 choose the profile a selection names. a named profile must be declared. an
@@ -281,5 +281,5 @@ default are refused: no profile is ever selected by table order
 | `itn` | resolves the names |
 | `m` | the manifest |
 | `pick` | the profile name, or "" for the default |
-| **returns** | the profile; err "mach.toml: no profile named '&lt;pick>'" or, with an empty name, an error when several profiles are declared and none is the default |
+| **returns** | the profile; err "mach.toml: no profile named '\<pick>'" or, with an empty name, an error when several profiles are declared and none is the default |
 

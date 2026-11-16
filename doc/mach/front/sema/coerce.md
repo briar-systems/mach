@@ -10,9 +10,9 @@ range, as a comptime integer value must. a float literal's rounding is checked o
 final. assignment may add secrecy, spreads `^[N]T` to `[N]^T`, and converts `ptr` to and from
 a typed pointer that reaches no secret.
 
-<sub>source: [`src/front/sema/coerce.mach`](../../../../src/front/sema/coerce.mach) · imported by 4 modules</sub>
+Source: [`src/front/sema/coerce.mach`](../../../../src/front/sema/coerce.mach)
 
-<sub>`CoerceKind` is private · `type_kind` is [`mach.type.kind`](../../type/kind.md) · `wide` is [`mach.base.wide`](../../base/wide.md) · `type_prim` is [`mach.type.prim`](../../type/prim.md) · `sema_context` is [`mach.front.sema.context`](context.md) · `ast_id` is [`mach.front.ast.id`](../ast/id.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `comptime_value` is [`mach.front.comptime.value`](../comptime/value.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.wide`](../../base/wide.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.comptime.value`](../comptime/value.md), [`mach.front.sema.context`](context.md), [`mach.type.kind`](../../type/kind.md), [`mach.type.prim`](../../type/prim.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -20,7 +20,7 @@ a typed pointer that reaches no secret.
 
 | On `CoerceResult` | |
 | :--- | :--- |
-| [`out_of_range`](#out_of_range) · [`try_coerce_literal`](#try_coerce_literal) | |
+| [`out_of_range`](#out_of_range), [`try_coerce_literal`](#try_coerce_literal) | |
 | [`probe_literal_range`](#probe_literal_range) | ask whether a literal-shaped expression fits the integer range of `to` without retyping anything: `COERCE_OUT_OF_RANGE` carries the offending leaf's value and sign, and any other kind means the shape is not a literal or it fits |
 | [`fit_ct_int`](#fit_ct_int) | whether a comptime integer value fits integer type `to`, retyping nothing: not applicable unless both are integers |
 
@@ -33,7 +33,7 @@ a typed pointer that reaches no secret.
 
 | Constants | |
 | :--- | :--- |
-| [`COERCE_COERCED`](#constants) · [`COERCE_OUT_OF_RANGE`](#constants) | |
+| [`COERCE_COERCED`](#constants), [`COERCE_OUT_OF_RANGE`](#constants) | |
 
 ---
 
@@ -42,10 +42,10 @@ a typed pointer that reaches no secret.
 ```mach
 pub rec CoerceResult {
     kind:    CoerceKind;
-    ty:      type_kind.TypeId;
-    value:   wide.Wide;
+    ty:      mach.type.kind.TypeId;
+    value:   mach.base.wide.Wide;
     negated: bool;
-    bounds:  type_prim.IntRange;
+    bounds:  mach.type.prim.IntRange;
 
     literal: bool;
 }
@@ -54,19 +54,19 @@ pub rec CoerceResult {
 ### out_of_range
 
 ```mach
-pub fun out_of_range(to: type_kind.TypeId, value: wide.Wide, negated: bool, bounds: type_prim.IntRange, literal: bool) CoerceResult
+pub fun out_of_range(to: mach.type.kind.TypeId, value: mach.base.wide.Wide, negated: bool, bounds: mach.type.prim.IntRange, literal: bool) CoerceResult
 ```
 
 ### try_coerce_literal
 
 ```mach
-pub fun try_coerce_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type_kind.TypeId) res[CoerceResult, fail.Fail]
+pub fun try_coerce_literal(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId, to: mach.type.kind.TypeId) res[CoerceResult, mach.base.fail.Fail]
 ```
 
 ### probe_literal_range
 
 ```mach
-pub fun probe_literal_range(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type_kind.TypeId) res[CoerceResult, fail.Fail]
+pub fun probe_literal_range(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId, to: mach.type.kind.TypeId) res[CoerceResult, mach.base.fail.Fail]
 ```
 
 ask whether a literal-shaped expression fits the integer range of `to` without
@@ -83,7 +83,7 @@ sign, and any other kind means the shape is not a literal or it fits
 ### fit_ct_int
 
 ```mach
-pub fun fit_ct_int(sc: *sema_context.SemaContext, ctval: comptime_value.CTValue, to: type_kind.TypeId) CoerceResult
+pub fun fit_ct_int(sc: *mach.front.sema.context.SemaContext, ctval: mach.front.comptime.value.CTValue, to: mach.type.kind.TypeId) CoerceResult
 ```
 
 whether a comptime integer value fits integer type `to`, retyping nothing:
@@ -94,7 +94,7 @@ not applicable unless both are integers
 ### is_untyped_int_literal
 
 ```mach
-pub fun is_untyped_int_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[bool, fail.Fail]
+pub fun is_untyped_int_literal(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId) res[bool, mach.base.fail.Fail]
 ```
 
 whether an expression is built only from unsuffixed integer literals under the
@@ -109,13 +109,13 @@ operators a literal coerces through, so its exact value is still untyped
 ### int_bounds_of
 
 ```mach
-pub fun int_bounds_of(sc: *sema_context.SemaContext, to: type_kind.TypeId) opt[type_prim.IntRange]
+pub fun int_bounds_of(sc: *mach.front.sema.context.SemaContext, to: mach.type.kind.TypeId) opt[mach.type.prim.IntRange]
 ```
 
 ### check_float_literal
 
 ```mach
-pub fun check_float_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, ty: type_kind.TypeId)
+pub fun check_float_literal(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId, ty: mach.type.kind.TypeId)
 ```
 
 the float literal rule, applied once the literal's type is final. the literal rounds to
@@ -132,7 +132,7 @@ warns with that value. an exact literal never warns
 ### is_assignable
 
 ```mach
-pub fun is_assignable(sc: *sema_context.SemaContext, from: type_kind.TypeId, to: type_kind.TypeId) bool
+pub fun is_assignable(sc: *mach.front.sema.context.SemaContext, from: mach.type.kind.TypeId, to: mach.type.kind.TypeId) bool
 ```
 
 ## Constants

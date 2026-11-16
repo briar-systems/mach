@@ -2,39 +2,55 @@
 
 # mach.tool.doc.build
 
-the document model of a loaded project, built from its syntax trees, its name
-resolution and its module graph
+the document model of a project, built from the syntax trees of its source files
 
-every `$if` arm is read from the syntax tree, so the entries and their signatures do
-not depend on the target analyzed; only what resolution decides (what a `fwd` in a
-selected arm forwards, which modules some artifact reaches) does. nothing here reads
-source text except the spans the syntax tree gives
+nothing here runs name resolution or knows a target: every `$if` arm is read, an
+import alias is what the file's `use` lines bind (a `use` in an arm binding under
+that arm's condition), and a `fwd` is followed by its alias and name into the tree
+of the module it names. nothing reads source text except the spans the syntax tree
+gives
 
-<sub>source: [`src/tool/doc/build.mach`](../../../../src/tool/doc/build.mach) · imported by 1 module</sub>
+Source: [`src/tool/doc/build.mach`](../../../../src/tool/doc/build.mach)
 
-<sub>`A` is `std.allocator` · `project` is [`mach.compile.project`](../../compile/project.md) · `manifest_model` is [`mach.manifest.model`](../../manifest/model.md) · `model` is [`mach.tool.doc.model`](model.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.front.ast`](../../front/ast.md), [`mach.manifest.model`](../../manifest/model.md), [`mach.tool.doc.model`](model.md).
 
-| Functions | |
+| Type | | |
+| :--- | :--- | :--- |
+| [`Source`](#source) | `rec` | one parsed source file of the project: its module's dotted path, its syntax tree and its source text |
+
+| On `Source` | |
 | :--- | :--- |
-| [`build`](#build) | the model of `p`, every module of its own that its artifacts reach |
+| [`build`](#build) | the model of the project whose parsed files `sources` holds |
 
 ---
 
-## Functions
+## Source
+
+```mach
+pub rec Source {
+    path: str;
+    tree: *mach.front.ast.Ast;
+    text: str;
+}
+```
+
+one parsed source file of the project: its module's dotted path, its syntax tree and
+its source text
 
 ### build
 
 ```mach
-pub fun build(a: *A.Allocator, p: *project.Project, m: *manifest_model.Manifest, out: *model.Project) err[fail.Fail]
+pub fun build(a: *std.allocator.Allocator, m: *mach.manifest.model.Manifest, itn: *mach.base.intern.Interner, sources: *Vector[Source], out: *mach.tool.doc.model.Project) err[mach.base.fail.Fail]
 ```
 
-the model of `p`, every module of its own that its artifacts reach
+the model of the project whose parsed files `sources` holds
 
 | Parameter | |
 | :--- | :--- |
 | `a` | the arena the model lives in |
-| `p` | the analyzed project, through name resolution |
-| `m` | its manifest |
+| `m` | the project's manifest |
+| `itn` | the interner the manifest's names are in |
+| `sources` | every source file under the project's source root, sorted here by path |
 | `out` | the model |
 | **returns** | ok, or the allocator's refusal |
 

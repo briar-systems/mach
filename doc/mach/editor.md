@@ -12,9 +12,9 @@ envelope that outlives later edits, while the trees and tables it lends borrow t
 nothing in the compiler reaches this module: mach-lsp does, and the `editor` artifact keeps
 it built.
 
-<sub>source: [`src/editor.mach`](../../src/editor.mach) · imported by 1 module</sub>
+Source: [`src/editor.mach`](../../src/editor.mach)
 
-<sub>`session` is [`mach.session`](session.md) · `A` is `std.allocator` · `Buffer` is private · `fail` is [`mach.base.fail`](base/fail.md) · `arena` is `std.allocator.arena` · `project` is [`mach.compile.project`](compile/project.md) · `collections_vector` is `std.collections.vector` · `base_source` is [`mach.base.source`](base/source.md) · `compile` is [`mach.compile`](compile.md) · `ProjKey` is private · `intern` is [`mach.base.intern`](base/intern.md) · `RootRetainer` is private · `target_resolved` is [`mach.target.resolved`](target/resolved.md) · `request` is [`mach.compile.request`](compile/request.md) · `query` is [`mach.session.query`](session/query.md) · `report_phase` is [`mach.report.phase`](report/phase.md) · `AnalysisTarget` is private · `diagnostic` is [`mach.base.diagnostic`](base/diagnostic.md) · `AnalysisSource` is private · `ast` is [`mach.front.ast`](front/ast.md) · `resolve` is [`mach.front.resolve`](front/resolve.md) · `sema_product` is [`mach.front.sema.product`](front/sema/product.md)</sub>
+Uses types from [`mach.base.diagnostic`](base/diagnostic.md), [`mach.base.fail`](base/fail.md), [`mach.base.intern`](base/intern.md), [`mach.base.source`](base/source.md), [`mach.compile`](compile.md), [`mach.compile.project`](compile/project.md), [`mach.compile.request`](compile/request.md), [`mach.front.ast`](front/ast.md), [`mach.front.resolve`](front/resolve.md), [`mach.front.sema.product`](front/sema/product.md), [`mach.report.phase`](report/phase.md), [`mach.session`](session.md), [`mach.session.query`](session/query.md), [`mach.target.resolved`](target/resolved.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -77,26 +77,26 @@ it built.
 
 ```mach
 pub rec EditorSession {
-    s:                 *session.Session;
-    alloc:             *A.Allocator;
+    s:                 *mach.session.Session;
+    alloc:             *std.allocator.Allocator;
     buffers:           *Buffer;
     buf_len:           u32;
     view_generation:   u64;
     active_request:    *AnalysisRequest;
-    operation_failure: opt[fail.Fail];
+    operation_failure: opt[mach.base.fail.Fail];
 
-    proj_arena:      arena.Arena;
-    proj_alloc:      A.Allocator;
+    proj_arena:      std.allocator.arena.Arena;
+    proj_alloc:      std.allocator.Allocator;
     proj_loaded:     bool;
-    proj:            project.Project;
+    proj:            mach.compile.project.Project;
     proj_root:       str;
     proj_dirty:      bool; # the closure itself is stale: a reload is due
-    proj_edited:     collections_vector.Vector[base_source.FileId]; # buffers whose text changed since the project loaded
+    proj_edited:     std.collections.vector.Vector[mach.base.source.FileId]; # buffers whose text changed since the project loaded
     proj_loads:      u64; # closure loads performed, so a caller can see a reload happen
     proj_refreshes:  u64; # in-place refreshes performed, so a caller can see an edit stay cheap
-    proj_phase:      compile.FrontendPhase;
+    proj_phase:      mach.compile.FrontendPhase;
     proj_key:        ProjKey;
-    proj_roots:      *intern.StrId;
+    proj_roots:      *mach.base.intern.StrId;
     proj_root_count: u32;
     proj_root_cap:   u32;
 
@@ -109,7 +109,7 @@ one serial facade over a borrowed session, with compact open-buffer slots
 ### analyze
 
 ```mach
-pub fun analyze(es: *EditorSession, req: *AnalysisRequest) res[AnalysisResult, fail.Fail]
+pub fun analyze(es: *EditorSession, req: *AnalysisRequest) res[AnalysisResult, mach.base.fail.Fail]
 ```
 
 run the frontend over an open buffer to the requested phase. ok means the owned envelope
@@ -128,7 +128,7 @@ by the editor session, released with fail_dnit
 ### init
 
 ```mach
-pub fun init(s: *session.Session) EditorSession
+pub fun init(s: *mach.session.Session) EditorSession
 ```
 
 an editor facade over a caller-owned Session, borrowed for serial use; neither may move
@@ -142,7 +142,7 @@ down with dnit before the Session
 ### open
 
 ```mach
-pub fun open(es: *EditorSession, path: str, text: str) res[base_source.FileId, fail.Fail]
+pub fun open(es: *EditorSession, path: str, text: str) res[mach.base.source.FileId, mach.base.fail.Fail]
 ```
 
 register a buffer's text under a path and return its FileId
@@ -159,7 +159,7 @@ project load reads the buffer instead of the file on disk; marks the project dir
 ### update
 
 ```mach
-pub fun update(es: *EditorSession, fid: base_source.FileId, text: str) res[bool, fail.Fail]
+pub fun update(es: *EditorSession, fid: mach.base.source.FileId, text: str) res[bool, mach.base.fail.Fail]
 ```
 
 replace an open buffer's text and drop its cached analysis
@@ -174,7 +174,7 @@ replace an open buffer's text and drop its cached analysis
 ### dnit
 
 ```mach
-pub fun dnit(es: *EditorSession) err[fail.Fail]
+pub fun dnit(es: *EditorSession) err[mach.base.fail.Fail]
 ```
 
 retire every editor-owned input together and free the editor's structural state.
@@ -189,7 +189,7 @@ destroy the Session only after this succeeds; there is no separate close-all
 ### fail_dnit
 
 ```mach
-pub fun fail_dnit(es: *EditorSession, f: *fail.Fail)
+pub fun fail_dnit(es: *EditorSession, f: *mach.base.fail.Fail)
 ```
 
 release an operational failure returned by analyze or build
@@ -203,11 +203,11 @@ release an operational failure returned by analyze or build
 
 ```mach
 pub rec AnalysisRequest {
-    file:              base_source.FileId;
-    phase:             compile.FrontendPhase;
+    file:              mach.base.source.FileId;
+    phase:             mach.compile.FrontendPhase;
     selection:         ProjectSelection;
-    standalone_target: *target_resolved.Target;
-    standalone_build:  request.BuildRequest;
+    standalone_target: *mach.target.resolved.Target;
+    standalone_build:  mach.compile.request.BuildRequest;
 }
 ```
 
@@ -215,16 +215,16 @@ what one analyze call asks for
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `file` | `base_source.FileId` | an open buffer's FileId, the root of the analysis |
-| `phase` | `compile.FrontendPhase` | how far the frontend runs, compile.FRONTEND_PARSE, compile.FRONTEND_RESOLVE or compile.FRONTEND_SEMA |
+| `file` | `mach.base.source.FileId` | an open buffer's FileId, the root of the analysis |
+| `phase` | `mach.compile.FrontendPhase` | how far the frontend runs, compile.FRONTEND_PARSE, compile.FRONTEND_RESOLVE or compile.FRONTEND_SEMA |
 | `selection` | `ProjectSelection` | the overrides of mach's selection for a file under a project's src, empty for none; its request is composed from the manifest as a project snapshot's is |
-| `standalone_target` | `*target_resolved.Target` | for a file under no manifest, a borrowed resolved target; nil selects the host target. a project's target selection is never replaced by it |
-| `standalone_build` | `request.BuildRequest` | for a file under no manifest, the options it is analyzed with, since no profile composes them; a project's are never taken from it |
+| `standalone_target` | `*mach.target.resolved.Target` | for a file under no manifest, a borrowed resolved target; nil selects the host target. a project's target selection is never replaced by it |
+| `standalone_build` | `mach.compile.request.BuildRequest` | for a file under no manifest, the options it is analyzed with, since no profile composes them; a project's are never taken from it |
 
 ### analysis_request
 
 ```mach
-pub fun analysis_request(file: base_source.FileId, phase: compile.FrontendPhase) AnalysisRequest
+pub fun analysis_request(file: mach.base.source.FileId, phase: mach.compile.FrontendPhase) AnalysisRequest
 ```
 
 a request for one buffer at one phase on mach's own selection
@@ -233,28 +233,28 @@ a request for one buffer at one phase on mach's own selection
 
 ```mach
 pub rec AnalysisResult {
-    alloc:              *A.Allocator;
+    alloc:              *std.allocator.Allocator;
     editor:             *EditorSession;
-    session:            *session.Session;
+    session:            *mach.session.Session;
     view_generation:    u64;
     session_generation: u64;
     query_operation:    u64;
-    query_revision:     query.Revision;
-    file:               base_source.FileId;
+    query_revision:     mach.session.query.Revision;
+    file:               mach.base.source.FileId;
     source_revision:    u64;
-    phase:              compile.FrontendPhase;
-    status:             report_phase.PhaseStatus;
-    failure:            opt[fail.Fail];
+    phase:              mach.compile.FrontendPhase;
+    status:             mach.report.phase.PhaseStatus;
+    failure:            opt[mach.base.fail.Fail];
     target:             AnalysisTarget;
     target_available:   bool;
-    configuration:      query.QueryOutput;
+    configuration:      mach.session.query.QueryOutput;
     project_root:       str;
     profile:            str;
     message:            str;
-    diagnostics:        *diagnostic.DiagnosticStore;
+    diagnostics:        *mach.base.diagnostic.DiagnosticStore;
     sources:            Vector[AnalysisSource];
-    tree:               *ast.Ast;
-    names:              *intern.Interner;
+    tree:               *mach.front.ast.Ast;
+    names:              *mach.base.intern.Interner;
 }
 ```
 
@@ -265,15 +265,15 @@ taken in. release exactly once with analysis_dnit, never copy it as a second own
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `alloc` | `*A.Allocator` | owns every field below; must outlive the result |
-| `status` | `report_phase.PhaseStatus` | the phase's standing, accepted, rejected or internal; diagnostic counts never decide it |
-| `failure` | `opt[fail.Fail]` | an operational project failure with its fail.Fail category, absent when the frontend ran |
+| `alloc` | `*std.allocator.Allocator` | owns every field below; must outlive the result |
+| `status` | `mach.report.phase.PhaseStatus` | the phase's standing, accepted, rejected or internal; diagnostic counts never decide it |
+| `failure` | `opt[mach.base.fail.Fail]` | an operational project failure with its fail.Fail category, absent when the frontend ran |
 | `target` | `AnalysisTarget` | the target metadata the analysis ran under, read only when target_available |
 | `target_available` | `bool` | false when the requested target context was not acquired; host metadata is never substituted |
-| `diagnostics` | `*diagnostic.DiagnosticStore` | the owned store, with related locations, fix edits and lost-diagnostic evidence |
+| `diagnostics` | `*mach.base.diagnostic.DiagnosticStore` | the owned store, with related locations, fix edits and lost-diagnostic evidence |
 | `sources` | `Vector[AnalysisSource]` | the owned source versions every diagnostic location refers to; analysis_source finds one by FileId |
-| `tree` | `*ast.Ast` | the owned tree of a parse_text result; nil for an analysis of a buffer |
-| `names` | `*intern.Interner` | the owned interner the names of a parse_text result's tree are ids in; nil for an analysis of a buffer, whose tree's names are its session's |
+| `tree` | `*mach.front.ast.Ast` | the owned tree of a parse_text result; nil for an analysis of a buffer |
+| `names` | `*mach.base.intern.Interner` | the owned interner the names of a parse_text result's tree are ids in; nil for an analysis of a buffer, whose tree's names are its session's |
 
 ### analysis_dnit
 
@@ -292,7 +292,7 @@ tokenize must be freed before it because its bytes borrow the result's source
 ### ast_of
 
 ```mach
-pub fun ast_of(result: *AnalysisResult) res[*ast.Ast, fail.Fail]
+pub fun ast_of(result: *AnalysisResult) res[*mach.front.ast.Ast, mach.base.fail.Fail]
 ```
 
 the AST of the analyzed buffer. raw products borrow the current serial view: a later
@@ -310,7 +310,7 @@ reached only by mach-lsp
 ### resolve_of
 
 ```mach
-pub fun resolve_of(result: *AnalysisResult) res[*resolve.ResolveResult, fail.Fail]
+pub fun resolve_of(result: *AnalysisResult) res[*mach.front.resolve.ResolveResult, mach.base.fail.Fail]
 ```
 
 the resolve product, under ast_of's view rules; the phase must be at least
@@ -325,7 +325,7 @@ reached only by mach-lsp
 ### sema_of
 
 ```mach
-pub fun sema_of(result: *AnalysisResult) res[*sema_product.SemaResult, fail.Fail]
+pub fun sema_of(result: *AnalysisResult) res[*mach.front.sema.product.SemaResult, mach.base.fail.Fail]
 ```
 
 the sema product, under ast_of's view rules; the phase must be driver.FRONTEND_SEMA
@@ -338,7 +338,7 @@ reached only by mach-lsp
 ### parse_text
 
 ```mach
-pub fun parse_text(alloc: *A.Allocator, text: str) res[AnalysisResult, fail.Fail]
+pub fun parse_text(alloc: *std.allocator.Allocator, text: str) res[AnalysisResult, mach.base.fail.Fail]
 ```
 
 parse a text on its own, with no buffer, project or session: the text is copied into the
@@ -358,7 +358,7 @@ reached only by mach-lsp
 ### same_shape
 
 ```mach
-pub fun same_shape(x: *AnalysisResult, y: *AnalysisResult) res[bool, fail.Fail]
+pub fun same_shape(x: *AnalysisResult, y: *AnalysisResult) res[bool, mach.base.fail.Fail]
 ```
 
 whether two results' trees have the same shape, as ast.same_shape compares them
@@ -405,7 +405,7 @@ reached only by mach-lsp
 ```mach
 pub rec ProjectRequest {
     root:         str;
-    phase:        compile.FrontendPhase;
+    phase:        mach.compile.FrontendPhase;
     selection:    ProjectSelection;
     buffers:      *ProjectBuffer;
     buffer_count: u32;
@@ -419,7 +419,7 @@ reached only by mach-lsp
 | Field | Type | |
 | :--- | :--- | :--- |
 | `root` | `str` | the project's directory, the one holding its mach.toml |
-| `phase` | `compile.FrontendPhase` | how far the frontend runs, compile.FRONTEND_PARSE, compile.FRONTEND_RESOLVE or compile.FRONTEND_SEMA |
+| `phase` | `mach.compile.FrontendPhase` | how far the frontend runs, compile.FRONTEND_PARSE, compile.FRONTEND_RESOLVE or compile.FRONTEND_SEMA |
 | `selection` | `ProjectSelection` | the overrides of mach's selection, empty for none |
 | `buffers` | `*ProjectBuffer` | the open buffers, nil with buffer_count 0 |
 | `buffer_count` | `u32` | how many buffers |
@@ -427,7 +427,7 @@ reached only by mach-lsp
 ### project_request
 
 ```mach
-pub fun project_request(root: str, phase: compile.FrontendPhase) ProjectRequest
+pub fun project_request(root: str, phase: mach.compile.FrontendPhase) ProjectRequest
 ```
 
 a request for the project at `root` to `phase`, on mach's own selection and with no buffers
@@ -436,7 +436,7 @@ reached only by mach-lsp
 ### project_init
 
 ```mach
-pub fun project_init(s: *session.Session, req: *ProjectRequest) res[ProjectSnapshot, fail.Fail]
+pub fun project_init(s: *mach.session.Session, req: *ProjectRequest) res[ProjectSnapshot, mach.base.fail.Fail]
 ```
 
 analyze the project at a root on the cell mach selects for it, over the union of its artifacts,
@@ -458,18 +458,18 @@ reached only by mach-lsp
 
 ```mach
 pub rec ProjectSnapshot {
-    alloc:           *A.Allocator;
-    session:         *session.Session;
-    phase:           compile.FrontendPhase;
+    alloc:           *std.allocator.Allocator;
+    session:         *mach.session.Session;
+    phase:           mach.compile.FrontendPhase;
     loaded:          bool;
-    project:         project.Project;
+    project:         mach.compile.project.Project;
     overlays:        Vector[str];
     query_operation: u64;
-    query_revision:  query.Revision;
-    status:          report_phase.PhaseStatus;
-    failure:         opt[fail.Fail];
+    query_revision:  mach.session.query.Revision;
+    status:          mach.report.phase.PhaseStatus;
+    failure:         opt[mach.base.fail.Fail];
     message:         str;
-    diagnostics:     *diagnostic.DiagnosticStore;
+    diagnostics:     *mach.base.diagnostic.DiagnosticStore;
     sources:         Vector[AnalysisSource];
     root:            str;
     key:             ProjKey;
@@ -484,14 +484,14 @@ reached only by mach-lsp
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `alloc` | `*A.Allocator` | the Session's allocator, which owns every field below |
-| `session` | `*session.Session` | the Session the snapshot was opened in and whose overlays it holds |
-| `phase` | `compile.FrontendPhase` | the phase it was opened to |
+| `alloc` | `*std.allocator.Allocator` | the Session's allocator, which owns every field below |
+| `session` | `*mach.session.Session` | the Session the snapshot was opened in and whose overlays it holds |
+| `phase` | `mach.compile.FrontendPhase` | the phase it was opened to |
 | `loaded` | `bool` | whether `project` holds a project; false when the project could not be loaded |
-| `status` | `report_phase.PhaseStatus` | the frontend's standing over every module, accepted, rejected or internal |
-| `failure` | `opt[fail.Fail]` | the operational failure that kept the project from loading, absent when it loaded |
+| `status` | `mach.report.phase.PhaseStatus` | the frontend's standing over every module, accepted, rejected or internal |
+| `failure` | `opt[mach.base.fail.Fail]` | the operational failure that kept the project from loading, absent when it loaded |
 | `message` | `str` | the failure's text, or the internal standing's, "" for neither |
-| `diagnostics` | `*diagnostic.DiagnosticStore` | the owned store, with related locations, fix edits and lost-diagnostic evidence |
+| `diagnostics` | `*mach.base.diagnostic.DiagnosticStore` | the owned store, with related locations, fix edits and lost-diagnostic evidence |
 | `sources` | `Vector[AnalysisSource]` | the owned source versions every diagnostic location refers to |
 | `root` | `str` | the owned copy of the request's root, which the loaded project's request borrows |
 | `key` | `ProjKey` | the owned copies of the request's selection strings, which the loaded project borrows |
@@ -499,7 +499,7 @@ reached only by mach-lsp
 ### project_dnit
 
 ```mach
-pub fun project_dnit(snap: *ProjectSnapshot) err[fail.Fail]
+pub fun project_dnit(snap: *ProjectSnapshot) err[mach.base.fail.Fail]
 ```
 
 release a snapshot: its project, the overlays it set on its Session and everything it owns. a
@@ -540,7 +540,7 @@ reached only by mach-lsp
 ### project_module_fqn
 
 ```mach
-pub fun project_module_fqn(snap: *ProjectSnapshot, index: u32) res[str, fail.Fail]
+pub fun project_module_fqn(snap: *ProjectSnapshot, index: u32) res[str, mach.base.fail.Fail]
 ```
 
 a module's fully qualified name, borrowed from the snapshot's Session
@@ -549,7 +549,7 @@ reached only by mach-lsp
 ### project_module_file
 
 ```mach
-pub fun project_module_file(snap: *ProjectSnapshot, index: u32) res[base_source.FileId, fail.Fail]
+pub fun project_module_file(snap: *ProjectSnapshot, index: u32) res[mach.base.source.FileId, mach.base.fail.Fail]
 ```
 
 the source file a module was read from, whose version the snapshot analyzed
@@ -558,7 +558,7 @@ reached only by mach-lsp
 ### project_ast_of
 
 ```mach
-pub fun project_ast_of(snap: *ProjectSnapshot, index: u32) res[*ast.Ast, fail.Fail]
+pub fun project_ast_of(snap: *ProjectSnapshot, index: u32) res[*mach.front.ast.Ast, mach.base.fail.Fail]
 ```
 
 a module's AST, under ast_of's rules over the snapshot's Session; nil when the module has none
@@ -567,7 +567,7 @@ reached only by mach-lsp
 ### project_resolve_of
 
 ```mach
-pub fun project_resolve_of(snap: *ProjectSnapshot, index: u32) res[*resolve.ResolveResult, fail.Fail]
+pub fun project_resolve_of(snap: *ProjectSnapshot, index: u32) res[*mach.front.resolve.ResolveResult, mach.base.fail.Fail]
 ```
 
 a module's resolve product, under resolve_of's rules; nil when the module did not reach resolution
@@ -576,7 +576,7 @@ reached only by mach-lsp
 ### project_sema_of
 
 ```mach
-pub fun project_sema_of(snap: *ProjectSnapshot, index: u32) res[*sema_product.SemaResult, fail.Fail]
+pub fun project_sema_of(snap: *ProjectSnapshot, index: u32) res[*mach.front.sema.product.SemaResult, mach.base.fail.Fail]
 ```
 
 a module's sema product, under sema_of's rules; nil when the module was not type checked
@@ -585,7 +585,7 @@ reached only by mach-lsp
 ### project_module_status
 
 ```mach
-pub fun project_module_status(snap: *ProjectSnapshot, index: u32) res[report_phase.PhaseStatus, fail.Fail]
+pub fun project_module_status(snap: *ProjectSnapshot, index: u32) res[mach.report.phase.PhaseStatus, mach.base.fail.Fail]
 ```
 
 a module's own phase standing, as the snapshot's analysis left it
@@ -594,7 +594,7 @@ reached only by mach-lsp
 ### project_module_is_root
 
 ```mach
-pub fun project_module_is_root(snap: *ProjectSnapshot, index: u32) res[bool, fail.Fail]
+pub fun project_module_is_root(snap: *ProjectSnapshot, index: u32) res[bool, mach.base.fail.Fail]
 ```
 
 whether a module belongs to the project the snapshot was opened for, not to one of its dependencies
@@ -605,7 +605,7 @@ reached only by mach-lsp
 ### is_identifier
 
 ```mach
-pub fun is_identifier(alloc: *A.Allocator, text: str) res[bool, fail.Fail]
+pub fun is_identifier(alloc: *std.allocator.Allocator, text: str) res[bool, mach.base.fail.Fail]
 ```
 
 whether a text is exactly one identifier token, as the lexer reads it standalone

@@ -7,9 +7,9 @@ the decoding of the `[dep.<name>]` tables
 a dependency names exactly one source, `git` or `path`. a git dependency selects by
 `ref` or by a `version` range, never both, and no dependency may share the project's id.
 
-<sub>source: [`src/manifest/dep.mach`](../../../src/manifest/dep.mach) · imported by 1 module</sub>
+Source: [`src/manifest/dep.mach`](../../../src/manifest/dep.mach)
 
-<sub>`A` is `std.allocator` · `intern` is [`mach.base.intern`](../base/intern.md) · `toml_value` is `toml.value` · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md).
 
 | Functions | |
 | :--- | :--- |
@@ -22,6 +22,6 @@ a dependency names exactly one source, `git` or `path`. a git dependency selects
 ### parse_deps
 
 ```mach
-pub fun parse_deps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail]
+pub fun parse_deps(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, t: *toml.value.Table, m: *Manifest) err[mach.base.fail.Fail]
 ```
 

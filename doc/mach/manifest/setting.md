@@ -6,9 +6,9 @@
 and its value are read by the rows and decoders that read the key in a manifest, so a value
 `--set` gives is held to every rule the key keeps in mach.toml
 
-<sub>source: [`src/manifest/setting.mach`](../../../src/manifest/setting.mach) · imported by 2 modules</sub>
+Source: [`src/manifest/setting.mach`](../../../src/manifest/setting.mach)
 
-<sub>`A` is `std.allocator` · `intern` is [`mach.base.intern`](../base/intern.md) · `base_source` is [`mach.base.source`](../base/source.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -39,8 +39,8 @@ one `--set <key>=<value>`, split at its first `=`
 ### apply
 
 ```mach
-pub fun apply(alloc: *A.Allocator, itn: *intern.Interner, sources: *base_source.SourceMap, m: *Manifest, list: *Assignment,
-    n: usize) err[fail.Fail]
+pub fun apply(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, sources: *mach.base.source.SourceMap, m: *Manifest, list: *Assignment,
+    n: usize) err[mach.base.fail.Fail]
 ```
 
 write each assignment over every table of its key's section in `m`, in order, so a later

@@ -4,9 +4,7 @@
 
 collected tests, the result of each run and the tally over a run's results
 
-<sub>source: [`src/report/testrun.mach`](../../../src/report/testrun.mach) · imported by 6 modules</sub>
-
-<sub>`A` is `std.allocator`</sub>
+Source: [`src/report/testrun.mach`](../../../src/report/testrun.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -18,15 +16,15 @@ collected tests, the result of each run and the tally over a run's results
 
 | On `GateResultKind` | |
 | :--- | :--- |
-| [`RESULT_PASS`](#gateresultkind) · [`RESULT_SEMANTIC_MISMATCH`](#gateresultkind) · [`RESULT_TOOL_UNAVAILABLE`](#gateresultkind) · [`RESULT_INFRASTRUCTURE_FAILURE`](#gateresultkind) · [`RESULT_RESOURCE_EXHAUSTION`](#gateresultkind) · [`RESULT_SKIP`](#gateresultkind) · [`gate_result`](#gate_result) | |
+| [`RESULT_PASS`](#gateresultkind), [`RESULT_SEMANTIC_MISMATCH`](#gateresultkind), [`RESULT_TOOL_UNAVAILABLE`](#gateresultkind), [`RESULT_INFRASTRUCTURE_FAILURE`](#gateresultkind), [`RESULT_RESOURCE_EXHAUSTION`](#gateresultkind), [`RESULT_SKIP`](#gateresultkind), [`gate_result`](#gate_result) | |
 
 | On `GateCause` | |
 | :--- | :--- |
-| [`CAUSE_PASS`](#gatecause) · [`CAUSE_ORACLE_TIMEOUT`](#gatecause) · [`CAUSE_ORACLE_SPAWN_FAILURE`](#gatecause) · [`CAUSE_ORACLE_CAPTURE`](#gatecause) · [`CAUSE_ORACLE_SIGNAL`](#gatecause) · [`CAUSE_ORACLE_EXIT`](#gatecause) · [`CAUSE_INVALID_TERMINAL`](#gatecause) · [`CAUSE_SKIP`](#gatecause) | |
+| [`CAUSE_PASS`](#gatecause), [`CAUSE_ORACLE_TIMEOUT`](#gatecause), [`CAUSE_ORACLE_SPAWN_FAILURE`](#gatecause), [`CAUSE_ORACLE_CAPTURE`](#gatecause), [`CAUSE_ORACLE_SIGNAL`](#gatecause), [`CAUSE_ORACLE_EXIT`](#gatecause), [`CAUSE_INVALID_TERMINAL`](#gatecause), [`CAUSE_SKIP`](#gatecause) | |
 
 | On `GateTally` | |
 | :--- | :--- |
-| [`gate_tally_init`](#gate_tally_init) · [`record_gate`](#record_gate) | |
+| [`gate_tally_init`](#gate_tally_init), [`record_gate`](#record_gate) | |
 
 | Constants | |
 | :--- | :--- |
@@ -127,13 +125,13 @@ pub rec GateTally {
 ### gate_tally_init
 
 ```mach
-pub fun gate_tally_init(a: *A.Allocator) GateTally
+pub fun gate_tally_init(a: *std.allocator.Allocator) GateTally
 ```
 
 ### record_gate
 
 ```mach
-pub fun record_gate(gt: *GateTally, a: *A.Allocator, r: GateResult) err[A.Error]
+pub fun record_gate(gt: *GateTally, a: *std.allocator.Allocator, r: GateResult) err[std.allocator.Error]
 ```
 
 ## Constants

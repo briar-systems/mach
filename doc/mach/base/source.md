@@ -8,9 +8,9 @@ a file is written once into a slot that never moves, so a `*SourceFile` stays va
 map is released, and reloading or releasing its text bumps its revision in place. a location is
 a span of one file, or nowhere when its file is FILE_NIL.
 
-<sub>source: [`src/base/source.mach`](../../../src/base/source.mach) · imported by 115 modules</sub>
+Source: [`src/base/source.mach`](../../../src/base/source.mach)
 
-<sub>`A` is `std.allocator` · `handle` is [`mach.base.handle`](handle.md) · `intern` is [`mach.base.intern`](intern.md) · `map` is `std.collections.map`</sub>
+Uses types from [`mach.base.handle`](handle.md), [`mach.base.intern`](intern.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -28,7 +28,7 @@ a span of one file, or nowhere when its file is FILE_NIL.
 | :--- | :--- |
 | [`FILE_NIL`](#fileid) | no source: an unlocated diagnostic, or a node the build synthesized |
 | [`FILE_PENDING`](#fileid) | a span whose file is not known yet: a reader that meets its spans before it knows the file they are in places them once it does |
-| [`file_id`](#file_id) · [`file_index`](#file_index) · [`file_same`](#file_same) · [`file_is_nil`](#file_is_nil) · [`location`](#location) | |
+| [`file_id`](#file_id), [`file_index`](#file_index), [`file_same`](#file_same), [`file_is_nil`](#file_is_nil), [`location`](#location) | |
 
 | On `Span` | |
 | :--- | :--- |
@@ -56,7 +56,7 @@ a span of one file, or nowhere when its file is FILE_NIL.
 
 | On `SourceFile` | |
 | :--- | :--- |
-| [`copy_file`](#copy_file) · [`dnit_file`](#dnit_file) | |
+| [`copy_file`](#copy_file), [`dnit_file`](#dnit_file) | |
 | [`position`](#position-1) | the line and column of `offset` in the file; an offset past the end is placed at the end |
 | [`line_start`](#line_start) | the offset line `line` (from 1) starts at |
 | [`offset_of`](#offset_of) | the offset of `at` in the file, none for a line it does not hold; a column past the line stays where it falls |
@@ -248,7 +248,7 @@ at a line break as line_break_len reads it
 ### lines_init
 
 ```mach
-pub fun lines_init(a: *A.Allocator, data: *u8, n: usize) res[Lines, A.Error]
+pub fun lines_init(a: *std.allocator.Allocator, data: *u8, n: usize) res[Lines, std.allocator.Error]
 ```
 
 the line index of the `n` bytes at `data`; released with `lines_dnit`. a break is `\n`, `\r\n` or a
@@ -257,7 +257,7 @@ lone `\r`, as line_break_len reads it
 ### lines_dnit
 
 ```mach
-pub fun lines_dnit(a: *A.Allocator, l: *Lines)
+pub fun lines_dnit(a: *std.allocator.Allocator, l: *Lines)
 ```
 
 ### lines_position
@@ -272,8 +272,8 @@ the line and column of `offset`, clamped to the text's end
 
 ```mach
 pub tag Error: u8 {
-    alloc: A.Error;
-    store: handle.Error;
+    alloc: std.allocator.Error;
+    store: mach.base.handle.Error;
     exhausted;
     revision;
     absent;
@@ -308,13 +308,13 @@ pub rec SourceFile {
 ### copy_file
 
 ```mach
-pub fun copy_file(file: *SourceFile, a: *A.Allocator) res[SourceFile, Error]
+pub fun copy_file(file: *SourceFile, a: *std.allocator.Allocator) res[SourceFile, Error]
 ```
 
 ### dnit_file
 
 ```mach
-pub fun dnit_file(file: *SourceFile, a: *A.Allocator)
+pub fun dnit_file(file: *SourceFile, a: *std.allocator.Allocator)
 ```
 
 ### position
@@ -355,10 +355,10 @@ the bytes of line `line` (from 1) without its line ending
 
 ```mach
 pub rec SourceMap {
-    a:       *A.Allocator;
-    files:   handle.StableChunks[SourceFile];
-    paths:   intern.Interner;
-    by_path: map.Map[intern.StrId, FileId];
+    a:       *std.allocator.Allocator;
+    files:   mach.base.handle.StableChunks[SourceFile];
+    paths:   mach.base.intern.Interner;
+    by_path: std.collections.map.Map[mach.base.intern.StrId, FileId];
 }
 ```
 
@@ -375,7 +375,7 @@ interner, so every session that shares it finds a file by the same path
 ### init
 
 ```mach
-pub fun init(a: *A.Allocator) SourceMap
+pub fun init(a: *std.allocator.Allocator) SourceMap
 ```
 
 ### dnit
@@ -465,11 +465,11 @@ whether the payload behind it changed
 pub rec PreparedLoad {
     owner:     *SourceMap;
     id:        FileId;
-    key:       intern.StrId;
+    key:       mach.base.intern.StrId;
     file:      SourceFile;
     changed:   bool;
     new_entry: bool;
-    editor:    handle.ChunkEditor[SourceFile];
+    editor:    mach.base.handle.ChunkEditor[SourceFile];
 }
 ```
 

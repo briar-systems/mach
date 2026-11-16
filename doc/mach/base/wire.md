@@ -15,9 +15,9 @@ by measuring first), grows storage it owns, or feeds a sha-256 digest, and
 a format writes the same sequence to each. a source reads a bounded span and
 never reads past it.
 
-<sub>source: [`src/base/wire.mach`](../../../src/base/wire.mach) · imported by 20 modules</sub>
+Source: [`src/base/wire.mach`](../../../src/base/wire.mach)
 
-<sub>`binary` is `std.encoding.binary` · `sha256` is `crypto.hash.sha256` · `fail` is [`mach.base.fail`](fail.md) · `A` is `std.allocator`</sub>
+Uses types from [`mach.base.fail`](fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -39,7 +39,7 @@ never reads past it.
 | [`refuse`](#refuse) | fail the sink with `f` unless it already failed |
 | [`failure`](#failure) | |
 | [`bytes`](#bytes) | the bytes a fixed or grown sink holds |
-| [`put_bytes`](#put_bytes) · [`put_u8`](#put_u8) · [`put_u16`](#put_u16) · [`put_u32`](#put_u32) · [`put_u64`](#put_u64) · [`put_unsigned`](#put_unsigned) · [`put_signed`](#put_signed) | |
+| [`put_bytes`](#put_bytes), [`put_u8`](#put_u8), [`put_u16`](#put_u16), [`put_u32`](#put_u32), [`put_u64`](#put_u64), [`put_unsigned`](#put_unsigned), [`put_signed`](#put_signed) | |
 | [`patch_u32`](#patch_u32) | overwrite the u32 at `at`, already put, as a format fills a length it only knows once the rest is put; a measuring sink has nothing to overwrite |
 | [`put_sized`](#put_sized) | a byte run's u32 length, then its bytes |
 | [`take`](#take) | hand off a grown sink's bytes, exactly its length, owned by the caller in the sink's allocator; nil when it holds none |
@@ -53,7 +53,7 @@ never reads past it.
 | [`done`](#done) | whether every read succeeded and consumed the whole span |
 | [`take_bytes`](#take_bytes) | the next `n` bytes in place, nil when fewer remain |
 | [`take_into`](#take_into) | copy the next `n` bytes into dst |
-| [`take_u8`](#take_u8) · [`take_u32`](#take_u32) · [`take_u64`](#take_u64) | |
+| [`take_u8`](#take_u8), [`take_u32`](#take_u32), [`take_u64`](#take_u64) | |
 | [`take_count`](#take_count) | a u32 count whose entries, at least `min` bytes each, fit in what remains |
 | [`take_sized`](#take_sized) | a byte run's u32 length then its bytes in place; the length in `out_len` |
 
@@ -78,12 +78,12 @@ pub rec Sink {
     to:      Destination;
     storage: *u8;
     cap:     usize;
-    grown:   binary.Encoder;
-    state:   sha256.State;
+    grown:   std.encoding.binary.Encoder;
+    state:   crypto.hash.sha256.State;
     # the bytes put so far
     len:     usize;
     failed:  bool;
-    failure: fail.Fail;
+    failure: mach.base.fail.Fail;
 }
 ```
 
@@ -107,7 +107,7 @@ that fails the sink
 ### grown
 
 ```mach
-pub fun grown(a: *A.Allocator) Sink
+pub fun grown(a: *std.allocator.Allocator) Sink
 ```
 
 a sink that writes into storage it grows in `a`, released by dnit or
@@ -130,7 +130,7 @@ pub fun dnit(s: *Sink)
 ### refuse
 
 ```mach
-pub fun refuse(s: *Sink, f: fail.Fail)
+pub fun refuse(s: *Sink, f: mach.base.fail.Fail)
 ```
 
 fail the sink with `f` unless it already failed
@@ -138,7 +138,7 @@ fail the sink with `f` unless it already failed
 ### failure
 
 ```mach
-pub fun failure(s: *Sink) opt[fail.Fail]
+pub fun failure(s: *Sink) opt[mach.base.fail.Fail]
 ```
 
 ### bytes
@@ -211,7 +211,7 @@ a byte run's u32 length, then its bytes
 ### take
 
 ```mach
-pub fun take(s: *Sink) res[*u8, fail.Fail]
+pub fun take(s: *Sink) res[*u8, mach.base.fail.Fail]
 ```
 
 hand off a grown sink's bytes, exactly its length, owned by the caller in

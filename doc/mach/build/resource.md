@@ -7,9 +7,9 @@ PE image's resource tree from: its icon's images and their group, its version
 information and its application manifest (Win32 RESOURCEHEADER, VS_VERSIONINFO,
 and the icon directory of an .ico file)
 
-<sub>source: [`src/build/resource.mach`](../../../src/build/resource.mach) · imported by 1 module</sub>
+Source: [`src/build/resource.mach`](../../../src/build/resource.mach)
 
-<sub>`A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -52,7 +52,7 @@ what an executable declares of its resources
 ### file_of
 
 ```mach
-pub fun file_of(a: *A.Allocator, d: *Declared) res[Sink, fail.Fail]
+pub fun file_of(a: *std.allocator.Allocator, d: *Declared) res[Sink, mach.base.fail.Fail]
 ```
 
 the resource file of what `d` declares, owned by the caller: the icon's images

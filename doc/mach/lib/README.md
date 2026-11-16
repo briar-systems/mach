@@ -2,9 +2,6 @@
 
 # mach.lib
 
-<sub>1 module</sub>
-
-| Module | |
-| :--- | :--- |
-| [`editor`](editor.md) | the editor library, the analysis surface mach-lsp builds on |
+the entry of the `editor` artifact, which keeps the analysis surface a language server
+builds on checked, documented and built
 

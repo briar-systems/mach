@@ -8,9 +8,9 @@ an `asm` block reaches mirl as inline assembly whose `{name}` substitutions are 
 bound to the slots of the locals they name. a `$each` is lowered once per element of the array
 value sema recorded for it.
 
-<sub>source: [`src/lower/stmt.mach`](../../../src/lower/stmt.mach) · imported by 1 module</sub>
+Source: [`src/lower/stmt.mach`](../../../src/lower/stmt.mach)
 
-<sub>`lower_context` is [`mach.lower.context`](context.md) · `ast_id` is [`mach.front.ast.id`](../front/ast/id.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.front.ast.id`](../front/ast/id.md), [`mach.lower.context`](context.md).
 
 | Functions | |
 | :--- | :--- |
@@ -23,6 +23,6 @@ value sema recorded for it.
 ### lower_stmt
 
 ```mach
-pub fun lower_stmt(ctx: *lower_context.LowerContext, sid: ast_id.StmtId) err[fail.Fail]
+pub fun lower_stmt(ctx: *mach.lower.context.LowerContext, sid: mach.front.ast.id.StmtId) err[mach.base.fail.Fail]
 ```
 

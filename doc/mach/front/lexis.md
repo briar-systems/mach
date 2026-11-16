@@ -4,18 +4,18 @@
 
 the reserved words and identifier characters the lexer, the parser and the migrator share
 
-<sub>source: [`src/front/lexis.mach`](../../../src/front/lexis.mach) · imported by 4 modules</sub>
+Source: [`src/front/lexis.mach`](../../../src/front/lexis.mach)
 
 | Functions | |
 | :--- | :--- |
 | [`is_keyword`](#is_keyword) | `text[0..len]` is a reserved word |
-| [`is_ident_start`](#is_ident_start) · [`is_ident_char`](#is_ident_char) | |
+| [`is_ident_start`](#is_ident_start), [`is_ident_char`](#is_ident_char) | |
 | [`is_identifier`](#is_identifier) | `text[0..len]` lexes as exactly one identifier token; keywords lex as identifiers too |
 
 | Constants | |
 | :--- | :--- |
 | [`KW_ASM`](#constants) | the reserved words: each lexes as an identifier and is refused as a name |
-| [`KW_BRK`](#constants) · [`KW_CNT`](#constants) · [`KW_DEF`](#constants) · [`KW_EACH`](#constants) · [`KW_ERROR`](#constants) · [`KW_EXT`](#constants) · [`KW_FIN`](#constants) · [`KW_FOR`](#constants) · [`KW_FUN`](#constants) · [`KW_FWD`](#constants) · [`KW_IF`](#constants) · [`KW_IN`](#constants) · [`KW_NIL`](#constants) · [`KW_OR`](#constants) · [`KW_PUB`](#constants) · [`KW_REC`](#constants) · [`KW_RET`](#constants) · [`KW_SEL`](#constants) · [`KW_TAG`](#constants) · [`KW_TEST`](#constants) · [`KW_UNI`](#constants) · [`KW_USE`](#constants) · [`KW_VAL`](#constants) · [`KW_VAR`](#constants) | |
+| [`KW_BRK`](#constants), [`KW_CNT`](#constants), [`KW_DEF`](#constants), [`KW_EACH`](#constants), [`KW_ERROR`](#constants), [`KW_EXT`](#constants), [`KW_FIN`](#constants), [`KW_FOR`](#constants), [`KW_FUN`](#constants), [`KW_FWD`](#constants), [`KW_IF`](#constants), [`KW_IN`](#constants), [`KW_NIL`](#constants), [`KW_OR`](#constants), [`KW_PUB`](#constants), [`KW_REC`](#constants), [`KW_RET`](#constants), [`KW_SEL`](#constants), [`KW_TAG`](#constants), [`KW_TEST`](#constants), [`KW_UNI`](#constants), [`KW_USE`](#constants), [`KW_VAL`](#constants), [`KW_VAR`](#constants) | |
 
 ---
 

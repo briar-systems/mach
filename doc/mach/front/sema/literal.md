@@ -4,9 +4,9 @@
 
 the checks over a typed module's literals: float precision, defaulted literals and shifts
 
-<sub>source: [`src/front/sema/literal.mach`](../../../../src/front/sema/literal.mach) · imported by 1 module</sub>
+Source: [`src/front/sema/literal.mach`](../../../../src/front/sema/literal.mach)
 
-<sub>`sema_context` is [`mach.front.sema.context`](context.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `type_kind` is [`mach.type.kind`](../../type/kind.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.sema.context`](context.md), [`mach.type.kind`](../../type/kind.md).
 
 | Functions | |
 | :--- | :--- |
@@ -22,7 +22,7 @@ the checks over a typed module's literals: float precision, defaulted literals a
 ### check_float_literals
 
 ```mach
-pub fun check_float_literals(sc: *sema_context.SemaContext)
+pub fun check_float_literals(sc: *mach.front.sema.context.SemaContext)
 ```
 
 the float literal rule at each literal's final type, once every body has been inferred
@@ -30,7 +30,7 @@ the float literal rule at each literal's final type, once every body has been in
 ### check_default_literals
 
 ```mach
-pub fun check_default_literals(sc: *sema_context.SemaContext) err[fail.Fail]
+pub fun check_default_literals(sc: *mach.front.sema.context.SemaContext) err[mach.base.fail.Fail]
 ```
 
 a literal its context did not type took the i64 default, where the range rule has
@@ -42,7 +42,7 @@ a refused one leaves its literals at the default, so they are marked inner all t
 ### check_literal_shifts
 
 ```mach
-pub fun check_literal_shifts(sc: *sema_context.SemaContext)
+pub fun check_literal_shifts(sc: *mach.front.sema.context.SemaContext)
 ```
 
 a shift of an untyped literal is typed by its context, so its count is checked
@@ -51,7 +51,7 @@ against that type's width once every body has been inferred
 ### check_instance_float_literals
 
 ```mach
-pub fun check_instance_float_literals(sc: *sema_context.SemaContext, generic: *type_kind.TypeId)
+pub fun check_instance_float_literals(sc: *mach.front.sema.context.SemaContext, generic: *mach.type.kind.TypeId)
 ```
 
 the rule for the literals an instance retypes: those its generic body left at a type

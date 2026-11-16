@@ -4,9 +4,9 @@
 
 what a type holds or reaches, each property a leaf predicate over the one type walk
 
-<sub>source: [`src/type/query/reach.mach`](../../../../src/type/query/reach.mach) · imported by 4 modules</sub>
+Source: [`src/type/query/reach.mach`](../../../../src/type/query/reach.mach)
 
-<sub>`session` is [`mach.session`](../../session.md) · `type_kind` is [`mach.type.kind`](../kind.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `type_query` is [`mach.type.query`](../query.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.session`](../../session.md), [`mach.type.kind`](../kind.md), [`mach.type.query`](../query.md).
 
 | Functions | |
 | :--- | :--- |
@@ -22,7 +22,7 @@ what a type holds or reaches, each property a leaf predicate over the one type w
 ### module_secret
 
 ```mach
-pub fun module_secret(s: *session.Session, resolved: *type_kind.TypeId, len: u32) res[bool, fail.Fail]
+pub fun module_secret(s: *mach.session.Session, resolved: *mach.type.kind.TypeId, len: u32) res[bool, mach.base.fail.Fail]
 ```
 
 whether any of a module's `len` resolved types reaches a secret
@@ -30,7 +30,7 @@ whether any of a module's `len` resolved types reaches a secret
 ### tag_value
 
 ```mach
-pub fun tag_value(s: *session.Session, tid: type_kind.TypeId) res[bool, fail.Fail]
+pub fun tag_value(s: *mach.session.Session, tid: mach.type.kind.TypeId) res[bool, mach.base.fail.Fail]
 ```
 
 whether `tid` holds a tag value in its own storage
@@ -38,7 +38,7 @@ whether `tid` holds a tag value in its own storage
 ### vector
 
 ```mach
-pub fun vector(q: *type_query.Query, tid: type_kind.TypeId) bool
+pub fun vector(q: *mach.type.query.Query, tid: mach.type.kind.TypeId) bool
 ```
 
 whether `tid` holds a vector in its own storage, with the field tables built so far
@@ -46,7 +46,7 @@ whether `tid` holds a vector in its own storage, with the field tables built so 
 ### generic_union
 
 ```mach
-pub fun generic_union(q: *type_query.Query, nominal: type_kind.TypeId) bool
+pub fun generic_union(q: *mach.type.query.Query, nominal: mach.type.kind.TypeId) bool
 ```
 
 whether a generic union is reachable from `nominal`, through any member, element,

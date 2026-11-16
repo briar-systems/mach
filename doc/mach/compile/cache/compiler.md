@@ -4,9 +4,7 @@
 
 the running compiler's identity: the sha-256 of its executable file, once per process
 
-<sub>source: [`src/compile/cache/compiler.mach`](../../../../src/compile/cache/compiler.mach) · imported by 2 modules</sub>
-
-<sub>`A` is `std.allocator`</sub>
+Source: [`src/compile/cache/compiler.mach`](../../../../src/compile/cache/compiler.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -43,7 +41,7 @@ pub fun identity_clear(id: *Identity)
 ### identity
 
 ```mach
-pub fun identity(alloc: *A.Allocator, out: *Identity) err[Error]
+pub fun identity(alloc: *std.allocator.Allocator, out: *Identity) err[Error]
 ```
 
 identifies the current executable, never argv[0], once per process, by the

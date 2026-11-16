@@ -7,9 +7,9 @@ the primitive types: their catalog, widths, names and integer ranges, and vector
 a kind is primitive exactly when the catalog names it, never by its place in the numbering. the
 vectors the type table seeds, and the lanes a name such as `u32x4` spells, are read here too.
 
-<sub>source: [`src/type/prim.mach`](../../../src/type/prim.mach) · imported by 22 modules</sub>
+Source: [`src/type/prim.mach`](../../../src/type/prim.mach)
 
-<sub>`wide` is [`mach.base.wide`](../base/wide.md) · `VecFormStatus` is private · `float` is [`mach.base.float`](../base/float.md)</sub>
+Uses types from [`mach.base.float`](../base/float.md), [`mach.base.wide`](../base/wide.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,7 +21,7 @@ vectors the type table seeds, and the lanes a name such as `u32x4` spells, are r
 
 | On `PrimClass` | |
 | :--- | :--- |
-| [`PRIM_CLASS_NONE`](#primclass) · [`PRIM_CLASS_INT`](#primclass) · [`PRIM_CLASS_FLOAT`](#primclass) · [`PRIM_CLASS_PTR`](#primclass) | |
+| [`PRIM_CLASS_NONE`](#primclass), [`PRIM_CLASS_INT`](#primclass), [`PRIM_CLASS_FLOAT`](#primclass), [`PRIM_CLASS_PTR`](#primclass) | |
 
 | On `PrimDesc` | |
 | :--- | :--- |
@@ -33,7 +33,7 @@ vectors the type table seeds, and the lanes a name such as `u32x4` spells, are r
 
 | On `IntRange` | |
 | :--- | :--- |
-| [`int_range`](#int_range) · [`int_fits`](#int_fits) | |
+| [`int_range`](#int_range), [`int_fits`](#int_fits) | |
 
 | On `VecForm` | |
 | :--- | :--- |
@@ -44,9 +44,9 @@ vectors the type table seeds, and the lanes a name such as `u32x4` spells, are r
 | [`is_prim`](#is_prim) | the primitive predicate: a kind is primitive exactly when the catalog names it, never because of where it sits in the TypeKind numbering |
 | [`prim_index`](#prim_index) | the catalog position of a primitive kind, the index of every table sized by PRIM_COUNT |
 | [`prim_kind_at`](#prim_kind_at) | the kind at a catalog position, for walkers over 0..PRIM_COUNT |
-| [`prim_name`](#prim_name) · [`prim_spelling_len`](#prim_spelling_len) | |
+| [`prim_name`](#prim_name), [`prim_spelling_len`](#prim_spelling_len) | |
 | [`int_kind_for`](#int_kind_for) | the integer primitive of a width and signedness, absent when the catalog has no such row; the one lookup every width-driven typing goes through |
-| [`prim_from_view`](#prim_from_view) · [`int_fits_either_sign`](#int_fits_either_sign) | |
+| [`prim_from_view`](#prim_from_view), [`int_fits_either_sign`](#int_fits_either_sign) | |
 | [`float_width_of`](#float_width_of) | the width of a float kind; FLOAT_W_NONE for every other kind |
 | [`float_kind_of`](#float_kind_of) | the float kind of a width, f64 for FLOAT_W_NONE, the unsuffixed default |
 | [`is_vector_spelling`](#is_vector_spelling) | |
@@ -55,9 +55,9 @@ vectors the type table seeds, and the lanes a name such as `u32x4` spells, are r
 | :--- | :--- |
 | [`PRIM_COUNT`](#constants) | |
 | [`VEC_COUNT`](#constants) | the vectors the type table seeds, by position below VEC_COUNT |
-| [`MAX_VEC_LANES`](#constants) · [`VEC_FORM_NONE`](#constants) · [`VEC_FORM_OK`](#constants) · [`VEC_FORM_TOO_WIDE`](#constants) | |
+| [`MAX_VEC_LANES`](#constants), [`VEC_FORM_NONE`](#constants), [`VEC_FORM_OK`](#constants), [`VEC_FORM_TOO_WIDE`](#constants) | |
 | [`VEC_FORM_BAD_ELEMENT`](#constants) | the element is a primitive no vector packs: a lane is 8 to 64 bits wide |
-| [`VEC_LANE_MIN_BITS`](#constants) · [`VEC_LANE_MAX_BITS`](#constants) | |
+| [`VEC_LANE_MIN_BITS`](#constants), [`VEC_LANE_MAX_BITS`](#constants) | |
 
 ---
 
@@ -116,8 +116,8 @@ pub fun vec_shape(index: u32) VecShape
 ```mach
 pub rec IntRange {
     min_negated: bool;
-    min_mag:     wide.Wide;
-    max_mag:     wide.Wide;
+    min_mag:     mach.base.wide.Wide;
+    max_mag:     mach.base.wide.Wide;
 }
 ```
 
@@ -133,7 +133,7 @@ pub fun int_range(kind: TypeKind) opt[IntRange]
 ### int_fits
 
 ```mach
-pub fun int_fits(value: wide.Wide, negated: bool, r: IntRange) bool
+pub fun int_fits(value: mach.base.wide.Wide, negated: bool, r: IntRange) bool
 ```
 
 ## VecForm
@@ -211,13 +211,13 @@ pub fun prim_from_view(name: View) opt[TypeKind]
 ### int_fits_either_sign
 
 ```mach
-pub fun int_fits_either_sign(value: wide.Wide, kind: TypeKind) bool
+pub fun int_fits_either_sign(value: mach.base.wide.Wide, kind: TypeKind) bool
 ```
 
 ### float_width_of
 
 ```mach
-pub fun float_width_of(kind: TypeKind) float.FloatWidth
+pub fun float_width_of(kind: TypeKind) mach.base.float.FloatWidth
 ```
 
 the width of a float kind; FLOAT_W_NONE for every other kind
@@ -225,7 +225,7 @@ the width of a float kind; FLOAT_W_NONE for every other kind
 ### float_kind_of
 
 ```mach
-pub fun float_kind_of(w: float.FloatWidth) TypeKind
+pub fun float_kind_of(w: mach.base.float.FloatWidth) TypeKind
 ```
 
 the float kind of a width, f64 for FLOAT_W_NONE, the unsuffixed default

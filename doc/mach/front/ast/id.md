@@ -8,7 +8,7 @@ each id is the index of its node in the table for its kind, with all ones as its
 are transparent `def` aliases of `u32`, so the compiler does not keep one kind of id from
 standing where another, or a bare integer, is meant.
 
-<sub>source: [`src/front/ast/id.mach`](../../../../src/front/ast/id.mach) · imported by 60 modules</sub>
+Source: [`src/front/ast/id.mach`](../../../../src/front/ast/id.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -20,23 +20,23 @@ standing where another, or a bare integer, is meant.
 
 | On `ExprId` | |
 | :--- | :--- |
-| [`EXPR_NIL`](#exprid) · [`expr`](#expr) · [`expr_index`](#expr_index) · [`expr_same`](#expr_same) · [`expr_is_nil`](#expr_is_nil) | |
+| [`EXPR_NIL`](#exprid), [`expr`](#expr), [`expr_index`](#expr_index), [`expr_same`](#expr_same), [`expr_is_nil`](#expr_is_nil) | |
 
 | On `StmtId` | |
 | :--- | :--- |
-| [`STMT_NIL`](#stmtid) · [`stmt`](#stmt) · [`stmt_index`](#stmt_index) · [`stmt_same`](#stmt_same) · [`stmt_is_nil`](#stmt_is_nil) | |
+| [`STMT_NIL`](#stmtid), [`stmt`](#stmt), [`stmt_index`](#stmt_index), [`stmt_same`](#stmt_same), [`stmt_is_nil`](#stmt_is_nil) | |
 
 | On `DeclId` | |
 | :--- | :--- |
-| [`DECL_NIL`](#declid) · [`decl`](#decl) · [`decl_index`](#decl_index) · [`decl_same`](#decl_same) · [`decl_is_nil`](#decl_is_nil) | |
+| [`DECL_NIL`](#declid), [`decl`](#decl), [`decl_index`](#decl_index), [`decl_same`](#decl_same), [`decl_is_nil`](#decl_is_nil) | |
 
 | On `TypeId` | |
 | :--- | :--- |
-| [`TYPE_NIL`](#typeid) · [`type`](#type) · [`type_index`](#type_index) · [`type_is_nil`](#type_is_nil) | |
+| [`TYPE_NIL`](#typeid), [`type`](#type), [`type_index`](#type_index), [`type_is_nil`](#type_is_nil) | |
 
 | On `ModuleNodeId` | |
 | :--- | :--- |
-| [`MODULE_NODE_NIL`](#modulenodeid) · [`module_node`](#module_node) · [`module_node_index`](#module_node_index) · [`module_node_is_nil`](#module_node_is_nil) | |
+| [`MODULE_NODE_NIL`](#modulenodeid), [`module_node`](#module_node), [`module_node_index`](#module_node_index), [`module_node_is_nil`](#module_node_is_nil) | |
 
 ---
 

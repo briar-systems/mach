@@ -6,18 +6,18 @@ a contained path walk: each component of a path beneath a root is read
 without following a symlink, refused when it is not what the caller expects,
 and made when the caller's policy creates it
 
-<sub>source: [`src/build/step/walk.mach`](../../../../src/build/step/walk.mach) · imported by 2 modules</sub>
+Source: [`src/build/step/walk.mach`](../../../../src/build/step/walk.mach)
 
-<sub>`A` is `std.allocator` · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md).
 
 | Functions | |
 | :--- | :--- |
-| [`path_check`](#path_check) · [`ancestors_check`](#ancestors_check) · [`directory_ensure`](#directory_ensure) | |
+| [`path_check`](#path_check), [`ancestors_check`](#ancestors_check), [`directory_ensure`](#directory_ensure) | |
 | [`owned_directory_ensure`](#owned_directory_ensure) | as `directory_ensure`, in output layout the build owns |
 
 | Constants | |
 | :--- | :--- |
-| [`PHYSICAL_REGULAR`](#constants) · [`PHYSICAL_DIRECTORY`](#constants) · [`PHYSICAL_ENTRY`](#constants) | |
+| [`PHYSICAL_REGULAR`](#constants), [`PHYSICAL_DIRECTORY`](#constants), [`PHYSICAL_ENTRY`](#constants) | |
 
 ---
 
@@ -26,25 +26,25 @@ and made when the caller's policy creates it
 ### path_check
 
 ```mach
-pub fun path_check(alloc: *A.Allocator, root: str, rel: str, expected: u8, label: str) err[fail.Fail]
+pub fun path_check(alloc: *std.allocator.Allocator, root: str, rel: str, expected: u8, label: str) err[mach.base.fail.Fail]
 ```
 
 ### ancestors_check
 
 ```mach
-pub fun ancestors_check(alloc: *A.Allocator, root: str, rel: str, label: str) err[fail.Fail]
+pub fun ancestors_check(alloc: *std.allocator.Allocator, root: str, rel: str, label: str) err[mach.base.fail.Fail]
 ```
 
 ### directory_ensure
 
 ```mach
-pub fun directory_ensure(alloc: *A.Allocator, root: str, rel: str, label: str) err[fail.Fail]
+pub fun directory_ensure(alloc: *std.allocator.Allocator, root: str, rel: str, label: str) err[mach.base.fail.Fail]
 ```
 
 ### owned_directory_ensure
 
 ```mach
-pub fun owned_directory_ensure(alloc: *A.Allocator, root: str, rel: str, label: str) err[fail.Fail]
+pub fun owned_directory_ensure(alloc: *std.allocator.Allocator, root: str, rel: str, label: str) err[mach.base.fail.Fail]
 ```
 
 as `directory_ensure`, in output layout the build owns

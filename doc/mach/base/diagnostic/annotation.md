@@ -7,9 +7,9 @@ the related places and machine-applicable fixes a report names beyond its own lo
 a failure and a diagnostic share these. each place is a span of a file of the source map the
 report was raised against.
 
-<sub>source: [`src/base/diagnostic/annotation.mach`](../../../../src/base/diagnostic/annotation.mach) · imported by 4 modules</sub>
+Source: [`src/base/diagnostic/annotation.mach`](../../../../src/base/diagnostic/annotation.mach)
 
-<sub>`base_source` is [`mach.base.source`](../source.md) · `A` is `std.allocator`</sub>
+Uses types from [`mach.base.source`](../source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -34,7 +34,7 @@ report was raised against.
 
 ```mach
 pub rec Related {
-    loc:   base_source.Location;
+    loc:   mach.base.source.Location;
     label: str;
 }
 ```
@@ -43,13 +43,13 @@ another place a report concerns: the other edge of a cycle, the other claim of a
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `loc` | `base_source.Location` | where it is |
+| `loc` | `mach.base.source.Location` | where it is |
 | `label` | `str` | what it is, nil to show the place without one |
 
 ### related_dnit
 
 ```mach
-pub fun related_dnit(a: *A.Allocator, r: *Related)
+pub fun related_dnit(a: *std.allocator.Allocator, r: *Related)
 ```
 
 release a related place's label, allocated through `a`
@@ -58,7 +58,7 @@ release a related place's label, allocated through `a`
 
 ```mach
 pub rec Edit {
-    loc:         base_source.Location;
+    loc:         mach.base.source.Location;
     replacement: str;
 }
 ```
@@ -100,7 +100,7 @@ whether the fix carries a rewrite
 ### fix_dnit
 
 ```mach
-pub fun fix_dnit(a: *A.Allocator, fx: *Fix)
+pub fun fix_dnit(a: *std.allocator.Allocator, fx: *Fix)
 ```
 
 release a fix's label, each edit's replacement and the edit storage, allocated through `a`
@@ -108,7 +108,7 @@ release a fix's label, each edit's replacement and the edit storage, allocated t
 ### fix_copy
 
 ```mach
-pub fun fix_copy(src: *Fix, a: *A.Allocator) res[Fix, A.Error]
+pub fun fix_copy(src: *Fix, a: *std.allocator.Allocator) res[Fix, std.allocator.Error]
 ```
 
 a copy of `src` owning its label, its edits and their replacements through `a`, released with

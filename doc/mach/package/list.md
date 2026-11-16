@@ -5,9 +5,9 @@
 list: what `mach dep list` shows: each root declaration with its winning selection, its
 pin and its state, and under it every requirement of the identity that selection overrides
 
-<sub>source: [`src/package/list.mach`](../../../src/package/list.mach) · imported by 1 module</sub>
+Source: [`src/package/list.mach`](../../../src/package/list.mach)
 
-<sub>`package_closure` is [`mach.package.closure`](closure.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.package.closure`](closure.md).
 
 | Functions | |
 | :--- | :--- |
@@ -20,7 +20,7 @@ pin and its state, and under it every requirement of the identity that selection
 ### lines
 
 ```mach
-pub fun lines(op: *package_closure.Operation, out: *Vector[str]) err[fail.Fail]
+pub fun lines(op: *mach.package.closure.Operation, out: *Vector[str]) err[mach.base.fail.Fail]
 ```
 
 the lines `mach dep list` shows, appended to `out`

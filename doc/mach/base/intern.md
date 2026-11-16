@@ -8,9 +8,7 @@ a string may hold NUL bytes and is equal to another by its bytes and length. an 
 layered over a base: it answers every id the base had issued when it was made and issues its
 own past them, and `child_reintern` maps a child's strings into its base.
 
-<sub>source: [`src/base/intern.mach`](../../../src/base/intern.mach) · imported by 120 modules</sub>
-
-<sub>`A` is `std.allocator` · `Entry` is private · `map` is `std.collections.map`</sub>
+Source: [`src/base/intern.mach`](../../../src/base/intern.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -20,7 +18,7 @@ own past them, and `child_reintern` maps a child's strings into its base.
 
 | On `StrId` | |
 | :--- | :--- |
-| [`STR_NIL`](#strid) · [`str_id`](#str_id) · [`str_index`](#str_index) · [`str_same`](#str_same) · [`str_is_nil`](#str_is_nil) | |
+| [`STR_NIL`](#strid), [`str_id`](#str_id), [`str_index`](#str_index), [`str_same`](#str_same), [`str_is_nil`](#str_is_nil) | |
 
 | On `Interner` | |
 | :--- | :--- |
@@ -31,7 +29,7 @@ own past them, and `child_reintern` maps a child's strings into its base.
 | [`text`](#text) | the text of `id` |
 | [`get`](#get) | the text of `id`, or none for an id the interner never issued |
 | [`bytes`](#bytes) | every byte of `id`, NULs included, or none for an id the interner never issued |
-| [`add`](#add) · [`bytes_add`](#bytes_add) | |
+| [`add`](#add), [`bytes_add`](#bytes_add) | |
 | [`range_add`](#range_add) | the `len` bytes of `source` from `offset`, interned |
 | [`find`](#find) | the id `text` was interned under, none when it never was; nothing is interned, so a reader that shares the interner may ask while no one adds |
 | [`child_reintern`](#child_reintern) | a non-child interner is a contract violation of the receiver, reported as the allocator layer reports its own (`invalid`) |
@@ -86,11 +84,11 @@ pub fun str_is_nil(id: StrId) bool
 
 ```mach
 pub rec Interner {
-    a:        *A.Allocator;
+    a:        *std.allocator.Allocator;
     strings:  *Entry;
     len:      usize;
     cap:      usize;
-    dedup:    map.MapBy[Entry, StrId];
+    dedup:    std.collections.map.MapBy[Entry, StrId];
     base:     *Interner;
     base_len: usize;
 }
@@ -99,13 +97,13 @@ pub rec Interner {
 ### init
 
 ```mach
-pub fun init(a: *A.Allocator) Interner
+pub fun init(a: *std.allocator.Allocator) Interner
 ```
 
 ### child_init
 
 ```mach
-pub fun child_init(base: *Interner, a: *A.Allocator) Interner
+pub fun child_init(base: *Interner, a: *std.allocator.Allocator) Interner
 ```
 
 an interner layered over `base`: it answers every id `base` and its own
@@ -159,19 +157,19 @@ every byte of `id`, NULs included, or none for an id the interner never issued
 ### add
 
 ```mach
-pub fun add(itn: *Interner, text: str) res[StrId, A.Error]
+pub fun add(itn: *Interner, text: str) res[StrId, std.allocator.Error]
 ```
 
 ### bytes_add
 
 ```mach
-pub fun bytes_add(itn: *Interner, data: str, len: usize) res[StrId, A.Error]
+pub fun bytes_add(itn: *Interner, data: str, len: usize) res[StrId, std.allocator.Error]
 ```
 
 ### range_add
 
 ```mach
-pub fun range_add(itn: *Interner, source: str, offset: usize, len: usize) res[StrId, A.Error]
+pub fun range_add(itn: *Interner, source: str, offset: usize, len: usize) res[StrId, std.allocator.Error]
 ```
 
 the `len` bytes of `source` from `offset`, interned. the bytes are taken as
@@ -189,7 +187,7 @@ that shares the interner may ask while no one adds
 ### child_reintern
 
 ```mach
-pub fun child_reintern(child: *Interner, alloc_: *A.Allocator) res[Remap, A.Error]
+pub fun child_reintern(child: *Interner, alloc_: *std.allocator.Allocator) res[Remap, std.allocator.Error]
 ```
 
 a non-child interner is a contract violation of the receiver, reported as
@@ -208,7 +206,7 @@ pub rec Remap {
 ### remap_dnit
 
 ```mach
-pub fun remap_dnit(alloc: *A.Allocator, remap: *Remap)
+pub fun remap_dnit(alloc: *std.allocator.Allocator, remap: *Remap)
 ```
 
 release a remap; a nil remap holds nothing

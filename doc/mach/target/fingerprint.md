@@ -6,9 +6,9 @@ the bytes that identify a resolved target to the build cache: the owners' rows
 it names, by their spelling, the selection it stands on and the image keys
 its manifest states
 
-<sub>source: [`src/target/fingerprint.mach`](../../../src/target/fingerprint.mach) · imported by 1 module</sub>
+Source: [`src/target/fingerprint.mach`](../../../src/target/fingerprint.mach)
 
-<sub>`resolved` is [`mach.target.resolved`](resolved.md) · `wire` is [`mach.base.wire`](../base/wire.md)</sub>
+Uses types from [`mach.base.wire`](../base/wire.md), [`mach.target.resolved`](resolved.md).
 
 | Functions | |
 | :--- | :--- |
@@ -21,6 +21,6 @@ its manifest states
 ### put
 
 ```mach
-pub fun put(t: *resolved.Target, s: *wire.Sink)
+pub fun put(t: *mach.target.resolved.Target, s: *mach.base.wire.Sink)
 ```
 

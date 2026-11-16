@@ -5,9 +5,9 @@
 editing a manifest's text in place: adding and removing a `[dep.<name>]`
 table, leaving every other byte as it was written
 
-<sub>source: [`src/manifest/edit.mach`](../../../src/manifest/edit.mach) · imported by 2 modules</sub>
+Source: [`src/manifest/edit.mach`](../../../src/manifest/edit.mach)
 
-<sub>`A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -67,7 +67,7 @@ a `[dep.<name>]` table to append to a manifest's text
 ### dep_table_add
 
 ```mach
-pub fun dep_table_add(alloc: *A.Allocator, source_text: str, spec: *DepTableSpec) res[str, fail.Fail]
+pub fun dep_table_add(alloc: *std.allocator.Allocator, source_text: str, spec: *DepTableSpec) res[str, mach.base.fail.Fail]
 ```
 
 append a `[dep.<name>]` table to manifest text, leaving every existing byte in
@@ -86,7 +86,7 @@ line (two when the text lacks a trailing newline)
 ### dep_table_remove
 
 ```mach
-pub fun dep_table_remove(alloc: *A.Allocator, source_text: str, name: str) res[str, fail.Fail]
+pub fun dep_table_remove(alloc: *std.allocator.Allocator, source_text: str, name: str) res[str, mach.base.fail.Fail]
 ```
 
 cut a `[dep.<name>]` table out of manifest text, from its header line to the

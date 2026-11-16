@@ -6,9 +6,9 @@ the lexis of an inline-asm body that the language owns: its `#` comments, and th
 `{name}` references that bind a local. everything else in the body is the instruction
 set's, and reaches its assembler as written
 
-<sub>source: [`src/front/asm.mach`](../../../src/front/asm.mach) · imported by 2 modules</sub>
+Source: [`src/front/asm.mach`](../../../src/front/asm.mach)
 
-<sub>`RefKind` is private · `base_source` is [`mach.base.source`](../base/source.md) · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -36,7 +36,7 @@ set's, and reaches its assembler as written
 ```mach
 pub rec Ref {
     kind:  RefKind;
-    inner: base_source.Span;
+    inner: mach.base.source.Span;
 }
 ```
 
@@ -45,7 +45,7 @@ one brace group of a body: its kind and the text between its braces
 ### ref_next
 
 ```mach
-pub fun ref_next(source: str, body: base_source.Span, at: *usize) Ref
+pub fun ref_next(source: str, body: mach.base.source.Span, at: *usize) Ref
 ```
 
 the next brace group of `body` at or after `at`, outside any comment; `at` moves past it
@@ -61,7 +61,7 @@ the next brace group of `body` at or after `at`, outside any comment; `at` moves
 ### comments_strip
 
 ```mach
-pub fun comments_strip(a: *A.Allocator, source: str, body: base_source.Span) res[str, fail.Fail]
+pub fun comments_strip(a: *std.allocator.Allocator, source: str, body: mach.base.source.Span) res[str, mach.base.fail.Fail]
 ```
 
 the body with each comment blanked to spaces, the text an assembler reads, every offset

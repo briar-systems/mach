@@ -8,11 +8,11 @@ toolchain spawns it, and a build never does. every git process starts here, with
 environment that keeps the user's configuration and drops whatever would redirect git to
 another repository, and every failure names the command, how it ended and what git printed
 
-<sub>[`mach.package.git`](../git.md) · 5 modules · imports [`base`](../../base/README.md), [`compile`](../../compile/README.md), [`host`](../../host/README.md), [`manifest`](../../manifest/README.md), [`session`](../../session/README.md) · imported by [`cli`](../../cli/README.md)</sub>
+The directory's root module is [`mach.package.git`](../git.md).
 
 | Module | |
 | :--- | :--- |
-| [`checkout`](checkout.md) | checkout: the git half of the source contract that realizes dep/&lt;id> |
+| [`checkout`](checkout.md) | checkout: the git half of the source contract that realizes dep/\<id> |
 | [`gitlink`](gitlink.md) | gitlink: the git member of the pin contract |
 | [`member`](member.md) | member: git as a member of the source and pin contracts, its tables assembled from the parts beside it |
 | [`tags`](tags.md) | tags: the git half of the source contract that lists releases |

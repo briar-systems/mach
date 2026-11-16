@@ -2,7 +2,8 @@
 
 # mach.manifest
 
-<sub>19 modules · imports [`base`](../base/README.md), [`host`](../host/README.md), [`session`](../session/README.md), [`target`](../target/README.md) · imported by [`build`](../build/README.md), [`cli`](../cli/README.md), [`compile`](../compile/README.md), [`package`](../package/README.md), [`session`](../session/README.md), [`tool`](../tool/README.md)</sub>
+`mach.toml`: its schema and model, loading, the selection of targets, profiles and
+artifacts, templates, steps, and edits
 
 | Module | |
 | :--- | :--- |
@@ -17,7 +18,7 @@
 | [`profile`](profile.md) | the decoding of the `[profile.<name>]` tables, and the rule of at most one default |
 | [`project`](project.md) | the decoding of the `[project]` table, and the expansion of its `work` directory |
 | [`refusal`](refusal.md) | how the manifest refuses: the text of a refusal, made through the caller's allocator, where in the file it points, and the other places it names |
-| [`runner`](runner.md) | the command a target's programs are launched through |
+| [`runner`](runner.md) | the command a target's programs are launched through, and the executable `mach run` launches |
 | [`schema`](schema.md) | the manifest's schema: every key's row with its shape, rule and rewrite, and the check |
 | [`select`](select.md) | the one selection model: the selection a command's `-a`, `-t` and `-p` options and `--all` describe, resolved against a manifest into the (artifact, target, profile) cells it covers, which the build plan takes |
 | [`setting`](setting.md) | `--set`: a manifest key written over every table of its section for one invocation |

@@ -8,14 +8,14 @@ a path keeps the comments and whitespace it was written with, so its segments, i
 segment and its prefix are found by walking its span, and `intern_path` interns it with its
 segments joined by single dots.
 
-<sub>source: [`src/front/path.mach`](../../../src/front/path.mach) · imported by 4 modules</sub>
+Source: [`src/front/path.mach`](../../../src/front/path.mach)
 
-<sub>`base_source` is [`mach.base.source`](../base/source.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `A` is `std.allocator`</sub>
+Uses types from [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md).
 
 | Functions | |
 | :--- | :--- |
 | [`next`](#next) | paths are parser accepted identifier and dot sequences with original trivia intact |
-| [`leaf`](#leaf) · [`prefix`](#prefix) · [`intern_path`](#intern_path) | |
+| [`leaf`](#leaf), [`prefix`](#prefix), [`intern_path`](#intern_path) | |
 
 ---
 
@@ -24,7 +24,7 @@ segments joined by single dots.
 ### next
 
 ```mach
-pub fun next(source: str, path: base_source.Span, cursor: *usize) base_source.Span
+pub fun next(source: str, path: mach.base.source.Span, cursor: *usize) mach.base.source.Span
 ```
 
 paths are parser accepted identifier and dot sequences with original trivia intact
@@ -32,18 +32,18 @@ paths are parser accepted identifier and dot sequences with original trivia inta
 ### leaf
 
 ```mach
-pub fun leaf(source: str, path: base_source.Span) base_source.Span
+pub fun leaf(source: str, path: mach.base.source.Span) mach.base.source.Span
 ```
 
 ### prefix
 
 ```mach
-pub fun prefix(source: str, path: base_source.Span) base_source.Span
+pub fun prefix(source: str, path: mach.base.source.Span) mach.base.source.Span
 ```
 
 ### intern_path
 
 ```mach
-pub fun intern_path(itn: *intern.Interner, source: str, path: base_source.Span) res[intern.StrId, A.Error]
+pub fun intern_path(itn: *mach.base.intern.Interner, source: str, path: mach.base.source.Span) res[mach.base.intern.StrId, std.allocator.Error]
 ```
 

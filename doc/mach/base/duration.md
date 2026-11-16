@@ -6,9 +6,7 @@ durations written as `<n>ms`, `<n>s`, `<n>m` or `<n>h`, parsed and rendered back
 
 the form the command line's `--timeout` and a manifest step's `timeout` take.
 
-<sub>source: [`src/base/duration.mach`](../../../src/base/duration.mach) · imported by 5 modules</sub>
-
-<sub>`chrono_duration` is `std.chrono.duration`</sub>
+Source: [`src/base/duration.mach`](../../../src/base/duration.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -44,7 +42,7 @@ unit: "h", "m", "s" or "ms"; "ns" when d is not a whole number of milliseconds
 ### text
 
 ```mach
-pub fun text(d: chrono_duration.Duration) Text
+pub fun text(d: std.chrono.duration.Duration) Text
 ```
 
 render d in the form parse reads back
@@ -59,7 +57,7 @@ render d in the form parse reads back
 ### parse
 
 ```mach
-pub fun parse(s: *u8) opt[chrono_duration.Duration]
+pub fun parse(s: *u8) opt[std.chrono.duration.Duration]
 ```
 
 parse a duration: a positive decimal integer followed by one of the

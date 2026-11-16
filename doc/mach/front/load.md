@@ -11,9 +11,9 @@ build. it leaves a load record on each module, with one `Binding` per import dec
 name resolution to bind from. the host owns the module table and the parses, and a reload
 walks one changed module again and says whether its load surface survived.
 
-<sub>source: [`src/front/load.mach`](../../../src/front/load.mach) · imported by 8 modules</sub>
+Source: [`src/front/load.mach`](../../../src/front/load.mach)
 
-<sub>`ast_id` is [`mach.front.ast.id`](ast/id.md) · `BindingKind` is private · `intern` is [`mach.base.intern`](../base/intern.md) · `module` is [`mach.session.module`](../session/module.md) · `base_source` is [`mach.base.source`](../base/source.md) · `target_facts` is [`mach.target.facts`](../target/facts.md) · `report_phase` is [`mach.report.phase`](../report/phase.md) · `provider` is [`mach.base.source.provider`](../base/source/provider.md) · `comptime_gate` is [`mach.front.comptime.gate`](comptime/gate.md) · `comptime_scope` is [`mach.front.comptime.scope`](comptime/scope.md) · `collections_vector` is `std.collections.vector` · `Const` is private · `DemandIndex` is private · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md) · `ast` is [`mach.front.ast`](ast.md) · `session` is [`mach.session`](../session.md) · `diagnostic` is [`mach.base.diagnostic`](../base/diagnostic.md) · `map` is `std.collections.map` · `Held` is private · `Named` is private · `Demand` is private</sub>
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.base.source.provider`](../base/source/provider.md), [`mach.front.ast`](ast.md), [`mach.front.ast.id`](ast/id.md), [`mach.front.comptime.gate`](comptime/gate.md), [`mach.front.comptime.scope`](comptime/scope.md), [`mach.report.phase`](../report/phase.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.target.facts`](../target/facts.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -54,7 +54,7 @@ walks one changed module again and says whether its load surface survived.
 | Constants | |
 | :--- | :--- |
 | [`FRAME_BUILD`](#constants) | the frame the load walk reads and binds in: the build target's, or a union tuple's by index |
-| [`BINDING_MODULE`](#constants) · [`BINDING_MEMBER`](#constants) · [`BINDING_UNBOUND`](#constants) | |
+| [`BINDING_MODULE`](#constants), [`BINDING_MEMBER`](#constants), [`BINDING_UNBOUND`](#constants) | |
 
 ---
 
@@ -70,11 +70,11 @@ how far the load has reached a module
 
 ```mach
 pub rec Binding {
-    decl:     ast_id.DeclId;
+    decl:     mach.front.ast.id.DeclId;
     kind:     BindingKind;
-    name:     intern.StrId;
-    module:   module.StableModuleId;
-    span:     base_source.Span;
+    name:     mach.base.intern.StrId;
+    module:   mach.session.module.StableModuleId;
+    span:     mach.base.source.Span;
     constant: bool;
 }
 ```
@@ -83,22 +83,22 @@ the record of one import declaration, which resolve binds from rather than readi
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `decl` | `ast_id.DeclId` | the `use` or `fwd` |
+| `decl` | `mach.front.ast.id.DeclId` | the `use` or `fwd` |
 | `kind` | `BindingKind` | what it binds |
-| `name` | `intern.StrId` | the name a module binding binds it under, or the member a member binding names |
-| `module` | `module.StableModuleId` | the module it names |
-| `span` | `base_source.Span` | its path |
+| `name` | `mach.base.intern.StrId` | the name a module binding binds it under, or the member a member binding names |
+| `module` | `mach.session.module.StableModuleId` | the module it names |
+| `span` | `mach.base.source.Span` | its path |
 | `constant` | `bool` | a `use` of a member under the member's own name, so the member's public constant is bound for the importer's gates |
 
 ## Tuple
 
 ```mach
 pub rec Tuple {
-    target:        target_facts.Facts;
-    os_name:       intern.StrId;
-    isa_name:      intern.StrId;
-    abi_name:      intern.StrId;
-    platform_name: intern.StrId;
+    target:        mach.target.facts.Facts;
+    os_name:       mach.base.intern.StrId;
+    isa_name:      mach.base.intern.StrId;
+    abi_name:      mach.base.intern.StrId;
+    platform_name: mach.base.intern.StrId;
 }
 ```
 
@@ -108,23 +108,23 @@ one target a union build decides every gate under
 
 ```mach
 pub rec Module {
-    status:       report_phase.PhaseStatus;
-    home:         provider.Home;
-    artifact:     intern.StrId;
+    status:       mach.report.phase.PhaseStatus;
+    home:         mach.base.source.provider.Home;
+    artifact:     mach.base.intern.StrId;
     gated:        bool;
-    outcome:      comptime_gate.GateOutcome;
-    ctx:          comptime_scope.ComptimeCtx;
+    outcome:      mach.front.comptime.gate.GateOutcome;
+    ctx:          mach.front.comptime.scope.ComptimeCtx;
     frame:        u32;
-    frames:       *comptime_scope.ComptimeCtx;
+    frames:       *mach.front.comptime.scope.ComptimeCtx;
     frame_count:  u32;
     walked:       *bool;
     frame_walked: *bool;
     decl_count:   u32;
     reached:      *bool;
     reach_count:  u32;
-    deps:         collections_vector.Vector[module.StableModuleId];
-    consts:       collections_vector.Vector[Const];
-    bindings:     collections_vector.Vector[Binding];
+    deps:         std.collections.vector.Vector[mach.session.module.StableModuleId];
+    consts:       std.collections.vector.Vector[Const];
+    bindings:     std.collections.vector.Vector[Binding];
     binders:      DemandIndex;
 }
 ```
@@ -135,32 +135,32 @@ stable id
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `status` | `report_phase.PhaseStatus` | the standing of the module's load |
-| `home` | `provider.Home` | the package that owns it and its file there |
-| `artifact` | `intern.StrId` | the artifact whose walk first reached it, what `$bin.name` reads |
+| `status` | `mach.report.phase.PhaseStatus` | the standing of the module's load |
+| `home` | `mach.base.source.provider.Home` | the package that owns it and its file there |
+| `artifact` | `mach.base.intern.StrId` | the artifact whose walk first reached it, what `$bin.name` reads |
 | `gated` | `bool` | it was first reached from an artifact this target does not build, or a union reached it only under another target's arms (see build_reach) |
-| `outcome` | `comptime_gate.GateOutcome` | the outcome of its module-scope gates |
-| `ctx` | `comptime_scope.ComptimeCtx` | its build target's frame, which every later phase reads |
+| `outcome` | `mach.front.comptime.gate.GateOutcome` | the outcome of its module-scope gates |
+| `ctx` | `mach.front.comptime.scope.ComptimeCtx` | its build target's frame, which every later phase reads |
 | `frame` | `u32` | the frame the walk is in: FRAME_BUILD or a union tuple |
-| `frames` | `*comptime_scope.ComptimeCtx` | its frame under each union tuple, which only the load reads |
+| `frames` | `*mach.front.comptime.scope.ComptimeCtx` | its frame under each union tuple, which only the load reads |
 | `walked` | `*bool` | the declarations the walk reached in its build target's frame, by declaration |
 | `frame_walked` | `*bool` | the declarations the walk reached under each union tuple, `decl_count` per tuple |
 | `reached` | `*bool` | the union tuples a walk reached it under |
-| `deps` | `collections_vector.Vector[module.StableModuleId]` | the modules it imports |
-| `consts` | `collections_vector.Vector[Const]` | the public constants it exports to its importers' gates |
-| `bindings` | `collections_vector.Vector[Binding]` | one record per import declaration the walk reached |
+| `deps` | `std.collections.vector.Vector[mach.session.module.StableModuleId]` | the modules it imports |
+| `consts` | `std.collections.vector.Vector[Const]` | the public constants it exports to its importers' gates |
+| `bindings` | `std.collections.vector.Vector[Binding]` | one record per import declaration the walk reached |
 | `binders` | `DemandIndex` | where a demand finds each name a declaration list binds, built once per syntax (see demand_index) |
 
 ### module_dnit
 
 ```mach
-pub fun module_dnit(a: *A.Allocator, m: *Module)
+pub fun module_dnit(a: *std.allocator.Allocator, m: *Module)
 ```
 
 ### walked
 
 ```mach
-pub fun walked(m: *Module, did: ast_id.DeclId) bool
+pub fun walked(m: *Module, did: mach.front.ast.id.DeclId) bool
 ```
 
 whether the walk reached a declaration in the module's build target's frame
@@ -168,7 +168,7 @@ whether the walk reached a declaration in the module's build target's frame
 ### binding_for
 
 ```mach
-pub fun binding_for(m: *Module, decl: ast_id.DeclId) opt[*Binding]
+pub fun binding_for(m: *Module, decl: mach.front.ast.id.DeclId) opt[*Binding]
 ```
 
 the record of what the import declaration `decl` binds, none when the load recorded none
@@ -177,9 +177,9 @@ the record of what the import declaration `decl` binds, none when the load recor
 
 ```mach
 pub rec Row {
-    name:   intern.StrId;
-    stable: module.StableModuleId;
-    file:   base_source.FileId;
+    name:   mach.base.intern.StrId;
+    stable: mach.session.module.StableModuleId;
+    file:   mach.base.source.FileId;
     load:   *Module;
 }
 ```
@@ -191,12 +191,12 @@ a module as the load's host holds it: its identity and its load record
 ```mach
 pub rec Host {
     ctx:     ptr;
-    add:     fun(ptr, intern.StrId, module.StableModuleId) res[module.ModuleId, fail.Fail];
-    row:     fun(ptr, module.ModuleId) Row;
-    syntax:  fun(ptr, module.ModuleId) *ast.Ast;
-    parse:   fun(ptr, module.ModuleId, base_source.FileId, bool) err[fail.Fail];
-    context: fun(ptr, intern.StrId) res[comptime_scope.ComptimeCtx, fail.Fail];
-    done:    fun(ptr, module.ModuleId) err[fail.Fail];
+    add:     fun(ptr, mach.base.intern.StrId, mach.session.module.StableModuleId) res[mach.session.module.ModuleId, mach.base.fail.Fail];
+    row:     fun(ptr, mach.session.module.ModuleId) Row;
+    syntax:  fun(ptr, mach.session.module.ModuleId) *mach.front.ast.Ast;
+    parse:   fun(ptr, mach.session.module.ModuleId, mach.base.source.FileId, bool) err[mach.base.fail.Fail];
+    context: fun(ptr, mach.base.intern.StrId) res[mach.front.comptime.scope.ComptimeCtx, mach.base.fail.Fail];
+    done:    fun(ptr, mach.session.module.ModuleId) err[mach.base.fail.Fail];
 }
 ```
 
@@ -207,36 +207,36 @@ decorators_record) whole, and replaces no module's syntax while one runs but thr
 | Field | Type | |
 | :--- | :--- | :--- |
 | `ctx` | `ptr` | the host's own state |
-| `add` | `fun(ptr, intern.StrId, module.StableModuleId) res[module.ModuleId, fail.Fail]` | make a row for a module with this name and stable id, with no file or syntax yet, and give its id; ids are given in order from zero |
-| `row` | `fun(ptr, module.ModuleId) Row` | a module's row; the load record it points at stays where it is |
-| `syntax` | `fun(ptr, module.ModuleId) *ast.Ast` | a module's current syntax, nil where it has none |
-| `parse` | `fun(ptr, module.ModuleId, base_source.FileId, bool) err[fail.Fail]` | give the module this file and make its syntax current; `reported` says the load reached it by walking, so a progress readout lists it |
-| `context` | `fun(ptr, intern.StrId) res[comptime_scope.ComptimeCtx, fail.Fail]` | the comptime context of a module of `artifact` under the build target, with nothing of the module itself |
-| `done` | `fun(ptr, module.ModuleId) err[fail.Fail]` | a module and everything it imports finished loading |
+| `add` | `fun(ptr, mach.base.intern.StrId, mach.session.module.StableModuleId) res[mach.session.module.ModuleId, mach.base.fail.Fail]` | make a row for a module with this name and stable id, with no file or syntax yet, and give its id; ids are given in order from zero |
+| `row` | `fun(ptr, mach.session.module.ModuleId) Row` | a module's row; the load record it points at stays where it is |
+| `syntax` | `fun(ptr, mach.session.module.ModuleId) *mach.front.ast.Ast` | a module's current syntax, nil where it has none |
+| `parse` | `fun(ptr, mach.session.module.ModuleId, mach.base.source.FileId, bool) err[mach.base.fail.Fail]` | give the module this file and make its syntax current; `reported` says the load reached it by walking, so a progress readout lists it |
+| `context` | `fun(ptr, mach.base.intern.StrId) res[mach.front.comptime.scope.ComptimeCtx, mach.base.fail.Fail]` | the comptime context of a module of `artifact` under the build target, with nothing of the module itself |
+| `done` | `fun(ptr, mach.session.module.ModuleId) err[mach.base.fail.Fail]` | a module and everything it imports finished loading |
 
 ## Loader
 
 ```mach
 pub rec Loader {
-    s:           *session.Session;
-    alloc:       *A.Allocator;
+    s:           *mach.session.Session;
+    alloc:       *std.allocator.Allocator;
     host:        Host;
-    sources:     provider.Provider;
-    diags:       *diagnostic.DiagnosticStore;
-    by_name:     map.Map[intern.StrId, module.ModuleId];
-    by_stable:   map.Map[module.StableModuleId, module.ModuleId];
-    states:      collections_vector.Vector[State];
-    held:        collections_vector.Vector[Held];
+    sources:     mach.base.source.provider.Provider;
+    diags:       *mach.base.diagnostic.DiagnosticStore;
+    by_name:     std.collections.map.Map[mach.base.intern.StrId, mach.session.module.ModuleId];
+    by_stable:   std.collections.map.Map[mach.session.module.StableModuleId, mach.session.module.ModuleId];
+    states:      std.collections.vector.Vector[State];
+    held:        std.collections.vector.Vector[Held];
     entry:       u64;
-    named:       map.Map[intern.StrId, Named];
-    demands:     collections_vector.Vector[Demand];
+    named:       std.collections.map.Map[mach.base.intern.StrId, Named];
+    demands:     std.collections.vector.Vector[Demand];
     union:       bool;
     tuples:      *Tuple;
     tuple_count: u32;
     tuple_cap:   u32;
     filter:      *bool;
     foreign:     bool;
-    artifact:    intern.StrId;
+    artifact:    mach.base.intern.StrId;
     dirty:       bool;
 }
 ```
@@ -248,25 +248,25 @@ those gates read, and leaves a load record on each
 | Field | Type | |
 | :--- | :--- | :--- |
 | `host` | `Host` | what runs the load, bound before each use |
-| `sources` | `provider.Provider` | the module namespace, bound before each use |
-| `diags` | `*diagnostic.DiagnosticStore` | where the load reports, bound before each use |
-| `by_name` | `map.Map[intern.StrId, module.ModuleId]` | each module's id by its fqn |
-| `by_stable` | `map.Map[module.StableModuleId, module.ModuleId]` | each module's id by its stable id |
-| `states` | `collections_vector.Vector[State]` | how far each module is loaded, by id |
-| `held` | `collections_vector.Vector[Held]` | what the loader holds of each module, by id |
+| `sources` | `mach.base.source.provider.Provider` | the module namespace, bound before each use |
+| `diags` | `*mach.base.diagnostic.DiagnosticStore` | where the load reports, bound before each use |
+| `by_name` | `std.collections.map.Map[mach.base.intern.StrId, mach.session.module.ModuleId]` | each module's id by its fqn |
+| `by_stable` | `std.collections.map.Map[mach.session.module.StableModuleId, mach.session.module.ModuleId]` | each module's id by its stable id |
+| `states` | `std.collections.vector.Vector[State]` | how far each module is loaded, by id |
+| `held` | `std.collections.vector.Vector[Held]` | what the loader holds of each module, by id |
 | `entry` | `u64` | the entry running now, numbering each from 1 |
-| `named` | `map.Map[intern.StrId, Named]` | whether each path a `use` or `fwd` spells names a module, as the provider answered the entry it was asked in |
-| `demands` | `collections_vector.Vector[Demand]` | the gates and constants the load is deciding, innermost last |
+| `named` | `std.collections.map.Map[mach.base.intern.StrId, Named]` | whether each path a `use` or `fwd` spells names a module, as the provider answered the entry it was asked in |
+| `demands` | `std.collections.vector.Vector[Demand]` | the gates and constants the load is deciding, innermost last |
 | `union` | `bool` | the build decides every gate under each of `tuples` as well as its own target |
 | `filter` | `*bool` | the tuples the walk is under now, nil for all of them |
 | `foreign` | `bool` | the walk is under an artifact this target does not build |
-| `artifact` | `intern.StrId` | the artifact a module reached now is attributed to |
+| `artifact` | `mach.base.intern.StrId` | the artifact a module reached now is attributed to |
 | `dirty` | `bool` | a module reached under a new tuple after it loaded was walked again, which can give it dependencies the host's order placed after it |
 
 ### init
 
 ```mach
-pub fun init(s: *session.Session, a: *A.Allocator) Loader
+pub fun init(s: *mach.session.Session, a: *std.allocator.Allocator) Loader
 ```
 
 ### dnit
@@ -280,7 +280,7 @@ release what the loader owns; each module's record is released by its row's owne
 ### bind
 
 ```mach
-pub fun bind(l: *Loader, host: Host, sources: provider.Provider, diags: *diagnostic.DiagnosticStore)
+pub fun bind(l: *Loader, host: Host, sources: mach.base.source.provider.Provider, diags: *mach.base.diagnostic.DiagnosticStore)
 ```
 
 point the loader at what runs it, which may have moved since its last use
@@ -296,7 +296,7 @@ make a union build: every gate is decided under each of `count` tuples, which th
 ### module_find
 
 ```mach
-pub fun module_find(l: *Loader, fqn: intern.StrId) opt[module.ModuleId]
+pub fun module_find(l: *Loader, fqn: mach.base.intern.StrId) opt[mach.session.module.ModuleId]
 ```
 
 the id of the module named `fqn`, none when the load has not reached it
@@ -304,7 +304,7 @@ the id of the module named `fqn`, none when the load has not reached it
 ### module_of
 
 ```mach
-pub fun module_of(l: *Loader, sid: module.StableModuleId) module.ModuleId
+pub fun module_of(l: *Loader, sid: mach.session.module.StableModuleId) mach.session.module.ModuleId
 ```
 
 the id of the module a load product names by stable id, MODULE_NIL when the load has not reached it
@@ -312,7 +312,7 @@ the id of the module a load product names by stable id, MODULE_NIL when the load
 ### gated_at
 
 ```mach
-pub fun gated_at(l: *Loader, mid: module.ModuleId) bool
+pub fun gated_at(l: *Loader, mid: mach.session.module.ModuleId) bool
 ```
 
 whether the module is gated out of this build
@@ -326,7 +326,7 @@ pub fun module_count(l: *Loader) u32
 ### module_load_one
 
 ```mach
-pub fun module_load_one(l: *Loader, fqn: intern.StrId) res[module.ModuleId, fail.Fail]
+pub fun module_load_one(l: *Loader, fqn: mach.base.intern.StrId) res[mach.session.module.ModuleId, mach.base.fail.Fail]
 ```
 
 parse the module `fqn` names without walking it, as a root a later phase reads alone
@@ -334,7 +334,7 @@ parse the module `fqn` names without walking it, as a root a later phase reads a
 ### module_load
 
 ```mach
-pub fun module_load(l: *Loader, fqn: intern.StrId) res[module.ModuleId, fail.Fail]
+pub fun module_load(l: *Loader, fqn: mach.base.intern.StrId) res[mach.session.module.ModuleId, mach.base.fail.Fail]
 ```
 
 load the module `fqn` names and everything it reaches: each is parsed, its gates decided and
@@ -343,7 +343,7 @@ its imports loaded first, then handed to the host as done
 ### module_reload
 
 ```mach
-pub fun module_reload(l: *Loader, mid: module.ModuleId) res[bool, fail.Fail]
+pub fun module_reload(l: *Loader, mid: mach.session.module.ModuleId) res[bool, mach.base.fail.Fail]
 ```
 
 reparse and re-walk one loaded module in place, after its text changed, and say whether its load
@@ -361,7 +361,7 @@ since gate states and load marks are keyed by the old syntax tree's ids
 ### build_reach
 
 ```mach
-pub fun build_reach(l: *Loader, reached: *bool) err[fail.Fail]
+pub fun build_reach(l: *Loader, reached: *bool) err[mach.base.fail.Fail]
 ```
 
 mark in `reached`, by module index, every module the build target's own frame reaches from the
@@ -371,7 +371,7 @@ its frame selected. a module the union loaded only under another tuple's arms st
 ### decorators_record
 
 ```mach
-pub fun decorators_record(l: *Loader, mid: module.ModuleId) err[fail.Fail]
+pub fun decorators_record(l: *Loader, mid: mach.session.module.ModuleId) err[mach.base.fail.Fail]
 ```
 
 records the load's reading of the module's decorator arguments, in the build target's frame the
@@ -382,8 +382,8 @@ walk bound: the string each argument that takes one evaluates to, and what each 
 ### embeds_record
 
 ```mach
-pub fun embeds_record(s: *session.Session, c: *comptime_scope.ComptimeCtx, a: *ast.Ast, fqn: intern.StrId,
-    reached: *bool) err[fail.Fail]
+pub fun embeds_record(s: *mach.session.Session, c: *mach.front.comptime.scope.ComptimeCtx, a: *mach.front.ast.Ast, fqn: mach.base.intern.StrId,
+    reached: *bool) err[mach.base.fail.Fail]
 ```
 
 records into the load scope `c` what each `embed` argument of a module names, reading the string

@@ -9,7 +9,7 @@ exact arithmetic behind 128-bit literals, comptime evaluation, constant
 folding and IR constants. every operation is total: wrapping where the name
 says so, flagged where the caller must know, never undefined.
 
-<sub>source: [`src/base/wide.mach`](../../../src/base/wide.mach) · imported by 19 modules</sub>
+Source: [`src/base/wide.mach`](../../../src/base/wide.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -18,14 +18,14 @@ says so, flagged where the caller must know, never undefined.
 
 | On `Wide` | |
 | :--- | :--- |
-| [`zero`](#zero) · [`make`](#make) · [`from_u64`](#from_u64) · [`from_i64`](#from_i64) · [`is_zero`](#is_zero) · [`eq`](#eq) · [`lt_u`](#lt_u) · [`lt_s`](#lt_s) · [`is_negative`](#is_negative) · [`add`](#add) · [`sub`](#sub) · [`neg`](#neg) · [`max_u`](#max_u) · [`min_s`](#min_s) · [`not`](#not) · [`and`](#and) · [`or`](#or) · [`xor`](#xor) · [`mul_u64`](#mul_u64) · [`mul`](#mul) | |
+| [`zero`](#zero), [`make`](#make), [`from_u64`](#from_u64), [`from_i64`](#from_i64), [`is_zero`](#is_zero), [`eq`](#eq), [`lt_u`](#lt_u), [`lt_s`](#lt_s), [`is_negative`](#is_negative), [`add`](#add), [`sub`](#sub), [`neg`](#neg), [`max_u`](#max_u), [`min_s`](#min_s), [`not`](#not), [`and`](#and), [`or`](#or), [`xor`](#xor), [`mul_u64`](#mul_u64), [`mul`](#mul) | |
 | [`divmod_u`](#divmod_u) | a / b and a % b unsigned, none when b is zero |
 | [`divmod_s`](#divmod_s) | a / b and a % b signed, rounding toward zero, none when b is zero |
 | [`quot_rem_u`](#quot_rem_u) | a / b and a % b unsigned |
 | [`quot_rem_s`](#quot_rem_s) | a / b and a % b signed, rounding toward zero, total over a nonzero `b` as quot_rem_u is |
-| [`shl`](#shl) · [`shr_u`](#shr_u) · [`shr_s`](#shr_s) · [`trunc`](#trunc) · [`sext`](#sext) · [`fits_unsigned`](#fits_unsigned) | |
+| [`shl`](#shl), [`shr_u`](#shr_u), [`shr_s`](#shr_s), [`trunc`](#trunc), [`sext`](#sext), [`fits_unsigned`](#fits_unsigned) | |
 | [`fits_signed`](#fits_signed) | whether `a`, read as signed, lies in the range of a signed `bits`-wide integer, `bits` in 1..128 |
-| [`bit_length`](#bit_length) · [`trailing_zeros`](#trailing_zeros) · [`is_pow2`](#is_pow2) · [`mul_add_small`](#mul_add_small) · [`format_u`](#format_u) | |
+| [`bit_length`](#bit_length), [`trailing_zeros`](#trailing_zeros), [`is_pow2`](#is_pow2), [`mul_add_small`](#mul_add_small), [`format_u`](#format_u) | |
 | [`text_u`](#text_u) | the decimal text of an unsigned value, terminated, in a FORMAT_CAP buffer |
 | [`text_s`](#text_s) | the decimal text of a signed value, terminated, in a FORMAT_CAP buffer |
 

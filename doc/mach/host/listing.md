@@ -5,9 +5,9 @@
 a directory listing read by name, for the sites that look for sources,
 manifests or dependency slots in it
 
-<sub>source: [`src/host/listing.mach`](../../../src/host/listing.mach) · imported by 4 modules</sub>
+Source: [`src/host/listing.mach`](../../../src/host/listing.mach)
 
-<sub>`A` is `std.allocator` · `fs` is `std.filesystem` · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md).
 
 | Functions | |
 | :--- | :--- |
@@ -21,7 +21,7 @@ manifests or dependency slots in it
 ### names
 
 ```mach
-pub fun names(a: *A.Allocator, dir: str, entries: *Vector[fs.Listed]) res[Vector[str], fail.Fail]
+pub fun names(a: *std.allocator.Allocator, dir: str, entries: *Vector[std.filesystem.Listed]) res[Vector[str], mach.base.fail.Fail]
 ```
 
 the UTF-8 names of `entries` in its order, borrowed from the listing, which
@@ -39,7 +39,7 @@ with a failure naming `dir` rather than being passed over
 ### unspellable
 
 ```mach
-pub fun unspellable(a: *A.Allocator, dir: str) fail.Fail
+pub fun unspellable(a: *std.allocator.Allocator, dir: str) mach.base.fail.Fail
 ```
 
 the failure for a directory holding an entry with no UTF-8 spelling

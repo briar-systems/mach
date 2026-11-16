@@ -4,13 +4,13 @@
 
 the comptime capabilities a sema walk publishes for each of its phases
 
-<sub>source: [`src/front/sema/capability.mach`](../../../../src/front/sema/capability.mach) · imported by 1 module</sub>
+Source: [`src/front/sema/capability.mach`](../../../../src/front/sema/capability.mach)
 
-<sub>`comptime_capability` is [`mach.front.comptime.capability`](../comptime/capability.md) · `sema_context` is [`mach.front.sema.context`](context.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.comptime.capability`](../comptime/capability.md), [`mach.front.sema.context`](context.md).
 
 | Functions | |
 | :--- | :--- |
-| [`semantic_name_caps`](#semantic_name_caps) · [`semantic_type_caps`](#semantic_type_caps) | |
+| [`semantic_name_caps`](#semantic_name_caps), [`semantic_type_caps`](#semantic_type_caps) | |
 
 ---
 
@@ -19,12 +19,12 @@ the comptime capabilities a sema walk publishes for each of its phases
 ### semantic_name_caps
 
 ```mach
-pub fun semantic_name_caps() res[comptime_capability.PhaseCapabilities[sema_context.SemaContext], fail.Fail]
+pub fun semantic_name_caps() res[mach.front.comptime.capability.PhaseCapabilities[mach.front.sema.context.SemaContext], mach.base.fail.Fail]
 ```
 
 ### semantic_type_caps
 
 ```mach
-pub fun semantic_type_caps() res[comptime_capability.PhaseCapabilities[sema_context.SemaContext], fail.Fail]
+pub fun semantic_type_caps() res[mach.front.comptime.capability.PhaseCapabilities[mach.front.sema.context.SemaContext], mach.base.fail.Fail]
 ```
 

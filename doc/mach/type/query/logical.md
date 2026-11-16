@@ -9,9 +9,9 @@ or union on the cycle, which names that record rather than spelling it again, an
 reference into a generic whose argument grows through a pointer names a fresh type at every
 step, so it has no declaration
 
-<sub>source: [`src/type/query/logical.mach`](../../../../src/type/query/logical.mach) · imported by 1 module</sub>
+Source: [`src/type/query/logical.mach`](../../../../src/type/query/logical.mach)
 
-<sub>`type_query` is [`mach.type.query`](../query.md) · `type_kind` is [`mach.type.kind`](../kind.md)</sub>
+Uses types from [`mach.type.kind`](../kind.md), [`mach.type.query`](../query.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -34,7 +34,7 @@ step, so it has no declaration
 
 | Constants | |
 | :--- | :--- |
-| [`RECURSIVE_MSG`](#constants) · [`UNBOUNDED_MSG`](#constants) | |
+| [`RECURSIVE_MSG`](#constants), [`UNBOUNDED_MSG`](#constants) | |
 
 ---
 
@@ -52,7 +52,7 @@ pub def Refusal: u8
 ### refusal
 
 ```mach
-pub fun refusal(q: *type_query.Query, tid: type_kind.TypeId) Refusal
+pub fun refusal(q: *mach.type.query.Query, tid: mach.type.kind.TypeId) Refusal
 ```
 
 why a logical-addressing target cannot declare `tid`, REFUSAL_NONE when it can
@@ -61,7 +61,7 @@ why a logical-addressing target cannot declare `tid`, REFUSAL_NONE when it can
 
 ```mach
 pub rec Path {
-    ty:       type_kind.TypeId;
+    ty:       mach.type.kind.TypeId;
     previous: *Path;
 }
 ```
@@ -71,7 +71,7 @@ the types a declaration is being spelled through, innermost first
 ### pointer_names
 
 ```mach
-pub fun pointer_names(q: *type_query.Query, path: *Path, ptr: type_kind.TypeId) opt[type_kind.TypeId]
+pub fun pointer_names(q: *mach.type.query.Query, path: *Path, ptr: mach.type.kind.TypeId) opt[mach.type.kind.TypeId]
 ```
 
 the record or union a pointer to `ptr`'s base names instead of spelling it, when that
@@ -82,7 +82,7 @@ base lies on a cycle with the record or union `path` is spelling it inside
 ### on_cycle
 
 ```mach
-pub fun on_cycle(q: *type_query.Query, tid: type_kind.TypeId) bool
+pub fun on_cycle(q: *mach.type.query.Query, tid: mach.type.kind.TypeId) bool
 ```
 
 whether record or union `tid` reaches itself through its members

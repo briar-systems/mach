@@ -5,7 +5,7 @@
 checked arithmetic: counts, offsets, addresses, alignments and ids typed by
 their unit, and the narrowing conversions, each refusing overflow with a cause
 
-<sub>source: [`src/base/checked.mach`](../../../src/base/checked.mach) · imported by 1 module</sub>
+Source: [`src/base/checked.mach`](../../../src/base/checked.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,21 +21,21 @@ their unit, and the narrowing conversions, each refusing overflow with a cause
 
 | On `Cause` | |
 | :--- | :--- |
-| [`ADD_OVERFLOW`](#cause) · [`usize_add`](#usize_add) · [`usize_mul`](#usize_mul) | |
+| [`ADD_OVERFLOW`](#cause), [`usize_add`](#usize_add), [`usize_mul`](#usize_mul) | |
 | [`align_u64_up`](#align_u64_up) | the address-space twin of align_offset_up: a u64 value rounded up to a power-of-two alignment, refusing an invalid alignment and an overflow |
-| [`usize_to_u16`](#usize_to_u16) · [`usize_to_u32`](#usize_to_u32) · [`u64_to_u32`](#u64_to_u32) · [`usize_to_i32`](#usize_to_i32) | |
+| [`usize_to_u16`](#usize_to_u16), [`usize_to_u32`](#usize_to_u32), [`u64_to_u32`](#u64_to_u32), [`usize_to_i32`](#usize_to_i32) | |
 
 | On `Count` | |
 | :--- | :--- |
-| [`count`](#count-1) · [`count_add`](#count_add) · [`count_mul`](#count_mul) · [`range_fits`](#range_fits) · [`id_below`](#id_below) | |
+| [`count`](#count-1), [`count_add`](#count_add), [`count_mul`](#count_mul), [`range_fits`](#range_fits), [`id_below`](#id_below) | |
 
 | On `Offset` | |
 | :--- | :--- |
-| [`offset`](#offset-1) · [`offset_add`](#offset_add) · [`align_offset_up`](#align_offset_up) | |
+| [`offset`](#offset-1), [`offset_add`](#offset_add), [`align_offset_up`](#align_offset_up) | |
 
 | On `Address` | |
 | :--- | :--- |
-| [`address`](#address-1) · [`address_add`](#address_add) | |
+| [`address`](#address-1), [`address_add`](#address_add) | |
 
 | On `Alignment` | |
 | :--- | :--- |

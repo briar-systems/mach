@@ -2,12 +2,13 @@
 
 # mach.front.parser
 
-the parser's entry: one token stream parsed into a syntax tree, then its docstrings
-linted, the tree handed back only when the parse completed
+the parser's entry: one token stream parsed into a syntax tree, handed back only when
+the parse completed. its docstrings are linted by name resolution, for the project's
+own modules only
 
-<sub>source: [`src/front/parser.mach`](../../../src/front/parser.mach) · imported by 3 modules</sub>
+Source: [`src/front/parser.mach`](../../../src/front/parser.mach)
 
-<sub>`front_lexer` is [`mach.front.lexer`](lexer.md) · `ast` is [`mach.front.ast`](ast.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `diagnostic` is [`mach.base.diagnostic`](../base/diagnostic.md) · `report_phase` is [`mach.report.phase`](../report/phase.md) · `state` is [`mach.front.parser.state`](parser/state.md)</sub>
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.intern`](../base/intern.md), [`mach.front.ast`](ast.md), [`mach.front.lexer`](lexer.md), [`mach.front.parser.state`](parser/state.md), [`mach.report.phase`](../report/phase.md).
 
 | Functions | |
 | :--- | :--- |
@@ -20,7 +21,7 @@ linted, the tree handed back only when the parse completed
 ### parse
 
 ```mach
-pub fun parse(tokens: *front_lexer.TokenStream, out: *ast.Ast, names: *intern.Interner, diags: *diagnostic.DiagnosticStore) res[report_phase.PhaseStatus, state.ParseFail]
+pub fun parse(tokens: *mach.front.lexer.TokenStream, out: *mach.front.ast.Ast, names: *mach.base.intern.Interner, diags: *mach.base.diagnostic.DiagnosticStore) res[mach.report.phase.PhaseStatus, mach.front.parser.state.ParseFail]
 ```
 
 the names the tree holds are interned in `names`, which must outlive it

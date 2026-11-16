@@ -10,9 +10,9 @@ recipe, worked out once per type and kept in the type table, which `$type_id` an
 information keys types by. `anonymous` interns the recipe of an anonymous aggregate's fields
 as its name.
 
-<sub>source: [`src/front/sema/recipe.mach`](../../../../src/front/sema/recipe.mach) · imported by 2 modules</sub>
+Source: [`src/front/sema/recipe.mach`](../../../../src/front/sema/recipe.mach)
 
-<sub>`session` is [`mach.session`](../../session.md) · `type_kind` is [`mach.type.kind`](../../type/kind.md) · `type_field` is [`mach.type.field`](../../type/field.md) · `intern` is [`mach.base.intern`](../../base/intern.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.session`](../../session.md), [`mach.type.field`](../../type/field.md), [`mach.type.kind`](../../type/kind.md).
 
 | Functions | |
 | :--- | :--- |
@@ -26,14 +26,14 @@ as its name.
 ### anonymous
 
 ```mach
-pub fun anonymous(s: *session.Session, kind: type_kind.TypeKind,
-    fields: *type_field.Entry, count: u32) res[intern.StrId, fail.Fail]
+pub fun anonymous(s: *mach.session.Session, kind: mach.type.kind.TypeKind,
+    fields: *mach.type.field.Entry, count: u32) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
 ### identity
 
 ```mach
-pub fun identity(s: *session.Session, tid: type_kind.TypeId) res[u64, fail.Fail]
+pub fun identity(s: *mach.session.Session, tid: mach.type.kind.TypeId) res[u64, mach.base.fail.Fail]
 ```
 
 the first 64 bits of sha-256 over a domain tag and the type's canonical recipe; the recipe

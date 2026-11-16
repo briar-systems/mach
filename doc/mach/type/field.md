@@ -8,9 +8,9 @@ a table is staged entry by entry and then published for its type. publishing ove
 held other fields says so, since every fact read from the old one is then stale, and a reset of
 the projection clears all of it.
 
-<sub>source: [`src/type/field.mach`](../../../src/type/field.mach) · imported by 30 modules</sub>
+Source: [`src/type/field.mach`](../../../src/type/field.mach)
 
-<sub>`intern` is [`mach.base.intern`](../base/intern.md) · `deprecation` is [`mach.type.deprecation`](deprecation.md) · `A` is `std.allocator` · `handle` is [`mach.base.handle`](../base/handle.md) · `map` is `std.collections.map` · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.handle`](../base/handle.md), [`mach.base.intern`](../base/intern.md), [`mach.type.deprecation`](deprecation.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,14 +21,14 @@ the projection clears all of it.
 
 | On `Projection` | |
 | :--- | :--- |
-| [`projection_init`](#projection_init) · [`projection_dnit`](#projection_dnit) · [`projection_reset`](#projection_reset) | |
+| [`projection_init`](#projection_init), [`projection_dnit`](#projection_dnit), [`projection_reset`](#projection_reset) | |
 | [`stage`](#stage) | reserves room for `additional` entries and answers where the next staged run starts |
 | [`entry_push`](#entry_push) | |
 | [`publish`](#publish) | publish the staged run as the fields of `ty` |
 | [`table_for`](#table_for) | the table published for `ty` |
 | [`entry_at`](#entry_at) | entry `ix` of the published table `ft`, which holds more than `ix` entries |
 | [`discriminator_of`](#discriminator_of) | the declared discriminator of tag nominal `nom`, TYPE_NIL when it has none |
-| [`discriminator_set`](#discriminator_set) · [`discriminator_del`](#discriminator_del) | |
+| [`discriminator_set`](#discriminator_set), [`discriminator_del`](#discriminator_del) | |
 | [`decoration_of`](#decoration_of) | the decorations `ty` declares; none when it declares none |
 | [`decoration_set`](#decoration_set) | |
 
@@ -38,10 +38,10 @@ the projection clears all of it.
 
 ```mach
 pub rec Entry {
-    name: intern.StrId;
+    name: mach.base.intern.StrId;
     ty:   TypeId;
     # a tag case's deprecation notice; absent on every record and union field
-    deprecation: deprecation.Deprecation;
+    deprecation: mach.type.deprecation.Deprecation;
 }
 ```
 
@@ -72,17 +72,17 @@ pub rec Table {
 
 ```mach
 pub rec Projection {
-    a: *A.Allocator;
+    a: *std.allocator.Allocator;
 
     # by type id, one past the index of its table in `tables`, 0 where it has none
-    tables: handle.StableChunks[Table];
+    tables: mach.base.handle.StableChunks[Table];
     index:  Vector[u32];
-    pool:   handle.StableChunks[Entry];
+    pool:   mach.base.handle.StableChunks[Entry];
 
     # the declared discriminator type per tag nominal, re-installed with the case table
-    discriminators: map.Map[TypeId, TypeId];
+    discriminators: std.collections.map.Map[TypeId, TypeId];
     # the declared decorations per nominal, re-installed with its field table
-    decorations: map.Map[TypeId, Decoration];
+    decorations: std.collections.map.Map[TypeId, Decoration];
 }
 ```
 
@@ -93,7 +93,7 @@ reset clears all of it
 ### projection_init
 
 ```mach
-pub fun projection_init(a: *A.Allocator) Projection
+pub fun projection_init(a: *std.allocator.Allocator) Projection
 ```
 
 ### projection_dnit
@@ -111,7 +111,7 @@ pub fun projection_reset(p: *Projection)
 ### stage
 
 ```mach
-pub fun stage(p: *Projection, additional: u32) res[u32, fail.Fail]
+pub fun stage(p: *Projection, additional: u32) res[u32, mach.base.fail.Fail]
 ```
 
 reserves room for `additional` entries and answers where the next staged run starts
@@ -119,13 +119,13 @@ reserves room for `additional` entries and answers where the next staged run sta
 ### entry_push
 
 ```mach
-pub fun entry_push(p: *Projection, fe: Entry) err[fail.Fail]
+pub fun entry_push(p: *Projection, fe: Entry) err[mach.base.fail.Fail]
 ```
 
 ### publish
 
 ```mach
-pub fun publish(p: *Projection, ty: TypeId, fields_start: u32, fields_len: u32) res[bool, fail.Fail]
+pub fun publish(p: *Projection, ty: TypeId, fields_start: u32, fields_len: u32) res[bool, mach.base.fail.Fail]
 ```
 
 publish the staged run as the fields of `ty`. true when `ty` already had a table and this
@@ -158,7 +158,7 @@ the declared discriminator of tag nominal `nom`, TYPE_NIL when it has none
 ### discriminator_set
 
 ```mach
-pub fun discriminator_set(p: *Projection, nom: TypeId, disc: TypeId) err[fail.Fail]
+pub fun discriminator_set(p: *Projection, nom: TypeId, disc: TypeId) err[mach.base.fail.Fail]
 ```
 
 ### discriminator_del
@@ -178,6 +178,6 @@ the decorations `ty` declares; none when it declares none
 ### decoration_set
 
 ```mach
-pub fun decoration_set(p: *Projection, ty: TypeId, d: Decoration) err[fail.Fail]
+pub fun decoration_set(p: *Projection, ty: TypeId, d: Decoration) err[mach.base.fail.Fail]
 ```
 

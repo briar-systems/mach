@@ -11,9 +11,9 @@ an edge grows when the argument wraps the parameter (`L[*T]` in `L[T]`) rather t
 being it, `^T` included as the parameter itself since `^` is idempotent. a cycle with a
 growing edge mints a fresh instance at every trip, so its generics are expansive
 
-<sub>source: [`src/type/query/expansive.mach`](../../../../src/type/query/expansive.mach) · imported by 4 modules</sub>
+Source: [`src/type/query/expansive.mach`](../../../../src/type/query/expansive.mach)
 
-<sub>`type_query` is [`mach.type.query`](../query.md) · `type_kind` is [`mach.type.kind`](../kind.md) · `type` is [`mach.type`](../../type.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.type`](../../type.md), [`mach.type.kind`](../kind.md), [`mach.type.query`](../query.md).
 
 | Functions | |
 | :--- | :--- |
@@ -29,7 +29,7 @@ growing edge mints a fresh instance at every trip, so its generics are expansive
 ### nominal
 
 ```mach
-pub fun nominal(q: *type_query.Query, generic: type_kind.TypeId) bool
+pub fun nominal(q: *mach.type.query.Query, generic: mach.type.kind.TypeId) bool
 ```
 
 whether generic nominal `generic` lies on an instantiation cycle that grows an
@@ -39,7 +39,7 @@ generic the cycle could pass through has no fields yet
 ### holds
 
 ```mach
-pub fun holds(q: *type_query.Query, tid: type_kind.TypeId) bool
+pub fun holds(q: *mach.type.query.Query, tid: mach.type.kind.TypeId) bool
 ```
 
 whether `tid` holds, by value, an instance of an expansive generic
@@ -47,7 +47,7 @@ whether `tid` holds, by value, an instance of an expansive generic
 ### instance_is
 
 ```mach
-pub fun instance_is(types: *type.TypeInterner, facts: *type_query.Facts, tid: type_kind.TypeId) res[bool, fail.Fail]
+pub fun instance_is(types: *mach.type.TypeInterner, facts: *mach.type.query.Facts, tid: mach.type.kind.TypeId) res[bool, mach.base.fail.Fail]
 ```
 
 whether `tid` is an instance of an expansive generic
@@ -55,7 +55,7 @@ whether `tid` is an instance of an expansive generic
 ### holds_instance
 
 ```mach
-pub fun holds_instance(types: *type.TypeInterner, facts: *type_query.Facts, tid: type_kind.TypeId) res[bool, fail.Fail]
+pub fun holds_instance(types: *mach.type.TypeInterner, facts: *mach.type.query.Facts, tid: mach.type.kind.TypeId) res[bool, mach.base.fail.Fail]
 ```
 
 whether `tid` holds, by value, an instance of an expansive generic

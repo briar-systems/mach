@@ -4,13 +4,13 @@
 
 checking each decorator against its declaration: its places, arguments and rule
 
-<sub>source: [`src/front/sema/decorator.mach`](../../../../src/front/sema/decorator.mach) · imported by 1 module</sub>
+Source: [`src/front/sema/decorator.mach`](../../../../src/front/sema/decorator.mach)
 
-<sub>`sema_context` is [`mach.front.sema.context`](context.md) · `ast_decl` is [`mach.front.ast.decl`](../ast/decl.md)</sub>
+Uses types from [`mach.front.ast.decl`](../ast/decl.md), [`mach.front.sema.context`](context.md).
 
 | Functions | |
 | :--- | :--- |
-| [`infer_decorator_args`](#infer_decorator_args) · [`validate_decorators`](#validate_decorators) | |
+| [`infer_decorator_args`](#infer_decorator_args), [`validate_decorators`](#validate_decorators) | |
 
 ---
 
@@ -19,12 +19,12 @@ checking each decorator against its declaration: its places, arguments and rule
 ### infer_decorator_args
 
 ```mach
-pub fun infer_decorator_args(sc: *sema_context.SemaContext, d: *ast_decl.Decl)
+pub fun infer_decorator_args(sc: *mach.front.sema.context.SemaContext, d: *mach.front.ast.decl.Decl)
 ```
 
 ### validate_decorators
 
 ```mach
-pub fun validate_decorators(sc: *sema_context.SemaContext, d: *ast_decl.Decl)
+pub fun validate_decorators(sc: *mach.front.sema.context.SemaContext, d: *mach.front.ast.decl.Decl)
 ```
 

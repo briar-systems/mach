@@ -7,9 +7,9 @@ invocation expanded, its outputs staged and published, and its stamp kept, so
 a step runs again only when what it reads changed. the build engine runs a
 project's own steps and its dependencies' steps as phases of a unit
 
-<sub>source: [`src/build/step.mach`](../../../src/build/step.mach) · imported by 2 modules</sub>
+Source: [`src/build/step.mach`](../../../src/build/step.mach)
 
-<sub>`A` is `std.allocator` · `project` is [`mach.compile.project`](../compile/project.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `intern` is [`mach.base.intern`](../base/intern.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.compile.project`](../compile/project.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -44,7 +44,7 @@ one exported dependency step selected for a cell, by position in the closure
 ### run
 
 ```mach
-pub fun run(a: *A.Allocator, p: *project.Project) err[fail.Fail]
+pub fun run(a: *std.allocator.Allocator, p: *mach.compile.project.Project) err[mach.base.fail.Fail]
 ```
 
 run the declaring project's prerequisite steps for the configured cell, in its
@@ -54,7 +54,7 @@ in the root's output tree through an absolute `{project.work}`
 ### dependency_plan
 
 ```mach
-pub fun dependency_plan(p: *project.Project, isa: intern.StrId, os: intern.StrId, abi: intern.StrId) res[Vector[Dependency], fail.Fail]
+pub fun dependency_plan(p: *mach.compile.project.Project, isa: mach.base.intern.StrId, os: mach.base.intern.StrId, abi: mach.base.intern.StrId) res[Vector[Dependency], mach.base.fail.Fail]
 ```
 
 the exported dependency steps a cell runs, in execution order: each realized
@@ -69,6 +69,6 @@ order. shared by `dependency_run` and the build plan display
 ### dependency_run
 
 ```mach
-pub fun dependency_run(p: *project.Project, isa: intern.StrId, os: intern.StrId, abi: intern.StrId) err[fail.Fail]
+pub fun dependency_run(p: *mach.compile.project.Project, isa: mach.base.intern.StrId, os: mach.base.intern.StrId, abi: mach.base.intern.StrId) err[mach.base.fail.Fail]
 ```
 

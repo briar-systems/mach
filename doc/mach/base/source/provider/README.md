@@ -9,7 +9,7 @@ package ids it holds. a member answers a name it does not hold by saying so, nev
 so one provider can stand in front of another, as the editor's overlay stands in front of the
 disk.
 
-<sub>[`mach.base.source.provider`](../provider.md) · 2 modules · imported by [`compile`](../../../compile/README.md), [`front`](../../../front/README.md), [`session`](../../../session/README.md)</sub>
+The directory's root module is [`mach.base.source.provider`](../provider.md).
 
 | Module | |
 | :--- | :--- |

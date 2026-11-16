@@ -2,8 +2,6 @@
 
 # mach.front.sema
 
-<sub>31 modules · imports [`base`](../../base/README.md), [`report`](../../report/README.md), [`session`](../../session/README.md), [`target`](../../target/README.md), [`type`](../../type/README.md) · imported by [`build`](../../build/README.md), [`compile`](../../compile/README.md), [`lower`](../../lower/README.md)</sub>
-
 | Module | |
 | :--- | :--- |
 | [`abitype`](abitype.md) | `#[abi_type]` declarations: C types whose layout the target supplies, such as `va_list` |

@@ -11,9 +11,7 @@ architecture families names. a tag's id is its row's position plus one, 0
 standing for none, so mach states no tag of its own and a row mink adds is a
 tag with no change here
 
-<sub>source: [`src/target/tags.mach`](../../../src/target/tags.mach) · imported by 8 modules</sub>
-
-<sub>`mink_os` is `mink.catalog.os` · `mink_arch` is `mink.catalog.arch`</sub>
+Source: [`src/target/tags.mach`](../../../src/target/tags.mach)
 
 | Functions | |
 | :--- | :--- |
@@ -41,7 +39,7 @@ tag with no change here
 ### sys_id
 
 ```mach
-pub fun sys_id(s: *mink_os.System) u32
+pub fun sys_id(s: *mink.catalog.os.System) u32
 ```
 
 the id of mink's system `s`, NONE for one its list does not hold
@@ -49,7 +47,7 @@ the id of mink's system `s`, NONE for one its list does not hold
 ### arch_id
 
 ```mach
-pub fun arch_id(a: *mink_arch.Arch) u32
+pub fun arch_id(a: *mink.catalog.arch.Arch) u32
 ```
 
 the id of mink's architecture `a`, NONE for one its list does not hold
@@ -89,7 +87,7 @@ the name of the architecture tag `id`, "unknown" for NONE or an id past the list
 ### abi_id
 
 ```mach
-pub fun abi_id(row: *mink_arch.Abi) u32
+pub fun abi_id(row: *mink.catalog.arch.Abi) u32
 ```
 
 the id of mink's convention row `row`: the id of its spelling, which every row of that

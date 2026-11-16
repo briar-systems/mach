@@ -7,13 +7,13 @@ stage its gitlink and register it in .gitmodules with the declared source; the c
 must be a repository root at that gitlink, match its committed tree, keep every symlink
 inside itself, and satisfy every exact selector and version range the closure declares
 
-<sub>source: [`src/package/git/verify.mach`](../../../../src/package/git/verify.mach) · imported by 1 module</sub>
+Source: [`src/package/git/verify.mach`](../../../../src/package/git/verify.mach)
 
-<sub>`session` is [`mach.session`](../../session.md) · `git` is [`mach.package.git`](../git.md) · `manifest_model` is [`mach.manifest.model`](../../manifest/model.md) · `intern` is [`mach.base.intern`](../../base/intern.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.manifest.model`](../../manifest/model.md), [`mach.package.git`](../git.md), [`mach.session`](../../session.md).
 
 | Functions | |
 | :--- | :--- |
-| [`requirer_selector_satisfied`](#requirer_selector_satisfied) · [`realized`](#realized) | |
+| [`requirer_selector_satisfied`](#requirer_selector_satisfied), [`realized`](#realized) | |
 
 ---
 
@@ -22,14 +22,14 @@ inside itself, and satisfy every exact selector and version range the closure de
 ### requirer_selector_satisfied
 
 ```mach
-pub fun requirer_selector_satisfied(s: *session.Session, gi: *git.Inspector, alias: str, chain: str, project_root: str,
-    dir_dep: str, d: *manifest_model.DepDef, content: intern.StrId, root_own: bool) err[fail.Fail]
+pub fun requirer_selector_satisfied(s: *mach.session.Session, gi: *mach.package.git.Inspector, alias: str, chain: str, project_root: str,
+    dir_dep: str, d: *mach.manifest.model.DepDef, content: mach.base.intern.StrId, root_own: bool) err[mach.base.fail.Fail]
 ```
 
 ### realized
 
 ```mach
-pub fun realized(s: *session.Session, gi: *git.Inspector, alias: str, parent_root: str,
-    dep_dir: str, dir_dep: str, d: *manifest_model.DepDef) res[intern.StrId, fail.Fail]
+pub fun realized(s: *mach.session.Session, gi: *mach.package.git.Inspector, alias: str, parent_root: str,
+    dep_dir: str, dir_dep: str, d: *mach.manifest.model.DepDef) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 

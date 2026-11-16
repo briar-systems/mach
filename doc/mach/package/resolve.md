@@ -7,9 +7,9 @@ through a version range resolves together against the releases its source publis
 (resolver.mach); an identity the root or a fixed edge selects by ref or path is fixed, and a
 requirement on it is overridden
 
-<sub>source: [`src/package/resolve.mach`](../../../src/package/resolve.mach) · imported by 2 modules</sub>
+Source: [`src/package/resolve.mach`](../../../src/package/resolve.mach)
 
-<sub>`resolver` is [`mach.package.resolver`](resolver.md) · `package_closure` is [`mach.package.closure`](closure.md) · `manifest_load` is [`mach.manifest.load`](../manifest/load.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.manifest.load`](../manifest/load.md), [`mach.package.closure`](closure.md), [`mach.package.resolver`](resolver.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -35,7 +35,7 @@ requirement on it is overridden
 
 ```mach
 pub rec Resolution {
-    picks:  Vector[resolver.Choice];
+    picks:  Vector[mach.package.resolver.Choice];
     ranged: bool;
     notes:  Vector[str];
 }
@@ -47,8 +47,8 @@ requirement a root `ref` or `path` overrides
 ### versions
 
 ```mach
-pub fun versions(op: *package_closure.Operation, doc: *manifest_load.Doc, lowest: bool, lock: bool, unlocked: str,
-    root_notes: bool, walk: *package_closure.Walk) res[Resolution, fail.Fail]
+pub fun versions(op: *mach.package.closure.Operation, doc: *mach.manifest.load.Doc, lowest: bool, lock: bool, unlocked: str,
+    root_notes: bool, walk: *mach.package.closure.Walk) res[Resolution, mach.base.fail.Fail]
 ```
 
 resolve every identity the closure reaches through a version range: the root's
@@ -94,7 +94,7 @@ releases by version, and a row for each that does
 ### outdated
 
 ```mach
-pub fun outdated(op: *package_closure.Operation, doc: *manifest_load.Doc, offline: bool) res[Outdated, fail.Fail]
+pub fun outdated(op: *mach.package.closure.Operation, doc: *mach.manifest.load.Doc, offline: bool) res[Outdated, mach.base.fail.Fail]
 ```
 
 each version-selected identity's pinned release, the highest this compiler and every range
@@ -105,6 +105,6 @@ accept, and the highest release published
 ### pick_index
 
 ```mach
-pub fun pick_index(picks: *Vector[resolver.Choice], id: str) i64
+pub fun pick_index(picks: *Vector[mach.package.resolver.Choice], id: str) i64
 ```
 

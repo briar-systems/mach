@@ -15,9 +15,9 @@ so passes repeat until one adds nothing. beside its places, a parameter is reach
 argument appears anywhere an instance's fields lead, an empty array's element included,
 which is what a question about what a type contains reads
 
-<sub>source: [`src/type/query/placement.mach`](../../../../src/type/query/placement.mach) · imported by 2 modules</sub>
+Source: [`src/type/query/placement.mach`](../../../../src/type/query/placement.mach)
 
-<sub>`type_query` is [`mach.type.query`](../query.md) · `map` is `std.collections.map` · `type_kind` is [`mach.type.kind`](../kind.md) · `Entry` is private · `Param` is private</sub>
+Uses types from [`mach.type.kind`](../kind.md), [`mach.type.query`](../query.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -26,11 +26,11 @@ which is what a question about what a type contains reads
 
 | On `Place` | |
 | :--- | :--- |
-| [`LAID`](#place) · [`LAID_SECRET`](#place) · [`POINTEE`](#place) · [`place_at`](#place_at) | |
+| [`LAID`](#place), [`LAID_SECRET`](#place), [`POINTEE`](#place), [`place_at`](#place_at) | |
 
 | On `Places` | |
 | :--- | :--- |
-| [`init`](#init) · [`dnit`](#dnit) | |
+| [`init`](#init), [`dnit`](#dnit) | |
 | [`settle`](#settle) | settles the places of `generic` and every generic it reaches; false when they cannot be known, because a generic it reaches has no fields yet or the walk failed |
 | [`bits`](#bits) | the places parameter `param` of a settled generic takes |
 | [`reached`](#reached) | whether parameter `param` of a settled generic is reached, through storage or not |
@@ -66,8 +66,8 @@ pub fun place_at(i: u32) Place
 
 ```mach
 pub rec Places {
-    q:       *type_query.Query;
-    index:   map.Map[type_kind.TypeId, u32];
+    q:       *mach.type.query.Query;
+    index:   std.collections.map.Map[mach.type.kind.TypeId, u32];
     entries: Vector[Entry];
     params:  Vector[Param];
     # a generic met had no field table, so no answer is final
@@ -79,7 +79,7 @@ pub rec Places {
 ### init
 
 ```mach
-pub fun init(q: *type_query.Query) Places
+pub fun init(q: *mach.type.query.Query) Places
 ```
 
 ### dnit
@@ -91,7 +91,7 @@ pub fun dnit(p: *Places)
 ### settle
 
 ```mach
-pub fun settle(p: *Places, generic: type_kind.TypeId) bool
+pub fun settle(p: *Places, generic: mach.type.kind.TypeId) bool
 ```
 
 settles the places of `generic` and every generic it reaches; false when they cannot be
@@ -100,7 +100,7 @@ known, because a generic it reaches has no fields yet or the walk failed
 ### bits
 
 ```mach
-pub fun bits(p: *Places, generic: type_kind.TypeId, param: u32) u8
+pub fun bits(p: *Places, generic: mach.type.kind.TypeId, param: u32) u8
 ```
 
 the places parameter `param` of a settled generic takes
@@ -108,7 +108,7 @@ the places parameter `param` of a settled generic takes
 ### reached
 
 ```mach
-pub fun reached(p: *Places, generic: type_kind.TypeId, param: u32) bool
+pub fun reached(p: *Places, generic: mach.type.kind.TypeId, param: u32) bool
 ```
 
 whether parameter `param` of a settled generic is reached, through storage or not
@@ -116,7 +116,7 @@ whether parameter `param` of a settled generic is reached, through storage or no
 ### via
 
 ```mach
-pub fun via(p: *Places, generic: type_kind.TypeId, param: u32, place: Place) u32
+pub fun via(p: *Places, generic: mach.type.kind.TypeId, param: u32, place: Place) u32
 ```
 
 the field of `generic` through which `param` first took place `place`, which it must take

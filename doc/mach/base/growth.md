@@ -14,9 +14,7 @@ was: the old storage and capacity stay valid and nothing moved. a capacity
 that cannot count what is needed, or a byte size that overflows, refuses
 with overflow; otherwise the refusal is the allocator's.
 
-<sub>source: [`src/base/growth.mach`](../../../src/base/growth.mach) · imported by 20 modules</sub>
-
-<sub>`A` is `std.allocator`</sub>
+Source: [`src/base/growth.mach`](../../../src/base/growth.mach)
 
 | Functions | |
 | :--- | :--- |
@@ -36,7 +34,7 @@ with overflow; otherwise the refusal is the allocator's.
 ### reserve
 
 ```mach
-pub fun reserve[T](a: *A.Allocator, data: **T, cap: *u32, needed: usize) err[A.Error]
+pub fun reserve[T](a: *std.allocator.Allocator, data: **T, cap: *u32, needed: usize) err[std.allocator.Error]
 ```
 
 grow the array at `data`, of `cap` elements, so it holds at least `needed`
@@ -44,7 +42,7 @@ grow the array at `data`, of `cap` elements, so it holds at least `needed`
 ### reserve_usize
 
 ```mach
-pub fun reserve_usize[T](a: *A.Allocator, data: **T, cap: *usize, needed: usize) err[A.Error]
+pub fun reserve_usize[T](a: *std.allocator.Allocator, data: **T, cap: *usize, needed: usize) err[std.allocator.Error]
 ```
 
 reserve for an array whose capacity is a usize
@@ -52,7 +50,7 @@ reserve for an array whose capacity is a usize
 ### resize
 
 ```mach
-pub fun resize[T](a: *A.Allocator, data: **T, cap: *u32, count: usize) err[A.Error]
+pub fun resize[T](a: *std.allocator.Allocator, data: **T, cap: *u32, count: usize) err[std.allocator.Error]
 ```
 
 give the array at `data`, of `cap` elements, exactly `count`; zero releases it
@@ -60,7 +58,7 @@ give the array at `data`, of `cap` elements, exactly `count`; zero releases it
 ### resize_usize
 
 ```mach
-pub fun resize_usize[T](a: *A.Allocator, data: **T, cap: *usize, count: usize) err[A.Error]
+pub fun resize_usize[T](a: *std.allocator.Allocator, data: **T, cap: *usize, count: usize) err[std.allocator.Error]
 ```
 
 resize for an array whose capacity is a usize

@@ -8,9 +8,9 @@ the build plan: the units a request selects, with every decision the engine exec
 dependency closure and adds the cells a dependency's export library requires, and
 `configure` fills in what the closure decides. `render` prints a plan for `mach build --plan`.
 
-<sub>source: [`src/build/plan.mach`](../../../src/build/plan.mach) · imported by 5 modules</sub>
+Source: [`src/build/plan.mach`](../../../src/build/plan.mach)
 
-<sub>`diagnostic` is [`mach.base.diagnostic`](../base/diagnostic.md) · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md) · `project` is [`mach.compile.project`](../compile/project.md) · `request` is [`mach.compile.request`](../compile/request.md) · `input` is [`mach.target.input`](../target/input.md) · `manifest_link` is [`mach.manifest.link`](../manifest/link.md) · `mink_subsystem` is `mink.catalog.subsystem` · `intern` is [`mach.base.intern`](../base/intern.md) · `manifest_model` is [`mach.manifest.model`](../manifest/model.md) · `base_source` is [`mach.base.source`](../base/source.md) · `session` is [`mach.session`](../session.md) · `manifest_select` is [`mach.manifest.select`](../manifest/select.md) · `compile_closure` is [`mach.compile.closure`](../compile/closure.md) · `io_writer` is `std.io.writer`</sub>
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.compile.closure`](../compile/closure.md), [`mach.compile.project`](../compile/project.md), [`mach.compile.request`](../compile/request.md), [`mach.manifest.link`](../manifest/link.md), [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.select`](../manifest/select.md), [`mach.session`](../session.md), [`mach.target.input`](../target/input.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -20,9 +20,9 @@ dependency closure and adds the cells a dependency's export library requires, an
 
 | On `PhaseKind` | |
 | :--- | :--- |
-| [`PH_DEP_STEPS`](#phasekind) · [`PH_LOAD`](#phasekind) · [`PH_STEPS`](#phasekind) · [`PH_SEMA`](#phasekind) | |
+| [`PH_DEP_STEPS`](#phasekind), [`PH_LOAD`](#phasekind), [`PH_STEPS`](#phasekind), [`PH_SEMA`](#phasekind) | |
 | [`PH_CODEGEN`](#phasekind) | each unit lowered and compiled, or its object restored |
-| [`PH_EMIT`](#phasekind) · [`PH_LINK`](#phasekind) | |
+| [`PH_EMIT`](#phasekind), [`PH_LINK`](#phasekind) | |
 | [`PH_TEST`](#phasekind) | a test build's test objects, after the normal objects they are lowered against |
 | [`phase_name`](#phase_name) | the name of a declared build phase, absent for an unknown catalog member |
 | [`phase_origin`](#phase_origin) | the origin a failure of the phase is reported under when no product raised it, the phase's own work outside every computation: a step, a file it reads or writes, the engine itself |
@@ -73,7 +73,7 @@ the name of a declared build phase, absent for an unknown catalog member
 ### phase_origin
 
 ```mach
-pub fun phase_origin(k: PhaseKind) diagnostic.Origin
+pub fun phase_origin(k: PhaseKind) mach.base.diagnostic.Origin
 ```
 
 the origin a failure of the phase is reported under when no product raised it, the phase's
@@ -83,7 +83,7 @@ build step is the build's, and a test build's test objects are generated code
 ### unknown_phase
 
 ```mach
-pub fun unknown_phase(a: *A.Allocator, k: PhaseKind) fail.Fail
+pub fun unknown_phase(a: *std.allocator.Allocator, k: PhaseKind) mach.base.fail.Fail
 ```
 
 an internal catalog failure with a caller-owned message
@@ -92,10 +92,10 @@ an internal catalog failure with a caller-owned message
 
 ```mach
 pub rec BuildUnit {
-    target_entry: *project.TargetEntry;
+    target_entry: *mach.compile.project.TargetEntry;
     profile:      str;
     opt_level:    u8;
-    goal:         request.BuildGoal;
+    goal:         mach.compile.request.BuildGoal;
     out_path:     str;
     # the expanded `[project].work`: the build owns the layout beneath it
     out_dir: str;
@@ -105,18 +105,18 @@ pub rec BuildUnit {
     ir_dir:       str;
     asm_dir:      str;
     test_dir:     str;
-    link_inputs:  Vector[input.Input];
+    link_inputs:  Vector[mach.target.input.Input];
     phases:       Vector[PhaseKind];
     steps:        Vector[str];
     dep_steps:    Vector[str];
-    export_links: Vector[manifest_link.LinkRequirement];
+    export_links: Vector[mach.manifest.link.LinkRequirement];
     configured:   bool;
 
     sel_target:   str;
     sel_artifact: str;
     is_required:  bool;
     requires:     Vector[str];
-    subsystem:    opt[*mink_subsystem.Subsystem];
+    subsystem:    opt[*mink.catalog.subsystem.Subsystem];
 
     owner:        str;
     owner_chain:  str;
@@ -133,7 +133,7 @@ adds what the realized dependency closure decides
 | :--- | :--- | :--- |
 | `steps` | `Vector[str]` | the declaring manifest's prerequisite steps in execution order, by name |
 | `dep_steps` | `Vector[str]` | exported dependency steps in execution order as `<dep id>.<step>`; empty until `configure` |
-| `export_links` | `Vector[manifest_link.LinkRequirement]` | the dependency closure's exported link requirements for this cell, in link order; empty until `configure` |
+| `export_links` | `Vector[mach.manifest.link.LinkRequirement]` | the dependency closure's exported link requirements for this cell, in link order; empty until `configure` |
 | `configured` | `bool` | `configure` ran, so `dep_steps` and `export_links` are effective |
 | `requires` | `Vector[str]` | the declaring manifest's artifacts this cell requires, by name |
 | `owner` | `str` | "" for a cell of the root manifest, or the id of the dependency whose export library requires the cell |
@@ -145,14 +145,14 @@ adds what the realized dependency closure decides
 
 ```mach
 pub rec BuildPlan {
-    request:  request.BuildRequest;
+    request:  mach.compile.request.BuildRequest;
     project:  str;
     units:    Vector[BuildUnit];
-    names:    *intern.Interner;
-    manifest: *manifest_model.Manifest;
-    closure:  project.Closure;
+    names:    *mach.base.intern.Interner;
+    manifest: *mach.manifest.model.Manifest;
+    closure:  mach.compile.project.Closure;
     located:  bool;
-    sources:  *base_source.SourceMap;
+    sources:  *mach.base.source.SourceMap;
 }
 ```
 
@@ -170,7 +170,7 @@ sources:  the texts the manifest and closure were read into, the map of the sess
 ### plan
 
 ```mach
-pub fun plan(a: *A.Allocator, itn: *intern.Interner, m: *manifest_model.Manifest, owned_req: request.BuildRequest) res[BuildPlan, fail.Fail]
+pub fun plan(a: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *mach.manifest.model.Manifest, owned_req: mach.compile.request.BuildRequest) res[BuildPlan, mach.base.fail.Fail]
 ```
 
 plan the request's own selection: `req.artifact` on `req.target`, each an
@@ -189,7 +189,7 @@ default selection holds, any other goal every one
 ### plan_to_run
 
 ```mach
-pub fun plan_to_run(a: *A.Allocator, s: *session.Session, m: *manifest_model.Manifest, owned_req: request.BuildRequest) res[BuildPlan, fail.Fail]
+pub fun plan_to_run(a: *std.allocator.Allocator, s: *mach.session.Session, m: *mach.manifest.model.Manifest, owned_req: mach.compile.request.BuildRequest) res[BuildPlan, mach.base.fail.Fail]
 ```
 
 `plan`, with the plan's dependency closure located in `s` as
@@ -203,7 +203,7 @@ pub fun plan_to_run(a: *A.Allocator, s: *session.Session, m: *manifest_model.Man
 ### plan_cells
 
 ```mach
-pub fun plan_cells(a: *A.Allocator, itn: *intern.Interner, m: *manifest_model.Manifest, owned_req: request.BuildRequest, cells: *Vector[manifest_select.Cell]) res[BuildPlan, fail.Fail]
+pub fun plan_cells(a: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *mach.manifest.model.Manifest, owned_req: mach.compile.request.BuildRequest, cells: *Vector[mach.manifest.select.Cell]) res[BuildPlan, mach.base.fail.Fail]
 ```
 
 plan resolved cells for one profile: each cell's artifact on its target, and
@@ -222,7 +222,7 @@ a cell's own profile is its caller's grouping and is not read here
 ### configure
 
 ```mach
-pub fun configure(s: *session.Session, bp: *BuildPlan) err[fail.Fail]
+pub fun configure(s: *mach.session.Session, bp: *BuildPlan) err[mach.base.fail.Fail]
 ```
 
 resolve every planned cell against the plan's dependency closure, filling in
@@ -240,7 +240,7 @@ report it. nothing is fetched, no step runs and no output is written
 ### plan_dependency_requirements
 
 ```mach
-pub fun plan_dependency_requirements(s: *session.Session, bp: *BuildPlan, unrealized: compile_closure.Unrealized) err[fail.Fail]
+pub fun plan_dependency_requirements(s: *mach.session.Session, bp: *BuildPlan, unrealized: mach.compile.closure.Unrealized) err[mach.base.fail.Fail]
 ```
 
 locate the root's dependency closure, once, into the plan, and add the cells a
@@ -262,7 +262,7 @@ are refused
 ### check_plan_outputs
 
 ```mach
-pub fun check_plan_outputs(a: *A.Allocator, plans: *Vector[BuildPlan]) err[fail.Fail]
+pub fun check_plan_outputs(a: *std.allocator.Allocator, plans: *Vector[BuildPlan]) err[mach.base.fail.Fail]
 ```
 
 refuse two plans of one selection, one per profile, that would write one
@@ -278,7 +278,7 @@ outputs at the same paths
 ### render
 
 ```mach
-pub fun render(a: *A.Allocator, w: *io_writer.Writer, p: *BuildPlan, itn: *intern.Interner) err[fail.Fail]
+pub fun render(a: *std.allocator.Allocator, w: *std.io.writer.Writer, p: *BuildPlan, itn: *mach.base.intern.Interner) err[mach.base.fail.Fail]
 ```
 
 render the effective plan: one block per selected cell, naming the project,
@@ -306,8 +306,8 @@ whether `path` lies under the directory `dir`
 ### requirement_input
 
 ```mach
-pub fun requirement_input(a: *A.Allocator, itn: *intern.Interner, root: str,
-    req: *manifest_link.LinkRequirement) res[input.Input, fail.Fail]
+pub fun requirement_input(a: *std.allocator.Allocator, itn: *mach.base.intern.Interner, root: str,
+    req: *mach.manifest.link.LinkRequirement) res[mach.target.input.Input, mach.base.fail.Fail]
 ```
 
 the input a manifest link requirement names: a framework or a library by

@@ -4,9 +4,9 @@
 
 strongly connected components of a directed graph over numbered nodes
 
-<sub>source: [`src/base/scc.mach`](../../../src/base/scc.mach) · imported by 2 modules</sub>
+Source: [`src/base/scc.mach`](../../../src/base/scc.mach)
 
-<sub>`A` is `std.allocator` · `fail` is [`mach.base.fail`](fail.md)</sub>
+Uses types from [`mach.base.fail`](fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -30,7 +30,7 @@ pub rec Arc {
 ### components
 
 ```mach
-pub fun components(alloc: *A.Allocator, n: u32, arcs: *Arc, e: u32, comp: *u32) res[u32, fail.Fail]
+pub fun components(alloc: *std.allocator.Allocator, n: u32, arcs: *Arc, e: u32, comp: *u32) res[u32, mach.base.fail.Fail]
 ```
 
 Tarjan's strongly connected components over `n` nodes and `e` arcs, iteratively; `comp`

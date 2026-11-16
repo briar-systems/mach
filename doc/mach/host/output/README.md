@@ -12,7 +12,7 @@ interrupted write leaves the original intact. the build owns its output
 layout: `directory` and `reserve` replace a stale entry of the wrong kind,
 and every failure names the path and the operation through `fail.refusal`
 
-<sub>[`mach.host.output`](../output.md) · 2 modules · imports [`base`](../../base/README.md) · imported by [`build`](../../build/README.md), [`cli`](../../cli/README.md), [`compile`](../../compile/README.md), [`manifest`](../../manifest/README.md), [`package`](../../package/README.md), [`tool`](../../tool/README.md)</sub>
+The directory's root module is [`mach.host.output`](../output.md).
 
 | Module | |
 | :--- | :--- |

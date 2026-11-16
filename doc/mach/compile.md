@@ -9,9 +9,9 @@ artifact's modules, and runs the query phases over them: resolve, sema, codegen,
 and link. `analyze` runs the front end alone for a tool, and `refresh_frontend`
 re-derives it after one module's text changes. the root manifest is read here too.
 
-<sub>source: [`src/compile.mach`](../../src/compile.mach) · imported by 7 modules</sub>
+Source: [`src/compile.mach`](../../src/compile.mach)
 
-<sub>`project` is [`mach.compile.project`](compile/project.md) · `module` is [`mach.session.module`](session/module.md) · `fail` is [`mach.base.fail`](base/fail.md) · `manifest_model` is [`mach.manifest.model`](manifest/model.md) · `manifest_select` is [`mach.manifest.select`](manifest/select.md) · `session` is [`mach.session`](session.md) · `query` is [`mach.session.query`](session/query.md) · `request` is [`mach.compile.request`](compile/request.md) · `compile_closure` is [`mach.compile.closure`](compile/closure.md) · `readout` is [`mach.report.readout`](report/readout.md) · `A` is `std.allocator` · `intern` is [`mach.base.intern`](base/intern.md)</sub>
+Uses types from [`mach.base.fail`](base/fail.md), [`mach.base.intern`](base/intern.md), [`mach.compile.closure`](compile/closure.md), [`mach.compile.project`](compile/project.md), [`mach.compile.request`](compile/request.md), [`mach.manifest.model`](manifest/model.md), [`mach.manifest.select`](manifest/select.md), [`mach.report.readout`](report/readout.md), [`mach.session`](session.md), [`mach.session.module`](session/module.md), [`mach.session.query`](session/query.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -20,7 +20,7 @@ re-derives it after one module's text changes. the root manifest is read here to
 
 | On `FrontendPhase` | |
 | :--- | :--- |
-| [`FRONTEND_PARSE`](#frontendphase) · [`FRONTEND_RESOLVE`](#frontendphase) · [`FRONTEND_SEMA`](#frontendphase) | |
+| [`FRONTEND_PARSE`](#frontendphase), [`FRONTEND_RESOLVE`](#frontendphase), [`FRONTEND_SEMA`](#frontendphase) | |
 | [`refresh_frontend`](#refresh_frontend) | re-derive a loaded project's frontend after one module's text changed, without reloading its closure |
 
 | On `Analysis` | |
@@ -34,7 +34,7 @@ re-derives it after one module's text changes. the root manifest is read here to
 | [`phase_finish`](#phase_finish) | a phase the query engine does not run is published as one it does: the project's diagnostics are refreshed beside its result |
 | [`reconfigure`](#reconfigure) | a loaded project under another request from its host: the build context is frozen again, so what read the old one is computed again, and nothing reads a context no freeze captured |
 | [`run_sema_pass`](#run_sema_pass) | |
-| [`run_codegen_pass`](#run_codegen_pass) | the codegen stage: each emitted module and instance unit lowered and compiled, or its object restored from `obj/` |
+| [`run_codegen_pass`](#run_codegen_pass) | the codegen stage: each emitted module lowered and compiled, or its object restored from `obj/` |
 | [`run_test_pass`](#run_test_pass) | the test stage: each test object, lowered against its module's normal object |
 | [`run_link_pass`](#run_link_pass) | the link stage: the artifact `job` names, written by its action only when an input of the link moved since it last ran or the artifact on disk is not the one it wrote |
 | [`closure_locate`](#closure_locate) | locate a root manifest's dependency closure with no build cell configured, as a build locates it: every dependency under dep/, its manifest and its direct edges, and nothing is checked against git or the pins |
@@ -63,7 +63,7 @@ pub def FrontendPhase: u8
 ### refresh_frontend
 
 ```mach
-pub fun refresh_frontend(p: *project.Project, mid: module.ModuleId, phase: FrontendPhase) res[bool, fail.Fail]
+pub fun refresh_frontend(p: *mach.compile.project.Project, mid: mach.session.module.ModuleId, phase: FrontendPhase) res[bool, mach.base.fail.Fail]
 ```
 
 re-derive a loaded project's frontend after one module's text changed, without
@@ -85,9 +85,9 @@ not survive is reported as ok(false): the caller reloads
 ```mach
 pub rec Analysis {
     root:       str;
-    manifest:   *manifest_model.Manifest;
-    selection:  *manifest_select.Selectors;
-    roots:      project.RootSet;
+    manifest:   *mach.manifest.model.Manifest;
+    selection:  *mach.manifest.select.Selectors;
+    roots:      mach.compile.project.RootSet;
     files:      *str;
     file_count: u32;
     phase:      FrontendPhase;
@@ -101,9 +101,9 @@ loaded beside the root set
 | Field | Type | |
 | :--- | :--- | :--- |
 | `root` | `str` | the project's directory, the one holding its mach.toml |
-| `manifest` | `*manifest_model.Manifest` | the project's manifest when the caller already read it, nil to read it from `root` |
-| `selection` | `*manifest_select.Selectors` | the artifact, target and profile selection, one cell of which is analyzed |
-| `roots` | `project.RootSet` | the root set the frontend loads: `project.ROOT_ARTIFACT` is the selected artifact's closure, `project.ROOT_UNION` every artifact's with the modules only a foreign target reaches gated out and `{artifact.<id>.out}` resolving over every artifact some artifact needs |
+| `manifest` | `*mach.manifest.model.Manifest` | the project's manifest when the caller already read it, nil to read it from `root` |
+| `selection` | `*mach.manifest.select.Selectors` | the artifact, target and profile selection, one cell of which is analyzed |
+| `roots` | `mach.compile.project.RootSet` | the root set the frontend loads: `project.ROOT_ARTIFACT` is the selected artifact's closure, `project.ROOT_UNION` every artifact's with the modules only a foreign target reaches gated out and `{artifact.<id>.out}` resolving over every artifact some artifact needs |
 | `files` | `*str` | source files whose modules load beside the root set, nil with count 0; a file of another project, or outside the root's source directory, is skipped |
 | `file_count` | `u32` | how many files |
 | `phase` | `FrontendPhase` | the last frontend phase to run |
@@ -111,7 +111,7 @@ loaded beside the root set
 ### analyze
 
 ```mach
-pub fun analyze(s: *session.Session, an: *Analysis) res[project.Project, fail.Fail]
+pub fun analyze(s: *mach.session.Session, an: *Analysis) res[mach.compile.project.Project, mach.base.fail.Fail]
 ```
 
 the frontend analysis tools share: the project comes back whenever the frontend ran,
@@ -133,13 +133,13 @@ I/O). every string `an` holds is borrowed for the call, and the project borrows 
 ### append_frontend_roots
 
 ```mach
-pub fun append_frontend_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[fail.Fail]
+pub fun append_frontend_roots(p: *mach.compile.project.Project, roots: *Vector[mach.session.query.QueryKey]) err[mach.base.fail.Fail]
 ```
 
 ### append_test_roots
 
 ```mach
-pub fun append_test_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[fail.Fail]
+pub fun append_test_roots(p: *mach.compile.project.Project, roots: *Vector[mach.session.query.QueryKey]) err[mach.base.fail.Fail]
 ```
 
 the codegen roots and each test object's lowering and codegen
@@ -147,8 +147,8 @@ the codegen roots and each test object's lowering and codegen
 ### phase_finish
 
 ```mach
-pub fun phase_finish(p: *project.Project,
-    result: err[fail.Fail]) err[fail.Fail]
+pub fun phase_finish(p: *mach.compile.project.Project,
+    result: err[mach.base.fail.Fail]) err[mach.base.fail.Fail]
 ```
 
 a phase the query engine does not run is published as one it does: the
@@ -157,7 +157,7 @@ project's diagnostics are refreshed beside its result
 ### reconfigure
 
 ```mach
-pub fun reconfigure(p: *project.Project, req: request.BuildRequest) err[fail.Fail]
+pub fun reconfigure(p: *mach.compile.project.Project, req: mach.compile.request.BuildRequest) err[mach.base.fail.Fail]
 ```
 
 a loaded project under another request from its host: the build context is frozen again, so
@@ -166,22 +166,22 @@ what read the old one is computed again, and nothing reads a context no freeze c
 ### run_sema_pass
 
 ```mach
-pub fun run_sema_pass(p: *project.Project) err[fail.Fail]
+pub fun run_sema_pass(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
 ```
 
 ### run_codegen_pass
 
 ```mach
-pub fun run_codegen_pass(p: *project.Project) err[fail.Fail]
+pub fun run_codegen_pass(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
 ```
 
-the codegen stage: each emitted module and instance unit lowered and compiled, or its object
+the codegen stage: each emitted module lowered and compiled, or its object
 restored from `obj/`
 
 ### run_test_pass
 
 ```mach
-pub fun run_test_pass(p: *project.Project) err[fail.Fail]
+pub fun run_test_pass(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
 ```
 
 the test stage: each test object, lowered against its module's normal object
@@ -189,7 +189,7 @@ the test stage: each test object, lowered against its module's normal object
 ### run_link_pass
 
 ```mach
-pub fun run_link_pass(p: *project.Project, job: *project.LinkJob) err[fail.Fail]
+pub fun run_link_pass(p: *mach.compile.project.Project, job: *mach.compile.project.LinkJob) err[mach.base.fail.Fail]
 ```
 
 the link stage: the artifact `job` names, written by its action only when an input of the
@@ -200,8 +200,8 @@ the bytes it holds (compile/cache)
 ### closure_locate
 
 ```mach
-pub fun closure_locate(s: *session.Session, m: *manifest_model.Manifest, project_root: str,
-    unrealized: compile_closure.Unrealized) res[project.Closure, fail.Fail]
+pub fun closure_locate(s: *mach.session.Session, m: *mach.manifest.model.Manifest, project_root: str,
+    unrealized: mach.compile.closure.Unrealized) res[mach.compile.project.Closure, mach.base.fail.Fail]
 ```
 
 locate a root manifest's dependency closure with no build cell configured, as a
@@ -219,8 +219,8 @@ edges, and nothing is checked against git or the pins
 ### closure_checked
 
 ```mach
-pub fun closure_checked(s: *session.Session, m: *manifest_model.Manifest, project_root: str,
-    check: *compile_closure.Check) res[project.Closure, fail.Fail]
+pub fun closure_checked(s: *mach.session.Session, m: *mach.manifest.model.Manifest, project_root: str,
+    check: *mach.compile.closure.Check) res[mach.compile.project.Closure, mach.base.fail.Fail]
 ```
 
 locate a root manifest's dependency closure as `closure_locate` does, holding every edge
@@ -234,8 +234,8 @@ to `check` as it is located, as `mach dep verify` does
 ### begin_build
 
 ```mach
-pub fun begin_build(s: *session.Session, m: *manifest_model.Manifest, closure: *project.Closure, req: *request.BuildRequest,
-    progress: *readout.Progress) res[project.Project, fail.Fail]
+pub fun begin_build(s: *mach.session.Session, m: *mach.manifest.model.Manifest, closure: *mach.compile.project.Closure, req: *mach.compile.request.BuildRequest,
+    progress: *mach.report.readout.Progress) res[mach.compile.project.Project, mach.base.fail.Fail]
 ```
 
 begin the build the request names: every goal, a test goal included, loads the
@@ -249,13 +249,13 @@ selected artifact's closure
 ### run_load_phase
 
 ```mach
-pub fun run_load_phase(p: *project.Project) err[fail.Fail]
+pub fun run_load_phase(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
 ```
 
 ### load_manifest
 
 ```mach
-pub fun load_manifest(s: *session.Session, project_root: str) res[manifest_model.Manifest, fail.Fail]
+pub fun load_manifest(s: *mach.session.Session, project_root: str) res[mach.manifest.model.Manifest, mach.base.fail.Fail]
 ```
 
 the root manifest of the project at `project_root`, read once: its text, an
@@ -272,7 +272,7 @@ records the input and the revision it was read at
 ### project_root_of
 
 ```mach
-pub fun project_root_of(alloc: *A.Allocator, file_path: str) res[opt[str], fail.Fail]
+pub fun project_root_of(alloc: *std.allocator.Allocator, file_path: str) res[opt[str], mach.base.fail.Fail]
 ```
 
 the root of the project a file belongs to: the nearest directory above it holding a
@@ -281,8 +281,8 @@ mach.toml, none when no directory does
 ### module_under
 
 ```mach
-pub fun module_under(alloc: *A.Allocator, itn: *intern.Interner, path: str, root: str, id_text: str,
-    src_text: str) res[opt[intern.StrId], fail.Fail]
+pub fun module_under(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, path: str, root: str, id_text: str,
+    src_text: str) res[opt[mach.base.intern.StrId], mach.base.fail.Fail]
 ```
 
 the module the file at `path` is under the project at `root`: none when it lies outside the
@@ -296,8 +296,8 @@ source directory
 ### file_module
 
 ```mach
-pub fun file_module(alloc: *A.Allocator, itn: *intern.Interner, path: str, root: str, id_text: str,
-    src_text: str) res[opt[intern.StrId], fail.Fail]
+pub fun file_module(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, path: str, root: str, id_text: str,
+    src_text: str) res[opt[mach.base.intern.StrId], mach.base.fail.Fail]
 ```
 
 the module the file at `path` is loaded as beside the project at `root`: none when the

@@ -10,9 +10,9 @@ publishes a graph into the type table's current projection and refuses one that 
 a table already there, so a module's typing or published surface brings the field tables it
 was read with.
 
-<sub>source: [`src/front/sema/fields.mach`](../../../../src/front/sema/fields.mach) · imported by 4 modules</sub>
+Source: [`src/front/sema/fields.mach`](../../../../src/front/sema/fields.mach)
 
-<sub>`type_kind` is [`mach.type.kind`](../../type/kind.md) · `collections_vector` is `std.collections.vector` · `type_field` is [`mach.type.field`](../../type/field.md) · `session` is [`mach.session`](../../session.md) · `A` is `std.allocator` · `CaptureMode` is private · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.session`](../../session.md), [`mach.type.field`](../../type/field.md), [`mach.type.kind`](../../type/kind.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -26,11 +26,11 @@ was read with.
 
 | On `Graph` | |
 | :--- | :--- |
-| [`init`](#init) · [`dnit`](#dnit) · [`install`](#install) | |
+| [`init`](#init), [`dnit`](#dnit), [`install`](#install) | |
 
 | Constants | |
 | :--- | :--- |
-| [`RECIPES`](#constants) · [`MATERIALIZED`](#constants) | |
+| [`RECIPES`](#constants), [`MATERIALIZED`](#constants) | |
 
 ---
 
@@ -38,11 +38,11 @@ was read with.
 
 ```mach
 pub rec Node {
-    ty:         type_kind.TypeId;
-    entries:    collections_vector.Vector[type_field.Entry];
-    decoration: type_field.Decoration;
+    ty:         mach.type.kind.TypeId;
+    entries:    std.collections.vector.Vector[mach.type.field.Entry];
+    decoration: mach.type.field.Decoration;
     # the declared discriminator of a tag nominal; TYPE_NIL on every other node
-    disc: type_kind.TypeId;
+    disc: mach.type.kind.TypeId;
 }
 ```
 
@@ -50,7 +50,7 @@ pub rec Node {
 
 ```mach
 pub rec Roots {
-    data: *type_kind.TypeId;
+    data: *mach.type.kind.TypeId;
     len:  usize;
 }
 ```
@@ -58,15 +58,15 @@ pub rec Roots {
 ### capture
 
 ```mach
-pub fun capture[T](s: *session.Session, a: *A.Allocator, roots: *Roots, count: usize, mode: CaptureMode, ctx: *T,
-    prepare: fun(*T, type_kind.TypeId) err[fail.Fail]) res[Graph, fail.Fail]
+pub fun capture[T](s: *mach.session.Session, a: *std.allocator.Allocator, roots: *Roots, count: usize, mode: CaptureMode, ctx: *T,
+    prepare: fun(*T, mach.type.kind.TypeId) err[mach.base.fail.Fail]) res[Graph, mach.base.fail.Fail]
 ```
 
 ## Graph
 
 ```mach
 pub rec Graph {
-    nodes:                collections_vector.Vector[Node];
+    nodes:                std.collections.vector.Vector[Node];
     installed:            bool;
     installed_generation: u64;
 }
@@ -75,7 +75,7 @@ pub rec Graph {
 ### init
 
 ```mach
-pub fun init(a: *A.Allocator) Graph
+pub fun init(a: *std.allocator.Allocator) Graph
 ```
 
 ### dnit
@@ -87,7 +87,7 @@ pub fun dnit(graph: *Graph)
 ### install
 
 ```mach
-pub fun install(s: *session.Session, graph: *Graph) err[fail.Fail]
+pub fun install(s: *mach.session.Session, graph: *Graph) err[mach.base.fail.Fail]
 ```
 
 ## Constants

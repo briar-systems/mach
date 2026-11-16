@@ -4,9 +4,9 @@
 
 the deprecation notice a declaration or a tag case carries
 
-<sub>source: [`src/type/deprecation.mach`](../../../src/type/deprecation.mach) · imported by 7 modules</sub>
+Source: [`src/type/deprecation.mach`](../../../src/type/deprecation.mach)
 
-<sub>`base_source` is [`mach.base.source`](../base/source.md) · `intern` is [`mach.base.intern`](../base/intern.md)</sub>
+Uses types from [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -24,8 +24,8 @@ the deprecation notice a declaration or a tag case carries
 ```mach
 pub rec Deprecation {
     present: bool;
-    owner:   base_source.FileId;
-    message: intern.StrId;
+    owner:   mach.base.source.FileId;
+    message: mach.base.intern.StrId;
 }
 ```
 

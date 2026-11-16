@@ -13,9 +13,9 @@ framework is named with its kind, and a file by its absolute path. mink adds the
 as one section every image leaves out, so an archive of the objects carries them
 to the link that takes it
 
-<sub>source: [`src/compile/claims.mach`](../../../src/compile/claims.mach) · imported by 2 modules</sub>
+Source: [`src/compile/claims.mach`](../../../src/compile/claims.mach)
 
-<sub>`project` is [`mach.compile.project`](project.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `manifest_link` is [`mach.manifest.link`](../manifest/link.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](project.md), [`mach.manifest.link`](../manifest/link.md).
 
 | Functions | |
 | :--- | :--- |
@@ -29,7 +29,7 @@ to the link that takes it
 ### state
 
 ```mach
-pub fun state(p: *project.Project, o: *Object) err[fail.Fail]
+pub fun state(p: *mach.compile.project.Project, o: *Object) err[mach.base.fail.Fail]
 ```
 
 add to `o` the claims of every link requirement of `p`'s unit, nothing for none
@@ -37,7 +37,7 @@ add to `o` the claims of every link requirement of `p`'s unit, nothing for none
 ### described
 
 ```mach
-pub fun described(req: *manifest_link.LinkRequirement, describes: bool) bool
+pub fun described(req: *mach.manifest.link.LinkRequirement, describes: bool) bool
 ```
 
 whether the link makes the library the requirement `req` names from its claim: a

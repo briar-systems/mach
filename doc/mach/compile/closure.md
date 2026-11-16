@@ -9,9 +9,9 @@ or missing dependency surfaces as a build error that `mach dep pull` fixes. the 
 closure then scopes the build: a dependency's own closure, the link requirements each
 artifact cascades, and the template variables a manifest reads
 
-<sub>source: [`src/compile/closure.mach`](../../../src/compile/closure.mach) · imported by 16 modules</sub>
+Source: [`src/compile/closure.mach`](../../../src/compile/closure.mach)
 
-<sub>`LocatedFn` is private · `ReleaseFn` is private · `SelectorFn` is private · `session` is [`mach.session`](../session.md) · `A` is `std.allocator` · `manifest_model` is [`mach.manifest.model`](../manifest/model.md) · `project` is [`mach.compile.project`](project.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `std_format` is `std.format` · `manifest_link` is [`mach.manifest.link`](../manifest/link.md) · `template` is [`mach.manifest.template`](../manifest/template.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.compile.project`](project.md), [`mach.manifest.link`](../manifest/link.md), [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.template`](../manifest/template.md), [`mach.session`](../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -35,7 +35,7 @@ artifact cascades, and the template variables a manifest reads
 | [`adopt`](#adopt) | the cell `p` configures compiles against `c`: its `deps` borrow every entry |
 | [`scope_closure_to_dependency`](#scope_closure_to_dependency) | make a resolved closure the closure of one of its dependencies: the dependency's entry becomes `p.config.owner` and `p.config.deps` keeps only what it reaches through its own edges, in closure order |
 | [`resolve_requirement_scopes`](#resolve_requirement_scopes) | the requirement scope of each project a configured cell compiles: the declaring project's, holding the cell artifact's requirements, then one per closure dependency, holding what its default library artifacts require |
-| [`resolve_cascade_libs`](#resolve_cascade_libs) · [`build_dep_root`](#build_dep_root) · [`cell_tmpl_vars`](#cell_tmpl_vars) | |
+| [`resolve_cascade_libs`](#resolve_cascade_libs), [`build_dep_root`](#build_dep_root), [`cell_tmpl_vars`](#cell_tmpl_vars) | |
 | [`owner_tmpl_vars`](#owner_tmpl_vars) | `cell_tmpl_vars` whose `{artifact.<id>.out}` resolves in the requirement scope of the project `owner` names, empty when the cell binds no scope for it |
 
 | Constants | |
@@ -59,8 +59,8 @@ pub rec Check {
 ### locate
 
 ```mach
-pub fun locate(s: *session.Session, alloc: *A.Allocator, m: *manifest_model.Manifest, project_root: str,
-    check: *Check, unrealized: Unrealized) res[project.Closure, fail.Fail]
+pub fun locate(s: *mach.session.Session, alloc: *std.allocator.Allocator, m: *mach.manifest.model.Manifest, project_root: str,
+    check: *Check, unrealized: Unrealized) res[mach.compile.project.Closure, mach.base.fail.Fail]
 ```
 
 locate a root manifest's dependency closure as a build reads it: every
@@ -97,13 +97,13 @@ what locating makes of a dependency nothing is realized for under dep/
 ### root_dependency
 
 ```mach
-pub fun root_dependency(root_m: *manifest_model.Manifest, name: intern.StrId) *manifest_model.DepDef
+pub fun root_dependency(root_m: *mach.manifest.model.Manifest, name: mach.base.intern.StrId) *mach.manifest.model.DepDef
 ```
 
 ### running_mach_range_floor
 
 ```mach
-pub fun running_mach_range_floor(a: *A.Allocator) res[str, std_format.FormatError]
+pub fun running_mach_range_floor(a: *std.allocator.Allocator) res[str, std.format.FormatError]
 ```
 
 mach_range_floor for this compiler
@@ -111,7 +111,7 @@ mach_range_floor for this compiler
 ### check_dep_root
 
 ```mach
-pub fun check_dep_root(a: *A.Allocator, project_root: str) res[bool, fail.Fail]
+pub fun check_dep_root(a: *std.allocator.Allocator, project_root: str) res[bool, mach.base.fail.Fail]
 ```
 
 whether the dependency root exists; err when it is anything but a physical directory. a
@@ -120,7 +120,7 @@ refusal's text is allocated in `a`
 ### adopt
 
 ```mach
-pub fun adopt(p: *project.Project, c: *project.Closure) err[fail.Fail]
+pub fun adopt(p: *mach.compile.project.Project, c: *mach.compile.project.Closure) err[mach.base.fail.Fail]
 ```
 
 the cell `p` configures compiles against `c`: its `deps` borrow every entry
@@ -132,7 +132,7 @@ the cell `p` configures compiles against `c`: its `deps` borrow every entry
 ### scope_closure_to_dependency
 
 ```mach
-pub fun scope_closure_to_dependency(p: *project.Project, owner: str) err[fail.Fail]
+pub fun scope_closure_to_dependency(p: *mach.compile.project.Project, owner: str) err[mach.base.fail.Fail]
 ```
 
 make a resolved closure the closure of one of its dependencies: the dependency's
@@ -148,7 +148,7 @@ through its own edges, in closure order. the entries stay the closure's
 ### resolve_requirement_scopes
 
 ```mach
-pub fun resolve_requirement_scopes(p: *project.Project, root: *manifest_model.Manifest, profile: str) err[fail.Fail]
+pub fun resolve_requirement_scopes(p: *mach.compile.project.Project, root: *mach.manifest.model.Manifest, profile: str) err[mach.base.fail.Fail]
 ```
 
 the requirement scope of each project a configured cell compiles: the declaring
@@ -165,26 +165,26 @@ dependency, holding what its default library artifacts require
 ### resolve_cascade_libs
 
 ```mach
-pub fun resolve_cascade_libs(p: *project.Project, isa: intern.StrId, os: intern.StrId, abi: intern.StrId,
-    own_libs: *manifest_link.LinkRequirement, own_count: u32) err[fail.Fail]
+pub fun resolve_cascade_libs(p: *mach.compile.project.Project, isa: mach.base.intern.StrId, os: mach.base.intern.StrId, abi: mach.base.intern.StrId,
+    own_libs: *mach.manifest.link.LinkRequirement, own_count: u32) err[mach.base.fail.Fail]
 ```
 
 ### build_dep_root
 
 ```mach
-pub fun build_dep_root(alloc: *A.Allocator, project_root: str, dir_dep: str, alias: str) res[str, fail.Fail]
+pub fun build_dep_root(alloc: *std.allocator.Allocator, project_root: str, dir_dep: str, alias: str) res[str, mach.base.fail.Fail]
 ```
 
 ### cell_tmpl_vars
 
 ```mach
-pub fun cell_tmpl_vars(p: *project.Project) template.Values
+pub fun cell_tmpl_vars(p: *mach.compile.project.Project) mach.manifest.template.Values
 ```
 
 ### owner_tmpl_vars
 
 ```mach
-pub fun owner_tmpl_vars(p: *project.Project, owner: str) template.Values
+pub fun owner_tmpl_vars(p: *mach.compile.project.Project, owner: str) mach.manifest.template.Values
 ```
 
 `cell_tmpl_vars` whose `{artifact.<id>.out}` resolves in the requirement scope

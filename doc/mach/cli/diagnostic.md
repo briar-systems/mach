@@ -8,9 +8,9 @@ a command's `Report` writes to stderr as human text or, under `--diagnostics jso
 one record a line closed by a summary record. a `Readout` renders the engine's and the
 test runner's events as they arrive, by the readout contract (doc/language/readout.md).
 
-<sub>source: [`src/cli/diagnostic.mach`](../../../src/cli/diagnostic.mach) · imported by 12 modules</sub>
+Source: [`src/cli/diagnostic.mach`](../../../src/cli/diagnostic.mach)
 
-<sub>`readout` is [`mach.report.readout`](../report/readout.md) · `Tally` is private · `io_writer` is `std.io.writer` · `A` is `std.allocator` · `arena` is `std.allocator.arena` · `PathBase` is private · `Built` is private · `base_source` is [`mach.base.source`](../base/source.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `diagnostic` is [`mach.base.diagnostic`](../base/diagnostic.md) · `report` is [`mach.package.report`](../package/report.md) · `diagnostic_kind` is [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md) · `testrun` is [`mach.report.testrun`](../report/testrun.md) · `session` is [`mach.session`](../session.md) · `outcome` is [`mach.build.outcome`](../build/outcome.md)</sub>
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.build.outcome`](../build/outcome.md), [`mach.package.report`](../package/report.md), [`mach.report.readout`](../report/readout.md), [`mach.report.testrun`](../report/testrun.md), [`mach.session`](../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -56,12 +56,12 @@ test runner's events as they arrive, by the readout contract (doc/language/reado
 
 ```mach
 pub rec Readout {
-    sink:   readout.Sink;
+    sink:   mach.report.readout.Sink;
     r:      *Report;
     units:  usize;
     quiet:  bool;
     tally:  Tally;
-    run:    *readout.TestResult;
+    run:    *mach.report.readout.TestResult;
     count:  u32;
     mod_w:  usize;
     name_w: usize;
@@ -81,12 +81,12 @@ finished test, and run_end
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `sink` | `readout.Sink` | what the engine and the test runner are given; its ctx is this record, which must not move |
+| `sink` | `mach.report.readout.Sink` | what the engine and the test runner are given; its ctx is this record, which must not move |
 | `r` | `*Report` | the command's report |
 | `units` | `usize` | the plan's unit count; a banner prints only when it is more than one |
 | `quiet` | `bool` | `--quiet`, which suppresses the banners |
 | `tally` | `Tally` | the human tally, counted as the events pass |
-| `run` | `*readout.TestResult` | the running test run's results, from its run_start to its run_end |
+| `run` | `*mach.report.readout.TestResult` | the running test run's results, from its run_start to its run_end |
 | `count` | `u32` | how many results run holds |
 | `mod_w` | `usize` | the module column's width |
 | `name_w` | `usize` | the test column's width |
@@ -150,22 +150,22 @@ the format a `--diagnostics` value names
 ```mach
 pub rec Report {
     format:   Format;
-    w:        io_writer.Writer;
+    w:        std.io.writer.Writer;
     root:     str;
     errors:   usize;
     warnings: usize;
     notes:    usize;
     made:     bool;
-    backing:  A.Allocator;
-    ar:       arena.Arena;
-    a:        A.Allocator;
+    backing:  std.allocator.Allocator;
+    ar:       std.allocator.arena.Arena;
+    a:        std.allocator.Allocator;
     pb:       PathBase;
     built:    Vector[Built];
     # the texts a failure's locations name, nil while the command holds none
-    sources: *base_source.SourceMap;
+    sources: *mach.base.source.SourceMap;
     # the first refusal met while writing, which fails the report at its close
-    refusal: opt[fail.Fail];
-    out:     io_writer.Writer;
+    refusal: opt[mach.base.fail.Fail];
+    out:     std.io.writer.Writer;
 }
 ```
 
@@ -176,18 +176,18 @@ summary record, whose counts are the severities of the records before it
 | Field | Type | |
 | :--- | :--- | :--- |
 | `format` | `Format` | human text or json records |
-| `w` | `io_writer.Writer` | where the report is written, stderr |
+| `w` | `std.io.writer.Writer` | where the report is written, stderr |
 | `root` | `str` | the project root as the command resolved it, nil until then; a json record names a file inside it relative to it |
 | `errors` | `usize` | the error records written |
 | `warnings` | `usize` | the warning records written |
 | `made` | `bool` | whether the arena record paths are built in, and the base they are measured from, have been made; they are on first use |
 | `built` | `Vector[Built]` | under json, each unit's `built` line, which the summary record carries |
-| `out` | `io_writer.Writer` | stdout as the command writes it, its first refused write kept as the report's refusal |
+| `out` | `std.io.writer.Writer` | stdout as the command writes it, its first refused write kept as the report's refusal |
 
 ### report_store
 
 ```mach
-pub fun report_store(r: *Report, sources: *base_source.SourceMap, list: *diagnostic.DiagnosticStore)
+pub fun report_store(r: *Report, sources: *mach.base.source.SourceMap, list: *mach.base.diagnostic.DiagnosticStore)
 ```
 
 render every diagnostic of a store through a command's report: as text with its tally line,
@@ -202,7 +202,7 @@ or a record each under json
 ### dependency_report
 
 ```mach
-pub fun dependency_report(a: *A.Allocator, r: *Report) report.Report
+pub fun dependency_report(a: *std.allocator.Allocator, r: *Report) mach.package.report.Report
 ```
 
 where a dependency command reports: progress on standard output, and notes and failures,
@@ -231,7 +231,7 @@ until `report_dnit`
 ### out
 
 ```mach
-pub fun out(r: *Report) *io_writer.Writer
+pub fun out(r: *Report) *std.io.writer.Writer
 ```
 
 where a command writes its output, stdout through the report, so a refused write fails the
@@ -240,7 +240,7 @@ command as the system's
 ### report_note
 
 ```mach
-pub fun report_note(r: *Report, k: diagnostic_kind.Kind, text: str)
+pub fun report_note(r: *Report, k: mach.base.diagnostic.kind.Kind, text: str)
 ```
 
 report a note of kind `k`, which points at nothing: `note: text` in human text, or a
@@ -255,7 +255,7 @@ diagnostic record of note severity under json
 ### report_fail
 
 ```mach
-pub fun report_fail(r: *Report, f: fail.Fail, origin: diagnostic.Origin) i64
+pub fun report_fail(r: *Report, f: mach.base.fail.Fail, origin: mach.base.diagnostic.Origin) i64
 ```
 
 report a carried failure as the diagnostic it reads as, in text or as a diagnostic record
@@ -271,7 +271,7 @@ under json. a reported failure writes nothing, its diagnostics having been rende
 ### report_case
 
 ```mach
-pub fun report_case(r: *Report, art: *testrun.TestArtifact)
+pub fun report_case(r: *Report, art: *mach.report.testrun.TestArtifact)
 ```
 
 one collected test as a record under json, as `mach test --list` lists it; human text
@@ -319,7 +319,7 @@ writes; the report's arena is released either way
 ### flush
 
 ```mach
-pub fun flush(out: *io_writer.Writer, s: *session.Session, list: *diagnostic.DiagnosticStore)
+pub fun flush(out: *std.io.writer.Writer, s: *mach.session.Session, list: *mach.base.diagnostic.DiagnosticStore)
 ```
 
 render every diagnostic of a store to a writer, then an "N errors / M warnings" line
@@ -333,7 +333,7 @@ render every diagnostic of a store to a writer, then an "N errors / M warnings" 
 ### flush_sources
 
 ```mach
-pub fun flush_sources(out: *io_writer.Writer, sources: *base_source.SourceMap, list: *diagnostic.DiagnosticStore)
+pub fun flush_sources(out: *std.io.writer.Writer, sources: *mach.base.source.SourceMap, list: *mach.base.diagnostic.DiagnosticStore)
 ```
 
 render every diagnostic of a store to a writer, then an "N errors / M warnings" line
@@ -347,7 +347,7 @@ render every diagnostic of a store to a writer, then an "N errors / M warnings" 
 ### render_fail
 
 ```mach
-pub fun render_fail(sources: *base_source.SourceMap, f: *fail.Fail) i64
+pub fun render_fail(sources: *mach.base.source.SourceMap, f: *mach.base.fail.Fail) i64
 ```
 
 print a Fail to stderr as the diagnostic it reads as, and map it to an exit code
@@ -362,7 +362,7 @@ a reported Fail prints nothing, its diagnostics having been rendered already
 ### refuse
 
 ```mach
-pub fun refuse(sources: *base_source.SourceMap, f: fail.Fail) i64
+pub fun refuse(sources: *mach.base.source.SourceMap, f: mach.base.fail.Fail) i64
 ```
 
 render_fail for a failure built in place
@@ -376,7 +376,7 @@ render_fail for a failure built in place
 ### dependency_outcome
 
 ```mach
-pub fun dependency_outcome(rep: *report.Report, outcome: err[fail.Fail]) i64
+pub fun dependency_outcome(rep: *mach.package.report.Report, outcome: err[mach.base.fail.Fail]) i64
 ```
 
 show how a dependency command ended: its failure, then a note for each change it made
@@ -391,13 +391,13 @@ before failing
 ### outcome_code
 
 ```mach
-pub fun outcome_code(bo: *outcome.BuildOutcome) i64
+pub fun outcome_code(bo: *mach.build.outcome.BuildOutcome) i64
 ```
 
 ### has_capture
 
 ```mach
-pub fun has_capture(r: *testrun.GateResult) bool
+pub fun has_capture(r: *mach.report.testrun.GateResult) bool
 ```
 
 whether a result kept output worth pointing at

@@ -9,9 +9,9 @@ identity's domain is its listed releases, so a set of versions is a bitset over 
 complement is exact. the running compiler is checked per release as its own
 incompatibility, and a failure is explained from the derivation that proved it.
 
-<sub>source: [`src/package/resolver.mach`](../../../src/package/resolver.mach) · imported by 3 modules</sub>
+Source: [`src/package/resolver.mach`](../../../src/package/resolver.mach)
 
-<sub>`A` is `std.allocator` · `package_source` is [`mach.package.source`](source.md) · `NeedsFn` is private · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.package.source`](source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -91,8 +91,8 @@ overrides them, so no requirement on them takes part in resolution
 ### resolve
 
 ```mach
-pub fun resolve(a: *A.Allocator, src: *package_source.Releases, needs: NeedsFn, needs_ctx: ptr,
-    problem: *Problem) res[Vector[Choice], fail.Fail]
+pub fun resolve(a: *std.allocator.Allocator, src: *mach.package.source.Releases, needs: NeedsFn, needs_ctx: ptr,
+    problem: *Problem) res[Vector[Choice], mach.base.fail.Fail]
 ```
 
 the selected release of every identity the root reaches, allocated in `a`;

@@ -9,9 +9,9 @@ through one of these, and the class says where the fault lies: a member read fro
 malformed and the user's, a declared member a target, format or phase cannot honor is
 unsupported, and a member the compiler produced that its own catalog lacks is internal.
 
-<sub>source: [`src/base/catalog.mach`](../../../src/base/catalog.mach) · imported by 11 modules</sub>
+Source: [`src/base/catalog.mach`](../../../src/base/catalog.mach)
 
-<sub>`Member` is private · `Unsupported` is private · `A` is `std.allocator` · `std_format` is `std.format` · `intern` is [`mach.base.intern`](intern.md) · `fail` is [`mach.base.fail`](fail.md)</sub>
+Uses types from [`mach.base.fail`](fail.md), [`mach.base.intern`](intern.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -87,7 +87,7 @@ the same, named with the site that produced it
 ### catalog_text
 
 ```mach
-pub fun catalog_text(a: *A.Allocator, c: Catalog) res[str, std_format.FormatError]
+pub fun catalog_text(a: *std.allocator.Allocator, c: Catalog) res[str, std.format.FormatError]
 ```
 
 the message, owned by the caller's allocator (extent str_len + 1, released
@@ -96,7 +96,7 @@ with str_free); the only failure a literal format can meet is the allocator's
 ### catalog_interned
 
 ```mach
-pub fun catalog_interned(itn: *intern.Interner, a: *A.Allocator, c: Catalog) res[str, fail.Fail]
+pub fun catalog_interned(itn: *mach.base.intern.Interner, a: *std.allocator.Allocator, c: Catalog) res[str, mach.base.fail.Fail]
 ```
 
 the message, owned by the interner so it outlives temporary phase storage,
@@ -105,7 +105,7 @@ with `a` as scratch
 ### catalog
 
 ```mach
-pub fun catalog(a: *A.Allocator, c: Catalog) fail.Fail
+pub fun catalog(a: *std.allocator.Allocator, c: Catalog) mach.base.fail.Fail
 ```
 
 the closed-catalog policy as a failure: an input or capability fault is the
@@ -117,6 +117,6 @@ through the caller's allocator
 ### unknown_catalog
 
 ```mach
-pub fun unknown_catalog(a: *A.Allocator, catalog_name: str, tag: u32) fail.Fail
+pub fun unknown_catalog(a: *std.allocator.Allocator, catalog_name: str, tag: u32) mach.base.fail.Fail
 ```
 

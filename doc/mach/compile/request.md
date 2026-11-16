@@ -7,9 +7,9 @@ a build request: what one build is asked to do, from its profile and the command
 `compose` takes the selected profile's levers and sets the command line's overrides over
 them, and `semantic_hash` digests the fields that decide what the build produces.
 
-<sub>source: [`src/compile/request.mach`](../../../src/compile/request.mach) · imported by 14 modules</sub>
+Source: [`src/compile/request.mach`](../../../src/compile/request.mach)
 
-<sub>`A` is `std.allocator` · `intern` is [`mach.base.intern`](../base/intern.md) · `manifest_model` is [`mach.manifest.model`](../manifest/model.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `relaxation` is `mirl.pass.relaxation` · `mink_subsystem` is `mink.catalog.subsystem` · `diagnostic_kind` is [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md)</sub>
+Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.manifest.model`](../manifest/model.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -33,7 +33,7 @@ them, and `semantic_hash` digests the fields that decide what the build produces
 | On `BuildGoal` | |
 | :--- | :--- |
 | [`GOAL_ARTIFACT`](#buildgoal) | the finished artifact of the unit's kind: an executable, a static archive or a shared library |
-| [`GOAL_OBJECTS`](#buildgoal) · [`GOAL_TESTS`](#buildgoal) · [`GOAL_TEST_LIST`](#buildgoal) | |
+| [`GOAL_OBJECTS`](#buildgoal), [`GOAL_TESTS`](#buildgoal), [`GOAL_TEST_LIST`](#buildgoal) | |
 | [`GOAL_CHECK`](#buildgoal) | `mach check`: load, resolve and check the selected artifacts' reachable source through the frontend and stop; no step runs and no product is written |
 | [`test_goal`](#test_goal) | |
 | [`goal_name`](#goal_name) | the name a catalogued goal is displayed by |
@@ -41,7 +41,7 @@ them, and `semantic_hash` digests the fields that decide what the build produces
 
 | On `BuildRequest` | |
 | :--- | :--- |
-| [`defaults`](#defaults) · [`validate`](#validate) · [`is_release`](#is_release) · [`for_cell`](#for_cell) · [`semantic_hash`](#semantic_hash) | |
+| [`defaults`](#defaults), [`validate`](#validate), [`is_release`](#is_release), [`for_cell`](#for_cell), [`semantic_hash`](#semantic_hash) | |
 
 | Functions | |
 | :--- | :--- |
@@ -51,7 +51,7 @@ them, and `semantic_hash` digests the fields that decide what the build produces
 | Constants | |
 | :--- | :--- |
 | [`OPT_DEBUG`](#constants) | a build's optimization lever: off, or the level mirl's schedule optimizes at |
-| [`OPT_RELEASE`](#constants) · [`HASH_SIZE`](#constants) | |
+| [`OPT_RELEASE`](#constants), [`HASH_SIZE`](#constants) | |
 
 ---
 
@@ -103,7 +103,7 @@ a lever or value left unset leaves the profile's
 ### overrides_init
 
 ```mach
-pub fun overrides_init(a: *A.Allocator) Overrides
+pub fun overrides_init(a: *std.allocator.Allocator) Overrides
 ```
 
 no override: the profile decides everything, with empty name lists and link
@@ -112,8 +112,8 @@ inputs growable through `a`
 ### compose
 
 ```mach
-pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest_model.Manifest,
-    o: *Overrides, root: str, goal: BuildGoal, profile: str) res[BuildRequest, fail.Fail]
+pub fun compose(a: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *mach.manifest.model.Manifest,
+    o: *Overrides, root: str, goal: BuildGoal, profile: str) res[BuildRequest, mach.base.fail.Fail]
 ```
 
 ## BuildGoal
@@ -186,12 +186,12 @@ pub rec BuildRequest {
     # whether the linker may relax the code, which mirl's relax build option states
     linker_relax: bool;
     # the float relaxations the profile's `relax` permits, which mirl's floats build option states
-    floats: relaxation.Relaxations;
+    floats: mirl.pass.relaxation.Relaxations;
     # the artifact's declared subsystem, none for the host's
-    subsystem: opt[*mink_subsystem.Subsystem];
-    simd:      manifest_model.SimdMode;
+    subsystem: opt[*mink.catalog.subsystem.Subsystem];
+    simd:      mach.manifest.model.SimdMode;
     # the warning kinds the profile silences: presentation only, so no part of the request hash
-    allow:   diagnostic_kind.KindSet;
+    allow:   mach.base.diagnostic.kind.KindSet;
     threads: u32;
 
     emit_ir:  bool;
@@ -228,7 +228,7 @@ pub fun defaults() BuildRequest
 ### validate
 
 ```mach
-pub fun validate(a: *A.Allocator, r: *BuildRequest) err[fail.Fail]
+pub fun validate(a: *std.allocator.Allocator, r: *BuildRequest) err[mach.base.fail.Fail]
 ```
 
 ### is_release
@@ -241,13 +241,13 @@ pub fun is_release(r: *BuildRequest) bool
 
 ```mach
 pub fun for_cell(base: *BuildRequest, owner: str, target: str, artifact: str,
-    subsystem: opt[*mink_subsystem.Subsystem], goal: BuildGoal) BuildRequest
+    subsystem: opt[*mink.catalog.subsystem.Subsystem], goal: BuildGoal) BuildRequest
 ```
 
 ### semantic_hash
 
 ```mach
-pub fun semantic_hash(a: *A.Allocator, r: *BuildRequest, digest: *u8) err[fail.Fail]
+pub fun semantic_hash(a: *std.allocator.Allocator, r: *BuildRequest, digest: *u8) err[mach.base.fail.Fail]
 ```
 
 ## Functions
@@ -255,7 +255,7 @@ pub fun semantic_hash(a: *A.Allocator, r: *BuildRequest, digest: *u8) err[fail.F
 ### work_apply
 
 ```mach
-pub fun work_apply(itn: *intern.Interner, work: str, m: *manifest_model.Manifest) err[fail.Fail]
+pub fun work_apply(itn: *mach.base.intern.Interner, work: str, m: *mach.manifest.model.Manifest) err[mach.base.fail.Fail]
 ```
 
 `work`, a `-w` value, in place of the root manifest `m`'s `[project].work`: a

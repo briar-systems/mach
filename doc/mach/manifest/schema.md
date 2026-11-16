@@ -9,9 +9,9 @@ key and a removed key, where each is written. the rows also say which keys `--se
 writes and what `mach migrate` rewrites. the readers of a checked table, and the rules
 for identifiers and project paths, are here too.
 
-<sub>source: [`src/manifest/schema.mach`](../../../src/manifest/schema.mach) · imported by 23 modules</sub>
+Source: [`src/manifest/schema.mach`](../../../src/manifest/schema.mach)
 
-<sub>`toml_value` is `toml.value` · `base_source` is [`mach.base.source`](../base/source.md) · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `Rows` is private · `KeyRow` is private · `textbuild` is [`mach.base.textbuild`](../base/textbuild.md)</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.base.textbuild`](../base/textbuild.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -54,7 +54,7 @@ for identifiers and project paths, are here too.
 | [`value_span`](#value_span) | the literal of the value `key` names in a table; the zero span when absent |
 | [`value_text`](#value_text) | a scalar value as a refusal quotes it; a refused allocation is the failure |
 | [`is_valid_id`](#is_valid_id) | whether `s` is a portable identifier: non-empty, only ASCII letters, digits, '_' and '-' |
-| [`is_project_path`](#is_project_path) | whether `value` is a canonical strict descendant of the project root: non-empty, '/'-separated, no '\', not absolute, no drive letter, no empty component, no '.' or '..' component |
+| [`is_project_path`](#is_project_path) | whether `value` is a canonical strict descendant of the project root: non-empty, '/'-separated, no '\\', not absolute, no drive letter, no empty component, no '.' or '..' component |
 | [`check_path`](#check_path) | refuse a path that `is_project_path` does not admit, naming it as `field` and pointing at `sp`, the value as written |
 
 | Constants | |
@@ -108,9 +108,9 @@ the mechanical rewrite of a key as a previous major wrote it
 ```mach
 pub rec Setting {
     section: str;
-    doc:     toml_value.Table;
+    doc:     toml.value.Table;
     text:    str;
-    file:    base_source.FileId;
+    file:    mach.base.source.FileId;
 }
 ```
 
@@ -119,13 +119,13 @@ a `--set` key and value, read as the manifest reads the key
 | Field | Type | |
 | :--- | :--- | :--- |
 | `section` | `str` | the root key of the tables the key is written over, such as "target" |
-| `doc` | `toml_value.Table` | the document `<key> = <value>`, released with toml_tree.dnit |
+| `doc` | `toml.value.Table` | the document `<key> = <value>`, released with toml_tree.dnit |
 | `text` | `str` | the document's text, which a refusal of the value points into |
 
 ### setting
 
 ```mach
-pub fun setting(alloc: *A.Allocator, sources: *base_source.SourceMap, key: str, value: str) res[Setting, fail.Fail]
+pub fun setting(alloc: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, key: str, value: str) res[Setting, mach.base.fail.Fail]
 ```
 
 a `--set` key and value checked against the row of the key: the key is one a row marks `set`,
@@ -157,7 +157,7 @@ one replacement of the bytes `at` to `at + len` of a manifest's text by
 ### rewrites
 
 ```mach
-pub fun rewrites(alloc: *A.Allocator, doc: *toml_value.Table, out: *Vector[Fix]) err[A.Error]
+pub fun rewrites(alloc: *std.allocator.Allocator, doc: *toml.value.Table, out: *Vector[Fix]) err[std.allocator.Error]
 ```
 
 every rewrite the schema's rows call for in a parsed manifest document, as
@@ -180,7 +180,7 @@ pub rec Leftover {
     name:    str;
     key:     str;
     note:    str;
-    at:      toml_value.Span;
+    at:      toml.value.Span;
 }
 ```
 
@@ -193,12 +193,12 @@ author decides what replaces it
 | `name` | `str` | its table's name under a section of named tables, "" for a section itself |
 | `key` | `str` | the key |
 | `note` | `str` | what replaces it, as its refusal says |
-| `at` | `toml_value.Span` | the key token as written |
+| `at` | `toml.value.Span` | the key token as written |
 
 ### leftovers
 
 ```mach
-pub fun leftovers(doc: *toml_value.Table, out: *Vector[Leftover]) err[A.Error]
+pub fun leftovers(doc: *toml.value.Table, out: *Vector[Leftover]) err[std.allocator.Error]
 ```
 
 every removed key a parsed manifest document writes that no rewrite migrates, in every table
@@ -214,7 +214,7 @@ the schema holds
 
 ```mach
 pub rec StrArr {
-    items:   *intern.StrId;
+    items:   *mach.base.intern.StrId;
     count:   u32;
     present: bool;
 }
@@ -224,14 +224,14 @@ a decoded array of strings, each interned
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `items` | `*intern.StrId` | the ids, nil when the array is absent or empty |
+| `items` | `*mach.base.intern.StrId` | the ids, nil when the array is absent or empty |
 | `count` | `u32` | how many |
 | `present` | `bool` | the key is written |
 
 ### ids_of
 
 ```mach
-pub fun ids_of(alloc: *A.Allocator, itn: *intern.Interner, arr: *toml_value.Array, label: str, key: str) res[StrArr, fail.Fail]
+pub fun ids_of(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, arr: *toml.value.Array, label: str, key: str) res[StrArr, mach.base.fail.Fail]
 ```
 
 intern every element of an array of strings the schema check has admitted
@@ -258,7 +258,7 @@ the row of `key` among `rows`, nil when no row names it
 ### check
 
 ```mach
-pub fun check(alloc: *A.Allocator, doc: *toml_value.Table) err[fail.Fail]
+pub fun check(alloc: *std.allocator.Allocator, doc: *toml.value.Table) err[mach.base.fail.Fail]
 ```
 
 check a parsed manifest document against the schema: every key it writes is a
@@ -276,7 +276,7 @@ concerns, or at the table a missing key belongs to
 ### toml_string
 
 ```mach
-pub fun toml_string(b: *textbuild.TextBuilder, text: str)
+pub fun toml_string(b: *mach.base.textbuild.TextBuilder, text: str)
 ```
 
 `text` as a TOML basic string: a quote and a backslash escaped by a backslash, and a control
@@ -285,7 +285,7 @@ byte, which a basic string cannot hold, as its `\u00XX` escape
 ### section_check
 
 ```mach
-pub fun section_check(alloc: *A.Allocator, doc: *toml_value.Table, key: str) err[fail.Fail]
+pub fun section_check(alloc: *std.allocator.Allocator, doc: *toml.value.Table, key: str) err[mach.base.fail.Fail]
 ```
 
 check one section of the document root, as `check` holds it, for a reader
@@ -301,7 +301,7 @@ that needs only that section
 ### key_text
 
 ```mach
-pub fun key_text(t: *toml_value.Table, key: str) str
+pub fun key_text(t: *toml.value.Table, key: str) str
 ```
 
 a string key as the manifest reads it: absent and empty are the same err
@@ -310,7 +310,7 @@ a string key as the manifest reads it: absent and empty are the same err
 ### flag
 
 ```mach
-pub fun flag(t: *toml_value.Table, key: str) bool
+pub fun flag(t: *toml.value.Table, key: str) bool
 ```
 
 a boolean key's value, false when it is not written; the schema check has
@@ -319,7 +319,7 @@ refused any other shape
 ### written_value
 
 ```mach
-pub fun written_value(t: *toml_value.Table, key: str) *toml_value.Value
+pub fun written_value(t: *toml.value.Table, key: str) *toml.value.Value
 ```
 
 the value of a key the schema check has seen written with its row's shape, nil
@@ -328,7 +328,7 @@ when it is not written
 ### key_span
 
 ```mach
-pub fun key_span(tab: *toml_value.Table, i: usize) toml_value.Span
+pub fun key_span(tab: *toml.value.Table, i: usize) toml.value.Span
 ```
 
 the key token of a table's entry `i` as written; the zero span when absent
@@ -336,7 +336,7 @@ the key token of a table's entry `i` as written; the zero span when absent
 ### element_span
 
 ```mach
-pub fun element_span(arr: *toml_value.Array, i: usize) toml_value.Span
+pub fun element_span(arr: *toml.value.Array, i: usize) toml.value.Span
 ```
 
 the literal of an array's element `i`; the zero span when absent
@@ -344,7 +344,7 @@ the literal of an array's element `i`; the zero span when absent
 ### origin
 
 ```mach
-pub fun origin(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml_value.Table, lead: str, key: str) res[Origin, fail.Fail]
+pub fun origin(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, sub: *toml.value.Table, lead: str, key: str) res[Origin, mach.base.fail.Fail]
 ```
 
 where the table `sub` writes `key`, named for a refusal under `lead`, the table's label in
@@ -363,7 +363,7 @@ until the manifest or the `--set` text resolves it
 ### value_span
 
 ```mach
-pub fun value_span(tab: *toml_value.Table, key: str) toml_value.Span
+pub fun value_span(tab: *toml.value.Table, key: str) toml.value.Span
 ```
 
 the literal of the value `key` names in a table; the zero span when absent
@@ -371,7 +371,7 @@ the literal of the value `key` names in a table; the zero span when absent
 ### value_text
 
 ```mach
-pub fun value_text(alloc: *A.Allocator, v: *toml_value.Value) res[str, fail.Fail]
+pub fun value_text(alloc: *std.allocator.Allocator, v: *toml.value.Value) res[str, mach.base.fail.Fail]
 ```
 
 a scalar value as a refusal quotes it; a refused allocation is the failure
@@ -398,7 +398,7 @@ pub fun is_project_path(value: str) bool
 ```
 
 whether `value` is a canonical strict descendant of the project root: non-empty,
-'/'-separated, no '\', not absolute, no drive letter, no empty component, no
+'/'-separated, no '\\', not absolute, no drive letter, no empty component, no
 '.' or '..' component
 
 | Parameter | |
@@ -409,7 +409,7 @@ whether `value` is a canonical strict descendant of the project root: non-empty,
 ### check_path
 
 ```mach
-pub fun check_path(alloc: *A.Allocator, value: str, field: str, sp: toml_value.Span) err[fail.Fail]
+pub fun check_path(alloc: *std.allocator.Allocator, value: str, field: str, sp: toml.value.Span) err[mach.base.fail.Fail]
 ```
 
 refuse a path that `is_project_path` does not admit, naming it as `field`

@@ -7,9 +7,9 @@ operating system the compiler itself was built for. a compiler module calls
 these and holds no host conditional of its own. the target a build produces
 is the target module's concern, not this one's
 
-<sub>source: [`src/host.mach`](../../src/host.mach) · imported by 13 modules</sub>
+Source: [`src/host.mach`](../../src/host.mach)
 
-<sub>`A` is `std.allocator` · `fail` is [`mach.base.fail`](base/fail.md)</sub>
+Uses types from [`mach.base.fail`](base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -26,11 +26,11 @@ is the target module's concern, not this one's
 
 | On `ProbeKind` | |
 | :--- | :--- |
-| [`PROBE_ABSENT`](#probekind) · [`PROBE_FAILED`](#probekind) · [`PROBE_LINK`](#probekind) · [`PROBE_DIR`](#probekind) · [`PROBE_FILE`](#probekind) · [`PROBE_OTHER`](#probekind) | |
+| [`PROBE_ABSENT`](#probekind), [`PROBE_FAILED`](#probekind), [`PROBE_LINK`](#probekind), [`PROBE_DIR`](#probekind), [`PROBE_FILE`](#probekind), [`PROBE_OTHER`](#probekind) | |
 
 | On `Cursor` | |
 | :--- | :--- |
-| [`cursor_open`](#cursor_open) · [`cursor_close`](#cursor_close) | |
+| [`cursor_open`](#cursor_open), [`cursor_close`](#cursor_close) | |
 | [`cursor_probe`](#cursor_probe) | the component's kind; windows resolves the prefix against the root |
 | [`cursor_make`](#cursor_make) | a directory for a missing component; one a concurrent writer made first is as good |
 | [`cursor_unlink`](#cursor_unlink) | remove a stale non-directory component, never following it |
@@ -63,7 +63,7 @@ is the target module's concern, not this one's
 ```mach
 pub tag NativeTextError: u8 {
     native: i64;
-    alloc:  A.Error;
+    alloc:  std.allocator.Error;
 }
 ```
 
@@ -72,12 +72,12 @@ why text could not be put in native units
 | Case | Payload | |
 | :--- | :--- | :--- |
 | `native` | `i64` | the conversion refused it, malformed UTF-8 on windows; the native code |
-| `alloc` | `A.Error` | the owned copy could not be acquired |
+| `alloc` | `std.allocator.Error` | the owned copy could not be acquired |
 
 ### native_text
 
 ```mach
-pub fun native_text(a: *A.Allocator, text: str) res[NativeName, NativeTextError]
+pub fun native_text(a: *std.allocator.Allocator, text: str) res[NativeName, NativeTextError]
 ```
 
 `text` in std.runtime.native units, owned and terminated: converted from
@@ -119,7 +119,7 @@ what a component is, read without following it
 ```mach
 pub rec Probe {
     kind:  ProbeKind;
-    cause: fail.Cause;
+    cause: mach.base.fail.Cause;
 }
 ```
 
@@ -129,7 +129,7 @@ cause: what refused the probe, read only for PROBE_ABSENT and PROBE_FAILED
 
 ```mach
 pub rec Cursor {
-    alloc: *A.Allocator;
+    alloc: *std.allocator.Allocator;
     root:  str;
     fd:    usize;
 }
@@ -142,19 +142,19 @@ each prefix by path, beneath the same root
 ### cursor_open
 
 ```mach
-pub fun cursor_open(c: *Cursor, alloc: *A.Allocator, root: str, label: str) err[fail.Fail]
+pub fun cursor_open(c: *Cursor, alloc: *std.allocator.Allocator, root: str, label: str) err[mach.base.fail.Fail]
 ```
 
 ### cursor_close
 
 ```mach
-pub fun cursor_close(c: *Cursor) err[fail.Fail]
+pub fun cursor_close(c: *Cursor) err[mach.base.fail.Fail]
 ```
 
 ### cursor_probe
 
 ```mach
-pub fun cursor_probe(c: *Cursor, component: str, prefix: str) res[Probe, fail.Fail]
+pub fun cursor_probe(c: *Cursor, component: str, prefix: str) res[Probe, mach.base.fail.Fail]
 ```
 
 the component's kind; windows resolves the prefix against the root
@@ -162,7 +162,7 @@ the component's kind; windows resolves the prefix against the root
 ### cursor_make
 
 ```mach
-pub fun cursor_make(c: *Cursor, component: str, prefix: str) opt[fail.Cause]
+pub fun cursor_make(c: *Cursor, component: str, prefix: str) opt[mach.base.fail.Cause]
 ```
 
 a directory for a missing component; one a concurrent writer made first is as good
@@ -170,7 +170,7 @@ a directory for a missing component; one a concurrent writer made first is as go
 ### cursor_unlink
 
 ```mach
-pub fun cursor_unlink(c: *Cursor, component: str, prefix: str) opt[fail.Cause]
+pub fun cursor_unlink(c: *Cursor, component: str, prefix: str) opt[mach.base.fail.Cause]
 ```
 
 remove a stale non-directory component, never following it
@@ -178,7 +178,7 @@ remove a stale non-directory component, never following it
 ### cursor_enter
 
 ```mach
-pub fun cursor_enter(c: *Cursor, enter: str, invalid: str, label: str, rel: str, component: str, prefix: str) err[fail.Fail]
+pub fun cursor_enter(c: *Cursor, enter: str, invalid: str, label: str, rel: str, component: str, prefix: str) err[mach.base.fail.Fail]
 ```
 
 step beneath a component already read as a real directory, checking that
@@ -204,7 +204,7 @@ pub rec Fault { kind: u8; message: str; }
 ### image_digest
 
 ```mach
-pub fun image_digest(alloc: *A.Allocator, out: *u8) err[Fault]
+pub fun image_digest(alloc: *std.allocator.Allocator, out: *u8) err[Fault]
 ```
 
 the sha-256 of the running image's file, read through a handle checked to be
@@ -230,7 +230,7 @@ arguments for the process named by pid, written to argv and ended by nil
 ### native_text_dnit
 
 ```mach
-pub fun native_text_dnit(a: *A.Allocator, name: *NativeName)
+pub fun native_text_dnit(a: *std.allocator.Allocator, name: *NativeName)
 ```
 
 release a native text; an empty one owns no units
@@ -238,7 +238,7 @@ release a native text; an empty one owns no units
 ### compare_env_names
 
 ```mach
-pub fun compare_env_names(a: *A.Allocator, left: *Unit, left_length: usize, right: *Unit, right_length: usize) res[i32, fail.Fail]
+pub fun compare_env_names(a: *std.allocator.Allocator, left: *Unit, left_length: usize, right: *Unit, right_length: usize) res[i32, mach.base.fail.Fail]
 ```
 
 compare two environment variable names in native units by the host's
@@ -253,7 +253,7 @@ elsewhere
 ### program_resolve
 
 ```mach
-pub fun program_resolve(a: *A.Allocator, name: str) res[str, fail.Fail]
+pub fun program_resolve(a: *std.allocator.Allocator, name: str) res[str, mach.base.fail.Fail]
 ```
 
 locate an executable the way a shell would: a name with a path separator is used directly
@@ -269,9 +269,9 @@ and must be an existing executable file; any other name is searched on PATH
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `OPEN_NOFOLLOW` | `i32` | `native_os.O_NOFOLLOW` where `$mach.build.sys == $mach.sys.linux \|\| $mach.build.sys == $mach.sys.darwin`<br>`0` where not `$mach.build.sys == $mach.sys.linux \|\| $mach.build.sys == $mach.sys.darwin` | the open flag that refuses a symlink at the leaf, and the one that keeps an open from blocking on a fifo; 0 where the host's open has neither |
-| `OPEN_NONBLOCK` | `i32` | `native_os.O_NONBLOCK` where `$mach.build.sys == $mach.sys.linux \|\| $mach.build.sys == $mach.sys.darwin`<br>`0` where not `$mach.build.sys == $mach.sys.linux \|\| $mach.build.sys == $mach.sys.darwin` | the open flag that refuses a symlink at the leaf, and the one that keeps an open from blocking on a fifo; 0 where the host's open has neither |
-| `PERMISSIONS` | `bool` | `false` where `$mach.build.sys == $mach.sys.windows`<br>`true` where not `$mach.build.sys == $mach.sys.windows` | whether the host keeps posix permission bits on a file |
+| `OPEN_NOFOLLOW` | `i32` | `native_os.O_NOFOLLOW` where `$mach.build.sys == $mach.sys.linux \|\| $mach.build.sys == $mach.sys.darwin`; `0` otherwise | the open flag that refuses a symlink at the leaf, and the one that keeps an open from blocking on a fifo; 0 where the host's open has neither |
+| `OPEN_NONBLOCK` | `i32` | `native_os.O_NONBLOCK` where `$mach.build.sys == $mach.sys.linux \|\| $mach.build.sys == $mach.sys.darwin`; `0` otherwise | the open flag that refuses a symlink at the leaf, and the one that keeps an open from blocking on a fifo; 0 where the host's open has neither |
+| `PERMISSIONS` | `bool` | `false` where `$mach.build.sys == $mach.sys.windows`; `true` otherwise | whether the host keeps posix permission bits on a file |
 | `FAULT_UNAVAILABLE` | `u8` | `1` | why the running image's identity could not be read: unavailable on this host or in this process, or an internal fault of the reader |
 | `FAULT_INTERNAL` | `u8` | `2` |  |
 

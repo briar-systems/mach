@@ -13,9 +13,9 @@ and depth first; equal bytes on recomputation keep the previous revision and
 stop propagation; a failed dependency fails the product and the previous value
 is never served. all reads happen inside one operation
 
-<sub>source: [`src/session/query.mach`](../../../src/session/query.mach) · imported by 15 modules</sub>
+Source: [`src/session/query.mach`](../../../src/session/query.mach)
 
-<sub>`A` is `std.allocator` · `diagnostic` is [`mach.base.diagnostic`](../base/diagnostic.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `Slot` is private · `QueryShard` is private · `StackFrame` is private · `Attempt` is private · `OwnedFn` is private</sub>
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -40,11 +40,11 @@ is never served. all reads happen inside one operation
 
 | On `KeyOwner` | |
 | :--- | :--- |
-| [`KEY_UNOWNED`](#keyowner) · [`KEY_MODULE`](#keyowner) · [`KEY_FILE`](#keyowner) · [`KEY_UNIT`](#keyowner) | |
+| [`KEY_UNOWNED`](#keyowner), [`KEY_MODULE`](#keyowner), [`KEY_FILE`](#keyowner) | |
 
 | On `Role` | |
 | :--- | :--- |
-| [`INPUT`](#role) · [`DERIVED`](#role) | |
+| [`INPUT`](#role), [`DERIVED`](#role) | |
 
 | On `Presentation` | |
 | :--- | :--- |
@@ -70,7 +70,7 @@ is never served. all reads happen inside one operation
 | [`prepare_owned_retirement`](#prepare_owned_retirement) | a retirement rooted at every product whose key a released module or file owns, with its dependents |
 | [`prepared_view`](#prepared_view) | |
 | [`prepared_diags`](#prepared_diags) | the store a prepared query's compute reports into: work finished outside the compute (a worker thread's optimize) appends there, so a refusal it records reaches the presentation like one the compute made itself |
-| [`cancel_prepared`](#cancel_prepared) · [`complete_prepared`](#complete_prepared) | |
+| [`cancel_prepared`](#cancel_prepared), [`complete_prepared`](#complete_prepared) | |
 | [`walk_products`](#walk_products) | visit a product and every product it was computed from that the filter enters, each once and its dependencies first, as presentation walks them |
 | [`peek_revision`](#peek_revision) | the revision a product last changed at, without validating it; 0 when it has none |
 | [`published`](#published) | a product as its last successful computation published it, read between operations by the host that ran them |
@@ -81,12 +81,12 @@ is never served. all reads happen inside one operation
 | [`get`](#get) | the current value of a product, computing or revalidating it inside the open operation and recording it as a dependency of the product being computed, if any |
 | [`reusable`](#reusable) | validation may refresh dependencies but never computes the requested product |
 | [`prepare`](#prepare) | compute a derived product the caller finishes outside the computation (a worker thread), published by complete_prepared or dropped by cancel_prepared before the operation ends |
-| [`revision`](#revision-1) · [`depend`](#depend) | |
+| [`revision`](#revision-1), [`depend`](#depend) | |
 
 | On `PreparedRetirement` | |
 | :--- | :--- |
 | [`discard_retirement`](#discard_retirement) | release a retirement that was prepared and not committed; one already committed or discarded owns nothing |
-| [`validate_retirement`](#validate_retirement) · [`commit_retirement`](#commit_retirement) | |
+| [`validate_retirement`](#validate_retirement), [`commit_retirement`](#commit_retirement) | |
 
 ---
 
@@ -98,17 +98,13 @@ pub def KeyOwner: u8
 
 what a kind's keys name, so a session can release every product a module or file left behind.
 a kind keyed by a module carries its stable module id in the key's low 32 bits, whatever the
-higher bits add (a test build), and a kind keyed by a file is keyed by its file id alone. a kind
-keyed by an instance unit carries the stable id of the unit's origin module in the low 32 bits
-and its bucket above them, and goes with that module; no key of it names a module's own product.
-a row left at KEY_UNDECLARED is refused on its first use, so a kind cannot leak by omission
+higher bits add (a test build), and a kind keyed by a file is keyed by its file id alone. a row left at KEY_UNDECLARED is refused on its first use, so a kind cannot leak by omission
 
 | Name | Value | |
 | :--- | :--- | :--- |
 | `KEY_UNOWNED` | `1` |  |
 | `KEY_MODULE` | `2` |  |
 | `KEY_FILE` | `3` |  |
-| `KEY_UNIT` | `4` |  |
 
 ## Revision
 
@@ -133,7 +129,7 @@ reached through Kind.role
 ## FinalizeFn
 
 ```mach
-pub def FinalizeFn: fun(*u8, u32, *A.Allocator)
+pub def FinalizeFn: fun(*u8, u32, *std.allocator.Allocator)
 ```
 
 releases what an owned product's bytes hold
@@ -151,7 +147,7 @@ reached through Kind.equal
 ## ComputeFn
 
 ```mach
-pub def ComputeFn: fun(ptr, *Kind, u64, *A.Allocator, *diagnostic.DiagnosticStore) res[QueryOutput, fail.Fail]
+pub def ComputeFn: fun(ptr, *Kind, u64, *std.allocator.Allocator, *mach.base.diagnostic.DiagnosticStore) res[QueryOutput, mach.base.fail.Fail]
 ```
 
 a derived product's computation: the context the operation's runtime carries, the row it
@@ -165,7 +161,7 @@ pub rec Kind {
     name:     str;
     role:     Role;
     owner:    KeyOwner;
-    origin:   diagnostic.Origin;
+    origin:   mach.base.diagnostic.Origin;
     compute:  ComputeFn;
     finalize: FinalizeFn;
     equal:    EqualFn;
@@ -181,7 +177,7 @@ the row on its first use; a row's address is its identity, so two rows never sha
 | `name` | `str` | how failures and cycles name the kind |
 | `role` | `Role` | INPUT or DERIVED |
 | `owner` | `KeyOwner` | what the kind's keys name |
-| `origin` | `diagnostic.Origin` | the phase a derived product's diagnostics belong to |
+| `origin` | `mach.base.diagnostic.Origin` | the phase a derived product's diagnostics belong to |
 | `compute` | `ComputeFn` | a derived product's computation; an input has none |
 | `finalize` | `FinalizeFn` | releases what an owned derived product's bytes hold, called only on bytes its own computation published; nil when the bytes own nothing |
 | `equal` | `EqualFn` | whether two owned products are the same, so an equal recomputation keeps the revision; requires finalize |
@@ -229,11 +225,11 @@ pub rec PreparedQuery {
 
 ```mach
 pub rec Presentation {
-    alloc:         *A.Allocator;
-    diags:         diagnostic.DiagnosticStore;
-    failure:       opt[fail.Fail];
-    failure_alloc: *A.Allocator;
-    origin:        diagnostic.Origin;
+    alloc:         *std.allocator.Allocator;
+    diags:         mach.base.diagnostic.DiagnosticStore;
+    failure:       opt[mach.base.fail.Fail];
+    failure_alloc: *std.allocator.Allocator;
+    origin:        mach.base.diagnostic.Origin;
 }
 ```
 
@@ -243,10 +239,10 @@ operation's failure if it had one. released with presentation_dnit, exactly once
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `alloc` | `*A.Allocator` | owns the presentation and its store |
-| `diags` | `diagnostic.DiagnosticStore` | the collected diagnostics, in dependency order, each product once |
-| `failure` | `opt[fail.Fail]` | the operation's failure, owning its text and places through `failure_alloc`; absent when every product computed |
-| `origin` | `diagnostic.Origin` | the origin of the product whose computation raised the failure, ORIGIN_NONE for one the operation raised outside every computation |
+| `alloc` | `*std.allocator.Allocator` | owns the presentation and its store |
+| `diags` | `mach.base.diagnostic.DiagnosticStore` | the collected diagnostics, in dependency order, each product once |
+| `failure` | `opt[mach.base.fail.Fail]` | the operation's failure, owning its text and places through `failure_alloc`; absent when every product computed |
+| `origin` | `mach.base.diagnostic.Origin` | the origin of the product whose computation raised the failure, ORIGIN_NONE for one the operation raised outside every computation |
 
 ### presentation_dnit
 
@@ -289,7 +285,7 @@ the caller never frees it
 
 ```mach
 pub rec QueryDb {
-    a:                    *A.Allocator;
+    a:                    *std.allocator.Allocator;
     revision:             Revision;
     storage:              **QueryShard;
     storage_cap:          u32;
@@ -307,28 +303,28 @@ pub rec QueryDb {
     # the failure the operation stands on, its text and places copied into and owned through `a`.
     # a failure the engine hands out borrows them until the operation's presentation is collected
     # or discarded, when the presentation takes the failure over or it is freed
-    operation_failure: opt[fail.Fail];
+    operation_failure: opt[mach.base.fail.Fail];
     # the origin of the product whose computation raised the standing failure, ORIGIN_NONE for
     # one raised outside every computation
-    operation_origin: diagnostic.Origin;
+    operation_origin: mach.base.diagnostic.Origin;
     # the failure the standing one displaced, owned like it and freed only with it, since a
     # computation may still read the copy it was handed. precedence keeps it to one: only a
     # defect displaces, and only a user's or the environment's failure
-    operation_displaced: fail.Fail;
+    operation_displaced: mach.base.fail.Fail;
     # the last operation's presentation, kept for its reader
     presentation: *Presentation;
     # the last held failure's text and places, owned through `a`, and the origin of the
     # product that raised it, ORIGIN_NONE for one no computation raised
     failure_message: str;
-    failure_places:  fail.Fail;
-    failure_origin:  diagnostic.Origin;
+    failure_places:  mach.base.fail.Fail;
+    failure_origin:  mach.base.diagnostic.Origin;
 }
 ```
 
 ### init
 
 ```mach
-pub fun init(a: *A.Allocator) res[QueryDb, fail.Fail]
+pub fun init(a: *std.allocator.Allocator) res[QueryDb, mach.base.fail.Fail]
 ```
 
 a database over a caller-owned allocator, holding no kind until a row is first used;
@@ -349,7 +345,7 @@ release the text and the places of the last failure the database holds
 ### adopt_failure
 
 ```mach
-pub fun adopt_failure(db: *QueryDb, failure: fail.Fail)
+pub fun adopt_failure(db: *QueryDb, failure: mach.base.fail.Fail)
 ```
 
 hold the failure an operation handed back, its text and places owned through the query
@@ -358,7 +354,7 @@ database, as the held failure, replacing what the slot held; the database owns i
 ### hold_failure
 
 ```mach
-pub fun hold_failure(db: *QueryDb, failure: fail.Fail, lost: *bool) fail.Fail
+pub fun hold_failure(db: *QueryDb, failure: mach.base.fail.Fail, lost: *bool) mach.base.fail.Fail
 ```
 
 hold a failure where the database presents it: its text and the places it points at are
@@ -376,7 +372,7 @@ refused leaves the failure without that part and sets `lost`
 ### origin_of
 
 ```mach
-pub fun origin_of(db: *QueryDb, f: fail.Fail) diagnostic.Origin
+pub fun origin_of(db: *QueryDb, f: mach.base.fail.Fail) mach.base.diagnostic.Origin
 ```
 
 the origin of the product that raised `f`: the operation's, the held failure's or the last
@@ -403,13 +399,13 @@ and the operation state are released. nil is a no-op
 ### runtime
 
 ```mach
-pub fun runtime[T](db: *QueryDb) res[QueryRuntime[T], fail.Fail]
+pub fun runtime[T](db: *QueryDb) res[QueryRuntime[T], mach.base.fail.Fail]
 ```
 
 ### begin
 
 ```mach
-pub fun begin(db: *QueryDb) res[Operation, fail.Fail]
+pub fun begin(db: *QueryDb) res[Operation, mach.base.fail.Fail]
 ```
 
 open an operation. one is open at a time, and the previous one's presentation must
@@ -424,7 +420,7 @@ cleared
 ### end
 
 ```mach
-pub fun end(db: *QueryDb, operation: Operation) err[fail.Fail]
+pub fun end(db: *QueryDb, operation: Operation) err[mach.base.fail.Fail]
 ```
 
 close an operation: no computation may be on the stack and no prepared product may be
@@ -440,7 +436,7 @@ presentation is pending either way
 ### discard
 
 ```mach
-pub fun discard(db: *QueryDb, operation: Operation) err[fail.Fail]
+pub fun discard(db: *QueryDb, operation: Operation) err[mach.base.fail.Fail]
 ```
 
 release a pending presentation without collecting it: the attempts, the failure and
@@ -454,7 +450,7 @@ its message are dropped and the db accepts the next begin
 ### take_failure
 
 ```mach
-pub fun take_failure(db: *QueryDb, operation: Operation) res[opt[fail.Fail], fail.Fail]
+pub fun take_failure(db: *QueryDb, operation: Operation) res[opt[mach.base.fail.Fail], mach.base.fail.Fail]
 ```
 
 take ownership of the ended operation's failure before discarding it: its text and places are
@@ -470,7 +466,7 @@ none when none was recorded
 
 ```mach
 pub fun collect(db: *QueryDb, operation: Operation, roots: *QueryKey, count: usize,
-    a: *A.Allocator) res[*Presentation, fail.Fail]
+    a: *std.allocator.Allocator) res[*Presentation, mach.base.fail.Fail]
 ```
 
 collect the ended operation's presentation: the diagnostics of every product reachable
@@ -490,7 +486,7 @@ failure nothing was released and the presentation is still pending
 ### set_input
 
 ```mach
-pub fun set_input(db: *QueryDb, kind: *Kind, key: u64, value: *u8, value_len: u32) err[fail.Fail]
+pub fun set_input(db: *QueryDb, kind: *Kind, key: u64, value: *u8, value_len: u32) err[mach.base.fail.Fail]
 ```
 
 set an input product's bytes, copied into the database. equal bytes keep the revision. an open
@@ -504,7 +500,7 @@ value; one it has read is refused
 ### prepare_retirement
 
 ```mach
-pub fun prepare_retirement(db: *QueryDb, roots: *QueryKey, count: usize) res[PreparedRetirement, fail.Fail]
+pub fun prepare_retirement(db: *QueryDb, roots: *QueryKey, count: usize) res[PreparedRetirement, mach.base.fail.Fail]
 ```
 
 a retirement rooted at the given products and every product that depends on them. a root
@@ -520,7 +516,7 @@ whose kind was never used has nothing to retire
 ### prepare_owned_retirement
 
 ```mach
-pub fun prepare_owned_retirement(db: *QueryDb, owned: OwnedFn, ctx: ptr) res[PreparedRetirement, fail.Fail]
+pub fun prepare_owned_retirement(db: *QueryDb, owned: OwnedFn, ctx: ptr) res[PreparedRetirement, mach.base.fail.Fail]
 ```
 
 a retirement rooted at every product whose key a released module or file owns, with its dependents
@@ -535,13 +531,13 @@ a retirement rooted at every product whose key a released module or file owns, w
 ### prepared_view
 
 ```mach
-pub fun prepared_view(db: *QueryDb, prepared: PreparedQuery) res[QueryView, fail.Fail]
+pub fun prepared_view(db: *QueryDb, prepared: PreparedQuery) res[QueryView, mach.base.fail.Fail]
 ```
 
 ### prepared_diags
 
 ```mach
-pub fun prepared_diags(db: *QueryDb, prepared: PreparedQuery) res[*diagnostic.DiagnosticStore, fail.Fail]
+pub fun prepared_diags(db: *QueryDb, prepared: PreparedQuery) res[*mach.base.diagnostic.DiagnosticStore, mach.base.fail.Fail]
 ```
 
 the store a prepared query's compute reports into: work finished outside the
@@ -551,19 +547,19 @@ reaches the presentation like one the compute made itself
 ### cancel_prepared
 
 ```mach
-pub fun cancel_prepared(db: *QueryDb, prepared: PreparedQuery) err[fail.Fail]
+pub fun cancel_prepared(db: *QueryDb, prepared: PreparedQuery) err[mach.base.fail.Fail]
 ```
 
 ### complete_prepared
 
 ```mach
-pub fun complete_prepared(db: *QueryDb, prepared: PreparedQuery, result: err[fail.Fail]) err[fail.Fail]
+pub fun complete_prepared(db: *QueryDb, prepared: PreparedQuery, result: err[mach.base.fail.Fail]) err[mach.base.fail.Fail]
 ```
 
 ### walk_products
 
 ```mach
-pub fun walk_products(db: *QueryDb, root: QueryKey, ctx: ptr, enter: ProductFilter, visit: ProductVisit) err[fail.Fail]
+pub fun walk_products(db: *QueryDb, root: QueryKey, ctx: ptr, enter: ProductFilter, visit: ProductVisit) err[mach.base.fail.Fail]
 ```
 
 visit a product and every product it was computed from that the filter enters, each once
@@ -608,7 +604,7 @@ served and a product the host's operations never reached is not taken for one th
 ### value_dnit
 
 ```mach
-pub fun value_dnit(db: *QueryDb, kind: *Kind, key: u64) err[fail.Fail]
+pub fun value_dnit(db: *QueryDb, kind: *Kind, key: u64) err[mach.base.fail.Fail]
 ```
 
 give back the value of a derived product no reader of the build reads again: its finalizer
@@ -637,7 +633,7 @@ runtime's context, a `T` the computations of every kind read through
 ### get
 
 ```mach
-pub fun get[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[QueryView, fail.Fail]
+pub fun get[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[QueryView, mach.base.fail.Fail]
 ```
 
 the current value of a product, computing or revalidating it inside the open operation
@@ -654,7 +650,7 @@ and recording it as a dependency of the product being computed, if any
 ### reusable
 
 ```mach
-pub fun reusable[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[bool, fail.Fail]
+pub fun reusable[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[bool, mach.base.fail.Fail]
 ```
 
 validation may refresh dependencies but never computes the requested product
@@ -662,7 +658,7 @@ validation may refresh dependencies but never computes the requested product
 ### prepare
 
 ```mach
-pub fun prepare[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[PreparedQuery, fail.Fail]
+pub fun prepare[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[PreparedQuery, mach.base.fail.Fail]
 ```
 
 compute a derived product the caller finishes outside the computation (a worker thread),
@@ -671,13 +667,13 @@ published by complete_prepared or dropped by cancel_prepared before the operatio
 ### revision
 
 ```mach
-pub fun revision[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[Revision, fail.Fail]
+pub fun revision[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[Revision, mach.base.fail.Fail]
 ```
 
 ### depend
 
 ```mach
-pub fun depend[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) err[fail.Fail]
+pub fun depend[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) err[mach.base.fail.Fail]
 ```
 
 ## PreparedRetirement
@@ -704,13 +700,13 @@ discarded owns nothing
 ### validate_retirement
 
 ```mach
-pub fun validate_retirement(prepared: *PreparedRetirement) err[fail.Fail]
+pub fun validate_retirement(prepared: *PreparedRetirement) err[mach.base.fail.Fail]
 ```
 
 ### commit_retirement
 
 ```mach
-pub fun commit_retirement(prepared: *PreparedRetirement) err[fail.Fail]
+pub fun commit_retirement(prepared: *PreparedRetirement) err[mach.base.fail.Fail]
 ```
 
 ## ProductFilter
@@ -725,7 +721,7 @@ reached through walk_products
 ## ProductVisit
 
 ```mach
-pub def ProductVisit: fun(ptr, QueryKey, *diagnostic.DiagnosticStore)
+pub def ProductVisit: fun(ptr, QueryKey, *mach.base.diagnostic.DiagnosticStore)
 ```
 
 what a product walk is shown of each product: its address and the store it reported into,

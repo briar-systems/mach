@@ -6,15 +6,15 @@ member: git as a member of the source and pin contracts, its tables assembled fr
 parts beside it. the closure engine opens a source's tables here and works through them,
 never naming git itself
 
-<sub>source: [`src/package/git/member.mach`](../../../../src/package/git/member.mach) · imported by 4 modules</sub>
+Source: [`src/package/git/member.mach`](../../../../src/package/git/member.mach)
 
-<sub>`session` is [`mach.session`](../../session.md) · `report` is [`mach.package.report`](../report.md) · `package_source` is [`mach.package.source`](../source.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `package_pin` is [`mach.package.pin`](../pin.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.package.pin`](../pin.md), [`mach.package.report`](../report.md), [`mach.package.source`](../source.md), [`mach.session`](../../session.md).
 
 | Functions | |
 | :--- | :--- |
-| [`checkouts`](#checkouts) | the checkouts table of git: dep/&lt;id> is a submodule |
+| [`checkouts`](#checkouts) | the checkouts table of git: dep/\<id> is a submodule |
 | [`releases`](#releases) | the releases table of git: a url's releases are its `v`-prefixed semver tags |
-| [`pin`](#pin) | the pin table of git: a pin is the gitlink the enclosing repository stages at dep/&lt;id> |
+| [`pin`](#pin) | the pin table of git: a pin is the gitlink the enclosing repository stages at dep/\<id> |
 
 ---
 
@@ -23,10 +23,10 @@ never naming git itself
 ### checkouts
 
 ```mach
-pub fun checkouts(s: *session.Session, rep: *report.Report) res[package_source.Checkouts, fail.Fail]
+pub fun checkouts(s: *mach.session.Session, rep: *mach.package.report.Report) res[mach.package.source.Checkouts, mach.base.fail.Fail]
 ```
 
-the checkouts table of git: dep/&lt;id> is a submodule
+the checkouts table of git: dep/\<id> is a submodule
 
 | Parameter | |
 | :--- | :--- |
@@ -37,7 +37,7 @@ the checkouts table of git: dep/&lt;id> is a submodule
 ### releases
 
 ```mach
-pub fun releases(s: *session.Session, offline: bool, local: str) res[package_source.Releases, fail.Fail]
+pub fun releases(s: *mach.session.Session, offline: bool, local: str) res[mach.package.source.Releases, mach.base.fail.Fail]
 ```
 
 the releases table of git: a url's releases are its `v`-prefixed semver tags
@@ -52,8 +52,8 @@ the releases table of git: a url's releases are its `v`-prefixed semver tags
 ### pin
 
 ```mach
-pub fun pin(s: *session.Session) package_pin.Pin
+pub fun pin(s: *mach.session.Session) mach.package.pin.Pin
 ```
 
-the pin table of git: a pin is the gitlink the enclosing repository stages at dep/&lt;id>
+the pin table of git: a pin is the gitlink the enclosing repository stages at dep/\<id>
 

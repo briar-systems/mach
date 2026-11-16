@@ -5,9 +5,9 @@
 what each phase lets a comptime evaluation ask of it: members, identifiers, types,
 fields and layout, published as one record per phase
 
-<sub>source: [`src/front/comptime/capability.mach`](../../../../src/front/comptime/capability.mach) · imported by 13 modules</sub>
+Source: [`src/front/comptime/capability.mach`](../../../../src/front/comptime/capability.mach)
 
-<sub>`ast` is [`mach.front.ast`](../ast.md) · `ast_id` is [`mach.front.ast.id`](../ast/id.md) · `ast_expr` is [`mach.front.ast.expr`](../ast/expr.md) · `comptime_failure` is [`mach.front.comptime.failure`](failure.md) · `ast_type` is [`mach.front.ast.type`](../ast/type.md) · `PhaseCapabilityKind` is private · `comptime_value` is [`mach.front.comptime.value`](value.md) · `type` is [`mach.type`](../../type.md) · `comptime_deep` is [`mach.front.comptime.deep`](deep.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.ast`](../ast.md), [`mach.front.ast.expr`](../ast/expr.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.ast.type`](../ast/type.md), [`mach.front.comptime.deep`](deep.md), [`mach.front.comptime.failure`](failure.md), [`mach.front.comptime.value`](value.md), [`mach.type`](../../type.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -16,9 +16,9 @@ fields and layout, published as one record per phase
 
 | On `PhaseCapabilities` | |
 | :--- | :--- |
-| [`capabilities_make`](#capabilities_make) · [`read_head`](#read_head) · [`read_expression`](#read_expression) | |
+| [`capabilities_make`](#capabilities_make), [`read_head`](#read_head), [`read_expression`](#read_expression) | |
 | [`no_capabilities`](#no_capabilities) | no phase capability: an expression reads literals and the constants its context binds |
-| [`loading_capabilities`](#loading_capabilities) · [`resolution_capabilities`](#resolution_capabilities) · [`semantic_name_capabilities`](#semantic_name_capabilities) · [`semantic_type_capabilities`](#semantic_type_capabilities) · [`lowering_capabilities`](#lowering_capabilities) · [`capabilities_have_member`](#capabilities_have_member) · [`capabilities_have_ident`](#capabilities_have_ident) · [`capabilities_have_constant`](#capabilities_have_constant) | |
+| [`loading_capabilities`](#loading_capabilities), [`resolution_capabilities`](#resolution_capabilities), [`semantic_name_capabilities`](#semantic_name_capabilities), [`semantic_type_capabilities`](#semantic_type_capabilities), [`lowering_capabilities`](#lowering_capabilities), [`capabilities_have_member`](#capabilities_have_member), [`capabilities_have_ident`](#capabilities_have_ident), [`capabilities_have_constant`](#capabilities_have_constant) | |
 | [`store_of`](#store_of) | the store holding the node a value names, which only a phase that reads interfaces has |
 | [`capabilities_have_types`](#capabilities_have_types) | |
 | [`capabilities_lowering`](#capabilities_lowering) | whether the phase is lowering, which materializes only values an earlier phase asked for |
@@ -27,11 +27,11 @@ fields and layout, published as one record per phase
 
 | Functions | |
 | :--- | :--- |
-| [`parsed_expression`](#parsed_expression) · [`parsed_head`](#parsed_head) | |
+| [`parsed_expression`](#parsed_expression), [`parsed_head`](#parsed_head) | |
 
 | Constants | |
 | :--- | :--- |
-| [`FIELD_SEL_NAME`](#constants) · [`FIELD_SEL_TYPE`](#constants) · [`FIELD_SEL_OFFSET`](#constants) · [`FIELD_SEL_HAS_PAYLOAD`](#constants) · [`FIELD_SEL_CODE`](#constants) · [`FIELD_SEL_TYPE_BY_NAME`](#constants) · [`COMPTIME_CASE_NO_PAYLOAD_MSG`](#constants) · [`TYPE_QUERY_IS_RECORD`](#constants) · [`TYPE_QUERY_IS_UNION`](#constants) · [`TYPE_QUERY_IS_POINTER`](#constants) · [`TYPE_QUERY_NAME`](#constants) · [`TYPE_QUERY_IS_SECRET`](#constants) · [`TYPE_QUERY_IS_TAG`](#constants) · [`TYPE_QUERY_IS_INTEGER`](#constants) · [`TYPE_QUERY_IS_FLOAT`](#constants) · [`TYPE_QUERY_HOLDS_SECRET`](#constants) · [`PHASE_CAP_NONE`](#constants) · [`PHASE_CAP_LOADING`](#constants) · [`PHASE_CAP_RESOLUTION`](#constants) | |
+| [`FIELD_SEL_NAME`](#constants), [`FIELD_SEL_TYPE`](#constants), [`FIELD_SEL_OFFSET`](#constants), [`FIELD_SEL_HAS_PAYLOAD`](#constants), [`FIELD_SEL_CODE`](#constants), [`FIELD_SEL_TYPE_BY_NAME`](#constants), [`COMPTIME_CASE_NO_PAYLOAD_MSG`](#constants), [`TYPE_QUERY_IS_RECORD`](#constants), [`TYPE_QUERY_IS_UNION`](#constants), [`TYPE_QUERY_IS_POINTER`](#constants), [`TYPE_QUERY_NAME`](#constants), [`TYPE_QUERY_IS_SECRET`](#constants), [`TYPE_QUERY_IS_TAG`](#constants), [`TYPE_QUERY_IS_INTEGER`](#constants), [`TYPE_QUERY_IS_FLOAT`](#constants), [`TYPE_QUERY_HOLDS_SECRET`](#constants), [`PHASE_CAP_NONE`](#constants), [`PHASE_CAP_LOADING`](#constants), [`PHASE_CAP_RESOLUTION`](#constants) | |
 
 ---
 
@@ -47,32 +47,32 @@ the context of an evaluation that holds no phase capability
 
 ```mach
 pub rec PhaseCapabilities[T] {
-    expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail];
+    expression: fun(*T, *mach.front.ast.Ast, mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.front.comptime.failure.EvalFail];
     # a type node as the phase reads it, a literal head split into type and case once names are
     # resolved
-    head:   fun(*T, *ast.Ast, ast_id.TypeId) res[ast_type.Type, comptime_failure.EvalFail];
+    head:   fun(*T, *mach.front.ast.Ast, mach.front.ast.id.TypeId) res[mach.front.ast.type.Type, mach.front.comptime.failure.EvalFail];
     kind:   PhaseCapabilityKind;
-    member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
-    type_:  fun(*T, ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail];
+    member: fun(*T, mach.front.ast.id.ExprId) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail];
+    type_:  fun(*T, mach.front.ast.id.ExprId) res[opt[u32], mach.front.comptime.failure.EvalFail];
     # the type store the field descriptors read, and the byte offset of a field, which only
     # the phase that knows layout answers
-    types:  fun(*T) *type.TypeInterner;
-    offset: fun(*T, u32, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
+    types:  fun(*T) *mach.type.TypeInterner;
+    offset: fun(*T, u32, u32) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail];
     # the zero of a type, which a member an element literal leaves out holds: a scalar's value,
     # or an aggregate as a node `store` answers
-    zero:   fun(*T, u32) res[comptime_value.CTValue, comptime_failure.EvalFail];
-    query:  fun(*T, u32, u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
-    layout: fun(*T, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
-    ident:  fun(*T, ast_id.ExprId) bool;
+    zero:   fun(*T, u32) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail];
+    query:  fun(*T, u32, u8) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail];
+    layout: fun(*T, u32) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail];
+    ident:  fun(*T, mach.front.ast.id.ExprId) bool;
     # the value of the module constant a bare name names, which only sema binds on demand
-    constant: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail];
-    cast:     fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail];
-    scalar:   fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail];
+    constant: fun(*T, mach.front.ast.id.ExprId) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail];
+    cast:     fun(*T, mach.front.ast.id.ExprId, mach.front.comptime.value.CTValue) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail];
+    scalar:   fun(*T, mach.front.ast.id.ExprId, mach.front.comptime.value.CTValue) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail];
     # whether the place an expression reads is of a type that holds a secret, which only sema answers
-    secret: fun(*T, ast_id.ExprId) bool;
+    secret: fun(*T, mach.front.ast.id.ExprId) bool;
     # the store of published constant values of the module with a stable id, which only the
     # phases that read interfaces hold
-    store: fun(*T, u32) res[*comptime_deep.Store, comptime_failure.EvalFail];
+    store: fun(*T, u32) res[*mach.front.comptime.deep.Store, mach.front.comptime.failure.EvalFail];
 }
 ```
 
@@ -85,13 +85,13 @@ pub fun capabilities_make[T](kind: PhaseCapabilityKind) PhaseCapabilities[T]
 ### read_head
 
 ```mach
-pub fun read_head[T](ctx: *T, caps: PhaseCapabilities[T], a: *ast.Ast, tid: ast_id.TypeId) res[ast_type.Type, comptime_failure.EvalFail]
+pub fun read_head[T](ctx: *T, caps: PhaseCapabilities[T], a: *mach.front.ast.Ast, tid: mach.front.ast.id.TypeId) res[mach.front.ast.type.Type, mach.front.comptime.failure.EvalFail]
 ```
 
 ### read_expression
 
 ```mach
-pub fun read_expression[T](ctx: *T, caps: PhaseCapabilities[T], a: *ast.Ast, eid: ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail]
+pub fun read_expression[T](ctx: *T, caps: PhaseCapabilities[T], a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.front.comptime.failure.EvalFail]
 ```
 
 ### no_capabilities
@@ -105,70 +105,70 @@ no phase capability: an expression reads literals and the constants its context 
 ### loading_capabilities
 
 ```mach
-pub fun loading_capabilities[T](member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
-    cast: fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail],
-    head: fun(*T, *ast.Ast, ast_id.TypeId) res[ast_type.Type, comptime_failure.EvalFail]) res[PhaseCapabilities[T], fail.Fail]
+pub fun loading_capabilities[T](member: fun(*T, mach.front.ast.id.ExprId) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail],
+    cast: fun(*T, mach.front.ast.id.ExprId, mach.front.comptime.value.CTValue) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail],
+    head: fun(*T, *mach.front.ast.Ast, mach.front.ast.id.TypeId) res[mach.front.ast.type.Type, mach.front.comptime.failure.EvalFail]) res[PhaseCapabilities[T], mach.base.fail.Fail]
 ```
 
 ### resolution_capabilities
 
 ```mach
-pub fun resolution_capabilities[T](ident: fun(*T, ast_id.ExprId) bool,
-    expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail],
-    head: fun(*T, *ast.Ast, ast_id.TypeId) res[ast_type.Type, comptime_failure.EvalFail]) res[PhaseCapabilities[T], fail.Fail]
+pub fun resolution_capabilities[T](ident: fun(*T, mach.front.ast.id.ExprId) bool,
+    expression: fun(*T, *mach.front.ast.Ast, mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.front.comptime.failure.EvalFail],
+    head: fun(*T, *mach.front.ast.Ast, mach.front.ast.id.TypeId) res[mach.front.ast.type.Type, mach.front.comptime.failure.EvalFail]) res[PhaseCapabilities[T], mach.base.fail.Fail]
 ```
 
 ### semantic_name_capabilities
 
 ```mach
 pub fun semantic_name_capabilities[T](
-    member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
-    constant: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
-    store: fun(*T, u32) res[*comptime_deep.Store, comptime_failure.EvalFail],
-    ident: fun(*T, ast_id.ExprId) bool,
-    secret: fun(*T, ast_id.ExprId) bool,
-    expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail],
-    head: fun(*T, *ast.Ast, ast_id.TypeId) res[ast_type.Type, comptime_failure.EvalFail]) res[PhaseCapabilities[T], fail.Fail]
+    member: fun(*T, mach.front.ast.id.ExprId) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail],
+    constant: fun(*T, mach.front.ast.id.ExprId) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail],
+    store: fun(*T, u32) res[*mach.front.comptime.deep.Store, mach.front.comptime.failure.EvalFail],
+    ident: fun(*T, mach.front.ast.id.ExprId) bool,
+    secret: fun(*T, mach.front.ast.id.ExprId) bool,
+    expression: fun(*T, *mach.front.ast.Ast, mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.front.comptime.failure.EvalFail],
+    head: fun(*T, *mach.front.ast.Ast, mach.front.ast.id.TypeId) res[mach.front.ast.type.Type, mach.front.comptime.failure.EvalFail]) res[PhaseCapabilities[T], mach.base.fail.Fail]
 ```
 
 ### semantic_type_capabilities
 
 ```mach
 pub fun semantic_type_capabilities[T](
-    member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
-    constant: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
-    store: fun(*T, u32) res[*comptime_deep.Store, comptime_failure.EvalFail],
-    type_: fun(*T, ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail],
-    types: fun(*T) *type.TypeInterner,
-    offset: fun(*T, u32, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
-    zero: fun(*T, u32) res[comptime_value.CTValue, comptime_failure.EvalFail],
-    query: fun(*T, u32, u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
-    layout: fun(*T, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
-    cast: fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail],
-    scalar: fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail],
-    ident: fun(*T, ast_id.ExprId) bool,
-    secret: fun(*T, ast_id.ExprId) bool,
-    expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail],
-    head: fun(*T, *ast.Ast, ast_id.TypeId) res[ast_type.Type, comptime_failure.EvalFail]) res[PhaseCapabilities[T], fail.Fail]
+    member: fun(*T, mach.front.ast.id.ExprId) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail],
+    constant: fun(*T, mach.front.ast.id.ExprId) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail],
+    store: fun(*T, u32) res[*mach.front.comptime.deep.Store, mach.front.comptime.failure.EvalFail],
+    type_: fun(*T, mach.front.ast.id.ExprId) res[opt[u32], mach.front.comptime.failure.EvalFail],
+    types: fun(*T) *mach.type.TypeInterner,
+    offset: fun(*T, u32, u32) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail],
+    zero: fun(*T, u32) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail],
+    query: fun(*T, u32, u8) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail],
+    layout: fun(*T, u32) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail],
+    cast: fun(*T, mach.front.ast.id.ExprId, mach.front.comptime.value.CTValue) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail],
+    scalar: fun(*T, mach.front.ast.id.ExprId, mach.front.comptime.value.CTValue) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail],
+    ident: fun(*T, mach.front.ast.id.ExprId) bool,
+    secret: fun(*T, mach.front.ast.id.ExprId) bool,
+    expression: fun(*T, *mach.front.ast.Ast, mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.front.comptime.failure.EvalFail],
+    head: fun(*T, *mach.front.ast.Ast, mach.front.ast.id.TypeId) res[mach.front.ast.type.Type, mach.front.comptime.failure.EvalFail]) res[PhaseCapabilities[T], mach.base.fail.Fail]
 ```
 
 ### lowering_capabilities
 
 ```mach
 pub fun lowering_capabilities[T](
-    member: fun(*T, ast_id.ExprId) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
-    store: fun(*T, u32) res[*comptime_deep.Store, comptime_failure.EvalFail],
-    type_: fun(*T, ast_id.ExprId) res[opt[u32], comptime_failure.EvalFail],
-    types: fun(*T) *type.TypeInterner,
-    offset: fun(*T, u32, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
-    zero: fun(*T, u32) res[comptime_value.CTValue, comptime_failure.EvalFail],
-    query: fun(*T, u32, u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
-    layout: fun(*T, u32) res[opt[comptime_value.CTValue], comptime_failure.EvalFail],
-    cast: fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail],
-    scalar: fun(*T, ast_id.ExprId, comptime_value.CTValue) res[comptime_value.CTValue, comptime_failure.EvalFail],
-    ident: fun(*T, ast_id.ExprId) bool,
-    expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail],
-    head: fun(*T, *ast.Ast, ast_id.TypeId) res[ast_type.Type, comptime_failure.EvalFail]) res[PhaseCapabilities[T], fail.Fail]
+    member: fun(*T, mach.front.ast.id.ExprId) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail],
+    store: fun(*T, u32) res[*mach.front.comptime.deep.Store, mach.front.comptime.failure.EvalFail],
+    type_: fun(*T, mach.front.ast.id.ExprId) res[opt[u32], mach.front.comptime.failure.EvalFail],
+    types: fun(*T) *mach.type.TypeInterner,
+    offset: fun(*T, u32, u32) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail],
+    zero: fun(*T, u32) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail],
+    query: fun(*T, u32, u8) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail],
+    layout: fun(*T, u32) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail],
+    cast: fun(*T, mach.front.ast.id.ExprId, mach.front.comptime.value.CTValue) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail],
+    scalar: fun(*T, mach.front.ast.id.ExprId, mach.front.comptime.value.CTValue) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail],
+    ident: fun(*T, mach.front.ast.id.ExprId) bool,
+    expression: fun(*T, *mach.front.ast.Ast, mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.front.comptime.failure.EvalFail],
+    head: fun(*T, *mach.front.ast.Ast, mach.front.ast.id.TypeId) res[mach.front.ast.type.Type, mach.front.comptime.failure.EvalFail]) res[PhaseCapabilities[T], mach.base.fail.Fail]
 ```
 
 ### capabilities_have_member
@@ -192,7 +192,7 @@ pub fun capabilities_have_constant[T](ctx: *T, caps: PhaseCapabilities[T]) bool
 ### store_of
 
 ```mach
-pub fun store_of[T](ctx: *T, caps: PhaseCapabilities[T], module: u32) res[*comptime_deep.Store, comptime_failure.EvalFail]
+pub fun store_of[T](ctx: *T, caps: PhaseCapabilities[T], module: u32) res[*mach.front.comptime.deep.Store, mach.front.comptime.failure.EvalFail]
 ```
 
 the store holding the node a value names, which only a phase that reads interfaces has
@@ -220,7 +220,7 @@ pub fun capabilities_cast[T](ctx: *T, caps: PhaseCapabilities[T]) bool
 ### field_of
 
 ```mach
-pub fun field_of[T](ctx: *T, caps: PhaseCapabilities[T], owner: u32, index: u32, pick: u8) res[opt[comptime_value.CTValue], comptime_failure.EvalFail]
+pub fun field_of[T](ctx: *T, caps: PhaseCapabilities[T], owner: u32, index: u32, pick: u8) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail]
 ```
 
 what a field descriptor answers about field `index` of `owner`, `pick` naming the member
@@ -231,13 +231,13 @@ asked; every answer but the offset reads the type store, and the offset is the p
 ### parsed_expression
 
 ```mach
-pub fun parsed_expression[T](ctx: *T, a: *ast.Ast, eid: ast_id.ExprId) res[ast_expr.Expr, comptime_failure.EvalFail]
+pub fun parsed_expression[T](ctx: *T, a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.front.comptime.failure.EvalFail]
 ```
 
 ### parsed_head
 
 ```mach
-pub fun parsed_head[T](ctx: *T, a: *ast.Ast, tid: ast_id.TypeId) res[ast_type.Type, comptime_failure.EvalFail]
+pub fun parsed_head[T](ctx: *T, a: *mach.front.ast.Ast, tid: mach.front.ast.id.TypeId) res[mach.front.ast.type.Type, mach.front.comptime.failure.EvalFail]
 ```
 
 ## Constants

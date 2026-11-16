@@ -7,9 +7,9 @@ the forms of the previous major and the tables that carry a project across them
 each form is refused, its diagnostic naming what this major spells. the head, option
 and alias tables are what `mach migrate` rewrites with, and the next major deletes them
 
-<sub>source: [`src/front/transition.mach`](../../../src/front/transition.mach) · imported by 5 modules</sub>
+Source: [`src/front/transition.mach`](../../../src/front/transition.mach)
 
-<sub>`diagnostic_kind` is [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md) · `base_source` is [`mach.base.source`](../base/source.md)</sub>
+Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.source`](../base/source.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -68,7 +68,7 @@ the row of `form`
 
 ```mach
 pub rec Row {
-    refusal: diagnostic_kind.Kind;
+    refusal: mach.base.diagnostic.kind.Kind;
     message: str;
     note:    str;
 }
@@ -78,7 +78,7 @@ one form
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `refusal` | `diagnostic_kind.Kind` | the kind it is refused with |
+| `refusal` | `mach.base.diagnostic.kind.Kind` | the kind it is refused with |
 | `message` | `str` | what the diagnostic says |
 | `note` | `str` | the replacement it names |
 
@@ -97,7 +97,7 @@ architecture's first level, which adds nothing to a target of it
 ### head_of
 
 ```mach
-pub fun head_of(source: str, span: base_source.Span) *Head
+pub fun head_of(source: str, span: mach.base.source.Span) *Head
 ```
 
 the row of the head `span` of `source` writes, nil when no previous major wrote it
@@ -136,7 +136,7 @@ a `def` a previous major spelled over a width this major has a truth value for
 ### alias_of
 
 ```mach
-pub fun alias_of(source: str, name: base_source.Span, over: base_source.Span) *Alias
+pub fun alias_of(source: str, name: mach.base.source.Span, over: mach.base.source.Span) *Alias
 ```
 
 the row of a `def` of the name at `name` over the type at `over`, nil for any other

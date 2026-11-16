@@ -8,9 +8,9 @@ an outcome owns everything it records, and a refused record leaves it as it was.
 failure is a `fail.Fail` and folds into the severity, while the failures and
 diagnostics themselves went to the build's readout sink as they happened.
 
-<sub>source: [`src/build/outcome.mach`](../../../src/build/outcome.mach) · imported by 6 modules</sub>
+Source: [`src/build/outcome.mach`](../../../src/build/outcome.mach)
 
-<sub>`fail` is [`mach.base.fail`](../base/fail.md) · `Artifact` is private · `testrun` is [`mach.report.testrun`](../report/testrun.md) · `A` is `std.allocator`</sub>
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.report.testrun`](../report/testrun.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -20,7 +20,7 @@ diagnostics themselves went to the build's readout sink as they happened.
 
 | On `BuildSeverity` | |
 | :--- | :--- |
-| [`BUILD_OK`](#buildseverity) · [`BUILD_USER`](#buildseverity) · [`BUILD_ENVIRONMENT`](#buildseverity) · [`BUILD_INTERNAL`](#buildseverity) · [`severity_of`](#severity_of) | |
+| [`BUILD_OK`](#buildseverity), [`BUILD_USER`](#buildseverity), [`BUILD_ENVIRONMENT`](#buildseverity), [`BUILD_INTERNAL`](#buildseverity), [`severity_of`](#severity_of) | |
 
 | On `BuildOutcome` | |
 | :--- | :--- |
@@ -50,7 +50,7 @@ pub def BuildSeverity: u8
 ### severity_of
 
 ```mach
-pub fun severity_of(f: *fail.Fail) BuildSeverity
+pub fun severity_of(f: *mach.base.fail.Fail) BuildSeverity
 ```
 
 ## BuildOutcome
@@ -59,7 +59,7 @@ pub fun severity_of(f: *fail.Fail) BuildSeverity
 pub rec BuildOutcome {
     severity:     BuildSeverity;
     artifacts:    Vector[Artifact];
-    tests:        Vector[testrun.TestArtifact];
+    tests:        Vector[mach.report.testrun.TestArtifact];
     declassified: Vector[Declassified];
 }
 ```
@@ -73,13 +73,13 @@ way, failures and diagnostics included, went to the build's readout sink
 | :--- | :--- | :--- |
 | `severity` | `BuildSeverity` | the worst standing recorded, BUILD_OK to BUILD_INTERNAL; ordered, compared with > |
 | `artifacts` | `Vector[Artifact]` | the outputs written, in build order |
-| `tests` | `Vector[testrun.TestArtifact]` | the test dispatchers built, for the runner |
+| `tests` | `Vector[mach.report.testrun.TestArtifact]` | the test dispatchers built, for the runner |
 | `declassified` | `Vector[Declassified]` | the declassifications a check listed, in module then source order |
 
 ### outcome_init
 
 ```mach
-pub fun outcome_init(oa: *A.Allocator) BuildOutcome
+pub fun outcome_init(oa: *std.allocator.Allocator) BuildOutcome
 ```
 
 an empty outcome whose records `oa` will own
@@ -95,7 +95,7 @@ release an outcome and everything it recorded; nil is a no-op
 ### record_artifact
 
 ```mach
-pub fun record_artifact(bo: *BuildOutcome, kind: Spelled, path: str) err[A.Error]
+pub fun record_artifact(bo: *BuildOutcome, kind: Spelled, path: str) err[std.allocator.Error]
 ```
 
 every record_* copies what it stores into the outcome's allocator; a refused
@@ -105,7 +105,7 @@ made before the refusal
 ### record_test
 
 ```mach
-pub fun record_test(bo: *BuildOutcome, t: testrun.TestArtifact) err[A.Error]
+pub fun record_test(bo: *BuildOutcome, t: mach.report.testrun.TestArtifact) err[std.allocator.Error]
 ```
 
 t's text is borrowed; the outcome keeps its own copy. a nil text stays nil
@@ -113,7 +113,7 @@ t's text is borrowed; the outcome keeps its own copy. a nil text stays nil
 ### record_declassified
 
 ```mach
-pub fun record_declassified(bo: *BuildOutcome, d: Declassified) err[A.Error]
+pub fun record_declassified(bo: *BuildOutcome, d: Declassified) err[std.allocator.Error]
 ```
 
 d's texts are borrowed; the outcome keeps its own copies
@@ -121,7 +121,7 @@ d's texts are borrowed; the outcome keeps its own copies
 ### fold_fail
 
 ```mach
-pub fun fold_fail(bo: *BuildOutcome, f: *fail.Fail)
+pub fun fold_fail(bo: *BuildOutcome, f: *mach.base.fail.Fail)
 ```
 
 a reported or user failure is the user's; the severity never regresses
@@ -129,7 +129,7 @@ a reported or user failure is the user's; the severity never regresses
 ### merge
 
 ```mach
-pub fun merge(agg: *BuildOutcome, unit: *BuildOutcome) err[A.Error]
+pub fun merge(agg: *BuildOutcome, unit: *BuildOutcome) err[std.allocator.Error]
 ```
 
 capacity is reserved for both transfers before any element moves, so
