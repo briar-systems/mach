@@ -25,9 +25,11 @@ files with.
 
 ## The source tree
 
-`src/` is divided into areas. Each area is a directory, and an area that has a
-root module keeps it beside the directory: `src/lower.mach` is `mach.lower` and
-`src/lower/expr.mach` is `mach.lower.expr`.
+`src/` is divided into areas. Each area is a directory with its root module
+beside it: `src/lower.mach` is `mach.lower` and `src/lower/expr.mach` is
+`mach.lower.expr`. The root module's docstring says what the area is, and the
+generated reference prints it at the top of the area's page. Where an area has
+nothing to declare at its root, the root module holds that docstring alone.
 
 The areas are listed from the bottom up. A module imports from its own area and
 from the areas listed before it, never from one listed after it. The one

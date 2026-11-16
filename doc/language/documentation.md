@@ -63,6 +63,13 @@ documented components are out of declaration order
 Tags have no return value, so a `ret:` component line on a tag is warned. A bare
 generic name without brackets (such as `T:` instead of `[T]:`) is also warned.
 
+The lint runs on the modules of the project being built, checked or
+documented, and never on a dependency's: a project is not shown warnings
+about source it does not own, as with the unused-import warning. Its
+warnings come with name resolution, so a file whose names are not resolved
+in a run is not linted by it, except under `mach doc`, which lints every file
+it documents.
+
 A summary-only docstring, a docstring on a `val`, `var`, `def`, `use`, or
 `fwd` (which are summary-only forms), and a non-`pub` declaration are not
 checked. A component block need not be complete: an element with no line is
@@ -213,6 +220,17 @@ file, before any `use`, `fwd`, or decorator.
 Like every docstring, a module docstring may continue past its summary with
 further paragraphs separated by blank `#` lines.
 
+A file may hold a module docstring and nothing else. Such a module declares
+nothing and is never imported for what it holds: it exists to describe the
+directory of the same name beside it, such as `src/front.mach` for
+`src/front/`, and `mach doc` gives it no page of its own and shows its
+docstring as that directory's description.
+
+```mach
+# the front end: the lexer, the parser and the syntax tree, module loading and name
+# resolution, comptime evaluation, decorators, type checking, and doc comments
+```
+
 ## Value
 
 ```mach
@@ -226,45 +244,79 @@ var calls: i64 = 0;
 ## What `mach doc` writes
 
 `mach doc <path>` documents the whole project at `<path>` in one run: every
-module of the project that one of its artifacts reaches, each once, on the
-target `-t` names or the host's. It writes markdown into `doc/<project id>/`
-(`<dir>/<project id>/` with `-o <dir>`), a directory it owns: a page it did
-not write in the run, such as one whose module is gone, is removed, and so is
-a directory left empty. Nothing outside that directory is written.
+`.mach` file under its source root, each once. It parses the files and runs
+nothing more, so the reference is the same on every host, needs no target
+(`-t` and `-a` are refused) and is written for a project whose dependencies
+are not pulled. A file that does not parse refuses the run. It writes markdown
+into `doc/<project id>/` (`<dir>/<project id>/` with `-o <dir>`), a directory
+it owns: a page it did not write in the run, such as one whose file is gone,
+is removed, and so is a directory left empty. Nothing outside that directory
+is written.
 
 - **The project page**, `doc/<id>/README.md`: the project's id and version,
   its artifacts with their kinds and entry modules, its top-level directories
-  with their module counts and the summaries of their root modules, its
-  top-level modules, and the ids of its dependencies.
+  with the summaries of their root modules, its top-level modules, and the ids
+  of its dependencies.
 - **A directory page**, `README.md` in each directory of the source tree:
   the directory's root module (the file beside it of the same name, such as
   `src/lower.mach` for `src/lower/`) with its summary and paragraphs when it
-  has one, the other top-level directories its modules import and those
-  importing them, a table of its modules with their summaries, and its
-  sub-directories with their module counts.
-- **A module page**, `doc/<id>/<path>.md`: a breadcrumb up the tree, the
-  module's path, its docstring, a link to its source file, a line naming
-  every import alias and private type the page's declarations use (`A` is
-  `std.allocator`, `Entry` is private), a map of every
-  public name with its summary, and then an entry for each. A type is shown
-  with the functions and constants that belong to it: a function belongs to
-  the first of its parameters whose type names a type the module declares
-  (through pointers, `^`, arrays and generic arguments), or failing that to a
-  type its return type names (through `res`, `opt`, `err` and pointers); a
-  constant belongs to the type it is declared with. What belongs to no type
-  follows under Functions, Constants, Variables and Forwards.
+  has one, a table of its modules with their summaries, and its
+  sub-directories.
+- **A module page**, `doc/<id>/<path>.md`, for each module that declares
+  anything (a `use` declares nothing): a breadcrumb up the tree, the module's path, its docstring, a line
+  linking its source file, a line naming the modules of the project its
+  signatures mention, each linked, a map of every public name with its
+  summary, and then an entry for each. A type is shown with the functions and
+  constants that belong to it: a function belongs to the first of its
+  parameters whose type names a type the module declares (through pointers,
+  `^`, arrays and generic arguments), or failing that to a type its return
+  type names (through `res`, `opt`, `err` and pointers); a constant belongs to
+  the type it is declared with. What belongs to no type follows under
+  Functions, Constants, Variables and Forwards.
 
-An entry shows its declaration as written, a record with its fields and a
-function without its body, with its decorators above it, the `$if` condition
-of each arm that declares it (a name several arms declare is one entry with a
-signature per arm), and its whole docstring. `#[deprecated]` is a warning carrying its message. Component
-lines become a table: a function's parameters with `ret` as its returns row,
-a type's fields or cases with their types. Constants are a table of name,
-value and summary. A `fwd` is an entry under the name it exports, linking the
-declaration it forwards when the project documents it, with that
-declaration's signature and summary. Every `pub` declaration and every `fwd`
-is documented whether or not it has a docstring, and a `#[testing]`
-declaration never is.
+An entry shows its declaration in a code block, a record with its fields and
+a function without its body, with its decorators above it as the source has
+them. A type the source spells through an import alias is written with the
+path of the module the alias names in place of the alias (`*A.Allocator`
+reads `*std.allocator.Allocator`), and a name the source writes bare stays
+bare; the source's line breaks and alignment are kept. An alias is what the
+file's `use` lines bind, a `use` inside a `$if` arm binding under that arm's
+condition. Every `$if` arm is read: a name several arms declare is one entry
+with a code block per arm. Then comes its whole docstring.
+
+A `$if` chain is tried in order and the first arm whose condition holds is
+taken, and the pages say so once rather than repeat it per arm. Where several
+arms are shown together (the arms of one entry, the providers of a `fwd`, the
+values of a constant), a line states that the first whose condition holds is
+taken, and each arm then carries its own condition alone ("where ..."), the
+last arm with none reading "otherwise". An arm the run does not show beside the
+arms before it also names those it excludes ("and not ..."), so a declaration
+standing alone in a later arm reads exactly: "Only where `c` and not `a` nor
+`b`". A `#[deprecated]` declaration
+has a paragraph beginning **Deprecated:** with its message. Component lines
+become a table: a function's parameters with `ret` as its returns row, a
+type's fields or cases with their types. Constants are a table of name,
+value and summary.
+
+A `fwd` is an entry under the name it exports. Its alias and name are read
+the same way, and the declaration it forwards is found by name in that
+module's own file when the module is in the project; a forward of a forward
+is followed link by link. When the alias is bound to a different module in
+each arm, the entry lists every module that provides it, in order, each under
+its own condition and linked, and shows the forwarded declaration once when every
+provider spells it alike, or under each provider when they differ. Its own
+docstring is shown, or else the forwarded declaration's. Every `pub`
+declaration and every `fwd` is documented whether or not it has a docstring,
+and a `#[testing]` declaration never is.
+
+The pages are plain markdown: headings, paragraphs, emphasis, links, lists,
+fenced code and pipe tables, and nothing else. The generator writes no HTML
+tag, no byte outside ASCII and no syntax only one site renders, such as
+GitHub's alerts. Names that share one table cell are separated by commas.
+In prose, `<`, `&` and `\` are kept readable by markdown's backslash escape,
+never by an HTML entity. The text of a docstring is its author's and is
+carried as written, so a docstring that uses a character outside ASCII puts
+it on the page.
 
 Wherever a page lists a name with a few words beside it (the map, a table of
 constants, a directory's modules), those words are the docstring's summary:

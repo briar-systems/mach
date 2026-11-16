@@ -1,12 +1,14 @@
 # the documentation generator: a project's reference, written as markdown pages into
 # the one directory the generator owns, `<dir>/<project id>/`
 #
-# the document model is built from the analyzed project (`mach.tool.doc.build`) and
-# rendered to pages (`mach.tool.doc.markdown`); this module writes the pages and
-# keeps the directory to them. a page whose text is unchanged is left as it is, and
-# whatever the directory holds that this run did not write is removed, a directory
-# left empty with it, so a module that is gone takes its page along. nothing outside
-# the directory is touched
+# every `.mach` file under the project's source root is parsed and nothing more is
+# run: no target, no name resolution, no dependency. the document model is built from
+# the syntax trees (`mach.tool.doc.build`) and rendered to pages
+# (`mach.tool.doc.markdown`); this module reads the files, writes the pages and keeps
+# the directory to them. a page whose text is unchanged is left as it is, and whatever
+# the directory holds that this run did not write is removed, a directory left empty
+# with it, so a file that is gone takes its page along. nothing outside the directory
+# is touched
 use collections_vector: std.collections.vector;
 use std.collections.vector.Vector;
 use fs:       std.filesystem;
@@ -20,17 +22,26 @@ use types_path: std.types.path;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_ends_with;
 use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use A: std.allocator;
 use std.allocator.arena;
 
+use mach.base.diagnostic;
 use diagnostic_kind: mach.base.diagnostic.kind;
 use mach.base.fail;
-use mach.compile.project;
+use mach.base.intern;
+use base_source: mach.base.source;
+use mach.front.ast;
+use mach.front.doclint;
+use front_lexer:  mach.front.lexer;
+use front_parser: mach.front.parser;
+use mach.front.parser.state;
 use mach.host.output;
 use manifest_model: mach.manifest.model;
+use report_phase:   mach.report.phase;
 use doc_build:      mach.tool.doc.build;
 use mach.tool.doc.markdown;
 use mach.tool.doc.model;
@@ -41,7 +52,7 @@ val DIR_MODE:  i32 = 0o755;
 # what a run did
 # ---
 # dir:     the directory it owns, `<dir>/<project id>`
-# modules: the modules documented
+# modules: the source files it read
 # pages:   the pages it wrote or found already current
 # changed: the pages whose text it wrote
 # removed: the files and directories it removed
@@ -53,17 +64,22 @@ pub rec Outcome {
     removed: u32;
 }
 
-# write the reference of `p` under `<root>/<leaf>/<project id>`
+# parse every source file of the project at `root` and write its reference under
+# `<root>/<leaf>/<project id>`
 # ---
-# alloc: owns the outcome's path and every failure
-# p:     the project, analyzed through name resolution over every artifact
-# m:     its manifest
-# root:  the project's directory
-# leaf:  the directory below `root` the reference's directory is made in, such as `doc`
-# out:   what the run did
-# ret:   ok, or the first failure: allocation, or a directory or page that cannot be read,
-#        made, written or removed
-pub fun generate(alloc: *A.Allocator, p: *project.Project, m: *manifest_model.Manifest, root: str, leaf: str, out: *Outcome) err[fail.Fail] {
+# alloc:   owns the outcome's path and every failure
+# sources: receives every file read, so a diagnostic can name it
+# diags:   receives the lexer's and parser's diagnostics, the doc linter's warnings among them
+# itn:     the interner the manifest's names are in
+# m:       the project's manifest
+# root:    the project's directory
+# leaf:    the directory below `root` the reference's directory is made in, such as `doc`
+# out:     what the run did
+# ret:     ok; a reported failure when a file does not parse, its diagnostics on `diags`;
+#          or the first failure of allocation, or of a file or directory that cannot be
+#          read, made, written or removed
+pub fun generate(alloc: *A.Allocator, sources: *base_source.SourceMap, diags: *diagnostic.DiagnosticStore, itn: *intern.Interner,
+    m: *manifest_model.Manifest, root: str, leaf: str, out: *Outcome) err[fail.Fail] {
     var ar:        arena.Arena;
     val err_arena: err[A.Error] = arena.init(?ar, alloc, 0);
     if (sel err_arena.err) { ret err[fail.Fail].err{fail.refused(err_arena.err)}; }
@@ -72,8 +88,33 @@ pub fun generate(alloc: *A.Allocator, p: *project.Project, m: *manifest_model.Ma
     val err_alloc: err[A.Error] = arena.allocator(?a, ?ar);
     if (sel err_alloc.err) { ret err[fail.Fail].err{fail.refused(err_alloc.err)}; }
 
+    val id:      str               = intern.text(itn, m.id);
+    val res_src: res[str, A.Error] = types_path.join(?a, root, intern.text(itn, m.src));
+    if (sel res_src.err) { ret err[fail.Fail].err{fail.refused(res_src.err)}; }
+    var files:      Vector[str]    = collections_vector.init[str](?a);
+    val err_listed: err[fail.Fail] = list_sources(alloc, ?a, res_src.ok, "", ?files);
+    if (sel err_listed.err) { ret err_listed; }
+
+    var names:   intern.Interner          = intern.init(?a);
+    var parsed:  Vector[doc_build.Source] = collections_vector.init[doc_build.Source](?a);
+    var refused: bool                     = false;
+    var k:       usize                    = 0;
+    for (k < files.len) {
+        val res_parsed: res[doc_build.Source, fail.Fail] = parse_file(alloc, ?a, sources, diags, ?names, id, res_src.ok, files.data[k]);
+        if (sel res_parsed.err) {
+            if (!fail.is_reported(res_parsed.err)) { ret err[fail.Fail].err{res_parsed.err}; }
+            refused = true;
+        }
+        or {
+            val res_kept: res[usize, A.Error] = collections_vector.push[doc_build.Source](?parsed, res_parsed.ok);
+            if (sel res_kept.err) { ret err[fail.Fail].err{fail.refused(res_kept.err)}; }
+        }
+        k = k + 1;
+    }
+    if (refused) { ret err[fail.Fail].err{fail.reported()}; }
+
     var doc:       model.Project;
-    val err_built: err[fail.Fail] = doc_build.build(?a, p, m, ?doc);
+    val err_built: err[fail.Fail] = doc_build.build(?a, m, itn, ?parsed, ?doc);
     if (sel err_built.err) { ret err_built; }
 
     # the project root as the reference's directory sees it: up out of the id's directory,
@@ -102,7 +143,7 @@ pub fun generate(alloc: *A.Allocator, p: *project.Project, m: *manifest_model.Ma
     out.removed = 0;
 
     var written: Vector[str] = collections_vector.init[str](?a);
-    var k:       usize       = 0;
+    k = 0;
     for (k < pages.len) {
         val res_path: res[str, A.Error] = types_path.join(?a, out.dir, pages.data[k].path);
         if (sel res_path.err) { ret err[fail.Fail].err{fail.refused(res_path.err)}; }
@@ -115,6 +156,93 @@ pub fun generate(alloc: *A.Allocator, p: *project.Project, m: *manifest_model.Ma
     val res_pruned: res[bool, fail.Fail] = prune(alloc, ?a, out.dir, ?written, out);
     if (sel res_pruned.err) { ret err[fail.Fail].err{res_pruned.err}; }
     ret err[fail.Fail].ok{};
+}
+
+# every `.mach` file below `dir`, by its path relative to the source root, `rel` being
+# `dir`'s own; an entry with no UTF-8 name, or a symbolic link, is no source file
+fun list_sources(alloc: *A.Allocator, a: *A.Allocator, dir: str, rel: str, out: *Vector[str]) err[fail.Fail] {
+    val res_listed: res[Vector[fs.Listed], fs.FsError] = fs.read_dir(a, dir);
+    if (sel res_listed.err) { ret err[fail.Fail].err{fail.refusal(alloc, diagnostic_kind.FS_READ, fail.Op{verb: "list", role: "the source directory", path: dir}, fail.Cause.fs{res_listed.err})}; }
+    val entries: Vector[fs.Listed] = res_listed.ok;
+    var i:       usize             = 0;
+    for (i < entries.len) {
+        val entry: fs.Listed = entries.data[i];
+        if (sel entry.name) {
+            val res_child: res[str, A.Error] = types_path.join(a, dir, entry.name);
+            if (sel res_child.err) { ret err[fail.Fail].err{fail.refused(res_child.err)}; }
+            var sub: str = entry.name;
+            if (str_len(rel) > 0) {
+                val res_sub: res[str, A.Error] = types_path.join(a, rel, entry.name);
+                if (sel res_sub.err) { ret err[fail.Fail].err{fail.refused(res_sub.err)}; }
+                sub = res_sub.ok;
+            }
+            val res_meta: res[fs.Metadata, io_error.Error] = fs.metadata_link(res_child.ok);
+            if (sel res_meta.err) { ret err[fail.Fail].err{fail.refusal(alloc, diagnostic_kind.FS_STAT, fail.Op{verb: "inspect", path: res_child.ok}, fail.Cause.io{res_meta.err})}; }
+            var meta: fs.Metadata = res_meta.ok;
+            if (fs.meta_is_dir(?meta)) {
+                val err_sub: err[fail.Fail] = list_sources(alloc, a, res_child.ok, sub, out);
+                if (sel err_sub.err) { ret err_sub; }
+            }
+            or (fs.meta_is_file(?meta) && str_ends_with(sub, ".mach")) {
+                val res_kept: res[usize, A.Error] = collections_vector.push[str](out, sub);
+                if (sel res_kept.err) { ret err[fail.Fail].err{fail.refused(res_kept.err)}; }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the module path of the file at `rel` below the source root: the project id, then `rel`
+# with its segments dotted and its `.mach` dropped
+fun module_path(a: *A.Allocator, id: str, rel: str) res[str, fail.Fail] {
+    val il:      usize             = str_len(id);
+    val rl:      usize             = str_len(rel) - 5;
+    val res_buf: res[*u8, A.Error] = A.allocate[u8](a, il + rl + 2);
+    if (sel res_buf.err) { ret res[str, fail.Fail].err{fail.refused(res_buf.err)}; }
+    val buf: *u8 = res_buf.ok;
+    memory.raw_copy(buf, id::*u8, il);
+    buf[il] = '.';
+    var i: usize = 0;
+    for (i < rl) {
+        var c: u8 = rel[i];
+        if (c == '/' || c == '\\') { c = '.'; }
+        buf[il + 1 + i] = c;
+        i               = i + 1;
+    }
+    buf[il + 1 + rl] = 0;
+    ret res[str, fail.Fail].ok{buf::str};
+}
+
+# read and parse the file at `rel` below the source root `src`; a lexical or syntactic
+# rejection is on `diags`, and refuses as reported
+fun parse_file(alloc: *A.Allocator, a: *A.Allocator, sources: *base_source.SourceMap, diags: *diagnostic.DiagnosticStore, names: *intern.Interner,
+    id: str, src: str, rel: str) res[doc_build.Source, fail.Fail] {
+    val res_path: res[str, A.Error] = types_path.join(a, src, rel);
+    if (sel res_path.err) { ret res[doc_build.Source, fail.Fail].err{fail.refused(res_path.err)}; }
+    val res_text: res[str, fs.FsError] = fs.read_string(a, res_path.ok);
+    if (sel res_text.err) { ret res[doc_build.Source, fail.Fail].err{fail.refusal(alloc, diagnostic_kind.FS_READ, fail.Op{verb: "read", path: res_path.ok}, fail.Cause.fs{res_text.err})}; }
+    val text:      str                                        = res_text.ok;
+    val res_added: res[base_source.FileId, base_source.Error] = base_source.add(sources, res_path.ok, text);
+    if (sel res_added.err) { ret res[doc_build.Source, fail.Fail].err{fail.message(base_source.text(res_added.err))}; }
+    val res_lexed: res[front_lexer.TokenStream, fail.Fail] = front_lexer.tokenize(text, a, res_added.ok);
+    if (sel res_lexed.err) { ret res[doc_build.Source, fail.Fail].err{res_lexed.err}; }
+    var stream:      front_lexer.TokenStream = res_lexed.ok;
+    val err_emitted: err[fail.Fail]          = front_lexer.emit_diagnostics(?stream, diags);
+    if (sel err_emitted.err)   { ret res[doc_build.Source, fail.Fail].err{err_emitted.err}; }
+    if (stream.error_len != 0) { ret res[doc_build.Source, fail.Fail].err{fail.reported()}; }
+    val res_tree: res[*ast.Ast, A.Error] = A.allocate[ast.Ast](a, 1);
+    if (sel res_tree.err) { ret res[doc_build.Source, fail.Fail].err{fail.refused(res_tree.err)}; }
+    val tree: *ast.Ast = res_tree.ok;
+    @tree = ast.init(a, res_added.ok);
+    val res_parsed: res[report_phase.PhaseStatus, state.ParseFail] = front_parser.parse(?stream, tree, names, diags);
+    if (sel res_parsed.err)                       { ret res[doc_build.Source, fail.Fail].err{state.failure(res_parsed.err)}; }
+    if (!report_phase.is_accepted(res_parsed.ok)) { ret res[doc_build.Source, fail.Fail].err{fail.reported()}; }
+    val err_linted: err[fail.Fail] = doclint.lint_module(tree, text, diags);
+    if (sel err_linted.err) { ret res[doc_build.Source, fail.Fail].err{err_linted.err}; }
+    val res_module: res[str, fail.Fail] = module_path(a, id, rel);
+    if (sel res_module.err) { ret res[doc_build.Source, fail.Fail].err{res_module.err}; }
+    ret res[doc_build.Source, fail.Fail].ok{doc_build.Source{path: res_module.ok, tree: tree, text: text}};
 }
 
 fun repeated(a: *A.Allocator, s: str, n: usize) res[str, fail.Fail] {
