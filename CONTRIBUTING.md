@@ -76,10 +76,9 @@ builds the compiler with itself, and nothing else.
 The tree is canonical: `mach fmt .` must leave it unchanged before a pull
 request is opened (`mach fmt --check .` reports what differs).
 
-The API reference is held the same way: `doc/mach` and `doc/README.md` are what `mach doc .`
-writes, together with the pages `mach doc . -a editor` adds for the editor library, whose
-index entries follow the compiler's. A change to a doc-comment or to the module tree
-regenerates them in the same pull request.
+The API reference is held the same way: `doc/mach` is what `mach doc .` writes, in one run
+over every module either artifact reaches, the editor library's included. A change to a
+doc-comment or to the module tree regenerates it in the same pull request.
 
 ### Local checks
 
@@ -90,7 +89,7 @@ failure.
 | check | command |
 |---|---|
 | formatter | `"$MACH" fmt --check .` |
-| committed reference | `"$MACH" doc . -o out/docgen -q && "$MACH" doc . -a editor -o out/docgen -q`, then compare `out/docgen/mach` with `doc/mach` |
+| committed reference | `"$MACH" doc . -o out/docgen -q`, then compare `out/docgen/mach` with `doc/mach`: every page and nothing else |
 | editor library | `"$MACH" check . -a editor` |
 | documented flags are accepted | `python3 .github/scripts/doc-flags.py "$MACH" doc` |
 | doc and source markers cite open issues | `GH_TOKEN=$(gh auth token) GH_REPO=briar-systems/mach python3 .github/scripts/doc-markers.py` |

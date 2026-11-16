@@ -21,9 +21,11 @@ changes generated code.
 # <component>: <description>
 ```
 
-- **Summary.** `<summary>` is a single sentence by convention. Additional
-  paragraphs may follow, separated by blank `#` lines, and the summary runs
-  to the separator or to the end of the docstring.
+- **Summary.** `<summary>` opens the docstring's first paragraph. Further
+  text may follow it in that paragraph, and further paragraphs may follow on
+  any docstring, each after a blank `#` line, up to the separator or the end
+  of the docstring. `mach doc` shows the summary beside the name wherever it
+  lists one (see [What `mach doc` writes](#what-mach-doc-writes)).
 - **Separator.** `# ---` is present when one or more component lines
   follow; absent when the docstring is summary-only.
 - **Component lines.** Each is `# <component>: <description>`. One line
@@ -42,7 +44,7 @@ changes generated code.
 | Generic type parameter | the `[T]` form |
 | Return value | `ret` |
 | Record field | field name |
-| Union variant | variant name |
+| Union field | field name |
 | Tag case | case name |
 
 ## What the lint checks
@@ -58,8 +60,8 @@ documented component has no description
 documented components are out of declaration order
 ```
 
-Tags have no return value, so a `ret:` component line on a tag is rejected. A bare
-generic name without brackets (such as `T:` instead of `[T]:`) is also rejected.
+Tags have no return value, so a `ret:` component line on a tag is warned. A bare
+generic name without brackets (such as `T:` instead of `[T]:`) is also warned.
 
 A summary-only docstring, a docstring on a `val`, `var`, `def`, `use`, or
 `fwd` (which are summary-only forms), and a non-`pub` declaration are not
@@ -78,7 +80,8 @@ comment that shares its line with code (`val x: i32 = 1; # note`) is not
 documentation: it neither starts a run, nor joins the comment on the next
 line, nor attaches to the declaration below it. The docstring is therefore
 the first thing above the declaration, with decorators between it and the
-declaration:
+declaration. A docstring inside a `$if` arm is written at the arm's
+indentation:
 
 ```mach fragment
 # terminate the program with a message
@@ -87,6 +90,17 @@ declaration:
 #[symbol("panic")]
 pub fun panic(msg: *u8) { ... }
 ```
+
+The comment run that opens a file has one owner. When it ends directly above
+the file's first declaration and that declaration is not a `use`, it is that
+declaration's docstring: a first `fun`, `rec`, `fwd` or `$if` written directly
+under it takes it, and the module has none. Otherwise it is the module
+docstring, a `use` directly under it included, since a `use` is never
+documented. A blank line after a module docstring keeps it the module's
+whatever follows.
+
+A docstring above a `$if` documents the declarations in its arms that carry
+none of their own, so one docstring can serve a name every arm declares.
 
 ## Function
 
@@ -168,7 +182,7 @@ pub tag Outcome[E]: u8 {
 ```
 
 Cases appear in declaration order after generic parameters. Tags have no return
-value, so `ret:` is refused. Undocumented cases are permitted, but any documented
+value, so `ret:` is warned. Undocumented cases are permitted, but any documented
 case must exist on the tag; `doclint` warns at the component otherwise:
 
 ```mach
@@ -196,9 +210,8 @@ file, before any `use`, `fwd`, or decorator.
 # directly (e.g. myproj.system.os.linux).
 ```
 
-Modules may extend beyond the summary with additional paragraphs
-separated by blank `#` lines. Other declaration kinds do not extend
-beyond the summary and the component block.
+Like every docstring, a module docstring may continue past its summary with
+further paragraphs separated by blank `#` lines.
 
 ## Value
 
@@ -209,6 +222,58 @@ pub val MAX: i64 = 100;
 # module-local request counter
 var calls: i64 = 0;
 ```
+
+## What `mach doc` writes
+
+`mach doc <path>` documents the whole project at `<path>` in one run: every
+module of the project that one of its artifacts reaches, each once, on the
+target `-t` names or the host's. It writes markdown into `doc/<project id>/`
+(`<dir>/<project id>/` with `-o <dir>`), a directory it owns: a page it did
+not write in the run, such as one whose module is gone, is removed, and so is
+a directory left empty. Nothing outside that directory is written.
+
+- **The project page**, `doc/<id>/README.md`: the project's id and version,
+  its artifacts with their kinds and entry modules, its top-level directories
+  with their module counts and the summaries of their root modules, its
+  top-level modules, and the ids of its dependencies.
+- **A directory page**, `README.md` in each directory of the source tree:
+  the directory's root module (the file beside it of the same name, such as
+  `src/lower.mach` for `src/lower/`) with its summary and paragraphs when it
+  has one, the other top-level directories its modules import and those
+  importing them, a table of its modules with their summaries, and its
+  sub-directories with their module counts.
+- **A module page**, `doc/<id>/<path>.md`: a breadcrumb up the tree, the
+  module's path, its docstring, a link to its source file, a line naming
+  every import alias and private type the page's declarations use (`A` is
+  `std.allocator`, `Entry` is private), a map of every
+  public name with its summary, and then an entry for each. A type is shown
+  with the functions and constants that belong to it: a function belongs to
+  the first of its parameters whose type names a type the module declares
+  (through pointers, `^`, arrays and generic arguments), or failing that to a
+  type its return type names (through `res`, `opt`, `err` and pointers); a
+  constant belongs to the type it is declared with. What belongs to no type
+  follows under Functions, Constants, Variables and Forwards.
+
+An entry shows its declaration as written, a record with its fields and a
+function without its body, with its decorators above it, the `$if` condition
+of each arm that declares it (a name several arms declare is one entry with a
+signature per arm), and its whole docstring. `#[deprecated]` is a warning carrying its message. Component
+lines become a table: a function's parameters with `ret` as its returns row,
+a type's fields or cases with their types. Constants are a table of name,
+value and summary. A `fwd` is an entry under the name it exports, linking the
+declaration it forwards when the project documents it, with that
+declaration's signature and summary. Every `pub` declaration and every `fwd`
+is documented whether or not it has a docstring, and a `#[testing]`
+declaration never is.
+
+Wherever a page lists a name with a few words beside it (the map, a table of
+constants, a directory's modules), those words are the docstring's summary:
+its first paragraph up to its first sentence end, a `.` followed by white
+space or the end of the paragraph that is not inside a code span and does
+not end `e.g.`, `i.e.`, `etc.` or `vs.`. The `.` itself is left out, and a
+paragraph with no such `.` is its own summary. So the first sentence of a
+docstring is what a reader scanning the reference sees: it should say what
+the declaration is on its own, and the explanation belongs after it.
 
 ## Comments that are not docstrings
 

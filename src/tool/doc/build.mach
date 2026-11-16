@@ -1,0 +1,1002 @@
+# the document model of a loaded project, built from its syntax trees, its name
+# resolution and its module graph
+#
+# every `$if` arm is read from the syntax tree, so the entries and their signatures do
+# not depend on the target analyzed; only what resolution decides (what a `fwd` in a
+# selected arm forwards, which modules some artifact reaches) does. nothing here reads
+# source text except the spans the syntax tree gives
+use std.collections.sort;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.memory;
+use std.text.string.str_dup_range;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.view.View;
+
+use A: std.allocator;
+
+use mach.base.fail;
+use mach.base.intern;
+use base_source:      mach.base.source;
+use compile_frontend: mach.compile.frontend;
+use compile_passes:   mach.compile.passes;
+use mach.compile.project;
+use mach.front.ast;
+use ast_decl:   mach.front.ast.decl;
+use ast_expr:   mach.front.ast.expr;
+use ast_id:     mach.front.ast.id;
+use ast_module: mach.front.ast.module;
+use ast_stmt:   mach.front.ast.stmt;
+use ast_type:   mach.front.ast.type;
+use mach.front.decorator;
+use front_doc: mach.front.doc;
+use mach.front.resolve;
+use manifest_model: mach.manifest.model;
+use mach.session.module;
+use mach.tool.doc.model;
+use mink.catalog.output;
+
+# what the build reads of one module of the project
+rec Source {
+    entry: *project.ModuleEntry;
+    index: u32;
+    path:  str;
+    tree:  *ast.Ast;
+    text:  str;
+    rr:    *resolve.ResolveResult;
+}
+
+# the build's state: every allocation is the arena's, and the first refusal is latched
+# so the walk need not thread one out of every step
+rec Builder {
+    a:      *A.Allocator;
+    p:      *project.Project;
+    failed: bool;
+    fault:  A.Error;
+}
+
+# a name some `use` of the module binds, and the path it names
+rec Use {
+    name: str;
+    path: str;
+}
+
+# the walk of one module's declarations
+# ---
+# owners:  for each entry, the name of the type it belongs to, "" for none
+# own:     for each entry, whether its doc is a declaration's own rather than its `$if`'s
+# types:   the names of the public types the module declares
+# private: the names of the types it keeps private
+# scope:   the `use` names in scope at the walk's place, innermost last
+# clauses: the arms around the walk's place, outermost first
+rec Walk {
+    b:       *Builder;
+    src:     *Source;
+    m:       *model.Module;
+    owners:  Vector[str];
+    own:     Vector[bool];
+    types:   Vector[str];
+    private: Vector[str];
+    scope:   Vector[Use];
+    clauses: Vector[model.Clause];
+}
+
+# the model of `p`, every module of its own that its artifacts reach
+# ---
+# a:   the arena the model lives in
+# p:   the analyzed project, through name resolution
+# m:   its manifest
+# out: the model
+# ret: ok, or the allocator's refusal
+pub fun build(a: *A.Allocator, p: *project.Project, m: *manifest_model.Manifest, out: *model.Project) err[fail.Fail] {
+    var b:   Builder          = Builder{a: a, p: p, failed: false, fault: A.Error.exhausted{}};
+    val itn: *intern.Interner = ?p.s.interner;
+    out.id        = intern.text(itn, m.id);
+    out.version   = intern.text(itn, m.version);
+    out.artifacts = collections_vector.init[model.Artifact](a);
+    out.deps      = collections_vector.init[str](a);
+    out.modules   = collections_vector.init[model.Module](a);
+    out.dirs      = collections_vector.init[model.Dir](a);
+
+    var sources: Vector[Source] = collections_vector.init[Source](a);
+    var i:       u32            = 0;
+    for (i < project.module_count(p)) {
+        val entry:    *project.ModuleEntry         = project.module_at(p, i);
+        val tree:     *ast.Ast                     = compile_frontend.syntax(p, entry);
+        val opt_file: opt[*base_source.SourceFile] = base_source.get(p.s.sources, entry.file_id);
+        if (sel opt_file.some) {
+            if (compile_passes.module_in_current_project(p, entry.fqn) && tree != nil) {
+                keep[Source](?b, ?sources, Source{entry: entry, index: i, path: intern.text(itn, entry.fqn), tree: tree, text: opt_file.some.text, rr: compile_frontend.resolved(p, entry)});
+            }
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Source](sources.data, sources.len, source_order);
+
+    val count:   u32                = project.module_count(p);
+    val res_map: res[*u32, A.Error] = A.allocate[u32](a, count::usize + 1);
+    if (sel res_map.err) { ret err[fail.Fail].err{fail.refused(res_map.err)}; }
+    val by_project: *u32 = res_map.ok;
+    i = 0;
+    for (i <= count) {
+        by_project[i] = model.NONE;
+        i             = i + 1;
+    }
+    var k: usize = 0;
+    for (k < sources.len) {
+        by_project[sources.data[k].index] = k::u32;
+        k                                 = k + 1;
+    }
+
+    val src_dir: str = intern.text(itn, m.src);
+    k = 0;
+    for (k < sources.len) {
+        keep[model.Module](?b, ?out.modules, module_of(?b, ?sources.data[k], out.id, src_dir));
+        k = k + 1;
+    }
+    link(?b, out, ?sources, by_project);
+    directories(?b, out);
+
+    var ai: u32 = 0;
+    for (ai < m.artifact_count) {
+        val ad:    *manifest_model.ArtifactDef = ?m.artifacts[ai];
+        val entry: str                         = entry_path(?b, out.id, intern.text(itn, ad.entry));
+        keep[model.Artifact](?b, ?out.artifacts, model.Artifact{name: intern.text(itn, ad.name), kind: kind_text(ad.kind), entry: entry, module: module_by_path(out, entry)});
+        ai = ai + 1;
+    }
+    var di: u32 = 0;
+    for (di < m.dep_count) {
+        keep[str](?b, ?out.deps, intern.text(itn, m.deps[di].name));
+        di = di + 1;
+    }
+
+    if (b.failed) { ret err[fail.Fail].err{fail.refused(b.fault)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun source_order(x: *Source, y: *Source) i64 {
+    ret str_compare(x.path, y.path);
+}
+
+# the manifest's spelling of an artifact kind; every executable is spelled alike
+fun kind_text(k: output.Spelled) str {
+    if (sel k.row) { ret k.row.spelled; }
+    ret output.DYNAMIC.spelled;
+}
+
+# latch the first refusal of the allocator
+fun refuse(b: *Builder, e: A.Error) {
+    if (!b.failed) { b.fault = e; }
+    b.failed = true;
+}
+
+fun keep[T](b: *Builder, v: *Vector[T], x: T) {
+    val res_pushed: res[usize, A.Error] = collections_vector.push[T](v, x);
+    if (sel res_pushed.err) { refuse(b, res_pushed.err); }
+}
+
+fun dup(b: *Builder, s: str, offset: usize, len: usize) str {
+    val res_dup: res[str, A.Error] = str_dup_range(b.a, s, offset, len);
+    if (sel res_dup.err) {
+        refuse(b, res_dup.err);
+        ret "";
+    }
+    ret res_dup.ok;
+}
+
+fun span_text(b: *Builder, src: *Source, span: base_source.Span) str {
+    ret dup(b, src.text, span.offset, span.len);
+}
+
+# `head` and `tail` joined by `sep`, a byte or 0 for none
+fun join(b: *Builder, head: str, sep: u8, tail: str) str {
+    val hl: usize = str_len(head);
+    val tl: usize = str_len(tail);
+    var n:  usize = hl + tl;
+    if (sep != 0) { n = n + 1; }
+    val res_buf: res[*u8, A.Error] = A.allocate[u8](b.a, n + 1);
+    if (sel res_buf.err) {
+        refuse(b, res_buf.err);
+        ret "";
+    }
+    val buf: *u8 = res_buf.ok;
+    memory.raw_copy(buf, head::*u8, hl);
+    var at: usize = hl;
+    if (sep != 0) {
+        buf[at] = sep;
+        at      = at + 1;
+    }
+    memory.raw_copy(?buf[at], tail::*u8, tl);
+    buf[n] = 0;
+    ret buf::str;
+}
+
+# `s` with every `from` byte replaced by `to`
+fun replaced(b: *Builder, s: str, from: u8, to: u8) str {
+    val out: str   = dup(b, s, 0, str_len(s));
+    var i:   usize = 0;
+    for (out[i] != 0) {
+        if (out[i] == from) { out[i] = to; }
+        i = i + 1;
+    }
+    ret out;
+}
+
+# the offset just past the last `sep` in `s`, 0 when it has none
+fun after_last(s: str, sep: u8) usize {
+    var at: usize = 0;
+    var i:  usize = 0;
+    for (s[i] != 0) {
+        if (s[i] == sep) { at = i + 1; }
+        i = i + 1;
+    }
+    ret at;
+}
+
+fun doc_of(b: *Builder, src: *Source, span: base_source.Span) model.Doc {
+    var d: model.Doc = model.Doc{summary: "", paragraphs: collections_vector.init[str](b.a), components: collections_vector.init[model.Component](b.a)};
+    if (span.len == 0) { ret d; }
+    var pit:   front_doc.ParagraphIter = front_doc.paragraph_iter(src.text, span);
+    var para:  base_source.Span;
+    var first: bool                    = true;
+    for (front_doc.paragraph_next(?pit, ?para)) {
+        val res_text: res[str, A.Error] = front_doc.prose(b.a, src.text, para);
+        if (sel res_text.err) {
+            refuse(b, res_text.err);
+            ret d;
+        }
+        if (first) { d.summary = dup(b, res_text.ok, 0, front_doc.summary_len(res_text.ok)); }
+        keep[str](b, ?d.paragraphs, res_text.ok);
+        first = false;
+    }
+    var cit: front_doc.DocComponentIter = front_doc.component_iter(src.text, span);
+    var c:   front_doc.DocComponent;
+    for (front_doc.component_next(?cit, ?c)) {
+        val res_desc: res[str, A.Error] = front_doc.flowed(b.a, src.text, c.desc_span);
+        if (sel res_desc.err) {
+            refuse(b, res_desc.err);
+            ret d;
+        }
+        keep[model.Component](b, ?d.components, model.Component{name: span_text(b, src, c.name_span), text: res_desc.ok});
+    }
+    ret d;
+}
+
+fun doc_empty(d: *model.Doc) bool {
+    ret str_len(d.summary) == 0 && d.components.len == 0;
+}
+
+fun module_of(b: *Builder, src: *Source, id: str, src_dir: str) model.Module {
+    val skip: usize        = str_len(id) + 1;
+    val rel:  str          = replaced(b, (?src.path[skip])::str, '.', '/');
+    var m:    model.Module = model.Module{
+        path:    src.path, rel: rel, leaf: (?src.path[after_last(src.path, '.')])::str, file: join(b, join(b, src_dir, '/', rel), 0, ".mach"),
+        dir:     model.NONE, entries: collections_vector.init[model.Entry](b.a), groups: collections_vector.init[model.Group](b.a),
+        imports: collections_vector.init[u32](b.a), importers: collections_vector.init[u32](b.a)
+    };
+    var none: base_source.Span;
+    none.offset = 0;
+    none.len    = 0;
+    var doc_span: base_source.Span        = none;
+    val opt_root: opt[*ast_module.Module] = ast.get_module(src.tree, src.tree.root_module);
+    if (sel opt_root.none) {
+        m.doc = doc_of(b, src, none);
+        ret m;
+    }
+    val root: *ast_module.Module = opt_root.some;
+    m.doc = doc_of(b, src, root.doc);
+
+    var w: Walk = Walk{
+        b:       b, src: src, m: ?m, owners: collections_vector.init[str](b.a), own: collections_vector.init[bool](b.a), types: collections_vector.init[str](b.a),
+        private: collections_vector.init[str](b.a), scope: collections_vector.init[Use](b.a),
+        clauses: collections_vector.init[model.Clause](b.a)
+    };
+    type_names(?w, root.decls_start, root.decls_len);
+    walk(?w, root.decls_start, root.decls_len, none);
+    group(?w);
+    ret m;
+}
+
+# the names of the types the declarations in a list declare, in every arm
+fun type_names(w: *Walk, start: u32, len: u32) {
+    val a: *ast.Ast = w.src.tree;
+    var i: u32      = 0;
+    for (i < len) {
+        val opt_d: opt[*ast_decl.Decl] = ast.get_decl(a, a.decl_ids.data[start + i]);
+        if (sel opt_d.some) {
+            val d: *ast_decl.Decl = opt_d.some;
+            if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+                var bi: u32 = 0;
+                for (bi < d.data.comptime_if.branches_len) {
+                    val br: *ast_decl.ComptimeBranch = ?a.comptime_branches.data[d.data.comptime_if.branches_start + bi];
+                    type_names(w, br.body_start, br.body_len);
+                    bi = bi + 1;
+                }
+            }
+            or (kind_of(d) != model.NONE && model.is_type(kind_of(d)::model.Kind)) {
+                val name: str = span_text(w.b, w.src, ast.decl_name_span(a, a.decl_ids.data[start + i]));
+                if ((d.flags & ast_decl.DECL_FLAG_PUB) != 0 && !resolve.declaration_testing(a, a.decl_ids.data[start + i])) { keep[str](w.b, ?w.types, name); }
+                or                                                                                                          { keep[str](w.b, ?w.private, name); }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# the entry kind a declaration documents as, NONE for one that is never documented
+fun kind_of(d: *ast_decl.Decl) u32 {
+    if (d.kind == ast_decl.DECL_KIND_FUN) { ret model.KIND_FUN::u32; }
+    if (d.kind == ast_decl.DECL_KIND_REC) { ret model.KIND_REC::u32; }
+    if (d.kind == ast_decl.DECL_KIND_UNI) { ret model.KIND_UNI::u32; }
+    if (d.kind == ast_decl.DECL_KIND_TAG) { ret model.KIND_TAG::u32; }
+    if (d.kind == ast_decl.DECL_KIND_DEF) { ret model.KIND_DEF::u32; }
+    if (d.kind == ast_decl.DECL_KIND_VAL) { ret model.KIND_VAL::u32; }
+    if (d.kind == ast_decl.DECL_KIND_VAR) { ret model.KIND_VAR::u32; }
+    if (d.kind == ast_decl.DECL_KIND_FWD) { ret model.KIND_FWD::u32; }
+    ret model.NONE;
+}
+
+# walk a declaration list: its `use` names first, since a list's imports bind across it,
+# then each public declaration and `fwd`, and each `$if` arm with its condition
+fun walk(w: *Walk, start: u32, len: u32, around: base_source.Span) {
+    val a:     *ast.Ast = w.src.tree;
+    val scope: usize    = w.scope.len;
+    var i:     u32      = 0;
+    for (i < len) {
+        val opt_d:   opt[*ast_decl.Decl]   = ast.get_decl(a, a.decl_ids.data[start + i]);
+        var opt_use: opt[ast_decl.DeclUse] = opt[ast_decl.DeclUse].none{};
+        if (sel opt_d.some) {
+            if (opt_d.some.kind == ast_decl.DECL_KIND_USE) { opt_use = opt[ast_decl.DeclUse].some{opt_d.some.data.use_}; }
+        }
+        if (sel opt_use.some) {
+            val u:    ast_decl.DeclUse = opt_use.some;
+            val path: str              = span_text(w.b, w.src, u.path);
+            var name: str              = (?path[after_last(path, '.')])::str;
+            if (u.alias.len > 0) { name = span_text(w.b, w.src, u.alias); }
+            keep[Use](w.b, ?w.scope, Use{name: name, path: path});
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < len) {
+        val did:   ast_id.DeclId       = a.decl_ids.data[start + i];
+        val opt_d: opt[*ast_decl.Decl] = ast.get_decl(a, did);
+        if (sel opt_d.some) {
+            val d: *ast_decl.Decl = opt_d.some;
+            if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+                var inner: base_source.Span = around;
+                if (d.doc.len > 0) { inner = d.doc; }
+                var prior: Vector[str] = collections_vector.init[str](w.b.a);
+                var bi:    u32         = 0;
+                for (bi < d.data.comptime_if.branches_len) {
+                    val br:       *ast_decl.ComptimeBranch = ?a.comptime_branches.data[d.data.comptime_if.branches_start + bi];
+                    var cond:     str                      = "";
+                    val opt_cond: opt[*ast_expr.Expr]      = ast.get_expr(a, br.cond);
+                    if (sel opt_cond.some) { cond = span_text(w.b, w.src, opt_cond.some.span); }
+                    keep[model.Clause](w.b, ?w.clauses, model.Clause{text: cond, prior: prior});
+                    walk(w, br.body_start, br.body_len, inner);
+                    collections_vector.pop[model.Clause](?w.clauses);
+                    var next: Vector[str] = collections_vector.init[str](w.b.a);
+                    var pi:   usize       = 0;
+                    for (pi < prior.len) {
+                        keep[str](w.b, ?next, prior.data[pi]);
+                        pi = pi + 1;
+                    }
+                    keep[str](w.b, ?next, cond);
+                    prior = next;
+                    bi    = bi + 1;
+                }
+            }
+            or (documented(a, did, d)) {
+                arm_add(w, did, d, around);
+            }
+        }
+        i = i + 1;
+    }
+    collections_vector.truncate[Use](?w.scope, scope);
+}
+
+fun documented(a: *ast.Ast, did: ast_id.DeclId, d: *ast_decl.Decl) bool {
+    if (kind_of(d) == model.NONE || resolve.declaration_testing(a, did)) { ret false; }
+    ret d.kind == ast_decl.DECL_KIND_FWD || (d.flags & ast_decl.DECL_FLAG_PUB) != 0;
+}
+
+fun arm_add(w: *Walk, did: ast_id.DeclId, d: *ast_decl.Decl, around: base_source.Span) {
+    val b:    *Builder = w.b;
+    val a:    *ast.Ast = w.src.tree;
+    var name: str      = "";
+    if (d.kind == ast_decl.DECL_KIND_FWD) {
+        val f: ast_decl.DeclFwd = d.data.fwd_;
+        if (f.alias.len > 0) { name = span_text(b, w.src, f.alias); }
+        or {
+            val path: str = span_text(b, w.src, f.path);
+            name = (?path[after_last(path, '.')])::str;
+        }
+    }
+    or {
+        name = span_text(b, w.src, ast.decl_name_span(a, did));
+    }
+
+    var ei: usize = 0;
+    for (ei < w.m.entries.len && !str_equals(w.m.entries.data[ei].name, name)) { ei = ei + 1; }
+    if (ei == w.m.entries.len) {
+        var e: model.Entry = model.Entry{
+            name:       name, kind: kind_of(d)::model.Kind, external: (d.flags & ast_decl.DECL_FLAG_EXT) != 0, doc: doc_of(b, w.src, around),
+            deprecated: false, deprecation: "", arms: collections_vector.init[model.Arm](b.a), elements: collections_vector.init[model.Element](b.a),
+            aliases:    collections_vector.init[model.Alias](b.a),
+            forward:    model.Forward{resolved: false, whole: false, target: "", module: model.NONE, entry: model.NONE}, owner: model.NONE
+        };
+        elements(w, d, ?e);
+        keep[model.Entry](b, ?w.m.entries, e);
+        keep[str](b, ?w.owners, owner_of(w, d));
+        keep[bool](b, ?w.own, false);
+    }
+    if (b.failed) { ret; }
+    val e: *model.Entry = ?w.m.entries.data[ei];
+    if (d.doc.len > 0 && !w.own.data[ei]) {
+        e.doc          = doc_of(b, w.src, d.doc);
+        w.own.data[ei] = true;
+    }
+
+    var arm: model.Arm = model.Arm{clauses: collections_vector.init[model.Clause](b.a), decorators: collections_vector.init[str](b.a), signature: "", value: ""};
+    var ci:  usize     = 0;
+    for (ci < w.clauses.len) {
+        keep[model.Clause](b, ?arm.clauses, w.clauses.data[ci]);
+        ci = ci + 1;
+    }
+    var di: u32 = 0;
+    for (di < d.decorators_len) {
+        val dec: *ast_decl.Decorator = ?a.decorators.data[d.decorators_start + di];
+        if (dec.id != decorator.DEPRECATED) { keep[str](b, ?arm.decorators, span_text(b, w.src, dec.span)); }
+        or {
+            e.deprecated = true;
+            if (dec.args_len > 0) {
+                val opt_arg: opt[*ast_expr.Expr] = ast.get_expr(a, a.expr_ids.data[dec.args_start]);
+                if (sel opt_arg.some) {
+                    if (opt_arg.some.kind == ast_expr.EXPR_KIND_LIT_STR) {
+                        val v: View = ast.lit_str_value(a, opt_arg.some);
+                        e.deprecation = dup(b, v.data::str, 0, v.len);
+                    }
+                }
+            }
+        }
+        di = di + 1;
+    }
+    arm.signature = span_text(b, w.src, signature_span(a, w.src.text, d));
+    if (d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR) {
+        val opt_init: opt[*ast_expr.Expr] = ast.get_expr(a, d.data.bind.init);
+        if (sel opt_init.some) { arm.value = span_text(b, w.src, opt_init.some.span); }
+    }
+    keep[model.Arm](b, ?e.arms, arm);
+
+    aliases(w, e, d);
+    if (d.kind == ast_decl.DECL_KIND_FWD && !e.forward.resolved) { e.forward = forward_of(w, did); }
+}
+
+# the span of a declaration as written without its decorators, its body or its value
+fun signature_span(a: *ast.Ast, text: str, d: *ast_decl.Decl) base_source.Span {
+    var lo: usize = d.span.offset;
+    if (d.decorators_len > 0) {
+        val last: *ast_decl.Decorator = ?a.decorators.data[d.decorators_start + d.decorators_len - 1];
+        lo = last.span.offset + last.span.len;
+    }
+    var hi: usize = d.span.offset + d.span.len;
+    if (d.kind == ast_decl.DECL_KIND_FUN) {
+        val opt_body: opt[*ast_stmt.Stmt] = ast.get_stmt(a, d.data.fun_.body);
+        if (sel opt_body.some) { hi = opt_body.some.span.offset; }
+    }
+    or (d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR) {
+        val opt_ty: opt[*ast_type.Type] = ast.get_type(a, d.data.bind.ty);
+        if (sel opt_ty.some) { hi = opt_ty.some.span.offset + opt_ty.some.span.len; }
+        or                   { hi = d.data.bind.name.offset + d.data.bind.name.len; }
+    }
+    for (lo < hi && is_layout(text[lo])) { lo = lo + 1; }
+    for (hi > lo && (is_layout(text[hi - 1]) || text[hi - 1] == ';')) { hi = hi - 1; }
+    var s: base_source.Span;
+    s.offset = lo;
+    s.len    = hi - lo;
+    ret s;
+}
+
+fun is_layout(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+fun type_text(w: *Walk, tid: ast_id.TypeId) str {
+    val opt_ty: opt[*ast_type.Type] = ast.get_type(w.src.tree, tid);
+    if (sel opt_ty.none) { ret ""; }
+    ret span_text(w.b, w.src, opt_ty.some.span);
+}
+
+fun element_add(w: *Walk, e: *model.Entry, name: str, ty: str) {
+    keep[model.Element](w.b, ?e.elements, model.Element{name: name, ty: ty});
+}
+
+fun generics_add(w: *Walk, e: *model.Entry, start: u32, len: u32) {
+    var i: u32 = 0;
+    for (i < len) {
+        val name: str = span_text(w.b, w.src, w.src.tree.generic_names.data[start + i]);
+        element_add(w, e, join(w.b, join(w.b, "[", 0, name), 0, "]"), "");
+        i = i + 1;
+    }
+}
+
+fun typed_add(w: *Walk, e: *model.Entry, start: u32, len: u32) {
+    var i: u32 = 0;
+    for (i < len) {
+        val tn:   *ast_decl.TypedName = ?w.src.tree.typed_names.data[start + i];
+        var name: str                 = span_text(w.b, w.src, tn.name);
+        if (tn.comptime) { name = join(w.b, "$", 0, name); }
+        element_add(w, e, name, type_text(w, tn.ty));
+        i = i + 1;
+    }
+}
+
+# what the component lines of a declaration can name, in declaration order
+fun elements(w: *Walk, d: *ast_decl.Decl, e: *model.Entry) {
+    if (d.kind == ast_decl.DECL_KIND_FUN) {
+        generics_add(w, e, d.data.fun_.generics_start, d.data.fun_.generics_len);
+        typed_add(w, e, d.data.fun_.params_start, d.data.fun_.params_len);
+    }
+    or (d.kind == ast_decl.DECL_KIND_REC) {
+        generics_add(w, e, d.data.rec_.generics_start, d.data.rec_.generics_len);
+        typed_add(w, e, d.data.rec_.fields_start, d.data.rec_.fields_len);
+    }
+    or (d.kind == ast_decl.DECL_KIND_UNI) {
+        generics_add(w, e, d.data.uni_.generics_start, d.data.uni_.generics_len);
+        typed_add(w, e, d.data.uni_.fields_start, d.data.uni_.fields_len);
+    }
+    or (d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR) {
+        element_add(w, e, e.name, type_text(w, d.data.bind.ty));
+    }
+    or (d.kind == ast_decl.DECL_KIND_TAG) {
+        generics_add(w, e, d.data.tag_.generics_start, d.data.tag_.generics_len);
+        var i: u32 = 0;
+        for (i < d.data.tag_.cases_len) {
+            val c: *ast_decl.TagCase = ?w.src.tree.tag_cases.data[d.data.tag_.cases_start + i];
+            element_add(w, e, span_text(w.b, w.src, c.name), type_text(w, c.payload));
+            i = i + 1;
+        }
+    }
+}
+
+fun listed(v: *Vector[str], name: str) bool {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (str_equals(v.data[i], name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the public type of this module a type names directly, "" for none
+fun local_named(w: *Walk, t: *ast_type.Type) str {
+    if (t.kind != ast_type.TYPE_KIND_NAMED) { ret ""; }
+    val name: str = span_text(w.b, w.src, t.data.named.name);
+    if (listed(?w.types, name)) { ret name; }
+    ret "";
+}
+
+# the public type of this module that a type names through any pointer, secrecy mark,
+# array or generic argument, the first in source order; "" for none
+fun named_within(w: *Walk, tid: ast_id.TypeId) str {
+    val a:      *ast.Ast            = w.src.tree;
+    val opt_ty: opt[*ast_type.Type] = ast.get_type(a, tid);
+    if (sel opt_ty.none) { ret ""; }
+    val t:    *ast_type.Type = opt_ty.some;
+    val name: str            = local_named(w, t);
+    if (str_len(name) > 0) { ret name; }
+    if (t.kind == ast_type.TYPE_KIND_NAMED) {
+        var i: u32 = 0;
+        for (i < t.data.named.args_len) {
+            val inner: str = named_within(w, a.type_ids.data[t.data.named.args_start + i]);
+            if (str_len(inner) > 0) { ret inner; }
+            i = i + 1;
+        }
+    }
+    if (t.kind == ast_type.TYPE_KIND_PTR)    { ret named_within(w, t.data.ptr.pointee); }
+    if (t.kind == ast_type.TYPE_KIND_SECRET) { ret named_within(w, t.data.secret.inner); }
+    if (t.kind == ast_type.TYPE_KIND_ARRAY)  { ret named_within(w, t.data.array.element); }
+    ret "";
+}
+
+# the public type of this module that a return type names through `res`, `opt`, `err` and
+# pointers; "" for none
+fun named_returned(w: *Walk, tid: ast_id.TypeId) str {
+    val a:      *ast.Ast            = w.src.tree;
+    val opt_ty: opt[*ast_type.Type] = ast.get_type(a, tid);
+    if (sel opt_ty.none) { ret ""; }
+    val t:    *ast_type.Type = opt_ty.some;
+    val name: str            = local_named(w, t);
+    if (str_len(name) > 0)                  { ret name; }
+    if (t.kind == ast_type.TYPE_KIND_PTR)   { ret named_returned(w, t.data.ptr.pointee); }
+    if (t.kind != ast_type.TYPE_KIND_NAMED) { ret ""; }
+    val whole: str = span_text(w.b, w.src, t.data.named.name);
+    val leaf:  str = (?whole[after_last(whole, '.')])::str;
+    if (!str_equals(leaf, "res") && !str_equals(leaf, "opt") && !str_equals(leaf, "err")) { ret ""; }
+    var i: u32 = 0;
+    for (i < t.data.named.args_len) {
+        val inner: str = named_returned(w, a.type_ids.data[t.data.named.args_start + i]);
+        if (str_len(inner) > 0) { ret inner; }
+        i = i + 1;
+    }
+    ret "";
+}
+
+# the type a declaration belongs to: a function's first parameter that names one of the
+# module's types, or else its return type; a binding's declared type; "" for none
+fun owner_of(w: *Walk, d: *ast_decl.Decl) str {
+    val a: *ast.Ast = w.src.tree;
+    if (d.kind == ast_decl.DECL_KIND_FUN) {
+        var i: u32 = 0;
+        for (i < d.data.fun_.params_len) {
+            val name: str = named_within(w, a.typed_names.data[d.data.fun_.params_start + i].ty);
+            if (str_len(name) > 0) { ret name; }
+            i = i + 1;
+        }
+        ret named_returned(w, d.data.fun_.return_type);
+    }
+    if (d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR) {
+        val opt_ty: opt[*ast_type.Type] = ast.get_type(a, d.data.bind.ty);
+        if (sel opt_ty.some) { ret local_named(w, opt_ty.some); }
+    }
+    ret "";
+}
+
+fun alias_add(w: *Walk, e: *model.Entry, x: model.Alias) {
+    var i: usize = 0;
+    for (i < e.aliases.len) {
+        if (str_equals(e.aliases.data[i].name, x.name)) { ret; }
+        i = i + 1;
+    }
+    keep[model.Alias](w.b, ?e.aliases, x);
+}
+
+# record the import aliases and private types a type names
+fun type_aliases(w: *Walk, e: *model.Entry, tid: ast_id.TypeId) {
+    val a:      *ast.Ast            = w.src.tree;
+    val opt_ty: opt[*ast_type.Type] = ast.get_type(a, tid);
+    if (sel opt_ty.none) { ret; }
+    val t: *ast_type.Type = opt_ty.some;
+    if (t.kind == ast_type.TYPE_KIND_NAMED) {
+        val name: str   = span_text(w.b, w.src, t.data.named.name);
+        var dot:  usize = 0;
+        for (name[dot] != 0 && name[dot] != '.') { dot = dot + 1; }
+        if (name[dot] == '.') {
+            val head: str   = dup(w.b, name, 0, dot);
+            var si:   usize = w.scope.len;
+            for (si > 0) {
+                si = si - 1;
+                if (str_equals(w.scope.data[si].name, head)) {
+                    alias_add(w, e, model.Alias{name: head, target: w.scope.data[si].path, module: model.NONE, private: false});
+                    si = 0;
+                }
+            }
+        }
+        or (listed(?w.private, name)) {
+            alias_add(w, e, model.Alias{name: name, target: "", module: model.NONE, private: true});
+        }
+        var i: u32 = 0;
+        for (i < t.data.named.args_len) {
+            type_aliases(w, e, a.type_ids.data[t.data.named.args_start + i]);
+            i = i + 1;
+        }
+    }
+    or (t.kind == ast_type.TYPE_KIND_PTR)             { type_aliases(w, e, t.data.ptr.pointee); }
+    or (t.kind == ast_type.TYPE_KIND_SECRET)          { type_aliases(w, e, t.data.secret.inner); }
+    or (t.kind == ast_type.TYPE_KIND_ARRAY)           { type_aliases(w, e, t.data.array.element); }
+    or (t.kind == ast_type.TYPE_KIND_POINTEE_OF)      { type_aliases(w, e, t.data.pointee_of.inner); }
+    or (t.kind == ast_type.TYPE_KIND_DISCRIMINANT_OF) { type_aliases(w, e, t.data.discriminant_of.inner); }
+    or (t.kind == ast_type.TYPE_KIND_FUN) {
+        var i: u32 = 0;
+        for (i < t.data.fun_.params_len) {
+            type_aliases(w, e, a.type_ids.data[t.data.fun_.params_start + i]);
+            i = i + 1;
+        }
+        type_aliases(w, e, t.data.fun_.ret_type);
+    }
+    or (t.kind == ast_type.TYPE_KIND_REC) { typed_aliases(w, e, t.data.rec_.fields_start, t.data.rec_.fields_len); }
+    or (t.kind == ast_type.TYPE_KIND_UNI) { typed_aliases(w, e, t.data.uni_.fields_start, t.data.uni_.fields_len); }
+}
+
+fun typed_aliases(w: *Walk, e: *model.Entry, start: u32, len: u32) {
+    var i: u32 = 0;
+    for (i < len) {
+        type_aliases(w, e, w.src.tree.typed_names.data[start + i].ty);
+        i = i + 1;
+    }
+}
+
+# record the aliases every type in a declaration's signature names
+fun aliases(w: *Walk, e: *model.Entry, d: *ast_decl.Decl) {
+    if (d.kind == ast_decl.DECL_KIND_FUN) {
+        typed_aliases(w, e, d.data.fun_.params_start, d.data.fun_.params_len);
+        type_aliases(w, e, d.data.fun_.return_type);
+    }
+    or (d.kind == ast_decl.DECL_KIND_REC) { typed_aliases(w, e, d.data.rec_.fields_start, d.data.rec_.fields_len); }
+    or (d.kind == ast_decl.DECL_KIND_UNI) { typed_aliases(w, e, d.data.uni_.fields_start, d.data.uni_.fields_len); }
+    or (d.kind == ast_decl.DECL_KIND_TAG) {
+        type_aliases(w, e, d.data.tag_.disc);
+        var i: u32 = 0;
+        for (i < d.data.tag_.cases_len) {
+            type_aliases(w, e, w.src.tree.tag_cases.data[d.data.tag_.cases_start + i].payload);
+            i = i + 1;
+        }
+    }
+    or (d.kind == ast_decl.DECL_KIND_DEF)                                     { type_aliases(w, e, d.data.def_.ty); }
+    or (d.kind == ast_decl.DECL_KIND_VAL || d.kind == ast_decl.DECL_KIND_VAR) { type_aliases(w, e, d.data.bind.ty); }
+}
+
+# what resolution decided a `fwd` forwards; its module is the project's numbering until
+# `link` renumbers it
+fun forward_of(w: *Walk, did: ast_id.DeclId) model.Forward {
+    var f:  model.Forward          = model.Forward{resolved: false, whole: false, target: "", module: model.NONE, entry: model.NONE};
+    val rr: *resolve.ResolveResult = w.src.rr;
+    if (rr == nil || ast_id.decl_index(did) >= rr.decl_count) { ret f; }
+    val sid: resolve.SymbolId = rr.decl_symbol[ast_id.decl_index(did)];
+    if (resolve.symbol_is_sentinel(sid)) { ret f; }
+    val p:   *project.Project = w.b.p;
+    val sym: *resolve.Symbol  = ?rr.symbols[resolve.symbol_index(sid)];
+    f.whole = sym.kind == resolve.SYM_USE;
+    var target: module.ModuleId = resolve.origin_of(p.s, sym);
+    if (f.whole)                                { target = resolve.use_target(p.s, sym); }
+    if (target::u32 >= project.module_count(p)) { ret f; }
+    val tpath: str = intern.text(?p.s.interner, project.module_at(p, target::u32).fqn);
+    f.resolved = true;
+    f.module   = target::u32;
+    f.target   = tpath;
+    if (!f.whole) {
+        val canon: str = intern.text(?p.s.interner, sym.canon);
+        f.target = join(w.b, tpath, '.', (?canon[after_last(canon, '.')])::str);
+    }
+    ret f;
+}
+
+# group the module's entries: each public type with what belongs to it, in declaration
+# order, then what belongs to none by kind
+fun group(w: *Walk) {
+    val m: *model.Module = w.m;
+    var i: usize         = 0;
+    for (i < m.entries.len) {
+        val owner: str = w.owners.data[i];
+        if (str_len(owner) > 0) {
+            var t: usize = 0;
+            for (t < m.entries.len && !(model.is_type(m.entries.data[t].kind) && str_equals(m.entries.data[t].name, owner))) { t = t + 1; }
+            if (t < m.entries.len) { m.entries.data[i].owner = t::u32; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < m.entries.len) {
+        if (model.is_type(m.entries.data[i].kind)) { group_add(w, i::u32, m.entries.data[i].kind); }
+        i = i + 1;
+    }
+    group_add(w, model.NONE, model.KIND_FUN);
+    group_add(w, model.NONE, model.KIND_VAL);
+    group_add(w, model.NONE, model.KIND_VAR);
+    group_add(w, model.NONE, model.KIND_FWD);
+}
+
+fun group_add(w: *Walk, owner: u32, kind: model.Kind) {
+    val m: *model.Module = w.m;
+    var g: model.Group   = model.Group{owner: owner, kind: kind, members: collections_vector.init[u32](w.b.a)};
+    var i: usize         = 0;
+    for (i < m.entries.len) {
+        val e: *model.Entry = ?m.entries.data[i];
+        if (owner != model.NONE && e.owner == owner)                        { keep[u32](w.b, ?g.members, i::u32); }
+        if (owner == model.NONE && e.owner == model.NONE && e.kind == kind) { keep[u32](w.b, ?g.members, i::u32); }
+        i = i + 1;
+    }
+    if (owner == model.NONE && g.members.len == 0) { ret; }
+    keep[model.Group](w.b, ?m.groups, g);
+}
+
+# the module whose path is `path`, NONE when the model has none
+fun module_by_path(out: *model.Project, path: str) u32 {
+    var lo: usize = 0;
+    var hi: usize = out.modules.len;
+    for (lo < hi) {
+        val mid: usize = (lo + hi) / 2;
+        val c:   i64   = str_compare(out.modules.data[mid].path, path);
+        if (c == 0) { ret mid::u32; }
+        if (c < 0)  { lo = mid + 1; }
+        or          { hi = mid; }
+    }
+    ret model.NONE;
+}
+
+fun entry_by_name(m: *model.Module, name: str) u32 {
+    var i: usize = 0;
+    for (i < m.entries.len) {
+        if (str_equals(m.entries.data[i].name, name)) { ret i::u32; }
+        i = i + 1;
+    }
+    ret model.NONE;
+}
+
+# insert `x` into the ascending `v` unless it holds it
+fun insert_sorted(b: *Builder, v: *Vector[u32], x: u32) {
+    var i: usize = 0;
+    for (i < v.len && v.data[i] < x) { i = i + 1; }
+    if (i < v.len && v.data[i] == x) { ret; }
+    keep[u32](b, v, x);
+    if (b.failed) { ret; }
+    var j: usize = v.len - 1;
+    for (j > i) {
+        v.data[j] = v.data[j - 1];
+        j         = j - 1;
+    }
+    v.data[i] = x;
+}
+
+# the relations between modules, once every module is in the model: what each `fwd`
+# forwards and each alias names, by model index, and the import graph
+fun link(b: *Builder, out: *model.Project, sources: *Vector[Source], by_project: *u32) {
+    val p:  *project.Project = b.p;
+    var mi: usize            = 0;
+    for (mi < out.modules.len) {
+        val m:  *model.Module = ?out.modules.data[mi];
+        var ei: usize         = 0;
+        for (ei < m.entries.len) {
+            val e: *model.Entry = ?m.entries.data[ei];
+            if (e.forward.resolved) {
+                e.forward.module = by_project[e.forward.module];
+                if (e.forward.module != model.NONE && !e.forward.whole) {
+                    e.forward.entry = entry_by_name(?out.modules.data[e.forward.module], (?e.forward.target[after_last(e.forward.target, '.')])::str);
+                }
+            }
+            var ai: usize = 0;
+            for (ai < e.aliases.len) {
+                if (!e.aliases.data[ai].private) { e.aliases.data[ai].module = module_by_path(out, e.aliases.data[ai].target); }
+                ai = ai + 1;
+            }
+            ei = ei + 1;
+        }
+        val deps: *Vector[module.StableModuleId] = ?sources.data[mi].entry.load.deps;
+        var di:   usize                          = 0;
+        for (di < deps.len) {
+            val mid: module.ModuleId = module.module_id_for_stable(?p.s.modules, deps.data[di]);
+            if (mid::u32 < project.module_count(p)) {
+                val to: u32 = by_project[mid::u32];
+                if (to != model.NONE && to != mi::u32) {
+                    insert_sorted(b, ?m.imports, to);
+                    insert_sorted(b, ?out.modules.data[to].importers, mi::u32);
+                }
+            }
+            di = di + 1;
+        }
+        mi = mi + 1;
+    }
+}
+
+fun dir_by_rel(out: *model.Project, rel: str) u32 {
+    var i: usize = 0;
+    for (i < out.dirs.len) {
+        if (str_equals(out.dirs.data[i].rel, rel)) { ret i::u32; }
+        i = i + 1;
+    }
+    ret model.NONE;
+}
+
+fun dir_order(x: *model.Dir, y: *model.Dir) i64 {
+    ret str_compare(x.rel, y.rel);
+}
+
+# the top-level directory a module's area is, its first segment, NONE for none
+fun area_of(b: *Builder, out: *model.Project, m: *model.Module) u32 {
+    var n: usize = 0;
+    for (m.rel[n] != 0 && m.rel[n] != '/') { n = n + 1; }
+    ret dir_by_rel(out, dup(b, m.rel, 0, n));
+}
+
+# whether module `m` lies in or below directory `d`, or is its root module
+fun within(m: *model.Module, d: *model.Dir) bool {
+    val n: usize = str_len(d.rel);
+    var i: usize = 0;
+    for (i < n) {
+        if (m.rel[i] != d.rel[i]) { ret false; }
+        i = i + 1;
+    }
+    ret m.rel[n] == 0 || m.rel[n] == '/';
+}
+
+# the directories of the source tree: every one holding a module, its root module, its
+# contents and its area's imports
+fun directories(b: *Builder, out: *model.Project) {
+    keep[model.Dir](b, ?out.dirs, dir_make(b, "", model.NONE));
+    var mi: usize = 0;
+    for (mi < out.modules.len) {
+        val rel: str   = out.modules.data[mi].rel;
+        var i:   usize = 0;
+        for (rel[i] != 0) {
+            if (rel[i] == '/') {
+                val sub: str = dup(b, rel, 0, i);
+                if (dir_by_rel(out, sub) == model.NONE) { keep[model.Dir](b, ?out.dirs, dir_make(b, sub, model.NONE)); }
+            }
+            i = i + 1;
+        }
+        mi = mi + 1;
+    }
+    if (b.failed) { ret; }
+    sort.sort_by[model.Dir](out.dirs.data, out.dirs.len, dir_order);
+
+    var di: usize = 1;
+    for (di < out.dirs.len) {
+        val d:   *model.Dir = ?out.dirs.data[di];
+        val cut: usize      = after_last(d.rel, '/');
+        d.leaf = (?d.rel[cut])::str;
+        var up: str = "";
+        if (cut > 0) { up = dup(b, d.rel, 0, cut - 1); }
+        d.parent = dir_by_rel(out, up);
+        keep[u32](b, ?out.dirs.data[d.parent].dirs, di::u32);
+        di = di + 1;
+    }
+    mi = 0;
+    for (mi < out.modules.len) {
+        val m:   *model.Module = ?out.modules.data[mi];
+        val cut: usize         = after_last(m.rel, '/');
+        var up:  str           = "";
+        if (cut > 0) { up = dup(b, m.rel, 0, cut - 1); }
+        m.dir = dir_by_rel(out, up);
+        keep[u32](b, ?out.dirs.data[m.dir].modules, mi::u32);
+        val own: u32 = dir_by_rel(out, m.rel);
+        if (own != model.NONE) { out.dirs.data[own].root = mi::u32; }
+        var at: u32 = m.dir;
+        for (at != model.NONE) {
+            out.dirs.data[at].total = out.dirs.data[at].total + 1;
+            at                      = out.dirs.data[at].parent;
+        }
+        mi = mi + 1;
+    }
+    di = 1;
+    for (di < out.dirs.len) {
+        val d:   *model.Dir = ?out.dirs.data[di];
+        var top: u32        = di::u32;
+        for (out.dirs.data[top].parent != 0) { top = out.dirs.data[top].parent; }
+        mi = 0;
+        for (mi < out.modules.len) {
+            val m: *model.Module = ?out.modules.data[mi];
+            if (within(m, d)) {
+                var k: usize = 0;
+                for (k < m.imports.len) {
+                    val area: u32 = area_of(b, out, ?out.modules.data[m.imports.data[k]]);
+                    if (area != model.NONE && area != top) { insert_sorted(b, ?d.imports, area); }
+                    k = k + 1;
+                }
+                k = 0;
+                for (k < m.importers.len) {
+                    val area: u32 = area_of(b, out, ?out.modules.data[m.importers.data[k]]);
+                    if (area != model.NONE && area != top) { insert_sorted(b, ?d.importers, area); }
+                    k = k + 1;
+                }
+            }
+            mi = mi + 1;
+        }
+        di = di + 1;
+    }
+}
+
+fun dir_make(b: *Builder, rel: str, parent: u32) model.Dir {
+    ret model.Dir{
+        rel:   rel, leaf: rel, parent: parent, root: model.NONE, modules: collections_vector.init[u32](b.a), dirs: collections_vector.init[u32](b.a),
+        total: 0, imports: collections_vector.init[u32](b.a), importers: collections_vector.init[u32](b.a)
+    };
+}
+
+# the module path of an artifact's entry file, `bin/main.mach` in project `mach` being
+# `mach.bin.main`
+fun entry_path(b: *Builder, id: str, entry: str) str {
+    var n: usize = str_len(entry);
+    if (n > 5 && str_equals((?entry[n - 5])::str, ".mach")) { n = n - 5; }
+    ret join(b, id, '.', replaced(b, dup(b, entry, 0, n), '/', '.'));
+}

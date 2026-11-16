@@ -34,8 +34,9 @@ An axis no option names, without `--all`, takes the manifest's default:
 - the artifacts are the **default selection** for each selected target: of the
   artifacts whose `targets` includes it, those marked `default = true` when any is
   marked, and every one of them when none is. `mach build` and `mach check` take the
-  whole default selection. `mach test` and `mach doc` need one artifact and take the
+  whole default selection. `mach test` needs one artifact and takes the
   default selection when it holds one; several with none marked are refused.
+  `mach doc` documents every artifact at once, analyzed together on one target.
   `mach run` takes the sole `bin` the target builds.
 
 No default is chosen by table order: several candidates with none marked are
@@ -54,9 +55,10 @@ refused, naming them.
   host has. `--runner <cmd>` replaces the target's runner for one invocation and needs
   the selection to resolve to one cell. A run in which nothing was runnable exits `1`, so a green run always ran
   something, unless `--allow-unrunnable` accepts it.
-- `mach run <path>` and `mach doc <path>` consume exactly one cell and refuse a
-  selection that resolves to several, naming them. `mach run` takes no `--all`, and
-  `mach doc` selects with `-a` and `-t` only. `mach run` launches the built program
+- `mach run <path>` consumes exactly one cell and refuses a selection that resolves
+  to several, naming them, and takes no `--all`. `mach doc <path>` refuses `-a`,
+  since one run documents every artifact, and takes one `-t` pattern, which must
+  name one target. `mach run` launches the built program
   through the target's `runner` when it declares one, the expanded runner followed by
   the arguments after `--`; `--runner <cmd>` replaces it with `<cmd> <program> <args>`
   for one invocation. A target that is not the host's and declares no runner is
