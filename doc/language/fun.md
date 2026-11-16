@@ -142,17 +142,14 @@ error[generic.growing_cycle]: `g` instantiates `f` here at an argument that grow
 
 ### Where an instance's code lives
 
-Every instance is compiled once per build, whichever modules call it. A module's
-object only declares the instances it calls. The code goes into an **instance
-unit**: one object per generic's module and bucket, where the bucket is a fixed
-hash (FNV-1a) of the instance's mangled name modulo 8. A generic, comptime-value
-or pack instance of `m.f` therefore lands in one of the objects `m#instances.0`
-through `m#instances.7`, and which one depends on its name alone.
+An instance is compiled into every object whose code reaches it, directly or
+through other instances, and the link keeps one copy. A module's object holds
+its own code and each instance that code calls, and its test object holds what
+its tests reach. No object is made for instances alone.
 
-- **Nothing in a unit depends on build order.** A unit lowers its instances in
-  mangled-name order, and unit objects follow every module object in the link,
-  ordered by module name and then bucket. Adding or dropping a use of an
-  instance changes at most the one unit that holds it.
+- **Nothing in an object depends on build order.** A module lowers its own
+  declarations, then each instance its code reaches, in the order its code
+  reaches them.
 - **Linkage.** An instance is a merged definition, hidden, so no shared library
   exports it, `#[export]` or not. Every object that holds it holds a copy, and the
   link keeps the first copy in link order. Each copy carries the instance's
@@ -172,12 +169,14 @@ through `m#instances.7`, and which one depends on its name alone.
   is building both with the same one. ELF, COFF and wasm linkers refuse either
   kind as a plain duplicate symbol. On Mach-O only mink refuses, since the
   format has no groups and other linkers coalesce weak definitions without a
-  check. One build compiles one copy of each instance: a function's
-  `#[extension]` admits instructions in its own inline `asm` only, so an
-  instance it calls is compiled for the target's selection, or with the
-  generic's own `#[extension]`, which is part of its source. A private declaration
-  an instance body reaches, such as a helper or a table of the generic's module,
-  is reached from the unit as a hidden symbol of the same image.
+  check. Every copy of an instance in one build is compiled the same way: a
+  function's `#[extension]` admits instructions in its own inline `asm` only, so
+  an instance it calls is compiled for the target's selection, or with the
+  generic's own `#[extension]`, which is part of its source. A private
+  declaration an instance body reaches, such as a helper or a table of the
+  generic's module, is reached from another module's object as a hidden symbol
+  of the same image. On a target whose objects hold no merged definitions
+  (SPIR-V), an instance is a weak definition instead.
 - **What the identity does not catch.** It is no authentication. An object made
   by hand with another toolchain that copies a real identity onto other code
   merges silently with the copies it imitates when it comes first in link order.
@@ -189,9 +188,9 @@ through `m#instances.7`, and which one depends on its name alone.
   described, as that library was built, not as your own objects were. To choose
   the copy, put the library whose build you want first in link order.
 - **Constant time.** A `constant_time` function's code is verified only against the
-  callees its own object holds. So an instance it calls is also compiled into the
-  caller's object, as a local copy under the same name, and the caller calls that
-  copy.
+  callees its own object holds. So an instance it calls is a local copy in the
+  caller's object, under the same name, and the caller calls that copy. Other code
+  of the same object calls that copy too.
 - **Typed once, reported by every caller.** An instance is type checked once per
   build, against its generic's module and the modules declaring its type arguments,
   never against a caller, and its refusals are made and kept once. Each module whose
@@ -202,24 +201,17 @@ through `m#instances.7`, and which one depends on its name alone.
   that must change, and every file that asks for a broken instance shows it.
 - **Reused across builds.** An instance is keyed by its mangled name, the text
   of its generic's module without the bodies of its plain functions and tests,
-  and the declarations of every module its typing reads (their text without any
-  function body, and the same of every module each imports). A unit's object
-  stays in `obj/` beside its generic module's, keyed by its members' keys, so a
-  rebuild that changes none of those reuses it. A module's object record lists the
-  instances its code asks for, and the cache directory keeps a record of each
-  instance's typing (`.cache/instances`: the instances its body asks for and what
-  it reported), keyed by the instance's key. A rebuild reads the demand from those
-  records, so a module whose object is reused and that nothing rebuilt imports
-  runs no front end, and an instance whose record stands is not typed again. A
-  module's object is keyed by its own source and the declarations of the modules
-  it imports, never their function bodies, so changing a generic's body rebuilds
-  that generic's units and not the modules that call it. The one exception is the
-  local copy constant-time code calls: an object's record lists each instance it
-  holds a copy of under the instance's key, and the object is rebuilt when one of
-  those keys changes. The same holds in every profile, `optimize` included.
-- **Every program of a build links every unit**, test programs included, and a
-  `kind = "static"` library holds the unit objects next to its module objects.
-- `-vv` lists units as `<module>#instances.<bucket>` beside the modules.
+  and the same of every module its typing reads, and of every module each of
+  those imports. A module's object is keyed by its own source and the
+  declarations of the modules it imports, never their function bodies, and its
+  record lists each instance it holds under the instance's key. The object is
+  rebuilt when one of those keys changes, so changing a generic's body rebuilds
+  the objects that hold an instance of it and no other. A module whose object is
+  reused types none of its instances, and when nothing rebuilt imports it, it
+  runs no front end. A warning an instance reports is replayed with the
+  object, and the object is rebuilt when a source outside its module that a
+  replayed warning points into has changed. The same holds in every profile,
+  `optimize` included.
 
 ## Comptime value parameters
 

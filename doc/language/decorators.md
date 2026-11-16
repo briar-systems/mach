@@ -443,8 +443,8 @@ its instructions never leave a constant-time validated body; a `naked`,
 [`weak`](#weakstr--a-definition-as-a-link-time-default) or `inline("never")`
 function, a recursive cycle and an indirect call are never expanded.
 A remaining call or taken address still names the original defining function.
-Generic, comptime and pack specializations are weak and hidden, and each is
-defined once per build, in its instance unit (see
+Generic, comptime and pack specializations are merged and hidden, and each is
+defined in every object whose code calls it (see
 [fun.md](fun.md#where-an-instances-code-lives)).
 Helpers referencing compiler-local literal pools retain their calls because those
 objects have module-local identity. Named globals keep their original symbols,
