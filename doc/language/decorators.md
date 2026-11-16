@@ -382,6 +382,10 @@ holds at each one.
   no one symbol.
 - It applies to functions only, and it cannot stand with `testing`, as `symbol`
   cannot.
+- A module compiled to a `spirv` object, as a project's modules are, refuses it
+  with `spirv.unsupported`: SPIR-V linkage has no replaceable definition, and a
+  module calls its own functions by id, never by name, so no link could replace
+  the default.
 
 ### `library(str)` — dynamic import attribution
 
