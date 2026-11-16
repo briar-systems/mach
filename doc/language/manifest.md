@@ -559,14 +559,14 @@ target shares the value.
 | Axis  | Values |
 |-------|--------|
 | `arch` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv`, `wasm32` |
-| `sys`  | `linux`, `windows`, `darwin`, `freestanding`, `vulkan`, `wasi` |
+| `sys`  | `linux`, `windows`, `darwin`, `freestanding`, `uefi`, `vulkan`, `wasi` |
 | `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `shader`, `basic` |
 | `of`  | `elf`, `macho`, `coff`, `flat`, `spirv`, `wasm` |
 | `env` | `vulkan1.0`, `vulkan1.1`, `vulkan1.2`, `vulkan1.3`, `preview1` |
 
 Each `arch`, `sys` and `of` value is the name of a row of mink's catalog: `arch` an
 architecture, `sys` a system and `of` a format. mach reads the spelling from that row,
-and the catalog's rows mach has no target for (`x86`, `uefi`, ...)
+and the catalog's rows mach has no target for (`x86`, ...)
 are not values here. A spelling mink names otherwise is refused where it is written,
 naming the new spelling and carrying the rewrite `mach migrate` applies:
 
@@ -603,6 +603,7 @@ not an os of its own. `spirv` is not a machine at all — it
 emits a finished GPU module rather than machine code (see
 [Finished-module targets](#finished-module-targets)). `wasi` builds a WebAssembly
 module that a host runtime instantiates (see [WebAssembly targets](#webassembly-targets)).
+`uefi` builds a PE image a UEFI firmware loads (see [UEFI targets](#uefi-targets)).
 
 ### RISC-V baselines
 
@@ -689,7 +690,7 @@ caught rather than silently never matching.
 ### Object-format override
 
 `of` overrides the object format a target implies. Each os has a default format —
-`linux` → `elf`, `windows` → `coff`, `darwin` → `macho`, `freestanding` → `flat`,
+`linux` → `elf`, `windows` → `coff`, `uefi` → `coff`, `darwin` → `macho`, `freestanding` → `flat`,
 `vulkan` → `spirv` — and `of` names a different one from the same closed set: `elf`,
 `coff`, `macho`, `flat`, `spirv`. `of` is optional; omit it to
 take the default. An os accepts only the formats it can load, so an override the
@@ -1001,6 +1002,47 @@ runner = ["wasmtime", "{artifact.out}"]
   `ENOTSUP`, which std reports as its unsupported error kind. std's manifest declares
   no `[link.*]` entry for the system interface, since the environment names the
   module every import resolves from.
+
+### UEFI targets
+
+A `uefi` target builds a PE image that a UEFI firmware loads, on `x86_64` and
+`aarch64`. The firmware places the image wherever it chooses and applies its base
+relocations, so every image is relocatable (`linkage = "pie"`, the only one the
+system runs), and it calls the image's entry, `efi_main`, with the image's handle and
+the system table. Everything the image reaches it reaches through that table, so the
+image imports nothing and std's manifest declares no `[link.*]` entry for it.
+
+```toml
+[target.uefi-x86_64]
+arch = "x86_64"
+sys  = "uefi"
+abi  = "win64"
+```
+
+- **The tuple.** There is no environment. The calling convention is the firmware's:
+  `win64` on `x86_64` and `aapcs64` on `aarch64` (UEFI 2.10, 2.3.4 and 2.3.6), the
+  defaults `mach info targets` marks. The format is `coff`, and with no `isa` an
+  `x86_64` target stands on the psABI baseline and an `aarch64` one on
+  `armv8-a+fp+simd`, which the firmware enables before it calls the entry. A PE
+  image's frames are written as its machine's unwind data, which mink builds today
+  only from frames laid out under `win64` and `aapcs64win`, so an `aarch64` image
+  whose code has a frame links under `abi = "aapcs64win"` alone, whose calls are
+  AAPCS64's for every signature without a variable argument list.
+- **Artifacts.** A `bin` artifact is a `.efi` image whose subsystem is
+  `efi_application` unless the artifact's `subsystem` names another of the four the
+  firmware loads, `efi_boot_service_driver`, `efi_runtime_driver` or `efi_rom`. Any
+  other subsystem is refused, naming the four. A `static` artifact is a `.lib`
+  archive. No image binds another's exports, so a `shared` artifact is refused with
+  mink's reason.
+- **The entry.** `use std.runtime;` links std's `efi_main`, which keeps the handle and
+  the table for the program (`std.runtime.uefi`), calls `main(0, nil)`, and returns
+  main's result to the firmware as the image's status. `std.system.uefi` lays out
+  the system table, the console protocols and the boot and runtime services, from
+  which a program calls the firmware itself. std's OS layer has no uefi member, so
+  `std.system.capability` states no group on it and a module that needs one is
+  refused at build, naming the capability.
+- **Thread-locals.** The firmware runs one processor's code at a time and keeps no
+  table of an image's thread-local storage, so a thread-local variable is refused.
 
 ### Platform targets (bare metal)
 
@@ -1369,7 +1411,7 @@ reads the selected artifact's name.
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | absent: links nothing | Array of `[link.X]` names this artifact links (see below). A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names no [link.*] table: 'nosuch' (declared: [link.kernel32])`). |
 | `need`    | absent: needs nothing | Array of category-qualified requirements such as `step.generate`, `artifact.support`, and `artifact.shader-*`. Each glob matches only its named category. See [Artifact requirements](#artifact-requirements). |
-| `subsystem` | absent: `"console"` | A PE subsystem as mink spells it, such as `"console"` or `"windows"` — the environment a windows executable declares it runs under; refused on a target whose image format has no subsystem (see below). |
+| `subsystem` | absent: the system's default, `"console"` on `windows` and `"efi_application"` on `uefi` | A PE subsystem as mink spells it, such as `"console"` or `"windows"` — the environment a windows executable declares it runs under, or the kind of image a UEFI firmware loads; refused on a target whose image format has no subsystem, and on one whose system does not run it (see below). |
 | `icon` | absent: no icon | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `manifest` | absent: no application manifest | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `default` | absent: not marked | Selection only. `true` puts the artifact in the [default selection](build.md#selection-and-the-build-matrix): with no `-a`, `mach build` and `mach check` take the marked artifacts among those supporting the selected target (every one of them when none is marked), and a command that needs one artifact (`mach test`, `mach run`, the editor's union build) takes the marked one. A command that needs one artifact refuses two marked candidates; an explicit `-a` always wins, and a sole candidate needs no marker. |
@@ -1551,6 +1593,7 @@ inspection use the same expansion.
 | ELF on Linux or freestanding | empty | `.a` | `.so` (refused on freestanding) |
 | Mach-O on Darwin | empty | `.a` | `.dylib` (not written) |
 | COFF/PE on Windows | `.exe` | `.lib` | `.dll` (not written) |
+| COFF/PE on UEFI | `.efi` | `.lib` | refused |
 | Raw image | empty | unsupported | unsupported |
 | SPIR-V module | refused, its artifact is a `module` (`.spv`) | unsupported | unsupported |
 | wasm module on wasi | `.wasm` | `.a` | refused |

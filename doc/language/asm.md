@@ -36,7 +36,8 @@ asm <selection> {
 - **A head may add instruction extensions only.** It never sets execution state: an
   x86 width, AArch64 streaming mode, `dit`, `doitm`, a RISC-V `xlen` other than the
   target's. Those stay the function's, with `#[constant_time]` and the target, so a
-  head that sets one is refused with `asm.head`, naming them. A head that repeats
+  head that sets one is refused with `asm.head`, naming them. An x86 width is
+  switched inside a naked function's block instead (see [Code width](#code-width-x86)). A head that repeats
   the state the target enters at, as `rv64i` does on riscv64, sets nothing.
 - **WebAssembly reads a block as masc's wasm text.** The block starts and ends on an
   empty stack, and a `{name}` is a pointer to the local's storage, reached with
@@ -527,9 +528,9 @@ Control registers are `cr0`, `cr2`, `cr3`, `cr4` and `cr8` — CR1 and CR5–CR7
 reserved and have no spelling. A control-register move takes a 64-bit
 general-purpose register on its other side, since there is no narrower form.
 Segment registers (`es`, `cs`, `ss`, `ds`, `fs`, `gs`) can be **read** into a
-general-purpose register; writing one through `mov` is not supported, because
-long mode does not admit it for CS and SS at all and the remaining loads carry
-descriptor-cache and interrupt-shadow effects.
+general-purpose register, and every one but `cs` can be **written** from one, as
+`mov ds, ax` loads a data selector after a mode switch. No `mov` writes `cs`, which
+changes only by a far transfer such as `retf`.
 
 None of these writes a register the allocator tracks: the interrupt and direction
 flags, RFLAGS, the stack pointer and a segment base are all outside the allocated
@@ -551,6 +552,69 @@ is therefore refused, just as addressing memory with a secret is.
 `Mnemonic` names registers written and nothing else. That is sound — nothing can
 survive an instruction control never returns from — but it means statements after
 an `iretq` are unreachable without the compiler saying so.
+
+## Code width (x86)
+
+A block on x86 may switch the width its code is read at with `.code16`, `.code32`
+and `.code64`, as the standalone assembler does. The statements after a directive
+are read, checked and encoded as code of that width, so the few dozen lines every
+x86 system runs below 64-bit mode (a boot sector, the switch into protected and long
+mode, the trampoline that starts another core) are written as instructions:
+
+```mach fragment
+#[naked]
+#[section(".boot")]
+fun boot() {
+    asm x86-64 {
+    .code32
+        mov eax, cr4
+        or eax, 0x20                # PAE
+        mov cr4, eax
+        lgdtd [0x4018]
+        call 1f
+    1:
+        pop eax
+        add eax, 8                  # the 64-bit tail
+        push 8                      # its code selector
+        push eax
+        retf
+    .code64
+        mov ax, 0x10
+        mov ds, ax
+        jmp _start
+    }
+}
+```
+
+The rows are masc's for that width, spelled as at that width: `lgdtd` is the 32-bit
+form, and an instruction or register that exists only in 64-bit code, such as `rax`,
+is refused under `.code32` as not available under the selection. A numbered label and its
+references may sit at different widths. The rules:
+
+- **Only a `#[naked]` function may switch.** The compiler builds a frame for any
+  other function, and its prologue, its epilogue and the code it writes around the
+  block run at the target's width, so a block that switches in one is refused
+  with `asm.unsupported`. A naked function's body is its blocks alone, so nothing
+  the compiler writes runs between them, and a naked function binds no `{name}`,
+  so no operand's address is formed at a width it was not measured for.
+- **A block ends at the width it starts at.** On x86_64 a block that switches ends
+  under `.code64`, so whatever follows it, the compiler's trap after a naked body
+  or the next block, is read as the code it was made as. A block that ends at
+  another width is refused with `asm.syntax`. A width the target's code is
+  already at sets nothing, and a directive that is followed by anything on its
+  line is refused.
+- **A constant-time function never holds one.** The constant-time check decodes the
+  function's machine code at the width the function is made for, so code at
+  another width is not code it can judge. `#[naked]` and `#[constant_time]` exclude
+  each other, so no mach function reaches this, and mirl refuses the block itself
+  in a function that requires constant time, as it refuses a data directive there.
+- **The listing states the widths.** `--emit asm` writes each run of the block under
+  the directive that selects its width, as the block wrote it, so the listing
+  assembles back to the same bytes.
+- **Debug information is the block's as for any block.** The line table attributes
+  the block's bytes to its statement, and a naked function states no frame rules.
+  Nothing in DWARF or CodeView records a code width, so a debugger disassembles the
+  bytes at the width it assumes for the image.
 
 ## Raw encodings
 

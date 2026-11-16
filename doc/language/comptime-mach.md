@@ -232,6 +232,7 @@ $mach.sys.linux
 $mach.sys.darwin
 $mach.sys.windows
 $mach.sys.freestanding           # no OS / bare metal
+$mach.sys.uefi                   # a PE image a UEFI firmware loads
 $mach.sys.vulkan                 # a spir-v module's system
 $mach.arch.x86_64
 $mach.arch.aarch64
