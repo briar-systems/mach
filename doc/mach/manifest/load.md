@@ -1,9 +1,62 @@
+[mach](../README.md) / [manifest](README.md) / **load**
+
 # mach.manifest.load
 
-## fun parse
+reading a manifest: its TOML held to the schema, decoded into the model and checked
+
+one rule holds for every key whoever reads the manifest, so a dependency's manifest is
+held to exactly the rules of the project being built. a refusal points at the key or
+value it concerns.
+
+<sub>source: [`src/manifest/load.mach`](../../../src/manifest/load.mach) · imported by 22 modules</sub>
+
+<sub>`base_source` is [`mach.base.source`](../base/source.md) · `toml_value` is `toml.value` · `A` is `std.allocator` · `intern` is [`mach.base.intern`](../base/intern.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Doc`](#doc) | `rec` | a manifest's text, the file it was read from, its slot in the source map its reader holds, and its TOML tree, owned through the allocator that made it and released with `doc_dnit` |
+
+| On `Doc` | |
+| :--- | :--- |
+| [`parse`](#parse) | build a `Manifest` from a parsed TOML document, in three stages |
+| [`doc_parse`](#doc_parse) | `text`, the manifest at `path`, as a doc whose text is loaded into `sources`: bytes a manifest refuses and a document that is not TOML are failures pointing at the byte refused |
+| [`doc_parse_bytes`](#doc_parse_bytes) | `doc_parse` over the `n` bytes at `data`, which need not end in a NUL and may hold one, which is refused where it is written |
+| [`doc_read`](#doc_read) | the manifest file at `path` read and parsed as `doc_parse` parses it; a file that cannot be read is refused as a path the project names |
+| [`doc_dnit`](#doc_dnit) | release a doc and everything it owns |
+
+| Functions | |
+| :--- | :--- |
+| [`project_parse`](#project_parse) | the `[project]` table of a parsed TOML document alone, held to its rows as `parse` holds it, for a reader such as `mach fmt` that needs nothing else |
+| [`source_load`](#source_load) | the `n` bytes at `data`, the file at `path`, loaded into `sources` so a refusal can point into them; a NUL ends the text the map holds, and a refusal at it points at its end |
+| [`parse_text`](#parse_text) | the manifest `text`, read from `path`, parsed and checked |
+| [`read_at`](#read_at) | the manifest of the project rooted at `dir`, read off disk and parsed |
+| [`check`](#check) | the checks every manifest model passes, whether decoded from mach.toml or made by an entry build: the rules that span its entries and values, then the host target it builds for where it declares none |
+
+| Constants | |
+| :--- | :--- |
+| [`MANIFEST_FILE`](#constants) | the file name of a project manifest, looked up in a project root |
+
+---
+
+## Doc
 
 ```mach
-pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, doc: *Doc) res[Manifest, fail.Fail];
+pub rec Doc {
+    path:  str;
+    text:  str;
+    file:  base_source.FileId;
+    table: toml_value.Table;
+}
+```
+
+a manifest's text, the file it was read from, its slot in the source map its
+reader holds, and its TOML tree, owned through the allocator that made it and
+released with `doc_dnit`. a failure that names a key points into `file`
+
+### parse
+
+```mach
+pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, doc: *Doc) res[Manifest, fail.Fail]
 ```
 
 build a `Manifest` from a parsed TOML document, in three stages. the schema
@@ -17,131 +70,128 @@ its place admits. one rule holds for every key whoever reads the manifest, so
 a dependency's manifest is held to exactly the rules of the project being
 built. on any error every array allocated so far is freed
 
-alloc: owns the manifest's arrays
-itn: receives every string of the manifest
-doc: the manifest's text and its TOML document
-ret: the manifest, or the first error as a "mach.toml: ..." message pointing at
-       the key or value in `doc` it concerns. the manifest records where each
-       field a later refusal names is written, in `doc`'s file
+| Parameter | |
+| :--- | :--- |
+| `alloc` | owns the manifest's arrays |
+| `itn` | receives every string of the manifest |
+| `doc` | the manifest's text and its TOML document |
+| **returns** | the manifest, or the first error as a "mach.toml: ..." message pointing at the key or value in `doc` it concerns. the manifest records where each field a later refusal names is written, in `doc`'s file |
 
-## fun project_parse
-
-```mach
-pub fun project_parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail];
-```
-
-the `[project]` table of a parsed TOML document alone, held to its rows as
-`parse` holds it, for a reader such as `mach fmt` that needs nothing else
-
-alloc: owns the refusal's text
-itn: receives the table's strings
-t: the document root
-m: receives the project fields
-ret: ok, or the first refusal
-
-## rec Doc
+### doc_parse
 
 ```mach
-pub rec Doc;
-```
-
-a manifest's text, the file it was read from, its slot in the source map its
-reader holds, and its TOML tree, owned through the allocator that made it and
-released with `doc_dnit`. a failure that names a key points into `file`
-
-## fun doc_parse
-
-```mach
-pub fun doc_parse(alloc: *A.Allocator, sources: *base_source.SourceMap, path: str, text: str) res[Doc, fail.Fail];
+pub fun doc_parse(alloc: *A.Allocator, sources: *base_source.SourceMap, path: str, text: str) res[Doc, fail.Fail]
 ```
 
 `text`, the manifest at `path`, as a doc whose text is loaded into `sources`:
 bytes a manifest refuses and a document that is not TOML are failures pointing
 at the byte refused. the doc keeps its own copies of both
 
-## fun doc_parse_bytes
+### doc_parse_bytes
 
 ```mach
-pub fun doc_parse_bytes(alloc: *A.Allocator, sources: *base_source.SourceMap, path: str, data: *u8, n: usize) res[Doc, fail.Fail];
+pub fun doc_parse_bytes(alloc: *A.Allocator, sources: *base_source.SourceMap, path: str, data: *u8, n: usize) res[Doc, fail.Fail]
 ```
 
 `doc_parse` over the `n` bytes at `data`, which need not end in a NUL and may
 hold one, which is refused where it is written
 
-## fun source_load
+### doc_read
 
 ```mach
-pub fun source_load(alloc: *A.Allocator, sources: *base_source.SourceMap, path: str, data: *u8, n: usize) res[base_source.FileId, fail.Fail];
-```
-
-the `n` bytes at `data`, the file at `path`, loaded into `sources` so a refusal can point
-into them; a NUL ends the text the map holds, and a refusal at it points at its end
-
-## fun doc_read
-
-```mach
-pub fun doc_read(alloc: *A.Allocator, sources: *base_source.SourceMap, path: str) res[Doc, fail.Fail];
+pub fun doc_read(alloc: *A.Allocator, sources: *base_source.SourceMap, path: str) res[Doc, fail.Fail]
 ```
 
 the manifest file at `path` read and parsed as `doc_parse` parses it; a file
 that cannot be read is refused as a path the project names
 
-## val MANIFEST_FILE
+### doc_dnit
 
 ```mach
-pub val MANIFEST_FILE: str = "mach.toml"
-```
-
-the file name of a project manifest, looked up in a project root
-
-## fun parse_text
-
-```mach
-pub fun parse_text(alloc: *A.Allocator, itn: *intern.Interner, sources: *base_source.SourceMap, path: str, text: str) res[Manifest, fail.Fail];
-```
-
-the manifest `text`, read from `path`, parsed and checked
-
-alloc: owns the manifest, released with `dnit`, and a refusal's text
-itn: interns its names
-sources: receives the text, which a refusal points into
-ret: the manifest; err as the text does not parse or fails a check
-
-## fun read_at
-
-```mach
-pub fun read_at(alloc: *A.Allocator, itn: *intern.Interner, sources: *base_source.SourceMap, dir: str) res[Manifest, fail.Fail];
-```
-
-the manifest of the project rooted at `dir`, read off disk and parsed
-
-alloc: owns the manifest, released with `dnit`, and a refusal's text
-itn: interns its names
-sources: receives the text, which a refusal points into
-dir: the project root, which holds MANIFEST_FILE
-ret: the manifest; err from the environment when it cannot be read, else as
-         it does not parse or fails a check
-
-## fun doc_dnit
-
-```mach
-pub fun doc_dnit(alloc: *A.Allocator, d: *Doc);
+pub fun doc_dnit(alloc: *A.Allocator, d: *Doc)
 ```
 
 release a doc and everything it owns
 
-## fun check
+## Functions
+
+### project_parse
 
 ```mach
-pub fun check(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[fail.Fail];
+pub fun project_parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml_value.Table, m: *Manifest) err[fail.Fail]
+```
+
+the `[project]` table of a parsed TOML document alone, held to its rows as
+`parse` holds it, for a reader such as `mach fmt` that needs nothing else
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | owns the refusal's text |
+| `itn` | receives the table's strings |
+| `t` | the document root |
+| `m` | receives the project fields |
+| **returns** | ok, or the first refusal |
+
+### source_load
+
+```mach
+pub fun source_load(alloc: *A.Allocator, sources: *base_source.SourceMap, path: str, data: *u8, n: usize) res[base_source.FileId, fail.Fail]
+```
+
+the `n` bytes at `data`, the file at `path`, loaded into `sources` so a refusal can point
+into them; a NUL ends the text the map holds, and a refusal at it points at its end
+
+### parse_text
+
+```mach
+pub fun parse_text(alloc: *A.Allocator, itn: *intern.Interner, sources: *base_source.SourceMap, path: str, text: str) res[Manifest, fail.Fail]
+```
+
+the manifest `text`, read from `path`, parsed and checked
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | owns the manifest, released with `dnit`, and a refusal's text |
+| `itn` | interns its names |
+| `sources` | receives the text, which a refusal points into |
+| **returns** | the manifest; err as the text does not parse or fails a check |
+
+### read_at
+
+```mach
+pub fun read_at(alloc: *A.Allocator, itn: *intern.Interner, sources: *base_source.SourceMap, dir: str) res[Manifest, fail.Fail]
+```
+
+the manifest of the project rooted at `dir`, read off disk and parsed
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | owns the manifest, released with `dnit`, and a refusal's text |
+| `itn` | interns its names |
+| `sources` | receives the text, which a refusal points into |
+| `dir` | the project root, which holds MANIFEST_FILE |
+| **returns** | the manifest; err from the environment when it cannot be read, else as it does not parse or fails a check |
+
+### check
+
+```mach
+pub fun check(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[fail.Fail]
 ```
 
 the checks every manifest model passes, whether decoded from mach.toml or made by an entry
 build: the rules that span its entries and values, then the host target it builds for where
 it declares none
 
-alloc: owns the model's arrays and a refusal's text
-itn: holds the model's strings
-m: the model, which gains its native target where it declares none
-ret: ok, or the first refusal
+| Parameter | |
+| :--- | :--- |
+| `alloc` | owns the model's arrays and a refusal's text |
+| `itn` | holds the model's strings |
+| `m` | the model, which gains its native target where it declares none |
+| **returns** | ok, or the first refusal |
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `MANIFEST_FILE` | `str` | `"mach.toml"` | the file name of a project manifest, looked up in a project root |
 

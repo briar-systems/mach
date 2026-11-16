@@ -1,32 +1,47 @@
+[mach](../../README.md) / [cli](../README.md) / [cmd](README.md) / **migrate**
+
 # mach.cli.cmd.migrate
 
-## val COMMAND
+`mach migrate`, which rewrites a project's manifest and source to this major's spelling
+
+a script that may run mach beside the source, and a step whose `argv` runs mach, is read
+for removed options, which are reported and never rewritten. under `--check` nothing is
+written.
+
+<sub>source: [`src/cli/cmd/migrate.mach`](../../../../src/cli/cmd/migrate.mach) · imported by 1 module</sub>
+
+<sub>`args` is [`mach.cli.args`](../args.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `std_args` is `std.args`</sub>
+
+| Functions | |
+| :--- | :--- |
+| [`run`](#run) | `mach migrate [<path>] [--check]` |
+
+| Constants | |
+| :--- | :--- |
+| [`COMMAND`](#constants) | `mach migrate` |
+| [`POLICY`](#constants) | what mach holds `mach migrate` to beyond the parse |
+
+---
+
+## Functions
+
+### run
 
 ```mach
-pub val COMMAND: std_args.Command = std_args.Command;
-```
-
-`mach migrate`
-
-## val POLICY
-
-```mach
-pub val POLICY: args.Policy = args.Policy;
-```
-
-what mach holds `mach migrate` to beyond the parse
-
-## fun run
-
-```mach
-pub fun run(cx: *args.Call) res[i64, fail.Fail];
+pub fun run(cx: *args.Call) res[i64, fail.Fail]
 ```
 
 `mach migrate [<path>] [--check]`
 
-cx: the call
-ret: exit.OK when the project is in this major's spelling (or was made so), exit.USER when a
-     file would change under --check, or in either mode when the manifest still writes a
-     removed key no rewrite migrates or a source could not be read as one; a script's or a
-     step's removed option is reported and fails nothing. otherwise the failure
+| Parameter | |
+| :--- | :--- |
+| `cx` | the call |
+| **returns** | exit.OK when the project is in this major's spelling (or was made so), exit.USER when a file would change under --check, or in either mode when the manifest still writes a removed key no rewrite migrates or a source could not be read as one; a script's or a step's removed option is reported and fails nothing. otherwise the failure |
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `COMMAND` | `std_args.Command` | `std_args.Command{name: "migrate", aliases: args.NO_WORDS, help: "rewrite a project into this major's spelling", usage: "[<path>]", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: 1, passthrough: false}` | `mach migrate` |
+| `POLICY` | `args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach migrate` to beyond the parse |
 

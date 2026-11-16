@@ -1,3 +1,5 @@
+[mach](../README.md) / [base](README.md) / **wide**
+
 # mach.base.wide
 
 128-bit integer carrier over two u64 limbs
@@ -7,269 +9,299 @@ exact arithmetic behind 128-bit literals, comptime evaluation, constant
 folding and IR constants. every operation is total: wrapping where the name
 says so, flagged where the caller must know, never undefined.
 
-## rec Wide
+<sub>source: [`src/base/wide.mach`](../../../src/base/wide.mach) · imported by 19 modules</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Wide`](#wide) | `rec` |  |
+| [`QuotRem`](#quotrem) | `rec` | a quotient and its remainder |
+
+| On `Wide` | |
+| :--- | :--- |
+| [`zero`](#zero) · [`make`](#make) · [`from_u64`](#from_u64) · [`from_i64`](#from_i64) · [`is_zero`](#is_zero) · [`eq`](#eq) · [`lt_u`](#lt_u) · [`lt_s`](#lt_s) · [`is_negative`](#is_negative) · [`add`](#add) · [`sub`](#sub) · [`neg`](#neg) · [`max_u`](#max_u) · [`min_s`](#min_s) · [`not`](#not) · [`and`](#and) · [`or`](#or) · [`xor`](#xor) · [`mul_u64`](#mul_u64) · [`mul`](#mul) | |
+| [`divmod_u`](#divmod_u) | a / b and a % b unsigned, none when b is zero |
+| [`divmod_s`](#divmod_s) | a / b and a % b signed, rounding toward zero, none when b is zero |
+| [`quot_rem_u`](#quot_rem_u) | a / b and a % b unsigned |
+| [`quot_rem_s`](#quot_rem_s) | a / b and a % b signed, rounding toward zero, total over a nonzero `b` as quot_rem_u is |
+| [`shl`](#shl) · [`shr_u`](#shr_u) · [`shr_s`](#shr_s) · [`trunc`](#trunc) · [`sext`](#sext) · [`fits_unsigned`](#fits_unsigned) | |
+| [`fits_signed`](#fits_signed) | whether `a`, read as signed, lies in the range of a signed `bits`-wide integer, `bits` in 1..128 |
+| [`bit_length`](#bit_length) · [`trailing_zeros`](#trailing_zeros) · [`is_pow2`](#is_pow2) · [`mul_add_small`](#mul_add_small) · [`format_u`](#format_u) | |
+| [`text_u`](#text_u) | the decimal text of an unsigned value, terminated, in a FORMAT_CAP buffer |
+| [`text_s`](#text_s) | the decimal text of a signed value, terminated, in a FORMAT_CAP buffer |
+
+| Constants | |
+| :--- | :--- |
+| [`FORMAT_CAP`](#constants) | room for any formatted value: a sign, 39 decimal digits and the terminator |
+
+---
+
+## Wide
 
 ```mach
-pub rec Wide;
+pub rec Wide {
+    lo: u64;
+    hi: u64;
+}
 ```
 
-## fun zero
+### zero
 
 ```mach
-pub fun zero() Wide;
+pub fun zero() Wide
 ```
 
-## fun make
+### make
 
 ```mach
-pub fun make(lo: u64, hi: u64) Wide;
+pub fun make(lo: u64, hi: u64) Wide
 ```
 
-## fun from_u64
+### from_u64
 
 ```mach
-pub fun from_u64(v: u64) Wide;
+pub fun from_u64(v: u64) Wide
 ```
 
-## fun from_i64
+### from_i64
 
 ```mach
-pub fun from_i64(v: i64) Wide;
+pub fun from_i64(v: i64) Wide
 ```
 
-## fun is_zero
+### is_zero
 
 ```mach
-pub fun is_zero(a: Wide) bool;
+pub fun is_zero(a: Wide) bool
 ```
 
-## fun eq
+### eq
 
 ```mach
-pub fun eq(a: Wide, b: Wide) bool;
+pub fun eq(a: Wide, b: Wide) bool
 ```
 
-## fun lt_u
+### lt_u
 
 ```mach
-pub fun lt_u(a: Wide, b: Wide) bool;
+pub fun lt_u(a: Wide, b: Wide) bool
 ```
 
-## fun lt_s
+### lt_s
 
 ```mach
-pub fun lt_s(a: Wide, b: Wide) bool;
+pub fun lt_s(a: Wide, b: Wide) bool
 ```
 
-## fun is_negative
+### is_negative
 
 ```mach
-pub fun is_negative(a: Wide) bool;
+pub fun is_negative(a: Wide) bool
 ```
 
-## fun add
+### add
 
 ```mach
-pub fun add(a: Wide, b: Wide) Wide;
+pub fun add(a: Wide, b: Wide) Wide
 ```
 
-## fun sub
+### sub
 
 ```mach
-pub fun sub(a: Wide, b: Wide) Wide;
+pub fun sub(a: Wide, b: Wide) Wide
 ```
 
-## fun neg
+### neg
 
 ```mach
-pub fun neg(a: Wide) Wide;
+pub fun neg(a: Wide) Wide
 ```
 
-## fun max_u
+### max_u
 
 ```mach
-pub fun max_u() Wide;
+pub fun max_u() Wide
 ```
 
-## fun min_s
+### min_s
 
 ```mach
-pub fun min_s() Wide;
+pub fun min_s() Wide
 ```
 
-## fun not
+### not
 
 ```mach
-pub fun not(a: Wide) Wide;
+pub fun not(a: Wide) Wide
 ```
 
-## fun and
+### and
 
 ```mach
-pub fun and(a: Wide, b: Wide) Wide;
+pub fun and(a: Wide, b: Wide) Wide
 ```
 
-## fun or
+### or
 
 ```mach
-pub fun or (a: Wide, b: Wide) Wide;
+pub fun or (a: Wide, b: Wide) Wide
 ```
 
-## fun xor
+### xor
 
 ```mach
-pub fun xor(a: Wide, b: Wide) Wide;
+pub fun xor(a: Wide, b: Wide) Wide
 ```
 
-## fun mul_u64
+### mul_u64
 
 ```mach
-pub fun mul_u64(a: u64, b: u64) Wide;
+pub fun mul_u64(a: u64, b: u64) Wide
 ```
 
-## fun mul
+### mul
 
 ```mach
-pub fun mul(a: Wide, b: Wide) Wide;
+pub fun mul(a: Wide, b: Wide) Wide
 ```
 
-## rec QuotRem
+### divmod_u
 
 ```mach
-pub rec QuotRem;
-```
-
-a quotient and its remainder
-
-## fun divmod_u
-
-```mach
-pub fun divmod_u(a: Wide, b: Wide) opt[QuotRem];
+pub fun divmod_u(a: Wide, b: Wide) opt[QuotRem]
 ```
 
 a / b and a % b unsigned, none when b is zero
 
-## fun divmod_s
+### divmod_s
 
 ```mach
-pub fun divmod_s(a: Wide, b: Wide) opt[QuotRem];
+pub fun divmod_s(a: Wide, b: Wide) opt[QuotRem]
 ```
 
 a / b and a % b signed, rounding toward zero, none when b is zero
 
-## fun quot_rem_u
+### quot_rem_u
 
 ```mach
-pub fun quot_rem_u(a: Wide, b: Wide) QuotRem;
+pub fun quot_rem_u(a: Wide, b: Wide) QuotRem
 ```
 
 a / b and a % b unsigned. total over a nonzero `b`: a zero divisor is a
 broken precondition of the caller, and it stops the compiler
 
-## fun quot_rem_s
+### quot_rem_s
 
 ```mach
-pub fun quot_rem_s(a: Wide, b: Wide) QuotRem;
+pub fun quot_rem_s(a: Wide, b: Wide) QuotRem
 ```
 
 a / b and a % b signed, rounding toward zero, total over a nonzero `b` as
 quot_rem_u is
 
-## fun shl
+### shl
 
 ```mach
-pub fun shl(a: Wide, n: u32) Wide;
+pub fun shl(a: Wide, n: u32) Wide
 ```
 
-## fun shr_u
+### shr_u
 
 ```mach
-pub fun shr_u(a: Wide, n: u32) Wide;
+pub fun shr_u(a: Wide, n: u32) Wide
 ```
 
-## fun shr_s
+### shr_s
 
 ```mach
-pub fun shr_s(a: Wide, n: u32) Wide;
+pub fun shr_s(a: Wide, n: u32) Wide
 ```
 
-## fun trunc
+### trunc
 
 ```mach
-pub fun trunc(a: Wide, bits: u32) Wide;
+pub fun trunc(a: Wide, bits: u32) Wide
 ```
 
-## fun sext
+### sext
 
 ```mach
-pub fun sext(a: Wide, bits: u32) Wide;
+pub fun sext(a: Wide, bits: u32) Wide
 ```
 
-## fun fits_unsigned
+### fits_unsigned
 
 ```mach
-pub fun fits_unsigned(a: Wide, bits: u32) bool;
+pub fun fits_unsigned(a: Wide, bits: u32) bool
 ```
 
-## fun fits_signed
+### fits_signed
 
 ```mach
-pub fun fits_signed(a: Wide, bits: u32) bool;
+pub fun fits_signed(a: Wide, bits: u32) bool
 ```
 
 whether `a`, read as signed, lies in the range of a signed `bits`-wide integer, `bits` in 1..128
 
-## fun bit_length
+### bit_length
 
 ```mach
-pub fun bit_length(a: Wide) u32;
+pub fun bit_length(a: Wide) u32
 ```
 
-## fun trailing_zeros
+### trailing_zeros
 
 ```mach
-pub fun trailing_zeros(a: Wide) u32;
+pub fun trailing_zeros(a: Wide) u32
 ```
 
-## fun is_pow2
+### is_pow2
 
 ```mach
-pub fun is_pow2(a: Wide) bool;
+pub fun is_pow2(a: Wide) bool
 ```
 
-## fun mul_add_small
+### mul_add_small
 
 ```mach
-pub fun mul_add_small(a: Wide, m: u64, d: u64, overflow: *bool) Wide;
+pub fun mul_add_small(a: Wide, m: u64, d: u64, overflow: *bool) Wide
 ```
 
-## fun format_u
+### format_u
 
 ```mach
-pub fun format_u(a: Wide, buf: *u8, cap: usize) usize;
+pub fun format_u(a: Wide, buf: *u8, cap: usize) usize
 ```
 
-## val FORMAT_CAP
+### text_u
 
 ```mach
-pub val FORMAT_CAP: usize = 41
-```
-
-room for any formatted value: a sign, 39 decimal digits and the terminator
-
-## fun text_u
-
-```mach
-pub fun text_u(a: Wide, buf: *u8) str;
+pub fun text_u(a: Wide, buf: *u8) str
 ```
 
 the decimal text of an unsigned value, terminated, in a FORMAT_CAP buffer
 
-## fun text_s
+### text_s
 
 ```mach
-pub fun text_s(a: Wide, buf: *u8) str;
+pub fun text_s(a: Wide, buf: *u8) str
 ```
 
 the decimal text of a signed value, terminated, in a FORMAT_CAP buffer
+
+## QuotRem
+
+```mach
+pub rec QuotRem {
+    q: Wide;
+    r: Wide;
+}
+```
+
+a quotient and its remainder
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `FORMAT_CAP` | `usize` | `41` | room for any formatted value: a sign, 39 decimal digits and the terminator |
 

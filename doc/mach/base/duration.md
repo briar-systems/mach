@@ -1,43 +1,78 @@
+[mach](../README.md) / [base](README.md) / **duration**
+
 # mach.base.duration
 
-## val FORMS
+durations written as `<n>ms`, `<n>s`, `<n>m` or `<n>h`, parsed and rendered back
+
+the form the command line's `--timeout` and a manifest step's `timeout` take.
+
+<sub>source: [`src/base/duration.mach`](../../../src/base/duration.mach) · imported by 5 modules</sub>
+
+<sub>`chrono_duration` is `std.chrono.duration`</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Text`](#text) | `rec` | a duration in the largest unit of parse's that divides it exactly n:    the count unit: "h", "m", "s" or "ms"; "ns" when d is not a whole number of milliseconds |
+
+| On `Text` | |
+| :--- | :--- |
+| [`text`](#text-1) | render d in the form parse reads back |
+
+| Functions | |
+| :--- | :--- |
+| [`parse`](#parse) | parse a duration: a positive decimal integer followed by one of the units ms, s, m or h |
+
+| Constants | |
+| :--- | :--- |
+| [`FORMS`](#constants) | the accepted forms of a duration, for error messages |
+
+---
+
+## Text
 
 ```mach
-pub val FORMS: str = "<n>ms, <n>s, <n>m or <n>h, with n a positive integer"
-```
-
-the accepted forms of a duration, for error messages
-
-## fun parse
-
-```mach
-pub fun parse(s: *u8) opt[chrono_duration.Duration];
-```
-
-parse a duration: a positive decimal integer followed by one of the
-units ms, s, m or h
-
-s: the argument
-ret: the duration; none when s is malformed, zero, or overflows
-
-## rec Text
-
-```mach
-pub rec Text;
+pub rec Text {
+    n:    i64;
+    unit: str;
+}
 ```
 
 a duration in the largest unit of parse's that divides it exactly
 n:    the count
 unit: "h", "m", "s" or "ms"; "ns" when d is not a whole number of milliseconds
 
-## fun text
+### text
 
 ```mach
-pub fun text(d: chrono_duration.Duration) Text;
+pub fun text(d: chrono_duration.Duration) Text
 ```
 
 render d in the form parse reads back
 
-d: the duration
-ret: the count and its unit
+| Parameter | |
+| :--- | :--- |
+| `d` | the duration |
+| **returns** | the count and its unit |
+
+## Functions
+
+### parse
+
+```mach
+pub fun parse(s: *u8) opt[chrono_duration.Duration]
+```
+
+parse a duration: a positive decimal integer followed by one of the
+units ms, s, m or h
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the argument |
+| **returns** | the duration; none when s is malformed, zero, or overflows |
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `FORMS` | `str` | `"<n>ms, <n>s, <n>m or <n>h, with n a positive integer"` | the accepted forms of a duration, for error messages |
 

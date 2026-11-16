@@ -1,111 +1,66 @@
+[mach](../../README.md) / [cli](../README.md) / [cmd](README.md) / **dep**
+
 # mach.cli.cmd.dep
 
-## val LIST
+`mach dep` and its actions: list, add, remove, update, pull, outdated and verify
+
+each action's flags are read here and its work is the package manager's (mach.package).
+
+<sub>source: [`src/cli/cmd/dep.mach`](../../../../src/cli/cmd/dep.mach) · imported by 1 module</sub>
+
+<sub>`args` is [`mach.cli.args`](../args.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `std_args` is `std.args`</sub>
+
+| Functions | |
+| :--- | :--- |
+| [`run`](#run) | `mach dep`: route to one action: list, add, remove, update, pull, verify or outdated, each a command over the dependency manager (mach.package) that renders what it reports |
+
+| Constants | |
+| :--- | :--- |
+| [`LIST`](#constants) | `mach dep list` |
+| [`ADD`](#constants) | `mach dep add` |
+| [`REMOVE`](#constants) | `mach dep remove` |
+| [`UPDATE`](#constants) | `mach dep update` |
+| [`PULL`](#constants) | `mach dep pull` |
+| [`OUTDATED`](#constants) | `mach dep outdated` |
+| [`VERIFY`](#constants) | `mach dep verify` |
+| [`ADD_POLICY`](#constants) | what mach holds `mach dep add` to beyond the parse |
+| [`UPDATE_POLICY`](#constants) | what mach holds `mach dep update` to beyond the parse |
+| [`VERIFY_POLICY`](#constants) | what mach holds `mach dep verify` to beyond the parse |
+| [`POLICY`](#constants) | what mach holds `mach dep` and its other actions to beyond the parse |
+| [`COMMAND`](#constants) | `mach dep` |
+
+---
+
+## Functions
+
+### run
 
 ```mach
-pub val LIST: std_args.Command = std_args.Command;
-```
-
-`mach dep list`
-
-## val ADD
-
-```mach
-pub val ADD: std_args.Command = std_args.Command;
-```
-
-`mach dep add`
-
-## val REMOVE
-
-```mach
-pub val REMOVE: std_args.Command = std_args.Command;
-```
-
-`mach dep remove`
-
-## val UPDATE
-
-```mach
-pub val UPDATE: std_args.Command = std_args.Command;
-```
-
-`mach dep update`
-
-## val PULL
-
-```mach
-pub val PULL: std_args.Command = std_args.Command;
-```
-
-`mach dep pull`
-
-## val OUTDATED
-
-```mach
-pub val OUTDATED: std_args.Command = std_args.Command;
-```
-
-`mach dep outdated`
-
-## val VERIFY
-
-```mach
-pub val VERIFY: std_args.Command = std_args.Command;
-```
-
-`mach dep verify`
-
-## val ADD_POLICY
-
-```mach
-pub val ADD_POLICY: args.Policy = args.Policy;
-```
-
-what mach holds `mach dep add` to beyond the parse
-
-## val UPDATE_POLICY
-
-```mach
-pub val UPDATE_POLICY: args.Policy = args.Policy;
-```
-
-what mach holds `mach dep update` to beyond the parse
-
-## val VERIFY_POLICY
-
-```mach
-pub val VERIFY_POLICY: args.Policy = args.Policy;
-```
-
-what mach holds `mach dep verify` to beyond the parse
-
-## val POLICY
-
-```mach
-pub val POLICY: args.Policy = args.Policy;
-```
-
-what mach holds `mach dep` and its other actions to beyond the parse
-
-## val COMMAND
-
-```mach
-pub val COMMAND: std_args.Command = std_args.Command;
-```
-
-`mach dep`
-
-## fun run
-
-```mach
-pub fun run(cx: *args.Call) res[i64, fail.Fail];
+pub fun run(cx: *args.Call) res[i64, fail.Fail]
 ```
 
 `mach dep`: route to one action: list, add, remove, update, pull, verify or outdated, each a
 command over the dependency manager (mach.package) that renders what it reports
 
-cx: the call, its action read and its operands counted
-ret: exit.OK, the code `exit.of` maps the action's rendered failure to, or the failure that
-     kept the action from starting
+| Parameter | |
+| :--- | :--- |
+| `cx` | the call, its action read and its operands counted |
+| **returns** | exit.OK, the code `exit.of` maps the action's rendered failure to, or the failure that kept the action from starting |
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `LIST` | `std_args.Command` | `std_args.Command{name: "list", aliases: args.NO_WORDS, help: "list declared dependencies and their state", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?PLAIN_FLAGS[0], size: 3}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach dep list` |
+| `ADD` | `std_args.Command` | `std_args.Command{name: "add", aliases: args.NO_WORDS, help: "declare a dependency", usage: "<path> <name> (--git <url> [--ref <ref> \| --range <range>] \| --path <dir>)", flags: Slice[*std_args.Flag]{data: ?ADD_FLAGS[0], size: 8}, commands: args.NO_COMMANDS, operand_min: 2, operand_max: 2, passthrough: false}` | `mach dep add` |
+| `REMOVE` | `std_args.Command` | `std_args.Command{name: "remove", aliases: args.NO_WORDS, help: "remove a dependency", usage: "<path> <name>", flags: Slice[*std_args.Flag]{data: ?REMOVE_FLAGS[0], size: 4}, commands: args.NO_COMMANDS, operand_min: 2, operand_max: 2, passthrough: false}` | `mach dep remove` |
+| `UPDATE` | `std_args.Command` | `std_args.Command{name: "update", aliases: args.NO_WORDS, help: "advance dependencies to their newest selected revisions", usage: "<path> (<name> \| --all)", flags: Slice[*std_args.Flag]{data: ?UPDATE_FLAGS[0], size: 6}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 2, passthrough: false}` | `mach dep update` |
+| `PULL` | `std_args.Command` | `std_args.Command{name: "pull", aliases: args.NO_WORDS, help: "realize dependencies at their pinned revisions", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?PLAIN_FLAGS[0], size: 3}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach dep pull` |
+| `OUTDATED` | `std_args.Command` | `std_args.Command{name: "outdated", aliases: args.NO_WORDS, help: "report pinned, compatible and latest releases", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?OUTDATED_FLAGS[0], size: 4}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach dep outdated` |
+| `VERIFY` | `std_args.Command` | `std_args.Command{name: "verify", aliases: args.NO_WORDS, help: "check the realized dependencies against the manifest", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?VERIFY_FLAGS[0], size: 4}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach dep verify` |
+| `ADD_POLICY` | `args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: Slice[args.Conflict]{data: ?ADD_CONFLICTS[0], size: ADD_CONFLICTS_N}}` | what mach holds `mach dep add` to beyond the parse |
+| `UPDATE_POLICY` | `args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach dep update` to beyond the parse |
+| `VERIFY_POLICY` | `args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach dep verify` to beyond the parse |
+| `POLICY` | `args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach dep` and its other actions to beyond the parse |
+| `COMMAND` | `std_args.Command` | `std_args.Command{name: "dep", aliases: args.NO_WORDS, help: "manage project dependencies", usage: "", flags: Slice[*std_args.Flag]{data: ?PLAIN_FLAGS[0], size: 3}, commands: Slice[*std_args.Command]{data: ?ACTIONS[0], size: ACTIONS_N}, operand_min: 0, operand_max: 0, passthrough: false}` | `mach dep` |
 

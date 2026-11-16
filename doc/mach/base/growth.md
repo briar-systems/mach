@@ -1,3 +1,5 @@
+[mach](../README.md) / [base](README.md) / **growth**
+
 # mach.base.growth
 
 the compiler's one growth routine for arrays it keeps as a pointer and a
@@ -12,43 +14,60 @@ was: the old storage and capacity stay valid and nothing moved. a capacity
 that cannot count what is needed, or a byte size that overflows, refuses
 with overflow; otherwise the refusal is the allocator's.
 
-## val MINIMUM
+<sub>source: [`src/base/growth.mach`](../../../src/base/growth.mach) · imported by 20 modules</sub>
+
+<sub>`A` is `std.allocator`</sub>
+
+| Functions | |
+| :--- | :--- |
+| [`reserve`](#reserve) | grow the array at `data`, of `cap` elements, so it holds at least `needed` |
+| [`reserve_usize`](#reserve_usize) | reserve for an array whose capacity is a usize |
+| [`resize`](#resize) | give the array at `data`, of `cap` elements, exactly `count`; zero releases it |
+| [`resize_usize`](#resize_usize) | resize for an array whose capacity is a usize |
+
+| Constants | |
+| :--- | :--- |
+| [`MINIMUM`](#constants) | the first capacity reserve gives an empty array |
+
+---
+
+## Functions
+
+### reserve
 
 ```mach
-pub val MINIMUM: usize = 8
-```
-
-the first capacity reserve gives an empty array
-
-## fun reserve
-
-```mach
-pub fun reserve[T](a: *A.Allocator, data: **T, cap: *u32, needed: usize) err[A.Error];
+pub fun reserve[T](a: *A.Allocator, data: **T, cap: *u32, needed: usize) err[A.Error]
 ```
 
 grow the array at `data`, of `cap` elements, so it holds at least `needed`
 
-## fun reserve_usize
+### reserve_usize
 
 ```mach
-pub fun reserve_usize[T](a: *A.Allocator, data: **T, cap: *usize, needed: usize) err[A.Error];
+pub fun reserve_usize[T](a: *A.Allocator, data: **T, cap: *usize, needed: usize) err[A.Error]
 ```
 
 reserve for an array whose capacity is a usize
 
-## fun resize
+### resize
 
 ```mach
-pub fun resize[T](a: *A.Allocator, data: **T, cap: *u32, count: usize) err[A.Error];
+pub fun resize[T](a: *A.Allocator, data: **T, cap: *u32, count: usize) err[A.Error]
 ```
 
 give the array at `data`, of `cap` elements, exactly `count`; zero releases it
 
-## fun resize_usize
+### resize_usize
 
 ```mach
-pub fun resize_usize[T](a: *A.Allocator, data: **T, cap: *usize, count: usize) err[A.Error];
+pub fun resize_usize[T](a: *A.Allocator, data: **T, cap: *usize, count: usize) err[A.Error]
 ```
 
 resize for an array whose capacity is a usize
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `MINIMUM` | `usize` | `8` | the first capacity reserve gives an empty array |
 

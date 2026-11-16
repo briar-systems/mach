@@ -1,110 +1,106 @@
+[mach](../../README.md) / [front](../README.md) / [comptime](README.md) / **failure**
+
 # mach.front.comptime.failure
 
 why a comptime evaluation has no value: refused for good, waiting on a later phase or
 an instance, or failed inside the compiler
 
-## def EvalFailKind
+<sub>source: [`src/front/comptime/failure.mach`](../../../../src/front/comptime/failure.mach) · imported by 25 modules</sub>
+
+<sub>`diagnostic_kind` is [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md) · `fail` is [`mach.base.fail`](../../base/fail.md) · `A` is `std.allocator` · `diagnostic` is [`mach.base.diagnostic`](../../base/diagnostic.md) · `base_source` is [`mach.base.source`](../../base/source.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`EvalFailKind`](#evalfailkind) | `def` |  |
+| [`EvalFail`](#evalfail) | `rec` | diag: the diagnostic kind the failure is reported as, where it reaches the user |
+
+| On `EvalFailKind` | |
+| :--- | :--- |
+| [`EVAL_FAIL_NONE`](#evalfailkind) · [`EVAL_FAIL_REJECTED`](#evalfailkind) · [`EVAL_FAIL_UNBOUND`](#evalfailkind) · [`EVAL_FAIL_NEEDS_MEMBER`](#evalfailkind) · [`EVAL_FAIL_NEEDS_TYPES`](#evalfailkind) · [`EVAL_FAIL_NEEDS_LAYOUT`](#evalfailkind) · [`EVAL_FAIL_INTERNAL`](#evalfailkind) · [`EVAL_FAIL_NEEDS_INSTANCE`](#evalfailkind) · [`EVAL_FAIL_NOT_INTEGER`](#evalfailkind) · [`eval_error`](#eval_error) · [`not_constant`](#not_constant) | |
+
+| On `EvalFail` | |
+| :--- | :--- |
+| [`eval_internal`](#eval_internal) | an internal failure of the evaluator, a compiler defect wherever it surfaces |
+| [`eval_from_fail`](#eval_from_fail) | |
+| [`eval_from_refusal`](#eval_from_refusal) | a failure a walk with no place of its own returned to an evaluation: a refusal of the input is rejected under its own kind, which the evaluation reports at the node it stands on, and any other failure reads as eval_from_fail reads it |
+| [`stands_alone`](#stands_alone) | whether a failure of a global initializer's own evaluation means it is no constant: it needs a value, a member, the types or a layout no constant gives it a refusal reported as itself wherever a compile-time value was asked for, since it says why no value exists better than the asker can: a secret |
+
+| Functions | |
+| :--- | :--- |
+| [`init_not_constant_report`](#init_not_constant_report) | reports the initializer at `span` of the global `name` as no constant, the one report check and lowering both give it; a decorator argument has no name |
+
+---
+
+## EvalFailKind
 
 ```mach
 pub def EvalFailKind: u8
 ```
 
-## val EVAL_FAIL_NONE
+| Name | Value | |
+| :--- | :--- | :--- |
+| `EVAL_FAIL_NONE` | `0` |  |
+| `EVAL_FAIL_REJECTED` | `1` |  |
+| `EVAL_FAIL_UNBOUND` | `2` |  |
+| `EVAL_FAIL_NEEDS_MEMBER` | `3` |  |
+| `EVAL_FAIL_NEEDS_TYPES` | `4` |  |
+| `EVAL_FAIL_NEEDS_LAYOUT` | `5` |  |
+| `EVAL_FAIL_INTERNAL` | `6` |  |
+| `EVAL_FAIL_NEEDS_INSTANCE` | `7` |  |
+| `EVAL_FAIL_NOT_INTEGER` | `8` |  |
+
+### eval_error
 
 ```mach
-pub val EVAL_FAIL_NONE:           EvalFailKind = 0
+pub fun eval_error(kind: EvalFailKind, diag: diagnostic_kind.Kind, message: str) EvalFail
 ```
 
-## val EVAL_FAIL_REJECTED
+### not_constant
 
 ```mach
-pub val EVAL_FAIL_REJECTED:       EvalFailKind = 1
+pub fun not_constant(kind: EvalFailKind) bool
 ```
 
-## val EVAL_FAIL_UNBOUND
+## EvalFail
 
 ```mach
-pub val EVAL_FAIL_UNBOUND:        EvalFailKind = 2
-```
-
-## val EVAL_FAIL_NEEDS_MEMBER
-
-```mach
-pub val EVAL_FAIL_NEEDS_MEMBER:   EvalFailKind = 3
-```
-
-## val EVAL_FAIL_NEEDS_TYPES
-
-```mach
-pub val EVAL_FAIL_NEEDS_TYPES:    EvalFailKind = 4
-```
-
-## val EVAL_FAIL_NEEDS_LAYOUT
-
-```mach
-pub val EVAL_FAIL_NEEDS_LAYOUT:   EvalFailKind = 5
-```
-
-## val EVAL_FAIL_INTERNAL
-
-```mach
-pub val EVAL_FAIL_INTERNAL:       EvalFailKind = 6
-```
-
-## val EVAL_FAIL_NEEDS_INSTANCE
-
-```mach
-pub val EVAL_FAIL_NEEDS_INSTANCE: EvalFailKind = 7
-```
-
-## val EVAL_FAIL_NOT_INTEGER
-
-```mach
-pub val EVAL_FAIL_NOT_INTEGER:    EvalFailKind = 8
-```
-
-## rec EvalFail
-
-```mach
-pub rec EvalFail;
+pub rec EvalFail {
+    kind:    EvalFailKind;
+    diag:    diagnostic_kind.Kind;
+    message: str;
+}
 ```
 
 diag: the diagnostic kind the failure is reported as, where it reaches the user
 
-## fun eval_error
+### eval_internal
 
 ```mach
-pub fun eval_error(kind: EvalFailKind, diag: diagnostic_kind.Kind, message: str) EvalFail;
-```
-
-## fun eval_internal
-
-```mach
-pub fun eval_internal(message: str) EvalFail;
+pub fun eval_internal(message: str) EvalFail
 ```
 
 an internal failure of the evaluator, a compiler defect wherever it surfaces
 
-## fun eval_from_fail
+### eval_from_fail
 
 ```mach
-pub fun eval_from_fail(f: fail.Fail, diag: diagnostic_kind.Kind, rejected_message: str) EvalFail;
+pub fun eval_from_fail(f: fail.Fail, diag: diagnostic_kind.Kind, rejected_message: str) EvalFail
 ```
 
-## fun eval_from_refusal
+### eval_from_refusal
 
 ```mach
-pub fun eval_from_refusal(f: fail.Fail, diag: diagnostic_kind.Kind, rejected_message: str) EvalFail;
+pub fun eval_from_refusal(f: fail.Fail, diag: diagnostic_kind.Kind, rejected_message: str) EvalFail
 ```
 
 a failure a walk with no place of its own returned to an evaluation: a refusal of the input
 is rejected under its own kind, which the evaluation reports at the node it stands on, and
 any other failure reads as eval_from_fail reads it
 
-## fun stands_alone
+### stands_alone
 
 ```mach
-pub fun stands_alone(f: EvalFail) bool;
+pub fun stands_alone(f: EvalFail) bool
 ```
 
 whether a failure of a global initializer's own evaluation means it is no constant: it needs a
@@ -112,16 +108,12 @@ value, a member, the types or a layout no constant gives it
 a refusal reported as itself wherever a compile-time value was asked for, since it says why no
 value exists better than the asker can: a secret
 
-## fun not_constant
+## Functions
+
+### init_not_constant_report
 
 ```mach
-pub fun not_constant(kind: EvalFailKind) bool;
-```
-
-## fun init_not_constant_report
-
-```mach
-pub fun init_not_constant_report(alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore, file: base_source.FileId, span: base_source.Span, name: opt[str]) err[fail.Fail];
+pub fun init_not_constant_report(alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore, file: base_source.FileId, span: base_source.Span, name: opt[str]) err[fail.Fail]
 ```
 
 reports the initializer at `span` of the global `name` as no constant, the one report check

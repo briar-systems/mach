@@ -1,3 +1,5 @@
+[mach](../README.md) / [compile](README.md) / **cache**
+
 # mach.compile.cache
 
 the persistent object cache. every module the build emits is keyed once per
@@ -25,11 +27,108 @@ directory (compile/cache/memo) keeps only what a text's digest names. an
 object is reused only when its bytes hash to what the build that wrote it
 recorded (compile/cache/objects)
 
-## fun configuration
+<sub>source: [`src/compile/cache.mach`](../../../src/compile/cache.mach) · imported by 5 modules</sub>
+
+<sub>`cache_key` is [`mach.compile.cache.key`](cache/key.md) · `project` is [`mach.compile.project`](project.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `module` is [`mach.session.module`](../session/module.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `A` is `std.allocator` · `compiler` is [`mach.compile.cache.compiler`](cache/compiler.md) · `Cached` is private · `readout` is [`mach.report.readout`](../report/readout.md) · `testrunner` is [`mach.lower.testrunner`](../lower/testrunner.md) · `diagnostic` is [`mach.base.diagnostic`](../base/diagnostic.md) · `cache_record` is [`mach.compile.cache.record`](cache/record.md) · `query` is [`mach.session.query`](../session/query.md) · `demand` is [`mach.compile.demand`](demand.md) · `backend` is [`mach.compile.backend`](backend.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`UnitKeying`](#unitkeying) | `rec` | an instance unit's key as its members are added |
+
+| On `UnitKeying` | |
+| :--- | :--- |
+| [`unit_begin`](#unit_begin) | begin the key of the unit named `name`: the configuration every key of this load shares and the unit's name |
+| [`unit_member`](#unit_member) | add the member named `name`, reading the modules `reads` holds, its declaring module first (key_reads) |
+| [`unit_finish`](#unit_finish) | finish the unit's key into `u`, and publish it for the unit's codegen product |
+
+| Functions | |
+| :--- | :--- |
+| [`configuration`](#configuration) | what every module's key shares: the compiler identity, the configuration bytes the driver captured (target, platform, project identity), the request, the realized dependency closure and the link requirements |
+| [`test_object_path`](#test_object_path) | where the build writes module m's test object: `obj/<project>/<module path>.test.<ext>` |
+| [`has_test_object`](#has_test_object) | the module gets a test object in this build: a test build, and a module whose source declares a test or a `#[testing]` declaration |
+| [`early_restore_enabled`](#early_restore_enabled) | a module whose object is cached skips lowering when nothing else needs its unit: the ir and asm emitters read it |
+| [`restored`](#restored) | the module's codegen product is its cached object under the key this load built, whether it is still staged or a query already took it |
+| [`staged_restored`](#staged_restored) | restored and still staged, which is what the codegen query publishes |
+| [`test_restored`](#test_restored) | the module's test object is its cached object under the key this load built |
+| [`test_staged_restored`](#test_staged_restored) | the test object is restored and still staged for the codegen query to publish |
+| [`skips_lowering`](#skips_lowering) | the module is restored and nothing needs its lowered ir |
+| [`lowered_count`](#lowered_count) | the emitted modules the build lowers |
+| [`generated_count`](#generated_count) | the emitted modules the build generates code for |
+| [`frontend_count`](#frontend_count) | the modules the front end still processes |
+| [`forget`](#forget) | every key, skip decision and record of the previous load is dropped: the next load keys again, and a project that is not keyed processes every module |
+| [`note_written`](#note_written) | the object written to `location` was the `len` bytes at `bytes`: a keyed object under `obj/` is remembered by its digest for the restore that reads it back |
+| [`store_written`](#store_written) | store the digests of the objects this build wrote, once they are in place |
+| [`read`](#read) | the object at `location` when its bytes are the bytes a build wrote there, its record says it was built under `expected` and every copy it holds stands (copies_stand), none on a miss: an object that is missing, unreadable, not the bytes written, carries no record or a damaged one, was built under another key or holds a copy that no longer stands is rebuilt, never reused |
+| [`test_input_key`](#test_input_key) | the query key of a module's test object products and its object key input |
+| [`instance_key`](#instance_key) | the key of an instance: the configuration, its symbol and what it reads |
+| [`prepare`](#prepare) | once per load, after the load walk and the embedded inputs, before anything is resolved: key every module, read each emitted module's `obj/` object under its key, mark the modules the front end skips and read the cell's instance records |
+| [`take_staged`](#take_staged) | hand the staged object to the query that publishes it; the facts stay with the module |
+| [`take_staged_test`](#take_staged_test) | |
+| [`collect_tests`](#collect_tests) | a module's tests, from its lowered test unit or from the facts its restored test object carries |
+| [`source_table`](#source_table) | the session's files named by path, as a recorded store names them |
+| [`publish`](#publish) | a generated object carries its record into `obj/`: its key, the source it was built from, its warnings, and what its lowering kept: the instances its code asks for, those it holds a copy of and, for a module that declares tests, the symbols it defines, which its test object declares |
+| [`publish_test`](#publish_test) | the same for the module's test object, which records only its own back half's warnings: the normal object carries the front end's |
+| [`restore_unit`](#restore_unit) | read unit u's object at `location` under its key; a hit is staged for its codegen product and its back half's warnings are reported again |
+| [`take_staged_unit`](#take_staged_unit) | hand unit u's staged object to the product that publishes it |
+| [`publish_unit`](#publish_unit) | a compiled unit's object carries its record into `obj/`: its key, the warnings its own codegen product reported, which are its lowering's and its back end's, and the instances beside its members it holds a copy of |
+| [`units_compiled`](#units_compiled) | the instance units the build compiles rather than restores |
+| [`store_records`](#store_records) | the cell's instance records after a demand settled: each instance of its closure keeps the record this build made of it, or else the one that stood in for its typing, and an instance the closure no longer holds drops out |
+| [`link_stands`](#link_stands) | the link that would write `artifact` need not run: this build compiled nothing, the link reads no input found by name and its last run read no file a search found, its key and the files that run read beyond its keyed inputs key it as the record of the artifact's path does, and the file there hashes to the digest that record holds |
+| [`note_link`](#note_link) | the link that wrote `artifact` as the bytes `digest` names, having read `read`, is recorded under its key and the files it read, so a later build that compiles nothing, keys its link the same and finds those files holding the same bytes leaves the artifact as it is |
+
+| Constants | |
+| :--- | :--- |
+| [`TEST_KEY_BIT`](#constants) | a module's test object is keyed in the query database by its stable id and this bit |
+| [`OBJECT_KEY`](#constants) | the key a module's reused object was built under, keyed by its stable id and the test bit |
+| [`DEMAND_RECORDS`](#constants) | the record of what the build's demand reads outside the query engine, which the demand depends on: whether the load is keyed, each skipped module and the key its record stands under, and each instance record and what the load decided of it |
+| [`UNIT_OBJECT_KEY`](#constants) | the key an instance unit's object is built under, keyed by the unit's query key: the persistent key's in-process image, as OBJECT_KEY is a module's |
+
+---
+
+## UnitKeying
+
+```mach
+pub rec UnitKeying {
+    b:     cache_key.Builder;
+    keyed: bool;
+}
+```
+
+an instance unit's key as its members are added
+
+### unit_begin
+
+```mach
+pub fun unit_begin(p: *project.Project, name: intern.StrId) UnitKeying
+```
+
+begin the key of the unit named `name`: the configuration every key of this load shares and
+the unit's name. a load that keyed nothing keys no unit
+
+### unit_member
+
+```mach
+pub fun unit_member(p: *project.Project, k: *UnitKeying, name: intern.StrId, reads: *module.ModuleId, count: usize)
+```
+
+add the member named `name`, reading the modules `reads` holds, its declaring module first
+(key_reads). a member reading a module this load did not key leaves the unit unkeyed
+
+### unit_finish
+
+```mach
+pub fun unit_finish(p: *project.Project, k: *UnitKeying, u: *project.InstanceUnit) err[fail.Fail]
+```
+
+finish the unit's key into `u`, and publish it for the unit's codegen product
+
+## Functions
+
+### configuration
 
 ```mach
 pub fun configuration(scratch: *A.Allocator, p: *project.Project, config: *u8, config_len: usize,
-compiler_id: *compiler.Identity, digest: *[32]u8) err[fail.Fail];
+    compiler_id: *compiler.Identity, digest: *[32]u8) err[fail.Fail]
 ```
 
 what every module's key shares: the compiler identity, the configuration
@@ -38,127 +137,127 @@ the realized dependency closure and the link requirements.
 a step's output reaches a module only as a file it embeds or a source it
 loads, each keyed by its bytes, so no step is part of the configuration
 
-## fun test_object_path
+### test_object_path
 
 ```mach
-pub fun test_object_path(p: *project.Project, m: *project.ModuleEntry, a: *A.Allocator) res[str, fail.Fail];
+pub fun test_object_path(p: *project.Project, m: *project.ModuleEntry, a: *A.Allocator) res[str, fail.Fail]
 ```
 
 where the build writes module m's test object: `obj/<project>/<module path>.test.<ext>`
 
-## fun has_test_object
+### has_test_object
 
 ```mach
-pub fun has_test_object(p: *project.Project, m: *project.ModuleEntry) bool;
+pub fun has_test_object(p: *project.Project, m: *project.ModuleEntry) bool
 ```
 
 the module gets a test object in this build: a test build, and a module whose
 source declares a test or a `#[testing]` declaration
 
-## fun early_restore_enabled
+### early_restore_enabled
 
 ```mach
-pub fun early_restore_enabled(p: *project.Project) bool;
+pub fun early_restore_enabled(p: *project.Project) bool
 ```
 
 a module whose object is cached skips lowering when nothing else needs its
 unit: the ir and asm emitters read it
 
-## fun restored
+### restored
 
 ```mach
-pub fun restored(p: *project.Project, m: *project.ModuleEntry) bool;
+pub fun restored(p: *project.Project, m: *project.ModuleEntry) bool
 ```
 
 the module's codegen product is its cached object under the key this load
 built, whether it is still staged or a query already took it
 
-## fun staged_restored
+### staged_restored
 
 ```mach
-pub fun staged_restored(p: *project.Project, m: *project.ModuleEntry) bool;
+pub fun staged_restored(p: *project.Project, m: *project.ModuleEntry) bool
 ```
 
 restored and still staged, which is what the codegen query publishes
 
-## fun test_restored
+### test_restored
 
 ```mach
-pub fun test_restored(p: *project.Project, m: *project.ModuleEntry) bool;
+pub fun test_restored(p: *project.Project, m: *project.ModuleEntry) bool
 ```
 
 the module's test object is its cached object under the key this load built
 
-## fun test_staged_restored
+### test_staged_restored
 
 ```mach
-pub fun test_staged_restored(p: *project.Project, m: *project.ModuleEntry) bool;
+pub fun test_staged_restored(p: *project.Project, m: *project.ModuleEntry) bool
 ```
 
 the test object is restored and still staged for the codegen query to publish
 
-## fun skips_lowering
+### skips_lowering
 
 ```mach
-pub fun skips_lowering(p: *project.Project, m: *project.ModuleEntry) bool;
+pub fun skips_lowering(p: *project.Project, m: *project.ModuleEntry) bool
 ```
 
 the module is restored and nothing needs its lowered ir
 
-## fun lowered_count
+### lowered_count
 
 ```mach
-pub fun lowered_count(p: *project.Project) u32;
+pub fun lowered_count(p: *project.Project) u32
 ```
 
 the emitted modules the build lowers
 
-## fun generated_count
+### generated_count
 
 ```mach
-pub fun generated_count(p: *project.Project) u32;
+pub fun generated_count(p: *project.Project) u32
 ```
 
 the emitted modules the build generates code for
 
-## fun frontend_count
+### frontend_count
 
 ```mach
-pub fun frontend_count(p: *project.Project) u32;
+pub fun frontend_count(p: *project.Project) u32
 ```
 
 the modules the front end still processes
 
-## fun forget
+### forget
 
 ```mach
-pub fun forget(p: *project.Project) err[fail.Fail];
+pub fun forget(p: *project.Project) err[fail.Fail]
 ```
 
 every key, skip decision and record of the previous load is dropped: the next load
 keys again, and a project that is not keyed processes every module
 
-## fun note_written
+### note_written
 
 ```mach
-pub fun note_written(p: *project.Project, location: str, bytes: *u8, len: usize) err[fail.Fail];
+pub fun note_written(p: *project.Project, location: str, bytes: *u8, len: usize) err[fail.Fail]
 ```
 
 the object written to `location` was the `len` bytes at `bytes`: a keyed object under `obj/`
 is remembered by its digest for the restore that reads it back
 
-## fun store_written
+### store_written
 
 ```mach
-pub fun store_written(p: *project.Project) err[fail.Fail];
+pub fun store_written(p: *project.Project) err[fail.Fail]
 ```
 
 store the digests of the objects this build wrote, once they are in place
 
-## fun read
+### read
 
 ```mach
-pub fun read(p: *project.Project, location: str, expected: *[32]u8) res[opt[Cached], fail.Fail];
+pub fun read(p: *project.Project, location: str, expected: *[32]u8) res[opt[Cached], fail.Fail]
 ```
 
 the object at `location` when its bytes are the bytes a build wrote there, its record says it
@@ -167,54 +266,28 @@ object that is missing, unreadable, not the bytes written, carries no record or 
 was built under another key or holds a copy that no longer stands is rebuilt, never reused.
 err only when allocation fails
 
-## val TEST_KEY_BIT
+### test_input_key
 
 ```mach
-pub val TEST_KEY_BIT: u64 = 0x100000000
-```
-
-a module's test object is keyed in the query database by its stable id and this bit
-
-## val OBJECT_KEY
-
-```mach
-pub val OBJECT_KEY: query.Kind = query.Kind;
-```
-
-the key a module's reused object was built under, keyed by its stable id and the test bit
-
-## fun test_input_key
-
-```mach
-pub fun test_input_key(m: *project.ModuleEntry) u64;
+pub fun test_input_key(m: *project.ModuleEntry) u64
 ```
 
 the query key of a module's test object products and its object key input
 
-## val DEMAND_RECORDS
+### instance_key
 
 ```mach
-pub val DEMAND_RECORDS: query.Kind = query.Kind;
-```
-
-the record of what the build's demand reads outside the query engine, which the demand depends
-on: whether the load is keyed, each skipped module and the key its record stands under, and each
-instance record and what the load decided of it. a load that is not keyed reads nothing
-
-## fun instance_key
-
-```mach
-pub fun instance_key(p: *project.Project, name: intern.StrId, reads: *module.ModuleId, count: usize, out: *[32]u8) res[bool, fail.Fail];
+pub fun instance_key(p: *project.Project, name: intern.StrId, reads: *module.ModuleId, count: usize, out: *[32]u8) res[bool, fail.Fail]
 ```
 
 the key of an instance: the configuration, its symbol and what it reads. its record stands under
 it, and an object holding a copy of it lists it under it. false when a module it reads is not
 keyed
 
-## fun prepare
+### prepare
 
 ```mach
-pub fun prepare(p: *project.Project, config: *u8, config_len: usize, ph: readout.Phase) err[fail.Fail];
+pub fun prepare(p: *project.Project, config: *u8, config_len: usize, ph: readout.Phase) err[fail.Fail]
 ```
 
 once per load, after the load walk and the embedded inputs, before anything
@@ -223,149 +296,106 @@ under its key, mark the modules the front end skips and read the cell's
 instance records. config is the captured configuration identity. its items
 are reported under the readout phase ph
 
-## fun take_staged
+### take_staged
 
 ```mach
-pub fun take_staged(p: *project.Project, m: *project.ModuleEntry) *Object;
+pub fun take_staged(p: *project.Project, m: *project.ModuleEntry) *Object
 ```
 
 hand the staged object to the query that publishes it; the facts stay with the module
 
-## fun take_staged_test
+### take_staged_test
 
 ```mach
-pub fun take_staged_test(p: *project.Project, m: *project.ModuleEntry) *Object;
+pub fun take_staged_test(p: *project.Project, m: *project.ModuleEntry) *Object
 ```
 
-## fun collect_tests
+### collect_tests
 
 ```mach
-pub fun collect_tests(p: *project.Project, m: *project.ModuleEntry, mid: u32, c: *testrunner.Collected) err[fail.Fail];
+pub fun collect_tests(p: *project.Project, m: *project.ModuleEntry, mid: u32, c: *testrunner.Collected) err[fail.Fail]
 ```
 
 a module's tests, from its lowered test unit or from the facts its restored test object carries
 
-## fun source_table
+### source_table
 
 ```mach
-pub fun source_table(p: *project.Project) diagnostic.SourceTable;
+pub fun source_table(p: *project.Project) diagnostic.SourceTable
 ```
 
 the session's files named by path, as a recorded store names them
 
-## fun publish
+### publish
 
 ```mach
 pub fun publish(p: *project.Project, m: *project.ModuleEntry, o: *Object, asked: *cache_record.Asked, asked_count: u32,
-defined: *intern.StrId, defined_count: u32, copied: *intern.StrId, copied_count: u32, object: query.QueryKey) err[fail.Fail];
+    defined: *intern.StrId, defined_count: u32, copied: *intern.StrId, copied_count: u32, object: query.QueryKey) err[fail.Fail]
 ```
 
 a generated object carries its record into `obj/`: its key, the source it was built from, its
 warnings, and what its lowering kept: the instances its code asks for, those it holds a copy of
 and, for a module that declares tests, the symbols it defines, which its test object declares
 
-## fun publish_test
+### publish_test
 
 ```mach
-pub fun publish_test(p: *project.Project, m: *project.ModuleEntry, o: *Object, copied: *intern.StrId, copied_count: u32, object: query.QueryKey) err[fail.Fail];
+pub fun publish_test(p: *project.Project, m: *project.ModuleEntry, o: *Object, copied: *intern.StrId, copied_count: u32, object: query.QueryKey) err[fail.Fail]
 ```
 
 the same for the module's test object, which records only its own back half's warnings:
 the normal object carries the front end's
 
-## val UNIT_OBJECT_KEY
+### restore_unit
 
 ```mach
-pub val UNIT_OBJECT_KEY: query.Kind = query.Kind;
-```
-
-the key an instance unit's object is built under, keyed by the unit's query key: the
-persistent key's in-process image, as OBJECT_KEY is a module's
-
-## rec UnitKeying
-
-```mach
-pub rec UnitKeying;
-```
-
-an instance unit's key as its members are added
-
-## fun unit_begin
-
-```mach
-pub fun unit_begin(p: *project.Project, name: intern.StrId) UnitKeying;
-```
-
-begin the key of the unit named `name`: the configuration every key of this load shares and
-the unit's name. a load that keyed nothing keys no unit
-
-## fun unit_member
-
-```mach
-pub fun unit_member(p: *project.Project, k: *UnitKeying, name: intern.StrId, reads: *module.ModuleId, count: usize);
-```
-
-add the member named `name`, reading the modules `reads` holds, its declaring module first
-(key_reads). a member reading a module this load did not key leaves the unit unkeyed
-
-## fun unit_finish
-
-```mach
-pub fun unit_finish(p: *project.Project, k: *UnitKeying, u: *project.InstanceUnit) err[fail.Fail];
-```
-
-finish the unit's key into `u`, and publish it for the unit's codegen product
-
-## fun restore_unit
-
-```mach
-pub fun restore_unit(p: *project.Project, u: *project.InstanceUnit, location: str) res[bool, fail.Fail];
+pub fun restore_unit(p: *project.Project, u: *project.InstanceUnit, location: str) res[bool, fail.Fail]
 ```
 
 read unit u's object at `location` under its key; a hit is staged for its codegen product and
 its back half's warnings are reported again. its recorded warnings stand for the origin's
 source they were reported in, as a module's do
 
-## fun take_staged_unit
+### take_staged_unit
 
 ```mach
-pub fun take_staged_unit(u: *project.InstanceUnit) *Object;
+pub fun take_staged_unit(u: *project.InstanceUnit) *Object
 ```
 
 hand unit u's staged object to the product that publishes it
 
-## fun publish_unit
+### publish_unit
 
 ```mach
-pub fun publish_unit(p: *project.Project, u: *project.InstanceUnit, copied: *intern.StrId, copied_count: u32, object: query.QueryKey) err[fail.Fail];
+pub fun publish_unit(p: *project.Project, u: *project.InstanceUnit, copied: *intern.StrId, copied_count: u32, object: query.QueryKey) err[fail.Fail]
 ```
 
 a compiled unit's object carries its record into `obj/`: its key, the warnings its own codegen
 product reported, which are its lowering's and its back end's, and the instances beside its
 members it holds a copy of
 
-## fun units_compiled
+### units_compiled
 
 ```mach
-pub fun units_compiled(p: *project.Project) u32;
+pub fun units_compiled(p: *project.Project) u32
 ```
 
 the instance units the build compiles rather than restores
 
-## fun store_records
+### store_records
 
 ```mach
-pub fun store_records(p: *project.Project, d: *demand.Demand) err[fail.Fail];
+pub fun store_records(p: *project.Project, d: *demand.Demand) err[fail.Fail]
 ```
 
 the cell's instance records after a demand settled: each instance of its closure keeps the
 record this build made of it, or else the one that stood in for its typing, and an instance the
 closure no longer holds drops out. a store that would hold what it holds is left as it is
 
-## fun link_stands
+### link_stands
 
 ```mach
-pub fun link_stands(p: *project.Project, artifact: str) res[bool, fail.Fail];
+pub fun link_stands(p: *project.Project, artifact: str) res[bool, fail.Fail]
 ```
 
 the link that would write `artifact` need not run: this build compiled nothing, the link reads
@@ -374,14 +404,23 @@ run read beyond its keyed inputs key it as the record of the artifact's path doe
 there hashes to the digest that record holds. every file is read and hashed every time, never
 trusted from its metadata
 
-## fun note_link
+### note_link
 
 ```mach
-pub fun note_link(p: *project.Project, artifact: str, digest: *[32]u8, read: *backend.LinkRead) err[fail.Fail];
+pub fun note_link(p: *project.Project, artifact: str, digest: *[32]u8, read: *backend.LinkRead) err[fail.Fail]
 ```
 
 the link that wrote `artifact` as the bytes `digest` names, having read `read`, is recorded under
 its key and the files it read, so a later build that compiles nothing, keys its link the same and
 finds those files holding the same bytes leaves the artifact as it is. a link that read a file a
 search found is recorded as one that always runs
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `TEST_KEY_BIT` | `u64` | `0x100000000` | a module's test object is keyed in the query database by its stable id and this bit |
+| `OBJECT_KEY` | `query.Kind` | `query.Kind{name: "object key", role: query.INPUT, owner: query.KEY_MODULE}` | the key a module's reused object was built under, keyed by its stable id and the test bit |
+| `DEMAND_RECORDS` | `query.Kind` | `query.Kind{name: "demand records", role: query.INPUT, owner: query.KEY_UNOWNED}` | the record of what the build's demand reads outside the query engine, which the demand depends on: whether the load is keyed, each skipped module and the key its record stands under, and each instance record and what the load decided of it |
+| `UNIT_OBJECT_KEY` | `query.Kind` | `query.Kind{name: "unit object key", role: query.INPUT, owner: query.KEY_UNIT}` | the key an instance unit's object is built under, keyed by the unit's query key: the persistent key's in-process image, as OBJECT_KEY is a module's |
 

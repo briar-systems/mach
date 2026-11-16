@@ -1,3 +1,5 @@
+[mach](../README.md) / [target](README.md) / **assembled**
+
 # mach.target.assembled
 
 the target mirl assembles from a resolved target
@@ -6,55 +8,87 @@ mirl assembles a target from the target mink resolved, masc's check of its basel
 the output kind under build, reading no text, and opens the build the target's added
 extensions select over it. the tuple of the target's parts names the modules built for it
 
-## fun tuple_of
+<sub>source: [`src/target/assembled.mach`](../../../src/target/assembled.mach) · imported by 4 modules</sub>
+
+<sub>`mirl_record` is `mirl.target.record` · `mirl_basis` is `mirl.target.basis` · `A` is `std.allocator` · `resolved` is [`mach.target.resolved`](resolved.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Assembled`](#assembled) | `rec` | the target mirl assembled for a resolved target and the build basis its added extensions opened, which lowering lays types out under and compilation adds the added names to |
+
+| On `Assembled` | |
+| :--- | :--- |
+| [`assemble`](#assemble) | the target mirl assembles for `t`, with the build its added extensions select opened |
+| [`added`](#added) | the names the target adds over its baseline |
+| [`basis_of`](#basis_of) | the build basis the added extensions opened, none for a target that states no baseline |
+| [`dnit`](#dnit) | |
+
+| Functions | |
+| :--- | :--- |
+| [`tuple_of`](#tuple_of) | the tuple a resolved target names its owners' parts by |
+
+---
+
+## Assembled
 
 ```mach
-pub fun tuple_of(t: *resolved.Target) Tuple;
-```
-
-the tuple a resolved target names its owners' parts by
-
-## rec Assembled
-
-```mach
-pub rec Assembled;
+pub rec Assembled {
+    tuple:  Tuple;
+    target: mirl_record.Target;
+    basis:  mirl_basis.Basis;
+    based:  bool;
+    names:  [resolved.MAX_ADDED]str;
+    count:  usize;
+}
 ```
 
 the target mirl assembled for a resolved target and the build basis its added
 extensions opened, which lowering lays types out under and compilation adds the
 added names to
 
-tuple: the five parts the target was assembled from, which name its modules
-names: the names of masc's catalog the target adds over its baseline
+| Field | Type | |
+| :--- | :--- | :--- |
+| `tuple` | `Tuple` | the five parts the target was assembled from, which name its modules |
+| `names` | `[resolved.MAX_ADDED]str` | the names of masc's catalog the target adds over its baseline |
 
-## fun assemble
+### assemble
 
 ```mach
-pub fun assemble(a: *A.Allocator, t: *resolved.Target) res[*Assembled, fail.Fail];
+pub fun assemble(a: *A.Allocator, t: *resolved.Target) res[*Assembled, fail.Fail]
 ```
 
 the target mirl assembles for `t`, with the build its added extensions select
 opened. given back by release
 
-## fun added
+### added
 
 ```mach
-pub fun added(x: *Assembled) Slice[str];
+pub fun added(x: *Assembled) Slice[str]
 ```
 
 the names the target adds over its baseline
 
-## fun basis_of
+### basis_of
 
 ```mach
-pub fun basis_of(x: *Assembled) opt[*mirl_basis.Basis];
+pub fun basis_of(x: *Assembled) opt[*mirl_basis.Basis]
 ```
 
 the build basis the added extensions opened, none for a target that states no baseline
 
-## fun dnit
+### dnit
 
 ```mach
-pub fun dnit(a: *A.Allocator, x: *Assembled);
+pub fun dnit(a: *A.Allocator, x: *Assembled)
 ```
+
+## Functions
+
+### tuple_of
+
+```mach
+pub fun tuple_of(t: *resolved.Target) Tuple
+```
+
+the tuple a resolved target names its owners' parts by
 

@@ -1,3 +1,5 @@
+[mach](../README.md) / [package](README.md) / **report**
+
 # mach.package.report
 
 where dependency management reports while it works. a progress line, a note and a
@@ -5,73 +7,98 @@ failure the operation goes on past stream to the caller as they happen; `effects
 a note for each change an operation made before it failed, which the caller shows after
 the failure, so a failed command still names the state it left
 
-## rec Report
+<sub>source: [`src/package/report.mach`](../../../src/package/report.mach) · imported by 14 modules</sub>
+
+<sub>`LineFn` is private · `NoteFn` is private · `FaultFn` is private · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Report`](#report) | `rec` |  |
+
+| On `Report` | |
+| :--- | :--- |
+| [`init`](#init) | a report over the given sink, whose effects `a` owns |
+| [`dnit`](#dnit) · [`line`](#line) · [`note`](#note) · [`fault`](#fault) | |
+| [`effectf`](#effectf) | keep an effect note formatted as std.format formats it; a note that cannot be kept is dropped, since it only explains a failure already reported |
+| [`linef`](#linef) | a progress line formatted as std.format formats it, through storage `a` lends for the call |
+| [`notef`](#notef) | a note formatted as std.format formats it, through storage `a` lends for the call |
+| [`discard`](#discard) | a report that keeps nothing, for work that has nothing to say or a test that checks state rather than what is said |
+
+---
+
+## Report
 
 ```mach
-pub rec Report;
+pub rec Report {
+    ctx:     ptr;
+    line:    LineFn;
+    note:    NoteFn;
+    fault:   FaultFn;
+    effects: Vector[str];
+}
 ```
 
-## fun init
+### init
 
 ```mach
-pub fun init(a: *A.Allocator, ctx: ptr, on_line: LineFn, on_note: NoteFn, on_fault: FaultFn) Report;
+pub fun init(a: *A.Allocator, ctx: ptr, on_line: LineFn, on_note: NoteFn, on_fault: FaultFn) Report
 ```
 
 a report over the given sink, whose effects `a` owns
 
-## fun dnit
+### dnit
 
 ```mach
-pub fun dnit(r: *Report);
+pub fun dnit(r: *Report)
 ```
 
-## fun line
+### line
 
 ```mach
-pub fun line(r: *Report, text: str);
+pub fun line(r: *Report, text: str)
 ```
 
-## fun note
+### note
 
 ```mach
-pub fun note(r: *Report, text: str);
+pub fun note(r: *Report, text: str)
 ```
 
-## fun fault
+### fault
 
 ```mach
-pub fun fault(r: *Report, f: fail.Fail);
+pub fun fault(r: *Report, f: fail.Fail)
 ```
 
-## fun effectf
+### effectf
 
 ```mach
-pub fun effectf(r: *Report, fmt: str, va: ...);
+pub fun effectf(r: *Report, fmt: str, va: ...)
 ```
 
 keep an effect note formatted as std.format formats it; a note that cannot be kept is
 dropped, since it only explains a failure already reported
 
-## fun linef
+### linef
 
 ```mach
-pub fun linef(r: *Report, a: *A.Allocator, fmt: str, va: ...);
+pub fun linef(r: *Report, a: *A.Allocator, fmt: str, va: ...)
 ```
 
 a progress line formatted as std.format formats it, through storage `a` lends for the call
 
-## fun notef
+### notef
 
 ```mach
-pub fun notef(r: *Report, a: *A.Allocator, fmt: str, va: ...);
+pub fun notef(r: *Report, a: *A.Allocator, fmt: str, va: ...)
 ```
 
 a note formatted as std.format formats it, through storage `a` lends for the call
 
-## fun discard
+### discard
 
 ```mach
-pub fun discard(a: *A.Allocator) Report;
+pub fun discard(a: *A.Allocator) Report
 ```
 
 a report that keeps nothing, for work that has nothing to say or a test that checks state

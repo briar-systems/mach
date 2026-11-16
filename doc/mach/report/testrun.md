@@ -1,25 +1,60 @@
+[mach](../README.md) / [report](README.md) / **testrun**
+
 # mach.report.testrun
 
-## rec TestArtifact
+collected tests, the result of each run and the tally over a run's results
+
+<sub>source: [`src/report/testrun.mach`](../../../src/report/testrun.mach) · imported by 6 modules</sub>
+
+<sub>`A` is `std.allocator`</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`TestArtifact`](#testartifact) | `rec` | a collected test: its qualified name, where it is declared, the test object that holds it, the dispatcher that runs it as `<exe> <idx>`, and the target and profile that dispatcher was built for |
+| [`GateResultKind`](#gateresultkind) | `def` | how a test ran: passed, skipped, disagreed with what it checks, or could not be judged |
+| [`GateCause`](#gatecause) | `def` | what decided a result's kind |
+| [`GateResult`](#gateresult) | `rec` | one test's result; the tally owns a recorded result's detail |
+| [`GateTally`](#gatetally) | `rec` |  |
+
+| On `GateResultKind` | |
+| :--- | :--- |
+| [`RESULT_PASS`](#gateresultkind) · [`RESULT_SEMANTIC_MISMATCH`](#gateresultkind) · [`RESULT_TOOL_UNAVAILABLE`](#gateresultkind) · [`RESULT_INFRASTRUCTURE_FAILURE`](#gateresultkind) · [`RESULT_RESOURCE_EXHAUSTION`](#gateresultkind) · [`RESULT_SKIP`](#gateresultkind) · [`gate_result`](#gate_result) | |
+
+| On `GateCause` | |
+| :--- | :--- |
+| [`CAUSE_PASS`](#gatecause) · [`CAUSE_ORACLE_TIMEOUT`](#gatecause) · [`CAUSE_ORACLE_SPAWN_FAILURE`](#gatecause) · [`CAUSE_ORACLE_CAPTURE`](#gatecause) · [`CAUSE_ORACLE_SIGNAL`](#gatecause) · [`CAUSE_ORACLE_EXIT`](#gatecause) · [`CAUSE_INVALID_TERMINAL`](#gatecause) · [`CAUSE_SKIP`](#gatecause) | |
+
+| On `GateTally` | |
+| :--- | :--- |
+| [`gate_tally_init`](#gate_tally_init) · [`record_gate`](#record_gate) | |
+
+| Constants | |
+| :--- | :--- |
+| [`EXIT_SKIP`](#constants) | the exit status a test reports a skip with: 0 is a pass, this is a skip, and any other status is a failure |
+
+---
+
+## TestArtifact
 
 ```mach
-pub rec TestArtifact;
+pub rec TestArtifact {
+    module:  *u8;
+    name:    *u8;
+    file:    *u8;
+    line:    u32;
+    object:  *u8;
+    exe:     *u8;
+    idx:     u32;
+    target:  *u8;
+    profile: *u8;
+}
 ```
 
 a collected test: its qualified name, where it is declared, the test object
 that holds it, the dispatcher that runs it as `<exe> <idx>`, and the target and
 profile that dispatcher was built for
 
-## val EXIT_SKIP
-
-```mach
-pub val EXIT_SKIP: i32 = 77
-```
-
-the exit status a test reports a skip with: 0 is a pass, this is a skip, and
-any other status is a failure
-
-## def GateResultKind
+## GateResultKind
 
 ```mach
 pub def GateResultKind: u8
@@ -27,43 +62,22 @@ pub def GateResultKind: u8
 
 how a test ran: passed, skipped, disagreed with what it checks, or could not be judged
 
-## val RESULT_PASS
+| Name | Value | |
+| :--- | :--- | :--- |
+| `RESULT_PASS` | `0` |  |
+| `RESULT_SEMANTIC_MISMATCH` | `1` |  |
+| `RESULT_TOOL_UNAVAILABLE` | `3` |  |
+| `RESULT_INFRASTRUCTURE_FAILURE` | `4` |  |
+| `RESULT_RESOURCE_EXHAUSTION` | `5` |  |
+| `RESULT_SKIP` | `7` |  |
+
+### gate_result
 
 ```mach
-pub val RESULT_PASS:                   GateResultKind = 0
+pub fun gate_result(kind: GateResultKind, cause: GateCause, detail_identity: str) GateResult
 ```
 
-## val RESULT_SEMANTIC_MISMATCH
-
-```mach
-pub val RESULT_SEMANTIC_MISMATCH:      GateResultKind = 1
-```
-
-## val RESULT_TOOL_UNAVAILABLE
-
-```mach
-pub val RESULT_TOOL_UNAVAILABLE:       GateResultKind = 3
-```
-
-## val RESULT_INFRASTRUCTURE_FAILURE
-
-```mach
-pub val RESULT_INFRASTRUCTURE_FAILURE: GateResultKind = 4
-```
-
-## val RESULT_RESOURCE_EXHAUSTION
-
-```mach
-pub val RESULT_RESOURCE_EXHAUSTION:    GateResultKind = 5
-```
-
-## val RESULT_SKIP
-
-```mach
-pub val RESULT_SKIP:                   GateResultKind = 7
-```
-
-## def GateCause
+## GateCause
 
 ```mach
 pub def GateCause: u8
@@ -71,83 +85,60 @@ pub def GateCause: u8
 
 what decided a result's kind
 
-## val CAUSE_PASS
+| Name | Value | |
+| :--- | :--- | :--- |
+| `CAUSE_PASS` | `0` |  |
+| `CAUSE_ORACLE_TIMEOUT` | `4` |  |
+| `CAUSE_ORACLE_SPAWN_FAILURE` | `6` |  |
+| `CAUSE_ORACLE_CAPTURE` | `7` |  |
+| `CAUSE_ORACLE_SIGNAL` | `8` |  |
+| `CAUSE_ORACLE_EXIT` | `9` |  |
+| `CAUSE_INVALID_TERMINAL` | `10` |  |
+| `CAUSE_SKIP` | `11` |  |
+
+## GateResult
 
 ```mach
-pub val CAUSE_PASS:                 GateCause = 0
-```
-
-## val CAUSE_ORACLE_TIMEOUT
-
-```mach
-pub val CAUSE_ORACLE_TIMEOUT:       GateCause = 4
-```
-
-## val CAUSE_ORACLE_SPAWN_FAILURE
-
-```mach
-pub val CAUSE_ORACLE_SPAWN_FAILURE: GateCause = 6
-```
-
-## val CAUSE_ORACLE_CAPTURE
-
-```mach
-pub val CAUSE_ORACLE_CAPTURE:       GateCause = 7
-```
-
-## val CAUSE_ORACLE_SIGNAL
-
-```mach
-pub val CAUSE_ORACLE_SIGNAL:        GateCause = 8
-```
-
-## val CAUSE_ORACLE_EXIT
-
-```mach
-pub val CAUSE_ORACLE_EXIT:          GateCause = 9
-```
-
-## val CAUSE_INVALID_TERMINAL
-
-```mach
-pub val CAUSE_INVALID_TERMINAL:     GateCause = 10
-```
-
-## val CAUSE_SKIP
-
-```mach
-pub val CAUSE_SKIP:                 GateCause = 11
-```
-
-## rec GateResult
-
-```mach
-pub rec GateResult;
+pub rec GateResult {
+    kind:            GateResultKind;
+    cause:           GateCause;
+    detail_identity: str;
+}
 ```
 
 one test's result; the tally owns a recorded result's detail
 
-## fun gate_result
+## GateTally
 
 ```mach
-pub fun gate_result(kind: GateResultKind, cause: GateCause, detail_identity: str) GateResult;
+pub rec GateTally {
+    pass:                   u32;
+    semantic_mismatch:      u32;
+    unsupported_input:      u32;
+    tool_unavailable:       u32;
+    infrastructure_failure: u32;
+    resource_exhaustion:    u32;
+    invalid_injection:      u32;
+    skip:                   u32;
+    results:                Vector[GateResult];
+}
 ```
 
-## rec GateTally
+### gate_tally_init
 
 ```mach
-pub rec GateTally;
+pub fun gate_tally_init(a: *A.Allocator) GateTally
 ```
 
-## fun gate_tally_init
+### record_gate
 
 ```mach
-pub fun gate_tally_init(a: *A.Allocator) GateTally;
+pub fun record_gate(gt: *GateTally, a: *A.Allocator, r: GateResult) err[A.Error]
 ```
 
-## fun record_gate
+## Constants
 
-```mach
-pub fun record_gate(gt: *GateTally, a: *A.Allocator, r: GateResult) err[A.Error];
-```
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `EXIT_SKIP` | `i32` | `77` | the exit status a test reports a skip with: 0 is a pass, this is a skip, and any other status is a failure |
 

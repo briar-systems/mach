@@ -1,3 +1,5 @@
+[mach](../README.md) / [package](README.md) / **source**
+
 # mach.package.source
 
 the source contract: where a dependency named by a url comes from. it has two halves,
@@ -5,7 +7,7 @@ each a table of operations a source member fills:
 
 - Releases: the releases published at a url and the manifest each ships, which version
   resolution reads
-- Checkouts: how dep/<id> holds a source's content: bringing it to a selection, saying what
+- Checkouts: how dep/&lt;id> holds a source's content: bringing it to a selection, saying what
   it holds, and checking it against what selected it
 
 git is the member today: its releases are `v`-prefixed semver tags and its checkouts are
@@ -14,97 +16,126 @@ release archive into the same slot, filling the same two tables. a selector beyo
 release (a `ref` naming a branch, a tag or a commit) is a source's own vocabulary, and a
 member without one refuses it
 
-## rec Release
+<sub>source: [`src/package/source.mach`](../../../src/package/source.mach) · imported by 8 modules</sub>
+
+<sub>`manifest_version` is [`mach.manifest.version`](../manifest/version.md) · `A` is `std.allocator` · `manifest_model` is [`mach.manifest.model`](../manifest/model.md) · `ListFn` is private · `ShippedFn` is private · `ReleaseOfFn` is private · `RememberFn` is private · `ReleasesCloseFn` is private · `AcquireFn` is private · `RevisionFn` is private · `AdvanceFn` is private · `HydrateFn` is private · `SelectionFn` is private · `ManifestOfFn` is private · `ReleaseAtFn` is private · `AtReleaseFn` is private · `HasReleasesFn` is private · `HoldsFn` is private · `VerifyFn` is private · `SatisfiesFn` is private · `CloseFn` is private</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Release`](#release) | `rec` | one release: its version (whose pre-release text borrows from `text`), the tag that names it and the commit it points at, all owned by the list's allocator |
+| [`Shipped`](#shipped) | `rec` | a release's manifest as resolution reads it: `manifest` when the release is a candidate, and otherwise `excluded` says why it is not one, its manifest not loading or naming another version |
+| [`Releases`](#releases) | `rec` |  |
+| [`Acquisition`](#acquisition) | `rec` | one acquisition of dep/&lt;id>: bring it to `selector` from `url` and record its pin as the project records pins (`mode`, a pin.mach mode) |
+| [`Checkouts`](#checkouts) | `rec` |  |
+
+| On `Release` | |
+| :--- | :--- |
+| [`releases_dnit`](#releases_dnit) | |
+
+| Constants | |
+| :--- | :--- |
+| [`REALIZED_NOTHING`](#constants) | what acquiring dep/&lt;id> changed |
+| [`REALIZED_INITIALIZED`](#constants) · [`REALIZED_PINNED`](#constants) · [`REALIZED_REGISTERED`](#constants) · [`REALIZED_ADOPTED`](#constants) · [`REALIZED_CLONED`](#constants) | |
+| [`REALIZED_UNPINNED`](#constants) | nothing pins the dependency and nothing holds it, so a selection by range alone has nothing to realize |
+
+---
+
+## Release
 
 ```mach
-pub rec Release;
+pub rec Release {
+    version: manifest_version.Version;
+    text:    str;
+    tag:     str;
+    commit:  str;
+}
 ```
 
 one release: its version (whose pre-release text borrows from `text`), the tag that
 names it and the commit it points at, all owned by the list's allocator
 
-## rec Shipped
+### releases_dnit
 
 ```mach
-pub rec Shipped;
+pub fun releases_dnit(a: *A.Allocator, list: *Vector[Release])
+```
+
+## Shipped
+
+```mach
+pub rec Shipped {
+    manifest: manifest_model.Manifest;
+    excluded: str;
+}
 ```
 
 a release's manifest as resolution reads it: `manifest` when the release is a candidate,
 and otherwise `excluded` says why it is not one, its manifest not loading or naming
 another version. the manifest is owned by the caller
 
-## rec Releases
+## Releases
 
 ```mach
-pub rec Releases;
+pub rec Releases {
+    ctx:        ptr;
+    list:       ListFn;
+    shipped:    ShippedFn;
+    release_of: ReleaseOfFn;
+    remember:   RememberFn;
+    close:      ReleasesCloseFn;
+}
 ```
 
-## val REALIZED_NOTHING
+## Acquisition
 
 ```mach
-pub val REALIZED_NOTHING:     u8 = 0
+pub rec Acquisition {
+    root:        str;
+    id:          str;
+    url:         str;
+    selector:    str;
+    mode:        u8;
+    accept:      bool;
+    offline:     bool;
+    pinned_only: bool;
+}
 ```
 
-what acquiring dep/<id> changed
-
-## val REALIZED_INITIALIZED
-
-```mach
-pub val REALIZED_INITIALIZED: u8 = 1
-```
-
-## val REALIZED_PINNED
-
-```mach
-pub val REALIZED_PINNED:      u8 = 2
-```
-
-## val REALIZED_REGISTERED
-
-```mach
-pub val REALIZED_REGISTERED:  u8 = 3
-```
-
-## val REALIZED_ADOPTED
-
-```mach
-pub val REALIZED_ADOPTED:     u8 = 4
-```
-
-## val REALIZED_CLONED
-
-```mach
-pub val REALIZED_CLONED:      u8 = 5
-```
-
-## val REALIZED_UNPINNED
-
-```mach
-pub val REALIZED_UNPINNED: u8 = 6
-```
-
-nothing pins the dependency and nothing holds it, so a selection by range alone has nothing to realize
-
-## rec Acquisition
-
-```mach
-pub rec Acquisition;
-```
-
-one acquisition of dep/<id>: bring it to `selector` from `url` and record its pin as the
+one acquisition of dep/&lt;id>: bring it to `selector` from `url` and record its pin as the
 project records pins (`mode`, a pin.mach mode). `accept` takes an existing checkout as the
 dependency, as `mach dep add` does; `pinned_only` is a selection by range alone, which
 acquires only what a pin or an existing checkout already names
 
-## rec Checkouts
+## Checkouts
 
 ```mach
-pub rec Checkouts;
+pub rec Checkouts {
+    ctx:          ptr;
+    acquire:      AcquireFn;
+    revision:     RevisionFn;
+    advance:      AdvanceFn;
+    hydrate:      HydrateFn;
+    selection:    SelectionFn;
+    manifest_of:  ManifestOfFn;
+    release_at:   ReleaseAtFn;
+    at_release:   AtReleaseFn;
+    has_releases: HasReleasesFn;
+    holds:        HoldsFn;
+    verify:       VerifyFn;
+    satisfies:    SatisfiesFn;
+    close:        CloseFn;
+}
 ```
 
-## fun releases_dnit
+## Constants
 
-```mach
-pub fun releases_dnit(a: *A.Allocator, list: *Vector[Release]);
-```
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `REALIZED_NOTHING` | `u8` | `0` | what acquiring dep/&lt;id> changed |
+| `REALIZED_INITIALIZED` | `u8` | `1` |  |
+| `REALIZED_PINNED` | `u8` | `2` |  |
+| `REALIZED_REGISTERED` | `u8` | `3` |  |
+| `REALIZED_ADOPTED` | `u8` | `4` |  |
+| `REALIZED_CLONED` | `u8` | `5` |  |
+| `REALIZED_UNPINNED` | `u8` | `6` | nothing pins the dependency and nothing holds it, so a selection by range alone has nothing to realize |
 

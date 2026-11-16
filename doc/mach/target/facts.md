@@ -1,10 +1,37 @@
+[mach](../README.md) / [target](README.md) / **facts**
+
 # mach.target.facts
 
 what a program may ask of its target while it compiles, read once from the back end a
 build opens: the tag ids of mink's rows, masc's selection, and what mirl's assembled
 target lays out and guarantees
 
-## tag VaList
+<sub>source: [`src/target/facts.mach`](../../../src/target/facts.mach) · imported by 9 modules</sub>
+
+<sub>`mirl_capability` is `mirl.target.capability` · `float` is [`mach.base.float`](../base/float.md) · `resolved` is [`mach.target.resolved`](resolved.md) · `ct` is [`mach.target.ct`](ct.md) · `A` is `std.allocator` · `assembled` is [`mach.target.assembled`](assembled.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`VaList`](#valist) | `tag` | what mirl says of the `va_list` of the target's own convention |
+| [`Listed`](#listed) | `rec` | the size and alignment of a `va_list` |
+| [`Registers`](#registers) | `rec` | the vector registers a vector aligns to: `narrow` the narrowest and `widest` the widest the build meets, in bits |
+| [`Nans`](#nans) | `rec` | the nan a target's float operations return in each format, binary16, binary32 and binary64 at the index of mirl's format, which mirl's folder reads |
+| [`Facts`](#facts) | `rec` | what a program may ask of its target while it compiles: the tag ids, the extents of its primitives and vectors, the selection its extensions are read against, what a float operation makes of a NaN, and whether `asm` reaches an assembler |
+
+| On `Nans` | |
+| :--- | :--- |
+| [`nans_none`](#nans_none) | no format's rule stated, as where no target is selected |
+| [`nans_at`](#nans_at) | the rule of the format of width `w`, binary64 for any other width |
+| [`nans_held`](#nans_held) | whether any format's rule is stated, as it is wherever a target is selected |
+
+| On `Facts` | |
+| :--- | :--- |
+| [`of`](#of) | the facts of the target `t` mirl assembled as `x`: mink's rows by their tag ids, masc's selection, and what mirl lays out and guarantees |
+| [`none`](#none) | no target's facts, as where no target is selected |
+
+---
+
+## VaList
 
 ```mach
 pub tag VaList: u8 {
@@ -16,64 +43,95 @@ pub tag VaList: u8 {
 
 what mirl says of the `va_list` of the target's own convention
 
-listed: its size and alignment under the target's data layout
-unlisted: the convention has no `va_list`
-refused: mirl answers none for the target, with why
+| Case | Payload | |
+| :--- | :--- | :--- |
+| `listed` | `Listed` | its size and alignment under the target's data layout |
+| `unlisted` |  | the convention has no `va_list` |
+| `refused` | `str` | mirl answers none for the target, with why |
 
-## rec Listed
+## Listed
 
 ```mach
-pub rec Listed;
+pub rec Listed {
+    size:  u32;
+    align: u32;
+}
 ```
 
 the size and alignment of a `va_list`
 
-## rec Registers
+## Registers
 
 ```mach
-pub rec Registers;
+pub rec Registers {
+    narrow: u32;
+    widest: u32;
+}
 ```
 
 the vector registers a vector aligns to: `narrow` the narrowest and `widest` the widest
 the build meets, in bits
 
-## rec Nans
+## Nans
 
 ```mach
-pub rec Nans;
+pub rec Nans {
+    formats: [3]mirl_capability.Nans;
+}
 ```
 
 the nan a target's float operations return in each format, binary16, binary32
 and binary64 at the index of mirl's format, which mirl's folder reads
 
-## fun nans_none
+### nans_none
 
 ```mach
-pub fun nans_none() Nans;
+pub fun nans_none() Nans
 ```
 
 no format's rule stated, as where no target is selected
 
-## fun nans_at
+### nans_at
 
 ```mach
-pub fun nans_at(n: *Nans, w: float.FloatWidth) mirl_capability.Nans;
+pub fun nans_at(n: *Nans, w: float.FloatWidth) mirl_capability.Nans
 ```
 
 the rule of the format of width `w`, binary64 for any other width
 
-## fun nans_held
+### nans_held
 
 ```mach
-pub fun nans_held(n: *Nans) bool;
+pub fun nans_held(n: *Nans) bool
 ```
 
 whether any format's rule is stated, as it is wherever a target is selected
 
-## rec Facts
+## Facts
 
 ```mach
-pub rec Facts;
+pub rec Facts {
+    os_id:         u32;
+    arch_id:       u32;
+    abi_id:        u32;
+    pointer_width: u32;
+    vector_bits:   u32;
+    register_bits: u32;
+    selected:      resolved.Selected;
+    has_assembly:  bool;
+    # whether a pointer is an address, or on a logical target a reference to a declared type
+    flat_addressing: bool;
+    # the nan each float format's operations return, which comptime folds by
+    nans: Nans;
+    # the `va_list` of the target's convention, which `abi_type("va_list")` declares
+    va_list: VaList;
+    # the scalar multiplies mirl runs in time independent of their operands, which
+    # `$mach.build.ct_mul` reads
+    multiplies: ct.CtMulMask;
+    # the build guarantees every timing mode a soft constant-time function's code may be held
+    # under, so a hard function may call a soft one
+    soft_guaranteed: bool;
+}
 ```
 
 what a program may ask of its target while it compiles: the tag ids, the
@@ -81,19 +139,19 @@ extents of its primitives and vectors, the selection its extensions are read
 against, what a float operation makes of a NaN, and whether `asm` reaches an
 assembler
 
-## fun of
+### of
 
 ```mach
-pub fun of(a: *A.Allocator, x: *assembled.Assembled, t: *resolved.Target) res[Facts, fail.Fail];
+pub fun of(a: *A.Allocator, x: *assembled.Assembled, t: *resolved.Target) res[Facts, fail.Fail]
 ```
 
 the facts of the target `t` mirl assembled as `x`: mink's rows by their tag ids, masc's
 selection, and what mirl lays out and guarantees
 
-## fun none
+### none
 
 ```mach
-pub fun none() Facts;
+pub fun none() Facts
 ```
 
 no target's facts, as where no target is selected

@@ -1,3 +1,5 @@
+[mach](../README.md) / [target](README.md) / **resolved**
+
 # mach.target.resolved
 
 a resolved target: mink's resolution of a spelling and its narrowing, masc's closed
@@ -9,177 +11,239 @@ the instruction set and the extensions once and returns the closed selection, an
 keeps only its own data beside them: the image keys a manifest states, else its stack
 defaults (mach.target.defaults), and the output kind under build
 
-## val MAX_ADDED
+<sub>source: [`src/target/resolved.mach`](../../../src/target/resolved.mach) · imported by 19 modules</sub>
+
+<sub>`masc_extension` is `masc.core.extension` · `requirement` is `masc.core.requirement` · `mink_target` is `mink.catalog.target` · `mink_output` is `mink.catalog.output` · `mink_arch` is `mink.catalog.arch` · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md) · `mink_fail` is `mink.base.fail` · `diagnostic_kind` is [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Selected`](#selected) | `rec` | a closed selection of masc's catalog of the target's architecture, held by value |
+| [`Target`](#target) | `rec` | a target mink resolved and masc checked |
+| [`Image`](#image) | `rec` | the image keys a manifest states of a target, 0 for each it leaves out |
+| [`Refused`](#refused) | `rec` | a refusal of a target and the part of it refused |
+
+| On `Selected` | |
+| :--- | :--- |
+| [`selected_none`](#selected_none) | no selection |
+| [`selected_has`](#selected_has) | whether `s` holds the catalog row `id` |
+| [`extension_named`](#extension_named) | the one extension of the selection's catalog `name[0..len]` names, none where the catalog has no such name or it names a level of many |
+
+| On `Target` | |
+| :--- | :--- |
+| [`none`](#none) | no target selected |
+| [`is_selected`](#is_selected) | whether a target is selected |
+| [`abi`](#abi) | the calling convention row of the target, nil where its family names none |
+| [`abi_name`](#abi_name) | mink's psABI name of the target's calling convention, "" where its family names none |
+| [`isa`](#isa) | the instruction set the target stands on, in masc's spelling |
+| [`pie`](#pie) | whether the target's executable is position independent: the linkage the target resolved to |
+
+| On `Image` | |
+| :--- | :--- |
+| [`resolve`](#resolve) | the target `s` narrowed by `n` resolves to, with the image keys `image` states |
+
+| Functions | |
+| :--- | :--- |
+| [`refusal`](#refusal) | mink's failure `f` as mach's: an allocation it was refused is the machine's, and anything else the compiler's |
+| [`refused`](#refused-1) | mink's refusal `f` of a part of a target as a user failure of `kind`, in mink's words; a failure that refuses no part is mink's own, as `refusal` words it |
+| [`spec_of`](#spec_of) | the system and the architecture named `sys` and `arch`, each a row's name, refused as mink refuses them, as a user failure of `kind` |
+
+| Constants | |
+| :--- | :--- |
+| [`MAX_ADDED`](#constants) | the most extensions a target adds over its baseline |
+
+---
+
+## Selected
 
 ```mach
-pub val MAX_ADDED: u32 = 64
-```
-
-the most extensions a target adds over its baseline
-
-## rec Selected
-
-```mach
-pub rec Selected;
+pub rec Selected {
+    catalog: *masc_extension.Catalog;
+    words:   [SELECTED_WORDS]u64;
+}
 ```
 
 a closed selection of masc's catalog of the target's architecture, held by value
 
-catalog: the catalog, nil where masc serves the architecture with none
-words: one bit per catalog row the selection holds
+| Field | Type | |
+| :--- | :--- | :--- |
+| `catalog` | `*masc_extension.Catalog` | the catalog, nil where masc serves the architecture with none |
+| `words` | `[SELECTED_WORDS]u64` | one bit per catalog row the selection holds |
 
-## fun selected_none
+### selected_none
 
 ```mach
-pub fun selected_none() Selected;
+pub fun selected_none() Selected
 ```
 
 no selection
 
-## fun selected_has
+### selected_has
 
 ```mach
-pub fun selected_has(s: *Selected, id: requirement.Id) bool;
+pub fun selected_has(s: *Selected, id: requirement.Id) bool
 ```
 
 whether `s` holds the catalog row `id`
 
-## fun extension_named
+### extension_named
 
 ```mach
-pub fun extension_named(s: *Selected, name: str, len: usize) opt[requirement.Id];
+pub fun extension_named(s: *Selected, name: str, len: usize) opt[requirement.Id]
 ```
 
 the one extension of the selection's catalog `name[0..len]` names, none where the
 catalog has no such name or it names a level of many
 
-## rec Target
+## Target
 
 ```mach
-pub rec Target;
+pub rec Target {
+    target:        mink_target.Target;
+    added:         [MAX_ADDED]str;
+    added_count:   u32;
+    selected:      Selected;
+    code_model:    opt[*CodeModel];
+    output:        opt[*mink_output.Kind];
+    base:          u64;
+    stack_reserve: u64;
+    stack_commit:  u64;
+}
 ```
 
 a target mink resolved and masc checked
 
-target: mink's resolution, its rows nil where no target is selected. its `ext`
-               is borrowed from the narrowing, which a resolved target outlives, so it
-               is cleared and the names are held in `added`
-added: the names of masc's catalog the target adds over its baseline
-added_count: how many
-selected: masc's closed selection of the instruction set with what the target adds
-code_model: the code model the narrowing names, none where the target takes its host's
-               default, which mirl reads as unpicked
-output: the output kind of the artifact under build, which mirl's address model
-               reads: a shared object's exported definitions another image may preempt.
-               none where no artifact selected the target
-base: the image base the manifest states, 0 for none
-stack_reserve: the main stack's reserve the manifest states, else mach's default for the
-               system (mach.target.defaults), 0 for none
-stack_commit: the main stack's commit the manifest states, 0 for none
+| Field | Type | |
+| :--- | :--- | :--- |
+| `target` | `mink_target.Target` | mink's resolution, its rows nil where no target is selected. its `ext` is borrowed from the narrowing, which a resolved target outlives, so it is cleared and the names are held in `added` |
+| `added` | `[MAX_ADDED]str` | the names of masc's catalog the target adds over its baseline |
+| `added_count` | `u32` | how many |
+| `selected` | `Selected` | masc's closed selection of the instruction set with what the target adds |
+| `code_model` | `opt[*CodeModel]` | the code model the narrowing names, none where the target takes its host's default, which mirl reads as unpicked |
+| `output` | `opt[*mink_output.Kind]` | the output kind of the artifact under build, which mirl's address model reads: a shared object's exported definitions another image may preempt. none where no artifact selected the target |
+| `base` | `u64` | the image base the manifest states, 0 for none |
+| `stack_reserve` | `u64` | the main stack's reserve the manifest states, else mach's default for the system (mach.target.defaults), 0 for none |
+| `stack_commit` | `u64` | the main stack's commit the manifest states, 0 for none |
 
-## rec Image
+### none
 
 ```mach
-pub rec Image;
-```
-
-the image keys a manifest states of a target, 0 for each it leaves out
-
-## fun none
-
-```mach
-pub fun none() Target;
+pub fun none() Target
 ```
 
 no target selected
 
-## fun is_selected
+### is_selected
 
 ```mach
-pub fun is_selected(t: *Target) bool;
+pub fun is_selected(t: *Target) bool
 ```
 
 whether a target is selected
 
-## fun abi
+### abi
 
 ```mach
-pub fun abi(t: *Target) *mink_arch.Abi;
+pub fun abi(t: *Target) *mink_arch.Abi
 ```
 
 the calling convention row of the target, nil where its family names none
 
-## fun abi_name
+### abi_name
 
 ```mach
-pub fun abi_name(t: *Target) str;
+pub fun abi_name(t: *Target) str
 ```
 
 mink's psABI name of the target's calling convention, "" where its family names none
 
-## fun isa
+### isa
 
 ```mach
-pub fun isa(t: *Target) str;
+pub fun isa(t: *Target) str
 ```
 
 the instruction set the target stands on, in masc's spelling
 
-## fun pie
+### pie
 
 ```mach
-pub fun pie(t: *Target) bool;
+pub fun pie(t: *Target) bool
 ```
 
 whether the target's executable is position independent: the linkage the target
 resolved to. false where the host runs no executable
 
-## rec Refused
+## Image
 
 ```mach
-pub rec Refused;
+pub rec Image {
+    base:          u64;
+    stack_reserve: u64;
+    stack_commit:  u64;
+}
 ```
 
-a refusal of a target and the part of it refused
+the image keys a manifest states of a target, 0 for each it leaves out
 
-part: the part, as mink names it (mink_target.part_name)
-why: the refusal, worded
-
-## fun refusal
+### resolve
 
 ```mach
-pub fun refusal(a: *A.Allocator, f: mink_fail.Fail) fail.Fail;
-```
-
-mink's failure `f` as mach's: an allocation it was refused is the machine's, and anything
-else the compiler's
-
-## fun refused
-
-```mach
-pub fun refused(a: *A.Allocator, kind: diagnostic_kind.Kind, f: mink_fail.Fail) fail.Fail;
-```
-
-mink's refusal `f` of a part of a target as a user failure of `kind`, in mink's words; a
-failure that refuses no part is mink's own, as `refusal` words it
-
-## fun spec_of
-
-```mach
-pub fun spec_of(a: *A.Allocator, kind: diagnostic_kind.Kind, sys: str, arch: str) res[mink_target.Spec, fail.Fail];
-```
-
-the system and the architecture named `sys` and `arch`, each a row's name, refused as mink
-refuses them, as a user failure of `kind`
-
-## fun resolve
-
-```mach
-pub fun resolve(a: *A.Allocator, s: mink_target.Spec, n: *mink_target.Narrowing, image: Image) res[Target, Refused];
+pub fun resolve(a: *A.Allocator, s: mink_target.Spec, n: *mink_target.Narrowing, image: Image) res[Target, Refused]
 ```
 
 the target `s` narrowed by `n` resolves to, with the image keys `image` states. mink
 resolves every part, the object format included, and masc checks the instruction set and
 the extensions the narrowing adds. the target holds the names of the extensions, and
 borrows the narrowing's other text
+
+## Refused
+
+```mach
+pub rec Refused {
+    part: str;
+    why:  fail.Fail;
+}
+```
+
+a refusal of a target and the part of it refused
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `part` | `str` | the part, as mink names it (mink_target.part_name) |
+| `why` | `fail.Fail` | the refusal, worded |
+
+## Functions
+
+### refusal
+
+```mach
+pub fun refusal(a: *A.Allocator, f: mink_fail.Fail) fail.Fail
+```
+
+mink's failure `f` as mach's: an allocation it was refused is the machine's, and anything
+else the compiler's
+
+### refused
+
+```mach
+pub fun refused(a: *A.Allocator, kind: diagnostic_kind.Kind, f: mink_fail.Fail) fail.Fail
+```
+
+mink's refusal `f` of a part of a target as a user failure of `kind`, in mink's words; a
+failure that refuses no part is mink's own, as `refusal` words it
+
+### spec_of
+
+```mach
+pub fun spec_of(a: *A.Allocator, kind: diagnostic_kind.Kind, sys: str, arch: str) res[mink_target.Spec, fail.Fail]
+```
+
+the system and the architecture named `sys` and `arch`, each a row's name, refused as mink
+refuses them, as a user failure of `kind`
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `MAX_ADDED` | `u32` | `64` | the most extensions a target adds over its baseline |
 

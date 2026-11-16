@@ -1,3 +1,5 @@
+[mach](../README.md) / [package](README.md) / **agreement**
+
 # mach.package.agreement
 
 agreement: one package pinned at one commit across a whole dependency closure. every
@@ -10,32 +12,48 @@ that select differently are the root's override or a conflict, which the closure
 already notes or refuses, and a version range is reconciled by resolution, so a
 requirer's pin of it is only a seed
 
-## fun disagreements
+<sub>source: [`src/package/agreement.mach`](../../../src/package/agreement.mach) · imported by 2 modules</sub>
+
+<sub>`package_closure` is [`mach.package.closure`](closure.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `A` is `std.allocator`</sub>
+
+| Functions | |
+| :--- | :--- |
+| [`disagreements`](#disagreements) | one line per pin that differs from the first one seen for its identity, in closure order |
+| [`refused`](#refused) | the refusal of a closure that pins a package at more than one commit, ok when `lines` is empty: every line past the first is reported to the operation's report and the first is the failure, so every command that walks a closure refuses a disagreement alike |
+| [`lines_dnit`](#lines_dnit) | |
+
+---
+
+## Functions
+
+### disagreements
 
 ```mach
-pub fun disagreements(op: *package_closure.Operation, reqs: *Vector[package_closure.Request], out: *Vector[str]) err[fail.Fail];
+pub fun disagreements(op: *package_closure.Operation, reqs: *Vector[package_closure.Request], out: *Vector[str]) err[fail.Fail]
 ```
 
 one line per pin that differs from the first one seen for its identity, in closure order
 
-op: the operation
-reqs: the realized closure
-out: receives the lines, owned by `op.a`; free with `lines_dnit`
-ret: err naming the first failure to read a manifest or a pin
+| Parameter | |
+| :--- | :--- |
+| `op` | the operation |
+| `reqs` | the realized closure |
+| `out` | receives the lines, owned by `op.a`; free with `lines_dnit` |
+| **returns** | err naming the first failure to read a manifest or a pin |
 
-## fun refused
+### refused
 
 ```mach
-pub fun refused(op: *package_closure.Operation, lines: *Vector[str]) err[fail.Fail];
+pub fun refused(op: *package_closure.Operation, lines: *Vector[str]) err[fail.Fail]
 ```
 
 the refusal of a closure that pins a package at more than one commit, ok when `lines` is
 empty: every line past the first is reported to the operation's report and the first is the
 failure, so every command that walks a closure refuses a disagreement alike
 
-## fun lines_dnit
+### lines_dnit
 
 ```mach
-pub fun lines_dnit(a: *A.Allocator, lines: *Vector[str]);
+pub fun lines_dnit(a: *A.Allocator, lines: *Vector[str])
 ```
 

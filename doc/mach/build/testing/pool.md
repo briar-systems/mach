@@ -1,3 +1,5 @@
+[mach](../../README.md) / [build](../README.md) / [testing](README.md) / **pool**
+
 # mach.build.testing.pool
 
 the test process pool: every test of a run is its own process, up to a window
@@ -5,42 +7,70 @@ of them at once, each bounded by the run's timeout and its output captured to
 a log beside the dispatcher. a test is classified and reported to the readout
 the moment it is reaped, and the run closes with its summary
 
-## rec Config
+<sub>source: [`src/build/testing/pool.mach`](../../../../src/build/testing/pool.mach) · imported by 1 module</sub>
+
+<sub>`runner` is [`mach.manifest.runner`](../../manifest/runner.md) · `chrono_duration` is `std.chrono.duration` · `A` is `std.allocator` · `readout` is [`mach.report.readout`](../../report/readout.md) · `testrun` is [`mach.report.testrun`](../../report/testrun.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Config`](#config) | `rec` | how a run executes its tests |
+| [`Counts`](#counts) | `rec` | what a finished run decides: how many tests did not pass, and how many of those the run's own machinery failed rather than the test |
+
+| On `Config` | |
+| :--- | :--- |
+| [`run`](#run) | run one set of tests, each reported to sink as it finishes, and close the run with its summary |
+
+---
+
+## Config
 
 ```mach
-pub rec Config;
+pub rec Config {
+    runner:  *runner.Runner;
+    threads: u32;
+    timeout: chrono_duration.Duration;
+    level:   u8;
+    bytes:   bool;
+}
 ```
 
 how a run executes its tests
 
-runner: what each test is launched through, or nil for the test to run itself
-threads: how many tests run at once, at least one
-timeout: each test's bound, 0 for none
-level: the readout level; a passing test's output is kept only at the items level
-bytes: whether a test's captured output is kept for the renderer
+| Field | Type | |
+| :--- | :--- | :--- |
+| `runner` | `*runner.Runner` | what each test is launched through, or nil for the test to run itself |
+| `threads` | `u32` | how many tests run at once, at least one |
+| `timeout` | `chrono_duration.Duration` | each test's bound, 0 for none |
+| `level` | `u8` | the readout level; a passing test's output is kept only at the items level |
+| `bytes` | `bool` | whether a test's captured output is kept for the renderer |
 
-## rec Counts
-
-```mach
-pub rec Counts;
-```
-
-what a finished run decides: how many tests did not pass, and how many of
-those the run's own machinery failed rather than the test
-
-## fun run
+### run
 
 ```mach
-pub fun run(a: *A.Allocator, sink: *readout.Sink, arts: *testrun.TestArtifact, n: u32, config: *Config) res[Counts, fail.Fail];
+pub fun run(a: *A.Allocator, sink: *readout.Sink, arts: *testrun.TestArtifact, n: u32, config: *Config) res[Counts, fail.Fail]
 ```
 
 run one set of tests, each reported to sink as it finishes, and close the run
 with its summary
 
-a: backs the results, the logs' paths and every process
-sink: the readout the run reports to
-arts: the tests
-n: how many there are
-config: how they run
-ret: the run's counts; err when the run could not start, before any test ran
+| Parameter | |
+| :--- | :--- |
+| `a` | backs the results, the logs' paths and every process |
+| `sink` | the readout the run reports to |
+| `arts` | the tests |
+| `n` | how many there are |
+| `config` | how they run |
+| **returns** | the run's counts; err when the run could not start, before any test ran |
+
+## Counts
+
+```mach
+pub rec Counts {
+    failed:         u32;
+    infrastructure: u32;
+}
+```
+
+what a finished run decides: how many tests did not pass, and how many of
+those the run's own machinery failed rather than the test
 

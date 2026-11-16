@@ -1,327 +1,132 @@
+[mach](../README.md) / [front](README.md) / **token**
+
 # mach.front.token
 
-## def Kind
+the tokens of the language: their kinds, fixed punctuation spellings and infix precedence
+
+<sub>source: [`src/front/token.mach`](../../../src/front/token.mach) · imported by 7 modules</sub>
+
+<sub>`base_source` is [`mach.base.source`](../base/source.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Kind`](#kind) | `def` |  |
+| [`Token`](#token) | `rec` |  |
+| [`Spelling`](#spelling) | `rec` | a token the source spells with fixed punctuation |
+
+| On `Kind` | |
+| :--- | :--- |
+| [`KIND_IDENT`](#kind) · [`KIND_LIT_INT`](#kind) · [`KIND_LIT_FLOAT`](#kind) · [`KIND_LIT_CHAR`](#kind) · [`KIND_LIT_STR`](#kind) · [`KIND_LPAREN`](#kind) · [`KIND_RPAREN`](#kind) · [`KIND_LBRACE`](#kind) · [`KIND_RBRACE`](#kind) · [`KIND_LBRACKET`](#kind) · [`KIND_RBRACKET`](#kind) · [`KIND_SEMI`](#kind) · [`KIND_COLON`](#kind) · [`KIND_COMMA`](#kind) · [`KIND_DOT`](#kind) · [`KIND_QUESTION`](#kind) · [`KIND_AT`](#kind) · [`KIND_DOLLAR`](#kind) · [`KIND_PLUS`](#kind) · [`KIND_MINUS`](#kind) · [`KIND_STAR`](#kind) · [`KIND_SLASH`](#kind) · [`KIND_PERCENT`](#kind) · [`KIND_AMP`](#kind) · [`KIND_PIPE`](#kind) · [`KIND_CARET`](#kind) · [`KIND_TILDE`](#kind) · [`KIND_EQ`](#kind) · [`KIND_EQ_EQ`](#kind) · [`KIND_BANG`](#kind) · [`KIND_BANG_EQ`](#kind) · [`KIND_LT`](#kind) · [`KIND_LT_EQ`](#kind) · [`KIND_LT_LT`](#kind) · [`KIND_GT`](#kind) · [`KIND_GT_EQ`](#kind) · [`KIND_GT_GT`](#kind) · [`KIND_AMP_AMP`](#kind) · [`KIND_PIPE_PIPE`](#kind) · [`KIND_COLON_COLON`](#kind) · [`KIND_DOT_DOT_DOT`](#kind) · [`KIND_COLON_TILDE`](#kind) · [`KIND_DECORATOR_OPEN`](#kind) · [`KIND_COLON_GT`](#kind) · [`KIND_EOF`](#kind) · [`KIND_ERROR`](#kind) · [`make`](#make) | |
+| [`infix_precedence`](#infix_precedence) | the binding power of an infix operator token; 0 for every other kind, which is not an operator (a partition, enumerated by its test) |
+| [`is_right_assoc`](#is_right_assoc) | |
+
+| On `Token` | |
+| :--- | :--- |
+| [`spelling_at`](#spelling_at) | the fixed spelling that starts at `pos` in NUL-terminated `source`, the longest one, as a token |
+
+---
+
+## Kind
 
 ```mach
 pub def Kind: u8
 ```
 
-## val KIND_IDENT
+| Name | Value | |
+| :--- | :--- | :--- |
+| `KIND_IDENT` | `0` |  |
+| `KIND_LIT_INT` | `1` |  |
+| `KIND_LIT_FLOAT` | `2` |  |
+| `KIND_LIT_CHAR` | `3` |  |
+| `KIND_LIT_STR` | `4` |  |
+| `KIND_LPAREN` | `5` |  |
+| `KIND_RPAREN` | `6` |  |
+| `KIND_LBRACE` | `7` |  |
+| `KIND_RBRACE` | `8` |  |
+| `KIND_LBRACKET` | `9` |  |
+| `KIND_RBRACKET` | `10` |  |
+| `KIND_SEMI` | `11` |  |
+| `KIND_COLON` | `12` |  |
+| `KIND_COMMA` | `13` |  |
+| `KIND_DOT` | `14` |  |
+| `KIND_QUESTION` | `15` |  |
+| `KIND_AT` | `16` |  |
+| `KIND_DOLLAR` | `17` |  |
+| `KIND_PLUS` | `18` |  |
+| `KIND_MINUS` | `19` |  |
+| `KIND_STAR` | `20` |  |
+| `KIND_SLASH` | `21` |  |
+| `KIND_PERCENT` | `22` |  |
+| `KIND_AMP` | `23` |  |
+| `KIND_PIPE` | `24` |  |
+| `KIND_CARET` | `25` |  |
+| `KIND_TILDE` | `26` |  |
+| `KIND_EQ` | `27` |  |
+| `KIND_EQ_EQ` | `28` |  |
+| `KIND_BANG` | `29` |  |
+| `KIND_BANG_EQ` | `30` |  |
+| `KIND_LT` | `31` |  |
+| `KIND_LT_EQ` | `32` |  |
+| `KIND_LT_LT` | `33` |  |
+| `KIND_GT` | `34` |  |
+| `KIND_GT_EQ` | `35` |  |
+| `KIND_GT_GT` | `36` |  |
+| `KIND_AMP_AMP` | `37` |  |
+| `KIND_PIPE_PIPE` | `38` |  |
+| `KIND_COLON_COLON` | `39` |  |
+| `KIND_DOT_DOT_DOT` | `40` |  |
+| `KIND_COLON_TILDE` | `41` |  |
+| `KIND_DECORATOR_OPEN` | `42` |  |
+| `KIND_COLON_GT` | `43` |  |
+| `KIND_EOF` | `254` |  |
+| `KIND_ERROR` | `255` |  |
+
+### make
 
 ```mach
-pub val KIND_IDENT:     Kind = 0
+pub fun make(kind: Kind, offset: usize, len: usize) Token
 ```
 
-## val KIND_LIT_INT
+### infix_precedence
 
 ```mach
-pub val KIND_LIT_INT:   Kind = 1
-```
-
-## val KIND_LIT_FLOAT
-
-```mach
-pub val KIND_LIT_FLOAT: Kind = 2
-```
-
-## val KIND_LIT_CHAR
-
-```mach
-pub val KIND_LIT_CHAR:  Kind = 3
-```
-
-## val KIND_LIT_STR
-
-```mach
-pub val KIND_LIT_STR:   Kind = 4
-```
-
-## val KIND_LPAREN
-
-```mach
-pub val KIND_LPAREN:   Kind = 5
-```
-
-## val KIND_RPAREN
-
-```mach
-pub val KIND_RPAREN:   Kind = 6
-```
-
-## val KIND_LBRACE
-
-```mach
-pub val KIND_LBRACE:   Kind = 7
-```
-
-## val KIND_RBRACE
-
-```mach
-pub val KIND_RBRACE:   Kind = 8
-```
-
-## val KIND_LBRACKET
-
-```mach
-pub val KIND_LBRACKET: Kind = 9
-```
-
-## val KIND_RBRACKET
-
-```mach
-pub val KIND_RBRACKET: Kind = 10
-```
-
-## val KIND_SEMI
-
-```mach
-pub val KIND_SEMI:     Kind = 11
-```
-
-## val KIND_COLON
-
-```mach
-pub val KIND_COLON:    Kind = 12
-```
-
-## val KIND_COMMA
-
-```mach
-pub val KIND_COMMA:    Kind = 13
-```
-
-## val KIND_DOT
-
-```mach
-pub val KIND_DOT:      Kind = 14
-```
-
-## val KIND_QUESTION
-
-```mach
-pub val KIND_QUESTION: Kind = 15
-```
-
-## val KIND_AT
-
-```mach
-pub val KIND_AT:       Kind = 16
-```
-
-## val KIND_DOLLAR
-
-```mach
-pub val KIND_DOLLAR:   Kind = 17
-```
-
-## val KIND_PLUS
-
-```mach
-pub val KIND_PLUS:    Kind = 18
-```
-
-## val KIND_MINUS
-
-```mach
-pub val KIND_MINUS:   Kind = 19
-```
-
-## val KIND_STAR
-
-```mach
-pub val KIND_STAR:    Kind = 20
-```
-
-## val KIND_SLASH
-
-```mach
-pub val KIND_SLASH:   Kind = 21
-```
-
-## val KIND_PERCENT
-
-```mach
-pub val KIND_PERCENT: Kind = 22
-```
-
-## val KIND_AMP
-
-```mach
-pub val KIND_AMP:     Kind = 23
-```
-
-## val KIND_PIPE
-
-```mach
-pub val KIND_PIPE:    Kind = 24
-```
-
-## val KIND_CARET
-
-```mach
-pub val KIND_CARET:   Kind = 25
-```
-
-## val KIND_TILDE
-
-```mach
-pub val KIND_TILDE:   Kind = 26
-```
-
-## val KIND_EQ
-
-```mach
-pub val KIND_EQ:      Kind = 27
-```
-
-## val KIND_EQ_EQ
-
-```mach
-pub val KIND_EQ_EQ:   Kind = 28
-```
-
-## val KIND_BANG
-
-```mach
-pub val KIND_BANG:    Kind = 29
-```
-
-## val KIND_BANG_EQ
-
-```mach
-pub val KIND_BANG_EQ: Kind = 30
-```
-
-## val KIND_LT
-
-```mach
-pub val KIND_LT:      Kind = 31
-```
-
-## val KIND_LT_EQ
-
-```mach
-pub val KIND_LT_EQ:   Kind = 32
-```
-
-## val KIND_LT_LT
-
-```mach
-pub val KIND_LT_LT:   Kind = 33
-```
-
-## val KIND_GT
-
-```mach
-pub val KIND_GT:      Kind = 34
-```
-
-## val KIND_GT_EQ
-
-```mach
-pub val KIND_GT_EQ:   Kind = 35
-```
-
-## val KIND_GT_GT
-
-```mach
-pub val KIND_GT_GT:   Kind = 36
-```
-
-## val KIND_AMP_AMP
-
-```mach
-pub val KIND_AMP_AMP:   Kind = 37
-```
-
-## val KIND_PIPE_PIPE
-
-```mach
-pub val KIND_PIPE_PIPE: Kind = 38
-```
-
-## val KIND_COLON_COLON
-
-```mach
-pub val KIND_COLON_COLON: Kind = 39
-```
-
-## val KIND_DOT_DOT_DOT
-
-```mach
-pub val KIND_DOT_DOT_DOT: Kind = 40
-```
-
-## val KIND_COLON_TILDE
-
-```mach
-pub val KIND_COLON_TILDE: Kind = 41
-```
-
-## val KIND_DECORATOR_OPEN
-
-```mach
-pub val KIND_DECORATOR_OPEN: Kind = 42
-```
-
-## val KIND_COLON_GT
-
-```mach
-pub val KIND_COLON_GT:       Kind = 43
-```
-
-## val KIND_EOF
-
-```mach
-pub val KIND_EOF:   Kind = 254
-```
-
-## val KIND_ERROR
-
-```mach
-pub val KIND_ERROR: Kind = 255
-```
-
-## rec Token
-
-```mach
-pub rec Token;
-```
-
-## fun make
-
-```mach
-pub fun make(kind: Kind, offset: usize, len: usize) Token;
-```
-
-## rec Spelling
-
-```mach
-pub rec Spelling;
-```
-
-a token the source spells with fixed punctuation
-
-## fun spelling_at
-
-```mach
-pub fun spelling_at(source: str, pos: usize) opt[Token];
-```
-
-the fixed spelling that starts at `pos` in NUL-terminated `source`, the longest one, as a token
-
-## fun infix_precedence
-
-```mach
-pub fun infix_precedence(kind: Kind) u8;
+pub fun infix_precedence(kind: Kind) u8
 ```
 
 the binding power of an infix operator token; 0 for every other kind, which
 is not an operator (a partition, enumerated by its test)
 
-## fun is_right_assoc
+### is_right_assoc
 
 ```mach
-pub fun is_right_assoc(kind: Kind) bool;
+pub fun is_right_assoc(kind: Kind) bool
 ```
+
+## Token
+
+```mach
+pub rec Token {
+    span: base_source.Span;
+    kind: Kind;
+}
+```
+
+### spelling_at
+
+```mach
+pub fun spelling_at(source: str, pos: usize) opt[Token]
+```
+
+the fixed spelling that starts at `pos` in NUL-terminated `source`, the longest one, as a token
+
+## Spelling
+
+```mach
+pub rec Spelling {
+    text: str;
+    kind: Kind;
+}
+```
+
+a token the source spells with fixed punctuation
 

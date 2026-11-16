@@ -1,86 +1,64 @@
+[mach](../README.md) / [type](README.md) / **visit**
+
 # mach.type.visit
 
 one walk over the type graph: a property is a leaf predicate, and the walk follows
 the edges the property names from a type to the types it is built from. an aggregate is
 entered once per scan, and a type id the store does not hold is an internal failure
 
-## def Edges
+<sub>source: [`src/type/visit.mach`](../../../src/type/visit.mach) · imported by 5 modules</sub>
+
+<sub>`type` is [`mach.type`](../type.md) · `report_phase` is [`mach.report.phase`](../report/phase.md) · `type_scan` is [`mach.type.scan`](scan.md) · `type_kind` is [`mach.type.kind`](kind.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Edges`](#edges) | `def` |  |
+| [`Verdict`](#verdict) | `def` | what a leaf predicate says of one type |
+| [`Walk`](#walk) | `rec` |  |
+
+| On `Edges` | |
+| :--- | :--- |
+| [`EDGE_BASE`](#edges) | a secret's base |
+| [`EDGE_ELEMENT`](#edges) | an array's element |
+| [`EDGE_POINTEE`](#edges) | |
+| [`EDGE_SIGNATURE`](#edges) | a function's return, then its parameters |
+| [`EDGE_ARGUMENT`](#edges) | an instance's arguments |
+| [`EDGE_DECLARATION`](#edges) | the generic declaration an instance instantiates |
+| [`EDGE_FIELD`](#edges) | a record's, union's or tag's declared fields |
+| [`EDGES_VALUE`](#edges) | what a value holds in its own storage |
+| [`EDGES_SPELLING`](#edges) | every type a type is spelled from, through pointers and signatures included |
+
+| On `Verdict` | |
+| :--- | :--- |
+| [`DESCEND`](#verdict) | the property may lie below: follow the edges |
+| [`PRUNE`](#verdict) | the property is not here and not below |
+| [`FOUND`](#verdict) | the property is here, which ends the walk |
+
+| On `Walk` | |
+| :--- | :--- |
+| [`reaches`](#reaches) | whether the property holds at `tid` or below it; false once the walk has failed |
+
+---
+
+## Edges
 
 ```mach
 pub def Edges: u8
 ```
 
-## val EDGE_BASE
+| Name | Value | |
+| :--- | :--- | :--- |
+| `EDGE_BASE` | `1` | a secret's base |
+| `EDGE_ELEMENT` | `2` | an array's element |
+| `EDGE_POINTEE` | `4` |  |
+| `EDGE_SIGNATURE` | `8` | a function's return, then its parameters |
+| `EDGE_ARGUMENT` | `16` | an instance's arguments |
+| `EDGE_DECLARATION` | `32` | the generic declaration an instance instantiates |
+| `EDGE_FIELD` | `64` | a record's, union's or tag's declared fields |
+| `EDGES_VALUE` | `EDGE_BASE \| EDGE_ELEMENT \| EDGE_FIELD \| EDGE_INSTANCE_FIELD` | what a value holds in its own storage |
+| `EDGES_SPELLING` | `EDGE_BASE \| EDGE_ELEMENT \| EDGE_POINTEE \| EDGE_SIGNATURE \| EDGE_ARGUMENT` | every type a type is spelled from, through pointers and signatures included |
 
-```mach
-pub val EDGE_BASE: Edges = 1
-```
-
-a secret's base
-
-## val EDGE_ELEMENT
-
-```mach
-pub val EDGE_ELEMENT: Edges = 2
-```
-
-an array's element
-
-## val EDGE_POINTEE
-
-```mach
-pub val EDGE_POINTEE: Edges = 4
-```
-
-## val EDGE_SIGNATURE
-
-```mach
-pub val EDGE_SIGNATURE: Edges = 8
-```
-
-a function's return, then its parameters
-
-## val EDGE_ARGUMENT
-
-```mach
-pub val EDGE_ARGUMENT: Edges = 16
-```
-
-an instance's arguments
-
-## val EDGE_DECLARATION
-
-```mach
-pub val EDGE_DECLARATION: Edges = 32
-```
-
-the generic declaration an instance instantiates
-
-## val EDGE_FIELD
-
-```mach
-pub val EDGE_FIELD: Edges = 64
-```
-
-a record's, union's or tag's declared fields
-
-## val EDGES_VALUE
-
-```mach
-pub val EDGES_VALUE: Edges = EDGE_BASE | EDGE_ELEMENT | EDGE_FIELD | EDGE_INSTANCE_FIELD
-```
-
-what a value holds in its own storage
-
-## val EDGES_SPELLING
-
-```mach
-pub val EDGES_SPELLING: Edges = EDGE_BASE | EDGE_ELEMENT | EDGE_POINTEE | EDGE_SIGNATURE | EDGE_ARGUMENT
-```
-
-every type a type is spelled from, through pointers and signatures included
-
-## def Verdict
+## Verdict
 
 ```mach
 pub def Verdict: u8
@@ -88,40 +66,34 @@ pub def Verdict: u8
 
 what a leaf predicate says of one type
 
-## val DESCEND
+| Name | Value | |
+| :--- | :--- | :--- |
+| `DESCEND` | `0` | the property may lie below: follow the edges |
+| `PRUNE` | `1` | the property is not here and not below |
+| `FOUND` | `2` | the property is here, which ends the walk |
+
+## Walk
 
 ```mach
-pub val DESCEND: Verdict = 0
+pub rec Walk[C] {
+    types:  *type.TypeInterner;
+    status: *report_phase.PhaseStatus;
+    # the aggregates already entered; nil enters each every time it is met
+    scan: *type_scan.Scan;
+    # with a scan, every type is entered once, not only an aggregate: for a property whose
+    # answer below a type does not depend on the path the walk took to it, so a scan shared
+    # across many roots visits each type once in all
+    once:  bool;
+    edges: Edges;
+    ctx:   *C;
+    leaf:  fun(*C, type_kind.TypeId, *type.Type) Verdict;
+}
 ```
 
-the property may lie below: follow the edges
-
-## val PRUNE
+### reaches
 
 ```mach
-pub val PRUNE: Verdict = 1
-```
-
-the property is not here and not below
-
-## val FOUND
-
-```mach
-pub val FOUND: Verdict = 2
-```
-
-the property is here, which ends the walk
-
-## rec Walk
-
-```mach
-pub rec Walk[C];
-```
-
-## fun reaches
-
-```mach
-pub fun reaches[C](w: *Walk[C], tid: type_kind.TypeId) bool;
+pub fun reaches[C](w: *Walk[C], tid: type_kind.TypeId) bool
 ```
 
 whether the property holds at `tid` or below it; false once the walk has failed. the walk

@@ -1,39 +1,67 @@
+[mach](../README.md) / [build](README.md) / **outcome**
+
 # mach.build.outcome
 
-## def BuildSeverity
+what a build produced: artifacts, test dispatchers, declassifications, worst severity
+
+an outcome owns everything it records, and a refused record leaves it as it was. a
+failure is a `fail.Fail` and folds into the severity, while the failures and
+diagnostics themselves went to the build's readout sink as they happened.
+
+<sub>source: [`src/build/outcome.mach`](../../../src/build/outcome.mach) · imported by 6 modules</sub>
+
+<sub>`fail` is [`mach.base.fail`](../base/fail.md) · `Artifact` is private · `testrun` is [`mach.report.testrun`](../report/testrun.md) · `A` is `std.allocator`</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`BuildSeverity`](#buildseverity) | `def` |  |
+| [`BuildOutcome`](#buildoutcome) | `rec` | what a build produced |
+| [`Declassified`](#declassified) | `rec` | one declassification of the source, a `:>T` |
+
+| On `BuildSeverity` | |
+| :--- | :--- |
+| [`BUILD_OK`](#buildseverity) · [`BUILD_USER`](#buildseverity) · [`BUILD_ENVIRONMENT`](#buildseverity) · [`BUILD_INTERNAL`](#buildseverity) · [`severity_of`](#severity_of) | |
+
+| On `BuildOutcome` | |
+| :--- | :--- |
+| [`outcome_init`](#outcome_init) | an empty outcome whose records `oa` will own |
+| [`outcome_dnit`](#outcome_dnit) | release an outcome and everything it recorded; nil is a no-op |
+| [`record_artifact`](#record_artifact) | every record_* copies what it stores into the outcome's allocator; a refused copy or push leaves the outcome exactly as it was and releases the copies made before the refusal |
+| [`record_test`](#record_test) | t's text is borrowed; the outcome keeps its own copy |
+| [`record_declassified`](#record_declassified) | d's texts are borrowed; the outcome keeps its own copies |
+| [`fold_fail`](#fold_fail) | a reported or user failure is the user's; the severity never regresses |
+| [`merge`](#merge) | capacity is reserved for both transfers before any element moves, so a refused reservation leaves both outcomes exactly as they were |
+
+---
+
+## BuildSeverity
 
 ```mach
 pub def BuildSeverity: u8
 ```
 
-## val BUILD_OK
+| Name | Value | |
+| :--- | :--- | :--- |
+| `BUILD_OK` | `0` |  |
+| `BUILD_USER` | `1` |  |
+| `BUILD_ENVIRONMENT` | `2` |  |
+| `BUILD_INTERNAL` | `3` |  |
+
+### severity_of
 
 ```mach
-pub val BUILD_OK:          BuildSeverity = 0
+pub fun severity_of(f: *fail.Fail) BuildSeverity
 ```
 
-## val BUILD_USER
+## BuildOutcome
 
 ```mach
-pub val BUILD_USER:        BuildSeverity = 1
-```
-
-## val BUILD_ENVIRONMENT
-
-```mach
-pub val BUILD_ENVIRONMENT: BuildSeverity = 2
-```
-
-## val BUILD_INTERNAL
-
-```mach
-pub val BUILD_INTERNAL:    BuildSeverity = 3
-```
-
-## rec BuildOutcome
-
-```mach
-pub rec BuildOutcome;
+pub rec BuildOutcome {
+    severity:     BuildSeverity;
+    artifacts:    Vector[Artifact];
+    tests:        Vector[testrun.TestArtifact];
+    declassified: Vector[Declassified];
+}
 ```
 
 what a build produced. owned by the allocator outcome_init was given: every
@@ -41,87 +69,91 @@ artifact path and test artifact in it is released together by outcome_dnit, and
 a refused record_* leaves the outcome exactly as it was. what happened along the
 way, failures and diagnostics included, went to the build's readout sink
 
-severity: the worst standing recorded, BUILD_OK to BUILD_INTERNAL; ordered, compared with >
-artifacts: the outputs written, in build order
-tests: the test dispatchers built, for the runner
-declassified: the declassifications a check listed, in module then source order
+| Field | Type | |
+| :--- | :--- | :--- |
+| `severity` | `BuildSeverity` | the worst standing recorded, BUILD_OK to BUILD_INTERNAL; ordered, compared with > |
+| `artifacts` | `Vector[Artifact]` | the outputs written, in build order |
+| `tests` | `Vector[testrun.TestArtifact]` | the test dispatchers built, for the runner |
+| `declassified` | `Vector[Declassified]` | the declassifications a check listed, in module then source order |
 
-## rec Declassified
-
-```mach
-pub rec Declassified;
-```
-
-one declassification of the source, a `:>T`
-
-file: the path of its file
-line: its line, from 1
-column: its column, from 1
-function: the function it stands in, "" at module scope
-secret: the type of the value it declassifies, as the source spells it
-
-## fun outcome_init
+### outcome_init
 
 ```mach
-pub fun outcome_init(oa: *A.Allocator) BuildOutcome;
+pub fun outcome_init(oa: *A.Allocator) BuildOutcome
 ```
 
 an empty outcome whose records `oa` will own
 
-## fun outcome_dnit
+### outcome_dnit
 
 ```mach
-pub fun outcome_dnit(bo: *BuildOutcome);
+pub fun outcome_dnit(bo: *BuildOutcome)
 ```
 
 release an outcome and everything it recorded; nil is a no-op
 
-## fun record_artifact
+### record_artifact
 
 ```mach
-pub fun record_artifact(bo: *BuildOutcome, kind: Spelled, path: str) err[A.Error];
+pub fun record_artifact(bo: *BuildOutcome, kind: Spelled, path: str) err[A.Error]
 ```
 
 every record_* copies what it stores into the outcome's allocator; a refused
 copy or push leaves the outcome exactly as it was and releases the copies
 made before the refusal
 
-## fun record_test
+### record_test
 
 ```mach
-pub fun record_test(bo: *BuildOutcome, t: testrun.TestArtifact) err[A.Error];
+pub fun record_test(bo: *BuildOutcome, t: testrun.TestArtifact) err[A.Error]
 ```
 
 t's text is borrowed; the outcome keeps its own copy. a nil text stays nil
 
-## fun record_declassified
+### record_declassified
 
 ```mach
-pub fun record_declassified(bo: *BuildOutcome, d: Declassified) err[A.Error];
+pub fun record_declassified(bo: *BuildOutcome, d: Declassified) err[A.Error]
 ```
 
 d's texts are borrowed; the outcome keeps its own copies
 
-## fun severity_of
+### fold_fail
 
 ```mach
-pub fun severity_of(f: *fail.Fail) BuildSeverity;
-```
-
-## fun fold_fail
-
-```mach
-pub fun fold_fail(bo: *BuildOutcome, f: *fail.Fail);
+pub fun fold_fail(bo: *BuildOutcome, f: *fail.Fail)
 ```
 
 a reported or user failure is the user's; the severity never regresses
 
-## fun merge
+### merge
 
 ```mach
-pub fun merge(agg: *BuildOutcome, unit: *BuildOutcome) err[A.Error];
+pub fun merge(agg: *BuildOutcome, unit: *BuildOutcome) err[A.Error]
 ```
 
 capacity is reserved for both transfers before any element moves, so
 a refused reservation leaves both outcomes exactly as they were
+
+## Declassified
+
+```mach
+pub rec Declassified {
+    file:     str;
+    line:     usize;
+    column:   usize;
+    function: str;
+    secret:   str;
+}
+```
+
+one declassification of the source, a `:>T`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `file` | `str` | the path of its file |
+| `line` | `usize` | its line, from 1 |
+| `column` | `usize` | its column, from 1 |
+| `function` | `str` | the function it stands in, "" at module scope |
+| `secret` | `str` | the type of the value it declassifies, as the source spells it |
 

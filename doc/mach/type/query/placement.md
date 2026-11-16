@@ -1,3 +1,5 @@
+[mach](../../README.md) / [type](../README.md) / [query](README.md) / **placement**
+
 # mach.type.query.placement
 
 where each parameter of a generic sits in the storage its instances lay out, answered
@@ -13,7 +15,34 @@ so passes repeat until one adds nothing. beside its places, a parameter is reach
 argument appears anywhere an instance's fields lead, an empty array's element included,
 which is what a question about what a type contains reads
 
-## def Place
+<sub>source: [`src/type/query/placement.mach`](../../../../src/type/query/placement.mach) · imported by 2 modules</sub>
+
+<sub>`type_query` is [`mach.type.query`](../query.md) · `map` is `std.collections.map` · `type_kind` is [`mach.type.kind`](../kind.md) · `Entry` is private · `Param` is private</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Place`](#place) | `def` | one bit of a parameter's places |
+| [`Places`](#places) | `rec` |  |
+
+| On `Place` | |
+| :--- | :--- |
+| [`LAID`](#place) · [`LAID_SECRET`](#place) · [`POINTEE`](#place) · [`place_at`](#place_at) | |
+
+| On `Places` | |
+| :--- | :--- |
+| [`init`](#init) · [`dnit`](#dnit) | |
+| [`settle`](#settle) | settles the places of `generic` and every generic it reaches; false when they cannot be known, because a generic it reaches has no fields yet or the walk failed |
+| [`bits`](#bits) | the places parameter `param` of a settled generic takes |
+| [`reached`](#reached) | whether parameter `param` of a settled generic is reached, through storage or not |
+| [`via`](#via) | the field of `generic` through which `param` first took place `place`, which it must take |
+
+| Constants | |
+| :--- | :--- |
+| [`PLACE_COUNT`](#constants) | |
+
+---
+
+## Place
 
 ```mach
 pub def Place: u8
@@ -21,84 +50,80 @@ pub def Place: u8
 
 one bit of a parameter's places
 
-## val LAID
+| Name | Value | |
+| :--- | :--- | :--- |
+| `LAID` | `1` |  |
+| `LAID_SECRET` | `2` |  |
+| `POINTEE` | `4` |  |
+
+### place_at
 
 ```mach
-pub val LAID:           Place = 1
+pub fun place_at(i: u32) Place
 ```
 
-## val LAID_SECRET
+## Places
 
 ```mach
-pub val LAID_SECRET:    Place = 2
+pub rec Places {
+    q:       *type_query.Query;
+    index:   map.Map[type_kind.TypeId, u32];
+    entries: Vector[Entry];
+    params:  Vector[Param];
+    # a generic met had no field table, so no answer is final
+    incomplete: bool;
+    grew:       bool;
+}
 ```
 
-## val POINTEE
+### init
 
 ```mach
-pub val POINTEE:        Place = 4
+pub fun init(q: *type_query.Query) Places
 ```
 
-## val PLACE_COUNT
+### dnit
 
 ```mach
-pub val PLACE_COUNT: u32 = 4
+pub fun dnit(p: *Places)
 ```
 
-## fun place_at
+### settle
 
 ```mach
-pub fun place_at(i: u32) Place;
-```
-
-## rec Places
-
-```mach
-pub rec Places;
-```
-
-## fun init
-
-```mach
-pub fun init(q: *type_query.Query) Places;
-```
-
-## fun dnit
-
-```mach
-pub fun dnit(p: *Places);
-```
-
-## fun settle
-
-```mach
-pub fun settle(p: *Places, generic: type_kind.TypeId) bool;
+pub fun settle(p: *Places, generic: type_kind.TypeId) bool
 ```
 
 settles the places of `generic` and every generic it reaches; false when they cannot be
 known, because a generic it reaches has no fields yet or the walk failed
 
-## fun bits
+### bits
 
 ```mach
-pub fun bits(p: *Places, generic: type_kind.TypeId, param: u32) u8;
+pub fun bits(p: *Places, generic: type_kind.TypeId, param: u32) u8
 ```
 
 the places parameter `param` of a settled generic takes
 
-## fun reached
+### reached
 
 ```mach
-pub fun reached(p: *Places, generic: type_kind.TypeId, param: u32) bool;
+pub fun reached(p: *Places, generic: type_kind.TypeId, param: u32) bool
 ```
 
 whether parameter `param` of a settled generic is reached, through storage or not
 
-## fun via
+### via
 
 ```mach
-pub fun via(p: *Places, generic: type_kind.TypeId, param: u32, place: Place) u32;
+pub fun via(p: *Places, generic: type_kind.TypeId, param: u32, place: Place) u32
 ```
 
 the field of `generic` through which `param` first took place `place`, which it must take
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `PLACE_COUNT` | `u32` | `4` |  |
 

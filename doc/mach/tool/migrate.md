@@ -1,3 +1,5 @@
+[mach](../README.md) / [tool](README.md) / **migrate**
+
 # mach.tool.migrate
 
 a project written for the previous major, rewritten into this one's spelling,
@@ -22,84 +24,70 @@ the rules are rows themselves, each tagged with the major it migrates from. a
 release carries the rows of the major before it: 8.0.0 deletes every row tagged
 6 and adds its own
 
-## val FROM_MAJOR
+<sub>source: [`src/tool/migrate.mach`](../../../src/tool/migrate.mach) · imported by 1 module</sub>
+
+<sub>`A` is `std.allocator` · `base_source` is [`mach.base.source`](../base/source.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `toml_value` is `toml.value`</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Dependency`](#dependency) | `rec` | a dependency of the root project, as `mach migrate` reads it |
+
+| On `Dependency` | |
+| :--- | :--- |
+| [`dependencies`](#dependencies) | each dependency of the manifest `text`, whose project is at `root`, as dep/ holds it |
+| [`source`](#source) | a source's text in this major's spelling: each comptime path whose leading segments a previous major named, each decorator it named, each `asm` head, each truth alias over a width and each bare use of a project rewritten |
+
+| Functions | |
+| :--- | :--- |
+| [`manifest`](#manifest) | a manifest's text in this major's spelling: each key the schema retires with a rewrite rewritten, and each template variable a previous major named renamed wherever a string writes it |
+| [`on_previous_major`](#on_previous_major) | whether a dependency's `[project].mach` range stands on the major this release migrates |
+| [`word_in`](#word_in) | the offset of `word` standing as a word in `text` from `at` to `end`, `end` when it does not: after a quote, a space or a path's `/`, and before a quote, a space or an `=` |
+| [`runs_mach`](#runs_mach) | whether a step's `argv`, its literals in `text`, runs mach |
+
+| Constants | |
+| :--- | :--- |
+| [`FROM_MAJOR`](#constants) | the major this release migrates from |
+
+---
+
+## Dependency
 
 ```mach
-pub val FROM_MAJOR: u32 = 6
-```
-
-the major this release migrates from
-
-## rec Dependency
-
-```mach
-pub rec Dependency;
+pub rec Dependency {
+    id:     str;
+    range:  str;
+    module: str;
+}
 ```
 
 a dependency of the root project, as `mach migrate` reads it
 
-id: its key under `[dep]`
-range: its `[project].mach`, nil when dep/ holds no manifest for it
-module: the module its exported artifact's entry is, nil when it exports none
+| Field | Type | |
+| :--- | :--- | :--- |
+| `id` | `str` | its key under `[dep]` |
+| `range` | `str` | its `[project].mach`, nil when dep/ holds no manifest for it |
+| `module` | `str` | the module its exported artifact's entry is, nil when it exports none |
 
-## fun manifest
-
-```mach
-pub fun manifest(a: *A.Allocator, text: str) res[str, fail.Fail];
-```
-
-a manifest's text in this major's spelling: each key the schema retires with
-a rewrite rewritten, and each template variable a previous major named
-renamed wherever a string writes it. a text that is not TOML is refused, and
-one already in this spelling comes back unchanged
-
-a: owns the returned text
-text: the manifest's text
-ret: the rewritten text, owned by `a`
-
-## fun on_previous_major
+### dependencies
 
 ```mach
-pub fun on_previous_major(range: str) bool;
-```
-
-whether a dependency's `[project].mach` range stands on the major this release migrates
-
-## fun dependencies
-
-```mach
-pub fun dependencies(a: *A.Allocator, sources: *base_source.SourceMap, root: str, text: str, out: *Vector[Dependency]) err[fail.Fail];
+pub fun dependencies(a: *A.Allocator, sources: *base_source.SourceMap, root: str, text: str, out: *Vector[Dependency]) err[fail.Fail]
 ```
 
 each dependency of the manifest `text`, whose project is at `root`, as dep/ holds it
 
-a: owns what `out` holds
-sources: receives the text of each dependency's manifest dep/ holds
-root: the project's directory
-text: its manifest's text
-out: receives the dependencies
+| Parameter | |
+| :--- | :--- |
+| `a` | owns what `out` holds |
+| `sources` | receives the text of each dependency's manifest dep/ holds |
+| `root` | the project's directory |
+| `text` | its manifest's text |
+| `out` | receives the dependencies |
 
-## fun word_in
-
-```mach
-pub fun word_in(text: str, at: usize, end: usize, word: str) usize;
-```
-
-the offset of `word` standing as a word in `text` from `at` to `end`, `end` when it does
-not: after a quote, a space or a path's `/`, and before a quote, a space or an `=`
-
-## fun runs_mach
+### source
 
 ```mach
-pub fun runs_mach(text: str, args: *toml_value.Array) bool;
-```
-
-whether a step's `argv`, its literals in `text`, runs mach
-
-## fun source
-
-```mach
-pub fun source(a: *A.Allocator, text: str, deps: *Vector[Dependency]) res[str, fail.Fail];
+pub fun source(a: *A.Allocator, text: str, deps: *Vector[Dependency]) res[str, fail.Fail]
 ```
 
 a source's text in this major's spelling: each comptime path whose leading
@@ -107,8 +95,60 @@ segments a previous major named, each decorator it named, each `asm` head, each
 truth alias over a width and each bare use of a project rewritten. only tokens
 are read, so a comment or a string that spells one is left as written
 
-a: owns the returned text
-text: the source's text
-deps: the root project's dependencies
-ret: the rewritten text, owned by `a`, or the lexer's refusal
+| Parameter | |
+| :--- | :--- |
+| `a` | owns the returned text |
+| `text` | the source's text |
+| `deps` | the root project's dependencies |
+| **returns** | the rewritten text, owned by `a`, or the lexer's refusal |
+
+## Functions
+
+### manifest
+
+```mach
+pub fun manifest(a: *A.Allocator, text: str) res[str, fail.Fail]
+```
+
+a manifest's text in this major's spelling: each key the schema retires with
+a rewrite rewritten, and each template variable a previous major named
+renamed wherever a string writes it. a text that is not TOML is refused, and
+one already in this spelling comes back unchanged
+
+| Parameter | |
+| :--- | :--- |
+| `a` | owns the returned text |
+| `text` | the manifest's text |
+| **returns** | the rewritten text, owned by `a` |
+
+### on_previous_major
+
+```mach
+pub fun on_previous_major(range: str) bool
+```
+
+whether a dependency's `[project].mach` range stands on the major this release migrates
+
+### word_in
+
+```mach
+pub fun word_in(text: str, at: usize, end: usize, word: str) usize
+```
+
+the offset of `word` standing as a word in `text` from `at` to `end`, `end` when it does
+not: after a quote, a space or a path's `/`, and before a quote, a space or an `=`
+
+### runs_mach
+
+```mach
+pub fun runs_mach(text: str, args: *toml_value.Array) bool
+```
+
+whether a step's `argv`, its literals in `text`, runs mach
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `FROM_MAJOR` | `u32` | `6` | the major this release migrates from |
 

@@ -1,3 +1,5 @@
+[mach](../../README.md) / [front](../README.md) / [comptime](README.md) / **path**
+
 # mach.front.comptime.path
 
 the comptime path registry: one row per `$root.segment...` path the compiler
@@ -9,7 +11,46 @@ message of the most specific family it falls in, or, when a previous major
 named its leading segments, with the name this one gives them, which
 `mach migrate` writes. a new path is a row here and its read
 
-## def Read
+<sub>source: [`src/front/comptime/path.mach`](../../../../src/front/comptime/path.mach) · imported by 3 modules</sub>
+
+<sub>`base_source` is [`mach.base.source`](../../base/source.md) · `comptime_scope` is [`mach.front.comptime.scope`](scope.md) · `ast` is [`mach.front.ast`](../ast.md) · `ast_id` is [`mach.front.ast.id`](../ast/id.md) · `intern` is [`mach.base.intern`](../../base/intern.md) · `comptime_value` is [`mach.front.comptime.value`](value.md) · `comptime_failure` is [`mach.front.comptime.failure`](failure.md) · `fail` is [`mach.base.fail`](../../base/fail.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Read`](#read) | `def` | what a path reads; `Row.arg` refines the version components, 0 major, 1 minor and 2 patch |
+| [`Row`](#row) | `rec` | one path |
+| [`Renamed`](#renamed) | `rec` | leading segments a previous major named, and the name this one gives them |
+
+| On `Read` | |
+| :--- | :--- |
+| [`READ_SYS_TAG`](#read) · [`READ_ARCH_TAG`](#read) · [`READ_ABI_TAG`](#read) · [`READ_MODE_TAG`](#read) · [`READ_BUILD_CT_MUL`](#read) · [`READ_REFUSED`](#read) · [`READ_RESERVED`](#read) | |
+
+| On `Row` | |
+| :--- | :--- |
+| [`at`](#at) | the row at `i` in declaration order, nil past the end |
+| [`lookup`](#lookup) | the row a written path matches, called or not; nil when none does |
+
+| On `Renamed` | |
+| :--- | :--- |
+| [`renamed`](#renamed-1) | the renamed row whose segments lead the written path, nil when none does |
+| [`renamed_depth`](#renamed_depth) | how many segments a renamed row's `from` spans |
+
+| Functions | |
+| :--- | :--- |
+| [`unknown`](#unknown) | the refusal of a path no row matches; nil when its root names no family |
+| [`eval_path`](#eval_path) · [`resolve_comptime_path`](#resolve_comptime_path) | |
+| [`sys_tag_for`](#sys_tag_for) | the tag of `$mach.sys.<name>`: the position of mink's system of that name |
+| [`arch_tag_for`](#arch_tag_for) | the tag of `$mach.arch.<name>`: the position of mink's architecture of that name |
+| [`abi_tag_for`](#abi_tag_for) | the tag of `$mach.abi.<name>`: the spelling's place among mink's conventions |
+
+| Constants | |
+| :--- | :--- |
+| [`COMPTIME_BARE_IDENT_MSG`](#constants) · [`MODE_DEBUG`](#constants) · [`MODE_RELEASE`](#constants) | |
+| [`MODE_COUNT`](#constants) | the `$mach.mode.*` tags, each at its mode's value |
+
+---
+
+## Read
 
 ```mach
 pub def Read: u8
@@ -17,180 +58,146 @@ pub def Read: u8
 
 what a path reads; `Row.arg` refines the version components, 0 major, 1 minor and 2 patch
 
-## val READ_SYS_TAG
+| Name | Value | |
+| :--- | :--- | :--- |
+| `READ_SYS_TAG` | `4` |  |
+| `READ_ARCH_TAG` | `5` |  |
+| `READ_ABI_TAG` | `6` |  |
+| `READ_MODE_TAG` | `7` |  |
+| `READ_BUILD_CT_MUL` | `22` |  |
+| `READ_REFUSED` | `30` |  |
+| `READ_RESERVED` | `31` |  |
+
+## Row
 
 ```mach
-pub val READ_SYS_TAG:          Read = 4
-```
-
-## val READ_ARCH_TAG
-
-```mach
-pub val READ_ARCH_TAG:         Read = 5
-```
-
-## val READ_ABI_TAG
-
-```mach
-pub val READ_ABI_TAG:          Read = 6
-```
-
-## val READ_MODE_TAG
-
-```mach
-pub val READ_MODE_TAG:         Read = 7
-```
-
-## val READ_BUILD_CT_MUL
-
-```mach
-pub val READ_BUILD_CT_MUL:     Read = 22
-```
-
-## val READ_REFUSED
-
-```mach
-pub val READ_REFUSED:          Read = 30
-```
-
-## val READ_RESERVED
-
-```mach
-pub val READ_RESERVED:         Read = 31
-```
-
-## rec Row
-
-```mach
-pub rec Row;
+pub rec Row {
+    path: str;
+    read: Read;
+    arg:  u32;
+    call: bool;
+    note: str;
+}
 ```
 
 one path
 
-path: its segments after the `$`, `.`-separated, where `*` is any one segment
-arg: what `read` needs beyond the path, a version component
-call: the path is called with arguments, `$mach.build.ct_mul(op, width)`
-note: the refusal READ_REFUSED and READ_RESERVED report
+| Field | Type | |
+| :--- | :--- | :--- |
+| `path` | `str` | its segments after the `$`, `.`-separated, where `*` is any one segment |
+| `arg` | `u32` | what `read` needs beyond the path, a version component |
+| `call` | `bool` | the path is called with arguments, `$mach.build.ct_mul(op, width)` |
+| `note` | `str` | the refusal READ_REFUSED and READ_RESERVED report |
 
-## rec Renamed
-
-```mach
-pub rec Renamed;
-```
-
-leading segments a previous major named, and the name this one gives them
-
-from: the segments as the previous major wrote them, `.`-separated
-to: the segments that replace them
-note: the refusal of a path that writes them
-
-## fun renamed
+### at
 
 ```mach
-pub fun renamed(source: str, stack: *base_source.Span, depth: u32) *Renamed;
-```
-
-the renamed row whose segments lead the written path, nil when none does.
-`stack` holds its `depth` segments innermost first, the root at `depth - 1`
-
-## fun renamed_depth
-
-```mach
-pub fun renamed_depth(r: *Renamed) u32;
-```
-
-how many segments a renamed row's `from` spans
-
-## fun at
-
-```mach
-pub fun at(i: usize) *Row;
+pub fun at(i: usize) *Row
 ```
 
 the row at `i` in declaration order, nil past the end
 
-## fun lookup
+### lookup
 
 ```mach
-pub fun lookup(source: str, stack: *base_source.Span, depth: u32, call: bool) *Row;
+pub fun lookup(source: str, stack: *base_source.Span, depth: u32, call: bool) *Row
 ```
 
 the row a written path matches, called or not; nil when none does. `stack`
 holds its `depth` segments innermost first, the root at `depth - 1`
 
-## fun unknown
+## Renamed
 
 ```mach
-pub fun unknown(source: str, stack: *base_source.Span, depth: u32) str;
+pub rec Renamed {
+    from: str;
+    to:   str;
+    note: str;
+}
+```
+
+leading segments a previous major named, and the name this one gives them
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `from` | `str` | the segments as the previous major wrote them, `.`-separated |
+| `to` | `str` | the segments that replace them |
+| `note` | `str` | the refusal of a path that writes them |
+
+### renamed
+
+```mach
+pub fun renamed(source: str, stack: *base_source.Span, depth: u32) *Renamed
+```
+
+the renamed row whose segments lead the written path, nil when none does.
+`stack` holds its `depth` segments innermost first, the root at `depth - 1`
+
+### renamed_depth
+
+```mach
+pub fun renamed_depth(r: *Renamed) u32
+```
+
+how many segments a renamed row's `from` spans
+
+## Functions
+
+### unknown
+
+```mach
+pub fun unknown(source: str, stack: *base_source.Span, depth: u32) str
 ```
 
 the refusal of a path no row matches; nil when its root names no family
 
-## val COMPTIME_BARE_IDENT_MSG
-
-```mach
-pub val COMPTIME_BARE_IDENT_MSG: str =
-"comptime parameters are referenced without `$`
-```
-
-## fun eval_path
+### eval_path
 
 ```mach
 pub fun eval_path(
-c: *comptime_scope.ComptimeCtx,
-a: *ast.Ast,
-source: str,
-e: ast_id.ExprId,
-interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail];
+    c: *comptime_scope.ComptimeCtx,
+    a: *ast.Ast,
+    source: str,
+    e: ast_id.ExprId,
+    interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail]
 ```
 
-## fun resolve_comptime_path
+### resolve_comptime_path
 
 ```mach
-pub fun resolve_comptime_path(c: *comptime_scope.ComptimeCtx, source: str, file: base_source.FileId, stack: *base_source.Span, depth: u32, interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail];
+pub fun resolve_comptime_path(c: *comptime_scope.ComptimeCtx, source: str, file: base_source.FileId, stack: *base_source.Span, depth: u32, interner: *intern.Interner) res[comptime_value.CTValue, comptime_failure.EvalFail]
 ```
 
-## fun sys_tag_for
+### sys_tag_for
 
 ```mach
-pub fun sys_tag_for(name: View) res[u32, fail.Fail];
+pub fun sys_tag_for(name: View) res[u32, fail.Fail]
 ```
 
 the tag of `$mach.sys.<name>`: the position of mink's system of that name
 
-## fun arch_tag_for
+### arch_tag_for
 
 ```mach
-pub fun arch_tag_for(name: View) res[u32, fail.Fail];
+pub fun arch_tag_for(name: View) res[u32, fail.Fail]
 ```
 
 the tag of `$mach.arch.<name>`: the position of mink's architecture of that name
 
-## fun abi_tag_for
+### abi_tag_for
 
 ```mach
-pub fun abi_tag_for(name: View) res[u32, fail.Fail];
+pub fun abi_tag_for(name: View) res[u32, fail.Fail]
 ```
 
 the tag of `$mach.abi.<name>`: the spelling's place among mink's conventions
 
-## val MODE_DEBUG
+## Constants
 
-```mach
-pub val MODE_DEBUG:   u32 = 0
-```
-
-## val MODE_RELEASE
-
-```mach
-pub val MODE_RELEASE: u32 = 1
-```
-
-## val MODE_COUNT
-
-```mach
-pub val MODE_COUNT: usize           = 2
-```
-
-the `$mach.mode.*` tags, each at its mode's value
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `COMPTIME_BARE_IDENT_MSG` | `str` | `` "comptime parameters are referenced without `$`; comptime paths are rooted: `$mach`, `$project`, `$bin`" `` |  |
+| `MODE_DEBUG` | `u32` | `0` |  |
+| `MODE_RELEASE` | `u32` | `1` |  |
+| `MODE_COUNT` | `usize` | `2` | the `$mach.mode.*` tags, each at its mode's value |
 

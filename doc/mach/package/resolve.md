@@ -1,3 +1,5 @@
+[mach](../README.md) / [package](README.md) / **resolve**
+
 # mach.package.resolve
 
 resolve: version resolution over a project's closure. every identity the closure reaches
@@ -5,26 +7,48 @@ through a version range resolves together against the releases its source publis
 (resolver.mach); an identity the root or a fixed edge selects by ref or path is fixed, and a
 requirement on it is overridden
 
-## rec Resolution
+<sub>source: [`src/package/resolve.mach`](../../../src/package/resolve.mach) · imported by 2 modules</sub>
+
+<sub>`resolver` is [`mach.package.resolver`](resolver.md) · `package_closure` is [`mach.package.closure`](closure.md) · `manifest_load` is [`mach.manifest.load`](../manifest/load.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Resolution`](#resolution) | `rec` | notes are the lines a command prints unless --quiet: an --offline resolution, and each requirement a root `ref` or `path` overrides |
+| [`OutdatedRow`](#outdatedrow) | `rec` | one version-selected identity as `mach dep outdated` shows it: the release its pin is ("-" for none), the highest this compiler and every range accept, and the highest published |
+| [`Outdated`](#outdated) | `rec` | what `mach dep outdated` shows: the resolution's notes, whether any identity selects releases by version, and a row for each that does |
+
+| On `Resolution` | |
+| :--- | :--- |
+| [`versions`](#versions) | resolve every identity the closure reaches through a version range: the root's own ranges and every range a dependency reached by a ref or a path declares, read from the same closure walk `pull` realizes |
+
+| On `Outdated` | |
+| :--- | :--- |
+| [`outdated`](#outdated-1) | each version-selected identity's pinned release, the highest this compiler and every range accept, and the highest release published |
+
+| Functions | |
+| :--- | :--- |
+| [`pick_index`](#pick_index) | |
+
+---
+
+## Resolution
 
 ```mach
-pub rec Resolution;
+pub rec Resolution {
+    picks:  Vector[resolver.Choice];
+    ranged: bool;
+    notes:  Vector[str];
+}
 ```
 
 notes are the lines a command prints unless --quiet: an --offline resolution, and each
 requirement a root `ref` or `path` overrides
 
-## fun pick_index
-
-```mach
-pub fun pick_index(picks: *Vector[resolver.Choice], id: str) i64;
-```
-
-## fun versions
+### versions
 
 ```mach
 pub fun versions(op: *package_closure.Operation, doc: *manifest_load.Doc, lowest: bool, lock: bool, unlocked: str,
-root_notes: bool, walk: *package_closure.Walk) res[Resolution, fail.Fail];
+    root_notes: bool, walk: *package_closure.Walk) res[Resolution, fail.Fail]
 ```
 
 resolve every identity the closure reaches through a version range: the root's
@@ -40,30 +64,47 @@ admits it, so a dependency pulls its own tested pin in
 command that pulls the closure afterwards leaves them to the pull, which names every
 requirement the root overrides
 
-## rec OutdatedRow
+## OutdatedRow
 
 ```mach
-pub rec OutdatedRow;
+pub rec OutdatedRow {
+    id:         str;
+    pinned:     str;
+    compatible: str;
+    latest:     str;
+}
 ```
 
 one version-selected identity as `mach dep outdated` shows it: the release its pin is ("-"
 for none), the highest this compiler and every range accept, and the highest published
 
-## rec Outdated
+## Outdated
 
 ```mach
-pub rec Outdated;
+pub rec Outdated {
+    notes:  Vector[str];
+    ranged: bool;
+    rows:   Vector[OutdatedRow];
+}
 ```
 
 what `mach dep outdated` shows: the resolution's notes, whether any identity selects
 releases by version, and a row for each that does
 
-## fun outdated
+### outdated
 
 ```mach
-pub fun outdated(op: *package_closure.Operation, doc: *manifest_load.Doc, offline: bool) res[Outdated, fail.Fail];
+pub fun outdated(op: *package_closure.Operation, doc: *manifest_load.Doc, offline: bool) res[Outdated, fail.Fail]
 ```
 
 each version-selected identity's pinned release, the highest this compiler and every range
 accept, and the highest release published
+
+## Functions
+
+### pick_index
+
+```mach
+pub fun pick_index(picks: *Vector[resolver.Choice], id: str) i64
+```
 

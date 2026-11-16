@@ -1,3 +1,5 @@
+[mach](../../README.md) / [front](../README.md) / [comptime](README.md) / **deep**
+
 # mach.front.comptime.deep
 
 the deep value of a constant: an array, record or case literal as a tree of nodes with every
@@ -5,246 +7,239 @@ member evaluated, an address as the symbol it points into, and a leaf that has n
 value kept with its refusal. a store holds the trees of one module, every node under a tree's
 root in that store, and a value names a node of it by the module's stable id
 
-## def NodeKind
+<sub>source: [`src/front/comptime/deep.mach`](../../../../src/front/comptime/deep.mach) · imported by 16 modules</sub>
+
+<sub>`comptime_failure` is [`mach.front.comptime.failure`](failure.md) · `diagnostic_kind` is [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md) · `intern` is [`mach.base.intern`](../../base/intern.md) · `base_source` is [`mach.base.source`](../../base/source.md) · `type_kind` is [`mach.type.kind`](../../type/kind.md) · `comptime_value` is [`mach.front.comptime.value`](value.md) · `collections_vector` is `std.collections.vector` · `map` is `std.collections.map` · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../../base/fail.md) · `type` is [`mach.type`](../../type.md) · `ProjectionKind` is private · `ElementKind` is private</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`NodeKind`](#nodekind) | `def` |  |
+| [`Refusal`](#refusal) | `rec` | what reading a leaf with no compile-time value gives, and where that leaf is |
+| [`Symbol`](#symbol) | `rec` | the module-level function, `val` or `var` an address points into: its declaration `decl` in the module with stable id `module`, which name it in every module that reads it |
+| [`Node`](#node) | `rec` | one node of a value; an aggregate's members are `members[first .. first + len]` |
+| [`Member`](#member) | `rec` | a member of an aggregate node: a named field, or an element or positional value with STR_NIL |
+| [`Store`](#store) | `rec` |  |
+| [`Projection`](#projection) | `rec` |  |
+| [`Element`](#element-1) | `rec` |  |
+
+| On `NodeKind` | |
+| :--- | :--- |
+| [`NODE_SCALAR`](#nodekind) | a value the evaluator holds whole |
+| [`NODE_ARRAY`](#nodekind) | an array literal: its elements, in order |
+| [`NODE_LITERAL`](#nodekind) | a record or case literal: the case its head selects, STR_NIL for a record, then its named fields as written and its positional elements |
+| [`NODE_REFUSED`](#nodekind) | a leaf that has no compile-time value, with the refusal reading it gives |
+| [`NODE_ADDRESS`](#nodekind) | the address of `symbol`, then of the place its members step to: a field, named, or an element, unnamed, each a scalar holding its ordinal at the type it steps into |
+
+| On `Refusal` | |
+| :--- | :--- |
+| [`refusal_of`](#refusal_of) | |
+
+| On `Store` | |
+| :--- | :--- |
+| [`init`](#init) | |
+| [`dnit`](#dnit) | release a deep store; a nil store holds nothing |
+| [`node_add`](#node_add) | |
+| [`members_add`](#members_add) | the members of an aggregate are added together once its children are, so they are contiguous |
+| [`node_at`](#node_at) · [`member_at`](#member_at) | |
+| [`value`](#value) | the value a scalar node holds, or the refusal a refused one gives; an aggregate has no value of its own, and an address has none until the program is linked |
+| [`read`](#read) | what reading node `node` of module `module`'s store gives: a scalar's value, a refused leaf's or an address's refusal, or the aggregate itself as a value naming it |
+| [`project`](#project) | member `name` of a record or case literal: a record's field, or a case literal's payload when `name` is the case it holds |
+| [`element`](#element) | element `index` of an array node |
+| [`refused_within`](#refused_within) | the first leaf under `node` that has no compile-time value, none when every leaf has one |
+| [`clone`](#clone) | node `node` of `from` with everything under it, added to `to`, which is another store |
+| [`zero_node`](#zero_node) | the zero of `ty` in `s`, which a member a literal leaves out holds: a record, union or array with no members, a scalar zero, or a tag's first declared case over the zero of its payload |
+
+| Functions | |
+| :--- | :--- |
+| [`zero_defined`](#zero_defined) | whether `ty` has a zero: every type the type store holds does, an unresolved or error type does not |
+
+| Constants | |
+| :--- | :--- |
+| [`PROJECT_MEMBER`](#constants) | |
+| [`PROJECT_UNSELECTED`](#constants) | a case literal holding another case, `head` |
+| [`PROJECT_NO_PAYLOAD`](#constants) | a case literal holding the case but no payload for it |
+| [`PROJECT_OMITTED`](#constants) | a record literal that leaves the field out, which holds its zero |
+| [`ELEMENT_MEMBER`](#constants) · [`ELEMENT_PAST_END`](#constants) · [`INDEX_PAST_END_MSG`](#constants) · [`ZERO_UNKNOWN_MSG`](#constants) | |
+| [`SCRATCH_MODULE`](#constants) | the module index a scratch store of zeros answers to when a node of it is read as a value |
+| [`INSTANCE_MODULE`](#constants) | the module index the store of the instance being typed or lowered answers to: the values its body builds belong to the instance, not to any module |
+
+---
+
+## NodeKind
 
 ```mach
 pub def NodeKind: u8
 ```
 
-## val NODE_SCALAR
+| Name | Value | |
+| :--- | :--- | :--- |
+| `NODE_SCALAR` | `0` | a value the evaluator holds whole |
+| `NODE_ARRAY` | `1` | an array literal: its elements, in order |
+| `NODE_LITERAL` | `2` | a record or case literal: the case its head selects, STR_NIL for a record, then its named fields as written and its positional elements |
+| `NODE_REFUSED` | `3` | a leaf that has no compile-time value, with the refusal reading it gives |
+| `NODE_ADDRESS` | `4` | the address of `symbol`, then of the place its members step to: a field, named, or an element, unnamed, each a scalar holding its ordinal at the type it steps into |
+
+## Refusal
 
 ```mach
-pub val NODE_SCALAR: NodeKind = 0
-```
-
-a value the evaluator holds whole
-
-## val NODE_ARRAY
-
-```mach
-pub val NODE_ARRAY: NodeKind = 1
-```
-
-an array literal: its elements, in order
-
-## val NODE_LITERAL
-
-```mach
-pub val NODE_LITERAL: NodeKind = 2
-```
-
-a record or case literal: the case its head selects, STR_NIL for a record, then its
-named fields as written and its positional elements
-
-## val NODE_REFUSED
-
-```mach
-pub val NODE_REFUSED: NodeKind = 3
-```
-
-a leaf that has no compile-time value, with the refusal reading it gives
-
-## val NODE_ADDRESS
-
-```mach
-pub val NODE_ADDRESS: NodeKind = 4
-```
-
-the address of `symbol`, then of the place its members step to: a field, named, or an
-element, unnamed, each a scalar holding its ordinal at the type it steps into
-
-## rec Refusal
-
-```mach
-pub rec Refusal;
+pub rec Refusal {
+    kind:    comptime_failure.EvalFailKind;
+    diag:    diagnostic_kind.Kind;
+    message: intern.StrId;
+    at:      base_source.Location;
+}
 ```
 
 what reading a leaf with no compile-time value gives, and where that leaf is
 
-## rec Symbol
+### refusal_of
 
 ```mach
-pub rec Symbol;
+pub fun refusal_of(itn: *intern.Interner, r: Refusal) comptime_failure.EvalFail
+```
+
+## Symbol
+
+```mach
+pub rec Symbol {
+    module:   u32;
+    decl:     u32;
+    canon:    intern.StrId;
+    function: bool;
+}
 ```
 
 the module-level function, `val` or `var` an address points into: its declaration `decl` in
 the module with stable id `module`, which name it in every module that reads it
 
-## rec Node
+## Node
 
 ```mach
-pub rec Node;
+pub rec Node {
+    kind:  NodeKind;
+    ty:    type_kind.TypeId;
+    value: comptime_value.CTValue;
+    head:  intern.StrId;
+    first: u32;
+    len:   u32;
+    # an array's declared element count, of which `len` are held and the rest are zero
+    declared: u32;
+    refusal:  Refusal;
+    symbol:   Symbol;
+}
 ```
 
 one node of a value; an aggregate's members are `members[first .. first + len]`
 
-## rec Member
+## Member
 
 ```mach
-pub rec Member;
+pub rec Member {
+    name: intern.StrId;
+    node: u32;
+}
 ```
 
 a member of an aggregate node: a named field, or an element or positional value with STR_NIL
 
-## rec Store
+## Store
 
 ```mach
-pub rec Store;
+pub rec Store {
+    nodes:   collections_vector.Vector[Node];
+    members: collections_vector.Vector[Member];
+    # the root of the zero of each type built in this store, which every reader of that zero shares
+    zeros: map.Map[type_kind.TypeId, u32];
+}
 ```
 
-## fun init
+### init
 
 ```mach
-pub fun init(alloc: *A.Allocator) Store;
+pub fun init(alloc: *A.Allocator) Store
 ```
 
-## fun dnit
+### dnit
 
 ```mach
-pub fun dnit(s: *Store);
+pub fun dnit(s: *Store)
 ```
 
 release a deep store; a nil store holds nothing
 
-## fun node_add
+### node_add
 
 ```mach
-pub fun node_add(s: *Store, n: Node) res[u32, fail.Fail];
+pub fun node_add(s: *Store, n: Node) res[u32, fail.Fail]
 ```
 
-## fun members_add
+### members_add
 
 ```mach
-pub fun members_add(s: *Store, node: u32, members: *Member, len: u32) err[fail.Fail];
+pub fun members_add(s: *Store, node: u32, members: *Member, len: u32) err[fail.Fail]
 ```
 
 the members of an aggregate are added together once its children are, so they are contiguous
 
-## fun node_at
+### node_at
 
 ```mach
-pub fun node_at(s: *Store, node: u32) *Node;
+pub fun node_at(s: *Store, node: u32) *Node
 ```
 
-## fun member_at
+### member_at
 
 ```mach
-pub fun member_at(s: *Store, n: *Node, ord: u32) opt[Member];
+pub fun member_at(s: *Store, n: *Node, ord: u32) opt[Member]
 ```
 
-## fun refusal_of
+### value
 
 ```mach
-pub fun refusal_of(itn: *intern.Interner, r: Refusal) comptime_failure.EvalFail;
-```
-
-## fun value
-
-```mach
-pub fun value(s: *Store, itn: *intern.Interner, node: u32) res[comptime_value.CTValue, comptime_failure.EvalFail];
+pub fun value(s: *Store, itn: *intern.Interner, node: u32) res[comptime_value.CTValue, comptime_failure.EvalFail]
 ```
 
 the value a scalar node holds, or the refusal a refused one gives; an aggregate has no
 value of its own, and an address has none until the program is linked
 
-## fun read
+### read
 
 ```mach
-pub fun read(s: *Store, itn: *intern.Interner, module: u32, node: u32) res[comptime_value.CTValue, comptime_failure.EvalFail];
+pub fun read(s: *Store, itn: *intern.Interner, module: u32, node: u32) res[comptime_value.CTValue, comptime_failure.EvalFail]
 ```
 
 what reading node `node` of module `module`'s store gives: a scalar's value, a refused leaf's
 or an address's refusal, or the aggregate itself as a value naming it
 
-## val PROJECT_MEMBER
+### project
 
 ```mach
-pub val PROJECT_MEMBER: ProjectionKind = 1
-```
-
-## val PROJECT_UNSELECTED
-
-```mach
-pub val PROJECT_UNSELECTED: ProjectionKind = 2
-```
-
-a case literal holding another case, `head`
-
-## val PROJECT_NO_PAYLOAD
-
-```mach
-pub val PROJECT_NO_PAYLOAD: ProjectionKind = 3
-```
-
-a case literal holding the case but no payload for it
-
-## val PROJECT_OMITTED
-
-```mach
-pub val PROJECT_OMITTED: ProjectionKind = 4
-```
-
-a record literal that leaves the field out, which holds its zero
-
-## rec Projection
-
-```mach
-pub rec Projection;
-```
-
-## fun project
-
-```mach
-pub fun project(s: *Store, node: u32, name: intern.StrId) Projection;
+pub fun project(s: *Store, node: u32, name: intern.StrId) Projection
 ```
 
 member `name` of a record or case literal: a record's field, or a case literal's payload when
 `name` is the case it holds
 
-## val ELEMENT_MEMBER
+### element
 
 ```mach
-pub val ELEMENT_MEMBER: ElementKind = 1
-```
-
-## val ELEMENT_PAST_END
-
-```mach
-pub val ELEMENT_PAST_END: ElementKind = 3
-```
-
-## val INDEX_PAST_END_MSG
-
-```mach
-pub val INDEX_PAST_END_MSG: str = "this index is past the end of the constant it reads"
-```
-
-## rec Element
-
-```mach
-pub rec Element;
-```
-
-## fun element
-
-```mach
-pub fun element(s: *Store, node: u32, index: u64) Element;
+pub fun element(s: *Store, node: u32, index: u64) Element
 ```
 
 element `index` of an array node
 
-## fun refused_within
+### refused_within
 
 ```mach
-pub fun refused_within(s: *Store, node: u32) opt[u32];
+pub fun refused_within(s: *Store, node: u32) opt[u32]
 ```
 
 the first leaf under `node` that has no compile-time value, none when every leaf has one
 
-## fun clone
+### clone
 
 ```mach
-pub fun clone(to: *Store, from: *Store, node: u32) res[u32, fail.Fail];
+pub fun clone(to: *Store, from: *Store, node: u32) res[u32, fail.Fail]
 ```
 
 node `node` of `from` with everything under it, added to `to`, which is another store. the
@@ -252,24 +247,10 @@ copy recurses as deep as the value nests, so it asks for stack before it descend
 a value nested deeper (`nesting`), which the node that asked reports. a failure leaves `to`
 as it was
 
-## val ZERO_UNKNOWN_MSG
+### zero_node
 
 ```mach
-pub val ZERO_UNKNOWN_MSG: str = "the zero of this field's type is not known"
-```
-
-## fun zero_defined
-
-```mach
-pub fun zero_defined(types: *type.TypeInterner, ty: type_kind.TypeId) bool;
-```
-
-whether `ty` has a zero: every type the type store holds does, an unresolved or error type does not
-
-## fun zero_node
-
-```mach
-pub fun zero_node(s: *Store, types: *type.TypeInterner, pointer_width: u32, ty: type_kind.TypeId) res[u32, fail.Fail];
+pub fun zero_node(s: *Store, types: *type.TypeInterner, pointer_width: u32, ty: type_kind.TypeId) res[u32, fail.Fail]
 ```
 
 the zero of `ty` in `s`, which a member a literal leaves out holds: a record, union or array
@@ -279,20 +260,47 @@ most one tree per distinct type. Nothing writes a node once its members are link
 what makes the sharing safe. The tag's field table must be ready, and a tag with no cases is
 an internal failure. A failure leaves `s` as it was.
 
-## val SCRATCH_MODULE
+## Projection
 
 ```mach
-pub val SCRATCH_MODULE: u32 = 0xFFFFFFFF
+pub rec Projection {
+    kind: ProjectionKind;
+    node: u32;
+    head: intern.StrId;
+}
 ```
 
-the module index a scratch store of zeros answers to when a node of it is read as a value
-
-## val INSTANCE_MODULE
+## Element
 
 ```mach
-pub val INSTANCE_MODULE: u32 = 0xFFFFFFFE
+pub rec Element {
+    kind: ElementKind;
+    node: u32;
+}
 ```
 
-the module index the store of the instance being typed or lowered answers to: the values its
-body builds belong to the instance, not to any module
+## Functions
+
+### zero_defined
+
+```mach
+pub fun zero_defined(types: *type.TypeInterner, ty: type_kind.TypeId) bool
+```
+
+whether `ty` has a zero: every type the type store holds does, an unresolved or error type does not
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `PROJECT_MEMBER` | `ProjectionKind` | `1` |  |
+| `PROJECT_UNSELECTED` | `ProjectionKind` | `2` | a case literal holding another case, `head` |
+| `PROJECT_NO_PAYLOAD` | `ProjectionKind` | `3` | a case literal holding the case but no payload for it |
+| `PROJECT_OMITTED` | `ProjectionKind` | `4` | a record literal that leaves the field out, which holds its zero |
+| `ELEMENT_MEMBER` | `ElementKind` | `1` |  |
+| `ELEMENT_PAST_END` | `ElementKind` | `3` |  |
+| `INDEX_PAST_END_MSG` | `str` | `"this index is past the end of the constant it reads"` |  |
+| `ZERO_UNKNOWN_MSG` | `str` | `"the zero of this field's type is not known"` |  |
+| `SCRATCH_MODULE` | `u32` | `0xFFFFFFFF` | the module index a scratch store of zeros answers to when a node of it is read as a value |
+| `INSTANCE_MODULE` | `u32` | `0xFFFFFFFE` | the module index the store of the instance being typed or lowered answers to: the values its body builds belong to the instance, not to any module |
 

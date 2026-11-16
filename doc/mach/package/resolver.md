@@ -1,19 +1,55 @@
+[mach](../README.md) / [package](README.md) / **resolver**
+
 # mach.package.resolver
 
-## rec Need
+dependency version resolution: PubGrub over the releases each identity lists
+
+the algorithm is Weizenbaum's (2018), as in Dart's pub, over finite domains. an
+identity's domain is its listed releases, so a set of versions is a bitset over them and
+complement is exact. the running compiler is checked per release as its own
+incompatibility, and a failure is explained from the derivation that proved it.
+
+<sub>source: [`src/package/resolver.mach`](../../../src/package/resolver.mach) · imported by 3 modules</sub>
+
+<sub>`A` is `std.allocator` · `package_source` is [`mach.package.source`](source.md) · `NeedsFn` is private · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Need`](#need) | `rec` | `who` names the requirer a diagnostic attributes a root need to: the root itself ("" reads as the problem's root) or the chain of a dependency that declared the range, since every requirer's range takes part in the root's problem |
+| [`ReleaseNeeds`](#releaseneeds) | `rec` | what a release asks for: the compiler range its manifest states ("" for none) and its dependencies selected by version range |
+| [`Lock`](#lock) | `rec` | a preferred version, kept while it still satisfies every requirement (`update <name>`) |
+| [`Problem`](#problem) | `rec` | fixed ids are identities the root selects itself (an exact or branch ref, or a path): the root overrides them, so no requirement on them takes part in resolution |
+| [`Choice`](#choice) | `rec` |  |
+
+| On `Problem` | |
+| :--- | :--- |
+| [`resolve`](#resolve) | the selected release of every identity the root reaches, allocated in `a`; the solver's scratch arena grows from `a` and returns to it |
+
+---
+
+## Need
 
 ```mach
-pub rec Need;
+pub rec Need {
+    id:    str;
+    url:   str;
+    range: str;
+    who:   str;
+}
 ```
 
 `who` names the requirer a diagnostic attributes a root need to: the root itself
 ("" reads as the problem's root) or the chain of a dependency that declared the
 range, since every requirer's range takes part in the root's problem
 
-## rec ReleaseNeeds
+## ReleaseNeeds
 
 ```mach
-pub rec ReleaseNeeds;
+pub rec ReleaseNeeds {
+    mach:     str;
+    needs:    Vector[Need];
+    excluded: str;
+}
 ```
 
 what a release asks for: the compiler range its manifest states ("" for none) and its
@@ -22,36 +58,55 @@ why the release is not one (its manifest does not load, or names another version
 release is set aside and the reason explains a failure it takes part in, while a failure to
 read the release at all is the NeedsFn's err and stops resolution
 
-## rec Lock
+## Lock
 
 ```mach
-pub rec Lock;
+pub rec Lock {
+    id:      str;
+    version: str;
+}
 ```
 
 a preferred version, kept while it still satisfies every requirement (`update <name>`)
 
-## rec Problem
+## Problem
 
 ```mach
-pub rec Problem;
+pub rec Problem {
+    root:        str;
+    needs:       *Need;
+    need_count:  u32;
+    fixed:       *str;
+    fixed_count: u32;
+    compiler:    str;
+    lowest:      bool;
+    locks:       *Lock;
+    lock_count:  u32;
+}
 ```
 
 fixed ids are identities the root selects itself (an exact or branch ref, or a path): the root
 overrides them, so no requirement on them takes part in resolution
 
-## rec Choice
-
-```mach
-pub rec Choice;
-```
-
-## fun resolve
+### resolve
 
 ```mach
 pub fun resolve(a: *A.Allocator, src: *package_source.Releases, needs: NeedsFn, needs_ctx: ptr,
-problem: *Problem) res[Vector[Choice], fail.Fail];
+    problem: *Problem) res[Vector[Choice], fail.Fail]
 ```
 
 the selected release of every identity the root reaches, allocated in `a`;
 the solver's scratch arena grows from `a` and returns to it
+
+## Choice
+
+```mach
+pub rec Choice {
+    id:      str;
+    url:     str;
+    tag:     str;
+    commit:  str;
+    version: str;
+}
+```
 

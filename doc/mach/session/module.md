@@ -1,6 +1,57 @@
+[mach](../README.md) / [session](README.md) / **module**
+
 # mach.session.module
 
-## def ModuleId
+module ids: a module's index in the session and the stable identity of its name
+
+the registry holds each loaded module's fully qualified name, whether it belongs to the root
+project, and the stable identity of its name, which outlives the loads that reuse it. a
+standalone editor buffer's module id lies past BUFFER_BASE, so a table keyed by module serves
+both.
+
+<sub>source: [`src/session/module.mach`](../../../src/session/module.mach) · imported by 41 modules</sub>
+
+<sub>`map` is `std.collections.map` · `intern` is [`mach.base.intern`](../base/intern.md) · `A` is `std.allocator` · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`ModuleId`](#moduleid) | `def` | a module's index in the session's module table |
+| [`StableModuleId`](#stablemoduleid) | `def` | a module's identity across sessions, keyed by its fully qualified name |
+| [`Registry`](#registry) | `rec` | the identities of the modules a session loaded: each module's name, whether it belongs to the root project, and the stable identity of each name, which outlives the loads that reuse it |
+
+| On `ModuleId` | |
+| :--- | :--- |
+| [`MODULE_NIL`](#moduleid) | |
+| [`buffer_id`](#buffer_id) | the module of the standalone buffer over the file with index `file`, none past the last id the buffer range holds |
+| [`buffer_file`](#buffer_file) | the index of the file whose standalone buffer is the module `m`, none when `m` is a project's module or nil |
+| [`id`](#id) · [`index`](#index) · [`same`](#same) · [`is_nil`](#is_nil) | |
+
+| On `StableModuleId` | |
+| :--- | :--- |
+| [`STABLE_MODULE_NIL`](#stablemoduleid) · [`stable_id`](#stable_id) · [`stable_index`](#stable_index) · [`stable_same`](#stable_same) · [`stable_is_nil`](#stable_is_nil) | |
+
+| On `Registry` | |
+| :--- | :--- |
+| [`registry_init`](#registry_init) · [`registry_dnit`](#registry_dnit) | |
+| [`reset_module_registry`](#reset_module_registry) | forget every project module identity, keeping the stable identities, which outlive a load |
+| [`module_count`](#module_count) | one past the highest project module id the registry holds an identity for |
+| [`register_module_root_project`](#register_module_root_project) | |
+| [`module_is_root_project`](#module_is_root_project) | a module the loader never declared is not the root project's: a dependency's module, or one loaded outside a project, exports nothing of its own |
+| [`module_fqn`](#module_fqn) · [`stable_module_id`](#stable_module_id) · [`stable_module_id_lookup`](#stable_module_id_lookup) · [`register_stable_mid`](#register_stable_mid) · [`module_id_for_stable`](#module_id_for_stable) | |
+| [`register_module_identity`](#register_module_identity) | give the module `mid` its name and stable identity; a project's module also counts toward module_count, a standalone buffer's does not |
+| [`unregister_module_identity`](#unregister_module_identity) | |
+
+| Functions | |
+| :--- | :--- |
+| [`compose_fqn`](#compose_fqn) | the module name of a source path under a package: the id, then the path without its suffix, its separators dotted |
+
+| Constants | |
+| :--- | :--- |
+| [`BUFFER_BASE`](#constants) | a project numbers its modules from 0 below BUFFER_BASE, and a standalone editor buffer's module is BUFFER_BASE past its file's index, so no project module takes a buffer's id and a table keyed by module serves both |
+
+---
+
+## ModuleId
 
 ```mach
 pub def ModuleId: u32
@@ -8,13 +59,53 @@ pub def ModuleId: u32
 
 a module's index in the session's module table
 
-## val MODULE_NIL
+| Name | Value | |
+| :--- | :--- | :--- |
+| `MODULE_NIL` | `0xFFFFFFFF` |  |
+
+### buffer_id
 
 ```mach
-pub val MODULE_NIL: ModuleId = 0xFFFFFFFF
+pub fun buffer_id(file: u32) opt[ModuleId]
 ```
 
-## def StableModuleId
+the module of the standalone buffer over the file with index `file`, none
+past the last id the buffer range holds
+
+### buffer_file
+
+```mach
+pub fun buffer_file(m: ModuleId) opt[u32]
+```
+
+the index of the file whose standalone buffer is the module `m`, none when
+`m` is a project's module or nil
+
+### id
+
+```mach
+pub fun id(index: u32) ModuleId
+```
+
+### index
+
+```mach
+pub fun index(m: ModuleId) u32
+```
+
+### same
+
+```mach
+pub fun same(left: ModuleId, right: ModuleId) bool
+```
+
+### is_nil
+
+```mach
+pub fun is_nil(m: ModuleId) bool
+```
+
+## StableModuleId
 
 ```mach
 pub def StableModuleId: u32
@@ -22,201 +113,161 @@ pub def StableModuleId: u32
 
 a module's identity across sessions, keyed by its fully qualified name
 
-## val STABLE_MODULE_NIL
+| Name | Value | |
+| :--- | :--- | :--- |
+| `STABLE_MODULE_NIL` | `0xFFFFFFFF` |  |
+
+### stable_id
 
 ```mach
-pub val STABLE_MODULE_NIL: StableModuleId = 0xFFFFFFFF
+pub fun stable_id(index: u32) StableModuleId
 ```
 
-## val BUFFER_BASE
+### stable_index
 
 ```mach
-pub val BUFFER_BASE: u32 = 0x80000000
+pub fun stable_index(m: StableModuleId) u32
 ```
 
-a project numbers its modules from 0 below BUFFER_BASE, and a standalone
-editor buffer's module is BUFFER_BASE past its file's index, so no project
-module takes a buffer's id and a table keyed by module serves both
-
-## fun buffer_id
+### stable_same
 
 ```mach
-pub fun buffer_id(file: u32) opt[ModuleId];
+pub fun stable_same(left: StableModuleId, right: StableModuleId) bool
 ```
 
-the module of the standalone buffer over the file with index `file`, none
-past the last id the buffer range holds
-
-## fun buffer_file
+### stable_is_nil
 
 ```mach
-pub fun buffer_file(m: ModuleId) opt[u32];
+pub fun stable_is_nil(m: StableModuleId) bool
 ```
 
-the index of the file whose standalone buffer is the module `m`, none when
-`m` is a project's module or nil
-
-## fun id
+## Registry
 
 ```mach
-pub fun id(index: u32) ModuleId;
-```
-
-## fun index
-
-```mach
-pub fun index(m: ModuleId) u32;
-```
-
-## fun same
-
-```mach
-pub fun same(left: ModuleId, right: ModuleId) bool;
-```
-
-## fun is_nil
-
-```mach
-pub fun is_nil(m: ModuleId) bool;
-```
-
-## fun stable_id
-
-```mach
-pub fun stable_id(index: u32) StableModuleId;
-```
-
-## fun stable_index
-
-```mach
-pub fun stable_index(m: StableModuleId) u32;
-```
-
-## fun stable_same
-
-```mach
-pub fun stable_same(left: StableModuleId, right: StableModuleId) bool;
-```
-
-## fun stable_is_nil
-
-```mach
-pub fun stable_is_nil(m: StableModuleId) bool;
-```
-
-## fun compose_fqn
-
-```mach
-pub fun compose_fqn(alloc: *A.Allocator, itn: *intern.Interner, id_text: str, rel_text: str) res[intern.StrId, fail.Fail];
-```
-
-the module name of a source path under a package: the id, then the path without its suffix, its separators dotted
-
-## rec Registry
-
-```mach
-pub rec Registry;
+pub rec Registry {
+    count:         u32;
+    fqns:          map.Map[ModuleId, intern.StrId];
+    root_project:  map.Map[ModuleId, bool];
+    stable_ids:    map.Map[intern.StrId, StableModuleId];
+    stable_next:   StableModuleId;
+    stable_to_mid: map.Map[StableModuleId, ModuleId];
+}
 ```
 
 the identities of the modules a session loaded: each module's name, whether it
 belongs to the root project, and the stable identity of each name, which
 outlives the loads that reuse it
 
-count: one past the highest project module id held; below BUFFER_BASE, so it
-               never wraps
-fqns: each module's fully qualified name
-root_project: which modules belong to the root project rather than a dependency,
-               declared by the loader as it gives the module its id; a shared
-               library's export surface is drawn from these alone
-stable_ids: the stable identity of each name
-stable_next: the next stable identity to issue
-stable_to_mid: the module each stable identity is loaded as
+| Field | Type | |
+| :--- | :--- | :--- |
+| `count` | `u32` | one past the highest project module id held; below BUFFER_BASE, so it never wraps |
+| `fqns` | `map.Map[ModuleId, intern.StrId]` | each module's fully qualified name |
+| `root_project` | `map.Map[ModuleId, bool]` | which modules belong to the root project rather than a dependency, declared by the loader as it gives the module its id; a shared library's export surface is drawn from these alone |
+| `stable_ids` | `map.Map[intern.StrId, StableModuleId]` | the stable identity of each name |
+| `stable_next` | `StableModuleId` | the next stable identity to issue |
+| `stable_to_mid` | `map.Map[StableModuleId, ModuleId]` | the module each stable identity is loaded as |
 
-## fun registry_init
+### registry_init
 
 ```mach
-pub fun registry_init(a: *A.Allocator) Registry;
+pub fun registry_init(a: *A.Allocator) Registry
 ```
 
-## fun registry_dnit
+### registry_dnit
 
 ```mach
-pub fun registry_dnit(r: *Registry);
+pub fun registry_dnit(r: *Registry)
 ```
 
-## fun reset_module_registry
+### reset_module_registry
 
 ```mach
-pub fun reset_module_registry(r: *Registry);
+pub fun reset_module_registry(r: *Registry)
 ```
 
 forget every project module identity, keeping the stable identities, which outlive a load
 
-## fun module_count
+### module_count
 
 ```mach
-pub fun module_count(r: *Registry) u32;
+pub fun module_count(r: *Registry) u32
 ```
 
 one past the highest project module id the registry holds an identity for
 
-## fun register_module_root_project
+### register_module_root_project
 
 ```mach
-pub fun register_module_root_project(r: *Registry, mid: ModuleId, root: bool) err[fail.Fail];
+pub fun register_module_root_project(r: *Registry, mid: ModuleId, root: bool) err[fail.Fail]
 ```
 
-## fun module_is_root_project
+### module_is_root_project
 
 ```mach
-pub fun module_is_root_project(r: *Registry, mid: ModuleId) bool;
+pub fun module_is_root_project(r: *Registry, mid: ModuleId) bool
 ```
 
 a module the loader never declared is not the root project's: a dependency's
 module, or one loaded outside a project, exports nothing of its own
 
-## fun module_fqn
+### module_fqn
 
 ```mach
-pub fun module_fqn(r: *Registry, mid: ModuleId) intern.StrId;
+pub fun module_fqn(r: *Registry, mid: ModuleId) intern.StrId
 ```
 
-## fun stable_module_id
+### stable_module_id
 
 ```mach
-pub fun stable_module_id(r: *Registry, fqn: intern.StrId) res[StableModuleId, fail.Fail];
+pub fun stable_module_id(r: *Registry, fqn: intern.StrId) res[StableModuleId, fail.Fail]
 ```
 
-## fun stable_module_id_lookup
+### stable_module_id_lookup
 
 ```mach
-pub fun stable_module_id_lookup(r: *Registry, fqn: intern.StrId) StableModuleId;
+pub fun stable_module_id_lookup(r: *Registry, fqn: intern.StrId) StableModuleId
 ```
 
-## fun register_stable_mid
+### register_stable_mid
 
 ```mach
-pub fun register_stable_mid(r: *Registry, stable: StableModuleId, mid: ModuleId) err[fail.Fail];
+pub fun register_stable_mid(r: *Registry, stable: StableModuleId, mid: ModuleId) err[fail.Fail]
 ```
 
-## fun module_id_for_stable
+### module_id_for_stable
 
 ```mach
-pub fun module_id_for_stable(r: *Registry, stable: StableModuleId) ModuleId;
+pub fun module_id_for_stable(r: *Registry, stable: StableModuleId) ModuleId
 ```
 
-## fun register_module_identity
+### register_module_identity
 
 ```mach
-pub fun register_module_identity(r: *Registry, mid: ModuleId, fqn: intern.StrId, stable: StableModuleId) err[fail.Fail];
+pub fun register_module_identity(r: *Registry, mid: ModuleId, fqn: intern.StrId, stable: StableModuleId) err[fail.Fail]
 ```
 
 give the module `mid` its name and stable identity; a project's module also
 counts toward module_count, a standalone buffer's does not
 
-## fun unregister_module_identity
+### unregister_module_identity
 
 ```mach
-pub fun unregister_module_identity(r: *Registry, mid: ModuleId, stable: StableModuleId);
+pub fun unregister_module_identity(r: *Registry, mid: ModuleId, stable: StableModuleId)
 ```
+
+## Functions
+
+### compose_fqn
+
+```mach
+pub fun compose_fqn(alloc: *A.Allocator, itn: *intern.Interner, id_text: str, rel_text: str) res[intern.StrId, fail.Fail]
+```
+
+the module name of a source path under a package: the id, then the path without its suffix, its separators dotted
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `BUFFER_BASE` | `u32` | `0x80000000` | a project numbers its modules from 0 below BUFFER_BASE, and a standalone editor buffer's module is BUFFER_BASE past its file's index, so no project module takes a buffer's id and a table keyed by module serves both |
 

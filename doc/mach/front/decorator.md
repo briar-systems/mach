@@ -1,3 +1,5 @@
+[mach](../README.md) / [front](README.md) / **decorator**
+
 # mach.front.decorator
 
 the decorator registry: one row per decorator the language knows, which every
@@ -22,217 +24,174 @@ evaluates each once, after its walk has bound every constant, and records the
 string in its own bindings; every later stage reads it there, so resolution,
 type checking, lowering and the link all read one value
 
-## def Id
+<sub>source: [`src/front/decorator.mach`](../../../src/front/decorator.mach) · imported by 19 modules</sub>
+
+<sub>`base_source` is [`mach.base.source`](../base/source.md) · `ast_decl` is [`mach.front.ast.decl`](ast/decl.md) · `ast` is [`mach.front.ast`](ast.md) · `textbuild` is [`mach.base.textbuild`](../base/textbuild.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `comptime_scope` is [`mach.front.comptime.scope`](comptime/scope.md) · `comptime_capability` is [`mach.front.comptime.capability`](comptime/capability.md) · `fail` is [`mach.base.fail`](../base/fail.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Id`](#id) | `def` |  |
+| [`Places`](#places) | `def` | where a decorator may stand: one bit per declaration kind, one for an `ext` import, one for a tag case, and one for every declaration no decorator names |
+| [`Flags`](#flags) | `def` | what a row asks of its decorator beyond its arguments and places |
+| [`Row`](#row-1) | `rec` | one decorator |
+| [`Rewrite`](#rewrite) | `rec` | what `mach migrate` writes for the previous spelling at `name` in `source` |
+
+| On `Id` | |
+| :--- | :--- |
+| [`NONE`](#id) · [`DEPRECATED`](#id) · [`SYMBOL`](#id) · [`SECTION`](#id) · [`INLINE`](#id) · [`EXPORT`](#id) · [`ALIGN`](#id) · [`PACKED`](#id) · [`VOLATILE`](#id) · [`LIBRARY`](#id) · [`CONSTANT_TIME`](#id) · [`VECTORIZE`](#id) · [`NAKED`](#id) · [`EXTENSION`](#id) · [`EMBED`](#id) · [`GPU_STAGE`](#id) · [`GPU_WORKGROUP`](#id) · [`GPU_INPUT`](#id) · [`GPU_OUTPUT`](#id) · [`GPU_BUILTIN`](#id) · [`GPU_UNIFORM`](#id) · [`GPU_STORAGE`](#id) · [`GPU_SAMPLER`](#id) · [`GPU_PUSH`](#id) · [`GPU_SPEC`](#id) · [`GPU_SHARED`](#id) · [`INTRINSIC`](#id) · [`HANDLE`](#id) · [`ABI_TYPE`](#id) · [`TESTING`](#id) · [`EXPECT`](#id) · [`THREAD`](#id) · [`AT`](#id) · [`WEAK`](#id) | |
+| [`row`](#row) | the row of `id`; nil for NONE and any id no row declares |
+| [`id_of`](#id_of) | the decorator the name at `name` in `source` spells, NONE when it spells none |
+| [`name_of`](#name_of) | the name of `id`; nil for NONE |
+| [`admits`](#admits) | whether `id` may stand on the declaration `d` |
+| [`flagged`](#flagged) | whether `id`'s row carries every one of `flags` |
+| [`list_get`](#list_get) | the first decorator `id` among the `len` decorators from `start` |
+| [`list_has`](#list_has) | whether the decorator `id` is among the `len` decorators from `start` |
+| [`get`](#get) | the declaration's decorator `id`, the first when it repeats |
+| [`has`](#has) | whether the declaration carries the decorator `id` |
+
+| On `Places` | |
+| :--- | :--- |
+| [`PLACE_CASE`](#places) · [`PLACES_ANY`](#places) | |
+| [`places_of`](#places_of) | where the declaration `d` stands, for a row's `places` |
+
+| On `Flags` | |
+| :--- | :--- |
+| [`FLAG_ONCE`](#flags) · [`FLAG_ROLE`](#flags) · [`FLAG_TESTING_EXCLUSIVE`](#flags) · [`FLAG_STRINGS_CHECKED`](#flags) · [`FLAG_PLACE_CHECKED`](#flags) · [`FLAG_DEFINES`](#flags) | |
+| [`count_flagged`](#count_flagged) | how many of the declaration's decorators carry every one of `flags` |
+| [`names_append`](#names_append) | appends the names of the rows that carry every one of `flags` and stand somewhere in `places`, `, `-separated in row order |
+
+| On `Rewrite` | |
+| :--- | :--- |
+| [`rewrite_of`](#rewrite_of) | the rewrite of the decorator named at `name` in `source` with `args` arguments, nil name when it is written as this major spells it |
+
+| Functions | |
+| :--- | :--- |
+| [`refusal_of`](#refusal_of) | the refusal of the previous spelling at `name` in `source` with `args` arguments, nil when it is none |
+| [`constant_time_mode`](#constant_time_mode) | the constant-time mode `d` declares, "soft" or "hard", none when it declares none |
+| [`mode_admits`](#mode_admits) | whether `value` is one of the `\|`-separated `modes` |
+| [`takes_string`](#takes_string) | whether argument `ord` of `dec` is a string the load records |
+| [`string_id`](#string_id) | the string argument `ord` of `dec` evaluated to in the scope `c`; STR_NIL when it is not a constant string |
+| [`string_of`](#string_of) | the text of `string_id` |
+| [`strings_record`](#strings_record) | records into `into` the string every string argument of a module's decorators evaluates to, with the phase's own evaluator over the scope `c` |
+
+---
+
+## Id
 
 ```mach
 pub def Id: u8
 ```
 
-## val NONE
+| Name | Value | |
+| :--- | :--- | :--- |
+| `NONE` | `0` |  |
+| `DEPRECATED` | `1` |  |
+| `SYMBOL` | `2` |  |
+| `SECTION` | `3` |  |
+| `INLINE` | `4` |  |
+| `EXPORT` | `5` |  |
+| `ALIGN` | `6` |  |
+| `PACKED` | `7` |  |
+| `VOLATILE` | `8` |  |
+| `LIBRARY` | `9` |  |
+| `CONSTANT_TIME` | `10` |  |
+| `VECTORIZE` | `11` |  |
+| `NAKED` | `12` |  |
+| `EXTENSION` | `13` |  |
+| `EMBED` | `14` |  |
+| `GPU_STAGE` | `15` |  |
+| `GPU_WORKGROUP` | `16` |  |
+| `GPU_INPUT` | `17` |  |
+| `GPU_OUTPUT` | `18` |  |
+| `GPU_BUILTIN` | `19` |  |
+| `GPU_UNIFORM` | `20` |  |
+| `GPU_STORAGE` | `21` |  |
+| `GPU_SAMPLER` | `22` |  |
+| `GPU_PUSH` | `23` |  |
+| `GPU_SPEC` | `24` |  |
+| `GPU_SHARED` | `25` |  |
+| `INTRINSIC` | `26` |  |
+| `HANDLE` | `27` |  |
+| `ABI_TYPE` | `28` |  |
+| `TESTING` | `29` |  |
+| `EXPECT` | `30` |  |
+| `THREAD` | `31` |  |
+| `AT` | `32` |  |
+| `WEAK` | `33` |  |
+
+### row
 
 ```mach
-pub val NONE:          Id = 0
+pub fun row(id: Id) *Row
 ```
 
-## val DEPRECATED
+the row of `id`; nil for NONE and any id no row declares
+
+### id_of
 
 ```mach
-pub val DEPRECATED:    Id = 1
+pub fun id_of(source: str, name: base_source.Span) Id
 ```
 
-## val SYMBOL
+the decorator the name at `name` in `source` spells, NONE when it spells none
+
+### name_of
 
 ```mach
-pub val SYMBOL:        Id = 2
+pub fun name_of(id: Id) str
 ```
 
-## val SECTION
+the name of `id`; nil for NONE
+
+### admits
 
 ```mach
-pub val SECTION:       Id = 3
+pub fun admits(id: Id, d: *ast_decl.Decl) bool
 ```
 
-## val INLINE
+whether `id` may stand on the declaration `d`
+
+### flagged
 
 ```mach
-pub val INLINE:        Id = 4
+pub fun flagged(id: Id, flags: Flags) bool
 ```
 
-## val EXPORT
+whether `id`'s row carries every one of `flags`
+
+### list_get
 
 ```mach
-pub val EXPORT:        Id = 5
+pub fun list_get(a: *ast.Ast, start: u32, len: u32, id: Id) opt[*ast_decl.Decorator]
 ```
 
-## val ALIGN
+the first decorator `id` among the `len` decorators from `start`
+
+### list_has
 
 ```mach
-pub val ALIGN:         Id = 6
+pub fun list_has(a: *ast.Ast, start: u32, len: u32, id: Id) bool
 ```
 
-## val PACKED
+whether the decorator `id` is among the `len` decorators from `start`
+
+### get
 
 ```mach
-pub val PACKED:        Id = 7
+pub fun get(a: *ast.Ast, d: *ast_decl.Decl, id: Id) opt[*ast_decl.Decorator]
 ```
 
-## val VOLATILE
+the declaration's decorator `id`, the first when it repeats
+
+### has
 
 ```mach
-pub val VOLATILE:      Id = 8
+pub fun has(a: *ast.Ast, d: *ast_decl.Decl, id: Id) bool
 ```
 
-## val LIBRARY
+whether the declaration carries the decorator `id`
 
-```mach
-pub val LIBRARY:       Id = 9
-```
-
-## val CONSTANT_TIME
-
-```mach
-pub val CONSTANT_TIME: Id = 10
-```
-
-## val VECTORIZE
-
-```mach
-pub val VECTORIZE:     Id = 11
-```
-
-## val NAKED
-
-```mach
-pub val NAKED:         Id = 12
-```
-
-## val EXTENSION
-
-```mach
-pub val EXTENSION:     Id = 13
-```
-
-## val EMBED
-
-```mach
-pub val EMBED:         Id = 14
-```
-
-## val GPU_STAGE
-
-```mach
-pub val GPU_STAGE:     Id = 15
-```
-
-## val GPU_WORKGROUP
-
-```mach
-pub val GPU_WORKGROUP: Id = 16
-```
-
-## val GPU_INPUT
-
-```mach
-pub val GPU_INPUT:     Id = 17
-```
-
-## val GPU_OUTPUT
-
-```mach
-pub val GPU_OUTPUT:    Id = 18
-```
-
-## val GPU_BUILTIN
-
-```mach
-pub val GPU_BUILTIN:   Id = 19
-```
-
-## val GPU_UNIFORM
-
-```mach
-pub val GPU_UNIFORM:   Id = 20
-```
-
-## val GPU_STORAGE
-
-```mach
-pub val GPU_STORAGE:   Id = 21
-```
-
-## val GPU_SAMPLER
-
-```mach
-pub val GPU_SAMPLER:   Id = 22
-```
-
-## val GPU_PUSH
-
-```mach
-pub val GPU_PUSH:      Id = 23
-```
-
-## val GPU_SPEC
-
-```mach
-pub val GPU_SPEC:      Id = 24
-```
-
-## val GPU_SHARED
-
-```mach
-pub val GPU_SHARED:    Id = 25
-```
-
-## val INTRINSIC
-
-```mach
-pub val INTRINSIC:     Id = 26
-```
-
-## val HANDLE
-
-```mach
-pub val HANDLE:        Id = 27
-```
-
-## val ABI_TYPE
-
-```mach
-pub val ABI_TYPE:      Id = 28
-```
-
-## val TESTING
-
-```mach
-pub val TESTING:       Id = 29
-```
-
-## val EXPECT
-
-```mach
-pub val EXPECT:        Id = 30
-```
-
-## val THREAD
-
-```mach
-pub val THREAD:        Id = 31
-```
-
-## val AT
-
-```mach
-pub val AT:            Id = 32
-```
-
-## val WEAK
-
-```mach
-pub val WEAK:          Id = 33
-```
-
-## def Places
+## Places
 
 ```mach
 pub def Places: u32
@@ -242,19 +201,20 @@ where a decorator may stand: one bit per declaration kind, one for an `ext`
 import, one for a tag case, and one for every declaration no decorator names.
 PLACES_ANY is every declaration; a tag case admits only a row that names it
 
-## val PLACE_CASE
+| Name | Value | |
+| :--- | :--- | :--- |
+| `PLACE_CASE` | `0x800` |  |
+| `PLACES_ANY` | `0x17FF` |  |
+
+### places_of
 
 ```mach
-pub val PLACE_CASE:  Places = 0x800
+pub fun places_of(d: *ast_decl.Decl) Places
 ```
 
-## val PLACES_ANY
+where the declaration `d` stands, for a row's `places`
 
-```mach
-pub val PLACES_ANY:  Places = 0x17FF
-```
-
-## def Flags
+## Flags
 
 ```mach
 pub def Flags: u32
@@ -262,240 +222,156 @@ pub def Flags: u32
 
 what a row asks of its decorator beyond its arguments and places
 
-FLAG_ONCE: it stands at most once on a declaration
-FLAG_ROLE: it gives a module binding a shader interface role, and a binding has one
-FLAG_TESTING_EXCLUSIVE: it names a consumer outside Mach source, which `#[testing]` cannot confine
-FLAG_STRINGS_CHECKED: its string arguments are checked by the row, not by the decorator's own rule
-FLAG_PLACE_CHECKED: the decorator refuses a misplacement itself, in a diagnostic of its own kind
-FLAG_DEFINES: it supplies the type of a `def` that states none
+| Field | Type | |
+| :--- | :--- | :--- |
+| `FLAG_ONCE` |  | it stands at most once on a declaration |
+| `FLAG_ROLE` |  | it gives a module binding a shader interface role, and a binding has one |
+| `FLAG_TESTING_EXCLUSIVE` |  | it names a consumer outside Mach source, which `#[testing]` cannot confine |
+| `FLAG_STRINGS_CHECKED` |  | its string arguments are checked by the row, not by the decorator's own rule |
+| `FLAG_PLACE_CHECKED` |  | the decorator refuses a misplacement itself, in a diagnostic of its own kind |
+| `FLAG_DEFINES` |  | it supplies the type of a `def` that states none |
 
-## val FLAG_ONCE
+| Name | Value | |
+| :--- | :--- | :--- |
+| `FLAG_ONCE` | `0x1` |  |
+| `FLAG_ROLE` | `0x2` |  |
+| `FLAG_TESTING_EXCLUSIVE` | `0x4` |  |
+| `FLAG_STRINGS_CHECKED` | `0x10` |  |
+| `FLAG_PLACE_CHECKED` | `0x20` |  |
+| `FLAG_DEFINES` | `0x40` |  |
 
-```mach
-pub val FLAG_ONCE:              Flags = 0x1
-```
-
-## val FLAG_ROLE
-
-```mach
-pub val FLAG_ROLE:              Flags = 0x2
-```
-
-## val FLAG_TESTING_EXCLUSIVE
-
-```mach
-pub val FLAG_TESTING_EXCLUSIVE: Flags = 0x4
-```
-
-## val FLAG_STRINGS_CHECKED
+### count_flagged
 
 ```mach
-pub val FLAG_STRINGS_CHECKED:   Flags = 0x10
-```
-
-## val FLAG_PLACE_CHECKED
-
-```mach
-pub val FLAG_PLACE_CHECKED:     Flags = 0x20
-```
-
-## val FLAG_DEFINES
-
-```mach
-pub val FLAG_DEFINES:           Flags = 0x40
-```
-
-## rec Row
-
-```mach
-pub rec Row;
-```
-
-one decorator
-
-places: where it stands, `misplaced` the refusal of anywhere else
-args_min, args_max:           the argument count it takes, `arity` the refusal of any other
-strings_first, strings_count: the arguments that are strings the load records, none when the count is 0
-integers: one bit per argument the row checks as an integer constant, `argument`
-           the refusal of a string or integer argument of the wrong kind
-modes: the values its first argument may take, `|`-separated, nil when any string is
-           its own; `argument` is the refusal of any other value too
-duplicate: the refusal of a second one where FLAG_ONCE holds
-
-## fun row
-
-```mach
-pub fun row(id: Id) *Row;
-```
-
-the row of `id`; nil for NONE and any id no row declares
-
-## fun id_of
-
-```mach
-pub fun id_of(source: str, name: base_source.Span) Id;
-```
-
-the decorator the name at `name` in `source` spells, NONE when it spells none
-
-## rec Rewrite
-
-```mach
-pub rec Rewrite;
-```
-
-what `mach migrate` writes for the previous spelling at `name` in `source`
-
-name: the name this major gives it
-mode: the argument a previous flag stood for, nil for none
-words: its arguments were bare names, which this major writes as strings
-
-## fun rewrite_of
-
-```mach
-pub fun rewrite_of(source: str, name: base_source.Span, args: u32) Rewrite;
-```
-
-the rewrite of the decorator named at `name` in `source` with `args` arguments, nil name
-when it is written as this major spells it
-
-## fun refusal_of
-
-```mach
-pub fun refusal_of(source: str, name: base_source.Span, args: u32) str;
-```
-
-the refusal of the previous spelling at `name` in `source` with `args` arguments, nil when
-it is none
-
-## fun constant_time_mode
-
-```mach
-pub fun constant_time_mode(itn: *intern.Interner, c: *comptime_scope.ComptimeCtx, a: *ast.Ast, d: *ast_decl.Decl) opt[str];
-```
-
-the constant-time mode `d` declares, "soft" or "hard", none when it declares none. every
-reader of the mode asks here, so none disagree
-
-## fun name_of
-
-```mach
-pub fun name_of(id: Id) str;
-```
-
-the name of `id`; nil for NONE
-
-## fun places_of
-
-```mach
-pub fun places_of(d: *ast_decl.Decl) Places;
-```
-
-where the declaration `d` stands, for a row's `places`
-
-## fun admits
-
-```mach
-pub fun admits(id: Id, d: *ast_decl.Decl) bool;
-```
-
-whether `id` may stand on the declaration `d`
-
-## fun flagged
-
-```mach
-pub fun flagged(id: Id, flags: Flags) bool;
-```
-
-whether `id`'s row carries every one of `flags`
-
-## fun mode_admits
-
-```mach
-pub fun mode_admits(modes: str, value: str) bool;
-```
-
-whether `value` is one of the `|`-separated `modes`
-
-## fun list_get
-
-```mach
-pub fun list_get(a: *ast.Ast, start: u32, len: u32, id: Id) opt[*ast_decl.Decorator];
-```
-
-the first decorator `id` among the `len` decorators from `start`
-
-## fun list_has
-
-```mach
-pub fun list_has(a: *ast.Ast, start: u32, len: u32, id: Id) bool;
-```
-
-whether the decorator `id` is among the `len` decorators from `start`
-
-## fun get
-
-```mach
-pub fun get(a: *ast.Ast, d: *ast_decl.Decl, id: Id) opt[*ast_decl.Decorator];
-```
-
-the declaration's decorator `id`, the first when it repeats
-
-## fun has
-
-```mach
-pub fun has(a: *ast.Ast, d: *ast_decl.Decl, id: Id) bool;
-```
-
-whether the declaration carries the decorator `id`
-
-## fun count_flagged
-
-```mach
-pub fun count_flagged(a: *ast.Ast, d: *ast_decl.Decl, flags: Flags) u32;
+pub fun count_flagged(a: *ast.Ast, d: *ast_decl.Decl, flags: Flags) u32
 ```
 
 how many of the declaration's decorators carry every one of `flags`
 
-## fun names_append
+### names_append
 
 ```mach
-pub fun names_append(b: *textbuild.TextBuilder, flags: Flags, places: Places, conjunction: str) err[textbuild.Error];
+pub fun names_append(b: *textbuild.TextBuilder, flags: Flags, places: Places, conjunction: str) err[textbuild.Error]
 ```
 
 appends the names of the rows that carry every one of `flags` and stand somewhere
 in `places`, `, `-separated in row order. with a `conjunction` each name is quoted
 in backticks and the conjunction precedes the last, as in "`a`, `b`, and `c`"
 
-## fun takes_string
+## Row
 
 ```mach
-pub fun takes_string(dec: *ast_decl.Decorator, ord: u32) bool;
+pub rec Row {
+    id:            Id;
+    name:          str;
+    places:        Places;
+    args_min:      u32;
+    args_max:      u32;
+    strings_first: u32;
+    strings_count: u32;
+    integers:      u32;
+    modes:         str;
+    flags:         Flags;
+    arity:         str;
+    argument:      str;
+    misplaced:     str;
+    duplicate:     str;
+}
+```
+
+one decorator
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `places` | `Places` | where it stands, `misplaced` the refusal of anywhere else args_min, args_max:           the argument count it takes, `arity` the refusal of any other strings_first, strings_count: the arguments that are strings the load records, none when the count is 0 |
+| `integers` | `u32` | one bit per argument the row checks as an integer constant, `argument` the refusal of a string or integer argument of the wrong kind |
+| `modes` | `str` | the values its first argument may take, `\|`-separated, nil when any string is its own; `argument` is the refusal of any other value too |
+| `duplicate` | `str` | the refusal of a second one where FLAG_ONCE holds |
+
+## Rewrite
+
+```mach
+pub rec Rewrite {
+    name:  str;
+    mode:  str;
+    words: bool;
+}
+```
+
+what `mach migrate` writes for the previous spelling at `name` in `source`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `name` | `str` | the name this major gives it |
+| `mode` | `str` | the argument a previous flag stood for, nil for none |
+| `words` | `bool` | its arguments were bare names, which this major writes as strings |
+
+### rewrite_of
+
+```mach
+pub fun rewrite_of(source: str, name: base_source.Span, args: u32) Rewrite
+```
+
+the rewrite of the decorator named at `name` in `source` with `args` arguments, nil name
+when it is written as this major spells it
+
+## Functions
+
+### refusal_of
+
+```mach
+pub fun refusal_of(source: str, name: base_source.Span, args: u32) str
+```
+
+the refusal of the previous spelling at `name` in `source` with `args` arguments, nil when
+it is none
+
+### constant_time_mode
+
+```mach
+pub fun constant_time_mode(itn: *intern.Interner, c: *comptime_scope.ComptimeCtx, a: *ast.Ast, d: *ast_decl.Decl) opt[str]
+```
+
+the constant-time mode `d` declares, "soft" or "hard", none when it declares none. every
+reader of the mode asks here, so none disagree
+
+### mode_admits
+
+```mach
+pub fun mode_admits(modes: str, value: str) bool
+```
+
+whether `value` is one of the `|`-separated `modes`
+
+### takes_string
+
+```mach
+pub fun takes_string(dec: *ast_decl.Decorator, ord: u32) bool
 ```
 
 whether argument `ord` of `dec` is a string the load records
 
-## fun string_id
+### string_id
 
 ```mach
-pub fun string_id(c: *comptime_scope.ComptimeCtx, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) intern.StrId;
+pub fun string_id(c: *comptime_scope.ComptimeCtx, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) intern.StrId
 ```
 
 the string argument `ord` of `dec` evaluated to in the scope `c`; STR_NIL when it is not a constant string
 
-## fun string_of
+### string_of
 
 ```mach
-pub fun string_of(itn: *intern.Interner, c: *comptime_scope.ComptimeCtx, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) opt[str];
+pub fun string_of(itn: *intern.Interner, c: *comptime_scope.ComptimeCtx, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) opt[str]
 ```
 
 the text of `string_id`
 
-## fun strings_record
+### strings_record
 
 ```mach
 pub fun strings_record[T](itn: *intern.Interner, into: *comptime_scope.ComptimeCtx, a: *ast.Ast, source: str,
-c: *comptime_scope.ComptimeCtx, cap_ctx: *T, caps: comptime_capability.PhaseCapabilities[T], reached: *bool) err[fail.Fail];
+    c: *comptime_scope.ComptimeCtx, cap_ctx: *T, caps: comptime_capability.PhaseCapabilities[T], reached: *bool) err[fail.Fail]
 ```
 
 records into `into` the string every string argument of a module's decorators evaluates to, with

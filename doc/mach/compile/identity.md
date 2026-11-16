@@ -1,3 +1,5 @@
+[mach](../README.md) / [compile](README.md) / **identity**
+
 # mach.compile.identity
 
 source identity: what a merged definition was made from, independent of how
@@ -24,27 +26,42 @@ the parts are digests cut to 32 and 16 bits: ample against accident, and no
 authentication. an object made by hand that copies an identity onto other
 code merges with the copies it imitates
 
-## val SOURCE_IDENTITY
+<sub>source: [`src/compile/identity.mach`](../../../src/compile/identity.mach) · imported by 1 module</sub>
+
+<sub>`project` is [`mach.compile.project`](project.md) · `module` is [`mach.session.module`](../session/module.md) · `fail` is [`mach.base.fail`](../base/fail.md) · `sema_instance` is [`mach.front.sema.instance`](../front/sema/instance.md) · `intern` is [`mach.base.intern`](../base/intern.md) · `query` is [`mach.session.query`](../session/query.md)</sub>
+
+| Functions | |
+| :--- | :--- |
+| [`of_module`](#of_module) | the source identity of module `mid` |
+| [`of_instance`](#of_instance) | the identity of the instance `item` of symbol `name` |
+
+| Constants | |
+| :--- | :--- |
+| [`SOURCE_IDENTITY`](#constants) | a module's source identity, keyed by its stable id |
+
+---
+
+## Functions
+
+### of_module
 
 ```mach
-pub val SOURCE_IDENTITY: query.Kind = query.Kind;
-```
-
-a module's source identity, keyed by its stable id
-
-## fun of_module
-
-```mach
-pub fun of_module(p: *project.Project, mid: module.ModuleId, out: *[32]u8) err[fail.Fail];
+pub fun of_module(p: *project.Project, mid: module.ModuleId, out: *[32]u8) err[fail.Fail]
 ```
 
 the source identity of module `mid`
 
-## fun of_instance
+### of_instance
 
 ```mach
-pub fun of_instance(p: *project.Project, item: *sema_instance.Instance, name: intern.StrId) res[u64, fail.Fail];
+pub fun of_instance(p: *project.Project, item: *sema_instance.Instance, name: intern.StrId) res[u64, fail.Fail]
 ```
 
 the identity of the instance `item` of symbol `name`
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `SOURCE_IDENTITY` | `query.Kind` | `query.Kind{ name: "source identity", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_LOWER, compute: module_compute }` | a module's source identity, keyed by its stable id |
 

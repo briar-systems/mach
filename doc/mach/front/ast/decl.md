@@ -1,197 +1,256 @@
+[mach](../../README.md) / [front](../README.md) / [ast](README.md) / **decl**
+
 # mach.front.ast.decl
 
-## def DeclKind
+the declaration nodes of the syntax tree, with typed names, tag cases and decorators
+
+<sub>source: [`src/front/ast/decl.mach`](../../../../src/front/ast/decl.mach) · imported by 38 modules</sub>
+
+<sub>`base_source` is [`mach.base.source`](../../base/source.md) · `ast_id` is [`mach.front.ast.id`](id.md)</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`DeclKind`](#declkind) | `def` |  |
+| [`TypedName`](#typedname) | `rec` |  |
+| [`DeclUse`](#decluse) | `rec` |  |
+| [`DeclFwd`](#declfwd) | `rec` |  |
+| [`DeclFun`](#declfun) | `rec` |  |
+| [`DeclRec`](#declrec) | `rec` |  |
+| [`DeclUni`](#decluni) | `rec` |  |
+| [`TagCase`](#tagcase) | `rec` |  |
+| [`DeclTag`](#decltag) | `rec` |  |
+| [`DeclBind`](#declbind) | `rec` |  |
+| [`DeclDef`](#decldef) | `rec` |  |
+| [`DeclTest`](#decltest) | `rec` |  |
+| [`ComptimeBranch`](#comptimebranch) | `rec` |  |
+| [`DeclComptimeIf`](#declcomptimeif) | `rec` |  |
+| [`DeclComptimeDirective`](#declcomptimedirective) | `rec` |  |
+| [`Decorator`](#decorator) | `rec` | `#[name(args)]`, all of which `span` covers; `id` is the decorator registry's id the name spells, decoded once by the parser, and 0 when it spells none |
+| [`Decl`](#decl) | `rec` |  |
+
+| On `DeclKind` | |
+| :--- | :--- |
+| [`DECL_KIND_USE`](#declkind) · [`DECL_KIND_FWD`](#declkind) · [`DECL_KIND_FUN`](#declkind) · [`DECL_KIND_REC`](#declkind) · [`DECL_KIND_VAL`](#declkind) · [`DECL_KIND_VAR`](#declkind) · [`DECL_KIND_DEF`](#declkind) · [`DECL_KIND_TEST`](#declkind) · [`DECL_KIND_COMPTIME_IF`](#declkind) · [`DECL_KIND_COMPTIME_DIRECTIVE`](#declkind) · [`DECL_KIND_UNI`](#declkind) · [`DECL_KIND_TAG`](#declkind) · [`DECL_KIND_ERROR`](#declkind) | |
+
+| Constants | |
+| :--- | :--- |
+| [`DECL_FLAG_PUB`](#constants) · [`DECL_FLAG_EXT`](#constants) | |
+
+---
+
+## DeclKind
 
 ```mach
 pub def DeclKind: u8
 ```
 
-## val DECL_KIND_USE
+| Name | Value | |
+| :--- | :--- | :--- |
+| `DECL_KIND_USE` | `0` |  |
+| `DECL_KIND_FWD` | `1` |  |
+| `DECL_KIND_FUN` | `2` |  |
+| `DECL_KIND_REC` | `3` |  |
+| `DECL_KIND_VAL` | `4` |  |
+| `DECL_KIND_VAR` | `5` |  |
+| `DECL_KIND_DEF` | `6` |  |
+| `DECL_KIND_TEST` | `7` |  |
+| `DECL_KIND_COMPTIME_IF` | `8` |  |
+| `DECL_KIND_COMPTIME_DIRECTIVE` | `9` |  |
+| `DECL_KIND_UNI` | `10` |  |
+| `DECL_KIND_TAG` | `11` |  |
+| `DECL_KIND_ERROR` | `255` |  |
+
+## TypedName
 
 ```mach
-pub val DECL_KIND_USE:                DeclKind = 0
+pub rec TypedName {
+    name:     base_source.Span;
+    ty:       ast_id.TypeId;
+    comptime: bool;
+}
 ```
 
-## val DECL_KIND_FWD
+## DeclUse
 
 ```mach
-pub val DECL_KIND_FWD:                DeclKind = 1
+pub rec DeclUse {
+    alias: base_source.Span;
+    path:  base_source.Span;
+}
 ```
 
-## val DECL_KIND_FUN
+## DeclFwd
 
 ```mach
-pub val DECL_KIND_FUN:                DeclKind = 2
+pub rec DeclFwd {
+    alias: base_source.Span;
+    path:  base_source.Span;
+}
 ```
 
-## val DECL_KIND_REC
+## DeclFun
 
 ```mach
-pub val DECL_KIND_REC:                DeclKind = 3
+pub rec DeclFun {
+    name:           base_source.Span;
+    generics_start: u32;
+    generics_len:   u32;
+    params_start:   u32;
+    params_len:     u32;
+    return_type:    ast_id.TypeId;
+    body:           ast_id.StmtId;
+    c_variadic:     bool;
+}
 ```
 
-## val DECL_KIND_VAL
+## DeclRec
 
 ```mach
-pub val DECL_KIND_VAL:                DeclKind = 4
+pub rec DeclRec {
+    name:           base_source.Span;
+    generics_start: u32;
+    generics_len:   u32;
+    fields_start:   u32;
+    fields_len:     u32;
+}
 ```
 
-## val DECL_KIND_VAR
+## DeclUni
 
 ```mach
-pub val DECL_KIND_VAR:                DeclKind = 5
+pub rec DeclUni {
+    name:           base_source.Span;
+    generics_start: u32;
+    generics_len:   u32;
+    fields_start:   u32;
+    fields_len:     u32;
+}
 ```
 
-## val DECL_KIND_DEF
+## TagCase
 
 ```mach
-pub val DECL_KIND_DEF:                DeclKind = 6
+pub rec TagCase {
+    name:             base_source.Span;
+    payload:          ast_id.TypeId;
+    decorators_start: u32;
+    decorators_len:   u32;
+}
 ```
 
-## val DECL_KIND_TEST
+## DeclTag
 
 ```mach
-pub val DECL_KIND_TEST:               DeclKind = 7
+pub rec DeclTag {
+    name:           base_source.Span;
+    generics_start: u32;
+    generics_len:   u32;
+    cases_start:    u32;
+    cases_len:      u32;
+    disc:           ast_id.TypeId;
+}
 ```
 
-## val DECL_KIND_COMPTIME_IF
+## DeclBind
 
 ```mach
-pub val DECL_KIND_COMPTIME_IF:        DeclKind = 8
+pub rec DeclBind {
+    name: base_source.Span;
+    ty:   ast_id.TypeId;
+    init: ast_id.ExprId;
+}
 ```
 
-## val DECL_KIND_COMPTIME_DIRECTIVE
+## DeclDef
 
 ```mach
-pub val DECL_KIND_COMPTIME_DIRECTIVE: DeclKind = 9
+pub rec DeclDef {
+    name: base_source.Span;
+    ty:   ast_id.TypeId;
+}
 ```
 
-## val DECL_KIND_UNI
+## DeclTest
 
 ```mach
-pub val DECL_KIND_UNI:                DeclKind = 10
+pub rec DeclTest {
+    name: base_source.Span;
+    body: ast_id.StmtId;
+}
 ```
 
-## val DECL_KIND_TAG
+## ComptimeBranch
 
 ```mach
-pub val DECL_KIND_TAG:                DeclKind = 11
+pub rec ComptimeBranch {
+    cond:       ast_id.ExprId;
+    body_start: u32;
+    body_len:   u32;
+}
 ```
 
-## val DECL_KIND_ERROR
+## DeclComptimeIf
 
 ```mach
-pub val DECL_KIND_ERROR:              DeclKind = 255
+pub rec DeclComptimeIf {
+    branches_start: u32;
+    branches_len:   u32;
+}
 ```
 
-## val DECL_FLAG_PUB
+## DeclComptimeDirective
 
 ```mach
-pub val DECL_FLAG_PUB: u8 = 1
+pub rec DeclComptimeDirective {
+    target: ast_id.ExprId;
+}
 ```
 
-## val DECL_FLAG_EXT
+## Decorator
 
 ```mach
-pub val DECL_FLAG_EXT: u8 = 2
+pub rec Decorator {
+    span:       base_source.Span;
+    name:       base_source.Span;
+    id:         u8;
+    args_start: u32;
+    args_len:   u32;
+}
 ```
 
-## rec TypedName
+`#[name(args)]`, all of which `span` covers; `id` is the decorator registry's id the
+name spells, decoded once by the parser, and 0 when it spells none
+
+## Decl
 
 ```mach
-pub rec TypedName;
+pub rec Decl {
+    span:             base_source.Span;
+    kind:             DeclKind;
+    flags:            u8;
+    doc:              base_source.Span;
+    decorators_start: u32;
+    decorators_len:   u32;
+    data:             uni {
+        use_: DeclUse;
+        fwd_: DeclFwd;
+        fun_: DeclFun;
+        rec_: DeclRec;
+        uni_: DeclUni;
+        tag_: DeclTag;
+        bind: DeclBind;
+        def_: DeclDef;
+        test_: DeclTest;
+        comptime_if: DeclComptimeIf;
+        comptime_directive: DeclComptimeDirective;
+    };
+}
 ```
 
-## rec DeclUse
+## Constants
 
-```mach
-pub rec DeclUse;
-```
-
-## rec DeclFwd
-
-```mach
-pub rec DeclFwd;
-```
-
-## rec DeclFun
-
-```mach
-pub rec DeclFun;
-```
-
-## rec DeclRec
-
-```mach
-pub rec DeclRec;
-```
-
-## rec DeclUni
-
-```mach
-pub rec DeclUni;
-```
-
-## rec TagCase
-
-```mach
-pub rec TagCase;
-```
-
-## rec DeclTag
-
-```mach
-pub rec DeclTag;
-```
-
-## rec DeclBind
-
-```mach
-pub rec DeclBind;
-```
-
-## rec DeclDef
-
-```mach
-pub rec DeclDef;
-```
-
-## rec DeclTest
-
-```mach
-pub rec DeclTest;
-```
-
-## rec ComptimeBranch
-
-```mach
-pub rec ComptimeBranch;
-```
-
-## rec DeclComptimeIf
-
-```mach
-pub rec DeclComptimeIf;
-```
-
-## rec DeclComptimeDirective
-
-```mach
-pub rec DeclComptimeDirective;
-```
-
-## rec Decorator
-
-```mach
-pub rec Decorator;
-```
-
-`#[name(args)]`; `id` is the decorator registry's id the name spells, decoded
-once by the parser, and 0 when it spells none
-
-## rec Decl
-
-```mach
-pub rec Decl;
-```
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `DECL_FLAG_PUB` | `u8` | `1` |  |
+| `DECL_FLAG_EXT` | `u8` | `2` |  |
 

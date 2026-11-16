@@ -1,6 +1,83 @@
+[mach](../README.md) / [base](README.md) / **fail**
+
 # mach.base.fail
 
-## tag Fail
+the compiler's one failure type, and how a refusal of the machine becomes one
+
+every pass, the linker, the query engine, the session and the build return a `Fail`: reported,
+when diagnostics already say it, a compiler defect, the user's input, or the environment's
+refusal. a failure may point at a source location and carry related places and a fix, and it
+records whether it owns its text and its places. `refusal` is the one way a refused std
+operation becomes a failure, naming the operation and the path it acted on.
+
+<sub>source: [`src/base/fail.mach`](../../../src/base/fail.mach) · imported by 201 modules</sub>
+
+<sub>`Message` is private · `Keyed` is private · `diagnostic_kind` is [`mach.base.diagnostic.kind`](diagnostic/kind.md) · `base_source` is [`mach.base.source`](source.md) · `A` is `std.allocator` · `annotation` is [`mach.base.diagnostic.annotation`](diagnostic/annotation.md) · `std_format` is `std.format` · `toml_error` is `toml.error` · `io_error` is `std.io.error` · `fs` is `std.filesystem` · `env` is `std.process.env` · `io_writer` is `std.io.writer`</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Fail`](#fail) | `tag` | the compiler's failure, one type for every pass, the linker, the query engine, the session and the build |
+| [`Op`](#op) | `rec` | an operation the machine was asked to carry out, as a refusal of it names it: `cannot <verb>[ <role>][ '<path>'][ <link> '<other>']: <cause>` |
+| [`Cause`](#cause) | `tag` | what refused an operation, as the std operation reported it; `text` is a cause its own module renders (a subprocess, a contained removal) |
+
+| On `Fail` | |
+| :--- | :--- |
+| [`reported`](#reported) | |
+| [`message`](#message) | an internal failure: a compiler defect, reported as `compiler.internal` |
+| [`user`](#user) | the input is wrong or unsupported |
+| [`environment`](#environment) | the machine refused: a file could not be read or written, a tool could not be spawned |
+| [`owning`](#owning) | the same failure owning its text, which was allocated through the allocator its holder releases it with (`dnit`); a reported failure carries none |
+| [`as_user`](#as_user) | a failure the user caused met by a phase that cannot classify it (target selection, source loading, import libraries): an internal text becomes the user class under `k`, a keyed failure keeps its own class and kind, a reported failure stays reported |
+| [`as_internal`](#as_internal) | a failure met on input the compiler produced itself (an object it wrote, a module it emitted): whatever the check says of the input, it is the compiler's defect, an internal failure keeping the text and the place |
+| [`defect`](#defect) | the compiler's defect a failure names, borrowing its text and keeping its place, for a holder of the first defect a phase met: an internal failure as it is, a keyed one as the defect its text names, and a reported one as the defect of being handed one, since its diagnostics name no defect of their own |
+| [`at`](#at) | the same failure pointing at `at`, a location of the source map its caller reads |
+| [`spanned`](#spanned) | the same failure pointing at the span `s` of the file that caused it, which `placed` names, as `at` points it |
+| [`placed`](#placed) | the same failure with every span still waiting for its file, its own, each related one and each fix edit's, placed in `file` |
+| [`with_related`](#with_related) | the same failure naming the `n` locations at `locs` as its related places, in order, each unlabelled; a nil location is skipped |
+| [`with_fix`](#with_fix) | the same failure carrying the rewrite `label` names, which replaces the span `s` of the file the failure points into, or the bytes it points at when `s` is none, with `replacement` |
+| [`fix_of`](#fix_of) | the rewrite a failure carries, none when it carries no fix; it shares the failure's places' lifetime |
+| [`related_of`](#related_of) | the related places a failure names, empty for one that names no other; they share the failure's places' lifetime |
+| [`borrowing_places`](#borrowing_places) | the same failure borrowing its places, for a view of places a holder owns: the places it owned before are the caller's to release |
+| [`place_of`](#place_of) | where the failure points, when it points at a file of the source map its caller reads |
+| [`kind_of`](#kind_of) | the kind the failure is reported as, NONE for a reported one, whose diagnostics carry their own |
+| [`is_reported`](#is_reported) · [`is_message`](#is_message) · [`is_environment`](#is_environment) | |
+| [`text`](#text) | the text a failure carries, absent for a reported one |
+| [`describe`](#describe) | |
+| [`with_text`](#with_text) | the same failure carrying `text` instead, which it borrows: the class, the kind and the places are kept |
+| [`with_secondary`](#with_secondary) | the same failure also naming `secondary`, a failure met while releasing what the failing path held (a child cancelled, a file removed, a source closed): the text gains "; cleanup also failed: " and the secondary's, joined into `a`, and the class, kind and places stay the failure's |
+| [`retain`](#retain) | a copy of the failure that owns its text and its places through `a`, for a failure that outlives the storage its message was made in; released with `dnit` |
+| [`dnit`](#dnit) | release what a failure owns through `a`: its text and its places, each when it owns them |
+| [`places_retain`](#places_retain) | a copy of the failure whose places, every related place and its fix, are owned through `a`, its text left as it is; for a holder that keeps the text apart |
+| [`places_dnit`](#places_dnit) | release the places a failure owns through `a`, as `places_retain` made them; borrowed places are left alone |
+| [`without_places`](#without_places) | the same failure pointing nowhere, naming no related place and carrying no fix, for a holder whose places were released or never copied |
+| [`same_places`](#same_places) | whether two failures hold the same places: the same location and the same related and fix storage, as a holder that copied them once sees its own copy |
+| [`unit`](#unit) | the unit outcome of an operation whose value is not needed |
+| [`prefixed`](#prefixed) | `cause` with `context` in front of its text, joined into `a`, which owns the new text; the class, the kind and the places are kept |
+| [`formatted`](#formatted) | an internal failure whose text is `fmt` formatted with `va` into `a`, which the failure owns; a refusal to format is the failure instead |
+| [`formatted_user`](#formatted_user) | a user failure under `k` whose text is `fmt` formatted with `va` into `a`, which the failure owns; a refusal to format is the failure instead |
+| [`message_of`](#message_of) | the internal failure carrying a made text, which it borrows (a made text may be interned), or the failure that refused to make it |
+| [`user_of`](#user_of) | the user failure under `k` carrying a made text, which it borrows, or the failure that refused to make it |
+| [`environment_of`](#environment_of) | the environment failure under `k` carrying a made text, which it borrows, or the failure that refused to make it |
+| [`refused`](#refused) | the refusals the compiler recovers from at no site, each carrying its text: the allocator's, which is the environment's, and a string operation, a format and the source map, each internal unless the allocator refused it |
+| [`str_refused`](#str_refused) · [`format_refused`](#format_refused) · [`source_refused`](#source_refused) | |
+| [`toml_refused`](#toml_refused) | a document that does not parse is the user's, pointing at the byte the parser refused; one the allocator refused is the environment's |
+
+| On `Op` | |
+| :--- | :--- |
+| [`refusal`](#refusal) | the failure of `op`, refused by `cause`, reported under `k` with the text `op` names, allocated in `a`, which the failure borrows |
+
+| On `Cause` | |
+| :--- | :--- |
+| [`charged`](#charged) | the failure under `k` carrying `text`, which it borrows, for a refusal of `cause` that a module words itself because its text names more than one operation does (a contained walk names the path, the component and the policy): charged as `refusal` charges it, `given` saying whether the user named the path |
+| [`cause_text`](#cause_text) | the text of what refused an operation, for a note or a report line that is not itself a failure; a failure goes through `refusal`, which names the operation |
+
+| Functions | |
+| :--- | :--- |
+| [`str_text`](#str_text) · [`format_text`](#format_text) · [`toml_text`](#toml_text) | |
+
+---
+
+## Fail
 
 ```mach
 pub tag Fail: u8 {
@@ -33,16 +110,16 @@ failure that names related places or a fix records whether it owns their
 storage in the same way, all of it or none: `places_retain`, `retain`,
 `with_related` and `with_fix` own it
 
-## fun reported
+### reported
 
 ```mach
-pub fun reported() Fail;
+pub fun reported() Fail
 ```
 
-## fun message
+### message
 
 ```mach
-pub fun message(text: str) Fail;
+pub fun message(text: str) Fail
 ```
 
 an internal failure: a compiler defect, reported as `compiler.internal`.
@@ -52,38 +129,38 @@ answer or an abort. panic is left to a function documented as total, which
 has no failure to return, when its caller breaks the precondition it states.
 the failure borrows `text`; `owning` hands it text it owns
 
-## fun user
+### user
 
 ```mach
-pub fun user(k: diagnostic_kind.Kind, text: str) Fail;
+pub fun user(k: diagnostic_kind.Kind, text: str) Fail
 ```
 
 the input is wrong or unsupported. a failure names a live row of the
 registry: one that names none, or a retired one, is a compiler defect and
 becomes an internal failure. the failure borrows `text`
 
-## fun environment
+### environment
 
 ```mach
-pub fun environment(k: diagnostic_kind.Kind, text: str) Fail;
+pub fun environment(k: diagnostic_kind.Kind, text: str) Fail
 ```
 
 the machine refused: a file could not be read or written, a tool could not
 be spawned. the failure borrows `text`
 
-## fun owning
+### owning
 
 ```mach
-pub fun owning(f: Fail) Fail;
+pub fun owning(f: Fail) Fail
 ```
 
 the same failure owning its text, which was allocated through the allocator
 its holder releases it with (`dnit`); a reported failure carries none
 
-## fun as_user
+### as_user
 
 ```mach
-pub fun as_user(k: diagnostic_kind.Kind, f: Fail) Fail;
+pub fun as_user(k: diagnostic_kind.Kind, f: Fail) Fail
 ```
 
 a failure the user caused met by a phase that cannot classify it (target
@@ -91,10 +168,10 @@ selection, source loading, import libraries): an internal text becomes the
 user class under `k`, a keyed failure keeps its own class and kind, a
 reported failure stays reported
 
-## fun as_internal
+### as_internal
 
 ```mach
-pub fun as_internal(f: Fail) Fail;
+pub fun as_internal(f: Fail) Fail
 ```
 
 a failure met on input the compiler produced itself (an object it wrote, a
@@ -102,10 +179,10 @@ module it emitted): whatever the check says of the input, it is the
 compiler's defect, an internal failure keeping the text and the place. a
 reported failure stays reported
 
-## fun defect
+### defect
 
 ```mach
-pub fun defect(f: Fail) Fail;
+pub fun defect(f: Fail) Fail
 ```
 
 the compiler's defect a failure names, borrowing its text and keeping its place, for a
@@ -113,10 +190,10 @@ holder of the first defect a phase met: an internal failure as it is, a keyed on
 defect its text names, and a reported one as the defect of being handed one, since its
 diagnostics name no defect of their own
 
-## fun at
+### at
 
 ```mach
-pub fun at(f: Fail, at: base_source.Location) Fail;
+pub fun at(f: Fail, at: base_source.Location) Fail
 ```
 
 the same failure pointing at `at`, a location of the source map its caller reads. a
@@ -124,28 +201,28 @@ failure that already points somewhere keeps its place, the innermost site knowin
 a reported one, or a nil `at`, points nowhere. a fix that names no place of its own
 rewrites the bytes the failure points at
 
-## fun spanned
+### spanned
 
 ```mach
-pub fun spanned(f: Fail, s: base_source.Span) Fail;
+pub fun spanned(f: Fail, s: base_source.Span) Fail
 ```
 
 the same failure pointing at the span `s` of the file that caused it, which `placed`
 names, as `at` points it
 
-## fun placed
+### placed
 
 ```mach
-pub fun placed(f: Fail, file: base_source.FileId) Fail;
+pub fun placed(f: Fail, file: base_source.FileId) Fail
 ```
 
 the same failure with every span still waiting for its file, its own, each related one and
 each fix edit's, placed in `file`
 
-## fun with_related
+### with_related
 
 ```mach
-pub fun with_related(a: *A.Allocator, f: Fail, locs: *base_source.Location, n: usize) Fail;
+pub fun with_related(a: *A.Allocator, f: Fail, locs: *base_source.Location, n: usize) Fail
 ```
 
 the same failure naming the `n` locations at `locs` as its related places, in order, each
@@ -153,10 +230,10 @@ unlabelled; a nil location is skipped. the failure owns its places through `a` a
 `places_retain` leaves them. a failure that already names related places keeps them, and one
 whose copy is refused is that refusal
 
-## fun with_fix
+### with_fix
 
 ```mach
-pub fun with_fix(a: *A.Allocator, f: Fail, label: str, s: opt[base_source.Span], replacement: str) Fail;
+pub fun with_fix(a: *A.Allocator, f: Fail, label: str, s: opt[base_source.Span], replacement: str) Fail
 ```
 
 the same failure carrying the rewrite `label` names, which replaces the span `s` of the file
@@ -165,96 +242,96 @@ label and the replacement are copied, so the failure owns its places through `a`
 `places_retain` leaves them. a failure with no kind carries none, one that already carries a
 fix keeps it, and one whose copy is refused is that refusal
 
-## fun fix_of
+### fix_of
 
 ```mach
-pub fun fix_of(f: Fail) opt[annotation.Fix];
+pub fun fix_of(f: Fail) opt[annotation.Fix]
 ```
 
 the rewrite a failure carries, none when it carries no fix; it shares the failure's places'
 lifetime
 
-## fun related_of
+### related_of
 
 ```mach
-pub fun related_of(f: Fail) Vector[annotation.Related];
+pub fun related_of(f: Fail) Vector[annotation.Related]
 ```
 
 the related places a failure names, empty for one that names no other; they share the
 failure's places' lifetime
 
-## fun borrowing_places
+### borrowing_places
 
 ```mach
-pub fun borrowing_places(f: Fail) Fail;
+pub fun borrowing_places(f: Fail) Fail
 ```
 
 the same failure borrowing its places, for a view of places a holder owns:
 the places it owned before are the caller's to release
 
-## fun place_of
+### place_of
 
 ```mach
-pub fun place_of(f: Fail) opt[base_source.Location];
+pub fun place_of(f: Fail) opt[base_source.Location]
 ```
 
 where the failure points, when it points at a file of the source map its caller reads
 
-## fun kind_of
+### kind_of
 
 ```mach
-pub fun kind_of(f: Fail) diagnostic_kind.Kind;
+pub fun kind_of(f: Fail) diagnostic_kind.Kind
 ```
 
 the kind the failure is reported as, NONE for a reported one, whose
 diagnostics carry their own
 
-## fun is_reported
+### is_reported
 
 ```mach
-pub fun is_reported(f: Fail) bool;
+pub fun is_reported(f: Fail) bool
 ```
 
-## fun is_message
+### is_message
 
 ```mach
-pub fun is_message(f: Fail) bool;
+pub fun is_message(f: Fail) bool
 ```
 
-## fun is_environment
+### is_environment
 
 ```mach
-pub fun is_environment(f: Fail) bool;
+pub fun is_environment(f: Fail) bool
 ```
 
-## fun text
+### text
 
 ```mach
-pub fun text(f: Fail) opt[str];
+pub fun text(f: Fail) opt[str]
 ```
 
 the text a failure carries, absent for a reported one
 
-## fun describe
+### describe
 
 ```mach
-pub fun describe(f: Fail) str;
+pub fun describe(f: Fail) str
 ```
 
-## fun with_text
+### with_text
 
 ```mach
-pub fun with_text(f: Fail, text: str) Fail;
+pub fun with_text(f: Fail, text: str) Fail
 ```
 
 the same failure carrying `text` instead, which it borrows: the class, the
 kind and the places are kept. text the failure is to own goes through
 `owning` as well. the text it carried before is the caller's to release
 
-## fun with_secondary
+### with_secondary
 
 ```mach
-pub fun with_secondary(a: *A.Allocator, f: Fail, secondary: Fail) Fail;
+pub fun with_secondary(a: *A.Allocator, f: Fail, secondary: Fail) Fail
 ```
 
 the same failure also naming `secondary`, a failure met while releasing what
@@ -267,73 +344,173 @@ a refused join leaves the failure as it was, as `prefixed` does, so the
 secondary never takes the failure's place. the joined text is owned through
 `a`; a failure returned as it was keeps the ownership it had
 
-## fun retain
+### retain
 
 ```mach
-pub fun retain(a: *A.Allocator, f: Fail) res[Fail, A.Error];
+pub fun retain(a: *A.Allocator, f: Fail) res[Fail, A.Error]
 ```
 
 a copy of the failure that owns its text and its places through `a`, for a
 failure that outlives the storage its message was made in; released with
 `dnit`
 
-## fun dnit
+### dnit
 
 ```mach
-pub fun dnit(a: *A.Allocator, f: Fail);
+pub fun dnit(a: *A.Allocator, f: Fail)
 ```
 
 release what a failure owns through `a`: its text and its places, each when
 it owns them
 
-## fun places_retain
+### places_retain
 
 ```mach
-pub fun places_retain(a: *A.Allocator, f: Fail) res[Fail, A.Error];
+pub fun places_retain(a: *A.Allocator, f: Fail) res[Fail, A.Error]
 ```
 
 a copy of the failure whose places, every related place and its fix, are owned through `a`,
 its text left as it is; for a holder that keeps the text apart. released with `places_dnit`
 
-## fun places_dnit
+### places_dnit
 
 ```mach
-pub fun places_dnit(a: *A.Allocator, f: Fail);
+pub fun places_dnit(a: *A.Allocator, f: Fail)
 ```
 
 release the places a failure owns through `a`, as `places_retain` made them;
 borrowed places are left alone
 
-## fun without_places
+### without_places
 
 ```mach
-pub fun without_places(f: Fail) Fail;
+pub fun without_places(f: Fail) Fail
 ```
 
 the same failure pointing nowhere, naming no related place and carrying no
 fix, for a holder whose places were released or never copied
 
-## fun same_places
+### same_places
 
 ```mach
-pub fun same_places(x: Fail, y: Fail) bool;
+pub fun same_places(x: Fail, y: Fail) bool
 ```
 
 whether two failures hold the same places: the same location and the same related and fix
 storage, as a holder that copied them once sees its own copy
 
-## fun unit
+### unit
 
 ```mach
-pub fun unit[V](r: res[V, Fail]) err[Fail];
+pub fun unit[V](r: res[V, Fail]) err[Fail]
 ```
 
 the unit outcome of an operation whose value is not needed
 
-## rec Op
+### prefixed
 
 ```mach
-pub rec Op;
+pub fun prefixed(a: *A.Allocator, context: str, cause: Fail) Fail
+```
+
+`cause` with `context` in front of its text, joined into `a`, which owns the
+new text; the class, the kind and the places are kept. a reported cause has
+no text to extend, and a refused join leaves the cause as it was, keeping the
+ownership it had, so the context never takes the cause's place
+
+### formatted
+
+```mach
+pub fun formatted(a: *A.Allocator, fmt: str, va: ...) Fail
+```
+
+an internal failure whose text is `fmt` formatted with `va` into `a`, which
+the failure owns; a refusal to format is the failure instead
+
+### formatted_user
+
+```mach
+pub fun formatted_user(a: *A.Allocator, k: diagnostic_kind.Kind, fmt: str, va: ...) Fail
+```
+
+a user failure under `k` whose text is `fmt` formatted with `va` into `a`,
+which the failure owns; a refusal to format is the failure instead
+
+### message_of
+
+```mach
+pub fun message_of(made: res[str, Fail]) Fail
+```
+
+the internal failure carrying a made text, which it borrows (a made text may
+be interned), or the failure that refused to make it
+
+### user_of
+
+```mach
+pub fun user_of(k: diagnostic_kind.Kind, made: res[str, Fail]) Fail
+```
+
+the user failure under `k` carrying a made text, which it borrows, or the
+failure that refused to make it
+
+### environment_of
+
+```mach
+pub fun environment_of(k: diagnostic_kind.Kind, made: res[str, Fail]) Fail
+```
+
+the environment failure under `k` carrying a made text, which it borrows, or
+the failure that refused to make it
+
+### refused
+
+```mach
+pub fun refused(e: A.Error) Fail
+```
+
+the refusals the compiler recovers from at no site, each carrying its text: the
+allocator's, which is the environment's, and a string operation, a format and
+the source map, each internal unless the allocator refused it
+
+### str_refused
+
+```mach
+pub fun str_refused(e: StrError) Fail
+```
+
+### format_refused
+
+```mach
+pub fun format_refused(e: std_format.FormatError) Fail
+```
+
+### source_refused
+
+```mach
+pub fun source_refused(e: base_source.Error) Fail
+```
+
+### toml_refused
+
+```mach
+pub fun toml_refused(e: toml_error.TomlError) Fail
+```
+
+a document that does not parse is the user's, pointing at the byte the parser
+refused; one the allocator refused is the environment's
+
+## Op
+
+```mach
+pub rec Op {
+    verb:  str;
+    role:  str;
+    path:  str;
+    link:  str;
+    other: str;
+    given: bool;
+}
 ```
 
 an operation the machine was asked to carry out, as a refusal of it names it:
@@ -346,16 +523,28 @@ by "in". of two paths the one the user asked about comes first, and a path the
 compiler derived (a temporary, a staged copy) is the other; a subject with no path (an environment variable, a stream) is named
 by its role alone, and a variable's name is its path
 
-verb: what was being done, without "cannot"
-role: what the path is for, nil when the path speaks for itself
-path: the path the operation acted on, nil when the subject has none
-link: how `other` relates to `path`, nil when there is no second path
-other: the second path
-given: whether the user named `path`, so a path that is not there, is not the
-       kind of entry the operation needs, or is too long, is the user's input
-       and not the machine's refusal
+| Field | Type | |
+| :--- | :--- | :--- |
+| `verb` | `str` | what was being done, without "cannot" |
+| `role` | `str` | what the path is for, nil when the path speaks for itself |
+| `path` | `str` | the path the operation acted on, nil when the subject has none |
+| `link` | `str` | how `other` relates to `path`, nil when there is no second path |
+| `other` | `str` | the second path |
+| `given` | `bool` | whether the user named `path`, so a path that is not there, is not the kind of entry the operation needs, or is too long, is the user's input and not the machine's refusal |
 
-## tag Cause
+### refusal
+
+```mach
+pub fun refusal(a: *A.Allocator, k: diagnostic_kind.Kind, op: Op, cause: Cause) Fail
+```
+
+the failure of `op`, refused by `cause`, reported under `k` with the text `op`
+names, allocated in `a`, which the failure borrows. an allocation refusal is
+internal whatever the operation; a path the user named that is missing or the
+wrong kind of entry is the user's; every other refusal is the environment's.
+this is the one way a refusal of the machine becomes a failure
+
+## Cause
 
 ```mach
 pub tag Cause: u8 {
@@ -371,22 +560,10 @@ pub tag Cause: u8 {
 what refused an operation, as the std operation reported it; `text` is a cause
 its own module renders (a subprocess, a contained removal)
 
-## fun refusal
+### charged
 
 ```mach
-pub fun refusal(a: *A.Allocator, k: diagnostic_kind.Kind, op: Op, cause: Cause) Fail;
-```
-
-the failure of `op`, refused by `cause`, reported under `k` with the text `op`
-names, allocated in `a`, which the failure borrows. an allocation refusal is
-internal whatever the operation; a path the user named that is missing or the
-wrong kind of entry is the user's; every other refusal is the environment's.
-this is the one way a refusal of the machine becomes a failure
-
-## fun charged
-
-```mach
-pub fun charged(k: diagnostic_kind.Kind, given: bool, cause: Cause, text: str) Fail;
+pub fun charged(k: diagnostic_kind.Kind, given: bool, cause: Cause, text: str) Fail
 ```
 
 the failure under `k` carrying `text`, which it borrows, for a refusal of
@@ -396,123 +573,32 @@ policy): charged as `refusal` charges it, `given` saying whether the user
 named the path. a failure of a path goes through `refusal` unless its wording
 needs this
 
-## fun cause_text
+### cause_text
 
 ```mach
-pub fun cause_text(c: Cause) str;
+pub fun cause_text(c: Cause) str
 ```
 
 the text of what refused an operation, for a note or a report line that is not
 itself a failure; a failure goes through `refusal`, which names the operation
 
-## fun str_text
+## Functions
+
+### str_text
 
 ```mach
-pub fun str_text(e: StrError) str;
+pub fun str_text(e: StrError) str
 ```
 
-## fun format_text
+### format_text
 
 ```mach
-pub fun format_text(e: std_format.FormatError) str;
+pub fun format_text(e: std_format.FormatError) str
 ```
 
-## fun toml_text
+### toml_text
 
 ```mach
-pub fun toml_text(e: toml_error.TomlError) str;
+pub fun toml_text(e: toml_error.TomlError) str
 ```
-
-## fun prefixed
-
-```mach
-pub fun prefixed(a: *A.Allocator, context: str, cause: Fail) Fail;
-```
-
-`cause` with `context` in front of its text, joined into `a`, which owns the
-new text; the class, the kind and the places are kept. a reported cause has
-no text to extend, and a refused join leaves the cause as it was, keeping the
-ownership it had, so the context never takes the cause's place
-
-## fun formatted
-
-```mach
-pub fun formatted(a: *A.Allocator, fmt: str, va: ...) Fail;
-```
-
-an internal failure whose text is `fmt` formatted with `va` into `a`, which
-the failure owns; a refusal to format is the failure instead
-
-## fun formatted_user
-
-```mach
-pub fun formatted_user(a: *A.Allocator, k: diagnostic_kind.Kind, fmt: str, va: ...) Fail;
-```
-
-a user failure under `k` whose text is `fmt` formatted with `va` into `a`,
-which the failure owns; a refusal to format is the failure instead
-
-## fun message_of
-
-```mach
-pub fun message_of(made: res[str, Fail]) Fail;
-```
-
-the internal failure carrying a made text, which it borrows (a made text may
-be interned), or the failure that refused to make it
-
-## fun user_of
-
-```mach
-pub fun user_of(k: diagnostic_kind.Kind, made: res[str, Fail]) Fail;
-```
-
-the user failure under `k` carrying a made text, which it borrows, or the
-failure that refused to make it
-
-## fun environment_of
-
-```mach
-pub fun environment_of(k: diagnostic_kind.Kind, made: res[str, Fail]) Fail;
-```
-
-the environment failure under `k` carrying a made text, which it borrows, or
-the failure that refused to make it
-
-## fun refused
-
-```mach
-pub fun refused(e: A.Error) Fail;
-```
-
-the refusals the compiler recovers from at no site, each carrying its text: the
-allocator's, which is the environment's, and a string operation, a format and
-the source map, each internal unless the allocator refused it
-
-## fun str_refused
-
-```mach
-pub fun str_refused(e: StrError) Fail;
-```
-
-## fun format_refused
-
-```mach
-pub fun format_refused(e: std_format.FormatError) Fail;
-```
-
-## fun source_refused
-
-```mach
-pub fun source_refused(e: base_source.Error) Fail;
-```
-
-## fun toml_refused
-
-```mach
-pub fun toml_refused(e: toml_error.TomlError) Fail;
-```
-
-a document that does not parse is the user's, pointing at the byte the parser
-refused; one the allocator refused is the environment's
 

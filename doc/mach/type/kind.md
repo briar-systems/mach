@@ -1,6 +1,41 @@
+[mach](../README.md) / [type](README.md) / **kind**
+
 # mach.type.kind
 
-## def TypeId
+type ids and the kinds of type the type table holds
+
+a `TypeId` is a type's index in the type table, with two reserved values for no type and the
+error type. a new kind is appended after the last, the catalog of `mach.type.prim` decides
+which kinds are primitive, and `TYPE_KIND_COUNT` bounds them.
+
+<sub>source: [`src/type/kind.mach`](../../../src/type/kind.mach) · imported by 57 modules</sub>
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`TypeId`](#typeid) | `def` | the identity of one type in the type table |
+| [`TypeKind`](#typekind) | `def` |  |
+
+| On `TypeId` | |
+| :--- | :--- |
+| [`TYPE_NIL`](#typeid) · [`TYPE_ERROR`](#typeid) · [`id`](#id) · [`index`](#index) · [`same`](#same) · [`is_nil`](#is_nil) · [`is_error`](#is_error) | |
+
+| On `TypeKind` | |
+| :--- | :--- |
+| [`TYPE_U8`](#typekind) · [`TYPE_U16`](#typekind) · [`TYPE_U32`](#typekind) · [`TYPE_U64`](#typekind) · [`TYPE_I8`](#typekind) · [`TYPE_I16`](#typekind) · [`TYPE_I32`](#typekind) · [`TYPE_I64`](#typekind) · [`TYPE_F32`](#typekind) · [`TYPE_F64`](#typekind) · [`TYPE_PTR`](#typekind) · [`TYPE_POINTER`](#typekind) · [`TYPE_ARRAY`](#typekind) · [`TYPE_FUN`](#typekind) · [`TYPE_REC`](#typekind) · [`TYPE_UNI`](#typekind) · [`TYPE_GENERIC_PARAM`](#typekind) · [`TYPE_INSTANCE`](#typekind) · [`TYPE_PACK`](#typekind) · [`TYPE_SECRET`](#typekind) · [`TYPE_VECTOR`](#typekind) · [`TYPE_HANDLE`](#typekind) · [`TYPE_ABI`](#typekind) · [`TYPE_TAG`](#typekind) · [`TYPE_CASE_SELECTOR`](#typekind) | |
+| [`TYPE_U128`](#typekind) | the 128-bit integers are appended kinds: the catalog, never the numbering, decides what is primitive |
+| [`TYPE_I128`](#typekind) | |
+| [`TYPE_F16`](#typekind) | IEEE binary16, appended like the 128-bit integers |
+| [`TYPE_U256`](#typekind) | the 256 and 512-bit integers, appended like the 128-bit integers |
+| [`TYPE_I256`](#typekind) · [`TYPE_U512`](#typekind) · [`TYPE_I512`](#typekind) · [`TYPE_U1`](#typekind) | |
+
+| Constants | |
+| :--- | :--- |
+| [`TABLE_INDEX_TEXT`](#constants) | an index the type table issued no longer names a slot: a defect, never an input fault |
+| [`TYPE_KIND_COUNT`](#constants) | one past the last kind, so an appended kind takes over this reference |
+
+---
+
+## TypeId
 
 ```mach
 pub def TypeId: u32
@@ -8,274 +43,87 @@ pub def TypeId: u32
 
 the identity of one type in the type table
 
-## val TYPE_NIL
+| Name | Value | |
+| :--- | :--- | :--- |
+| `TYPE_NIL` | `0xFFFFFFFF` |  |
+| `TYPE_ERROR` | `0xFFFFFFFE` |  |
+
+### id
 
 ```mach
-pub val TYPE_NIL:   TypeId = 0xFFFFFFFF
+pub fun id(index: u32) TypeId
 ```
 
-## val TYPE_ERROR
+### index
 
 ```mach
-pub val TYPE_ERROR: TypeId = 0xFFFFFFFE
+pub fun index(t: TypeId) u32
 ```
 
-## fun id
+### same
 
 ```mach
-pub fun id(index: u32) TypeId;
+pub fun same(left: TypeId, right: TypeId) bool
 ```
 
-## fun index
+### is_nil
 
 ```mach
-pub fun index(t: TypeId) u32;
+pub fun is_nil(t: TypeId) bool
 ```
 
-## fun same
+### is_error
 
 ```mach
-pub fun same(left: TypeId, right: TypeId) bool;
+pub fun is_error(t: TypeId) bool
 ```
 
-## fun is_nil
-
-```mach
-pub fun is_nil(t: TypeId) bool;
-```
-
-## fun is_error
-
-```mach
-pub fun is_error(t: TypeId) bool;
-```
-
-## val TABLE_INDEX_TEXT
-
-```mach
-pub val TABLE_INDEX_TEXT: str = "type table index out of bounds"
-```
-
-an index the type table issued no longer names a slot: a defect, never an input fault
-
-## def TypeKind
+## TypeKind
 
 ```mach
 pub def TypeKind: u8
 ```
 
-## val TYPE_U8
-
-```mach
-pub val TYPE_U8:  TypeKind = 0
-```
-
-## val TYPE_U16
-
-```mach
-pub val TYPE_U16: TypeKind = 1
-```
-
-## val TYPE_U32
-
-```mach
-pub val TYPE_U32: TypeKind = 2
-```
-
-## val TYPE_U64
-
-```mach
-pub val TYPE_U64: TypeKind = 3
-```
-
-## val TYPE_I8
-
-```mach
-pub val TYPE_I8:  TypeKind = 4
-```
-
-## val TYPE_I16
-
-```mach
-pub val TYPE_I16: TypeKind = 5
-```
-
-## val TYPE_I32
-
-```mach
-pub val TYPE_I32: TypeKind = 6
-```
-
-## val TYPE_I64
-
-```mach
-pub val TYPE_I64: TypeKind = 7
-```
-
-## val TYPE_F32
-
-```mach
-pub val TYPE_F32: TypeKind = 8
-```
-
-## val TYPE_F64
-
-```mach
-pub val TYPE_F64: TypeKind = 9
-```
-
-## val TYPE_PTR
-
-```mach
-pub val TYPE_PTR: TypeKind = 10
-```
-
-## val TYPE_POINTER
-
-```mach
-pub val TYPE_POINTER:       TypeKind = 11
-```
-
-## val TYPE_ARRAY
-
-```mach
-pub val TYPE_ARRAY:         TypeKind = 12
-```
-
-## val TYPE_FUN
-
-```mach
-pub val TYPE_FUN:           TypeKind = 13
-```
-
-## val TYPE_REC
-
-```mach
-pub val TYPE_REC:           TypeKind = 14
-```
-
-## val TYPE_UNI
-
-```mach
-pub val TYPE_UNI:           TypeKind = 15
-```
-
-## val TYPE_GENERIC_PARAM
-
-```mach
-pub val TYPE_GENERIC_PARAM: TypeKind = 16
-```
-
-## val TYPE_INSTANCE
-
-```mach
-pub val TYPE_INSTANCE:      TypeKind = 17
-```
-
-## val TYPE_PACK
-
-```mach
-pub val TYPE_PACK: TypeKind = 18
-```
-
-## val TYPE_SECRET
-
-```mach
-pub val TYPE_SECRET: TypeKind = 19
-```
-
-## val TYPE_VECTOR
-
-```mach
-pub val TYPE_VECTOR: TypeKind = 20
-```
-
-## val TYPE_HANDLE
-
-```mach
-pub val TYPE_HANDLE: TypeKind = 21
-```
-
-## val TYPE_ABI
-
-```mach
-pub val TYPE_ABI: TypeKind = 22
-```
-
-## val TYPE_TAG
-
-```mach
-pub val TYPE_TAG: TypeKind = 23
-```
-
-## val TYPE_CASE_SELECTOR
-
-```mach
-pub val TYPE_CASE_SELECTOR: TypeKind = 24
-```
-
-## val TYPE_U128
-
-```mach
-pub val TYPE_U128: TypeKind = 25
-```
-
-the 128-bit integers are appended kinds: the catalog, never the
-numbering, decides what is primitive
-
-## val TYPE_I128
-
-```mach
-pub val TYPE_I128: TypeKind = 26
-```
-
-## val TYPE_F16
-
-```mach
-pub val TYPE_F16: TypeKind = 27
-```
-
-IEEE binary16, appended like the 128-bit integers
-
-## val TYPE_U256
-
-```mach
-pub val TYPE_U256: TypeKind = 28
-```
-
-the 256 and 512-bit integers, appended like the 128-bit integers
-
-## val TYPE_I256
-
-```mach
-pub val TYPE_I256: TypeKind = 29
-```
-
-## val TYPE_U512
-
-```mach
-pub val TYPE_U512: TypeKind = 30
-```
-
-## val TYPE_I512
-
-```mach
-pub val TYPE_I512: TypeKind = 31
-```
-
-## val TYPE_U1
-
-```mach
-pub val TYPE_U1:   TypeKind = 32
-```
-
-## val TYPE_KIND_COUNT
-
-```mach
-pub val TYPE_KIND_COUNT: u32 = TYPE_U1::u32 + 1
-```
-
-one past the last kind, so an appended kind takes over this reference. the
-type table refuses a kind at or past it, so a walker over 0..TYPE_KIND_COUNT
-meets every kind a type can carry
+| Name | Value | |
+| :--- | :--- | :--- |
+| `TYPE_U8` | `0` |  |
+| `TYPE_U16` | `1` |  |
+| `TYPE_U32` | `2` |  |
+| `TYPE_U64` | `3` |  |
+| `TYPE_I8` | `4` |  |
+| `TYPE_I16` | `5` |  |
+| `TYPE_I32` | `6` |  |
+| `TYPE_I64` | `7` |  |
+| `TYPE_F32` | `8` |  |
+| `TYPE_F64` | `9` |  |
+| `TYPE_PTR` | `10` |  |
+| `TYPE_POINTER` | `11` |  |
+| `TYPE_ARRAY` | `12` |  |
+| `TYPE_FUN` | `13` |  |
+| `TYPE_REC` | `14` |  |
+| `TYPE_UNI` | `15` |  |
+| `TYPE_GENERIC_PARAM` | `16` |  |
+| `TYPE_INSTANCE` | `17` |  |
+| `TYPE_PACK` | `18` |  |
+| `TYPE_SECRET` | `19` |  |
+| `TYPE_VECTOR` | `20` |  |
+| `TYPE_HANDLE` | `21` |  |
+| `TYPE_ABI` | `22` |  |
+| `TYPE_TAG` | `23` |  |
+| `TYPE_CASE_SELECTOR` | `24` |  |
+| `TYPE_U128` | `25` | the 128-bit integers are appended kinds: the catalog, never the numbering, decides what is primitive |
+| `TYPE_I128` | `26` |  |
+| `TYPE_F16` | `27` | IEEE binary16, appended like the 128-bit integers |
+| `TYPE_U256` | `28` | the 256 and 512-bit integers, appended like the 128-bit integers |
+| `TYPE_I256` | `29` |  |
+| `TYPE_U512` | `30` |  |
+| `TYPE_I512` | `31` |  |
+| `TYPE_U1` | `32` |  |
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `TABLE_INDEX_TEXT` | `str` | `"type table index out of bounds"` | an index the type table issued no longer names a slot: a defect, never an input fault |
+| `TYPE_KIND_COUNT` | `u32` | `TYPE_U1::u32 + 1` | one past the last kind, so an appended kind takes over this reference |
 
