@@ -227,14 +227,26 @@ fires is **refused**:
   other error and no warning of the module is reported.
 - A module that imports a refused module, directly or through modules that import
   it, is not analysed and reports nothing, its own module-scope `$error` included.
-  So one refused module gives one line however long the chain of imports above it
-  is, and two refused modules that do not import each other give one line each.
-- The build fails as it does for any error, and the summary counts the lines it
-  printed.
+  So one refused module gives one diagnostic however long the chain of imports
+  above it is, and two refused modules that do not import each other give one
+  each.
+- A refused module that is a file of the project being built reports at its
+  `$error`. One outside the project, in a dependency such as std, reports where the
+  project reached it, as a `$error` in an instance reports at the call that asked
+  for the instance: the diagnostic stands at the import in the project's own source
+  that reaches the refused module, directly or through refused modules between,
+  with each `$error` that fired as the related site. Several project files may
+  reach one refused module: the diagnostic stands at the first import that does,
+  the project's files taken in the order the build loads them, the entry first, and
+  each file's imports in their order. The walk from an import stops at a project
+  file, which reports at its own imports.
+- The build fails as it does for any error, and the summary counts the diagnostics
+  it printed.
 
 ```mach fragment
-# on any target but linux this module prints this one line and nothing else, and
-# a module that imports it, or imports one that does, prints nothing
+# on any target but linux this module gives this one diagnostic and nothing else,
+# and a module that imports it, or imports one that does, gives nothing. in a
+# dependency, the diagnostic stands at the project's import that reaches it
 $if ($mach.build.sys == $mach.sys.linux) {
     use native: std.system.os.linux;
 }

@@ -1269,6 +1269,8 @@ pub fun refresh_diagnostics(p: *project.Project) err[fail.Fail] {
     if (sel err_recorded.err) { ret err_recorded; }
     diagnostic.report_unfulfilled(?staged);
     drop_refused(p, ?staged);
+    val err_placed: err[fail.Fail] = place_refusals(p, ?staged);
+    if (sel err_placed.err) { ret err_placed; }
     diagnostic.set_origin(?staged, p.s.diags.origin);
     diagnostic.store_dnit(?p.s.diags);
     p.s.diags = staged;
@@ -1291,9 +1293,135 @@ fun drop_refused(p: *project.Project, store: *diagnostic.DiagnosticStore) {
     }
 }
 
+# a module refused by its own `$error` that is not a file of the project is reported at the
+# import in the project's own source that reaches it, directly or through modules refused by
+# their imports, with each `$error` that fired as a related site, and its own file then shows
+# nothing. one diagnostic stands for each such module, at the first import that reaches it: the
+# project's files in the order the build loaded them, each file's imports in their order. a
+# project file refused by its own `$error` reports there, and the walk stops at one refused by
+# an import, which reports at its own imports. a refused module no project import reaches keeps
+# its `$error`s where they are
+fun place_refusals(p: *project.Project, store: *diagnostic.DiagnosticStore) err[fail.Fail] {
+    val count: u32 = project.module_count(p);
+    if (!placeable(p)) { ret err[fail.Fail].ok{}; }
+    val res_placed: res[*bool, A.Error] = A.zallocate[bool](p.s.alloc, count::usize);
+    if (sel res_placed.err) { ret err[fail.Fail].err{fail.refused(res_placed.err)}; }
+    fin { A.deallocate[bool](p.s.alloc, res_placed.ok, count::usize); }
+    val res_seen: res[*bool, A.Error] = A.zallocate[bool](p.s.alloc, count::usize);
+    if (sel res_seen.err) { ret err[fail.Fail].err{fail.refused(res_seen.err)}; }
+    fin { A.deallocate[bool](p.s.alloc, res_seen.ok, count::usize); }
+    var stack: collections_vector.Vector[module.ModuleId] = collections_vector.init[module.ModuleId](p.s.alloc);
+    fin { collections_vector.dnit[module.ModuleId](?stack); }
+    var i: u32 = 0;
+    for (i < count) {
+        val m: *project.ModuleEntry = project.module_at(p, i);
+        i = i + 1;
+        if (!m.load.home.root || base_source.file_is_nil(m.file_id)) { cnt; }
+        var k: usize = 0;
+        for (k < m.load.bindings.len) {
+            val b: *front_load.Binding = ?m.load.bindings.data[k];
+            k = k + 1;
+            if (b.kind == front_load.BINDING_UNBOUND) { cnt; }
+            val mid: module.ModuleId = front_load.module_of(?p.loader, b.module);
+            if (module.is_nil(mid))                                   { cnt; }
+            if (refusal_of(p, project.module_at(p, mid::u32)) == nil) { cnt; }
+            memory.zero[bool](res_seen.ok, count::usize);
+            collections_vector.clear[module.ModuleId](?stack);
+            val res_pushed: res[usize, A.Error] = collections_vector.push[module.ModuleId](?stack, mid);
+            if (sel res_pushed.err) { ret err[fail.Fail].err{fail.refused(res_pushed.err)}; }
+            for (stack.len > 0) {
+                val opt_at: opt[module.ModuleId] = collections_vector.pop[module.ModuleId](?stack);
+                if (sel opt_at.none) { brk; }
+                val at: module.ModuleId = opt_at.some;
+                if (res_seen.ok[at]) { cnt; }
+                res_seen.ok[at] = true;
+                val n: *project.ModuleEntry = project.module_at(p, at::u32);
+                val r: *refusal.Refusal     = refusal_of(p, n);
+                if (r == nil || n.load.home.root) { cnt; }
+                if (r.state == refusal.OWN) {
+                    if (!res_placed.ok[at]) {
+                        res_placed.ok[at] = true;
+                        val err_moved: err[fail.Fail] = place_refusal(store, m, b, n, r);
+                        if (sel err_moved.err) { ret err_moved; }
+                    }
+                    cnt;
+                }
+                var j: usize = 0;
+                for (j < n.load.bindings.len) {
+                    val nb: *front_load.Binding = ?n.load.bindings.data[j];
+                    j = j + 1;
+                    if (nb.kind == front_load.BINDING_UNBOUND) { cnt; }
+                    val next: module.ModuleId = front_load.module_of(?p.loader, nb.module);
+                    if (module.is_nil(next)) { cnt; }
+                    val res_next: res[usize, A.Error] = collections_vector.push[module.ModuleId](?stack, next);
+                    if (sel res_next.err) { ret err[fail.Fail].err{fail.refused(res_next.err)}; }
+                }
+            }
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# whether some module outside the project is refused by its own `$error`
+fun placeable(p: *project.Project) bool {
+    var i: u32 = 0;
+    for (i < project.module_count(p)) {
+        val m: *project.ModuleEntry = project.module_at(p, i);
+        i = i + 1;
+        if (m.load.home.root) { cnt; }
+        val r: *refusal.Refusal = refusal_of(p, m);
+        if (r != nil && r.state == refusal.OWN) { ret true; }
+    }
+    ret false;
+}
+
+# the label each `$error` of a refused module carries where its importer reports it
+val REFUSAL_LABEL: str = "the module this import reaches is refused by this module-scope `$error`";
+
+# report the refusal of `n` at the import `b` of the project file `m`: the message of its first
+# `$error`, each `$error` a related site and the message of each after the first a note. the
+# `$error`s then leave `n`'s file. nothing moves when the store holds no `$error` of `n`
+fun place_refusal(store: *diagnostic.DiagnosticStore, m: *project.ModuleEntry, b: *front_load.Binding, n: *project.ModuleEntry, r: *refusal.Refusal) err[fail.Fail] {
+    var first: *diagnostic.Diagnostic = nil;
+    var i:     usize                  = 0;
+    for (first == nil && i < store.items.len) {
+        val d: *diagnostic.Diagnostic = ?store.items.data[i];
+        if (base_source.file_same(d.loc.file, n.file_id) && d.loc.span.offset == r.sites.data[0]::usize) { first = d; }
+        i = i + 1;
+    }
+    if (first == nil) { ret err[fail.Fail].ok{}; }
+    val res_builder: res[diagnostic.DiagnosticBuilder, fail.Fail] = diagnostic.builder_init(store.a, first.kind, m.file_id, b.span, first.message);
+    if (sel res_builder.err) { ret err[fail.Fail].err{res_builder.err}; }
+    var builder: diagnostic.DiagnosticBuilder = res_builder.ok;
+    builder.origin = first.origin;
+    var handed: bool = false;
+    fin {
+        if (!handed) { diagnostic.builder_dnit(?builder); }
+    }
+    var s: usize = 0;
+    for (s < r.sites.len) {
+        var k: usize = 0;
+        for (k < store.items.len) {
+            val d: *diagnostic.Diagnostic = ?store.items.data[k];
+            k = k + 1;
+            if (!base_source.file_same(d.loc.file, n.file_id) || d.loc.span.offset != r.sites.data[s]::usize) { cnt; }
+            val err_related: err[fail.Fail] = diagnostic.attach_related(?builder, d.loc.file, d.loc.span, REFUSAL_LABEL);
+            if (sel err_related.err) { ret err_related; }
+            if (s > 0) {
+                val err_noted: err[fail.Fail] = diagnostic.attach_note(?builder, d.message);
+                if (sel err_noted.err) { ret err_noted; }
+            }
+        }
+        s = s + 1;
+    }
+    diagnostic.drop_file(store, n.file_id);
+    handed = true;
+    ret diagnostic.commit(?builder, store);
+}
+
 # why a module is refused, as this project's operations last published it: by resolution, or
 # by typing when resolution did not refuse it. nil when neither did
-pub fun refusal_of(p: *project.Project, m: *project.ModuleEntry) *refusal.Refusal {
+fun refusal_of(p: *project.Project, m: *project.ModuleEntry) *refusal.Refusal {
     val rr: *resolve.ResolveResult = resolved(p, m);
     if (rr != nil && refusal.is_refused(?rr.refusal)) { ret ?rr.refusal; }
     val sr: *sema_product.SemaResult = typed(p, m);
