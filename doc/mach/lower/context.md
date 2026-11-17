@@ -76,7 +76,8 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`comptime_ident_is_runtime`](#comptime_ident_is_runtime) | a lowering capability; a nil context, which the capability check refuses before any call, answers as an evaluation with no lowering would |
 | [`resolve_type_comparison_operand`](#resolve_type_comparison_operand) | a lowering capability; a nil context, which the capability check refuses before any call, answers as an evaluation with no lowering would |
 | [`resolve_type_query`](#resolve_type_query) | a lowering capability; a nil context, which the capability check refuses before any call, answers as an evaluation with no lowering would |
-| [`resolve_layout_intrinsic`](#resolve_layout_intrinsic) | a lowering capability; a nil context, which the capability check refuses before any call, answers as an evaluation with no lowering would |
+| [`laid_type`](#laid_type) | a lowering capability; a nil context, which the capability check refuses before any call, answers as an evaluation with no lowering would the type the layout intrinsics read for source type `tid`: a handle sizes and aligns as the target's `ptr`, as a name for a resource the target mints or an inert one it does not, and any other type as it lowers |
+| [`resolve_layout_intrinsic`](#resolve_layout_intrinsic) | |
 | [`member_offset`](#member_offset) | the byte offset of field or case `index` of the source type `tid`, lowered as `ir`: a record's field, a union's member at zero, or a tag case's payload, which a case with none does not have |
 | [`field_offset`](#field_offset) | a field descriptor's offset, from the layout lowering gives the owning type |
 | [`type_store`](#type_store) | the type store a comptime evaluation during lowering reads |
@@ -92,6 +93,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`builder_state`](#builder_state) | the first refusal the builder met, which every builder call after it skips |
 | [`int_type`](#int_type), [`ptr_type`](#ptr_type) | |
 | [`lower_type`](#lower_type) | the mirl type a value of the source type `tid` is held in |
+| [`texel_number`](#texel_number) | the number the texels of the handle type `ty` are, as the target's catalog relates them to a word operand of its kind, none for a handle whose kind relates none, one whose operand names any, or another type |
 | [`tag_case_has_payload`](#tag_case_has_payload) | whether case `i` of the tag `tid` holds a payload |
 | [`tag_carried`](#tag_carried) | where the tag `tid` holds the payload of case `i`, which has one: the area of the tag's structure and the member of that area's union, as its placement gives it |
 | [`storage_align`](#storage_align) | the alignment a value held in `ir` is stored at: the target's layout of `ir`, which states a decorated record's alignment and packing |
@@ -816,14 +818,23 @@ pub fun resolve_type_query(lc: *LowerContext, tid: u32, which: u8) res[opt[mach.
 a lowering capability; a nil context, which the capability check refuses before any call,
 answers as an evaluation with no lowering would
 
+### laid_type
+
+```mach
+pub fun laid_type(lc: *LowerContext, tid: mach.type.kind.TypeId) res[Type, mach.base.fail.Fail]
+```
+
+a lowering capability; a nil context, which the capability check refuses before any call,
+answers as an evaluation with no lowering would
+the type the layout intrinsics read for source type `tid`: a handle sizes and aligns as the
+target's `ptr`, as a name for a resource the target mints or an inert one it does not, and any
+other type as it lowers
+
 ### resolve_layout_intrinsic
 
 ```mach
 pub fun resolve_layout_intrinsic(lc: *LowerContext, eid: u32) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail]
 ```
-
-a lowering capability; a nil context, which the capability check refuses before any call,
-answers as an evaluation with no lowering would
 
 ### member_offset
 
@@ -1003,6 +1014,16 @@ pub fun lower_type(lc: *LowerContext, tid: mach.type.kind.TypeId) res[Type, mach
 ```
 
 the mirl type a value of the source type `tid` is held in
+
+### texel_number
+
+```mach
+pub fun texel_number(lc: *LowerContext, ty: Type) opt[mirl.target.capability.Number]
+```
+
+the number the texels of the handle type `ty` are, as the target's catalog relates them to a word
+operand of its kind, none for a handle whose kind relates none, one whose operand names any, or
+another type
 
 ### tag_case_has_payload
 
