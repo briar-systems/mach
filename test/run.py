@@ -75,10 +75,11 @@ def blocks(dump):
 
 
 def field(part, line):
-    # `Key: a b` holds of a line whose key is Key and whose value has the words a and b
+    # `Key: a b` holds of a line whose key is Key and whose value has the words a and b,
+    # and `Key` alone of a line whose key or flag name is Key
     key, sep, words = part.partition(': ')
     if not sep:
-        return line.startswith(part)
+        return re.split('[: ]', line, maxsplit=1)[0] == part
     lkey, lsep, lwords = line.partition(': ')
     return lsep and lkey == key and set(words.split()) <= set(lwords.split())
 
