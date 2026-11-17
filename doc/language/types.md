@@ -507,6 +507,21 @@ handle is refused with `spirv.unsupported` as `$size_of(ptr)` is. On a target th
 no such type the declaration is **inert**: it still denotes a type and still sizes, and
 an operation over it is an undefined symbol at link.
 
+An `image` of `Dim` `SubpassData` is a **subpass input**, which reads the attachment a
+previous subpass wrote at the fragment's own place. It is declared with `Sampled` `2`,
+the `Unknown` format and `Arrayed` `0`, its `MS` matching the attachment's samples, and
+a module binding of one carries `#[gpu.storage(set, binding)]` and
+`#[gpu.attachment(index)]`, the input attachment it reads. It is read by `OpImageRead`
+at the coordinate (0, 0), from a fragment stage alone (see
+[gpu.md](gpu.md#gpuattachmentindex-and-subpass-inputs)):
+
+```mach fragment
+#[handle("spirv", "image", f32, "SubpassData", 0, 0, 0, 2, "Unknown")]
+pub def SubpassInput;
+
+#[gpu.storage(0, 0)] #[gpu.attachment(0)] var albedo: SubpassInput;
+```
+
 A target refuses an operand combination its constructor spells but it cannot emit,
 naming the operand rather than the declaration, with `handle.arguments`. The SPIR-V
 target's handle catalog refuses a `Depth` other than `0`, `1` or `2`, an `MS` or

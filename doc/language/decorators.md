@@ -67,6 +67,7 @@ uses generic words such as `input` and `shared`.
 #[gpu.storage(set, bnd, "writeonly")] # the same buffer, with reads refused
 #[gpu.storage(set, bnd, "coherent")] # the same buffer, its writes visible across workgroups
 #[gpu.sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
+#[gpu.attachment(n)]     # input attachment index of a subpass input, beside its gpu.storage (global only)
 #[gpu.push]              # push-constant block, read-only (global only)
 #[gpu.spec(id)]          # specialization constant the host supplies (module var only)
 #[gpu.shared]            # compute workgroup memory, zero when a stage starts (global only)
@@ -1118,6 +1119,22 @@ are described in [gpu.md](gpu.md). v6 spelled the GPU set without its prefix
 (`#[stage]`, `#[input]` and the rest) and the instruction decorator `#[op]`. Each
 is refused naming its replacement, which takes the same arguments.
 
+### `gpu.attachment(index)`: a subpass input's input attachment
+
+A subpass input, a handle the target declares one (on SPIR-V an `image` of `Dim`
+`SubpassData`), states the input attachment it reads by this decorator, beside the
+`#[gpu.storage(set, binding)]` that binds it:
+
+```mach fragment
+#[gpu.storage(0, 0)] #[gpu.attachment(0)] var albedo: SubpassInput;
+```
+
+It takes one integer constant, an unsigned 32-bit one, and a negative or wider value is
+refused with `decorator.argument`. It is required on a subpass input, which is refused
+without it with `handle.unbound`, and refused with `decorator.misplaced` on anything
+else. The SPIR-V target emits it as `InputAttachmentIndex`. See
+[gpu.md](gpu.md#gpuattachmentindex-and-subpass-inputs).
+
 ### `abi_type(name)` — a C type whose layout the target declares
 
 A bodyless `def` carrying this decorator declares a C type whose size and alignment
@@ -1178,6 +1195,7 @@ a further rule the decorator's own section states.
 | `gpu.uniform` | `val`, `var` |  |
 | `gpu.storage` | `val`, `var` |  |
 | `gpu.sampler` | `val`, `var` |  |
+| `gpu.attachment` | `val`, `var` | a binding of a handle the target declares a subpass input, where it is required |
 | `gpu.push` | `val`, `var` |  |
 | `gpu.spec` | `val`, `var` | a `var` |
 | `gpu.shared` | `val`, `var` | a `var` |

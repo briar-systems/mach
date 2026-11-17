@@ -361,7 +361,9 @@ the texel at the fragment's own place, so its coordinate is the constant vector 
 (Vulkan's `VUID-StandaloneSpirv-SubpassData-04660`): a run-time coordinate is refused at
 the call with `op.operand_not_constant` and a constant with a component that is not zero
 with `op.operand_value`. A `SubpassData` image is declared with `Arrayed` 0, `Sampled` 2
-and the `Unknown` format (see [types.md](types.md)). `OpImageQuerySamples` reads the sample
+and the `Unknown` format (see [types.md](types.md)), is bound with its input attachment
+index and is read from a fragment stage alone (see
+[`gpu.attachment`](#gpuattachmentindex-and-subpass-inputs)). `OpImageQuerySamples` reads the sample
 count of a multisampled image only, and `OpImageQuerySizeLod` does not take one.
 `OpImageQuerySize` reads an image with no level of detail to choose, a multisampled
 image, a storage image or a texel buffer, so a single-sampled sampled image is
@@ -556,6 +558,58 @@ A `gpu.push` block becomes an `OpVariable`
 in the `PushConstant` class, with no `DescriptorSet` or `Binding`. A `gpu.shared` variable
 becomes an `OpVariable` in the `Workgroup` class, named in the interface of each entry
 point that uses it from SPIR-V 1.4.
+
+## `gpu.attachment(index)` and subpass inputs
+
+A **subpass input** reads the attachment a previous subpass of the render pass wrote,
+at the fragment's own place. It is a handle the target declares one, an `image` of
+`Dim` `SubpassData` (see [types.md](types.md)), which is a storage image of the
+`Unknown` format, so it binds through `gpu.storage` at its descriptor set and binding.
+Beside that it states which input attachment it reads, the index into the subpass's
+`pInputAttachments`, by `#[gpu.attachment(index)]`:
+
+```mach
+#[handle("spirv", "image", f32, "SubpassData", 0, 0, 0, 2, "Unknown")]
+pub def SubpassInput;
+
+#[intrinsic("spirv", "core", "OpImageRead")]
+fun subpass_load(img: SubpassInput, at: i32x2) f32x4;
+
+#[gpu.storage(0, 0)] #[gpu.attachment(0)] var albedo: SubpassInput;
+#[gpu.storage(0, 1)] #[gpu.attachment(1)] var normal: SubpassInput;
+#[gpu.output(0)] var colour: f32x4;
+
+#[gpu.stage("fragment")]
+fun main() {
+    colour = subpass_load(albedo, i32x2{0, 0}) * subpass_load(normal, i32x2{0, 0});
+}
+```
+
+The index is an integer constant, an unsigned 32-bit one like a descriptor set, a
+binding, a location or a specialization id, and a negative or wider value is refused
+with `decorator.argument`. On `spirv` it becomes the variable's `InputAttachmentIndex`
+decoration. The decorator is **required** on a subpass input: Vulkan matches a subpass
+input to its attachment by that decoration alone, and requires it of every subpass
+input outside dynamic rendering with `dynamicRenderingLocalRead`
+(`VUID-RuntimeSpirv-None-09558`). The index is written even there, where it names the
+attachment the host maps to it. A subpass input without one is refused at its
+declaration with `handle.unbound`, which `spirv-val` does not check. The decorator is
+refused with `decorator.misplaced` anywhere else: on a declaration that is no
+module-level `val` or `var`, on a binding of an ordinary type, and on a handle the
+target does not declare a subpass input, as the target's handle catalog states.
+Vulkan places `InputAttachmentIndex` only on a variable in `UniformConstant`
+(`VUID-StandaloneSpirv-InputAttachmentIndex-06678`), where every subpass input lives.
+A subpass input never sits in an array, as no handle does, so the consecutive indices
+Vulkan gives the elements of an array of subpass inputs, from the one stated, do not
+arise. The index must be below the device's `maxPerStageDescriptorInputAttachments`,
+which the compiler cannot know.
+
+A subpass input exists only in a **fragment stage**: SPIR-V's `OpTypeImage` admits
+`SubpassData` in the `Fragment` execution model alone, the one stage with a place in
+the attachment to read. A vertex or compute stage that reaches a subpass input,
+directly or through a function it calls, is refused with `spirv.interface`, naming
+the stage, its entry point and the binding, as a built-in reached outside its stages
+is. A module may still declare one beside a compute stage that does not reach it.
 
 ## `gpu.spec(id)` — specialization constants
 
