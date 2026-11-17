@@ -597,8 +597,10 @@ fun walk() {
 
 A physical pointer is a full `*T`. It is dereferenced, indexed, stepped (`?p[i]`),
 compared, ordered as an unsigned 64-bit address and cast to and from `u64`, and it
-can be held in memory, passed and returned. Its pointee is laid out by the std430
-rules a `#[gpu.storage]` block follows (see [decorators.md](decorators.md)), refused
+can be held in memory, passed and returned. Comparing, ordering, casting and adding
+a byte offset read the address as the `u64` it is, so they need `Int64` as any `u64`
+does. The rest need nothing past `PhysicalStorageBufferAddresses`. Its pointee is
+laid out by the std430 rules a `#[gpu.storage]` block follows (see [decorators.md](decorators.md)), refused
 where mach's layout disagrees with them. A record that reaches itself through
 pointers, like `Node` above, is a recursive type, and so is a set of records that
 reach each other. A tag cannot sit behind a physical pointer.
@@ -608,10 +610,14 @@ an address made from an integer must be aligned for the type it points at. An at
 through one takes no memory operands and carries no alignment, so its address is held
 to the same rule, and the semantics passed to it name its memory `UniformMemory`, as
 on a storage buffer. A 64-bit or float atomic needs the capability of its
-operation (see [gpu.md](gpu.md)). Every
-variable and parameter holding one is decorated aliased, since mach makes no
-promise that two pointers do not overlap. Accesses through one are private under
-the Vulkan memory model: no `"coherent"` qualifier reaches device memory.
+operation (see [gpu.md](gpu.md)). The module holds a physical pointer as its
+address, two 32-bit words with the low one first, in memory, in a variable, as a
+parameter and as a result, and makes a `PhysicalStorageBuffer` pointer of it with
+`OpBitcast` at each access, since a `PhysicalStorageBuffer` pointer has no null
+constant for `nil`. So no variable or parameter holds a SPIR-V pointer to decorate,
+and mach makes no promise that two pointers do not overlap. Accesses through one
+are private under the Vulkan memory model: no `"coherent"` qualifier reaches device
+memory.
 
 A register that one path makes logical and another physical is refused, as is
 every operation a logical pointer has no form for, each naming why. Physical

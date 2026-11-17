@@ -51,10 +51,12 @@ use types:      mirl.ir.type.table;
 use mirl.ir.type.table.Type;
 use mirl_value: mirl.ir.value;
 use mirl.ir.value.Declaration;
-use mirl_layout:  mirl.target.layout;
-use mirl_record:  mirl.target.record;
-use spirv_schema: mirl.target.spirv.schema;
+use mirl_capability: mirl.target.capability;
+use mirl_layout:     mirl.target.layout;
+use mirl_record:     mirl.target.record;
+use spirv_schema:    mirl.target.spirv.schema;
 
+use diagnostic_kind: mach.base.diagnostic.kind;
 use mach.base.fail;
 use mach.base.float;
 use base_source: mach.base.source;
@@ -293,6 +295,29 @@ pub fun global_space(b: *Builder, ix: u32) u32 {
 # parameters take the classes of the storage their arguments point into
 pub fun classes(b: *Builder) bool {
     ret sel b.target.caps.addressing.logical;
+}
+
+# the address space of a physical pointer where the target's pointers name a storage class
+# each: the one space whose pointers the target models as addresses, as spir-v's
+# PhysicalStorageBuffer. a pointer the source holds in memory, returns, makes from an
+# integer or spells `nil` is of this space (types.md, "pointers on spir-v")
+pub fun physical_space(b: *Builder) opt[u32] {
+    if (!classes(b)) { ret opt[u32].none{}; }
+    val rows: Slice[mirl_capability.Space] = b.target.caps.widths.pointers;
+    var i:    usize                        = 0;
+    for (i < rows.size) {
+        val p: mirl_capability.Pointer = rows.data[i].pointer;
+        if (sel p.modelled) { ret opt[u32].some{rows.data[i].space}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# whether `ty` is a physical pointer
+pub fun is_physical(b: *Builder, ty: Type) bool {
+    if (!irt.is_ptr(?b.m.types, ty)) { ret false; }
+    val opt_space: opt[u32] = physical_space(b);
+    ret sel opt_space.some && irt.space_of(?b.m.types, ty) == opt_space.some;
 }
 
 pub fun int_type(b: *Builder, bits: u32) Type {
@@ -636,7 +661,10 @@ pub fun constant_of(b: *Builder, v: value.Value) id.Constant {
         if (sel opt_bits.none) { ret 0xFFFFFFFF; }
         ret mbuild.constant(?b.mb, ConstantData.float{opt_bits.some});
     }
-    if (v.kind == value.VAL_NULL)  { ret mbuild.constant(?b.mb, ConstantData.zero{v.ty}); }
+    if (v.kind == value.VAL_NULL) {
+        held_address(b, v.ty);
+        ret mbuild.constant(?b.mb, ConstantData.zero{v.ty});
+    }
     if (v.kind == value.VAL_CONST) { ret v.index; }
     if (v.kind == value.VAL_GLOBAL) {
         ret mbuild.constant(?b.mb, ConstantData.address{Address{type: ptr_in(b, v.space), symbol: id.Symbol.global{v.index}, offset: 0}});
@@ -741,11 +769,36 @@ fun is_ptr(b: *Builder, v: value.Value) bool {
     ret irt.is_ptr(?b.m.types, v.ty);
 }
 
+# the refusal of a comparison or a difference that reads a logical pointer as an address, where
+# the target's pointers name a storage class each: a logical pointer names a variable and has
+# none, so only physical pointers and `nil` are compared, ordered or subtracted
+fun addresses(b: *Builder, x: value.Value, y: value.Value) err[fail.Fail] {
+    if (!classes(b)) { ret err[fail.Fail].ok{}; }
+    if ((is_ptr(b, x) && x.kind != value.VAL_NULL && !is_physical(b, x.ty)) || (is_ptr(b, y) && y.kind != value.VAL_NULL && !is_physical(b, y.ty))) {
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.SPIRV_UNSUPPORTED, "a logical pointer is compared, ordered or subtracted: it names a variable and has no address, which only a physical pointer has")};
+    }
+    ret err[fail.Fail].ok{};
+}
+
 # an address read as the integer as wide as a pointer, which comparisons and differences read
 fun as_address_int(b: *Builder, v: value.Value) value.Value {
-    if (!is_ptr(b, v))            { ret v; }
-    if (v.kind == value.VAL_NULL) { ret value.const_int(0, index_type(b)); }
-    ret take(b, converted(b, opcode.PTRTOINT, v, index_type(b)));
+    if (!is_ptr(b, v)) { ret v; }
+    val xty: Type = address_type(b, v.ty);
+    if (v.kind == value.VAL_NULL) { ret value.const_int(0, xty); }
+    ret take(b, converted(b, opcode.PTRTOINT, v, xty));
+}
+
+# a physical pointer of `ty` made where the build's addressing model holds it as an address, or
+# the refusal of the layout that names what selects one
+fun held_address(b: *Builder, ty: Type) {
+    if (is_physical(b, ty)) { size_of(b, ty); }
+}
+
+# the integer a pointer of `ty` is read as: a physical pointer's address as wide as the build's
+# addressing model holds it, as a u64 under PhysicalStorageBuffer64, else the index type
+fun address_type(b: *Builder, ty: Type) Type {
+    if (!is_physical(b, ty)) { ret index_type(b); }
+    ret int_type(b, (size_of(b, ty) * 8)::u32);
 }
 
 pub fun emit_add(b: *Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
@@ -761,8 +814,12 @@ pub fun emit_sub(b: *Builder, x: value.Value, y: value.Value) res[value.Value, f
         if (sel res_negated.err) { ret res_negated; }
         ret emit_offset(b, x, res_negated.ok);
     }
-    if (is_ptr(b, x) && is_ptr(b, y)) { ret binary(b, opcode.SUB, as_address_int(b, x), as_address_int(b, y)); }
-    if (is_float(b, x))               { ret binary(b, opcode.FSUB, x, y); }
+    if (is_ptr(b, x) && is_ptr(b, y)) {
+        val err_addressed: err[fail.Fail] = addresses(b, x, y);
+        if (sel err_addressed.err) { ret res[value.Value, fail.Fail].err{err_addressed.err}; }
+        ret binary(b, opcode.SUB, as_address_int(b, x), as_address_int(b, y));
+    }
+    if (is_float(b, x)) { ret binary(b, opcode.FSUB, x, y); }
     ret binary(b, opcode.SUB, x, y);
 }
 
@@ -845,10 +902,12 @@ fun widened(b: *Builder, r: res[value.Value, fail.Fail], to: Type, mask: bool) r
 # a compare's bool byte, which remembers the i1 it was widened from so a branch on it reads
 # the compare itself
 fun compare(b: *Builder, int_code: Opcode, float_code: Opcode, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
-    var res_held: res[value.Value, fail.Fail] = res[value.Value, fail.Fail].ok{value.none()};
-    if (is_float(b, x))   { res_held = binary(b, float_code, x, y); }
-    or                    { res_held = binary(b, int_code, as_address_int(b, x), as_address_int(b, y)); }
-    if (sel res_held.err) { ret res_held; }
+    var res_held:      res[value.Value, fail.Fail] = res[value.Value, fail.Fail].ok{value.none()};
+    val err_addressed: err[fail.Fail]              = addresses(b, x, y);
+    if (sel err_addressed.err) { ret res[value.Value, fail.Fail].err{err_addressed.err}; }
+    if (is_float(b, x))        { res_held = binary(b, float_code, x, y); }
+    or                         { res_held = binary(b, int_code, as_address_int(b, x), as_address_int(b, y)); }
+    if (sel res_held.err)      { ret res_held; }
     val res_wide: res[value.Value, fail.Fail] = widened(b, res_held, i8(b), false);
     if (sel res_wide.err) { ret res_wide; }
     var out: value.Value = res_wide.ok;
@@ -1003,6 +1062,7 @@ pub fun emit_bitcast(b: *Builder, x: value.Value, to: Type) res[value.Value, fai
     }
     if (irt.is_int(t, x.ty) && irt.is_ptr(t, to)) {
         if (x.kind == value.VAL_INT && wide.is_zero(x.bits)) { ret ok(value.const_null(to)); }
+        held_address(b, to);
         ret converted(b, opcode.INTTOPTR, x, to);
     }
     if (irt.is_int(t, x.ty) && irt.is_int(t, to))           { ret resize_int(b, x, to, false); }
@@ -1682,14 +1742,28 @@ pub fun emit_target_op(b: *Builder, op: *native.Op, values: *value.Value, n: u32
         if (sel res_pushed.err) { ret res[value.Value, fail.Fail].err{fail.refused(res_pushed.err)}; }
         i = i + 1;
     }
+    # a pointer an instruction gives is of the class its row makes, which the target reads from
+    # the row, so it is stated in the slot space as no class of the source's, never physical
+    var results: vector.Vector[Type] = vector.init[Type](b.a);
+    fin { vector.dnit[Type](?results); }
+    var stated: native.Op = @op;
+    var k:      usize     = 0;
+    for (k < op.results.size) {
+        var t: Type = op.results.data[k];
+        if (is_physical(b, t)) { t = ptr_type(b); }
+        val res_kept: res[usize, A.Error] = vector.push[Type](?results, t);
+        if (sel res_kept.err) { ret res[value.Value, fail.Fail].err{fail.refused(res_kept.err)}; }
+        k = k + 1;
+    }
+    stated.results = Slice[Type]{data: results.data, size: results.len};
     var code: Opcode = opcode.TARGET_OP;
-    if (native.touches(op)) { code = opcode.TARGET_OP_MEMORY; }
-    var imm:  [1]Immediate   = [1]Immediate{Immediate.op{op}};
+    if (native.touches(?stated)) { code = opcode.TARGET_OP_MEMORY; }
+    var imm:  [1]Immediate   = [1]Immediate{Immediate.op{?stated}};
     val made: id.Instruction = mbuild.emit(?b.mb, request(code, ops.data, ops.len::u32, ?imm[0], 1));
-    if (mbuild.failed(?b.mb)) { ret after(b, value.none()); }
-    if (op.results.size == 0) { ret ok(value.none()); }
+    if (mbuild.failed(?b.mb))     { ret after(b, value.none()); }
+    if (stated.results.size == 0) { ret ok(value.none()); }
     val r: id.Value = mbuild.result(?b.mb, made, 0);
-    ret after(b, value.ssa(r, op.results.data[0], secret_of(b, r)));
+    ret after(b, value.ssa(r, stated.results.data[0], secret_of(b, r)));
 }
 
 pub fun emit_unreachable(b: *Builder) err[fail.Fail] {
