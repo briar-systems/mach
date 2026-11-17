@@ -625,10 +625,21 @@ as anywhere else.
   destination only where FPCR.NEP is set under FEAT_AFP, and so reads the
   destination only then. Where the target establishes FPCR.NEP clear, the walk
   checks with it clear and such an instruction writes its destination without
-  reading it. Where the target does not, the walk takes FPCR.NEP as possibly
-  set, so the destination's old value is an input, and a refusal for it says
-  `needs no nep=on`. A block may not write `fpcr`: `msr fpcr` is refused
-  whatever value it writes.
+  reading it. Where the target does not, a constant-time function whose
+  compiled code may select such an instruction clears FPCR.NEP itself: its
+  entry reads `fpcr`, clears bit 2 in a copy and writes it back where the bit
+  is set, each return restores `fpcr` from the saved copy where the entry
+  wrote it, and each call of a callee it does not trust is followed by the
+  clear again. A function entered with the bit clear, as a constant-time
+  caller leaves it, writes nothing. The function's code is then checked with
+  FPCR.NEP clear, and a function with no such instruction carries none of
+  this. Without FEAT_AFP the bit is RES0, so the copy holds 0 there and the
+  clear changes nothing. An instruction the function's code does not switch
+  for, as one of a block, is still checked with FPCR.NEP possibly set, and a
+  refusal for it names the state, `fpcr`, and that neither the system nor the
+  function clears it there: write the register before the instruction. A
+  block may not write `fpcr`: `msr fpcr` is refused whatever value it writes,
+  and only the function's own save, clear and restore are admitted.
 
 What the walk cannot read, it refuses: bytes that decode to no instruction, an
 instruction whose effects masc's tables leave undecided, and control that leaves
@@ -1213,26 +1224,30 @@ known and accepted under it:
 - untrusted code whose `asm` moves a secret it reaches through a global into
   public storage it was given, directly or through a trusted callee.
 
-The check is a proof under the processor state the target establishes. On
+The check is a proof under the processor state the code runs under. On
 aarch64 that is FPCR.NEP, which a target states clear only where a source
-establishes it, cited beside the fact in mink's catalog of hosts:
+establishes it, cited beside the fact in mink's catalog of hosts, and which a
+constant-time function establishes itself everywhere else:
 
-| target | FPCR.NEP at a thread's start | source |
-|---|---|---|
-| linux | clear | exec clears the thread's whole float state (`fpsimd_flush_thread`), a new thread copies its parent's, a signal handler runs on the interrupted thread's |
-| darwin | clear | xnu sets a 64-bit thread's FPCR to `FPCR_DEFAULT`, which is 0 |
-| uefi | clear | UEFI 2.10, section 2.3.6: FPCR=0 at image entry |
-| freestanding | not established | a warm reset leaves FPCR UNKNOWN, and a program may supply its own entry, so nothing outside the function establishes it |
-| windows | not established | no primary source states a thread's initial FPCR |
+| target | FPCR.NEP at a thread's start | source | what holds it clear in a constant-time function |
+|---|---|---|---|
+| linux | clear | exec clears the thread's whole float state (`fpsimd_flush_thread`), a new thread copies its parent's, a signal handler runs on the interrupted thread's | the system |
+| darwin | clear | xnu sets a 64-bit thread's FPCR to `FPCR_DEFAULT`, which is 0 | the system |
+| uefi | clear | UEFI 2.10, section 2.3.6: FPCR=0 at image entry | the system |
+| freestanding | not established | a warm reset leaves FPCR UNKNOWN, and a program may supply its own entry, so nothing outside the function establishes it | the function's own clear, where its code needs it |
+| windows | not established | no primary source states a thread's initial FPCR | the function's own clear, where its code needs it |
 
-On a target that does not establish it, a one-source scalar float instruction
-whose destination may hold a secret is refused.
-
-Code that sets FPCR.NEP by hand is outside what the checker proves: with it
-set, a one-source scalar float instruction keeps its destination's upper bits,
-which may hold a secret a caller left in the register. A constant-time
-function's own write of `fpcr` is refused, and untrusted code that sets it and
-returns is trusted not to.
+On linux, darwin and uefi a constant-time function emits nothing for
+FPCR.NEP. On freestanding and windows the function clears it around its own
+code where that code may select a one-source scalar float instruction, as
+[the codegen contract](#constant_time--the-codegen-contract) states, in `soft`
+and `hard` alike: the state is the function's own doing, decided when it is
+compiled, and needs no feature of the processor, as the clear is harmless
+where the bit is RES0. That proof rests on nothing a startup routine does.
+Where the system establishes the bit clear, the proof rests on that source and
+on untrusted code not setting the bit and returning: a constant-time
+function's own write of `fpcr` other than its clear is refused, and code that
+sets FPCR.NEP by hand is outside what the checker proves.
 
 ## Assurance
 
