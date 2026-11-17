@@ -20,6 +20,7 @@ resolution, comptime evaluation, decorators, type checking, and doc comments
 | [`load`](load.md) | module loading: every module a build reaches, its gates decided and its imports bound |
 | [`parser`](parser.md) | the parser's entry: one token stream parsed into a syntax tree, handed back only when the parse completed |
 | [`path`](path.md) | dotted paths read from the source, with the trivia between their segments skipped |
+| [`refusal`](refusal.md) | a module refused by a module-scope `$error` |
 | [`resolve`](resolve.md) | name resolution: every name a module spells bound to the symbol it means |
 | [`token`](token.md) | the tokens of the language: their kinds, fixed punctuation spellings and infix precedence |
 | [`transition`](transition.md) | the forms of the previous major and the tables that carry a project across them |

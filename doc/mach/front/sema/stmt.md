@@ -13,7 +13,9 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../
 | [`test_return_type`](#test_return_type) | |
 | [`gate_condition_check`](#gate_condition_check) | a statement gate's verdict in the walk's frame, recorded there for lowering once decided types a gate's condition inside the gate and checks that it is a condition |
 | [`deferred_gate_decide`](#deferred_gate_decide) | the verdict of a deferred chain's gate, none when the gate is not a condition or its verdict is neither active nor inactive, which is reported at `cond_span` |
-| [`gate_verdict_truth`](#gate_verdict_truth), [`infer_stmt`](#infer_stmt), [`eval_comptime_directive`](#eval_comptime_directive), [`check_binding`](#check_binding) | |
+| [`gate_verdict_truth`](#gate_verdict_truth), [`infer_stmt`](#infer_stmt) | |
+| [`eval_comptime_directive`](#eval_comptime_directive) | whether the directive at `span` is a `$error` that fired, reported as the walk reports |
+| [`check_binding`](#check_binding) | |
 
 ---
 
@@ -58,8 +60,10 @@ pub fun infer_stmt(sc: *mach.front.sema.context.SemaContext, sid: mach.front.ast
 ### eval_comptime_directive
 
 ```mach
-pub fun eval_comptime_directive(sc: *mach.front.sema.context.SemaContext, target: mach.front.ast.id.ExprId, span: mach.base.source.Span)
+pub fun eval_comptime_directive(sc: *mach.front.sema.context.SemaContext, target: mach.front.ast.id.ExprId, span: mach.base.source.Span) bool
 ```
+
+whether the directive at `span` is a `$error` that fired, reported as the walk reports
 
 ### check_binding
 

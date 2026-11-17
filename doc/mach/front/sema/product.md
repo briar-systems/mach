@@ -6,7 +6,7 @@ what sema publishes for a module, and how one module reads another's
 
 Source: [`src/front/sema/product.mach`](../../../../src/front/sema/product.mach)
 
-Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.front.comptime.deep`](../comptime/deep.md), [`mach.front.comptime.scope`](../comptime/scope.md), [`mach.front.resolve`](../resolve.md), [`mach.front.sema.fields`](fields.md), [`mach.front.sema.growth`](growth.md), [`mach.front.sema.instance`](instance.md), [`mach.front.sema.interface`](interface.md), [`mach.report.phase`](../../report/phase.md), [`mach.session.module`](../../session/module.md), [`mach.type.kind`](../../type/kind.md).
+Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.front.comptime.deep`](../comptime/deep.md), [`mach.front.comptime.scope`](../comptime/scope.md), [`mach.front.refusal`](../refusal.md), [`mach.front.resolve`](../resolve.md), [`mach.front.sema.fields`](fields.md), [`mach.front.sema.growth`](growth.md), [`mach.front.sema.instance`](instance.md), [`mach.front.sema.interface`](interface.md), [`mach.report.phase`](../../report/phase.md), [`mach.session.module`](../../session/module.md), [`mach.type.kind`](../../type/kind.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -82,6 +82,9 @@ pub rec SemaResult {
     growth: mach.front.sema.growth.Analysis;
     # what the lowering of every importer reads of the module
     interface: mach.front.sema.interface.Interface;
+    # why typing refused the module, if it did: a module-scope `$error` that only typing
+    # decides fired in it, or a module it imports was refused
+    refusal: mach.front.refusal.Refusal;
 }
 ```
 
@@ -101,7 +104,7 @@ pub fun result_shed(r: *SemaResult)
 
 give back what only the module's own lowering reads of a semantic result, once it is lowered:
 its typing, its bound constants, its instances and its growth. the interface every importer's
-lowering reads, the field graph and the status stay
+lowering reads, the field graph, the status and the refusal stay
 
 ## InstanceResult
 
@@ -155,6 +158,8 @@ pub rec ModuleSema {
     graph:   mach.front.sema.fields.Graph;
     index:   std.collections.map.Map[u64, u32];
     indexed: usize;
+    # the module is refused, by its own `$error` or an import's: an importer is not typed
+    refused: bool;
 }
 ```
 

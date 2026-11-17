@@ -10,7 +10,7 @@ project's operations last published it
 
 Source: [`src/compile/frontend.mach`](../../../src/compile/frontend.mach)
 
-Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](project.md), [`mach.front.ast`](../front/ast.md), [`mach.front.resolve`](../front/resolve.md), [`mach.front.sema.instance`](../front/sema/instance.md), [`mach.front.sema.product`](../front/sema/product.md), [`mach.report.phase`](../report/phase.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md).
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](project.md), [`mach.front.ast`](../front/ast.md), [`mach.front.refusal`](../front/refusal.md), [`mach.front.resolve`](../front/resolve.md), [`mach.front.sema.instance`](../front/sema/instance.md), [`mach.front.sema.product`](../front/sema/product.md), [`mach.report.phase`](../report/phase.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -38,6 +38,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](pr
 | [`instance_deps_dnit`](#instance_deps_dnit) | release what instance_deps made |
 | [`begin_query_phase`](#begin_query_phase) | open a query operation over the project: the build context must be as it was frozen, and the type projections the last operation installed are reset |
 | [`refresh_diagnostics`](#refresh_diagnostics) | the session's store is rebuilt from the project's and the query presentation's, dropping the warnings a declaration's `#[expect]` acknowledges and the ones the profile's `allow` silences, then reporting each judged expectation nothing fulfilled |
+| [`refusal_of`](#refusal_of) | why a module is refused, as this project's operations last published it: by resolution, or by typing when resolution did not refuse it |
 | [`products_dnit`](#products_dnit) | give back a lowered module's front-end products, which nothing the build runs after its lowering reads: its syntax tree, its resolution, its lowering scope and what its typing holds beyond the interface its importers' lowerings read |
 | [`finish_query_phase`](#finish_query_phase) | close a query operation over the project and show it: end it, hold its failure where the session presents it, collect the diagnostics of every product the roots reach into the session's presentation and refresh the session's store from it |
 
@@ -214,6 +215,15 @@ the session's store is rebuilt from the project's and the query presentation's,
 dropping the warnings a declaration's `#[expect]` acknowledges and the ones the
 profile's `allow` silences, then reporting each judged expectation nothing
 fulfilled. a warning replayed from the cache passes through here as a fresh one does
+
+### refusal_of
+
+```mach
+pub fun refusal_of(p: *mach.compile.project.Project, m: *mach.compile.project.ModuleEntry) *mach.front.refusal.Refusal
+```
+
+why a module is refused, as this project's operations last published it: by resolution, or
+by typing when resolution did not refuse it. nil when neither did
 
 ### products_dnit
 

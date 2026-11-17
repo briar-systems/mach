@@ -47,6 +47,7 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`expect`](#expect) | acknowledge every warning an expectation in `list` covers as it reaches the store; the store takes the list, whatever the outcome, and indexes it by file |
 | [`report_unfulfilled`](#report_unfulfilled) | an expectation nothing fulfilled is itself a warning, where it is judged: a build with errors judges none, since a pass it stopped may have been the one to raise the warning |
 | [`drop_file`](#drop_file) | drop every diagnostic located in one file, keeping the rest in order |
+| [`drop_file_except`](#drop_file_except) | drop every diagnostic located in one file except those that begin at one of `sites`, keeping the rest in order, as drop_file does |
 | [`store_dnit`](#store_dnit) | release a store and every diagnostic it holds; a nil store holds nothing and releases nothing |
 | [`len`](#len) | how many diagnostics `store` holds; a nil store, as a walk that reports nowhere has, holds none |
 | [`error_count`](#error_count) | how many errors `store` counts; a nil store counts none |
@@ -267,6 +268,21 @@ drop is stale afterwards, as after a truncate
 | :--- | :--- |
 | `store` | the store |
 | `file_id` | the file whose diagnostics go |
+
+### drop_file_except
+
+```mach
+pub fun drop_file_except(store: *DiagnosticStore, file_id: mach.base.source.FileId, sites: *u32, site_count: usize)
+```
+
+drop every diagnostic located in one file except those that begin at one of `sites`,
+keeping the rest in order, as drop_file does
+
+| Parameter | |
+| :--- | :--- |
+| `store` | the store |
+| `file_id` | the file whose diagnostics go |
+| `sites` | the offsets in the file whose diagnostics stay, `site_count` of them |
 
 ### store_dnit
 

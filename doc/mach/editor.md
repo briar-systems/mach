@@ -25,6 +25,7 @@ Uses types from [`mach.base.diagnostic`](base/diagnostic.md), [`mach.base.fail`]
 | [`ProjectBuffer`](#projectbuffer) | `rec` | an open buffer's text, which a snapshot reads in place of the file at `path` reached only by mach-lsp |
 | [`ProjectRequest`](#projectrequest) | `rec` | what one project_init call asks for; every string and the buffer array are borrowed only during the call reached only by mach-lsp |
 | [`ProjectSnapshot`](#projectsnapshot) | `rec` | the whole project at a root analyzed for a tool, every artifact's closure with the open buffers' modules beside it |
+| [`ImportRefusal`](#importrefusal) | `rec` | what the file of a module refused through an import shows: the path of its import that names a refused module, and the module-scope `$error` the refused imports from there lead to, which the build reports in its own module's file and not in this one reached only by mach-lsp |
 
 | On `EditorSession` | |
 | :--- | :--- |
@@ -65,6 +66,7 @@ Uses types from [`mach.base.diagnostic`](base/diagnostic.md), [`mach.base.fail`]
 | [`project_resolve_of`](#project_resolve_of) | a module's resolve product, under resolve_of's rules; nil when the module did not reach resolution reached only by mach-lsp |
 | [`project_sema_of`](#project_sema_of) | a module's sema product, under sema_of's rules; nil when the module was not type checked reached only by mach-lsp |
 | [`project_module_status`](#project_module_status) | a module's own phase standing, as the snapshot's analysis left it reached only by mach-lsp |
+| [`project_import_refusal`](#project_import_refusal) | a module's import refusal, none when it is not refused through an import reached only by mach-lsp |
 | [`project_module_is_root`](#project_module_is_root) | whether a module belongs to the project the snapshot was opened for, not to one of its dependencies reached only by mach-lsp |
 
 | Functions | |
@@ -591,6 +593,15 @@ pub fun project_module_status(snap: *ProjectSnapshot, index: u32) res[mach.repor
 a module's own phase standing, as the snapshot's analysis left it
 reached only by mach-lsp
 
+### project_import_refusal
+
+```mach
+pub fun project_import_refusal(snap: *ProjectSnapshot, index: u32) res[opt[ImportRefusal], mach.base.fail.Fail]
+```
+
+a module's import refusal, none when it is not refused through an import
+reached only by mach-lsp
+
 ### project_module_is_root
 
 ```mach
@@ -599,6 +610,25 @@ pub fun project_module_is_root(snap: *ProjectSnapshot, index: u32) res[bool, mac
 
 whether a module belongs to the project the snapshot was opened for, not to one of its dependencies
 reached only by mach-lsp
+
+## ImportRefusal
+
+```mach
+pub rec ImportRefusal {
+    import: mach.base.source.Span;
+    cause:  *mach.base.diagnostic.Diagnostic;
+}
+```
+
+what the file of a module refused through an import shows: the path of its import that names
+a refused module, and the module-scope `$error` the refused imports from there lead to, which
+the build reports in its own module's file and not in this one
+reached only by mach-lsp
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `import` | `mach.base.source.Span` | the import's path, in the module's file |
+| `cause` | `*mach.base.diagnostic.Diagnostic` | the `$error`, borrowed from the snapshot's diagnostics |
 
 ## Functions
 

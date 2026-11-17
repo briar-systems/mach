@@ -13,7 +13,7 @@ symbol import nothing uses.
 
 Source: [`src/front/resolve.mach`](../../../src/front/resolve.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.front.ast`](ast.md), [`mach.front.ast.expr`](ast/expr.md), [`mach.front.ast.id`](ast/id.md), [`mach.front.ast.interpretation`](ast/interpretation.md), [`mach.front.ast.type`](ast/type.md), [`mach.front.comptime.scope`](comptime/scope.md), [`mach.front.comptime.value`](comptime/value.md), [`mach.front.load`](load.md), [`mach.report.phase`](../report/phase.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.type`](../type.md), [`mach.type.deprecation`](../type/deprecation.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.front.ast`](ast.md), [`mach.front.ast.expr`](ast/expr.md), [`mach.front.ast.id`](ast/id.md), [`mach.front.ast.interpretation`](ast/interpretation.md), [`mach.front.ast.type`](ast/type.md), [`mach.front.comptime.scope`](comptime/scope.md), [`mach.front.comptime.value`](comptime/value.md), [`mach.front.load`](load.md), [`mach.front.refusal`](refusal.md), [`mach.report.phase`](../report/phase.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.type`](../type.md), [`mach.type.deprecation`](../type/deprecation.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -273,7 +273,7 @@ pub rec ModuleExports {
     count:   u32;
     # `(name << 32) | index` of each symbol, ascending, which find_export searches
     by_name: *u64;
-    # the module refused itself, and that refusal is its diagnostic, so a missing name is not one
+    # the module is refused, by its own `$error` or an import's: an importer is not analysed
     refused: bool;
 }
 ```
@@ -403,8 +403,8 @@ pub rec ResolveResult {
     # the local each `{name}` of an asm block binds
     asm_binds: std.collections.vector.Vector[AsmBind];
 
-    # a module-scope `$error` in a decided arm refused the module, so nothing else was resolved
-    refused: bool;
+    # why the module is refused, if it is: then nothing else of it was resolved
+    refusal: mach.front.refusal.Refusal;
 }
 ```
 

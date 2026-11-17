@@ -7,7 +7,7 @@ instance it types and its own walk state, with the reads and reports every check
 
 Source: [`src/front/sema/context.mach`](../../../../src/front/sema/context.mach)
 
-Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.base.source`](../../base/source.md), [`mach.front.ast`](../ast.md), [`mach.front.ast.decl`](../ast/decl.md), [`mach.front.ast.expr`](../ast/expr.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.ast.type`](../ast/type.md), [`mach.front.comptime.capability`](../comptime/capability.md), [`mach.front.comptime.deep`](../comptime/deep.md), [`mach.front.comptime.failure`](../comptime/failure.md), [`mach.front.comptime.scope`](../comptime/scope.md), [`mach.front.comptime.value`](../comptime/value.md), [`mach.front.resolve`](../resolve.md), [`mach.front.sema.growth`](growth.md), [`mach.front.sema.instance`](instance.md), [`mach.front.sema.interface`](interface.md), [`mach.front.sema.product`](product.md), [`mach.report.phase`](../../report/phase.md), [`mach.session`](../../session.md), [`mach.session.module`](../../session/module.md), [`mach.type`](../../type.md), [`mach.type.field`](../../type/field.md), [`mach.type.kind`](../../type/kind.md), [`mach.type.query`](../../type/query.md), [`mach.type.query.extent`](../../type/query/extent.md), [`mach.type.scan`](../../type/scan.md).
+Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.base.source`](../../base/source.md), [`mach.front.ast`](../ast.md), [`mach.front.ast.decl`](../ast/decl.md), [`mach.front.ast.expr`](../ast/expr.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.ast.type`](../ast/type.md), [`mach.front.comptime.capability`](../comptime/capability.md), [`mach.front.comptime.deep`](../comptime/deep.md), [`mach.front.comptime.failure`](../comptime/failure.md), [`mach.front.comptime.scope`](../comptime/scope.md), [`mach.front.comptime.value`](../comptime/value.md), [`mach.front.refusal`](../refusal.md), [`mach.front.resolve`](../resolve.md), [`mach.front.sema.growth`](growth.md), [`mach.front.sema.instance`](instance.md), [`mach.front.sema.interface`](interface.md), [`mach.front.sema.product`](product.md), [`mach.report.phase`](../../report/phase.md), [`mach.session`](../../session.md), [`mach.session.module`](../../session/module.md), [`mach.type`](../../type.md), [`mach.type.field`](../../type/field.md), [`mach.type.kind`](../../type/kind.md), [`mach.type.query`](../../type/query.md), [`mach.type.query.extent`](../../type/query/extent.md), [`mach.type.scan`](../../type/scan.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -236,6 +236,8 @@ pub rec Typing {
     type_fn:             fun(*SemaContext, mach.front.ast.id.TypeId) mach.type.kind.TypeId;
     module:              mach.session.module.StableModuleId;
     values:              *mach.front.comptime.deep.Store;
+    # why the module being typed is refused, if it is; nil in an instance's typing
+    refusal: *mach.front.refusal.Refusal;
 }
 ```
 
