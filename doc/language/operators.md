@@ -116,6 +116,7 @@ never a call:
 | riscv64, riscv32 | binary64, the conversions inline | binary64, the widening inline |
 | riscv with `zfhmin` | binary32 through `fcvt.s.h` and `fcvt.h.s` | binary32 through `fcvt.s.h` |
 | riscv with `zfh` | native (`fadd.h`, `fsub.h`, `fmul.h`, `fdiv.h`) | native (`feq.h`, `flt.h`, `fle.h`) |
+| riscv without `f` or `d` | binary16 helpers, integer code ([types.md](types.md#floats-on-a-target-with-no-float-unit)) | binary16 helper |
 | spirv with `Float16` | native, the core float instructions on `OpTypeFloat 16` | native |
 | spirv without `Float16` | binary32, the conversions inline | binary32, the widening inline |
 

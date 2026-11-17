@@ -650,7 +650,10 @@ selected machine, but the emitter writes full-width instructions only.
 The ABI still selects the calling convention on its own, and it must fit the
 selected machine: `rv32imc` and `rv32imac` have no floating-point registers, so
 they take `ilp32` and are refused with `ilp32f` or `ilp32d`; name
-`isa = "rv32imafdc"` when RV32 hardware floating point is wanted.
+`isa = "rv32imafdc"` when RV32 hardware floating point is wanted. A selection
+without `f` computes `f32` and `f64` by helpers the compiler writes into the
+program, and one without `d` computes `f64` so, under any convention it takes
+(see [types.md](types.md#floats-on-a-target-with-no-float-unit)).
 
 `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, and `ilp32d` are the RISC-V psABI
 calling-convention family, one `abi` per member. The lp64 three target

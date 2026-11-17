@@ -72,6 +72,21 @@ the result is the same bits either way, is on
 [SIMD vectors](#simd-vectors) below, and the calling conventions on
 [ext-fun.md](ext-fun.md#f16-and-_float16).
 
+### Floats on a target with no float unit
+
+`f16`, `f32` and `f64` and every float operator are available on every target,
+whatever unit its instruction set selects. Where the selection computes a width
+in no unit, as a RISC-V selection without `f` and `d` (`rv32imc` or `rv32imac`
+under `ilp32`, `rv64imac` under `lp64`) computes every width, or one with `f`
+alone computes `f64`, each operation on that width is a call of a helper the
+compiler writes into the program as integer code: the arithmetic operators,
+`%`, the comparisons, and the conversions to and from integers and between
+widths, each correctly rounded to nearest with ties to even. A value of such a
+width crosses a call or a return as its encoding, where the calling convention
+places it (`ilp32` and `lp64` in integer registers). Nothing is refused for the
+missing unit and nothing extra is linked. Which widths a selection computes in a
+unit is on [manifest.md](manifest.md), under the RISC-V instruction sets.
+
 ### 128-bit integers
 
 `u128` and `i128` are integers like the others: every arithmetic, bitwise,
