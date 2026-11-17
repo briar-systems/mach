@@ -93,22 +93,22 @@ unit is on [manifest.md](manifest.md), under the RISC-V instruction sets.
 shift, comparison and conversion operator applies, literals take the `u128`
 and `i128` suffixes, comptime evaluates them exactly, and `$size_of` is 16
 with `$align_of` 16, which is what C's `__int128` has on every ABI mach
-targets.
+targets. SPIR-V has no C ABI, and its `$align_of` is 8, its 64-bit word's.
 
-No target has a 128-bit register. A 128-bit value is **realized** as two
-64-bit lanes on the 64-bit targets (x86-64, aarch64, riscv64), the way a
-vector wider than the vector register is realized as pieces: addition and
-subtraction carry across the lanes, shifts move bits between them, and a
-comparison decides on the high lane first. Which targets realize the width is
-a declaration of the machine model, not a consequence of its name. SPIR-V
+No target has a 128-bit register. A 128-bit value is **realized** as words of
+the widest width the target computes at, the way a vector wider than the
+vector register is realized as pieces: two 64-bit words on x86-64, aarch64,
+riscv64 and wasm32, and four 32-bit words on riscv32. Addition and subtraction
+carry across the words, shifts move bits between them, and a comparison decides
+on the high word first. The width a target computes at is a declaration of its
+machine model, not a consequence of its name, and every target realizes every
+integer width this way, so no target refuses a 128-bit integer. SPIR-V
 splits a 128-bit integer into 64-bit words as it does any integer wider than its
-widest arithmetic, so it needs `Int64`. A target that declares no 128-bit integer
-(riscv32) refuses the type where it is used, at the declaration or expression
-that names it:
-
-```text
-error[target.int_width]: a 128-bit integer is not realized on riscv32: the target declares no integer of that width
-```
+widest arithmetic, so it needs `Int64`, and since SPIR-V has no 128-bit type
+it holds one in memory as an array of its two words, low word first: a local,
+a global, an initializer, a member and a block member are each that array
+(`OpTypeArray` of the 64-bit integer, with an `ArrayStride` of 8 in a block),
+and each access reaches its words as the array's elements.
 
 Three operations have a shape worth knowing:
 
@@ -512,8 +512,13 @@ naming the operand rather than the declaration, with `handle.arguments`. The SPI
 target's handle catalog refuses a `Depth` other than `0`, `1` or `2`, an `MS` or
 `Arrayed` other than `0` or `1`, a `Dim` the grammar does not state, a `Sampled` other
 than `1` or `2` (Vulkan's `VUID-StandaloneSpirv-OpTypeImage-04657`), a texel scalar that
-is not its format's number, and a `sampled_image` over an image whose `Sampled` is not
-`1` (`VUID-StandaloneSpirv-OpTypeSampledImage-06671`).
+is not its format's number, a `SubpassData` image whose `Sampled` is not `2`, whose format
+is not `Unknown` (SPIR-V 1.6, `OpTypeImage`) or whose `Arrayed` is not `0`
+(`VUID-StandaloneSpirv-OpTypeImage-06214`), and a `sampled_image` over an image whose
+`Sampled` is not `1` (`VUID-StandaloneSpirv-OpTypeSampledImage-06671`), or, where the
+target's version is SPIR-V 1.6 or later, as `vulkan1.3` and no `env` are, over an image of
+`Dim` `Buffer` (SPIR-V 1.6, `OpTypeSampledImage`), the refusal naming the version. A texel
+buffer is read with `OpImageFetch` of the image itself.
 
 See [decorators.md](decorators.md) for `#[handle]` and `#[gpu.sampler(set, binding)]`,
 and the shader library for the handles a SPIR-V target declares.

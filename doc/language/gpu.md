@@ -356,7 +356,12 @@ literal, a vector of literals directly or through a binding, a module-scope `val
 which a shader reads as the constant it is, or an aggregate passed whole as an array
 literal of constants or a copy of a `val`, written as one composite constant. An
 aggregate any run-time value writes, or one written only in part, is a value, and is
-refused with `op.operand_not_constant`. `OpImageQuerySamples` reads the sample
+refused with `op.operand_not_constant`. An `OpImageRead` of a `SubpassData` image reads
+the texel at the fragment's own place, so its coordinate is the constant vector (0, 0)
+(Vulkan's `VUID-StandaloneSpirv-SubpassData-04660`): a run-time coordinate is refused at
+the call with `op.operand_not_constant` and a constant with a component that is not zero
+with `op.operand_value`. A `SubpassData` image is declared with `Arrayed` 0, `Sampled` 2
+and the `Unknown` format (see [types.md](types.md)). `OpImageQuerySamples` reads the sample
 count of a multisampled image only, and `OpImageQuerySizeLod` does not take one.
 `OpImageQuerySize` reads an image with no level of detail to choose, a multisampled
 image, a storage image or a texel buffer, so a single-sampled sampled image is
@@ -935,6 +940,10 @@ scalar or vector of floats, the trigonometric and exponential rows, `Pow`, `Radi
 `Degrees` on floats of 16 or 32 bits only, the pack and unpack rows on the 32-bit and 64-bit
 types their names state, `FindILsb`, `FindSMsb`, `FindUMsb` and the `InterpolateAt` rows on
 32-bit components, and the `InterpolateAt` rows execute in a fragment stage alone. The
+core bit rows `OpBitReverse`, `OpBitFieldInsert`, `OpBitFieldSExtract` and
+`OpBitFieldUExtract` take a `Base` of 32-bit integer components, which Vulkan's
+`VUID-RuntimeSpirv-None-10824` requires unless the device enables `maintenance9`, a feature
+no Vulkan version guarantees, and their offset and count are integer scalars. The
 subgroup rows on a scalar or vector of integers or
 floats. The GLSL.std.450 integer rows operate on the signedness their name states:
 `SAbs`, `SSign`, `SMin`, `SMax`, `SClamp` and `FindSMsb` on signed integers, `UMin`,
@@ -971,7 +980,13 @@ the consumer enables through the feature Vulkan reports it by:
 | quad              | `QuadBroadcast`, `QuadSwap`                                  | `GroupNonUniformQuad`             |
 
 `BallotBitCount` takes a `GroupOperation` too, which its ballot capability covers
-and which has no clustered form. `QuadSwap`'s direction is a constant id in every SPIR-V
+and which has no clustered form. A clustered row's ClusterSize is an unsigned integer
+scalar, a constant, and a power of two, so at least 1 (SPIR-V 1.6, the arithmetic group
+operations): a signed declaration is refused with `op.signature`, a run-time value with
+`op.operand_not_constant` and another constant with `op.operand_value`. The rule is
+masc's typing data on the optional operand, read by mirl. A ClusterSize larger than the
+device's subgroup is undefined behaviour SPIR-V leaves to the program, since the size is
+the device's. `QuadSwap`'s direction is a constant id in every SPIR-V
 version. `Broadcast`'s lane and `QuadBroadcast`'s index are constant ids before SPIR-V 1.5,
 so under `vulkan1.1`, and from 1.5 on may be run-time values, which must then be
 dynamically uniform (Vulkan admits them under `subgroupBroadcastDynamicId`, which every
