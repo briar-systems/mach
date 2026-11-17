@@ -30,6 +30,9 @@ pub uni Maybe[T] {
 }
 ```
 
+Each field name is declared once, as in a `rec`: a second field of the same
+name is refused with `name.duplicate`.
+
 A `uni`'s size is the size of its largest field, plus any alignment
 padding. A literal writes the field it names and nothing else, so the bytes
 past that field are unspecified. A `uni` that holds a secret has those bytes

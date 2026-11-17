@@ -30,6 +30,16 @@ pub rec Pair[T, U] {
 }
 ```
 
+Each field name is declared once. A second field of the same name is refused
+with `name.duplicate`:
+
+```mach error duplicate field: `x` is already a field of this type
+rec Twice {
+    x: i64;
+    x: i64;
+}
+```
+
 ## Construction and access
 
 A record literal names the type and provides each field by name:
