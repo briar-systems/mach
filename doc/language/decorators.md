@@ -670,9 +670,17 @@ usability, so treat a green riscv64 leg as evidence about correctness only.
 
 This has not been measured on riscv64 hardware. It cannot be: qemu-user emulates a
 misaligned guest load directly and never takes the kernel path, so a qemu measurement
-shows no cost whether or not real silicon would. If the cost turns out to matter, the
-answer is byte-wise lowering of packed field access on faulting targets, which is
-codegen work and not part of `#[packed]` as it stands.
+shows no cost whether or not real silicon would.
+
+#### Target note: alignment-faulting targets
+
+Every access to a packed field states the alignment its offset admits in the record,
+never its type's own. A target that does not carry out an access below its type's
+alignment, as freestanding aarch64 (which runs with the MMU off, where such an access
+faults) and freestanding riscv64 and riscv32 do, makes each such access of the widest
+accesses that alignment admits, joined into the value or taken out of it in the
+target's byte order. Linux, darwin, windows and uefi targets carry out the access as
+one load or store.
 
 x86-64 and aarch64 do unaligned scalar access in hardware. Both architectures define an
 unaligned load or store to ordinary memory, and Linux runs aarch64 programs with alignment
