@@ -449,10 +449,12 @@ multisampled sampled image needs no capability. A multisampled storage image
 declares `StorageImageMultisample`, and an arrayed one `ImageMSArray` too, under
 the `StorageImageMultisample` extension.
 
-The operands are ordinary comptime constants. One position is not: a constructor
-that composes over another handle takes a **type name**, so `Sampler2D` names the
-image it wraps rather than restating that image's operands and cannot disagree with
-it. That is the only place a decorator argument is read as a type.
+The operands are ordinary comptime constants, except where the constructor's part
+takes a **type name**. An image's texel scalar is the scalar itself (`f32`) or an
+alias of it, and a constructor that composes over another handle names that handle,
+so `Sampler2D` names the image it wraps rather than restating that image's operands
+and cannot disagree with it. These are the only places a decorator argument is read
+as a type, and a name there that is neither a scalar nor a handle is refused.
 
 Every rule a handle carries follows from the one fact the decorator states, and the
 set is fixed and closed rather than varied per declaration:

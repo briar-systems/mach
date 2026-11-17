@@ -53,7 +53,7 @@ uses generic words such as `input` and `shared`.
 #[naked]             # no prologue or epilogue; body as written (no arguments)
 #[extension("a", "b")] # the function may use these instruction-set extensions
 #[embed("path")]     # compile-time file embedding (val only)
-#[intrinsic(tgt,set,name)] # the target instruction this function is (bodyless fun only)
+#[intrinsic(tgt,set,name)] # the target instruction this function is (its body, if any, runs elsewhere)
 #[handle(tgt,ctor,..)] # the target type this declares (bodyless def only)
 #[abi_type("name")]   # a C type whose layout the target declares (bodyless def only)
 #[gpu.stage("name")]     # GPU pipeline stage; makes the function an entry point
@@ -993,9 +993,12 @@ that one precedes the call, because only the program knows how it detects the
 processor's features and when that answer holds.
 
 - **Names come from every instruction set.** A name no extension catalog names
-  is refused, and the refusal names the catalogs it was read against (masc's x86,
-  aarch64 and riscv catalogs, and mach's own spirv vocabulary) and lists
-  the names the compiler emits against. A name a catalog holds that the compiler
+  is refused, and the refusal names the catalogs it was read against, masc's
+  extension catalog of each instruction set it serves (riscv, x86, wasm, spirv and
+  aarch64). It lists no names: the catalogs hold hundreds, the manifest's
+  [`ext`](manifest.md#instruction-set-extensions) table says where each is read
+  from, and the names are spelled as the instruction set's own sources spell them,
+  so `float16` is no name where `Float16` is. A name a catalog holds that the compiler
   emits nothing against, or that another instruction set declares, admits
   nothing on this target and is not an error, so one
   declaration serves a multi-arch source: `#[extension("sse41", "sha2")]` admits
@@ -1004,7 +1007,10 @@ processor's features and when that answer holds.
   the isa. Each name may appear once. The names are those the manifest's
   [`ext`](manifest.md#instruction-set-extensions) key takes, closed over
   what they imply (`sse41` admits `pshufb`), except the rows only a target
-  selects (riscv `i`, `c`, `f`, `d`, `zkt`), which are refused with the reason.
+  selects (riscv `i`, `c`, `f`, `d`, `zkt`, and every spirv name, since a SPIR-V
+  module declares what it holds once for all its functions, as the manifest
+  [says](manifest.md#instruction-set-extensions)), which are refused with the
+  reason. Which rows those are, and why, is masc's catalog's.
 - **One predicate, everywhere.** A function's admitted set is the target's
   selection plus what the decorator names. An instruction requiring an extension
   is emitted only into a function whose admitted set holds it (see
@@ -1151,7 +1157,7 @@ a further rule the decorator's own section states.
 | `naked` | `fun` |  |
 | `extension` | `fun` | a function with a body |
 | `embed` | `val` | a `val` that is not `ext`, checked by `embed` itself |
-| `intrinsic` | `fun` | a function with no body |
+| `intrinsic` | `fun` | a function, whose body, if it has one, is what other targets run |
 | `handle` | `def` | a `def` with no type, checked by `handle` itself |
 | `abi_type` | `def` | a `def` with no type, checked by `abi_type` itself |
 | `gpu.stage` | `fun` |  |

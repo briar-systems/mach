@@ -2,7 +2,8 @@
 # their offsets, a tag's case code and payload, an array's or a vector's elements at the
 # element stride, a string leaf as a pointer to its bytes, and an address as a relocation
 # against the symbol it points into. the bytes become one mirl constant: runs of bytes
-# between the addresses, each address at its offset
+# between the addresses, each address at its offset, or under logical addressing, which
+# reinterprets no memory, a constant of the type itself, read member by member from them
 use std.collections.map;
 use std.collections.slice.Slice;
 use collections_vector: std.collections.vector;
@@ -22,6 +23,7 @@ use mach.base.float;
 use mach.base.intern;
 use mach.base.wide;
 use comptime_deep: mach.front.comptime.deep;
+use mach.lower.builder;
 use lower_context: mach.lower.context;
 use mach.lower.irt;
 use mach.lower.mangle;
@@ -37,6 +39,7 @@ use type_kind:      mach.type.kind;
 use mbuild:         mirl.build.builder;
 use mirl.ir.constant.Address;
 use mirl.ir.constant.Aggregate;
+use mirl.ir.constant.Bits;
 use mirl.ir.constant.Bytes;
 use mirl.ir.constant.ConstantData;
 use mirl.ir.function.ConstantTime;
@@ -90,13 +93,15 @@ fun constant_type(ctx: *lower_context.LowerContext, c: id.Constant, ity: Type) T
     ret ity;
 }
 
-# bytes as one constant: zero when every byte is, an address when one address fills them,
-# else a structure of byte runs and the addresses between them
+# bytes as one constant: zero when every byte is, a constant of `ity` under logical
+# addressing, an address when one address fills them, else a structure of byte runs and the
+# addresses between them
 fun constant_of_image(ctx: *lower_context.LowerContext, image: *Image, ity: Type) res[id.Constant, fail.Fail] {
     val ptr: Type = lower_context.ptr_or_none(ctx);
     if (image.relocs.len == 0 && all_zero(image.blob, image.size)) {
         ret made(ctx, ConstantData.zero{ity});
     }
+    if (builder.classes(?ctx.builder)) { ret typed(ctx, image, ity, 0); }
     val res_psize: res[u64, fail.Fail] = size_of(ctx, ptr);
     if (sel res_psize.err) { ret res[id.Constant, fail.Fail].err{res_psize.err}; }
     if (image.relocs.len == 1 && image.size == res_psize.ok && image.relocs.data[0].offset == 0 && irt.is_ptr(?ctx.m.types, ity)) {
@@ -138,6 +143,87 @@ fun constant_of_image(ctx: *lower_context.LowerContext, image: *Image, ity: Type
     val res_structure_at: res[Type, fail.Fail] = irt.structure_at(?ctx.m.types, members.data, offsets.data, members.len::u32);
     if (sel res_structure_at.err) { ret res[id.Constant, fail.Fail].err{res_structure_at.err}; }
     ret made(ctx, ConstantData.aggregate{Aggregate{type: res_structure_at.ok, elements: Slice[id.Constant]{data: elements.data, size: elements.len}}});
+}
+
+# the bytes of `image` from `base` as a constant of the type `ty` laid out there: zero where
+# they and no address are, a number of the bits its bytes hold, an address where one is placed,
+# and an aggregate of its members' or elements' constants. a union has no constant of its own
+# members to be held as, so one that is not zero is refused
+fun typed(ctx: *lower_context.LowerContext, image: *Image, ty: Type, base: u64) res[id.Constant, fail.Fail] {
+    val res_size: res[u64, fail.Fail] = size_of(ctx, ty);
+    if (sel res_size.err) { ret res[id.Constant, fail.Fail].err{res_size.err}; }
+    val size:   u64        = res_size.ok;
+    val opt_at: opt[Reloc] = reloc_at(image, base);
+    val placed: bool       = sel opt_at.some;
+    if (irt.is_ptr(?ctx.m.types, ty)) {
+        if (sel opt_at.some) { ret made(ctx, ConstantData.address{Address{type: ty, symbol: opt_at.some.symbol, offset: opt_at.some.addend}}); }
+        ret made(ctx, ConstantData.zero{ty});
+    }
+    if (!placed && !relocated(image, base, size) && all_zero((image.blob::usize + base::usize)::*u8, size)) { ret made(ctx, ConstantData.zero{ty}); }
+    if (irt.is_int(?ctx.m.types, ty) || irt.is_float(?ctx.m.types, ty)) {
+        if (size == 0 || size > 16) { ret res[id.Constant, fail.Fail].err{fail.message("lower: a constant scalar has an unsupported size")}; }
+        var words: [2]u64 = [2]u64{0, 0};
+        var i:     u64    = 0;
+        for (i < size) {
+            words[i / 8] = words[i / 8] | (image.blob[base + i]::u64 << ((i % 8) * 8));
+            i            = i + 1;
+        }
+        val bits: Bits = Bits{type: ty, words: Slice[u64]{data: ?words[0], size: ((size + 7) / 8)::usize}};
+        if (irt.is_float(?ctx.m.types, ty)) { ret made(ctx, ConstantData.float{bits}); }
+        ret made(ctx, ConstantData.integer{bits});
+    }
+    var count:  u64  = 0;
+    var stride: u64  = 0;
+    val record: bool = irt.is_struct(?ctx.m.types, ty);
+    if (record) { count = irt.member_count(?ctx.m.types, ty)::u64; }
+    or (irt.is_array(?ctx.m.types, ty) || irt.is_vector(?ctx.m.types, ty)) {
+        count = irt.count(?ctx.m.types, ty);
+        if (irt.is_vector(?ctx.m.types, ty)) { count = irt.lanes(?ctx.m.types, ty)::u64; }
+        val res_stride: res[u64, fail.Fail] = element_stride(ctx, ty);
+        if (sel res_stride.err) { ret res[id.Constant, fail.Fail].err{res_stride.err}; }
+        stride = res_stride.ok;
+    }
+    or { ret res[id.Constant, fail.Fail].err{fail.message("lower: a constant under logical addressing holds a union or another type with no constant of its own")}; }
+    var elements: collections_vector.Vector[id.Constant] = collections_vector.init[id.Constant](ctx.s.alloc);
+    fin { collections_vector.dnit[id.Constant](?elements); }
+    var k: u64 = 0;
+    for (k < count) {
+        var at:   u64  = base + k * stride;
+        var part: Type = irt.element(?ctx.m.types, ty);
+        if (record) {
+            part = irt.member(?ctx.m.types, ty, k::u32);
+            val res_offset: res[u64, fail.Fail] = member_offset(ctx, ty, k::u32);
+            if (sel res_offset.err) { ret res[id.Constant, fail.Fail].err{res_offset.err}; }
+            at = base + res_offset.ok;
+        }
+        val res_part: res[id.Constant, fail.Fail] = typed(ctx, image, part, at);
+        if (sel res_part.err) { ret res_part; }
+        val res_pushed: res[usize, A.Error] = collections_vector.push[id.Constant](?elements, res_part.ok);
+        if (sel res_pushed.err) { ret res[id.Constant, fail.Fail].err{fail.refused(res_pushed.err)}; }
+        k = k + 1;
+    }
+    ret made(ctx, ConstantData.aggregate{Aggregate{type: ty, elements: Slice[id.Constant]{data: elements.data, size: elements.len}}});
+}
+
+# the address placed at `offset`, none where none is
+fun reloc_at(image: *Image, offset: u64) opt[Reloc] {
+    var i: usize = 0;
+    for (i < image.relocs.len) {
+        if (image.relocs.data[i].offset == offset) { ret opt[Reloc].some{image.relocs.data[i]}; }
+        i = i + 1;
+    }
+    ret opt[Reloc].none{};
+}
+
+# whether an address is placed in the `size` bytes from `base`
+fun relocated(image: *Image, base: u64, size: u64) bool {
+    var i: usize = 0;
+    for (i < image.relocs.len) {
+        val at: u64 = image.relocs.data[i].offset;
+        if (at >= base && at < base + size) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # the image's addresses by offset: a literal names its fields in any order, and

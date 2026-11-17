@@ -376,10 +376,9 @@ x86-64-v2, x86-64-v3, x86-64-v4
 The array must hold strings, each an identifier (`sse41`, not `sse4.1`) or a level
 spelling (`x86-64-v2`), listed once.
 
-The x86_64, aarch64 and riscv names, what each implies and the x86-64 levels are read from
+The names of every `arch`, what each implies and the x86-64 levels are read from
 masc's extension catalog for the instruction set, and mach adds only which of its
-rows the compiler emits against. The spirv names are mach's own until a catalog
-names them. A name may cover several rows, as llvm's aarch64 `aes` covers
+rows the compiler emits against. A name may cover several rows, as llvm's aarch64 `aes` covers
 `FEAT_AES` and `FEAT_PMULL` and `sha2` covers `FEAT_SHA1` and `FEAT_SHA256`: in
 `ext` and `#[extension(...)]` it selects every row it covers, and
 `$mach.build.ext.<name>` answers for the one row it stands for, the one that
@@ -443,19 +442,14 @@ selection mach never emits, and `f` and `d` select the float register file and t
 calling convention's float registers, and `zkt` is a promise about the machine's
 execution timing that the constant-time rows read, so none of them may be named in
 [`#[extension(...)]`](decorators.md#extnames--an-outlier-function); the
-refusal says why. So are spirv `Float16`, `Int8`, `Int16`, `Int64` and `Float64`,
-the device features that let the whole module use a type of that width, and spirv
-`StorageImageReadWithoutFormat` and
-`StorageImageWriteWithoutFormat`, the device features that let a storage image of
-`Unknown` format be read and written, spirv `StorageImageMultisample`, the
-device feature that lets a storage image be multisampled, spirv
-`MinLod` and `ImageGatherExtended`, the device features
-that let a sample clamp its level of detail and a gather take a run-time offset, and spirv `VulkanMemoryModel` and
-`VulkanMemoryModelDeviceScope`, the device features that select the Vulkan memory
-model for the whole module and let it use the `Device` scope, and spirv
-`PhysicalStorageBufferAddresses`, the device feature that lets a module hold physical
-pointers. Every x86_64 and aarch64 row, and riscv `m`, `a`,
-`zicond`, `zicsr`, `zifencei`, `zfhmin` and `zfh`, may be.
+refusal says why. Neither may any spirv name, capability, extension or version
+alike: a SPIR-V module declares each capability and extension it holds once, for
+every function in it (SPIR-V 2.4, logical layout of a module), so whatever one
+function would select the whole module holds, and only the target's `ext` selects
+it. Every x86_64 and aarch64 row, and riscv `m`, `a`,
+`zicond`, `zicsr`, `zifencei`, `zfhmin` and `zfh`, may be. Which rows are the
+target's alone, and why, is masc's catalog of the instruction set (its
+generator's `target-only.txt`).
 
 Selecting an extension is a promise about **every** machine the binary runs on. The
 inline assembler admits the extension's mnemonics anywhere in the build, and a host
@@ -793,8 +787,11 @@ the compiler derives the minimal capability set a module needs and refuses a
 module that needs more than the ceiling, naming the capability and the
 environment. The ceiling only admits a capability. One that Vulkan leaves to an
 optional device feature also needs the target to select that feature, as below.
-Without `env` a module is written as SPIR-V 1.6 with no ceiling, and holds every
-feature.
+Without `env` a module is written as SPIR-V 1.6 with no ceiling, and holds what
+`vulkan1.3` selects and every device feature these pages name: the type features, the
+8- and 16-bit storage features, the image features, the atomic features, the subgroup
+features and the variable pointer features. It holds no capability of a kernel and no
+vendor extension, which a target names in its `ext`.
 
 Vulkan's `shaderZeroInitializeWorkgroupMemory` is core from `vulkan1.3`. It enables
 no capability, so no `ext` name states it, and a target for an earlier version

@@ -44,12 +44,15 @@ on it: on `spirv` a staged function becomes an `OpEntryPoint` with the matching
 execution model, and on a machine target the stage is ignored and the function is
 compiled normally.
 
-A module that declares any stage is a **shader module**, and that changes the whole
-artifact rather than just the one function. A shader module carries entry points
-and no external linkage at all; a module with no stage is a **library module**,
-which publishes each function as a linkage export so a consumer can find it. The
-two are exclusive — a Vulkan consumer refuses a module carrying linkage — so
-adding the first `#[gpu.stage(...)]` to a module stops it exporting its functions.
+Whether a build makes a **shader module** or a **library module** is the artifact's
+[`kind`](manifest.md#artifactname), not the source's, so one source set can build both.
+A `module` artifact is a shader module: mink's link joins the build's objects into one
+module that carries the entry point of every stage and no external linkage at all,
+since a Vulkan consumer refuses a module carrying linkage, and a `module` that holds
+no stage is refused. An `object` artifact is a library module: each object keeps the
+`Linkage` capability and publishes each function as a linkage export, so a later link
+can find it, and no Vulkan consumer takes it as it is. Adding a `#[gpu.stage(...)]` to
+a source does not change which of the two a build makes.
 
 The entry point's name, as a pipeline-creation call looks it up, is the function's
 **bare source name** (`vertex_main` above), not a mangled linker symbol. A shader
@@ -151,9 +154,12 @@ input/output marker to pair with `gpu.builtin`, and none that could disagree wit
 The **type** is a property of the built-in too, and it is a requirement rather
 than a suggestion: the pipeline binds the variable itself, so a wider or narrower
 one is an invalid module rather than a wasteful one. Declaring a built-in at any
-other type is a compile error naming both the declared type and the required one.
-The scalar integer rows accept `i32` as well as `u32`, because the compiler carries
-an integer's width and not its sign and the emitted type is sign-less either way.
+other type is a compile error naming both the declared type and the required one,
+on every target, since the type is the built-in's and not the target's.
+The integer rows accept `i32` as well as `u32`, and `i32x3` as well as `u32x3`,
+because the compiler carries an integer's width and not its sign, the emitted type
+is sign-less either way, and the Vulkan environment asks of each only that its
+components be 32-bit integers.
 
 The **stage** is a property of the built-in as well. Each row exists in the stages
 SPIR-V defines it in, in its direction: the pipeline supplies an input built-in to
@@ -177,12 +183,18 @@ host wrote. Wrap a single value in a one-field record.
 `gpu.uniform` binds a read-only one. Both must be a `rec` for the same reason, and both
 are emitted as a `Block`-decorated struct with an explicit offset on every member.
 
-They differ in one place: their **layout rules**. A uniform block follows
-std140-shaped rules, under which an array's stride is rounded up to 16 — which
-mach's own layout does not do, so an array of anything narrower than 16 bytes is
-refused rather than silently repacked. A storage buffer follows std430-shaped
-rules, which use the element's natural stride, and that *is* mach's layout, so
-`[8]f32` is fine in a `gpu.storage` block and rejected in a `gpu.uniform` one.
+They differ in one place: their **layout rules**. A block keeps mach's own layout,
+and the layout is held to the rules Vulkan holds its class to, refused where it
+breaks them rather than silently repacked. A uniform block follows std140-shaped
+rules, under which an array's stride is rounded up to 16 — which mach's own layout
+does not do, so an array of anything narrower than 16 bytes is refused. A storage
+buffer follows std430-shaped rules, which use the element's natural stride, as
+mach's layout does, so `[8]f32` is fine in a `gpu.storage` block and rejected in a
+`gpu.uniform` one. Both place a vector at a multiple of its own alignment, twice its
+lane's for two lanes and four times for three or four; from SPIR-V 1.3, which
+Vulkan 1.1 takes with relaxed block layout, a vector member may sit at any multiple
+of its lane's size that keeps it within one 16-byte line. The refusal names the
+first byte the layout places where the rules would not.
 
 A compute stage's data path is `gpu.storage`: Vulkan forbids the `Output` storage class
 in a compute execution model, so a compute shader reads and writes buffers rather
@@ -263,7 +275,9 @@ selects (see [manifest.md](manifest.md#finished-module-targets)):
   image's `OpImageRead` and `OpImageWrite` carry `MakeTexelVisible` or
   `MakeTexelAvailable` with `NonPrivateTexel` the same way. A storage image handed to
   a function as a parameter carries no qualifier into it, so every image read and
-  write in such a function is coherent in a module that binds a coherent image.
+  write in such a function is coherent in a module that binds a coherent image, and
+  likewise every load and store through a pointer parameter into buffer memory is
+  coherent in a module that binds a coherent buffer.
 
 ```mach
 rec Counters { done: u32; }
@@ -371,13 +385,10 @@ fun shadow_lod(s: ShadowSampler, uv: f32x2, depth: f32, mask: u32, lod: f32) f32
 fun shadow_gather(s: ShadowSampler, uv: f32x2, depth: f32, mask: u32, offset: i32x2) f32x4;
 ```
 
-The projective forms, `OpImageSampleProj*` and `OpImageSampleProjDref*`, have no
-row. Each divides the coordinate, and a comparison's reference, by the
-coordinate's last component before sampling, which a shader writes as that
-division and passes to the plain form: they add no sampling a row here does not
-already give, HLSL, MSL and WGSL have none, and each brings its own refusals (no
-`Cube` image, no arrayed one). A declaration naming one is refused as an
-instruction the target does not define.
+The projective forms, `OpImageSampleProj*` and `OpImageSampleProjDref*`, are rows
+like any other. Each divides the coordinate, and a comparison's reference, by the
+coordinate's last component before sampling, so its coordinate has one component
+more than the plain form's, and SPIR-V admits no `Cube` or arrayed image for one.
 
 `gpu.push` binds a **push-constant block**, a small `rec` the host supplies with the
 command that records a dispatch or draw rather than through a descriptor, so it
@@ -538,7 +549,10 @@ compiler treats it:
   that is exactly what keeps the host's value live.
 - A **store to it is refused**, naming the line that wrote it. On the GPU it is a
   constant once the pipeline exists, so there is nothing to write. Copy it into a
-  local to change the value. Handing its address to a function counts as a store.
+  local to change the value. **Taking its address is refused** too, on every target:
+  where a target states it each read is the constant itself, so there is no storage
+  for an address to name, and an address handed on would count as a store. Pass the
+  value, or copy it into a local and take that address.
 
 The type must be a scalar integer or float. There is no boolean specialization
 constant, because mach has no boolean type the compiler knows: `bool` is an alias
@@ -584,7 +598,8 @@ takes a number and a string naming one of its grammar's enumerants where the row
 takes an enumerant (`"2D"`, `"Rgba8"`), except where the kind's part
 takes a **type**: there the operand is a type name, the only place a decorator
 argument is read as a type rather than as a value. An image's texel and a
-cooperative matrix's component are a scalar written as itself (`f32`), and a
+cooperative matrix's component are a scalar written as itself (`f32`) or through an
+alias of one, and a
 constructor that composes over another handle names that handle, so a composing
 declaration names what it wraps instead of restating it, which keeps the two from
 disagreeing. The named type must be a handle the same target mints, of the kind that
@@ -621,7 +636,8 @@ must be strings on every target, but the instruction set and name are checked on
 when the named target is the one selected: a declaration for any other target is
 inert, and that target's table is not consulted. When it is checked, the parameter
 count is held to the instruction's own operand count, which is not uniform across a
-family that looks it.
+family that looks it, and a count outside it is refused with `op.operand_count` at
+each call, where the declaration is read against the target's table.
 
 | Set              | Meaning                                                     |
 |------------------|-------------------------------------------------------------|
@@ -652,8 +668,8 @@ selected the declaration's types are checked against both:
 
 A **pointer operand takes its storage class from the call site**: the argument's
 own access chain decides whether it points into a storage buffer, workgroup memory,
-a function-local object or an image, since an `intrinsic` has no body and so no boundary at
-which its parameter's pointer could be given one. Any access chain is accepted, a
+a function-local object or an image, since on its target an `intrinsic` is the instruction
+and never a body, so there is no boundary at which its parameter's pointer could be given one. Any access chain is accepted, a
 member or element as well as a whole object. The kinds are also what the
 `"readonly"` and `"writeonly"` qualifiers of a `gpu.storage` binding are checked
 against: an atomic load through a `readonly` binding is accepted and an atomic add
@@ -692,10 +708,14 @@ level. `OpControlBarrier` takes an execution scope, a memory scope and memory
 semantics, and `OpMemoryBarrier` a memory scope and semantics, each an integer
 constant. A memory scope and memory semantics are held to the module's memory model:
 under the Vulkan model the `Device` scope needs the `VulkanMemoryModelDeviceScope`
-extension, and under GLSL450 the `QueueFamily` scope and the `MakeAvailable`,
-`MakeVisible` and `Volatile` semantics need `VulkanMemoryModel` (see
+extension, declared where the target selects it and refused with `spirv.capability`
+naming it where it does not, and under GLSL450 the `QueueFamily` scope and the
+`MakeAvailable`, `MakeVisible` and `Volatile` semantics need `VulkanMemoryModel`,
+which a target selecting it would have written under the Vulkan model, so each is
+refused with `spirv.capability` naming it (see
 [manifest.md](manifest.md#finished-module-targets)). An atomic's scope and semantics
-are held the same way. The execution scope is not, since a Vulkan barrier executes
+are held the same way, the compiler's own atomics included, which take the `Device`
+scope. The execution scope is not, since a Vulkan barrier executes
 at `Workgroup` or `Subgroup` only. `SequentiallyConsistent` semantics are refused under
 either model, since Vulkan defines no sequentially consistent order
 (VUID-StandaloneSpirv-MemorySemantics-10866): use `Acquire`, `Release` or
@@ -751,7 +771,7 @@ checked at the call, where the literal's value is known:
 A device feature is an extension the target names in its `ext` once the
 consumer enables it, since no environment guarantees it: `GroupNonUniformArithmetic` is
 enabled by Vulkan's `VK_SUBGROUP_FEATURE_ARITHMETIC_BIT`, and a target naming no `env` holds
-every extension. A module declares a capability only when something it emits needs
+every device feature these pages name ([manifest.md](manifest.md#finished-module-targets)). A module declares a capability only when something it emits needs
 it, with `OpExtension` for a capability a SPIR-V extension defines.
 
 A call that passes a pointer into a `#[gpu.storage]` binding, or into any part of
