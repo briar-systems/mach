@@ -36,7 +36,7 @@ fun fragment_main() {}
 A staged function **takes no parameters and returns nothing**. A pipeline stage
 does not have a caller: its inputs arrive through input interface variables and
 its results leave through output ones, so there is no argument list or return
-value to carry them. A staged function with either is rejected.
+value to carry them. A `spirv` build rejects a staged function with either.
 
 The decorator is accepted on every target, because which target a module is built
 for is not a property of its source. Only a target that has pipeline stages acts
@@ -252,9 +252,10 @@ fun fill(i: u32, x: u32) {
 }
 ```
 
-The inference is one-sided on purpose. Anything the compiler cannot follow, such as
-the binding's address handed to a function, counts as a write, so a missing
-decoration is possible and a wrong one is not.
+The inference is one-sided on purpose. It follows the binding's address into every
+function it is handed to, since every module of an artifact is one unit, and anything
+it cannot follow counts as a write, so a missing decoration is possible and a wrong
+one is not.
 
 `"writeonly"` is the mirror: it says that nothing reads the binding, and the buffer
 is emitted `NonReadable`.
@@ -587,8 +588,10 @@ bytes as a `VkBool32`:
 var use_fog: u32 = 1;
 ```
 
-A narrower integer such as `u8` works too, but it needs the capability for its
-width like any other `u8` in a shader. On `spirv` each one becomes an
+A narrower integer such as `u8` works too, and is carried like any other `u8` in a
+shader: under the capability for its width it is a constant of its own width, and
+without it a 32-bit one, so the host supplies as many bytes as the constant the
+module states. On `spirv` each one becomes an
 `OpSpecConstant` whose literal is the initializer, decorated with `SpecId`, and a
 read uses that constant directly with no load. Two `#[gpu.spec]` vars with one id that
 one SPIR-V module reads are refused, whichever source modules declare them, since the
@@ -846,7 +849,11 @@ pub fun atomic_add64(p: *u64, scope: u32, semantics: u32, v: u64) u64;
 pub fun atomic_fadd(p: *f32, scope: u32, semantics: u32, v: f32) f32;
 ```
 
-A 32-bit integer atomic is core in every storage class. Every other type needs the
+An atomic operates on buffer memory, workgroup memory or a storage image texel, the
+storage classes Vulkan admits one in (`VUID-StandaloneSpirv-None-04686`), and one on
+any other memory, a local or a module-scope `var` among it, is refused with
+`spirv.capability`, naming the class. A 32-bit integer atomic is core in each of
+them. Every other type needs the
 capability of its row, named in the target's `ext`, and the consumer enables the
 Vulkan device feature of its storage class that provides it, named for its
 `shaderBuffer*`, `shaderShared*` or `shaderImage*` member: buffer memory

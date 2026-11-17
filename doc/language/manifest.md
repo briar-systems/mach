@@ -747,14 +747,15 @@ names does when it is laid after them.
 
 ### Finished-module targets
 
-A `spirv` target's artifact is a `module`. Each source module is written to
-`<out>/obj/<fqn-as-path>.o` like any other target's objects, and each generic instance
-the stages reach is compiled in an object of its own beside them, so an object is a
-link input that carries the `Linkage` capability and is not a module a Vulkan consumer
-takes. mink's SPIR-V link joins them into one module at the artifact's resolved `out`
-(or `-o`), giving each id its index and laying out no sections, and drops the
-`Linkage` capability and every linkage decoration, so the module it writes is the
-deliverable. `--emit obj` stops at the objects:
+A `spirv` target's artifact is a `module`. Every source module the artifact holds,
+its dependencies' and the generic instances its stages reach included, compiles as one
+unit into one object, `<out>/obj/<entry module path>.o`, since the rules of a finished
+module span it whole. That object is a link input that carries the `Linkage`
+capability and is not a module a Vulkan consumer takes. mink's SPIR-V link writes it
+as one module at the artifact's resolved `out` (or `-o`), giving each id its index and
+laying out no sections, and drops the `Linkage` capability and every linkage
+decoration, so the module it writes is the deliverable. `--emit obj` stops at the
+object:
 
 ```toml
 [target.gpu]
@@ -765,7 +766,7 @@ abi = "shader"
 ```
 
 ```
-mach build . --target gpu     # links the module at the artifact's out, from the objects under out/gpu/<profile>/obj
+mach build . --target gpu     # links the module at the artifact's out, from the object under out/gpu/<profile>/obj
 ```
 
 With `debug` on, each module carries its debug information inside it, written only with
