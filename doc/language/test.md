@@ -162,7 +162,7 @@ run are:
 --list                   list the collected tests and exit
 --diagnostics <human|json>  write failures and the run's records to stderr as text or NDJSON
 --runner <cmd>           launch each test through a host-side command, in place of the target's runner
---timeout <duration>     terminate a test and its process group after the duration
+--timeout <duration>     stop each test after the duration (default: 60s)
 --allow-unrunnable       exit 0 when nothing selected can run on this host, after building it
 ```
 
@@ -211,12 +211,18 @@ test dispatcher`).
 
 ### Timeouts
 
-`--timeout <duration>` bounds each spawned test process independently, from
-its own spawn, on its whole process group, so a process the test started dies
-with it. A test that exceeds the bound is the distinct outcome **timed out**:
-it renders as `(timed out after <duration>)`, is counted separately on the
-summary line, and is still a failing test for the exit code, so the suite
-exits `1`.
+Every test runs under a bound, 60 seconds unless `--timeout <duration>` gives
+another. The bound applies to each spawned test process independently, from
+its own spawn. Tests declare no time limits of their own: a test that waits for
+an event waits, and one that hangs is ended by its bound. When the bound
+passes, the test's process group is asked to stop (`SIGTERM` on Linux and
+macOS) and the test process itself is killed, so a process the test started
+ends with it unless that process ignores the request. On Windows the test's
+job object is terminated, which ends every process in it. A test that exceeds
+the bound is the distinct outcome **timed out**: it renders as
+`(timed out after <duration>)` with its `rerun:` command, is counted
+separately on the summary line, and is still a failing test for the exit code,
+so the suite exits `1`.
 
 ```
 failures:
@@ -227,8 +233,9 @@ failures:
 
 `<duration>` is a positive integer followed by a unit: `ms`, `s`, `m` or `h`
 (`30ms`, `30s`, `5m`, `1h`). A bare number, a fraction, zero or any other
-unit is a usage error naming the accepted forms. There is no default: omitting
-the flag leaves every test unbounded.
+unit is a usage error naming the accepted forms, so no value removes the bound.
+The default is rendered in the largest whole unit, so a test that reaches it
+reports `(timed out after 1m)`.
 
 ### JSON output
 

@@ -228,7 +228,7 @@ A `test` record adds how it ended:
 |---|---|---|
 | `outcome` | string | `"pass"`, `"skip"`, `"exit"`, `"signal"`, `"timeout"`, `"spawn"` or `"other"` |
 | `code` | integer | its exit code, or `0` when it has none |
-| `timeout_ns` | integer | the `--timeout` bound in nanoseconds, `0` when unbounded |
+| `timeout_ns` | integer | the bound it exceeded in nanoseconds when its outcome is `"timeout"`, otherwise `0` |
 | `duration_ns` | integer | how long it ran, in nanoseconds |
 | `exe` | string | the dispatcher that ran it |
 | `output` | string or `null` | the file holding its captured output, kept for a test that failed |
