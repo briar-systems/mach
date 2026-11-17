@@ -102,6 +102,9 @@ Rules:
 - Each arm gate of a comptime-parameter `$if` must itself be comptime-foldable:
   its identifiers must all be comptime (the comptime parameters or comptime
   constants). A gate referencing a runtime local/parameter is rejected.
+- Any gate is refused with `gate.runtime_value` at a run-time binding it reads,
+  and with `gate.not_constant` when it has no compile-time value for another
+  reason, such as a call.
 - A comptime parameter has no storage, so its address cannot be taken
   (`?$mode` is rejected with `cannot take the address of a comptime parameter`).
 - A comptime-parameter function is a template, not a value: it can only be

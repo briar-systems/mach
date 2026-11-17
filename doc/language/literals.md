@@ -64,8 +64,8 @@ fun total() u32 {
 }
 ```
 
-A literal outside the range of the type its suffix declares is rejected,
-with the range named. A leading `-` is part of the range check, so the
+A literal outside the range of the type its suffix declares is rejected
+with `literal.out_of_range`, with the range named. A leading `-` is part of the range check, so the
 most negative value of a signed type is written the way it reads:
 
 ```mach error literal 128 is out of range for i8

@@ -80,9 +80,10 @@ an element or a window `A[start, n]` of one), and each member is built the same
 way, down to leaves that are compile-time scalars, strings, `nil`, a function
 named bare, or the address `?place` of a module-level function, `val` or `var`
 or of a field or element of one. An address leaf keeps its symbol, so it crosses
-modules like any other member. A leaf that has no compile-time value, such as a
-call or the address of a place behind a pointer, is rejected at that leaf with
-the reason it has none.
+modules like any other member. An initializer, or a leaf of one, that has no
+compile-time value, such as a call or the address of a place behind a pointer,
+is rejected at that leaf with `global.init_not_constant`, noting the reason it
+has none.
 
 A scalar read through such a constant is a compile-time constant too: a field, a
 nested member, or an element of a record or array `val`, this module's or an

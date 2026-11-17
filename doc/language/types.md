@@ -552,6 +552,10 @@ of a declared record, union or tag (`#[volatile]`, see
 [decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access)),
 so an access through `*T` is volatile exactly when `T`'s storage is.
 
+`ptr` is an address with no pointee type. Nothing is read or written through it:
+a dereference, an index or a member access on a `ptr` is refused with
+`ptr.untyped_access`. Cast it to a typed pointer (`p::*u64`) first.
+
 ### Pointers on SPIR-V
 
 A SPIR-V target has two kinds of pointer, and mach spells both `*T`. The compiler
