@@ -191,9 +191,10 @@ does not do, so an array of anything narrower than 16 bytes is refused. A storag
 buffer follows std430-shaped rules, which use the element's natural stride, as
 mach's layout does, so `[8]f32` is fine in a `gpu.storage` block and rejected in a
 `gpu.uniform` one. Both place a vector at a multiple of its own alignment, twice its
-lane's for two lanes and four times for three or four; from SPIR-V 1.3, which
-Vulkan 1.1 takes with relaxed block layout, a vector member may sit at any multiple
-of its lane's size that keeps it within one 16-byte line. The refusal names the
+lane's for two lanes and four times for three or four; under `vulkan1.1` and later,
+and with no `env`, whose relaxed block layout Vulkan 1.1 took into its core, a vector
+member may sit at any multiple of its lane's size that keeps it within one 16-byte
+line. `vulkan1.0` holds no relaxed layout. The refusal names the
 first byte the layout places where the rules would not.
 
 A compute stage's data path is `gpu.storage`: Vulkan forbids the `Output` storage class

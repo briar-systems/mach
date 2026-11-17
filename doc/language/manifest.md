@@ -782,12 +782,12 @@ names and source lines.
 
 `env` is a general target key whose values are owned by the target's isa; a
 `spirv` target uses it to declare the environment its modules are consumed in.
-The environment fixes the SPIR-V version word and the capability ceiling:
-the compiler derives the minimal capability set a module needs and refuses a
-module that needs more than the ceiling, naming the capability and the
-environment. The ceiling only admits a capability. One that Vulkan leaves to an
+The environment fixes the SPIR-V version word and the capability bound (the table
+below): the compiler derives the minimal capability set a module needs and refuses a
+target that selects more than the bound, naming the capability and the
+environment. The bound only admits a capability. One that Vulkan leaves to an
 optional device feature also needs the target to select that feature, as below.
-Without `env` a module is written as SPIR-V 1.6 with no ceiling, and holds what
+Without `env` a module is written as SPIR-V 1.6 with no bound, and holds what
 `vulkan1.3` selects and every device feature these pages name: the type features, the
 8- and 16-bit storage features, the image features, the atomic features, the subgroup
 features and the variable pointer features. It holds no capability of a kernel and no
@@ -851,8 +851,9 @@ No environment selects a type's feature, since every Vulkan version leaves them
 optional: `Int8`, `Int16`, `Int64`, `Float16` and `Float64` are Vulkan's
 `shaderInt8`, `shaderInt16`, `shaderInt64`, `shaderFloat16` and `shaderFloat64`,
 and the target selects one with `ext` when its consumer enables it. A module
-without `env` has all five. The ceiling below still bounds them, so `Int8` or
-`Float16` under `vulkan1.0` is refused for the environment, not the feature.
+without `env` has all five. The bound below still holds them, and every Vulkan
+version admits all five, `Int8` and `Float16` through `VK_KHR_shader_float16_int8`
+before Vulkan 1.2 took them into its core.
 
 Under `Float16` an `f16` is the native `OpTypeFloat 16` wherever it lives, computed,
 negated and converted by the core float instructions, so an `f16` shader needs
@@ -919,23 +920,28 @@ env        = "vulkan1.0"
 ext = ["Int16", "Int64", "Float64"]
 ```
 
-| `env` | SPIR-V | capabilities the ceiling admits |
+| `env` | SPIR-V | capabilities the bound admits beyond the floor |
 |---|---|---|
-| `vulkan1.0` | 1.0 | Int16, Int64, Float64, Sampled1D, SampledCubeArray, Image1D, ImageCubeArray, SampledBuffer, ImageBuffer, StorageImageExtendedFormats |
-| `vulkan1.1` | 1.3 | same as `vulkan1.0` |
-| `vulkan1.2` | 1.5 | the above plus Int8, Float16 |
-| `vulkan1.3` | 1.6 | same as `vulkan1.2` |
+| `vulkan1.0` | 1.0 | Geometry, Tessellation, Float16, Float64, Int64, Int64Atomics, Int16, Int8, TessellationPointSize, GeometryPointSize, ImageGatherExtended, StorageImageMultisample, the four `*ArrayDynamicIndexing` of uniform buffers, sampled images, storage buffers and storage images, ClipDistance, CullDistance, ImageCubeArray, SampleRateShading, SparseResidency, MinLod, SampledCubeArray, ImageMSArray, StorageImageExtendedFormats, InterpolationFunction, TransformFeedback, GeometryStreams, StorageImageReadWithoutFormat, StorageImageWriteWithoutFormat, MultiViewport |
+| `vulkan1.1` | 1.3 | the above plus the eight `GroupNonUniform*`, DrawParameters, the four 16-bit storage capabilities, DeviceGroup, MultiView, VariablePointersStorageBuffer, VariablePointers |
+| `vulkan1.2` | 1.5 | the above plus ShaderLayer, ShaderViewportIndex, the three 8-bit storage capabilities, the five float controls, ShaderNonUniform, RuntimeDescriptorArray and the descriptor indexing capabilities, VulkanMemoryModel, VulkanMemoryModelDeviceScope, PhysicalStorageBufferAddresses |
+| `vulkan1.3` | 1.6 | the above plus DemoteToHelperInvocation and the four `DotProduct*` |
 
-The ceiling is what a conforming implementation of that Vulkan version can
-enable through core device features alone, with no device extension: from the Vulkan
-specification's "Vulkan Environment for SPIR-V" appendix, the capabilities table
-maps `Int64`, `Int16`, `Float64` and `SampledCubeArray` to the `shaderInt64`,
-`shaderInt16`, `shaderFloat64` and `imageCubeArray` features of Vulkan 1.0,
-`ImageCubeArray` to `imageCubeArray` as well, `Sampled1D`, `Image1D`,
-`SampledBuffer`, `ImageBuffer` and `StorageImageExtendedFormats` to core, and `Int8` and `Float16` to `shaderInt8` and
-`shaderFloat16`, which became core features in Vulkan 1.2 (promoted from
-`VK_KHR_shader_float16_int8`). The SPIR-V version per Vulkan version is the
-appendix's required version: 1.0, 1.3, 1.5 and 1.6.
+The bound is what the Vulkan specification's "Vulkan Environment for SPIR-V"
+appendix lets a module of that version declare, through a core feature or a
+device extension the version can enable, as SPIRV-Tools validates a module for
+it. A capability past the bound that a SPIR-V extension enables, as
+`VulkanMemoryModel` and `PhysicalStorageBufferAddresses` are below SPIR-V 1.5,
+is held where the target selects it: a capability SPIR-V took into its core at
+a later version brings the extension it was enabled by with it, so a target for
+`vulkan1.1` naming `StorageBuffer16BitAccess` or `VulkanMemoryModel` declares
+`SPV_KHR_16bit_storage` or `SPV_KHR_vulkan_memory_model` as well. An extension
+that needs a later SPIR-V version than the environment's is refused, as
+`SPV_KHR_vulkan_memory_model`, which needs SPIR-V 1.3, is for `vulkan1.0`, and so
+is a capability the bound does not admit and no extension enables, as `Kernel`.
+The refusal is `spirv.capability`, naming what the target selects and the
+environment, whether or not a module uses it. A target without `env` states no
+bound.
 
 ```toml
 [target.gpu]
