@@ -68,10 +68,23 @@ out/linux-x86_64/debug/bin/mach fmt .
 out/linux-x86_64/debug/bin/mach check .
 ```
 
-The compiler carries no tests of its own: no unit `test` blocks, no goldens
-and no corpus. `mach test` and the language's `test` blocks are features for
-the projects Mach builds. CI is the build: it walks the bootstrap chain and
-builds the compiler with itself, and nothing else.
+The compiler's tests are a corpus under `test/`, one program a file, with no
+project around any of them. A file under `run/` builds for every target and
+exits 0 where the host can run it. A file under `refuse/` is refused with the
+diagnostic kind its first line names. A file under `gpu/` builds for the shader
+targets. Each file under `target/` names a target's flags and states what
+`mink dump` must show of every artifact built for it. One driver runs it all
+through the compiler you just built, with the `mink` on `PATH` unless `--mink`
+names another:
+
+```bash
+python3 test/run.py --mach out/linux-x86_64/debug/bin/mach
+```
+
+The compiler carries no unit `test` blocks and no goldens. `mach test` and the
+language's `test` blocks are features for the projects Mach builds. CI is the
+build: it walks the bootstrap chain and builds the compiler with itself, and
+nothing else.
 
 The tree is canonical: `mach fmt .` must leave it unchanged before a pull
 request is opened (`mach fmt --check .` reports what differs).
