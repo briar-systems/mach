@@ -422,7 +422,10 @@ which `vulkan1.3` accepts and an earlier `env` accepts only with the
 `StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat` extensions (see
 [manifest.md](manifest.md#instruction-set-extensions)). A format must match the
 texel scalar: a float or normalized format is read as `f32`, a signed integer
-format as `i32` and an unsigned one as `u32`. `R64ui` and `R64i` hold 64-bit texels,
+format as `i32` and an unsigned one as `u32`. A module declares its integer types without
+signedness, so an instruction reading or writing the texels of a signed integer
+format sets the `SignExtend` image operand, which SPIR-V 1.4 brings, and a target
+for `vulkan1.0` or `vulkan1.1` is refused for one with `spirv.capability`. `R64ui` and `R64i` hold 64-bit texels,
 the texel scalar `u64` or `i64`, and declare `Int64ImageEXT`, which needs the
 `Int64ImageEXT` and `SPV_EXT_shader_image_int64` extensions.
 
@@ -446,8 +449,9 @@ it is refused on `1D`, `3D`, `Cube` and `Buffer`. A multisampled image is never
 sampled, so a `sampled_image` cannot compose over one, and its texels are read per
 sample with the `Sample` image operand (see [decorators.md](decorators.md)). A
 multisampled sampled image needs no capability. A multisampled storage image
-declares `StorageImageMultisample`, and an arrayed one `ImageMSArray` too, under
-the `StorageImageMultisample` extension.
+declares `StorageImageMultisample`, and an arrayed one `ImageMSArray` too, each
+under the extension of its name: Vulkan's `shaderStorageImageMultisample` enables
+both, so a target whose consumer enables it names both.
 
 The operands are ordinary comptime constants, except where the constructor's part
 takes a **type name**. An image's texel scalar is the scalar itself (`f32`) or an

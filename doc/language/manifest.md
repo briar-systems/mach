@@ -836,8 +836,9 @@ feature.
 No environment selects `StorageImageMultisample`, Vulkan's
 `shaderStorageImageMultisample`, which every version leaves optional. A module
 declaring a multisampled storage image is refused unless the target selects it,
-and with it the module declares `StorageImageMultisample`, and `ImageMSArray` as
-well for an arrayed one. A multisampled sampled image needs no feature.
+and with it the module declares `StorageImageMultisample`. An arrayed one declares
+`ImageMSArray` as well, which the same Vulkan feature enables and the target
+selects by its own name. A multisampled sampled image needs no feature.
 
 No environment selects `MinLod` either, Vulkan's `shaderResourceMinLod`. A
 sample passing the `MinLod` image operand is refused unless the target selects it,

@@ -224,8 +224,9 @@ var palette: Palette;
 
 A store through a `"readonly"` binding is a compile error on every target, naming
 the line that wrote it. That is what the qualifier buys over what the compiler
-works out on its own: a buffer no body in the module stores through is emitted with
-the SPIR-V `NonWritable` decoration whether or not it is marked, and Vulkan reads
+works out on its own: a buffer or storage image no body in the module stores
+through is emitted with the SPIR-V `NonWritable` decoration whether or not it is
+marked, an atomic through a texel pointer counting as a store to its image, and Vulkan reads
 that decoration to decide whether a stage needs `vertexPipelineStoresAndAtomics`.
 So an accidental write does not produce a wrong module, it produces a **correct one
 that quietly costs a hardware feature**. Marking the binding turns that into a
@@ -695,7 +696,10 @@ on it is refused, and an atomic store into a `writeonly` binding is accepted and
 atomic load from it is refused. A handle passed as an ordinary value names its
 descriptor and touches none of its memory, and a handle read or write is checked the
 same way, so `OpImageWrite` into a `"readonly"` storage image and `OpImageRead` from a
-`"writeonly"` one are refused.
+`"writeonly"` one are refused. An atomic through a texel pointer `OpImageTexelPointer` makes is an
+access of the storage image the pointer points into, so an atomic add through one
+into a `"readonly"` image is refused, and so is any atomic but a store through one
+into a `"writeonly"` image.
 
 A non-constant argument to a constant id or a literal is refused at the call,
 naming the operand. A row **without a result** is declared with no return type,
