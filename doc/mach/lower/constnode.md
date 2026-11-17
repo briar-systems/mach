@@ -6,7 +6,8 @@ a published constant value laid out as the constant bytes of its type: a record'
 their offsets, a tag's case code and payload, an array's or a vector's elements at the
 element stride, a string leaf as a pointer to its bytes, and an address as a relocation
 against the symbol it points into. the bytes become one mirl constant: runs of bytes
-between the addresses, each address at its offset
+between the addresses, each address at its offset, or under logical addressing, which
+reinterprets no memory, a constant of the type itself, read member by member from them
 
 Source: [`src/lower/constnode.mach`](../../../src/lower/constnode.mach)
 

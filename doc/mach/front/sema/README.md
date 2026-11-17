@@ -5,6 +5,7 @@
 | Module | |
 | :--- | :--- |
 | [`abitype`](abitype.md) | `#[abi_type]` declarations: C types whose layout the target supplies, such as `va_list` |
+| [`builtin`](builtin.md) | the built-ins a `#[gpu.builtin]` names: the spir-v built-in each stands for, whether a stage writes it, and the type the pipeline binds it at, which type checking holds a declaration to and lowering spells the built-in by |
 | [`capability`](capability.md) | the comptime capabilities a sema walk publishes for each of its phases |
 | [`check`](check.md) | the type rules sema holds each site to: assignments, calls, indexes, members and casts |
 | [`coerce`](coerce.md) | literal coercion, and the rule for when a value of one type may be assigned to another |

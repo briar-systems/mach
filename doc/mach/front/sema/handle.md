@@ -24,7 +24,8 @@ Uses types from [`mach.front.ast.decl`](../ast/decl.md), [`mach.front.ast.id`](.
 
 | Functions | |
 | :--- | :--- |
-| [`arg_is_type`](#arg_is_type), [`read`](#read), [`read_dnit`](#read_dnit), [`validate`](#validate), [`type_of`](#type_of) | |
+| [`arg_is_type`](#arg_is_type) | whether a handle operand names a type, which is read as one and never as a value |
+| [`read`](#read), [`read_dnit`](#read_dnit), [`validate`](#validate), [`type_of`](#type_of) | |
 | [`check_annotation_handles_all`](#check_annotation_handles_all) | every annotation's check shares one walk, so a type that several annotations spell, as a chain of defs each over the one before does, is walked once rather than once per annotation |
 | [`scan_begin`](#scan_begin), [`type_carries_handle`](#type_carries_handle) | |
 | [`annotation_refuses_indirection`](#annotation_refuses_indirection) | a binding whose written annotation holds a chain of pointers over a handle has drawn that annotation's refusal, and a binding whose type is inferred has no annotation to draw it |
@@ -56,6 +57,8 @@ pub def ReadStatus: u8
 ```mach
 pub fun arg_is_type(sc: *mach.front.sema.context.SemaContext, dec: *mach.front.ast.decl.Decorator, index: u32) bool
 ```
+
+whether a handle operand names a type, which is read as one and never as a value
 
 ### read
 
