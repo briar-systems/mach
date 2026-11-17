@@ -17,7 +17,7 @@ Version 6.10.1.
 | [`front/`](front/README.md) | the front end: the lexer, the parser and the syntax tree, module loading and name resolution, comptime evaluation, decorators, type checking, and doc comments |
 | [`host/`](host/README.md) | the host the compiler runs on: every primitive whose spelling differs by the operating system the compiler itself was built for |
 | [`lib/`](lib/README.md) | the entry of the `editor` artifact, which keeps the analysis surface a language server builds on checked, documented and built |
-| [`lower/`](lower/README.md) | lowering of a checked module into one mirl module |
+| [`lower/`](lower/README.md) | lowering of checked modules into one mirl module |
 | [`manifest/`](manifest/README.md) | `mach.toml`: its schema and model, loading, the selection of targets, profiles and artifacts, templates, steps, and edits |
 | [`package/`](package/README.md) | the dependency manager behind `mach dep` and `mach init` |
 | [`report/`](report/README.md) | how running work reports itself: the status a phase ends with, the progress readout a command renders, and the results of a test run |
@@ -31,7 +31,7 @@ Version 6.10.1.
 | [`compile`](compile.md) | compiling one project for one build cell: the build, its phases, and analysis for tools |
 | [`editor`](editor.md) | the analysis surface a language server builds on |
 | [`host`](host.md) | the host the compiler runs on: every primitive whose spelling differs by the operating system the compiler itself was built for |
-| [`lower`](lower.md) | lowering of a checked module into one mirl module |
+| [`lower`](lower.md) | lowering of checked modules into one mirl module |
 | [`package`](package.md) | the dependency manager behind `mach dep` and `mach init` |
 | [`session`](session.md) | the compiler session: the state one process keeps across its builds |
 | [`target`](target.md) | what a target builds: the host the compiler names, mink's output kinds as an artifact and a linkage select them, the name an artifact's file takes and what the target's object format holds |

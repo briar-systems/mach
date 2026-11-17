@@ -36,8 +36,8 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`test_restored`](#test_restored) | the module's test object is its cached object under the key this load built |
 | [`test_staged_restored`](#test_staged_restored) | the test object is restored and still staged for the codegen query to publish |
 | [`skips_lowering`](#skips_lowering) | the module is restored and nothing needs its lowered ir |
-| [`lowered_count`](#lowered_count) | the emitted modules the build lowers |
-| [`generated_count`](#generated_count) | the emitted modules the build generates code for |
+| [`lowered_count`](#lowered_count) | the units the build lowers |
+| [`generated_count`](#generated_count) | the units the build generates code for |
 | [`frontend_count`](#frontend_count) | the modules the front end still processes |
 | [`forget`](#forget) | every key, skip decision and record of the previous load is dropped: the next load keys again, and a project that is not keyed processes every module |
 | [`note_written`](#note_written) | the object written to `location` was the `len` bytes at `bytes`: a keyed object under `obj/` is remembered by its digest for the restore that reads it back |
@@ -150,7 +150,7 @@ the module is restored and nothing needs its lowered ir
 pub fun lowered_count(p: *mach.compile.project.Project) u32
 ```
 
-the emitted modules the build lowers
+the units the build lowers
 
 ### generated_count
 
@@ -158,7 +158,7 @@ the emitted modules the build lowers
 pub fun generated_count(p: *mach.compile.project.Project) u32
 ```
 
-the emitted modules the build generates code for
+the units the build generates code for
 
 ### frontend_count
 

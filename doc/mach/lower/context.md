@@ -22,6 +22,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`Unit`](#unit) | `rec` | what mach keeps of a lowered module once its mirl module is compiled and gone: its name and the facts of its functions |
 | [`NormalObject`](#normalobject) | `rec` | a module's test object holds its tests and `#[testing]` declarations beside its normal object, which it never changes |
 | [`ModuleScope`](#modulescope) | `rec` |  |
+| [`SpecClaim`](#specclaim) | `rec` | the `#[gpu.spec]` var that claims a specialization id: the module that declares it, its declaration there and its qualified name |
 | [`EachElement`](#eachelement) | `rec` | the element of a constant array a `$each` loop variable names: the array's expression and the element's index in it, where the element is stored |
 | [`ScopeMark`](#scopemark) | `rec` |  |
 | [`ClassCopy`](#classcopy) | `rec` | a copy of a function whose pointer parameters take the classes its call sites pass, lowered into this module once the module's own declarations are |
@@ -54,6 +55,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`normal_defines`](#normal_defines) | lowering the test object, which declares `name` because the normal object defines it |
 | [`origin_scope`](#origin_scope) | the scope another module's template is read in: the copy its interface publishes, with a comptime scope over its constants that this lowering owns, so what an instance binds stays here |
 | [`scope_enter`](#scope_enter), [`scope_leave`](#scope_leave), [`init_context`](#init_context) | |
+| [`module_enter`](#module_enter) | the context moved into the module `req` names, whose declarations it lowers next into the same mirl module: its scope, the instance set its code is read through and how it reads instances |
 | [`dnit_context`](#dnit_context) | release a lowering context; a nil context holds nothing |
 | [`each_element_of`](#each_element_of) | the element the innermost `$each` loop variable `name` names |
 | [`interface_of`](#interface_of) | the interface of the module `origin`: the one the lowering module published, or an import's |
@@ -342,6 +344,19 @@ pub fun module_scope(
     ctx: *mach.front.comptime.scope.ComptimeCtx) res[ModuleScope, mach.base.fail.Fail]
 ```
 
+## SpecClaim
+
+```mach
+pub rec SpecClaim {
+    origin: mach.session.module.ModuleId;
+    decl:   mach.front.ast.id.DeclId;
+    name:   str;
+}
+```
+
+the `#[gpu.spec]` var that claims a specialization id: the module that declares it, its
+declaration there and its qualified name
+
 ## EachElement
 
 ```mach
@@ -554,6 +569,8 @@ pub rec LowerContext {
     # the scratch store of the zeros an element literal's omitted fields hold, one tree per type
     # for the context's life
     zeros: mach.front.comptime.deep.Store;
+    # the `#[gpu.spec]` var each specialization id the unit reads names, by the id
+    specs: std.collections.map.Map[u32, SpecClaim];
 
     pack_slots:    *mach.lower.value.Value;
     pack_types:    *mach.type.kind.TypeId;
@@ -622,6 +639,17 @@ pub fun scope_leave(lc: *LowerContext, mark: ScopeMark) err[mach.base.fail.Fail]
 ```mach
 pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *mirl.ir.module.Module, unit: *Unit) err[mach.base.fail.Fail]
 ```
+
+### module_enter
+
+```mach
+pub fun module_enter(lc: *LowerContext, req: *LowerRequest)
+```
+
+the context moved into the module `req` names, whose declarations it lowers next into the same
+mirl module: its scope, the instance set its code is read through and how it reads instances.
+what the context already lowered and reached stays, so a unit of several modules defines each
+symbol once
 
 ### dnit_context
 

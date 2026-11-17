@@ -2,7 +2,8 @@
 
 # mach.compile.unit
 
-one module's object, normal or test, made in two steps. `lower` lowers the unit's
+one unit's object, normal or test, made in two steps: a unit is one module, or every module of an
+artifact where the target's family compiles it whole. `lower` lowers the unit's
 code into a mirl module on a heap of its own and hands both back as one value, which its
 owner keeps until `compile` has verified it, written it as text when asked and compiled it
 into an object; `dnit` then tears the heap down. compiling reads the lowered unit and its
@@ -24,7 +25,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 
 | On `Lowered` | |
 | :--- | :--- |
-| [`lower`](#lower) | the module `req` names lowered for `back`'s target onto a heap drawing its spans from `spans`, which the unit owns alone and so takes no lock, the value held in `out` until `dnit`, or why it was not lowered |
+| [`lower`](#lower) | the modules the `count` requests at `reqs` name lowered for `back`'s target into one mirl module on a heap drawing its spans from `spans`, which the unit owns alone and so takes no lock, the value held in `out` until `dnit`, or why it was not lowered |
 | [`dnit`](#dnit) | tear down what `lower` made in `out`: the heap and the module on it |
 
 | On `Job` | |
@@ -75,12 +76,13 @@ until `dnit`
 ### lower
 
 ```mach
-pub fun lower(req: *mach.lower.context.LowerRequest, back: *mach.compile.backend.Back, spans: *std.allocator.heap.Pool, out: *std.allocator.Allocator) res[*Lowered, mach.base.fail.Fail]
+pub fun lower(reqs: *mach.lower.context.LowerRequest, count: usize, back: *mach.compile.backend.Back, spans: *std.allocator.heap.Pool, out: *std.allocator.Allocator) res[*Lowered, mach.base.fail.Fail]
 ```
 
-the module `req` names lowered for `back`'s target onto a heap drawing its spans from `spans`,
-which the unit owns alone and so takes no lock, the value held in `out` until `dnit`, or why it
-was not lowered. the request's `malloc` holds the facts and any refusal
+the modules the `count` requests at `reqs` name lowered for `back`'s target into one mirl module
+on a heap drawing its spans from `spans`, which the unit owns alone and so takes no lock, the
+value held in `out` until `dnit`, or why it was not lowered. the requests' `malloc` holds the facts
+and any refusal
 
 ### dnit
 

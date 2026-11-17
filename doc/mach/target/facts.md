@@ -16,7 +16,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.float`](../base
 | [`Listed`](#listed) | `rec` | the size and alignment of a `va_list` |
 | [`Registers`](#registers) | `rec` | the vector registers a vector aligns to: `narrow` the narrowest and `widest` the widest the build meets, in bits |
 | [`Nans`](#nans) | `rec` | the nan a target's float operations return in each format, binary16, binary32 and binary64 at the index of mirl's format, which mirl's folder reads |
-| [`Facts`](#facts) | `rec` | what a program may ask of its target while it compiles: the tag ids, the extents of its primitives and vectors, the selection its extensions are read against, what a float operation makes of a NaN, and whether `asm` reaches an assembler |
+| [`Facts`](#facts) | `rec` | what a program may ask of its target while it compiles: the tag ids, the extents of its primitives and vectors, the selection its extensions are read against, what a float operation makes of a NaN, and whether its functions take `asm`, as mirl's capabilities of the target state it |
 
 | On `Nans` | |
 | :--- | :--- |
@@ -136,8 +136,8 @@ pub rec Facts {
 
 what a program may ask of its target while it compiles: the tag ids, the
 extents of its primitives and vectors, the selection its extensions are read
-against, what a float operation makes of a NaN, and whether `asm` reaches an
-assembler
+against, what a float operation makes of a NaN, and whether its functions take `asm`,
+as mirl's capabilities of the target state it
 
 ### of
 

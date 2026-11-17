@@ -30,15 +30,15 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | Functions | |
 | :--- | :--- |
 | [`artifact_product_name`](#artifact_product_name) | |
-| [`emit_static_archive`](#emit_static_archive) | the archive of the build's objects, the emitted modules', read back from `inputs` in their order, as mink's archive writer lays one out in the variant its registry states for the target's format, its index naming each member's exported symbols |
-| [`object_count`](#object_count) | the objects every program of the build links: each emitted module's |
-| [`ordered_inputs`](#ordered_inputs) | the build's objects as the link's inputs, in the link's order: the emitted modules' in topological order |
+| [`emit_static_archive`](#emit_static_archive) | the archive of the build's objects, each unit's, read back from `inputs` in their order, as mink's archive writer lays one out in the variant its registry states for the target's format, its index naming each member's exported symbols |
+| [`object_count`](#object_count) | the objects every program of the build links: each unit's |
+| [`ordered_inputs`](#ordered_inputs) | the build's objects as the link's inputs, in the link's order: the units' in the topological order of their modules |
 | [`ordered_inputs_free`](#ordered_inputs_free) | |
 | [`objects_into`](#objects_into) | the build's objects in the link's order into `into`, which holds object_count of them |
 | [`input_name`](#input_name) | what the link calls the objects of module `m`: its source file, which outlives the link |
 | [`test_input_name`](#test_input_name) | the name module m's test object goes to the link under, set apart from its object's |
 | [`external_inputs`](#external_inputs) | the inputs the unit links beyond its objects, in link order: the manifest's link entries, those its dependencies cascade, then the command line's |
-| [`write_objects`](#write_objects) | every module's object reaches `obj/` through a sibling temporary, carrying its cache record, since the object cache reads it back; a module the cache restored is already there |
+| [`write_objects`](#write_objects) | every unit's object reaches `obj/` through a sibling temporary, carrying its cache record, since the object cache reads it back; a module the cache restored is already there |
 | [`write_test_objects`](#write_test_objects) | each test object reaches `obj/` beside its module's object, the same way |
 | [`inputs_dnit`](#inputs_dnit) | release `n` object inputs and their array of `cap`; a nil array owns nothing |
 
@@ -123,7 +123,7 @@ pub fun artifact_product_name(p: *mach.compile.project.Project) *u8
 pub fun emit_static_archive(p: *mach.compile.project.Project, destination: str, inputs: *mink.format.contract.Input, out_path: **u8) err[mach.base.fail.Fail]
 ```
 
-the archive of the build's objects, the emitted modules', read back from `inputs` in their
+the archive of the build's objects, each unit's, read back from `inputs` in their
 order, as mink's archive writer lays one out in the variant its
 registry states for the target's format, its index naming each member's exported symbols
 
@@ -133,7 +133,7 @@ registry states for the target's format, its index naming each member's exported
 pub fun object_count(p: *mach.compile.project.Project) u32
 ```
 
-the objects every program of the build links: each emitted module's
+the objects every program of the build links: each unit's
 
 ### ordered_inputs
 
@@ -141,8 +141,8 @@ the objects every program of the build links: each emitted module's
 pub fun ordered_inputs(p: *mach.compile.project.Project) res[*Given, mach.base.fail.Fail]
 ```
 
-the build's objects as the link's inputs, in the link's order: the emitted modules' in
-topological order
+the build's objects as the link's inputs, in the link's order: the units' in the topological
+order of their modules
 
 ### ordered_inputs_free
 
@@ -191,7 +191,7 @@ the claims the objects carry is no input of its own
 pub fun write_objects(p: *mach.compile.project.Project, destinations: *str, inputs_out: **mink.format.contract.Input) err[mach.base.fail.Fail]
 ```
 
-every module's object reaches `obj/` through a sibling temporary, carrying its cache record,
+every unit's object reaches `obj/` through a sibling temporary, carrying its cache record,
 since the object cache reads it back; a module the cache restored is already there
 
 ### write_test_objects

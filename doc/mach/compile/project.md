@@ -52,6 +52,8 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | On `Project` | |
 | :--- | :--- |
 | [`record_dnit`](#record_dnit) | give back a record's bytes |
+| [`unit_count`](#unit_count) | the units the build compiles its emitted modules in, one object each: one per module, or one for them all where the family that compiles the build takes an artifact whole |
+| [`unit_module`](#unit_module) | the module whose entry holds unit `u`'s object, mirl text and listing: the module itself, or for an artifact taken whole the last module emitted, which no other emitted module imports |
 | [`link_name_for`](#link_name_for) | the name a C symbol `bare` takes in the target's objects: the prefix mink's registry gives a C symbol of the target's format on its architecture, then `bare` |
 | [`staged_dnit`](#staged_dnit) | a staged object is the project's until a query takes it, and `object` is borrowed |
 | [`staged_test_dnit`](#staged_test_dnit), [`all_staged_dnit`](#all_staged_dnit) | |
@@ -451,6 +453,24 @@ pub fun record_dnit(p: *Project, r: *Record)
 ```
 
 give back a record's bytes
+
+### unit_count
+
+```mach
+pub fun unit_count(p: *Project) u32
+```
+
+the units the build compiles its emitted modules in, one object each: one per module, or one for
+them all where the family that compiles the build takes an artifact whole
+
+### unit_module
+
+```mach
+pub fun unit_module(p: *Project, u: u32) *ModuleEntry
+```
+
+the module whose entry holds unit `u`'s object, mirl text and listing: the module itself, or for an
+artifact taken whole the last module emitted, which no other emitted module imports
 
 ### link_name_for
 

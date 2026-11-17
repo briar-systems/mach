@@ -20,6 +20,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`retain_modules`](#retain_modules) | every module the load reached, gated out or not, is held under the session's active retainer: the project borrows each one's parse |
 | [`back_half_key`](#back_half_key) | a module's lowering and codegen products are keyed by its stable id, and by the test bit for its test object |
 | [`back_half_key_is_test`](#back_half_key_is_test) | |
+| [`unit_key`](#unit_key) | the key of unit `u`'s lowering and codegen: its module's normal key, or for an artifact taken whole that module's key with the whole bit |
 | [`back_half_key_for`](#back_half_key_for) | the normal object's key, the same in every build that compiles the module |
 | [`test_key_for`](#test_key_for) | |
 | [`has_test_object`](#has_test_object) | the module gets a test object in this build: a test build, and a module whose source declares a test or a `#[testing]` declaration |
@@ -100,6 +101,15 @@ test bit for its test object
 ```mach
 pub fun back_half_key_is_test(key: u64) bool
 ```
+
+### unit_key
+
+```mach
+pub fun unit_key(p: *mach.compile.project.Project, u: u32) u64
+```
+
+the key of unit `u`'s lowering and codegen: its module's normal key, or for an artifact taken
+whole that module's key with the whole bit
 
 ### back_half_key_for
 

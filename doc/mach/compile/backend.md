@@ -27,6 +27,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`init`](#init) | the back half of the resolved target `t` |
 | [`merges`](#merges) | whether the objects the back half writes hold merged definitions (mink.model.merged), the copies of one a link keeps one of: false for a format masc writes none in |
 | [`unlisted`](#unlisted) | whether an image of format `f` exports only what its inputs' export directives name, so a definition states no visibility; false for a format mink links no image of the name of the mirl family that compiles the build when it writes no listing of its objects, none when it writes one |
+| [`whole`](#whole) | whether the family that compiles the build takes an artifact's modules whole, as one unit whose one object the link takes, rather than each module apart |
 | [`dnit`](#dnit) | |
 | [`machine`](#machine) | the machine lowering builds for, refused for a cell no owner assembles yet |
 | [`object_bytes`](#object_bytes) | the bytes of `o` laid out in the format the target's objects are written in, given back with sink.dnit |
@@ -132,6 +133,15 @@ pub fun unlisted(b: *Back) opt[str]
 whether an image of format `f` exports only what its inputs' export directives name, so a
 definition states no visibility; false for a format mink links no image of
 the name of the mirl family that compiles the build when it writes no listing of its objects, none when it writes one
+
+### whole
+
+```mach
+pub fun whole(b: *Back) bool
+```
+
+whether the family that compiles the build takes an artifact's modules whole, as one unit
+whose one object the link takes, rather than each module apart
 
 ### dnit
 
