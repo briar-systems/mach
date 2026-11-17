@@ -1172,9 +1172,9 @@ a further rule the decorator's own section states.
 | `abi_type` | `def` | a `def` with no type, checked by `abi_type` itself |
 | `gpu.stage` | `fun` |  |
 | `gpu.workgroup` | `fun` | a function that also carries `#[gpu.stage("compute")]` |
-| `gpu.input` | `val`, `var` |  |
+| `gpu.input` | `val`, `var` | a `var`: an input takes no initializer and a `val` needs one, so a `val` is refused for its initializer (`decorator.conflict`) |
 | `gpu.output` | `val`, `var` |  |
-| `gpu.builtin` | `val`, `var` |  |
+| `gpu.builtin` | `val`, `var` | a `var` where the built-in is an input, for the same reason |
 | `gpu.uniform` | `val`, `var` |  |
 | `gpu.storage` | `val`, `var` |  |
 | `gpu.sampler` | `val`, `var` |  |

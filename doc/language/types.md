@@ -100,9 +100,11 @@ No target has a 128-bit register. A 128-bit value is **realized** as two
 vector wider than the vector register is realized as pieces: addition and
 subtraction carry across the lanes, shifts move bits between them, and a
 comparison decides on the high lane first. Which targets realize the width is
-a declaration of the machine model, not a consequence of its name. A target
-that declares no 128-bit integer (riscv32, spirv) refuses the type where it
-is used, at the declaration or expression that names it:
+a declaration of the machine model, not a consequence of its name. SPIR-V
+splits a 128-bit integer into 64-bit words as it does any integer wider than its
+widest arithmetic, so it needs `Int64`. A target that declares no 128-bit integer
+(riscv32) refuses the type where it is used, at the declaration or expression
+that names it:
 
 ```text
 error[target.int_width]: a 128-bit integer is not realized on riscv32: the target declares no integer of that width
@@ -422,7 +424,11 @@ which `vulkan1.3` accepts and an earlier `env` accepts only with the
 `StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat` extensions (see
 [manifest.md](manifest.md#instruction-set-extensions)). A format must match the
 texel scalar: a float or normalized format is read as `f32`, a signed integer
-format as `i32` and an unsigned one as `u32`. A module declares its integer types without
+format as `i32` and an unsigned one as `u32`, `R64i` as `i64` and `R64ui` as `u64`
+(Vulkan's image format and type matching, `VUID-StandaloneSpirv-Image-04965`). Each
+format's number and component count is masc's typing data, which the target's handle
+catalog reads, and a declaration whose texel scalar is not its format's number is refused
+with `handle.arguments`, naming the format operand. A module declares its integer types without
 signedness, except the `Sampled Type` of an image of signed texels, which is a signed
 integer: one of a signed integer format, or one of `Unknown` format whose texel scalar is
 `i32` or `i64`, so every access to its texels is signed as Vulkan requires (the
@@ -438,7 +444,9 @@ the texel scalar `u64` or `i64`, and declare `Int64ImageEXT`, which needs the
 (see [decorators.md](decorators.md)), and it is read without one like any other
 image. Vulkan places no `Depth` constraint on a storage image, so a storage image
 may declare `1` too, though no comparison reads it: a comparison samples through a
-sampler. `2`, which states no indication either way, is refused.
+sampler. `2` states no indication either way, which SPIR-V's `OpTypeImage` admits and
+Vulkan places no rule on, so it is accepted, and a comparison reads it as it reads a
+depth image, since a comparison asks only that `Depth` is not `0`.
 
 ```mach fragment
 #[handle("spirv", "image", f32, "2D", 1, 0, 0, 1, "Unknown")]
@@ -448,10 +456,13 @@ pub def ShadowMap;
 pub def ShadowSampler;
 ```
 
-`MS` `1` is a **multisampled** image, which only a `2D` image is, arrayed or not:
-it is refused on `1D`, `3D`, `Cube` and `Buffer`. A multisampled image is never
-sampled, so a `sampled_image` cannot compose over one, and its texels are read per
-sample with the `Sample` image operand (see [decorators.md](decorators.md)). A
+`MS` `1` is a **multisampled** image. SPIR-V's `OpTypeImage` places no rule on which
+`Dim` holds one, and states each multisample rule on the instruction that reads the
+image, so each is refused at the call with `op.operand_value`: a sample, a gather and a
+level-of-detail query take only an image whose `MS` is `0`, `OpImageQuerySamples` only a
+`2D` one whose `MS` is `1`, and a fetch or read of one takes the `Sample` image operand
+(see [decorators.md](decorators.md)). A `sampled_image` may compose over one, which
+`OpImageFetch` then reads through `OpImage`, though no sampling instruction takes it. A
 multisampled sampled image needs no capability. A multisampled storage image
 declares `StorageImageMultisample`, and an arrayed one `ImageMSArray` too, each
 under the extension of its name: Vulkan's `shaderStorageImageMultisample` enables
@@ -487,16 +498,22 @@ every annotation (a parameter, a result, a local, a field or a type argument), s
 the inner pointer would be one the program stores and may reassign, so the handle
 would trace to no binding.
 
-`$size_of` a handle is the target's pointer size: it is a name for a resource, and
-a pointer is the shape every target already has for that. On a target that mints no
-such type the declaration is **inert**: it still denotes a type and still sizes, and
+`$size_of` a handle is the target's pointer size, and `$align_of` its alignment: it is
+a name for a resource, and a pointer is the shape every target already has for that, so
+a handle sizes as `ptr` does on the same build. On SPIR-V that is the physical pointer's
+8 bytes where the target selects `PhysicalStorageBufferAddresses`, as `vulkan1.3` and no
+`env` do, and under logical addressing alone, where a pointer has no size, `$size_of` a
+handle is refused with `spirv.unsupported` as `$size_of(ptr)` is. On a target that mints
+no such type the declaration is **inert**: it still denotes a type and still sizes, and
 an operation over it is an undefined symbol at link.
 
 A target refuses an operand combination its constructor spells but it cannot emit,
-naming the operand rather than the declaration. The SPIR-V target refuses a
-`Depth` other than `0` or `1`, an `MS` other than `0` or `1`, a `Dim` past `Cube`
-other than `Buffer`, and a `Sampled` other than `1` or `2`, each with what SPIR-V
-would need instead.
+naming the operand rather than the declaration, with `handle.arguments`. The SPIR-V
+target's handle catalog refuses a `Depth` other than `0`, `1` or `2`, an `MS` or
+`Arrayed` other than `0` or `1`, a `Dim` the grammar does not state, a `Sampled` other
+than `1` or `2` (Vulkan's `VUID-StandaloneSpirv-OpTypeImage-04657`), a texel scalar that
+is not its format's number, and a `sampled_image` over an image whose `Sampled` is not
+`1` (`VUID-StandaloneSpirv-OpTypeSampledImage-06671`).
 
 See [decorators.md](decorators.md) for `#[handle]` and `#[gpu.sampler(set, binding)]`,
 and the shader library for the handles a SPIR-V target declares.

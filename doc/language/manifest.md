@@ -910,9 +910,11 @@ the zero first, converted from a 32-bit one, and the output needs
 constant, which needs the type's feature as well. The 16-bit capabilities need
 `SPV_KHR_16bit_storage` below SPIR-V 1.3 and the 8-bit ones `SPV_KHR_8bit_storage`
 below SPIR-V 1.5. Vulkan defines no 8-bit stage input or
-output, so one is refused, and an 8-bit member of a `#[gpu.storage(...)]` buffer is
-refused under `vulkan1.0`, whose storage buffer is a `BufferBlock` in the `Uniform`
-class, which the 8-bit feature does not reach.
+output, so one is refused. Under `vulkan1.0` a storage buffer is a `BufferBlock` in the
+`Uniform` class, which no 8-bit capability names (SPIR-V 3.31), so an 8-bit member of a
+`#[gpu.storage(...)]` buffer needs the `StorageBuffer` class as well: a target that names
+`SPV_KHR_storage_buffer_storage_class` in its `ext` writes its storage buffers in that
+class, and one that does not is refused with `spirv.capability`, naming the extension.
 
 ```toml
 [target.gpu]

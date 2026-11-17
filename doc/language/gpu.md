@@ -317,7 +317,9 @@ A **storage image** is the exception: an `image` handle whose `Sampled` operand 
 do to a buffer, checked against the instructions that read and write its texels. A
 storage texel buffer, an image of `Dim` `Buffer` with `Sampled` `2`, binds the same
 way, and a uniform texel buffer (`Sampled` `1`) keeps `gpu.sampler`. Binding a storage
-image through `gpu.sampler`, or any other handle through `gpu.storage`, is a compile error.
+image through `gpu.sampler`, or any other handle through `gpu.storage`, is refused at the
+binding with `handle.role`: the target's handle catalog states which kinds, and which
+operand values, make a storage resource, and the binding alone decides it.
 A storage image is read and written by `OpImageRead` and `OpImageWrite`, a uniform
 texel buffer or a sampled image is fetched texel by texel by `OpImageFetch`, and
 `OpImageQuerySize`, `OpImageQuerySizeLod`, `OpImageQueryLevels` and
@@ -346,8 +348,10 @@ no Vulkan version requires, so a run-time `Offset` on any other image instructio
 at the call with `op.operand_value`, and a constant offset is `ConstOffset`. A sample takes
 `MinLod` (`0x80`), the least level of detail it reads, which an explicit-lod sample
 takes only with `Grad` and which needs the `MinLod` extension.
-`OpImageGather` reads one component, a constant id, of the four texels a sample of a
-`2D` or `Cube` image would filter. A constant operand is a constant by emission: a
+`OpImageGather` and `OpImageSparseGather` read one component, a constant id, of the four
+texels a sample of a `2D` or `Cube` image would filter (Vulkan's
+`VUID-StandaloneSpirv-OpImageGather-04664`), and a run-time component is refused at the
+call with `op.operand_not_constant`. A constant operand is a constant by emission: a
 literal, a vector of literals directly or through a binding, a module-scope `val`,
 which a shader reads as the constant it is, or an aggregate passed whole as an array
 literal of constants or a copy of a `val`, written as one composite constant. An
@@ -927,13 +931,21 @@ A declaration that returns a handle is refused with `op.signature` unless its ro
 names the operand its result derives from, since a handle holds a binding's
 descriptor and only that operand says whose. Each math row and subgroup row states the
 class of number it operates on. The GLSL.std.450 float rows and `OpDot` operate on a
-scalar or vector of floats, and the subgroup rows on a scalar or vector of integers or
+scalar or vector of floats, the trigonometric and exponential rows, `Pow`, `Radians` and
+`Degrees` on floats of 16 or 32 bits only, the pack and unpack rows on the 32-bit and 64-bit
+types their names state, `FindILsb`, `FindSMsb`, `FindUMsb` and the `InterpolateAt` rows on
+32-bit components, and the `InterpolateAt` rows execute in a fragment stage alone. The
+subgroup rows on a scalar or vector of integers or
 floats. The GLSL.std.450 integer rows operate on the signedness their name states:
 `SAbs`, `SSign`, `SMin`, `SMax`, `SClamp` and `FindSMsb` on signed integers, `UMin`,
-`UMax`, `UClamp` and `FindUMsb` on unsigned ones, and `FindILsb` on either. A data
+`UMax`, `UClamp` and `FindUMsb` on unsigned ones, and `FindILsb` on either. A subgroup
+row's lane, mask, delta, index and direction operands, its ballot `u32x4` and the counts
+and bit positions it returns are unsigned integers, which SPIR-V states as a Signedness of
+0. A data
 operand of any other type is refused with `op.signature`: an integer for `FAbs`, an
-`i32` for `UMin`, a handle, a pointer or an aggregate. GLSL.std.450 removed `IMix`, so
-it has no row.
+`i32` for `UMin`, a handle, a pointer or an aggregate. GLSL.std.450 removed `IMix`, which
+its grammar still lists: masc's typing data states that no environment admits it, so a call
+of it is refused with `op.unknown`, quoting the removal. A declaration nothing calls builds.
 
 Each image row names the rule its texel's component count comes from, and the
 refusal quotes it: the 4-vector read result is Vulkan's `VUID-StandaloneSpirv-Result-04780`,
@@ -959,8 +971,12 @@ the consumer enables through the feature Vulkan reports it by:
 | quad              | `QuadBroadcast`, `QuadSwap`                                  | `GroupNonUniformQuad`             |
 
 `BallotBitCount` takes a `GroupOperation` too, which its ballot capability covers
-and which has no clustered form. `Broadcast`'s lane, `QuadBroadcast`'s index and
-`QuadSwap`'s direction are constant ids, which every SPIR-V version accepts. Vulkan
+and which has no clustered form. `QuadSwap`'s direction is a constant id in every SPIR-V
+version. `Broadcast`'s lane and `QuadBroadcast`'s index are constant ids before SPIR-V 1.5,
+so under `vulkan1.1`, and from 1.5 on may be run-time values, which must then be
+dynamically uniform (Vulkan admits them under `subgroupBroadcastDynamicId`, which every
+Vulkan 1.2 device has). A run-time value where a constant id is asked is refused at the
+call with `op.operand_not_constant`. The rule is masc's typing data, read by mirl. Vulkan
 guarantees subgroup operations only in compute stages, so a use reached from a
 vertex or fragment stage, an operation or a subgroup built-in alike, also needs the
 device's `subgroupSupportedStages` to include that stage, which enables no capability
