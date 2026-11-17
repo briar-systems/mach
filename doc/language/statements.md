@@ -92,7 +92,8 @@ ret;                        # return from a void function
 ## `brk` / `cnt`
 
 Loop control: `brk` exits the enclosing `for`; `cnt` continues to the
-next iteration.
+next iteration. A `brk` or `cnt` with no enclosing `for` in its function is
+refused with `jump.no_loop`.
 
 ```mach
 use std.print;
