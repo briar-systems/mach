@@ -164,7 +164,7 @@ model's, and `subgroup_size` and `subgroup_invocation` are every stage's, decora
 `Flat` as a fragment stage's integer inputs. A stage that uses a built-in outside
 its row, directly or through a function it calls, is a compile error naming the
 built-in and both stages. The four subgroup built-ins need SPIR-V 1.3, and outside
-a compute stage the `subgroup_graphics_stages` feature, as the subgroup operations do.
+a compute stage the device's `subgroupSupportedStages`, as the subgroup operations do.
 
 `gpu.uniform` binds a read-only block by descriptor set and binding. Its type **must
 be a `rec`**: a uniform is a block with a host-visible layout, and a bare scalar
@@ -309,10 +309,10 @@ derivatives it derives that level from. A fetch, a sample and a gather take
 coordinate, and never on a `Cube` image. A gather may take `ConstOffsets` (`0x20`)
 instead, a constant `[4]i32x2` of the offsets of the four texels it reads. An
 instruction takes one offset bit at most. `Offset` and `ConstOffsets` need the
-`image_gather_extended` extension, and `Offset` on a fetch or a sample `maintenance8` as well,
-since Vulkan admits it outside a gather only under that feature. A sample takes
+`ImageGatherExtended` extension, and Vulkan admits `Offset` outside a gather only under
+its `maintenance8` feature, which enables no capability and so has no `ext` name. A sample takes
 `MinLod` (`0x80`), the least level of detail it reads, which an explicit-lod sample
-takes only with `Grad` and which needs the `resource_min_lod` extension.
+takes only with `Grad` and which needs the `MinLod` extension.
 `OpImageGather` reads one component, a constant id, of the four texels a sample of a
 `2D` or `Cube` image would filter. A constant operand is a constant by emission: a
 literal, a vector of literals directly or through a binding, a module-scope `val`,
@@ -458,10 +458,9 @@ variable is, on every environment. How depends on the environment:
 
 - Where workgroup memory is zero-initialized by the consumer, the variable carries an
   `OpConstantNull` initializer. `vulkan1.3` guarantees that
-  (`shaderZeroInitializeWorkgroupMemory` is core there), and a target that selects the
-  `zero_init_workgroup` extension declares it for an earlier version (see
-  [manifest.md](manifest.md#instruction-set-extensions)). The consumer then has to
-  enable the feature (`VK_KHR_zero_initialize_workgroup_memory`).
+  (`shaderZeroInitializeWorkgroupMemory` is core there). The feature enables no
+  capability, so no `ext` name selects it for an earlier version (see
+  [manifest.md](manifest.md#instruction-set-extensions)).
 - Otherwise the compiler zeroes it itself, at the start of each compute stage that uses
   it. Each invocation stores zero to its own slice, the elements of an array its local
   invocation index reaches in steps of the workgroup size and the whole of any other
@@ -671,7 +670,7 @@ storage class the row itself declares, as `OpImageTexelPointer` returns an `Imag
 pointer, and that result is accepted as a later instruction's pointer operand. A
 row whose result is a **truth value**, such as `OpGroupNonUniformElect`, is declared
 returning an integer, which receives 1 or 0. A `bool` return is an 8-bit integer,
-which a target without `int8` carries at 32 bits like any other 8-bit local
+which a target without `Int8` carries at 32 bits like any other 8-bit local
 ([manifest.md](manifest.md#finished-module-targets)), so the module needs no Int8 for it.
 
 ```mach
@@ -692,9 +691,9 @@ load or store is moved across a barrier or an atomic, at any optimization
 level. `OpControlBarrier` takes an execution scope, a memory scope and memory
 semantics, and `OpMemoryBarrier` a memory scope and semantics, each an integer
 constant. A memory scope and memory semantics are held to the module's memory model:
-under the Vulkan model the `Device` scope needs the `vulkan_memory_model_device_scope`
+under the Vulkan model the `Device` scope needs the `VulkanMemoryModelDeviceScope`
 extension, and under GLSL450 the `QueueFamily` scope and the `MakeAvailable`,
-`MakeVisible` and `Volatile` semantics need `vulkan_memory_model` (see
+`MakeVisible` and `Volatile` semantics need `VulkanMemoryModel` (see
 [manifest.md](manifest.md#finished-module-targets)). An atomic's scope and semantics
 are held the same way. The execution scope is not, since a Vulkan barrier executes
 at `Workgroup` or `Subgroup` only. `SequentiallyConsistent` semantics are refused under
@@ -727,9 +726,8 @@ pub fun subgroup_cluster_add(scope: u32, operation: u32, v: u32, cluster_size: u
 ```
 
 Its operation is a `GroupOperation`. `Reduce` (0), `InclusiveScan` (1) and
-`ExclusiveScan` (2) need the `subgroup_arithmetic` extension and declare
-`GroupNonUniformArithmetic`, and `ClusteredReduce` (3) needs `subgroup_clustered`,
-declares `GroupNonUniformClustered` and is followed by the ClusterSize operand, so
+`ExclusiveScan` (2) need the `GroupNonUniformArithmetic` extension and declare it,
+and `ClusteredReduce` (3) needs and declares `GroupNonUniformClustered` and is followed by the ClusterSize operand, so
 it is passed only to the four-parameter declaration.
 
 Where the specification makes the literal itself optional, as it does an
@@ -751,8 +749,8 @@ checked at the call, where the literal's value is known:
 | a capability whose SPIR-V version the environment is below | `spirv.capability`, naming the first `env` that reaches it |
 
 A device feature is an extension the target names in its `ext` once the
-consumer enables it, since no environment guarantees it: `subgroup_arithmetic` is
-Vulkan's `VK_SUBGROUP_FEATURE_ARITHMETIC_BIT`, and a target naming no `env` holds
+consumer enables it, since no environment guarantees it: `GroupNonUniformArithmetic` is
+enabled by Vulkan's `VK_SUBGROUP_FEATURE_ARITHMETIC_BIT`, and a target naming no `env` holds
 every extension. A module declares a capability only when something it emits needs
 it, with `OpExtension` for a capability a SPIR-V extension defines.
 
@@ -797,34 +795,35 @@ pub fun atomic_fadd(p: *f32, scope: u32, semantics: u32, v: f32) f32;
 ```
 
 A 32-bit integer atomic is core in every storage class. Every other type needs the
-Vulkan device feature of its storage class, named for its `shaderBuffer*`,
-`shaderShared*` or `shaderImage*` member: `buffer_*` on buffer memory
+capability of its row, named in the target's `ext`, and the consumer enables the
+Vulkan device feature of its storage class that provides it, named for its
+`shaderBuffer*`, `shaderShared*` or `shaderImage*` member: buffer memory
 (`StorageBuffer`, `Uniform` before SPIR-V 1.3, or `PhysicalStorageBuffer` through a
-[physical pointer](types.md#pointers-on-spir-v)), `shared_*` on [`#[gpu.shared]`](#gpuinputn--gpuoutputn--gpubuiltinstr--gpuuniformset-binding--gpustorageset-binding--gpusamplerset-binding--gpupush--gpuspecid--gpushared--shader-interface)
-workgroup memory, and `image_*` on a storage image texel (`Image`, through
+[physical pointer](types.md#pointers-on-spir-v)), [`#[gpu.shared]`](#gpuinputn--gpuoutputn--gpubuiltinstr--gpuuniformset-binding--gpustorageset-binding--gpusamplerset-binding--gpupush--gpuspecid--gpushared--shader-interface)
+workgroup memory, or a storage image texel (`Image`, through
 `OpImageTexelPointer`), where Vulkan defines only a 64-bit integer and an `f32`. Any
 other storage class is refused. An image of 64-bit texels (`R64ui` or `R64i`) declares
-`Int64ImageEXT` (`SPV_EXT_shader_image_int64`), which `image_int64_atomics` enables, so
-the image itself needs that feature whatever reaches it. An `f16` atomic also needs
-`float16`, under which `f16` memory is the `OpTypeFloat 16` the atomic operates on, and
-the storage buffer holding one needs `storage_buffer_16bit_access`
+`Int64ImageEXT` (`SPV_EXT_shader_image_int64`), which `shaderImageInt64Atomics`
+enables, so the image itself needs that capability whatever reaches it. An `f16` atomic also needs
+`Float16`, under which `f16` memory is the `OpTypeFloat 16` the atomic operates on, and
+the storage buffer holding one needs `StorageBuffer16BitAccess`
 ([manifest.md](manifest.md#finished-module-targets)).
 
-| Rows | Type | Extensions | Vulkan feature | Capability (SPIR-V extension) |
-|------|------|-----------|----------------|-------------------------------|
-| all 15 integer atomics | `u32`, `i32` | none | core | none |
-| all 15 integer atomics | `u64`, `i64` | `buffer_int64_atomics`, `shared_int64_atomics`, `image_int64_atomics` | `shaderBufferInt64Atomics`, `shaderSharedInt64Atomics`, `shaderImageInt64Atomics` | `Int64Atomics` |
-| `OpAtomicLoad`, `OpAtomicStore`, `OpAtomicExchange` | `f16`, `f32`, `f64` | `buffer_float{16,32,64}_atomics`, `shared_float{16,32,64}_atomics`, `image_float32_atomics` | `shader{Buffer,Shared}Float{16,32,64}Atomics`, `shaderImageFloat32Atomics` | none |
-| `OpAtomicFAddEXT` | `f32`, `f64` | `buffer_float{32,64}_atomic_add`, `shared_float{32,64}_atomic_add`, `image_float32_atomic_add` | `shader{Buffer,Shared}Float{32,64}AtomicAdd`, `shaderImageFloat32AtomicAdd` | `AtomicFloat{32,64}AddEXT` (`SPV_EXT_shader_atomic_float_add`) |
-| `OpAtomicFAddEXT` | `f16` | `buffer_float16_atomic_add`, `shared_float16_atomic_add` | `shader{Buffer,Shared}Float16AtomicAdd` | `AtomicFloat16AddEXT` (`SPV_EXT_shader_atomic_float16_add`) |
-| `OpAtomicFMinEXT`, `OpAtomicFMaxEXT` | `f16`, `f32`, `f64` | `buffer_float{16,32,64}_atomic_min_max`, `shared_float{16,32,64}_atomic_min_max`, `image_float32_atomic_min_max` | `shader{Buffer,Shared}Float{16,32,64}AtomicMinMax`, `shaderImageFloat32AtomicMinMax` | `AtomicFloat{16,32,64}MinMaxEXT` (`SPV_EXT_shader_atomic_float_min_max`) |
+| Rows | Type | Vulkan feature | `ext` (capability, SPIR-V extension) |
+|------|------|----------------|--------------------------------------|
+| all 15 integer atomics | `u32`, `i32` | core | none |
+| all 15 integer atomics | `u64`, `i64` | `shaderBufferInt64Atomics`, `shaderSharedInt64Atomics`, `shaderImageInt64Atomics` | `Int64Atomics` |
+| `OpAtomicLoad`, `OpAtomicStore`, `OpAtomicExchange` | `f16`, `f32`, `f64` | `shader{Buffer,Shared}Float{16,32,64}Atomics`, `shaderImageFloat32Atomics` | none |
+| `OpAtomicFAddEXT` | `f32`, `f64` | `shader{Buffer,Shared}Float{32,64}AtomicAdd`, `shaderImageFloat32AtomicAdd` | `AtomicFloat{32,64}AddEXT`, `SPV_EXT_shader_atomic_float_add` |
+| `OpAtomicFAddEXT` | `f16` | `shader{Buffer,Shared}Float16AtomicAdd` | `AtomicFloat16AddEXT`, `SPV_EXT_shader_atomic_float16_add` |
+| `OpAtomicFMinEXT`, `OpAtomicFMaxEXT` | `f16`, `f32`, `f64` | `shader{Buffer,Shared}Float{16,32,64}AtomicMinMax`, `shaderImageFloat32AtomicMinMax` | `AtomicFloat{16,32,64}MinMaxEXT`, `SPV_EXT_shader_atomic_float_min_max` |
 
 The features come from `VkPhysicalDeviceShaderAtomicInt64Features`,
 `VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT`,
 `VkPhysicalDeviceShaderAtomicFloatFeaturesEXT` and
 `VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT`. No environment guarantees any of
-them, so a target names each one its consumer enables, and a target naming no `env`
-holds them all. The integer atomics are `OpAtomicLoad`, `OpAtomicStore`,
+them, so a target names the capability of each one its consumer enables, and a target
+naming no `env` holds them all. The integer atomics are `OpAtomicLoad`, `OpAtomicStore`,
 `OpAtomicExchange`, `OpAtomicCompareExchange`, `OpAtomicIIncrement`,
 `OpAtomicIDecrement`, `OpAtomicIAdd`, `OpAtomicISub`, `OpAtomicSMin`, `OpAtomicUMin`,
 `OpAtomicSMax`, `OpAtomicUMax`, `OpAtomicAnd`, `OpAtomicOr` and `OpAtomicXor`.
@@ -832,7 +831,7 @@ holds them all. The integer atomics are `OpAtomicLoad`, `OpAtomicStore`,
 | At the call                                            | Is refused with                    |
 |--------------------------------------------------------|------------------------------------|
 | a type the row admits only in other storage classes    | `spirv.capability`, naming the class |
-| a type whose feature the target does not select        | `spirv.capability`, naming the feature |
+| a type whose capability the target does not select     | `spirv.capability`, naming the capability |
 
 A row also states how its operands' types and its result's **relate** to the type it
 operates on, the type of the one operand its typing reads (a pointer's pointee). A
@@ -886,25 +885,27 @@ because it sees no `VkFormat`.
 
 The **subgroup operations** are the `OpGroupNonUniform*` rows, each taking the
 Subgroup scope (3) as its first operand. Every one needs SPIR-V 1.3, so `vulkan1.1`
-or later, and each family needs its capability and the feature Vulkan reports it by:
+or later, and each family needs its capability, named in the target's `ext`, which
+the consumer enables through the feature Vulkan reports it by:
 
-| Family            | Rows                                                         | Feature                     |
+| Family            | Rows                                                         | `ext`                       |
 |-------------------|--------------------------------------------------------------|-----------------------------|
 | basic             | `Elect`                                                      | none: every vulkan1.1 device |
-| vote              | `All`, `Any`, `AllEqual`                                     | `subgroup_vote`             |
-| arithmetic        | `IAdd`, `FAdd`, `IMul`, `FMul`, `SMin`, `UMin`, `FMin`, `SMax`, `UMax`, `FMax`, `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `LogicalAnd`, `LogicalOr`, `LogicalXor` with `Reduce` or a scan | `subgroup_arithmetic` |
-| clustered         | the same rows with `ClusteredReduce` and a ClusterSize       | `subgroup_clustered`        |
-| ballot            | `Ballot`, `InverseBallot`, `BallotBitExtract`, `BallotBitCount`, `BallotFindLSB`, `BallotFindMSB`, `Broadcast`, `BroadcastFirst` | `subgroup_ballot` |
-| shuffle           | `Shuffle`, `ShuffleXor`                                      | `subgroup_shuffle`          |
-| relative shuffle  | `ShuffleUp`, `ShuffleDown`                                   | `subgroup_shuffle_relative` |
-| quad              | `QuadBroadcast`, `QuadSwap`                                  | `subgroup_quad`             |
+| vote              | `All`, `Any`, `AllEqual`                                     | `GroupNonUniformVote`             |
+| arithmetic        | `IAdd`, `FAdd`, `IMul`, `FMul`, `SMin`, `UMin`, `FMin`, `SMax`, `UMax`, `FMax`, `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `LogicalAnd`, `LogicalOr`, `LogicalXor` with `Reduce` or a scan | `GroupNonUniformArithmetic` |
+| clustered         | the same rows with `ClusteredReduce` and a ClusterSize       | `GroupNonUniformClustered`        |
+| ballot            | `Ballot`, `InverseBallot`, `BallotBitExtract`, `BallotBitCount`, `BallotFindLSB`, `BallotFindMSB`, `Broadcast`, `BroadcastFirst` | `GroupNonUniformBallot` |
+| shuffle           | `Shuffle`, `ShuffleXor`                                      | `GroupNonUniformShuffle`          |
+| relative shuffle  | `ShuffleUp`, `ShuffleDown`                                   | `GroupNonUniformShuffleRelative` |
+| quad              | `QuadBroadcast`, `QuadSwap`                                  | `GroupNonUniformQuad`             |
 
 `BallotBitCount` takes a `GroupOperation` too, which its ballot capability covers
 and which has no clustered form. `Broadcast`'s lane, `QuadBroadcast`'s index and
 `QuadSwap`'s direction are constant ids, which every SPIR-V version accepts. Vulkan
 guarantees subgroup operations only in compute stages, so a use reached from a
-vertex or fragment stage, an operation or a subgroup built-in alike, also needs
-`subgroup_graphics_stages`, the device's `subgroupSupportedStages`.
+vertex or fragment stage, an operation or a subgroup built-in alike, also needs the
+device's `subgroupSupportedStages` to include that stage, which enables no capability
+and so has no `ext` name.
 
 ```mach
 use std.types.bool.bool;

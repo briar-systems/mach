@@ -116,8 +116,8 @@ never a call:
 | riscv64, riscv32 | binary64, the conversions inline | binary64, the widening inline |
 | riscv with `zfhmin` | binary32 through `fcvt.s.h` and `fcvt.h.s` | binary32 through `fcvt.s.h` |
 | riscv with `zfh` | native (`fadd.h`, `fsub.h`, `fmul.h`, `fdiv.h`) | native (`feq.h`, `flt.h`, `fle.h`) |
-| spirv with `float16` | native, the core float instructions on `OpTypeFloat 16` | native |
-| spirv without `float16` | binary32, the conversions inline | binary32, the widening inline |
+| spirv with `Float16` | native, the core float instructions on `OpTypeFloat 16` | native |
+| spirv without `Float16` | binary32, the conversions inline | binary32, the widening inline |
 
 aarch64 without `fp16` computes in binary64 even though `fcvt` converts to
 binary32, because that conversion quiets a signaling operand and the half unit
@@ -512,7 +512,7 @@ same result:
 - riscv with `zfhmin`: `fcvt.s.h` and `fcvt.h.s`, and with `d` also `fcvt.d.h`
   and `fcvt.h.d`; with `zfh` the integer conversions (`fcvt.w.h`, `fcvt.h.w` and
   their unsigned and, on riscv64, 64-bit forms);
-- spirv with `float16`: the core float conversions.
+- spirv with `Float16`: the core float conversions.
 
 Every other conversion is inline integer code on the binary16 encoding, joined to
 the target's binary64 conversion for an integer, never a call. Vectors convert lane by lane with the
@@ -686,7 +686,7 @@ extend-then-multiply path where the vector register is 128 bits. x86-64 under
 32-byte product. Either path gives the same lanes.
 
 `f16` lanes realize per target as [types.md](types.md#simd-vectors) lists: packed
-on aarch64 with `fp16` and on spirv with `float16`, through packed `f32` lanes on
+on aarch64 with `fp16` and on spirv with `Float16`, through packed `f32` lanes on
 x86-64 with `f16c` (and for comparisons on aarch64 without `fp16`), and otherwise
 each lane's scalar `f16` operation
 ([Half-precision arithmetic](#half-precision-arithmetic)). Every form gives each

@@ -240,8 +240,8 @@ way the target realizes the shape:
 | x86-64 with `f16c` (`x86-64-v3` and up) | four lanes at a time widened to `f32` lanes (`vcvtph2ps`), computed there and narrowed back (`vcvtps2ph`) | four lanes at a time widened to `f32` lanes and compared there |
 | x86-64 without `f16c` | each lane's scalar `f16` operation | each lane's scalar comparison |
 | riscv64, riscv32 | each lane's scalar `f16` operation (no vector unit) | each lane's scalar comparison |
-| spirv with `float16` | the core float instructions on an `f16` vector | the same |
-| spirv without `float16` | each lane's scalar `f16` operation | each lane's scalar comparison |
+| spirv with `Float16` | the core float instructions on an `f16` vector | the same |
+| spirv without `Float16` | each lane's scalar `f16` operation | each lane's scalar comparison |
 
 A lane's scalar operation is the target's own half instruction where it has one
 and the inline expansion otherwise (see
@@ -404,12 +404,12 @@ feature to read or write, and a format other than `Rgba32f`, `Rgba16f`, `R32f`,
 declares `StorageImageExtendedFormats`. An `Unknown` storage image is read and
 written under `StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat`,
 which `vulkan1.3` accepts and an earlier `env` accepts only with the
-`storage_read_without_format` and `storage_write_without_format` extensions (see
+`StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat` extensions (see
 [manifest.md](manifest.md#instruction-set-extensions)). A format must match the
 texel scalar: a float or normalized format is read as `f32`, a signed integer
 format as `i32` and an unsigned one as `u32`. `R64ui` and `R64i` hold 64-bit texels,
 the texel scalar `u64` or `i64`, and declare `Int64ImageEXT`, which needs the
-`image_int64_atomics` extension.
+`Int64ImageEXT` and `SPV_EXT_shader_image_int64` extensions.
 
 `Depth` `1` is a **depth image**, the shadow map a depth comparison samples, and
 `0` any other. Only a depth image is sampled by the `OpImage*Dref*` comparisons
@@ -432,7 +432,7 @@ sampled, so a `sampled_image` cannot compose over one, and its texels are read p
 sample with the `Sample` image operand (see [decorators.md](decorators.md)). A
 multisampled sampled image needs no capability. A multisampled storage image
 declares `StorageImageMultisample`, and an arrayed one `ImageMSArray` too, under
-the `storage_image_multisample` extension.
+the `StorageImageMultisample` extension.
 
 The operands are ordinary comptime constants. One position is not: a constructor
 that composes over another handle takes a **type name**, so `Sampler2D` names the
@@ -582,15 +582,15 @@ Every load and store through a physical pointer carries the pointee's alignment,
 an address made from an integer must be aligned for the type it points at. An atomic
 through one takes no memory operands and carries no alignment, so its address is held
 to the same rule, and the semantics passed to it name its memory `UniformMemory`, as
-on a storage buffer. A 64-bit or float atomic needs the `buffer_*` feature of its
-operation (see [decorators.md](decorators.md)). Every
+on a storage buffer. A 64-bit or float atomic needs the capability of its
+operation (see [gpu.md](gpu.md)). Every
 variable and parameter holding one is decorated aliased, since mach makes no
 promise that two pointers do not overlap. Accesses through one are private under
 the Vulkan memory model: no `"coherent"` qualifier reaches device memory.
 
 A register that one path makes logical and another physical is refused, as is
 every operation a logical pointer has no form for, each naming why. Physical
-pointers need the `buffer_device_address` device feature (see
+pointers need the `PhysicalStorageBufferAddresses` device feature (see
 [manifest.md](manifest.md#finished-module-targets)). A module that holds no physical
 pointer keeps the Logical addressing model and is unchanged by them.
 
