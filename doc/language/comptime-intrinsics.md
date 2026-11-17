@@ -834,7 +834,9 @@ coverage fallback for a `$type_of` dispatch — the unhandled-type `$or {}` arm
 fails the build at compile time instead of falling through to a runtime error.
 
 `$error` is valid in both declaration and statement scope and takes one
-string-literal message.
+string-literal message. One that fires in declaration scope refuses its module,
+and the modules that import it report nothing: see
+[comptime-control.md](comptime-control.md#a-module-refused-by-its-own-error).
 
 ```mach fragment
 $error("msg")           # fails compilation when reached

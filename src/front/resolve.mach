@@ -55,8 +55,9 @@ use comptime_scope: mach.front.comptime.scope;
 use comptime_value: mach.front.comptime.value;
 use mach.front.decorator;
 use mach.front.doclint;
-use front_load:   mach.front.load;
-use front_path:   mach.front.path;
+use front_load: mach.front.load;
+use front_path: mach.front.path;
+use mach.front.refusal;
 use report_phase: mach.report.phase;
 use mach.session;
 use mach.session.module;
@@ -219,7 +220,7 @@ pub rec ModuleExports {
     count:   u32;
     # `(name << 32) | index` of each symbol, ascending, which find_export searches
     by_name: *u64;
-    # the module refused itself, and that refusal is its diagnostic, so a missing name is not one
+    # the module is refused, by its own `$error` or an import's: an importer is not analysed
     refused: bool;
 }
 
@@ -332,8 +333,10 @@ rec ResolveContext {
 
     module_index: map.Map[intern.StrId, SymbolId];
 
-    # names bound from a refused module: a use of one is that refusal again, not a new error
+    # names of imports the load reported and bound nothing for: a use of one is that report
+    # again, not a new error
     refused_names: map.Map[intern.StrId, SymbolId];
+    refusal:       refusal.Refusal;
 
     # whether the lints for the project being built run, never for its dependencies:
     # unused imports and doc comments
@@ -383,8 +386,8 @@ pub rec ResolveResult {
     # the local each `{name}` of an asm block binds
     asm_binds: collections_vector.Vector[AsmBind];
 
-    # a module-scope `$error` in a decided arm refused the module, so nothing else was resolved
-    refused: bool;
+    # why the module is refused, if it is: then nothing else of it was resolved
+    refusal: refusal.Refusal;
 }
 
 # one `{name}` of an asm block and the local it binds
@@ -533,7 +536,7 @@ fun list_holds(list: *module.ModuleId, len: u32, id: module.ModuleId) bool {
 # alloc: owns the returned symbols, released with the ModuleExports they are in
 pub fun result_exports(alloc: *A.Allocator, rr: *ResolveResult, path: intern.StrId,
     stable: module.StableModuleId) res[ModuleExports, fail.Fail] {
-    var mx: ModuleExports = ModuleExports{path: path, module: stable, refused: rr != nil && rr.refused};
+    var mx: ModuleExports = ModuleExports{path: path, module: stable, refused: rr != nil && refusal.is_refused(?rr.refusal)};
     if (rr == nil || rr.pub_count == 0) { ret res[ModuleExports, fail.Fail].ok{mx}; }
     val res_allocate: res[*PublicSymbol, A.Error] = A.allocate[PublicSymbol](alloc, rr.pub_count::usize);
     if (sel res_allocate.err) { ret res[ModuleExports, fail.Fail].err{fail.refused(res_allocate.err)}; }
@@ -731,6 +734,7 @@ pub fun result_dnit(r: *ResolveResult) {
     map.dnit[u64, SymbolId](?r.declared);
     collections_vector.dnit[AsmBind](?r.asm_binds);
     comptime_scope.bindings_dnit(?r.constants);
+    refusal.dnit(?r.refusal);
     r.symbols               = nil;
     r.symbol_count          = 0;
     r.pub_count             = 0;
@@ -751,13 +755,16 @@ pub fun result_dnit(r: *ResolveResult) {
 pub fun result_copy(r: *ResolveResult, alloc: *A.Allocator) res[ResolveResult, fail.Fail] {
     var out: ResolveResult = ResolveResult{status: r.status, alloc: alloc, symbol_count: r.symbol_count, pub_count: r.pub_count,
         expr_count:         r.expr_count, type_count: r.type_count, decl_count: r.decl_count, public_constant_count: r.public_constant_count,
-        expr_choices_count: r.expr_choices_count, refused: r.refused,
+        expr_choices_count: r.expr_choices_count,
         param_index:        map.init[u64, SymbolId](alloc), nominals: map.init[u64, SymbolId](alloc), declared: map.init[u64, SymbolId](alloc),
         constants:          comptime_scope.bindings_init(alloc)};
     var done: bool = false;
     fin {
         if (!done) { result_dnit(?out); }
     }
+    val res_refusal: res[refusal.Refusal, fail.Fail] = refusal.copy(?r.refusal, alloc);
+    if (sel res_refusal.err) { ret res[ResolveResult, fail.Fail].err{res_refusal.err}; }
+    out.refusal = res_refusal.ok;
     val res_symbols: res[*Symbol, A.Error] = array_copy[Symbol](alloc, r.symbols, r.symbol_count::usize);
     if (sel res_symbols.err) { ret res[ResolveResult, fail.Fail].err{fail.refused(res_symbols.err)}; }
     out.symbols = res_symbols.ok;
@@ -863,16 +870,15 @@ pub fun resolve(
     if (!sel opt_module.some) { ret res[ResolveResult, fail.Fail].err{fail.message("root_module is not set on this Ast")}; }
     val mnode: *ast_module.Module = opt_module.some;
 
-    # every other diagnostic in a refused module is a consequence of the refusal
-    val res_refusal: res[bool, fail.Fail] = module_refusal(?rc, mnode.decls_start, mnode.decls_len);
-    if (sel res_refusal.err) { ret res[ResolveResult, fail.Fail].err{res_refusal.err}; }
-    if (res_refusal.ok) {
-        val res_refused: res[ResolveResult, fail.Fail] = build_result(?rc);
-        if (sel res_refused.err) { ret res_refused; }
-        var refused: ResolveResult = res_refused.ok;
-        refused.refused = true;
-        ret res[ResolveResult, fail.Fail].ok{refused};
+    # a module that imports a refused module is not analysed and reports nothing, and one in
+    # which a module-scope `$error` fires reports each that fired and nothing else
+    if (import_refusal(?rc)) {
+        report_phase.reject(?rc.status);
+        ret build_result(?rc);
     }
+    val err_refusal: err[fail.Fail] = module_refusal(?rc, mnode.decls_start, mnode.decls_len);
+    if (sel err_refusal.err)             { ret res[ResolveResult, fail.Fail].err{err_refusal.err}; }
+    if (refusal.is_refused(?rc.refusal)) { ret build_result(?rc); }
 
     val err_decls_collected: err[fail.Fail] = collect_decl_list(?rc, mnode.decls_start, mnode.decls_len, rc.module_scope, true);
     if (sel err_decls_collected.err) { ret res[ResolveResult, fail.Fail].err{err_decls_collected.err}; }
@@ -992,6 +998,7 @@ fun init_context(
     rc.vec_cache      = map.init[intern.StrId, SymbolId](s.alloc);
     rc.module_index   = map.init[intern.StrId, SymbolId](s.alloc);
     rc.refused_names  = map.init[intern.StrId, SymbolId](s.alloc);
+    rc.refusal        = refusal.init(s.alloc);
     rc.lint_project   = module.module_is_root_project(?s.modules, own_module);
     rc.symbol_imports = collections_vector.init[SymbolImport](s.alloc);
     rc.fwd_paths      = collections_vector.init[base_source.Span](s.alloc);
@@ -1103,6 +1110,7 @@ fun dnit_context(rc: *ResolveContext) {
     map.dnit[intern.StrId, SymbolId](?rc.vec_cache);
     map.dnit[intern.StrId, SymbolId](?rc.module_index);
     map.dnit[intern.StrId, SymbolId](?rc.refused_names);
+    refusal.dnit(?rc.refusal);
     collections_vector.dnit[SymbolImport](?rc.symbol_imports);
     collections_vector.dnit[base_source.Span](?rc.fwd_paths);
     collections_vector.dnit[AsmBind](?rc.asm_binds);
@@ -1620,43 +1628,58 @@ fun register_constant_tag(rc: *ResolveContext, name_span: base_source.Span, init
     ret comptime_scope.bind(rc.ctx, name_id, comptime_value.const_elem_untyped(init_expr::u32));
 }
 
-# module_refusal reports the first module-scope `$error` reached through arms the gates
-# decide here, and says whether one was. a gate that cannot be decided yet leaves its
-# chain to collection and sema, which report it when it is decided.
-fun module_refusal(rc: *ResolveContext, start: u32, len: u32) res[bool, fail.Fail] {
+# whether a module this one imports is refused, which refuses this one in turn: a module
+# refused by its own `$error` or by one of its imports exports that it is, so the refusal
+# reaches every module above it
+fun import_refusal(rc: *ResolveContext) bool {
+    var i: u32 = 0;
+    for (i < rc.deps.count) {
+        if (rc.deps.entries[i].refused) {
+            rc.refusal.state = refusal.IMPORTED;
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# reports every module-scope `$error` reached through arms the gates decide here, each a
+# site of the module's refusal. a gate that cannot be decided yet leaves its chain to sema,
+# which refuses the module the same way when it decides it
+fun module_refusal(rc: *ResolveContext, start: u32, len: u32) err[fail.Fail] {
     var i: u32 = 0;
     for (i < len) {
         val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(rc.a, rc.a.decl_ids.data[start + i]);
-        if (!sel opt_decl.some) { ret res[bool, fail.Fail].err{fail.message("DeclId out of range")}; }
+        if (!sel opt_decl.some) { ret err[fail.Fail].err{fail.message("DeclId out of range")}; }
         val d: *ast_decl.Decl = opt_decl.some;
         if (d.kind == ast_decl.DECL_KIND_COMPTIME_DIRECTIVE && !ast_id.expr_is_nil(d.data.comptime_directive.target)
             && intrinsic.is_error_call(rc.a, rc.source, d.data.comptime_directive.target)) {
             val err_report_error_directive: err[fail.Fail] = report_error_directive(rc, d.data.comptime_directive.target, d.span);
-            if (sel err_report_error_directive.err) { ret res[bool, fail.Fail].err{err_report_error_directive.err}; }
-            ret res[bool, fail.Fail].ok{true};
+            if (sel err_report_error_directive.err) { ret err_report_error_directive; }
+            val err_fired: err[fail.Fail] = refusal.fired(?rc.refusal, d.span.offset);
+            if (sel err_fired.err) { ret err_fired; }
         }
         if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
-            val res_comptime_if_refusal: res[bool, fail.Fail] = comptime_if_refusal(rc, ?d.data.comptime_if);
-            if (sel res_comptime_if_refusal.err) { ret res_comptime_if_refusal; }
-            if (res_comptime_if_refusal.ok)      { ret res_comptime_if_refusal; }
+            val err_comptime_if_refusal: err[fail.Fail] = comptime_if_refusal(rc, ?d.data.comptime_if);
+            if (sel err_comptime_if_refusal.err) { ret err_comptime_if_refusal; }
         }
         i = i + 1;
     }
-    ret res[bool, fail.Fail].ok{false};
+    ret err[fail.Fail].ok{};
 }
 
-fun comptime_if_refusal(rc: *ResolveContext, ci: *ast_decl.DeclComptimeIf) res[bool, fail.Fail] {
+fun comptime_if_refusal(rc: *ResolveContext, ci: *ast_decl.DeclComptimeIf) err[fail.Fail] {
     var bi: u32 = 0;
     for (bi < ci.branches_len) {
         val br:                       *ast_decl.ComptimeBranch                  = ?rc.a.comptime_branches.data[ci.branches_start + bi];
         val res_refusal_gate_outcome: res[comptime_gate.GateOutcome, fail.Fail] = refusal_gate_outcome(rc, br);
-        if (sel res_refusal_gate_outcome.err) { ret res[bool, fail.Fail].err{res_refusal_gate_outcome.err}; }
+        if (sel res_refusal_gate_outcome.err) { ret err[fail.Fail].err{res_refusal_gate_outcome.err}; }
         val outcome: comptime_gate.GateOutcome = res_refusal_gate_outcome.ok;
         if (outcome == comptime_gate.GATE_ACTIVE)   { ret module_refusal(rc, br.body_start, br.body_len); }
-        if (outcome != comptime_gate.GATE_INACTIVE) { ret res[bool, fail.Fail].ok{false}; }
+        if (outcome != comptime_gate.GATE_INACTIVE) { ret err[fail.Fail].ok{}; }
         bi = bi + 1;
     }
-    ret res[bool, fail.Fail].ok{false};
+    ret err[fail.Fail].ok{};
 }
 
 # a decision the load recorded stands here as it does for collection, whatever
@@ -1897,7 +1920,6 @@ fun collect_use(rc: *ResolveContext, decl_id: ast_id.DeclId, du: *ast_decl.DeclU
     }
 
     val ps: *PublicSymbol = find_export(pmx, leaf_id);
-    if (ps == nil && pmx.refused) { ret note_refused_name(rc, bind_span); }
     if (ps == nil) {
         report_named2(rc, diagnostic_kind.VISIBILITY_NOT_EXPORTED, du.path, "`", leaf_id, "` is not exported by `", pmx.path, "`");
         ret err[fail.Fail].ok{};
@@ -1928,7 +1950,6 @@ fun bind_recorded_use(rc: *ResolveContext, decl_id: ast_id.DeclId, du: *ast_decl
     var bind_span: base_source.Span = du.alias;
     if (bind_span.len == 0) { bind_span = leaf; }
     val ps: *PublicSymbol = find_export(mx, b.name);
-    if (ps == nil && mx.refused) { ret note_refused_name(rc, bind_span); }
     if (ps == nil) {
         report_named2(rc, diagnostic_kind.VISIBILITY_NOT_EXPORTED, du.path, "`", b.name, "` is not exported by `", mx.path, "`");
         ret err[fail.Fail].ok{};
@@ -2068,10 +2089,6 @@ fun bind_member_qualified(rc: *ResolveContext, eid: ast_id.ExprId, member: *ast_
     if (intern.str_is_nil(leaf_id)) { ret err[fail.Fail].ok{}; }
 
     val ps: *PublicSymbol = find_export(mx, leaf_id);
-    if (ps == nil && mx.refused) {
-        report_phase.reject(?rc.status);
-        ret err[fail.Fail].ok{};
-    }
     if (ps == nil && rc.in_deferred_arm) {
         rc.expr_resolved[ast_id.expr_index(eid)] = SYMBOL_DEFERRED_NAME;
         ret err[fail.Fail].ok{};
@@ -2279,7 +2296,6 @@ fun collect_fwd(rc: *ResolveContext, decl_id: ast_id.DeclId, df: *ast_decl.DeclF
     }
 
     val ps: *PublicSymbol = find_export(pmx, leaf_id);
-    if (ps == nil && pmx.refused) { ret note_refused_name(rc, bind_span); }
     if (ps == nil) {
         record_report(rc, diagnostic_kind.VISIBILITY_NOT_EXPORTED, df.path, "re-exported symbol is not exported by its module");
         ret err[fail.Fail].ok{};
@@ -3975,6 +3991,8 @@ fun build_result(rc: *ResolveContext) res[ResolveResult, fail.Fail] {
     out.type_heads         = rc.type_heads;
     out.asm_binds          = rc.asm_binds;
     rc.asm_binds           = collections_vector.init[AsmBind](rc.s.alloc);
+    out.refusal            = rc.refusal;
+    rc.refusal             = refusal.init(rc.s.alloc);
     out.constants          = comptime_scope.publish(rc.ctx);
 
     rc.expr_resolved      = nil;

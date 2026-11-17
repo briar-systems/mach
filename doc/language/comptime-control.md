@@ -210,13 +210,55 @@ $or {
 }
 ```
 
-The one visible consequence is ordering. A `$error` reached under a chain that
-declares nothing is reported during type checking, so an unrelated name-resolution
-error elsewhere in the same module is reported before it rather than after.
+What the time changes for a module-scope `$error` is when it fires, which the
+next section describes.
 
 A `$if` inside a **function body** is always decided during type checking: it
 selects statements rather than declarations, so the question above does not arise
 and its gate may always ask about a type.
+
+## A module refused by its own `$error`
+
+A `$error` written at module scope, bare or in an arm of a declaration-scope
+chain, states that the module cannot exist in this build. A module in which one
+fires is **refused**:
+
+- It reports every module-scope `$error` that fires in it and nothing else: no
+  other error and no warning of the module is reported.
+- A module that imports a refused module, directly or through modules that import
+  it, is not analysed and reports nothing, its own module-scope `$error` included.
+  So one refused module gives one line however long the chain of imports above it
+  is, and two refused modules that do not import each other give one line each.
+- The build fails as it does for any error, and the summary counts the lines it
+  printed.
+
+```mach fragment
+# on any target but linux this module prints this one line and nothing else, and
+# a module that imports it, or imports one that does, prints nothing
+$if ($mach.build.sys == $mach.sys.linux) {
+    use native: std.system.os.linux;
+}
+$or {
+    $error("this module needs a linux target");
+}
+```
+
+Where the `$error` sits decides when the module is refused. Bare, or under a chain
+name resolution decides (one that declares something, or one whose gate asks no
+type question), it fires while names are resolved. Then neither the module nor
+anything that imports it is resolved or type checked, so a `$error` of the module
+under a chain only type checking decides is not reached. Under a chain that
+declares nothing and asks a type question, it fires during type checking. Type
+checking runs only once every module of the build resolves without error or
+refusal, so until then the name-resolution errors are reported, the refused
+module's included, and the `$error` is not yet reached. Once it fires, the modules
+that import the refused one are not type checked, and nothing that loading or name
+resolution said of the refused module or of them is reported.
+
+A `$error` in a function body, or in an arm an instance selects, refuses nothing:
+it is reported where the next sections say, unless its module is refused or not
+analysed. `mach doc` only parses, decides no gate and fires no `$error`, so it
+documents a module a build would refuse.
 
 ## Discarded branches
 
@@ -261,7 +303,8 @@ instance that selects it, at the call that asked for the instance, with the
 `$error` itself as the related site. A `$error` in an arm no instance selects
 never fires, and neither does one in a function nothing calls. A `$error`
 outside any gated arm is reported once, at the `$error`, without waiting for
-a call.
+a call. None of these refuses its module, and none is reported from a module
+that is [refused or not analysed](#a-module-refused-by-its-own-error).
 
 ```mach error no two
 fun shifted($n: u8, x: u64) u64 {
