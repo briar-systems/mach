@@ -25,6 +25,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | Functions | |
 | :--- | :--- |
 | [`attaching`](#attaching) | whether the target reads shader attributes |
+| [`storage_class`](#storage_class) | the value of the storage class the spir-v grammar names `name` |
 | [`initialized`](#initialized) | whether a global of the declaration `d` holds the initial value it is written with: the host, the pipeline or the previous stage supplies an interface variable's |
 | [`specialized`](#specialized) | whether the declaration `d` is a `#[gpu.spec]` var on a target that states specialization constants, which defines no global there: each read of it is the constant |
 | [`global_attributes`](#global_attributes) | the attributes of global `gix` its declaration `d` states, read in the scope `d` is written in |
@@ -63,6 +64,14 @@ pub fun attaching(lc: *mach.lower.context.LowerContext) bool
 ```
 
 whether the target reads shader attributes
+
+### storage_class
+
+```mach
+pub fun storage_class(name: str) opt[u64]
+```
+
+the value of the storage class the spir-v grammar names `name`
 
 ### initialized
 

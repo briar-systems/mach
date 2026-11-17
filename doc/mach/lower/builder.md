@@ -31,6 +31,8 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`slot_space`](#slot_space) | the address space a stack slot lives in, as mirl's target states it |
 | [`global_space`](#global_space) | the address space global `ix` lives in: its storage class where the target's pointers name one, the default space elsewhere |
 | [`classes`](#classes) | whether the target's pointers name a storage class each, so a function's pointer parameters take the classes of the storage their arguments point into |
+| [`physical_space`](#physical_space) | the address space of a physical pointer where the target's pointers name a storage class each: the one space whose pointers the target models as addresses, as spir-v's PhysicalStorageBuffer |
+| [`is_physical`](#is_physical) | whether `ty` is a physical pointer |
 | [`int_type`](#int_type) | |
 | [`index_type`](#index_type) | the integer as wide as a pointer, which addresses are compared and stepped in |
 | [`size_of`](#size_of), [`align_of`](#align_of), [`offset_of`](#offset_of) | |
@@ -279,6 +281,25 @@ pub fun classes(b: *Builder) bool
 
 whether the target's pointers name a storage class each, so a function's pointer
 parameters take the classes of the storage their arguments point into
+
+### physical_space
+
+```mach
+pub fun physical_space(b: *Builder) opt[u32]
+```
+
+the address space of a physical pointer where the target's pointers name a storage class
+each: the one space whose pointers the target models as addresses, as spir-v's
+PhysicalStorageBuffer. a pointer the source holds in memory, returns, makes from an
+integer or spells `nil` is of this space (types.md, "pointers on spir-v")
+
+### is_physical
+
+```mach
+pub fun is_physical(b: *Builder, ty: Type) bool
+```
+
+whether `ty` is a physical pointer
 
 ### int_type
 

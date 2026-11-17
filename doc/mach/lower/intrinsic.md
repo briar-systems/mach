@@ -21,6 +21,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | Functions | |
 | :--- | :--- |
 | [`check`](#check) | what a call's declaration must be against its row, refused with `op.signature` |
+| [`result_class`](#result_class) | the storage class a call's pointer result points into where its row's typing relates the result to the texel of an image: the Image class, as OpImageTexelPointer's result points into (spir-v 1.6, OpImageTexelPointer), none for any other row, whose pointer result keeps the default space |
 
 ---
 
@@ -41,4 +42,14 @@ what a call's declaration must be against its row, refused with `op.signature`
 | `r` | its row |
 | `lead` | the row operands its result, result type or set's import take |
 | `fn` | the declaration's function type |
+
+### result_class
+
+```mach
+pub fun result_class(ctx: *mach.lower.context.LowerContext, r: *masc.core.row.Row) opt[u32]
+```
+
+the storage class a call's pointer result points into where its row's typing relates the result to the texel of an
+image: the Image class, as OpImageTexelPointer's result points into (spir-v 1.6, OpImageTexelPointer), none for any
+other row, whose pointer result keeps the default space
 

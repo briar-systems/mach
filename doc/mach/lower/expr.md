@@ -22,8 +22,8 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`lower_stored_rvalue`](#lower_stored_rvalue) | the value a store consumes |
 | [`branch_on`](#branch_on) | branch to `then_b` where the condition `eid` holds, else to `else_b` |
 | [`condition_value`](#condition_value) | |
-| [`store_stated`](#store_stated) | write `v` to `ptr`, a place of source type `ty`, stating the memory it writes as secret or public as `ty` is |
-| [`const_value_of_init`](#const_value_of_init), [`type_is_volatile_record`](#type_is_volatile_record) | |
+| [`refuse_mixed`](#refuse_mixed) | write `v` to `ptr`, a place of source type `ty`, stating the memory it writes as secret or public as `ty` is refuse the pointer `v` written where `at` holds a pointer of the type `held` names, when one of the two is physical and the other logical: memory, a result and a parameter no call names a storage of hold physical pointers only, and a pointer local holds the class its initializer gave it, so a logical pointer stored there, or a physical one where a logical one is held, is a register one path makes logical and another physical (types.md, "pointers on spir-v") |
+| [`store_stated`](#store_stated), [`const_value_of_init`](#const_value_of_init), [`type_is_volatile_record`](#type_is_volatile_record) | |
 
 ---
 
@@ -85,13 +85,24 @@ its right operand runs only where the left does not decide
 pub fun condition_value(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId, v: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+### refuse_mixed
+
+```mach
+pub fun refuse_mixed(ctx: *mach.lower.context.LowerContext, v: mach.lower.value.Value, at: mach.lower.value.Value, held: Type, span: mach.base.source.Span) err[mach.base.fail.Fail]
+```
+
+write `v` to `ptr`, a place of source type `ty`, stating the memory it writes as secret or public as `ty` is
+refuse the pointer `v` written where `at` holds a pointer of the type `held` names, when one of
+the two is physical and the other logical: memory, a result and a parameter no call names a
+storage of hold physical pointers only, and a pointer local holds the class its initializer
+gave it, so a logical pointer stored there, or a physical one where a logical one is held, is
+a register one path makes logical and another physical (types.md, "pointers on spir-v")
+
 ### store_stated
 
 ```mach
 pub fun store_stated(ctx: *mach.lower.context.LowerContext, v: mach.lower.value.Value, ptr: mach.lower.value.Value, ty: mach.type.kind.TypeId, vol: bool) err[mach.base.fail.Fail]
 ```
-
-write `v` to `ptr`, a place of source type `ty`, stating the memory it writes as secret or public as `ty` is
 
 ### const_value_of_init
 
