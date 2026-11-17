@@ -100,10 +100,13 @@ Where it allows it, the stage carries `LocalSizeId` over the spec constant. That
 needs SPIR-V 1.2 and, on Vulkan, the `maintenance4` feature, which only Vulkan
 1.3 requires of every device, so the form is used with no `env` and with
 `vulkan1.3`. Every other environment gets a `WorkgroupSize` built-in over an
-`OpSpecConstantComposite`. That built-in sizes **every** compute stage in the
+`OpSpecConstantComposite`, and each stage's `LocalSize` states the defaults, which
+the built-in overrides. That built-in sizes **every** compute stage in the
 module, so a module in such an environment whose compute stages size their
 workgroups differently, and at least one of them through a `#[gpu.spec]` var, is
-refused. Give the stages one workgroup or put them in separate modules.
+refused. Two stages size a dimension the same way only where both name one
+`#[gpu.spec]` var or both write one number, since the host may specialize the var
+to any size. Give the stages one workgroup or put them in separate modules.
 
 ## `gpu.input(n)` / `gpu.output(n)` / `gpu.builtin(str)` / `gpu.uniform(set, binding)` / `gpu.storage(set, binding)` / `gpu.sampler(set, binding)` / `gpu.push` / `gpu.spec(id)` / `gpu.shared` — shader interface
 
@@ -525,10 +528,15 @@ SPIR-V and Vulkan both admit an initializer on an Output variable.
 As with `#[gpu.stage(...)]`, these are accepted on every target and acted on only by a
 target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in the
 matching storage class, carrying the matching decoration, and the Input and Output
-variables are named in every entry point's interface list. A `gpu.sampler` binding
-becomes an `OpVariable` in the `UniformConstant` class — the one class Vulkan
-permits an image, sampler or sampled-image variable in — carrying `DescriptorSet`
-and `Binding` exactly as a `gpu.uniform` does. A `gpu.push` block becomes an `OpVariable`
+variables are named in every entry point's interface list. A binding's class is
+decided by its role and the type it holds. A `gpu.sampler` binding, which holds a
+sampler or a sampled image, and a `gpu.storage` binding that holds a storage image
+become `OpVariable`s in the `UniformConstant` class, the one class Vulkan permits a
+handle variable in. A binding that holds a block becomes one in `Uniform` for
+`gpu.uniform` and in `StorageBuffer` for `gpu.storage`. A handle is never a
+`gpu.uniform` binding, and never sits in an array, both refused before code is made.
+Every binding carries `DescriptorSet` and `Binding`.
+A `gpu.push` block becomes an `OpVariable`
 in the `PushConstant` class, with no `DescriptorSet` or `Binding`. A `gpu.shared` variable
 becomes an `OpVariable` in the `Workgroup` class, named in the interface of each entry
 point that uses it from SPIR-V 1.4.
