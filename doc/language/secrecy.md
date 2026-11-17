@@ -616,6 +616,19 @@ as anywhere else.
 - **The timing mode.** A block may not turn the timing mode off: aarch64's
   `msr dit` from a register and `msr pstate.dit, #0` are refused whatever encodes
   them. Only the read, set and restore the frame code places are admitted.
+- **The processor state the walk reads under.** An instruction may read a
+  register only under a processor state, and the walk reads it under the state
+  the target establishes where a thread of the program starts. On aarch64 a
+  scalar float instruction of one source (`fabs`, `fneg`, `fsqrt`, the `frint`
+  forms, `fcvt`, `bfcvt`, `frecpe`, `frecpx`, `frsqrte`, `fcvtxn`, the
+  conversions to and from integers and fixed point) keeps the upper bits of its
+  destination only where FPCR.NEP is set under FEAT_AFP, and so reads the
+  destination only then. Where the target establishes FPCR.NEP clear, the walk
+  checks with it clear and such an instruction writes its destination without
+  reading it. Where the target does not, the walk takes FPCR.NEP as possibly
+  set, so the destination's old value is an input, and a refusal for it says
+  `needs no nep=on`. A block may not write `fpcr`: `msr fpcr` is refused
+  whatever value it writes.
 
 What the walk cannot read, it refuses: bytes that decode to no instruction, an
 instruction whose effects masc's tables leave undecided, and control that leaves
@@ -1199,6 +1212,27 @@ known and accepted under it:
 - an untrusted callee whose `asm` reads its caller's frame;
 - untrusted code whose `asm` moves a secret it reaches through a global into
   public storage it was given, directly or through a trusted callee.
+
+The check is a proof under the processor state the target establishes. On
+aarch64 that is FPCR.NEP, which a target states clear only where a source
+establishes it, cited beside the fact in mink's catalog of hosts:
+
+| target | FPCR.NEP at a thread's start | source |
+|---|---|---|
+| linux | clear | exec clears the thread's whole float state (`fpsimd_flush_thread`), a new thread copies its parent's, a signal handler runs on the interrupted thread's |
+| darwin | clear | xnu sets a 64-bit thread's FPCR to `FPCR_DEFAULT`, which is 0 |
+| uefi | clear | UEFI 2.10, section 2.3.6: FPCR=0 at image entry |
+| freestanding | not established | a warm reset leaves FPCR UNKNOWN, and a program may supply its own entry, so nothing outside the function establishes it |
+| windows | not established | no primary source states a thread's initial FPCR |
+
+On a target that does not establish it, a one-source scalar float instruction
+whose destination may hold a secret is refused.
+
+Code that sets FPCR.NEP by hand is outside what the checker proves: with it
+set, a one-source scalar float instruction keeps its destination's upper bits,
+which may hold a secret a caller left in the register. A constant-time
+function's own write of `fpcr` is refused, and untrusted code that sets it and
+returns is trusted not to.
 
 ## Assurance
 
