@@ -846,7 +846,8 @@ and with it the module declares `MinLod`. Nor does any select `ImageGatherExtend
 `shaderImageGatherExtended`, which a run-time `Offset` image operand needs and with
 which the module declares `ImageGatherExtended`. Vulkan admits that operand on a
 fetch or a sample as well as a gather only under its `maintenance8` feature, which
-enables no capability, so no `ext` name states it.
+enables no capability, so no `ext` name states it, and which no Vulkan version requires,
+so a run-time `Offset` outside a gather is refused.
 
 No environment selects a type's feature, since every Vulkan version leaves them
 optional: `Int8`, `Int16`, `Int64`, `Float16` and `Float64` are Vulkan's

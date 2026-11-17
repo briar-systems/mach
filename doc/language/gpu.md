@@ -196,12 +196,15 @@ are emitted as a `Block`-decorated struct with an explicit offset on every membe
 
 They differ in one place: their **layout rules**. A block keeps mach's own layout,
 and the layout is held to the rules Vulkan holds its class to, refused where it
-breaks them rather than silently repacked. A uniform block follows std140-shaped
-rules, under which an array's stride is rounded up to 16 — which mach's own layout
-does not do, so an array of anything narrower than 16 bytes is refused. A storage
-buffer follows std430-shaped rules, which use the element's natural stride, as
-mach's layout does, so `[8]f32` is fine in a `gpu.storage` block and rejected in a
-`gpu.uniform` one. Both place a vector at a multiple of its own alignment, twice its
+breaks them rather than silently repacked. Under `vulkan1.0` and `vulkan1.1` a uniform
+block follows std140-shaped rules, under which an array's stride is rounded up to 16,
+which mach's own layout does not do, so an array of anything narrower than 16 bytes is
+refused. A storage buffer follows std430-shaped rules, which use the element's natural
+stride, as mach's layout does, so `[8]f32` is fine in a `gpu.storage` block and
+rejected in a `gpu.uniform` one there. Vulkan 1.2 requires `uniformBufferStandardLayout`
+of every device, under which a uniform block takes the storage buffer's rules, so under
+`vulkan1.2`, `vulkan1.3` and with no `env` a uniform block follows the std430-shaped
+rules too. Both place a vector at a multiple of its own alignment, twice its
 lane's for two lanes and four times for three or four; under `vulkan1.1` and later,
 and with no `env`, whose relaxed block layout Vulkan 1.1 took into its core, a vector
 member may sit at any multiple of its lane's size that keeps it within one 16-byte
@@ -337,7 +340,9 @@ coordinate, and never on a `Cube` image. A gather may take `ConstOffsets` (`0x20
 instead, a constant `[4]i32x2` of the offsets of the four texels it reads. An
 instruction takes one offset bit at most. `Offset` and `ConstOffsets` need the
 `ImageGatherExtended` extension, and Vulkan admits `Offset` outside a gather only under
-its `maintenance8` feature, which enables no capability and so has no `ext` name. A sample takes
+its `maintenance8` feature, which enables no capability and so has no `ext` name and which
+no Vulkan version requires, so a run-time `Offset` on any other image instruction is refused
+at the call with `op.operand_value`, and a constant offset is `ConstOffset`. A sample takes
 `MinLod` (`0x80`), the least level of detail it reads, which an explicit-lod sample
 takes only with `Grad` and which needs the `MinLod` extension.
 `OpImageGather` reads one component, a constant id, of the four texels a sample of a
@@ -705,7 +710,12 @@ A non-constant argument to a constant id or a literal is refused at the call,
 naming the operand. A row **without a result** is declared with no return type,
 and a row with one must return it. A row may also **return a pointer** into a
 storage class the row itself declares, as `OpImageTexelPointer` returns an `Image`
-pointer, and that result is accepted as a later instruction's pointer operand. A
+pointer, and that result is accepted as a later instruction's pointer operand. No call
+passes a pointer into the `Image` class (SPIR-V's logical addressing takes none as a
+function's argument, with or without variable pointers), so passing a texel pointer to
+a function is refused at the call with `spirv.unsupported`. A row whose result is a
+**structure**, as each `OpImageSparse` instruction gives its residency code and its
+texels, is declared returning a `rec` of those members, which receives the structure. A
 row whose result is a **truth value**, such as `OpGroupNonUniformElect`, is declared
 returning an integer, which receives 1 or 0. A `bool` return is an 8-bit integer,
 which a target without `Int8` carries at 32 bits like any other 8-bit local

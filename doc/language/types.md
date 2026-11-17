@@ -423,9 +423,12 @@ which `vulkan1.3` accepts and an earlier `env` accepts only with the
 [manifest.md](manifest.md#instruction-set-extensions)). A format must match the
 texel scalar: a float or normalized format is read as `f32`, a signed integer
 format as `i32` and an unsigned one as `u32`. A module declares its integer types without
-signedness, so an instruction reading or writing the texels of a signed integer
-format sets the `SignExtend` image operand, which SPIR-V 1.4 brings, and a target
-for `vulkan1.0` or `vulkan1.1` is refused for one with `spirv.capability`. `R64ui` and `R64i` hold 64-bit texels,
+signedness, except the `Sampled Type` of an image of a signed integer format, which is a
+signed integer, so every access to its texels is signed as Vulkan requires (the
+signedness of an access is its image's `Sampled Type`'s where it sets neither `SignExtend`
+nor `ZeroExtend`), in every `env`. Each texel the instruction reads or writes, or an
+atomic reaches through a texel pointer, is that signed integer, reinterpreted from or to
+the `i32` the program holds. `R64ui` and `R64i` hold 64-bit texels,
 the texel scalar `u64` or `i64`, and declare `Int64ImageEXT`, which needs the
 `Int64ImageEXT` and `SPV_EXT_shader_image_int64` extensions.
 
