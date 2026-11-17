@@ -74,7 +74,9 @@ uses generic words such as `input` and `shared`.
 
 Decorators appear **before** the declaration they target, one per line or
 space-separated on the same line. They attach to the immediately following
-declaration only and do not bleed across declarations.
+declaration only and do not bleed across declarations. Each decorator stands
+at most once on a declaration: a second of the same name, with the same
+arguments or others, is refused with `decorator.duplicate`.
 
 ```mach fragment
 #[inline("always")]
