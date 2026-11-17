@@ -688,8 +688,9 @@ extend-then-multiply path where the vector register is 128 bits. x86-64 under
 
 `f16` lanes realize per target as [types.md](types.md#simd-vectors) lists: packed
 on aarch64 with `fp16` and on spirv with `Float16`, through packed `f32` lanes on
-x86-64 with `f16c` (and for comparisons on aarch64 without `fp16`), and otherwise
-each lane's scalar `f16` operation
+x86-64 with `f16c` (and for comparisons on aarch64 without `fp16`), as `f32` lanes of
+integer code on the lanes' encodings at the vector's width on spirv without `Float16`, and
+otherwise each lane's scalar `f16` operation
 ([Half-precision arithmetic](#half-precision-arithmetic)). Every form gives each
 lane the bits of the scalar operation.
 

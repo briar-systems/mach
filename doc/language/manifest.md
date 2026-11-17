@@ -896,7 +896,7 @@ the version that took it into the core.
 
 | Memory | 16-bit | 8-bit |
 |---|---|---|
-| `#[gpu.storage(...)]`, or a record a physical pointer reaches | `StorageBuffer16BitAccess` | `StorageBuffer8BitAccess` |
+| `#[gpu.storage(...)]`, or a record a physical pointer reaches (with `Int16` or `Float16`, and `Int8`, as well, see [types.md](types.md#pointers-on-spir-v)) | `StorageBuffer16BitAccess` | `StorageBuffer8BitAccess` |
 | `#[gpu.uniform(...)]` | `UniformAndStorageBuffer16BitAccess` | `UniformAndStorageBuffer8BitAccess` |
 | `#[gpu.push]` | `StoragePushConstant16` | `StoragePushConstant8` |
 | `#[gpu.input(n)]`, `#[gpu.output(n)]` | `StorageInputOutput16` | refused |

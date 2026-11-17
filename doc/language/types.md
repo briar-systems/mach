@@ -256,7 +256,7 @@ way the target realizes the shape:
 | x86-64 without `f16c` | each lane's scalar `f16` operation | each lane's scalar comparison |
 | riscv64, riscv32 | each lane's scalar `f16` operation (no vector unit) | each lane's scalar comparison |
 | spirv with `Float16` | the core float instructions on an `f16` vector | the same |
-| spirv without `Float16` | each lane's scalar `f16` operation | each lane's scalar comparison |
+| spirv without `Float16` | the lanes widened to `f32` lanes as integer code on their encodings, computed there and narrowed back, at the vector's width | the lanes widened to `f32` lanes and compared there |
 
 A lane's scalar operation is the target's own half instruction where it has one
 and the inline expansion otherwise (see
@@ -423,8 +423,9 @@ which `vulkan1.3` accepts and an earlier `env` accepts only with the
 [manifest.md](manifest.md#instruction-set-extensions)). A format must match the
 texel scalar: a float or normalized format is read as `f32`, a signed integer
 format as `i32` and an unsigned one as `u32`. A module declares its integer types without
-signedness, except the `Sampled Type` of an image of a signed integer format, which is a
-signed integer, so every access to its texels is signed as Vulkan requires (the
+signedness, except the `Sampled Type` of an image of signed texels, which is a signed
+integer: one of a signed integer format, or one of `Unknown` format whose texel scalar is
+`i32` or `i64`, so every access to its texels is signed as Vulkan requires (the
 signedness of an access is its image's `Sampled Type`'s where it sets neither `SignExtend`
 nor `ZeroExtend`), in every `env`. Each texel the instruction reads or writes, or an
 atomic reaches through a texel pointer, is that signed integer, reinterpreted from or to
@@ -603,10 +604,16 @@ compared, ordered as an unsigned 64-bit address and cast to and from `u64`, and 
 can be held in memory, passed and returned. Comparing, ordering, casting and adding
 a byte offset read the address as the `u64` it is, so they need `Int64` as any `u64`
 does. The rest need nothing past `PhysicalStorageBufferAddresses`. Its pointee is
-laid out by the std430 rules a `#[gpu.storage]` block follows (see [decorators.md](decorators.md)), refused
-where mach's layout disagrees with them. A record that reaches itself through
+laid out by the std430 rules a `#[gpu.storage]` block follows (see [decorators.md](decorators.md)), relaxed
+for vectors where the environment states relaxed block layout, and refused with
+`spirv.interface` at the first access that reaches it where mach's layout disagrees with them. A record that reaches itself through
 pointers, like `Node` above, is a recursive type, and so is a set of records that
-reach each other. A tag cannot sit behind a physical pointer.
+reach each other. A tag behind one is held as it is in a storage buffer, its
+discriminant first and its payload as its largest case. An 8- or 16-bit scalar or an `f16`
+behind one needs the storage feature of its width, as in a storage buffer, and the width's own
+feature (`Int8`, `Int16` or `Float16`) as well, since the module makes the pointer to it with
+`OpBitcast`, and the storage features make a pointer to such a type only as the result of a
+variable or an access chain (SPIR-V 2.16.1, "Data rules").
 
 Every load and store through a physical pointer carries the pointee's alignment, so
 an address made from an integer must be aligned for the type it points at. An atomic
