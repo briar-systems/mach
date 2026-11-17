@@ -756,6 +756,31 @@ Vulkan's `VK_SUBGROUP_FEATURE_ARITHMETIC_BIT`, and a target naming no `env` hold
 every extension. A module declares a capability only when something it emits needs
 it, with `OpExtension` for a capability a SPIR-V extension defines.
 
+A call that passes a pointer into a `#[gpu.storage]` binding, or into any part of
+one, needs the device feature `VariablePointersStorageBuffer`, Vulkan's
+`variablePointersStorageBuffer`, since logical addressing lets a call pass a
+storage buffer pointer only under that capability (SPIR-V 2.16.1). A target that
+names it in its `ext` declares the capability, with `SPV_KHR_variable_pointers`
+below SPIR-V 1.3, and one that does not is refused with `spirv.capability`, naming
+it. The callee is never inlined to avoid it.
+
+Logical addressing limits what else a call may be passed (SPIR-V 2.16.1). A
+pointer argument may be:
+
+- a whole local, a whole module-scope `var` or `#[gpu.shared]` variable, or a
+  pointer parameter passed on, which needs nothing;
+- a pointer into a `#[gpu.storage]` binding, whole or any part of it, under
+  `VariablePointersStorageBuffer` as above;
+- a part of a `#[gpu.shared]` variable, a member or an element, under
+  `VariablePointers`, Vulkan's `variablePointers`, declared the same way and
+  refused the same way without it.
+
+Nothing else may be passed: neither a part of a local or of a module-scope `var`,
+nor a pointer into a `#[gpu.uniform]`, `#[gpu.push]`, `#[gpu.input]` or
+`#[gpu.output]` variable, whole or part. Such a call is refused with
+`spirv.unsupported`, naming the storage class, and the program passes the value
+instead or reaches the binding in the callee.
+
 A row may also be **typed**: its requirement depends on the type it operates on, read
 from one operand (a pointer's pointee), and on the storage class that operand's
 memory lives in. The atomics are typed. A declaration whose type the row admits in no
