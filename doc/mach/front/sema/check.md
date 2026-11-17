@@ -20,14 +20,17 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 | [`check_const_range`](#check_const_range) | a constant start must keep the whole range inside an array or a vector: `start + count` may reach the length and not pass it |
 | [`const_index_value`](#const_index_value) | |
 | [`check_shift_count`](#check_shift_count) | a shift whose count is a comptime constant must keep the count below the left operand's width: at or above it the runtime answer is the saturated value (0, or the sign fill), which a constant program never means |
-| [`check_secret_address`](#check_secret_address), [`check_member`](#check_member), [`check_cast`](#check_cast) | |
+| [`check_secret_address`](#check_secret_address) | |
+| [`report_untyped_access`](#report_untyped_access) | the refusal of `access` read through the untyped `ptr`, which names no type to read |
+| [`check_member`](#check_member), [`check_cast`](#check_cast) | |
 | [`report_secrecy`](#report_secrecy) | a secrecy refusal whose message names the field its answer turned on: where the classes differ, or the instance that grows and what kept it from lining up with the other side |
 | [`check_reinterpret`](#check_reinterpret), [`check_return`](#check_return), [`check_condition`](#check_condition) | |
 | [`refuse_form`](#refuse_form) | form `form` of a previous major written at `span`, refused naming what this major spells |
 | [`byte_size`](#byte_size) | the size of a value of `t`, 0 when it has none or does not fit 32 bits; an array is its element's size times every count above it, read in a loop, so an array nested through flat defs deeper than the stack still has its size |
-| [`type_to_str`](#type_to_str), [`type_str_free`](#type_str_free), [`report_no_field`](#report_no_field), [`report_named`](#report_named), [`report_missing_type_args`](#report_missing_type_args), [`report_typed`](#report_typed), [`report_typed2`](#report_typed2), [`expr_span_of`](#expr_span_of), [`report_out_of_range`](#report_out_of_range) | |
+| [`type_to_str`](#type_to_str), [`type_str_free`](#type_str_free), [`report_no_field`](#report_no_field), [`report_named`](#report_named), [`report_missing_type_args`](#report_missing_type_args), [`report_missing_call_type_args`](#report_missing_call_type_args), [`report_typed`](#report_typed), [`report_typed2`](#report_typed2), [`expr_span_of`](#expr_span_of), [`report_out_of_range`](#report_out_of_range) | |
 | [`report_default_out_of_range`](#report_default_out_of_range) | the range refusal of a literal no context typed, which took the i64 default |
 | [`report_cast_out_of_range`](#report_cast_out_of_range) | the range refusal of a literal a cast to `to` reinterprets, which took an integer of `to`'s size |
+| [`report_literal_out_of_range`](#report_literal_out_of_range) | the range refusal of a suffixed literal its own suffix's type does not hold |
 
 | Constants | |
 | :--- | :--- |
@@ -112,6 +115,14 @@ value (0, or the sign fill), which a constant program never means
 ```mach
 pub fun check_secret_address(sc: *mach.front.sema.context.SemaContext, ty: mach.type.kind.TypeId, span: mach.base.source.Span) bool
 ```
+
+### report_untyped_access
+
+```mach
+pub fun report_untyped_access(sc: *mach.front.sema.context.SemaContext, span: mach.base.source.Span, access: str)
+```
+
+the refusal of `access` read through the untyped `ptr`, which names no type to read
 
 ### check_member
 
@@ -201,6 +212,12 @@ pub fun report_named(sc: *mach.front.sema.context.SemaContext, k: mach.base.diag
 pub fun report_missing_type_args(sc: *mach.front.sema.context.SemaContext, span: mach.base.source.Span, name: mach.base.intern.StrId, expected: u32)
 ```
 
+### report_missing_call_type_args
+
+```mach
+pub fun report_missing_call_type_args(sc: *mach.front.sema.context.SemaContext, span: mach.base.source.Span, name: mach.base.intern.StrId, expected: u32)
+```
+
 ### report_typed
 
 ```mach
@@ -240,6 +257,14 @@ pub fun report_cast_out_of_range(sc: *mach.front.sema.context.SemaContext, span:
 ```
 
 the range refusal of a literal a cast to `to` reinterprets, which took an integer of `to`'s size
+
+### report_literal_out_of_range
+
+```mach
+pub fun report_literal_out_of_range(sc: *mach.front.sema.context.SemaContext, span: mach.base.source.Span, cr: mach.front.sema.coerce.CoerceResult)
+```
+
+the range refusal of a suffixed literal its own suffix's type does not hold
 
 ## Constants
 

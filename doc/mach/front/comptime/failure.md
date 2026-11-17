@@ -17,6 +17,7 @@ Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.
 | On `EvalFailKind` | |
 | :--- | :--- |
 | [`EVAL_FAIL_NONE`](#evalfailkind), [`EVAL_FAIL_REJECTED`](#evalfailkind), [`EVAL_FAIL_UNBOUND`](#evalfailkind), [`EVAL_FAIL_NEEDS_MEMBER`](#evalfailkind), [`EVAL_FAIL_NEEDS_TYPES`](#evalfailkind), [`EVAL_FAIL_NEEDS_LAYOUT`](#evalfailkind), [`EVAL_FAIL_INTERNAL`](#evalfailkind), [`EVAL_FAIL_NEEDS_INSTANCE`](#evalfailkind), [`EVAL_FAIL_NOT_INTEGER`](#evalfailkind), [`eval_error`](#eval_error), [`not_constant`](#not_constant) | |
+| [`no_value`](#no_value) | whether a failure of kind `kind` reported as `diag` says the expression has no compile-time value at all, as a run-time binding, a call or a name no constant binds gives none, rather than a fault in a value it has |
 
 | On `EvalFail` | |
 | :--- | :--- |
@@ -27,7 +28,8 @@ Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.
 
 | Functions | |
 | :--- | :--- |
-| [`init_not_constant_report`](#init_not_constant_report) | reports the initializer at `span` of the global `name` as no constant, the one report check and lowering both give it; a decorator argument has no name |
+| [`init_not_constant_report`](#init_not_constant_report) | reports the initializer at `span` of the global `name` as no constant, as lowering meets it; a decorator argument has no name |
+| [`init_no_value_report`](#init_no_value_report) | reports the initializer at `span` of the global `name` as no constant, as init_not_constant_report does, with the evaluator's reason it has no value as a note |
 
 ---
 
@@ -60,6 +62,16 @@ pub fun eval_error(kind: EvalFailKind, diag: mach.base.diagnostic.kind.Kind, mes
 ```mach
 pub fun not_constant(kind: EvalFailKind) bool
 ```
+
+### no_value
+
+```mach
+pub fun no_value(kind: EvalFailKind, diag: mach.base.diagnostic.kind.Kind) bool
+```
+
+whether a failure of kind `kind` reported as `diag` says the expression has no compile-time
+value at all, as a run-time binding, a call or a name no constant binds gives none, rather
+than a fault in a value it has. a context that asks for a constant refuses it under its own kind
 
 ## EvalFail
 
@@ -116,6 +128,15 @@ value exists better than the asker can: a secret
 pub fun init_not_constant_report(alloc: *std.allocator.Allocator, diags: *mach.base.diagnostic.DiagnosticStore, file: mach.base.source.FileId, span: mach.base.source.Span, name: opt[str]) err[mach.base.fail.Fail]
 ```
 
-reports the initializer at `span` of the global `name` as no constant, the one report check
-and lowering both give it; a decorator argument has no name
+reports the initializer at `span` of the global `name` as no constant, as lowering meets
+it; a decorator argument has no name
+
+### init_no_value_report
+
+```mach
+pub fun init_no_value_report(diags: *mach.base.diagnostic.DiagnosticStore, file: mach.base.source.FileId, span: mach.base.source.Span, name: str, why: str) err[mach.base.fail.Fail]
+```
+
+reports the initializer at `span` of the global `name` as no constant, as
+init_not_constant_report does, with the evaluator's reason it has no value as a note
 

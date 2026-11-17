@@ -355,7 +355,7 @@ pub rec Walk {
     write_place:      mach.front.ast.id.ExprId;
     in_comptime_gate: bool;
     in_fin:           bool;
-    fin_loop_depth:   u32;
+    loop_depth:       u32;
     in_test:          bool;
     timed:            u8;
     guards:           *Guard;
@@ -372,6 +372,7 @@ sets it
 | `offer` | `*Offer` | a fix the next error raised offers, set by a check that knows one and cleared by it once the check is done; nil offers none |
 | `arm` | `u8` | which walk reports a `$error` the comptime arm walked reaches, as `ARM_*` |
 | `write_place` | `mach.front.ast.id.ExprId` | the place under a store or an address-of, whose root is written or addressed rather than read |
+| `loop_depth` | `u32` | the loops entered since the body a jump cannot leave began, a function's or a `fin`'s, so a `brk` or `cnt` at 0 has no loop to target |
 | `in_test` | `bool` | inside a `test` body, where a `ret` value is a status in 0..255 |
 | `timed` | `u8` | the constant-time mode of the function whose body is walked, `TIMED_NONE` outside one |
 

@@ -13,7 +13,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.sema.contex
 | Functions | |
 | :--- | :--- |
 | [`interface_of`](#interface_of) | the interface takes over the module's store of constant values, which its typing built in |
-| [`refusals_report`](#refusals_report) | reports the refusal each module `val` and `var` the interface publishes holds, as lowering the global reports it: a refused member of an aggregate or address value under any kind, and a refused value of its own only as lowering's own fold meets it again, the evaluator's rejection as it is and an initializer that needs a value no constant gives as no constant |
+| [`refusals_report`](#refusals_report) | reports the refusal each module `val` and `var` the interface publishes holds: an initializer, or a member of an aggregate or address value, that has no compile-time value as no constant, and any other refusal, a fault in a value it has, under its own kind |
 
 ---
 
@@ -33,9 +33,9 @@ the interface takes over the module's store of constant values, which its typing
 pub fun refusals_report(sc: *mach.front.sema.context.SemaContext, iface: *mach.front.sema.interface.Interface)
 ```
 
-reports the refusal each module `val` and `var` the interface publishes holds, as lowering
-the global reports it: a refused member of an aggregate or address value under any kind, and
-a refused value of its own only as lowering's own fold meets it again, the evaluator's
-rejection as it is and an initializer that needs a value no constant gives as no constant.
-a `nil` initializer lowers as null and folds nothing
+reports the refusal each module `val` and `var` the interface publishes holds: an initializer,
+or a member of an aggregate or address value, that has no compile-time value as no constant,
+and any other refusal, a fault in a value it has, under its own kind. a value of its own is
+reported only as lowering's own fold meets it again. a `nil` initializer lowers as null and
+folds nothing
 

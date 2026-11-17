@@ -56,8 +56,8 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 
 | On `Flags` | |
 | :--- | :--- |
-| [`FLAG_ONCE`](#flags), [`FLAG_ROLE`](#flags), [`FLAG_TESTING_EXCLUSIVE`](#flags), [`FLAG_STRINGS_CHECKED`](#flags), [`FLAG_PLACE_CHECKED`](#flags), [`FLAG_DEFINES`](#flags) | |
-| [`count_flagged`](#count_flagged) | how many of the declaration's decorators carry every one of `flags` |
+| [`FLAG_ROLE`](#flags), [`FLAG_TESTING_EXCLUSIVE`](#flags), [`FLAG_STRINGS_CHECKED`](#flags), [`FLAG_PLACE_CHECKED`](#flags), [`FLAG_DEFINES`](#flags) | |
+| [`count_flagged`](#count_flagged) | how many distinct decorators the declaration carries that carry every one of `flags`; a repeat is refused as a duplicate, so it is not counted again |
 | [`names_append`](#names_append) | appends the names of the rows that carry every one of `flags` and stand somewhere in `places`, `, `-separated in row order |
 
 | On `Rewrite` | |
@@ -224,7 +224,6 @@ what a row asks of its decorator beyond its arguments and places
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `FLAG_ONCE` |  | it stands at most once on a declaration |
 | `FLAG_ROLE` |  | it gives a module binding a shader interface role, and a binding has one |
 | `FLAG_TESTING_EXCLUSIVE` |  | it names a consumer outside Mach source, which `#[testing]` cannot confine |
 | `FLAG_STRINGS_CHECKED` |  | its string arguments are checked by the row, not by the decorator's own rule |
@@ -233,7 +232,6 @@ what a row asks of its decorator beyond its arguments and places
 
 | Name | Value | |
 | :--- | :--- | :--- |
-| `FLAG_ONCE` | `0x1` |  |
 | `FLAG_ROLE` | `0x2` |  |
 | `FLAG_TESTING_EXCLUSIVE` | `0x4` |  |
 | `FLAG_STRINGS_CHECKED` | `0x10` |  |
@@ -246,7 +244,8 @@ what a row asks of its decorator beyond its arguments and places
 pub fun count_flagged(a: *mach.front.ast.Ast, d: *mach.front.ast.decl.Decl, flags: Flags) u32
 ```
 
-how many of the declaration's decorators carry every one of `flags`
+how many distinct decorators the declaration carries that carry every one of `flags`;
+a repeat is refused as a duplicate, so it is not counted again
 
 ### names_append
 
@@ -286,7 +285,7 @@ one decorator
 | `places` | `Places` | where it stands, `misplaced` the refusal of anywhere else args_min, args_max:           the argument count it takes, `arity` the refusal of any other strings_first, strings_count: the arguments that are strings the load records, none when the count is 0 |
 | `integers` | `u32` | one bit per argument the row checks as an integer constant, `argument` the refusal of a string or integer argument of the wrong kind |
 | `modes` | `str` | the values its first argument may take, `\|`-separated, nil when any string is its own; `argument` is the refusal of any other value too |
-| `duplicate` | `str` | the refusal of a second one where FLAG_ONCE holds |
+| `duplicate` | `str` | the refusal of a second one, since every decorator stands at most once |
 
 ## Rewrite
 
