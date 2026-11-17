@@ -40,7 +40,7 @@ how a run executes its tests
 | :--- | :--- | :--- |
 | `runner` | `*mach.manifest.runner.Runner` | what each test is launched through, or nil for the test to run itself |
 | `threads` | `u32` | how many tests run at once, at least one |
-| `timeout` | `std.chrono.duration.Duration` | each test's bound, 0 for none |
+| `timeout` | `std.chrono.duration.Duration` | each test's bound, positive |
 | `level` | `u8` | the readout level; a passing test's output is kept only at the items level |
 | `bytes` | `bool` | whether a test's captured output is kept for the renderer |
 

@@ -33,7 +33,8 @@ pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 
 `mach test`: build the project's test dispatcher and run the collected tests. `--emit` is
 refused; `--list` prints the collected tests and stops; `--diagnostics json` adds the run's
-records to the report; `--filter`, `--runner`, `--timeout`, and `--threads` shape the run; `-o`
+records to the report; `--filter`, `--runner`, `--timeout` (each test's bound, TIMEOUT_DEFAULT
+when not given), and `--threads` shape the run; `-o`
 names the dispatcher binary the way `mach build -o` names a built one, inside the project
 root, so runs in one tree with different `-o` do not collide
 

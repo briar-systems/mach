@@ -5,10 +5,10 @@
 a shader declaration's decorators as the attributes of the target family that reads them
 
 a stage, its entry name and its workgroup size attach to the function, and an interface
-variable's storage class, descriptor set and binding, location, built-in and memory
-qualifiers to the global, each the number spir-v gives it, read from masc's grammar by
-its spir-v name. only a target whose family's schema is spir-v's takes them, so a machine
-target compiles a staged function as any other
+variable's storage class, descriptor set and binding, input attachment index, location,
+built-in and memory qualifiers to the global, each the number spir-v gives it, read from
+masc's grammar by its spir-v name. only a target whose family's schema is spir-v's takes
+them, so a machine target compiles a staged function as any other
 
 Source: [`src/lower/shader.mach`](../../../src/lower/shader.mach)
 

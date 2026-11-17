@@ -8,7 +8,8 @@ a bodyless `def` marked `#[handle(target, constructor, operands...)]` is typed f
 constructor and operands when the build selects its target, and is inert otherwise. a handle's
 representation is the target's, not the program's, so it may not be a field or payload, sit in
 an array or behind a pointer to a pointer, and a module binding of one must carry its
-descriptor decorator.
+descriptor decorator. only a handle binding takes `gpu.attachment`, which the target
+holds to the handles it declares subpass inputs.
 
 Source: [`src/front/sema/handle.mach`](../../../../src/front/sema/handle.mach)
 

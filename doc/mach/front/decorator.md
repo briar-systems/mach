@@ -38,7 +38,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 
 | On `Id` | |
 | :--- | :--- |
-| [`NONE`](#id), [`DEPRECATED`](#id), [`SYMBOL`](#id), [`SECTION`](#id), [`INLINE`](#id), [`EXPORT`](#id), [`ALIGN`](#id), [`PACKED`](#id), [`VOLATILE`](#id), [`LIBRARY`](#id), [`CONSTANT_TIME`](#id), [`VECTORIZE`](#id), [`NAKED`](#id), [`EXTENSION`](#id), [`EMBED`](#id), [`GPU_STAGE`](#id), [`GPU_WORKGROUP`](#id), [`GPU_INPUT`](#id), [`GPU_OUTPUT`](#id), [`GPU_BUILTIN`](#id), [`GPU_UNIFORM`](#id), [`GPU_STORAGE`](#id), [`GPU_SAMPLER`](#id), [`GPU_PUSH`](#id), [`GPU_SPEC`](#id), [`GPU_SHARED`](#id), [`INTRINSIC`](#id), [`HANDLE`](#id), [`ABI_TYPE`](#id), [`TESTING`](#id), [`EXPECT`](#id), [`THREAD`](#id), [`AT`](#id), [`WEAK`](#id) | |
+| [`NONE`](#id), [`DEPRECATED`](#id), [`SYMBOL`](#id), [`SECTION`](#id), [`INLINE`](#id), [`EXPORT`](#id), [`ALIGN`](#id), [`PACKED`](#id), [`VOLATILE`](#id), [`LIBRARY`](#id), [`CONSTANT_TIME`](#id), [`VECTORIZE`](#id), [`NAKED`](#id), [`EXTENSION`](#id), [`EMBED`](#id), [`GPU_STAGE`](#id), [`GPU_WORKGROUP`](#id), [`GPU_INPUT`](#id), [`GPU_OUTPUT`](#id), [`GPU_BUILTIN`](#id), [`GPU_UNIFORM`](#id), [`GPU_STORAGE`](#id), [`GPU_SAMPLER`](#id), [`GPU_PUSH`](#id), [`GPU_SPEC`](#id), [`GPU_SHARED`](#id), [`INTRINSIC`](#id), [`HANDLE`](#id), [`ABI_TYPE`](#id), [`TESTING`](#id), [`EXPECT`](#id), [`THREAD`](#id), [`AT`](#id), [`WEAK`](#id), [`GPU_ATTACHMENT`](#id) | |
 | [`row`](#row) | the row of `id`; nil for NONE and any id no row declares |
 | [`id_of`](#id_of) | the decorator the name at `name` in `source` spells, NONE when it spells none |
 | [`name_of`](#name_of) | the name of `id`; nil for NONE |
@@ -118,6 +118,7 @@ pub def Id: u8
 | `THREAD` | `31` |  |
 | `AT` | `32` |  |
 | `WEAK` | `33` |  |
+| `GPU_ATTACHMENT` | `34` |  |
 
 ### row
 
@@ -269,6 +270,7 @@ pub rec Row {
     strings_first: u32;
     strings_count: u32;
     integers:      u32;
+    words:         u32;
     modes:         str;
     flags:         Flags;
     arity:         str;
@@ -284,6 +286,7 @@ one decorator
 | :--- | :--- | :--- |
 | `places` | `Places` | where it stands, `misplaced` the refusal of anywhere else args_min, args_max:           the argument count it takes, `arity` the refusal of any other strings_first, strings_count: the arguments that are strings the load records, none when the count is 0 |
 | `integers` | `u32` | one bit per argument the row checks as an integer constant, `argument` the refusal of a string or integer argument of the wrong kind |
+| `words` | `u32` | one bit per integer argument the row holds to an unsigned 32-bit value, the one literal word its target states it in |
 | `modes` | `str` | the values its first argument may take, `\|`-separated, nil when any string is its own; `argument` is the refusal of any other value too |
 | `duplicate` | `str` | the refusal of a second one, since every decorator stands at most once |
 
