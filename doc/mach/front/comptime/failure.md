@@ -16,7 +16,9 @@ Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.
 
 | On `EvalFailKind` | |
 | :--- | :--- |
-| [`EVAL_FAIL_NONE`](#evalfailkind), [`EVAL_FAIL_REJECTED`](#evalfailkind), [`EVAL_FAIL_UNBOUND`](#evalfailkind), [`EVAL_FAIL_NEEDS_MEMBER`](#evalfailkind), [`EVAL_FAIL_NEEDS_TYPES`](#evalfailkind), [`EVAL_FAIL_NEEDS_LAYOUT`](#evalfailkind), [`EVAL_FAIL_INTERNAL`](#evalfailkind), [`EVAL_FAIL_NEEDS_INSTANCE`](#evalfailkind), [`EVAL_FAIL_NOT_INTEGER`](#evalfailkind), [`eval_error`](#eval_error), [`not_constant`](#not_constant) | |
+| [`EVAL_FAIL_NONE`](#evalfailkind), [`EVAL_FAIL_REJECTED`](#evalfailkind), [`EVAL_FAIL_UNBOUND`](#evalfailkind), [`EVAL_FAIL_NEEDS_MEMBER`](#evalfailkind), [`EVAL_FAIL_NEEDS_TYPES`](#evalfailkind), [`EVAL_FAIL_NEEDS_LAYOUT`](#evalfailkind), [`EVAL_FAIL_INTERNAL`](#evalfailkind), [`EVAL_FAIL_NEEDS_INSTANCE`](#evalfailkind), [`EVAL_FAIL_NOT_INTEGER`](#evalfailkind), [`eval_error`](#eval_error) | |
+| [`typed_alone`](#typed_alone) | whether a refusal is one typing reports itself wherever the expression is typed, naming more than the evaluator can: a suffixed literal its suffix's type does not hold |
+| [`not_constant`](#not_constant) | |
 | [`no_value`](#no_value) | whether a failure of kind `kind` reported as `diag` says the expression has no compile-time value at all, as a run-time binding, a call or a name no constant binds gives none, rather than a fault in a value it has |
 
 | On `EvalFail` | |
@@ -56,6 +58,15 @@ pub def EvalFailKind: u8
 ```mach
 pub fun eval_error(kind: EvalFailKind, diag: mach.base.diagnostic.kind.Kind, message: str) EvalFail
 ```
+
+### typed_alone
+
+```mach
+pub fun typed_alone(kind: EvalFailKind, diag: mach.base.diagnostic.kind.Kind) bool
+```
+
+whether a refusal is one typing reports itself wherever the expression is typed, naming
+more than the evaluator can: a suffixed literal its suffix's type does not hold
 
 ### not_constant
 

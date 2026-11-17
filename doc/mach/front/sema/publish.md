@@ -37,5 +37,5 @@ reports the refusal each module `val` and `var` the interface publishes holds: a
 or a member of an aggregate or address value, that has no compile-time value as no constant,
 and any other refusal, a fault in a value it has, under its own kind. a value of its own is
 reported only as lowering's own fold meets it again. a `nil` initializer lowers as null and
-folds nothing
+folds nothing, and a refusal the declaration's typing reports itself is not reported again
 

@@ -49,9 +49,8 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 
 ```mach
 pub rec Int {
-    value:    mach.base.wide.Wide;
-    suffix:   mach.type.kind.TypeKind;
-    in_range: bool;
+    value:  mach.base.wide.Wide;
+    suffix: mach.type.kind.TypeKind;
 }
 ```
 

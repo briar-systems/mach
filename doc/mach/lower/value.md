@@ -14,7 +14,7 @@ Uses types from [`mach.base.wide`](../base/wide.md).
 | Type | | |
 | :--- | :--- | :--- |
 | [`ValueKind`](#valuekind) | `def` |  |
-| [`Value`](#value) | `rec` | space: the address space of the storage an address points into, which a value retyped        as its aggregate keeps held:  what a stack slot was made to hold, none for any other value whole: an aggregate held as a mirl value of its own type, which has no address |
+| [`Value`](#value) | `rec` | space: the address space of the storage an address points into, which a value retyped        as its aggregate keeps held:  what a stack slot was made to hold, none for any other value whole: an aggregate held as a mirl value of its own type, which has no address align: the alignment an address is known to have, which a part of a packed aggregate holds below        its own type's, 0 where nothing is known past what its pointee's type states |
 
 | On `ValueKind` | |
 | :--- | :--- |
@@ -73,6 +73,7 @@ pub rec Value {
     truth:  mirl.ir.id.Value;
     truthy: bool;
     whole:  bool;
+    align:  u64;
 }
 ```
 
@@ -80,6 +81,8 @@ space: the address space of the storage an address points into, which a value re
        as its aggregate keeps
 held:  what a stack slot was made to hold, none for any other value
 whole: an aggregate held as a mirl value of its own type, which has no address
+align: the alignment an address is known to have, which a part of a packed aggregate holds below
+       its own type's, 0 where nothing is known past what its pointee's type states
 
 ### none
 
