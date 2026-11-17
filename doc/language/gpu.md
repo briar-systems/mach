@@ -46,17 +46,25 @@ compiled normally.
 
 Whether a build makes a **shader module** or a **library module** is the artifact's
 [`kind`](manifest.md#artifactname), not the source's, so one source set can build both.
-A `module` artifact is a shader module: mink's link joins the build's objects into one
-module that carries the entry point of every stage and no external linkage at all,
-since a Vulkan consumer refuses a module carrying linkage, and a `module` that holds
-no stage is refused. An `object` artifact is a library module: each object keeps the
-`Linkage` capability and publishes each function as a linkage export, so a later link
+Every module an artifact holds, its dependencies' included, compiles as one unit into
+one SPIR-V module, since the rules of a finished module span it whole: what each stage
+reaches through every function it calls, wherever that function is written. A
+`module` artifact is a shader module: that module carries the entry point of every
+stage and no external linkage at all, since a Vulkan consumer refuses a module
+carrying linkage, and a `module` that holds no stage is refused. An `object` artifact
+is a library module: its one object keeps the `Linkage` capability and publishes each
+function as a linkage export, so a later link that joins it to other prebuilt modules
 can find it, and no Vulkan consumer takes it as it is. Adding a `#[gpu.stage(...)]` to
 a source does not change which of the two a build makes.
 
 The entry point's name, as a pipeline-creation call looks it up, is the function's
 **bare source name** (`vertex_main` above), not a mangled linker symbol. A shader
 module has no linker symbols to mangle.
+
+A SPIR-V module has no call stack, so the static call graph of an entry point holds no
+cycle (SPIR-V 2.16.1): a function a stage reaches that reaches itself again, directly or
+through the functions it calls, is a compile error (`spirv.recursion`) at the call that
+closes the cycle. Write the recursion as a loop.
 
 ## `gpu.workgroup(x, y, z)` — compute workgroup dimensions
 
@@ -568,8 +576,9 @@ var use_fog: u32 = 1;
 A narrower integer such as `u8` works too, but it needs the capability for its
 width like any other `u8` in a shader. On `spirv` each one becomes an
 `OpSpecConstant` whose literal is the initializer, decorated with `SpecId`, and a
-read uses that constant directly with no load. Two `#[gpu.spec]` vars with one id in
-the same module are refused, since the host names the constant by its id. On a
+read uses that constant directly with no load. Two `#[gpu.spec]` vars with one id that
+one SPIR-V module reads are refused, whichever source modules declare them, since the
+host names the constant by its id. On a
 machine target the decorator has no effect and the var is an ordinary global.
 
 A `#[gpu.spec]` var may also size a compute workgroup (see

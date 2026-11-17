@@ -164,7 +164,7 @@ expanded `work`, in one layout:
 
 | Path | Holds |
 | --- | --- |
-| `obj/` | one object per module, each carrying its cache key; it is the [object cache](#stepname--build-steps) and is read by developers and tooling too |
+| `obj/` | one object per module, each carrying its cache key, or for a target whose back end compiles an artifact whole (SPIR-V) one object for every module, named for the last; it is the [object cache](#stepname--build-steps) and is read by developers and tooling too |
 | `ir/`, `asm/` | the human-readable views `--emit ir` and `--emit asm` write |
 | `.cache/` | compiler-only state, read and written by nothing but the compiler |
 | `.cache/steps/` | one fingerprint stamp per [build step](#stepname--build-steps) |
@@ -1444,7 +1444,8 @@ any of them (see [test.md](test.md#which-tests-run)).
   written at `out`. A format
   mink builds no module in, such as ELF, refuses it.
 - **`object`** is each module's object, written under `obj/` for a later link,
-  as `--emit obj` writes them. It takes no `out`, and `{artifact.<id>.out}` names
+  as `--emit obj` writes them. A target whose back end compiles an artifact whole,
+  as SPIR-V's does, writes one object of every module the artifact holds. It takes no `out`, and `{artifact.<id>.out}` names
   none. An entry build's `-k object -o <path>` writes its object there when the
   build writes exactly one.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
@@ -2006,7 +2007,9 @@ in `{project.work}/.cache/objects` under its path in `obj/`, and a build reuses 
 object only when the bytes it reads hash to that digest: an object that is missing,
 has no recorded digest, holds other bytes than were written (one flipped bit
 included), has no key, a damaged one or another key is rebuilt, never linked
-stale. `obj/` holds one object per module, the latest, and each object is written
+stale. A target whose back end compiles an artifact whole, as SPIR-V's does,
+compiles every module into one object no module's key covers, so its builds reuse
+no object and compile the artifact again. `obj/` holds one object per module, the latest, and each object is written
 to a sibling temporary and renamed into place, so an interrupted build leaves the
 previous object or the new one, never a torn file, and the digests are stored only
 after the objects they describe are in place. No timestamp decides anything: every

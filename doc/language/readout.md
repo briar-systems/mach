@@ -46,7 +46,9 @@ built out/app  48 modules  1 MiB  in 358ms
 ```
 
 Each module's object is made by a step that lowers it, holds it to mirl's
-verifier and has mirl compile it. The `lower` and `verify` rows are the sums of
+verifier and has mirl compile it. A target whose back end compiles an artifact
+whole, as SPIR-V's does, makes one object by one step that lowers every module,
+and its rows count that one object. The `lower` and `verify` rows are the sums of
 those stages over the modules, moved out of the `codegen` row, which keeps the
 rest. `lower` also holds the preparation of the lowering's inputs before the
 first step runs. mirl times its own stages when a readout is shown, and each moves out of
