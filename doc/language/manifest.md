@@ -560,7 +560,7 @@ target shares the value.
 |-------|--------|
 | `arch` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv`, `wasm32` |
 | `sys`  | `linux`, `windows`, `darwin`, `freestanding`, `uefi`, `vulkan`, `wasi` |
-| `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `shader`, `basic` |
+| `abi` | `sysv64`, `win64`, `aapcs64`, `darwinpcs`, `aapcs64win`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `shader`, `basic` |
 | `of`  | `elf`, `macho`, `coff`, `flat`, `spirv`, `wasm` |
 | `env` | `vulkan1.0`, `vulkan1.1`, `vulkan1.2`, `vulkan1.3`, `preview1` |
 
@@ -670,8 +670,9 @@ convention, must name it explicitly, since `abi` has no default of its own
 (see [Totality](#totality)). `linux` accepts all three on `riscv64` because
 its kernel ABI is integer-only, whereas every operating system accepts only
 the conventions it declares per instruction set (`linux` and `darwin` refuse
-`win64` on `x86_64`, `windows` refuses `sysv64`) and `freestanding` accepts
-every convention the instruction set covers.
+`win64` on `x86_64`, `windows` and `uefi` refuse `sysv64`, `darwin` takes
+`darwinpcs` alone on `aarch64` and `windows` and `uefi` take `aapcs64win` alone)
+and `freestanding` accepts every convention the instruction set covers.
 
 `mach info targets` prints every target mink's catalog spells, one per line as
 `-t` takes it (`<sys>-<arch>`), then the environments, calling conventions, code
@@ -1019,15 +1020,17 @@ sys  = "uefi"
 abi  = "win64"
 ```
 
-- **The tuple.** There is no environment. The calling convention is the firmware's:
-  `win64` on `x86_64` and `aapcs64` on `aarch64` (UEFI 2.10, 2.3.4 and 2.3.6), the
-  defaults `mach info targets` marks. The format is `coff`, and with no `isa` an
-  `x86_64` target stands on the psABI baseline and an `aarch64` one on
-  `armv8-a+fp+simd`, which the firmware enables before it calls the entry. A PE
-  image's frames are written as its machine's unwind data, which mink builds today
-  only from frames laid out under `win64` and `aapcs64win`, so an `aarch64` image
-  whose code has a frame links under `abi = "aapcs64win"` alone, whose calls are
-  AAPCS64's for every signature without a variable argument list.
+- **The tuple.** There is no environment. An image is a PE image made under its
+  architecture's PE convention, `win64` on `x86_64` and `aapcs64win` on `aarch64`,
+  the only one `mach info targets` lists for each. `aapcs64win` leaves `x18` unused,
+  as the firmware's AArch64 binding asks (UEFI 2.10, 2.3.6.4), lays its frames out as
+  the machine's PE unwind data states them, and calls the firmware as AAPCS64 does:
+  the two differ only in a floating-point value in a variable argument list, which
+  no firmware call passes. Any other `abi` is refused where the target is resolved
+  (`no host of the system runs the architecture under this calling convention`).
+  The format is `coff`, and with no `isa` an `x86_64` target stands on the psABI
+  baseline and an `aarch64` one on `armv8-a+fp+simd`, which the firmware enables
+  before it calls the entry.
 - **Artifacts.** A `bin` artifact is a `.efi` image whose subsystem is
   `efi_application` unless the artifact's `subsystem` names another of the four the
   firmware loads, `efi_boot_service_driver`, `efi_runtime_driver` or `efi_rom`. Any
