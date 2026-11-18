@@ -351,12 +351,13 @@ takes only with `Grad` and which needs the `MinLod` extension.
 `OpImageGather` and `OpImageSparseGather` read one component, a constant id, of the four
 texels a sample of a `2D` or `Cube` image would filter (Vulkan's
 `VUID-StandaloneSpirv-OpImageGather-04664`), and a run-time component is refused at the
-call with `op.operand_not_constant`. A constant operand is a constant by emission: a
-literal, a vector of literals directly or through a binding, a module-scope `val`,
-which a shader reads as the constant it is, or an aggregate passed whole as an array
-literal of constants or a copy of a `val`, written as one composite constant. An
-aggregate any run-time value writes, or one written only in part, is a value, and is
-refused with `op.operand_not_constant`. An `OpImageRead` of a `SubpassData` image reads
+call with `op.operand_not_constant`. A constant operand is a constant by emission: an
+argument the compiler evaluates at compile time, as it does a literal, `-1` or
+`A | B` over module-scope `val`s, a vector or array literal whose every element is one,
+as `i32x2{1, -1}`, passed directly or through a binding, a module-scope `val`, which a
+shader reads as the constant it is, or an aggregate passed whole as a copy of a `val`,
+written as one composite constant. An aggregate any run-time value writes, or one
+written only in part, is a value, and is refused with `op.operand_not_constant`. An `OpImageRead` of a `SubpassData` image reads
 the texel at the fragment's own place, so its coordinate is the constant vector (0, 0)
 (Vulkan's `VUID-StandaloneSpirv-SubpassData-04660`): a run-time coordinate is refused at
 the call with `op.operand_not_constant` and a constant with a component that is not zero
@@ -966,8 +967,8 @@ A row holds a declaration's signedness only where the instruction reads its oper
 result as signed or as unsigned, so that the other signedness would compute another
 value than the declaration says: the signed and unsigned minimum, maximum, clamp,
 absolute value, sign and most significant bit, the signed and unsigned comparisons and
-bit-field extracts, the signed and unsigned atomic and subgroup minimum and maximum, and
-the carry and borrow. Everywhere else a row asks what the specification asks, the
+bit-field extracts, the signed and unsigned atomic and subgroup minimum and maximum, the
+carry and borrow, and the result of the signed, unsigned and mixed integer dot products. Everywhere else a row asks what the specification asks, the
 class, width and component count and the sameness of a type, and accepts either
 signedness: the module writes an integer of any declared signedness unsigned, but for
 the sampled type and texels of an image of a signed integer format, which it converts
@@ -989,6 +990,8 @@ is declared with.
 | `Modf` | the result is the value's type, and the out-pointer points to the value's type, where the whole part is stored |
 | `Frexp` | the result is the value's type, and the out-pointer points to an `i32` scalar or vector with as many components as the value, where the exponent is stored |
 | `OpDot` | the second vector is the first's type |
+| `OpSDot`, `OpUDot`, `OpSUDot` and their `AccSat` forms | the result is a signed integer scalar (unsigned for `OpUDot` and `OpUDotAccSat`) at least as wide as the components of the first vector where it is a vector, the second vector is the first's type (`OpSUDot`: its component count and width, of either signedness), and the accumulator is the result's type |
+| `OpImage` | the sampled image's image is the result's type |
 | `OpIsNan`, `OpIsInf` | the result is a truth value per lane of the operand, a scalar or vector of floats |
 | `OpSMod`, `OpExpectKHR` | the result and every operand have the first operand's component count and width, integers of either signedness |
 | `OpFMod`, `NMin`, `NMax`, `NClamp` | the result and every operand are the first operand's type, a scalar or vector of floats |
@@ -1162,10 +1165,28 @@ where the instruction has one. Its types are the author's to get right, and a wr
 declaration of one can build a module a validator rejects. The rules are masc's
 typing data (`dep/masc/gen/data/spirv/typings.txt`), one or more lines per typed
 instruction citing the specification text each holds, and the relations each
-instruction is held to are in the table of relations above. `OpKill` and
-`OpTerminateInvocation` are of the second kind: a call of one is not where its block
-ends, and the compiler builds it into a module a validator rejects, so a program that
-discards a fragment writes `OpDemoteToHelperInvocation` instead.
+instruction is held to are in the table of relations above.
+
+An instruction nothing falls through after, as `OpKill` and `OpTerminateInvocation`,
+ends its block: the call is the last instruction of the block it stands in, and what
+follows it in the source is unreachable and is not compiled. A fragment that discards
+itself under a condition calls one in an `if`. `OpTerminateInvocation` ends the
+invocation, and `OpDemoteToHelperInvocation` makes it a helper that goes on running
+without writing, which a fragment that still computes derivatives for its neighbours
+needs.
+
+```mach fragment
+#[intrinsic("spirv", "core", "OpTerminateInvocation")]
+fun discard();
+
+#[gpu.stage("fragment")]
+fun main() {
+    if (alpha < 0.5) {
+        discard();
+    }
+    color = alpha;
+}
+```
 
 An instruction is refused as a construct's only when a construct emits it. One the
 compiler writes only inside another construct's code, or never, is an intrinsic's,
