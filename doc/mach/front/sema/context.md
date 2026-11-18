@@ -20,6 +20,7 @@ Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.
 | [`ModuleView`](#moduleview) | `rec` | the module a walk reads and the typing tables it writes: the module being typed, or the declaring module of an instance |
 | [`Instance`](#instance) | `rec` | the instance a walk types, or none |
 | [`Walk`](#walk) | `rec` | the state of one walk over syntax, fresh at each body and scoped to the construct that sets it |
+| [`Expansion`](#expansion) | `rec` | an alias whose definition a walk is resolving, and the one whose definition named it |
 | [`SemaContext`](#semacontext) | `rec` |  |
 | [`StmtListVisitor`](#stmtlistvisitor) | `def` |  |
 
@@ -359,6 +360,7 @@ pub rec Walk {
     in_test:          bool;
     timed:            u8;
     guards:           *Guard;
+    expanding:        *Expansion;
 }
 ```
 
@@ -375,12 +377,25 @@ sets it
 | `loop_depth` | `u32` | the loops entered since the body a jump cannot leave began, a function's or a `fin`'s, so a `brk` or `cnt` at 0 has no loop to target |
 | `in_test` | `bool` | inside a `test` body, where a `ret` value is a status in 0..255 |
 | `timed` | `u8` | the constant-time mode of the function whose body is walked, `TIMED_NONE` outside one |
+| `expanding` | `*Expansion` | the aliases whose definitions the walk is inside, innermost first, nil at none |
 
 ### walk_make
 
 ```mach
 pub fun walk_make() Walk
 ```
+
+## Expansion
+
+```mach
+pub rec Expansion {
+    decl:  mach.front.ast.id.DeclId;
+    name:  mach.base.intern.StrId;
+    outer: *Expansion;
+}
+```
+
+an alias whose definition a walk is resolving, and the one whose definition named it
 
 ## SemaContext
 

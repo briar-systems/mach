@@ -22,6 +22,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | Functions | |
 | :--- | :--- |
 | [`check`](#check) | what a call's declaration must be against its row, refused with `op.signature` |
+| [`ends`](#ends) | whether row `r` ends its block, nothing falling through after it, as OpKill and OpTerminateInvocation |
 | [`result_class`](#result_class) | the storage class a call's pointer result points into where its row's typing states it: the Image class where it relates the result to the texel of an image, as OpImageTexelPointer's result points into (spir-v 1.6, OpImageTexelPointer), PhysicalStorageBuffer where the result is a physical pointer, as OpConvertUToPtr makes |
 | [`chain_base`](#chain_base) | the row operand a call's pointer result is chained from where its row's typing relates the result to an index chain, as OpInBoundsAccessChain's to its Base, the result pointing into the storage class that operand points into |
 | [`chained`](#chained) | the pointer result of a chained row held to what its indexes reach: from what parameter `base` points to, each parameter after it steps into an array's element, a vector's component, or the member of a record its constant names, and the return type points to what the last step reaches |
@@ -45,6 +46,14 @@ what a call's declaration must be against its row, refused with `op.signature`
 | `r` | its row |
 | `lead` | the row operands its result, result type or set's import take |
 | `fn` | the declaration's function type |
+
+### ends
+
+```mach
+pub fun ends(r: *masc.core.row.Row) bool
+```
+
+whether row `r` ends its block, nothing falling through after it, as OpKill and OpTerminateInvocation
 
 ### result_class
 
