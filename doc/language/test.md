@@ -216,9 +216,11 @@ another. The bound applies to each spawned test process independently, from
 its own spawn. Tests declare no time limits of their own: a test that waits for
 an event waits, and one that hangs is ended by its bound. When the bound
 passes, the test's process group is asked to stop (`SIGTERM` on Linux and
-macOS) and the test process itself is killed, so a process the test started
-ends with it unless that process ignores the request. On Windows the test's
-job object is terminated, which ends every process in it. A test that exceeds
+macOS) and given one second. Whatever is still alive in the group then is
+killed as a group (`SIGKILL`), so no process the test started outlives it,
+even one that ignores the request. The second runs out early once nothing is
+left in the group. On Windows the test's job object is terminated, which ends
+every process in it. A test that exceeds
 the bound is the distinct outcome **timed out**: it renders as
 `(timed out after <duration>)` with its `rerun:` command, is counted
 separately on the summary line, and is still a failing test for the exit code,

@@ -742,13 +742,17 @@ fun capture_over_limit(p: *OwnedSubprocess) res[bool, Error] {
     ret res[bool, Error].ok{res_stat_of.ok.size > p.capture.limit};
 }
 
+# how long wait_any gives an owner it ends, and its group, to stop before what
+# is left is killed
+val GRACE: chrono_duration.Duration = chrono_duration.SECOND;
+
 # supervise `count` owners until one of them reaches its terminal, and return
 # that one reaped
 #
 # each pass polls the scope, then every running owner: a cancelled or expired
 # scope cancels or times out the first running owner, an owner past its own
 # deadline is timed out, and one whose capture outgrew its limit is
-# cancelled. a terminate, interrupt, console-close or service-stop event from
+# cancelled, each with GRACE to stop. a terminate, interrupt, console-close or service-stop event from
 # `source` cancels the scope.
 # ---
 # owners: array of `count` owners, some of which may not be running
@@ -788,15 +792,15 @@ pub fun wait_any(a: *A.Allocator, owners: *OwnedSubprocess, count: u32, scope: *
                 live = true;
                 if (fired == REQUEST_TIMED_OUT || fired == REQUEST_CANCELLED) {
                     var res_timeout: res[SubprocessTerminal, Error];
-                    if (fired == REQUEST_TIMED_OUT) { res_timeout = timeout(a, p, 0); }
-                    or                              { res_timeout = cancel(a, p, 0); }
+                    if (fired == REQUEST_TIMED_OUT) { res_timeout = timeout(a, p, GRACE); }
+                    or                              { res_timeout = cancel(a, p, GRACE); }
                     if (sel res_timeout.err) {
                         ret res[*OwnedSubprocess, Error].err{res_timeout.err};
                     }
                     ret res[*OwnedSubprocess, Error].ok{p};
                 }
                 if (deadline_reached(p, now)) {
-                    val res_timeout: res[SubprocessTerminal, Error] = timeout(a, p, 0);
+                    val res_timeout: res[SubprocessTerminal, Error] = timeout(a, p, GRACE);
                     if (sel res_timeout.err) {
                         ret res[*OwnedSubprocess, Error].err{res_timeout.err};
                     }
@@ -805,7 +809,7 @@ pub fun wait_any(a: *A.Allocator, owners: *OwnedSubprocess, count: u32, scope: *
                 val res_over: res[bool, Error] = capture_over_limit(p);
                 if (sel res_over.err) { ret res[*OwnedSubprocess, Error].err{res_over.err}; }
                 if (res_over.ok) {
-                    val res_cancel: res[SubprocessTerminal, Error] = cancel(a, p, 0);
+                    val res_cancel: res[SubprocessTerminal, Error] = cancel(a, p, GRACE);
                     if (sel res_cancel.err) {
                         ret res[*OwnedSubprocess, Error].err{res_cancel.err};
                     }
@@ -951,8 +955,14 @@ fun pid_string(buf: *u8, child_pid: i64) *u8 {
     ret buf;
 }
 
-# ask `child` to stop, or kill it when `hard`; nothing, or the refusal
+# ask `child` to stop, or kill it when `hard`, its whole group when it has
+# one; nothing, or the refusal
 fun actual_terminate(a: *A.Allocator, child: exec.Child, hard: bool) err[Error] {
+    if (hard && child.pgid != 0) {
+        val err_killed: err[exec.Error] = exec.kill_group(child);
+        if (sel err_killed.err) { ret err[Error].err{failure("subprocess", Cause.exec{err_killed.err})}; }
+        ret err[Error].ok{};
+    }
     if (hard) {
         val err_terminated: err[exec.Error] = exec.terminate_child(exec.Child{pid: child.pid});
         if (sel err_terminated.err) { ret err[Error].err{failure("subprocess", Cause.exec{err_terminated.err})}; }
@@ -1002,6 +1012,13 @@ fun actual_wait(a: *A.Allocator, child_pid: i64, block: bool) res[opt[Subprocess
     ret res[opt[SubprocessTerminal], Error].ok{opt_ended};
 }
 
+# whether a process is left in the group of `child`, or the refusal
+fun actual_group_alive(a: *A.Allocator, child: exec.Child) res[bool, Error] {
+    val res_alive: res[bool, exec.Error] = exec.group_alive(child);
+    if (sel res_alive.err) { ret res[bool, Error].err{failure("subprocess", Cause.exec{res_alive.err})}; }
+    ret res[bool, Error].ok{res_alive.ok};
+}
+
 fun actual_sleep(a: *A.Allocator) {
     system_os.sleep(chrono_duration.MILLISECOND);
 }
@@ -1009,11 +1026,16 @@ fun actual_sleep(a: *A.Allocator) {
 # a soft request that could not be sent, or a poll after it that failed,
 # escalates to the hard kill rather than failing; a hard kill that could not
 # be sent fails with its refusal unless the child ended anyway
+#
+# a grouped child that ends within the grace leaves the rest of its group the
+# remainder of it: what is still alive when it runs out is killed as a group.
+# a group kill refused after the child was reaped fails with the child reaped.
 fun request_with[T](p: *OwnedSubprocess, a: *A.Allocator, request: Request, attempts: u32,
     ctx: *T, terminate: fun(*T, exec.Child, bool) err[Error],
     wait_child: fun(*T, i64, bool) res[opt[SubprocessTerminal], Error],
+    group_alive: fun(*T, exec.Child) res[bool, Error],
     sleep: fun(*T)) res[SubprocessTerminal, Error] {
-    if (ctx == nil || terminate == nil || wait_child == nil || sleep == nil) {
+    if (ctx == nil || terminate == nil || wait_child == nil || group_alive == nil || sleep == nil) {
         ret res[SubprocessTerminal, Error].err{failure(owner_identity(p), Cause.incomplete{})};
     }
     if (!running(p)) {
@@ -1025,13 +1047,38 @@ fun request_with[T](p: *OwnedSubprocess, a: *A.Allocator, request: Request, atte
     p.requested = request;
 
     val err_soft: err[Error] = terminate(ctx, p.child, false);
+    var ended:    bool       = false;
+    var terminal: SubprocessTerminal;
     var i:        u32        = 0;
     for (sel err_soft.ok && i < attempts) {
-        val res_wait_child: res[opt[SubprocessTerminal], Error] = wait_child(ctx, p.child.pid, false);
-        if (sel res_wait_child.err)     { brk; }
-        if (sel res_wait_child.ok.some) { ret reaped_as(p, res_wait_child.ok.some); }
+        if (!ended) {
+            val res_wait_child: res[opt[SubprocessTerminal], Error] = wait_child(ctx, p.child.pid, false);
+            if (sel res_wait_child.err) { brk; }
+            if (sel res_wait_child.ok.some) {
+                ended    = true;
+                terminal = res_wait_child.ok.some;
+            }
+        }
+        if (ended) {
+            if (p.child.pgid == 0) { ret reaped_as(p, terminal); }
+            val res_alive: res[bool, Error] = group_alive(ctx, p.child);
+            if (sel res_alive.err) { brk; }
+            if (!res_alive.ok)     { ret reaped_as(p, terminal); }
+        }
         sleep(ctx);
         i = i + 1;
+    }
+
+    if (ended) {
+        var err_left:  err[Error]       = err[Error].ok{};
+        val res_alive: res[bool, Error] = group_alive(ctx, p.child);
+        if (sel res_alive.err) { err_left = err[Error].err{res_alive.err}; }
+        if (sel res_alive.ok) {
+            if (res_alive.ok) { err_left = terminate(ctx, p.child, true); }
+        }
+        val res_reaped: res[SubprocessTerminal, Error] = reaped_as(p, terminal);
+        if (sel err_left.err) { ret res[SubprocessTerminal, Error].err{err_left.err}; }
+        ret res_reaped;
     }
 
     val err_hard: err[Error] = terminate(ctx, p.child, true);
@@ -1074,13 +1121,15 @@ fun request(p: *OwnedSubprocess, a: *A.Allocator, state: Request,
         attempts = millis::u32;
     }
     ret request_with[A.Allocator](p, a, state, attempts, a, actual_terminate, actual_wait,
-        actual_sleep);
+        actual_group_alive, actual_sleep);
 }
 
 # terminate the running child for outliving its deadline and reap it
 #
 # the child is asked to stop, its whole group when it has one, and given
-# `grace` to end before it is killed.
+# `grace` to end before it is killed. a grouped child's group gets the whole
+# grace even when the child ends sooner, and what is left of it then is
+# killed as a group.
 # ---
 # grace: how long the child has to stop, rounded up to a millisecond
 # ret:   how the child ended, or the refusal. a refused termination keeps the
