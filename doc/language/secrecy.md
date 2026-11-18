@@ -613,6 +613,16 @@ as anywhere else.
   holds no secret states its memory public, and every other destination is memory
   nothing states the secrecy of. A secret stored to either is refused
   ([asm.md](asm.md) has the binding rules and an example).
+  A frame that realigns the stack pointer for a local aligned past the stack's
+  alignment is followed off two origins: the stack pointer's value on entry, off
+  which the saves, the frame pointer and the incoming arguments lie, and the value
+  the prologue realigns it to, off which the locals and spills lie. The walk names
+  the second only where it sees an instruction compute it, the bitwise and of the
+  stack pointer's known value with minus the alignment, and holds it anywhere in
+  the alignment's interval below that value, so a slot off one origin is taken
+  apart from a slot off the other only where every place the realign can leave
+  them shows it. A realigned frame whose stack pointer an `asm` block moves is
+  refused when the frame is laid out, as its locals would move with it.
 - **The timing mode.** A block may not turn the timing mode off: aarch64's
   `msr dit` from a register and `msr pstate.dit, #0` are refused whatever encodes
   them. Only the read, set and restore the frame code places are admitted.
