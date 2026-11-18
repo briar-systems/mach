@@ -960,7 +960,10 @@ A row also states how its operands' types and its result's **relate** to the typ
 operates on, the type of the one operand its typing reads (a pointer's pointee). A
 declaration that breaks a relation is refused with `op.signature`, naming both the
 parameter (or the return type) and the operand it relates to, so a mismatch is caught
-at the declaration rather than as an invalid module.
+at the declaration rather than as an invalid module. The module holds every integer
+unsigned, so where a rule asks only the same component count and width, or the same
+SPIR-V type of an integer slot, a declaration of either signedness meets it, and the
+rows marked so below accept one.
 
 | Rows | Relation |
 |------|----------|
@@ -976,6 +979,21 @@ at the declaration rather than as an invalid module.
 | `Modf` | the result is the value's type, and the out-pointer points to the value's type, where the whole part is stored |
 | `Frexp` | the result is the value's type, and the out-pointer points to an `i32` scalar or vector with as many components as the value, where the exponent is stored |
 | `OpDot` | the second vector is the first's type |
+| `OpIsNan`, `OpIsInf` | the result is a truth value per lane of the operand, a scalar or vector of floats |
+| `OpSMod`, `OpExpectKHR` | the result and every operand have the first operand's component count and width, integers of either signedness |
+| `OpFMod`, `NMin`, `NMax`, `NClamp` | the result and every operand are the first operand's type, a scalar or vector of floats |
+| `OpQuantizeToF16` | the result is the operand's type, a scalar or vector of 32-bit floats |
+| `ModfStruct` | the result is a `rec` of two members, each the operand's type, a scalar or vector of floats |
+| `OpGroupNonUniformRotateKHR` | the result has the value's component count, class and width, the delta is an integer scalar, and the ClusterSize an integer constant power of two |
+| `OpSubgroupFirstInvocationKHR` | the result has the value's class and width, a 32-bit integer or float scalar |
+| `OpSubgroupBallotKHR` | the result is a 4-vector of 32-bit integers, and the predicate a truth value |
+| `OpSubgroupAllKHR`, `OpSubgroupAnyKHR`, `OpSubgroupAllEqualKHR`, `OpGroupNonUniformQuadAllKHR`, `OpGroupNonUniformQuadAnyKHR` | the result and the predicate are truth values |
+| `OpIsHelperInvocationEXT` | the result is a truth value, in a fragment stage |
+| `OpAssumeTrueKHR` | the condition is a truth value |
+| `OpImageSampleProj*Lod` | as the sample rows, with a coordinate of 32-bit float components carrying the projective divisor |
+| `OpImageQueryLod` | the result is a 2-vector of floats, and the coordinate is 32-bit floats |
+| the `OpImageSparse*` rows | the coordinate is 32-bit floats (integers for `OpImageSparseFetch`, either for `OpImageSparseRead`), and the reference an `f32` scalar; the result structure is not held |
+| `OpControlBarrier`, `OpMemoryBarrier`, every atomic and every `OpGroupNonUniform*` row | each scope and memory semantics operand is a 32-bit integer scalar constant (SPIR-V's `Scope <id>` and `Memory Semantics <id>`, and 2.16.2) |
 
 A relation on a pointer operand, such as the out-pointer `Modf` and `Frexp` store
 their second part through, holds the type it points to. The pointer may address a
@@ -1079,7 +1097,7 @@ the instruction. A `spirv` build never emits the body at all.
 
 ### Which instructions an `intrinsic` may name
 
-An `intrinsic` may name any instruction of its set except four kinds, each refused
+An `intrinsic` may name any instruction of its set except three kinds, each refused
 with `op.unknown` at a call, saying what a program writes instead or why the
 instruction is not available:
 
@@ -1124,8 +1142,20 @@ instruction is not available:
   is the pointee's stride, which a physical pointer, an address, does not carry:
   `` `OpTranspose` is not available as an `intrinsic`: it is over matrices, a type
   the language does not declare ``.
-- **An instruction that transfers control**, as `OpKill` or
-  `OpTerminateInvocation`: control flow is the language's.
+
+A named instruction the compiler has typing rules for is held to them, at the
+declaration with `op.signature` and at the call where a rule depends on the
+arguments. One it has no typing rules for is held to its operand kinds alone: a
+constant or literal operand taken as an integer, a handle operand taken as a handle,
+a pointer it reads or writes through taken as a pointer, and a result returned only
+where the instruction has one. Its types are the author's to get right, and a wrong
+declaration of one can build a module a validator rejects. The rules are masc's
+typing data (`dep/masc/gen/data/spirv/typings.txt`), one or more lines per typed
+instruction citing the specification text each holds, and the relations each
+instruction is held to are in the table of relations above. `OpKill` and
+`OpTerminateInvocation` are of the second kind: a call of one is not where its block
+ends, and the compiler builds it into a module a validator rejects, so a program that
+discards a fragment writes `OpDemoteToHelperInvocation` instead.
 
 An instruction is refused as a construct's only when a construct emits it. One the
 compiler writes only inside another construct's code, or never, is an intrinsic's,
@@ -1187,6 +1217,9 @@ Pointers reach five instructions as values:
   `VariablePointers`, which the selection must hold, refused with `spirv.capability`
   naming it where it does not. No pointer into `PhysicalStorageBuffer` is compared, as
   SPIR-V forbids it (2.16.1), so such a call is refused with `op.signature`.
+
+`OpDemoteToHelperInvocation` takes nothing and executes in a fragment stage alone, as
+the typing data states.
 
 The set of accepted instructions is masc's SPIR-V table (`src/isa/spirv/gen_row.mach`
 in masc), which masc's generator writes from the SPIR-V grammar and the overlay under
