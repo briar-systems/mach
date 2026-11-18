@@ -637,9 +637,10 @@ as anywhere else.
   clear changes nothing. An instruction the function's code does not switch
   for, as one of a block, is still checked with FPCR.NEP possibly set, and a
   refusal for it names the state, `fpcr`, and that neither the system nor the
-  function clears it there: write the register before the instruction. A
-  block may not write `fpcr`: `msr fpcr` is refused whatever value it writes,
-  and only the function's own save, clear and restore are admitted.
+  function clears it there. A block may not write `fpcr`: `msr fpcr` is
+  refused whatever value it writes, and only the function's own save, clear
+  and restore are admitted. The refusal says so and points to the way out:
+  write the operation in Mach, where the function clears FPCR.NEP around it.
 
 What the walk cannot read, it refuses: bytes that decode to no instruction, an
 instruction whose effects masc's tables leave undecided, and control that leaves
