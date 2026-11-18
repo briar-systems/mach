@@ -12,7 +12,8 @@ pointer, and a handle returned only where the row's result is one. on spir-v the
 typing in masc (`masc.isa.spirv.typing`) holds each slot further: the number its type is
 a scalar or vector of, its shape and widths, and how it relates to another slot's type,
 a pointer slot's being the type it points to. a row masc states no typing of is held to
-its kinds alone. each break is refused with `op.signature`, naming the parameter
+its operand kinds alone, and its types are the author's to get right. each break is
+refused with `op.signature`, naming the parameter
 
 Source: [`src/lower/intrinsic.mach`](../../../src/lower/intrinsic.mach)
 
