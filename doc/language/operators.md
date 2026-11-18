@@ -24,6 +24,9 @@ only the NaN is defined, not its sign or payload. In a constant expression a
 zero divisor is refused as division by zero, and the other cases fold to the
 same results as at run time, except a NaN on a target that leaves it unspecified
 ([A NaN in a constant on a target that leaves it unspecified](#a-nan-in-a-constant-on-a-target-that-leaves-it-unspecified)).
+On `spirv` a float `%` is computed to this definition by code the compiler
+provides, not by `OpFRem`, which is an `intrinsic`'s
+([gpu.md](gpu.md#which-instructions-an-intrinsic-may-name)).
 
 ```mach
 use std.print;
@@ -198,6 +201,16 @@ values**, so the result is identical in either operand order:
 
 On the seeded vector types, a comparison produces a
 same-shape unsigned **mask** vector (lane-wise) — see [SIMD vectors](#simd-vectors).
+
+On `spirv` a comparison of numbers is one instruction: `==` and `!=` on integers
+are `OpIEqual` and `OpINotEqual`, `<` and `<=` are `OpULessThan`, `OpSLessThan` and
+their `Equal` forms, and `>` and `>=` are the same instructions with the operands
+exchanged. On floats `==`, `<` and `<=` are the ordered `OpFOrdEqual`,
+`OpFOrdLessThan` and `OpFOrdLessThanEqual`, `>` and `>=` exchange their operands
+the same way, and `!=` is the unordered `OpFUnordNotEqual`. The comparisons no
+operator writes, the greater-than instructions and the other ordered and unordered
+float relations, are an `intrinsic`'s
+([gpu.md](gpu.md#which-instructions-an-intrinsic-may-name)).
 
 `==` / `!=` on an **aggregate value** (a `rec`, `uni`, or whole `tag`) is a compile error.
 Comparing representations would silently relate padding bytes and unwritten union

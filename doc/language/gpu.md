@@ -994,7 +994,7 @@ scalar or vector of floats, the trigonometric and exponential rows, `Pow`, `Radi
 `Degrees` on floats of 16 or 32 bits only, the pack and unpack rows on the 32-bit and 64-bit
 types their names state, `FindILsb`, `FindSMsb`, `FindUMsb` and the `InterpolateAt` rows on
 32-bit components, and the `InterpolateAt` rows execute in a fragment stage alone. The
-core bit rows `OpBitReverse`, `OpBitFieldInsert`, `OpBitFieldSExtract` and
+core bit rows `OpBitCount`, `OpBitReverse`, `OpBitFieldInsert`, `OpBitFieldSExtract` and
 `OpBitFieldUExtract` take a `Base` of 32-bit integer components, which Vulkan's
 `VUID-RuntimeSpirv-None-10824` requires unless the device enables `maintenance9`, a feature
 no Vulkan version guarantees, and their offset and count are integer scalars. The
@@ -1075,6 +1075,90 @@ link time naming the symbol. That is a deliberate design choice on the library's
 part, not a property of the decorator: a decorated function may have a body, and if
 it does, that body is what every non-`spirv` target runs while `spirv` substitutes
 the instruction. A `spirv` build never emits the body at all.
+
+### Which instructions an `intrinsic` may name
+
+An `intrinsic` may name any instruction of its set except three kinds, each refused
+with `op.unknown` at a call, saying what a program writes instead:
+
+- **An instruction a construct of the language writes.** Each operation has one
+  spelling, so the instruction an operator, a cast, an access, a literal, a call, a
+  declaration or a statement is written as stays that construct's, and the refusal
+  names the construct: `` `OpIAdd` is no `intrinsic`: the language writes it with
+  the `+` operator on integers ``. These are the instructions of the arithmetic,
+  bitwise and shift operators (`OpIAdd`, `OpISub`, `OpIMul`, `OpUDiv`, `OpSDiv`,
+  `OpUMod`, `OpSRem`, `OpSNegate`, `OpNot`, `OpBitwiseAnd`, `OpBitwiseOr`,
+  `OpBitwiseXor`, `OpShiftLeftLogical`, `OpShiftRightLogical`,
+  `OpShiftRightArithmetic`, `OpFAdd`, `OpFSub`, `OpFMul`, `OpFDiv`, `OpFNegate`), the
+  comparisons they are written as (`OpIEqual`, `OpINotEqual`, `OpULessThan`,
+  `OpULessThanEqual`, `OpSLessThan`, `OpSLessThanEqual`, `OpFOrdEqual`,
+  `OpFOrdLessThan`, `OpFOrdLessThanEqual`, `OpFUnordNotEqual`), the casts
+  (`OpBitcast`, `OpConvertFToS`, `OpConvertFToU`, `OpConvertSToF`, `OpConvertUToF`,
+  `OpFConvert`, `OpSConvert`, `OpUConvert`), the
+  [widening multiply](operators.md#arithmetic) (`OpUMulExtended`, `OpSMulExtended`),
+  literals, lanes and members (`OpCompositeConstruct`, `OpCompositeExtract`,
+  `OpCompositeInsert`), member access and indexing (`OpAccessChain`,
+  `OpPtrAccessChain`), reading and assigning (`OpLoad`, `OpStore`), `var`
+  (`OpVariable`), calls (`OpFunctionCall`) and the statements (`OpBranch`,
+  `OpBranchConditional`, `OpReturn`, `OpReturnValue`).
+- **What is no instruction a program writes**: a type, a constant or a
+  specialization constant, a decoration, debug information, a capability, an
+  extension and the memory model (the target's `env` and `ext`), an entry point and
+  its execution modes (`#[gpu.stage]` and its decorators), the parts of a function
+  (`fun`), and the labels, joins and merges of control flow, which the compiler
+  derives from `if`, `for`, `brk`, `cnt` and `ret` (`OpLabel`, `OpPhi`,
+  `OpLoopMerge`, `OpSelectionMerge`, `OpSwitch`, `OpUnreachable`). So is `OpUndef`,
+  since no value of the language is undefined, an operation on an untyped pointer
+  (`OpUntypedVariableKHR` and the `OpUntyped*AccessChainKHR` instructions), a type
+  the language has none of, and `OpCopyLogical`, a copy between two types alike
+  member for member without being one type, which the language never declares,
+  since records of the same members are one type. The refusal says what it is:
+  `` `OpTypeInt` is no `intrinsic`: a type is declared, not called ``.
+- **An instruction that transfers control**, as `OpKill` or
+  `OpTerminateInvocation`: control flow is the language's.
+
+An instruction is refused as a construct's only when a construct writes it. One the
+compiler writes only inside another construct's code, or never, is an intrinsic's,
+held to its row and typed by masc's overlay like any other:
+
+| Instructions | Why no construct writes them |
+|--------------|------------------------------|
+| `OpSGreaterThan`, `OpSGreaterThanEqual`, `OpUGreaterThan`, `OpUGreaterThanEqual`, `OpFOrdGreaterThan`, `OpFOrdGreaterThanEqual` | `>` and `>=` are the less-than instructions with their operands exchanged |
+| `OpFOrdNotEqual`, `OpFUnordEqual`, `OpFUnordLessThan`, `OpFUnordLessThanEqual`, `OpFUnordGreaterThan`, `OpFUnordGreaterThanEqual`, `OpIsNan` | a float comparison is ordered but for `!=`, which is unordered, and `x != x` is that comparison |
+| `OpLogicalAnd`, `OpLogicalOr`, `OpLogicalNot`, `OpLogicalEqual`, `OpLogicalNotEqual` | `&&` and `\|\|` branch, and a truth value is an integer to the other operators |
+| `OpSelect` | the language has no conditional expression |
+| `OpAll`, `OpAny` | the language has no reduction of a vector's lanes |
+| `OpBitCount` | the language has no count of one bits |
+| `OpIAddCarry`, `OpISubBorrow` | the language has no carry out of `+` or borrow out of `-` |
+| `OpFRem` | a float `%` is computed to its definition by code the compiler provides |
+| `OpVectorShuffle` | a range `v[start, count]` takes consecutive lanes of one vector, and a shuffle of two vectors or of lanes in any order has no construct |
+| `OpVectorExtractDynamic`, `OpVectorInsertDynamic` | a lane index is a constant |
+| `OpVectorTimesScalar` | a vector multiplies a vector |
+| `OpCopyObject`, `OpCopyMemory` | a value is used as itself, and an assignment of an aggregate copies its members |
+| `OpPtrEqual`, `OpPtrNotEqual` | a logical pointer is never compared, and a physical one is compared as its address |
+| `OpNop` | nothing writes it |
+
+Some of these the target cannot run. `OpLessOrGreater`, `OpOrdered` and `OpUnordered`
+need `Kernel`, `OpCopyMemorySized` needs `Addresses`, and `OpFmaKHR` needs `FMAKHR`,
+which no Vulkan environment holds, so a call of one is refused with
+`spirv.capability`, naming it. `OpInBoundsAccessChain`, `OpInBoundsPtrAccessChain`
+and `OpConvertUToPtr` return a pointer whose storage class is not the row's own, and
+`OpConvertPtrToU`, `OpPtrEqual` and `OpPtrNotEqual` take a physical pointer as a value,
+neither of which an `intrinsic` carries yet, so such a call is refused with
+`spirv.unsupported`. `OpPtrEqual` and `OpPtrNotEqual` have no call that builds a valid
+module yet: on physical pointers the call is refused, and on logical pointers the module
+needs `VariablePointers`, which nothing declares for it, so it is invalid.
+
+What the overlay states of each is held at the declaration with `op.signature`, as for
+every row. A comparison, `OpIsNan` and a logical instruction return one truth value, so
+each is declared over scalars: the compiler gives a truth result one component. The
+objects of `OpSelect` and `OpCopyObject` are scalars or vectors, since an aggregate
+argument reaches a row as its address. Three rules the overlay does not state are the
+program's to keep, and a module that breaks one is invalid: an `OpIAddCarry` or
+`OpISubBorrow` result is a `rec` of two members of the operands' type, an
+`OpVectorShuffle` result has as many components as the call passes component literals
+and its operands' component type, and the two pointers of an `OpCopyMemory` point into
+memory of one layout (two locals, or two parts of one kind of binding).
 
 The set of accepted instructions is masc's SPIR-V table (`src/isa/spirv/gen_row.mach`
 in masc), which masc's generator writes from the SPIR-V grammar and the overlay under

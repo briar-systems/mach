@@ -1115,7 +1115,10 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
 The `gpu.` decorators shape a pipeline stage and its workgroup, the shader
 interface and specialization constants. They, with the handle types a target
 mints (`handle`) and the functions that are target instructions (`intrinsic`),
-are described in [gpu.md](gpu.md). v6 spelled the GPU set without its prefix
+are described in [gpu.md](gpu.md). An `intrinsic` names any instruction of its
+set but one a construct of the language writes, which the refusal names, one that
+is no instruction a program writes, as a type or a decoration, and one that
+transfers control ([gpu.md](gpu.md#which-instructions-an-intrinsic-may-name)). v6 spelled the GPU set without its prefix
 (`#[stage]`, `#[input]` and the rest) and the instruction decorator `#[op]`. Each
 is refused naming its replacement, which takes the same arguments.
 
