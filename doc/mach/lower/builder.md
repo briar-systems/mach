@@ -112,7 +112,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`emit_ret`](#emit_ret) | return `v` from the function being built: an aggregate is read whole from its address, as secret as `v` is |
 | [`emit_ret_void`](#emit_ret_void) | |
 | [`emit_asm`](#emit_asm) | an inline assembly block at the cursor, binding the `n` values at `values` in its operands' order |
-| [`emit_target_op`](#emit_target_op) | the target op `op` at the cursor over the `n` values at `values`, in its operands' order, its result the one `op` states or none |
+| [`emit_target_op`](#emit_target_op) | the target op `op` at the cursor over the `n` values at `values`, in its operands' order, its result the one `op` states or none, a pointer's in the space its caller places it |
 | [`emit_unreachable`](#emit_unreachable), [`add`](#add), [`sub`](#sub), [`mul`](#mul), [`band`](#band), [`bor`](#bor), [`bxor`](#bxor), [`shl`](#shl), [`shr_u`](#shr_u), [`shr_s`](#shr_s), [`eq`](#eq), [`ne`](#ne), [`lt_s`](#lt_s), [`lt_u`](#lt_u), [`le_u`](#le_u), [`trunc`](#trunc), [`zext`](#zext), [`sext`](#sext), [`bitcast`](#bitcast), [`br`](#br), [`cbr`](#cbr) | |
 
 ---
@@ -1172,7 +1172,8 @@ pub fun emit_target_op(b: *Builder, op: *mirl.ir.native.Op, values: *mach.lower.
 ```
 
 the target op `op` at the cursor over the `n` values at `values`, in its operands' order,
-its result the one `op` states or none. the instruction copies the op, so it may be borrowed
+its result the one `op` states or none, a pointer's in the space its caller places it. the
+instruction copies the op, so it may be borrowed
 
 ### emit_unreachable
 

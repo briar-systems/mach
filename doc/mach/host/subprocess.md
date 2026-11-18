@@ -304,7 +304,7 @@ that one reaped
 each pass polls the scope, then every running owner: a cancelled or expired
 scope cancels or times out the first running owner, an owner past its own
 deadline is timed out, and one whose capture outgrew its limit is
-cancelled. a terminate, interrupt, console-close or service-stop event from
+cancelled, each with GRACE to stop. a terminate, interrupt, console-close or service-stop event from
 `source` cancels the scope.
 
 | Parameter | |
@@ -365,7 +365,9 @@ pub fun timeout(a: *std.allocator.Allocator, p: *OwnedSubprocess, grace: std.chr
 terminate the running child for outliving its deadline and reap it
 
 the child is asked to stop, its whole group when it has one, and given
-`grace` to end before it is killed.
+`grace` to end before it is killed. a grouped child's group gets the whole
+grace even when the child ends sooner, and what is left of it then is
+killed as a group.
 
 | Parameter | |
 | :--- | :--- |

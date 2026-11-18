@@ -28,4 +28,5 @@ The directory's root module is [`mach.lower`](../lower.md).
 | [`stmt`](stmt.md) | the lowering of statements, with `asm` blocks and the comptime `$if` and `$each` among them |
 | [`testrunner`](testrunner.md) | the tests a build collects and the dispatcher that runs one of them by index |
 | [`value`](value.md) | a value lowering holds: a mirl value of the function being built, or a constant, a function or a global the builder makes a value of where an instruction uses it |
+| [`written`](written.md) | the language's own spellings of target instructions, which decide the `intrinsic` calls it refuses |
 
