@@ -783,7 +783,8 @@ a function is refused at the call with `spirv.unsupported`. A row whose result i
 **structure**, as each `OpImageSparse` instruction gives its residency code and its
 texels, is declared returning a `rec` of those members, which receives the structure. A
 row whose result is a **truth value**, such as `OpGroupNonUniformElect`, is declared
-returning an integer, which receives 1 or 0. A `bool` return is an 8-bit integer,
+returning an integer, which receives 1 or 0, and one that gives a truth value per lane,
+as `OpIsNan` over a vector, returning an integer vector of those lanes. A `bool` return is an 8-bit integer,
 which a target without `Int8` carries at 32 bits like any other 8-bit local
 ([manifest.md](manifest.md#finished-module-targets)), so the module needs no Int8 for it.
 
@@ -1078,8 +1079,9 @@ the instruction. A `spirv` build never emits the body at all.
 
 ### Which instructions an `intrinsic` may name
 
-An `intrinsic` may name any instruction of its set except three kinds, each refused
-with `op.unknown` at a call, saying what a program writes instead:
+An `intrinsic` may name any instruction of its set except four kinds, each refused
+with `op.unknown` at a call, saying what a program writes instead or why the
+instruction is not available:
 
 - **An instruction a construct of the language writes.** Each operation has one
   spelling, so the instruction an operator, a cast, an access, a literal, a call, a
@@ -1099,27 +1101,39 @@ with `op.unknown` at a call, saying what a program writes instead:
   literals, lanes and members (`OpCompositeConstruct`, `OpCompositeExtract`,
   `OpCompositeInsert`), member access and indexing (`OpAccessChain`,
   `OpPtrAccessChain`), reading and assigning (`OpLoad`, `OpStore`), `var`
-  (`OpVariable`), calls (`OpFunctionCall`) and the statements (`OpBranch`,
-  `OpBranchConditional`, `OpReturn`, `OpReturnValue`).
+  (`OpVariable`), calls (`OpFunctionCall`).
 - **What is no instruction a program writes**: a type, a constant or a
   specialization constant, a decoration, debug information, a capability, an
   extension and the memory model (the target's `env` and `ext`), an entry point and
   its execution modes (`#[gpu.stage]` and its decorators), the parts of a function
-  (`fun`), and the labels, joins and merges of control flow, which the compiler
-  derives from `if`, `for`, `brk`, `cnt` and `ret` (`OpLabel`, `OpPhi`,
-  `OpLoopMerge`, `OpSelectionMerge`, `OpSwitch`, `OpUnreachable`). So is `OpUndef`,
-  since no value of the language is undefined, an operation on an untyped pointer
-  (`OpUntypedVariableKHR` and the `OpUntyped*AccessChainKHR` instructions), a type
-  the language has none of, and `OpCopyLogical`, a copy between two types alike
-  member for member without being one type, which the language never declares,
-  since records of the same members are one type. The refusal says what it is:
-  `` `OpTypeInt` is no `intrinsic`: a type is declared, not called ``.
+  (`fun`), and control flow, which the compiler derives from `if`, `for`, `brk`,
+  `cnt` and `ret` (`OpBranch`, `OpBranchConditional`, `OpReturn`, `OpReturnValue`,
+  `OpLabel`, `OpPhi`, `OpLoopMerge`, `OpSelectionMerge`, `OpSwitch`,
+  `OpUnreachable`). The refusal says what it is: `` `OpTypeInt` is no
+  `intrinsic`: a type is declared, not called ``.
+- **An instruction that is not available**, since its rule cannot be held for any
+  declaration of the language, refused saying why: `OpUndef`, since no value of the
+  language is undefined, an operation on an untyped pointer (every `OpUntyped*`
+  instruction, as `OpUntypedVariableKHR` and `OpUntypedAccessChainKHR`), a type
+  the language has none of, `OpCopyLogical`, a copy between two types alike member
+  for member without being one type, which the language never declares, the
+  instructions over matrices (`OpTranspose`, `OpOuterProduct`,
+  `OpMatrixTimesScalar`, `OpMatrixTimesVector`, `OpVectorTimesMatrix`,
+  `OpMatrixTimesMatrix`, and `Determinant` and `MatrixInverse` of `GLSL.std.450`),
+  a type the language has none of, and `OpInBoundsPtrAccessChain`, whose element
+  is the pointee's stride, which a physical pointer, an address, does not carry:
+  `` `OpTranspose` is not available as an `intrinsic`: it is over matrices, a type
+  the language does not declare ``.
 - **An instruction that transfers control**, as `OpKill` or
   `OpTerminateInvocation`: control flow is the language's.
 
-An instruction is refused as a construct's only when a construct writes it. One the
+An instruction is refused as a construct's only when a construct emits it. One the
 compiler writes only inside another construct's code, or never, is an intrinsic's,
-held to its row and typed by masc's overlay like any other:
+held to its row and typed by masc's overlay like any other. Where a construct
+writes the instruction's operation by emitting another instruction, as `>` by a
+less-than with its operands exchanged, the instruction is an intrinsic's too, and
+the compiler's table of constructs (`mach.lower.written`) records the construct
+with `emits: false`:
 
 | Instructions | Why no construct writes them |
 |--------------|------------------------------|
@@ -1136,29 +1150,43 @@ held to its row and typed by masc's overlay like any other:
 | `OpVectorTimesScalar` | a vector multiplies a vector |
 | `OpCopyObject`, `OpCopyMemory` | a value is used as itself, and an assignment of an aggregate copies its members |
 | `OpPtrEqual`, `OpPtrNotEqual` | a logical pointer is never compared, and a physical one is compared as its address |
+| `OpInBoundsAccessChain` | an access, `r.f` or `a[i]`, makes no claim that it stays in bounds |
+| `OpConvertPtrToU`, `OpConvertUToPtr` | a cast between a physical pointer and `u64` reinterprets the address's bits |
 | `OpNop` | nothing writes it |
 
 Some of these the target cannot run. `OpLessOrGreater`, `OpOrdered` and `OpUnordered`
 need `Kernel`, `OpCopyMemorySized` needs `Addresses`, and `OpFmaKHR` needs `FMAKHR`,
 which no Vulkan environment holds, so a call of one is refused with
-`spirv.capability`, naming it. `OpInBoundsAccessChain`, `OpInBoundsPtrAccessChain`
-and `OpConvertUToPtr` return a pointer whose storage class is not the row's own, and
-`OpConvertPtrToU`, `OpPtrEqual` and `OpPtrNotEqual` take a physical pointer as a value,
-neither of which an `intrinsic` carries yet, so such a call is refused with
-`spirv.unsupported`. `OpPtrEqual` and `OpPtrNotEqual` have no call that builds a valid
-module yet: on physical pointers the call is refused, and on logical pointers the module
-needs `VariablePointers`, which nothing declares for it, so it is invalid.
+`spirv.capability`, naming it.
 
 What the overlay states of each is held at the declaration with `op.signature`, as for
-every row. A comparison, `OpIsNan` and a logical instruction return one truth value, so
-each is declared over scalars: the compiler gives a truth result one component. The
-objects of `OpSelect` and `OpCopyObject` are scalars or vectors, since an aggregate
-argument reaches a row as its address. Three rules the overlay does not state are the
-program's to keep, and a module that breaks one is invalid: an `OpIAddCarry` or
-`OpISubBorrow` result is a `rec` of two members of the operands' type, an
-`OpVectorShuffle` result has as many components as the call passes component literals
-and its operands' component type, and the two pointers of an `OpCopyMemory` point into
-memory of one layout (two locals, or two parts of one kind of binding).
+every row, and what depends on the arguments is held at the call. A comparison, `OpIsNan`
+and a logical instruction return a truth value per lane of their operands, so each is
+declared over scalars or over vectors, a vector result an integer vector of the operands'
+lane count that holds 1 or 0 in each lane. The objects of `OpSelect` and `OpCopyObject`
+are scalars or vectors, since an aggregate argument reaches a row as its address. An
+`OpIAddCarry` or `OpISubBorrow` result is a `rec` of two members of the operands' type.
+An `OpVectorShuffle` result has the component type of its two vector operands and as
+many components as the call passes component literals, each literal below the two
+operands' lane count together or `0xFFFFFFFF`. The two pointers of an `OpCopyMemory`
+point into memory of one layout. The derivatives (`OpDPdx`, `OpDPdy`, `OpFwidth` and their
+`Fine` and `Coarse` forms) take and return one type, a 32-bit float or a vector of them,
+and `Ldexp` takes its exponent as 32-bit integers of the value's lane count.
+
+Pointers reach five instructions as values:
+
+- `OpInBoundsAccessChain` takes a pointer and indexes and returns a pointer into the same
+  storage class. Each index is an integer, a constant where it selects a member of a
+  record and below the record's member count or a constant array's length where it is
+  constant, and the result points to the type the indexes reach.
+- `OpConvertUToPtr` takes a `u64` and returns a physical pointer, and `OpConvertPtrToU`
+  takes a physical pointer and returns a `u64`: under the target's
+  `PhysicalStorageBuffer64` addressing an address is 64 bits wide.
+- `OpPtrEqual` and `OpPtrNotEqual` compare two pointers of one type into one storage
+  class: `StorageBuffer` under `VariablePointersStorageBuffer` or `Workgroup` under
+  `VariablePointers`, which the selection must hold, refused with `spirv.capability`
+  naming it where it does not. No pointer into `PhysicalStorageBuffer` is compared, as
+  SPIR-V forbids it (2.16.1), so such a call is refused with `op.signature`.
 
 The set of accepted instructions is masc's SPIR-V table (`src/isa/spirv/gen_row.mach`
 in masc), which masc's generator writes from the SPIR-V grammar and the overlay under

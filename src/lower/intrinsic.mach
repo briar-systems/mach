@@ -24,9 +24,11 @@ use mach.base.fail;
 use mach.base.intern;
 use base_source: mach.base.source;
 use mach.front.sema.typename;
+use mach.lower.builder;
 use lower_context: mach.lower.context;
 use lower_shader:  mach.lower.shader;
 use mach.type;
+use type_field:   mach.type.field;
 use type_kind:    mach.type.kind;
 use type_prim:    mach.type.prim;
 use masc_effect:  masc.core.effect;
@@ -91,16 +93,17 @@ pub fun check(ctx: *lower_context.LowerContext, span: base_source.Span, name: st
     }
     var k: u32 = 0;
     for (k < t.count) {
-        val err_form: err[fail.Fail] = form(ctx, span, name, ?d, lead, ?t.forms[k]);
+        val err_form: err[fail.Fail] = form(ctx, span, name, r, ?d, lead, ?t.forms[k]);
         if (sel err_form.err) { ret err_form; }
         k = k + 1;
     }
     ret typed(ctx, span, name, ?d, lead, t);
 }
 
-# the storage class a call's pointer result points into where its row's typing relates the result to the texel of an
-# image: the Image class, as OpImageTexelPointer's result points into (spir-v 1.6, OpImageTexelPointer), none for any
-# other row, whose pointer result keeps the default space
+# the storage class a call's pointer result points into where its row's typing states it: the Image class where it
+# relates the result to the texel of an image, as OpImageTexelPointer's result points into (spir-v 1.6,
+# OpImageTexelPointer), PhysicalStorageBuffer where the result is a physical pointer, as OpConvertUToPtr makes. none for
+# any other row, whose pointer result keeps the default space or takes its base's (`chain_base`)
 pub fun result_class(ctx: *lower_context.LowerContext, r: *masc_row.Row) opt[u32] {
     if (!lower_shader.attaching(ctx)) { ret opt[u32].none{}; }
     val opt_typing: opt[*typing.Typing] = typing.of(?gen_typing.TYPINGS[0], gen_typing.COUNT, r.index);
@@ -108,6 +111,7 @@ pub fun result_class(ctx: *lower_context.LowerContext, r: *masc_row.Row) opt[u32
     val t: *typing.Typing = opt_typing.some;
     var k: u32            = 0;
     for (k < t.count) {
+        if (t.forms[k].slot == typing.RESULT && t.forms[k].pointer == typing.PHYSICAL) { ret builder.physical_space(?ctx.builder); }
         if (t.forms[k].slot == typing.RESULT && t.forms[k].relation == typing.TEXEL) {
             val opt_class: opt[u64] = lower_shader.storage_class("Image");
             if (sel opt_class.none) { ret opt[u32].none{}; }
@@ -116,6 +120,75 @@ pub fun result_class(ctx: *lower_context.LowerContext, r: *masc_row.Row) opt[u32
         k = k + 1;
     }
     ret opt[u32].none{};
+}
+
+# the row operand a call's pointer result is chained from where its row's typing relates the result to an index chain,
+# as OpInBoundsAccessChain's to its Base, the result pointing into the storage class that operand points into. none for
+# any other row
+pub fun chain_base(ctx: *lower_context.LowerContext, r: *masc_row.Row) opt[u8] {
+    if (!lower_shader.attaching(ctx)) { ret opt[u8].none{}; }
+    val opt_typing: opt[*typing.Typing] = typing.of(?gen_typing.TYPINGS[0], gen_typing.COUNT, r.index);
+    if (sel opt_typing.none) { ret opt[u8].none{}; }
+    val t: *typing.Typing = opt_typing.some;
+    var k: u32            = 0;
+    for (k < t.count) {
+        if (t.forms[k].slot == typing.RESULT && t.forms[k].relation == typing.CHAIN) { ret opt[u8].some{t.forms[k].to}; }
+        k = k + 1;
+    }
+    ret opt[u8].none{};
+}
+
+# the pointer result of a chained row held to what its indexes reach: from what parameter `base` points to, each
+# parameter after it steps into an array's element, a vector's component, or the member of a record its constant names,
+# and the return type points to what the last step reaches. `indexes` holds the constant each index parameter's argument
+# folds to, none for one known only at run time
+pub fun chained(ctx: *lower_context.LowerContext, span: base_source.Span, name: str, fn: type_kind.TypeId, lead: u32, base: u8, indexes: *opt[u64], n: u32) err[fail.Fail] {
+    val opt_fn: opt[*type.Type] = shape_of(ctx, fn);
+    if (sel opt_fn.none)                        { ret err[fail.Fail].ok{}; }
+    if (opt_fn.some.kind != type_kind.TYPE_FUN) { ret err[fail.Fail].ok{}; }
+    val d:     Declared = Declared{params: opt_fn.some.data.fn.params_start, count: opt_fn.some.data.fn.params_len, result: opt_fn.some.data.fn.ret_type};
+    val first: u32      = base::u32 - lead;
+    if (first >= d.count || type_kind.is_nil(d.result)) { ret err[fail.Fail].ok{}; }
+    var at: type_kind.TypeId = pointee(ctx, param(ctx, ?d, first));
+    var k:  u32              = 0;
+    for (k < n) {
+        val index: type_kind.TypeId = param(ctx, ?d, first + k + 1);
+        if (!type_kind.is_nil(index) && !integer_scalar(ctx, index)) { ret refused_param(ctx, span, name, first + k + 1, index, "an index, a scalar integer"); }
+        val opt_t: opt[*type.Type] = shape_of(ctx, at);
+        if (sel opt_t.none) { ret err[fail.Fail].ok{}; }
+        val kind: type_kind.TypeKind = opt_t.some.kind;
+        if (kind == type_kind.TYPE_ARRAY) { at = type.strip_secret(?ctx.s.types, opt_t.some.data.array.base); }
+        or (kind == type_kind.TYPE_VECTOR) {
+            val opt_lane: opt[type_kind.TypeId] = type.prim(?ctx.s.types, opt_t.some.data.vector.element);
+            if (sel opt_lane.none) { ret err[fail.Fail].ok{}; }
+            at = opt_lane.some;
+        }
+        or (type.is_record(?ctx.s.types, at)) {
+            val i: opt[u64] = indexes[k];
+            if (sel i.none) {
+                ret refused(ctx, span, diagnostic.format(ctx.s.alloc, "parameter {} of the declaration of `{}` indexes a record, whose member an index names by a constant: pass a literal or a module-scope `val`", first + k + 2, name));
+            }
+            val members: u32 = type.field_count(?ctx.s.types, at);
+            if (i.some >= members::u64) {
+                ret refused(ctx, span, diagnostic.format(ctx.s.alloc, "parameter {} of the declaration of `{}` indexes member {} of a record of {} members: pass the index of one of them", first + k + 2, name, i.some, members));
+            }
+            val opt_field: opt[*type_field.Entry] = type.field_at(?ctx.s.types, at, i.some::u32);
+            if (sel opt_field.none) { ret err[fail.Fail].ok{}; }
+            at = type.strip_secret(?ctx.s.types, opt_field.some.ty);
+        }
+        or {
+            ret refused(ctx, span, diagnostic.format(ctx.s.alloc, "the declaration of `{}` passes {} indexes after parameter {}, and parameter {} indexes a value that holds no members: pass one index per step into what parameter {} points to", name, n, first + 1, first + k + 2, first + 1));
+        }
+        k = k + 1;
+    }
+    if (!is_pointer(ctx, d.result) || pointee(ctx, d.result) == at) { ret err[fail.Fail].ok{}; }
+    val res_reached: res[str, fail.Fail] = typename.type_to_str(ctx.s, at);
+    if (sel res_reached.err) { ret err[fail.Fail].err{res_reached.err}; }
+    fin { typename.type_str_free(ctx.s, res_reached.ok); }
+    val res_named: res[str, fail.Fail] = typename.type_to_str(ctx.s, d.result);
+    if (sel res_named.err) { ret err[fail.Fail].err{res_named.err}; }
+    fin { typename.type_str_free(ctx.s, res_named.ok); }
+    ret refused(ctx, span, diagnostic.format(ctx.s.alloc, "the return type of the declaration of `{}` is `{}`, and its indexes reach `{}` in what parameter {} points to: return a pointer to that", name, res_named.ok, res_reached.ok, first + 1));
 }
 
 # the type a typed row's data operand points to held to the types the row admits
@@ -315,15 +388,36 @@ fun admits(c: typing.Class, k: type_kind.TypeKind) bool {
     ret p.class == type_prim.PRIM_CLASS_INT || p.class == type_prim.PRIM_CLASS_FLOAT;
 }
 
+# whether the form `f` of row `r` holds a pointer: one its form says is, or one the row reads or writes through
+fun pointer_slot(r: *masc_row.Row, f: *typing.Form) bool {
+    if (f.pointer != typing.VALUE) { ret true; }
+    ret f.slot != typing.RESULT && f.slot::u32 < r.operands.len && accessed(r, f.slot::u32);
+}
+
+# whether row operand `slot` is a variadic literal, whose values a form holds by their count
+fun literal_slot(r: *masc_row.Row, slot: u8) bool {
+    if (slot == typing.RESULT || slot::u32 >= r.operands.len) { ret false; }
+    ret r.operands.at[slot].quantity == masc_operand.VARIADIC;
+}
+
 # slot `f.slot` of the declaration held to form `f`
-fun form(ctx: *lower_context.LowerContext, span: base_source.Span, name: str, d: *Declared, lead: u32, f: *typing.Form) err[fail.Fail] {
+fun form(ctx: *lower_context.LowerContext, span: base_source.Span, name: str, r: *masc_row.Row, d: *Declared, lead: u32, f: *typing.Form) err[fail.Fail] {
+    if (literal_slot(r, f.slot)) { ret counted(ctx, span, name, d, lead, f); }
     val held: type_kind.TypeId = slot_type(ctx, d, lead, f.slot);
-    if (type_kind.is_nil(held)) { ret err[fail.Fail].ok{}; }
+    if (type_kind.is_nil(held))                       { ret err[fail.Fail].ok{}; }
+    if (pointer_slot(r, f) && !is_pointer(ctx, held)) { ret broke_kind(ctx, span, name, lead, f, held, "a pointer"); }
+    if (!pointer_slot(r, f) && is_pointer(ctx, held)) { ret broke_kind(ctx, span, name, lead, f, held, "a value, not a pointer"); }
     val t: type_kind.TypeId = pointee(ctx, held);
+    if (f.relation == typing.PAIR) {
+        val to: type_kind.TypeId = pointee(ctx, slot_type(ctx, d, lead, f.to));
+        if (type_kind.is_nil(to)) { ret err[fail.Fail].ok{}; }
+        if (!paired(ctx, t, to))  { ret broke(ctx, span, name, d, lead, f, held, "a record of two members, each the type of"); }
+        ret err[fail.Fail].ok{};
+    }
     if (f.relation == typing.COMPOSED) {
         val to: type_kind.TypeId = pointee(ctx, slot_type(ctx, d, lead, f.to));
         if (type_kind.is_nil(to))  { ret err[fail.Fail].ok{}; }
-        if (!composes(ctx, t, to)) { ret broke(ctx, span, name, lead, f, held, "a sampled image whose image is the type of"); }
+        if (!composes(ctx, t, to)) { ret broke(ctx, span, name, d, lead, f, held, "a sampled image whose image is the type of"); }
         ret err[fail.Fail].ok{};
     }
     if (f.class != typing.ANY) {
@@ -350,26 +444,27 @@ fun form(ctx: *lower_context.LowerContext, span: base_source.Span, name: str, d:
     val other: type_kind.TypeId = slot_type(ctx, d, lead, f.to);
     if (type_kind.is_nil(other)) { ret err[fail.Fail].ok{}; }
     val u: type_kind.TypeId = pointee(ctx, other);
-    if (f.relation == typing.SAME && t != u) { ret broke(ctx, span, name, lead, f, held, "the type of"); }
-    if (f.relation == typing.COMPONENT) {
+    if (f.relation == typing.SAME && t != u) { ret broke(ctx, span, name, d, lead, f, held, "the type of"); }
+    if (f.relation == typing.COMPONENT || f.relation == typing.ELEMENT) {
         val opt_mine:   opt[type_kind.TypeKind] = component(ctx, t);
         val opt_theirs: opt[type_kind.TypeKind] = component(ctx, u);
-        if (sel opt_mine.some) {
-            if (sel opt_theirs.some) {
-                if (lanes(ctx, t) != 1 || opt_mine.some != opt_theirs.some) { ret broke(ctx, span, name, lead, f, held, "the component type of"); }
-            }
+        if (sel opt_theirs.some) {
+            var same_kind: bool = false;
+            if (sel opt_mine.some)                                                    { same_kind = opt_mine.some == opt_theirs.some; }
+            if (f.relation == typing.COMPONENT && (lanes(ctx, t) != 1 || !same_kind)) { ret broke(ctx, span, name, d, lead, f, held, "the component type of"); }
+            if (f.relation == typing.ELEMENT && !same_kind)                           { ret broke(ctx, span, name, d, lead, f, held, "components of the component type of"); }
         }
     }
-    if (f.relation == typing.LANES && lanes(ctx, t) != lanes(ctx, u)) { ret broke(ctx, span, name, lead, f, held, "as many components as"); }
+    if (f.relation == typing.LANES && lanes(ctx, t) != lanes(ctx, u)) { ret broke(ctx, span, name, d, lead, f, held, "as many components as"); }
     if (f.relation == typing.TEXEL || f.relation == typing.FORMAT) {
         val opt_texel: opt[type_kind.TypeKind] = texel(ctx, u);
         val opt_mine:  opt[type_kind.TypeKind] = component(ctx, t);
         if (sel opt_texel.some) {
             if (sel opt_mine.some) {
-                if (!same_number(opt_texel.some, opt_mine.some)) { ret broke(ctx, span, name, lead, f, held, "the texel scalar of the image of"); }
+                if (!same_number(opt_texel.some, opt_mine.some)) { ret broke(ctx, span, name, d, lead, f, held, "the texel scalar of the image of"); }
             }
         }
-        if (f.relation == typing.FORMAT && lanes(ctx, t) < format_lanes(ctx, u)) { ret broke(ctx, span, name, lead, f, held, "at least as many components as the format of the image of"); }
+        if (f.relation == typing.FORMAT && lanes(ctx, t) < format_lanes(ctx, u)) { ret broke(ctx, span, name, d, lead, f, held, "at least as many components as the format of the image of"); }
     }
     ret err[fail.Fail].ok{};
 }
@@ -380,6 +475,45 @@ fun same_number(a: type_kind.TypeKind, b: type_kind.TypeKind) bool {
     val x: type_prim.PrimDesc = type_prim.prim_desc(a);
     val y: type_prim.PrimDesc = type_prim.prim_desc(b);
     ret x.class == y.class && x.bits == y.bits;
+}
+
+# whether `t` is a record of exactly two members, each of type `member`
+fun paired(ctx: *lower_context.LowerContext, t: type_kind.TypeId, member: type_kind.TypeId) bool {
+    if (!type.is_record(?ctx.s.types, t) || type.field_count(?ctx.s.types, t) != 2) { ret false; }
+    var i: u32 = 0;
+    for (i < 2) {
+        val opt_field: opt[*type_field.Entry] = type.field_at(?ctx.s.types, t, i);
+        if (sel opt_field.none)                                           { ret false; }
+        if (type.strip_secret(?ctx.s.types, opt_field.some.ty) != member) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the values the declaration passes for the variadic literal `f.slot` held to the count its form relates them to
+fun counted(ctx: *lower_context.LowerContext, span: base_source.Span, name: str, d: *Declared, lead: u32, f: *typing.Form) err[fail.Fail] {
+    if (f.relation != typing.COUNT || f.slot::u32 < lead) { ret err[fail.Fail].ok{}; }
+    val first: u32 = f.slot::u32 - lead;
+    var given: u32 = 0;
+    if (d.count > first) { given = d.count - first; }
+    val other: type_kind.TypeId = slot_type(ctx, d, lead, f.to);
+    if (type_kind.is_nil(other)) { ret err[fail.Fail].ok{}; }
+    val want: u32 = lanes(ctx, pointee(ctx, other));
+    if (given == want) { ret err[fail.Fail].ok{}; }
+    val res_to: res[str, fail.Fail] = slot_name(ctx, lead, f.to);
+    if (sel res_to.err) { ret err[fail.Fail].err{res_to.err}; }
+    ret refused(ctx, span, diagnostic.format(ctx.s.alloc, "the declaration of `{}` passes {} values from parameter {} on, and the instruction takes one for each of the {} components of {}: declare one parameter per component",
+        name, given, first + 1, want, res_to.ok));
+}
+
+# slot `f.slot` refused for being a pointer where its operand takes a value, or the reverse
+fun broke_kind(ctx: *lower_context.LowerContext, span: base_source.Span, name: str, lead: u32, f: *typing.Form, held: type_kind.TypeId, takes: str) err[fail.Fail] {
+    val res_named: res[str, fail.Fail] = typename.type_to_str(ctx.s, held);
+    if (sel res_named.err) { ret err[fail.Fail].err{res_named.err}; }
+    fin { typename.type_str_free(ctx.s, res_named.ok); }
+    val res_slot: res[str, fail.Fail] = slot_name(ctx, lead, f.slot);
+    if (sel res_slot.err) { ret err[fail.Fail].err{res_slot.err}; }
+    ret refused(ctx, span, diagnostic.format(ctx.s.alloc, "{} of the declaration of `{}` is `{}`, and the instruction takes {} there: declare it so", res_slot.ok, name, res_named.ok, takes));
 }
 
 fun broke_class(ctx: *lower_context.LowerContext, span: base_source.Span, name: str, lead: u32, f: *typing.Form, held: type_kind.TypeId) err[fail.Fail] {
@@ -411,7 +545,9 @@ fun bits_text(f: *typing.Form) str {
     ret "";
 }
 
-fun broke(ctx: *lower_context.LowerContext, span: base_source.Span, name: str, lead: u32, f: *typing.Form, held: type_kind.TypeId, relation: str) err[fail.Fail] {
+# a relation of slot `f.slot` to slot `f.to` the declaration breaks, saying a pointer's type is
+# its pointee's where either slot takes a pointer
+fun broke(ctx: *lower_context.LowerContext, span: base_source.Span, name: str, d: *Declared, lead: u32, f: *typing.Form, held: type_kind.TypeId, relation: str) err[fail.Fail] {
     val res_named: res[str, fail.Fail] = typename.type_to_str(ctx.s, held);
     if (sel res_named.err) { ret err[fail.Fail].err{res_named.err}; }
     fin { typename.type_str_free(ctx.s, res_named.ok); }
@@ -419,8 +555,9 @@ fun broke(ctx: *lower_context.LowerContext, span: base_source.Span, name: str, l
     if (sel res_slot.err) { ret err[fail.Fail].err{res_slot.err}; }
     val res_to: res[str, fail.Fail] = slot_name(ctx, lead, f.to);
     if (sel res_to.err) { ret err[fail.Fail].err{res_to.err}; }
-    ret refused(ctx, span, diagnostic.format(ctx.s.alloc, "{} of the declaration of `{}` is `{}`, and the instruction takes {} {}, a pointer's being the type it points to: declare them alike",
-        res_slot.ok, name, res_named.ok, relation, res_to.ok));
+    var said: str = "{} of the declaration of `{}` is `{}`, and the instruction takes {} {}: declare them alike";
+    if (is_pointer(ctx, held) || is_pointer(ctx, slot_type(ctx, d, lead, f.to))) { said = "{} of the declaration of `{}` is `{}`, and the instruction takes {} {}, a pointer's being the type it points to: declare them alike"; }
+    ret refused(ctx, span, diagnostic.format(ctx.s.alloc, said, res_slot.ok, name, res_named.ok, relation, res_to.ok));
 }
 
 # operand `i` of handle `h` as its part and value
