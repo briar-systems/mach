@@ -960,14 +960,24 @@ A row also states how its operands' types and its result's **relate** to the typ
 operates on, the type of the one operand its typing reads (a pointer's pointee). A
 declaration that breaks a relation is refused with `op.signature`, naming both the
 parameter (or the return type) and the operand it relates to, so a mismatch is caught
-at the declaration rather than as an invalid module. The module holds every integer
-unsigned, so where a rule asks only the same component count and width, or the same
-SPIR-V type of an integer slot, a declaration of either signedness meets it, and the
-rows marked so below accept one.
+at the declaration rather than as an invalid module.
+
+A row holds a declaration's signedness only where the instruction reads its operands or
+result as signed or as unsigned, so that the other signedness would compute another
+value than the declaration says: the signed and unsigned minimum, maximum, clamp,
+absolute value, sign and most significant bit, the signed and unsigned comparisons and
+bit-field extracts, the signed and unsigned atomic and subgroup minimum and maximum, and
+the carry and borrow. Everywhere else a row asks what the specification asks, the
+class, width and component count and the sameness of a type, and accepts either
+signedness: the module writes an integer of any declared signedness unsigned, but for
+the sampled type and texels of an image of a signed integer format, which it converts
+at the instruction, so a count, index, id, scope, ballot or address, and an operand
+that must be the result's type, meets the specification's rule whatever signedness it
+is declared with.
 
 | Rows | Relation |
 |------|----------|
-| every atomic | the result and each value operand are the pointer's pointee |
+| every atomic | the result and each value operand are the pointer's pointee, of either signedness but for the signed and unsigned minimum and maximum |
 | `OpImageRead`, `OpImageFetch`, `OpImageSample*Lod`, `OpImageGather` | the result is a 4-vector of the image's texel scalar, a sampled image's being its image's |
 | `OpImageSampleDref*Lod` | the result is a scalar of the image's texel scalar, and the reference is an `f32` scalar |
 | `OpImageDrefGather` | the result is a 4-vector of the image's texel scalar, and the reference is an `f32` scalar |
@@ -1021,9 +1031,9 @@ subgroup rows on a scalar or vector of integers or
 floats. The GLSL.std.450 integer rows operate on the signedness their name states:
 `SAbs`, `SSign`, `SMin`, `SMax`, `SClamp` and `FindSMsb` on signed integers, `UMin`,
 `UMax`, `UClamp` and `FindUMsb` on unsigned ones, and `FindILsb` on either. A subgroup
-row's lane, mask, delta, index and direction operands, its ballot `u32x4` and the counts
-and bit positions it returns are unsigned integers, which SPIR-V states as a Signedness of
-0. A data
+row's lane, mask, delta, index and direction operands, its ballot and the counts and bit
+positions it returns are 32-bit integers of either signedness, which the module writes
+with the Signedness of 0 SPIR-V states. A data
 operand of any other type is refused with `op.signature`: an integer for `FAbs`, an
 `i32` for `UMin`, a handle, a pointer or an aggregate. GLSL.std.450 removed `IMix`, which
 its grammar still lists: masc's typing data states that no environment admits it, so a call
@@ -1053,9 +1063,9 @@ the consumer enables through the feature Vulkan reports it by:
 | quad              | `QuadBroadcast`, `QuadSwap`                                  | `GroupNonUniformQuad`             |
 
 `BallotBitCount` takes a `GroupOperation` too, which its ballot capability covers
-and which has no clustered form. A clustered row's ClusterSize is an unsigned integer
-scalar, a constant, and a power of two, so at least 1 (SPIR-V 1.6, the arithmetic group
-operations): a signed declaration is refused with `op.signature`, a run-time value with
+and which has no clustered form. A clustered row's ClusterSize is an integer scalar of
+either signedness, a constant, and a power of two, so at least 1 (SPIR-V 1.6, the
+arithmetic group operations): a float or vector is refused with `op.signature`, a run-time value with
 `op.operand_not_constant` and another constant with `op.operand_value`. The rule is
 masc's typing data on the optional operand, read by mirl. A ClusterSize larger than the
 device's subgroup is undefined behaviour SPIR-V leaves to the program, since the size is
@@ -1209,8 +1219,9 @@ Pointers reach five instructions as values:
   storage class. Each index is an integer, a constant where it selects a member of a
   record and below the record's member count or a constant array's length where it is
   constant, and the result points to the type the indexes reach.
-- `OpConvertUToPtr` takes a `u64` and returns a physical pointer, and `OpConvertPtrToU`
-  takes a physical pointer and returns a `u64`: under the target's
+- `OpConvertUToPtr` takes a 64-bit integer and returns a physical pointer, and
+  `OpConvertPtrToU` takes a physical pointer and returns a 64-bit integer, of either
+  signedness: under the target's
   `PhysicalStorageBuffer64` addressing an address is 64 bits wide.
 - `OpPtrEqual` and `OpPtrNotEqual` compare two pointers of one type into one storage
   class: `StorageBuffer` under `VariablePointersStorageBuffer` or `Workgroup` under
