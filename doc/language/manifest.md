@@ -280,7 +280,7 @@ to whichever *declared* target matches the host.
 | `of`  | absent: the system's format | Object-format override; defers to the system's format when omitted. See [Object-format override](#object-format-override). |
 | `base` | absent: the system's base | Load-address override (integer, not negative). Overrides the system's default base virtual address; defers to it when omitted, which mink's catalog states per architecture (on `freestanding`, `0x100000` on `x86_64`, `0x40000000` on `aarch64` and `0x80000000` on `riscv64` and `riscv32`). |
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
-| `stack_reserve` | absent: the format's default (8 MiB on PE), and no stack on an image no loader maps | Main stack size in bytes, not negative: the reserve a PE or Mach-O header records, or the size of the `.stack` section of a freestanding ELF or flat image. See [Image stack size](#image-stack-size). |
+| `stack_reserve` | absent: the format's default (8 MiB on PE), no stack on a freestanding image, and the system's base (64 KiB) on `wasi` | Main stack size in bytes, not negative: the reserve a PE or Mach-O header records, the size of the `.stack` section of a freestanding ELF or flat image, or the size of the stack a wasm module lays out below its data. See [Image stack size](#image-stack-size). |
 | `stack_commit` | absent: the format's default | Main stack commit in bytes, not negative, on PE only. See [Image stack size](#image-stack-size). |
 | `code_model` | absent: the host's default for the target | The code model the target's code is built under (string), by the psABI name mink's catalog gives it, such as `medany` on linux and freestanding `riscv64` or `medlow` on freestanding `riscv32`. Any target may state it. A model that forms a symbol's absolute address, as `medlow` on `riscv64` does within the 2 GiB about address zero, cannot reach an image linked above that, so a link whose image runs where its code model cannot reach is refused naming the model and the first address out of its reach. A model the target's host does not offer is refused naming those it does, and one mirl does not carry is refused with mirl's reason. `mach info targets` lists each target's models, its default first, and `--code-model` narrows an entry build's target to one. |
 | `default` | removed | Refused as a removed key, with its removal as the fix `mach migrate` applies. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
@@ -535,6 +535,25 @@ the key:
 error[target.stack_size]: mach.toml: [target.board] states no `stack_reserve`, and the image
 needs a stack: it refers to the bounds of the `.stack` section, which an image no loader maps
 holds its stack in. state the stack's size in bytes as `stack_reserve`
+```
+
+**On a wasm module**, as on `wasi`, the runtime gives the module its linear memory and
+nothing else: the module lays out its own stack, at the bottom of that memory, from its
+base down to address zero, with its data starting at the base. `stack_reserve` is the
+stack's size, and so the address the data starts at. The rules of an image no loader
+maps hold as they are: the size is a multiple of 16, and `stack_commit` is refused,
+each as `target.stack_size`. Omitting it keeps the system's base, 64 KiB, as the stack.
+`base` places the data and so sizes the stack too: it is the same address, so a target
+that states both states one value, and two different values are refused with
+`target.stack_size`.
+
+```toml
+[target.wasi]
+arch          = "wasm32"
+sys           = "wasi"
+env           = "preview1"
+abi           = "basic"
+stack_reserve = 0x100000        # 1 MiB
 ```
 
 **On a hosted ELF image**, as on `linux`, the system sizes the main thread's stack from
@@ -990,8 +1009,9 @@ runner = ["wasmtime", "{artifact.out}"]
   a `shared` artifact is refused with mink's reason, naming the system.
 - **No linker-side image options.** A wasm module has no PE subsystem, so
   `subsystem` and `--set subsystem` are refused as on any format without one. Its data
-  starts at the first page of linear memory past the stack, which grows down, so a
-  stack overflow traps below the data instead of corrupting it.
+  starts in linear memory past the stack, which grows down from there, so a stack
+  overflow traps below address zero instead of corrupting the data. The stack is 64 KiB
+  unless `stack_reserve` states its size (see [Image stack size](#image-stack-size)).
 - **Inline assembly** reads masc's wasm text under a `mvp` or `wasm1` head, as
   [asm.md](asm.md) states.
 - **Function pointers** are table indices, as
@@ -1256,7 +1276,6 @@ reused for a different kind: see [the registry](diagnostics.md#the-registry).
 | `decl.deprecated` | code outside a `#[deprecated]` declaration's module uses it | yes |
 | `doc.lint` | a doc comment's component list names no parameter, field, generic or `ret` of its declaration, leaves a component undescribed, or lists them out of declaration order | yes |
 | `float.inexact` | a float literal is not exact at its type and its digits are not the shortest spelling of the value stored | yes |
-| `debug.dropped` | the linker leaves out an object's debug info that it cannot merge | no |
 | `target.skipped` | multi-target analysis skips a declared target this build does not support | no |
 | `vector.scalarize` | a vector operation falls back to scalar code on the target (see `simd`); portable code silences it | no |
 | `expect.unfulfilled` | an `#[expect]` names a key decided by source and no such warning is raised inside its declaration | no |

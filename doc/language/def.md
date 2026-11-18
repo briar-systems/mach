@@ -36,6 +36,26 @@ fun parse(x: i64) R {
 }
 ```
 
+## An alias cannot name itself
+
+An alias is another name for the type it names, never a type of its own, so a
+definition that reaches its own name, directly or through other aliases, never
+ends. Unlike a record, which is a type with a name of its own, so that
+`rec Node { next: *Node; }` refers to it, an alias is refused when it names
+itself behind a pointer or a function type just as when it names itself bare.
+The refusal is `def.cycle`, at the name that closes the cycle, naming each alias
+on it:
+
+```
+error[def.cycle]: `Visit` names itself through its own definition (Visit -> Visit): an alias is another name for the type it names and never a type of its own, so its definition never ends, behind a pointer or not. declare a `rec` to give the type a name it can refer to
+```
+
+A type that must refer to itself gets its name from a record:
+
+```mach
+rec Walker { visit: fun(*Walker) u32; }
+```
+
 ## A `def` with no type
 
 A `def` that states no type is a declaration whose type something else
