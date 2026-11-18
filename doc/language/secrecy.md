@@ -621,8 +621,10 @@ as anywhere else.
   stack pointer's known value with minus the alignment, and holds it anywhere in
   the alignment's interval below that value, so a slot off one origin is taken
   apart from a slot off the other only where every place the realign can leave
-  them shows it. A realigned frame whose stack pointer an `asm` block moves is
-  refused when the frame is laid out, as its locals would move with it.
+  them shows it. A realigned frame whose stack pointer moves holds the aligned
+  origin in its base register, which the walk follows from the copy of the masked
+  stack pointer and, after a block that writes it, from the frame pointer and the
+  same mask, so its slots stay placed wherever the stack pointer goes.
 - **The timing mode.** A block may not turn the timing mode off: aarch64's
   `msr dit` from a register and `msr pstate.dit, #0` are refused whatever encodes
   them. Only the read, set and restore the frame code places are admitted.

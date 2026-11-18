@@ -96,11 +96,13 @@ and pop around the block instead, or drop the `{name}` and stage the address int
 register yourself.
 
 A body that binds no `{name}` is unaffected and may do whatever it likes with the stack
-pointer, which is what a `#[naked]` function's hand-written prologue does. The one
-exception is a function holding a local aligned past the stack's alignment: its
-prologue realigns the stack pointer and its locals are addressed off it (see
-`align` in [decorators](decorators.md)), so a block there that writes the stack
-pointer is refused, as it would move every local out from under the code.
+pointer, which is what a `#[naked]` function's hand-written prologue does. In a function
+holding a local aligned past the stack's alignment (see `align` in
+[decorators](decorators.md)) that also moves the stack pointer, the locals are addressed
+off a base register instead (rbx on x86-64, x19 on aarch64, s1 on riscv), so a block there
+may move the stack pointer and still bind a `{name}`. A block in such a function that
+writes the base register is followed by the compiler deriving it again, and may not bind
+a `{name}`, which would be addressed off the register it writes.
 
 ## Calls and jumps (x86-64)
 

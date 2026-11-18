@@ -541,9 +541,11 @@ instruction and up to `N - 16` bytes of frame. A function with nothing
 over-aligned emits exactly the prologue it always did.
 
 The frame pointer stays where the ABI put it, so incoming stack arguments, the
-frame record and a stack walk through it are unaffected. Because the locals hang
-off the masked stack pointer, such a function may hold no `asm` block that writes
-the stack pointer, and the compiler refuses one.
+frame record and a stack walk through it are unaffected. Where such a function also
+moves the stack pointer, as an `asm` block can, it copies the masked stack pointer
+into a preserved base register (rbx on x86-64, x19 on aarch64, s1 on riscv) and
+addresses its locals from there, which costs that register and its save only in
+those functions.
 
 ### `packed` — no padding
 
