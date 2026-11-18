@@ -6,6 +6,8 @@
 #   test/run.py [--mach <path>] [--mink <path>] [--std <dir>] [--root <dir>] [--jobs <n>] [--kinds] [--local] [filter...]
 #
 # a filter is a substring of a file's path or a target's name. build output goes to test/out.
+# a `# targets:` line in a file's header names the targets that take it: a refuse/ file is
+# tried on the host alone without one, and a run/ or gpu/ file on every target taking its kind.
 # --local also runs each artifact of a target the host cannot run under the tool its target
 # file names on a `local` line (an emulator, or a validator for a module), when it is installed.
 # it is for a developer's machine, never CI. exit 0: nothing failed.
@@ -24,6 +26,11 @@ def header(path):
             break
         out[m.group(1)] = m.group(2)
     return out
+
+
+def aimed(path, target, default):
+    # whether the `# targets:` line of a file's header, or the default without one, names a target
+    return target in header(path).get('targets', default).replace(',', ' ').split()
 
 
 def corpus(kind):
@@ -220,13 +227,13 @@ def main():
         if 'refuse' not in h:
             fails.append(f'{os.path.relpath(path, HERE)} names no `# refuse: <kind>`')
         else:
-            refusals.append((path, h['refuse'], h.get('targets', host)))
+            refusals.append((path, h['refuse']))
 
     jobs = []
     with concurrent.futures.ThreadPoolExecutor(cfg.jobs) as pool:
         for t in targets:
-            files = [p for p in corpus(t.takes) if keep(p) or keep(t.name)]
-            mine = [(p, k) for p, k, where in refusals if t.name in where.replace(',', ' ').split() and (keep(p) or keep(t.name))]
+            files = [p for p in corpus(t.takes) if (keep(p) or keep(t.name)) and aimed(p, t.name, t.name)]
+            mine = [(p, k) for p, k in refusals if aimed(p, t.name, host) and (keep(p) or keep(t.name))]
             if cfg.filter and not keep(t.name) and not any(keep(p) for p in corpus(t.takes)) and not mine:
                 continue
             jobs.append(pool.submit(one_target, cfg, t, files, mine, host))
@@ -237,7 +244,7 @@ def main():
 
     kfile = os.path.join(cfg.root, 'src', 'base', 'diagnostic', 'kind.mach')
     kinds = re.findall(r'key: "([a-z0-9_.]+)", level: LEVEL_ERROR[^}]*retired: false', open(kfile, encoding='utf-8').read()) if os.path.isfile(kfile) else []
-    named = {k for _, k, _ in refusals}
+    named = {k for _, k in refusals}
     unnamed = [k for k in kinds if k not in named]
     if kinds:
         print(f'error kinds: {len(kinds)}, with a refuse/ file: {len(kinds) - len(unnamed)}')
