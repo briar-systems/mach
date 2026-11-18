@@ -101,7 +101,7 @@ targets the dependency declares for them. No other `[target.*]` entry is read.
 [project]
 id      = "demo"                       # required: identifier; root of every module path
 version = "0.1.0"                      # required
-mach    = "^5.3"                       # required: the compiler range
+mach    = "^7"                         # required: the compiler range
 src     = "src"                        # required: source dir, project-root-relative
 work    = "out/{target.name}/{profile.name}"  # required: the work directory template
 
@@ -146,7 +146,7 @@ ref = "branch/main"
 | `version` | string | Project version. Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `work`    | string | The work directory template: everything a build writes besides its artifacts, referenced as `{project.work}` by artifact `out`, step `argv`, `in` and `out`, and local link paths. Expanded over `{target.name}`/`{target.arch}`/`{target.sys}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). `-w` names another work directory for one build or test. |
-| `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.3"`). Required in every manifest, a dependency's included. See [Compiler range](#compiler-range). |
+| `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^7"`). Required in every manifest, a dependency's included. See [Compiler range](#compiler-range). |
 | `out`     | removed | Refused as a removed key: the work directory is `work`. Its refusal carries the rename as a fix. |
 
 `[project]` is exactly the five keys with a type, and every one is required. Any other
@@ -197,20 +197,20 @@ requirement and the chain that states it, pointing at the first unmet range in
 the manifest that states it:
 
 ```
-error[mach.version_unaccepted]: this is mach 5.2.1, and the dependency closure does not accept it:
-    app (mach.toml) requires mach ^5.3
-    app -> gfx -> glfw requires mach >=5.4, <6
+error[mach.version_unaccepted]: this is mach 6.10.1, and the dependency closure does not accept it:
+    app (mach.toml) requires mach ^7
+    app -> gfx -> glfw requires mach >=7.2, <8
  --> mach.toml:2:11
   |
-2 | mach    = "^5.3"
-  |           ^^^^^^
+2 | mach    = "^7"
+  |           ^^^^
 ```
 
 Every manifest must state `mach`, a dependency's included. One without it is
 refused like any missing required key (`mach.toml: [project] is missing required
 key 'mach'`), and for a dependency the build fails naming it. `mach init` writes the same range. It is the oldest
 release of the running compiler's major that reads the key: `^5.3` for every
-5.x compiler, since 5.3.0 is the first release that accepts `mach`, and `^N.0`
+5.x compiler, since 5.3.0 is the first release that accepts `mach`, and `^N`
 for a later major N, since a caret cannot span majors. The range depends only on
 the running major, so two authors on one project write the same line.
 
@@ -2326,7 +2326,7 @@ and never on a windows one.
 [project]
 id      = "demo"
 version = "0.1.0"
-mach    = "^5.3"
+mach    = "^7"
 src     = "src"
 work    = "out/{target.name}/{profile.name}"
 

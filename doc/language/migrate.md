@@ -83,7 +83,7 @@ Rewritten by `mach migrate`:
 | `def bool: u8;` | `def bool: u1;` |
 | `use id;`, `fwd id;` | the path of the dependency's exported artifact entry |
 | `--jobs`, `--jobs=n` in the `argv` of a `[step]` that runs mach | `--threads`, `--threads=n` |
-| `[project] mach` on the previous major | the running major |
+| `[project] mach` on the previous major | `^7`, the range `mach init` writes |
 
 Reported, for you to change:
 

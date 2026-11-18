@@ -53,7 +53,7 @@ gives it but `isa`, which is left to the system's floor:
 [project]
 id = "myproj"
 version = "0.1.0"
-mach = "^7.0"
+mach = "^7"
 src = "src"
 work = "out/{target.name}/{profile.name}"
 
