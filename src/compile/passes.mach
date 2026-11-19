@@ -45,6 +45,7 @@ use mach.session.retention;
 use mink_intern: mink.base.intern;
 use mink_table:  mink.base.table;
 use mink_output: mink.catalog.output;
+use mink_object: mink.model.object;
 use mink.model.object.Object;
 use mink_symbol:   mink.model.symbol;
 use mirl_stats:    mirl.base.stats;
@@ -840,6 +841,7 @@ val PASS_TESTS:     u8 = 2;
 # empty:    its prepare produced no product
 # made:     the pending product a run compiles, nil when nothing compiles
 # ran:      what the run made, read once `finished`
+# bytes:    about what it holds once finished, until it completes
 rec Slot {
     position: u32;
     key:      u64;
@@ -850,6 +852,7 @@ rec Slot {
     made:     *Product;
     ran:      Ran;
     finished: bool;
+    bytes:    usize;
 }
 
 # every unit of `kind` in pass order: each prepared on the owner, compiled, and completed on the owner strictly in
@@ -920,7 +923,15 @@ fun run_units_serial(p: *project.Project, kind: u8, read: *bool) err[fail.Fail] 
     ret err[fail.Fail].ok{};
 }
 
-# the `count` units of a pass of `kind` with `crew` compiling them
+# the most bytes of finished objects a pass on a crew holds while they wait for their turn to complete. they hold
+# only their object and what their lowering kept, so the owner prepares ahead past them until this many wait
+val OBJECTS_WAITING: usize = 67108864;
+
+# the `count` units of a pass of `kind` with `crew` compiling them. the owner bounds two things apart: units whose
+# heap is alive, lowered and queued or compiling, at its threads plus one queued, and units that finished compiling
+# and wait for their turn, by the bytes they hold (OBJECTS_WAITING). within both it prepares ahead, and it completes
+# the oldest as soon as its compile finished, so no thread idles while the owner could lower and the owner waits
+# only when neither bound lets it prepare
 fun run_units_on(p: *project.Project, kind: u8, read: *bool, crew: *workers.Crew, count: u32) err[fail.Fail] {
     val res_slots: res[*Slot, A.Error] = A.zallocate[Slot](p.s.alloc, count::usize);
     if (sel res_slots.err) {
@@ -933,44 +944,58 @@ fun run_units_on(p: *project.Project, kind: u8, read: *bool, crew: *workers.Crew
     var position: u32            = 0;
     var next:     u32            = 0;
     var done:     u32            = 0;
-    var waiting:  u32            = 0;
+    var alive:    u32            = 0;
+    var waiting:  usize          = 0;
     var stopped:  bool           = false;
-    for (done < next || (!stopped && next < count)) {
-        for (!stopped && next < count && waiting <= crew.started) {
+    var failed:   bool           = false;
+    for (!failed) {
+        var drained: bool = true;
+        for (drained) {
+            val opt_index: opt[u32] = workers.finished_now(crew);
+            drained = false;
+            if (sel opt_index.some) {
+                slot_finished(?slots[opt_index.some], ?alive, ?waiting);
+                drained = true;
+            }
+        }
+        for (done < next && slot_ready(?slots[done])) {
+            val s: *Slot = ?slots[done];
+            reached(p, kind, s.position);
+            val err_finished: err[fail.Fail] = slot_finish(p, kind, read, s);
+            if (s.made != nil) { waiting = waiting - s.bytes; }
+            done = done + 1;
+            if (sel err_finished.err) {
+                result = err_finished;
+                failed = true;
+                brk;
+            }
+        }
+        if (failed || (done == next && (stopped || next == count))) { brk; }
+        if (!stopped && next < count && alive <= crew.started && waiting <= OBJECTS_WAITING) {
             for (!pass_unit(p, kind, position)) { position = position + 1; }
             val s: *Slot = ?slots[next];
             s.position = position;
             position   = position + 1;
             slot_begin(p, kind, s);
             if (s.made != nil) {
+                alive = alive + 1;
                 if (!workers.submit(crew, next, s::ptr, slot_run)) {
-                    s.ran      = codegen_run(s.made);
-                    s.finished = true;
+                    s.ran = codegen_run(s.made);
+                    slot_finished(s, ?alive, ?waiting);
                 }
-                waiting = waiting + 1;
             }
             # the pass ends at this unit at the latest, so nothing after it is prepared
             if (sel s.begun.err || s.held || s.empty) { stopped = true; }
             next = next + 1;
+            cnt;
         }
-        val s: *Slot = ?slots[done];
-        for (s.made != nil && !s.finished) {
-            val opt_index: opt[u32] = workers.finished(crew);
-            if (sel opt_index.none) { brk; }
-            slots[opt_index.some].finished = true;
-        }
-        if (s.made != nil && !s.finished) {
+        val opt_index: opt[u32] = workers.finished(crew);
+        if (sel opt_index.none) {
             result = err[fail.Fail].err{fail.message("a unit's compile never reported finished")};
+            failed = true;
             brk;
         }
-        reached(p, kind, s.position);
-        val err_finished: err[fail.Fail] = slot_finish(p, kind, read, s);
-        if (s.made != nil) { waiting = waiting - 1; }
-        done = done + 1;
-        if (sel err_finished.err) {
-            result = err_finished;
-            brk;
-        }
+        slot_finished(?slots[opt_index.some], ?alive, ?waiting);
     }
     workers.close(crew);
     var draining: bool = true;
@@ -987,6 +1012,28 @@ fun run_units_on(p: *project.Project, kind: u8, read: *bool, crew: *workers.Crew
         done = done + 1;
     }
     ret result;
+}
+
+# whether the unit `s` holds may complete: nothing compiles for it, or its compile finished
+fun slot_ready(s: *Slot) bool {
+    ret s.made == nil || s.finished;
+}
+
+# the compile of `s` finished: its heap is gone, and what it holds waits for its turn
+fun slot_finished(s: *Slot, alive: *u32, waiting: *usize) {
+    s.finished = true;
+    s.bytes    = slot_bytes(s);
+    @alive     = @alive - 1;
+    @waiting   = @waiting + s.bytes;
+}
+
+# about the bytes a finished unit holds until it completes: its object and the names its lowering kept
+fun slot_bytes(s: *Slot) usize {
+    var n: usize = (s.made.kept.held.len + s.made.kept.defined.len) * $size_of(intern.StrId);
+
+    var outcome: res[compile_unit.Made, backend_compile.Unplaced] = s.ran.made;
+    if (sel outcome.ok) { n = n + mink_object.held_bytes(?outcome.ok.compiled.object); }
+    ret n;
 }
 
 fun slot_run(raw: ptr) {
@@ -1040,6 +1087,7 @@ fun slot_clear(s: *Slot, key: u64) {
     s.empty    = false;
     s.made     = nil;
     s.finished = false;
+    s.bytes    = 0;
 }
 
 # the unit `s.key` names read as it stands when its object is current, else prepared
