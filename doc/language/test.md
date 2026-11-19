@@ -156,7 +156,7 @@ full flag reference is `mach help test`; the options that select and shape a
 run are:
 
 ```
---threads <n>            run up to n test processes at once (default: host CPUs)
+--threads <n>            compile on n threads and run up to n test processes at once (default: host CPUs)
 --filter <substr>        select only tests whose qualified name contains the substring
 --include-deps           also run tests declared in dependency modules
 --dep-warnings           also show dependencies' warnings, each under its own allow and #[expect]

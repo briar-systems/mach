@@ -276,6 +276,7 @@ A **phase** record is a phase row:
 | `count` | integer | what the phase processed; absent for `other` |
 | `unit` | string | the noun the count is in, singular for a count of one: `"modules"`, `"objects"` |
 | `time_us` | integer | the phase's time |
+| `threads` | integer | the threads its time is added up over, present only when more than one; such a row is not part of the unit's wall time |
 | `dropped` | integer | the modules it dropped as target-gated, present only when any |
 | `slowest` | string | under `-vv`, the slowest of its items, present when it had two or more |
 | `slowest_us` | integer | that item's time, present with `slowest` |

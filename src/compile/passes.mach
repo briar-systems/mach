@@ -65,7 +65,8 @@ use mach.compile.demand;
 use mach.compile.frontend;
 use mach.compile.identity;
 use mach.compile.project;
-use compile_unit:   mach.compile.unit;
+use compile_unit: mach.compile.unit;
+use mach.compile.workers;
 use sema_instance:  mach.front.sema.instance;
 use sema_interface: mach.front.sema.interface;
 use sema_module:    mach.front.sema.module;
@@ -90,7 +91,7 @@ pub val LOWER: query.Kind = query.Kind{
 # lowering and never its compiled object
 pub val DEFINED: query.Kind = query.Kind{name: "defined", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_LOWER, compute: defined_compute};
 # a module's object, mink's, and the facts its lowering kept, keyed by its back-half key: its
-# lowered module compiled, prepared and completed by the pass (unit_object), or the object the
+# lowered module compiled, prepared and completed by the pass (run_units), or the object the
 # object cache staged
 pub val CODEGEN: query.Kind = query.Kind{
     name:     "codegen", role: query.DERIVED, owner: query.KEY_MODULE, origin: diagnostic.ORIGIN_CODEGEN, compute: codegen_compute,
@@ -540,7 +541,7 @@ fun lower_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, di
     val res_lowered: res[*compile_unit.Lowered, fail.Fail] = compile_unit.lower(reqs, count::usize, ?p.back, s.spans, p.s.alloc);
     if (sel res_lowered.err) { ret res[query.QueryOutput, fail.Fail].err{lower_stable_fail(p, res_lowered.err)}; }
     val l: *compile_unit.Lowered = res_lowered.ok;
-    read_out_lowering(p, test_object, intern.text(?s.interner, m.fqn), l, opt_t_lower);
+    lowering_carved(p, test_object, opt_t_lower);
     handed = true;
     ret lowering_encode(p, alloc, l, reading.held, tests);
 }
@@ -591,16 +592,18 @@ fun bind_held(raw: ptr, item: *sema_instance.Instance) res[lower_context.Definin
     ret res[lower_context.Defining, fail.Fail].ok{lower_context.Defining.merged{res_source.ok}};
 }
 
-# what lowering a module measured: its own row, carved out of the codegen row it runs inside
-# while each module is lowered just before it is compiled, and the counts of its module
-fun read_out_lowering(p: *project.Project, test_object: bool, name: str, l: *compile_unit.Lowered, t_lower: readout.Instant) {
-    var lower:   readout.Phase = readout.LOWER;
-    var codegen: readout.Phase = readout.CODEGEN;
-    if (test_object) {
-        lower   = readout.TEST_LOWER;
-        codegen = readout.TEST_CODEGEN;
-    }
-    readout.span_end(p.progress, lower, codegen, t_lower);
+# the time lowering a module took, its own row, carved out of the codegen row it runs inside while each
+# module is lowered on the owner before it is compiled
+fun lowering_carved(p: *project.Project, test_object: bool, t_lower: readout.Instant) {
+    if (test_object) { readout.span_end(p.progress, readout.TEST_LOWER, readout.TEST_CODEGEN, t_lower); }
+    or               { readout.span_end(p.progress, readout.LOWER, readout.CODEGEN, t_lower); }
+}
+
+# what lowering the module `name` measured, its item and its module's counts, read out at the unit's
+# completion so they come in pass order at every thread count
+fun read_out_lowered(p: *project.Project, test_object: bool, name: str, l: *compile_unit.Lowered) {
+    var lower: readout.Phase = readout.LOWER;
+    if (test_object) { lower = readout.TEST_LOWER; }
     readout.item_spent(p.progress, lower, name, l.lower);
     readout.count(p.progress, readout.FUNCTIONS, name, l.functions);
     readout.count(p.progress, readout.IR_INSTRUCTIONS, name, l.ir_count);
@@ -757,17 +760,7 @@ pub fun run_test_pass(p: *project.Project) err[fail.Fail] {
 
 fun run_test_object_pass(p: *project.Project) err[fail.Fail] {
     p.test_reached = 0;
-    var i: u32 = 0;
-    for (i < p.emit_len) {
-        val mid: module.ModuleId = p.topo[i];
-        p.test_reached = i + 1;
-        if (has_test_object(p, project.module_at(p, mid::u32))) {
-            val err_run_test_object_one: err[fail.Fail] = run_test_object_one(p, mid);
-            if (sel err_run_test_object_one.err) { ret err[fail.Fail].err{err_run_test_object_one.err}; }
-        }
-        i = i + 1;
-    }
-    ret err[fail.Fail].ok{};
+    ret run_units(p, PASS_TESTS, nil);
 }
 
 # each module in topological order, its front-end products given back once its own unit is done.
@@ -780,19 +773,11 @@ fun run_test_object_pass(p: *project.Project) err[fail.Fail] {
 # (query.get, frontend.acquire_sema). a test build lowers every module again and gives back none
 pub fun run_codegen_pass(p: *project.Project) err[fail.Fail] {
     p.codegen_reached = 0;
+    p.codegen_threads = 1;
     val err_inputs: err[fail.Fail] = acquire_codegen_inputs(p);
     if (sel err_inputs.err)     { ret err_inputs; }
     if (backend.whole(?p.back)) { ret run_whole_codegen(p); }
-    if (test_build(p)) {
-        var t: u32 = 0;
-        for (t < p.emit_len) {
-            p.codegen_reached = t + 1;
-            val err_run_codegen_one: err[fail.Fail] = run_codegen_one(p, p.topo[t]);
-            if (sel err_run_codegen_one.err) { ret err_run_codegen_one; }
-            t = t + 1;
-        }
-        ret err[fail.Fail].ok{};
-    }
+    if (test_build(p))          { ret run_units(p, PASS_HOLDING, nil); }
     val count:         u32                 = project.module_count(p);
     val res_allocated: res[*bool, A.Error] = A.zallocate[bool](p.s.alloc, count::usize);
     if (sel res_allocated.err) { ret err[fail.Fail].err{fail.refused(res_allocated.err)}; }
@@ -800,21 +785,7 @@ pub fun run_codegen_pass(p: *project.Project) err[fail.Fail] {
     fin { A.deallocate[bool](p.s.alloc, read, count::usize); }
     val err_read: err[fail.Fail] = identity_reads(p, read);
     if (sel err_read.err) { ret err_read; }
-    var i: u32 = 0;
-    for (i < p.emit_len) {
-        p.codegen_reached = i + 1;
-        val err_run_codegen_one: err[fail.Fail] = run_codegen_one(p, p.topo[i]);
-        if (sel err_run_codegen_one.err) { ret err_run_codegen_one; }
-        if (read[p.topo[i]::u32]) {
-            var digest:    [32]u8;
-            val err_known: err[fail.Fail] = identity.of_module(p, p.topo[i], ?digest);
-            if (sel err_known.err) { ret err_known; }
-        }
-        val err_released: err[fail.Fail] = frontend.products_dnit(p, p.topo[i]);
-        if (sel err_released.err) { ret err_released; }
-        i = i + 1;
-    }
-    ret err[fail.Fail].ok{};
+    ret run_units(p, PASS_RELEASING, read);
 }
 
 # marks in `read` the modules whose source identity a later unit may read once their syntax is
@@ -850,31 +821,348 @@ fun identity_read(p: *project.Project, read: *bool, mid: module.ModuleId) {
     }
 }
 
-fun run_codegen_one(p: *project.Project, mid: module.ModuleId) err[fail.Fail] {
-    val m:        *project.ModuleEntry     = project.module_at(p, mid::u32);
-    val key:      u64                      = back_half_key_for(p, m);
-    val res_made: res[*Product, fail.Fail] = unit_object(p, key, cache.staged_restored(p, m));
+# which units a pass runs and what it does once each completes
+# ---
+# PASS_RELEASING: every emitted module's object, each module's front-end products given back after its unit
+# PASS_HOLDING:   the same in a test build, whose test pass lowers every module again, so nothing is given back
+# PASS_TESTS:     the test object of every emitted module that has one
+val PASS_RELEASING: u8 = 0;
+val PASS_HOLDING:   u8 = 1;
+val PASS_TESTS:     u8 = 2;
+
+# one unit of a pass, from its prepare to its completion
+# ---
+# position: the unit's module's place in the emit order
+# key:      its codegen key
+# begun:    a failure deciding whether it compiles or preparing it, the pass's at the unit's turn
+# prepared: its prepare, to be completed or cancelled
+# held:     its prepare holds a failure, which its completion records
+# empty:    its prepare produced no product
+# made:     the pending product a run compiles, nil when nothing compiles
+# ran:      what the run made, read once `finished`
+rec Slot {
+    position: u32;
+    key:      u64;
+    begun:    err[fail.Fail];
+    prepared: opt[query.PreparedQuery];
+    held:     bool;
+    empty:    bool;
+    made:     *Product;
+    ran:      Ran;
+    finished: bool;
+}
+
+# every unit of `kind` in pass order: each prepared on the owner, compiled, and completed on the owner strictly in
+# order. on one thread the three run in sequence and nothing else is made. on more, a crew compiles: the owner keeps
+# preparing while fewer than its threads plus one wait to complete, and completes the oldest once its compile
+# finished. a unit's completion failing ends the pass there: nothing is prepared after it, and every unit prepared
+# ahead of it is cancelled and reports nothing. `read` is PASS_RELEASING's identity_reads
+fun run_units(p: *project.Project, kind: u8, read: *bool) err[fail.Fail] {
+    var count: u32 = 0;
+    var i:     u32 = 0;
+    for (i < p.emit_len) {
+        if (pass_unit(p, kind, i)) { count = count + 1; }
+        i = i + 1;
+    }
+    val n: u32 = crew_threads(p, kind, count);
+    if (n == 0) { ret run_units_serial(p, kind, read); }
+    var crew: workers.Crew;
+    if (!workers.open(?crew, p.s.alloc, n, count::usize, n::usize + 1)) { ret run_units_serial(p, kind, read); }
+
+    if (kind != PASS_TESTS) { p.codegen_threads = crew.started; }
+    summed_rows(p, kind);
+    val err_ran: err[fail.Fail] = run_units_on(p, kind, read, ?crew, count);
+    workers.dnit(?crew);
+    ret err_ran;
+}
+
+# the threads a pass of `kind` over `count` units compiles on, 0 when it compiles on the owner: at most
+# `--threads` and one per unit, more than one for the codegen pass. the test pass compiles on threads exactly
+# when the codegen pass did, since both feed the stage rows
+fun crew_threads(p: *project.Project, kind: u8, count: u32) u32 {
+    var n: u32 = p.req.threads;
+    if (kind == PASS_TESTS) { n = p.codegen_threads; }
+    if (n > count)          { n = count; }
+    if (kind == PASS_TESTS) {
+        if (p.codegen_threads <= 1) { ret 0; }
+        ret n;
+    }
+    if (n <= 1) { ret 0; }
+    ret n;
+}
+
+# whether emitted module `i` has a unit in a pass of `kind`
+fun pass_unit(p: *project.Project, kind: u8, i: u32) bool {
+    if (kind != PASS_TESTS) { ret true; }
+    ret has_test_object(p, project.module_at(p, p.topo[i]::u32));
+}
+
+# the units of a pass of `kind` prepared, compiled and completed in sequence on the owner
+fun run_units_serial(p: *project.Project, kind: u8, read: *bool) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        if (!pass_unit(p, kind, i)) {
+            i = i + 1;
+            cnt;
+        }
+        reached(p, kind, i);
+        var s: Slot;
+        s.position = i;
+        slot_begin(p, kind, ?s);
+        if (s.made != nil) {
+            s.ran      = codegen_run(s.made);
+            s.finished = true;
+        }
+        val err_finished: err[fail.Fail] = slot_finish(p, kind, read, ?s);
+        if (sel err_finished.err) { ret err_finished; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the `count` units of a pass of `kind` with `crew` compiling them
+fun run_units_on(p: *project.Project, kind: u8, read: *bool, crew: *workers.Crew, count: u32) err[fail.Fail] {
+    val res_slots: res[*Slot, A.Error] = A.zallocate[Slot](p.s.alloc, count::usize);
+    if (sel res_slots.err) {
+        workers.close(crew);
+        ret err[fail.Fail].err{fail.refused(res_slots.err)};
+    }
+    val slots: *Slot = res_slots.ok;
+    fin { A.deallocate[Slot](p.s.alloc, slots, count::usize); }
+    var result:   err[fail.Fail] = err[fail.Fail].ok{};
+    var position: u32            = 0;
+    var next:     u32            = 0;
+    var done:     u32            = 0;
+    var waiting:  u32            = 0;
+    var stopped:  bool           = false;
+    for (done < next || (!stopped && next < count)) {
+        for (!stopped && next < count && waiting <= crew.started) {
+            for (!pass_unit(p, kind, position)) { position = position + 1; }
+            val s: *Slot = ?slots[next];
+            s.position = position;
+            position   = position + 1;
+            slot_begin(p, kind, s);
+            if (s.made != nil) {
+                if (!workers.submit(crew, next, s::ptr, slot_run)) {
+                    s.ran      = codegen_run(s.made);
+                    s.finished = true;
+                }
+                waiting = waiting + 1;
+            }
+            # the pass ends at this unit at the latest, so nothing after it is prepared
+            if (sel s.begun.err || s.held || s.empty) { stopped = true; }
+            next = next + 1;
+        }
+        val s: *Slot = ?slots[done];
+        for (s.made != nil && !s.finished) {
+            val opt_index: opt[u32] = workers.finished(crew);
+            if (sel opt_index.none) { brk; }
+            slots[opt_index.some].finished = true;
+        }
+        if (s.made != nil && !s.finished) {
+            result = err[fail.Fail].err{fail.message("a unit's compile never reported finished")};
+            brk;
+        }
+        reached(p, kind, s.position);
+        val err_finished: err[fail.Fail] = slot_finish(p, kind, read, s);
+        if (s.made != nil) { waiting = waiting - 1; }
+        done = done + 1;
+        if (sel err_finished.err) {
+            result = err_finished;
+            brk;
+        }
+    }
+    workers.close(crew);
+    var draining: bool = true;
+    for (draining) {
+        val opt_index: opt[u32] = workers.finished_now(crew);
+        draining = false;
+        if (sel opt_index.some) {
+            slots[opt_index.some].finished = true;
+            draining                       = true;
+        }
+    }
+    for (done < next) {
+        slot_cancel(p, ?slots[done]);
+        done = done + 1;
+    }
+    ret result;
+}
+
+fun slot_run(raw: ptr) {
+    val s: *Slot = raw::*Slot;
+    s.ran = codegen_run(s.made);
+}
+
+# the presentation names the units up to and holding the one at `position`
+fun reached(p: *project.Project, kind: u8, position: u32) {
+    if (kind == PASS_TESTS) { p.test_reached = position + 1; }
+    or                      { p.codegen_reached = position + 1; }
+}
+
+# on a crew a pass's compiles run side by side, so its verify rows and the stage rows, which the test pass
+# adds to, are sums over the codegen pass's threads, not spans of the owner's codegen row
+fun summed_rows(p: *project.Project, kind: u8) {
+    if (kind == PASS_TESTS) {
+        readout.phase_summed(p.progress, readout.TEST_VERIFY, p.codegen_threads);
+        ret;
+    }
+    readout.phase_summed(p.progress, readout.VERIFY, p.codegen_threads);
+    var i: usize = 0;
+    for (i < readout.STAGE_COUNT) {
+        readout.phase_summed(p.progress, readout.STAGES[i], p.codegen_threads);
+        i = i + 1;
+    }
+}
+
+# the unit at `s.position` begun on the owner: read as it stands when its object is current or the cache staged
+# it, else prepared, its product left pending when it has a module to compile. a failure here is the unit's, which
+# its completion answers
+fun slot_begin(p: *project.Project, kind: u8, s: *Slot) {
+    val m: *project.ModuleEntry = project.module_at(p, p.topo[s.position]::u32);
+    if (kind == PASS_TESTS) {
+        slot_clear(s, test_key_for(m));
+        if (cache.test_staged_restored(p, m)) { ret; }
+    }
+    or {
+        slot_clear(s, back_half_key_for(p, m));
+        if (cache.staged_restored(p, m)) { ret; }
+    }
+    slot_prepare(p, s);
+}
+
+# a slot for the unit `key` names, begun on nothing yet
+fun slot_clear(s: *Slot, key: u64) {
+    s.key      = key;
+    s.begun    = err[fail.Fail].ok{};
+    s.prepared = opt[query.PreparedQuery].none{};
+    s.held     = false;
+    s.empty    = false;
+    s.made     = nil;
+    s.finished = false;
+}
+
+# the unit `s.key` names read as it stands when its object is current, else prepared
+fun slot_prepare(p: *project.Project, s: *Slot) {
+    val res_reusable: res[bool, fail.Fail] = query.reusable[project.Project](?p.queries, p, ?CODEGEN, s.key);
+    if (sel res_reusable.err) {
+        s.begun = err[fail.Fail].err{res_reusable.err};
+        ret;
+    }
+    if (res_reusable.ok) { ret; }
+    val res_prepared: res[query.PreparedQuery, fail.Fail] = query.prepare[project.Project](?p.queries, p, ?CODEGEN, s.key);
+    if (sel res_prepared.err) {
+        s.begun = err[fail.Fail].err{res_prepared.err};
+        ret;
+    }
+    s.prepared = opt[query.PreparedQuery].some{res_prepared.ok};
+    val db:       *query.QueryDb       = ?p.s.queries;
+    val res_held: res[bool, fail.Fail] = query.prepared_held(db, res_prepared.ok);
+    if (sel res_held.err) {
+        s.begun = err[fail.Fail].err{res_held.err};
+        ret;
+    }
+    if (res_held.ok) {
+        s.held = true;
+        ret;
+    }
+    val res_view: res[query.QueryView, fail.Fail] = query.prepared_view(db, res_prepared.ok);
+    if (sel res_view.err) {
+        s.begun = err[fail.Fail].err{res_view.err};
+        ret;
+    }
+    val made: *Product = product_decode(res_view.ok);
+    if (made == nil) {
+        s.empty = true;
+        ret;
+    }
+    # a prepare that found the object the cache staged has nothing to compile
+    if (made.pending != nil) { s.made = made; }
+}
+
+# the unit's codegen product once its turn came: its prepare completed, then read as it stands
+fun slot_end(p: *project.Project, s: *Slot) res[*Product, fail.Fail] {
+    if (sel s.begun.err) { ret res[*Product, fail.Fail].err{s.begun.err}; }
+    val taken: opt[query.PreparedQuery] = s.prepared;
+    s.prepared = opt[query.PreparedQuery].none{};
+    if (sel taken.some) {
+        val db:       *query.QueryDb      = ?p.s.queries;
+        val prepared: query.PreparedQuery = taken.some;
+        var err_made: err[fail.Fail]      = err[fail.Fail].ok{};
+        if (s.made != nil)    { err_made = codegen_complete(p, s.key, prepared, s.made, s.ran); }
+        or (s.empty)          { err_made = query.complete_prepared(db, prepared, err[fail.Fail].err{fail.message("the codegen prepare produced no result handle")}); }
+        or                    { err_made = query.complete_prepared(db, prepared, err[fail.Fail].ok{}); }
+        if (sel err_made.err) { ret res[*Product, fail.Fail].err{err_made.err}; }
+    }
+    val res_queries_entry: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?CODEGEN, s.key);
+    if (sel res_queries_entry.err) { ret res[*Product, fail.Fail].err{res_queries_entry.err}; }
+    val made: *Product = product_decode(res_queries_entry.ok);
+    if (made == nil) { ret res[*Product, fail.Fail].err{fail.message("the codegen query produced no result handle")}; }
+    ret res[*Product, fail.Fail].ok{made};
+}
+
+# the unit completed and its object held on its module, published to the object cache and written to `obj/`; in
+# PASS_RELEASING its module's source identity is made when a later unit may read it, then its front-end products
+# are given back
+fun slot_finish(p: *project.Project, kind: u8, read: *bool, s: *Slot) err[fail.Fail] {
+    val res_made: res[*Product, fail.Fail] = slot_end(p, s);
     if (sel res_made.err) { ret err[fail.Fail].err{res_made.err}; }
-    val made: *Product = res_made.ok;
+    val made: *Product             = res_made.ok;
+    val mid:  module.ModuleId      = p.topo[s.position];
+    val m:    *project.ModuleEntry = project.module_at(p, mid::u32);
+    if (kind == PASS_TESTS) {
+        m.test.object = ?made.object;
+        m.test.unit   = product_facts(made);
+        var err_published: err[fail.Fail] = err[fail.Fail].ok{};
+        if (!made.lowered)         { err_published = cache.publish_test(p, m, m.test.object, nil, 0, query.QueryKey{kind: ?CODEGEN, key: s.key}); }
+        or                         { err_published = cache.publish_test(p, m, m.test.object, made.kept.held.data, made.kept.held.len::u32, query.QueryKey{kind: ?CODEGEN, key: s.key}); }
+        if (sel err_published.err) { ret err_published; }
+        ret cache.test_object_written(p, m);
+    }
     m.object = ?made.object;
     m.unit   = product_facts(made);
-    val o: *Object = m.object;
     # a generated object, or one this session held, carries the key of the current snapshot
     # into `obj/`, written there now
     var err_published: err[fail.Fail] = err[fail.Fail].ok{};
-    if (!made.lowered)         { err_published = cache.publish(p, m, o, nil, 0, nil, 0, query.QueryKey{kind: ?CODEGEN, key: key}); }
-    or                         { err_published = cache.publish(p, m, o, made.kept.defined.data, made.kept.defined.len::u32, made.kept.held.data, made.kept.held.len::u32, query.QueryKey{kind: ?CODEGEN, key: key}); }
+    if (!made.lowered)         { err_published = cache.publish(p, m, m.object, nil, 0, nil, 0, query.QueryKey{kind: ?CODEGEN, key: s.key}); }
+    or                         { err_published = cache.publish(p, m, m.object, made.kept.defined.data, made.kept.defined.len::u32, made.kept.held.data, made.kept.held.len::u32, query.QueryKey{kind: ?CODEGEN, key: s.key}); }
     if (sel err_published.err) { ret err_published; }
-    ret cache.object_written(p, m);
+    val err_written: err[fail.Fail] = cache.object_written(p, m);
+    if (sel err_written.err)    { ret err_written; }
+    if (kind != PASS_RELEASING) { ret err[fail.Fail].ok{}; }
+    if (read[mid::u32]) {
+        var digest:    [32]u8;
+        val err_known: err[fail.Fail] = identity.of_module(p, mid, ?digest);
+        if (sel err_known.err) { ret err_known; }
+    }
+    ret frontend.products_dnit(p, mid);
 }
 
-# an artifact taken whole: every emitted module lowered into the one unit and compiled, its object
-# held on the unit's module, then every module's front-end products given back, since the unit's
-# lowering was the last to read them. no object cache keys such a unit (cache.prepare)
+# a unit prepared ahead of the one that ended its pass, given back unreported: what its compile made, then its
+# prepare, held failure and all
+fun slot_cancel(p: *project.Project, s: *Slot) {
+    if (s.made != nil && s.finished) {
+        var outcome: res[compile_unit.Made, backend_compile.Unplaced] = s.ran.made;
+        if (sel outcome.ok) { backend_compile.dnit(s.made.job.out, ?outcome.ok.compiled); }
+        or                  { backend_compile.unplaced_dnit(s.made.job.out, ?outcome.err); }
+    }
+    if (sel s.prepared.some) { val err_cancelled: err[fail.Fail] = query.cancel_prepared(?p.s.queries, s.prepared.some); }
+}
+
+# an artifact taken whole: every emitted module lowered into the one unit and compiled on the owner, its object
+# held on the unit's module, then every module's front-end products given back, since the unit's lowering was the
+# last to read them. no object cache keys such a unit (cache.prepare)
 fun run_whole_codegen(p: *project.Project) err[fail.Fail] {
     if (p.emit_len == 0) { ret err[fail.Fail].ok{}; }
     p.codegen_reached = 1;
-    val res_made: res[*Product, fail.Fail] = unit_object(p, unit_key(p, 0), false);
+    var s: Slot;
+    slot_clear(?s, unit_key(p, 0));
+    slot_prepare(p, ?s);
+    if (s.made != nil) {
+        s.ran      = codegen_run(s.made);
+        s.finished = true;
+    }
+    val res_made: res[*Product, fail.Fail] = slot_end(p, ?s);
     if (sel res_made.err) { ret err[fail.Fail].err{res_made.err}; }
     val made: *Product             = res_made.ok;
     val m:    *project.ModuleEntry = project.unit_module(p, 0);
@@ -889,60 +1177,6 @@ fun run_whole_codegen(p: *project.Project) err[fail.Fail] {
         i = i + 1;
     }
     ret err[fail.Fail].ok{};
-}
-
-# the module's test object, lowered against its normal object and compiled
-fun run_test_object_one(p: *project.Project, mid: module.ModuleId) err[fail.Fail] {
-    val m:        *project.ModuleEntry     = project.module_at(p, mid::u32);
-    val res_made: res[*Product, fail.Fail] = unit_object(p, test_key_for(m), cache.test_staged_restored(p, m));
-    if (sel res_made.err) { ret err[fail.Fail].err{res_made.err}; }
-    val made: *Product = res_made.ok;
-    m.test.object = ?made.object;
-    m.test.unit   = product_facts(made);
-    val o:             *Object        = m.test.object;
-    var err_published: err[fail.Fail] = err[fail.Fail].ok{};
-    if (!made.lowered)         { err_published = cache.publish_test(p, m, o, nil, 0, query.QueryKey{kind: ?CODEGEN, key: test_key_for(m)}); }
-    or                         { err_published = cache.publish_test(p, m, o, made.kept.held.data, made.kept.held.len::u32, query.QueryKey{kind: ?CODEGEN, key: test_key_for(m)}); }
-    if (sel err_published.err) { ret err_published; }
-    ret cache.test_object_written(p, m);
-}
-
-# the codegen product of the unit `key` names, as its pass takes it: read as it stands when it is current or the
-# object cache staged its object, and otherwise prepared, its module compiled and the product completed, in that
-# order on the owner, so a failure is the pass's at the unit that raised it
-fun unit_object(p: *project.Project, key: u64, staged: bool) res[*Product, fail.Fail] {
-    if (!staged) {
-        val res_reusable: res[bool, fail.Fail] = query.reusable[project.Project](?p.queries, p, ?CODEGEN, key);
-        if (sel res_reusable.err) { ret res[*Product, fail.Fail].err{res_reusable.err}; }
-        if (!res_reusable.ok) {
-            val res_prepared: res[query.PreparedQuery, fail.Fail] = query.prepare[project.Project](?p.queries, p, ?CODEGEN, key);
-            if (sel res_prepared.err) { ret res[*Product, fail.Fail].err{res_prepared.err}; }
-            val err_made: err[fail.Fail] = unit_made(p, key, res_prepared.ok);
-            if (sel err_made.err) { ret res[*Product, fail.Fail].err{err_made.err}; }
-        }
-    }
-    val res_queries_entry: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?CODEGEN, key);
-    if (sel res_queries_entry.err) { ret res[*Product, fail.Fail].err{res_queries_entry.err}; }
-    val made: *Product = product_decode(res_queries_entry.ok);
-    if (made == nil) { ret res[*Product, fail.Fail].err{fail.message("the codegen query produced no result handle")}; }
-    ret res[*Product, fail.Fail].ok{made};
-}
-
-# the prepared unit `key` names finished: its module compiled by the worker half and the product completed, or the
-# failure its prepare held recorded
-fun unit_made(p: *project.Project, key: u64, prepared: query.PreparedQuery) err[fail.Fail] {
-    val db:       *query.QueryDb       = ?p.s.queries;
-    val res_held: res[bool, fail.Fail] = query.prepared_held(db, prepared);
-    if (sel res_held.err) { ret err[fail.Fail].err{res_held.err}; }
-    if (res_held.ok)      { ret query.complete_prepared(db, prepared, err[fail.Fail].ok{}); }
-    val res_view: res[query.QueryView, fail.Fail] = query.prepared_view(db, prepared);
-    if (sel res_view.err) { ret err[fail.Fail].err{res_view.err}; }
-    val made: *Product = product_decode(res_view.ok);
-    if (made == nil) { ret query.complete_prepared(db, prepared, err[fail.Fail].err{fail.message("the codegen prepare produced no result handle")}); }
-    # a prepare that found the object the cache staged has nothing to compile
-    if (made.pending == nil) { ret query.complete_prepared(db, prepared, err[fail.Fail].ok{}); }
-    val ran: Ran = codegen_run(made);
-    ret codegen_complete(p, key, prepared, made, ran);
 }
 
 # the test object's codegen product is current or cached, so no worker generates it
@@ -1022,8 +1256,10 @@ fun codegen_run(made: *Product) Ran {
 # its warnings placed and reported where its product reports, its link claims stated and its rows read out, then
 # the product published
 fun codegen_complete(p: *project.Project, key: u64, prepared: query.PreparedQuery, made: *Product, ran: Ran) err[fail.Fail] {
-    val db:      *query.QueryDb                                   = ?p.s.queries;
-    var outcome: res[compile_unit.Made, backend_compile.Unplaced] = ran.made;
+    val db:        *query.QueryDb                                   = ?p.s.queries;
+    var outcome:   res[compile_unit.Made, backend_compile.Unplaced] = ran.made;
+    val res_keyed: res[module.ModuleId, fail.Fail]                  = keyed_module(p, key);
+    if (sel res_keyed.ok) { read_out_lowered(p, back_half_key_is_test(key), intern.text(?p.s.interner, project.module_at(p, res_keyed.ok::u32).fqn), made.pending); }
     if (sel outcome.err) {
         val refused: fail.Fail = lower_stable_fail(p, backend_compile.placed(p.s.backing, p.s.sources, ?outcome.err));
         ret query.complete_prepared(db, prepared, err[fail.Fail].err{refused});
@@ -1063,12 +1299,16 @@ fun read_out_step(p: *project.Project, test_object: bool, name: str, st: *compil
     val masc_encode: u64                      = ms.masc.encode;
     var mirl_emit:   u64                      = 0;
     if (ms.emit > masc_layout + masc_encode) { mirl_emit = ms.emit - masc_layout - masc_encode; }
-    readout.carve(p.progress, verify, codegen, verified);
+    # side by side, the compiles' stages are summed over the threads, not spans of the codegen row
+    val summed: bool = p.codegen_threads > 1;
+    if (summed) { readout.summed_into(p.progress, verify, verified); }
+    or          { readout.carve(p.progress, verify, codegen, verified); }
     var times:  [readout.STAGE_COUNT]u64 = [readout.STAGE_COUNT]u64{ms.lower + ms.passes, ms.select, ms.alloc, ms.frame, mirl_emit, masc_layout, masc_encode};
     var carved: chrono_duration.Duration = verified;
     var i:      usize                    = 0;
     for (i < readout.STAGE_COUNT) {
-        readout.carve(p.progress, readout.STAGES[i], codegen, ns(times[i]));
+        if (summed) { readout.summed_into(p.progress, readout.STAGES[i], ns(times[i])); }
+        or          { readout.carve(p.progress, readout.STAGES[i], codegen, ns(times[i])); }
         readout.item_spent(p.progress, readout.STAGES[i], name, ns(times[i]));
         carved = carved + ns(times[i]);
         i      = i + 1;

@@ -67,6 +67,27 @@ first step runs. mirl times its own stages when a readout is shown, and each mov
 
 A test object's mirl and masc stages add to the same rows.
 
+A build compiles its modules on `--threads` threads, the host's processors when
+the flag is absent. The owner thread lowers each module and completes each
+compile in module order, so diagnostics, objects and the rows above are the
+same at every thread count. On one thread every step runs on the owner and the
+rows are as described. On more, the steps' compiles run side by side: `lower`
+and `codegen` stay the owner's own time (`codegen` then also holds the owner's
+waits for compiles to finish), and `verify` and mirl's and masc's rows are the
+time every thread spent in them, added up. Such a row says
+`(summed over N threads)`, and it is not part of the unit's wall time, so
+`other` stays the time no wall row accounts for:
+
+```
+alloc       1119 objects    18.5s  (summed over 4 threads)
+```
+
+A target whose back end compiles an artifact whole compiles it on the owner.
+The counters do not depend on the thread count, except std's heap counters.
+Every step's heap draws its spans from one pool the threads share, and a large
+block's room is the span the pool grants, so on more than one thread those
+counters follow which spans the pool held when each step asked.
+
 Each object is written to `obj/` as its step finishes, and the build holds no
 copy of it after: a link reads it back from its file. The `emit` row is the
 time of those writes, moved out of the `codegen` row (a test object's out of
