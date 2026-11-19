@@ -55,7 +55,7 @@ it, in the manifest that states it, a dependency's own included.
 carries the same place as the failure's `primary` span.
 
 ```
-error[manifest.invalid_value] mach.toml: simd in profile 'debug' must be "scalarize" or "require", found "fast"
+error[manifest.invalid_value] mach.toml: [profile.debug].simd must be "scalarize" or "require", found "fast"
    @ mach.toml:15:8
 15 | simd = "fast"
    |        ^^^^^^
@@ -1336,7 +1336,7 @@ compiler with its dependencies.
 
 ### Float reassociation
 
-`relax = ["float-reassoc"]` grants the optimizer exactly one liberty: it may treat
+`relax = ["float-reassoc"]` grants the build exactly one liberty: it may treat
 floating-point `+` and `*` as **associative**, and regroup a reduction accordingly.
 Nothing else changes. It does not license reciprocal substitution for division,
 assumptions that operands are finite or non-NaN, contraction into a fused
@@ -1413,8 +1413,9 @@ this major's short `-d`, `-e` and `-s` naming `--debug`, `--emit` and `--source`
 `-k` is the short form of `--kind`. The previous major's `--pie` is refused naming
 `--linkage pie` and the `linkage` key.
 
-A `mach build` whose flags change the selected profile writes a differently
-configured build, so it must say where: it names the artifact with `-o`, or a
+A `mach build` whose flags change the selected profile, a profile key written
+with `--set` among them, writes a differently configured build, so it must say
+where: it names the artifact with `-o`, or a
 work directory with `-w` that every artifact it writes sits under. Without
 either it is refused:
 
@@ -1432,7 +1433,13 @@ and `mach check` and `mach run` build nothing.
 key spelled as this manifest spells it. It writes the value over every table of
 the key's section for one invocation, a later `--set` of the same key winning.
 `--set` writes `platform`, `base`, `stack_reserve` and `stack_commit` over every
-target, the `native` one included, and `subsystem` over every artifact.
+target, the `native` one included, `subsystem` over every artifact, and the
+profile keys `optimize`, `debug`, `simd`, `relax`, `linker_relax` and `allow`
+over every profile, so the profile the build selects holds the value whichever
+it is. A single-file build's one profile takes them as well, so
+`mach build main.mach --set simd=require` builds that file under
+`simd = "require"`. `default` is not written: it picks the profile, and every
+profile would claim it.
 
 The value is read as the key is read here: a string-shaped key takes the value
 as written, and any other reads it as a TOML value, so `--set base=0x400000`
@@ -1441,8 +1448,8 @@ reasons as the key in `mach.toml`. A key no table holds is refused naming it,
 and so is a key `--set` does not write:
 
 ```
-error[cli.flag_value] --set does not apply to 'optimize'; it sets platform, base, stack_reserve, stack_commit, subsystem
-error[manifest.value_type] --set base: must be an integer
+error[cli.flag_value] --set does not apply to 'default'. it sets platform, base, stack_reserve, stack_commit, subsystem, optimize, debug, simd, relax, linker_relax, allow
+error[manifest.value_type] --set base must be an integer
 ```
 
 A value `--set` wrote carries where it was written, so every later refusal of
@@ -1455,6 +1462,22 @@ error[catalog.unsupported] subsystem windows is not available on linux (--set su
 1 | subsystem = windows
   |             ^^^^^^^
 ```
+
+A profile key is refused by the rule its key keeps in `mach.toml`, named the
+same way:
+
+```
+error[manifest.invalid_value] --set simd must be "scalarize" or "require", found "fast"
+  @ --set:1:8
+1 | simd = "fast"
+  |        ^^^^^^
+```
+
+`--set` writes the profile, so the levers' order below puts it with the
+profile: `-O`, `--no-optimize`, `--debug` and `--no-debug` apply after it and
+win, so `--set optimize=false -O` optimizes. A `mach build` that writes a
+profile key with `--set` changes the selected profile, so it must name where
+its artifacts go, as below.
 
 The previous major's `--subsystem`, `--base`, `--stack-reserve`,
 `--stack-commit` and `--platform` are refused naming the `--set` that replaces

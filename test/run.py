@@ -13,6 +13,7 @@
 # block holding the second.
 # a `# targets:` line in a file's header names the targets that take it: a refuse/ file is
 # tried on the host alone without one, and a run/ or gpu/ file on every target taking its kind.
+# a `# flags:` line adds its words to the file's build after the target's, as `--set simd=require`.
 # --local also runs each artifact of a target the host cannot run under the tool its target
 # file names on a `local` line (an emulator, or a validator for a module), when it is installed.
 # it is for a developer's machine, never CI. exit 0: nothing failed.
@@ -206,7 +207,7 @@ def build(cfg, path, target):
     out = os.path.join('out', 'bin', target.name, rel[:-len('.mach')].replace(os.sep, '-'))
     os.makedirs(os.path.join(HERE, os.path.dirname(out)), exist_ok=True)
     # an entry build names its entry by a relative path inside the directory it runs in
-    cmd = [cfg.mach, 'build', rel, '--source', 'std=' + cfg.std, *target.flags,
+    cmd = [cfg.mach, 'build', rel, '--source', 'std=' + cfg.std, *target.flags, *header(path).get('flags', '').split(),
            '-w', os.path.join('out', 'work', target.name), '-o', out, '--diagnostics', 'json']
     p = subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
     return p.returncode, errors(p.stdout + p.stderr), os.path.join(HERE, out)

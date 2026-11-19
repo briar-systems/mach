@@ -219,8 +219,9 @@ instruction set. A bare `linux-<arch>` is the raw-syscall host with no
 environment, so an entry build that links the C library names `--env gnu`. The
 previous major's `--arch` and `--sys` are refused naming `-t`, and `--of` is
 refused because the system implies the object format.
-`--set` writes a manifest key over the entry build's target or artifact as over
-a project's (see
+`--set` writes a manifest key over the entry build's target, artifact or profile
+as over a project's, so `mach build main.mach --set simd=require` builds the
+file under `simd = "require"` (see
 [Overriding a key for one build](manifest.md#overriding-a-key-for-one-build)).
 
 ## See also
