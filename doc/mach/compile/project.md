@@ -253,6 +253,10 @@ pub rec ModuleEntry {
     file_id: mach.base.source.FileId;
     unit:    *mach.lower.context.Unit;
     object:  *Object;
+    # where its object is written once its unit completes, "" for held until the build ends
+    object_output: str;
+    # the object went to object_output and `object` is empty until a link reads it back
+    object_away: bool;
     # where its step writes mirl's text of the module, "" for nowhere
     ir_output: str;
     # where its step writes masc's listing of the module's object, "" for nowhere
@@ -338,6 +342,8 @@ the cache record a compiled object carries into `obj/`, nil until the cache publ
 pub rec TestObject {
     unit:          *mach.lower.context.Unit;
     object:        *Object;
+    object_output: str;
+    object_away:   bool;
     staged:        *Object;
     staged_facts:  mach.compile.cache.record.Facts;
     record:        Record;

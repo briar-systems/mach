@@ -10,22 +10,17 @@ resources an executable declares.
 
 Source: [`src/build/emit.mach`](../../../src/build/emit.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.build.plan`](plan.md), [`mach.compile.backend`](../compile/backend.md), [`mach.compile.project`](../compile/project.md), [`mach.host.output`](../host/output.md), [`mach.target.input`](../target/input.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.build.plan`](plan.md), [`mach.compile.backend`](../compile/backend.md), [`mach.compile.project`](../compile/project.md), [`mach.target.input`](../target/input.md).
 
 | Type | | |
 | :--- | :--- | :--- |
 | [`LoadedImageOptions`](#loadedimageoptions) | `rec` | the resources an executable declares: its icon and manifest, read, with the version and names an image's version resource states |
-| [`ObjectWrite`](#objectwrite) | `rec` |  |
 
 | On `LoadedImageOptions` | |
 | :--- | :--- |
 | [`dnit_image_options`](#dnit_image_options) | release loaded image options; nil options own nothing |
 | [`load_image_options`](#load_image_options) | the resources an executable declares, read where the target's images state a subsystem, as mink's host of it names; an image of another host carries none |
 | [`link_image`](#link_image) | the image of `kind` mink links in memory from the `count` objects at `inputs`, in link order, then the `link_count` inputs at `links`, written to `destination` with the resources `image` declares, laid out as the artifact and its placed globals state, what the link tells of itself reported to `diags`, answering what the link read |
-
-| On `ObjectWrite` | |
-| :--- | :--- |
-| [`write_object`](#write_object) | |
 
 | Functions | |
 | :--- | :--- |
@@ -38,8 +33,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`input_name`](#input_name) | what the link calls the objects of module `m`: its source file, which outlives the link |
 | [`test_input_name`](#test_input_name) | the name module m's test object goes to the link under, set apart from its object's |
 | [`external_inputs`](#external_inputs) | the inputs the unit links beyond its objects, in link order: the manifest's link entries, those its dependencies cascade, then the command line's |
-| [`write_objects`](#write_objects) | every unit's object reaches `obj/` through a sibling temporary, carrying its cache record, since the object cache reads it back; a module the cache restored is already there |
-| [`write_test_objects`](#write_test_objects) | each test object reaches `obj/` beside its module's object, the same way |
+| [`object_inputs`](#object_inputs) | every unit's object as a file input: each reached `obj/` when its unit completed (cache.object_written), and a module the cache restored was there already |
 | [`inputs_dnit`](#inputs_dnit) | release `n` object inputs and their array of `cap`; a nil array owns nothing |
 
 ---
@@ -92,22 +86,6 @@ the image of `kind` mink links in memory from the `count` objects at `inputs`, i
 then the `link_count` inputs at `links`, written to `destination` with the resources
 `image` declares, laid out as the artifact and its placed globals state, what the link tells of
 itself reported to `diags`, answering what the link read
-
-## ObjectWrite
-
-```mach
-pub rec ObjectWrite {
-    p:      *mach.compile.project.Project;
-    o:      *Object;
-    record: *mach.compile.project.Record;
-}
-```
-
-### write_object
-
-```mach
-pub fun write_object(w: *ObjectWrite, t: *mach.host.output.Temporary) err[mach.base.fail.Fail]
-```
 
 ## Functions
 
@@ -185,26 +163,14 @@ those its dependencies cascade, then the command line's. an input named twice is
 once, and each library registers the symbols it claims. a library the link makes from
 the claims the objects carry is no input of its own
 
-### write_objects
+### object_inputs
 
 ```mach
-pub fun write_objects(p: *mach.compile.project.Project, destinations: *str, inputs_out: **mink.format.contract.Input) err[mach.base.fail.Fail]
+pub fun object_inputs(p: *mach.compile.project.Project, destinations: *str, inputs_out: **mink.format.contract.Input) err[mach.base.fail.Fail]
 ```
 
-every unit's object reaches `obj/` through a sibling temporary, carrying its cache record,
-since the object cache reads it back; a module the cache restored is already there
-
-### write_test_objects
-
-```mach
-pub fun write_test_objects(p: *mach.compile.project.Project, destinations: *str) err[mach.base.fail.Fail]
-```
-
-each test object reaches `obj/` beside its module's object, the same way
-
-| Parameter | |
-| :--- | :--- |
-| `destinations` | per emitted module, its test object's path, nil for a module without one |
+every unit's object as a file input: each reached `obj/` when its unit completed
+(cache.object_written), and a module the cache restored was there already
 
 ### inputs_dnit
 

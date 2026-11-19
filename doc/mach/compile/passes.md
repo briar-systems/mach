@@ -27,7 +27,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`codegen_reusable`](#codegen_reusable), [`test_build`](#test_build) | |
 | [`prepare_codegen_pass`](#prepare_codegen_pass) | the import libraries the declarations name, which every lowering reads, registered before any is |
 | [`run_test_pass`](#run_test_pass) | the test stage's computation: each test object's typed inputs, then each test object |
-| [`run_codegen_pass`](#run_codegen_pass) | each module in topological order, its front-end products given back once nothing after reads them: an importer's lowering reads the definitions of every module it reaches, so a module is held until the last module reaching it is lowered, and a test build lowers every module again |
+| [`run_codegen_pass`](#run_codegen_pass) | each module in topological order, its front-end products given back once its own unit is done |
 | [`test_codegen_reusable`](#test_codegen_reusable) | the test object's codegen product is current or cached, so no worker generates it |
 | [`compile_module`](#compile_module) | the mirl module `m`, the project's own, compiled into an object, which owns its storage in the session's backing allocator, the warnings mirl gave reported on `diags` |
 | [`run_link_pass`](#run_link_pass) | the link stage's computation: the current objects, then the link the build's job names, which runs only when one of its inputs moved |
@@ -168,9 +168,14 @@ the test stage's computation: each test object's typed inputs, then each test ob
 pub fun run_codegen_pass(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
 ```
 
-each module in topological order, its front-end products given back once nothing after reads
-them: an importer's lowering reads the definitions of every module it reaches, so a module is
-held until the last module reaching it is lowered, and a test build lowers every module again
+each module in topological order, its front-end products given back once its own unit is done.
+a unit's prepare reads the syntax, resolution, per-node typing and lowering scope of its own
+modules alone: what it reads of another module is that module's interface (its declarations,
+constants, template copy), the typed instances, the surfaces instance typing reads and the source
+identities instances are bound by, each a product of its own that outlives the release. those
+made from the released products are made before it: the instances once sema is done, and the
+identities as each module goes (identity_reads). a read of a released product refuses
+(query.get, frontend.acquire_sema). a test build lowers every module again and gives back none
 
 ### test_codegen_reusable
 

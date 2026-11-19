@@ -60,6 +60,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`section_count`](#section_count) | how many sections `o` holds |
 | [`globals_in`](#globals_in) | the names of the data symbols `o` places in its sections named `name`, the globals they hold and not the marks a format adds, borrowed from the object |
 | [`object_dnit`](#object_dnit) | |
+| [`object_emptied`](#object_emptied) | give back everything `o` owns and leave an empty object in its place, which its owner's release gives back again as nothing |
 | [`symbol_count`](#symbol_count) | how many symbols `o` holds |
 | [`exported`](#exported) | whether symbol `i` of `o` is one the object defines and links outside it |
 | [`weakened`](#weakened) | a copy of `o` in which its definition of `name`, when it has a global one, yields to another as a weak definition; none when `o` defines no such symbol |
@@ -481,6 +482,15 @@ hold and not the marks a format adds, borrowed from the object
 ```mach
 pub fun object_dnit(o: *Object)
 ```
+
+### object_emptied
+
+```mach
+pub fun object_emptied(o: *Object)
+```
+
+give back everything `o` owns and leave an empty object in its place, which its owner's
+release gives back again as nothing
 
 ### symbol_count
 

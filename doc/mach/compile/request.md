@@ -180,8 +180,9 @@ pub rec BuildRequest {
 
     # the level mirl's schedule runs at
     opt: u8;
-    # the command line changed a lever of the selected profile, so a build that
-    # publishes artifacts must say where: presentation only, no part of any hash
+    # the command line changed a lever of the selected profile, or a `--set` wrote
+    # a key of it, so a build that publishes artifacts must say where:
+    # presentation only, no part of any hash
     overrides: bool;
     debug:     bool;
     # whether mach and mirl run their verifiers: opt-in, no part of any hash

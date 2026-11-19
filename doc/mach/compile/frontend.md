@@ -32,6 +32,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](pr
 | [`frontend_status`](#frontend_status) | the standing of the front end over every module |
 | [`read_definition`](#read_definition) | a module's definition as far as a phase reads it, through the products of this operation |
 | [`acquire_sema`](#acquire_sema) | a module's sema product in the open operation, its field graph installed in the projection |
+| [`kept_sema`](#kept_sema) | what a module's sema product keeps once its front-end products are given back: its status, refusal, interface and field graph, the graph installed in the projection |
 | [`record_load_views`](#record_load_views) | set each module's load view from what the walk left it; an unchanged view is no change |
 | [`instance_deps`](#instance_deps) | what typing the instance `item` reads besides its declaring module's definition: the typed surfaces of every module the declaring module imports, and of every module declaring a type its arguments or pack name with what each of those imports, transitively, each field graph installed |
 | [`instance_reads`](#instance_reads) | the modules the instance `item` names: its declaring module first, then every module declaring a type its arguments or pack name |
@@ -157,7 +158,18 @@ a module's definition as far as a phase reads it, through the products of this o
 pub fun acquire_sema(p: *mach.compile.project.Project, mid: mach.session.module.ModuleId) res[*mach.front.sema.product.SemaResult, mach.base.fail.Fail]
 ```
 
-a module's sema product in the open operation, its field graph installed in the projection
+a module's sema product in the open operation, its field graph installed in the projection.
+once the module's front-end products are given back (products_dnit) only kept_sema reads it
+
+### kept_sema
+
+```mach
+pub fun kept_sema(p: *mach.compile.project.Project, mid: mach.session.module.ModuleId) res[*mach.front.sema.product.SemaResult, mach.base.fail.Fail]
+```
+
+what a module's sema product keeps once its front-end products are given back: its status,
+refusal, interface and field graph, the graph installed in the projection. the rest of it is
+acquire_sema's
 
 ### record_load_views
 
@@ -225,7 +237,8 @@ give back a lowered module's front-end products, which nothing the build runs af
 lowering reads: its syntax tree, its resolution, its lowering scope and what its typing holds
 beyond the interface its importers' lowerings read. its expectations are collected first and
 held, so a later refresh judges them as it would have. called inside the operation that
-lowered it, once its own products and every reader of them are done
+lowered it, once its own products and every reader of them are done. a later read of any of
+them refuses: the syntax and resolution in the query engine, the typing in acquire_sema
 
 ### finish_query_phase
 

@@ -245,10 +245,12 @@ pub rec ResolvedProfile {
     name:         mach.base.intern.StrId;
     optimize:     bool;
     relax:        NameList;
+    relax_named:  str;
     linker_relax: bool;
     debug:        bool;
     simd:         SimdMode;
     allow:        mach.base.diagnostic.kind.KindSet;
+    written:      bool;
 }
 ```
 
@@ -259,10 +261,12 @@ the profile a selection resolves to, copied out of its `ProfileDef`
 | `name` | `mach.base.intern.StrId` | the profile's name |
 | `optimize` | `bool` | as `ProfileDef` |
 | `relax` | `NameList` | as `ProfileDef`, borrowed from the manifest |
+| `relax_named` | `str` | as `ProfileDef` |
 | `linker_relax` | `bool` | as `ProfileDef` |
 | `debug` | `bool` | as `ProfileDef` |
 | `simd` | `SimdMode` | as `ProfileDef` |
 | `allow` | `mach.base.diagnostic.kind.KindSet` | as `ProfileDef` |
+| `written` | `bool` | as `ProfileDef` |
 
 ### resolve_profile
 

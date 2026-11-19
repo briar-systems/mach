@@ -60,7 +60,6 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`emit_add`](#emit_add), [`emit_sub`](#emit_sub), [`emit_mul`](#emit_mul), [`emit_div_s`](#emit_div_s), [`emit_div_u`](#emit_div_u), [`emit_rem_s`](#emit_rem_s), [`emit_rem_u`](#emit_rem_u), [`emit_and`](#emit_and), [`emit_or`](#emit_or), [`emit_xor`](#emit_xor), [`emit_shl`](#emit_shl), [`emit_shr_s`](#emit_shr_s), [`emit_shr_u`](#emit_shr_u), [`emit_neg`](#emit_neg), [`emit_not`](#emit_not), [`emit_cmp_eq`](#emit_cmp_eq), [`emit_cmp_ne`](#emit_cmp_ne), [`emit_cmp_lt_s`](#emit_cmp_lt_s), [`emit_cmp_lt_u`](#emit_cmp_lt_u), [`emit_cmp_le_s`](#emit_cmp_le_s), [`emit_cmp_le_u`](#emit_cmp_le_u), [`emit_cmp_gt_s`](#emit_cmp_gt_s), [`emit_cmp_gt_u`](#emit_cmp_gt_u), [`emit_cmp_ge_s`](#emit_cmp_ge_s), [`emit_cmp_ge_u`](#emit_cmp_ge_u) | |
 | [`emit_vcompare`](#emit_vcompare) | a lanewise comparison of two vectors as a mask of `result_ty`, every bit of a lane set where it holds |
 | [`truth`](#truth) | an i1 that holds where a bool byte, or any integer, is not zero |
-| [`emit_select`](#emit_select) | `x` where `c` holds, else `y`; a vector condition picks lane by lane |
 | [`resize_int`](#resize_int) | an integer of `to`'s width from `x`: kept, truncated or extended by `signed` |
 | [`emit_trunc`](#emit_trunc), [`emit_sext`](#emit_sext), [`emit_zext`](#emit_zext), [`emit_fp_trunc`](#emit_fp_trunc), [`emit_fp_ext`](#emit_fp_ext) | |
 | [`emit_fp_resize`](#emit_fp_resize) | a float of `to`'s format from `x`, promoted or demoted |
@@ -91,7 +90,6 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`emit_vec_insert`](#emit_vec_insert) | |
 | [`emit_vec_build`](#emit_vec_build) | a vector of `ty` from one value per lane |
 | [`emit_shuffle`](#emit_shuffle) | lanes of `x` and `y` joined, picked by `picks`, as a vector of `ty` |
-| [`emit_reduce`](#emit_reduce) | a reduction of a vector's lanes to one scalar |
 | [`emit_unary`](#emit_unary) | a lanewise or scalar operation of one operand |
 | [`emit_binary`](#emit_binary) | a lanewise or scalar operation of two operands |
 | [`emit_ternary`](#emit_ternary) | a lanewise or scalar operation of three operands |
@@ -700,14 +698,6 @@ pub fun truth(b: *Builder, c: mach.lower.value.Value) mach.lower.value.Value
 
 an i1 that holds where a bool byte, or any integer, is not zero
 
-### emit_select
-
-```mach
-pub fun emit_select(b: *Builder, c: mach.lower.value.Value, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
-```
-
-`x` where `c` holds, else `y`; a vector condition picks lane by lane
-
 ### resize_int
 
 ```mach
@@ -999,14 +989,6 @@ pub fun emit_shuffle(b: *Builder, ty: Type, x: mach.lower.value.Value, y: mach.l
 ```
 
 lanes of `x` and `y` joined, picked by `picks`, as a vector of `ty`
-
-### emit_reduce
-
-```mach
-pub fun emit_reduce(b: *Builder, code: Opcode, x: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
-```
-
-a reduction of a vector's lanes to one scalar
 
 ### emit_unary
 

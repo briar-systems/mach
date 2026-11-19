@@ -4,7 +4,8 @@
 
 `--set`: a manifest key written over every table of its section for one invocation. the key
 and its value are read by the rows and decoders that read the key in a manifest, so a value
-`--set` gives is held to every rule the key keeps in mach.toml
+`--set` gives is held to every rule the key keeps in mach.toml. a profile key is written over
+every profile, so the profile a build selects holds it whichever that is
 
 Source: [`src/manifest/setting.mach`](../../../src/manifest/setting.mach)
 

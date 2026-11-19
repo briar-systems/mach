@@ -351,10 +351,12 @@ pub rec ProfileDef {
     is_default:   bool;
     optimize:     bool;
     relax:        NameList;
+    relax_named:  str;
     linker_relax: bool;
     debug:        bool;
     simd:         SimdMode;
     allow:        mach.base.diagnostic.kind.KindSet;
+    written:      bool;
     at:           mach.base.source.Location;
     default_at:   mach.base.source.Location;
 }
@@ -369,10 +371,12 @@ least one
 | `is_default` | `bool` | `default = true`; false when the key is absent. more than one default is a parse error |
 | `optimize` | `bool` | the required `optimize` key: whether the release passes run |
 | `relax` | `NameList` | the optional `relax` key: the departures from exact semantics the build permits |
+| `relax_named` | `str` | the `relax` key as a refusal of one of its names names it, its table's label or `--set` before it |
 | `linker_relax` | `bool` | the optional `linker_relax` key: whether the linker may relax the code, true when the key is absent |
 | `debug` | `bool` | the required `debug` key |
 | `simd` | `SimdMode` | the required `simd` key |
 | `allow` | `mach.base.diagnostic.kind.KindSet` | the optional `allow` key: the warning kinds the profile silences, empty when the key is absent |
+| `written` | `bool` | a `--set` wrote a key of it for this invocation |
 | `at` | `mach.base.source.Location` | where the table's key is written |
 | `default_at` | `mach.base.source.Location` | where its `default` value is written, the zero place when absent |
 

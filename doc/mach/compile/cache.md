@@ -23,7 +23,15 @@ recorded (compile/cache/objects)
 
 Source: [`src/compile/cache.mach`](../../../src/compile/cache.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.compile.backend`](backend.md), [`mach.compile.cache.compiler`](cache/compiler.md), [`mach.compile.project`](project.md), [`mach.lower.testrunner`](../lower/testrunner.md), [`mach.report.readout`](../report/readout.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.compile.backend`](backend.md), [`mach.compile.cache.compiler`](cache/compiler.md), [`mach.compile.project`](project.md), [`mach.host.output`](../host/output.md), [`mach.lower.testrunner`](../lower/testrunner.md), [`mach.report.readout`](../report/readout.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md).
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`ObjectWrite`](#objectwrite) | `rec` | an object to write, with the record it carries, nil for none |
+
+| On `ObjectWrite` | |
+| :--- | :--- |
+| [`object_write`](#object_write) | the object's bytes, its record in the section the target carries it in, fill `t`, and the digest of what reached `obj/` is noted |
 
 | Functions | |
 | :--- | :--- |
@@ -42,6 +50,11 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`forget`](#forget) | every key, skip decision and record of the previous load is dropped: the next load keys again, and a project that is not keyed processes every module |
 | [`note_written`](#note_written) | the object written to `location` was the `len` bytes at `bytes`: a keyed object under `obj/` is remembered by its digest for the restore that reads it back |
 | [`store_written`](#store_written) | store the digests of the objects this build wrote, once they are in place |
+| [`object_written`](#object_written) | a completed unit's object reaches its `obj/` file through a sibling temporary, carrying its record, since the object cache reads it back, and the build holds no form of it after: a link reads it back from there (object_back) |
+| [`test_object_written`](#test_object_written) | the same for the module's test object, its time carved out of test codegen's |
+| [`object_back`](#object_back) | the object module `m` wrote when its unit completed, read back from its file into the slot it left, as the cache restores one, so a link reads the one form whether the object was made now or restored |
+| [`test_object_back`](#test_object_back) | the same for the module's test object |
+| [`object_reread`](#object_reread) | `o` replaced by the object the file `from` holds, which the build wrote from it |
 | [`test_input_key`](#test_input_key) | the query key of a module's test object products and its object key input |
 | [`instance_key`](#instance_key) | the key of an instance: the configuration, its symbol and what it reads |
 | [`prepare`](#prepare) | once per load, after the load walk and the embedded inputs, before anything is resolved: key every module, read each emitted module's `obj/` object under its key and mark the modules the front end skips |
@@ -60,6 +73,27 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`OBJECT_KEY`](#constants) | the key a module's reused object was built under, keyed by its stable id and the test bit |
 
 ---
+
+## ObjectWrite
+
+```mach
+pub rec ObjectWrite {
+    p:      *mach.compile.project.Project;
+    o:      *Object;
+    record: *mach.compile.project.Record;
+}
+```
+
+an object to write, with the record it carries, nil for none
+
+### object_write
+
+```mach
+pub fun object_write(w: *ObjectWrite, t: *mach.host.output.Temporary) err[mach.base.fail.Fail]
+```
+
+the object's bytes, its record in the section the target carries it in, fill `t`, and the
+digest of what reached `obj/` is noted
 
 ## Functions
 
@@ -193,6 +227,52 @@ pub fun store_written(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
 ```
 
 store the digests of the objects this build wrote, once they are in place
+
+### object_written
+
+```mach
+pub fun object_written(p: *mach.compile.project.Project, m: *mach.compile.project.ModuleEntry) err[mach.base.fail.Fail]
+```
+
+a completed unit's object reaches its `obj/` file through a sibling temporary, carrying its
+record, since the object cache reads it back, and the build holds no form of it after: a link
+reads it back from there (object_back). a module the cache restored is there already, and one
+with nowhere to go keeps its object. the time is the emit row's, carved out of codegen's
+
+### test_object_written
+
+```mach
+pub fun test_object_written(p: *mach.compile.project.Project, m: *mach.compile.project.ModuleEntry) err[mach.base.fail.Fail]
+```
+
+the same for the module's test object, its time carved out of test codegen's
+
+### object_back
+
+```mach
+pub fun object_back(p: *mach.compile.project.Project, m: *mach.compile.project.ModuleEntry) err[mach.base.fail.Fail]
+```
+
+the object module `m` wrote when its unit completed, read back from its file into the slot it
+left, as the cache restores one, so a link reads the one form whether the object was made now
+or restored. what the format writes and reads back otherwise is not the object's and never
+reaches a link. an object held in memory is left as it is
+
+### test_object_back
+
+```mach
+pub fun test_object_back(p: *mach.compile.project.Project, m: *mach.compile.project.ModuleEntry) err[mach.base.fail.Fail]
+```
+
+the same for the module's test object
+
+### object_reread
+
+```mach
+pub fun object_reread(p: *mach.compile.project.Project, o: *Object, from: str) err[mach.base.fail.Fail]
+```
+
+`o` replaced by the object the file `from` holds, which the build wrote from it
 
 ### test_input_key
 
