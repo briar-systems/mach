@@ -588,9 +588,10 @@ A vector shift shifts each lane by the count in the same lane, and each lane
 follows the scalar operator exactly: `>>` is arithmetic on signed lanes and
 logical on unsigned ones, a lane count at or above the lane width saturates
 (`0`, or the sign fill for an arithmetic `>>`), and a lane count that is a
-compile-time constant at or above the width is an error. A uniform count is
-the same count in every lane of a literal, which is the form every baseline
-instruction set shifts by in one instruction:
+compile-time constant at or above the width is an error. Whether a target
+packs a shift depends on its lane type alone, never on what the count holds.
+A uniform count, the same count in every lane of a literal, can take a shorter
+sequence, as one instruction on every baseline instruction set:
 
 ```mach
 use std.runtime;
@@ -675,21 +676,24 @@ Integer `*` is where this is most visible today:
 | `i32x4 * i32x4` | packed `pmuludq` pair (`pmulld` under `sse41`) | packed `mul .4s` | scalar expansion |
 | `i64x2 * i64x2` | scalar expansion | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
 
-Shifts realize by the count's form: a count that is the same value in every
-lane shifts every lane by that one scalar, and any other count shifts each lane
-by its own. A count is the same in every lane where the shift's operand is a
+A shift is packed or expanded by its operator, its lane type and the
+target's features, so a debug build and an optimised one, and a count written
+in the shift or held in a local or a parameter, all get the same answer under
+`simd = "require"`. What the count holds only picks the sequence: on x86_64 a
+count the backend sees is the same value in every lane shifts every lane by
+that one value in one instruction. It sees one where the shift's operand is a
 literal of one value in every lane (`x >> u32x4{n, n, n, n}`), or, in a build
-that promotes locals to registers (`-O`), a local holding one. A debug build
-keeps a local in memory, so there only a literal written in the shift itself
-counts.
+that promotes locals to registers (`-O`), a local holding one. Any other count
+is shifted in the vector registers once per lane, by that lane's count, and
+the lanes merged by packed shuffles, so no lane passes through a general
+register.
 
 | shape | x86_64 (SSE2) | aarch64 (NEON) | riscv64 (no vector unit) |
 |---|---|---|---|
-| uniform `<<`, `>>` on 16-, 32- and 64-bit lanes | packed `psll*` / `psrl*` / `psra*`, the count moved zero-extended to the low quadword of a register | packed, as a per-lane count | scalar expansion |
-| uniform arithmetic `>>` on 64-bit lanes | scalar expansion (`vpsraq` is AVX-512) | packed, as a per-lane count | scalar expansion |
+| `<<`, `>>` on 32- and 64-bit lanes (not arithmetic `>>` on 64-bit lanes) | packed `vpsllv*` / `vpsrlv*` / `vpsravd` under `avx2`, else one `psll*` / `psrl*` / `psra*` by a register per lane merged by `punpck*qdq` and `pshufd`, or one of them for a uniform count | packed `ushl` / `sshl` | scalar expansion |
+| `<<`, `>>` on 16-bit lanes | packed: one `psllw` / `psrlw` / `psraw` by a register per lane, paired into doublewords by `pslld`, `psrld` and `por` and merged as above, or one of them for a uniform count (`vpsllvw` is AVX-512BW) | packed `ushl` / `sshl` | scalar expansion |
+| arithmetic `>>` on 64-bit lanes | scalar expansion (`vpsraq` and `vpsravq` are AVX-512) | packed `sshl` | scalar expansion |
 | `<<`, `>>` on 8-bit lanes | scalar expansion (SSE has no byte shift) | packed `ushl` / `sshl` | scalar expansion |
-| per-lane count on 32- and 64-bit lanes | packed `vpsllv*` / `vpsrlv*` / `vpsravd` under `avx2`, else scalar expansion (the 64-bit arithmetic `vpsravq` is AVX-512) | packed `ushl` / `sshl` | scalar expansion |
-| per-lane count on 16-bit lanes | scalar expansion (`vpsllvw` is AVX-512BW) | packed `ushl` / `sshl` | scalar expansion |
 
 The x86_64 packed instructions saturate a count at or above the lane width on
 their own: `psll`, `psrl` and `psra` read the whole low quadword of the count
