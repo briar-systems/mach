@@ -55,7 +55,7 @@ it, in the manifest that states it, a dependency's own included.
 carries the same place as the failure's `primary` span.
 
 ```
-error[manifest.invalid_value] mach.toml: profile 'debug': simd must be "scalarize" or "require" (got "fast")
+error[manifest.invalid_value] mach.toml: simd in profile 'debug' must be "scalarize" or "require", found "fast"
    @ mach.toml:15:8
 15 | simd = "fast"
    |        ^^^^^^
@@ -530,9 +530,9 @@ freestanding entry does, and whose target states no `stack_reserve` is refused, 
 the key:
 
 ```
-error[target.stack_size] mach.toml: [target.board] states no `stack_reserve`, and the image
-needs a stack: it refers to the bounds of the `.stack` section, which an image no loader maps
-holds its stack in. state the stack's size in bytes as `stack_reserve`
+error[target.stack_size] mach.toml: [target.board] needs `stack_reserve`, because the image
+uses the bounds of the `.stack` section, which holds its stack. state the stack's size in
+bytes as `stack_reserve`
 ```
 
 **On a wasm module**, as on `wasi`, the runtime gives the module its linear memory and
@@ -591,7 +591,7 @@ v6 wrote a RISC-V selection as `isa = "rv32imc"` with no architecture at all, an
 `mach migrate` writes the `arch` that enters it beside it.
 
 ```
-error[target.retired_spelling] mach.toml: [target.metal].of = "raw" is a retired spelling; write "flat", mink's name for it
+error[target.retired_spelling] mach.toml: [target.metal].of = "raw" is a retired spelling. write "flat"
 ```
 
 `vulkan1.0` through `vulkan1.3` are `vulkan`'s environments and `preview1` is `wasi`'s.
@@ -1210,7 +1210,7 @@ Table order carries no meaning. A manifest that declares several profiles and
 marks none is refused wherever a command must pick one:
 
 ```
-error[selection.ambiguous] mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with -p
+error[selection.ambiguous] mach.toml: several profiles are declared and none has `default = true`. mark one [profile.<name>] with `default = true` or select one with -p
 ```
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
 concern: it is controlled only by the `--emit ir` and `--emit asm` flags of `mach build`.
@@ -1287,7 +1287,7 @@ unknown:
 | `secret.branch` | a secret value decides a branch or loop condition |
 
 ```
-error[allow.error_key] mach.toml: [profile.release].allow entry "secret.branch" names an error; only a warning can be silenced
+error[allow.error_key] mach.toml: [profile.release].allow entry "secret.branch" names an error, and only a warning can be silenced
 ```
 
 Like the SIMD levers, `allow` is the consumer's: a dependency's profiles are
@@ -1378,7 +1378,7 @@ work directory with `-w` that every artifact it writes sits under. Without
 either it is refused:
 
 ```
-error[cli.flag_conflict] these options would write a differently configured build over the profile's existing artifacts; name an artifact path with -o or a work directory with -w
+error[cli.flag_conflict] these options would overwrite the profile's artifacts with a differently configured build. name an artifact path with -o or a work directory with -w
 ```
 
 The object cache is keyed by the whole configuration, so only published
@@ -1409,7 +1409,7 @@ it, a target's system refusing a subsystem included, names `--set <key>` and
 points at the `--set` text rather than at a line of `mach.toml`:
 
 ```
-error[catalog.unsupported] --set subsystem: Subsystem windows is unsupported by linux (target 'linux-x86_64' runs on linux, whose images state no subsystem)
+error[catalog.unsupported] subsystem windows is not available on linux (--set subsystem states it, and target 'linux-x86_64' runs on linux, whose images state no subsystem)
   @ --set:1:13
 1 | subsystem = windows
   |             ^^^^^^^
@@ -1431,7 +1431,7 @@ reads the selected artifact's name.
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
 | `out`     | every kind but `object` | This artifact's output path, relative to the project root like every other path. An `object` artifact states none, since its objects stay under `obj/` for a later link: stating it is refused, and `mach migrate` removes it. Write `{project.work}/bin/demo` to place it under the build output, or any other project path to place it there. v6 rooted it under the expanded `[project].out` without saying so, so `mach migrate` writes `{project.work}/` before each `out` of a manifest that still writes `[project].out`. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
-| `link`    | absent: links nothing | Array of `[link.X]` names this artifact links (see below). A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names no [link.*] table: 'nosuch' (declared: [link.kernel32])`). |
+| `link`    | absent: links nothing | Array of `[link.X]` names this artifact links (see below). A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names 'nosuch', which is no [link.*] table (the declared tables are [link.kernel32])`). |
 | `need`    | absent: needs nothing | Array of category-qualified requirements such as `step.generate`, `artifact.support`, and `artifact.shader-*`. Each glob matches only its named category. See [Artifact requirements](#artifact-requirements). |
 | `subsystem` | absent: the system's default, `"console"` on `windows` and `"efi_application"` on `uefi` | A PE subsystem as mink spells it, such as `"console"` or `"windows"` — the environment a windows executable declares it runs under, or the kind of image a UEFI firmware loads; refused on a target whose image format has no subsystem, and on one whose system does not run it (see below). |
 | `icon` | absent: no icon | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
@@ -1662,7 +1662,7 @@ for a target whose format has none (ELF, Mach-O, a flat image, a wasm module) is
 unsupported, naming the key, the target and the format:
 
 ```
-mach.toml: artifact.game.subsystem: Subsystem windows is unsupported by linux (target 'host' runs on linux, whose images state no subsystem)
+subsystem windows is not available on linux (mach.toml: artifact.game.subsystem states it, and target 'host' runs on linux, whose images state no subsystem)
 ```
 
 An omitted key is the console default and is never refused, so an artifact

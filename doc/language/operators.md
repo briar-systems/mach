@@ -389,7 +389,7 @@ fun main(argc: i64, argv: **u8) i64 {
 Reading `@p::u64` as dereference-then-convert is refused, because the cast
 applies to `p` and a `u64` cannot be dereferenced:
 
-```mach error dereference of non-pointer type
+```mach error only a pointer can be dereferenced
 fun widen(p: *i64) u64 {
     ret @p::u64; # error: @(p::u64) dereferences a u64
 }
@@ -607,7 +607,7 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
-```mach error a vector shift count is a vector of the shifted type, never a scalar
+```mach error a vector shift count must be a vector of the shifted type, not a scalar
 fun f(x: u32x4) u32x4 {
     ret x << 3;
 }

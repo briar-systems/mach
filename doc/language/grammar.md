@@ -559,7 +559,7 @@ unary-op ::= "-"      (* numeric negation *)
 - `sel` binds the same way and requires the result to be a member access or
   a descriptor projection (`sel r.ok`, `sel v.[c]`), so `sel r.ok && r.ok > 3`
   parses as `(sel r.ok) && (r.ok > 3)`; any other operand is a parse error
-  (`` `sel` tests one case of a place: write `sel place.case` or `sel place.[case]` ``).
+  (`` `sel` tests one case of a place. write `sel place.case` or `sel place.[case]` ``).
 - `(expr)` is a plain grouping; there is no tuple form.
 
 ### Postfix

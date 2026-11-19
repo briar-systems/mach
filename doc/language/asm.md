@@ -44,7 +44,7 @@ asm <selection> {
   `local.get`: `asm mvp { local.get {old}  local.get {pages}  i32.load  memory.grow  i32.store }`.
   mirl reads the body, so a body it refuses is refused at the build, not at the head.
 - There is no `asm ... or ...` chain. `$if` chooses the block per target.
-- **A target with no assembler takes no `asm` block.** SPIR-V declares no assembly capability, so any `asm` block compiled for it, whatever its head, is refused where it is written with `inline assembly is not available on instruction set 'spirv'`. Guard a routine shared with a shader behind `$if ($mach.build.arch != $mach.arch.spirv)`.
+- **A target with no assembler takes no `asm` block.** SPIR-V declares no assembly capability, so any `asm` block compiled for it, whatever its head, is refused where it is written with `inline assembly is not allowed on instruction set 'spirv', which declares no assembly capability`. Guard a routine shared with a shader behind `$if ($mach.build.arch != $mach.arch.spirv)`.
 - Each line is an instruction in the ISA's native syntax.
 - `#` introduces a line comment: everything from `#` to the end of the line is ignored, whatever it contains (`;`, `{}`, `%`, and so on are all inert inside a comment).
 

@@ -330,7 +330,7 @@ write, `::f64` (see
 ext fun printf(fmt: *u8, ...) i32;
 
 fun show(h: f16) i32 {
-    ret printf("%f\n"::*u8, h); # error: `f16` is promoted to `f64`; write the cast
+    ret printf("%f\n"::*u8, h); # error: `f16` is promoted to `f64`. write the cast
 }
 ```
 

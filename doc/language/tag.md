@@ -93,7 +93,7 @@ case takes empty braces. There is no other construction form:
 - The record-literal form (`Reply{value: 1}` or `Reply{empty}`) is a compile error
 - A case selector alone (`Reply.value`) is not a value
 
-```mach error this tag case requires a payload
+```mach error this tag case needs a payload
 tag Reply: u8 { empty; value: i64; }
 
 val missing: Reply = Reply.value{}; # the case declares a payload
@@ -237,7 +237,7 @@ fun tests(reply: Reply, next: opt[i64], a: opt[i64], b: opt[i64]) bool {
 
 `sel` takes a place, so a call result is refused:
 
-```mach error `sel` tests a place
+```mach error `sel` needs a place
 tag Reply: u8 { empty; value: i64; }
 
 fun make() Reply {

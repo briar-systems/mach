@@ -140,7 +140,7 @@ Every binding declares its type. An untyped numeric literal is checked
 against the binding's declared type; it does not participate in inferring
 that type.
 
-```mach error bindings require an explicit type annotation
+```mach error a binding needs an explicit type
 val n: i64 = 42;                    # ok — 42 conforms to i64
 val x       = 42;                   # ERROR — a binding declares its type
 val y       = 42i64;                # ERROR — a suffix is not an annotation

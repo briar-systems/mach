@@ -86,8 +86,8 @@ $if ($project.target.sys == "windows") { ... }    # the declared os string
 A standalone bare `$ident` — `$mode`, `$foo` — is **none** of the shapes above
 and is rejected with one teaching diagnostic, owned by the comptime evaluator:
 
-> comptime parameters are referenced without `$`; comptime paths are rooted:
-> `` $mach ``, `` $project ``, `` $bin ``
+> comptime parameters are referenced without `$`. a comptime path starts at
+> `$mach`, `$project` or `$bin`
 
 A comptime **parameter** is referenced by its bare name (no `$`); every comptime
 **path** is rooted. The rule applies identically in a `$if` gate and in value
@@ -101,12 +101,12 @@ under the ordinary scoping rules — never whichever binding happens to share it
 spelling. A block-scoped binding shadows an outer one of the same name here
 exactly as it does at runtime:
 
-```mach error array length is not a comptime constant
+```mach error the array length must be a comptime constant
 val N: i64 = 9;
 
 fun f(k: i64) i64 {
     val N:  i64 = k; # shadows the module constant
-    var xs: [N]i64; # error: array length is not a comptime constant
+    var xs: [N]i64; # error: the array length must be a comptime constant
     ret xs[0];
 }
 ```

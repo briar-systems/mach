@@ -233,7 +233,7 @@ test queue__drains_in_order {
 fun drained() Queue { ret filled(0); } # so may another testing declaration
 
 pub fun reset() Queue { ret filled(0); }
-# error[testing.use] `filled` is a `#[testing]` declaration: only a test body or another
+# error[testing.use] `filled` is a `#[testing]` declaration. only a test body or another
 #        `#[testing]` declaration may reference it
 ```
 

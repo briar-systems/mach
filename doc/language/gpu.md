@@ -1117,8 +1117,8 @@ instruction is not available:
 - **An instruction a construct of the language writes.** Each operation has one
   spelling, so the instruction an operator, a cast, an access, a literal, a call, a
   declaration or a statement is written as stays that construct's, and the refusal
-  names the construct: `` `OpIAdd` is no `intrinsic`: the language writes it with
-  the `+` operator on integers ``. These are the instructions of the arithmetic,
+  names the construct: `` `OpIAdd` is not an `intrinsic`. write it with the
+  `+` operator on integers ``. These are the instructions of the arithmetic,
   bitwise and shift operators (`OpIAdd`, `OpISub`, `OpIMul`, `OpUDiv`, `OpSDiv`,
   `OpUMod`, `OpSRem`, `OpSNegate`, `OpNot`, `OpBitwiseAnd`, `OpBitwiseOr`,
   `OpBitwiseXor`, `OpShiftLeftLogical`, `OpShiftRightLogical`,
@@ -1153,7 +1153,7 @@ instruction is not available:
   `OpMatrixTimesMatrix`, and `Determinant` and `MatrixInverse` of `GLSL.std.450`),
   a type the language has none of, and `OpInBoundsPtrAccessChain`, whose element
   is the pointee's stride, which a physical pointer, an address, does not carry:
-  `` `OpTranspose` is not available as an `intrinsic`: it is over matrices, a type
+  `` `OpTranspose` is not available as an `intrinsic`. it is over matrices, a type
   the language does not declare ``.
 
 A named instruction the compiler has typing rules for is held to them, at the

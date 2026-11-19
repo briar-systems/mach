@@ -119,8 +119,8 @@ rounds to zero, is an error:
 ```mach error float literal overflows `f32`
 val a: f32 = 3.4028235e38; # fine: the largest f32
 val b: f64 = 1.0e39; # fine: f64 holds it
-val c: f32 = 1.0e39; # error: float literal overflows `f32`: it rounds to infinity
-val d: f32 = 1.0e-46; # error: float literal underflows `f32`: its nonzero value rounds to zero
+val c: f32 = 1.0e39; # error: float literal overflows `f32` and rounds to infinity
+val d: f32 = 1.0e-46; # error: float literal underflows `f32` and rounds to zero
 ```
 
 `f16` holds much less, so its bounds come early:
@@ -128,8 +128,8 @@ val d: f32 = 1.0e-46; # error: float literal underflows `f32`: its nonzero value
 ```mach error float literal overflows `f16`
 val a: f16 = 65504.0; # fine: the largest f16
 val b: f16 = 0.00000006; # fine: rounds to the smallest subnormal, 2^-24
-val c: f16 = 70000.0; # error: float literal overflows `f16`: it rounds to infinity
-val d: f16 = 1.0e-8; # error: float literal underflows `f16`: its nonzero value rounds to zero
+val c: f16 = 70000.0; # error: float literal overflows `f16` and rounds to infinity
+val d: f16 = 1.0e-8; # error: float literal underflows `f16` and rounds to zero
 ```
 
 Every phase agrees on the type a suffix declares: compile-time evaluation,

@@ -11,9 +11,9 @@ A **release** of a git dependency is a tag `vX.Y.Z` (optionally
 does not load, as an old tag's written for an earlier manifest schema, or whose
 `[project].version` differs from the tag name is not a candidate. Resolution
 sets it aside and keeps looking. When nothing fits, the error lists it among the
-requirements (`gl 0.1.0 is not a candidate: its mach.toml does not load: unknown
-key 'name' in [project]`, or `... its [project].version does not match the
-tag`), so the error never reads as one in the project's own `mach.toml`.
+requirements (`gl 0.1.0 is not a candidate (its mach.toml does not load
+(unknown key 'name' in [project]))`, or `... (its [project].version does not
+match the tag)`), so the error never reads as one in the project's own `mach.toml`.
 
 Resolution runs in exactly three places: `mach dep add`, `mach dep update` and
 `mach dep outdated`. **Builds never resolve and never verify.** They read
@@ -49,10 +49,10 @@ When nothing fits, the error lists every requirement that took part and names
 the identity the root can settle:
 
 ```
-error[dep.unsatisfiable] no set of releases satisfies every requirement:
+error[dep.unsatisfiable] no set of releases satisfies every requirement
     root requires b ^1.2
     a 1.0.0 requires b ^2.0
-  the root decides by declaring the identity itself, for example:
+  the root decides by declaring the identity itself, for example
     [dep.b]
     version = "<a range the root can use>"
 ```
@@ -125,9 +125,9 @@ replaced, whatever `--quiet` says, naming the identity, the root's winning
 selection, the requirer chain and what that chain asked for:
 
 ```
-note dependency 'std': the root declares ref = "tag/v2.0.0", overriding
-hedgeacme -> hedge -> std which requires ref = "tag/v2.1.0"; nothing checks that
-'std' supports the root's selection
+note dependency 'std' is declared by the root as ref = "tag/v2.0.0", overriding
+hedgeacme -> hedge -> std, which requires ref = "tag/v2.1.0". nothing checks that
+'std' accepts the root's selection
 ```
 
 A requirement that asks for exactly the root's selection is no override and is
@@ -145,9 +145,9 @@ a requirer's `use b.*` binds to whatever the root selected, even a major that
 requirer was never built or tested against. Nothing proves the requirer supports
 it: a passing build only shows that the code the build reached compiled, so it is
 evidence and not a guarantee. `mach dep verify` prints a note for every edge an
-override replaced, without failing (`note dependency 'b': the root declares ref =
-"tag/v2.0.0", overriding root -> a -> b which requires version = "^1.2"; nothing
-checks that 'b' supports the root's selection`). Treat each note as a claim to
+override replaced, without failing (`note dependency 'b' is declared by the root as
+ref = "tag/v2.0.0", overriding root -> a -> b, which requires version = "^1.2".
+nothing checks that 'b' accepts the root's selection`). Treat each note as a claim to
 confirm, by testing the requirer at that selection or by checking its own range.
 
 ## A release selects only releases
@@ -283,8 +283,8 @@ that:
 7. no identity is pinned at two commits: the root and every project of the
    closure, a path dependency's source included, record the gitlink of each
    Git dependency they declare, and all records of one identity agree
-   (`dependency 'b' is pinned at two commits: <commit> at <root>/dep/b, and
-   <other> at <path>/dep/b; pin it at one commit across the closure`). The
+   (`dependency 'b' is pinned at two commits, <commit> at <root>/dep/b and
+   <other> at <path>/dep/b. pin it at one commit across the closure`). The
    first pin met, root first, is the one the others are compared with.
 
 A pin outside a range names the requirer chain, the range, the pinned release
@@ -296,9 +296,9 @@ names the pinned commit '<commit>'`, and names `mach dep pull` beside `mach dep
 update`. A checkout that holds no tags at all, as a shallow clone (`git
 submodule update --depth 1`) does, cannot say which release its pin is, and
 the refusal says so rather than claim the pin is outside the range (`... but
-the release of the pinned commit '<commit>' cannot be read: its checkout at
-<dir> holds no tags (a shallow clone fetches none); run `mach dep pull <path>`
-for project '<root>' to fetch them`).
+pinned commit '<commit>' has no readable release, because its checkout at
+<dir> holds no tags. run `mach dep pull <path>` for project '<root>' to fetch
+them`).
 
 The recorded gitlink is the pin, and two kinds of drift from it are refused,
 each naming the identity and the command that fixes it:
@@ -322,10 +322,10 @@ selectors are not checked against its pin (the override notes above name them).
 For an identity the root does **not** declare, every requirer's exact selector
 (`tag/`, resolved through the checkout's own refs, or `commit/`) must be
 satisfied by the realized commit; a mismatch names both commits and the two
-remedies (`dependency 'b': exact ref 'tag/v1.0.0' required by root -> a -> b
-resolves to '<commit>' but the realized commit is '<other>'; run `mach dep
-update <path> b` for project '<root>' to re-pin it, or declare the identity at
-the root to override`). A `branch/` selector is an input to `update`, never a
+remedies (`dependency 'b' has exact ref 'tag/v1.0.0', required by root -> a ->
+b, which resolves to '<commit>', but the realized commit is '<other>'. run
+`mach dep update <path> b` for project '<root>' to re-pin it, or declare the
+identity at the root to override`). A `branch/` selector is an input to `update`, never a
 verify fact. The verifier reads the git **index**, so a freshly realized
 dependency is verifiable before it is committed.
 
@@ -409,12 +409,13 @@ build:
 
 - a **key that is not the project id**, a `[dep.<key>]` whose realized project
   declares a different id:
-  `[dep.foo] realizes project 'std': the manifest key, the directory under
-  dep/, and the project id are one name, so rename the table to [dep.std] and
-  the directory to dep/std`;
-- a **nested realization**, a `dep/<id>/dep/<x>/mach.toml`: `dependency 'a':
-  dep/a/dep/b is a nested realization: the root's dep/ owns the flat closure
-  and a dependency's own dep/ is never realized, so delete dep/a/dep`. The
+  `[dep.foo] realizes project 'std'. rename the table to [dep.std] and the
+  directory to dep/std`, because the manifest key, the directory under dep/
+  and the project id are one name;
+- a **nested realization**, a `dep/<id>/dep/<x>/mach.toml`: `dependency 'a'
+  has a nested realization at dep/a/dep/b, which is never used. delete
+  dep/a/dep`, because the root's dep/ owns the flat closure and a dependency's
+  own dep/ is never realized. The
   empty directory git materializes for a consumed dependency's own gitlink is
   not a realization and passes.
 
