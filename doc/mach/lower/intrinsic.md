@@ -2,26 +2,39 @@
 
 # mach.lower.intrinsic
 
-an `#[intrinsic]` declaration of the selected target held to the row its call becomes
+an `#[intrinsic]` declaration of the selected target held to the row its calls become
 
-a call is where a declaration is read against the target's catalog, so it is where the
-declaration's types are held to its row: the result it must or must not return, a
-constant or literal operand taken as an integer, an image, sampler or sampled image
-operand taken as a handle, a pointer an instruction reads or writes through taken as a
-pointer, and a handle returned only where the row's result is one. on spir-v the row's
-typing in masc (`masc.isa.spirv.typing`) holds each slot further: the number its type is
-a scalar or vector of, its shape and widths, and how it relates to another slot's type,
-a pointer slot's being the type it points to. a row masc states no typing of is held to
-its operand kinds alone, and its types are the author's to get right. each break is
-refused with `op.signature`, naming the parameter
+a declaration is held to its row where it is declared, whether or not anything calls it:
+its parameter count, the result it must or must not return, a constant or literal operand
+taken as an integer, an image, sampler or sampled image operand taken as a handle, a pointer
+an instruction reads or writes through taken as a pointer, and a handle returned only where
+the row's result is one. on spir-v the row's typing in masc (`masc.isa.spirv.typing`) holds
+each slot further: the number its type is a scalar or vector of, its shape and widths, how
+it relates to another slot's type, a pointer slot's being the type it points to, the
+members of a record it is, and the types a typed row's data operand or result may be. a row
+masc states no typing of is held to its operand kinds alone, and its types are the author's
+to get right. each break is refused with `op.signature`, naming the parameter. a call holds
+what depends on its arguments: an instruction the catalog does not hold or holds as no
+`intrinsic`, the constants an index chain reads, and in mirl the constants, enumerant
+values, image operands, storage classes and capabilities of the call
 
 Source: [`src/lower/intrinsic.mach`](../../../src/lower/intrinsic.mach)
 
-Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.lower.context`](context.md), [`mach.type.kind`](../type/kind.md).
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.front.sema.interface`](../front/sema/interface.md), [`mach.lower.context`](context.md), [`mach.lower.written`](written.md), [`mach.type.kind`](../type/kind.md).
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Found`](#found) | `rec` | the instruction an `#[intrinsic]` names in the selected target's catalog |
+| [`Named`](#named) | `tag` | what the selected target's catalog holds of the instruction an `#[intrinsic]` names |
+
+| On `Named` | |
+| :--- | :--- |
+| [`named`](#named-1) | what the selected target's catalog holds of instruction `name` of set `set` |
 
 | Functions | |
 | :--- | :--- |
-| [`check`](#check) | what a call's declaration must be against its row, refused with `op.signature` |
+| [`declared`](#declared) | the `#[intrinsic]` declaration `op` of the selected target, of function type `fn`, held to its row where it is declared, at `span` |
+| [`withdrawn`](#withdrawn) | a call of row `r`, named `name` at `span`, refused where masc's typing states that no environment admits the row, as GLSL.std.450 removed IMix |
 | [`ends`](#ends) | whether row `r` ends its block, nothing falling through after it, as OpKill and OpTerminateInvocation |
 | [`result_class`](#result_class) | the storage class a call's pointer result points into where its row's typing states it: the Image class where it relates the result to the texel of an image, as OpImageTexelPointer's result points into (spir-v 1.6, OpImageTexelPointer), PhysicalStorageBuffer where the result is a physical pointer, as OpConvertUToPtr makes |
 | [`chain_base`](#chain_base) | the row operand a call's pointer result is chained from where its row's typing relates the result to an index chain, as OpInBoundsAccessChain's to its Base, the result pointing into the storage class that operand points into |
@@ -29,23 +42,74 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 
 ---
 
-## Functions
-
-### check
+## Found
 
 ```mach
-pub fun check(ctx: *mach.lower.context.LowerContext, span: mach.base.source.Span, name: str, r: *masc.core.row.Row, lead: u32, fn: mach.type.kind.TypeId) err[mach.base.fail.Fail]
+pub rec Found {
+    set:  *mirl.target.capability.OpSet;
+    row:  *masc.core.row.Row;
+    lead: u32;
+}
 ```
 
-what a call's declaration must be against its row, refused with `op.signature`
+the instruction an `#[intrinsic]` names in the selected target's catalog
 
-| Parameter | |
-| :--- | :--- |
-| `span` | the call |
-| `name` | the instruction, as the declaration names it |
-| `r` | its row |
-| `lead` | the row operands its result, result type or set's import take |
-| `fn` | the declaration's function type |
+| Field | Type | |
+| :--- | :--- | :--- |
+| `set` | `*mirl.target.capability.OpSet` | its set |
+| `row` | `*masc.core.row.Row` | its row |
+| `lead` | `u32` | the row operands its result, result type or set's import take |
+
+## Named
+
+```mach
+pub tag Named: u8 {
+    no_catalog;
+    no_set;
+    refused: mach.lower.written.Refusal;
+    no_row;
+    found: Found;
+}
+```
+
+what the selected target's catalog holds of the instruction an `#[intrinsic]` names
+
+| Case | Payload | |
+| :--- | :--- | :--- |
+| `no_catalog` |  | the catalog holds no instruction set |
+| `no_set` |  | it holds no set of the name |
+| `refused` | `mach.lower.written.Refusal` | the set holds the instruction, but no `intrinsic` may name it, for the reason given |
+| `no_row` |  | the set holds no instruction of the name |
+| `found` | `Found` | the instruction |
+
+### named
+
+```mach
+pub fun named(ctx: *mach.lower.context.LowerContext, set: str, name: str) Named
+```
+
+what the selected target's catalog holds of instruction `name` of set `set`
+
+## Functions
+
+### declared
+
+```mach
+pub fun declared(ctx: *mach.lower.context.LowerContext, span: mach.base.source.Span, op: *mach.front.sema.interface.Declaration, fn: mach.type.kind.TypeId) err[mach.base.fail.Fail]
+```
+
+the `#[intrinsic]` declaration `op` of the selected target, of function type `fn`, held to
+its row where it is declared, at `span`. one whose instruction the catalog does not hold, or
+holds as no `intrinsic`, is refused at each call instead, where the program uses it
+
+### withdrawn
+
+```mach
+pub fun withdrawn(ctx: *mach.lower.context.LowerContext, span: mach.base.source.Span, name: str, r: *masc.core.row.Row) err[mach.base.fail.Fail]
+```
+
+a call of row `r`, named `name` at `span`, refused where masc's typing states that no
+environment admits the row, as GLSL.std.450 removed IMix. a declaration of it builds
 
 ### ends
 

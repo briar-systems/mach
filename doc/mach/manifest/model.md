@@ -401,7 +401,7 @@ one `[dep.<name>]` table as parsed. exactly one of `git` and `path` is set
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `name` | `mach.base.intern.StrId` | the table key; a portable identifier |
+| `name` | `mach.base.intern.StrId` | the table key, the project id the dependency declares |
 | `git` | `mach.base.intern.StrId` | the `git` clone URL, or STR_NIL for a path dependency |
 | `path` | `mach.base.intern.StrId` | the `path` directory, or STR_NIL for a git dependency |
 | `ref` | `mach.base.intern.StrId` | the `ref` key, required with `git` and rejected with `path`; one of `branch/<name>`, `tag/<name>`, `commit/<40 or 64 lowercase hex digits>`. STR_NIL for a path dependency a git dependency names exactly one of `ref` (an exact or branch selector) and `version` (a release range); STR_NIL marks the one it does not |
@@ -627,7 +627,7 @@ that caused it
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `id` | `mach.base.intern.StrId` | the required `[project].id`, a portable identifier |
+| `id` | `mach.base.intern.StrId` | the required `[project].id`, a project id |
 | `version` | `mach.base.intern.StrId` | the required `[project].version`, carried verbatim |
 | `src` | `mach.base.intern.StrId` | the required `[project].src`, a project-relative path |
 | `work_tmpl` | `mach.base.intern.StrId` | the required `[project].work`, an unexpanded path template for the work directory |

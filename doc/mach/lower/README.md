@@ -19,7 +19,7 @@ The directory's root module is [`mach.lower`](../lower.md).
 | [`context`](context.md) | the state of one lowering, and the questions every lowering walk asks through it |
 | [`decl`](decl.md) | the lowering of declarations: functions, instances, class copies and globals |
 | [`expr`](expr.md) | the lowering of expressions into mirl values, places and branches |
-| [`intrinsic`](intrinsic.md) | an `#[intrinsic]` declaration of the selected target held to the row its call becomes |
+| [`intrinsic`](intrinsic.md) | an `#[intrinsic]` declaration of the selected target held to the row its calls become |
 | [`irt`](irt.md) | the mirl types lowering builds: interned in the module's type table, laid out by the target's data layout and never by mach |
 | [`linkage`](linkage.md) | what a build declares about linkage, owned by the build's project and read by the lowering that names declarations and the linker that binds imports: each declaration's export name and library, the name each declaration links under once the lowering has named it, and the library each imported symbol is pinned to |
 | [`mangle`](mangle.md) | linkage names: the symbols of declarations, tests and generic, value and pack instances |

@@ -34,8 +34,10 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 
 | On `Operation` | |
 | :--- | :--- |
-| [`init`](#init) | open an operation on the project at `root`, released with `dnit` |
-| [`dnit`](#dnit) | |
+| [`init`](#init) | open an operation on the project at `root`, which need not exist yet, released with `dnit` |
+| [`dnit`](#dnit) | release the operation; err names the releases table's scratch it could not remove, once the rest is released |
+| [`ended`](#ended) | `outcome` of the work an operation held, then the operation released: a failure to release it is the outcome when the work succeeded, and is reported beside it otherwise |
+| [`releases`](#releases) | the releases table of the operation, opened by its first resolution as `walk` reads: offline or not, and announcing each url it reads from the network unless quiet |
 | [`realize`](#realize) | walk and realize the closure into `reqs`, the root's manifest read from `candidate` when it is not nil and otherwise from the project; `verify_only` realizes nothing and refuses a directory under dep/ outside the closure, where a realizing walk notes and retains it |
 | [`acquire`](#acquire) | acquire a git dependency's slot through the source and report what changed; `accept` is add taking an existing checkout, and `pinned_only` a range with no selector, which only a pin or an existing checkout realizes |
 | [`preflight`](#preflight) | a fixed git dependency's manifest, and the pins it commits for its ranges, are read at the revision its selector picks, never from whatever its checkout holds |
@@ -65,17 +67,22 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 
 ```mach
 pub rec Operation {
-    s:         *mach.session.Session;
-    a:         *std.allocator.Allocator;
-    root:      str;
-    checkouts: mach.package.source.Checkouts;
-    pins:      mach.package.pin.Pin;
-    rep:       *mach.package.report.Report;
+    s:             *mach.session.Session;
+    a:             *std.allocator.Allocator;
+    root:          str;
+    checkouts:     mach.package.source.Checkouts;
+    pins:          mach.package.pin.Pin;
+    rep:           *mach.package.report.Report;
+    releases:      mach.package.source.Releases;
+    releases_open: bool;
 }
 ```
 
 one operation on a project's dependencies: the session and storage it works in, the
-project root, the tables of the source and pin members, and where it reports
+project root, the tables of the source and pin members, and where it reports. `releases`
+is the one table every resolution of the operation reads a url's releases from, so a url is
+listed and its manifests fetched once however many times the operation resolves; it is
+opened by the first resolution, and `releases_open` says whether it has been
 
 ### init
 
@@ -83,13 +90,35 @@ project root, the tables of the source and pin members, and where it reports
 pub fun init(s: *mach.session.Session, a: *std.allocator.Allocator, root: str, rep: *mach.package.report.Report) res[Operation, mach.base.fail.Fail]
 ```
 
-open an operation on the project at `root`, released with `dnit`
+open an operation on the project at `root`, which need not exist yet, released with `dnit`
 
 ### dnit
 
 ```mach
-pub fun dnit(op: *Operation)
+pub fun dnit(op: *Operation) err[mach.base.fail.Fail]
 ```
+
+release the operation; err names the releases table's scratch it could not remove, once the
+rest is released
+
+### ended
+
+```mach
+pub fun ended(op: *Operation, outcome: err[mach.base.fail.Fail]) err[mach.base.fail.Fail]
+```
+
+`outcome` of the work an operation held, then the operation released: a failure to release
+it is the outcome when the work succeeded, and is reported beside it otherwise
+
+### releases
+
+```mach
+pub fun releases(op: *Operation, walk: *Walk) res[*mach.package.source.Releases, mach.base.fail.Fail]
+```
+
+the releases table of the operation, opened by its first resolution as `walk` reads: offline
+or not, and announcing each url it reads from the network unless quiet. every later
+resolution of the operation reads the same table
 
 ### realize
 

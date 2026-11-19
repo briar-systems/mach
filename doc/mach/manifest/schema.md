@@ -56,6 +56,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`value_text`](#value_text) | a scalar value as a refusal quotes it; a refused allocation is the failure |
 | [`is_valid_id`](#is_valid_id) | whether `s` is a portable identifier: non-empty, only ASCII letters, digits, '_' and '-' |
 | [`is_project_id`](#is_project_id) | whether `s` can head a `use` path, which is the rule for a project id: an identifier as the grammar spells one, a letter or '_' and then letters, digits and '_' |
+| [`dep_name_refused`](#dep_name_refused) | the refusal of a dependency name that is no project id: a dependency is named by the project id it declares, which a `use` path spells |
 | [`is_project_path`](#is_project_path) | whether `value` is a canonical strict descendant of the project root: non-empty, '/'-separated, no '\\', not absolute, no drive letter, no empty component, no '.' or '..' component |
 | [`check_path`](#check_path) | refuse a path that `is_project_path` does not admit, naming it as `field` and pointing at `sp`, the value as written |
 
@@ -395,8 +396,8 @@ pub fun is_valid_id(s: str) bool
 ```
 
 whether `s` is a portable identifier: non-empty, only ASCII letters, digits,
-'_' and '-'. the rule for target, artifact, profile, dependency, link and step
-names. a project id keeps the narrower `is_project_id`
+'_' and '-'. the rule for target, artifact, profile, link and step names. a
+project id, and so a dependency's name, keeps the narrower `is_project_id`
 
 | Parameter | |
 | :--- | :--- |
@@ -416,6 +417,15 @@ grammar spells one, a letter or '_' and then letters, digits and '_'
 | :--- | :--- |
 | `s` | the candidate |
 | **returns** | true when `s` is one |
+
+### dep_name_refused
+
+```mach
+pub fun dep_name_refused(alloc: *std.allocator.Allocator, name: str) mach.base.fail.Fail
+```
+
+the refusal of a dependency name that is no project id: a dependency is named by the project
+id it declares, which a `use` path spells
 
 ### is_project_path
 

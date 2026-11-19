@@ -27,7 +27,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.manifest.edit`](../m
 | [`update`](#update) | `mach dep update`: move one root-declared or transitive identity, or every one under `all` |
 | [`update_apply`](#update_apply) | update: the fixed git selectors move first (a ref is fetched and checked out), so their manifests are the closure's when the version ranges resolve; then every chosen release is realized and the closure is pulled, which syncs every path copy once and reports it |
 | [`notes`](#notes) | a resolution's notes, as a command shows them unless --quiet |
-| [`release_range`](#release_range) | the caret range of the release resolution picks for the running compiler for the git dependency `spec` declares, added to the manifest `text` of the project at `root`, which need not exist yet |
+| [`release_range`](#release_range) | the caret range of the release resolution picks for the running compiler for the git dependency `spec` declares, added to the manifest `text` of the operation's project, which need not exist yet |
 | [`change`](#change) | add or remove the [dep] table `spec` describes and realize the closure it leaves |
 
 ---
@@ -89,24 +89,20 @@ project's dependencies; a root that records them already is left as it is
 ### update
 
 ```mach
-pub fun update(s: *mach.session.Session, a: *std.allocator.Allocator, root: str, all: bool, name: str, quiet: bool, lowest: bool, offline: bool,
-    rep: *mach.package.report.Report) err[mach.base.fail.Fail]
+pub fun update(op: *mach.package.closure.Operation, all: bool, name: str, quiet: bool, lowest: bool, offline: bool) err[mach.base.fail.Fail]
 ```
 
 `mach dep update`: move one root-declared or transitive identity, or every one under `all`
 
 | Parameter | |
 | :--- | :--- |
-| `s` | the session; a failure may borrow from it, so the caller shows it before ending it |
-| `a` | the storage the operation works in |
-| `root` | the project root directory |
+| `op` | the operation, on the project root; a failure may borrow from its session, so the caller shows it before ending either |
 | `all` | move every identity |
 | `name` | the identity to move when not `all` |
 | `quiet` | report no progress lines |
 | `lowest` | resolve each range to its lowest admitted release |
 | `offline` | fetch nothing |
-| `rep` | receives progress, notes, and the effects a failure left |
-| **returns** | err naming the failure |
+| **returns** | err naming the failure, whose effects the operation's report holds |
 
 ### update_apply
 
@@ -132,40 +128,35 @@ a resolution's notes, as a command shows them unless --quiet
 ### release_range
 
 ```mach
-pub fun release_range(s: *mach.session.Session, a: *std.allocator.Allocator, root: str, text: str, spec: *mach.manifest.edit.DepTableSpec,
-    quiet: bool, rep: *mach.package.report.Report) res[str, mach.base.fail.Fail]
+pub fun release_range(op: *mach.package.closure.Operation, text: str, spec: *mach.manifest.edit.DepTableSpec, quiet: bool) res[str, mach.base.fail.Fail]
 ```
 
 the caret range of the release resolution picks for the running compiler for the git
-dependency `spec` declares, added to the manifest `text` of the project at `root`, which
+dependency `spec` declares, added to the manifest `text` of the operation's project, which
 need not exist yet. nothing is written or checked out, as `mach init` resolves its
-dependencies before it writes the project
+dependencies before it writes the project, and the releases read stay in the operation for
+the update that checks the dependency out
 
 | Parameter | |
 | :--- | :--- |
-| `s` | the session; a failure may borrow from it, so the caller shows it before ending it |
-| `a` | the storage the operation works in |
-| `root` | the project root directory |
+| `op` | the operation, on the project root; a failure may borrow from its session, so the caller shows it before ending either |
 | `text` | the project's manifest, as it will be written |
-| `spec` | the dependency, a git source with no selector |
+| `spec` | the dependency, a git source with no ref, and the range to choose in or none for any |
 | `quiet` | report no progress line |
-| `rep` | receives progress and notes |
 | **returns** | the range, `^X.Y.Z`; err naming the failure |
 
 ### change
 
 ```mach
-pub fun change(s: *mach.session.Session, a: *std.allocator.Allocator, root: str, spec: *mach.manifest.edit.DepTableSpec, name: str, adding: bool,
-    purge: bool, quiet: bool, realize: bool, offline: bool, rep: *mach.package.report.Report) err[mach.base.fail.Fail]
+pub fun change(op: *mach.package.closure.Operation, spec: *mach.manifest.edit.DepTableSpec, name: str, adding: bool,
+    purge: bool, quiet: bool, realize: bool, offline: bool) err[mach.base.fail.Fail]
 ```
 
 add or remove the [dep] table `spec` describes and realize the closure it leaves
 
 | Parameter | |
 | :--- | :--- |
-| `s` | the session; a failure may borrow from it, so the caller shows it before ending it |
-| `a` | the storage the operation works in |
-| `root` | the project root directory |
+| `op` | the operation, on the project root; a failure may borrow from its session, so the caller shows it before ending either |
 | `spec` | the table to add, or the name to remove |
 | `name` | the dependency identity |
 | `adding` | add the table; false removes it |
@@ -173,6 +164,5 @@ add or remove the [dep] table `spec` describes and realize the closure it leaves
 | `quiet` | report no progress lines |
 | `realize` | realize the closure; false only writes the table |
 | `offline` | fetch nothing |
-| `rep` | receives progress, notes, and the effects a failure left |
-| **returns** | err naming the failure |
+| **returns** | err naming the failure, whose effects the operation's report holds |
 

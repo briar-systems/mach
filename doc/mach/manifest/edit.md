@@ -58,7 +58,7 @@ a `[dep.<name>]` table to append to a manifest's text
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `name` | `str` | the dependency name; must satisfy `is_valid_id` |
+| `name` | `str` | the dependency name, a project id |
 | `source` | `DepSource` | which key `value` is written under |
 | `value` | `str` | the git URL or the path; escaped as a TOML basic string |
 | `ref` | `str` | the `ref` value; written only for a git source and only when non-empty |
@@ -79,7 +79,7 @@ line (two when the text lacks a trailing newline)
 | `alloc` | owns the returned text |
 | `source_text` | the current `mach.toml` |
 | `spec` | the table to add |
-| **returns** | the new text; err when the name is not an identifier, the source is not git or path, the text is not valid TOML, the dependency is already declared in any form, or the result does not reparse with the table present |
+| **returns** | the new text; err when the name is not a project id, the source is not git or path, the text is not valid TOML, the dependency is already declared in any form, or the result does not reparse with the table present |
 
 ## Functions
 
