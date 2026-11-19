@@ -8,8 +8,9 @@ use crypto.hash.sha256;
 use std.allocator.heap;
 use collections_vector: std.collections.vector;
 use std.collections.vector.Vector;
-use fs:       std.filesystem;
-use io_error: std.io.error;
+use fs:        std.filesystem;
+use io_error:  std.io.error;
+use system_os: std.system.os;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -22,6 +23,8 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_is_empty;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
 
 use A: std.allocator;
 
@@ -47,6 +50,7 @@ use mach.compile.passes;
 use mach.compile.project;
 use mach.compile.request;
 use mach.host.output;
+use mach.host.output.remove;
 use mach.lower.testrunner;
 use manifest_model: mach.manifest.model;
 use report_phase:   mach.report.phase;
@@ -154,10 +158,12 @@ pub fun execute(bp: *build_plan.BuildPlan, backing: *A.Allocator, spans: *heap.P
         if (sel res_blocked_by.ok.some) {
             val err_record_blocked_unit: err[fail.Fail] = record_blocked_unit(?bo, sink, oa, ?failed, unit, res_blocked_by.ok.some);
             if (sel err_record_blocked_unit.err) { ret res[outcome.BuildOutcome, fail.Fail].err{err_record_blocked_unit.err}; }
+            withdraw(oa, bp.request.project_root, unit, ?bo, sink);
             i = i + 1;
             cnt;
         }
 
+        var unit_failed:      bool                                 = false;
         val res_execute_unit: res[outcome.BuildOutcome, fail.Fail] = execute_unit(bp, i, backing, spans, oa, sink);
         if (sel res_execute_unit.err) {
             var f: fail.Fail = res_execute_unit.err;
@@ -165,6 +171,7 @@ pub fun execute(bp: *build_plan.BuildPlan, backing: *A.Allocator, spans: *heap.P
             outcome.fold_fail(?bo, ?f);
             val res_failed_pushed: res[usize, A.Error] = collections_vector.push[str](?failed, unit.label);
             if (sel res_failed_pushed.err) { ret res[outcome.BuildOutcome, fail.Fail].err{fail.refused(res_failed_pushed.err)}; }
+            unit_failed = true;
         }
         if (sel res_execute_unit.ok) {
             var ubo:       outcome.BuildOutcome = res_execute_unit.ok;
@@ -175,11 +182,13 @@ pub fun execute(bp: *build_plan.BuildPlan, backing: *A.Allocator, spans: *heap.P
             if (ubo.severity != outcome.BUILD_OK) {
                 val res_failed_pushed: res[usize, A.Error] = collections_vector.push[str](?failed, unit.label);
                 if (sel res_failed_pushed.err) { ret res[outcome.BuildOutcome, fail.Fail].err{fail.refused(res_failed_pushed.err)}; }
+                unit_failed = true;
             }
             val err_merge: err[A.Error] = outcome.merge(?bo, ?ubo);
             if (sel err_merge.err) { ret res[outcome.BuildOutcome, fail.Fail].err{fail.message("failed to merge build outcome")}; }
             ubo_moved = true;
         }
+        if (unit_failed) { withdraw(oa, bp.request.project_root, unit, ?bo, sink); }
         i = i + 1;
     }
     handed = true;
@@ -308,6 +317,59 @@ fun execute_unit(bp: *build_plan.BuildPlan, unit_index: usize, backing: *A.Alloc
         outcome.fold_fail(?bo, ?f);
     }
     ret res[outcome.BuildOutcome, fail.Fail].ok{bo};
+}
+
+# a cell that failed or was not built leaves no product a reader could take for its own: the
+# file at its output path, whether this build wrote it or an earlier one did, and the trees of
+# the views `--emit ir` and `--emit asm` write are removed. its objects stay, as each is the
+# object cache's, keyed by everything that made it. a removal that fails is a failure of the
+# build beside the cell's own
+fun withdraw(oa: *A.Allocator, root: str, unit: *build_plan.BuildUnit, bo: *outcome.BuildOutcome, sink: *readout.Sink) {
+    # a test build's dispatcher sits in the work directory's test tree, which is its runner's
+    if (unit.goal != request.GOAL_ARTIFACT && unit.goal != request.GOAL_OBJECTS) { ret; }
+    var paths: [3]str;
+    paths[0] = unit.ir_dir;
+    paths[1] = unit.asm_dir;
+    paths[2] = "";
+    # an object product's output path is its obj directory, which is the cache
+    if (!str_equals(unit.out_path, unit.obj_dir)) { paths[2] = unit.out_path; }
+    var root_fd: usize = system_os.INVALID_HANDLE;
+    var k:       usize = 0;
+    for (k < 3) {
+        val path: str = paths[k];
+        k = k + 1;
+        val rel: str = beneath(root, path);
+        if (rel == nil) { cnt; }
+        if (root_fd == system_os.INVALID_HANDLE) {
+            val opened: i64 = remove.open_path(root, ?root_fd);
+            if (opened < 0) {
+                var f: fail.Fail = fail.refusal(oa, diagnostic_kind.FS_OPEN, fail.Op{verb: "open", role: "the project root", path: root}, fail.Cause.native{opened});
+                readout.failure(sink, ?f, diagnostic.ORIGIN_BUILD);
+                outcome.fold_fail(bo, ?f);
+                ret;
+            }
+        }
+        val rr: remove.Removal = remove.relative(root_fd, rel);
+        if (rr.failed && !(rr.kind == io_error.NOT_FOUND && !rr.containment)) {
+            var f: fail.Fail = remove.refusal(oa, diagnostic_kind.FS_REMOVE, fail.Op{verb: "remove", role: "the output of a cell that failed", path: path}, rr);
+            readout.failure(sink, ?f, diagnostic.ORIGIN_BUILD);
+            outcome.fold_fail(bo, ?f);
+        }
+    }
+    # a directory opened read-only loses nothing to a refused close
+    if (root_fd != system_os.INVALID_HANDLE) { system_os.close(root_fd); }
+}
+
+# `path` as a path beneath the project `root`, nil when it is empty or not provably beneath it
+fun beneath(root: str, path: str) str {
+    if (str_is_empty(path)) { ret nil; }
+    val n:    usize = str_len(path);
+    var skip: usize = str_len(root);
+    if (skip > 0 && root[skip - 1] != '/')                                { skip = skip + 1; }
+    if (n > skip && str_starts_with(path, root) && path[skip - 1] == '/') { ret (?path[skip])::str; }
+    # a root given as `.` places relative paths beneath it as they are written
+    if ((str_equals(root, ".") || str_equals(root, "./")) && path[0] != '/') { ret path; }
+    ret nil;
 }
 
 # a session runs a plan it reads as planned: the plan located its closure, and

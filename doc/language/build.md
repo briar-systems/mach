@@ -116,7 +116,15 @@ a build never writes outside the tree it was asked to build.
 
 Every cell is attempted; a failure does not abandon the ones after it. Each cell's
 diagnostics are reported under its own heading as it happens, and every cell that
-succeeded leaves its artifact on disk at its own path — nothing is rolled back. The
+succeeded leaves its artifact on disk at its own path — nothing is rolled back.
+
+A cell that fails, or is not built because an artifact it needs failed, leaves
+nothing at its output path that could be taken for its product: the artifact
+there is removed, whether this build or an earlier one wrote it, and so are the
+`ir/` and `asm/` trees of its work directory when `--emit ir` or `--emit asm`
+asked for them, since a refusal can come after a module's text was written. Its
+objects in `obj/` stay, as the object cache keys each one by everything that
+made it. The
 exit code is `0` when all cells succeeded, and otherwise the code of the worst failure
 among them: `2` when any cell failed internally, else `3` when any failed for the
 environment, and `1` otherwise.

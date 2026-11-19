@@ -43,8 +43,8 @@ is `compiler.internal`.
 A message is a sentence about the subject: what is wrong with it, in words a
 reader of the program can act on. The key, the location and the origin say
 where the diagnostic came from, so a message never starts with the part of the
-compiler that raised it: `error[link.size_limit] range-extension thunks take
-the code past the maximum section size`, not `linker: range-extension ...`. A
+compiler that raised it: `error[project.empty] the entry point loaded no
+modules`, not `loader: the entry point ...`. A
 format, a target or a flag is named where it is the subject, as in `COFF
 object too small`.
 
@@ -71,8 +71,8 @@ The table is append-only:
   key stays an error and a note key stays a note.
 - **A new kind gets a new key**, added at the end of the table.
 
-A test in the compiler holds the table to these rules: it fails when a key
-disappears, moves or changes severity.
+These rules are stated in the table's own comment, and no test checks them: a
+change to the table is held to them by whoever makes it.
 
 A diagnostic is reported once. The same kind at the same place with the same
 message, notes, related places and fixes is one report, however many phases,

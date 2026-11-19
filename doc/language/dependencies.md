@@ -84,10 +84,12 @@ compiler runs `mach init` and `mach dep pull` in a scratch project and takes
 what resolution chose.
 
 **`--offline`.** `add`, `update` and `outdated` read candidates from each
-dependency's repository: one `git ls-remote --tags` per URL, announced first
-(`reading the releases of <url>`), and the first time a release's manifest is
-needed, every listed release's manifest at once, in two fetches into a scratch
-repository: the listed tags' commits and trees with no file contents, then each
+dependency's repository: one `git ls-remote --tags` per URL and command,
+announced first (`reading the releases of <url>`), and the first time a
+release's manifest is needed, every listed release's manifest at once, in two
+fetches into a scratch repository, which every later resolution in the same
+command reads again (`add` resolves the new range and then the closure,
+`init` resolves std's range and then checks it out): the listed tags' commits and trees with no file contents, then each
 release's `mach.toml` by its object id. The cost follows the number of files in
 a release, not their size, and a release that is no candidate costs nothing
 more on the network. When no release fits, releases refused for the same

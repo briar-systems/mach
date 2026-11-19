@@ -108,7 +108,8 @@ as `std.*` in source.
   for std: `ref = "branch/dev"` until the std major that accepts this compiler
   is released, and that major's version range from then on. A ref is written as
   it is. A range is resolved before anything is written, reading std's releases
-  from the network (`mach init` says so first), and when no release in it
+  from the network once (`mach init` says so first, and checking std out reads
+  the same listing), and when no release in it
   exists nothing is created and the error names the way on: `mach init
   --no-deps`, then `mach dep add <dir> std --git <url> --ref branch/<name>` to
   take std from a branch.
@@ -121,6 +122,10 @@ as `std.*` in source.
   holding `/out/`, the work directory every build writes under, is written
   where none exists. `dep/` is not ignored, since each checkout there is a
   submodule its pin records. Under `--no-git` no `.gitignore` is written.
+- **The files** are written whole or not at all. When a write fails, every file
+  and directory `mach init` made is removed again, and nothing that was there
+  before is touched. A file `--force` replaces is replaced after every new file
+  is written, so a failure among the new ones replaces nothing.
 - **A failure** after the files are written, in `git init` or in checking std
   out, leaves the project complete and says which step to rerun.
 

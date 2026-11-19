@@ -183,7 +183,8 @@ under the work directory when it is written from `{project.work}`.
 `dep/` along with every artifact output, for every cell `mach build --all` plans,
 dependency requirement cells included, so the build after it is a cold one that
 reuses nothing. It plans as that build does, so a manifest the build refuses is
-refused by `mach clean` too. A dependency never pulled was never built, so it
+refused by `mach clean` too. A build given `-w` or `-o` writes where only that
+command names, so `mach clean` does not reach what it wrote. A dependency never pulled was never built, so it
 adds nothing to remove and `mach clean` does not refuse it. A step output may not
 name a path inside `obj/<project.id>/`, `.cache/` or `.stage/` (see
 [build steps](#stepname--build-steps)).
@@ -459,12 +460,10 @@ target at its baseline instead. It confines the extension instructions to
 and picks one of those at run time, after detecting the host's features.
 
 A mnemonic that needs an extension the target does not select, outside such a
-function, is refused. The refusal names the line to add:
+function, is refused as one the block's selection does not admit:
 
 ```
-error[asm.extension] inline-asm instruction 'sha256rnds2' needs the `sha` extension, which
-this target does not select; add `extensions = ["sha"]` to the target, or mark the
-function `#[extension("sha")]` and call it only after detecting the extension at run time
+error[asm.syntax] an asm block of 'app.main.f' cannot be read (instruction not admitted by the selection)
 ```
 
 The selected set is part of the target's identity: two targets that differ only in
@@ -1277,6 +1276,8 @@ reused for a different kind: see [the registry](diagnostics.md#the-registry).
 | `vector.scalarize` | a vector operation falls back to scalar code on the target (see `simd`); portable code silences it | no |
 | `expect.unfulfilled` | an `#[expect]` names a key decided by source and no such warning is raised inside its declaration | no |
 | `secret.target_unenforceable` | an `#[constant_time]` function compiles for a target whose instruction set masc says cannot guarantee constant-time execution (wasm) | no |
+| `readout.clock_refused` | the clock refuses a read while the back end times a module, so a row of the build's stage times is incomplete | no |
+| `link.report` | a link that succeeds reports something about the image as a whole, one warning per line mink reports | no |
 
 A kind decided by source warns or not from the source text alone, whatever the
 target, goal or profile. Only such a key is reported when an `#[expect]`
@@ -2102,6 +2103,17 @@ segment of every module path the dependency exposes (`use <id>.x;`). The
 compiler checks all three agree: `dep/<id>/mach.toml` must declare
 `id = "<id>"`. A dependency whose id is the declaring project's own is refused
 where it is declared, since one head segment cannot name two projects.
+
+The key is held to the rule for a project id, since a `use` path spells it: a
+letter or `_`, then letters, digits and `_`. Any other key is refused, and so is
+the same name given to `mach dep add` or `mach dep update`:
+
+```
+error[manifest.invalid_name] mach.toml: dependency name 'my-lib' is not a project id. a project id must start with a letter or '_' and hold only letters, digits and '_', so that a `use` path can name it
+```
+
+`mach dep remove` takes any name a table can have, so it can remove a table
+the rule refuses.
 
 ```toml
 [dep.std]

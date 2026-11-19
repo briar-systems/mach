@@ -120,7 +120,7 @@ related places. Its `severity` is `"error"`, its `code` the
 failure's key, and its `notes` and `help` are empty.
 
 ```json
-{"schema":2,"record":"diagnostic","severity":"error","code":"link.entry_missing","message":"undefined entry symbol '_start'; ensure the target startup library is linked","origin":"link","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
+{"schema":2,"record":"diagnostic","severity":"error","code":"link.input_invalid","message":"the link does not define the entry symbol `_start`","origin":"link","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
 ```
 
 `primary` is the span in the file that caused the failure, or `null` when no
