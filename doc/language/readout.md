@@ -65,7 +65,13 @@ first step runs. mirl times its own stages when a readout is shown, and each mov
 | `layout` | masc laying out the object | masc |
 | `encode` | masc encoding the settled layout | masc |
 
-A test object's mirl and masc stages add to the same rows. When the clock
+A test object's mirl and masc stages add to the same rows.
+
+Each object is written to `obj/` as its step finishes, and the build holds no
+copy of it after: a link reads it back from its file. The `emit` row is the
+time of those writes, moved out of the `codegen` row (a test object's out of
+`test codegen`), and what the emit phase does after the steps, which is noting
+where the objects went and storing their digests. When the clock
 refuses a read, the stage it would have timed comes up short, and the build
 reports `readout.clock_refused` naming the module instead of showing a zero.
 
