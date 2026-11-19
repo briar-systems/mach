@@ -459,11 +459,11 @@ target at its baseline instead. It confines the extension instructions to
 [`#[extension(...)]`](decorators.md#extnames--an-outlier-function) functions
 and picks one of those at run time, after detecting the host's features.
 
-A mnemonic that needs an extension the target does not select, outside such a
-function, is refused as one the block's selection does not admit:
+A mnemonic or a register that needs an extension the target does not select,
+outside such a function, is refused, naming the instruction and what it needs:
 
 ```
-error[asm.syntax] an asm block of 'app.main.f' cannot be read (instruction not admitted by the selection)
+error[asm.extension] an asm block of 'app.main.f' uses `vpaddd` with `ymm0`, which needs avx. select what it needs in the target's `isa` or `ext`, or in the function's `#[extension]`
 ```
 
 The selected set is part of the target's identity: two targets that differ only in
@@ -475,8 +475,8 @@ Each packed row of a target's catalog declares the extension its instruction nee
 and the lowering reads those rows: a cell with a baseline row and a row gated on an
 extension lowers to the gated instruction when the selected set holds it (`i32x4 *
 i32x4` is `pmulld` under `sse41` on x86_64 and the `pmuludq` pair without). A cell
-whose only packed row is gated scalarizes without the extension, and the warning at
-each such site names it (see `simd` below). SSE2 is the x86_64 baseline. A build never infers the build machine's features: what the binary
+whose only packed row is gated scalarizes without the extension, and a build with
+debug information warns at each such site (`vector.scalarize`, see `simd` below). SSE2 is the x86_64 baseline. A build never infers the build machine's features: what the binary
 assumes is what the manifest declares.
 
 ### Image stack size
@@ -1144,7 +1144,7 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 | `relax` | array of strings | **Optional.** The departures from exact semantics the build permits. The one there is, `"float-reassoc"`, is described under [Float reassociation](#float-reassociation). Absent, the build keeps exact semantics. |
 | `linker_relax` | bool | **Optional.** Whether the linker may relax the code, as RISC-V linker relaxation shortens a call or an address pair once the link has placed its target. The build hands it to mirl's `relax` build option on every target, and a target whose linker relaxes nothing takes it without effect. `false` keeps every instruction sequence at the length the compiler laid it out. Absent, it is `true`. It has no command-line form. A non-boolean is a manifest error. |
 | `debug` | bool    | Emit debug info for this profile: DWARF in ELF, Mach-O and COFF objects alike, and the SPIR-V debug instructions its `env` holds on a `spirv` target (see [Finished-module targets](#finished-module-targets)). A PE image carries its DWARF in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
-| `simd`  | string  | SIMD scalarization lever. `"scalarize"` is the one setting a build accepts: mirl legalizes every vector operation, so a target with no packed instruction for an operator gets a defined unrolled scalar expansion. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. `"require"` is refused, since mirl reports no operation it scalarizes and a build cannot be held to packed forms. Any other string is a manifest error. |
+| `simd`  | string  | SIMD scalarization lever. `"scalarize"` is the one setting a build accepts: mirl legalizes every vector operation, so a target with no packed instruction for an operator gets a defined unrolled scalar expansion. It applies **per operation on every target**, not only to targets with no vector unit: neither x86-64's SSE2 baseline nor NEON has a 64-bit lane integer multiply or any integer lane division, so a capable target scalarizes too. A build with debug information warns at each operation whose lanes a vector unit holds but which no unit computes, so it runs one lane at a time (`vector.scalarize`). `"require"` is refused, since mirl reports a scalarized operation only at the source location it carries, which a build without debug information does not record, so such a build could not be held to packed forms. Any other string is a manifest error. |
 | `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile requirement and selection](#profile-requirement-and-selection). |
 | `allow` | array of strings | **Optional.** The warnings this profile silences, each entry a key or a family of keys from the [warning key table](#silencing-warnings), named once. An unknown key, an entry that covers only errors, a repeated entry or a non-string entry is a manifest error. Absent, nothing is silenced. |
 | `opt` | removed | Refused as a removed key: write `optimize = true` or `optimize = false`. |
@@ -1236,7 +1236,7 @@ Every diagnostic kind has a dotted key, named by the subject it concerns, and
 every diagnostic that has one prints it:
 
 ```
-warning[vector.scalarize] vector divide on 4 lanes of 32-bit integers in 'app.main.kernel' scalarizes on x86_64: no packed form for it at any extension
+warning[vector.scalarize] the vector divide over 4 lanes of 32-bit integers is split into scalar operations, because no vector unit of the target computes it
 ```
 
 `allow` names warning keys the build does not report. A silenced warning is
@@ -1273,7 +1273,7 @@ reused for a different kind: see [the registry](diagnostics.md#the-registry).
 | `doc.lint` | a doc comment's component list names no parameter, field, generic or `ret` of its declaration, leaves a component undescribed, or lists them out of declaration order | yes |
 | `float.inexact` | a float literal is not exact at its type and its digits are not the shortest spelling of the value stored | yes |
 | `target.skipped` | multi-target analysis skips a declared target this build does not support | no |
-| `vector.scalarize` | a vector operation falls back to scalar code on the target (see `simd`); portable code silences it | no |
+| `vector.scalarize` | a vector operation whose lanes a vector unit of the target holds runs one lane at a time, because no unit computes it, reported only by a build with debug information (see `simd`), and portable code silences it | no |
 | `expect.unfulfilled` | an `#[expect]` names a key decided by source and no such warning is raised inside its declaration | no |
 | `secret.target_unenforceable` | an `#[constant_time]` function compiles for a target whose instruction set masc says cannot guarantee constant-time execution (wasm) | no |
 | `readout.clock_refused` | the clock refuses a read while the back end times a module, so a row of the build's stage times is incomplete | no |

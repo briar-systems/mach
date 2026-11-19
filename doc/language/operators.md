@@ -627,25 +627,29 @@ where the target has one, else a **defined unrolled scalar expansion** with
 lane-identical results (see [policy.md](policy.md)). Neither choice changes the
 answer, so nothing about the surface depends on it.
 
-The cost does change, so the build says where it is paid. Each operation that
-falls back to the scalar expansion is one warning at its own site, never one per
-lane. The warning names the operation, its lanes and the target:
+The cost does change, so a build with debug information says where it is paid.
+An operation whose lanes a vector unit of the target holds, but which no unit
+the build selects computes, is taken one lane at a time, and each such
+operation is one warning at its own site, never one per lane. The warning names
+the operation, its lane count and its lane type:
 
 ```
-warning[vector.scalarize] vector divide on 4 lanes of 32-bit integers in 'app.main.kernel' scalarizes on x86_64: no packed form for it at any extension
+warning[vector.scalarize] the vector divide over 4 lanes of 32-bit integers is split into scalar operations, because no vector unit of the target computes it
+  @ src/main.mach:12:9
 ```
 
-Every packed row in a target's catalog declares the extension its instruction
-needs, and the warning reads those rows. When a row declared under an extension
-would pack the operation, the warning names that extension in place of "no
-packed form", for example "declaring `sse41` in the target's `ext` packs it", and
-declaring it in [`[target.<name>].extensions`](manifest.md#instruction-set-extensions)
-makes the warning go away. Code that is portable on purpose silences the key
-with `allow = ["vector.scalarize"]` in its profile, a declaration that
-scalarizes on purpose acknowledges it with
-[`#[expect("vector.scalarize")]`](decorators.md#expectkey--acknowledge-a-warning), and
-[`simd = "require"`](manifest.md#profilename) turns the same sites into errors
-with the same text.
+The warning says that what the source wrote as one vector operation is not one
+on this target, where another type or another target may make it one. A lane type no
+unit holds is no such case: on a target with no vector unit at all, as riscv64
+without `v`, every vector operation is scalar code and none of them warns. The
+site comes from the debug information, so a build without it (`debug = false`
+in the profile, or `--no-debug`) reports none. Code that is portable on purpose
+silences the key with `allow = ["vector.scalarize"]` in its profile, and a
+declaration that scalarizes on purpose acknowledges it with
+[`#[expect("vector.scalarize")]`](decorators.md#expectkey--acknowledge-a-warning).
+[`simd = "require"`](manifest.md#profilename), which would make the same sites
+errors, is refused, because a build without debug information could not be held
+to it.
 
 Integer `*` is where this is most visible today:
 
@@ -654,7 +658,7 @@ Integer `*` is where this is most visible today:
 | `i8x16 * i8x16` | scalar expansion | packed `mul .16b` | scalar expansion |
 | `i16x8 * i16x8` | packed `pmullw` | packed `mul .8h` | scalar expansion |
 | `i32x4 * i32x4` | packed `pmuludq` pair (`pmulld` under `sse41`) | packed `mul .4s` | scalar expansion |
-| `i64x2 * i64x2` | packed `pmuludq` triple (`vpmullq` under `avx512dq` and `avx512vl`) | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
+| `i64x2 * i64x2` | scalar expansion | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
 
 Shifts realize by the count's form: a count that is the same value in every
 lane shifts every lane by that one scalar, and any other count shifts each lane

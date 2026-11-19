@@ -227,8 +227,9 @@ piece (`i16x8 → i32x8` is `pmullw`/`pmulhw` with `punpcklwd`/`punpckhwd` on
 x86-64, and `smull` with `smull2` on aarch64), and a narrowing one joins the
 narrowed lanes of its pieces. A reduction written over the lanes reads each lane
 from its piece. An operation with no packed form for the lane shape (a 64-bit
-lane multiply on x86-64) runs lane by lane on each piece, and under
-`simd = "scalarize"` it warns at its site while `simd = "require"` refuses it.
+lane multiply on x86-64) runs lane by lane on each piece, and a build with debug
+information warns at its site (`vector.scalarize`, see
+[operators.md](operators.md#legality-is-target-independent-realization-is-not)).
 
 The piece width is the target's **declared** vector width, not its name, so a
 target that gains wider vector registers gets **better code**, not new

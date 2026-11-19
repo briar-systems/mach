@@ -97,8 +97,8 @@ the human rendering shows after `@`.
 | `load` | loading and parsing the module closure, and `$if` gates decided while loading |
 | `resolve` | name resolution, `use`, exports and visibility |
 | `sema` | type checking, including a declaration's unfulfilled `#[expect]` |
-| `lower` | lowering to IR and the optimizer, such as `vector.scalarize` |
-| `codegen` | code generation and the constant-time validation of emitted code |
+| `lower` | lowering to IR and the optimizer |
+| `codegen` | code generation and the constant-time validation of emitted code, and `vector.scalarize` |
 | `link` | linking an executable or library |
 | `test` | the test runner of `mach test`: running the collected tests |
 

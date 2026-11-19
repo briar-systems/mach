@@ -281,7 +281,7 @@ test float__rounding {
 
 A warning is matched to the declaration whose source contains its site. That
 holds for a warning raised late in the build, such as `vector.scalarize` from
-lowering, and for a generic instance, whose warnings belong to the generic's
+the back end, and for a generic instance, whose warnings belong to the generic's
 declaration. A warning replayed from the build cache is matched exactly as a
 fresh one, and a warning `#[expect]` covers counts as acknowledged even when a
 profile's `allow` silences its key too.
@@ -290,8 +290,9 @@ An acknowledgement cannot rot silently. When a key the source alone decides
 (`import.unused`, `decl.deprecated`, `doc.lint`, `float.inexact`) names no
 warning raised inside the declaration, that is itself a warning,
 `expect.unfulfilled`. A key whose warning depends on the target or on what the
-build compiles, such as `vector.scalarize`, may be quiet in a given build, so
-its expectation is not reported. A build with errors judges no expectation.
+build compiles, such as `vector.scalarize`, which a build without debug
+information never raises, may be quiet in a given build, so its expectation is
+not reported. A build with errors judges no expectation.
 
 It applies to `fun`, `rec`, `uni`, `tag`, `val`, `var` and `test` declarations
 and may appear once, naming every key it acknowledges. There is no

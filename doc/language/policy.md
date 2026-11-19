@@ -14,11 +14,13 @@ Things that need to feel like the language:
 - **SIMD operators on primitive vector types.** Lane-wise arithmetic,
   bitwise, comparison-to-mask, lane indexing, and full-arity vector
   literals over the primitive vector types (the honest per-operator
-  table is in [operators.md](operators.md)). On a target with the hardware
-  (SSE2 on x86_64, NEON on aarch64) the compiler emits one instruction per
-  operator; on a target without it the compiler emits a **defined unrolled
-  scalar expansion** of the same operator — scalarize operators, never
-  algorithms — and reports the scalarization at build time. What to do on
+  table is in [operators.md](operators.md)). Where the target's vector unit
+  (SSE2 on x86_64, NEON on aarch64) computes an operator, the compiler emits
+  its packed form, and anywhere else a **defined unrolled scalar expansion** of
+  the same operator — scalarize operators, never algorithms. Where the vector
+  unit holds the lanes but computes no packed form of the operator, a build
+  with debug information reports the scalarization at its site
+  (`vector.scalarize`). What to do on
   an incapable target is the `simd` profile lever (see
   [manifest.md](manifest.md)), not a compiler default.
 - **`asm` parsing, encoding, and operand allocation** for each supported
