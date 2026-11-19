@@ -274,6 +274,11 @@ nothing is checked out at 'dep/std'; run `mach dep pull <root>``). A build
 also refuses a cycle in the manifests it reads, and a compiler outside any
 manifest's `[project].mach` (see [Compiler range](manifest.md#compiler-range)).
 
+A build shows the warnings of the project being built, never a dependency's
+unless `--dep-warnings` asks, and then each dependency's under its own `allow`
+and `#[expect]`. A dependency's errors always fail the build. See
+[Whose warnings a build shows](manifest.md#whose-warnings-a-build-shows).
+
 ## What `mach dep verify` checks
 
 `mach dep verify` locates the closure as a build does and checks, offline,

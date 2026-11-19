@@ -91,7 +91,9 @@ requirement of the dependency stay its own.
 
 A dependency declares its `[profile.*]` tables like any project, since it also
 builds on its own, but they are never read to build the consumer, which resolves
-its own profile and builds everything with it. A dependency's
+its own profile and builds everything with it. The one exception is a profile's
+`allow`, which `--dep-warnings` reads for the dependency's own warnings (see
+[Whose warnings a build shows](#whose-warnings-a-build-shows)). A dependency's
 `[target.*]` tables are read for exactly one purpose: the targets its travelling
 requirements name, `env` included, since those artifacts are built for the
 targets the dependency declares for them. No other `[target.*]` entry is read.
@@ -1226,8 +1228,9 @@ reductions and does nothing else. A relaxation never rides on `optimize`.
 
 Every lever of a profile is always the **consumer's**.
 As [Dependency manifests](#dependency-manifests) sets out, a dependency's `[profile.*]`
-is parsed by the same schema and never read to build the consumer, so a library's
-values are inert — the effective levers come from the consumer's resolved profile.
+is parsed by the same schema and never read to build the consumer, its `allow`
+aside, which governs only its own warnings and only under `--dep-warnings`. A library's
+levers are inert — the effective levers come from the consumer's resolved profile.
 Libraries set nothing SIMD-specific and inherit the consumer's choice; there is no
 ecosystem fork and no dual API.
 
@@ -1297,8 +1300,39 @@ unknown:
 error[allow.error_key] mach.toml: [profile.release].allow entry "secret.branch" names an error, and only a warning can be silenced
 ```
 
-Like the SIMD levers, `allow` is the consumer's: a dependency's profiles are
-never read to build it, so a library cannot silence the consumer's warnings.
+### Whose warnings a build shows
+
+A build shows the warnings of the project being built and none of its
+dependencies'. A warning belongs to the package that owns the file it stands
+in, so a warning a dependency's source raises is the dependency's, whichever
+stage raises it: name resolution, type checking, the back end
+(`vector.scalarize`) or anything else that points into its files. A warning that
+stands in no file, as `link.report` or `target.skipped`, is the build's own and
+is shown. A hidden warning is not counted in the summary line, which counts
+what was printed. A check whose only product is warnings does not run on a
+module whose warnings the build hides: the unused-import and doc-comment lints,
+the deprecated-use check, the shortest-spelling check of `float.inexact` and
+the gathering of `#[expect]` acknowledgements. A warning that falls out of work
+the build does anyway, as `vector.scalarize` from code generation, is raised and
+then hidden. Errors are never hidden: a dependency's error is the build's
+error, and under `simd = "require"` a scalar expansion in a dependency refuses
+the build, naming the dependency.
+
+`--dep-warnings`, on `mach build`, `mach check` and `mach test`, shows each
+dependency's warnings as well, each governed by the dependency's own
+statements, exactly as when it is the project being built: its `#[expect]`
+decorators, and the `allow` of the profile its manifest selects with no
+profile named, its `default = true` one or its only one. A dependency whose
+manifest selects no profile that way is refused under the option, since there
+is no `allow` to read. The root's `allow` governs the root's warnings only, and
+a dependency's governs that dependency's only, so neither silences the other's.
+Without the option no dependency's profile is read, and a library cannot
+silence the consumer's warnings. The option makes those checks run on every
+dependency module, and a module's cached record holds its warnings, so the
+first build that switches the option either way compiles the dependencies'
+modules again. Measured on a hello world over std, the checks cost about 4% of
+a `mach check` and under 1% of a build, and about 3% of a `mach check` of the
+compiler with its dependencies.
 
 ### Float reassociation
 

@@ -284,7 +284,9 @@ holds for a warning raised late in the build, such as `vector.scalarize` from
 the back end, and for a generic instance, whose warnings belong to the generic's
 declaration. A warning replayed from the build cache is matched exactly as a
 fresh one, and a warning `#[expect]` covers counts as acknowledged even when a
-profile's `allow` silences its key too.
+profile's `allow` silences its key too. A dependency's expectations govern its
+own warnings, which a build shows only under `--dep-warnings` (see
+[Whose warnings a build shows](manifest.md#whose-warnings-a-build-shows)).
 
 An acknowledgement cannot rot silently. When a key the source alone decides
 (`import.unused`, `decl.deprecated`, `doc.lint`, `float.inexact`) names no

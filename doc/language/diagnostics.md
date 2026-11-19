@@ -60,6 +60,11 @@ print has a key. The same rows are what a profile's
 [`#[expect]`](decorators.md#expectkey--acknowledge-a-warning) select by, so a
 key there is exactly the kind the diagnostic carries.
 
+A build prints the warnings of the project being built, and a dependency's only
+under `--dep-warnings`, where that dependency's own `allow` and `#[expect]`
+govern them. Errors and notes print whoever owns them. See
+[Whose warnings a build shows](manifest.md#whose-warnings-a-build-shows).
+
 The table is append-only:
 
 - **A key is never reused.** Once a key has named a kind, it names that kind and

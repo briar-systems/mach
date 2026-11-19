@@ -12,11 +12,13 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
-use A:                  std.allocator;
+use A: std.allocator;
+use std.collections.map;
 use collections_vector: std.collections.vector;
 use std.memory;
 
 use mach.base.diagnostic;
+use diagnostic_kind: mach.base.diagnostic.kind;
 use mach.base.fail;
 use base_fingerprint: mach.base.fingerprint;
 use mach.base.float;
@@ -43,14 +45,15 @@ use mach.type.deprecation;
 use mach.compile.codec;
 use mach.compile.context;
 use mach.compile.project;
-use comptime_scope: mach.front.comptime.scope;
-use comptime_value: mach.front.comptime.value;
-use sema_fields:    mach.front.sema.fields;
-use sema_instance:  mach.front.sema.instance;
-use sema_module:    mach.front.sema.module;
-use sema_product:   mach.front.sema.product;
-use sema_surface:   mach.front.sema.surface;
-use report_phase:   mach.report.phase;
+use comptime_scope:  mach.front.comptime.scope;
+use comptime_value:  mach.front.comptime.value;
+use sema_fields:     mach.front.sema.fields;
+use sema_instance:   mach.front.sema.instance;
+use sema_module:     mach.front.sema.module;
+use sema_product:    mach.front.sema.product;
+use sema_surface:    mach.front.sema.surface;
+use manifest_select: mach.manifest.select;
+use report_phase:    mach.report.phase;
 use mach.type;
 use type_field: mach.type.field;
 use type_kind:  mach.type.kind;
@@ -1244,8 +1247,8 @@ pub fun begin_query_phase(p: *project.Project) res[query.Operation, fail.Fail] {
 }
 
 # the session's store is rebuilt from the project's and the query presentation's,
-# dropping the warnings a declaration's `#[expect]` acknowledges and the ones the
-# profile's `allow` silences, then reporting each judged expectation nothing
+# dropping the warnings a declaration's `#[expect]` acknowledges and the ones their
+# owner's governance hides or silences, then reporting each judged expectation nothing
 # fulfilled. a warning replayed from the cache passes through here as a fresh one does
 pub fun refresh_diagnostics(p: *project.Project) err[fail.Fail] {
     var staged: diagnostic.DiagnosticStore = diagnostic.store_init(p.s.alloc);
@@ -1253,7 +1256,8 @@ pub fun refresh_diagnostics(p: *project.Project) err[fail.Fail] {
     fin {
         if (!handed) { diagnostic.store_dnit(?staged); }
     }
-    diagnostic.silence(?staged, p.req.allow);
+    val err_governed: err[fail.Fail] = govern(p, ?staged);
+    if (sel err_governed.err) { ret err_governed; }
     var expects:      collections_vector.Vector[diagnostic.Expectation] = collections_vector.init[diagnostic.Expectation](p.s.alloc);
     val err_gathered: err[fail.Fail]                                    = gather_expectations(p, ?expects);
     val err_indexed:  err[fail.Fail]                                    = diagnostic.expect(?staged, expects);
@@ -1276,6 +1280,64 @@ pub fun refresh_diagnostics(p: *project.Project) err[fail.Fail] {
     p.s.diags = staged;
     handed    = true;
     ret err[fail.Fail].ok{};
+}
+
+# who owns each warning and how the owner governs it. a warning belongs to the package that
+# owns the file it stands in: the project being built shows its own under the profile's
+# `allow`, and a warning standing in no package's file is its. whether a dependency's are shown
+# is the registry's `module_warned`, as every warning-only pass reads it, and a shown one is
+# governed by the `allow` of the profile it selects as a build of it would with no profile
+# named, so the root's `allow` never silences a dependency's warning nor the reverse. errors
+# and notes belong to the build whoever owns them
+fun govern(p: *project.Project, store: *diagnostic.DiagnosticStore) err[fail.Fail] {
+    diagnostic.govern(store, diagnostic.Governance{shown: true, silenced: p.req.allow});
+    var owners: map.Map[intern.StrId, u32] = map.init[intern.StrId, u32](p.s.alloc);
+    fin { map.dnit[intern.StrId, u32](?owners); }
+    var i: u32 = 0;
+    for (i < project.module_count(p)) {
+        val m:     *project.ModuleEntry = project.module_at(p, i);
+        val shown: bool                 = module.module_warned(?p.s.modules, module.id(i));
+        i = i + 1;
+        if (m.load.home.root || base_source.file_is_nil(m.file_id)) { cnt; }
+        var package:   intern.StrId = m.load.home.package;
+        val opt_owner: opt[*u32]    = map.get[intern.StrId, u32](?owners, ?package);
+        var owner:     u32          = 0;
+        if (sel opt_owner.some) { owner = @opt_owner.some; }
+        or {
+            val res_governance: res[diagnostic.Governance, fail.Fail] = dependency_governance(p, package, shown);
+            if (sel res_governance.err) { ret err[fail.Fail].err{res_governance.err}; }
+            val res_added: res[u32, fail.Fail] = diagnostic.owner_add(store, res_governance.ok);
+            if (sel res_added.err) { ret err[fail.Fail].err{res_added.err}; }
+            owner = res_added.ok;
+            val res_noted: res[bool, A.Error] = map.insert[intern.StrId, u32](?owners, package, owner);
+            if (sel res_noted.err) { ret err[fail.Fail].err{fail.refused(res_noted.err)}; }
+        }
+        val err_owned: err[fail.Fail] = diagnostic.own(store, m.file_id, owner);
+        if (sel err_owned.err) { ret err_owned; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# how the dependency `package` governs its warnings in this build: hidden unless `shown`, and
+# when shown under the `allow` of the profile its own manifest selects with no profile named. a
+# package the closure holds no manifest of silences nothing
+fun dependency_governance(p: *project.Project, package: intern.StrId, shown: bool) res[diagnostic.Governance, fail.Fail] {
+    var g: diagnostic.Governance = diagnostic.Governance{shown: shown, silenced: diagnostic_kind.set_make()};
+    if (!g.shown) { ret res[diagnostic.Governance, fail.Fail].ok{g}; }
+    var i: u32 = 0;
+    for (i < p.config.dep_count) {
+        val d: *project.DepEntry = ?p.config.deps[i];
+        i = i + 1;
+        if (d.project_id != package) { cnt; }
+        val res_profile: res[manifest_select.ResolvedProfile, fail.Fail] = manifest_select.resolve_profile(p.s.alloc, ?p.s.interner, ?d.manifest, "");
+        if (sel res_profile.err) {
+            ret res[diagnostic.Governance, fail.Fail].err{fail.formatted_user(p.s.alloc, fail.kind_of(res_profile.err),
+                "--dep-warnings reads the `allow` of dependency '{}', whose profile cannot be selected ({})", intern.text(?p.s.interner, d.alias), fail.describe(res_profile.err))};
+        }
+        g.silenced = res_profile.ok.allow;
+        ret res[diagnostic.Governance, fail.Fail].ok{g};
+    }
+    ret res[diagnostic.Governance, fail.Fail].ok{g};
 }
 
 # a refused module's file shows the module-scope `$error`s that fired in it, and the file of
@@ -1453,6 +1515,9 @@ fun gather_expectations(p: *project.Project, out: *collections_vector.Vector[dia
     for (i < project.module_count(p)) {
         val m: *project.ModuleEntry = project.module_at(p, i);
         i = i + 1;
+        # an expectation acknowledges warnings alone, so a module whose warnings the build hides
+        # gathers none
+        if (!module.module_warned(?p.s.modules, module.id(i - 1))) { cnt; }
         if (m.released) {
             val err_held: err[fail.Fail] = expectations_append(out, ?m.held_expects);
             if (sel err_held.err) { ret err_held; }

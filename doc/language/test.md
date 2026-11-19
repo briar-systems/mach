@@ -159,6 +159,7 @@ run are:
 --threads <n>            run up to n test processes at once (default: host CPUs)
 --filter <substr>        select only tests whose qualified name contains the substring
 --include-deps           also run tests declared in dependency modules
+--dep-warnings           also show dependencies' warnings, each under its own allow and #[expect]
 --list                   list the collected tests and exit
 --diagnostics <human|json>  write failures and the run's records to stderr as text or NDJSON
 --runner <cmd>           launch each test through a host-side command, in place of the target's runner

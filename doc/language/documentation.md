@@ -63,9 +63,10 @@ documented components are out of declaration order
 Tags have no return value, so a `ret:` component line on a tag is warned. A bare
 generic name without brackets (such as `T:` instead of `[T]:`) is also warned.
 
-The lint runs on the modules of the project being built, checked or
-documented, and never on a dependency's: a project is not shown warnings
-about source it does not own, as with the unused-import warning. Its
+Like every warning, the lint's warnings show for the project being built,
+checked or documented, and a dependency's only under `--dep-warnings` (see
+[Whose warnings a build shows](manifest.md#whose-warnings-a-build-shows)). The
+lint runs only on a module whose warnings the build shows. Its
 warnings come with name resolution, so a file whose names are not resolved
 in a run is not linted by it, except under `mach doc`, which lints every file
 it documents.
