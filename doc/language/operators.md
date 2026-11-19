@@ -647,9 +647,24 @@ in the profile, or `--no-debug`) reports none. Code that is portable on purpose
 silences the key with `allow = ["vector.scalarize"]` in its profile, and a
 declaration that scalarizes on purpose acknowledges it with
 [`#[expect("vector.scalarize")]`](decorators.md#expectkey--acknowledge-a-warning).
-[`simd = "require"`](manifest.md#profilename), which would make the same sites
-errors, is refused, because a build without debug information could not be held
-to it.
+
+[`simd = "require"`](manifest.md#profilename) makes every scalar expansion an
+error, `vector.scalarize_refused`, in every build, with debug information or
+without. It covers more than the warning does: an operation a unit computes
+for none of its lanes, one whose lanes no unit holds (an `i32x5` on x86-64),
+and, on a target with no vector unit, every vector operation. The error names
+the function and the operation, and stands at the operation's site where the
+build records one:
+
+```
+error[vector.scalarize_refused] 'req.main.div32' has a vector divide over 4 lanes of 32-bit integers that no vector unit of the target computes, so `simd = "require"` refuses its scalar expansion
+  @ src/main.mach:12:9
+```
+
+An operation no target has an instruction for, as an integer vector divide,
+is scalar code everywhere, so `require` refuses it on every target. Code that
+builds under `require` writes those lanes itself, as a loop or one scalar
+operation per lane, where the cost is in plain sight.
 
 Integer `*` is where this is most visible today:
 
@@ -713,7 +728,7 @@ lane the bits of the scalar operation.
 
 A project that cannot afford a scalar expansion sets `simd = "require"` in its
 profile (see [manifest.md](manifest.md)), which turns the shortfall into a
-build error naming the operation, its lane width, the function and the target.
+build error naming the function, the operation and its lanes.
 
 A comparison produces the same-shape **unsigned mask** vector — one lane per input
 lane, all-ones bits (`0xFF…`) for true and all-zeros for false, exactly what the

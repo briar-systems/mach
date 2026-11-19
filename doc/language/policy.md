@@ -20,9 +20,9 @@ Things that need to feel like the language:
   the same operator — scalarize operators, never algorithms. Where the vector
   unit holds the lanes but computes no packed form of the operator, a build
   with debug information reports the scalarization at its site
-  (`vector.scalarize`). What to do on
-  an incapable target is the `simd` profile lever (see
-  [manifest.md](manifest.md)), not a compiler default.
+  (`vector.scalarize`). Whether a build accepts a scalar expansion at all is
+  the `simd` profile lever (see [manifest.md](manifest.md)): `"require"`
+  refuses every one, not a compiler default.
 - **`asm` parsing, encoding, and operand allocation** for each supported
   ISA.
 - **The comptime channel** — `$mach.*` reads, the closed intrinsic set,

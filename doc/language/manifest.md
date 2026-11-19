@@ -115,7 +115,7 @@ abi = "sysv64"
 [profile.debug]                        # a build variant; every manifest declares at least one
 optimize = false                       # run the optimization pass set
 debug = true                           # emit debug info for this profile
-simd  = "scalarize"                    # SIMD lever: "scalarize"
+simd  = "scalarize"                    # SIMD lever: "scalarize" or "require"
 # relax = ["float-reassoc"]            # optional: departures from exact semantics
 # linker_relax = false                 # optional: whether the linker may relax the code
 # allow = ["import.unused"]            # optional: warning keys this profile silences
@@ -476,7 +476,8 @@ and the lowering reads those rows: a cell with a baseline row and a row gated on
 extension lowers to the gated instruction when the selected set holds it (`i32x4 *
 i32x4` is `pmulld` under `sse41` on x86_64 and the `pmuludq` pair without). A cell
 whose only packed row is gated scalarizes without the extension, and a build with
-debug information warns at each such site (`vector.scalarize`, see `simd` below). SSE2 is the x86_64 baseline. A build never infers the build machine's features: what the binary
+debug information warns at each such site (`vector.scalarize`), or every build
+refuses it under `simd = "require"` (see `simd` below). SSE2 is the x86_64 baseline. A build never infers the build machine's features: what the binary
 assumes is what the manifest declares.
 
 ### Image stack size
@@ -1144,7 +1145,7 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 | `relax` | array of strings | **Optional.** The departures from exact semantics the build permits. The one there is, `"float-reassoc"`, is described under [Float reassociation](#float-reassociation). Absent, the build keeps exact semantics. |
 | `linker_relax` | bool | **Optional.** Whether the linker may relax the code, as RISC-V linker relaxation shortens a call or an address pair once the link has placed its target. The build hands it to mirl's `relax` build option on every target, and a target whose linker relaxes nothing takes it without effect. `false` keeps every instruction sequence at the length the compiler laid it out. Absent, it is `true`. It has no command-line form. A non-boolean is a manifest error. |
 | `debug` | bool    | Emit debug info for this profile: DWARF in ELF, Mach-O and COFF objects alike, and the SPIR-V debug instructions its `env` holds on a `spirv` target (see [Finished-module targets](#finished-module-targets)). A PE image carries its DWARF in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
-| `simd`  | string  | SIMD scalarization lever. `"scalarize"` is the one setting a build accepts: mirl legalizes every vector operation, so a target with no packed instruction for an operator gets a defined unrolled scalar expansion. It applies **per operation on every target**, not only to targets with no vector unit: neither x86-64's SSE2 baseline nor NEON has a 64-bit lane integer multiply or any integer lane division, so a capable target scalarizes too. A build with debug information warns at each operation whose lanes a vector unit holds but which no unit computes, so it runs one lane at a time (`vector.scalarize`). `"require"` is refused, since mirl reports a scalarized operation only at the source location it carries, which a build without debug information does not record, so such a build could not be held to packed forms. Any other string is a manifest error. |
+| `simd`  | string  | SIMD scalarization lever, `"scalarize"` or `"require"`. Under `"scalarize"`, mirl legalizes every vector operation, so a target with no packed instruction for an operator gets a defined unrolled scalar expansion. It applies **per operation on every target**, not only to targets with no vector unit: neither x86-64's SSE2 baseline nor NEON has a 64-bit lane integer multiply or any integer lane division, so a capable target scalarizes too. A build with debug information warns at each operation whose lanes a vector unit holds but which no unit computes, so it runs one lane at a time (`vector.scalarize`). Under `"require"`, every operation mirl would expand into scalar code is an error (`vector.scalarize_refused`) in every build, debug or not, naming the function and the operation, at its site where the build records one: an operation no unit computes, one whose lanes no unit holds, and every vector operation of a target with no vector unit. An operation with no instruction on any target, as an integer vector divide, is refused everywhere, so a project under `"require"` writes those lanes itself. The lever is the consumer's, so a dependency's code is held to it too. Absent, it is `"scalarize"`. Any other string is a manifest error. |
 | `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile requirement and selection](#profile-requirement-and-selection). |
 | `allow` | array of strings | **Optional.** The warnings this profile silences, each entry a key or a family of keys from the [warning key table](#silencing-warnings), named once. An unknown key, an entry that covers only errors, a repeated entry or a non-string entry is a manifest error. Absent, nothing is silenced. |
 | `opt` | removed | Refused as a removed key: write `optimize = true` or `optimize = false`. |
@@ -1273,7 +1274,7 @@ reused for a different kind: see [the registry](diagnostics.md#the-registry).
 | `doc.lint` | a doc comment's component list names no parameter, field, generic or `ret` of its declaration, leaves a component undescribed, or lists them out of declaration order | yes |
 | `float.inexact` | a float literal is not exact at its type and its digits are not the shortest spelling of the value stored | yes |
 | `target.skipped` | multi-target analysis skips a declared target this build does not support | no |
-| `vector.scalarize` | a vector operation whose lanes a vector unit of the target holds runs one lane at a time, because no unit computes it, reported only by a build with debug information (see `simd`), and portable code silences it | no |
+| `vector.scalarize` | a vector operation whose lanes a vector unit of the target holds runs one lane at a time, because no unit computes it, reported only by a build with debug information under `simd = "scalarize"` (see `simd`), and portable code silences it | no |
 | `expect.unfulfilled` | an `#[expect]` names a key decided by source and no such warning is raised inside its declaration | no |
 | `secret.target_unenforceable` | an `#[constant_time]` function compiles for a target whose instruction set masc says cannot guarantee constant-time execution (wasm) | no |
 | `readout.clock_refused` | the clock refuses a read while the back end times a module, so a row of the build's stage times is incomplete | no |
