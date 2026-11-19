@@ -324,7 +324,7 @@ pub fun const_elem_value(elem: u32, ty: u32) CTValue
 ### node_ref
 
 ```mach
-pub fun node_ref(module: u32, node: u32, ty: u32) CTValue
+pub fun node_ref(module: u32, shape: u32, at: u32, ty: u32) CTValue
 ```
 
 ### ct_str

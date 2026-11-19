@@ -10,7 +10,7 @@ The directory's root module is [`mach.front.comptime`](../comptime.md).
 | Module | |
 | :--- | :--- |
 | [`capability`](capability.md) | what each phase lets a comptime evaluation ask of it: members, identifiers, types, fields and layout, published as one record per phase |
-| [`deep`](deep.md) | the deep value of a constant: an array, record or case literal as a tree of nodes with every member evaluated, an address as the symbol it points into, and a leaf that has no compile-time value kept with its refusal |
+| [`deep`](deep.md) | the deep value of a constant: an array, record or case literal with every member evaluated, an address as the symbol it points into, and a leaf that has no compile-time value kept with its refusal |
 | [`failure`](failure.md) | why a comptime evaluation has no value: refused for good, waiting on a later phase or an instance, or failed inside the compiler |
 | [`fold`](fold.md) | comptime arithmetic through mirl's constant folder: every operation a constant expression computes is one row of mirl's opcode table folded on constants, so a constant means at compile time what the same operation means at run time and no fold rule is stated here |
 | [`gate`](gate.md) | comptime gates: which later phase a gate's condition depends on, and the verdict that selects or discards its arm |

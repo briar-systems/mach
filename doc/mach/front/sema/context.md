@@ -284,7 +284,7 @@ pub rec ModuleView {
     # how far each module `val` is bound, and the node of its value in the module's store once
     # built (see sema.constant); nil in a view of another module
     constant_state: *u8;
-    constant_node:  *u32;
+    constant_node:  *mach.front.comptime.deep.Node;
     inferred_len:   *u64;
     embed_paths:    *mach.base.intern.StrId;
     embed_path_len: u32;

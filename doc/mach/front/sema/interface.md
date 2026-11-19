@@ -54,7 +54,7 @@ pub rec Declaration {
     params_len:   u32;
     op_set:       mach.base.intern.StrId;
     op_name:      mach.base.intern.StrId;
-    value:        u32;
+    value:        mach.front.comptime.deep.Node;
 }
 ```
 
@@ -66,7 +66,7 @@ one module-level function, `val` or `var`
 | `generics` | `u32` | how many type parameters a function declares |
 | `params_start` | `u32` | where a function's parameters start in `params` |
 | `op_set` | `mach.base.intern.StrId` | the instruction set and operation an `#[intrinsic]` names, STR_NIL without one |
-| `value` | `u32` | the node in `values` of a `val`'s constant value, or of the value a `var`'s initializer gives it, NONE when it has none |
+| `value` | `mach.front.comptime.deep.Node` | the node in `values` of a `val`'s constant value, or of the value a `var`'s initializer gives it, comptime_deep.NONE when it has none |
 
 ## Param
 

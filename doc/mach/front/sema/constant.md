@@ -93,7 +93,7 @@ an instance, evaluates one again
 ### own_value
 
 ```mach
-pub fun own_value(sc: *mach.front.sema.context.SemaContext, sym: *mach.front.resolve.Symbol) res[u32, mach.base.fail.Fail]
+pub fun own_value(sc: *mach.front.sema.context.SemaContext, sym: *mach.front.resolve.Symbol) res[mach.front.comptime.deep.Node, mach.base.fail.Fail]
 ```
 
 the node of the value the module `val` `sym` declares, built in the module's store on first
@@ -139,12 +139,13 @@ the type the walk gave an expression
 ### node_build
 
 ```mach
-pub fun node_build(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId) res[u32, mach.base.fail.Fail]
+pub fun node_build(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId, hint: u32) res[mach.front.comptime.deep.Node, mach.base.fail.Fail]
 ```
 
 the node of the expression `eid`: an aggregate literal member by member, the value of the
 constant it names, an address, or anything else as the evaluator answers it at the type the
-walk gave it
+walk gave it. `hint` is the shape the node is expected to have, the shape of the same member of
+the value built before it, NO_SHAPE when there is none
 
 ### zero_of
 

@@ -26,7 +26,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 ### aggregate
 
 ```mach
-pub fun aggregate(ctx: *mach.lower.context.LowerContext, store: *mach.front.comptime.deep.Store, node: u32, ity: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
+pub fun aggregate(ctx: *mach.lower.context.LowerContext, store: *mach.front.comptime.deep.Store, node: mach.front.comptime.deep.Node, ity: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
 node `node` of `store` as a constant of the mirl type `ity`, which a global of `ity` is
