@@ -39,7 +39,7 @@ assembled and readied.
 
 ```
 load         48 modules     77ms
-codegen      48 modules     75ms  (16 threads)  (slowest std.filesystem 9ms)
+codegen      48 modules     75ms  (slowest std.filesystem 9ms)
 emit         48 objects      6ms
 other        -              32ms
 built out/app  48 modules  1 MiB  in 358ms
@@ -86,9 +86,8 @@ After the rows each counter prints its total over the unit's modules:
 Under `-vv` each module prints a line per stage and per counter as its step
 finishes.
 
-`(N threads)` shows when a phase ran on more than one worker, and
-`(N target-gated, not carried forward)` when it dropped modules gated to
-another target. Under `-vv` each module or file prints as an indented line
+`(N target-gated, not carried forward)` shows when a phase dropped modules
+gated to another target. Under `-vv` each module or file prints as an indented line
 under the phase that processed it, in the order they finish, and the row names
 the slowest of them. A unit whose project or dependencies declare build steps
 opens with a `steps` row, and under `-vv` each step that ran prints by name;

@@ -253,7 +253,7 @@ are integer microseconds.
 ```json
 {"schema":2,"record":"unit","verb":"building","artifact":"app","target":"linux","profile":"debug"}
 {"schema":2,"record":"phase","name":"load","count":48,"unit":"modules","time_us":77012}
-{"schema":2,"record":"phase","name":"codegen","count":48,"unit":"modules","time_us":75012,"threads":16,"slowest":"std.filesystem","slowest_us":9104}
+{"schema":2,"record":"phase","name":"codegen","count":48,"unit":"modules","time_us":75012,"slowest":"std.filesystem","slowest_us":9104}
 {"schema":2,"record":"phase","name":"other","time_us":32007}
 ```
 
@@ -276,7 +276,6 @@ A **phase** record is a phase row:
 | `count` | integer | what the phase processed; absent for `other` |
 | `unit` | string | the noun the count is in, singular for a count of one: `"modules"`, `"objects"` |
 | `time_us` | integer | the phase's time |
-| `threads` | integer | the workers it ran on, present only when more than one |
 | `dropped` | integer | the modules it dropped as target-gated, present only when any |
 | `slowest` | string | under `-vv`, the slowest of its items, present when it had two or more |
 | `slowest_us` | integer | that item's time, present with `slowest` |

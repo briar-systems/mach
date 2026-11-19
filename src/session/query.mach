@@ -142,6 +142,10 @@ pub rec Presentation {
     origin:        diagnostic.Origin;
 }
 
+# held:      the failure raised while its prepare computed, owned through the db, which complete_prepared records
+#            and cancel_prepared leaves unrecorded
+# origin:    the origin of the product whose computation raised `held`
+# displaced: the failure `held` displaced, owned like it, since a computation may still read the copy it was handed
 rec Attempt {
     key:       Slot;
     prepared:  *QueryEntry;
@@ -150,6 +154,9 @@ rec Attempt {
     failed:    bool;
     rejected:  bool;
     evidence:  QueryEntry;
+    held:      opt[fail.Fail];
+    origin:    diagnostic.Origin;
+    displaced: opt[fail.Fail];
 }
 
 pub rec QueryOutput {
@@ -238,6 +245,8 @@ pub rec QueryDb {
     attempts:             Vector[Attempt];
     attempt_index:        Map[Slot, usize];
     validated:            Map[Slot, Revision];
+    # the attempt whose prepare is computing, which holds every failure raised meanwhile
+    holding: opt[usize];
     # the failure the operation stands on, its text and places copied into and owned through `a`.
     # a failure the engine hands out borrows them until the operation's presentation is collected
     # or discarded, when the presentation takes the failure over or it is freed
@@ -280,6 +289,7 @@ pub fun init(a: *A.Allocator) res[QueryDb, fail.Fail] {
     db.compute_depth        = 0;
     db.stack                = collections_vector.init[StackFrame](a);
     db.prepared_count       = 0;
+    db.holding              = opt[usize].none{};
     db.operation_sequence   = 0;
     db.operation_active     = false;
     db.presentation_pending = false;
@@ -487,14 +497,17 @@ pub fun end(db: *QueryDb, operation: Operation) err[fail.Fail] {
 # records the operation's failure and answers the failure the operation carries, borrowing the
 # operation's copy of it: its class, kind, text, place, related places and fix. a defect stands
 # over the user's and the environment's failures, either of which stands over a reported one,
-# and of two alike the first stands
+# and of two alike the first stands. while a prepare computes, its attempt holds the failure
+# under the same order instead, and the operation records it only when the prepared product
+# completes
 fun operation_fail(db: *QueryDb, failure: fail.Fail) fail.Fail {
     ret operation_fail_in(db, failure, computing_origin(db));
 }
 
 # operation_fail for a failure raised by a product of `origin`
 fun operation_fail_in(db: *QueryDb, failure: fail.Fail, origin: diagnostic.Origin) fail.Fail {
-    val opt_stands: opt[fail.Fail] = standing_over(db, failure);
+    if (sel db.holding.some) { ret attempt_hold(db, db.holding.some, failure, origin); }
+    val opt_stands: opt[fail.Fail] = stands_over(db.operation_failure, failure);
     if (sel opt_stands.some) { ret borrowed(opt_stands.some); }
     val res_copied: res[fail.Fail, A.Error] = fail.retain(db.a, failure);
     if (sel res_copied.err) { ret operation_stand(db, fail.refused(res_copied.err), origin); }
@@ -507,10 +520,26 @@ fun computing_origin(db: *QueryDb) diagnostic.Origin {
     ret db.storage[db.stack.data[db.stack.len - 1].kind::u32].spec.origin;
 }
 
-# the failure the operation stands on, when it stands over `failure`
-fun standing_over(db: *QueryDb, failure: fail.Fail) opt[fail.Fail] {
-    if (sel db.operation_failure.none) { ret opt[fail.Fail].none{}; }
-    val held: fail.Fail = db.operation_failure.some;
+# the attempt `index` made to hold `failure` unless the failure it holds stands over it, the one
+# it displaces kept until the operation's state is released; answers the borrowing copy
+fun attempt_hold(db: *QueryDb, index: usize, failure: fail.Fail, origin: diagnostic.Origin) fail.Fail {
+    val attempt:    *Attempt       = ?db.attempts.data[index];
+    val opt_stands: opt[fail.Fail] = stands_over(attempt.held, failure);
+    if (sel opt_stands.some) { ret borrowed(opt_stands.some); }
+    var owned:      fail.Fail               = failure;
+    val res_copied: res[fail.Fail, A.Error] = fail.retain(db.a, failure);
+    if (sel res_copied.err)    { owned = fail.refused(res_copied.err); }
+    or                         { owned = res_copied.ok; }
+    if (sel attempt.held.some) { attempt.displaced = attempt.held; }
+    attempt.held   = opt[fail.Fail].some{owned};
+    attempt.origin = origin;
+    ret borrowed(owned);
+}
+
+# the failure `standing` holds, when it stands over `failure`
+fun stands_over(standing: opt[fail.Fail], failure: fail.Fail) opt[fail.Fail] {
+    if (sel standing.none) { ret opt[fail.Fail].none{}; }
+    val held: fail.Fail = standing.some;
     if (fail.is_message(held) || sel failure.reported)        { ret opt[fail.Fail].some{held}; }
     if (!fail.is_reported(held) && !fail.is_message(failure)) { ret opt[fail.Fail].some{held}; }
     ret opt[fail.Fail].none{};
@@ -545,6 +574,12 @@ fun operation_failures_dnit(db: *QueryDb) {
 # one query and of the queries that read it; the rest of the operation still
 # computes, and the operation's standing is the fold of its roots'
 fun operation_poison(db: *QueryDb) opt[fail.Fail] {
+    if (sel db.holding.some) {
+        val held: opt[fail.Fail] = db.attempts.data[db.holding.some].held;
+        if (sel held.some) {
+            if (fail.is_message(held.some)) { ret opt[fail.Fail].some{borrowed(held.some)}; }
+        }
+    }
     if (sel db.operation_failure.some) {
         if (fail.is_message(db.operation_failure.some)) { ret opt[fail.Fail].some{borrowed(db.operation_failure.some)}; }
     }
@@ -589,6 +624,8 @@ fun attempts_clear(db: *QueryDb) {
             A.deallocate[QueryEntry](db.a, attempt.prepared, 1);
         }
         entry_dnit(db, db.storage[attempt.key.kind::u32], ?attempt.evidence);
+        if (sel attempt.held.some)      { fail.dnit(db.a, attempt.held.some); }
+        if (sel attempt.displaced.some) { fail.dnit(db.a, attempt.displaced.some); }
         i = i + 1;
     }
     collections_vector.truncate[Attempt](?db.attempts, 0);
@@ -1162,7 +1199,10 @@ fun reusable_inner[T](rt: *QueryRuntime[T], ctx: *T, row: *Kind, key: u64) res[b
 }
 
 # compute a derived product the caller finishes outside the computation (a worker thread),
-# published by complete_prepared or dropped by cancel_prepared before the operation ends
+# published by complete_prepared or dropped by cancel_prepared before the operation ends. a
+# failure raised while it computes is the prepared product's: it is held, and recorded by
+# complete_prepared or left unrecorded by cancel_prepared, so a product prepared ahead never
+# fails the operation before the products the caller completes ahead of it
 pub fun prepare[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[PreparedQuery, fail.Fail] {
     val res_prepare_inner: res[PreparedQuery, fail.Fail] = prepare_inner[T](rt, ctx, kind, key);
     if (sel res_prepare_inner.err) {
@@ -1207,11 +1247,11 @@ fun prepare_inner[T](rt: *QueryRuntime[T], ctx: *T, row: *Kind, key: u64) res[Pr
     if (sel res_marked.err) { ret res[PreparedQuery, fail.Fail].err{fail.refused(res_marked.err)}; }
     val err_pushed: err[fail.Fail] = stack_push(db, kind, key, nil);
     if (sel err_pushed.err) { ret res[PreparedQuery, fail.Fail].err{err_pushed.err}; }
+    db.holding = opt[usize].some{index};
     val err_computed: err[fail.Fail] = candidate_compute[T](rt, ctx, sh, key, candidate);
+    db.holding = opt[usize].none{};
     stack_pop(db);
-    if (sel err_computed.err) {
-        ret res[PreparedQuery, fail.Fail].err{operation_fail(db, err_computed.err)};
-    }
+    if (sel err_computed.err) { val held: fail.Fail = attempt_hold(db, index, err_computed.err, computing_origin(db)); }
     db.attempts.data[index].prepared = candidate;
     db.attempts.data[index].fresh    = fresh;
     db.prepared_count                = db.prepared_count + 1;
@@ -1230,6 +1270,25 @@ fun prepared_attempt(db: *QueryDb, prepared: PreparedQuery) res[*Attempt, fail.F
     val attempt: *Attempt = ?db.attempts.data[@opt_index.some];
     if (attempt.prepared == nil) { ret res[*Attempt, fail.Fail].err{fail.message("prepared query has already been consumed")}; }
     ret res[*Attempt, fail.Fail].ok{attempt};
+}
+
+# whether the prepared query's compute failed, its failure held for complete_prepared to record
+pub fun prepared_held(db: *QueryDb, prepared: PreparedQuery) res[bool, fail.Fail] {
+    val res_owner: res[*Attempt, fail.Fail] = prepared_attempt(db, prepared);
+    if (sel res_owner.err) { ret res[bool, fail.Fail].err{res_owner.err}; }
+    ret res[bool, fail.Fail].ok{sel res_owner.ok.held.some};
+}
+
+# whether the computation on the stack is the prepare of the product `kind` keys under `key`, which a
+# compute reads to tell a prepare that finishes it outside the computation from a read that does not
+pub fun preparing(db: *QueryDb, kind: *Kind, key: u64) bool {
+    val sh: *QueryShard = shard_find(db, kind);
+    if (sh == nil || db.stack.len != 1) { ret false; }
+    if (sel db.holding.some) {
+        val at: Slot = db.attempts.data[db.holding.some].key;
+        ret at.kind == sh.kind && at.key == key;
+    }
+    ret false;
 }
 
 pub fun prepared_view(db: *QueryDb, prepared: PreparedQuery) res[QueryView, fail.Fail] {
@@ -1272,9 +1331,18 @@ pub fun cancel_prepared(db: *QueryDb, prepared: PreparedQuery) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
+# publish a prepared product, or record its failure: the one its compute raised, held until now, else
+# `result`, the failure of the work finished outside the computation. a failed product is dropped
 pub fun complete_prepared(db: *QueryDb, prepared: PreparedQuery, result: err[fail.Fail]) err[fail.Fail] {
     val res_owner: res[*Attempt, fail.Fail] = prepared_attempt(db, prepared);
     if (sel res_owner.err) { ret err[fail.Fail].err{res_owner.err}; }
+    val held: opt[fail.Fail] = res_owner.ok.held;
+    if (sel held.some) {
+        val recorded:      fail.Fail      = operation_fail_in(db, held.some, res_owner.ok.origin);
+        val err_cancelled: err[fail.Fail] = cancel_prepared(db, prepared);
+        if (sel err_cancelled.err) { ret err_cancelled; }
+        ret err[fail.Fail].err{recorded};
+    }
     if (sel result.err) {
         val recorded:      fail.Fail      = operation_fail_in(db, result.err, db.storage[prepared.key.kind::u32].spec.origin);
         val err_cancelled: err[fail.Fail] = cancel_prepared(db, prepared);
@@ -1528,12 +1596,17 @@ fun missing_input(db: *QueryDb, sh: *QueryShard, key: u64) fail.Fail {
     ret text_failure(db, res[str, fail.Fail].ok{res_built.ok});
 }
 
-# the operation's failure, a defect whose text, made through the db's allocator, the operation
-# owns; an earlier defect stands
+# the operation's failure, or the prepare's while one computes, a defect whose text, made through
+# the db's allocator, the operation owns; an earlier defect stands
 fun text_failure(db: *QueryDb, built: res[str, fail.Fail]) fail.Fail {
     if (sel built.err) { ret operation_fail(db, built.err); }
-    val failure:    fail.Fail      = fail.owning(fail.message(built.ok));
-    val opt_stands: opt[fail.Fail] = standing_over(db, failure);
+    val failure: fail.Fail = fail.owning(fail.message(built.ok));
+    if (sel db.holding.some) {
+        val held: fail.Fail = attempt_hold(db, db.holding.some, failure, computing_origin(db));
+        fail.dnit(db.a, failure);
+        ret held;
+    }
+    val opt_stands: opt[fail.Fail] = stands_over(db.operation_failure, failure);
     if (sel opt_stands.some) {
         fail.dnit(db.a, failure);
         ret borrowed(opt_stands.some);
