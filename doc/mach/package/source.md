@@ -23,7 +23,7 @@ Uses types from [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.v
 | Type | | |
 | :--- | :--- | :--- |
 | [`Release`](#release) | `rec` | one release: its version (whose pre-release text borrows from `text`), the tag that names it and the commit it points at, all owned by the list's allocator |
-| [`Shipped`](#shipped) | `rec` | a release's manifest as resolution reads it: `manifest` when the release is a candidate, and otherwise `excluded` says why it is not one, its manifest not loading or naming another version |
+| [`Shipped`](#shipped) | `rec` | a release's manifest as resolution reads it: `manifest` when the release is a candidate, and otherwise `excluded` says why it is not one, its manifest not loading or naming another version, and `detail` is what the manifest's load said, or nil |
 | [`Releases`](#releases) | `rec` |  |
 | [`Acquisition`](#acquisition) | `rec` | one acquisition of dep/\<id>: bring it to `selector` from `url` and record its pin as the project records pins (`mode`, a pin.mach mode) |
 | [`Checkouts`](#checkouts) | `rec` |  |
@@ -66,12 +66,15 @@ pub fun releases_dnit(a: *std.allocator.Allocator, list: *Vector[Release])
 pub rec Shipped {
     manifest: mach.manifest.model.Manifest;
     excluded: str;
+    detail:   str;
 }
 ```
 
 a release's manifest as resolution reads it: `manifest` when the release is a candidate,
 and otherwise `excluded` says why it is not one, its manifest not loading or naming
-another version. the manifest is owned by the caller
+another version, and `detail` is what the manifest's load said, or nil. releases excluded
+for one reason are reported together, with the newest one's detail. the manifest is owned
+by the caller
 
 ## Releases
 

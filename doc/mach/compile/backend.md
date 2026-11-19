@@ -51,7 +51,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 
 | Functions | |
 | :--- | :--- |
-| [`refused_by_mink`](#refused_by_mink) | mink's failure `f` as mach's, under `lead`: what mink does not do is the input's to change, an allocation it was refused is the machine's, and every other cause is the compiler's |
+| [`refused_by_mink`](#refused_by_mink) | mink's failure `f` as mach's, after `lead` where it says what mink was doing, nil where mink's own words say it all: what mink does not do is the input's to change, an allocation it was refused is the machine's, and every other cause is the compiler's |
 | [`lays_stack`](#lays_stack) | whether an image of `t` holds its main stack as a section of its own: an ELF or flat image no loader maps, so no loader gives it a stack and no header records one |
 | [`stacks_below_base`](#stacks_below_base) | whether an image of `t` lays its main stack out in its own memory below its base, as its format's writer states, so the stack reserve the link is handed is where its data starts |
 | [`refers`](#refers) | whether `o` refers to the symbol `name` and leaves its definition to another object |
@@ -413,8 +413,9 @@ a linked image and what its link read
 pub fun refused_by_mink(a: *std.allocator.Allocator, lead: str, f: Fail) mach.base.fail.Fail
 ```
 
-mink's failure `f` as mach's, under `lead`: what mink does not do is the input's to change, an
-allocation it was refused is the machine's, and every other cause is the compiler's
+mink's failure `f` as mach's, after `lead` where it says what mink was doing, nil where mink's
+own words say it all: what mink does not do is the input's to change, an allocation it was
+refused is the machine's, and every other cause is the compiler's
 
 ### lays_stack
 

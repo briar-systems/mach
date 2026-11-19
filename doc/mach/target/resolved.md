@@ -43,7 +43,8 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 
 | Functions | |
 | :--- | :--- |
-| [`refusal`](#refusal) | mink's failure `f` as mach's: an allocation it was refused is the machine's, and anything else the compiler's |
+| [`summary`](#summary) | mink's failure `f` in mink's words on one line, as diag.summary sets it into another message, copied into `a` |
+| [`refusal`](#refusal) | mink's failure `f` as mach's: an allocation it was refused is the machine's, and anything else the compiler's, in mink's words |
 | [`refused`](#refused-1) | mink's refusal `f` of a part of a target as a user failure of `kind`, in mink's words; a failure that refuses no part is mink's own, as `refusal` words it |
 | [`spec_of`](#spec_of) | the system and the architecture named `sys` and `arch`, each a row's name, refused as mink refuses them, as a user failure of `kind` |
 
@@ -214,6 +215,15 @@ a refusal of a target and the part of it refused
 
 ## Functions
 
+### summary
+
+```mach
+pub fun summary(a: *std.allocator.Allocator, f: mink.base.fail.Fail) res[str, mach.base.fail.Fail]
+```
+
+mink's failure `f` in mink's words on one line, as diag.summary sets it into another message,
+copied into `a`. mink's words reach mach only this way, never as they stand
+
 ### refusal
 
 ```mach
@@ -221,7 +231,7 @@ pub fun refusal(a: *std.allocator.Allocator, f: mink.base.fail.Fail) mach.base.f
 ```
 
 mink's failure `f` as mach's: an allocation it was refused is the machine's, and anything
-else the compiler's
+else the compiler's, in mink's words
 
 ### refused
 

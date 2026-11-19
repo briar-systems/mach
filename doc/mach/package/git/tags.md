@@ -3,18 +3,19 @@
 # mach.package.git.tags
 
 tags: the git half of the source contract that lists releases. a release is a
-`v`-prefixed semver tag at a url, listed with one `ls-remote` each; the manifest of a
-release is read from a scratch bare repository after a shallow fetch of its tag. offline,
-both come from a local repository, a realized checkout of the url, and nothing reaches
-the network
+`v`-prefixed semver tag at a url, listed with one `ls-remote` each. the first manifest read
+at a url brings every listed release's manifest into a scratch bare repository at once:
+one shallow fetch of the listed tags without file contents, then one fetch of each
+release's mach.toml by its object id. offline, both come from a local repository, a
+realized checkout of the url, and nothing reaches the network
 
 Source: [`src/package/git/tags.mach`](../../../../src/package/git/tags.mach)
 
-Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.package.git`](../git.md), [`mach.package.source`](../source.md), [`mach.session`](../../session.md).
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.package.git`](../git.md), [`mach.package.report`](../report.md), [`mach.package.source`](../source.md), [`mach.session`](../../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Remotes`](#remotes) | `rec` |  |
+| [`Remotes`](#remotes) | `rec` | `fetched` holds each url whose listed releases' manifests the scratch holds |
 
 | On `Remotes` | |
 | :--- | :--- |
@@ -37,17 +38,22 @@ pub rec Remotes {
     gi:            mach.package.git.Inspector;
     listings:      Vector[CachedListing];
     locals:        Vector[LocalRepo];
+    fetched:       Vector[str];
     offline:       bool;
     local:         str;
     scratch:       str;
     scratch_ready: bool;
+    rep:           *mach.package.report.Report;
 }
 ```
+
+`fetched` holds each url whose listed releases' manifests the scratch holds. `rep` hears a
+line before each url's releases are read from the network, nil for none
 
 ### init
 
 ```mach
-pub fun init(s: *mach.session.Session, offline: bool, local: str) res[Remotes, mach.base.fail.Fail]
+pub fun init(s: *mach.session.Session, offline: bool, local: str, rep: *mach.package.report.Report) res[Remotes, mach.base.fail.Fail]
 ```
 
 ### dnit

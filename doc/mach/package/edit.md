@@ -27,7 +27,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.manifest.edit`](../m
 | [`update`](#update) | `mach dep update`: move one root-declared or transitive identity, or every one under `all` |
 | [`update_apply`](#update_apply) | update: the fixed git selectors move first (a ref is fetched and checked out), so their manifests are the closure's when the version ranges resolve; then every chosen release is realized and the closure is pulled, which syncs every path copy once and reports it |
 | [`notes`](#notes) | a resolution's notes, as a command shows them unless --quiet |
-| [`add_release`](#add_release) | declare a git dependency at the caret range of the release resolution picks for the running compiler and realize the closure, as `mach dep add <root> <name> --git <url>` does |
+| [`release_range`](#release_range) | the caret range of the release resolution picks for the running compiler for the git dependency `spec` declares, added to the manifest `text` of the project at `root`, which need not exist yet |
 | [`change`](#change) | add or remove the [dep] table `spec` describes and realize the closure it leaves |
 
 ---
@@ -129,27 +129,28 @@ pub fun notes(rep: *mach.package.report.Report, lines: *Vector[str])
 
 a resolution's notes, as a command shows them unless --quiet
 
-### add_release
+### release_range
 
 ```mach
-pub fun add_release(s: *mach.session.Session, a: *std.allocator.Allocator, root: str, name: str, url: str, quiet: bool, realize: bool,
-    rep: *mach.package.report.Report) err[mach.base.fail.Fail]
+pub fun release_range(s: *mach.session.Session, a: *std.allocator.Allocator, root: str, text: str, spec: *mach.manifest.edit.DepTableSpec,
+    quiet: bool, rep: *mach.package.report.Report) res[str, mach.base.fail.Fail]
 ```
 
-declare a git dependency at the caret range of the release resolution picks for the running
-compiler and realize the closure, as `mach dep add <root> <name> --git <url>` does
+the caret range of the release resolution picks for the running compiler for the git
+dependency `spec` declares, added to the manifest `text` of the project at `root`, which
+need not exist yet. nothing is written or checked out, as `mach init` resolves its
+dependencies before it writes the project
 
 | Parameter | |
 | :--- | :--- |
 | `s` | the session; a failure may borrow from it, so the caller shows it before ending it |
 | `a` | the storage the operation works in |
 | `root` | the project root directory |
-| `name` | the dependency identity |
-| `url` | its git source |
-| `quiet` | report no progress lines |
-| `realize` | check the release out; false only resolves the range and writes the table |
-| `rep` | receives progress, notes, and the effects a failure left |
-| **returns** | err naming the failure |
+| `text` | the project's manifest, as it will be written |
+| `spec` | the dependency, a git source with no selector |
+| `quiet` | report no progress line |
+| `rep` | receives progress and notes |
+| **returns** | the range, `^X.Y.Z`; err naming the failure |
 
 ### change
 

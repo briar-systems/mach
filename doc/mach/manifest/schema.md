@@ -45,6 +45,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`check`](#check) | check a parsed manifest document against the schema: every key it writes is a row of its table, every value has its row's shape, every required key is written and no removed one is |
 | [`toml_string`](#toml_string) | `text` as a TOML basic string: a quote and a backslash escaped by a backslash, and a control byte, which a basic string cannot hold, as its `\u00XX` escape |
 | [`section_check`](#section_check) | check one section of the document root, as `check` holds it, for a reader that needs only that section |
+| [`removed_note`](#removed_note) | what replaces the removed key `v` of `tab` as written: its rewrite's word where the value decides it, else the row's note |
 | [`key_text`](#key_text) | a string key as the manifest reads it: absent and empty are the same err (`is missing required key`), so both read as the empty string |
 | [`flag`](#flag) | a boolean key's value, false when it is not written; the schema check has refused any other shape |
 | [`written_value`](#written_value) | the value of a key the schema check has seen written with its row's shape, nil when it is not written |
@@ -54,12 +55,14 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`value_span`](#value_span) | the literal of the value `key` names in a table; the zero span when absent |
 | [`value_text`](#value_text) | a scalar value as a refusal quotes it; a refused allocation is the failure |
 | [`is_valid_id`](#is_valid_id) | whether `s` is a portable identifier: non-empty, only ASCII letters, digits, '_' and '-' |
+| [`is_project_id`](#is_project_id) | whether `s` can head a `use` path, which is the rule for a project id: an identifier as the grammar spells one, a letter or '_' and then letters, digits and '_' |
 | [`is_project_path`](#is_project_path) | whether `value` is a canonical strict descendant of the project root: non-empty, '/'-separated, no '\\', not absolute, no drive letter, no empty component, no '.' or '..' component |
 | [`check_path`](#check_path) | refuse a path that `is_project_path` does not admit, naming it as `field` and pointing at `sp`, the value as written |
 
 | Constants | |
 | :--- | :--- |
 | [`SET_PATH`](#constants) | the path a refusal of a `--set` value is placed in |
+| [`PROJECT_ID_RULE`](#constants) | what a project id may hold, as a refusal of one says it |
 | [`OUTPUT_CONSTRAINT`](#constants) | the rule `-o` keeps wherever it names an output, which the cli prints and build refuses by |
 
 ---
@@ -101,7 +104,7 @@ the mechanical rewrite of a key as a previous major wrote it
 | `label` | `str` | what the rewrite does; nil when the value as written has none |
 | `whole` | `bool` | the rewrite replaces the key and its value, not the key alone |
 | `replacement` | `str` | the text written in their place |
-| `why` | `str` | for a key this major still reads, why the key as written is refused; nil for a removed key, whose row's note says it |
+| `why` | `str` | for a key this major still reads, why the key as written is refused. for a removed key, what replaces the key as written, where that depends on its value; nil where the row's note says it |
 
 ## Setting
 
@@ -298,6 +301,15 @@ that needs only that section
 | `key` | a key of the document root, such as "project" |
 | **returns** | ok when the section has the schema's shape |
 
+### removed_note
+
+```mach
+pub fun removed_note(row: *KeyRow, tab: *toml.value.Table, v: *toml.value.Value) str
+```
+
+what replaces the removed key `v` of `tab` as written: its rewrite's word where the value
+decides it, else the row's note
+
 ### key_text
 
 ```mach
@@ -383,13 +395,27 @@ pub fun is_valid_id(s: str) bool
 ```
 
 whether `s` is a portable identifier: non-empty, only ASCII letters, digits,
-'_' and '-'. the rule for project, target, artifact, profile, dependency,
-link and step names
+'_' and '-'. the rule for target, artifact, profile, dependency, link and step
+names. a project id keeps the narrower `is_project_id`
 
 | Parameter | |
 | :--- | :--- |
 | `s` | the candidate |
 | **returns** | true when every byte is allowed |
+
+### is_project_id
+
+```mach
+pub fun is_project_id(s: str) bool
+```
+
+whether `s` can head a `use` path, which is the rule for a project id: an identifier as the
+grammar spells one, a letter or '_' and then letters, digits and '_'
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the candidate |
+| **returns** | true when `s` is one |
 
 ### is_project_path
 
@@ -420,5 +446,6 @@ and pointing at `sp`, the value as written
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
 | `SET_PATH` | `str` | `"--set"` | the path a refusal of a `--set` value is placed in |
-| `OUTPUT_CONSTRAINT` | `str` | `"-o must name a canonical path inside the project root: relative, with no . or .. component"` | the rule `-o` keeps wherever it names an output, which the cli prints and build refuses by |
+| `PROJECT_ID_RULE` | `str` | `` "a project id must start with a letter or '_' and hold only letters, digits and '_', so that a `use` path can name it" `` | what a project id may hold, as a refusal of one says it |
+| `OUTPUT_CONSTRAINT` | `str` | `"-o must name a canonical path inside the project root, relative, with no . or .. component"` | the rule `-o` keeps wherever it names an output, which the cli prints and build refuses by |
 

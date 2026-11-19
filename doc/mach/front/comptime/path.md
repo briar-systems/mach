@@ -196,7 +196,7 @@ the tag of `$mach.abi.<name>`: the spelling's place among mink's conventions
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COMPTIME_BARE_IDENT_MSG` | `str` | `` "comptime parameters are referenced without `$`; comptime paths are rooted: `$mach`, `$project`, `$bin`" `` |  |
+| `COMPTIME_BARE_IDENT_MSG` | `str` | `` "comptime parameters are referenced without `$`. a comptime path starts at `$mach`, `$project` or `$bin`" `` |  |
 | `MODE_DEBUG` | `u32` | `0` |  |
 | `MODE_RELEASE` | `u32` | `1` |  |
 | `MODE_COUNT` | `usize` | `2` | the `$mach.mode.*` tags, each at its mode's value |

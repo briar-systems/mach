@@ -34,7 +34,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`dependency_report`](#dependency_report) | where a dependency command reports: progress on standard output, and notes and failures, the ones the command goes on past too, through the command's report |
 | [`report_init`](#report_init) | start a report in place; it holds its own arena, so it stays where it was made until `report_dnit` |
 | [`out`](#out) | where a command writes its output, stdout through the report, so a refused write fails the command as the system's |
-| [`report_note`](#report_note) | report a note of kind `k`, which points at nothing: `note: text` in human text, or a diagnostic record of note severity under json |
+| [`report_note`](#report_note) | report a note of kind `k`, which points at nothing: `note text` in human text, or a diagnostic record of note severity under json |
 | [`report_fail`](#report_fail) | report a carried failure as the diagnostic it reads as, in text or as a diagnostic record under json |
 | [`report_case`](#report_case) | one collected test as a record under json, as `mach test --list` lists it; human text writes nothing here |
 | [`report_skip`](#report_skip) | a (target, profile) whose tests were built and not run, as a record under json; human text writes nothing here |
@@ -243,7 +243,7 @@ command as the system's
 pub fun report_note(r: *Report, k: mach.base.diagnostic.kind.Kind, text: str)
 ```
 
-report a note of kind `k`, which points at nothing: `note: text` in human text, or a
+report a note of kind `k`, which points at nothing: `note text` in human text, or a
 diagnostic record of note severity under json
 
 | Parameter | |

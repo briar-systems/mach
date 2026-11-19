@@ -13,6 +13,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | Type | | |
 | :--- | :--- | :--- |
 | [`Transform`](#transform) | `def` | the text a command makes of one source's text, such as its canonical layout; a refusal `fail.is_reported` holds was reported into the store and marks the source malformed, and any other ends the command |
+| [`Heading`](#heading) | `def` | the offset of the line that heads a change at the offset `at` of a source's text, such as the table a manifest line stands in, which a diff names beside the change |
 | [`Report`](#report-1) | `rec` | one command's pass over its inputs |
 | [`Sink`](#sink) | `def` | where the transformed text of one input goes |
 
@@ -59,6 +60,16 @@ pub fun report(diagnostics: *mach.cli.diagnostic.Report, sources: *mach.base.sou
 
 a pass with nothing read yet
 
+## Heading
+
+```mach
+pub def Heading: fun(str, usize) usize
+```
+
+the offset of the line that heads a change at the offset `at` of a source's text, such as
+the table a manifest line stands in, which a diff names beside the change. the text's
+length where no line heads it
+
 ## Report
 
 ```mach
@@ -70,6 +81,7 @@ pub rec Report {
     sources:     *mach.base.source.SourceMap;
     transform:   Transform;
     context:     ptr;
+    heading:     Heading;
 }
 ```
 
@@ -84,6 +96,7 @@ one command's pass over its inputs
 | `sources` | `*mach.base.source.SourceMap` | the source map a refused file's text is loaded into, which its failure points into |
 | `transform` | `Transform` | the text each source becomes |
 | `context` | `ptr` | what the command hands its transform |
+| `heading` | `Heading` | what heads each change a diff prints, nil for none |
 
 ## Sink
 
@@ -98,7 +111,7 @@ where the transformed text of one input goes
 | `file` |  | replace the input file in place and name it on stdout |
 | `stream` |  | write the transformed text to stdout, whether or not it differs |
 | `name` |  | write no source; name the input on stdout when the transform changes it |
-| `diff` |  | write no source; name the input and print the lines the transform changes |
+| `diff` |  | write no source; print the changes as a unified diff with no context lines |
 
 | Name | Value | |
 | :--- | :--- | :--- |

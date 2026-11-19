@@ -37,7 +37,7 @@ the checkouts table of git: dep/\<id> is a submodule
 ### releases
 
 ```mach
-pub fun releases(s: *mach.session.Session, offline: bool, local: str) res[mach.package.source.Releases, mach.base.fail.Fail]
+pub fun releases(s: *mach.session.Session, offline: bool, local: str, rep: *mach.package.report.Report) res[mach.package.source.Releases, mach.base.fail.Fail]
 ```
 
 the releases table of git: a url's releases are its `v`-prefixed semver tags
@@ -47,6 +47,7 @@ the releases table of git: a url's releases are its `v`-prefixed semver tags
 | `s` | the session; the table's state is allocated from it |
 | `offline` | read releases only from local checkouts the table is told of, reaching no network |
 | `local` | a repository every url's releases are read from offline, or "" for none |
+| `rep` | hears a line before a url's releases are read from the network, nil for none |
 | **returns** | the table, released with its own `close`; err when git cannot be run |
 
 ### pin

@@ -77,6 +77,10 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 | [`id_of`](#id_of) | the id of `text`, interned in `itn`; a refused allocation is the failure |
 | [`optional_id_of`](#optional_id_of) | `id_of` for an optional key's value: STR_NIL for the empty text an absent key reads as |
 
+| Constants | |
+| :--- | :--- |
+| [`TARGET_PART_KEYS`](#constants) | how many keys of a target a resolution refuses by the part they state |
+
 ---
 
 ## NameList
@@ -156,6 +160,7 @@ pub rec TargetDef {
     runner:             *mach.base.intern.StrId;
     runner_count:       u32;
     runner_at:          *mach.base.source.Location;
+    parts_at:           [TARGET_PART_KEYS]mach.base.source.Location;
     at:                 mach.base.source.Location;
 }
 ```
@@ -182,6 +187,7 @@ the manifest text, unvalidated against the target registry
 | `runner` | `*mach.base.intern.StrId` | the `runner` argv templates the target's programs are launched through; nil when absent. freed by `dnit` |
 | `runner_count` | `u32` | length of `runner` |
 | `runner_at` | `*mach.base.source.Location` | where each `runner` entry is written |
+| `parts_at` | `[TARGET_PART_KEYS]mach.base.source.Location` | where each key a resolution refuses by its part is written, in the order of target.PART_KEYS, the nil location for a key the table does not write |
 | `at` | `mach.base.source.Location` | where the table's key is written |
 
 ### target_def
@@ -700,4 +706,10 @@ pub fun optional_id_of(itn: *mach.base.intern.Interner, text: str) res[mach.base
 ```
 
 `id_of` for an optional key's value: STR_NIL for the empty text an absent key reads as
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `TARGET_PART_KEYS` | `usize` | `8` | how many keys of a target a resolution refuses by the part they state |
 

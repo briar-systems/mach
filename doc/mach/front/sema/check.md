@@ -270,5 +270,5 @@ the range refusal of a suffixed literal its own suffix's type does not hold
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `GROWTH_NOTE` | `str` | `"a generic whose argument grows through a pointer is compared by the arguments its fields lay out, never walked. where two laid arguments differ in size or alignment, padding can line the layouts up at one depth and not the next, so the comparison is refused rather than decided"` |  |
+| `GROWTH_NOTE` | `str` | `"a generic whose argument grows through a pointer is compared by the layout of the arguments its fields hold, and arguments that differ in size or alignment cannot be compared. give both sides arguments of the same size and alignment"` |  |
 

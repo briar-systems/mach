@@ -92,5 +92,5 @@ whether record or union `tid` reaches itself through its members
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
 | `RECURSIVE_MSG` | `str` | `"recursive reference types require pointer capabilities absent from the Logical Shader environment"` |  |
-| `UNBOUNDED_MSG` | `str` | `"a reference into a generic whose argument grows through a pointer has unboundedly many types, which the Logical Shader environment cannot declare"` |  |
+| `UNBOUNDED_MSG` | `str` | `"a reference into a generic whose argument grows through a pointer names a new type at every step, which the Logical Shader environment cannot declare. keep the type out of shader code"` |  |
 

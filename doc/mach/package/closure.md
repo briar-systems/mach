@@ -227,13 +227,14 @@ pub rec Walk {
     offline: bool;
     all:     bool;
     name:    str;
+    quiet:   bool;
 }
 ```
 
 how a closure walk reads a fixed git dependency: at the revision its selector picks,
 fetching one its checkout lacks unless `offline`. a branch is read at its pin, or at its
 fetched tip when the walk is an update that moves it: every one under `all`, or the
-identity `name` names
+identity `name` names. a walk that reads releases from the network says so first unless `quiet`
 
 ## Functions
 

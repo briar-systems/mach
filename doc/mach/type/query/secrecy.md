@@ -74,6 +74,6 @@ whether two union variants overlaying one storage agree on every byte they share
 | `DISAGREE` | `Agreement` | `1` |  |
 | `UNDECIDABLE` | `Agreement` | `2` |  |
 | `NO_FIELD` | `u32` | `0xFFFFFFFF` |  |
-| `UNBOUNDED_VARIANTS_MSG` | `str` | `"union variants: cannot prove that overlapping fields agree on secrecy"` |  |
+| `UNBOUNDED_VARIANTS_MSG` | `str` | `"cannot prove that overlapping union fields agree on secrecy"` |  |
 | `UNBOUNDED_CAST_MSG` | `str` | `"cannot prove that the two types agree on secrecy"` |  |
 

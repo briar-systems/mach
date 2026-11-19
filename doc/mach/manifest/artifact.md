@@ -21,7 +21,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`find_artifact`](#find_artifact) | the artifact `m` declares under `name`, nil when none is |
 | [`find_artifact_by_name`](#find_artifact_by_name) | |
 | [`artifact_needs_artifact`](#artifact_needs_artifact) | whether a `need` entry of `a` selects `other`, a different artifact |
-| [`expand_artifact_output`](#expand_artifact_output) | expand an artifact's `out` for the target `vars` names; a refusal points at the `out` value |
+| [`expand_artifact_output`](#expand_artifact_output) | expand an artifact's `out` for the target `vars` names |
 | [`artifact_supports_target`](#artifact_supports_target) | whether an artifact's `targets` lists a target name or "*" |
 
 ---
@@ -111,7 +111,8 @@ whether a `need` entry of `a` selects `other`, a different artifact
 pub fun expand_artifact_output(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, a: *ArtifactDef, project_work: str, vars: *mach.manifest.template.Values) res[str, mach.base.fail.Fail]
 ```
 
-expand an artifact's `out` for the target `vars` names; a refusal points at the `out` value
+expand an artifact's `out` for the target `vars` names. a refusal of the target points at the
+target, one of the artifact's kind at its `kind`, and one of the template at its `out`
 
 ### artifact_supports_target
 

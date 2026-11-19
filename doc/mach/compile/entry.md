@@ -80,7 +80,7 @@ what the command line states of an entry build
 | `entry` | `str` | the entry file, a canonical path under the current directory |
 | `kind` | `str` | the artifact's product, mink's spelling |
 | `linkage` | `str` | the `--linkage` spelling, nil for the target's default |
-| `sources` | `*str` | each `-s` value, `name=dir` as written |
+| `sources` | `*str` | each `--source` value, `name=dir` as written |
 | `source_count` | `usize` | length of `sources` |
 | `target` | `str` | the `-t` spelling, nil for the host's system and architecture |
 | `narrowing` | `Narrowing` | the flags that narrow the target |

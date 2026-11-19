@@ -44,7 +44,7 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`text`](#text) | the text a failure carries, absent for a reported one |
 | [`describe`](#describe) | |
 | [`with_text`](#with_text) | the same failure carrying `text` instead, which it borrows: the class, the kind and the places are kept |
-| [`with_secondary`](#with_secondary) | the same failure also naming `secondary`, a failure met while releasing what the failing path held (a child cancelled, a file removed, a source closed): the text gains "; cleanup also failed: " and the secondary's, joined into `a`, and the class, kind and places stay the failure's |
+| [`with_secondary`](#with_secondary) | the same failure also naming `secondary`, a failure met while releasing what the failing path held (a child cancelled, a file removed, a source closed): the text gains " |
 | [`retain`](#retain) | a copy of the failure that owns its text and its places through `a`, for a failure that outlives the storage its message was made in; released with `dnit` |
 | [`dnit`](#dnit) | release what a failure owns through `a`: its text and its places, each when it owns them |
 | [`places_retain`](#places_retain) | a copy of the failure whose places, every related place and its fix, are owned through `a`, its text left as it is; for a holder that keeps the text apart |
@@ -52,7 +52,7 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`without_places`](#without_places) | the same failure pointing nowhere, naming no related place and carrying no fix, for a holder whose places were released or never copied |
 | [`same_places`](#same_places) | whether two failures hold the same places: the same location and the same related and fix storage, as a holder that copied them once sees its own copy |
 | [`unit`](#unit) | the unit outcome of an operation whose value is not needed |
-| [`prefixed`](#prefixed) | `cause` with `context` in front of its text, joined into `a`, which owns the new text; the class, the kind and the places are kept |
+| [`prefixed`](#prefixed) | `cause` with `context` in front of its text, which follows in parentheses, joined into `a`, which owns the new text; the class, the kind and the places are kept |
 | [`formatted`](#formatted) | an internal failure whose text is `fmt` formatted with `va` into `a`, which the failure owns; a refusal to format is the failure instead |
 | [`formatted_user`](#formatted_user) | a user failure under `k` whose text is `fmt` formatted with `va` into `a`, which the failure owns; a refusal to format is the failure instead |
 | [`message_of`](#message_of) | the internal failure carrying a made text, which it borrows (a made text may be interned), or the failure that refused to make it |
@@ -336,7 +336,7 @@ pub fun with_secondary(a: *std.allocator.Allocator, f: Fail, secondary: Fail) Fa
 
 the same failure also naming `secondary`, a failure met while releasing what
 the failing path held (a child cancelled, a file removed, a source closed):
-the text gains "; cleanup also failed: " and the secondary's, joined into
+the text gains ". cleanup also failed (" and the secondary's, joined into
 `a`, and the class, kind and places stay the failure's. a reported failure
 has no text to carry it, so the secondary goes out in its place, the reported
 diagnostics already recorded, and a reported secondary already named itself.
@@ -413,10 +413,11 @@ the unit outcome of an operation whose value is not needed
 pub fun prefixed(a: *std.allocator.Allocator, context: str, cause: Fail) Fail
 ```
 
-`cause` with `context` in front of its text, joined into `a`, which owns the
-new text; the class, the kind and the places are kept. a reported cause has
-no text to extend, and a refused join leaves the cause as it was, keeping the
-ownership it had, so the context never takes the cause's place
+`cause` with `context` in front of its text, which follows in parentheses,
+joined into `a`, which owns the new text; the class, the kind and the places
+are kept. a reported cause has no text to extend, and a refused join leaves
+the cause as it was, keeping the ownership it had, so the context never takes
+the cause's place
 
 ### formatted
 

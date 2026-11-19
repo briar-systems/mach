@@ -5,8 +5,11 @@
 `mach init`, which scaffolds a project: its manifest, entry file and std dependency
 
 the entry is `src/bin/main.mach` with a bin artifact, or under `--lib`
-`src/lib/<id>.mach` with a static artifact. std is added at the caret range of the
-release resolution picks for the running compiler, and checked out unless `--no-deps`.
+`src/lib/<id>.mach` with a static artifact. std is declared at the caret range of the
+release resolution picks for the running compiler, which is resolved before anything is
+written, so a project is made whole or not at all, and is then checked out. `--no-deps`
+declares no dependency and reads nothing from the network. a project made in a git
+repository ignores its work directory.
 
 Source: [`src/cli/cmd/init.mach`](../../../../src/cli/cmd/init.mach)
 
@@ -32,18 +35,19 @@ pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 ```
 
 `mach init`: scaffold a project. the positional names the directory (default the working
-directory) and, unless `--name` is given, the project id, which must be a portable
-identifier. an absent directory is created whole; an existing one is filled in, and
-`--force` allows overwriting mach.toml and the entry file. the entry is src/bin/main.mach and
-a bin artifact, or with `--lib` src/lib/\<id>.mach and a static artifact. the std dependency
-is then added at the caret range of the release resolution picks and checked out, unless
-`--no-deps`, which still resolves the range (so needs the network) but skips the checkout.
-`--quiet` silences progress
+directory) and, unless `--name` is given, the project id: the directory's name, with each '-'
+written as '_' where the name is not a project id as written. an absent directory is created
+whole; an existing one is filled in, and `--force` allows overwriting mach.toml and the entry
+file. the entry is src/bin/main.mach and a bin artifact, or with `--lib` src/lib/\<id>.mach and
+a static artifact. the std dependency's range is resolved before anything is written, and the
+release is checked out once the project is. `--no-deps` declares no dependency and reads nothing
+from the network. in git mode the project is made a repository unless it stands in one, and a
+`.gitignore` naming its work directory is written where none is. `--quiet` silences progress
 
 | Parameter | |
 | :--- | :--- |
 | `cx` | the call |
-| **returns** | exit.OK, or the failure: a user one for an invalid id or a refused overwrite, otherwise the std dependency's own class when it could not be added |
+| **returns** | exit.OK, or the failure: a user one for an invalid id or a refused overwrite, otherwise the class of the failure that resolving, initializing git or checking out met |
 
 ## Constants
 

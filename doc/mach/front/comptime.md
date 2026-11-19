@@ -130,6 +130,6 @@ the case the head of the literal `e` selects, STR_NIL for a record literal or an
 | `COMPTIME_TYPE_NEEDS_INSTANCE_MSG` | `str` | `"a type comparison on an unsubstituted generic parameter is only decidable at an instantiation"` |  |
 | `COMPTIME_FIELD_UNKNOWN_MEMBER_MSG` | `str` | `` "a field descriptor has only `.name`, `.type`, and `.offset`" `` |  |
 | `COMPTIME_CASE_UNKNOWN_MEMBER_MSG` | `str` | `` "a case descriptor has only `.name`, `.has_payload`, `.type`, `.offset`, and `.code`" `` |  |
-| `COMPTIME_DESCRIPTOR_LAYOUT_MSG` | `str` | `"this descriptor's offset has no answer: the layout of its owning type could not be determined"` |  |
-| `COMPTIME_SECRET_MSG` | `str` | `` "a value whose type holds a secret has no compile-time value; declassify it where a compile-time value is meant, as in `K:>u64`" `` |  |
+| `COMPTIME_DESCRIPTOR_LAYOUT_MSG` | `str` | `"this descriptor's offset has no answer, because the layout of its owning type could not be determined"` |  |
+| `COMPTIME_SECRET_MSG` | `str` | `` "a value whose type holds a secret has no compile-time value. declassify it where one is meant, as in `K:>u64`" `` |  |
 

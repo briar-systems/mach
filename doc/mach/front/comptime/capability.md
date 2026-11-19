@@ -250,7 +250,7 @@ pub fun parsed_head[T](ctx: *T, a: *mach.front.ast.Ast, tid: mach.front.ast.id.T
 | `FIELD_SEL_HAS_PAYLOAD` | `u8` | `4` |  |
 | `FIELD_SEL_CODE` | `u8` | `5` |  |
 | `FIELD_SEL_TYPE_BY_NAME` | `u8` | `6` |  |
-| `COMPTIME_CASE_NO_PAYLOAD_MSG` | `str` | `` "this case has no payload, so it has no `.type` or `.offset`; gate on `.has_payload` first" `` |  |
+| `COMPTIME_CASE_NO_PAYLOAD_MSG` | `str` | `` "this case has no payload, so it has no `.type` or `.offset`. gate on `.has_payload` first" `` |  |
 | `TYPE_QUERY_IS_RECORD` | `u8` | `0` |  |
 | `TYPE_QUERY_IS_UNION` | `u8` | `1` |  |
 | `TYPE_QUERY_IS_POINTER` | `u8` | `2` |  |

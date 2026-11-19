@@ -49,6 +49,7 @@ pub rec ReleaseNeeds {
     mach:     str;
     needs:    Vector[Need];
     excluded: str;
+    detail:   str;
 }
 ```
 
@@ -56,7 +57,8 @@ what a release asks for: the compiler range its manifest states ("" for none) an
 dependencies selected by version range. `excluded` is "" for a candidate and otherwise says
 why the release is not one (its manifest does not load, or names another version): the
 release is set aside and the reason explains a failure it takes part in, while a failure to
-read the release at all is the NeedsFn's err and stops resolution
+read the release at all is the NeedsFn's err and stops resolution. `detail` is what the
+manifest's load said, or nil
 
 ## Lock
 
