@@ -32,6 +32,7 @@ The directory's root module is [`mach.compile`](../compile.md).
 | [`surface`](surface.md) | what of a module's source text a reader of it depends on, as the spans a walk of its syntax omits |
 | [`union`](union.md) | the union build's targets, under which every gate is decided, and every artifact's entry |
 | [`unit`](unit.md) | one unit's object, normal or test, made in two steps: a unit is one module, or every module of an artifact where the target's family compiles it whole |
+| [`workers`](workers.md) | the threads a codegen pass compiles on: a pool over std.sync.worker_pool that runs each task it is handed on a thread with the driver's stack reserve, then reports the task's index on a channel of finished indices, which only the owner reads |
 
 | Directory | |
 | :--- | :--- |

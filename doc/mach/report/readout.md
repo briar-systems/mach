@@ -27,7 +27,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`Phase`](#phase) | `def` | a readout phase, an index into the phase table |
 | [`Counter`](#counter) | `def` | a readout counter, an index into the counter table |
 | [`Unit`](#unit) | `rec` | a unit of the plan starts: what its goal calls the work (`building`, `checking`), the artifact, the target and the profile |
-| [`PhaseEnd`](#phaseend) | `rec` | a phase row closes: the count it processed, in the noun that counts it, its time, the modules it dropped as target-gated, and under LEVEL_ITEMS its slowest item, nil when it had fewer than two |
+| [`PhaseEnd`](#phaseend) | `rec` | a phase row closes: the count it processed, in the noun that counts it, its time, the threads that time is summed over (0 for a row of the unit's own time), the modules it dropped as target-gated, and under LEVEL_ITEMS its slowest item, nil when it had fewer than two |
 | [`Item`](#item) | `rec` | one module or file a phase finished, when it finished |
 | [`Tally`](#tally) | `rec` | a counter's value: one module's under LEVEL_ITEMS, named by it, or the unit's total under LEVEL_PHASES, with a nil name |
 | [`Summary`](#summary) | `rec` | a unit built its output: the path, the modules in it, its size in bytes when the output is one file, the time no row accounts for, and the unit's wall time |
@@ -91,6 +91,8 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`start`](#start) | start a unit's progress over sink, timed from now |
 | [`phase_begin`](#phase_begin) | phase ph's row opens now; its time runs to phase_end, less what is carved out of it |
 | [`phase_carved`](#phase_carved) | phase ph runs inside another phase and is timed by the spans moved into it |
+| [`phase_summed`](#phase_summed) | phase ph runs on up to `threads` threads side by side, timed by the sum of what each spent (summed_into): its row is not part of the unit's wall time and says how many threads it sums |
+| [`summed_into`](#summed_into) | the time d one thread spent in the summed phase ph |
 | [`phase_dropped`](#phase_dropped) | phase ph dropped n modules as target-gated |
 | [`span_begin`](#span_begin) | the start of a span that span_end moves into a hosted phase |
 | [`span_end`](#span_end) | the span from start belongs to ph, and leaves the phase host that ran it |
@@ -204,6 +206,7 @@ pub rec PhaseEnd {
     noun_one:        str;
     noun_many:       str;
     elapsed:         std.chrono.duration.Duration;
+    threads:         u32;
     dropped:         u32;
     slowest:         str;
     slowest_elapsed: std.chrono.duration.Duration;
@@ -211,8 +214,9 @@ pub rec PhaseEnd {
 ```
 
 a phase row closes: the count it processed, in the noun that counts it, its
-time, the modules it dropped as target-gated, and under LEVEL_ITEMS its slowest
-item, nil when it had fewer than two
+time, the threads that time is summed over (0 for a row of the unit's own
+time), the modules it dropped as target-gated, and under LEVEL_ITEMS its
+slowest item, nil when it had fewer than two
 
 ## Item
 
@@ -486,6 +490,23 @@ pub fun phase_carved(pr: *Progress, ph: Phase)
 ```
 
 phase ph runs inside another phase and is timed by the spans moved into it
+
+### phase_summed
+
+```mach
+pub fun phase_summed(pr: *Progress, ph: Phase, threads: u32)
+```
+
+phase ph runs on up to `threads` threads side by side, timed by the sum of what each spent
+(summed_into): its row is not part of the unit's wall time and says how many threads it sums
+
+### summed_into
+
+```mach
+pub fun summed_into(pr: *Progress, ph: Phase, d: std.chrono.duration.Duration)
+```
+
+the time d one thread spent in the summed phase ph
 
 ### phase_dropped
 

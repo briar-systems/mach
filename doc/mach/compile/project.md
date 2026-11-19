@@ -420,6 +420,8 @@ pub rec Project {
     # and holding the one whose failure ended the pass, which are all its presentation names
     codegen_reached: u32;
     test_reached:    u32;
+    # the threads the codegen pass compiled on, 1 when it compiled on the owner, which the test pass follows
+    codegen_threads: u32;
     # every instance the build's modules met, described for its typing
     instances: mach.compile.demand.Registry;
     # the digests of the objects the cell's builds wrote into `obj/` (compile/cache/objects)
