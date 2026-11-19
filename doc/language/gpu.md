@@ -900,10 +900,10 @@ nor a pointer into a `#[gpu.uniform]`, `#[gpu.push]`, `#[gpu.input]` or
 instead or reaches the binding in the callee.
 
 A row may also be **typed**: its requirement depends on the type it operates on, read
-from one operand (a pointer's pointee), and on the storage class that operand's
-memory lives in. The atomics are typed. A declaration whose type the row admits in no
-storage class is refused with `op.signature`, and each call is checked where its
-storage class is known. A load reads its pointer and every other atomic writes it, so
+from one operand (a pointer's pointee), and for a pointer on the storage class that
+operand's memory lives in. The atomics and the integer dot products are typed. A
+declaration whose pointee the row admits in no storage class is refused with
+`op.signature`, and each call is checked where its storage class is known. A load reads its pointer and every other atomic writes it, so
 a `"readonly"` binding admits only an atomic load.
 
 ```mach
@@ -956,6 +956,28 @@ naming no `env` holds them all. The integer atomics are `OpAtomicLoad`, `OpAtomi
 |--------------------------------------------------------|------------------------------------|
 | a type the row admits only in other storage classes    | `spirv.capability`, naming the class |
 | a type whose capability the target does not select     | `spirv.capability`, naming the capability |
+
+The six integer dot products (`OpSDot`, `OpUDot`, `OpSUDot` and their `AccSat` forms)
+are typed by the shape of Vector 1, which Vector 2 shares: a 32-bit scalar is the
+packed form, four 8-bit components in one integer, read under its Packed Vector Format
+operand. Each shape needs an input capability beside `DotProduct` (SPIR-V 1.6, OpSDot:
+"32-bit integers (enabled by the DotProductInput4x8BitPacked capability) or vectors of
+integer type (enabled by the DotProductInput4x8Bit or DotProductInputAll
+capability)"). A call declares the narrowest capability the target's `ext` holds that
+covers its shape, and is refused with `spirv.capability`, naming the narrowest one,
+where the target holds none of them. Vulkan's `shaderIntegerDotProduct` feature
+(`VkPhysicalDeviceVulkan13Features`, or `VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR`
+under `VK_KHR_shader_integer_dot_product`) enables all four capabilities.
+
+| Vector 1 | `ext`, the narrowest first |
+|----------|----------------------------|
+| `u32` or `i32`, packed | `DotProductInput4x8BitPacked` |
+| `i8x4` or `u8x4` | `DotProductInput4x8Bit`, which implies `Int8`, or `DotProductInputAll` |
+| any other integer vector | `DotProductInputAll` |
+
+An 8-bit vector on a target that holds neither `Int8` nor `DotProductInput4x8Bit` is
+carried in 32-bit components ([manifest.md](manifest.md#finished-module-targets)), so it
+needs `DotProductInputAll`.
 
 A row also states how its operands' types and its result's **relate** to the type it
 operates on, the type of the one operand its typing reads (a pointer's pointee). A
