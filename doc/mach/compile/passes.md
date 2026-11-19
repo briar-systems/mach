@@ -29,7 +29,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`run_test_pass`](#run_test_pass) | the test stage's computation: each test object's typed inputs, then each test object |
 | [`run_codegen_pass`](#run_codegen_pass) | each module in topological order, its front-end products given back once nothing after reads them: an importer's lowering reads the definitions of every module it reaches, so a module is held until the last module reaching it is lowered, and a test build lowers every module again |
 | [`test_codegen_reusable`](#test_codegen_reusable) | the test object's codegen product is current or cached, so no worker generates it |
-| [`compile_module`](#compile_module) | the mirl module `m` compiled into an object, which owns its storage in the session's backing allocator, the warnings mirl gave reported on `diags` |
+| [`compile_module`](#compile_module) | the mirl module `m`, the project's own, compiled into an object, which owns its storage in the session's backing allocator, the warnings mirl gave reported on `diags` |
 | [`run_link_pass`](#run_link_pass) | the link stage's computation: the current objects, then the link the build's job names, which runs only when one of its inputs moved |
 | [`prepare_link`](#prepare_link) | before the link stage's operation: when the artifact on disk is not what the link last wrote to `artifact`, or nothing was linked yet, LINK_ARTIFACT moves to a value it never held, the database's next revision, so the link runs again |
 | [`prepare_object_cache`](#prepare_object_cache) | key the loaded modules and read `obj/` under their keys (compile/cache), reported as the cache phase carved out of resolve, which it precedes |
@@ -186,7 +186,7 @@ the test object's codegen product is current or cached, so no worker generates i
 pub fun compile_module(p: *mach.compile.project.Project, diags: *mach.base.diagnostic.DiagnosticStore, m: *Module, name: str) res[Object, mach.base.fail.Fail]
 ```
 
-the mirl module `m` compiled into an object, which owns its storage in the session's backing
+the mirl module `m`, the project's own, compiled into an object, which owns its storage in the session's backing
 allocator, the warnings mirl gave reported on `diags`. compiling spends the module
 
 ### run_link_pass

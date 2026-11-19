@@ -46,6 +46,7 @@ Source: [`src/base/diagnostic/kind.mach`](../../../../src/base/diagnostic/kind.m
 | [`DEF_CYCLE`](#kind) | a type alias whose definition names itself, directly or through other aliases |
 | [`spec`](#spec) | the row of `k`, nil for NONE or a kind no row declares |
 | [`is_error`](#is_error) | a diagnostic of kind `k` is an error: severity is the row's level, and a kind no row declares is a defect, raised as an error if at all |
+| [`is_warning`](#is_warning) | a diagnostic of kind `k` is a warning |
 | [`is_note`](#is_note) | a diagnostic of kind `k` is a note |
 | [`live`](#live) | the kind can be raised: a row declares it and it is not retired |
 | [`key_of`](#key_of) | the key of `k`, nil for NONE or a kind no row declares |
@@ -583,6 +584,14 @@ pub fun is_error(k: Kind) bool
 
 a diagnostic of kind `k` is an error: severity is the row's level, and a kind
 no row declares is a defect, raised as an error if at all
+
+### is_warning
+
+```mach
+pub fun is_warning(k: Kind) bool
+```
+
+a diagnostic of kind `k` is a warning
 
 ### is_note
 

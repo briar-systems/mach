@@ -35,8 +35,8 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`registry_init`](#registry_init), [`registry_dnit`](#registry_dnit) | |
 | [`reset_module_registry`](#reset_module_registry) | forget every project module identity, keeping the stable identities, which outlive a load |
 | [`module_count`](#module_count) | one past the highest project module id the registry holds an identity for |
-| [`register_module_root_project`](#register_module_root_project) | |
-| [`module_is_root_project`](#module_is_root_project) | a module the loader never declared is not the root project's: a dependency's module, or one loaded outside a project, exports nothing of its own |
+| [`register_module_warned`](#register_module_warned) | the build shows the warnings of the module `mid`, as its package's `warned` declares |
+| [`module_warned`](#module_warned) | whether the build shows the warnings of the module `mid` |
 | [`module_fqn`](#module_fqn), [`stable_module_id`](#stable_module_id), [`stable_module_id_lookup`](#stable_module_id_lookup), [`register_stable_mid`](#register_stable_mid), [`module_id_for_stable`](#module_id_for_stable) | |
 | [`register_module_identity`](#register_module_identity) | give the module `mid` its name and stable identity; a project's module also counts toward module_count, a standalone buffer's does not |
 | [`unregister_module_identity`](#unregister_module_identity) | |
@@ -147,7 +147,7 @@ pub fun stable_is_nil(m: StableModuleId) bool
 pub rec Registry {
     count:         u32;
     fqns:          std.collections.map.Map[ModuleId, mach.base.intern.StrId];
-    root_project:  std.collections.map.Map[ModuleId, bool];
+    warned:        std.collections.map.Map[ModuleId, bool];
     stable_ids:    std.collections.map.Map[mach.base.intern.StrId, StableModuleId];
     stable_next:   StableModuleId;
     stable_to_mid: std.collections.map.Map[StableModuleId, ModuleId];
@@ -162,7 +162,7 @@ outlives the loads that reuse it
 | :--- | :--- | :--- |
 | `count` | `u32` | one past the highest project module id held; below BUFFER_BASE, so it never wraps |
 | `fqns` | `std.collections.map.Map[ModuleId, mach.base.intern.StrId]` | each module's fully qualified name |
-| `root_project` | `std.collections.map.Map[ModuleId, bool]` | which modules belong to the root project rather than a dependency, declared by the loader as it gives the module its id; a shared library's export surface is drawn from these alone |
+| `warned` | `std.collections.map.Map[ModuleId, bool]` | the modules whose warnings the build shows, declared by the loader as it gives the module its id, from its package (`mach.compile.request.shows_warnings`). the store and every pass whose only product is a warning read it here |
 | `stable_ids` | `std.collections.map.Map[mach.base.intern.StrId, StableModuleId]` | the stable identity of each name |
 | `stable_next` | `StableModuleId` | the next stable identity to issue |
 | `stable_to_mid` | `std.collections.map.Map[StableModuleId, ModuleId]` | the module each stable identity is loaded as |
@@ -195,20 +195,22 @@ pub fun module_count(r: *Registry) u32
 
 one past the highest project module id the registry holds an identity for
 
-### register_module_root_project
+### register_module_warned
 
 ```mach
-pub fun register_module_root_project(r: *Registry, mid: ModuleId, root: bool) err[mach.base.fail.Fail]
+pub fun register_module_warned(r: *Registry, mid: ModuleId, warned: bool) err[mach.base.fail.Fail]
 ```
 
-### module_is_root_project
+the build shows the warnings of the module `mid`, as its package's `warned` declares
+
+### module_warned
 
 ```mach
-pub fun module_is_root_project(r: *Registry, mid: ModuleId) bool
+pub fun module_warned(r: *Registry, mid: ModuleId) bool
 ```
 
-a module the loader never declared is not the root project's: a dependency's
-module, or one loaded outside a project, exports nothing of its own
+whether the build shows the warnings of the module `mid`. a module the loader never declared,
+as a standalone editor buffer's, belongs to no project, and its warning-only passes do not run
 
 ### module_fqn
 

@@ -41,7 +41,9 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 
 | On `BuildRequest` | |
 | :--- | :--- |
-| [`defaults`](#defaults), [`validate`](#validate), [`is_release`](#is_release), [`for_cell`](#for_cell), [`semantic_hash`](#semantic_hash) | |
+| [`defaults`](#defaults), [`validate`](#validate) | |
+| [`shows_warnings`](#shows_warnings) | whether a build shows the warnings of a package, the project being built where `root` holds and a dependency otherwise: its own always, a dependency's only under `--dep-warnings` |
+| [`is_release`](#is_release), [`for_cell`](#for_cell), [`semantic_hash`](#semantic_hash) | |
 
 | Functions | |
 | :--- | :--- |
@@ -78,6 +80,7 @@ pub rec Overrides {
     emit_asm:     bool;
     emit_ir:      bool;
     verify:       bool;
+    dep_warnings: bool;
     optimize:     Lever;
     debug:        Lever;
     threads:      u32;
@@ -191,8 +194,11 @@ pub rec BuildRequest {
     subsystem: opt[*mink.catalog.subsystem.Subsystem];
     simd:      mach.manifest.model.SimdMode;
     # the warning kinds the profile silences: presentation only, so no part of the request hash
-    allow:   mach.base.diagnostic.kind.KindSet;
-    threads: u32;
+    allow: mach.base.diagnostic.kind.KindSet;
+    # the build shows its dependencies' warnings too, each under that dependency's own `allow`:
+    # presentation only, so no part of the request hash
+    dep_warnings: bool;
+    threads:      u32;
 
     emit_ir:  bool;
     emit_asm: bool;
@@ -230,6 +236,17 @@ pub fun defaults() BuildRequest
 ```mach
 pub fun validate(a: *std.allocator.Allocator, r: *BuildRequest) err[mach.base.fail.Fail]
 ```
+
+### shows_warnings
+
+```mach
+pub fun shows_warnings(r: *BuildRequest, root: bool) bool
+```
+
+whether a build shows the warnings of a package, the project being built where `root` holds
+and a dependency otherwise: its own always, a dependency's only under `--dep-warnings`. the one
+statement of the rule, which the store's governance and every pass whose only product is a
+warning read through the module registry
 
 ### is_release
 

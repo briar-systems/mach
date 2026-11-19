@@ -37,7 +37,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](pr
 | [`instance_reads`](#instance_reads) | the modules the instance `item` names: its declaring module first, then every module declaring a type its arguments or pack name |
 | [`instance_deps_dnit`](#instance_deps_dnit) | release what instance_deps made |
 | [`begin_query_phase`](#begin_query_phase) | open a query operation over the project: the build context must be as it was frozen, and the type projections the last operation installed are reset |
-| [`refresh_diagnostics`](#refresh_diagnostics) | the session's store is rebuilt from the project's and the query presentation's, dropping the warnings a declaration's `#[expect]` acknowledges and the ones the profile's `allow` silences, then reporting each judged expectation nothing fulfilled |
+| [`refresh_diagnostics`](#refresh_diagnostics) | the session's store is rebuilt from the project's and the query presentation's, dropping the warnings a declaration's `#[expect]` acknowledges and the ones their owner's governance hides or silences, then reporting each judged expectation nothing fulfilled |
 | [`products_dnit`](#products_dnit) | give back a lowered module's front-end products, which nothing the build runs after its lowering reads: its syntax tree, its resolution, its lowering scope and what its typing holds beyond the interface its importers' lowerings read |
 | [`finish_query_phase`](#finish_query_phase) | close a query operation over the project and show it: end it, hold its failure where the session presents it, collect the diagnostics of every product the roots reach into the session's presentation and refresh the session's store from it |
 
@@ -211,8 +211,8 @@ pub fun refresh_diagnostics(p: *mach.compile.project.Project) err[mach.base.fail
 ```
 
 the session's store is rebuilt from the project's and the query presentation's,
-dropping the warnings a declaration's `#[expect]` acknowledges and the ones the
-profile's `allow` silences, then reporting each judged expectation nothing
+dropping the warnings a declaration's `#[expect]` acknowledges and the ones their
+owner's governance hides or silences, then reporting each judged expectation nothing
 fulfilled. a warning replayed from the cache passes through here as a fresh one does
 
 ### products_dnit

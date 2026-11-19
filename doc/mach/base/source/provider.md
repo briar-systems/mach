@@ -42,6 +42,7 @@ pub rec Home {
     package: mach.base.intern.StrId;
     version: mach.base.intern.StrId;
     root:    bool;
+    warned:  bool;
 }
 ```
 
@@ -53,6 +54,7 @@ the package that owns a module and the file it is read from inside that package
 | `package` | `mach.base.intern.StrId` | the owning package's id, what `$mach.project.id` reads |
 | `version` | `mach.base.intern.StrId` | the owning package's version |
 | `root` | `bool` | the package being built owns it, not one of its dependencies |
+| `warned` | `bool` | the build shows the owning package's warnings |
 
 ## Origin
 

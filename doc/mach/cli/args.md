@@ -76,6 +76,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`THREADS`](#constants) | `--threads <n>` |
 | [`LIB_DIR`](#constants) | `--library-dir <dir>`, `-L` |
 | [`LIB`](#constants) | `--library <name>`, `-l` |
+| [`DEP_WARNINGS`](#constants) | `--dep-warnings` |
 | [`NO_CACHE`](#constants) | `--no-cache` |
 | [`DIAGNOSTICS`](#constants) | `--diagnostics <human\|json>`: how diagnostics, failures and a test run's results reach stderr |
 | [`PLAN`](#constants) | `--plan` |
@@ -417,6 +418,7 @@ any other failure is returned as given
 | `THREADS` | `std.args.Flag` | `std_args.Flag{long: "threads", short: 0, value: "n", repeat: false, negatable: false, help: "how many test processes run at once (default: host CPUs); a build runs on one thread"}` | `--threads <n>` |
 | `LIB_DIR` | `std.args.Flag` | `std_args.Flag{long: "library-dir", short: 'L', value: "dir", repeat: true, negatable: false, help: "add a library search directory"}` | `--library-dir <dir>`, `-L` |
 | `LIB` | `std.args.Flag` | `std_args.Flag{long: "library", short: 'l', value: "name", repeat: true, negatable: false, help: "link a library, object or archive by name"}` | `--library <name>`, `-l` |
+| `DEP_WARNINGS` | `std.args.Flag` | `std_args.Flag{long: "dep-warnings", short: 0, value: nil, repeat: false, negatable: false, help: "also show dependencies' warnings, each under its own allow and #[expect]"}` | `--dep-warnings` |
 | `NO_CACHE` | `std.args.Flag` | `std_args.Flag{long: "no-cache", short: 0, value: nil, repeat: false, negatable: false, help: "rebuild without reusing cached objects or steps"}` | `--no-cache` |
 | `DIAGNOSTICS` | `std.args.Flag` | `std_args.Flag{long: "diagnostics", short: 0, value: "human\|json", repeat: false, negatable: false, help: "diagnostics as human text or NDJSON (default: human)"}` | `--diagnostics <human\|json>`: how diagnostics, failures and a test run's results reach stderr |
 | `PLAN` | `std.args.Flag` | `std_args.Flag{long: "plan", short: 0, value: nil, repeat: false, negatable: false, help: "print the build plan without building"}` | `--plan` |

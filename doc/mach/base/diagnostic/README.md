@@ -5,8 +5,8 @@
 diagnostics, the builder that assembles one and the store that collects them
 
 a store keeps its diagnostics in commit order and never holds the same report twice. it drops
-the warnings a silenced kind or an `#[expect]` covers and reports an expectation nothing
-fulfilled. a store replays into another and encodes to bytes that name files by path, so
+the warnings an `#[expect]` covers, and the warnings their owner's governance hides or
+silences, and reports an expectation nothing fulfilled. a store replays into another and encodes to bytes that name files by path, so
 another session can decode it. the texts a diagnostic or failure carries are interned here
 when they must outlive the scratch storage they were made in.
 

@@ -11,7 +11,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.sema.contex
 
 | Functions | |
 | :--- | :--- |
-| [`warn_deprecated_uses`](#warn_deprecated_uses) | |
+| [`warn_deprecated_uses`](#warn_deprecated_uses) | warn at each use of a deprecated declaration, where the build shows the module's warnings, since warning is all it does |
 | [`check_testing_uses`](#check_testing_uses) | a reference to a `#[testing]` declaration is legal only inside a test body or another `#[testing]` declaration: every resolved name and type use is checked against the source ranges of those declarations, and an unmarked `fwd` may not re-export one |
 
 ---
@@ -23,6 +23,9 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.sema.contex
 ```mach
 pub fun warn_deprecated_uses(sc: *mach.front.sema.context.SemaContext) err[mach.base.fail.Fail]
 ```
+
+warn at each use of a deprecated declaration, where the build shows the module's warnings, since
+warning is all it does
 
 ### check_testing_uses
 

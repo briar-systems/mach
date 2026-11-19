@@ -107,6 +107,7 @@ pub rec Job {
     name:     str;
     timed:    bool;
     sources:  *mach.base.source.SourceMap;
+    owner:    str;
 }
 ```
 
@@ -122,6 +123,7 @@ how one lowered unit is compiled, all of it read only to the step
 | `name` | `str` | the name of the object it makes, the module's or its test object's, no other object's in a link, which refusals name and the object's format may name symbols after |
 | `timed` | `bool` | whether mirl times and counts its stages, which only a readout reads |
 | `sources` | `*mach.base.source.SourceMap` | the texts a failure or warning of the compile points into |
+| `owner` | `str` | the dependency whose code the module is, which a refusal names, nil for the project being built |
 
 ### compile
 

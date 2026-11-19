@@ -32,6 +32,7 @@ pub rec Package {
     dir:     mach.base.intern.StrId;
     src:     mach.base.intern.StrId;
     root:    bool;
+    warned:  bool;
 }
 ```
 
@@ -45,6 +46,7 @@ the package id, and the rest is the module's path under `src`
 | `dir` | `mach.base.intern.StrId` | the package's directory |
 | `src` | `mach.base.intern.StrId` | its source directory, relative to `dir` |
 | `root` | `bool` | it is the package being built |
+| `warned` | `bool` | the build shows its warnings |
 
 ## Disk
 

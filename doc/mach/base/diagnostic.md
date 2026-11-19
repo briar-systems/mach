@@ -5,8 +5,8 @@
 diagnostics, the builder that assembles one and the store that collects them
 
 a store keeps its diagnostics in commit order and never holds the same report twice. it drops
-the warnings a silenced kind or an `#[expect]` covers and reports an expectation nothing
-fulfilled. a store replays into another and encodes to bytes that name files by path, so
+the warnings an `#[expect]` covers, and the warnings their owner's governance hides or
+silences, and reports an expectation nothing fulfilled. a store replays into another and encodes to bytes that name files by path, so
 another session can decode it. the texts a diagnostic or failure carries are interned here
 when they must outlive the scratch storage they were made in.
 
@@ -22,6 +22,7 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`FixId`](#fixid) | `def` | a fix's position in its diagnostic's fix list |
 | [`Diagnostic`](#diagnostic) | `rec` | one diagnostic; its severity is its kind's, read with `is_error` |
 | [`DiagnosticStore`](#diagnosticstore) | `rec` | the diagnostics of a build, in the order they were committed |
+| [`Governance`](#governance) | `rec` | how the owner of a warning, the project being built or one of its dependencies, governs it as it reaches a store: whether the build shows the owner's warnings at all, and the kinds the owner's own `allow` silences |
 | [`Expectation`](#expectation) | `rec` | one key of a declaration's `#[expect]`: a warning of a kind it selects, located in the declaration's own file between `start` and `end`, is acknowledged there and dropped |
 | [`DiagnosticBuilder`](#diagnosticbuilder) | `rec` | a diagnostic being assembled: notes, help, related places and fixes attach here, and `commit` hands the whole to a store |
 | [`SourceTable`](#sourcetable) | `rec` | how an encoded store names its files: by path, which outlives the file ids of the session that encoded it |
@@ -43,7 +44,9 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | :--- | :--- |
 | [`store_init`](#store_init) | |
 | [`set_origin`](#set_origin) | attribute every diagnostic committed to the store from now on whose builder names no origin to `o`; a diagnostic already committed keeps its own |
-| [`silence`](#silence) | drop every warning of a kind in `set` that reaches the store from now on |
+| [`govern`](#govern) | govern the warnings of the project being built that reach the store from now on by `g` |
+| [`owner_add`](#owner_add) | a further owner of warnings, governed by `g`, whose files `own` hands it |
+| [`own`](#own) | the warnings that stand in `file` belong to `owner`, one `owner_add` gave |
 | [`expect`](#expect) | acknowledge every warning an expectation in `list` covers as it reaches the store; the store takes the list, whatever the outcome, and indexes it by file |
 | [`report_unfulfilled`](#report_unfulfilled) | an expectation nothing fulfilled is itself a warning, where it is judged: a build with errors judges none, since a pass it stopped may have been the one to raise the warning |
 | [`drop_file`](#drop_file) | drop every diagnostic located in one file, keeping the rest in order |
@@ -193,8 +196,13 @@ pub rec DiagnosticStore {
     epoch:       u64;
     # the origin a diagnostic committed here takes when its builder names none
     origin: Origin;
-    # warnings of these kinds are dropped as they reach the store
-    silenced: mach.base.diagnostic.kind.KindSet;
+    # how the project being built governs its warnings, and a warning that stands in no file
+    # another owner holds
+    built: Governance;
+    # how each other owner governs its warnings, and the owner of each file one holds, a
+    # position in `others` keyed by the file's index
+    others: Vector[Governance];
+    owners: std.collections.map.Map[u32, u32];
     # the `#[expect]` acknowledgements a warning is matched against before it
     # is silenced or kept, in the order they were gathered
     expects: Vector[Expectation];
@@ -226,13 +234,33 @@ pub fun set_origin(store: *DiagnosticStore, o: Origin)
 attribute every diagnostic committed to the store from now on whose builder
 names no origin to `o`; a diagnostic already committed keeps its own
 
-### silence
+### govern
 
 ```mach
-pub fun silence(store: *DiagnosticStore, set: mach.base.diagnostic.kind.KindSet)
+pub fun govern(store: *DiagnosticStore, g: Governance)
 ```
 
-drop every warning of a kind in `set` that reaches the store from now on
+govern the warnings of the project being built that reach the store from now on by `g`
+
+### owner_add
+
+```mach
+pub fun owner_add(store: *DiagnosticStore, g: Governance) res[u32, mach.base.fail.Fail]
+```
+
+a further owner of warnings, governed by `g`, whose files `own` hands it
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the owner, which `own` takes |
+
+### own
+
+```mach
+pub fun own(store: *DiagnosticStore, file: mach.base.source.FileId, owner: u32) err[mach.base.fail.Fail]
+```
+
+the warnings that stand in `file` belong to `owner`, one `owner_add` gave
 
 ### expect
 
@@ -425,6 +453,19 @@ origin, its kind's key, location and message, then its notes, related places
 and fixes. a location is its file's path (absent as 0xFFFFFFFF), offset and
 length; a text is its length (absent as 0xFFFFFFFF) and bytes; every number
 little endian. a kind travels by its key, which never changes meaning
+
+## Governance
+
+```mach
+pub rec Governance {
+    shown:    bool;
+    silenced: mach.base.diagnostic.kind.KindSet;
+}
+```
+
+how the owner of a warning, the project being built or one of its dependencies, governs
+it as it reaches a store: whether the build shows the owner's warnings at all, and the
+kinds the owner's own `allow` silences
 
 ## Expectation
 
