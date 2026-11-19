@@ -728,7 +728,8 @@ when the named target is the one selected: a declaration for any other target is
 inert, and that target's table is not consulted. When it is checked, the parameter
 count is held to the instruction's own operand count, which is not uniform across a
 family that looks it, and a count outside it is refused with `op.operand_count` at
-each call, where the declaration is read against the target's table.
+the declaration, where it is read against the target's table whether or not anything
+calls it.
 
 | Set              | Meaning                                                     |
 |------------------|-------------------------------------------------------------|
@@ -782,7 +783,9 @@ passes a pointer into the `Image` class (SPIR-V's logical addressing takes none 
 function's argument, with or without variable pointers), so passing a texel pointer to
 a function is refused at the call with `spirv.unsupported`. A row whose result is a
 **structure**, as each `OpImageSparse` instruction gives its residency code and its
-texels, is declared returning a `rec` of those members, which receives the structure. A
+texels, is declared returning a `rec` of those members, which receives the structure.
+Where the typing data states the members, the `rec` must have exactly those members, each
+of the type its rule asks, as `FrexpStruct`'s significand and exponent. A
 row whose result is a **truth value**, such as `OpGroupNonUniformElect`, is declared
 returning an integer, which receives 1 or 0, and one that gives a truth value per lane,
 as `OpIsNan` over a vector, returning an integer vector of those lanes. A `bool` return is an 8-bit integer,
@@ -901,9 +904,12 @@ instead or reaches the binding in the callee.
 
 A row may also be **typed**: its requirement depends on the type it operates on, read
 from one operand (a pointer's pointee), and for a pointer on the storage class that
-operand's memory lives in. The atomics and the integer dot products are typed. A
-declaration whose pointee the row admits in no storage class is refused with
-`op.signature`, and each call is checked where its storage class is known. A load reads its pointer and every other atomic writes it, so
+operand's memory lives in. The atomics and the integer dot products are typed, and two
+rows whose result may take one of two shapes are typed by their result alone:
+`OpArrayLength` and `OpReadClockKHR`. A
+declaration whose pointee the row admits in no storage class, or whose operand or
+result is a type the row admits none of, is refused with `op.signature` at the
+declaration, and each call is checked where its storage class is known. A load reads its pointer and every other atomic writes it, so
 a `"readonly"` binding admits only an atomic load.
 
 ```mach
@@ -983,7 +989,7 @@ A row also states how its operands' types and its result's **relate** to the typ
 operates on, the type of the one operand its typing reads (a pointer's pointee). A
 declaration that breaks a relation is refused with `op.signature`, naming both the
 parameter (or the return type) and the operand it relates to, so a mismatch is caught
-at the declaration rather than as an invalid module.
+at the declaration rather than as an invalid module, whether or not anything calls it.
 
 A row holds a declaration's signedness only where the instruction reads its operands or
 result as signed or as unsigned, so that the other signedness would compute another
@@ -1019,6 +1025,10 @@ is declared with.
 | `OpFMod`, `NMin`, `NMax`, `NClamp` | the result and every operand are the first operand's type, a scalar or vector of floats |
 | `OpQuantizeToF16` | the result is the operand's type, a scalar or vector of 32-bit floats |
 | `ModfStruct` | the result is a `rec` of two members, each the operand's type, a scalar or vector of floats |
+| `FrexpStruct` | the result is a `rec` of two members, the operand's type, a scalar or vector of floats, and 32-bit integers of its component count |
+| `OpIAddCarry`, `OpISubBorrow` | the result is a `rec` of two members, each the operands' type, unsigned integers |
+| `OpArrayLength` | the result is a `u32` or `u64` scalar, and the structure a pointer to a `rec` whose last member is a run-time array, `[0]T`. The member operand, the index of that last member, is not held |
+| `OpReadClockKHR` | the result is a `u64` scalar or a `u32x2` vector |
 | `OpGroupNonUniformRotateKHR` | the result has the value's component count, class and width, the delta is an integer scalar, and the ClusterSize an integer constant power of two |
 | `OpSubgroupFirstInvocationKHR` | the result has the value's class and width, a 32-bit integer or float scalar |
 | `OpSubgroupBallotKHR` | the result is a 4-vector of 32-bit integers, and the predicate a truth value |
@@ -1179,8 +1189,11 @@ instruction is not available:
   which no declaration can state. write the operation over vectors ``.
 
 A named instruction the compiler has typing rules for is held to them, at the
-declaration with `op.signature` and at the call where a rule depends on the
-arguments. One it has no typing rules for is held to its operand kinds alone: a
+declaration with `op.signature`, whether or not anything calls it, and at the call where
+a rule depends on the arguments: an operand that must be a constant and its value, the
+operands an enumerant value brings, the image operands a mask sets, the member an index
+chain's constant selects, the storage class a pointer argument points into and the
+capability a typed row's type needs. One it has no typing rules for is held to its operand kinds alone: a
 constant or literal operand taken as an integer, a handle operand taken as a handle,
 a pointer it reads or writes through taken as a pointer, and a result returned only
 where the instruction has one. Its types are the author's to get right, and a wrong
