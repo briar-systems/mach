@@ -40,15 +40,17 @@ warnings alone with `warnings_dnit` once the object has moved on
 
 ```mach
 pub fun compile(b: *Back, a: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, m: *Module, level: u8, checked: bool, relax: bool, floats: mirl.pass.relaxation.Relaxations,
-    listing: opt[*std.io.writer.Writer], stats: opt[*mirl.base.stats.Stats], name: str) res[Compiled, mach.base.fail.Fail]
+    require: bool, listing: opt[*std.io.writer.Writer], stats: opt[*mirl.base.stats.Stats], name: str) res[Compiled, mach.base.fail.Fail]
 ```
 
 the mirl module `m` compiled to mink's object at mirl's level `level`, its schedule's own checks
 run with `checked`, the linker let relax its code with `relax` and the float relaxations `floats`
 permitted, masc's listing of the object written to `listing` when there is one, and its stages
-timed and counted into `stats` when there is one. a failure or warning points at the file of
-`sources` mirl's location names. `name` is the object's, no other object's in a link. the module is the schedule's
-to rewrite, so it is spent here
+timed and counted into `stats` when there is one. a vector operation mirl takes lane by lane is
+refused where `require` holds, as the profile's `simd = "require"` asks, and is a warning
+otherwise. a failure or warning points at the file of `sources` mirl's location names. `name`
+is the object's, no other object's in a link. the module is the schedule's to rewrite, so it is
+spent here
 
 ### warnings_dnit
 
