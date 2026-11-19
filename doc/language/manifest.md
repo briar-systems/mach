@@ -57,7 +57,6 @@ carries the same place as the failure's `primary` span.
 ```
 error[manifest.invalid_value]: mach.toml: profile 'debug': simd must be "scalarize" or "require" (got "fast")
   --> mach.toml:15:8
-   |
 15 | simd = "fast"
    |        ^^^^^^
 ```
@@ -201,7 +200,6 @@ error[mach.version_unaccepted]: this is mach 6.10.1, and the dependency closure 
     app (mach.toml) requires mach ^7
     app -> gfx -> glfw requires mach >=7.2, <8
  --> mach.toml:2:11
-  |
 2 | mach    = "^7"
   |           ^^^^
 ```
@@ -1172,10 +1170,8 @@ removed and `float_reassoc = true` is `relax = ["float-reassoc"]`. `pass` and
 ```
 error[manifest.removed_key]: mach.toml: [profile.release] uses removed key 'opt'; write `optimize = true` or `optimize = false`
   --> mach.toml:12:1
-   |
 12 | opt = 2
    | ^^^
-   |
    = fix: write `optimize = true`
   --> mach.toml:12:1
      -> replace with `optimize = true`
@@ -1197,7 +1193,6 @@ included. One that declares none is refused, pointing at the start of the file:
 ```
 error[manifest.missing_required]: mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring optimize, debug and simd
  --> mach.toml:1:1
-  |
 1 | [project]
   | ^
 ```
@@ -1419,7 +1414,6 @@ points at the `--set` text rather than at a line of `mach.toml`:
 ```
 error[catalog.unsupported]: --set subsystem: Subsystem windows is unsupported by linux (target 'linux-x86_64' runs on linux, whose images state no subsystem)
  --> --set:1:13
-  |
 1 | subsystem = windows
   |             ^^^^^^^
 ```

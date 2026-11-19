@@ -96,12 +96,9 @@ instantiation that asked for it, naming that type:
 ```
 error[operator.operand_type]: `Point` has no ordering: `<`, `<=`, `>` and `>=` order integers and floats
   --> src/main.mach:12:5
-   |
 12 |     maxof[Point](p, q);
    |     ^^^^^^^^^^^^^^^^^^
-   |
   --> src/main.mach:4:9
-   |
  4 |     if (a > b) { ret a; }
    |         ----- in this generic body, checked against this instance's type arguments
 ```

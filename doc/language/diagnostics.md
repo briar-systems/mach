@@ -7,10 +7,8 @@ key, a stable code a tool can match instead of the wording:
 ```
 error[name.unresolved]: unresolved identifier `helpr`
  --> src/main.mach:4:9
-  |
 4 |     ret helpr(x) * 2;
   |         ^^^^^
-  |
   = help: did you mean `helper`?
 ```
 
@@ -49,6 +47,11 @@ compiler that raised it: `error[link.size_limit]: range-extension thunks take
 the code past the maximum section size`, not `linker: range-extension ...`. A
 format, a target or a flag is named where it is the subject, as in `COFF
 object too small`.
+
+A message, note or help line states what is illegal or required and what to
+write instead, in the language's own terms: ``implicit numeric conversion is
+illegal; cast the value with `value::Type` ``. It never describes the language
+by what it has or lacks, or by comparison with another language.
 
 ## The registry
 
