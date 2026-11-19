@@ -576,7 +576,9 @@ as anywhere else.
   register, its 8 and 16-bit writes keep it, aarch64's `w` writes zero it),
   shifts and rotates by a constant, byte swaps of a 32-bit or 64-bit register,
   bit-field extracts, and `and`, `or` and `xor` with a constant or with another
-  register carry each byte to where the instruction puts it. Every other
+  register carry each byte to where the instruction puts it. An `xor` or an
+  and-not of a register with itself writes zero whatever the register held, so
+  every byte it writes is public. Every other
   instruction, an add, a multiply, an exchange, a shift by a register or a
   conditional move among them, makes every byte it writes secret if any byte it
   reads is. A compare of a narrow view reads only
@@ -625,6 +627,16 @@ as anywhere else.
   origin in its base register, which the walk follows from the copy of the masked
   stack pointer and, after a block that writes it, from the frame pointer and the
   same mask, so its slots stay placed wherever the stack pointer goes.
+  A copy of a secret between two frame slots is emitted in runs cut where either
+  slot's statement of which bytes are public changes, so a public member copied
+  beside a secret one stays public in the destination, as a copy too large to be
+  moved step by step is otherwise a loop whose every store may hold what any of
+  its loads read.
+- **Writes.** The compiler states a written secret only at a call: the
+  registers a call carrying a secret clobbers besides its result are taken as
+  possibly secret after it. Every other instruction writes what the walk
+  computes from what it reads, so a value the compiler moves or splits keeps
+  each byte's secrecy as the walk follows it.
 - **The timing mode.** A block may not turn the timing mode off: aarch64's
   `msr dit` from a register and `msr pstate.dit, #0` are refused whatever encodes
   them. Only the read, set and restore the frame code places are admitted.
@@ -678,9 +690,31 @@ secret (`*^u32`) is a public address and a secret load: the register it is
 staged into may address memory, and what a load through it produces is secret,
 while a secret pointer (`^*u32`) is a secret address.
 
-On a typed stream (wasm) the producer states no store, so the store rule above
-does not apply there, and a stream's walk takes a secret stored at an address it
-does not place as possibly anywhere.
+On a typed stream (wasm) the producer states each load and store as on a
+machine target, and places in the frame each access whose address is a frame
+slot's moved only by constants and lying within the slot. wasm keeps a secret
+local whose address is taken, or one spilled past the operand stack, in linear
+memory off a frame base local the frame code sets once from the stack-pointer
+global, and nothing else writes it, so such an access reaches exactly the bytes
+the producer states. The walk holds a secret stored there in those bytes, and a
+slot no other access reaches is private to the function, so a constant-time
+function may hold a secret in its own frame across a call to a callee it does
+not trust. A slot whose address is passed on, or reached at an offset known
+only when the code runs, is not private, and a secret in it refuses such a call.
+The walk holds one bit of secrecy for each
+value on the operand stack and in each local. A `:>T` cast states a declassify
+point at the instruction that leaves the declassified value on top of the stack,
+which the walk takes as public there and nothing else. A call to a trusted
+callee pushes its results as the callee's declaration states them, a result
+public where the declaration makes it public, and a call to a callee nothing
+states takes every value it pushes as secret where any it pops or any memory it
+reaches may hold one. A function's own results are held to its declaration at
+each return, and it may leave no secret in a global. An `asm` block's accesses
+are placed nowhere, as the address it forms is its own, so a block in such a
+function reads every byte it loads as secret and may store no secret: nothing
+states the secrecy of the memory a block reaches, and a block's store of a
+secret into a public local's storage would otherwise come back as a public
+result.
 
 ### Calls
 
@@ -697,7 +731,10 @@ generic instance included.
 A constant-time function may pass a secret only to a callee that
 
 - it names directly, since a function type states no mode: a secret passed
-  through a function value is refused, whatever the value points at;
+  through a function value is refused, whatever the value points at. A call
+  through a function value that passes no secret and reaches none takes its
+  result as the function type declares it, as a direct call takes its callee's
+  declaration;
 - is declared `#[constant_time("soft")]` or `#[constant_time("hard")]`, a generic
   included, whose instances take its mode. An unmarked function is refused
   whether it is generic or not, in the same module or another: mark it;
