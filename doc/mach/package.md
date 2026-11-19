@@ -16,7 +16,8 @@ so a new source is a new member and not a new engine:
 - report.mach: where progress, notes and failures go while it works
 
 git, under package/git, is the member of the first two and the one outside tool mach
-runs; path.mach realizes a dependency declared by a local path. this module holds what
+runs; path.mach realizes a dependency declared by a local path, and scratch.mach makes the
+temporary storage every part writes, released when the command ends. this module holds what
 every part shares: the slot layout under dep/ and the identity rule
 
 Source: [`src/package.mach`](../../src/package.mach)

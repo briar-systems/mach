@@ -16,7 +16,8 @@ so a new source is a new member and not a new engine:
 - report.mach: where progress, notes and failures go while it works
 
 git, under package/git, is the member of the first two and the one outside tool mach
-runs; path.mach realizes a dependency declared by a local path. this module holds what
+runs; path.mach realizes a dependency declared by a local path, and scratch.mach makes the
+temporary storage every part writes, released when the command ends. this module holds what
 every part shares: the slot layout under dep/ and the identity rule
 
 The directory's root module is [`mach.package`](../package.md).
@@ -34,6 +35,7 @@ The directory's root module is [`mach.package`](../package.md).
 | [`report`](report.md) | where dependency management reports while it works |
 | [`resolve`](resolve.md) | resolve: version resolution over a project's closure |
 | [`resolver`](resolver.md) | dependency version resolution: PubGrub over the releases each identity lists |
+| [`scratch`](scratch.md) | scratch: the one place the dependency manager makes temporary storage (a git output capture, the bare repository release candidates are fetched into) |
 | [`source`](source.md) | the source contract: where a dependency named by a url comes from |
 | [`verify`](verify.md) | verify: `mach dep verify`, which checks a realized closure without changing it |
 

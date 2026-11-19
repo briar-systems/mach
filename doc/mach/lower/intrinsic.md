@@ -15,7 +15,7 @@ members of a record it is, and the types a typed row's data operand or result ma
 masc states no typing of is held to its operand kinds alone, and its types are the author's
 to get right. each break is refused with `op.signature`, naming the parameter. a call holds
 what depends on its arguments: an instruction the catalog does not hold or holds as no
-`intrinsic`, the constants an index chain reads, and in mirl the constants, enumerant
+`intrinsic`, the constants an index chain reads, the member a literal indexes, and in mirl the constants, enumerant
 values, image operands, storage classes and capabilities of the call
 
 Source: [`src/lower/intrinsic.mach`](../../../src/lower/intrinsic.mach)
@@ -26,10 +26,16 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | :--- | :--- | :--- |
 | [`Found`](#found) | `rec` | the instruction an `#[intrinsic]` names in the selected target's catalog |
 | [`Named`](#named) | `tag` | what the selected target's catalog holds of the instruction an `#[intrinsic]` names |
+| [`LastOf`](#lastof) | `rec` | a literal operand whose value a row's typing relates to a record, and the operand the record is, or points to |
 
 | On `Named` | |
 | :--- | :--- |
 | [`named`](#named-1) | what the selected target's catalog holds of instruction `name` of set `set` |
+
+| On `LastOf` | |
+| :--- | :--- |
+| [`last_of`](#last_of) | the literal a call's row indexes the last member of a record with, as OpArrayLength's Array member indexes the run-time array that ends the record its Structure points to |
+| [`last_held`](#last_held) | a call's literal held to the record it indexes the last member of, the literal's argument folding to `value` |
 
 | Functions | |
 | :--- | :--- |
@@ -89,6 +95,40 @@ pub fun named(ctx: *mach.lower.context.LowerContext, set: str, name: str) Named
 ```
 
 what the selected target's catalog holds of instruction `name` of set `set`
+
+## LastOf
+
+```mach
+pub rec LastOf {
+    literal: u8;
+    record:  u8;
+}
+```
+
+a literal operand whose value a row's typing relates to a record, and the operand the record is, or points to
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `literal` | `u8` | the row operand of the literal |
+| `record` | `u8` | the row operand whose record the literal indexes the last member of |
+
+### last_of
+
+```mach
+pub fun last_of(ctx: *mach.lower.context.LowerContext, r: *masc.core.row.Row) opt[LastOf]
+```
+
+the literal a call's row indexes the last member of a record with, as OpArrayLength's Array member indexes the run-time
+array that ends the record its Structure points to. none for any other row
+
+### last_held
+
+```mach
+pub fun last_held(ctx: *mach.lower.context.LowerContext, span: mach.base.source.Span, name: str, fn: mach.type.kind.TypeId, lead: u32, at: LastOf, value: u64) err[mach.base.fail.Fail]
+```
+
+a call's literal held to the record it indexes the last member of, the literal's argument folding to `value`. the
+declaration holds the record's shape, so a declaration refused there or one whose operand is no record is left to it
 
 ## Functions
 

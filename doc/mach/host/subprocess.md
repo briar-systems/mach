@@ -295,7 +295,7 @@ block until the running child of `p` ends, and reap it
 ### wait_any
 
 ```mach
-pub fun wait_any(a: *std.allocator.Allocator, owners: *OwnedSubprocess, count: u32, scope: *std.sync.cancel.Scope, source: *std.process.events.Source) res[*OwnedSubprocess, Error]
+pub fun wait_any(a: *std.allocator.Allocator, owners: *OwnedSubprocess, count: u32, scope: *std.sync.cancel.Scope) res[*OwnedSubprocess, Error]
 ```
 
 supervise `count` owners until one of them reaches its terminal, and return
@@ -304,14 +304,13 @@ that one reaped
 each pass polls the scope, then every running owner: a cancelled or expired
 scope cancels or times out the first running owner, an owner past its own
 deadline is timed out, and one whose capture outgrew its limit is
-cancelled, each with GRACE to stop. a terminate, interrupt, console-close or service-stop event from
-`source` cancels the scope.
+cancelled, each with GRACE to stop. an ending event the process holds the interrupt for
+(mach.host.interrupt) cancels the scope.
 
 | Parameter | |
 | :--- | :--- |
 | `owners` | array of `count` owners, some of which may not be running |
 | `scope` | cancellation scope over all of them, or nil |
-| `source` | process events that cancel the scope, or nil |
 | **returns** | the owner that reached its terminal, or the refusal when none is running |
 
 ### finish_capture
