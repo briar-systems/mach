@@ -17,7 +17,7 @@ and `[dep.X]`. TOML itself enforces name uniqueness within a section.
 A manifest is required. A project directory without one does not build:
 
 ```
-error[project.no_manifest]: no mach.toml in the project directory
+error[project.no_manifest] no mach.toml in the project directory
 ```
 
 Nothing is inferred from the directory layout. `mach init` writes a complete
@@ -44,7 +44,7 @@ type. A value of the wrong type is refused where it is written, naming the type
 the key takes, and a string key never takes the empty string:
 
 ```
-error[manifest.value_type]: mach.toml: [target.windows-x86_64].stack_reserve must be an integer
+error[manifest.value_type] mach.toml: [target.windows-x86_64].stack_reserve must be an integer
 ```
 
 A manifest refusal points at what it refuses, after the message: the value it
@@ -55,8 +55,8 @@ it, in the manifest that states it, a dependency's own included.
 carries the same place as the failure's `primary` span.
 
 ```
-error[manifest.invalid_value]: mach.toml: profile 'debug': simd must be "scalarize" or "require" (got "fast")
-  --> mach.toml:15:8
+error[manifest.invalid_value] mach.toml: profile 'debug': simd must be "scalarize" or "require" (got "fast")
+   @ mach.toml:15:8
 15 | simd = "fast"
    |        ^^^^^^
 ```
@@ -73,8 +73,8 @@ built. It is read once, and an unknown, removed, mistyped or missing key in it
 fails the consumer's build naming the dependency:
 
 ```
-error[manifest.unknown_key]: dep 'std': mach.toml: unknown key 'bogus' in [project]
-error[manifest.missing_required]: dep 'gfx': mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring optimize, debug and simd
+error[manifest.unknown_key] dep 'std': mach.toml: unknown key 'bogus' in [project]
+error[manifest.missing_required] dep 'gfx': mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring optimize, debug and simd
 ```
 
 What a consumer *uses* from a dependency's manifest is its export surface: the
@@ -196,10 +196,10 @@ requirement and the chain that states it, pointing at the first unmet range in
 the manifest that states it:
 
 ```
-error[mach.version_unaccepted]: this is mach 6.10.1, and the dependency closure does not accept it:
+error[mach.version_unaccepted] this is mach 6.10.1, and the dependency closure does not accept it:
     app (mach.toml) requires mach ^7
     app -> gfx -> glfw requires mach >=7.2, <8
- --> mach.toml:2:11
+  @ mach.toml:2:11
 2 | mach    = "^7"
   |           ^^^^
 ```
@@ -365,7 +365,7 @@ A name the selected isa does not hold is refused when the target resolves, with 
 names it does hold:
 
 ```
-error[target.invalid]: target: `sha2` is not an extension or level of isa 'x86_64'; its extensions are:
+error[target.invalid] target: `sha2` is not an extension or level of isa 'x86_64'; its extensions are:
 ssse3, sse41, sha, fsgsbase, popcnt, lzcnt, bmi1, sse42, cx16, avx, avx2, bmi2, fma,
 movbe, f16c, avx512f, avx512bw, avx512cd, avx512dq, avx512vl, aes, pclmul; its levels are:
 x86-64-v2, x86-64-v3, x86-64-v4
@@ -460,7 +460,7 @@ A mnemonic that needs an extension the target does not select, outside such a
 function, is refused. The refusal names the line to add:
 
 ```
-error[asm.extension]: inline-asm instruction 'sha256rnds2' needs the `sha` extension, which
+error[asm.extension] inline-asm instruction 'sha256rnds2' needs the `sha` extension, which
 this target does not select; add `extensions = ["sha"]` to the target, or mark the
 function `#[extension("sha")]` and call it only after detecting the extension at run time
 ```
@@ -530,7 +530,7 @@ freestanding entry does, and whose target states no `stack_reserve` is refused, 
 the key:
 
 ```
-error[target.stack_size]: mach.toml: [target.board] states no `stack_reserve`, and the image
+error[target.stack_size] mach.toml: [target.board] states no `stack_reserve`, and the image
 needs a stack: it refers to the bounds of the `.stack` section, which an image no loader maps
 holds its stack in. state the stack's size in bytes as `stack_reserve`
 ```
@@ -591,7 +591,7 @@ v6 wrote a RISC-V selection as `isa = "rv32imc"` with no architecture at all, an
 `mach migrate` writes the `arch` that enters it beside it.
 
 ```
-error[target.retired_spelling]: mach.toml: [target.metal].of = "raw" is a retired spelling; write "flat", mink's name for it
+error[target.retired_spelling] mach.toml: [target.metal].of = "raw" is a retired spelling; write "flat", mink's name for it
 ```
 
 `vulkan1.0` through `vulkan1.3` are `vulkan`'s environments and `preview1` is `wasi`'s.
@@ -1153,7 +1153,7 @@ others are optional, with the meaning of their absence above. A missing key is a
 manifest error naming the table and the key:
 
 ```
-error[manifest.missing_required]: mach.toml: [profile.debug] is missing required key 'simd'; a profile declares optimize, debug and simd
+error[manifest.missing_required] mach.toml: [profile.debug] is missing required key 'simd'; a profile declares optimize, debug and simd
 ```
 
 A relaxation that does not exist is refused where it is written.
@@ -1168,13 +1168,10 @@ removed and `float_reassoc = true` is `relax = ["float-reassoc"]`. `pass` and
 `skip` have no rewrite, since no key says which passes run:
 
 ```
-error[manifest.removed_key]: mach.toml: [profile.release] uses removed key 'opt'; write `optimize = true` or `optimize = false`
-  --> mach.toml:12:1
+error[manifest.removed_key] mach.toml: [profile.release] uses removed key 'opt'; write `optimize = true` or `optimize = false`
+   @ mach.toml:12:1
 12 | opt = 2
    | ^^^
-   = fix: write `optimize = true`
-  --> mach.toml:12:1
-     -> replace with `optimize = true`
 ```
 
 ### Passes
@@ -1191,8 +1188,8 @@ Every manifest declares at least one `[profile.*]` table, a dependency's
 included. One that declares none is refused, pointing at the start of the file:
 
 ```
-error[manifest.missing_required]: mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring optimize, debug and simd
- --> mach.toml:1:1
+error[manifest.missing_required] mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring optimize, debug and simd
+  @ mach.toml:1:1
 1 | [project]
   | ^
 ```
@@ -1213,7 +1210,7 @@ Table order carries no meaning. A manifest that declares several profiles and
 marks none is refused wherever a command must pick one:
 
 ```
-error[selection.ambiguous]: mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with -p
+error[selection.ambiguous] mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with -p
 ```
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
 concern: it is controlled only by the `--emit ir` and `--emit asm` flags of `mach build`.
@@ -1235,7 +1232,7 @@ Every diagnostic kind has a dotted key, named by the subject it concerns, and
 every diagnostic that has one prints it:
 
 ```
-warning[vector.scalarize]: vector divide on 4 lanes of 32-bit integers in 'app.main.kernel' scalarizes on x86_64: no packed form for it at any extension
+warning[vector.scalarize] vector divide on 4 lanes of 32-bit integers in 'app.main.kernel' scalarizes on x86_64: no packed form for it at any extension
 ```
 
 `allow` names warning keys the build does not report. A silenced warning is
@@ -1290,7 +1287,7 @@ unknown:
 | `secret.branch` | a secret value decides a branch or loop condition |
 
 ```
-error[allow.error_key]: mach.toml: [profile.release].allow entry "secret.branch" names an error; only a warning can be silenced
+error[allow.error_key] mach.toml: [profile.release].allow entry "secret.branch" names an error; only a warning can be silenced
 ```
 
 Like the SIMD levers, `allow` is the consumer's: a dependency's profiles are
@@ -1381,7 +1378,7 @@ work directory with `-w` that every artifact it writes sits under. Without
 either it is refused:
 
 ```
-error[cli.flag_conflict]: these options would write a differently configured build over the profile's existing artifacts; name an artifact path with -o or a work directory with -w
+error[cli.flag_conflict] these options would write a differently configured build over the profile's existing artifacts; name an artifact path with -o or a work directory with -w
 ```
 
 The object cache is keyed by the whole configuration, so only published
@@ -1403,8 +1400,8 @@ reasons as the key in `mach.toml`. A key no table holds is refused naming it,
 and so is a key `--set` does not write:
 
 ```
-error[cli.flag_value]: --set does not apply to 'optimize'; it sets platform, base, stack_reserve, stack_commit, subsystem
-error[manifest.value_type]: --set base: must be an integer
+error[cli.flag_value] --set does not apply to 'optimize'; it sets platform, base, stack_reserve, stack_commit, subsystem
+error[manifest.value_type] --set base: must be an integer
 ```
 
 A value `--set` wrote carries where it was written, so every later refusal of
@@ -1412,8 +1409,8 @@ it, a target's system refusing a subsystem included, names `--set <key>` and
 points at the `--set` text rather than at a line of `mach.toml`:
 
 ```
-error[catalog.unsupported]: --set subsystem: Subsystem windows is unsupported by linux (target 'linux-x86_64' runs on linux, whose images state no subsystem)
- --> --set:1:13
+error[catalog.unsupported] --set subsystem: Subsystem windows is unsupported by linux (target 'linux-x86_64' runs on linux, whose images state no subsystem)
+  @ --set:1:13
 1 | subsystem = windows
   |             ^^^^^^^
 ```
@@ -2234,7 +2231,7 @@ These are errors:
 - an artifact requirement in a step's `need` list;
 - artifact cycles and step cycles, including cycles formed by globs. A cycle is
   refused at its first `need` entry with the others named as related, and the
-  message spells the chain, as in `'need' cycle: step.a -> step.b -> step.a`.
+  message spells the chain, as in `mach.toml: step.a -> step.b -> step.a`.
 
 Globs exclude the declaring item. Matching declarations retain manifest order,
 and transitive prerequisites run before their consumers. Both root and dependency

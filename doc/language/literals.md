@@ -41,7 +41,7 @@ and with digit separators (`0xFFu8`, `0b1010u16`, `1_000_000u32`, `1.5e2f32`, `0
 A suffixed literal *is* that type, in the same way a variable of that type
 is. It is not a hint, and it is never silently retyped:
 
-```mach error type mismatch: expected u64, found u32
+```mach error expected u64, found u32
 val a: u32 = 7u32; # fine
 val b: u64 = 7u32; # error: type mismatch, expected u64, found u32
 val c: f64 = 1.5f32; # error: type mismatch, expected f64, found f32

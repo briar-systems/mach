@@ -336,9 +336,9 @@ public/secret aliasing leak unconstructable with no alias analysis:
   (it may be larger than one area would be; see
   [tag.md](tag.md#layout-and-representation))
 
-```mach error union variants must agree on secrecy
+```mach error overlapping fields are part secret
 fun erase(p: *^u8) ptr {
-    ret p; # error: type mismatch: expected ptr, found *^u8
+    ret p; # error: expected ptr, found *^u8
 }
 
 uni Bad { a: ^u32; b: u32; } # error: variants disagree on secrecy

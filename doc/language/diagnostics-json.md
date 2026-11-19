@@ -46,7 +46,7 @@ A type error in a generic instance, whose primary span covers two lines and
 whose related site is in another file:
 
 ```json
-{"schema":2,"record":"diagnostic","severity":"error","code":"operator.operand_mismatch","message":"type mismatch: incompatible operand types `R` and `i64`","origin":"sema","primary":{"file":"src/main.mach","line":6,"column":16,"end_line":7,"end_column":11,"byte_start":111,"byte_end":127},"related":[{"file":"src/lib.mach","line":3,"column":9,"end_line":3,"end_column":14,"byte_start":53,"byte_end":58,"label":"in this generic body, checked against this instance's type arguments"}],"notes":[],"help":[],"fixes":[]}
+{"schema":2,"record":"diagnostic","severity":"error","code":"operator.operand_mismatch","message":"incompatible operand types `R` and `i64`","origin":"sema","primary":{"file":"src/main.mach","line":6,"column":16,"end_line":7,"end_column":11,"byte_start":111,"byte_end":127},"related":[{"file":"src/lib.mach","line":3,"column":9,"end_line":3,"end_column":14,"byte_start":53,"byte_end":58,"label":"in this generic body, checked against this instance's type arguments"}],"notes":[],"help":[],"fixes":[]}
 ```
 
 | Member | Type | Meaning |
@@ -66,7 +66,8 @@ whose related site is in another file:
 A **fix** is an object with a `label` (string, what the fix does) and `edits`,
 an array of spans each with a `replacement` string: applying a fix replaces
 the bytes of every one of its edits with that edit's replacement. The edits of
-one fix never overlap.
+one fix never overlap. A fix is carried here and offered by the language server,
+and the human rendering does not print it.
 
 ### Spans
 
@@ -86,7 +87,7 @@ The end is exclusive, as in the Language Server Protocol: a span of `helpr` at
 line 5 column 18 ends at line 5 column 23. An empty span has its end equal to
 its start. A column counts bytes, not characters, so a tool that needs UTF-16
 columns converts from the line's text. `line` and `column` are the position
-the human rendering shows after `-->`.
+the human rendering shows after `@`.
 
 ### Origins
 
@@ -114,8 +115,8 @@ the constant-time validator does.
 ## Failures
 
 A failure raised outside the compiler's diagnostics is a diagnostic record, as
-the human rendering shows it as a diagnostic: the snippet at its place, its
-related places and its fix. Its `severity` is `"error"`, its `code` the
+the human rendering shows it as a diagnostic: the snippet at its place and its
+related places. Its `severity` is `"error"`, its `code` the
 failure's key, and its `notes` and `help` are empty.
 
 ```json
@@ -130,7 +131,7 @@ table is missing from it. A dependency's refusal points into the
 dependency's own manifest, not the root that imported it. Its `file` follows
 the rule for every span, so a dependency's manifest is `dep/libx/mach.toml`,
 and `dep\libx\mach.toml` on Windows. The human rendering shows the same place
-after the headline, as `--> <file>:<line>:<column>` and the snippet, naming the
+after the headline, as `@ <file>:<line>:<column>` and the snippet, naming the
 file by the path it was read at, as it names a source file.
 
 ```json
@@ -163,12 +164,12 @@ A refusal between several entries points at the first and lists the others in
 - a cycle among `need` entries, at the entry of its first edge, the entries of
   the other edges related
 
-The human rendering shows each related place with its own `-->` line and
+The human rendering shows each related place with its own `@` line and
 snippet after the primary's. A target or profile named on the command line that the manifest does
 not declare is caused by no entry in it, so its refusal has no `primary`.
 
 ```json
-{"schema":2,"record":"diagnostic","severity":"error","code":"need.cycle","message":"mach.toml: 'need' cycle: step.a -> step.b -> step.a","origin":"build","primary":{"file":"mach.toml","line":12,"column":9,"end_line":12,"end_column":17,"byte_start":141,"byte_end":149},"related":[{"file":"mach.toml","line":18,"column":9,"end_line":18,"end_column":17,"byte_start":216,"byte_end":224,"label":null}],"notes":[],"help":[],"fixes":[]}
+{"schema":2,"record":"diagnostic","severity":"error","code":"need.cycle","message":"mach.toml: step.a -> step.b -> step.a","origin":"build","primary":{"file":"mach.toml","line":12,"column":9,"end_line":12,"end_column":17,"byte_start":141,"byte_end":149},"related":[{"file":"mach.toml","line":18,"column":9,"end_line":18,"end_column":17,"byte_start":216,"byte_end":224,"label":null}],"notes":[],"help":[],"fixes":[]}
 ```
 
 `origin` names the phase the failure came from, by the rule of
@@ -182,7 +183,7 @@ that names nothing, has no `origin`.
 
 A note says what a command did or found, without failing it, and is a diagnostic
 record with `severity` `"note"`, its `code` the note's key, and a `null`
-`primary`. The human rendering writes the same note as `note: <message>`.
+`primary`. The human rendering writes the same note as `note <message>`.
 
 | `code` | Written by |
 |---|---|

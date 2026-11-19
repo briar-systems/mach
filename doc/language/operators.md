@@ -632,7 +632,7 @@ falls back to the scalar expansion is one warning at its own site, never one per
 lane. The warning names the operation, its lanes and the target:
 
 ```
-warning[vector.scalarize]: vector divide on 4 lanes of 32-bit integers in 'app.main.kernel' scalarizes on x86_64: no packed form for it at any extension
+warning[vector.scalarize] vector divide on 4 lanes of 32-bit integers in 'app.main.kernel' scalarizes on x86_64: no packed form for it at any extension
 ```
 
 Every packed row in a target's catalog declares the extension its instruction

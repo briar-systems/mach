@@ -5,11 +5,11 @@ dependency tooling, the test runner and the command line, names its kind by a
 key, a stable code a tool can match instead of the wording:
 
 ```
-error[name.unresolved]: unresolved identifier `helpr`
- --> src/main.mach:4:9
+error[name.unresolved] unresolved identifier `helpr`
+  @ src/main.mach:4:9
 4 |     ret helpr(x) * 2;
   |         ^^^^^
-  = help: did you mean `helper`?
+  help did you mean `helper`?
 ```
 
 The key sits between the severity and the message: `error[<key>]` or
@@ -19,7 +19,7 @@ key, the location and the rest as data with
 [`--diagnostics json`](diagnostics-json.md) rather than from this text.
 
 A note says what a command did or found and never fails it. Its human text is
-`note: <message>`, without the key, which the
+`note <message>`, without the key, which the
 [json record](diagnostics-json.md#notes) carries.
 
 ## Keys
@@ -43,15 +43,10 @@ is `compiler.internal`.
 A message is a sentence about the subject: what is wrong with it, in words a
 reader of the program can act on. The key, the location and the origin say
 where the diagnostic came from, so a message never starts with the part of the
-compiler that raised it: `error[link.size_limit]: range-extension thunks take
+compiler that raised it: `error[link.size_limit] range-extension thunks take
 the code past the maximum section size`, not `linker: range-extension ...`. A
 format, a target or a flag is named where it is the subject, as in `COFF
 object too small`.
-
-A message, note or help line states what is illegal or required and what to
-write instead, in the language's own terms: ``implicit numeric conversion is
-illegal; cast the value with `value::Type` ``. It never describes the language
-by what it has or lacks, or by comparison with another language.
 
 ## The registry
 

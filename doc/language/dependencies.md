@@ -49,7 +49,7 @@ When nothing fits, the error lists every requirement that took part and names
 the identity the root can settle:
 
 ```
-error[dep.unsatisfiable]: no set of releases satisfies every requirement:
+error[dep.unsatisfiable] no set of releases satisfies every requirement:
     root requires b ^1.2
     a 1.0.0 requires b ^2.0
   the root decides by declaring the identity itself, for example:
@@ -125,7 +125,7 @@ replaced, whatever `--quiet` says, naming the identity, the root's winning
 selection, the requirer chain and what that chain asked for:
 
 ```
-note: dependency 'std': the root declares ref = "tag/v2.0.0", overriding
+note dependency 'std': the root declares ref = "tag/v2.0.0", overriding
 hedgeacme -> hedge -> std which requires ref = "tag/v2.1.0"; nothing checks that
 'std' supports the root's selection
 ```
@@ -145,7 +145,7 @@ a requirer's `use b.*` binds to whatever the root selected, even a major that
 requirer was never built or tested against. Nothing proves the requirer supports
 it: a passing build only shows that the code the build reached compiled, so it is
 evidence and not a guarantee. `mach dep verify` prints a note for every edge an
-override replaced, without failing (`note: dependency 'b': the root declares ref =
+override replaced, without failing (`note dependency 'b': the root declares ref =
 "tag/v2.0.0", overriding root -> a -> b which requires version = "^1.2"; nothing
 checks that 'b' supports the root's selection`). Treat each note as a claim to
 confirm, by testing the requirer at that selection or by checking its own range.
@@ -165,7 +165,7 @@ stops when it reaches one, and `mach dep verify` refuses it,
 naming the chain and the offending line:
 
 ```
-error[dep.release_selector]: root -> a is a release (ref = "tag/v1.1.0"), and its manifest selects
+error[dep.release_selector] root -> a is a release (ref = "tag/v1.1.0"), and its manifest selects
 [dep.b] by ref = "branch/main"; a release may select its dependencies only by
 `version` or an exact `tag/`, so it cannot be reproduced from its tag
 ```
@@ -225,7 +225,7 @@ diagnostic prints both requiring chains and the exact root declaration that
 would resolve it:
 
 ```
-error[dep.conflict]: dependency conflict: project id 'b' is reached with two different selections:
+error[dep.conflict] project id 'b' is reached with two different selections:
     root -> a -> b requires git <url> @ tag/v1.0.0
     root -> c -> b requires git <url> @ tag/v2.0.0
   the root decides by declaring the identity itself, for example:

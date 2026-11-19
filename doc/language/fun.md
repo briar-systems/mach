@@ -94,13 +94,13 @@ A type that genuinely does not support the operator is refused at the
 instantiation that asked for it, naming that type:
 
 ```
-error[operator.operand_type]: `Point` has no ordering: `<`, `<=`, `>` and `>=` order integers and floats
-  --> src/main.mach:12:5
+error[operator.operand_type] `Point` has no ordering: `<`, `<=`, `>` and `>=` order integers and floats
+   @ src/main.mach:12:5
 12 |     maxof[Point](p, q);
    |     ^^^^^^^^^^^^^^^^^^
-  --> src/main.mach:4:9
+   @ src/main.mach:4:9 in this generic body, checked against this instance's type arguments
  4 |     if (a > b) { ret a; }
-   |         ----- in this generic body, checked against this instance's type arguments
+   |         -----
 ```
 
 The template itself reports nothing past name resolution. It types the body so
@@ -134,7 +134,7 @@ a cycle of calls through such an argument asks for a new instance at every step.
   only reach the finitely many instances its arguments name.
 
 ```
-error[generic.growing_cycle]: `g` instantiates `f` here at an argument that grows, on a cycle of instances no comptime gate can stop (f, g), so its instances never end
+error[generic.growing_cycle] `g` instantiates `f` here at an argument that grows, on a cycle of instances no comptime gate can stop (f, g), so its instances never end
 ```
 
 ### Where an instance's code lives
