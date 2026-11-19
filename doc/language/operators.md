@@ -264,7 +264,7 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
-```mach error cannot take the address of a call result
+```mach error cannot take the address of a call result. `?` needs a place, such as a binding, a field, an element or a dereference
 fun g() i64 {
     ret 1;
 }
@@ -277,8 +277,8 @@ fun addresses(x: i64) {
 }
 ```
 
-Each of those reads, in full, `cannot take the address of a call result: `?`
-applies to a place (a binding, a field, an element, or a dereference)`. Bind
+Each of those reads, in full, `` cannot take the address of a call result. `?`
+needs a place, such as a binding, a field, an element or a dereference ``. Bind
 the temporary to a `var` and take that binding's address.
 
 ### Where locals lie

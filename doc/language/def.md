@@ -47,7 +47,7 @@ The refusal is `def.cycle`, at the name that closes the cycle, naming each alias
 on it:
 
 ```
-error[def.cycle]: `Visit` names itself through its own definition (Visit -> Visit): an alias is another name for the type it names and never a type of its own, so its definition never ends, behind a pointer or not. declare a `rec` to give the type a name it can refer to
+error[def.cycle] `Visit` names itself through its own definition (Visit -> Visit). an alias is another name for the type it names and never a type of its own, so its definition never ends, behind a pointer or not. declare a `rec` to give the type a name it can refer to
 ```
 
 A type that must refer to itself gets its name from a record:

@@ -203,7 +203,7 @@ mach build .                                      # build it
 mach run .                                        # run it
 ```
 
-`mach init` leaves a working program in `src/main.mach`:
+`mach init` leaves a working program in `src/bin/main.mach`:
 
 ```mach
 use std.print;

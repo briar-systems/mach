@@ -17,7 +17,7 @@ narrower binding is a choice of representation rather than a conversion. It
 adopts the binding's width and signedness, and is **refused** — never truncated —
 when the measured value does not fit:
 
-```mach error value 300 is out of range for u8
+```mach error value 300 is out of range for u8 (0..255)
 use std.types.size.usize;
 
 rec Point { x: i64; y: i64; }

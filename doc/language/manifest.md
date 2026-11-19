@@ -70,11 +70,13 @@ boundary.
 
 A dependency's `mach.toml` is held to exactly the rules of the project being
 built. It is read once, and an unknown, removed, mistyped or missing key in it
-fails the consumer's build naming the dependency:
+fails the consumer's build pointing into the dependency's own file:
 
 ```
-error[manifest.unknown_key] dep 'std': mach.toml: unknown key 'bogus' in [project]
-error[manifest.missing_required] dep 'gfx': mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring optimize, debug and simd
+error[manifest.unknown_key] mach.toml: unknown key 'bogus' in [project]
+  @ ./gfxdep/mach.toml:7:1
+7 | bogus = 1
+  | ^^^^^
 ```
 
 What a consumer *uses* from a dependency's manifest is its export surface: the
@@ -365,10 +367,10 @@ A name the selected isa does not hold is refused when the target resolves, with 
 names it does hold:
 
 ```
-error[target.invalid] target: `sha2` is not an extension or level of isa 'x86_64'; its extensions are:
-ssse3, sse41, sha, fsgsbase, popcnt, lzcnt, bmi1, sse42, cx16, avx, avx2, bmi2, fma,
-movbe, f16c, avx512f, avx512bw, avx512cd, avx512dq, avx512vl, aes, pclmul; its levels are:
-x86-64-v2, x86-64-v3, x86-64-v4
+error[extension.unknown] mach.toml: [target.linux-x86_64] is invalid. the architecture has no extension named `sha2` (target, ext), and it accepts 3dnow, ace, adx, aes, amx_avx512, amx_bf16, amx_complex, amx_fp16, amx_fp8, amx_int8, amx_movrs, amx_tile, apx_f, apx_nci_ndd_nf, avx, avx10_1, avx10_2, avx10_v1_aux, avx10_v2_aux, avx10_vnni_int, avx2, avx512_4fmaps, avx512_4vnniw, avx512_bf16, avx512_bitalg, avx512_fp16, avx512_vbmi2, avx512_vnni, avx512_vp2intersect, avx512_vpopcntdq, avx512bw, avx512cd, avx512dq, avx512er, avx512f, avx512ifma, avx512pf, avx512vbmi, avx512vl, avx_ifma, avx_ne_convert, avx_vnni, avx_vnni_int16, avx_vnni_int8, bmi1, bmi2, cet, cldemote, clflush, clflushopt, clwb, clzero, cmov, cmpccxadd, cx16, cx8, enqcmd, f16c, fma, fma4, fred, fsgsbase, fxsr, gfni, hreset, ibhf, icache_prefetch, invlpgb, invpcid, keylocker, keylocker_wide, lahf, lkgs, lwp, lzcnt, mcommit, mmx, monitor, monitorx, movbe, movdir64b, movdiri, movrs, mpx, msr_imm, msrlist, osfxsr, osxsave, pbndkb, pclmul, pconfig, pku, popcnt, prefetchw, prefetchwt1, ptwrite, rao_int, rdpid, rdpru, rdrand, rdseed, rdtscp, rtm, sce, sep, serialize, sgx, sha, sha512, sm3, sm4, smap, smx, snp, sse, sse2, sse3, sse41, sse42, sse4a, ssse3, svm, tbm, tdx, tsx_ldtrk, uintr, user_msr, vaes, via_padlock_aes, via_padlock_pmm, via_padlock_rng, via_padlock_sha, vmfunc, vmx, vpclmulqdq, waitpkg, wbnoinvd, wrmsrns, x86-64, x86-64-v2, x86-64-v3, x86-64-v4, x87, xop, xsave, xsavec, xsaveopt, xsaves
+   @ ./mach.toml:18:7
+18 | ext = ["sha2"]
+   |       ^^^^^^^^
 ```
 
 The array must hold strings, each an identifier (`sse41`, not `sse4.1`) or a level
@@ -1191,7 +1193,7 @@ Every manifest declares at least one `[profile.*]` table, a dependency's
 included. One that declares none is refused, pointing at the start of the file:
 
 ```
-error[manifest.missing_required] mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring optimize, debug and simd
+error[manifest.missing_required] mach.toml: the [profile] table is missing. a build needs an explicit [profile.<name>] declaring optimize, debug and simd
   @ mach.toml:1:1
 1 | [project]
   | ^

@@ -715,7 +715,7 @@ fun read() i32 {
     var xs: [4]i32;
     val a:  i32 = xs[3]; # ok
     val b:  i32 = xs[4]; # error: index 4 is out of bounds for `[4]i32` of length 4
-    val c:  i32 = xs[-1]; # error: index -1 is out of bounds ...
+    val c:  i32 = xs[-1]; # error: index -1 is out of bounds for `[4]i32` of length 4
     ret a + b + c;
 }
 ```
