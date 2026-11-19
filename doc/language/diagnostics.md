@@ -102,7 +102,7 @@ modules or generic instances raise it.
 | `doc` | doc comments (`doc.lint`) |
 | `manifest`, `toml`, `allow`, `selection`, `need`, `template`, `version` | `mach.toml`: its keys and values, profile `allow` lists, target, profile and artifact selection, `need` entries, path templates and version ranges |
 | `project`, `artifact`, `output`, `source`, `path`, `glob`, `step`, `clean` | the build: finding the project, artifacts and their outputs, build steps, and `mach clean`, and the project `mach init` creates (`project.created`, a note) |
-| `dep`, `mach`, `git` | dependencies: declaration, resolution, realization and pins, the compiler range the closure accepts, and the Git operations behind them, and the notes a dependency command writes (`dep.note`, `dep.effect`, `dep.realized`, `dep.declared`) |
+| `dep`, `mach`, `git` | dependencies: declaration, resolution, realization and pins, the compiler range the closure accepts, and the Git operations behind them, and the notes a dependency command writes (`dep.note`, `dep.effect`, `dep.realized`) |
 | `test` | the test runner, alongside `test` blocks |
 | `cli`, `editor` | command-line flags, commands and operands, and the editor analysis entry points |
 | `fs`, `process`, `env`, `memory` | the machine: a file, process or environment operation that failed, or storage the allocator refused (`memory.refused`) |

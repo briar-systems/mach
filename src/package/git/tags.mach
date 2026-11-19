@@ -1,8 +1,9 @@
 # tags: the git half of the source contract that lists releases. a release is a
-# `v`-prefixed semver tag at a url, listed with one `ls-remote` each; the manifest of a
-# release is read from a scratch bare repository after a shallow fetch of its tag. offline,
-# both come from a local repository, a realized checkout of the url, and nothing reaches
-# the network
+# `v`-prefixed semver tag at a url, listed with one `ls-remote` each. the first manifest read
+# at a url brings every listed release's manifest into a scratch bare repository at once:
+# one shallow fetch of the listed tags without file contents, then one fetch of each
+# release's mach.toml by its object id. offline, both come from a local repository, a
+# realized checkout of the url, and nothing reaches the network
 use collections_vector: std.collections.vector;
 use std.collections.vector.Vector;
 use fs:         std.filesystem;
@@ -37,6 +38,7 @@ use mach.base.diagnostic;
 use manifest_load:  mach.manifest.load;
 use manifest_model: mach.manifest.model;
 use mach.package.git;
+use mach.package.report;
 use package_source: mach.package.source;
 
 # a url's tag listing, read once per command
@@ -51,22 +53,27 @@ rec LocalRepo {
     dir: str;
 }
 
+# `fetched` holds each url whose listed releases' manifests the scratch holds. `rep` hears a
+# line before each url's releases are read from the network, nil for none
 pub rec Remotes {
     s:             *session.Session;
     gi:            git.Inspector;
     listings:      Vector[CachedListing];
     locals:        Vector[LocalRepo];
+    fetched:       Vector[str];
     offline:       bool;
     local:         str;
     scratch:       str;
     scratch_ready: bool;
+    rep:           *report.Report;
 }
 
-pub fun init(s: *session.Session, offline: bool, local: str) res[Remotes, fail.Fail] {
+pub fun init(s: *session.Session, offline: bool, local: str, rep: *report.Report) res[Remotes, fail.Fail] {
     val res_inspector_init: res[git.Inspector, fail.Fail] = git.inspector_init(s.build_alloc, s.environ);
     if (sel res_inspector_init.err) { ret res[Remotes, fail.Fail].err{res_inspector_init.err}; }
     ret res[Remotes, fail.Fail].ok{Remotes{s: s, gi: res_inspector_init.ok, listings: collections_vector.init[CachedListing](s.build_alloc),
-        locals: collections_vector.init[LocalRepo](s.build_alloc), offline: offline, local: local, scratch: "", scratch_ready: false}};
+        locals: collections_vector.init[LocalRepo](s.build_alloc), fetched: collections_vector.init[str](s.build_alloc), offline: offline,
+        local:  local, scratch: "", scratch_ready: false, rep: rep}};
 }
 
 # release the table; a candidate scratch that stays is the failure, once
@@ -93,6 +100,12 @@ pub fun dnit(c: *Remotes) err[fail.Fail] {
         i = i + 1;
     }
     collections_vector.dnit[LocalRepo](?c.locals);
+    i = 0;
+    for (i < c.fetched.len) {
+        str_free(c.s.build_alloc, c.fetched.data[i]);
+        i = i + 1;
+    }
+    collections_vector.dnit[str](?c.fetched);
     git.inspector_dnit(c.s.build_alloc, ?c.gi);
     ret err_out;
 }
@@ -283,6 +296,7 @@ fun cached_listing(c: *Remotes, url: str) res[str, fail.Fail] {
         res_listed = git.query_raw(a, ?c.gi, res_dir.ok, ?args[0], 3);
     }
     or {
+        if (c.rep != nil) { report.linef(c.rep, a, "reading the releases of {}", url); }
         var args: [3]str;
         args[0]    = "ls-remote";
         args[1]    = "--tags";
@@ -349,13 +363,151 @@ fun excluded(why: str) res[package_source.Shipped, fail.Fail] {
     ret res[package_source.Shipped, fail.Fail].ok{out};
 }
 
-# why a release whose manifest failed to load is no candidate, from the load's own message
-fun unloadable(a: *A.Allocator, fault: fail.Fail) res[package_source.Shipped, fail.Fail] {
+# why a release whose manifest failed to load is no candidate, with the load's own message
+fun unloadable(fault: fail.Fail) res[package_source.Shipped, fail.Fail] {
     var text: str = fail.describe(fault);
     if (str_starts_with(text, "mach.toml: ")) { text = (?text[11])::str; }
-    val res_format: res[str, fail.Fail] = diagnostic.format(a, "its mach.toml does not load ({})", text);
-    if (sel res_format.err) { ret res[package_source.Shipped, fail.Fail].err{res_format.err}; }
-    ret excluded(res_format.ok);
+    var out: package_source.Shipped;
+    out.excluded = "its mach.toml does not load";
+    out.detail   = text;
+    ret res[package_source.Shipped, fail.Fail].ok{out};
+}
+
+fun is_fetched(c: *Remotes, url: str) bool {
+    var i: usize = 0;
+    for (i < c.fetched.len) {
+        if (str_equals(c.fetched.data[i], url)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# run git in the scratch with automatic maintenance off: maintenance detached after one fetch
+# rewrites the shallow file the next fetch reads, and the throwaway scratch never needs it
+fun scratch_git(c: *Remotes, args: *Vector[str]) err[fail.Fail] {
+    val res_ran: res[str, fail.Fail] = git.op(c.s.build_alloc, ?c.gi, c.scratch, args.data, args.len, nil);
+    if (sel res_ran.err) { ret err[fail.Fail].err{res_ran.err}; }
+    str_free(c.s.build_alloc, res_ran.ok);
+    ret err[fail.Fail].ok{};
+}
+
+fun push_all(v: *Vector[str], words: *str, n: usize) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < n) {
+        val res_pushed: res[usize, A.Error] = collections_vector.push[str](v, words[i]);
+        if (sel res_pushed.err) { ret err[fail.Fail].err{fail.refused(res_pushed.err)}; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# bring the manifest of every release listed at `url` into the scratch, once per url. the
+# search reads only each release's commit and its mach.toml, so the first fetch takes the listed
+# tags' commits and trees without file contents, and the second takes each mach.toml by the id
+# its tree names: two round trips whatever the number or size of the releases. the tags are the
+# listing's own, so the scratch holds what the listing named and nothing pushed since
+fun fetch_manifests(c: *Remotes, url: str) err[fail.Fail] {
+    if (is_fetched(c, url)) { ret err[fail.Fail].ok{}; }
+    val err_ready: err[fail.Fail] = ensure_scratch(c);
+    if (sel err_ready.err) { ret err_ready; }
+    val a:    *A.Allocator                   = c.s.build_alloc;
+    var rels: Vector[package_source.Release] = collections_vector.init[package_source.Release](a);
+    fin { package_source.releases_dnit(a, ?rels); }
+    val err_listed: err[fail.Fail] = releases((c)::ptr, url, ?rels);
+    if (sel err_listed.err) { ret err_listed; }
+    var owned: Vector[str] = collections_vector.init[str](a);
+    fin {
+        var k: usize = 0;
+        for (k < owned.len) {
+            str_free(a, owned.data[k]);
+            k = k + 1;
+        }
+        collections_vector.dnit[str](?owned);
+    }
+    var head: [9]str;
+    head[0] = "-c";
+    head[1] = "gc.auto=0";
+    head[2] = "-c";
+    head[3] = "maintenance.auto=false";
+    head[4] = "fetch";
+    head[5] = "-q";
+    head[6] = "--depth=1";
+    head[7] = "--filter=blob:none";
+    head[8] = url;
+    var args: Vector[str] = collections_vector.init[str](a);
+    fin { collections_vector.dnit[str](?args); }
+    val err_head: err[fail.Fail] = push_all(?args, ?head[0], 9);
+    if (sel err_head.err) { ret err_head; }
+    var i: usize = 0;
+    for (i < rels.len) {
+        val res_refspec: res[str, std_format.FormatError] = std_format.sprint(a, "+refs/tags/{}:refs/tags/{}", rels.data[i].tag, rels.data[i].tag);
+        if (sel res_refspec.err) { ret err[fail.Fail].err{fail.format_refused(res_refspec.err)}; }
+        val res_kept: res[usize, A.Error] = collections_vector.push[str](?owned, res_refspec.ok);
+        if (sel res_kept.err) {
+            str_free(a, res_refspec.ok);
+            ret err[fail.Fail].err{fail.refused(res_kept.err)};
+        }
+        val err_pushed: err[fail.Fail] = push_all(?args, ?owned.data[owned.len - 1], 1);
+        if (sel err_pushed.err) { ret err_pushed; }
+        i = i + 1;
+    }
+    if (rels.len > 0) {
+        val err_trees: err[fail.Fail] = scratch_git(c, ?args);
+        if (sel err_trees.err) { ret err_trees; }
+    }
+    # a manifest's id is read from its release's tree, which the first fetch brought
+    collections_vector.truncate[str](?args, 0);
+    var blob_head: [12]str;
+    blob_head[0]  = "-c";
+    blob_head[1]  = "gc.auto=0";
+    blob_head[2]  = "-c";
+    blob_head[3]  = "maintenance.auto=false";
+    blob_head[4]  = "-c";
+    blob_head[5]  = "fetch.negotiationAlgorithm=noop";
+    blob_head[6]  = "fetch";
+    blob_head[7]  = "-q";
+    blob_head[8]  = "--no-tags";
+    blob_head[9]  = "--no-write-fetch-head";
+    blob_head[10] = "--filter=blob:none";
+    blob_head[11] = url;
+    val err_blob_head: err[fail.Fail] = push_all(?args, ?blob_head[0], 12);
+    if (sel err_blob_head.err) { ret err_blob_head; }
+    i = 0;
+    for (i < rels.len) {
+        var tree: [5]str;
+        tree[0] = "ls-tree";
+        tree[1] = "--format=%(objectname)";
+        tree[2] = rels.data[i].commit;
+        tree[3] = "--";
+        tree[4] = manifest_load.MANIFEST_FILE;
+        i       = i + 1;
+        val res_id: res[str, fail.Fail] = git.query(a, ?c.gi, c.scratch, ?tree[0], 5);
+        if (sel res_id.err) { ret err[fail.Fail].err{res_id.err}; }
+        # a release with no mach.toml has no id, and reading it fails as before
+        if (str_is_empty(res_id.ok)) {
+            str_free(a, res_id.ok);
+            cnt;
+        }
+        val res_kept: res[usize, A.Error] = collections_vector.push[str](?owned, res_id.ok);
+        if (sel res_kept.err) {
+            str_free(a, res_id.ok);
+            ret err[fail.Fail].err{fail.refused(res_kept.err)};
+        }
+        val err_pushed: err[fail.Fail] = push_all(?args, ?owned.data[owned.len - 1], 1);
+        if (sel err_pushed.err) { ret err_pushed; }
+    }
+    if (args.len > 12) {
+        val err_blobs: err[fail.Fail] = scratch_git(c, ?args);
+        if (sel err_blobs.err) { ret err_blobs; }
+    }
+    val res_url: res[str, A.Error] = str_dup_range(a, url, 0, str_len(url));
+    if (sel res_url.err) { ret err[fail.Fail].err{fail.refused(res_url.err)}; }
+    val res_pushed: res[usize, A.Error] = collections_vector.push[str](?c.fetched, res_url.ok);
+    if (sel res_pushed.err) {
+        str_free(a, res_url.ok);
+        ret err[fail.Fail].err{fail.refused(res_pushed.err)};
+    }
+    ret err[fail.Fail].ok{};
 }
 
 pub fun shipped(ctx: ptr, url: str, rel: *package_source.Release) res[package_source.Shipped, fail.Fail] {
@@ -368,27 +520,9 @@ pub fun shipped(ctx: ptr, url: str, rel: *package_source.Release) res[package_so
         dir = res_offline_dir.ok;
     }
     or {
-        val err_ready: err[fail.Fail] = ensure_scratch(c);
-        if (sel err_ready.err) { ret res[package_source.Shipped, fail.Fail].err{err_ready.err}; }
+        val err_fetched: err[fail.Fail] = fetch_manifests(c, url);
+        if (sel err_fetched.err) { ret res[package_source.Shipped, fail.Fail].err{err_fetched.err}; }
         dir = c.scratch;
-        val res_refspec: res[str, std_format.FormatError] = std_format.sprint(a, "+refs/tags/{}:refs/tags/{}", rel.tag, rel.tag);
-        if (sel res_refspec.err) { ret res[package_source.Shipped, fail.Fail].err{fail.message(fail.format_text(res_refspec.err))}; }
-        # automatic maintenance, detached after one fetch, rewrites the shallow file the next
-        # fetch has read, so the throwaway scratch never maintains itself
-        var args: [9]str;
-        args[0] = "-c";
-        args[1] = "gc.auto=0";
-        args[2] = "-c";
-        args[3] = "maintenance.auto=false";
-        args[4] = "fetch";
-        args[5] = "-q";
-        args[6] = "--depth=1";
-        args[7] = url;
-        args[8] = res_refspec.ok;
-        val res_fetched: res[str, fail.Fail] = git.op(a, ?c.gi, dir, ?args[0], 9, nil);
-        str_free(a, res_refspec.ok);
-        if (sel res_fetched.err) { ret res[package_source.Shipped, fail.Fail].err{res_fetched.err}; }
-        str_free(a, res_fetched.ok);
     }
     val res_spec: res[str, std_format.FormatError] = std_format.sprint(a, "{}:{}", rel.commit, manifest_load.MANIFEST_FILE);
     if (sel res_spec.err) { ret res[package_source.Shipped, fail.Fail].err{fail.message(fail.format_text(res_spec.err))}; }
@@ -408,7 +542,7 @@ pub fun shipped(ctx: ptr, url: str, rel: *package_source.Release) res[package_so
     var doc: manifest_load.Doc = res_doc.ok;
     fin { manifest_load.doc_dnit(a, ?doc); }
     val res_parsed: res[manifest_model.Manifest, fail.Fail] = manifest_load.parse(a, ?c.s.interner, ?doc);
-    if (sel res_parsed.err) { ret unloadable(a, res_parsed.err); }
+    if (sel res_parsed.err) { ret unloadable(res_parsed.err); }
     var m:            manifest_model.Manifest = res_parsed.ok;
     val opt_declared: opt[str]                = intern.get(?c.s.interner, m.version);
     var agrees:       bool                    = false;

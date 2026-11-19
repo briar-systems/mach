@@ -11,9 +11,12 @@ A **release** of a git dependency is a tag `vX.Y.Z` (optionally
 does not load, as an old tag's written for an earlier manifest schema, or whose
 `[project].version` differs from the tag name is not a candidate. Resolution
 sets it aside and keeps looking. When nothing fits, the error lists it among the
-requirements (`gl 0.1.0 is not a candidate (its mach.toml does not load
-(unknown key 'name' in [project]))`, or `... (its [project].version does not
-match the tag)`), so the error never reads as one in the project's own `mach.toml`.
+requirements (`gl 0.1.0 is not a candidate, because its mach.toml does not load
+(unknown key 'name' in [project])`, or `..., because its [project].version does
+not match the tag`), and several releases set aside for one reason share a line
+(`28 releases of gl, 0.1.0 to 0.18.0, are not candidates, each because its
+mach.toml does not load (in gl 0.18.0, unknown key 'name' in [project])`), so the
+error never reads as one in the project's own `mach.toml`.
 
 Resolution runs in exactly three places: `mach dep add`, `mach dep update` and
 `mach dep outdated`. **Builds never resolve and never verify.** They read
@@ -71,15 +74,22 @@ What `mach dep add` writes:
 
 `mach init` adds std the same way, so a new project names the std release that
 works with the compiler that created it. std is an ordinary dependency, with
-no std-specific command. `mach init --no-deps` still resolves and writes the
-range and skips only the checkout, so it needs the network too. Offline it
-fails and writes no `[dep.std]` table. A tool that needs the std for a given
+no std-specific command. `mach init --no-deps` declares no dependency and reads
+nothing from the network (see [files.md](files.md#what-mach-init-does)). A tool
+that needs the std for a given
 compiler runs `mach init` and `mach dep pull` in a scratch project and takes
 what resolution chose.
 
 **`--offline`.** `add`, `update` and `outdated` read candidates from each
-dependency's repository: one `git ls-remote --tags` per URL, and the manifest
-at a release through a shallow fetch of its tag. With `--offline` they use only
+dependency's repository: one `git ls-remote --tags` per URL, announced first
+(`reading the releases of <url>`), and the first time a release's manifest is
+needed, every listed release's manifest at once, in two fetches into a scratch
+repository: the listed tags' commits and trees with no file contents, then each
+release's `mach.toml` by its object id. The cost follows the number of files in
+a release, not their size, and a release that is no candidate costs nothing
+more on the network. When no release fits, releases refused for the same
+reason are reported on one line with their count and versions, the reason
+named at the newest. With `--offline` they use only
 the tags already present in the realized checkouts, and they say so
 (`resolving from releases already fetched (--offline)`). A resolution that
 needs a candidate it doesn't have fails, naming the identity. Realizing a

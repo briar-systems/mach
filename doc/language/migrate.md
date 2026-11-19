@@ -5,8 +5,11 @@ current one. It rewrites the root project's `mach.toml`, then every source file
 under its `[project].src`, and reports what it cannot rewrite.
 
 - It is idempotent: a migrated project changes nothing.
-- `--check` writes nothing and prints each change as a diff, so CI can confirm a
-  project is migrated.
+- `--check` writes nothing and prints each change as a unified diff with no
+  context lines, so CI can confirm a project is migrated. Each hunk header names
+  the change's line numbers and, after the `@@`, the table it sits in, as
+  `@@ -29,3 +29,3 @@ [target.darwin-aarch64]`. The output applies with
+  `patch -p0` from the directory `mach migrate` ran in.
 - It works on the root project only. Dependencies under `dep/` belong to other
   projects and are never edited, and one still on the previous major is reported.
 - A script that runs `mach` with a removed option is reported with its file and line,
@@ -60,7 +63,9 @@ Rewritten by `mach migrate`:
 
 | 6 | 7 |
 |---|---|
-| `opt`, `float_reassoc` | `optimize`, `relax` |
+| `opt` | `optimize` |
+| `float_reassoc = true` | `relax = ["float-reassoc"]` |
+| `float_reassoc = false` | removed: float arithmetic is exact unless a profile relaxes it |
 | `vectorize = true` or `vectorize = false` in a profile | removed: `optimize` schedules the pass, and `#[vectorize("never")]` opts one function out |
 | `[project] out`, `{project.out}` | `work`, `{project.work}` |
 | an artifact `out` such as `"bin/app"`, which v6 rooted under `[project] out` | `"{project.work}/bin/app"` |
@@ -69,6 +74,9 @@ Rewritten by `mach migrate`:
 | `{target.isa}`, `{target.os}` | `{target.arch}`, `{target.sys}` |
 | an `isa` naming an architecture | `arch` |
 | an `isa` naming a RISC-V selection, as `isa = "rv32imc"` | `arch = "riscv32"` beside it |
+| a freestanding target's `isa` naming an architecture, as `isa = "riscv64"` | `arch` with `isa` set to the floor 6 built for (`x86-64`, `armv8-a+fp+simd`, `rv64gc`, `rv32imac`), since 7 has no freestanding default |
+| a freestanding target with no `of`, which 6 wrote as a flat image | `of = "flat"`, since 7 writes ELF by default |
+| `abi = "aapcs64"` on a darwin aarch64 target | `abi = "darwinpcs"` |
 | `of = "raw"`, `of = "spv"` | `of = "flat"`, `of = "spirv"` |
 | a spirv target's `os = "freestanding"`, `abi = "spirv"` | `sys = "vulkan"`, `abi = "shader"` |
 | `subsystem = "gui"` | `subsystem = "windows"` |
@@ -84,6 +92,7 @@ Rewritten by `mach migrate`:
 | `use id;`, `fwd id;` | the path of the dependency's exported artifact entry |
 | `--jobs`, `--jobs=n` in the `argv` of a `[step]` that runs mach | `--threads`, `--threads=n` |
 | `[project] mach` on the previous major | `^7`, the range `mach init` writes |
+| `fwd.instances`, `debug.dropped`, `target.default_deprecated`, `target.native_fallback` in a profile's `allow` | removed: 7 never raises these warnings |
 
 Reported, for you to change:
 

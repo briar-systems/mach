@@ -168,6 +168,12 @@ command line states the project: `--source <name>=<dir>` binds a source root,
 spelled as `mach info targets` prints it. The target is the host's when `-t` is left out.
 `-a`, `-p` and `--all` select nothing in an entry build and are refused.
 
+The entry's own project is the one a `--source` binds over the entry's
+directory, else a project named by the entry's stem, so `mach build tool.mach`
+builds project `tool`. Both names must be project ids, which a `use` path can
+spell: a letter or `_`, then letters, digits and `_`. A stem such as `my-tool`
+is refused, and the entry is renamed or bound with `--source my_tool=.`.
+
 A directory a `--source` binds may be a project, holding a `mach.toml`. Its `id`
 must be the name it is bound to, it may declare no dependencies, and its sources
 are its `src`. Its exported `[link]` entries then apply to the entry build as they

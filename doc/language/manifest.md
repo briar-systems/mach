@@ -141,7 +141,7 @@ ref = "branch/main"
 
 | Key       | Type   | Meaning |
 |-----------|--------|---------|
-| `id`      | string | Root segment of every module path the project exposes: a file at `<src>/foo/bar.mach` is reachable as `<id>.foo.bar`. Must be a plain identifier — letters, digits, `_`, `-` — since it names the dependency store and keys step stamp files. Read by `$project.id`. |
+| `id`      | string | Root segment of every module path the project exposes: a file at `<src>/foo/bar.mach` is reachable as `<id>.foo.bar`. It must start with a letter or `_` and hold only letters, digits and `_`, so that a `use` path can name it, and a manifest with any other id is refused. `mach init` derives one from the directory's name, writing each `-` as `_`. Read by `$project.id`. |
 | `version` | string | Project version. Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `work`    | string | The work directory template: everything a build writes besides its artifacts, referenced as `{project.work}` by artifact `out`, step `argv`, `in` and `out`, and local link paths. Expanded over `{target.name}`/`{target.arch}`/`{target.sys}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). `-w` names another work directory for one build or test. |
@@ -585,6 +585,7 @@ naming the new spelling and carrying the rewrite `mach migrate` applies:
 | `of` | `spv` | `spirv` |
 | `sys` (on `arch = "spirv"`) | `freestanding` | `vulkan` |
 | `abi` (on `arch = "spirv"`) | `spirv` | `shader` |
+| `abi` (on `arch = "aarch64"`, `sys = "darwin"`) | `aapcs64` | `darwinpcs` |
 | `arch` | a RISC-V selection such as `rv32imc` | `arch = "riscv32"` and `isa = "rv32imc"` |
 
 v6 wrote a RISC-V selection as `isa = "rv32imc"` with no architecture at all, and
@@ -605,7 +606,7 @@ and runs natively in CI on every PR; `riscv64`-linux runs under qemu and
 self-hosts. `windows` is a supported cross-compilation target (PE/COFF,
 Win64 ABI). `darwin` is validated end-to-end on both architectures: each
 self-hosts to a three-generation fixpoint on a native macOS runner and ships a
-release archive. `freestanding` targets a raw flat image with no OS runtime; a
+release archive. `freestanding` targets an ELF or flat image with no OS runtime; a
 bare-metal platform such as BareMetal (`bmos`) is a `freestanding` target plus a
 `platform` tag and `base` override (see [Platform targets](#platform-targets-bare-metal)),
 not an os of its own. `spirv` is not a machine at all — it
@@ -703,7 +704,7 @@ caught rather than silently never matching.
 ### Object-format override
 
 `of` overrides the object format a target implies. Each os has a default format —
-`linux` → `elf`, `windows` → `coff`, `uefi` → `coff`, `darwin` → `macho`, `freestanding` → `flat`,
+`linux` → `elf`, `windows` → `coff`, `uefi` → `coff`, `darwin` → `macho`, `freestanding` → `elf`,
 `vulkan` → `spirv` — and `of` names a different one from the same closed set: `elf`,
 `coff`, `macho`, `flat`, `spirv`. `of` is optional; omit it to
 take the default. An os accepts only the formats it can load, so an override the
@@ -712,9 +713,10 @@ os cannot enter is refused.
 ```toml
 [target.metal]
 arch = "x86_64"
-sys  = "freestanding"   # os default object format is "flat"
-abi = "sysv64"
-of  = "elf"            # override: emit an ELF object instead
+isa  = "x86-64"
+sys  = "freestanding"   # os default object format is "elf"
+abi  = "sysv64"
+of   = "flat"           # override: emit a flat image instead
 ```
 
 The default is a function of the whole tuple, not the os alone. An os default
@@ -1085,11 +1087,12 @@ open `platform` tag a support library keys its backend on (surfaced to comptime 
 ```toml
 [target.bmos]
 arch      = "x86_64"
+isa       = "x86-64"
 sys       = "freestanding"
-abi      = "sysv64"
-base     = 0xFFFF800000000000   # BareMetal copies the flat image here and calls it
-platform = "bmos"               # selects the mach-bmos backend
-# no `of`: freestanding's default object format is "flat"
+abi       = "sysv64"
+of        = "flat"               # freestanding's default object format is "elf"
+base      = 0xFFFF800000000000   # BareMetal copies the flat image here and calls it
+platform  = "bmos"               # selects the mach-bmos backend
 ```
 
 - The artifact is a **flat binary** — no header, no sections, no entry record.

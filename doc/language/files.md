@@ -97,6 +97,30 @@ The `id` is the root of every module path the project exposes. A file at
 the standard library, realized as a git submodule at `dep/std/` and addressed
 as `std.*` in source.
 
+## What mach init does
+
+- **The id.** `--name` gives it, else the directory's name. A `use` path must
+  be able to spell the id, so it starts with a letter or `_` and holds only
+  letters, digits and `_`. A directory name such as `my-app` becomes `my_app`,
+  each `-` written as `_`, and `mach init` says which id it chose. A `--name`
+  that is not an id, or a directory name that stays one after that, is refused.
+- **std first.** The `[dep.std]` range is resolved before anything is written,
+  reading std's releases from the network (`mach init` says so first). When no
+  release works with the running compiler, nothing is created and the error
+  names the way on: `mach init --no-deps`, then `mach dep add <dir> std --git
+  <url> --ref branch/<name>` to take std from a branch.
+- **`--no-deps`** declares no dependency and reads nothing from the network. It
+  is for a project offline, or one that names std's source itself. The entry
+  still uses std, so the project builds once std is declared, and `mach init`
+  prints the `mach dep add` command that declares it.
+- **Git.** Unless `--no-git`, the directory is made a repository (unless it
+  stands in one already), std is checked out as a submodule, and a `.gitignore`
+  holding `/out/`, the work directory every build writes under, is written
+  where none exists. `dep/` is not ignored, since each checkout there is a
+  submodule its pin records. Under `--no-git` no `.gitignore` is written.
+- **A failure** after the files are written, in `git init` or in checking std
+  out, leaves the project complete and says which step to rerun.
+
 ## See also
 
 - [modules.md](modules.md) — how files map to module paths

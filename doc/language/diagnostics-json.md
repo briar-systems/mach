@@ -189,9 +189,8 @@ record with `severity` `"note"`, its `code` the note's key, and a `null`
 |---|---|
 | `dep.note` | a dependency command as it works: an overridden requirement, a directory left under `dep/`, a copy or checkout that stopped part way |
 | `dep.effect` | a dependency command that failed, once for each change it made before the failure, after the failure's record |
-| `project.created` | `mach init`, for the project it made |
+| `project.created` | `mach init`, for the project it made, the id it chose, and under `--no-deps` the command that declares each dependency the entry uses |
 | `dep.realized` | `mach init`, for each dependency it declared and realized |
-| `dep.declared` | `mach init --no-deps`, for each dependency it declared without a checkout, naming the command that realizes it |
 
 ```json
 {"schema":2,"record":"diagnostic","severity":"note","code":"project.created","message":"created project 'app'","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
