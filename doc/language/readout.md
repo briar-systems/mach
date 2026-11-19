@@ -103,8 +103,8 @@ After the rows each counter prints its total over the unit's modules:
 | `functions` | the functions of the lowered modules | mirl's module |
 | `ir instrs` | the instructions lowering built into their bodies | mirl's bodies |
 | `verify runs` | the runs of mirl's verifier over them, mach's and those mirl makes in a checked compile | mach, mirl |
-| `allocated blocks` | the blocks a step allocated from its heap while it lowered and compiled the module, a moved reallocation counting again | std's heap |
-| `allocated bytes` | the bytes of those allocations, which never go down | std's heap |
+| `heap blocks` | the blocks a step allocated from its heap while it lowered and compiled the module, a moved reallocation counting again | std's heap |
+| `heap bytes` | the bytes of those allocations, which never go down | std's heap |
 | `heap peak` | the most bytes a step's heap mapped, the largest over the modules | std's heap |
 | `selected instrs` | the machine instructions selection made | mirl |
 | `allocated instrs` | the machine instructions after register allocation | mirl |
