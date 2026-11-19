@@ -4,6 +4,7 @@
 # environment that keeps the user's configuration and drops whatever would redirect git to
 # another repository, and every failure names the command, how it ended and what git printed
 use std.collections.sort;
+use std.chrono.time;
 use collections_vector: std.collections.vector;
 use std.collections.vector.Vector;
 use fs:         std.filesystem;
@@ -13,7 +14,8 @@ use std.process.env;
 use std.process.exec;
 use std.runtime.native.view.NativeName;
 use std.runtime.native.view.Unit;
-use system_os: std.system.os;
+use sync_cancel: std.sync.cancel;
+use system_os:   std.system.os;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -38,7 +40,9 @@ use mach.base.fail;
 use compile_load: mach.compile.load;
 use mach.host;
 use host_environment: mach.host.environment;
+use mach.host.interrupt;
 use mach.host.subprocess;
+use mach.package.scratch;
 use mach.session;
 
 pub rec Entry {
@@ -134,23 +138,23 @@ fun captured_bytes(alloc: *A.Allocator, p: *subprocess.OwnedSubprocess, trim_lin
 }
 
 # release a run's child and capture file; a capture file that stays is the failure
-fun capture_dnit(alloc: *A.Allocator, temp: *fs.TempFile, child: *subprocess.OwnedSubprocess, release: bool) err[fail.Fail] {
+fun capture_dnit(alloc: *A.Allocator, capture: str, child: *subprocess.OwnedSubprocess, release: bool) err[fail.Fail] {
     # a capture finished once refuses release only when its own buffer's free is refused, which leaves no file behind
     if (release) { subprocess.capture_dnit(alloc, child); }
     subprocess.dnit(alloc, child);
-    val err_removed: err[fail.Fail] = capture_removed(alloc, temp);
-    str_free(alloc, fs.temp_path(temp));
+    val err_removed: err[fail.Fail] = capture_removed(alloc, capture);
+    str_free(alloc, capture);
     ret err_removed;
 }
 
 val CAPTURE_ROLE: str = "the git output capture file";
 
-# the capture file removed; one already gone is no failure
-fun capture_removed(alloc: *A.Allocator, temp: *fs.TempFile) err[fail.Fail] {
-    val err_removed: err[io_error.Error] = fs.temp_remove(temp);
+# the capture file removed; one never made or already gone is no failure
+fun capture_removed(alloc: *A.Allocator, capture: str) err[fail.Fail] {
+    val err_removed: err[io_error.Error] = fs.remove_file(capture);
     if (sel err_removed.ok)                         { ret err[fail.Fail].ok{}; }
     if (err_removed.err.kind == io_error.NOT_FOUND) { ret err[fail.Fail].ok{}; }
-    ret err[fail.Fail].err{fail.refusal(alloc, diagnostic_kind.FS_REMOVE, fail.Op{verb: "remove", role: CAPTURE_ROLE, path: fs.temp_path(temp)}, fail.Cause.io{err_removed.err})};
+    ret err[fail.Fail].err{fail.refusal(alloc, diagnostic_kind.FS_REMOVE, fail.Op{verb: "remove", role: CAPTURE_ROLE, path: capture}, fail.Cause.io{err_removed.err})};
 }
 
 pub fun count_nil_terminated(arr: **u8) usize {
@@ -335,6 +339,14 @@ fun failure(alloc: *A.Allocator, child: *subprocess.OwnedSubprocess, args: **u8,
     ret fail.refusal(alloc, diagnostic_kind.GIT_COMMAND, ran, fail.Cause.text{res_full.ok});
 }
 
+# the failure of a git command an interrupt stopped, or kept from starting
+fun interrupted(alloc: *A.Allocator, args: **u8, dir: str) fail.Fail {
+    val res_command: res[str, std_format.FormatError] = command_text(alloc, args);
+    if (sel res_command.err) { ret fail.format_refused(res_command.err); }
+    fin { str_free(alloc, res_command.ok); }
+    ret fail.refusal(alloc, diagnostic_kind.GIT_COMMAND, fail.Op{verb: "run", path: res_command.ok, link: "in", other: dir}, fail.Cause.text{"the command was interrupted"});
+}
+
 fun run_capture(alloc: *A.Allocator, gi: *Inspector, argv: **u8, shown: **u8, trim_line_end: bool, extra_env: **u8, stdin_fd: usize, capture_stderr: bool) res[Bytes, fail.Fail] {
     val res_ran: res[opt[Bytes], fail.Fail] = run(alloc, gi, argv, shown, trim_line_end, extra_env, stdin_fd, capture_stderr, false);
     if (sel res_ran.err)     { ret res[Bytes, fail.Fail].err{res_ran.err}; }
@@ -346,23 +358,15 @@ fun run_capture(alloc: *A.Allocator, gi: *Inspector, argv: **u8, shown: **u8, tr
 # exit answered rather than failed, so a question whose answer is the exit can ask it
 fun run(alloc: *A.Allocator, gi: *Inspector, argv: **u8, shown: **u8, trim_line_end: bool, extra_env: **u8, stdin_fd: usize, capture_stderr: bool,
     quiet_exit: bool) res[opt[Bytes], fail.Fail] {
-    val res_temp_create: res[fs.TempFile, fs.FsError] = fs.temp_create(alloc, "mach_dep_verify");
-    if (sel res_temp_create.err) { ret res[opt[Bytes], fail.Fail].err{fail.refusal(alloc, diagnostic_kind.FS_TEMP, fail.Op{verb: "create", role: "a temporary for the git output capture"}, fail.Cause.fs{res_temp_create.err})}; }
-    var temp:           fs.TempFile         = res_temp_create.ok;
-    val err_temp_close: err[io_error.Error] = fs.temp_close(?temp);
-    if (sel err_temp_close.err) {
-        val closing:     fail.Fail      = fail.refusal(alloc, diagnostic_kind.GIT_COMMAND, fail.Op{verb: "close", role: CAPTURE_ROLE, path: fs.temp_path(?temp)}, fail.Cause.io{err_temp_close.err});
-        val err_removed: err[fail.Fail] = capture_removed(alloc, ?temp);
-        str_free(alloc, fs.temp_path(?temp));
-        if (sel err_removed.err) { ret res[opt[Bytes], fail.Fail].err{fail.with_secondary(alloc, closing, err_removed.err)}; }
-        ret res[opt[Bytes], fail.Fail].err{closing};
-    }
+    if (interrupt.taken()) { ret res[opt[Bytes], fail.Fail].err{interrupted(alloc, shown, argv_dir(argv))}; }
+    val res_capture: res[str, fail.Fail] = scratch.path(alloc, "capture");
+    if (sel res_capture.err) { ret res[opt[Bytes], fail.Fail].err{res_capture.err}; }
 
     var child: subprocess.OwnedSubprocess;
     subprocess.init(?child);
     var captured:    bool                       = false;
-    val res_ran:     res[opt[Bytes], fail.Fail] = run_captured(alloc, gi, ?temp, ?child, ?captured, argv, shown, trim_line_end, extra_env, stdin_fd, capture_stderr, quiet_exit);
-    val err_cleaned: err[fail.Fail]             = capture_dnit(alloc, ?temp, ?child, captured);
+    val res_ran:     res[opt[Bytes], fail.Fail] = run_captured(alloc, gi, res_capture.ok, ?child, ?captured, argv, shown, trim_line_end, extra_env, stdin_fd, capture_stderr, quiet_exit);
+    val err_cleaned: err[fail.Fail]             = capture_dnit(alloc, res_capture.ok, ?child, captured);
     if (sel err_cleaned.err) {
         if (sel res_ran.err) { ret res[opt[Bytes], fail.Fail].err{fail.with_secondary(alloc, res_ran.err, err_cleaned.err)}; }
         if (sel res_ran.ok.some) {
@@ -377,7 +381,7 @@ fun run(alloc: *A.Allocator, gi: *Inspector, argv: **u8, shown: **u8, trim_line_
 # `run` once its capture file is made: git spawned, waited on and its output read
 # ---
 # captured: set once the capture is finished, so its release is owed
-fun run_captured(alloc: *A.Allocator, gi: *Inspector, temp: *fs.TempFile, child: *subprocess.OwnedSubprocess, captured: *bool,
+fun run_captured(alloc: *A.Allocator, gi: *Inspector, capture: str, child: *subprocess.OwnedSubprocess, captured: *bool,
     argv: **u8, shown: **u8, trim_line_end: bool, extra_env: **u8, stdin_fd: usize, capture_stderr: bool, quiet_exit: bool) res[opt[Bytes], fail.Fail] {
     if (!argv_reads_only(argv)) { trees_dnit(gi); }
     var shared: bool = extra_env == nil && gi.alloc != nil;
@@ -404,24 +408,33 @@ fun run_captured(alloc: *A.Allocator, gi: *Inspector, temp: *fs.TempFile, child:
     }
     var options: subprocess.SpawnOptions = subprocess.spawn_options();
     options.stdin          = stdin_fd;
-    options.capture        = fs.temp_path(temp);
+    options.capture        = capture;
     options.capture_stderr = capture_stderr;
     options.capture_limit  = 1048576;
     val dir:              str                   = argv_dir(argv);
     val err_spawn_native: err[subprocess.Error] = subprocess.spawn_native(alloc, child, gi.program, argv, exec.NativeEnvironment.given{git_env.items}, options);
     if (sel err_spawn_native.err) { ret res[opt[Bytes], fail.Fail].err{subprocess.refusal(alloc, diagnostic_kind.GIT_COMMAND, "run", err_spawn_native.err, dir)}; }
-    val res_wait: res[subprocess.SubprocessTerminal, subprocess.Error] = subprocess.wait(alloc, child);
+    # the scope is cancelled by a caught interrupt, which stops git before the scratch is released
+    var scope: sync_cancel.Scope;
+    sync_cancel.make_root(?scope, opt[time.Instant].none{});
+    val res_wait: res[*subprocess.OwnedSubprocess, subprocess.Error] = subprocess.wait_any(alloc, child, 1, ?scope);
+    # a root scope made here holds no child, registration or waiter once the wait returns, so destroy cannot refuse
+    sync_cancel.dnit(?scope);
     if (sel res_wait.err) {
         subprocess.abandon_capture(child);
         ret res[opt[Bytes], fail.Fail].err{subprocess.refusal(alloc, diagnostic_kind.GIT_COMMAND, "wait for", res_wait.err, dir)};
     }
-    val terminal:           subprocess.SubprocessTerminal                     = res_wait.ok;
+    if (interrupt.taken()) {
+        subprocess.abandon_capture(child);
+        ret res[opt[Bytes], fail.Fail].err{interrupted(alloc, shown, dir)};
+    }
+    val terminal:           subprocess.SubprocessTerminal                     = child.terminal;
     val res_finish_capture: res[subprocess.CaptureIoResult, subprocess.Error] = subprocess.finish_capture(alloc, child, true);
     if (sel res_finish_capture.err) { ret res[opt[Bytes], fail.Fail].err{subprocess.refusal(alloc, diagnostic_kind.GIT_COMMAND, "read the output of", res_finish_capture.err, dir)}; }
     val cap: subprocess.CaptureIoResult = res_finish_capture.ok;
     @captured = true;
     if (cap.read_failed || cap.write_failed || cap.close_failed || cap.short_read || cap.truncated) {
-        ret res[opt[Bytes], fail.Fail].err{fail.refusal(alloc, diagnostic_kind.GIT_COMMAND, fail.Op{verb: "capture all of the git output in", role: CAPTURE_ROLE, path: fs.temp_path(temp)}, fail.Cause.text{"the capture was cut short"})};
+        ret res[opt[Bytes], fail.Fail].err{fail.refusal(alloc, diagnostic_kind.GIT_COMMAND, fail.Op{verb: "capture all of the git output in", role: CAPTURE_ROLE, path: capture}, fail.Cause.text{"the capture was cut short"})};
     }
     if (terminal.kind != subprocess.STATE_EXITED || terminal.code != 0) {
         if (quiet_exit) { ret res[opt[Bytes], fail.Fail].ok{opt[Bytes].none{}}; }

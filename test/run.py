@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # the compiler's test corpus: every file under run/ and gpu/ builds for every target that
 # takes it and exits 0 where the host can run it, every file under refuse/ is refused with
-# the diagnostic it names, and every artifact holds to its target's rules.
+# the diagnostic it names, every artifact holds to its target's rules, and every project
+# manifest of the tree (its own, each package's under dep/ and any under test/) loads.
 #
 #   test/run.py [--mach <path>] [--mink <path>] [--std <dir>] [--root <dir>] [--jobs <n>] [--kinds] [--local] [filter...]
 #
 # a filter is a substring of a file's path or a target's name. build output goes to test/out.
+# a target file's rules hold of the blocks of `mink dump`: `has` some block holds every part,
+# `lacks` none does, `each` every block holding the first part holds the rest, and
+# `inside <parts> | <parts>` every block holding the first parts lies within the addresses of a
+# block holding the second.
 # a `# targets:` line in a file's header names the targets that take it: a refuse/ file is
 # tried on the host alone without one, and a run/ or gpu/ file on every target taking its kind.
 # --local also runs each artifact of a target the host cannot run under the tool its target
@@ -59,6 +64,11 @@ class Target:
                 self.local = rest.split()
             elif verb in ('has', 'lacks', 'each'):
                 self.rules.append((verb, [p.strip() for p in rest.split(';')], n))
+            elif verb == 'inside':
+                inner, bar, outer = rest.partition('|')
+                if not bar:
+                    sys.exit(f'{path}:{n}: `inside` needs `<parts> | <parts>`')
+                self.rules.append((verb, ([p.strip() for p in inner.split(';')], [p.strip() for p in outer.split(';')]), n))
             else:
                 sys.exit(f'{path}:{n}: unknown line `{verb}`')
         if '--target' not in self.flags:
@@ -95,10 +105,34 @@ def holds(block, parts):
     return all(any(field(p, line) for line in block) for p in parts)
 
 
+def span(block):
+    # the addresses a section (Address, Size) or a segment (VirtualAddress, MemSize) occupies, or None
+    got = {}
+    for line in block:
+        key, sep, value = line.partition(': ')
+        if sep and key in ('Address', 'Size', 'VirtualAddress', 'MemSize'):
+            got[key] = int(value.split()[0], 0)
+    for at, size in (('Address', 'Size'), ('VirtualAddress', 'MemSize')):
+        if at in got and size in got:
+            return got[at], got[at] + got[size]
+    return None
+
+
 def judge(rules, dump):
     # the rules a dump breaks, each as text
     bs, broken = blocks(dump), []
     for verb, parts, n in rules:
+        if verb == 'inside':
+            # every block holding the inner parts lies within the addresses of a block holding the outer ones
+            inner, outer = parts
+            said = ' ; '.join(inner) + ' | ' + ' ; '.join(outer)
+            spans = [span(b) for b in bs if holds(b, outer)]
+            for b in bs:
+                mine = span(b) if holds(b, inner) else None
+                if mine and not any(o and o[0] <= mine[0] and mine[1] <= o[1] for o in spans):
+                    broken.append(f'line {n}: inside {said}')
+                    break
+            continue
         said = ' ; '.join(parts)
         if verb == 'has' and not any(holds(b, parts) for b in bs):
             broken.append(f'line {n}: has {said}')
@@ -121,6 +155,31 @@ def errors(text):
             if r.get('record') == 'diagnostic' and r.get('severity') == 'error':
                 out.append((r.get('code', '?'), r.get('message', '')))
     return out
+
+
+def manifests():
+    # every mach.toml of the tree: the root's, and each under dep/ and test/, never one in a build's
+    # output or in a package's own copy of its dependencies
+    found = [os.path.join(ROOT, 'mach.toml')] if os.path.isfile(os.path.join(ROOT, 'mach.toml')) else []
+    for top in ('dep', 'test'):
+        for d, subdirs, fs in os.walk(os.path.join(ROOT, top)):
+            subdirs[:] = sorted(s for s in subdirs if s not in ('out', 'dep'))
+            if 'mach.toml' in fs:
+                found.append(os.path.join(d, 'mach.toml'))
+    return found
+
+
+def manifest_loads(cfg, path):
+    # why a manifest does not load, or None. no artifact is named `=`, so a check that selects it
+    # stops at the selection, after the whole manifest is accepted and before any dependency is read
+    rel = os.path.relpath(path, ROOT)
+    p = subprocess.run([cfg.mach, 'check', os.path.dirname(rel) or '.', '--artifact', '=', '--diagnostics', 'json'],
+                       capture_output=True, text=True, cwd=ROOT)
+    errs = errors(p.stdout + p.stderr)
+    if errs and errs[0][0] == 'selection.unknown':
+        return None
+    why = f'{errs[0][0]}: {errs[0][1]}' if errs else f'exit {p.returncode} and no diagnostic'
+    return f'{rel} does not load: ' + ' '.join(why.split())
 
 
 def fail(rel, target, what):
@@ -237,10 +296,14 @@ def main():
             if cfg.filter and not keep(t.name) and not any(keep(p) for p in corpus(t.takes)) and not mine:
                 continue
             jobs.append(pool.submit(one_target, cfg, t, files, mine, host))
+        loads = [pool.submit(manifest_loads, cfg, m) for m in manifests() if keep(m)]
         for j in jobs:
             name, built, ran, refused, f = j.result()
             fails += f
             print(f'{name}: {built} built, {ran} ran, {refused} refused, {len(f)} failed')
+        broken = [why for why in (j.result() for j in loads) if why]
+        fails += broken
+        print(f'manifests: {len(loads) - len(broken)} loaded, {len(broken)} failed')
 
     kfile = os.path.join(cfg.root, 'src', 'base', 'diagnostic', 'kind.mach')
     kinds = re.findall(r'key: "([a-z0-9_.]+)", level: LEVEL_ERROR[^}]*retired: false', open(kfile, encoding='utf-8').read()) if os.path.isfile(kfile) else []

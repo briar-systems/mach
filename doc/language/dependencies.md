@@ -105,6 +105,17 @@ retained checkout or store is checked out at its selector as held there, and
 one with neither is not cloned. A selector nothing local holds fails, naming
 the dependency and the selector.
 
+**Scratch.** The scratch repository and the files git's output is read back
+from live in one directory per process under the system temporary directory,
+`mach_scratch_<16 hex digits>`, beside a lock file of the same name with
+`.lock` that the process holds locked while the directory exists. The command
+removes both when it ends. An interrupt, a termination or a hangup that
+arrives while the scratch exists is caught: the git command running is
+stopped, the scratch is removed, and `mach` exits with 128 plus the signal's
+number (130 for an interrupt). A process killed outright leaves its scratch,
+and the next command that makes one removes every scratch whose lock no
+process holds. Nothing else in the temporary directory is touched.
+
 **`--lowest`.** `mach dep update <path> --all --lowest` picks the lowest
 release every range accepts. A library's CI runs it in a scratch checkout and
 then builds and tests, which proves the lower bounds it declares are honest.
