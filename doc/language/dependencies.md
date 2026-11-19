@@ -111,8 +111,10 @@ from live in one directory per process under the system temporary directory,
 `.lock` that the process holds locked while the directory exists. The command
 removes both when it ends. An interrupt, a termination or a hangup that
 arrives while the scratch exists is caught: the git command running is
-stopped, the scratch is removed, and `mach` exits with 128 plus the signal's
-number (130 for an interrupt). A process killed outright leaves its scratch,
+stopped, the scratch is removed, and `mach` writes the one line
+`interrupted by SIGINT` (or `SIGTERM`, `SIGHUP`) in place of anything the
+stopped operation would report and exits with 128 plus the signal's number
+(130 for an interrupt). A process killed outright leaves its scratch,
 and the next command that makes one removes every scratch whose lock no
 process holds. Nothing else in the temporary directory is touched.
 

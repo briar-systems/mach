@@ -341,10 +341,22 @@ Every run ends with one summary record, the last line on stderr:
 | `errors` | integer | the diagnostic records before it with severity `"error"` |
 | `warnings` | integer | those with severity `"warning"` |
 | `notes` | integer | those with severity `"note"` |
-| `outcome` | string | `"success"` when the command exits 0, otherwise `"failure"` |
+| `outcome` | string | `"success"` when the command exits 0, `"interrupted"` when an interrupt stopped it, otherwise `"failure"` |
+| `event` | string | when the outcome is `"interrupted"`, what stopped it: `"SIGINT"`, `"SIGTERM"` or `"SIGHUP"`, or on Windows `"Ctrl+C"`, `"Ctrl+Break"`, `"console close"` or `"service stop"`; absent otherwise |
 | `exit_code` | integer | the command's exit code |
 | `time_us` | integer | under `-v`, the wall time of every unit that built, added up; absent when none did |
 | `built` | array | under `-v`, one object per `built` line, in order; absent when none was written |
+
+An interrupted command writes nothing after the interrupt arrives, neither the
+records its stopped operations would make of it nor any output on stdout, and
+ends with the summary record alone (the counts are of the records written
+before it):
+
+```json
+{"schema":2,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"interrupted","event":"SIGINT","exit_code":130}
+```
+
+The human text ends the same way, with the single line `interrupted by SIGINT`.
 
 A `built` object has the unit's `out` (string), `modules` (integer), `bytes`
 (integer, present when the line shows a size) and `time_us` (integer).

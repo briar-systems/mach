@@ -102,6 +102,9 @@ as `std.*` in source.
 
 ## What mach init does
 
+- **The directory.** `mach init <dir>` takes exactly one operand, the
+  project's directory, made when it does not exist. `mach init .` names the
+  working directory.
 - **The id.** `--name` gives it, else the directory's name. A `use` path must
   be able to spell the id, so it starts with a letter or `_` and holds only
   letters, digits and `_`. A directory name such as `my-app` becomes `my_app`,

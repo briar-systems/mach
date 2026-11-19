@@ -238,6 +238,7 @@ rec OwnedCapture {
 # has_deadline:    bound set a deadline
 # deadline:        the instant wait_any times the child out
 # timeout:         the bound the deadline came from
+# watch:           the child's end watched on the queue wait_any blocks on, while it waits
 pub rec OwnedSubprocess {
     child:           exec.Child;
     state:           SubprocessState;
@@ -251,6 +252,7 @@ pub rec OwnedSubprocess {
     has_deadline:    bool;
     deadline:        time.Instant;
     timeout:         chrono_duration.Duration;
+    watch:           exec.ExitWatch;
 }
 
 fun dup_cstr(a: *A.Allocator, s: *u8) res[*u8, Error] {
@@ -388,6 +390,7 @@ pub fun init(p: *OwnedSubprocess) {
     p.has_deadline    = false;
     p.deadline        = time.Instant{sec: 0, nsec: 0};
     p.timeout         = 0;
+    p.watch           = exec.ExitWatch{child: exec.Child{}, resource: -1};
 }
 
 fun set_deadline(p: *OwnedSubprocess, deadline: time.Instant) err[Cause] {
@@ -746,34 +749,89 @@ fun capture_over_limit(p: *OwnedSubprocess) res[bool, Error] {
 # is left is killed
 val GRACE: chrono_duration.Duration = chrono_duration.SECOND;
 
+# how often wait_any measures a running owner's capture against its limit: a
+# file's growth wakes no wait, so this is the one bound a blocked wait keeps
+val CAPTURE_CHECK: chrono_duration.Duration = 10 * chrono_duration.MILLISECOND;
+
 # supervise `count` owners until one of them reaches its terminal, and return
 # that one reaped
 #
-# each pass polls the scope, then every running owner: a cancelled or expired
-# scope cancels or times out the first running owner, an owner past its own
-# deadline is timed out, and one whose capture outgrew its limit is
-# cancelled, each with GRACE to stop. an ending event the process holds the interrupt for
-# (mach.host.interrupt) cancels the scope.
+# the wait blocks, with no polling, until a running owner's child ends, an
+# ending event arrives while the process holds the interrupt (mach.host.interrupt,
+# whose queue the wait blocks on then), the nearest deadline passes, or a
+# capture is due its check. each pass looks at the scope, then every running
+# owner: a cancelled or expired scope cancels or times out the first running
+# owner, an owner past its own deadline is timed out, and one whose capture
+# outgrew its limit is cancelled, each with GRACE to stop. an ending event
+# cancels the scope.
 # ---
 # owners: array of `count` owners, some of which may not be running
 # scope:  cancellation scope over all of them, or nil
 # ret:    the owner that reached its terminal, or the refusal when none is
 #         running
 pub fun wait_any(a: *A.Allocator, owners: *OwnedSubprocess, count: u32, scope: *sync_cancel.Scope) res[*OwnedSubprocess, Error] {
+    var own:   system_os.IoQueue;
+    var queue: *system_os.IoQueue = interrupt.queue();
+    var owned: bool               = false;
+    if (queue == nil) {
+        val made: i64 = system_os.io_queue_create(?own);
+        if (made < 0) { ret res[*OwnedSubprocess, Error].err{failure("subprocess", Cause.native{made})}; }
+        queue = ?own;
+        owned = true;
+    }
+    val res_waited: res[*OwnedSubprocess, Error] = wait_watched(a, queue, owners, count, scope);
+    # every watch is released before the queue closes; the first refusal stands in for a wait that ended well
+    var err_released: err[Error] = err[Error].ok{};
+    var refused:      bool       = false;
+    var i:            u32        = 0;
+    for (i < count) {
+        val err_unwatched: err[exec.Error] = exec.unwatch_exit(queue, ?owners[i].watch);
+        if (sel err_unwatched.err) {
+            if (!refused) { err_released = err[Error].err{failure(owner_identity(?owners[i]), Cause.exec{err_unwatched.err})}; }
+            refused = true;
+        }
+        i = i + 1;
+    }
+    if (owned) {
+        val closed: i64 = system_os.io_queue_close(?own);
+        if (closed < 0 && !refused) { err_released = err[Error].err{failure("subprocess", Cause.native{closed})}; }
+    }
+    if (sel res_waited.err)   { ret res_waited; }
+    if (sel err_released.err) { ret res[*OwnedSubprocess, Error].err{err_released.err}; }
+    ret res_waited;
+}
+
+# wait_any once every running owner's end is watched on `queue`
+fun wait_watched(a: *A.Allocator, queue: *system_os.IoQueue, owners: *OwnedSubprocess, count: u32, scope: *sync_cancel.Scope) res[*OwnedSubprocess, Error] {
+    var i: u32 = 0;
+    for (i < count) {
+        val p: *OwnedSubprocess = ?owners[i];
+        if (running(p)) {
+            val res_watched: res[exec.ExitWatch, exec.Error] = exec.watch_exit(queue, p.child, (i + 1)::usize);
+            if (sel res_watched.err) { ret res[*OwnedSubprocess, Error].err{failure(owner_identity(p), Cause.exec{res_watched.err})}; }
+            p.watch = res_watched.ok;
+        }
+        i = i + 1;
+    }
     for (true) {
         val res_clock: time.InstantClock = time.instant();
         if (sel res_clock.err) { ret res[*OwnedSubprocess, Error].err{failure("subprocess", Cause.io{res_clock.err})}; }
         val now:   time.Instant = res_clock.ok;
         var fired: Request      = REQUEST_ACTIVE;
+        var next:  opt[time.Instant];
         if (scope != nil) {
             # the caller's scope is live, so cancel refuses nothing, and an already ended scope already stops the wait
             if (interrupt.taken()) { sync_cancel.cancel(scope); }
             sync_cancel.expire(scope, now);
             fired = request_of(sync_cancel.reason(scope));
+            val res_deadline: sync_cancel.DeadlineQuery = sync_cancel.get_deadline(scope);
+            if (sel res_deadline.ok) {
+                if (sel res_deadline.ok.some) { next = opt[time.Instant].some{res_deadline.ok.some.at}; }
+            }
         }
 
         var live: bool = false;
-        var i:    u32  = 0;
+        i = 0;
         for (i < count) {
             val p: *OwnedSubprocess = ?owners[i];
             if (running(p)) {
@@ -813,12 +871,36 @@ pub fun wait_any(a: *A.Allocator, owners: *OwnedSubprocess, count: u32, scope: *
                     if (sel err_observed.err) { ret res[*OwnedSubprocess, Error].err{err_observed.err}; }
                     ret res[*OwnedSubprocess, Error].ok{p};
                 }
+                if (p.has_deadline) { next = earliest(next, p.deadline); }
+                if (p.has_capture)  { next = earliest(next, time.instant_add(now, CAPTURE_CHECK)); }
             }
             i = i + 1;
         }
         if (!live) { ret res[*OwnedSubprocess, Error].err{failure("subprocess", Cause.idle{})}; }
-        system_os.sleep(chrono_duration.MILLISECOND);
+        val waited: i64 = system_os.io_queue_wait(queue, timeout_ms(now, next));
+        # a handled signal ends the wait early, and the next pass looks at what it brought
+        if (waited < 0 && system_os.error_kind(waited) != io_error.INTERRUPTED) { ret res[*OwnedSubprocess, Error].err{failure("subprocess", Cause.native{waited})}; }
     }
+}
+
+# the earlier of `next`, when there is one, and `at`
+fun earliest(next: opt[time.Instant], at: time.Instant) opt[time.Instant] {
+    if (sel next.some) {
+        if (time.instant_before(next.some, at)) { ret next; }
+    }
+    ret opt[time.Instant].some{at};
+}
+
+# the milliseconds from `now` to `next`, rounded up so the wait never ends short
+# of it, or -1 to wait without a bound
+fun timeout_ms(now: time.Instant, next: opt[time.Instant]) i32 {
+    if (sel next.none)                        { ret -1; }
+    if (!time.instant_before(now, next.some)) { ret 0; }
+    val left:   chrono_duration.Duration = time.instant_sub(next.some, now);
+    var millis: i64                      = left / chrono_duration.MILLISECOND;
+    if (left % chrono_duration.MILLISECOND != 0) { millis = millis + 1; }
+    if (millis > 2147483647)                     { ret 2147483647; }
+    ret millis::i32;
 }
 
 fun finalize_capture_file(a: *A.Allocator, c: *OwnedCapture, keep: bool) {
