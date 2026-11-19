@@ -104,11 +104,14 @@ as `std.*` in source.
   letters, digits and `_`. A directory name such as `my-app` becomes `my_app`,
   each `-` written as `_`, and `mach init` says which id it chose. A `--name`
   that is not an id, or a directory name that stays one after that, is refused.
-- **std first.** The `[dep.std]` range is resolved before anything is written,
-  reading std's releases from the network (`mach init` says so first). When no
-  release works with the running compiler, nothing is created and the error
-  names the way on: `mach init --no-deps`, then `mach dep add <dir> std --git
-  <url> --ref branch/<name>` to take std from a branch.
+- **std.** `[dep.std]` is declared at the selection the running compiler states
+  for std: `ref = "branch/dev"` until the std major that accepts this compiler
+  is released, and that major's version range from then on. A ref is written as
+  it is. A range is resolved before anything is written, reading std's releases
+  from the network (`mach init` says so first), and when no release in it
+  exists nothing is created and the error names the way on: `mach init
+  --no-deps`, then `mach dep add <dir> std --git <url> --ref branch/<name>` to
+  take std from a branch.
 - **`--no-deps`** declares no dependency and reads nothing from the network. It
   is for a project offline, or one that names std's source itself. The entry
   still uses std, so the project builds once std is declared, and `mach init`

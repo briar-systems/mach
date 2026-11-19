@@ -72,9 +72,12 @@ What `mach dep add` writes:
 - with `--range <range>`, that range;
 - with `--ref <selector>`, that selector, as before.
 
-`mach init` adds std the same way, so a new project names the std release that
-works with the compiler that created it. std is an ordinary dependency, with
-no std-specific command. `mach init --no-deps` declares no dependency and reads
+`mach init` declares std at the selection the compiler that runs it states for
+std, so it never searches every release. The selection is a version range,
+written as the caret range of the newest release in it, or a ref, written as it
+is. Until the std major that accepts mach 7 is released it is
+`ref = "branch/dev"`. std is an ordinary dependency, with no std-specific
+command. `mach init --no-deps` declares no dependency and reads
 nothing from the network (see [files.md](files.md#what-mach-init-does)). A tool
 that needs the std for a given
 compiler runs `mach init` and `mach dep pull` in a scratch project and takes
