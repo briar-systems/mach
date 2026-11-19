@@ -254,20 +254,15 @@ way the target realizes the shape:
 
 | target | `f16` lane arithmetic | `f16` lane comparisons |
 |---|---|---|
-| aarch64 with `fp16` | packed `.8h` and `.4h` instructions | packed `.8h` and `.4h` compares |
-| aarch64 without `fp16` | each lane's scalar `f16` operation | the lanes widened to `f32` (`fcvtl`) and compared there |
-| x86-64 with `f16c` (`x86-64-v3` and up) | four lanes at a time widened to `f32` lanes (`vcvtph2ps`), computed there and narrowed back (`vcvtps2ph`) | four lanes at a time widened to `f32` lanes and compared there |
-| x86-64 without `f16c` | each lane's scalar `f16` operation | each lane's scalar comparison |
-| riscv64, riscv32 | each lane's scalar `f16` operation (no vector unit) | each lane's scalar comparison |
+| aarch64, x86-64, riscv64, riscv32 | each lane widened to `f32` as integer code on its encoding, computed by the scalar `f32` operation and narrowed back, with or without `fp16` or `f16c` | each lane widened to `f32` and compared there by the scalar comparison |
 | spirv with `Float16` | the core float instructions on an `f16` vector | the same |
 | spirv without `Float16` | the lanes widened to `f32` lanes as integer code on their encodings, computed there and narrowed back, at the vector's width | the lanes widened to `f32` lanes and compared there |
 
-A lane's scalar operation is the target's own half instruction where it has one
-and the inline expansion otherwise (see
-[operators.md](operators.md#half-precision-arithmetic)). On aarch64 the
-conversions between `f16` and `f32` lanes are packed (`fcvtl`, `fcvtn`) with or
-without `fp16`. A comparison makes no NaN and every widening is exact, so
-comparing in `f32` lanes gives the scalar mask. x86-64 has no packed `f16`
+The widening and narrowing are the inline expansion (see
+[operators.md](operators.md#half-precision-arithmetic)), so no register target
+emits a half instruction or a packed conversion (`fcvtl`, `vcvtph2ps`) for a
+lane. A comparison makes no NaN and every widening is exact, so comparing in
+`f32` gives the scalar mask. x86-64 has no packed `f16`
 arithmetic below AVX-512 FP16, and mach does not emit AVX-512 FP16.
 
 ### Size and alignment

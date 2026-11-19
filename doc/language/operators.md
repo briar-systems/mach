@@ -677,27 +677,55 @@ Integer `*` is where this is most visible today:
 
 Shifts realize by the count's form: a count that is the same value in every
 lane shifts every lane by that one scalar, and any other count shifts each lane
-by its own.
+by its own. A count is the same in every lane where the shift's operand is a
+literal of one value in every lane (`x >> u32x4{n, n, n, n}`), or, in a build
+that promotes locals to registers (`-O`), a local holding one. A debug build
+keeps a local in memory, so there only a literal written in the shift itself
+counts.
 
 | shape | x86_64 (SSE2) | aarch64 (NEON) | riscv64 (no vector unit) |
 |---|---|---|---|
-| uniform `<<`, `>>` on 16-, 32- and 64-bit lanes | packed `psll*` / `psrl*` / `psra*` | packed `shl` / `ushr` / `sshr` by a constant, `dup` then `ushl` / `sshl` by a register | scalar expansion |
-| uniform arithmetic `>>` on 64-bit lanes | scalar expansion (`psraq` is AVX-512VL) | packed, as above | scalar expansion |
-| uniform `<<`, `>>` on 8-bit lanes | packed through the 16-bit shifts, each byte shifted with its neighbour cleared | packed, as above | scalar expansion |
-| per-lane count on 32- and 64-bit lanes | packed `vpsllv*` / `vpsrlv*` / `vpsravd` under `avx2`, else scalar expansion (the 64-bit arithmetic `vpsravq` is AVX-512VL) | packed `ushl` / `sshl` | scalar expansion |
-| per-lane count on 8- and 16-bit lanes | scalar expansion | packed `ushl` / `sshl` | scalar expansion |
+| uniform `<<`, `>>` on 16-, 32- and 64-bit lanes | packed `psll*` / `psrl*` / `psra*`, the count moved zero-extended to the low quadword of a register | packed, as a per-lane count | scalar expansion |
+| uniform arithmetic `>>` on 64-bit lanes | scalar expansion (`vpsraq` is AVX-512) | packed, as a per-lane count | scalar expansion |
+| `<<`, `>>` on 8-bit lanes | scalar expansion (SSE has no byte shift) | packed `ushl` / `sshl` | scalar expansion |
+| per-lane count on 32- and 64-bit lanes | packed `vpsllv*` / `vpsrlv*` / `vpsravd` under `avx2`, else scalar expansion (the 64-bit arithmetic `vpsravq` is AVX-512) | packed `ushl` / `sshl` | scalar expansion |
+| per-lane count on 16-bit lanes | scalar expansion (`vpsllvw` is AVX-512BW) | packed `ushl` / `sshl` | scalar expansion |
 
 The x86_64 packed instructions saturate a count at or above the lane width on
-their own, so they need none of the scalar shift's range test. aarch64's
-`ushl` and `sshl` read only a count's low byte, as a signed amount that shifts
-right when negative, so a count is first clamped with `uqshl` and `ushr` to at
-most 127, which every lane width saturates at, and negated for a right shift.
-A constant count at or above the width is the fill itself. SPIR-V leaves an
+their own: `psll`, `psrl` and `psra` read the whole low quadword of the count
+register as unsigned, and `vpsllv`, `vpsrlv` and `vpsravd` each lane's count,
+so they need none of the scalar shift's range test. aarch64's `ushl` and
+`sshl` read only a count's low byte, as a signed amount that shifts right when
+negative, so `<<` and a logical `>>` clear every lane whose count is past the
+width less one (`cmhi` against a splat of it, then `bic`), shifting by the
+count, negated for `>>`, which is exact below the width, and an arithmetic
+`>>` shifts by the count clamped to the width less one (`umin`, or `cmhi` and
+`bsl` on 64-bit lanes) and negated, which fills with the sign past it. SPIR-V leaves an
 `OpShift*` by the component width or more undefined, so it packs the shift
 beside an `OpULessThan` against the width and an `OpSelect` of 0, or of the
 shift by the width less one for an arithmetic `>>`, where the count is out of
 range. A uniform count is splatted by `OpCompositeConstruct`, since `OpShift*`
 takes a count per component.
+
+A comparison is one packed compare where the target has one, its result already
+the mask, and a short fixed sequence otherwise. `>` and `>=` are `<` and `<=`
+with the operands exchanged, and the float compares give the scalar operators'
+answer on a nan: `==`, `<` and `<=` are false and `!=` is true.
+
+| shape | x86_64 | aarch64 (NEON) | riscv64 (no vector unit) |
+|---|---|---|---|
+| `==` on 8-, 16-, 32-bit lanes | `pcmpeqb` / `pcmpeqw` / `pcmpeqd` | `cmeq` | scalar expansion |
+| `==` on 64-bit lanes | `pcmpeqq` under `sse41`, else `pcmpeqd`, `pshufd` and `pand` | `cmeq` | scalar expansion |
+| `!=` | `==`, then `pxor` with all ones | `cmeq` and `not` | scalar expansion |
+| signed `<`, `<=` on 8-, 16-, 32-bit lanes | `pcmpgt*`, and `pxor` with all ones for `<=` | `cmgt`, `cmge` | scalar expansion |
+| signed `<`, `<=` on 64-bit lanes | `pcmpgtq` under `sse42`, else scalar expansion | `cmgt`, `cmge` | scalar expansion |
+| unsigned `<`, `<=` on 8-bit lanes | `pminub` and `pcmpeqb`, and `pxor` with all ones for `<` | `cmhi`, `cmhs` | scalar expansion |
+| unsigned `<`, `<=` on 16-bit lanes | `pminuw` and `pcmpeqw` under `sse41`, else `psubusw` and a compare with zero | `cmhi`, `cmhs` | scalar expansion |
+| unsigned `<`, `<=` on 32-bit lanes | `pminud` and `pcmpeqd` under `sse41`, else both sign bits flipped and `pcmpgtd` | `cmhi`, `cmhs` | scalar expansion |
+| unsigned `<`, `<=` on 64-bit lanes | both sign bits flipped and `pcmpgtq` under `sse42`, else scalar expansion | `cmhi`, `cmhs` | scalar expansion |
+| `==`, `!=`, `<`, `<=` on `f32` and `f64` lanes | `cmpps` / `cmppd` with `eq`, `neq`, `lt` and `le` | `fcmeq`, `fcmeq` and `not`, `fcmgt`, `fcmge` | scalar expansion |
+
+The complement `~` is `pxor` with all ones on x86_64 and `not` on aarch64.
 
 Operators never widen implicitly, so a widening multiply is spelled as two lane
 casts and a multiply: `a::i32x4 * b::i32x4` for `a, b: i16x4`. When both operands
