@@ -325,6 +325,13 @@ it (Darwin's underscore prefix, nothing elsewhere; see
 the target's C symbol prefix, so `#[symbol("main")]` is `_main` on Darwin. Two definitions in one module cannot state one
 name, and the second is refused with `name.duplicate`.
 
+A symbol names a definition for whatever refers to it by name, and keeps
+nothing: the link keeps a function or global exactly while something it keeps
+refers to it, so a definition nothing refers to is left out whatever symbol it
+states. `main` is no exception. The link enters the image at the runtime's
+entry, which calls `main`, and that call is what keeps it. A reference from an
+`asm` block is a relocation like any other and keeps what it names.
+
 A mangled name is the source FQN, dotted, with generic arguments after a `$`:
 `std.types.string.str_len`, `std.collections.vector.push$ptr`. Each argument is
 introduced by a run of `$` whose length is its nesting depth, so a nested
@@ -765,6 +772,13 @@ name it share that one section, each at its own aligned offset. A function's
 section holds code, a `var`'s writable data, a `val`'s read-only data and a
 `#[thread]` var's thread-local template. Cross-section calls and accesses use
 ordinary relocations.
+
+A named section is one unit to the link: it keeps all of it while anything it
+keeps refers to any symbol in it, and leaves all of it out when nothing does.
+A function or global that nothing refers to is not in the image, in a named
+section or not, unless it is stated with `#[at]`, so a table a loader or the
+hardware reads by its address, as an interrupt vector table, is stated with
+`#[at]` or referred to from the entry's code. Naming a section keeps nothing.
 
 ### `at(offset)` — placement in the image
 

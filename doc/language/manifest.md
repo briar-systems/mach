@@ -1560,6 +1560,15 @@ output section each object's section is laid into, so `.text` takes every
 layout serves a program with no `.bss` as well as one with it, and its bounds
 name the empty range where it would land.
 
+A region lays only what the link keeps. The link keeps each function and global
+exactly while something it keeps refers to it, from the entry the system's
+runtime defines, and a named section as one unit, so a table nothing refers to,
+as an interrupt vector table the hardware reads by its address, is not in the
+image unless it is stated with
+[`#[at]`](decorators.md#atoffset--placement-in-the-image), which keeps what it
+places, or referred to from code the link keeps. Naming its section in a region
+keeps nothing.
+
 A loaded output section no region names, such as an `.eh_frame` the link writes
 of the objects' frame records or a `.rodata` left out of `run`, runs in the
 region whose `access` admits it and allows least beyond what it needs, laid

@@ -30,14 +30,17 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
-`std.runtime` provides the platform-specific `_start` symbol the linker uses as
-the true process entrypoint; `_start` decodes `argc`/`argv` and calls whatever
-function exports `main`, then terminates the process with its returned exit
-code. `use std.runtime;` is **required** to link `_start` into the binary, even
+`std.runtime` defines the symbol each system's catalog names as the process
+entrypoint: `_start` on linux, wasi and freestanding targets, `mainCRTStartup`
+on windows, `start` on darwin and `efi_main` on uefi. The linker enters the
+image there and never at `main`. The runtime's entry decodes `argc`/`argv`,
+calls whatever function exports `main`, and terminates the process with its
+returned exit code, so `main` is kept by that call like any other function.
+`use std.runtime;` is **required** to link the entry into the binary, even
 though no code references it by name.
 
-Only the exported `main` symbol binds the entry — the Mach-level function name
-is irrelevant, so `fun entry(...)` tagged `#[symbol("main")]` works identically.
+Only the exported `main` symbol is what the runtime calls, and the Mach-level
+function name is irrelevant, so `fun entry(...)` tagged `#[symbol("main")]` works identically.
 
 ## mach.toml
 
