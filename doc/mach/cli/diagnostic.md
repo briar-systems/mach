@@ -306,7 +306,8 @@ pub fun report_dnit(r: *Report, code: i64) i64
 
 end the run: a refusal kept while it ran, such as a refused write to stdout,
 reported, then under json the summary record, the last line the command
-writes; the report's arena is released either way
+writes; the report's arena is released either way. a command an interrupt
+stopped ends with the one line report_interrupted writes instead
 
 | Parameter | |
 | :--- | :--- |

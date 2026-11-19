@@ -30,7 +30,7 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.base.intern`](base/inte
 | Functions | |
 | :--- | :--- |
 | [`append_frontend_roots`](#append_frontend_roots) | |
-| [`append_test_roots`](#append_test_roots) | the codegen roots and each test object's lowering and codegen |
+| [`append_test_roots`](#append_test_roots) | the codegen roots and the lowering and codegen of each test object the test pass reached |
 | [`phase_finish`](#phase_finish) | a phase the query engine does not run is published as one it does: the project's diagnostics are refreshed beside its result |
 | [`reconfigure`](#reconfigure) | a loaded project under another request from its host: the build context is frozen again, so what read the old one is computed again, and nothing reads a context no freeze captured |
 | [`run_sema_pass`](#run_sema_pass) | |
@@ -142,7 +142,7 @@ pub fun append_frontend_roots(p: *mach.compile.project.Project, roots: *Vector[m
 pub fun append_test_roots(p: *mach.compile.project.Project, roots: *Vector[mach.session.query.QueryKey]) err[mach.base.fail.Fail]
 ```
 
-the codegen roots and each test object's lowering and codegen
+the codegen roots and the lowering and codegen of each test object the test pass reached
 
 ### phase_finish
 

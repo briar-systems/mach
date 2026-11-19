@@ -11,5 +11,5 @@ The directory's root module is [`mach.compile.backend`](../backend.md).
 
 | Module | |
 | :--- | :--- |
-| [`compile`](compile.md) | one mirl module compiled on the back half's prepared target, and what mirl and masc said of it in mach's terms: a refusal as the failure it is reported under, at the source location mirl states for it, and each warning mirl returns as a failure of the warning's kind, located the same way, which the caller reports |
+| [`compile`](compile.md) | one mirl module compiled on the back half's prepared target, and what mirl and masc said of it in mach's terms: a refusal as the failure it is reported under, with the source location mirl states for it, and each warning mirl returns as a failure of the warning's kind, located the same way |
 

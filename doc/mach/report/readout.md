@@ -27,7 +27,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`Phase`](#phase) | `def` | a readout phase, an index into the phase table |
 | [`Counter`](#counter) | `def` | a readout counter, an index into the counter table |
 | [`Unit`](#unit) | `rec` | a unit of the plan starts: what its goal calls the work (`building`, `checking`), the artifact, the target and the profile |
-| [`PhaseEnd`](#phaseend) | `rec` | a phase row closes: the count it processed, in the noun that counts it, its time, the workers it ran on, the modules it dropped as target-gated, and under LEVEL_ITEMS its slowest item, nil when it had fewer than two |
+| [`PhaseEnd`](#phaseend) | `rec` | a phase row closes: the count it processed, in the noun that counts it, its time, the modules it dropped as target-gated, and under LEVEL_ITEMS its slowest item, nil when it had fewer than two |
 | [`Item`](#item) | `rec` | one module or file a phase finished, when it finished |
 | [`Tally`](#tally) | `rec` | a counter's value: one module's under LEVEL_ITEMS, named by it, or the unit's total under LEVEL_PHASES, with a nil name |
 | [`Summary`](#summary) | `rec` | a unit built its output: the path, the modules in it, its size in bytes when the output is one file, the time no row accounts for, and the unit's wall time |
@@ -101,9 +101,6 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`item_spent`](#item_spent) | name spent d in phase ph, measured by its caller |
 | [`count`](#count) | the module name's value of counter c, added to the unit's total and sent under LEVEL_ITEMS |
 | [`counts_end`](#counts_end) | send the unit's total of every counter posted since the last close, then start them over |
-| [`workers_begin`](#workers_begin) | open the item queue of a parallel section that posts at most n items |
-| [`item_post`](#item_post) | a worker thread's item: queued, then delivered by this thread unless another holds the drain, which then delivers it |
-| [`workers_end`](#workers_end) | close a parallel section of phase ph that ran on n workers, after every worker has joined: every posted item still queued is delivered and the queue's storage returned |
 | [`phase_end`](#phase_end) | close phase ph's row: count is what it processed, named by noun_one or noun_many |
 | [`summary`](#summary-1) | the unit built out: the time no row accounts for floors at zero |
 
@@ -207,7 +204,6 @@ pub rec PhaseEnd {
     noun_one:        str;
     noun_many:       str;
     elapsed:         std.chrono.duration.Duration;
-    workers:         u32;
     dropped:         u32;
     slowest:         str;
     slowest_elapsed: std.chrono.duration.Duration;
@@ -215,8 +211,8 @@ pub rec PhaseEnd {
 ```
 
 a phase row closes: the count it processed, in the noun that counts it, its
-time, the workers it ran on, the modules it dropped as target-gated, and under
-LEVEL_ITEMS its slowest item, nil when it had fewer than two
+time, the modules it dropped as target-gated, and under LEVEL_ITEMS its slowest
+item, nil when it had fewer than two
 
 ## Item
 
@@ -453,20 +449,13 @@ pub rec Progress {
     unit_start: Instant;
     unit_rows:  std.chrono.duration.Duration;
     phases:     [PHASE_COUNT]PhaseState;
-    posted:     *Posted;
-    post_cap:   usize;
-    post_tail:  i64;
-    post_head:  usize;
-    draining:   i64;
     counts:     [COUNTER_COUNT]u64;
 }
 ```
 
 one unit's phase rows, timed as they run and sent to the sink as each closes.
-a parallel section's workers post their items to a queue that whichever
-thread holds the drain delivers, so a worker never waits on the sink. a run
-that shows no readout has no progress, and every phase, span and item given a
-nil one is not shown
+a run that shows no readout has no progress, and every phase, span and item
+given a nil one is not shown
 
 ### start
 
@@ -577,34 +566,6 @@ pub fun counts_end(pr: *Progress)
 ```
 
 send the unit's total of every counter posted since the last close, then start them over
-
-### workers_begin
-
-```mach
-pub fun workers_begin(pr: *Progress, a: *std.allocator.Allocator, n: usize) err[mach.base.fail.Fail]
-```
-
-open the item queue of a parallel section that posts at most n items. the
-queue's storage is drawn from a and returned by workers_end
-
-### item_post
-
-```mach
-pub fun item_post(pr: *Progress, ph: Phase, name: str, d: std.chrono.duration.Duration)
-```
-
-a worker thread's item: queued, then delivered by this thread unless another
-holds the drain, which then delivers it. name must outlive the section
-
-### workers_end
-
-```mach
-pub fun workers_end(pr: *Progress, a: *std.allocator.Allocator, ph: Phase, n: u32)
-```
-
-close a parallel section of phase ph that ran on n workers, after every worker
-has joined: every posted item still queued is delivered and the queue's storage
-returned
 
 ### phase_end
 

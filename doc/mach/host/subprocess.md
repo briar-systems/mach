@@ -175,6 +175,7 @@ pub rec OwnedSubprocess {
     has_deadline:    bool;
     deadline:        std.chrono.time.Instant;
     timeout:         std.chrono.duration.Duration;
+    watch:           std.process.exec.ExitWatch;
 }
 ```
 
@@ -194,6 +195,7 @@ the owner of one supervised child, made by init and released by dnit
 | `has_deadline` | `bool` | bound set a deadline |
 | `deadline` | `std.chrono.time.Instant` | the instant wait_any times the child out |
 | `timeout` | `std.chrono.duration.Duration` | the bound the deadline came from |
+| `watch` | `std.process.exec.ExitWatch` | the child's end watched on the queue wait_any blocks on, while it waits |
 
 ### init
 
@@ -301,11 +303,14 @@ pub fun wait_any(a: *std.allocator.Allocator, owners: *OwnedSubprocess, count: u
 supervise `count` owners until one of them reaches its terminal, and return
 that one reaped
 
-each pass polls the scope, then every running owner: a cancelled or expired
-scope cancels or times out the first running owner, an owner past its own
-deadline is timed out, and one whose capture outgrew its limit is
-cancelled, each with GRACE to stop. an ending event the process holds the interrupt for
-(mach.host.interrupt) cancels the scope.
+the wait blocks, with no polling, until a running owner's child ends, an
+ending event arrives while the process holds the interrupt (mach.host.interrupt,
+whose queue the wait blocks on then), the nearest deadline passes, or a
+capture is due its check. each pass looks at the scope, then every running
+owner: a cancelled or expired scope cancels or times out the first running
+owner, an owner past its own deadline is timed out, and one whose capture
+outgrew its limit is cancelled, each with GRACE to stop. an ending event
+cancels the scope.
 
 | Parameter | |
 | :--- | :--- |

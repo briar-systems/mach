@@ -15,7 +15,9 @@ Source: [`src/host/interrupt.mach`](../../../src/host/interrupt.mach)
 | :--- | :--- |
 | [`hold`](#hold) | catch the ending events from here until the matching `release` |
 | [`release`](#release) | end one hold; the last restores the default handling, and an event caught before it stays taken |
+| [`queue`](#queue) | the wait queue every caught event wakes while something holds the interrupt, so a wait blocked on it ends for an event as well as for what it watches there |
 | [`taken`](#taken) | whether an ending event has been caught, now or earlier in the process |
+| [`name`](#name) | the name of the event taken: the signal on linux and darwin, the console or service event on windows |
 | [`status`](#status) | the exit status of a process ended by the event taken: 128 plus the signal's number, as a shell reports a process the signal ended, and the console's own status on windows |
 
 ---
@@ -46,6 +48,19 @@ end one hold; the last restores the default handling, and an event caught before
 | :--- | :--- |
 | **returns** | the refusal to restore the handlers |
 
+### queue
+
+```mach
+pub fun queue() *std.system.os.IoQueue
+```
+
+the wait queue every caught event wakes while something holds the interrupt, so
+a wait blocked on it ends for an event as well as for what it watches there
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the queue, borrowed until the last release, or nil when nothing holds it |
+
 ### taken
 
 ```mach
@@ -53,6 +68,15 @@ pub fun taken() bool
 ```
 
 whether an ending event has been caught, now or earlier in the process
+
+### name
+
+```mach
+pub fun name() str
+```
+
+the name of the event taken: the signal on linux and darwin, the console or service event
+on windows
 
 ### status
 

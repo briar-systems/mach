@@ -53,6 +53,6 @@ from the network. in git mode the project is made a repository unless it stands 
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COMMAND` | `std.args.Command` | `std_args.Command{name: "init", aliases: args.NO_WORDS, help: "create a project", usage: "[dir]", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: false}` | `mach init` |
+| `COMMAND` | `std.args.Command` | `std_args.Command{name: "init", aliases: args.NO_WORDS, help: "create a project", usage: "<dir>", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 1, operand_max: 1, passthrough: false}` | `mach init` |
 | `POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach init` to beyond the parse |
 

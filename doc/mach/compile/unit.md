@@ -13,7 +13,7 @@ owner holds of the module, for the readout
 
 Source: [`src/compile/unit.mach`](../../../src/compile/unit.mach)
 
-Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.compile.backend`](backend.md), [`mach.compile.backend.compile`](backend/compile.md), [`mach.lower.context`](../lower/context.md).
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.backend`](backend.md), [`mach.compile.backend.compile`](backend/compile.md), [`mach.lower.context`](../lower/context.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -26,11 +26,11 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | On `Lowered` | |
 | :--- | :--- |
 | [`lower`](#lower) | the modules the `count` requests at `reqs` name lowered for `back`'s target into one mirl module on a heap drawing its spans from `spans`, which the unit owns alone and so takes no lock, the value held in `out` until `dnit`, or why it was not lowered |
-| [`dnit`](#dnit) | tear down what `lower` made in `out`: the heap and the module on it |
+| [`dnit`](#dnit) | tear down what `lower` made in `out`: the heap and the module on it, unless compiling tore them down |
 
 | On `Job` | |
 | :--- | :--- |
-| [`compile`](#compile) | the object of the lowered unit `l`, compiled as `job` says, or why it was not made |
+| [`compile`](#compile) | the object of the lowered unit `l`, compiled as `job` says, or why it was not made, unplaced |
 
 ---
 
@@ -62,6 +62,7 @@ pub rec Lowered {
     lower:     std.chrono.duration.Duration;
     functions: u64;
     ir_count:  u64;
+    spent:     bool;
 }
 ```
 
@@ -74,6 +75,7 @@ until `dnit`
 | `lower` | `std.chrono.duration.Duration` | lowering the module into mirl |
 | `functions` | `u64` | the module's functions, as mirl's module holds them |
 | `ir_count` | `u64` | the instructions lowering built into its bodies, as mirl's bodies hold them |
+| `spent` | `bool` | compiling the module tore down the heap |
 
 ### lower
 
@@ -92,8 +94,8 @@ and any refusal
 pub fun dnit(out: *std.allocator.Allocator, l: *Lowered)
 ```
 
-tear down what `lower` made in `out`: the heap and the module on it. the facts are the
-holder's, who gives them back or hands them on
+tear down what `lower` made in `out`: the heap and the module on it, unless compiling tore them
+down. the facts are the holder's, who gives them back or hands them on
 
 ## Job
 
@@ -106,7 +108,6 @@ pub rec Job {
     asm_path: str;
     name:     str;
     timed:    bool;
-    sources:  *mach.base.source.SourceMap;
     owner:    str;
 }
 ```
@@ -122,17 +123,16 @@ how one lowered unit is compiled, all of it read only to the step
 | `asm_path` | `str` | where masc's listing of the object is written as it compiles, "" for nowhere |
 | `name` | `str` | the name of the object it makes, the module's or its test object's, no other object's in a link, which refusals name and the object's format may name symbols after |
 | `timed` | `bool` | whether mirl times and counts its stages, which only a readout reads |
-| `sources` | `*mach.base.source.SourceMap` | the texts a failure or warning of the compile points into |
 | `owner` | `str` | the dependency whose code the module is, which a refusal names, nil for the project being built |
 
 ### compile
 
 ```mach
-pub fun compile(job: *Job, l: *Lowered) res[Made, mach.base.fail.Fail]
+pub fun compile(job: *Job, l: *Lowered) res[Made, mach.compile.backend.compile.Unplaced]
 ```
 
-the object of the lowered unit `l`, compiled as `job` says, or why it was not made.
-compiling spends the module, so a lowered unit is compiled once
+the object of the lowered unit `l`, compiled as `job` says, or why it was not made, unplaced.
+compiling spends the module and tears down the unit's heap, so a lowered unit is compiled once
 
 ## Stats
 

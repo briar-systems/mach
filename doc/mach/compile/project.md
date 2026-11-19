@@ -410,6 +410,10 @@ pub rec Project {
     lower_visit_epoch: u32;
 
     emit_len: u32;
+    # the units the codegen pass and the test pass reached in order: every unit, or those up to
+    # and holding the one whose failure ended the pass, which are all its presentation names
+    codegen_reached: u32;
+    test_reached:    u32;
     # every instance the build's modules met, described for its typing
     instances: mach.compile.demand.Registry;
     # the digests of the objects the cell's builds wrote into `obj/` (compile/cache/objects)

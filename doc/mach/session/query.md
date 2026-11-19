@@ -68,9 +68,12 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`set_input`](#set_input) | set an input product's bytes, copied into the database |
 | [`prepare_retirement`](#prepare_retirement) | a retirement rooted at the given products and every product that depends on them |
 | [`prepare_owned_retirement`](#prepare_owned_retirement) | a retirement rooted at every product whose key a released module or file owns, with its dependents |
+| [`prepared_held`](#prepared_held) | whether the prepared query's compute failed, its failure held for complete_prepared to record |
+| [`preparing`](#preparing) | whether the computation on the stack is the prepare of the product `kind` keys under `key`, which a compute reads to tell a prepare that finishes it outside the computation from a read that does not |
 | [`prepared_view`](#prepared_view) | |
 | [`prepared_diags`](#prepared_diags) | the store a prepared query's compute reports into: work finished outside the compute (a worker thread's optimize) appends there, so a refusal it records reaches the presentation like one the compute made itself |
-| [`cancel_prepared`](#cancel_prepared), [`complete_prepared`](#complete_prepared) | |
+| [`cancel_prepared`](#cancel_prepared) | |
+| [`complete_prepared`](#complete_prepared) | publish a prepared product, or record its failure: the one its compute raised, held until now, else `result`, the failure of the work finished outside the computation |
 | [`walk_products`](#walk_products) | visit a product and every product it was computed from that the filter enters, each once and its dependencies first, as presentation walks them |
 | [`peek_revision`](#peek_revision) | the revision a product last changed at, without validating it; 0 when it has none |
 | [`published`](#published) | a product as its last successful computation published it, read between operations by the host that ran them |
@@ -300,6 +303,8 @@ pub rec QueryDb {
     attempts:             Vector[Attempt];
     attempt_index:        Map[Slot, usize];
     validated:            Map[Slot, Revision];
+    # the attempt whose prepare is computing, which holds every failure raised meanwhile
+    holding: opt[usize];
     # the failure the operation stands on, its text and places copied into and owned through `a`.
     # a failure the engine hands out borrows them until the operation's presentation is collected
     # or discarded, when the presentation takes the failure over or it is freed
@@ -528,6 +533,23 @@ a retirement rooted at every product whose key a released module or file owns, w
 | `ctx` | owned's context |
 | **returns** | the prepared retirement, committed or discarded by the caller |
 
+### prepared_held
+
+```mach
+pub fun prepared_held(db: *QueryDb, prepared: PreparedQuery) res[bool, mach.base.fail.Fail]
+```
+
+whether the prepared query's compute failed, its failure held for complete_prepared to record
+
+### preparing
+
+```mach
+pub fun preparing(db: *QueryDb, kind: *Kind, key: u64) bool
+```
+
+whether the computation on the stack is the prepare of the product `kind` keys under `key`, which a
+compute reads to tell a prepare that finishes it outside the computation from a read that does not
+
 ### prepared_view
 
 ```mach
@@ -555,6 +577,9 @@ pub fun cancel_prepared(db: *QueryDb, prepared: PreparedQuery) err[mach.base.fai
 ```mach
 pub fun complete_prepared(db: *QueryDb, prepared: PreparedQuery, result: err[mach.base.fail.Fail]) err[mach.base.fail.Fail]
 ```
+
+publish a prepared product, or record its failure: the one its compute raised, held until now, else
+`result`, the failure of the work finished outside the computation. a failed product is dropped
 
 ### walk_products
 
@@ -662,7 +687,10 @@ pub fun prepare[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[Pre
 ```
 
 compute a derived product the caller finishes outside the computation (a worker thread),
-published by complete_prepared or dropped by cancel_prepared before the operation ends
+published by complete_prepared or dropped by cancel_prepared before the operation ends. a
+failure raised while it computes is the prepared product's: it is held, and recorded by
+complete_prepared or left unrecorded by cancel_prepared, so a product prepared ahead never
+fails the operation before the products the caller completes ahead of it
 
 ### revision
 
