@@ -1073,8 +1073,9 @@ DIT mode is on (Arm ARM DDI 0487, "About PSTATE.DIT"; the DIT register page of
 DDI 0601 lists the instructions: `madd`, `msub`, `smaddl`, `smsubl`, `smulh`,
 `umaddl`, `umsubl`, `umulh`). The mode is per-thread processor state that user
 code turns on with `msr dit, 1`, and a processor without FEAT_DIT has no such
-bit. On riscv the same promise is the Zkt extension, which changes no
-instruction and is assumed of every machine a binary built with it runs on. A
+bit. On riscv the same promise is the Zkt extension, and for the vector unit
+the Zvkt extension, neither of which changes an instruction, each assumed of
+every machine a binary built with it runs on. A
 constant-time function's mode says what happens when the build cannot be sure
 the promise holds.
 
@@ -1096,7 +1097,7 @@ function uses, or the build is refused with a diagnostic naming the missing
 feature:
 
 - aarch64 needs DIT in the target's baseline, as darwin-arm64 has it;
-- riscv needs Zkt in the selection;
+- riscv needs Zkt in the selection, and Zvkt as well for vector code;
 - x86-64's scalar cells hold unconditionally, so they pass.
 
 **Calls between the modes.** Both modes do the same at entry and at every
@@ -1110,7 +1111,7 @@ caller may rely on a soft callee exactly where the build guarantees every mode
 a soft function's code may be held under, as the hard callee's own check would
 have required: every x86-64 build, whose one mode the system sets for every
 process, an aarch64 build that selects `dit` and a riscv64 build that selects
-`zkt`. Elsewhere a hard function passing a secret to a soft one is refused
+`zkt`, and `zvkt` too where it has a vector unit. Elsewhere a hard function passing a secret to a soft one is refused
 (`secret.call_untrusted`), and masc's walk takes the soft callee as one it does
 not trust.
 
@@ -1269,8 +1270,8 @@ remainder or product helper's result is taken as public where every operand
 the call passes is: its text reads and writes no memory and calls nothing,
 which mirl checks when it delivers it, so the result is formed from the
 operands alone, in registers, on the stack or in a copy passed by reference.
-On wasm, where a 128-bit operand travels in memory, the result is taken as
-secret.
+On wasm a 128-bit operand and the result travel in copies in the caller's
+frame, which the walk holds off the frame's base as it holds every slot there.
 
 What is checked and what is trusted: the checker verifies the functions marked
 `#[constant_time]`, their `asm` included. Code that is not marked is trusted to
