@@ -1167,16 +1167,16 @@ instruction is not available:
 - **An instruction that is not available**, since its rule cannot be held for any
   declaration of the language, refused saying why: `OpUndef`, since no value of the
   language is undefined, an operation on an untyped pointer (every `OpUntyped*`
-  instruction, as `OpUntypedVariableKHR` and `OpUntypedAccessChainKHR`), a type
-  the language has none of, `OpCopyLogical`, a copy between two types alike member
-  for member without being one type, which the language never declares, the
+  instruction, as `OpUntypedVariableKHR` and `OpUntypedAccessChainKHR`), which no
+  declaration can state, `OpCopyLogical`, a copy between two distinct types alike
+  member for member, where records of the same members are one type, the
   instructions over matrices (`OpTranspose`, `OpOuterProduct`,
   `OpMatrixTimesScalar`, `OpMatrixTimesVector`, `OpVectorTimesMatrix`,
   `OpMatrixTimesMatrix`, and `Determinant` and `MatrixInverse` of `GLSL.std.450`),
-  a type the language has none of, and `OpInBoundsPtrAccessChain`, whose element
-  is the pointee's stride, which a physical pointer, an address, does not carry:
-  `` `OpTranspose` is not available as an `intrinsic`. it is over matrices, a type
-  the language does not declare ``.
+  which no declaration can state either, and `OpInBoundsPtrAccessChain`, whose
+  element is the pointee's stride, which a physical pointer, an address, does not
+  carry: `` `OpTranspose` is not available as an `intrinsic`. it is over matrices,
+  which no declaration can state. write the operation over vectors ``.
 
 A named instruction the compiler has typing rules for is held to them, at the
 declaration with `op.signature` and at the call where a rule depends on the
