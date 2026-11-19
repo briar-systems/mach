@@ -1,12 +1,19 @@
-# the deep value of a constant: an array, record or case literal as a tree of nodes with every
-# member evaluated, an address as the symbol it points into, and a leaf that has no compile-time
-# value kept with its refusal. a store holds the trees of one module, every node under a tree's
-# root in that store, and a value names a node of it by the module's stable id
+# the deep value of a constant: an array, record or case literal with every member evaluated, an
+# address as the symbol it points into, and a leaf that has no compile-time value kept with its
+# refusal. a value is a shape and a payload. the shape is everything about it but the data of its
+# scalar leaves: its kind, its type, a record's field names, an array's element count, a scalar's
+# value kind and width, and the shapes of its members, each at its offset in the payload. the
+# payload is the data of its scalar leaves, in member order, each at the width its shape states.
+# a store holds the shapes and payloads of one module's values: equal shapes are held once, so a
+# table of records costs one shape per distinct form and its data bytes, and a member's payload
+# lies inside its aggregate's. a node names a value of a store by its shape and where its payload
+# starts, and a value names a node of the store of the module with that stable id
 use std.collections.map;
 use collections_vector: std.collections.vector;
+use std.crypto.hash.fnv1a;
 use std.types.bool.bool;
+use std.types.bool.false;
 use std.types.bool.true;
-use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
@@ -19,6 +26,7 @@ use mach.base.fail;
 use mach.base.intern;
 use base_source: mach.base.source;
 use mach.base.stack;
+use mach.base.wide;
 use comptime_failure: mach.front.comptime.failure;
 use comptime_value:   mach.front.comptime.value;
 use mach.type;
@@ -57,74 +65,469 @@ pub rec Symbol {
     function: bool;
 }
 
-# one node of a value; an aggregate's members are `members[first .. first + len]`
+# a value of a store: its shape, and the offset of its payload in the store's bytes
 pub rec Node {
-    kind:  NodeKind;
-    ty:    type_kind.TypeId;
-    value: comptime_value.CTValue;
-    head:  intern.StrId;
-    first: u32;
-    len:   u32;
-    # an array's declared element count, of which `len` are held and the rest are zero
+    shape: u32;
+    at:    u32;
+}
+
+# the node of no value
+pub val NONE: Node = Node{shape: 0xFFFFFFFF, at: 0};
+
+pub fun is_none(n: Node) bool {
+    ret n.shape == NONE.shape;
+}
+
+pub fun same(l: Node, r: Node) bool {
+    ret l.shape == r.shape && l.at == r.at;
+}
+
+# the form of a value apart from its scalar data
+# ---
+# width:    a scalar's payload is the low `width` bytes of its value's data, the bytes above them
+#           filled from its top bit when `signed` and with zero when not
+# refuses:  a refused leaf lies within it
+# uniform:  an array whose members all have the shape `first`, member `i` at `i` times its size;
+#           any other aggregate's members are the slots `first .. first + len`
+# declared: an array's declared element count, of which `len` are held and the rest are zero
+# size:     the bytes of its payload
+# value:    a scalar's value with its data zero
+pub rec Shape {
+    kind:     NodeKind;
+    width:    u8;
+    signed:   bool;
+    refuses:  bool;
+    uniform:  bool;
+    ty:       type_kind.TypeId;
+    head:     intern.StrId;
+    first:    u32;
+    len:      u32;
     declared: u32;
+    size:     u32;
+    hash:     u64;
+    value:    comptime_value.CTValue;
     refusal:  Refusal;
     symbol:   Symbol;
 }
 
-# a member of an aggregate node: a named field, or an element or positional value with STR_NIL
+# a member of an aggregate shape: its name, STR_NIL for an element or positional value, its
+# shape, and the offset of its payload in the aggregate's
+rec Slot {
+    name:  intern.StrId;
+    shape: u32;
+    at:    u32;
+}
+
+# a member of an aggregate value
 pub rec Member {
     name: intern.StrId;
-    node: u32;
+    node: Node;
 }
 
 pub rec Store {
-    nodes:   collections_vector.Vector[Node];
-    members: collections_vector.Vector[Member];
-    # the root of the zero of each type built in this store, which every reader of that zero shares
-    zeros: map.Map[type_kind.TypeId, u32];
+    shapes: collections_vector.Vector[Shape];
+    slots:  collections_vector.Vector[Slot];
+    bytes:  collections_vector.Vector[u8];
+    # the last shape added under each fingerprint, which an equal shape reuses
+    known: map.Map[u64, u32];
+    # the zero of each type built in this store, which every reader of that zero shares
+    zeros: map.Map[type_kind.TypeId, Node];
 }
 
 pub fun init(alloc: *A.Allocator) Store {
-    ret Store{nodes: collections_vector.init[Node](alloc), members: collections_vector.init[Member](alloc), zeros: map.init[type_kind.TypeId, u32](alloc)};
+    ret Store{
+        shapes: collections_vector.init[Shape](alloc), slots: collections_vector.init[Slot](alloc), bytes: collections_vector.init[u8](alloc),
+        known:  map.init[u64, u32](alloc), zeros: map.init[type_kind.TypeId, Node](alloc)
+    };
 }
 
 # release a deep store; a nil store holds nothing
 pub fun dnit(s: *Store) {
     if (s == nil) { ret; }
-    collections_vector.dnit[Node](?s.nodes);
-    collections_vector.dnit[Member](?s.members);
-    map.dnit[type_kind.TypeId, u32](?s.zeros);
+    collections_vector.dnit[Shape](?s.shapes);
+    collections_vector.dnit[Slot](?s.slots);
+    collections_vector.dnit[u8](?s.bytes);
+    map.dnit[u64, u32](?s.known);
+    map.dnit[type_kind.TypeId, Node](?s.zeros);
 }
 
-pub fun node_add(s: *Store, n: Node) res[u32, fail.Fail] {
-    val at:         u32                 = s.nodes.len::u32;
-    val res_pushed: res[usize, A.Error] = collections_vector.push[Node](?s.nodes, n);
+pub fun shape_at(s: *Store, n: Node) *Shape {
+    ret ?s.shapes.data[n.shape];
+}
+
+# the value a value names: node `node` of the store of the module with stable id `module`, read
+# at type `ty`
+pub fun node_ref(module: u32, node: Node, ty: u32) comptime_value.CTValue {
+    ret comptime_value.node_ref(module, node.shape, node.at, ty);
+}
+
+# the node a value of kind CT_KIND_NODE names
+pub fun node_of(v: comptime_value.CTValue) Node {
+    ret Node{shape: v.data.node.shape, at: v.data.node.at};
+}
+
+# what a store holds at one moment, which a failed build is undone to
+rec Mark {
+    shapes: usize;
+    slots:  usize;
+    bytes:  usize;
+}
+
+fun mark(s: *Store) Mark {
+    ret Mark{shapes: s.shapes.len, slots: s.slots.len, bytes: s.bytes.len};
+}
+
+# drops everything added since `m`, and the fingerprints that name a dropped shape
+fun undo(s: *Store, m: Mark) {
+    var i: usize = m.shapes;
+    for (i < s.shapes.len) {
+        var key:       u64       = s.shapes.data[i].hash;
+        val opt_known: opt[*u32] = map.get[u64, u32](?s.known, ?key);
+        if (sel opt_known.some && (@opt_known.some)::usize >= m.shapes) { map.remove[u64, u32](?s.known, ?key); }
+        i = i + 1;
+    }
+    collections_vector.truncate[Shape](?s.shapes, m.shapes);
+    collections_vector.truncate[Slot](?s.slots, m.slots);
+    collections_vector.truncate[u8](?s.bytes, m.bytes);
+}
+
+# one word folded into a fingerprint
+fun mix(h: u64, x: u64) u64 {
+    ret (h ^ x) * 0x100000001B3;
+}
+
+# the fingerprint of everything a shape holds but its slots
+fun shape_hash(d: *Shape) u64 {
+    var h: u64 = fnv1a.FNV_INIT;
+    h = mix(h, d.kind::u64 | (d.width::u64 << 8) | (d.signed::u64 << 16) | (d.uniform::u64 << 24) | (type_kind.index(d.ty)::u64 << 32));
+    h = mix(h, intern.str_index(d.head)::u64 | (d.len::u64 << 32));
+    h = mix(h, d.declared::u64);
+    if (d.uniform) { h = mix(h, d.first::u64); }
+    if (d.kind == NODE_SCALAR) {
+        h = mix(h, d.value.kind::u64 | (d.value.int_unsigned::u64 << 8) | (d.value.int_width::u64 << 16) | (d.value.float_width::u64 << 24) | (d.value.secret::u64 << 32));
+    }
+    if (d.kind == NODE_REFUSED) {
+        h = mix(h, d.refusal.kind::u64 | (d.refusal.diag::u64 << 8) | (intern.str_index(d.refusal.message)::u64 << 32));
+        h = mix(h, d.refusal.at.file::u64);
+        h = mix(h, d.refusal.at.span.offset::u64);
+        h = mix(h, d.refusal.at.span.len::u64);
+    }
+    if (d.kind == NODE_ADDRESS) {
+        h = mix(h, d.symbol.module::u64 | (d.symbol.decl::u64 << 32));
+        h = mix(h, intern.str_index(d.symbol.canon)::u64 | (d.symbol.function::u64 << 32));
+    }
+    ret h;
+}
+
+fun shape_same(l: *Shape, r: *Shape) bool {
+    if (l.kind != r.kind || l.width != r.width || l.signed != r.signed || l.uniform != r.uniform) { ret false; }
+    if (!type_kind.same(l.ty, r.ty) || !intern.str_same(l.head, r.head))                          { ret false; }
+    if (l.len != r.len || l.declared != r.declared || l.size != r.size)                           { ret false; }
+    if (l.uniform && l.first != r.first)                                                          { ret false; }
+    if (l.kind == NODE_SCALAR) {
+        ret l.value.kind == r.value.kind && l.value.int_unsigned == r.value.int_unsigned && l.value.int_width == r.value.int_width
+            && l.value.float_width == r.value.float_width && l.value.secret == r.value.secret;
+    }
+    if (l.kind == NODE_REFUSED) {
+        ret l.refusal.kind == r.refusal.kind && l.refusal.diag == r.refusal.diag && intern.str_same(l.refusal.message, r.refusal.message)
+            && l.refusal.at.file == r.refusal.at.file && l.refusal.at.span.offset == r.refusal.at.span.offset && l.refusal.at.span.len == r.refusal.at.span.len;
+    }
+    if (l.kind == NODE_ADDRESS) {
+        ret l.symbol.module == r.symbol.module && l.symbol.decl == r.symbol.decl && intern.str_same(l.symbol.canon, r.symbol.canon)
+            && l.symbol.function == r.symbol.function;
+    }
+    ret true;
+}
+
+# the shape `owned` with the slots `slots[0 .. owned.len]` unless it is uniform: the one already held
+# when an equal shape is, else `owned` added, its fingerprint and first slot written into it
+fun shape_intern(s: *Store, owned: *Shape, slots: *Slot) res[u32, fail.Fail] {
+    var h:      u64  = shape_hash(owned);
+    val listed: bool = owned.kind != NODE_SCALAR && owned.kind != NODE_REFUSED && !owned.uniform;
+    var i:      u32  = 0;
+    if (listed) {
+        for (i < owned.len) {
+            h = mix(h, intern.str_index(slots[i].name)::u64 | (slots[i].shape::u64 << 32));
+            i = i + 1;
+        }
+    }
+    owned.hash = h;
+    val opt_known: opt[*u32] = map.get[u64, u32](?s.known, ?h);
+    if (sel opt_known.some) {
+        val held:  *Shape = ?s.shapes.data[@opt_known.some];
+        var equal: bool   = shape_same(held, owned);
+        if (equal && listed) {
+            i = 0;
+            for (i < owned.len) {
+                val k: Slot = s.slots.data[held.first + i];
+                if (!intern.str_same(k.name, slots[i].name) || k.shape != slots[i].shape) {
+                    equal = false;
+                    brk;
+                }
+                i = i + 1;
+            }
+        }
+        if (equal) { ret res[u32, fail.Fail].ok{@opt_known.some}; }
+    }
+    if (listed) {
+        owned.first = s.slots.len::u32;
+        i           = 0;
+        for (i < owned.len) {
+            val res_pushed: res[usize, A.Error] = collections_vector.push[Slot](?s.slots, slots[i]);
+            if (sel res_pushed.err) { ret res[u32, fail.Fail].err{fail.refused(res_pushed.err)}; }
+            i = i + 1;
+        }
+    }
+    val at:         u32                 = s.shapes.len::u32;
+    val res_pushed: res[usize, A.Error] = collections_vector.push[Shape](?s.shapes, @owned);
     if (sel res_pushed.err) { ret res[u32, fail.Fail].err{fail.refused(res_pushed.err)}; }
+    val res_put: res[bool, A.Error] = map.insert[u64, u32](?s.known, h, at);
+    if (sel res_put.err) { ret res[u32, fail.Fail].err{fail.refused(res_put.err)}; }
     ret res[u32, fail.Fail].ok{at};
 }
 
-# the members of an aggregate are added together once its children are, so they are contiguous
-pub fun members_add(s: *Store, node: u32, members: *Member, len: u32) err[fail.Fail] {
-    val first: u32 = s.members.len::u32;
-    var i:     u32 = 0;
+# the low `width` bytes of `w`, the bytes above filled from the top one when `signed` and with
+# zero when not
+fun extended(w: wide.Wide, width: u8, signed: bool) wide.Wide {
+    if (width >= 16) { ret w; }
+    if (width == 0)  { ret wide.Wide{lo: 0, hi: 0}; }
+    if (width <= 8) {
+        val bits: u64 = width::u64 * 8;
+        var lo:   u64 = w.lo;
+        if (bits < 64) { lo = lo & ((1::u64 << bits) - 1); }
+        var hi: u64 = 0;
+        if (signed && ((lo >> (bits - 1)) & 1) != 0) {
+            if (bits < 64) { lo = lo | ~((1::u64 << bits) - 1); }
+            hi = 0xFFFFFFFFFFFFFFFF;
+        }
+        ret wide.Wide{lo: lo, hi: hi};
+    }
+    val bits: u64 = (width::u64 - 8) * 8;
+    var hi:   u64 = w.hi & ((1::u64 << bits) - 1);
+    if (signed && ((hi >> (bits - 1)) & 1) != 0) { hi = hi | ~((1::u64 << bits) - 1); }
+    ret wide.Wide{lo: w.lo, hi: hi};
+}
+
+# the data of a payload `width` bytes wide at `p`, the bytes above filled as `signed` says
+fun data_of(p: *u8, width: u8, signed: bool) wide.Wide {
+    var lo: u64 = 0;
+    var hi: u64 = 0;
+    var i:  u32 = width::u32;
+    for (i > 8) {
+        i  = i - 1;
+        hi = (hi << 8) | p[i]::u64;
+    }
+    for (i > 0) {
+        i  = i - 1;
+        lo = (lo << 8) | p[i]::u64;
+    }
+    if (!signed || width == 0 || width >= 16) { ret wide.Wide{lo: lo, hi: hi}; }
+    if (width <= 8) {
+        val bits: u64 = width::u64 * 8;
+        if (((lo >> (bits - 1)) & 1) == 0) { ret wide.Wide{lo: lo, hi: 0}; }
+        if (bits < 64)                     { lo = lo | ~((1::u64 << bits) - 1); }
+        ret wide.Wide{lo: lo, hi: 0xFFFFFFFFFFFFFFFF};
+    }
+    val bits: u64 = (width::u64 - 8) * 8;
+    if (((hi >> (bits - 1)) & 1) != 0) { hi = hi | ~((1::u64 << bits) - 1); }
+    ret wide.Wide{lo: lo, hi: hi};
+}
+
+# the bytes of its data a scalar's payload holds: the width its kind holds a value in, or all
+# sixteen for data its kind's width does not reproduce, so a table of one type's values has one
+# shape whatever the values are
+fun payload_width(v: *comptime_value.CTValue) u8 {
+    var width: u8 = 16;
+    if (v.kind == comptime_value.CT_KIND_INT && v.int_width > 0 && v.int_width <= 128)                                                 { width = ((v.int_width::u32 + 7) / 8)::u8; }
+    or (v.kind == comptime_value.CT_KIND_FLOAT)                                                                                        { width = 8; }
+    or (v.kind == comptime_value.CT_KIND_STR || v.kind == comptime_value.CT_KIND_TYPE || v.kind == comptime_value.CT_KIND_NON_INTEGER) { width = 4; }
+    or (v.kind == comptime_value.CT_KIND_FIELD || v.kind == comptime_value.CT_KIND_CASE || v.kind == comptime_value.CT_KIND_PACK_ELEM
+        || v.kind == comptime_value.CT_KIND_CONST_ELEM) { width = 8; }
+    val back: wide.Wide = extended(v.data.w, width, payload_signed(v));
+    if (back.lo != v.data.w.lo || back.hi != v.data.w.hi) { ret 16; }
+    ret width;
+}
+
+# a signed integer's payload sign-fills its high bytes, every other value's zero-fills them
+fun payload_signed(v: *comptime_value.CTValue) bool {
+    ret v.kind == comptime_value.CT_KIND_INT && !v.int_unsigned;
+}
+
+# no shape a builder expects of a value
+pub val NO_SHAPE: u32 = 0xFFFFFFFF;
+
+# the shape member `ord`, named `name`, of a value of shape `hint` has: what a builder expects of
+# the same member of the next value it builds of that form. NO_SHAPE when `hint` is none or holds
+# no such member
+pub fun hint_member(s: *Store, hint: u32, ord: u32, name: intern.StrId) u32 {
+    if (hint == NO_SHAPE) { ret NO_SHAPE; }
+    val h: *Shape = ?s.shapes.data[hint];
+    if ((h.kind != NODE_ARRAY && h.kind != NODE_LITERAL) || ord >= h.len) { ret NO_SHAPE; }
+    if (h.uniform)                                                        { ret h.first; }
+    val k: Slot = s.slots.data[h.first + ord];
+    if (!intern.str_same(k.name, name)) { ret NO_SHAPE; }
+    ret k.shape;
+}
+
+# whether the scalar shape `h` is the one a scalar of type `ty` with value `v` and payload width
+# `width` has
+fun scalar_fits(h: *Shape, ty: type_kind.TypeId, v: *comptime_value.CTValue, width: u8) bool {
+    ret h.kind == NODE_SCALAR && h.width == width && type_kind.same(h.ty, ty) && h.value.kind == v.kind && h.value.int_unsigned == v.int_unsigned
+        && h.value.int_width == v.int_width && h.value.float_width == v.float_width && h.value.secret == v.secret;
+}
+
+# the scalar `v` of type `ty`; `hint` is the shape the builder expects it to have, which a column of
+# a table shares from row to row, so it is taken without a lookup when it fits
+pub fun scalar_add(s: *Store, ty: type_kind.TypeId, v: comptime_value.CTValue, hint: u32) res[Node, fail.Fail] {
+    var held:  comptime_value.CTValue = v;
+    val width: u8                     = payload_width(?held);
+    var shape: u32                    = hint;
+    if (hint == NO_SHAPE || !scalar_fits(?s.shapes.data[hint], ty, ?held, width)) {
+        var d: Shape = Shape{kind: NODE_SCALAR, width: width, signed: payload_signed(?held), ty: ty, head: intern.STR_NIL, size: width::u32, value: held};
+        d.value.data.w = wide.Wide{lo: 0, hi: 0};
+        val res_shape: res[u32, fail.Fail] = shape_intern(s, ?d, nil);
+        if (sel res_shape.err) { ret res[Node, fail.Fail].err{res_shape.err}; }
+        shape = res_shape.ok;
+    }
+    if (s.bytes.len + width::usize > s.bytes.cap) {
+        val res_room: res[usize, A.Error] = collections_vector.reserve[u8](?s.bytes, width::usize);
+        if (sel res_room.err) { ret res[Node, fail.Fail].err{fail.refused(res_room.err)}; }
+    }
+    val at:   u32 = s.bytes.len::u32;
+    var word: u64 = held.data.w.lo;
+    var i:    u32 = 0;
+    for (i < width::u32) {
+        if (i == 8) { word = held.data.w.hi; }
+        s.bytes.data[s.bytes.len] = word::u8;
+        s.bytes.len               = s.bytes.len + 1;
+        word                      = word >> 8;
+        i                         = i + 1;
+    }
+    ret res[Node, fail.Fail].ok{Node{shape: shape, at: at}};
+}
+
+# a leaf of type `ty` with no compile-time value, which gives `r` when read
+pub fun refused_add(s: *Store, ty: type_kind.TypeId, r: Refusal) res[Node, fail.Fail] {
+    var d:         Shape               = Shape{kind: NODE_REFUSED, refuses: true, ty: ty, head: intern.STR_NIL, refusal: r};
+    val res_shape: res[u32, fail.Fail] = shape_intern(s, ?d, nil);
+    if (sel res_shape.err) { ret res[Node, fail.Fail].err{res_shape.err}; }
+    ret res[Node, fail.Fail].ok{Node{shape: res_shape.ok, at: s.bytes.len::u32}};
+}
+
+# an array or a record or case literal of type `ty` with the members `members[0 .. len]`, each a
+# node of `s`: the case `head` selects, and an array's declared element count. `hint` is the shape
+# the builder expects it to have, taken without a lookup when it fits
+pub fun aggregate_add(s: *Store, kind: NodeKind, ty: type_kind.TypeId, head: intern.StrId, declared: u32, members: *Member, len: u32, hint: u32) res[Node, fail.Fail] {
+    var d: Shape = Shape{kind: kind, ty: ty, head: head, declared: declared};
+    ret composite_add(s, ?d, members, len, hint);
+}
+
+# the address of `symbol` of type `ty`, then of the place the steps `steps[0 .. len]` reach
+pub fun address_add(s: *Store, ty: type_kind.TypeId, symbol: Symbol, steps: *Member, len: u32) res[Node, fail.Fail] {
+    var d: Shape = Shape{kind: NODE_ADDRESS, ty: ty, head: intern.STR_NIL, symbol: symbol};
+    ret composite_add(s, ?d, steps, len, NO_SHAPE);
+}
+
+# the composite `shape` describes, completed from its members, with the members' payloads in order
+# as its own: where they already lie so, in place, and otherwise copied to the end of the store's bytes
+fun composite_add(s: *Store, shape: *Shape, members: *Member, len: u32, hint: u32) res[Node, fail.Fail] {
+    var size:   u64  = 0;
+    var start:  u32  = s.bytes.len::u32;
+    var placed: bool = false;
+    var lined:  bool = true;
+    var i:      u32  = 0;
+    shape.uniform = shape.kind == NODE_ARRAY && len > 0;
     for (i < len) {
-        val res_pushed: res[usize, A.Error] = collections_vector.push[Member](?s.members, members[i]);
-        if (sel res_pushed.err) { ret err[fail.Fail].err{fail.refused(res_pushed.err)}; }
+        val m:     Node   = members[i].node;
+        val child: *Shape = ?s.shapes.data[m.shape];
+        if (child.refuses)                                              { shape.refuses = true; }
+        if (m.shape != members[0].node.shape)                           { shape.uniform = false; }
+        if (child.size > 0 && placed && m.at::u64 != start::u64 + size) { lined = false; }
+        if (child.size > 0 && !placed) {
+            start  = m.at;
+            placed = true;
+        }
+        size = size + child.size::u64;
+        i    = i + 1;
+    }
+    if (size > 0xFFFFFFFF) { ret res[Node, fail.Fail].err{fail.message("a constant's value is larger than a store holds")}; }
+    shape.len  = len;
+    shape.size = size::u32;
+    if (shape.uniform) { shape.first = members[0].node.shape; }
+    if (!lined) {
+        val res_room: res[usize, A.Error] = collections_vector.reserve[u8](?s.bytes, size::usize);
+        if (sel res_room.err) { ret res[Node, fail.Fail].err{fail.refused(res_room.err)}; }
+        start = s.bytes.len::u32;
+        i     = 0;
+        for (i < len) {
+            val m:     Node = members[i].node;
+            val count: u32  = s.shapes.data[m.shape].size;
+            var k:     u32  = 0;
+            for (k < count) {
+                s.bytes.data[s.bytes.len] = s.bytes.data[m.at + k];
+                s.bytes.len               = s.bytes.len + 1;
+                k                         = k + 1;
+            }
+            i = i + 1;
+        }
+    }
+    if (hint != NO_SHAPE && composite_fits(s, ?s.shapes.data[hint], shape, members)) { ret res[Node, fail.Fail].ok{Node{shape: hint, at: start}}; }
+    var slots: *Slot = nil;
+    if (!shape.uniform && len > 0) {
+        val res_allocated: res[*Slot, A.Error] = A.allocate[Slot](s.slots.a, len::usize);
+        if (sel res_allocated.err) { ret res[Node, fail.Fail].err{fail.refused(res_allocated.err)}; }
+        slots = res_allocated.ok;
+        var off: u32 = 0;
+        i = 0;
+        for (i < len) {
+            slots[i] = Slot{name: members[i].name, shape: members[i].node.shape, at: off};
+            off      = off + s.shapes.data[members[i].node.shape].size;
+            i        = i + 1;
+        }
+    }
+    val res_shape: res[u32, fail.Fail] = shape_intern(s, shape, slots);
+    if (slots != nil)      { A.deallocate[Slot](s.slots.a, slots, len::usize); }
+    if (sel res_shape.err) { ret res[Node, fail.Fail].err{res_shape.err}; }
+    ret res[Node, fail.Fail].ok{Node{shape: res_shape.ok, at: start}};
+}
+
+# whether the aggregate shape `h` is the one `d`, with the members `members[0 .. d.len]`, has
+fun composite_fits(s: *Store, h: *Shape, d: *Shape, members: *Member) bool {
+    if (h.kind != d.kind || h.uniform != d.uniform || h.len != d.len || h.declared != d.declared || h.size != d.size) { ret false; }
+    if (!type_kind.same(h.ty, d.ty) || !intern.str_same(h.head, d.head))                                              { ret false; }
+    if (d.uniform)                                                                                                    { ret h.first == d.first; }
+    var i: u32 = 0;
+    for (i < d.len) {
+        val k: Slot = s.slots.data[h.first + i];
+        if (k.shape != members[i].node.shape || !intern.str_same(k.name, members[i].name)) { ret false; }
         i = i + 1;
     }
-    s.nodes.data[node].first = first;
-    s.nodes.data[node].len   = len;
-    ret err[fail.Fail].ok{};
+    ret true;
 }
 
-pub fun node_at(s: *Store, node: u32) *Node {
-    ret ?s.nodes.data[node];
+# member `ord` of the aggregate or address `n`, which holds more than `ord` members
+pub fun member(s: *Store, n: Node, ord: u32) Member {
+    val shape: *Shape = ?s.shapes.data[n.shape];
+    if (shape.uniform) {
+        ret Member{name: intern.STR_NIL, node: Node{shape: shape.first, at: n.at + ord * s.shapes.data[shape.first].size}};
+    }
+    val k: Slot = s.slots.data[shape.first + ord];
+    ret Member{name: k.name, node: Node{shape: k.shape, at: n.at + k.at}};
 }
 
-pub fun member_at(s: *Store, n: *Node, ord: u32) opt[Member] {
-    if (n.kind != NODE_ARRAY && n.kind != NODE_LITERAL) { ret opt[Member].none{}; }
-    if (ord >= n.len)                                   { ret opt[Member].none{}; }
-    ret opt[Member].some{s.members.data[n.first + ord]};
+pub fun member_at(s: *Store, n: Node, ord: u32) opt[Member] {
+    val shape: *Shape = shape_at(s, n);
+    if (shape.kind != NODE_ARRAY && shape.kind != NODE_LITERAL) { ret opt[Member].none{}; }
+    if (ord >= shape.len)                                       { ret opt[Member].none{}; }
+    ret opt[Member].some{member(s, n, ord)};
+}
+
+# the value of the scalar `n`
+pub fun scalar(s: *Store, n: Node) comptime_value.CTValue {
+    val shape: *Shape                 = ?s.shapes.data[n.shape];
+    var v:     comptime_value.CTValue = shape.value;
+    v.data.w = data_of(?s.bytes.data[n.at], shape.width, shape.signed);
+    ret v;
 }
 
 pub fun refusal_of(itn: *intern.Interner, r: Refusal) comptime_failure.EvalFail {
@@ -133,9 +536,9 @@ pub fun refusal_of(itn: *intern.Interner, r: Refusal) comptime_failure.EvalFail 
 
 # the value a scalar node holds, or the refusal a refused one gives; an aggregate has no
 # value of its own, and an address has none until the program is linked
-pub fun value(s: *Store, itn: *intern.Interner, node: u32) res[comptime_value.CTValue, comptime_failure.EvalFail] {
-    val n: *Node = node_at(s, node);
-    if (n.kind == NODE_SCALAR)  { ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{n.value}; }
+pub fun value(s: *Store, itn: *intern.Interner, node: Node) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    val n: *Shape = shape_at(s, node);
+    if (n.kind == NODE_SCALAR)  { ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{scalar(s, node)}; }
     if (n.kind == NODE_REFUSED) { ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{refusal_of(itn, n.refusal)}; }
     if (n.kind == NODE_ADDRESS) {
         ret res[comptime_value.CTValue, comptime_failure.EvalFail].err{comptime_failure.eval_error(comptime_failure.EVAL_FAIL_REJECTED,
@@ -147,10 +550,10 @@ pub fun value(s: *Store, itn: *intern.Interner, node: u32) res[comptime_value.CT
 
 # what reading node `node` of module `module`'s store gives: a scalar's value, a refused leaf's
 # or an address's refusal, or the aggregate itself as a value naming it
-pub fun read(s: *Store, itn: *intern.Interner, module: u32, node: u32) res[comptime_value.CTValue, comptime_failure.EvalFail] {
-    val n: *Node = node_at(s, node);
+pub fun read(s: *Store, itn: *intern.Interner, module: u32, node: Node) res[comptime_value.CTValue, comptime_failure.EvalFail] {
+    val n: *Shape = shape_at(s, node);
     if (n.kind == NODE_SCALAR || n.kind == NODE_REFUSED || n.kind == NODE_ADDRESS) { ret value(s, itn, node); }
-    ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{comptime_value.node_ref(module, node, type_kind.index(n.ty))};
+    ret res[comptime_value.CTValue, comptime_failure.EvalFail].ok{node_ref(module, node, type_kind.index(n.ty))};
 }
 
 def ProjectionKind: u8;
@@ -166,24 +569,24 @@ pub val PROJECT_OMITTED: ProjectionKind = 4;
 
 pub rec Projection {
     kind: ProjectionKind;
-    node: u32;
+    node: Node;
     head: intern.StrId;
 }
 
 # member `name` of a record or case literal: a record's field, or a case literal's payload when
 # `name` is the case it holds
-pub fun project(s: *Store, node: u32, name: intern.StrId) Projection {
-    val n: *Node = node_at(s, node);
+pub fun project(s: *Store, node: Node, name: intern.StrId) Projection {
+    val n: *Shape = shape_at(s, node);
     if (n.kind != NODE_LITERAL) { ret Projection{kind: PROJECT_ABSENT, head: intern.STR_NIL}; }
     if (!intern.str_is_nil(n.head)) {
         if (!intern.str_same(n.head, name)) { ret Projection{kind: PROJECT_UNSELECTED, head: n.head}; }
-        val opt_payload: opt[Member] = member_at(s, n, 0);
-        if (sel opt_payload.none) { ret Projection{kind: PROJECT_NO_PAYLOAD, head: n.head}; }
-        ret Projection{kind: PROJECT_MEMBER, node: opt_payload.some.node, head: n.head};
+        if (n.len == 0)                     { ret Projection{kind: PROJECT_NO_PAYLOAD, head: n.head}; }
+        ret Projection{kind: PROJECT_MEMBER, node: member(s, node, 0).node, head: n.head};
     }
-    var i: u32 = 0;
-    for (i < n.len) {
-        val m: Member = s.members.data[n.first + i];
+    val len: u32 = n.len;
+    var i:   u32 = 0;
+    for (i < len) {
+        val m: Member = member(s, node, i);
         if (intern.str_same(m.name, name)) { ret Projection{kind: PROJECT_MEMBER, node: m.node, head: intern.STR_NIL}; }
         i = i + 1;
     }
@@ -202,72 +605,84 @@ pub val INDEX_PAST_END_MSG: str = "this index is past the end of the constant it
 
 pub rec Element {
     kind: ElementKind;
-    node: u32;
+    node: Node;
 }
 
 # element `index` of an array node
-pub fun element(s: *Store, node: u32, index: u64) Element {
-    val n: *Node = node_at(s, node);
+pub fun element(s: *Store, node: Node, index: u64) Element {
+    val n: *Shape = shape_at(s, node);
     if (n.kind != NODE_ARRAY)     { ret Element{kind: ELEMENT_ABSENT}; }
     if (index >= n.declared::u64) { ret Element{kind: ELEMENT_PAST_END}; }
     if (index >= n.len::u64)      { ret Element{kind: ELEMENT_OMITTED}; }
-    ret Element{kind: ELEMENT_MEMBER, node: s.members.data[n.first + index::u32].node};
+    ret Element{kind: ELEMENT_MEMBER, node: member(s, node, index::u32).node};
 }
 
 # the first leaf under `node` that has no compile-time value, none when every leaf has one
-pub fun refused_within(s: *Store, node: u32) opt[u32] {
-    val n: *Node = node_at(s, node);
-    if (n.kind == NODE_REFUSED)                          { ret opt[u32].some{node}; }
-    if (n.kind == NODE_SCALAR || n.kind == NODE_ADDRESS) { ret opt[u32].none{}; }
-    var i: u32 = 0;
-    for (i < n.len) {
-        val opt_inner: opt[u32] = refused_within(s, s.members.data[n.first + i].node);
+pub fun refused_within(s: *Store, node: Node) opt[Node] {
+    val n: *Shape = shape_at(s, node);
+    if (n.kind == NODE_REFUSED) { ret opt[Node].some{node}; }
+    if (!n.refuses)             { ret opt[Node].none{}; }
+    val len: u32 = n.len;
+    var i:   u32 = 0;
+    for (i < len) {
+        val opt_inner: opt[Node] = refused_within(s, member(s, node, i).node);
         if (sel opt_inner.some) { ret opt_inner; }
         i = i + 1;
     }
-    ret opt[u32].none{};
+    ret opt[Node].none{};
 }
 
-# node `node` of `from` with everything under it, added to `to`, which is another store. the
-# copy recurses as deep as the value nests, so it asks for stack before it descends and refuses
-# a value nested deeper (`nesting`), which the node that asked reports. a failure leaves `to`
-# as it was
-pub fun clone(to: *Store, from: *Store, node: u32) res[u32, fail.Fail] {
-    val nodes:      usize               = to.nodes.len;
-    val members:    usize               = to.members.len;
-    val res_copied: res[u32, fail.Fail] = clone_tree(to, from, node);
+# node `node` of `from` with everything under it, added to `to`, which is another store: its
+# shape and those under it, and its payload. the copy recurses as deep as the shape nests, so it
+# asks for stack before it descends and refuses a value nested deeper (`nesting`), which the node
+# that asked reports. a failure leaves `to` as it was
+pub fun clone(to: *Store, from: *Store, node: Node) res[Node, fail.Fail] {
+    val m:          Mark                = mark(to);
+    val res_copied: res[u32, fail.Fail] = shape_clone(to, from, node.shape);
     if (sel res_copied.err) {
-        collections_vector.truncate[Node](?to.nodes, nodes);
-        collections_vector.truncate[Member](?to.members, members);
+        undo(to, m);
+        ret res[Node, fail.Fail].err{res_copied.err};
     }
-    ret res_copied;
+    val size:     u32                 = from.shapes.data[node.shape].size;
+    val res_room: res[usize, A.Error] = collections_vector.reserve[u8](?to.bytes, size::usize);
+    if (sel res_room.err) {
+        undo(to, m);
+        ret res[Node, fail.Fail].err{fail.refused(res_room.err)};
+    }
+    val at: u32 = to.bytes.len::u32;
+    var k:  u32 = 0;
+    for (k < size) {
+        to.bytes.data[to.bytes.len] = from.bytes.data[node.at + k];
+        to.bytes.len                = to.bytes.len + 1;
+        k                           = k + 1;
+    }
+    ret res[Node, fail.Fail].ok{Node{shape: res_copied.ok, at: at}};
 }
 
-fun clone_tree(to: *Store, from: *Store, node: u32) res[u32, fail.Fail] {
+fun shape_clone(to: *Store, from: *Store, shape: u32) res[u32, fail.Fail] {
     if (stack.exhausted()) { ret res[u32, fail.Fail].err{nesting()}; }
-    var n:     Node = from.nodes.data[node];
-    val count: u32  = n.len;
-    val first: u32  = n.first;
-    n.first = 0;
-    n.len   = 0;
-    val res_node_add: res[u32, fail.Fail] = node_add(to, n);
-    if (sel res_node_add.err) { ret res_node_add; }
-    if (count == 0)           { ret res_node_add; }
-    val res_allocated: res[*Member, A.Error] = A.allocate[Member](to.members.a, count::usize);
+    var d: Shape = from.shapes.data[shape];
+    if (d.uniform) {
+        val res_element: res[u32, fail.Fail] = shape_clone(to, from, d.first);
+        if (sel res_element.err) { ret res_element; }
+        d.first = res_element.ok;
+        ret shape_intern(to, ?d, nil);
+    }
+    if (d.kind == NODE_SCALAR || d.kind == NODE_REFUSED || d.len == 0) { ret shape_intern(to, ?d, nil); }
+    val count:         u32                 = d.len;
+    val res_allocated: res[*Slot, A.Error] = A.allocate[Slot](to.slots.a, count::usize);
     if (sel res_allocated.err) { ret res[u32, fail.Fail].err{fail.refused(res_allocated.err)}; }
-    val members: *Member = res_allocated.ok;
-    fin { A.deallocate[Member](to.members.a, members, count::usize); }
+    val slots: *Slot = res_allocated.ok;
+    fin { A.deallocate[Slot](to.slots.a, slots, count::usize); }
     var i: u32 = 0;
     for (i < count) {
-        val m:         Member              = from.members.data[first + i];
-        val res_child: res[u32, fail.Fail] = clone_tree(to, from, m.node);
+        val k:         Slot                = from.slots.data[d.first + i];
+        val res_child: res[u32, fail.Fail] = shape_clone(to, from, k.shape);
         if (sel res_child.err) { ret res_child; }
-        members[i] = Member{name: m.name, node: res_child.ok};
-        i          = i + 1;
+        slots[i] = Slot{name: k.name, shape: res_child.ok, at: k.at};
+        i        = i + 1;
     }
-    val err_linked: err[fail.Fail] = members_add(to, res_node_add.ok, members, count);
-    if (sel err_linked.err) { ret res[u32, fail.Fail].err{err_linked.err}; }
-    ret res_node_add;
+    ret shape_intern(to, ?d, slots);
 }
 
 pub val ZERO_UNKNOWN_MSG: str = "the zero of this field's type is not known";
@@ -281,23 +696,20 @@ pub fun zero_defined(types: *type.TypeInterner, ty: type_kind.TypeId) bool {
 # the zero of `ty` in `s`, which a member a literal leaves out holds: a record, union or array
 # with no members, a scalar zero, or a tag's first declared case over the zero of its payload.
 # It is built the first time it is asked for and shared by every later reader, so `s` holds at
-# most one tree per distinct type. Nothing writes a node once its members are linked, which is
-# what makes the sharing safe. The tag's field table must be ready, and a tag with no cases is
+# most one per distinct type. The tag's field table must be ready, and a tag with no cases is
 # an internal failure. A failure leaves `s` as it was.
-pub fun zero_node(s: *Store, types: *type.TypeInterner, pointer_width: u32, ty: type_kind.TypeId) res[u32, fail.Fail] {
-    val opt_hit: opt[*u32] = map.get[type_kind.TypeId, u32](?s.zeros, ?ty);
-    if (sel opt_hit.some) { ret res[u32, fail.Fail].ok{@opt_hit.some}; }
-    val nodes:     usize               = s.nodes.len;
-    val members:   usize               = s.members.len;
-    val res_built: res[u32, fail.Fail] = zero_build(s, types, pointer_width, ty);
-    var res_kept:  res[u32, fail.Fail] = res_built;
+pub fun zero_node(s: *Store, types: *type.TypeInterner, pointer_width: u32, ty: type_kind.TypeId) res[Node, fail.Fail] {
+    val opt_hit: opt[*Node] = map.get[type_kind.TypeId, Node](?s.zeros, ?ty);
+    if (sel opt_hit.some) { ret res[Node, fail.Fail].ok{@opt_hit.some}; }
+    val m:         Mark                 = mark(s);
+    val res_built: res[Node, fail.Fail] = zero_build(s, types, pointer_width, ty);
+    var res_kept:  res[Node, fail.Fail] = res_built;
     if (sel res_built.ok) {
-        val res_put: res[bool, A.Error] = map.insert[type_kind.TypeId, u32](?s.zeros, ty, res_built.ok);
+        val res_put: res[bool, A.Error] = map.insert[type_kind.TypeId, Node](?s.zeros, ty, res_built.ok);
         if (sel res_put.ok) { ret res_built; }
-        res_kept = res[u32, fail.Fail].err{fail.refused(res_put.err)};
+        res_kept = res[Node, fail.Fail].err{fail.refused(res_put.err)};
     }
-    collections_vector.truncate[Node](?s.nodes, nodes);
-    collections_vector.truncate[Member](?s.members, members);
+    undo(s, m);
     ret res_kept;
 }
 
@@ -307,48 +719,32 @@ fun nesting() fail.Fail {
 }
 
 # the zero recurses as deep as tags hold tags by value, so it asks for stack before it descends
-fun zero_build(s: *Store, types: *type.TypeInterner, pointer_width: u32, ty: type_kind.TypeId) res[u32, fail.Fail] {
-    if (stack.exhausted()) { ret res[u32, fail.Fail].err{nesting()}; }
+fun zero_build(s: *Store, types: *type.TypeInterner, pointer_width: u32, ty: type_kind.TypeId) res[Node, fail.Fail] {
+    if (stack.exhausted()) { ret res[Node, fail.Fail].err{nesting()}; }
     val bare: type_kind.TypeId = type.strip_secret(types, ty);
     if (type.is_tag(types, bare)) { ret zero_tag(s, types, pointer_width, ty); }
-    var node:         Node     = Node{kind: NODE_SCALAR, ty: ty, head: intern.STR_NIL};
     val opt_elements: opt[u32] = type.element_count(types, ty);
-    if (type.is_record(types, ty) || type.is_union(types, ty)) { node.kind = NODE_LITERAL; }
-    or (sel opt_elements.some) {
-        node.kind     = NODE_ARRAY;
-        node.declared = opt_elements.some;
-    }
-    or {
-        val opt_found: opt[*type.Type] = type.get(types, bare);
-        if (sel opt_found.none) { ret res[u32, fail.Fail].err{fail.message(ZERO_UNKNOWN_MSG)}; }
-        val desc: type_prim.PrimDesc = type_prim.prim_desc(opt_found.some.kind);
-        if (desc.class == type_prim.PRIM_CLASS_FLOAT) { node.value = comptime_value.ct_float(0.0, type_prim.float_width_of(opt_found.some.kind)); }
-        or (desc.class == type_prim.PRIM_CLASS_INT)   { node.value = comptime_value.ct_zero_int(!desc.signed, comptime_value.width_held(desc.bits)); }
-        or                                            { node.value = comptime_value.ct_zero_int(true, (pointer_width * 8)::u8); }
-    }
-    ret node_add(s, node);
+    if (type.is_record(types, ty) || type.is_union(types, ty)) { ret aggregate_add(s, NODE_LITERAL, ty, intern.STR_NIL, 0, nil, 0, NO_SHAPE); }
+    if (sel opt_elements.some)                                 { ret aggregate_add(s, NODE_ARRAY, ty, intern.STR_NIL, opt_elements.some, nil, 0, NO_SHAPE); }
+    val opt_found: opt[*type.Type] = type.get(types, bare);
+    if (sel opt_found.none) { ret res[Node, fail.Fail].err{fail.message(ZERO_UNKNOWN_MSG)}; }
+    val desc: type_prim.PrimDesc = type_prim.prim_desc(opt_found.some.kind);
+    if (desc.class == type_prim.PRIM_CLASS_FLOAT) { ret scalar_add(s, ty, comptime_value.ct_float(0.0, type_prim.float_width_of(opt_found.some.kind)), NO_SHAPE); }
+    if (desc.class == type_prim.PRIM_CLASS_INT)   { ret scalar_add(s, ty, comptime_value.ct_zero_int(!desc.signed, comptime_value.width_held(desc.bits)), NO_SHAPE); }
+    ret scalar_add(s, ty, comptime_value.ct_zero_int(true, (pointer_width * 8)::u8), NO_SHAPE);
 }
 
 # the case literal of the first declared case of tag `ty`, holding the zero of its payload when it
 # declares one: the shape a written case literal has, and the value lowering zero-fills
-fun zero_tag(s: *Store, types: *type.TypeInterner, pointer_width: u32, ty: type_kind.TypeId) res[u32, fail.Fail] {
+fun zero_tag(s: *Store, types: *type.TypeInterner, pointer_width: u32, ty: type_kind.TypeId) res[Node, fail.Fail] {
     val opt_first: opt[*type_field.Entry] = type.field_at(types, type.strip_secret(types, ty), 0);
-    if (sel opt_first.none) { ret res[u32, fail.Fail].err{fail.message("a tag has no cases, or its field table is not ready")}; }
-    var payload: u32  = 0;
-    val has:     bool = !type_kind.is_nil(opt_first.some.ty);
-    if (has) {
-        val res_zero: res[u32, fail.Fail] = zero_build(s, types, pointer_width, opt_first.some.ty);
-        if (sel res_zero.err) { ret res_zero; }
-        payload = res_zero.ok;
-    }
-    val res_node: res[u32, fail.Fail] = node_add(s, Node{kind: NODE_LITERAL, ty: ty, head: opt_first.some.name});
-    if (sel res_node.err) { ret res_node; }
-    if (has) {
-        val member:     Member         = Member{name: intern.STR_NIL, node: payload};
-        val err_linked: err[fail.Fail] = members_add(s, res_node.ok, ?member, 1);
-        if (sel err_linked.err) { ret res[u32, fail.Fail].err{err_linked.err}; }
-    }
-    ret res_node;
+    if (sel opt_first.none) { ret res[Node, fail.Fail].err{fail.message("a tag has no cases, or its field table is not ready")}; }
+    val head: intern.StrId = opt_first.some.name;
+    if (type_kind.is_nil(opt_first.some.ty)) { ret aggregate_add(s, NODE_LITERAL, ty, head, 0, nil, 0, NO_SHAPE); }
+    val res_zero: res[Node, fail.Fail] = zero_build(s, types, pointer_width, opt_first.some.ty);
+    if (sel res_zero.err) { ret res_zero; }
+    var payload: Member = Member{name: intern.STR_NIL, node: res_zero.ok};
+    ret aggregate_add(s, NODE_LITERAL, ty, head, 0, ?payload, 1, NO_SHAPE);
 }
 
 # the module index a scratch store of zeros answers to when a node of it is read as a value
