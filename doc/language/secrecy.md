@@ -1262,6 +1262,16 @@ The only secret-to-public crossings are the explicit `:>T` cast and inline
 `asm`, which masc's walk validates but a type system cannot check. A proof is
 always relative to a leakage model. Its fidelity to real silicon is empirical.
 
+mirl's own helpers, the routines a constant-time function calls for a
+division, product, conversion, copy or fill the target has no instruction for,
+are walked as constant-time functions where one calls them. A division,
+remainder or product helper's result is taken as public where every operand
+the call passes is: its text reads and writes no memory and calls nothing,
+which mirl checks when it delivers it, so the result is formed from the
+operands alone, in registers, on the stack or in a copy passed by reference.
+On wasm, where a 128-bit operand travels in memory, the result is taken as
+secret.
+
 What is checked and what is trusted: the checker verifies the functions marked
 `#[constant_time]`, their `asm` included. Code that is not marked is trusted to
 follow the type system and its declared signatures, and `asm` outside a
