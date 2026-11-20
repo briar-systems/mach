@@ -45,7 +45,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | On `Symbol` | |
 | :--- | :--- |
 | [`origin_of`](#origin_of) | the module a symbol is defined in, as the current operation numbers it |
-| [`foreign_to`](#foreign_to) | whether `sym` names a binding a module other than `own` declares: an import, or a `fwd` of one, which carries the kind the binding is declared with there as its own |
+| [`foreign_to`](#foreign_to) | whether `sym` names a binding a module other than the one `own` names declares: an import, or a `fwd` of one, which carries the kind the binding is declared with there as its own |
 | [`use_target`](#use_target) | the module a `use` symbol names, as the current operation numbers it |
 | [`use_stable`](#use_stable) | the stable id of the module a `use` symbol names, nil for any other symbol |
 | [`symbol_is_runtime`](#symbol_is_runtime) | |
@@ -216,11 +216,11 @@ the module a symbol is defined in, as the current operation numbers it
 ### foreign_to
 
 ```mach
-pub fun foreign_to(s: *mach.session.Session, sym: *Symbol, own: mach.session.module.ModuleId) bool
+pub fun foreign_to(sym: *Symbol, own: mach.session.module.StableModuleId) bool
 ```
 
-whether `sym` names a binding a module other than `own` declares: an import, or a `fwd` of one,
-which carries the kind the binding is declared with there as its own
+whether `sym` names a binding a module other than the one `own` names declares: an import, or a
+`fwd` of one, which carries the kind the binding is declared with there as its own
 
 ### use_target
 

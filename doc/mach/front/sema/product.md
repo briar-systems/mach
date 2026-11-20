@@ -46,6 +46,12 @@ Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.
 | [`acquire_definition`](#acquire_definition) | the definition of module `origin` as far as each phase got: an importer is checked against what a rejected module resolved and typed, since what it refused carries the error type |
 | [`acquire_symbol`](#acquire_symbol) | the current definition of `requested`, which module `origin` defines as this operation numbers it |
 
+| On `SemaDeps` | |
+| :--- | :--- |
+| [`surfaces_set`](#surfaces_set) | hand `deps` the surfaces `entries` holds, an array of `count` allocated from `a` |
+| [`surfaces_dnit`](#surfaces_dnit) | release what surfaces_set handed `deps`: the array, from `a`, and the index; the surfaces are borrowed |
+| [`surface_of_owner`](#surface_of_owner) | the surface of the module `owner` among those `deps` holds, none when it holds none |
+
 | Constants | |
 | :--- | :--- |
 | [`INFERRED_LEN_NONE`](#constants), [`INFERRED_LEN_FAILED`](#constants) | |
@@ -154,6 +160,7 @@ module's interface publishes
 pub rec ModuleSema {
     path:    mach.base.intern.StrId;
     module:  mach.session.module.ModuleId;
+    stable:  mach.session.module.StableModuleId;
     exports: std.collections.vector.Vector[TypeExport];
     graph:   mach.front.sema.fields.Graph;
     index:   std.collections.map.Map[u64, u32];
@@ -164,12 +171,12 @@ pub rec ModuleSema {
 ```
 
 exports are append-only, and `index` maps (origin, canon) to the first export with
-that key over the first `indexed` of them
+that key over the first `indexed` of them. `stable` names the module whose surface it is
 
 ### module_sema_init
 
 ```mach
-pub fun module_sema_init(a: *std.allocator.Allocator, path: mach.base.intern.StrId, module: mach.session.module.ModuleId) ModuleSema
+pub fun module_sema_init(a: *std.allocator.Allocator, path: mach.base.intern.StrId, module: mach.session.module.ModuleId, stable: mach.session.module.StableModuleId) ModuleSema
 ```
 
 ### module_sema_dnit
@@ -279,12 +286,39 @@ pub rec SemaDeps {
     definitions: DefinitionReader;
     entries:     **ModuleSema;
     count:       u32;
+    owners:      std.collections.map.Map[u32, u32];
     watch:       GrowthWatch;
 }
 ```
 
 the imported surfaces are borrowed: the driver owns each one and shares it
-between every importer in a pass
+between every importer in a pass. `owners` holds each surface's position by the stable
+index of its module, the first where two are one module's; surfaces_set fills it with
+`entries`, which nothing changes after, and surfaces_dnit releases both
+
+### surfaces_set
+
+```mach
+pub fun surfaces_set(deps: *SemaDeps, entries: **ModuleSema, count: u32, a: *std.allocator.Allocator) err[std.allocator.Error]
+```
+
+hand `deps` the surfaces `entries` holds, an array of `count` allocated from `a`
+
+### surfaces_dnit
+
+```mach
+pub fun surfaces_dnit(deps: *SemaDeps, a: *std.allocator.Allocator)
+```
+
+release what surfaces_set handed `deps`: the array, from `a`, and the index; the surfaces are borrowed
+
+### surface_of_owner
+
+```mach
+pub fun surface_of_owner(deps: *SemaDeps, owner: mach.session.module.StableModuleId) opt[*ModuleSema]
+```
+
+the surface of the module `owner` among those `deps` holds, none when it holds none
 
 ## GrowthWatch
 

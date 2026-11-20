@@ -274,6 +274,7 @@ pub rec ModuleView {
     rr:         *mach.front.resolve.ResolveResult;
     ctx:        *mach.front.comptime.scope.ComptimeCtx;
     own_module: mach.session.module.ModuleId;
+    own_stable: mach.session.module.StableModuleId;
     source:     str;
 
     expr_type:          *mach.type.kind.TypeId;

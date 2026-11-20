@@ -14,7 +14,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.session`](../../s
 | [`ensure`](#ensure) | builds the field table of instance `tid` for the current projection, once |
 | [`apply_or_self`](#apply_or_self) | `tid` under `who`'s arguments, or itself when there are none |
 | [`substitute`](#substitute) | replace `who`'s parameters in `body_type` with `args`, position for position; a parameter of any other declaration (an enclosing generic's, in an open instance) stays, so a substituted type reads as the identity under a second pass |
-| [`ensure_fields`](#ensure_fields) | |
+| [`ensure_fields`](#ensure_fields) | the field table of `tid` built when it is an instance that has none yet; a query is made only then |
 
 ---
 
@@ -61,4 +61,6 @@ instance) stays, so a substituted type reads as the identity under a second pass
 ```mach
 pub fun ensure_fields(s: *mach.session.Session, tid: mach.type.kind.TypeId) err[mach.base.fail.Fail]
 ```
+
+the field table of `tid` built when it is an instance that has none yet; a query is made only then
 

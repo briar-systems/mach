@@ -318,6 +318,7 @@ pub rec ModuleScope {
     source:      str;
     fqn:         mach.base.intern.StrId;
     own_module:  mach.session.module.ModuleId;
+    own_stable:  mach.session.module.StableModuleId;
     typing:      mach.front.sema.template.Typing;
     iface:       *mach.front.sema.interface.Interface;
     rr:          *mach.front.resolve.ResolveResult;
