@@ -68,7 +68,8 @@ first step runs. mirl times its own stages when a readout is shown, and each mov
 A test object's mirl and masc stages add to the same rows.
 
 A build compiles its modules on `--threads` threads, the host's processors when
-the flag is absent. The owner thread lowers each module and completes each
+the flag is absent. The link reads and relocates its inputs on as many, and its
+row stays the owner's wall time. The owner thread lowers each module and completes each
 compile in module order, so diagnostics, objects and the rows above are the
 same at every thread count. On one thread every step runs on the owner and the
 rows are as described. On more, the steps' compiles run side by side: `lower`
