@@ -68,6 +68,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | :--- | :--- |
 | [`refusal_of`](#refusal_of) | the refusal of the previous spelling at `name` in `source` with `args` arguments, nil when it is none |
 | [`constant_time_mode`](#constant_time_mode) | the constant-time mode `d` declares, "soft" or "hard", none when it declares none |
+| [`inline_mode`](#inline_mode) | the mode `d`'s `#[inline]` names, "always" or "never", or none |
 | [`mode_admits`](#mode_admits) | whether `value` is one of the `\|`-separated `modes` |
 | [`takes_string`](#takes_string) | whether argument `ord` of `dec` is a string, which the load records where it can |
 | [`string_id`](#string_id) | the string argument `ord` of `dec` evaluated to in the scope `c`, as the load or type checking recorded it; STR_NIL when it is not a constant string |
@@ -338,6 +339,14 @@ pub fun constant_time_mode(itn: *mach.base.intern.Interner, c: *mach.front.compt
 
 the constant-time mode `d` declares, "soft" or "hard", none when it declares none. every
 reader of the mode asks here, so none disagree
+
+### inline_mode
+
+```mach
+pub fun inline_mode(itn: *mach.base.intern.Interner, c: *mach.front.comptime.scope.ComptimeCtx, a: *mach.front.ast.Ast, d: *mach.front.ast.decl.Decl) opt[str]
+```
+
+the mode `d`'s `#[inline]` names, "always" or "never", or none
 
 ### mode_admits
 
