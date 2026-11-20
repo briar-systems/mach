@@ -65,6 +65,7 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | On `Op` | |
 | :--- | :--- |
 | [`refusal`](#refusal) | the failure of `op`, refused by `cause`, reported under `k` with the text `op` names, allocated in `a`, which the failure borrows |
+| [`refusal_text`](#refusal_text) | the text `refusal` names `op` with, allocated in `a`, or the failure that stands in its place, carrying a static text: an allocation refusal behind `cause`, or a refusal to format the text |
 
 | On `Cause` | |
 | :--- | :--- |
@@ -541,9 +542,20 @@ pub fun refusal(a: *std.allocator.Allocator, k: mach.base.diagnostic.kind.Kind, 
 
 the failure of `op`, refused by `cause`, reported under `k` with the text `op`
 names, allocated in `a`, which the failure borrows. an allocation refusal is
-internal whatever the operation; a path the user named that is missing or the
-wrong kind of entry is the user's; every other refusal is the environment's.
-this is the one way a refusal of the machine becomes a failure
+the environment's `memory.refused` whatever the operation; a path the user
+named that is missing or the wrong kind of entry is the user's; every other
+refusal is the environment's. this is the one way a refusal of the machine
+becomes a failure
+
+### refusal_text
+
+```mach
+pub fun refusal_text(a: *std.allocator.Allocator, op: Op, cause: Cause) res[str, Fail]
+```
+
+the text `refusal` names `op` with, allocated in `a`, or the failure that
+stands in its place, carrying a static text: an allocation refusal behind
+`cause`, or a refusal to format the text
 
 ## Cause
 

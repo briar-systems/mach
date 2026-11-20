@@ -3,7 +3,8 @@
 # mach.base.wire
 
 the compiler's one binary codec. a Sink puts little-endian numbers, LEB128
-numbers and byte runs, and a Source takes them back. the formats the
+numbers and byte runs, and a Source takes back the fixed-width numbers and
+byte runs. the formats the
 compiler writes and reads (the link carrier, object snapshots, cache records,
 the digest memo, recorded warnings, query fingerprints and cache keys) are
 each a sequence of these. both fail sticky: once an operation fails every

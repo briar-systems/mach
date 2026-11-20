@@ -5,9 +5,10 @@
 `mach init`, which scaffolds a project: its manifest, entry file and std dependency
 
 the entry is `src/bin/main.mach` with a bin artifact, or under `--lib`
-`src/lib/<id>.mach` with a static artifact. std is declared at the caret range of the
-release resolution picks for the running compiler, which is resolved before anything is
-written, so a project is made whole or not at all, and is then checked out. `--no-deps`
+`src/lib/<id>.mach` with a static artifact. std is declared at the selection the running
+compiler states for it, a followed ref as written or the caret range of the newest release in
+a stated range, resolved before anything is written, so a project is made whole or not at
+all, and is then checked out. `--no-deps`
 declares no dependency and reads nothing from the network. a project made in a git
 repository ignores its work directory.
 
@@ -34,8 +35,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.cli.args`](../arg
 pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 ```
 
-`mach init`: scaffold a project. the positional names the directory (default the working
-directory) and, unless `--name` is given, the project id: the directory's name, with each '-'
+`mach init`: scaffold a project. the positional names the directory and, unless `--name` is given, the project id: the directory's name, with each '-'
 written as '_' where the name is not a project id as written. an absent directory is created
 whole; an existing one is filled in, and `--force` allows overwriting mach.toml and the entry
 file. the entry is src/bin/main.mach and a bin artifact, or with `--lib` src/lib/\<id>.mach and

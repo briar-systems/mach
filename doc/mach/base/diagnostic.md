@@ -91,7 +91,7 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`text_retain`](#text_retain) | the interner's copy of a borrowed `text`, which outlives the storage `text` came from |
 | [`text_intern`](#text_intern) | `text`, owned by `a`, moved into the interner: the interned copy outlives `a`'s storage, and `text` is released either way |
 | [`format_intern`](#format_intern) | `fmt` formatted with `va` through `a` as scratch and interned, so the text outlives `a`'s storage |
-| [`refusal_interned`](#refusal_interned) | `fail.refusal` of `op` with its text interned, so the failure outlives `a`'s storage; an internal failure carries a static text and is returned as it is |
+| [`refusal_interned`](#refusal_interned) | `fail.refusal` of `op` with its text interned, so the failure outlives `a`'s storage; a failure that stands in for the text carries a static one and is returned as it is |
 | [`suggestion_build`](#suggestion_build), [`fix_label_replace`](#fix_label_replace) | |
 
 ---
@@ -679,7 +679,8 @@ pub fun refusal_interned(itn: *mach.base.intern.Interner, a: *std.allocator.Allo
 ```
 
 `fail.refusal` of `op` with its text interned, so the failure outlives `a`'s
-storage; an internal failure carries a static text and is returned as it is
+storage; a failure that stands in for the text carries a static one and is
+returned as it is
 
 ### suggestion_build
 

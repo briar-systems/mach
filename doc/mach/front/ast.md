@@ -28,7 +28,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`names_remap`](#names_remap) | every name the tree holds an id of, renamed through `remap`: the ids a parse made in a name table of its own, as the table it was merged into names them |
 | [`add_path_name`](#add_path_name) | the id of one segment of a named type's path, after the segments before it |
 | [`add_decorator`](#add_decorator) | |
-| [`literal_bytes_reserve`](#literal_bytes_reserve) | a table over storage the caller owns, for a test that builds nodes in place room for `n` more bytes at the end of the literal byte table, which literal_bytes_take then claims |
+| [`literal_bytes_reserve`](#literal_bytes_reserve) | room for `n` more bytes at the end of the literal byte table, which literal_bytes_take then claims |
 | [`literal_bytes_take`](#literal_bytes_take) | claims the first `n` reserved bytes as one literal's value |
 | [`lit_str_value`](#lit_str_value) | the decoded bytes a string literal names |
 | [`mark`](#mark), [`rollback`](#rollback) | |
@@ -214,7 +214,6 @@ pub fun add_decorator(a: *Ast, d: mach.front.ast.decl.Decorator) res[u32, mach.b
 pub fun literal_bytes_reserve(a: *Ast, n: usize) res[*u8, mach.base.fail.Fail]
 ```
 
-a table over storage the caller owns, for a test that builds nodes in place
 room for `n` more bytes at the end of the literal byte table, which literal_bytes_take
 then claims
 

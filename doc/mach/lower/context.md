@@ -120,7 +120,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`gate_of`](#gate_of) | the verdict sema gave a statement gate in the frame the code is read through |
 | [`each_array`](#each_array) | the published value of the array sema typed the `$each` at `stmt` over, in the frame the code is read through |
 | [`iteration_frame`](#iteration_frame) | the frame of iteration `index` of the `$each` at `stmt` under the current frame |
-| [`decl_ret_sem`](#decl_ret_sem), [`function_return_ir`](#function_return_ir) | |
+| [`decl_ret_sem`](#decl_ret_sem) | |
 | [`lower_fn_sig`](#lower_fn_sig) | the signature of the function `did` declares |
 | [`fn_sig_of_type`](#fn_sig_of_type) | the signature a value of the source function type `tid` is called through |
 | [`c_variadic_fixed`](#c_variadic_fixed) | how many parameters the C-variadic function type `tid` names, none for any other type |
@@ -1283,12 +1283,6 @@ the frame of iteration `index` of the `$each` at `stmt` under the current frame
 
 ```mach
 pub fun decl_ret_sem(lc: *LowerContext, did: mach.front.ast.id.DeclId) mach.type.kind.TypeId
-```
-
-### function_return_ir
-
-```mach
-pub fun function_return_ir(lc: *LowerContext, did: mach.front.ast.id.DeclId) res[Type, mach.base.fail.Fail]
 ```
 
 ### lower_fn_sig

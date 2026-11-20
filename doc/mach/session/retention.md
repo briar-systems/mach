@@ -20,7 +20,6 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | On `RetainerId` | |
 | :--- | :--- |
 | [`RETAINER_SESSION`](#retainerid) | the retainer a session records under until a caller names another |
-| [`retainer_same`](#retainer_same) | |
 
 | On `Retention` | |
 | :--- | :--- |
@@ -45,12 +44,6 @@ a retainer's slot in the retention table
 | Name | Value | |
 | :--- | :--- | :--- |
 | `RETAINER_SESSION` | `0` | the retainer a session records under until a caller names another |
-
-### retainer_same
-
-```mach
-pub fun retainer_same(left: RetainerId, right: RetainerId) bool
-```
 
 ## Retention
 

@@ -154,6 +154,6 @@ one declassification of the source, a `:>T`
 | `file` | `str` | the path of its file |
 | `line` | `usize` | its line, from 1 |
 | `column` | `usize` | its column, from 1 |
-| `function` | `str` | the function it stands in, "" at module scope |
+| `function` | `str` | the function or `test <name>` it stands in, "\<module>" outside both |
 | `secret` | `str` | the type of the value it declassifies, as the source spells it |
 

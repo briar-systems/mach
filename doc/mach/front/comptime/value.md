@@ -7,7 +7,7 @@ casts between scalars
 
 Source: [`src/front/comptime/value.mach`](../../../../src/front/comptime/value.mach)
 
-Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`mach.base.float`](../../base/float.md), [`mach.base.intern`](../../base/intern.md), [`mach.base.wide`](../../base/wide.md), [`mach.front.ast`](../ast.md), [`mach.front.ast.expr`](../ast/expr.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.comptime.failure`](failure.md), [`mach.target.facts`](../../target/facts.md), [`mach.type`](../../type.md), [`mach.type.kind`](../../type/kind.md).
+Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`mach.base.fail`](../../base/fail.md), [`mach.base.float`](../../base/float.md), [`mach.base.intern`](../../base/intern.md), [`mach.base.wide`](../../base/wide.md), [`mach.front.ast`](../ast.md), [`mach.front.ast.expr`](../ast/expr.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.comptime.failure`](failure.md), [`mach.target.facts`](../../target/facts.md), [`mach.type`](../../type.md), [`mach.type.kind`](../../type/kind.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -23,7 +23,9 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 
 | On `CTValue` | |
 | :--- | :--- |
-| [`internal_failure`](#internal_failure), [`reject`](#reject), [`awaiting`](#awaiting), [`cast_int`](#cast_int) | |
+| [`internal_failure`](#internal_failure), [`reject`](#reject) | |
+| [`reject_formatted`](#reject_formatted) | the refusal `diag` with a message formatted on the allocator of `itn`, interned so it outlives the evaluation while the formatted copy is freed |
+| [`awaiting`](#awaiting), [`cast_int`](#cast_int) | |
 | [`nan_unspecified`](#nan_unspecified) | the refusal of a float operation whose result is a NaN at width `w` on the instruction set `arch_id`, whose rule `nans` gives no defined NaN for it: no constant has that value |
 | [`cast_scalar`](#cast_scalar) | a numeric conversion folds through mirl's conversion rows |
 | [`is_descriptor`](#is_descriptor), [`apply_declared_int_type`](#apply_declared_int_type) | |
@@ -109,6 +111,15 @@ pub fun internal_failure(message: str) res[CTValue, mach.front.comptime.failure.
 ```mach
 pub fun reject(diag: mach.base.diagnostic.kind.Kind, message: str) res[CTValue, mach.front.comptime.failure.EvalFail]
 ```
+
+### reject_formatted
+
+```mach
+pub fun reject_formatted(itn: *mach.base.intern.Interner, diag: mach.base.diagnostic.kind.Kind, res_text: res[str, mach.base.fail.Fail]) res[CTValue, mach.front.comptime.failure.EvalFail]
+```
+
+the refusal `diag` with a message formatted on the allocator of `itn`, interned so it
+outlives the evaluation while the formatted copy is freed
 
 ### awaiting
 

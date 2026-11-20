@@ -20,7 +20,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`Removed`](#removed) | `rec` | a spelling an earlier version took, refused by name with what replaced it |
 | [`Conflict`](#conflict) | `rec` | two flags a command refuses together |
 | [`Policy`](#policy) | `rec` | what mach holds a command's line to beyond what std.args parses |
-| [`Call`](#call) | `rec` |  |
+| [`Call`](#call) | `rec` | what dispatch hands a command's handler; dispatch owns every member and outlives the call |
 
 | On `CliArgs` | |
 | :--- | :--- |
@@ -35,6 +35,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | :--- | :--- |
 | [`refusal`](#refusal) | a parsed line's refusal as a failure, in mach's words where mach knows more of the option than the parser and the parser's words otherwise |
 | [`run`](#run) | run a parsed line and report how it ended through one report, in the format `--diagnostics` selects, human when that format is itself malformed: its refusal when it holds one, then a flag combination the command refuses, otherwise the handler, given an arena this call owns |
+| [`refuse`](#refuse) | report a parsed line's refusal through one report, in the format `--diagnostics` selects, human when that format is itself malformed |
 
 | Functions | |
 | :--- | :--- |
@@ -280,6 +281,22 @@ failure the handler returns is reported here
 | `handler` | what runs |
 | **returns** | the exit code |
 
+### refuse
+
+```mach
+pub fun refuse(a: *std.allocator.Allocator, inv: *std.args.Parsed, policy: *Policy) i64
+```
+
+report a parsed line's refusal through one report, in the format `--diagnostics` selects, human
+when that format is itself malformed
+
+| Parameter | |
+| :--- | :--- |
+| `a` | owns the refusal's text |
+| `inv` | the parsed line, which holds a refusal |
+| `policy` | the matched command's policy |
+| **returns** | the exit code |
+
 ## Call
 
 ```mach
@@ -294,6 +311,17 @@ pub rec Call {
     sources: *mach.base.source.SourceMap;
 }
 ```
+
+what dispatch hands a command's handler; dispatch owns every member and outlives the call
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `a` | `*std.allocator.Allocator` | an arena dispatch releases once the handler returns, for what lives as long as the command |
+| `backing` | `*std.allocator.Allocator` | the heap under a, for what the command frees itself before it returns |
+| `spans` | `*std.allocator.heap.Pool` | the spans every heap of the command draws from and gives back to |
+| `inv` | `*std.args.Parsed` | the parsed command line |
+| `report` | `*mach.cli.diagnostic.Report` | where the command reports a failure it goes on past or that carries an origin, in the format `--diagnostics` selected |
+| `environ` | `std.process.exec.Environment` | the environment the command runs in, which the processes it starts inherit |
 
 ## Functions
 

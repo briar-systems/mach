@@ -15,6 +15,7 @@ Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.
 | [`UniReports`](#unireports) | `rec` |  |
 | [`SecrecyWalk`](#secrecywalk) | `rec` | the walk the union-secrecy checks of every annotation in one scope share, under the one substitution the scope is typed with, so a type several annotations reach is walked once |
 | [`Guard`](#guard) | `rec` | one lexical payload guard: the tag place and the case it is known to hold; frames live on the walker's stack and chain through `prev` |
+| [`Hold`](#hold) | `tag` | what a payload access finds among the open guards |
 | [`Offer`](#offer) | `rec` | a fix an error offers: `close` at `tail`, and with `open` set, `open` at `head` too, as one fix labelled `label` |
 | [`Typing`](#typing) | `rec` | the typing of one module that every walk of it shares: the instances it asks for, its growing cycles, and the reports each instance would otherwise repeat |
 | [`ModuleView`](#moduleview) | `rec` | the module a walk reads and the typing tables it writes: the module being typed, or the declaring module of an instance |
@@ -189,12 +190,29 @@ substitution the scope is typed with, so a type several annotations reach is wal
 pub rec Guard {
     place:     mach.front.ast.id.ExprId;
     case_name: mach.base.intern.StrId;
+    ended:     bool;
+    hidden_by: mach.front.ast.id.StmtId;
     prev:      *Guard;
 }
 ```
 
 one lexical payload guard: the tag place and the case it is known to hold; frames live on the
-walker's stack and chain through `prev`
+walker's stack and chain through `prev`. `ended` is set where an assignment moves the place's
+spelling onto storage nothing tested, and holds for the rest of the region. `hidden_by` is the
+`fin` whose body is being walked when the rest of that fin's block ends the guard, STMT_NIL
+otherwise
+
+## Hold
+
+```mach
+pub tag Hold: u8 {
+    none;
+    held;
+    ended;
+}
+```
+
+what a payload access finds among the open guards
 
 ## Offer
 
@@ -361,6 +379,7 @@ pub rec Walk {
     in_test:          bool;
     timed:            u8;
     guards:           *Guard;
+    block:            mach.base.source.Span;
     expanding:        *Expansion;
 }
 ```
@@ -378,6 +397,7 @@ sets it
 | `loop_depth` | `u32` | the loops entered since the body a jump cannot leave began, a function's or a `fin`'s, so a `brk` or `cnt` at 0 has no loop to target |
 | `in_test` | `bool` | inside a `test` body, where a `ret` value is a status in 0..255 |
 | `timed` | `u8` | the constant-time mode of the function whose body is walked, `TIMED_NONE` outside one |
+| `block` | `mach.base.source.Span` | the innermost block statement walked, whose end is where a `fin` in it replays |
 | `expanding` | `*Expansion` | the aliases whose definitions the walk is inside, innermost first, nil at none |
 
 ### walk_make

@@ -19,7 +19,7 @@ Uses types from [`mach.base.fail`](fail.md), [`mach.base.intern`](intern.md), [`
 
 | On `Domain` | |
 | :--- | :--- |
-| [`DOMAIN_SUBSYSTEM`](#domain), [`DOMAIN_BUILD_GOAL`](#domain), [`DOMAIN_ARCH`](#domain), [`DOMAIN_ABI`](#domain), [`DOMAIN_OS`](#domain), [`DOMAIN_BUILD_STEP`](#domain), [`DOMAIN_OF`](#domain), [`DOMAIN_DEBUG`](#domain), [`DOMAIN_TARGET_MODEL`](#domain), [`DOMAIN_BACKEND`](#domain), [`DOMAIN_IMAGE`](#domain), [`DOMAIN_FS_POLICY`](#domain), [`put_domain_u8`](#put_domain_u8), [`put_domain_u32`](#put_domain_u32), [`put_domain_u64`](#put_domain_u64), [`put_domain_bytes`](#put_domain_bytes), [`put_domain_str`](#put_domain_str) | |
+| [`DOMAIN_BUILD_GOAL`](#domain), [`DOMAIN_ARCH`](#domain), [`DOMAIN_ABI`](#domain), [`DOMAIN_OS`](#domain), [`DOMAIN_BUILD_STEP`](#domain), [`DOMAIN_OF`](#domain), [`DOMAIN_IMAGE`](#domain), [`put_domain_u8`](#put_domain_u8), [`put_domain_u64`](#put_domain_u64), [`put_domain_bytes`](#put_domain_bytes), [`put_domain_str`](#put_domain_str) | |
 
 | Functions | |
 | :--- | :--- |
@@ -40,29 +40,18 @@ pub def Domain: u16
 
 | Name | Value | |
 | :--- | :--- | :--- |
-| `DOMAIN_SUBSYSTEM` | `1` |  |
 | `DOMAIN_BUILD_GOAL` | `2` |  |
 | `DOMAIN_ARCH` | `3` |  |
 | `DOMAIN_ABI` | `4` |  |
 | `DOMAIN_OS` | `5` |  |
 | `DOMAIN_BUILD_STEP` | `6` |  |
 | `DOMAIN_OF` | `7` |  |
-| `DOMAIN_DEBUG` | `8` |  |
-| `DOMAIN_TARGET_MODEL` | `9` |  |
-| `DOMAIN_BACKEND` | `10` |  |
 | `DOMAIN_IMAGE` | `11` |  |
-| `DOMAIN_FS_POLICY` | `12` |  |
 
 ### put_domain_u8
 
 ```mach
 pub fun put_domain_u8(s: *mach.base.wire.Sink, domain: Domain, schema_version: u8, value: u8)
-```
-
-### put_domain_u32
-
-```mach
-pub fun put_domain_u32(s: *mach.base.wire.Sink, domain: Domain, schema_version: u8, value: u32)
 ```
 
 ### put_domain_u64

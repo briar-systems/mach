@@ -29,7 +29,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 | [`param_at`](#param_at), [`declaration_has_comptime_param`](#declaration_has_comptime_param) | |
 | [`declaration_has_instances`](#declaration_has_instances) | a generic, comptime-parameter or pack function has instances in place of one definition |
 | [`template_of`](#template_of) | the template part, none for a module with no generic, comptime-parameter or pack function |
-| [`exported_add`](#exported_add), [`exported_count`](#exported_count), [`exported_at`](#exported_at) | |
+| [`exported_add`](#exported_add) | |
 
 | Constants | |
 | :--- | :--- |
@@ -187,18 +187,6 @@ the template part, none for a module with no generic, comptime-parameter or pack
 
 ```mach
 pub fun exported_add(iface: *Interface, e: Exported) err[mach.base.fail.Fail]
-```
-
-### exported_count
-
-```mach
-pub fun exported_count(iface: *Interface) u32
-```
-
-### exported_at
-
-```mach
-pub fun exported_at(iface: *Interface, ord: u32) *Exported
 ```
 
 ## Reader

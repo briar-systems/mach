@@ -27,8 +27,8 @@ the `mach` entry point: route the arguments to one command and return its exit c
 renders the page of the command it follows in place of running it, whatever else the line is
 refused for but an unknown command, and `--version` before a command prints the version alone.
 with no command the overview prints and the code is 1, and an unknown command is refused with
-the overview after it; otherwise args.run reports a refusal or a refused combination, or runs
-the command
+the overview after it. a refusal is reported in the format `--diagnostics` selects, and
+otherwise args.run reports a refused combination or runs the command
 
 | Parameter | |
 | :--- | :--- |

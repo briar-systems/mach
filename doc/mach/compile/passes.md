@@ -24,11 +24,11 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`back_half_key_for`](#back_half_key_for) | the normal object's key, the same in every build that compiles the module |
 | [`test_key_for`](#test_key_for) | |
 | [`has_test_object`](#has_test_object) | the module gets a test object in this build: a test build, and a module whose source declares a test or a `#[testing]` declaration |
-| [`codegen_reusable`](#codegen_reusable), [`test_build`](#test_build) | |
+| [`test_build`](#test_build) | |
 | [`prepare_codegen_pass`](#prepare_codegen_pass) | the import libraries the declarations name, which every lowering reads, registered before any is |
 | [`run_test_pass`](#run_test_pass) | the test stage's computation: each test object's typed inputs, then each test object |
 | [`run_codegen_pass`](#run_codegen_pass) | each module in topological order, its front-end products given back once its own unit is done |
-| [`test_codegen_reusable`](#test_codegen_reusable) | the test object's codegen product is current or cached, so no worker generates it |
+| [`codegen_modules_reached`](#codegen_modules_reached) | how many modules, in topological order, the codegen pass lowered or would have: every one for an artifact taken whole, whose one unit lowers them all, else those up to the unit it reached |
 | [`compile_module`](#compile_module) | the mirl module `m`, the project's own, compiled into an object, which owns its storage in the session's backing allocator, the warnings mirl gave reported on `diags` |
 | [`run_link_pass`](#run_link_pass) | the link stage's computation: the current objects, then the link the build's job names, which runs only when one of its inputs moved |
 | [`prepare_link`](#prepare_link) | before the link stage's operation: when the artifact on disk is not what the link last wrote to `artifact`, or nothing was linked yet, LINK_ARTIFACT moves to a value it never held, the database's next revision, so the link runs again |
@@ -134,12 +134,6 @@ pub fun has_test_object(p: *mach.compile.project.Project, m: *mach.compile.proje
 the module gets a test object in this build: a test build, and a module whose
 source declares a test or a `#[testing]` declaration
 
-### codegen_reusable
-
-```mach
-pub fun codegen_reusable(p: *mach.compile.project.Project, mid: mach.session.module.ModuleId) res[bool, mach.base.fail.Fail]
-```
-
 ### test_build
 
 ```mach
@@ -177,13 +171,14 @@ made from the released products are made before it: the instances once sema is d
 identities before the first unit (identities_made). a read of a released product refuses
 (query.get, frontend.acquire_sema). a test build lowers every module again and gives back none
 
-### test_codegen_reusable
+### codegen_modules_reached
 
 ```mach
-pub fun test_codegen_reusable(p: *mach.compile.project.Project, mid: mach.session.module.ModuleId) res[bool, mach.base.fail.Fail]
+pub fun codegen_modules_reached(p: *mach.compile.project.Project) u32
 ```
 
-the test object's codegen product is current or cached, so no worker generates it
+how many modules, in topological order, the codegen pass lowered or would have: every one for an artifact
+taken whole, whose one unit lowers them all, else those up to the unit it reached
 
 ### compile_module
 

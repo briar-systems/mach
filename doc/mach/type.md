@@ -38,7 +38,6 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.base.handle`](base/hand
 | [`get`](#get), [`type_count`](#type_count), [`get_param`](#get_param), [`prim`](#prim), [`is_integer`](#is_integer), [`is_numeric`](#is_numeric), [`is_float`](#is_float), [`is_pointer_like`](#is_pointer_like), [`is_pointer`](#is_pointer), [`deref_one`](#deref_one), [`is_secret`](#is_secret), [`is_vector`](#is_vector), [`vector_element`](#vector_element), [`vector_lanes`](#vector_lanes), [`element_count`](#element_count), [`vector_mask`](#vector_mask), [`strip_secret`](#strip_secret) | |
 | [`mentions_generic_param`](#mentions_generic_param) | whether `tid` mentions a type parameter anywhere it is spelled; it never fails |
 | [`shape_kind`](#shape_kind), [`is_u8`](#is_u8), [`is_u1`](#is_u1) | |
-| [`carries_secret`](#carries_secret) | whether `tid` is secret or reaches a secret through pointers and array elements alone |
 | [`contains_secret`](#contains_secret) | true when any byte of a value of this type may be secret: the type itself, an element, a field or a case payload; a pointer's pointee is not the object's storage and does not count |
 | [`type_scan_begin`](#type_scan_begin), [`type_scan_end`](#type_scan_end), [`type_scan_mark`](#type_scan_mark), [`pair_scan_begin`](#pair_scan_begin), [`pair_scan_end`](#pair_scan_end), [`pair_scan_mark`](#pair_scan_mark), [`intern_pointer`](#intern_pointer), [`intern_secret`](#intern_secret), [`intern_array`](#intern_array), [`intern_vector`](#intern_vector) | |
 | [`intern_window`](#intern_window) | the type of the window `object[start, count]`, its one owner: `count` lanes of a vector as a vector of that width, or `count` elements of an array or through a pointer as `[count]T`; a secret object gives a secret window, as a whole read of it is secret |
@@ -77,7 +76,6 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.base.handle`](base/hand
 | [`HANDLE_PART_WORD`](#constants) | a minted handle's constructor is the interned name of the kind the target's family mints, as `spirv.image`, and its operands are pairs, the part then its value: a word is the number itself, a type operand the type's id, and a named one the interned name of an enumerant its row's grammar states |
 | [`HANDLE_PART_TYPE`](#constants), [`HANDLE_PART_NAME`](#constants), [`ABI_TYPE_VA_LIST`](#constants) | |
 | [`FACT_PARAM`](#constants) | a generic parameter is spelled in the type: itself, or under a pointer, secret or array, in a signature or as an instance's argument |
-| [`FACT_CARRIES_SECRET`](#constants) | the type is secret, or reaches a secret through pointers and array elements alone |
 | [`FACT_CARRIES_HANDLE`](#constants) | the type is a handle, or reaches one through pointers, arrays and secrets alone |
 
 ---
@@ -394,14 +392,6 @@ pub fun is_u8(ti: *TypeInterner, tid: TypeId) bool
 ```mach
 pub fun is_u1(ti: *TypeInterner, tid: TypeId) bool
 ```
-
-### carries_secret
-
-```mach
-pub fun carries_secret(ti: *TypeInterner, tid: TypeId) bool
-```
-
-whether `tid` is secret or reaches a secret through pointers and array elements alone
 
 ### contains_secret
 
@@ -805,6 +795,5 @@ pub fun is_valid_discriminator_kind(k: TypeKind) bool
 | `HANDLE_PART_NAME` | `u32` | `2` |  |
 | `ABI_TYPE_VA_LIST` | `u32` | `0` |  |
 | `FACT_PARAM` | `u8` | `1` | a generic parameter is spelled in the type: itself, or under a pointer, secret or array, in a signature or as an instance's argument |
-| `FACT_CARRIES_SECRET` | `u8` | `2` | the type is secret, or reaches a secret through pointers and array elements alone |
 | `FACT_CARRIES_HANDLE` | `u8` | `4` | the type is a handle, or reaches one through pointers, arrays and secrets alone |
 

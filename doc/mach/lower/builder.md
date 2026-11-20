@@ -39,14 +39,13 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`enter`](#enter) | build in function `f`, whose entry block takes `params`, each secret as `secrets` says |
 | [`seal`](#seal) | end every block left open with unreachable: a block nothing branches to, such as the one after a return |
 | [`leave`](#leave) | leave the function: nothing is built until the next is entered |
-| [`in_function`](#in_function), [`function`](#function), [`entry_block`](#entry_block), [`block_make`](#block_make) | |
+| [`in_function`](#in_function), [`function`](#function), [`block_make`](#block_make) | |
 | [`block_make_with`](#block_make_with) | a block whose parameters are `params`, which every edge into it passes |
 | [`block_param`](#block_param) | parameter `i` of block `k`, typed `ty` |
-| [`set_block`](#set_block), [`current_block`](#current_block), [`block_terminated`](#block_terminated) | |
+| [`set_block`](#set_block), [`block_terminated`](#block_terminated) | |
 | [`terminated`](#terminated) | whether the block being built already ends |
 | [`set_loc`](#set_loc), [`current_loc`](#current_loc) | |
 | [`location_of`](#location_of) | the debug table's location of a source location, none when it has no file |
-| [`debug_location`](#debug_location) | the debug location the next instructions are built for |
 | [`set_secret`](#set_secret) | whether the next instructions are marked secret: a load, call or atomic read of a secret |
 | [`set_access`](#set_access) | the next accesses through an address state the memory they read or write as the source type says: secret, which marks them so, or public |
 | [`end_access`](#end_access) | the next accesses state nothing of the memory they reach |
@@ -370,12 +369,6 @@ pub fun in_function(b: *Builder) bool
 pub fun function(b: *Builder) mirl.ir.id.Function
 ```
 
-### entry_block
-
-```mach
-pub fun entry_block(b: *Builder) mirl.ir.id.Block
-```
-
 ### block_make
 
 ```mach
@@ -402,12 +395,6 @@ parameter `i` of block `k`, typed `ty`
 
 ```mach
 pub fun set_block(b: *Builder, k: mirl.ir.id.Block)
-```
-
-### current_block
-
-```mach
-pub fun current_block(b: *Builder) mirl.ir.id.Block
 ```
 
 ### block_terminated
@@ -443,14 +430,6 @@ pub fun location_of(b: *Builder, loc: mach.base.source.Location) opt[mirl.ir.deb
 ```
 
 the debug table's location of a source location, none when it has no file
-
-### debug_location
-
-```mach
-pub fun debug_location(b: *Builder) opt[mirl.ir.debug.record.Location]
-```
-
-the debug location the next instructions are built for
 
 ### set_secret
 

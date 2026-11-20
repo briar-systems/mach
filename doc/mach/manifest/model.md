@@ -69,6 +69,8 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 | :--- | :--- |
 | [`init`](#init) | a manifest with every array nil and every count 0 |
 | [`dnit`](#dnit) | free every array a parsed manifest owns and zero the counts |
+| [`effective_target_count`](#effective_target_count) | how many targets a build of the manifest can produce: the declared ones, or the host target synthesized for a manifest that declares none |
+| [`effective_target`](#effective_target) | the target at `i` of the set `effective_target_count` counts |
 
 | Functions | |
 | :--- | :--- |
@@ -678,6 +680,29 @@ result of `init` and on a manifest already released
 | :--- | :--- |
 | `m` | the manifest |
 | `alloc` | the allocator `parse` was given |
+
+### effective_target_count
+
+```mach
+pub fun effective_target_count(m: *Manifest) u32
+```
+
+how many targets a build of the manifest can produce: the declared ones, or
+the host target synthesized for a manifest that declares none
+
+### effective_target
+
+```mach
+pub fun effective_target(m: *Manifest, i: u32) *TargetDef
+```
+
+the target at `i` of the set `effective_target_count` counts
+
+| Parameter | |
+| :--- | :--- |
+| `m` | the manifest |
+| `i` | the index, below `effective_target_count(m)` |
+| **returns** | the target definition |
 
 ## Functions
 

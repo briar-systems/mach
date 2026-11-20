@@ -150,7 +150,7 @@ what happened to a capture file
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `bytes` | `usize` | captured bytes read back and kept |
+| `bytes` | `usize` | captured bytes read back, kept only when owned |
 | `truncated` | `bool` | the child wrote more than the capture limit |
 | `short_read` | `bool` | the read back ended before the bytes the file held |
 | `read_failed` | `bool` | the read back failed, or the capture was abandoned |

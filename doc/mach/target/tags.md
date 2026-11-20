@@ -19,7 +19,6 @@ Source: [`src/target/tags.mach`](../../../src/target/tags.mach)
 | [`arch_id`](#arch_id) | the id of mink's architecture `a`, NONE for one its list does not hold |
 | [`sys_named`](#sys_named) | the id of the system spelled `name`, NONE for a spelling mink's list does not hold |
 | [`arch_named`](#arch_named) | the id of the architecture spelled `name`, NONE for a spelling mink's list does not hold |
-| [`sys_name`](#sys_name) | the name of the system tag `id`, "unknown" for NONE or an id past the list |
 | [`arch_name`](#arch_name) | the name of the architecture tag `id`, "unknown" for NONE or an id past the list |
 | [`abi_id`](#abi_id) | the id of mink's convention row `row`: the id of its spelling, which every row of that spelling shares, NONE for a row no family of mink's architectures names |
 | [`abi_named`](#abi_named) | the id of the calling convention spelled `name`: one per distinct spelling the families name, NONE for a spelling none names |
@@ -67,14 +66,6 @@ pub fun arch_named(name: str) u32
 ```
 
 the id of the architecture spelled `name`, NONE for a spelling mink's list does not hold
-
-### sys_name
-
-```mach
-pub fun sys_name(id: u32) str
-```
-
-the name of the system tag `id`, "unknown" for NONE or an id past the list
 
 ### arch_name
 

@@ -24,7 +24,6 @@ Uses types from [`mach.base.source`](../source.md).
 | On `Fix` | |
 | :--- | :--- |
 | [`fix_none`](#fix_none) | a fix carrying no rewrite |
-| [`fix_present`](#fix_present) | whether the fix carries a rewrite |
 | [`fix_dnit`](#fix_dnit) | release a fix's label, each edit's replacement and the edit storage, allocated through `a` |
 | [`fix_copy`](#fix_copy) | a copy of `src` owning its label, its edits and their replacements through `a`, released with `fix_dnit` |
 
@@ -88,14 +87,6 @@ pub fun fix_none() Fix
 ```
 
 a fix carrying no rewrite
-
-### fix_present
-
-```mach
-pub fun fix_present(fx: *Fix) bool
-```
-
-whether the fix carries a rewrite
 
 ### fix_dnit
 

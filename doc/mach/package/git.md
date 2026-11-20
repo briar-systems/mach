@@ -34,7 +34,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.host.environment`](.
 
 | Functions | |
 | :--- | :--- |
-| [`count_nil_terminated`](#count_nil_terminated), [`object_id_valid`](#object_id_valid) | |
+| [`object_id_valid`](#object_id_valid) | |
 
 | Constants | |
 | :--- | :--- |
@@ -208,12 +208,6 @@ pub fun bytes_dnit(alloc: *std.allocator.Allocator, bytes: *Bytes)
 ```
 
 ## Functions
-
-### count_nil_terminated
-
-```mach
-pub fun count_nil_terminated(arr: **u8) usize
-```
 
 ### object_id_valid
 

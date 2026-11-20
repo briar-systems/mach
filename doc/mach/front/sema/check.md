@@ -16,7 +16,7 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 | Functions | |
 | :--- | :--- |
 | [`check_coercible`](#check_coercible), [`check_call`](#check_call), [`check_comptime_call`](#check_comptime_call), [`imported_module_const_sym`](#imported_module_const_sym), [`check_index`](#check_index), [`check_const_index`](#check_const_index) | |
-| [`check_range_count`](#check_range_count) | the count of a range `x[i, n]`: a comptime constant, at least one |
+| [`check_range_count`](#check_range_count) | the count of a range `x[i, n]`: an integer comptime constant, at least one |
 | [`check_const_range`](#check_const_range) | a constant start must keep the whole range inside an array or a vector: `start + count` may reach the length and not pass it |
 | [`const_index_value`](#const_index_value) | |
 | [`check_shift_count`](#check_shift_count) | a shift whose count is a comptime constant must keep the count below the left operand's width: at or above it the runtime answer is the saturated value (0, or the sign fill), which a constant program never means |
@@ -79,11 +79,11 @@ pub fun check_const_index(sc: *mach.front.sema.context.SemaContext, object: mach
 ### check_range_count
 
 ```mach
-pub fun check_range_count(sc: *mach.front.sema.context.SemaContext, count: mach.front.ast.id.ExprId) opt[u32]
+pub fun check_range_count(sc: *mach.front.sema.context.SemaContext, count: mach.front.ast.id.ExprId, count_type: mach.type.kind.TypeId) opt[u32]
 ```
 
-the count of a range `x[i, n]`: a comptime constant, at least one. absent,
-reported at the count, when it is not
+the count of a range `x[i, n]`: an integer comptime constant, at least one.
+absent, reported at the count, when it is not
 
 ### check_const_range
 
@@ -127,7 +127,7 @@ the refusal of `access` read through the untyped `ptr`, which names no type to r
 ### check_member
 
 ```mach
-pub fun check_member(sc: *mach.front.sema.context.SemaContext, object: mach.type.kind.TypeId, name: mach.base.intern.StrId, guarded: bool, span: mach.base.source.Span) opt[mach.type.kind.TypeId]
+pub fun check_member(sc: *mach.front.sema.context.SemaContext, object: mach.type.kind.TypeId, name: mach.base.intern.StrId, hold: mach.front.sema.context.Hold, span: mach.base.source.Span) opt[mach.type.kind.TypeId]
 ```
 
 ### check_cast

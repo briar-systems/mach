@@ -28,10 +28,6 @@ Uses types from [`mach.type.kind`](../kind.md), [`mach.type.query`](../query.md)
 | :--- | :--- |
 | [`pointer_names`](#pointer_names) | the record or union a pointer to `ptr`'s base names instead of spelling it, when that base lies on a cycle with the record or union `path` is spelling it inside |
 
-| Functions | |
-| :--- | :--- |
-| [`on_cycle`](#on_cycle) | whether record or union `tid` reaches itself through its members |
-
 | Constants | |
 | :--- | :--- |
 | [`RECURSIVE_MSG`](#constants), [`UNBOUNDED_MSG`](#constants) | |
@@ -76,16 +72,6 @@ pub fun pointer_names(q: *mach.type.query.Query, path: *Path, ptr: mach.type.kin
 
 the record or union a pointer to `ptr`'s base names instead of spelling it, when that
 base lies on a cycle with the record or union `path` is spelling it inside
-
-## Functions
-
-### on_cycle
-
-```mach
-pub fun on_cycle(q: *mach.type.query.Query, tid: mach.type.kind.TypeId) bool
-```
-
-whether record or union `tid` reaches itself through its members
 
 ## Constants
 

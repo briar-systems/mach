@@ -40,7 +40,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | :--- | :--- |
 | [`SYM_FUN`](#symkind), [`SYM_REC`](#symkind), [`SYM_DEF`](#symkind), [`SYM_VAL`](#symkind), [`SYM_VAR`](#symkind), [`SYM_PARAM`](#symkind), [`SYM_GENERIC`](#symkind), [`SYM_USE`](#symkind), [`SYM_IMPORTED`](#symkind) | |
 | [`SYM_TEST`](#symkind) | reached only by mach-lsp |
-| [`SYM_UNI`](#symkind), [`SYM_PRIM`](#symkind), [`SYM_VECTOR`](#symkind), [`SYM_TAG`](#symkind), [`sym_kind_valid`](#sym_kind_valid) | |
+| [`SYM_UNI`](#symkind), [`SYM_PRIM`](#symkind), [`SYM_VECTOR`](#symkind), [`SYM_TAG`](#symkind) | |
 
 | On `Symbol` | |
 | :--- | :--- |
@@ -174,12 +174,6 @@ pub def SymKind: u8
 | `SYM_PRIM` | `11` |  |
 | `SYM_VECTOR` | `12` |  |
 | `SYM_TAG` | `13` |  |
-
-### sym_kind_valid
-
-```mach
-pub fun sym_kind_valid(kind: SymKind) bool
-```
 
 ## Symbol
 

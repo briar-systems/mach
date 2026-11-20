@@ -19,8 +19,6 @@ Source: [`src/base/wide.mach`](../../../src/base/wide.mach)
 | On `Wide` | |
 | :--- | :--- |
 | [`zero`](#zero), [`make`](#make), [`from_u64`](#from_u64), [`from_i64`](#from_i64), [`is_zero`](#is_zero), [`eq`](#eq), [`lt_u`](#lt_u), [`lt_s`](#lt_s), [`is_negative`](#is_negative), [`add`](#add), [`sub`](#sub), [`neg`](#neg), [`max_u`](#max_u), [`min_s`](#min_s), [`not`](#not), [`and`](#and), [`or`](#or), [`xor`](#xor), [`mul_u64`](#mul_u64), [`mul`](#mul) | |
-| [`divmod_u`](#divmod_u) | a / b and a % b unsigned, none when b is zero |
-| [`divmod_s`](#divmod_s) | a / b and a % b signed, rounding toward zero, none when b is zero |
 | [`quot_rem_u`](#quot_rem_u) | a / b and a % b unsigned |
 | [`quot_rem_s`](#quot_rem_s) | a / b and a % b signed, rounding toward zero, total over a nonzero `b` as quot_rem_u is |
 | [`shl`](#shl), [`shr_u`](#shr_u), [`shr_s`](#shr_s), [`trunc`](#trunc), [`sext`](#sext), [`fits_unsigned`](#fits_unsigned) | |
@@ -163,22 +161,6 @@ pub fun mul_u64(a: u64, b: u64) Wide
 ```mach
 pub fun mul(a: Wide, b: Wide) Wide
 ```
-
-### divmod_u
-
-```mach
-pub fun divmod_u(a: Wide, b: Wide) opt[QuotRem]
-```
-
-a / b and a % b unsigned, none when b is zero
-
-### divmod_s
-
-```mach
-pub fun divmod_s(a: Wide, b: Wide) opt[QuotRem]
-```
-
-a / b and a % b signed, rounding toward zero, none when b is zero
 
 ### quot_rem_u
 

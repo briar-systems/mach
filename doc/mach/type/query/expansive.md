@@ -20,7 +20,6 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.type`](../../type
 | [`nominal`](#nominal) | whether generic nominal `generic` lies on an instantiation cycle that grows an argument, so it has unboundedly many instances; true, with nothing recorded, when a generic the cycle could pass through has no fields yet |
 | [`holds`](#holds) | whether `tid` holds, by value, an instance of an expansive generic |
 | [`instance_is`](#instance_is) | whether `tid` is an instance of an expansive generic |
-| [`holds_instance`](#holds_instance) | whether `tid` holds, by value, an instance of an expansive generic |
 
 ---
 
@@ -51,12 +50,4 @@ pub fun instance_is(types: *mach.type.TypeInterner, facts: *mach.type.query.Fact
 ```
 
 whether `tid` is an instance of an expansive generic
-
-### holds_instance
-
-```mach
-pub fun holds_instance(types: *mach.type.TypeInterner, facts: *mach.type.query.Facts, tid: mach.type.kind.TypeId) res[bool, mach.base.fail.Fail]
-```
-
-whether `tid` holds, by value, an instance of an expansive generic
 

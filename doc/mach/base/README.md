@@ -9,7 +9,7 @@ interned strings and handles, source locations, and plain utilities
 | :--- | :--- |
 | [`alloc`](alloc.md) | the compiler's allocation refusal, rendered once |
 | [`catalog`](catalog.md) | the refusal of a catalog member that no arm of a dispatch names |
-| [`checked`](checked.md) | checked arithmetic: counts, offsets, addresses, alignments and ids typed by their unit, and the narrowing conversions, each refusing overflow with a cause |
+| [`checked`](checked.md) | checked arithmetic refusing overflow with a cause |
 | [`diagnostic`](diagnostic.md) | diagnostics, the builder that assembles one and the store that collects them |
 | [`duration`](duration.md) | durations written as `<n>ms`, `<n>s`, `<n>m` or `<n>h`, parsed and rendered back |
 | [`fail`](fail.md) | the compiler's one failure type, and how a refusal of the machine becomes one |

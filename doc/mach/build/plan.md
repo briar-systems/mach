@@ -34,6 +34,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`plan_to_run`](#plan_to_run) | `plan`, with the plan's dependency closure located in `s` as `plan_dependency_requirements` locates it, so the plan is ready to run there |
 | [`plan_cells`](#plan_cells) | plan resolved cells for one profile: each cell's artifact on its target, and before it every artifact it requires |
 | [`configure`](#configure) | resolve every planned cell against the plan's dependency closure, filling in the exported dependency steps and export link requirements each cell consumes |
+| [`cell_request`](#cell_request) | the request cell `u` of `bp` builds for |
 | [`plan_dependency_requirements`](#plan_dependency_requirements) | locate the root's dependency closure, once, into the plan, and add the cells a dependency's export library requires to it |
 | [`check_plan_outputs`](#check_plan_outputs) | refuse two plans of one selection, one per profile, that would write one file: a `[project].work` without `{profile.name}` puts every profile's outputs at the same paths |
 | [`render`](#render) | render the effective plan: one block per selected cell, naming the project, target, profile, artifact, entry, output paths, ordered prerequisite steps and link requirements |
@@ -236,6 +237,15 @@ report it. nothing is fetched, no step runs and no output is written
 | `s` | the session the plan was made in |
 | `bp` | the plan, its closure located; mutated in place, each unit becomes `configured` |
 | **returns** | ok; the configuration failure of the first cell that has one |
+
+### cell_request
+
+```mach
+pub fun cell_request(bp: *BuildPlan, u: *BuildUnit) mach.compile.request.BuildRequest
+```
+
+the request cell `u` of `bp` builds for. `-o` names a selected cell's output,
+so a required cell keeps its declared one
 
 ### plan_dependency_requirements
 

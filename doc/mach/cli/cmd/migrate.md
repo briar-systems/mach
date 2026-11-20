@@ -14,7 +14,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.cli.args`](../arg
 
 | Functions | |
 | :--- | :--- |
-| [`run`](#run) | `mach migrate [<path>] [--check]` |
+| [`run`](#run) | `mach migrate <path> [--check]` |
 
 | Constants | |
 | :--- | :--- |
@@ -31,7 +31,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.cli.args`](../arg
 pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 ```
 
-`mach migrate [<path>] [--check]`
+`mach migrate <path> [--check]`
 
 | Parameter | |
 | :--- | :--- |
@@ -42,6 +42,6 @@ pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COMMAND` | `std.args.Command` | `std_args.Command{name: "migrate", aliases: args.NO_WORDS, help: "rewrite a project into this major's spelling", usage: "[<path>]", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: 1, passthrough: false}` | `mach migrate` |
+| `COMMAND` | `std.args.Command` | `std_args.Command{name: "migrate", aliases: args.NO_WORDS, help: "rewrite a project into this major's spelling", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: 1, passthrough: false}` | `mach migrate` |
 | `POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: args.NO_FLAGS, refusal: "", conflicts: args.NO_CONFLICTS}` | what mach holds `mach migrate` to beyond the parse |
 

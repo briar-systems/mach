@@ -16,7 +16,7 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 | [`Lever`](#lever) | `def` | a binary profile lever as the command line sets it |
 | [`Overrides`](#overrides) | `rec` | what a build-shaped command sets over the profile it builds, already typed; a lever or value left unset leaves the profile's |
 | [`BuildGoal`](#buildgoal) | `def` |  |
-| [`LinkToken`](#linktoken) | `rec` | reached only by mach-lsp |
+| [`LinkToken`](#linktoken) | `rec` | a `-l` value or path operand the build plan links |
 | [`BuildRequest`](#buildrequest) | `rec` | owner: "" for a cell of the root manifest, or the id of the closure dependency        whose export library requires the cell; `target` and        `artifact` then name that dependency's declarations |
 
 | On `Lever` | |
@@ -163,7 +163,7 @@ pub rec LinkToken {
 }
 ```
 
-reached only by mach-lsp
+a `-l` value or path operand the build plan links
 
 ## BuildRequest
 

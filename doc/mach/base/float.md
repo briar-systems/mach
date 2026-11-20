@@ -5,16 +5,15 @@
 binary floating point as the compiler computes it: formats, rounding, NaNs and decimals
 
 comptime folds and float literals are computed in f64 and rounded once to the format of their
-width, which is exact for every narrower format. a target states what a conversion makes of a
-NaN (`NanRule`). a decimal is parsed with its fit reported, and a value is printed back as the
-shortest decimal that rounds to it in its own format.
+width, which is exact for every narrower format. a NaN is carried bit-exactly, and what a target
+makes of one is its `Nans` rule in mach.target.facts. a decimal is parsed with its fit reported,
+and a value is printed back as the shortest decimal that rounds to it in its own format.
 
 Source: [`src/base/float.mach`](../../../src/base/float.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
 | [`FloatWidth`](#floatwidth) | `def` |  |
-| [`NanRule`](#nanrule) | `def` | what the target makes of a NaN it computes, a conversion between two float formats among them, which comptime folds by (see doc/language/operators.md) |
 | [`Format`](#format) | `rec` | a binary interchange format: its significand precision, the hidden bit counted, and the width of its exponent field |
 | [`Fit`](#fit) | `def` |  |
 | [`Rounded`](#rounded) | `rec` | a decimal rounded to one format: the value, carried exactly in an f64, and how it fit |
@@ -31,14 +30,6 @@ Source: [`src/base/float.mach`](../../../src/base/float.mach)
 | [`widths_agree`](#widths_agree), [`unify_width`](#unify_width) | |
 | [`parse_decimal`](#parse_decimal) | the decimal `s`, its first `len` bytes, rounded once to nearest with ties to even at `w` by std's parse and carried exactly in an f64, none when the parse refuses the text |
 | [`shortest`](#shortest) | the shortest round-trip decimal of a positive finite nonzero value representable in the format of `w`, by exact bignum arithmetic (Steele and White's dragon4) over that format's own neighbours, ties read the way round-to-nearest-even reads them back |
-
-| On `NanRule` | |
-| :--- | :--- |
-| [`NAN_RULE_NONE`](#nanrule) | no rule declared: a machine model that leaves it here is refused |
-| [`NAN_PRESERVE`](#nanrule) | the sign and the top of the payload kept, the quiet bit set: x86-64 and aarch64 |
-| [`NAN_CANONICAL`](#nanrule) | the canonical NaN, positive and quiet with an empty payload: RISC-V |
-| [`NAN_UNSPECIFIED`](#nanrule) | no NaN the target computes is specified, so comptime folds none: SPIR-V under Vulkan with no float-controls execution mode |
-| [`nan_rule_valid`](#nan_rule_valid) | |
 
 | On `Fit` | |
 | :--- | :--- |
@@ -156,28 +147,6 @@ own neighbours, ties read the way round-to-nearest-even reads them back
 | `v` | the value, carried in an f64 |
 | `w` | the width whose neighbours bound the round trip |
 | **returns** | its shortest digits and their exponent |
-
-## NanRule
-
-```mach
-pub def NanRule: u8
-```
-
-what the target makes of a NaN it computes, a conversion between two float formats
-among them, which comptime folds by (see doc/language/operators.md)
-
-| Name | Value | |
-| :--- | :--- | :--- |
-| `NAN_RULE_NONE` | `0` | no rule declared: a machine model that leaves it here is refused |
-| `NAN_PRESERVE` | `1` | the sign and the top of the payload kept, the quiet bit set: x86-64 and aarch64 |
-| `NAN_CANONICAL` | `2` | the canonical NaN, positive and quiet with an empty payload: RISC-V |
-| `NAN_UNSPECIFIED` | `4` | no NaN the target computes is specified, so comptime folds none: SPIR-V under Vulkan with no float-controls execution mode |
-
-### nan_rule_valid
-
-```mach
-pub fun nan_rule_valid(r: NanRule) bool
-```
 
 ## Format
 

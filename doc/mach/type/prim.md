@@ -48,7 +48,6 @@ Uses types from [`mach.base.float`](../base/float.md), [`mach.base.wide`](../bas
 | [`int_kind_for`](#int_kind_for) | the integer primitive of a width and signedness, absent when the catalog has no such row; the one lookup every width-driven typing goes through |
 | [`prim_from_view`](#prim_from_view), [`int_fits_either_sign`](#int_fits_either_sign) | |
 | [`float_width_of`](#float_width_of) | the width of a float kind; FLOAT_W_NONE for every other kind |
-| [`float_kind_of`](#float_kind_of) | the float kind of a width, f64 for FLOAT_W_NONE, the unsuffixed default |
 | [`is_vector_spelling`](#is_vector_spelling) | |
 
 | Constants | |
@@ -221,14 +220,6 @@ pub fun float_width_of(kind: TypeKind) mach.base.float.FloatWidth
 ```
 
 the width of a float kind; FLOAT_W_NONE for every other kind
-
-### float_kind_of
-
-```mach
-pub fun float_kind_of(w: mach.base.float.FloatWidth) TypeKind
-```
-
-the float kind of a width, f64 for FLOAT_W_NONE, the unsuffixed default
 
 ### is_vector_spelling
 

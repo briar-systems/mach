@@ -13,7 +13,7 @@ The directory's root module is [`mach.type.query`](../query.md).
 | Module | |
 | :--- | :--- |
 | [`areas`](areas.md) | how a tag's cases share bytes on the build's target: a byte of a tag is never public under one case and secret under another, so two cases share an area only where they agree on the class of every byte both cover, the comparison a union's variants must pass |
-| [`deep`](deep.md) | whether a type reaches a property anywhere, through pointers included, answered over the declarations so a generic that grows through a pointer still has a finite answer |
+| [`deep`](deep.md) | whether a type reaches a secret anywhere, through pointers included, answered over the declarations so a generic that grows through a pointer still has a finite answer |
 | [`expansive`](expansive.md) | whether a generic has unboundedly many instances, decided on the first question about it once its fields exist and recorded for the projection it was decided under |
 | [`extent`](extent.md) | the size, alignment and member offsets of a type, as mirl's data layout of the build's target lays it out: each source type is interned in a type table the laying holds, no module's, and mirl answers every question of it, so mach computes no layout of its own |
 | [`logical`](logical.md) | the types a logical-addressing target can declare |
