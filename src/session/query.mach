@@ -2129,3 +2129,172 @@ fun bytes_dup(a: *A.Allocator, src: *u8, len: u32) res[*u8, fail.Fail] {
     memory.raw_copy(dst::ptr, src::ptr, len::usize);
     ret res[*u8, fail.Fail].ok{dst};
 }
+
+# a computation that reads off the stack. it reads only products validated in this operation before
+# it started, through views the owner gathered, and logs each read. the owner replays the log onto
+# the computing frame in log order, so the edges are those the same reads made through `get` would
+# have recorded, at the same place in the list. views and the log touch no map or shard of the
+# database, and no view is added once the reading starts, so the reading may run on another thread
+# while the owner works on. a read the views do not hold is a miss, which the reader answers on the
+# owner (replay what was logged, then `get`) or by giving the reading up
+# ---
+# kind, key:                         the product read
+# last_changed, diagnostics_changed: its revisions when read, which replay requires unchanged
+pub rec Read {
+    kind:                KindIndex;
+    key:                 u64;
+    last_changed:        Revision;
+    diagnostics_changed: Revision;
+}
+
+# the reads of one computation in the order it made them, those before `done` replayed
+pub rec ReadLog {
+    reads: Vector[Read];
+    done:  usize;
+}
+
+# how a computation reads a product: through `get` on the owner, or through views it logs
+# reached through Reads.read
+pub def ReadFn: fun(ptr, *Kind, u64) res[QueryView, fail.Fail];
+
+pub rec Reads {
+    ctx:  ptr;
+    read: ReadFn;
+}
+
+rec ViewRow {
+    spec: *Kind;
+    kind: KindIndex;
+}
+
+# products a reading may read, each validated in this operation, ready and not given back. a view
+# set may sit over a `base` set, which it is read through after its own
+pub rec Views {
+    base:    *Views;
+    rows:    Vector[ViewRow];
+    entries: Map[Slot, *QueryEntry];
+}
+
+pub fun log_init(a: *A.Allocator) ReadLog {
+    ret ReadLog{reads: collections_vector.init[Read](a), done: 0};
+}
+
+pub fun log_dnit(log: *ReadLog) {
+    collections_vector.dnit[Read](?log.reads);
+}
+
+pub fun views_init(a: *A.Allocator, base: *Views) Views {
+    ret Views{base: base, rows: collections_vector.init[ViewRow](a), entries: map.init[Slot, *QueryEntry](a)};
+}
+
+pub fun views_dnit(v: *Views) {
+    collections_vector.dnit[ViewRow](?v.rows);
+    map.dnit[Slot, *QueryEntry](?v.entries);
+}
+
+fun view_row(v: *Views, sh: *QueryShard) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < v.rows.len) {
+        if (v.rows.data[i].kind == sh.kind) { ret err[fail.Fail].ok{}; }
+        i = i + 1;
+    }
+    val res_pushed: res[usize, A.Error] = collections_vector.push[ViewRow](?v.rows, ViewRow{spec: sh.spec, kind: sh.kind});
+    if (sel res_pushed.err) { ret err[fail.Fail].err{fail.refused(res_pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun viewable(db: *QueryDb, entry: *QueryEntry) bool {
+    ret entry != nil && entry.ready && !entry.stale && !entry.released && entry.validated_at == db.operation_sequence;
+}
+
+fun view_put(db: *QueryDb, v: *Views, kind: KindIndex, entry: *QueryEntry) err[fail.Fail] {
+    if (!viewable(db, entry)) { ret err[fail.Fail].ok{}; }
+    val res_put: res[bool, A.Error] = map.insert[Slot, *QueryEntry](?v.entries, Slot{kind: kind, key: entry.key}, entry);
+    if (sel res_put.err) { ret err[fail.Fail].err{fail.refused(res_put.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# every product of `kind` validated in this operation added to `v`
+pub fun views_add(db: *QueryDb, v: *Views, kind: *Kind) err[fail.Fail] {
+    val sh: *QueryShard = shard_find(db, kind);
+    if (sh == nil) { ret err[fail.Fail].ok{}; }
+    val err_row: err[fail.Fail] = view_row(v, sh);
+    if (sel err_row.err) { ret err_row; }
+    var i: usize = 0;
+    for (i < sh.entries.len) {
+        val err_put: err[fail.Fail] = view_put(db, v, sh.kind, sh.entries.data[i]);
+        if (sel err_put.err) { ret err_put; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# every product of `kind` the product `of` keyed `key` read, validated in this operation, added to `v`
+pub fun views_add_deps(db: *QueryDb, v: *Views, of: *Kind, key: u64, kind: *Kind) err[fail.Fail] {
+    val from: *QueryShard = shard_find(db, of);
+    val sh:   *QueryShard = shard_find(db, kind);
+    if (from == nil || sh == nil) { ret err[fail.Fail].ok{}; }
+    val err_row: err[fail.Fail] = view_row(v, sh);
+    if (sel err_row.err) { ret err_row; }
+    val owner: *QueryEntry = entry_find(from, key);
+    if (owner == nil) { ret err[fail.Fail].ok{}; }
+    var i: u32 = 0;
+    for (i < owner.dep_len) {
+        val d: Dep = owner.deps[i];
+        if (d.kind == sh.kind) {
+            val err_put: err[fail.Fail] = view_put(db, v, sh.kind, entry_find(sh, d.key));
+            if (sel err_put.err) { ret err_put; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the product `kind` keys under `key` read through `v` and logged, or none when `v` does not hold it
+pub fun view_read(v: *Views, log: *ReadLog, kind: *Kind, key: u64) res[opt[QueryView], fail.Fail] {
+    var at: *Views = v;
+    for (at != nil) {
+        var i: usize = 0;
+        for (i < at.rows.len && at.rows.data[i].spec != kind) { i = i + 1; }
+        if (i < at.rows.len) {
+            var product:   Slot              = Slot{kind: at.rows.data[i].kind, key: key};
+            val opt_entry: opt[**QueryEntry] = map.get[Slot, *QueryEntry](?at.entries, ?product);
+            if (sel opt_entry.some) {
+                val entry:      *QueryEntry         = @opt_entry.some;
+                val res_pushed: res[usize, A.Error] = collections_vector.push[Read](?log.reads, Read{
+                    kind: product.kind, key: key, last_changed: entry.last_changed, diagnostics_changed: entry.diagnostics_changed
+                });
+                if (sel res_pushed.err) { ret res[opt[QueryView], fail.Fail].err{fail.refused(res_pushed.err)}; }
+                ret res[opt[QueryView], fail.Fail].ok{opt[QueryView].some{QueryView{value: entry.value, value_len: entry.value_len, last_changed: entry.last_changed}}};
+            }
+        }
+        at = at.base;
+    }
+    ret res[opt[QueryView], fail.Fail].ok{opt[QueryView].none{}};
+}
+
+# the reads `log` holds past `done` replayed onto the computing frame, as `get` records a read of a
+# validated product: the edge, then its revisions. a product changed since its read is a defect
+pub fun replay(db: *QueryDb, log: *ReadLog) err[fail.Fail] {
+    $if (role.CHECKED) { role.touched(role.QUERY, nil); }
+
+    if (db.stack.len == 0) { ret err[fail.Fail].err{fail.message("a read log was replayed outside every computation")}; }
+    val opt_poison: opt[fail.Fail] = operation_poison(db);
+    if (sel opt_poison.some) { ret err[fail.Fail].err{opt_poison.some}; }
+    val frame: *StackFrame = ?db.stack.data[db.stack.len - 1];
+    for (log.done < log.reads.len) {
+        val r:            Read                = log.reads.data[log.done];
+        val res_recorded: res[u32, fail.Fail] = dep_record(db, frame, r.kind, r.key);
+        if (sel res_recorded.err) { ret err[fail.Fail].err{res_recorded.err}; }
+        val res_shard: res[*QueryShard, fail.Fail] = shard_get(db, r.kind);
+        if (sel res_shard.err) { ret err[fail.Fail].err{res_shard.err}; }
+        val entry: *QueryEntry = entry_find(res_shard.ok, r.key);
+        if (!viewable(db, entry) || entry.last_changed != r.last_changed || entry.diagnostics_changed != r.diagnostics_changed) {
+            ret err[fail.Fail].err{fail.message("a product read through a view changed before its read was replayed")};
+        }
+        val err_observed: err[fail.Fail] = dep_observe(?frame.entry.deps[res_recorded.ok], entry);
+        if (sel err_observed.err) { ret err_observed; }
+        log.done = log.done + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
