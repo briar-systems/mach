@@ -92,15 +92,18 @@ asm armv8-a {
 }
 ```
 
-Such a block may not also write the frame pointer, which its locals are now
-addressed off.
+No block of a function that keeps its frame pointer may write that register, bound
+name or not, whether the function keeps it for a block that moves the stack pointer, a
+dynamic allocation, realignment or because the target always keeps one. Such a block is
+refused with `asm.unsupported`.
 
 A block in a function with no frame pointer that moved the stack pointer and bound a
 `{name}` off it would be refused with `asm.unsupported`, naming the move, and the cure is
 to push and pop around the block or to stage the address into a register before it.
 
 A body that binds no `{name}` may do whatever it likes with the stack pointer, which is
-what a `#[naked]` function's hand-written prologue does. In a function
+what a `#[naked]` function's hand-written prologue does. Moving the stack pointer still
+makes the function keep its frame pointer, which no block of it may then write. In a function
 holding a local whose type is aligned past the stack's alignment (see `align` in
 [decorators](decorators.md)) that also moves the stack pointer, the locals are addressed
 off a base register instead (rbx on x86-64, x19 on aarch64, s1 on riscv), so a block there
@@ -689,7 +692,8 @@ Values are written in the target's byte order, so `.word 0xd503201f` is the aarc
 directive's width. A value the width cannot hold is refused rather than truncated, and
 one directive carries a whole sequence — up to 256 payload bytes — not four.
 
-On aarch64 and riscv64 a statement must emit a whole number of instruction words:
+On aarch64 a statement must emit a whole number of 4-byte instruction words, and on
+riscv64 a whole number of 2-byte parcels, since compressed encodings are 2 bytes:
 `.byte 0x1f, 0x20, 0x03` is refused, because three bytes would misalign every
 instruction after it. x86-64 has no such constraint.
 

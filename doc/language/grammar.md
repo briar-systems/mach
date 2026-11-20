@@ -215,9 +215,11 @@ The lexer has no fall-through quote or reserved class: any byte that begins
 none of the token forms above is an **unexpected character**. The lexer
 records it, emits a one-byte `ERROR` token (`KIND_ERROR`) for it, and
 continues. A control byte (below `0x20`, other than the tab and line breaks
-above, or `0x7f`) is refused as `source.control_char`. Every other such byte,
-a non-ASCII byte included, is refused as `source.unexpected_char`, whose text
-reads `this character is not allowed. source text must be ASCII`.
+above, or `0x7f`) is refused as `source.control_char`. Every other such byte
+is refused as `source.unexpected_char`. A non-ASCII byte (`0x80` and above)
+reads `this character is not allowed. source text must be ASCII`, and a
+printable ASCII byte that begins no token, such as the backtick or a lone
+backslash, reads `this character begins no token`.
 
 The backtick `` ` `` is not a token: it is an unexpected character wherever it
 appears, refused as `source.unexpected_char`. `#[` is the two-byte decorator-open token (`KIND_DECORATOR_OPEN`) that
@@ -362,7 +364,8 @@ typed-name ::= [ "$" ] IDENT ":" type
 ```
 
 - A trailing `name: ...` declares a **comptime variadic pack parameter**
-  (`TYPE_KIND_PACK`); it must be the last parameter.
+  (`TYPE_KIND_PACK`). It must be the last parameter, and a parameter after it is
+  refused as `pack.not_last`, ``a variadic pack `...` must be the last parameter``.
 - A trailing **bare** `...` declares a **C-variadic** signature: the preceding
   parameters are the fixed arity and a call may pass further arguments, placed by
   the target's C variadic rules (see
@@ -373,15 +376,9 @@ typed-name ::= [ "$" ] IDENT ":" type
   missing parameter name (`syntax.expected_name`). A comptime variadic pack is a
   named parameter (`va: ...`). (A function *pointer type* also carries `...`; see
   `fun-type-params` below.)
-- A leading `$` on a `typed-name` marks it a **comptime value parameter**.
-
-> **Divergence (parser vs. doc).** `typed-name` is shared between function
-> parameters and `rec`/`uni` fields, so the parser will *accept* a leading
-> `$` on a named `rec`/`uni` field too. [fun.md](fun.md) states comptime
-> value parameters apply to function parameters only; anonymous inline
-> `rec {...}` / `uni {...}` field types hardcode the comptime flag off. A
-> `$` on a *named-type* field parses, and sema does not refuse it (`rec R { $x: i64; }`
-> builds and `R{x: 2}.x` reads 2), but it is not the documented surface.
+- A leading `$` on a `typed-name` marks it a **comptime value parameter**. It is
+  accepted on function parameters only, and a `$` on a named `rec` or `uni` field
+  is refused as `syntax.expected_name`, ``a field takes no `$` comptime marker``.
 
 ### `val` / `var` - bindings
 
@@ -458,7 +455,6 @@ type ::= secret-type
        | fun-type
        | rec-type
        | uni-type
-       | pack-type
        | constructed-type
        | field-type
        | named-type
@@ -466,7 +462,6 @@ type ::= secret-type
 secret-type     ::= "^" type
 ptr-type        ::= "*" type
 array-type      ::= "[" ( expr | "_" ) "]" type
-pack-type       ::= "..."
 constructed-type ::= "$" type-constructor "(" type ")"
 type-constructor ::= "pointee_of" | "discriminant_of"
 field-type      ::= IDENT "." "type"
@@ -497,8 +492,8 @@ Notes:
   inside another intrinsic's operand and inside a generic argument list. An
   operand of the wrong kind is refused by sema with its own cause, see
   [comptime-intrinsics.md](comptime-intrinsics.md).
-- `...` as a type is a variadic pack, written only as the type of a function's
-  last parameter (`va: ...`, see `pack-param` above).
+- `...` is not a type. Written where a type is expected it is refused as
+  `syntax.expected_type`. A variadic pack is spelled only by `pack-param`.
 - `f.type` is a field descriptor's own type inside a `$each` body, and is
   a type spelling in its own right so a constructor can take one
   (`$pointee_of(f.type)`). `type` is contextual, not a keyword: a module or record

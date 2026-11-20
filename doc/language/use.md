@@ -3,8 +3,8 @@
 `use` brings an external symbol or module into the current scope under a
 local name. It is a private import. The imported name is not exposed to
 consumers of this module: a consumer that imports it through this module is
-refused with `visibility.not_exported`, and one that writes it qualified
-through this module, as `module.name`, gets `name.unresolved`.
+refused with `visibility.not_exported`, whether it imports the name or writes it
+qualified through this module, as `module.name`, in a value or a type.
 
 ## Grammar
 

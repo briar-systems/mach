@@ -1,8 +1,9 @@
 # `ext fun` — external function
 
 `ext fun` declares a function with C ABI as a forward reference — body-less.
-The linker resolves the symbol at link time. This is the only body-less
-function form Mach allows.
+The linker resolves the symbol at link time. Apart from an `#[intrinsic]`
+function (see [gpu.md](gpu.md)), this is the only body-less function form Mach
+allows.
 
 ## Grammar
 
@@ -10,8 +11,12 @@ function form Mach allows.
 ext fun NAME(args) RET;
 ```
 
-- No body block. The declaration ends with a semicolon.
+- No body block. The declaration ends with a semicolon. A body is refused with
+  `ext.fun_body`.
 - Argument and return types must be representable in C.
+- No type parameters and no `$` comptime parameters. Each instance would be a
+  function of its own that no foreign library exports, so either is refused with
+  `ext.generic`.
 - `pub ext fun` exposes the import to other modules; without `pub`, the
   import is file-private.
 
@@ -48,7 +53,7 @@ ext fun fcntl(fd: i32, cmd: i32, ...) i32;
   refused with `variadic.no_fixed_param`.
 - Only the **call** side exists. Mach cannot *define* a C-variadic function: there
   is no `va_list` and no `va_arg`, so such a declaration cannot carry a body
-  (`ext.variadic_body`).
+  (`ext.fun_body`).
 
 The declared parameters are the *fixed* arity. A call must supply all of them and
 may supply any number of further arguments, including none. A call short of the
@@ -402,7 +407,7 @@ ext fun WSAStartup(ver: u16, data: *u8) i32;
   name (`libfoo.so.3`, an `LC_ID_DYLIB` install name, or `foo.dll`) does not
   bind: an import attributed to the loader name of an entry is refused
   (`import '<sym>' is attributed to '<loader>', the loader name of link entry
-  '<key>'; #[library] names a link entry by its table key, so write
+  '<key>'. #[library] names a link entry by its table key, so write
   #[library("<key>")]`). An import that a linked import library declares is
   attributed to the key of the entry that links that import library, never to
   the DLL name the import library records. The named library **must** be
@@ -641,7 +646,9 @@ is recorded and undefined `ext` functions become run-time imports. A file no
 object format reads is read as a GNU linker script where the target's system
 uses them, as glibc's `libc.so` is: its `GROUP` and `INPUT` entries enter the
 link in order, and each file it names is checked for the link's architecture as
-it is read. A static definition always wins over a same-named dynamic import.
+it is read. A file the link names that is for another architecture, a shared
+library among them, is refused. A static definition always wins over a
+same-named dynamic import.
 
 ## See also
 

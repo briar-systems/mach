@@ -311,8 +311,10 @@ addressing `gpu.uniform` and `gpu.storage` use, so a host binds one the way it b
 others. Its type must be a **handle type**, a bodyless `def` carrying `#[handle]`
 (see [types.md](types.md)), and a handle type must carry this decorator: a handle
 names a descriptor rather than an object with storage, so one with no descriptor
-address is reachable from no stage. A handle cannot sit behind a pointer, inside an
-array, or in a local binding, and each of those is a compile error naming why.
+address is reachable from no stage. A handle's one indirection is a pointer to its
+binding, passed to a function. A handle cannot sit behind a pointer to a pointer,
+inside an array, or in a local binding, and each of those is a compile error naming
+why.
 
 A **storage image** is the exception: an `image` handle whose `Sampled` operand is
 `2` is read and written directly rather than sampled, which is Vulkan's

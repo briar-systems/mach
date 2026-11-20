@@ -419,10 +419,12 @@ No gitlink command ever runs against a path that is not a checkout of its own.
 
 A path dependency has no pin, so `mach dep pull` syncs its `dep/<id>` with the
 declared `path` every time, and `mach dep update` does the same, once per
-command. Unless `--quiet`, each says whether the copy was refreshed or reused (`realized hedge
-from ../.. (copy refreshed from its source)`, or `(copy reused: it already
+command. Unless `--quiet`, each says whether the copy was made, refreshed or
+reused (`realized hedge from ../.. (copy made from its source)` when `dep/<id>`
+did not exist, `(copy refreshed from its source)`, or `(copy reused: it already
 matched its source)`), so a copy left from another checkout cannot pass
-unnoticed. A build reads the copy as it is and never syncs it. A changed
+unnoticed. `mach dep add` of a path dependency makes the copy once and says so
+the same way. A build reads the copy as it is and never syncs it. A changed
 `path` realizes the new source. A file the source no longer has is removed and
 named, and a file whose content differs from the source is overwritten and named
 (`replaced 'src/lib.mach' with its source's content`), so local edits to the
@@ -463,7 +465,7 @@ described in [Releases and resolution](#releases-and-resolution).
 ## Removed forms
 
 Two shapes of a realized closure are refused by `pull`, `verify`, `add` and
-`update`:
+`update`, and the first also by `build` and `check`:
 
 - a **key that is not the project id**, a `[dep.<key>]` whose realized project
   declares a different id:

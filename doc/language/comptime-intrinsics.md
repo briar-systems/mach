@@ -738,8 +738,8 @@ types (`$discriminant_of(^T)`) because it reports storage metadata rather than
 the active case. Conversely, `$cases(^T)` is refused, matching current shape query
 conventions.
 
-`$offset_of(T, payload_case)` reuses the layout intrinsic to report the common
-payload offset. Naming a payloadless case is an error. Like `$size_of` and
+`$offset_of(T, payload_case)` reuses the layout intrinsic to report the offset
+of the payload area that holds the case. Naming a payloadless case is an error. Like `$size_of` and
 `$align_of`, layout answers for tags come from the checked target layout and are
 available during type checking.
 

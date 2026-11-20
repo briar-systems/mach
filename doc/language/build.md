@@ -114,6 +114,11 @@ for.
 `-o` names the build's output, and `mach run -o <path>` names the same output, the
 program it launches.
 
+The products `--emit` names are the products made. An `--emit` set without `exe`
+stops at the objects, with their `ir/` and `asm/` text when it names those, and
+links nothing. `-o` names the linked artifact, so it is refused as
+`cli.flag_inapplicable` when `--emit` names no `exe`.
+
 `-o` is accepted exactly when the selection resolves to a single (artifact, target,
 profile), and refused otherwise, naming the cells it resolved to. Two artifacts
 collide on one output path the same way two targets or two profiles do: each would
@@ -167,8 +172,8 @@ With no `-t`, [an artifact can settle the target](#a-named-artifact-can-settle-t
 when its `targets` list leaves one answer. The same rule holds there. An artifact whose
 only target is hosted and does not match the host is refused with
 `selection.no_host_target`, naming the artifact, because building it would be the same
-fallback. An artifact whose only target no host runs as `native` (a `freestanding` or
-`wasi` target, or a finished-module target on `vulkan` or `opencl`) is still pinned to it:
+fallback. An artifact whose only target no host runs as `native` (a `freestanding`,
+`uefi` or `wasi` target, or a finished-module target on `vulkan` or `opencl`) is still pinned to it:
 such a target is never `native`, so naming the artifact selects it explicitly, and a
 host artifact that `need`s it builds it on any host. This path is taken whenever an
 artifact is settled before its target: `mach build` and `mach check` with

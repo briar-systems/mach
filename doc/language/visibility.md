@@ -46,7 +46,7 @@ private import, and a test is never part of a module's public surface.
 
 Declares a function or a data binding whose definition lives in another
 object, as a forward reference the linker resolves. An `ext fun` has no body
-and follows the C ABI. An `ext val` / `ext var` has no initializer and no
+and follows the C ABI, and a body on one is refused with `ext.fun_body`. An `ext val` / `ext var` has no initializer and no
 storage of its own, and an initializer on one is refused with
 `ext.data_initializer`.
 
@@ -61,8 +61,9 @@ ext var errno: i32;
   representable in C.
 - Use the `#[symbol("real_name")]` decorator to override the linker name.
 
-There are no body-less functions outside of `ext fun`. Regular forward
-declarations do not exist.
+There are no body-less functions outside of `ext fun` and `#[intrinsic]`.
+Regular forward declarations do not exist, and a body-less `fun` of any other
+kind is refused with `fun.bodyless`.
 
 ## What a shared library exports
 

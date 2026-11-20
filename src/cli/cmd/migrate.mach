@@ -1,8 +1,8 @@
 # `mach migrate`, which rewrites a project's manifest and source to this major's spelling
 #
 # a script that may run mach beside the source, and a step whose `argv` runs mach, is read
-# for removed options, which are reported and never rewritten. under `--check` nothing is
-# written.
+# for removed options, and every script and step for the step environment 6 set, which are
+# reported and never rewritten. under `--check` nothing is written.
 
 use std_args: std.args;
 use std.collections.slice.Slice;
@@ -46,10 +46,12 @@ use cli_diagnostic: mach.cli.diagnostic;
 use mach.cli.exit;
 use mach.cli.rewrite;
 use mach.cli.util;
+use compile_closure: mach.compile.closure;
 use mach.front.transition;
 use mach.host.listing;
 use manifest_load: mach.manifest.load;
 use mach.manifest.schema;
+use manifest_target: mach.manifest.target;
 use mach.tool.migrate;
 use mink_fail:     mink.base.fail;
 use macho_library: mink.format.macho.neutral.library;
@@ -61,7 +63,7 @@ fun keyed(a: *A.Allocator, text: str, diags: *diagnostic.DiagnosticStore, contex
 
 # a source's text in this major's spelling
 fun spelled(a: *A.Allocator, text: str, diags: *diagnostic.DiagnosticStore, context: ptr) res[str, fail.Fail] {
-    ret migrate.source(a, text, context::*Vector[migrate.Dependency]);
+    ret migrate.source(a, text, diags, context::*Vector[migrate.Dependency]);
 }
 
 # a script is a file that may run a build beside the source, read for removed options. it is
@@ -165,6 +167,10 @@ fun next_word(s: *Scan, w: *Word) bool {
             s.at = s.at + 1;
             cnt;
         }
+        if (b == '$' && s.at + 2 < s.end && s.text[s.at + 1] == '{' && s.text[s.at + 2] == '{') {
+            expression_skip(s);
+            cnt;
+        }
         if (b == '"' || b == '\'') {
             quote = b;
             s.at  = s.at + 1;
@@ -183,6 +189,24 @@ fun next_word(s: *Scan, w: *Word) bool {
     }
     w.len = s.at - w.at;
     ret true;
+}
+
+# move the cursor past the workflow expression `${{ ... }}` it stands at, which the runner
+# replaces before the shell reads the line, so what it holds is part of the word it stands in.
+# a quote in it opens or closes one of its strings, and `''` in a string stands for a quote
+fun expression_skip(s: *Scan) {
+    s.at = s.at + 3;
+    var quoted: bool = false;
+    for (s.at < s.end) {
+        val b: u8 = s.text[s.at];
+        if (b == '\n') { s.line = s.line + 1; }
+        if (b == '\'') { quoted = !quoted; }
+        or (!quoted && b == '}' && s.at + 1 < s.end && s.text[s.at + 1] == '}') {
+            s.at = s.at + 2;
+            ret;
+        }
+        s.at = s.at + 1;
+    }
 }
 
 # the bytes of `w` inside one pair of quotes around the whole word, if it has them
@@ -230,23 +254,74 @@ fun command_prefix(text: str, w: Word) bool {
     ret false;
 }
 
+# each removed option the word `option` of a mach invocation in `name` is, located on `line`.
+# `path` is the invocation's leading words after `mach`, which a row for one command is held to
+fun removed_report(out: *io_writer.Writer, name: str, text: str, option: Word, line: usize, path: str) {
+    var i: usize = 0;
+    for (i < args.REMOVED_N) {
+        val removed: *args.Removed = ?args.REMOVED[i];
+        i = i + 1;
+        if (args.removed_in(removed, path) && word_option(text, option, removed.name)) {
+            std_format.format(out, "{}:{}: option '{}' is not allowed. use {}\n", name, line, removed.name, removed.use);
+        }
+    }
+}
+
+# each removed option a string of a workflow expression `${{ ... }}` in the word `w` is, since
+# the runner writes the string into the command in the expression's place
+fun expression_report(out: *io_writer.Writer, name: str, text: str, w: Word, path: str) {
+    val end:    usize = w.at + w.len;
+    var i:      usize = w.at;
+    var inside: bool  = false;
+    for (i < end) {
+        if (!inside) {
+            if (i + 2 < end && text[i] == '$' && text[i + 1] == '{' && text[i + 2] == '{') {
+                inside = true;
+                i      = i + 3;
+                cnt;
+            }
+            i = i + 1;
+            cnt;
+        }
+        if (text[i] == '}' && i + 1 < end && text[i + 1] == '}') {
+            inside = false;
+            i      = i + 2;
+            cnt;
+        }
+        if (text[i] == '\'') {
+            var close: usize = i + 1;
+            for (close < end && text[close] != '\'') { close = close + 1; }
+            removed_report(out, name, text, Word{at: i + 1, len: close - i - 1, line: w.line}, w.line, path);
+            i = close + 1;
+            cnt;
+        }
+        i = i + 1;
+    }
+}
+
 # each removed option a mach invocation in the script `name` writes, from `at` to `end` of its
 # text, located on its own line. only the words of the simple command whose command word names
-# mach are read, so another program's options are never taken for mach's. a workflow's
-# `run: '...'` is read inside its quotes
-fun script_report(out: *io_writer.Writer, name: str, text: str, at: usize, end: usize, line: usize) {
+# mach are read, so another program's options are never taken for mach's, and a row for one
+# command only in an invocation of that command. a workflow's `run: '...'` is read inside its
+# quotes, and each string of a `${{ ... }}` expression as a word of the command it stands in
+fun script_report(out: *io_writer.Writer, a: *A.Allocator, name: str, text: str, at: usize, end: usize, line: usize) {
     var s: Scan = Scan{text: text, at: at, end: end, line: line};
     for (s.at < s.end) {
-        var w:      Word;
-        var placed: bool = false;
-        var runs:   bool = false;
-        var after:  bool = false;
+        var w:       Word;
+        var placed:  bool             = false;
+        var runs:    bool             = false;
+        var after:   bool             = false;
+        var leading: bool             = true;
+        var path:    str              = "";
+        var lead:    io_writer.Memory;
+        var lw:      io_writer.Writer = io_writer.memory_growing(?lead, a);
+        fin { io_writer.memory_dnit(?lead); }
         for (next_word(?s, ?w)) {
             if (!placed) {
                 if (after) {
                     val inner: Word = unquoted(text, w);
                     if (inner.len != w.len) {
-                        script_report(out, name, text, inner.at, inner.at + inner.len, w.line);
+                        script_report(out, a, name, text, inner.at, inner.at + inner.len, w.line);
                         cnt;
                     }
                 }
@@ -257,15 +332,64 @@ fun script_report(out: *io_writer.Writer, name: str, text: str, at: usize, end: 
                 cnt;
             }
             if (!runs) { cnt; }
-            val option: Word  = unquoted(text, w);
-            var i:      usize = 0;
-            for (i < args.REMOVED_N) {
-                if (word_option(text, option, args.REMOVED[i].name)) {
-                    std_format.format(out, "{}:{}: option '{}' is not allowed. use {}\n", name, w.line, args.REMOVED[i].name, args.REMOVED[i].use);
+            val option: Word = unquoted(text, w);
+            if (leading) {
+                # the words before the first option name the command
+                if (option.len > 0 && text[option.at] != '-') {
+                    if (lead.len != 0) { io_writer.write_str(?lw, " "); }
+                    io_writer.write_all(?lw, ?text[option.at], option.len);
+                    cnt;
                 }
-                i = i + 1;
+                leading = false;
+                path    = io_writer.memory_text(?lead);
             }
+            removed_report(out, name, text, option, w.line, path);
+            expression_report(out, name, text, w, path);
         }
+    }
+}
+
+# a step environment variable 6 set, and the name 7 sets it by
+# ---
+# from: the name 6 set
+# to:   the name 7 sets
+rec Renamed {
+    from: str;
+    to:   str;
+}
+
+# row count of VARIABLES
+val VARIABLES_N: usize = 2;
+# the step environment variables 6 set that 7 names otherwise
+val VARIABLES: [VARIABLES_N]Renamed = [VARIABLES_N]Renamed{
+    Renamed{from: "MACH_TARGET_ISA", to: "MACH_TARGET_ARCH"},
+    Renamed{from: "MACH_TARGET_OS", to: "MACH_TARGET_SYS"},
+};
+
+# whether `c` can stand in a variable's name
+fun name_byte(c: u8) bool {
+    ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+# each step environment variable 6 set that `name` reads from `at` to `end` of `text`, located on
+# its line. it is found wherever it stands with no byte of a name on either side, as `$X`, `${X:-}`,
+# `%X%` or `$env:X` write it, since a script or a step reads its environment anywhere
+fun variables_report(out: *io_writer.Writer, name: str, text: str, at: usize, end: usize) {
+    var i: usize = at;
+    for (i < end) {
+        var step: usize = 1;
+        var r:    usize = 0;
+        for (r < VARIABLES_N) {
+            val renamed: *Renamed = ?VARIABLES[r];
+            val len:     usize    = str_len(renamed.from);
+            r = r + 1;
+            if (i + len > end || !str_region_equals(text, i, len, renamed.from)) { cnt; }
+            if (i > at && name_byte(text[i - 1]))                                { cnt; }
+            if (i + len < end && name_byte(text[i + len]))                       { cnt; }
+            std_format.format(out, "{}:{}: {} is not set by a build step. use {}\n", name, line_of(text, i), renamed.from, renamed.to);
+            step = len;
+        }
+        i = i + step;
     }
 }
 
@@ -337,8 +461,11 @@ fun scripts_in(out: *io_writer.Writer, a: *A.Allocator, root: str, rel: str, dir
         val executable: bool = (res_meta.ok.mode & 0o111) != 0;
         if (!named && !executable) { cnt; }
         val opt_read: opt[str] = rewrite.text_of(a, res_path.ok);
-        if (sel opt_read.none)                             { cnt; }
-        if (named || str_starts_with(opt_read.some, "#!")) { script_report(out, child, opt_read.some, 0, str_len(opt_read.some), 1); }
+        if (sel opt_read.none) { cnt; }
+        if (named || str_starts_with(opt_read.some, "#!")) {
+            script_report(out, a, child, opt_read.some, 0, str_len(opt_read.some), 1);
+            variables_report(out, child, opt_read.some, 0, str_len(opt_read.some));
+        }
         str_free(a, opt_read.some);
     }
     ret err[fail.Fail].ok{};
@@ -348,9 +475,54 @@ fun by_name(x: *str, y: *str) i64 {
     ret str_compare(@x, @y);
 }
 
-# each removed option the `argv` of a step that runs mach writes, located in the manifest `doc`.
-# an option the migration rewrites in a step is not one
-fun step_report(out: *io_writer.Writer, doc: *manifest_load.Doc) {
+# the leading words of the mach invocation the step `argv` writes, after the word that names
+# mach and before its first option, into `w`: the items after an item that is mach, or the words
+# after mach within one item, as an item `sh -c` runs writes them
+fun step_path(w: *io_writer.Writer, text: str, argv: *toml_value.Array) {
+    var found: bool  = false;
+    var wrote: bool  = false;
+    var k:     usize = 0;
+    for (k < toml_lookup.array_len(argv)) {
+        val opt_arg: opt[*toml_value.Value] = toml_lookup.array_get(argv, k);
+        k = k + 1;
+        if (sel opt_arg.none) { cnt; }
+        val item: Word = unquoted(text, Word{at: opt_arg.some.span.at, len: opt_arg.some.span.len, line: 0});
+        if (found) {
+            if (item.len == 0 || text[item.at] == '-') { ret; }
+            if (wrote)                                 { io_writer.write_str(w, " "); }
+            io_writer.write_all(w, ?text[item.at], item.len);
+            wrote = true;
+            cnt;
+        }
+        if (runs_mach_word(text, item)) {
+            found = true;
+            cnt;
+        }
+        if (!names_in(text, item.at, item.at + item.len, "mach")) { cnt; }
+        var s:    Scan = Scan{text: text, at: item.at, end: item.at + item.len, line: 0};
+        var word: Word;
+        var runs: bool = false;
+        for (s.at < s.end) {
+            for (next_word(?s, ?word)) {
+                val option: Word = unquoted(text, word);
+                if (!runs) {
+                    runs = runs_mach_word(text, word);
+                    cnt;
+                }
+                if (option.len == 0 || text[option.at] == '-') { ret; }
+                if (wrote)                                     { io_writer.write_str(w, " "); }
+                io_writer.write_all(w, ?text[option.at], option.len);
+                wrote = true;
+            }
+            if (runs) { ret; }
+        }
+    }
+}
+
+# each removed option the `argv` of a step that runs mach writes, and each step environment
+# variable 6 set that a step's `argv` or `env` reads, located in the manifest `doc`. an option the
+# migration rewrites in a step is not one
+fun step_report(out: *io_writer.Writer, a: *A.Allocator, doc: *manifest_load.Doc) {
     val opt_steps: opt[*toml_value.Table] = toml_lookup.get_table(?doc.table, "step");
     if (sel opt_steps.none) { ret; }
     var s: usize = 0;
@@ -359,21 +531,40 @@ fun step_report(out: *io_writer.Writer, doc: *manifest_load.Doc) {
         s = s + 1;
         if (sel opt_step.none)                          { cnt; }
         if (opt_step.some.tag != toml_value.TYPE_TABLE) { cnt; }
+        val opt_env: opt[*toml_value.Value] = toml_lookup.get(?opt_step.some.data.table, "env");
+        if (sel opt_env.some) {
+            val env: *toml_value.Value = opt_env.some;
+            var e:   usize             = 0;
+            for (env.tag == toml_value.TYPE_TABLE && e < toml_lookup.table_len(?env.data.table)) {
+                val opt_value: opt[*toml_value.Value] = toml_lookup.table_value(?env.data.table, e);
+                e = e + 1;
+                if (sel opt_value.none) { cnt; }
+                variables_report(out, manifest_load.MANIFEST_FILE, doc.text, opt_value.some.span.at, opt_value.some.span.at + opt_value.some.span.len);
+            }
+        }
         val opt_argv: opt[*toml_value.Value] = toml_lookup.get(?opt_step.some.data.table, "argv");
-        if (sel opt_argv.none)                                       { cnt; }
-        if (opt_argv.some.tag != toml_value.TYPE_ARRAY)              { cnt; }
-        if (!migrate.runs_mach(doc.text, ?opt_argv.some.data.array)) { cnt; }
-        var k: usize = 0;
+        if (sel opt_argv.none)                          { cnt; }
+        if (opt_argv.some.tag != toml_value.TYPE_ARRAY) { cnt; }
+        val runs: bool             = migrate.runs_mach(doc.text, ?opt_argv.some.data.array);
+        var lead: io_writer.Memory;
+        var lw:   io_writer.Writer = io_writer.memory_growing(?lead, a);
+        fin { io_writer.memory_dnit(?lead); }
+        step_path(?lw, doc.text, ?opt_argv.some.data.array);
+        val path: str   = io_writer.memory_text(?lead);
+        var k:    usize = 0;
         for (k < toml_lookup.array_len(?opt_argv.some.data.array)) {
             val opt_arg: opt[*toml_value.Value] = toml_lookup.array_get(?opt_argv.some.data.array, k);
             k = k + 1;
             if (sel opt_arg.none) { cnt; }
             val end: usize = opt_arg.some.span.at + opt_arg.some.span.len;
-            var i:   usize = 0;
+            variables_report(out, manifest_load.MANIFEST_FILE, doc.text, opt_arg.some.span.at, end);
+            if (!runs) { cnt; }
+            var i: usize = 0;
             for (i < args.REMOVED_N) {
                 val removed: *args.Removed = ?args.REMOVED[i];
                 i = i + 1;
                 if (step_rewrites(removed.name))                                  { cnt; }
+                if (!args.removed_in(removed, path))                              { cnt; }
                 if (!names_in(doc.text, opt_arg.some.span.at, end, removed.name)) { cnt; }
                 std_format.format(out, "{}:{}: option '{}' is not allowed. use {}\n", manifest_load.MANIFEST_FILE, line_of(doc.text, opt_arg.some.span.at), removed.name, removed.use);
             }
@@ -397,6 +588,22 @@ fun leftover_report(out: *io_writer.Writer, a: *A.Allocator, doc: *manifest_load
         or                        { std_format.format(out, "{}:{}: [{}.{}].{} is not allowed, and no rewrite replaces it. {}\n", manifest_load.MANIFEST_FILE, line, k.section, k.name, k.key, k.note); }
     }
     ret res[usize, fail.Fail].ok{left.len};
+}
+
+# each retired spir-v device feature name the manifest `doc` lists in a target's `ext` that
+# names no capability, located, which the rewrite removes
+fun dropped_ext_report(out: *io_writer.Writer, a: *A.Allocator, doc: *manifest_load.Doc) err[fail.Fail] {
+    var dropped: Vector[manifest_target.DroppedExt] = collections_vector.init[manifest_target.DroppedExt](a);
+    fin { collections_vector.dnit[manifest_target.DroppedExt](?dropped); }
+    val err_found: err[A.Error] = manifest_target.dropped_extensions(?doc.table, ?dropped);
+    if (sel err_found.err) { ret err[fail.Fail].err{fail.refused(err_found.err)}; }
+    var i: usize = 0;
+    for (i < dropped.len) {
+        val d: *manifest_target.DroppedExt = ?dropped.data[i];
+        i = i + 1;
+        std_format.format(out, "{}:{}: [target.{}].ext entry \"{}\" names no capability, so the rewrite removes it\n", manifest_load.MANIFEST_FILE, line_of(doc.text, d.at.at), d.target, d.name);
+    }
+    ret err[fail.Fail].ok{};
 }
 
 # the string value of `key` in `t`, nil when it holds none
@@ -506,6 +713,46 @@ fun library_report(out: *io_writer.Writer, doc: *manifest_load.Doc, moved: *mani
     ret reported;
 }
 
+# each default library of the manifest `doc` when it has several, located: 6 made every one the
+# export surface, and 7 exports the one its author marks
+fun default_report(out: *io_writer.Writer, doc: *manifest_load.Doc) {
+    val opt_artifacts: opt[*toml_value.Table] = toml_lookup.get_table(?doc.table, "artifact");
+    if (sel opt_artifacts.none)                             { ret; }
+    if (migrate.export_candidates(opt_artifacts.some) <= 1) { ret; }
+    var i: usize = 0;
+    for (i < toml_lookup.table_len(opt_artifacts.some)) {
+        val opt_name: opt[str]               = toml_lookup.table_key(opt_artifacts.some, i);
+        val opt_row:  opt[*toml_value.Value] = toml_lookup.table_value(opt_artifacts.some, i);
+        i = i + 1;
+        if (sel opt_name.none)                                  { cnt; }
+        if (sel opt_row.none)                                   { cnt; }
+        if (opt_row.some.tag != toml_value.TYPE_TABLE)          { cnt; }
+        if (!migrate.default_library(?opt_row.some.data.table)) { cnt; }
+        std_format.format(out, "{}:{}: [artifact.{}] is one of several default libraries, which 6 made the export surface. 7 exports one library, so mark the one whose need consumers build `export = true`\n", manifest_load.MANIFEST_FILE, entry_line(doc, "artifact", opt_name.some), opt_name.some);
+    }
+}
+
+# each bin of the manifest `doc` that lists a spir-v target beside another, located, which no
+# one kind builds and the manifest check refuses
+fun module_report(out: *io_writer.Writer, doc: *manifest_load.Doc) usize {
+    val opt_artifacts: opt[*toml_value.Table] = toml_lookup.get_table(?doc.table, "artifact");
+    if (sel opt_artifacts.none) { ret 0; }
+    var reported: usize = 0;
+    var i:        usize = 0;
+    for (i < toml_lookup.table_len(opt_artifacts.some)) {
+        val opt_name: opt[str]               = toml_lookup.table_key(opt_artifacts.some, i);
+        val opt_row:  opt[*toml_value.Value] = toml_lookup.table_value(opt_artifacts.some, i);
+        i = i + 1;
+        if (sel opt_name.none)                                          { cnt; }
+        if (sel opt_row.none)                                           { cnt; }
+        if (opt_row.some.tag != toml_value.TYPE_TABLE)                  { cnt; }
+        if (!migrate.spirv_mixed(?doc.table, ?opt_row.some.data.table)) { cnt; }
+        std_format.format(out, "{}:{}: [artifact.{}] is a bin for a spirv target and another target. a spirv target builds a module, so write a separate kind = \"module\" artifact for the spirv target\n", manifest_load.MANIFEST_FILE, entry_line(doc, "artifact", opt_name.some), opt_name.some);
+        reported = reported + 1;
+    }
+    ret reported;
+}
+
 # whether the migration rewrites the option `name` in a step's `argv`
 fun step_rewrites(name: str) bool {
     var f: usize = 0;
@@ -527,15 +774,16 @@ fun line_of(text: str, at: usize) usize {
     ret line;
 }
 
-# each dependency the root project does not migrate: dep/ does not hold it, or it stands
-# on the previous major
+# each dependency the root project does not migrate: dep/ does not hold it, it stands on the
+# previous major, or it stands on a major older still, which an earlier mach migrates first
 fun dependency_report(out: *io_writer.Writer, deps: *Vector[migrate.Dependency]) {
     var i: usize = 0;
     for (i < deps.len) {
         val d: *migrate.Dependency = ?deps.data[i];
         i = i + 1;
-        if (d.range == nil)                     { std_format.format(out, "dependency '{}' was not read, as dep/ holds no manifest for it\n", d.id); }
-        or (migrate.on_previous_major(d.range)) { std_format.format(out, "dependency '{}' requires mach {}, the previous major. it migrates as its own project\n", d.id, d.range); }
+        if (d.range == nil)                              { std_format.format(out, "dependency '{}' was not read, as dep/ holds no manifest for it\n", d.id); }
+        or (migrate.on_previous_major(d.range))          { std_format.format(out, "dependency '{}' requires mach {}, the previous major. it migrates as its own project\n", d.id, d.range); }
+        or (!compile_closure.compiler_admitted(d.range)) { std_format.format(out, "dependency '{}' requires mach {}, which this mach does not accept and which is not the previous major. it migrates with an earlier mach first\n", d.id, d.range); }
     }
 }
 
@@ -589,8 +837,9 @@ pub val POLICY: args.Policy = args.Policy{refused: args.NO_FLAGS, refusal: "", c
 # ret: exit.OK when the project is in this major's spelling (or was made so), exit.USER when a
 #      file would change under --check, or in either mode when the manifest still writes a
 #      removed key no rewrite migrates, links a system library 6 found that it does not yet say
-#      how 7 finds, or a source could not be read as one; a script's or a step's removed option
-#      is reported and fails nothing. otherwise the failure
+#      how 7 finds, writes a bin for a spir-v target and another, or a source could not be read
+#      as one; a script's or a step's removed option is reported and fails nothing. otherwise
+#      the failure
 pub fun run(cx: *args.Call) res[i64, fail.Fail] {
     val arg:     *u8                                  = args.operand(cx.inv, 0);
     val res_loc: res[util.ProjectLocation, fail.Fail] = util.resolve_project_location(cx.a, arg);
@@ -624,6 +873,8 @@ pub fun run(cx: *args.Call) res[i64, fail.Fail] {
     if (sel err_walked.err) { ret res[i64, fail.Fail].err{err_walked.err}; }
     val res_stated: res[usize, fail.Fail] = leftover_report(cli_diagnostic.out(cx.report), cx.a, ?doc);
     if (sel res_stated.err) { ret res[i64, fail.Fail].err{res_stated.err}; }
+    val err_dropped: err[fail.Fail] = dropped_ext_report(cli_diagnostic.out(cx.report), cx.a, ?doc);
+    if (sel err_dropped.err) { ret res[i64, fail.Fail].err{err_dropped.err}; }
     val res_text: res[str, fail.Fail] = migrate.manifest(cx.a, doc.text);
     if (sel res_text.err) { ret res[i64, fail.Fail].err{res_text.err}; }
     fin { str_free(cx.a, res_text.ok); }
@@ -632,13 +883,16 @@ pub fun run(cx: *args.Call) res[i64, fail.Fail] {
     var moved: manifest_load.Doc = res_moved.ok;
     fin { manifest_load.doc_dnit(cx.a, ?moved); }
     val libraries: usize = library_report(cli_diagnostic.out(cx.report), ?doc, ?moved);
-    step_report(cli_diagnostic.out(cx.report), ?doc);
+    val modules:   usize = module_report(cli_diagnostic.out(cx.report), ?doc);
+    default_report(cli_diagnostic.out(cx.report), ?doc);
+    step_report(cli_diagnostic.out(cx.report), cx.a, ?doc);
     val err_searched: err[fail.Fail] = scripts_in(cli_diagnostic.out(cx.report), cx.a, loc.root, "", ?dirs, 0);
     if (sel err_searched.err) { ret res[i64, fail.Fail].err{err_searched.err}; }
     dependency_report(cli_diagnostic.out(cx.report), ?deps);
-    # a key no rewrite migrates or a source the rewrite refused leaves a project the reader refuses,
-    # and a system library 6 found and 7 is not told how to find leaves one the link refuses
-    if (res_stated.ok + libraries != 0 || keys.malformed + sources.malformed != 0) { ret res[i64, fail.Fail].ok{exit.USER}; }
-    if (check && keys.differing + sources.differing != 0)                          { ret res[i64, fail.Fail].ok{exit.USER}; }
+    # a key no rewrite migrates, a source the rewrite refused or a bin for spir-v and another
+    # target leaves a project the reader refuses, and a system library 6 found and 7 is not told
+    # how to find leaves one the link refuses
+    if (res_stated.ok + libraries + modules != 0 || keys.malformed + sources.malformed != 0) { ret res[i64, fail.Fail].ok{exit.USER}; }
+    if (check && keys.differing + sources.differing != 0)                                    { ret res[i64, fail.Fail].ok{exit.USER}; }
     ret res[i64, fail.Fail].ok{exit.OK};
 }

@@ -129,7 +129,7 @@ Rules:
   calls is not type checked and reports nothing.
 - The function may live in any module: a value-parameter instance is emitted
   against its declaring module and folds its `$if` gates against that module's
-  own comptime constants, so a library can export a comptime-parameter function
+  own comptime constants, so a library can make a comptime-parameter function public
   gated on its own `val`s, private ones included.
 - A comptime parameter may gate per-target asm safely, since each instance only
   compiles its taken arm:

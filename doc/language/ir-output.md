@@ -9,6 +9,11 @@ statement and what each instruction means are mirl's to state, in
 [the mirl IR specification](https://github.com/briar-systems/mirl/blob/dev/doc/ir.md)
 and [its text form](https://github.com/briar-systems/mirl/blob/dev/doc/ir/text.md).
 
+`--emit ir` or `--emit asm` without `--emit exe` writes the text and the objects
+and links nothing. `--emit ir --emit exe` also links, and `-o` is refused with
+`cli.flag_inapplicable` when the `--emit` set names no `exe`, since nothing is
+linked for it to name.
+
 The text reads back. `mirl` reads a file mach wrote, so a module can be
 compiled, verified or optimised on its own with `mirl compile` (`--level` sets
 the optimisation level, and the output goes to standard output unless `-o`

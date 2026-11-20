@@ -23,6 +23,10 @@ fwd ALIAS: PATH;            # re-export with rename
   by its module`.
 - A path that names a project and no module, such as `fwd std;`, is refused
   with `fwd.not_symbol`, `` `fwd` path must name a symbol of a module ``.
+- A path that names no module or member of one is refused with `use.unresolved`,
+  as a `use` is, with a message that reads `fwd path ...`. A path whose root is
+  not this project or a declared dependency names that root and says to declare
+  it in mach.toml.
 
 ## Examples
 

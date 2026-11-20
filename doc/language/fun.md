@@ -189,7 +189,8 @@ its tests reach. No object is made for instances alone.
   by hand with another toolchain that copies a real identity onto other code
   merges silently with the copies it imitates when it comes first in link order.
   Mach source cannot make one: a `#[symbol]` name that collides with an instance
-  is refused at link as a definition beside the copies.
+  is refused when its module is compiled if the instance is in the same module,
+  and at link as a definition beside the copies otherwise.
 - **Debugging a merged instance.** The copy that runs is the one the link kept,
   built with the settings of the library that held it. When that library was
   built under another profile, a debugger steps through code optimized, or

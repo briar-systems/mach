@@ -816,7 +816,9 @@ val SIGNATURE: [2]u8 = [2]u8{0x55, 0xaa};
 Exports a function or global from a shared library under its symbol name. It
 requires `pub` and is refused with `decorator.requires` on a declaration that is
 not `pub`, and with `decorator.misplaced` on an `ext` declaration, which another
-image defines. `pub` alone states a module's interface to other Mach modules and
+image defines. It is also refused with `decorator.misplaced` on a generic,
+comptime-parameter or pack function, whose instances have no one symbol, so one
+instantiation is exported through a non-generic `#[export]` wrapper. `pub` alone states a module's interface to other Mach modules and
 never exports. Takes no arguments, and `#[testing]` cannot combine with it. An
 exported declaration is seen from outside the image wherever its project sits in
 the build, so a dependency's `#[export]` is exported as the root project's is.

@@ -20,7 +20,9 @@ fun name(va: ...) RetType { ... }
 fun name(fixed: T, va: ...) RetType { ... }   # leading fixed params are allowed
 ```
 
-The pack parameter must be last. Any number of fixed (typed) parameters may
+The pack parameter must be last. A parameter written after it is refused with
+`pack.not_last`, and `...` anywhere else a type is expected is refused with
+`syntax.expected_type`. Any number of fixed (typed) parameters may
 precede it.
 
 ## Iterating with `$each`
