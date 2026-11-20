@@ -13,8 +13,9 @@ length and bytes of the module's warnings (compile/cache encodes them), then
 the count of the symbols the module defines for its test object to declare
 and per symbol its name, then the count of the instances the object holds a
 copy of and per instance its symbol, its 32-byte key and the count and names
-of the modules it reads, every number a little-endian u32 and every name its
-length then its bytes
+of the modules it reads, then the length and bytes of the module's offer of
+its bodies and of the names it offers (compile/offer), every number a
+little-endian u32 and every name its length then its bytes
 
 Source: [`src/compile/cache/record.mach`](../../../../src/compile/cache/record.mach)
 
@@ -80,6 +81,12 @@ pub rec Facts {
     copy_count:  u32;
     copy_reads:  *mach.base.intern.StrId;
     reads_count: u32;
+    # the module's offer of its bodies to its importers' inliners and its names list (mirl.opt.offer), which a
+    # restored module offers as its lowering did. empty when it offers none
+    offer:       *u8;
+    offer_len:   u32;
+    offered:     *u8;
+    offered_len: u32;
 }
 ```
 

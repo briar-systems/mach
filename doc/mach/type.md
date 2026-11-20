@@ -121,6 +121,7 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.base.handle`](base/hand
 | [`intern_function`](#intern_function) | the function type of a signature |
 | [`with_timed`](#with_timed) | the function type `tid` with the constant-time mode `timed` in place of its own |
 | [`is_fun_type`](#is_fun_type) | whether `tid` is a function type |
+| [`same_signature`](#same_signature) | whether the function types `a` and `b` state one signature: the same parameter types in order, the same result and the same C-variadic tail |
 | [`is_markable_fun`](#is_markable_fun) | whether `tid` is a function type a constant-time mode may mark: a function type that is not C-variadic, as no constant-time function is |
 | [`timed_of`](#timed_of) | the constant-time mode the function type `tid` states, TIMED_NONE for any other type |
 | [`intern_instance`](#intern_instance) | the instance of a generic under type arguments |
@@ -1294,6 +1295,16 @@ pub fun is_fun_type(ti: *TypeInterner, tid: TypeId) bool
 ```
 
 whether `tid` is a function type
+
+### same_signature
+
+```mach
+pub fun same_signature(ti: *TypeInterner, a: TypeId, b: TypeId) bool
+```
+
+whether the function types `a` and `b` state one signature: the same parameter types in order, the
+same result and the same C-variadic tail. the constant-time mode is no part of it, since a
+declaration with no body states none
 
 ### is_markable_fun
 

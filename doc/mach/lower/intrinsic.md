@@ -41,6 +41,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | :--- | :--- |
 | [`declared`](#declared) | the `#[intrinsic]` declaration `op` of the selected target, of function type `fn`, held to its row where it is declared, at `span` |
 | [`withdrawn`](#withdrawn) | a call of row `r`, named `name` at `span`, refused where masc's typing states that no environment admits the row, as GLSL.std.450 removed IMix |
+| [`admitted`](#admitted) | a call of row `r`, named `name` at `span`, refused with `spirv.capability` where the selection the calling function compiles under, the build's widened by the function's own extensions, does not hold what the row requires, as SPIR-V 1.0 holds no subgroup operation |
 | [`ends`](#ends) | whether row `r` ends its block, nothing falling through after it, as OpKill and OpTerminateInvocation |
 | [`result_class`](#result_class) | the storage class a call's pointer result points into where its row's typing states it: the Image class where it relates the result to the texel of an image, as OpImageTexelPointer's result points into (spir-v 1.6, OpImageTexelPointer), PhysicalStorageBuffer where the result is a physical pointer, as OpConvertUToPtr makes |
 | [`chain_base`](#chain_base) | the row operand a call's pointer result is chained from where its row's typing relates the result to an index chain, as OpInBoundsAccessChain's to its Base, the result pointing into the storage class that operand points into |
@@ -150,6 +151,19 @@ pub fun withdrawn(ctx: *mach.lower.context.LowerContext, span: mach.base.source.
 
 a call of row `r`, named `name` at `span`, refused where masc's typing states that no
 environment admits the row, as GLSL.std.450 removed IMix. a declaration of it builds
+
+### admitted
+
+```mach
+pub fun admitted(ctx: *mach.lower.context.LowerContext, span: mach.base.source.Span, name: str, r: *masc.core.row.Row) err[mach.base.fail.Fail]
+```
+
+a call of row `r`, named `name` at `span`, refused with `spirv.capability` where the selection
+the calling function compiles under, the build's widened by the function's own extensions,
+does not hold what the row requires, as SPIR-V 1.0 holds no subgroup operation. mirl's
+verifier holds every target op to this rule, so the call is refused here, at the call,
+naming the atom the back end would name. a function whose extensions the target cannot
+widen by is refused where its extensions are checked, so it is held to the build's alone
 
 ### ends
 

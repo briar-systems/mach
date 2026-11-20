@@ -2,10 +2,11 @@
 
 # mach.front.sema.inferred
 
-the lengths `[_]T` array types take from the array literals that fix them
+the lengths `[_]T` array types take from the array and string literals that fix them
 
 a pass over a module's syntax before any type resolves: it gives a literal's own `[_]T`, and the
-annotation of a `val` or `var` one initializes, the literal's element count. a `[_]` left unset
+annotation of a `val` or `var` one initializes, the literal's element count, and the annotation
+of a `val` or `var` a string literal initializes the literal's byte count. a `[_]` left unset
 is refused where it resolves.
 
 Source: [`src/front/sema/inferred.mach`](../../../../src/front/sema/inferred.mach)

@@ -20,7 +20,7 @@
 | [`guard`](guard.md) | tag payload guards: the lexical regions in which a payload place may be used |
 | [`handle`](handle.md) | `#[handle]` declarations, the types a target mints, and where a handle may be held |
 | [`infer`](infer.md) | typing expressions: each expression's type, the checks on its operands, and the instances its calls ask for |
-| [`inferred`](inferred.md) | the lengths `[_]T` array types take from the array literals that fix them |
+| [`inferred`](inferred.md) | the lengths `[_]T` array types take from the array and string literals that fix them |
 | [`instance`](instance.md) | the instances a module's sema discovers and the typing of each, which lowering reads |
 | [`interface`](interface.md) | what a module publishes for the lowering of every module that imports it, in place of its syntax tree: the facts of each module-level function and binding, the deep value of each module constant, and the public surface a `fwd` re-exports |
 | [`lint`](lint.md) | the lints over a typed module: uses of deprecated declarations, and testing declarations reached from code outside a test |

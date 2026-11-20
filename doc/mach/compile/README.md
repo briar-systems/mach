@@ -26,6 +26,7 @@ The directory's root module is [`mach.compile`](../compile.md).
 | [`frontend`](frontend.md) | the front end's products: a module's parse, its resolution and the surface it exports, its types and the typed surface importers read, each a kind declared here beside its computation |
 | [`identity`](identity.md) | source identity: what a merged definition was made from, independent of how it was compiled (mink.model.merged) |
 | [`load`](load.md) | loading a project's modules: the load walk, reloads after an edit, and the emit order |
+| [`offer`](offer.md) | offers: the bodies a module's normal object offers the inliners of the modules that import it (design 2.7) |
 | [`passes`](passes.md) | the back half's query kinds, and the passes that drive a project's modules through the build |
 | [`project`](project.md) | one project compiled for one build cell: its configuration, target, modules and objects |
 | [`readahead`](readahead.md) | files read and parsed ahead of the load walk |

@@ -12,7 +12,7 @@ globals, local instances and class copies the object declares and defines.
 
 Source: [`src/lower/context.mach`](../../../src/lower/context.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.float`](../base/float.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.front.ast`](../front/ast.md), [`mach.front.ast.expr`](../front/ast/expr.md), [`mach.front.ast.id`](../front/ast/id.md), [`mach.front.ast.type`](../front/ast/type.md), [`mach.front.comptime.capability`](../front/comptime/capability.md), [`mach.front.comptime.deep`](../front/comptime/deep.md), [`mach.front.comptime.failure`](../front/comptime/failure.md), [`mach.front.comptime.scope`](../front/comptime/scope.md), [`mach.front.comptime.value`](../front/comptime/value.md), [`mach.front.resolve`](../front/resolve.md), [`mach.front.sema.instance`](../front/sema/instance.md), [`mach.front.sema.interface`](../front/sema/interface.md), [`mach.front.sema.product`](../front/sema/product.md), [`mach.front.sema.template`](../front/sema/template.md), [`mach.lower.builder`](builder.md), [`mach.lower.linkage`](linkage.md), [`mach.lower.value`](value.md), [`mach.report.phase`](../report/phase.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.target.assembled`](../target/assembled.md), [`mach.target.facts`](../target/facts.md), [`mach.type`](../type.md), [`mach.type.kind`](../type/kind.md), [`mach.type.query.extent`](../type/query/extent.md), [`mach.type.shape`](../type/shape.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.float`](../base/float.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.front.ast`](../front/ast.md), [`mach.front.ast.decl`](../front/ast/decl.md), [`mach.front.ast.expr`](../front/ast/expr.md), [`mach.front.ast.id`](../front/ast/id.md), [`mach.front.ast.type`](../front/ast/type.md), [`mach.front.comptime.capability`](../front/comptime/capability.md), [`mach.front.comptime.deep`](../front/comptime/deep.md), [`mach.front.comptime.failure`](../front/comptime/failure.md), [`mach.front.comptime.scope`](../front/comptime/scope.md), [`mach.front.comptime.value`](../front/comptime/value.md), [`mach.front.resolve`](../front/resolve.md), [`mach.front.sema.instance`](../front/sema/instance.md), [`mach.front.sema.interface`](../front/sema/interface.md), [`mach.front.sema.product`](../front/sema/product.md), [`mach.front.sema.template`](../front/sema/template.md), [`mach.lower.builder`](builder.md), [`mach.lower.linkage`](linkage.md), [`mach.lower.value`](value.md), [`mach.report.phase`](../report/phase.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.target.assembled`](../target/assembled.md), [`mach.target.facts`](../target/facts.md), [`mach.type`](../type.md), [`mach.type.kind`](../type/kind.md), [`mach.type.query.extent`](../type/query/extent.md), [`mach.type.shape`](../type/shape.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,6 +21,9 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`FnInfo`](#fninfo) | `rec` | what the driver reads of a lowered module beside its mirl module: its name and, for each function of the module by index, what mach declared it as |
 | [`Unit`](#unit) | `rec` | what mach keeps of a lowered module once its mirl module is compiled and gone: its name and the facts of its functions |
 | [`NormalObject`](#normalobject) | `rec` | a module's test object holds its tests and `#[testing]` declarations beside its normal object, which it never changes |
+| [`Signed`](#signed) | `rec` | the function that stated a symbol of the unit first: an `ext fun` or a definition, its syntax and its declaration |
+| [`Defines`](#defines) | `tag` | what the object defines under a symbol, from a declaration written where its name is |
+| [`Meaning`](#meaning) | `rec` | what the object means by a symbol: its own definition, or what another module declares |
 | [`ModuleScope`](#modulescope) | `rec` | the module or template a lowering reads code from |
 | [`SpecClaim`](#specclaim) | `rec` | the `#[gpu.spec]` var that claims a specialization id: the module that declares it, its declaration there and its qualified name |
 | [`EachElement`](#eachelement) | `rec` | the element of a constant array a `$each` loop variable names: the array's expression and the element's index in it, where the element is stored |
@@ -56,7 +59,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`origin_scope`](#origin_scope) | the scope another module's template is read in: the copy its interface publishes, with a comptime scope over its constants that this lowering owns, so what an instance binds stays here |
 | [`scope_enter`](#scope_enter) | read code from `next` until the matching scope_leave, keeping the current scope |
 | [`scope_leave`](#scope_leave) | return to the scope the matching scope_enter left |
-| [`init_context`](#init_context) | make a lowering context for `req` that builds into `m` and records its functions' facts in `unit` |
+| [`init_context`](#init_context) | make a lowering context for the `count` requests at `reqs`, which builds into `m` from the first and records its functions' facts in `unit` |
 | [`module_enter`](#module_enter) | the context moved into the module `req` names, whose declarations it lowers next into the same mirl module: its scope, the instance set its code is read through and how it reads instances |
 | [`dnit_context`](#dnit_context) | release a lowering context; a nil context holds nothing |
 | [`each_element_of`](#each_element_of) | the element the innermost `$each` loop variable `name` names |
@@ -104,7 +107,6 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`end_scopes_from`](#end_scopes_from) | the storage of each local begun since `mark` ended, the latest first, where control still reaches |
 | [`pop_scopes_to`](#pop_scopes_to) | forget every local begun after `mark`, whose storage its block's exits have ended |
 | [`ptr_or_none`](#ptr_or_none) | the pointer type, which every address is held in |
-| [`byte_type`](#byte_type) | the byte type, which a global another module defines is declared as when only its address is taken |
 | [`builder_state`](#builder_state) | the first refusal the builder met, which every builder call after it skips |
 | [`int_type`](#int_type) | the mirl integer type of `bits` |
 | [`ptr_type`](#ptr_type) | the pointer type every address is held in, which never fails |
@@ -161,7 +163,10 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`function_named`](#function_named) | the function of the module named `name`, none when no function is |
 | [`global_named`](#global_named) | the global of the module named `name`, none when no global is |
 | [`define_function`](#define_function) | the module's definition of a function: a reference earlier in the module declared it, and the definition takes the declaration's place |
-| [`define_global`](#define_global) | the module's definition of a global, in place of a declaration a reference made |
+| [`hold_signature`](#hold_signature) | the unit holds one function for a symbol, so the `ext fun`s and the definition its modules state the symbol `name` with, as the function `d` declared by `did` does, state one signature |
+| [`hold_definition`](#hold_definition) | the object defines the symbol `name` as `what`, from the declaration whose name the module or template in scope writes at `span` |
+| [`hold_reference`](#hold_reference) | the object refers, at the node the lowering stands on, to the declaration `decl` of the module `origin` by the symbol `name` |
+| [`define_global`](#define_global) | the module's definition of the global `name`, in place of a declaration a reference made |
 | [`ensure_extern_function`](#ensure_extern_function) | the module's function `name`, declared here with `linkage` when another object defines it, with the mode `timed` its declaration states and the secret parameters and result its signature does, which are what a caller may trust of it |
 | [`stated_callee`](#stated_callee) | the declaration a call through a value of the function type `tid` states its callee keeps, none for a type marked with no constant-time mode: the type's mode, and the secret parameters, secret result and public pointers a function of that signature declares, so the call is trusted as one naming such a function is |
 | [`mode_of`](#mode_of) | the mode the function `decl` of module `origin` is declared with, as its module's interface publishes it |
@@ -367,6 +372,51 @@ holds is declared in the test object instead, so each symbol has one definition
 | Field | Type | |
 | :--- | :--- | :--- |
 | `defined` | `std.collections.map.Map[mach.base.intern.StrId, bool]` | the global symbols the normal object defines |
+
+## Signed
+
+```mach
+pub rec Signed {
+    a:    *mach.front.ast.Ast;
+    decl: mach.front.ast.id.DeclId;
+    sem:  mach.type.kind.TypeId;
+}
+```
+
+the function that stated a symbol of the unit first: an `ext fun` or a definition, its syntax
+and its declaration
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `a` | `*mach.front.ast.Ast` | the syntax that declares it |
+| `decl` | `mach.front.ast.id.DeclId` | its declaration |
+| `sem` | `mach.type.kind.TypeId` | its function type |
+
+## Defines
+
+```mach
+pub tag Defines: u8 {
+    declaration;
+    default;
+    instance;
+    copy;
+    testing;
+}
+```
+
+what the object defines under a symbol, from a declaration written where its name is. a `#[weak]` default is
+replaced at link by the definition another module gives, so it is not the module's meaning of the symbol
+
+## Meaning
+
+```mach
+pub rec Meaning {
+    defined:  opt[Definition];
+    referred: opt[Referral];
+}
+```
+
+what the object means by a symbol: its own definition, or what another module declares
 
 ## ModuleScope
 
@@ -658,6 +708,14 @@ pub rec LowerContext {
     # the declaration a call through a value of each function type marked constant time states its callee keeps,
     # stated once per type
     stated: std.collections.map.Map[mach.type.kind.TypeId, mirl.ir.id.Stated];
+    # the first function each symbol is stated by, where the unit takes several modules
+    signed: std.collections.map.Map[mach.base.intern.StrId, Signed];
+    # the requests of the modules the unit lowers into its one object, several for an artifact
+    # compiled whole, and how many
+    requests:    *LowerRequest;
+    request_len: usize;
+    # what the object means by each symbol it defines or refers to another module's declaration by
+    meanings: std.collections.map.Map[mach.base.intern.StrId, Meaning];
     # the read-only global holding each string's bytes, by its text: one per module
     strings: std.collections.map.Map[mach.base.intern.StrId, mach.lower.value.Value];
     # the pointees the debug types name by key, described once every other type is
@@ -785,15 +843,17 @@ return to the scope the matching scope_enter left
 ### init_context
 
 ```mach
-pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *mirl.ir.module.Module, unit: *Unit) err[mach.base.fail.Fail]
+pub fun init_context(lc: *LowerContext, reqs: *LowerRequest, count: usize, m: *mirl.ir.module.Module, unit: *Unit) err[mach.base.fail.Fail]
 ```
 
-make a lowering context for `req` that builds into `m` and records its functions' facts in `unit`
+make a lowering context for the `count` requests at `reqs`, which builds into `m` from the first
+and records its functions' facts in `unit`
 
 | Parameter | |
 | :--- | :--- |
 | `lc` | the lowering context |
-| `req` | the lowering request |
+| `reqs` | the lowering requests, one per module the unit lowers, borrowed |
+| `count` | how many there are |
 | `m` | the mirl module built into, borrowed |
 | `unit` | the unit the facts go to, borrowed |
 | **returns** | nothing, or the refusal, which leaves nothing for dnit_context to release |
@@ -1302,15 +1362,6 @@ pub fun ptr_or_none(lc: *LowerContext) Type
 ```
 
 the pointer type, which every address is held in
-
-### byte_type
-
-```mach
-pub fun byte_type(lc: *LowerContext) Type
-```
-
-the byte type, which a global another module defines is declared as when only its
-address is taken
 
 ### builder_state
 
@@ -1881,19 +1932,53 @@ the global of the module named `name`, none when no global is
 ### define_function
 
 ```mach
-pub fun define_function(lc: *LowerContext, data: FunctionData, info: FnInfo, span: mach.base.source.Span) res[u32, mach.base.fail.Fail]
+pub fun define_function(lc: *LowerContext, data: FunctionData, info: FnInfo, span: mach.base.source.Span, what: Defines) res[u32, mach.base.fail.Fail]
 ```
 
 the module's definition of a function: a reference earlier in the module declared it,
 and the definition takes the declaration's place
 
+### hold_signature
+
+```mach
+pub fun hold_signature(lc: *LowerContext, name: mach.base.intern.StrId, did: mach.front.ast.id.DeclId, d: *mach.front.ast.decl.Decl) err[mach.base.fail.Fail]
+```
+
+the unit holds one function for a symbol, so the `ext fun`s and the definition its modules state
+the symbol `name` with, as the function `d` declared by `did` does, state one signature. sema holds
+each module to this alone, and this holds the modules of a unit that takes several
+
+### hold_definition
+
+```mach
+pub fun hold_definition(lc: *LowerContext, name: mach.base.intern.StrId, span: mach.base.source.Span, what: Defines) err[mach.base.fail.Fail]
+```
+
+the object defines the symbol `name` as `what`, from the declaration whose name the module or
+template in scope writes at `span`. one symbol means one thing in a module, so a reference the
+object made under it to another module's declaration is refused. a second definition is
+define_function's and define_global's to refuse
+
+### hold_reference
+
+```mach
+pub fun hold_reference(lc: *LowerContext, name: mach.base.intern.StrId, origin: mach.session.module.ModuleId, decl: mach.front.ast.id.DeclId) err[mach.base.fail.Fail]
+```
+
+the object refers, at the node the lowering stands on, to the declaration `decl` of the module
+`origin` by the symbol `name`. a declaration of a module the object compiles is its own, and
+the symbol of any other means what the link binds it to, which the object's own definition of
+the symbol would stand in for, so that pair is refused whichever of the two comes first. a
+`#[weak]` default of another module is replaced at link by the definition that meets it, so a
+reference to one takes no part
+
 ### define_global
 
 ```mach
-pub fun define_global(lc: *LowerContext, g: GlobalData, span: mach.base.source.Span) res[u32, mach.base.fail.Fail]
+pub fun define_global(lc: *LowerContext, name: mach.base.intern.StrId, g: GlobalData, span: mach.base.source.Span) res[u32, mach.base.fail.Fail]
 ```
 
-the module's definition of a global, in place of a declaration a reference made
+the module's definition of the global `name`, in place of a declaration a reference made
 
 ### ensure_extern_function
 

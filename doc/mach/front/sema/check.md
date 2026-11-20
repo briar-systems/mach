@@ -57,7 +57,7 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 | [`report_typed`](#report_typed) | report a diagnostic of kind `k` whose message is `prefix`, the spelling of `t`, then `suffix` |
 | [`report_typed2`](#report_typed2) | report a diagnostic of kind `k` spelling two types between `prefix`, `mid` and `suffix`, with a note naming their modules when two distinct types spell the same |
 | [`expr_span_of`](#expr_span_of) | the span of expression `eid`, or the failure reading it, which also fails the phase as internal |
-| [`report_out_of_range`](#report_out_of_range) | the range refusal of a value an out-of-range coercion result describes |
+| [`report_out_of_range`](#report_out_of_range) | |
 | [`report_default_out_of_range`](#report_default_out_of_range) | the range refusal of a literal no context typed, which took the i64 default |
 | [`report_cast_out_of_range`](#report_cast_out_of_range) | the range refusal of a literal a cast to `to` reinterprets, which took an integer of `to`'s size |
 | [`report_literal_out_of_range`](#report_literal_out_of_range) | the range refusal of a suffixed literal its own suffix's type does not hold |
@@ -520,8 +520,6 @@ the span of expression `eid`, or the failure reading it, which also fails the ph
 ```mach
 pub fun report_out_of_range(sc: *mach.front.sema.context.SemaContext, span: mach.base.source.Span, cr: mach.front.sema.coerce.CoerceResult)
 ```
-
-the range refusal of a value an out-of-range coercion result describes
 
 ### report_default_out_of_range
 

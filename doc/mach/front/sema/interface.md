@@ -9,7 +9,7 @@ holds and points into no syntax tree, scope or other product
 
 Source: [`src/front/sema/interface.mach`](../../../../src/front/sema/interface.mach)
 
-Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.comptime.deep`](../comptime/deep.md), [`mach.front.resolve`](../resolve.md), [`mach.front.sema.template`](template.md), [`mach.session.module`](../../session/module.md).
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.base.source`](../../base/source.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.comptime.deep`](../comptime/deep.md), [`mach.front.resolve`](../resolve.md), [`mach.front.sema.template`](template.md), [`mach.session.module`](../../session/module.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -49,6 +49,7 @@ pub rec Declaration {
     kind:         mach.front.resolve.SymKind;
     canon:        mach.base.intern.StrId;
     decl:         mach.front.ast.id.DeclId;
+    at:           mach.base.source.Location;
     flags:        DeclarationFlags;
     generics:     u32;
     params_start: u32;
@@ -64,6 +65,7 @@ one module-level function, `val` or `var`
 | Field | Type | |
 | :--- | :--- | :--- |
 | `decl` | `mach.front.ast.id.DeclId` | the declaration in its module, which keys the session's tables of it |
+| `at` | `mach.base.source.Location` | where its name is written |
 | `generics` | `u32` | how many type parameters a function declares |
 | `params_start` | `u32` | where a function's parameters start in `params` |
 | `op_set` | `mach.base.intern.StrId` | the instruction set and operation an `#[intrinsic]` names, STR_NIL without one |

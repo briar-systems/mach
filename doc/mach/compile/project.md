@@ -21,6 +21,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`ProjectConfig`](#projectconfig) | `rec` | what a configured build cell compiles and where it writes |
 | [`ArtifactEntry`](#artifactentry) | `rec` | an artifact entry the union walk loads: the entry module, the artifact it is of and where the artifact's `entry` is written in the manifest |
 | [`ModuleEntry`](#moduleentry) | `rec` | a module the project loaded: its identity, what the load decided for it, and the codegen staging of its objects |
+| [`Offer`](#offer) | `rec` | a module's offer: mirl's text of the bodies it offers and its names list, a line per symbol the text states (mirl.opt.offer), both drawn from `a` |
 | [`Record`](#record) | `rec` | the cache record a compiled object carries into `obj/`, nil until the cache publishes one |
 | [`TestObject`](#testobject) | `rec` | a module's test object, beside its normal object and never changing it: the module's tests and what they reach that the normal object does not define |
 | [`Project`](#project) | `rec` | one project compiled for one build cell: its request, configuration and target, its module table with each module's products and objects, the object cache's state and the link job |
@@ -48,6 +49,10 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`recorded_dnit`](#recorded_dnit) | give back the front end's warnings a module's record held |
 | [`lower_scope_dnit`](#lower_scope_dnit) | release the scope lowering bound a module's constants in |
 | [`dep_count`](#dep_count) | how many modules a loaded module imports |
+
+| On `Offer` | |
+| :--- | :--- |
+| [`offer_dnit`](#offer_dnit) | give back an offer's bytes, leaving it empty |
 
 | On `Project` | |
 | :--- | :--- |
@@ -331,6 +336,11 @@ pub rec ModuleEntry {
     # collected then, are what a later refresh reads of it
     released:     bool;
     held_expects: std.collections.vector.Vector[mach.base.diagnostic.Expectation];
+    # the bodies its normal object offers its importers' inliners (compile/offer): made by its unit's run, handed to
+    # its importers as soon as it is made and moved here at its unit's completion, or read from the record of its
+    # restored object, empty when it offers none. only the owner replaces it, at its own unit's completion, and the
+    # bytes it held were handed to no unit of that pass
+    offer: Offer;
 }
 ```
 
@@ -361,6 +371,38 @@ pub fun dep_count(m: *ModuleEntry) u32
 ```
 
 how many modules a loaded module imports
+
+## Offer
+
+```mach
+pub rec Offer {
+    a:         *std.allocator.Allocator;
+    text:      *u8;
+    text_len:  u32;
+    names:     *u8;
+    names_len: u32;
+}
+```
+
+a module's offer: mirl's text of the bodies it offers and its names list, a line per symbol the text states
+(mirl.opt.offer), both drawn from `a`. both nil when it offers nothing. its bytes never move while it is held, so a
+unit's run reads them as views
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `a` | `*std.allocator.Allocator` | the allocator its bytes are drawn from, nil when it holds none |
+| `text` | `*u8` | the text of the offered bodies |
+| `text_len` | `u32` | its length |
+| `names` | `*u8` | its names list |
+| `names_len` | `u32` | their length |
+
+### offer_dnit
+
+```mach
+pub fun offer_dnit(o: *Offer)
+```
+
+give back an offer's bytes, leaving it empty
 
 ## Record
 

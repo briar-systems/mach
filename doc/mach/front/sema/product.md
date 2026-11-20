@@ -55,7 +55,7 @@ Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.
 | Constants | |
 | :--- | :--- |
 | [`INFERRED_LEN_NONE`](#constants), [`INFERRED_LEN_FAILED`](#constants) | |
-| [`INFERRED_LEN_NEEDS_LITERAL`](#constants) | a `[_]T` annotation on a binding whose initializer is absent or not an array literal |
+| [`INFERRED_LEN_NEEDS_LITERAL`](#constants) | a `[_]T` annotation on a binding whose initializer is absent or not an array or string literal |
 
 ---
 
@@ -373,5 +373,5 @@ the surface of the module `owner` among those `deps` holds, none when it holds n
 | :--- | :--- | :--- | :--- |
 | `INFERRED_LEN_NONE` | `u64` | `0xFFFFFFFFFFFFFFFF` |  |
 | `INFERRED_LEN_FAILED` | `u64` | `0xFFFFFFFFFFFFFFFE` |  |
-| `INFERRED_LEN_NEEDS_LITERAL` | `u64` | `0xFFFFFFFFFFFFFFFD` | a `[_]T` annotation on a binding whose initializer is absent or not an array literal |
+| `INFERRED_LEN_NEEDS_LITERAL` | `u64` | `0xFFFFFFFFFFFFFFFD` | a `[_]T` annotation on a binding whose initializer is absent or not an array or string literal |
 

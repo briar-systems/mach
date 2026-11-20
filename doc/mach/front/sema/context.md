@@ -85,6 +85,7 @@ Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.
 | [`check_handle_in_array`](#check_handle_in_array) | report a handle held as an array element of `ty`, unless a pointer chain over the handle already draws its own diagnostic |
 | [`report_internal`](#report_internal) | fail the phase internally with `f`, a defect met at `span` of the syntax in view; a failure that names a place of its own keeps it |
 | [`report_note`](#report_note) | a diagnostic of kind `k` with a note attached, nothing in a silent walk |
+| [`report_related`](#report_related) | a diagnostic of kind `k` that points at the related place `at` under `label`, nothing in a silent walk |
 | [`text`](#text) | `fmt` formatted with `args`, owned by the caller and released with `text_free`; a refused format fails the phase as an internal failure and gives none |
 | [`text_free`](#text_free) | release a text that `text` returned |
 | [`reportf`](#reportf) | a diagnostic whose message is `fmt` formatted with `args`; a refused format fails the phase as an internal failure, here and nowhere else |
@@ -271,6 +272,9 @@ pub rec Typing {
     # the symbols the module's definitions state so far, each by name, to the offset of
     # the declaration stating it
     symbols: *std.collections.map.Map[u32, u64];
+    # the functions of the module that state a symbol, an `ext fun`'s or a definition's, each
+    # by the symbol to the first declaration stating it
+    functions: *std.collections.map.Map[u32, mach.front.ast.id.DeclId];
     # the types a logical-addressing target was asked to declare, each judged once
     logical_seen:        *std.collections.map.Map[mach.type.kind.TypeId, bool];
     has_secret:          bool;
@@ -881,6 +885,15 @@ rejects the module
 | `span` | where it is reported |
 | `message` | its message |
 | `note` | the note attached, nil for none |
+
+### report_related
+
+```mach
+pub fun report_related(sc: *SemaContext, k: mach.base.diagnostic.kind.Kind, span: mach.base.source.Span, message: str, at: mach.base.source.Location, label: str)
+```
+
+a diagnostic of kind `k` that points at the related place `at` under `label`, nothing in a
+silent walk. only an error rejects the module
 
 ### text
 

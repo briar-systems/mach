@@ -21,7 +21,7 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 | :--- | :--- | :--- |
 | [`NodeKind`](#nodekind) | `def` |  |
 | [`Refusal`](#refusal) | `rec` | what reading a leaf with no compile-time value gives, and where that leaf is |
-| [`Symbol`](#symbol) | `rec` | the module-level function, `val` or `var` an address points into: its declaration `decl` in the module with stable id `module`, which name it in every module that reads it |
+| [`Symbol`](#symbol) | `rec` | the module-level function, `val` or `var` an address points into: its declaration `decl` in the module with stable id `module`, which name it in every module that reads it, and the type `ty` it is declared with, which its declaration in a module that reads it states |
 | [`Node`](#node) | `rec` | a value of a store: its shape, and the offset of its payload in the store's bytes |
 | [`Shape`](#shape) | `rec` | the form of a value apart from its scalar data |
 | [`Member`](#member) | `rec` | a member of an aggregate value |
@@ -136,11 +136,13 @@ pub rec Symbol {
     decl:     u32;
     canon:    mach.base.intern.StrId;
     function: bool;
+    ty:       mach.type.kind.TypeId;
 }
 ```
 
 the module-level function, `val` or `var` an address points into: its declaration `decl` in
-the module with stable id `module`, which name it in every module that reads it
+the module with stable id `module`, which name it in every module that reads it, and the type
+`ty` it is declared with, which its declaration in a module that reads it states
 
 ## Node
 

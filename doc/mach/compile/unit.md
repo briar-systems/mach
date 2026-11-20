@@ -5,15 +5,16 @@
 one unit's object, normal or test, made in two steps: a unit is one module, or every module of an
 artifact where the target's family compiles it whole. `lower` lowers the unit's
 code into a mirl module on a heap of its own and hands both back as one value, which its
-owner keeps until `compile` has verified it, written it as text when asked and compiled it
-into an object; `dnit` then tears the heap down. compiling reads the lowered unit and its
-job and writes only what it returns, so compiles of different units can run side by side on
-one shared target (mirl#406). each step times the stages it runs and keeps the counts each
-owner holds of the module, for the readout
+owner keeps until `compile` has bound the offers of other modules' bodies it was given,
+verified it, written it as text when asked and compiled it into an object; `dnit` then tears
+the heap down. compiling reads the lowered unit and its job and writes only what it returns,
+so compiles of different units can run side by side on one shared target (mirl#406). each
+step times the stages it runs and keeps the counts each owner holds of the module, for the
+readout
 
 Source: [`src/compile/unit.mach`](../../../src/compile/unit.mach)
 
-Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.backend`](backend.md), [`mach.compile.backend.compile`](backend/compile.md), [`mach.lower.context`](../lower/context.md).
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.backend`](backend.md), [`mach.compile.backend.compile`](backend/compile.md), [`mach.compile.offer`](offer.md), [`mach.lower.context`](../lower/context.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -62,6 +63,7 @@ pub rec Lowered {
     lower:     std.chrono.duration.Duration;
     functions: u64;
     ir_count:  u64;
+    offers:    Slice[mach.compile.offer.Candidate];
     spent:     bool;
 }
 ```
@@ -75,6 +77,7 @@ until `dnit`
 | `lower` | `std.chrono.duration.Duration` | lowering the module into mirl |
 | `functions` | `u64` | the module's functions, as mirl's module holds them |
 | `ir_count` | `u64` | the instructions lowering built into its bodies, as mirl's bodies hold them |
+| `offers` | `Slice[mach.compile.offer.Candidate]` | the other modules' offers of their bodies the module may bind before it is compiled (compile/offer), views on the heap of offers handed over, which outlive the compile |
 | `spent` | `bool` | compiling the module tore down the heap |
 
 ### lower

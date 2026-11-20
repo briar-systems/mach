@@ -8,7 +8,8 @@ an unsuffixed integer literal, or an expression built from such literals under t
 literal coerces through, takes the type it is checked against when its value fits that type's
 range, as a comptime integer value must. a float literal's rounding is checked once its type is
 final. assignment may add secrecy, spreads `^[N]T` to `[N]^T`, and converts `ptr` to and from
-a typed pointer that reaches no secret.
+a typed pointer that reaches no secret. a string literal checked against an array of u8 is
+that array, holding the literal's bytes and nothing else, when the counts agree.
 
 Source: [`src/front/sema/coerce.mach`](../../../../src/front/sema/coerce.mach)
 
@@ -34,7 +35,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.wide`](../..
 
 | Constants | |
 | :--- | :--- |
-| [`COERCE_COERCED`](#constants), [`COERCE_OUT_OF_RANGE`](#constants) | |
+| [`COERCE_COERCED`](#constants), [`COERCE_OUT_OF_RANGE`](#constants), [`COERCE_BYTES_LENGTH`](#constants), [`COERCE_BYTES_ELEMENT`](#constants) | |
 
 ---
 
@@ -49,6 +50,8 @@ pub rec CoerceResult {
     bounds:  mach.type.prim.IntRange;
 
     literal: bool;
+    bytes:   u64;
+    length:  u64;
 }
 ```
 
@@ -56,12 +59,14 @@ what coercing a literal-shaped expression to a type found
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `kind` | `CoerceKind` | COERCE_COERCED when it takes the type, COERCE_OUT_OF_RANGE when a value does not fit, or not applicable when the expression is no literal shape for that type |
-| `ty` | `mach.type.kind.TypeId` | the type coerced to, TYPE_ERROR when not applicable |
+| `kind` | `CoerceKind` | COERCE_COERCED when it takes the type, COERCE_OUT_OF_RANGE when a value does not fit, COERCE_BYTES_LENGTH when a string literal's byte count is not its array's length, COERCE_BYTES_ELEMENT when its array's element is no u8, or not applicable when the expression is no literal shape for that type |
+| `ty` | `mach.type.kind.TypeId` | the type coerced to, TYPE_ERROR when not applicable, the array a string literal missed |
 | `value` | `mach.base.wide.Wide` | out of range, the magnitude of the value that does not fit |
 | `negated` | `bool` | out of range, whether that value is negative |
 | `bounds` | `mach.type.prim.IntRange` | out of range, the range of the integer type it missed |
 | `literal` | `bool` | out of range, whether the value is a written literal rather than a comptime value |
+| `bytes` | `u64` | a string literal's refusal, the bytes the literal holds |
+| `length` | `u64` | a string literal's refusal, the length of the array it missed |
 
 ### out_of_range
 
@@ -194,4 +199,6 @@ a typed pointer that reaches no secret, or function types with equal signatures
 | :--- | :--- | :--- | :--- |
 | `COERCE_COERCED` | `CoerceKind` | `1` |  |
 | `COERCE_OUT_OF_RANGE` | `CoerceKind` | `2` |  |
+| `COERCE_BYTES_LENGTH` | `CoerceKind` | `3` |  |
+| `COERCE_BYTES_ELEMENT` | `CoerceKind` | `4` |  |
 

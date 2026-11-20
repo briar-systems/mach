@@ -24,7 +24,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.ast.id`](..
 | [`own_value`](#own_value) | the node of the value the module `val` `sym` declares, built in the module's store on first ask: the constant sema bound, or its initializer evaluated member by member; NONE for a declaration with no initializer of its own |
 | [`array_value`](#array_value) | the value of the array `sym` names that a `$each` reads: a module constant's, this module's built once and another module's as it published it, or the value of a `val` local to a body, built in the walk that reads it since each instance of the body may give it another; none for a binding with no array, record or case literal value |
 | [`store_of`](#store_of) | the store of constant values of the module with stable index `module_index`: this module's, or the one another module's interface publishes |
-| [`is_aggregate`](#is_aggregate) | an array literal, or a record or case literal spelled with its head type |
+| [`is_aggregate`](#is_aggregate) | an array literal, a string literal typed as an array of its bytes, or a record or case literal spelled with its head type |
 | [`type_at`](#type_at) | the type the walk gave an expression |
 | [`node_build`](#node_build) | the node of the expression `eid`: an aggregate literal member by member, the value of the constant it names, an address, or anything else as the evaluator answers it at the type the walk gave it |
 | [`zero_of`](#zero_of) | the zero of the type `ty` as a value, for an evaluation that holds a type and no expression |
@@ -126,7 +126,8 @@ another module's interface publishes
 pub fun is_aggregate(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId) bool
 ```
 
-an array literal, or a record or case literal spelled with its head type
+an array literal, a string literal typed as an array of its bytes, or a record or case literal
+spelled with its head type
 
 ### type_at
 

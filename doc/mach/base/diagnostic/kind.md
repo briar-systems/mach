@@ -49,6 +49,8 @@ Source: [`src/base/diagnostic/kind.mach`](../../../../src/base/diagnostic/kind.m
 | [`EXT_GENERIC`](#kind) | an ext fun with type or comptime parameters, whose instances no foreign library exports |
 | [`PACK_NOT_LAST`](#kind) | a parameter written after a variadic pack parameter |
 | [`DEP_IGNORED`](#kind) | a dependency slot under dep/ that an ignore rule of the enclosing repository ignores |
+| [`EXT_SIGNATURE`](#kind) | an `ext fun` and a definition, or two `ext fun`s, of one symbol in one module that state different signatures |
+| [`NAME_CLASH`](#kind) | a module's reference to another module's declaration under a symbol the module defines itself |
 | [`spec`](#spec) | the row of `k`, nil for NONE or a kind no row declares |
 | [`is_error`](#is_error) | a diagnostic of kind `k` is an error: severity is the row's level, and a kind no row declares is a defect, raised as an error if at all |
 | [`is_warning`](#is_warning) | a diagnostic of kind `k` is a warning |
@@ -579,6 +581,8 @@ pub def Kind: u16
 | `EXT_GENERIC` | `534` | an ext fun with type or comptime parameters, whose instances no foreign library exports |
 | `PACK_NOT_LAST` | `535` | a parameter written after a variadic pack parameter |
 | `DEP_IGNORED` | `536` | a dependency slot under dep/ that an ignore rule of the enclosing repository ignores |
+| `EXT_SIGNATURE` | `537` | an `ext fun` and a definition, or two `ext fun`s, of one symbol in one module that state different signatures |
+| `NAME_CLASH` | `538` | a module's reference to another module's declaration under a symbol the module defines itself |
 
 ### spec
 
@@ -757,5 +761,5 @@ the selection covers no warning row
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COUNT` | `usize` | `536` |  |
+| `COUNT` | `usize` | `538` |  |
 
