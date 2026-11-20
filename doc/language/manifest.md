@@ -1920,7 +1920,10 @@ entry for the DLL with each symbol imported by name, and on Mach-O a load comman
 with the install name and the entry's versions, each symbol bound to that
 library's ordinal. A Windows or macOS program therefore cross-links from any host
 with no import library, SDK or `-L`. A symbol two records give to two different
-libraries is refused, naming the symbol and both libraries.
+libraries is refused, naming the symbol and both libraries. On Mach-O the entry's
+`name` is the library's install name, an absolute path or one under a loader prefix
+such as `@rpath/libMoltenVK.dylib`, since no file is read to learn it, and a bare
+name such as `MoltenVK` is refused before the link, naming the entry.
 
 Everything else is a file: a `static` entry, a `local` entry, a `framework`, and
 every entry on ELF and wasm. ELF stays file based because only the `.so` states
