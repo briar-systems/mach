@@ -107,7 +107,7 @@ fun check(mac: ^u64, want: ^u64) bool {
 
 ```
 error[secret.branch] secret value used as a branch condition
-  @ ./src/mac.mach:3:5
+  @ src/mac.mach:3:5
 ```
 
 **GPU compute and shaders.** Vertex, fragment and compute stages are Mach functions. A `spirv` target compiles them straight to a finished SPIR-V module a Vulkan driver loads, with no shading language on the side and no second toolchain. See [shaders](https://machlang.org/docs/shaders.html).
@@ -169,7 +169,7 @@ $or {
 
 A target names an `arch`, an `sys`, an `abi` and optionally an object format `of`, and a spirv target an `env`. The values each axis accepts are listed in [the manifest reference](doc/language/manifest.md#accepted-tuple-values).
 
-x86_64 linux is the primary host. aarch64 linux runs natively in CI, riscv64 linux self-hosts under qemu, darwin self-hosts on both architectures, and windows is a cross-compilation target. `mach info targets` lists every tuple your binary can build.
+x86_64 linux is the primary host. aarch64 linux runs natively in CI, riscv64 linux self-hosts under qemu, darwin self-hosts on both architectures, and windows self-hosts on x86_64. `mach info targets` lists every tuple your binary can build.
 
 
 ## Documentation

@@ -25,7 +25,7 @@ Keep these core principles in mind when writing Mach to avoid common pitfalls:
 - **Tagged values use `sel` and lexical guards**: Unions with an active variant are declared as `tag Name: u8 { case1; case2: T; }`. Construct variants using `Type.case{payload}` or `Type.empty{}`. Inspect the active case with `sel place.case`, which evaluates to `bool` (`u8`) and can be used in expressions, stored, or combined with `!`, `&&`, and `||`. Variant payloads are ordinary storage accessible wherever guarded: inside an `if (sel place.case)` block, in expressions on the right-hand side of `&&` (such as `if (sel r.ok && r.ok > 0)`), or after all alternative variant branches exit via `ret`, `brk`, or `cnt`. Whole tags can be assigned, passed, and returned, but cannot be compared with `==` or `!=`.
 - **No error bubbling sugar**: Mach has no `try` keyword or `?` error propagation operator. Explicitly test and return errors: `if (sel outcome.err) { ret res[T, E].err{outcome.err}; }`.
 - **Explicit generic call sites**: Generic function and type instantiations must always provide explicit type parameters at call sites, such as `identity[i64](42)`.
-- **Decorators use `#[...]`**: Placed on the line or lines immediately preceding the declaration. Multiple decorators can be stacked one per line (such as `#[inline]` followed by `#[symbol("name")]`) or written space-separated on the same line.
+- **Decorators use `#[...]`**: Placed on the line or lines immediately preceding the declaration. Multiple decorators can be stacked one per line (such as `#[inline("always")]` followed by `#[symbol("name")]`) or written space-separated on the same line.
 
 ## Project and Module Structure
 
@@ -322,7 +322,7 @@ A test is named with an identifier in its module's own test namespace, so it nev
 - **Floating point**: `f16`, `f32`, `f64`.
 - **Untyped pointer**: `ptr`.
 - **Typed pointers**: `*T`. Pointers support array indexing `p[i]` and dereferencing `@p`. Member access on a pointer auto-dereferences once, so accessing a field through a pointer is written `p.x`.
-- **Arrays**: `[N]T` where `N` is a compile-time constant expression, such as `[4]u32`. Array literals are written as `[4]u32{1, 2, 3, 4}`. Fixed arrays are value types copied on assignment and function calls. To pass array data without copying, pass a pointer `*[N]T` or pass pointer and length pairs. The standard library also defines `std.types.view.View` as one common slice record representation. The inferred array syntax `[_]u8` is permitted only on `val` bindings annotated with `#[embed("path")]`.
+- **Arrays**: `[N]T` where `N` is a compile-time constant expression, such as `[4]u32`. Array literals are written as `[4]u32{1, 2, 3, 4}`. Fixed arrays are value types copied on assignment and function calls. To pass array data without copying, pass a pointer `*[N]T` or pass pointer and length pairs. The standard library also defines `std.types.view.View` as one common slice record representation. The inferred length `[_]T` is permitted on a `val` or `var` initialized by an array literal, such as `val names: [_]u8 = [_]u8{1, 2, 3};`, and on a `val` annotated with `#[embed("path")]`.
 - **SIMD vectors**: Formatted as `<scalar>x<lanes>` such as `f32x4`, `i32x8`, and `u8x16`. Literals are positional expressions like `f32x4{1.0, 2.0, 3.0, 4.0}`. Lane access uses compile-time indexing `vec[0]`.
 - **Function pointers**: `fun(ParamTypes) ReturnType`, such as `fun(i64, *u8) i64`.
 - **Secret qualifier**: `^T` marks values containing sensitive data subject to constant-time restrictions. Secret values cannot be branched on, looped on, or used as array indices or memory addresses. The only way to remove the secret qualifier is an explicit downgrade cast `val:>T`.
@@ -345,7 +345,7 @@ fun update_point(p: *Point) {
 - **Integers**: Decimal `42`, hexadecimal `0x2A`, binary `0b101010`, octal `0o52`, with optional digit separators `1_000_000`. Typed integer suffixes include `42u8`, `100i32`, `500u64`.
 - **Floats**: `3.14`, `1.0e-5`, with optional typed suffixes `2.5f32`, `0.1f64`.
 - **Characters**: `'A'` represents a `u8` byte value. Standard escape sequences include `\n`, `\t`, `\r`, `\\`, `\'`, `\0`, `\xHH`.
-- **Strings**: `"hello\n"` represents a null-terminated `*u8` pointer to static memory. Multi-line strings are not supported directly, so embed newline escapes instead. Strings do not have a `.len` property, and `==` compares pointer addresses. Use standard library functions to measure length or compare contents:
+- **Strings**: `"hello\n"` represents a null-terminated `*u8` pointer to static memory. Text of several lines is a multiline string: each line starts with `\\`, and the lines join with `\n`. Strings do not have a `.len` property, and `==` compares pointer addresses. Use standard library functions to measure length or compare contents:
 
 ```mach
 use std.types.bool.bool;
@@ -548,7 +548,7 @@ Every intrinsic is described in `doc/language/comptime-intrinsics.md`.
 Decorators attach compiler metadata to declarations. Each directive is written in its own `#[<name>]` or `#[<name>(arg)]` clause. Multiple decorators can be stacked across several lines immediately preceding the declaration or written space-separated on one line:
 
 ```mach
-#[inline]
+#[inline("always")]
 #[symbol("fast_calc")]
 pub fun fast_calc(x: i64) i64 {
     ret x * 2;
@@ -556,16 +556,16 @@ pub fun fast_calc(x: i64) i64 {
 ```
 
 - `#[symbol("name")]`: overrides the exported or imported linker symbol name.
-- `#[inline]`: forces the compiler to inline a function.
+- `#[inline("always")]`: forces the compiler to inline a function, and `#[inline("never")]` forbids it.
 - `#[align(N)]`: raises the alignment of a record, union, tag, global or function.
 - `#[packed]`: removes alignment padding from a record, union, or tag.
 - `#[section(".name")]`: places a function or global variable into a specific object file section.
 - `#[embed("path")]`: embeds the raw bytes of an external file at compile time into an uninitialized `val name: [_]u8;` array.
 - `#[library("name")]`: specifies the dynamic library name required for an external import.
 - `#[deprecated]` or `#[deprecated("message")]`: emits a compile warning wherever another module uses the decorated symbol.
-- `#[scalar]`: opts a function out of automatic vectorization.
+- `#[vectorize("never")]`: opts a function out of automatic vectorization.
 - `#[naked]`: emits a function without prologue or epilogue code, intended for functions written entirely with inline assembly.
-- `#[oblivious]`: marks a function as constant-time, verifying that no secret-dependent branches or variable-latency operations are emitted.
+- `#[constant_time("soft")]` or `#[constant_time("hard")]`: marks a function as constant-time, verifying that no secret-dependent branches or variable-latency operations are emitted.
 
 Every decorator, and where each one applies, is listed in `doc/language/decorators.md`.
 
@@ -576,17 +576,17 @@ Inline assembly uses an ISA-tagged block with native instruction text:
 ```mach
 pub fun pause() {
     $if ($mach.build.arch == $mach.arch.x86_64) {
-        asm x86_64 {
+        asm x86-64 {
             pause
         }
     }
     $or ($mach.build.arch == $mach.arch.aarch64) {
-        asm aarch64 {
+        asm armv8-a {
             isb
         }
     }
     $or ($mach.build.arch == $mach.arch.riscv64) {
-        asm riscv64 {
+        asm rv64i_zihintpause {
             pause
         }
     }
@@ -594,7 +594,7 @@ pub fun pause() {
 ```
 
 Rules for inline assembly:
-- The architecture tag is mandatory: one of `x86_64`, `aarch64`, `riscv64`, `riscv32`.
+- The head is mandatory and is a selection in masc's syntax for the instruction set, such as `x86-64`, `x86-64,avx2`, `armv8-a` or `rv64gc_zba`. A head names no architecture, so `$if` chooses a block per target.
 - Operands reference local variables via `{name}` substitution. The compiler resolves substitutions to registers or stack slots based on instruction semantics.
 - Never write double indirections like `[{ptr}]`. Always load the address into a register first, then dereference the register.
 - The compiler automatically infers clobber sets and assumes a memory clobber. Manual clobber lists do not exist.
