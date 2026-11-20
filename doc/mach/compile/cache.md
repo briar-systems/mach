@@ -50,10 +50,10 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`forget`](#forget) | every key, skip decision and record of the previous load is dropped: the next load keys again, and a project that is not keyed processes every module |
 | [`note_written`](#note_written) | the object written to `location` was the `len` bytes at `bytes`: a keyed object under `obj/` is remembered by its digest for the restore that reads it back |
 | [`store_written`](#store_written) | store the digests of the objects this build wrote, once they are in place |
-| [`object_written`](#object_written) | a completed unit's object reaches its `obj/` file through a sibling temporary, carrying its record, since the object cache reads it back, and the build holds no form of it after: a link reads it back from there (object_back) |
+| [`object_written`](#object_written) | a completed unit's object reaches its `obj/` file through a sibling temporary, carrying its record, since the object cache reads it back, and the build holds no form of it after: a link reads it back from there (objects_back) |
 | [`test_object_written`](#test_object_written) | the same for the module's test object, its time carved out of test codegen's |
-| [`object_back`](#object_back) | the object module `m` wrote when its unit completed, read back from its file into the slot it left, as the cache restores one, so a link reads the one form whether the object was made now or restored |
-| [`test_object_back`](#test_object_back) | the same for the module's test object |
+| [`objects_back`](#objects_back) | the objects of the units in the link's order, each read back from the file it was written to when its unit completed into the slot it left, as the cache restores one, so a link reads the one form whether the object was made now or restored |
+| [`test_objects_back`](#test_objects_back) | the same for the test objects of the emitted modules, in their order |
 | [`object_reread`](#object_reread) | `o` replaced by the object the file `from` holds, which the build wrote from it |
 | [`test_input_key`](#test_input_key) | the query key of a module's test object products and its object key input |
 | [`instance_key`](#instance_key) | the key of an instance: the configuration, its symbol and what it reads |
@@ -236,7 +236,7 @@ pub fun object_written(p: *mach.compile.project.Project, m: *mach.compile.projec
 
 a completed unit's object reaches its `obj/` file through a sibling temporary, carrying its
 record, since the object cache reads it back, and the build holds no form of it after: a link
-reads it back from there (object_back). a module the cache restored is there already, and one
+reads it back from there (objects_back). a module the cache restored is there already, and one
 with nowhere to go keeps its object. the time is the emit row's, carved out of codegen's
 
 ### test_object_written
@@ -247,24 +247,27 @@ pub fun test_object_written(p: *mach.compile.project.Project, m: *mach.compile.p
 
 the same for the module's test object, its time carved out of test codegen's
 
-### object_back
+### objects_back
 
 ```mach
-pub fun object_back(p: *mach.compile.project.Project, m: *mach.compile.project.ModuleEntry) err[mach.base.fail.Fail]
+pub fun objects_back(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
 ```
 
-the object module `m` wrote when its unit completed, read back from its file into the slot it
-left, as the cache restores one, so a link reads the one form whether the object was made now
-or restored. what the format writes and reads back otherwise is not the object's and never
-reaches a link. an object held in memory is left as it is
+the objects of the units in the link's order, each read back from the file it was written to
+when its unit completed into the slot it left, as the cache restores one, so a link reads the
+one form whether the object was made now or restored. what the format writes and reads back
+otherwise is not the object's and never reaches a link. the units before the first without an
+object, which a link refuses, are read, and an object held in memory is left as it is. on more
+than one thread the reads run on a crew, and what they make and the failure returned are the
+same as reading them in order
 
-### test_object_back
+### test_objects_back
 
 ```mach
-pub fun test_object_back(p: *mach.compile.project.Project, m: *mach.compile.project.ModuleEntry) err[mach.base.fail.Fail]
+pub fun test_objects_back(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
 ```
 
-the same for the module's test object
+the same for the test objects of the emitted modules, in their order
 
 ### object_reread
 
