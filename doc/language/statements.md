@@ -185,7 +185,8 @@ fun leave() i64 {
 ## Block
 
 `{ ... }` introduces a new lexical scope. Statements inside are evaluated
-in order. Blocks can stand alone:
+in order, and the storage of a local declared in it ends when control leaves it
+(see [val-var.md](val-var.md#scope)). Blocks can stand alone:
 
 ```mach fragment
 {

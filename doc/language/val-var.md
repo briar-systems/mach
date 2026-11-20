@@ -63,6 +63,17 @@ At module top level:
 
 Inside functions, they are local to the enclosing block.
 
+A local's storage begins at its declaration and ends when control leaves the
+block that declares it: by reaching the end of the block, by `brk` or `cnt` out
+of it, or by `ret`. A declaration inside a loop makes the local anew on each pass
+through it, so nothing it held carries from one pass to the next.
+
+A pointer to a local may be used only while the local's storage lasts. Reading or
+writing through one after its block was left is undefined behaviour, which the
+compiler does not diagnose. Two locals whose storage never lasts at the same time
+may occupy the same bytes of the frame, as an optimised build lays them out, so a
+pointer kept past its block may read or write another local.
+
 A module-level `val` of integer, `bool` or float type whose initializer is a
 compile-time constant **is** that value at every use site, in its own module and
 in every module that imports it, however the reference is spelled (bare,
