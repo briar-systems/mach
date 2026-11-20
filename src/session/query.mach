@@ -8,6 +8,27 @@
 # and depth first; equal bytes on recomputation keep the previous revision and
 # stop propagation; a failed dependency fails the product and the previous value
 # is never served. all reads happen inside one operation
+#
+# a product may be prepared: computed now and finished later outside its computation (a worker
+# thread's), then completed or cancelled on the owner. the contract of a prepared attempt:
+# - it is prepared outside every computation, or inside the computation of another prepared
+#   product, its parent, at any depth. it is never prepared inside a computation `get` started,
+#   which would publish before the prepared product could complete
+# - a nested prepare records the parent's edge to it where `get` would, before it computes, and
+#   the edge takes its revisions when it completes, so the parent's dependency list is the one
+#   `get` would have made
+# - while it computes, or is entered again (`prepared_enter`), a failure raised is its own, held
+#   by its attempt, and its parent holds again once it returns
+# - between its prepare and its completion it may be entered again on the owner, outside every
+#   computation or over its parent's frame, and what is read then records onto it after what its
+#   computation read, in read order, as though the computation had gone on reading
+# - a product completes only after every product its computation prepared completed or was
+#   cancelled. a nested product completes as `get` answers it: a failure is recorded where a
+#   failure of `get` would have been, a reported one rejects the product for the rest of the
+#   operation, and a published one is observed by its parent's edge. cancelling a product cancels
+#   what it prepared first
+# - no reader is served a prepared product before it completes, and the operation cannot end
+#   while one is pending
 use std.collections.map;
 use std.collections.map.Map;
 use collections_vector: std.collections.vector;
@@ -151,6 +172,11 @@ pub rec Presentation {
 #            and cancel_prepared leaves unrecorded
 # origin:    the origin of the product whose computation raised `held`
 # displaced: the failure `held` displaced, owned like it, since a computation may still read the copy it was handed
+# parent:    the prepared product whose computation prepared this one, none for one prepared outside every
+#            computation
+# edge:      the parent's edge to this product, which its completion observes
+# children:  how many products its computation prepared are still pending
+# outer:     the attempt that held failures before this one was entered again
 rec Attempt {
     key:       Slot;
     prepared:  *QueryEntry;
@@ -162,6 +188,10 @@ rec Attempt {
     held:      opt[fail.Fail];
     origin:    diagnostic.Origin;
     displaced: opt[fail.Fail];
+    parent:    opt[usize];
+    edge:      u32;
+    children:  u32;
+    outer:     opt[usize];
 }
 
 # the bytes a derived product's computation publishes, allocated from the allocator it was handed
@@ -1213,16 +1243,18 @@ pub fun get[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[QueryVi
     ret res[QueryView, fail.Fail].ok{QueryView{value: entry.value, value_len: entry.value_len, last_changed: entry.last_changed}};
 }
 
-# validation may refresh dependencies but never computes the requested product
+# validation may refresh dependencies but never computes the requested product. asked inside a prepared
+# product's computation it records no edge, so the computation reads or prepares the product next
 pub fun reusable[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[bool, fail.Fail] {
     $if (role.CHECKED) { role.touched(role.QUERY, nil); }
 
     if (rt == nil || rt.db == nil || ctx == nil) {
         ret res[bool, fail.Fail].err{fail.message("query reuse requires a complete runtime")};
     }
-    val db: *QueryDb = rt.db;
-    if (!db.operation_active || db.stack.len != 0) {
-        ret res[bool, fail.Fail].err{fail.message("query reuse requires an active owner-thread operation")};
+    val db:        *QueryDb   = rt.db;
+    val computing: opt[usize] = computing_attempt(db);
+    if (!db.operation_active || (db.stack.len != 0 && sel computing.none)) {
+        ret res[bool, fail.Fail].err{fail.message("query reuse requires an active owner-thread operation, outside every computation or in a prepared one")};
     }
     val opt_poison: opt[fail.Fail] = operation_poison(db);
     if (sel opt_poison.some) { ret res[bool, fail.Fail].err{opt_poison.some}; }
@@ -1246,6 +1278,7 @@ fun reusable_inner[T](rt: *QueryRuntime[T], ctx: *T, row: *Kind, key: u64) res[b
         || db.attempts.data[@opt_pending.some].cancelled)) {
         ret res[bool, fail.Fail].err{fail.message("query product is awaiting owner completion")};
     }
+    if (stack_contains(db, kind, key)) { ret res[bool, fail.Fail].err{cycle_failure(db, kind, key)}; }
     val entry: *QueryEntry = entry_find(sh, key);
     if (entry == nil || !entry.ready) { ret res[bool, fail.Fail].ok{false}; }
     val opt_prior: opt[*Revision] = map.get[Slot, Revision](?db.validated, ?pair);
@@ -1284,7 +1317,8 @@ fun reusable_inner[T](rt: *QueryRuntime[T], ctx: *T, row: *Kind, key: u64) res[b
 # published by complete_prepared or dropped by cancel_prepared before the operation ends. a
 # failure raised while it computes is the prepared product's: it is held, and recorded by
 # complete_prepared or left unrecorded by cancel_prepared, so a product prepared ahead never
-# fails the operation before the products the caller completes ahead of it
+# fails the operation before the products the caller completes ahead of it. prepared inside
+# a prepared product's computation it is that product's child (see the header)
 pub fun prepare[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[PreparedQuery, fail.Fail] {
     $if (role.CHECKED) { role.touched(role.QUERY, nil); }
 
@@ -1300,17 +1334,32 @@ pub fun prepare[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[Pre
 # prepare's work: compute a derived product not yet acquired in the operation into a candidate the
 # attempt keeps, holding any failure the computation raises
 fun prepare_inner[T](rt: *QueryRuntime[T], ctx: *T, row: *Kind, key: u64) res[PreparedQuery, fail.Fail] {
+    if (rt == nil || rt.db == nil) { ret res[PreparedQuery, fail.Fail].err{fail.message("query prepare requires a live runtime")}; }
+    val parent: opt[usize] = computing_attempt(rt.db);
+    if (rt.db.stack.len != 0 && sel parent.none) {
+        ret res[PreparedQuery, fail.Fail].err{fail.message("a product is prepared outside every computation or inside a prepared one")};
+    }
     val res_current: res[bool, fail.Fail] = reusable[T](rt, ctx, row, key);
     if (sel res_current.err) { ret res[PreparedQuery, fail.Fail].err{res_current.err}; }
     if (res_current.ok)      { ret res[PreparedQuery, fail.Fail].err{fail.message("cannot prepare a query owner already acquired in this operation")}; }
-    val db:           *QueryDb              = rt.db;
-    val sh:           *QueryShard           = shard_find(db, row);
-    val kind:         KindIndex             = sh.kind;
-    val pair:         Slot                  = Slot{kind: kind, key: key};
+    val db:   *QueryDb    = rt.db;
+    val sh:   *QueryShard = shard_find(db, row);
+    val kind: KindIndex   = sh.kind;
+    val pair: Slot        = Slot{kind: kind, key: key};
+    # the parent's edge is recorded before the product computes, as `get` records a read, and observed
+    # when it completes
+    var edge: u32 = 0;
+    if (sel parent.some) {
+        val res_recorded: res[u32, fail.Fail] = dep_record(db, ?db.stack.data[db.stack.len - 1], kind, key);
+        if (sel res_recorded.err) { ret res[PreparedQuery, fail.Fail].err{res_recorded.err}; }
+        edge = res_recorded.ok;
+    }
     val res_reserved: res[usize, fail.Fail] = attempt_prepare(db, pair);
     if (sel res_reserved.err) { ret res[PreparedQuery, fail.Fail].err{res_reserved.err}; }
     val index: usize = res_reserved.ok;
     if (db.attempts.data[index].prepared != nil) { ret res[PreparedQuery, fail.Fail].err{fail.message("query product is already prepared")}; }
+    # what its computation prepares counts against it from here on
+    db.attempts.data[index].children = 0;
     val res_allocated: res[*QueryEntry, A.Error] = A.allocate[QueryEntry](db.a, 1);
     if (sel res_allocated.err) { ret res[PreparedQuery, fail.Fail].err{fail.refused(res_allocated.err)}; }
     val candidate: *QueryEntry = res_allocated.ok;
@@ -1335,29 +1384,59 @@ fun prepare_inner[T](rt: *QueryRuntime[T], ctx: *T, row: *Kind, key: u64) res[Pr
     if (sel err_pushed.err) { ret res[PreparedQuery, fail.Fail].err{err_pushed.err}; }
     db.holding = opt[usize].some{index};
     val err_computed: err[fail.Fail] = candidate_compute[T](rt, ctx, sh, key, candidate);
-    db.holding = opt[usize].none{};
+    db.holding = parent;
     stack_pop(db);
     if (sel err_computed.err) { val held: fail.Fail = attempt_hold(db, index, err_computed.err, computing_origin(db)); }
     db.attempts.data[index].prepared = candidate;
     db.attempts.data[index].fresh    = fresh;
-    db.prepared_count                = db.prepared_count + 1;
-    retained                         = true;
+    db.attempts.data[index].parent   = parent;
+    db.attempts.data[index].edge     = edge;
+    if (sel parent.some) { db.attempts.data[parent.some].children = db.attempts.data[parent.some].children + 1; }
+    db.prepared_count = db.prepared_count + 1;
+    retained          = true;
     ret res[PreparedQuery, fail.Fail].ok{PreparedQuery{
         operation: Operation{owner: db::ptr, sequence: db.operation_sequence}, key: pair
     }};
 }
 
-# the attempt holding a prepared product, refusing a handle from another operation, one used
-# during a computation, or one already completed or cancelled
-fun prepared_attempt(db: *QueryDb, prepared: PreparedQuery) res[*Attempt, fail.Fail] {
+# the attempt whose computation is on top of the stack: a prepare computing, or a prepared product entered
+# again. none when the stack is empty or a computation `get` started is on top
+fun computing_attempt(db: *QueryDb) opt[usize] {
+    if (db.stack.len == 0) { ret opt[usize].none{}; }
+    if (sel db.holding.some) {
+        val at:  Slot        = db.attempts.data[db.holding.some].key;
+        val top: *StackFrame = ?db.stack.data[db.stack.len - 1];
+        if (top.kind == at.kind && top.key == at.key) { ret db.holding; }
+    }
+    ret opt[usize].none{};
+}
+
+# the index of the attempt holding a prepared product, refusing a handle from another operation, one
+# reached inside a computation other than its parent's, or one already completed or cancelled
+fun prepared_index(db: *QueryDb, prepared: PreparedQuery) res[usize, fail.Fail] {
     if (db == nil || prepared.operation.owner != db::ptr || prepared.operation.sequence != db.operation_sequence
-        || !db.operation_active || db.stack.len != 0) { ret res[*Attempt, fail.Fail].err{fail.message("prepared query belongs to another operation")}; }
+        || !db.operation_active) { ret res[usize, fail.Fail].err{fail.message("prepared query belongs to another operation")}; }
     var key:       Slot        = prepared.key;
     val opt_index: opt[*usize] = map.get[Slot, usize](?db.attempt_index, ?key);
-    if (sel opt_index.none) { ret res[*Attempt, fail.Fail].err{fail.message("prepared query is no longer owned")}; }
-    val attempt: *Attempt = ?db.attempts.data[@opt_index.some];
-    if (attempt.prepared == nil) { ret res[*Attempt, fail.Fail].err{fail.message("prepared query has already been consumed")}; }
-    ret res[*Attempt, fail.Fail].ok{attempt};
+    if (sel opt_index.none) { ret res[usize, fail.Fail].err{fail.message("prepared query is no longer owned")}; }
+    val index: usize = @opt_index.some;
+    if (db.attempts.data[index].prepared == nil) { ret res[usize, fail.Fail].err{fail.message("prepared query has already been consumed")}; }
+    # the owner reaches a prepared product outside every computation, or from its parent's computation
+    if (db.stack.len != 0) {
+        val opt_at: opt[usize] = computing_attempt(db);
+        if (sel opt_at.none) { ret res[usize, fail.Fail].err{fail.message("prepared query is reached inside a computation that did not prepare it")}; }
+        val parent: opt[usize] = db.attempts.data[index].parent;
+        if (sel parent.none)            { ret res[usize, fail.Fail].err{fail.message("prepared query is reached inside a computation that did not prepare it")}; }
+        if (parent.some != opt_at.some) { ret res[usize, fail.Fail].err{fail.message("prepared query is reached inside a computation that did not prepare it")}; }
+    }
+    ret res[usize, fail.Fail].ok{index};
+}
+
+# the attempt holding a prepared product, refused as `prepared_index` refuses it
+fun prepared_attempt(db: *QueryDb, prepared: PreparedQuery) res[*Attempt, fail.Fail] {
+    val res_index: res[usize, fail.Fail] = prepared_index(db, prepared);
+    if (sel res_index.err) { ret res[*Attempt, fail.Fail].err{res_index.err}; }
+    ret res[*Attempt, fail.Fail].ok{?db.attempts.data[res_index.ok]};
 }
 
 # whether the prepared query's compute failed, its failure held for complete_prepared to record
@@ -1367,16 +1446,16 @@ pub fun prepared_held(db: *QueryDb, prepared: PreparedQuery) res[bool, fail.Fail
     ret res[bool, fail.Fail].ok{sel res_owner.ok.held.some};
 }
 
-# whether the computation on the stack is the prepare of the product `kind` keys under `key`, which a
-# compute reads to tell a prepare that finishes it outside the computation from a read that does not
+# whether the computation on top of the stack is the prepare of the product `kind` keys under `key`, at
+# any depth, which a compute reads to tell a prepare that finishes it outside the computation from a read
+# that does not
 pub fun preparing(db: *QueryDb, kind: *Kind, key: u64) bool {
     val sh: *QueryShard = shard_find(db, kind);
-    if (sh == nil || db.stack.len != 1) { ret false; }
-    if (sel db.holding.some) {
-        val at: Slot = db.attempts.data[db.holding.some].key;
-        ret at.kind == sh.kind && at.key == key;
-    }
-    ret false;
+    if (sh == nil) { ret false; }
+    val opt_at: opt[usize] = computing_attempt(db);
+    if (sel opt_at.none) { ret false; }
+    val at: Slot = db.attempts.data[opt_at.some].key;
+    ret at.kind == sh.kind && at.key == key;
 }
 
 # a view of a prepared product's bytes, before they are published
@@ -1411,70 +1490,181 @@ pub fun prepared_diags(db: *QueryDb, prepared: PreparedQuery) res[*diagnostic.Di
 # prepared: the handle prepare returned
 # ret:      ok, or a failure when the handle is stale or consumed
 pub fun cancel_prepared(db: *QueryDb, prepared: PreparedQuery) err[fail.Fail] {
-    val res_owner: res[*Attempt, fail.Fail] = prepared_attempt(db, prepared);
-    if (sel res_owner.err) { ret err[fail.Fail].err{res_owner.err}; }
-    val attempt:   *Attempt    = res_owner.ok;
+    val res_index: res[usize, fail.Fail] = prepared_index(db, prepared);
+    if (sel res_index.err) { ret err[fail.Fail].err{res_index.err}; }
+    ret attempt_cancel(db, res_index.ok);
+}
+
+# the pending attempt `index` dropped unreported, what its computation prepared and is still pending first
+fun attempt_cancel(db: *QueryDb, index: usize) err[fail.Fail] {
+    val err_children: err[fail.Fail] = children_cancel(db, index);
+    if (sel err_children.err) { ret err_children; }
+    val attempt:   *Attempt    = ?db.attempts.data[index];
     val candidate: *QueryEntry = attempt.prepared;
-    val sh:        *QueryShard = db.storage[prepared.key.kind::u32];
-    var key:       Slot        = prepared.key;
-    val opt_index: opt[*usize] = map.get[Slot, usize](?db.attempt_index, ?key);
-    if (sel opt_index.none) { ret err[fail.Fail].err{fail.message("prepared query lost its attempt index")}; }
-    attempt_preserve(db, sh, @opt_index.some, candidate);
+    val sh:        *QueryShard = db.storage[attempt.key.kind::u32];
+    attempt_preserve(db, sh, index, candidate);
     A.deallocate[QueryEntry](db.a, candidate, 1);
     attempt.prepared  = nil;
     attempt.cancelled = true;
     db.prepared_count = db.prepared_count - 1;
-    if (attempt.fresh) { entry_remove(db, sh, prepared.key.key); }
+    attempt_settled(db, index);
+    if (attempt.fresh) { entry_remove(db, sh, attempt.key.key); }
     or {
-        val kept: *QueryEntry = entry_find(sh, prepared.key.key);
+        val kept: *QueryEntry = entry_find(sh, attempt.key.key);
         if (kept != nil) { kept.stale = true; }
     }
     ret err[fail.Fail].ok{};
 }
 
+# every product the computation of the attempt `index` prepared and is still pending cancelled, the latest first
+fun children_cancel(db: *QueryDb, index: usize) err[fail.Fail] {
+    var i: usize = db.attempts.len;
+    for (db.attempts.data[index].children != 0 && i > 0) {
+        i = i - 1;
+        val parent: opt[usize] = db.attempts.data[i].parent;
+        if (sel parent.some && parent.some == index) {
+            if (db.attempts.data[i].prepared != nil) {
+                val err_child: err[fail.Fail] = attempt_cancel(db, i);
+                if (sel err_child.err) { ret err_child; }
+            }
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the attempt `index` is no longer pending in its parent's computation
+fun attempt_settled(db: *QueryDb, index: usize) {
+    val parent: opt[usize] = db.attempts.data[index].parent;
+    if (sel parent.some) { db.attempts.data[parent.some].children = db.attempts.data[parent.some].children - 1; }
+}
+
+# a prepared product's failure, recorded as `recorded`, ends its attempt, and what its computation prepared and
+# is still pending is cancelled: one prepared outside every computation is cancelled, its failure the
+# operation's. a nested one is answered as `get` answers a failed computation: its evidence kept for the
+# presentation, its entry no longer served, and a reported failure rejects it for the rest of the operation
+fun attempt_failed(db: *QueryDb, index: usize, recorded: fail.Fail) err[fail.Fail] {
+    val nested: bool = sel db.attempts.data[index].parent.some;
+    if (!nested) {
+        val err_cancelled: err[fail.Fail] = attempt_cancel(db, index);
+        if (sel err_cancelled.err) { ret err_cancelled; }
+        ret err[fail.Fail].err{recorded};
+    }
+    val err_children: err[fail.Fail] = children_cancel(db, index);
+    if (sel err_children.err) { ret err_children; }
+    val attempt:   *Attempt    = ?db.attempts.data[index];
+    val candidate: *QueryEntry = attempt.prepared;
+    val sh:        *QueryShard = db.storage[attempt.key.kind::u32];
+    attempt_preserve(db, sh, index, candidate);
+    A.deallocate[QueryEntry](db.a, candidate, 1);
+    attempt.prepared  = nil;
+    db.prepared_count = db.prepared_count - 1;
+    attempt_settled(db, index);
+    if (attempt.fresh) { entry_remove(db, sh, attempt.key.key); }
+    or {
+        val kept: *QueryEntry = entry_find(sh, attempt.key.key);
+        if (kept != nil) { kept.stale = true; }
+    }
+    if (sel recorded.reported) {
+        attempt.rejected = true;
+        db.rejections    = db.rejections + 1;
+    }
+    ret err[fail.Fail].err{recorded};
+}
+
 # publish a prepared product, or record its failure: the one its compute raised, held until now, else
-# `result`, the failure of the work finished outside the computation. a failed product is dropped
+# `result`, the failure of the work finished outside the computation. a failed product is dropped, with what
+# its computation prepared and is still pending. a product publishes only once every product its computation
+# prepared has completed or been cancelled
 pub fun complete_prepared(db: *QueryDb, prepared: PreparedQuery, result: err[fail.Fail]) err[fail.Fail] {
-    val res_owner: res[*Attempt, fail.Fail] = prepared_attempt(db, prepared);
-    if (sel res_owner.err) { ret err[fail.Fail].err{res_owner.err}; }
-    val held: opt[fail.Fail] = res_owner.ok.held;
-    if (sel held.some) {
-        val recorded:      fail.Fail      = operation_fail_in(db, held.some, res_owner.ok.origin);
-        val err_cancelled: err[fail.Fail] = cancel_prepared(db, prepared);
-        if (sel err_cancelled.err) { ret err_cancelled; }
-        ret err[fail.Fail].err{recorded};
-    }
-    if (sel result.err) {
-        val recorded:      fail.Fail      = operation_fail_in(db, result.err, db.storage[prepared.key.kind::u32].spec.origin);
-        val err_cancelled: err[fail.Fail] = cancel_prepared(db, prepared);
-        if (sel err_cancelled.err) { ret err_cancelled; }
-        ret err[fail.Fail].err{recorded};
-    }
+    val res_index: res[usize, fail.Fail] = prepared_index(db, prepared);
+    if (sel res_index.err) { ret err[fail.Fail].err{res_index.err}; }
+    val index: usize          = res_index.ok;
+    val held:  opt[fail.Fail] = db.attempts.data[index].held;
+    if (sel held.some)  { ret attempt_failed(db, index, operation_fail_in(db, held.some, db.attempts.data[index].origin)); }
+    if (sel result.err) { ret attempt_failed(db, index, operation_fail_in(db, result.err, db.storage[prepared.key.kind::u32].spec.origin)); }
     val opt_poison: opt[fail.Fail] = operation_poison(db);
-    if (sel opt_poison.some) {
-        val err_cancelled: err[fail.Fail] = cancel_prepared(db, prepared);
-        if (sel err_cancelled.err) { ret err_cancelled; }
-        ret err[fail.Fail].err{opt_poison.some};
-    }
-    val attempt: *Attempt    = res_owner.ok;
-    val sh:      *QueryShard = db.storage[prepared.key.kind::u32];
-    val entry:   *QueryEntry = entry_find(sh, prepared.key.key);
+    if (sel opt_poison.some)                   { ret attempt_failed(db, index, opt_poison.some); }
+    if (db.attempts.data[index].children != 0) { ret attempt_failed(db, index, operation_fail(db, fail.message("a prepared query completed before what its computation prepared"))); }
+    val sh:    *QueryShard = db.storage[prepared.key.kind::u32];
+    val entry: *QueryEntry = entry_find(sh, prepared.key.key);
     if (entry == nil) { ret err[fail.Fail].err{fail.message("prepared query lost its publication slot")}; }
     var key:          Slot           = prepared.key;
     val opt_revision: opt[*Revision] = map.get[Slot, Revision](?db.validated, ?key);
     if (sel opt_revision.none) { ret err[fail.Fail].err{fail.message("prepared query lost its validation revision")}; }
-    val res_published: res[*QueryEntry, fail.Fail] = candidate_publish(db, sh, entry, attempt.prepared);
-    if (sel res_published.err) {
-        val recorded:      fail.Fail      = operation_fail(db, res_published.err);
-        val err_cancelled: err[fail.Fail] = cancel_prepared(db, prepared);
-        if (sel err_cancelled.err) { ret err_cancelled; }
-        ret err[fail.Fail].err{recorded};
-    }
+    val res_published: res[*QueryEntry, fail.Fail] = candidate_publish(db, sh, entry, db.attempts.data[index].prepared);
+    if (sel res_published.err) { ret attempt_failed(db, index, operation_fail(db, res_published.err)); }
     @opt_revision.some = entry.last_changed;
     entry.validated_at = db.operation_sequence;
+    val attempt: *Attempt = ?db.attempts.data[index];
     A.deallocate[QueryEntry](db.a, attempt.prepared, 1);
     attempt.prepared  = nil;
     db.prepared_count = db.prepared_count - 1;
+    val parent: opt[usize] = attempt.parent;
+    if (sel parent.some) {
+        attempt_settled(db, index);
+        val owner: *QueryEntry = db.attempts.data[parent.some].prepared;
+        if (owner == nil || attempt.edge >= owner.dep_len) { ret err[fail.Fail].err{fail.message("prepared query lost its parent's edge")}; }
+        val err_observed: err[fail.Fail] = dep_observe(?owner.deps[attempt.edge], entry);
+        if (sel err_observed.err) { ret err[fail.Fail].err{operation_fail(db, err_observed.err)}; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the pending prepared product put back on the stack over its parent's frame, or outside every computation,
+# so what the owner reads for it now (a read log replayed, a `get`) records onto it after what its computation
+# read, and a failure raised meanwhile is its own. left with prepared_leave
+# ---
+# db:       the database
+# prepared: the handle prepare returned, still pending
+# ret:      ok, or a failure when the handle is refused as `prepared_index` refuses it, or storage is refused
+pub fun prepared_enter(db: *QueryDb, prepared: PreparedQuery) err[fail.Fail] {
+    $if (role.CHECKED) { role.touched(role.QUERY, nil); }
+
+    val res_index: res[usize, fail.Fail] = prepared_index(db, prepared);
+    if (sel res_index.err) { ret err[fail.Fail].err{res_index.err}; }
+    val index:     usize          = res_index.ok;
+    val candidate: *QueryEntry    = db.attempts.data[index].prepared;
+    var edges:     Map[Slot, u32] = map.init[Slot, u32](db.a);
+    var i:         u32            = 0;
+    for (i < candidate.dep_len) {
+        val res_indexed: res[bool, A.Error] = map.insert[Slot, u32](?edges, Slot{kind: candidate.deps[i].kind, key: candidate.deps[i].key}, i);
+        if (sel res_indexed.err) {
+            map.dnit[Slot, u32](?edges);
+            ret err[fail.Fail].err{fail.refused(res_indexed.err)};
+        }
+        i = i + 1;
+    }
+    val err_pushed: err[fail.Fail] = stack_push(db, prepared.key.kind, prepared.key.key, candidate);
+    if (sel err_pushed.err) {
+        map.dnit[Slot, u32](?edges);
+        ret err_pushed;
+    }
+    db.stack.data[db.stack.len - 1].edges = edges;
+    db.attempts.data[index].outer         = db.holding;
+    db.holding                            = opt[usize].some{index};
+    ret err[fail.Fail].ok{};
+}
+
+# the prepared product prepared_enter put back taken off the stack, the attempt that held failures before it
+# holding them again
+# ---
+# db:       the database
+# prepared: the handle prepared_enter entered
+# ret:      ok, or a failure when the product is no longer owned or is not the computation on top of the stack
+pub fun prepared_leave(db: *QueryDb, prepared: PreparedQuery) err[fail.Fail] {
+    var key:       Slot        = prepared.key;
+    val opt_index: opt[*usize] = map.get[Slot, usize](?db.attempt_index, ?key);
+    if (sel opt_index.none) { ret err[fail.Fail].err{fail.message("prepared query is no longer owned")}; }
+    val index:  usize      = @opt_index.some;
+    val opt_at: opt[usize] = computing_attempt(db);
+    if (sel opt_at.none) { ret err[fail.Fail].err{fail.message("a prepared query left the stack while it was not on top")}; }
+    if (opt_at.some != index || db.attempts.data[index].prepared == nil || db.stack.data[db.stack.len - 1].entry != db.attempts.data[index].prepared) {
+        ret err[fail.Fail].err{fail.message("a prepared query left the stack while it was not on top")};
+    }
+    map.dnit[Slot, u32](?db.stack.data[db.stack.len - 1].edges);
+    stack_pop(db);
+    db.holding                    = db.attempts.data[index].outer;
+    db.attempts.data[index].outer = opt[usize].none{};
     ret err[fail.Fail].ok{};
 }
 

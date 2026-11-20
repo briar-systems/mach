@@ -27,6 +27,7 @@ use fs:              std.filesystem;
 use io_error:        std.io.error;
 use std_writer:      std.io.writer;
 use std.memory;
+use std.sync.atomic;
 
 use mach.base.diagnostic;
 use mach.base.diagnostic.annotation;
@@ -401,8 +402,8 @@ fun defined_read(p: *project.Project, key: u64, into: *collections_vector.Vector
     ret err[fail.Fail].ok{};
 }
 
-# a module's defined symbols: its restored object's record's, or its lowering's when it declares
-# tests. a lowering already compiled has given its module back, so this is read before its codegen
+# a module's defined symbols: its restored object's record's, or those its lowering kept when it declares
+# tests
 fun defined_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
     val p:         *project.Project                = raw::*project.Project;
     val res_keyed: res[module.ModuleId, fail.Fail] = keyed_module(p, key);
@@ -421,40 +422,45 @@ fun defined_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, 
     val res_queries_entry: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?LOWER, key);
     if (sel res_queries_entry.err) { ret res[query.QueryOutput, fail.Fail].err{res_queries_entry.err}; }
     val l: *Lowering = handle_decode(res_queries_entry.ok)::*Lowering;
-    if (l.taken)  { ret res[query.QueryOutput, fail.Fail].err{fail.message("defined: the module's lowering was compiled before its symbols were read")}; }
-    if (!l.tests) { ret codec.output(?fb); }
-    var names: collections_vector.Vector[intern.StrId] = collections_vector.init[intern.StrId](p.s.backing);
-    fin { collections_vector.dnit[intern.StrId](?names); }
-    val err_gathered: err[fail.Fail] = gather_defined(p, ?l.lowered.m, ?names);
-    if (sel err_gathered.err) { ret res[query.QueryOutput, fail.Fail].err{err_gathered.err}; }
-    var i: usize = 0;
-    for (i < names.len) {
-        wire.put_u32(?fb, intern.str_index(names.data[i]));
+    var i: usize     = 0;
+    for (i < l.defined.len) {
+        wire.put_u32(?fb, intern.str_index(l.defined.data[i]));
         i = i + 1;
     }
     ret codec.output(?fb);
 }
 
 # a lowering product: the module lowered and what its lowering kept for its cache record, until
-# its codegen takes them
+# its codegen takes them. while it is prepared it holds the job its unit's run lowers, and its
+# completion makes it the lowering
 # ---
-# held:  every instance the object holds a copy of, whose typing the lowering read
-# tests: the module declares tests, so DEFINED reads the symbols its lowered module defines
-# taken: its codegen took the lowered module, the facts and the instances, so it holds nothing
+# lowered: the lowered module, nil while the job is pending
+# held:    every instance the object holds a copy of, whose typing the lowering read
+# defined: the symbols the lowered module defines under a binding other objects see, which DEFINED
+#          reads, kept only when the module declares tests and so has a test object declaring them
+# taken:   its codegen took the lowered module, the facts and the instances
+# job:     the prepared lowering its unit's run finishes, nil once it completed
+# out:     the allocator the lowered module is held in
 rec Lowering {
+    out:     *A.Allocator;
     lowered: *compile_unit.Lowered;
     held:    collections_vector.Vector[intern.StrId];
-    tests:   bool;
+    defined: collections_vector.Vector[intern.StrId];
     taken:   bool;
+    job:     *LowerJob;
 }
 
 fun lowering_dnit(raw: ptr, alloc: *A.Allocator) {
     val l: *Lowering = raw::*Lowering;
+    if (l.job != nil) { lower_job_dnit(l.job); }
     if (!l.taken) {
-        lower_context.unit_dnit(?l.lowered.facts);
+        if (l.lowered != nil) {
+            lower_context.unit_dnit(?l.lowered.facts);
+            compile_unit.dnit(l.out, l.lowered);
+        }
         collections_vector.dnit[intern.StrId](?l.held);
-        compile_unit.dnit(alloc, l.lowered);
     }
+    collections_vector.dnit[intern.StrId](?l.defined);
     A.deallocate[Lowering](alloc, l, 1);
 }
 
@@ -462,28 +468,28 @@ fun lowered_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
     lowering_dnit(handle_decode(query.QueryView{value: value, value_len: value_len}), alloc);
 }
 
-# the module `lowered` made into a lowering product, the instances it holds kept beside it
-fun lowering_encode(p: *project.Project, alloc: *A.Allocator, lowered: *compile_unit.Lowered, held: collections_vector.Vector[intern.StrId], tests: bool) res[query.QueryOutput, fail.Fail] {
+# the prepared lowering `job` made into a lowering product its completion fills
+fun lowering_pending(p: *project.Project, alloc: *A.Allocator, job: *LowerJob) res[query.QueryOutput, fail.Fail] {
     val res_boxed: res[*Lowering, A.Error] = A.allocate[Lowering](p.s.alloc, 1);
     if (sel res_boxed.err) {
-        var h: collections_vector.Vector[intern.StrId] = held;
-        collections_vector.dnit[intern.StrId](?h);
-        lower_context.unit_dnit(?lowered.facts);
-        compile_unit.dnit(p.s.alloc, lowered);
+        lower_job_dnit(job);
         ret res[query.QueryOutput, fail.Fail].err{fail.refused(res_boxed.err)};
     }
-    @res_boxed.ok = Lowering{lowered: lowered, held: held, tests: tests, taken: false};
+    @res_boxed.ok = Lowering{
+        out:   p.s.backing, lowered: nil, held: collections_vector.init[intern.StrId](p.s.backing), defined: collections_vector.init[intern.StrId](p.s.backing),
+        taken: false, job: job
+    };
     ret handle_encode(alloc, res_boxed.ok::ptr, lowering_dnit, p.s.alloc);
 }
 
 # every symbol the lowered module `m` defines, a function with a body or a global with a value,
-# under a binding other objects see
-fun gather_defined(p: *project.Project, m: *Module, into: *collections_vector.Vector[intern.StrId]) err[fail.Fail] {
+# under a binding other objects see, named in `within`, the interner its lowering names its strings in
+fun gather_defined(within: *intern.Interner, m: *Module, into: *collections_vector.Vector[intern.StrId]) err[fail.Fail] {
     var i: usize = 0;
     for (i < m.functions.len) {
         val f: *mirl_function.Node = ?m.functions.data[i];
         if (f.data.linkage.binding != ?mink_symbol.LOCAL && f.body.blocks.len != 0) {
-            val err_kept: err[fail.Fail] = defined_add(p, m, f.data.name, into);
+            val err_kept: err[fail.Fail] = defined_add(within, m, f.data.name, into);
             if (sel err_kept.err) { ret err_kept; }
         }
         i = i + 1;
@@ -492,7 +498,7 @@ fun gather_defined(p: *project.Project, m: *Module, into: *collections_vector.Ve
     for (i < m.globals.len) {
         val g: *mirl_global.Node = ?m.globals.data[i];
         if (g.data.linkage.binding != ?mink_symbol.LOCAL && sel g.data.initial.some) {
-            val err_kept: err[fail.Fail] = defined_add(p, m, g.data.name, into);
+            val err_kept: err[fail.Fail] = defined_add(within, m, g.data.name, into);
             if (sel err_kept.err) { ret err_kept; }
         }
         i = i + 1;
@@ -500,23 +506,94 @@ fun gather_defined(p: *project.Project, m: *Module, into: *collections_vector.Ve
     ret err[fail.Fail].ok{};
 }
 
-fun defined_add(p: *project.Project, m: *Module, n: mink_table.Id[mink_intern.Name], into: *collections_vector.Vector[intern.StrId]) err[fail.Fail] {
+# the symbol `n` of `m` named in `within` and pushed onto `into`
+fun defined_add(within: *intern.Interner, m: *Module, n: mink_table.Id[mink_intern.Name], into: *collections_vector.Vector[intern.StrId]) err[fail.Fail] {
     val name:      View                       = mirl_module.name_of(m, n);
-    val res_named: res[intern.StrId, A.Error] = intern.bytes_add(p.s.interner, name.data::str, name.len);
+    val res_named: res[intern.StrId, A.Error] = intern.bytes_add(within, name.data::str, name.len);
     if (sel res_named.err) { ret err[fail.Fail].err{fail.refused(res_named.err)}; }
     val res_pushed: res[usize, A.Error] = collections_vector.push[intern.StrId](into, res_named.ok);
     if (sel res_pushed.err) { ret err[fail.Fail].err{fail.refused(res_pushed.err)}; }
     ret err[fail.Fail].ok{};
 }
 
-# a unit's lowering, against its normal object's symbols when it is a module's test object: its
-# modules' typed definitions, their instances and the target are its inputs. it keeps the instances
-# its object holds, and whether the module declares tests. an artifact taken whole lowers every
-# emitted module in topological order into its one unit, and declares no tests
+# a lowering prepared on the owner, which its unit's run finishes: what its prepare read, and what the run
+# made. the prepare reads every product the lowering needs and gathers the views it reads the rest through.
+# the run reads nothing it did not gather, so it can run where its unit runs. the completion, on the owner
+# at the unit's turn, merges what it made and replays what it read
+# ---
+# p:           the project
+# stores:      the unit's stores, nil when it writes the session's own (on one thread)
+# reading:     what the lowering reads beside its typing, through its views, logging each read
+# mids:        each module the unit lowers
+# defs:        each module's typed definition
+# count:       how many modules the unit lowers
+# normal:      the symbols its normal object defines, held when `tested`, the unit being a module's test object
+# tests:       the module declares tests, so the run names the symbols the lowered module defines
+# test_object: the unit is a module's test object
+# diags:       the store the lowering reports into: its product's on one thread, else `own`
+# own:         a store of its own, which a run off the owner reports into and its completion places in its
+#              product's
+# started:     when its prepare began on the owner
+# spent:       the time from its prepare to the end of its run, or on a crew the time its run took, read on
+#              the owner at its completion
+# summed:      it ran on a crew, whose lowering row is a sum over the crew's threads
+# made:        the run made `lowered`, `defined` and `gathered`, which the job holds until its completion
+#              takes them
+# lowered:     the lowered unit, or the failure lowering it
+# defined:     the symbols the run named, when the module declares tests
+# gathered:    the failure naming them, ok when it did not fail
+rec LowerJob {
+    p:           *project.Project;
+    stores:      *UnitStores;
+    reading:     Reading;
+    mids:        *module.ModuleId;
+    defs:        *sema_product.Definition;
+    count:       u32;
+    normal:      lower_context.NormalObject;
+    tested:      bool;
+    tests:       bool;
+    test_object: bool;
+    diags:       *diagnostic.DiagnosticStore;
+    own:         diagnostic.DiagnosticStore;
+    started:     readout.Instant;
+    spent:       chrono_duration.Duration;
+    summed:      bool;
+    made:        bool;
+    lowered:     res[*compile_unit.Lowered, fail.Fail];
+    defined:     collections_vector.Vector[intern.StrId];
+    gathered:    err[fail.Fail];
+}
+
+# release `job` and all it holds: the lowered unit when the run made it and no completion took it, its stores,
+# its own diagnostics, its reading and its inputs
+fun lower_job_dnit(job: *LowerJob) {
+    val p: *project.Project = job.p;
+    if (sel job.lowered.ok) {
+        if (job.made) {
+            lower_context.unit_dnit(?job.lowered.ok.facts);
+            compile_unit.dnit(p.s.backing, job.lowered.ok);
+        }
+    }
+    collections_vector.dnit[intern.StrId](?job.defined);
+    if (job.stores != nil) { diagnostic.store_dnit(?job.own); }
+    reading_dnit(?job.reading);
+    if (job.tested) { map.dnit[intern.StrId, bool](?job.normal.defined); }
+    unit_stores_dnit(p, job.stores);
+    if (job.mids != nil) { A.deallocate[module.ModuleId](p.s.backing, job.mids, job.count::usize); }
+    if (job.defs != nil) { A.deallocate[sema_product.Definition](p.s.backing, job.defs, job.count::usize); }
+    A.deallocate[LowerJob](p.s.backing, job, 1);
+}
+
+# a unit's lowering prepared, against its normal object's symbols when it is a module's test object: its
+# modules' typed definitions, their instances and the target are its inputs, read here. the run lowers it
+# and the unit's completion publishes it (lower_complete). it keeps the instances its object holds, and the
+# symbols its module defines when the module declares tests. an artifact taken whole lowers every emitted
+# module in topological order into its one unit, and declares no tests
 fun lower_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
-    val p:           *project.Project                = raw::*project.Project;
-    val s:           *session.Session                = p.s;
-    val opt_t_lower: readout.Instant                 = readout.span_begin(p.progress);
+    val p:           *project.Project = raw::*project.Project;
+    val s:           *session.Session = p.s;
+    val opt_t_lower: readout.Instant  = readout.span_begin(p.progress);
+    if (!query.preparing(?s.queries, kind, key)) { ret res[query.QueryOutput, fail.Fail].err{fail.message("lower: a module's lowering is computed only under its prepare")}; }
     val test_object: bool                            = back_half_key_is_test(key);
     val res_keyed:   res[module.ModuleId, fail.Fail] = keyed_module(p, key);
     if (sel res_keyed.err) { ret res[query.QueryOutput, fail.Fail].err{res_keyed.err}; }
@@ -524,109 +601,180 @@ fun lower_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, di
     val err_depend: err[fail.Fail]       = query.depend[project.Project](?p.queries, p, ?context.TARGET, 0);
     if (sel err_depend.err) { ret res[query.QueryOutput, fail.Fail].err{err_depend.err}; }
 
-    val res_stores: res[*UnitStores, fail.Fail] = unit_stores_init(p, owner_lent(p));
+    val res_stores: res[*UnitStores, fail.Fail] = unit_stores_init(p);
     if (sel res_stores.err) { ret res[query.QueryOutput, fail.Fail].err{res_stores.err}; }
-    val stores: *UnitStores = res_stores.ok;
-    fin { unit_stores_dnit(p, stores); }
+    val res_job: res[*LowerJob, A.Error] = A.allocate[LowerJob](s.backing, 1);
+    if (sel res_job.err) {
+        unit_stores_dnit(p, res_stores.ok);
+        ret res[query.QueryOutput, fail.Fail].err{fail.refused(res_job.err)};
+    }
+    val job:    *LowerJob        = res_job.ok;
     var seen:   *session.Session = s;
     var within: *intern.Interner = s.interner;
-    if (stores != nil) {
-        seen   = ?stores.view;
-        within = ?stores.names;
+    if (res_stores.ok != nil) {
+        seen   = ?res_stores.ok.view;
+        within = ?res_stores.ok.names;
+    }
+    @job = LowerJob{
+        p:       p, stores: res_stores.ok, test_object: test_object, diags: diags, started: opt_t_lower,
+        lowered: res[*compile_unit.Lowered, fail.Fail].err{fail.message("lower: the unit's lowering never ran")},
+        defined: collections_vector.init[intern.StrId](s.backing), gathered: err[fail.Fail].ok{},
+        reading: Reading{
+            p:          p, s: seen, leaf: res_stores.ok != nil, held: collections_vector.init[intern.StrId](s.backing),
+            interfaces: map.init[module.ModuleId, *sema_interface.Interface](s.backing), views: query.views_init(s.backing, p.views),
+            log:        query.log_init(s.backing)
+        }
+    };
+    job.reading.reads = query.Reads{ctx: (?job.reading)::ptr, read: reading_read};
+    # a lowering that may run off the owner reports into a store of its own, drawn from the backing allocator
+    if (job.stores != nil) {
+        job.own = diagnostic.store_init(s.backing);
+        diagnostic.set_origin(?job.own, diagnostic.ORIGIN_LOWER);
+        job.diags = ?job.own;
+    }
+    var handed: bool = false;
+    fin {
+        if (!handed) { lower_job_dnit(job); }
     }
 
     # a test object declares what its normal object defines, so it lowers against those symbols
-    var normal:      lower_context.NormalObject;
-    var normal_from: *lower_context.NormalObject = nil;
     if (test_object) {
         val res_defined: res[lower_context.NormalObject, fail.Fail] = normal_object_of(p, m, within);
         if (sel res_defined.err) { ret res[query.QueryOutput, fail.Fail].err{res_defined.err}; }
-        normal      = res_defined.ok;
-        normal_from = ?normal;
-    }
-    fin {
-        if (normal_from != nil) { map.dnit[intern.StrId, bool](?normal.defined); }
-    }
-    var reading: Reading = Reading{
-        p:          p,
-        s:          seen,
-        held:       collections_vector.init[intern.StrId](s.backing),
-        interfaces: map.init[module.ModuleId, *sema_interface.Interface](s.backing),
-        views:      query.views_init(s.backing, p.views),
-        log:        query.log_init(s.backing)
-    };
-    reading.reads = query.Reads{ctx: (?reading)::ptr, read: reading_read};
-    var handed: bool = false;
-    fin {
-        if (!handed) { collections_vector.dnit[intern.StrId](?reading.held); }
-        map.dnit[module.ModuleId, *sema_interface.Interface](?reading.interfaces);
-        query.views_dnit(?reading.views);
-        query.log_dnit(?reading.log);
+        job.normal = res_defined.ok;
+        job.tested = true;
     }
     var count: u32 = 1;
     if (back_half_key_is_whole(key)) { count = p.emit_len; }
-    val res_reqs: res[*lower_context.LowerRequest, A.Error] = A.allocate[lower_context.LowerRequest](s.backing, count::usize);
-    if (sel res_reqs.err) { ret res[query.QueryOutput, fail.Fail].err{fail.refused(res_reqs.err)}; }
-    val reqs: *lower_context.LowerRequest = res_reqs.ok;
-    fin { A.deallocate[lower_context.LowerRequest](s.backing, reqs, count::usize); }
-    var tests: bool = false;
-    var i:     u32  = 0;
+    val res_mids: res[*module.ModuleId, A.Error] = A.allocate[module.ModuleId](s.backing, count::usize);
+    if (sel res_mids.err) { ret res[query.QueryOutput, fail.Fail].err{fail.refused(res_mids.err)}; }
+    job.mids = res_mids.ok;
+    val res_defs: res[*sema_product.Definition, A.Error] = A.allocate[sema_product.Definition](s.backing, count::usize);
+    if (sel res_defs.err) {
+        A.deallocate[module.ModuleId](s.backing, job.mids, count::usize);
+        job.mids = nil;
+        ret res[query.QueryOutput, fail.Fail].err{fail.refused(res_defs.err)};
+    }
+    job.defs  = res_defs.ok;
+    job.count = count;
+    var i: u32 = 0;
     for (i < count) {
         var mid: module.ModuleId = res_keyed.ok;
         if (back_half_key_is_whole(key)) { mid = p.topo[i]; }
         val res_definition: res[sema_product.Definition, fail.Fail] = frontend.read_definition(p::ptr, mid, sema_product.DEFINITION_TYPED);
         if (sel res_definition.err) { ret res[query.QueryOutput, fail.Fail].err{res_definition.err}; }
-        val d: sema_product.Definition = res_definition.ok;
+        job.mids[i] = mid;
+        job.defs[i] = res_definition.ok;
         # the instances the module's code reaches, typed and reported as the module's
         val reached:     u64                             = module.stable_index(project.module_at(p, mid::u32).stable_id)::u64;
         val res_reached: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?INSTANCES, reached);
         if (sel res_reached.err) { ret res[query.QueryOutput, fail.Fail].err{res_reached.err}; }
-        val err_viewed: err[fail.Fail] = query.views_add_deps(?s.queries, ?reading.views, ?INSTANCES, reached, ?INSTANCE_SEMA);
-        if (sel err_viewed.err) { ret res[query.QueryOutput, fail.Fail].err{err_viewed.err}; }
-        val res_req: res[lower_context.LowerRequest, fail.Fail] = unit_request(p, stores, mid, d, normal_from, ?reading, diags);
-        if (sel res_req.err) { ret res[query.QueryOutput, fail.Fail].err{res_req.err}; }
-        reqs[i] = res_req.ok;
-        if (!test_object && !back_half_key_is_whole(key)) { tests = testrunner.declares_tests(d.parsed.a); }
+        val err_viewed: err[fail.Fail] = query.views_add_deps(?s.queries, ?job.reading.views, ?INSTANCES, reached, ?INSTANCE_SEMA);
+        if (sel err_viewed.err)                           { ret res[query.QueryOutput, fail.Fail].err{err_viewed.err}; }
+        if (!test_object && !back_half_key_is_whole(key)) { job.tests = testrunner.declares_tests(res_definition.ok.parsed.a); }
         i = i + 1;
     }
-    val res_lowered: res[*compile_unit.Lowered, fail.Fail] = compile_unit.lower(reqs, count::usize, ?p.back, s.spans, p.s.alloc);
-    var facts:       *lower_context.Unit                   = nil;
-    if (sel res_lowered.ok) { facts = ?res_lowered.ok.facts; }
-    val err_merged:   err[fail.Fail] = unit_stores_merge(p, stores, facts);
-    val err_replayed: err[fail.Fail] = query.replay(?s.queries, ?reading.log);
-    if (sel res_lowered.err) { ret res[query.QueryOutput, fail.Fail].err{diagnostic.failure_retain(p.s.interner, res_lowered.err)}; }
-    if (sel err_merged.err) {
-        lower_context.unit_dnit(?res_lowered.ok.facts);
-        compile_unit.dnit(p.s.alloc, res_lowered.ok);
-        ret res[query.QueryOutput, fail.Fail].err{err_merged.err};
-    }
-    val l: *compile_unit.Lowered = res_lowered.ok;
-    if (sel err_replayed.err) {
-        lower_context.unit_dnit(?l.facts);
-        compile_unit.dnit(p.s.alloc, l);
-        ret res[query.QueryOutput, fail.Fail].err{err_replayed.err};
-    }
-    lowering_carved(p, test_object, opt_t_lower);
     handed = true;
-    ret lowering_encode(p, alloc, l, reading.held, tests);
+    ret lowering_pending(p, alloc, job);
+}
+
+# the lowering `job` prepared, run where its unit runs, which reads only what the prepare gathered and writes
+# only the unit's stores and the stores `lent` lends: the requests made, the modules lowered, and the symbols
+# a test object declares named with the lowering's own strings
+fun lower_run(job: *LowerJob, lent: *Lent) {
+    val p: *project.Project = job.p;
+    job.made   = true;
+    job.summed = lent.summed;
+    var began: readout.Instant = job.started;
+    if (lent.summed) { began = readout.sample(); }
+    unit_stores_lend(job.stores, lent);
+    fin {
+        unit_stores_return(job.stores, lent);
+        job.spent = readout.elapsed(began);
+    }
+    val res_reqs: res[*lower_context.LowerRequest, A.Error] = A.allocate[lower_context.LowerRequest](p.s.backing, job.count::usize);
+    if (sel res_reqs.err) {
+        job.lowered = res[*compile_unit.Lowered, fail.Fail].err{fail.refused(res_reqs.err)};
+        ret;
+    }
+    val reqs: *lower_context.LowerRequest = res_reqs.ok;
+    fin { A.deallocate[lower_context.LowerRequest](p.s.backing, reqs, job.count::usize); }
+    var normal: *lower_context.NormalObject = nil;
+    if (job.tested) { normal = ?job.normal; }
+    var i: u32 = 0;
+    for (i < job.count) {
+        val res_req: res[lower_context.LowerRequest, fail.Fail] = unit_request(p, job.stores, lent, job.mids[i], job.defs[i], normal, ?job.reading, job.diags);
+        if (sel res_req.err) {
+            job.lowered = res[*compile_unit.Lowered, fail.Fail].err{res_req.err};
+            ret;
+        }
+        reqs[i] = res_req.ok;
+        i       = i + 1;
+    }
+    job.lowered = compile_unit.lower(reqs, job.count::usize, ?p.back, p.s.spans, p.s.backing);
+    if (!job.tests)         { ret; }
+    if (sel job.lowered.ok) { job.gathered = gather_defined(job.reading.s.interner, ?job.lowered.ok.m, ?job.defined); }
+}
+
+# the lowering a unit's run finished, completed on the owner at the unit's turn: the strings and types it made
+# merged, its read log replayed onto it after what its prepare read, then published as the module's lowering,
+# or its failure recorded as the lowering's, its text kept in the session's interner after the unit's strings, as
+# one thread names it, since a failure with text to keep ends the pass. `l` is the prepared product's, which a
+# failure gives back
+fun lower_complete(p: *project.Project, prepared: query.PreparedQuery, l: *Lowering) err[fail.Fail] {
+    val db:    *query.QueryDb      = ?p.s.queries;
+    val job:   *LowerJob           = l.job;
+    var facts: *lower_context.Unit = nil;
+    if (sel job.lowered.ok) { facts = ?job.lowered.ok.facts; }
+    val err_merged: err[fail.Fail] = unit_stores_merge(p, job.stores, facts, ?job.defined);
+    var err_placed: err[fail.Fail] = err[fail.Fail].ok{};
+    if (job.stores != nil) {
+        val res_diags: res[*diagnostic.DiagnosticStore, fail.Fail] = query.prepared_diags(db, prepared);
+        if (sel res_diags.err) { err_placed = err[fail.Fail].err{res_diags.err}; }
+        or                     { err_placed = diagnostic.replay_into(res_diags.ok, ?job.own); }
+    }
+    val err_entered:  err[fail.Fail] = query.prepared_enter(db, prepared);
+    var err_replayed: err[fail.Fail] = err_entered;
+    if (sel err_entered.ok) {
+        val err_read: err[fail.Fail] = query.replay(db, ?job.reading.log);
+        val err_left: err[fail.Fail] = query.prepared_leave(db, prepared);
+        err_replayed = err_left;
+        if (sel err_read.err) { err_replayed = err_read; }
+    }
+    if (sel job.lowered.err) { ret query.complete_prepared(db, prepared, err[fail.Fail].err{diagnostic.failure_retain(p.s.interner, job.lowered.err)}); }
+    var err_kept: err[fail.Fail] = err_replayed;
+    if (sel err_placed.err)   { err_kept = err_placed; }
+    if (sel err_merged.err)   { err_kept = err_merged; }
+    if (sel job.gathered.err) { err_kept = job.gathered; }
+    if (sel err_kept.err)     { ret query.complete_prepared(db, prepared, err_kept); }
+    lowering_timed(p, job.test_object, job.summed, job.spent);
+    l.lowered = job.lowered.ok;
+    collections_vector.dnit[intern.StrId](?l.held);
+    collections_vector.dnit[intern.StrId](?l.defined);
+    l.held           = job.reading.held;
+    l.defined        = job.defined;
+    job.reading.held = collections_vector.init[intern.StrId](p.s.backing);
+    job.defined      = collections_vector.init[intern.StrId](p.s.backing);
+    job.made         = false;
+    lower_job_dnit(job);
+    l.job = nil;
+    ret query.complete_prepared(db, prepared, err[fail.Fail].ok{});
 }
 
 # the lowering request of the module `mid`, whose typed definition is `d`, against `normal` when
-# it is the module's test object, writing the unit's `stores`, the session's own when there are none, and its
-# instances read through `reading`
-fun unit_request(p: *project.Project, stores: *UnitStores, mid: module.ModuleId, d: sema_product.Definition, normal: *lower_context.NormalObject, reading: *Reading,
-    diags: *diagnostic.DiagnosticStore) res[lower_context.LowerRequest, fail.Fail] {
-    var s:      *session.Session = p.s;
-    var laying: *extent.Laying   = p.back.laying;
-    var named:  *linkage.Named   = ?p.linkage.named;
+# it is the module's test object, writing the unit's `stores`, the session's own when there are none, and
+# the stores `lent` lends, its instances read through `reading`
+fun unit_request(p: *project.Project, stores: *UnitStores, lent: *Lent, mid: module.ModuleId, d: sema_product.Definition, normal: *lower_context.NormalObject,
+    reading: *Reading, diags: *diagnostic.DiagnosticStore) res[lower_context.LowerRequest, fail.Fail] {
+    var s:     *session.Session = p.s;
+    var named: *linkage.Named   = ?p.linkage.named;
     if (stores != nil) {
-        s      = ?stores.view;
-        laying = stores.laying;
-        named  = ?stores.named;
+        s     = ?stores.view;
+        named = ?stores.named;
     }
     val res_machine: res[*lower_context.Machine, fail.Fail] = backend.machine(?p.back);
     if (sel res_machine.err) { ret res[lower_context.LowerRequest, fail.Fail].err{res_machine.err}; }
-    ret lower_context.request(s, ?p.linkage, named, ?p.back.facts, res_machine.ok, laying, s.backing, d.parsed.a, project.module_at(p, mid::u32).fqn, mid,
+    ret lower_context.request(s, ?p.linkage, named, ?p.back.facts, res_machine.ok, lent.laying, s.backing, d.parsed.a, project.module_at(p, mid::u32).fqn, mid,
         d.sr, d.rr, d.ctx, normal, shared_artifact_build(p), p.req.debug, archive_build(p), !p.req.optimise.on, diags,
         sema_interface.Reader{ctx: reading::ptr, read: read_interface}, lower_context.InstanceReader{ctx: reading::ptr, read: read_held, bind: bind_held});
 }
@@ -637,89 +785,198 @@ fun unit_request(p: *project.Project, stores: *UnitStores, mid: module.ModuleId,
 # ---
 # facts:  the type facts
 # laying: how types are laid out over the build's target
+# side:   the memos and scan sets a unit's layer is handed for its run (type.side_lend)
+# summed: the run is one of a crew's, whose lowering row sums its threads
 rec Lent {
     facts:  *type_query.Facts;
     laying: *extent.Laying;
+    side:   *type.Side;
+    summed: bool;
 }
 
 # the stores the owner lends a lowering it runs: the session's
-fun owner_lent(p: *project.Project) Lent {
-    ret Lent{facts: p.s.type_facts, laying: p.back.laying};
+fun owner_lent(p: *project.Project, summed: bool) Lent {
+    ret Lent{facts: p.s.type_facts, laying: p.back.laying, side: ?p.s.types.side, summed: summed};
+}
+
+# the stores a crew's threads lend the lowerings they run, one set per thread, each drawn from the backing
+# allocator and dropped when the pass ends. a run takes a free set for its span and gives it back, and at most
+# one run per thread is under way, so a set is always free
+# ---
+# lents: each set, `count` of them
+# busy:  whether each is taken
+rec Lending {
+    lents:   *Lent;
+    facts:   *type_query.Facts;
+    sides:   *type.Side;
+    busy:    *i64;
+    count:   usize;
+    backing: *A.Allocator;
+}
+
+# `into` filled with `count` sets of lent stores, one per crew thread, drawn from the backing allocator
+fun lending_init(p: *project.Project, into: *Lending, count: usize) err[fail.Fail] {
+    val a: *A.Allocator = p.s.backing;
+    @into = Lending{count: 0, backing: a};
+    val res_lents: res[*Lent, A.Error] = A.zallocate[Lent](a, count);
+    if (sel res_lents.err) { ret err[fail.Fail].err{fail.refused(res_lents.err)}; }
+    into.lents = res_lents.ok;
+    val res_facts: res[*type_query.Facts, A.Error] = A.allocate[type_query.Facts](a, count);
+    if (sel res_facts.err) {
+        A.deallocate[Lent](a, into.lents, count);
+        ret err[fail.Fail].err{fail.refused(res_facts.err)};
+    }
+    into.facts = res_facts.ok;
+    val res_sides: res[*type.Side, A.Error] = A.allocate[type.Side](a, count);
+    if (sel res_sides.err) {
+        A.deallocate[type_query.Facts](a, into.facts, count);
+        A.deallocate[Lent](a, into.lents, count);
+        ret err[fail.Fail].err{fail.refused(res_sides.err)};
+    }
+    into.sides = res_sides.ok;
+    val res_busy: res[*i64, A.Error] = A.zallocate[i64](a, count);
+    if (sel res_busy.err) {
+        A.deallocate[type.Side](a, into.sides, count);
+        A.deallocate[type_query.Facts](a, into.facts, count);
+        A.deallocate[Lent](a, into.lents, count);
+        ret err[fail.Fail].err{fail.refused(res_busy.err)};
+    }
+    into.busy = res_busy.ok;
+    for (into.count < count) {
+        val i:          usize                          = into.count;
+        val res_laying: res[*extent.Laying, fail.Fail] = backend.laying_init(a, ?p.back);
+        if (sel res_laying.err) {
+            lending_dnit(into);
+            ret err[fail.Fail].err{res_laying.err};
+        }
+        into.facts[i] = type_query.facts_init(a);
+        into.sides[i] = type.side_init(a);
+        into.lents[i] = Lent{facts: ?into.facts[i], laying: res_laying.ok, side: ?into.sides[i], summed: true};
+        into.count    = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# release every set of lent stores `l` holds
+fun lending_dnit(l: *Lending) {
+    var i: usize = 0;
+    for (i < l.count) {
+        type_query.facts_dnit(?l.facts[i]);
+        type.side_dnit(?l.sides[i]);
+        extent.dnit(l.lents[i].laying);
+        i = i + 1;
+    }
+    if (l.busy == nil) { ret; }
+    A.deallocate[i64](l.backing, l.busy, l.count);
+    A.deallocate[type.Side](l.backing, l.sides, l.count);
+    A.deallocate[type_query.Facts](l.backing, l.facts, l.count);
+    A.deallocate[Lent](l.backing, l.lents, l.count);
+    l.busy = nil;
+}
+
+# a free set of `l`, taken for the calling run's span
+fun lending_take(l: *Lending) *Lent {
+    for {
+        var i: usize = 0;
+        for (i < l.count) {
+            if (atomic.exchange(?l.busy[i], 1) == 0) { ret ?l.lents[i]; }
+            i = i + 1;
+        }
+        atomic.spin_hint();
+    }
+    ret nil;
+}
+
+# the set `lent` of `l` given back
+fun lending_give(l: *Lending, lent: *Lent) {
+    var i: usize = 0;
+    for (i < l.count) {
+        if (?l.lents[i] == lent) { atomic.store(?l.busy[i], 0); }
+        i = i + 1;
+    }
 }
 
 # the stores one unit's lowering writes in place of the session's, and the session as the lowering sees it,
 # its handles naming them, while a pass on a crew has the session's table and interner frozen. its types
 # are layered over the frozen table and its strings named in a child of the frozen interner, so each id
-# it makes is the unit's own until `unit_stores_merge`, at the lowering's serial point, names its strings
+# it makes is the unit's own until `unit_stores_merge`, at the unit's serial point, names its strings
 # in the session's interner and interns its types into the session's table, each in the order the
 # lowering made them; strings are equal by their bytes and types by their parts, so each lands on the id
-# one thread lowering in order would have given it (intern.child_reintern, type.merge). the layer holds
-# the side of the table it was made from until it is merged or released, and what else is derived from
-# the types is lent by the thread. the names its declarations link under are kept for this lowering
-# alone, in its own strings. on one thread nothing is frozen and a unit writes the session's own stores
+# one thread lowering in order would have given it (intern.child_reintern, type.merge). what else is
+# derived from the types is lent by the thread that runs the lowering, for the span of its run, the side
+# of the table among it. the names its declarations link under are kept for this lowering alone, in its
+# own strings. on one thread nothing is frozen and a unit writes the session's own stores
 # ---
-# types:     the unit's layer
-# from:      the table whose side the layer holds
-# side_held: whether the layer still holds it
-# names:     the unit's child of the frozen interner
-# owned:     how many strings the session's interner had issued when the unit's lowering began
-# named:     the names the unit's declarations link under
-# laying:    how the unit lays out the types it names, the thread's
-# view:      the session with `types`, `names` and the thread's type facts in place of its own
+# types: the unit's layer
+# names: the unit's child of the frozen interner
+# named: the names the unit's declarations link under
+# view:  the session with `types`, `names` and, while the unit runs, the thread's type facts in place of its own,
+#        drawing from the backing allocator, which any thread may
 rec UnitStores {
-    types:     type.TypeInterner;
-    from:      *type.TypeInterner;
-    side_held: bool;
-    names:     intern.Interner;
-    owned:     usize;
-    named:     linkage.Named;
-    laying:    *extent.Laying;
-    view:      session.Session;
+    types: type.TypeInterner;
+    names: intern.Interner;
+    named: linkage.Named;
+    view:  session.Session;
 }
 
 # the stores for one unit, none when nothing is frozen
-fun unit_stores_init(p: *project.Project, lent: Lent) res[*UnitStores, fail.Fail] {
+fun unit_stores_init(p: *project.Project) res[*UnitStores, fail.Fail] {
     val s: *session.Session = p.s;
     if (p.types_frozen == nil)                          { ret res[*UnitStores, fail.Fail].ok{nil}; }
     if (type.own_type_count(s.types) != p.types_merged) { ret res[*UnitStores, fail.Fail].err{fail.message("lower: the owner made types during the pass, which no lowering can read")}; }
+    if (s.interner.len != p.names_merged)               { ret res[*UnitStores, fail.Fail].err{fail.message("lower: the owner named strings outside a unit's merge, which the units could not follow")}; }
     val res_boxed: res[*UnitStores, A.Error] = A.allocate[UnitStores](s.backing, 1);
     if (sel res_boxed.err) { ret res[*UnitStores, fail.Fail].err{fail.refused(res_boxed.err)}; }
     val u: *UnitStores = res_boxed.ok;
-    type.layer_init(?u.types, p.types_frozen, s.backing, type.side_take(s.types));
-    u.from            = s.types;
-    u.side_held       = true;
-    u.names           = intern.child_init(p.names_frozen, s.backing);
-    u.owned           = s.interner.base_len + s.interner.len;
-    u.named           = linkage.named_init(s.backing);
-    u.laying          = lent.laying;
-    u.view            = @s;
-    u.view.types      = ?u.types;
-    u.view.interner   = ?u.names;
-    u.view.type_facts = lent.facts;
+    type.layer_init(?u.types, p.types_frozen, s.backing, type.side_init(s.backing));
+    u.names            = intern.child_init(p.names_frozen, s.backing);
+    u.named            = linkage.named_init(s.backing);
+    u.view             = @s;
+    u.view.types       = ?u.types;
+    u.view.interner    = ?u.names;
+    u.view.type_facts  = nil;
+    u.view.alloc       = s.backing;
+    u.view.build_alloc = s.backing;
     ret res[*UnitStores, fail.Fail].ok{u};
 }
 
 fun unit_stores_dnit(p: *project.Project, u: *UnitStores) {
-    if (u == nil)    { ret; }
-    if (u.side_held) { type.side_give(u.from, type.layer_side(?u.types)); }
+    if (u == nil) { ret; }
     type.dnit(?u.types);
     intern.dnit(?u.names);
     linkage.named_dnit(?u.named);
     A.deallocate[UnitStores](p.s.backing, u, 1);
 }
 
+# the stores `lent` lends handed to the unit for its run: the side of the table to its layer, the type facts
+# to its view
+fun unit_stores_lend(u: *UnitStores, lent: *Lent) {
+    if (u == nil) { ret; }
+    type.side_lend(?u.types, @lent.side);
+    @lent.side        = type.side_init(u.types.a);
+    u.view.type_facts = lent.facts;
+}
+
+# what unit_stores_lend handed the unit given back to `lent` once the unit's run is over
+fun unit_stores_return(u: *UnitStores, lent: *Lent) {
+    if (u == nil) { ret; }
+    type.side_dnit(lent.side);
+    @lent.side        = type.layer_side(?u.types);
+    u.view.type_facts = nil;
+}
+
 # the strings the unit named, then the types it made, merged into the session's stores in the order it
-# made them, and the names of the functions it lowered, held in `facts` when it lowered, mapped to the
-# session's. a string the session's interner named while the unit lowered would precede the unit's in
-# its numbering where one thread names it after them, so it fails the merge. nothing the lowering keeps
-# names one of its types, so their remap is not read
-fun unit_stores_merge(p: *project.Project, u: *UnitStores, facts: *lower_context.Unit) err[fail.Fail] {
+# made them, and the names of the functions it lowered, held in `facts` when it lowered, and of the symbols
+# it defines, `defined`, mapped to the session's. while the pass runs on a crew the owner names strings
+# only by merging units: one it named itself would land before a unit's strings where one thread names it
+# after them, so a string the session's interner gained since the last merge fails the merge. nothing the
+# lowering keeps names one of its types, so their remap is not read
+fun unit_stores_merge(p: *project.Project, u: *UnitStores, facts: *lower_context.Unit, defined: *collections_vector.Vector[intern.StrId]) err[fail.Fail] {
     if (u == nil) { ret err[fail.Fail].ok{}; }
-    type.side_give(u.from, type.layer_side(?u.types));
-    u.side_held = false;
     val s: *session.Session = p.s;
-    if (s.interner.base_len + s.interner.len != u.owned) { ret err[fail.Fail].err{fail.message("lower: the owner named strings while a unit lowered, which the unit's could not follow")}; }
+    if (s.interner.len != p.names_merged) { ret err[fail.Fail].err{fail.message("lower: the owner named strings outside a unit's merge, which the units could not follow")}; }
     val res_named: res[intern.Remap, A.Error] = intern.child_reintern(?u.names, s.interner, s.backing);
+    p.names_merged = s.interner.len;
     if (sel res_named.err) { ret err[fail.Fail].err{fail.refused(res_named.err)}; }
     var names: intern.Remap = res_named.ok;
     fin { intern.remap_dnit(s.backing, ?names); }
@@ -736,6 +993,11 @@ fun unit_stores_merge(p: *project.Project, u: *UnitStores, facts: *lower_context
             i                      = i + 1;
         }
     }
+    var i: usize = 0;
+    for (i < defined.len) {
+        defined.data[i] = intern.remapped(?names, defined.data[i]);
+        i               = i + 1;
+    }
     ret err[fail.Fail].ok{};
 }
 
@@ -746,10 +1008,13 @@ fun unit_stores_merge(p: *project.Project, u: *UnitStores, facts: *lower_context
 # within the computation, which is all the table lives for. the lowering reads products through
 # `views`, the pass's over the instances its modules' INSTANCES read, logging each read in `log`,
 # which the computation replays onto its frame when the lowering returns. it names instances in
-# `s`, the session as the lowering sees it
+# `s`, the session as the lowering sees it. a `leaf` lowering, one with stores of its own, reads only
+# through its views: it may run off the owner, where no product can be computed, so a read its views
+# do not hold is a defect
 rec Reading {
     p:          *project.Project;
     s:          *session.Session;
+    leaf:       bool;
     held:       collections_vector.Vector[intern.StrId];
     interfaces: map.Map[module.ModuleId, *sema_interface.Interface];
     views:      query.Views;
@@ -757,9 +1022,17 @@ rec Reading {
     reads:      query.Reads;
 }
 
+# release what `r` gathered: the names it held, the interfaces, the views and the read log
+fun reading_dnit(r: *Reading) {
+    collections_vector.dnit[intern.StrId](?r.held);
+    map.dnit[module.ModuleId, *sema_interface.Interface](?r.interfaces);
+    query.views_dnit(?r.views);
+    query.log_dnit(?r.log);
+}
+
 # a product a lowering reads, through its views when they hold it. a read they do not hold is
 # answered here on the owner: what was logged is replayed first, so the edge `get` records lands
-# after them, in read order
+# after them, in read order. a leaf lowering has no owner to answer it
 fun reading_read(raw: ptr, kind: *query.Kind, key: u64) res[query.QueryView, fail.Fail] {
     val r: *Reading = raw::*Reading;
     if (r.p.views != nil) {
@@ -767,6 +1040,7 @@ fun reading_read(raw: ptr, kind: *query.Kind, key: u64) res[query.QueryView, fai
         if (sel res_viewed.err)     { ret res[query.QueryView, fail.Fail].err{res_viewed.err}; }
         if (sel res_viewed.ok.some) { ret res[query.QueryView, fail.Fail].ok{res_viewed.ok.some}; }
     }
+    if (r.leaf) { ret res[query.QueryView, fail.Fail].err{fail.message("lower: a lowering read a product its views do not hold")}; }
     val err_replayed: err[fail.Fail] = query.replay(?r.p.s.queries, ?r.log);
     if (sel err_replayed.err) { ret res[query.QueryView, fail.Fail].err{err_replayed.err}; }
     ret query.get[project.Project](?r.p.queries, r.p, kind, key);
@@ -795,16 +1069,22 @@ fun bind_held(raw: ptr, item: *sema_instance.Instance) res[lower_context.Definin
     if (!backend.merges(?r.p.back)) { ret res[lower_context.Defining, fail.Fail].ok{lower_context.Defining.instance{}}; }
     val res_named: res[intern.StrId, fail.Fail] = demand.registered(?r.p.instances, r.s, item);
     if (sel res_named.err) { ret res[lower_context.Defining, fail.Fail].err{res_named.err}; }
-    val res_source: res[u64, fail.Fail] = identity.of_instance(r.p, ?r.reads, item, res_named.ok);
+    val res_source: res[u64, fail.Fail] = identity.of_instance(r.p, r.s, ?r.reads, item, res_named.ok);
     if (sel res_source.err) { ret res[lower_context.Defining, fail.Fail].err{res_source.err}; }
     ret res[lower_context.Defining, fail.Fail].ok{lower_context.Defining.merged{res_source.ok}};
 }
 
-# the time lowering a module took, its own row, carved out of the codegen row it runs inside while each
-# module is lowered on the owner before it is compiled
-fun lowering_carved(p: *project.Project, test_object: bool, t_lower: readout.Instant) {
-    if (test_object) { readout.span_end(p.progress, readout.TEST_LOWER, readout.TEST_CODEGEN, t_lower); }
-    or               { readout.span_end(p.progress, readout.LOWER, readout.CODEGEN, t_lower); }
+# the time lowering a module took, its own row: on one thread from its prepare to the end of its run, carved out
+# of the codegen row it runs inside; on a crew its run's, summed over the crew's threads beside the compiles
+fun lowering_timed(p: *project.Project, test_object: bool, summed: bool, spent: chrono_duration.Duration) {
+    var lower:   readout.Phase = readout.LOWER;
+    var codegen: readout.Phase = readout.CODEGEN;
+    if (test_object) {
+        lower   = readout.TEST_LOWER;
+        codegen = readout.TEST_CODEGEN;
+    }
+    if (summed) { readout.summed_into(p.progress, lower, spent); }
+    or          { readout.carve(p.progress, lower, codegen, spent); }
 }
 
 # what lowering the module `name` measured, its item and its module's counts, read out at the unit's
@@ -817,14 +1097,11 @@ fun read_out_lowered(p: *project.Project, test_object: bool, name: str, l: *comp
     readout.count(p.progress, readout.IR_INSTRUCTIONS, name, l.ir_count);
 }
 
-# a module's test object's name, `<module path>#tests`: `#` is in no module path, so it names no module
+# a module's test object's name, `<module path>#tests`: `#` is in no module path, so it names no module. the
+# text is the caller's, drawn from the session's allocator, and is named in no interner, since a unit's
+# prepare names nothing the units' merges could not follow
 fun test_object_name(p: *project.Project, fqn: intern.StrId) res[str, fail.Fail] {
-    val res_joined: res[str, fail.Fail] = diagnostic.join(p.alloc, intern.text(p.s.interner, fqn), "#tests");
-    if (sel res_joined.err) { ret res_joined; }
-    val res_held: res[intern.StrId, A.Error] = intern.add(p.s.interner, res_joined.ok);
-    str_free(p.alloc, res_joined.ok);
-    if (sel res_held.err) { ret res[str, fail.Fail].err{fail.refused(res_held.err)}; }
-    ret res[str, fail.Fail].ok{intern.text(p.s.interner, res_held.ok)};
+    ret diagnostic.join(p.s.alloc, intern.text(p.s.interner, fqn), "#tests");
 }
 
 # how this build's request has mirl compile each module
@@ -915,7 +1192,7 @@ fun read_interface(raw: ptr, mid: module.ModuleId) res[*sema_interface.Interface
     var key:       module.ModuleId                 = mid;
     val opt_known: opt[**sema_interface.Interface] = map.get[module.ModuleId, *sema_interface.Interface](?r.interfaces, ?key);
     if (sel opt_known.some) { ret res[*sema_interface.Interface, fail.Fail].ok{@opt_known.some}; }
-    val res_acquired: res[*sema_product.SemaResult, fail.Fail] = frontend.kept_sema_read(r.p, ?r.reads, mid);
+    val res_acquired: res[*sema_product.SemaResult, fail.Fail] = frontend.kept_sema_read(r.p, r.s, ?r.reads, mid);
     if (sel res_acquired.err)                      { ret res[*sema_interface.Interface, fail.Fail].err{res_acquired.err}; }
     if (!sel res_acquired.ok.status.kind.accepted) { ret res[*sema_interface.Interface, fail.Fail].err{report_phase.phase_failure(res_acquired.ok.status)}; }
     val iface:       *sema_interface.Interface = ?res_acquired.ok.interface;
@@ -985,7 +1262,7 @@ fun run_test_object_pass(p: *project.Project) err[fail.Fail] {
 # constants, template copy), the typed instances, the surfaces instance typing reads and the source
 # identities instances are bound by, each a product of its own that outlives the release. those
 # made from the released products are made before it: the instances once sema is done, and the
-# identities before the first unit (identities_made). a read of a released product refuses
+# identities before the first unit (run_units). a read of a released product refuses
 # (query.get, frontend.acquire_sema). a test build lowers every module again and gives back none
 pub fun run_codegen_pass(p: *project.Project) err[fail.Fail] {
     p.codegen_reached = 0;
@@ -994,15 +1271,14 @@ pub fun run_codegen_pass(p: *project.Project) err[fail.Fail] {
     if (sel err_inputs.err)     { ret err_inputs; }
     if (backend.whole(?p.back)) { ret run_whole_codegen(p); }
     if (test_build(p))          { ret run_units(p, PASS_HOLDING); }
-    val err_made: err[fail.Fail] = identities_made(p);
-    if (sel err_made.err) { ret err_made; }
     ret run_units(p, PASS_RELEASING);
 }
 
-# the source identity of every module a lowering may read one of made before any unit: on a target
-# whose objects merge instances, a lowering binds each instance by an identity read from every
-# module the instance names, and from each, every module it imports. made here, while every module's
-# syntax is held, each is a complete product the pass's lowerings read through their views
+# the source identity of every module a lowering may read one of made, or validated, in the pass's
+# operation before any unit: on a target whose objects merge instances, a lowering binds each instance
+# by an identity read from every module the instance names, and from each, every module it imports.
+# made while every module's syntax is held, each is a complete product the pass's lowerings read
+# through their views
 fun identities_made(p: *project.Project) err[fail.Fail] {
     if (!backend.merges(?p.back)) { ret err[fail.Fail].ok{}; }
     val count:         u32                 = project.module_count(p);
@@ -1031,7 +1307,7 @@ fun identity_reads(p: *project.Project, read: *bool) err[fail.Fail] {
     var k: u32 = 0;
     for (k < sema_instance.count(?p.instances.set)) {
         collections_vector.clear[module.ModuleId](?named);
-        val err_named: err[fail.Fail] = frontend.instance_reads(p, sema_instance.at(?p.instances.set, k), ?named);
+        val err_named: err[fail.Fail] = frontend.instance_reads(p, p.s.types, sema_instance.at(?p.instances.set, k), ?named);
         if (sel err_named.err) { ret err_named; }
         var n: usize = 0;
         for (n < named.len) {
@@ -1071,9 +1347,10 @@ val PASS_TESTS:     u8 = 2;
 # prepared: its prepare, to be completed or cancelled
 # held:     its prepare holds a failure, which its completion records
 # empty:    its prepare produced no product
-# made:     the pending product a run compiles, nil when nothing compiles
+# made:     the pending product a run lowers and compiles, nil when nothing compiles
 # ran:      what the run made, read once `finished`
 # bytes:    about what it holds once finished, until it completes
+# lending:  the stores a crew's threads lend its run, nil when it runs on the owner
 rec Slot {
     position: u32;
     key:      u64;
@@ -1085,6 +1362,7 @@ rec Slot {
     ran:      Ran;
     finished: bool;
     bytes:    usize;
+    lending:  *Lending;
 }
 
 # every unit of `kind` in pass order: each prepared on the owner, compiled, and completed on the owner strictly in
@@ -1093,6 +1371,8 @@ rec Slot {
 # finished. a unit's completion failing ends the pass there: nothing is prepared after it, and every unit prepared
 # ahead of it is cancelled and reports nothing
 fun run_units(p: *project.Project, kind: u8) err[fail.Fail] {
+    val err_made: err[fail.Fail] = identities_made(p);
+    if (sel err_made.err) { ret err_made; }
     var views: query.Views = query.views_init(p.s.alloc, nil);
     fin {
         p.views = nil;
@@ -1149,6 +1429,7 @@ fun stores_freeze(p: *project.Project) err[fail.Fail] {
     type.layer_init(res_boxed.ok, s.types, s.alloc, type.side_take(s.types));
     p.types_frozen = s.types;
     p.types_merged = 0;
+    p.names_merged = 0;
     s.types        = res_boxed.ok;
     # the owner's strings move to the frozen interner when the pass ends, so they draw on its allocator
     @res_names.ok  = intern.child_init(s.interner, s.interner.a);
@@ -1243,7 +1524,8 @@ fun run_units_serial(p: *project.Project, kind: u8) err[fail.Fail] {
         s.position = i;
         slot_begin(p, kind, ?s);
         if (s.made != nil) {
-            s.ran      = codegen_run(s.made);
+            var lent: Lent = owner_lent(p, false);
+            s.ran      = unit_run(s.made, ?lent);
             s.finished = true;
         }
         val err_finished: err[fail.Fail] = slot_finish(p, kind, ?s);
@@ -1274,6 +1556,13 @@ fun run_units_on(p: *project.Project, kind: u8, crew: *workers.Crew, count: u32)
     }
     val slots: *Slot = res_slots.ok;
     fin { A.deallocate[Slot](p.s.alloc, slots, count::usize); }
+    var lending:    Lending        = Lending{};
+    val err_lended: err[fail.Fail] = lending_init(p, ?lending, crew.started::usize);
+    if (sel err_lended.err) {
+        workers.close(crew);
+        ret err_lended;
+    }
+    fin { lending_dnit(?lending); }
     var result:   err[fail.Fail] = err[fail.Fail].ok{};
     var position: u32            = 0;
     var next:     u32            = 0;
@@ -1315,10 +1604,12 @@ fun run_units_on(p: *project.Project, kind: u8, crew: *workers.Crew, count: u32)
             s.position = position;
             position   = position + 1;
             slot_begin(p, kind, s);
+            s.lending = ?lending;
             if (s.made != nil) {
                 alive = alive + 1;
                 if (!workers.submit(crew, next, s::ptr, slot_run)) {
-                    s.ran = codegen_run(s.made);
+                    var lent: Lent = owner_lent(p, true);
+                    s.ran = unit_run(s.made, ?lent);
                     slot_finished(s, ?alive, ?waiting);
                 }
             }
@@ -1370,16 +1661,34 @@ fun slot_finished(s: *Slot, alive: *u32, waiting: *usize) {
 
 # about the bytes a finished unit holds until it completes: its object and the names its lowering kept
 fun slot_bytes(s: *Slot) usize {
-    var n: usize = (s.made.kept.held.len + s.made.kept.defined.len) * $size_of(intern.StrId);
-
+    var n:   usize     = 0;
+    val job: *LowerJob = s.made.lowering.job;
+    if (job != nil)      { n = (job.reading.held.len + job.defined.len) * $size_of(intern.StrId); }
+    if (!s.ran.compiled) { ret n; }
     var outcome: res[compile_unit.Made, backend_compile.Unplaced] = s.ran.made;
     if (sel outcome.ok) { n = n + mink_object.held_bytes(?outcome.ok.compiled.object); }
     ret n;
 }
 
+# a unit's run on a crew's thread, against a set of stores the crew lends, owning only those and the unit's
 fun slot_run(raw: ptr) {
-    val s: *Slot = raw::*Slot;
-    s.ran = codegen_run(s.made);
+    val s:    *Slot = raw::*Slot;
+    val lent: *Lent = lending_take(s.lending);
+    $if (role.CHECKED) { slot_permit(s, lent); }
+    s.ran = unit_run(s.made, lent);
+    $if (role.CHECKED) { role.permit(nil, 0); }
+    lending_give(s.lending, lent);
+}
+
+# the stores the calling worker owns while it runs the unit of `s`: the unit's own and those it is lent
+fun slot_permit(s: *Slot, lent: *Lent) {
+    val job: *LowerJob = s.made.lowering.job;
+    if (job == nil || job.stores == nil) {
+        role.permit(nil, 0);
+        ret;
+    }
+    var own: [5]ptr = [5]ptr{(?job.stores.types)::ptr, (?job.stores.names)::ptr, (?job.stores.named)::ptr, job.diags::ptr, (lent.facts)::ptr};
+    role.permit(?own[0], 5);
 }
 
 # the presentation names the units up to and holding the one at `position`
@@ -1388,13 +1697,16 @@ fun reached(p: *project.Project, kind: u8, position: u32) {
     or                      { p.codegen_reached = position + 1; }
 }
 
-# on a crew a pass's compiles run side by side, so its verify row is a sum over its own crew's threads and the
-# stage rows, which the test pass adds to, a sum over the codegen pass's, which bound the test crew's
+# on a crew a pass's lowerings and compiles run side by side, so its lowering and verify rows are sums over its own
+# crew's threads and the stage rows, which the test pass adds to, a sum over the codegen pass's, which bound the
+# test crew's. the owner's prepares stay in the codegen row
 fun summed_rows(p: *project.Project, kind: u8) {
     if (kind == PASS_TESTS) {
+        readout.phase_summed(p.progress, readout.TEST_LOWER, p.test_threads);
         readout.phase_summed(p.progress, readout.TEST_VERIFY, p.test_threads);
         ret;
     }
+    readout.phase_summed(p.progress, readout.LOWER, p.codegen_threads);
     readout.phase_summed(p.progress, readout.VERIFY, p.codegen_threads);
     var i: usize = 0;
     for (i < readout.STAGE_COUNT) {
@@ -1427,6 +1739,7 @@ fun slot_clear(s: *Slot, key: u64) {
     s.held     = false;
     s.empty    = false;
     s.made     = nil;
+    s.ran      = Ran{};
     s.finished = false;
     s.bytes    = 0;
 }
@@ -1466,7 +1779,7 @@ fun slot_prepare(p: *project.Project, s: *Slot) {
         ret;
     }
     # a prepare that found the object the cache staged has nothing to compile
-    if (made.pending != nil) { s.made = made; }
+    if (made.lowering != nil) { s.made = made; }
 }
 
 # the unit's codegen product once its turn came: its prepare completed, then read as it stands
@@ -1478,7 +1791,7 @@ fun slot_end(p: *project.Project, s: *Slot) res[*Product, fail.Fail] {
         val db:       *query.QueryDb      = ?p.s.queries;
         val prepared: query.PreparedQuery = taken.some;
         var err_made: err[fail.Fail]      = err[fail.Fail].ok{};
-        if (s.made != nil)    { err_made = codegen_complete(p, s.key, prepared, s.made, s.ran); }
+        if (s.made != nil)    { err_made = unit_complete(p, s.key, prepared, s.made, ?s.ran); }
         or (s.empty)          { err_made = query.complete_prepared(db, prepared, err[fail.Fail].err{fail.message("the codegen prepare produced no result handle")}); }
         or                    { err_made = query.complete_prepared(db, prepared, err[fail.Fail].ok{}); }
         if (sel err_made.err) { ret res[*Product, fail.Fail].err{err_made.err}; }
@@ -1524,12 +1837,8 @@ fun slot_finish(p: *project.Project, kind: u8, s: *Slot) err[fail.Fail] {
 # a unit prepared ahead of the one that ended its pass, given back unreported: what its compile made, then its
 # prepare, held failure and all
 fun slot_cancel(p: *project.Project, s: *Slot) {
-    if (s.made != nil && s.finished) {
-        var outcome: res[compile_unit.Made, backend_compile.Unplaced] = s.ran.made;
-        if (sel outcome.ok) { backend_compile.dnit(s.made.job.out, ?outcome.ok.compiled); }
-        or                  { backend_compile.unplaced_dnit(s.made.job.out, ?outcome.err); }
-    }
-    if (sel s.prepared.some) { val err_cancelled: err[fail.Fail] = query.cancel_prepared(?p.s.queries, s.prepared.some); }
+    if (s.made != nil && s.finished) { ran_dnit(s.made, ?s.ran); }
+    if (sel s.prepared.some)         { val err_cancelled: err[fail.Fail] = query.cancel_prepared(?p.s.queries, s.prepared.some); }
 }
 
 # an artifact taken whole: every emitted module lowered into the one unit and compiled on the owner, its object
@@ -1554,7 +1863,8 @@ fun whole_run(p: *project.Project) err[fail.Fail] {
     slot_clear(?s, unit_key(p, 0));
     slot_prepare(p, ?s);
     if (s.made != nil) {
-        s.ran      = codegen_run(s.made);
+        var lent: Lent = owner_lent(p, false);
+        s.ran      = unit_run(s.made, ?lent);
         s.finished = true;
     }
     val res_made: res[*Product, fail.Fail] = slot_end(p, ?s);
@@ -1574,9 +1884,11 @@ fun whole_run(p: *project.Project) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
-# a module's object under its prepare: its lowering, which it then depends on, taken whole into a product left
-# pending for `codegen_run` to compile and `codegen_complete` to finish, with the symbols a normal object defines
-# read before the lowering is taken; or, read as it stands, the object the object cache staged for it
+# a module's object under its prepare: its lowering, which it depends on, prepared beside it and finished by
+# the unit's run, which then compiles it, into a product left pending for `unit_complete` to finish, which
+# completes the lowering first and reads the symbols a normal object defines before the lowering is taken. a
+# lowering current in this operation is read as it stands. or, read as it stands, the object the object cache
+# staged for it
 fun codegen_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
     val p:         *project.Project                = raw::*project.Project;
     val s:         *session.Session                = p.s;
@@ -1591,6 +1903,7 @@ fun codegen_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, 
     var job: compile_unit.Job = compile_unit.Job{back: ?p.back, codegen: codegen_of(p), out: s.backing, ir_path: "", asm_path: "", name: intern.text(s.interner, m.fqn),
         timed: p.progress != nil, owner: nil};
     if (!m.load.home.root) { job.owner = intern.text(s.interner, m.load.home.package); }
+    var title: str = nil;
     if (!test_object) {
         job.ir_path  = m.ir_output;
         job.asm_path = m.asm_output;
@@ -1598,68 +1911,155 @@ fun codegen_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, 
     or {
         val res_named: res[str, fail.Fail] = test_object_name(p, m.fqn);
         if (sel res_named.err) { ret res[query.QueryOutput, fail.Fail].err{res_named.err}; }
-        job.name = res_named.ok;
+        title    = res_named.ok;
+        job.name = title;
     }
-    val res_queries_entry: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?LOWER, key);
-    if (sel res_queries_entry.err) { ret res[query.QueryOutput, fail.Fail].err{res_queries_entry.err}; }
-    val l:       *Lowering                               = handle_decode(res_queries_entry.ok)::*Lowering;
-    var defined: collections_vector.Vector[intern.StrId] = collections_vector.init[intern.StrId](s.backing);
-    if (!test_object && !back_half_key_is_whole(key)) {
-        val err_read: err[fail.Fail] = defined_read(p, key, ?defined);
-        if (sel err_read.err) {
-            collections_vector.dnit[intern.StrId](?defined);
-            ret res[query.QueryOutput, fail.Fail].err{err_read.err};
-        }
+    var handed: bool = false;
+    fin {
+        if (!handed && title != nil) { str_free(s.alloc, title); }
     }
-    val lowered: *compile_unit.Lowered = l.lowered;
-    var kept:    Kept                  = Kept{facts: lowered.facts, held: l.held, defined: defined};
-    l.taken = true;
-    val err_released: err[fail.Fail] = query.value_dnit(?s.queries, ?LOWER, key);
-    if (sel err_released.err) {
-        kept_dnit(?kept);
-        compile_unit.dnit(s.alloc, lowered);
-        ret res[query.QueryOutput, fail.Fail].err{err_released.err};
+    val db:          *query.QueryDb       = ?s.queries;
+    val res_current: res[bool, fail.Fail] = query.reusable[project.Project](?p.queries, p, ?LOWER, key);
+    if (sel res_current.err) { ret res[query.QueryOutput, fail.Fail].err{res_current.err}; }
+    if (res_current.ok) {
+        val res_read: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?LOWER, key);
+        if (sel res_read.err) { ret res[query.QueryOutput, fail.Fail].err{res_read.err}; }
+        handed = true;
+        ret product_pending(db, alloc, handle_decode(res_read.ok)::*Lowering, opt[query.PreparedQuery].none{}, job, title, s.alloc);
     }
-    ret product_pending(alloc, lowered, job, kept, s.alloc);
+    val res_prepared: res[query.PreparedQuery, fail.Fail] = query.prepare[project.Project](?p.queries, p, ?LOWER, key);
+    if (sel res_prepared.err) { ret res[query.QueryOutput, fail.Fail].err{res_prepared.err}; }
+    val prepared: query.PreparedQuery  = res_prepared.ok;
+    val res_held: res[bool, fail.Fail] = query.prepared_held(db, prepared);
+    if (sel res_held.err) {
+        val err_cancelled: err[fail.Fail] = query.cancel_prepared(db, prepared);
+        ret res[query.QueryOutput, fail.Fail].err{res_held.err};
+    }
+    # a lowering whose prepare failed is answered as a read of it would have been
+    if (res_held.ok) {
+        val err_lowered: err[fail.Fail] = query.complete_prepared(db, prepared, err[fail.Fail].ok{});
+        if (sel err_lowered.err) { ret res[query.QueryOutput, fail.Fail].err{err_lowered.err}; }
+        ret res[query.QueryOutput, fail.Fail].err{fail.message("codegen: a lowering that held a failure completed")};
+    }
+    val res_view: res[query.QueryView, fail.Fail] = query.prepared_view(db, prepared);
+    if (sel res_view.err) {
+        val err_cancelled: err[fail.Fail] = query.cancel_prepared(db, prepared);
+        ret res[query.QueryOutput, fail.Fail].err{res_view.err};
+    }
+    handed = true;
+    ret product_pending(db, alloc, handle_decode(res_view.ok)::*Lowering, opt[query.PreparedQuery].some{prepared}, job, title, s.alloc);
 }
 
-# what compiling a prepared unit's module made, and the time it took
+# what a unit's run made: whether it compiled, then what compiling its lowered module made and the time it took
 rec Ran {
-    made:  res[compile_unit.Made, backend_compile.Unplaced];
-    spent: chrono_duration.Duration;
+    compiled: bool;
+    made:     res[compile_unit.Made, backend_compile.Unplaced];
+    spent:    chrono_duration.Duration;
 }
 
-# the worker half of a unit's codegen: the pending module of `made` compiled as its job says, reading the product
-# alone and touching only the unit's heap, which it tears down, the target and the object allocator
-fun codegen_run(made: *Product) Ran {
+# the run of a unit: its lowering, when it is pending and not yet run, lowered against the stores `lent` lends,
+# then its lowered module compiled as its job says. it reads the product and what the lowering's prepare
+# gathered, and touches only the unit's stores and heap, the stores lent, the target and the object allocator
+fun unit_run(made: *Product, lent: *Lent) Ran {
+    val l:       *Lowering             = made.lowering;
+    var lowered: *compile_unit.Lowered = l.lowered;
+    if (l.job != nil) {
+        if (!l.job.made)            { lower_run(l.job, lent); }
+        if (sel l.job.lowered.err)  { ret Ran{compiled: false}; }
+        if (sel l.job.gathered.err) { ret Ran{compiled: false}; }
+        lowered = l.job.lowered.ok;
+    }
     var started: readout.Instant = readout.Instant.none{};
     if (made.job.timed) { started = readout.sample(); }
-    val res_made: res[compile_unit.Made, backend_compile.Unplaced] = compile_unit.compile(?made.job, made.pending);
-    ret Ran{made: res_made, spent: readout.elapsed(started)};
+    val res_made: res[compile_unit.Made, backend_compile.Unplaced] = compile_unit.compile(?made.job, lowered);
+    ret Ran{compiled: true, made: res_made, spent: readout.elapsed(started)};
 }
 
-# the completion of a prepared unit, in order on the owner: its refusal recorded, or its object made the product's,
-# its warnings placed and reported where its product reports, its link claims stated and its rows read out, then
-# the product published
+# what a unit's run compiled given back unreported
+fun ran_dnit(made: *Product, ran: *Ran) {
+    if (!ran.compiled) { ret; }
+    var outcome: res[compile_unit.Made, backend_compile.Unplaced] = ran.made;
+    if (sel outcome.ok) { backend_compile.dnit(made.job.out, ?outcome.ok.compiled); }
+    or                  { backend_compile.unplaced_dnit(made.job.out, ?outcome.err); }
+    ran.compiled = false;
+}
+
+# the completion of a prepared unit, in order on the owner: its lowering completed first when it was prepared
+# beside it, then what its codegen reads of the lowering read and taken, then its compile completed
+fun unit_complete(p: *project.Project, key: u64, prepared: query.PreparedQuery, made: *Product, ran: *Ran) err[fail.Fail] {
+    val db:    *query.QueryDb           = ?p.s.queries;
+    val lower: opt[query.PreparedQuery] = made.lower;
+    made.lower = opt[query.PreparedQuery].none{};
+    if (sel lower.some) {
+        val err_lowered: err[fail.Fail] = lower_complete(p, lower.some, made.lowering);
+        if (sel err_lowered.err) {
+            made.lowering = nil;
+            ran_dnit(made, ran);
+            ret query.complete_prepared(db, prepared, err_lowered);
+        }
+    }
+    val err_taken: err[fail.Fail] = codegen_take(p, key, prepared, made);
+    if (sel err_taken.err) {
+        ran_dnit(made, ran);
+        ret query.complete_prepared(db, prepared, err_taken);
+    }
+    ret codegen_complete(p, key, prepared, made, @ran);
+}
+
+# what a unit's codegen reads of its completed lowering, read on its own product entered again: the symbols a
+# normal object defines, then the lowered module, the facts and the instances taken, the lowering given back
+fun codegen_take(p: *project.Project, key: u64, prepared: query.PreparedQuery, made: *Product) err[fail.Fail] {
+    val db:      *query.QueryDb                          = ?p.s.queries;
+    val l:       *Lowering                               = made.lowering;
+    var defined: collections_vector.Vector[intern.StrId] = collections_vector.init[intern.StrId](p.s.backing);
+    if (!back_half_key_is_test(key) && !back_half_key_is_whole(key)) {
+        val err_entered: err[fail.Fail] = query.prepared_enter(db, prepared);
+        if (sel err_entered.err) {
+            collections_vector.dnit[intern.StrId](?defined);
+            ret err_entered;
+        }
+        val err_read: err[fail.Fail] = defined_read(p, key, ?defined);
+        val err_left: err[fail.Fail] = query.prepared_leave(db, prepared);
+        var err_kept: err[fail.Fail] = err_left;
+        if (sel err_read.err) { err_kept = err_read; }
+        if (sel err_kept.err) {
+            collections_vector.dnit[intern.StrId](?defined);
+            ret err_kept;
+        }
+    }
+    made.kept     = Kept{facts: l.lowered.facts, held: l.held, defined: defined};
+    made.lowered  = true;
+    made.pending  = l.lowered;
+    made.lowering = nil;
+    l.taken       = true;
+    ret query.value_dnit(db, ?LOWER, key);
+}
+
+# the completion of a prepared unit's compile, in order on the owner: its refusal recorded, or its object made
+# the product's, its warnings placed and reported where its product reports, its link claims stated and its rows
+# read out, then the product published
 fun codegen_complete(p: *project.Project, key: u64, prepared: query.PreparedQuery, made: *Product, ran: Ran) err[fail.Fail] {
     val db:        *query.QueryDb                                   = ?p.s.queries;
     var outcome:   res[compile_unit.Made, backend_compile.Unplaced] = ran.made;
     val res_keyed: res[module.ModuleId, fail.Fail]                  = keyed_module(p, key);
     if (sel res_keyed.ok) { read_out_lowered(p, back_half_key_is_test(key), intern.text(p.s.interner, project.module_at(p, res_keyed.ok::u32).fqn), made.pending); }
     if (sel outcome.err) {
-        val refused: fail.Fail = diagnostic.failure_retain(p.s.interner, backend_compile.placed(p.s.backing, p.s.sources, ?outcome.err));
+        val refused: fail.Fail = backend_compile.placed(p.s.backing, p.s.sources, ?outcome.err);
         # a back end refusal is the unit's own and the pass goes on to the next unit, so every refusing unit is
-        # reported. the allocator's refusal ends the pass
-        if (fail.is_environment(refused)) { ret query.complete_prepared(db, prepared, err[fail.Fail].err{refused}); }
+        # reported, its text copied into the product's diagnostics. it is not named in the session's interner,
+        # since on a crew the owner names strings only by merging units. the allocator's refusal ends the pass,
+        # its text the session's
+        if (fail.is_environment(refused)) { ret query.complete_prepared(db, prepared, err[fail.Fail].err{diagnostic.failure_retain(p.s.interner, refused)}); }
         val res_refusal_diags: res[*diagnostic.DiagnosticStore, fail.Fail] = query.prepared_diags(db, prepared);
         if (sel res_refusal_diags.err) { ret query.complete_prepared(db, prepared, err[fail.Fail].err{res_refusal_diags.err}); }
         val err_refusal: err[fail.Fail] = refusal_reported(res_refusal_diags.ok, refused);
         if (sel err_refusal.err) { ret query.complete_prepared(db, prepared, err_refusal); }
         ret query.complete_prepared(db, prepared, err[fail.Fail].err{fail.reported()});
     }
-    compile_unit.dnit(p.s.alloc, made.pending);
+    compile_unit.dnit(made.job.out, made.pending);
     made.pending = nil;
     made.object  = outcome.ok.compiled.object;
+    made.holds   = true;
     val res_diags: res[*diagnostic.DiagnosticStore, fail.Fail] = query.prepared_diags(db, prepared);
     if (sel res_diags.err) {
         backend_compile.warnings_dnit(p.s.backing, ?outcome.ok.compiled);
@@ -1830,34 +2230,49 @@ fun kept_dnit(k: *Kept) {
 }
 
 # a codegen product: the unit's object, and what it kept of its lowering, none for an object
-# the cache restored. a prepared product holds its lowered module and the job that compiles it
-# until its completion makes the object
+# the cache restored. a prepared product holds the unit's lowering, prepared beside it or current, and
+# the job that compiles it, until its completion takes the lowering and makes the object
+# ---
+# holds:    it holds its object, restored or made by its completion
+# kept:     what it kept of its lowering, once `lowered`
+# pending:  the lowered module its completion took, until the object is made of it
+# title:    the test object's name, which the job names it by and the product owns; nil for a module's
+#           object, named by its module's path
+# lowering: the unit's lowering, the LOWER product's, borrowed until the completion takes it
+# lower:    the lowering prepared beside it, which completes before it
 rec Product {
-    object:  Object;
-    kept:    Kept;
-    lowered: bool;
-    pending: *compile_unit.Lowered;
-    job:     compile_unit.Job;
+    object:   Object;
+    holds:    bool;
+    kept:     Kept;
+    lowered:  bool;
+    pending:  *compile_unit.Lowered;
+    job:      compile_unit.Job;
+    title:    str;
+    lowering: *Lowering;
+    lower:    opt[query.PreparedQuery];
 }
 
 fun product_dnit(raw: ptr, alloc: *A.Allocator) {
     val made: *Product = raw::*Product;
-    if (made.pending != nil) { compile_unit.dnit(alloc, made.pending); }
-    or                       { backend.object_dnit(?made.object); }
+    if (made.pending != nil) { compile_unit.dnit(made.job.out, made.pending); }
+    if (made.holds)          { backend.object_dnit(?made.object); }
     if (made.lowered)        { kept_dnit(?made.kept); }
+    if (made.title != nil)   { str_free(alloc, made.title); }
     A.deallocate[Product](alloc, made, 1);
 }
 
-# a prepared product: the lowered module `lowered` and what its lowering kept, which `job` compiles
-fun product_pending(alloc: *A.Allocator, lowered: *compile_unit.Lowered, job: compile_unit.Job, kept: Kept, owner: *A.Allocator) res[query.QueryOutput, fail.Fail] {
-    var held:      Kept                   = kept;
+# a prepared product over the unit's lowering `l`, prepared beside it as `lower` or current, which `job`
+# compiles, the test object's name `title` owned by it. a lowering prepared beside it is cancelled when the
+# product cannot be made
+fun product_pending(db: *query.QueryDb, alloc: *A.Allocator, l: *Lowering, lower: opt[query.PreparedQuery], job: compile_unit.Job, title: str,
+    owner: *A.Allocator) res[query.QueryOutput, fail.Fail] {
     val res_boxed: res[*Product, A.Error] = A.allocate[Product](owner, 1);
     if (sel res_boxed.err) {
-        kept_dnit(?held);
-        compile_unit.dnit(owner, lowered);
+        if (sel lower.some) { val err_cancelled: err[fail.Fail] = query.cancel_prepared(db, lower.some); }
+        if (title != nil)   { str_free(owner, title); }
         ret res[query.QueryOutput, fail.Fail].err{fail.refused(res_boxed.err)};
     }
-    @res_boxed.ok = Product{kept: held, lowered: true, pending: lowered, job: job};
+    @res_boxed.ok = Product{lowered: false, pending: nil, job: job, title: title, lowering: l, lower: lower};
     ret handle_encode(alloc, res_boxed.ok::ptr, product_dnit, owner);
 }
 
@@ -1869,7 +2284,7 @@ fun product_encode(alloc: *A.Allocator, o: Object, owner: *A.Allocator) res[quer
         backend.object_dnit(?held);
         ret res[query.QueryOutput, fail.Fail].err{fail.refused(res_boxed.err)};
     }
-    @res_boxed.ok = Product{object: held, lowered: false, pending: nil};
+    @res_boxed.ok = Product{object: held, holds: true, lowered: false, pending: nil};
     ret handle_encode(alloc, res_boxed.ok::ptr, product_dnit, owner);
 }
 
