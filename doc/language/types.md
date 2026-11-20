@@ -2,8 +2,8 @@
 
 Mach has a small set of compiler-shipped concrete types plus a uniform
 type-construction grammar for pointers, arrays, and function types. There
-are no compiler-known type aliases — names like `bool`, `usize`, and `str`
-are stdlib `def`s.
+are no compiler-known type aliases. Names like `bool`, `usize`, and `str`
+are stdlib `def`s, and a module that does not import one cannot spell it.
 
 ## Primitive scalars
 
@@ -122,11 +122,11 @@ Three operations have a shape worth knowing:
   schoolbook over its lanes, three multiplies and the widening one.
 - **Division and remainder** at 128 bits have no instruction on any target
   and are calls into helpers the compiler provides with the program.
-- **Vectors** have lanes of 8 to 64 bits, so `u128x2` is not a vector type;
-  it is refused with the lane rule named.
+- **Vectors** have lanes of 8 to 64 bits, so `u128x2` is not a vector type.
+  It is refused with `vector.invalid_type`, naming the lane rule.
 
 The secrecy page states which 128-bit operations a secret may reach
-([secrecy.md](secrecy.md)); the calling conventions for `u128` and `i128`
+([secrecy.md](secrecy.md)), and the calling conventions for `u128` and `i128`
 across an `ext fun` boundary are on [ext-fun.md](ext-fun.md).
 
 ### 256 and 512-bit integers
@@ -142,19 +142,23 @@ Constants at these widths are held in 128 bits for now (mach#4803 widens
 them):
 
 - No literal suffix names them, and a literal or constant of one of them
-  reaches what an `i128` holds, `-2^127` to `2^127 - 1`. It extends to the full
-  width by its sign.
+  reaches what an `i128` holds: `-2^127` to `2^127 - 1` for `i256` and `i512`,
+  and `0` to `2^127 - 1` for `u256` and `u512`. A literal outside that range is
+  refused with `const.out_of_range`. A signed one extends to the full width by
+  its sign.
 - Comptime evaluation reads a value of one of them as an untyped integer, exact
   to 128 bits, with any overflow past that refused.
 
 `u1` is the truth value: one byte holding 0 or 1, with its layout read from mirl's
 row of the one-bit integer. Comparisons, `&&`, `||`, `!` and `sel` produce it, and a
 condition requires it. It has `&`, `|`, `^`, `==` and `<` but no arithmetic, so it stays
-0 or 1. `x::u1` asks whether the integer `x` is non-zero, and a float is compared
-instead. There is no `i1`.
+0 or 1. Arithmetic and `~` on a `u1` are refused with `type.mismatch`, and a
+condition of any other type with `condition.type`. `x::u1` asks whether the
+integer `x` is non-zero. A float cast to `u1` is refused with `cast.invalid`, so
+a float is compared instead (`x != 0.0`). There is no `i1`.
 
 There is no compiler `bool`. `bool` is a stdlib alias, `def bool: u1;`, with `true` /
-`false` as stdlib `val`s (`1` / `0`) — see [def.md](def.md).
+`false` as stdlib `val`s (`1` / `0`), see [def.md](def.md).
 
 ## SIMD vectors
 
@@ -170,7 +174,7 @@ u8x16  u16x8  u32x4  u64x2      # unsigned integer lanes
 ```
 
 The spelling is `<u|i|f><width>x<count>` with a **single** `x`. A name like
-`f32x4x4` is not a vector type (it resolves as an ordinary identifier); a matrix
+`f32x4x4` is not a vector type (it resolves as an ordinary identifier). A matrix
 is an algorithm over vectors and belongs in a library over vector elements, not
 the language.
 
@@ -182,9 +186,9 @@ val f32x4: i64 = 7; # fine: values are a different position
 ```
 
 A **type** may not. `rec`, `uni`, `tag`, `def` and a generic parameter reject a name
-spelled as a vector form, because a type declared with a vector's name would be
-silently unreachable:
-every use in type position resolves to the vector instead:
+spelled as a vector form with `decl.vector_spelled_name`, because a type declared
+with a vector's name would be silently unreachable. Every use in type position
+resolves to the vector instead:
 
 ```mach error is spelled as a vector type
 rec f32x3     { x: f32; } # error: `f32x3` is spelled as a vector type
@@ -194,23 +198,24 @@ tag f32x4: u8 { empty; } # error: `f32x4` is spelled as a vector type
 This holds for any well-formed spelling, so the name cannot be claimed by a type
 and then collide with the vector it spells.
 
-Two rules bound the form, and **neither depends on the target**:
+Two rules bound the form, and **neither depends on the target**. Each is refused
+with `vector.invalid_type`, as is a lane type outside the lane rule below:
 
-- **At least 2 lanes.** `f32x1` is refused; a one-lane vector is just its scalar.
+- **At least 2 lanes.** `f32x1` is refused. A one-lane vector is just its scalar.
 - **At most 65535 lanes.** A compiler limit, not a machine one: the lane count is
   carried as a 16-bit field through code generation.
 
 Everything else is legal at every width. `f32x3` is 96 bits, `f32x8` is 256, and
-both compile on every target — including one with no vector unit at all.
+both compile on every target, including one with no vector unit at all.
 
 **Width is a realization question, not a legality one.** How a shape is realized
-does depend on the target, and there are three answers: one packed instruction
-when the shape fits a vector register and the operation has a packed form; one
-packed instruction per register-width piece when the shape is wider than the
-register; and per-lane scalar code where the operation has no packed form for the
+does depend on the target, and there are three answers. A shape that fits a
+vector register is one packed instruction where the operation has a packed form.
+A shape wider than the register is one packed instruction per register-width
+piece. Per-lane scalar code serves where the operation has no packed form for the
 lane shape, or on a target with no vector unit (rv64gc today). All three
-compute identical lanes — the expansion is a fixed unroll, never a reassociation
-— so only performance varies. The `simd` manifest lever (see
+compute identical lanes (the expansion is a fixed unroll, never a reassociation),
+so only performance varies. The `simd` manifest lever (see
 [manifest.md](manifest.md)) reports or refuses the scalar cases if a project
 cannot afford them.
 
@@ -223,7 +228,7 @@ shift, a conversion that keeps its lanes in place) runs on each piece. One that
 moves lanes between pieces has its own lowering over the pieces: a range
 `v[start, count]` reads the pieces it crosses and joins them, a widening
 conversion or multiply writes each half of a source piece into its own result
-piece (`i16x8 → i32x8` is `pmullw`/`pmulhw` with `punpcklwd`/`punpckhwd` on
+piece (`i16x8` to `i32x8` is `pmullw`/`pmulhw` with `punpcklwd`/`punpckhwd` on
 x86-64, and `smull` with `smull2` on aarch64), and a narrowing one joins the
 narrowed lanes of its pieces. A reduction written over the lanes reads each lane
 from its piece. An operation with no packed form for the lane shape (a 64-bit
@@ -267,8 +272,12 @@ arithmetic below AVX-512 FP16, and mach does not emit AVX-512 FP16.
 
 ### Size and alignment
 
-`$size_of` is **lane-derived**: `lanes × element size`, packed, with no padding
-at any width.
+`$size_of` is **lane-derived**: the lanes are packed, `lanes x element size`
+bytes, and that extent is rounded up to a multiple of `$align_of`, as every
+type's size is. A vector that aligns to a single lane has no padding, so
+`f32x3` is 12 bytes. One that aligns to a register width is padded when its
+lanes are not a multiple of that width: `f32x5` holds 20 bytes of lanes, aligns
+to 16 and is 32 bytes.
 
 | type | `$size_of` | `$align_of` |
 |---|---|---|
@@ -278,22 +287,24 @@ at any width.
 | `f32x3` | 12 | 4 |
 | `f32x4` | 16 | 16 |
 | `i16x4` | 8 | 2 |
-| `f32x5` | 20 | 16 |
+| `f32x5` | 32 | 16 |
 | `f32x8` | 32 | 16 (32 where the target's vector register is 256 bits) |
+| `i32x9` | 48 (64 where the register is 256 bits) | 16 (32 there) |
 
 `$align_of` has **two rungs, each for its own reason**. A vector *narrower* than
 the vector register is a packed aggregate that loads piecewise, so it aligns to a
 single lane. One that *fills* the register aligns to its whole size, because the
 machine's vector load requires it. One *wider* than the register is split into
 register-width pieces, each loaded and stored on its own, so it aligns to the
-register width — 16 for `f32x8`, not 32, because each piece is one 16-byte load
+register width (16 for `f32x8`, not 32), because each piece is one 16-byte load
 and a larger alignment would serve none of them.
 
 The register is the widest the target's selected extensions give it. On x86-64
 with `avx` it is the 32-byte `ymm`, and a vector aligns to the widest register it
 fills: 32 for `f32x8`, `i32x8` and every wider vector, 16 for `f32x4` and for a
-20- or 24-byte vector, and a lane for one narrower than 16 bytes, as C aligns
-`__m256` and `__m128`.
+vector of 20 to 31 bytes of lanes (which is then 32 bytes in size), and a lane
+for one narrower than 16 bytes, matching the psABI alignment of `__m256` and
+`__m128`.
 
 The first rung is what makes `[N]f32x3` a usable packed vertex buffer: padding
 `f32x3` to 16 bytes would make it indistinguishable from `f32x4` in memory.
@@ -301,8 +312,9 @@ The first rung is what makes `[N]f32x3` a usable packed vertex buffer: padding
 Arrays of vectors (`[4]f32x4`) and pointers to vectors (`*f32x4`) are ordinary
 composite types over a vector element.
 
-**Literals** are full-arity — one initializer per lane, mirroring array literals.
-The lane count must match exactly; too few or too many lanes is a compile error.
+**Literals** are full-arity: one initializer per lane, mirroring array literals.
+The lane count must match exactly. Too few or too many lanes is refused with
+`vector.literal_length`.
 
 ```mach fragment
 val v: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0};
@@ -331,8 +343,9 @@ The load is one unaligned vector load and the store one vector store (`movups` o
 x86-64), with no array value in between, so any element offset is valid. Nothing
 requires `i` to be a multiple of the lane count. `::` between an array and a
 vector is type-checked like every other `::`: the element type and the count must
-be the same on both sides, so `[4]i32` does not convert to `f32x4` and `[8]i16`
-does not convert to `i32x4`. The range and the conversion are described with the
+be the same on both sides, so `[4]i32` does not convert to `f32x4`
+(`cast.vector_element`) and `[8]i16` does not convert to `i32x4`
+(`cast.vector_shape`). The range and the conversion are described with the
 index and cast operators in [operators.md](operators.md#range).
 
 **The reinterpret is the bit-level view.** `@((?A[i]):~*f32x4)` reads the sixteen
@@ -353,13 +366,14 @@ val hi: i32x4 = v[4, 4]::i32x4;         # widen the high half
 Where the target packs the lane-halving extension (x86-64, aarch64) each line is
 that one instruction, signed or unsigned by the source lanes, and elsewhere it is the
 lane path. A vector range's start is a comptime constant, as a lane index is, and
-it takes at least 2 lanes (one lane is `v[i]`).
+it takes at least 2 lanes (one lane is `v[i]`). A one-lane range is refused with
+`vector.range_width`.
 
 **Lane access** `v[i]` reads or writes a single lane. The index must be a
-comptime constant in `[0, lanes)`; a dynamic (runtime) lane index is not
-supported in this increment. The bound is the same compile-time rule an array
-gets, reported the same way — `v[4]` on a `u32x4` is `index 4 is out of bounds
-for `u32x4` of length 4`.
+comptime constant in `[0, lanes)`. A dynamic (runtime) lane index is not
+supported in this increment and is refused with `vector.lane_index_dynamic`. The
+bound is the same compile-time rule an array gets, reported the same way:
+`v[4]` on a `u32x4` is `index 4 is out of bounds for `u32x4` of length 4`.
 
 ```mach fragment
 var v: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0};
@@ -367,16 +381,17 @@ val x: f32 = v[0];              # read lane 0
 v[3] = 9.0;                     # write lane 3
 ```
 
-There are no scalar↔vector casts in this increment: neither an implicit
-scalar-to-vector conversion nor a `1.0::f32x4` reinterpret is legal. Between
+There are no casts between a scalar and a vector in this increment: neither an
+implicit scalar-to-vector conversion nor a `1.0::f32x4` reinterpret is legal. Between
 two vectors with the same lane count, `::` converts each lane with the scalar
 rule (a lane of `-7` becomes `-7.0` in `i32x4::f32x4`), and `:~` reads the
 bits of any vector of the same byte size. The lane-wise operators and the
 comparison-to-mask rule are in [operators.md](operators.md), including the
 shifts, whose two forms are `vec << vec` and `vec >> vec` with a count of the
 same shape (a uniform count is the same count in every lane of a literal,
-`v >> u32x4{k, k, k, k}`, never a scalar); what a target
-without hardware SIMD does with a vector operator is the `simd` profile lever ([manifest.md](manifest.md),
+`v >> u32x4{k, k, k, k}`, and a scalar count is refused with
+`vector.shift_count`). What a target without hardware SIMD does with a vector
+operator is the `simd` profile lever ([manifest.md](manifest.md),
 [policy.md](policy.md)).
 
 ## Handles
@@ -482,6 +497,9 @@ set is fixed and closed rather than varied per declaration:
 - it reaches an operation only by being passed to one, bound as a descriptor
 - its extent is declared by the owning target
 
+A handle declared as a local binding, a record or union field, an array element
+or behind a pointer to a pointer is refused with `handle.storage`.
+
 A generic function takes a handle as a type argument, and each instance is held to
 these rules as the same function written out would be: the handle is passed by value,
 behind a pointer to its binding, or returned, and never named as a local or placed in an
@@ -548,7 +566,7 @@ pub def VaList;
 
 It exists for the one C type that has no correct spelling in mach source.
 `va_list` is a plain pointer on System V x86-64, Apple arm64, Microsoft x64 and
-RISC-V lp64d, and a 32-byte 8-aligned composite under AAPCS64 — so `ptr` binds
+RISC-V lp64d, and a 32-byte 8-aligned composite under AAPCS64, so `ptr` binds
 correctly on four platforms and silently corrupts on the fifth, where the psABI
 passes the composite indirectly with the caller owning the copy.
 
@@ -566,8 +584,11 @@ What a program may do with one is bounded to the opposite end from a handle's:
 - it cannot be a local binding, a global, or a record or union field
 - it cannot sit behind a pointer or inside an array
 
-Reading one needs `va_arg`, which mach has no callee shape for: mach has no runtime
-variadics, so nothing walks its own argument tail. `$size_of` and `$align_of`
+Each use the list forbids is refused with `abi_type.opaque`, and a name other
+than `va_list` with `abi_type.unknown`.
+
+Reading one needs `va_arg`, and no mach function walks its own argument tail:
+variadics are a C FFI form and a comptime pack, never a runtime callee shape. `$size_of` and `$align_of`
 answer with the target's declared numbers, which are published psABI facts rather
 than anything about a value.
 
@@ -580,7 +601,7 @@ See [ext-fun.md](ext-fun.md) for the binding recipe and
 
 ## Pointer
 
-`*T` — pointer to a value of type `T`.
+`*T` is a pointer to a value of type `T`.
 
 ```mach fragment
 var x: i64;
@@ -671,7 +692,7 @@ pointer keeps the Logical addressing model and is unchanged by them.
 
 ## Array
 
-`[N]T` — array of exactly `N` values of type `T`. Nested: `[N][M]T`.
+`[N]T` is an array of exactly `N` values of type `T`. Nested: `[N][M]T`.
 
 ```mach
 val a: [4]i64    = [4]i64{1, 2, 3, 4};
@@ -724,12 +745,15 @@ same way. It is exactly the length `$length_of` reports
 ([comptime-intrinsics.md](comptime-intrinsics.md)), and a vector's lane count
 takes the identical rule.
 
-Only a **constant** index is checked. A runtime index is not, and a pointer is
-not indexed against any length at all — `*T` carries none.
+An index out of bounds is refused with `index.out_of_bounds`, and a range with
+`range.out_of_bounds`. Only a **constant** index is checked. A runtime index is
+not, and a pointer is not indexed against any length at all, since `*T` carries
+none.
 
 **A range** `x[start, count]` is `count` consecutive elements from `start`, as a
 `[count]T` value, over an array or through a pointer. `count` is a comptime
-constant of at least 1, and `start` is any index. A constant `start` is checked the
+constant of at least 1 (a count of 0 is refused with `range.count_invalid`), and
+`start` is any index. A constant `start` is checked the
 way a constant index is, against the whole range: `start + count` may reach `N`
 and may not pass it.
 
@@ -744,13 +768,14 @@ fun window() i32 {
 
 A range is also an assignment target, storing `count` elements from `start`: the
 stored value's type is exactly `[count]T`. A range read is a value, not a view:
-`?xs[0, 2]` is an error, and writing into a range (`xs[0, 2][1] = 3`) is too. With
+`?xs[0, 2]` is an error (`address.temporary`), and writing into a range
+(`xs[0, 2][1] = 3`) is too (`assign.not_place`). With
 `::` to a vector of the same shape it is the vector load and store in
 [SIMD vectors](#simd-vectors).
 
 ## Function type
 
-`fun(T1, T2) R` — first-class function-pointer type.
+`fun(T1, T2) R` is a first-class function-pointer type.
 
 ```mach
 use std.print;
@@ -807,7 +832,7 @@ other declaration (`use std.types.result.res;`):
 - `err[E]` is an outcome with error case `err: E` first and payloadless success `ok` second
 
 `err[E]` is not an alias of `opt[E]`. There are no defaulted generic
-arguments, no general type inference and no dummy success types; the compiler
+arguments, no general type inference and no dummy success types. The compiler
 has no knowledge of the three names, so a module that imports none of them
 cannot spell them, and a module may declare its own.
 
@@ -825,6 +850,6 @@ case test and the lexical payload guards are in [tag.md](tag.md).
 
 ## See also
 
-- [secrecy.md](secrecy.md) — the `^` secret qualifier over any of these types
-- [operators.md](operators.md) — what operations work on each type
-- [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`, `$align_of`
+- [secrecy.md](secrecy.md): the `^` secret qualifier over any of these types
+- [operators.md](operators.md): what operations work on each type
+- [comptime-intrinsics.md](comptime-intrinsics.md): `$size_of`, `$align_of`

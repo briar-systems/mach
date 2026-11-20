@@ -142,11 +142,11 @@ pub tag opt[T]:    u8 { none; some: T; }
 pub tag err[E]:    u8 { err: E; ok; }
 ```
 
-- `res[T, E]` is either an error of type `E` or a value of type `T`; `err: E` is
+- `res[T, E]` is either an error of type `E` or a value of type `T`. `err: E` is
   the first declared case and `ok: T` the second.
-- `opt[T]` is either absence or a value of type `T`; payloadless `none` is
+- `opt[T]` is either absence or a value of type `T`. Payloadless `none` is
   first and `some: T` second.
-- `err[E]` is either an error of type `E` or payloadless success; `err: E` is
+- `err[E]` is either an error of type `E` or payloadless success. `err: E` is
   first and payloadless `ok` second. It is distinct from `opt[E]`, not an alias.
 
 There is no defaulted type argument, general type inference, dummy success
@@ -174,9 +174,9 @@ both `res[T, E]` and `err[E]` selects `err` with a zero-initialized error
 payload. The case names `ok`, `err`, `some` and `none` are members of their
 tags, not keywords.
 
-Their layouts and closed case sets are part of std's SemVer contract; they ship
-in std 2.0.0 paired with Mach 5.0.0. They are std declarations like any other:
-the compiler has no knowledge of the three names, they resolve only through an
+Their layouts and closed case sets are part of std's SemVer contract. They first
+shipped in std 2.0.0 paired with Mach 5.0.0. They are std declarations like any
+other: the compiler has no knowledge of the three names, they resolve only through an
 import or a declaration in scope, and a module may declare its own `res`, `opt`
 or `err` as a tag or as anything else. Declaring one twice in a module is the
 ordinary duplicate definition. A module that spells `res` without importing it
@@ -326,7 +326,7 @@ tracked and leaves the debug-profile discriminator check as the only net.
 Inside a guard the payload place is ordinary storage: reading it copies under
 the existing value rules, writing it keeps the selected case, and `?value.case`
 yields a typed pointer to naturally aligned storage. Whole-value assignment to
-the guarded place is a compile error; rebind to a new name instead.
+the guarded place is a compile error. Rebind to a new name instead.
 
 ```mach error cannot assign to this place inside a guard
 tag Reply: u8 { empty; value: i64; }
@@ -360,7 +360,7 @@ since no pointer to it exists and a write by name under the guard is refused.
 
 A tag is laid out with its discriminator at byte offset zero in target byte
 order. The discriminator type is the one the declaration names after the tag
-name (`tag Name: u8 { ... }`), one of `u8`, `u16`, `u32` or `u64`; a type too
+name (`tag Name: u8 { ... }`), one of `u8`, `u16`, `u32` or `u64`, and a type too
 narrow to number every declared case is rejected. Declaration order determines
 case codes, starting at zero. Single-case tags still include a discriminator.
 
@@ -451,7 +451,9 @@ and are not returned by value inside results.
 
 Tags support comptime reflection through three intrinsics:
 
-- `$is_tag(T)` returns true for public tag shapes, including canonical tags
+- `$is_tag(T)` is true for public tag shapes, including canonical tags, and is
+  false for `^T`. Like every type predicate it is written only as a `$if` gate
+  condition
 - `$cases(T)` yields a comptime sequence of case descriptors
 - `$discriminant_of(T)` returns the unsigned integer type used for the discriminator
 
@@ -478,11 +480,11 @@ after specialization.
 `#[deprecated]` and `#[deprecated("msg")]` apply to a `tag` declaration and,
 inside the body, to a single case, where it is the only decorator a case
 accepts. A deprecated case warns at every external construction, `sel` test
-and payload place that names it; see [decorators.md](decorators.md).
+and payload place that names it (see [decorators.md](decorators.md)).
 
 `#[volatile]` on a tag makes every access to its storage, discriminator and
-payload alike, a volatile access; see
-[decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access).
+payload alike, a volatile access (see
+[decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access)).
 
 ## See also
 

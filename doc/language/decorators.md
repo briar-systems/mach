@@ -23,7 +23,7 @@ GPU set is dotted: it is a large domain that applies only to shader stages and
 uses generic words such as `input` and `shared`.
 
 > `#[...]` is the only decorator surface. A backtick is not a token: one
-> anywhere in source is a lexer error.
+> outside a comment, a string literal or a character literal is a lexer error.
 
 > One caveat the decorator form introduces: a line comment that begins `#[`
 > (with no space) opens a decorator. Write such a comment with a separating
@@ -100,13 +100,15 @@ Where a decorator takes a string or an integer, the argument is a constant
 expression of that type, evaluated at compile time in the declaring module. A
 literal is one. So is a `val`, one an `$if` arm selects, or one imported from
 another module. A decorator's argument never depends on the build that
-evaluates it, only on the constants in scope. `#[symbol]` stays exactly the
-name you give it: the compiler adds no platform decoration of its own, and a
-`val` gated by comptime is how one declaration names its symbol per target.
+evaluates it, only on the constants in scope. `#[symbol]` gives the C name,
+and the linker sees it with the target's C symbol prefix, as it sees an `ext`
+declaration's name (see [`symbol`](#symbolstr--linker-name)), so the source
+never spells Darwin's underscore. A `val` gated by comptime is how one
+declaration names a different symbol per target.
 
 ```mach
-$if ($mach.build.sys == $mach.sys.darwin) {
-    val SPIN: *u8 = "_spin";
+$if ($mach.build.sys == $mach.sys.windows) {
+    val SPIN: *u8 = "spin_win32";
 }
 $or {
     val SPIN: *u8 = "spin";
@@ -153,7 +155,7 @@ pub fun replacement() i32 {
 use example.legacy;
 
 fun caller() i32 {
-    ret legacy.old(); # warning: `old` is deprecated: use replacement
+    ret legacy.old(); # warning: `old` is deprecated. use replacement
 }
 ```
 
@@ -176,7 +178,7 @@ pub tag Reply: u8 {
 use example.reply;
 
 fun read(r: reply.Reply) i64 {
-    if (sel r.value) { ret r.value; } # both sites warn: tag case `value` is deprecated: use fresh
+    if (sel r.value) { ret r.value; } # both sites warn: tag case `value` is deprecated. use fresh
     ret 0;
 }
 
@@ -185,7 +187,7 @@ fun make() reply.Reply {
 }
 
 fun stale() reply.Old {
-    ret reply.Old.empty{}; # warning: `Old` is deprecated: the whole tag
+    ret reply.Old.empty{}; # warning: `Old` is deprecated. the whole tag
 }
 ```
 
@@ -499,8 +501,8 @@ caller's instruction cache, or to hold code size down on a constrained target.
 
 ### `align(expr)` — alignment override
 
-Sets the alignment of a global variable, a record/union type, or a function's
-entry, which the object places at that boundary. `expr` must
+Sets the alignment of a global variable, a record, union or tag type, or a
+function's entry, which the object places at that boundary. `expr` must
 be a comptime integer — either a literal or a comptime expression such as
 `$size_of(T)` or `$align_of(T)`, in both positions.
 
@@ -532,7 +534,7 @@ naming the type that closes it.
 
 - On a `var` / `val`, sets the global's section alignment and address
   alignment.
-- On a `rec` or `uni`, sets the type's own alignment, which is then inherited
+- On a `rec`, `uni` or `tag`, sets the type's own alignment, which is then inherited
   by any global of that type.
 - On a `fun`, sets the alignment of the function's entry address. Without it
   a function still starts at the target's own entry alignment: 16 bytes on
@@ -588,7 +590,7 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
-Naturally the same shape is 24 bytes. `$size_of`, `$align_of` and `$offset_of` all
+Naturally the same shape is 16 bytes, aligned to 8. `$size_of`, `$align_of` and `$offset_of` all
 report the packed layout, and so does the code that reads and writes the fields —
 there is one layout, not a declared one and an emitted one.
 
@@ -857,7 +859,7 @@ var depth: u32 = 0;
   reached as a library's is.
 - The address of a thread-local is no constant, since each thread holds its
   copy at its own address. A module binding whose initializer takes one is
-  refused with `address.thread_local`.
+  refused with `global.init_not_constant`, with a note saying why.
 - A shader interface role and `thread` are refused together.
 - A `constant_time` function reaches a thread-local as it does a global, on
   every target but darwin, whose thread-locals are reached through a resolver
@@ -1090,8 +1092,8 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
 - The path resolves relative to the **declaring source file's** directory. An
   absolute path is taken as written. The resolved file must lie inside the
   project root: an embed that escapes it (`../../outside.txt` from `src/`) is
-  refused at the decorator (`` `embed` path escapes the project root; an
-  embedded file must live inside the project and the file is not read ``) and
+  refused at the decorator with `embed.escapes_root` (`` the `embed` path is
+  outside the project root. an embedded file must be inside the project ``) and
   the file outside is never read. Keep assets under the project.
 - A path holding `{artifact.<id>.out}` names the output of a required artifact
   and resolves against the **root project's** directory rather than the

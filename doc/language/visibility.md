@@ -1,11 +1,11 @@
-# Visibility — `pub` and `ext`
+# Visibility: `pub` and `ext`
 
 Two declaration modifiers control how a symbol is seen.
 
 ## `pub`
 
 Marks a declaration as part of its module's public surface. Other modules
-that `use` this module can reference `pub`-marked symbols by name; symbols
+that `use` this module can reference `pub`-marked symbols by name. Symbols
 without `pub` are file-private.
 
 ```mach error no symbol `helper` exported by `example.lib`
@@ -34,8 +34,11 @@ fun peek() i64 {
 }
 ```
 
-Applies to: `fun`, `rec`, `uni`, `def`, `val`, `var`, `ext fun`, `ext val`,
-`ext var`.
+Applies to: `fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`, `ext fun`,
+`ext val`, `ext var`.
+
+`pub` before `use` or `test` is accepted and has no effect. A `use` stays a
+private import, and a test is never part of a module's public surface.
 
 `fwd` always publishes and does not take an explicit `pub` modifier.
 
@@ -43,8 +46,9 @@ Applies to: `fun`, `rec`, `uni`, `def`, `val`, `var`, `ext fun`, `ext val`,
 
 Declares a function or a data binding whose definition lives in another
 object, as a forward reference the linker resolves. An `ext fun` has no body
-and follows the C ABI; an `ext val` / `ext var` has no initializer and no
-storage of its own.
+and follows the C ABI. An `ext val` / `ext var` has no initializer and no
+storage of its own, and an initializer on one is refused with
+`ext.data_initializer`.
 
 ```mach
 #[symbol("write")]
@@ -53,7 +57,7 @@ pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ext var errno: i32;
 ```
 
-- The C ABI is the contract; argument and return types must be
+- The C ABI is the contract, so argument and return types must be
   representable in C.
 - Use the `#[symbol("real_name")]` decorator to override the linker name.
 
@@ -86,7 +90,7 @@ An executable exports nothing at all, so `pub` makes no difference to one.
 
 ## See also
 
-- [fun.md](fun.md) — regular function declarations
-- [ext-fun.md](ext-fun.md) — full reference for `ext fun`
-- [val-var.md](val-var.md#ext--foreign-data-imports) — `ext val` / `ext var`
-- [decorators.md](decorators.md) — `#[symbol]` and the other decorators
+- [fun.md](fun.md) - regular function declarations
+- [ext-fun.md](ext-fun.md) - full reference for `ext fun`
+- [val-var.md](val-var.md#ext-foreign-data-imports) - `ext val` / `ext var`
+- [decorators.md](decorators.md) - `#[symbol]` and the other decorators

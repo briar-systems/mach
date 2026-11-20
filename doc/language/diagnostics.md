@@ -32,8 +32,12 @@ part of the compiler that raises it: `name.unresolved`, `call.arity`,
 
 One key names one rule. Every place that reports the same rule reports it under
 the same key, whatever the message's wording and whichever phase finds it: a
-secret branch is `secret.branch` whether the type checker sees it in the source
-or the constant-time validator sees it in the emitted instructions.
+`naked` function whose body holds more than inline `asm` is `naked.body`
+whether the type checker sees it in the source or code generation sees it in
+the emitted instructions. A rule a phase checks on its own is its own key: the
+constant-time validation of emitted code refuses what it cannot verify, a
+secret branch included, under `secret.unverifiable`, while the type checker
+refuses a secret branch in the source under `secret.branch`.
 
 A failure the compiler does not blame on the program, a defect in mach itself,
 is `compiler.internal`.
@@ -54,7 +58,7 @@ The keys are rows of one table in the compiler,
 `src/base/diagnostic/kind.mach`. Each row gives the key and its severity, the
 only place a diagnostic's severity is decided, and
 every site that raises a diagnostic names its row. A diagnostic that names no
-row is refused before it is recorded, so every diagnostic the compiler can
+row, or a retired one, is refused before it is recorded, so every diagnostic the compiler can
 print has a key. The same rows are what a profile's
 [`allow`](manifest.md#silencing-warnings) and a declaration's
 [`#[expect]`](decorators.md#expectkey--acknowledge-a-warning) select by, so a
@@ -90,16 +94,17 @@ modules or generic instances raise it.
 | `syntax` | source that does not parse: an expected token, name, type, expression or declaration is missing, or nesting is too deep |
 | `source` | characters the source may not contain |
 | `literal`, `float` | a literal that is malformed, unterminated or out of range for its type, and a float literal that is not exact at its type (`float.inexact`) |
-| `name`, `use`, `module`, `visibility`, `import`, `fwd` | names that do not resolve, collide, take a built-in type's name (`name.builtin_type`) or are not exported; `use` and `fwd` paths |
+| `name`, `use`, `module`, `visibility`, `import`, `fwd` | names that do not resolve, collide, take a built-in type's name (`name.builtin_type`) or are not exported, and `use` and `fwd` paths |
 | `decl`, `def`, `binding`, `global`, `const` | declaration forms: bindings, globals, constants and type aliases |
 | `type`, `cast`, `operator`, `condition`, `assign`, `address`, `ptr` | type checking: mismatches, conversions, operators, conditions, assignment and addresses |
 | `call`, `variadic`, `pack`, `ret` | calls, C-variadic and pack parameters, and returned values |
+| `jump` | a `brk` or `cnt` with no enclosing loop (`jump.no_loop`) |
 | `field`, `index`, `range`, `shift`, `array`, `uni`, `tag`, `sel`, `guard` | records, arrays, unions, tags, `sel` and guarded places |
 | `generic` | type arguments and instantiation |
 | `comptime`, `gate`, `each` | compile-time evaluation, intrinsics and descriptors, `$if` gates, `$each`, and the user's own `$error` (`comptime.user_error`) |
 | `decorator`, `expect`, `extension`, `embed`, `handle`, `abi_type`, `op`, `naked`, `fin`, `ext` | decorators and the declarations they shape |
 | `test`, `testing` | `test` blocks and `#[testing]` declarations |
-| `secret` | the secrecy rules, in the source and in the constant-time validation of emitted code (`secret.branch`) |
+| `secret` | the secrecy rules in the source (`secret.branch`), and the constant-time validation of emitted code (`secret.unverifiable`) |
 | `vector` | vector types and operations, including the scalar fallback (`vector.scalarize`) |
 | `asm` | inline assembly: syntax, instructions, operands, extensions, labels and locals |
 | `read` | reads the target forbids, such as a load from write-only storage (`read.writeonly_storage`) |
@@ -112,6 +117,7 @@ modules or generic instances raise it.
 | `cli`, `editor` | command-line flags, commands and operands, and the editor analysis entry points |
 | `fs`, `process`, `env`, `memory` | the machine: a file, process or environment operation that failed, or storage the allocator refused (`memory.refused`) |
 | `link`, `resource` | the link: its declared inputs that are missing, unreadable or that mink refuses, sections and tables it cannot place, symbol claims that conflict, import libraries, resources that are malformed or over a format limit, and what a finished link reports of its inputs (`link.report`) |
+| `readout` | the [timing readout](readout.md) `-v` turns on, when the clock refuses a read (`readout.clock_refused`, a warning) |
 | `catalog` | a member of a closed catalog read from input that is malformed or that the target cannot honor |
 | `compiler` | `compiler.internal`, a defect in mach |
 
@@ -121,6 +127,6 @@ itself.
 
 ## See also
 
-- [diagnostics-json.md](diagnostics-json.md) — `--diagnostics json`, the same diagnostics as versioned NDJSON records
-- [manifest.md](manifest.md#silencing-warnings) — silencing warnings with `allow`
-- [decorators.md](decorators.md#expectkey--acknowledge-a-warning) — acknowledging a warning with `#[expect]`
+- [diagnostics-json.md](diagnostics-json.md): `--diagnostics json`, the same diagnostics as versioned NDJSON records
+- [manifest.md](manifest.md#silencing-warnings): silencing warnings with `allow`
+- [decorators.md](decorators.md#expectkey--acknowledge-a-warning): acknowledging a warning with `#[expect]`

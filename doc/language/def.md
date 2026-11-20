@@ -1,7 +1,8 @@
-# `def` — type alias
+# `def`: type alias
 
 `def` introduces a new name for an existing type. The alias and the
-underlying type are interchangeable; there is no nominal distinction.
+underlying type are interchangeable, with no nominal distinction between them:
+a value of the alias passes, assigns and returns as the type it names.
 
 ## Grammar
 
@@ -20,9 +21,9 @@ pub def Choice: uni { a: i64; b: f64; }; # inline union
 ```
 
 Aliases may name any type: primitives, pointers, arrays, function types,
-records, unions, tags, or other aliases. `def` is a module-scope declaration;
-there is no function-scope alias. An alias of a tag constructs, tests and
-copies as the tag:
+records, unions, tags, or other aliases. `def` is a module-scope declaration,
+and a `def` inside a function body is a syntax error. An alias of a tag
+constructs, tests and copies as the tag:
 
 ```mach
 use std.types.result.res;
@@ -74,10 +75,12 @@ a use of the name is not reported again.
 
 ## Stdlib aliases
 
-Mach has no compiler-known type aliases. Names like `usize` and `str` live
-in stdlib as ordinary `def`s — `def usize: u64;` (or `u32`, target-
-conditional via `$if`) and `def str: *u8;`. A module that wants the
-shorthand imports the appropriate stdlib module.
+Every type alias is an ordinary `def`, and the compiler knows none by name.
+Names like `usize` and `str` live in stdlib: `std.types.size` declares
+`def usize: u64;` (`u32` or `u16` on a target with a narrower pointer, chosen
+with `$if` on `$mach.build.pointer_width`), and `std.types.string` declares
+`def str: *char;`, where `char` is `def char: u8;` from `std.types.char`. A
+module that wants the shorthand imports it, as in `use std.types.size.usize;`.
 
 ## See also
 

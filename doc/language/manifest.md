@@ -73,8 +73,8 @@ built. It is read once, and an unknown, removed, mistyped or missing key in it
 fails the consumer's build pointing into the dependency's own file:
 
 ```
-error[manifest.unknown_key] mach.toml: unknown key 'bogus' in [project]
-  @ ./gfxdep/mach.toml:7:1
+error[manifest.unknown_key] dependency 'gfx' cannot be read (mach.toml: unknown key 'bogus' in [project])
+  @ ./dep/gfx/mach.toml:7:1
 7 | bogus = 1
   | ^^^^^
 ```
@@ -290,7 +290,7 @@ to whichever *declared* target matches the host.
 | `os`, `baseline`, `extensions` | removed | v6's names of `sys`, `isa` and `ext`, refused with the rename `mach migrate` writes. |
 | `ext` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the architecture's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
 | `runner` | absent: the host runs its own programs, and no other target's | Array of argv templates the target's programs are launched through by `mach run` and `mach test`, whether or not the target is the host. See [Execution command](#execution-command). |
-| `env` | absent: none | The environment the target's system runs it under (string), such as `macos` on `darwin`, `msvc` on `windows`, `vulkan1.2` on `vulkan` or `preview1` on `wasi`. Any target may state it. The values are the system's, owned by mink's host rows and mirl's target record, and an `env` the system does not list is a manifest error. It is required where the system has no host without an environment, as on `darwin`, `windows` and `wasi`. An architecture that defines its own environments, today only `spirv`, also checks the value against them; see [Finished-module targets](#finished-module-targets). |
+| `env` | absent: the system's default | The environment the target's system runs it under (string), such as `macos` on `darwin`, `msvc` on `windows`, `vulkan1.2` on `vulkan` or `preview1` on `wasi`. Any target may state it. The values are the system's, owned by mink's host rows and mirl's target record, and an `env` the system does not list is a manifest error. Absent, the target takes the environment mink's catalog names as the system's default, which `mach info targets` lists first and marks `*`: `macos` on `darwin`, `msvc` on `windows` and `preview1` on `wasi`, and none on a system whose hosts need none, such as `linux`. An architecture that defines its own environments, today only `spirv`, also checks the value against them. See [Finished-module targets](#finished-module-targets). |
 
 ### Execution command
 
@@ -395,10 +395,11 @@ aarch64 `FEAT_PMULL` brings `FEAT_AES`. On riscv `d` brings
 `f`, `zfh` brings `zfhmin`, `zfhmin` brings `f`, and `f` brings `zicsr`, as masc's
 riscv catalog has it, so `ext = ["d"]` on `isa = "rv64i"` selects
 `rv64ifd` with Zicsr. The baseline and the list feed one set: `isa = "rv64i"`
-with `ext = ["m"]` selects the same machine as `isa = "rv64im"`. A name nothing in
-the compiler encodes against yet (`avx`, `avx512f`) is still a declared requirement:
-the inline assembler has no rows to admit under it, so today it records only the
-promise the binary makes about its hosts, and the promise is the program's to check.
+with `ext = ["m"]` selects the same machine as `isa = "rv64im"`. A name is a declared
+requirement whether or not code generation reads it: it admits the inline assembler's
+rows under it (`ext = ["avx"]` admits `vaddps` on `ymm` registers, `["avx512f"]` the
+`zmm` forms) and records the promise the binary makes about its hosts, and the promise
+is the program's to check.
 
 #### Levels
 
@@ -465,8 +466,11 @@ A mnemonic or a register that needs an extension the target does not select,
 outside such a function, is refused, naming the instruction and what it needs:
 
 ```
-error[asm.extension] an asm block of 'app.main.f' uses `vpaddd` with `ymm0`, which needs avx. select what it needs in the target's `isa` or `ext`, or in the function's `#[extension]`
+error[asm.extension] an asm block of 'app.main.f' uses `vaddps` with `ymm0`, which the target's extensions do not admit. select avx in the target's `isa` or `ext`, or in the function's `#[extension]`
 ```
+
+The check runs where the block is assembled, so `mach build` reports it and
+`mach check`, which generates no code, does not.
 
 The selected set is part of the target's identity: two targets that differ only in
 `ext` never share cached products.
@@ -575,7 +579,7 @@ target shares the value.
 | `sys`  | `linux`, `windows`, `darwin`, `freestanding`, `uefi`, `vulkan`, `wasi` |
 | `abi` | `sysv64`, `win64`, `aapcs64`, `darwinpcs`, `aapcs64win`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `shader`, `basic` |
 | `of`  | `elf`, `macho`, `coff`, `flat`, `spirv`, `wasm` |
-| `env` | `vulkan1.0`, `vulkan1.1`, `vulkan1.2`, `vulkan1.3`, `preview1` |
+| `env` | `gnu`, `macos`, `msvc`, `vulkan1.0`, `vulkan1.1`, `vulkan1.2`, `vulkan1.3`, `preview1` |
 
 Each `arch`, `sys` and `of` value is the name of a row of mink's catalog: `arch` an
 architecture, `sys` a system and `of` a format. mach reads the spelling from that row,
@@ -599,11 +603,19 @@ v6 wrote a RISC-V selection as `isa = "rv32imc"` with no architecture at all, an
 error[target.retired_spelling] mach.toml: [target.metal].of = "raw" is a retired spelling. write "flat"
 ```
 
-`vulkan1.0` through `vulkan1.3` are `vulkan`'s environments and `preview1` is `wasi`'s.
+`gnu` is `linux`'s environment, `macos` is `darwin`'s, `msvc` is `windows`'s,
+`vulkan1.0` through `vulkan1.3` are `vulkan`'s and `preview1` is `wasi`'s.
 
-A `[target.*]` naming an `arch`, `sys` or `abi` outside these lists is refused
-through the registry's own lookup (`no arch implementation registered for
-'mos6502' (registered: ...)`).
+A `[target.*]` naming an `arch`, `sys`, `abi` or `env` outside these lists is
+refused through the catalog's own lookup, listing what it accepts there:
+
+```
+error[target.unsupported] mach.toml: [target.l] is invalid. no architecture is named `mos6502` (target, arch), and it accepts x86_64, x86, aarch64, riscv64, riscv32
+```
+
+A catalog row that no mach target is built on, such as
+`x86`, is named in that list and by `mach info targets`, and a target naming it
+is refused when mach assembles it (`no target can be assembled for arch x86, ...`).
 
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
 and runs natively in CI on every PR; `riscv64`-linux runs under qemu and
@@ -644,7 +656,8 @@ architecture enters it. An `isa` masc's catalog refuses, or one of the other
 width (`rv64gc` on `riscv32`) or the E base, is refused naming the `isa` and the
 architecture. On `x86_64` the `isa` is a comma separated list in masc's x86
 catalog, of extension names and levels (`x86-64-v3`, `x86-64-v2,sha`), closed over
-the same implications, and a name the catalog does not hold is refused naming it.
+the same implications, and one holding a name the catalog does not is refused
+naming the `isa`.
 
 mach emits against I, M, A, F, D, C, Zicond, Zicsr, Zifencei, Zfhmin, Zfh and Zkt.
 Zicond adds `czero.eqz` and `czero.nez`, which a branch-free select compiles to
@@ -673,9 +686,10 @@ program, and one without `d` computes `f64` so, under any convention it takes
 
 `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, and `ilp32d` are the RISC-V psABI
 calling-convention family, one `abi` per member. The lp64 three target
-`riscv64` and the ilp32 three target `riscv32`; an ilp32 member on a `riscv64`
+`riscv64` and the ilp32 three target `riscv32`. An ilp32 member on a `riscv64`
 target or an lp64 member on `riscv32` is refused when that target is selected
-(`calling convention 'ilp32' does not target instruction set 'riscv64'`),
+(``the architecture has no calling convention named `ilp32` (target, abi), and it
+accepts lp64d, lp64, lp64f``),
 since XLEN is part of what the id means. Within each width, the members differ only in how
 floating-point arguments travel: `lp64` and `ilp32` are **soft float** — every
 float argument rides an integer register — while the `f` and `d` suffixes are
@@ -694,8 +708,11 @@ and `freestanding` accepts every convention the instruction set covers.
 `mach info targets` prints every target mink's catalog spells, one per line as
 `-t` takes it (`<sys>-<arch>`), then the environments, calling conventions, code
 models and executable linkages it accepts as `env=`, `abi=`, `code_model=` and
-`linkage=` lists, the default first and marked `*`. A target that runs no
-executable, such as `vulkan-spirv`, lists `linkage=-`. `none` is the environment of a host that states none,
+`linkage=` lists, the default first and marked `*`. Linkages depend on the
+environment, so where they differ the list repeats per environment, as
+`linkage=*static gnu:*pie,dynamic,static` on `linux-x86_64` says that a target with
+no `env` links static only and one with `env = "gnu"` defaults to `pie`. A target
+that runs no executable, such as `vulkan-spirv`, lists `linkage=-`. `none` is the environment of a host that states none,
 such as bare `linux`, and `-` stands for a part the target has no choices of.
 It marks `needs --isa` beside each whose system bounds the machine not at all,
 such as `freestanding-riscv32`, so a target spelled that way names its
@@ -707,12 +724,14 @@ caught rather than silently never matching.
 
 ### Object-format override
 
-`of` overrides the object format a target implies. Each os has a default format —
-`linux` → `elf`, `windows` → `coff`, `uefi` → `coff`, `darwin` → `macho`, `freestanding` → `elf`,
-`vulkan` → `spirv` — and `of` names a different one from the same closed set: `elf`,
-`coff`, `macho`, `flat`, `spirv`. `of` is optional; omit it to
+`of` overrides the object format a target implies. Each os has a default format,
+`elf` on `linux`, `coff` on `windows`, `coff` on `uefi`, `macho` on `darwin`, `elf` on `freestanding`,
+`spirv` on `vulkan` and `wasm` on `wasi`, and `of` names a different one from the same closed set: `elf`,
+`coff`, `macho`, `flat`, `spirv`, `wasm`. `of` is optional. Omit it to
 take the default. An os accepts only the formats it can load, so an override the
-os cannot enter is refused.
+os cannot enter is refused, listing those it writes (``the system writes no object
+format named `macho` (target, format), and it accepts elf``). Today only
+`freestanding` writes more than one, `elf` and `flat`.
 
 ```toml
 [target.metal]
@@ -729,9 +748,9 @@ so a `spirv` target resolves to `spirv`, the format that carries a finished
 module, which is also the only format `vulkan` accepts.
 
 An `of` naming a format whose emission shape does not match the instruction set's
-is refused at composition (`instruction set 'spirv' emits finished modules, but
-object format 'flat' carries linkable objects`), so the override cannot compose a
-tuple that would emit nothing.
+is refused with the system's list, as `of = "flat"` on a `vulkan` target is
+(``the system writes no object format named `flat` (target, format), and it accepts
+spirv``), so the override cannot compose a tuple that would emit nothing.
 
 The page an image is laid out at is a function of the same tuple. A format a
 loader maps by page (`elf`, `coff`, `macho`) places every load segment on a page
@@ -1002,7 +1021,8 @@ abi    = "basic"
 runner = ["wasmtime", "{artifact.out}"]
 ```
 
-- **The tuple.** `env` is required (see [`[target.<name>]`](#targetname)). `abi =
+- **The tuple.** `env` is `preview1`, the system's default when the target names
+  none (see [`[target.<name>]`](#targetname)). `abi =
   "basic"` is the basic C ABI of the WebAssembly tool conventions, and the format is
   `wasm`. Name `isa` and `ext` as on any target: with no `isa` the target stands on
   `wasm1`, WebAssembly's core 1.0, and `ext` adds features from masc's wasm set (see
@@ -1160,7 +1180,7 @@ others are optional, with the meaning of their absence above. A missing key is a
 manifest error naming the table and the key:
 
 ```
-error[manifest.missing_required] mach.toml: [profile.debug] is missing required key 'simd'; a profile declares optimize, debug and simd
+error[manifest.missing_required] mach.toml: [profile.debug] is missing required key 'simd'. a profile declares optimize, debug and simd
 ```
 
 A relaxation that does not exist is refused where it is written.
@@ -1175,7 +1195,7 @@ removed and `float_reassoc = true` is `relax = ["float-reassoc"]`. `pass` and
 `skip` have no rewrite, since no key says which passes run:
 
 ```
-error[manifest.removed_key] mach.toml: [profile.release] uses removed key 'opt'; write `optimize = true` or `optimize = false`
+error[manifest.removed_key] mach.toml: [profile.release].opt is not allowed. write `optimize = true` or `optimize = false`
    @ mach.toml:12:1
 12 | opt = 2
    | ^^^
@@ -1459,8 +1479,8 @@ points at the `--set` text rather than at a line of `mach.toml`:
 ```
 error[catalog.unsupported] subsystem windows is not available on linux (--set subsystem states it, and target 'linux-x86_64' runs on linux, whose images state no subsystem)
   @ --set:1:13
-1 | subsystem = windows
-  |             ^^^^^^^
+1 | subsystem = "windows"
+  |             ^^^^^^^^^
 ```
 
 A profile key is refused by the rule its key keeps in `mach.toml`, named the
@@ -1491,7 +1511,7 @@ reads the selected artifact's name.
 | Key       | Required | Meaning |
 |-----------|----------|---------|
 | `kind`    | yes | What the artifact is, by mink's product name: `"bin"` (an executable), `"static"` (a static library), `"shared"` (a shared library), `"object"` (each module's object, for a later link) or `"module"` (a module a runtime instantiates, such as a SPIR-V module). Any other value is refused listing mink's products (see below). |
-| `linkage` | absent: the target's default | How a `bin` is linked, by mink's linkage name: `"pie"`, `"dynamic"` or `"static"`. A name mink has no linkage of is refused listing them, and the key is refused on any other `kind`, naming it. A linkage the target's loader does not run is refused when the target resolves, pointing at the key and listing those it runs, its default first, as `mach info targets` shows them. |
+| `linkage` | absent: the target's default | How a `bin` is linked, by mink's linkage name: `"pie"`, `"dynamic"` or `"static"`. A name mink has no linkage of is refused listing those the target runs, and the key is refused on any other `kind`, naming it. A linkage the target's loader does not run is refused when the target resolves, pointing at the key and listing those it runs, its default first, as `mach info targets` shows them. |
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
 | `out`     | every kind but `object` | This artifact's output path, relative to the project root like every other path. An `object` artifact states none, since its objects stay under `obj/` for a later link: stating it is refused, and `mach migrate` removes it. Write `{project.work}/bin/demo` to place it under the build output, or any other project path to place it there. v6 rooted it under the expanded `[project].out` without saying so, so `mach migrate` writes `{project.work}/` before each `out` of a manifest that still writes `[project].out`. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
@@ -1687,10 +1707,10 @@ inspection use the same expansion.
 | Target output format | `bin` suffix | `static` suffix | `shared` suffix |
 | --- | --- | --- | --- |
 | ELF on Linux or freestanding | empty | `.a` | `.so` (refused on freestanding) |
-| Mach-O on Darwin | empty | `.a` | `.dylib` (not written) |
-| COFF/PE on Windows | `.exe` | `.lib` | `.dll` (not written) |
+| Mach-O on Darwin | empty | `.a` | `.dylib` |
+| COFF/PE on Windows | `.exe` | `.lib` | `.dll` |
 | COFF/PE on UEFI | `.efi` | `.lib` | refused |
-| Raw image | empty | unsupported | unsupported |
+| Flat image (`of = "flat"`) | empty | unsupported | unsupported |
 | SPIR-V module | refused, its artifact is a `module` (`.spv`) | unsupported | unsupported |
 | wasm module on wasi | `.wasm` | `.a` | refused |
 
@@ -1735,8 +1755,11 @@ for a target whose format has none (ELF, Mach-O, a flat image, a wasm module) is
 unsupported, naming the key, the target and the format:
 
 ```
-subsystem windows is not available on linux (mach.toml: artifact.game.subsystem states it, and target 'host' runs on linux, whose images state no subsystem)
+error[catalog.unsupported] subsystem windows is not available on linux (mach.toml: [artifact.game].subsystem states it, and target 'host' runs on linux, whose images state no subsystem)
 ```
+
+A subsystem the target's system does not run is refused the same way, listing
+those it does, as `"efi_application"` is on `windows`.
 
 An omitted key is the console default and is never refused, so an artifact
 that declares no subsystem still builds everywhere. An artifact that needs the
@@ -1974,7 +1997,8 @@ that consumes these inputs.
 
 A step is a command, make-recipe style, that produces files a build consumes
 (typically a `local` link input, e.g. a vendored-C object). `<name>` must be a
-plain identifier — it keys the step's stamp file.
+portable identifier of letters, digits, `_` and `-`, since it keys the step's stamp
+file.
 
 | Key    | Required | Meaning |
 |--------|----------|---------|
@@ -2163,7 +2187,7 @@ available in the `argv` templates as the `{target.*}` keys (see
 [Path templates](#path-templates)).
 
 `cmd` was the pre-4.x spelling of a step's command and is a removed key:
-`[step.s] uses removed key 'cmd'; use a nonempty 'argv' array`.
+``[step.s].cmd is not allowed. write the command as a nonempty `argv` array``.
 
 ## `[dep.<id>]`
 
@@ -2205,7 +2229,8 @@ others:
 dependency also names exactly one selector, `ref` or `version`.
 
 `ref` and `version` are mutually exclusive (`[dep.std] names both 'ref' and
-'version'; keep one`). `ref` selects one exact commit or tag, or follows a
+'version'. keep 'version' for a release range or 'ref' for one exact or branch
+selector`). `ref` selects one exact commit or tag, or follows a
 branch. `version` selects among releases.
 
 How a `version` is resolved to a release, how pins are recorded, and what
@@ -2508,6 +2533,7 @@ sys  = "windows"
 abi = "win64"
 
 [profile.debug]
+default = true
 optimize = false
 debug = true
 simd  = "scalarize"
@@ -2518,9 +2544,9 @@ debug = false
 simd  = "scalarize"
 ```
 
-The `gl` and `shim-x11` entries carry `sys = "linux"`, so on a windows build cell
+The `gl` and `shim-x11` entries carry `sys = ["linux"]`, so on a windows build cell
 they filter out (and `shim-x11`'s step is never demanded); `shim-win32` carries
-`sys = "windows"` and applies only there. The unconditional `shim` entry (`sys = "*"`)
+`sys = ["windows"]` and applies only there. The unconditional `shim` entry (`sys = ["*"]`)
 applies to both.
 
 ## Worked example: a C-binding dependency's export
@@ -2531,9 +2557,11 @@ darwin pull the `glfw` system library, a windows build pulls `glfw3.dll`, and th
 darwin frameworks apply only on darwin.
 
 ```toml
+# its [target.*], [profile.*] and [artifact.*] tables are left out here
 [project]
 id      = "glfw"
 version = "0.3.0"
+mach    = "^7"
 src     = "src"
 work    = "out/{target.name}/{profile.name}"
 
@@ -2586,9 +2614,11 @@ its surface pulls the entry, and the entry's path demands the step in the
 consumer's output tree:
 
 ```toml
+# its [target.*], [profile.*] and [artifact.*] tables are left out here
 [project]
 id      = "mz"
 version = "1.0.3"
+mach    = "^7"
 src     = "src"
 work    = "out/{target.name}/{profile.name}"
 

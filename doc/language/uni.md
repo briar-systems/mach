@@ -1,8 +1,8 @@
-# `uni` — raw union
+# `uni`: raw union
 
 A `uni` is a collection of named fields that share the same memory. Writing
 to one field overwrites whatever bytes were in the others. The compiler
-does not track which field is "live"; the user is responsible for that.
+does not track which field is "live". The user is responsible for that.
 
 ## Grammar
 
@@ -35,16 +35,20 @@ name is refused with `name.duplicate`.
 
 A `uni`'s size is the size of its largest field, plus any alignment
 padding. A literal writes the field it names and nothing else, so the bytes
-past that field are unspecified. A `uni` that holds a secret has those bytes
-and its padding zeroed (see
+past that field are unspecified. A literal of a `uni` that holds a secret, or
+any union literal in a constant-time function, has those bytes zeroed (see
 [secrecy.md](secrecy.md#padding-of-secret-aggregates)).
 
-A `uni`'s overlapping variants must agree on secrecy: every field is either
-secret (`^`) or every field is public. A mixed union would let the same storage
-be read at two secrecy classifications, the aliasing leak the welded-storage
-rules forbid. See [secrecy.md](secrecy.md). A `tag` may mix secret and public
-payloads because it lays cases that disagree out in separate areas, at the cost
-of size (see [tag.md](tag.md#layout-and-representation)).
+A `uni`'s overlapping variants must agree on secrecy. Every field overlays the
+union's storage from offset 0, and every byte that two fields both cover must be
+secret (`^`) in both or public in both, with a padding byte counting as public.
+The check is deep, so a secret nested inside a field's record counts.
+`uni { a: ^u64; b: u64; }` is refused with `secret.variant_mismatch`, while two records that each hold a `^u8` at offset 0
+and public bytes after it agree and are accepted. A mixed union would let the
+same storage be read at two secrecy classifications, the aliasing leak the
+welded-storage rules forbid. See [secrecy.md](secrecy.md). A `tag` may mix
+secret and public payloads because it lays cases that disagree out in separate
+areas, at the cost of size (see [tag.md](tag.md#layout-and-representation)).
 
 ## Raw unions versus tagged values
 
@@ -72,7 +76,7 @@ With manual composition, the compiler does not verify that `kind` and `data`
 agree. Keeping them consistent is the programmer's responsibility. In ordinary
 Mach code, prefer first-class `tag` declarations.
 
-A union may carry `#[align(N)]`, `#[packed]` and `#[volatile]` like a record;
+A union may carry `#[align(N)]`, `#[packed]` and `#[volatile]` like a record.
 `#[volatile]` makes every access to the union's storage a volatile access, for a
 device register that reads and writes as different types. See
 [decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access).

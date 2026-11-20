@@ -44,7 +44,7 @@ asm <selection> {
   `local.get`: `asm mvp { local.get {old}  local.get {pages}  i32.load  memory.grow  i32.store }`.
   mirl reads the body, so a body it refuses is refused at the build, not at the head.
 - There is no `asm ... or ...` chain. `$if` chooses the block per target.
-- **A target with no assembler takes no `asm` block.** SPIR-V declares no assembly capability, so any `asm` block compiled for it, whatever its head, is refused where it is written with `inline assembly is not allowed on instruction set 'spirv', which declares no assembly capability`. Guard a routine shared with a shader behind `$if ($mach.build.arch != $mach.arch.spirv)`.
+- **A target with no assembler takes no `asm` block.** SPIR-V declares no assembly capability, so any `asm` block compiled for it, whatever its head, is refused where it is written with `asm.unavailable` and `inline assembly is not allowed on instruction set 'spirv', which declares no assembly capability`. Guard a routine shared with a shader behind `$if ($mach.build.arch != $mach.arch.spirv)`.
 - Each line is an instruction in the ISA's native syntax.
 - `#` introduces a line comment: everything from `#` to the end of the line is ignored, whatever it contains (`;`, `{}`, `%`, and so on are all inert inside a comment).
 
@@ -73,36 +73,41 @@ pub fun add_via_asm(a: i64, b: i64) i64 {
 }
 ```
 
-### A body that binds `{name}` may not move the stack pointer
+### A body that binds `{name}` and moves the stack pointer
 
 A `{name}` becomes a fixed displacement off a base register, measured once when the
-block is assembled. On aarch64 and riscv64 that base is the **stack pointer**, because
-it is the only one whose displacement stays inside those ISAs' immediate forms however
-deep the enclosing frame is. A statement that moves the stack pointer therefore moves
-every `{name}` in the block out from under its own address, and the compiler refuses the
-block rather than assembling a wrong one:
+function's frame is laid out. A function that keeps no frame pointer addresses its
+locals off the **stack pointer**, so a statement that moved the stack pointer would move
+every `{name}` in the block out from under its own address. The compiler therefore
+reads each block for writes of the stack pointer first, and a function holding a block
+that moves it keeps its frame pointer (rbp on x86-64, x29 on aarch64, s0 on riscv) and
+addresses its locals off that instead. Such a block may bind a `{name}` and still move
+the stack pointer:
 
 ```mach fragment
 var x: i64 = 0;
 asm armv8-a {
-    ldr x9, {x}
-    stp x1, x2, [sp, -16]!   # refused: this body binds {x}
+    ldr x9, {x}              # [x29, -16]: the frame pointer, not sp
+    stp x1, x2, [sp, -16]!
 }
 ```
 
-The refusal covers the whole block, not the statements after the write, because a
-backward branch reaches an earlier `{name}` again with the pointer already moved. Push
-and pop around the block instead, or drop the `{name}` and stage the address into a
-register yourself.
+Such a block may not also write the frame pointer, which its locals are now
+addressed off.
 
-A body that binds no `{name}` is unaffected and may do whatever it likes with the stack
-pointer, which is what a `#[naked]` function's hand-written prologue does. In a function
-holding a local aligned past the stack's alignment (see `align` in
+A block in a function with no frame pointer that moved the stack pointer and bound a
+`{name}` off it would be refused with `asm.unsupported`, naming the move, and the cure is
+to push and pop around the block or to stage the address into a register before it.
+
+A body that binds no `{name}` may do whatever it likes with the stack pointer, which is
+what a `#[naked]` function's hand-written prologue does. In a function
+holding a local whose type is aligned past the stack's alignment (see `align` in
 [decorators](decorators.md)) that also moves the stack pointer, the locals are addressed
 off a base register instead (rbx on x86-64, x19 on aarch64, s1 on riscv), so a block there
 may move the stack pointer and still bind a `{name}`. A block in such a function that
 writes the base register is followed by the compiler deriving it again, and may not bind
-a `{name}`, which would be addressed off the register it writes.
+a `{name}`, which would be addressed off the register it writes. That block is refused
+with `asm.unsupported`.
 
 ## Calls and jumps (x86-64)
 
@@ -126,9 +131,10 @@ The absolute form exists for a fixed-address ABI — one whose entry points are
 addresses rather than symbols, like BareMetal's kernel call table at
 `0x100010..0x100040`. Its displacement is sign-extended to 64 bits, so an address
 outside signed 32-bit range is refused rather than silently truncated. `call
-[symbol]` and `jmp [symbol]` are refused too: the rip-relative form would mean
-"transfer to the pointer *stored* at the symbol", which is not what the direct
-form beside it means.
+[symbol]` and `jmp [symbol]` are the memory form with the symbol's address as that
+displacement (`ff 14 25` under `R_X86_64_32S`), so they transfer to the pointer
+*stored* at the symbol, not to the symbol, and the address must fit the signed 32-bit
+field when the image is linked.
 
 Both indirect operands are fixed 64-bit in long mode, so a narrower register
 (`jmp eax`) is refused rather than widened.
@@ -157,7 +163,7 @@ does not settle it either the width must be written out, in nasm's spelling:
 ```mach fragment
 asm x86-64 {
     movzx eax, word [rcx]     # a two-byte load, zero-extended into eax
-    movsx rax, dword [rcx]    # a four-byte load, sign-extended (movsxd)
+    movsxd rax, dword [rcx]   # a four-byte load, sign-extended
     mov dword [rcx], 1        # a four-byte store, not the machine word
     neg qword [rcx]           # an eight-byte read-modify-write
 }
@@ -177,7 +183,7 @@ token.** What counts as a contradiction is per mnemonic:
 |---|---|
 | most instructions | every operand shares one width, so a prefix must agree with any register operand, and two register operands of different widths (`add rax, ecx`) name no form; with no register operand the prefix *sets* the width |
 | `shl` / `shr` / `sar`, `shld` / `shrd` | the count is `cl` or an immediate whatever the width of the operand shifted |
-| `movzx` / `movsx` | the source is narrower by design, so a memory source **must** be sized, and the size must be strictly narrower than the destination |
+| `movzx` / `movsx` | the source is narrower by design, so a memory source **must** be sized, and the size must be strictly narrower than the destination. A four-byte source is `movsxd`, and `movsx rax, dword [rcx]` is refused |
 | `push` / `pop`, indirect `call` / `jmp` | fixed 64-bit in long mode, so any narrower prefix names no instruction |
 | `lidt` | its pseudo-descriptor is ten bytes, which no keyword names |
 
@@ -189,7 +195,7 @@ zero-extending load was written.
 ## Bit scans, byte swap, multiply and double shifts (x86-64)
 
 ```mach fragment
-asm x86-64 {
+asm x86-64,bmi1,lzcnt,popcnt {
     bsf rax, rcx              # index of the lowest set bit; zf set and rax undefined when rcx is 0
     bsr rdx, qword [rdi]      # index of the highest set bit
     tzcnt r8, r9              # trailing zeros, 64 for a zero source (bmi1)
@@ -209,10 +215,12 @@ register or memory source of the same width. `bsf` and `bsr` set ZF on a zero
 source and leave the destination and CF undefined, which the effect model reports
 as writing the flags. `popcnt`, `lzcnt` and `tzcnt` define ZF and CF, and need
 their extension, listed under
-[Extension instructions](#extension-instructions). `bswap` takes one 32- or
-64-bit register, and has no 16-bit form. `imul` in two or three operands is the
-signed multiply with the low half kept; the one-operand widening form is not
-spelled. `shld` and `shrd` take the register or memory shifted, a register of the
+[Extension instructions](#extension-instructions), which the head above adds to
+the block. `bswap` takes one 32- or 64-bit register. `bswap ax` assembles as GNU as
+encodes it (`66 0f c8`), and the architecture leaves its result undefined. `imul` in
+two or three operands is the signed multiply with the low half kept, and the
+one-operand form (`imul rcx`) is the widening multiply into RDX:RAX, as `mul` is
+for unsigned. `shld` and `shrd` take the register or memory shifted, a register of the
 same width feeding bits, and a count of 0 to 255 or `cl`. A secret in `cl` is a
 variable-latency count for the constant-time check, as it is for `shl`; an
 immediate count is not.
@@ -233,8 +241,8 @@ asm x86-64 {
 ```
 
 `movs`, `stos`, `lods`, `cmps` and `scas` take a width suffix, `b`, `w`, `d` or
-`q`, and no operands: `movsd` here is the string move, since the scalar-double
-move is not an inline-asm row. Each reaches memory through its implicit
+`q`, and no operands: a bare `movsd` is the string move, and `movsd xmm0, xmm1`
+with operands is the scalar-double move. Each reaches memory through its implicit
 registers:
 
 | mnemonic | reads | writes | memory |
@@ -249,9 +257,9 @@ A prefix repeats the instruction `rcx` times and counts `rcx` down, so it adds
 `rcx` to what the instruction reads and writes. `rep` repeats a move, store or
 load. A compare repeats under a condition instead, `repe` (or `repz`) while its
 elements are equal and `repne` (or `repnz`) while they differ, and stops early
-when the condition fails. `rep cmpsb` and `repe movsb` are refused, since the
-first says nothing about when to stop and the second names a condition nothing
-sets. The written registers are the block's clobbers like any other, so a value
+when the condition fails. `rep` is the same `f3` byte as `repe`, so `rep cmpsb`
+assembles as `repe cmpsb`, as GNU as reads it. `repe movsb` is refused, since it
+names a condition nothing sets. The written registers are the block's clobbers like any other, so a value
 the allocator keeps live across the block never sits in one of them.
 
 Every step moves `rsi` and `rdi` forward when the direction flag is clear and
@@ -284,14 +292,17 @@ asm x86-64 {
 }
 ```
 
-The override is refused wherever it would change nothing or mislead:
+The override is refused where it has no address to relocate:
 
 | operand | why it is refused |
 |---|---|
-| `es:`, `cs:`, `ss:`, `ds:` | long mode ignores these bases, so the prefix relocates nothing |
 | a register, an immediate or a `{name}` binding | only a bracketed memory operand has an address to relocate |
 | `lea rax, fs:[rbx]` | `lea` never accesses its address, so the result is not segment-relative |
-| `fs:[symbol]` | a symbol operand is RIP-relative, and the base would move it off the symbol |
+
+`es:`, `cs:`, `ss:` and `ds:` are accepted and write their prefix (`0x26`, `0x2e`,
+`0x36`, `0x3e`), although long mode ignores those bases, so the prefix relocates
+nothing. `fs:[symbol]` is accepted as the symbol's address taken as an absolute
+displacement from the fs base (`R_X86_64_32S`), not as a RIP-relative operand.
 
 A segment override does not change which registers an instruction reads or
 writes, and the constant-time check treats `fs:[rbx]` exactly as `[rbx]`. The
@@ -329,16 +340,18 @@ fun copy(src: *^u64, dst: *^u64, count: *u64) {
 }
 ```
 
-The statement follows the register the block loads the pointer into, from that
-load until the register is written again. A pointer copied to another register,
-offset with `add`, or spilled and reloaded is no longer the loaded one, so a
-store through it states nothing. Index from the loaded register in the address
-instead (`[rdx + 8]`, `[rdx + rcx*8]` with a public `rcx`).
+The statement follows the value the block loads from the binding, from that load
+until the register holding it is written with something else. A copy of it to
+another register (`mov r8, rdx`) and an offset of it with `add` carry the
+statement, as does indexing from it in the address (`[rdx + 8]`, `[rdx + rcx*8]`
+with a public `rcx`). A pointer spilled and reloaded, or loaded through the
+binding's pointee (`mov rdx, [rdx]`), is no longer the loaded one, so a store
+through it states nothing.
 
 A block may not turn the processor's timing mode off inside a constant-time
-function: aarch64's `msr dit, xN` and `msr pstate.dit, #0` are refused. `msr
-pstate.dit, #1` is admitted when written as the mnemonic, as it
-sets what the function's own switch already set. The read, set and restore the
+function: aarch64's `msr dit, xN` and `msr dit, 0` are refused. `msr dit, 1` is
+admitted when written as the mnemonic, as it sets what the function's own switch
+already set, and a constant-time function's block needs no head to name it. The read, set and restore the
 frame code places around the body are the only other writes admitted. x86-64's
 DOITM is a model-specific register only the system writes, and RISC-V's Zkt is a
 promise with no mode to change, so neither has an instruction a block can use.
@@ -351,10 +364,19 @@ clobber set, and a live vector value crossing the block is kept the same way a
 general-purpose one is. A memory base or index is always a general-purpose
 register, and a vector register in a general-purpose form is refused by name.
 
-**x86-64** spells them `xmm0` to `xmm15`. A memory operand of a vector
+The tables below list the baseline forms this page describes. They are not the whole
+surface: the rows are masc's, whose catalog holds each instruction set entire, so the
+scalar floating-point forms (`addsd`, `movsd xmm0, xmm1`), aarch64's 64-bit
+arrangements (`add v0.2s, v1.2s, v2.2s`, `and v0.8b, ...`) and multi-register lists
+(`ld1 {v0.16b, v1.16b}, [x0]`) assemble too, and an extension's forms assemble under
+it (see [Extension instructions](#extension-instructions)).
+
+**x86-64** spells them `xmm0` to `xmm15` in the baseline. A memory operand of a vector
 instruction is a whole 128-bit vector, written bare or as `xmmword [...]`, and a
-narrower width prefix is refused. `[symbol]` addresses RIP-relative data, and the
-relocation is correct after a trailing immediate.
+narrower width prefix is refused. `[rip + symbol]` addresses RIP-relative data
+(`R_X86_64_PC32`), and the relocation is correct after a trailing immediate. A bare
+`[symbol]` is the symbol's absolute address (`R_X86_64_32S`), as it is for every
+instruction.
 
 | form | mnemonics |
 |---|---|
@@ -366,7 +388,8 @@ relocation is correct after a trailing immediate.
 | `xmm, xmm/m128` (the count is the source's low quadword) | `psllq` `psrlq` |
 
 `movq xmm, r64` writes the low quadword and zeroes the high one, and `movq r64,
-xmm` reads the low quadword. Only the 64-bit general register form is spelled.
+xmm` reads the low quadword. The 32-bit general register form is `movd` (`movd xmm0,
+eax`), and `movq` with a 32-bit register is refused.
 `pslldq` and `psrldq` shift the whole register by bytes, and `psllq` and `psrlq`
 shift each quadword by bits. A count past the width empties the register or the
 lane, as GNU as encodes it, so any immediate from 0 to 255 is accepted. All of
@@ -376,8 +399,9 @@ constant-time check lets a secret through them as data.
 **aarch64** spells them `vN.16b`, `vN.8h`, `vN.4s` or `vN.2d`. The suffix is the
 lane arrangement, and every operand of one instruction shares it. `add`, `sub`,
 `and`, `orr`, `eor` and `mov` select their vector form when their operands are
-vector registers. `and`, `orr`, `eor`, `mov` and `mvn` exist only at `.16b`, the
-float members only at `.4s` and `.2d`, and `mul` everywhere except `.2d`.
+vector registers. Of the four arrangements above, `and`, `orr`, `eor`, `mov` and
+`mvn` exist only at `.16b` (and at `.8b` in the 64-bit half), the float members only
+at `.4s` and `.2d` (`.8h` needs `FEAT_FP16`), and `mul` everywhere except `.2d`.
 
 | form | mnemonics |
 |---|---|
@@ -419,9 +443,14 @@ tracks secrets in vector registers separately from general-purpose ones.
 Some instructions exist only on processors that implement an extension beyond
 the instruction set's baseline. Each such row names its extension, and the
 encoder refuses it unless the target selects that extension (the manifest's
-[`ext`](manifest.md#instruction-set-extensions) key) or the enclosing
-function admits it with [`#[extension(...)]`](decorators.md#extnames--an-outlier-function).
-The refusal names the instruction, the extension, and both ways to admit it.
+[`ext`](manifest.md#instruction-set-extensions) key), the enclosing
+function admits it with [`#[extension(...)]`](decorators.md#extensionnames--an-outlier-function),
+or the block's head adds it.
+The refusal is `asm.extension`, and names the instruction, the extension, and the
+target's `isa` or `ext` and the function's `#[extension]` as the ways to admit it.
+The table lists the rows this page describes, not every one: masc's catalog for
+the instruction set holds the whole of each extension, so `vaddps` on `ymm`
+registers assembles under `avx` and `fmul` at `.8h` under `FEAT_FP16`.
 
 The one invariant behind every check: **an instruction that requires extension E
 is emitted only into a function whose admitted set holds E, or into a block whose
@@ -453,22 +482,23 @@ function.
 
 A manifest [level](manifest.md#levels) (`ext = ["x86-64-v2"]`) selects every
 member name, so it admits the rows of each: `pmulld` assembles under `x86-64-v2`, and
-`tzcnt`, `lzcnt` and `vpsllvd` under `x86-64-v3`, and `vpmullq` under `x86-64-v4`. The
-names a level brings that have no rows yet (`sse42`, `avx`, `avx512f`, `avx512bw`,
-`avx512cd`) admit nothing until an encoding lands for them.
+`tzcnt`, `lzcnt` and `vpsllvd` under `x86-64-v3`, and `vpmullq` under `x86-64-v4`. A
+level spelled as the target's `isa` (`isa = "x86-64-v3"`) admits the same rows.
 
 The `avx2` rows are VEX-encoded three-operand instructions: the destination, then the
 shifted vector, then the per-lane counts, as GNU as spells them. Each shifts every lane
 by the count in the same lane of the last operand, and a count at or above the lane
-width empties the lane (or, for `vpsravd`, fills it with the sign). The 128-bit form is
-the only one inline asm spells; `ymm` registers are not operands.
+width empties the lane (or, for `vpsravd`, fills it with the sign). The 256-bit form on
+`ymm` registers assembles under the same extension.
 
 `vpmullq` is EVEX-encoded and takes its operands the same way: the destination, then
 the two factors, and it keeps the low 64 bits of each lane's product. Its 128-bit form
-needs `avx512vl` beside `avx512dq`, so a target selecting only one of them refuses it,
-naming the other. A memory source's displacement is scaled by 16 when that fits a
-byte, as GNU as does. Opmask registers, broadcast, `xmm16` to `xmm31`, and the `ymm`
-and `zmm` forms are not operands inline asm spells.
+needs `avx512vl` beside `avx512dq`: with only `avx512vl` it is refused naming
+`avx512dq`, and with only `avx512dq` its `xmm` operands are refused as the wrong
+register class. A memory source's displacement is scaled by 16 when that fits a
+byte, as GNU as does. `xmm16` to `xmm31` and the `zmm` form assemble under the same
+extensions. An opmask written in braces, as `{k1}`, is read as a `{name}` binding (see
+[Operand substitution](#operand-substitution)), so a masked form cannot be spelled.
 
 `sha256rnds2` also reads `xmm0`, the round keys, without naming it, and the
 constant-time check follows a secret through it. `ptest` defines ZF and CF, so a
@@ -554,7 +584,10 @@ enabled FSGSBASE, and they trap elsewhere. A base write is an address for the co
 every later `fs:` or `gs:` access goes through it. Writing a secret into a base
 is therefore refused, just as addressing memory with a secret is.
 
-`iretq` does not fall through, and the effect model has no way to say so: a
+In a function with a compiler-built frame `iretq` is refused like `ret`, with
+`asm.unsupported`, since it leaves the function without its epilogue, so a handler
+that ends in it is a `#[naked]` function. `iretq` does not fall through, and the
+effect model has no way to say so: a
 `Mnemonic` names registers written and nothing else. That is sound — nothing can
 survive an instruction control never returns from — but it means statements after
 an `iretq` are unreachable without the compiler saying so.
@@ -666,7 +699,8 @@ function may not contain one at all — which is why a real mnemonic is always p
 where one exists. Data directives are not allowed in a constant-time function's `asm`:
 the check of the function's code tells a block's instructions apart from the compiler's
 by counting the instructions the block wrote, and a directive's bytes are no count of
-instructions, so a `.word` that encodes `msr pstate.dit, #1` is refused like any other.
+instructions, so a `.word` that encodes `msr dit, 1` is refused like any other, with
+`asm.operand`.
 
 ## Declaring a raw encoding's effects
 
@@ -710,9 +744,10 @@ Registers are named in the target's own vocabulary, in either bank:
 | aarch64 | `x0`–`x30`, `sp`, `xzr` | `v0`–`v31` |
 | riscv64 | `x0`–`x31`, psABI aliases (`a0`, `t0`, `sp`, …) | `f0`–`f31`, psABI aliases (`fa0`, `ft0`, …) |
 
-A width is not a register: `eax`, `w0` and `v2.4s` are refused, because `eax` and `rax`
-are one register whose bits the allocator tracks as a unit and accepting both spellings
-would suggest the clobber set told them apart.
+A width spelling of a general-purpose register names the whole register: `writes(ebx)`
+clobbers all of `rbx`, as `writes(w0)` does `x0`, because the allocator tracks a
+register's bits as a unit. A lane arrangement is not a register name, so `v2.4s` is
+refused.
 
 ### What the compiler still guarantees, and what it does not
 
@@ -723,7 +758,9 @@ worth being precise about which part.
 so a malformed one fails the build rather than being silently dropped — a mistyped
 `writes(` is an error, not a declaration that quietly said nothing. Every register named
 must resolve in this target's own name table, so a typo fails rather than declaring a
-smaller set than you wrote. An attribute that does not exist is refused by name.
+smaller set than you wrote. An attribute that does not exist, such as `reads(rax)`, is
+refused as a malformed declaration, and a clause after an instruction rather than a
+directive is refused as text not expected there.
 
 **Structurally bounded.** A clause may only follow a **data directive**. A modeled
 instruction's effects come from its mnemonic and cannot be overridden, so a declaration
@@ -787,12 +824,17 @@ block is: `#` opens a comment to the end of the line, so Arm's `#1` would leave 
 instruction without its operand.
 
 ```mach fragment
-asm armv8-a {
+asm armv8-a+dit {
     msr dit, 1                # turn on data-independent timing for this thread
     dsb nsh                   # ... and make the write take effect before what follows
     isb
 }
 ```
+
+`dit` exists only on a processor with FEAT_DIT, so outside a constant-time function
+the block needs it from its head (`armv8-a+dit`, or a level that holds it such as
+`armv8.4-a`), the target or the function, and is refused with `asm.extension`
+otherwise.
 
 Access permission is not checked: whether a register is writable depends on the exception
 level the code runs at, which the compiler does not know. Writing a register that is
@@ -803,7 +845,7 @@ read-only at the current level traps at run time, as the architecture defines.
 The three architectural barriers take the Arm ARM's option vocabulary:
 
 ```mach fragment
-asm armv8-a {
+asm armv8-a+sb {
     dmb ish                   # data memory barrier, inner shareable
     dsb nsh                   # data synchronization barrier, non-shareable
     isb                       # instruction synchronization barrier (`isb sy` spells the same word)
@@ -814,7 +856,8 @@ asm armv8-a {
 `dmb` and `dsb` take one option from `sy`, `st`, `ld`, `ish`, `ishst`, `ishld`, `nsh`,
 `nshst`, `nshld`, `osh`, `oshst`, `oshld`. `isb` takes no option or `sy`, the one the
 architecture defines. `sb` exists only on a processor with FEAT_SB, so it is an
-[extension instruction](#extension-instructions) under `sb`. None of the four reads or
+[extension instruction](#extension-instructions) under `sb`, which the head above
+adds. None of the four reads or
 writes a register, so an oblivious body may spell them beside a loaded secret, and a
 value stays live across them.
 
@@ -875,7 +918,7 @@ asm rv64i {
     tail some_symbol      # the same pair through t1, no link
     j    1f               # a numeric local label resolves in place, no relocation
 1:
-    beq  a0, a1, 1b       # a conditional branch takes a numeric local label only
+    beq  a0, a1, 1b       # a conditional branch to a numeric local label is one word
 }
 ```
 
@@ -883,10 +926,11 @@ asm rv64i {
 fills from the final placement and refuses when the target is more than 1 MiB away, so
 a target that may live in another module or a shared object is spelled `call` or
 `tail`, whose `auipc` + `jalr` pair reaches +-2 GiB and, for an imported function, the
-PLT stub. A conditional branch (`beq`, `bnez` and the rest) takes a numeric local
-label only: its 12-bit field has no relocation kind here, the same posture as
-aarch64's `b.cond`, so a symbol in that position is refused at the asm site rather
-than assembled to a word the linker cannot fill. On riscv32 the rows are the same.
+PLT stub. A conditional branch (`beq`, `bnez` and the rest) to a numeric local label
+resolves in place. To a symbol it is relaxed as GNU as relaxes it, into the inverted
+branch over a `j` to the symbol under `R_RISCV_JAL` (`beq a0, a1, sym` becomes
+`bne a0, a1, 8` then `j sym`), so it reaches what `j` reaches. On riscv32 the rows
+are the same.
 
 ## Control-and-status registers (riscv64)
 
@@ -894,7 +938,7 @@ The Zicsr extension's six instructions — read-write, read-set and read-clear, 
 taking its source from a register or a five-bit immediate — reach a CSR by name:
 
 ```mach fragment
-asm rv64i {
+asm rv64i_zicntr {
     csrrw a0, mstatus, a1   # read mstatus into a0, write a1 into it
     csrr  a0, mtvec         # csrrs a0, mtvec, x0 - the read-only pseudo
     csrw  stvec, a1         # csrrw x0, stvec, a1 - install a trap vector
@@ -905,7 +949,10 @@ asm rv64i {
 The named set covers what freestanding code reaches for — the machine and supervisor
 trap vector / exception-PC / cause registers, the interrupt enable / pending pairs, the
 address-translation root, the hart id an SMP boot path reads to tell cores apart, and
-the three unprivileged counters `rdtime` / `rdcycle` / `rdinstret` name. It is
+the three unprivileged counters `rdtime` / `rdcycle` / `rdinstret` name. Those three
+pseudos are Zicntr's, so a block that spells them needs `zicntr` from its head, as
+above, or from the target or the function, and is refused with `asm.extension`
+otherwise. It is
 deliberately not exhaustive: the privileged spec defines several hundred addresses
 across three privilege levels, so **any** CSR is also reachable by its numeric address,
 exactly as a name resolves to one:

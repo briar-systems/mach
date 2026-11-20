@@ -38,15 +38,21 @@ ext fun fcntl(fd: i32, cmd: i32, ...) i32;
   It is not a named parameter and has no type.
 - **`ext` only.** A mach-bodied `fun` has no C-variadic form — its variadic is the
   comptime pack `va: ...`, an ordinary *named* parameter with an entirely different
-  meaning (see [variadics.md](variadics.md)). A bare `...` in a non-`ext` parameter
-  list is an error that names the pack.
+  meaning (see [variadics.md](variadics.md)). In a non-`ext` parameter list a bare
+  `...` is not a parameter, and the parser reports the missing parameter name
+  (`syntax.expected_name`). The other way round, a pack on an `ext fun`
+  (`ext fun f(va: ...)`) is refused with `pack.bodyless`, whose note names the
+  C-variadic spelling.
 - **At least one fixed parameter** must precede the `...`, as in C. Every psABI
-  defines its variadic rule relative to the named arguments.
+  defines its variadic rule relative to the named arguments. `ext fun f(...)` is
+  refused with `variadic.no_fixed_param`.
 - Only the **call** side exists. Mach cannot *define* a C-variadic function: there
-  is no `va_list` and no `va_arg`, so such a declaration cannot carry a body.
+  is no `va_list` and no `va_arg`, so such a declaration cannot carry a body
+  (`ext.variadic_body`).
 
 The declared parameters are the *fixed* arity. A call must supply all of them and
-may supply any number of further arguments, including none.
+may supply any number of further arguments, including none. A call short of the
+fixed arity is refused with `call.arity` (`expected at least 1 argument, found 0`).
 
 ### Naming the signature as a type
 
@@ -81,21 +87,27 @@ A tail argument has no declared parameter type to check against, so it is checke
 against the C variadic contract directly. C applies **default argument promotions**
 there: an integer narrower than `int` arrives as an `int`, and a `float` arrives as
 a `double`. Mach inserts no implicit conversions anywhere and makes no exception
-here — a narrow argument is **rejected**, naming the cast:
+here. A narrow argument is **rejected** with `call.c_variadic_promotion`, naming
+the cast:
 
 ```mach fragment
 var c: u8  = 65;
 var f: f32 = 1.5;
 
-log(fmt, c);                 # error: cast it to `i32` / `u32`
-log(fmt, f);                 # error: cast it to `f64`
+log(fmt, c);                 # error: write the cast `x::i32` or `x::u32`
+log(fmt, f);                 # error: write the cast `x::f64`
 log(fmt, c::i32, f::f64);    # correct
 ```
+
+The first error reads ``error[call.c_variadic_promotion] `u8` is promoted to a
+32-bit integer in a C-variadic argument. write the cast `x::i32` or `x::u32` ``.
+A character literal is a `u8` and is refused the same way.
 
 An argument of 32 bits or wider passes as written: `i32`/`u32`, `i64`/`u64`, `f64`,
 any pointer, and a record or vector passed by value. A **secret** (`^T`) may not
 enter a variadic tail: the callee is foreign code that prints or logs the value, so
-it is an observation boundary — declassify with `:>T` first.
+it is an observation boundary. Declassify it with `:>T` first. The refusal is
+`secret.variadic`.
 
 ### Per-target argument passing
 
@@ -171,7 +183,8 @@ fun trace(level: i32, text: *u8, args: VaList) i64 {
 The declaration carries no size of its own. The selected target declares what a
 `va_list` is on that platform, and the same source text binds correctly on every
 one of them. A target that declares none refuses the declaration by name rather
-than guessing.
+than guessing, with `abi_type.unavailable` (on `vulkan-spirv`: ``the `va_list` of
+calling convention `shader` has no layout``).
 
 ### Mach can forward one and never read one
 
@@ -187,6 +200,11 @@ fun make() VaList { … }     # refused: a return position
 fun peek(ap: *VaList) { … } # refused: behind a pointer
 val raw: ptr = args :~ ptr; # refused: a cast in either direction
 ```
+
+Each is `abi_type.opaque`: ``a `va_list` cannot be read, constructed or stored.
+receive it as a parameter and pass it to the C function that consumes it``. A
+union field, a tag payload, an array parameter and a secret parameter are refused
+the same way.
 
 Reading one needs `va_arg`, and mach cannot have `va_arg`: it has no runtime
 variadics, so it has no callee that walks its own argument tail. That is not a gap
@@ -209,10 +227,11 @@ x86-64 it is a pointer into shared state that the callee advances. Forward it on
 | **System V x86-64** | `__va_list_tag[1]`, an array type, so a parameter decays to one pointer |
 | **Apple arm64** | `char *` |
 | **Microsoft x64** and **Windows arm64** | `char *` |
-| **RISC-V lp64d** | `void *` |
+| **RISC-V**, every ABI | `void *` |
+| **WebAssembly** (`wasi-wasm32`) | `void *` |
 | **AAPCS64 linux** | a 32-byte, 8-aligned composite |
 
-On the first four, spelling the parameter `ptr` is already ABI-correct. On
+On every row but the last, spelling the parameter `ptr` is already ABI-correct. On
 AAPCS64-linux it is not, and the way it fails is the reason this type exists rather
 than a documented caveat: AAPCS64 passes a composite over 16 bytes indirectly, with
 the **caller** owning the copy, so a `ptr` forwards the received pointer instead of
@@ -330,7 +349,7 @@ write, `::f64` (see
 ext fun printf(fmt: *u8, ...) i32;
 
 fun show(h: f16) i32 {
-    ret printf("%f\n"::*u8, h); # error: `f16` is promoted to `f64`. write the cast
+    ret printf("%f\n"::*u8, h); # error: `f16` is promoted to `f64` in a C-variadic argument. write the cast `x::f64`
 }
 ```
 
@@ -558,6 +577,10 @@ mach build . -l c
   refused. Link a static library by its path, or by a `[link.X]` entry with
   `kind = "static"`. mach keeps no search of its own. `-L` and `-l` may each be
   repeated.
+- A library is searched for by name only where the target's environment
+  provides system libraries. On Linux that is `env = "gnu"` in the target, or
+  `--env gnu` on an entry build. A target that states no `env` refuses `-l c` (``the target states no environment that provides system libraries, so
+  `c` has nowhere to be found (linux)``).
 
 ### Manifest
 
@@ -611,15 +634,14 @@ resolved is a hard error.
 Loose `.o` relocatable objects and static `.a` archives are linked **statically**.
 An archive contributes only the members that define a symbol left undefined by
 the objects and members before it, selected to a fixed point within that
-archive, so a vendored archive costs the binary exactly the members it uses
-(`mach help build` states the resolution rules). A shared `.so`, `.dylib`, framework,
+archive, so a vendored archive costs the binary exactly the members it uses.
+A shared `.so`, `.dylib`, framework,
 or `.dll` is a **dynamic** dependency: its format-specific canonical loader name
-is recorded and undefined `ext` functions become run-time imports. A shared
-input is validated before it is recorded: a `.so` that is not a loadable ELF
-shared object for the selected architecture (a linker script, a
-foreign-architecture file) is refused (`'<file>' is not a loadable ELF shared
-object for the selected architecture`). A static definition always wins over a
-same-named dynamic import.
+is recorded and undefined `ext` functions become run-time imports. A file no
+object format reads is read as a GNU linker script where the target's system
+uses them, as glibc's `libc.so` is: its `GROUP` and `INPUT` entries enter the
+link in order, and each file it names is checked for the link's architecture as
+it is read. A static definition always wins over a same-named dynamic import.
 
 ## See also
 

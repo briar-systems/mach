@@ -33,7 +33,9 @@ literal its default.
 ### Typed suffixes
 
 A suffix is the spelling of the primitive type the literal has: an integer
-primitive on an integer literal and a float primitive on a float literal (see
+primitive from `u8` to `i128` on an integer literal and a float primitive on a
+float literal. No suffix names `u256`, `i256`, `u512` or `i512`, since a
+literal's value is held in 128 bits (see
 [types.md](types.md#primitive-scalars), and the `int-suffix` and `float-suffix`
 productions of [grammar.md](grammar.md#integer-literals)). It works with every radix
 and with digit separators (`0xFFu8`, `0b1010u16`, `1_000_000u32`, `1.5e2f32`, `0.25f16`).
@@ -76,8 +78,10 @@ val d: u32 = -1u32; # error: literal -1 is out of range for u32 (0..4294967295)
 ```
 
 An integer literal may be as large as `u128` holds, in any radix and with
-separators, and the range check reaches the same width; a literal that no
-integer type holds is an error:
+separators, and the range check reaches the same width. A larger literal is
+refused with `literal.out_of_range`, even where the context is `u256` or
+`u512`, and in such a context a literal reaches only what an `i128` holds (see
+[types.md](types.md#256-and-512-bit-integers)):
 
 ```mach fragment
 val a: u128 = 340282366920938463463374607431768211455;         # u128 max
@@ -146,7 +150,8 @@ val c: u8 = 'M';
 
 Char escapes: `\n` `\t` `\r` `\\` `\'` `\"` `\0` `\xHH`.
 
-This set is deliberately minimal — there is no `\a` `\b` `\f` `\v`. Any other
+This set is deliberately minimal, and `\a` `\b` `\f` `\v` are refused as
+unknown escapes with `literal.malformed`. Any other
 byte, control characters included, is written `\xHH` (e.g. `\x08` for
 backspace, `\x07` for bell).
 
@@ -188,7 +193,7 @@ val usage: *u8 =
 ## `nil`
 
 The `nil` keyword is the null-address literal. With no context it types as
-`*u8`; it coerces to any pointer-like type — a raw `ptr`, a typed `*T`, or a
+`*u8`. It coerces to any pointer-like type: a raw `ptr`, a typed `*T`, or a
 function type `fun(...)` (a function value is a code address, so the null
 address is a valid null callback). The coercion is uniform across every
 position a value flows into: globals, locals, record fields, array elements,
@@ -200,7 +205,7 @@ var p:  *i64     = nil; # null pointer
 var cb: fun(u32) = nil; # null function pointer
 var k:  F        = nil::F; # the cast spelling works too
 
-fun absent() u8 {
+fun absent() u1 {
     ret p == nil; # nil compares against any pointer-like value
 }
 ```

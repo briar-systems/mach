@@ -1,7 +1,7 @@
-# `rec` — record
+# `rec`: record
 
 A `rec` is a named, structurally-laid-out collection of typed fields. Each
-field has its own storage; the record's size is the sum of field sizes
+field has its own storage, and the record's size is the sum of field sizes
 plus any padding for alignment.
 
 ## Grammar
@@ -61,6 +61,10 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
+A field given twice in one literal is refused with `field.duplicate_init`, and
+a name the record does not declare with `field.unknown`. A positional literal
+such as `Point{1, 2}` is refused, because positional braces build a vector.
+
 A literal may leave fields out. **Every omitted field is zero-initialized**:
 integers and floats read `0`, pointers read `nil`, and a nested record or array
 is zero in every byte. This holds for secret (`^`) fields and secret-welded
@@ -87,12 +91,13 @@ By default the compiler may insert padding between fields for alignment. A
 record that holds a secret has its padding zeroed wherever a value of it is
 built (see [secrecy.md](secrecy.md#padding-of-secret-aggregates)). The
 `#[align(N)]` decorator on a record raises its minimum type alignment to `N`
-bytes (a power of two), and `#[packed]` lays the record out with no padding
+bytes (a non-zero power of two, with any other value refused as
+`decorator.align`), and `#[packed]` lays the record out with no padding
 at all, for a shape whose layout is fixed elsewhere (a C struct, a file
-header, a wire frame); see [decorators.md](decorators.md#packed--no-padding)
-for what a packed record refuses. `#[volatile]` makes every access to the
+header, a wire frame). [decorators.md](decorators.md#packed--no-padding)
+lists what a packed record refuses. `#[volatile]` makes every access to the
 record's storage a volatile access, the way a memory-mapped register block is
-declared; see [decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access).
+declared. See [decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access).
 
 ## See also
 

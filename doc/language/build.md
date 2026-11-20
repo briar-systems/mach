@@ -1,6 +1,6 @@
 # Selection and the build matrix
 
-A build cell is one artifact × one target × one profile.
+A build cell is one artifact by one target by one profile.
 
 Every command that builds, checks, tests, runs or documents cells selects them
 with three options, one per axis:
@@ -35,12 +35,14 @@ An axis no option names, without `--all`, takes the manifest's default:
   artifacts whose `targets` includes it, those marked `default = true` when any is
   marked, and every one of them when none is. `mach build` and `mach check` take the
   whole default selection. `mach test` needs one artifact and takes the
-  default selection when it holds one; several with none marked are refused.
+  default selection when it holds one. Several with none marked are refused.
   `mach doc` selects nothing: it documents every source file, on no target.
-  `mach run` takes the sole `bin` the target builds.
+  `mach run` takes the sole `bin` the target builds, or the one marked
+  `default = true` when several do.
 
 No default is chosen by table order: several candidates with none marked are
-refused, naming them.
+refused with `selection.ambiguous`, whose fix is to mark one `default = true` or
+to select one. `mach test` names the artifacts it found.
 
 - `mach build <path>` and `mach check <path>` build and check every selected cell.
   A selection that spans several profiles plans and runs one profile after another.
@@ -50,22 +52,24 @@ refused, naming them.
   then run once per (target, profile): the tests every selected artifact reaches
   there are combined, each qualified name running once. A target that declares a
   [`runner`](manifest.md#targetname) runs through it, and a target whose `sys` and
-  `arch` are the host's and that declares none runs directly; every other (target,
+  `arch` are the host's and that declares none runs directly. Every other (target,
   profile) is built, reported on a `skip` line, and not run, whatever emulation the
   host has. `--runner <cmd>` replaces the target's runner for one invocation and needs
   the selection to resolve to one cell. A run in which nothing was runnable exits `1`, so a green run always ran
   something, unless `--allow-unrunnable` accepts it.
 - `mach run <path>` consumes exactly one cell and refuses a selection that resolves
-  to several, naming them, and takes no `--all`. `mach doc <path>` refuses `-a`
+  to several, naming them, and takes no `--all`. It launches a program a build
+  already wrote and never builds one: with nothing at the cell's output path it is
+  refused with `artifact.not_built`, which names `mach build`. `mach doc <path>` refuses `-a`
   and `-t`, since one run documents every source file and runs no target's analysis
   (see [documentation.md](documentation.md#what-mach-doc-writes)). `mach run` launches the built program
   through the target's `runner` when it declares one, the expanded runner followed by
-  the arguments after `--`; `--runner <cmd>` replaces it with `<cmd> <program> <args>`
+  the arguments after `--`, and `--runner <cmd>` replaces it with `<cmd> <program> <args>`
   for one invocation. A target that is not the host's and declares no runner is
   refused, naming the target, and the program's exit status, or the runner's, is
   `mach run`'s.
 
-## Enumerated cells are filtered; named ones are not
+## Enumerated cells are filtered, named ones are not
 
 A cell whose artifact does not list the cell's target is a cell the manifest never
 declared, so a selection that reaches it through a glob skips it. Naming both halves
@@ -73,9 +77,11 @@ of that pair exactly is a different act: `-a kernel -t linux-x86_64` is refused 
 name, because you asked for a cell that does not exist. `-a kernel -t '*'` globs
 the target axis and so filters back to the targets `kernel` declares.
 
-If a selection is well-formed but holds no cell — a `-t` no artifact lists, or
-globs that only pair unsupported cells — it fails naming what it selected, rather
-than succeeding with an empty plan.
+If a selection is well-formed but holds no cell, it fails with
+`target.no_artifacts` rather than succeeding with an empty plan. A `-t` that names
+exactly a target no artifact lists is refused naming that target and the declared
+artifacts, and globs that only pair unsupported cells are refused with the fix to
+widen `-a` or `-t`.
 
 ## A named artifact can settle the target
 
@@ -86,11 +92,19 @@ already leave only one answer:
   repeat what the manifest already said. A hosted target that does not match the
   host is refused instead (see [`native` target resolution](#native-target-resolution))
 - several, one of which matches the host: the host target, as before
-- several, none matching the host: refused, naming the targets the artifact does
-  declare so the choice is visible without opening `mach.toml`
+- several, none matching the host: refused. When the manifest declares a target
+  for the host that the artifact does not list, the refusal is
+  `selection.unsupported_target`, naming the artifact and that default target, with
+  the fix to select one of the artifact's targets with `-t`. When the manifest
+  declares no target for the host, it is `native`'s own `selection.no_host_target`
+
+A glob over the artifact axis settles each artifact it names the same way, and
+leaves out one that cannot be settled. When the glob selects nothing else, the
+refusal of an artifact the manifest declares no host target for stands, and an
+artifact that does not list the host target gives `target.no_artifacts`.
 
 An explicit `-t` always wins, including when it names a target the artifact
-does not list — that pair is still refused by name. This only applies to a named
+does not list, and that pair is still refused by name. This only applies to a named
 artifact: an artifact axis left to the default keeps the target fixed for the whole
 matrix, so a bare `mach build <path>` never widens into a target it was not asked
 for.
@@ -114,9 +128,9 @@ a build never writes outside the tree it was asked to build.
 
 ## When one cell fails
 
-Every cell is attempted; a failure does not abandon the ones after it. Each cell's
+Every cell is attempted, and a failure does not abandon the ones after it. Each cell's
 diagnostics are reported under its own heading as it happens, and every cell that
-succeeded leaves its artifact on disk at its own path — nothing is rolled back.
+succeeded leaves its artifact on disk at its own path. Nothing is rolled back.
 
 A cell that fails, or is not built because an artifact it needs failed, leaves
 nothing at its output path that could be taken for its product: the artifact
@@ -135,9 +149,9 @@ profiles whose `[project].work` has no `{profile.name}` to keep them apart.
 
 ## `native` target resolution
 
-`native` resolves the host's `(isa, os)` against the **declared** targets only —
+`native` resolves the host's `(arch, sys)` against the **declared** targets only,
 never a synthesized tuple, and never a target the host cannot run. Exactly one host
-match is chosen; several matching tuples is an ambiguity error naming the candidates.
+match is chosen, and several matching tuples is an ambiguity error naming the candidates.
 With no match `native` is an error, however many targets are declared and however
 they are marked, and it is raised before any step runs. A declared target that does
 not match the host is built only when `-t` names it:
@@ -153,8 +167,8 @@ With no `-t`, [an artifact can settle the target](#a-named-artifact-can-settle-t
 when its `targets` list leaves one answer. The same rule holds there. An artifact whose
 only target is hosted and does not match the host is refused with
 `selection.no_host_target`, naming the artifact, because building it would be the same
-fallback. An artifact whose only target no host runs as `native` (a `freestanding`
-target, including a finished-module target such as `spirv`) is still pinned to it:
+fallback. An artifact whose only target no host runs as `native` (a `freestanding` or
+`wasi` target, or a finished-module target on `vulkan` or `opencl`) is still pinned to it:
 such a target is never `native`, so naming the artifact selects it explicitly, and a
 host artifact that `need`s it builds it on any host. This path is taken whenever an
 artifact is settled before its target: `mach build` and `mach check` with
@@ -226,5 +240,5 @@ file under `simd = "require"` (see
 
 ## See also
 
-- [manifest.md](manifest.md) — the `[target]`, `[profile]` and `[artifact]` tables a selection reads
-- [dependencies.md](dependencies.md) — the dependency closure a build compiles
+- [manifest.md](manifest.md): the `[target]`, `[profile]` and `[artifact]` tables a selection reads
+- [dependencies.md](dependencies.md): the dependency closure a build compiles

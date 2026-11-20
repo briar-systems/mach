@@ -30,11 +30,11 @@ and `-vv` write the [readout](readout.md) as [readout records](#readout-records)
   own, and the last one is the [summary](#the-summary-record). Output a build
   step or a test writes itself is not mach's and is not a record.
 - The text is ASCII. A non-ASCII character in a message, a label or a path is
-  written as a `\u` escape, and a byte that is not valid UTF-8 as `�`, so
-  every line is valid UTF-8 and valid JSON.
+  written as a `\u` escape, and a byte that is not valid UTF-8 as `\ufffd`,
+  the escape of U+FFFD, so every line is valid UTF-8 and valid JSON.
 - Under `json` the human tally (`N errors / M warnings`) is not written, and
   the `building <artifact>` banners and `profile <name>:` headers are not
-  written; under `-v` a `unit` record opens every unit instead.
+  written. Under `-v` a `unit` record opens every unit instead.
 
 ## A record
 
@@ -46,7 +46,7 @@ A type error in a generic instance, whose primary span covers two lines and
 whose related site is in another file:
 
 ```json
-{"schema":2,"record":"diagnostic","severity":"error","code":"operator.operand_mismatch","message":"incompatible operand types `R` and `i64`","origin":"sema","primary":{"file":"src/main.mach","line":6,"column":16,"end_line":7,"end_column":11,"byte_start":111,"byte_end":127},"related":[{"file":"src/lib.mach","line":3,"column":9,"end_line":3,"end_column":14,"byte_start":53,"byte_end":58,"label":"in this generic body, checked against this instance's type arguments"}],"notes":[],"help":[],"fixes":[]}
+{"schema":2,"record":"diagnostic","severity":"error","code":"operator.operand_mismatch","message":"operands `u8` and `i64` have different types. cast one operand with `::` so both have one type","origin":"sema","primary":{"file":"src/main.mach","line":6,"column":16,"end_line":7,"end_column":11,"byte_start":111,"byte_end":127},"related":[{"file":"src/lib.mach","line":3,"column":9,"end_line":3,"end_column":14,"byte_start":53,"byte_end":58,"label":"in this generic body, checked against this instance's type arguments"}],"notes":[],"help":[],"fixes":[]}
 ```
 
 | Member | Type | Meaning |
@@ -135,7 +135,7 @@ after the headline, as `@ <file>:<line>:<column>` and the snippet, naming the
 file by the path it was read at, as it names a source file.
 
 ```json
-{"schema":2,"record":"diagnostic","severity":"error","code":"version.invalid_range","message":"mach.toml: [project].mach = \"^x\": expected a number (clause 1)","origin":"build","primary":{"file":"mach.toml","line":2,"column":8,"end_line":2,"end_column":12,"byte_start":17,"byte_end":21},"related":[],"notes":[],"help":[],"fixes":[]}
+{"schema":2,"record":"diagnostic","severity":"error","code":"version.invalid_range","message":"mach.toml: [project].mach = \"^x\" is not a valid range. expected a number (clause 1)","origin":"build","primary":{"file":"mach.toml","line":2,"column":8,"end_line":2,"end_column":12,"byte_start":17,"byte_end":21},"related":[],"notes":[],"help":[],"fixes":[]}
 ```
 
 A refusal raised later from the parsed manifest, while a build is laid out or
@@ -177,7 +177,10 @@ not declare is caused by no entry in it, so its refusal has no `primary`.
 steps, the phase whose work raised a failure inside the compiler, and `test` for
 the test runner. A
 refusal of the command line itself, such as an unknown flag or a project path
-that names nothing, has no `origin`.
+that names nothing, has no `origin`. A flag's value the build checks against
+the project is refused by the build and carries `build`: a `-w` that is not a
+relative path inside the project root (`cli.output_path`), or a `-t` or `-p`
+the manifest does not declare (`selection.unknown`).
 
 ## Notes
 
@@ -234,14 +237,17 @@ A `test` record adds how it ended:
 | `output` | string or `null` | the file holding its captured output, kept for a test that failed |
 | `origin` | string | `"test"` |
 
-A `case` record adds `object`, the test object that holds the test. A `skip`
-record carries `target`, `profile` and `reason`. `run_start` carries `tests`,
+A `case` record adds `object`, the test object that holds the test. Unlike
+`file`, the paths `exe`, `output` and `object` are spelled from the project
+path the command was given, as a `built` object's `out` is: `mach test .`
+writes `./out/...`, and `mach test app` from the parent writes `app/out/...`.
+A `skip` record carries `target`, `profile` and `reason`. `run_start` carries `tests`,
 the run's count, and `run_end` the run's totals: `passed`, `failed`, `skipped`,
 `total`, `duration_ns`, `timed_out` and the count of each failure class. A test
 that skipped (exit 77, see [test.md](test.md#semantics)) has the outcome
 `"skip"` and counts in `skipped`, neither passed nor failed.
 
-None of these records carries a `severity` or counts in a summary total; the
+None of these records carries a `severity` or counts in a summary total. The
 summary's `outcome` and `exit_code` say whether a test failed.
 
 ## Readout records
@@ -274,7 +280,7 @@ A **phase** record is a phase row:
 |---|---|---|
 | `name` | string | the row's label: `steps`, `target`, `load`, `resolve`, `sema`, `lower`, `verify`, `optimize`, `codegen`, `passes`, `select`, `alloc`, `frame`, `mirl emit`, `layout`, `encode`, `emit`, `link`, `cache`, `test lower`, `test verify`, `test codegen`, or `other` for the time no row accounts for |
 | `count` | integer | what the phase processed; absent for `other` |
-| `unit` | string | the noun the count is in, singular for a count of one: `"modules"`, `"objects"` |
+| `unit` | string | the noun the count is in, singular for a count of one: `"steps"` for the `steps` row, `"modules"` for the front end's rows, `"objects"` from `lower` to `emit`, `"target"` for the `target` row, `"binary"` for the `link` row of an executable |
 | `time_us` | integer | the phase's time |
 | `threads` | integer | the threads its time is added up over, present only when more than one; such a row is not part of the unit's wall time |
 | `dropped` | integer | the modules it dropped as target-gated, present only when any |
@@ -284,8 +290,10 @@ A **phase** record is a phase row:
 The slowest item is on the phase record rather than on an item, since it is
 only known when the phase closes.
 
-Under `-vv` a **phase_item** record is each module or file a phase processed,
-written as it finishes, before its phase's record:
+Under `-vv` a **phase_item** record is each item a phase processed, written as
+it finishes, before its phase's record: a module, a file such as the `link`
+row's output, a build step under `steps`, or a stage of the `cache` row such as
+`module keys`:
 
 ```json
 {"schema":2,"record":"phase_item","phase":"load","name":"std.filesystem","time_us":2013}
@@ -294,12 +302,14 @@ written as it finishes, before its phase's record:
 | Member | Type | Meaning |
 |---|---|---|
 | `phase` | string | the label of the phase that processed it |
-| `name` | string | the module or file |
+| `name` | string | the module, file, step or stage |
 | `time_us` | integer | its time |
 
 Under `-v` a **counter** record is the unit's total of a counter, written after the rows
 of the phase that counted it, and under `-vv` one is also written for each module,
-named by it, as its step finishes:
+named by it, as its step finishes. A counter whose total is zero, such as every
+counter of a unit whose objects all came from the cache, writes no total record,
+while a module's record is written with its value even when that is zero:
 
 ```json
 {"schema":2,"record":"counter","counter":"ir instrs","name":"std.filesystem","value":20811}
@@ -380,6 +390,6 @@ A `built` object has the unit's `out` (string), `modules` (integer), `bytes`
 
 ## See also
 
-- [diagnostics.md](diagnostics.md) — keys, the registry and its never-reused rule
-- [readout.md](readout.md) — what `-v` and `-vv` show, on which stream, and when
-- [test.md](test.md#json-output) — the records of a test run
+- [diagnostics.md](diagnostics.md): keys, the registry and its never-reused rule
+- [readout.md](readout.md): what `-v` and `-vv` show, on which stream, and when
+- [test.md](test.md#json-output): the records of a test run

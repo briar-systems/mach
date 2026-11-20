@@ -32,20 +32,24 @@ whether or not it links that library prebuilt.
 ## Shadow-module pattern
 
 A file `foo.mach` may co-exist with a directory `foo/`. The file is the
-**surface** module — the public face of `foo`. The directory's files are
+**surface** module, the public face of `foo`. The directory's files are
 **split** implementations that the surface loads and re-exports.
 
 ```
-myproj/
-├── foo.mach          # surface
-└── foo/
-    ├── a.mach        # split: myproj.foo.a
-    └── b.mach        # split: myproj.foo.b
+src/
++-- foo.mach          # surface: myproj.foo
++-- foo/
+    +-- a.mach        # split: myproj.foo.a
+    +-- b.mach        # split: myproj.foo.b
 ```
 
 The surface loads each split with `use myproj.foo.a;` and re-exports its
 public symbols with `fwd a.X;`. Consumers `use myproj.foo;` and access
-symbols through the surface — they never name the split files directly.
+symbols through the surface, so they never need to name the split files.
+The pattern is a convention: a split is an ordinary module, so a
+`use myproj.foo.a;` elsewhere still resolves. Only a `pub` symbol can be
+forwarded, and `fwd a.X;` on a private `X` is refused with
+`visibility.not_exported`, `re-exported symbol is not exported by its module`.
 
 ```mach
 # file: src/foo/a.mach
@@ -78,13 +82,13 @@ fun main(argc: i64, argv: **u8) i64 {
 
 Two common uses:
 
-- **Topical splits** — organize a large module by topic; all splits
+- **Topical splits** organize a large module by topic, with every split
   forwarded unconditionally.
-- **Multiplatform splits** — one impl per target, selected by `$if` on
+- **Multiplatform splits** hold one impl per target, selected by `$if` on
   `$mach.build.sys` or `$mach.build.arch`.
 
 ## See also
 
-- [files.md](files.md) — how `mach.toml` declares the project root
-- [use.md](use.md) — loading a module into another module's scope
-- [fwd.md](fwd.md) — re-exporting from a surface module
+- [files.md](files.md): how `mach.toml` declares the project root
+- [use.md](use.md): loading a module into another module's scope
+- [fwd.md](fwd.md): re-exporting from a surface module

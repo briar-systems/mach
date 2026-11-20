@@ -12,12 +12,17 @@ shows, on which stream, and when.
 
 | Flag | `build` and `check` | `test` |
 |---|---|---|
-| none | diagnostics, failures, the `building <artifact>` banner when the plan has several units, the closing tally | the build's output as for `build`, then one roll-up line per module and the closing summary |
-| `-v` | also one row per phase as the phase closes, the `other` row and the `built` line of each unit | the build's phase rows, and one line per test instead of the roll-ups |
+| none | diagnostics, failures, the `building <artifact>` banner (`checking <artifact>` for a check) when the plan has several units, and the closing tally when anything was reported | the build's output as for `build`, then one roll-up line per module and the closing summary |
+| `-v` | also one row per phase as the phase closes, the `other` row and the `built` line of each unit (a check stops after `sema` and builds nothing, so it shows neither) | the build's phase rows, and one line per test instead of the roll-ups |
 | `-vv` | also one line per module or file a phase processed, as it finishes, and each phase row names its slowest item | the build's per-module lines, and the captured output of passing tests |
 
-`-v` and `-vv` cannot be combined with `--quiet` or `-q`. `--quiet` drops the
-banners and the `profile <name>:` headers.
+A banner names the unit's target in parentheses, `building app (linux-x86_64)`,
+when the command selected targets with `-t` or `--all`. A selection that spans
+several profiles prints a `profile <name>:` header before each profile's units.
+
+`-v` and `-vv` cannot be combined with `--quiet` or `-q`, which is refused as
+`cli.flag_conflict`. `--quiet` drops the banners and the `profile <name>:`
+headers.
 
 ## Streams
 
@@ -31,17 +36,19 @@ leaves stdout as it is.
 ## The build readout
 
 A phase row is written when the phase closes. A phase that runs inside another
-(optimization inside lowering) is timed by the spans moved out of the phase
+(lowering inside code generation) is timed by the spans moved out of the phase
 that hosts it, so no time is counted twice, and `other` is the unit's wall time
 that no row accounts for. The `target` row is the build's target resolved and
 its back half opened once for the unit: mink's formats and mirl's target,
-assembled and readied.
+assembled and readied. When the cache is on, a `cache` row follows `load` and
+counts the modules whose objects it reused, and the phases the cache spared
+count 0.
 
 ```
-load         48 modules     77ms
-codegen      48 modules     75ms  (slowest std.filesystem 9ms)
-emit         48 objects      6ms
-other        -              32ms
+load          48 modules     77ms
+codegen       48 objects     75ms  (slowest std.filesystem 9ms)
+emit          48 objects      6ms
+other        -               32ms
 built out/app  48 modules  1 MiB  in 358ms
 ```
 
@@ -65,7 +72,9 @@ first step runs. mirl times its own stages when a readout is shown, and each mov
 | `layout` | masc laying out the object | masc |
 | `encode` | masc encoding the settled layout | masc |
 
-A test object's mirl and masc stages add to the same rows.
+A test build lowers, verifies and generates its test objects in rows of their
+own, `test lower`, `test verify` and `test codegen`, and a test object's mirl
+and masc stages add to the same rows as above.
 
 A build compiles its modules on `--threads` threads, the host's processors when
 the flag is absent. The link reads and relocates its inputs on as many, and its
@@ -80,7 +89,7 @@ time every thread spent in them, added up. Such a row says
 `other` stays the time no wall row accounts for:
 
 ```
-alloc       1119 objects    18.5s  (summed over 4 threads)
+alloc        1119 objects    18.5s  (summed over 4 threads)
 ```
 
 A target whose back end compiles an artifact whole compiles it on the owner.
@@ -97,7 +106,9 @@ where the objects went and storing their digests. When the clock
 refuses a read, the stage it would have timed comes up short, and the build
 reports `readout.clock_refused` naming the module instead of showing a zero.
 
-After the rows each counter prints its total over the unit's modules:
+When code generation closes, after mirl's and masc's rows and before the `emit`
+row, each counter prints its total over the unit's modules. A counter whose
+total is zero, as `verify runs` is without `--verify`, prints no line:
 
 | Counter | What it counts | Read from |
 |---|---|---|
@@ -118,8 +129,8 @@ finishes.
 gated to another target. Under `-vv` each module or file prints as an indented line
 under the phase that processed it, in the order they finish, and the row names
 the slowest of them. A unit whose project or dependencies declare build steps
-opens with a `steps` row, and under `-vv` each step that ran prints by name;
-a step its stamp shows is current is counted but prints no line.
+opens with a `steps` row, and under `-vv` each step that ran prints by name. A
+step its stamp shows is current is counted but prints no line.
 
 Under `-v` a growing cycle of instances (see
 [fun.md](fun.md#instantiation-ends-or-is-refused)) prints a line each time its
@@ -131,9 +142,11 @@ instance count doubles, so an expansion that does not stop shows while it runs:
 
 Under `--diagnostics json` every one of these lines is a record, written when
 the line would be: a `phase` record for a row, a `phase_item` record for an
-item, a `counter` record for a counter's line, a `growth` record for a growing cycle's line, a `phase` record named `other` without a count, and each `built` line as
-a member of the closing `summary` record. Every unit opens with a `unit` record
-naming its artifact, target and profile, even when the text prints no banner or
+item, a `counter` record for a counter's line, a `growth` record for a growing
+cycle's line, a `phase` record named `other` without a count, and each `built`
+line as a member of the closing `summary` record. Under `-v` or `-vv` every
+unit opens with a `unit` record naming its artifact, target and profile, even
+when the text prints no banner or
 `profile` header, so a tool can tell apart the rows of several units and of
 several profiles.
 [diagnostics-json.md](diagnostics-json.md#readout-records) has the schema.
@@ -166,7 +179,12 @@ Lines and roll-ups therefore come out in the order the tests finish, which can
 differ from run to run. The closing summary does not: it re-lists every failure
 in collection order, the order `--list` prints, and ends with the counts. A
 skipped test is neither a pass nor a failure: it is never re-listed, and the
-skip count follows the total whenever a test skipped.
+skip count follows the total whenever a test skipped. A test that ran past its
+time bound is a failure, and the failed count is then followed by how many
+timed out, as `2 failed (1 timed out)`. A run in which a test ended in an
+infrastructure outcome, a time-out among them, adds one line under the counts
+that tallies them: `unsupported 0, target unavailable 0, resource exhaustion 1,
+invalid injection 0`.
 
 ```
 failures:
@@ -181,5 +199,5 @@ finishes, between a `run_start` and a `run_end` record, as
 
 ## See also
 
-- [test.md](test.md) — the `mach test` workflow
-- [diagnostics-json.md](diagnostics-json.md) — the record schema
+- [test.md](test.md): the `mach test` workflow
+- [diagnostics-json.md](diagnostics-json.md): the record schema

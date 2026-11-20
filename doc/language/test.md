@@ -1,4 +1,4 @@
-# `test` — test declaration
+# `test`: test declaration
 
 A `test` declaration names a block of statements the test runner can
 execute on its own. Any module may declare them, and `mach test` collects
@@ -12,15 +12,16 @@ test <identifier> { ... }
 ```
 
 The name is an identifier, following the ordinary identifier rules. A string
-in its place (`test "label" { ... }`) is a compile error located at the string
-that names the identifier form. The body is a block of statements. A test takes
-no parameters and is not callable from ordinary code; it exists only for the
-runner to invoke.
+in its place (`test "label" { ... }`) is the compile error `test.string_name`,
+located at the string, and its message names the identifier form. The body is
+a block of statements. A test takes no parameters and is not callable from
+ordinary code. It exists only for the runner to invoke.
 
 Tests live in their own namespace in each module. A test's name is never in
 scope in code, so `test str_len { ... }` and `fun str_len` in one module do not
 conflict, and no code can name, call or reference a test. Two tests with the
-same name in one module are a compile error located at the second.
+same name in one module are the compile error `test.duplicate`, located at the
+second.
 
 A test's **qualified name** is its module path, `#`, and its name:
 `std.types.string#str_len__empty`. `#` appears in no identifier or module path,
@@ -35,7 +36,7 @@ does not check.
 
 `test` is a reserved keyword and appears at module (declaration) scope,
 the same level as `fun`, `rec`, and `val`. Visibility modifiers such as
-`pub` are syntactically accepted before `test` but carry no meaning — a
+`pub` are syntactically accepted before `test` but carry no meaning. A
 test is never part of a module's public surface.
 
 ## Examples
@@ -95,15 +96,15 @@ The body is checked against an `i32` return type. A test reports its result
 through that return value, treated as a process-style status in the range
 `0..255`. There are three outcomes:
 
-- `ret 0` — pass.
-- `ret 77` — skip: the test could not check anything on this host, so it
+- `ret 0`: pass.
+- `ret 77`: skip. The test could not check anything on this host, so it
   neither passes nor fails. It does not fail the run, and the runner counts it
   apart from the passes.
-- any other `ret N` with `N` in `1..255` — fail, reported as `(exit N)`.
+- any other `ret N` with `N` in `1..255`: fail, reported as `(exit N)`.
 
 Falling off the end of the body returns `0` (the default terminator for a
 non-void function is a zero return), so a body that never returns explicitly
-is treated as a pass. `77` is the skip status automake, meson and TAP use; std's
+is treated as a pass. `77` is the skip status automake, meson and TAP use. std's
 panic and `os.abort` exit with `255`, so a crash never reads as a skip.
 
 The result is the test process's exit status, and a process exit status is
@@ -113,19 +114,20 @@ ends:
 
 - A `ret` in a test body whose value is a literal (or a literal-shaped
   expression: a negated literal, or an arithmetic expression over literals)
-  outside `0..255` is a compile error located at the `ret`, naming the value:
-  `test result 256 is outside the status range 0..255`. An ordinary function
-  returning the same value is unaffected; only test bodies carry the range.
-- A result computed at run time that lands outside `0..255` — a bit mask that
-  has grown past eight bits, a negative code — is folded by the dispatcher to
+  outside `0..255` is the compile error `test.status_range`, located at the
+  `ret` and naming the value: `test result 256 is outside the status range
+  0..255`. An ordinary function returning the same value is unaffected. Only
+  test bodies carry the range.
+- A result computed at run time that lands outside `0..255`, such as a bit mask that
+  has grown past eight bits or a negative code, is folded by the dispatcher to
   `255` before the process exits. It is reported as `(exit 255)` and is
   always a failure. The low eight bits are never used on their own, so a
   result of `256` cannot read as a pass.
 
 Within the range the compiler attaches no meaning to any code but `0` and
-`77`, nor does it provide built-in assertion or skip intrinsics. A test signals failure by returning non-zero — typically by
+`77`, nor does it provide built-in assertion or skip intrinsics. A test signals failure by returning non-zero, typically by
 returning early from a failed check, as in the example above. A test that
-accumulates a bit mask must keep it within eight bits; past that, return
+accumulates a bit mask must keep it within eight bits. Past that, return
 the ordinal of the first failing check instead.
 
 ### Collection across modules
@@ -138,7 +140,7 @@ artifact's normal entry and runs each test through it in its own process.
 By default collection is scoped to the current project's own modules: tests
 declared in dependency modules are excluded, so a library's own suite never
 runs (or fails) as part of your project's `mach test`. Pass `--include-deps`
-to collect dependency tests as well — useful when working on a dependency
+to collect dependency tests as well, which is useful when working on a dependency
 in-tree. `--filter` narrows the run by qualified name in either mode.
 
 ## The `mach test` workflow
@@ -148,11 +150,11 @@ artifact's objects exactly as `mach build` does, adds a test object beside each
 module that declares tests, links one test **dispatcher** executable covering
 the selected tests, then runs each of them as its own process
 (`<exe> <index>`), captures its output, times
-it, and renders a per-module readout as the tests finish — collapsing
+it, and renders a per-module readout as the tests finish, collapsing
 all-passing modules to a single roll-up line and expanding any module with a
 failure to show the failing test's captured output and location. What `-v` and
 `-vv` add, and the order lines come out in, is the [readout](readout.md). The
-full flag reference is `mach help test`; the options that select and shape a
+full flag reference is `mach help test`, and the options that select and shape a
 run are:
 
 ```
@@ -171,7 +173,7 @@ A roll-up is `<module>  <ok> ok[  <skip> skip][  <fail> FAIL]  <duration>`, writ
 module's last test finishes, so roll-ups come out in the order modules finish.
 Each expanded failure shows `file:line`, the exit code (`(exit N)`), signal
 (`(signal N)`) or `(timed out after <duration>)`, the child's captured output
-indented beneath, and the exact `rerun:` command; a passing or skipped test
+indented beneath, and the exact `rerun:` command. A passing or skipped test
 stays quiet. The run closes with a summary that re-lists every failure in
 collection order, then the counts, with the skip count after the total
 whenever a test skipped:
@@ -185,13 +187,14 @@ failures:
 
 The exit code of `mach test`:
 
-- `0` — every test that ran passed or skipped. A project that declares no
+- `0`: every test that ran passed or skipped. A project that declares no
   test runs none, reports `0 passed, 0 failed, 0 total` and exits `0`.
-- `1` — at least one test failed, was killed by a signal, or timed out; also a
-  user error such as an unknown flag.
-- `2` — a build or internal error before the tests could run, or a test that
-  failed for an infrastructure reason (the harness, not the test).
-- `3` — an environment failure before the tests could run: storage, or a file,
+- `1`: at least one test failed, was killed by a signal, or timed out. It is
+  also a user error, such as an unknown flag, a rejected manifest, or a source
+  the build refuses (a test body that does not compile).
+- `2`: an internal error of the compiler before the tests could run, or a test
+  that failed for an infrastructure reason (the harness, not the test).
+- `3`: an environment failure before the tests could run: storage, or a file,
   directory or process operation the machine refused.
 
 These are the codes every `mach` command shares. `test` only adds what `1`
@@ -206,9 +209,9 @@ app.parser#rejects_trailing_comma ./out/linux-x86_64/debug/obj/app/parser.test.o
 
 `--filter <substr>` selects before the dispatcher links, so the dispatcher
 holds only the selected tests and what they reach, and changing the filter
-relinks without recompiling. `--emit` is rejected under `mach test`
-(`option '--emit' is not applicable to 'test'; test always builds its internal
-test dispatcher`).
+relinks without recompiling. `--emit` is rejected under `mach test` with
+`cli.flag_inapplicable` (`'--emit' does not apply to test. test always builds
+its internal test dispatcher`).
 
 ### Timeouts
 
@@ -232,7 +235,13 @@ failures:
   app.main#spins  src/main.mach:4  (timed out after 1s)
 
 0 passed, 1 failed (1 timed out), 1 total  (1.0s)
+  unsupported 0, target unavailable 0, resource exhaustion 1, invalid injection 0
 ```
+
+The indented line after the counts breaks the run down by gate cause, and is
+written whenever any of those counts is non-zero. A timed-out test counts there
+as resource exhaustion, as it does in the `run_end` record's
+`resource_exhaustion` beside `timed_out`.
 
 `<duration>` is a positive integer followed by a unit: `ms`, `s`, `m` or `h`
 (`30ms`, `30s`, `5m`, `1h`). A bare number, a fraction, zero or any other
@@ -326,7 +335,7 @@ the runner's business, and `wine`, for one, passes the program's status through.
 `rerun:` line of a failure shows the whole launch command. A run that executed
 nothing exits `1`, naming the host, so a passing run always ran tests. A
 selection with nothing runnable on the host exits `0` under `--allow-unrunnable`,
-after building it and printing each skip line; a build failure still exits non-zero.
+after building it and printing each skip line, and a build failure still exits non-zero.
 
 An inline `test name { }` declaration in a module the artifact reaches runs
 with no further wiring, and that is the only way a test is placed: a test is
@@ -360,11 +369,11 @@ fails and otherwise returns `77` when any arm skipped.
 
 ## See also
 
-- [fun.md](fun.md) — functions; a test body is checked like a function body
-- [decorators.md](decorators.md#testing--test-only-declaration) — `#[testing]`
+- [fun.md](fun.md) - functions, and a test body is checked like a function body
+- [decorators.md](decorators.md#testing--test-only-declaration) - `#[testing]`
   for declarations that exist only for tests
-- [statements.md](statements.md) — `if`/`or`, `ret`, and the other
+- [statements.md](statements.md) - `if`/`or`, `ret`, and the other
   statements a test body uses
-- [files.md](files.md) — project layout the build (and `mach test`)
+- [files.md](files.md) - project layout the build (and `mach test`)
   discovers
-- [readout.md](readout.md) — what `mach test` writes, at each level, and when
+- [readout.md](readout.md) - what `mach test` writes, at each level, and when

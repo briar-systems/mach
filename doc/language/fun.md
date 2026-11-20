@@ -1,4 +1,4 @@
-# `fun` — function
+# `fun`: function
 
 A function takes typed arguments, optionally returns a typed value, and
 has a body of statements.
@@ -42,7 +42,7 @@ pub fun make_pair[T, U](a: T, b: U) Pair[T, U] {
 ## Generic type parameters
 
 Generic functions take type parameters in brackets `[T]`. There are no
-constraints; any type may be substituted. The compiler monomorphizes per
+constraints, and any type may be substituted. The compiler monomorphizes per
 unique type instantiation.
 
 Call sites supply the types explicitly:
@@ -63,7 +63,7 @@ ret apply(identity[i64], 42);          # passed as a callback
 ```
 
 A generic itself is a template rather than code, so a bare `identity` has no
-address and cannot be a value; only an instance can.
+address and cannot be a value. Only an instance can.
 
 ### A body is checked at each instantiation
 
@@ -89,6 +89,13 @@ fun sum[T](p: *T, n: u64) T {
     ret acc;
 }
 ```
+
+The literal takes `T` under the same rules as anywhere else. An integer literal
+is never implicitly a float, so `sum[f64]` is refused as `type.mismatch`
+(`expected f64, found i64`) at the call that asks for it, pointing at
+`var acc: T = 0;` in the body, just as `var x: f64 = 0;` is refused. A
+generic meant for floats too converts the literal, as `var acc: T = 0::T;`, which
+every numeric instance accepts.
 
 A type that genuinely does not support the operator is refused at the
 instantiation that asked for it, naming that type:
@@ -118,12 +125,16 @@ instantiates its own generics in its own tests.
 
 An instance asks for the instances its body calls, and those ask for theirs. A
 call whose arguments derive from its caller's parameters without being them
-(`f[*T]` from `T`, `f(n + 1)` from `n`, `f(x, va...)` from a pack) grows them, and
-a cycle of calls through such an argument asks for a new instance at every step.
+(`f[*T]` from `T`, `f(n + 1)` from `n`, `f(?a)` from an element `a` that `$each`
+binds over a pack) grows them, and a cycle of calls through such an argument
+asks for a new instance at every step. A spread cannot grow a pack, since `va...`
+must be the sole trailing argument and forwards the whole pack. A call that puts
+another argument into the callee's pack beside it, as `h(x, va...)` inside
+`fun h(va: ...)`, is refused as `call.spread`.
 
 - **A cycle no comptime gate stops is refused** before any of it is expanded, as
   `generic.growing_cycle` at the growing call, naming the templates on the cycle.
-  A gate is a comptime `$if` arm or an `$each`; a runtime `if` is not, since every
+  A gate is a comptime `$if` arm or an `$each`. A runtime `if` is not, since every
   instance of the caller compiles both of its branches.
 - **A cycle with a gate on it runs** as far as the gate lets it. There is no step
   or count limit: `$if ($is_pointer(T)) { ret peel[$pointee_of(T)](x); }` peels any
@@ -237,15 +248,15 @@ an enclosing comptime parameter, as `narrow(m + 200)` inside `fun wide($m: u8)`,
 is held to the type at each instance of the enclosing function, where `m` has a
 value.
 
-Comptime value parameters apply to function parameters only — not record
-fields, not other contexts.
+Comptime value parameters apply to function parameters only, never to record
+fields or any other context.
 
 ## Variadic packs
 
 A function with a trailing named pack parameter (`va: ...`) accepts a
 variable number of trailing arguments. The compiler monomorphizes the
-function once per distinct call-site type-list; the pack is consumed by
-`$each a in va` at compile time — there is no runtime `va_list`.
+function once per distinct call-site type-list. The pack is consumed by
+`$each a in va` at compile time, and no runtime `va_list` is involved.
 
 ```mach
 use std.print;
@@ -279,35 +290,23 @@ reference.
 
 ## Tail calls
 
-A build with `optimize = true` treats a call whose result the function
-returns unchanged, as in `ret f(a, b);`, as a tail call. A call to the function
-itself becomes a loop: the recursion runs in the stack of one frame at any
-depth. `ret f(n - 1) + x`, and the same with `*`, `|` or `^` on integers, is a
-loop too, with the pending operands carried in an accumulator. A call to any
-other function becomes a jump that hands the callee the caller's frame, so a
-chain of such calls, mutual recursion included, also runs in constant stack.
+A call is always a call. A call whose result the function returns unchanged, as
+in `ret f(a, b);`, is compiled as an ordinary call followed by a return, in
+every profile, `optimize = true` included. A call to the function itself is not
+turned into a loop and a call to another function is not turned into a jump, so
+each level of recursion, mutual recursion included, takes a frame of its own and
+the depth a recursion can reach is bounded by the stack. An algorithm that must
+run at any depth is written as a `for` loop.
 
-A call stays a call when the function has a `fin` pending at the `ret`, when
-the address of one of its locals escapes (to the callee or to any earlier
-call), when it runs inline assembly or is `#[naked]` or `#[constant_time]`, when a
-by-value argument is a copy the caller has to make, or when the callee takes
-more stack arguments than the caller received. A build with `optimize = false`
-makes no tail calls, and neither does one that skips the `tailrec` and `tailcall`
-passes.
-
-`debug = true` changes none of this: debug information is added to the same code. A
-debugger or unwinder therefore never sees the frame a tail call left. A
-backtrace taken inside the callee shows it directly below the caller's own
-caller, and a self tail call shows as the one frame of the loop, its parameters
-holding the current iteration's values. A local of the caller that holds the
-call's result reads as optimized out, since the caller never receives it.
+Since every frame stays on the stack, a debugger or unwinder sees each call in a
+backtrace, under `debug = true` and with any `optimize` setting.
 
 ## See also
 
-- [ext-fun.md](ext-fun.md) — body-less external functions
-- [variadics.md](variadics.md) — variadic pack parameter reference
-- [comptime-control.md](comptime-control.md) — `$if` inside function bodies, and
+- [ext-fun.md](ext-fun.md): body-less external functions
+- [variadics.md](variadics.md): variadic pack parameter reference
+- [comptime-control.md](comptime-control.md): `$if` inside function bodies, and
   the two regimes a generic body is checked under
-- [operators.md](operators.md) — the operator table an instance is checked against
-- [expressions.md](expressions.md) — function calls and generic
+- [operators.md](operators.md): the operator table an instance is checked against
+- [expressions.md](expressions.md): function calls and generic
   instantiation

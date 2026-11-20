@@ -177,8 +177,8 @@ before the loop.
 
 ## Comparison
 
-`==` `!=` `<` `>` `<=` `>=` — produce `u1` (`1` or `0`). Mach has no compiler
-`bool`; `bool` is a stdlib alias. Comparisons relate **mathematical
+`==` `!=` `<` `>` `<=` `>=` produce `u1` (`1` or `0`). `bool` is a stdlib
+alias, not a compiler type. Comparisons relate **mathematical
 values**, so the result is identical in either operand order:
 
 - **integer vs integer** — any signedness and width mix is legal and compares
@@ -448,8 +448,10 @@ depends on when the cast is evaluated:
 
 - **At compile time** the cast is refused (`comptime.cast_range`), the way a
   division by zero is, and the error names the value and the type. This holds
-  for every integer width and both signednesses: `300.5::u8`, `-1.0::u32` and a
-  NaN cast to `i32` in a constant expression are errors.
+  for every integer width and both signednesses: `300.5::u8`, `(-1.0)::u32` and a
+  NaN cast to `i32` in a constant expression are errors. The parentheses matter:
+  `-1.0::u32` is `-(1.0::u32)` ([Cast](#cast)), a negation of the in-range `1`
+  that wraps to `4294967295`.
 - **At run time** the cast saturates: a value below the type's minimum gives
   the minimum, one above its maximum gives the maximum, and a NaN gives 0, the
   same on every target.
@@ -458,15 +460,19 @@ depends on when the cast is evaluated:
 
 A compile-time float operation whose result is a NaN gives the NaN the target's
 own operation returns, by the rule mirl's target model states for the result's
-format: the canonical NaN on riscv with hardware floats, and the first NaN
-operand, quieted, on x86-64. Where the model gives no defined NaN result, a
-float operation whose result would be a NaN, arithmetic or a conversion between
-float widths, is not folded at compile time, so it is never miscompiled. SPIR-V
-is the case the target itself leaves unspecified: Vulkan defines no NaN result
-unless the module states a float-controls execution mode, and mach never states
-one. Every other refusal is a toolchain gap, a rule mirl does not state yet
-(aarch64's, binary16 on x86-64, and riscv without hardware floats), and it
-closes as mirl states the rule.
+format: the canonical NaN on riscv, with hardware floats or without, the first
+NaN operand, quieted, on x86-64, and on aarch64 the first signaling NaN operand,
+or else the first NaN operand, quieted. An invalid operation with no NaN operand gives the target's
+default NaN, negative on x86-64 and positive on aarch64. binary16 takes the rule
+of the format the target computes it in. Where the model gives no defined NaN
+result, a float operation whose result would be a NaN, arithmetic or a
+conversion between float widths, is not folded at compile time, so it is never
+miscompiled. SPIR-V and wasm32 are the targets that leave it unspecified: Vulkan
+defines no NaN result unless the module states a float-controls execution mode,
+and mach never states one, and WebAssembly lets the engine choose the NaN an
+operation returns. A format whose rule mirl's target model does not state yet
+is refused the same way, as a toolchain gap that closes when mirl states the
+rule.
 
 - **Where a constant is required**, a module `val`, an array length, a `$if`
   condition or a comptime argument, it has no value and is refused
@@ -474,8 +480,8 @@ closes as mirl states the rule.
   the target model states the NaN as unspecified or states no rule for the
   format yet. This holds for a NaN anywhere in the expression, so `$if` over a
   comparison of such a NaN is refused too.
-- **In a function body** on spirv the operation runs on the device, as it
-  would with operands known only at run time.
+- **In a function body** on spirv or wasm32 the operation runs on the device or
+  in the engine, as it would with operands known only at run time.
 
 `:~` is not an operation on the value, so a NaN read from its bits is a constant
 on every target.
@@ -543,6 +549,7 @@ because it is what the target's own conversion instruction does:
 | x86-64, aarch64 | keeps its sign and the top of its payload, with the quiet bit set |
 | riscv32, riscv64 | the canonical NaN, positive and quiet with an empty payload |
 | spirv | unspecified: a device may return any NaN |
+| wasm32 | unspecified: an engine may return any NaN |
 
 A conversion folded at compile time follows the build target's rule, so a folded
 `::` gives the bits the same `::` gives at run time on that target. Where the
@@ -636,7 +643,9 @@ the operation, its lane count and its lane type:
 
 ```
 warning[vector.scalarize] the vector divide over 4 lanes of 32-bit integers is split into scalar operations, because no vector unit of the target computes it
-  @ src/main.mach:12:9
+  @ src/main.mach:3:41
+3 | fun div(a: i32x4, b: i32x4) i32x4 { ret a / b; }
+  |                                         ^
 ```
 
 The warning says that what the source wrote as one vector operation is not one
@@ -658,8 +667,10 @@ the function and the operation, and stands at the operation's site where the
 build records one:
 
 ```
-error[vector.scalarize_refused] 'req.main.div32' has a vector divide over 4 lanes of 32-bit integers that no vector unit of the target computes, so `simd = "require"` refuses its scalar expansion
-  @ src/main.mach:12:9
+error[vector.scalarize_refused] 'example.main.div' has a vector divide over 4 lanes of 32-bit integers that no vector unit of the target computes, so `simd = "require"` refuses its scalar expansion
+  @ src/main.mach:3:41
+3 | fun div(a: i32x4, b: i32x4) i32x4 { ret a / b; }
+  |                                         ^
 ```
 
 An operation no target has an instruction for, as an integer vector divide,

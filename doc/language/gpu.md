@@ -22,8 +22,8 @@ argument names the stage and the set is closed:
 | `"fragment"` | fragment (pixel) shader   |
 | `"compute"`  | compute shader            |
 
-An unrecognized value is a compile error, not a module that quietly forms no
-stage.
+An unrecognized value is a compile error (`decorator.argument`), not a module that
+quietly forms no stage.
 
 ```mach
 #[gpu.stage("vertex")]
@@ -36,7 +36,8 @@ fun fragment_main() {}
 A staged function **takes no parameters and returns nothing**. A pipeline stage
 does not have a caller: its inputs arrive through input interface variables and
 its results leave through output ones, so there is no argument list or return
-value to carry them. A `spirv` build rejects a staged function with either.
+value to carry them. A `spirv` build rejects a staged function with either, with
+`spirv.stage_signature`.
 
 The decorator is accepted on every target, because which target a module is built
 for is not a property of its source. Only a target that has pipeline stages acts
@@ -53,7 +54,8 @@ reaches through every function it calls, wherever that function is written. A
 stage and no external linkage at all, since a Vulkan consumer refuses a module
 carrying linkage, and a `module` that holds no stage is refused. An `object` artifact
 is a library module: its one object keeps the `Linkage` capability and publishes each
-function as a linkage export, so a later link that joins it to other prebuilt modules
+function that is not an entry point as a linkage export, so a later link that joins it
+to other prebuilt modules
 can find it, and no Vulkan consumer takes it as it is. Adding a `#[gpu.stage(...)]` to
 a source does not change which of the two a build makes.
 
@@ -77,10 +79,11 @@ comptime integers giving the x, y and z dimensions.
 fun compute_main() {}
 ```
 
-It requires a stage on the same function — without one it would silently mean
-nothing — and it applies only to the compute stage. When it is omitted, a compute
-stage takes the single-invocation default `(1, 1, 1)`; the dimensions are always
-declared in the emitted module, since a compute stage that does not state its
+It requires a stage on the same function, since without one it would silently mean
+nothing, and it applies only to the compute stage. Each is refused with
+`decorator.requires`. When it is omitted, a compute stage takes the
+single-invocation default `(1, 1, 1)`. The dimensions are always declared in the
+emitted module, since a compute stage that does not state its
 workgroup size is not one a consumer can dispatch.
 
 Any dimension may instead name a `#[gpu.spec]` var (see
@@ -113,8 +116,9 @@ to any size. Give the stages one workgroup or put them in separate modules.
 A pipeline stage does not receive its inputs or return its results through a call.
 It reads and writes **module-scope variables** that the pipeline binds, and these
 decorators say which kind each variable is. They apply only to module-level
-`val` / `var` bindings, and a variable carries **exactly one** of them — they
-are mutually exclusive. `gpu.spec`, described in its own section below, is one of
+`val` / `var` bindings, and a variable carries **exactly one** of them, since they
+are mutually exclusive. A second one is refused with `decorator.conflict`.
+`gpu.spec`, described in its own section below, is one of
 them too.
 
 ```mach fragment
@@ -158,8 +162,8 @@ location carries. The accepted set is closed:
 | `"subgroup_id"`            | the subgroup's index in its workgroup  | `u32`   | read      | compute  |
 | `"num_subgroups"`          | subgroups in the workgroup             | `u32`   | read      | compute  |
 
-The direction is a property of the built-in, not something you restate — a stage
-writes its position and reads what the pipeline hands it — so there is no
+The direction is a property of the built-in, not something you restate. A stage
+writes its position and reads what the pipeline hands it, so there is no
 input/output marker to pair with `gpu.builtin`, and none that could disagree with it.
 
 The **type** is a property of the built-in too, and it is a requirement rather
@@ -205,7 +209,7 @@ rejected in a `gpu.uniform` one there. Vulkan 1.2 requires `uniformBufferStandar
 of every device, under which a uniform block takes the storage buffer's rules, so under
 `vulkan1.2`, `vulkan1.3` and with no `env` a uniform block follows the std430-shaped
 rules too. Both place a vector at a multiple of its own alignment, twice its
-lane's for two lanes and four times for three or four; under `vulkan1.1` and later,
+lane's for two lanes and four times for three or four. Under `vulkan1.1` and later,
 and with no `env`, whose relaxed block layout Vulkan 1.1 took into its core, a vector
 member may sit at any multiple of its lane's size that keeps it within one 16-byte
 line. `vulkan1.0` holds no relaxed layout. The refusal names the
@@ -546,8 +550,9 @@ SPIR-V and Vulkan both admit an initializer on an Output variable.
 
 As with `#[gpu.stage(...)]`, these are accepted on every target and acted on only by a
 target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in the
-matching storage class, carrying the matching decoration, and the Input and Output
-variables are named in every entry point's interface list. A binding's class is
+matching storage class, carrying the matching decoration, and each entry point's
+interface list names the Input and Output variables that stage reaches, directly or
+through the functions it calls. A binding's class is
 decided by its role and the type it holds. A `gpu.sampler` binding, which holds a
 sampler or a sampled image, and a `gpu.storage` binding that holds a storage image
 become `OpVariable`s in the `UniformConstant` class, the one class Vulkan permits a
@@ -643,7 +648,7 @@ compiler treats it:
   value, or copy it into a local and take that address.
 
 The type must be a scalar integer or float. There is no boolean specialization
-constant, because mach has no boolean type the compiler knows: `bool` is an alias
+constant, because the compiler knows no boolean type: `bool` is an alias
 of `u1`. Write a flag as an integer spec var, which the host sets with the same 4
 bytes as a `VkBool32`:
 
@@ -826,7 +831,7 @@ either model, since Vulkan defines no sequentially consistent order
 
 A control barrier must be reached in **uniform control flow**: every
 invocation of its execution scope executes it, or none does. That is the
-program's obligation, as it is in GLSL and WGSL, because whether a branch is
+program's obligation, because whether a branch is
 uniform is not statically decidable in general. The compiler does not check
 it, and a barrier inside a branch or loop that some invocations of the scope
 skip is undefined behavior on the device.
@@ -869,7 +874,7 @@ checked at the call, where the literal's value is known:
 | a value whose operands the declaration does not pass, or passes without it | `op.operand_value`, naming the count |
 | a parameter the value's operand kind does not admit     | `op.signature`, naming the operand |
 | a requirement's extension the target does not select   | `spirv.capability`, naming the extension |
-| a capability whose SPIR-V version the environment is below | `spirv.capability`, naming the first `env` that reaches it |
+| a capability whose SPIR-V version the environment is below | `spirv.capability`, naming the SPIR-V version it needs, as `spv1.3` |
 
 A device feature is an extension the target names in its `ext` once the
 consumer enables it, since no environment guarantees it: `GroupNonUniformArithmetic` is
@@ -1128,13 +1133,13 @@ pub fun subgroup_shuffle_xor(scope: u32, v: u32, mask: u32) u32;
 `OpExtInstImport "GLSL.std.450"` is emitted **once per module and only when that
 module uses the set**. A module that calls none of these carries no import.
 
-Note that `dot` is **core `OpDot`**, not a GLSL.std.450 instruction, even though
-GLSL spells it beside `normalize` and `length`. Check each function against the
-specification rather than against GLSL's surface.
+Note that `dot` is **core `OpDot`**, not a GLSL.std.450 instruction, while `normalize`
+and `length` are the extended set's `Normalize` and `Length`. Check each function's
+set against the specification.
 
 On every target other than `spirv` the decorator is inert, and a decorated function
-is an ordinary function. A **bodiless** one — which is what the shader-side maths
-library uses — is then an undefined symbol, so a CPU build that calls it fails at
+is an ordinary function. A **bodiless** one, which is what the shader-side maths
+library uses, is then an undefined symbol, so a CPU build that calls it fails at
 link time naming the symbol. That is a deliberate design choice on the library's
 part, not a property of the decorator: a decorated function may have a body, and if
 it does, that body is what every non-`spirv` target runs while `spirv` substitutes
@@ -1296,6 +1301,6 @@ are masc's extension catalog (`src/isa/spirv/extension.mach`).
 
 ## See also
 
-- [decorators.md](decorators.md) — the decorator set and where each decorator applies
-- [manifest.md](manifest.md#finished-module-targets) — the `spirv` target, its environments and its device features
-- [types.md](types.md) — the vector types a shader stage computes over and the handle types `handle` declares
+- [decorators.md](decorators.md): the decorator set and where each decorator applies
+- [manifest.md](manifest.md#finished-module-targets): the `spirv` target, its environments and its device features
+- [types.md](types.md): the vector types a shader stage computes over and the handle types `handle` declares

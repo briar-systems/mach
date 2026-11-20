@@ -3,13 +3,13 @@
 Mach source-level documentation uses `#` comments immediately above
 declarations. Each docstring is one summary followed by an optional
 component block. `mach doc` renders them, and the compiler's docstring lint
-checks the component block of every `pub fun`, `pub rec`, `pub uni`, and `pub tag`
-against the declaration it documents.
+checks the component block of every `pub fun` (an `ext fun` included), `pub rec`,
+`pub uni`, and `pub tag` against the declaration it documents.
 
 A docstring states **what** a declaration is and **how** it is used, and a
 module's docstring states the contract the module holds its callers to. The
 language, command and manifest references under `doc/` say what the user
-sees; when something changed belongs in the changelog. Documentation never
+sees, and when something changed belongs in the changelog. Documentation never
 changes generated code.
 
 ## Grammar
@@ -27,10 +27,10 @@ changes generated code.
   of the docstring. `mach doc` shows the summary beside the name wherever it
   lists one (see [What `mach doc` writes](#what-mach-doc-writes)).
 - **Separator.** `# ---` is present when one or more component lines
-  follow; absent when the docstring is summary-only.
+  follow, and absent when the docstring is summary-only.
 - **Component lines.** Each is `# <component>: <description>`. One line
   per element the declaration exposes, in declaration order. A component
-  head has zero or one space between `#` and the name; a line with two or
+  head has zero or one space between `#` and the name, and a line with two or
   more spaces after `#` is a continuation of the previous description, which
   is how a long description wraps.
 - Prose is lowercase except for proper nouns and type names.
@@ -52,7 +52,7 @@ changes generated code.
 For a `pub fun`, `pub rec`, `pub uni`, or `pub tag` whose docstring has a component
 block, every component line must name an element of that declaration, carry
 a description, and appear in declaration order (generics, then parameters,
-fields, or cases, then `ret` for functions). Each violation is a warning naming the line:
+fields, or cases, then `ret` for functions). Each violation is a `doc.lint` warning naming the line:
 
 ```
 documented component matches no parameter, field, generic, or `ret` of this declaration
@@ -60,7 +60,8 @@ documented component has no description
 documented components are out of declaration order
 ```
 
-Tags have no return value, so a `ret:` component line on a tag is warned. A bare
+Tags have no return value, so a `ret:` component line on a tag is warned, and so is one on
+a record, a union, or a function declared with no return type. A bare
 generic name without brackets (such as `T:` instead of `[T]:`) is also warned.
 
 Like every warning, the lint's warnings show for the project being built,
@@ -191,7 +192,7 @@ pub tag Outcome[E]: u8 {
 
 Cases appear in declaration order after generic parameters. Tags have no return
 value, so `ret:` is warned. Undocumented cases are permitted, but any documented
-case must exist on the tag; `doclint` warns at the component otherwise:
+case must exist on the tag, and the lint warns at the component otherwise:
 
 ```mach
 # a unit outcome with a typed failure
@@ -249,7 +250,8 @@ var calls: i64 = 0;
 nothing more, so the reference is the same on every host, needs no target
 (`-t` and `-a` are refused) and is written for a project whose dependencies
 are not pulled. A file that does not parse refuses the run. It writes markdown
-into `doc/<project id>/` (`<dir>/<project id>/` with `-o <dir>`), a directory
+into `doc/<project id>/` (`<dir>/<project id>/` with `-o <dir>`, where `<dir>` is
+a relative path inside the project root with no `.` or `..` component), a directory
 it owns: a page it did not write in the run, such as one whose file is gone,
 is removed, and so is a directory left empty. Nothing outside that directory
 is written.
@@ -271,16 +273,16 @@ is written.
   constants that belong to it: a function belongs to the first of its
   parameters whose type names a type the module declares (through pointers,
   `^`, arrays and generic arguments), or failing that to a type its return
-  type names (through `res`, `opt`, `err` and pointers); a constant belongs to
+  type names (through `res`, `opt`, `err` and pointers). A constant belongs to
   the type it is declared with. What belongs to no type follows under
   Functions, Constants, Variables and Forwards.
 
 An entry shows its declaration in a code block, a record with its fields and
 a function without its body, with its decorators above it as the source has
-them. A type the source spells through an import alias is written with the
+them, all but `#[deprecated]`, which becomes the entry's deprecation paragraph. A type the source spells through an import alias is written with the
 path of the module the alias names in place of the alias (`*A.Allocator`
 reads `*std.allocator.Allocator`), and a name the source writes bare stays
-bare; the source's line breaks and alignment are kept. An alias is what the
+bare. The source's line breaks and alignment are kept. An alias is what the
 file's `use` lines bind, a `use` inside a `$if` arm binding under that arm's
 condition. Every `$if` arm is read: a name several arms declare is one entry
 with a code block per arm. Then comes its whole docstring.
@@ -296,12 +298,13 @@ standing alone in a later arm reads exactly: "Only where `c` and not `a` nor
 `b`". A `#[deprecated]` declaration
 has a paragraph beginning **Deprecated:** with its message. Component lines
 become a table: a function's parameters with `ret` as its returns row, a
-type's fields or cases with their types. Constants are a table of name,
-value and summary.
+type's fields or cases with their types. Constants are a table of name, type,
+value and summary, and the constants that belong to a type a table of name,
+value and summary under that type.
 
 A `fwd` is an entry under the name it exports. Its alias and name are read
 the same way, and the declaration it forwards is found by name in that
-module's own file when the module is in the project; a forward of a forward
+module's own file when the module is in the project. A forward of a forward
 is followed link by link. When the alias is bound to a different module in
 each arm, the entry lists every module that provides it, in order, each under
 its own condition and linked, and shows the forwarded declaration once when every
@@ -333,7 +336,7 @@ the declaration is on its own, and the explanation belongs after it.
 A comment that is not directly above a declaration is an ordinary comment.
 Comments are brief, lowercase, and single-line, and appear only where the
 code is not self-evident. There are no sectional or separator comments. A
-line comment that begins `#[` with no space opens a decorator; write such a
+line comment that begins `#[` with no space opens a decorator, so write such a
 comment as `# [...]`.
 
 ## See also

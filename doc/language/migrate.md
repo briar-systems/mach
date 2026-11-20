@@ -1,14 +1,16 @@
 # Migrating a project
 
-`mach migrate [<path>] [--check]` moves a project from the previous major to the
+`mach migrate <path> [--check]` moves a project from the previous major to the
 current one. It rewrites the root project's `mach.toml`, then every source file
-under its `[project].src`, and reports what it cannot rewrite.
+under its `[project].src`, and reports what it cannot rewrite. Each file it rewrites
+is named on its own line.
 
 - It is idempotent: a migrated project changes nothing.
 - `--check` writes nothing and prints each change as a unified diff with no
   context lines, so CI can confirm a project is migrated. Each hunk header names
-  the change's line numbers and, after the `@@`, the table it sits in, as
-  `@@ -29,3 +29,3 @@ [target.darwin-aarch64]`. The output applies with
+  the change's line numbers, and in the manifest, after the `@@`, the table it sits
+  in, as `@@ -29,3 +29,3 @@ [target.darwin-aarch64]`. A source file's hunk header
+  names only the line numbers. The output applies with
   `patch -p0` from the directory `mach migrate` ran in.
 - It works on the root project only. Dependencies under `dep/` belong to other
   projects and are never edited, and one still on the previous major is reported.
@@ -43,9 +45,9 @@ compared with the removed options:
 
 Not recognised: mach reached through any other variable or alias, a command word
 after `exec`, `env`, `time`, `sudo`, `if` or another prefix, a function or script
-that wraps mach, a here-document, and a file that is not a script by the rules
-above. An option in another program's words, as `cc -O2`, or in a comment is never
-reported.
+that wraps mach, and a file that is not a script by the rules above. A here-document
+is not recognised as one: its lines are read as commands like any other line. An
+option in another program's words, as `cc -O2`, or in a comment is never reported.
 
 ## Exit code
 
@@ -55,7 +57,9 @@ reported.
   writes a removed key no rewrite migrates, each one reported, or a source could
   not be read as source. The manifest reader refuses such a project, so the input
   is what is wrong. So does a system library 6 found that the manifest does not
-  yet say how 7 finds, each one reported, since the link refuses it.
+  yet say how 7 finds, each one reported, since the link refuses it. A missing or
+  invalid path, or a migrated manifest the reader refuses, also exits `1`, as for
+  every command.
 - `2` and `3`: an internal or environment failure, as for every command.
 
 ## The changes from 6 to 7
@@ -64,7 +68,8 @@ Rewritten by `mach migrate`:
 
 | 6 | 7 |
 |---|---|
-| `opt` | `optimize` |
+| `opt = 0` | `optimize = false` |
+| `opt = 1` or `opt = 2` | `optimize = true` |
 | `float_reassoc = true` | `relax = ["float-reassoc"]` |
 | `float_reassoc = false` | removed: float arithmetic is exact unless a profile relaxes it |
 | `vectorize = true` or `vectorize = false` in a profile | removed: `optimize` schedules the pass, and `#[vectorize("never")]` opts one function out |
@@ -96,23 +101,27 @@ Rewritten by `mach migrate`:
 | `[project] mach` on the previous major | `^7`, the range `mach init` writes |
 | `fwd.instances`, `debug.dropped`, `target.default_deprecated`, `target.native_fallback` in a profile's `allow` | removed: 7 never raises these warnings |
 
-Reported, for you to change:
+Left for you to change:
 
 | 6 | 7 |
 |---|---|
 | a condition of type `u8`, as `if (flags & 1)` | a `u1`, as `if ((flags & 1) != 0)` |
-| a `u1` stored in a `u8` or under arithmetic | `value::u8`, or a `u1` destination |
+| a `u1` stored in a `u8`, under arithmetic, a shift or `~`, or beside a wider operand of `&`, `\|` or `^` | `value::u8`, or a `u1` destination |
 | `-g`, `-O0`, `-O2`, `--emit-asm`, `--emit-ir`, `--pie`, `--simd`, `--jobs`, `--arch`, `--sys`, `--of`, `--platform`, `--subsystem`, `--base`, `--stack-reserve`, `--stack-commit`, `-d`, `-e`, `-s` in a script, or in a step's `argv` other than `--jobs` | the spelling the report names |
 | a linux target with no `env` that an artifact links a `source = "system"` entry on, which 6 found in the gnu environment's directories | `env = "gnu"` on the target, under which a `bin` links `pie` unless its `linkage` says otherwise, so the report names the target and the entry |
 | a darwin `source = "system"` shared entry named by no install name, as `name = "MoltenVK"`, whose file 6 found and linked by the install name it states | the install name, as `name = "@rpath/libMoltenVK.dylib"` or an absolute path, which 7 links from the entry's claim with no file |
 
-The compiler refuses the first two, naming the replacement. So does the manifest
-reader for a removed key with no mechanical rewrite: a link's `library`, which
-the table key replaces, and a profile's `pass` and `skip`. A table that writes
-such a key still gets every other rewrite, and the key is reported once. The link
-refuses the last two: neither has one answer migrate can write,
-since `env` changes how every `bin` of the target links and the install name is the
-library's own. A report names the line of the table it is about.
+The compiler refuses the first two, and `mach migrate` reports the third. A `u8`
+condition is refused as `condition.type` and a `u1` under an operator as
+`type.mismatch`, each naming the replacement. A `u1` stored in a `u8` is refused as
+a plain `type.mismatch`, `expected u8, found u1`. The manifest reader refuses a
+removed key with no mechanical rewrite, and `mach migrate` reports each one with
+its line: a link's `library`, which the table key replaces, a profile's `pass` and
+`skip`, an `opt` other than `0`, `1` or `2`, and a step's `cmd` and `shell`, which
+`argv` replaces. A table that writes such a key still gets every other rewrite, and
+the key is reported once. The link refuses the last two: neither has one answer
+migrate can write, since `env` changes how every `bin` of the target links and the
+install name is the library's own. A report names the line of the table it is about.
 
 New in 7, with nothing to migrate: [`u1`](types.md), [`$zeroize`](comptime-intrinsics.md)
 and the [selection heads](asm.md) of `asm`.

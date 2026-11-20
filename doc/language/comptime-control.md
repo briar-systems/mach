@@ -1,7 +1,7 @@
-# `$if` / `$or` — comptime control flow
+# `$if` / `$or`: comptime control flow
 
 `$if` and `$or` branch on comptime-evaluable conditions. Only the taken
-branch compiles — the discarded branches are not resolved, type-checked,
+branch compiles. The discarded branches are not resolved, type-checked,
 or emitted into the binary. This is fundamentally different from runtime
 `if` / `or`, which generates a branch at runtime.
 
@@ -22,8 +22,8 @@ $or {
 The condition must be a comptime expression. Common shapes:
 
 - `$mach.*` reads for target / build conditions
-- Comparisons of comptime constants (`pub val` declarations)
-- Comparisons of a comptime function parameter (`$mode`) — see below
+- Comparisons of comptime constants (`val` declarations)
+- Comparisons of a comptime function parameter (`$mode`), see below
 
 A condition is a `u1`, and a constant it reads has the width and sign its
 declaration gives it. A constant declared through a `def`, as std's `bool` is
@@ -31,17 +31,22 @@ declaration gives it. A constant declared through a `def`, as std's `bool` is
 across `use` and `fwd`, so `$if (capability.HAS_FILES)` reads a `u1`. Any other integer is refused
 with `gate.not_u1`. A chain
 that ends outside the integers (a record, a pointer, a float) is refused at the
-gate with a message naming the chain. A `def` declared inside a `$if` arm is not
+gate with `gate.const_not_integer`, in a message naming the chain. A `def` declared inside a `$if` arm is not
 read this way: a declaring gate on a constant typed through one is decided once
 types are checked.
 
 A comptime comparison or arithmetic relates the **mathematical values** of its
 operands, exactly as the runtime operators do (see
 [operators.md](operators.md)). A constant in `2^63 .. 2^64-1` is its true
-unsigned magnitude, so `$if (0xFFFFFFFFFFFFFFFF > 0)` is taken and a cross-sign
-comparison agrees with the runtime `if` — `$if (X < Y)` never selects a branch
-that `if (X < Y)` would not. Comptime arithmetic that overflows the value's
-range is a compile error rather than a silent wrap.
+unsigned magnitude, so `$if (0xFFFFFFFFFFFFFFFFu64 > 0)` is taken and a cross-sign
+comparison agrees with the runtime `if`: `$if (X < Y)` never selects a branch
+that `if (X < Y)` would not. A gate's literal is typed as any literal is (see
+[literals.md](literals.md)): an unsuffixed literal with no typed context is
+`i64`, so the magnitude above needs its suffix. Comptime arithmetic computes the
+exact result and never wraps to an operand's width: with `val Z: u8 = 255`,
+`$if (Z + 1 > 255)` is taken. A result outside the 128-bit range the
+evaluator works in (`i128`, or `u128` when an operand is unsigned) is refused
+with `comptime.overflow` rather than wrapped.
 
 ## Examples
 
@@ -49,10 +54,10 @@ range is a compile error rather than a silent wrap.
 
 ```mach fragment
 $if ($mach.build.sys == $mach.sys.linux) {
-    use full.os.linux;
+    use std.system.os.linux;
 }
 $or ($mach.build.sys == $mach.sys.windows) {
-    use full.os.windows;
+    use std.system.os.windows;
 }
 $or {
     $error("unsupported OS");
@@ -95,8 +100,9 @@ fun main(argc: i64, argv: **u8) i64 {
 Rules:
 
 - The argument bound to a `$`-parameter must be a compile-time constant at the
-  call site (a literal, a `pub val`, or another comptime parameter); a runtime
-  value is rejected with `comptime argument is not a compile-time constant`. A
+  call site (a literal, a `val` constant, or another comptime parameter). A runtime
+  value is rejected with `comptime.argument_not_constant` (`comptime argument
+  is not a compile-time constant`). A
   cross-module constant works, whether imported by bare name or as a qualified
   member (`alias.CONST`).
 - Each arm gate of a comptime-parameter `$if` must itself be comptime-foldable:
@@ -106,21 +112,25 @@ Rules:
   and with `gate.not_constant` when it has no compile-time value for another
   reason, such as a call.
 - A comptime parameter has no storage, so its address cannot be taken
-  (`?$mode` is rejected with `cannot take the address of a comptime parameter`).
+  (`?mode` is rejected with `address.comptime_param`, `cannot take the address
+  of a comptime parameter`).
 - A comptime-parameter function is a template, not a value: it can only be
-  called, not assigned, passed, or compared (`val fp = apply;` is rejected with
-  `cannot reference a comptime-parameter function as a value`).
+  called, not assigned, passed, or compared (`val fp: fun(i64) i64 = apply;` is
+  rejected with `comptime.param_fn_value`, `cannot reference a comptime-parameter
+  function as a value`).
 - Comptime parameters carry no runtime cost: they are stripped from the lowered
   signature and ABI, so only the runtime parameters are passed.
 - A comptime parameter may be mixed freely with runtime parameters in any order.
 - A comptime parameter on a **generic** function (`fun f[T]($mode: u8, ...)`) is
-  refused: a function has type instances or value instances, never both, and
-  the declaration is reported as `comptime value parameters on a generic
-  function are not yet supported`.
+  refused: a function has type instances or value instances, never both. The
+  refusal stands at each call, which is reported as
+  `generic.comptime_value_param` (`comptime value parameters on a generic
+  function are not yet supported`). Like any generic, a declaration nothing
+  calls is not type checked and reports nothing.
 - The function may live in any module: a value-parameter instance is emitted
   against its declaring module and folds its `$if` gates against that module's
   own comptime constants, so a library can export a comptime-parameter function
-  gated on its own `pub val`s.
+  gated on its own `val`s, private ones included.
 - A comptime parameter may gate per-target asm safely, since each instance only
   compiles its taken arm:
 
@@ -279,14 +289,14 @@ documents a module a build would refuse.
 
 A `$if` branch that isn't taken is entirely absent from the compiled
 output. For a target- or constant-gated `$if`, the compiler doesn't even
-resolve names inside the untaken branches — this is the mechanism that makes
+resolve names inside the untaken branches. This is the mechanism that makes
 per-target asm blocks safe even when one block references registers the other
 backend doesn't know about.
 
 Inside a function body, a gate that names a constant from another module (for
 example `$if (capability.HOSTED) { ... }`) is decided during type checking, after
 names are resolved. Its arms are read the same way: a name that doesn't exist in
-an arm the gate discards is never reported, exactly as with C's `#if`. A name
+an arm the gate discards is never reported. A name
 that doesn't exist in the arm the gate **selects** is reported as an ordinary
 `unresolved identifier` or `unresolved type name` error, once, however many times
 the enclosing function is instantiated. So such an arm may name what only exists
@@ -294,11 +304,16 @@ on the targets that select it.
 
 ```mach fragment
 use capability: std.system.capability;
+use io_error: std.io.error;
+
+$if (capability.HOSTED) {
+    use std.system.os;
+}
 
 fun field_token(c: *Cursor, error: io_error.Error) {
     $if (capability.HOSTED) {
-        # names that only a hosted target provides
-        put_quoted(c, io_error.message(error));
+        # `os` is imported only on a hosted target
+        put_quoted(c, os.message(error));
     }
 }
 ```
@@ -337,8 +352,10 @@ fun use_it(x: u64) u64 {
 A `$if` gated on a `$type_of` type comparison is *not* such an exception: at
 monomorphization the operand's concrete type is known, so the provably-dead arms
 are **pruned** and only the selected arm is type-checked (and emitted). Each arm
-may therefore use its value at its own concrete type with no per-arm cast — see
-[comptime-intrinsics.md](comptime-intrinsics.md).
+may therefore use its value at its own concrete type with no per-arm cast (see
+[comptime-intrinsics.md](comptime-intrinsics.md)). Names are still resolved in
+every arm, so a name that does not exist is reported even in an arm no
+instantiation selects.
 
 Such a chain is decided only at an instantiation. While the operand's type still
 names a generic parameter no arm is selected and none is type-checked, so a `!=`
@@ -355,7 +372,7 @@ the only thing a reader has to hold.
 
 | the question | when it is answered | what is checked |
 |---|---|---|
-| a `$if` gated on a comptime **value parameter** | per call site | **all** arms, structurally, before any is selected; its gates and the `$error`s of the selected arm, per instance |
+| a `$if` gated on a comptime **value parameter** | per call site | **all** arms, structurally, before any is selected, and its gates and the `$error`s of the selected arm, per instance |
 | a `$if` gated on a `$type_of` or a type predicate | per instantiation | only the arm that instantiation selects |
 | an operator, cast, `:~`, literal or condition on a **type parameter** | per instantiation | the whole body, once per distinct instantiation |
 
@@ -369,14 +386,15 @@ no concrete type to decide it against: a gate waits for the instantiation, and s
 does every operator. The template types the body so each instance and the lowering
 have an expression table to read, and reports nothing of its own. A refusal
 belongs to the instantiation that asked for the instance and names that instance's
-concrete type — see [fun.md](fun.md).
+concrete type (see [fun.md](fun.md)).
 
 The consequence is worth stating plainly: a generic that nothing instantiates is
-not checked at all.
+not type checked at all. Only name resolution runs over it, so an unresolved
+name in its body is still reported.
 
 ## See also
 
-- [comptime-mach.md](comptime-mach.md) — `$mach.*` for target reads
-- [asm.md](asm.md) — `asm` blocks gated by `$if`
-- [statements.md](statements.md) — runtime `if` / `or` counterpart
-- [fun.md](fun.md) — generic type parameters and per-instance checking
+- [comptime-mach.md](comptime-mach.md): `$mach.*` for target reads
+- [asm.md](asm.md): `asm` blocks gated by `$if`
+- [statements.md](statements.md): runtime `if` / `or` counterpart
+- [fun.md](fun.md): generic type parameters and per-instance checking

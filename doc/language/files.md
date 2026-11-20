@@ -10,7 +10,7 @@ scaffolds `src/bin/main.mach` for a binary and `src/lib/<id>.mach` for a
 library.
 
 An artifact's build is rooted at its entry module and follows `use` and `fwd`
-edges from there; a file under `src` that no entry reaches is not part of that
+edges from there. A file under `src` that no entry reaches is not part of that
 artifact, under `mach build`, `mach check` and `mach test` alike, so a test
 runs only in a module an entry reaches (see [test.md](test.md#which-tests-run)).
 
@@ -37,7 +37,9 @@ image there and never at `main`. The runtime's entry decodes `argc`/`argv`,
 calls whatever function exports `main`, and terminates the process with its
 returned exit code, so `main` is kept by that call like any other function.
 `use std.runtime;` is **required** to link the entry into the binary, even
-though no code references it by name.
+though no code references it by name. Without it the link is refused with
+`link.input_invalid`, "the link does not define the entry symbol `_start`" on
+linux.
 
 Only the exported `main` symbol is what the runtime calls, and the Mach-level
 function name is irrelevant, so `fun entry(...)` tagged `#[symbol("main")]` works identically.
@@ -45,8 +47,8 @@ function name is irrelevant, so `fun entry(...)` tagged `#[symbol("main")]` work
 ## mach.toml
 
 The project manifest. It declares the project's identity, its targets, its
-profiles, its artifacts, and its dependencies; every table is required to be
-complete. The full reference is [manifest.md](manifest.md). A binary
+profiles, its artifacts, and its dependencies, and every table is required to
+be complete. The full reference is [manifest.md](manifest.md). A binary
 project as `mach init` writes it, shown with one of the six targets it
 declares (`linux-x86_64`, `linux-aarch64`, `linux-riscv64`, `darwin-x86_64`,
 `darwin-aarch64`, `windows-x86_64`), each stating every part mink's catalog
@@ -84,15 +86,17 @@ simd = "scalarize"
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^X.Y.Z"
+ref = "branch/dev"
 ```
 
 The manifest declares no `[link.*]` table: the system libraries a program
 needs on darwin and windows are std's `export = true` entries, which travel to
 every project that uses it. A library project (`mach init --lib`) differs only
 in its artifact, a `static` one with `entry = "lib/<id>.mach"` and
-`export = true`. The `[dep.std]` range is the one `mach dep add` writes, with
-`X.Y.Z` the std release resolution picks for the running compiler (see
+`export = true`. The `[dep.std]` selection is the one the running compiler
+states for std, `ref = "branch/dev"` until the std major that accepts this
+compiler is released, and from then on that major's version range, written as
+`mach dep add` writes it (see
 [dependencies.md](dependencies.md#releases-and-resolution)).
 
 The `id` is the root of every module path the project exposes. A file at
@@ -109,7 +113,10 @@ as `std.*` in source.
   be able to spell the id, so it starts with a letter or `_` and holds only
   letters, digits and `_`. A directory name such as `my-app` becomes `my_app`,
   each `-` written as `_`, and `mach init` says which id it chose. A `--name`
-  that is not an id, or a directory name that stays one after that, is refused.
+  that is not an id, or a directory name that is still not one after that, is
+  refused with `project.invalid_id`. `mach init` refuses to scaffold over an
+  existing `mach.toml` or entry file (`project.file_exists`) unless `--force`
+  is given.
 - **std.** `[dep.std]` is declared at the selection the running compiler states
   for std: `ref = "branch/dev"` until the std major that accepts this compiler
   is released, and that major's version range from then on. A ref is written as
@@ -137,6 +144,6 @@ as `std.*` in source.
 
 ## See also
 
-- [modules.md](modules.md) — how files map to module paths
-- [use.md](use.md) — referencing modules from other modules
-- [decorators.md](decorators.md) — `#[symbol("main")]` and the linker-name override
+- [modules.md](modules.md): how files map to module paths
+- [use.md](use.md): referencing modules from other modules
+- [decorators.md](decorators.md): `#[symbol("main")]` and the linker-name override

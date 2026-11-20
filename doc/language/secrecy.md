@@ -319,8 +319,9 @@ parameter declared with a type that holds a secret (`$c: ^u64`) is a
 contradiction, and its declaration is refused. Mach has no explicit tag
 discriminator values and no field defaults, so neither can name a secret.
 `#[embed]` cannot produce a secret array: the embedded bytes are public by
-type (`[_]u8`), so a key compiled into an image is embedded public and copied
-into secret storage, `val` to `var` of a `^` type, where it is used.
+type (`[_]u8` or `[N]u8`, and `^[_]u8` is refused as `embed.type`), so a key
+compiled into an image is embedded public and copied into secret storage, `val`
+to `var` of a `^` type, where it is used.
 
 ## Welded-storage pointers
 
@@ -355,9 +356,12 @@ uni U[T]   { a: T; b: u32; }
 rec Box[T] { u: U[T]; }
 
 var s: U[^u32]; # error: this instantiation makes the variants disagree
-var b: Box[^u32]; # same error: the instance need not be spelled
+var b: Box[^u64]; # same error: the instance need not be spelled
 var p: U[u32]; # fine, and so is an all-secret instantiation
 ```
+
+Each mixed instance is reported once, where it is first formed, so a
+`Box[^u32]` written after `U[^u32]` adds no second error.
 
 A *partially* concrete template (`U[T, ^u32]` written inside another generic) is
 a legal annotation with both legal and illegal instantiations, so it is never
@@ -993,9 +997,11 @@ The declared rows, one line per multiply:
 
 The table describes masc's rows, and masc's registration of each instruction
 set is the source. Inside a constant-time function a secret multiply whose
-rows are not classified constant time under the function's mode is refused, as
-is every lane multiply (`i32x4 * i32x4` on a secret vector), which no
-instruction set classifies.
+rows are not classified constant time under the function's mode is refused. A
+lane multiply (`i32x4 * i32x4` on a secret vector) is held to the rows its
+selection emits in the same way: on x86-64 it is `pmuludq` with shuffles, each
+on Intel's list, and a target with no vector unit runs it as one scalar
+multiply per lane.
 
 **Realized cells.** A cell no instruction executes directly is admitted exactly
 when every cell of its realization is, under the union of their conditions. On

@@ -88,8 +88,8 @@ $or {
   - always;
   - the extension it names, selected for the target;
   - a data-independent-timing mode the target's baseline holds.
-- riscv64 with Zkt selected (`rv64gc_zkt`) answers 1 for `low` at every width
-  and the three high halves at 64. x86-64 answers 1 for `low`, `high_u`,
+- riscv64 with Zkt selected (`rv64gc_zkt`) answers 1 for `low` at 8, 16, 32
+  and 64 bits and the three high halves at 64. x86-64 answers 1 for `low`, `high_u`,
   `high_s` and `wide_u` / `wide_s` on every OS. aarch64 classifies its
   multiplies under PSTATE.DIT, so it answers 1 only where the target's baseline
   holds DIT, as darwin-arm64's does. A `soft` function sets the mode where the
@@ -102,7 +102,7 @@ $or {
 
 #### `$mach.build.ext.<name>` — instruction-set extensions
 
-One `u8` member per extension name of the selected architecture, like `$mach.build.pie`. It is
+One `u1` member per extension name of the selected architecture, like `$mach.build.pie`. It is
 1 when the target selects that extension and 0 otherwise. A build selects extensions
 with the target's `ext` key and, on riscv, its `isa`, closed over what
 each one implies (see
@@ -118,15 +118,15 @@ A name the selected architecture does not declare is a compile error, never a si
 `$mach.arch.*` refuses an unknown architecture:
 
 ```
-`$mach.build.ext.sha`: `sha` is not an extension of arch 'aarch64'; its
-extensions are: FEAT_SHA1, FEAT_SB, FEAT_AES, FEAT_PMULL, FEAT_FP16
+error[comptime.extension_unknown] `$mach.build.ext.sha` cannot be read, because `sha` names no single extension of masc's catalog for arch 'aarch64'
 ```
 
-So a source that serves several architectures nests the extension question under an
-architecture guard. `&&` does not stand in for the nesting: every `$mach` path in a
-condition is checked on its own, so
-`$if ($mach.build.arch == $mach.arch.x86_64 && $mach.build.ext.sha == 1)` is
-refused on aarch64 although the left side is false. Write the nested form:
+So a source that serves several architectures asks the extension question only
+under an architecture guard. A comptime `&&` short-circuits as it does at run time:
+when the left side is false the right side is not read, so
+`$if ($mach.build.arch == $mach.arch.x86_64 && $mach.build.ext.sha == 1)` builds on
+aarch64. The right side is read when the left is true, and an unknown name there is
+refused. The nested form keeps one fallback per architecture:
 
 ```mach fragment
 $if ($mach.build.arch == $mach.arch.x86_64) {
@@ -163,7 +163,7 @@ and the member stays 0 for it.
 ### `$mach.version` — the compiler version
 
 ```mach fragment
-$mach.version                   # live; the version string, e.g. "2.0.0"
+$mach.version                   # live; the version string, e.g. "7.0.0"
 $mach.version.major             # live; integer component
 $mach.version.minor             # live; integer component
 $mach.version.patch             # live; integer component
@@ -234,36 +234,41 @@ $mach.sys.windows
 $mach.sys.freestanding           # no OS / bare metal
 $mach.sys.uefi                   # a PE image a UEFI firmware loads
 $mach.sys.vulkan                 # a spir-v module's system
+$mach.sys.wasi
 $mach.arch.x86_64
 $mach.arch.aarch64
 $mach.arch.riscv64
 $mach.arch.riscv32
 $mach.arch.spirv
+$mach.arch.wasm32
 $mach.abi.sysv64
 $mach.abi.win64
 $mach.abi.aapcs64
+$mach.abi.darwinpcs
+$mach.abi.aapcs64win
 $mach.abi.lp64
 $mach.abi.lp64f
 $mach.abi.lp64d
 $mach.abi.ilp32
 $mach.abi.ilp32f
 $mach.abi.ilp32d
-$mach.abi.spirv
+$mach.abi.shader                 # a spir-v module's convention
+$mach.abi.basic
 $mach.mode.debug
 $mach.mode.release
 ```
 
 The tag names are the target registries' own spellings, read from them
-directly; there is no second list to keep in step. A tag name the registry
+directly, so there is no second list to keep in step. A tag name the registry
 does not carry is a compile error, never a silent fold.
 
-The x86-64 System V ABI is spelled `sysv64`, as the registry spells it;
+The x86-64 System V ABI is spelled `sysv64`, as the registry spells it.
 `$mach.abi.sysv` is an unknown tag, as is any other name the registry does not
 carry.
 
 ## Comparison
 
-Tag comparisons are path-value — no `.id` suffix or unwrapping. Both sides share
+Tag comparisons are path-value, with no `.id` suffix or unwrapping. Both sides share
 one numeric space, so the comparison is an ordinary integer compare:
 
 ```mach fragment
@@ -279,7 +284,7 @@ RHS at compile time:
 ```mach
 use std.types.string.str;
 
-pub val IS_LINUX: u8  = $mach.build.sys == $mach.sys.linux;
+pub val IS_LINUX: u1  = $mach.build.sys == $mach.sys.linux;
 pub val COMPILER: *u8 = $mach.compiler.name;
 pub val VERSION:  str = $mach.version;
 pub val MAJOR:    u64 = $mach.version.major;
@@ -288,9 +293,9 @@ pub val WIDTH:    u64 = $mach.build.pointer_width;
 
 ## See also
 
-- [comptime-control.md](comptime-control.md) — `$if` / `$or` using these
+- [comptime-control.md](comptime-control.md): `$if` / `$or` using these
   reads
-- [comptime.md](comptime.md) — the `$project.*` / `$bin.*` roots, and which
+- [comptime.md](comptime.md): the `$project.*` / `$bin.*` roots, and which
   project each root names
-- [val-var.md](val-var.md) — binding compiler values into runtime
+- [val-var.md](val-var.md): binding compiler values into runtime
   constants

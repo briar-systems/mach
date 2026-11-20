@@ -1,24 +1,24 @@
 # Mach language reference
 
-Per-element reference docs. Each file covers one language component;
-read the index below or follow `see also` links to navigate.
+Per-element reference docs. Each file covers one language component.
+Read the index below or follow `see also` links to navigate.
 
 This directory is the reference for the Mach language. Each file is a focused
 doc with grammar, examples, and neighboring links. Start from the index below.
 
 ## Files and structure
 
-- [files.md](files.md) — extensions, the `src/bin/` / `src/lib/` entry conventions
-- [modules.md](modules.md) — module tree, path separator, shadow-module pattern
-- [use.md](use.md) — imports
-- [fwd.md](fwd.md) — re-exports
+- [files.md](files.md) - extensions, the `src/bin/` / `src/lib/` entry conventions
+- [modules.md](modules.md) - module tree, path separator, shadow-module pattern
+- [use.md](use.md) - imports
+- [fwd.md](fwd.md) - re-exports
 
 ## Declarations
 
-- [visibility.md](visibility.md) — `pub` and `ext` modifiers
-- [decorators.md](decorators.md) — decorators, `#[<name>]`, and where each one applies
-- [gpu.md](gpu.md) — the GPU decorators: pipeline stages, the shader interface, target handles and instructions
-- [def.md](def.md) — type alias
+- [visibility.md](visibility.md) - `pub` and `ext` modifiers
+- [decorators.md](decorators.md) - decorators, `#[<name>]`, and where each one applies
+- [gpu.md](gpu.md) - the GPU decorators: pipeline stages, the shader interface, target handles and instructions
+- [def.md](def.md) - type alias
 - [rec.md](rec.md) - record
 - [uni.md](uni.md) - raw union
 - [tag.md](tag.md) - tagged value
@@ -49,23 +49,23 @@ doc with grammar, examples, and neighboring links. Start from the index below.
 
 ## Low-level
 
-- [asm.md](asm.md) — inline assembly
-- [policy.md](policy.md) — compiler vs stdlib boundary
+- [asm.md](asm.md) - inline assembly
+- [policy.md](policy.md) - compiler vs stdlib boundary
 
 ## Diagnostics
 
-- [diagnostics.md](diagnostics.md) — diagnostic keys, the code registry and its never-reused rule
-- [diagnostics-json.md](diagnostics-json.md) — `--diagnostics json`, the versioned NDJSON record schema
-- [readout.md](readout.md) — what `-v` and `-vv` show for build, check and test, on which stream, and when
+- [diagnostics.md](diagnostics.md) - diagnostic keys, the code registry and its never-reused rule
+- [diagnostics-json.md](diagnostics-json.md) - `--diagnostics json`, the versioned NDJSON record schema
+- [readout.md](readout.md) - what `-v` and `-vv` show for build, check and test, on which stream, and when
 
 ## Formal grammar
 
-- [grammar.md](grammar.md) — full EBNF grammar of the implemented dialect,
+- [grammar.md](grammar.md) - full EBNF grammar of the implemented dialect,
   derived from the lexer and parser
 
 ## Conventions
 
-- [documentation.md](documentation.md) — docstring style for functions,
+- [documentation.md](documentation.md) - docstring style for functions,
   types, modules, and values
 - The ```` ```mach ```` blocks on these pages are illustrations and are not compiled.
   ```` ```mach fragment ```` marks a block that is not a whole program, and
@@ -75,11 +75,11 @@ doc with grammar, examples, and neighboring links. Start from the index below.
 
 ## Build system
 
-- [manifest.md](manifest.md) — the `mach.toml` manifest reference
-- [dependencies.md](dependencies.md) — how dependencies are resolved, pinned and verified
-- [build.md](build.md) — which targets, profiles and artifacts a command builds
-- [ir-output.md](ir-output.md) — `--emit ir`, which writes mirl's text of each module
-- `mach --help` and `mach help <command>` — the command-line reference
+- [manifest.md](manifest.md) - the `mach.toml` manifest reference
+- [dependencies.md](dependencies.md) - how dependencies are resolved, pinned and verified
+- [build.md](build.md) - which targets, profiles and artifacts a command builds
+- [ir-output.md](ir-output.md) - `--emit ir`, which writes mirl's text of each module
+- `mach --help` and `mach help <command>` - the command-line reference
 
 The supported, source-stable surface of the compiler is the editor API
 (`mach.editor`, documented by its docstrings and rendered by
