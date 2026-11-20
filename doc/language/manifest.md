@@ -1203,9 +1203,9 @@ A relaxation that does not exist is refused where it is written.
 The previous major's keys are refused by name, each with what replaced it, and
 with the rewrite `mach migrate` applies as a fix wherever the value has a
 mechanical one: `opt = 0` is `optimize = false`, `opt = 1` and `opt = 2` are
-`optimize = true`, `vectorize = true` is what `optimize` schedules and is removed,
-`vectorize = false` is an opt-out no profile key states and is removed too, with
-`#[vectorize("never")]` still opting one function out, `float_reassoc = false` is
+`optimize = true`, `vectorize = true` and `vectorize = false` are removed, since
+no profile key turns vectorization on or off, with `#[vectorize("never")]` still
+opting one function out, `float_reassoc = false` is
 removed and `float_reassoc = true` is `relax = ["float-reassoc"]`. `pass` and
 `skip` have no rewrite, since they listed passes by the previous major's names:
 
@@ -1404,18 +1404,17 @@ assumptions that operands are finite or non-NaN, contraction into a fused
 multiply-add, or flushing subnormals to zero. Each of those would be its own key, with
 its own argument.
 
-What it unlocks is the reduction vectorizer. `s = s + a[i]` is a serial dependence
-chain: every iteration must wait for the previous one's rounded result, so it cannot be
-done four lanes at a time without regrouping the additions. With the key set, the loop
-becomes lane-count independent partial accumulators plus a horizontal combine at the
-end — which computes a *differently grouped*, and therefore differently rounded, sum.
-Element-wise float loops (`a[i] = b[i] * c[i]`) never needed the key and are
-unaffected: each lane performs exactly the operation the scalar loop performed.
+What it reaches is a float sum or product reduction: one that combines its lanes one
+after another may then combine them in any grouping, so a vector unit can keep partial
+sums and combine them at the end, which computes a *differently grouped*, and therefore
+differently rounded, result. Element-wise float operations never need the key: each
+lane performs exactly the operation the scalar code performs. Subtraction and division
+are not associative in real arithmetic either, and no reduction of them is regrouped.
 
-The reductions it admits are sum (`s = s + x`), product (`s = s * x`), and the dot /
-matmul inner loop (`s = s + a[i]*b[i]`). Subtraction and division reductions are not
-associative in real arithmetic either, so they are refused with the key set exactly as
-without it.
+Today the key is read only over mirl's sequential float reduction operations, by its
+reassociation pass and by its vector legalisation. Mach source lowers to no reduction
+operation and no loop vectorizer forms one, so the key changes no code built from Mach
+source.
 
 **The accuracy cost, measured.** Summing one million `f64` values of `0.1`, scored
 against a compensated (Kahan) reference on x86-64:
@@ -1439,22 +1438,11 @@ that depends on the data. Code whose correctness depends on the exact bit patter
 float reduction — a checksum, a reproducibility requirement, a comparison against a
 reference implementation — must not relax it.
 
-Two exactness properties are preserved rather than traded away. The idle lanes are
-seeded with the op's **exact** IEEE identity — `-0.0` for addition (`x + (-0.0)` is `x`
-for every `x`, where `+0.0` would turn a negative-zero sum positive) and `1.0` for
-multiplication — so no signed-zero or NaN behaviour changes. And a trip count below the
-lane count never enters the vector loop at all, so short reductions are bit-identical
-regardless of the relaxation.
+The relaxation is profile-wide. There is no per-function opt-*in*: whether a reduction
+may be reassociated is the caller's tolerance to decide, not the callee author's.
 
-The relaxation is profile-wide. For a single function, `#[vectorize("never")]` opts out of vectorization
-entirely and takes precedence over it, so a routine that must stay IEEE-strict inside
-an otherwise-reassociating build has a spelling. There is no per-function opt-*in*:
-whether a reduction may be reassociated is the caller's tolerance to decide, not the
-callee author's.
-
-Integer reductions are untouched by this relaxation. They vectorize unconditionally and are
-bit-identical to the scalar reference, because integer add / xor / or / and reassociate
-exactly.
+Integer reductions are untouched by this relaxation, since integer add, xor, or and and
+reassociate exactly.
 
 ### Levers on the command line
 

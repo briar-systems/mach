@@ -45,8 +45,11 @@ RUNNER_OS=Linux RUNNER_TEMP=$PWD/out/boot GITHUB_ENV=$PWD/out/boot/env \
 
 The script installs the seed release named on the `seed` line of
 `.github/bootstrap-chain`, never whichever `mach` is on `PATH`, and walks the
-chain through each pinned mach commit. The last step builds `a` from your tree,
-`a` builds `b`, and `b` builds `c`. It fails when `cmp b c` differs and
+chain through each pinned mach commit. The last step builds `a` from your tree
+at the debug profile, so no older compiler's optimiser compiles it, `a` builds
+`b` at the profile on two threads, and `b` builds `c` at the profile on three,
+so the fixpoint also holds the output to being the same at every thread count.
+It fails when `cmp b c` differs and
 otherwise leaves `c` as the compiler, with its path in `out/boot/env`. Use `RUNNER_OS=macOS` or
 `Windows` on those hosts (the outputs are then `a.exe`, `b.exe` and `c.exe` on
 Windows), and `--profile release` for the release fixpoint. Without

@@ -3,10 +3,18 @@
 # a table is staged entry by entry and then published for its type. publishing over a table that
 # held other fields says so, since every fact read from the old one is then stale, and a reset of
 # the projection clears all of it.
+#
+# a projection may be layered over a base, as its type table is (mach.type): it reads the base
+# without a lock, so the base takes nothing new while the layer lives. it borrows the base's
+# entries, numbering its own past them, so a table names its entries the same way in either, and
+# answers the base's tables, discriminators and decorations besides its own. a layer never
+# publishes over a table its base holds: it holds the same fields or the publish fails, since a
+# reset is the one way tables change and no layer lives across one
 
 use std.collections.map;
 use collections_vector: std.collections.vector;
 use std.collections.vector.Vector;
+use std.system.panic.panic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -63,10 +71,16 @@ pub rec Projection {
     a: *A.Allocator;
 
     # the published tables, and in `index`, by type id, one past the index of its table in
-    # `tables`, 0 where it has none
-    tables: handle.StableChunks[Table];
-    index:  Vector[u32];
-    pool:   handle.StableChunks[Entry];
+    # `tables`, 0 where it has none: dense on a root, by type in `index_at` on a layer, whose
+    # tables are few
+    tables:   handle.StableChunks[Table];
+    index:    Vector[u32];
+    index_at: map.Map[TypeId, u32];
+    pool:     handle.StableChunks[Entry];
+
+    # the projection this one is layered over, nil for a root, and how many entries it held then
+    base:      *Projection;
+    pool_base: u32;
 
     # the declared discriminator type per tag nominal, re-installed with the case table
     discriminators: map.Map[TypeId, TypeId];
@@ -86,6 +100,18 @@ pub fun projection_init(a: *A.Allocator) Projection {
     p.index          = collections_vector.init[u32](a);
     p.discriminators = map.init[TypeId, TypeId](a);
     p.decorations    = map.init[TypeId, Decoration](a);
+    p.index_at       = map.init[TypeId, u32](a);
+    p.base           = nil;
+    p.pool_base      = 0;
+    ret p;
+}
+
+# a projection layered over `base`, which takes nothing new while it lives
+pub fun layer_init(a: *A.Allocator, base: *Projection) Projection {
+    var p: Projection = projection_init(a);
+    p.pool      = handle.chunk_borrow[Entry](a, ?base.pool);
+    p.base      = base;
+    p.pool_base = handle.chunk_count[Entry](?base.pool)::u32;
     ret p;
 }
 
@@ -96,6 +122,7 @@ pub fun projection_dnit(p: *Projection) {
     handle.chunk_dnit[Table](?p.tables);
     handle.chunk_dnit[Entry](?p.pool);
     collections_vector.dnit[u32](?p.index);
+    map.dnit[TypeId, u32](?p.index_at);
     map.dnit[TypeId, TypeId](?p.discriminators);
     map.dnit[TypeId, Decoration](?p.decorations);
 }
@@ -109,6 +136,7 @@ pub fun projection_reset(p: *Projection) {
     p.tables = handle.chunk_init[Table](p.a);
     p.pool   = handle.chunk_init[Entry](p.a);
     collections_vector.clear[u32](?p.index);
+    map.clear[TypeId, u32](?p.index_at);
     map.clear[TypeId, TypeId](?p.discriminators);
     map.clear[TypeId, Decoration](?p.decorations);
 }
@@ -171,6 +199,7 @@ pub fun publish(p: *Projection, ty: TypeId, fields_start: u32, fields_len: u32) 
     if (ty == TYPE_NIL || ty == TYPE_ERROR) {
         ret res[bool, fail.Fail].err{fail.message("field table: published for no type")};
     }
+    if (p.base != nil) { ret layer_publish(p, ty, fields_start, fields_len); }
     val at: usize = ty::usize;
     if (at < p.index.len && p.index.data[at] != 0) {
         val slot:    *Table = handle.chunk_get[Table](?p.tables, (p.index.data[at] - 1)::usize);
@@ -205,11 +234,69 @@ pub fun publish(p: *Projection, ty: TypeId, fields_start: u32, fields_len: u32) 
     ret res[bool, fail.Fail].ok{false};
 }
 
-# the table published for `ty`
+# a staged run published on a layer: a table its base holds for `ty` must hold the same fields,
+# else it is the layer's own, indexed by type
+fun layer_publish(p: *Projection, ty: TypeId, fields_start: u32, fields_len: u32) res[bool, fail.Fail] {
+    val opt_based: opt[*Table] = table_for(p.base, ty);
+    if (sel opt_based.some) {
+        if (holds(p, opt_based.some, fields_start, fields_len)) { ret res[bool, fail.Fail].ok{false}; }
+        ret res[bool, fail.Fail].err{fail.message("field table: a layer published other fields over its base's table")};
+    }
+    var key:       TypeId    = ty;
+    val opt_found: opt[*u32] = map.get[TypeId, u32](?p.index_at, ?key);
+    if (sel opt_found.some) {
+        val slot:    *Table = handle.chunk_get[Table](?p.tables, (@opt_found.some - 1)::usize);
+        val changed: bool   = !holds(p, slot, fields_start, fields_len);
+        slot.fields_start = fields_start;
+        slot.fields_len   = fields_len;
+        ret res[bool, fail.Fail].ok{changed};
+    }
+    val res_chunk_editor: res[handle.ChunkEditor[Table], handle.Error] = handle.chunk_editor[Table](?p.tables);
+    if (sel res_chunk_editor.err) { ret res[bool, fail.Fail].err{fail.message(handle.text(res_chunk_editor.err))}; }
+    var ce:       handle.ChunkEditor[Table] = res_chunk_editor.ok;
+    val res_push: res[*Table, handle.Error] = handle.chunk_append[Table](?ce, Table{ty: ty, fields_start: fields_start, fields_len: fields_len});
+    handle.chunk_editor_finish[Table](?ce);
+    if (sel res_push.err) { ret res[bool, fail.Fail].err{fail.message(handle.text(res_push.err))}; }
+    val res_indexed: res[bool, A.Error] = map.insert[TypeId, u32](?p.index_at, ty, handle.chunk_count[Table](?p.tables)::u32);
+    if (sel res_indexed.err) { ret res[bool, fail.Fail].err{fail.refused(res_indexed.err)}; }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+# the table published for `ty`, by the projection or a projection under it
 pub fun table_for(p: *Projection, ty: TypeId) opt[*Table] {
+    if (p.base != nil) { ret layer_table_for(p, ty); }
     val at: usize = ty::usize;
     if (at >= p.index.len || p.index.data[at] == 0) { ret opt[*Table].none{}; }
     ret opt[*Table].some{handle.chunk_get[Table](?p.tables, (p.index.data[at] - 1)::usize)};
+}
+
+fun layer_table_for(p: *Projection, ty: TypeId) opt[*Table] {
+    var on: *Projection = p;
+    for (on.base != nil) {
+        if (on.index_at.len != 0) {
+            var key:       TypeId    = ty;
+            val opt_found: opt[*u32] = map.get[TypeId, u32](?on.index_at, ?key);
+            if (sel opt_found.some) { ret opt[*Table].some{handle.chunk_get[Table](?on.tables, (@opt_found.some - 1)::usize)}; }
+        }
+        on = on.base;
+    }
+    val at: usize = ty::usize;
+    if (at >= on.index.len || on.index.data[at] == 0) { ret opt[*Table].none{}; }
+    ret opt[*Table].some{handle.chunk_get[Table](?on.tables, (on.index.data[at] - 1)::usize)};
+}
+
+# how many tables the projection itself published, its base's not counted
+pub fun own_count(p: *Projection) u32 {
+    ret handle.chunk_count[Table](?p.tables)::u32;
+}
+
+# the table the projection itself published `at`th, its base's not counted
+# ---
+# p:   the projection
+# at:  the position among its own tables, below own_count
+# ret: the table
+pub fun own_at(p: *Projection, at: u32) *Table {
+    ret handle.chunk_get[Table](?p.tables, at::usize);
 }
 
 # entry `ix` of the published table `ft`, which holds more than `ix` entries
@@ -219,9 +306,23 @@ pub fun entry_at(p: *Projection, ft: *Table, ix: u32) *Entry {
 
 # the declared discriminator of tag nominal `nom`, TYPE_NIL when it has none
 pub fun discriminator_of(p: *Projection, nom: TypeId) TypeId {
+    if (p.base != nil) { ret layer_discriminator_of(p, nom); }
     val opt_found: opt[*TypeId] = map.get[TypeId, TypeId](?p.discriminators, ?nom);
     if (!sel opt_found.some) { ret TYPE_NIL; }
     ret @opt_found.some;
+}
+
+# the declared discriminator of tag nominal `nom` on a layer: the nearest layer's, else the root's
+fun layer_discriminator_of(p: *Projection, nom: TypeId) TypeId {
+    var on: *Projection = p;
+    for (on.base != nil) {
+        if (on.discriminators.len != 0) {
+            val opt_own: opt[*TypeId] = map.get[TypeId, TypeId](?on.discriminators, ?nom);
+            if (sel opt_own.some) { ret @opt_own.some; }
+        }
+        on = on.base;
+    }
+    ret discriminator_of(on, nom);
 }
 
 # record the declared discriminator of a tag nominal
@@ -241,14 +342,29 @@ pub fun discriminator_set(p: *Projection, nom: TypeId, disc: TypeId) err[fail.Fa
 # p:   the projection
 # nom: the tag nominal
 pub fun discriminator_del(p: *Projection, nom: TypeId) {
+    if (p.base != nil && discriminator_of(p.base, nom) != TYPE_NIL) { panic("field table: a layer dropped its base's discriminator\n"); }
     map.remove[TypeId, TypeId](?p.discriminators, ?nom);
 }
 
 # the decorations `ty` declares; none when it declares none
 pub fun decoration_of(p: *Projection, ty: TypeId) Decoration {
+    if (p.base != nil) { ret layer_decoration_of(p, ty); }
     val opt_found: opt[*Decoration] = map.get[TypeId, Decoration](?p.decorations, ?ty);
     if (!sel opt_found.some) { ret Decoration{align: 0, packed: false, volatile_: false}; }
     ret @opt_found.some;
+}
+
+# the decorations `ty` declares on a layer: the nearest layer's, else the root's
+fun layer_decoration_of(p: *Projection, ty: TypeId) Decoration {
+    var on: *Projection = p;
+    for (on.base != nil) {
+        if (on.decorations.len != 0) {
+            val opt_own: opt[*Decoration] = map.get[TypeId, Decoration](?on.decorations, ?ty);
+            if (sel opt_own.some) { ret @opt_own.some; }
+        }
+        on = on.base;
+    }
+    ret decoration_of(on, ty);
 }
 
 # record the layout decorations a nominal declares
@@ -260,5 +376,42 @@ pub fun decoration_of(p: *Projection, ty: TypeId) Decoration {
 pub fun decoration_set(p: *Projection, ty: TypeId, d: Decoration) err[fail.Fail] {
     val res_inserted: res[bool, A.Error] = map.insert[TypeId, Decoration](?p.decorations, ty, d);
     if (sel res_inserted.err) { ret err[fail.Fail].err{fail.refused(res_inserted.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# `layer` folded into its base, which took nothing new since the layer was made: its entries
+# appended there in order keep their numbers, and its tables, discriminators and decorations are
+# the base's after
+pub fun fold(layer: *Projection) err[fail.Fail] {
+    val base: *Projection = layer.base;
+    if (base == nil || handle.chunk_count[Entry](?base.pool)::u32 != layer.pool_base) { ret err[fail.Fail].err{fail.message("field table: a layer folded into a base that changed under it")}; }
+    val entries:    u32                 = handle.chunk_count[Entry](?layer.pool)::u32;
+    val res_staged: res[u32, fail.Fail] = stage(base, entries - layer.pool_base);
+    if (sel res_staged.err) { ret err[fail.Fail].err{res_staged.err}; }
+    var i: u32 = layer.pool_base;
+    for (i < entries) {
+        val err_pushed: err[fail.Fail] = entry_push(base, @handle.chunk_get[Entry](?layer.pool, i::usize));
+        if (sel err_pushed.err) { ret err_pushed; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < own_count(layer)) {
+        val t:             *Table               = own_at(layer, i);
+        val res_published: res[bool, fail.Fail] = publish(base, t.ty, t.fields_start, t.fields_len);
+        if (sel res_published.err) { ret err[fail.Fail].err{res_published.err}; }
+        i = i + 1;
+    }
+    var it:    map.Iter = map.iter[TypeId, TypeId](?layer.discriminators);
+    var entry: map.Entry[TypeId, TypeId];
+    for (map.next[TypeId, TypeId](?layer.discriminators, ?it, ?entry)) {
+        val err_set: err[fail.Fail] = discriminator_set(base, @entry.key, @entry.value);
+        if (sel err_set.err) { ret err_set; }
+    }
+    var at:        map.Iter = map.iter[TypeId, Decoration](?layer.decorations);
+    var decorated: map.Entry[TypeId, Decoration];
+    for (map.next[TypeId, Decoration](?layer.decorations, ?at, ?decorated)) {
+        val err_set: err[fail.Fail] = decoration_set(base, @decorated.key, @decorated.value);
+        if (sel err_set.err) { ret err_set; }
+    }
     ret err[fail.Fail].ok{};
 }

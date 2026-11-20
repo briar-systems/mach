@@ -4,6 +4,23 @@
 # its parts spell, read when it is interned. the field tables, tag discriminators and layout
 # decorations belong to the current projection (`mach.type.field`), and a fact read from them is
 # kept until the projection resets or a table is published over one that held other fields.
+#
+# a table may be layered over a base, which is how work off the owner thread makes types. its
+# contract:
+# - a layer reads its base without a lock, so the base takes nothing new while the layer lives. it
+#   borrows the base's storage and copies a part only when it first adds to it, so it reads every
+#   type, parameter run, handle and field table of its base as the base reads its own
+# - a layer numbers what it adds past its base. its numbers are its own: two layers over one base
+#   give one number to different types, so no id a layer made is read anywhere but through the
+#   layer until it is merged, and no store shared between tables keeps a fact of one (memo_keyed)
+# - what a table keeps beside its types (`Side`) is moved, never shared: a layer is handed the side
+#   of the table or thread that made it and hands it back, with every memo of a type past its base
+#   dropped at both ends, so a memo is only ever read under the numbering it was made in
+# - `merge` interns each type a layer made into another table over the same base, in the order the
+#   layer made them, and says where each landed. types are equal by their parts, so when the owner
+#   merges layers at the points one thread would have made their types, and in that order, every
+#   merged id is the id the one thread would have given
+# - `fold` appends a layer to its base, which took nothing since, so every id the layer gave stands
 
 use mach.base.fail;
 use std.collections.map;
@@ -303,41 +320,109 @@ fun pool_facts(ti: *TypeInterner, start: u32, len: u32) u8 {
     ret facts;
 }
 
-# the type table: every type interned once and named by its `TypeId`
+# what a table keeps beside its types: the memos, each a pure function of a type and the
+# projection, dense by type index, and the visited sets of the scans its walks open, scratch that
+# holds no fact. a table owns one and moves it to a layer made over it (layer_init)
 # ---
-# a:              the allocator everything here is held in
-# types:          the types, by index
-# params:         the pool of function parameter types and instance arguments
-# dedup:          the type of each recipe, for every kind but functions, instances and handles
-# fun_index:      the newest function type per signature hash, heading its bucket chain
-# instance_index: the newest instance per hash of its generic and arguments, heading its bucket chain
-# handles:        every handle type, searched in full on each intern
-# handle_ops:     the pool of handle operands
-# prims:          the type of each primitive, by catalog position
-# vecs:           the seeded vector types, by position below VEC_COUNT
-# fields:         the current projection's field tables, discriminators and decorations
-# scans:          the visited sets of the open scans
+# projected:  the projected facts settled under the current projection (`PROJECTED_*`)
+# identities: the identity recipe gave each type, zero until it is asked for. it names the type by
+#             its recipe alone, so no projection drops it
+# scans:      the visited sets
+pub rec Side {
+    projected:  Vector[u8];
+    identities: Vector[u64];
+    scans:      type_scan.Sets;
+}
+
+# an empty side
+# ---
+# a:   the allocator it is held in
+# ret: the side, released by side_dnit
+pub fun side_init(a: *A.Allocator) Side {
+    ret Side{projected: collections_vector.init[u8](a), identities: collections_vector.init[u64](a), scans: type_scan.sets_init(a)};
+}
+
+# release a side's memos and visited sets
+# ---
+# side: the side
+pub fun side_dnit(side: *Side) {
+    collections_vector.dnit[u8](?side.projected);
+    collections_vector.dnit[u64](?side.identities);
+    type_scan.sets_dnit(?side.scans);
+}
+
+# every memo of a type numbered `count` or past it dropped
+fun side_cut(side: *Side, count: u32) {
+    if (side.projected.len > count::usize)  { side.projected.len = count::usize; }
+    if (side.identities.len > count::usize) { side.identities.len = count::usize; }
+}
+
+# the type table: every type interned once and named by its `TypeId`. a table may be layered over a
+# base, which it reads as its own (the header states the contract)
+# ---
+# a:                     the allocator everything here is held in
+# base:                  the table this one is layered over, nil for a root
+# base_types:            how many types the base held when the layer was made
+# base_params:           how many parameter pool entries the base held then
+# base_handles:          how many handle types the base held then
+# base_ops:              how many handle operands the base held then
+# types:                 the types, by index, the base's borrowed on a layer
+# params:                the pool of function parameter types and instance arguments
+# params_len:            how many pool entries are in use
+# params_cap:            how many the pool has room for
+# params_lent:           the pool is still the base's, copied before the layer first adds to it
+# dedup:                 the type of each recipe, for every kind but functions, instances and handles; a
+#                        layer's holds only the types it made
+# fun_index:             the newest function type per signature hash, heading its bucket chain; a layer's
+#                        heads chains of its own types, which continue into the base's
+# instance_index:        the newest instance per hash of its generic and arguments, heading its bucket
+#                        chain, layered as `fun_index` is
+# handles:               every handle type, searched in full on each intern
+# handles_len:           how many handle types there are
+# handles_cap:           how many `handles` has room for
+# handles_lent:          `handles` is still the base's
+# handle_ops:            the pool of handle operands
+# handle_ops_len:        how many operands are in use
+# handle_ops_cap:        how many the operand pool has room for
+# handle_ops_lent:       the operand pool is still the base's
+# prims:                 the type of each primitive, by catalog position
+# vecs:                  the seeded vector types, by position below VEC_COUNT
+# fields:                the current projection's field tables, discriminators and decorations
+# projection_generation: bumped by every projection reset
+# side:                  the memos and the visited sets of the open scans, moved, never shared
 pub rec TypeInterner {
     a: *A.Allocator;
 
+    # the table this one is layered over, nil for a root, and how many types, parameters,
+    # handles and handle operands it held when the layer was made
+    base:         *TypeInterner;
+    base_types:   u32;
+    base_params:  u32;
+    base_handles: u32;
+    base_ops:     u32;
+
     types: handle.StableChunks[Type];
 
-    params:     *TypeId;
-    params_len: u32;
-    params_cap: u32;
+    # on a layer, each run below is its base's until the layer first adds to it
+    params:      *TypeId;
+    params_len:  u32;
+    params_cap:  u32;
+    params_lent: bool;
 
     dedup: map.MapBy[Type, TypeId];
 
     fun_index:      map.Map[u64, TypeId];
     instance_index: map.Map[u64, TypeId];
 
-    handles:     *TypeId;
-    handles_len: u32;
-    handles_cap: u32;
+    handles:      *TypeId;
+    handles_len:  u32;
+    handles_cap:  u32;
+    handles_lent: bool;
 
-    handle_ops:     *u32;
-    handle_ops_len: u32;
-    handle_ops_cap: u32;
+    handle_ops:      *u32;
+    handle_ops_len:  u32;
+    handle_ops_cap:  u32;
+    handle_ops_lent: bool;
 
     prims: [type_prim.PRIM_COUNT]TypeId;
 
@@ -346,17 +431,10 @@ pub rec TypeInterner {
     fields: type_field.Projection;
 
     # bumped by every projection reset, which drops every fact derived from the tables;
-    # published tables never change otherwise
+    # published tables never change otherwise. a layer reads its base's
     projection_generation: u64;
 
-    # by type index, the projected facts settled under the current projection (`PROJECTED_*`)
-    projected: Vector[u8];
-
-    # by type index, the identity recipe gave the type, zero until it is asked for. it
-    # names the type by its recipe alone, so no projection drops it
-    identities: Vector[u64];
-
-    scans: type_scan.Sets;
+    side: Side;
 }
 
 val INITIAL_PARAMS_CAP: u32 = 32;
@@ -367,26 +445,32 @@ val INITIAL_PARAMS_CAP: u32 = 32;
 # a:   the allocator the store holds everything in
 # ret: ok, or the allocation failure, after which the store is already released
 pub fun init(ti: *TypeInterner, a: *A.Allocator) err[fail.Fail] {
-    ti.a = a;
+    ti.a            = a;
+    ti.base         = nil;
+    ti.base_types   = 0;
+    ti.base_params  = 0;
+    ti.base_handles = 0;
+    ti.base_ops     = 0;
 
     ti.types = handle.chunk_init[Type](a);
 
-    ti.params     = nil;
-    ti.params_len = 0;
-    ti.params_cap = 0;
+    ti.params      = nil;
+    ti.params_len  = 0;
+    ti.params_cap  = 0;
+    ti.params_lent = false;
 
-    ti.handles        = nil;
-    ti.handles_len    = 0;
-    ti.handles_cap    = 0;
-    ti.handle_ops     = nil;
-    ti.handle_ops_len = 0;
-    ti.handle_ops_cap = 0;
+    ti.handles         = nil;
+    ti.handles_len     = 0;
+    ti.handles_cap     = 0;
+    ti.handles_lent    = false;
+    ti.handle_ops      = nil;
+    ti.handle_ops_len  = 0;
+    ti.handle_ops_cap  = 0;
+    ti.handle_ops_lent = false;
 
     ti.fields                = type_field.projection_init(a);
     ti.projection_generation = 0;
-    ti.projected             = collections_vector.init[u8](a);
-    ti.identities            = collections_vector.init[u64](a);
-    ti.scans                 = type_scan.sets_init(a);
+    ti.side                  = side_init(a);
 
     ti.dedup          = map.init_by[Type, TypeId](a, hash_type, eq_type);
     ti.fun_index      = map.init[u64, TypeId](a);
@@ -439,41 +523,118 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
+# a table layered over `base` in `ti`, handed `side`, the side of the table or thread that made
+# it. `base` takes nothing new while the layer lives
+pub fun layer_init(ti: *TypeInterner, base: *TypeInterner, a: *A.Allocator, side: Side) {
+    ti.a            = a;
+    ti.base         = base;
+    ti.base_types   = type_count(base);
+    ti.base_params  = base.params_len;
+    ti.base_handles = base.handles_len;
+    ti.base_ops     = base.handle_ops_len;
+
+    ti.types = handle.chunk_borrow[Type](a, ?base.types);
+
+    ti.params      = base.params;
+    ti.params_len  = base.params_len;
+    ti.params_cap  = base.params_cap;
+    ti.params_lent = true;
+
+    ti.handles         = base.handles;
+    ti.handles_len     = base.handles_len;
+    ti.handles_cap     = base.handles_cap;
+    ti.handles_lent    = true;
+    ti.handle_ops      = base.handle_ops;
+    ti.handle_ops_len  = base.handle_ops_len;
+    ti.handle_ops_cap  = base.handle_ops_cap;
+    ti.handle_ops_lent = true;
+
+    ti.dedup          = map.init_by[Type, TypeId](a, hash_type, eq_type);
+    ti.fun_index      = map.init[u64, TypeId](a);
+    ti.instance_index = map.init[u64, TypeId](a);
+    ti.prims          = base.prims;
+    ti.vecs           = base.vecs;
+
+    ti.fields                = type_field.layer_init(a, ?base.fields);
+    ti.projection_generation = base.projection_generation;
+    ti.side                  = side;
+    side_cut(?ti.side, ti.base_types);
+}
+
+# the side a layer was handed, back from it with every memo of a type it made dropped. the layer
+# keeps an empty one
+pub fun layer_side(ti: *TypeInterner) Side {
+    var side: Side = ti.side;
+    side_cut(?side, ti.base_types);
+    ti.side = side_init(ti.a);
+    ret side;
+}
+
+# a table's side, taken from it to hand a layer, which leaves it an empty one
+pub fun side_take(ti: *TypeInterner) Side {
+    val side: Side = ti.side;
+    ti.side = side_init(ti.a);
+    ret side;
+}
+
+# `side` given to `ti` in place of the one it holds
+pub fun side_give(ti: *TypeInterner, side: Side) {
+    side_dnit(?ti.side);
+    ti.side = side;
+}
+
 # release a type store; a nil store holds nothing
 pub fun dnit(ti: *TypeInterner) {
     if (ti == nil) { ret; }
 
     handle.chunk_dnit[Type](?ti.types);
-    if (ti.params != nil && ti.params_cap > 0) {
+    if (ti.params != nil && ti.params_cap > 0 && !ti.params_lent) {
         A.deallocate[TypeId](ti.a, ti.params, ti.params_cap::usize);
     }
-    if (ti.handles != nil && ti.handles_cap > 0) {
+    if (ti.handles != nil && ti.handles_cap > 0 && !ti.handles_lent) {
         A.deallocate[TypeId](ti.a, ti.handles, ti.handles_cap::usize);
     }
-    if (ti.handle_ops != nil && ti.handle_ops_cap > 0) {
+    if (ti.handle_ops != nil && ti.handle_ops_cap > 0 && !ti.handle_ops_lent) {
         A.deallocate[u32](ti.a, ti.handle_ops, ti.handle_ops_cap::usize);
     }
     type_field.projection_dnit(?ti.fields);
-    collections_vector.dnit[u8](?ti.projected);
-    collections_vector.dnit[u64](?ti.identities);
-    type_scan.sets_dnit(?ti.scans);
+    side_dnit(?ti.side);
 
     map.dnit_by[Type, TypeId](?ti.dedup);
     map.dnit[u64, TypeId](?ti.fun_index);
     map.dnit[u64, TypeId](?ti.instance_index);
 
-    ti.params     = nil;
-    ti.params_len = 0;
-    ti.params_cap = 0;
+    ti.params      = nil;
+    ti.params_len  = 0;
+    ti.params_cap  = 0;
+    ti.params_lent = false;
 
-    ti.handles        = nil;
-    ti.handles_len    = 0;
-    ti.handles_cap    = 0;
-    ti.handle_ops     = nil;
-    ti.handle_ops_len = 0;
-    ti.handle_ops_cap = 0;
+    ti.handles         = nil;
+    ti.handles_len     = 0;
+    ti.handles_cap     = 0;
+    ti.handles_lent    = false;
+    ti.handle_ops      = nil;
+    ti.handle_ops_len  = 0;
+    ti.handle_ops_cap  = 0;
+    ti.handle_ops_lent = false;
 
     ti.projection_generation = 0;
+}
+
+# a run a layer borrowed from its base, copied to its own before the layer first adds to it
+fun run_own[T](a: *A.Allocator, data: **T, len: u32, cap: *u32, lent: *bool) err[A.Error] {
+    val want:      u32              = len + len / 2 + 32;
+    val res_alloc: res[*T, A.Error] = A.allocate[T](a, want::usize);
+    if (sel res_alloc.err) { ret err[A.Error].err{res_alloc.err}; }
+    var i: u32 = 0;
+    for (i < len) {
+        res_alloc.ok[i] = (@data)[i];
+        i               = i + 1;
+    }
+    @data = res_alloc.ok;
+    @cap  = want;
+    @lent = false;
+    ret err[A.Error].ok{};
 }
 
 # the type `tid` names
@@ -491,6 +652,11 @@ pub fun get(ti: *TypeInterner, tid: TypeId) opt[*Type] {
 # ret: the count, one past the highest index issued
 pub fun type_count(ti: *TypeInterner) u32 {
     ret handle.chunk_count[Type](?ti.types)::u32;
+}
+
+# how many types the table made itself, its base's not counted
+pub fun own_type_count(ti: *TypeInterner) u32 {
+    ret type_count(ti) - ti.base_types;
 }
 
 # one entry of the pool of function parameter types and instance arguments
@@ -801,9 +967,9 @@ fun held_walk(ti: *TypeInterner, tid: TypeId) res[Held, fail.Fail] {
 # scan: the scan to open, closed again by type_scan_end
 # ret:  ok, or the failure growing the visited sets, which leaves the scan closed
 pub fun type_scan_begin(ti: *TypeInterner, scan: *TypeScan) err[fail.Fail] {
-    $if (role.CHECKED) { role.touched(role.TYPE_SCAN, nil); }
+    $if (role.CHECKED) { role.touched(role.TYPE_SCAN, ti::ptr); }
 
-    ret type_scan.begin(?ti.scans, scan);
+    ret type_scan.begin(?ti.side.scans, scan);
 }
 
 # close a scan and every scan opened inside it
@@ -811,7 +977,7 @@ pub fun type_scan_begin(ti: *TypeInterner, scan: *TypeScan) err[fail.Fail] {
 # ti:   the type store
 # scan: the scan to close
 pub fun type_scan_end(ti: *TypeInterner, scan: *TypeScan) {
-    type_scan.end(?ti.scans, scan);
+    type_scan.end(?ti.side.scans, scan);
 }
 
 # mark a type seen in an open scan
@@ -821,7 +987,7 @@ pub fun type_scan_end(ti: *TypeInterner, scan: *TypeScan) {
 # tid:  the type met
 # ret:  VISIT_FRESH the first time, VISIT_SEEN after and for nil or the error type, or a failure for a closed scan or a set that cannot grow
 pub fun type_scan_mark(ti: *TypeInterner, scan: *TypeScan, tid: TypeId) res[VisitMark, fail.Fail] {
-    ret type_scan.mark(?ti.scans, scan, tid);
+    ret type_scan.mark(?ti.side.scans, scan, tid);
 }
 
 # open a scan over pairs of the store's types at the next nesting level
@@ -830,9 +996,9 @@ pub fun type_scan_mark(ti: *TypeInterner, scan: *TypeScan, tid: TypeId) res[Visi
 # scan: the scan to open, closed again by pair_scan_end
 # ret:  ok, or the failure growing the visited sets, which leaves the scan closed
 pub fun pair_scan_begin(ti: *TypeInterner, scan: *PairScan) err[fail.Fail] {
-    $if (role.CHECKED) { role.touched(role.TYPE_SCAN, nil); }
+    $if (role.CHECKED) { role.touched(role.TYPE_SCAN, ti::ptr); }
 
-    ret type_scan.pair_begin(?ti.scans, scan);
+    ret type_scan.pair_begin(?ti.side.scans, scan);
 }
 
 # close a pair scan and every pair scan opened inside it
@@ -840,7 +1006,7 @@ pub fun pair_scan_begin(ti: *TypeInterner, scan: *PairScan) err[fail.Fail] {
 # ti:   the type store
 # scan: the scan to close
 pub fun pair_scan_end(ti: *TypeInterner, scan: *PairScan) {
-    type_scan.pair_end(?ti.scans, scan);
+    type_scan.pair_end(?ti.side.scans, scan);
 }
 
 # mark an ordered pair of types seen in an open pair scan
@@ -851,7 +1017,7 @@ pub fun pair_scan_end(ti: *TypeInterner, scan: *PairScan) {
 # b:    the second type
 # ret:  VISIT_FRESH the first time, VISIT_SEEN after, or a failure for a closed scan or a set that cannot grow
 pub fun pair_scan_mark(ti: *TypeInterner, scan: *PairScan, a: TypeId, b: TypeId) res[VisitMark, fail.Fail] {
-    ret type_scan.pair_mark(?ti.scans, scan, a, b);
+    ret type_scan.pair_mark(?ti.side.scans, scan, a, b);
 }
 
 # the pointer type to `base`
@@ -1090,8 +1256,12 @@ pub fun handle_operand(ti: *TypeInterner, tid: TypeId, index: u32) u32 {
 }
 
 fun handle_ops_append(ti: *TypeInterner, src: *u32, len: u32) res[u32, fail.Fail] {
-    val start:     u32          = ti.handle_ops_len;
-    val needed:    usize        = ti.handle_ops_len::usize + len::usize;
+    val start:  u32   = ti.handle_ops_len;
+    val needed: usize = ti.handle_ops_len::usize + len::usize;
+    if (ti.handle_ops_lent) {
+        val err_owned: err[A.Error] = run_own[u32](ti.a, ?ti.handle_ops, ti.handle_ops_len, ?ti.handle_ops_cap, ?ti.handle_ops_lent);
+        if (sel err_owned.err) { ret res[u32, fail.Fail].err{fail.refused(err_owned.err)}; }
+    }
     val err_grown: err[A.Error] = growth.reserve[u32](ti.a, ?ti.handle_ops, ?ti.handle_ops_cap, needed);
     if (sel err_grown.err) { ret res[u32, fail.Fail].err{fail.refused(err_grown.err)}; }
 
@@ -1105,6 +1275,10 @@ fun handle_ops_append(ti: *TypeInterner, src: *u32, len: u32) res[u32, fail.Fail
 }
 
 fun track_handle(ti: *TypeInterner, tid: TypeId) err[fail.Fail] {
+    if (ti.handles_lent) {
+        val err_owned: err[A.Error] = run_own[TypeId](ti.a, ?ti.handles, ti.handles_len, ?ti.handles_cap, ?ti.handles_lent);
+        if (sel err_owned.err) { ret err[fail.Fail].err{fail.refused(err_owned.err)}; }
+    }
     if (ti.handles_len == ti.handles_cap) {
         val err_grown: err[A.Error] = growth.reserve[TypeId](ti.a, ?ti.handles, ?ti.handles_cap, ti.handles_len::usize + 1);
         if (sel err_grown.err) { ret err[fail.Fail].err{fail.refused(err_grown.err)}; }
@@ -1292,7 +1466,8 @@ pub fun timed_of(ti: *TypeInterner, tid: TypeId) u8 {
 
 fun intern_function_bucket(ti: *TypeInterner, ret_type: TypeId, params: *TypeId, count: u32, c_variadic: bool, timed: u8, h: u64) res[TypeId, fail.Fail] {
     var head:    TypeId       = TYPE_NIL;
-    val opt_get: opt[*TypeId] = map.get[u64, TypeId](?ti.fun_index, ?h);
+    var opt_get: opt[*TypeId] = map.get[u64, TypeId](?ti.fun_index, ?h);
+    if (ti.base != nil && !sel opt_get.some) { opt_get = bucket_head(ti.base, h, false); }
     if (sel opt_get.some) {
         head = @opt_get.some;
         var existing: TypeId = head;
@@ -1384,7 +1559,8 @@ pub fun intern_instance(ti: *TypeInterner, nominal: TypeId, args: *TypeId, count
 
 fun intern_instance_bucket(ti: *TypeInterner, nominal: TypeId, args: *TypeId, count: u32, h: u64) res[TypeId, fail.Fail] {
     var head:    TypeId       = TYPE_NIL;
-    val opt_get: opt[*TypeId] = map.get[u64, TypeId](?ti.instance_index, ?h);
+    var opt_get: opt[*TypeId] = map.get[u64, TypeId](?ti.instance_index, ?h);
+    if (ti.base != nil && !sel opt_get.some) { opt_get = bucket_head(ti.base, h, true); }
     if (sel opt_get.some) {
         head = @opt_get.some;
         var existing: TypeId = head;
@@ -1467,10 +1643,10 @@ pub fun signature_converts(ti: *TypeInterner, a: TypeId, b: TypeId) bool {
 # ---
 # ti: the type store
 pub fun field_projection_reset(ti: *TypeInterner) {
-    $if (role.CHECKED) { role.touched(role.TYPE_MEMO, nil); }
+    $if (role.CHECKED) { role.touched(role.TYPE_MEMO, ti::ptr); }
 
     type_field.projection_reset(?ti.fields);
-    collections_vector.clear[u8](?ti.projected);
+    collections_vector.clear[u8](?ti.side.projected);
     ti.projection_generation = ti.projection_generation + 1;
 }
 
@@ -1490,8 +1666,8 @@ pub val PROJECTED_SPELLS_SECRET: Projected = 2;
 # the settled answer to projected fact `which` of `tid`, none while it is unsettled
 pub fun projected_get(ti: *TypeInterner, tid: TypeId, which: Projected) opt[bool] {
     val at: usize = index(tid)::usize;
-    if (at >= ti.projected.len) { ret opt[bool].none{}; }
-    val bits: u8 = ti.projected.data[at] >> (which * 2);
+    if (at >= ti.side.projected.len) { ret opt[bool].none{}; }
+    val bits: u8 = ti.side.projected.data[at] >> (which * 2);
     if ((bits & 1) == 0) { ret opt[bool].none{}; }
     ret opt[bool].some{(bits & 2) != 0};
 }
@@ -1504,25 +1680,25 @@ pub fun projected_get(ti: *TypeInterner, tid: TypeId, which: Projected) opt[bool
 # answer: its answer
 # ret:    ok, with nothing recorded for nil or the error type, or the failure growing the record
 pub fun projected_set(ti: *TypeInterner, tid: TypeId, which: Projected, answer: bool) err[fail.Fail] {
-    $if (role.CHECKED) { role.touched(role.TYPE_MEMO, nil); }
+    $if (role.CHECKED) { role.touched(role.TYPE_MEMO, ti::ptr); }
 
     if (is_nil(tid) || is_error(tid)) { ret err[fail.Fail].ok{}; }
     val at: usize = index(tid)::usize;
-    for (ti.projected.len <= at) {
-        val res_grown: res[usize, A.Error] = collections_vector.push[u8](?ti.projected, 0);
+    for (ti.side.projected.len <= at) {
+        val res_grown: res[usize, A.Error] = collections_vector.push[u8](?ti.side.projected, 0);
         if (sel res_grown.err) { ret err[fail.Fail].err{fail.refused(res_grown.err)}; }
     }
     var bits: u8 = 1;
     if (answer) { bits = 3; }
-    ti.projected.data[at] = ti.projected.data[at] | (bits << (which * 2));
+    ti.side.projected.data[at] = ti.side.projected.data[at] | (bits << (which * 2));
     ret err[fail.Fail].ok{};
 }
 
 # the identity recipe gave `tid`, none until it is asked for
 pub fun identity_get(ti: *TypeInterner, tid: TypeId) opt[u64] {
     val at: usize = index(tid)::usize;
-    if (at >= ti.identities.len || ti.identities.data[at] == 0) { ret opt[u64].none{}; }
-    ret opt[u64].some{ti.identities.data[at]};
+    if (at >= ti.side.identities.len || ti.side.identities.data[at] == 0) { ret opt[u64].none{}; }
+    ret opt[u64].some{ti.side.identities.data[at]};
 }
 
 # record the identity recipe gave `tid`
@@ -1532,15 +1708,15 @@ pub fun identity_get(ti: *TypeInterner, tid: TypeId) opt[u64] {
 # identity: the identity, nonzero since 0 reads as unasked
 # ret:      ok, with nothing recorded for nil or the error type, or the failure growing the record
 pub fun identity_set(ti: *TypeInterner, tid: TypeId, identity: u64) err[fail.Fail] {
-    $if (role.CHECKED) { role.touched(role.TYPE_MEMO, nil); }
+    $if (role.CHECKED) { role.touched(role.TYPE_MEMO, ti::ptr); }
 
     if (is_nil(tid) || is_error(tid)) { ret err[fail.Fail].ok{}; }
     val at: usize = index(tid)::usize;
-    for (ti.identities.len <= at) {
-        val res_grown: res[usize, A.Error] = collections_vector.push[u64](?ti.identities, 0);
+    for (ti.side.identities.len <= at) {
+        val res_grown: res[usize, A.Error] = collections_vector.push[u64](?ti.side.identities, 0);
         if (sel res_grown.err) { ret err[fail.Fail].err{fail.refused(res_grown.err)}; }
     }
-    ti.identities.data[at] = identity;
+    ti.side.identities.data[at] = identity;
     ret err[fail.Fail].ok{};
 }
 
@@ -1575,11 +1751,11 @@ pub fun field_table_stage_push_entry(ti: *TypeInterner, fe: FieldEntry) err[fail
 # a table published over one holding other fields drops every projected fact, since any of
 # them may have read the old one
 pub fun field_table_publish(ti: *TypeInterner, ty: TypeId, fields_start: u32, fields_len: u32) err[fail.Fail] {
-    $if (role.CHECKED) { role.touched(role.TYPE_MEMO, nil); }
+    $if (role.CHECKED) { role.touched(role.TYPE_MEMO, ti::ptr); }
 
     val res_published: res[bool, fail.Fail] = type_field.publish(?ti.fields, ty, fields_start, fields_len);
     if (sel res_published.err) { ret err[fail.Fail].err{res_published.err}; }
-    if (res_published.ok)      { collections_vector.clear[u8](?ti.projected); }
+    if (res_published.ok)      { collections_vector.clear[u8](?ti.side.projected); }
     ret err[fail.Fail].ok{};
 }
 
@@ -1595,7 +1771,7 @@ pub fun decoration_of(ti: *TypeInterner, tid: TypeId) Decoration {
 # d:   its decorations
 # ret: ok, or the failure growing the table
 pub fun decoration_set(ti: *TypeInterner, tid: TypeId, d: Decoration) err[fail.Fail] {
-    $if (role.CHECKED) { role.touched(role.TYPE_MEMO, nil); }
+    $if (role.CHECKED) { role.touched(role.TYPE_MEMO, ti::ptr); }
 
     ret type_field.decoration_set(?ti.fields, tid, d);
 }
@@ -1630,7 +1806,7 @@ pub fun is_tag(ti: *TypeInterner, tid: TypeId) bool {
 # disc: the discriminator type, TYPE_NIL to clear it
 # ret:  ok, with nothing recorded when `tid` is no tag, or the failure growing the table
 pub fun set_tag_discriminator(ti: *TypeInterner, tid: TypeId, disc: TypeId) err[fail.Fail] {
-    $if (role.CHECKED) { role.touched(role.TYPE_MEMO, nil); }
+    $if (role.CHECKED) { role.touched(role.TYPE_MEMO, ti::ptr); }
 
     val nom: TypeId = aggregate_nominal(ti, tid);
     if (!nominal_kind_is(ti, nom, TYPE_TAG)) { ret err[fail.Fail].ok{}; }
@@ -1749,8 +1925,9 @@ pub fun field_entry_at(ti: *TypeInterner, ft: *FieldTable, ix: u32) *FieldEntry 
 }
 
 fun intern_dedup(ti: *TypeInterner, t: Type) res[TypeId, fail.Fail] {
-    $if (role.CHECKED) { role.touched(role.TYPE_ADD, nil); }
+    $if (role.CHECKED) { role.touched(role.TYPE_ADD, ti::ptr); }
 
+    if (ti.base != nil) { ret layer_intern_dedup(ti, t); }
     val opt_get: opt[*TypeId] = map.get_by[Type, TypeId](?ti.dedup, ?t);
     if (sel opt_get.some) {
         ret res[TypeId, fail.Fail].ok{@opt_get.some};
@@ -1771,8 +1948,31 @@ fun intern_dedup(ti: *TypeInterner, t: Type) res[TypeId, fail.Fail] {
     ret res[TypeId, fail.Fail].ok{tid};
 }
 
+# `t` interned in a layer: found in it or a table under it by one hash, else made its own
+fun layer_intern_dedup(ti: *TypeInterner, t: Type) res[TypeId, fail.Fail] {
+    var key: Type          = t;
+    val h:   u64           = hash_type(?key);
+    var on:  *TypeInterner = ti;
+    for (on != nil) {
+        if (on.dedup.len != 0) {
+            val opt_get: opt[*TypeId] = map.get_by_hashed[Type, TypeId](?on.dedup, ?key, h);
+            if (sel opt_get.some) { ret res[TypeId, fail.Fail].ok{@opt_get.some}; }
+        }
+        on = on.base;
+    }
+    val res_append: res[TypeId, fail.Fail] = append_type(ti, t);
+    if (sel res_append.err) { ret res_append; }
+    val tid:        TypeId             = res_append.ok;
+    val res_insert: res[bool, A.Error] = map.insert_by_hashed[Type, TypeId](?ti.dedup, t, tid, h);
+    if (sel res_insert.err) {
+        ti.types.len = index(tid)::usize;
+        ret res[TypeId, fail.Fail].err{fail.refused(res_insert.err)};
+    }
+    ret res[TypeId, fail.Fail].ok{tid};
+}
+
 fun append_type(ti: *TypeInterner, t: Type) res[TypeId, fail.Fail] {
-    $if (role.CHECKED) { role.touched(role.TYPE_ADD, nil); }
+    $if (role.CHECKED) { role.touched(role.TYPE_ADD, ti::ptr); }
 
     if (t.kind::u32 >= TYPE_KIND_COUNT) { ret res[TypeId, fail.Fail].err{fail.message("type: kind is past TYPE_KIND_COUNT")}; }
     val count: usize = handle.chunk_count[Type](?ti.types);
@@ -1797,6 +1997,10 @@ fun append_type(ti: *TypeInterner, t: Type) res[TypeId, fail.Fail] {
 }
 
 fun reserve_params(ti: *TypeInterner, need: u32) err[fail.Fail] {
+    if (ti.params_lent) {
+        val err_owned: err[A.Error] = run_own[TypeId](ti.a, ?ti.params, ti.params_len, ?ti.params_cap, ?ti.params_lent);
+        if (sel err_owned.err) { ret err[fail.Fail].err{fail.refused(err_owned.err)}; }
+    }
     val err_grown: err[A.Error] = growth.reserve[TypeId](ti.a, ?ti.params, ?ti.params_cap, ti.params_len::usize + need::usize);
     if (sel err_grown.err) { ret err[fail.Fail].err{fail.refused(err_grown.err)}; }
     ret err[fail.Fail].ok{};
@@ -1960,4 +2164,279 @@ fun eq_type(a: *Type, b: *Type) bool {
     }
 
     ret true;
+}
+
+# whether a fact of `tid` may be kept in a store `ti` shares with other tables, as the type facts
+# and a laying are: every type of a root, and on a layer only its base's
+#[inline("always")]
+pub fun memo_keyed(ti: *TypeInterner, tid: TypeId) bool {
+    ret ti.base == nil || index(tid) < ti.base_types;
+}
+
+# the newest type in the function or instance bucket `h` of `ti` or a table under it
+fun bucket_head(ti: *TypeInterner, h: u64, instance: bool) opt[*TypeId] {
+    var on:  *TypeInterner = ti;
+    var key: u64           = h;
+    for (on != nil) {
+        var opt_get: opt[*TypeId] = opt[*TypeId].none{};
+        if (instance && on.instance_index.len != 0) { opt_get = map.get[u64, TypeId](?on.instance_index, ?key); }
+        or (!instance && on.fun_index.len != 0)     { opt_get = map.get[u64, TypeId](?on.fun_index, ?key); }
+        if (sel opt_get.some)                       { ret opt_get; }
+        on = on.base;
+    }
+    ret opt[*TypeId].none{};
+}
+
+# where each type a merged layer made landed in the table it was merged into: an id below the
+# layer's own range is its base's and stands, one in it is mapped
+# ---
+# base_types: how many types the layer's base held, the first id the layer made
+# ids:        where each type the layer made landed, in the order it made them
+# len:        how many of `ids` are filled
+pub rec Remap {
+    base_types: u32;
+    ids:        *TypeId;
+    len:        u32;
+}
+
+# release a remap's ids
+# ---
+# a: the allocator `merge` was given
+# r: the remap
+pub fun remap_dnit(a: *A.Allocator, r: *Remap) {
+    if (r.ids != nil && r.len > 0) { A.deallocate[TypeId](a, r.ids, r.len::usize); }
+    r.ids = nil;
+    r.len = 0;
+}
+
+# the id `tid` of the merged layer names in the table it was merged into
+# ---
+# r:   the remap
+# tid: an id the layer gave or read
+# ret: `tid` itself for the nil and error types and an id of the base, else where it landed
+pub fun remapped(r: *Remap, tid: TypeId) TypeId {
+    if (is_nil(tid) || is_error(tid) || index(tid) < r.base_types) { ret tid; }
+    ret r.ids[index(tid) - r.base_types];
+}
+
+# `layer` merged into `into`, a table over the same base: each type the layer made interned there
+# in the order the layer made it, its parts first mapped, since a type's parts are made before it,
+# then each field table the layer published, published there for the type it landed as. a table
+# `into` already holds for that type must hold the same fields. every string a type or table names
+# is mapped by `names`, from the interner the layer's types were named in to the one `into`'s are.
+# the remap names where each of the layer's types landed
+pub fun merge(into: *TypeInterner, layer: *TypeInterner, names: *intern.Remap, a: *A.Allocator) res[Remap, fail.Fail] {
+    var out: Remap = Remap{base_types: layer.base_types, ids: nil, len: 0};
+    if (layer.base == nil || !descends(into, layer.base)) {
+        ret res[Remap, fail.Fail].err{fail.message("type: a layer was merged into a table not over its base")};
+    }
+    val count: u32 = own_type_count(layer);
+    if (count > 0) {
+        val res_ids: res[*TypeId, A.Error] = A.allocate[TypeId](a, count::usize);
+        if (sel res_ids.err) { ret res[Remap, fail.Fail].err{fail.refused(res_ids.err)}; }
+        out.ids = res_ids.ok;
+    }
+    var kept: bool = false;
+    fin {
+        if (!kept) { remap_dnit(a, ?out); }
+    }
+    var parts: Vector[TypeId] = collections_vector.init[TypeId](a);
+    fin { collections_vector.dnit[TypeId](?parts); }
+    var ops: Vector[u32] = collections_vector.init[u32](a);
+    fin { collections_vector.dnit[u32](?ops); }
+    var j: u32 = 0;
+    for (j < count) {
+        val res_landed: res[TypeId, fail.Fail] = merge_one(into, layer, ?out, names, @handle.chunk_get[Type](?layer.types, (layer.base_types + j)::usize), ?parts, ?ops);
+        if (sel res_landed.err) { ret res[Remap, fail.Fail].err{res_landed.err}; }
+        out.ids[j] = res_landed.ok;
+        out.len    = j + 1;
+        j          = j + 1;
+    }
+    val err_tables: err[fail.Fail] = merge_tables(into, layer, ?out, names);
+    if (sel err_tables.err) { ret res[Remap, fail.Fail].err{err_tables.err}; }
+    kept = true;
+    ret res[Remap, fail.Fail].ok{out};
+}
+
+# whether `ti` answers every type `base` holds: it is `base`, or layered over it
+pub fun descends(ti: *TypeInterner, base: *TypeInterner) bool {
+    var on: *TypeInterner = ti;
+    for (on != nil) {
+        if (on == base) { ret true; }
+        on = on.base;
+    }
+    ret false;
+}
+
+# the type `t`, one `layer` made, interned in `into` with its parts mapped by `r` and its strings by `names`
+fun merge_one(into: *TypeInterner, layer: *TypeInterner, r: *Remap, names: *intern.Remap, t: Type, parts: *Vector[TypeId], ops: *Vector[u32]) res[TypeId, fail.Fail] {
+    var mapped: Type     = t;
+    val k:      TypeKind = t.kind;
+    if (k == TYPE_FUN || k == TYPE_INSTANCE) {
+        var start: u32 = t.data.fn.params_start;
+        var len:   u32 = t.data.fn.params_len;
+        if (k == TYPE_INSTANCE) {
+            start = t.data.instance.args_start;
+            len   = t.data.instance.args_len;
+        }
+        collections_vector.clear[TypeId](parts);
+        var i: u32 = 0;
+        for (i < len) {
+            val res_pushed: res[usize, A.Error] = collections_vector.push[TypeId](parts, remapped(r, layer.params[start + i]));
+            if (sel res_pushed.err) { ret res[TypeId, fail.Fail].err{fail.refused(res_pushed.err)}; }
+            i = i + 1;
+        }
+        if (k == TYPE_FUN) { ret intern_function(into, remapped(r, t.data.fn.ret_type), parts.data, len, t.data.fn.c_variadic, t.data.fn.timed); }
+        ret intern_instance(into, remapped(r, t.data.instance.nominal), parts.data, len);
+    }
+    if (k == TYPE_HANDLE) {
+        collections_vector.clear[u32](ops);
+        var i: u32 = 0;
+        for (i < t.data.handle.ops_len) {
+            var op: u32 = layer.handle_ops[t.data.handle.ops_start + i];
+            # operands are pairs, the part then its value, and a type operand's value is a type
+            if ((i & 1) == 1 && layer.handle_ops[t.data.handle.ops_start + i - 1] == HANDLE_PART_TYPE) { op = remapped(r, op::TypeId)::u32; }
+            or ((i & 1) == 1 && layer.handle_ops[t.data.handle.ops_start + i - 1] == HANDLE_PART_NAME) { op = intern.remapped(names, op::intern.StrId)::u32; }
+            val res_pushed: res[usize, A.Error] = collections_vector.push[u32](ops, op);
+            if (sel res_pushed.err) { ret res[TypeId, fail.Fail].err{fail.refused(res_pushed.err)}; }
+            i = i + 1;
+        }
+        ret intern_handle(into, intern.remapped(names, t.data.handle.name), intern.remapped(names, t.data.handle.ctor::intern.StrId)::u32, ops.data, t.data.handle.ops_len);
+    }
+    if (k == TYPE_POINTER) { mapped.data.pointer.base = remapped(r, t.data.pointer.base); }
+    or (k == TYPE_SECRET)  { mapped.data.secret.base = remapped(r, t.data.secret.base); }
+    or (k == TYPE_ARRAY)   { mapped.data.array.base = remapped(r, t.data.array.base); }
+    or (k == TYPE_CASE_SELECTOR) {
+        mapped.data.case_selector.tag_type  = remapped(r, t.data.case_selector.tag_type);
+        mapped.data.case_selector.case_name = intern.remapped(names, t.data.case_selector.case_name);
+    }
+    or (k == TYPE_ABI) { mapped.data.abi.name = intern.remapped(names, t.data.abi.name); }
+    or (k == TYPE_REC || k == TYPE_UNI || k == TYPE_TAG) {
+        mapped.data.nominal.name   = intern.remapped(names, t.data.nominal.name);
+        mapped.data.nominal.syntax = intern.remapped(names, t.data.nominal.syntax);
+    }
+    or (k == TYPE_GENERIC_PARAM) {
+        mapped.data.generic_param.name       = intern.remapped(names, t.data.generic_param.name);
+        mapped.data.generic_param.owner_name = intern.remapped(names, t.data.generic_param.owner_name);
+    }
+    mapped.facts = 0;
+    ret intern_dedup(into, mapped);
+}
+
+# each field table `layer` published, in the order it published them, published in `into` for the
+# type it landed as, its field names mapped by `names`, with its discriminator and decorations
+fun merge_tables(into: *TypeInterner, layer: *TypeInterner, r: *Remap, names: *intern.Remap) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < type_field.own_count(?layer.fields)) {
+        val ft:       *FieldTable      = type_field.own_at(?layer.fields, i);
+        val ty:       TypeId           = remapped(r, ft.ty);
+        val opt_held: opt[*FieldTable] = field_table_for(into, ty);
+        if (sel opt_held.some) {
+            if (!table_holds(into, opt_held.some, layer, ft, r, names)) { ret err[fail.Fail].err{fail.message("type: a merged layer's field table disagrees with its target's")}; }
+            i = i + 1;
+            cnt;
+        }
+        val res_start: res[u32, fail.Fail] = field_table_stage(into, ft.fields_len);
+        if (sel res_start.err) { ret err[fail.Fail].err{res_start.err}; }
+        var f: u32 = 0;
+        for (f < ft.fields_len) {
+            var fe: FieldEntry = @field_entry_at(layer, ft, f);
+            fe.ty                  = remapped(r, fe.ty);
+            fe.name                = intern.remapped(names, fe.name);
+            fe.deprecation.message = intern.remapped(names, fe.deprecation.message);
+            val err_pushed: err[fail.Fail] = field_table_stage_push_entry(into, fe);
+            if (sel err_pushed.err) { ret err_pushed; }
+            f = f + 1;
+        }
+        val err_published: err[fail.Fail] = field_table_publish(into, ty, res_start.ok, ft.fields_len);
+        if (sel err_published.err) { ret err_published; }
+        i = i + 1;
+    }
+    var it:    map.Iter = map.iter[TypeId, TypeId](?layer.fields.discriminators);
+    var entry: map.Entry[TypeId, TypeId];
+    for (map.next[TypeId, TypeId](?layer.fields.discriminators, ?it, ?entry)) {
+        val err_set: err[fail.Fail] = type_field.discriminator_set(?into.fields, remapped(r, @entry.key), remapped(r, @entry.value));
+        if (sel err_set.err) { ret err_set; }
+    }
+    var at:        map.Iter = map.iter[TypeId, Decoration](?layer.fields.decorations);
+    var decorated: map.Entry[TypeId, Decoration];
+    for (map.next[TypeId, Decoration](?layer.fields.decorations, ?at, ?decorated)) {
+        val err_set: err[fail.Fail] = type_field.decoration_set(?into.fields, remapped(r, @decorated.key), @decorated.value);
+        if (sel err_set.err) { ret err_set; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# whether table `held` of `into` holds the fields `ft` of `layer` does, their types mapped by `r` and their
+# names by `names`
+fun table_holds(into: *TypeInterner, held: *FieldTable, layer: *TypeInterner, ft: *FieldTable, r: *Remap, names: *intern.Remap) bool {
+    if (held.fields_len != ft.fields_len) { ret false; }
+    var f: u32 = 0;
+    for (f < ft.fields_len) {
+        val had: *FieldEntry = field_entry_at(into, held, f);
+        val now: *FieldEntry = field_entry_at(layer, ft, f);
+        if (had.name != intern.remapped(names, now.name) || !same(had.ty, remapped(r, now.ty))) { ret false; }
+        f = f + 1;
+    }
+    ret true;
+}
+
+# `layer` folded into its base, which took nothing since the layer was made: each type, parameter,
+# handle operand and field table the layer made appended there in order, so every id the layer
+# gave names the same type in the base. its side's memos hold for the base after, uncut (side_take)
+pub fun fold(layer: *TypeInterner) err[fail.Fail] {
+    val base: *TypeInterner = layer.base;
+    if (base == nil || type_count(base) != layer.base_types || base.params_len != layer.base_params || base.handles_len != layer.base_handles
+        || base.handle_ops_len != layer.base_ops) {
+        ret err[fail.Fail].err{fail.message("type: a layer was folded into a base that changed under it")};
+    }
+    val params: u32 = layer.params_len - layer.base_params;
+    if (params > 0) {
+        val res_start: res[u32, fail.Fail] = params_append(base, ?layer.params[layer.base_params], params);
+        if (sel res_start.err) { ret err[fail.Fail].err{res_start.err}; }
+    }
+    val ops: u32 = layer.handle_ops_len - layer.base_ops;
+    if (ops > 0) {
+        val res_ops: res[u32, fail.Fail] = handle_ops_append(base, ?layer.handle_ops[layer.base_ops], ops);
+        if (sel res_ops.err) { ret err[fail.Fail].err{res_ops.err}; }
+    }
+    var j: u32 = layer.base_types;
+    for (j < type_count(layer)) {
+        val t:          Type                   = @handle.chunk_get[Type](?layer.types, j::usize);
+        val res_placed: res[TypeId, fail.Fail] = type_place(base, t);
+        if (sel res_placed.err) { ret err[fail.Fail].err{res_placed.err}; }
+        val tid: TypeId = res_placed.ok;
+        if (t.kind == TYPE_HANDLE) {
+            val err_track: err[fail.Fail] = track_handle(base, tid);
+            if (sel err_track.err) { ret err_track; }
+        }
+        or (t.kind == TYPE_FUN) {
+            val h:           u64                = hash_fun(t.data.fn.ret_type, ?base.params[t.data.fn.params_start], t.data.fn.params_len, t.data.fn.c_variadic, t.data.fn.timed);
+            val res_indexed: res[bool, A.Error] = map.insert[u64, TypeId](?base.fun_index, h, tid);
+            if (sel res_indexed.err) { ret err[fail.Fail].err{fail.refused(res_indexed.err)}; }
+        }
+        or (t.kind == TYPE_INSTANCE) {
+            val h:           u64                = hash_instance(t.data.instance.nominal, ?base.params[t.data.instance.args_start], t.data.instance.args_len);
+            val res_indexed: res[bool, A.Error] = map.insert[u64, TypeId](?base.instance_index, h, tid);
+            if (sel res_indexed.err) { ret err[fail.Fail].err{fail.refused(res_indexed.err)}; }
+        }
+        or {
+            val res_indexed: res[bool, A.Error] = map.insert_by[Type, TypeId](?base.dedup, t, tid);
+            if (sel res_indexed.err) { ret err[fail.Fail].err{fail.refused(res_indexed.err)}; }
+        }
+        j = j + 1;
+    }
+    ret type_field.fold(?layer.fields);
+}
+
+# `t`, its facts already read, appended to `ti` as it stands
+fun type_place(ti: *TypeInterner, t: Type) res[TypeId, fail.Fail] {
+    val tid:              TypeId                                      = id(type_count(ti));
+    val res_chunk_editor: res[handle.ChunkEditor[Type], handle.Error] = handle.chunk_editor[Type](?ti.types);
+    if (sel res_chunk_editor.err) { ret res[TypeId, fail.Fail].err{fail.message(handle.text(res_chunk_editor.err))}; }
+    var ce:       handle.ChunkEditor[Type] = res_chunk_editor.ok;
+    val res_push: res[*Type, handle.Error] = handle.chunk_append[Type](?ce, t);
+    handle.chunk_editor_finish[Type](?ce);
+    if (sel res_push.err) { ret res[TypeId, fail.Fail].err{fail.message(handle.text(res_push.err))}; }
+    ret res[TypeId, fail.Fail].ok{tid};
 }

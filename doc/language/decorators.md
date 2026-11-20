@@ -523,8 +523,7 @@ caller's instruction cache, or to hold code size down on a constrained target.
 - Purely a hint to the inliner; it does not otherwise change codegen. It binds
   in every build, and a build that does not optimize runs no inlining pass at
   all, so `inline("never")` is inert (and unnecessary) there — and it will bind
-  identically when a callee body is available from another module. Recursive
-  peeling also respects `inline("never")` and `vectorize("never")`.
+  identically when a callee body is available from another module.
 - v6's bare `#[inline]` is `#[inline("always")]`, and its `#[noinline]` is
   `#[inline("never")]`. Each v6 spelling is refused, naming its replacement (see
   [v6 spellings](#v6-spellings)).
@@ -979,8 +978,8 @@ fun reference_sum(a: *i64, n: usize) i64 { ... }
 A `#[vectorize("never")]` function is also declined by the inliner, so the opt-out survives
 inlining — it cannot be lost by the body moving into an unflagged caller. Use it
 for a scalar reference twin in a differential test, or where vectorized codegen
-is undesirable for a specific function. The project-wide equivalent is the
-`vectorize` profile key (see [manifest.md](manifest.md#profilename)).
+is undesirable for a specific function. No profile key turns vectorization off for a
+whole build (see [manifest.md](manifest.md#profilename)).
 
 ### `naked` — no prologue, no epilogue, body as written
 
@@ -1065,7 +1064,11 @@ fun compress(state: *[8]u32, block: *[64]u8) {
 This is the same contract as Rust's `target_feature(enable = "...")` attribute and
 gcc's `__attribute__((target("...")))`. Inside the function, inline `asm` may
 use every instruction the named extensions admit, in addition to what the
-target selects. **The caller owns the run-time check.** Calling an outlier on a
+target selects. The compiler builds the function's own code under the same
+widened selection: a vector operation the named extensions compute is taken
+whole there, so under `simd = "require"` an `i64x4` comparison in a function
+naming `avx2` is accepted on a baseline x86-64 target, and the rest of the
+program keeps the target's selection. **The caller owns the run-time check.** Calling an outlier on a
 processor that lacks one of its extensions is undefined behaviour, typically an
 illegal-instruction trap. The compiler neither inserts the check nor verifies
 that one precedes the call, because only the program knows how it detects the
@@ -1301,4 +1304,4 @@ A v6 spelling is refused with `decorator.unknown`, naming the v7 spelling, and
 - [val-var.md](val-var.md) — `val` / `var` bindings, and the `embed` exemption to `val`'s initializer requirement
 - [grammar.md](grammar.md#types) — the `[_]` inferred array length `embed` introduces
 - [types.md](types.md) — the SIMD vector types a shader stage computes over and `intrinsic` operates on, and the handle types `handle` declares
-- [manifest.md](manifest.md) — the `vectorize` profile key `vectorize("never")` opts out of, and content-fingerprinted build inputs (`embed`, `[step]` `in`)
+- [manifest.md](manifest.md) — the removed `vectorize` profile key, and content-fingerprinted build inputs (`embed`, `[step]` `in`)

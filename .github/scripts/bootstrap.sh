@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # walks the bootstrap chain (.github/bootstrap-chain) and builds this compiler
-# from its last step: that step builds a, a builds b, and --fixpoint adds c and
-# requires b == c.
+# from its last step: that step builds a at debug, so no older optimiser compiles
+# this tree, a builds b at the profile, and --fixpoint adds c, built by b at the
+# profile on another thread count, and requires b == c.
 # contract: reads RUNNER_OS and RUNNER_TEMP from the runner, and writes
 # MACH=<absolute path of the last stage> to GITHUB_ENV for later steps.
 #
@@ -75,12 +76,12 @@ for sha in $steps; do
 done
 
 "$prev" dep pull .
-"$prev" build . --profile "$profile" -o "a$exe"
+"$prev" build . --profile debug -o "a$exe"
 "./a$exe" dep pull .
-"./a$exe" build . --profile "$profile" -o "b$exe"
+"./a$exe" build . --profile "$profile" --threads 2 -o "b$exe"
 last=b$exe
 if [ "$fixpoint" = 1 ]; then
-    "./b$exe" build . --profile "$profile" -o "c$exe"
+    "./b$exe" build . --profile "$profile" --threads 3 -o "c$exe"
     cmp "b$exe" "c$exe" || { echo "::error::the $profile build did not reach its fixpoint"; exit 1; }
     last=c$exe
 fi
