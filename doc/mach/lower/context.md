@@ -99,6 +99,10 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`fin_count`](#fin_count) | how many `fin` blocks are open |
 | [`fin_at`](#fin_at) | the `fin` block opened `i`th, counting from the outermost |
 | [`pop_fins_to`](#pop_fins_to) | close every `fin` block opened after `mark` |
+| [`local_for`](#local_for) | a slot for a local whose storage begins here and ends where control leaves its block (`end_scopes_from`) |
+| [`scope_count`](#scope_count) | how many locals' storage has begun and not ended |
+| [`end_scopes_from`](#end_scopes_from) | the storage of each local begun since `mark` ended, the latest first, where control still reaches |
+| [`pop_scopes_to`](#pop_scopes_to) | forget every local begun after `mark`, whose storage its block's exits have ended |
 | [`ptr_or_none`](#ptr_or_none) | the pointer type, which every address is held in |
 | [`byte_type`](#byte_type) | the byte type, which a global another module defines is declared as when only its address is taken |
 | [`builder_state`](#builder_state) | the first refusal the builder met, which every builder call after it skips |
@@ -186,9 +190,10 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 
 ```mach
 pub rec LoopFrame {
-    header:    mirl.ir.id.Block;
-    exit:      mirl.ir.id.Block;
-    fin_depth: u32;
+    header:      mirl.ir.id.Block;
+    exit:        mirl.ir.id.Block;
+    fin_depth:   u32;
+    scope_depth: u32;
 }
 ```
 
@@ -199,6 +204,7 @@ a loop the walk is inside, which `brk` and `cnt` branch out of
 | `header` | `mirl.ir.id.Block` | the block `cnt` branches to |
 | `exit` | `mirl.ir.id.Block` | the block `brk` branches to |
 | `fin_depth` | `u32` | the `fin` blocks open when the loop began, which a jump out of it runs down to |
+| `scope_depth` | `u32` | the locals whose storage had begun when the loop began, whose storage a jump out of it does not end |
 
 ## Machine
 
@@ -671,6 +677,9 @@ pub rec LowerContext {
     fins:    *mach.front.ast.id.StmtId;
     fin_len: u32;
     fin_cap: u32;
+
+    # the slots of the locals whose storage has begun and not yet ended, innermost last
+    scoped: std.collections.vector.Vector[mach.lower.value.Value];
 
     # the instance set whose frames the code being lowered is read through: the module's own,
     # or the set of the instance being lowered, and the store that instance's constants are in
@@ -1230,6 +1239,61 @@ close every `fin` block opened after `mark`
 | :--- | :--- |
 | `lc` | the lowering context |
 | `mark` | a count fin_count gave |
+
+### local_for
+
+```mach
+pub fun local_for(lc: *LowerContext, tid: mach.type.kind.TypeId, ir: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
+```
+
+a slot for a local whose storage begins here and ends where control leaves its block (`end_scopes_from`)
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `tid` | the local's source type |
+| `ir` | the ir type the slot holds |
+| **returns** | the slot's address, or the failure of making it or of stating where its storage begins |
+
+### scope_count
+
+```mach
+pub fun scope_count(lc: *LowerContext) u32
+```
+
+how many locals' storage has begun and not ended
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| **returns** | the count, a mark `end_scopes_from` and `pop_scopes_to` take |
+
+### end_scopes_from
+
+```mach
+pub fun end_scopes_from(lc: *LowerContext, mark: u32) err[mach.base.fail.Fail]
+```
+
+the storage of each local begun since `mark` ended, the latest first, where control still reaches
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `mark` | a count scope_count gave |
+| **returns** | nothing, or the failure mirl's builder kept |
+
+### pop_scopes_to
+
+```mach
+pub fun pop_scopes_to(lc: *LowerContext, mark: u32)
+```
+
+forget every local begun after `mark`, whose storage its block's exits have ended
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `mark` | a count scope_count gave |
 
 ### ptr_or_none
 

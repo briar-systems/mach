@@ -138,6 +138,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`emit_atomic_store`](#emit_atomic_store) | an atomic write of `x` to `addr` |
 | [`emit_atomic_rmw`](#emit_atomic_rmw) | an atomic read-modify-write, giving the value held before |
 | [`emit_atomic_cmpxchg`](#emit_atomic_cmpxchg) | an atomic compare and exchange, giving the value held before |
+| [`emit_scope`](#emit_scope) | where the storage of `slot`, an alloca's result, begins or ends, unmarked whatever the builder marks |
 | [`emit_fence`](#emit_fence) | a memory fence of `order` |
 | [`emit_call`](#emit_call) | a call of `callee` through the signature `sig`, every argument named |
 | [`emit_call_named`](#emit_call_named) | a call of `callee` through the signature `sig`, of which `named` states how many arguments are named, the rest being a C-variadic call's unnamed ones |
@@ -1624,6 +1625,22 @@ pub fun emit_atomic_cmpxchg(b: *Builder, addr: mach.lower.value.Value, expected:
 ```
 
 an atomic compare and exchange, giving the value held before
+
+### emit_scope
+
+```mach
+pub fun emit_scope(b: *Builder, slot: mach.lower.value.Value, begins: bool) err[mach.base.fail.Fail]
+```
+
+where the storage of `slot`, an alloca's result, begins or ends, unmarked
+whatever the builder marks
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `slot` | the alloca's result |
+| `begins` | true for where its storage begins, false for where it ends |
+| **returns** | nothing, or the failure mirl's builder kept |
 
 ### emit_fence
 
