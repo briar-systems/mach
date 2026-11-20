@@ -3,15 +3,21 @@
 # a tag payload place `P.c` is readable, writable and addressable only inside a guard for that
 # place and case. a guard opens on `if (sel P.c)`, after a chain of exiting `sel` tests on one
 # place that leaves one case untested, and in the final `or` of such a chain. guards are frames on
-# the caller's stack, linked through the sema context and closed when their region ends, so no
-# flow fact is ever kept. a place is matched by its spelling, so one that spelling cannot match is
-# refused at the `sel`, and inside a guard no assignment may replace the guarded place whole or
-# an object it is reached through.
+# the caller's stack, linked through the sema context and closed when their region ends. a place is
+# matched by its spelling, so one that spelling cannot match is refused at the `sel`, and inside a
+# guard no assignment may replace the guarded place whole or an object it is reached through.
+#
+# the one flow fact kept is a guard's end: an assignment to anything else the spelling names, a
+# subscript or a pointer the place is reached through, moves the spelling onto storage nothing
+# tested, so the frame is marked ended and every later lookup in its region misses it. later is
+# the text after the assignment, the whole of a loop that holds one, since a later iteration runs
+# after it, and a `fin` body when the rest of its block holds one, since the fin replays after it.
 
 use A: std.allocator;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
@@ -41,6 +47,8 @@ use type_kind:  mach.type.kind;
 pub fun push(sc: *sema_context.SemaContext, frame: *sema_context.Guard, place: ast_id.ExprId, case_name: intern.StrId) {
     frame.place     = place;
     frame.case_name = case_name;
+    frame.ended     = false;
+    frame.hidden_by = ast_id.STMT_NIL;
     frame.prev      = sc.walk.guards;
     sc.walk.guards  = frame;
 }
@@ -61,17 +69,116 @@ pub fun sel_begin(sc: *sema_context.SemaContext, cond: ast_id.ExprId, frame: *se
     ret res[bool, fail.Fail].ok{true};
 }
 
-pub fun guarded(sc: *sema_context.SemaContext, place: ast_id.ExprId, case_name: intern.StrId) res[bool, fail.Fail] {
-    var g: *sema_context.Guard = sc.walk.guards;
+# whether an open guard holds `place` for `case_name`, or only one that has ended does
+pub fun guarded(sc: *sema_context.SemaContext, place: ast_id.ExprId, case_name: intern.StrId) res[sema_context.Hold, fail.Fail] {
+    var hold: sema_context.Hold   = sema_context.Hold.none{};
+    var g:    *sema_context.Guard = sc.walk.guards;
     for (g != nil) {
         if (intern.str_same(g.case_name, case_name)) {
             val res_same: res[bool, fail.Fail] = place_equal(sc, g.place, place);
-            if (sel res_same.err) { ret res_same; }
-            if (res_same.ok)      { ret res_same; }
+            if (sel res_same.err)       { ret res[sema_context.Hold, fail.Fail].err{res_same.err}; }
+            if (res_same.ok && live(g)) { ret res[sema_context.Hold, fail.Fail].ok{sema_context.Hold.held{}}; }
+            if (res_same.ok)            { hold = sema_context.Hold.ended{}; }
         }
         g = g.prev;
     }
+    ret res[sema_context.Hold, fail.Fail].ok{hold};
+}
+
+fun live(g: *sema_context.Guard) bool {
+    ret !g.ended && ast_id.stmt_is_nil(g.hidden_by);
+}
+
+# a loop runs its condition and body again after any assignment in them, so a guard open at the
+# loop that an assignment inside it moves is ended for the whole loop
+pub fun loop_begin(sc: *sema_context.SemaContext, span: base_source.Span) err[fail.Fail] {
+    var g: *sema_context.Guard = sc.walk.guards;
+    for (g != nil) {
+        if (live(g)) {
+            val res_moved: res[bool, fail.Fail] = moved_within(sc, span.offset, span.offset + span.len, g.place);
+            if (sel res_moved.err) { ret err[fail.Fail].err{res_moved.err}; }
+            if (res_moved.ok)      { g.ended = true; }
+        }
+        g = g.prev;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a `fin` body replays when its block ends, after the rest of the block, so inside the body a guard
+# that an assignment in that rest moves does not hold
+pub fun fin_begin(sc: *sema_context.SemaContext, fin: ast_id.StmtId, span: base_source.Span) err[fail.Fail] {
+    val rest: usize               = span.offset + span.len;
+    val end:  usize               = sc.walk.block.offset + sc.walk.block.len;
+    var g:    *sema_context.Guard = sc.walk.guards;
+    for (g != nil) {
+        if (live(g) && rest < end) {
+            val res_moved: res[bool, fail.Fail] = moved_within(sc, rest, end, g.place);
+            if (sel res_moved.err) { ret err[fail.Fail].err{res_moved.err}; }
+            if (res_moved.ok)      { g.hidden_by = fin; }
+        }
+        g = g.prev;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun fin_end(sc: *sema_context.SemaContext, fin: ast_id.StmtId) {
+    var g: *sema_context.Guard = sc.walk.guards;
+    for (g != nil) {
+        if (ast_id.stmt_same(g.hidden_by, fin)) { g.hidden_by = ast_id.STMT_NIL; }
+        g = g.prev;
+    }
+}
+
+# an assignment written between `start` and `end` moves `place`; only a place with a subscript name
+# or a pointer in it can be moved, so any other skips the search
+fun moved_within(sc: *sema_context.SemaContext, start: usize, end: usize, place: ast_id.ExprId) res[bool, fail.Fail] {
+    val res_movable: res[bool, fail.Fail] = movable(sc, place);
+    if (sel res_movable.err) { ret res_movable; }
+    if (!res_movable.ok)     { ret res_movable; }
+    var i: usize = 0;
+    for (i < sc.view.a.exprs.len) {
+        val e: *ast_expr.Expr = ?sc.view.a.exprs.data[i];
+        if (e.kind == ast_expr.EXPR_KIND_BINARY && e.data.binary.op == ast_expr.BIN_ASSIGN && e.span.offset >= start && e.span.offset + e.span.len <= end) {
+            val res_spanned: res[ast_id.ExprId, fail.Fail] = range_object(sc, e.data.binary.lhs);
+            if (sel res_spanned.err) { ret res[bool, fail.Fail].err{res_spanned.err}; }
+            val res_moves: res[bool, fail.Fail] = moves(sc, e.data.binary.lhs, res_spanned.ok, place);
+            if (sel res_moves.err) { ret res_moves; }
+            if (res_moves.ok)      { ret res_moves; }
+        }
+        i = i + 1;
+    }
     ret res[bool, fail.Fail].ok{false};
+}
+
+# the place's spelling has a name standing as a subscript or a part of pointer type, the only
+# parts an assignment can move without replacing the case
+fun movable(sc: *sema_context.SemaContext, eid: ast_id.ExprId) res[bool, fail.Fail] {
+    if (ast_id.expr_is_nil(eid))                          { ret res[bool, fail.Fail].ok{false}; }
+    if (type.is_pointer(sc.s.types, place_type(sc, eid))) { ret res[bool, fail.Fail].ok{true}; }
+    val res_expr: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, eid);
+    if (sel res_expr.err) { ret res[bool, fail.Fail].err{res_expr.err}; }
+    val e: ast_expr.Expr     = res_expr.ok;
+    val k: ast_expr.ExprKind = e.kind;
+    if (stack.exhausted())              { ret res[bool, fail.Fail].err{refused(sc, e.span)}; }
+    if (k == ast_expr.EXPR_KIND_IDENT)  { ret res[bool, fail.Fail].ok{false}; }
+    if (k == ast_expr.EXPR_KIND_MEMBER) { ret movable(sc, e.data.member.object); }
+    if (k == ast_expr.EXPR_KIND_PROJECT) {
+        if (is_ident(sc, e.data.project.field)) { ret res[bool, fail.Fail].ok{true}; }
+        ret movable(sc, e.data.project.object);
+    }
+    if (k == ast_expr.EXPR_KIND_INDEX) {
+        if (is_ident(sc, e.data.index.index) || is_ident(sc, e.data.index.count)) { ret res[bool, fail.Fail].ok{true}; }
+        ret movable(sc, e.data.index.object);
+    }
+    if (k == ast_expr.EXPR_KIND_UNARY && e.data.unary.op == ast_expr.UN_DEREF) { ret movable(sc, e.data.unary.operand); }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+fun is_ident(sc: *sema_context.SemaContext, eid: ast_id.ExprId) bool {
+    if (ast_id.expr_is_nil(eid)) { ret false; }
+    val res_expr: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, eid);
+    if (sel res_expr.err) { ret false; }
+    ret res_expr.ok.kind == ast_expr.EXPR_KIND_IDENT;
 }
 
 # a chain whose arms all test one place with `sel` or `!sel` and all exit leaves the block knowing
@@ -159,23 +266,70 @@ fun remaining_begin(sc: *sema_context.SemaContext, sid: ast_id.StmtId, place: as
 }
 
 # whole-value assignment to a guarded place, or to an object it is reached through, replaces the case
+# and is refused; an assignment to anything else the place's spelling names moves it and ends the
+# guard. a guard a `fin` body does not see is ended by either, since the fin replays inside its region
 pub fun check_assign(sc: *sema_context.SemaContext, lhs: ast_id.ExprId, span: base_source.Span) {
+    val res_spanned: res[ast_id.ExprId, fail.Fail] = range_object(sc, lhs);
+    if (sel res_spanned.err) { ret; }
     var g: *sema_context.Guard = sc.walk.guards;
     for (g != nil) {
-        val res_covered: res[bool, fail.Fail] = covers(sc, lhs, g.place);
-        if (sel res_covered.err) { ret; }
-        if (res_covered.ok) {
-            val opt_name: opt[str] = intern.get(sc.s.interner, g.case_name);
-            if (sel opt_name.none) {
-                sema_context.report_internal(sc, span, fail.message("a guard's case name is not interned"));
+        if (!g.ended) {
+            val res_covered: res[bool, fail.Fail] = covers(sc, lhs, g.place);
+            if (sel res_covered.err) { ret; }
+            if (res_covered.ok && live(g)) {
+                val opt_name: opt[str] = intern.get(sc.s.interner, g.case_name);
+                if (sel opt_name.none) {
+                    sema_context.report_internal(sc, span, fail.message("a guard's case name is not interned"));
+                    ret;
+                }
+                sema_context.reportf(sc, diagnostic_kind.GUARD_ASSIGN, span,
+                    "cannot assign to this place inside a guard for its `{}` payload. bind the new value to a new name", opt_name.some);
                 ret;
             }
-            sema_context.reportf(sc, diagnostic_kind.GUARD_ASSIGN, span,
-                "cannot assign to this place inside a guard for its `{}` payload. bind the new value to a new name", opt_name.some);
-            ret;
+            val res_moved: res[bool, fail.Fail] = moves(sc, lhs, res_spanned.ok, g.place);
+            if (sel res_moved.err)              { ret; }
+            if (res_covered.ok || res_moved.ok) { g.ended = true; }
         }
         g = g.prev;
     }
+}
+
+# an assignment to `lhs`, whose range spans `spanned` when it is one, writes a part of the place's
+# spelling: the place, an object or pointer it is reached through, a subscript name, or the
+# elements an index selects from
+fun moves(sc: *sema_context.SemaContext, lhs: ast_id.ExprId, spanned: ast_id.ExprId, eid: ast_id.ExprId) res[bool, fail.Fail] {
+    if (ast_id.expr_is_nil(eid)) { ret res[bool, fail.Fail].ok{false}; }
+    val res_same: res[bool, fail.Fail] = place_equal(sc, lhs, eid);
+    if (sel res_same.err) { ret res_same; }
+    if (res_same.ok)      { ret res_same; }
+    val res_expr: res[ast_expr.Expr, fail.Fail] = sema_context.expression(sc, eid);
+    if (sel res_expr.err) { ret res[bool, fail.Fail].err{res_expr.err}; }
+    val e: ast_expr.Expr     = res_expr.ok;
+    val k: ast_expr.ExprKind = e.kind;
+    if (stack.exhausted())              { ret res[bool, fail.Fail].err{refused(sc, e.span)}; }
+    if (k == ast_expr.EXPR_KIND_MEMBER) { ret moves(sc, lhs, spanned, e.data.member.object); }
+    if (k == ast_expr.EXPR_KIND_PROJECT) {
+        val res_field: res[bool, fail.Fail] = moves(sc, lhs, spanned, e.data.project.field);
+        if (sel res_field.err) { ret res_field; }
+        if (res_field.ok)      { ret res_field; }
+        ret moves(sc, lhs, spanned, e.data.project.object);
+    }
+    if (k == ast_expr.EXPR_KIND_INDEX) {
+        if (!ast_id.expr_is_nil(spanned)) {
+            val res_spans: res[bool, fail.Fail] = place_equal(sc, spanned, e.data.index.object);
+            if (sel res_spans.err) { ret res_spans; }
+            if (res_spans.ok)      { ret res_spans; }
+        }
+        val res_index: res[bool, fail.Fail] = moves(sc, lhs, spanned, e.data.index.index);
+        if (sel res_index.err) { ret res_index; }
+        if (res_index.ok)      { ret res_index; }
+        val res_count: res[bool, fail.Fail] = moves(sc, lhs, spanned, e.data.index.count);
+        if (sel res_count.err) { ret res_count; }
+        if (res_count.ok)      { ret res_count; }
+        ret moves(sc, lhs, spanned, e.data.index.object);
+    }
+    if (k == ast_expr.EXPR_KIND_UNARY && e.data.unary.op == ast_expr.UN_DEREF) { ret moves(sc, lhs, spanned, e.data.unary.operand); }
+    ret res[bool, fail.Fail].ok{false};
 }
 
 fun covers(sc: *sema_context.SemaContext, lhs: ast_id.ExprId, place: ast_id.ExprId) res[bool, fail.Fail] {

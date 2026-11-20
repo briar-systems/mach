@@ -43,7 +43,10 @@ fun read(reply: Reply) i64 {
 A guard is a lexical region, not a flow fact. A chain whose every arm exits
 guards the remainder of the enclosing block for the case the chain left
 untested, and a chain's final bare `or` is guarded the same way for the one case
-the arms before it left untested. See [tag.md](tag.md).
+the arms before it left untested. Assigning a name the guarded place is spelled
+with, such as the `i` of `sel items[i].value`, ends the guard from that point on,
+for the whole of a loop that holds the assignment and in a `fin` body that
+replays after it. See [tag.md](tag.md).
 
 ## `for`
 

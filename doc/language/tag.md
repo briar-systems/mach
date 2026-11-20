@@ -319,9 +319,8 @@ its left operand, because `&&` short-circuits. `||`, `!` and every other
 operator open no guard.
 
 A guard is matched by spelling, so a guarded place must be a path of
-identifiers, fields, dereferences and indexes by a name or a literal, `sel`
-rejects anything else, and reassigning an index binding inside the guard is not
-tracked and leaves the debug-profile discriminator check as the only net.
+identifiers, fields, dereferences and indexes by a name or a literal, and `sel`
+rejects anything else.
 
 Inside a guard the payload place is ordinary storage: reading it copies under
 the existing value rules, writing it keeps the selected case, and `?value.case`
@@ -343,10 +342,39 @@ fun reset(reply: Reply) i64 {
 
 The check covers the guarded place and every object it is reached through by
 value (`b.r = ...` under `sel b.r.value` is refused too). A pointer ends that
-chain: under `sel p.value` with `p: *Reply`, reassigning `p` or writing
-`@p = ...` is not tracked, because the guard covers the storage the pointer
-reached when the test ran, and a write through a pointer is the ordinary
-raw-memory obligation below.
+chain: under `sel p.value` with `p: *Reply`, writing `@p = ...` is not tracked,
+because a write through a pointer is the ordinary raw-memory obligation below,
+and reassigning `p` ends the guard as the next paragraph says.
+
+Assigning anything else the place's spelling names is allowed and ends the
+guard: a name standing as an index or a range count (`i` under
+`sel items[i].value`), a pointer the place is reached through (`p` under
+`sel p.value`), or a range over an object the place indexes. From there on the
+spelling may name a tag no `sel` tested, so a payload read after the assignment
+is refused with `tag.payload_unguarded`. After the assignment means the rest of
+the region past it, also when it sits in a nested `if` that may not have run;
+the whole of a loop that holds it, condition included, when the guard opened
+outside that loop, because a later iteration runs after an earlier one's
+assignment; and a `fin` body when the rest of the fin's block holds it, because
+the fin replays when the block ends. A guard opened inside a loop body is tested
+again on every iteration, so an `i = i + 1` that closes such a body ends nothing
+a later read relies on. Read the payload before the assignment, bind it to a name
+across it, or test the case again after it. A name changed through a pointer to
+it, such as `?i` handed to a call, is not tracked, because the language does not
+track what a pointer can reach.
+
+```mach error the guard for this payload ended
+tag Reply: u8 { empty; value: i64; }
+
+fun second(replies: *Reply) i64 {
+    var i: u64 = 0;
+    if (sel replies[i].value) {
+        i = i + 1;
+        ret replies[i].value; # replies[i] is now an element no `sel` tested
+    }
+    ret 0;
+}
+```
 
 A payload read whose case is no longer selected is undefined behavior of the
 same class as a stale pointer read. A raw pointer to a payload does not pin a
@@ -354,7 +382,8 @@ case or extend a lifetime. There is no borrow checker, proof analysis or runtime
 validator. In the debug profile only, a guarded payload access compares the
 discriminator and traps on mismatch. The comparison is left out where the value
 is a local or parameter that nothing takes the address of, in whole or in part,
-since no pointer to it exists and a write by name under the guard is refused.
+since no pointer to it exists and a write by name under the guard is refused or
+ends the guard.
 
 ## Layout and representation
 

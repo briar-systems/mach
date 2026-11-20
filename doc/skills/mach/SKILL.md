@@ -195,6 +195,8 @@ Lexical guards govern access to variant payloads. Once guarded, a payload is ord
 2. **Conditional expressions**: On the right-hand side of `&&` when `sel place.case` is on the left, allowing direct comparisons and operations right in the condition.
 3. **Exiting chains**: When preceding branches check other cases and exit with `ret`, `brk`, or `cnt`, the remaining block code is guarded for the remaining variant.
 
+Assigning a name the guarded place is spelled with, such as the `i` of `sel items[i].case` or a pointer `p` under `sel p.case`, ends the guard from that point on (for the whole loop when the guard opened outside it), so read the payload or bind it to a name before the assignment.
+
 ```mach
 use std.types.bool.bool;
 use std.types.bool.false;
