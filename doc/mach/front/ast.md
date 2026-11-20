@@ -25,6 +25,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`add_module`](#add_module), [`get_module`](#get_module), [`add_expr`](#add_expr), [`get_expr`](#get_expr), [`add_stmt`](#add_stmt), [`get_stmt`](#get_stmt), [`add_decl`](#add_decl), [`get_decl`](#get_decl), [`decl_name_span`](#decl_name_span), [`add_type`](#add_type), [`get_type`](#get_type), [`add_typed_name`](#add_typed_name) | |
 | [`add_field_init`](#add_field_init) | reached only by mach-lsp |
 | [`add_generic_name`](#add_generic_name) | |
+| [`names_remap`](#names_remap) | every name the tree holds an id of, renamed through `remap`: the ids a parse made in a name table of its own, as the table it was merged into names them |
 | [`add_path_name`](#add_path_name) | the id of one segment of a named type's path, after the segments before it |
 | [`add_decorator`](#add_decorator) | |
 | [`literal_bytes_reserve`](#literal_bytes_reserve) | a table over storage the caller owns, for a test that builds nodes in place room for `n` more bytes at the end of the literal byte table, which literal_bytes_take then claims |
@@ -182,6 +183,16 @@ reached only by mach-lsp
 ```mach
 pub fun add_generic_name(a: *Ast, name: mach.base.source.Span) res[u32, mach.base.fail.Fail]
 ```
+
+### names_remap
+
+```mach
+pub fun names_remap(a: *Ast, remap: *mach.base.intern.Remap)
+```
+
+every name the tree holds an id of, renamed through `remap`: the ids a parse made in a name table
+of its own, as the table it was merged into names them. a parse interns only identifiers,
+member and field-initializer names, the case a member selects and path segments
 
 ### add_path_name
 

@@ -20,6 +20,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`module_load_one`](#module_load_one) | parse the module `fqn` names as a root, without walking it |
 | [`module_unread`](#module_unread) | whether the load reached the module `fqn` names and never read its file |
 | [`module_reload`](#module_reload) | reparse and re-walk one loaded module after its text changed, and say whether its load surface survived, so the project's other modules stand as they are; every product the project holds of the module is dropped, since each is keyed by the old syntax tree |
+| [`reach`](#reach) | mark in `reached`, by module index, every module the build target's own frame reaches from the modules marked there already, the loader bound for the walk |
 | [`decorators_record`](#decorators_record) | record the strings a module's decorator arguments evaluate to, from the syntax the project's operations last published |
 | [`rebuild_topo`](#rebuild_topo), [`register_module_asts`](#register_module_asts), [`acquire_loaded_parses`](#acquire_loaded_parses), [`collect_loaded_parses`](#collect_loaded_parses) | |
 
@@ -83,6 +84,15 @@ pub fun module_reload(p: *mach.compile.project.Project, mid: mach.session.module
 reparse and re-walk one loaded module after its text changed, and say whether its load surface
 survived, so the project's other modules stand as they are; every product the project holds of
 the module is dropped, since each is keyed by the old syntax tree
+
+### reach
+
+```mach
+pub fun reach(p: *mach.compile.project.Project, reached: *bool) err[mach.base.fail.Fail]
+```
+
+mark in `reached`, by module index, every module the build target's own frame reaches from the
+modules marked there already, the loader bound for the walk
 
 ### decorators_record
 

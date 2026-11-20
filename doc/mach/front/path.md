@@ -16,6 +16,7 @@ Uses types from [`mach.base.intern`](../base/intern.md), [`mach.base.source`](..
 | :--- | :--- |
 | [`next`](#next) | paths are parser accepted identifier and dot sequences with original trivia intact |
 | [`leaf`](#leaf), [`prefix`](#prefix), [`intern_path`](#intern_path) | |
+| [`path_text`](#path_text) | the text `intern_path` interns, from `a` and terminated, without interning it |
 
 ---
 
@@ -46,4 +47,12 @@ pub fun prefix(source: str, path: mach.base.source.Span) mach.base.source.Span
 ```mach
 pub fun intern_path(itn: *mach.base.intern.Interner, source: str, path: mach.base.source.Span) res[mach.base.intern.StrId, std.allocator.Error]
 ```
+
+### path_text
+
+```mach
+pub fun path_text(a: *std.allocator.Allocator, source: str, path: mach.base.source.Span) res[str, std.allocator.Error]
+```
+
+the text `intern_path` interns, from `a` and terminated, without interning it
 

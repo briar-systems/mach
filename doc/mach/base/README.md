@@ -18,6 +18,7 @@ interned strings and handles, source locations, and plain utilities
 | [`growth`](growth.md) | the compiler's one growth routine for arrays it keeps as a pointer and a capacity beside its own count |
 | [`handle`](handle.md) | stores whose elements never move |
 | [`intern`](intern.md) | interned strings: one stable id per distinct byte string |
+| [`role`](role.md) | which side of a build the calling thread works on, the owner or a worker, and a check that a worker leaves the build's shared stores alone |
 | [`scc`](scc.md) | strongly connected components of a directed graph over numbered nodes |
 | [`source`](source.md) | the source map: the files of a compilation and the spans, locations and lines in them |
 | [`stack`](stack.md) | the stack the compiler's recursive readers run on |

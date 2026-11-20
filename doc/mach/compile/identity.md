@@ -33,7 +33,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | Functions | |
 | :--- | :--- |
 | [`of_module`](#of_module) | the source identity of module `mid` |
-| [`of_instance`](#of_instance) | the identity of the instance `item` of symbol `name` |
+| [`of_instance`](#of_instance) | the identity of the instance `item` of symbol `name`, its modules' identities read through `reads` |
 
 | Constants | |
 | :--- | :--- |
@@ -54,10 +54,10 @@ the source identity of module `mid`
 ### of_instance
 
 ```mach
-pub fun of_instance(p: *mach.compile.project.Project, item: *mach.front.sema.instance.Instance, name: mach.base.intern.StrId) res[u64, mach.base.fail.Fail]
+pub fun of_instance(p: *mach.compile.project.Project, reads: *mach.session.query.Reads, item: *mach.front.sema.instance.Instance, name: mach.base.intern.StrId) res[u64, mach.base.fail.Fail]
 ```
 
-the identity of the instance `item` of symbol `name`
+the identity of the instance `item` of symbol `name`, its modules' identities read through `reads`
 
 ## Constants
 

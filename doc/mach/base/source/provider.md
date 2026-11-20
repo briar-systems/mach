@@ -30,7 +30,7 @@ Uses types from [`mach.base.fail`](../fail.md), [`mach.base.intern`](../intern.m
 
 | On `Provider` | |
 | :--- | :--- |
-| [`module_locate`](#module_locate), [`module_exists`](#module_exists), [`module_read`](#module_read), [`package_known`](#package_known) | |
+| [`module_locate`](#module_locate), [`module_exists`](#module_exists), [`module_read`](#module_read), [`module_site`](#module_site), [`module_peek`](#module_peek), [`package_known`](#package_known) | |
 
 ---
 
@@ -103,6 +103,8 @@ pub rec Provider {
     locate:  fun(ptr, *std.allocator.Allocator, mach.base.intern.StrId) res[opt[Origin], mach.base.fail.Fail];
     exists:  fun(ptr, *std.allocator.Allocator, mach.base.intern.StrId) res[bool, mach.base.fail.Fail];
     read:    fun(ptr, *std.allocator.Allocator, str) res[Text, mach.base.fail.Fail];
+    site:    fun(ptr, *std.allocator.Allocator, str) res[opt[str], mach.base.fail.Fail];
+    peek:    fun(ptr, *std.allocator.Allocator, str) opt[Text];
     package: fun(ptr, mach.base.intern.StrId) bool;
 }
 ```
@@ -117,6 +119,8 @@ saying so, never by failing, so a provider can stand in front of another one
 | `locate` | `fun(ptr, *std.allocator.Allocator, mach.base.intern.StrId) res[opt[Origin], mach.base.fail.Fail]` | where the module an fqn names would be read from, none when no package owns the fqn's head segment; it does not say the module exists |
 | `exists` | `fun(ptr, *std.allocator.Allocator, mach.base.intern.StrId) res[bool, mach.base.fail.Fail]` | whether the fqn names a module, spelled exactly as the provider holds it |
 | `read` | `fun(ptr, *std.allocator.Allocator, str) res[Text, mach.base.fail.Fail]` | the text at a path `locate` gave |
+| `site` | `fun(ptr, *std.allocator.Allocator, str) res[opt[str], mach.base.fail.Fail]` | the path `locate` would give for an fqn spelled out, none when no package owns its head segment. it checks nothing and records nothing, so the owner may ask it ahead of a load |
+| `peek` | `fun(ptr, *std.allocator.Allocator, str) opt[Text]` | the text `read` would give at a path, none where `read` would refuse. it reports and records nothing and reads only the file system and what the provider holds unchanged, so it may run on any thread |
 | `package` | `fun(ptr, mach.base.intern.StrId) bool` | whether a package has the id |
 
 ### module_locate
@@ -135,6 +139,18 @@ pub fun module_exists(p: *Provider, a: *std.allocator.Allocator, fqn: mach.base.
 
 ```mach
 pub fun module_read(p: *Provider, a: *std.allocator.Allocator, path: str) res[Text, mach.base.fail.Fail]
+```
+
+### module_site
+
+```mach
+pub fun module_site(p: *Provider, a: *std.allocator.Allocator, fqn: str) res[opt[str], mach.base.fail.Fail]
+```
+
+### module_peek
+
+```mach
+pub fun module_peek(p: *Provider, a: *std.allocator.Allocator, path: str) opt[Text]
 ```
 
 ### package_known

@@ -33,6 +33,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](pr
 | [`read_definition`](#read_definition) | a module's definition as far as a phase reads it, through the products of this operation |
 | [`acquire_sema`](#acquire_sema) | a module's sema product in the open operation, its field graph installed in the projection |
 | [`kept_sema`](#kept_sema) | what a module's sema product keeps once its front-end products are given back: its status, refusal, interface and field graph, the graph installed in the projection |
+| [`kept_sema_read`](#kept_sema_read) | the semantic product of module `mid` as `reads` reads it, its field graph installed |
 | [`record_load_views`](#record_load_views) | set each module's load view from what the walk left it; an unchanged view is no change |
 | [`instance_deps`](#instance_deps) | what typing the instance `item` reads besides its declaring module's definition: the typed surfaces of every module the declaring module imports, and of every module declaring a type its arguments or pack name with what each of those imports, transitively, each field graph installed |
 | [`instance_reads`](#instance_reads) | the modules the instance `item` names: its declaring module first, then every module declaring a type its arguments or pack name |
@@ -170,6 +171,14 @@ pub fun kept_sema(p: *mach.compile.project.Project, mid: mach.session.module.Mod
 what a module's sema product keeps once its front-end products are given back: its status,
 refusal, interface and field graph, the graph installed in the projection. the rest of it is
 acquire_sema's
+
+### kept_sema_read
+
+```mach
+pub fun kept_sema_read(p: *mach.compile.project.Project, reads: *mach.session.query.Reads, mid: mach.session.module.ModuleId) res[*mach.front.sema.product.SemaResult, mach.base.fail.Fail]
+```
+
+the semantic product of module `mid` as `reads` reads it, its field graph installed
 
 ### record_load_views
 

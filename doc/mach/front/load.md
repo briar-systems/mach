@@ -36,6 +36,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`init`](#init) | |
 | [`dnit`](#dnit) | release what the loader owns; each module's record is released by its row's owner |
 | [`bind`](#bind) | point the loader at what runs it, which may have moved since its last use |
+| [`unbind`](#unbind) | drop the host `bind` gave, whose context lives only as long as the walk it serves |
 | [`tuples_set`](#tuples_set) | make a union build: every gate is decided under each of `count` tuples, which the loader owns |
 | [`module_find`](#module_find) | the id of the module named `fqn`, none when the load has not reached it |
 | [`module_of`](#module_of) | the id of the module a load product names by stable id, MODULE_NIL when the load has not reached it |
@@ -194,6 +195,7 @@ pub rec Host {
     add:     fun(ptr, mach.base.intern.StrId, mach.session.module.StableModuleId) res[mach.session.module.ModuleId, mach.base.fail.Fail];
     row:     fun(ptr, mach.session.module.ModuleId) Row;
     syntax:  fun(ptr, mach.session.module.ModuleId) *mach.front.ast.Ast;
+    text:    fun(ptr, str) opt[mach.base.source.provider.Text];
     parse:   fun(ptr, mach.session.module.ModuleId, mach.base.source.FileId, bool) err[mach.base.fail.Fail];
     context: fun(ptr, mach.base.intern.StrId) res[mach.front.comptime.scope.ComptimeCtx, mach.base.fail.Fail];
     done:    fun(ptr, mach.session.module.ModuleId) err[mach.base.fail.Fail];
@@ -210,6 +212,7 @@ decorators_record) whole, and replaces no module's syntax while one runs but thr
 | `add` | `fun(ptr, mach.base.intern.StrId, mach.session.module.StableModuleId) res[mach.session.module.ModuleId, mach.base.fail.Fail]` | make a row for a module with this name and stable id, with no file or syntax yet, and give its id; ids are given in order from zero |
 | `row` | `fun(ptr, mach.session.module.ModuleId) Row` | a module's row; the load record it points at stays where it is |
 | `syntax` | `fun(ptr, mach.session.module.ModuleId) *mach.front.ast.Ast` | a module's current syntax, nil where it has none |
+| `text` | `fun(ptr, str) opt[mach.base.source.provider.Text]` | the text a module's file at this path was read ahead with, borrowed from the host, or none for the load to read it itself |
 | `parse` | `fun(ptr, mach.session.module.ModuleId, mach.base.source.FileId, bool) err[mach.base.fail.Fail]` | give the module this file and make its syntax current; `reported` says the load reached it by walking, so a progress readout lists it |
 | `context` | `fun(ptr, mach.base.intern.StrId) res[mach.front.comptime.scope.ComptimeCtx, mach.base.fail.Fail]` | the comptime context of a module of `artifact` under the build target, with nothing of the module itself |
 | `done` | `fun(ptr, mach.session.module.ModuleId) err[mach.base.fail.Fail]` | a module and everything it imports finished loading |
@@ -284,6 +287,14 @@ pub fun bind(l: *Loader, host: Host, sources: mach.base.source.provider.Provider
 ```
 
 point the loader at what runs it, which may have moved since its last use
+
+### unbind
+
+```mach
+pub fun unbind(l: *Loader)
+```
+
+drop the host `bind` gave, whose context lives only as long as the walk it serves
 
 ### tuples_set
 

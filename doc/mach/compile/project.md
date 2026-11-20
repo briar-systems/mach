@@ -10,7 +10,7 @@ dependency closure a plan's cells share.
 
 Source: [`src/compile/project.mach`](../../../src/compile/project.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.handle`](../base/handle.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.base.source.provider.disk`](../base/source/provider/disk.md), [`mach.base.source.provider.overlay`](../base/source/provider/overlay.md), [`mach.compile.backend`](backend.md), [`mach.compile.cache.compiler`](cache/compiler.md), [`mach.compile.cache.objects`](cache/objects.md), [`mach.compile.cache.record`](cache/record.md), [`mach.compile.demand`](demand.md), [`mach.compile.request`](request.md), [`mach.front.comptime.scope`](../front/comptime/scope.md), [`mach.front.expect`](../front/expect.md), [`mach.front.load`](../front/load.md), [`mach.lower.context`](../lower/context.md), [`mach.lower.linkage`](../lower/linkage.md), [`mach.manifest.link`](../manifest/link.md), [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.plan`](../manifest/plan.md), [`mach.manifest.template`](../manifest/template.md), [`mach.report.readout`](../report/readout.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md), [`mach.target.resolved`](../target/resolved.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.handle`](../base/handle.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.base.source.provider.disk`](../base/source/provider/disk.md), [`mach.base.source.provider.overlay`](../base/source/provider/overlay.md), [`mach.compile.backend`](backend.md), [`mach.compile.cache.compiler`](cache/compiler.md), [`mach.compile.cache.objects`](cache/objects.md), [`mach.compile.cache.record`](cache/record.md), [`mach.compile.demand`](demand.md), [`mach.compile.readahead`](readahead.md), [`mach.compile.request`](request.md), [`mach.front.comptime.scope`](../front/comptime/scope.md), [`mach.front.expect`](../front/expect.md), [`mach.front.load`](../front/load.md), [`mach.lower.context`](../lower/context.md), [`mach.lower.linkage`](../lower/linkage.md), [`mach.manifest.link`](../manifest/link.md), [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.plan`](../manifest/plan.md), [`mach.manifest.template`](../manifest/template.md), [`mach.report.readout`](../report/readout.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md), [`mach.target.resolved`](../target/resolved.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -406,6 +406,10 @@ pub rec Project {
     loader:  mach.front.load.Loader;
     disk:    mach.base.source.provider.disk.Disk;
     overlay: mach.base.source.provider.overlay.Overlay;
+    # the files the running load walk reads and parses ahead of itself, nil when it reads none
+    ahead: *mach.compile.readahead.ReadAhead;
+    # what a codegen pass's lowerings read of other products, gathered when the pass starts; nil outside one
+    views: *mach.session.query.Views;
 
     topo:     *mach.session.module.ModuleId;
     topo_len: u32;

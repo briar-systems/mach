@@ -8,6 +8,15 @@ a string may hold NUL bytes and is equal to another by its bytes and length. an 
 layered over a base: it answers every id the base had issued when it was made and issues its
 own past them, and `child_reintern` maps a child's strings into its base.
 
+a child is how work off the owner thread names strings. its contract:
+- a child reads its base without a lock, so the base takes no new names while the child lives.
+  a child with no base reads nothing shared and may live on any thread
+- only the child's own thread adds to it, and its ids are its own until it is merged
+- `child_reintern` merges it on the owner: each string the child issued is interned in the target
+  in the order the child issued it, and the remap names the target's id for each of the child's
+- so when the owner merges children at the points a single thread would have interned their
+  strings, and in that order, every merged id is the id the single thread would have issued
+
 Source: [`src/base/intern.mach`](../../../src/base/intern.mach)
 
 | Type | | |
@@ -32,11 +41,12 @@ Source: [`src/base/intern.mach`](../../../src/base/intern.mach)
 | [`add`](#add), [`bytes_add`](#bytes_add) | |
 | [`range_add`](#range_add) | the `len` bytes of `source` from `offset`, interned |
 | [`find`](#find) | the id `text` was interned under, none when it never was; nothing is interned, so a reader that shares the interner may ask while no one adds |
-| [`child_reintern`](#child_reintern) | a non-child interner is a contract violation of the receiver, reported as the allocator layer reports its own (`invalid`) |
+| [`child_reintern`](#child_reintern) | `child` merged into `into`, its base or, for a child with no base, any interner: each string the child issued interned there in the order it issued them, and the ids they got |
 
 | On `Remap` | |
 | :--- | :--- |
 | [`remap_dnit`](#remap_dnit) | release a remap; a nil remap holds nothing |
+| [`remapped`](#remapped) | the id in the merge's target that `id`, issued by the merged child, names: an id below the child's own range is its base's and stays, one in it is mapped |
 
 ---
 
@@ -187,11 +197,13 @@ that shares the interner may ask while no one adds
 ### child_reintern
 
 ```mach
-pub fun child_reintern(child: *Interner, alloc_: *std.allocator.Allocator) res[Remap, std.allocator.Error]
+pub fun child_reintern(child: *Interner, into: *Interner, alloc_: *std.allocator.Allocator) res[Remap, std.allocator.Error]
 ```
 
-a non-child interner is a contract violation of the receiver, reported as
-the allocator layer reports its own (`invalid`)
+`child` merged into `into`, its base or, for a child with no base, any interner: each string the
+child issued interned there in the order it issued them, and the ids they got. a child layered
+over another interner is a contract violation of the receiver, reported as the allocator layer
+reports its own (`invalid`)
 
 ## Remap
 
@@ -210,4 +222,13 @@ pub fun remap_dnit(alloc: *std.allocator.Allocator, remap: *Remap)
 ```
 
 release a remap; a nil remap holds nothing
+
+### remapped
+
+```mach
+pub fun remapped(remap: *Remap, id: StrId) StrId
+```
+
+the id in the merge's target that `id`, issued by the merged child, names: an id below the
+child's own range is its base's and stays, one in it is mapped
 

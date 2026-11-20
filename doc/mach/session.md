@@ -52,10 +52,12 @@ pub rec Session {
     sources:      *mach.base.source.SourceMap;
     owns_sources: bool;
     diags:        mach.base.diagnostic.DiagnosticStore;
-    interner:     mach.base.intern.Interner;
-    types:        mach.type.TypeInterner;
+    # the shared stores, each held behind a handle the session owns, so a worker can be handed a
+    # view whose handles name its own layer over them
+    interner: *mach.base.intern.Interner;
+    types:    *mach.type.TypeInterner;
     # the facts derived from the type store, read and written only by mach.type.query
-    type_facts: mach.type.query.Facts;
+    type_facts: *mach.type.query.Facts;
 
     queries:        mach.session.query.QueryDb;
     parse_sequence: u64;

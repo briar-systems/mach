@@ -37,6 +37,11 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`PreparedRetirement`](#preparedretirement) | `rec` |  |
 | [`ProductFilter`](#productfilter) | `def` | whether a product walk enters a product, visiting it and walking what it was computed from reached through walk_products |
 | [`ProductVisit`](#productvisit) | `def` | what a product walk is shown of each product: its address and the store it reported into, nil when it reported nothing reached through walk_products |
+| [`Read`](#read) | `rec` | a computation that reads off the stack |
+| [`ReadLog`](#readlog) | `rec` | the reads of one computation in the order it made them, those before `done` replayed |
+| [`ReadFn`](#readfn) | `def` | how a computation reads a product: through `get` on the owner, or through views it logs reached through Reads.read |
+| [`Reads`](#reads) | `rec` |  |
+| [`Views`](#views) | `rec` | products a reading may read, each validated in this operation, ready and not given back |
 
 | On `KeyOwner` | |
 | :--- | :--- |
@@ -78,6 +83,9 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`peek_revision`](#peek_revision) | the revision a product last changed at, without validating it; 0 when it has none |
 | [`published`](#published) | a product as its last successful computation published it, read between operations by the host that ran them |
 | [`value_dnit`](#value_dnit) | give back the value of a derived product no reader of the build reads again: its finalizer runs and its bytes go, while the entry stays current, so a product computed from it still validates against its revision |
+| [`views_add`](#views_add) | every product of `kind` validated in this operation added to `v` |
+| [`views_add_deps`](#views_add_deps) | every product of `kind` the product `of` keyed `key` read, validated in this operation, added to `v` |
+| [`replay`](#replay) | the reads `log` holds past `done` replayed onto the computing frame, as `get` records a read of a validated product: the edge, then its revisions |
 
 | On `QueryRuntime` | |
 | :--- | :--- |
@@ -90,6 +98,15 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | :--- | :--- |
 | [`discard_retirement`](#discard_retirement) | release a retirement that was prepared and not committed; one already committed or discarded owns nothing |
 | [`validate_retirement`](#validate_retirement), [`commit_retirement`](#commit_retirement) | |
+
+| On `ReadLog` | |
+| :--- | :--- |
+| [`log_init`](#log_init), [`log_dnit`](#log_dnit) | |
+
+| On `Views` | |
+| :--- | :--- |
+| [`views_init`](#views_init), [`views_dnit`](#views_dnit) | |
+| [`view_read`](#view_read) | the product `kind` keys under `key` read through `v` and logged, or none when `v` does not hold it |
 
 ---
 
@@ -644,6 +661,31 @@ what it read moves, serves a new value
 | `key` | the product's key within the kind |
 | **returns** | ok, also when the product was never computed or is released already |
 
+### views_add
+
+```mach
+pub fun views_add(db: *QueryDb, v: *Views, kind: *Kind) err[mach.base.fail.Fail]
+```
+
+every product of `kind` validated in this operation added to `v`
+
+### views_add_deps
+
+```mach
+pub fun views_add_deps(db: *QueryDb, v: *Views, of: *Kind, key: u64, kind: *Kind) err[mach.base.fail.Fail]
+```
+
+every product of `kind` the product `of` keyed `key` read, validated in this operation, added to `v`
+
+### replay
+
+```mach
+pub fun replay(db: *QueryDb, log: *ReadLog) err[mach.base.fail.Fail]
+```
+
+the reads `log` holds past `done` replayed onto the computing frame, as `get` records a read of a
+validated product: the edge, then its revisions. a product changed since its read is a defect
+
 ## QueryRuntime
 
 ```mach
@@ -755,4 +797,97 @@ pub def ProductVisit: fun(ptr, QueryKey, *mach.base.diagnostic.DiagnosticStore)
 what a product walk is shown of each product: its address and the store it reported into,
 nil when it reported nothing
 reached through walk_products
+
+## Read
+
+```mach
+pub rec Read {
+    kind:                KindIndex;
+    key:                 u64;
+    last_changed:        Revision;
+    diagnostics_changed: Revision;
+}
+```
+
+a computation that reads off the stack. it reads only products validated in this operation before
+it started, through views the owner gathered, and logs each read. the owner replays the log onto
+the computing frame in log order, so the edges are those the same reads made through `get` would
+have recorded, at the same place in the list. views and the log touch no map or shard of the
+database, and no view is added once the reading starts, so the reading may run on another thread
+while the owner works on. a read the views do not hold is a miss, which the reader answers on the
+owner (replay what was logged, then `get`) or by giving the reading up
+
+## ReadLog
+
+```mach
+pub rec ReadLog {
+    reads: Vector[Read];
+    done:  usize;
+}
+```
+
+the reads of one computation in the order it made them, those before `done` replayed
+
+### log_init
+
+```mach
+pub fun log_init(a: *std.allocator.Allocator) ReadLog
+```
+
+### log_dnit
+
+```mach
+pub fun log_dnit(log: *ReadLog)
+```
+
+## ReadFn
+
+```mach
+pub def ReadFn: fun(ptr, *Kind, u64) res[QueryView, mach.base.fail.Fail]
+```
+
+how a computation reads a product: through `get` on the owner, or through views it logs
+reached through Reads.read
+
+## Reads
+
+```mach
+pub rec Reads {
+    ctx:  ptr;
+    read: ReadFn;
+}
+```
+
+## Views
+
+```mach
+pub rec Views {
+    base:    *Views;
+    rows:    Vector[ViewRow];
+    entries: Map[Slot, *QueryEntry];
+}
+```
+
+products a reading may read, each validated in this operation, ready and not given back. a view
+set may sit over a `base` set, which it is read through after its own
+
+### views_init
+
+```mach
+pub fun views_init(a: *std.allocator.Allocator, base: *Views) Views
+```
+
+### views_dnit
+
+```mach
+pub fun views_dnit(v: *Views)
+```
+
+### view_read
+
+```mach
+pub fun view_read(v: *Views, log: *ReadLog, kind: *Kind, key: u64) res[opt[QueryView], mach.base.fail.Fail]
+```
+
+the product `kind` keys under `key` read through `v` and logged, or none when `v` does not hold it
 
