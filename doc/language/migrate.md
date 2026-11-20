@@ -147,8 +147,10 @@ its line: a link's `library`, which the table key replaces, a profile's `pass` a
 the key is reported once. The link refuses the last three. The `env` and the
 install name have no one answer migrate can write, since `env` changes how every
 `bin` of the target links and the install name is the library's own. The C library
-is refused as symbols nothing defines, with a note that the linked library depends
-on the C library, which the link does not name. A report names the line of the table it is about.
+is refused as symbols nothing defines. When the named library is a shared library
+that depends on the C library, as `m` is, a note says so. On glibc 2.34 and later
+`pthread`, `dl` and `rt` are empty archives with no dependencies, so their refusal
+names only the undefined symbols and the files that refer to them. A report names the line of the table it is about.
 
 A tag whose payloads disagree on the class of a byte, secret against public or a
 pointer that reaches a secret against anything but a pointer to the same storage,
