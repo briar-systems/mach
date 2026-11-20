@@ -50,6 +50,7 @@ use cache_record:  mach.compile.cache.record;
 use mach.compile.declared;
 use mach.compile.demand;
 use mach.compile.surface;
+use mach.compile.workers;
 use sema_instance: mach.front.sema.instance;
 use mach.host.output;
 use lower_context: mach.lower.context;
@@ -423,7 +424,7 @@ pub fun store_written(p: *project.Project) err[fail.Fail] {
 
 # a completed unit's object reaches its `obj/` file through a sibling temporary, carrying its
 # record, since the object cache reads it back, and the build holds no form of it after: a link
-# reads it back from there (object_back). a module the cache restored is there already, and one
+# reads it back from there (objects_back). a module the cache restored is there already, and one
 # with nowhere to go keeps its object. the time is the emit row's, carved out of codegen's
 pub fun object_written(p: *project.Project, m: *project.ModuleEntry) err[fail.Fail] {
     if (str_is_empty(m.object_output) || restored(p, m)) { ret err[fail.Fail].ok{}; }
@@ -472,25 +473,107 @@ pub fun object_write(w: *ObjectWrite, t: *output.Temporary) err[fail.Fail] {
     ret note_written(w.p, t.destination, sink.data(?bytes), sink.len(?bytes));
 }
 
-# the object module `m` wrote when its unit completed, read back from its file into the slot it
-# left, as the cache restores one, so a link reads the one form whether the object was made now
-# or restored. what the format writes and reads back otherwise is not the object's and never
-# reaches a link. an object held in memory is left as it is
-pub fun object_back(p: *project.Project, m: *project.ModuleEntry) err[fail.Fail] {
-    ret read_back(p, m.object, m.object_output, ?m.object_away);
+# the objects of the units in the link's order, each read back from the file it was written to
+# when its unit completed into the slot it left, as the cache restores one, so a link reads the
+# one form whether the object was made now or restored. what the format writes and reads back
+# otherwise is not the object's and never reaches a link. the units before the first without an
+# object, which a link refuses, are read, and an object held in memory is left as it is. on more
+# than one thread the reads run on a crew, and what they make and the failure returned are the
+# same as reading them in order
+pub fun objects_back(p: *project.Project) err[fail.Fail] {
+    var count: u32 = 0;
+    for (count < project.unit_count(p) && project.unit_module(p, count).object != nil) { count = count + 1; }
+    val res_backs: res[*Back, A.Error] = A.allocate[Back](p.s.alloc, count::usize + 1);
+    if (sel res_backs.err) { ret err[fail.Fail].err{fail.refused(res_backs.err)}; }
+    fin { A.deallocate[Back](p.s.alloc, res_backs.ok, count::usize + 1); }
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < count) {
+        val m: *project.ModuleEntry = project.unit_module(p, i);
+        if (m.object_away) {
+            res_backs.ok[n] = Back{p: p, o: m.object, from: m.object_output, away: ?m.object_away};
+            n               = n + 1;
+        }
+        i = i + 1;
+    }
+    ret backs_read(p, res_backs.ok, n);
 }
 
-# the same for the module's test object
-pub fun test_object_back(p: *project.Project, m: *project.ModuleEntry) err[fail.Fail] {
-    ret read_back(p, m.test.object, m.test.object_output, ?m.test.object_away);
+# the same for the test objects of the emitted modules, in their order
+pub fun test_objects_back(p: *project.Project) err[fail.Fail] {
+    val res_backs: res[*Back, A.Error] = A.allocate[Back](p.s.alloc, p.emit_len::usize + 1);
+    if (sel res_backs.err) { ret err[fail.Fail].err{fail.refused(res_backs.err)}; }
+    fin { A.deallocate[Back](p.s.alloc, res_backs.ok, p.emit_len::usize + 1); }
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val m: *project.ModuleEntry = project.module_at(p, p.topo[i]::u32);
+        if (m.test.object != nil && m.test.object_away) {
+            res_backs.ok[n] = Back{p: p, o: m.test.object, from: m.test.object_output, away: ?m.test.object_away};
+            n               = n + 1;
+        }
+        i = i + 1;
+    }
+    ret backs_read(p, res_backs.ok, n);
 }
 
-fun read_back(p: *project.Project, o: *Object, from: str, away: *bool) err[fail.Fail] {
-    if (!@away) { ret err[fail.Fail].ok{}; }
-    val err_read: err[fail.Fail] = object_reread(p, o, from);
-    if (sel err_read.err) { ret err_read; }
-    @away = false;
+# one object to read back and how reading it ended, which only its read writes
+rec Back {
+    p:    *project.Project;
+    o:    *Object;
+    from: str;
+    away: *bool;
+    err:  err[fail.Fail];
+}
+
+# the `count` objects of `backs` read back. on one thread they are read in order and the first
+# failure stops the rest. on more each is a task of a crew, every one runs, and the first failure
+# in their order is the one returned, the later ones dropped, so the outcome is the same
+fun backs_read(p: *project.Project, backs: *Back, count: u32) err[fail.Fail] {
+    var n: u32 = p.req.threads;
+    if (n > count) { n = count; }
+    var crew: workers.Crew;
+    if (n <= 1 || !workers.open(?crew, p.s.alloc, n, count::usize, count::usize)) {
+        var i: u32 = 0;
+        for (i < count) {
+            back_run((?backs[i])::ptr);
+            if (sel backs[i].err.err) { ret backs[i].err; }
+            @backs[i].away = false;
+            i              = i + 1;
+        }
+        ret err[fail.Fail].ok{};
+    }
+    var submitted: u32 = 0;
+    var i:         u32 = 0;
+    for (i < count) {
+        if (workers.submit(?crew, i, (?backs[i])::ptr, back_run)) { submitted = submitted + 1; }
+        or                                                        { back_run((?backs[i])::ptr); }
+        i = i + 1;
+    }
+    for (submitted > 0) {
+        val opt_index: opt[u32] = workers.finished(?crew);
+        if (sel opt_index.none) { brk; }
+        submitted = submitted - 1;
+    }
+    workers.close(?crew);
+    workers.dnit(?crew);
+    # the first failure in their order, count while none failed
+    var first: u32 = count;
+    i = 0;
+    for (i < count) {
+        val b: *Back = ?backs[i];
+        if (sel b.err.ok)   { @b.away = false; }
+        or (first == count) { first = i; }
+        or (sel b.err.err)  { fail.dnit(p.s.alloc, b.err.err); }
+        i = i + 1;
+    }
+    if (first < count) { ret backs[first].err; }
     ret err[fail.Fail].ok{};
+}
+
+fun back_run(context: ptr) {
+    val b: *Back = context::*Back;
+    b.err = object_reread(b.p, b.o, b.from);
 }
 
 # `o` replaced by the object the file `from` holds, which the build wrote from it
