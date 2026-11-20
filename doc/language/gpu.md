@@ -883,6 +883,7 @@ checked at the call, where the literal's value is known:
 | a value outside the operand's enumeration              | `op.operand_value`, naming the values |
 | a value whose operands the declaration does not pass, or passes without it | `op.operand_value`, naming the count |
 | a parameter the value's operand kind does not admit     | `op.signature`, naming the operand |
+| an instruction whose own row requires what the calling function's selection does not hold, as a subgroup operation below SPIR-V 1.3 | `spirv.capability`, naming what it needs |
 | a requirement's extension the target does not select   | `spirv.capability`, naming the extension |
 | a capability whose SPIR-V version the environment is below | `spirv.capability`, naming the SPIR-V version it needs, as `spv1.3` |
 

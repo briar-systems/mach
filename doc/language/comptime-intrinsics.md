@@ -108,6 +108,36 @@ var i: u64 = 0;
 for (i < $length_of(LOGO)) { ... }
 ```
 
+The binding is any `val` or `var` at file scope, a local, or a parameter, and
+the answer is its type's whatever gave it that type: a written length, an array
+literal, a string literal or an `#[embed]` behind `[_]`. It folds wherever the
+intrinsic does, so a binding's length is an array length, a `$if` condition and
+a loop bound:
+
+```mach fragment
+val NAME: [_]u8 = "mach";                 # [4]u8
+def Twice: [2 * $length_of(NAME) + 1]u8;  # [9]u8
+
+$if ($length_of(NAME) != 4) {
+    $error("NAME changed");
+}
+```
+
+What the operand may be:
+
+- A name that resolves to a binding of array type answers for that type, as
+  `$size_of` does for a binding of any type.
+- A name that resolves to a binding of another type is that type, so
+  `$length_of` refuses it with `comptime.length_of`, naming the type, as it
+  refuses the type written out.
+- A dotted path is read as a module-qualified type, so a field path such as
+  `r.t` is refused (`module.alias_expected`). Name the field's type, or bind
+  the field first.
+- An expression (`A[0, 2]`, a call) is refused as no type
+  (`syntax.expected_type`).
+- `$type_of(A)` is not a type constructor and is refused where a type is
+  written (`comptime.type_constructor`). The binding itself is the operand.
+
 This is the operand slot's rule, not a per-intrinsic one, and it is **only** that
 slot. A name written where a type is expected and resolving to a value is still a
 mistake in every other position, and accepting it there would turn that mistake into

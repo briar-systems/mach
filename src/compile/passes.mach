@@ -5,6 +5,7 @@
 # module and carry on over the rest, and an internal failure ends a pass.
 
 use std.collections.map;
+use std.collections.slice.Slice;
 use collections_vector: std.collections.vector;
 use std.text.string.str_free;
 use std.types.bool.bool;
@@ -21,7 +22,8 @@ use std.types.view.View;
 use std.types.view.view;
 use std.types.view.view_eq_str;
 
-use A:               std.allocator;
+use A: std.allocator;
+use std.allocator.heap;
 use chrono_duration: std.chrono.duration;
 use fs:              std.filesystem;
 use io_error:        std.io.error;
@@ -68,6 +70,7 @@ use mach.compile.declared;
 use mach.compile.demand;
 use mach.compile.frontend;
 use mach.compile.identity;
+use mach.compile.offer;
 use mach.compile.project;
 use compile_unit: mach.compile.unit;
 use mach.compile.workers;
@@ -711,7 +714,7 @@ fun lower_run(job: *LowerJob, lent: *Lent) {
         reqs[i] = res_req.ok;
         i       = i + 1;
     }
-    job.lowered = compile_unit.lower(reqs, job.count::usize, ?p.back, p.s.spans, p.s.backing);
+    job.lowered = compile_unit.lower(reqs, job.count::usize, ?p.back, lent.spans, p.s.backing);
     if (!job.tests)         { ret; }
     if (sel job.lowered.ok) { job.gathered = gather_defined(job.reading.s.interner, ?job.lowered.ok.m, ?job.defined); }
 }
@@ -786,29 +789,38 @@ fun unit_request(p: *project.Project, stores: *UnitStores, lent: *Lent, mid: mod
 # facts:  the type facts
 # laying: how types are laid out over the build's target
 # side:   the memos and scan sets a unit's layer is handed for its run (type.side_lend)
+# spans:  the pool the unit's heap draws its spans from and gives them back to
 # summed: the run is one of a crew's, whose lowering row sums its threads
 rec Lent {
     facts:  *type_query.Facts;
     laying: *extent.Laying;
     side:   *type.Side;
+    spans:  *heap.Pool;
     summed: bool;
 }
 
 # the stores the owner lends a lowering it runs: the session's
 fun owner_lent(p: *project.Project, summed: bool) Lent {
-    ret Lent{facts: p.s.type_facts, laying: p.back.laying, side: ?p.s.types.side, summed: summed};
+    ret Lent{facts: p.s.type_facts, laying: p.back.laying, side: ?p.s.types.side, spans: p.s.spans, summed: summed};
 }
 
 # the stores a crew's threads lend the lowerings they run, one set per thread, each drawn from the backing
 # allocator and dropped when the pass ends. a run takes a free set for its span and gives it back, and at most
-# one run per thread is under way, so a set is always free
+# one run per thread is under way, so a set is always free. each set holds a pool of spans over the session's:
+# a thread's units run one after another, each heap torn down whole before the next is made, which is the
+# pattern a pool serves, so a unit takes the spans the thread's last unit gave back and the pass's threads do
+# not trade spans through one pool. the sets split the session pool's budget, so what a thread holds past its
+# share goes back to the session's pool, where any thread finds it, and the pass's pools together hold no more
+# than the session's would
 # ---
 # lents: each set, `count` of them
+# pools: each set's pool of spans
 # busy:  whether each is taken
 rec Lending {
     lents:   *Lent;
     facts:   *type_query.Facts;
     sides:   *type.Side;
+    pools:   *heap.Pool;
     busy:    *i64;
     count:   usize;
     backing: *A.Allocator;
@@ -834,8 +846,17 @@ fun lending_init(p: *project.Project, into: *Lending, count: usize) err[fail.Fai
         ret err[fail.Fail].err{fail.refused(res_sides.err)};
     }
     into.sides = res_sides.ok;
+    val res_pools: res[*heap.Pool, A.Error] = A.allocate[heap.Pool](a, count);
+    if (sel res_pools.err) {
+        A.deallocate[type.Side](a, into.sides, count);
+        A.deallocate[type_query.Facts](a, into.facts, count);
+        A.deallocate[Lent](a, into.lents, count);
+        ret err[fail.Fail].err{fail.refused(res_pools.err)};
+    }
+    into.pools = res_pools.ok;
     val res_busy: res[*i64, A.Error] = A.zallocate[i64](a, count);
     if (sel res_busy.err) {
+        A.deallocate[heap.Pool](a, into.pools, count);
         A.deallocate[type.Side](a, into.sides, count);
         A.deallocate[type_query.Facts](a, into.facts, count);
         A.deallocate[Lent](a, into.lents, count);
@@ -849,9 +870,20 @@ fun lending_init(p: *project.Project, into: *Lending, count: usize) err[fail.Fai
             lending_dnit(into);
             ret err[fail.Fail].err{res_laying.err};
         }
+        var shared: heap.Source;
+        heap.pool_source(?shared, p.s.spans);
+        # a budget of 0 means no ceiling, so a share never rounds down to it
+        var share: usize = p.s.spans.budget / count;
+        if (share == 0) { share = 1; }
+        val err_pooled: err[A.Error] = heap.pool_init(?into.pools[i], ?shared, share);
+        if (sel err_pooled.err) {
+            extent.dnit(res_laying.ok);
+            lending_dnit(into);
+            ret err[fail.Fail].err{fail.refused(err_pooled.err)};
+        }
         into.facts[i] = type_query.facts_init(a);
         into.sides[i] = type.side_init(a);
-        into.lents[i] = Lent{facts: ?into.facts[i], laying: res_laying.ok, side: ?into.sides[i], summed: true};
+        into.lents[i] = Lent{facts: ?into.facts[i], laying: res_laying.ok, side: ?into.sides[i], spans: ?into.pools[i], summed: true};
         into.count    = i + 1;
     }
     ret err[fail.Fail].ok{};
@@ -864,10 +896,13 @@ fun lending_dnit(l: *Lending) {
         type_query.facts_dnit(?l.facts[i]);
         type.side_dnit(?l.sides[i]);
         extent.dnit(l.lents[i].laying);
+        # a pool over the session's gives every span back to it, which never refuses one
+        val err_returned: err[A.Error] = heap.pool_dnit(?l.pools[i]);
         i = i + 1;
     }
     if (l.busy == nil) { ret; }
     A.deallocate[i64](l.backing, l.busy, l.count);
+    A.deallocate[heap.Pool](l.backing, l.pools, l.count);
     A.deallocate[type.Side](l.backing, l.sides, l.count);
     A.deallocate[type_query.Facts](l.backing, l.facts, l.count);
     A.deallocate[Lent](l.backing, l.lents, l.count);
@@ -1351,6 +1386,8 @@ val PASS_TESTS:     u8 = 2;
 # ran:      what the run made, read once `finished`
 # bytes:    about what it holds once finished, until it completes
 # lending:  the stores a crew's threads lend its run, nil when it runs on the owner
+# handover: the pass's hand-over of offers, which its run hands its module's offer to and reads its binds from, nil
+#           where the build makes none
 rec Slot {
     position: u32;
     key:      u64;
@@ -1363,13 +1400,27 @@ rec Slot {
     finished: bool;
     bytes:    usize;
     lending:  *Lending;
+    handover: *offer.Handover;
 }
 
-# every unit of `kind` in pass order: each prepared on the owner, compiled, and completed on the owner strictly in
-# order. on one thread the three run in sequence and nothing else is made. on more, a crew compiles: the owner keeps
-# preparing while fewer than its threads plus one wait to complete, and completes the oldest once its compile
-# finished. a unit's completion failing ends the pass there: nothing is prepared after it, and every unit prepared
-# ahead of it is cancelled and reports nothing
+# the unit runner: every unit of `kind` in pass order, each prepared on the owner, run (lowered and compiled), and
+# completed on the owner. on one thread the three run in sequence and no thread is made. on more, a crew runs the
+# units: the owner keeps preparing while fewer than its threads plus one wait to complete, and completes the oldest
+# once its run finished. its contract:
+# - ordered: prepares, in pass order, and completions, in pass order, all on the owner. a completion is the only
+#   place a unit's products and its module's entry are written. runs are ordered only by the queue: a unit's run
+#   starts after the run of every unit prepared before it started
+# - a prepare reads the session as the completions before it left it and no product of a unit still running. what it
+#   gathers is all its run reads of the owner's state
+# - offers are their own ordered event (offer.Handover): each module of the pass is handed over exactly once, by its
+#   unit's run as soon as its offer is made, before its imports' offers are read and before it compiles, or by the
+#   owner when the pass begins or when its unit begins without running. a run whose lowering or offer failed hands
+#   over an empty offer. a run waits only for the hand-overs of the modules its prepare named, its direct imports,
+#   whose runs started before it, so it never waits on a unit behind it and the owner never waits on an offer. a
+#   unit whose run never starts is dropped by a pass that ended, with every unit behind it
+# - a unit's completion failing ends the pass there: nothing is prepared after it, the hand-over is cancelled so a
+#   run still waiting for an offer returns compiling nothing, and every unit prepared ahead of it is cancelled and
+#   reports nothing
 fun run_units(p: *project.Project, kind: u8) err[fail.Fail] {
     val err_made: err[fail.Fail] = identities_made(p);
     if (sel err_made.err) { ret err_made; }
@@ -1391,10 +1442,21 @@ fun units_run(p: *project.Project, kind: u8) err[fail.Fail] {
         if (pass_unit(p, kind, i)) { count = count + 1; }
         i = i + 1;
     }
+    var handover: offer.Handover  = offer.Handover{};
+    var handing:  *offer.Handover = nil;
+    if (offer.made(p)) {
+        # the test pass's units make no offer, so every module is handed over as its entry holds it
+        var pending: u32 = p.emit_len;
+        if (kind == PASS_TESTS) { pending = 0; }
+        val err_handover: err[fail.Fail] = offer.handover_init(?handover, p, p.s.alloc, p.topo, pending);
+        if (sel err_handover.err) { ret err_handover; }
+        handing = ?handover;
+    }
+    fin { offer.handover_dnit(?handover); }
     val n: u32 = crew_threads(p, kind, count);
-    if (n == 0) { ret run_units_serial(p, kind); }
+    if (n == 0) { ret run_units_serial(p, kind, handing); }
     var crew: workers.Crew;
-    if (!workers.open(?crew, p.s.alloc, n, count::usize, n::usize + 1)) { ret run_units_serial(p, kind); }
+    if (!workers.open(?crew, p.s.alloc, n, count::usize, n::usize + 1)) { ret run_units_serial(p, kind, handing); }
 
     if (kind == PASS_TESTS) { p.test_threads = crew.started; }
     or                      { p.codegen_threads = crew.started; }
@@ -1404,7 +1466,7 @@ fun units_run(p: *project.Project, kind: u8) err[fail.Fail] {
         workers.dnit(?crew);
         ret err_frozen;
     }
-    val err_ran:    err[fail.Fail] = run_units_on(p, kind, ?crew, count);
+    val err_ran:    err[fail.Fail] = run_units_on(p, kind, ?crew, count, handing);
     val err_thawed: err[fail.Fail] = stores_thaw(p);
     workers.dnit(?crew);
     if (sel err_ran.err) { ret err_ran; }
@@ -1511,7 +1573,7 @@ fun pass_unit(p: *project.Project, kind: u8, i: u32) bool {
 }
 
 # the units of a pass of `kind` prepared, compiled and completed in sequence on the owner
-fun run_units_serial(p: *project.Project, kind: u8) err[fail.Fail] {
+fun run_units_serial(p: *project.Project, kind: u8, handover: *offer.Handover) err[fail.Fail] {
     var refused: bool = false;
     var i:       u32  = 0;
     for (i < p.emit_len) {
@@ -1522,10 +1584,11 @@ fun run_units_serial(p: *project.Project, kind: u8) err[fail.Fail] {
         reached(p, kind, i);
         var s: Slot;
         s.position = i;
+        s.handover = handover;
         slot_begin(p, kind, ?s);
         if (s.made != nil) {
             var lent: Lent = owner_lent(p, false);
-            s.ran      = unit_run(s.made, ?lent);
+            s.ran      = unit_run(s.made, ?lent, handover);
             s.finished = true;
         }
         val err_finished: err[fail.Fail] = slot_finish(p, kind, ?s);
@@ -1547,8 +1610,9 @@ val OBJECTS_WAITING: usize = 67108864;
 # heap is alive, lowered and queued or compiling, at its threads plus one queued, and units that finished compiling
 # and wait for their turn, by the bytes they hold (OBJECTS_WAITING). within both it prepares ahead, and it completes
 # the oldest as soon as its compile finished, so no thread idles while the owner could lower and the owner waits
-# only when neither bound lets it prepare
-fun run_units_on(p: *project.Project, kind: u8, crew: *workers.Crew, count: u32) err[fail.Fail] {
+# only when neither bound lets it prepare. offers pass between units through `handover`, which waits for nothing on
+# the owner (run_units)
+fun run_units_on(p: *project.Project, kind: u8, crew: *workers.Crew, count: u32, handover: *offer.Handover) err[fail.Fail] {
     val res_slots: res[*Slot, A.Error] = A.zallocate[Slot](p.s.alloc, count::usize);
     if (sel res_slots.err) {
         workers.close(crew);
@@ -1598,10 +1662,11 @@ fun run_units_on(p: *project.Project, kind: u8, crew: *workers.Crew, count: u32)
             }
         }
         if (failed || (done == next && (stopped || next == count))) { brk; }
+        for (next < count && !pass_unit(p, kind, position)) { position = position + 1; }
         if (!stopped && next < count && alive <= crew.started && waiting <= OBJECTS_WAITING) {
-            for (!pass_unit(p, kind, position)) { position = position + 1; }
             val s: *Slot = ?slots[next];
             s.position = position;
+            s.handover = handover;
             position   = position + 1;
             slot_begin(p, kind, s);
             s.lending = ?lending;
@@ -1609,7 +1674,7 @@ fun run_units_on(p: *project.Project, kind: u8, crew: *workers.Crew, count: u32)
                 alive = alive + 1;
                 if (!workers.submit(crew, next, s::ptr, slot_run)) {
                     var lent: Lent = owner_lent(p, true);
-                    s.ran = unit_run(s.made, ?lent);
+                    s.ran = unit_run(s.made, ?lent, handover);
                     slot_finished(s, ?alive, ?waiting);
                 }
             }
@@ -1626,6 +1691,8 @@ fun run_units_on(p: *project.Project, kind: u8, crew: *workers.Crew, count: u32)
         }
         slot_finished(?slots[opt_index.some], ?alive, ?waiting);
     }
+    # a run still waiting for an offer belongs to a unit the pass will cancel, so it stops before compiling
+    if (handover != nil) { offer.handover_cancel(handover); }
     workers.close(crew);
     var draining: bool = true;
     for (draining) {
@@ -1675,7 +1742,7 @@ fun slot_run(raw: ptr) {
     val s:    *Slot = raw::*Slot;
     val lent: *Lent = lending_take(s.lending);
     $if (role.CHECKED) { slot_permit(s, lent); }
-    s.ran = unit_run(s.made, lent);
+    s.ran = unit_run(s.made, lent, s.handover);
     $if (role.CHECKED) { role.permit(nil, 0); }
     lending_give(s.lending, lent);
 }
@@ -1726,9 +1793,23 @@ fun slot_begin(p: *project.Project, kind: u8, s: *Slot) {
     }
     or {
         slot_clear(s, back_half_key_for(p, m));
-        if (cache.staged_restored(p, m)) { ret; }
+        if (cache.staged_restored(p, m)) {
+            slot_handed(p, kind, s);
+            ret;
+        }
     }
     slot_prepare(p, s);
+    slot_handed(p, kind, s);
+}
+
+# where the unit of `s` makes no offer by running, its module's offer handed over at its begin as its entry holds
+# it, which its completion leaves standing
+fun slot_handed(p: *project.Project, kind: u8, s: *Slot) {
+    if (s.handover == nil || kind == PASS_TESTS) { ret; }
+    if (s.made != nil) {
+        if (sel s.made.offering.some) { ret; }
+    }
+    offer.hand(s.handover, p.topo[s.position]::u32, ?project.module_at(p, p.topo[s.position]::u32).offer);
 }
 
 # a slot for the unit `key` names, begun on nothing yet
@@ -1864,7 +1945,7 @@ fun whole_run(p: *project.Project) err[fail.Fail] {
     slot_prepare(p, ?s);
     if (s.made != nil) {
         var lent: Lent = owner_lent(p, false);
-        s.ran      = unit_run(s.made, ?lent);
+        s.ran      = unit_run(s.made, ?lent, nil);
         s.finished = true;
     }
     val res_made: res[*Product, fail.Fail] = slot_end(p, ?s);
@@ -1887,8 +1968,8 @@ fun whole_run(p: *project.Project) err[fail.Fail] {
 # a module's object under its prepare: its lowering, which it depends on, prepared beside it and finished by
 # the unit's run, which then compiles it, into a product left pending for `unit_complete` to finish, which
 # completes the lowering first and reads the symbols a normal object defines before the lowering is taken. a
-# lowering current in this operation is read as it stands. or, read as it stands, the object the object cache
-# staged for it
+# lowering current in this operation is read as it stands. where the build makes offers the product names the
+# modules whose offers its run may bind (offers_read). or, read as it stands, the object the object cache staged for it
 fun codegen_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
     val p:         *project.Project                = raw::*project.Project;
     val s:         *session.Session                = p.s;
@@ -1914,9 +1995,18 @@ fun codegen_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, 
         title    = res_named.ok;
         job.name = title;
     }
-    var handed: bool = false;
+    var handed: bool       = false;
+    var binds:  Slice[u32] = Slice[u32]{data: nil, size: 0};
     fin {
-        if (!handed && title != nil) { str_free(s.alloc, title); }
+        if (!handed && title != nil)      { str_free(s.alloc, title); }
+        if (!handed && binds.data != nil) { A.deallocate[u32](s.alloc, binds.data, binds.size); }
+    }
+    var offering: opt[u32] = opt[u32].none{};
+    if (offer.made(p) && !test_object && !back_half_key_is_whole(key)) { offering = opt[u32].some{mid::u32}; }
+    if (offer.made(p) && !back_half_key_is_whole(key)) {
+        val res_binds: res[Slice[u32], fail.Fail] = offers_read(p, mid::u32, m, test_object);
+        if (sel res_binds.err) { ret res[query.QueryOutput, fail.Fail].err{res_binds.err}; }
+        binds = res_binds.ok;
     }
     val db:          *query.QueryDb       = ?s.queries;
     val res_current: res[bool, fail.Fail] = query.reusable[project.Project](?p.queries, p, ?LOWER, key);
@@ -1925,7 +2015,7 @@ fun codegen_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, 
         val res_read: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, ?LOWER, key);
         if (sel res_read.err) { ret res[query.QueryOutput, fail.Fail].err{res_read.err}; }
         handed = true;
-        ret product_pending(db, alloc, handle_decode(res_read.ok)::*Lowering, opt[query.PreparedQuery].none{}, job, title, s.alloc);
+        ret product_pending(db, alloc, handle_decode(res_read.ok)::*Lowering, opt[query.PreparedQuery].none{}, job, title, binds, offering, s.alloc);
     }
     val res_prepared: res[query.PreparedQuery, fail.Fail] = query.prepare[project.Project](?p.queries, p, ?LOWER, key);
     if (sel res_prepared.err) { ret res[query.QueryOutput, fail.Fail].err{res_prepared.err}; }
@@ -1947,36 +2037,120 @@ fun codegen_compute(raw: ptr, kind: *query.Kind, key: u64, alloc: *A.Allocator, 
         ret res[query.QueryOutput, fail.Fail].err{res_view.err};
     }
     handed = true;
-    ret product_pending(db, alloc, handle_decode(res_view.ok)::*Lowering, opt[query.PreparedQuery].some{prepared}, job, title, s.alloc);
+    ret product_pending(db, alloc, handle_decode(res_view.ok)::*Lowering, opt[query.PreparedQuery].some{prepared}, job, title, binds, offering, s.alloc);
 }
 
-# what a unit's run made: whether it compiled, then what compiling its lowered module made and the time it took
+# the modules whose offers the unit of module `mid` may bind, named on its prepare (compile/offer): its direct
+# imports, and its own module for a test object, in that order, drawn from the session's allocator as the product
+# is. its run reads their offers once each is handed over (offer.Handover), so the prepare reads no offer and waits
+# for no unit. the unit depends on the text of each direct import, as its object key takes each one's object key
+# (compile/cache, key_offers), so an edit that changes, adds or drops an offered body compiles it again
+fun offers_read(p: *project.Project, mid: u32, m: *project.ModuleEntry, test_object: bool) res[Slice[u32], fail.Fail] {
+    var count: usize = project.dep_count(m)::usize;
+    if (test_object) { count = count + 1; }
+    var d: u32 = 0;
+    for (d < project.dep_count(m)) {
+        val x: *project.ModuleEntry = project.module_at(p, project.dep_at(p, m, d)::u32);
+        if (!base_source.file_is_nil(x.file_id)) {
+            val err_depend: err[fail.Fail] = query.depend[project.Project](?p.queries, p, ?session.FILE_TEXT, base_source.file_index(x.file_id)::u64);
+            if (sel err_depend.err) { ret res[Slice[u32], fail.Fail].err{err_depend.err}; }
+        }
+        d = d + 1;
+    }
+    if (count == 0) { ret res[Slice[u32], fail.Fail].ok{Slice[u32]{data: nil, size: 0}}; }
+    val res_binds: res[*u32, A.Error] = A.allocate[u32](p.s.alloc, count);
+    if (sel res_binds.err) { ret res[Slice[u32], fail.Fail].err{fail.refused(res_binds.err)}; }
+    d = 0;
+    for (d < project.dep_count(m)) {
+        res_binds.ok[d] = project.dep_at(p, m, d)::u32;
+        d               = d + 1;
+    }
+    if (test_object) { res_binds.ok[d] = mid; }
+    ret res[Slice[u32], fail.Fail].ok{Slice[u32]{data: res_binds.ok, size: count}};
+}
+
+# what a unit's run made: whether it compiled, then what compiling its lowered module made and the time it took,
+# and for a normal object of a build that makes offers the offer its run made of the lowered module before compiling
+# it, which the unit's completion hands over to the module, or the failure making it or reading the offers it binds
+# ---
+# compiled: its lowered module was compiled, so `made` and `spent` are read
+# made:     what compiling it made
+# spent:    the time compiling took
+# offer:    the offer made of the lowered module, empty when none was made
+# offered:  the failure making the offer or reading the offers it binds, which stopped the run before compiling, none
+#           when neither failed
+# stopped:  the pass ended while the run waited for an offer, so it compiled nothing and the unit is cancelled
 rec Ran {
     compiled: bool;
     made:     res[compile_unit.Made, backend_compile.Unplaced];
     spent:    chrono_duration.Duration;
+    offer:    project.Offer;
+    offered:  opt[fail.Fail];
+    stopped:  bool;
 }
 
 # the run of a unit: its lowering, when it is pending and not yet run, lowered against the stores `lent` lends,
-# then its lowered module compiled as its job says. it reads the product and what the lowering's prepare
-# gathered, and touches only the unit's stores and heap, the stores lent, the target and the object allocator
-fun unit_run(made: *Product, lent: *Lent) Ran {
+# then for a normal object of a build that makes offers its offer made of the lowered module and handed over to
+# `handover`, empty when the lowering or the offer failed, then the offers of the modules its prepare named, read
+# once each is handed over, then its lowered module compiled as its job says, binding those offers that the module
+# binds. it reads the product, what the lowering's prepare gathered and the offers handed over, which no one
+# replaces while it runs, and touches only the unit's stores and heap, the stores lent, the hand-over, the target and
+# the object allocator
+fun unit_run(made: *Product, lent: *Lent, handover: *offer.Handover) Ran {
     val l:       *Lowering             = made.lowering;
     var lowered: *compile_unit.Lowered = l.lowered;
+    var ran:     Ran                   = Ran{compiled: false};
     if (l.job != nil) {
-        if (!l.job.made)            { lower_run(l.job, lent); }
-        if (sel l.job.lowered.err)  { ret Ran{compiled: false}; }
-        if (sel l.job.gathered.err) { ret Ran{compiled: false}; }
+        if (!l.job.made) { lower_run(l.job, lent); }
+        if (sel l.job.lowered.err) {
+            run_handed(made, handover, ?ran.offer);
+            ret ran;
+        }
+        if (sel l.job.gathered.err) {
+            run_handed(made, handover, ?ran.offer);
+            ret ran;
+        }
         lowered = l.job.lowered.ok;
+    }
+    if (sel made.offering.some) {
+        val res_offer: res[project.Offer, fail.Fail] = offer.make(made.job.out, ?lowered.m);
+        if (sel res_offer.err) {
+            run_handed(made, handover, ?ran.offer);
+            ran.offered = opt[fail.Fail].some{res_offer.err};
+            ret ran;
+        }
+        ran.offer = res_offer.ok;
+        run_handed(made, handover, ?ran.offer);
+    }
+    if (made.binds.size != 0) {
+        val res_bound: res[opt[Slice[offer.Candidate]], fail.Fail] = offer.bound(handover, made.binds, ?lowered.ir);
+        if (sel res_bound.err) {
+            ran.offered = opt[fail.Fail].some{res_bound.err};
+            ret ran;
+        }
+        val opt_candidates: opt[Slice[offer.Candidate]] = res_bound.ok;
+        if (sel opt_candidates.none) {
+            ran.stopped = true;
+            ret ran;
+        }
+        lowered.offers = opt_candidates.some;
     }
     var started: readout.Instant = readout.Instant.none{};
     if (made.job.timed) { started = readout.sample(); }
-    val res_made: res[compile_unit.Made, backend_compile.Unplaced] = compile_unit.compile(?made.job, lowered);
-    ret Ran{compiled: true, made: res_made, spent: readout.elapsed(started)};
+    ran.made     = compile_unit.compile(?made.job, lowered);
+    ran.spent    = readout.elapsed(started);
+    ran.compiled = true;
+    ret ran;
 }
 
-# what a unit's run compiled given back unreported
+# the offer `o` a unit's run made, empty when it made none, handed over to its importers where the unit offers
+fun run_handed(made: *Product, handover: *offer.Handover, o: *project.Offer) {
+    if (sel made.offering.some) { offer.hand(handover, made.offering.some, o); }
+}
+
+# what a unit's run made given back unreported: what it compiled and the offer it made
 fun ran_dnit(made: *Product, ran: *Ran) {
+    project.offer_dnit(?ran.offer);
     if (!ran.compiled) { ret; }
     var outcome: res[compile_unit.Made, backend_compile.Unplaced] = ran.made;
     if (sel outcome.ok) { backend_compile.dnit(made.job.out, ?outcome.ok.compiled); }
@@ -1984,12 +2158,23 @@ fun ran_dnit(made: *Product, ran: *Ran) {
     ran.compiled = false;
 }
 
-# the completion of a prepared unit, in order on the owner: its lowering completed first when it was prepared
-# beside it, then what its codegen reads of the lowering read and taken, then its compile completed
+# the completion of a prepared unit, in order on the owner: the offers it read given back and, for a normal object
+# of a build that makes offers, the offer its run made handed over to its module, empty when the run made none, so
+# an importer prepared after it reads the offer this unit's source makes. then its lowering completed first when it
+# was prepared beside it, a failure making or reading offers recorded, what its codegen reads of the lowering read
+# and taken, and its compile completed
 fun unit_complete(p: *project.Project, key: u64, prepared: query.PreparedQuery, made: *Product, ran: *Ran) err[fail.Fail] {
     val db:    *query.QueryDb           = ?p.s.queries;
     val lower: opt[query.PreparedQuery] = made.lower;
     made.lower = opt[query.PreparedQuery].none{};
+    binds_dnit(made, p.s.alloc);
+    if (sel made.offering.some) {
+        val m: *project.ModuleEntry = project.module_at(p, made.offering.some);
+        project.offer_dnit(?m.offer);
+        m.offer   = ran.offer;
+        ran.offer = project.Offer{};
+    }
+    project.offer_dnit(?ran.offer);
     if (sel lower.some) {
         val err_lowered: err[fail.Fail] = lower_complete(p, lower.some, made.lowering);
         if (sel err_lowered.err) {
@@ -1997,6 +2182,13 @@ fun unit_complete(p: *project.Project, key: u64, prepared: query.PreparedQuery, 
             ran_dnit(made, ran);
             ret query.complete_prepared(db, prepared, err_lowered);
         }
+    }
+    # a failure making or reading offers is a defect or the allocator's refusal and ends the pass, so its text is
+    # kept in the session's interner as lower_complete keeps a lowering's
+    if (sel ran.offered.some) {
+        val failed: fail.Fail = ran.offered.some;
+        ran_dnit(made, ran);
+        ret query.complete_prepared(db, prepared, err[fail.Fail].err{diagnostic.failure_retain(p.s.interner, failed)});
     }
     val err_taken: err[fail.Fail] = codegen_take(p, key, prepared, made);
     if (sel err_taken.err) {
@@ -2240,6 +2432,9 @@ fun kept_dnit(k: *Kept) {
 #           object, named by its module's path
 # lowering: the unit's lowering, the LOWER product's, borrowed until the completion takes it
 # lower:    the lowering prepared beside it, which completes before it
+# binds:    the modules whose offers its run may bind, named by its prepare (offers_read), drawn from the product's
+#           allocator and given back at its completion
+# offering: the module whose offer its run makes and hands over, a normal object's of a build that makes offers
 rec Product {
     object:   Object;
     holds:    bool;
@@ -2250,10 +2445,19 @@ rec Product {
     title:    str;
     lowering: *Lowering;
     lower:    opt[query.PreparedQuery];
+    binds:    Slice[u32];
+    offering: opt[u32];
+}
+
+# the modules a product's run may bind given back to `alloc`, the product's allocator
+fun binds_dnit(made: *Product, alloc: *A.Allocator) {
+    if (made.binds.data != nil) { A.deallocate[u32](alloc, made.binds.data, made.binds.size); }
+    made.binds = Slice[u32]{data: nil, size: 0};
 }
 
 fun product_dnit(raw: ptr, alloc: *A.Allocator) {
     val made: *Product = raw::*Product;
+    binds_dnit(made, alloc);
     if (made.pending != nil) { compile_unit.dnit(made.job.out, made.pending); }
     if (made.holds)          { backend.object_dnit(?made.object); }
     if (made.lowered)        { kept_dnit(?made.kept); }
@@ -2262,17 +2466,19 @@ fun product_dnit(raw: ptr, alloc: *A.Allocator) {
 }
 
 # a prepared product over the unit's lowering `l`, prepared beside it as `lower` or current, which `job`
-# compiles, the test object's name `title` owned by it. a lowering prepared beside it is cancelled when the
-# product cannot be made
+# compiles, the test object's name `title` and the modules whose offers its run may bind, `binds`, owned by it, its
+# run making the offer of module `offering`. a lowering prepared beside it is cancelled when the product cannot be
+# made
 fun product_pending(db: *query.QueryDb, alloc: *A.Allocator, l: *Lowering, lower: opt[query.PreparedQuery], job: compile_unit.Job, title: str,
-    owner: *A.Allocator) res[query.QueryOutput, fail.Fail] {
+    binds: Slice[u32], offering: opt[u32], owner: *A.Allocator) res[query.QueryOutput, fail.Fail] {
     val res_boxed: res[*Product, A.Error] = A.allocate[Product](owner, 1);
     if (sel res_boxed.err) {
-        if (sel lower.some) { val err_cancelled: err[fail.Fail] = query.cancel_prepared(db, lower.some); }
-        if (title != nil)   { str_free(owner, title); }
+        if (sel lower.some)    { val err_cancelled: err[fail.Fail] = query.cancel_prepared(db, lower.some); }
+        if (title != nil)      { str_free(owner, title); }
+        if (binds.data != nil) { A.deallocate[u32](owner, binds.data, binds.size); }
         ret res[query.QueryOutput, fail.Fail].err{fail.refused(res_boxed.err)};
     }
-    @res_boxed.ok = Product{lowered: false, pending: nil, job: job, title: title, lowering: l, lower: lower};
+    @res_boxed.ok = Product{lowered: false, pending: nil, job: job, title: title, lowering: l, lower: lower, binds: binds, offering: offering};
     ret handle_encode(alloc, res_boxed.ok::ptr, product_dnit, owner);
 }
 

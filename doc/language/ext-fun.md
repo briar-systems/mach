@@ -392,6 +392,99 @@ Common reasons to rename:
 - The target's calling convention or ABI decorates symbol names and you
   need to match the decorated form.
 
+## One symbol, one signature
+
+A module may declare a function it also defines, by giving the `ext fun` and the
+definition one symbol. Its object holds one function under that symbol, so every
+`ext fun` of the symbol states the definition's signature, and two `ext fun`s of one
+symbol state the same one. A pair whose signatures differ is refused with
+`ext.signature` at the later of the two, with the earlier one pointed at:
+
+```mach error which `sink` defines as `fun(i64, ptr) i64`
+#[symbol("sink")]
+fun sink(a: i64, p: ptr) i64 {
+    ret a + (p :~ i64);
+}
+
+#[symbol("sink")]
+ext fun c_sink(a: i64, p: *u8) i64; # error: `c_sink` declares the symbol `sink` as `fun(i64, *u8) i64`, which `sink` defines as `fun(i64, ptr) i64`. an `ext fun` states the signature of the definition it names
+```
+
+The signature is the Mach function type: the parameter types in order, the result
+type and whether a C-variadic `...` ends it. Parameter names are no part of it, an
+alias is the type it names, and a constant-time mode is no part of it either, since
+a declaration with no body states none. It is never what the types lower to: `*u8`
+and `ptr` differ although both are one pointer, and so do `VaList` and `ptr`, which
+are both one pointer on System V x86-64 and differ on AAPCS64 linux. Deciding on the
+Mach types keeps one answer for one source on every target.
+
+The rule holds within one module, and across every module of an artifact that a
+target compiles whole as one unit, as SPIR-V does (see [gpu.md](gpu.md)), since
+those modules also become one object. Modules compiled apart each hold their own
+declaration, and the link joins them by name.
+
+## One symbol, one meaning
+
+The rule above holds what a module states for one symbol to one signature. Beside
+it stands a rule for what a module refers to by a symbol. A module that defines a
+symbol refers to no other module's declaration by it, since its object holds one
+function or global under the name and the reference would reach the module's own
+definition, never the declaration it names. The reference is refused with
+`name.clash`, with the module's definition and the other module's declaration
+pointed at:
+
+```mach fragment
+# file: src/other.mach
+#[constant_time("soft")]
+pub fun gsoft[T](a: ^T) ^T {
+    ret a + 3;
+}
+
+# file: src/evil.mach
+#[symbol("example.other.gsoft$u64")]
+pub fun evil(a: u64) u64 {
+    ret a + 1000;
+}
+
+# file: src/main.mach
+use example.other;
+use example.evil;
+
+# this module's object holds its own copy of `other.gsoft[u64]`, under that symbol
+#[constant_time("soft")]
+fun f(a: ^u64) ^u64 {
+    ret other.gsoft[u64](a);
+}
+
+fun g(n: u64) u64 {
+    ret evil.evil(n); # error: `example.evil.evil` has the symbol `example.other.gsoft$u64`, which this module defines as an instance of `example.other.gsoft`. a module refers to no other module's declaration by a symbol it defines
+}
+```
+
+What a module defines is each function and global it declares with a body, each
+test, and each instance or copy its object compiles, including an instance made
+only because another instance it compiles calls it. Either may come first in the
+module. Its own `ext fun` of its own definition means the definition, and the rule
+above holds the two to one signature. Another module's declaration is a second
+meaning even when it is an `ext fun` stating the same signature, and even where the
+link would bind it to this module's definition. A module that defines nothing under
+the symbol may refer to other modules' declarations of it, and the link decides what
+it names. The modules a target compiles whole as one unit count as one module.
+
+A `#[weak]` definition takes no part in the rule, either as the module's own
+definition or as the declaration referred to: a weak definition is replaced at link
+by the definition another module gives, so it is not this module's meaning of the
+symbol. A module may define a default and call another module's replacement of it,
+or the reverse, and the link binds the two (see
+[decorators.md](decorators.md#weakstr--a-definition-as-a-link-time-default)).
+
+An `ext fun` naming another module's definition is not checked against it. Where
+its signature differs, the source is wrong about the definition, and every call
+goes through the `ext fun` as written, at every optimisation level.
+
+The refusal comes from a build, not from `mach check`, because the instances a
+module's object compiles are known only once the object is made.
+
 ## Library attribution
 
 On a two-level dynamic format — PE (Windows) or Mach-O (Darwin) — the `library`

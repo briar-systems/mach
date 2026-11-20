@@ -14,6 +14,8 @@
 # a `# targets:` line in a file's header names the targets that take it: a refuse/ file is
 # tried on the host alone without one, and a run/ or gpu/ file on every target taking its kind.
 # a `# flags:` line adds its words to the file's build after the target's, as `--set simd=require`.
+# a `# has:` or `# lacks:` line is a rule of a target file's kind on the file's own artifact, on
+# every target that builds it, as a code shape that only one file's program has.
 # --local also runs each artifact of a target the host cannot run under the tool its target
 # file names on a `local` line (an emulator, or a validator for a module), when it is installed.
 # it is for a developer's machine, never CI. exit 0: nothing failed.
@@ -32,6 +34,12 @@ def header(path):
             break
         out[m.group(1)] = m.group(2)
     return out
+
+
+def file_rules(path):
+    # the `# has:` and `# lacks:` rules of a file's header
+    h = header(path)
+    return [(verb, [p.strip() for p in h[verb].split(';')], 0) for verb in ('has', 'lacks') if verb in h]
 
 
 def aimed(path, target, default):
@@ -234,12 +242,15 @@ def one_target(cfg, target, files, refusals, host):
             if why:
                 fails.append(fail(rel, target, why))
             ran += 1
-        if target.rules:
+        own = file_rules(path)
+        if target.rules or own:
             d = subprocess.run([cfg.mink, 'dump', out], capture_output=True, text=True)
             if d.returncode != 0:
                 fails.append(fail(rel, target, 'mink cannot read the artifact'))
             for b in judge(target.rules, d.stdout):
                 fails.append(fail(rel, target, f'breaks {target.name}.target {b}'))
+            for b in judge(own, d.stdout):
+                fails.append(fail(rel, target, f'breaks its own header rule, {b}'))
     refused = 0
     for path, kind in refusals:
         rel = os.path.relpath(path, HERE)

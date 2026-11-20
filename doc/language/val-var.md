@@ -180,7 +180,8 @@ annotation is refused with `binding.untyped`.
 
 The one part of an annotation an initializer may supply is an array length:
 `[_]T` takes its length from the array literal that initializes the binding, as
-in `val names: [_]str = [_]str{"a", "b", "c"};`. See
+in `val names: [_]str = [_]str{"a", "b", "c"};`, or from the byte count of a
+string literal, as in `val tag: [_]u8 = "abc";` (a `[3]u8`). See
 [types.md](types.md#inferred-length-_t).
 
 ## See also

@@ -662,7 +662,11 @@ declaration that scalarizes on purpose acknowledges it with
 error, `vector.scalarize_refused`, in every build, with debug information or
 without. It covers more than the warning does: an operation a unit computes
 for none of its lanes, one whose lanes no unit holds (an `i32x5` on x86-64),
-and, on a target with no vector unit, every vector operation. The error names
+on a target with no vector unit, every vector operation, and an operation of a
+constant-time function that the function computes lane by lane because the
+target does not time the vector form against the lanes under the modes the
+function is checked under (riscv64 with `zkt` and without `zvkt`, see
+[secrecy](secrecy.md#soft-and-hard)). The error names
 the function and the operation, and stands at the operation's site where the
 build records one:
 

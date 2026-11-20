@@ -508,7 +508,8 @@ Notes:
 - `[_]T` is an inferred array length: the length is not written but taken
   from elsewhere. It is legal only as the type of an array literal
   (`[_]T{...}`), as the annotation of a `val` or `var` initialized by an array
-  literal, where the length is the literal's element count, and on a `val`
+  literal, where the length is the literal's element count, or by a string
+  literal, where it is the literal's byte count, and on a `val`
   carrying `#[embed(...)]`, where it is the embedded file's byte count. A
   `val` or `var` annotation may wrap it in a secret (`^[_]u8`). Anywhere
   else, including nested in another type (`*[_]u8`), it is rejected with

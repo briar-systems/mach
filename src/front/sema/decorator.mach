@@ -12,6 +12,7 @@ use ast_stmt: mach.front.ast.stmt;
 use ast_type: mach.front.ast.type;
 use mach.front.comptime;
 use comptime_failure: mach.front.comptime.failure;
+use comptime_scope:   mach.front.comptime.scope;
 use comptime_value:   mach.front.comptime.value;
 use mach.front.decorator;
 use mach.front.expect;
@@ -26,6 +27,7 @@ use sema_handle: mach.front.sema.handle;
 use mach.front.sema.infer;
 use mach.front.sema.typename;
 use report_phase: mach.report.phase;
+use mach.session;
 use mach.session.module;
 use mach.type;
 use type_kind:      mach.type.kind;
@@ -73,9 +75,10 @@ pub fun infer_decorator_args(sc: *sema_context.SemaContext, d: *ast_decl.Decl) {
 # id adds, with the decorators of a tag's cases, a `def` that states no type, and the
 # symbols `d` defines. problems are reported to `sc`
 # ---
-# sc: the sema context of the module being typed
-# d:  the declaration whose decorators are checked
-pub fun validate_decorators(sc: *sema_context.SemaContext, d: *ast_decl.Decl) {
+# sc:  the sema context of the module being typed
+# did: the declaration's id
+# d:   the declaration whose decorators are checked
+pub fun validate_decorators(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl) {
     val places: decorator.Places = decorator.places_of(d);
     var i:      u32              = 0;
     for (i < d.decorators_len) {
@@ -86,6 +89,150 @@ pub fun validate_decorators(sc: *sema_context.SemaContext, d: *ast_decl.Decl) {
     if (d.kind == ast_decl.DECL_KIND_TAG) { validate_case_decorators(sc, ?d.data.tag_); }
     if (d.kind == ast_decl.DECL_KIND_DEF) { validate_def_defined(sc, d); }
     if (states_definition(sc, d))         { validate_symbols_once(sc, d); }
+    if (states_function(sc.view.a, d))    { validate_symbol_signature(sc, did, d); }
+}
+
+# whether `d` is a function that states a signature for a symbol: an `ext fun`, or a
+# definition no template makes instances of
+pub fun states_function(a: *ast.Ast, d: *ast_decl.Decl) bool {
+    if (d.kind != ast_decl.DECL_KIND_FUN)        { ret false; }
+    if ((d.flags & ast_decl.DECL_FLAG_EXT) != 0) { ret true; }
+    ret !ast_id.stmt_is_nil(d.data.fun_.body) && !growth.fun_is_template(a, d);
+}
+
+# the symbol the function `d` of the syntax `a`, whose source is `source`, states: the name its
+# `symbol` or `weak` decorator gives, else an `ext fun`'s own name. nil for a definition the
+# compiler names, which no other declaration can name
+pub fun stated_symbol(s: *session.Session, c: *comptime_scope.ComptimeCtx, a: *ast.Ast, source: str, d: *ast_decl.Decl) res[intern.StrId, fail.Fail] {
+    var i: u32 = 0;
+    for (i < d.decorators_len) {
+        val dec: *ast_decl.Decorator = ?a.decorators.data[d.decorators_start + i];
+        i = i + 1;
+        if (dec.id != decorator.SYMBOL && dec.id != decorator.WEAK) { cnt; }
+        ret res[intern.StrId, fail.Fail].ok{decorator.string_id(c, a, dec, 0)};
+    }
+    if ((d.flags & ast_decl.DECL_FLAG_EXT) == 0) { ret res[intern.StrId, fail.Fail].ok{intern.STR_NIL}; }
+    val res_named: res[intern.StrId, A.Error] = intern.range_add(s.interner, source, d.data.fun_.name.offset, d.data.fun_.name.len);
+    if (sel res_named.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(res_named.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{res_named.ok};
+}
+
+# one module holds one function for a symbol, so the `ext fun`s and the definition that state it
+# state one signature. the first function of each symbol is kept, and each later one is held to it
+fun validate_symbol_signature(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl) {
+    if (sc.typing.functions == nil || sc.view.decl_type == nil) { ret; }
+    val res_source: res[str, fail.Fail] = sema_context.source_text_of(sc.s, sc.view.a);
+    if (sel res_source.err) {
+        sema_context.report_internal(sc, d.data.fun_.name, res_source.err);
+        ret;
+    }
+    val res_named: res[intern.StrId, fail.Fail] = stated_symbol(sc.s, sc.view.ctx, sc.view.a, res_source.ok, d);
+    if (sel res_named.err) {
+        sema_context.refuse(sc, d.data.fun_.name, res_named.err);
+        ret;
+    }
+    if (intern.str_is_nil(res_named.ok)) { ret; }
+    val key:       u32                 = res_named.ok::u32;
+    val opt_prior: opt[*ast_id.DeclId] = map.get[u32, ast_id.DeclId](sc.typing.functions, ?key);
+    if (sel opt_prior.none) {
+        val res_noted: res[bool, A.Error] = map.insert[u32, ast_id.DeclId](sc.typing.functions, key, did);
+        if (sel res_noted.err) { sema_context.refuse(sc, d.data.fun_.name, fail.refused(res_noted.err)); }
+        ret;
+    }
+    val prior: ast_id.DeclId = @opt_prior.some;
+    if (prior == did) { ret; }
+    val first: *ast_decl.Decl = ?sc.view.a.decls.data[ast_id.decl_index(prior)];
+    # two definitions are the `symbol` rule's
+    if (((first.flags | d.flags) & ast_decl.DECL_FLAG_EXT) == 0) { ret; }
+    val first_type: type_kind.TypeId = sc.view.decl_type[ast_id.decl_index(prior)];
+    val own_type:   type_kind.TypeId = sc.view.decl_type[ast_id.decl_index(did)];
+    if (type_kind.is_error(first_type) || type_kind.is_error(own_type)) { ret; }
+    if (type.same_signature(sc.s.types, first_type, own_type))          { ret; }
+    val res_said: res[str, fail.Fail] = signature_refusal(sc.s, res_named.ok, sc.view.a, first, sc.view.a, d);
+    if (sel res_said.err) {
+        sema_context.report_internal(sc, d.data.fun_.name, res_said.err);
+        ret;
+    }
+    sema_context.report_related(sc, diagnostic_kind.EXT_SIGNATURE, d.data.fun_.name, res_said.ok, base_source.location(sc.view.a.file_id, first.data.fun_.name), stated_label(first));
+    str_free(sc.s.alloc, res_said.ok);
+}
+
+# the label of the place the function `d` states its symbol
+pub fun stated_label(d: *ast_decl.Decl) str {
+    if ((d.flags & ast_decl.DECL_FLAG_EXT) != 0) { ret "declared here"; }
+    ret "defined here";
+}
+
+# the refusal of the function `second` of the syntax `sa` stating the symbol `symbol` with another
+# signature than the function `first` of `fa` states it with, each spelled as its source writes
+# it, released with `str_free`
+pub fun signature_refusal(s: *session.Session, symbol: intern.StrId, fa: *ast.Ast, first: *ast_decl.Decl, sa: *ast.Ast, second: *ast_decl.Decl) res[str, fail.Fail] {
+    var b: textbuild.TextBuilder = textbuild.tb_init(s.alloc);
+    fin { textbuild.tb_dnit(?b); }
+    val err_second: err[fail.Fail] = put_function(s, ?b, sa, second);
+    if (sel err_second.err) { ret res[str, fail.Fail].err{err_second.err}; }
+    textbuild.tb_append(?b, " the symbol `");
+    textbuild.tb_append(?b, intern.text(s.interner, symbol));
+    textbuild.tb_append(?b, "` as `");
+    val err_spelled: err[fail.Fail] = put_signature(s, ?b, sa, second);
+    if (sel err_spelled.err) { ret res[str, fail.Fail].err{err_spelled.err}; }
+    textbuild.tb_append(?b, "`, which ");
+    val err_first: err[fail.Fail] = put_function(s, ?b, fa, first);
+    if (sel err_first.err) { ret res[str, fail.Fail].err{err_first.err}; }
+    textbuild.tb_append(?b, " as `");
+    val err_respelled: err[fail.Fail] = put_signature(s, ?b, fa, first);
+    if (sel err_respelled.err)                                        { ret res[str, fail.Fail].err{err_respelled.err}; }
+    if (((first.flags & second.flags) & ast_decl.DECL_FLAG_EXT) != 0) { textbuild.tb_append(?b, "`. every `ext fun` of one symbol states one signature"); }
+    or                                                                { textbuild.tb_append(?b, "`. an `ext fun` states the signature of the definition it names"); }
+    val res_text: res[str, textbuild.Error] = textbuild.tb_finish(?b);
+    if (sel res_text.err) { ret res[str, fail.Fail].err{fail.message(textbuild.text(res_text.err))}; }
+    ret res[str, fail.Fail].ok{res_text.ok};
+}
+
+# the function's name in backquotes and what it does with its symbol, `declares` or `defines`
+fun put_function(s: *session.Session, b: *textbuild.TextBuilder, a: *ast.Ast, d: *ast_decl.Decl) err[fail.Fail] {
+    val res_source: res[str, fail.Fail] = sema_context.source_text_of(s, a);
+    if (sel res_source.err) { ret err[fail.Fail].err{res_source.err}; }
+    val res_named: res[intern.StrId, A.Error] = intern.range_add(s.interner, res_source.ok, d.data.fun_.name.offset, d.data.fun_.name.len);
+    if (sel res_named.err) { ret err[fail.Fail].err{fail.refused(res_named.err)}; }
+    textbuild.tb_append(b, "`");
+    textbuild.tb_append(b, intern.text(s.interner, res_named.ok));
+    if ((d.flags & ast_decl.DECL_FLAG_EXT) != 0) { textbuild.tb_append(b, "` declares"); }
+    or                                           { textbuild.tb_append(b, "` defines"); }
+    ret err[fail.Fail].ok{};
+}
+
+# the signature of the function `d` as a function type, each part as its source spells it
+fun put_signature(s: *session.Session, b: *textbuild.TextBuilder, a: *ast.Ast, d: *ast_decl.Decl) err[fail.Fail] {
+    textbuild.tb_append(b, "fun(");
+    val f: *ast_decl.DeclFun = ?d.data.fun_;
+    var i: u32               = 0;
+    for (i < f.params_len) {
+        if (i > 0) { textbuild.tb_append(b, ", "); }
+        val err_part: err[fail.Fail] = put_annotation(s, b, a, a.typed_names.data[f.params_start + i].ty);
+        if (sel err_part.err) { ret err_part; }
+        i = i + 1;
+    }
+    if (f.c_variadic) {
+        if (f.params_len > 0) { textbuild.tb_append(b, ", "); }
+        textbuild.tb_append(b, "...");
+    }
+    textbuild.tb_append(b, ")");
+    if (!ast_id.type_is_nil(f.return_type)) {
+        textbuild.tb_append(b, " ");
+        ret put_annotation(s, b, a, f.return_type);
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun put_annotation(s: *session.Session, b: *textbuild.TextBuilder, a: *ast.Ast, tid: ast_id.TypeId) err[fail.Fail] {
+    val res_spelled: res[opt[str], fail.Fail] = typename.annotation_str(s, a, tid);
+    if (sel res_spelled.err) { ret err[fail.Fail].err{res_spelled.err}; }
+    val spelled: opt[str] = res_spelled.ok;
+    if (sel spelled.none) { ret err[fail.Fail].err{fail.message("sema: a function's annotation has no source")}; }
+    textbuild.tb_append(b, spelled.some);
+    typename.type_str_free(s, spelled.some);
+    ret err[fail.Fail].ok{};
 }
 
 # whether `d` defines one symbol of its own: an `ext` or bodyless declaration may name

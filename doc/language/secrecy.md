@@ -1199,7 +1199,11 @@ function uses, or the build is refused with a diagnostic naming the missing
 feature:
 
 - aarch64 needs DIT in the target's baseline, as darwin-arm64 has it;
-- riscv needs Zkt in the selection, and Zvkt as well for vector code;
+- riscv needs Zkt in the selection. Without Zvkt the vector instructions
+  carry no promise, so a constant-time function, hard or soft, keeps the lanes
+  of its vectors in scalar registers and computes them one by one, and a
+  function that is not constant-time packs the same code. Zvkt in the
+  selection lets a constant-time function pack it too;
 - x86-64's scalar cells hold unconditionally, so they pass.
 
 **Calls between the modes.** Both modes do the same at entry and at every

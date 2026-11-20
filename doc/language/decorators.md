@@ -357,6 +357,9 @@ it (Darwin's underscore prefix, nothing elsewhere; see
 [ext-fun.md](ext-fun.md)). `symbol` gives the C name, and the linker sees it with
 the target's C symbol prefix, so `#[symbol("main")]` is `_main` on Darwin. Two definitions in one module cannot state one
 name, and the second is refused with `name.duplicate`.
+A module cannot refer to another module's declaration by a name it defines either,
+and the reference is refused with `name.clash`. That rule and the one that holds each
+`ext fun` of a symbol to one signature are in [ext-fun.md](ext-fun.md#one-symbol-one-signature).
 
 A symbol names a definition for whatever refers to it by name, and keeps
 nothing: the link keeps a function or global exactly while something it keeps
@@ -464,8 +467,9 @@ stand once on a function, so the two modes never meet.
 
 `inline("always")` expands a function at every direct call the inliner may
 expand, whatever its size. A build that optimizes runs the inliner over each
-module (see [manifest.md](manifest.md), the `inline` pass), and it expands only
-calls of functions of the same module. Without a decorator, a direct call is
+module (see [manifest.md](manifest.md), the `inline` pass), and it expands calls
+of functions of the same module and of the modules it imports directly. Without
+a decorator, a direct call is
 expanded where the callee is small: at most 5 instructions after promotion of
 its locals to values, or fewer than 25 where the call stands inside a loop of
 the caller. Debug annotations are not instructions, so `debug = true` never
@@ -473,9 +477,10 @@ moves the decision. The inliner works bottom up, so a callee is expanded with
 the calls the inliner already expanded into it.
 
 The inliner never expands a call of an `inline("never")` function, a call
-within a recursive call cycle, an indirect call, or a call of a
+within a recursive call cycle, an indirect call, a call of a
 [`weak`](#weakstr--a-definition-as-a-link-time-default), `naked` or
-`vectorize("never")` function, whatever the decorator says. A `constant_time`
+`vectorize("never")` function, or any call inside a `vectorize("never")`
+function, whatever the decorator says. A `constant_time`
 function is expanded only into another `constant_time` function whose call
 trusts it by the two declarations alone (a `soft` caller, or a `hard` callee),
 so its instructions never leave a constant-time validated body, and a function
@@ -486,6 +491,31 @@ own code, a remaining call or a taken address still names it, and one nothing
 reaches any more is left out by the link as any unreferenced function is. The
 copied instructions keep their secrecy, their effects and their debug
 locations, and record the call as the site they were inlined at.
+
+A function of another module is expanded from the body that module offers its
+importers, as it lowered it, before any optimization. A module offers each of
+its `pub` functions the rules above may expand: one that is not `inline("never")`,
+`weak`, `naked`, `vectorize("never")`, exported from a shared image, run by the
+loader or decorated with `#[extension]`, that holds no inline `asm`, that is
+`inline("always")` or smaller than 25 instructions after promotion, and whose
+body names only functions and globals another module may refer to (a `pub` one,
+not a private helper, a string literal or a generic instance). A function
+that fails one of these is called across modules as before. A generic instance
+is never offered: each module that uses one compiles its own copy, which the
+link folds or, where constant-time code calls it, keeps local. An offered
+function is the one strong definition of its symbol, so the link binds every
+other module's reference to that symbol to it, and the importer expands it
+only where linking would have called it: an importer copies an offered body
+only where it calls that function and does not define it, along with the
+offered bodies of the same module that body calls, and only where it defines
+no symbol the copied body names or defines. A `symbol`
+function is offered like any other, and only a name a `symbol` states can meet
+another module's, so a program in which no two modules state one symbol loses
+no expansion by this. A target that
+compiles an artifact as one module (`vulkan-spirv`) has every body to hand and
+offers none. Because an importer copies those bodies, a build that runs the
+`inline` pass keys each module's reused object on the whole of its direct
+imports (see [manifest.md](manifest.md), the object cache).
 
 ```mach
 #[inline("always")]
@@ -966,11 +996,13 @@ is refused naming its replacement.
 fun reference_sum(a: *i64, n: usize) i64 { ... }
 ```
 
-A `#[vectorize("never")]` function is also declined by the inliner, so the opt-out survives
-inlining — it cannot be lost by the body moving into an unflagged caller. Use it
+A `#[vectorize("never")]` function is also declined by the inliner both ways, so the opt-out
+survives inlining: it cannot be lost by the body moving into an unflagged caller, and no
+call inside it is expanded, so a callee's loop never becomes scalar by moving into it. Use it
 for a scalar reference twin in a differential test, or where vectorized codegen
-is undesirable for a specific function. No profile key turns vectorization off for a
-whole build (see [manifest.md](manifest.md#profilename)).
+is undesirable for a specific function. For a whole build no `vectorize` key exists:
+`optimize` schedules vectorization and `passes.vectorise = false` leaves it out
+(see [manifest.md](manifest.md#passes)).
 
 ### `naked` — no prologue, no epilogue, body as written
 

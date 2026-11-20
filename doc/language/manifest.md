@@ -1204,8 +1204,8 @@ The previous major's keys are refused by name, each with what replaced it, and
 with the rewrite `mach migrate` applies as a fix wherever the value has a
 mechanical one: `opt = 0` is `optimize = false`, `opt = 1` and `opt = 2` are
 `optimize = true`, `vectorize = true` and `vectorize = false` are removed, since
-no profile key turns vectorization on or off, with `#[vectorize("never")]` still
-opting one function out, `float_reassoc = false` is
+`optimize` schedules vectorization and `passes.vectorise` turns it off, with
+`#[vectorize("never")]` still opting one function out, `float_reassoc = false` is
 removed and `float_reassoc = true` is `relax = ["float-reassoc"]`. `pass` and
 `skip` have no rewrite, since they listed passes by the previous major's names:
 
@@ -1236,11 +1236,11 @@ licm = false                           # every other pass runs, loop invariant m
 ```
 
 The optimization passes are `inline`, `split`, `promote`, `reassociate`, `fold`,
-`algebraic`, `reduce`, `effects`, `cse`, `licm` and `dce`. A key that names none of them is refused where it is
+`algebraic`, `reduce`, `effects`, `cse`, `forward`, `dse`, `thread`, `ifconvert`, `demanded`, `licm`, `vectorise`, `hoist`, `unroll`, `dce` and `switch`. A key that names none of them is refused where it is
 written, with the list, whichever profile the build selects:
 
 ```
-error[manifest.invalid_value] mach.toml: [profile.release].passes names "peel", which is no optimization pass. the optimization passes are inline, split, promote, reassociate, fold, algebraic, reduce, effects, cse, licm, dce
+error[manifest.invalid_value] mach.toml: [profile.release].passes names "peel", which is no optimization pass. the optimization passes are inline, split, promote, reassociate, fold, algebraic, reduce, effects, cse, forward, dse, thread, ifconvert, demanded, licm, vectorise, hoist, unroll, dce, switch
 ```
 
 A non-boolean value is a manifest error. `--set passes.<name>=<bool>` writes
@@ -2145,9 +2145,14 @@ compiler identity, the build configuration, the module's own source and embedded
 files, and the surface of every module it imports, directly or not. A module's
 surface is its source without the bodies of its tests and of its functions that
 are neither generic nor take a comptime parameter, since no importer compiles
-those; a release build inlines function bodies across modules, so there the
-whole source is the surface. Editing such a body rebuilds that module alone, and
-editing a declaration rebuilds the module and the modules that import it. With
+those. Editing such a body rebuilds that module alone, and editing a declaration
+rebuilds the module and the modules that import it. A build that runs the
+`inline` pass expands small function bodies of a module's direct imports into
+it (see [decorators.md](decorators.md#inlinemode--force-or-forbid-inlining)),
+so there a module's key takes the whole key of each module it imports directly
+in place of that module's surface: editing a body rebuilds the module and the
+modules that import it directly, and a module imported only through others
+reaches its importers through those modules' keys as before. With
 debug information the surface also covers where each retained declaration sits,
 so an edit that moves one to another line rebuilds its importers. A reused
 module reports again the warnings it reported when it was compiled, so a warm

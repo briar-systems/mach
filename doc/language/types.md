@@ -699,24 +699,42 @@ val a: [4]i64    = [4]i64{1, 2, 3, 4};
 val g: [2][2]i64 = [2][2]i64{[2]i64{1, 2}, [2]i64{3, 4}};
 ```
 
+An array of `u8` is also initialized by a string literal, which holds its bytes
+and nothing else, so a terminator is stored only when written:
+
+```mach fragment
+val A: [3]u8    = "abc";                       # 61 62 63
+val B: [4]u8    = "abc\0";                     # 61 62 63 00
+val C: [4]u8    = "abc";                       # error: the string literal holds 3 bytes and the array 4
+val P: [2][3]u8 = [2][3]u8{"abc", "def"};
+```
+
+The literal's byte count must be the array's length, and the element must be
+`u8` or an alias of it. The same literal bound to `*u8` stores a terminator
+after its bytes, so `"abc"` is 4 bytes there and 3 in `[3]u8`. See
+[literals.md](literals.md#string).
+
 ### Inferred length `[_]T`
 
 `[_]T` leaves the length for an array literal to give. It is legal only
 where an array literal of known element count fixes it: the literal's own
 type spelling, and the annotation of a `val` or `var` initialized by one. The
 length is the literal's element count, the same count `array.literal_length`
-checks.
+checks. A string literal initializing a `val` or `var` gives its byte count
+the same way, after escapes and with no terminator unless one is written.
 
 ```mach fragment
 val NAMES: [_]str = [_]str{"a", "b", "c"};   # [3]str
 val K:     [_]u8  = [2]u8{1, 2};              # [2]u8
 val S:     ^[_]u8 = [2]u8{1, 2};              # ^[2]u8
 val GRID:  [_][2]u8 = [_][2]u8{[2]u8{1, 2}, [2]u8{3, 4}}; # [2][2]u8
+val D:     [_]u8  = "abc";                    # [3]u8
+val Z:     [_]u8  = "abc\0";                  # [4]u8
 ```
 
 Every other `[_]` is refused with `array.inferred_length`: a parameter, a field,
-a result, a `var` with no initializer, an initializer that is not an array
-literal, and a `[_]` nested in another type, whether as the element of an array
+a result, a `var` with no initializer, an initializer that is not an array or
+string literal, and a `[_]` nested in another type, whether as the element of an array
 (`[_][_]T`, `[3][_]T`) or behind a pointer (`*[_]T`). A `val` or `var`
 annotation may wrap the `[_]` in a secret (`^[_]T`), since an array length is public.
 Only the outermost length is inferred, since one literal counts only its own

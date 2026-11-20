@@ -157,16 +157,62 @@ backspace, `\x07` for bell).
 
 ## String
 
-A sequence of characters in double quotes, producing a `*u8` pointing at
-null-terminated bytes in the data segment:
+A sequence of characters in double quotes. A string literal is its bytes: each
+character written, with each escape standing for the one byte it names. What
+the bytes become depends on where the literal is used.
+
+Bound to a pointer, which is also what a literal is when nothing gives it a
+type, the literal is a `*u8` pointing at its bytes in the data segment with a
+terminating `0` byte stored after them:
 
 ```mach
 val msg: *u8 = "hello, mach\n";
 ```
 
-The bytes are read-only. Two literals with the same text in one module may be
+These bytes are read-only. Two literals with the same text in one module may be
 the same bytes at the same address, so the address of a literal says nothing
 about which literal it came from.
+
+Checked against an array of `u8`, the literal is that array and holds its bytes
+and nothing else. A terminator is stored only when it is written, as `\0`:
+
+```mach fragment
+val A: [3]u8 = "abc";      # 61 62 63
+val B: [4]u8 = "abc\0";    # 61 62 63 00
+val C: [4]u8 = "abc";      # error: the string literal holds 3 bytes and the array 4
+val D: [_]u8 = "abc";      # [3]u8
+```
+
+So `"abc"` stores 4 bytes when bound to `*u8` and 3 when bound to `[3]u8`. One
+rule covers both: a string literal is its bytes, and a pointer binding stores a
+terminator after them.
+
+- The length `N` of `[N]u8` is checked. A literal whose byte count is not `N` is
+  refused with `array.literal_length`, and when the literal is one byte short
+  the refusal suggests ending it with `\0`. `[N]` never adds a terminator for
+  the literal.
+- `[_]u8` takes its length from the literal's byte count (see
+  [types.md](types.md#inferred-length-_t)).
+- The count is of bytes after escapes: `"a\n"` is 2 bytes, `"\x41\x42"` is 2,
+  `"a\0b"` is 3 with a `0` byte in the middle, and `""` is none.
+- The element type is `u8`, or an alias of it as std's `char` is. There is no
+  transcoding, and an array of any other element type is refused with
+  `type.mismatch`.
+- The array is a value like any other array: it is the bytes of the binding
+  itself, so `#[section]`, `#[align]` and `#[at]` on a module binding place
+  those bytes, with no pointer and no relocation, and a local `var` gets its
+  own copy it may write.
+- The same holds wherever a value is checked against an array type: a `val` or
+  `var` at module scope or in a function, a record field (`R{name: "abc"}`
+  with `name: [3]u8`), an element of an array of arrays
+  (`[2][3]u8{"abc", "def"}`), a call argument for a `[N]u8` parameter, a `ret`
+  from a function returning `[N]u8`, and an assignment to an array. Only the
+  literal as a whole expression takes the array. A comparison gives it no
+  array type, so it stays a pointer beside a pointer, and an array is never
+  compared with `==`.
+- A module `val` holding the array is a constant like one an array literal
+  initializes: `$length_of` reads its length, and comptime reads its elements
+  (`A[0]`, `$each b in A`).
 
 String escapes: the same set.
 
@@ -187,6 +233,8 @@ val usage: *u8 =
   line or a comment does. The `;` or `,` after a multiline string goes on the
   next line, since a line's text runs to its end.
 - A CRLF line break joins as `\n`.
+- A multiline string is a string literal like any other, so it initializes an
+  array of `u8` with its bytes as a quoted one does.
 - `mach fmt` indents each line, and keeps the bytes after each `\\` as written,
   trailing whitespace included.
 
