@@ -10,7 +10,7 @@ project's operations last published it
 
 Source: [`src/compile/frontend.mach`](../../../src/compile/frontend.mach)
 
-Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](project.md), [`mach.front.ast`](../front/ast.md), [`mach.front.resolve`](../front/resolve.md), [`mach.front.sema.instance`](../front/sema/instance.md), [`mach.front.sema.product`](../front/sema/product.md), [`mach.report.phase`](../report/phase.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md).
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](project.md), [`mach.front.ast`](../front/ast.md), [`mach.front.resolve`](../front/resolve.md), [`mach.front.sema.instance`](../front/sema/instance.md), [`mach.front.sema.product`](../front/sema/product.md), [`mach.report.phase`](../report/phase.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md), [`mach.type`](../type.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -33,10 +33,10 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](pr
 | [`read_definition`](#read_definition) | a module's definition as far as a phase reads it, through the products of this operation |
 | [`acquire_sema`](#acquire_sema) | a module's sema product in the open operation, its field graph installed in the projection |
 | [`kept_sema`](#kept_sema) | what a module's sema product keeps once its front-end products are given back: its status, refusal, interface and field graph, the graph installed in the projection |
-| [`kept_sema_read`](#kept_sema_read) | the semantic product of module `mid` as `reads` reads it, its field graph installed |
+| [`kept_sema_read`](#kept_sema_read) | the semantic product of module `mid` as `reads` reads it, its field graph installed in the type table of `s`, the session as the reader sees it |
 | [`record_load_views`](#record_load_views) | set each module's load view from what the walk left it; an unchanged view is no change |
 | [`instance_deps`](#instance_deps) | what typing the instance `item` reads besides its declaring module's definition: the typed surfaces of every module the declaring module imports, and of every module declaring a type its arguments or pack name with what each of those imports, transitively, each field graph installed |
-| [`instance_reads`](#instance_reads) | the modules the instance `item` names: its declaring module first, then every module declaring a type its arguments or pack name |
+| [`instance_reads`](#instance_reads) | the modules the instance `item` names: its declaring module first, then every module declaring a type its arguments or pack name, the types read in `types` |
 | [`instance_deps_dnit`](#instance_deps_dnit) | release what instance_deps made |
 | [`begin_query_phase`](#begin_query_phase) | open a query operation over the project: the build context must be as it was frozen, and the type projections the last operation installed are reset |
 | [`refresh_diagnostics`](#refresh_diagnostics) | the session's store is rebuilt from the project's and the query presentation's, dropping the warnings a declaration's `#[expect]` acknowledges and the ones their owner's governance hides or silences, then reporting each judged expectation nothing fulfilled |
@@ -175,10 +175,11 @@ acquire_sema's
 ### kept_sema_read
 
 ```mach
-pub fun kept_sema_read(p: *mach.compile.project.Project, reads: *mach.session.query.Reads, mid: mach.session.module.ModuleId) res[*mach.front.sema.product.SemaResult, mach.base.fail.Fail]
+pub fun kept_sema_read(p: *mach.compile.project.Project, s: *mach.session.Session, reads: *mach.session.query.Reads, mid: mach.session.module.ModuleId) res[*mach.front.sema.product.SemaResult, mach.base.fail.Fail]
 ```
 
-the semantic product of module `mid` as `reads` reads it, its field graph installed
+the semantic product of module `mid` as `reads` reads it, its field graph installed in the type table of
+`s`, the session as the reader sees it
 
 ### record_load_views
 
@@ -202,11 +203,11 @@ installed. reading them is what makes the instance's typing depend on them
 ### instance_reads
 
 ```mach
-pub fun instance_reads(p: *mach.compile.project.Project, item: *mach.front.sema.instance.Instance, out: *std.collections.vector.Vector[mach.session.module.ModuleId]) err[mach.base.fail.Fail]
+pub fun instance_reads(p: *mach.compile.project.Project, types: *mach.type.TypeInterner, item: *mach.front.sema.instance.Instance, out: *std.collections.vector.Vector[mach.session.module.ModuleId]) err[mach.base.fail.Fail]
 ```
 
 the modules the instance `item` names: its declaring module first, then every module declaring
-a type its arguments or pack name
+a type its arguments or pack name, the types read in `types`
 
 ### instance_deps_dnit
 

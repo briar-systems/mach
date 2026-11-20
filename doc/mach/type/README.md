@@ -18,8 +18,9 @@ contract:
   give one number to different types, so no id a layer made is read anywhere but through the
   layer until it is merged, and no store shared between tables keeps a fact of one (memo_keyed)
 - what a table keeps beside its types (`Side`) is moved, never shared: a layer is handed the side
-  of the table or thread that made it and hands it back, with every memo of a type past its base
-  dropped at both ends, so a memo is only ever read under the numbering it was made in
+  of the table or thread working on it, when it is made or for a span of its work (`side_lend`),
+  and hands it back, with every memo of a type past its base dropped at both ends, so a memo is
+  only ever read under the numbering it was made in
 - `merge` interns each type a layer made into another table over the same base, in the order the
   layer made them, and says where each landed. types are equal by their parts, so when the owner
   merges layers at the points one thread would have made their types, and in that order, every

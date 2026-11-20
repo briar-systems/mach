@@ -12,13 +12,13 @@ was read with.
 
 Source: [`src/front/sema/fields.mach`](../../../../src/front/sema/fields.mach)
 
-Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.session`](../../session.md), [`mach.type.field`](../../type/field.md), [`mach.type.kind`](../../type/kind.md).
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.session`](../../session.md), [`mach.type`](../../type.md), [`mach.type.field`](../../type/field.md), [`mach.type.kind`](../../type/kind.md).
 
 | Type | | |
 | :--- | :--- | :--- |
 | [`Node`](#node) | `rec` | one record, union, tag or materialized instance a graph captured |
 | [`Roots`](#roots) | `rec` | one group of root types a capture starts from |
-| [`Graph`](#graph) | `rec` | the field tables a capture copied, sorted by type index |
+| [`Graph`](#graph) | `rec` | a module's field recipes, and the root table they were last installed in, under its projection generation, which every table descending from it answers them from |
 
 | On `Roots` | |
 | :--- | :--- |
@@ -100,16 +100,19 @@ instance that has a field table is captured as well
 pub rec Graph {
     nodes:                std.collections.vector.Vector[Node];
     installed:            bool;
+    installed_in:         *mach.type.TypeInterner;
     installed_generation: u64;
 }
 ```
 
-the field tables a capture copied, sorted by type index
+a module's field recipes, and the root table they were last installed in, under its projection
+generation, which every table descending from it answers them from
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `nodes` | `std.collections.vector.Vector[Node]` | the captured nodes, owned by the graph |
-| `installed` | `bool` | whether `install` has published the graph |
+| `nodes` | `std.collections.vector.Vector[Node]` | the captured field tables, sorted by type index and owned by the graph |
+| `installed` | `bool` | whether `install` has published the graph in a root table |
+| `installed_in` | `*mach.type.TypeInterner` | the root table it was published in, nil before the first root install |
 | `installed_generation` | `u64` | the projection generation it was published under |
 
 ### init

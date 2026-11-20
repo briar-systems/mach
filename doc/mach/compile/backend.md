@@ -28,6 +28,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`merges`](#merges) | whether the objects the back half writes hold merged definitions (mink.model.merged), the copies of one a link keeps one of: false for a format masc writes none in |
 | [`unlisted`](#unlisted) | the name of the mirl family that compiles the build when it writes no listing of its objects, none when it writes one |
 | [`whole`](#whole) | whether the family that compiles the build takes an artifact's modules whole, as one unit whose one object the link takes, rather than each module apart |
+| [`laying_init`](#laying_init) | a laying over the build's target, which lays types out as the back end's own does, drawn from `a` |
 | [`dnit`](#dnit) | release what a back half opened and leave it compiling nothing, as none gives |
 | [`machine`](#machine) | the machine lowering builds for, refused for a cell no owner assembles yet |
 | [`object_bytes`](#object_bytes) | the bytes of `o` laid out in the format the target's objects are written in, given back with sink.dnit |
@@ -144,6 +145,14 @@ pub fun whole(b: *Back) bool
 
 whether the family that compiles the build takes an artifact's modules whole, as one unit
 whose one object the link takes, rather than each module apart
+
+### laying_init
+
+```mach
+pub fun laying_init(a: *std.allocator.Allocator, b: *Back) res[*mach.type.query.extent.Laying, mach.base.fail.Fail]
+```
+
+a laying over the build's target, which lays types out as the back end's own does, drawn from `a`
 
 ### dnit
 

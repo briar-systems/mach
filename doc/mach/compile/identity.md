@@ -28,12 +28,12 @@ code merges with the copies it imitates
 
 Source: [`src/compile/identity.mach`](../../../src/compile/identity.mach)
 
-Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.compile.project`](project.md), [`mach.front.sema.instance`](../front/sema/instance.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md).
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.compile.project`](project.md), [`mach.front.sema.instance`](../front/sema/instance.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md).
 
 | Functions | |
 | :--- | :--- |
 | [`of_module`](#of_module) | the source identity of module `mid` |
-| [`of_instance`](#of_instance) | the identity of the instance `item` of symbol `name`, its modules' identities read through `reads` |
+| [`of_instance`](#of_instance) | the identity of the instance `item` of symbol `name`, its modules' identities read through `reads` and its types and name in `s`, the session as the reader sees it |
 
 | Constants | |
 | :--- | :--- |
@@ -54,10 +54,11 @@ the source identity of module `mid`
 ### of_instance
 
 ```mach
-pub fun of_instance(p: *mach.compile.project.Project, reads: *mach.session.query.Reads, item: *mach.front.sema.instance.Instance, name: mach.base.intern.StrId) res[u64, mach.base.fail.Fail]
+pub fun of_instance(p: *mach.compile.project.Project, s: *mach.session.Session, reads: *mach.session.query.Reads, item: *mach.front.sema.instance.Instance, name: mach.base.intern.StrId) res[u64, mach.base.fail.Fail]
 ```
 
-the identity of the instance `item` of symbol `name`, its modules' identities read through `reads`
+the identity of the instance `item` of symbol `name`, its modules' identities read through `reads` and
+its types and name in `s`, the session as the reader sees it
 
 ## Constants
 

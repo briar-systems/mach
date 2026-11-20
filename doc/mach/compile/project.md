@@ -458,6 +458,9 @@ pub rec Project {
     # strings over while the session's handle names the owner's child of it; nil otherwise, when a
     # lowering names its strings in the session's interner itself
     names_frozen: *mach.base.intern.Interner;
+    # how many strings the owner's child holds from merged lowerings, which is every string it holds:
+    # while a pass runs on a crew the owner names strings only by merging units, in their order
+    names_merged: usize;
 
     topo:     *mach.session.module.ModuleId;
     topo_len: u32;

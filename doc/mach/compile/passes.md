@@ -189,7 +189,7 @@ modules alone: what it reads of another module is that module's interface (its d
 constants, template copy), the typed instances, the surfaces instance typing reads and the source
 identities instances are bound by, each a product of its own that outlives the release. those
 made from the released products are made before it: the instances once sema is done, and the
-identities before the first unit (identities_made). a read of a released product refuses
+identities before the first unit (run_units). a read of a released product refuses
 (query.get, frontend.acquire_sema). a test build lowers every module again and gives back none
 
 ### codegen_modules_reached

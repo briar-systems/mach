@@ -13,6 +13,27 @@ and depth first; equal bytes on recomputation keep the previous revision and
 stop propagation; a failed dependency fails the product and the previous value
 is never served. all reads happen inside one operation
 
+a product may be prepared: computed now and finished later outside its computation (a worker
+thread's), then completed or cancelled on the owner. the contract of a prepared attempt:
+- it is prepared outside every computation, or inside the computation of another prepared
+  product, its parent, at any depth. it is never prepared inside a computation `get` started,
+  which would publish before the prepared product could complete
+- a nested prepare records the parent's edge to it where `get` would, before it computes, and
+  the edge takes its revisions when it completes, so the parent's dependency list is the one
+  `get` would have made
+- while it computes, or is entered again (`prepared_enter`), a failure raised is its own, held
+  by its attempt, and its parent holds again once it returns
+- between its prepare and its completion it may be entered again on the owner, outside every
+  computation or over its parent's frame, and what is read then records onto it after what its
+  computation read, in read order, as though the computation had gone on reading
+- a product completes only after every product its computation prepared completed or was
+  cancelled. a nested product completes as `get` answers it: a failure is recorded where a
+  failure of `get` would have been, a reported one rejects the product for the rest of the
+  operation, and a published one is observed by its parent's edge. cancelling a product cancels
+  what it prepared first
+- no reader is served a prepared product before it completes, and the operation cannot end
+  while one is pending
+
 Source: [`src/session/query.mach`](../../../src/session/query.mach)
 
 Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md).
@@ -74,11 +95,13 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`prepare_retirement`](#prepare_retirement) | a retirement rooted at the given products and every product that depends on them |
 | [`prepare_owned_retirement`](#prepare_owned_retirement) | a retirement rooted at every product whose key a released module or file owns, with its dependents |
 | [`prepared_held`](#prepared_held) | whether the prepared query's compute failed, its failure held for complete_prepared to record |
-| [`preparing`](#preparing) | whether the computation on the stack is the prepare of the product `kind` keys under `key`, which a compute reads to tell a prepare that finishes it outside the computation from a read that does not |
+| [`preparing`](#preparing) | whether the computation on top of the stack is the prepare of the product `kind` keys under `key`, at any depth, which a compute reads to tell a prepare that finishes it outside the computation from a read that does not |
 | [`prepared_view`](#prepared_view) | a view of a prepared product's bytes, before they are published |
 | [`prepared_diags`](#prepared_diags) | the store a prepared query's compute reports into: work finished outside the compute (a worker thread's optimize) appends there, so a refusal it records reaches the presentation like one the compute made itself |
 | [`cancel_prepared`](#cancel_prepared) | drop a prepared product unpublished, keeping its dependencies and diagnostics as the attempt's evidence |
 | [`complete_prepared`](#complete_prepared) | publish a prepared product, or record its failure: the one its compute raised, held until now, else `result`, the failure of the work finished outside the computation |
+| [`prepared_enter`](#prepared_enter) | the pending prepared product put back on the stack over its parent's frame, or outside every computation, so what the owner reads for it now (a read log replayed, a `get`) records onto it after what its computation read, and a failure raised meanwhile is its own |
+| [`prepared_leave`](#prepared_leave) | the prepared product prepared_enter put back taken off the stack, the attempt that held failures before it holding them again |
 | [`walk_products`](#walk_products) | visit a product and every product it was computed from that the filter enters, each once and its dependencies first, as presentation walks them |
 | [`peek_revision`](#peek_revision) | the revision a product last changed at, without validating it; 0 when it has none |
 | [`published`](#published) | a product as its last successful computation published it, read between operations by the host that ran them |
@@ -609,8 +632,9 @@ whether the prepared query's compute failed, its failure held for complete_prepa
 pub fun preparing(db: *QueryDb, kind: *Kind, key: u64) bool
 ```
 
-whether the computation on the stack is the prepare of the product `kind` keys under `key`, which a
-compute reads to tell a prepare that finishes it outside the computation from a read that does not
+whether the computation on top of the stack is the prepare of the product `kind` keys under `key`, at
+any depth, which a compute reads to tell a prepare that finishes it outside the computation from a read
+that does not
 
 ### prepared_view
 
@@ -659,7 +683,40 @@ pub fun complete_prepared(db: *QueryDb, prepared: PreparedQuery, result: err[mac
 ```
 
 publish a prepared product, or record its failure: the one its compute raised, held until now, else
-`result`, the failure of the work finished outside the computation. a failed product is dropped
+`result`, the failure of the work finished outside the computation. a failed product is dropped, with what
+its computation prepared and is still pending. a product publishes only once every product its computation
+prepared has completed or been cancelled
+
+### prepared_enter
+
+```mach
+pub fun prepared_enter(db: *QueryDb, prepared: PreparedQuery) err[mach.base.fail.Fail]
+```
+
+the pending prepared product put back on the stack over its parent's frame, or outside every computation,
+so what the owner reads for it now (a read log replayed, a `get`) records onto it after what its computation
+read, and a failure raised meanwhile is its own. left with prepared_leave
+
+| Parameter | |
+| :--- | :--- |
+| `db` | the database |
+| `prepared` | the handle prepare returned, still pending |
+| **returns** | ok, or a failure when the handle is refused as `prepared_index` refuses it, or storage is refused |
+
+### prepared_leave
+
+```mach
+pub fun prepared_leave(db: *QueryDb, prepared: PreparedQuery) err[mach.base.fail.Fail]
+```
+
+the prepared product prepared_enter put back taken off the stack, the attempt that held failures before it
+holding them again
+
+| Parameter | |
+| :--- | :--- |
+| `db` | the database |
+| `prepared` | the handle prepared_enter entered |
+| **returns** | ok, or a failure when the product is no longer owned or is not the computation on top of the stack |
 
 ### walk_products
 
@@ -783,7 +840,8 @@ and recording it as a dependency of the product being computed, if any
 pub fun reusable[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[bool, mach.base.fail.Fail]
 ```
 
-validation may refresh dependencies but never computes the requested product
+validation may refresh dependencies but never computes the requested product. asked inside a prepared
+product's computation it records no edge, so the computation reads or prepares the product next
 
 ### prepare
 
@@ -795,7 +853,8 @@ compute a derived product the caller finishes outside the computation (a worker 
 published by complete_prepared or dropped by cancel_prepared before the operation ends. a
 failure raised while it computes is the prepared product's: it is held, and recorded by
 complete_prepared or left unrecorded by cancel_prepared, so a product prepared ahead never
-fails the operation before the products the caller completes ahead of it
+fails the operation before the products the caller completes ahead of it. prepared inside
+a prepared product's computation it is that product's child (see the header)
 
 ### revision
 
