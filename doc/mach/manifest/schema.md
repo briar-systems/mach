@@ -95,6 +95,7 @@ pub rec Rewrite {
     whole:       bool;
     replacement: str;
     why:         str;
+    listed:      bool;
 }
 ```
 
@@ -104,8 +105,9 @@ the mechanical rewrite of a key as a previous major wrote it
 | :--- | :--- | :--- |
 | `label` | `str` | what the rewrite does; nil when the value as written has none |
 | `whole` | `bool` | the rewrite replaces the key and its value, not the key alone |
-| `replacement` | `str` | the text written in their place |
+| `replacement` | `str` | the text written in their place, nil to keep the key as written |
 | `why` | `str` | for a key this major still reads, why the key as written is refused. for a removed key, what replaces the key as written, where that depends on its value; nil where the row's note says it |
+| `listed` | `bool` | the value, one string as written, is written as an array of it |
 
 ## Setting
 

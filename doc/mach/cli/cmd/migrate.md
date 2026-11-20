@@ -36,7 +36,7 @@ pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 | Parameter | |
 | :--- | :--- |
 | `cx` | the call |
-| **returns** | exit.OK when the project is in this major's spelling (or was made so), exit.USER when a file would change under --check, or in either mode when the manifest still writes a removed key no rewrite migrates or a source could not be read as one; a script's or a step's removed option is reported and fails nothing. otherwise the failure |
+| **returns** | exit.OK when the project is in this major's spelling (or was made so), exit.USER when a file would change under --check, or in either mode when the manifest still writes a removed key no rewrite migrates, links a system library 6 found that it does not yet say how 7 finds, or a source could not be read as one; a script's or a step's removed option is reported and fails nothing. otherwise the failure |
 
 ## Constants
 
