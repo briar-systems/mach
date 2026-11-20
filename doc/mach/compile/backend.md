@@ -233,14 +233,15 @@ with no file, as a two-level namespace format does
 ### link
 
 ```mach
-pub fun link(b: *Back, a: *std.allocator.Allocator, diags: *mach.base.diagnostic.DiagnosticStore, kind: *mink.catalog.output.Kind, requests: *Request, count: usize, output_path: str, gc: bool, image: *Image) res[Linked, mach.base.fail.Fail]
+pub fun link(b: *Back, a: *std.allocator.Allocator, diags: *mach.base.diagnostic.DiagnosticStore, kind: *mink.catalog.output.Kind, requests: *Request, count: usize, output_path: str, gc: bool, image: *Image, threads: u32) res[Linked, mach.base.fail.Fail]
 ```
 
 the image of `kind` in the target's format mink links from the `count` requests at `requests`, a library
 named by name found by mink's search, named `output` where its format records a name, its
 unreferenced sections left out with `gc`, laid out as `image` states, with what the link read.
 mink's notes go to `diags`: a refused link's are notes of the refusal, which is reported there,
-and a finished link's are warnings
+and a finished link's are warnings. its divisible steps run on `threads` threads, `a` shared
+between them
 
 ## Laying
 
