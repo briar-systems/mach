@@ -54,7 +54,8 @@ reported.
 - `1`: under `--check`, a file would change. In either mode, the manifest still
   writes a removed key no rewrite migrates, each one reported, or a source could
   not be read as source. The manifest reader refuses such a project, so the input
-  is what is wrong.
+  is what is wrong. So does a system library 6 found that the manifest does not
+  yet say how 7 finds, each one reported, since the link refuses it.
 - `2` and `3`: an internal or environment failure, as for every command.
 
 ## The changes from 6 to 7
@@ -68,7 +69,7 @@ Rewritten by `mach migrate`:
 | `float_reassoc = false` | removed: float arithmetic is exact unless a profile relaxes it |
 | `vectorize = true` or `vectorize = false` in a profile | removed: `optimize` schedules the pass, and `#[vectorize("never")]` opts one function out |
 | `[project] out`, `{project.out}` | `work`, `{project.work}` |
-| an artifact `out` such as `"bin/app"`, which v6 rooted under `[project] out` | `"{project.work}/bin/app"` |
+| an artifact `out` such as `"bin/app"`, which v6 rooted under `[project] out` | `"{project.work}/bin/app"`, the same file name: 6 wrote `out` as written, adding no prefix and no suffix for any kind on any target, as 7 does, and `{artifact.suffix}` stays where it was written |
 | `out` on an `object` artifact | removed: its objects stay under `obj/` |
 | `default` on a target | removed: with no `-t` a command takes the target matching the host |
 | `{target.isa}`, `{target.os}` | `{target.arch}`, `{target.sys}` |
@@ -82,6 +83,7 @@ Rewritten by `mach migrate`:
 | `subsystem = "gui"` | `subsystem = "windows"` |
 | `os`, `baseline`, `extensions` | `sys`, `isa`, `ext` |
 | link `os`, `isa` | link `sys`, `arch` |
+| a link filter written as one string, as `os = "linux"` or `abi = "*"` | an array of it, as `sys = ["linux"]` or `abi = ["*"]` |
 | `$mach.os`, `$mach.build.os`, `$mach.build.extensions`, `$project.target.os` | `$mach.sys`, `$mach.build.sys`, `$mach.build.ext`, `$project.target.sys` |
 | `#[op]`, `#[stage]` and the shader decorators | `#[intrinsic]`, `#[gpu.stage]` and the `gpu.` family |
 | `#[inline]`, `#[noinline]`, `#[scalar]` | `#[inline("always")]`, `#[inline("never")]`, `#[vectorize("never")]` |
@@ -101,10 +103,16 @@ Reported, for you to change:
 | a condition of type `u8`, as `if (flags & 1)` | a `u1`, as `if ((flags & 1) != 0)` |
 | a `u1` stored in a `u8` or under arithmetic | `value::u8`, or a `u1` destination |
 | `-g`, `-O0`, `-O2`, `--emit-asm`, `--emit-ir`, `--pie`, `--simd`, `--jobs`, `--arch`, `--sys`, `--of`, `--platform`, `--subsystem`, `--base`, `--stack-reserve`, `--stack-commit`, `-d`, `-e`, `-s` in a script, or in a step's `argv` other than `--jobs` | the spelling the report names |
+| a linux target with no `env` that an artifact links a `source = "system"` entry on, which 6 found in the gnu environment's directories | `env = "gnu"` on the target, under which a `bin` links `pie` unless its `linkage` says otherwise, so the report names the target and the entry |
+| a darwin `source = "system"` shared entry named by no install name, as `name = "MoltenVK"`, whose file 6 found and linked by the install name it states | the install name, as `name = "@rpath/libMoltenVK.dylib"` or an absolute path, which 7 links from the entry's claim with no file |
 
 The compiler refuses the first two, naming the replacement. So does the manifest
 reader for a removed key with no mechanical rewrite: a link's `library`, which
-the table key replaces, and a profile's `pass` and `skip`.
+the table key replaces, and a profile's `pass` and `skip`. A table that writes
+such a key still gets every other rewrite, and the key is reported once. The link
+refuses the last two: neither has one answer migrate can write,
+since `env` changes how every `bin` of the target links and the install name is the
+library's own. A report names the line of the table it is about.
 
 New in 7, with nothing to migrate: [`u1`](types.md), [`$zeroize`](comptime-intrinsics.md)
 and the [selection heads](asm.md) of `asm`.
