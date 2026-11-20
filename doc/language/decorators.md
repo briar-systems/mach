@@ -462,38 +462,30 @@ ext fun wsa_startup(ver: u16, data: *u8) i32;
 Takes one mode, `"always"` or `"never"`, and applies to functions only. It may
 stand once on a function, so the two modes never meet.
 
-v7 has no inliner yet. The compiler checks the decorator where it is written,
-with the conflicts listed on this page, and nothing else reads it. The inlining
-rules here and wherever this page speaks of the inliner are where v7's inliner
-starts from. They are not what the compiler does now.
+`inline("always")` expands a function at every direct call the inliner may
+expand, whatever its size. A build that optimizes runs the inliner over each
+module (see [manifest.md](manifest.md), the `inline` pass), and it expands only
+calls of functions of the same module. Without a decorator, a direct call is
+expanded where the callee is small: at most 5 instructions after promotion of
+its locals to values, or fewer than 25 where the call stands inside a loop of
+the caller. Debug annotations are not instructions, so `debug = true` never
+moves the decision. The inliner works bottom up, so a callee is expanded with
+the calls the inliner already expanded into it.
 
-`inline("always")` marks a function for inlining at every direct call site,
-overriding the compiler's size and use-count heuristics and exempt from the
-caller's expansion budget. The optimization
-pipeline must enable inlining. Indirect calls and recursive call cycles are not
-expanded by this decorator. Taking a function's address retains its callable
-identity even when direct calls are inlined.
-
-Release optimization makes small ordinary helper bodies available across source
-modules without emitting extra definitions. A helper is small when its body has
-fewer than 25 live instructions after promotion, debug annotations excluded, so
-`debug = true` never moves the decision. Extraction, import and per-caller heuristic expansion each
-have a limit of 1024 copied IR instructions and 256 KiB of owned payload. An
-`inline` function is expanded at every direct call site in the same module
-without charging that budget, so the outcome never depends on what else the
-caller expanded first; across modules it is imported within the extraction and
-import limits like any other body. A
-`constant_time` function is expanded only into another `constant_time` function, so
-its instructions never leave a constant-time validated body; a `naked`,
-[`weak`](#weakstr--a-definition-as-a-link-time-default) or `inline("never")`
-function, a recursive cycle and an indirect call are never expanded.
-A remaining call or taken address still names the original defining function.
-Generic, comptime and pack specializations are merged and hidden, and each is
-defined in every object whose code calls it (see
-[fun.md](fun.md#where-an-instances-code-lives)).
-Helpers referencing compiler-local literal pools retain their calls because those
-objects have module-local identity. Named globals keep their original symbols,
-and copied instructions preserve effects, assembly bindings and debug locations.
+The inliner never expands a call of an `inline("never")` function, a call
+within a recursive call cycle, an indirect call, or a call of a
+[`weak`](#weakstr--a-definition-as-a-link-time-default), `naked` or
+`vectorize("never")` function, whatever the decorator says. A `constant_time`
+function is expanded only into another `constant_time` function whose call
+trusts it by the two declarations alone (a `soft` caller, or a `hard` callee),
+so its instructions never leave a constant-time validated body, and a function
+that is not `constant_time` is never expanded into one. A function whose
+`#[extension]` names an extension its caller's does not is never expanded into
+it. Expanding a call removes no function: the function keeps its symbol and its
+own code, a remaining call or a taken address still names it, and one nothing
+reaches any more is left out by the link as any unreferenced function is. The
+copied instructions keep their secrecy, their effects and their debug
+locations, and record the call as the site they were inlined at.
 
 ```mach
 #[inline("always")]
@@ -503,7 +495,7 @@ fun fast_path(x: i64) i64 {
 ```
 
 `inline("never")` forbids inlining a function into any caller, overriding the
-compiler's size- and use-count heuristics that would otherwise fold it in.
+size rule that would otherwise expand it.
 
 ```mach
 #[inline("never")]
@@ -520,10 +512,9 @@ caller's instruction cache, or to hold code size down on a constrained target.
   so `"always"` and `"never"` never contradict each other.
 - `vectorize("never")` already declines inlining as a side effect, so pairing it
   with `inline("never")` is legal but redundant.
-- Purely a hint to the inliner; it does not otherwise change codegen. It binds
-  in every build, and a build that does not optimize runs no inlining pass at
-  all, so `inline("never")` is inert (and unnecessary) there — and it will bind
-  identically when a callee body is available from another module.
+- It changes nothing but which calls are expanded. It binds in every build, and
+  a build that does not optimize runs no inliner at all, so `inline("never")`
+  is inert there.
 - v6's bare `#[inline]` is `#[inline("always")]`, and its `#[noinline]` is
   `#[inline("never")]`. Each v6 spelling is refused, naming its replacement (see
   [v6 spellings](#v6-spellings)).
@@ -1097,19 +1088,19 @@ processor's features and when that answer holds.
   selection plus what the decorator names. An instruction requiring an extension
   is emitted only into a function whose admitted set holds it (see
   [asm.md](asm.md#extension-instructions)); the encoder checks every row against
-  it, and the inliner checks it before moving a body, so an outlier the target
-  already selects may still inline into a baseline caller.
+  it, and the inliner declines to move a body whose function names an extension
+  its caller's does not name, whether or not the target already selects it.
 - **Only the instructions change.** The decorator admits instructions in the
   function's inline `asm`. It does not change how the compiler generates the
   rest of the body, which stays within the target's selection. The function is
   called through the ordinary ABI, and its address is an ordinary `fun(...)`
   value that dispatch through a pointer calls like any other.
 - **It is never inlined into a caller that admits less.** The inliner declines
-  to move an outlier's body into a function whose admitted set does not hold
-  every extension the outlier's does, so the extension instructions stay behind
-  the call the run-time check guards. `#[inline("always")]` does not override this. A
-  caller carrying a superset of the outlier's extensions may still inline it,
-  and any function may be inlined *into* an outlier. A generic function's
+  to move an outlier's body into a function whose decorator does not name every
+  extension the outlier's names, so the extension instructions stay behind the
+  call the run-time check guards. `#[inline("always")]` does not override this. A
+  caller naming a superset of the outlier's extensions may still inline it, and
+  any function may be inlined *into* an outlier. A generic function's
   instances carry the decorator's set.
 - **Nothing else changes.** The decorator composes with `inline`, `symbol`,
   `section` and `align`. `#[constant_time]` already refuses the instructions a

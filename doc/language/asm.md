@@ -501,9 +501,9 @@ The one invariant behind every check: **an instruction that requires extension E
 is emitted only into a function whose admitted set holds E, or into a block whose
 head adds E**, where a function's admitted set is the target's selection plus what
 its `#[extension(...)]` names, each closed over what it implies. The encoder applies
-it to every row of an `asm` block, and the inliner applies the same predicate before
-moving one body into another, so an inlined body never carries an instruction its new
-home does not admit. A block reads under its function's set with its head added, so a
+it to every row of an `asm` block, and the inliner moves one body into another only
+where the caller's `#[extension(...)]` names every extension the callee's does, so an
+inlined body never carries an instruction its new home does not admit. A block reads under its function's set with its head added, so a
 head admits an extension to that block and `#[extension(...)]` admits it to the whole
 function.
 

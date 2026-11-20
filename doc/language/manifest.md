@@ -1235,12 +1235,12 @@ simd     = "scalarize"
 licm = false                           # every other pass runs, loop invariant motion does not
 ```
 
-The optimization passes are `split`, `promote`, `reassociate`, `fold`,
+The optimization passes are `inline`, `split`, `promote`, `reassociate`, `fold`,
 `algebraic`, `reduce`, `effects`, `cse`, `licm` and `dce`. A key that names none of them is refused where it is
 written, with the list, whichever profile the build selects:
 
 ```
-error[manifest.invalid_value] mach.toml: [profile.release].passes names "inline", which is no optimization pass. the optimization passes are split, promote, reassociate, fold, algebraic, reduce, effects, cse, licm, dce
+error[manifest.invalid_value] mach.toml: [profile.release].passes names "peel", which is no optimization pass. the optimization passes are inline, split, promote, reassociate, fold, algebraic, reduce, effects, cse, licm, dce
 ```
 
 A non-boolean value is a manifest error. `--set passes.<name>=<bool>` writes
