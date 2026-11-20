@@ -16,6 +16,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | :--- | :--- | :--- |
 | [`Sort`](#sort) | `def` | what the build knows an imported symbol to be |
 | [`Import`](#import) | `rec` | an imported symbol pinned to a library |
+| [`Named`](#named) | `rec` | the name each declaration links under once a lowering has named it, keyed as a linkage keys declarations |
 | [`Linkage`](#linkage) | `rec` | keyed by declaration: a module's index in the high 32 bits, its declaration index in the low imports holds every pinned import in the order it was first pinned, and import_at its index there by link name |
 
 | On `Sort` | |
@@ -23,6 +24,13 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`UNSTATED`](#sort) | nothing, as of a name a manifest entry claims for an archive |
 | [`CODE`](#sort) | a function, as an `ext fun` declares |
 | [`DATA`](#sort) | a variable, as an `ext val` or `ext var` declares |
+
+| On `Named` | |
+| :--- | :--- |
+| [`named_init`](#named_init) | an empty memo |
+| [`named_dnit`](#named_dnit) | give back a memo's map |
+| [`register_name`](#register_name) | record in `n` the name declaration `did` of `mid` links under, as the lowering first names it |
+| [`name`](#name) | the name `n` holds for declaration `did` of `mid`, nil before a lowering has named it there |
 
 | On `Linkage` | |
 | :--- | :--- |
@@ -32,8 +40,6 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`register_export_name`](#register_export_name) | record the name declaration `did` of `mid` is exported under, replacing an earlier one |
 | [`forget_names`](#forget_names) | drop every export name and linkage name of one module's declarations, before its syntax tree is replaced and its declaration ids no longer name the same declarations |
 | [`export_name`](#export_name) | the name declaration `did` of `mid` is exported under, nil when it names none |
-| [`register_name`](#register_name) | record the name declaration `did` of `mid` links under, as the lowering first names it |
-| [`name`](#name) | the name declaration `did` of `mid` links under, nil before the lowering has named it |
 | [`register_export_library`](#register_export_library) | record the library declaration `did` of `mid` is imported from, replacing an earlier one |
 | [`export_library`](#export_library) | the library declaration `did` of `mid` is imported from, nil when it names none |
 | [`register_import_library`](#register_import_library) | pin the imported symbol `name`, known as `sort`, to the library `lib` |
@@ -73,12 +79,67 @@ an imported symbol pinned to a library
 | `lib` | `mach.base.intern.StrId` | the library's key |
 | `sort` | `Sort` | what the build knows it to be |
 
+## Named
+
+```mach
+pub rec Named {
+    names: std.collections.map.Map[u64, mach.base.intern.StrId];
+}
+```
+
+the name each declaration links under once a lowering has named it, keyed as a linkage keys
+declarations. a name is a pure function of its key, so a memo serves every lowering that names
+its strings where the memo's names were named: the project's serves each lowering on the owner,
+and a lowering that names its strings in an interner of its own keeps one of its own
+
+### named_init
+
+```mach
+pub fun named_init(alloc: *std.allocator.Allocator) Named
+```
+
+an empty memo
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | the allocator the memo's map takes |
+| **returns** | the memo, which `named_dnit` gives back |
+
+### named_dnit
+
+```mach
+pub fun named_dnit(n: *Named)
+```
+
+give back a memo's map
+
+| Parameter | |
+| :--- | :--- |
+| `n` | the memo, unusable after |
+
+### register_name
+
+```mach
+pub fun register_name(n: *Named, mid: mach.session.module.ModuleId, did: u32, name: mach.base.intern.StrId) err[mach.base.fail.Fail]
+```
+
+record in `n` the name declaration `did` of `mid` links under, as the lowering
+first names it
+
+### name
+
+```mach
+pub fun name(n: *Named, mid: mach.session.module.ModuleId, did: u32) mach.base.intern.StrId
+```
+
+the name `n` holds for declaration `did` of `mid`, nil before a lowering has named it there
+
 ## Linkage
 
 ```mach
 pub rec Linkage {
     export_names:     std.collections.map.Map[u64, mach.base.intern.StrId];
-    names:            std.collections.map.Map[u64, mach.base.intern.StrId];
+    named:            Named;
     export_libraries: std.collections.map.Map[u64, mach.base.intern.StrId];
     imports:          Vector[Import];
     import_at:        std.collections.map.Map[mach.base.intern.StrId, usize];
@@ -162,23 +223,6 @@ pub fun export_name(l: *Linkage, mid: mach.session.module.ModuleId, did: u32) ma
 ```
 
 the name declaration `did` of `mid` is exported under, nil when it names none
-
-### register_name
-
-```mach
-pub fun register_name(l: *Linkage, mid: mach.session.module.ModuleId, did: u32, name: mach.base.intern.StrId) err[mach.base.fail.Fail]
-```
-
-record the name declaration `did` of `mid` links under, as the lowering
-first names it
-
-### name
-
-```mach
-pub fun name(l: *Linkage, mid: mach.session.module.ModuleId, did: u32) mach.base.intern.StrId
-```
-
-the name declaration `did` of `mid` links under, nil before the lowering has named it
 
 ### register_export_library
 

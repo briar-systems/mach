@@ -9,6 +9,23 @@ its parts spell, read when it is interned. the field tables, tag discriminators 
 decorations belong to the current projection (`mach.type.field`), and a fact read from them is
 kept until the projection resets or a table is published over one that held other fields.
 
+a table may be layered over a base, which is how work off the owner thread makes types. its
+contract:
+- a layer reads its base without a lock, so the base takes nothing new while the layer lives. it
+  borrows the base's storage and copies a part only when it first adds to it, so it reads every
+  type, parameter run, handle and field table of its base as the base reads its own
+- a layer numbers what it adds past its base. its numbers are its own: two layers over one base
+  give one number to different types, so no id a layer made is read anywhere but through the
+  layer until it is merged, and no store shared between tables keeps a fact of one (memo_keyed)
+- what a table keeps beside its types (`Side`) is moved, never shared: a layer is handed the side
+  of the table or thread that made it and hands it back, with every memo of a type past its base
+  dropped at both ends, so a memo is only ever read under the numbering it was made in
+- `merge` interns each type a layer made into another table over the same base, in the order the
+  layer made them, and says where each landed. types are equal by their parts, so when the owner
+  merges layers at the points one thread would have made their types, and in that order, every
+  merged id is the id the one thread would have given
+- `fold` appends a layer to its base, which took nothing since, so every id the layer gave stands
+
 Source: [`src/type.mach`](../../src/type.mach)
 
 Uses types from [`mach.base.fail`](base/fail.md), [`mach.base.handle`](base/handle.md), [`mach.base.intern`](base/intern.md), [`mach.base.source`](base/source.md), [`mach.session.module`](session/module.md), [`mach.type.field`](type/field.md), [`mach.type.scan`](type/scan.md).
@@ -23,8 +40,10 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.base.handle`](base/hand
 | [`TypeNominal`](#typenominal) | `rec` | the identity of a record, union or tag |
 | [`GenericOwner`](#genericowner) | `rec` | the declaration whose type parameters a substitution replaces: a parameter of any other declaration, an enclosing generic's for one, is left as it is |
 | [`Type`](#type) | `rec` | one interned type |
+| [`Side`](#side) | `rec` | what a table keeps beside its types: the memos, each a pure function of a type and the projection, dense by type index, and the visited sets of the scans its walks open, scratch that holds no fact |
 | [`TypeInterner`](#typeinterner) | `rec` | the type table: every type interned once and named by its `TypeId` |
 | [`Projected`](#projected) | `def` | a fact of a type that reads the field tables, so it holds for one projection |
+| [`Remap`](#remap) | `rec` | where each type a merged layer made landed in the table it was merged into: an id below the layer's own range is its base's and stands, one in it is mapped |
 
 | On `GenericOwner` | |
 | :--- | :--- |
@@ -32,13 +51,23 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.base.handle`](base/hand
 | [`param_owner`](#param_owner) | the declaration that owns a generic parameter |
 | [`param_owned_by`](#param_owned_by) | whether a generic parameter belongs to declaration `who` |
 
+| On `Side` | |
+| :--- | :--- |
+| [`side_init`](#side_init) | an empty side |
+| [`side_dnit`](#side_dnit) | release a side's memos and visited sets |
+
 | On `TypeInterner` | |
 | :--- | :--- |
 | [`facts_of`](#facts_of) | the facts of `tid`, none for the nil and error types |
 | [`init`](#init) | set up an empty type store with every primitive and seeded vector interned |
+| [`layer_init`](#layer_init) | a table layered over `base` in `ti`, handed `side`, the side of the table or thread that made it |
+| [`layer_side`](#layer_side) | the side a layer was handed, back from it with every memo of a type it made dropped |
+| [`side_take`](#side_take) | a table's side, taken from it to hand a layer, which leaves it an empty one |
+| [`side_give`](#side_give) | `side` given to `ti` in place of the one it holds |
 | [`dnit`](#dnit) | release a type store; a nil store holds nothing |
 | [`get`](#get) | the type `tid` names |
 | [`type_count`](#type_count) | how many types the store holds |
+| [`own_type_count`](#own_type_count) | how many types the table made itself, its base's not counted |
 | [`get_param`](#get_param) | one entry of the pool of function parameter types and instance arguments |
 | [`prim`](#prim) | the type of a primitive kind |
 | [`is_integer`](#is_integer) | whether `tid`, with any secret qualifier stripped, is an integer primitive |
@@ -116,12 +145,21 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.base.handle`](base/hand
 | [`field_count`](#field_count) | how many fields or cases `ty`'s table holds |
 | [`field_at`](#field_at) | one field or case of `ty`'s table |
 | [`field_entry_at`](#field_entry_at) | entry `ix` of a published table, which holds more than `ix` entries |
+| [`memo_keyed`](#memo_keyed) | whether a fact of `tid` may be kept in a store `ti` shares with other tables, as the type facts and a laying are: every type of a root, and on a layer only its base's |
+| [`merge`](#merge) | `layer` merged into `into`, a table over the same base: each type the layer made interned there in the order the layer made it, its parts first mapped, since a type's parts are made before it, then each field table the layer published, published there for the type it landed as |
+| [`descends`](#descends) | whether `ti` answers every type `base` holds: it is `base`, or layered over it |
+| [`fold`](#fold) | `layer` folded into its base, which took nothing since the layer was made: each type, parameter, handle operand and field table the layer made appended there in order, so every id the layer gave names the same type in the base |
 
 | On `Projected` | |
 | :--- | :--- |
 | [`PROJECTED_HELD_SECRET`](#projected) | a value of the type holds a secret in its own storage (`contains_secret`) |
 | [`PROJECTED_REACHES_SECRET`](#projected) | the type reaches a secret anywhere, through pointers, with an instance's arguments counted where its generic places them (`query.deep.secret`) |
 | [`PROJECTED_SPELLS_SECRET`](#projected) | a secret is spelled anywhere the type reaches, through every edge and every instance argument (`query.reach.module_secret`) |
+
+| On `Remap` | |
+| :--- | :--- |
+| [`remap_dnit`](#remap_dnit) | release a remap's ids |
+| [`remapped`](#remapped) | the id `tid` of the merged layer names in the table it was merged into |
 
 | Functions | |
 | :--- | :--- |
@@ -331,30 +369,87 @@ one interned type
 | `facts` | `u8` | what the type spells (`FACT_*`) |
 | `data` | `uni { pointer: TypePointer; secret: TypeSecret; array: TypeArray; vector: TypeVector; handle: TypeHandle; abi: TypeAbi; fn: TypeFun; nominal: TypeNominal; generic_param: TypeGenericParam; instance: TypeInstance; case_selector: TypeCaseSelector; }` | the parts of the type, one member per kind that has any |
 
+## Side
+
+```mach
+pub rec Side {
+    projected:  Vector[u8];
+    identities: Vector[u64];
+    scans:      mach.type.scan.Sets;
+}
+```
+
+what a table keeps beside its types: the memos, each a pure function of a type and the
+projection, dense by type index, and the visited sets of the scans its walks open, scratch that
+holds no fact. a table owns one and moves it to a layer made over it (layer_init)
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `projected` | `Vector[u8]` | the projected facts settled under the current projection (`PROJECTED_*`) |
+| `identities` | `Vector[u64]` | the identity recipe gave each type, zero until it is asked for. it names the type by its recipe alone, so no projection drops it |
+| `scans` | `mach.type.scan.Sets` | the visited sets |
+
+### side_init
+
+```mach
+pub fun side_init(a: *std.allocator.Allocator) Side
+```
+
+an empty side
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator it is held in |
+| **returns** | the side, released by side_dnit |
+
+### side_dnit
+
+```mach
+pub fun side_dnit(side: *Side)
+```
+
+release a side's memos and visited sets
+
+| Parameter | |
+| :--- | :--- |
+| `side` | the side |
+
 ## TypeInterner
 
 ```mach
 pub rec TypeInterner {
     a: *std.allocator.Allocator;
 
+    # the table this one is layered over, nil for a root, and how many types, parameters,
+    # handles and handle operands it held when the layer was made
+    base:         *TypeInterner;
+    base_types:   u32;
+    base_params:  u32;
+    base_handles: u32;
+    base_ops:     u32;
+
     types: mach.base.handle.StableChunks[Type];
 
-    params:     *TypeId;
-    params_len: u32;
-    params_cap: u32;
+    # on a layer, each run below is its base's until the layer first adds to it
+    params:      *TypeId;
+    params_len:  u32;
+    params_cap:  u32;
+    params_lent: bool;
 
     dedup: std.collections.map.MapBy[Type, TypeId];
 
     fun_index:      std.collections.map.Map[u64, TypeId];
     instance_index: std.collections.map.Map[u64, TypeId];
 
-    handles:     *TypeId;
-    handles_len: u32;
-    handles_cap: u32;
+    handles:      *TypeId;
+    handles_len:  u32;
+    handles_cap:  u32;
+    handles_lent: bool;
 
-    handle_ops:     *u32;
-    handle_ops_len: u32;
-    handle_ops_cap: u32;
+    handle_ops:      *u32;
+    handle_ops_len:  u32;
+    handle_ops_cap:  u32;
+    handle_ops_lent: bool;
 
     prims: [type_prim.PRIM_COUNT]TypeId;
 
@@ -363,36 +458,45 @@ pub rec TypeInterner {
     fields: mach.type.field.Projection;
 
     # bumped by every projection reset, which drops every fact derived from the tables;
-    # published tables never change otherwise
+    # published tables never change otherwise. a layer reads its base's
     projection_generation: u64;
 
-    # by type index, the projected facts settled under the current projection (`PROJECTED_*`)
-    projected: Vector[u8];
-
-    # by type index, the identity recipe gave the type, zero until it is asked for. it
-    # names the type by its recipe alone, so no projection drops it
-    identities: Vector[u64];
-
-    scans: mach.type.scan.Sets;
+    side: Side;
 }
 ```
 
-the type table: every type interned once and named by its `TypeId`
+the type table: every type interned once and named by its `TypeId`. a table may be layered over a
+base, which it reads as its own (the header states the contract)
 
 | Field | Type | |
 | :--- | :--- | :--- |
 | `a` | `*std.allocator.Allocator` | the allocator everything here is held in |
-| `types` | `mach.base.handle.StableChunks[Type]` | the types, by index |
+| `base` | `*TypeInterner` | the table this one is layered over, nil for a root |
+| `base_types` | `u32` | how many types the base held when the layer was made |
+| `base_params` | `u32` | how many parameter pool entries the base held then |
+| `base_handles` | `u32` | how many handle types the base held then |
+| `base_ops` | `u32` | how many handle operands the base held then |
+| `types` | `mach.base.handle.StableChunks[Type]` | the types, by index, the base's borrowed on a layer |
 | `params` | `*TypeId` | the pool of function parameter types and instance arguments |
-| `dedup` | `std.collections.map.MapBy[Type, TypeId]` | the type of each recipe, for every kind but functions, instances and handles |
-| `fun_index` | `std.collections.map.Map[u64, TypeId]` | the newest function type per signature hash, heading its bucket chain |
-| `instance_index` | `std.collections.map.Map[u64, TypeId]` | the newest instance per hash of its generic and arguments, heading its bucket chain |
+| `params_len` | `u32` | how many pool entries are in use |
+| `params_cap` | `u32` | how many the pool has room for |
+| `params_lent` | `bool` | the pool is still the base's, copied before the layer first adds to it |
+| `dedup` | `std.collections.map.MapBy[Type, TypeId]` | the type of each recipe, for every kind but functions, instances and handles; a layer's holds only the types it made |
+| `fun_index` | `std.collections.map.Map[u64, TypeId]` | the newest function type per signature hash, heading its bucket chain; a layer's heads chains of its own types, which continue into the base's |
+| `instance_index` | `std.collections.map.Map[u64, TypeId]` | the newest instance per hash of its generic and arguments, heading its bucket chain, layered as `fun_index` is |
 | `handles` | `*TypeId` | every handle type, searched in full on each intern |
+| `handles_len` | `u32` | how many handle types there are |
+| `handles_cap` | `u32` | how many `handles` has room for |
+| `handles_lent` | `bool` | `handles` is still the base's |
 | `handle_ops` | `*u32` | the pool of handle operands |
+| `handle_ops_len` | `u32` | how many operands are in use |
+| `handle_ops_cap` | `u32` | how many the operand pool has room for |
+| `handle_ops_lent` | `bool` | the operand pool is still the base's |
 | `prims` | `[type_prim.PRIM_COUNT]TypeId` | the type of each primitive, by catalog position |
 | `vecs` | `[type_prim.VEC_COUNT]TypeId` | the seeded vector types, by position below VEC_COUNT |
 | `fields` | `mach.type.field.Projection` | the current projection's field tables, discriminators and decorations |
-| `scans` | `mach.type.scan.Sets` | the visited sets of the open scans |
+| `projection_generation` | `u64` | bumped by every projection reset |
+| `side` | `Side` | the memos and the visited sets of the open scans, moved, never shared |
 
 ### facts_of
 
@@ -415,6 +519,40 @@ set up an empty type store with every primitive and seeded vector interned
 | `ti` | the store to fill, whose prior contents are not released |
 | `a` | the allocator the store holds everything in |
 | **returns** | ok, or the allocation failure, after which the store is already released |
+
+### layer_init
+
+```mach
+pub fun layer_init(ti: *TypeInterner, base: *TypeInterner, a: *std.allocator.Allocator, side: Side)
+```
+
+a table layered over `base` in `ti`, handed `side`, the side of the table or thread that made
+it. `base` takes nothing new while the layer lives
+
+### layer_side
+
+```mach
+pub fun layer_side(ti: *TypeInterner) Side
+```
+
+the side a layer was handed, back from it with every memo of a type it made dropped. the layer
+keeps an empty one
+
+### side_take
+
+```mach
+pub fun side_take(ti: *TypeInterner) Side
+```
+
+a table's side, taken from it to hand a layer, which leaves it an empty one
+
+### side_give
+
+```mach
+pub fun side_give(ti: *TypeInterner, side: Side)
+```
+
+`side` given to `ti` in place of the one it holds
 
 ### dnit
 
@@ -450,6 +588,14 @@ how many types the store holds
 | :--- | :--- |
 | `ti` | the type store |
 | **returns** | the count, one past the highest index issued |
+
+### own_type_count
+
+```mach
+pub fun own_type_count(ti: *TypeInterner) u32
+```
+
+how many types the table made itself, its base's not counted
 
 ### get_param
 
@@ -1472,6 +1618,47 @@ entry `ix` of a published table, which holds more than `ix` entries
 | `ix` | the entry's position |
 | **returns** | the entry, borrowed |
 
+### memo_keyed
+
+```mach
+#[inline("always")]
+pub fun memo_keyed(ti: *TypeInterner, tid: TypeId) bool
+```
+
+whether a fact of `tid` may be kept in a store `ti` shares with other tables, as the type facts
+and a laying are: every type of a root, and on a layer only its base's
+
+### merge
+
+```mach
+pub fun merge(into: *TypeInterner, layer: *TypeInterner, names: *mach.base.intern.Remap, a: *std.allocator.Allocator) res[Remap, mach.base.fail.Fail]
+```
+
+`layer` merged into `into`, a table over the same base: each type the layer made interned there
+in the order the layer made it, its parts first mapped, since a type's parts are made before it,
+then each field table the layer published, published there for the type it landed as. a table
+`into` already holds for that type must hold the same fields. every string a type or table names
+is mapped by `names`, from the interner the layer's types were named in to the one `into`'s are.
+the remap names where each of the layer's types landed
+
+### descends
+
+```mach
+pub fun descends(ti: *TypeInterner, base: *TypeInterner) bool
+```
+
+whether `ti` answers every type `base` holds: it is `base`, or layered over it
+
+### fold
+
+```mach
+pub fun fold(layer: *TypeInterner) err[mach.base.fail.Fail]
+```
+
+`layer` folded into its base, which took nothing since the layer was made: each type, parameter,
+handle operand and field table the layer made appended there in order, so every id the layer
+gave names the same type in the base. its side's memos hold for the base after, uncut (side_take)
+
 ## Projected
 
 ```mach
@@ -1487,6 +1674,52 @@ so does a table published over one that held other fields. each takes two bits: 
 | `PROJECTED_HELD_SECRET` | `0` | a value of the type holds a secret in its own storage (`contains_secret`) |
 | `PROJECTED_REACHES_SECRET` | `1` | the type reaches a secret anywhere, through pointers, with an instance's arguments counted where its generic places them (`query.deep.secret`) |
 | `PROJECTED_SPELLS_SECRET` | `2` | a secret is spelled anywhere the type reaches, through every edge and every instance argument (`query.reach.module_secret`) |
+
+## Remap
+
+```mach
+pub rec Remap {
+    base_types: u32;
+    ids:        *TypeId;
+    len:        u32;
+}
+```
+
+where each type a merged layer made landed in the table it was merged into: an id below the
+layer's own range is its base's and stands, one in it is mapped
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `base_types` | `u32` | how many types the layer's base held, the first id the layer made |
+| `ids` | `*TypeId` | where each type the layer made landed, in the order it made them |
+| `len` | `u32` | how many of `ids` are filled |
+
+### remap_dnit
+
+```mach
+pub fun remap_dnit(a: *std.allocator.Allocator, r: *Remap)
+```
+
+release a remap's ids
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator `merge` was given |
+| `r` | the remap |
+
+### remapped
+
+```mach
+pub fun remapped(r: *Remap, tid: TypeId) TypeId
+```
+
+the id `tid` of the merged layer names in the table it was merged into
+
+| Parameter | |
+| :--- | :--- |
+| `r` | the remap |
+| `tid` | an id the layer gave or read |
+| **returns** | `tid` itself for the nil and error types and an id of the base, else where it landed |
 
 ## Functions
 

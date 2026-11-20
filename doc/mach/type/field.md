@@ -8,6 +8,13 @@ a table is staged entry by entry and then published for its type. publishing ove
 held other fields says so, since every fact read from the old one is then stale, and a reset of
 the projection clears all of it.
 
+a projection may be layered over a base, as its type table is (mach.type): it reads the base
+without a lock, so the base takes nothing new while the layer lives. it borrows the base's
+entries, numbering its own past them, so a table names its entries the same way in either, and
+answers the base's tables, discriminators and decorations besides its own. a layer never
+publishes over a table its base holds: it holds the same fields or the publish fails, since a
+reset is the one way tables change and no layer lives across one
+
 Source: [`src/type/field.mach`](../../../src/type/field.mach)
 
 Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.handle`](../base/handle.md), [`mach.base.intern`](../base/intern.md), [`mach.type.deprecation`](deprecation.md).
@@ -22,18 +29,22 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.handle`](../bas
 | On `Projection` | |
 | :--- | :--- |
 | [`projection_init`](#projection_init) | an empty projection |
+| [`layer_init`](#layer_init) | a projection layered over `base`, which takes nothing new while it lives |
 | [`projection_dnit`](#projection_dnit) | release everything a projection holds |
 | [`projection_reset`](#projection_reset) | clear every table, staged entry, discriminator and decoration, keeping the projection usable |
 | [`stage`](#stage) | reserves room for `additional` entries and answers where the next staged run starts |
 | [`entry_push`](#entry_push) | stage one entry after the last |
 | [`publish`](#publish) | publish the staged run as the fields of `ty` |
-| [`table_for`](#table_for) | the table published for `ty` |
+| [`table_for`](#table_for) | the table published for `ty`, by the projection or a projection under it |
+| [`own_count`](#own_count) | how many tables the projection itself published, its base's not counted |
+| [`own_at`](#own_at) | the table the projection itself published `at`th, its base's not counted |
 | [`entry_at`](#entry_at) | entry `ix` of the published table `ft`, which holds more than `ix` entries |
 | [`discriminator_of`](#discriminator_of) | the declared discriminator of tag nominal `nom`, TYPE_NIL when it has none |
 | [`discriminator_set`](#discriminator_set) | record the declared discriminator of a tag nominal |
 | [`discriminator_del`](#discriminator_del) | forget the declared discriminator of a tag nominal |
 | [`decoration_of`](#decoration_of) | the decorations `ty` declares; none when it declares none |
 | [`decoration_set`](#decoration_set) | record the layout decorations a nominal declares |
+| [`fold`](#fold) | `layer` folded into its base, which took nothing new since the layer was made: its entries appended there in order keep their numbers, and its tables, discriminators and decorations are the base's after |
 
 ---
 
@@ -94,10 +105,16 @@ pub rec Projection {
     a: *std.allocator.Allocator;
 
     # the published tables, and in `index`, by type id, one past the index of its table in
-    # `tables`, 0 where it has none
-    tables: mach.base.handle.StableChunks[Table];
-    index:  Vector[u32];
-    pool:   mach.base.handle.StableChunks[Entry];
+    # `tables`, 0 where it has none: dense on a root, by type in `index_at` on a layer, whose
+    # tables are few
+    tables:   mach.base.handle.StableChunks[Table];
+    index:    Vector[u32];
+    index_at: std.collections.map.Map[TypeId, u32];
+    pool:     mach.base.handle.StableChunks[Entry];
+
+    # the projection this one is layered over, nil for a root, and how many entries it held then
+    base:      *Projection;
+    pool_base: u32;
 
     # the declared discriminator type per tag nominal, re-installed with the case table
     discriminators: std.collections.map.Map[TypeId, TypeId];
@@ -122,6 +139,14 @@ an empty projection
 | :--- | :--- |
 | `a` | the allocator its tables are held in |
 | **returns** | the projection, released by projection_dnit |
+
+### layer_init
+
+```mach
+pub fun layer_init(a: *std.allocator.Allocator, base: *Projection) Projection
+```
+
+a projection layered over `base`, which takes nothing new while it lives
 
 ### projection_dnit
 
@@ -184,7 +209,29 @@ one holds other fields, which makes every fact read from the old table stale
 pub fun table_for(p: *Projection, ty: TypeId) opt[*Table]
 ```
 
-the table published for `ty`
+the table published for `ty`, by the projection or a projection under it
+
+### own_count
+
+```mach
+pub fun own_count(p: *Projection) u32
+```
+
+how many tables the projection itself published, its base's not counted
+
+### own_at
+
+```mach
+pub fun own_at(p: *Projection, at: u32) *Table
+```
+
+the table the projection itself published `at`th, its base's not counted
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the projection |
+| `at` | the position among its own tables, below own_count |
+| **returns** | the table |
 
 ### entry_at
 
@@ -252,4 +299,14 @@ record the layout decorations a nominal declares
 | `ty` | the nominal |
 | `d` | its decorations |
 | **returns** | ok, or the failure growing the map |
+
+### fold
+
+```mach
+pub fun fold(layer: *Projection) err[mach.base.fail.Fail]
+```
+
+`layer` folded into its base, which took nothing new since the layer was made: its entries
+appended there in order keep their numbers, and its tables, discriminators and decorations are
+the base's after
 

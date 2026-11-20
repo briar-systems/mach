@@ -242,6 +242,7 @@ an empty mirl module in `a`, built for the machine's target and stated as mach's
 pub fun request(
     s: *mach.session.Session,
     l: *mach.lower.linkage.Linkage,
+    named: *mach.lower.linkage.Named,
     facts: *mach.target.facts.Facts,
     machine: *Machine,
     laying: *mach.type.query.extent.Laying,
@@ -552,7 +553,9 @@ constant-time code calls it
 ```mach
 pub rec LowerRequest {
     # the declarations' export names, the project's
-    linkage:    *mach.lower.linkage.Linkage;
+    linkage: *mach.lower.linkage.Linkage;
+    # the names the lowering's declarations link under, kept as it names them
+    named:      *mach.lower.linkage.Named;
     interfaces: mach.front.sema.interface.Reader;
     typed:      InstanceReader;
     instances:  *mach.front.sema.instance.Set;
@@ -607,6 +610,7 @@ pub rec LowerContext {
     status:           mach.report.phase.PhaseStatus;
     s:                *mach.session.Session;
     linkage:          *mach.lower.linkage.Linkage;
+    named:            *mach.lower.linkage.Named;
     facts:            *mach.target.facts.Facts;
     machine:          *Machine;
     laying:           *mach.type.query.extent.Laying;

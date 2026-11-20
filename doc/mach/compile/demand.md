@@ -25,7 +25,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | :--- | :--- |
 | [`registry_init`](#registry_init) | a registry holding nothing yet: its set is made on the first instance it keeps |
 | [`registry_dnit`](#registry_dnit) | free everything the registry holds |
-| [`register`](#register) | the symbol of the instance `item` describes, its description kept under it |
+| [`registered`](#registered) | the symbol of the instance `item` describes, named in `s`'s interner, which a typing registered before: a lowering reads the registry and never writes it, since every instance it reaches was registered by the typing that decided its module's instances, so it names each as that typing did |
 | [`described`](#described) | the instance the symbol `name` names, none when nothing described it |
 
 | On `Demand` | |
@@ -76,14 +76,23 @@ free everything the registry holds
 | :--- | :--- |
 | `r` | registry to free, unusable after |
 
-### register
+### registered
 
 ```mach
-pub fun register(r: *Registry, s: *mach.session.Session, item: *mach.front.sema.instance.Instance, watch: GrowthWatch) res[mach.base.intern.StrId, mach.base.fail.Fail]
+pub fun registered(r: *Registry, s: *mach.session.Session, item: *mach.front.sema.instance.Instance) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
-the symbol of the instance `item` describes, its description kept under it. the first time the
-build meets an instance of a growing cycle it counts toward that cycle
+the symbol of the instance `item` describes, named in `s`'s interner, which a typing registered before: a
+lowering reads the registry and never writes it, since every instance it reaches was registered by the
+typing that decided its module's instances, so it names each as that typing did. an instance no typing
+registered is a failure of the lowering
+
+| Parameter | |
+| :--- | :--- |
+| `r` | registry the typings filled, read only |
+| `s` | session as the lowering sees it, whose interner names the symbol |
+| `item` | instance the lowering reached |
+| **returns** | the instance's symbol, or a failure when no typing registered it |
 
 ### described
 

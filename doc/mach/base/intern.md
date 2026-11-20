@@ -13,7 +13,9 @@ a child is how work off the owner thread names strings. its contract:
   a child with no base reads nothing shared and may live on any thread
 - only the child's own thread adds to it, and its ids are its own until it is merged
 - `child_reintern` merges it on the owner: each string the child issued is interned in the target
-  in the order the child issued it, and the remap names the target's id for each of the child's
+  in the order the child issued it, and the remap names the target's id for each of the child's.
+  the target is the child's base or another child of that base, which the owner names strings in
+  while the base is frozen and `fold` gives back to the base when it thaws
 - so when the owner merges children at the points a single thread would have interned their
   strings, and in that order, every merged id is the id the single thread would have issued
 
@@ -46,7 +48,8 @@ Source: [`src/base/intern.mach`](../../../src/base/intern.mach)
 | [`bytes_add`](#bytes_add) | the id of the `len` bytes at `data`, NULs included, interned when they were not yet |
 | [`range_add`](#range_add) | the `len` bytes of `source` from `offset`, interned |
 | [`find`](#find) | the id `text` was interned under, none when it never was; nothing is interned, so a reader that shares the interner may ask while no one adds |
-| [`child_reintern`](#child_reintern) | `child` merged into `into`, its base or, for a child with no base, any interner: each string the child issued interned there in the order it issued them, and the ids they got |
+| [`child_reintern`](#child_reintern) | `child` merged into `into`, its base, another child of its base or, for a child with no base, any interner: each string the child issued interned there in the order it issued them, and the ids they got |
+| [`fold`](#fold) | `layer` folded into its base, which issued nothing since the layer was made: each string the layer issued moved there under the id it has, the layer left holding none |
 
 | On `Remap` | |
 | :--- | :--- |
@@ -244,10 +247,21 @@ that shares the interner may ask while no one adds
 pub fun child_reintern(child: *Interner, into: *Interner, alloc_: *std.allocator.Allocator) res[Remap, std.allocator.Error]
 ```
 
-`child` merged into `into`, its base or, for a child with no base, any interner: each string the
-child issued interned there in the order it issued them, and the ids they got. a child layered
-over another interner is a contract violation of the receiver, reported as the allocator layer
-reports its own (`invalid`)
+`child` merged into `into`, its base, another child of its base or, for a child with no base, any
+interner: each string the child issued interned there in the order it issued them, and the ids
+they got. a child layered over another interner is a contract violation of the receiver, reported
+as the allocator layer reports its own (`invalid`)
+
+### fold
+
+```mach
+pub fun fold(layer: *Interner) err[std.allocator.Error]
+```
+
+`layer` folded into its base, which issued nothing since the layer was made: each string the layer
+issued moved there under the id it has, the layer left holding none. strings move, not copy, so
+both draw on one allocator. a base that issued since is a contract violation of the receiver
+(`invalid`); a failure leaves the strings not yet moved in the layer, still layered over the base
 
 ## Remap
 

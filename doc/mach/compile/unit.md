@@ -25,7 +25,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.backend`](ba
 
 | On `Lowered` | |
 | :--- | :--- |
-| [`lower`](#lower) | the modules the `count` requests at `reqs` name lowered for `back`'s target into one mirl module on a heap drawing its spans from `spans`, which the unit owns alone and so takes no lock, the value held in `out` until `dnit`, or why it was not lowered |
+| [`lower`](#lower) | the modules the `count` requests at `reqs` name lowered for `back`'s target into one mirl module on a heap drawing its spans from `spans`, the pool every unit of the build shares under its lock, the value held in `out` until `dnit`, or why it was not lowered |
 | [`dnit`](#dnit) | tear down what `lower` made in `out`: the heap and the module on it, unless compiling tore them down |
 
 | On `Job` | |
@@ -84,7 +84,7 @@ pub fun lower(reqs: *mach.lower.context.LowerRequest, count: usize, back: *mach.
 ```
 
 the modules the `count` requests at `reqs` name lowered for `back`'s target into one mirl module
-on a heap drawing its spans from `spans`, which the unit owns alone and so takes no lock, the
+on a heap drawing its spans from `spans`, the pool every unit of the build shares under its lock, the
 value held in `out` until `dnit`, or why it was not lowered. the requests' `malloc` holds the facts
 and any refusal
 

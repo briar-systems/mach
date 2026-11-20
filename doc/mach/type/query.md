@@ -55,7 +55,9 @@ pub rec Facts {
 ```
 
 the cached facts: whether each decided generic is expansive, and whether each nominal's
-fields mention a type parameter. a lookup under a later generation drops them first
+fields mention a type parameter. a lookup under a later generation drops them first. a store is
+shared by the tables over one base, the session's or the one lent to the thread a layer works on,
+so it keeps facts only of the types every such table names alike (type.memo_keyed)
 
 ### facts_init
 

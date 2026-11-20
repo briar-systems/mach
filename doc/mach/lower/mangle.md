@@ -16,7 +16,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | Functions | |
 | :--- | :--- |
 | [`linkage_name`](#linkage_name) | the linkage name of a declaration: its export name when the build declares one, its module path and bare name joined by a dot otherwise |
-| [`declaration_linkage_name`](#declaration_linkage_name) | the linkage name of the declaration `decl` of module `mid`, whose canonical name is `canon`, exported under the name `l` declares for it, made once and kept in `l` |
+| [`declaration_linkage_name`](#declaration_linkage_name) | the linkage name of the declaration `decl` of module `mid`, whose canonical name is `canon`, exported under the name `l` declares for it, made once and kept in `named` |
 | [`test_name`](#test_name) | a test's qualified name and symbol, `<module path>#<identifier>`: `#` is in no identifier or module path, so it names no other symbol |
 | [`instance_link_name`](#instance_link_name) | the symbol the instance `item` is defined and referenced under, a function of its identity alone |
 | [`instance_name`](#instance_name) | the symbol of a generic instance: its declaration's name with each type argument after a `$` |
@@ -51,11 +51,11 @@ module path and bare name joined by a dot otherwise
 ### declaration_linkage_name
 
 ```mach
-pub fun declaration_linkage_name(l: *mach.lower.linkage.Linkage, s: *mach.session.Session, mid: mach.session.module.ModuleId, canon: mach.base.intern.StrId, decl: u32) res[mach.base.intern.StrId, mach.base.fail.Fail]
+pub fun declaration_linkage_name(l: *mach.lower.linkage.Linkage, named: *mach.lower.linkage.Named, s: *mach.session.Session, mid: mach.session.module.ModuleId, canon: mach.base.intern.StrId, decl: u32) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
 the linkage name of the declaration `decl` of module `mid`, whose canonical name is `canon`,
-exported under the name `l` declares for it, made once and kept in `l`
+exported under the name `l` declares for it, made once and kept in `named`
 
 ### test_name
 

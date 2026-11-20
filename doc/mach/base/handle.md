@@ -22,6 +22,7 @@ Source: [`src/base/handle.mach`](../../../src/base/handle.mach)
 | On `StableChunks` | |
 | :--- | :--- |
 | [`chunk_init`](#chunk_init) | an empty store, released with chunk_dnit |
+| [`chunk_borrow`](#chunk_borrow) | a store that reads every element of `from` as its own and adds its own past them: it borrows `from`'s chunks, which take nothing new while it lives, and at its first edit copies the list of them and the last one when `from` left it part full |
 | [`chunk_dnit`](#chunk_dnit) | release a store and its chunks; a nil store holds nothing |
 | [`chunk_count`](#chunk_count) | how many elements the store holds, none for a nil store |
 | [`chunk_at`](#chunk_at) | the element at `index`, absent past the end or on a nil store |
@@ -61,21 +62,27 @@ the text of a store's refusal
 
 ```mach
 pub rec StableChunks[T] {
-    a:       *std.allocator.Allocator;
-    chunks:  Vector[*T];
-    len:     usize;
-    editing: bool;
+    a:        *std.allocator.Allocator;
+    chunks:   Vector[*T];
+    len:      usize;
+    editing:  bool;
+    borrowed: usize;
+    lent:     bool;
 }
 ```
 
-elements kept in fixed chunks, so an element never moves until the store is released
+elements kept in fixed chunks, so an element never moves until the store is released. a store may
+borrow another's chunks (chunk_borrow): its first `borrowed` chunks are the lender's, and until its
+first edit so is the list of them
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `a` | `*std.allocator.Allocator` | owns the chunks |
+| `a` | `*std.allocator.Allocator` | owns the chunks past the borrowed ones |
 | `chunks` | `Vector[*T]` | the chunks, each CHUNK_CAPACITY elements |
-| `len` | `usize` | how many elements the store holds |
+| `len` | `usize` | how many elements the store holds, the lender's included |
 | `editing` | `bool` | an editor holds the store |
+| `borrowed` | `usize` | how many leading chunks are the lender's, never released by this store |
+| `lent` | `bool` | the list of chunks is still the lender's, copied at the first edit |
 
 ### chunk_init
 
@@ -84,6 +91,16 @@ pub fun chunk_init[T](a: *std.allocator.Allocator) StableChunks[T]
 ```
 
 an empty store, released with chunk_dnit
+
+### chunk_borrow
+
+```mach
+pub fun chunk_borrow[T](a: *std.allocator.Allocator, from: *StableChunks[T]) StableChunks[T]
+```
+
+a store that reads every element of `from` as its own and adds its own past them: it borrows
+`from`'s chunks, which take nothing new while it lives, and at its first edit copies the list of
+them and the last one when `from` left it part full
 
 ### chunk_dnit
 

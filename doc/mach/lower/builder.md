@@ -185,16 +185,17 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 
 ```mach
 pub rec Builder {
-    m:       *mirl.ir.module.Module;
-    a:       *std.allocator.Allocator;
-    mb:      mirl.build.builder.Builder;
-    target:  *mirl.target.record.Target;
-    layout:  mirl.target.layout.Layout;
-    slots:   u32;
-    fn:      opt[mirl.ir.id.Function];
-    entry:   mirl.ir.id.Block;
-    block:   mirl.ir.id.Block;
-    allocas: u32;
+    m:      *mirl.ir.module.Module;
+    a:      *std.allocator.Allocator;
+    mb:     mirl.build.builder.Builder;
+    target: *mirl.target.record.Target;
+    layout: mirl.target.layout.Layout;
+    slots:  u32;
+    fn:     opt[mirl.ir.id.Function];
+    entry:  mirl.ir.id.Block;
+    block:  mirl.ir.id.Block;
+    # the last stack slot made at the head of the entry, none yet
+    slot_last: mirl.ir.id.Instruction;
     # the slot the next call's aggregate result lands in, in place of one of its own
     into:     mach.lower.value.Value;
     into_set: bool;
@@ -227,7 +228,7 @@ the state lowering emits a module's code through
 | `fn` | `opt[mirl.ir.id.Function]` | the function being built, none between functions |
 | `entry` | `mirl.ir.id.Block` | the entry block of the function being built |
 | `block` | `mirl.ir.id.Block` | the block the cursor is in |
-| `allocas` | `u32` | stack slots made so far at the head of the entry block |
+| `slot_last` | `mirl.ir.id.Instruction` | the last stack slot made at the head of the entry block, NO_INSTRUCTION before the first |
 | `into` | `mach.lower.value.Value` | the slot the next call's aggregate result lands in |
 | `into_set` | `bool` | whether into is set |
 | `whole` | `bool` | the next call's aggregate result is held whole |

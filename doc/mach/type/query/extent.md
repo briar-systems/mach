@@ -62,7 +62,9 @@ pub rec Laying {
 ```
 
 what a build lays its types out by: mirl's target and the context its selection opened,
-borrowed from the build's back end, and the type table each source type is interned in
+borrowed from the build's back end, and the type table each source type is interned in. it keeps
+what it laid out only of the types every table over one base names alike (type.memo_keyed), so a
+laying lent to the thread a layer works on serves every layer it works on
 
 | Field | Type | |
 | :--- | :--- | :--- |

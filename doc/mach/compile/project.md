@@ -10,7 +10,7 @@ dependency closure a plan's cells share.
 
 Source: [`src/compile/project.mach`](../../../src/compile/project.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.handle`](../base/handle.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.base.source.provider.disk`](../base/source/provider/disk.md), [`mach.base.source.provider.overlay`](../base/source/provider/overlay.md), [`mach.compile.backend`](backend.md), [`mach.compile.cache.compiler`](cache/compiler.md), [`mach.compile.cache.objects`](cache/objects.md), [`mach.compile.cache.record`](cache/record.md), [`mach.compile.demand`](demand.md), [`mach.compile.readahead`](readahead.md), [`mach.compile.request`](request.md), [`mach.front.comptime.scope`](../front/comptime/scope.md), [`mach.front.expect`](../front/expect.md), [`mach.front.load`](../front/load.md), [`mach.lower.context`](../lower/context.md), [`mach.lower.linkage`](../lower/linkage.md), [`mach.manifest.link`](../manifest/link.md), [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.plan`](../manifest/plan.md), [`mach.manifest.template`](../manifest/template.md), [`mach.report.readout`](../report/readout.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md), [`mach.target.resolved`](../target/resolved.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.handle`](../base/handle.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.base.source.provider.disk`](../base/source/provider/disk.md), [`mach.base.source.provider.overlay`](../base/source/provider/overlay.md), [`mach.compile.backend`](backend.md), [`mach.compile.cache.compiler`](cache/compiler.md), [`mach.compile.cache.objects`](cache/objects.md), [`mach.compile.cache.record`](cache/record.md), [`mach.compile.demand`](demand.md), [`mach.compile.readahead`](readahead.md), [`mach.compile.request`](request.md), [`mach.front.comptime.scope`](../front/comptime/scope.md), [`mach.front.expect`](../front/expect.md), [`mach.front.load`](../front/load.md), [`mach.lower.context`](../lower/context.md), [`mach.lower.linkage`](../lower/linkage.md), [`mach.manifest.link`](../manifest/link.md), [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.plan`](../manifest/plan.md), [`mach.manifest.template`](../manifest/template.md), [`mach.report.readout`](../report/readout.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md), [`mach.target.resolved`](../target/resolved.md), [`mach.type`](../type.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -447,6 +447,17 @@ pub rec Project {
     ahead: *mach.compile.readahead.ReadAhead;
     # what a codegen pass's lowerings read of other products, gathered when the pass starts; nil outside one
     views: *mach.session.query.Views;
+    # the session's type table as a codegen pass on a crew froze it, which every lowering layers its
+    # own types over while the session's handle names the owner's layer; nil otherwise, when a lowering
+    # writes the session's table itself
+    types_frozen: *mach.type.TypeInterner;
+    # how many types the owner's layer holds from merged lowerings, which is every type it holds: a
+    # lowering reads the frozen table, so a type the owner made itself would be one it cannot see
+    types_merged: u32;
+    # the session's interner as a codegen pass on a crew froze it, which every lowering names its own
+    # strings over while the session's handle names the owner's child of it; nil otherwise, when a
+    # lowering names its strings in the session's interner itself
+    names_frozen: *mach.base.intern.Interner;
 
     topo:     *mach.session.module.ModuleId;
     topo_len: u32;
