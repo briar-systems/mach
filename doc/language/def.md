@@ -2,7 +2,10 @@
 
 `def` introduces a new name for an existing type. The alias and the
 underlying type are interchangeable, with no nominal distinction between them:
-a value of the alias passes, assigns and returns as the type it names.
+a value of the alias passes, assigns and returns as the type it names. The one
+exception is an alias of a function type marked `#[constant_time]`, which names
+a function type of its own (see
+[A marked alias of a function type](#a-marked-alias-of-a-function-type)).
 
 ## Grammar
 
@@ -56,6 +59,31 @@ A type that must refer to itself gets its name from a record:
 ```mach
 rec Walker { visit: fun(*Walker) u32; }
 ```
+
+## A marked alias of a function type
+
+`#[constant_time("soft")]` or `#[constant_time("hard")]` on an alias of a
+function type marks the type with that constant-time mode. The alias then names
+the marked type, not the type written after the colon: the one place an alias
+is not the type it is written as.
+
+```mach
+#[constant_time("soft")]
+def Seal: fun(*^u8, u64) ^u64;
+```
+
+A value of `Seal` holds only a function declared `#[constant_time]` in that
+mode or a stronger one, with the same signature, and a constant-time function
+may pass secrets through it, trusted as a direct call of such a function is.
+The mode is part of the type as `...` is, so two marked aliases of one
+signature and one mode name the same type, and an alias of `Seal` is `Seal`. The
+rules, conversions included, are in
+[secrecy.md](secrecy.md#function-types-marked-constant-time).
+
+The alias must state a function type, which must not be C-variadic and must not
+carry a mode already: `#[constant_time]` on `def Word: u64;`, on an alias of a
+C-variadic function type or on an alias of `Seal` is refused as
+`decorator.misplaced`.
 
 ## A `def` with no type
 

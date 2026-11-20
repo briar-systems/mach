@@ -167,7 +167,7 @@ its tests reach. No object is made for instances alone.
   functions, the files it embeds and the same of every module it imports). Its settings are the profile's float relaxations (`relax`)
   and the target's instruction set and extensions (`ext`), the two settings
   that change what the code computes or where it can run. The compiler, the
-  optimization level, debug information and paths are left out. So two static
+  optimization setting, debug information and paths are left out. So two static
   libraries built from the same source and settings link together whatever
   profile or compiler build made each. Two built from different source, such as
   two versions of a dependency, are refused at link as built from different
@@ -248,6 +248,41 @@ argument, never truncated: `narrow(300)` against `fun narrow($n: u8)` reports
 an enclosing comptime parameter, as `narrow(m + 200)` inside `fun wide($m: u8)`,
 is held to the type at each instance of the enclosing function, where `m` has a
 value.
+
+A comptime value parameter sizes types in the body of its function. Each
+instance resolves the types its parameters size at its own values, so
+`var xs: [N]i64;` in `fun h($N: i64)` is three elements long in `h(3)` and one in
+`h(1)`. `$length_of([N]i64)` and `$size_of([N]i64)` read the same instance's
+length:
+
+```mach
+use std.runtime;
+
+fun count($N: i64) i64 {
+    var xs: [N]i64;
+    ret $length_of([N]i64) + $size_of([N]i64)::i64;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    if (count(3) != 27) { ret 1; }
+    ret 0;
+}
+```
+
+A body with such a type is judged at each instance, as a generic body is: what
+it reports, it reports at the call that asked for the instance, against that
+instance's values, and a function no call instantiates is not judged. A body
+whose types no comptime parameter sizes is judged once, where it is written.
+
+A comptime parameter never sizes a type in the function's own signature. One
+in a parameter type or the return type is refused as `array.length_not_const`:
+
+```mach error a comptime parameter sizes a type only in the body of its function, never in a parameter or return type
+fun first($N: i64, xs: [N]i64) i64 {
+    ret xs[0];
+}
+```
 
 Comptime value parameters apply to function parameters only, never to record
 fields or any other context.

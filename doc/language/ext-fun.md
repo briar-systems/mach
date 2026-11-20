@@ -549,7 +549,11 @@ link time, either **statically** by an external precompiled object/archive or
 **dynamically** by a shared library bound at load time. Provide those inputs to
 `mach build` either on the command line or through the project manifest. An
 undefined `ext` symbol that no static object defines and no shared library can
-bind is a link error.
+bind is a link error when code the link keeps refers to it. The link drops what
+nothing reaches from the program's roots before it judges undefined symbols, so
+an `ext fun` called only from functions nothing calls needs no definition: a
+binding module may declare functions a given provider lacks, and a program that
+never calls them links without them.
 
 ### Command line
 
@@ -572,8 +576,10 @@ mach build . -l c
 
 - A bare argument that contains a `/`, ends in `.o` (object) or `.a` (archive),
   or names a `.so`, `.dylib`, or `.dll` is treated as an explicit input. A
-  relative path is tried first against the working directory, then against the
-  project root.
+  relative path is read against the working directory, where it was typed, and
+  nowhere else. A manifest's `local` path is anchored at the project that
+  declares it instead (see
+  [manifest.md](manifest.md#linkname--link-requirements)).
 - `-l <name>` is handed to mink's library search, which finds it as the link
   runs. The directories are each `-L <dir>` in order, then the working
   directory, then the system's library directories the target's host row in

@@ -38,8 +38,17 @@ calls whatever function exports `main`, and terminates the process with its
 returned exit code, so `main` is kept by that call like any other function.
 `use std.runtime;` is **required** to link the entry into the binary, even
 though no code references it by name. Without it the link is refused with
-`link.input_invalid`, "the link does not define the entry symbol `_start`" on
-linux.
+`link.input_invalid` at the artifact's `entry` key, naming the entry symbol the
+link did not find and that a `use` of the module defining it belongs in the
+artifact's entry:
+
+```
+error[link.input_invalid] the link does not define the entry symbol `_start`. an image takes its entry symbol from a module its artifact's entry reaches, so write a `use` of the module that defines it in that entry
+```
+
+A library's tests link into an executable too (see
+[test.md](test.md#the-runner)), so a library entry states `use std.runtime;`
+for its tests to link, and the library carries the runtime's entry with it.
 
 Only the exported `main` symbol is what the runtime calls, and the Mach-level
 function name is irrelevant, so `fun entry(...)` tagged `#[symbol("main")]` works identically.
@@ -93,7 +102,8 @@ The manifest declares no `[link.*]` table: the system libraries a program
 needs on darwin and windows are std's `export = true` entries, which travel to
 every project that uses it. A library project (`mach init --lib`) differs only
 in its artifact, a `static` one with `entry = "lib/<id>.mach"` and
-`export = true`. The `[dep.std]` selection is the one the running compiler
+`export = true`, and in its entry, which holds `use std.runtime;` so the
+library's tests link (see [Executable entry](#executable-entry)). The `[dep.std]` selection is the one the running compiler
 states for std, `ref = "branch/dev"` until the std major that accepts this
 compiler is released, and from then on that major's version range, written as
 `mach dep add` writes it (see

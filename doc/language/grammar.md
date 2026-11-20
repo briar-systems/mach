@@ -110,6 +110,9 @@ keyword ::= "asm" | "brk" | "cnt" | "def" | "each" | "error" | "ext" | "fin"
 ```
 
 `nil` is an expression literal and `sel` is a prefix expression operator.
+`asm` is the one keyword the lexer reads: where a statement begins, followed on its
+line by a word, it opens an inline-assembly block whose head and body are raw text (see
+[Inline assembly](#inline-assembly)).
 `each`, `error` and `in` are recognized only in the comptime forms that spell
 them (`$each x in ...`, `$error(...)`; see [Statements](#statements)). The
 rest are statement, declaration, or type introducers. Note these are *contextual*: nothing in the lexer prevents a
@@ -777,19 +780,30 @@ Notes:
 asm-stmt ::= "asm" asm-head "{" asm-body "}"
 ```
 
-- `asm-head` is the mandatory **selection of masc's**: raw text from `asm` to the
-  body's `{`, handed to masc unchanged (see [asm.md](asm.md)). Bare `asm { ... }`
-  is rejected as `asm.isa_missing`.
-- `asm-body` is **raw text**, not a token grammar: the parser captures the
-  source span between the opening `{` and its brace-matched `}` and hands it
-  to the backend verbatim. Nested `{ }` are balanced by depth. Local
-  substitution uses `{name}` references inside the body; operand direction
-  and clobbers are inferred from the instruction stream, so there is no
-  operand or clobber list. `#` introduces a line comment inside the body.
+- `asm` beginning a statement is always an `asm-stmt`. A statement begins at the
+  start of a file or a body and after `;`, `{` or `}`, and there the lexer reads
+  `asm` followed on its line by a word as a block: `asm-head` and `asm-body` are each
+  one token of raw text. `asm` elsewhere is an ordinary identifier.
+- `asm-head` is the mandatory **selection of masc's**: raw text from after `asm` to
+  the `{` on the same line, handed to masc unchanged (see [asm.md](asm.md)). A
+  statement that begins with `asm` and no head, as `asm { ... }`, is rejected as
+  `asm.isa_missing`.
+- `asm-body` is **raw text**, not a token grammar: the lexer takes the source
+  between the opening `{` and the `}` that closes it and hands it to the backend
+  verbatim. That `}` is found in the source dialect of the one instruction set of
+  masc's whose catalog reads the head, whatever the target and whether or not
+  `$if` keeps the block, so a brace inside the dialect's comments (`#` on x86 and
+  RISC-V, `//` on aarch64, `;;` on WebAssembly), strings or character constants
+  neither opens nor closes the body, and every other brace balances. A head no
+  set reads, or more than one reads, is refused with `asm.head`, and a body never
+  closed with `asm.unterminated`. Local substitution uses `{name}` references
+  inside the body, outside its comments and literals. Operand direction and
+  clobbers are inferred from the instruction stream, so there is no operand or
+  clobber list.
 
 ```ebnf
-asm-head ::= (* raw source text; masc's selection syntax *)
-asm-body ::= (* raw source text, brace-balanced; not tokenized *)
+asm-head ::= (* raw source text to the "{" on its line; masc's selection syntax *)
+asm-body ::= (* raw source text, brace-balanced in the head's dialect; not tokenized *)
 ```
 
 

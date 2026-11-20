@@ -54,7 +54,9 @@ to select one. `mach test` names the artifacts it found.
   [`runner`](manifest.md#targetname) runs through it, and a target whose `sys` and
   `arch` are the host's and that declares none runs directly. Every other (target,
   profile) is built, reported on a `skip` line, and not run, whatever emulation the
-  host has. `--runner <cmd>` replaces the target's runner for one invocation and needs
+  host has. A cell on a finished-module target links no dispatcher: it is built as its
+  artifact and its (target, profile) is reported on a `skip` line naming why (see
+  [test.md](test.md#which-tests-run)). `--runner <cmd>` replaces the target's runner for one invocation and needs
   the selection to resolve to one cell. A run in which nothing was runnable exits `1`, so a green run always ran
   something, unless `--allow-unrunnable` accepts it.
 - `mach run <path>` consumes exactly one cell and refuses a selection that resolves
@@ -240,7 +242,8 @@ previous major's `--arch` and `--sys` are refused naming `-t`, and `--of` is
 refused because the system implies the object format.
 `--set` writes a manifest key over the entry build's target, artifact or profile
 as over a project's, so `mach build main.mach --set simd=require` builds the
-file under `simd = "require"` (see
+file under `simd = "require"`, and `mach build main.mach -O --set passes.licm=false`
+optimizes it with every optimization pass but loop invariant motion (see
 [Overriding a key for one build](manifest.md#overriding-a-key-for-one-build)).
 
 ## See also

@@ -29,6 +29,13 @@ is named on its own line.
 - A project whose `[project] mach` is neither accepted by this mach nor on the
   previous major is refused, and nothing is written. Migrate it with the previous
   major's mach first.
+- The names no rule rewrites are checked before anything is written. A
+  `[project].id` or a `[dep.<id>]` key that 7 refuses, as one holding `-`, which 6
+  accepted, is refused with its line in `mach.toml`, and the manifest and the
+  source are left as they were.
+- A bare `use id;` or `fwd id;` whose module the migration cannot tell, as `id`
+  names no dependency, `dep/` holds no manifest for it, or it exports no library, is
+  reported with its file and line while the rest of the file is rewritten.
 - Rules are data rows tagged with the major they migrate from. A release carries the
   rows of the major before it, and the next major deletes them.
 - Only tokens of source are read, so a comment or a string that spells an old form is
@@ -68,13 +75,14 @@ option in another program's words, as `cc -O2`, or in a comment is never reporte
 - `0`: the project is in this major's spelling, or was made so. Script and step
   reports leave it at `0`: they name files the migration never edits.
 - `1`: under `--check`, a file would change. In either mode, the manifest still
-  writes a removed key no rewrite migrates, each one reported, or a source could
-  not be read as source. The manifest reader refuses such a project, so the input
+  writes a removed key no rewrite migrates, each one reported, a source could
+  not be read as source, or a source holds a bare `use` the migration could not
+  rewrite, each one reported. The manifest reader refuses such a project, so the input
   is what is wrong. So does a system library 6 found that the manifest does not
   yet say how 7 finds, each one reported, since the link refuses it. A missing or
-  invalid path, a migrated manifest the reader refuses, or a `[project] mach`
-  that names a range this release does not migrate from also exits `1`, as for
-  every command.
+  invalid path, a `[project].id` or `[dep]` key the reader refuses, or a
+  `[project] mach` that names a range this release does not migrate from also exits
+  `1`, as for every command, with nothing written.
 - `2` and `3`: an internal or environment failure, as for every command.
 
 ## The changes from 6 to 7
@@ -113,6 +121,7 @@ Rewritten by `mach migrate`:
 | `#[oblivious]` | `#[constant_time("soft")]` |
 | `#[ext(sha)]`, `#[extensions(sha)]` | `#[extension("sha")]` |
 | `asm x86_64`, `asm aarch64`, `asm riscv64`, `asm riscv32` | `asm x86-64`, `asm armv8-a`, `asm rv64i`, `asm rv32i` |
+| `#` to the end of a line in an aarch64 or WebAssembly `asm` body, a comment on every instruction set in 6 | `//` and `;;`, the comment of the body's own dialect ([asm.md](asm.md#how-a-block-is-read)) |
 | `def bool: u8;` | `def bool: u1;` |
 | `use id;`, `fwd id;` | the path of the dependency's exported artifact entry |
 | `--jobs`, `--jobs=n` in the `argv` of a `[step]` that runs mach | `--threads`, `--threads=n` |
@@ -125,19 +134,32 @@ Left for you to change:
 |---|---|
 | a condition of type `u8`, as `if (flags & 1)` | a `u1`, as `if ((flags & 1) != 0)` |
 | a `u1` stored in a `u8`, under arithmetic, a shift or `~`, or beside a wider operand of `&`, `\|` or `^` | `value::u8`, or a `u1` destination |
+| a secret passed through a function value from `#[oblivious]` code, as `seal(key, data)` for `seal: fun(*^u8, u64) u64` | an alias of the function type marked like the code, `#[constant_time("soft")] def Seal: fun(*^u8, u64) u64;`, as the type of the value, its field and its parameter |
 | `-g`, `-O0`, `-O2`, `--emit-asm`, `--emit-ir`, `--pie`, `--simd`, `--jobs`, `--arch`, `--sys`, `--of`, `--platform`, `--subsystem`, `--base`, `--stack-reserve`, `--stack-commit`, `-d`, `-e`, `-s`, and `--version` after `mach dep add`, in a script, or in a step's `argv` other than `--jobs` | the spelling the report names |
 | `MACH_TARGET_ISA`, `MACH_TARGET_OS` read by a script or a step | `MACH_TARGET_ARCH`, `MACH_TARGET_SYS` |
+| a `[project].id` or a `[dep.<id>]` key holding `-`, which 6 accepted | an id of letters, digits and `_` that starts with a letter or `_`, renamed together with the `dep/<id>/` directory and every consumer's `[dep]` key and `use` paths |
+| a bare `use id;` or `fwd id;` whose dependency is not in the project's closure, has no manifest under `dep/`, or exports no library | the path of the module it bound, as `use id.lib.id;` |
 | a spirv target's v6 `ext` name that enables no capability: `zero_init_workgroup`, `subgroup_graphics_stages`, `maintenance8` and the plain `*_float16_atomics`, `*_float32_atomics`, `*_float64_atomics` | removed from `ext`, and the report names the target and the entry, since the consumer still enables the device feature |
 | a `bin` artifact listing a spirv target beside another | a separate `kind = "module"` artifact for the spirv target, which `mach migrate` reports |
 | a linux target with no `env` that an artifact links a `source = "system"` entry on, which 6 found in the gnu environment's directories | `env = "gnu"` on the target, under which a `bin` links `pie` unless its `linkage` says otherwise, so the report names the target and the entry |
 | a darwin `source = "system"` shared entry named by no install name, as `name = "MoltenVK"`, whose file 6 found and linked by the install name it states | the install name, as `name = "@rpath/libMoltenVK.dylib"` or an absolute path, which 7 links from the entry's claim with no file |
 | a linux artifact whose links reach the C library only through another library's dependency, as `pthread`, `m`, `dl` or `rt` with no `c`, which 6 bound through that library's own dependency | `c` named in the artifact's links, since 7 binds a reference only to a library the link names |
 
-The compiler refuses the first two, and `mach migrate` reports the next four. A `u8`
+The compiler refuses the first three, and `mach migrate` reports the next six. An id
+or a `[dep]` key holding `-` is refused as `manifest.invalid_name` before anything is
+written, since the id is one name in three places, the `[dep]` key, the `dep/`
+directory and the head of every consumer's `use` path, and migrate edits only the
+root project. A bare `use` it cannot rewrite is reported as `use.unresolved` at
+its name, saying which of the three it met. A `u8`
 condition is refused as `condition.type` and a `u1` under an operator as
 `type.mismatch`, each naming the replacement. A `u1` stored in a `u8` is refused as
 `type.mismatch`, `expected u8, found u1`, with a help line naming the cast,
-``cast the value with `::u8` ``. Several default libraries in one manifest are
+``cast the value with `::u8` ``. A secret passed through a function value whose type
+states no constant-time mode is refused as `secret.call_untrusted`, naming the marked
+alias. `mach migrate` rewrites `#[oblivious]` but writes no alias, since only the
+author knows which function values the code means to trust: the functions stored in
+such a value must be constant time themselves, and a plain or `#[weak]` one is refused
+where it is stored ([secrecy.md](secrecy.md#function-types-marked-constant-time)). Several default libraries in one manifest are
 reported with their lines, since 7 exports one library and only its `need`
 travels. The manifest reader refuses a
 removed key with no mechanical rewrite, and `mach migrate` reports each one with

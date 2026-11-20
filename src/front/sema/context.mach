@@ -309,7 +309,8 @@ pub rec Instance {
 # loop_depth:    the loops entered since the body a jump cannot leave began, a function's
 #                or a `fin`'s, so a `brk` or `cnt` at 0 has no loop to target
 # in_test:       inside a `test` body, where a `ret` value is a status in 0..255
-# timed:         the constant-time mode of the function whose body is walked, `TIMED_NONE` outside one
+# timed:         the constant-time mode of the function whose body is walked, `mach.type.TIMED_NONE` outside one
+# ret_written:   the return type the function whose body is walked writes, nil outside one
 # block:         the innermost block statement walked, whose end is where a `fin` in it replays
 # expanding:     the aliases whose definitions the walk is inside, innermost first, nil at none
 pub rec Walk {
@@ -325,6 +326,7 @@ pub rec Walk {
     loop_depth:       u32;
     in_test:          bool;
     timed:            u8;
+    ret_written:      ast_id.TypeId;
     guards:           *Guard;
     block:            base_source.Span;
     expanding:        *Expansion;
@@ -336,11 +338,6 @@ pub rec Expansion {
     name:  intern.StrId;
     outer: *Expansion;
 }
-
-# the constant-time modes a walked body may hold, as `Walk.timed`
-pub val TIMED_NONE: u8 = 0;
-pub val TIMED_SOFT: u8 = 1;
-pub val TIMED_HARD: u8 = 2;
 
 # which walk reports a `$error` a comptime arm reaches, as `Walk.arm`: this one; none, in
 # an arm this walk cannot select; or this value instance, in an arm it selected that its
@@ -379,6 +376,7 @@ pub fun walk_make() Walk {
     var w: Walk = Walk{};
     w.callee_eid  = ast_id.EXPR_NIL;
     w.write_place = ast_id.EXPR_NIL;
+    w.ret_written = ast_id.TYPE_NIL;
     ret w;
 }
 
@@ -521,7 +519,45 @@ pub fun resolved_type_of(sc: *SemaContext, ast_tid: ast_id.TypeId) type_kind.Typ
     if (sc.instance.subst != nil && sc.typing.annotation_check_fn != nil) {
         sc.typing.annotation_check_fn(sc, ast_tid);
     }
+    if (type_frame_of(sc, ast_tid) == resolve.TYPE_FRAME_BODY && sc.typing.insts != nil && sc.instance.frame != sema_instance.FRAME_TEMPLATE) {
+        ret framed_type(sc, ast_tid);
+    }
     ret apply_subst(sc, sc.view.type_resolved_ty[ast_id.type_index(ast_tid)]);
+}
+
+# how the type node `tid` reads a comptime parameter or `$each` loop variable
+# ---
+# sc:  the walk
+# tid: the type node
+# ret: TYPE_FRAME_BODY when each frame resolves it, TYPE_FRAME_REFUSED when a signature spells it, else TYPE_FRAME_NONE
+pub fun type_frame_of(sc: *SemaContext, tid: ast_id.TypeId) resolve.TypeFrame {
+    val rr: *resolve.ResolveResult = sc.view.rr;
+    if (rr == nil || rr.type_frames == nil || ast_id.type_index(tid) >= rr.type_count) { ret resolve.TYPE_FRAME_NONE; }
+    ret rr.type_frames[ast_id.type_index(tid)];
+}
+
+# a type node the walk's comptime bindings size, resolved once in each frame that reads it: the
+# template has no value to size it by and holds an error type for it
+fun framed_type(sc: *SemaContext, tid: ast_id.TypeId) type_kind.TypeId {
+    val opt_had: opt[type_kind.TypeId] = sema_instance.type_in_frame(?sc.typing.insts.set, sc.instance.frame, tid);
+    if (sel opt_had.some) { ret opt_had.some; }
+    val ty:      type_kind.TypeId = apply_subst(sc, sc.typing.type_fn(sc, tid));
+    val err_put: err[fail.Fail]   = sema_instance.type_record(?sc.typing.insts.set, sc.instance.frame, tid, ty);
+    if (sel err_put.err) { report_phase.internal(?sc.status, err_put.err); }
+    ret ty;
+}
+
+# whether the function `did` declares spells a type its comptime parameters size, so each value
+# instance types its body afresh and reports what it finds there
+# ---
+# rr:  the module's resolution, nil for none
+# did: the declaration
+# ret: false for no resolution, or a declaration that is nil, unknown or names no symbol
+pub fun decl_value_sized(rr: *resolve.ResolveResult, did: ast_id.DeclId) bool {
+    if (rr == nil || rr.decl_symbol == nil || ast_id.decl_is_nil(did) || ast_id.decl_index(did) >= rr.decl_count) { ret false; }
+    val sid: resolve.SymbolId = rr.decl_symbol[ast_id.decl_index(did)];
+    if (resolve.symbol_is_nil(sid) || resolve.symbol_index(sid) >= rr.symbol_count) { ret false; }
+    ret (rr.symbols[resolve.symbol_index(sid)].flags & resolve.SYM_FLAG_VALUE_SIZED) != 0;
 }
 
 # expression `eid` as name resolution read it
@@ -810,12 +846,14 @@ pub fun walk_binds_pack(sc: *SemaContext) bool {
 }
 
 # an instance with no type arguments is typed by its template, except in the iterations
-# its frames hold
+# its frames hold and in a value instance whose comptime arguments size types in its body
 fun frame_records_typing(sc: *SemaContext) bool {
     if (sc.typing.insts == nil || sc.instance.frame == sema_instance.FRAME_TEMPLATE) { ret false; }
     if (sema_instance.frame_is_iteration(?sc.typing.insts.set, sc.instance.frame))   { ret true; }
     if (sc.instance.parent == INST_NONE)                                             { ret true; }
-    ret sema_instance.at(?sc.typing.insts.set, sc.instance.parent).arg_len > 0;
+    val item: *sema_instance.Instance = sema_instance.at(?sc.typing.insts.set, sc.instance.parent);
+    if (item.arg_len > 0) { ret true; }
+    ret item.kind == sema_instance.KIND_VALUE && decl_value_sized(sc.view.rr, item.decl);
 }
 
 # the verdict the walk gives a comptime gate in its frame
@@ -888,16 +926,17 @@ pub fun symbol_for_expr(sc: *SemaContext, eid: ast_id.ExprId) opt[*resolve.Symbo
     ret symbol_by_id(sc, sid);
 }
 
-# whether expression `eid` names a binding that only has a value at run time
+# what expression `eid` names, as a comptime evaluation reads it: no symbol, a binding that only
+# has a value at run time, a comptime parameter or `$each` loop variable, or a declaration
 # ---
 # sc:  the walk, nil for none
 # eid: the expression
-# ret: false for no walk, a nil expression or one that names nothing
-pub fun comptime_ident_is_runtime(sc: *SemaContext, eid: ast_id.ExprId) bool {
-    if (sc == nil || ast_id.expr_is_nil(eid)) { ret false; }
+# ret: NAME_NONE for no walk, a nil expression or one that names nothing, else its kind
+pub fun comptime_ident_kind(sc: *SemaContext, eid: ast_id.ExprId) comptime_capability.NameKind {
+    if (sc == nil || ast_id.expr_is_nil(eid)) { ret comptime_capability.NAME_NONE; }
     val opt_sym: opt[*resolve.Symbol] = symbol_for_expr(sc, eid);
-    if (!sel opt_sym.some) { ret false; }
-    ret resolve.symbol_is_runtime(opt_sym.some);
+    if (!sel opt_sym.some) { ret comptime_capability.NAME_NONE; }
+    ret resolve.symbol_name_kind(opt_sym.some);
 }
 
 # the symbol a type names, none when it names none
@@ -1482,9 +1521,20 @@ pub fun decorator_string_arg(sc: *SemaContext, dec: *ast_decl.Decorator, ord: u3
         report(sc, kind, at, kind_msg);
         ret opt[str].none{};
     }
-    # the load could not read what type checking can: the value no later phase sees
-    report_not_constant(sc, dec, at);
-    ret opt[str].none{};
+    # a string only type checking evaluates is recorded for the phases after it, unless a phase
+    # before it or another module's typing reads the decorator's strings
+    val row: *decorator.Row = decorator.row(dec.id);
+    if (row == nil || (row.flags & decorator.FLAG_LOAD_STRINGS) != 0) {
+        reportf(sc, diagnostic_kind.DECORATOR_NOT_CONSTANT, at,
+            "the `{}` decorator's arguments must be known when the module loads, and this one is known only once types are checked", decorator.name_of(dec.id));
+        ret opt[str].none{};
+    }
+    val err_recorded: err[fail.Fail] = comptime_scope.decorator_string_set(sc.view.ctx, eid, res_evaluate.ok.data.s);
+    if (sel err_recorded.err) {
+        report_internal(sc, at, err_recorded.err);
+        ret opt[str].none{};
+    }
+    ret intern.get(sc.s.interner, res_evaluate.ok.data.s);
 }
 
 # an integer argument that is not a constant expression is refused as one;

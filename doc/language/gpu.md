@@ -546,9 +546,17 @@ initializer, and at zero without one, as every mach `var` does:
 #[gpu.output(1)] var out_mask:   u32;
 ```
 
+It starts there in each stage that reaches it, which is each stage that names it,
+directly or through the functions it calls. A stage that does not reach an output
+does not have it, so that stage writes nothing to the output's location, whatever
+the initializer says. A fragment stage that writes only `out_mask` above has no
+location 0 output.
+
 On `spirv` the Output `OpVariable` carries that value as its initializer: the
 constant the initializer spells, or `OpConstantNull` where it is zero or absent.
-SPIR-V and Vulkan both admit an initializer on an Output variable.
+SPIR-V and Vulkan both admit an initializer on an Output variable. An output that no
+entry point of the module reaches is in no interface list and the link drops its
+`OpVariable`.
 
 As with `#[gpu.stage(...)]`, these are accepted on every target and acted on only by a
 target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in the
@@ -908,6 +916,18 @@ nor a pointer into a `#[gpu.uniform]`, `#[gpu.push]`, `#[gpu.input]` or
 `#[gpu.output]` variable, whole or part. Such a call is refused with
 `spirv.unsupported`, naming the storage class, and the program passes the value
 instead or reaches the binding in the callee.
+
+A pointer parameter takes its SPIR-V type from what its calls pass. A whole
+`#[gpu.storage]` or `#[gpu.uniform]` binding is a `Block`-decorated structure, and a
+member or an element of one, of the same record type, is the plain structure, so the
+two are different pointer types. A parameter every call passes a whole binding is a
+pointer to the block, and one every call passes a member or an element is a pointer
+to the plain structure, whether the argument is reached directly or through another
+function's parameter. A function no call reaches takes the block for a record in a
+class that holds blocks. A function one call passes a whole binding and another a
+member or an element of one for the same parameter is refused with
+`spirv.unsupported` at the second call. The program splits it into one function for
+each kind of argument.
 
 A row may also be **typed**: its requirement depends on the type it operates on, read
 from one operand (a pointer's pointee), and for a pointer on the storage class that

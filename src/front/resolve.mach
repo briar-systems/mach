@@ -65,6 +65,7 @@ use mach.type;
 use mach.type.deprecation;
 use type_kind: mach.type.kind;
 use type_prim: mach.type.prim;
+use masc_isa:  masc.isa;
 
 # a symbol's slot in the resolve context's symbol table
 pub def SymbolId: u32;
@@ -154,6 +155,17 @@ pub val SYM_FLAG_REACHED: u8 = 16;
 # an assignment writes a field or element reached from the local or parameter by name, so
 # what it holds changes in part where nothing stores to it whole
 pub val SYM_FLAG_WRITTEN: u8 = 32;
+
+# a function whose body spells a type one of its comptime parameters sizes, so each value
+# instance types the body afresh
+pub val SYM_FLAG_VALUE_SIZED: u8 = 64;
+
+# how a type node reads a comptime parameter or `$each` loop variable: not at all, in a body,
+# where each frame that binds them resolves it afresh, or in a signature, where it is refused
+pub def TypeFrame: u8;
+pub val TYPE_FRAME_NONE:    TypeFrame = 0;
+pub val TYPE_FRAME_BODY:    TypeFrame = 1;
+pub val TYPE_FRAME_REFUSED: TypeFrame = 2;
 
 # an imported symbol is shared by every binding of the same definition that carries the
 # same notice and testing mark, so a `#[deprecated]` or `#[testing]` binding never taints a clean
@@ -382,6 +394,17 @@ rec ResolveContext {
     expr_choices_count: usize;
     # how each literal head's path reads, one per type node; the parsed tree is never rewritten
     type_heads: *interpretation.Head;
+    # how each type node reads a comptime local, one per type node
+    type_frames: *TypeFrame;
+    # reads of comptime locals bound so far, and of comptime parameters among them, which a
+    # type node compares across its own binding
+    local_reads: u32;
+    param_reads: u32;
+    # binding a function's parameter and return types
+    in_signature: bool;
+    syntax_clean: bool;
+    # the function body being bound has a type a comptime parameter sizes
+    value_sized: bool;
 }
 
 # what resolving one module produced, owned by the result and released with result_dnit
@@ -425,12 +448,16 @@ pub rec ResolveResult {
     # how each literal head's path reads, `type_count` of them: as written, or as a type and the
     # tag case its last segment selects
     type_heads: *interpretation.Head;
+    # how each type node reads a comptime local, `type_count` of them
+    type_frames: *TypeFrame;
 
     # the local each `{name}` of an asm block binds
     asm_binds: collections_vector.Vector[AsmBind];
 
     # why the module is refused, if it is: then nothing else of it was resolved
     refusal: refusal.Refusal;
+    # the module's syntax parsed without an error, so its module-scope `$error`s are evaluated
+    syntax_clean: bool;
 }
 
 # one `{name}` of an asm block and the local it binds
@@ -775,6 +802,9 @@ pub fun result_dnit(r: *ResolveResult) {
     if (r.type_heads != nil && r.type_count != 0) {
         A.deallocate[interpretation.Head](r.alloc, r.type_heads, r.type_count::usize);
     }
+    if (r.type_frames != nil && r.type_count != 0) {
+        A.deallocate[TypeFrame](r.alloc, r.type_frames, r.type_count::usize);
+    }
     map.dnit[u64, SymbolId](?r.param_index);
     map.dnit[u64, SymbolId](?r.nominals);
     map.dnit[u64, SymbolId](?r.declared);
@@ -795,13 +825,14 @@ pub fun result_dnit(r: *ResolveResult) {
     r.expr_choices          = nil;
     r.expr_choices_count    = 0;
     r.type_heads            = nil;
+    r.type_frames           = nil;
 }
 
 # an owned copy of `r` from `alloc`, every entry at the id it has in `r`
 pub fun result_copy(r: *ResolveResult, alloc: *A.Allocator) res[ResolveResult, fail.Fail] {
     var out: ResolveResult = ResolveResult{status: r.status, alloc: alloc, symbol_count: r.symbol_count, pub_count: r.pub_count,
         expr_count:         r.expr_count, type_count: r.type_count, decl_count: r.decl_count, public_constant_count: r.public_constant_count,
-        expr_choices_count: r.expr_choices_count,
+        expr_choices_count: r.expr_choices_count, syntax_clean: r.syntax_clean,
         param_index:        map.init[u64, SymbolId](alloc), nominals: map.init[u64, SymbolId](alloc), declared: map.init[u64, SymbolId](alloc),
         constants:          comptime_scope.bindings_init(alloc)};
     var done: bool = false;
@@ -832,6 +863,9 @@ pub fun result_copy(r: *ResolveResult, alloc: *A.Allocator) res[ResolveResult, f
     val res_heads: res[*interpretation.Head, A.Error] = array_copy[interpretation.Head](alloc, r.type_heads, r.type_count::usize);
     if (sel res_heads.err) { ret res[ResolveResult, fail.Fail].err{fail.refused(res_heads.err)}; }
     out.type_heads = res_heads.ok;
+    val res_frames: res[*TypeFrame, A.Error] = array_copy[TypeFrame](alloc, r.type_frames, r.type_count::usize);
+    if (sel res_frames.err) { ret res[ResolveResult, fail.Fail].err{fail.refused(res_frames.err)}; }
+    out.type_frames = res_frames.ok;
     map.dnit[u64, SymbolId](?out.param_index);
     val res_params: res[map.Map[u64, SymbolId], A.Error] = map.clone[u64, SymbolId](?r.param_index, alloc);
     if (sel res_params.err) {
@@ -894,6 +928,7 @@ pub fun resolve(
     load: *comptime_scope.ComptimeCtx,
     own_module: module.ModuleId,
     own_stable: module.StableModuleId,
+    syntax_clean: bool,
     diags: *diagnostic.DiagnosticStore) res[ResolveResult, fail.Fail] {
     var scope: comptime_scope.ComptimeCtx = comptime_scope.stage_init(load, comptime_scope.STAGE_RESOLVE, s.alloc);
     fin { comptime_scope.dnit(?scope); }
@@ -917,14 +952,19 @@ pub fun resolve(
     val mnode: *ast_module.Module = opt_module.some;
 
     # a module that imports a refused module is not analysed and reports nothing, and one in
-    # which a module-scope `$error` fires reports each that fired and nothing else
+    # which a module-scope `$error` fires reports each that fired and nothing else. a module
+    # whose syntax did not parse cleanly reports its syntax errors, and its `$error`s are not
+    # evaluated, since the gates they stand under were read from a tree the parse recovered
+    rc.syntax_clean = syntax_clean;
     if (import_refusal(?rc)) {
         report_phase.reject(?rc.status);
         ret build_result(?rc);
     }
-    val err_refusal: err[fail.Fail] = module_refusal(?rc, mnode.decls_start, mnode.decls_len);
-    if (sel err_refusal.err)             { ret res[ResolveResult, fail.Fail].err{err_refusal.err}; }
-    if (refusal.is_refused(?rc.refusal)) { ret build_result(?rc); }
+    if (syntax_clean) {
+        val err_refusal: err[fail.Fail] = module_refusal(?rc, mnode.decls_start, mnode.decls_len);
+        if (sel err_refusal.err)             { ret res[ResolveResult, fail.Fail].err{err_refusal.err}; }
+        if (refusal.is_refused(?rc.refusal)) { ret build_result(?rc); }
+    }
 
     val err_decls_collected: err[fail.Fail] = collect_decl_list(?rc, mnode.decls_start, mnode.decls_len, rc.module_scope, true);
     if (sel err_decls_collected.err) { ret res[ResolveResult, fail.Fail].err{err_decls_collected.err}; }
@@ -1005,7 +1045,7 @@ fun init_context(
     rc.deps   = deps;
     rc.ctx    = ctx;
     val res_caps: res[comptime_capability.PhaseCapabilities[ResolveContext], fail.Fail] =
-        comptime_capability.resolution_capabilities[ResolveContext](comptime_ident_is_runtime, comptime_expression, comptime_head);
+        comptime_capability.resolution_capabilities[ResolveContext](comptime_ident_kind, comptime_expression, comptime_head);
     if (sel res_caps.err) {
         ret err[fail.Fail].err{res_caps.err};
     }
@@ -1053,6 +1093,11 @@ fun init_context(
     rc.expr_choices       = nil;
     rc.expr_choices_count = 0;
     rc.type_heads         = nil;
+    rc.type_frames        = nil;
+    rc.local_reads        = 0;
+    rc.param_reads        = 0;
+    rc.in_signature       = false;
+    rc.value_sized        = false;
 
     var handed: bool = false;
     fin {
@@ -1107,6 +1152,13 @@ fun init_context(
         }
         rc.type_heads = res_heads.ok;
         memory.fill[interpretation.Head](rc.type_heads, interpretation.HEAD_PARSED, a.types.len);
+        val res_frames: res[*TypeFrame, A.Error] = A.allocate[TypeFrame](s.alloc, a.types.len);
+        if (sel res_frames.err) {
+            report_phase.internal(?rc.status, fail.refused(res_frames.err));
+            ret err[fail.Fail].err{fail.refused(res_frames.err)};
+        }
+        rc.type_frames = res_frames.ok;
+        memory.fill[TypeFrame](rc.type_frames, TYPE_FRAME_NONE, a.types.len);
     }
     if (a.decls.len > 0) {
         val res_allocate: res[*SymbolId, A.Error] = A.allocate[SymbolId](s.alloc, a.decls.len);
@@ -1151,6 +1203,9 @@ fun dnit_context(rc: *ResolveContext) {
     }
     if (rc.type_heads != nil) {
         A.deallocate[interpretation.Head](rc.s.alloc, rc.type_heads, rc.a.types.len);
+    }
+    if (rc.type_frames != nil) {
+        A.deallocate[TypeFrame](rc.s.alloc, rc.type_frames, rc.a.types.len);
     }
     map.dnit_by[ImportedKey, SymbolId](?rc.imported_cache);
     map.dnit[intern.StrId, SymbolId](?rc.vec_cache);
@@ -1642,7 +1697,7 @@ fun try_register_comptime_const(rc: *ResolveContext, name_span: base_source.Span
     }
     val name_id: intern.StrId = res_range_add.ok;
 
-    val opt_bound: opt[comptime_scope.NamedConst] = comptime_scope.lookup(rc.ctx, name_id);
+    val opt_bound: opt[comptime_scope.NamedConst] = comptime_scope.lookup_constant(rc.ctx, name_id);
     if (sel opt_bound.some) { ret err[fail.Fail].ok{}; }
 
     val fw:                          float.FloatWidth                                       = comptime.declared_float_width(rc.a, rc.source, ty);
@@ -1669,7 +1724,7 @@ fun register_constant_tag(rc: *ResolveContext, name_span: base_source.Span, init
         ret err[fail.Fail].ok{};
     }
     val name_id:   intern.StrId                   = res_range_add.ok;
-    val opt_bound: opt[comptime_scope.NamedConst] = comptime_scope.lookup(rc.ctx, name_id);
+    val opt_bound: opt[comptime_scope.NamedConst] = comptime_scope.lookup_constant(rc.ctx, name_id);
     if (sel opt_bound.some) { ret err[fail.Fail].ok{}; }
     ret comptime_scope.bind(rc.ctx, name_id, comptime_value.const_elem_untyped(init_expr::u32));
 }
@@ -2601,16 +2656,17 @@ fun mark_arm_names(rc: *ResolveContext, start: u32, len: u32, bound: u32, at_dec
 
 # an asm body names what it uses in `{name}` substitutions, which lowering binds
 # binds each `{name}` of an asm block to the local it names: a runtime `val`, `var` or
-# parameter in scope, which lowering stores to and loads from by its slot
-fun bind_asm(rc: *ResolveContext, sid: ast_id.StmtId, body: base_source.Span) err[fail.Fail] {
+# parameter in scope, which lowering stores to and loads from by its slot. a body whose
+# head names no one instruction set was refused by the lexer, and binds nothing
+fun bind_asm(rc: *ResolveContext, sid: ast_id.StmtId, head: base_source.Span, body: base_source.Span) err[fail.Fail] {
+    val res_dialect: res[masc_isa.Reader, A.Error] = front_asm.dialect(rc.s.alloc, rc.source, head);
+    if (sel res_dialect.err) { ret err[fail.Fail].err{fail.refused(res_dialect.err)}; }
+    val reader: masc_isa.Reader = res_dialect.ok;
+    if (!sel reader.one) { ret err[fail.Fail].ok{}; }
     var at: usize = body.offset;
     for (true) {
-        val r: front_asm.Ref = front_asm.ref_next(rc.source, body, ?at);
+        val r: front_asm.Ref = front_asm.ref_next(?reader.one.source, rc.source, body, ?at);
         if (r.kind == front_asm.REF_END) { brk; }
-        if (r.kind == front_asm.REF_UNTERMINATED) {
-            record_report(rc, diagnostic_kind.ASM_SYNTAX, body, "unterminated '{' in inline asm body");
-            brk;
-        }
         if (r.kind == front_asm.REF_EMPTY) {
             record_report(rc, diagnostic_kind.ASM_SYNTAX, body, "an empty `{}` in an asm body is not allowed. write `{name}` to reference a local");
             brk;
@@ -2784,21 +2840,32 @@ pub fun symbol_is_runtime(sym: *Symbol) bool {
     ret sym.kind == SYM_PARAM;
 }
 
-# whether a resolved expression names a runtime binding, a local or a parameter
-# whose value no comptime evaluation sees; false for a name that resolved to none
-pub fun expr_is_runtime(rr: *ResolveResult, eid: ast_id.ExprId) bool {
-    if (rr == nil || rr.expr_resolved == nil || ast_id.expr_is_nil(eid) || eid::u32 >= rr.expr_count) { ret false; }
-    val sid: SymbolId = rr.expr_resolved[ast_id.expr_index(eid)];
-    if (symbol_is_nil(sid) || sid::u32 >= rr.symbol_count) { ret false; }
-    ret symbol_is_runtime(?rr.symbols[symbol_index(sid)]);
+# a comptime parameter or `$each` loop variable, whose value a frame binds by name
+pub fun symbol_is_comptime_local(sym: *Symbol) bool {
+    ret (sym.flags & SYM_FLAG_COMPTIME) != 0 && (sym.flags & SYM_FLAG_MODULE) == 0;
 }
 
-fun comptime_ident_is_runtime(rc: *ResolveContext, eid: ast_id.ExprId) bool {
-    if (rc == nil || rc.expr_resolved == nil)                       { ret false; }
-    if (ast_id.expr_is_nil(eid) || eid::u32 >= rc.a.exprs.len::u32) { ret false; }
+# what a comptime evaluation reads a name resolved to `sym` as
+pub fun symbol_name_kind(sym: *Symbol) comptime_capability.NameKind {
+    if (symbol_is_runtime(sym))        { ret comptime_capability.NAME_RUNTIME; }
+    if (symbol_is_comptime_local(sym)) { ret comptime_capability.NAME_LOCAL; }
+    ret comptime_capability.NAME_DECLARED;
+}
+
+# what a resolved expression names, as a comptime evaluation reads it
+pub fun expr_name_kind(rr: *ResolveResult, eid: ast_id.ExprId) comptime_capability.NameKind {
+    if (rr == nil || rr.expr_resolved == nil || ast_id.expr_is_nil(eid) || eid::u32 >= rr.expr_count) { ret comptime_capability.NAME_NONE; }
+    val sid: SymbolId = rr.expr_resolved[ast_id.expr_index(eid)];
+    if (symbol_is_nil(sid) || sid::u32 >= rr.symbol_count) { ret comptime_capability.NAME_NONE; }
+    ret symbol_name_kind(?rr.symbols[symbol_index(sid)]);
+}
+
+fun comptime_ident_kind(rc: *ResolveContext, eid: ast_id.ExprId) comptime_capability.NameKind {
+    if (rc == nil || rc.expr_resolved == nil)                       { ret comptime_capability.NAME_NONE; }
+    if (ast_id.expr_is_nil(eid) || eid::u32 >= rc.a.exprs.len::u32) { ret comptime_capability.NAME_NONE; }
     val sid: SymbolId = rc.expr_resolved[ast_id.expr_index(eid)];
-    if (symbol_is_nil(sid) || symbol_index(sid) >= rc.sym_len) { ret false; }
-    ret symbol_is_runtime(?rc.symbols[symbol_index(sid)]);
+    if (symbol_is_nil(sid) || symbol_index(sid) >= rc.sym_len) { ret comptime_capability.NAME_NONE; }
+    ret symbol_name_kind(?rc.symbols[symbol_index(sid)]);
 }
 
 fun bind_fun(rc: *ResolveContext, f: *ast_decl.DeclFun, decl_id: ast_id.DeclId) err[fail.Fail] {
@@ -2828,11 +2895,13 @@ fun bind_fun(rc: *ResolveContext, f: *ast_decl.DeclFun, decl_id: ast_id.DeclId) 
     val param_scope: ScopeId = res_open_scope_gen_scope.ok;
     rc.current_scope = param_scope;
 
+    rc.in_signature = true;
     var pi: u32 = 0;
     for (pi < f.params_len) {
         val tn:            *ast_decl.TypedName = ?rc.a.typed_names.data[f.params_start + pi];
         val err_bind_type: err[fail.Fail]      = bind_type(rc, tn.ty);
         if (sel err_bind_type.err) {
+            rc.in_signature  = false;
             rc.current_scope = saved_scope;
             ret err_bind_type;
         }
@@ -2840,6 +2909,7 @@ fun bind_fun(rc: *ResolveContext, f: *ast_decl.DeclFun, decl_id: ast_id.DeclId) 
         val res_declare: res[SymbolId, fail.Fail] = declare(rc, SYM_PARAM, pflags, tn.name, decl_id, pi, rc.own_stable, param_scope);
         if (sel res_declare.err) {
             report_phase.internal(?rc.status, res_declare.err);
+            rc.in_signature  = false;
             rc.current_scope = saved_scope;
             ret err[fail.Fail].err{res_declare.err};
         }
@@ -2849,17 +2919,27 @@ fun bind_fun(rc: *ResolveContext, f: *ast_decl.DeclFun, decl_id: ast_id.DeclId) 
     if (!ast_id.type_is_nil(f.return_type)) {
         val err_bind_type: err[fail.Fail] = bind_type(rc, f.return_type);
         if (sel err_bind_type.err) {
+            rc.in_signature  = false;
             rc.current_scope = saved_scope;
             ret err_bind_type;
         }
     }
+    rc.in_signature = false;
 
     if (!ast_id.stmt_is_nil(f.body)) {
+        rc.value_sized = false;
         val err_bind_stmt: err[fail.Fail] = bind_stmt(rc, f.body);
         if (sel err_bind_stmt.err) {
             rc.current_scope = saved_scope;
             ret err_bind_stmt;
         }
+        if (rc.value_sized && rc.decl_symbol != nil) {
+            val sid: SymbolId = rc.decl_symbol[ast_id.decl_index(decl_id)];
+            if (!symbol_is_nil(sid) && symbol_index(sid) < rc.sym_len) {
+                rc.symbols[symbol_index(sid)].flags = rc.symbols[symbol_index(sid)].flags | SYM_FLAG_VALUE_SIZED;
+            }
+        }
+        rc.value_sized = false;
     }
 
     rc.current_scope = saved_scope;
@@ -2960,7 +3040,7 @@ fun bind_stmt(rc: *ResolveContext, sid: ast_id.StmtId) err[fail.Fail] {
     if (s.kind == ast_stmt.STMT_KIND_DECL) {
         ret bind_local_decl(rc, s.data.decl.decl);
     }
-    if (s.kind == ast_stmt.STMT_KIND_ASM) { ret bind_asm(rc, sid, s.data.asm_.body); }
+    if (s.kind == ast_stmt.STMT_KIND_ASM) { ret bind_asm(rc, sid, s.data.asm_.head, s.data.asm_.body); }
     if (s.kind == ast_stmt.STMT_KIND_COMPTIME_IF) {
         ret bind_comptime_if(rc, s.data.comptime_if.branches_start, s.data.comptime_if.branches_len, s.span, false);
     }
@@ -3408,6 +3488,11 @@ fun bind_ident(rc: *ResolveContext, eid: ast_id.ExprId, span: base_source.Span, 
     }
     or {
         if (rc.expr_resolved != nil) { rc.expr_resolved[ast_id.expr_index(eid)] = sid; }
+        val sym: *Symbol = ?rc.symbols[symbol_index(sid)];
+        if (symbol_is_comptime_local(sym)) {
+            rc.local_reads = rc.local_reads + 1;
+            if (sym.kind == SYM_PARAM) { rc.param_reads = rc.param_reads + 1; }
+        }
     }
     ret err[fail.Fail].ok{};
 }
@@ -3774,7 +3859,21 @@ fun path_tail_symbol(rc: *ResolveContext, path: base_source.Span, segments: u32)
     ret current_sym;
 }
 
+# binds the type node `tid` and notes whether it reads a comptime local
 fun bind_type(rc: *ResolveContext, tid: ast_id.TypeId) err[fail.Fail] {
+    val locals:     u32            = rc.local_reads;
+    val params:     u32            = rc.param_reads;
+    val err_parsed: err[fail.Fail] = bind_type_node(rc, tid);
+    if (rc.local_reads == locals || ast_id.type_is_nil(tid) || rc.type_frames == nil) { ret err_parsed; }
+    if (rc.in_signature)                                                              { rc.type_frames[ast_id.type_index(tid)] = TYPE_FRAME_REFUSED; }
+    or {
+        rc.type_frames[ast_id.type_index(tid)] = TYPE_FRAME_BODY;
+        if (rc.param_reads != params) { rc.value_sized = true; }
+    }
+    ret err_parsed;
+}
+
+fun bind_type_node(rc: *ResolveContext, tid: ast_id.TypeId) err[fail.Fail] {
     if (ast_id.type_is_nil(tid)) { ret err[fail.Fail].ok{}; }
     val opt_type: opt[*ast_type.Type] = ast.get_type(rc.a, tid);
     if (!sel opt_type.some) { ret err[fail.Fail].err{fail.message("TypeId out of range")}; }
@@ -3833,8 +3932,14 @@ fun bind_type(rc: *ResolveContext, tid: ast_id.TypeId) err[fail.Fail] {
     }
     if (t.kind == ast_type.TYPE_KIND_ARRAY) {
         if (!ast_id.expr_is_nil(t.data.array.length)) {
+            val params:        u32            = rc.param_reads;
             val err_bind_expr: err[fail.Fail] = bind_expr(rc, t.data.array.length);
             if (sel err_bind_expr.err) { ret err_bind_expr; }
+            if (rc.in_signature && rc.param_reads != params) {
+                val err_refused: err[fail.Fail] = report(rc, diagnostic_kind.ARRAY_LENGTH_NOT_CONST, t.span,
+                    "a comptime parameter sizes a type only in the body of its function, never in a parameter or return type");
+                if (sel err_refused.err) { ret err_refused; }
+            }
         }
         ret bind_type(rc, t.data.array.element);
     }
@@ -4083,10 +4188,12 @@ fun build_result(rc: *ResolveContext) res[ResolveResult, fail.Fail] {
     out.expr_choices       = rc.expr_choices;
     out.expr_choices_count = rc.expr_choices_count;
     out.type_heads         = rc.type_heads;
+    out.type_frames        = rc.type_frames;
     out.asm_binds          = rc.asm_binds;
     rc.asm_binds           = collections_vector.init[AsmBind](rc.s.alloc);
     out.refusal            = rc.refusal;
     rc.refusal             = refusal.init(rc.s.alloc);
+    out.syntax_clean       = rc.syntax_clean;
     out.constants          = comptime_scope.publish(rc.ctx);
 
     rc.expr_resolved      = nil;
@@ -4095,6 +4202,7 @@ fun build_result(rc: *ResolveContext) res[ResolveResult, fail.Fail] {
     rc.expr_choices       = nil;
     rc.expr_choices_count = 0;
     rc.type_heads         = nil;
+    rc.type_frames        = nil;
 
     handed = true;
     ret res[ResolveResult, fail.Fail].ok{out};
@@ -4120,7 +4228,7 @@ fun public_constants_copy(rc: *ResolveContext, symbols: *Symbol, count: u32,
         if (symbol.kind == SYM_VAL && (symbol.flags & SYM_FLAG_MODULE) != 0) {
             var item: ExportConstant = ExportConstant{};
             item.name = symbol.name;
-            val opt_named: opt[comptime_scope.NamedConst] = comptime_scope.lookup(rc.ctx, symbol.name);
+            val opt_named: opt[comptime_scope.NamedConst] = comptime_scope.lookup_constant(rc.ctx, symbol.name);
             # a constant element points into this module's syntax tree and cannot cross a module boundary
             if (sel opt_named.some) {
                 if (opt_named.some.value.kind != comptime_value.CT_KIND_CONST_ELEM) {

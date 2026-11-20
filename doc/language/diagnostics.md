@@ -52,6 +52,18 @@ modules`, not `loader: the entry point ...`. A
 format, a target or a flag is named where it is the subject, as in `COFF
 object too small`.
 
+A type in a message is spelled by its parts, with every alias expanded, since an
+alias is never a type of its own (see [def.md](def.md)). The one exception is
+the expected type of `type.mismatch` when an annotation wrote it: the type of a
+`val` or `var`, a function's return type, a parameter of the function a call
+names, or a field of the record or union a literal names. That type is spelled
+as the annotation writes it, and the type it names follows once in parentheses
+where the two spellings differ. The found type is always spelled by its parts:
+
+```
+error[type.mismatch] expected res[Vector[str], fs.FsError] (that is res[Vector[*u8], FsError]), found res[Vector[Listed], FsError]
+```
+
 ## The registry
 
 The keys are rows of one table in the compiler,

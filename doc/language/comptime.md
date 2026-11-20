@@ -123,7 +123,13 @@ in parentheses:
 
 A binding marked `$`, a comptime value parameter or an `$each` loop variable,
 *is* a comptime binding, and shadows an outer name of its own spelling in the
-same way. Inside the `$each` below the name `N` is the element, not the 9:
+same way. It holds a value only where its instance or iteration binds one, so a
+comptime parameter sizes a type in each instance of its function's body (see
+[fun.md](fun.md)), and a module constant read inside that body, or by another
+constant's initializer, still reads the constant, whatever binding shares its
+spelling. An `$each` loop variable over a constant array sizes a type in each
+iteration the same way. Inside the `$each` below the name `N` is the element,
+not the 9:
 
 ```mach
 use std.print;

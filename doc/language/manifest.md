@@ -115,7 +115,8 @@ abi = "sysv64"
 # runner = ["wine", "{artifact.out}"]  # optional: the command run and test launch through
 
 [profile.debug]                        # a build variant; every manifest declares at least one
-optimize = false                       # run the optimization pass set
+optimize = false                       # run the optimization passes
+# passes = { licm = true }             # optional: optimization passes turned on or off one by one
 debug = true                           # emit debug info for this profile
 simd  = "scalarize"                    # SIMD lever: "scalarize" or "require"
 # relax = ["float-reassoc"]            # optional: departures from exact semantics
@@ -281,7 +282,7 @@ to whichever *declared* target matches the host.
 | `sys`  | yes      | System. Read by `$project.target.sys`. |
 | `abi` | yes      | Application binary interface. Read by `$project.target.abi`. |
 | `of`  | absent: the system's format | Object-format override; defers to the system's format when omitted. See [Object-format override](#object-format-override). |
-| `base` | absent: the system's base | Load-address override (integer, not negative). Overrides the system's default base virtual address; defers to it when omitted, which mink's catalog states per architecture (on `freestanding`, `0x100000` on `x86_64`, `0x40000000` on `aarch64` and `0x80000000` on `riscv64` and `riscv32`). |
+| `base` | absent: the system's base | Load-address override, an [address](#addresses). Overrides the system's default base virtual address; defers to it when omitted, which mink's catalog states per architecture (on `freestanding`, `0x100000` on `x86_64`, `0x40000000` on `aarch64` and `0x80000000` on `riscv64` and `riscv32`). |
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
 | `stack_reserve` | absent: the format's default (8 MiB on PE), no stack on a freestanding image, and the system's base (64 KiB) on `wasi` | Main stack size in bytes, not negative: the reserve a PE or Mach-O header records, the size of the `.stack` section of a freestanding ELF or flat image, or the size of the stack a wasm module lays out below its data. See [Image stack size](#image-stack-size). |
 | `stack_commit` | absent: the format's default | Main stack commit in bytes, not negative, on PE only. See [Image stack size](#image-stack-size). |
@@ -291,6 +292,18 @@ to whichever *declared* target matches the host.
 | `ext` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the architecture's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
 | `runner` | absent: the host runs its own programs, and no other target's | Array of argv templates the target's programs are launched through by `mach run` and `mach test`, whether or not the target is the host. See [Execution command](#execution-command). |
 | `env` | absent: the system's default | The environment the target's system runs it under (string), such as `macos` on `darwin`, `msvc` on `windows`, `vulkan1.2` on `vulkan` or `preview1` on `wasi`. Any target may state it. The values are the system's, owned by mink's host rows and mirl's target record, and an `env` the system does not list is a manifest error. Absent, the target takes the environment mink's catalog names as the system's default, which `mach info targets` lists first and marks `*`: `macos` on `darwin`, `msvc` on `windows` and `preview1` on `wasi`, and none on a system whose hosts need none, such as `linux`. An architecture that defines its own environments, today only `spirv`, also checks the value against them. See [Finished-module targets](#finished-module-targets). |
+
+### Addresses
+
+A key that holds an address, `base` here and a memory region's `origin`, takes
+an integer that is not negative or a string holding the address. A TOML integer
+stops at `0x7FFFFFFFFFFFFFFF`, so an address above it, as every high-half kernel
+address is, is written as a string: `base = "0xFFFF800000000000"`. The string
+holds a decimal number or one prefixed `0x`, `0o` or `0b`, `_` may separate its
+digits, and it must fit 64 bits. Any other string, and a negative integer, is
+refused as `manifest.invalid_value` naming the key, and a value of another TOML
+type as `manifest.value_type`. `--set base=<value>` reads the value as the
+string form, so a decimal or prefixed address works there whatever its size.
 
 ### Execution command
 
@@ -944,7 +957,8 @@ the version that took it into the core.
 | `#[gpu.push]` | `StoragePushConstant16` | `StoragePushConstant8` |
 | `#[gpu.input(n)]`, `#[gpu.output(n)]` | `StorageInputOutput16` | refused |
 
-A stage output starts at its initializer, and at zero without one. A constant of a
+A stage output starts at its initializer, and at zero without one, in each stage
+that reaches it. A constant of a
 16-bit type needs the type's own feature, `Int16` or `Float16`, so an output holding a
 16-bit scalar without it carries no zero constant: each stage that reaches it stores
 the zero first, converted from a 32-bit one, and the output needs
@@ -1115,7 +1129,7 @@ isa       = "x86-64"
 sys       = "freestanding"
 abi       = "sysv64"
 of        = "flat"               # freestanding's default object format is "elf"
-base      = 0xFFFF800000000000   # BareMetal copies the flat image here and calls it
+base      = "0xFFFF800000000000" # BareMetal copies the flat image here and calls it
 platform  = "bmos"               # selects the mach-bmos backend
 ```
 
@@ -1163,7 +1177,8 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 
 | Key     | Type    | Meaning |
 |---------|---------|---------|
-| `optimize` | bool | Whether the build asks mirl for its release schedule of passes. `false` asks for the debug schedule, which keeps the passes every build needs. The legalization passes, which make the program something the target can execute, run at every setting. A non-boolean is a manifest error. |
+| `optimize` | bool | Whether the build runs mirl's optimization passes. Each pass the `passes` table does not name follows it. The legalization passes, which make the program something the target can execute, run at every setting. A non-boolean is a manifest error. |
+| `passes` | table of booleans | **Optional.** The optimization passes turned on or off one by one over `optimize`, one key per pass, named as mirl's pass record names it. See [Passes](#passes). Absent, every pass follows `optimize`. |
 | `relax` | array of strings | **Optional.** The departures from exact semantics the build permits. The one there is, `"float-reassoc"`, is described under [Float reassociation](#float-reassociation). Absent, the build keeps exact semantics. |
 | `linker_relax` | bool | **Optional.** Whether the linker may relax the code, as RISC-V linker relaxation shortens a call or an address pair once the link has placed its target. The build hands it to mirl's `relax` build option on every target, and a target whose linker relaxes nothing takes it without effect. `false` keeps every instruction sequence at the length the compiler laid it out. Absent, it is `true`. It has no command-line form. A non-boolean is a manifest error. |
 | `debug` | bool    | Emit debug info for this profile: DWARF in ELF, Mach-O and COFF objects alike, and the SPIR-V debug instructions its `env` holds on a `spirv` target (see [Finished-module targets](#finished-module-targets)). A PE image carries its DWARF in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
@@ -1171,8 +1186,8 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 | `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile requirement and selection](#profile-requirement-and-selection). |
 | `allow` | array of strings | **Optional.** The warnings this profile silences, each entry a key or a family of keys from the [warning key table](#silencing-warnings), named once. An unknown key, an entry that covers only errors, a repeated entry or a non-string entry is a manifest error. Absent, nothing is silenced. |
 | `opt` | removed | Refused as a removed key: write `optimize = true` or `optimize = false`. |
-| `pass`, `skip` | removed | Refused as removed keys: mirl schedules its passes by optimization level, which `optimize` sets. |
-| `vectorize` | removed | Refused as a removed key: mirl schedules its passes by optimization level, which `optimize` sets. |
+| `pass`, `skip` | removed | Refused as removed keys: `optimize` and the `passes` table set the passes a build runs. |
+| `vectorize` | removed | Refused as a removed key: `optimize` turns vectorization on. |
 | `float_reassoc` | removed | Refused as a removed key: reassociation is permitted with `relax = ["float-reassoc"]`. |
 
 Three keys (`optimize`, `debug`, `simd`) are required in every profile; the
@@ -1192,7 +1207,7 @@ mechanical one: `opt = 0` is `optimize = false`, `opt = 1` and `opt = 2` are
 `vectorize = false` is an opt-out no profile key states and is removed too, with
 `#[vectorize("never")]` still opting one function out, `float_reassoc = false` is
 removed and `float_reassoc = true` is `relax = ["float-reassoc"]`. `pass` and
-`skip` have no rewrite, since no key says which passes run:
+`skip` have no rewrite, since they listed passes by the previous major's names:
 
 ```
 error[manifest.removed_key] mach.toml: [profile.release].opt is not allowed. write `optimize = true` or `optimize = false`
@@ -1203,11 +1218,37 @@ error[manifest.removed_key] mach.toml: [profile.release].opt is not allowed. wri
 
 ### Passes
 
-mirl schedules the middle end's passes by optimization level, and `optimize`
-sets the level for a whole build: `true` asks for the release schedule and
-`false` for the debug one. No key adds or leaves out a single pass. For a single
-function, the `#[vectorize("never")]` decorator is the finer-grained opt-out
-(see [decorators.md](decorators.md)).
+A build either optimizes or does not, which `optimize` states, and the
+`passes` table turns optimization passes on or off one by one over it. Each key
+is one optimization pass, named as mirl's pass record names it, and its value
+says whether the pass runs. A pass the table does not name runs exactly when
+`optimize` is `true`. The legalization passes are not optimizations and run in
+every build, so no key names one.
+
+```toml
+[profile.release]
+optimize = true
+debug    = false
+simd     = "scalarize"
+
+[profile.release.passes]
+licm = false                           # every other pass runs, loop invariant motion does not
+```
+
+The optimization passes are `promote`, `reassociate`, `fold`, `algebraic`,
+`cse`, `licm` and `dce`. A key that names none of them is refused where it is
+written, with the list, whichever profile the build selects:
+
+```
+error[manifest.invalid_value] mach.toml: [profile.release].passes names "inline", which is no optimization pass. the optimization passes are promote, reassociate, fold, algebraic, cse, licm, dce
+```
+
+A non-boolean value is a manifest error. `--set passes.<name>=<bool>` writes
+one key of the table for one invocation (see
+[Overriding a key for one build](#overriding-a-key-for-one-build)), and `-O`
+and `--no-optimize` set `optimize` alone, so a pass the table names keeps its
+value under either. For a single function, the `#[vectorize("never")]`
+decorator is the finer-grained opt-out (see [decorators.md](decorators.md)).
 
 ### Profile requirement and selection
 
@@ -1454,22 +1495,25 @@ key spelled as this manifest spells it. It writes the value over every table of
 the key's section for one invocation, a later `--set` of the same key winning.
 `--set` writes `platform`, `base`, `stack_reserve` and `stack_commit` over every
 target, the `native` one included, `subsystem` over every artifact, and the
-profile keys `optimize`, `debug`, `simd`, `relax`, `linker_relax` and `allow`
-over every profile, so the profile the build selects holds the value whichever
+profile keys `optimize`, `passes`, `debug`, `simd`, `relax`, `linker_relax` and
+`allow` over every profile, so the profile the build selects holds the value whichever
 it is. A single-file build's one profile takes them as well, so
 `mach build main.mach --set simd=require` builds that file under
-`simd = "require"`. `default` is not written: it picks the profile, and every
+`simd = "require"`. `--set passes.<name>=<bool>` writes one key of the `passes`
+table, over the keys the table writes already, and `--set passes={...}` writes
+several. `default` is not written: it picks the profile, and every
 profile would claim it.
 
-The value is read as the key is read here: a string-shaped key takes the value
-as written, and any other reads it as a TOML value, so `--set base=0x400000`
-is an integer. It is then checked by the same rules and refused with the same
+The value is read as the key is read here: a string-shaped key and an
+[address](#addresses) take the value as written, and any other reads it as a TOML
+value, so `--set optimize=true` is a boolean and `--set base=0xFFFF800000000000`
+is an address. It is then checked by the same rules and refused with the same
 reasons as the key in `mach.toml`. A key no table holds is refused naming it,
 and so is a key `--set` does not write:
 
 ```
-error[cli.flag_value] --set does not apply to 'default'. it sets platform, base, stack_reserve, stack_commit, subsystem, optimize, debug, simd, relax, linker_relax, allow
-error[manifest.value_type] --set base must be an integer
+error[cli.flag_value] --set does not apply to 'default'. it sets platform, base, stack_reserve, stack_commit, subsystem, optimize, debug, simd, passes, relax, linker_relax, allow
+error[manifest.value_type] --set stack_reserve must be an integer
 ```
 
 A value `--set` wrote carries where it was written, so every later refusal of
@@ -1624,7 +1668,7 @@ the stack the program starts on.
 
 | Key | Required | Meaning |
 |-----|----------|---------|
-| `origin` | yes | The address the region starts at. |
+| `origin` | yes | The address the region starts at, an [address](#addresses). A region that runs past the top of the 64-bit address space is refused. |
 | `length` | yes | The bytes it spans. |
 | `access` | yes | What it allows, the letters `r`, `w` and `x`, each at most once. |
 | `run` | absent: none | The output sections that run in the region. |
@@ -1845,6 +1889,16 @@ target, which is an assumption to state, so a `kernel32` entry with no `sys` is
 refused rather than linked on Linux. A non-canonical spelling is a manifest
 error. An entry applies
 to a cell when all three axes match.
+
+A `local` entry's `path` is anchored once, where the entry is read, at the
+project that declares it. A path naming `{project.work}` or `{artifact.<id>.out}`
+lies under the root project's directory, as those variables always do, and any
+other path lies under the directory of the project whose manifest states the
+entry. So a dependency that exports `path = "prebuilt/one.o"` names its own
+`prebuilt/one.o`, and one that exports `{project.work}/vendor/thing.o` names the
+file its step writes into the consumer's output tree. Neither depends on the
+directory the build was started from: `mach build app` from a parent directory
+reads the same files as `mach build .` inside `app`.
 
 A `local` entry's `path` must, at build time, either match a `[step.X]`'s `out`
 (which demands that step) or already exist on disk — anything else is an up-front

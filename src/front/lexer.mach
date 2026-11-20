@@ -4,6 +4,10 @@
 # line-adjacent `#` comments that each start their own line fold into one run, and the
 # parser asks for the run directly above a declaration (`doc_run_above`) and the run
 # opening the file (`leading_run`)
+#
+# `asm` where a statement begins, followed on its line by a word, opens an inline-asm block:
+# its head runs to the `{` on that line, and its body, the instruction set's text, is one
+# token whose end the dialect of the set the head names finds (`mach.front.asm`)
 use mach.base.fail;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -13,6 +17,8 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_region_equals;
 
 use A: std.allocator;
 
@@ -20,8 +26,12 @@ use mach.base.diagnostic;
 use diagnostic_kind: mach.base.diagnostic.kind;
 use mach.base.growth;
 use base_source: mach.base.source;
+use front_asm:   mach.front.asm;
 use mach.front.lexis;
 use mach.front.token;
+
+use masc_source: masc.core.source;
+use masc_isa:    masc.isa;
 
 def LexErrorCode: u8;
 
@@ -30,6 +40,9 @@ val LEX_ERR_UNTERMINATED_STR:  LexErrorCode = 2;
 val LEX_ERR_UNTERMINATED_CHAR: LexErrorCode = 3;
 val LEX_ERR_CONTROL_CHAR:      LexErrorCode = 4;
 val LEX_ERR_NON_ASCII:         LexErrorCode = 5;
+val LEX_ERR_ASM_UNREAD:        LexErrorCode = 6;
+val LEX_ERR_ASM_AMBIGUOUS:     LexErrorCode = 7;
+val LEX_ERR_ASM_UNTERMINATED:  LexErrorCode = 8;
 
 rec LexError {
     span: base_source.Span;
@@ -98,6 +111,7 @@ pub fun tokenize(source: str, alloc: *A.Allocator, file_id: base_source.FileId) 
 
 fun scan(stream: *TokenStream, alloc: *A.Allocator) err[fail.Fail] {
     val source: str   = stream.source;
+    val length: usize = str_len(source);
     var pos:    usize = 0;
     var line:   usize = 1;
     for (source[pos] != 0) {
@@ -138,8 +152,17 @@ fun scan(stream: *TokenStream, alloc: *A.Allocator) err[fail.Fail] {
             if (sel res_quoted.err) { ret err[fail.Fail].err{res_quoted.err}; }
             tok = res_quoted.ok;
         }
-        or (c >= '0' && c <= '9')    { tok = scan_number(source, pos); }
-        or (lexis.is_ident_start(c)) { tok = scan_ident(source, pos); }
+        or (c >= '0' && c <= '9') { tok = scan_number(source, pos); }
+        or (lexis.is_ident_start(c)) {
+            tok = scan_ident(source, pos);
+            if (asm_opens(stream, tok)) {
+                val res_past: res[usize, fail.Fail] = scan_asm(stream, alloc, tok, length);
+                if (sel res_past.err) { ret err[fail.Fail].err{res_past.err}; }
+                line = line + newlines(source, pos, res_past.ok);
+                pos  = res_past.ok;
+                cnt;
+            }
+        }
         or {
             val opt_spelled: opt[token.Token] = token.spelling_at(source, pos);
             if (sel opt_spelled.some) { tok = opt_spelled.some; }
@@ -158,6 +181,87 @@ fun scan(stream: *TokenStream, alloc: *A.Allocator) err[fail.Fail] {
         if (sel err_pushed.err) { ret err_pushed; }
     }
     ret token_add(stream, alloc, token.make(token.KIND_EOF, pos, 0));
+}
+
+# whether `tok` is an `asm` that opens a block: where a statement begins, after nothing or a
+# `;`, `{` or `}`, and with a word after it on its line
+fun asm_opens(stream: *TokenStream, tok: token.Token) bool {
+    val source: str = stream.source;
+    if (!str_region_equals(source, tok.span.offset, tok.span.len, lexis.KW_ASM)) { ret false; }
+    if (stream.len > 0) {
+        val before: token.Kind = stream.tokens[stream.len - 1].kind;
+        if (before != token.KIND_SEMI && before != token.KIND_LBRACE && before != token.KIND_RBRACE) { ret false; }
+    }
+    var at: usize = tok.span.offset + tok.span.len;
+    if (source[at] != ' ' && source[at] != '\t') { ret false; }
+    for (source[at] == ' ' || source[at] == '\t') { at = at + 1; }
+    ret lexis.is_ident_char(source[at]);
+}
+
+# the tokens of the asm block `word` opens, and the offset past them: `asm`, its head, and
+# when a `{` ends the head on its line, that brace, the body and the `}` that closes it. a
+# body its dialect never closes runs to the end of the text
+fun scan_asm(stream: *TokenStream, alloc: *A.Allocator, word: token.Token, length: usize) res[usize, fail.Fail] {
+    val source:   str            = stream.source;
+    val err_word: err[fail.Fail] = token_add(stream, alloc, word);
+    if (sel err_word.err) { ret res[usize, fail.Fail].err{err_word.err}; }
+    var start: usize = word.span.offset + word.span.len;
+    for (source[start] == ' ' || source[start] == '\t') { start = start + 1; }
+    var stop: usize = start;
+    for (source[stop] != 0 && source[stop] != '{' && source[stop] != ';' && newline_len(source, stop) == 0) { stop = stop + 1; }
+    var end: usize = stop;
+    for (end > start && (source[end - 1] == ' ' || source[end - 1] == '\t')) { end = end - 1; }
+    val head:     base_source.Span = base_source.span(start, end - start);
+    val err_head: err[fail.Fail]   = token_add(stream, alloc, token.make(token.KIND_ASM_HEAD, start, end - start));
+    if (sel err_head.err)    { ret res[usize, fail.Fail].err{err_head.err}; }
+    if (source[stop] != '{') { ret res[usize, fail.Fail].ok{end}; }
+    val err_brace: err[fail.Fail] = token_add(stream, alloc, token.make(token.KIND_LBRACE, stop, 1));
+    if (sel err_brace.err) { ret res[usize, fail.Fail].err{err_brace.err}; }
+
+    val body:        usize                         = stop + 1;
+    val res_dialect: res[masc_isa.Reader, A.Error] = front_asm.dialect(alloc, source, head);
+    if (sel res_dialect.err) { ret res[usize, fail.Fail].err{fail.refused(res_dialect.err)}; }
+    val reader: masc_isa.Reader = res_dialect.ok;
+    if (sel reader.many) { ret asm_unread(stream, alloc, head, body, length, LEX_ERR_ASM_AMBIGUOUS); }
+    if (!sel reader.one) { ret asm_unread(stream, alloc, head, body, length, LEX_ERR_ASM_UNREAD); }
+    val opt_close: opt[usize] = masc_source.closing(?reader.one.source, ?source[body], length - body);
+    if (sel opt_close.none) {
+        val err_open: err[fail.Fail] = error_add(stream, alloc, word.span.offset, word.span.len, LEX_ERR_ASM_UNTERMINATED);
+        if (sel err_open.err) { ret res[usize, fail.Fail].err{err_open.err}; }
+        val err_rest: err[fail.Fail] = token_add(stream, alloc, token.make(token.KIND_ASM_BODY, body, length - body));
+        if (sel err_rest.err) { ret res[usize, fail.Fail].err{err_rest.err}; }
+        ret res[usize, fail.Fail].ok{length};
+    }
+    ret asm_closed(stream, alloc, body, body + opt_close.some);
+}
+
+# the body from `body` to its `}` at `close`, and the offset past that brace
+fun asm_closed(stream: *TokenStream, alloc: *A.Allocator, body: usize, close: usize) res[usize, fail.Fail] {
+    val err_body: err[fail.Fail] = token_add(stream, alloc, token.make(token.KIND_ASM_BODY, body, close - body));
+    if (sel err_body.err) { ret res[usize, fail.Fail].err{err_body.err}; }
+    val err_close: err[fail.Fail] = token_add(stream, alloc, token.make(token.KIND_RBRACE, close, 1));
+    if (sel err_close.err) { ret res[usize, fail.Fail].err{err_close.err}; }
+    ret res[usize, fail.Fail].ok{close + 1};
+}
+
+# a body no dialect reads, refused with `code` at the head. the file is refused, so the body
+# is taken to its first brace-balanced `}` only for the diagnostics of the text after it
+fun asm_unread(stream: *TokenStream, alloc: *A.Allocator, head: base_source.Span, body: usize, length: usize, code: LexErrorCode) res[usize, fail.Fail] {
+    val err_refused: err[fail.Fail] = error_add(stream, alloc, head.offset, head.len, code);
+    if (sel err_refused.err) { ret res[usize, fail.Fail].err{err_refused.err}; }
+    var depth: usize = 1;
+    var at:    usize = body;
+    for (at < length) {
+        if (stream.source[at] == '{') { depth = depth + 1; }
+        or (stream.source[at] == '}') {
+            depth = depth - 1;
+            if (depth == 0) { ret asm_closed(stream, alloc, body, at); }
+        }
+        at = at + 1;
+    }
+    val err_body: err[fail.Fail] = token_add(stream, alloc, token.make(token.KIND_ASM_BODY, body, length - body));
+    if (sel err_body.err) { ret res[usize, fail.Fail].err{err_body.err}; }
+    ret res[usize, fail.Fail].ok{length};
 }
 
 # the offset of the newline that ends the line holding `pos`, or of the text's end
@@ -429,6 +533,9 @@ fun error_message(code: LexErrorCode) opt[str] {
     if (code == LEX_ERR_CONTROL_CHAR)      { ret opt[str].some{"control characters are not allowed in source. only printable ASCII and whitespace are allowed"}; }
     if (code == LEX_ERR_NON_ASCII)         { ret opt[str].some{"this character is not allowed. source text must be ASCII"}; }
     if (code == LEX_ERR_UNEXPECTED_CHAR)   { ret opt[str].some{"this character begins no token"}; }
+    if (code == LEX_ERR_ASM_UNREAD)        { ret opt[str].some{"no instruction set of masc's reads this head as a selection, so the body's text cannot be read"}; }
+    if (code == LEX_ERR_ASM_AMBIGUOUS)     { ret opt[str].some{"more than one instruction set of masc's reads this head as a selection, so the body's text cannot be read"}; }
+    if (code == LEX_ERR_ASM_UNTERMINATED)  { ret opt[str].some{"unterminated asm body"}; }
     ret opt[str].none{};
 }
 
@@ -439,12 +546,31 @@ fun error_kind(code: LexErrorCode) diagnostic_kind.Kind {
     if (code == LEX_ERR_CONTROL_CHAR)      { ret diagnostic_kind.SOURCE_CONTROL_CHAR; }
     if (code == LEX_ERR_NON_ASCII)         { ret diagnostic_kind.SOURCE_UNEXPECTED_CHAR; }
     if (code == LEX_ERR_UNEXPECTED_CHAR)   { ret diagnostic_kind.SOURCE_UNEXPECTED_CHAR; }
+    if (code == LEX_ERR_ASM_UNREAD)        { ret diagnostic_kind.ASM_HEAD; }
+    if (code == LEX_ERR_ASM_AMBIGUOUS)     { ret diagnostic_kind.ASM_HEAD; }
+    if (code == LEX_ERR_ASM_UNTERMINATED)  { ret diagnostic_kind.ASM_UNTERMINATED; }
     ret diagnostic_kind.NONE;
 }
 
 fun newline_len(source: str, pos: usize) usize {
     if (source[pos] == 0) { ret 0; }
     ret base_source.line_break_len(source[pos], source[pos + 1]);
+}
+
+# the line breaks from `start` to `end`
+fun newlines(source: str, start: usize, end: usize) usize {
+    var n: usize = 0;
+    var i: usize = start;
+    for (i < end) {
+        val nl: usize = newline_len(source, i);
+        if (nl > 0) {
+            n = n + 1;
+            i = i + nl;
+            cnt;
+        }
+        i = i + 1;
+    }
+    ret n;
 }
 
 # the line breaks between `start` and `end`, counted no further than 2

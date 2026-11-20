@@ -734,11 +734,13 @@ generic instance included.
 
 A constant-time function may pass a secret only to a callee that
 
-- it names directly, since a function type states no mode: a secret passed
-  through a function value is refused, whatever the value points at. A call
-  through a function value that passes no secret and reaches none takes its
-  result as the function type declares it, as a direct call takes its callee's
-  declaration;
+- it names directly, or reaches through a value of a function type marked
+  constant time ([Function types marked
+  constant time](#function-types-marked-constant-time)). A plain function type
+  states no mode, so a secret passed through a value of one is refused,
+  whatever the value points at. A call through a function value that passes no
+  secret and reaches none takes its result as the function type declares it,
+  as a direct call takes its callee's declaration;
 - is declared `#[constant_time("soft")]` or `#[constant_time("hard")]`, a generic
   included, whose instances take its mode. An unmarked function is refused
   whether it is generic or not, in the same module or another: mark it;
@@ -755,7 +757,8 @@ A constant-time function may pass a secret only to a callee that
 secret anywhere it reaches, as `*^u8` or a record with a `^` field, as
 `$holds_secret` answers, counts, and the refusal is `secret.call_untrusted`,
 naming the type. masc's walk checks the same at the machine level from the
-callee's declaration and the calling convention: a secret in a register or
+callee's declaration, or the one a marked function type states, and the calling
+convention: a secret in a register or
 stack slot the callee's declaration says is public is refused, and so is any
 secret a call to a callee it does not trust could reach, in a register, an
 argument on the stack or memory the callee could reach through a pointer,
@@ -803,6 +806,79 @@ image therefore runs the code the walk read. A `#[weak]` default is never
 trusted, since another definition of its name may replace it.
 
 The zeroizing-write guarantee is separate and broader; it is described below.
+
+### Function types marked constant time
+
+A function type carries a constant-time mode, none, soft or hard, as part of
+its identity, beside the C-variadic `...`. The only spelling of a mode is an
+alias marked with the decorator, which names the marked type instead of the
+type written after it ([def.md](def.md#a-marked-alias-of-a-function-type)):
+
+```mach
+#[constant_time("soft")]
+def Seal: fun(*^u8, u64) ^u64;
+
+rec Cipher { id: u64; seal: Seal; }
+
+#[constant_time("soft")]
+fun sum(data: *^u8, n: u64) ^u64 {
+    var acc: ^u64 = 0;
+    var i:   u64  = 0;
+    for (i < n) {
+        acc = acc + data[i]::^u64;
+        i   = i + 1;
+    }
+    ret acc;
+}
+
+#[constant_time("soft")]
+fun seal_with(table: *[2]Cipher, which: u64, data: *^u8, n: u64) ^u64 {
+    ret table[which].seal(data, n); # trusted as a direct call of a soft function
+}
+```
+
+- **Where marked values come from.** The value of a function declared
+  `#[constant_time(mode)]` that is not `#[weak]` has its signature marked with
+  that mode, a generic's instances included. A `#[weak]` default, which
+  another definition may replace, an `ext` function and an unmarked one have
+  the plain type. So a value of `Seal` holds only a function declared soft or
+  hard with that signature, which is a rule of assignment, not of the call.
+- **Hard against soft.** A soft type holds soft and hard functions, a hard type
+  only hard ones. A call through a marked type is judged as a direct call of a
+  function in that mode: a soft caller relies on either, and a hard caller on a
+  hard type, or on a soft one only where the build guarantees every timing mode
+  a soft function's code may be held under, as [Soft and hard](#soft-and-hard)
+  states. Elsewhere it is `secret.call_untrusted`.
+- **Conversion.** A value converts with no cast from a stronger mode to a
+  weaker one: hard to soft, and any marked type to the plain one, which only
+  forgets a promise. Nothing converts the other way. Assigning an unmarked or
+  `#[weak]` function to `Seal`, or a soft one to a hard type, is refused as
+  `type.mismatch` with a note naming what the type holds. A value cast, `::` or
+  `:~`, to a marked function type or an array of them stands only where the
+  value converts with no cast, so no cast gives a type a mode (`cast.invalid`).
+  `nil` converts to a marked type, and a call through it faults. A pointer keeps
+  its target exact, so `*Seal` is not `*fun(*^u8, u64) ^u64`. A pointer cast to
+  `*Seal`, a union with a `Seal` member or a by-value cast of a record holding
+  one retypes storage, which the cast rule does not follow: like reading bytes
+  nothing wrote, it is the program's own statement.
+- **Fields, parameters, results and generics.** A marked type is an ordinary
+  type in each of them, and a type argument (`Vector[Seal]`, `Box[Seal]`). Its
+  instances are named apart from those of the plain type. A generic body is
+  checked per instance, so a call through a value whose type is a parameter
+  bound to `Seal` is trusted in that instance and refused in one bound to a
+  plain function type.
+- **ABI.** None. A marked function type is passed, returned and called as the
+  plain one in every convention, and an `ext` declaration may take or return
+  one. The mode is a fact of the type alone.
+- **The walk.** The front end states, for each call through a marked type, the
+  declaration its callee keeps: the type's mode, and the secret parameters,
+  secret result and public pointers a function of that signature declares. mirl
+  keeps it as a declaration no symbol names, and the call's model in masc's walk
+  is made from it exactly as from the declaration of a function a call names, so
+  the call trusts its callee under the same rule. The callee's own build walked
+  its body against its own declaration, which has the same signature, so the
+  declaration the call states is the callee's. The address the call jumps to is
+  a value of the caller's like any other, and a secret one is refused.
 
 ### Declassification
 
@@ -992,7 +1068,10 @@ The declared rows, one line per multiply:
 | `riscv64` | `high_u` | 64 | `m` and `zkt` selected |
 | `riscv64` | `high_s` | 64 | `m` and `zkt` selected |
 | `riscv64` | `high_su` | 64 | `m` and `zkt` selected |
-| `riscv32` | none | | |
+| `riscv32` | `low` | 8, 16, 32 | `m` and `zkt` selected |
+| `riscv32` | `high_u` | 32 | `m` and `zkt` selected |
+| `riscv32` | `high_s` | 32 | `m` and `zkt` selected |
+| `riscv32` | `high_su` | 32 | `m` and `zkt` selected |
 | `spirv` | none | | |
 
 The table describes masc's rows, and masc's registration of each instruction
@@ -1003,21 +1082,38 @@ selection emits in the same way: on x86-64 it is `pmuludq` with shuffles, each
 on Intel's list, and a target with no vector unit runs it as one scalar
 multiply per lane.
 
-**Realized cells.** A cell no instruction executes directly is admitted exactly
-when every cell of its realization is, under the union of their conditions. On
-x86-64 the one-operand `mul` and `imul` write the full product to a register
+**Realized cells.** A multiply is classified as the build computes it, after
+mirl's legalisations, which is what both the constant-time check of a
+function's selected code and `$mach.build.ct_mul` read. A cell is admitted
+exactly when every multiply of its realization is, under the union of their
+conditions:
+
+- a product at a width the target's multiply does not run at is widened to the
+  narrowest one above it, so an 8- or 16-bit `low` cell on x86-64 and riscv64
+  is the 32-bit multiply, and a narrow high half is that multiply of the
+  operands extended, shifted down;
+- a high half the target has no form for, at a width it multiplies at, is four
+  low products of the operands' half-width pieces at that width, so x86-64's
+  `high_su` at 32 and 64 bits and riscv64's high halves at 32 bits are low
+  cells;
+- a multiply wider than the widest arithmetic is split into words, its low and
+  unsigned high products of words, so a 128-bit cell on a 64-bit target is the
+  64-bit `low` and `high_u` cells, and a 64-bit cell on riscv32 the 32-bit
+  ones;
+- a width the target has no multiply for at all calls a helper, which no cell
+  covers, so the cell is 0.
+
+On x86-64 the one-operand `mul` and `imul` write the full product to a register
 pair, so the high halves and the widening products are the same instruction;
 on aarch64 and riscv64 the full product is the low multiply beside the high
 one (`mul` + `umulh`/`smulh`, `mul` + `mulhu`/`mulh`), so the 64-bit `wide_u`
-and `wide_s` are admitted there through the 64-bit `low` and high rows. A
-**128-bit** multiply is never declared by a target, because no target executes
-one: `(a::^u128) * (b::^u128)` with 64-bit `a` and `b` is the 64-bit widening
+and `wide_s` are admitted there through the 64-bit `low` and high rows.
+`(a::^u128) * (b::^u128)` with 64-bit `a` and `b` is the 64-bit widening
 product, one instruction, and its high half `(... >> 64)::^u64` is that same
-instruction; a secret `^u128 * ^u128` low product is the schoolbook over the
-lanes, three 64-bit low products and the widening one. `$mach.build.ct_mul(wide_u,
-64)` answers for the 64-bit low and high halves together, so on aarch64 it needs
-DIT like the 64-bit high half, and a 128-bit cell answers as mirl's selection
-covers a multiply of that width.
+instruction. A secret `^u128 * ^u128` low product is the schoolbook over the
+words, three 64-bit low products and the widening one.
+`$mach.build.ct_mul(wide_u, 64)` answers for the 64-bit low and high halves
+together, so on aarch64 it needs DIT like the 64-bit high half.
 
 **Why each row holds.** Every row cites its source beside the declaration in the
 instruction set's registration, and the kind of each claim is marked:

@@ -175,16 +175,20 @@ FAIL  app.main#fails_on_purpose           1ms  (exit 3)  src/main.mach:11
     rerun: ./out/linux-x86_64/debug/test/app/app 4
 ```
 
+Every time the test readout prints is wall time. A `-v` line's time is the
+test's, from its launch to its exit. A roll-up's time is the module's wall span,
+from the launch of its first test to the exit of its last, so tests that ran at
+once count once and a roll-up never shows more time than the run. The summary's
+time in parentheses is the whole run's wall time, which the `run_end` record's
+`duration_ns` also holds.
+
 Lines and roll-ups therefore come out in the order the tests finish, which can
 differ from run to run. The closing summary does not: it re-lists every failure
 in collection order, the order `--list` prints, and ends with the counts. A
 skipped test is neither a pass nor a failure: it is never re-listed, and the
 skip count follows the total whenever a test skipped. A test that ran past its
 time bound is a failure, and the failed count is then followed by how many
-timed out, as `2 failed (1 timed out)`. A run in which a test ended in an
-infrastructure outcome, a time-out among them, adds one line under the counts
-that tallies them: `unsupported 0, target unavailable 0, resource exhaustion 1,
-invalid injection 0`.
+timed out, as `2 failed (1 timed out)`.
 
 ```
 failures:

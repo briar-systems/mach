@@ -39,14 +39,14 @@ and `-vv` write the [readout](readout.md) as [readout records](#readout-records)
 ## A record
 
 ```json
-{"schema":2,"record":"diagnostic","severity":"error","code":"name.unresolved","message":"unresolved identifier `helpr`","origin":"resolve","primary":{"file":"src/main.mach","line":5,"column":18,"end_line":5,"end_column":23,"byte_start":107,"byte_end":112},"related":[],"notes":[],"help":["did you mean `helper`?"],"fixes":[{"label":"replace with `helper`","edits":[{"file":"src/main.mach","line":5,"column":18,"end_line":5,"end_column":23,"byte_start":107,"byte_end":112,"replacement":"helper"}]}]}
+{"schema":3,"record":"diagnostic","severity":"error","code":"name.unresolved","message":"unresolved identifier `helpr`","origin":"resolve","primary":{"file":"src/main.mach","line":5,"column":18,"end_line":5,"end_column":23,"byte_start":107,"byte_end":112},"related":[],"notes":[],"help":["did you mean `helper`?"],"fixes":[{"label":"replace with `helper`","edits":[{"file":"src/main.mach","line":5,"column":18,"end_line":5,"end_column":23,"byte_start":107,"byte_end":112,"replacement":"helper"}]}]}
 ```
 
 A type error in a generic instance, whose primary span covers two lines and
 whose related site is in another file:
 
 ```json
-{"schema":2,"record":"diagnostic","severity":"error","code":"operator.operand_mismatch","message":"operands `u8` and `i64` have different types. cast one operand with `::` so both have one type","origin":"sema","primary":{"file":"src/main.mach","line":6,"column":16,"end_line":7,"end_column":11,"byte_start":111,"byte_end":127},"related":[{"file":"src/lib.mach","line":3,"column":9,"end_line":3,"end_column":14,"byte_start":53,"byte_end":58,"label":"in this generic body, checked against this instance's type arguments"}],"notes":[],"help":[],"fixes":[]}
+{"schema":3,"record":"diagnostic","severity":"error","code":"operator.operand_mismatch","message":"operands `u8` and `i64` have different types. cast one operand with `::` so both have one type","origin":"sema","primary":{"file":"src/main.mach","line":6,"column":16,"end_line":7,"end_column":11,"byte_start":111,"byte_end":127},"related":[{"file":"src/lib.mach","line":3,"column":9,"end_line":3,"end_column":14,"byte_start":53,"byte_end":58,"label":"in this generic body, checked against this instance's type arguments"}],"notes":[],"help":[],"fixes":[]}
 ```
 
 | Member | Type | Meaning |
@@ -120,7 +120,7 @@ related places. Its `severity` is `"error"`, its `code` the
 failure's key, and its `notes` and `help` are empty.
 
 ```json
-{"schema":2,"record":"diagnostic","severity":"error","code":"link.input_invalid","message":"the link does not define the entry symbol `_start`","origin":"link","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
+{"schema":3,"record":"diagnostic","severity":"error","code":"link.input_invalid","message":"the link does not define the entry symbol `_start`","origin":"link","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
 ```
 
 `primary` is the span in the file that caused the failure, or `null` when no
@@ -135,7 +135,7 @@ after the headline, as `@ <file>:<line>:<column>` and the snippet, naming the
 file by the path it was read at, as it names a source file.
 
 ```json
-{"schema":2,"record":"diagnostic","severity":"error","code":"version.invalid_range","message":"mach.toml: [project].mach = \"^x\" is not a valid range. expected a number (clause 1)","origin":"build","primary":{"file":"mach.toml","line":2,"column":8,"end_line":2,"end_column":12,"byte_start":17,"byte_end":21},"related":[],"notes":[],"help":[],"fixes":[]}
+{"schema":3,"record":"diagnostic","severity":"error","code":"version.invalid_range","message":"mach.toml: [project].mach = \"^x\" is not a valid range. expected a number (clause 1)","origin":"build","primary":{"file":"mach.toml","line":2,"column":8,"end_line":2,"end_column":12,"byte_start":17,"byte_end":21},"related":[],"notes":[],"help":[],"fixes":[]}
 ```
 
 A refusal raised later from the parsed manifest, while a build is laid out or
@@ -169,7 +169,7 @@ snippet after the primary's. A target or profile named on the command line that 
 not declare is caused by no entry in it, so its refusal has no `primary`.
 
 ```json
-{"schema":2,"record":"diagnostic","severity":"error","code":"need.cycle","message":"mach.toml: step.a -> step.b -> step.a","origin":"build","primary":{"file":"mach.toml","line":12,"column":9,"end_line":12,"end_column":17,"byte_start":141,"byte_end":149},"related":[{"file":"mach.toml","line":18,"column":9,"end_line":18,"end_column":17,"byte_start":216,"byte_end":224,"label":null}],"notes":[],"help":[],"fixes":[]}
+{"schema":3,"record":"diagnostic","severity":"error","code":"need.cycle","message":"mach.toml: step.a -> step.b -> step.a","origin":"build","primary":{"file":"mach.toml","line":12,"column":9,"end_line":12,"end_column":17,"byte_start":141,"byte_end":149},"related":[{"file":"mach.toml","line":18,"column":9,"end_line":18,"end_column":17,"byte_start":216,"byte_end":224,"label":null}],"notes":[],"help":[],"fixes":[]}
 ```
 
 `origin` names the phase the failure came from, by the rule of
@@ -196,7 +196,7 @@ record with `severity` `"note"`, its `code` the note's key, and a `null`
 | `dep.realized` | `mach init`, for each dependency it declared and realized |
 
 ```json
-{"schema":2,"record":"diagnostic","severity":"note","code":"project.created","message":"created project 'app'","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
+{"schema":3,"record":"diagnostic","severity":"note","code":"project.created","message":"created project 'app'","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
 ```
 
 ## Test records
@@ -208,9 +208,9 @@ a `test` record per test in the order the tests finish, and closes with a
 `skip` record, and under `--list` each collected test is a `case` record.
 
 ```json
-{"schema":2,"record":"run_start","tests":14}
-{"schema":2,"record":"test","name":"app.main#parses","module":"app.main","file":"src/main.mach","line":10,"index":4,"target":"linux","profile":"debug","outcome":"exit","code":3,"timeout_ns":0,"duration_ns":1204000,"exe":"out/linux/debug/test/app/app","output":"out/linux/debug/test/app/log/4.log","origin":"test"}
-{"schema":2,"record":"run_end","passed":13,"failed":1,"skipped":0,"total":14,"duration_ns":61000000,"mismatch":1,"unsupported":0,"target_unavailable":0,"infrastructure_failure":0,"resource_exhaustion":0,"timed_out":0,"invalid_injection":0,"origin":"test"}
+{"schema":3,"record":"run_start","tests":14}
+{"schema":3,"record":"test","name":"app.main#parses","module":"app.main","file":"src/main.mach","line":10,"index":4,"target":"linux","profile":"debug","outcome":"exit","code":3,"timeout_ns":0,"duration_ns":1204000,"exe":"out/linux/debug/test/app/app","output":"out/linux/debug/test/app/log/4.log","origin":"test"}
+{"schema":3,"record":"run_end","passed":13,"failed":1,"skipped":0,"total":14,"duration_ns":61000000,"mismatch":1,"infrastructure_failure":0,"resource_exhaustion":0,"timed_out":0,"origin":"test"}
 ```
 
 A `test` or `case` record names its test with these members:
@@ -243,7 +243,10 @@ path the command was given, as a `built` object's `out` is: `mach test .`
 writes `./out/...`, and `mach test app` from the parent writes `app/out/...`.
 A `skip` record carries `target`, `profile` and `reason`. `run_start` carries `tests`,
 the run's count, and `run_end` the run's totals: `passed`, `failed`, `skipped`,
-`total`, `duration_ns`, `timed_out` and the count of each failure class. A test
+`total`, `duration_ns`, `timed_out` and the count of each failure class:
+`mismatch` for a test that exited non-zero or died of a signal,
+`infrastructure_failure` for one the harness could not launch or judge, and
+`resource_exhaustion` for one stopped at its time bound. A test
 that skipped (exit 77, see [test.md](test.md#semantics)) has the outcome
 `"skip"` and counts in `skipped`, neither passed nor failed.
 
@@ -257,10 +260,10 @@ stderr is a record, written when the line would be and in the same order. Times
 are integer microseconds.
 
 ```json
-{"schema":2,"record":"unit","verb":"building","artifact":"app","target":"linux","profile":"debug"}
-{"schema":2,"record":"phase","name":"load","count":48,"unit":"modules","time_us":77012}
-{"schema":2,"record":"phase","name":"codegen","count":48,"unit":"modules","time_us":75012,"slowest":"std.filesystem","slowest_us":9104}
-{"schema":2,"record":"phase","name":"other","time_us":32007}
+{"schema":3,"record":"unit","verb":"building","artifact":"app","target":"linux","profile":"debug"}
+{"schema":3,"record":"phase","name":"load","count":48,"unit":"modules","time_us":77012}
+{"schema":3,"record":"phase","name":"codegen","count":48,"unit":"modules","time_us":75012,"slowest":"std.filesystem","slowest_us":9104}
+{"schema":3,"record":"phase","name":"other","time_us":32007}
 ```
 
 A **unit** record opens each unit, before its rows. It is written for every
@@ -296,7 +299,7 @@ row's output, a build step under `steps`, or a stage of the `cache` row such as
 `module keys`:
 
 ```json
-{"schema":2,"record":"phase_item","phase":"load","name":"std.filesystem","time_us":2013}
+{"schema":3,"record":"phase_item","phase":"load","name":"std.filesystem","time_us":2013}
 ```
 
 | Member | Type | Meaning |
@@ -312,8 +315,8 @@ counter of a unit whose objects all came from the cache, writes no total record,
 while a module's record is written with its value even when that is zero:
 
 ```json
-{"schema":2,"record":"counter","counter":"ir instrs","name":"std.filesystem","value":20811}
-{"schema":2,"record":"counter","counter":"ir instrs","value":412093}
+{"schema":3,"record":"counter","counter":"ir instrs","name":"std.filesystem","value":20811}
+{"schema":3,"record":"counter","counter":"ir instrs","value":412093}
 ```
 
 | Member | Type | Meaning |
@@ -326,7 +329,7 @@ Under `-v` a **growth** record is a growing cycle of instances, written each tim
 instance count doubles:
 
 ```json
-{"schema":2,"record":"growth","module":"app.main","members":"peel","instances":32}
+{"schema":3,"record":"growth","module":"app.main","members":"peel","instances":32}
 ```
 
 | Member | Type | Meaning |
@@ -343,7 +346,7 @@ A unit's `built` line is not a record of its own: it is carried by the
 Every run ends with one summary record, the last line on stderr:
 
 ```json
-{"schema":2,"record":"summary","errors":1,"warnings":0,"notes":0,"outcome":"failure","exit_code":1}
+{"schema":3,"record":"summary","errors":1,"warnings":0,"notes":0,"outcome":"failure","exit_code":1}
 ```
 
 | Member | Type | Meaning |
@@ -363,7 +366,7 @@ ends with the summary record alone (the counts are of the records written
 before it):
 
 ```json
-{"schema":2,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"interrupted","event":"SIGINT","exit_code":130}
+{"schema":3,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"interrupted","event":"SIGINT","exit_code":130}
 ```
 
 The human text ends the same way, with the single line `interrupted by SIGINT`.
@@ -372,13 +375,15 @@ A `built` object has the unit's `out` (string), `modules` (integer), `bytes`
 (integer, present when the line shows a size) and `time_us` (integer).
 
 ```json
-{"schema":2,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"success","exit_code":0,"time_us":358120,"built":[{"out":"out/linux/debug/bin/app","modules":48,"bytes":1048576,"time_us":358120}]}
+{"schema":3,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"success","exit_code":0,"time_us":358120,"built":[{"out":"out/linux/debug/bin/app","modules":48,"bytes":1048576,"time_us":358120}]}
 ```
 
 ## Stability
 
-- Every record carries `"schema": 2`. Schema 2 writes a failure as a
-  diagnostic record, where schema 1 wrote it as a `"failure"` record.
+- Every record carries `"schema": 3`. Schema 3 drops the `run_end` members
+  `unsupported`, `target_unavailable` and `invalid_injection`, which no run ever
+  counted. Schema 2 wrote a failure as a diagnostic record, where schema 1 wrote
+  it as a `"failure"` record.
 - **Compatible changes keep the version:** a new member in a record or a span,
   a new record type, and a new value of an enumerated member (`severity`,
   `origin`, `record`). A tool ignores members it does not know, skips records

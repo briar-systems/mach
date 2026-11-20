@@ -124,6 +124,35 @@ An argument that is not a constant expression, such as a `var` or a call, is
 refused with `decorator.not_constant`, naming the decorator. A constant of the
 wrong type is refused with `decorator.argument`.
 
+A string argument is evaluated when the module loads where it can be, and
+otherwise during type checking. A literal, a string `val` and a `val` an `$if`
+arm selects are known when the module loads. A string only type checking can
+compute, such as `$type_name(T)`, is known only once types are checked, and it
+is accepted wherever nothing reads the decorator's strings before then:
+`section`, `inline`, `vectorize`, `extension`, `intrinsic`, `handle`,
+`abi_type`, `gpu.stage` and `gpu.builtin`.
+
+```mach
+rec Packet { len: u32; }
+
+#[section($type_name(Packet))]
+pub var packets: u32 = 0;
+```
+
+The other string-taking decorators are read before type checking, or by the type
+checking of another module, so each of their strings must be known when the
+module loads: `symbol` and `weak` name what the link sees and `library` the
+import's library, all registered as the module loads, `embed` names a file the
+load reads, `deprecated` carries the notice every importer warns with,
+`expect` names the warnings it acknowledges, `constant_time` gives the mode a
+caller in another module relies on, and `gpu.storage` gives the access
+qualifiers a shader in another module is checked against. Such a string computed
+during type checking is refused with `decorator.not_constant`:
+
+```
+error[decorator.not_constant] the `symbol` decorator's arguments must be known when the module loads, and this one is known only once types are checked
+```
+
 ## The decorator set
 
 ### `deprecated` / `deprecated(str)` — source-use notice
@@ -342,7 +371,8 @@ introduced by a run of `$` whose length is its nesting depth, so a nested
 argument closes without a bracket — `f[Map[Vec[i64], str], u8]` is
 `m.f$m.Map$$m.Vec$$$i64$$str$u8`. `p$u8` is `*u8`, `sec$u32` is `^u32`,
 `arr4$u8` is `[4]u8`, `fn$$i64$$u8` is `fun(u8) i64`, `fnv$$i64$$u8` is the
-C-variadic `fun(u8, ...) i64`, a record is its own dotted
+C-variadic `fun(u8, ...) i64`, `fns$$i64$$u8` and `fnh$$i64$$u8` are `fun(u8) i64`
+marked soft and hard, a record is its own dotted
 origin FQN, a comptime value is its literal, and a variadic-pack instance carries
 a `pack` marker before its element list. A test's symbol is its qualified name,
 `<module path>#<identifier>` (see [test.md](test.md#grammar)). There is no prefix:
@@ -491,7 +521,7 @@ caller's instruction cache, or to hold code size down on a constrained target.
 - `vectorize("never")` already declines inlining as a side effect, so pairing it
   with `inline("never")` is legal but redundant.
 - Purely a hint to the inliner; it does not otherwise change codegen. It binds
-  at every optimization level — the debug pipeline runs no inlining pass at
+  in every build, and a build that does not optimize runs no inlining pass at
   all, so `inline("never")` is inert (and unnecessary) there — and it will bind
   identically when a callee body is available from another module. Recursive
   peeling also respects `inline("never")` and `vectorize("never")`.
@@ -917,6 +947,19 @@ instruction's timing (SPIR-V, whose module a downstream compiler translates),
 and warned at the mark for one that cannot guarantee any instruction's timing
 (wasm, whose runtime decides the instructions that run).
 
+On a `def` of a function type it marks the type with the mode instead, the one
+alias that is not the type it is written as: a value of the alias holds only a
+function declared constant time in that mode or a stronger one, and a
+constant-time function may pass secrets through it. The alias must name a
+function type that is not C-variadic and carries no mode yet, or the mark is
+refused (`decorator.misplaced`). See [def.md](def.md#a-marked-alias-of-a-function-type)
+and [secrecy.md](secrecy.md#function-types-marked-constant-time).
+
+```mach fragment
+#[constant_time("soft")]
+def Seal: fun(^Key, *u8) u64;
+```
+
 v6 spelled it `#[oblivious]`, which is refused naming `constant_time` and its two
 modes (see [v6 spellings](#v6-spellings)).
 
@@ -1207,7 +1250,7 @@ a further rule the decorator's own section states.
 | `volatile` | `rec`, `uni`, `tag` |  |
 | `at` | `val`, `var` | not `ext`, `section` or `thread` |
 | `thread` | `var` | no shader interface role |
-| `constant_time` | `fun` |  |
+| `constant_time` | `fun`, `def` | a function with a body, or an alias of a function type that is not C-variadic and carries no mode |
 | `vectorize` | `fun` |  |
 | `naked` | `fun` |  |
 | `extension` | `fun` | a function with a body |

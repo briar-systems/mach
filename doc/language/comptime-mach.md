@@ -83,17 +83,23 @@ $or {
   - `wide_u`, `wide_s`: the full double-width product.
 - `width` is the operand width in bits, a comptime integer: 8, 16, 32, 64 or 128.
 - A widening cell is the low and the high half at that width, held when both
-  are. A cell holds when every row the selection emits for it is classified
+  are. A cell answers for the multiply as the build computes it, after mirl's
+  legalisations: a narrow product widened to the multiply's width, a high half
+  with no form of its own built from low products, a multiply wider than the
+  word split into products of words, and a width with no multiply at all a
+  helper's call, which is 0 (see
+  [secrecy.md](secrecy.md#constant-time-multiply-by-instruction-set)). It holds
+  when every row the selection emits for those multiplies is classified
   constant time under a mode the build guarantees:
   - always;
   - the extension it names, selected for the target;
   - a data-independent-timing mode the target's baseline holds.
-- riscv64 with Zkt selected (`rv64gc_zkt`) answers 1 for `low` at 8, 16, 32
-  and 64 bits and the three high halves at 64. x86-64 answers 1 for `low`, `high_u`,
-  `high_s` and `wide_u` / `wide_s` on every OS. aarch64 classifies its
-  multiplies under PSTATE.DIT, so it answers 1 only where the target's baseline
-  holds DIT, as darwin-arm64's does. A `soft` function sets the mode where the
-  processor has it, which the query does not count on (see
+- x86-64 answers 1 for every multiply at every width on every OS, and riscv64
+  and riscv32 with Zkt selected (`rv64gc_zkt`, `rv32gc_zkt`) do as well.
+  aarch64 classifies its multiplies under PSTATE.DIT, so it answers 1, for
+  every multiply at every width, only where the target's baseline holds DIT,
+  as darwin-arm64's does. A `soft` function sets the mode where the processor
+  has it, which the query does not count on (see
   [secrecy.md](secrecy.md#soft-and-hard)). Every other target folds to 0. Lane
   multiplies are not part of the query.
 - The result is a `u1`, like `$mach.build.pie`. An unknown `op` or `width`, a

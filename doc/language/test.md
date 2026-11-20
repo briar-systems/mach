@@ -171,6 +171,10 @@ run are:
 
 A roll-up is `<module>  <ok> ok[  <skip> skip][  <fail> FAIL]  <duration>`, written once the
 module's last test finishes, so roll-ups come out in the order modules finish.
+Its `<duration>` is the module's wall span, from the launch of its first test to
+the exit of its last, and the summary's duration is the run's wall time, so
+every time the readout prints is wall time (see
+[readout.md](readout.md#the-test-readout)).
 Each expanded failure shows `file:line`, the exit code (`(exit N)`), signal
 (`(signal N)`) or `(timed out after <duration>)`, the child's captured output
 indented beneath, and the exact `rerun:` command. A passing or skipped test
@@ -235,13 +239,10 @@ failures:
   app.main#spins  src/main.mach:4  (timed out after 1s)
 
 0 passed, 1 failed (1 timed out), 1 total  (1.0s)
-  unsupported 0, target unavailable 0, resource exhaustion 1, invalid injection 0
 ```
 
-The indented line after the counts breaks the run down by gate cause, and is
-written whenever any of those counts is non-zero. A timed-out test counts there
-as resource exhaustion, as it does in the `run_end` record's
-`resource_exhaustion` beside `timed_out`.
+A timed-out test counts in the `run_end` record's `resource_exhaustion` beside
+`timed_out`.
 
 `<duration>` is a positive integer followed by a unit: `ms`, `s`, `m` or `h`
 (`30ms`, `30s`, `5m`, `1h`). A bare number, a fraction, zero or any other
@@ -288,7 +289,12 @@ whose entry selects a test by its index argument, and links it with the test
 objects and the module objects into `test/<artifact>/<artifact>`, even for a
 library artifact. The link keeps only what the selected tests reach. The
 dispatcher is the program's `main`: an artifact's own `main` yields to it in
-the link, so its object is linked unchanged.
+the link, so its object is linked unchanged. The process entry that calls `main`
+comes from the artifact's closure as it does for a program, never from the test
+build, so a library's entry states `use std.runtime;` as `mach init --lib`
+writes it. A closure that reaches no process entry is refused at the artifact's
+`entry` key, naming the missing entry symbol and the `use` that supplies it (see
+[files.md](files.md#executable-entry)).
 
 The dispatcher's entry calls the selected test and exits with its result:
 as is when the result is in `0..255`, and `255` otherwise (see
@@ -326,6 +332,24 @@ and reported on a `skip` line, since an emulator the host happens to have is not
 target unless the manifest says so. `--runner <cmd>` replaces the target's runner for
 one invocation, launching each test as `<cmd> <exe> <index>`, and needs the selection
 to resolve to one (artifact, target, profile), foreign or not.
+
+A [finished-module target](manifest.md#finished-module-targets), a shader on
+`vulkan` or a kernel on `opencl`, links no executable, so it has no dispatcher. A
+cell on one is built as `mach build` builds it, its module written to the
+artifact's own `out`, and its (target, profile) is reported on a `skip` line that
+names the reason while the other cells build and run:
+
+```
+skip  spirv (debug): a finished-module target links no test executable; built, not run
+```
+
+Under `--list` such a cell is type checked, not built, and the line ends `checked,
+not listed`. This holds whether the selection named the cell exactly or reached it
+through a glob or `--all`, so `mach test --all` also catches a shader that does not
+compile. `--runner` over a finished-module cell is refused with
+`target.output_unsupported`, since there is no program to launch, and a selection
+whose every target is a finished-module one exits `1` with `target.not_runnable`
+unless `--allow-unrunnable` accepts it.
 
 A test launched through a runner is judged by the runner's exit status under the
 same rule as a native test: `0` is a pass, `77` a skip, and anything else a failure.

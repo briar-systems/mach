@@ -9,7 +9,7 @@ semantics: no `in` / `out` declarations, no clobber list.
 
 ```mach fragment
 asm <selection> {
-    # raw instructions, one per line, # for comments
+    # raw instructions in the selection's own dialect, here x86's, whose comments start with #
     mov rcx, {ptr}
     mov rax, [rcx]
     mov {result}, rax
@@ -25,8 +25,10 @@ asm <selection> {
 - **Every block that survives comptime has its head read by masc for the compile
   target**, and one masc refuses, or that names another architecture's selection,
   is refused at the head with `asm.head` and masc's message. A block in a discarded
-  `$if` arm is never read, so a routine writes one block per target and `$if`
-  chooses among them (see [Multi-arch dispatch](#multi-arch-dispatch)).
+  `$if` arm is never checked against the target, so a routine writes one block per
+  target and `$if` chooses among them (see [Multi-arch dispatch](#multi-arch-dispatch)).
+  Every block is still lexed, its head naming the set whose dialect its body is read
+  in (see [How a block is read](#how-a-block-is-read)).
 - **A head widens its block.** The block is read under its function's set with what
   the head adds, closed over its implications, so what the function admits stays
   admitted and a row past both is refused. The widening is the block's alone. It
@@ -46,7 +48,46 @@ asm <selection> {
 - There is no `asm ... or ...` chain. `$if` chooses the block per target.
 - **A target with no assembler takes no `asm` block.** SPIR-V declares no assembly capability, so any `asm` block compiled for it, whatever its head, is refused where it is written with `asm.unavailable` and `inline assembly is not allowed on instruction set 'spirv', which declares no assembly capability`. Guard a routine shared with a shader behind `$if ($mach.build.arch != $mach.arch.spirv)`.
 - Each line is an instruction in the ISA's native syntax.
-- `#` introduces a line comment: everything from `#` to the end of the line is ignored, whatever it contains (`;`, `{}`, `%`, and so on are all inert inside a comment).
+
+### How a block is read
+
+A block is found while the file is lexed, before anything is parsed, so every tool that
+reads source (a build, `mach check`, `mach fmt`, `mach doc`, `mach migrate` and the
+editor) reads it the same way.
+
+- **`asm` beginning a statement is always a block.** A statement begins at the start of
+  the file or a body and after a `;`, `{` or `}`. There, `asm` followed on its line by a
+  word opens a block: the head is the text after `asm` up to the `{` on that line, and a
+  head the line ends before any `{` is refused with `syntax.expected_token`. A statement
+  that begins with `asm` and no head, as `asm { ... }` or `asm = 1;`, is refused with
+  `asm.isa_missing`. A name `asm` anywhere else, as `$each asm in xs` or a field named
+  `asm`, is an ordinary identifier.
+- **The body is the instruction set's text, read in its dialect.** It is one raw piece
+  from the `{` to the `}` that closes it, and the lexer finds that `}` with the dialect of
+  the one instruction set of masc's whose catalog reads the head as a selection, whatever
+  the compile target and whether or not `$if` keeps the block. A brace inside one of the
+  dialect's comments, strings or character constants is text and neither opens nor
+  closes the body. Every other `{` and `}` of the body balances, as a `{name}`, x86's
+  `{disp32}` or aarch64's `{v0.16b}` does.
+- **A head no set reads, or that more than one reads, is refused** with `asm.head`, since
+  nothing then says where the body ends. A body its dialect never closes is refused with
+  `asm.unterminated` at its `asm`. Either refusal is lexical, so the file goes no further.
+- **A head a previous major wrote** (see [From a previous major](#from-a-previous-major))
+  is read as the selection that stands for it, so its body is found and the head itself is
+  refused with the rewrite to make.
+
+| Instruction set | Heads, for example | Comment to the line's end | Also |
+| --- | --- | --- | --- |
+| x86 | `x86-64`, `x86-64,avx2` | `#` | |
+| aarch64 | `armv8-a`, `armv8.2-a+sha2` | `//` | `#` begins an immediate, as `add x0, x0, #1` |
+| RISC-V | `rv64i`, `rv32i_zicsr` | `#` | |
+| WebAssembly | `mvp`, `wasm1,simd128` | `;;` | `(; ... ;)` block comments, which nest, and no character constants: `'` is an ordinary character |
+
+On x86, aarch64 and RISC-V a `/* ... */` comment may span lines, `;` ends a statement within
+a line, a string is `"` to `"` on one line with `\` escaping the byte after it, and a
+character constant is `'c'` or `'c`, as `mov eax, '}'` or aarch64's `add x9, x9, #'{'`.
+On WebAssembly a string is `"` to `"`. Everything from a comment's start to its end is
+inert, whatever it holds (`;`, `{}`, `'`, `%` and so on).
 
 ## Operand substitution
 
@@ -57,7 +98,8 @@ typically a stack slot — so a pointer local's pointee is reached by staging
 the pointer through a scratch register first (`mov rcx, {ptr}` then
 `mov rax, [rcx]`), never by a direct `[{ptr}]` indirection.
 
-Only an identifier inside braces names a local. Any other braced text belongs to
+Only an identifier inside braces names a local, and only outside the dialect's comments,
+strings and character constants. Any other braced text belongs to
 the ISA's own syntax, such as aarch64's `{v0.16b}` register list, and reaches its
 grammar untouched.
 
@@ -87,7 +129,7 @@ the stack pointer:
 ```mach fragment
 var x: i64 = 0;
 asm armv8-a {
-    ldr x9, {x}              # [x29, -16]: the frame pointer, not sp
+    ldr x9, {x}              // [x29, -16]: the frame pointer, not sp
     stp x1, x2, [sp, -16]!
 }
 ```
@@ -430,10 +472,10 @@ register, `, x9`. Either form writes the base register:
 
 ```mach fragment
 asm armv8-a {
-    ld1 {v0.16b}, [x1], 16      # load 16 bytes, then x1 += 16
+    ld1 {v0.16b}, [x1], 16      // load 16 bytes, then x1 += 16
     ld1 {v1.16b}, [x1], 16
     eor v0.16b, v0.16b, v1.16b
-    st1 {v0.16b}, [x2], x9      # store, then x2 += x9
+    st1 {v0.16b}, [x2], x9      // store, then x2 += x9
 }
 ```
 
@@ -669,7 +711,7 @@ asm x86-64 {
 }
 
 asm armv8-a {
-    .word 0xd53be040          # mrs x0, cntvct_el0
+    .word 0xd53be040          // mrs x0, cntvct_el0
 }
 
 asm rv64i {
@@ -721,7 +763,7 @@ asm x86-64 {
 }
 
 asm armv8-a {
-    .word 0xd4000002 :: writes(x0, x1, x2, x3)   # hvc #0, returning per SMCCC
+    .word 0xd4000002 :: writes(x0, x1, x2, x3)   // hvc #0, returning per SMCCC
 }
 
 asm rv64i {
@@ -796,10 +838,10 @@ every `asm` block is already assumed to modify arbitrary memory.
 
 ```mach fragment
 asm armv8-a {
-    mrs x0, cntvct_el0        # the virtual counter
-    mrs x1, CNTFRQ_EL0        # ... and its frequency, capitalized as ARM spells it
-    msr vbar_el1, x2          # install an exception vector base
-    msr daifset, 0xf          # mask every interrupt
+    mrs x0, cntvct_el0        // the virtual counter
+    mrs x1, CNTFRQ_EL0        // ... and its frequency, capitalized as ARM spells it
+    msr vbar_el1, x2          // install an exception vector base
+    msr daifset, 0xf          // mask every interrupt
 }
 ```
 
@@ -812,7 +854,7 @@ lags the architecture:
 
 ```mach fragment
 asm armv8-a {
-    mrs x0, s3_3_c14_c0_2     # the same register as `mrs x0, cntvct_el0`
+    mrs x0, s3_3_c14_c0_2     // the same register as `mrs x0, cntvct_el0`
 }
 ```
 
@@ -823,14 +865,13 @@ text does.
 
 `msr <field>, imm` writes a PSTATE field (`daifset`, `daifclr`, `spsel`, `pan`, `uao`,
 `ssbs`, `dit`, `tco`). The architecture spells these by name only, so there is no numeric
-escape for this form. The immediate is spelled bare, as every immediate in an `asm`
-block is: `#` opens a comment to the end of the line, so Arm's `#1` would leave the
-instruction without its operand.
+escape for this form. The immediate may be spelled bare or with Arm's `#`, as every
+aarch64 immediate may, since a comment starts with `//` there.
 
 ```mach fragment
 asm armv8-a+dit {
-    msr dit, 1                # turn on data-independent timing for this thread
-    dsb nsh                   # ... and make the write take effect before what follows
+    msr dit, 1                // turn on data-independent timing for this thread
+    dsb nsh                   // ... and make the write take effect before what follows
     isb
 }
 ```
@@ -850,10 +891,10 @@ The three architectural barriers take the Arm ARM's option vocabulary:
 
 ```mach fragment
 asm armv8-a+sb {
-    dmb ish                   # data memory barrier, inner shareable
-    dsb nsh                   # data synchronization barrier, non-shareable
-    isb                       # instruction synchronization barrier (`isb sy` spells the same word)
-    sb                        # speculation barrier, under the `sb` extension
+    dmb ish                   // data memory barrier, inner shareable
+    dsb nsh                   // data synchronization barrier, non-shareable
+    isb                       // instruction synchronization barrier (`isb sy` spells the same word)
+    sb                        // speculation barrier, under the `sb` extension
 }
 ```
 
@@ -872,9 +913,9 @@ which level answers:
 
 ```mach fragment
 asm armv8-a {
-    svc 0                     # the kernel, at EL1
-    hvc 0                     # the hypervisor, at EL2
-    smc 0                     # the secure monitor, at EL3
+    svc 0                     // the kernel, at EL1
+    hvc 0                     // the hypervisor, at EL2
+    smc 0                     // the secure monitor, at EL3
 }
 ```
 
@@ -893,8 +934,8 @@ The two waiting hints suspend the core until something wakes it:
 
 ```mach fragment
 asm armv8-a {
-    wfi                       # ... until an interrupt: the correct idle loop
-    wfe                       # ... until an event
+    wfi                       // ... until an interrupt: the correct idle loop
+    wfe                       // ... until an event
 }
 ```
 
@@ -1007,7 +1048,8 @@ $or ($mach.build.arch == $mach.arch.aarch64) {
 
 The discarded branches don't compile (see
 [comptime-control.md](comptime-control.md)), so each `asm` block only needs
-to be valid for the target its arm selects.
+to be valid for the target its arm selects. Each is still lexed in its own set's
+dialect, so its head names a set of masc's and its body closes.
 
 ## From a previous major
 
@@ -1015,6 +1057,10 @@ A v6 head names an architecture: `x86_64`, `aarch64`, `riscv64` or `riscv32`. It
 refused with `asm.head`, and [`mach migrate`](migrate.md) writes `x86-64`, `armv8-a`,
 `rv64i` and `rv32i`, each the architecture's first level, which adds nothing to a
 target of it.
+
+A v6 body took `#` to the end of a line as a comment on every instruction set. A body is now
+read in its set's dialect, so on aarch64 and WebAssembly, whose comments start otherwise,
+`mach migrate` writes each such `#` as `//` and `;;`.
 
 ## When to use
 

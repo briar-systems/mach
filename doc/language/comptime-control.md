@@ -238,6 +238,11 @@ fires is **refused**:
 
 - It reports every module-scope `$error` that fires in it and nothing else: no
   other error and no warning of the module is reported.
+- A module whose source has a lexical or syntax error is never refused. It reports
+  those errors, and none of its module-scope `$error`s is evaluated, since the gates
+  they stand under were read from a tree the parser recovered. A syntax error is
+  the same on every target, so it is never hidden behind a `$error` that fires on
+  some targets only.
 - A module that imports a refused module, directly or through modules that import
   it, is not analysed and reports nothing, its own module-scope `$error` included.
   So one refused module gives one diagnostic however long the chain of imports
