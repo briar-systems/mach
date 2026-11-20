@@ -21,18 +21,22 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.session`](../../s
 | On `Laying` | |
 | :--- | :--- |
 | [`init`](#init) | a laying over `target` under the context `ctx`, both borrowed, placing tags by `place` |
-| [`dnit`](#dnit), [`of`](#of) | |
+| [`dnit`](#dnit) | release a laying and its type table, a nil laying holding nothing |
+| [`of`](#of) | the size and alignment of a type, asked as a query of its own |
 | [`field_offset`](#field_offset) | the byte offset of a record field or tag payload from the same layout that sizes the type; `size` carries the offset when `ok` |
 
 | On `Cause` | |
 | :--- | :--- |
-| [`CAUSE_UNKNOWN`](#cause), [`CAUSE_FIELD_RANGE`](#cause), [`unknown`](#unknown) | |
+| [`CAUSE_UNKNOWN`](#cause), [`CAUSE_FIELD_RANGE`](#cause) | |
+| [`unknown`](#unknown) | the extent of a type that has none |
 | [`cause_name`](#cause_name) | the text of a cause; absent for one outside the catalog |
 
 | On `Measure` | |
 | :--- | :--- |
 | [`placement`](#placement) | where the tag `tid`, its secrecy stripped, holds each case's payload on the laying's target |
-| [`describe`](#describe), [`field`](#field), [`size`](#size) | |
+| [`describe`](#describe) | what a source type is made of, its secrecy stripped |
+| [`field`](#field) | the type of one field or case of a type, its secrecy stripped |
+| [`size`](#size) | the size and alignment of a type on the laying's target |
 | [`offset`](#offset) | the byte offset of a record field, or of a tag case's payload, in `size`; a case with no payload has none |
 
 | Constants | |
@@ -75,7 +79,7 @@ pub fun init(a: *std.allocator.Allocator, target: *mirl.target.record.Target, ct
 ```
 
 a laying over `target` under the context `ctx`, both borrowed, placing tags by `place`.
-given back by close
+given back by dnit
 
 ### dnit
 
@@ -83,11 +87,26 @@ given back by close
 pub fun dnit(l: *Laying)
 ```
 
+release a laying and its type table, a nil laying holding nothing
+
+| Parameter | |
+| :--- | :--- |
+| `l` | the laying |
+
 ### of
 
 ```mach
 pub fun of(s: *mach.session.Session, laying: *Laying, tid: mach.type.kind.TypeId) res[Extent, mach.base.fail.Fail]
 ```
+
+the size and alignment of a type, asked as a query of its own
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session holding the store and fact cache the query uses |
+| `laying` | the laying, nil where the build opened no target |
+| `tid` | the type |
+| **returns** | its extent, or the internal failure or refusal the query met |
 
 ### field_offset
 
@@ -114,6 +133,13 @@ pub def Cause: u8
 ```mach
 pub fun unknown(cause: Cause) Extent
 ```
+
+the extent of a type that has none
+
+| Parameter | |
+| :--- | :--- |
+| `cause` | why it has none |
+| **returns** | the extent, not ok |
 
 ### cause_name
 
@@ -190,17 +216,42 @@ the cases it gives are the laying's, good until the next tag is placed
 pub fun describe(mz: *Measure, id: u32) Node
 ```
 
+what a source type is made of, its secrecy stripped
+
+| Parameter | |
+| :--- | :--- |
+| `mz` | the layout walk |
+| `id` | the type's index |
+| **returns** | its node, NODE_ZERO for the nil type and NODE_UNKNOWN for a type with no layout |
+
 ### field
 
 ```mach
 pub fun field(mz: *Measure, id: u32, index: u32) u32
 ```
 
+the type of one field or case of a type, its secrecy stripped
+
+| Parameter | |
+| :--- | :--- |
+| `mz` | the layout walk |
+| `id` | the type's index |
+| `index` | the field's position |
+| **returns** | the field type's index, the error type's for no such field |
+
 ### size
 
 ```mach
 pub fun size(mz: *Measure, tid: mach.type.kind.TypeId) Extent
 ```
+
+the size and alignment of a type on the laying's target
+
+| Parameter | |
+| :--- | :--- |
+| `mz` | the layout walk |
+| `tid` | the type |
+| **returns** | its extent, or why it has none, CAUSE_UNAVAILABLE without a laying |
 
 ### offset
 

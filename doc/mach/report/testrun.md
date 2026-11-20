@@ -12,11 +12,12 @@ Source: [`src/report/testrun.mach`](../../../src/report/testrun.mach)
 | [`GateResultKind`](#gateresultkind) | `def` | how a test ran: passed, skipped, disagreed with what it checks, or could not be judged |
 | [`GateCause`](#gatecause) | `def` | what decided a result's kind |
 | [`GateResult`](#gateresult) | `rec` | one test's result; the tally owns a recorded result's detail |
-| [`GateTally`](#gatetally) | `rec` |  |
+| [`GateTally`](#gatetally) | `rec` | the count of results by kind over a run, and every result recorded |
 
 | On `GateResultKind` | |
 | :--- | :--- |
-| [`RESULT_PASS`](#gateresultkind), [`RESULT_SEMANTIC_MISMATCH`](#gateresultkind), [`RESULT_TOOL_UNAVAILABLE`](#gateresultkind), [`RESULT_INFRASTRUCTURE_FAILURE`](#gateresultkind), [`RESULT_RESOURCE_EXHAUSTION`](#gateresultkind), [`RESULT_SKIP`](#gateresultkind), [`gate_result`](#gate_result) | |
+| [`RESULT_PASS`](#gateresultkind), [`RESULT_SEMANTIC_MISMATCH`](#gateresultkind), [`RESULT_INFRASTRUCTURE_FAILURE`](#gateresultkind), [`RESULT_RESOURCE_EXHAUSTION`](#gateresultkind), [`RESULT_SKIP`](#gateresultkind) | |
+| [`gate_result`](#gate_result) | a result from its parts |
 
 | On `GateCause` | |
 | :--- | :--- |
@@ -24,7 +25,8 @@ Source: [`src/report/testrun.mach`](../../../src/report/testrun.mach)
 
 | On `GateTally` | |
 | :--- | :--- |
-| [`gate_tally_init`](#gate_tally_init), [`record_gate`](#record_gate) | |
+| [`gate_tally_init`](#gate_tally_init) | an empty tally |
+| [`record_gate`](#record_gate) | record one result and count it under its kind |
 
 | Constants | |
 | :--- | :--- |
@@ -64,16 +66,24 @@ how a test ran: passed, skipped, disagreed with what it checks, or could not be 
 | :--- | :--- | :--- |
 | `RESULT_PASS` | `0` |  |
 | `RESULT_SEMANTIC_MISMATCH` | `1` |  |
-| `RESULT_TOOL_UNAVAILABLE` | `3` |  |
-| `RESULT_INFRASTRUCTURE_FAILURE` | `4` |  |
-| `RESULT_RESOURCE_EXHAUSTION` | `5` |  |
-| `RESULT_SKIP` | `7` |  |
+| `RESULT_INFRASTRUCTURE_FAILURE` | `2` |  |
+| `RESULT_RESOURCE_EXHAUSTION` | `3` |  |
+| `RESULT_SKIP` | `4` |  |
 
 ### gate_result
 
 ```mach
 pub fun gate_result(kind: GateResultKind, cause: GateCause, detail_identity: str) GateResult
 ```
+
+a result from its parts
+
+| Parameter | |
+| :--- | :--- |
+| `kind` | how the test ran |
+| `cause` | what decided the kind |
+| `detail_identity` | the detail text, borrowed until the result is recorded, or nil |
+| **returns** | the result |
 
 ## GateCause
 
@@ -112,15 +122,23 @@ one test's result; the tally owns a recorded result's detail
 pub rec GateTally {
     pass:                   u32;
     semantic_mismatch:      u32;
-    unsupported_input:      u32;
-    tool_unavailable:       u32;
     infrastructure_failure: u32;
     resource_exhaustion:    u32;
-    invalid_injection:      u32;
     skip:                   u32;
     results:                Vector[GateResult];
 }
 ```
+
+the count of results by kind over a run, and every result recorded
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `pass` | `u32` | tests that passed |
+| `semantic_mismatch` | `u32` | tests that disagreed with what they check |
+| `infrastructure_failure` | `u32` | tests the harness failed to run |
+| `resource_exhaustion` | `u32` | tests that ran out of a resource |
+| `skip` | `u32` | tests that reported a skip |
+| `results` | `Vector[GateResult]` | every recorded result, whose detail the tally owns |
 
 ### gate_tally_init
 
@@ -128,11 +146,27 @@ pub rec GateTally {
 pub fun gate_tally_init(a: *std.allocator.Allocator) GateTally
 ```
 
+an empty tally
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator the result list grows in |
+| **returns** | the tally with every count zero |
+
 ### record_gate
 
 ```mach
 pub fun record_gate(gt: *GateTally, a: *std.allocator.Allocator, r: GateResult) err[std.allocator.Error]
 ```
+
+record one result and count it under its kind
+
+| Parameter | |
+| :--- | :--- |
+| `gt` | the tally |
+| `a` | allocates the tally's copy of the result's detail |
+| `r` | the result, whose detail is copied |
+| **returns** | err when the detail cannot be copied or the result cannot be stored, the tally then unchanged |
 
 ## Constants
 

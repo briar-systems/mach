@@ -10,13 +10,13 @@ dependency closure a plan's cells share.
 
 Source: [`src/compile/project.mach`](../../../src/compile/project.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.handle`](../base/handle.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.base.source.provider.disk`](../base/source/provider/disk.md), [`mach.base.source.provider.overlay`](../base/source/provider/overlay.md), [`mach.compile.backend`](backend.md), [`mach.compile.cache.compiler`](cache/compiler.md), [`mach.compile.cache.objects`](cache/objects.md), [`mach.compile.cache.record`](cache/record.md), [`mach.compile.demand`](demand.md), [`mach.compile.readahead`](readahead.md), [`mach.compile.request`](request.md), [`mach.front.comptime.scope`](../front/comptime/scope.md), [`mach.front.expect`](../front/expect.md), [`mach.front.load`](../front/load.md), [`mach.lower.context`](../lower/context.md), [`mach.lower.linkage`](../lower/linkage.md), [`mach.manifest.link`](../manifest/link.md), [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.plan`](../manifest/plan.md), [`mach.manifest.template`](../manifest/template.md), [`mach.report.readout`](../report/readout.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md), [`mach.target.resolved`](../target/resolved.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.handle`](../base/handle.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.base.source.provider.disk`](../base/source/provider/disk.md), [`mach.base.source.provider.overlay`](../base/source/provider/overlay.md), [`mach.compile.backend`](backend.md), [`mach.compile.cache.compiler`](cache/compiler.md), [`mach.compile.cache.objects`](cache/objects.md), [`mach.compile.cache.record`](cache/record.md), [`mach.compile.demand`](demand.md), [`mach.compile.readahead`](readahead.md), [`mach.compile.request`](request.md), [`mach.front.comptime.scope`](../front/comptime/scope.md), [`mach.front.expect`](../front/expect.md), [`mach.front.load`](../front/load.md), [`mach.lower.context`](../lower/context.md), [`mach.lower.linkage`](../lower/linkage.md), [`mach.manifest.link`](../manifest/link.md), [`mach.manifest.model`](../manifest/model.md), [`mach.manifest.plan`](../manifest/plan.md), [`mach.manifest.template`](../manifest/template.md), [`mach.report.readout`](../report/readout.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.session.query`](../session/query.md), [`mach.target.resolved`](../target/resolved.md).
 
 | Type | | |
 | :--- | :--- | :--- |
 | [`RootSet`](#rootset) | `def` |  |
-| [`TargetEntry`](#targetentry) | `rec` |  |
-| [`DepEntry`](#depentry) | `rec` |  |
+| [`TargetEntry`](#targetentry) | `rec` | the target a configured cell builds for and the artifact it builds, as target_entry_of makes it |
+| [`DepEntry`](#depentry) | `rec` | one dependency of a located closure |
 | [`Closure`](#closure) | `rec` | a root manifest's located dependency closure: every dependency realized under dep/, its manifest read once, and its direct edges |
 | [`ProjectConfig`](#projectconfig) | `rec` | what a configured build cell compiles and where it writes |
 | [`ArtifactEntry`](#artifactentry) | `rec` | an artifact entry the union walk loads: the entry module, the artifact it is of and where the artifact's `entry` is written in the manifest |
@@ -41,7 +41,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | On `Closure` | |
 | :--- | :--- |
 | [`closure_init`](#closure_init) | a closure that holds no dependency |
-| [`closure_dnit`](#closure_dnit) | |
+| [`closure_dnit`](#closure_dnit) | free every entry of a closure, leaving it empty |
 
 | On `ModuleEntry` | |
 | :--- | :--- |
@@ -56,11 +56,12 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`unit_module`](#unit_module) | the module whose entry holds unit `u`'s object, mirl text and listing: the module itself, or for an artifact taken whole the last module emitted, which no other emitted module imports |
 | [`link_name_for`](#link_name_for) | the name a C symbol `bare` takes in the target's objects: the prefix mink's registry gives a C symbol of the target's format on its architecture, then `bare` |
 | [`staged_dnit`](#staged_dnit) | a staged object is the project's until a query takes it, and `object` is borrowed |
-| [`staged_test_dnit`](#staged_test_dnit), [`all_staged_dnit`](#all_staged_dnit) | |
+| [`staged_test_dnit`](#staged_test_dnit) | a staged test object is the project's until a query takes it, and the test `object` is borrowed |
+| [`all_staged_dnit`](#all_staged_dnit) | give back every module's staged object and staged test object |
 | [`fresh_staged_dnit`](#fresh_staged_dnit) | a restored product stays staged across operations: it is keyed by the key it was read under and the next load discards it if that changed |
 | [`dnit_project`](#dnit_project) | release a project and everything it owns; a nil project holds nothing |
 | [`set_origin`](#set_origin) | attribute what the project's phases report directly, outside a query, to the phase now running: both the project's store and the session's |
-| [`init_project`](#init_project) | |
+| [`init_project`](#init_project) | make `p` an empty project of session `s`, resetting the session's diagnostics and presentation |
 | [`module_named`](#module_named) | the module loaded under `fqn`, nil when none is |
 | [`module_count`](#module_count) | the loaded module count; the next ModuleId to be issued |
 | [`module_at`](#module_at) | the entry behind a ModuleId the project has issued |
@@ -111,6 +112,20 @@ pub rec TargetEntry {
 }
 ```
 
+the target a configured cell builds for and the artifact it builds, as target_entry_of makes it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `name` | `mach.base.intern.StrId` | the target's name |
+| `os_name` | `mach.base.intern.StrId` | its system |
+| `isa_name` | `mach.base.intern.StrId` | its architecture |
+| `abi_name` | `mach.base.intern.StrId` | its abi |
+| `of_name` | `mach.base.intern.StrId` | its object format |
+| `platform_name` | `mach.base.intern.StrId` | its platform |
+| `entrypoint` | `mach.base.intern.StrId` | the artifact's entry, as the manifest writes it |
+| `libs` | `*mach.manifest.link.LinkRequirement` | the cell's own link requirements |
+| `lib_count` | `u32` | length of `libs` |
+
 ### target_entry_of
 
 ```mach
@@ -139,6 +154,20 @@ pub rec DepEntry {
     manifest:     mach.manifest.model.Manifest;
 }
 ```
+
+one dependency of a located closure
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `alias` | `mach.base.intern.StrId` | the key it is declared and realized under |
+| `project_id` | `mach.base.intern.StrId` | the project id its manifest states |
+| `project_dir_src` | `mach.base.intern.StrId` | its manifest's `src` |
+| `vendor_root` | `mach.base.intern.StrId` | the directory it is realized in |
+| `source` | `mach.base.intern.StrId` | a label of where it comes from, as messages show it |
+| `ref` | `mach.base.intern.StrId` | the ref its selecting declaration names |
+| `chain` | `mach.base.intern.StrId` | how the root reaches it, as messages show it |
+| `root_declared` | `bool` | the root manifest declares it itself |
+| `manifest` | `mach.manifest.model.Manifest` | its manifest, read once |
 
 ### dep_entries_dnit
 
@@ -182,6 +211,12 @@ a closure that holds no dependency
 pub fun closure_dnit(c: *Closure)
 ```
 
+free every entry of a closure, leaving it empty
+
+| Parameter | |
+| :--- | :--- |
+| `c` | closure to free, through its own allocator |
+
 ## ProjectConfig
 
 ```mach
@@ -204,6 +239,7 @@ pub rec ProjectConfig {
     target_count:      u32;
     deps:              *DepEntry;
     dep_count:         u32;
+    dep_allow:         *mach.base.diagnostic.kind.KindSet;
     cascade_libs:      *mach.manifest.link.LinkRequirement;
     cascade_lib_count: u32;
     profile:           mach.base.intern.StrId;
@@ -229,6 +265,7 @@ what a configured build cell compiles and where it writes
 | `dependency_owned` | `bool` | the cell is a requirement of a dependency's default library artifacts, built for the root project |
 | `closure` | `Closure` | the closure this project located itself, when it was configured without one to borrow; empty otherwise |
 | `deps` | `*DepEntry` | the realized closure the cell compiles against: the root's whole closure, or a dependency cell's own transitive closure. the array is the project's, each entry borrowed from the closure |
+| `dep_allow` | `*mach.base.diagnostic.kind.KindSet` | the `allow` of the profile each of `deps` selects with no profile named, parallel to `deps`, nil unless the build shows dependencies' warnings |
 | `art_reqs` | `*mach.manifest.template.Requirement` | the requirements of the cell's artifact, in its declaring manifest |
 | `req_scopes` | `*mach.manifest.template.Requirements` | one requirement scope per project the cell compiles, the declaring project's first |
 
@@ -513,11 +550,15 @@ a staged object is the project's until a query takes it, and `object` is borrowe
 pub fun staged_test_dnit(p: *Project, m: *ModuleEntry)
 ```
 
+a staged test object is the project's until a query takes it, and the test `object` is borrowed
+
 ### all_staged_dnit
 
 ```mach
 pub fun all_staged_dnit(p: *Project)
 ```
+
+give back every module's staged object and staged test object
 
 ### fresh_staged_dnit
 
@@ -552,6 +593,13 @@ phase now running: both the project's store and the session's
 ```mach
 pub fun init_project(p: *Project, s: *mach.session.Session)
 ```
+
+make `p` an empty project of session `s`, resetting the session's diagnostics and presentation
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the project to initialize, which allocates in the session's build allocator |
+| `s` | the session the project builds in |
 
 ### module_named
 

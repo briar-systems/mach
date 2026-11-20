@@ -19,7 +19,11 @@ Uses types from [`mach.base.fail`](../../fail.md), [`mach.base.intern`](../../in
 
 | On `Disk` | |
 | :--- | :--- |
-| [`init`](#init), [`dnit`](#dnit), [`package_add`](#package_add), [`packages_clear`](#packages_clear), [`provider_of`](#provider_of) | |
+| [`init`](#init) | a disk provider with no packages, naming paths in `itn`, released with dnit |
+| [`dnit`](#dnit) | release the provider's package list |
+| [`package_add`](#package_add) | add a package, matched after those added before it |
+| [`packages_clear`](#packages_clear) | drop every package |
+| [`provider_of`](#provider_of) | the provider contract over `d`, which must outlive it |
 
 ---
 
@@ -67,11 +71,15 @@ as linux does. the root package is matched first, then the dependencies in the o
 pub fun init(a: *std.allocator.Allocator, itn: *mach.base.intern.Interner) Disk
 ```
 
+a disk provider with no packages, naming paths in `itn`, released with dnit
+
 ### dnit
 
 ```mach
 pub fun dnit(d: *Disk)
 ```
+
+release the provider's package list
 
 ### package_add
 
@@ -79,15 +87,27 @@ pub fun dnit(d: *Disk)
 pub fun package_add(d: *Disk, p: Package) err[mach.base.fail.Fail]
 ```
 
+add a package, matched after those added before it
+
+| Parameter | |
+| :--- | :--- |
+| `d` | the provider |
+| `p` | the package |
+| **returns** | the allocator's refusal, as a failure |
+
 ### packages_clear
 
 ```mach
 pub fun packages_clear(d: *Disk)
 ```
 
+drop every package
+
 ### provider_of
 
 ```mach
 pub fun provider_of(d: *Disk) mach.base.source.provider.Provider
 ```
+
+the provider contract over `d`, which must outlive it
 

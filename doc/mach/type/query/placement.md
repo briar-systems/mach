@@ -22,15 +22,17 @@ Uses types from [`mach.type.kind`](../kind.md), [`mach.type.query`](../query.md)
 | Type | | |
 | :--- | :--- | :--- |
 | [`Place`](#place) | `def` | one bit of a parameter's places |
-| [`Places`](#places) | `rec` |  |
+| [`Places`](#places) | `rec` | the parameter places of every generic a question has met |
 
 | On `Place` | |
 | :--- | :--- |
-| [`LAID`](#place), [`LAID_SECRET`](#place), [`POINTEE`](#place), [`place_at`](#place_at) | |
+| [`LAID`](#place), [`LAID_SECRET`](#place), [`POINTEE`](#place) | |
+| [`place_at`](#place_at) | the place at one bit index |
 
 | On `Places` | |
 | :--- | :--- |
-| [`init`](#init), [`dnit`](#dnit) | |
+| [`init`](#init) | empty places for a query |
+| [`dnit`](#dnit) | release what the places hold |
 | [`settle`](#settle) | settles the places of `generic` and every generic it reaches; false when they cannot be known, because a generic it reaches has no fields yet or the walk failed |
 | [`bits`](#bits) | the places parameter `param` of a settled generic takes |
 | [`reached`](#reached) | whether parameter `param` of a settled generic is reached, through storage or not |
@@ -62,6 +64,13 @@ one bit of a parameter's places
 pub fun place_at(i: u32) Place
 ```
 
+the place at one bit index
+
+| Parameter | |
+| :--- | :--- |
+| `i` | the bit index, below PLACE_COUNT |
+| **returns** | the place |
+
 ## Places
 
 ```mach
@@ -76,17 +85,41 @@ pub rec Places {
 }
 ```
 
+the parameter places of every generic a question has met
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `q` | `*mach.type.query.Query` | the query they are answered within |
+| `index` | `std.collections.map.Map[mach.type.kind.TypeId, u32]` | the entry of each generic, by its type |
+| `entries` | `Vector[Entry]` | one entry per generic met |
+| `params` | `Vector[Param]` | every parameter's places, linked from its entry |
+| `incomplete` | `bool` | whether a generic met had no field table |
+| `grew` | `bool` | whether the current pass added anything |
+
 ### init
 
 ```mach
 pub fun init(q: *mach.type.query.Query) Places
 ```
 
+empty places for a query
+
+| Parameter | |
+| :--- | :--- |
+| `q` | the query |
+| **returns** | the places, released by dnit |
+
 ### dnit
 
 ```mach
 pub fun dnit(p: *Places)
 ```
+
+release what the places hold
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the places |
 
 ### settle
 

@@ -122,7 +122,7 @@ a target mink resolved and masc checked
 | `code_model` | `opt[*CodeModel]` | the code model the narrowing names, none where the target takes its host's default, which mirl reads as unpicked |
 | `output` | `opt[*mink.catalog.output.Kind]` | the output kind of the artifact under build, which mirl's address model reads: a shared object's exported definitions another image may preempt. none where no artifact selected the target |
 | `base` | `u64` | the image base the manifest states, 0 for none |
-| `stack_reserve` | `u64` | the main stack's reserve the manifest states, else mach's default for the system (mach.target.defaults), 0 for none |
+| `stack_reserve` | `u64` | the main stack's reserve the manifest states, else mach's default for the system (mach.target.defaults) when it states neither reserve nor commit, 0 for none |
 | `stack_commit` | `u64` | the main stack's commit the manifest states, 0 for none |
 
 ### none

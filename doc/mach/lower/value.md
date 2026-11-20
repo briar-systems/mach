@@ -23,17 +23,22 @@ Uses types from [`mach.base.wide`](../base/wide.md).
 
 | On `Value` | |
 | :--- | :--- |
-| [`none`](#none), [`ssa`](#ssa) | |
+| [`none`](#none) | no value, what a call of a function that gives nothing yields |
+| [`ssa`](#ssa) | the mirl value `at` of the function being built |
 | [`whole`](#whole) | the aggregate mirl value `at` of `ty`, held whole with no storage |
 | [`zero_whole`](#zero_whole) | the aggregate of `ty` every byte of which is zero, held whole |
-| [`const_int`](#const_int) | |
+| [`const_int`](#const_int) | an integer constant of up to 64 bits |
 | [`const_int_wide`](#const_int_wide) | a constant up to 128 bits wide; a narrower type reads its low bits |
-| [`const_float`](#const_float), [`const_null`](#const_null) | |
+| [`const_float`](#const_float) | a float constant, held as the bits of its binary64 encoding |
+| [`const_null`](#const_null) | the value of `ty` every bit of which is zero |
 | [`fn`](#fn) | function `index`, an address of `ptr` called through `sig` |
 | [`global`](#global) | the address of global `index`, of `ty`, into storage of `space` |
-| [`constant`](#constant), [`retype`](#retype), [`is_none`](#is_none) | |
+| [`constant`](#constant) | constant `c` of the module |
+| [`retype`](#retype) | `v` with its type replaced by `ty`, dropping the bool byte's widened i1 |
+| [`is_none`](#is_none) | whether `v` is no value |
 | [`int_lit`](#int_lit) | an integer constant's low 64 bits |
-| [`is_int_const`](#is_int_const), [`is_constant`](#is_constant) | |
+| [`is_int_const`](#is_int_const) | whether `v` is an integer constant |
+| [`is_constant`](#is_constant) | whether `v` is a constant: an integer, a float, every bit zero, or a module constant |
 | [`float_lit`](#float_lit) | a float constant's value |
 
 ---
@@ -90,11 +95,26 @@ align: the alignment an address is known to have, which a part of a packed aggre
 pub fun none() Value
 ```
 
+no value, what a call of a function that gives nothing yields
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | a value of kind VAL_NONE typed NONE, every other field at its empty state |
+
 ### ssa
 
 ```mach
 pub fun ssa(at: mirl.ir.id.Value, ty: Type, secret: bool) Value
 ```
+
+the mirl value `at` of the function being built
+
+| Parameter | |
+| :--- | :--- |
+| `at` | the mirl value id |
+| `ty` | its mirl type |
+| `secret` | whether the value is secret |
+| **returns** | a value of kind VAL_SSA |
 
 ### whole
 
@@ -118,6 +138,14 @@ the aggregate of `ty` every byte of which is zero, held whole
 pub fun const_int(bits: u64, ty: Type) Value
 ```
 
+an integer constant of up to 64 bits
+
+| Parameter | |
+| :--- | :--- |
+| `bits` | the constant's bits, of which a narrower type reads the low ones |
+| `ty` | its mirl type |
+| **returns** | a value of kind VAL_INT |
+
 ### const_int_wide
 
 ```mach
@@ -132,11 +160,26 @@ a constant up to 128 bits wide; a narrower type reads its low bits
 pub fun const_float(f: f64, ty: Type) Value
 ```
 
+a float constant, held as the bits of its binary64 encoding
+
+| Parameter | |
+| :--- | :--- |
+| `f` | the constant's value |
+| `ty` | its mirl type, which may be narrower than binary64 |
+| **returns** | a value of kind VAL_FLOAT |
+
 ### const_null
 
 ```mach
 pub fun const_null(ty: Type) Value
 ```
+
+the value of `ty` every bit of which is zero
+
+| Parameter | |
+| :--- | :--- |
+| `ty` | its mirl type |
+| **returns** | a value of kind VAL_NULL |
 
 ### fn
 
@@ -160,17 +203,40 @@ the address of global `index`, of `ty`, into storage of `space`
 pub fun constant(c: mirl.ir.id.Constant, ty: Type) Value
 ```
 
+constant `c` of the module
+
+| Parameter | |
+| :--- | :--- |
+| `c` | the module's constant id |
+| `ty` | the constant's mirl type |
+| **returns** | a value of kind VAL_CONST |
+
 ### retype
 
 ```mach
 pub fun retype(v: Value, ty: Type) Value
 ```
 
+`v` with its type replaced by `ty`, dropping the bool byte's widened i1
+
+| Parameter | |
+| :--- | :--- |
+| `v` | the value to retype |
+| `ty` | the new mirl type |
+| **returns** | a copy of `v` typed `ty` with `truthy` cleared |
+
 ### is_none
 
 ```mach
 pub fun is_none(v: Value) bool
 ```
+
+whether `v` is no value
+
+| Parameter | |
+| :--- | :--- |
+| `v` | the value to test |
+| **returns** | true for kind VAL_NONE |
 
 ### int_lit
 
@@ -186,11 +252,25 @@ an integer constant's low 64 bits
 pub fun is_int_const(v: Value) bool
 ```
 
+whether `v` is an integer constant
+
+| Parameter | |
+| :--- | :--- |
+| `v` | the value to test |
+| **returns** | true for kind VAL_INT |
+
 ### is_constant
 
 ```mach
 pub fun is_constant(v: Value) bool
 ```
+
+whether `v` is a constant: an integer, a float, every bit zero, or a module constant
+
+| Parameter | |
+| :--- | :--- |
+| `v` | the value to test |
+| **returns** | true for kind VAL_INT, VAL_FLOAT, VAL_NULL or VAL_CONST |
 
 ### float_lit
 

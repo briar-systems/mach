@@ -27,13 +27,13 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 
 | On `Module` | |
 | :--- | :--- |
-| [`module_dnit`](#module_dnit) | |
+| [`module_dnit`](#module_dnit) | release what a module's load record owns: its contexts, walk marks, union frames, lists and demand index |
 | [`walked`](#walked) | whether the walk reached a declaration in the module's build target's frame |
 | [`binding_for`](#binding_for) | the record of what the import declaration `decl` binds, none when the load recorded none |
 
 | On `Loader` | |
 | :--- | :--- |
-| [`init`](#init) | |
+| [`init`](#init) | a loader with no modules, no host and no union tuples |
 | [`dnit`](#dnit) | release what the loader owns; each module's record is released by its row's owner |
 | [`bind`](#bind) | point the loader at what runs it, which may have moved since its last use |
 | [`unbind`](#unbind) | drop the host `bind` gave, whose context lives only as long as the walk it serves |
@@ -41,7 +41,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`module_find`](#module_find) | the id of the module named `fqn`, none when the load has not reached it |
 | [`module_of`](#module_of) | the id of the module a load product names by stable id, MODULE_NIL when the load has not reached it |
 | [`gated_at`](#gated_at) | whether the module is gated out of this build |
-| [`module_count`](#module_count) | |
+| [`module_count`](#module_count) | how many modules the load has reached |
 | [`module_load_one`](#module_load_one) | parse the module `fqn` names without walking it, as a root a later phase reads alone |
 | [`module_load`](#module_load) | load the module `fqn` names and everything it reaches: each is parsed, its gates decided and its imports loaded first, then handed to the host as done |
 | [`module_reload`](#module_reload) | reparse and re-walk one loaded module in place, after its text changed, and say whether its load surface survived: the modules it reaches, the public constants it declares to importers' gates, its own gate outcome and its target gating |
@@ -158,6 +158,13 @@ stable id
 pub fun module_dnit(a: *std.allocator.Allocator, m: *Module)
 ```
 
+release what a module's load record owns: its contexts, walk marks, union frames, lists and demand index
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator the record's storage came from, the loader's |
+| `m` | the record to release |
+
 ### walked
 
 ```mach
@@ -272,6 +279,14 @@ those gates read, and leaves a load record on each
 pub fun init(s: *mach.session.Session, a: *std.allocator.Allocator) Loader
 ```
 
+a loader with no modules, no host and no union tuples
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session whose interner, sources and module ids the load uses |
+| `a` | the allocator the loader's tables grow from |
+| **returns** | the loader, bound with `bind` before each use and released with `dnit` |
+
 ### dnit
 
 ```mach
@@ -333,6 +348,13 @@ whether the module is gated out of this build
 ```mach
 pub fun module_count(l: *Loader) u32
 ```
+
+how many modules the load has reached
+
+| Parameter | |
+| :--- | :--- |
+| `l` | the loader |
+| **returns** | the module count, one past the highest module index |
 
 ### module_load_one
 

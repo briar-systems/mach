@@ -21,11 +21,12 @@ Uses types from [`mach.base.fail`](../../base/fail.md).
 | Type | | |
 | :--- | :--- | :--- |
 | [`Written`](#written) | `rec` | what wrote the output at a path: the link's key, the digest of the bytes it wrote, whether it read a file a search found, and the files beyond its keyed inputs it read, which a record owns and a caller's lends |
-| [`Store`](#store) | `rec` |  |
+| [`Store`](#store) | `rec` | the link records of a cell, indexed by the hash of their paths |
 
 | On `Store` | |
 | :--- | :--- |
-| [`init`](#init), [`dnit`](#dnit) | |
+| [`init`](#init) | an empty store |
+| [`dnit`](#dnit) | release a store's records, their paths and their files |
 | [`written`](#written-1) | what the record of `path` says wrote it, its files the store's, none when no link is recorded there |
 | [`put`](#put) | the record of `path` set to `w`, a copy of its files the store's; a path whose hash another path holds is not recorded, so its link always runs |
 | [`decode`](#decode) | the store `bytes` hold: every record, or none at all when the bytes are not a complete store |
@@ -59,17 +60,38 @@ pub rec Store {
 }
 ```
 
+the link records of a cell, indexed by the hash of their paths
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `alloc` | `*std.allocator.Allocator` | the allocator owning every record's path and files |
+| `records` | `Vector[Record]` | the records in the order they were put |
+| `index` | `std.collections.map.Map[u64, u32]` | each recorded path's hash to its record's position |
+
 ### init
 
 ```mach
 pub fun init(a: *std.allocator.Allocator) Store
 ```
 
+an empty store
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator the store's records are kept in |
+| **returns** | the store, released with dnit |
+
 ### dnit
 
 ```mach
 pub fun dnit(st: *Store)
 ```
+
+release a store's records, their paths and their files
+
+| Parameter | |
+| :--- | :--- |
+| `st` | the store to release |
 
 ### written
 

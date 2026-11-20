@@ -18,7 +18,7 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | :--- | :--- | :--- |
 | [`Origin`](#origin) | `def` | the phase or command that produced a diagnostic |
 | [`ChildKind`](#childkind) | `def` |  |
-| [`Child`](#child) | `rec` |  |
+| [`Child`](#child) | `rec` | a note or a help line attached to a diagnostic |
 | [`FixId`](#fixid) | `def` | a fix's position in its diagnostic's fix list |
 | [`Diagnostic`](#diagnostic) | `rec` | one diagnostic; its severity is its kind's, read with `is_error` |
 | [`DiagnosticStore`](#diagnosticstore) | `rec` | the diagnostics of a build, in the order they were committed |
@@ -42,7 +42,7 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 
 | On `DiagnosticStore` | |
 | :--- | :--- |
-| [`store_init`](#store_init) | |
+| [`store_init`](#store_init) | an empty store attributing to no origin, showing every warning of the project being built |
 | [`set_origin`](#set_origin) | attribute every diagnostic committed to the store from now on whose builder names no origin to `o`; a diagnostic already committed keeps its own |
 | [`govern`](#govern) | govern the warnings of the project being built that reach the store from now on by `g` |
 | [`owner_add`](#owner_add) | a further owner of warnings, governed by `g`, whose files `own` hands it |
@@ -63,7 +63,7 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`lost_count`](#lost_count) | how many diagnostics `store` could not take; a nil store lost none |
 | [`content_equal`](#content_equal) | compare observable diagnostic content without allocation or store identity |
 | [`copy`](#copy) | an owned copy of `src` from `a`, every diagnostic and its lost count kept, released with store_dnit |
-| [`replay_into`](#replay_into) | |
+| [`replay_into`](#replay_into) | commit a copy of every diagnostic of `src` to `dst`, each where it stands, and add `src`'s lost count to `dst`'s |
 | [`replay_located`](#replay_located) | replay into `dst` only the diagnostics of `src` placed somewhere, with its lost count: what a report placed nowhere waits for a requester to place does not come along |
 | [`replay_unplaced`](#replay_unplaced) | replay into `dst` only the diagnostics of `src` placed nowhere (their file base_source.FILE_NIL), each reported at `at` |
 | [`encode`](#encode) | write the store's diagnostics as bytes: their count, then per diagnostic its origin, its kind's key, location and message, then its notes, related places and fixes |
@@ -73,7 +73,8 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`builder_init`](#builder_init) | a builder for a diagnostic of kind `k` |
 | [`builder_initf`](#builder_initf) | a builder for a diagnostic of kind `k` whose message is `fmt` formatted with `args`; a format the allocator refuses is a failure, never a substitute message |
 | [`builder_dnit`](#builder_dnit) | release what a builder owns; a nil builder, or one already committed or released, owns nothing |
-| [`attach_note`](#attach_note), [`attach_help`](#attach_help) | |
+| [`attach_note`](#attach_note) | attach a note, copied through the builder's allocator |
+| [`attach_help`](#attach_help) | attach a help line, copied through the builder's allocator |
 | [`attach_related`](#attach_related) | a related place; a nil or empty label shows the place without one |
 | [`attach_fix`](#attach_fix) | a fix of one edit, which `attach_fix_edit` extends |
 | [`attach_fix_edit`](#attach_fix_edit) | a further edit of fix `fix`, which may not overlap one it already makes |
@@ -89,10 +90,12 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`format`](#format) | `fmt` formatted with `va` into `a`, which owns the text; a refusal to format is the failure instead |
 | [`join`](#join) | the texts `va` joined into `a`, which owns the result; a refusal to join is the failure instead |
 | [`text_retain`](#text_retain) | the interner's copy of a borrowed `text`, which outlives the storage `text` came from |
+| [`failure_retain`](#failure_retain) | `f` with its text the interner's copy, so it outlives the storage its text was made in, as a failure a product or a status keeps past the operation that made it does |
 | [`text_intern`](#text_intern) | `text`, owned by `a`, moved into the interner: the interned copy outlives `a`'s storage, and `text` is released either way |
 | [`format_intern`](#format_intern) | `fmt` formatted with `va` through `a` as scratch and interned, so the text outlives `a`'s storage |
 | [`refusal_interned`](#refusal_interned) | `fail.refusal` of `op` with its text interned, so the failure outlives `a`'s storage; a failure that stands in for the text carries a static one and is returned as it is |
-| [`suggestion_build`](#suggestion_build), [`fix_label_replace`](#fix_label_replace) | |
+| [`suggestion_build`](#suggestion_build) | the text "did you mean `name`?", owned by `a` |
+| [`fix_label_replace`](#fix_label_replace) | the fix label "replace with `name`", owned by `a` |
 
 ---
 
@@ -150,6 +153,13 @@ pub rec Child {
     text: str;
 }
 ```
+
+a note or a help line attached to a diagnostic
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `ChildKind` | CHILD_NOTE or CHILD_HELP |
+| `text` | `str` | the line, owned by the allocator of the diagnostic that holds it |
 
 ## FixId
 
@@ -224,6 +234,13 @@ its origin, is dropped
 ```mach
 pub fun store_init(a: *std.allocator.Allocator) DiagnosticStore
 ```
+
+an empty store attributing to no origin, showing every warning of the project being built
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator every diagnostic the store holds is owned through |
+| **returns** | the store, released with store_dnit |
 
 ### set_origin
 
@@ -423,6 +440,15 @@ an owned copy of `src` from `a`, every diagnostic and its lost count kept, relea
 pub fun replay_into(dst: *DiagnosticStore, src: *DiagnosticStore) err[mach.base.fail.Fail]
 ```
 
+commit a copy of every diagnostic of `src` to `dst`, each where it stands, and add `src`'s lost
+count to `dst`'s. a copy that fails rolls `dst` back to what it held before
+
+| Parameter | |
+| :--- | :--- |
+| `dst` | the store that takes the copies |
+| `src` | the store replayed, left as it was |
+| **returns** | a failure when either store is nil, they are one store, or a copy is refused |
+
 ### replay_located
 
 ```mach
@@ -548,11 +574,27 @@ nothing
 pub fun attach_note(b: *DiagnosticBuilder, text: str) err[mach.base.fail.Fail]
 ```
 
+attach a note, copied through the builder's allocator
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `text` | the note |
+| **returns** | a failure when the builder is not live, or the allocator's refusal |
+
 ### attach_help
 
 ```mach
 pub fun attach_help(b: *DiagnosticBuilder, text: str) err[mach.base.fail.Fail]
 ```
+
+attach a help line, copied through the builder's allocator
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `text` | the help line |
+| **returns** | a failure when the builder is not live, or the allocator's refusal |
 
 ### attach_related
 
@@ -654,6 +696,16 @@ pub fun text_retain(itn: *mach.base.intern.Interner, text: str) res[str, mach.ba
 the interner's copy of a borrowed `text`, which outlives the storage `text`
 came from
 
+### failure_retain
+
+```mach
+pub fun failure_retain(itn: *mach.base.intern.Interner, f: mach.base.fail.Fail) mach.base.fail.Fail
+```
+
+`f` with its text the interner's copy, so it outlives the storage its text was made in, as a
+failure a product or a status keeps past the operation that made it does. a reported failure
+and a refusal of storage carry no text to copy, and a refused copy is that refusal
+
 ### text_intern
 
 ```mach
@@ -688,9 +740,25 @@ returned as it is
 pub fun suggestion_build(a: *std.allocator.Allocator, name: str) res[str, mach.base.fail.Fail]
 ```
 
+the text "did you mean `name`?", owned by `a`
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator the text is owned through |
+| `name` | the suggested name |
+| **returns** | the text, or the failure that refused the join |
+
 ### fix_label_replace
 
 ```mach
 pub fun fix_label_replace(a: *std.allocator.Allocator, name: str) res[str, mach.base.fail.Fail]
 ```
+
+the fix label "replace with `name`", owned by `a`
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator the label is owned through |
+| `name` | the replacement name |
+| **returns** | the label, or the failure that refused the join |
 

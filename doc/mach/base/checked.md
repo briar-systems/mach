@@ -12,7 +12,8 @@ Source: [`src/base/checked.mach`](../../../src/base/checked.mach)
 
 | On `Cause` | |
 | :--- | :--- |
-| [`ADD_OVERFLOW`](#cause), [`usize_add`](#usize_add) | |
+| [`ADD_OVERFLOW`](#cause) | |
+| [`usize_add`](#usize_add) | the sum of two sizes, refused when it does not fit a usize |
 
 ---
 
@@ -31,4 +32,12 @@ pub def Cause: u8
 ```mach
 pub fun usize_add(left: usize, right: usize) res[usize, Cause]
 ```
+
+the sum of two sizes, refused when it does not fit a usize
+
+| Parameter | |
+| :--- | :--- |
+| `left` | the first operand |
+| `right` | the second operand |
+| **returns** | the sum, or ADD_OVERFLOW when it would wrap |
 

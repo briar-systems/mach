@@ -30,10 +30,10 @@ Uses types from [`mach.base.diagnostic`](base/diagnostic.md), [`mach.base.fail`]
 | :--- | :--- |
 | [`analyze`](#analyze) | run the frontend over an open buffer to the requested phase |
 | [`init`](#init) | an editor facade over a caller-owned Session, borrowed for serial use; neither may move while the other holds its address, and there is no concurrent request support |
-| [`open`](#open) | register a buffer's text under a path and return its FileId the text is loaded into the session SourceMap and set as the overlay for path, so a project load reads the buffer instead of the file on disk; marks the project dirty |
+| [`open`](#open) | register a buffer's text under a path and return its FileId the text is loaded into the session SourceMap and set as the overlay for path, so a project load reads the buffer instead of the file on disk |
 | [`update`](#update) | replace an open buffer's text and drop its cached analysis |
 | [`dnit`](#dnit) | retire every editor-owned input together and free the editor's structural state |
-| [`fail_dnit`](#fail_dnit) | release an operational failure returned by analyze or build |
+| [`fail_dnit`](#fail_dnit) | release an operational failure returned by analyze |
 
 | On `AnalysisRequest` | |
 | :--- | :--- |
@@ -44,7 +44,7 @@ Uses types from [`mach.base.diagnostic`](base/diagnostic.md), [`mach.base.fail`]
 | [`analysis_dnit`](#analysis_dnit) | release an analysis result and everything it owns; a zero result is a no-op |
 | [`ast_of`](#ast_of) | the AST of the analyzed buffer |
 | [`resolve_of`](#resolve_of) | the resolve product, under ast_of's view rules; the phase must be at least compile.FRONTEND_RESOLVE |
-| [`sema_of`](#sema_of) | the sema product, under ast_of's view rules; the phase must be driver.FRONTEND_SEMA reached only by mach-lsp |
+| [`sema_of`](#sema_of) | the sema product, under ast_of's view rules; the phase must be compile.FRONTEND_SEMA reached only by mach-lsp |
 | [`parse_text`](#parse_text) | parse a text on its own, with no buffer, project or session: the text is copied into the result as its source under FILE_NIL, and lexical and syntax errors become the result's diagnostics |
 | [`same_shape`](#same_shape) | whether two results' trees have the same shape, as ast.same_shape compares them reached only by mach-lsp |
 
@@ -147,7 +147,8 @@ pub fun open(es: *EditorSession, path: str, text: str) res[mach.base.source.File
 
 register a buffer's text under a path and return its FileId
 the text is loaded into the session SourceMap and set as the overlay for path, so a
-project load reads the buffer instead of the file on disk; marks the project dirty
+project load reads the buffer instead of the file on disk. a newly opened buffer marks the
+project dirty, and a changed text of an open one queues its module for an in-place refresh
 
 | Parameter | |
 | :--- | :--- |
@@ -192,7 +193,7 @@ destroy the Session only after this succeeds; there is no separate close-all
 pub fun fail_dnit(es: *EditorSession, f: *mach.base.fail.Fail)
 ```
 
-release an operational failure returned by analyze or build
+release an operational failure returned by analyze
 
 | Parameter | |
 | :--- | :--- |
@@ -282,8 +283,7 @@ pub fun analysis_dnit(result: *AnalysisResult)
 ```
 
 release an analysis result and everything it owns; a zero result is a no-op. this
-also ends the lifetime of every raw product borrowed from it, and a token stream from
-tokenize must be freed before it because its bytes borrow the result's source
+also ends the lifetime of every raw product borrowed from it
 
 | Parameter | |
 | :--- | :--- |
@@ -296,7 +296,7 @@ pub fun ast_of(result: *AnalysisResult) res[*mach.front.ast.Ast, mach.base.fail.
 ```
 
 the AST of the analyzed buffer. raw products borrow the current serial view: a later
-open, update, close, dnit, analyze, build or query operation expires the view, after
+open, update, dnit, analyze or query operation expires the view, after
 which every checked accessor answers a Fail and a pointer already obtained must not be
 dereferenced. a rejected parse can still expose a partial AST; a fatal acquisition
 exposes nil. a parse_text result owns its tree, which stays valid until analysis_dnit
@@ -328,7 +328,7 @@ reached only by mach-lsp
 pub fun sema_of(result: *AnalysisResult) res[*mach.front.sema.product.SemaResult, mach.base.fail.Fail]
 ```
 
-the sema product, under ast_of's view rules; the phase must be driver.FRONTEND_SEMA
+the sema product, under ast_of's view rules; the phase must be compile.FRONTEND_SEMA
 reached only by mach-lsp
 
 | Parameter | |

@@ -14,7 +14,8 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.wire`](../base/
 | Functions | |
 | :--- | :--- |
 | [`handle_bytes`](#handle_bytes) | the bytes of a handle product, which its encoder wrote `need` bytes long and the query engine hands back only as published, so the read is total: a product shorter than its encoding is a broken invariant of the driver, and it stops the compiler |
-| [`resolve_handle_encode`](#resolve_handle_encode), [`resolve_handle_decode`](#resolve_handle_decode) | |
+| [`resolve_handle_encode`](#resolve_handle_encode) | encode a resolve result as a handle product holding its pointer |
+| [`resolve_handle_decode`](#resolve_handle_decode) | the resolve result a handle product points to, stopping the compiler when the product is short |
 | [`output`](#output) | a grown fingerprint sink's bytes as a query output owned by the caller; the sink is left empty |
 | [`ct_value_encode`](#ct_value_encode) | a CONST_ELEM value names an element of its origin's definition, so it folds that definition's revision |
 
@@ -38,11 +39,26 @@ encoding is a broken invariant of the driver, and it stops the compiler
 pub fun resolve_handle_encode(alloc: *std.allocator.Allocator, r: *mach.front.resolve.ResolveResult) res[mach.session.query.QueryOutput, mach.base.fail.Fail]
 ```
 
+encode a resolve result as a handle product holding its pointer
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | allocator for the product bytes and the one that owns `r` |
+| `r` | resolve result the product takes ownership of |
+| **returns** | the product, or the failure of its allocation, in which case `r` is freed |
+
 ### resolve_handle_decode
 
 ```mach
 pub fun resolve_handle_decode(e: mach.session.query.QueryView) *mach.front.resolve.ResolveResult
 ```
+
+the resolve result a handle product points to, stopping the compiler when the product is short
+
+| Parameter | |
+| :--- | :--- |
+| `e` | published view of a product written by resolve_handle_encode |
+| **returns** | the resolve result, still owned by the query engine |
 
 ### output
 

@@ -11,23 +11,33 @@ Uses types from [`mach.base.fail`](../base/fail.md).
 
 | Functions | |
 | :--- | :--- |
-| [`is_none`](#is_none), [`same`](#same) | |
+| [`is_none`](#is_none) | whether `t` is NONE, the type of what gives nothing |
+| [`same`](#same) | whether two interned types are the same type |
 | [`int`](#int) | a signless integer of `bits`, rounded up to a width mirl holds |
-| [`float`](#float), [`ptr`](#ptr), [`ptr_in`](#ptr_in), [`vector`](#vector), [`array`](#array) | |
+| [`float`](#float) | a float of `bits` |
+| [`ptr`](#ptr) | a pointer into the default address space |
+| [`ptr_in`](#ptr_in) | a pointer into the address space `space` |
+| [`vector`](#vector) | a vector of `lanes` lanes of `element` |
+| [`array`](#array) | an array of `count` elements of `element`, at the stride the data layout gives |
 | [`structure_at`](#structure_at) | a structure whose members stand at the offsets mach states, as a constant's byte runs do |
 | [`signature`](#signature) | a signature: its parameters and results, each narrow integer with its extension |
 | [`restated`](#restated) | the signature `sig` with its `n` parameters of the types at `params`, its results, extensions and convention kept |
 | [`variadic`](#variadic) | the signature `sig` taking unnamed arguments after its parameters, as a C function declared with `...` does |
 | [`shape`](#shape) | the shape of `ty` as the table holds it, valid until the table next interns a type |
-| [`is_int`](#is_int) | |
+| [`is_int`](#is_int) | whether `ty` is an integer |
 | [`int_width`](#int_width) | an integer's width, 0 for any other type |
-| [`is_float`](#is_float) | |
+| [`is_float`](#is_float) | whether `ty` is a float |
 | [`float_width`](#float_width) | a float's width, 0 for any other type |
 | [`space_of`](#space_of) | the address space a pointer type points into, the default space for any other type |
-| [`is_ptr`](#is_ptr), [`is_vector`](#is_vector), [`is_function`](#is_function), [`is_handle`](#is_handle) | |
+| [`is_ptr`](#is_ptr) | whether `ty` is a pointer |
+| [`is_vector`](#is_vector) | whether `ty` is a vector |
+| [`is_function`](#is_function) | whether `ty` is a signature |
+| [`is_handle`](#is_handle) | whether `ty` is a handle of any kind |
 | [`handle`](#handle) | the handle of the kind `kind`, as its family mints it, made of the `n` operands at `operands` |
 | [`handle_of`](#handle_of) | whether `ty` is a handle of the kind `kind` |
-| [`is_struct`](#is_struct), [`is_array`](#is_array), [`is_union`](#is_union) | |
+| [`is_struct`](#is_struct) | whether `ty` is a structure |
+| [`is_array`](#is_array) | whether `ty` is an array |
+| [`is_union`](#is_union) | whether `ty` is a union |
 | [`is_aggregate`](#is_aggregate) | a structure, union or array: what lowering holds in storage and passes by its address |
 | [`is_float_like`](#is_float_like) | a float or a vector of floats |
 | [`is_ptr_like`](#is_ptr_like) | a pointer or a vector of pointers |
@@ -60,11 +70,26 @@ Uses types from [`mach.base.fail`](../base/fail.md).
 pub fun is_none(t: Type) bool
 ```
 
+whether `t` is NONE, the type of what gives nothing
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the type to test |
+| **returns** | true when `t` is NONE |
+
 ### same
 
 ```mach
 pub fun same(a: Type, b: Type) bool
 ```
+
+whether two interned types are the same type
+
+| Parameter | |
+| :--- | :--- |
+| `a` | one type |
+| `b` | the other type |
+| **returns** | true when both name one entry of the table |
 
 ### int
 
@@ -80,11 +105,26 @@ a signless integer of `bits`, rounded up to a width mirl holds
 pub fun float(t: *mirl.ir.type.table.Table, bits: u32) res[Type, mach.base.fail.Fail]
 ```
 
+a float of `bits`
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| `bits` | the float width in bits |
+| **returns** | the interned type, or a failure when mirl has no format of that width or the table refuses it |
+
 ### ptr
 
 ```mach
 pub fun ptr(t: *mirl.ir.type.table.Table) res[Type, mach.base.fail.Fail]
 ```
+
+a pointer into the default address space
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| **returns** | the interned type, or the table's refusal |
 
 ### ptr_in
 
@@ -92,17 +132,43 @@ pub fun ptr(t: *mirl.ir.type.table.Table) res[Type, mach.base.fail.Fail]
 pub fun ptr_in(t: *mirl.ir.type.table.Table, space: u32) res[Type, mach.base.fail.Fail]
 ```
 
+a pointer into the address space `space`
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| `space` | the address space the pointer points into |
+| **returns** | the interned type, or the table's refusal |
+
 ### vector
 
 ```mach
 pub fun vector(t: *mirl.ir.type.table.Table, element: Type, lanes: u32) res[Type, mach.base.fail.Fail]
 ```
 
+a vector of `lanes` lanes of `element`
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| `element` | the lane type |
+| `lanes` | the lane count |
+| **returns** | the interned type, or the table's refusal |
+
 ### array
 
 ```mach
 pub fun array(t: *mirl.ir.type.table.Table, element: Type, count: u64) res[Type, mach.base.fail.Fail]
 ```
+
+an array of `count` elements of `element`, at the stride the data layout gives
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| `element` | the element type |
+| `count` | the element count |
+| **returns** | the interned type, or the table's refusal |
 
 ### structure_at
 
@@ -152,6 +218,14 @@ the shape of `ty` as the table holds it, valid until the table next interns a ty
 pub fun is_int(t: *mirl.ir.type.table.Table, ty: Type) bool
 ```
 
+whether `ty` is an integer
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| `ty` | the type to test |
+| **returns** | true for an integer, false for any other type or NONE |
+
 ### int_width
 
 ```mach
@@ -165,6 +239,14 @@ an integer's width, 0 for any other type
 ```mach
 pub fun is_float(t: *mirl.ir.type.table.Table, ty: Type) bool
 ```
+
+whether `ty` is a float
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| `ty` | the type to test |
+| **returns** | true for a float, false for any other type or NONE |
 
 ### float_width
 
@@ -188,11 +270,27 @@ the address space a pointer type points into, the default space for any other ty
 pub fun is_ptr(t: *mirl.ir.type.table.Table, ty: Type) bool
 ```
 
+whether `ty` is a pointer
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| `ty` | the type to test |
+| **returns** | true for a pointer, false for any other type or NONE |
+
 ### is_vector
 
 ```mach
 pub fun is_vector(t: *mirl.ir.type.table.Table, ty: Type) bool
 ```
+
+whether `ty` is a vector
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| `ty` | the type to test |
+| **returns** | true for a vector, false for any other type or NONE |
 
 ### is_function
 
@@ -200,11 +298,27 @@ pub fun is_vector(t: *mirl.ir.type.table.Table, ty: Type) bool
 pub fun is_function(t: *mirl.ir.type.table.Table, ty: Type) bool
 ```
 
+whether `ty` is a signature
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| `ty` | the type to test |
+| **returns** | true for a function type, false for any other type or NONE |
+
 ### is_handle
 
 ```mach
 pub fun is_handle(t: *mirl.ir.type.table.Table, ty: Type) bool
 ```
+
+whether `ty` is a handle of any kind
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| `ty` | the type to test |
+| **returns** | true for a handle, false for any other type or NONE |
 
 ### handle
 
@@ -228,17 +342,41 @@ whether `ty` is a handle of the kind `kind`
 pub fun is_struct(t: *mirl.ir.type.table.Table, ty: Type) bool
 ```
 
+whether `ty` is a structure
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| `ty` | the type to test |
+| **returns** | true for a structure, false for any other type or NONE |
+
 ### is_array
 
 ```mach
 pub fun is_array(t: *mirl.ir.type.table.Table, ty: Type) bool
 ```
 
+whether `ty` is an array
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| `ty` | the type to test |
+| **returns** | true for an array, false for any other type or NONE |
+
 ### is_union
 
 ```mach
 pub fun is_union(t: *mirl.ir.type.table.Table, ty: Type) bool
 ```
+
+whether `ty` is a union
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the module's type table |
+| `ty` | the type to test |
+| **returns** | true for a union, false for any other type or NONE |
 
 ### is_aggregate
 

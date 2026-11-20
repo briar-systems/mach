@@ -20,7 +20,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.package.closure`](cl
 | :--- | :--- |
 | [`disagreements`](#disagreements) | one line per pin that differs from the first one seen for its identity, in closure order |
 | [`refused`](#refused) | the refusal of a closure that pins a package at more than one commit, ok when `lines` is empty: every line past the first is reported to the operation's report and the first is the failure, so every command that walks a closure refuses a disagreement alike |
-| [`lines_dnit`](#lines_dnit) | |
+| [`lines_dnit`](#lines_dnit) | free every line in a vector and then the vector itself |
 
 ---
 
@@ -56,4 +56,11 @@ failure, so every command that walks a closure refuses a disagreement alike
 ```mach
 pub fun lines_dnit(a: *std.allocator.Allocator, lines: *Vector[str])
 ```
+
+free every line in a vector and then the vector itself
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator that owns the lines |
+| `lines` | the vector to release |
 

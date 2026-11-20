@@ -56,7 +56,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 
 | On `Flags` | |
 | :--- | :--- |
-| [`FLAG_ROLE`](#flags), [`FLAG_TESTING_EXCLUSIVE`](#flags), [`FLAG_STRINGS_CHECKED`](#flags), [`FLAG_PLACE_CHECKED`](#flags), [`FLAG_DEFINES`](#flags) | |
+| [`FLAG_ROLE`](#flags), [`FLAG_TESTING_EXCLUSIVE`](#flags), [`FLAG_STRINGS_CHECKED`](#flags), [`FLAG_PLACE_CHECKED`](#flags), [`FLAG_DEFINES`](#flags), [`FLAG_LOAD_STRINGS`](#flags) | |
 | [`count_flagged`](#count_flagged) | how many distinct decorators the declaration carries that carry every one of `flags`; a repeat is refused as a duplicate, so it is not counted again |
 | [`names_append`](#names_append) | appends the names of the rows that carry every one of `flags` and stand somewhere in `places`, `, `-separated in row order |
 
@@ -69,8 +69,8 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`refusal_of`](#refusal_of) | the refusal of the previous spelling at `name` in `source` with `args` arguments, nil when it is none |
 | [`constant_time_mode`](#constant_time_mode) | the constant-time mode `d` declares, "soft" or "hard", none when it declares none |
 | [`mode_admits`](#mode_admits) | whether `value` is one of the `\|`-separated `modes` |
-| [`takes_string`](#takes_string) | whether argument `ord` of `dec` is a string the load records |
-| [`string_id`](#string_id) | the string argument `ord` of `dec` evaluated to in the scope `c`; STR_NIL when it is not a constant string |
+| [`takes_string`](#takes_string) | whether argument `ord` of `dec` is a string, which the load records where it can |
+| [`string_id`](#string_id) | the string argument `ord` of `dec` evaluated to in the scope `c`, as the load or type checking recorded it; STR_NIL when it is not a constant string |
 | [`string_of`](#string_of) | the text of `string_id` |
 | [`strings_record`](#strings_record) | records into `into` the string every string argument of a module's decorators evaluates to, with the phase's own evaluator over the scope `c` |
 
@@ -230,6 +230,7 @@ what a row asks of its decorator beyond its arguments and places
 | `FLAG_STRINGS_CHECKED` |  | its string arguments are checked by the row, not by the decorator's own rule |
 | `FLAG_PLACE_CHECKED` |  | the decorator refuses a misplacement itself, in a diagnostic of its own kind |
 | `FLAG_DEFINES` |  | it supplies the type of a `def` that states none |
+| `FLAG_LOAD_STRINGS` |  | its strings are read before type checking, or by another module's, so each must be one the load evaluates; any other may be one only type checking evaluates |
 
 | Name | Value | |
 | :--- | :--- | :--- |
@@ -238,6 +239,7 @@ what a row asks of its decorator beyond its arguments and places
 | `FLAG_STRINGS_CHECKED` | `0x10` |  |
 | `FLAG_PLACE_CHECKED` | `0x20` |  |
 | `FLAG_DEFINES` | `0x40` |  |
+| `FLAG_LOAD_STRINGS` | `0x80` |  |
 
 ### count_flagged
 
@@ -351,7 +353,7 @@ whether `value` is one of the `|`-separated `modes`
 pub fun takes_string(dec: *mach.front.ast.decl.Decorator, ord: u32) bool
 ```
 
-whether argument `ord` of `dec` is a string the load records
+whether argument `ord` of `dec` is a string, which the load records where it can
 
 ### string_id
 
@@ -359,7 +361,8 @@ whether argument `ord` of `dec` is a string the load records
 pub fun string_id(c: *mach.front.comptime.scope.ComptimeCtx, a: *mach.front.ast.Ast, dec: *mach.front.ast.decl.Decorator, ord: u32) mach.base.intern.StrId
 ```
 
-the string argument `ord` of `dec` evaluated to in the scope `c`; STR_NIL when it is not a constant string
+the string argument `ord` of `dec` evaluated to in the scope `c`, as the load or type checking
+recorded it; STR_NIL when it is not a constant string
 
 ### string_of
 

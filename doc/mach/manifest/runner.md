@@ -163,7 +163,7 @@ the program `mach run` launches
 | Field | Type | |
 | :--- | :--- | :--- |
 | `path` | `str` | the built executable, or `-o` |
-| `host_runnable` | `bool` | the target's os and isa are the host's |
+| `host_runnable` | `bool` | the target's sys and arch are the host's |
 | `target_name` | `str` | the target's declared name |
 | `runner` | `Runner` | the runner the target declares, none when it declares none |
 

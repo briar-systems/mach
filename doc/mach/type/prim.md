@@ -15,9 +15,9 @@ Uses types from [`mach.base.float`](../base/float.md), [`mach.base.wide`](../bas
 | :--- | :--- | :--- |
 | [`PrimClass`](#primclass) | `def` |  |
 | [`PrimDesc`](#primdesc) | `rec` | bits:  what a value occupies, in memory and as an operand width: the bits that hold its value, the width of mirl's row of its layout |
-| [`VecShape`](#vecshape) | `rec` |  |
+| [`VecShape`](#vecshape) | `rec` | one vector the type table seeds |
 | [`IntRange`](#intrange) | `rec` | the magnitudes an integer kind admits: min_mag is the largest negated value (the signed minimum), max_mag the largest positive one, both exact to 128 bits |
-| [`VecForm`](#vecform) | `rec` |  |
+| [`VecForm`](#vecform) | `rec` | what a vector spelling such as `u32x4` says |
 
 | On `PrimClass` | |
 | :--- | :--- |
@@ -25,30 +25,33 @@ Uses types from [`mach.base.float`](../base/float.md), [`mach.base.wide`](../bas
 
 | On `PrimDesc` | |
 | :--- | :--- |
-| [`prim_desc`](#prim_desc) | |
+| [`prim_desc`](#prim_desc) | the class, signedness and widths of a kind |
 
 | On `VecShape` | |
 | :--- | :--- |
-| [`vec_shape`](#vec_shape) | |
+| [`vec_shape`](#vec_shape) | the seeded vector at one position |
 
 | On `IntRange` | |
 | :--- | :--- |
-| [`int_range`](#int_range), [`int_fits`](#int_fits) | |
+| [`int_range`](#int_range) | the values an integer kind admits a kind wider than 128 bits answers what an i128 holds when signed, and 0 to the i128 maximum when unsigned |
+| [`int_fits`](#int_fits) | whether a signed magnitude lies in a range |
 
 | On `VecForm` | |
 | :--- | :--- |
-| [`vector_form`](#vector_form) | |
+| [`vector_form`](#vector_form) | read a vector spelling such as `u32x4` |
 
 | Functions | |
 | :--- | :--- |
 | [`is_prim`](#is_prim) | the primitive predicate: a kind is primitive exactly when the catalog names it, never because of where it sits in the TypeKind numbering |
 | [`prim_index`](#prim_index) | the catalog position of a primitive kind, the index of every table sized by PRIM_COUNT |
 | [`prim_kind_at`](#prim_kind_at) | the kind at a catalog position, for walkers over 0..PRIM_COUNT |
-| [`prim_name`](#prim_name), [`prim_spelling_len`](#prim_spelling_len) | |
+| [`prim_name`](#prim_name) | the spelling of a primitive kind |
+| [`prim_spelling_len`](#prim_spelling_len) | the length of a primitive kind's spelling |
 | [`int_kind_for`](#int_kind_for) | the integer primitive of a width and signedness, absent when the catalog has no such row; the one lookup every width-driven typing goes through |
-| [`prim_from_view`](#prim_from_view), [`int_fits_either_sign`](#int_fits_either_sign) | |
+| [`prim_from_view`](#prim_from_view) | the primitive a name spells exactly |
+| [`int_fits_either_sign`](#int_fits_either_sign) | whether a magnitude fits a kind as a positive or as a negative value |
 | [`float_width_of`](#float_width_of) | the width of a float kind; FLOAT_W_NONE for every other kind |
-| [`is_vector_spelling`](#is_vector_spelling) | |
+| [`is_vector_spelling`](#is_vector_spelling) | whether a name has the form of a vector spelling, well formed or not |
 
 | Constants | |
 | :--- | :--- |
@@ -94,6 +97,13 @@ width: the bits that hold its value, the width of mirl's row of its layout. only
 pub fun prim_desc(kind: TypeKind) PrimDesc
 ```
 
+the class, signedness and widths of a kind
+
+| Parameter | |
+| :--- | :--- |
+| `kind` | the kind |
+| **returns** | its description, PRIM_CLASS_NONE with zero widths for a kind the catalog does not name |
+
 ## VecShape
 
 ```mach
@@ -104,11 +114,26 @@ pub rec VecShape {
 }
 ```
 
+one vector the type table seeds
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `name` | `str` | its spelling |
+| `element` | `TypeKind` | its lane kind |
+| `lanes` | `u32` | its lane count |
+
 ### vec_shape
 
 ```mach
 pub fun vec_shape(index: u32) VecShape
 ```
+
+the seeded vector at one position
+
+| Parameter | |
+| :--- | :--- |
+| `index` | the position below VEC_COUNT |
+| **returns** | its shape, a nil name and zero lanes at or past VEC_COUNT |
 
 ## IntRange
 
@@ -129,11 +154,28 @@ the magnitudes an integer kind admits: min_mag is the largest negated value
 pub fun int_range(kind: TypeKind) opt[IntRange]
 ```
 
+the values an integer kind admits
+a kind wider than 128 bits answers what an i128 holds when signed, and 0 to the i128 maximum when unsigned
+
+| Parameter | |
+| :--- | :--- |
+| `kind` | the kind |
+| **returns** | its range, none for a kind that is not an integer |
+
 ### int_fits
 
 ```mach
 pub fun int_fits(value: mach.base.wide.Wide, negated: bool, r: IntRange) bool
 ```
+
+whether a signed magnitude lies in a range
+
+| Parameter | |
+| :--- | :--- |
+| `value` | the magnitude |
+| `negated` | whether the value is negative |
+| `r` | the range |
+| **returns** | true when it fits |
 
 ## VecForm
 
@@ -146,11 +188,27 @@ pub rec VecForm {
 }
 ```
 
+what a vector spelling such as `u32x4` says
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `status` | `VecFormStatus` | whether it is a vector spelling and how it is malformed (`VEC_FORM_*`) |
+| `element` | `TypeKind` | the lane kind |
+| `lanes` | `u32` | the lane count, MAX_VEC_LANES + 1 for any count past it |
+| `bits` | `u32` | the total width in bits, set only when well formed |
+
 ### vector_form
 
 ```mach
 pub fun vector_form(name: str) VecForm
 ```
+
+read a vector spelling such as `u32x4`
+
+| Parameter | |
+| :--- | :--- |
+| `name` | the spelling, which may be nil |
+| **returns** | its form, VEC_FORM_NONE when `name` is no vector spelling |
 
 ## Functions
 
@@ -186,11 +244,25 @@ the kind at a catalog position, for walkers over 0..PRIM_COUNT
 pub fun prim_name(kind: TypeKind) str
 ```
 
+the spelling of a primitive kind
+
+| Parameter | |
+| :--- | :--- |
+| `kind` | the kind |
+| **returns** | its spelling, nil for a kind the catalog does not name |
+
 ### prim_spelling_len
 
 ```mach
 pub fun prim_spelling_len(kind: TypeKind) usize
 ```
+
+the length of a primitive kind's spelling
+
+| Parameter | |
+| :--- | :--- |
+| `kind` | the kind |
+| **returns** | the length in bytes, 0 for a kind the catalog does not name |
 
 ### int_kind_for
 
@@ -207,11 +279,26 @@ no such row; the one lookup every width-driven typing goes through
 pub fun prim_from_view(name: View) opt[TypeKind]
 ```
 
+the primitive a name spells exactly
+
+| Parameter | |
+| :--- | :--- |
+| `name` | the name |
+| **returns** | the kind, none when it spells no primitive |
+
 ### int_fits_either_sign
 
 ```mach
 pub fun int_fits_either_sign(value: mach.base.wide.Wide, kind: TypeKind) bool
 ```
+
+whether a magnitude fits a kind as a positive or as a negative value
+
+| Parameter | |
+| :--- | :--- |
+| `value` | the magnitude |
+| `kind` | the kind |
+| **returns** | true when either fits, and for a kind that is not an integer |
 
 ### float_width_of
 
@@ -226,6 +313,13 @@ the width of a float kind; FLOAT_W_NONE for every other kind
 ```mach
 pub fun is_vector_spelling(name: str) bool
 ```
+
+whether a name has the form of a vector spelling, well formed or not
+
+| Parameter | |
+| :--- | :--- |
+| `name` | the name |
+| **returns** | true when it has |
 
 ## Constants
 

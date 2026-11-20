@@ -21,15 +21,16 @@ Uses types from [`mach.base.fail`](../../base/fail.md).
 | Type | | |
 | :--- | :--- | :--- |
 | [`Digests`](#digests) | `rec` | what a source text digests to (compile/surface): its bytes, its text without any function or test body, and its template text without positions and with the positions of what it omits |
-| [`Memo`](#memo) | `rec` |  |
+| [`Memo`](#memo) | `rec` | the digest memo of one compiler identity |
 
 | On `Memo` | |
 | :--- | :--- |
-| [`init`](#init), [`dnit`](#dnit) | |
+| [`init`](#init) | an empty memo of a compiler |
+| [`dnit`](#dnit) | release a memo's entries and index |
 | [`lookup`](#lookup) | the surface digests remembered for the text whose digest `out.content` holds, written into `out`; false when the memo holds none |
 | [`record`](#record) | remember the digests of a text, under its digest |
 | [`decode`](#decode) | the memo `bytes` hold for `compiler`: every entry, or none at all when the bytes are not a complete memo of that compiler |
-| [`encode`](#encode) | the memo's used entries as bytes, res_allocate in a and owned by the caller |
+| [`encode`](#encode) | the memo's used entries as bytes, allocated in a and owned by the caller |
 | [`load`](#load) | the memo stored at `file`, empty when there is none or it cannot be read; the file's bytes pass through `a` and are released before return |
 | [`store`](#store) | write the memo to `file` through a sibling temporary when it would change: an entry was added or one went unused |
 
@@ -61,17 +62,41 @@ pub rec Memo {
 }
 ```
 
+the digest memo of one compiler identity
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `alloc` | `*std.allocator.Allocator` | the allocator holding the entries and the index |
+| `compiler` | `[32]u8` | the digest of the compiler whose memo this is |
+| `entries` | `Vector[Entry]` | the remembered digests in the order they were added |
+| `index` | `std.collections.map.Map[u64, u32]` | each entry's index key to its position |
+| `dirty` | `bool` | an entry was added since the memo was read or stored |
+
 ### init
 
 ```mach
 pub fun init(a: *std.allocator.Allocator, compiler: *[32]u8) Memo
 ```
 
+an empty memo of a compiler
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator the memo's entries are kept in |
+| `compiler` | the compiler's 32-byte digest, copied |
+| **returns** | the memo, released with dnit |
+
 ### dnit
 
 ```mach
 pub fun dnit(m: *Memo)
 ```
+
+release a memo's entries and index
+
+| Parameter | |
+| :--- | :--- |
+| `m` | the memo to release |
 
 ### lookup
 
@@ -105,7 +130,7 @@ bytes are not a complete memo of that compiler. err only when allocation fails
 pub fun encode(m: *Memo, a: *std.allocator.Allocator, out_len: *usize) res[*u8, std.allocator.Error]
 ```
 
-the memo's used entries as bytes, res_allocate in a and owned by the caller
+the memo's used entries as bytes, allocated in a and owned by the caller
 
 ### load
 

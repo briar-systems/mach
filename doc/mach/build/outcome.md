@@ -20,7 +20,8 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.report.testrun`](../
 
 | On `BuildSeverity` | |
 | :--- | :--- |
-| [`BUILD_OK`](#buildseverity), [`BUILD_USER`](#buildseverity), [`BUILD_ENVIRONMENT`](#buildseverity), [`BUILD_INTERNAL`](#buildseverity), [`severity_of`](#severity_of) | |
+| [`BUILD_OK`](#buildseverity), [`BUILD_USER`](#buildseverity), [`BUILD_ENVIRONMENT`](#buildseverity), [`BUILD_INTERNAL`](#buildseverity) | |
+| [`severity_of`](#severity_of) | the build severity a failure stands at |
 
 | On `BuildOutcome` | |
 | :--- | :--- |
@@ -30,7 +31,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.report.testrun`](../
 | [`record_test`](#record_test) | t's text is borrowed; the outcome keeps its own copy |
 | [`record_declassified`](#record_declassified) | d's texts are borrowed; the outcome keeps its own copies |
 | [`fold_fail`](#fold_fail) | a reported or user failure is the user's; the severity never regresses |
-| [`merge`](#merge) | capacity is reserved for both transfers before any element moves, so a refused reservation leaves both outcomes exactly as they were |
+| [`merge`](#merge) | capacity is reserved for all three transfers before any element moves, so a refused reservation leaves both outcomes exactly as they were |
 
 ---
 
@@ -52,6 +53,13 @@ pub def BuildSeverity: u8
 ```mach
 pub fun severity_of(f: *mach.base.fail.Fail) BuildSeverity
 ```
+
+the build severity a failure stands at
+
+| Parameter | |
+| :--- | :--- |
+| `f` | the failure |
+| **returns** | BUILD_ENVIRONMENT for an environment failure, BUILD_INTERNAL for an internal message, BUILD_USER otherwise |
 
 ## BuildOutcome
 
@@ -132,7 +140,7 @@ a reported or user failure is the user's; the severity never regresses
 pub fun merge(agg: *BuildOutcome, unit: *BuildOutcome) err[std.allocator.Error]
 ```
 
-capacity is reserved for both transfers before any element moves, so
+capacity is reserved for all three transfers before any element moves, so
 a refused reservation leaves both outcomes exactly as they were
 
 ## Declassified

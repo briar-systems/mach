@@ -11,17 +11,17 @@ Uses types from [`mach.base.source`](../../base/source.md), [`mach.front.ast.id`
 | Type | | |
 | :--- | :--- | :--- |
 | [`TypeKind`](#typekind) | `def` |  |
-| [`TypeNamed`](#typenamed) | `rec` |  |
-| [`TypePtr`](#typeptr) | `rec` |  |
-| [`TypeSecret`](#typesecret) | `rec` |  |
-| [`TypeArray`](#typearray) | `rec` |  |
-| [`TypeFun`](#typefun) | `rec` |  |
-| [`TypeRec`](#typerec) | `rec` |  |
-| [`TypeUni`](#typeuni) | `rec` |  |
-| [`TypeFieldType`](#typefieldtype) | `rec` |  |
-| [`TypePointeeOf`](#typepointeeof) | `rec` |  |
-| [`TypeDiscriminantOf`](#typediscriminantof) | `rec` |  |
-| [`Type`](#type) | `rec` |  |
+| [`TypeNamed`](#typenamed) | `rec` | a named type, with its generic arguments |
+| [`TypePtr`](#typeptr) | `rec` | a pointer type `*T` |
+| [`TypeSecret`](#typesecret) | `rec` | a secret type `^T` |
+| [`TypeArray`](#typearray) | `rec` | an array type `[N]T` |
+| [`TypeFun`](#typefun) | `rec` | a function type |
+| [`TypeRec`](#typerec) | `rec` | an anonymous `rec { ... }` type |
+| [`TypeUni`](#typeuni) | `rec` | an anonymous `uni { ... }` type |
+| [`TypeFieldType`](#typefieldtype) | `rec` | the type of a comptime field descriptor, written `f.type` |
+| [`TypePointeeOf`](#typepointeeof) | `rec` | `$pointee_of(T)`, the type a typed reference refers to |
+| [`TypeDiscriminantOf`](#typediscriminantof) | `rec` | `$discriminant_of(T)`, a tag's discriminator type |
+| [`Type`](#type) | `rec` | one type-syntax node |
 
 | On `TypeKind` | |
 | :--- | :--- |
@@ -69,6 +69,15 @@ pub rec TypeNamed {
 }
 ```
 
+a named type, with its generic arguments
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `name` | `mach.base.source.Span` | the span of the dotted path |
+| `args_start` | `u32` | first generic argument in the type id table |
+| `args_len` | `u32` | how many generic arguments |
+| `operand` | `bool` | whether the type stands as a type operand of a call, such as the argument of `$size_of` |
+
 ## TypePtr
 
 ```mach
@@ -76,6 +85,12 @@ pub rec TypePtr {
     pointee: mach.front.ast.id.TypeId;
 }
 ```
+
+a pointer type `*T`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `pointee` | `mach.front.ast.id.TypeId` | the pointed-to type syntax |
 
 ## TypeSecret
 
@@ -85,6 +100,12 @@ pub rec TypeSecret {
 }
 ```
 
+a secret type `^T`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `inner` | `mach.front.ast.id.TypeId` | the qualified type syntax |
+
 ## TypeArray
 
 ```mach
@@ -93,6 +114,13 @@ pub rec TypeArray {
     element: mach.front.ast.id.TypeId;
 }
 ```
+
+an array type `[N]T`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `length` | `mach.front.ast.id.ExprId` | the length expression, EXPR_NIL for `[_]` |
+| `element` | `mach.front.ast.id.TypeId` | the element type syntax |
 
 ## TypeFun
 
@@ -105,6 +133,15 @@ pub rec TypeFun {
 }
 ```
 
+a function type
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `params_start` | `u32` | first parameter in the typed name table |
+| `params_len` | `u32` | how many parameters |
+| `ret_type` | `mach.front.ast.id.TypeId` | the return type syntax, TYPE_NIL when none is written |
+| `c_variadic` | `bool` | whether the parameter list ends in a C `...` |
+
 ## TypeRec
 
 ```mach
@@ -113,6 +150,13 @@ pub rec TypeRec {
     fields_len:   u32;
 }
 ```
+
+an anonymous `rec { ... }` type
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `fields_start` | `u32` | first field in the typed name table |
+| `fields_len` | `u32` | how many fields |
 
 ## TypeUni
 
@@ -123,6 +167,13 @@ pub rec TypeUni {
 }
 ```
 
+an anonymous `uni { ... }` type
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `fields_start` | `u32` | first field in the typed name table |
+| `fields_len` | `u32` | how many fields |
+
 ## TypeFieldType
 
 ```mach
@@ -130,6 +181,12 @@ pub rec TypeFieldType {
     var_name: mach.base.source.Span;
 }
 ```
+
+the type of a comptime field descriptor, written `f.type`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `var_name` | `mach.base.source.Span` | the span of the descriptor variable |
 
 ## TypePointeeOf
 
@@ -139,6 +196,12 @@ pub rec TypePointeeOf {
 }
 ```
 
+`$pointee_of(T)`, the type a typed reference refers to
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `inner` | `mach.front.ast.id.TypeId` | the reference type syntax |
+
 ## TypeDiscriminantOf
 
 ```mach
@@ -146,6 +209,12 @@ pub rec TypeDiscriminantOf {
     inner: mach.front.ast.id.TypeId;
 }
 ```
+
+`$discriminant_of(T)`, a tag's discriminator type
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `inner` | `mach.front.ast.id.TypeId` | the tag type syntax |
 
 ## Type
 
@@ -167,4 +236,12 @@ pub rec Type {
     };
 }
 ```
+
+one type-syntax node
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `span` | `mach.base.source.Span` | the whole type as written |
+| `kind` | `TypeKind` | which TYPE_KIND_ the node is, which names the active `data` field |
+| `data` | `uni { named: TypeNamed; ptr: TypePtr; secret: TypeSecret; array: TypeArray; fun_: TypeFun; rec_: TypeRec; uni_: TypeUni; field_type: TypeFieldType; pointee_of: TypePointeeOf; discriminant_of: TypeDiscriminantOf; }` | the payload of the node's kind |
 

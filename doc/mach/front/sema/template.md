@@ -20,7 +20,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.ast`](../as
 
 | On `Template` | |
 | :--- | :--- |
-| [`none`](#none) | |
+| [`none`](#none) | the template of a module with no generic, comptime-parameter or pack function: empty tables and `present` false |
 | [`dnit`](#dnit) | release a template set; a nil one, or one never made, holds nothing |
 
 | On `Captured` | |
@@ -69,6 +69,14 @@ env: the build and module the module's comptime reads
 ```mach
 pub fun none(alloc: *std.allocator.Allocator) Template
 ```
+
+the template of a module with no generic, comptime-parameter or pack function: empty
+tables and `present` false
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | the allocator its empty tables are held in |
+| **returns** | the template, released with `dnit` |
 
 ### dnit
 

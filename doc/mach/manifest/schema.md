@@ -49,6 +49,8 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`key_text`](#key_text) | a string key as the manifest reads it: absent and empty are the same err (`is missing required key`), so both read as the empty string |
 | [`flag`](#flag) | a boolean key's value, false when it is not written; the schema check has refused any other shape |
 | [`written_value`](#written_value) | the value of a key the schema check has seen written with its row's shape, nil when it is not written |
+| [`address_of`](#address_of) | the address a value states: an integer not negative, or a string holding a decimal number or one prefixed 0x, 0o or 0b that fits 64 bits |
+| [`written_address`](#written_address) | the address the schema check admitted under `key`, none when it is not written |
 | [`key_span`](#key_span) | the key token of a table's entry `i` as written; the zero span when absent |
 | [`element_span`](#element_span) | the literal of an array's element `i`; the zero span when absent |
 | [`origin`](#origin) | where the table `sub` writes `key`, named for a refusal under `lead`, the table's label in mach.toml such as `[target.x]`, or under `--set` for a nil lead |
@@ -56,6 +58,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`value_text`](#value_text) | a scalar value as a refusal quotes it; a refused allocation is the failure |
 | [`is_valid_id`](#is_valid_id) | whether `s` is a portable identifier: non-empty, only ASCII letters, digits, '_' and '-' |
 | [`is_project_id`](#is_project_id) | whether `s` can head a `use` path, which is the rule for a project id: an identifier as the grammar spells one, a letter or '_' and then letters, digits and '_' |
+| [`project_id_refused`](#project_id_refused) | the refusal of a `[project].id` that is no project id, which the manifest writes where the caller places it |
 | [`dep_name_refused`](#dep_name_refused) | the refusal of a dependency name that is no project id: a dependency is named by the project id it declares, which a `use` path spells |
 | [`is_project_path`](#is_project_path) | whether `value` is a canonical strict descendant of the project root: non-empty, '/'-separated, no '\\', not absolute, no drive letter, no empty component, no '.' or '..' component |
 | [`check_path`](#check_path) | refuse a path that `is_project_path` does not admit, naming it as `field` and pointing at `sp`, the value as written |
@@ -92,8 +95,9 @@ whoever reads it
 ```mach
 pub rec Rewrite {
     label:       str;
-    whole:       bool;
+    dropped:     bool;
     replacement: str;
+    value:       str;
     why:         str;
     listed:      bool;
 }
@@ -104,8 +108,9 @@ the mechanical rewrite of a key as a previous major wrote it
 | Field | Type | |
 | :--- | :--- | :--- |
 | `label` | `str` | what the rewrite does; nil when the value as written has none |
-| `whole` | `bool` | the rewrite replaces the key and its value, not the key alone |
-| `replacement` | `str` | the text written in their place, nil to keep the key as written |
+| `dropped` | `bool` | the rewrite removes the key and its value |
+| `replacement` | `str` | the key written in place of the key as written, nil to keep it |
+| `value` | `str` | the value text written in place of the value as written, nil to keep it |
 | `why` | `str` | for a key this major still reads, why the key as written is refused. for a removed key, what replaces the key as written, where that depends on its value; nil where the row's note says it |
 | `listed` | `bool` | the value, one string as written, is written as an array of it |
 
@@ -340,6 +345,23 @@ pub fun written_value(t: *toml.value.Table, key: str) *toml.value.Value
 the value of a key the schema check has seen written with its row's shape, nil
 when it is not written
 
+### address_of
+
+```mach
+pub fun address_of(v: *toml.value.Value) opt[u64]
+```
+
+the address a value states: an integer not negative, or a string holding a decimal number or
+one prefixed 0x, 0o or 0b that fits 64 bits. none when it states no address
+
+### written_address
+
+```mach
+pub fun written_address(t: *toml.value.Table, key: str) opt[u64]
+```
+
+the address the schema check admitted under `key`, none when it is not written
+
 ### key_span
 
 ```mach
@@ -419,6 +441,15 @@ grammar spells one, a letter or '_' and then letters, digits and '_'
 | :--- | :--- |
 | `s` | the candidate |
 | **returns** | true when `s` is one |
+
+### project_id_refused
+
+```mach
+pub fun project_id_refused(alloc: *std.allocator.Allocator, id: str) mach.base.fail.Fail
+```
+
+the refusal of a `[project].id` that is no project id, which the manifest writes where the
+caller places it
 
 ### dep_name_refused
 

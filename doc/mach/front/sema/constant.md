@@ -23,7 +23,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.ast.id`](..
 | [`settle`](#settle) | every constant still unbound once all are tried is none, so no later read, inside a body or an instance, evaluates one again |
 | [`own_value`](#own_value) | the node of the value the module `val` `sym` declares, built in the module's store on first ask: the constant sema bound, or its initializer evaluated member by member; NONE for a declaration with no initializer of its own |
 | [`array_value`](#array_value) | the value of the array `sym` names that a `$each` reads: a module constant's, this module's built once and another module's as it published it, or the value of a `val` local to a body, built in the walk that reads it since each instance of the body may give it another; none for a binding with no array, record or case literal value |
-| [`store_of`](#store_of) | the store of constant values of the module with stable id `module`: this module's, or the one another module's interface publishes |
+| [`store_of`](#store_of) | the store of constant values of the module with stable index `module_index`: this module's, or the one another module's interface publishes |
 | [`is_aggregate`](#is_aggregate) | an array literal, or a record or case literal spelled with its head type |
 | [`type_at`](#type_at) | the type the walk gave an expression |
 | [`node_build`](#node_build) | the node of the expression `eid`: an aggregate literal member by member, the value of the constant it names, an address, or anything else as the evaluator answers it at the type the walk gave it |
@@ -117,7 +117,7 @@ a binding with no array, record or case literal value
 pub fun store_of(sc: *mach.front.sema.context.SemaContext, module_index: u32) res[*mach.front.comptime.deep.Store, mach.front.comptime.failure.EvalFail]
 ```
 
-the store of constant values of the module with stable id `module`: this module's, or the one
+the store of constant values of the module with stable index `module_index`: this module's, or the one
 another module's interface publishes
 
 ### is_aggregate

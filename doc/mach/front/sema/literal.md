@@ -42,7 +42,7 @@ a refused one leaves its literals at the default, so they are marked inner all t
 ### check_literal_shifts
 
 ```mach
-pub fun check_literal_shifts(sc: *mach.front.sema.context.SemaContext)
+pub fun check_literal_shifts(sc: *mach.front.sema.context.SemaContext) err[mach.base.fail.Fail]
 ```
 
 a shift of an untyped literal is typed by its context, so its count is checked

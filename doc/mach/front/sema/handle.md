@@ -26,13 +26,17 @@ Uses types from [`mach.front.ast.decl`](../ast/decl.md), [`mach.front.ast.id`](.
 | Functions | |
 | :--- | :--- |
 | [`arg_is_type`](#arg_is_type) | whether a handle operand names a type, which is read as one and never as a value |
-| [`read`](#read), [`read_dnit`](#read_dnit), [`validate`](#validate), [`type_of`](#type_of) | |
+| [`read`](#read) | reads the `handle` decorator `dec` on `d`: the kind its target mints and its operands, each a type or a constant word |
+| [`read_dnit`](#read_dnit) | releases the operands of a read |
+| [`validate`](#validate) | reports every problem `read` finds in the `handle` decorator `dec` on `d` |
+| [`type_of`](#type_of) | the handle type the declaration `d` mints, inert when its target is not the one selected |
 | [`check_annotation_handles_all`](#check_annotation_handles_all) | every annotation's check shares one walk, so a type that several annotations spell, as a chain of defs each over the one before does, is walked once rather than once per annotation |
-| [`scan_begin`](#scan_begin), [`type_carries_handle`](#type_carries_handle) | |
+| [`scan_begin`](#scan_begin) | begins a scan over the session's type table, reporting a failure as internal |
+| [`type_carries_handle`](#type_carries_handle) | whether `t` holds a handle, directly or under a pointer, array or secret |
 | [`annotation_refuses_indirection`](#annotation_refuses_indirection) | a binding whose written annotation holds a chain of pointers over a handle has drawn that annotation's refusal, and a binding whose type is inferred has no annotation to draw it |
-| [`check_handle_fields_all`](#check_handle_fields_all) | |
+| [`check_handle_fields_all`](#check_handle_fields_all) | reports each field of the module's records and unions, and each payload of its tags, that holds a handle |
 | [`check_handle_signature`](#check_handle_signature) | a function's parameters and result are values the program passes, and a handle reaches one by value or behind a pointer to its binding, never inside an array |
-| [`check_handle_decl`](#check_handle_decl) | |
+| [`check_handle_decl`](#check_handle_decl) | holds a module binding to the rules of handle storage: a handle stands only as itself, is bound with `gpu.sampler` or `gpu.storage`, and `gpu.sampler` and `gpu.attachment` bind nothing else |
 | [`check_annotation_handles`](#check_annotation_handles) | a generic record, union or tag instantiated so that a field or payload holds a handle, directly or through a pointer, array or secret: the instance is the declaration its arguments spell, and the same declaration written out is refused for that field |
 
 | Constants | |
@@ -67,11 +71,30 @@ whether a handle operand names a type, which is read as one and never as a value
 pub fun read(sc: *mach.front.sema.context.SemaContext, d: *mach.front.ast.decl.Decl, dec: *mach.front.ast.decl.Decorator, report: bool, depth: u32) Read
 ```
 
+reads the `handle` decorator `dec` on `d`: the kind its target mints and its operands, each a
+type or a constant word. one naming a target the build does not select is inert
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context of the module being typed |
+| `d` | the declaration carrying the decorator |
+| `dec` | the `handle` decorator |
+| `report` | whether a refusal is reported, or only returned |
+| `depth` | how many handles deep the read is, bounded by MAX_COMPOSE_DEPTH |
+| **returns** | the read, refused after a misplaced or malformed decorator or an internal failure, whose operands the caller releases with `read_dnit` |
+
 ### read_dnit
 
 ```mach
 pub fun read_dnit(sc: *mach.front.sema.context.SemaContext, r: Read)
 ```
+
+releases the operands of a read
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context whose allocator holds them |
+| `r` | the read to release |
 
 ### validate
 
@@ -79,11 +102,28 @@ pub fun read_dnit(sc: *mach.front.sema.context.SemaContext, r: Read)
 pub fun validate(sc: *mach.front.sema.context.SemaContext, d: *mach.front.ast.decl.Decl, dec: *mach.front.ast.decl.Decorator)
 ```
 
+reports every problem `read` finds in the `handle` decorator `dec` on `d`
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context of the module being typed |
+| `d` | the declaration carrying the decorator |
+| `dec` | the `handle` decorator |
+
 ### type_of
 
 ```mach
 pub fun type_of(sc: *mach.front.sema.context.SemaContext, did: mach.front.ast.id.DeclId, d: *mach.front.ast.decl.Decl) mach.type.kind.TypeId
 ```
+
+the handle type the declaration `d` mints, inert when its target is not the one selected
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context of the module being typed |
+| `did` | the declaration's id |
+| `d` | the bodyless `def` carrying the decorator |
+| **returns** | the handle type, or the error type when `d` has no readable `handle` decorator or interning the type failed |
 
 ### check_annotation_handles_all
 
@@ -100,11 +140,27 @@ chain of defs each over the one before does, is walked once rather than once per
 pub fun scan_begin(sc: *mach.front.sema.context.SemaContext, scan: *mach.type.scan.Scan) bool
 ```
 
+begins a scan over the session's type table, reporting a failure as internal
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context of the module being typed |
+| `scan` | the scan to begin, which the caller ends |
+| **returns** | true when the scan began |
+
 ### type_carries_handle
 
 ```mach
 pub fun type_carries_handle(sc: *mach.front.sema.context.SemaContext, t: mach.type.kind.TypeId) bool
 ```
+
+whether `t` holds a handle, directly or under a pointer, array or secret
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context whose type table is read |
+| `t` | the type asked about |
+| **returns** | true when it carries a handle |
 
 ### annotation_refuses_indirection
 
@@ -121,6 +177,13 @@ annotation's refusal, and a binding whose type is inferred has no annotation to 
 pub fun check_handle_fields_all(sc: *mach.front.sema.context.SemaContext)
 ```
 
+reports each field of the module's records and unions, and each payload of its tags, that
+holds a handle
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context of the module being typed |
+
 ### check_handle_signature
 
 ```mach
@@ -135,6 +198,16 @@ one by value or behind a pointer to its binding, never inside an array
 ```mach
 pub fun check_handle_decl(sc: *mach.front.sema.context.SemaContext, did: mach.front.ast.id.DeclId, d: *mach.front.ast.decl.Decl)
 ```
+
+holds a module binding to the rules of handle storage: a handle stands only as itself, is
+bound with `gpu.sampler` or `gpu.storage`, and `gpu.sampler` and `gpu.attachment` bind
+nothing else. a uniform, storage or push block of an ordinary type is an unpacked record
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context of the module being typed |
+| `did` | the declaration's id |
+| `d` | the declaration checked, which is passed over unless it is a module binding |
 
 ### check_annotation_handles
 

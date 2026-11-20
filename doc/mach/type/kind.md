@@ -17,7 +17,12 @@ Source: [`src/type/kind.mach`](../../../src/type/kind.mach)
 
 | On `TypeId` | |
 | :--- | :--- |
-| [`TYPE_NIL`](#typeid), [`TYPE_ERROR`](#typeid), [`id`](#id), [`index`](#index), [`same`](#same), [`is_nil`](#is_nil), [`is_error`](#is_error) | |
+| [`TYPE_NIL`](#typeid), [`TYPE_ERROR`](#typeid) | |
+| [`id`](#id) | the type id of a table index |
+| [`index`](#index) | the table index a type id names |
+| [`same`](#same) | whether two type ids name the same type |
+| [`is_nil`](#is_nil) | whether `t` is the reserved id for no type |
+| [`is_error`](#is_error) | whether `t` is the reserved id of the error type |
 
 | On `TypeKind` | |
 | :--- | :--- |
@@ -25,7 +30,7 @@ Source: [`src/type/kind.mach`](../../../src/type/kind.mach)
 | [`TYPE_U128`](#typekind) | the 128-bit integers are appended kinds: the catalog, never the numbering, decides what is primitive |
 | [`TYPE_I128`](#typekind) | |
 | [`TYPE_F16`](#typekind) | IEEE binary16, appended like the 128-bit integers |
-| [`TYPE_U256`](#typekind) | the 256 and 512-bit integers, appended like the 128-bit integers |
+| [`TYPE_U256`](#typekind) | the 256 and 512-bit integers and the 1-bit u1, appended like the 128-bit integers |
 | [`TYPE_I256`](#typekind), [`TYPE_U512`](#typekind), [`TYPE_I512`](#typekind), [`TYPE_U1`](#typekind) | |
 
 | Constants | |
@@ -54,11 +59,25 @@ the identity of one type in the type table
 pub fun id(index: u32) TypeId
 ```
 
+the type id of a table index
+
+| Parameter | |
+| :--- | :--- |
+| `index` | the index in the type table |
+| **returns** | the id naming it |
+
 ### index
 
 ```mach
 pub fun index(t: TypeId) u32
 ```
+
+the table index a type id names
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the id |
+| **returns** | its index in the type table |
 
 ### same
 
@@ -66,17 +85,39 @@ pub fun index(t: TypeId) u32
 pub fun same(left: TypeId, right: TypeId) bool
 ```
 
+whether two type ids name the same type
+
+| Parameter | |
+| :--- | :--- |
+| `left` | one id |
+| `right` | the other id |
+| **returns** | true when they are equal |
+
 ### is_nil
 
 ```mach
 pub fun is_nil(t: TypeId) bool
 ```
 
+whether `t` is the reserved id for no type
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the id |
+| **returns** | true for TYPE_NIL |
+
 ### is_error
 
 ```mach
 pub fun is_error(t: TypeId) bool
 ```
+
+whether `t` is the reserved id of the error type
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the id |
+| **returns** | true for TYPE_ERROR |
 
 ## TypeKind
 
@@ -114,7 +155,7 @@ pub def TypeKind: u8
 | `TYPE_U128` | `25` | the 128-bit integers are appended kinds: the catalog, never the numbering, decides what is primitive |
 | `TYPE_I128` | `26` |  |
 | `TYPE_F16` | `27` | IEEE binary16, appended like the 128-bit integers |
-| `TYPE_U256` | `28` | the 256 and 512-bit integers, appended like the 128-bit integers |
+| `TYPE_U256` | `28` | the 256 and 512-bit integers and the 1-bit u1, appended like the 128-bit integers |
 | `TYPE_I256` | `29` |  |
 | `TYPE_U512` | `30` |  |
 | `TYPE_I512` | `31` |  |

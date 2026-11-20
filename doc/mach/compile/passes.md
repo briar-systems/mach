@@ -19,12 +19,12 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`types_instances`](#types_instances) | the build types the instances module `m` asks for: its front end runs, and no object restored for it holds them |
 | [`retain_modules`](#retain_modules) | every module the load reached, gated out or not, is held under the session's active retainer: the project borrows each one's parse |
 | [`back_half_key`](#back_half_key) | a module's lowering and codegen products are keyed by its stable id, and by the test bit for its test object |
-| [`back_half_key_is_test`](#back_half_key_is_test) | |
+| [`back_half_key_is_test`](#back_half_key_is_test) | whether a back-half key names a module's test object |
 | [`unit_key`](#unit_key) | the key of unit `u`'s lowering and codegen: its module's normal key, or for an artifact taken whole that module's key with the whole bit |
 | [`back_half_key_for`](#back_half_key_for) | the normal object's key, the same in every build that compiles the module |
-| [`test_key_for`](#test_key_for) | |
+| [`test_key_for`](#test_key_for) | the back-half key of a module's test object: its stable id with the test bit |
 | [`has_test_object`](#has_test_object) | the module gets a test object in this build: a test build, and a module whose source declares a test or a `#[testing]` declaration |
-| [`test_build`](#test_build) | |
+| [`test_build`](#test_build) | whether this build's goal builds tests |
 | [`prepare_codegen_pass`](#prepare_codegen_pass) | the import libraries the declarations name, which every lowering reads, registered before any is |
 | [`run_test_pass`](#run_test_pass) | the test stage's computation: each test object's typed inputs, then each test object |
 | [`run_codegen_pass`](#run_codegen_pass) | each module in topological order, its front-end products given back once its own unit is done |
@@ -33,7 +33,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`run_link_pass`](#run_link_pass) | the link stage's computation: the current objects, then the link the build's job names, which runs only when one of its inputs moved |
 | [`prepare_link`](#prepare_link) | before the link stage's operation: when the artifact on disk is not what the link last wrote to `artifact`, or nothing was linked yet, LINK_ARTIFACT moves to a value it never held, the database's next revision, so the link runs again |
 | [`prepare_object_cache`](#prepare_object_cache) | key the loaded modules and read `obj/` under their keys (compile/cache), reported as the cache phase carved out of resolve, which it precedes |
-| [`module_in_current_project`](#module_in_current_project) | |
+| [`module_in_current_project`](#module_in_current_project) | whether a module's path starts with the configured project's id |
 
 | Constants | |
 | :--- | :--- |
@@ -102,6 +102,13 @@ test bit for its test object
 pub fun back_half_key_is_test(key: u64) bool
 ```
 
+whether a back-half key names a module's test object
+
+| Parameter | |
+| :--- | :--- |
+| `key` | the key |
+| **returns** | true when its test bit is set |
+
 ### unit_key
 
 ```mach
@@ -125,6 +132,13 @@ the normal object's key, the same in every build that compiles the module
 pub fun test_key_for(m: *mach.compile.project.ModuleEntry) u64
 ```
 
+the back-half key of a module's test object: its stable id with the test bit
+
+| Parameter | |
+| :--- | :--- |
+| `m` | the module |
+| **returns** | the key |
+
 ### has_test_object
 
 ```mach
@@ -139,6 +153,13 @@ source declares a test or a `#[testing]` declaration
 ```mach
 pub fun test_build(p: *mach.compile.project.Project) bool
 ```
+
+whether this build's goal builds tests
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the project |
+| **returns** | true for a test build or a test listing |
 
 ### prepare_codegen_pass
 
@@ -222,6 +243,14 @@ reported as the cache phase carved out of resolve, which it precedes
 ```mach
 pub fun module_in_current_project(p: *mach.compile.project.Project, fqn: mach.base.intern.StrId) bool
 ```
+
+whether a module's path starts with the configured project's id
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the project |
+| `fqn` | the module's fully qualified name |
+| **returns** | true when the path's first segment is the project id |
 
 ## Constants
 

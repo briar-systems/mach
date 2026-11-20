@@ -15,7 +15,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | Type | | |
 | :--- | :--- | :--- |
 | [`Test`](#test) | `rec` | name: the qualified name `<module path>#<identifier>`, which is also the test's symbol |
-| [`Collected`](#collected) | `rec` |  |
+| [`Collected`](#collected) | `rec` | the tests a build has collected, in dispatch order, owned by the session's allocator |
 
 | On `Test` | |
 | :--- | :--- |
@@ -23,10 +23,10 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 
 | On `Collected` | |
 | :--- | :--- |
-| [`collected_init`](#collected_init) | |
+| [`collected_init`](#collected_init) | an empty collection that allocates nothing until its first push |
 | [`collect_module`](#collect_module) | the test declarations of one lowered module, in function order |
 | [`collected_dnit`](#collected_dnit) | release a collection; a nil collection holds nothing |
-| [`push`](#push) | |
+| [`push`](#push) | append the test `t` to `c`, growing it from the session's allocator |
 
 | Functions | |
 | :--- | :--- |
@@ -81,11 +81,25 @@ pub rec Collected {
 }
 ```
 
+the tests a build has collected, in dispatch order, owned by the session's allocator
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `tests` | `*Test` | the tests, nil before the first push |
+| `count` | `u32` | how many tests are held |
+| `cap` | `u32` | how many tests the allocation at `tests` has room for |
+
 ### collected_init
 
 ```mach
 pub fun collected_init() Collected
 ```
+
+an empty collection that allocates nothing until its first push
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the collection, which the caller releases with collected_dnit |
 
 ### collect_module
 
@@ -108,6 +122,15 @@ release a collection; a nil collection holds nothing
 ```mach
 pub fun push(s: *mach.session.Session, c: *Collected, t: Test) err[mach.base.fail.Fail]
 ```
+
+append the test `t` to `c`, growing it from the session's allocator
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session whose allocator the collection grows from |
+| `c` | the collection |
+| `t` | the test to append |
+| **returns** | ok, or the allocator's refusal with `c` left as it was |
 
 ## Functions
 

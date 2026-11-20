@@ -29,7 +29,7 @@ Uses types from [`mach.base.fail`](../base/fail.md).
 
 | On `Input` | |
 | :--- | :--- |
-| [`token_input`](#token_input) | the input a link token names: a path, located as written or under `root`, or a library by name, left to mink's search |
+| [`token_input`](#token_input) | the input a link token names: a path, located as written, or a library by name, left to mink's search |
 | [`framework_input`](#framework_input) | a framework by name, left to mink's search |
 
 | Functions | |
@@ -88,11 +88,13 @@ SHARED for any other input
 ### token_input
 
 ```mach
-pub fun token_input(a: *std.allocator.Allocator, root: str, tok: *u8) res[Input, mach.base.fail.Fail]
+pub fun token_input(a: *std.allocator.Allocator, tok: *u8) res[Input, mach.base.fail.Fail]
 ```
 
-the input a link token names: a path, located as written or under `root`,
-or a library by name, left to mink's search
+the input a link token names: a path, located as written, or a library by
+name, left to mink's search. a manifest's local path is anchored where its
+entry is read, so a relative path is one the command line gave, read against
+the working directory
 
 ### framework_input
 

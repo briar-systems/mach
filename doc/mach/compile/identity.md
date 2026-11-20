@@ -18,7 +18,7 @@ the digest of the build's closed instruction set selection mirl makes of
 every merged definition (mirl.target.basis.selection_digest), the two
 settings that change
 what a copy computes or where it runs, apart so a refusal can say which
-differed. the compiler, the optimisation level, debug information and every
+differed. the compiler, the optimisation setting, debug information and every
 path stay out, so two libraries built from the same source under any of
 those settings hold copies that merge
 

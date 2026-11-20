@@ -47,7 +47,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`render_fail`](#render_fail) | print a Fail to stderr as the diagnostic it reads as, and map it to an exit code a reported Fail prints nothing, its diagnostics having been rendered already |
 | [`refuse`](#refuse) | render_fail for a failure built in place |
 | [`dependency_outcome`](#dependency_outcome) | show how a dependency command ended: its failure, then a note for each change it made before failing |
-| [`outcome_code`](#outcome_code) | |
+| [`outcome_code`](#outcome_code) | map a build outcome's severity to the process exit code, an unknown severity reported to stderr |
 | [`has_capture`](#has_capture) | whether a result kept output worth pointing at |
 
 ---
@@ -394,6 +394,13 @@ before failing
 ```mach
 pub fun outcome_code(bo: *mach.build.outcome.BuildOutcome) i64
 ```
+
+map a build outcome's severity to the process exit code, an unknown severity reported to stderr
+
+| Parameter | |
+| :--- | :--- |
+| `bo` | the outcome |
+| **returns** | the shared exit code of the severity, exit.INTERNAL for one outside the catalog |
 
 ### has_capture
 

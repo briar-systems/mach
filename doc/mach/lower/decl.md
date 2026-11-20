@@ -15,9 +15,9 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 
 | Functions | |
 | :--- | :--- |
-| [`lower_decl`](#lower_decl) | |
+| [`lower_decl`](#lower_decl) | lower the module-level declaration `did` into the module: a function, a test in the test object, a global, a handle def or the active branch of a `$if` |
 | [`lower_instance`](#lower_instance) | an instance bound as `defining` states, or with `copy` the class copy of it taking its pointers in the classes `copy` states, under the name `name` each way |
-| [`lower_pack_instance`](#lower_pack_instance) | |
+| [`lower_pack_instance`](#lower_pack_instance) | a pack instance of the function `did`, its pack expanded to `types`, bound as `defining` states, or with `copy` the class copy of it, under the name `name` |
 | [`lower_class_copy`](#lower_class_copy) | a copy of the function `did` whose pointer parameters take the classes `sig` states, local to the module whose call asked for it |
 
 ---
@@ -29,6 +29,16 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 ```mach
 pub fun lower_decl(ctx: *mach.lower.context.LowerContext, did: mach.front.ast.id.DeclId) err[mach.base.fail.Fail]
 ```
+
+lower the module-level declaration `did` into the module: a function, a test in the test
+object, a global, a handle def or the active branch of a `$if`. a generic, comptime or pack
+function and a `#[testing]` declaration in the normal object lower to nothing here
+
+| Parameter | |
+| :--- | :--- |
+| `ctx` | the lowering context |
+| `did` | the declaration |
+| **returns** | nothing, or the refusal or failure met lowering it |
 
 ### lower_instance
 
@@ -47,6 +57,21 @@ scope's
 pub fun lower_pack_instance(ctx: *mach.lower.context.LowerContext, did: mach.front.ast.id.DeclId, d: *mach.front.ast.decl.Decl,
     name: mach.base.intern.StrId, types: *mach.type.kind.TypeId, type_len: u32, defining: mach.lower.context.Defining, copy: opt[Type]) err[mach.base.fail.Fail]
 ```
+
+a pack instance of the function `did`, its pack expanded to `types`, bound as `defining`
+states, or with `copy` the class copy of it, under the name `name`
+
+| Parameter | |
+| :--- | :--- |
+| `ctx` | the lowering context |
+| `did` | the declaration |
+| `d` | its node |
+| `name` | the instance's linkage name |
+| `types` | the source type of each element of the pack |
+| `type_len` | how many there are |
+| `defining` | how its definition is bound |
+| `copy` | the copy's signature, none for the instance itself |
+| **returns** | nothing, or the failure met lowering it |
 
 ### lower_class_copy
 

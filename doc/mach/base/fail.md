@@ -17,12 +17,12 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | Type | | |
 | :--- | :--- | :--- |
 | [`Fail`](#fail) | `tag` | the compiler's failure, one type for every pass, the linker, the query engine, the session and the build |
-| [`Op`](#op) | `rec` | an operation the machine was asked to carry out, as a refusal of it names it: `cannot <verb>[ <role>][ '<path>'][ <link> '<other>']: <cause>` |
+| [`Op`](#op) | `rec` | an operation the machine was asked to carry out, as a refusal of it names it: `cannot <verb>[ <role>][ '<path>'][ <link> '<other>'] (<cause>)` |
 | [`Cause`](#cause) | `tag` | what refused an operation, as the std operation reported it; `text` is a cause its own module renders (a subprocess, a contained removal) |
 
 | On `Fail` | |
 | :--- | :--- |
-| [`reported`](#reported) | |
+| [`reported`](#reported) | a failure the diagnostics already say, carrying no text of its own |
 | [`message`](#message) | an internal failure: a compiler defect, reported as `compiler.internal` |
 | [`user`](#user) | the input is wrong or unsupported |
 | [`environment`](#environment) | the machine refused: a file could not be read or written, a tool could not be spawned |
@@ -40,9 +40,11 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`borrowing_places`](#borrowing_places) | the same failure borrowing its places, for a view of places a holder owns: the places it owned before are the caller's to release |
 | [`place_of`](#place_of) | where the failure points, when it points at a file of the source map its caller reads |
 | [`kind_of`](#kind_of) | the kind the failure is reported as, NONE for a reported one, whose diagnostics carry their own |
-| [`is_reported`](#is_reported), [`is_message`](#is_message), [`is_environment`](#is_environment) | |
+| [`is_reported`](#is_reported) | whether the failure was already reported through diagnostics |
+| [`is_message`](#is_message) | whether the failure is internal, a compiler defect |
+| [`is_environment`](#is_environment) | whether the failure is the environment's refusal |
 | [`text`](#text) | the text a failure carries, absent for a reported one |
-| [`describe`](#describe) | |
+| [`describe`](#describe) | the failure as one line of presentation text, borrowed from the failure, or REPORTED_TEXT for a reported one |
 | [`with_text`](#with_text) | the same failure carrying `text` instead, which it borrows: the class, the kind and the places are kept |
 | [`with_secondary`](#with_secondary) | the same failure also naming `secondary`, a failure met while releasing what the failing path held (a child cancelled, a file removed, a source closed): the text gains " |
 | [`retain`](#retain) | a copy of the failure that owns its text and its places through `a`, for a failure that outlives the storage its message was made in; released with `dnit` |
@@ -58,8 +60,10 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 | [`message_of`](#message_of) | the internal failure carrying a made text, which it borrows (a made text may be interned), or the failure that refused to make it |
 | [`user_of`](#user_of) | the user failure under `k` carrying a made text, which it borrows, or the failure that refused to make it |
 | [`environment_of`](#environment_of) | the environment failure under `k` carrying a made text, which it borrows, or the failure that refused to make it |
-| [`refused`](#refused) | the refusals the compiler recovers from at no site, each carrying its text: the allocator's, which is the environment's, and a string operation, a format and the source map, each internal unless the allocator refused it |
-| [`str_refused`](#str_refused), [`format_refused`](#format_refused), [`source_refused`](#source_refused) | |
+| [`refused`](#refused) | the allocator's refusal, the environment's, as a failure that carries no text of its own: its message is the allocator's static wording, so it is made, kept, copied and printed with no storage |
+| [`str_refused`](#str_refused) | a refused string operation: the allocator's refusal as `refused` gives it, any other internal |
+| [`format_refused`](#format_refused) | a refused format: the allocator's refusal as `refused` gives it, any other internal |
+| [`source_refused`](#source_refused) | a refusal of the source map: the allocator's refusal as `refused` gives it, any other internal |
 | [`toml_refused`](#toml_refused) | a document that does not parse is the user's, pointing at the byte the parser refused; one the allocator refused is the environment's |
 
 | On `Op` | |
@@ -74,7 +78,9 @@ Uses types from [`mach.base.diagnostic.annotation`](diagnostic/annotation.md), [
 
 | Functions | |
 | :--- | :--- |
-| [`str_text`](#str_text), [`format_text`](#format_text), [`toml_text`](#toml_text) | |
+| [`str_text`](#str_text) | the text of a string operation's refusal |
+| [`format_text`](#format_text) | the text of a format's refusal |
+| [`toml_text`](#toml_text) | the text of a TOML document's refusal |
 
 ---
 
@@ -86,6 +92,7 @@ pub tag Fail: u8 {
     message:     Message;
     user:        Keyed;
     environment: Keyed;
+    refused:     std.allocator.Error;
 }
 ```
 
@@ -103,7 +110,8 @@ code derives from the case: 1 for user, 2 for internal, 3 where a command
 distinguishes the environment. `reported` is declared first so a zero
 failure is one that invents no text. an allocation refusal is the
 environment's; the compiler recovers from none of them at the site that met
-them. a failure
+them, and its text is the allocator's own, so it carries none and is made,
+kept and copied without an allocation. a failure
 that carries text records whether it owns it: owned text was allocated
 through the allocator `dnit` is given and is released there, borrowed text
 (a literal, an interned text, storage someone else releases) never is. a
@@ -116,6 +124,8 @@ storage in the same way, all of it or none: `places_retain`, `retain`,
 ```mach
 pub fun reported() Fail
 ```
+
+a failure the diagnostics already say, carrying no text of its own
 
 ### message
 
@@ -293,17 +303,23 @@ diagnostics carry their own
 pub fun is_reported(f: Fail) bool
 ```
 
+whether the failure was already reported through diagnostics
+
 ### is_message
 
 ```mach
 pub fun is_message(f: Fail) bool
 ```
 
+whether the failure is internal, a compiler defect
+
 ### is_environment
 
 ```mach
 pub fun is_environment(f: Fail) bool
 ```
+
+whether the failure is the environment's refusal
 
 ### text
 
@@ -318,6 +334,9 @@ the text a failure carries, absent for a reported one
 ```mach
 pub fun describe(f: Fail) str
 ```
+
+the failure as one line of presentation text, borrowed from the failure, or
+REPORTED_TEXT for a reported one
 
 ### with_text
 
@@ -471,9 +490,13 @@ the failure that refused to make it
 pub fun refused(e: std.allocator.Error) Fail
 ```
 
-the refusals the compiler recovers from at no site, each carrying its text: the
-allocator's, which is the environment's, and a string operation, a format and
-the source map, each internal unless the allocator refused it
+the allocator's refusal, the environment's, as a failure that carries no text of its own: its
+message is the allocator's static wording, so it is made, kept, copied and printed with no storage
+
+| Parameter | |
+| :--- | :--- |
+| `e` | the allocator's refusal |
+| **returns** | the failure |
 
 ### str_refused
 
@@ -481,17 +504,23 @@ the source map, each internal unless the allocator refused it
 pub fun str_refused(e: StrError) Fail
 ```
 
+a refused string operation: the allocator's refusal as `refused` gives it, any other internal
+
 ### format_refused
 
 ```mach
 pub fun format_refused(e: std.format.FormatError) Fail
 ```
 
+a refused format: the allocator's refusal as `refused` gives it, any other internal
+
 ### source_refused
 
 ```mach
 pub fun source_refused(e: mach.base.source.Error) Fail
 ```
+
+a refusal of the source map: the allocator's refusal as `refused` gives it, any other internal
 
 ### toml_refused
 
@@ -516,7 +545,7 @@ pub rec Op {
 ```
 
 an operation the machine was asked to carry out, as a refusal of it names it:
-`cannot <verb>[ <role>][ '<path>'][ <link> '<other>']: <cause>`. a path the
+`cannot <verb>[ <role>][ '<path>'][ <link> '<other>'] (<cause>)`. a path the
 user never typed (a temporary, a cache entry, a scratch directory) carries the
 role it plays, so the failure says what it is for and not only where it is; a
 move or a copy names its second path after `link` ("to"); a spawned process
@@ -603,15 +632,21 @@ itself a failure; a failure goes through `refusal`, which names the operation
 pub fun str_text(e: StrError) str
 ```
 
+the text of a string operation's refusal
+
 ### format_text
 
 ```mach
 pub fun format_text(e: std.format.FormatError) str
 ```
 
+the text of a format's refusal
+
 ### toml_text
 
 ```mach
 pub fun toml_text(e: toml.error.TomlError) str
 ```
+
+the text of a TOML document's refusal
 

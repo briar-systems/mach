@@ -23,7 +23,9 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 
 | On `Scope` | |
 | :--- | :--- |
-| [`root_scope`](#root_scope), [`dependency_scope`](#dependency_scope), [`scope_is_dependency`](#scope_is_dependency) | |
+| [`root_scope`](#root_scope) | the scope of the root project's own cells, `m` both root and owner and `dir` both directories |
+| [`dependency_scope`](#dependency_scope) | the scope of a cell `owner` declares, built for the project `root` |
+| [`scope_is_dependency`](#scope_is_dependency) | whether the scope's cells belong to a dependency rather than the root |
 | [`resolve_artifact_reqs`](#resolve_artifact_reqs) | list the artifacts a consumer requires, each with its output path when that path is unique, for `{artifact.<id>.out}` expansion |
 | [`resolve_export_reqs`](#resolve_export_reqs) | list the artifacts a dependency's export library requires, the scope `{artifact.<id>.out}` resolves in for that dependency's modules |
 | [`resolve_scoped_build_unit`](#resolve_scoped_build_unit) | `resolve_build_unit` for a cell of `s`: target, artifact and links resolve in `s.owner`, the profile and `[project].work` in `s.root`, and `{project.work}` in the artifact output names the scope's artifact root |
@@ -68,7 +70,7 @@ expanded. produced by `resolve_build_unit`; `libs` is owned by the unit
 | `target_name` | `mach.base.intern.StrId` | `target.name` |
 | `profile_name` | `mach.base.intern.StrId` | the resolved profile's name |
 | `entry` | `mach.base.intern.StrId` | the artifact's `entry` |
-| `bin_path` | `mach.base.intern.StrId` | the artifact's output: the expanded `[project].work` joined with the expanded artifact `out` |
+| `bin_path` | `mach.base.intern.StrId` | the artifact's output: its expanded `out`, with `{project.work}` naming the scope's artifact root, STR_NIL for an object artifact |
 | `out_root` | `mach.base.intern.StrId` | `<expanded project work>`, whose layout beneath it the build owns (mach.host.output.layout) |
 | `optimize` | `bool` | from the resolved profile |
 | `debug` | `bool` | from the resolved profile |
@@ -79,7 +81,7 @@ expanded. produced by `resolve_build_unit`; `libs` is owned by the unit
 ### resolve_build_unit
 
 ```mach
-pub fun resolve_build_unit(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest, c: *Cell) res[BuildUnit, mach.base.fail.Fail]
+pub fun resolve_build_unit(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest, dir: str, c: *Cell) res[BuildUnit, mach.base.fail.Fail]
 ```
 
 resolve one cell into a `BuildUnit`. the cell names its artifact; with no
@@ -94,6 +96,7 @@ through the template engine
 | `alloc` | owns `libs` and temporary strings |
 | `itn` | interns the expanded paths |
 | `m` | the manifest |
+| `dir` | the project's directory |
 | `c` | the cell, as `resolve_cells` resolves it or as `cell_of` names it |
 | **returns** | the unit; err from target or profile resolution, for an artifact the manifest does not declare, when the artifact does not support the target (naming the artifact's targets when none was selected), or from path expansion |
 
@@ -101,8 +104,10 @@ through the template engine
 
 ```mach
 pub rec Scope {
-    root:  *Manifest;
-    owner: *Manifest;
+    root:      *Manifest;
+    owner:     *Manifest;
+    root_dir:  str;
+    owner_dir: str;
 }
 ```
 
@@ -117,24 +122,46 @@ so identically named artifacts of two dependencies never share a path
 | :--- | :--- | :--- |
 | `root` | `*Manifest` | the manifest of the project being built |
 | `owner` | `*Manifest` | the manifest declaring the cell's artifact; `root` for the root's own |
+| `root_dir` | `str` | the root project's directory, which a local link path naming `{project.work}` lies under |
+| `owner_dir` | `str` | the owner's directory, which its other local link paths lie under |
 
 ### root_scope
 
 ```mach
-pub fun root_scope(m: *Manifest) Scope
+pub fun root_scope(m: *Manifest, dir: str) Scope
 ```
+
+the scope of the root project's own cells, `m` both root and owner and `dir` both directories
+
+| Parameter | |
+| :--- | :--- |
+| `m` | the root project's manifest |
+| `dir` | its directory |
+| **returns** | the scope |
 
 ### dependency_scope
 
 ```mach
-pub fun dependency_scope(root: *Manifest, owner: *Manifest) Scope
+pub fun dependency_scope(root: *Manifest, root_dir: str, owner: *Manifest, owner_dir: str) Scope
 ```
+
+the scope of a cell `owner` declares, built for the project `root`
+
+| Parameter | |
+| :--- | :--- |
+| `root` | the manifest of the project being built |
+| `root_dir` | its directory |
+| `owner` | the manifest declaring the cell |
+| `owner_dir` | its directory |
+| **returns** | the scope |
 
 ### scope_is_dependency
 
 ```mach
 pub fun scope_is_dependency(s: *Scope) bool
 ```
+
+whether the scope's cells belong to a dependency rather than the root
 
 ### resolve_artifact_reqs
 

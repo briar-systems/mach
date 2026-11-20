@@ -23,8 +23,8 @@ Uses types from [`mach.base.fail`](fail.md).
 | Type | | |
 | :--- | :--- | :--- |
 | [`Destination`](#destination) | `def` | where a sink's bytes go |
-| [`Sink`](#sink) | `rec` |  |
-| [`Source`](#source) | `rec` |  |
+| [`Sink`](#sink) | `rec` | where a format writes: a measure, fixed storage, grown storage or a digest |
+| [`Source`](#source) | `rec` | a bounded span a format reads from |
 
 | On `Destination` | |
 | :--- | :--- |
@@ -36,11 +36,17 @@ Uses types from [`mach.base.fail`](fail.md).
 | [`fixed`](#fixed) | a sink that writes into `cap` bytes at `storage`; a sequence longer than that fails the sink |
 | [`grown`](#grown) | a sink that writes into storage it grows in `a`, released by dnit or handed off by release |
 | [`digest`](#digest) | a sink that feeds a sha-256 digest, read by digest_final |
-| [`dnit`](#dnit) | |
+| [`dnit`](#dnit) | release a grown sink's storage and leave any sink with nothing put |
 | [`refuse`](#refuse) | fail the sink with `f` unless it already failed |
-| [`failure`](#failure) | |
+| [`failure`](#failure) | the sink's first failure, none while every operation held |
 | [`bytes`](#bytes) | the bytes a fixed or grown sink holds |
-| [`put_bytes`](#put_bytes), [`put_u8`](#put_u8), [`put_u16`](#put_u16), [`put_u32`](#put_u32), [`put_u64`](#put_u64), [`put_unsigned`](#put_unsigned), [`put_signed`](#put_signed) | |
+| [`put_bytes`](#put_bytes) | put the `len` bytes at `data` |
+| [`put_u8`](#put_u8) | put a u8 |
+| [`put_u16`](#put_u16) | put a u16, little endian |
+| [`put_u32`](#put_u32) | put a u32, little endian |
+| [`put_u64`](#put_u64) | put a u64, little endian |
+| [`put_unsigned`](#put_unsigned) | put a u64 as unsigned LEB128 |
+| [`put_signed`](#put_signed) | put an i64 as signed LEB128 |
 | [`patch_u32`](#patch_u32) | overwrite the u32 at `at`, already put, as a format fills a length it only knows once the rest is put; a measuring sink has nothing to overwrite |
 | [`put_sized`](#put_sized) | a byte run's u32 length, then its bytes |
 | [`take`](#take) | hand off a grown sink's bytes, exactly its length, owned by the caller in the sink's allocator; nil when it holds none |
@@ -48,13 +54,15 @@ Uses types from [`mach.base.fail`](fail.md).
 
 | On `Source` | |
 | :--- | :--- |
-| [`source`](#source-1) | |
+| [`source`](#source-1) | a source over the `len` bytes at `data`, which it borrows |
 | [`reject`](#reject) | fail the source: what it read does not form a record |
-| [`remaining`](#remaining) | |
+| [`remaining`](#remaining) | the bytes left to read, 0 once the source failed |
 | [`done`](#done) | whether every read succeeded and consumed the whole span |
 | [`take_bytes`](#take_bytes) | the next `n` bytes in place, nil when fewer remain |
 | [`take_into`](#take_into) | copy the next `n` bytes into dst |
-| [`take_u8`](#take_u8), [`take_u32`](#take_u32), [`take_u64`](#take_u64) | |
+| [`take_u8`](#take_u8) | take a u8, 0 when none remains |
+| [`take_u32`](#take_u32) | take a little-endian u32, 0 when fewer bytes remain |
+| [`take_u64`](#take_u64) | take a little-endian u64, 0 when fewer bytes remain |
 | [`take_count`](#take_count) | a u32 count whose entries, at least `min` bytes each, fit in what remains |
 | [`take_sized`](#take_sized) | a byte run's u32 length then its bytes in place; the length in `out_len` |
 
@@ -87,6 +95,19 @@ pub rec Sink {
     failure: mach.base.fail.Fail;
 }
 ```
+
+where a format writes: a measure, fixed storage, grown storage or a digest
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `to` | `Destination` | where the bytes go |
+| `storage` | `*u8` | the fixed storage |
+| `cap` | `usize` | the bytes of fixed storage |
+| `grown` | `std.encoding.binary.Encoder` | the grown storage |
+| `state` | `crypto.hash.sha256.State` | the digest being fed |
+| `len` | `usize` | the bytes put so far |
+| `failed` | `bool` | an operation failed, and every later one does nothing |
+| `failure` | `mach.base.fail.Fail` | the first failure |
 
 ### measure
 
@@ -128,6 +149,8 @@ a sink that feeds a sha-256 digest, read by digest_final
 pub fun dnit(s: *Sink)
 ```
 
+release a grown sink's storage and leave any sink with nothing put
+
 ### refuse
 
 ```mach
@@ -141,6 +164,8 @@ fail the sink with `f` unless it already failed
 ```mach
 pub fun failure(s: *Sink) opt[mach.base.fail.Fail]
 ```
+
+the sink's first failure, none while every operation held
 
 ### bytes
 
@@ -156,11 +181,16 @@ the bytes a fixed or grown sink holds
 pub fun put_bytes(s: *Sink, data: *u8, len: usize)
 ```
 
+put the `len` bytes at `data`. a run that overflows the sink's length or a fixed sink's
+capacity, a nonempty run with no bytes, or a grown sink's allocator refusing fails the sink
+
 ### put_u8
 
 ```mach
 pub fun put_u8(s: *Sink, v: u8)
 ```
+
+put a u8
 
 ### put_u16
 
@@ -168,11 +198,15 @@ pub fun put_u8(s: *Sink, v: u8)
 pub fun put_u16(s: *Sink, v: u16)
 ```
 
+put a u16, little endian
+
 ### put_u32
 
 ```mach
 pub fun put_u32(s: *Sink, v: u32)
 ```
+
+put a u32, little endian
 
 ### put_u64
 
@@ -180,17 +214,23 @@ pub fun put_u32(s: *Sink, v: u32)
 pub fun put_u64(s: *Sink, v: u64)
 ```
 
+put a u64, little endian
+
 ### put_unsigned
 
 ```mach
 pub fun put_unsigned(s: *Sink, v: u64)
 ```
 
+put a u64 as unsigned LEB128
+
 ### put_signed
 
 ```mach
 pub fun put_signed(s: *Sink, v: i64)
 ```
+
+put an i64 as signed LEB128
 
 ### patch_u32
 
@@ -237,11 +277,22 @@ pub rec Source {
 }
 ```
 
+a bounded span a format reads from
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `data` | `*u8` | the span |
+| `len` | `usize` | its length in bytes |
+| `pos` | `usize` | the bytes read so far |
+| `bad` | `bool` | a read failed or the record was rejected, and every later read gives nothing |
+
 ### source
 
 ```mach
 pub fun source(data: *u8, len: usize) Source
 ```
+
+a source over the `len` bytes at `data`, which it borrows
 
 ### reject
 
@@ -256,6 +307,8 @@ fail the source: what it read does not form a record
 ```mach
 pub fun remaining(r: *Source) usize
 ```
+
+the bytes left to read, 0 once the source failed
 
 ### done
 
@@ -287,17 +340,23 @@ copy the next `n` bytes into dst
 pub fun take_u8(r: *Source) u8
 ```
 
+take a u8, 0 when none remains
+
 ### take_u32
 
 ```mach
 pub fun take_u32(r: *Source) u32
 ```
 
+take a little-endian u32, 0 when fewer bytes remain
+
 ### take_u64
 
 ```mach
 pub fun take_u64(r: *Source) u64
 ```
+
+take a little-endian u64, 0 when fewer bytes remain
 
 ### take_count
 

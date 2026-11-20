@@ -10,7 +10,7 @@ The directory's root module is [`mach.front.parser`](../parser.md).
 
 | Module | |
 | :--- | :--- |
-| [`grammar`](grammar.md) |  |
+| [`grammar`](grammar.md) | the grammar: a recursive descent over a token stream, one function per production, each pushing its node into the tree through the parser state |
 | [`iasm`](iasm.md) | the parse of an inline `asm` statement |
 | [`state`](state.md) | the parser's state: its cursor over the tokens, the tree it builds and what it reports |
 

@@ -13,27 +13,34 @@ symbol import nothing uses.
 
 Source: [`src/front/resolve.mach`](../../../src/front/resolve.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.front.ast`](ast.md), [`mach.front.ast.expr`](ast/expr.md), [`mach.front.ast.id`](ast/id.md), [`mach.front.ast.interpretation`](ast/interpretation.md), [`mach.front.ast.type`](ast/type.md), [`mach.front.comptime.scope`](comptime/scope.md), [`mach.front.comptime.value`](comptime/value.md), [`mach.front.load`](load.md), [`mach.front.refusal`](refusal.md), [`mach.report.phase`](../report/phase.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.type`](../type.md), [`mach.type.deprecation`](../type/deprecation.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.front.ast`](ast.md), [`mach.front.ast.expr`](ast/expr.md), [`mach.front.ast.id`](ast/id.md), [`mach.front.ast.interpretation`](ast/interpretation.md), [`mach.front.ast.type`](ast/type.md), [`mach.front.comptime.capability`](comptime/capability.md), [`mach.front.comptime.scope`](comptime/scope.md), [`mach.front.comptime.value`](comptime/value.md), [`mach.front.load`](load.md), [`mach.front.refusal`](refusal.md), [`mach.report.phase`](../report/phase.md), [`mach.session`](../session.md), [`mach.session.module`](../session/module.md), [`mach.type`](../type.md), [`mach.type.deprecation`](../type/deprecation.md).
 
 | Type | | |
 | :--- | :--- | :--- |
 | [`SymbolId`](#symbolid) | `def` | a symbol's slot in the resolve context's symbol table |
 | [`SymKind`](#symkind) | `def` |  |
-| [`Symbol`](#symbol) | `rec` |  |
-| [`PublicSymbol`](#publicsymbol) | `rec` |  |
+| [`TypeFrame`](#typeframe) | `def` | how a type node reads a comptime parameter or `$each` loop variable: not at all, in a body, where each frame that binds them resolves it afresh, or in a signature, where it is refused |
+| [`Symbol`](#symbol) | `rec` | one binding a module's resolution knows: declared here, imported, or built in |
+| [`PublicSymbol`](#publicsymbol) | `rec` | one symbol a module exports, as an importer reads it |
 | [`ModuleExports`](#moduleexports) | `rec` | what a module exports to an importer, every module it names by stable id |
 | [`ExportConstant`](#exportconstant) | `rec` | a constant an importer reads, whose per-tuple gate is the published declaration's, not this record's |
-| [`ParsedDefinition`](#parseddefinition) | `rec` |  |
+| [`ParsedDefinition`](#parseddefinition) | `rec` | a parsed module as a definition reads it |
 | [`ResolveDeps`](#resolvedeps) | `rec` | what a module's resolve reads of the modules it imports |
-| [`ResolveResult`](#resolveresult) | `rec` |  |
+| [`ResolveResult`](#resolveresult) | `rec` | what resolving one module produced, owned by the result and released with result_dnit |
 | [`AsmBind`](#asmbind) | `rec` | one `{name}` of an asm block and the local it binds |
 | [`Exporters`](#exporters) | `rec` | the modules an importer's resolution reads: how many are loaded, with ids below that count, what each one exports, and the path it is imported by |
 
 | On `SymbolId` | |
 | :--- | :--- |
-| [`SYMBOL_NIL`](#symbolid), [`symbol_id`](#symbol_id), [`symbol_index`](#symbol_index), [`symbol_same`](#symbol_same) | |
+| [`SYMBOL_NIL`](#symbolid) | |
+| [`symbol_id`](#symbol_id) | the symbol id of slot `index` |
+| [`symbol_index`](#symbol_index) | the slot symbol id `id` names |
+| [`symbol_same`](#symbol_same) | whether two symbol ids are the same id |
 | [`symbol_is_sentinel`](#symbol_is_sentinel) | whether an id is one of the sentinels, which name no symbol |
-| [`symbol_is_nil`](#symbol_is_nil), [`symbol_is_rejected`](#symbol_is_rejected), [`SYMBOL_DEFERRED_TYPE`](#symbolid), [`symbol_deferred`](#symbol_deferred) | |
+| [`symbol_is_nil`](#symbol_is_nil) | whether `id` is SYMBOL_NIL, a name bound to nothing |
+| [`symbol_is_rejected`](#symbol_is_rejected) | whether `id` marks a name resolution visited and rejected |
+| [`SYMBOL_DEFERRED_TYPE`](#symbolid) | |
+| [`symbol_deferred`](#symbol_deferred) | whether `sid` marks a name left for sema to report, in value or type position |
 | [`SYMBOL_AMBIGUOUS`](#symbolid) | a nominal the module defines named by more than one declaration |
 
 | On `SymKind` | |
@@ -42,13 +49,19 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`SYM_TEST`](#symkind) | reached only by mach-lsp |
 | [`SYM_UNI`](#symkind), [`SYM_PRIM`](#symkind), [`SYM_VECTOR`](#symkind), [`SYM_TAG`](#symkind) | |
 
+| On `TypeFrame` | |
+| :--- | :--- |
+| [`TYPE_FRAME_NONE`](#typeframe), [`TYPE_FRAME_BODY`](#typeframe), [`TYPE_FRAME_REFUSED`](#typeframe) | |
+
 | On `Symbol` | |
 | :--- | :--- |
 | [`origin_of`](#origin_of) | the module a symbol is defined in, as the current operation numbers it |
 | [`foreign_to`](#foreign_to) | whether `sym` names a binding a module other than the one `own` names declares: an import, or a `fwd` of one, which carries the kind the binding is declared with there as its own |
 | [`use_target`](#use_target) | the module a `use` symbol names, as the current operation numbers it |
 | [`use_stable`](#use_stable) | the stable id of the module a `use` symbol names, nil for any other symbol |
-| [`symbol_is_runtime`](#symbol_is_runtime) | |
+| [`symbol_is_runtime`](#symbol_is_runtime) | whether `sym` is a runtime binding: a local `val` or `var` or a parameter, none of them comptime |
+| [`symbol_is_comptime_local`](#symbol_is_comptime_local) | a comptime parameter or `$each` loop variable, whose value a frame binds by name |
+| [`symbol_name_kind`](#symbol_name_kind) | what a comptime evaluation reads a name resolved to `sym` as |
 
 | On `ModuleExports` | |
 | :--- | :--- |
@@ -62,15 +75,15 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 
 | On `ResolveResult` | |
 | :--- | :--- |
-| [`param_symbol`](#param_symbol) | |
+| [`param_symbol`](#param_symbol) | the symbol of parameter `slot` of function `decl`, SYMBOL_NIL when it has none |
 | [`own_nominal`](#own_nominal) | the symbol of the record, union or tag of `kind` the module defines under `canon`: SYMBOL_NIL when it defines none, SYMBOL_AMBIGUOUS when more than one declaration does |
 | [`own_declared`](#own_declared) | the symbol of `kind` the module declares under `canon`, the last of them: SYMBOL_NIL when it declares none, SYMBOL_AMBIGUOUS when more than one declaration does |
 | [`result_exports`](#result_exports) | what a finished resolution of module `stable` exports to an importer |
 | [`result_dnit`](#result_dnit) | release a resolution; a nil result holds nothing |
 | [`result_copy`](#result_copy) | an owned copy of `r` from `alloc`, every entry at the id it has in `r` |
 | [`asm_binds_at`](#asm_binds_at) | the locals an asm block binds, in the order its body names them |
-| [`expr_is_runtime`](#expr_is_runtime) | whether a resolved expression names a runtime binding, a local or a parameter whose value no comptime evaluation sees; false for a name that resolved to none |
-| [`expression`](#expression) | |
+| [`expr_name_kind`](#expr_name_kind) | what a resolved expression names, as a comptime evaluation reads it |
+| [`expression`](#expression) | expression `eid` of `a` as name resolution read it |
 | [`type_node`](#type_node) | the type node `tid` of `a`, whose text is `source`, as name resolution read it: a literal head it split names the type by its path's prefix and the case by the last segment |
 
 | On `Exporters` | |
@@ -79,18 +92,20 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 
 | Functions | |
 | :--- | :--- |
-| [`stable_of_module`](#stable_of_module), [`type_owner`](#type_owner) | |
+| [`stable_of_module`](#stable_of_module) | the stable id of module `mid`, nil for a nil module or one with no name |
+| [`type_owner`](#type_owner) | the owner the types module `mid` declares in `file` carry |
 | [`decorators_deprecation`](#decorators_deprecation) | the message is the string the argument evaluates to; one that is not a constant string is reported by type checking and leaves the notice bare |
 | [`declaration_testing`](#declaration_testing) | whether a declaration carries `#[testing]`, which confines every reference to it to test code |
 | [`unknown_catalog`](#unknown_catalog) | the internal failure naming a member its catalog lacks; the text belongs to the session interner, not a resolver candidate |
 
 | Constants | |
 | :--- | :--- |
-| [`SYM_FLAG_PUB`](#constants) | reached only by mach-lsp |
+| [`SYM_FLAG_PUB`](#constants) | the symbol is exported, so it joins the module's public surface |
 | [`SYM_FLAG_COMPTIME`](#constants), [`SYM_FLAG_MODULE`](#constants) | |
 | [`SYM_FLAG_STORED`](#constants) | something stores to the local or parameter, takes its address or names it in an asm block, so it has storage of its own |
 | [`SYM_FLAG_REACHED`](#constants) | the address of something reached from the local or parameter by name, a field or an element, is taken |
 | [`SYM_FLAG_WRITTEN`](#constants) | an assignment writes a field or element reached from the local or parameter by name, so what it holds changes in part where nothing stores to it whole |
+| [`SYM_FLAG_VALUE_SIZED`](#constants) | a function whose body spells a type one of its comptime parameters sizes, so each value instance types the body afresh |
 
 ---
 
@@ -114,17 +129,23 @@ a symbol's slot in the resolve context's symbol table
 pub fun symbol_id(index: u32) SymbolId
 ```
 
+the symbol id of slot `index`
+
 ### symbol_index
 
 ```mach
 pub fun symbol_index(id: SymbolId) u32
 ```
 
+the slot symbol id `id` names
+
 ### symbol_same
 
 ```mach
 pub fun symbol_same(left: SymbolId, right: SymbolId) bool
 ```
+
+whether two symbol ids are the same id
 
 ### symbol_is_sentinel
 
@@ -140,17 +161,23 @@ whether an id is one of the sentinels, which name no symbol
 pub fun symbol_is_nil(id: SymbolId) bool
 ```
 
+whether `id` is SYMBOL_NIL, a name bound to nothing
+
 ### symbol_is_rejected
 
 ```mach
 pub fun symbol_is_rejected(id: SymbolId) bool
 ```
 
+whether `id` marks a name resolution visited and rejected
+
 ### symbol_deferred
 
 ```mach
 pub fun symbol_deferred(sid: SymbolId) bool
 ```
+
+whether `sid` marks a name left for sema to report, in value or type position
 
 ## SymKind
 
@@ -175,6 +202,21 @@ pub def SymKind: u8
 | `SYM_VECTOR` | `12` |  |
 | `SYM_TAG` | `13` |  |
 
+## TypeFrame
+
+```mach
+pub def TypeFrame: u8
+```
+
+how a type node reads a comptime parameter or `$each` loop variable: not at all, in a body,
+where each frame that binds them resolves it afresh, or in a signature, where it is refused
+
+| Name | Value | |
+| :--- | :--- | :--- |
+| `TYPE_FRAME_NONE` | `0` |  |
+| `TYPE_FRAME_BODY` | `1` |  |
+| `TYPE_FRAME_REFUSED` | `2` |  |
+
 ## Symbol
 
 ```mach
@@ -198,6 +240,23 @@ pub rec Symbol {
     origin: mach.session.module.StableModuleId;
 }
 ```
+
+one binding a module's resolution knows: declared here, imported, or built in
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `SymKind` | what the binding is here, SYM_IMPORTED for an imported symbol |
+| `definition_kind` | `SymKind` | the kind it is declared with where it is defined |
+| `definition_file` | `mach.base.source.FileId` | the file it is defined in, nil when none is known |
+| `generic_arity` | `u32` | how many type parameters its declaration takes |
+| `has_comptime_params` | `bool` | whether its function declares a comptime parameter |
+| `has_pack_param` | `bool` | whether its function declares a variadic pack parameter |
+| `deprecation` | `mach.type.deprecation.Deprecation` | the `#[deprecated]` notice on its declaration or on the import binding it |
+| `testing` | `bool` | whether its declaration or the import binding it carries `#[testing]` |
+| `flags` | `u8` | SYM_FLAG_* bits |
+| `name` | `mach.base.intern.StrId` | the name it is bound under here |
+| `canon` | `mach.base.intern.StrId` | the name it is declared under where it is defined |
+| `decl` | `mach.front.ast.id.DeclId` | its declaration in this module's syntax, nil for one declared elsewhere |
 
 ### origin_of
 
@@ -238,6 +297,24 @@ the stable id of the module a `use` symbol names, nil for any other symbol
 pub fun symbol_is_runtime(sym: *Symbol) bool
 ```
 
+whether `sym` is a runtime binding: a local `val` or `var` or a parameter, none of them comptime
+
+### symbol_is_comptime_local
+
+```mach
+pub fun symbol_is_comptime_local(sym: *Symbol) bool
+```
+
+a comptime parameter or `$each` loop variable, whose value a frame binds by name
+
+### symbol_name_kind
+
+```mach
+pub fun symbol_name_kind(sym: *Symbol) mach.front.comptime.capability.NameKind
+```
+
+what a comptime evaluation reads a name resolved to `sym` as
+
 ## PublicSymbol
 
 ```mach
@@ -256,6 +333,21 @@ pub rec PublicSymbol {
     origin: mach.session.module.StableModuleId;
 }
 ```
+
+one symbol a module exports, as an importer reads it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `SymKind` | the kind it is declared with where it is defined |
+| `name` | `mach.base.intern.StrId` | the name it is exported under |
+| `canon` | `mach.base.intern.StrId` | the name it is declared under where it is defined |
+| `file` | `mach.base.source.FileId` | the file it is defined in |
+| `generic_arity` | `u32` | how many type parameters its declaration takes |
+| `has_comptime_params` | `bool` | whether its function declares a comptime parameter |
+| `has_pack_param` | `bool` | whether its function declares a variadic pack parameter |
+| `deprecation` | `mach.type.deprecation.Deprecation` | the `#[deprecated]` notice it carries |
+| `testing` | `bool` | whether it carries `#[testing]` |
+| `origin` | `mach.session.module.StableModuleId` | the module it is defined in |
 
 ## ModuleExports
 
@@ -317,6 +409,15 @@ pub rec ParsedDefinition {
 }
 ```
 
+a parsed module as a definition reads it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `a` | `*mach.front.ast.Ast` | its syntax |
+| `status` | `mach.report.phase.PhaseStatus` | how its parse ended |
+| `owner` | `mach.type.TypeOwner` | the module and file that own the types it declares |
+| `incarnation` | `u64` | the incarnation of the syntax, as `a` records it |
+
 ## ResolveDeps
 
 ```mach
@@ -354,6 +455,7 @@ pub fun resolve(
     load: *mach.front.comptime.scope.ComptimeCtx,
     own_module: mach.session.module.ModuleId,
     own_stable: mach.session.module.StableModuleId,
+    syntax_clean: bool,
     diags: *mach.base.diagnostic.DiagnosticStore) res[ResolveResult, mach.base.fail.Fail]
 ```
 
@@ -393,20 +495,40 @@ pub rec ResolveResult {
     # how each literal head's path reads, `type_count` of them: as written, or as a type and the
     # tag case its last segment selects
     type_heads: *mach.front.ast.interpretation.Head;
+    # how each type node reads a comptime local, `type_count` of them
+    type_frames: *TypeFrame;
 
     # the local each `{name}` of an asm block binds
     asm_binds: std.collections.vector.Vector[AsmBind];
 
     # why the module is refused, if it is: then nothing else of it was resolved
     refusal: mach.front.refusal.Refusal;
+    # the module's syntax parsed without an error, so its module-scope `$error`s are evaluated
+    syntax_clean: bool;
 }
 ```
+
+what resolving one module produced, owned by the result and released with result_dnit
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `status` | `mach.report.phase.PhaseStatus` | whether resolution accepted the module, rejected it or failed internally |
+| `alloc` | `*std.allocator.Allocator` | owns every table here |
+| `symbols` | `*Symbol` | every symbol, the `pub_count` exported ones first, `symbol_count` in all |
+| `expr_resolved` | `*SymbolId` | the symbol each expression names, `expr_count` of them, nil or a sentinel for none |
+| `type_resolved` | `*SymbolId` | the symbol each type node names, `type_count` of them |
+| `decl_symbol` | `*SymbolId` | the symbol each declaration binds, `decl_count` of them |
+| `param_index` | `std.collections.map.Map[u64, SymbolId]` | each parameter's symbol, by declaration index in the high 32 bits and slot in the low |
+| `public_constants` | `*ExportConstant` | each exported module `val` and its value when it has one, `public_constant_count` of them |
+| `expr_choices` | `*mach.front.ast.interpretation.Choice` | how each expression reads, `expr_choices_count` of them |
 
 ### param_symbol
 
 ```mach
 pub fun param_symbol(r: *ResolveResult, decl: mach.front.ast.id.DeclId, slot: u32) SymbolId
 ```
+
+the symbol of parameter `slot` of function `decl`, SYMBOL_NIL when it has none
 
 ### own_nominal
 
@@ -463,20 +585,28 @@ pub fun asm_binds_at(r: *ResolveResult, sid: mach.front.ast.id.StmtId, out: *std
 
 the locals an asm block binds, in the order its body names them
 
-### expr_is_runtime
+### expr_name_kind
 
 ```mach
-pub fun expr_is_runtime(rr: *ResolveResult, eid: mach.front.ast.id.ExprId) bool
+pub fun expr_name_kind(rr: *ResolveResult, eid: mach.front.ast.id.ExprId) mach.front.comptime.capability.NameKind
 ```
 
-whether a resolved expression names a runtime binding, a local or a parameter
-whose value no comptime evaluation sees; false for a name that resolved to none
+what a resolved expression names, as a comptime evaluation reads it
 
 ### expression
 
 ```mach
 pub fun expression(rr: *ResolveResult, a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.base.fail.Fail]
 ```
+
+expression `eid` of `a` as name resolution read it
+
+| Parameter | |
+| :--- | :--- |
+| `rr` | the module's resolution |
+| `a` | the module's syntax |
+| `eid` | the expression |
+| **returns** | the expression, or a failure for a nil resolution, choices that do not match the syntax, or an id outside it |
 
 ### type_node
 
@@ -534,11 +664,15 @@ reached one re-exports, each once, allocated from `alloc` and released with deps
 pub fun stable_of_module(s: *mach.session.Session, mid: mach.session.module.ModuleId) mach.session.module.StableModuleId
 ```
 
+the stable id of module `mid`, nil for a nil module or one with no name
+
 ### type_owner
 
 ```mach
 pub fun type_owner(s: *mach.session.Session, mid: mach.session.module.ModuleId, file: mach.base.source.FileId) mach.type.TypeOwner
 ```
+
+the owner the types module `mid` declares in `file` carry
 
 ### decorators_deprecation
 
@@ -570,10 +704,11 @@ the session interner, not a resolver candidate
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `SYM_FLAG_PUB` | `u8` | `1` | reached only by mach-lsp |
+| `SYM_FLAG_PUB` | `u8` | `1` | the symbol is exported, so it joins the module's public surface |
 | `SYM_FLAG_COMPTIME` | `u8` | `2` |  |
 | `SYM_FLAG_MODULE` | `u8` | `4` |  |
 | `SYM_FLAG_STORED` | `u8` | `8` | something stores to the local or parameter, takes its address or names it in an asm block, so it has storage of its own |
 | `SYM_FLAG_REACHED` | `u8` | `16` | the address of something reached from the local or parameter by name, a field or an element, is taken |
 | `SYM_FLAG_WRITTEN` | `u8` | `32` | an assignment writes a field or element reached from the local or parameter by name, so what it holds changes in part where nothing stores to it whole |
+| `SYM_FLAG_VALUE_SIZED` | `u8` | `64` | a function whose body spells a type one of its comptime parameters sizes, so each value instance types the body afresh |
 

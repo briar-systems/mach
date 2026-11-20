@@ -11,7 +11,7 @@ Source: [`src/package/pin.mach`](../../../src/package/pin.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Pin`](#pin) | `rec` |  |
+| [`Pin`](#pin) | `rec` | a member of the pin contract: its context and the operations it fills |
 
 | Constants | |
 | :--- | :--- |
@@ -35,6 +35,20 @@ pub rec Pin {
     drop:     DropFn;
 }
 ```
+
+a member of the pin contract: its context and the operations it fills
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `ctx` | `ptr` | the member's state, passed to every operation |
+| `begin` | `BeginFn` | starts recording pins at a root |
+| `mode` | `ModeFn` | how the project at a root records pins |
+| `read` | `ReadFn` | the pin a root records for an id |
+| `read_at` | `ReadAtFn` | the pin a dependency's project records for an id at a revision |
+| `tracked` | `TrackedFn` | whether a directory is in a place that records pins |
+| `recorded` | `RecordedFn` | whether a root records a pin for an id |
+| `record` | `RecordFn` | records what dep/\<id> holds as its pin |
+| `drop` | `DropFn` | stops recording a pin for an id |
 
 ## Constants
 

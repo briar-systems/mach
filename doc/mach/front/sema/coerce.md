@@ -16,20 +16,21 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.wide`](../..
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`CoerceResult`](#coerceresult) | `rec` |  |
+| [`CoerceResult`](#coerceresult) | `rec` | what coercing a literal-shaped expression to a type found |
 
 | On `CoerceResult` | |
 | :--- | :--- |
-| [`out_of_range`](#out_of_range), [`try_coerce_literal`](#try_coerce_literal) | |
+| [`out_of_range`](#out_of_range) | an out-of-range result for `value` against type `to` |
+| [`try_coerce_literal`](#try_coerce_literal) | give a literal-shaped expression type `to` when every value in it fits, recording the types |
 | [`probe_literal_range`](#probe_literal_range) | ask whether a literal-shaped expression fits the integer range of `to` without retyping anything: `COERCE_OUT_OF_RANGE` carries the offending leaf's value and sign, and any other kind means the shape is not a literal or it fits |
 | [`fit_ct_int`](#fit_ct_int) | whether a comptime integer value fits integer type `to`, retyping nothing: not applicable unless both are integers |
 
 | Functions | |
 | :--- | :--- |
 | [`is_untyped_int_literal`](#is_untyped_int_literal) | whether an expression is built only from unsuffixed integer literals under the operators a literal coerces through, so its exact value is still untyped |
-| [`int_bounds_of`](#int_bounds_of) | |
+| [`int_bounds_of`](#int_bounds_of) | the integer range of type `to`, its secrecy stripped |
 | [`check_float_literal`](#check_float_literal) | the float literal rule, applied once the literal's type is final |
-| [`is_assignable`](#is_assignable) | |
+| [`is_assignable`](#is_assignable) | whether a value of type `from` may be assigned where `to` is expected: the same type, an error on either side, added secrecy, a secret array spread onto its elements, `ptr` to or from a typed pointer that reaches no secret, or function types with equal signatures |
 
 | Constants | |
 | :--- | :--- |
@@ -51,17 +52,50 @@ pub rec CoerceResult {
 }
 ```
 
+what coercing a literal-shaped expression to a type found
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `CoerceKind` | COERCE_COERCED when it takes the type, COERCE_OUT_OF_RANGE when a value does not fit, or not applicable when the expression is no literal shape for that type |
+| `ty` | `mach.type.kind.TypeId` | the type coerced to, TYPE_ERROR when not applicable |
+| `value` | `mach.base.wide.Wide` | out of range, the magnitude of the value that does not fit |
+| `negated` | `bool` | out of range, whether that value is negative |
+| `bounds` | `mach.type.prim.IntRange` | out of range, the range of the integer type it missed |
+| `literal` | `bool` | out of range, whether the value is a written literal rather than a comptime value |
+
 ### out_of_range
 
 ```mach
 pub fun out_of_range(to: mach.type.kind.TypeId, value: mach.base.wide.Wide, negated: bool, bounds: mach.type.prim.IntRange, literal: bool) CoerceResult
 ```
 
+an out-of-range result for `value` against type `to`
+
+| Parameter | |
+| :--- | :--- |
+| `to` | the type the value missed |
+| `value` | the value's magnitude |
+| `negated` | whether the value is negative |
+| `bounds` | the range of `to` |
+| `literal` | whether the value is a written literal |
+| **returns** | the result, of kind COERCE_OUT_OF_RANGE |
+
 ### try_coerce_literal
 
 ```mach
 pub fun try_coerce_literal(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId, to: mach.type.kind.TypeId) res[CoerceResult, mach.base.fail.Fail]
 ```
+
+give a literal-shaped expression type `to` when every value in it fits, recording the types.
+an operator is probed whole before anything is committed, and one out of range is left typed
+as an error for its caller to refuse
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the walk |
+| `eid` | the expression |
+| `to` | the type it is checked against, secret or not |
+| **returns** | the result, whose type is `to` stripped of secrecy when coerced and `to` itself when out of range, or the failure of a refused read |
 
 ### probe_literal_range
 
@@ -112,6 +146,14 @@ operators a literal coerces through, so its exact value is still untyped
 pub fun int_bounds_of(sc: *mach.front.sema.context.SemaContext, to: mach.type.kind.TypeId) opt[mach.type.prim.IntRange]
 ```
 
+the integer range of type `to`, its secrecy stripped
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the walk |
+| `to` | the type |
+| **returns** | the range, none when `to` is no integer type |
+
 ### check_float_literal
 
 ```mach
@@ -134,6 +176,17 @@ warns with that value. an exact literal never warns
 ```mach
 pub fun is_assignable(sc: *mach.front.sema.context.SemaContext, from: mach.type.kind.TypeId, to: mach.type.kind.TypeId) bool
 ```
+
+whether a value of type `from` may be assigned where `to` is expected: the same type, an
+error on either side, added secrecy, a secret array spread onto its elements, `ptr` to or from
+a typed pointer that reaches no secret, or function types with equal signatures
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the walk |
+| `from` | the value's type |
+| `to` | the expected type |
+| **returns** | true when the assignment is allowed |
 
 ## Constants
 

@@ -11,18 +11,18 @@ Uses types from [`mach.base.source`](../../base/source.md), [`mach.front.ast.id`
 | Type | | |
 | :--- | :--- | :--- |
 | [`StmtKind`](#stmtkind) | `def` |  |
-| [`StmtExpr`](#stmtexpr) | `rec` |  |
-| [`StmtBlock`](#stmtblock) | `rec` |  |
-| [`StmtIf`](#stmtif) | `rec` |  |
-| [`StmtFor`](#stmtfor) | `rec` |  |
-| [`StmtRet`](#stmtret) | `rec` |  |
-| [`StmtFin`](#stmtfin) | `rec` |  |
-| [`StmtDecl`](#stmtdecl) | `rec` |  |
+| [`StmtExpr`](#stmtexpr) | `rec` | an expression statement |
+| [`StmtBlock`](#stmtblock) | `rec` | a braced block |
+| [`StmtIf`](#stmtif) | `rec` | an `if` or an `or (cond)` arm |
+| [`StmtFor`](#stmtfor) | `rec` | a `for` loop |
+| [`StmtRet`](#stmtret) | `rec` | a `ret` statement |
+| [`StmtFin`](#stmtfin) | `rec` | a `fin` cleanup |
+| [`StmtDecl`](#stmtdecl) | `rec` | a local `val` or `var` |
 | [`StmtAsm`](#stmtasm) | `rec` | head: the text between `asm` and the body's `{`, masc's selection handed over unchanged |
-| [`StmtComptimeIf`](#stmtcomptimeif) | `rec` |  |
-| [`StmtComptimeEach`](#stmtcomptimeeach) | `rec` |  |
-| [`StmtComptimeDirective`](#stmtcomptimedirective) | `rec` |  |
-| [`Stmt`](#stmt) | `rec` |  |
+| [`StmtComptimeIf`](#stmtcomptimeif) | `rec` | a `$if` chain inside a function body |
+| [`StmtComptimeEach`](#stmtcomptimeeach) | `rec` | a `$each` loop |
+| [`StmtComptimeDirective`](#stmtcomptimedirective) | `rec` | a comptime directive statement such as `$error(...)` |
+| [`Stmt`](#stmt) | `rec` | one statement node |
 
 | On `StmtKind` | |
 | :--- | :--- |
@@ -61,6 +61,12 @@ pub rec StmtExpr {
 }
 ```
 
+an expression statement
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `expr` | `mach.front.ast.id.ExprId` | the expression |
+
 ## StmtBlock
 
 ```mach
@@ -69,6 +75,13 @@ pub rec StmtBlock {
     stmts_len:   u32;
 }
 ```
+
+a braced block
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `stmts_start` | `u32` | first statement in the statement id table |
+| `stmts_len` | `u32` | how many statements |
 
 ## StmtIf
 
@@ -80,6 +93,14 @@ pub rec StmtIf {
 }
 ```
 
+an `if` or an `or (cond)` arm
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `cond` | `mach.front.ast.id.ExprId` | the condition |
+| `then_block` | `mach.front.ast.id.StmtId` | the arm's block, STMT_NIL when the parse found none |
+| `else_block` | `mach.front.ast.id.StmtId` | the next `or (cond)` arm as an if statement, a block for a bare `or`, STMT_NIL when the chain ends |
+
 ## StmtFor
 
 ```mach
@@ -89,6 +110,13 @@ pub rec StmtFor {
 }
 ```
 
+a `for` loop
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `cond` | `mach.front.ast.id.ExprId` | the condition, EXPR_NIL for a bare `for` |
+| `body` | `mach.front.ast.id.StmtId` | the body block |
+
 ## StmtRet
 
 ```mach
@@ -96,6 +124,12 @@ pub rec StmtRet {
     value: mach.front.ast.id.ExprId;
 }
 ```
+
+a `ret` statement
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `value` | `mach.front.ast.id.ExprId` | the returned value, EXPR_NIL for a bare `ret` |
 
 ## StmtFin
 
@@ -105,6 +139,12 @@ pub rec StmtFin {
 }
 ```
 
+a `fin` cleanup
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `body` | `mach.front.ast.id.StmtId` | the cleanup block |
+
 ## StmtDecl
 
 ```mach
@@ -112,6 +152,12 @@ pub rec StmtDecl {
     decl: mach.front.ast.id.DeclId;
 }
 ```
+
+a local `val` or `var`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `decl` | `mach.front.ast.id.DeclId` | the declaration node of the binding |
 
 ## StmtAsm
 
@@ -133,6 +179,13 @@ pub rec StmtComptimeIf {
 }
 ```
 
+a `$if` chain inside a function body
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `branches_start` | `u32` | first arm in the comptime branch table |
+| `branches_len` | `u32` | how many arms |
+
 ## StmtComptimeEach
 
 ```mach
@@ -144,6 +197,15 @@ pub rec StmtComptimeEach {
 }
 ```
 
+a `$each` loop
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `var_name` | `mach.base.source.Span` | the span of the loop variable |
+| `seq` | `mach.front.ast.id.ExprId` | the sequence expression it walks |
+| `body_start` | `u32` | first body statement in the statement id table |
+| `body_len` | `u32` | how many body statements |
+
 ## StmtComptimeDirective
 
 ```mach
@@ -151,6 +213,12 @@ pub rec StmtComptimeDirective {
     target: mach.front.ast.id.ExprId;
 }
 ```
+
+a comptime directive statement such as `$error(...)`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `target` | `mach.front.ast.id.ExprId` | the directive expression |
 
 ## Stmt
 
@@ -173,4 +241,12 @@ pub rec Stmt {
     };
 }
 ```
+
+one statement node
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `span` | `mach.base.source.Span` | the whole statement |
+| `kind` | `StmtKind` | which STMT_KIND_ the statement is, which names the active `data` field |
+| `data` | `uni { expr: StmtExpr; block: StmtBlock; if_: StmtIf; for_: StmtFor; ret_: StmtRet; fin_: StmtFin; decl: StmtDecl; asm_: StmtAsm; comptime_if: StmtComptimeIf; comptime_each: StmtComptimeEach; comptime_directive: StmtComptimeDirective; }` | the payload of the statement's kind |
 

@@ -17,7 +17,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 
 | Functions | |
 | :--- | :--- |
-| [`lint_module`](#lint_module) | |
+| [`lint_module`](#lint_module) | lint the doc comment components of every public function, record, union and tag in a module whose doc has a separator |
 
 ---
 
@@ -28,4 +28,13 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 ```mach
 pub fun lint_module(a: *mach.front.ast.Ast, source: str, diags: *mach.base.diagnostic.DiagnosticStore) err[mach.base.fail.Fail]
 ```
+
+lint the doc comment components of every public function, record, union and tag in a module whose doc has a separator
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the module's syntax tree, whose allocator holds the scratch item lists |
+| `source` | the module's source text |
+| `diags` | store each `doc.lint` warning is reported to |
+| **returns** | ok once every declaration is checked, or the failure to allocate or to report |
 

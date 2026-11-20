@@ -15,15 +15,17 @@ Uses types from [`mach.base.fail`](../../fail.md), [`mach.base.source.provider`]
 | :--- | :--- | :--- |
 | [`Overlay`](#overlay) | `rec` | the provider an editor reads through: the session's open buffers stand in front of the provider under them, so a buffer is read for its file and a buffer whose file is not on disk yet still names a module |
 | [`Store`](#store) | `rec` | the open buffers, one per file however its path is spelled; scanned by path, as an editor holds a handful |
-| [`Prepared`](#prepared) | `rec` |  |
+| [`Prepared`](#prepared) | `rec` | a staged change to the buffers, made by commit or released by discard |
 
 | On `Overlay` | |
 | :--- | :--- |
-| [`provider_of`](#provider_of) | |
+| [`provider_of`](#provider_of) | the provider contract over `o`, which must outlive it |
 
 | On `Store` | |
 | :--- | :--- |
-| [`init`](#init), [`store_init`](#store_init), [`store_dnit`](#store_dnit) | |
+| [`init`](#init) | the overlay of the buffers in `s` over `base` |
+| [`store_init`](#store_init) | an empty buffer store owning its entries through `a`, released with store_dnit |
+| [`store_dnit`](#store_dnit) | release every buffer and the store's list |
 | [`prepare`](#prepare) | the caller exclusively borrows overlay state through commit or discard |
 | [`set`](#set) | set the text standing in for `path`; true when it changed the texts |
 | [`get`](#get) | the text standing in for `path`, none when no buffer does |
@@ -59,6 +61,8 @@ disk yet still names a module
 pub fun provider_of(o: *Overlay) mach.base.source.provider.Provider
 ```
 
+the provider contract over `o`, which must outlive it
+
 ## Store
 
 ```mach
@@ -82,17 +86,23 @@ editor holds a handful
 pub fun init(base: mach.base.source.provider.Provider, s: *Store) Overlay
 ```
 
+the overlay of the buffers in `s` over `base`
+
 ### store_init
 
 ```mach
 pub fun store_init(a: *std.allocator.Allocator) Store
 ```
 
+an empty buffer store owning its entries through `a`, released with store_dnit
+
 ### store_dnit
 
 ```mach
 pub fun store_dnit(s: *Store)
 ```
+
+release every buffer and the store's list
 
 ### prepare
 
@@ -130,6 +140,17 @@ pub rec Prepared {
     changed: bool;
 }
 ```
+
+a staged change to the buffers, made by commit or released by discard
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `owner` | `*Store` | the store, nil once committed or discarded |
+| `key` | `str` | the cleaned path, owned until a new entry takes it |
+| `text` | `str` | the copied text, owned until commit takes it, nil for a removal or no change |
+| `index` | `usize` | the buffer the path names, the store's length for a new one |
+| `remove` | `bool` | the change removes the buffer |
+| `changed` | `bool` | the change alters the texts |
 
 ### discard
 

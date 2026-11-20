@@ -25,7 +25,9 @@ Uses types from [`mach.base.diagnostic`](base/diagnostic.md), [`mach.base.fail`]
 | [`init_over`](#init_over) | a session whose names are layered over `base` and whose texts go to `sources`: every id `base` has issued names the same string here and every file of `sources` the same text, so what was planned in another session, its manifests and its cells, is read and located here as it was planned |
 | [`dnit`](#dnit) | release a session and everything it owns; a nil session holds nothing |
 | [`expire_views`](#expire_views) | a change to the session's inputs or module identities expires every view borrowed from it |
-| [`reset_type_projection`](#reset_type_projection), [`next_parse_incarnation`](#next_parse_incarnation), [`load_source`](#load_source) | |
+| [`reset_type_projection`](#reset_type_projection) | drop the type store's field projections so they are rebuilt, expiring every borrowed view |
+| [`next_parse_incarnation`](#next_parse_incarnation) | the next number naming one parse of a source, counting up from 1 |
+| [`load_source`](#load_source) | load a file's text into the source map and set it as the file's input in the query database a text that differs from the one already loaded expires every borrowed view |
 
 | Constants | |
 | :--- | :--- |
@@ -134,17 +136,41 @@ permanently refuses new borrowed views while teardown remains infallible
 pub fun reset_type_projection(s: *Session) err[mach.base.fail.Fail]
 ```
 
+drop the type store's field projections so they are rebuilt, expiring every borrowed view
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session whose type store is reset |
+| **returns** | ok, or a failure when a query operation is active or query products are still borrowed |
+
 ### next_parse_incarnation
 
 ```mach
 pub fun next_parse_incarnation(s: *Session) res[u64, mach.base.fail.Fail]
 ```
 
+the next number naming one parse of a source, counting up from 1
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session that issues the number |
+| **returns** | the new number, or a failure once the counter is exhausted |
+
 ### load_source
 
 ```mach
 pub fun load_source(s: *Session, path: str, text: str) res[mach.base.source.FileId, mach.base.fail.Fail]
 ```
+
+load a file's text into the source map and set it as the file's input in the query database
+a text that differs from the one already loaded expires every borrowed view
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session to load into |
+| `path` | the file's path, cleaned before it keys the source map |
+| `text` | the file's text, which the query database copies as the input |
+| **returns** | the file's id, or a failure when the path cannot be cleaned, the text is longer than 0xFFFFFFFF bytes, or the source map or query database refuses it |
 
 ## Constants
 

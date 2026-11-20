@@ -8,12 +8,12 @@ Source: [`src/compile/cache/compiler.mach`](../../../../src/compile/cache/compil
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Error`](#error) | `rec` |  |
+| [`Error`](#error) | `rec` | why the compiler identity could not be read |
 | [`Identity`](#identity) | `rec` | the sha-256 of the running image's file |
 
 | On `Identity` | |
 | :--- | :--- |
-| [`identity_clear`](#identity_clear) | |
+| [`identity_clear`](#identity_clear) | zero an identity's digest bytes and length |
 | [`identity`](#identity-1) | identifies the current executable, never argv[0], once per process, by the sha-256 of its file success fills the identity, failure leaves the output and the memo untouched |
 
 ---
@@ -23,6 +23,13 @@ Source: [`src/compile/cache/compiler.mach`](../../../../src/compile/cache/compil
 ```mach
 pub rec Error { kind: u8; message: str; }
 ```
+
+why the compiler identity could not be read
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `u8` | the host fault kind |
+| `message` | `str` | what went wrong |
 
 ## Identity
 
@@ -37,6 +44,12 @@ the sha-256 of the running image's file
 ```mach
 pub fun identity_clear(id: *Identity)
 ```
+
+zero an identity's digest bytes and length
+
+| Parameter | |
+| :--- | :--- |
+| `id` | the identity to clear |
 
 ### identity
 

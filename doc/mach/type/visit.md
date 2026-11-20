@@ -14,7 +14,7 @@ Uses types from [`mach.report.phase`](../report/phase.md), [`mach.type`](../type
 | :--- | :--- | :--- |
 | [`Edges`](#edges) | `def` |  |
 | [`Verdict`](#verdict) | `def` | what a leaf predicate says of one type |
-| [`Walk`](#walk) | `rec` |  |
+| [`Walk`](#walk) | `rec` | one walk for one property |
 
 | On `Edges` | |
 | :--- | :--- |
@@ -89,6 +89,18 @@ pub rec Walk[C] {
     leaf:  fun(*C, mach.type.kind.TypeId, *mach.type.Type) Verdict;
 }
 ```
+
+one walk for one property
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `types` | `*mach.type.TypeInterner` | the store walked |
+| `status` | `*mach.report.phase.PhaseStatus` | where an internal failure lands |
+| `scan` | `*mach.type.scan.Scan` | the scan marking what was entered |
+| `once` | `bool` | whether every type is entered once |
+| `edges` | `Edges` | the edges the walk follows |
+| `ctx` | `*C` | the property's context |
+| `leaf` | `fun(*C, mach.type.kind.TypeId, *mach.type.Type) Verdict` | the property's verdict on each type the walk visits |
 
 ### reaches
 

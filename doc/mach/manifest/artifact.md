@@ -15,11 +15,11 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | :--- | :--- |
 | [`artifact_set`](#artifact_set) | every key `--set` writes over an artifact that the table `sub` holds, decoded over `d` with where it was written; a key `sub` does not hold leaves `d` as it is |
 | [`subsystem_named`](#subsystem_named) | the PE subsystem mink spells `name`, or why it names none: the spelling a previous major took for the graphical subsystem is refused naming mink's, and any other unknown name is refused listing mink's |
-| [`parse_artifacts`](#parse_artifacts) | |
+| [`parse_artifacts`](#parse_artifacts) | decode every `[artifact.<name>]` table of `t` into `m.artifacts`, nothing when there is none |
 | [`export_validate`](#export_validate) | more than one `export = true` artifact is refused, pointing at each `export` value |
 | [`export_artifact`](#export_artifact) | the export library: the one artifact marked `export = true`, nil when none is |
 | [`find_artifact`](#find_artifact) | the artifact `m` declares under `name`, nil when none is |
-| [`find_artifact_by_name`](#find_artifact_by_name) | |
+| [`find_artifact_by_name`](#find_artifact_by_name) | the artifact `m` declares under the interned `name`, nil when none is |
 | [`artifact_needs_artifact`](#artifact_needs_artifact) | whether a `need` entry of `a` selects `other`, a different artifact |
 | [`expand_artifact_output`](#expand_artifact_output) | expand an artifact's `out` for the target `vars` names |
 | [`artifact_supports_target`](#artifact_supports_target) | whether an artifact's `targets` lists a target name or "*" |
@@ -67,6 +67,16 @@ listing mink's
 pub fun parse_artifacts(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, t: *toml.value.Table, m: *Manifest) err[mach.base.fail.Fail]
 ```
 
+decode every `[artifact.<name>]` table of `t` into `m.artifacts`, nothing when there is none
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | owns the artifact array, its entries and a refusal's text |
+| `itn` | interns the names and paths |
+| `t` | the manifest's root table |
+| `m` | the manifest the artifacts are set on |
+| **returns** | ok, or the refusal of the first artifact that does not decode |
+
 ### export_validate
 
 ```mach
@@ -96,6 +106,8 @@ the artifact `m` declares under `name`, nil when none is
 ```mach
 pub fun find_artifact_by_name(m: *Manifest, name: mach.base.intern.StrId) *ArtifactDef
 ```
+
+the artifact `m` declares under the interned `name`, nil when none is
 
 ### artifact_needs_artifact
 

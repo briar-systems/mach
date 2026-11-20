@@ -29,18 +29,18 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.base.intern`](base/inte
 
 | Functions | |
 | :--- | :--- |
-| [`append_frontend_roots`](#append_frontend_roots) | |
+| [`append_frontend_roots`](#append_frontend_roots) | the front end's roots in topological order: each module's parse, its resolve and sema unless the build skipped its front end, and the instances of each module the build types them for |
 | [`append_test_roots`](#append_test_roots) | the codegen roots and the lowering and codegen of each test object the test pass reached |
 | [`phase_finish`](#phase_finish) | a phase the query engine does not run is published as one it does: the project's diagnostics are refreshed beside its result |
 | [`reconfigure`](#reconfigure) | a loaded project under another request from its host: the build context is frozen again, so what read the old one is computed again, and nothing reads a context no freeze captured |
-| [`run_sema_pass`](#run_sema_pass) | |
+| [`run_sema_pass`](#run_sema_pass) | the sema stage: every loaded module whose front end the build did not skip typed through the query engine, and the instances they ask for |
 | [`run_codegen_pass`](#run_codegen_pass) | the codegen stage: each emitted module lowered and compiled, or its object restored from `obj/` |
 | [`run_test_pass`](#run_test_pass) | the test stage: each test object, lowered against its module's normal object |
 | [`run_link_pass`](#run_link_pass) | the link stage: the artifact `job` names, written by its action only when an input of the link moved since it last ran or the artifact on disk is not the one it wrote |
 | [`closure_locate`](#closure_locate) | locate a root manifest's dependency closure with no build cell configured, as a build locates it: every dependency under dep/, its manifest and its direct edges, and nothing is checked against git or the pins |
 | [`closure_checked`](#closure_checked) | locate a root manifest's dependency closure as `closure_locate` does, holding every edge to `check` as it is located, as `mach dep verify` does |
 | [`begin_build`](#begin_build) | begin the build the request names: every goal, a test goal included, loads the selected artifact's closure |
-| [`run_load_phase`](#run_load_phase) | |
+| [`run_load_phase`](#run_load_phase) | the load stage: the selected artifact's closure loaded from its entry, every artifact's under the union root set, then registered, frozen and resolved |
 | [`load_manifest`](#load_manifest) | the root manifest of the project at `project_root`, read once: its text, an open buffer's when the session holds one, becomes the session's input for the file, so a warm session sees an edit to it as an input change, and the manifest records the input and the revision it was read at |
 | [`project_root_of`](#project_root_of) | the root of the project a file belongs to: the nearest directory above it holding a mach.toml, none when no directory does |
 | [`module_under`](#module_under) | the module the file at `path` is under the project at `root`: none when it lies outside the source directory |
@@ -136,6 +136,15 @@ I/O). every string `an` holds is borrowed for the call, and the project borrows 
 pub fun append_frontend_roots(p: *mach.compile.project.Project, roots: *Vector[mach.session.query.QueryKey]) err[mach.base.fail.Fail]
 ```
 
+the front end's roots in topological order: each module's parse, its resolve and sema unless the
+build skipped its front end, and the instances of each module the build types them for
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the project |
+| `roots` | the vector the keys are appended to |
+| **returns** | ok, or the failure when the vector cannot grow |
+
 ### append_test_roots
 
 ```mach
@@ -168,6 +177,14 @@ what read the old one is computed again, and nothing reads a context no freeze c
 ```mach
 pub fun run_sema_pass(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
 ```
+
+the sema stage: every loaded module whose front end the build did not skip typed through the
+query engine, and the instances they ask for
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the loaded project |
+| **returns** | ok, or the stage's failure, its diagnostics those of the front end's roots |
 
 ### run_codegen_pass
 
@@ -251,6 +268,14 @@ selected artifact's closure
 ```mach
 pub fun run_load_phase(p: *mach.compile.project.Project) err[mach.base.fail.Fail]
 ```
+
+the load stage: the selected artifact's closure loaded from its entry, every artifact's under
+the union root set, then registered, frozen and resolved
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the project begin_build made |
+| **returns** | ok, or the failure of any step from target selection to the resolve |
 
 ### load_manifest
 

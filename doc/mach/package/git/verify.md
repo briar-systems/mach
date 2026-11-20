@@ -13,7 +13,8 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 
 | Functions | |
 | :--- | :--- |
-| [`requirer_selector_satisfied`](#requirer_selector_satisfied), [`realized`](#realized) | |
+| [`requirer_selector_satisfied`](#requirer_selector_satisfied) | check a requirer's git selector, a version range or an exact ref, against the commit the dependency is realized at |
+| [`realized`](#realized) | what `mach dep verify` checks of one realized git dependency |
 
 ---
 
@@ -26,10 +27,39 @@ pub fun requirer_selector_satisfied(s: *mach.session.Session, gi: *mach.package.
     dir_dep: str, d: *mach.manifest.model.DepDef, content: mach.base.intern.StrId, root_own: bool) err[mach.base.fail.Fail]
 ```
 
+check a requirer's git selector, a version range or an exact ref, against the commit the
+dependency is realized at
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session |
+| `gi` | the inspector whose git runs the checks |
+| `alias` | the dependency identity |
+| `chain` | the requiring chain, as a refusal names it |
+| `project_root` | the root project |
+| `dir_dep` | the dependency root's name under the project, dep |
+| `d` | the requirer's declaration, where a path declaration always holds |
+| `content` | the realized content, `git/<commit>` for a git checkout |
+| `root_own` | the root declares the identity itself, which shapes the remedy a refusal names |
+| **returns** | err naming the selector the pinned commit does not satisfy |
+
 ### realized
 
 ```mach
 pub fun realized(s: *mach.session.Session, gi: *mach.package.git.Inspector, alias: str, parent_root: str,
     dep_dir: str, dir_dep: str, d: *mach.manifest.model.DepDef) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
+
+what `mach dep verify` checks of one realized git dependency
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session |
+| `gi` | the inspector, started here when still pending |
+| `alias` | the dependency identity |
+| `parent_root` | the root of the project that declares it |
+| `dep_dir` | the dependency's checkout directory |
+| `dir_dep` | the dependency root's name under the parent, dep |
+| `d` | the declaration |
+| **returns** | the realized content `git/<commit>`, interned, which the closure's selectors are checked against, err naming the first mismatch |
 

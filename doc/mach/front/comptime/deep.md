@@ -25,9 +25,9 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 | [`Node`](#node) | `rec` | a value of a store: its shape, and the offset of its payload in the store's bytes |
 | [`Shape`](#shape) | `rec` | the form of a value apart from its scalar data |
 | [`Member`](#member) | `rec` | a member of an aggregate value |
-| [`Store`](#store) | `rec` |  |
-| [`Projection`](#projection) | `rec` |  |
-| [`Element`](#element-1) | `rec` |  |
+| [`Store`](#store) | `rec` | the shapes and payloads of one module's constant values |
+| [`Projection`](#projection) | `rec` | what projecting a member out of a node found |
+| [`Element`](#element-1) | `rec` | what indexing an array node found |
 
 | On `NodeKind` | |
 | :--- | :--- |
@@ -39,27 +39,28 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 
 | On `Refusal` | |
 | :--- | :--- |
-| [`refusal_of`](#refusal_of) | |
+| [`refusal_of`](#refusal_of) | the evaluation failure a refused leaf gives |
 
 | On `Node` | |
 | :--- | :--- |
 | [`NONE`](#node) | the node of no value |
-| [`is_none`](#is_none), [`same`](#same) | |
+| [`is_none`](#is_none) | whether a node is the node of no value |
+| [`same`](#same) | whether two nodes name the same value of one store |
 | [`node_ref`](#node_ref) | the value a value names: node `node` of the store of the module with stable id `module`, read at type `ty` |
 | [`node_of`](#node_of) | the node a value of kind CT_KIND_NODE names |
 
 | On `Store` | |
 | :--- | :--- |
-| [`init`](#init) | |
+| [`init`](#init) | an empty store, every table drawn from `alloc` |
 | [`dnit`](#dnit) | release a deep store; a nil store holds nothing |
-| [`shape_at`](#shape_at) | |
+| [`shape_at`](#shape_at) | the shape of a node |
 | [`hint_member`](#hint_member) | the shape member `ord`, named `name`, of a value of shape `hint` has: what a builder expects of the same member of the next value it builds of that form |
 | [`scalar_add`](#scalar_add) | the scalar `v` of type `ty`; `hint` is the shape the builder expects it to have, which a column of a table shares from row to row, so it is taken without a lookup when it fits |
 | [`refused_add`](#refused_add) | a leaf of type `ty` with no compile-time value, which gives `r` when read |
 | [`aggregate_add`](#aggregate_add) | an array or a record or case literal of type `ty` with the members `members[0 .. len]`, each a node of `s`: the case `head` selects, and an array's declared element count |
 | [`address_add`](#address_add) | the address of `symbol` of type `ty`, then of the place the steps `steps[0 .. len]` reach |
 | [`member`](#member-1) | member `ord` of the aggregate or address `n`, which holds more than `ord` members |
-| [`member_at`](#member_at) | |
+| [`member_at`](#member_at) | member `ord` of an array or literal node, checked |
 | [`scalar`](#scalar) | the value of the scalar `n` |
 | [`value`](#value) | the value a scalar node holds, or the refusal a refused one gives; an aggregate has no value of its own, and an address has none until the program is linked |
 | [`read`](#read) | what reading node `node` of module `module`'s store gives: a scalar's value, a refused leaf's or an address's refusal, or the aggregate itself as a value naming it |
@@ -119,6 +120,14 @@ what reading a leaf with no compile-time value gives, and where that leaf is
 pub fun refusal_of(itn: *mach.base.intern.Interner, r: Refusal) mach.front.comptime.failure.EvalFail
 ```
 
+the evaluation failure a refused leaf gives
+
+| Parameter | |
+| :--- | :--- |
+| `itn` | the interner the refusal's message is an id in |
+| `r` | the refusal |
+| **returns** | the failure, its message borrowed from the interner |
+
 ## Symbol
 
 ```mach
@@ -154,11 +163,26 @@ a value of a store: its shape, and the offset of its payload in the store's byte
 pub fun is_none(n: Node) bool
 ```
 
+whether a node is the node of no value
+
+| Parameter | |
+| :--- | :--- |
+| `n` | the node |
+| **returns** | true for NONE |
+
 ### same
 
 ```mach
 pub fun same(l: Node, r: Node) bool
 ```
+
+whether two nodes name the same value of one store
+
+| Parameter | |
+| :--- | :--- |
+| `l` | first node |
+| `r` | second node |
+| **returns** | true when their shapes and payload offsets are equal |
 
 ### node_ref
 
@@ -235,11 +259,26 @@ pub rec Store {
 }
 ```
 
+the shapes and payloads of one module's constant values
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `shapes` | `std.collections.vector.Vector[Shape]` | every distinct shape, a node's `shape` indexing it |
+| `slots` | `std.collections.vector.Vector[Slot]` | the members of every aggregate shape that is not uniform |
+| `bytes` | `std.collections.vector.Vector[u8]` | the payloads, a node's `at` indexing it |
+
 ### init
 
 ```mach
 pub fun init(alloc: *std.allocator.Allocator) Store
 ```
+
+an empty store, every table drawn from `alloc`
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | the allocator the store grows from until dnit |
+| **returns** | the store |
 
 ### dnit
 
@@ -254,6 +293,14 @@ release a deep store; a nil store holds nothing
 ```mach
 pub fun shape_at(s: *Store, n: Node) *Shape
 ```
+
+the shape of a node
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the store that holds the node |
+| `n` | the node, which must not be NONE |
+| **returns** | a pointer into the store's shapes, valid until the store next grows |
 
 ### hint_member
 
@@ -313,6 +360,15 @@ member `ord` of the aggregate or address `n`, which holds more than `ord` member
 ```mach
 pub fun member_at(s: *Store, n: Node, ord: u32) opt[Member]
 ```
+
+member `ord` of an array or literal node, checked
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the store |
+| `n` | the node |
+| `ord` | the member's ordinal |
+| **returns** | the member, or none when the node is no array or literal or holds no member `ord` |
 
 ### scalar
 
@@ -398,6 +454,14 @@ pub rec Projection {
 }
 ```
 
+what projecting a member out of a node found
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `ProjectionKind` | which PROJECT_ case it is |
+| `node` | `Node` | the member's node, set only for PROJECT_MEMBER |
+| `head` | `mach.base.intern.StrId` | the case a case literal holds, STR_NIL for a record |
+
 ## Element
 
 ```mach
@@ -406,6 +470,13 @@ pub rec Element {
     node: Node;
 }
 ```
+
+what indexing an array node found
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `ElementKind` | which ELEMENT_ case it is |
+| `node` | `Node` | the element's node, set only for ELEMENT_MEMBER |
 
 ## Functions
 

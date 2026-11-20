@@ -14,7 +14,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.ast.decl`](
 
 | Functions | |
 | :--- | :--- |
-| [`resolve_one`](#resolve_one) | |
+| [`resolve_one`](#resolve_one) | checks the `#[embed]` decorator `dec` on `d` and fixes the length of its array type to the size of the file the load read for it |
 
 ---
 
@@ -26,4 +26,16 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.ast.decl`](
 pub fun resolve_one(sc: *mach.front.sema.context.SemaContext, did: mach.front.ast.id.DeclId, d: *mach.front.ast.decl.Decl,
     dec: *mach.front.ast.decl.Decorator) err[mach.base.fail.Fail]
 ```
+
+checks the `#[embed]` decorator `dec` on `d` and fixes the length of its array type to the
+size of the file the load read for it. a refused declaration is reported to `sc` and its
+inferred lengths are marked failed so its uses say nothing more
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context of the module being typed |
+| `did` | the declaration's id |
+| `d` | the declaration carrying the decorator |
+| `dec` | the `embed` decorator |
+| **returns** | ok when the declaration was resolved or refused with a diagnostic, an error when the load recorded no path for the argument or the path could not be recorded |
 

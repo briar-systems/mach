@@ -13,7 +13,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.session`](../../s
 | :--- | :--- |
 | [`public_leaf`](#public_leaf) | the kinds that carry no secret of their own; false for every other kind, which a walk descends (a partition, enumerated by its test) |
 | [`secret`](#secret) | whether `tid` reaches a secret |
-| [`contains_secret`](#contains_secret) | |
+| [`contains_secret`](#contains_secret) | whether `tid` reaches a secret anywhere, pointers included, asked as a query of its own |
 
 ---
 
@@ -41,4 +41,12 @@ whether `tid` reaches a secret
 ```mach
 pub fun contains_secret(s: *mach.session.Session, tid: mach.type.kind.TypeId) res[bool, mach.base.fail.Fail]
 ```
+
+whether `tid` reaches a secret anywhere, pointers included, asked as a query of its own
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session holding the store and fact cache the query uses |
+| `tid` | the type |
+| **returns** | the answer, or the internal failure or refusal the query met |
 

@@ -12,26 +12,27 @@ Source: [`src/base/handle.mach`](../../../src/base/handle.mach)
 | Type | | |
 | :--- | :--- | :--- |
 | [`Error`](#error) | `tag` | a store's refusal: the allocator's, a store or editor that is not live, or a second exclusive editor |
-| [`StableChunks`](#stablechunks) | `rec` |  |
-| [`ChunkEditor`](#chunkeditor) | `rec` |  |
+| [`StableChunks`](#stablechunks) | `rec` | elements kept in fixed chunks, so an element never moves until the store is released |
+| [`ChunkEditor`](#chunkeditor) | `rec` | the exclusive right to append to one store, from chunk_editor until chunk_editor_finish |
 
 | On `Error` | |
 | :--- | :--- |
-| [`text`](#text) | |
+| [`text`](#text) | the text of a store's refusal |
 
 | On `StableChunks` | |
 | :--- | :--- |
-| [`chunk_init`](#chunk_init) | |
+| [`chunk_init`](#chunk_init) | an empty store, released with chunk_dnit |
 | [`chunk_dnit`](#chunk_dnit) | release a store and its chunks; a nil store holds nothing |
-| [`chunk_count`](#chunk_count) | |
+| [`chunk_count`](#chunk_count) | how many elements the store holds, none for a nil store |
 | [`chunk_at`](#chunk_at) | the element at `index`, absent past the end or on a nil store |
 | [`chunk_get`](#chunk_get) | the element at `index`, which the store handed out and so lies before its end; any other index is a broken precondition of the caller, and it stops the compiler |
-| [`chunk_editor`](#chunk_editor) | |
+| [`chunk_editor`](#chunk_editor) | open the store's one exclusive editor |
 
 | On `ChunkEditor` | |
 | :--- | :--- |
 | [`chunk_editor_finish`](#chunk_editor_finish) | end an edit of a store; an editor that opened no store ends nothing |
-| [`chunk_grow`](#chunk_grow), [`chunk_append`](#chunk_append) | |
+| [`chunk_grow`](#chunk_grow) | make room for `additional` more elements, so the appends that fill it cannot allocate |
+| [`chunk_append`](#chunk_append) | append `value`, growing by one chunk when the store is full |
 
 ---
 
@@ -54,6 +55,8 @@ second exclusive editor
 pub fun text(e: Error) str
 ```
 
+the text of a store's refusal
+
 ## StableChunks
 
 ```mach
@@ -65,11 +68,22 @@ pub rec StableChunks[T] {
 }
 ```
 
+elements kept in fixed chunks, so an element never moves until the store is released
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `a` | `*std.allocator.Allocator` | owns the chunks |
+| `chunks` | `Vector[*T]` | the chunks, each CHUNK_CAPACITY elements |
+| `len` | `usize` | how many elements the store holds |
+| `editing` | `bool` | an editor holds the store |
+
 ### chunk_init
 
 ```mach
 pub fun chunk_init[T](a: *std.allocator.Allocator) StableChunks[T]
 ```
+
+an empty store, released with chunk_dnit
 
 ### chunk_dnit
 
@@ -84,6 +98,8 @@ release a store and its chunks; a nil store holds nothing
 ```mach
 pub fun chunk_count[T](s: *StableChunks[T]) usize
 ```
+
+how many elements the store holds, none for a nil store
 
 ### chunk_at
 
@@ -108,6 +124,13 @@ other index is a broken precondition of the caller, and it stops the compiler
 pub fun chunk_editor[T](s: *StableChunks[T]) res[ChunkEditor[T], Error]
 ```
 
+open the store's one exclusive editor
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the store |
+| **returns** | the editor, or absent for a nil store and busy when an editor is already open |
+
 ## ChunkEditor
 
 ```mach
@@ -115,6 +138,12 @@ pub rec ChunkEditor[T] {
     store: *StableChunks[T];
 }
 ```
+
+the exclusive right to append to one store, from chunk_editor until chunk_editor_finish
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `store` | `*StableChunks[T]` | the store it edits, nil once finished |
 
 ### chunk_editor_finish
 
@@ -130,9 +159,25 @@ end an edit of a store; an editor that opened no store ends nothing
 pub fun chunk_grow[T](e: *ChunkEditor[T], additional: usize) err[Error]
 ```
 
+make room for `additional` more elements, so the appends that fill it cannot allocate
+
+| Parameter | |
+| :--- | :--- |
+| `e` | an open editor |
+| `additional` | how many elements to make room for |
+| **returns** | absent for an editor that opened no store, or the allocator's refusal, which releases the chunks this call added |
+
 ### chunk_append
 
 ```mach
 pub fun chunk_append[T](e: *ChunkEditor[T], value: T) res[*T, Error]
 ```
+
+append `value`, growing by one chunk when the store is full
+
+| Parameter | |
+| :--- | :--- |
+| `e` | an open editor |
+| `value` | the element |
+| **returns** | where the element now lives, stable until the store is released, or absent for an editor that opened no store, or the allocator's refusal |
 

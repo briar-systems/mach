@@ -15,7 +15,7 @@ Uses types from [`mach.base.fail`](fail.md), [`mach.base.intern`](intern.md).
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Catalog`](#catalog) | `tag` |  |
+| [`Catalog`](#catalog) | `tag` | the refusal of one catalog member, with the class that says where the fault lies |
 
 | On `Catalog` | |
 | :--- | :--- |
@@ -28,7 +28,7 @@ Uses types from [`mach.base.fail`](fail.md), [`mach.base.intern`](intern.md).
 
 | Functions | |
 | :--- | :--- |
-| [`unknown_catalog`](#unknown_catalog) | |
+| [`unknown_catalog`](#unknown_catalog) | the internal failure for a member tag `catalog_name` does not declare |
 
 ---
 
@@ -40,6 +40,13 @@ pub tag Catalog: u8 {
     internal:    Member;
 }
 ```
+
+the refusal of one catalog member, with the class that says where the fault lies
+
+| Case | Payload | |
+| :--- | :--- | :--- |
+| `unsupported` | `Unsupported` | a declared member a target, format or phase does not honor, the user's fault |
+| `internal` | `Member` | a member the compiler produced that its own catalog does not declare |
 
 ### unsupported_member
 
@@ -100,4 +107,13 @@ the caller's allocator
 ```mach
 pub fun unknown_catalog(a: *std.allocator.Allocator, catalog_name: str, tag: u32) mach.base.fail.Fail
 ```
+
+the internal failure for a member tag `catalog_name` does not declare
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator the failure's message is owned through |
+| `catalog_name` | the catalog's name as the message spells it |
+| `tag` | the member's tag |
+| **returns** | the internal failure, or the format refusal when the message could not be made |
 

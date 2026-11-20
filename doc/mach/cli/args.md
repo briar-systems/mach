@@ -31,6 +31,10 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | :--- | :--- |
 | [`entry_stated`](#entry_stated) | whether the command line states anything only an entry build takes |
 
+| On `Removed` | |
+| :--- | :--- |
+| [`removed_in`](#removed_in) | whether the removed spelling `row` stands in an invocation whose leading words after `mach` are `path`, as `dep add . regex`: a row for every command does, and a row for one command only within that command |
+
 | On `Policy` | |
 | :--- | :--- |
 | [`refusal`](#refusal) | a parsed line's refusal as a failure, in mach's words where mach knows more of the option than the parser and the parser's words otherwise |
@@ -149,7 +153,7 @@ pub fun collect_link_inputs(a: *std.allocator.Allocator, c: *CliArgs, inv: *std.
 
 fill c.overrides.link_tokens and c.overrides.lib_dirs in command-line order: every `-l` value and every
 operand after the first that input.token_is_path accepts go to link_tokens, every `-L` value to
-lib_dirs. Both vectors are reinitialised with a first
+lib_dirs. both vectors are reinitialised first
 
 | Parameter | |
 | :--- | :--- |
@@ -205,8 +209,9 @@ whether the command line states anything only an entry build takes
 
 ```mach
 pub rec Removed {
-    name: str;
-    use:  str;
+    command: str;
+    name:    str;
+    use:     str;
 }
 ```
 
@@ -214,8 +219,19 @@ a spelling an earlier version took, refused by name with what replaced it
 
 | Field | Type | |
 | :--- | :--- | :--- |
+| `command` | `str` | the command it was removed from, its words after `mach` as `dep add`, "" for every command |
 | `name` | `str` | the spelling, `--name` or `-c` |
 | `use` | `str` | what to write instead |
+
+### removed_in
+
+```mach
+pub fun removed_in(row: *Removed, path: str) bool
+```
+
+whether the removed spelling `row` stands in an invocation whose leading words after `mach` are
+`path`, as `dep add . regex`: a row for every command does, and a row for one command only
+within that command
 
 ## Conflict
 
@@ -456,8 +472,8 @@ any other failure is returned as given
 | `TIMEOUT` | `std.args.Flag` | `std_args.Flag{long: "timeout", short: 0, value: "duration", repeat: false, negatable: false, help: "stop after a duration such as 30s"}` | `--timeout <duration>` |
 | `ALLOW_UNRUNNABLE` | `std.args.Flag` | `std_args.Flag{long: "allow-unrunnable", short: 0, value: nil, repeat: false, negatable: false, help: "succeed when nothing selected can run on this host"}` | `--allow-unrunnable` |
 | `OFFLINE` | `std.args.Flag` | `std_args.Flag{long: "offline", short: 0, value: nil, repeat: false, negatable: false, help: "resolve from releases already fetched"}` | `--offline` |
-| `REMOVED_N` | `usize` | `19` | row count of REMOVED |
-| `REMOVED` | `[REMOVED_N]Removed` | `[REMOVED_N]Removed{ Removed{name: "-g", use: "--debug"}, Removed{name: "-d", use: "--debug"}, Removed{name: "-s", use: "--source"}, Removed{name: "-e", use: "--emit"}, Removed{name: "-O0", use: "--no-optimize"}, Removed{name: "-O2", use: "-O or --optimize"}, Removed{name: "--emit-asm", use: "--emit asm"}, Removed{name: "--emit-ir", use: "--emit ir"}, Removed{name: "--jobs", use: "--threads"}, Removed{name: "--pie", use: "--linkage pie, or the linkage key of a bin artifact"}, Removed{name: "--simd", use: "--set simd=<mode>"}, Removed{name: "--arch", use: "-t <sys>-<arch>"}, Removed{name: "--sys", use: "-t <sys>-<arch>"}, Removed{name: "--of", use: "the target's system, which implies the object format"}, Removed{name: "--platform", use: "--set platform=<name>"}, Removed{name: "--subsystem", use: "--set subsystem=<name>"}, Removed{name: "--base", use: "--set base=<address>"}, Removed{name: "--stack-reserve", use: "--set stack_reserve=<bytes>"}, Removed{name: "--stack-commit", use: "--set stack_commit=<bytes>"}, }` | the options a previous major took, each refused by name with what to write instead |
+| `REMOVED_N` | `usize` | `20` | row count of REMOVED |
+| `REMOVED` | `[REMOVED_N]Removed` | `[REMOVED_N]Removed{ Removed{command: "", name: "-g", use: "--debug"}, Removed{command: "", name: "-d", use: "--debug"}, Removed{command: "", name: "-s", use: "--source"}, Removed{command: "", name: "-e", use: "--emit"}, Removed{command: "", name: "-O0", use: "--no-optimize"}, Removed{command: "", name: "-O2", use: "-O or --optimize"}, Removed{command: "", name: "--emit-asm", use: "--emit asm"}, Removed{command: "", name: "--emit-ir", use: "--emit ir"}, Removed{command: "", name: "--jobs", use: "--threads"}, Removed{command: "", name: "--pie", use: "--linkage pie, or the linkage key of a bin artifact"}, Removed{command: "", name: "--simd", use: "--set simd=<mode>"}, Removed{command: "", name: "--arch", use: "-t <sys>-<arch>"}, Removed{command: "", name: "--sys", use: "-t <sys>-<arch>"}, Removed{command: "", name: "--of", use: "the target's system, which implies the object format"}, Removed{command: "", name: "--platform", use: "--set platform=<name>"}, Removed{command: "", name: "--subsystem", use: "--set subsystem=<name>"}, Removed{command: "", name: "--base", use: "--set base=<address>"}, Removed{command: "", name: "--stack-reserve", use: "--set stack_reserve=<bytes>"}, Removed{command: "", name: "--stack-commit", use: "--set stack_commit=<bytes>"}, Removed{command: "dep add", name: "--version", use: "--range"}, }` | the options a previous major took, each refused by name with what to write instead |
 | `NO_WORDS` | `Slice[str]` | `Slice[str]{data: nil, size: 0}` | no words, for a command with no aliases |
 | `NO_COMMANDS` | `Slice[*std.args.Command]` | `Slice[*std_args.Command]{data: nil, size: 0}` | no commands, for a command nothing is nested under |
 | `NO_FLAGS` | `Slice[*std.args.Flag]` | `Slice[*std_args.Flag]{data: nil, size: 0}` | no flags |

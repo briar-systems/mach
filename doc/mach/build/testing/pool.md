@@ -74,3 +74,8 @@ pub rec Counts {
 what a finished run decides: how many tests did not pass, and how many of
 those the run's own machinery failed rather than the test
 
+| Field | Type | |
+| :--- | :--- | :--- |
+| `failed` | `u32` | the tests whose result is neither a pass nor a skip |
+| `infrastructure` | `u32` | of those, the ones whose result is an infrastructure failure |
+

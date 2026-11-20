@@ -22,15 +22,20 @@ Uses types from [`mach.base.fail`](../fail.md), [`mach.base.intern`](../intern.m
 
 | On `Origin` | |
 | :--- | :--- |
-| [`origin_dnit`](#origin_dnit) | |
+| [`origin_dnit`](#origin_dnit) | release an origin's path through `a` |
 
 | On `Text` | |
 | :--- | :--- |
-| [`text_dnit`](#text_dnit) | |
+| [`text_dnit`](#text_dnit) | release a module's text through `a` when the reader owns it, and leave it empty |
 
 | On `Provider` | |
 | :--- | :--- |
-| [`module_locate`](#module_locate), [`module_exists`](#module_exists), [`module_read`](#module_read), [`module_site`](#module_site), [`module_peek`](#module_peek), [`package_known`](#package_known) | |
+| [`module_locate`](#module_locate) | where the module `fqn` names would be read from, as the provider's `locate` answers |
+| [`module_exists`](#module_exists) | whether `fqn` names a module, as the provider's `exists` answers |
+| [`module_read`](#module_read) | the text at `path`, as the provider's `read` answers |
+| [`module_site`](#module_site) | the path `locate` would give for `fqn`, as the provider's `site` answers |
+| [`module_peek`](#module_peek) | the text `read` would give at `path`, as the provider's `peek` answers |
+| [`package_known`](#package_known) | whether a package has the id `id`, as the provider's `package` answers |
 
 ---
 
@@ -78,6 +83,8 @@ where a module's text is read from
 pub fun origin_dnit(a: *std.allocator.Allocator, o: *Origin)
 ```
 
+release an origin's path through `a`
+
 ## Text
 
 ```mach
@@ -94,6 +101,8 @@ a module's text: borrowed from the provider, or owned by the reader when `owned`
 ```mach
 pub fun text_dnit(a: *std.allocator.Allocator, t: *Text)
 ```
+
+release a module's text through `a` when the reader owns it, and leave it empty
 
 ## Provider
 
@@ -129,11 +138,15 @@ saying so, never by failing, so a provider can stand in front of another one
 pub fun module_locate(p: *Provider, a: *std.allocator.Allocator, fqn: mach.base.intern.StrId) res[opt[Origin], mach.base.fail.Fail]
 ```
 
+where the module `fqn` names would be read from, as the provider's `locate` answers
+
 ### module_exists
 
 ```mach
 pub fun module_exists(p: *Provider, a: *std.allocator.Allocator, fqn: mach.base.intern.StrId) res[bool, mach.base.fail.Fail]
 ```
+
+whether `fqn` names a module, as the provider's `exists` answers
 
 ### module_read
 
@@ -141,11 +154,15 @@ pub fun module_exists(p: *Provider, a: *std.allocator.Allocator, fqn: mach.base.
 pub fun module_read(p: *Provider, a: *std.allocator.Allocator, path: str) res[Text, mach.base.fail.Fail]
 ```
 
+the text at `path`, as the provider's `read` answers
+
 ### module_site
 
 ```mach
 pub fun module_site(p: *Provider, a: *std.allocator.Allocator, fqn: str) res[opt[str], mach.base.fail.Fail]
 ```
+
+the path `locate` would give for `fqn`, as the provider's `site` answers
 
 ### module_peek
 
@@ -153,9 +170,13 @@ pub fun module_site(p: *Provider, a: *std.allocator.Allocator, fqn: str) res[opt
 pub fun module_peek(p: *Provider, a: *std.allocator.Allocator, path: str) opt[Text]
 ```
 
+the text `read` would give at `path`, as the provider's `peek` answers
+
 ### package_known
 
 ```mach
 pub fun package_known(p: *Provider, id: mach.base.intern.StrId) bool
 ```
+
+whether a package has the id `id`, as the provider's `package` answers
 

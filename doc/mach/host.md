@@ -17,7 +17,7 @@ Uses types from [`mach.base.fail`](base/fail.md).
 | [`ProbeKind`](#probekind) | `def` | what a component is, read without following it |
 | [`Probe`](#probe) | `rec` | cause: what refused the probe, read only for PROBE_ABSENT and PROBE_FAILED |
 | [`Cursor`](#cursor) | `rec` | a contained walk's hold on a path: on posix a descriptor for the directory the next component is read beneath, opened one component at a time; windows reads each prefix by path, beneath the same root |
-| [`Fault`](#fault) | `rec` |  |
+| [`Fault`](#fault) | `rec` | a refusal to read the running image's identity |
 
 | On `NativeTextError` | |
 | :--- | :--- |
@@ -30,7 +30,8 @@ Uses types from [`mach.base.fail`](base/fail.md).
 
 | On `Cursor` | |
 | :--- | :--- |
-| [`cursor_open`](#cursor_open), [`cursor_close`](#cursor_close) | |
+| [`cursor_open`](#cursor_open) | start a contained walk at `root`, opening it as a directory on posix |
+| [`cursor_close`](#cursor_close) | release the directory a cursor holds, a closed cursor holds none |
 | [`cursor_probe`](#cursor_probe) | the component's kind; windows resolves the prefix against the root |
 | [`cursor_make`](#cursor_make) | a directory for a missing component; one a concurrent writer made first is as good |
 | [`cursor_unlink`](#cursor_unlink) | remove a stale non-directory component, never following it |
@@ -145,11 +146,28 @@ each prefix by path, beneath the same root
 pub fun cursor_open(c: *Cursor, alloc: *std.allocator.Allocator, root: str, label: str) err[mach.base.fail.Fail]
 ```
 
+start a contained walk at `root`, opening it as a directory on posix
+
+| Parameter | |
+| :--- | :--- |
+| `c` | the cursor to set up, closed with cursor_close |
+| `alloc` | allocator for the walk's refusals and windows paths |
+| `root` | the walk's root, borrowed for the cursor's life |
+| `label` | what the root is, as the refusal names it |
+| **returns** | nothing, or the refusal when the root cannot be opened |
+
 ### cursor_close
 
 ```mach
 pub fun cursor_close(c: *Cursor) err[mach.base.fail.Fail]
 ```
+
+release the directory a cursor holds, a closed cursor holds none
+
+| Parameter | |
+| :--- | :--- |
+| `c` | the cursor |
+| **returns** | nothing, or the refusal of the close, which still leaves the cursor closed |
 
 ### cursor_probe
 
@@ -200,6 +218,13 @@ so a symlinked root is refused there as any component is
 ```mach
 pub rec Fault { kind: u8; message: str; }
 ```
+
+a refusal to read the running image's identity
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `u8` | FAULT_UNAVAILABLE or FAULT_INTERNAL |
+| `message` | `str` | the text of what refused |
 
 ### image_digest
 

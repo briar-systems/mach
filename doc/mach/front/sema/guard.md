@@ -23,17 +23,18 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 
 | Functions | |
 | :--- | :--- |
-| [`push`](#push), [`end`](#end) | |
+| [`push`](#push) | opens `frame` as a live guard for `place` and `case_name`, innermost on the context's stack |
+| [`end`](#end) | closes `frame`, which must be the innermost guard |
 | [`sel_begin`](#sel_begin) | opens a guard for `P.c` when the condition is exactly `sel P.c` |
 | [`guarded`](#guarded) | whether an open guard holds `place` for `case_name`, or only one that has ended does |
 | [`loop_begin`](#loop_begin) | a loop runs its condition and body again after any assignment in them, so a guard open at the loop that an assignment inside it moves is ended for the whole loop |
 | [`fin_begin`](#fin_begin) | a `fin` body replays when its block ends, after the rest of the block, so inside the body a guard that an assignment in that rest moves does not hold |
-| [`fin_end`](#fin_end) | |
+| [`fin_end`](#fin_end) | lets every guard the `fin` body `fin` hid hold again, once that body has been typed |
 | [`exit_chain_begin`](#exit_chain_begin) | a chain whose arms all test one place with `sel` or `!sel` and all exit leaves the block knowing which cases remain; when exactly one remains the rest of the block is guarded for it |
 | [`final_or_begin`](#final_or_begin) | a chain whose arms all test one place with `sel` or `!sel` reaches its final bare `or` knowing which cases remain, exiting or not; when exactly one remains the `or` body is guarded for it, as the rest of the block is after a chain that exits |
 | [`check_assign`](#check_assign) | whole-value assignment to a guarded place, or to an object it is reached through, replaces the case and is refused; an assignment to anything else the place's spelling names moves it and ends the guard |
 | [`check_stable`](#check_stable) | the spelling rule `place_equal` implements, enforced where a guard place is written so an unmatchable place is rejected at the `sel` rather than at every read inside the region |
-| [`span_text_equal`](#span_text_equal) | |
+| [`span_text_equal`](#span_text_equal) | whether two spans of the module's source hold the same text |
 
 ---
 
@@ -45,11 +46,27 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 pub fun push(sc: *mach.front.sema.context.SemaContext, frame: *mach.front.sema.context.Guard, place: mach.front.ast.id.ExprId, case_name: mach.base.intern.StrId)
 ```
 
+opens `frame` as a live guard for `place` and `case_name`, innermost on the context's stack
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context of the module being typed |
+| `frame` | the caller's frame, which must outlive the guard's region |
+| `place` | the guarded place expression |
+| `case_name` | the case the place is guarded for |
+
 ### end
 
 ```mach
 pub fun end(sc: *mach.front.sema.context.SemaContext, frame: *mach.front.sema.context.Guard)
 ```
+
+closes `frame`, which must be the innermost guard
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context of the module being typed |
+| `frame` | the guard to close |
 
 ### sel_begin
 
@@ -90,6 +107,13 @@ that an assignment in that rest moves does not hold
 ```mach
 pub fun fin_end(sc: *mach.front.sema.context.SemaContext, fin: mach.front.ast.id.StmtId)
 ```
+
+lets every guard the `fin` body `fin` hid hold again, once that body has been typed
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context of the module being typed |
+| `fin` | the `fin` statement whose body ended |
 
 ### exit_chain_begin
 
@@ -134,4 +158,13 @@ unmatchable place is rejected at the `sel` rather than at every read inside the 
 ```mach
 pub fun span_text_equal(sc: *mach.front.sema.context.SemaContext, a: mach.base.source.Span, b: mach.base.source.Span) bool
 ```
+
+whether two spans of the module's source hold the same text
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context whose source is read |
+| `a` | the first span |
+| `b` | the second span |
+| **returns** | true when both spans have the same length and bytes |
 

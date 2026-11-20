@@ -22,23 +22,28 @@ Source: [`src/base/intern.mach`](../../../src/base/intern.mach)
 | Type | | |
 | :--- | :--- | :--- |
 | [`StrId`](#strid) | `def` | the identity of one interned string |
-| [`Interner`](#interner) | `rec` |  |
-| [`Remap`](#remap) | `rec` |  |
+| [`Interner`](#interner) | `rec` | a table of interned strings, each id naming one entry |
+| [`Remap`](#remap) | `rec` | the ids a merged child's strings got in the merge's target |
 
 | On `StrId` | |
 | :--- | :--- |
-| [`STR_NIL`](#strid), [`str_id`](#str_id), [`str_index`](#str_index), [`str_same`](#str_same), [`str_is_nil`](#str_is_nil) | |
+| [`STR_NIL`](#strid) | |
+| [`str_id`](#str_id) | the string id at `index` |
+| [`str_index`](#str_index) | the index a string id names |
+| [`str_same`](#str_same) | whether two ids name the same interned string |
+| [`str_is_nil`](#str_is_nil) | whether an id is STR_NIL |
 
 | On `Interner` | |
 | :--- | :--- |
-| [`init`](#init) | |
+| [`init`](#init) | an empty interner with no base, released with dnit |
 | [`child_init`](#child_init) | an interner layered over `base`: it answers every id `base` and its own bases had issued when it was made, and issues its own past them |
 | [`descends`](#descends) | whether `itn` answers every id `base` has issued: it is `base`, or layered over it |
 | [`dnit`](#dnit) | release an interner and its strings; a nil interner holds nothing |
 | [`text`](#text) | the text of `id` |
 | [`get`](#get) | the text of `id`, or none for an id the interner never issued |
 | [`bytes`](#bytes) | every byte of `id`, NULs included, or none for an id the interner never issued |
-| [`add`](#add), [`bytes_add`](#bytes_add) | |
+| [`add`](#add) | the id of the text `text` up to its first NUL, interned when it was not yet |
+| [`bytes_add`](#bytes_add) | the id of the `len` bytes at `data`, NULs included, interned when they were not yet |
 | [`range_add`](#range_add) | the `len` bytes of `source` from `offset`, interned |
 | [`find`](#find) | the id `text` was interned under, none when it never was; nothing is interned, so a reader that shares the interner may ask while no one adds |
 | [`child_reintern`](#child_reintern) | `child` merged into `into`, its base or, for a child with no base, any interner: each string the child issued interned there in the order it issued them, and the ids they got |
@@ -72,11 +77,15 @@ apart from another id or a bare integer. absence is `STR_NIL`, never an
 pub fun str_id(index: u32) StrId
 ```
 
+the string id at `index`
+
 ### str_index
 
 ```mach
 pub fun str_index(id: StrId) u32
 ```
+
+the index a string id names
 
 ### str_same
 
@@ -84,11 +93,15 @@ pub fun str_index(id: StrId) u32
 pub fun str_same(left: StrId, right: StrId) bool
 ```
 
+whether two ids name the same interned string
+
 ### str_is_nil
 
 ```mach
 pub fun str_is_nil(id: StrId) bool
 ```
+
+whether an id is STR_NIL
 
 ## Interner
 
@@ -104,11 +117,25 @@ pub rec Interner {
 }
 ```
 
+a table of interned strings, each id naming one entry
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `a` | `*std.allocator.Allocator` | owns every entry's bytes and the table |
+| `strings` | `*Entry` | the entries this layer issued, in issue order |
+| `len` | `usize` | how many entries this layer issued |
+| `cap` | `usize` | the capacity of `strings` |
+| `dedup` | `std.collections.map.MapBy[Entry, StrId]` | each entry this layer issued, to its id |
+| `base` | `*Interner` | the interner this one is layered over, nil for none |
+| `base_len` | `usize` | how many ids the base and its own bases had issued when this one was made |
+
 ### init
 
 ```mach
 pub fun init(a: *std.allocator.Allocator) Interner
 ```
+
+an empty interner with no base, released with dnit
 
 ### child_init
 
@@ -170,11 +197,28 @@ every byte of `id`, NULs included, or none for an id the interner never issued
 pub fun add(itn: *Interner, text: str) res[StrId, std.allocator.Error]
 ```
 
+the id of the text `text` up to its first NUL, interned when it was not yet
+
+| Parameter | |
+| :--- | :--- |
+| `itn` | the interner |
+| `text` | the text |
+| **returns** | its id, or the allocator's refusal |
+
 ### bytes_add
 
 ```mach
 pub fun bytes_add(itn: *Interner, data: str, len: usize) res[StrId, std.allocator.Error]
 ```
+
+the id of the `len` bytes at `data`, NULs included, interned when they were not yet
+
+| Parameter | |
+| :--- | :--- |
+| `itn` | the interner |
+| `data` | the bytes |
+| `len` | how many |
+| **returns** | their id, or the allocator's refusal |
 
 ### range_add
 
@@ -214,6 +258,14 @@ pub rec Remap {
     len:      usize;
 }
 ```
+
+the ids a merged child's strings got in the merge's target
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `base_len` | `usize` | where the child's own range began, an id below it left as it is |
+| `ids` | `*StrId` | the target's id for each string the child issued, in issue order |
+| `len` | `usize` | how many |
 
 ### remap_dnit
 

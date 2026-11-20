@@ -16,21 +16,21 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`LoopFrame`](#loopframe) | `rec` |  |
+| [`LoopFrame`](#loopframe) | `rec` | a loop the walk is inside, which `brk` and `cnt` branch out of |
 | [`Machine`](#machine) | `rec` | the target lowering builds for: the tuple its modules are named for, the target mirl assembled from it, and the context the build's selection opened, none for a target with no baseline slots:    the address space the target's frame slots live in directed: the format exports only what export directives name sealed:   the visibility an exported definition no load may preempt takes |
 | [`FnInfo`](#fninfo) | `rec` | what the driver reads of a lowered module beside its mirl module: its name and, for each function of the module by index, what mach declared it as |
 | [`Unit`](#unit) | `rec` | what mach keeps of a lowered module once its mirl module is compiled and gone: its name and the facts of its functions |
 | [`NormalObject`](#normalobject) | `rec` | a module's test object holds its tests and `#[testing]` declarations beside its normal object, which it never changes |
-| [`ModuleScope`](#modulescope) | `rec` |  |
+| [`ModuleScope`](#modulescope) | `rec` | the module or template a lowering reads code from |
 | [`SpecClaim`](#specclaim) | `rec` | the `#[gpu.spec]` var that claims a specialization id: the module that declares it, its declaration there and its qualified name |
 | [`EachElement`](#eachelement) | `rec` | the element of a constant array a `$each` loop variable names: the array's expression and the element's index in it, where the element is stored |
-| [`ScopeMark`](#scopemark) | `rec` |  |
+| [`ScopeMark`](#scopemark) | `rec` | what scope_enter hands back for the matching scope_leave |
 | [`ClassCopy`](#classcopy) | `rec` | a copy of a function whose pointer parameters take the classes its call sites pass, lowered into this module once the module's own declarations are |
 | [`Defining`](#defining) | `tag` | how an instance's definition is bound in an object that reaches it |
 | [`Reached`](#reached) | `rec` | an instance the object's code reaches, as a set being read names it: the set and its id there, and whether constant-time code calls it |
 | [`InstanceReader`](#instancereader) | `rec` | how lowering reads an instance: the instance product of the instance a set names, which the reader's owner keeps alive for the lowering's life, and how its definition is bound where no constant-time code calls it |
-| [`LowerRequest`](#lowerrequest) | `rec` |  |
-| [`LowerContext`](#lowercontext) | `rec` |  |
+| [`LowerRequest`](#lowerrequest) | `rec` | what one lowering of a module is asked to do and what it reads, made by request the fields not listed here are described in place |
+| [`LowerContext`](#lowercontext) | `rec` | the state of one lowering: what its request gave, the mirl module and its builder, the scope being read, and the walk's locals, loops, `fin` blocks and per-function state |
 | [`Declared`](#declared-1) | `rec` | a module-level declaration as the interface of its module describes it |
 | [`FnSig`](#fnsig) | `rec` | a function's signature: its parameters and result, each narrow integer stating the extension its source type's signedness gives it a function's ir signature and the source types it was lowered from |
 
@@ -38,7 +38,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | :--- | :--- |
 | [`machine_of`](#machine_of) | the machine of a target the owners assembled, borrowing it |
 | [`module_init`](#module_init) | an empty mirl module in `a`, built for the machine's target and stated as mach's |
-| [`request`](#request) | |
+| [`request`](#request) | a lowering request for one module, checked for every reader and table it needs |
 
 | On `Unit` | |
 | :--- | :--- |
@@ -48,13 +48,15 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 
 | On `ModuleScope` | |
 | :--- | :--- |
-| [`module_scope`](#module_scope) | |
+| [`module_scope`](#module_scope) | the scope of a module lowered from its own syntax tree and sema's results |
 
 | On `LowerContext` | |
 | :--- | :--- |
 | [`normal_defines`](#normal_defines) | lowering the test object, which declares `name` because the normal object defines it |
 | [`origin_scope`](#origin_scope) | the scope another module's template is read in: the copy its interface publishes, with a comptime scope over its constants that this lowering owns, so what an instance binds stays here |
-| [`scope_enter`](#scope_enter), [`scope_leave`](#scope_leave), [`init_context`](#init_context) | |
+| [`scope_enter`](#scope_enter) | read code from `next` until the matching scope_leave, keeping the current scope |
+| [`scope_leave`](#scope_leave) | return to the scope the matching scope_enter left |
+| [`init_context`](#init_context) | make a lowering context for `req` that builds into `m` and records its functions' facts in `unit` |
 | [`module_enter`](#module_enter) | the context moved into the module `req` names, whose declarations it lowers next into the same mirl module: its scope, the instance set its code is read through and how it reads instances |
 | [`dnit_context`](#dnit_context) | release a lowering context; a nil context holds nothing |
 | [`each_element_of`](#each_element_of) | the element the innermost `$each` loop variable `name` names |
@@ -65,33 +67,43 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`declared_named`](#declared_named) | the one declaration of `kind` the module `origin` defines under `canon` |
 | [`declared_scalar`](#declared_scalar) | the scalar a module `val` holds, none when it holds no constant or an aggregate |
 | [`internal`](#internal) | fail the lowering internally with `f`, a defect met at the node the lowering stands on; a failure that names a place of its own keeps it |
-| [`report_gate`](#report_gate) | |
+| [`report_gate`](#report_gate) | reject the input with a diagnostic at `span` of the module in scope |
 | [`refuse_nesting`](#refuse_nesting) | the lowering recurses as deep as the input nests, on frames far larger than the checks before it, so each walk asks for stack before it descends and refuses the node it stands on |
 | [`refuse_type_nesting`](#refuse_type_nesting) | the same refusal of a walk over a type, which has no place of its own, at the node the lowering stands on |
 | [`refuse`](#refuse) | a failure a walk with no place of its own returned: a refusal of the input is reported under its own kind at the node the lowering stands on; any other failure is the lowering's own |
-| [`record_eval_result`](#record_eval_result) | |
+| [`refuse_at`](#refuse_at) | the same at `span`, the declaration whose walk returned it |
+| [`record_eval_result`](#record_eval_result) | fail the lowering internally when a comptime evaluation failed internally, nothing otherwise |
 | [`type_node`](#type_node) | the type node `tid` as name resolution read it, a literal head it split naming the type by its path's prefix and the case by the last segment |
-| [`expression`](#expression) | |
+| [`expression`](#expression) | the expression node `eid` of the module in scope as name resolution read it |
 | [`resolve_module_member_const`](#resolve_module_member_const) | a lowering capability; a nil context, which the capability check refuses before any call, answers as an evaluation with no lowering would |
-| [`comptime_ident_is_runtime`](#comptime_ident_is_runtime) | a lowering capability; a nil context, which the capability check refuses before any call, answers as an evaluation with no lowering would |
+| [`comptime_ident_kind`](#comptime_ident_kind) | a lowering capability; a nil context, which the capability check refuses before any call, answers as an evaluation with no lowering would |
 | [`resolve_type_comparison_operand`](#resolve_type_comparison_operand) | a lowering capability; a nil context, which the capability check refuses before any call, answers as an evaluation with no lowering would |
 | [`resolve_type_query`](#resolve_type_query) | a lowering capability; a nil context, which the capability check refuses before any call, answers as an evaluation with no lowering would |
-| [`laid_type`](#laid_type) | a lowering capability; a nil context, which the capability check refuses before any call, answers as an evaluation with no lowering would the type the layout intrinsics read for source type `tid`: a handle sizes and aligns as the target's `ptr`, as a name for a resource the target mints or an inert one it does not, and any other type as it lowers |
-| [`resolve_layout_intrinsic`](#resolve_layout_intrinsic) | |
+| [`laid_type`](#laid_type) | the type the layout intrinsics read for source type `tid`: a handle sizes and aligns as the target's `ptr`, as a name for a resource the target mints or an inert one it does not, and any other type as it lowers |
+| [`resolve_layout_intrinsic`](#resolve_layout_intrinsic) | the value of the `$size_of`, `$align_of`, `$length_of`, `$offset_of` or `$type_id` call at `eid`, none for any other expression a lowering capability |
 | [`member_offset`](#member_offset) | the byte offset of field or case `index` of the source type `tid`, lowered as `ir`: a record's field, a union's member at zero, or a tag case's payload, which a case with none does not have |
 | [`field_offset`](#field_offset) | a field descriptor's offset, from the layout lowering gives the owning type |
 | [`type_store`](#type_store) | the type store a comptime evaluation during lowering reads |
-| [`begin_function`](#begin_function) | a pointer's debug type whose pointee waits for the module's other debug types |
-| [`bind_local`](#bind_local) | |
+| [`begin_function`](#begin_function) | reset the per-function state to lower function `fn_index`, whose mirl result type is `ret_type`: no locals, loops or `fin` blocks, and no armed destination, result slot, exit or pack |
+| [`bind_local`](#bind_local) | bind a local to `v`, the stack slot it lives in, in place of any direct binding |
 | [`binds_direct`](#binds_direct) | whether a local of source type `tid`, held in `ir`, is bound to its value and has no slot: a scalar that holds no secret, or an aggregate held whole, which nothing stores to, takes the address of or names in an asm block, and, for an aggregate, whose parts nothing writes or takes the address of |
 | [`holds_whole`](#holds_whole) | whether a value of source type `tid`, held in the aggregate `ir`, is held whole, a mirl value with no storage: a record, tag or union of at most two pointer widths that holds no secret, is not volatile and has no array or vector in it, so each of its members is reached by a constant path, on a target whose memory a value's bytes can be reinterpreted in |
 | [`returns_whole`](#returns_whole) | whether the function being lowered returns an aggregate held whole, which its returns pass to its one exit as the exit's parameter |
 | [`bind_direct`](#bind_direct) | bind a local to the value it is |
-| [`lookup_direct`](#lookup_direct), [`lookup_local`](#lookup_local), [`push_loop`](#push_loop), [`pop_loop`](#pop_loop), [`current_loop`](#current_loop), [`push_fin`](#push_fin), [`fin_count`](#fin_count), [`fin_at`](#fin_at), [`pop_fins_to`](#pop_fins_to) | |
+| [`lookup_direct`](#lookup_direct) | the value a local bound by bind_direct is |
+| [`lookup_local`](#lookup_local) | the stack slot a local bound by bind_local lives in |
+| [`push_loop`](#push_loop) | enter a loop whose `cnt` branches to `header` and `brk` to `exit` |
+| [`pop_loop`](#pop_loop) | leave the innermost loop, nothing when none is open |
+| [`current_loop`](#current_loop) | the innermost loop |
+| [`push_fin`](#push_fin) | open a `fin` block, run when the walk leaves its enclosing block |
+| [`fin_count`](#fin_count) | how many `fin` blocks are open |
+| [`fin_at`](#fin_at) | the `fin` block opened `i`th, counting from the outermost |
+| [`pop_fins_to`](#pop_fins_to) | close every `fin` block opened after `mark` |
 | [`ptr_or_none`](#ptr_or_none) | the pointer type, which every address is held in |
 | [`byte_type`](#byte_type) | the byte type, which a global another module defines is declared as when only its address is taken |
 | [`builder_state`](#builder_state) | the first refusal the builder met, which every builder call after it skips |
-| [`int_type`](#int_type), [`ptr_type`](#ptr_type) | |
+| [`int_type`](#int_type) | the mirl integer type of `bits` |
+| [`ptr_type`](#ptr_type) | the pointer type every address is held in, which never fails |
 | [`lower_type`](#lower_type) | the mirl type a value of the source type `tid` is held in |
 | [`texel_number`](#texel_number) | the number the texels of the handle type `ty` are, as the target's catalog relates them to a word operand of its kind, none for a handle whose kind relates none, one whose operand names any, or another type |
 | [`tag_case_has_payload`](#tag_case_has_payload) | whether case `i` of the tag `tid` holds a payload |
@@ -99,7 +111,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`storage_align`](#storage_align) | the alignment a value held in `ir` is stored at: the target's layout of `ir`, which states a decorated record's alignment and packing |
 | [`leave`](#leave) | return `v` from the function, none for no value |
 | [`emit_exit`](#emit_exit) | write the one exit the function's returns branch to, where it has one |
-| [`result_slot`](#result_slot) | |
+| [`result_slot`](#result_slot) | the slot an aggregate result of the function being lowered is built in and returned from: one for every return, so the result is built where the caller receives it, made on first ask |
 | [`take_into`](#take_into) | the armed destination, taken once, when the expression being lowered is the armed one and builds an aggregate of `ir`, which the destination holds; none for any other |
 | [`slot_for`](#slot_for) | a stack slot for a value of the source type `tid`, held in `ir`, with the bytes `tid` lays out as public stated |
 | [`state_slot`](#state_slot) | state on the alloca of `slot`, which holds a value of source type `tid` held in `ir`, the bytes `tid` lays out as public (`public_ranges`), nothing for a type that is no type |
@@ -108,19 +120,23 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`debug_own_types`](#debug_own_types) | the types this object describes for every other: each record, union and tag the module declares that the object emits the declaration of, the test object a `#[testing]` one and the normal object any other |
 | [`debug_types_finish`](#debug_types_finish) | describe the types this object owns, then every pointee left waiting, then link the table |
 | [`block_terminated`](#block_terminated) | whether the block being built already ends |
-| [`is_void_ir`](#is_void_ir) | |
+| [`is_void_ir`](#is_void_ir) | whether the mirl type `tid` is no type, as a function with no result returns |
 | [`expr_type_of`](#expr_type_of) | an expression's type inside an instance's scope is the instance's, never the template's: sema records the template's and every type decision here is made against this instance an expression's type as the frame the code is read through decided it, else the template's under the instance's substitution |
-| [`expr_float_width`](#expr_float_width), [`expr_is_secret`](#expr_is_secret), [`type_is_secret`](#type_is_secret), [`type_contains_secret`](#type_contains_secret) | |
+| [`expr_float_width`](#expr_float_width) | the float width of expression `eid`'s type, a secret one's base |
+| [`expr_is_secret`](#expr_is_secret) | whether expression `eid`'s type is outermost secret |
+| [`type_is_secret`](#type_is_secret) | whether the source type `tid` is outermost secret |
+| [`type_contains_secret`](#type_contains_secret) | whether a value of the source type `tid` holds a secret in any of its own bytes |
 | [`secret_ranges`](#secret_ranges) | the secret byte ranges of a value of source type `tid`, held in `ir`, laid out from `base`, appended to `out` in no order: a secret's every byte, an aggregate's secret members and elements, every case of a union or a tag's payload, and nothing of a tag's discriminant or of padding |
 | [`global_secrecy`](#global_secrecy) | how much of a global of source type `tid`, held in `ir`, is secret, its ranges held in `ranges`, which must outlive the answer until the module copies it |
 | [`substitute_type`](#substitute_type) | a template's type as the instance being lowered holds it, applied once where a type is read from sema's tables, so every type the lowering passes on is already the instance's |
-| [`type_resolved_of`](#type_resolved_of), [`decl_type_of`](#decl_type_of) | |
-| [`instance_id_of_call`](#instance_id_of_call) | the instance sema decided the call or generic reference `eid` names, in the frame the code is read through the index in the set being read of the instance sema decided the call or generic reference `eid` names, in the frame the code is read through |
+| [`type_resolved_of`](#type_resolved_of) | the source type the type node `tid` names where the code is read: a frame's own where its comptime bindings size the node, else the template's under the instance's substitution |
+| [`decl_type_of`](#decl_type_of) | the source type of declaration `did`, as the frame the code is read through decided it, else the template's under the instance's substitution |
+| [`instance_id_of_call`](#instance_id_of_call) | the index in the set being read of the instance sema decided the call or generic reference `eid` names, in the frame the code is read through |
 | [`instance_link_name`](#instance_link_name) | the symbol an instance is emitted and referenced under |
 | [`gate_of`](#gate_of) | the verdict sema gave a statement gate in the frame the code is read through |
 | [`each_array`](#each_array) | the published value of the array sema typed the `$each` at `stmt` over, in the frame the code is read through |
 | [`iteration_frame`](#iteration_frame) | the frame of iteration `index` of the `$each` at `stmt` under the current frame |
-| [`decl_ret_sem`](#decl_ret_sem) | |
+| [`decl_ret_sem`](#decl_ret_sem) | the source result type of the function `did` declares |
 | [`lower_fn_sig`](#lower_fn_sig) | the signature of the function `did` declares |
 | [`fn_sig_of_type`](#fn_sig_of_type) | the signature a value of the source function type `tid` is called through |
 | [`c_variadic_fixed`](#c_variadic_fixed) | how many parameters the C-variadic function type `tid` names, none for any other type |
@@ -129,11 +145,11 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`declared_secrets`](#declared_secrets) | the secret parameters a function of signature `sig` declares, into `out`, its secret result, into `result`, and the positions of its parameters that point to storage holding no secret, into `pointers`: each as secret as its source type holds a secret in its own bytes, the bytes a pointer reaches being its pointee's and never the pointer's |
 | [`pack_instance_sig`](#pack_instance_sig) | the signature of a pack instance of the function typed `fn_ty`: its fixed parameters, then one per element of the pack |
 | [`instance_ref_sig`](#instance_ref_sig) | the signature an instance is referenced under: the one sema settled when it asked for it |
-| [`expr_symbol_of`](#expr_symbol_of) | |
+| [`expr_symbol_of`](#expr_symbol_of) | the symbol name resolution bound expression `eid` to, rejecting the phase for a rejected one |
 | [`module_source`](#module_source) | the source of the module in scope, read when the scope was made |
 | [`emit_dbg_birth`](#emit_dbg_birth) | a source variable named at `name_span` begins: one held in a stack slot is bound to the slot, which describes it wherever it lives, and any other, a parameter, to its value from here on |
 | [`describe_global`](#describe_global) | the source variable the module's global `g` is, named at `name_span` with source type `ty_sem`, which a debugger reads its type and declaration line from; nothing when this lowering keeps no debug information |
-| [`symbol_of`](#symbol_of) | |
+| [`symbol_of`](#symbol_of) | the symbol `sid` of the module in scope |
 | [`symbol_name`](#symbol_name) | the handle of the symbol name `name` in the module's names, interned once, by which its function or global is declared |
 | [`image_linkage`](#image_linkage) | the linkage of a definition every module of the image may reach and no other image sees, `pub` or not, unless `#[export]` says so, and of a reference to a private declaration, which an instance another module lowers reaches |
 | [`internal_visibility`](#internal_visibility) | the visibility that keeps a definition inside its image: hidden, or the default where the format exports only what its export directives name and states no visibility, as PE does |
@@ -143,6 +159,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`define_function`](#define_function) | the module's definition of a function: a reference earlier in the module declared it, and the definition takes the declaration's place |
 | [`define_global`](#define_global) | the module's definition of a global, in place of a declaration a reference made |
 | [`ensure_extern_function`](#ensure_extern_function) | the module's function `name`, declared here with `linkage` when another object defines it, with the mode `timed` its declaration states and the secret parameters and result its signature does, which are what a caller may trust of it |
+| [`stated_callee`](#stated_callee) | the declaration a call through a value of the function type `tid` states its callee keeps, none for a type marked with no constant-time mode: the type's mode, and the secret parameters, secret result and public pointers a function of that signature declares, so the call is trusted as one naming such a function is |
 | [`mode_of`](#mode_of) | the mode the function `decl` of module `origin` is declared with, as its module's interface publishes it |
 | [`class_copy`](#class_copy) | the copy of the function `decl` of `origin`, linked as `base`, whose pointer parameters take the classes `sig` states, declared here and lowered once the module's own declarations are, of the instance `instance` of the set being read where it is one |
 | [`building_constant_time`](#building_constant_time) | the function being built requires constant time |
@@ -151,7 +168,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`ensure_extern_global`](#ensure_extern_global) | the module's global `name` of `ty`, of source type `sem` (TYPE_NIL for bytes no source type describes), declared here with `linkage` when another object defines it, which the program never writes where `constant` holds |
 | [`thread_model`](#thread_model) | how a thread-local of this lowering's image is reached: an executable's own block sits at an offset the link fixes, and a shared library's at one its loader fixes at start, so a library that loads after start has no static block to hold it (no general-dynamic access is lowered) |
 | [`declared_thread`](#declared_thread) | the thread model a reference to the module binding `d` declares takes, none for one that is not thread-local |
-| [`add_global`](#add_global) | |
+| [`add_global`](#add_global) | add a global to the module |
 | [`constant_global`](#constant_global) | a read-only global of the module's own holding the constant `v`, whose address is the value |
 
 | On `FnSig` | |
@@ -174,6 +191,14 @@ pub rec LoopFrame {
     fin_depth: u32;
 }
 ```
+
+a loop the walk is inside, which `brk` and `cnt` branch out of
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `header` | `mirl.ir.id.Block` | the block `cnt` branches to |
+| `exit` | `mirl.ir.id.Block` | the block `brk` branches to |
+| `fin_depth` | `u32` | the `fin` blocks open when the loop began, which a jump out of it runs down to |
 
 ## Machine
 
@@ -236,6 +261,32 @@ pub fun request(
     interfaces: mach.front.sema.interface.Reader,
     typed: InstanceReader) res[LowerRequest, mach.base.fail.Fail]
 ```
+
+a lowering request for one module, checked for every reader and table it needs
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session |
+| `l` | the project's linkage |
+| `facts` | the target's facts |
+| `machine` | the target lowering builds for |
+| `laying` | what the build lays its types out by |
+| `malloc` | allocator for the unit's facts |
+| `a` | the module's syntax tree |
+| `fqn` | its qualified name |
+| `own_module` | its module id |
+| `sema_result` | sema's result for it |
+| `rr` | its name resolution |
+| `ctx` | its comptime context |
+| `normal_object` | nil for the normal object, what it defines for the test object |
+| `shared_artifact` | whether the artifact fed is a shared library |
+| `debug` | whether debug information is kept |
+| `standalone` | whether the objects are an archive's members |
+| `checks` | whether runtime checks are emitted |
+| `diags` | the diagnostic store |
+| `interfaces` | the reader of imported interfaces |
+| `typed` | the reader of typed instances |
+| **returns** | the request, borrowing what it is given, or the refusal of a missing piece |
 
 ## FnInfo
 
@@ -334,6 +385,25 @@ pub rec ModuleScope {
 }
 ```
 
+the module or template a lowering reads code from
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `a` | `*mach.front.ast.Ast` | its syntax tree |
+| `source` | `str` | its source text |
+| `fqn` | `mach.base.intern.StrId` | its qualified name |
+| `own_module` | `mach.session.module.ModuleId` | its module id |
+| `own_stable` | `mach.session.module.StableModuleId` | its stable module id |
+| `typing` | `mach.front.sema.template.Typing` | sema's types of its expressions, type nodes and declarations |
+| `iface` | `*mach.front.sema.interface.Interface` | the interface it publishes |
+| `rr` | `*mach.front.resolve.ResolveResult` | its name resolution |
+| `env` | `mach.front.comptime.scope.ComptimeEnv` | the comptime environment its constants are read in |
+| `ctx` | `*mach.front.comptime.scope.ComptimeCtx` | its comptime context |
+| `subst` | `*mach.type.kind.TypeId` | the type arguments an instance substitutes, nil for none |
+| `subst_len` | `u32` | how many there are |
+| `subst_owner` | `mach.type.GenericOwner` | the generic whose parameters they stand for |
+| `frame` | `u32` | the typing frame, described in place |
+
 ### module_scope
 
 ```mach
@@ -346,6 +416,19 @@ pub fun module_scope(
     rr: *mach.front.resolve.ResolveResult,
     ctx: *mach.front.comptime.scope.ComptimeCtx) res[ModuleScope, mach.base.fail.Fail]
 ```
+
+the scope of a module lowered from its own syntax tree and sema's results
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session |
+| `own_module` | the module's id |
+| `a` | its syntax tree |
+| `fqn` | its qualified name |
+| `sema_result` | sema's result for it |
+| `rr` | its name resolution |
+| `ctx` | its comptime context |
+| **returns** | the scope, borrowing each piece, or the refusal of a missing piece or of pieces made from another tree or module |
 
 ## SpecClaim
 
@@ -383,6 +466,15 @@ pub rec ScopeMark {
     parent:     u64;
 }
 ```
+
+what scope_enter hands back for the matching scope_leave
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `owner` | `ptr` | the context that made it |
+| `depth` | `u32` | the scope stack's depth after the enter |
+| `generation` | `u64` | the enter's generation, unique within the context |
+| `parent` | `u64` | the generation of the enclosing enter, 0 for none |
 
 ## ClassCopy
 
@@ -486,6 +578,23 @@ pub rec LowerRequest {
 }
 ```
 
+what one lowering of a module is asked to do and what it reads, made by request
+the fields not listed here are described in place
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `interfaces` | `mach.front.sema.interface.Reader` | the reader of imported modules' interfaces |
+| `typed` | `InstanceReader` | the reader of typed instances |
+| `instances` | `*mach.front.sema.instance.Set` | the module's own instance set |
+| `diags` | `*mach.base.diagnostic.DiagnosticStore` | the store diagnostics are reported to |
+| `s` | `*mach.session.Session` | the session |
+| `facts` | `*mach.target.facts.Facts` | the target's facts |
+| `machine` | `*Machine` | the target lowering builds for |
+| `malloc` | `*std.allocator.Allocator` | the allocator the unit's facts are held in |
+| `module` | `ModuleScope` | the scope of the module lowered |
+| `debug` | `bool` | whether debug information is kept |
+| `checks` | `bool` | whether debug-profile runtime checks are emitted |
+
 ## LowerContext
 
 ```mach
@@ -536,6 +645,9 @@ pub rec LowerContext {
     held: std.collections.map.Map[mach.type.kind.TypeId, u8];
     # the mirl type of each aggregate source type, by the substituted type: lowered once
     lowered: std.collections.map.Map[mach.type.kind.TypeId, Type];
+    # the declaration a call through a value of each function type marked constant time states its callee keeps,
+    # stated once per type
+    stated: std.collections.map.Map[mach.type.kind.TypeId, mirl.ir.id.Stated];
     # the read-only global holding each string's bytes, by its text: one per module
     strings: std.collections.map.Map[mach.base.intern.StrId, mach.lower.value.Value];
     # the pointees the debug types name by key, described once every other type is
@@ -608,6 +720,10 @@ pub rec LowerContext {
 }
 ```
 
+the state of one lowering: what its request gave, the mirl module and its builder, the
+scope being read, and the walk's locals, loops, `fin` blocks and per-function state.
+init_context makes it and dnit_context releases it, and its fields are described in place
+
 ### normal_defines
 
 ```mach
@@ -631,17 +747,43 @@ comptime scope over its constants that this lowering owns, so what an instance b
 pub fun scope_enter(lc: *LowerContext, next: ModuleScope) res[ScopeMark, mach.base.fail.Fail]
 ```
 
+read code from `next` until the matching scope_leave, keeping the current scope
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `next` | the scope to read from |
+| **returns** | the mark scope_leave takes, or the refusal of a nil context, an exhausted generation, or a stack that cannot grow |
+
 ### scope_leave
 
 ```mach
 pub fun scope_leave(lc: *LowerContext, mark: ScopeMark) err[mach.base.fail.Fail]
 ```
 
+return to the scope the matching scope_enter left
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `mark` | the mark scope_enter handed back |
+| **returns** | nothing, or the refusal of a mark of another context or out of order |
+
 ### init_context
 
 ```mach
 pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *mirl.ir.module.Module, unit: *Unit) err[mach.base.fail.Fail]
 ```
+
+make a lowering context for `req` that builds into `m` and records its functions' facts in `unit`
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `req` | the lowering request |
+| `m` | the mirl module built into, borrowed |
+| `unit` | the unit the facts go to, borrowed |
+| **returns** | nothing, or the refusal, which leaves nothing for dnit_context to release |
 
 ### module_enter
 
@@ -735,6 +877,16 @@ failure that names a place of its own keeps it
 pub fun report_gate(lc: *LowerContext, k: mach.base.diagnostic.kind.Kind, span: mach.base.source.Span, message: str) mach.base.fail.Fail
 ```
 
+reject the input with a diagnostic at `span` of the module in scope
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `k` | the diagnostic's kind |
+| `span` | where it is reported |
+| `message` | what it says |
+| **returns** | the phase failure the walk returns |
+
 ### refuse_nesting
 
 ```mach
@@ -762,11 +914,26 @@ pub fun refuse(lc: *LowerContext, f: mach.base.fail.Fail) mach.base.fail.Fail
 a failure a walk with no place of its own returned: a refusal of the input is reported under
 its own kind at the node the lowering stands on; any other failure is the lowering's own
 
+### refuse_at
+
+```mach
+pub fun refuse_at(lc: *LowerContext, span: mach.base.source.Span, f: mach.base.fail.Fail) mach.base.fail.Fail
+```
+
+the same at `span`, the declaration whose walk returned it
+
 ### record_eval_result
 
 ```mach
 pub fun record_eval_result(lc: *LowerContext, r: res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail])
 ```
+
+fail the lowering internally when a comptime evaluation failed internally, nothing otherwise
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `r` | the evaluation's result |
 
 ### type_node
 
@@ -783,6 +950,14 @@ path's prefix and the case by the last segment
 pub fun expression(lc: *LowerContext, eid: mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.base.fail.Fail]
 ```
 
+the expression node `eid` of the module in scope as name resolution read it
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `eid` | the expression |
+| **returns** | the node, or the failure, reported internal, of one that cannot be read or was rejected |
+
 ### resolve_module_member_const
 
 ```mach
@@ -792,10 +967,10 @@ pub fun resolve_module_member_const(lc: *LowerContext, eid: mach.front.ast.id.Ex
 a lowering capability; a nil context, which the capability check refuses before any call,
 answers as an evaluation with no lowering would
 
-### comptime_ident_is_runtime
+### comptime_ident_kind
 
 ```mach
-pub fun comptime_ident_is_runtime(lc: *LowerContext, eid: mach.front.ast.id.ExprId) bool
+pub fun comptime_ident_kind(lc: *LowerContext, eid: mach.front.ast.id.ExprId) mach.front.comptime.capability.NameKind
 ```
 
 a lowering capability; a nil context, which the capability check refuses before any call,
@@ -825,8 +1000,6 @@ answers as an evaluation with no lowering would
 pub fun laid_type(lc: *LowerContext, tid: mach.type.kind.TypeId) res[Type, mach.base.fail.Fail]
 ```
 
-a lowering capability; a nil context, which the capability check refuses before any call,
-answers as an evaluation with no lowering would
 the type the layout intrinsics read for source type `tid`: a handle sizes and aligns as the
 target's `ptr`, as a name for a resource the target mints or an inert one it does not, and any
 other type as it lowers
@@ -836,6 +1009,11 @@ other type as it lowers
 ```mach
 pub fun resolve_layout_intrinsic(lc: *LowerContext, eid: u32) res[opt[mach.front.comptime.value.CTValue], mach.front.comptime.failure.EvalFail]
 ```
+
+the value of the `$size_of`, `$align_of`, `$length_of`, `$offset_of` or `$type_id` call at
+`eid`, none for any other expression
+a lowering capability. a nil context, which the capability check refuses before any call,
+answers as an evaluation with no lowering would
 
 ### member_offset
 
@@ -869,13 +1047,23 @@ the type store a comptime evaluation during lowering reads
 pub fun begin_function(lc: *LowerContext, fn_index: u32, ret_type: Type)
 ```
 
-a pointer's debug type whose pointee waits for the module's other debug types
+reset the per-function state to lower function `fn_index`, whose mirl result type is `ret_type`:
+no locals, loops or `fin` blocks, and no armed destination, result slot, exit or pack
 
 ### bind_local
 
 ```mach
 pub fun bind_local(lc: *LowerContext, sym: mach.front.resolve.SymbolId, v: mach.lower.value.Value) err[mach.base.fail.Fail]
 ```
+
+bind a local to `v`, the stack slot it lives in, in place of any direct binding
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `sym` | the local's symbol |
+| `v` | its slot |
+| **returns** | nothing, or the refusal when the map cannot grow |
 
 ### binds_direct
 
@@ -923,11 +1111,27 @@ may stand in another block
 pub fun lookup_direct(lc: *LowerContext, sym: mach.front.resolve.SymbolId) opt[mach.lower.value.Value]
 ```
 
+the value a local bound by bind_direct is
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `sym` | the local's symbol |
+| **returns** | the value, none when it is not bound directly |
+
 ### lookup_local
 
 ```mach
 pub fun lookup_local(lc: *LowerContext, sym: mach.front.resolve.SymbolId) opt[mach.lower.value.Value]
 ```
+
+the stack slot a local bound by bind_local lives in
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `sym` | the local's symbol |
+| **returns** | the slot, none when it is not bound to one |
 
 ### push_loop
 
@@ -935,11 +1139,26 @@ pub fun lookup_local(lc: *LowerContext, sym: mach.front.resolve.SymbolId) opt[ma
 pub fun push_loop(lc: *LowerContext, header: mirl.ir.id.Block, exit: mirl.ir.id.Block) err[mach.base.fail.Fail]
 ```
 
+enter a loop whose `cnt` branches to `header` and `brk` to `exit`
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `header` | the loop's header block |
+| `exit` | the block after it |
+| **returns** | nothing, or the refusal when the stack cannot grow |
+
 ### pop_loop
 
 ```mach
 pub fun pop_loop(lc: *LowerContext)
 ```
+
+leave the innermost loop, nothing when none is open
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
 
 ### current_loop
 
@@ -947,11 +1166,26 @@ pub fun pop_loop(lc: *LowerContext)
 pub fun current_loop(lc: *LowerContext) *LoopFrame
 ```
 
+the innermost loop
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| **returns** | its frame, borrowed until the next push, or nil outside a loop |
+
 ### push_fin
 
 ```mach
 pub fun push_fin(lc: *LowerContext, body: mach.front.ast.id.StmtId) err[mach.base.fail.Fail]
 ```
+
+open a `fin` block, run when the walk leaves its enclosing block
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `body` | the block's statement |
+| **returns** | nothing, or the refusal when the stack cannot grow |
 
 ### fin_count
 
@@ -959,17 +1193,39 @@ pub fun push_fin(lc: *LowerContext, body: mach.front.ast.id.StmtId) err[mach.bas
 pub fun fin_count(lc: *LowerContext) u32
 ```
 
+how many `fin` blocks are open
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| **returns** | the count, a mark pop_fins_to takes |
+
 ### fin_at
 
 ```mach
 pub fun fin_at(lc: *LowerContext, i: u32) mach.front.ast.id.StmtId
 ```
 
+the `fin` block opened `i`th, counting from the outermost
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `i` | its position |
+| **returns** | its statement, or STMT_NIL past the open ones |
+
 ### pop_fins_to
 
 ```mach
 pub fun pop_fins_to(lc: *LowerContext, mark: u32)
 ```
+
+close every `fin` block opened after `mark`
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `mark` | a count fin_count gave |
 
 ### ptr_or_none
 
@@ -1002,11 +1258,26 @@ the first refusal the builder met, which every builder call after it skips
 pub fun int_type(lc: *LowerContext, bits: u32) res[Type, mach.base.fail.Fail]
 ```
 
+the mirl integer type of `bits`
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `bits` | width in bits |
+| **returns** | the type, or the refusal of mirl's type table |
+
 ### ptr_type
 
 ```mach
 pub fun ptr_type(lc: *LowerContext) res[Type, mach.base.fail.Fail]
 ```
+
+the pointer type every address is held in, which never fails
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| **returns** | the type |
 
 ### lower_type
 
@@ -1075,6 +1346,14 @@ write the one exit the function's returns branch to, where it has one
 ```mach
 pub fun result_slot(lc: *LowerContext) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+the slot an aggregate result of the function being lowered is built in and returned from:
+one for every return, so the result is built where the caller receives it, made on first ask
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| **returns** | the slot, or the refusal to make it |
 
 ### take_into
 
@@ -1159,6 +1438,14 @@ whether the block being built already ends
 pub fun is_void_ir(lc: *LowerContext, tid: Type) bool
 ```
 
+whether the mirl type `tid` is no type, as a function with no result returns
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `tid` | the mirl type |
+| **returns** | true for irt.NONE |
+
 ### expr_type_of
 
 ```mach
@@ -1176,11 +1463,27 @@ under the instance's substitution
 pub fun expr_float_width(lc: *LowerContext, eid: mach.front.ast.id.ExprId) mach.base.float.FloatWidth
 ```
 
+the float width of expression `eid`'s type, a secret one's base
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `eid` | the expression |
+| **returns** | the width, FLOAT_W_NONE for a type that is no float |
+
 ### expr_is_secret
 
 ```mach
 pub fun expr_is_secret(lc: *LowerContext, eid: mach.front.ast.id.ExprId) bool
 ```
+
+whether expression `eid`'s type is outermost secret
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `eid` | the expression |
+| **returns** | true for a `^` type |
 
 ### type_is_secret
 
@@ -1188,11 +1491,27 @@ pub fun expr_is_secret(lc: *LowerContext, eid: mach.front.ast.id.ExprId) bool
 pub fun type_is_secret(lc: *LowerContext, tid: mach.type.kind.TypeId) bool
 ```
 
+whether the source type `tid` is outermost secret
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `tid` | the type, nil reads as public |
+| **returns** | true for a `^` type |
+
 ### type_contains_secret
 
 ```mach
 pub fun type_contains_secret(lc: *LowerContext, tid: mach.type.kind.TypeId) bool
 ```
+
+whether a value of the source type `tid` holds a secret in any of its own bytes
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `tid` | the type, nil or error reads as public |
+| **returns** | true when it does, or when the walk failed the lowering |
 
 ### secret_ranges
 
@@ -1229,11 +1548,29 @@ from sema's tables, so every type the lowering passes on is already the instance
 pub fun type_resolved_of(lc: *LowerContext, tid: mach.front.ast.id.TypeId) mach.type.kind.TypeId
 ```
 
+the source type the type node `tid` names where the code is read: a frame's own where its
+comptime bindings size the node, else the template's under the instance's substitution
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `tid` | the type node |
+| **returns** | the type, TYPE_NIL for a nil or unknown node |
+
 ### decl_type_of
 
 ```mach
 pub fun decl_type_of(lc: *LowerContext, did: mach.front.ast.id.DeclId) mach.type.kind.TypeId
 ```
+
+the source type of declaration `did`, as the frame the code is read through decided it,
+else the template's under the instance's substitution
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `did` | the declaration |
+| **returns** | the type, TYPE_NIL for a nil or unknown declaration |
 
 ### instance_id_of_call
 
@@ -1241,8 +1578,6 @@ pub fun decl_type_of(lc: *LowerContext, did: mach.front.ast.id.DeclId) mach.type
 pub fun instance_id_of_call(lc: *LowerContext, eid: mach.front.ast.id.ExprId) res[u32, mach.base.fail.Fail]
 ```
 
-the instance sema decided the call or generic reference `eid` names, in the frame the
-code is read through
 the index in the set being read of the instance sema decided the call or generic reference
 `eid` names, in the frame the code is read through
 
@@ -1284,6 +1619,14 @@ the frame of iteration `index` of the `$each` at `stmt` under the current frame
 ```mach
 pub fun decl_ret_sem(lc: *LowerContext, did: mach.front.ast.id.DeclId) mach.type.kind.TypeId
 ```
+
+the source result type of the function `did` declares
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `did` | the declaration |
+| **returns** | the result type, TYPE_NIL for no result or a declaration that is no function |
 
 ### lower_fn_sig
 
@@ -1364,6 +1707,14 @@ the signature an instance is referenced under: the one sema settled when it aske
 pub fun expr_symbol_of(lc: *LowerContext, eid: mach.front.ast.id.ExprId) mach.front.resolve.SymbolId
 ```
 
+the symbol name resolution bound expression `eid` to, rejecting the phase for a rejected one
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `eid` | the expression |
+| **returns** | the symbol, or SYMBOL_NIL for none or a rejected one |
+
 ### module_source
 
 ```mach
@@ -1398,6 +1749,14 @@ lowering keeps no debug information
 ```mach
 pub fun symbol_of(lc: *LowerContext, sid: mach.front.resolve.SymbolId) opt[*mach.front.resolve.Symbol]
 ```
+
+the symbol `sid` of the module in scope
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `sid` | the symbol id |
+| **returns** | the symbol, borrowed from name resolution, none for nil or out of range |
 
 ### symbol_name
 
@@ -1454,7 +1813,7 @@ the global of the module named `name`, none when no global is
 ### define_function
 
 ```mach
-pub fun define_function(lc: *LowerContext, data: FunctionData, info: FnInfo) res[u32, mach.base.fail.Fail]
+pub fun define_function(lc: *LowerContext, data: FunctionData, info: FnInfo, span: mach.base.source.Span) res[u32, mach.base.fail.Fail]
 ```
 
 the module's definition of a function: a reference earlier in the module declared it,
@@ -1463,7 +1822,7 @@ and the definition takes the declaration's place
 ### define_global
 
 ```mach
-pub fun define_global(lc: *LowerContext, g: GlobalData) res[u32, mach.base.fail.Fail]
+pub fun define_global(lc: *LowerContext, g: GlobalData, span: mach.base.source.Span) res[u32, mach.base.fail.Fail]
 ```
 
 the module's definition of a global, in place of a declaration a reference made
@@ -1476,6 +1835,17 @@ pub fun ensure_extern_function(lc: *LowerContext, name: mach.base.intern.StrId, 
 
 the module's function `name`, declared here with `linkage` when another object defines it, with the mode `timed`
 its declaration states and the secret parameters and result its signature does, which are what a caller may trust of it
+
+### stated_callee
+
+```mach
+pub fun stated_callee(lc: *LowerContext, tid: mach.type.kind.TypeId) res[opt[mirl.ir.id.Stated], mach.base.fail.Fail]
+```
+
+the declaration a call through a value of the function type `tid` states its callee keeps, none for a type marked
+with no constant-time mode: the type's mode, and the secret parameters, secret result and public pointers a function
+of that signature declares, so the call is trusted as one naming such a function is. a value of the type holds only
+a function declared so, which sema decides, and the declaration names no symbol
 
 ### mode_of
 
@@ -1559,6 +1929,14 @@ that is not thread-local
 ```mach
 pub fun add_global(lc: *LowerContext, g: GlobalData) res[u32, mach.base.fail.Fail]
 ```
+
+add a global to the module
+
+| Parameter | |
+| :--- | :--- |
+| `lc` | the lowering context |
+| `g` | what it is |
+| **returns** | its index, or the builder's first failure, lowering's own before mirl's |
 
 ### constant_global
 

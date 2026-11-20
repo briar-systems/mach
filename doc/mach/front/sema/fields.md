@@ -16,17 +16,19 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.session`](../../s
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Node`](#node) | `rec` |  |
-| [`Roots`](#roots) | `rec` |  |
-| [`Graph`](#graph) | `rec` |  |
+| [`Node`](#node) | `rec` | one record, union, tag or materialized instance a graph captured |
+| [`Roots`](#roots) | `rec` | one group of root types a capture starts from |
+| [`Graph`](#graph) | `rec` | the field tables a capture copied, sorted by type index |
 
 | On `Roots` | |
 | :--- | :--- |
-| [`capture`](#capture) | |
+| [`capture`](#capture) | walks every type the roots reach, preparing each record, union and tag, and copies the fields, discriminator and decorations of each into a new graph |
 
 | On `Graph` | |
 | :--- | :--- |
-| [`init`](#init), [`dnit`](#dnit), [`install`](#install) | |
+| [`init`](#init) | an empty graph |
+| [`dnit`](#dnit) | releases every node of `graph` and the graph's own storage |
+| [`install`](#install) | publishes each node of `graph` that the type table has no field table for, and holds every one it already has to the node's fields, discriminator and decorations |
 
 | Constants | |
 | :--- | :--- |
@@ -46,6 +48,14 @@ pub rec Node {
 }
 ```
 
+one record, union, tag or materialized instance a graph captured
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `ty` | `mach.type.kind.TypeId` | the type the node describes |
+| `entries` | `std.collections.vector.Vector[mach.type.field.Entry]` | its fields, in declaration order |
+| `decoration` | `mach.type.field.Decoration` | its layout decorations |
+
 ## Roots
 
 ```mach
@@ -55,12 +65,34 @@ pub rec Roots {
 }
 ```
 
+one group of root types a capture starts from
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `data` | `*mach.type.kind.TypeId` | the first root |
+| `len` | `usize` | how many roots the group holds |
+
 ### capture
 
 ```mach
 pub fun capture[T](s: *mach.session.Session, a: *std.allocator.Allocator, roots: *Roots, count: usize, mode: CaptureMode, ctx: *T,
     prepare: fun(*T, mach.type.kind.TypeId) err[mach.base.fail.Fail]) res[Graph, mach.base.fail.Fail]
 ```
+
+walks every type the roots reach, preparing each record, union and tag, and copies the
+fields, discriminator and decorations of each into a new graph. in `MATERIALIZED` mode an
+instance that has a field table is captured as well
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session whose type table is read |
+| `a` | the allocator the graph is held in |
+| `roots` | the root groups |
+| `count` | how many groups `roots` holds |
+| `mode` | `RECIPES` or `MATERIALIZED` |
+| `ctx` | the context passed to `prepare` |
+| `prepare` | prepares one nominal's field table before it is read |
+| **returns** | the graph, owned by the caller and released with `dnit`, or the failure of a scan, an allocation, a preparation or an invalid argument |
 
 ## Graph
 
@@ -72,11 +104,26 @@ pub rec Graph {
 }
 ```
 
+the field tables a capture copied, sorted by type index
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `nodes` | `std.collections.vector.Vector[Node]` | the captured nodes, owned by the graph |
+| `installed` | `bool` | whether `install` has published the graph |
+| `installed_generation` | `u64` | the projection generation it was published under |
+
 ### init
 
 ```mach
 pub fun init(a: *std.allocator.Allocator) Graph
 ```
+
+an empty graph
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator its nodes are held in |
+| **returns** | the graph, released with `dnit` |
 
 ### dnit
 
@@ -84,11 +131,27 @@ pub fun init(a: *std.allocator.Allocator) Graph
 pub fun dnit(graph: *Graph)
 ```
 
+releases every node of `graph` and the graph's own storage
+
+| Parameter | |
+| :--- | :--- |
+| `graph` | the graph to release |
+
 ### install
 
 ```mach
 pub fun install(s: *mach.session.Session, graph: *Graph) err[mach.base.fail.Fail]
 ```
+
+publishes each node of `graph` that the type table has no field table for, and holds every
+one it already has to the node's fields, discriminator and decorations. a graph installed
+under the current projection is not checked again
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session whose type table receives the tables |
+| `graph` | the graph to install |
+| **returns** | ok, or a failure when a table disagrees with the graph or one cannot be published |
 
 ## Constants
 

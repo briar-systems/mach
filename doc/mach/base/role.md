@@ -11,8 +11,8 @@ Source: [`src/base/role.mach`](../../../src/base/role.mach)
 
 | Functions | |
 | :--- | :--- |
-| [`enter`](#enter) | the calling thread starts or stops working on the worker side |
-| [`leave`](#leave) | |
+| [`enter`](#enter) | the calling thread starts working on the worker side |
+| [`leave`](#leave) | the calling thread stops working on the worker side |
 | [`worker`](#worker) | whether the calling thread works on the worker side |
 | [`permit`](#permit) | the calling worker owns the stores at `first` and `second` until it names others, or nil |
 | [`touched`](#touched) | the store `store` at `at` was touched; counted when the calling thread works on the worker side and does not own it |
@@ -34,13 +34,15 @@ Source: [`src/base/role.mach`](../../../src/base/role.mach)
 pub fun enter()
 ```
 
-the calling thread starts or stops working on the worker side
+the calling thread starts working on the worker side
 
 ### leave
 
 ```mach
 pub fun leave()
 ```
+
+the calling thread stops working on the worker side
 
 ### worker
 

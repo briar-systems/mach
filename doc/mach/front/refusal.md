@@ -23,7 +23,9 @@ Uses types from [`mach.base.fail`](../base/fail.md).
 
 | On `Refusal` | |
 | :--- | :--- |
-| [`init`](#init), [`dnit`](#dnit), [`is_refused`](#is_refused) | |
+| [`init`](#init) | an unrefused module's state, with an empty site list |
+| [`dnit`](#dnit) | free the site list and return the state to NONE |
+| [`is_refused`](#is_refused) | whether the module is refused for any reason |
 | [`fired`](#fired) | a module-scope `$error` that fired at `offset` |
 | [`copy`](#copy) | an owned copy of `from`, from `a` |
 
@@ -63,17 +65,37 @@ why a module is refused, if it is
 pub fun init(a: *std.allocator.Allocator) Refusal
 ```
 
+an unrefused module's state, with an empty site list
+
+| Parameter | |
+| :--- | :--- |
+| `a` | allocator the site list grows from |
+| **returns** | a refusal in state NONE, released with `dnit` |
+
 ### dnit
 
 ```mach
 pub fun dnit(r: *Refusal)
 ```
 
+free the site list and return the state to NONE
+
+| Parameter | |
+| :--- | :--- |
+| `r` | refusal to release |
+
 ### is_refused
 
 ```mach
 pub fun is_refused(r: *Refusal) bool
 ```
+
+whether the module is refused for any reason
+
+| Parameter | |
+| :--- | :--- |
+| `r` | refusal to test |
+| **returns** | true when the state is OWN or IMPORTED |
 
 ### fired
 

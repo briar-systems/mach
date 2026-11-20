@@ -26,16 +26,19 @@ Source: [`src/target/ct.mach`](../../../src/target/ct.mach)
 
 | On `CtCap` | |
 | :--- | :--- |
-| [`CT_CAP_OK`](#ctcap), [`CT_CAP_ALWAYS`](#ctcap), [`CT_CAP_MUL`](#ctcap), [`cap_at_sema`](#cap_at_sema) | |
+| [`CT_CAP_OK`](#ctcap), [`CT_CAP_ALWAYS`](#ctcap), [`CT_CAP_MUL`](#ctcap) | |
+| [`cap_at_sema`](#cap_at_sema) | whether type checking reports an operation needing `cap` itself, since no target provides it |
 
 | On `CtMulOp` | |
 | :--- | :--- |
-| [`CT_MUL_NONE`](#ctmulop), [`CT_MUL_LOW`](#ctmulop), [`CT_MUL_HIGH_U`](#ctmulop), [`CT_MUL_HIGH_S`](#ctmulop), [`CT_MUL_HIGH_SU`](#ctmulop), [`CT_MUL_WIDE_U`](#ctmulop), [`CT_MUL_WIDE_S`](#ctmulop), [`mul_cell`](#mul_cell) | |
+| [`CT_MUL_NONE`](#ctmulop), [`CT_MUL_LOW`](#ctmulop), [`CT_MUL_HIGH_U`](#ctmulop), [`CT_MUL_HIGH_S`](#ctmulop), [`CT_MUL_HIGH_SU`](#ctmulop), [`CT_MUL_WIDE_U`](#ctmulop), [`CT_MUL_WIDE_S`](#ctmulop) | |
+| [`mul_cell`](#mul_cell) | the cell of a multiply |
 | [`mul_op_name`](#mul_op_name) | the spelling `$mach.build.ct_mul` reads, absent for NONE or an unknown tag |
 
 | On `CtMulMask` | |
 | :--- | :--- |
-| [`mul_mask_none`](#mul_mask_none), [`mul_mask_add`](#mul_mask_add) | |
+| [`mul_mask_none`](#mul_mask_none) | a mask holding no cell |
+| [`mul_mask_add`](#mul_mask_add) | add a cell to a mask, in its vector plane for a lane multiply |
 | [`mul_mask_has`](#mul_mask_has) | whether the cells cover this multiply, never for an unknown cell |
 
 | Functions | |
@@ -91,6 +94,13 @@ pub def CtCap: u8
 pub fun cap_at_sema(cap: CtCap) bool
 ```
 
+whether type checking reports an operation needing `cap` itself, since no target provides it
+
+| Parameter | |
+| :--- | :--- |
+| `cap` | the capability the operation needs |
+| **returns** | true for CT_CAP_ALWAYS |
+
 ## CtMulOp
 
 ```mach
@@ -116,6 +126,15 @@ product
 ```mach
 pub fun mul_cell(op: CtMulOp, width: u8, vector: bool) CtMulCell
 ```
+
+the cell of a multiply
+
+| Parameter | |
+| :--- | :--- |
+| `op` | the multiply |
+| `width` | the operand width in bits |
+| `vector` | whether it is a lane multiply |
+| **returns** | the cell |
 
 ### mul_op_name
 
@@ -154,11 +173,20 @@ the cells mirl runs in constant time, one bit per (op, width) in a scalar and a 
 pub fun mul_mask_none() CtMulMask
 ```
 
+a mask holding no cell
+
 ### mul_mask_add
 
 ```mach
 pub fun mul_mask_add(mask: *CtMulMask, cell: CtMulCell)
 ```
+
+add a cell to a mask, in its vector plane for a lane multiply. an unknown cell adds nothing
+
+| Parameter | |
+| :--- | :--- |
+| `mask` | the mask to add to |
+| `cell` | the cell |
 
 ### mul_mask_has
 

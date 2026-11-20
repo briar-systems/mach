@@ -13,12 +13,15 @@ Uses types from [`mach.base.fail`](../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Report`](#report) | `rec` |  |
+| [`Report`](#report) | `rec` | a sink for progress lines, notes and faults, with the effect notes an operation collected |
 
 | On `Report` | |
 | :--- | :--- |
 | [`init`](#init) | a report over the given sink, whose effects `a` owns |
-| [`dnit`](#dnit), [`line`](#line), [`note`](#note), [`fault`](#fault) | |
+| [`dnit`](#dnit) | free the effect notes the report kept |
+| [`line`](#line) | write a progress line to the sink |
+| [`note`](#note) | write a note to the sink |
+| [`fault`](#fault) | report a failure the operation goes on past |
 | [`effectf`](#effectf) | keep an effect note formatted as std.format formats it; a note that cannot be kept is dropped, since it only explains a failure already reported |
 | [`linef`](#linef) | a progress line formatted as std.format formats it, through storage `a` lends for the call |
 | [`notef`](#notef) | a note formatted as std.format formats it, through storage `a` lends for the call |
@@ -38,6 +41,16 @@ pub rec Report {
 }
 ```
 
+a sink for progress lines, notes and faults, with the effect notes an operation collected
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `ctx` | `ptr` | the context each callback receives |
+| `line` | `LineFn` | writes a progress line |
+| `note` | `NoteFn` | writes a note |
+| `fault` | `FaultFn` | reports a failure the operation goes on past |
+| `effects` | `Vector[str]` | the effect notes kept so far, owned by the report |
+
 ### init
 
 ```mach
@@ -52,11 +65,24 @@ a report over the given sink, whose effects `a` owns
 pub fun dnit(r: *Report)
 ```
 
+free the effect notes the report kept
+
+| Parameter | |
+| :--- | :--- |
+| `r` | the report to release |
+
 ### line
 
 ```mach
 pub fun line(r: *Report, text: str)
 ```
+
+write a progress line to the sink
+
+| Parameter | |
+| :--- | :--- |
+| `r` | the report |
+| `text` | the line, borrowed for the call |
 
 ### note
 
@@ -64,11 +90,25 @@ pub fun line(r: *Report, text: str)
 pub fun note(r: *Report, text: str)
 ```
 
+write a note to the sink
+
+| Parameter | |
+| :--- | :--- |
+| `r` | the report |
+| `text` | the note, borrowed for the call |
+
 ### fault
 
 ```mach
 pub fun fault(r: *Report, f: mach.base.fail.Fail)
 ```
+
+report a failure the operation goes on past
+
+| Parameter | |
+| :--- | :--- |
+| `r` | the report |
+| `f` | the failure |
 
 ### effectf
 

@@ -13,7 +13,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 
 | Functions | |
 | :--- | :--- |
-| [`parse_deps`](#parse_deps) | |
+| [`parse_deps`](#parse_deps) | decode every `[dep.<name>]` table of `t` into `m.deps`, nothing when there is none |
 
 ---
 
@@ -24,4 +24,14 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 ```mach
 pub fun parse_deps(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, t: *toml.value.Table, m: *Manifest) err[mach.base.fail.Fail]
 ```
+
+decode every `[dep.<name>]` table of `t` into `m.deps`, nothing when there is none
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | owns the dependency array and a refusal's text |
+| `itn` | interns the names, sources and selectors |
+| `t` | the manifest's root table |
+| `m` | the manifest the dependencies are set on, its `id` already decoded |
+| **returns** | ok, or the refusal of the first dependency that does not decode |
 

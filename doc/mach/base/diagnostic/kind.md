@@ -22,7 +22,7 @@ Source: [`src/base/diagnostic/kind.mach`](../../../../src/base/diagnostic/kind.m
 | [`Kind`](#kind) | `def` |  |
 | [`Level`](#level) | `def` |  |
 | [`Spec`](#spec-1) | `rec` | kind:    the row's own kind, which is its position in the table plus one key:     the dotted key the kind is printed and selected by level:   the severity every diagnostic of the kind is raised at source:  the kind is decided by the source alone, whatever the target, goal          or profile, so an `#[expect]` of it that nothing fulfils is reported retired: nothing raises the kind any more; the row stays so its key is          never given to another kind |
-| [`KindSet`](#kindset) | `rec` |  |
+| [`KindSet`](#kindset) | `rec` | a set of kinds, one bit per kind the table declares |
 | [`Selection`](#selection) | `rec` | what one key or family selects from the table |
 
 | On `Kind` | |
@@ -44,6 +44,11 @@ Source: [`src/base/diagnostic/kind.mach`](../../../../src/base/diagnostic/kind.m
 | [`SECRET_COMPTIME`](#kind) | a value whose type holds a secret, read where a compile-time value is asked for |
 | [`JUMP_NO_LOOP`](#kind) | a `brk` or `cnt` with no enclosing loop to leave or continue |
 | [`DEF_CYCLE`](#kind) | a type alias whose definition names itself, directly or through other aliases |
+| [`EXT_FUN_BODY`](#kind) | a body on an ext fun, which declares a foreign import |
+| [`FUN_BODYLESS`](#kind) | a fun with no body that is neither ext nor intrinsic |
+| [`EXT_GENERIC`](#kind) | an ext fun with type or comptime parameters, whose instances no foreign library exports |
+| [`PACK_NOT_LAST`](#kind) | a parameter written after a variadic pack parameter |
+| [`DEP_IGNORED`](#kind) | a dependency slot under dep/ that an ignore rule of the enclosing repository ignores |
 | [`spec`](#spec) | the row of `k`, nil for NONE or a kind no row declares |
 | [`is_error`](#is_error) | a diagnostic of kind `k` is an error: severity is the row's level, and a kind no row declares is a defect, raised as an error if at all |
 | [`is_warning`](#is_warning) | a diagnostic of kind `k` is a warning |
@@ -62,12 +67,14 @@ Source: [`src/base/diagnostic/kind.mach`](../../../../src/base/diagnostic/kind.m
 
 | On `KindSet` | |
 | :--- | :--- |
-| [`set_make`](#set_make), [`set_has`](#set_has), [`set_union`](#set_union) | |
+| [`set_make`](#set_make) | an empty set |
+| [`set_has`](#set_has) | whether `k` is in the set, which a kind no row declares never is |
+| [`set_union`](#set_union) | add every kind of `other` to `s` |
 
 | On `Selection` | |
 | :--- | :--- |
 | [`select`](#select) | the rows `selector` covers; nothing at all when it is unknown |
-| [`selection_unknown`](#selection_unknown) | the selection covers no row |
+| [`selection_unknown`](#selection_unknown) | the selection covers no live warning or error row |
 | [`selection_is_empty`](#selection_is_empty) | the selection covers no warning row |
 
 | Constants | |
@@ -567,6 +574,11 @@ pub def Kind: u16
 | `SECRET_COMPTIME` | `529` | a value whose type holds a secret, read where a compile-time value is asked for |
 | `JUMP_NO_LOOP` | `530` | a `brk` or `cnt` with no enclosing loop to leave or continue |
 | `DEF_CYCLE` | `531` | a type alias whose definition names itself, directly or through other aliases |
+| `EXT_FUN_BODY` | `532` | a body on an ext fun, which declares a foreign import |
+| `FUN_BODYLESS` | `533` | a fun with no body that is neither ext nor intrinsic |
+| `EXT_GENERIC` | `534` | an ext fun with type or comptime parameters, whose instances no foreign library exports |
+| `PACK_NOT_LAST` | `535` | a parameter written after a variadic pack parameter |
+| `DEP_IGNORED` | `536` | a dependency slot under dep/ that an ignore rule of the enclosing repository ignores |
 
 ### spec
 
@@ -671,11 +683,19 @@ pub rec KindSet {
 }
 ```
 
+a set of kinds, one bit per kind the table declares
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `words` | `[SET_WORDS]u64` | the bits, kind k at bit k % 64 of word k / 64 |
+
 ### set_make
 
 ```mach
 pub fun set_make() KindSet
 ```
+
+an empty set
 
 ### set_has
 
@@ -683,11 +703,15 @@ pub fun set_make() KindSet
 pub fun set_has(s: *KindSet, k: Kind) bool
 ```
 
+whether `k` is in the set, which a kind no row declares never is
+
 ### set_union
 
 ```mach
 pub fun set_union(s: *KindSet, other: *KindSet)
 ```
+
+add every kind of `other` to `s`
 
 ## Selection
 
@@ -719,7 +743,7 @@ the rows `selector` covers; nothing at all when it is unknown
 pub fun selection_unknown(s: *Selection) bool
 ```
 
-the selection covers no row
+the selection covers no live warning or error row
 
 ### selection_is_empty
 
@@ -733,5 +757,5 @@ the selection covers no warning row
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COUNT` | `usize` | `531` |  |
+| `COUNT` | `usize` | `536` |  |
 

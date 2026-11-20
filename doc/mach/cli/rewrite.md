@@ -49,8 +49,9 @@ pub def Transform: fun(*std.allocator.Allocator, str, *mach.base.diagnostic.Diag
 
 the text a command makes of one source's text, such as its canonical layout;
 a refusal `fail.is_reported` holds was reported into the store and marks the
-source malformed, and any other ends the command. the last argument is the pass's
-`context`
+source malformed, and any other ends the command. a text it makes beside
+diagnostics in the store marks the source flagged, for what the command left in
+it. the last argument is the pass's `context`
 
 ### report
 
@@ -77,6 +78,7 @@ pub rec Report {
     visited:     usize;
     differing:   usize;
     malformed:   usize;
+    flagged:     usize;
     diagnostics: *mach.cli.diagnostic.Report;
     sources:     *mach.base.source.SourceMap;
     transform:   Transform;
@@ -92,6 +94,7 @@ one command's pass over its inputs
 | `visited` | `usize` | source files read |
 | `differing` | `usize` | files the transform changed (rewritten, or listed by --check) |
 | `malformed` | `usize` | files the transform refused as reported; each was left unchanged |
+| `flagged` | `usize` | files the transform made a text of and reported diagnostics for, each about what it left as written |
 | `diagnostics` | `*mach.cli.diagnostic.Report` | the command's report, which a malformed file's diagnostics go through |
 | `sources` | `*mach.base.source.SourceMap` | the source map a refused file's text is loaded into, which its failure points into |
 | `transform` | `Transform` | the text each source becomes |
@@ -136,7 +139,8 @@ the walk visits only the source tree's `.mach` files
 pub fun tree(a: *std.allocator.Allocator, backing: *std.allocator.Allocator, project_root: str, rel: str, sink: Sink, report: *Report) err[mach.base.fail.Fail]
 ```
 
-`project` over the source directory `rel`, cleaned and relative to the root
+`project` over the source directory `rel`, cleaned and relative to the root. each source is
+named from the root as given, as the manifest is, so a diff applies from where the command ran
 
 ### file
 

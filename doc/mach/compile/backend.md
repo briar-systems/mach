@@ -28,7 +28,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`merges`](#merges) | whether the objects the back half writes hold merged definitions (mink.model.merged), the copies of one a link keeps one of: false for a format masc writes none in |
 | [`unlisted`](#unlisted) | the name of the mirl family that compiles the build when it writes no listing of its objects, none when it writes one |
 | [`whole`](#whole) | whether the family that compiles the build takes an artifact's modules whole, as one unit whose one object the link takes, rather than each module apart |
-| [`dnit`](#dnit) | |
+| [`dnit`](#dnit) | release what a back half opened and leave it compiling nothing, as none gives |
 | [`machine`](#machine) | the machine lowering builds for, refused for a cell no owner assembles yet |
 | [`object_bytes`](#object_bytes) | the bytes of `o` laid out in the format the target's objects are written in, given back with sink.dnit |
 | [`read_object`](#read_object) | the object the bytes of the file `file` hold, which owns the bytes, or mink's refusal to read one |
@@ -38,20 +38,22 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`archive_variant`](#archive_variant) | the variant mink writes a static library of the target's objects in, as its registry states it of the target's format |
 | [`c_prefix`](#c_prefix) | the prefix the target's format gives a C symbol's name on its architecture, empty for none, as mink's registry states it |
 | [`describes_claims`](#describes_claims) | whether the target's link makes a shared system library from the claim that names it, with no file, as a two-level namespace format does |
-| [`link`](#link) | the image of `kind` in the target's format mink links from the `count` requests at `requests`, a library named by name found by mink's search, named `output` where its format records a name, its unreferenced sections left out with `gc`, laid out as `image` states, with what the link read |
+| [`link`](#link) | the image of `kind` in the target's format mink links from the `count` requests at `requests`, a library named by name found by mink's search, named `output_path` where its format records a name, its unreferenced sections left out with `gc`, laid out as `image` states, with what the link read |
 
 | On `Laying` | |
 | :--- | :--- |
-| [`laying_dnit`](#laying_dnit) | |
+| [`laying_dnit`](#laying_dnit) | release a laying's output section names |
 | [`laid_name`](#laid_name) | the name of the output section the link lays section `i` of `o` into, valid until the laying names another |
 
 | On `LinkRead` | |
 | :--- | :--- |
-| [`link_read_init`](#link_read_init), [`link_read_dnit`](#link_read_dnit) | |
+| [`link_read_init`](#link_read_init) | an empty record of what a link read |
+| [`link_read_dnit`](#link_read_dnit) | release the file names a link read record owns |
 
 | Functions | |
 | :--- | :--- |
-| [`refused_by_mink`](#refused_by_mink) | mink's failure `f` as mach's, after `lead` where it says what mink was doing, nil where mink's own words say it all: what mink does not do is the input's to change, an allocation it was refused is the machine's, and every other cause is the compiler's |
+| [`refused_by_mink`](#refused_by_mink) | mink's failure `f` as mach's, after `lead` where it says what mink was doing, nil where mink's own words say it all: what mink does not do is the input's to change, an allocation it was refused is the machine's, in the allocator's words, and every other cause is the compiler's |
+| [`input_refused_by_mink`](#input_refused_by_mink) | mink's refusal `f` of the inputs a link or a claim reads as mach's, in mink's words: a fault mink names its own is the compiler's, an allocation it was refused is the machine's, and every other cause is the input's to change |
 | [`lays_stack`](#lays_stack) | whether an image of `t` holds its main stack as a section of its own: an ELF or flat image no loader maps, so no loader gives it a stack and no header records one |
 | [`stacks_below_base`](#stacks_below_base) | whether an image of `t` lays its main stack out in its own memory below its base, as its format's writer states, so the stack reserve the link is handed is where its data starts |
 | [`refers`](#refers) | whether `o` refers to the symbol `name` and leaves its definition to another object |
@@ -59,7 +61,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`section_names`](#section_names) | the names of the sections of `o` its producer named, borrowed from the object |
 | [`section_count`](#section_count) | how many sections `o` holds |
 | [`globals_in`](#globals_in) | the names of the data symbols `o` places in its sections named `name`, the globals they hold and not the marks a format adds, borrowed from the object |
-| [`object_dnit`](#object_dnit) | |
+| [`object_dnit`](#object_dnit) | release everything an object owns, mink's refusal to release dropped |
 | [`object_emptied`](#object_emptied) | give back everything `o` owns and leave an empty object in its place, which its owner's release gives back again as nothing |
 | [`symbol_count`](#symbol_count) | how many symbols `o` holds |
 | [`exported`](#exported) | whether symbol `i` of `o` is one the object defines and links outside it |
@@ -149,6 +151,13 @@ whose one object the link takes, rather than each module apart
 pub fun dnit(a: *std.allocator.Allocator, b: *Back)
 ```
 
+release what a back half opened and leave it compiling nothing, as none gives
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator the back half was opened with |
+| `b` | the back half to release |
+
 ### machine
 
 ```mach
@@ -235,7 +244,7 @@ pub fun link(b: *Back, a: *std.allocator.Allocator, diags: *mach.base.diagnostic
 ```
 
 the image of `kind` in the target's format mink links from the `count` requests at `requests`, a library
-named by name found by mink's search, named `output` where its format records a name, its
+named by name found by mink's search, named `output_path` where its format records a name, its
 unreferenced sections left out with `gc`, laid out as `image` states, with what the link read.
 mink's notes go to `diags`: a refused link's are notes of the refusal, which is reported there,
 and a finished link's are warnings. its divisible steps run on `threads` threads, `a` shared
@@ -265,6 +274,12 @@ own layout rules, so a layout the artifact states is held to the sections the li
 ```mach
 pub fun laying_dnit(l: *Laying)
 ```
+
+release a laying's output section names
+
+| Parameter | |
+| :--- | :--- |
+| `l` | the laying to release |
 
 ### laid_name
 
@@ -345,6 +360,7 @@ pub rec Stated {
     size:          mach.base.source.Location;
     stack_reserve: mach.base.source.Location;
     stack_commit:  mach.base.source.Location;
+    entry:         mach.base.source.Location;
     sections:      *mach.base.source.Location;
     regions:       *mach.base.source.Location;
 }
@@ -363,6 +379,7 @@ option was not written or names no place
 | `size` | `mach.base.source.Location` | the size ceiling |
 | `stack_reserve` | `mach.base.source.Location` | the stack's reserve |
 | `stack_commit` | `mach.base.source.Location` | the stack's commit |
+| `entry` | `mach.base.source.Location` | the artifact's entry, the module the image's entry symbol is reached from |
 | `sections` | `*mach.base.source.Location` | each section the plan places ahead of the rest, parallel to its sections |
 | `regions` | `*mach.base.source.Location` | each memory region, parallel to the plan's regions, which the plan's runs and loads name |
 
@@ -388,11 +405,25 @@ what a link read beyond the objects and the files it was handed by path
 pub fun link_read_init(a: *std.allocator.Allocator) LinkRead
 ```
 
+an empty record of what a link read
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator its file names are kept in |
+| **returns** | the record, released with link_read_dnit |
+
 ### link_read_dnit
 
 ```mach
 pub fun link_read_dnit(a: *std.allocator.Allocator, r: *LinkRead)
 ```
+
+release the file names a link read record owns
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator the record was made with |
+| `r` | the record to release |
 
 ## Linked
 
@@ -415,7 +446,17 @@ pub fun refused_by_mink(a: *std.allocator.Allocator, lead: str, f: Fail) mach.ba
 
 mink's failure `f` as mach's, after `lead` where it says what mink was doing, nil where mink's
 own words say it all: what mink does not do is the input's to change, an allocation it was
-refused is the machine's, and every other cause is the compiler's
+refused is the machine's, in the allocator's words, and every other cause is the compiler's
+
+### input_refused_by_mink
+
+```mach
+pub fun input_refused_by_mink(a: *std.allocator.Allocator, f: Fail) mach.base.fail.Fail
+```
+
+mink's refusal `f` of the inputs a link or a claim reads as mach's, in mink's words: a fault
+mink names its own is the compiler's, an allocation it was refused is the machine's, and every
+other cause is the input's to change
 
 ### lays_stack
 
@@ -481,6 +522,12 @@ hold and not the marks a format adds, borrowed from the object
 ```mach
 pub fun object_dnit(o: *Object)
 ```
+
+release everything an object owns, mink's refusal to release dropped
+
+| Parameter | |
+| :--- | :--- |
+| `o` | the object to release |
 
 ### object_emptied
 

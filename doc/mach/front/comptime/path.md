@@ -38,7 +38,8 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 | Functions | |
 | :--- | :--- |
 | [`unknown`](#unknown) | the refusal of a path no row matches; nil when its root names no family |
-| [`eval_path`](#eval_path), [`resolve_comptime_path`](#resolve_comptime_path) | |
+| [`eval_path`](#eval_path) | the value of a rooted comptime path expression `$root.segment...` |
+| [`resolve_comptime_path`](#resolve_comptime_path) | the value of a written comptime path given as its segments |
 | [`sys_tag_for`](#sys_tag_for) | the tag of `$mach.sys.<name>`: the position of mink's system of that name |
 | [`arch_tag_for`](#arch_tag_for) | the tag of `$mach.arch.<name>`: the position of mink's architecture of that name |
 | [`abi_tag_for`](#abi_tag_for) | the tag of `$mach.abi.<name>`: the spelling's place among mink's conventions |
@@ -162,11 +163,34 @@ pub fun eval_path(
     interner: *mach.base.intern.Interner) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail]
 ```
 
+the value of a rooted comptime path expression `$root.segment...`
+
+| Parameter | |
+| :--- | :--- |
+| `c` | the scope whose environment the path reads |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `e` | the outermost member of the path, or the bare `$name` |
+| `interner` | the interner names are ids in |
+| **returns** | the value, or a refusal for a path deeper than 16 segments, one not rooted at a `$` identifier, one no row matches or one whose value the build does not have |
+
 ### resolve_comptime_path
 
 ```mach
 pub fun resolve_comptime_path(c: *mach.front.comptime.scope.ComptimeCtx, source: str, file: mach.base.source.FileId, stack: *mach.base.source.Span, depth: u32, interner: *mach.base.intern.Interner) res[mach.front.comptime.value.CTValue, mach.front.comptime.failure.EvalFail]
 ```
+
+the value of a written comptime path given as its segments
+
+| Parameter | |
+| :--- | :--- |
+| `c` | the scope whose environment the path reads |
+| `source` | the text the segments index |
+| `file` | the file the path is written in, which `$mach.source.line` reads |
+| `stack` | the `depth` segments innermost first, the root at `depth - 1` |
+| `depth` | how many segments |
+| `interner` | the interner names are ids in |
+| **returns** | the value, or a refusal naming a renamed path, the family an unknown path falls in, a root that is no comptime path or a value the build does not have |
 
 ### sys_tag_for
 

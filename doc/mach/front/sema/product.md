@@ -10,16 +10,15 @@ Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`SemaResult`](#semaresult) | `rec` |  |
+| [`SemaResult`](#semaresult) | `rec` | what sema produced for one module, owned by the result and released with `result_dnit` |
 | [`InstanceResult`](#instanceresult) | `rec` | one instance typed on its own, which every user of it reads |
 | [`TypeExport`](#typeexport) | `rec` | a constant an array, record or case literal gives is a value naming a node of the store its module's interface publishes |
 | [`ModuleSema`](#modulesema) | `rec` | exports are append-only, and `index` maps (origin, canon) to the first export with that key over the first `indexed` of them |
 | [`DefinitionPhase`](#definitionphase) | `def` |  |
 | [`Definition`](#definition) | `rec` | a module's definition as far as a phase acquired it |
-| [`DefinitionReader`](#definitionreader) | `rec` |  |
-| [`DefinedSymbol`](#definedsymbol) | `rec` |  |
+| [`DefinitionReader`](#definitionreader) | `rec` | reads the definitions of other modules, keeping the one acquired for each origin |
+| [`DefinedSymbol`](#definedsymbol) | `rec` | a symbol and the definition of the module that declares it |
 | [`SemaDeps`](#semadeps) | `rec` | the imported surfaces are borrowed: the driver owns each one and shares it between every importer in a pass |
-| [`GrowthWatch`](#growthwatch) | `rec` | who hears of a growing cycle's expansion: the module that declares it, the templates on it, and how many instances of it the module being typed has made so far; a nil `expanded` hears nothing |
 
 | On `SemaResult` | |
 | :--- | :--- |
@@ -32,7 +31,8 @@ Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.
 
 | On `ModuleSema` | |
 | :--- | :--- |
-| [`module_sema_init`](#module_sema_init), [`module_sema_dnit`](#module_sema_dnit) | |
+| [`module_sema_init`](#module_sema_init) | an empty surface for one module |
+| [`module_sema_dnit`](#module_sema_dnit) | releases the exports, graph and index of `module` |
 | [`module_export_for`](#module_export_for) | the export of `module` keyed (origin, canon), bringing the index up to the current exports |
 
 | On `DefinitionPhase` | |
@@ -93,6 +93,23 @@ pub rec SemaResult {
     refusal: mach.front.refusal.Refusal;
 }
 ```
+
+what sema produced for one module, owned by the result and released with `result_dnit`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `field_graph` | `mach.front.sema.fields.Graph` | the field tables of the types the module was typed with |
+| `status` | `mach.report.phase.PhaseStatus` | whether typing passed, rejected the module or failed internally |
+| `alloc` | `*std.allocator.Allocator` | the allocator the typing arrays and embed paths are held in |
+| `expr_type` | `*mach.type.kind.TypeId` | the type of each expression, `expr_count` of them |
+| `type_resolved_ty` | `*mach.type.kind.TypeId` | the type each type node resolved to, `type_count` of them |
+| `decl_type` | `*mach.type.kind.TypeId` | the type of each declaration, `decl_count` of them |
+| `expr_count` | `u32` | how many expressions `expr_type` holds |
+| `type_count` | `u32` | how many type nodes `type_resolved_ty` holds |
+| `decl_count` | `u32` | how many declarations `decl_type` holds |
+| `embed_paths` | `*mach.base.intern.StrId` | the path of each file an `embed` read, `embed_path_count` of them |
+| `embed_path_count` | `u32` | how many embed paths are recorded |
+| `embed_path_cap` | `u32` | how many embed paths `embed_paths` has room for |
 
 ### result_dnit
 
@@ -179,11 +196,27 @@ that key over the first `indexed` of them. `stable` names the module whose surfa
 pub fun module_sema_init(a: *std.allocator.Allocator, path: mach.base.intern.StrId, module: mach.session.module.ModuleId, stable: mach.session.module.StableModuleId) ModuleSema
 ```
 
+an empty surface for one module
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator its exports, graph and index are held in |
+| `path` | the module's path |
+| `module` | the module's id in this session |
+| `stable` | the module's stable id |
+| **returns** | the surface, released with `module_sema_dnit` |
+
 ### module_sema_dnit
 
 ```mach
 pub fun module_sema_dnit(module: *ModuleSema)
 ```
+
+releases the exports, graph and index of `module`
+
+| Parameter | |
+| :--- | :--- |
+| `module` | the surface to release |
 
 ### module_export_for
 
@@ -235,6 +268,14 @@ pub rec DefinitionReader {
 }
 ```
 
+reads the definitions of other modules, keeping the one acquired for each origin
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `ctx` | `ptr` | the context passed to `read` |
+| `read` | `fun(ptr, mach.session.module.ModuleId, DefinitionPhase) res[Definition, mach.base.fail.Fail]` | acquires a module's definition as far as a phase |
+| `acquired` | `std.collections.vector.Vector[AcquiredDefinition]` | each definition read so far, with the phase it reached |
+
 ### reader_init
 
 ```mach
@@ -279,6 +320,13 @@ pub rec DefinedSymbol {
 }
 ```
 
+a symbol and the definition of the module that declares it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `definition` | `Definition` | the declaring module's definition |
+| `symbol` | `mach.front.resolve.Symbol` | the symbol as that module resolved it |
+
 ## SemaDeps
 
 ```mach
@@ -287,7 +335,6 @@ pub rec SemaDeps {
     entries:     **ModuleSema;
     count:       u32;
     owners:      std.collections.map.Map[u32, u32];
-    watch:       GrowthWatch;
 }
 ```
 
@@ -319,19 +366,6 @@ pub fun surface_of_owner(deps: *SemaDeps, owner: mach.session.module.StableModul
 ```
 
 the surface of the module `owner` among those `deps` holds, none when it holds none
-
-## GrowthWatch
-
-```mach
-pub rec GrowthWatch {
-    ctx:      ptr;
-    expanded: fun(ptr, mach.base.intern.StrId, mach.base.intern.StrId, u32);
-}
-```
-
-who hears of a growing cycle's expansion: the module that declares it, the templates on
-it, and how many instances of it the module being typed has made so far; a nil
-`expanded` hears nothing
 
 ## Constants
 

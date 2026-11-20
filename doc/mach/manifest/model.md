@@ -20,6 +20,8 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 | [`Origin`](#origin) | `rec` | where a value a refusal names was written: in a manifest table, or by `--set` for one invocation |
 | [`ArtifactDef`](#artifactdef) | `rec` | one `[artifact.<name>]` table as parsed |
 | [`RegionDef`](#regiondef) | `rec` | one `[artifact.X.region.<name>]` memory region as parsed, laid out as a linker script's MEMORY lays one |
+| [`PassChoice`](#passchoice) | `rec` | one key of a profile's `passes` table: an optimisation pass turned on or off by its name |
+| [`PassChoices`](#passchoices) | `rec` | the keys of a profile's `passes` table, each name once, a later write of a name in place of the earlier |
 | [`ProfileDef`](#profiledef) | `rec` | one `[profile.<name>]` compilation policy as parsed |
 | [`DepDef`](#depdef) | `rec` | one `[dep.<name>]` table as parsed |
 | [`LinkSource`](#linksource) | `def` | where a `[link.<name>]` entry is resolved from, decoded from its `source` key |
@@ -31,7 +33,7 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 
 | On `NameList` | |
 | :--- | :--- |
-| [`names_dnit`](#names_dnit) | release what a name list owns |
+| [`names_dnit`](#names_dnit) | |
 
 | On `SimdMode` | |
 | :--- | :--- |
@@ -46,6 +48,11 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 | On `ArtifactDef` | |
 | :--- | :--- |
 | [`artifact_def`](#artifact_def) | an artifact with every key a table may leave out at its default: no list, linkage, icon, manifest, size or region, the console subsystem, neither default nor exported |
+
+| On `PassChoices` | |
+| :--- | :--- |
+| [`choices_dnit`](#choices_dnit) | release what a name list owns give back the keys of a `passes` table |
+| [`choices_set`](#choices_set) | the choices `c` with the pass `name` turned `on` as `named` writes it at `at`: the earlier choice of the name replaced, or the name added after the rest |
 
 | On `ProfileDef` | |
 | :--- | :--- |
@@ -74,7 +81,7 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 
 | Functions | |
 | :--- | :--- |
-| [`free_strarr`](#free_strarr) | |
+| [`free_strarr`](#free_strarr) | release an array of `count` ids, nothing when it is nil or empty |
 | [`site_of`](#site_of) | the place `i` of a model's per-entry places, the zero place when none were recorded |
 | [`id_of`](#id_of) | the id of `text`, interned in `itn`; a refused allocation is the failure |
 | [`optional_id_of`](#optional_id_of) | `id_of` for an optional key's value: STR_NIL for the empty text an absent key reads as |
@@ -109,8 +116,6 @@ each against the catalog it names into
 ```mach
 pub fun names_dnit(alloc: *std.allocator.Allocator, l: *NameList)
 ```
-
-release what a name list owns
 
 ## SimdMode
 
@@ -265,7 +270,7 @@ pub rec ArtifactDef {
 }
 ```
 
-one `[artifact.<name>]` table as parsed. the three arrays are owned by the
+one `[artifact.<name>]` table as parsed. the arrays are owned by the
 manifest and freed by `dnit`
 
 | Field | Type | |
@@ -281,7 +286,7 @@ manifest and freed by `dnit`
 | `need` | `*mach.base.intern.StrId` | category-qualified step and artifact names or globs; nil when absent or empty |
 | `need_count` | `u32` | length of `need` |
 | `is_default` | `bool` | `default = true`: the artifact is in the default selection; false when the key is absent |
-| `is_export` | `bool` | `export = true`: the library a bare `use <id>;` binds and whose requirements travel to consumers; at most one artifact sets it |
+| `is_export` | `bool` | `export = true`: the library whose requirements travel to consumers; at most one artifact sets it |
 | `linkage` | `mach.base.intern.StrId` | the `linkage` key, the name of mink's executable output kind, which mink resolves against the target's host; nil when absent, which takes the target's default; `bin` artifacts only |
 | `linkage_from` | `Origin` | where `linkage` was written |
 | `subsystem` | `*mink.catalog.subsystem.Subsystem` | the `subsystem` key as mink spells the PE subsystem, console when absent |
@@ -345,6 +350,55 @@ MEMORY lays one
 | `load_count` | `u32` | length of `load` |
 | `at` | `mach.base.source.Location` | where the table's key is written |
 
+## PassChoice
+
+```mach
+pub rec PassChoice {
+    name:  mach.base.intern.StrId;
+    on:    bool;
+    named: str;
+    at:    mach.base.source.Location;
+}
+```
+
+one key of a profile's `passes` table: an optimisation pass turned on or off by its name
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `name` | `mach.base.intern.StrId` | the key, the pass's name as mirl's record gives it |
+| `on` | `bool` | the value |
+| `named` | `str` | the table as a refusal names it, `mach.toml: [profile.x].passes` or `--set passes` |
+| `at` | `mach.base.source.Location` | where the key is written |
+
+## PassChoices
+
+```mach
+pub rec PassChoices {
+    items: *PassChoice;
+    count: u32;
+}
+```
+
+the keys of a profile's `passes` table, each name once, a later write of a name in place of the earlier
+
+### choices_dnit
+
+```mach
+pub fun choices_dnit(alloc: *std.allocator.Allocator, c: *PassChoices)
+```
+
+release what a name list owns
+give back the keys of a `passes` table
+
+### choices_set
+
+```mach
+pub fun choices_set(alloc: *std.allocator.Allocator, c: *PassChoices, name: mach.base.intern.StrId, on: bool, named: str, at: mach.base.source.Location) err[mach.base.fail.Fail]
+```
+
+the choices `c` with the pass `name` turned `on` as `named` writes it at `at`: the earlier choice of the name
+replaced, or the name added after the rest
+
 ## ProfileDef
 
 ```mach
@@ -352,6 +406,7 @@ pub rec ProfileDef {
     name:         mach.base.intern.StrId;
     is_default:   bool;
     optimize:     bool;
+    passes:       PassChoices;
     relax:        NameList;
     relax_named:  str;
     linker_relax: bool;
@@ -371,7 +426,8 @@ least one
 | :--- | :--- | :--- |
 | `name` | `mach.base.intern.StrId` | the table key; a portable identifier |
 | `is_default` | `bool` | `default = true`; false when the key is absent. more than one default is a parse error |
-| `optimize` | `bool` | the required `optimize` key: whether the release passes run |
+| `optimize` | `bool` | the required `optimize` key: whether the optimisation passes run |
+| `passes` | `PassChoices` | the optional `passes` table: the optimisation passes turned on or off one by one over `optimize`, empty when the table is absent |
 | `relax` | `NameList` | the optional `relax` key: the departures from exact semantics the build permits |
 | `relax_named` | `str` | the `relax` key as a refusal of one of its names names it, its table's label or `--set` before it |
 | `linker_relax` | `bool` | the optional `linker_relax` key: whether the linker may relax the code, true when the key is absent |
@@ -410,7 +466,7 @@ one `[dep.<name>]` table as parsed. exactly one of `git` and `path` is set
 | `name` | `mach.base.intern.StrId` | the table key, the project id the dependency declares |
 | `git` | `mach.base.intern.StrId` | the `git` clone URL, or STR_NIL for a path dependency |
 | `path` | `mach.base.intern.StrId` | the `path` directory, or STR_NIL for a git dependency |
-| `ref` | `mach.base.intern.StrId` | the `ref` key, required with `git` and rejected with `path`; one of `branch/<name>`, `tag/<name>`, `commit/<40 or 64 lowercase hex digits>`. STR_NIL for a path dependency a git dependency names exactly one of `ref` (an exact or branch selector) and `version` (a release range); STR_NIL marks the one it does not |
+| `ref` | `mach.base.intern.StrId` | the `ref` key, required with `git` unless `version` is written, and rejected with `path`; one of `branch/<name>`, `tag/<name>`, `commit/<40 or 64 lowercase hex digits>`. STR_NIL for a path dependency a git dependency names exactly one of `ref` (an exact or branch selector) and `version` (a release range); STR_NIL marks the one it does not |
 
 ## LinkSource
 
@@ -594,7 +650,7 @@ no manifest, whose modules are the files under the directory
 pub rec Manifest {
     id:      mach.base.intern.StrId;
     version: mach.base.intern.StrId;
-    # the compiler range [project].mach states, STR_NIL when the key is absent
+    # the required compiler range [project].mach states
     mach: mach.base.intern.StrId;
     # where the `[project]` table and its `mach` value are written, each place's
     # path the interner's; the zero place when not written
@@ -711,6 +767,8 @@ the target at `i` of the set `effective_target_count` counts
 ```mach
 pub fun free_strarr(alloc: *std.allocator.Allocator, items: *mach.base.intern.StrId, count: u32)
 ```
+
+release an array of `count` ids, nothing when it is nil or empty
 
 ### site_of
 

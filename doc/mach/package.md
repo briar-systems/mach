@@ -26,12 +26,13 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.manifest.model`](manife
 
 | Functions | |
 | :--- | :--- |
-| [`name_vector_dnit`](#name_vector_dnit) | |
+| [`name_vector_dnit`](#name_vector_dnit) | free every name in a vector and then the vector itself |
 | [`override_note`](#override_note) | the note naming one requirement a root declaration overrode, as `mach dep pull`, `update`, `add` and `verify` print it |
 | [`ref_of`](#ref_of) | the ref a git line names, empty when it names none |
-| [`check_dep_identity`](#check_dep_identity) | the manifest key, the directory under dep/ and the project id are one name |
 | [`refuse_nested_realization`](#refuse_nested_realization) | a realized nested dependency (`dep/<id>/dep/<x>/mach.toml`) is refused: the root owns the flat closure and a dependency's own dep/ is never realized |
-| [`verify_dep_manifest_id`](#verify_dep_manifest_id), [`dep_rel_of`](#dep_rel_of), [`dep_full_of`](#dep_full_of) | |
+| [`verify_dep_manifest_id`](#verify_dep_manifest_id) | check that the manifest of a realized dependency declares the id it is realized under |
+| [`dep_rel_of`](#dep_rel_of) | the path of a dependency's slot relative to the project root, `dep/<id>` |
+| [`dep_full_of`](#dep_full_of) | the path of a dependency's slot under a project root, `<root>/dep/<id>` |
 | [`realized_ids`](#realized_ids) | a dependency slot is a directory under dep/ named by a valid project id |
 
 ---
@@ -43,6 +44,13 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.manifest.model`](manife
 ```mach
 pub fun name_vector_dnit(alloc: *std.allocator.Allocator, names: *Vector[str])
 ```
+
+free every name in a vector and then the vector itself
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | the allocator that owns the names |
+| `names` | the vector to release |
 
 ### override_note
 
@@ -69,14 +77,6 @@ pub fun ref_of(s: *mach.session.Session, d: *mach.manifest.model.DepDef) str
 
 the ref a git line names, empty when it names none
 
-### check_dep_identity
-
-```mach
-pub fun check_dep_identity(s: *mach.session.Session, key: str, declared: str) err[mach.base.fail.Fail]
-```
-
-the manifest key, the directory under dep/ and the project id are one name
-
 ### refuse_nested_realization
 
 ```mach
@@ -94,17 +94,43 @@ a realization and passes
 pub fun verify_dep_manifest_id(s: *mach.session.Session, dep_full: str, id: str) err[mach.base.fail.Fail]
 ```
 
+check that the manifest of a realized dependency declares the id it is realized under
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session whose allocator, interner and source map read the manifest |
+| `dep_full` | the dependency's root directory |
+| `id` | the identity it is realized under, its directory name under dep/ |
+| **returns** | ok when the declared id matches, err when the manifest cannot be read, declares no readable id or declares a different one |
+
 ### dep_rel_of
 
 ```mach
 pub fun dep_rel_of(alloc: *std.allocator.Allocator, id: str) res[str, mach.base.fail.Fail]
 ```
 
+the path of a dependency's slot relative to the project root, `dep/<id>`
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | allocates the path, which the caller owns |
+| `id` | the dependency identity |
+| **returns** | the relative path, err when it cannot be formatted |
+
 ### dep_full_of
 
 ```mach
 pub fun dep_full_of(alloc: *std.allocator.Allocator, root: str, id: str) res[str, mach.base.fail.Fail]
 ```
+
+the path of a dependency's slot under a project root, `<root>/dep/<id>`
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | allocates the path, which the caller owns |
+| `root` | the project root |
+| `id` | the dependency identity |
+| **returns** | the joined path, err when it cannot be built |
 
 ### realized_ids
 

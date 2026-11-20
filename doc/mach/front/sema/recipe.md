@@ -16,7 +16,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 
 | Functions | |
 | :--- | :--- |
-| [`anonymous`](#anonymous) | |
+| [`anonymous`](#anonymous) | the name of an anonymous record, union or tag: its kind and the name and type recipe of each field, interned |
 | [`identity`](#identity) | the first 64 bits of sha-256 over a domain tag and the type's canonical recipe; the recipe names nominal types by owning module and name, so every unit of one program derives the same value |
 
 ---
@@ -29,6 +29,17 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 pub fun anonymous(s: *mach.session.Session, kind: mach.type.kind.TypeKind,
     fields: *mach.type.field.Entry, count: u32) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
+
+the name of an anonymous record, union or tag: its kind and the name and type recipe of
+each field, interned
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session whose type table and interner are read |
+| `kind` | the aggregate's type kind |
+| `fields` | the aggregate's fields, `count` of them |
+| `count` | how many fields it has |
+| **returns** | the interned recipe, or the failure of encoding a field type or of interning |
 
 ### identity
 

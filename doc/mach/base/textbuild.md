@@ -16,13 +16,16 @@ Source: [`src/base/textbuild.mach`](../../../src/base/textbuild.mach)
 
 | On `Error` | |
 | :--- | :--- |
-| [`text`](#text) | |
+| [`text`](#text) | the text of the builder's failure |
 
 | On `TextBuilder` | |
 | :--- | :--- |
-| [`tb_init`](#tb_init), [`tb_append`](#tb_append) | |
+| [`tb_init`](#tb_init) | an empty builder growing in `a`, released with tb_dnit |
+| [`tb_append`](#tb_append) | append `text` up to its first NUL |
 | [`tb_fault`](#tb_fault) | the builder's first failure, or ok when every append so far held |
-| [`tb_len`](#tb_len), [`tb_finish`](#tb_finish), [`tb_dnit`](#tb_dnit) | |
+| [`tb_len`](#tb_len) | how many bytes the builder has appended |
+| [`tb_finish`](#tb_finish) | hand off the built text, terminated and fitted to its length, owned through the builder's allocator |
+| [`tb_dnit`](#tb_dnit) | release what the builder holds and leave it empty |
 
 ---
 
@@ -42,6 +45,8 @@ the builder's failure: the allocator refused, or a length or capacity left usize
 ```mach
 pub fun text(e: Error) str
 ```
+
+the text of the builder's failure
 
 ## TextBuilder
 
@@ -65,11 +70,21 @@ the failure once at `tb_finish` or `tb_fault`
 pub fun tb_init(a: *std.allocator.Allocator) TextBuilder
 ```
 
+an empty builder growing in `a`, released with tb_dnit
+
 ### tb_append
 
 ```mach
 pub fun tb_append(b: *TextBuilder, text: str) err[Error]
 ```
+
+append `text` up to its first NUL
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `text` | the text |
+| **returns** | the builder's first failure, which this append may be |
 
 ### tb_fault
 
@@ -85,15 +100,27 @@ the builder's first failure, or ok when every append so far held
 pub fun tb_len(b: *TextBuilder) usize
 ```
 
+how many bytes the builder has appended
+
 ### tb_finish
 
 ```mach
 pub fun tb_finish(b: *TextBuilder) res[str, Error]
 ```
 
+hand off the built text, terminated and fitted to its length, owned through the builder's
+allocator. the builder keeps no storage after a success
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| **returns** | the text, or the builder's first failure, which the final fit may be |
+
 ### tb_dnit
 
 ```mach
 pub fun tb_dnit(b: *TextBuilder)
 ```
+
+release what the builder holds and leave it empty
 

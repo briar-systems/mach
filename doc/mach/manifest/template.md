@@ -51,6 +51,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | Functions | |
 | :--- | :--- |
 | [`artifact_id`](#artifact_id) | the id the first `{artifact.<id>.out}` group in `tmpl` names, owned by `alloc`; none when the template holds no such group |
+| [`homed`](#homed) | whether `tmpl` names a variable whose value is a path relative to the root project's directory, so its expansion is too |
 
 ---
 
@@ -169,7 +170,7 @@ the values an `#[embed]` path expands with: the requirements of one scope
 | :--- | :--- |
 | `reqs` | the requirements |
 | `req_count` | length of `reqs` |
-| `dependency` | the dependency whose default library requirements they are, "" for the artifact being built |
+| `dependency` | the dependency whose export library (`export = true`) requirements they are, "" for the artifact being built |
 
 ## Requirements
 
@@ -187,7 +188,7 @@ the artifacts the modules of one project may name as `{artifact.<id>.out}`
 | Field | Type | |
 | :--- | :--- | :--- |
 | `owner` | `mach.base.intern.StrId` | the id of the project whose modules resolve in this scope |
-| `dependency` | `bool` | the requirements are a dependency's default library artifacts', not the requirements of the artifact being built |
+| `dependency` | `bool` | the requirements are those of a dependency's export library (`export = true`), not of the artifact being built |
 | `reqs` | `*Requirement` | the requirements; nil when none |
 | `req_count` | `u32` | length of `reqs` |
 
@@ -225,7 +226,7 @@ the values a template expands with
 | `run_out` | `str` | `{artifact.out}`, set for the program a runner launches |
 | `reqs` | `*Requirement` | the artifacts `{artifact.<id>.out}` may name; nil when none |
 | `req_count` | `u32` | length of `reqs` |
-| `dependency` | `str` | the id of the dependency whose default library requirements `reqs` are, "" for the artifact being built |
+| `dependency` | `str` | the id of the dependency whose export library (`export = true`) requirements `reqs` are, "" for the artifact being built |
 
 ### values_of
 
@@ -259,4 +260,13 @@ pub fun artifact_id(alloc: *std.allocator.Allocator, tmpl: str) res[opt[str], ma
 
 the id the first `{artifact.<id>.out}` group in `tmpl` names, owned by
 `alloc`; none when the template holds no such group
+
+### homed
+
+```mach
+pub fun homed(tmpl: str) bool
+```
+
+whether `tmpl` names a variable whose value is a path relative to the root
+project's directory, so its expansion is too
 

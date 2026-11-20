@@ -7,7 +7,7 @@ resolution, comptime evaluation, decorators, type checking, and doc comments
 
 | Module | |
 | :--- | :--- |
-| [`asm`](asm.md) | the lexis of an inline-asm body that the language owns: its `#` comments, and the `{name}` references that bind a local |
+| [`asm`](asm.md) | the lexis of an inline-asm body: the instruction set its head names, whose source dialect says where the body's comments and literals lie, and the `{name}` references outside them that bind a local |
 | [`ast`](ast.md) | the syntax tree of one parsed file |
 | [`comptime`](comptime.md) | the comptime evaluator: an expression's value under the capabilities of the phase that asks, over the scope it runs in |
 | [`decorator`](decorator.md) | the decorator registry: one row per decorator the language knows, which every phase reads by id |

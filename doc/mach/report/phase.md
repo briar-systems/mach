@@ -14,15 +14,17 @@ Uses types from [`mach.base.fail`](../base/fail.md).
 | Type | | |
 | :--- | :--- | :--- |
 | [`PhaseKind`](#phasekind) | `tag` | phase status is independent of diagnostic storage and rendering: accepted, rejected through recorded diagnostics, or failed with the first failure that is not the input's, a defect or the machine's refusal, which borrows its text and keeps where it points |
-| [`PhaseStatus`](#phasestatus) | `rec` |  |
+| [`PhaseStatus`](#phasestatus) | `rec` | the status of one phase and how many rejections it recorded |
 
 | On `PhaseStatus` | |
 | :--- | :--- |
-| [`accepted`](#accepted), [`reject`](#reject) | |
+| [`accepted`](#accepted) | a status that is accepted with no rejections |
+| [`reject`](#reject) | count one rejection, turning an accepted status rejected and leaving an internal failure as it is |
 | [`internal`](#internal) | fail the phase with the defect `f` names, or with `f` itself when the machine refused, which is no defect, unless it failed so already |
-| [`is_accepted`](#is_accepted) | |
+| [`is_accepted`](#is_accepted) | whether the phase is still accepted |
 | [`internal_failure`](#internal_failure) | the internal failure, absent unless the phase failed internally |
-| [`phase_failure`](#phase_failure), [`merge`](#merge) | |
+| [`phase_failure`](#phase_failure) | the failure a phase ends with |
+| [`merge`](#merge) | fold one status into another, adding its rejections and keeping the first internal failure |
 
 ---
 
@@ -50,17 +52,36 @@ pub rec PhaseStatus {
 }
 ```
 
+the status of one phase and how many rejections it recorded
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `PhaseKind` | accepted, rejected or failed internally |
+| `rejections` | `u64` | the number of rejections recorded against the phase |
+
 ### accepted
 
 ```mach
 pub fun accepted() PhaseStatus
 ```
 
+a status that is accepted with no rejections
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the fresh status |
+
 ### reject
 
 ```mach
 pub fun reject(s: *PhaseStatus)
 ```
+
+count one rejection, turning an accepted status rejected and leaving an internal failure as it is
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the status to update |
 
 ### internal
 
@@ -77,6 +98,13 @@ is no defect, unless it failed so already
 pub fun is_accepted(s: PhaseStatus) bool
 ```
 
+whether the phase is still accepted
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the status to inspect |
+| **returns** | true when it was never rejected and never failed internally |
+
 ### internal_failure
 
 ```mach
@@ -91,9 +119,23 @@ the internal failure, absent unless the phase failed internally
 pub fun phase_failure(s: PhaseStatus) mach.base.fail.Fail
 ```
 
+the failure a phase ends with
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the status to read |
+| **returns** | the reported marker when it was rejected, the internal failure when it failed, and a message failure when it was accepted, which callers never ask |
+
 ### merge
 
 ```mach
 pub fun merge(into: *PhaseStatus, from: PhaseStatus)
 ```
+
+fold one status into another, adding its rejections and keeping the first internal failure
+
+| Parameter | |
+| :--- | :--- |
+| `into` | the status that takes the result |
+| `from` | the status merged in |
 

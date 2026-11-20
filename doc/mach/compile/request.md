@@ -28,22 +28,25 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 | On `Overrides` | |
 | :--- | :--- |
 | [`overrides_init`](#overrides_init) | no override: the profile decides everything, with empty name lists and link inputs growable through `a` |
-| [`compose`](#compose) | |
+| [`compose`](#compose) | the request for a build of `m`: the selected profile's levers with the command line's over them |
 
 | On `BuildGoal` | |
 | :--- | :--- |
 | [`GOAL_ARTIFACT`](#buildgoal) | the finished artifact of the unit's kind: an executable, a static archive or a shared library |
 | [`GOAL_OBJECTS`](#buildgoal), [`GOAL_TESTS`](#buildgoal), [`GOAL_TEST_LIST`](#buildgoal) | |
 | [`GOAL_CHECK`](#buildgoal) | `mach check`: load, resolve and check the selected artifacts' reachable source through the frontend and stop; no step runs and no product is written |
-| [`test_goal`](#test_goal) | |
+| [`test_goal`](#test_goal) | whether a goal compiles the tests, to run them or to list them |
 | [`goal_name`](#goal_name) | the name a catalogued goal is displayed by |
 | [`goal_verb`](#goal_verb) | the verb a catalogued goal's unit is announced with |
 
 | On `BuildRequest` | |
 | :--- | :--- |
-| [`defaults`](#defaults), [`validate`](#validate) | |
+| [`defaults`](#defaults) | a request with every field at its built-in default: an unoptimized artifact build of no cell |
+| [`validate`](#validate) | refuse a request whose goal or simd mode is outside its catalog |
 | [`shows_warnings`](#shows_warnings) | whether a build shows the warnings of a package, the project being built where `root` holds and a dependency otherwise: its own always, a dependency's only under `--dep-warnings` |
-| [`is_release`](#is_release), [`for_cell`](#for_cell), [`semantic_hash`](#semantic_hash) | |
+| [`is_release`](#is_release) | whether the request optimizes |
+| [`for_cell`](#for_cell) | a copy of `base` aimed at one build cell |
+| [`semantic_hash`](#semantic_hash) | the sha-256 of the request fields that decide what the build produces |
 
 | Functions | |
 | :--- | :--- |
@@ -52,8 +55,7 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 
 | Constants | |
 | :--- | :--- |
-| [`OPT_DEBUG`](#constants) | a build's optimization lever: off, or the level mirl's schedule optimizes at |
-| [`OPT_RELEASE`](#constants), [`HASH_SIZE`](#constants) | |
+| [`HASH_SIZE`](#constants) | |
 
 ---
 
@@ -119,6 +121,19 @@ pub fun compose(a: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m:
     o: *Overrides, root: str, goal: BuildGoal, profile: str) res[BuildRequest, mach.base.fail.Fail]
 ```
 
+the request for a build of `m`: the selected profile's levers with the command line's over them
+
+| Parameter | |
+| :--- | :--- |
+| `a` | allocator for refusals and the request's link token and library directory lists |
+| `itn` | interner holding the manifest's names |
+| `m` | the root manifest, every profile of which is checked |
+| `o` | what the command line sets over the profile |
+| `root` | the project root |
+| `goal` | what the build is asked to produce |
+| `profile` | the profile to select, "" for the manifest's default |
+| **returns** | the request, its lists owned through `a` and its strings borrowed from `o`, or the refusal of the goal, the profile, a profile's `relax` list or an allocation |
+
 ## BuildGoal
 
 ```mach
@@ -138,6 +153,13 @@ pub def BuildGoal: u8
 ```mach
 pub fun test_goal(g: BuildGoal) bool
 ```
+
+whether a goal compiles the tests, to run them or to list them
+
+| Parameter | |
+| :--- | :--- |
+| `g` | the goal |
+| **returns** | true for GOAL_TESTS and GOAL_TEST_LIST |
 
 ### goal_name
 
@@ -178,8 +200,8 @@ pub rec BuildRequest {
 
     goal: BuildGoal;
 
-    # the level mirl's schedule runs at
-    opt: u8;
+    # whether mirl optimises, and the passes the profile turns on or off one by one
+    optimise: Optimise;
     # the command line changed a lever of the selected profile, or a `--set` wrote
     # a key of it, so a build that publishes artifacts must say where:
     # presentation only, no part of any hash
@@ -232,11 +254,25 @@ owner: "" for a cell of the root manifest, or the id of the closure dependency
 pub fun defaults() BuildRequest
 ```
 
+a request with every field at its built-in default: an unoptimized artifact build of no cell
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the request, its link token and library directory lists empty with no allocator |
+
 ### validate
 
 ```mach
 pub fun validate(a: *std.allocator.Allocator, r: *BuildRequest) err[mach.base.fail.Fail]
 ```
+
+refuse a request whose goal or simd mode is outside its catalog
+
+| Parameter | |
+| :--- | :--- |
+| `a` | allocator for the refusal's message |
+| `r` | the request to check |
+| **returns** | ok, or the refusal naming the catalog and the value |
 
 ### shows_warnings
 
@@ -255,6 +291,13 @@ warning read through the module registry
 pub fun is_release(r: *BuildRequest) bool
 ```
 
+whether the request optimizes
+
+| Parameter | |
+| :--- | :--- |
+| `r` | the request |
+| **returns** | true when its optimisation setting is on |
+
 ### for_cell
 
 ```mach
@@ -262,11 +305,32 @@ pub fun for_cell(base: *BuildRequest, owner: str, target: str, artifact: str,
     subsystem: opt[*mink.catalog.subsystem.Subsystem], goal: BuildGoal) BuildRequest
 ```
 
+a copy of `base` aimed at one build cell
+
+| Parameter | |
+| :--- | :--- |
+| `base` | the composed request |
+| `owner` | "" for a cell of the root manifest, or the dependency whose export library requires it |
+| `target` | the cell's target name |
+| `artifact` | the cell's artifact name |
+| `subsystem` | the artifact's declared subsystem, none for the host's |
+| `goal` | the cell's goal |
+| **returns** | the copy, sharing every list and string with `base` |
+
 ### semantic_hash
 
 ```mach
 pub fun semantic_hash(a: *std.allocator.Allocator, r: *BuildRequest, digest: *u8) err[mach.base.fail.Fail]
 ```
+
+the sha-256 of the request fields that decide what the build produces
+
+| Parameter | |
+| :--- | :--- |
+| `a` | allocator for the hashed bytes and any refusal |
+| `r` | the request, validated first |
+| `digest` | where the HASH_SIZE bytes of the digest go |
+| **returns** | ok, or the refusal of validation or of writing the fields |
 
 ## Functions
 
@@ -296,7 +360,5 @@ the workers a run uses: the `--threads` count, or the host's processor count whe
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `OPT_DEBUG` | `u8` | `0` | a build's optimization lever: off, or the level mirl's schedule optimizes at |
-| `OPT_RELEASE` | `u8` | `2` |  |
 | `HASH_SIZE` | `usize` | `32` |  |
 

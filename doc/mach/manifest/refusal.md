@@ -17,7 +17,8 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 
 | On `Sites` | |
 | :--- | :--- |
-| [`sites_init`](#sites_init), [`sites_add`](#sites_add) | |
+| [`sites_init`](#sites_init) | an empty gathering of places, its list grown through `alloc` |
+| [`sites_add`](#sites_add) | gather `p`, skipping a nil place, and nothing once an allocation was refused |
 | [`sites_fail`](#sites_fail) | `f` pointing at the first place gathered, naming the others as related; the gathered places are released |
 
 | Functions | |
@@ -56,11 +57,15 @@ names the rest as related
 pub fun sites_init(alloc: *std.allocator.Allocator) Sites
 ```
 
+an empty gathering of places, its list grown through `alloc`
+
 ### sites_add
 
 ```mach
 pub fun sites_add(s: *Sites, p: mach.base.source.Location)
 ```
+
+gather `p`, skipping a nil place, and nothing once an allocation was refused
 
 ### sites_fail
 

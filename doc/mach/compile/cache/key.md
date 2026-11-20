@@ -14,11 +14,16 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 
 | On `Builder` | |
 | :--- | :--- |
-| [`begin`](#begin), [`number`](#number), [`bytes`](#bytes), [`text`](#text), [`name`](#name), [`finish`](#finish) | |
+| [`begin`](#begin) | start a key in a domain, the domain hashed as the first input |
+| [`number`](#number) | add a u64 input to the key |
+| [`bytes`](#bytes) | add a byte run to the key as its length then its bytes a nonempty run with nil bytes marks the builder failed, reported by finish |
+| [`text`](#text) | add a string to the key, nil and present text hashed apart by a leading 0 or 1 |
+| [`name`](#name) | add an interned name to the key as its text, a nil id hashed as nil text a name missing from the interner marks the builder failed, reported by finish |
+| [`finish`](#finish) | finish the key into its 32-byte digest |
 
 | Functions | |
 | :--- | :--- |
-| [`equal`](#equal) | |
+| [`equal`](#equal) | compare two 32-byte keys |
 | [`object`](#object) | the key of a module's object: the module's key and its name |
 | [`test_object`](#test_object) | the key of a module's test object: the key of the normal object it is lowered against, which covers the module's whole source, tests included |
 
@@ -41,11 +46,25 @@ and every byte run its length then its bytes
 pub fun begin(domain: str) Builder
 ```
 
+start a key in a domain, the domain hashed as the first input
+
+| Parameter | |
+| :--- | :--- |
+| `domain` | the text naming what the key is for |
+| **returns** | a builder holding the running digest |
+
 ### number
 
 ```mach
 pub fun number(b: *Builder, value: u64)
 ```
+
+add a u64 input to the key
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the key being built |
+| `value` | the number to add |
 
 ### bytes
 
@@ -53,11 +72,27 @@ pub fun number(b: *Builder, value: u64)
 pub fun bytes(b: *Builder, data: *u8, len: usize)
 ```
 
+add a byte run to the key as its length then its bytes
+a nonempty run with nil bytes marks the builder failed, reported by finish
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the key being built |
+| `data` | the first byte, nil only when len is 0 |
+| `len` | the byte count |
+
 ### text
 
 ```mach
 pub fun text(b: *Builder, value: str)
 ```
+
+add a string to the key, nil and present text hashed apart by a leading 0 or 1
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the key being built |
+| `value` | the nul-terminated text, or nil |
 
 ### name
 
@@ -65,11 +100,28 @@ pub fun text(b: *Builder, value: str)
 pub fun name(b: *Builder, itn: *mach.base.intern.Interner, id: mach.base.intern.StrId)
 ```
 
+add an interned name to the key as its text, a nil id hashed as nil text
+a name missing from the interner marks the builder failed, reported by finish
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the key being built |
+| `itn` | the interner holding the name |
+| `id` | the name's id |
+
 ### finish
 
 ```mach
 pub fun finish(b: *Builder, digest: *[32]u8) err[mach.base.fail.Fail]
 ```
+
+finish the key into its 32-byte digest
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the key being built |
+| `digest` | where the digest is written |
+| **returns** | the builder's first refusal or a missing destination as an error, digest untouched |
 
 ## Functions
 
@@ -78,6 +130,14 @@ pub fun finish(b: *Builder, digest: *[32]u8) err[mach.base.fail.Fail]
 ```mach
 pub fun equal(left: *[32]u8, right: *[32]u8) bool
 ```
+
+compare two 32-byte keys
+
+| Parameter | |
+| :--- | :--- |
+| `left` | the first key |
+| `right` | the second key |
+| **returns** | true when every byte matches |
 
 ### object
 

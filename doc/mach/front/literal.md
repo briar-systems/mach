@@ -11,14 +11,14 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Int`](#int) | `rec` |  |
-| [`Float`](#float) | `rec` |  |
+| [`Int`](#int) | `rec` | an integer literal's value and suffix |
+| [`Float`](#float) | `rec` | a float literal's value and suffix |
 | [`Refusal`](#refusal) | `rec` | why a literal does not scan: the diagnostic it reports and what it says |
 | [`MultilineLine`](#multilineline) | `rec` | one line of a multiline string literal |
 
 | On `Int` | |
 | :--- | :--- |
-| [`int_scan`](#int_scan) | |
+| [`int_scan`](#int_scan) | the value and suffix of an integer literal, decimal or prefixed `0x`, `0b` or `0o`, with `_` separators skipped |
 
 | On `Float` | |
 | :--- | :--- |
@@ -54,11 +54,26 @@ pub rec Int {
 }
 ```
 
+an integer literal's value and suffix
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `value` | `mach.base.wide.Wide` | the value its digits name, held in 128 bits |
+| `suffix` | `mach.type.kind.TypeKind` | the type its suffix names, LIT_SUFFIX_NONE when it has none |
+
 ### int_scan
 
 ```mach
 pub fun int_scan(source: str, span: mach.base.source.Span) res[Int, Refusal]
 ```
+
+the value and suffix of an integer literal, decimal or prefixed `0x`, `0b` or `0o`, with `_` separators skipped
+
+| Parameter | |
+| :--- | :--- |
+| `source` | the text the span indexes |
+| `span` | the literal's token |
+| **returns** | the value and suffix, or a refusal for no digits, a digit outside the base, a value past 128 bits or an unknown suffix |
 
 ## Float
 
@@ -68,6 +83,13 @@ pub rec Float {
     suffix: mach.type.kind.TypeKind;
 }
 ```
+
+a float literal's value and suffix
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `value` | `f64` | the value rounded at its suffix's width, binary64 when it has none |
+| `suffix` | `mach.type.kind.TypeKind` | the type its suffix names, LIT_SUFFIX_NONE when it has none |
 
 ### float_scan
 

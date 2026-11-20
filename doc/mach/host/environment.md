@@ -25,7 +25,8 @@ Uses types from [`mach.base.fail`](../base/fail.md).
 
 | On `Environment` | |
 | :--- | :--- |
-| [`init`](#init), [`dnit`](#dnit) | |
+| [`init`](#init) | an empty environment |
+| [`dnit`](#dnit) | release every entry and the environment's storage |
 | [`put_owned`](#put_owned) | add `entry`, which the environment takes: a name already present keeps its value unless `replace`, and the entry not kept is released |
 | [`put`](#put) | entries own both strings and use host identity before any overlay is applied |
 | [`find`](#find) | the index of the entry named `name` by the host's name identity, none when the environment does not hold it |
@@ -102,11 +103,24 @@ a child's environment, one entry per name by the host's name identity
 pub fun init(a: *std.allocator.Allocator) Environment
 ```
 
+an empty environment
+
+| Parameter | |
+| :--- | :--- |
+| `a` | allocator the entries and their text are held in |
+| **returns** | the environment, released with dnit |
+
 ### dnit
 
 ```mach
 pub fun dnit(values: *Environment)
 ```
+
+release every entry and the environment's storage
+
+| Parameter | |
+| :--- | :--- |
+| `values` | the environment to release |
 
 ### put_owned
 

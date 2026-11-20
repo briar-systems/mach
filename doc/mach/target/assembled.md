@@ -21,7 +21,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.target.resolved`](re
 | [`assemble`](#assemble) | the target mirl assembles for `t`, with the build its added extensions select opened |
 | [`added`](#added) | the names the target adds over its baseline |
 | [`basis_of`](#basis_of) | the build basis the added extensions opened, none for a target that states no baseline |
-| [`dnit`](#dnit) | |
+| [`dnit`](#dnit) | give back an assembled target, its basis and its record |
 
 | Functions | |
 | :--- | :--- |
@@ -58,7 +58,7 @@ pub fun assemble(a: *std.allocator.Allocator, t: *mach.target.resolved.Target) r
 ```
 
 the target mirl assembles for `t`, with the build its added extensions select
-opened. given back by release
+opened. given back by dnit
 
 ### added
 
@@ -81,6 +81,13 @@ the build basis the added extensions opened, none for a target that states no ba
 ```mach
 pub fun dnit(a: *std.allocator.Allocator, x: *Assembled)
 ```
+
+give back an assembled target, its basis and its record
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator `assemble` was given |
+| `x` | the assembled target, freed here |
 
 ## Functions
 

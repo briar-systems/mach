@@ -22,10 +22,10 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`TestFact`](#testfact) | `rec` |  |
-| [`Facts`](#facts) | `rec` |  |
+| [`TestFact`](#testfact) | `rec` | a test the module declares, as its object's record keeps it |
+| [`Facts`](#facts) | `rec` | what the engine reads from a module's lowered unit besides its object, owned by the allocator that decoded or built them and released with facts_dnit |
 | [`Copy`](#copy) | `rec` | an instance the object holds a copy of: its symbol, its key (compile/cache, instance_key) and the modules it reads, the `count` names of `copy_reads` from `first`, its declaring module first |
-| [`Record`](#record) | `rec` |  |
+| [`Record`](#record) | `rec` | an object's cache record |
 
 | On `Facts` | |
 | :--- | :--- |
@@ -47,6 +47,13 @@ pub rec TestFact {
     line: u32;
 }
 ```
+
+a test the module declares, as its object's record keeps it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `name` | `mach.base.intern.StrId` | the test's qualified name |
+| `line` | `u32` | the line the test is declared on |
 
 ## Facts
 
@@ -75,6 +82,14 @@ pub rec Facts {
     reads_count: u32;
 }
 ```
+
+what the engine reads from a module's lowered unit besides its object, owned by the allocator
+that decoded or built them and released with facts_dnit
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `tests` | `*TestFact` | the module's tests, test_count of them |
+| `copy_reads` | `*mach.base.intern.StrId` | the modules the copies read, reads_count names, each copy a run of them |
 
 ### facts_dnit
 
@@ -116,6 +131,13 @@ pub rec Record {
     facts: Facts;
 }
 ```
+
+an object's cache record
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `key` | `[32]u8` | the key the object was built under |
+| `facts` | `Facts` | what the module lowered to besides its object |
 
 ### record_dnit
 

@@ -14,7 +14,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.front.ast.id`](../fr
 
 | Functions | |
 | :--- | :--- |
-| [`lower_stmt`](#lower_stmt) | |
+| [`lower_stmt`](#lower_stmt) | lower the statement `sid` into the function being built, at its own source location |
 
 ---
 
@@ -25,4 +25,12 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.front.ast.id`](../fr
 ```mach
 pub fun lower_stmt(ctx: *mach.lower.context.LowerContext, sid: mach.front.ast.id.StmtId) err[mach.base.fail.Fail]
 ```
+
+lower the statement `sid` into the function being built, at its own source location
+
+| Parameter | |
+| :--- | :--- |
+| `ctx` | the lowering context, positioned in the block the statement continues |
+| `sid` | the statement |
+| **returns** | ok, or the failure located at the statement, a statement nested past the stack's reach refused |
 

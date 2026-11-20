@@ -15,7 +15,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | Type | | |
 | :--- | :--- | :--- |
 | [`RetainerId`](#retainerid) | `def` | a retainer's slot in the retention table |
-| [`Retention`](#retention) | `rec` | active:  the retainer a build records under modules: how many retainers hold each module files:   how many held modules each file backs pending: modules released since the last retirement, possibly held again since |
+| [`Retention`](#retention) | `rec` | the retainers of a session and how many of them hold each module and file |
 
 | On `RetainerId` | |
 | :--- | :--- |
@@ -23,7 +23,8 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 
 | On `Retention` | |
 | :--- | :--- |
-| [`init`](#init), [`dnit`](#dnit) | |
+| [`init`](#init) | a retention table holding nothing, with the session's retainer open as RETAINER_SESSION |
+| [`dnit`](#dnit) | release every live retainer and the table's storage, retiring nothing |
 | [`acquire`](#acquire) | a new retainer holding nothing, in a free slot when one exists |
 | [`record`](#record) | a module the open round loaded; held from now on, so nothing retires it under the build |
 | [`reject`](#reject) | the rejected flag of the open round, for a load that ended before it reached any module |
@@ -58,10 +59,14 @@ pub rec Retention {
 }
 ```
 
-active:  the retainer a build records under
-modules: how many retainers hold each module
-files:   how many held modules each file backs
-pending: modules released since the last retirement, possibly held again since
+the retainers of a session and how many of them hold each module and file
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `active` | `RetainerId` | the retainer a build records under |
+| `modules` | `Map[u32, u32]` | how many retainers hold each module |
+| `files` | `Map[u32, u32]` | how many held modules each file backs |
+| `pending` | `Vector[Held]` | modules released since the last retirement, possibly held again since |
 
 ### init
 
@@ -69,11 +74,20 @@ pending: modules released since the last retirement, possibly held again since
 pub fun init(a: *std.allocator.Allocator) res[Retention, mach.base.fail.Fail]
 ```
 
+a retention table holding nothing, with the session's retainer open as RETAINER_SESSION
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator the table and its retainers draw from |
+| **returns** | the table, released with `dnit`, or a failure when the first retainer cannot be added |
+
 ### dnit
 
 ```mach
 pub fun dnit(t: *Retention)
 ```
+
+release every live retainer and the table's storage, retiring nothing
 
 ### acquire
 

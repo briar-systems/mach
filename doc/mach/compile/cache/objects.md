@@ -18,11 +18,12 @@ Uses types from [`mach.base.fail`](../../base/fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Store`](#store) | `rec` |  |
+| [`Store`](#store) | `rec` | the object digests of a cell, indexed by the hash of their paths |
 
 | On `Store` | |
 | :--- | :--- |
-| [`init`](#init), [`dnit`](#dnit) | |
+| [`init`](#init) | an empty store |
+| [`dnit`](#dnit) | release a store's entries and their paths |
 | [`written`](#written) | the digest of the object written at `path` under `obj/`, none when no build recorded one |
 | [`put`](#put) | the object at `path` under `obj/` was written as the `len` bytes at `bytes` |
 | [`decode`](#decode) | the store `bytes` hold: every entry, or none at all when the bytes are not a complete store |
@@ -42,17 +43,39 @@ pub rec Store {
 }
 ```
 
+the object digests of a cell, indexed by the hash of their paths
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `alloc` | `*std.allocator.Allocator` | the allocator owning every entry's path |
+| `entries` | `Vector[Entry]` | each recorded object's path under `obj/` and digest |
+| `index` | `std.collections.map.Map[u64, u32]` | each recorded path's hash to its entry's position |
+| `dirty` | `bool` | an entry changed since the store was read or stored |
+
 ### init
 
 ```mach
 pub fun init(a: *std.allocator.Allocator) Store
 ```
 
+an empty store
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator the store's entries are kept in |
+| **returns** | the store, released with dnit |
+
 ### dnit
 
 ```mach
 pub fun dnit(st: *Store)
 ```
+
+release a store's entries and their paths
+
+| Parameter | |
+| :--- | :--- |
+| `st` | the store to release |
 
 ### written
 

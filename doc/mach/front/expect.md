@@ -19,7 +19,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 
 | On `Index` | |
 | :--- | :--- |
-| [`index_dnit`](#index_dnit) | |
+| [`index_dnit`](#index_dnit) | free the index's site and step lists and mark it unread |
 | [`site_count`](#site_count) | how many declarations in the module the index holds carry `#[expect]` |
 | [`index`](#index-1) | bring the index up to the parsed module `a`, reading its sites when it was read from another parse; a failed read leaves it unread, so the next one walks the module again |
 | [`collect`](#collect) | every `#[expect]` key at the sites the index read from `a`, one expectation each |
@@ -59,6 +59,12 @@ refresh of the diagnostics walks none of the module's declarations
 ```mach
 pub fun index_dnit(idx: *Index)
 ```
+
+free the index's site and step lists and mark it unread
+
+| Parameter | |
+| :--- | :--- |
+| `idx` | index to release, its `visited` count kept |
 
 ### site_count
 

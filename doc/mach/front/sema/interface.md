@@ -14,22 +14,23 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 | Type | | |
 | :--- | :--- | :--- |
 | [`Declaration`](#declaration) | `rec` | one module-level function, `val` or `var` |
-| [`Param`](#param) | `rec` |  |
+| [`Param`](#param) | `rec` | one parameter of a declared function, as an importer's lowering needs it |
 | [`Exported`](#exported) | `rec` | one symbol on the module's public surface, as an importer of it names it |
-| [`Interface`](#interface) | `rec` |  |
+| [`Interface`](#interface) | `rec` | the interface of one module, which owns every table it holds |
 | [`Reader`](#reader) | `rec` | how a lowering reads the interface another module published |
 
 | On `Interface` | |
 | :--- | :--- |
-| [`init`](#init) | |
+| [`init`](#init) | an empty interface with no template part |
 | [`dnit`](#dnit) | release an interface; a nil one, or one never made, holds nothing |
 | [`declaration_add`](#declaration_add) | adds `d` with the parameters `params[0 .. params_len]`; a second declaration of one kind and canonical name leaves that name ambiguous, which a lookup by name refuses |
 | [`declaration_at`](#declaration_at) | the declaration `decl` of the module, none for one the interface does not describe |
 | [`declaration_for`](#declaration_for) | the one declaration of `kind` the module defines under `canon` |
-| [`param_at`](#param_at), [`declaration_has_comptime_param`](#declaration_has_comptime_param) | |
+| [`param_at`](#param_at) | the parameter `ord` of the declaration `d`, none past its last |
+| [`declaration_has_comptime_param`](#declaration_has_comptime_param) | whether any parameter of `d` is a comptime parameter |
 | [`declaration_has_instances`](#declaration_has_instances) | a generic, comptime-parameter or pack function has instances in place of one definition |
 | [`template_of`](#template_of) | the template part, none for a module with no generic, comptime-parameter or pack function |
-| [`exported_add`](#exported_add) | |
+| [`exported_add`](#exported_add) | adds `e` to the module's public surface |
 
 | Constants | |
 | :--- | :--- |
@@ -76,6 +77,12 @@ pub rec Param {
 }
 ```
 
+one parameter of a declared function, as an importer's lowering needs it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `comptime` | `bool` | whether the parameter is a `$` comptime parameter |
+
 ## Exported
 
 ```mach
@@ -96,7 +103,7 @@ one symbol on the module's public surface, as an importer of it names it
 | Field | Type | |
 | :--- | :--- | :--- |
 | `origin` | `mach.session.module.StableModuleId` | the module that declares it, which may be one this module re-exports |
-| `module` | `mach.session.module.StableModuleId` | the module a `pub use` names, for a module symbol |
+| `module` | `mach.session.module.StableModuleId` | the module a `fwd` names, for a module symbol |
 
 ## Interface
 
@@ -116,11 +123,29 @@ pub rec Interface {
 }
 ```
 
+the interface of one module, which owns every table it holds
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `alloc` | `*std.allocator.Allocator` | the allocator every table is held in, nil once released |
+| `declarations` | `std.collections.vector.Vector[Declaration]` | each module-level function, `val` and `var` |
+| `params` | `std.collections.vector.Vector[Param]` | the parameters of every declaration, each declaration's run in order |
+| `surface` | `std.collections.vector.Vector[Exported]` | the symbols on the module's public surface |
+| `by_decl` | `std.collections.map.Map[u32, u32]` | the index in `declarations` of each declaration id |
+| `by_canon` | `std.collections.map.Map[u64, u32]` | the index of each kind and canonical name, `NONE` when the name is ambiguous |
+
 ### init
 
 ```mach
 pub fun init(alloc: *std.allocator.Allocator) Interface
 ```
+
+an empty interface with no template part
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | the allocator its tables are held in |
+| **returns** | the interface, released with `dnit` |
 
 ### dnit
 
@@ -161,11 +186,28 @@ the one declaration of `kind` the module defines under `canon`
 pub fun param_at(iface: *Interface, d: *Declaration, ord: u32) opt[Param]
 ```
 
+the parameter `ord` of the declaration `d`, none past its last
+
+| Parameter | |
+| :--- | :--- |
+| `iface` | the interface holding `d` |
+| `d` | a declaration of `iface` |
+| `ord` | the parameter's position |
+| **returns** | the parameter, or none when `d` has fewer than `ord + 1` |
+
 ### declaration_has_comptime_param
 
 ```mach
 pub fun declaration_has_comptime_param(iface: *Interface, d: *Declaration) bool
 ```
+
+whether any parameter of `d` is a comptime parameter
+
+| Parameter | |
+| :--- | :--- |
+| `iface` | the interface holding `d` |
+| `d` | a declaration of `iface` |
+| **returns** | true when one parameter is comptime |
 
 ### declaration_has_instances
 
@@ -188,6 +230,14 @@ the template part, none for a module with no generic, comptime-parameter or pack
 ```mach
 pub fun exported_add(iface: *Interface, e: Exported) err[mach.base.fail.Fail]
 ```
+
+adds `e` to the module's public surface
+
+| Parameter | |
+| :--- | :--- |
+| `iface` | the interface to add to |
+| `e` | the exported symbol |
+| **returns** | ok, or the failure of the allocation |
 
 ## Reader
 

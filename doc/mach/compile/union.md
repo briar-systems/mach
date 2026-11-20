@@ -14,7 +14,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](pr
 
 | Functions | |
 | :--- | :--- |
-| [`populate_union_tuples`](#populate_union_tuples) | |
+| [`populate_union_tuples`](#populate_union_tuples) | make the project's loader a union build over every target the manifest declares a target whose facts cannot be resolved or assembled is skipped with a TARGET_SKIPPED warning, and the loader takes ownership of the tuple array |
 | [`populate_union_entries`](#populate_union_entries) | the artifact entries of this project, split by whether the selected target builds them: an artifact this target does not declare is another target's, and the modules only it reaches are not this build's to compile |
 
 ---
@@ -26,6 +26,16 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](pr
 ```mach
 pub fun populate_union_tuples(p: *mach.compile.project.Project, m: *mach.manifest.model.Manifest) err[mach.base.fail.Fail]
 ```
+
+make the project's loader a union build over every target the manifest declares
+a target whose facts cannot be resolved or assembled is skipped with a TARGET_SKIPPED warning,
+and the loader takes ownership of the tuple array. a manifest with no targets leaves the loader as it is
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the project whose loader takes the tuples |
+| `m` | the manifest whose targets are read |
+| **returns** | ok, or the failure when the tuple array cannot be allocated |
 
 ### populate_union_entries
 

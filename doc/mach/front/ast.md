@@ -19,19 +19,31 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 
 | On `Ast` | |
 | :--- | :--- |
-| [`init`](#init) | |
+| [`init`](#init) | an empty tree for one file, every table allocated from `a` |
 | [`dnit`](#dnit) | release a tree; a nil tree holds nothing |
 | [`copy`](#copy) | an owned copy of `src` from `alloc`, every node at the id it has in `src` |
-| [`add_module`](#add_module), [`get_module`](#get_module), [`add_expr`](#add_expr), [`get_expr`](#get_expr), [`add_stmt`](#add_stmt), [`get_stmt`](#get_stmt), [`add_decl`](#add_decl), [`get_decl`](#get_decl), [`decl_name_span`](#decl_name_span), [`add_type`](#add_type), [`get_type`](#get_type), [`add_typed_name`](#add_typed_name) | |
+| [`add_module`](#add_module) | append a module node |
+| [`get_module`](#get_module) | the module node an id names |
+| [`add_expr`](#add_expr) | append an expression node |
+| [`get_expr`](#get_expr) | the expression node an id names |
+| [`add_stmt`](#add_stmt) | append a statement node |
+| [`get_stmt`](#get_stmt) | the statement node an id names |
+| [`add_decl`](#add_decl) | append a declaration node |
+| [`get_decl`](#get_decl) | the declaration node an id names |
+| [`decl_name_span`](#decl_name_span) | the span of the name a declaration binds |
+| [`add_type`](#add_type) | append a type-syntax node |
+| [`get_type`](#get_type) | the type-syntax node an id names |
+| [`add_typed_name`](#add_typed_name) | append a typed name to the side list of parameters and fields |
 | [`add_field_init`](#add_field_init) | reached only by mach-lsp |
-| [`add_generic_name`](#add_generic_name) | |
+| [`add_generic_name`](#add_generic_name) | append a generic parameter name to its side list |
 | [`names_remap`](#names_remap) | every name the tree holds an id of, renamed through `remap`: the ids a parse made in a name table of its own, as the table it was merged into names them |
 | [`add_path_name`](#add_path_name) | the id of one segment of a named type's path, after the segments before it |
-| [`add_decorator`](#add_decorator) | |
+| [`add_decorator`](#add_decorator) | append a decorator to its side list |
 | [`literal_bytes_reserve`](#literal_bytes_reserve) | room for `n` more bytes at the end of the literal byte table, which literal_bytes_take then claims |
 | [`literal_bytes_take`](#literal_bytes_take) | claims the first `n` reserved bytes as one literal's value |
 | [`lit_str_value`](#lit_str_value) | the decoded bytes a string literal names |
-| [`mark`](#mark), [`rollback`](#rollback) | |
+| [`mark`](#mark) | the length of every table, for a later rollback |
+| [`rollback`](#rollback) | truncate every table back to the lengths of a mark nothing is truncated when any table is already shorter than its mark |
 | [`same_shape`](#same_shape) | whether two trees have the same shape: the same number of every node, and the same expression, statement, declaration and type kinds, and declaration flags, in the same order |
 | [`offset_to_expr`](#offset_to_expr) | the tightest expression enclosing a byte offset a linear scan of every expression; among equal spans the later one wins; an empty span never matches |
 | [`offset_to_decl`](#offset_to_decl) | the tightest declaration enclosing a byte offset a linear scan of every declaration; among equal spans the later one wins; an empty span never matches |
@@ -40,7 +52,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | Functions | |
 | :--- | :--- |
 | [`table_push`](#table_push) | appends `value` to an AST table and answers the index it takes |
-| [`expr_place_kind`](#expr_place_kind) | |
+| [`expr_place_kind`](#expr_place_kind) | the kind of an expression when it can stand as a place an identifier, member, projection, index, call or dereference is a place |
 | [`span_contains`](#span_contains) | reached only by mach-lsp |
 
 ---
@@ -82,6 +94,14 @@ node is named by its index in that table
 pub fun init(a: *std.allocator.Allocator, file_id: mach.base.source.FileId) Ast
 ```
 
+an empty tree for one file, every table allocated from `a`
+
+| Parameter | |
+| :--- | :--- |
+| `a` | allocator every table grows from, held by the tree until dnit |
+| `file_id` | the file the tree is parsed from |
+| **returns** | a tree with no nodes and a nil root module |
+
 ### dnit
 
 ```mach
@@ -104,11 +124,27 @@ an owned copy of `src` from `alloc`, every node at the id it has in `src`
 pub fun add_module(a: *Ast, m: mach.front.ast.module.Module) res[mach.front.ast.id.ModuleNodeId, mach.base.fail.Fail]
 ```
 
+append a module node
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `m` | the module node |
+| **returns** | the new node's id, or the failure when the table cannot grow or its id domain is spent |
+
 ### get_module
 
 ```mach
 pub fun get_module(a: *Ast, id_: mach.front.ast.id.ModuleNodeId) opt[*mach.front.ast.module.Module]
 ```
+
+the module node an id names
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `id_` | the module node id |
+| **returns** | a pointer into the module table, valid until the table next grows, or none when the id is out of range |
 
 ### add_expr
 
@@ -116,11 +152,27 @@ pub fun get_module(a: *Ast, id_: mach.front.ast.id.ModuleNodeId) opt[*mach.front
 pub fun add_expr(a: *Ast, e: mach.front.ast.expr.Expr) res[mach.front.ast.id.ExprId, mach.base.fail.Fail]
 ```
 
+append an expression node
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `e` | the expression node |
+| **returns** | the new node's id, or the failure when the table cannot grow or its id domain is spent |
+
 ### get_expr
 
 ```mach
 pub fun get_expr(a: *Ast, id_: mach.front.ast.id.ExprId) opt[*mach.front.ast.expr.Expr]
 ```
+
+the expression node an id names
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `id_` | the expression id |
+| **returns** | a pointer into the expression table, valid until the table next grows, or none when the id is out of range |
 
 ### add_stmt
 
@@ -128,11 +180,27 @@ pub fun get_expr(a: *Ast, id_: mach.front.ast.id.ExprId) opt[*mach.front.ast.exp
 pub fun add_stmt(a: *Ast, s: mach.front.ast.stmt.Stmt) res[mach.front.ast.id.StmtId, mach.base.fail.Fail]
 ```
 
+append a statement node
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `s` | the statement node |
+| **returns** | the new node's id, or the failure when the table cannot grow or its id domain is spent |
+
 ### get_stmt
 
 ```mach
 pub fun get_stmt(a: *Ast, id_: mach.front.ast.id.StmtId) opt[*mach.front.ast.stmt.Stmt]
 ```
+
+the statement node an id names
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `id_` | the statement id |
+| **returns** | a pointer into the statement table, valid until the table next grows, or none when the id is out of range |
 
 ### add_decl
 
@@ -140,11 +208,27 @@ pub fun get_stmt(a: *Ast, id_: mach.front.ast.id.StmtId) opt[*mach.front.ast.stm
 pub fun add_decl(a: *Ast, d: mach.front.ast.decl.Decl) res[mach.front.ast.id.DeclId, mach.base.fail.Fail]
 ```
 
+append a declaration node
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `d` | the declaration node |
+| **returns** | the new node's id, or the failure when the table cannot grow or its id domain is spent |
+
 ### get_decl
 
 ```mach
 pub fun get_decl(a: *Ast, id_: mach.front.ast.id.DeclId) opt[*mach.front.ast.decl.Decl]
 ```
+
+the declaration node an id names
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `id_` | the declaration id |
+| **returns** | a pointer into the declaration table, valid until the table next grows, or none when the id is out of range |
 
 ### decl_name_span
 
@@ -152,11 +236,27 @@ pub fun get_decl(a: *Ast, id_: mach.front.ast.id.DeclId) opt[*mach.front.ast.dec
 pub fun decl_name_span(a: *Ast, id_: mach.front.ast.id.DeclId) mach.base.source.Span
 ```
 
+the span of the name a declaration binds
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `id_` | the declaration id |
+| **returns** | the written alias of a use or fwd, empty when it has none, the name of any other named declaration, or an empty span for a test, a comptime declaration, an error node or an id out of range |
+
 ### add_type
 
 ```mach
 pub fun add_type(a: *Ast, t: mach.front.ast.type.Type) res[mach.front.ast.id.TypeId, mach.base.fail.Fail]
 ```
+
+append a type-syntax node
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `t` | the type-syntax node |
+| **returns** | the new node's id, or the failure when the table cannot grow or its id domain is spent |
 
 ### get_type
 
@@ -164,11 +264,27 @@ pub fun add_type(a: *Ast, t: mach.front.ast.type.Type) res[mach.front.ast.id.Typ
 pub fun get_type(a: *Ast, id_: mach.front.ast.id.TypeId) opt[*mach.front.ast.type.Type]
 ```
 
+the type-syntax node an id names
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `id_` | the type-syntax id |
+| **returns** | a pointer into the type table, valid until the table next grows, or none when the id is out of range |
+
 ### add_typed_name
 
 ```mach
 pub fun add_typed_name(a: *Ast, tn: mach.front.ast.decl.TypedName) res[u32, mach.base.fail.Fail]
 ```
+
+append a typed name to the side list of parameters and fields
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `tn` | the typed name |
+| **returns** | its index in the typed name table, or the failure when the table cannot grow or its id domain is spent |
 
 ### add_field_init
 
@@ -183,6 +299,14 @@ reached only by mach-lsp
 ```mach
 pub fun add_generic_name(a: *Ast, name: mach.base.source.Span) res[u32, mach.base.fail.Fail]
 ```
+
+append a generic parameter name to its side list
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `name` | the span of the parameter name |
+| **returns** | its index in the generic name table, or the failure when the table cannot grow or its id domain is spent |
 
 ### names_remap
 
@@ -207,6 +331,14 @@ the id of one segment of a named type's path, after the segments before it
 ```mach
 pub fun add_decorator(a: *Ast, d: mach.front.ast.decl.Decorator) res[u32, mach.base.fail.Fail]
 ```
+
+append a decorator to its side list
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `d` | the decorator |
+| **returns** | its index in the decorator table, or the failure when the table cannot grow or its id domain is spent |
 
 ### literal_bytes_reserve
 
@@ -239,11 +371,27 @@ the decoded bytes a string literal names
 pub fun mark(a: *Ast) AstMark
 ```
 
+the length of every table, for a later rollback
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| **returns** | the mark |
+
 ### rollback
 
 ```mach
 pub fun rollback(a: *Ast, m: AstMark) bool
 ```
+
+truncate every table back to the lengths of a mark
+nothing is truncated when any table is already shorter than its mark
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `m` | a mark taken from this tree |
+| **returns** | true when the tree was rolled back, false when the mark is ahead of the tree |
 
 ### same_shape
 
@@ -344,6 +492,14 @@ appends `value` to an AST table and answers the index it takes
 ```mach
 pub fun expr_place_kind(e: *mach.front.ast.expr.Expr) mach.front.ast.expr.ExprKind
 ```
+
+the kind of an expression when it can stand as a place
+an identifier, member, projection, index, call or dereference is a place
+
+| Parameter | |
+| :--- | :--- |
+| `e` | the expression |
+| **returns** | its kind when it is a place, EXPR_KIND_ERROR otherwise |
 
 ### span_contains
 

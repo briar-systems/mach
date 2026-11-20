@@ -27,7 +27,8 @@ Source: [`src/base/float.mach`](../../../src/base/float.mach)
 | [`round_at`](#round_at) | `f` rounded once, to nearest with ties to even, to the format of `w`, and carried back exactly in an f64 |
 | [`bits_at`](#bits_at) | the encoding at `w` of `v`, a value already representable at `w`: the bits `:~` reads |
 | [`value_of_bits`](#value_of_bits) | the value an encoding at `w` holds, carried exactly in an f64: the value `:~` makes |
-| [`widths_agree`](#widths_agree), [`unify_width`](#unify_width) | |
+| [`widths_agree`](#widths_agree) | whether two widths can meet: equal, or one of them FLOAT_W_NONE |
+| [`unify_width`](#unify_width) | the width two agreeing widths meet at: `a`, or `b` when `a` is FLOAT_W_NONE |
 | [`parse_decimal`](#parse_decimal) | the decimal `s`, its first `len` bytes, rounded once to nearest with ties to even at `w` by std's parse and carried exactly in an f64, none when the parse refuses the text |
 | [`shortest`](#shortest) | the shortest round-trip decimal of a positive finite nonzero value representable in the format of `w`, by exact bignum arithmetic (Steele and White's dragon4) over that format's own neighbours, ties read the way round-to-nearest-even reads them back |
 
@@ -45,9 +46,12 @@ Source: [`src/base/float.mach`](../../../src/base/float.mach)
 
 | Functions | |
 | :--- | :--- |
-| [`f64_bits`](#f64_bits), [`bits_f64`](#bits_f64), [`f64_neg`](#f64_neg), [`f64_signbit`](#f64_signbit) | |
+| [`f64_bits`](#f64_bits) | the binary64 encoding of `f` |
+| [`bits_f64`](#bits_f64) | the f64 a binary64 encoding holds |
+| [`f64_neg`](#f64_neg) | `f` with its sign bit flipped, a NaN and a zero included |
+| [`f64_signbit`](#f64_signbit) | whether the sign bit of `f` is set, as it is for -0 and a negative NaN |
 | [`f64_to_f32_bits`](#f64_to_f32_bits) | the binary32 encoding of binary64 bits that carry a binary32 value: rounded to nearest even, a NaN keeping every bit binary32 has |
-| [`f32_bits_to_f64_bits`](#f32_bits_to_f64_bits) | |
+| [`f32_bits_to_f64_bits`](#f32_bits_to_f64_bits) | a binary32 encoding as the binary64 bits of the same value: exact, a subnormal normalised and a NaN keeping every bit it has |
 
 | Constants | |
 | :--- | :--- |
@@ -117,11 +121,15 @@ the value an encoding at `w` holds, carried exactly in an f64: the value `:~` ma
 pub fun widths_agree(a: FloatWidth, b: FloatWidth) bool
 ```
 
+whether two widths can meet: equal, or one of them FLOAT_W_NONE
+
 ### unify_width
 
 ```mach
 pub fun unify_width(a: FloatWidth, b: FloatWidth) FloatWidth
 ```
+
+the width two agreeing widths meet at: `a`, or `b` when `a` is FLOAT_W_NONE
 
 ### parse_decimal
 
@@ -225,11 +233,15 @@ scientific form otherwise, terminated, in a SHORTEST_TEXT_CAP buffer
 pub fun f64_bits(f: f64) u64
 ```
 
+the binary64 encoding of `f`
+
 ### bits_f64
 
 ```mach
 pub fun bits_f64(bits: u64) f64
 ```
+
+the f64 a binary64 encoding holds
 
 ### f64_neg
 
@@ -237,11 +249,15 @@ pub fun bits_f64(bits: u64) f64
 pub fun f64_neg(f: f64) f64
 ```
 
+`f` with its sign bit flipped, a NaN and a zero included
+
 ### f64_signbit
 
 ```mach
 pub fun f64_signbit(f: f64) bool
 ```
+
+whether the sign bit of `f` is set, as it is for -0 and a negative NaN
 
 ### f64_to_f32_bits
 
@@ -257,6 +273,9 @@ nearest even, a NaN keeping every bit binary32 has
 ```mach
 pub fun f32_bits_to_f64_bits(s: u32) u64
 ```
+
+a binary32 encoding as the binary64 bits of the same value: exact, a subnormal normalised
+and a NaN keeping every bit it has
 
 ## Constants
 

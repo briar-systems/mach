@@ -13,21 +13,21 @@ Uses types from [`mach.base.intern`](../../base/intern.md), [`mach.base.source`]
 | [`ExprKind`](#exprkind) | `def` |  |
 | [`BinOp`](#binop) | `def` |  |
 | [`UnOp`](#unop) | `def` |  |
-| [`ByteRange`](#byterange) | `rec` | a string literal: `tok` covers the quotes a run of bytes in the tree's literal byte table |
-| [`ExprBinary`](#exprbinary) | `rec` |  |
-| [`ExprUnary`](#exprunary) | `rec` |  |
-| [`ExprCall`](#exprcall) | `rec` |  |
+| [`ByteRange`](#byterange) | `rec` | a run of bytes in the tree's literal byte table |
+| [`ExprBinary`](#exprbinary) | `rec` | a binary operation, assignment included |
+| [`ExprUnary`](#exprunary) | `rec` | a unary operation |
+| [`ExprCall`](#exprcall) | `rec` | a call, or a generic instance `f[T]` with no argument list the parser keeps the reading of the bracket as an index beside its reading as generic arguments, and name resolution picks one (interpretation.get) |
 | [`ExprIndex`](#exprindex) | `rec` | `x[i]` reads one element; `x[i, n]` is a range of `n` elements from `i`, and `count` is EXPR_NIL for the single element |
 | [`ExprMember`](#exprmember) | `rec` | `name_id` is `name` as the parse interned it, STR_NIL for a member with no name |
-| [`ExprProject`](#exprproject) | `rec` |  |
-| [`ExprSpread`](#exprspread) | `rec` |  |
-| [`ExprCast`](#exprcast) | `rec` |  |
-| [`ExprStrip`](#exprstrip) | `rec` |  |
-| [`ExprArrayLit`](#exprarraylit) | `rec` |  |
+| [`ExprProject`](#exprproject) | `rec` | a comptime field projection `x.[f]` |
+| [`ExprSpread`](#exprspread) | `rec` | a pack spread `va...` |
+| [`ExprCast`](#exprcast) | `rec` | a cast `x::T` or `x:~T` |
+| [`ExprStrip`](#exprstrip) | `rec` | a secret downgrade `x:>T` |
+| [`ExprArrayLit`](#exprarraylit) | `rec` | an array literal `[N]T{a, b}` |
 | [`FieldInit`](#fieldinit) | `rec` | `name_id` is `name` as the parse interned it, STR_NIL for a positional element |
-| [`ExprStructLit`](#exprstructlit) | `rec` |  |
+| [`ExprStructLit`](#exprstructlit) | `rec` | a typed literal `T{...}` with named or bare fields, or no fields |
 | [`ExprVectorLit`](#exprvectorlit) | `rec` | a typed literal with only positional elements, `T{a, b}`: a vector's lanes as written, or a tag case's payload when name resolution finds the head names a case (interpretation.CASE_LITERAL) |
-| [`ExprTypeRef`](#exprtyperef) | `rec` |  |
+| [`ExprTypeRef`](#exprtyperef) | `rec` | a type written where an expression stands |
 | [`ExprSel`](#exprsel) | `rec` |  |
 | [`Expr`](#expr) | `rec` | `span` is the node's visual extent, grouping parentheses included |
 
@@ -45,7 +45,7 @@ Uses types from [`mach.base.intern`](../../base/intern.md), [`mach.base.source`]
 
 | On `ExprIndex` | |
 | :--- | :--- |
-| [`is_range`](#is_range) | |
+| [`is_range`](#is_range) | whether an index expression is a range `x[i, n]` |
 
 | Constants | |
 | :--- | :--- |
@@ -136,7 +136,6 @@ pub rec ByteRange {
 }
 ```
 
-a string literal: `tok` covers the quotes
 a run of bytes in the tree's literal byte table
 
 ## ExprBinary
@@ -149,6 +148,14 @@ pub rec ExprBinary {
 }
 ```
 
+a binary operation, assignment included
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `op` | `BinOp` | the BIN_ operator |
+| `lhs` | `mach.front.ast.id.ExprId` | the left operand |
+| `rhs` | `mach.front.ast.id.ExprId` | the right operand |
+
 ## ExprUnary
 
 ```mach
@@ -157,6 +164,13 @@ pub rec ExprUnary {
     operand: mach.front.ast.id.ExprId;
 }
 ```
+
+a unary operation
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `op` | `UnOp` | the UN_ operator |
+| `operand` | `mach.front.ast.id.ExprId` | the operand |
 
 ## ExprCall
 
@@ -170,6 +184,19 @@ pub rec ExprCall {
     index_callee:    mach.front.ast.id.ExprId;
 }
 ```
+
+a call, or a generic instance `f[T]` with no argument list
+the parser keeps the reading of the bracket as an index beside its reading as generic
+arguments, and name resolution picks one (interpretation.get)
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `callee` | `mach.front.ast.id.ExprId` | the called expression |
+| `args_start` | `u32` | first argument in the expression id table |
+| `args_len` | `u32` | how many arguments |
+| `type_args_start` | `u32` | first generic argument in the type id table |
+| `type_args_len` | `u32` | how many generic arguments |
+| `index_callee` | `mach.front.ast.id.ExprId` | the bracket read as an index expression, EXPR_NIL when there is no bracket or it cannot be read as one |
 
 ## ExprIndex
 
@@ -189,6 +216,13 @@ pub rec ExprIndex {
 ```mach
 pub fun is_range(ix: *ExprIndex) bool
 ```
+
+whether an index expression is a range `x[i, n]`
+
+| Parameter | |
+| :--- | :--- |
+| `ix` | the index expression |
+| **returns** | true when it carries a count |
 
 ## ExprMember
 
@@ -211,6 +245,13 @@ pub rec ExprProject {
 }
 ```
 
+a comptime field projection `x.[f]`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `object` | `mach.front.ast.id.ExprId` | the projected value |
+| `field` | `mach.front.ast.id.ExprId` | the comptime field descriptor |
+
 ## ExprSpread
 
 ```mach
@@ -218,6 +259,12 @@ pub rec ExprSpread {
     inner: mach.front.ast.id.ExprId;
 }
 ```
+
+a pack spread `va...`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `inner` | `mach.front.ast.id.ExprId` | the spread pack |
 
 ## ExprCast
 
@@ -229,6 +276,14 @@ pub rec ExprCast {
 }
 ```
 
+a cast `x::T` or `x:~T`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `value` | `mach.front.ast.id.ExprId` | the cast operand |
+| `ty` | `mach.front.ast.id.TypeId` | the target type syntax |
+| `reinterpret` | `bool` | true for a `:~` bit reinterpretation, false for a `::` value conversion |
+
 ## ExprStrip
 
 ```mach
@@ -237,6 +292,13 @@ pub rec ExprStrip {
     ty:    mach.front.ast.id.TypeId;
 }
 ```
+
+a secret downgrade `x:>T`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `value` | `mach.front.ast.id.ExprId` | the operand |
+| `ty` | `mach.front.ast.id.TypeId` | the public target type syntax |
 
 ## ExprArrayLit
 
@@ -247,6 +309,14 @@ pub rec ExprArrayLit {
     elems_len:   u32;
 }
 ```
+
+an array literal `[N]T{a, b}`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `ty` | `mach.front.ast.id.TypeId` | the array type syntax |
+| `elems_start` | `u32` | first element in the expression id table |
+| `elems_len` | `u32` | how many elements |
 
 ## FieldInit
 
@@ -273,6 +343,16 @@ pub rec ExprStructLit {
 }
 ```
 
+a typed literal `T{...}` with named or bare fields, or no fields
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `elems_start` | `u32` | first element value in the expression id table, one per field init in order |
+| `elems_len` | `u32` | how many element values |
+| `ty` | `mach.front.ast.id.TypeId` | the head type syntax |
+| `fields_start` | `u32` | first field init in the field init table |
+| `fields_len` | `u32` | how many field inits |
+
 ## ExprVectorLit
 
 ```mach
@@ -293,6 +373,12 @@ pub rec ExprTypeRef {
     ty: mach.front.ast.id.TypeId;
 }
 ```
+
+a type written where an expression stands
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `ty` | `mach.front.ast.id.TypeId` | the type syntax |
 
 ## ExprSel
 

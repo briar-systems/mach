@@ -16,7 +16,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | :--- | :--- | :--- |
 | [`PhaseKind`](#phasekind) | `def` |  |
 | [`BuildUnit`](#buildunit) | `rec` | one planned cell: an artifact on a target for a profile, with every decision the engine executes |
-| [`BuildPlan`](#buildplan) | `rec` | project:  the root manifest's `[project].id` names:    the interner the plan's names live in; a session runs the plan only           when it holds them manifest: the root manifest the plan was made from, borrowed; it outlives the plan closure:  the manifest's dependency closure, located once by           `plan_dependency_requirements`; every cell borrows it located:  whether `closure` was located as a build needs it, every dependency           realized, which running the plan requires sources:  the texts the manifest and closure were read into, the map of the session           that located the closure; every session running the plan shares it |
+| [`BuildPlan`](#buildplan) | `rec` | a build's plan: the cells it runs in execution order, with the names, manifest and dependency closure they are read against |
 
 | On `PhaseKind` | |
 | :--- | :--- |
@@ -42,7 +42,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | Functions | |
 | :--- | :--- |
 | [`under_dir`](#under_dir) | whether `path` lies under the directory `dir` |
-| [`requirement_input`](#requirement_input) | the input a manifest link requirement names: a framework or a library by name, or a file located as written or under `root` |
+| [`requirement_input`](#requirement_input) | the input a manifest link requirement names: a framework or a library by name, or a file located as written, a local entry's path anchored already |
 
 ---
 
@@ -95,7 +95,7 @@ an internal catalog failure with a caller-owned message
 pub rec BuildUnit {
     target_entry: *mach.compile.project.TargetEntry;
     profile:      str;
-    opt_level:    u8;
+    optimise:     mirl.pass.setting.Optimise;
     goal:         mach.compile.request.BuildGoal;
     out_path:     str;
     # the expanded `[project].work`: the build owns the layout beneath it
@@ -116,6 +116,7 @@ pub rec BuildUnit {
     sel_target:   str;
     sel_artifact: str;
     is_required:  bool;
+    built_only:   bool;
     requires:     Vector[str];
     subsystem:    opt[*mink.catalog.subsystem.Subsystem];
 
@@ -136,6 +137,7 @@ adds what the realized dependency closure decides
 | `dep_steps` | `Vector[str]` | exported dependency steps in execution order as `<dep id>.<step>`; empty until `configure` |
 | `export_links` | `Vector[mach.manifest.link.LinkRequirement]` | the dependency closure's exported link requirements for this cell, in link order; empty until `configure` |
 | `configured` | `bool` | `configure` ran, so `dep_steps` and `export_links` are effective |
+| `built_only` | `bool` | a test run's cell on a finished-module target, which links no test executable: built as its artifact, or checked for a listing, and not run |
 | `requires` | `Vector[str]` | the declaring manifest's artifacts this cell requires, by name |
 | `owner` | `str` | "" for a cell of the root manifest, or the id of the dependency whose export library requires the cell |
 | `owner_chain` | `str` | the dependency chain that reaches `owner`, "" for the root |
@@ -157,16 +159,19 @@ pub rec BuildPlan {
 }
 ```
 
-project:  the root manifest's `[project].id`
-names:    the interner the plan's names live in; a session runs the plan only
-          when it holds them
-manifest: the root manifest the plan was made from, borrowed; it outlives the plan
-closure:  the manifest's dependency closure, located once by
-          `plan_dependency_requirements`; every cell borrows it
-located:  whether `closure` was located as a build needs it, every dependency
-          realized, which running the plan requires
-sources:  the texts the manifest and closure were read into, the map of the session
-          that located the closure; every session running the plan shares it
+a build's plan: the cells it runs in execution order, with the names, manifest and
+dependency closure they are read against
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `request` | `mach.compile.request.BuildRequest` | the request the plan was made for, each cell's request derived from it |
+| `project` | `str` | the root manifest's `[project].id` |
+| `units` | `Vector[BuildUnit]` | the planned cells in execution order, every requirement before the cells that need it |
+| `names` | `*mach.base.intern.Interner` | the interner the plan's names live in; a session runs the plan only when it holds them |
+| `manifest` | `*mach.manifest.model.Manifest` | the root manifest the plan was made from, borrowed; it outlives the plan |
+| `closure` | `mach.compile.project.Closure` | the manifest's dependency closure, located once by `plan_dependency_requirements`; every cell borrows it |
+| `located` | `bool` | whether `closure` was located as a build needs it, every dependency realized, which running the plan requires |
+| `sources` | `*mach.base.source.SourceMap` | the texts the manifest and closure were read into, the map of the session that located the closure; every session running the plan shares it |
 
 ### plan
 
@@ -316,10 +321,9 @@ whether `path` lies under the directory `dir`
 ### requirement_input
 
 ```mach
-pub fun requirement_input(a: *std.allocator.Allocator, itn: *mach.base.intern.Interner, root: str,
-    req: *mach.manifest.link.LinkRequirement) res[mach.target.input.Input, mach.base.fail.Fail]
+pub fun requirement_input(a: *std.allocator.Allocator, itn: *mach.base.intern.Interner, req: *mach.manifest.link.LinkRequirement) res[mach.target.input.Input, mach.base.fail.Fail]
 ```
 
 the input a manifest link requirement names: a framework or a library by
-name, or a file located as written or under `root`
+name, or a file located as written, a local entry's path anchored already
 

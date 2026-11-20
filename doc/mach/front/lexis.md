@@ -8,7 +8,8 @@ Source: [`src/front/lexis.mach`](../../../src/front/lexis.mach)
 
 | Functions | |
 | :--- | :--- |
-| [`is_ident_start`](#is_ident_start), [`is_ident_char`](#is_ident_char) | |
+| [`is_ident_start`](#is_ident_start) | whether a byte may begin an identifier |
+| [`is_ident_char`](#is_ident_char) | whether a byte may continue an identifier |
 | [`is_identifier`](#is_identifier) | `text[0..len]` lexes as exactly one identifier token; keywords lex as identifiers too |
 
 | Constants | |
@@ -26,11 +27,25 @@ Source: [`src/front/lexis.mach`](../../../src/front/lexis.mach)
 pub fun is_ident_start(c: u8) bool
 ```
 
+whether a byte may begin an identifier
+
+| Parameter | |
+| :--- | :--- |
+| `c` | byte to test |
+| **returns** | true for an ascii letter or underscore |
+
 ### is_ident_char
 
 ```mach
 pub fun is_ident_char(c: u8) bool
 ```
+
+whether a byte may continue an identifier
+
+| Parameter | |
+| :--- | :--- |
+| `c` | byte to test |
+| **returns** | true for an ascii letter, digit or underscore |
 
 ### is_identifier
 

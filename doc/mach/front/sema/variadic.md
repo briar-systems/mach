@@ -11,7 +11,7 @@ Uses types from [`mach.front.ast.id`](../ast/id.md), [`mach.front.sema.context`]
 
 | Functions | |
 | :--- | :--- |
-| [`decl_body_spreads_pack_to_c_variadic`](#decl_body_spreads_pack_to_c_variadic) | |
+| [`decl_body_spreads_pack_to_c_variadic`](#decl_body_spreads_pack_to_c_variadic) | whether the body of function `did` spreads a pack into a call that reaches a C variadic function, directly or through the functions it calls |
 
 ---
 
@@ -22,4 +22,14 @@ Uses types from [`mach.front.ast.id`](../ast/id.md), [`mach.front.sema.context`]
 ```mach
 pub fun decl_body_spreads_pack_to_c_variadic(sc: *mach.front.sema.context.SemaContext, origin: mach.session.module.ModuleId, did: mach.front.ast.id.DeclId) bool
 ```
+
+whether the body of function `did` spreads a pack into a call that reaches a C
+variadic function, directly or through the functions it calls
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | semantic context the walk reads definitions through |
+| `origin` | module that declares the function |
+| `did` | the function declaration |
+| **returns** | true when such a spread is found, false otherwise or when a part of the walk could not be reached |
 

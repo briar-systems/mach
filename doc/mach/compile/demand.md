@@ -16,6 +16,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | Type | | |
 | :--- | :--- | :--- |
 | [`Registry`](#registry) | `rec` | every instance a build has met, by its symbol: its identity as whoever asked for it last described it, which the instance's typing reads |
+| [`GrowthWatch`](#growthwatch) | `rec` | who hears of a growing cycle's expansion: the module that declares it, the templates on it, and how many instances of it the build has met so far |
 | [`Typer`](#typer) | `rec` | how the demand types an instance: the typing of the instance a symbol and its description name |
 | [`Entry`](#entry) | `rec` | one instance the closure reached |
 | [`Demand`](#demand) | `rec` | the closure, in the order it was met |
@@ -23,13 +24,14 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | On `Registry` | |
 | :--- | :--- |
 | [`registry_init`](#registry_init) | a registry holding nothing yet: its set is made on the first instance it keeps |
-| [`registry_dnit`](#registry_dnit) | |
+| [`registry_dnit`](#registry_dnit) | free everything the registry holds |
 | [`register`](#register) | the symbol of the instance `item` describes, its description kept under it |
 | [`described`](#described) | the instance the symbol `name` names, none when nothing described it |
 
 | On `Demand` | |
 | :--- | :--- |
-| [`init`](#init), [`dnit`](#dnit) | |
+| [`init`](#init) | an empty demand |
+| [`dnit`](#dnit) | free the demand's own storage, never the typings its entries point to |
 | [`offer_module`](#offer_module) | every instance the module's `set` asks for, where its code asks for it |
 | [`close`](#close) | the closure: every entry met, in the order met, typed, and every instance its body asks for met in turn |
 | [`report`](#report) | each instance's reports, from its typing |
@@ -40,14 +42,19 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 
 ```mach
 pub rec Registry {
-    set:   mach.front.sema.instance.Set;
-    names: Map[mach.base.intern.StrId, u32];
+    set:    mach.front.sema.instance.Set;
+    names:  Map[mach.base.intern.StrId, u32];
+    growth: Map[u64, u32];
 }
 ```
 
 every instance a build has met, by its symbol: its identity as whoever asked for it last
 described it, which the instance's typing reads. it lives as long as the project, since an
 instance is typed again in a later operation of the build when what it reads moved
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `growth` | `Map[u64, u32]` | how many instances of each growing cycle the build has met, keyed by the cycle's module and members |
 
 ### registry_init
 
@@ -63,13 +70,20 @@ a registry holding nothing yet: its set is made on the first instance it keeps
 pub fun registry_dnit(r: *Registry)
 ```
 
+free everything the registry holds
+
+| Parameter | |
+| :--- | :--- |
+| `r` | registry to free, unusable after |
+
 ### register
 
 ```mach
-pub fun register(r: *Registry, s: *mach.session.Session, item: *mach.front.sema.instance.Instance) res[mach.base.intern.StrId, mach.base.fail.Fail]
+pub fun register(r: *Registry, s: *mach.session.Session, item: *mach.front.sema.instance.Instance, watch: GrowthWatch) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
-the symbol of the instance `item` describes, its description kept under it
+the symbol of the instance `item` describes, its description kept under it. the first time the
+build meets an instance of a growing cycle it counts toward that cycle
 
 ### described
 
@@ -78,6 +92,18 @@ pub fun described(r: *Registry, name: mach.base.intern.StrId) opt[*mach.front.se
 ```
 
 the instance the symbol `name` names, none when nothing described it
+
+## GrowthWatch
+
+```mach
+pub rec GrowthWatch {
+    ctx:      ptr;
+    expanded: fun(ptr, mach.base.intern.StrId, mach.base.intern.StrId, u32);
+}
+```
+
+who hears of a growing cycle's expansion: the module that declares it, the templates on it,
+and how many instances of it the build has met so far. a nil `expanded` hears nothing
 
 ## Typer
 
@@ -130,16 +156,29 @@ the closure, in the order it was met
 pub fun init(a: *std.allocator.Allocator) Demand
 ```
 
+an empty demand
+
+| Parameter | |
+| :--- | :--- |
+| `a` | allocator the demand's entries, edges, asks and index grow in |
+| **returns** | the demand, which the caller frees with dnit |
+
 ### dnit
 
 ```mach
 pub fun dnit(d: *Demand)
 ```
 
+free the demand's own storage, never the typings its entries point to
+
+| Parameter | |
+| :--- | :--- |
+| `d` | demand to free, unusable after |
+
 ### offer_module
 
 ```mach
-pub fun offer_module(d: *Demand, r: *Registry, s: *mach.session.Session, set: *mach.front.sema.instance.Set) err[mach.base.fail.Fail]
+pub fun offer_module(d: *Demand, r: *Registry, s: *mach.session.Session, set: *mach.front.sema.instance.Set, watch: GrowthWatch) err[mach.base.fail.Fail]
 ```
 
 every instance the module's `set` asks for, where its code asks for it
@@ -147,7 +186,7 @@ every instance the module's `set` asks for, where its code asks for it
 ### close
 
 ```mach
-pub fun close(d: *Demand, r: *Registry, s: *mach.session.Session, t: Typer) err[mach.base.fail.Fail]
+pub fun close(d: *Demand, r: *Registry, s: *mach.session.Session, t: Typer, watch: GrowthWatch) err[mach.base.fail.Fail]
 ```
 
 the closure: every entry met, in the order met, typed, and every instance its body asks for met

@@ -19,7 +19,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | :--- | :--- |
 | [`run`](#run) | run the declaring project's prerequisite steps for the configured cell, in its own directory |
 | [`dependency_plan`](#dependency_plan) | the exported dependency steps a cell runs, in execution order: each realized dependency's export step plan for the cell target, dependencies in closure order |
-| [`dependency_run`](#dependency_run) | |
+| [`dependency_run`](#dependency_run) | run the exported dependency steps the cell's target selects, in `dependency_plan` order, each from its dependency's vendored root and homed in the root project's output directory |
 
 ---
 
@@ -71,4 +71,15 @@ order. shared by `dependency_run` and the build plan display
 ```mach
 pub fun dependency_run(p: *mach.compile.project.Project, isa: mach.base.intern.StrId, os: mach.base.intern.StrId, abi: mach.base.intern.StrId) err[mach.base.fail.Fail]
 ```
+
+run the exported dependency steps the cell's target selects, in `dependency_plan` order, each
+from its dependency's vendored root and homed in the root project's output directory
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the configured project |
+| `isa` | the cell target's architecture |
+| `os` | the cell target's system |
+| `abi` | the cell target's abi |
+| **returns** | ok, or the failure of planning, of placing the output home or a vendored root, or of the first step that fails |
 

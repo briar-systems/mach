@@ -27,7 +27,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.manifest.load`](../m
 
 | Functions | |
 | :--- | :--- |
-| [`pick_index`](#pick_index) | |
+| [`pick_index`](#pick_index) | the position of an identity among a resolution's picks |
 
 ---
 
@@ -107,4 +107,12 @@ accept, and the highest release published
 ```mach
 pub fun pick_index(picks: *Vector[mach.package.resolver.Choice], id: str) i64
 ```
+
+the position of an identity among a resolution's picks
+
+| Parameter | |
+| :--- | :--- |
+| `picks` | the chosen releases |
+| `id` | the identity to find |
+| **returns** | its index, -1 when resolution picked no release for it |
 

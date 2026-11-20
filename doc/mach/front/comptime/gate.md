@@ -14,9 +14,9 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 | [`GateOutcome`](#gateoutcome) | `def` |  |
 | [`GateProbe`](#gateprobe) | `def` |  |
 | [`GateNodeVerdict`](#gatenodeverdict) | `def` |  |
-| [`GateProbes`](#gateprobes) | `rec` |  |
+| [`GateProbes`](#gateprobes) | `rec` | the observers a dependency probe asks of the phase walking a gate, each over the observer `T` |
 | [`GateScope`](#gatescope) | `def` |  |
-| [`GateVerdict`](#gateverdict) | `rec` |  |
+| [`GateVerdict`](#gateverdict) | `rec` | what deciding one gate gave |
 
 | On `GateOutcome` | |
 | :--- | :--- |
@@ -32,17 +32,21 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 
 | On `GateProbes` | |
 | :--- | :--- |
-| [`gate_probes`](#gate_probes), [`gate_chain_depends_on`](#gate_chain_depends_on), [`gate_chain_defers`](#gate_chain_defers), [`gate_depends_on`](#gate_depends_on) | |
+| [`gate_probes`](#gate_probes) | the observers of the dependency probes, with no node action |
+| [`gate_chain_depends_on`](#gate_chain_depends_on) | whether any arm condition of a `$if` chain depends on what `probe` looks for |
+| [`gate_chain_defers`](#gate_chain_defers) | whether any arm condition of a `$if` chain depends on something only a later phase knows: a `$` parameter, a layout intrinsic, a type comparison, a field descriptor or a `$each` variable |
+| [`gate_depends_on`](#gate_depends_on) | whether the expression `eid` or any expression under it depends on what `probe` looks for |
 
 | On `GateScope` | |
 | :--- | :--- |
-| [`GATE_SCOPE_DECL`](#gatescope), [`GATE_SCOPE_INSTANCE`](#gatescope), [`evaluate_gate`](#evaluate_gate) | |
+| [`GATE_SCOPE_DECL`](#gatescope), [`GATE_SCOPE_INSTANCE`](#gatescope) | |
+| [`evaluate_gate`](#evaluate_gate) | decide a `$if` gate in the phase `caps` describes a nil condition, a bare `$or`, is active |
 
 | Functions | |
 | :--- | :--- |
 | [`comptime_if_declares_nothing`](#comptime_if_declares_nothing) | whether every arm of a chain, at any depth, declares nothing but directives and chains; a chain nested deeper than the stack lets the walk descend is refused (`nesting`) |
 | [`nesting`](#nesting) | the refusal of a walk over nesting deeper than the stack lets it descend, which the phase that asked reports against the node it asked about |
-| [`gate_walk`](#gate_walk) | |
+| [`gate_walk`](#gate_walk) | walk the condition `eid` with `action` deciding each node: a node it says yes to ends the walk, one it prunes is not descended |
 | [`never_decided_message`](#never_decided_message) | what a failed gate says when the name it waits on is a constant nowhere the module can see, which the caller frees |
 | [`type_question`](#type_question) | the first call in an expression that asks a type question, EXPR_NIL when none does |
 | [`type_question_message`](#type_question_message) | a declaring gate may not ask a type question; `through` names the constants it asks it through, as ` through `T` -> `S``, or is empty when the gate asks it itself |
@@ -99,6 +103,17 @@ pub rec GateProbes[T] {
 }
 ```
 
+the observers a dependency probe asks of the phase walking a gate, each over the observer `T`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `expression` | `fun(*T, *mach.front.ast.Ast, mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.front.comptime.failure.EvalFail]` | an expression node as the phase reads it |
+| `comptime_param` | `fun(*T, mach.front.ast.id.ExprId) bool` | whether an identifier names a `$` parameter |
+| `each_loopvar` | `fun(*T, mach.front.ast.id.ExprId) bool` | whether an identifier names a `$each` loop variable |
+| `field_loopvar` | `fun(*T, mach.front.ast.id.ExprId) bool` | whether a field descriptor member reads a `$each` variable over `$fields` |
+| `field_type_operand` | `fun(*T, mach.front.ast.id.ExprId) res[bool, mach.base.fail.Fail]` | whether a comparison operand is a field descriptor's type |
+| `node_action` | `fun(*T, mach.front.ast.id.ExprId, *mach.front.ast.expr.Expr) res[GateNodeVerdict, mach.base.fail.Fail]` | the visit of a plain walk, which decides each node itself, nil for a probe |
+
 ### gate_probes
 
 ```mach
@@ -110,6 +125,12 @@ pub fun gate_probes[T](
     expression: fun(*T, *mach.front.ast.Ast, mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.front.comptime.failure.EvalFail]) GateProbes[T]
 ```
 
+the observers of the dependency probes, with no node action
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the observer set |
+
 ### gate_chain_depends_on
 
 ```mach
@@ -117,6 +138,19 @@ pub fun gate_chain_depends_on[T](
     a: *mach.front.ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe,
     branches_start: u32, branches_len: u32) res[bool, mach.base.fail.Fail]
 ```
+
+whether any arm condition of a `$if` chain depends on what `probe` looks for
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `obs` | the observer the probes ask |
+| `probes` | the observers |
+| `probe` | which dependency to look for |
+| `branches_start` | first arm in the comptime branch table |
+| `branches_len` | how many arms |
+| **returns** | whether a condition depends on it, or the failure of the walk |
 
 ### gate_chain_defers
 
@@ -126,12 +160,37 @@ pub fun gate_chain_defers[T](
     branches_start: u32, branches_len: u32) res[bool, mach.base.fail.Fail]
 ```
 
+whether any arm condition of a `$if` chain depends on something only a later phase knows: a `$`
+parameter, a layout intrinsic, a type comparison, a field descriptor or a `$each` variable
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `obs` | the observer the probes ask |
+| `probes` | the observers |
+| `branches_start` | first arm in the comptime branch table |
+| `branches_len` | how many arms |
+| **returns** | whether the chain is deferred, or the failure of the walk |
+
 ### gate_depends_on
 
 ```mach
 pub fun gate_depends_on[T](
     a: *mach.front.ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe, eid: mach.front.ast.id.ExprId) res[bool, mach.base.fail.Fail]
 ```
+
+whether the expression `eid` or any expression under it depends on what `probe` looks for
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `obs` | the observer the probes ask |
+| `probes` | the observers |
+| `probe` | which dependency to look for |
+| `eid` | the expression, EXPR_NIL for none |
+| **returns** | whether it depends on it, or the failure of the walk, a nesting refusal included |
 
 ## GateScope
 
@@ -159,6 +218,23 @@ pub fun evaluate_gate[T](
     cache: bool) res[GateVerdict, mach.base.fail.Fail]
 ```
 
+decide a `$if` gate in the phase `caps` describes
+a nil condition, a bare `$or`, is active. a condition the phase cannot decide yet waits on its
+phase or its instance, and one that is no u1 constant is refused
+
+| Parameter | |
+| :--- | :--- |
+| `c` | the scope the condition is evaluated in, which caches a decided gate |
+| `cap_ctx` | the phase context |
+| `caps` | the phase's capabilities |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `cond` | the condition |
+| `interner` | the interner names are ids in |
+| `scope` | whether the gate is a declaration's or an instance's |
+| `cache` | whether the verdict is read from and written to the scope's gate cache |
+| **returns** | the verdict, or an internal failure |
+
 ## GateVerdict
 
 ```mach
@@ -172,6 +248,18 @@ pub rec GateVerdict {
     value:   mach.front.comptime.value.CTValue;
 }
 ```
+
+what deciding one gate gave
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `outcome` | `GateOutcome` | whether the arm is active, inactive, refused or waits on a later phase or an instance |
+| `fail` | `mach.front.comptime.failure.EvalFailKind` | the evaluation failure kind the verdict was decided from, EVAL_FAIL_NONE otherwise |
+| `diag` | `mach.base.diagnostic.kind.Kind` | the diagnostic kind a refusal is reported as, NONE for a verdict that reports nothing |
+| `message` | `str` | the refusal's text, "" for a verdict that reports nothing |
+| `span` | `mach.base.source.Span` | where the refusal points, the condition or the run-time binding it reads |
+| `depends` | `mach.base.intern.StrId` | the unbound name a failed gate waits on, STR_NIL when it waits on none |
+| `value` | `mach.front.comptime.value.CTValue` | the condition's value, where the verdict keeps it |
 
 ## Functions
 
@@ -201,6 +289,19 @@ pub fun gate_walk[T](a: *mach.front.ast.Ast, source: str, obs: *T,
     expression: fun(*T, *mach.front.ast.Ast, mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.front.comptime.failure.EvalFail],
     eid: mach.front.ast.id.ExprId) res[bool, mach.base.fail.Fail]
 ```
+
+walk the condition `eid` with `action` deciding each node: a node it says yes to ends the walk,
+one it prunes is not descended
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `obs` | the walk's own state, handed to both functions |
+| `action` | the visit of each node |
+| `expression` | how the walk reads an expression node |
+| `eid` | the root of the walk |
+| **returns** | whether a node was said yes to, or the failure of the walk, a nesting refusal included |
 
 ### never_decided_message
 

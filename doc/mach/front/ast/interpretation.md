@@ -23,7 +23,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.ast`](../as
 | :--- | :--- |
 | [`PARSED`](#choice), [`GENERIC`](#choice), [`INDEX_CALL`](#choice), [`INDEX_VALUE`](#choice), [`REJECTED`](#choice) | |
 | [`CASE_LITERAL`](#choice) | a positional literal whose head names a tag case: a case construction carrying its elements as the payload, not a vector's lanes |
-| [`get`](#get) | |
+| [`get`](#get) | the expression `eid` as name resolution read it, a copy rewritten by its choice |
 
 | On `Head` | |
 | :--- | :--- |
@@ -56,6 +56,16 @@ pub def Choice: u8
 ```mach
 pub fun get(a: *mach.front.ast.Ast, choices: *Choice, count: usize, eid: mach.front.ast.id.ExprId) res[mach.front.ast.expr.Expr, mach.base.fail.Fail]
 ```
+
+the expression `eid` as name resolution read it, a copy rewritten by its choice
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the parsed tree |
+| `choices` | one choice per expression of the tree |
+| `count` | how many choices, which must equal the tree's expression count |
+| `eid` | the expression |
+| **returns** | the expression as read, or a failure when the choices do not match the tree, the id is out of range or the choice does not fit the node |
 
 ## Head
 

@@ -12,14 +12,14 @@ Source: [`src/manifest/version.mach`](../../../src/manifest/version.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Version`](#version) | `rec` |  |
+| [`Version`](#version) | `rec` | a semver version |
 | [`Range`](#range) | `rec` | every clause narrows one interval, so a range is an interval plus the releases whose pre-releases it names |
-| [`RangeError`](#rangeerror) | `rec` |  |
+| [`RangeError`](#rangeerror) | `rec` | why a range does not parse |
 
 | On `Version` | |
 | :--- | :--- |
 | [`parse_version`](#parse_version) | a full version, as a tag or a manifest names one; build metadata is ignored |
-| [`compare`](#compare) | |
+| [`compare`](#compare) | the semver precedence of `a` against `b`: below zero, zero or above zero |
 
 | On `Range` | |
 | :--- | :--- |
@@ -40,6 +40,16 @@ pub rec Version {
 }
 ```
 
+a semver version
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `major` | `u64` | the major component |
+| `minor` | `u64` | the minor component |
+| `patch` | `u64` | the patch component |
+| `pre` | `*u8` | the pre-release identifiers after the `-`, borrowed from the parsed text, nil for a release |
+| `pre_len` | `usize` | the bytes of `pre`, 0 for a release |
+
 ### parse_version
 
 ```mach
@@ -53,6 +63,8 @@ a full version, as a tag or a manifest names one; build metadata is ignored
 ```mach
 pub fun compare(a: *Version, b: *Version) i32
 ```
+
+the semver precedence of `a` against `b`: below zero, zero or above zero
 
 ## Range
 
@@ -93,4 +105,11 @@ pub rec RangeError {
     clause: u32;
 }
 ```
+
+why a range does not parse
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `reason` | `str` | what is wrong, a static string |
+| `clause` | `u32` | the 1-based clause it concerns |
 

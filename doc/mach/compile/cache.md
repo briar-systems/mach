@@ -59,7 +59,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`instance_key`](#instance_key) | the key of an instance: the configuration, its symbol and what it reads |
 | [`prepare`](#prepare) | once per load, after the load walk and the embedded inputs, before anything is resolved: key every module, read each emitted module's `obj/` object under its key and mark the modules the front end skips |
 | [`take_staged`](#take_staged) | hand the staged object to the query that publishes it; the facts stay with the module |
-| [`take_staged_test`](#take_staged_test) | |
+| [`take_staged_test`](#take_staged_test) | hand the staged test object to the query that publishes it, its facts staying with the module |
 | [`collect_tests`](#collect_tests) | a module's tests, from its lowered test unit or from the facts its restored test object carries |
 | [`source_table`](#source_table) | the session's files named by path, as a recorded store names them |
 | [`publish`](#publish) | a generated object carries its record into `obj/`: its key, its warnings and where they are placed, the instances it holds a copy of and, for a module that declares tests, the symbols it defines, which its test object declares |
@@ -319,6 +319,8 @@ hand the staged object to the query that publishes it; the facts stay with the m
 ```mach
 pub fun take_staged_test(p: *mach.compile.project.Project, m: *mach.compile.project.ModuleEntry) *Object
 ```
+
+hand the staged test object to the query that publishes it, its facts staying with the module
 
 ### collect_tests
 

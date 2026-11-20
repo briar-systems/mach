@@ -22,7 +22,7 @@ Uses types from [`mach.base.textbuild`](../../base/textbuild.md), [`mach.type`](
 
 | Functions | |
 | :--- | :--- |
-| [`names_append`](#names_append) | every name `#[gpu.builtin]` takes, quoted, as `"position", ... or "num_subgroups"`; a failed append is held by the builder |
+| [`names_append`](#names_append) | every name `#[gpu.builtin]` takes, quoted, as `"position", ..., or "num_subgroups"` |
 
 ---
 
@@ -80,6 +80,6 @@ the type the pipeline binds `b` at, as a diagnostic spells it
 pub fun names_append(b: *mach.base.textbuild.TextBuilder)
 ```
 
-every name `#[gpu.builtin]` takes, quoted, as `"position", ... or "num_subgroups"`; a
+every name `#[gpu.builtin]` takes, quoted, as `"position", ..., or "num_subgroups"`. a
 failed append is held by the builder
 

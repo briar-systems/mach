@@ -68,7 +68,8 @@ pub fun artifact_naming(a: *std.allocator.Allocator, t: *mach.target.resolved.Ta
 
 the name an artifact of kind `k` takes on the target, mink's system's name of the file of
 its output kind, an executable's under the linkage the target resolved to. refused, with
-mink's reason, where the system builds none
+mink's reason, where the system builds none, and an executable on a target of finished
+modules naming the kind it builds
 
 ## Functions
 

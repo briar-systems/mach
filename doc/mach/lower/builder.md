@@ -14,18 +14,23 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Builder`](#builder) | `rec` |  |
+| [`Builder`](#builder) | `rec` | the state lowering emits a module's code through |
 
 | On `Builder` | |
 | :--- | :--- |
 | [`init`](#init) | a builder over `m`, whose types the target's layout lays out under the build's context, with its stack slots in the address space `slots` |
-| [`dnit`](#dnit), [`fault`](#fault), [`failed`](#failed) | |
+| [`dnit`](#dnit) | release the builder's own storage, the module stays |
+| [`fault`](#fault) | keep `f` as the builder's failure unless one is already kept |
+| [`failed`](#failed) | whether lowering or mirl's builder has kept a failure |
 | [`done`](#done) | the first failure of the work: lowering's own, else the one mirl's builder kept |
-| [`after_err_pub`](#after_err_pub) | |
+| [`after_err_pub`](#after_err_pub) | mirl's refusal, once its builder has kept one, as lowering's failure |
 | [`bind_storage`](#bind_storage) | bind a variable to the stack slot `slot` holds it in: the slot's alloca names it |
 | [`state_publics`](#state_publics) | state the bytes of the stack slot `slot` that the source type of what it holds lays out as public, `ranges` as the module takes them: the public ranges of its alloca, which the walk of a constant-time function's code takes as typed frame extents, and every other byte of it as of a secret type |
 | [`bind_value`](#bind_value) | bind a variable to `v` from the cursor's point on |
-| [`take`](#take), [`take_type`](#take_type), [`take_err`](#take_err), [`types_of`](#types_of) | |
+| [`take`](#take) | the value `r` holds, a failure kept as the builder's |
+| [`take_type`](#take_type) | the type `r` holds, a failure kept as the builder's |
+| [`take_err`](#take_err) | keep the failure `r` holds as the builder's |
+| [`types_of`](#types_of) | the type table of the module being built |
 | [`ptr_type`](#ptr_type) | a pointer into the storage a function's own slots live in, which a pointer the source names no other storage of points into |
 | [`ptr_in`](#ptr_in) | a pointer into the address space `space` |
 | [`slot_space`](#slot_space) | the address space a stack slot lives in, as mirl's target states it |
@@ -33,18 +38,24 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`classes`](#classes) | whether the target's pointers name a storage class each, so a function's pointer parameters take the classes of the storage their arguments point into |
 | [`physical_space`](#physical_space) | the address space of a physical pointer where the target's pointers name a storage class each: the one space whose pointers the target models as addresses, as spir-v's PhysicalStorageBuffer |
 | [`is_physical`](#is_physical) | whether `ty` is a physical pointer |
-| [`int_type`](#int_type) | |
+| [`int_type`](#int_type) | the integer type of `bits`, a failure kept as the builder's |
 | [`index_type`](#index_type) | the integer as wide as a pointer, which addresses are compared and stepped in |
-| [`size_of`](#size_of), [`align_of`](#align_of), [`offset_of`](#offset_of) | |
+| [`size_of`](#size_of) | the byte size of `ty` under the target's layout, a failure kept as the builder's |
+| [`align_of`](#align_of) | the alignment in bytes an access of `ty` states, a failure kept as the builder's |
+| [`offset_of`](#offset_of) | the byte offset of member `member` of `ty`, a failure kept as the builder's |
 | [`enter`](#enter) | build in function `f`, whose entry block takes `params`, each secret as `secrets` says |
 | [`seal`](#seal) | end every block left open with unreachable: a block nothing branches to, such as the one after a return |
 | [`leave`](#leave) | leave the function: nothing is built until the next is entered |
-| [`in_function`](#in_function), [`function`](#function), [`block_make`](#block_make) | |
+| [`in_function`](#in_function) | whether a function is being built |
+| [`function`](#function) | the function being built |
+| [`block_make`](#block_make) | a new block of no parameters in the function being built |
 | [`block_make_with`](#block_make_with) | a block whose parameters are `params`, which every edge into it passes |
 | [`block_param`](#block_param) | parameter `i` of block `k`, typed `ty` |
-| [`set_block`](#set_block), [`block_terminated`](#block_terminated) | |
+| [`set_block`](#set_block) | move the cursor to the end of block `k` |
+| [`block_terminated`](#block_terminated) | whether block `k` already ends |
 | [`terminated`](#terminated) | whether the block being built already ends |
-| [`set_loc`](#set_loc), [`current_loc`](#current_loc) | |
+| [`set_loc`](#set_loc) | the source location of what is built next, recorded for debug info when it is on |
+| [`current_loc`](#current_loc) | the source location of what is being built |
 | [`location_of`](#location_of) | the debug table's location of a source location, none when it has no file |
 | [`set_secret`](#set_secret) | whether the next instructions are marked secret: a load, call or atomic read of a secret |
 | [`set_access`](#set_access) | the next accesses through an address state the memory they read or write as the source type says: secret, which marks them so, or public |
@@ -52,22 +63,53 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`set_volatile`](#set_volatile) | whether the next memory accesses are volatile |
 | [`set_kept`](#set_kept) | whether the next writes are kept: a wipe of memory that held a secret |
 | [`spec_constant`](#spec_constant) | the specialization constant `spec_id`, whose default is the integer or float constant `default` |
-| [`constant_of`](#constant_of) | |
+| [`constant_of`](#constant_of) | the module constant a constant value stands for |
 | [`use`](#use) | the mirl value `v` stands for in the function being built |
 | [`emit_store_marked`](#emit_store_marked) | a store marked volatile where `vol` holds: an access of a volatile place |
 | [`emit_load_marked`](#emit_load_marked) | a load marked volatile where `vol` holds |
-| [`emit_add`](#emit_add), [`emit_sub`](#emit_sub), [`emit_mul`](#emit_mul), [`emit_div_s`](#emit_div_s), [`emit_div_u`](#emit_div_u), [`emit_rem_s`](#emit_rem_s), [`emit_rem_u`](#emit_rem_u), [`emit_and`](#emit_and), [`emit_or`](#emit_or), [`emit_xor`](#emit_xor), [`emit_shl`](#emit_shl), [`emit_shr_s`](#emit_shr_s), [`emit_shr_u`](#emit_shr_u), [`emit_neg`](#emit_neg), [`emit_not`](#emit_not), [`emit_cmp_eq`](#emit_cmp_eq), [`emit_cmp_ne`](#emit_cmp_ne), [`emit_cmp_lt_s`](#emit_cmp_lt_s), [`emit_cmp_lt_u`](#emit_cmp_lt_u), [`emit_cmp_le_s`](#emit_cmp_le_s), [`emit_cmp_le_u`](#emit_cmp_le_u), [`emit_cmp_gt_s`](#emit_cmp_gt_s), [`emit_cmp_gt_u`](#emit_cmp_gt_u), [`emit_cmp_ge_s`](#emit_cmp_ge_s), [`emit_cmp_ge_u`](#emit_cmp_ge_u) | |
+| [`emit_add`](#emit_add) | the sum of `x` and `y`: a pointer and an integer step the pointer by that many bytes, floats add as floats |
+| [`emit_sub`](#emit_sub) | `x` minus `y`: a pointer less an integer steps the pointer back by that many bytes, two pointers give the difference of their addresses, floats subtract as floats |
+| [`emit_mul`](#emit_mul) | the product of `x` and `y`, floats multiplied as floats |
+| [`emit_div_s`](#emit_div_s) | `x` divided by `y` as signed integers, floats divided as floats |
+| [`emit_div_u`](#emit_div_u) | `x` divided by `y` as unsigned integers, floats divided as floats |
+| [`emit_rem_s`](#emit_rem_s) | the remainder of `x` divided by `y` as signed integers, floats as floats |
+| [`emit_rem_u`](#emit_rem_u) | the remainder of `x` divided by `y` as unsigned integers, floats as floats |
+| [`emit_and`](#emit_and) | the bitwise and of `x` and `y` |
+| [`emit_or`](#emit_or) | the bitwise or of `x` and `y` |
+| [`emit_xor`](#emit_xor) | the bitwise exclusive or of `x` and `y` |
+| [`emit_shl`](#emit_shl) | `x` shifted left by `n`, the count resized or splat to `x`'s type |
+| [`emit_shr_s`](#emit_shr_s) | `x` shifted right, filling with its sign bit by `n`, the count resized or splat to `x`'s type |
+| [`emit_shr_u`](#emit_shr_u) | `x` shifted right, filling with zeros by `n`, the count resized or splat to `x`'s type |
+| [`emit_neg`](#emit_neg) | `x` negated, a float as a float |
+| [`emit_not`](#emit_not) | the bitwise complement of `x` |
+| [`emit_cmp_eq`](#emit_cmp_eq) | whether `x` equals `y`, as a bool byte: pointers compare their addresses, floats compared ordered |
+| [`emit_cmp_ne`](#emit_cmp_ne) | whether `x` differs from `y`, as a bool byte: pointers compare their addresses, floats compared unordered, so a nan differs |
+| [`emit_cmp_lt_s`](#emit_cmp_lt_s) | whether `x` is less than `y` as signed integers, as a bool byte: pointers compare their addresses, floats compared ordered |
+| [`emit_cmp_lt_u`](#emit_cmp_lt_u) | whether `x` is less than `y` as unsigned integers, as a bool byte: pointers compare their addresses, floats compared ordered |
+| [`emit_cmp_le_s`](#emit_cmp_le_s) | whether `x` is at most `y` as signed integers, as a bool byte: pointers compare their addresses, floats compared ordered |
+| [`emit_cmp_le_u`](#emit_cmp_le_u) | whether `x` is at most `y` as unsigned integers, as a bool byte: pointers compare their addresses, floats compared ordered |
+| [`emit_cmp_gt_s`](#emit_cmp_gt_s) | whether `x` is greater than `y` as signed integers, as a bool byte: pointers compare their addresses, floats compared ordered |
+| [`emit_cmp_gt_u`](#emit_cmp_gt_u) | whether `x` is greater than `y` as unsigned integers, as a bool byte: pointers compare their addresses, floats compared ordered |
+| [`emit_cmp_ge_s`](#emit_cmp_ge_s) | whether `x` is at least `y` as signed integers, as a bool byte: pointers compare their addresses, floats compared ordered |
+| [`emit_cmp_ge_u`](#emit_cmp_ge_u) | whether `x` is at least `y` as unsigned integers, as a bool byte: pointers compare their addresses, floats compared ordered |
 | [`emit_vcompare`](#emit_vcompare) | a lanewise comparison of two vectors as a mask of `result_ty`, every bit of a lane set where it holds |
 | [`truth`](#truth) | an i1 that holds where a bool byte, or any integer, is not zero |
 | [`resize_int`](#resize_int) | an integer of `to`'s width from `x`: kept, truncated or extended by `signed` |
-| [`emit_trunc`](#emit_trunc), [`emit_sext`](#emit_sext), [`emit_zext`](#emit_zext), [`emit_fp_trunc`](#emit_fp_trunc), [`emit_fp_ext`](#emit_fp_ext) | |
+| [`emit_trunc`](#emit_trunc) | `x` resized to the integer width of `to`, truncated or zero extended |
+| [`emit_sext`](#emit_sext) | `x` resized to the integer width of `to`, truncated or sign extended |
+| [`emit_zext`](#emit_zext) | `x` resized to the integer width of `to`, truncated or zero extended |
+| [`emit_fp_trunc`](#emit_fp_trunc) | `x` demoted to the float type `to`, `x` itself when it already is one |
+| [`emit_fp_ext`](#emit_fp_ext) | `x` promoted to the float type `to`, `x` itself when it already is one |
 | [`emit_fp_resize`](#emit_fp_resize) | a float of `to`'s format from `x`, promoted or demoted |
-| [`emit_fp_to_si`](#emit_fp_to_si), [`emit_fp_to_ui`](#emit_fp_to_ui), [`emit_si_to_fp`](#emit_si_to_fp), [`emit_ui_to_fp`](#emit_ui_to_fp) | |
+| [`emit_fp_to_si`](#emit_fp_to_si) | the float `x` converted to the signed integer type `to` |
+| [`emit_fp_to_ui`](#emit_fp_to_ui) | the float `x` converted to the unsigned integer type `to` |
+| [`emit_si_to_fp`](#emit_si_to_fp) | the signed integer `x` converted to the float type `to` |
+| [`emit_ui_to_fp`](#emit_ui_to_fp) | the unsigned integer `x` converted to the float type `to` |
 | [`emit_bitcast`](#emit_bitcast) | the same bits as `to`: an address read as an integer and back, a resize between integers of different widths, or a reinterpretation of equal widths |
 | [`emit_classify`](#emit_classify) | `x` made secret: a block parameter declared secret, which the branch into it passes `x` |
-| [`emit_declassify`](#emit_declassify) | |
+| [`emit_declassify`](#emit_declassify) | `x` made public: a constant as it is, an aggregate copied a word at a time into a public slot of its own, any other value through a declassify |
 | [`emit_alloca`](#emit_alloca) | a stack slot of `ty`, made in the entry block so every path reaches it |
-| [`alloca_aligned`](#alloca_aligned) | |
+| [`alloca_aligned`](#alloca_aligned) | a stack slot of `ty` aligned to `align`, made in the entry block so every path reaches it |
 | [`emit_whole`](#emit_whole) | the aggregate `v` held whole: itself where it is, a constant as its own value, and one at an address read from it whole, as secret as `v` and stated as its type |
 | [`emit_extract`](#emit_extract) | member `k` of the aggregate `v` held whole: a structure's member, an array's element or a union's member read from its first byte |
 | [`emit_insert`](#emit_insert) | the aggregate `v` held whole with member `k` replaced by `part`, held whole where it is an aggregate |
@@ -86,31 +128,56 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`emit_step`](#emit_step) | the address `ix` elements of `elem` past `addr`, as a pointer steps |
 | [`emit_splat`](#emit_splat) | a vector of `ty` with `scalar` in every lane |
 | [`emit_vec_extract`](#emit_vec_extract) | lane `lane` of `vec`, read as `ty`: a constant lane is read in place, any other through the vector's bytes in a slot |
-| [`emit_vec_insert`](#emit_vec_insert) | |
+| [`emit_vec_insert`](#emit_vec_insert) | `vec` with lane `lane` replaced by `x`: a constant lane in place, any other through the vector's bytes in a slot |
 | [`emit_vec_build`](#emit_vec_build) | a vector of `ty` from one value per lane |
 | [`emit_shuffle`](#emit_shuffle) | lanes of `x` and `y` joined, picked by `picks`, as a vector of `ty` |
 | [`emit_unary`](#emit_unary) | a lanewise or scalar operation of one operand |
 | [`emit_binary`](#emit_binary) | a lanewise or scalar operation of two operands |
 | [`emit_ternary`](#emit_ternary) | a lanewise or scalar operation of three operands |
 | [`emit_atomic_load`](#emit_atomic_load) | an atomic read of the integer `ty` at `addr` |
-| [`emit_atomic_store`](#emit_atomic_store) | |
+| [`emit_atomic_store`](#emit_atomic_store) | an atomic write of `x` to `addr` |
 | [`emit_atomic_rmw`](#emit_atomic_rmw) | an atomic read-modify-write, giving the value held before |
 | [`emit_atomic_cmpxchg`](#emit_atomic_cmpxchg) | an atomic compare and exchange, giving the value held before |
-| [`emit_fence`](#emit_fence) | |
+| [`emit_fence`](#emit_fence) | a memory fence of `order` |
 | [`emit_call`](#emit_call) | a call of `callee` through the signature `sig`, every argument named |
 | [`emit_call_named`](#emit_call_named) | a call of `callee` through the signature `sig`, of which `named` states how many arguments are named, the rest being a C-variadic call's unnamed ones |
+| [`call_states`](#call_states) | the declaration the next call, one through a value of a function type marked constant time, states its callee keeps (`lower_context.stated_callee`) |
 | [`result_whole`](#result_whole) | hold the next call's aggregate result whole, with no slot, unless it lands in a destination |
 | [`result_into`](#result_into) | land the next call's aggregate result in `slot`, storage of the result's type nothing reads yet |
 | [`param`](#param) | parameter `i` of the function being built, of `ty`: an aggregate held `whole` is the parameter itself, and any other lands in a slot of its own, whose address is the value |
-| [`emit_br`](#emit_br) | |
+| [`emit_br`](#emit_br) | end the block with a branch to `target`, which takes no arguments |
 | [`emit_br_args`](#emit_br_args) | a branch to `target`, passing one argument per parameter of it |
-| [`emit_cbr`](#emit_cbr) | |
-| [`emit_switch`](#emit_switch) | a branch on `sel` to the target of the case it equals, else to `otherwise` |
+| [`emit_cbr`](#emit_cbr) | end the block with a branch on `c`, compared with zero, to `then_b` or `else_b` |
+| [`emit_switch`](#emit_switch) | a branch on `selector` to the target of the case it equals, else to `otherwise` |
 | [`emit_ret`](#emit_ret) | return `v` from the function being built: an aggregate is read whole from its address, as secret as `v` is |
-| [`emit_ret_void`](#emit_ret_void) | |
+| [`emit_ret_void`](#emit_ret_void) | end the block with a return of no value |
 | [`emit_asm`](#emit_asm) | an inline assembly block at the cursor, binding the `n` values at `values` in its operands' order |
 | [`emit_target_op`](#emit_target_op) | the target op `op` at the cursor over the `n` values at `values`, in its operands' order, its result the one `op` states or none, a pointer's in the space its caller places it |
-| [`emit_unreachable`](#emit_unreachable), [`add`](#add), [`sub`](#sub), [`mul`](#mul), [`band`](#band), [`bor`](#bor), [`bxor`](#bxor), [`shl`](#shl), [`shr_u`](#shr_u), [`shr_s`](#shr_s), [`eq`](#eq), [`ne`](#ne), [`lt_s`](#lt_s), [`lt_u`](#lt_u), [`le_u`](#le_u), [`trunc`](#trunc), [`zext`](#zext), [`sext`](#sext), [`bitcast`](#bitcast), [`br`](#br), [`cbr`](#cbr) | |
+| [`emit_unreachable`](#emit_unreachable) | end the block as unreachable |
+| [`add`](#add) | emit_add with a failure kept as the builder's |
+| [`sub`](#sub) | emit_sub with a failure kept as the builder's |
+| [`mul`](#mul) | emit_mul with a failure kept as the builder's |
+| [`band`](#band) | emit_and with a failure kept as the builder's |
+| [`bor`](#bor) | emit_or with a failure kept as the builder's |
+| [`bxor`](#bxor) | emit_xor with a failure kept as the builder's |
+| [`shl`](#shl) | emit_shl with a failure kept as the builder's |
+| [`shr_u`](#shr_u) | emit_shr_u with a failure kept as the builder's |
+| [`shr_s`](#shr_s) | emit_shr_s with a failure kept as the builder's |
+| [`eq`](#eq) | emit_cmp_eq with a failure kept as the builder's |
+| [`ne`](#ne) | emit_cmp_ne with a failure kept as the builder's |
+| [`lt_s`](#lt_s) | emit_cmp_lt_s with a failure kept as the builder's |
+| [`lt_u`](#lt_u) | emit_cmp_lt_u with a failure kept as the builder's |
+| [`le_u`](#le_u) | emit_cmp_le_u with a failure kept as the builder's |
+| [`trunc`](#trunc) | emit_trunc with a failure kept as the builder's |
+| [`zext`](#zext) | emit_zext with a failure kept as the builder's |
+| [`sext`](#sext) | emit_sext with a failure kept as the builder's |
+| [`bitcast`](#bitcast) | emit_bitcast with a failure kept as the builder's |
+| [`br`](#br) | emit_br with a failure kept as the builder's |
+| [`cbr`](#cbr) | emit_cbr with a failure kept as the builder's |
+
+| Functions | |
+| :--- | :--- |
+| [`module_refusal`](#module_refusal) | mirl's refusal of what `what` names, as lowering's failure: storage refused where it stands for that, else a defect of the lowering |
 
 ---
 
@@ -132,7 +199,9 @@ pub rec Builder {
     into:     mach.lower.value.Value;
     into_set: bool;
     # the next call's aggregate result is held whole, with no slot
-    whole:    bool;
+    whole: bool;
+    # the declaration the next call, one through a value, states its callee keeps
+    callee:   opt[mirl.ir.id.Stated];
     ended:    std.collections.vector.Vector[bool];
     secret:   bool;
     stated:   bool;
@@ -144,6 +213,34 @@ pub rec Builder {
     failure:  opt[mach.base.fail.Fail];
 }
 ```
+
+the state lowering emits a module's code through
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `m` | `*mirl.ir.module.Module` | the module being built |
+| `a` | `*std.allocator.Allocator` | allocator for the builder's own scratch |
+| `mb` | `mirl.build.builder.Builder` | mirl's builder, which holds the cursor |
+| `target` | `*mirl.target.record.Target` | the target the module is built for |
+| `layout` | `mirl.target.layout.Layout` | the target's layout of the module's types |
+| `slots` | `u32` | the address space stack slots live in |
+| `fn` | `opt[mirl.ir.id.Function]` | the function being built, none between functions |
+| `entry` | `mirl.ir.id.Block` | the entry block of the function being built |
+| `block` | `mirl.ir.id.Block` | the block the cursor is in |
+| `allocas` | `u32` | stack slots made so far at the head of the entry block |
+| `into` | `mach.lower.value.Value` | the slot the next call's aggregate result lands in |
+| `into_set` | `bool` | whether into is set |
+| `whole` | `bool` | the next call's aggregate result is held whole |
+| `callee` | `opt[mirl.ir.id.Stated]` | the declaration the next call, one through a value, states its callee keeps |
+| `ended` | `std.collections.vector.Vector[bool]` | per block, whether it already ends |
+| `secret` | `bool` | whether the next instructions are marked secret |
+| `stated` | `bool` | whether the next accesses state the memory they reach |
+| `volatile` | `bool` | whether the next memory accesses are volatile |
+| `loc` | `mach.base.source.Location` | the source location of what is being built |
+| `debug` | `bool` | whether locations are recorded for debug info |
+| `sources` | `*mach.base.source.SourceMap` | the source files locations are read against |
+| `files` | `std.collections.vector.Vector[u32]` | per source file, its debug table file, NO_FILE before one is made |
+| `failure` | `opt[mach.base.fail.Fail]` | lowering's first failure, kept until done |
 
 ### init
 
@@ -160,17 +257,37 @@ with its stack slots in the address space `slots`
 pub fun dnit(b: *Builder)
 ```
 
+release the builder's own storage, the module stays
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+
 ### fault
 
 ```mach
 pub fun fault(b: *Builder, f: mach.base.fail.Fail)
 ```
 
+keep `f` as the builder's failure unless one is already kept
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `f` | the failure |
+
 ### failed
 
 ```mach
 pub fun failed(b: *Builder) bool
 ```
+
+whether lowering or mirl's builder has kept a failure
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| **returns** | true once either has failed |
 
 ### done
 
@@ -185,6 +302,13 @@ the first failure of the work: lowering's own, else the one mirl's builder kept
 ```mach
 pub fun after_err_pub(b: *Builder) err[mach.base.fail.Fail]
 ```
+
+mirl's refusal, once its builder has kept one, as lowering's failure
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| **returns** | nothing, or the refusal |
 
 ### bind_storage
 
@@ -218,11 +342,27 @@ bind a variable to `v` from the cursor's point on
 pub fun take(b: *Builder, r: res[mach.lower.value.Value, mach.base.fail.Fail]) mach.lower.value.Value
 ```
 
+the value `r` holds, a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `r` | a result of an emission |
+| **returns** | the value, or none on failure |
+
 ### take_type
 
 ```mach
 pub fun take_type(b: *Builder, r: res[Type, mach.base.fail.Fail]) Type
 ```
+
+the type `r` holds, a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `r` | a result naming a type |
+| **returns** | the type, or irt.NONE on failure |
 
 ### take_err
 
@@ -230,11 +370,25 @@ pub fun take_type(b: *Builder, r: res[Type, mach.base.fail.Fail]) Type
 pub fun take_err(b: *Builder, r: err[mach.base.fail.Fail])
 ```
 
+keep the failure `r` holds as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `r` | an outcome of an emission |
+
 ### types_of
 
 ```mach
 pub fun types_of(b: *Builder) *mirl.ir.type.table.Table
 ```
+
+the type table of the module being built
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| **returns** | the table, borrowed from the module |
 
 ### ptr_type
 
@@ -304,6 +458,14 @@ whether `ty` is a physical pointer
 pub fun int_type(b: *Builder, bits: u32) Type
 ```
 
+the integer type of `bits`, a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `bits` | width in bits |
+| **returns** | the type, or irt.NONE on failure |
+
 ### index_type
 
 ```mach
@@ -320,17 +482,42 @@ is a 32-bit word, as spir-v writes a constant index
 pub fun size_of(b: *Builder, ty: Type) u64
 ```
 
+the byte size of `ty` under the target's layout, a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `ty` | the type |
+| **returns** | the size, or 0 on failure |
+
 ### align_of
 
 ```mach
 pub fun align_of(b: *Builder, ty: Type) u64
 ```
 
+the alignment in bytes an access of `ty` states, a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `ty` | the type |
+| **returns** | the alignment, 1 for any pointer where pointers name a storage class, for a handle, or on failure |
+
 ### offset_of
 
 ```mach
 pub fun offset_of(b: *Builder, ty: Type, member: u32) u64
 ```
+
+the byte offset of member `member` of `ty`, a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `ty` | the aggregate type |
+| `member` | the member's index |
+| **returns** | the offset, or 0 on failure |
 
 ### enter
 
@@ -363,17 +550,38 @@ leave the function: nothing is built until the next is entered
 pub fun in_function(b: *Builder) bool
 ```
 
+whether a function is being built
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| **returns** | true between enter and leave |
+
 ### function
 
 ```mach
 pub fun function(b: *Builder) mirl.ir.id.Function
 ```
 
+the function being built
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| **returns** | its id, or 0xFFFFFFFF outside a function |
+
 ### block_make
 
 ```mach
 pub fun block_make(b: *Builder) res[mirl.ir.id.Block, mach.base.fail.Fail]
 ```
+
+a new block of no parameters in the function being built
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| **returns** | the block, or the builder's failure |
 
 ### block_make_with
 
@@ -397,11 +605,26 @@ parameter `i` of block `k`, typed `ty`
 pub fun set_block(b: *Builder, k: mirl.ir.id.Block)
 ```
 
+move the cursor to the end of block `k`
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `k` | the block to build in |
+
 ### block_terminated
 
 ```mach
 pub fun block_terminated(b: *Builder, k: mirl.ir.id.Block) bool
 ```
+
+whether block `k` already ends
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `k` | the block |
+| **returns** | true once a terminator was built in it |
 
 ### terminated
 
@@ -417,11 +640,25 @@ whether the block being built already ends
 pub fun set_loc(b: *Builder, loc: mach.base.source.Location)
 ```
 
+the source location of what is built next, recorded for debug info when it is on
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `loc` | the location |
+
 ### current_loc
 
 ```mach
 pub fun current_loc(b: *Builder) mach.base.source.Location
 ```
+
+the source location of what is being built
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| **returns** | the location set_loc last set |
 
 ### location_of
 
@@ -487,6 +724,14 @@ the specialization constant `spec_id`, whose default is the integer or float con
 pub fun constant_of(b: *Builder, v: mach.lower.value.Value) mirl.ir.id.Constant
 ```
 
+the module constant a constant value stands for
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `v` | an integer, float, nil, constant, global or function value |
+| **returns** | the constant, or 0xFFFFFFFF with the builder faulted for any other value |
+
 ### use
 
 ```mach
@@ -517,11 +762,31 @@ a load marked volatile where `vol` holds
 pub fun emit_add(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+the sum of `x` and `y`: a pointer and an integer step the pointer by that many
+bytes, floats add as floats
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_sub
 
 ```mach
 pub fun emit_sub(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+`x` minus `y`: a pointer less an integer steps the pointer back by that many bytes,
+two pointers give the difference of their addresses, floats subtract as floats
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or the refusal of a logical pointer's address or mirl's failure |
 
 ### emit_mul
 
@@ -529,11 +794,29 @@ pub fun emit_sub(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Val
 pub fun emit_mul(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+the product of `x` and `y`, floats multiplied as floats
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_div_s
 
 ```mach
 pub fun emit_div_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+`x` divided by `y` as signed integers, floats divided as floats
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or the failure mirl's builder kept |
 
 ### emit_div_u
 
@@ -541,11 +824,29 @@ pub fun emit_div_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.V
 pub fun emit_div_u(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+`x` divided by `y` as unsigned integers, floats divided as floats
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_rem_s
 
 ```mach
 pub fun emit_rem_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+the remainder of `x` divided by `y` as signed integers, floats as floats
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or the failure mirl's builder kept |
 
 ### emit_rem_u
 
@@ -553,11 +854,29 @@ pub fun emit_rem_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.V
 pub fun emit_rem_u(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+the remainder of `x` divided by `y` as unsigned integers, floats as floats
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_and
 
 ```mach
 pub fun emit_and(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+the bitwise and of `x` and `y`
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or the failure mirl's builder kept |
 
 ### emit_or
 
@@ -565,11 +884,29 @@ pub fun emit_and(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Val
 pub fun emit_or(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+the bitwise or of `x` and `y`
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_xor
 
 ```mach
 pub fun emit_xor(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+the bitwise exclusive or of `x` and `y`
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or the failure mirl's builder kept |
 
 ### emit_shl
 
@@ -577,11 +914,29 @@ pub fun emit_xor(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Val
 pub fun emit_shl(b: *Builder, x: mach.lower.value.Value, n: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+`x` shifted left by `n`, the count resized or splat to `x`'s type
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the value shifted |
+| `n` | the shift count |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_shr_s
 
 ```mach
 pub fun emit_shr_s(b: *Builder, x: mach.lower.value.Value, n: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+`x` shifted right, filling with its sign bit by `n`, the count resized or splat to `x`'s type
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the value shifted |
+| `n` | the shift count |
+| **returns** | the result, or the failure mirl's builder kept |
 
 ### emit_shr_u
 
@@ -589,11 +944,28 @@ pub fun emit_shr_s(b: *Builder, x: mach.lower.value.Value, n: mach.lower.value.V
 pub fun emit_shr_u(b: *Builder, x: mach.lower.value.Value, n: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+`x` shifted right, filling with zeros by `n`, the count resized or splat to `x`'s type
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the value shifted |
+| `n` | the shift count |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_neg
 
 ```mach
 pub fun emit_neg(b: *Builder, x: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+`x` negated, a float as a float
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the operand |
+| **returns** | the result, or the failure mirl's builder kept |
 
 ### emit_not
 
@@ -601,11 +973,29 @@ pub fun emit_neg(b: *Builder, x: mach.lower.value.Value) res[mach.lower.value.Va
 pub fun emit_not(b: *Builder, x: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+the bitwise complement of `x`
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the operand |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_cmp_eq
 
 ```mach
 pub fun emit_cmp_eq(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+whether `x` equals `y`, as a bool byte: pointers compare their addresses,
+floats compared ordered
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the bool byte, or the refusal of a logical pointer's address or mirl's failure |
 
 ### emit_cmp_ne
 
@@ -613,11 +1003,31 @@ pub fun emit_cmp_eq(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.
 pub fun emit_cmp_ne(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+whether `x` differs from `y`, as a bool byte: pointers compare their addresses,
+floats compared unordered, so a nan differs
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the bool byte, or the refusal of a logical pointer's address or mirl's failure |
+
 ### emit_cmp_lt_s
 
 ```mach
 pub fun emit_cmp_lt_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+whether `x` is less than `y` as signed integers, as a bool byte: pointers compare their addresses,
+floats compared ordered
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the bool byte, or the refusal of a logical pointer's address or mirl's failure |
 
 ### emit_cmp_lt_u
 
@@ -625,11 +1035,31 @@ pub fun emit_cmp_lt_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.valu
 pub fun emit_cmp_lt_u(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+whether `x` is less than `y` as unsigned integers, as a bool byte: pointers compare their addresses,
+floats compared ordered
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the bool byte, or the refusal of a logical pointer's address or mirl's failure |
+
 ### emit_cmp_le_s
 
 ```mach
 pub fun emit_cmp_le_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+whether `x` is at most `y` as signed integers, as a bool byte: pointers compare their addresses,
+floats compared ordered
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the bool byte, or the refusal of a logical pointer's address or mirl's failure |
 
 ### emit_cmp_le_u
 
@@ -637,11 +1067,31 @@ pub fun emit_cmp_le_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.valu
 pub fun emit_cmp_le_u(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+whether `x` is at most `y` as unsigned integers, as a bool byte: pointers compare their addresses,
+floats compared ordered
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the bool byte, or the refusal of a logical pointer's address or mirl's failure |
+
 ### emit_cmp_gt_s
 
 ```mach
 pub fun emit_cmp_gt_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+whether `x` is greater than `y` as signed integers, as a bool byte: pointers compare their addresses,
+floats compared ordered
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the bool byte, or the refusal of a logical pointer's address or mirl's failure |
 
 ### emit_cmp_gt_u
 
@@ -649,17 +1099,47 @@ pub fun emit_cmp_gt_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.valu
 pub fun emit_cmp_gt_u(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+whether `x` is greater than `y` as unsigned integers, as a bool byte: pointers compare their addresses,
+floats compared ordered
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the bool byte, or the refusal of a logical pointer's address or mirl's failure |
+
 ### emit_cmp_ge_s
 
 ```mach
 pub fun emit_cmp_ge_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+whether `x` is at least `y` as signed integers, as a bool byte: pointers compare their addresses,
+floats compared ordered
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the bool byte, or the refusal of a logical pointer's address or mirl's failure |
+
 ### emit_cmp_ge_u
 
 ```mach
 pub fun emit_cmp_ge_u(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+whether `x` is at least `y` as unsigned integers, as a bool byte: pointers compare their addresses,
+floats compared ordered
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the bool byte, or the refusal of a logical pointer's address or mirl's failure |
 
 ### emit_vcompare
 
@@ -691,11 +1171,29 @@ an integer of `to`'s width from `x`: kept, truncated or extended by `signed`
 pub fun emit_trunc(b: *Builder, x: mach.lower.value.Value, to: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+`x` resized to the integer width of `to`, truncated or zero extended
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the integer |
+| `to` | the integer type |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_sext
 
 ```mach
 pub fun emit_sext(b: *Builder, x: mach.lower.value.Value, to: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+`x` resized to the integer width of `to`, truncated or sign extended
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the integer |
+| `to` | the integer type |
+| **returns** | the result, or the failure mirl's builder kept |
 
 ### emit_zext
 
@@ -703,17 +1201,44 @@ pub fun emit_sext(b: *Builder, x: mach.lower.value.Value, to: Type) res[mach.low
 pub fun emit_zext(b: *Builder, x: mach.lower.value.Value, to: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+`x` resized to the integer width of `to`, truncated or zero extended
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the integer |
+| `to` | the integer type |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_fp_trunc
 
 ```mach
 pub fun emit_fp_trunc(b: *Builder, x: mach.lower.value.Value, to: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+`x` demoted to the float type `to`, `x` itself when it already is one
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the float |
+| `to` | the narrower float type |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_fp_ext
 
 ```mach
 pub fun emit_fp_ext(b: *Builder, x: mach.lower.value.Value, to: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+`x` promoted to the float type `to`, `x` itself when it already is one
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the float |
+| `to` | the wider float type |
+| **returns** | the result, or the failure mirl's builder kept |
 
 ### emit_fp_resize
 
@@ -729,11 +1254,29 @@ a float of `to`'s format from `x`, promoted or demoted
 pub fun emit_fp_to_si(b: *Builder, x: mach.lower.value.Value, to: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+the float `x` converted to the signed integer type `to`
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the float |
+| `to` | the integer type |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_fp_to_ui
 
 ```mach
 pub fun emit_fp_to_ui(b: *Builder, x: mach.lower.value.Value, to: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+the float `x` converted to the unsigned integer type `to`
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the float |
+| `to` | the integer type |
+| **returns** | the result, or the failure mirl's builder kept |
 
 ### emit_si_to_fp
 
@@ -741,11 +1284,29 @@ pub fun emit_fp_to_ui(b: *Builder, x: mach.lower.value.Value, to: Type) res[mach
 pub fun emit_si_to_fp(b: *Builder, x: mach.lower.value.Value, to: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+the signed integer `x` converted to the float type `to`
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the integer |
+| `to` | the float type |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_ui_to_fp
 
 ```mach
 pub fun emit_ui_to_fp(b: *Builder, x: mach.lower.value.Value, to: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+the unsigned integer `x` converted to the float type `to`
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the integer |
+| `to` | the float type |
+| **returns** | the result, or the failure mirl's builder kept |
 
 ### emit_bitcast
 
@@ -770,6 +1331,15 @@ pub fun emit_classify(b: *Builder, x: mach.lower.value.Value) res[mach.lower.val
 pub fun emit_declassify(b: *Builder, x: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+`x` made public: a constant as it is, an aggregate copied a word at a time
+into a public slot of its own, any other value through a declassify
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the value |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_alloca
 
 ```mach
@@ -783,6 +1353,16 @@ a stack slot of `ty`, made in the entry block so every path reaches it
 ```mach
 pub fun alloca_aligned(b: *Builder, ty: Type, align: u64) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+a stack slot of `ty` aligned to `align`, made in the entry block so every path
+reaches it
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `ty` | the type the slot holds |
+| `align` | the slot's alignment in bytes |
+| **returns** | the slot's address, or the refusal outside a function or mirl's failure |
 
 ### emit_whole
 
@@ -953,6 +1533,17 @@ the vector's bytes in a slot
 pub fun emit_vec_insert(b: *Builder, vec: mach.lower.value.Value, lane: mach.lower.value.Value, x: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+`vec` with lane `lane` replaced by `x`: a constant lane in place, any other
+through the vector's bytes in a slot
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `vec` | the vector |
+| `lane` | the lane index |
+| `x` | the new lane value |
+| **returns** | the result, or the failure mirl's builder kept |
+
 ### emit_vec_build
 
 ```mach
@@ -1007,6 +1598,16 @@ an atomic read of the integer `ty` at `addr`
 pub fun emit_atomic_store(b: *Builder, addr: mach.lower.value.Value, x: mach.lower.value.Value, order: Ordering) err[mach.base.fail.Fail]
 ```
 
+an atomic write of `x` to `addr`
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `addr` | the address written |
+| `x` | the value written |
+| `order` | the memory ordering |
+| **returns** | nothing, or the failure mirl's builder kept |
+
 ### emit_atomic_rmw
 
 ```mach
@@ -1029,6 +1630,14 @@ an atomic compare and exchange, giving the value held before
 pub fun emit_fence(b: *Builder, order: Ordering) err[mach.base.fail.Fail]
 ```
 
+a memory fence of `order`
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `order` | the memory ordering |
+| **returns** | nothing, or the failure mirl's builder kept |
+
 ### emit_call
 
 ```mach
@@ -1047,6 +1656,15 @@ pub fun emit_call_named(b: *Builder, callee: mach.lower.value.Value, sig: Type, 
 
 a call of `callee` through the signature `sig`, of which `named` states how many
 arguments are named, the rest being a C-variadic call's unnamed ones
+
+### call_states
+
+```mach
+pub fun call_states(b: *Builder, callee: opt[mirl.ir.id.Stated])
+```
+
+the declaration the next call, one through a value of a function type marked constant time, states its callee
+keeps (`lower_context.stated_callee`)
 
 ### result_whole
 
@@ -1079,6 +1697,14 @@ parameter itself, and any other lands in a slot of its own, whose address is the
 pub fun emit_br(b: *Builder, target: mirl.ir.id.Block) err[mach.base.fail.Fail]
 ```
 
+end the block with a branch to `target`, which takes no arguments
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `target` | the block branched to |
+| **returns** | nothing, or the failure mirl's builder kept |
+
 ### emit_br_args
 
 ```mach
@@ -1093,13 +1719,23 @@ a branch to `target`, passing one argument per parameter of it
 pub fun emit_cbr(b: *Builder, c: mach.lower.value.Value, then_b: mirl.ir.id.Block, else_b: mirl.ir.id.Block) err[mach.base.fail.Fail]
 ```
 
+end the block with a branch on `c`, compared with zero, to `then_b` or `else_b`
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `c` | the condition, an i1 or any integer |
+| `then_b` | the block taken where `c` holds |
+| `else_b` | the block taken otherwise |
+| **returns** | nothing, or the failure mirl's builder kept |
+
 ### emit_switch
 
 ```mach
 pub fun emit_switch(b: *Builder, selector: mach.lower.value.Value, otherwise: mirl.ir.id.Block, cases: *u64, targets: *mirl.ir.id.Block, n: u32) err[mach.base.fail.Fail]
 ```
 
-a branch on `sel` to the target of the case it equals, else to `otherwise`. `cases` holds
+a branch on `selector` to the target of the case it equals, else to `otherwise`. `cases` holds
 strictly increasing values, one per target
 
 ### emit_ret
@@ -1116,6 +1752,13 @@ secret as `v` is
 ```mach
 pub fun emit_ret_void(b: *Builder) err[mach.base.fail.Fail]
 ```
+
+end the block with a return of no value
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| **returns** | nothing, or the failure mirl's builder kept |
 
 ### emit_asm
 
@@ -1142,11 +1785,27 @@ instruction copies the op, so it may be borrowed
 pub fun emit_unreachable(b: *Builder) err[mach.base.fail.Fail]
 ```
 
+end the block as unreachable
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| **returns** | nothing, or the failure mirl's builder kept |
+
 ### add
 
 ```mach
 pub fun add(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
+
+emit_add with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or none with the failure kept as the builder's |
 
 ### sub
 
@@ -1154,11 +1813,29 @@ pub fun add(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) m
 pub fun sub(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
 
+emit_sub with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or none with the failure kept as the builder's |
+
 ### mul
 
 ```mach
 pub fun mul(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
+
+emit_mul with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or none with the failure kept as the builder's |
 
 ### band
 
@@ -1166,11 +1843,29 @@ pub fun mul(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) m
 pub fun band(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
 
+emit_and with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or none with the failure kept as the builder's |
+
 ### bor
 
 ```mach
 pub fun bor(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
+
+emit_or with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or none with the failure kept as the builder's |
 
 ### bxor
 
@@ -1178,11 +1873,29 @@ pub fun bor(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) m
 pub fun bxor(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
 
+emit_xor with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or none with the failure kept as the builder's |
+
 ### shl
 
 ```mach
 pub fun shl(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
+
+emit_shl with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the value shifted |
+| `y` | the shift count |
+| **returns** | the result, or none with the failure kept as the builder's |
 
 ### shr_u
 
@@ -1190,11 +1903,29 @@ pub fun shl(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) m
 pub fun shr_u(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
 
+emit_shr_u with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the value shifted |
+| `y` | the shift count |
+| **returns** | the result, or none with the failure kept as the builder's |
+
 ### shr_s
 
 ```mach
 pub fun shr_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
+
+emit_shr_s with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the value shifted |
+| `y` | the shift count |
+| **returns** | the result, or none with the failure kept as the builder's |
 
 ### eq
 
@@ -1202,11 +1933,29 @@ pub fun shr_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value)
 pub fun eq(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
 
+emit_cmp_eq with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or none with the failure kept as the builder's |
+
 ### ne
 
 ```mach
 pub fun ne(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
+
+emit_cmp_ne with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or none with the failure kept as the builder's |
 
 ### lt_s
 
@@ -1214,11 +1963,29 @@ pub fun ne(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) ma
 pub fun lt_s(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
 
+emit_cmp_lt_s with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or none with the failure kept as the builder's |
+
 ### lt_u
 
 ```mach
 pub fun lt_u(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
+
+emit_cmp_lt_u with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or none with the failure kept as the builder's |
 
 ### le_u
 
@@ -1226,11 +1993,29 @@ pub fun lt_u(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) 
 pub fun le_u(b: *Builder, x: mach.lower.value.Value, y: mach.lower.value.Value) mach.lower.value.Value
 ```
 
+emit_cmp_le_u with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the left operand |
+| `y` | the right operand |
+| **returns** | the result, or none with the failure kept as the builder's |
+
 ### trunc
 
 ```mach
 pub fun trunc(b: *Builder, x: mach.lower.value.Value, to: Type) mach.lower.value.Value
 ```
+
+emit_trunc with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the value converted |
+| `to` | the type converted to |
+| **returns** | the result, or none with the failure kept as the builder's |
 
 ### zext
 
@@ -1238,11 +2023,29 @@ pub fun trunc(b: *Builder, x: mach.lower.value.Value, to: Type) mach.lower.value
 pub fun zext(b: *Builder, x: mach.lower.value.Value, to: Type) mach.lower.value.Value
 ```
 
+emit_zext with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the value converted |
+| `to` | the type converted to |
+| **returns** | the result, or none with the failure kept as the builder's |
+
 ### sext
 
 ```mach
 pub fun sext(b: *Builder, x: mach.lower.value.Value, to: Type) mach.lower.value.Value
 ```
+
+emit_sext with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the value converted |
+| `to` | the type converted to |
+| **returns** | the result, or none with the failure kept as the builder's |
 
 ### bitcast
 
@@ -1250,15 +2053,57 @@ pub fun sext(b: *Builder, x: mach.lower.value.Value, to: Type) mach.lower.value.
 pub fun bitcast(b: *Builder, x: mach.lower.value.Value, to: Type) mach.lower.value.Value
 ```
 
+emit_bitcast with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `x` | the value converted |
+| `to` | the type converted to |
+| **returns** | the result, or none with the failure kept as the builder's |
+
 ### br
 
 ```mach
 pub fun br(b: *Builder, target: mirl.ir.id.Block)
 ```
 
+emit_br with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `target` | the block branched to |
+
 ### cbr
 
 ```mach
 pub fun cbr(b: *Builder, c: mach.lower.value.Value, then_b: mirl.ir.id.Block, else_b: mirl.ir.id.Block)
 ```
+
+emit_cbr with a failure kept as the builder's
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `c` | the condition |
+| `then_b` | the block taken where `c` holds |
+| `else_b` | the block taken otherwise |
+
+## Functions
+
+### module_refusal
+
+```mach
+pub fun module_refusal(e: mirl.ir.module.Error, what: str) mach.base.fail.Fail
+```
+
+mirl's refusal of what `what` names, as lowering's failure: storage refused where it stands for
+that, else a defect of the lowering
+
+| Parameter | |
+| :--- | :--- |
+| `e` | mirl's refusal |
+| `what` | the defect's message |
+| **returns** | the failure |
 

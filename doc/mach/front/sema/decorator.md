@@ -10,7 +10,8 @@ Uses types from [`mach.front.ast.decl`](../ast/decl.md), [`mach.front.sema.conte
 
 | Functions | |
 | :--- | :--- |
-| [`infer_decorator_args`](#infer_decorator_args), [`validate_decorators`](#validate_decorators) | |
+| [`infer_decorator_args`](#infer_decorator_args) | types every expression argument of `d`'s decorators, leaving out the arguments a `handle` decorator takes as types and every argument of an unknown decorator |
+| [`validate_decorators`](#validate_decorators) | checks each decorator of `d` against its registry row and then against the rule its id adds, with the decorators of a tag's cases, a `def` that states no type, and the symbols `d` defines |
 
 ---
 
@@ -22,9 +23,26 @@ Uses types from [`mach.front.ast.decl`](../ast/decl.md), [`mach.front.sema.conte
 pub fun infer_decorator_args(sc: *mach.front.sema.context.SemaContext, d: *mach.front.ast.decl.Decl)
 ```
 
+types every expression argument of `d`'s decorators, leaving out the arguments a
+`handle` decorator takes as types and every argument of an unknown decorator
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context of the module being typed |
+| `d` | the declaration whose decorators are typed |
+
 ### validate_decorators
 
 ```mach
 pub fun validate_decorators(sc: *mach.front.sema.context.SemaContext, d: *mach.front.ast.decl.Decl)
 ```
+
+checks each decorator of `d` against its registry row and then against the rule its
+id adds, with the decorators of a tag's cases, a `def` that states no type, and the
+symbols `d` defines. problems are reported to `sc`
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context of the module being typed |
+| `d` | the declaration whose decorators are checked |
 

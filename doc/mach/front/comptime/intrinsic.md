@@ -35,11 +35,32 @@ Uses types from [`mach.base.source`](../../base/source.md), [`mach.base.textbuil
 | Functions | |
 | :--- | :--- |
 | [`constructor_refusal`](#constructor_refusal) | the refusal of a `$` in a type that names no type constructor, listing the ones there are |
-| [`first_call_arg`](#first_call_arg), [`intrinsic_takes_type_operand`](#intrinsic_takes_type_operand), [`is_type_of_call`](#is_type_of_call), [`type_of_arg`](#type_of_arg), [`is_fields_call`](#is_fields_call), [`is_cases_call`](#is_cases_call), [`is_layout_intrinsic_call`](#is_layout_intrinsic_call), [`is_type_id_call`](#is_type_id_call), [`is_length_of_call`](#is_length_of_call), [`is_offset_of_call`](#is_offset_of_call), [`is_size_of_call`](#is_size_of_call), [`is_align_of_call`](#is_align_of_call), [`layout_intrinsic_type_arg`](#layout_intrinsic_type_arg), [`fields_type_arg`](#fields_type_arg), [`is_error_call`](#is_error_call), [`type_operand_value`](#type_operand_value), [`is_type_comparison`](#is_type_comparison), [`is_type_comparison_binary`](#is_type_comparison_binary), [`is_field_type_member`](#is_field_type_member), [`is_field_descriptor_member`](#is_field_descriptor_member), [`is_type_query_call`](#is_type_query_call) | |
+| [`first_call_arg`](#first_call_arg) | the first argument of a call |
+| [`intrinsic_takes_type_operand`](#intrinsic_takes_type_operand) | whether the intrinsic a `$name` token spells takes a type as its first argument |
+| [`is_type_of_call`](#is_type_of_call) | whether an expression is a `$type_of(...)` call |
+| [`type_of_arg`](#type_of_arg) | the argument of a `$type_of(...)` call |
+| [`is_fields_call`](#is_fields_call) | whether an expression is a `$fields(...)` call |
+| [`is_cases_call`](#is_cases_call) | whether an expression is a `$cases(...)` call |
+| [`is_layout_intrinsic_call`](#is_layout_intrinsic_call) | whether an expression is a call of a layout intrinsic |
+| [`is_type_id_call`](#is_type_id_call) | whether an expression is a `$type_id(...)` call |
+| [`is_length_of_call`](#is_length_of_call) | whether an expression is a `$length_of(...)` call |
+| [`is_offset_of_call`](#is_offset_of_call) | whether an expression is a `$offset_of(...)` call |
+| [`is_size_of_call`](#is_size_of_call) | whether an expression is a `$size_of(...)` call |
+| [`is_align_of_call`](#is_align_of_call) | whether an expression is a `$align_of(...)` call |
+| [`layout_intrinsic_type_arg`](#layout_intrinsic_type_arg) | the type argument of a layout intrinsic call |
+| [`fields_type_arg`](#fields_type_arg) | the type argument of a `$fields(...)` call |
+| [`is_error_call`](#is_error_call) | whether an expression is a `$error(...)` call |
+| [`type_operand_value`](#type_operand_value) | the expression a type operand names a type through: the argument of `$type_of(x)`, else itself |
+| [`is_type_comparison`](#is_type_comparison) | whether a binary expression compares a `$type_of(...)` call on either side |
+| [`is_type_comparison_binary`](#is_type_comparison_binary) | whether an `==` or `!=` compares types: a `$type_of(...)` call or a field descriptor's type on either side |
+| [`is_field_type_member`](#is_field_type_member) | whether an expression is a `.type` member access |
+| [`is_field_descriptor_member`](#is_field_descriptor_member) | whether an expression reads a field descriptor member: `.name`, `.type`, `.offset`, `.has_payload` or `.code` |
+| [`is_type_query_call`](#is_type_query_call) | whether an expression is a call of a type query intrinsic |
 | [`is_type_question_call`](#is_type_question_call) | a call that asks about a type: its layout, its identity, or a predicate over it |
 | [`is_path_call`](#is_path_call) | a call whose callee is a rooted comptime path: `$mach.build.ct_mul(low, 64)` |
 | [`is_comptime_value`](#is_comptime_value) | a rooted comptime path, or a call on one: both fold to a constant |
-| [`is_comptime_path`](#is_comptime_path), [`comptime_ident_name`](#comptime_ident_name) | |
+| [`is_comptime_path`](#is_comptime_path) | whether an expression is a rooted comptime path: a `$name`, or members of one |
+| [`comptime_ident_name`](#comptime_ident_name) | the name of a `$name` token without its `$` |
 
 ---
 
@@ -169,11 +190,27 @@ the refusal of a `$` in a type that names no type constructor, listing the ones 
 pub fun first_call_arg(a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) mach.front.ast.id.ExprId
 ```
 
+the first argument of a call
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `eid` | the call |
+| **returns** | the argument, EXPR_NIL when the expression is no call or takes no argument |
+
 ### intrinsic_takes_type_operand
 
 ```mach
 pub fun intrinsic_takes_type_operand(source: str, full: mach.base.source.Span) bool
 ```
+
+whether the intrinsic a `$name` token spells takes a type as its first argument
+
+| Parameter | |
+| :--- | :--- |
+| `source` | the tree's source text |
+| `full` | the token, `$` included |
+| **returns** | true when it does, false for a name that spells no intrinsic |
 
 ### is_type_of_call
 
@@ -181,11 +218,28 @@ pub fun intrinsic_takes_type_operand(source: str, full: mach.base.source.Span) b
 pub fun is_type_of_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
+whether an expression is a `$type_of(...)` call
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `eid` | the expression |
+| **returns** | true when it is, false for any other expression or EXPR_NIL |
+
 ### type_of_arg
 
 ```mach
 pub fun type_of_arg(a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) mach.front.ast.id.ExprId
 ```
+
+the argument of a `$type_of(...)` call
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `eid` | the call |
+| **returns** | the argument, EXPR_NIL when the expression is no call or takes no argument |
 
 ### is_fields_call
 
@@ -193,11 +247,29 @@ pub fun type_of_arg(a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) mach.
 pub fun is_fields_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
+whether an expression is a `$fields(...)` call
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `eid` | the expression |
+| **returns** | true when it is, false for any other expression or EXPR_NIL |
+
 ### is_cases_call
 
 ```mach
 pub fun is_cases_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
+
+whether an expression is a `$cases(...)` call
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `eid` | the expression |
+| **returns** | true when it is, false for any other expression or EXPR_NIL |
 
 ### is_layout_intrinsic_call
 
@@ -205,11 +277,29 @@ pub fun is_cases_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.i
 pub fun is_layout_intrinsic_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
+whether an expression is a call of a layout intrinsic
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `eid` | the expression |
+| **returns** | true when it is, false for any other expression or EXPR_NIL |
+
 ### is_type_id_call
 
 ```mach
 pub fun is_type_id_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
+
+whether an expression is a `$type_id(...)` call
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `eid` | the expression |
+| **returns** | true when it is, false for any other expression or EXPR_NIL |
 
 ### is_length_of_call
 
@@ -217,11 +307,29 @@ pub fun is_type_id_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast
 pub fun is_length_of_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
+whether an expression is a `$length_of(...)` call
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `eid` | the expression |
+| **returns** | true when it is, false for any other expression or EXPR_NIL |
+
 ### is_offset_of_call
 
 ```mach
 pub fun is_offset_of_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
+
+whether an expression is a `$offset_of(...)` call
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `eid` | the expression |
+| **returns** | true when it is, false for any other expression or EXPR_NIL |
 
 ### is_size_of_call
 
@@ -229,11 +337,29 @@ pub fun is_offset_of_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.a
 pub fun is_size_of_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
+whether an expression is a `$size_of(...)` call
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `eid` | the expression |
+| **returns** | true when it is, false for any other expression or EXPR_NIL |
+
 ### is_align_of_call
 
 ```mach
 pub fun is_align_of_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
+
+whether an expression is a `$align_of(...)` call
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `eid` | the expression |
+| **returns** | true when it is, false for any other expression or EXPR_NIL |
 
 ### layout_intrinsic_type_arg
 
@@ -241,11 +367,27 @@ pub fun is_align_of_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.as
 pub fun layout_intrinsic_type_arg(a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) mach.front.ast.id.ExprId
 ```
 
+the type argument of a layout intrinsic call
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `eid` | the call |
+| **returns** | the argument, EXPR_NIL when the expression is no call or takes no argument |
+
 ### fields_type_arg
 
 ```mach
 pub fun fields_type_arg(a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) mach.front.ast.id.ExprId
 ```
+
+the type argument of a `$fields(...)` call
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `eid` | the call |
+| **returns** | the argument, EXPR_NIL when the expression is no call or takes no argument |
 
 ### is_error_call
 
@@ -253,17 +395,44 @@ pub fun fields_type_arg(a: *mach.front.ast.Ast, eid: mach.front.ast.id.ExprId) m
 pub fun is_error_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
+whether an expression is a `$error(...)` call
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `eid` | the expression |
+| **returns** | true when it is, false for any other expression or EXPR_NIL |
+
 ### type_operand_value
 
 ```mach
 pub fun type_operand_value(a: *mach.front.ast.Ast, source: str, operand: mach.front.ast.id.ExprId) mach.front.ast.id.ExprId
 ```
 
+the expression a type operand names a type through: the argument of `$type_of(x)`, else itself
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `operand` | the type operand |
+| **returns** | the expression to type |
+
 ### is_type_comparison
 
 ```mach
 pub fun is_type_comparison(a: *mach.front.ast.Ast, source: str, bin: *mach.front.ast.expr.ExprBinary) bool
 ```
+
+whether a binary expression compares a `$type_of(...)` call on either side
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `bin` | the binary expression |
+| **returns** | true when either operand is a `$type_of(...)` call |
 
 ### is_type_comparison_binary
 
@@ -272,11 +441,32 @@ pub fun is_type_comparison_binary(a: *mach.front.ast.Ast, source: str, bin: *mac
     lhs_is_field_type: bool, rhs_is_field_type: bool) bool
 ```
 
+whether an `==` or `!=` compares types: a `$type_of(...)` call or a field descriptor's type on
+either side
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `bin` | the binary expression |
+| `lhs_is_field_type` | whether the caller found the left operand a field descriptor's type |
+| `rhs_is_field_type` | whether the caller found the right operand a field descriptor's type |
+| **returns** | true when the operator compares and some side is a type |
+
 ### is_field_type_member
 
 ```mach
 pub fun is_field_type_member(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
+
+whether an expression is a `.type` member access
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `eid` | the expression |
+| **returns** | true for a member named `type`, false otherwise or for EXPR_NIL |
 
 ### is_field_descriptor_member
 
@@ -284,11 +474,30 @@ pub fun is_field_type_member(a: *mach.front.ast.Ast, source: str, eid: mach.fron
 pub fun is_field_descriptor_member(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
 
+whether an expression reads a field descriptor member: `.name`, `.type`, `.offset`,
+`.has_payload` or `.code`
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `eid` | the expression |
+| **returns** | true for a member of one of those names, whatever its object, false otherwise |
+
 ### is_type_query_call
 
 ```mach
 pub fun is_type_query_call(a: *mach.front.ast.Ast, source: str, eid: mach.front.ast.id.ExprId) bool
 ```
+
+whether an expression is a call of a type query intrinsic
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `source` | the tree's source text |
+| `eid` | the expression |
+| **returns** | true when it is, false for any other expression or EXPR_NIL |
 
 ### is_type_question_call
 
@@ -320,9 +529,24 @@ a rooted comptime path, or a call on one: both fold to a constant
 pub fun is_comptime_path(a: *mach.front.ast.Ast, e: mach.front.ast.id.ExprId) bool
 ```
 
+whether an expression is a rooted comptime path: a `$name`, or members of one
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the tree |
+| `e` | the expression |
+| **returns** | true when the chain of member objects ends in a comptime identifier |
+
 ### comptime_ident_name
 
 ```mach
 pub fun comptime_ident_name(full: mach.base.source.Span) mach.base.source.Span
 ```
+
+the name of a `$name` token without its `$`
+
+| Parameter | |
+| :--- | :--- |
+| `full` | the token's span, `$` included |
+| **returns** | the span after the `$`, empty for an empty token |
 

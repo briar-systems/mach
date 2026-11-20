@@ -12,7 +12,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](pr
 
 | Functions | |
 | :--- | :--- |
-| [`capture_build_config`](#capture_build_config) | |
+| [`capture_build_config`](#capture_build_config) | capture the build context's bytes: the request's semantic hash, then the configuration identity |
 | [`capture_configuration_identity`](#capture_configuration_identity) | the build identity without the request: the persistent key hashes the request itself, with the project root in canonical form, so the spelled root stays out |
 | [`freeze`](#freeze) | freeze the build context: what every computation reads of the cell, the request and the target is captured once, set as the TARGET input every product that reads it depends on, and fingerprinted from the same bytes, so a later change to it is refused rather than read |
 | [`unchanged`](#unchanged) | refused when the context a frozen build reads no longer captures to the bytes it was frozen at |
@@ -30,6 +30,14 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.project`](pr
 ```mach
 pub fun capture_build_config(p: *mach.compile.project.Project, alloc: *std.allocator.Allocator) res[mach.session.query.QueryOutput, mach.base.fail.Fail]
 ```
+
+capture the build context's bytes: the request's semantic hash, then the configuration identity
+
+| Parameter | |
+| :--- | :--- |
+| `p` | project whose request, cell and target are captured |
+| `alloc` | allocator for the captured bytes |
+| **returns** | the bytes as a query output the caller owns, or the failure of hashing the request or of taking the bytes |
 
 ### capture_configuration_identity
 

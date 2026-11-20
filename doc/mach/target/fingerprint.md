@@ -12,7 +12,7 @@ Uses types from [`mach.base.wire`](../base/wire.md), [`mach.target.resolved`](re
 
 | Functions | |
 | :--- | :--- |
-| [`put`](#put) | |
+| [`put`](#put) | write the bytes that identify `t` to the build cache |
 
 ---
 
@@ -23,4 +23,11 @@ Uses types from [`mach.base.wire`](../base/wire.md), [`mach.target.resolved`](re
 ```mach
 pub fun put(t: *mach.target.resolved.Target, s: *mach.base.wire.Sink)
 ```
+
+write the bytes that identify `t` to the build cache
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the resolved target |
+| `s` | the sink the bytes are written to |
 

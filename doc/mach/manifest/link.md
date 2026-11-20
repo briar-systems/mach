@@ -24,10 +24,10 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 
 | Functions | |
 | :--- | :--- |
-| [`parse_links`](#parse_links) | |
+| [`parse_links`](#parse_links) | decode every `[link.<name>]` table of `t` into `m.links`, nothing when there is none |
 | [`link_matches_target`](#link_matches_target) | whether a link's `sys`, `arch` and `abi` filters all admit a target |
 | [`expand_local_path`](#expand_local_path) | expand a local link's `path` with `v`; a refusal points at the `path` value |
-| [`find_link_by_name`](#find_link_by_name) | |
+| [`find_link_by_name`](#find_link_by_name) | the link `m` declares under the interned `name`, nil when none is |
 
 ---
 
@@ -53,7 +53,7 @@ the symbol array is owned; release it with `link_claims_dnit`
 | Field | Type | |
 | :--- | :--- | :--- |
 | `source` | `LinkSource` | copied from the link |
-| `text` | `mach.base.intern.StrId` | for a local source, the `path` expanded and interned; otherwise the link's `name` |
+| `text` | `mach.base.intern.StrId` | for a local source, the `path` expanded, anchored as an absolute path and interned; otherwise the link's `name` |
 | `key` | `mach.base.intern.StrId` | the link's table key, its identity |
 | `symbols` | `*mach.base.intern.StrId` | an owned copy of the link's `symbols`, or nil when it has none |
 | `symbol_count` | `u32` | length of `symbols` |
@@ -119,20 +119,25 @@ and the new entries in `src` order. `src` is not modified
 
 ```mach
 pub fun link_requirement(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, l: *LinkDef,
-    proj_out: str, v: *mach.manifest.template.Values) res[LinkRequirement, mach.base.fail.Fail]
+    proj_out: str, v: *mach.manifest.template.Values, declared: str, home: str) res[LinkRequirement, mach.base.fail.Fail]
 ```
 
 resolve a link entry for one target into a `LinkRequirement`. a local `path`
-is expanded with `expand_project_path` and interned; the symbols are copied
-into an owned array
+is expanded with `expand_local_path`, anchored and interned, and the symbols are
+copied into an owned array. the path is anchored once, here: at the root
+project's directory when its template names a variable whose value lies under
+it, as `{project.work}` does, and otherwise at the directory of the project
+whose manifest states the entry
 
 | Parameter | |
 | :--- | :--- |
 | `alloc` | owns the symbol copy |
-| `itn` | interns the expanded path |
+| `itn` | interns the anchored path |
 | `l` | the link |
 | `proj_out` | the expanded `[project].work` |
 | `v` | the template values |
+| `declared` | the directory of the project whose manifest states `l` |
+| `home` | the root project's directory |
 | **returns** | the requirement; on error nothing is left allocated |
 
 ## Functions
@@ -142,6 +147,16 @@ into an owned array
 ```mach
 pub fun parse_links(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, t: *toml.value.Table, m: *Manifest) err[mach.base.fail.Fail]
 ```
+
+decode every `[link.<name>]` table of `t` into `m.links`, nothing when there is none
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | owns the link array, its entries and a refusal's text |
+| `itn` | interns the names, paths and filter values |
+| `t` | the manifest's root table |
+| `m` | the manifest the links are set on |
+| **returns** | ok, or the refusal of the first link that does not decode |
 
 ### link_matches_target
 
@@ -173,4 +188,6 @@ expand a local link's `path` with `v`; a refusal points at the `path` value
 ```mach
 pub fun find_link_by_name(m: *Manifest, name: mach.base.intern.StrId) *LinkDef
 ```
+
+the link `m` declares under the interned `name`, nil when none is
 

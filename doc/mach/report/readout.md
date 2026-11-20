@@ -33,7 +33,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`Summary`](#summary) | `rec` | a unit built its output: the path, the modules in it, its size in bytes when the output is one file, the time no row accounts for, and the unit's wall time |
 | [`TestResult`](#testresult) | `rec` | one test's result, filled in place when the test finishes |
 | [`RunStart`](#runstart) | `rec` | a test run starts over count tests in collection order, each with its art set and none done |
-| [`RunEnd`](#runend) | `rec` | a test run ended: its results in collection order, the counts of passed, failed, skipped and timed-out tests, the run's wall time, and the gate tally over every result |
+| [`RunEnd`](#runend) | `rec` | a test run ended: its results in collection order, the counts of passed, failed, skipped and timed-out tests among those that finished, the run's wall time, and the gate tally over every finished result |
 | [`Growth`](#growth) | `rec` | a growing cycle of instances being expanded: the module that declares its templates, the templates on it, and how many instances of it the module being typed has made |
 | [`Event`](#event) | `tag` | one event of a command, in the order it happened |
 | [`Sink`](#sink) | `rec` | where a build's events go: on_event is called once per event, in order, never from two threads at once, and may be called from a worker thread |
@@ -70,6 +70,10 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`ALLOCATED`](#counter) | the machine instructions after mirl's register allocation |
 | [`ALLOC_ROUNDS`](#counter) | the rounds of mirl's register allocation |
 | [`counter_label`](#counter_label) | the label of counter c |
+
+| On `TestResult` | |
+| :--- | :--- |
+| [`span`](#span) | the wall span of the tests from `first` to `last`, from the earliest launch to the latest finish, zero when none of them was launched at a sampled instant |
 
 | On `Sink` | |
 | :--- | :--- |
@@ -267,6 +271,7 @@ pub rec TestResult {
     done:      bool;
     result:    mach.report.testrun.GateResult;
     code:      i32;
+    start:     Instant;
     elapsed:   std.chrono.duration.Duration;
     bound:     std.chrono.duration.Duration;
     out:       *u8;
@@ -277,10 +282,28 @@ pub rec TestResult {
 }
 ```
 
-one test's result, filled in place when the test finishes. log is the file its
-captured output is kept in, nil when none could be named. launch is the command
-the test was launched through, its runner's words and the program before the
-test's index, nil when the program ran itself
+one test's result, filled in place when the test finishes. start is the instant it
+was launched, none for a test that never ran or when the clock refused, and elapsed
+its wall time from then. log is the file its captured output is kept in, nil when
+none could be named. launch is the command the test was launched through, its
+runner's words and the program before the test's index, nil when the program ran
+itself
+
+### span
+
+```mach
+pub fun span(tests: *TestResult, first: u32, last: u32) std.chrono.duration.Duration
+```
+
+the wall span of the tests from `first` to `last`, from the earliest launch to the latest
+finish, zero when none of them was launched at a sampled instant
+
+| Parameter | |
+| :--- | :--- |
+| `tests` | the results, indexed by test |
+| `first` | the index of the first test of the span |
+| `last` | the index of the last test of the span, inclusive |
+| **returns** | the time from the earliest launch to the latest finish |
 
 ## RunStart
 
@@ -311,8 +334,8 @@ pub rec RunEnd {
 ```
 
 a test run ended: its results in collection order, the counts of passed,
-failed, skipped and timed-out tests, the run's wall time, and the gate tally
-over every result
+failed, skipped and timed-out tests among those that finished, the run's wall
+time, and the gate tally over every finished result
 
 ## Growth
 

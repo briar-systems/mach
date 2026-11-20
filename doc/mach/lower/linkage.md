@@ -26,14 +26,15 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 
 | On `Linkage` | |
 | :--- | :--- |
-| [`init`](#init), [`dnit`](#dnit) | |
+| [`init`](#init) | an empty linkage record whose tables allocate from `alloc` |
+| [`dnit`](#dnit) | release every table of `l` |
 | [`clear`](#clear) | forget every declaration and import, as a project does when its module registry is reset |
-| [`register_export_name`](#register_export_name) | |
+| [`register_export_name`](#register_export_name) | record the name declaration `did` of `mid` is exported under, replacing an earlier one |
 | [`forget_names`](#forget_names) | drop every export name and linkage name of one module's declarations, before its syntax tree is replaced and its declaration ids no longer name the same declarations |
 | [`export_name`](#export_name) | the name declaration `did` of `mid` is exported under, nil when it names none |
 | [`register_name`](#register_name) | record the name declaration `did` of `mid` links under, as the lowering first names it |
 | [`name`](#name) | the name declaration `did` of `mid` links under, nil before the lowering has named it |
-| [`register_export_library`](#register_export_library) | |
+| [`register_export_library`](#register_export_library) | record the library declaration `did` of `mid` is imported from, replacing an earlier one |
 | [`export_library`](#export_library) | the library declaration `did` of `mid` is imported from, nil when it names none |
 | [`register_import_library`](#register_import_library) | pin the imported symbol `name`, known as `sort`, to the library `lib` |
 | [`import_library`](#import_library) | the library the imported symbol `name` is pinned to, nil when it is pinned to none |
@@ -95,11 +96,24 @@ there by link name
 pub fun init(alloc: *std.allocator.Allocator) Linkage
 ```
 
+an empty linkage record whose tables allocate from `alloc`
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | the allocator every table grows from |
+| **returns** | the linkage, which the caller releases with dnit |
+
 ### dnit
 
 ```mach
 pub fun dnit(l: *Linkage)
 ```
+
+release every table of `l`
+
+| Parameter | |
+| :--- | :--- |
+| `l` | the linkage to release |
 
 ### clear
 
@@ -115,6 +129,16 @@ module registry is reset
 ```mach
 pub fun register_export_name(l: *Linkage, mid: mach.session.module.ModuleId, did: u32, name: mach.base.intern.StrId) err[mach.base.fail.Fail]
 ```
+
+record the name declaration `did` of `mid` is exported under, replacing an earlier one
+
+| Parameter | |
+| :--- | :--- |
+| `l` | the linkage |
+| `mid` | the declaration's module |
+| `did` | the declaration's index in that module |
+| `name` | the export name |
+| **returns** | ok, or the allocator's refusal |
 
 ### forget_names
 
@@ -161,6 +185,16 @@ the name declaration `did` of `mid` links under, nil before the lowering has nam
 ```mach
 pub fun register_export_library(l: *Linkage, mid: mach.session.module.ModuleId, did: u32, lib: mach.base.intern.StrId) err[mach.base.fail.Fail]
 ```
+
+record the library declaration `did` of `mid` is imported from, replacing an earlier one
+
+| Parameter | |
+| :--- | :--- |
+| `l` | the linkage |
+| `mid` | the declaration's module |
+| `did` | the declaration's index in that module |
+| `lib` | the library's key |
+| **returns** | ok, or the allocator's refusal |
 
 ### export_library
 

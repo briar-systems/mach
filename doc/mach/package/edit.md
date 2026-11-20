@@ -17,7 +17,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.manifest.edit`](../m
 
 | On `Edit` | |
 | :--- | :--- |
-| [`begin`](#begin) | |
+| [`begin`](#begin) | open an edit: hold the project root open and check its dependency root |
 | [`finish`](#finish) | release the project root; err when closing it fails |
 | [`apply`](#apply) | add or remove a declaration within an open edit |
 
@@ -56,6 +56,15 @@ temporary and the dependency root is reached through it
 ```mach
 pub fun begin(edit: *Edit, a: *std.allocator.Allocator, root: str) err[mach.base.fail.Fail]
 ```
+
+open an edit: hold the project root open and check its dependency root
+
+| Parameter | |
+| :--- | :--- |
+| `edit` | the edit to fill, released with `finish` whether or not this fails |
+| `a` | holds the text of a refusal |
+| `root` | the project root |
+| **returns** | err when the root cannot be opened, or `dep` cannot be inspected or is not a physical directory |
 
 ### finish
 

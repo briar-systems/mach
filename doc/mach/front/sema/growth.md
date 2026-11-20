@@ -29,10 +29,10 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 
 | On `Analysis` | |
 | :--- | :--- |
-| [`init`](#init) | |
+| [`init`](#init) | an empty analysis, with no cycles |
 | [`dnit`](#dnit) | release an analysis; a nil one, or one never made, holds nothing |
 | [`cycle_of`](#cycle_of) | the growing cycle declaration `decl` lies on, if any |
-| [`cycle_at`](#cycle_at) | |
+| [`cycle_at`](#cycle_at) | the growing cycle `id`, as `cycle_of` names it |
 | [`analyze`](#analyze) | the growing cycles of module `own`, parsed as `a` and resolved as `rr` |
 
 | Functions | |
@@ -82,6 +82,13 @@ and left the rest of that body unwalked
 pub fun init(alloc: *std.allocator.Allocator) Analysis
 ```
 
+an empty analysis, with no cycles
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | the allocator its tables are held in |
+| **returns** | the analysis, released with `dnit` |
+
 ### dnit
 
 ```mach
@@ -103,6 +110,14 @@ the growing cycle declaration `decl` lies on, if any
 ```mach
 pub fun cycle_at(an: *Analysis, id: u32) *Cycle
 ```
+
+the growing cycle `id`, as `cycle_of` names it
+
+| Parameter | |
+| :--- | :--- |
+| `an` | the analysis holding the cycle |
+| `id` | the cycle's index, which must be one `cycle_of` gave |
+| **returns** | the cycle, owned by the analysis |
 
 ### analyze
 

@@ -18,8 +18,8 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.package.source`](sou
 | [`Need`](#need) | `rec` | `who` names the requirer a diagnostic attributes a root need to: the root itself ("" reads as the problem's root) or the chain of a dependency that declared the range, since every requirer's range takes part in the root's problem |
 | [`ReleaseNeeds`](#releaseneeds) | `rec` | what a release asks for: the compiler range its manifest states ("" for none) and its dependencies selected by version range |
 | [`Lock`](#lock) | `rec` | a preferred version, kept while it still satisfies every requirement (`update <name>`) |
-| [`Problem`](#problem) | `rec` | fixed ids are identities the root selects itself (an exact or branch ref, or a path): the root overrides them, so no requirement on them takes part in resolution |
-| [`Choice`](#choice) | `rec` |  |
+| [`Problem`](#problem) | `rec` | fixed ids are identities the root, or a dependency it reaches by ref or path, selects by ref or path: that selection overrides them, so no requirement on them takes part in resolution |
+| [`Choice`](#choice) | `rec` | the release resolution selected for one identity, its texts owned by the caller's allocator |
 
 | On `Problem` | |
 | :--- | :--- |
@@ -87,8 +87,8 @@ pub rec Problem {
 }
 ```
 
-fixed ids are identities the root selects itself (an exact or branch ref, or a path): the root
-overrides them, so no requirement on them takes part in resolution
+fixed ids are identities the root, or a dependency it reaches by ref or path, selects by ref
+or path: that selection overrides them, so no requirement on them takes part in resolution
 
 ### resolve
 
@@ -111,4 +111,14 @@ pub rec Choice {
     version: str;
 }
 ```
+
+the release resolution selected for one identity, its texts owned by the caller's allocator
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `id` | `str` | the identity |
+| `url` | `str` | the source it is listed at |
+| `tag` | `str` | the tag that names the release |
+| `commit` | `str` | the commit the tag points at |
+| `version` | `str` | the release's version text |
 

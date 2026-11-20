@@ -19,14 +19,15 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.package.git`](../
 
 | On `Remotes` | |
 | :--- | :--- |
-| [`init`](#init) | |
+| [`init`](#init) | open a releases table over git |
 | [`dnit`](#dnit) | release the table; a candidate scratch that stays is the failure, once everything else is released |
 | [`remember`](#remember) | the local repository offline resolution reads `url`'s releases from; the first existing one named wins, so a url with no checkout yet is refused by offline_dir and not by git |
 | [`release_of`](#release_of) | the release of `url` whose commit is `commit`, as its version text owned by the caller, or an owned "" when no release tag names that commit: a dependency's committed gitlink is a commit, and resolution deals in releases |
 
 | Functions | |
 | :--- | :--- |
-| [`releases`](#releases), [`shipped`](#shipped) | |
+| [`releases`](#releases) | every `v`-prefixed semver tag at a url as a release, listed once per url and cached |
+| [`shipped`](#shipped) | the manifest a release ships, read at its commit from the scratch, or offline from the local repository |
 
 ---
 
@@ -55,6 +56,16 @@ line before each url's releases are read from the network, nil for none
 ```mach
 pub fun init(s: *mach.session.Session, offline: bool, local: str, rep: *mach.package.report.Report) res[Remotes, mach.base.fail.Fail]
 ```
+
+open a releases table over git
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session, whose allocator holds the table's state |
+| `offline` | read releases only from local repositories, reaching no network |
+| `local` | the repository a url with no remembered checkout is read from offline, or "" |
+| `rep` | hears a line before a url's releases are read from the network, nil for none |
+| **returns** | the table, released with dnit, err when git is not on PATH |
 
 ### dnit
 
@@ -92,9 +103,28 @@ gitlink is a commit, and resolution deals in releases
 pub fun releases(ctx: ptr, url: str, out: *Vector[mach.package.source.Release]) err[mach.base.fail.Fail]
 ```
 
+every `v`-prefixed semver tag at a url as a release, listed once per url and cached
+
+| Parameter | |
+| :--- | :--- |
+| `ctx` | the table, a *Remotes |
+| `url` | the source url |
+| `out` | receives the releases, their strings owned by the session's allocator |
+| **returns** | err when the tags cannot be listed or a release cannot be kept |
+
 ### shipped
 
 ```mach
 pub fun shipped(ctx: ptr, url: str, rel: *mach.package.source.Release) res[mach.package.source.Shipped, mach.base.fail.Fail]
 ```
+
+the manifest a release ships, read at its commit from the scratch, or offline from the local
+repository
+
+| Parameter | |
+| :--- | :--- |
+| `ctx` | the table, a *Remotes |
+| `url` | the source url |
+| `rel` | the release |
+| **returns** | the manifest, owned by the caller, or why the release is no candidate when its manifest is not valid TOML, does not load or names another version, err when the manifest cannot be fetched or read at all |
 

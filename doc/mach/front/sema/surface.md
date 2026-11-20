@@ -17,7 +17,10 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 | On `Owner` | |
 | :--- | :--- |
 | [`exports`](#exports) | the exports of `owner`'s typed surface, allocated from `a`; a symbol it forwards is read from the surface its origin published |
-| [`graph`](#graph) | the field recipes of every type the exports of `surface` reach, under `owner`'s target |
+
+| Functions | |
+| :--- | :--- |
+| [`graph`](#graph) | the field recipes of every type the exports of `surface` reach, and of the type each exported constant names, read from the session's type table |
 
 ---
 
@@ -44,14 +47,6 @@ pub fun exports(s: *mach.session.Session, owner: *Owner, rr: *mach.front.resolve
 the exports of `owner`'s typed surface, allocated from `a`; a symbol it forwards is read
 from the surface its origin published
 
-### graph
-
-```mach
-pub fun graph(s: *mach.session.Session, owner: *Owner, surface: *mach.front.sema.product.ModuleSema) res[mach.front.sema.fields.Graph, mach.base.fail.Fail]
-```
-
-the field recipes of every type the exports of `surface` reach, under `owner`'s target
-
 ## Origins
 
 ```mach
@@ -63,4 +58,15 @@ pub rec Origins {
 
 where the surfaces of the modules a surface forwards from are read: a loaded module's
 published surface, owned by the caller
+
+## Functions
+
+### graph
+
+```mach
+pub fun graph(s: *mach.session.Session, surface: *mach.front.sema.product.ModuleSema) res[mach.front.sema.fields.Graph, mach.base.fail.Fail]
+```
+
+the field recipes of every type the exports of `surface` reach, and of the type each
+exported constant names, read from the session's type table
 

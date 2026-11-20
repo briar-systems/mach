@@ -19,11 +19,12 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 
 | On `Node` | |
 | :--- | :--- |
-| [`step_node`](#step_node) | |
+| [`step_node`](#step_node) | the node of the step at `index` of the manifest's steps |
 
 | On `Walk` | |
 | :--- | :--- |
-| [`walk_init`](#walk_init), [`walk_dnit`](#walk_dnit) | |
+| [`walk_init`](#walk_init) | a walk of `m` with every node unvisited, released with `walk_dnit` |
+| [`walk_dnit`](#walk_dnit) | release what a walk owns, its order included |
 | [`visit`](#visit) | visit `n` and every declaration its `need` reaches, adding each to `order` after what it needs; reaching a declaration again while its own visit is open is a cycle, refused at the first edge of the cycle with the others related |
 
 | Functions | |
@@ -57,6 +58,8 @@ one declaration of the graph: entry `index` of its category's tables
 pub fun step_node(index: u32) Node
 ```
 
+the node of the step at `index` of the manifest's steps
+
 ## Walk
 
 ```mach
@@ -87,11 +90,22 @@ a walk of the need graph of one manifest
 pub fun walk_init(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Interner, m: *Manifest) res[Walk, mach.base.fail.Fail]
 ```
 
+a walk of `m` with every node unvisited, released with `walk_dnit`
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | owns the walk's state, trail and order |
+| `itn` | resolves the names `need` entries select |
+| `m` | the manifest walked, which must outlive the walk |
+| **returns** | the walk, or the refused allocation |
+
 ### walk_dnit
 
 ```mach
 pub fun walk_dnit(w: *Walk)
 ```
+
+release what a walk owns, its order included
 
 ### visit
 

@@ -16,6 +16,11 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`verify`](#verify) | what `mach dep verify` checks of a path dependency's copy: no repository metadata and no symlink anywhere in it |
 | [`realize`](#realize) | sync dep/\<id> with a path dependency's source |
 
+| Constants | |
+| :--- | :--- |
+| [`COPY_REFRESHED`](#constants) | what syncing a path dependency's copy did: made it where none existed, refreshed what differed from its source, or reused it as it stood |
+| [`COPY_REUSED`](#constants), [`COPY_MADE`](#constants) | |
+
 ---
 
 ## Functions
@@ -36,12 +41,20 @@ symlink anywhere in it
 ### realize
 
 ```mach
-pub fun realize(s: *mach.session.Session, root: str, id: str, src_dir: str, rep: *mach.package.report.Report) res[bool, mach.base.fail.Fail]
+pub fun realize(s: *mach.session.Session, root: str, id: str, src_dir: str, rep: *mach.package.report.Report) res[u8, mach.base.fail.Fail]
 ```
 
 sync dep/\<id> with a path dependency's source
 
 | Parameter | |
 | :--- | :--- |
-| **returns** | true when the copy was refreshed, false when it already matched its source and was reused |
+| **returns** | COPY_MADE, COPY_REFRESHED or COPY_REUSED, what the sync did to the copy |
+
+## Constants
+
+| Name | Type | Value | |
+| :--- | :--- | :--- | :--- |
+| `COPY_REFRESHED` | `u8` | `1` | what syncing a path dependency's copy did: made it where none existed, refreshed what differed from its source, or reused it as it stood |
+| `COPY_REUSED` | `u8` | `2` |  |
+| `COPY_MADE` | `u8` | `3` |  |
 

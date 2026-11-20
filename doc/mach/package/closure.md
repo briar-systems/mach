@@ -39,6 +39,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`ended`](#ended) | `outcome` of the work an operation held, then the operation released: a failure to release it is the outcome when the work succeeded, and is reported beside it otherwise |
 | [`releases`](#releases) | the releases table of the operation, opened by its first resolution as `walk` reads: offline or not, and announcing each url it reads from the network unless quiet |
 | [`realize`](#realize) | walk and realize the closure into `reqs`, the root's manifest read from `candidate` when it is not nil and otherwise from the project; `verify_only` realizes nothing and refuses a directory under dep/ outside the closure, where a realizing walk notes and retains it |
+| [`sync_path`](#sync_path) | sync the copy of the path dependency `id` with its source `src`, saying what the sync did unless quiet |
 | [`acquire`](#acquire) | acquire a git dependency's slot through the source and report what changed; `accept` is add taking an existing checkout, and `pinned_only` a range with no selector, which only a pin or an existing checkout realizes |
 | [`preflight`](#preflight) | a fixed git dependency's manifest, and the pins it commits for its ranges, are read at the revision its selector picks, never from whatever its checkout holds |
 | [`effects`](#effects) | a note for each change made before a failure, which the caller shows after it |
@@ -46,20 +47,21 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | On `Request` | |
 | :--- | :--- |
 | [`selects_release`](#selects_release) | a release-selected git dependency: its requirements are the chosen release's |
-| [`index`](#index), [`requests_dnit`](#requests_dnit) | |
+| [`index`](#index) | the position of an identity among the requests |
+| [`requests_dnit`](#requests_dnit) | free every request and then the vector itself |
 | [`declared`](#declared) | the root's own declarations in the manifest table `mt`, appended to `reqs` |
 | [`conflict_text`](#conflict_text) | the example table is valid TOML as printed: values are escaped as the manifest writer would write them |
 
 | Functions | |
 | :--- | :--- |
 | [`pin_command`](#pin_command) | the command that pins and realizes a version-selected dependency with no checkout yet; pull's refusal and init's --no-deps hint both name it |
-| [`unpinned_refusal`](#unpinned_refusal) | |
+| [`unpinned_refusal`](#unpinned_refusal) | the refusal text for a version-selected dependency with no pin and no checkout yet |
 | [`key_text`](#key_text) | a string key as the dependency commands read it: absent reads as empty |
-| [`parse_file`](#parse_file) | |
+| [`parse_file`](#parse_file) | read and parse a manifest file, naming the file when it is not valid TOML |
 
 | Constants | |
 | :--- | :--- |
-| [`COPY_NONE`](#constants), [`COPY_REFRESHED`](#constants), [`COPY_REUSED`](#constants) | |
+| [`COPY_NONE`](#constants) | |
 
 ---
 
@@ -75,6 +77,7 @@ pub rec Operation {
     rep:           *mach.package.report.Report;
     releases:      mach.package.source.Releases;
     releases_open: bool;
+    synced:        str;
 }
 ```
 
@@ -82,7 +85,8 @@ one operation on a project's dependencies: the session and storage it works in, 
 project root, the tables of the source and pin members, and where it reports. `releases`
 is the one table every resolution of the operation reads a url's releases from, so a url is
 listed and its manifests fetched once however many times the operation resolves; it is
-opened by the first resolution, and `releases_open` says whether it has been
+opened by the first resolution, and `releases_open` says whether it has been. `synced` is
+the id of the path dependency whose copy the operation has already synced, nil before one
 
 ### init
 
@@ -142,6 +146,19 @@ directory under dep/ outside the closure, where a realizing walk notes and retai
 | `picks` | the releases resolution chose, or nil |
 | **returns** | err naming the first failure |
 
+### sync_path
+
+```mach
+pub fun sync_path(op: *Operation, id: str, src: str, quiet: bool) res[u8, mach.base.fail.Fail]
+```
+
+sync the copy of the path dependency `id` with its source `src`, saying what the sync did
+unless quiet. the operation records the sync, so its closure walk leaves the copy as it is
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the copy outcome, one of package_path's COPY_MADE, COPY_REFRESHED and COPY_REUSED |
+
 ### acquire
 
 ```mach
@@ -196,10 +213,11 @@ pub rec Request {
 one declared dependency of the closure. `via_release` marks a declaration read from a
 manifest reached through a release-selected edge, whose requirements the resolver reads
 itself from the chosen release; every other declaration is the closure's own. `seed` is the
-revision the declaring dependency's own pin holds for a range it declares, "" when it has
+revision the declaring dependency's own pin holds for a range it declares, nil when it has
 none. `decl` is the request's selector as its manifest line spells it; `overrode` holds, on
 a root declaration by `ref` or `path`, every differing requirement of the same identity it
-replaced; `copied` is what realizing a path dependency did to its copy
+replaced; `copied` is what realizing a path dependency did to its copy, COPY_NONE or one of
+package_path's copy outcomes
 
 ### selects_release
 
@@ -215,11 +233,26 @@ a release-selected git dependency: its requirements are the chosen release's
 pub fun index(reqs: *Vector[Request], id: str) i64
 ```
 
+the position of an identity among the requests
+
+| Parameter | |
+| :--- | :--- |
+| `reqs` | the closure |
+| `id` | the identity to find |
+| **returns** | its index, -1 when no request has it |
+
 ### requests_dnit
 
 ```mach
 pub fun requests_dnit(a: *std.allocator.Allocator, requests: *Vector[Request])
 ```
+
+free every request and then the vector itself
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator that owns the requests' strings |
+| `requests` | the vector to release |
 
 ### declared
 
@@ -282,6 +315,16 @@ pull's refusal and init's --no-deps hint both name it
 pub fun unpinned_refusal(a: *std.allocator.Allocator, root: str, id: str, version: str) res[str, mach.base.fail.Fail]
 ```
 
+the refusal text for a version-selected dependency with no pin and no checkout yet
+
+| Parameter | |
+| :--- | :--- |
+| `a` | allocates the text, which the caller owns |
+| `root` | the project root, as the command names it |
+| `id` | the dependency identity |
+| `version` | the range it declares |
+| **returns** | the text naming the command that pins it, err when it cannot be formatted |
+
 ### key_text
 
 ```mach
@@ -296,11 +339,18 @@ a string key as the dependency commands read it: absent reads as empty
 pub fun parse_file(a: *std.allocator.Allocator, sources: *mach.base.source.SourceMap, p: str) res[mach.manifest.load.Doc, mach.base.fail.Fail]
 ```
 
+read and parse a manifest file, naming the file when it is not valid TOML
+
+| Parameter | |
+| :--- | :--- |
+| `a` | allocates the document, which the caller frees with doc_dnit |
+| `sources` | the source map the file is registered in |
+| `p` | the manifest path |
+| **returns** | the document, err when it cannot be read or parsed |
+
 ## Constants
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
 | `COPY_NONE` | `u8` | `0` |  |
-| `COPY_REFRESHED` | `u8` | `1` |  |
-| `COPY_REUSED` | `u8` | `2` |  |
 

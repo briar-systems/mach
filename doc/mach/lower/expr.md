@@ -15,15 +15,17 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 
 | Functions | |
 | :--- | :--- |
-| [`lower_rvalue`](#lower_rvalue) | |
+| [`lower_rvalue`](#lower_rvalue) | lower the expression `eid` as a value, at its own source location, a value of a secret type classified secret |
 | [`symbol_linkage_name`](#symbol_linkage_name) | the linkage name of the module-level binding `eid` names, nil when it names a binding with none |
-| [`try_lower_comptime_intrinsic`](#try_lower_comptime_intrinsic) | |
+| [`try_lower_comptime_intrinsic`](#try_lower_comptime_intrinsic) | lower a call of a comptime intrinsic a runtime value stands for: a comptime path, `$type_name`, `$type_id`, `$zeroize`, or a layout measurement as `$size_of` |
 | [`expr_span_of`](#expr_span_of) | where expression `eid` is written; an expression its syntax lacks records an internal failure and has the empty span |
 | [`lower_stored_rvalue`](#lower_stored_rvalue) | the value a store consumes |
 | [`branch_on`](#branch_on) | branch to `then_b` where the condition `eid` holds, else to `else_b` |
-| [`condition_value`](#condition_value) | |
-| [`refuse_mixed`](#refuse_mixed) | write `v` to `ptr`, a place of source type `ty`, stating the memory it writes as secret or public as `ty` is refuse the pointer `v` written where `at` holds a pointer of the type `held` names, when one of the two is physical and the other logical: memory, a result and a parameter no call names a storage of hold physical pointers only, and a pointer local holds the class its initializer gave it, so a logical pointer stored there, or a physical one where a logical one is held, is a register one path makes logical and another physical (types.md, "pointers on spir-v") |
-| [`store_stated`](#store_stated), [`const_value_of_init`](#const_value_of_init), [`type_is_volatile_record`](#type_is_volatile_record) | |
+| [`condition_value`](#condition_value) | the truth a branch tests of `v`, the value of the condition `eid`: a comparison, a logical operator or a runtime `sel` as it is, any other value compared equal to 1 |
+| [`refuse_mixed`](#refuse_mixed) | refuse the pointer `v` written where `at` holds a pointer of the type `held` names, when one of the two is physical and the other logical: memory, a result and a parameter no call names a storage of hold physical pointers only, and a pointer local holds the class its initializer gave it, so a logical pointer stored there, or a physical one where a logical one is held, is a register one path makes logical and another physical (types.md, "pointers on spir-v") |
+| [`store_stated`](#store_stated) | write `v` to `ptr`, a place of source type `ty`, stating the memory it writes as secret or public as `ty` is |
+| [`const_value_of_init`](#const_value_of_init) | the comptime scalar `v` as a value of the type of `eid`, as a global's initializer names it |
+| [`type_is_volatile_record`](#type_is_volatile_record) | whether `sem_ty`, its secret qualifier stripped, is a record, union or tag declared volatile |
 
 ---
 
@@ -34,6 +36,15 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 ```mach
 pub fun lower_rvalue(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
+
+lower the expression `eid` as a value, at its own source location, a value of a secret type
+classified secret
+
+| Parameter | |
+| :--- | :--- |
+| `ctx` | the lowering context, positioned in the block the expression is evaluated in |
+| `eid` | the expression |
+| **returns** | the value, the address of its storage for an aggregate not held whole, or the failure located at the expression |
 
 ### symbol_linkage_name
 
@@ -49,6 +60,16 @@ none
 ```mach
 pub fun try_lower_comptime_intrinsic(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId, e: *mach.front.ast.expr.Expr) opt[res[mach.lower.value.Value, mach.base.fail.Fail]]
 ```
+
+lower a call of a comptime intrinsic a runtime value stands for: a comptime path,
+`$type_name`, `$type_id`, `$zeroize`, or a layout measurement as `$size_of`
+
+| Parameter | |
+| :--- | :--- |
+| `ctx` | the lowering context |
+| `eid` | the call |
+| `e` | the call's syntax |
+| **returns** | none when the call is no such intrinsic, else the value or the failure lowering it met |
 
 ### expr_span_of
 
@@ -85,13 +106,22 @@ its right operand runs only where the left does not decide
 pub fun condition_value(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId, v: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+the truth a branch tests of `v`, the value of the condition `eid`: a comparison, a logical
+operator or a runtime `sel` as it is, any other value compared equal to 1
+
+| Parameter | |
+| :--- | :--- |
+| `ctx` | the lowering context |
+| `eid` | the condition |
+| `v` | its lowered value |
+| **returns** | the truth value, or the builder's failure |
+
 ### refuse_mixed
 
 ```mach
 pub fun refuse_mixed(ctx: *mach.lower.context.LowerContext, v: mach.lower.value.Value, at: mach.lower.value.Value, held: Type, span: mach.base.source.Span) err[mach.base.fail.Fail]
 ```
 
-write `v` to `ptr`, a place of source type `ty`, stating the memory it writes as secret or public as `ty` is
 refuse the pointer `v` written where `at` holds a pointer of the type `held` names, when one of
 the two is physical and the other logical: memory, a result and a parameter no call names a
 storage of hold physical pointers only, and a pointer local holds the class its initializer
@@ -104,15 +134,43 @@ a register one path makes logical and another physical (types.md, "pointers on s
 pub fun store_stated(ctx: *mach.lower.context.LowerContext, v: mach.lower.value.Value, ptr: mach.lower.value.Value, ty: mach.type.kind.TypeId, vol: bool) err[mach.base.fail.Fail]
 ```
 
+write `v` to `ptr`, a place of source type `ty`, stating the memory it writes as secret or public as `ty` is
+
+| Parameter | |
+| :--- | :--- |
+| `ctx` | the lowering context, positioned where the store goes |
+| `v` | the value stored |
+| `ptr` | the address of the place |
+| `ty` | the place's source type, which decides the secrecy the store states |
+| `vol` | whether the store is volatile |
+| **returns** | ok, or a pointer of one class written where one of the other is held refused, or the builder's failure |
+
 ### const_value_of_init
 
 ```mach
 pub fun const_value_of_init(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId, v: mach.front.comptime.value.CTValue) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
+the comptime scalar `v` as a value of the type of `eid`, as a global's initializer names it
+
+| Parameter | |
+| :--- | :--- |
+| `ctx` | the lowering context |
+| `eid` | the expression whose type the value takes |
+| `v` | an integer, float or string comptime value |
+| **returns** | the constant, a string's being the address of a global holding its bytes, or a failure for any other kind of value |
+
 ### type_is_volatile_record
 
 ```mach
 pub fun type_is_volatile_record(ctx: *mach.lower.context.LowerContext, sem_ty: mach.type.kind.TypeId) bool
 ```
+
+whether `sem_ty`, its secret qualifier stripped, is a record, union or tag declared volatile
+
+| Parameter | |
+| :--- | :--- |
+| `ctx` | the lowering context |
+| `sem_ty` | the source type |
+| **returns** | true for a volatile nominal aggregate, false for any other type |
 

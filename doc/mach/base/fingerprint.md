@@ -19,7 +19,11 @@ Uses types from [`mach.base.fail`](fail.md), [`mach.base.intern`](intern.md), [`
 
 | On `Domain` | |
 | :--- | :--- |
-| [`DOMAIN_BUILD_GOAL`](#domain), [`DOMAIN_ARCH`](#domain), [`DOMAIN_ABI`](#domain), [`DOMAIN_OS`](#domain), [`DOMAIN_BUILD_STEP`](#domain), [`DOMAIN_OF`](#domain), [`DOMAIN_IMAGE`](#domain), [`put_domain_u8`](#put_domain_u8), [`put_domain_u64`](#put_domain_u64), [`put_domain_bytes`](#put_domain_bytes), [`put_domain_str`](#put_domain_str) | |
+| [`DOMAIN_BUILD_GOAL`](#domain), [`DOMAIN_ARCH`](#domain), [`DOMAIN_ABI`](#domain), [`DOMAIN_OS`](#domain), [`DOMAIN_BUILD_STEP`](#domain), [`DOMAIN_OF`](#domain), [`DOMAIN_IMAGE`](#domain) | |
+| [`put_domain_u8`](#put_domain_u8) | a u8 after its domain and schema version |
+| [`put_domain_u64`](#put_domain_u64) | a u64 after its domain and schema version |
+| [`put_domain_bytes`](#put_domain_bytes) | the `len` bytes at `p`, as their u32 length then the bytes, after their domain and schema version |
+| [`put_domain_str`](#put_domain_str) | a text, as its u32 length then its bytes, after its domain and schema version |
 
 | Functions | |
 | :--- | :--- |
@@ -54,11 +58,15 @@ pub def Domain: u16
 pub fun put_domain_u8(s: *mach.base.wire.Sink, domain: Domain, schema_version: u8, value: u8)
 ```
 
+a u8 after its domain and schema version
+
 ### put_domain_u64
 
 ```mach
 pub fun put_domain_u64(s: *mach.base.wire.Sink, domain: Domain, schema_version: u8, value: u64)
 ```
+
+a u64 after its domain and schema version
 
 ### put_domain_bytes
 
@@ -66,11 +74,15 @@ pub fun put_domain_u64(s: *mach.base.wire.Sink, domain: Domain, schema_version: 
 pub fun put_domain_bytes(s: *mach.base.wire.Sink, domain: Domain, schema_version: u8, p: *u8, len: usize)
 ```
 
+the `len` bytes at `p`, as their u32 length then the bytes, after their domain and schema version
+
 ### put_domain_str
 
 ```mach
 pub fun put_domain_str(s: *mach.base.wire.Sink, domain: Domain, schema_version: u8, text: str)
 ```
+
+a text, as its u32 length then its bytes, after its domain and schema version
 
 ## Functions
 

@@ -19,13 +19,14 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.manifest.load`](.
 
 | On `Slot` | |
 | :--- | :--- |
-| [`slot_dnit`](#slot_dnit), [`observe_slot`](#observe_slot) | |
+| [`slot_dnit`](#slot_dnit) | free what an observed slot owns and leave it empty |
+| [`observe_slot`](#observe_slot) | observe dep/\<id>: what the directory holds and, when the project records pins, its registration in .gitmodules, its module store and its committed gitlink |
 | [`realize_slot`](#realize_slot) | bring a slot `refuse_slot` accepted to the realization `mach dep verify` checks |
 
 | Functions | |
 | :--- | :--- |
 | [`own_work_tree`](#own_work_tree) | whether `dep_full` is a checkout of its own, holding its own `.git` |
-| [`revision`](#revision) | |
+| [`revision`](#revision) | the commit a dependency's checkout is at |
 | [`selection_commit`](#selection_commit) | the commit the fixed selector `ref` picks in the checkout at dep_full: a commit or a tag as named, and a branch at dep/\<id>'s pin unless `advance` moves it, then at its fetched tip |
 | [`manifest_at`](#manifest_at) | the manifest the commit `rev` of the repository at `dir` holds, allocated from `alloc` |
 | [`release_at_pin`](#release_at_pin) | the release version dep/\<id>'s pin is tagged with, read from its checkout's refs (an owned "" when no release tag points at it); the highest wins, and the caller frees the result |
@@ -67,11 +68,29 @@ tree, and then there is no record to read
 pub fun slot_dnit(alloc: *std.allocator.Allocator, slot: *Slot)
 ```
 
+free what an observed slot owns and leave it empty
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | the allocator that owns the slot's strings |
+| `slot` | the slot to release |
+
 ### observe_slot
 
 ```mach
 pub fun observe_slot(s: *mach.session.Session, root: str, id: str, mode: u8) res[Slot, mach.base.fail.Fail]
 ```
+
+observe dep/\<id>: what the directory holds and, when the project records pins, its
+registration in .gitmodules, its module store and its committed gitlink
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session, whose allocator owns the slot's strings |
+| `root` | the project root |
+| `id` | the dependency identity |
+| `mode` | how the project records pins, a pin.mach mode |
+| **returns** | the slot, freed with slot_dnit, err when the directory or the repository cannot be read |
 
 ### realize_slot
 
@@ -100,6 +119,14 @@ whether `dep_full` is a checkout of its own, holding its own `.git`
 ```mach
 pub fun revision(s: *mach.session.Session, dep_full: str) res[str, mach.base.fail.Fail]
 ```
+
+the commit a dependency's checkout is at
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the session, whose allocator holds the answer |
+| `dep_full` | the dependency directory |
+| **returns** | HEAD's commit id, owned by the session's allocator, err when the directory is not a checkout of its own or git fails |
 
 ### selection_commit
 

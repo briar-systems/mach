@@ -16,18 +16,19 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.handle`](../bas
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`EmbedFile`](#embedfile) | `rec` |  |
+| [`EmbedFile`](#embedfile) | `rec` | one embedded file as the cache last read it |
 | [`EmbedCache`](#embedcache) | `rec` | the embedded files of one build, found by interned path |
 | [`Resolution`](#resolution) | `rec` | what an `embed` argument resolves to |
 
 | On `EmbedCache` | |
 | :--- | :--- |
-| [`init`](#init) | |
+| [`init`](#init) | an empty cache with no root and no scopes bound, building artifacts |
 | [`set_path_env`](#set_path_env) | bind the build a path resolves in: the root embeds are contained in and templates expand against, and the requirement scope of each project whose modules the build compiles |
-| [`dnit`](#dnit) | |
+| [`dnit`](#dnit) | release every entry's bytes and the entry store |
 | [`get`](#get) | the entry for a path the cache holds |
 | [`resolve_arg`](#resolve_arg) | resolve an `embed` argument: a literal path against the declaring file's directory, a template against the root in the declaring module's project scope |
-| [`escapes_root`](#escapes_root), [`refresh`](#refresh) | |
+| [`escapes_root`](#escapes_root) | check lexical and existing-parent containment beneath the project root a missing parent is left to embed loading, while an incomplete check is err |
+| [`refresh`](#refresh) | read a file into its entry and publish its status and digest as a query input a file that is missing, a directory, unreadable or too large is recorded in the entry's status, not returned as a failure |
 | [`count`](#count) | the number of entries the cache holds |
 | [`insert`](#insert) | add an entry under a path the cache does not hold yet, into a chunk it never leaves; the entry's bytes belong to the cache from here and dnit frees them |
 
@@ -50,6 +51,17 @@ pub rec EmbedFile {
     digest: [32]u8;
 }
 ```
+
+one embedded file as the cache last read it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `path` | `mach.base.intern.StrId` | the file's interned path |
+| `status` | `EmbedStatus` | whether it was read, or why not (missing, a directory, unreadable, too large) |
+| `reason` | `str` | the text of a failed status, empty when the read succeeded |
+| `bytes` | `*u8` | the file's contents, owned by the cache, nil when it is empty or was not read |
+| `len` | `u32` | the byte length of `bytes` |
+| `digest` | `[32]u8` | the sha-256 of the contents, all zero when the file was not read |
 
 ## EmbedCache
 
@@ -82,6 +94,13 @@ entry in place, so a holder reads the current status, bytes and digest
 pub fun init(alloc: *std.allocator.Allocator) EmbedCache
 ```
 
+an empty cache with no root and no scopes bound, building artifacts
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | the allocator the cache's entries and their bytes come from |
+| **returns** | the cache, released with `dnit` |
+
 ### set_path_env
 
 ```mach
@@ -106,6 +125,12 @@ modules the build compiles
 ```mach
 pub fun dnit(c: *EmbedCache)
 ```
+
+release every entry's bytes and the entry store
+
+| Parameter | |
+| :--- | :--- |
+| `c` | the cache to release |
 
 ### get
 
@@ -145,11 +170,33 @@ directory, a template against the root in the declaring module's project scope
 pub fun escapes_root(alloc: *std.allocator.Allocator, c: *EmbedCache, resolved: str) res[bool, mach.base.fail.Fail]
 ```
 
+check lexical and existing-parent containment beneath the project root
+a missing parent is left to embed loading, while an incomplete check is err
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | the allocator the check's scratch paths come from |
+| `c` | the cache holding the project root |
+| `resolved` | the resolved `embed` path |
+| **returns** | true when the path lies outside the root or a component of its existing parent is a symlink, false when no root is bound, the root is missing or the path is contained. err when the working directory cannot be read, the root or a component cannot be inspected, the root is not a directory, the path crosses a non-directory, or an allocation is refused |
+
 ### refresh
 
 ```mach
 pub fun refresh(c: *EmbedCache, db: *mach.session.query.QueryDb, itn: *mach.base.intern.Interner, p: str) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
+
+read a file into its entry and publish its status and digest as a query input
+a file that is missing, a directory, unreadable or too large is recorded in the entry's
+status, not returned as a failure
+
+| Parameter | |
+| :--- | :--- |
+| `c` | the cache holding the entry, created here when the path is new |
+| `db` | the query database the entry is published to |
+| `itn` | interns the path |
+| `p` | the file's resolved path |
+| **returns** | the interned path, or a failure when interning, storing, copying the bytes or setting the input is refused |
 
 ### count
 

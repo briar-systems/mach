@@ -10,7 +10,7 @@ Uses types from [`mach.base.fail`](fail.md).
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Arc`](#arc) | `rec` |  |
+| [`Arc`](#arc) | `rec` | a directed arc between two numbered nodes |
 
 | On `Arc` | |
 | :--- | :--- |
@@ -26,6 +26,13 @@ pub rec Arc {
     to:   u32;
 }
 ```
+
+a directed arc between two numbered nodes
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `from` | `u32` | the node it leaves |
+| `to` | `u32` | the node it enters |
 
 ### components
 

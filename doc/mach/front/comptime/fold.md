@@ -19,7 +19,7 @@ Uses types from [`mach.base.float`](../../base/float.md), [`mach.base.wide`](../
 
 | On `Kind` | |
 | :--- | :--- |
-| [`fold_op`](#fold_op) | fold `op` over `n` operands of kind `k`, the results read at `out`, with the immediate type `to` where the row takes one |
+| [`fold_op`](#fold_op) | fold `op` over `n` operands of kind `k`, with the immediate type `to` where the row takes one |
 | [`convert`](#convert) | a conversion of `x`, read as `from`, to `to` by mirl's conversion row `op`, a nan result made by the target's rule `nans` |
 
 | On `Answer` | |
@@ -62,8 +62,7 @@ the type an operand or a result is read at
 pub fun fold_op(op: Opcode, k: Kind, x: [3]mach.base.wide.Wide, n: u32, to: opt[Kind], nans: mach.target.facts.Nans) Answer
 ```
 
-fold `op` over `n` operands of kind `k`, the results read at `out`, with the
-immediate type `to` where the row takes one
+fold `op` over `n` operands of kind `k`, with the immediate type `to` where the row takes one
 
 | Parameter | |
 | :--- | :--- |
@@ -73,6 +72,7 @@ immediate type `to` where the row takes one
 | `n` | how many, at most three |
 | `to` | the kind the row's type immediate states, none for a row with no immediate |
 | `nans` | the nan the target's float operations return in each format |
+| **returns** | the folded results, or why the folder refused |
 
 ### convert
 

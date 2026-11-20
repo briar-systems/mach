@@ -24,11 +24,11 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 
 | Functions | |
 | :--- | :--- |
-| [`artifact_product_name`](#artifact_product_name) | |
+| [`artifact_product_name`](#artifact_product_name) | the name the artifact's product goes by, its `bin_name`, empty when that is not interned |
 | [`emit_static_archive`](#emit_static_archive) | the archive of the build's objects, each unit's, read back from `inputs` in their order, as mink's archive writer lays one out in the variant its registry states for the target's format, its index naming each member's exported symbols |
 | [`object_count`](#object_count) | the objects every program of the build links: each unit's |
 | [`ordered_inputs`](#ordered_inputs) | the build's objects as the link's inputs, in the link's order: the units' in the topological order of their modules |
-| [`ordered_inputs_free`](#ordered_inputs_free) | |
+| [`ordered_inputs_free`](#ordered_inputs_free) | release the input array `ordered_inputs` returned |
 | [`objects_into`](#objects_into) | the build's objects in the link's order into `into`, which holds object_count of them |
 | [`input_name`](#input_name) | what the link calls the objects of module `m`: its source file, which outlives the link |
 | [`test_input_name`](#test_input_name) | the name module m's test object goes to the link under, set apart from its object's |
@@ -56,6 +56,18 @@ pub rec LoadedImageOptions {
 
 the resources an executable declares: its icon and manifest, read, with the
 version and names an image's version resource states
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `declared` | `bool` | whether the rest were read: the image states a subsystem and declares an icon or a manifest |
+| `icon_bytes` | `Vector[u8]` | the icon file's bytes, empty for none |
+| `manifest_bytes` | `Vector[u8]` | the application manifest's bytes, empty for none |
+| `icon_path` | `str` | the icon file's path, owned, nil for none |
+| `manifest_path` | `str` | the application manifest's path, owned, nil for none |
+| `version` | `str` | the project's version, borrowed |
+| `internal_name` | `str` | the artifact's `bin_name`, borrowed |
+| `original_filename` | `str` | the file name of the executable, borrowed from its path |
+| `product_name` | `str` | the artifact's `bin_name`, borrowed |
 
 ### dnit_image_options
 
@@ -95,6 +107,13 @@ itself reported to `diags`, answering what the link read
 pub fun artifact_product_name(p: *mach.compile.project.Project) *u8
 ```
 
+the name the artifact's product goes by, its `bin_name`, empty when that is not interned
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the project |
+| **returns** | the name, held by the session's names |
+
 ### emit_static_archive
 
 ```mach
@@ -127,6 +146,13 @@ order of their modules
 ```mach
 pub fun ordered_inputs_free(p: *mach.compile.project.Project, inputs: *Given)
 ```
+
+release the input array `ordered_inputs` returned
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the project the array was made for, whose allocator owns it |
+| `inputs` | the array |
 
 ### objects_into
 

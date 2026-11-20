@@ -179,7 +179,7 @@ one resolved cell of a selection
 | `target` | `str` | the target the cell is planned with: the declared name, or "" when the target axis took the manifest's default, so planning resolves it (and warns about a fallback) exactly as an unselected build does |
 | `target_name` | `str` | the declared target the cell resolves to |
 | `profile` | `str` | the declared profile name |
-| `native` | `bool` | the target's `os` and `isa` are the host's, so its programs run here |
+| `native` | `bool` | the target's `sys` and `arch` are the host's, so its programs run here |
 
 ### cell_of
 
@@ -225,7 +225,7 @@ the outcome of target resolution for a selection
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `target` | `*TargetDef` | the chosen target; points into the manifest unless synthesized for a manifest with no `[target.*]`, in which case it is allocated and never freed by `dnit` target borrows its manifest-owned declaration until manifest destruction |
+| `target` | `*TargetDef` | the chosen target; points into the manifest, or for a manifest with no `[target.*]` at its synthesized host target, which the manifest owns and `dnit` frees target borrows its manifest-owned declaration until manifest destruction |
 
 ### resolve_target
 
@@ -244,6 +244,7 @@ otherwise `native`
 pub rec ResolvedProfile {
     name:         mach.base.intern.StrId;
     optimize:     bool;
+    passes:       PassChoices;
     relax:        NameList;
     relax_named:  str;
     linker_relax: bool;
@@ -260,6 +261,7 @@ the profile a selection resolves to, copied out of its `ProfileDef`
 | :--- | :--- | :--- |
 | `name` | `mach.base.intern.StrId` | the profile's name |
 | `optimize` | `bool` | as `ProfileDef` |
+| `passes` | `PassChoices` | as `ProfileDef`, borrowed from the manifest |
 | `relax` | `NameList` | as `ProfileDef`, borrowed from the manifest |
 | `relax_named` | `str` | as `ProfileDef` |
 | `linker_relax` | `bool` | as `ProfileDef` |

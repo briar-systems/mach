@@ -28,19 +28,19 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`Kind`](#kind) | `rec` | one kind of product, declared once beside the computation that owns it |
 | [`QueryKey`](#querykey) | `rec` | a product's address: the row of its kind and its key |
 | [`Operation`](#operation) | `rec` | a handle on one query operation: the span between begin and end in which products are computed and validated |
-| [`PreparedQuery`](#preparedquery) | `rec` |  |
+| [`PreparedQuery`](#preparedquery) | `rec` | a handle on a product prepare computed, which complete_prepared publishes or cancel_prepared drops |
 | [`Presentation`](#presentation) | `rec` | what collect hands the caller after an operation: the diagnostics of every product reachable from the roots, copied into a store the caller's allocator owns, and the operation's failure if it had one |
-| [`QueryOutput`](#queryoutput) | `rec` |  |
+| [`QueryOutput`](#queryoutput) | `rec` | the bytes a derived product's computation publishes, allocated from the allocator it was handed |
 | [`QueryView`](#queryview) | `rec` | a borrowed view of a published product's bytes |
-| [`QueryDb`](#querydb) | `rec` |  |
+| [`QueryDb`](#querydb) | `rec` | the query database: one shard per kind, the open operation's state and the failures it holds |
 | [`QueryRuntime`](#queryruntime) | `rec` | the database as an operation's computations see it: each product is computed with the runtime's context, a `T` the computations of every kind read through |
-| [`PreparedRetirement`](#preparedretirement) | `rec` |  |
+| [`PreparedRetirement`](#preparedretirement) | `rec` | the products a retirement removes, valid while the database stays as it was prepared against |
 | [`ProductFilter`](#productfilter) | `def` | whether a product walk enters a product, visiting it and walking what it was computed from reached through walk_products |
 | [`ProductVisit`](#productvisit) | `def` | what a product walk is shown of each product: its address and the store it reported into, nil when it reported nothing reached through walk_products |
 | [`Read`](#read) | `rec` | a computation that reads off the stack |
 | [`ReadLog`](#readlog) | `rec` | the reads of one computation in the order it made them, those before `done` replayed |
 | [`ReadFn`](#readfn) | `def` | how a computation reads a product: through `get` on the owner, or through views it logs reached through Reads.read |
-| [`Reads`](#reads) | `rec` |  |
+| [`Reads`](#reads) | `rec` | how one computation reads products |
 | [`Views`](#views) | `rec` | products a reading may read, each validated in this operation, ready and not given back |
 
 | On `KeyOwner` | |
@@ -64,7 +64,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`origin_of`](#origin_of) | the origin of the product that raised `f`: the operation's, the held failure's or the last presentation's when `f` reads that failure's text, ORIGIN_NONE for any other failure and for one raised outside every computation |
 | [`presented_dnit`](#presented_dnit) | release the last operation's presentation and the failure held beside it |
 | [`dnit`](#dnit) | tear the database down: every owned product's finalizer runs on its bytes, every shard and the operation state are released |
-| [`runtime`](#runtime) | |
+| [`runtime`](#runtime) | the runtime an operation's computations read the database through |
 | [`begin`](#begin) | open an operation |
 | [`end`](#end) | close an operation: no computation may be on the stack and no prepared product may be unfinished |
 | [`discard`](#discard) | release a pending presentation without collecting it: the attempts, the failure and its message are dropped and the db accepts the next begin |
@@ -75,9 +75,9 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`prepare_owned_retirement`](#prepare_owned_retirement) | a retirement rooted at every product whose key a released module or file owns, with its dependents |
 | [`prepared_held`](#prepared_held) | whether the prepared query's compute failed, its failure held for complete_prepared to record |
 | [`preparing`](#preparing) | whether the computation on the stack is the prepare of the product `kind` keys under `key`, which a compute reads to tell a prepare that finishes it outside the computation from a read that does not |
-| [`prepared_view`](#prepared_view) | |
+| [`prepared_view`](#prepared_view) | a view of a prepared product's bytes, before they are published |
 | [`prepared_diags`](#prepared_diags) | the store a prepared query's compute reports into: work finished outside the compute (a worker thread's optimize) appends there, so a refusal it records reaches the presentation like one the compute made itself |
-| [`cancel_prepared`](#cancel_prepared) | |
+| [`cancel_prepared`](#cancel_prepared) | drop a prepared product unpublished, keeping its dependencies and diagnostics as the attempt's evidence |
 | [`complete_prepared`](#complete_prepared) | publish a prepared product, or record its failure: the one its compute raised, held until now, else `result`, the failure of the work finished outside the computation |
 | [`walk_products`](#walk_products) | visit a product and every product it was computed from that the filter enters, each once and its dependencies first, as presentation walks them |
 | [`peek_revision`](#peek_revision) | the revision a product last changed at, without validating it; 0 when it has none |
@@ -92,20 +92,24 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`get`](#get) | the current value of a product, computing or revalidating it inside the open operation and recording it as a dependency of the product being computed, if any |
 | [`reusable`](#reusable) | validation may refresh dependencies but never computes the requested product |
 | [`prepare`](#prepare) | compute a derived product the caller finishes outside the computation (a worker thread), published by complete_prepared or dropped by cancel_prepared before the operation ends |
-| [`revision`](#revision-1), [`depend`](#depend) | |
+| [`revision`](#revision-1) | the revision a product last changed at, read as `get` reads it |
+| [`depend`](#depend) | record a dependency on a product without reading its bytes, validating or computing it as `get` does |
 
 | On `PreparedRetirement` | |
 | :--- | :--- |
 | [`discard_retirement`](#discard_retirement) | release a retirement that was prepared and not committed; one already committed or discarded owns nothing |
-| [`validate_retirement`](#validate_retirement), [`commit_retirement`](#commit_retirement) | |
+| [`validate_retirement`](#validate_retirement) | whether a prepared retirement still matches its database |
+| [`commit_retirement`](#commit_retirement) | remove every selected product, its finalizer run on its bytes, and release the retirement a retirement that removes anything takes a new revision |
 
 | On `ReadLog` | |
 | :--- | :--- |
-| [`log_init`](#log_init), [`log_dnit`](#log_dnit) | |
+| [`log_init`](#log_init) | an empty read log |
+| [`log_dnit`](#log_dnit) | release a read log |
 
 | On `Views` | |
 | :--- | :--- |
-| [`views_init`](#views_init), [`views_dnit`](#views_dnit) | |
+| [`views_init`](#views_init) | an empty view set |
+| [`views_dnit`](#views_dnit) | release a view set, leaving its base alone |
 | [`view_read`](#view_read) | the product `kind` keys under `key` read through `v` and logged, or none when `v` does not hold it |
 
 ---
@@ -241,6 +245,13 @@ pub rec PreparedQuery {
 }
 ```
 
+a handle on a product prepare computed, which complete_prepared publishes or cancel_prepared drops
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `operation` | `Operation` | the operation it was prepared in |
+| `key` | `Slot` | the product's address in the database |
+
 ## Presentation
 
 ```mach
@@ -280,6 +291,13 @@ pub rec QueryOutput {
     len:   u32;
 }
 ```
+
+the bytes a derived product's computation publishes, allocated from the allocator it was handed
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `bytes` | `*u8` | the product's bytes, nil exactly when `len` is 0 |
+| `len` | `u32` | their length |
 
 ## QueryView
 
@@ -342,6 +360,26 @@ pub rec QueryDb {
     failure_origin:  mach.base.diagnostic.Origin;
 }
 ```
+
+the query database: one shard per kind, the open operation's state and the failures it holds
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `a` | `*std.allocator.Allocator` | owns the db, its shards and every derived product's bytes |
+| `revision` | `Revision` | the latest revision issued |
+| `storage` | `**QueryShard` | the shards, indexed by kind |
+| `storage_cap` | `u32` | the capacity of `storage` |
+| `kinds` | `u32` | how many shards `storage` holds |
+| `compute_depth` | `u32` | how many computations are running |
+| `stack` | `Vector[StackFrame]` | the products being computed or validated, innermost last |
+| `prepared_count` | `usize` | how many prepared products are not yet completed or cancelled |
+| `operation_sequence` | `u64` | the number of the latest operation |
+| `operation_active` | `bool` | an operation is open |
+| `presentation_pending` | `bool` | an ended operation's presentation is not yet collected or discarded |
+| `rejections` | `u64` | how many reads in the open operation were rejected |
+| `attempts` | `Vector[Attempt]` | each product the open operation tried, with its prepare and failure state |
+| `attempt_index` | `Map[Slot, usize]` | each tried product's index in `attempts` |
+| `validated` | `Map[Slot, Revision]` | each product the open operation read and the revision it read, 0 while it computes |
 
 ### init
 
@@ -423,6 +461,13 @@ and the operation state are released. nil is a no-op
 ```mach
 pub fun runtime[T](db: *QueryDb) res[QueryRuntime[T], mach.base.fail.Fail]
 ```
+
+the runtime an operation's computations read the database through
+
+| Parameter | |
+| :--- | :--- |
+| `db` | the database |
+| **returns** | the runtime, or a failure when `db` is nil |
 
 ### begin
 
@@ -573,6 +618,14 @@ compute reads to tell a prepare that finishes it outside the computation from a 
 pub fun prepared_view(db: *QueryDb, prepared: PreparedQuery) res[QueryView, mach.base.fail.Fail]
 ```
 
+a view of a prepared product's bytes, before they are published
+
+| Parameter | |
+| :--- | :--- |
+| `db` | the database |
+| `prepared` | the handle prepare returned |
+| **returns** | the view, with last_changed 0, valid until the product is completed or cancelled, or a failure when the handle is stale or consumed |
+
 ### prepared_diags
 
 ```mach
@@ -588,6 +641,16 @@ reaches the presentation like one the compute made itself
 ```mach
 pub fun cancel_prepared(db: *QueryDb, prepared: PreparedQuery) err[mach.base.fail.Fail]
 ```
+
+drop a prepared product unpublished, keeping its dependencies and diagnostics as the attempt's
+evidence. a failure its compute raised stays unrecorded. a product with no earlier entry is
+removed, and an earlier one is marked stale so it is not served
+
+| Parameter | |
+| :--- | :--- |
+| `db` | the database |
+| `prepared` | the handle prepare returned |
+| **returns** | ok, or a failure when the handle is stale or consumed |
 
 ### complete_prepared
 
@@ -740,11 +803,32 @@ fails the operation before the products the caller completes ahead of it
 pub fun revision[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) res[Revision, mach.base.fail.Fail]
 ```
 
+the revision a product last changed at, read as `get` reads it
+
+| Parameter | |
+| :--- | :--- |
+| `rt` | the runtime of the open operation |
+| `ctx` | the context every row's computation reads through |
+| `kind` | the product's row |
+| `key` | the product's key within the kind |
+| **returns** | the revision, or the product's failure |
+
 ### depend
 
 ```mach
 pub fun depend[T](rt: *QueryRuntime[T], ctx: *T, kind: *Kind, key: u64) err[mach.base.fail.Fail]
 ```
+
+record a dependency on a product without reading its bytes, validating or computing it as
+`get` does
+
+| Parameter | |
+| :--- | :--- |
+| `rt` | the runtime of the open operation |
+| `ctx` | the context every row's computation reads through |
+| `kind` | the product's row |
+| `key` | the product's key within the kind |
+| **returns** | ok, or the product's failure |
 
 ## PreparedRetirement
 
@@ -757,6 +841,16 @@ pub rec PreparedRetirement {
     selected:  Map[Slot, usize];
 }
 ```
+
+the products a retirement removes, valid while the database stays as it was prepared against
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `owner` | `*QueryDb` | the database, nil once committed or discarded |
+| `operation` | `u64` | the database's operation number when prepared |
+| `revision` | `Revision` | the database's revision when prepared |
+| `keys` | `Vector[Slot]` | the selected products, each before the products it read |
+| `selected` | `Map[Slot, usize]` | every selected product |
 
 ### discard_retirement
 
@@ -773,11 +867,26 @@ discarded owns nothing
 pub fun validate_retirement(prepared: *PreparedRetirement) err[mach.base.fail.Fail]
 ```
 
+whether a prepared retirement still matches its database
+
+| Parameter | |
+| :--- | :--- |
+| `prepared` | the prepared retirement |
+| **returns** | ok, or a failure when it was committed or discarded, an operation is active or pending, or the database ran an operation or changed revision since it was prepared |
+
 ### commit_retirement
 
 ```mach
 pub fun commit_retirement(prepared: *PreparedRetirement) err[mach.base.fail.Fail]
 ```
+
+remove every selected product, its finalizer run on its bytes, and release the retirement
+a retirement that removes anything takes a new revision
+
+| Parameter | |
+| :--- | :--- |
+| `prepared` | the prepared retirement, released on success |
+| **returns** | ok, or the failure validate_retirement reports, leaving the retirement prepared |
 
 ## ProductFilter
 
@@ -834,11 +943,20 @@ the reads of one computation in the order it made them, those before `done` repl
 pub fun log_init(a: *std.allocator.Allocator) ReadLog
 ```
 
+an empty read log
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator its reads draw from |
+| **returns** | the log, released with `log_dnit` |
+
 ### log_dnit
 
 ```mach
 pub fun log_dnit(log: *ReadLog)
 ```
+
+release a read log
 
 ## ReadFn
 
@@ -857,6 +975,13 @@ pub rec Reads {
     read: ReadFn;
 }
 ```
+
+how one computation reads products
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `ctx` | `ptr` | passed to `read` |
+| `read` | `ReadFn` | reads one product |
 
 ## Views
 
@@ -877,11 +1002,21 @@ set may sit over a `base` set, which it is read through after its own
 pub fun views_init(a: *std.allocator.Allocator, base: *Views) Views
 ```
 
+an empty view set
+
+| Parameter | |
+| :--- | :--- |
+| `a` | the allocator its rows and entries draw from |
+| `base` | the set read after this one, nil for none, borrowed for the set's life |
+| **returns** | the set, released with `views_dnit` |
+
 ### views_dnit
 
 ```mach
 pub fun views_dnit(v: *Views)
 ```
+
+release a view set, leaving its base alone
 
 ### view_read
 

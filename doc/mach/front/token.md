@@ -11,14 +11,17 @@ Uses types from [`mach.base.source`](../base/source.md).
 | Type | | |
 | :--- | :--- | :--- |
 | [`Kind`](#kind) | `def` |  |
-| [`Token`](#token) | `rec` |  |
+| [`Token`](#token) | `rec` | one token of a source |
 | [`Spelling`](#spelling) | `rec` | a token the source spells with fixed punctuation |
 
 | On `Kind` | |
 | :--- | :--- |
-| [`KIND_IDENT`](#kind), [`KIND_LIT_INT`](#kind), [`KIND_LIT_FLOAT`](#kind), [`KIND_LIT_CHAR`](#kind), [`KIND_LIT_STR`](#kind), [`KIND_LPAREN`](#kind), [`KIND_RPAREN`](#kind), [`KIND_LBRACE`](#kind), [`KIND_RBRACE`](#kind), [`KIND_LBRACKET`](#kind), [`KIND_RBRACKET`](#kind), [`KIND_SEMI`](#kind), [`KIND_COLON`](#kind), [`KIND_COMMA`](#kind), [`KIND_DOT`](#kind), [`KIND_QUESTION`](#kind), [`KIND_AT`](#kind), [`KIND_DOLLAR`](#kind), [`KIND_PLUS`](#kind), [`KIND_MINUS`](#kind), [`KIND_STAR`](#kind), [`KIND_SLASH`](#kind), [`KIND_PERCENT`](#kind), [`KIND_AMP`](#kind), [`KIND_PIPE`](#kind), [`KIND_CARET`](#kind), [`KIND_TILDE`](#kind), [`KIND_EQ`](#kind), [`KIND_EQ_EQ`](#kind), [`KIND_BANG`](#kind), [`KIND_BANG_EQ`](#kind), [`KIND_LT`](#kind), [`KIND_LT_EQ`](#kind), [`KIND_LT_LT`](#kind), [`KIND_GT`](#kind), [`KIND_GT_EQ`](#kind), [`KIND_GT_GT`](#kind), [`KIND_AMP_AMP`](#kind), [`KIND_PIPE_PIPE`](#kind), [`KIND_COLON_COLON`](#kind), [`KIND_DOT_DOT_DOT`](#kind), [`KIND_COLON_TILDE`](#kind), [`KIND_DECORATOR_OPEN`](#kind), [`KIND_COLON_GT`](#kind), [`KIND_EOF`](#kind), [`KIND_ERROR`](#kind), [`make`](#make) | |
+| [`KIND_IDENT`](#kind), [`KIND_LIT_INT`](#kind), [`KIND_LIT_FLOAT`](#kind), [`KIND_LIT_CHAR`](#kind), [`KIND_LIT_STR`](#kind), [`KIND_LPAREN`](#kind), [`KIND_RPAREN`](#kind), [`KIND_LBRACE`](#kind), [`KIND_RBRACE`](#kind), [`KIND_LBRACKET`](#kind), [`KIND_RBRACKET`](#kind), [`KIND_SEMI`](#kind), [`KIND_COLON`](#kind), [`KIND_COMMA`](#kind), [`KIND_DOT`](#kind), [`KIND_QUESTION`](#kind), [`KIND_AT`](#kind), [`KIND_DOLLAR`](#kind), [`KIND_PLUS`](#kind), [`KIND_MINUS`](#kind), [`KIND_STAR`](#kind), [`KIND_SLASH`](#kind), [`KIND_PERCENT`](#kind), [`KIND_AMP`](#kind), [`KIND_PIPE`](#kind), [`KIND_CARET`](#kind), [`KIND_TILDE`](#kind), [`KIND_EQ`](#kind), [`KIND_EQ_EQ`](#kind), [`KIND_BANG`](#kind), [`KIND_BANG_EQ`](#kind), [`KIND_LT`](#kind), [`KIND_LT_EQ`](#kind), [`KIND_LT_LT`](#kind), [`KIND_GT`](#kind), [`KIND_GT_EQ`](#kind), [`KIND_GT_GT`](#kind), [`KIND_AMP_AMP`](#kind), [`KIND_PIPE_PIPE`](#kind), [`KIND_COLON_COLON`](#kind), [`KIND_DOT_DOT_DOT`](#kind), [`KIND_COLON_TILDE`](#kind), [`KIND_DECORATOR_OPEN`](#kind), [`KIND_COLON_GT`](#kind) | |
+| [`KIND_ASM_HEAD`](#kind) | an inline-asm block's head and body, each raw text the lexer hands on whole |
+| [`KIND_ASM_BODY`](#kind), [`KIND_EOF`](#kind), [`KIND_ERROR`](#kind) | |
+| [`make`](#make) | a token of `kind` covering `len` bytes from `offset` |
 | [`infix_precedence`](#infix_precedence) | the binding power of an infix operator token; 0 for every other kind, which is not an operator (a partition, enumerated by its test) |
-| [`is_right_assoc`](#is_right_assoc) | |
+| [`is_right_assoc`](#is_right_assoc) | whether an infix operator binds right to left, which only assignment does |
 
 | On `Token` | |
 | :--- | :--- |
@@ -78,6 +81,8 @@ pub def Kind: u8
 | `KIND_COLON_TILDE` | `41` |  |
 | `KIND_DECORATOR_OPEN` | `42` |  |
 | `KIND_COLON_GT` | `43` |  |
+| `KIND_ASM_HEAD` | `44` | an inline-asm block's head and body, each raw text the lexer hands on whole |
+| `KIND_ASM_BODY` | `45` |  |
 | `KIND_EOF` | `254` |  |
 | `KIND_ERROR` | `255` |  |
 
@@ -86,6 +91,15 @@ pub def Kind: u8
 ```mach
 pub fun make(kind: Kind, offset: usize, len: usize) Token
 ```
+
+a token of `kind` covering `len` bytes from `offset`
+
+| Parameter | |
+| :--- | :--- |
+| `kind` | the token's kind |
+| `offset` | byte offset of the token in the source |
+| `len` | byte length of the token |
+| **returns** | the token |
 
 ### infix_precedence
 
@@ -102,6 +116,13 @@ is not an operator (a partition, enumerated by its test)
 pub fun is_right_assoc(kind: Kind) bool
 ```
 
+whether an infix operator binds right to left, which only assignment does
+
+| Parameter | |
+| :--- | :--- |
+| `kind` | the operator token's kind |
+| **returns** | true for `=`, false for every other kind |
+
 ## Token
 
 ```mach
@@ -110,6 +131,13 @@ pub rec Token {
     kind: Kind;
 }
 ```
+
+one token of a source
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `span` | `mach.base.source.Span` | where the token lies in the source |
+| `kind` | `Kind` | what the token is |
 
 ### spelling_at
 

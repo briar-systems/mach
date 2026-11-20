@@ -14,7 +14,7 @@ Uses types from [`mach.base.intern`](../base/intern.md), [`mach.base.source`](..
 
 | On `Deprecation` | |
 | :--- | :--- |
-| [`none`](#none) | |
+| [`none`](#none) | the absent notice |
 | [`equal`](#equal) | an absent notice is one value whatever its other fields hold, so a zero-filled record and `none()` compare equal |
 
 ---
@@ -37,6 +37,12 @@ annotation (so it never warns on itself) and the optional message
 ```mach
 pub fun none() Deprecation
 ```
+
+the absent notice
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | a notice with nothing present |
 
 ### equal
 

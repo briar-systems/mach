@@ -16,7 +16,7 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 
 | On `Removal` | |
 | :--- | :--- |
-| [`message`](#message) | |
+| [`message`](#message) | the text that says why removal `r` failed |
 | [`with_cleanup`](#with_cleanup) | the failure `f` reported for removal `r` of `tree`, also naming the close that failed on the way out when there was one |
 | [`refusal`](#refusal) | the failure of removing `op`'s path, which `r` refused outside containment, also naming the close that failed on the way out |
 | [`relative`](#relative) | remove the tree at `rel` beneath `root_fd`, walking to the parent of the last component with a descriptor held at each step |
@@ -24,7 +24,7 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 | Functions | |
 | :--- | :--- |
 | [`open_dir`](#open_dir) | open a directory entry beneath `dir` without following a symlink, writing its handle to out |
-| [`open_path`](#open_path) | |
+| [`open_path`](#open_path) | open the directory at `root`, read relative to the working directory, writing its handle to out |
 
 ---
 
@@ -50,6 +50,13 @@ on the way out, 0 when none did
 ```mach
 pub fun message(r: Removal) str
 ```
+
+the text that says why removal `r` failed
+
+| Parameter | |
+| :--- | :--- |
+| `r` | a failed removal |
+| **returns** | the containment reason, the native message for a native code, or the name of its kind |
 
 ### with_cleanup
 
@@ -93,4 +100,12 @@ open a directory entry beneath `dir` without following a symlink, writing its ha
 ```mach
 pub fun open_path(root: str, out: *usize) i64
 ```
+
+open the directory at `root`, read relative to the working directory, writing its handle to out
+
+| Parameter | |
+| :--- | :--- |
+| `root` | path of the directory |
+| `out` | receives the handle on success |
+| **returns** | 0 on success, otherwise the negative native error code |
 
