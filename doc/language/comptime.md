@@ -41,6 +41,7 @@ The parser distinguishes these by structure:
 | `$project.version.{major,minor,patch}` | structured version components | the root's `[project].version` |
 | `$project.target.{sys,arch,abi}` | the selected target's declared tuple, as strings | the selected `mach.toml` target |
 | `$bin.name` | the artifact being built | the selected build unit (`[artifact.*]`) |
+| `$bin.kind` | that artifact's kind, as the manifest spells it | its `kind` key |
 
 Two roots read a project's identity, and they differ in which project:
 
@@ -77,6 +78,19 @@ session analyzes the project as the union of every artifact, and there a module
 reads the artifact whose walk reached it first: the primary artifact when its
 walk reaches the module, otherwise the first artifact in manifest order that
 does. A module first reached behind a gate decided later reads its importer's.
+
+`$bin.kind` is the `kind` of that same artifact as a string, spelled as the
+manifest spells it: `"bin"`, `"shared"`, `"static"`, `"object"` or
+`"module"`. It is set per artifact exactly as `$bin.name` is, so under the
+editor's union, and under `mach test` with several artifacts selected, a module
+reads the kind of the artifact whose name it reads. A single file built outside a
+project is an executable named after the file: `mach build tool.mach` reads
+`"tool"` and `"bin"`. A build of a project that declares no artifact has
+neither: reading either reports `comptime.path_unavailable`.
+
+```mach fragment
+$if ($bin.kind == "shared") { ... }               # only in a shared library
+```
 
 ```mach fragment
 val ver: str = $project.version;                 # "2.0.0", from [project].version

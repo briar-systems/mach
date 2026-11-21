@@ -182,5 +182,43 @@ offsets and the way it is passed by value can grow with no source change, and
 nothing is rewritten or reported. Check code that persists such a tag's bytes,
 shares it with C, or depends on its `$size_of` or `$offset_of`.
 
+### Names std renamed or moved
+
+`mach migrate` rewrites the language and the manifest, never a name a dependency
+renamed or moved: those are the dependency's own changes, and its `MIGRATION.md`
+lists them. std 10.0.0, the std that pairs with mach 7, made two such changes that touch
+most projects. Both are left for you to change.
+
+Every std record field holding a function for a caller to invoke is named
+`fn_<action>`, its signature unchanged. A literal or a read that spells the old
+name is refused as `field.unknown`, with no hint of the new one.
+
+| std 9.x | std 10.0.0 |
+|---|---|
+| `io.reader.Reader{f_read: ...}`, `io.writer.Writer{f_write: ...}` | `fn_read`, `fn_write` |
+| `log.record.Clock.f_now`, `log.sink.Sink.f_publish`, `log.sink.Direct.f_write` | `fn_now`, `fn_publish`, `fn_write` |
+| `collections.map.MapBy.hash_fn`, `eq_fn` | `fn_hash`, `fn_eq` |
+| `sync.worker_pool.Task.run` | `fn_run` |
+| `net.resolve.Resolver.adapter` | `fn_adapter` |
+
+Modules left std for packages. Declare the package under its key, as
+`[dep.crypto]` with `git = "https://github.com/briar-systems/mach-crypto"`, and
+import the module by its path in the package. A `use` of the old path is refused
+as `use.unresolved`.
+
+| std 9.x | 10.0.0 | package |
+|---|---|---|
+| `std.crypto.hash.sha256`, `sha512`, `keccak`, `sha3_256`, `sha3_512`, `shake128`, `shake256` | `crypto.hash.sha256` and the same names under `crypto.hash` | mach-crypto |
+| `std.crypto.hash.crc32`, `adler32` | `deflate.crc32`, `deflate.adler32` | mach-deflate |
+| `std.compress.inflate`, `deflate`, `zlib`, `gzip`, `format` (and the `compress_format` re-export) | `deflate.inflate` and the same names under `deflate` | mach-deflate |
+| `std.data.json` | `json.parse`, `json.value`, `json.decode`, `json.write`, `json.ndjson`, `json.error` | mach-json |
+| `std.data.toml` | `toml.parse`, `toml.lookup`, `toml.value`, `toml.tree`, `toml.write`, `toml.expr`, `toml.error` | mach-toml |
+
+The moved hashes and checksums take the lifecycle names, as `sha256.init` became
+`sha256.make`, and std's `MIGRATION.md` maps each name of `std.data.json` and
+`std.data.toml` to the module that holds it now. `std.crypto.ct`,
+`std.crypto.rand`, `std.crypto.hash.hasher`, `fnv1a` and `siphash` stay in std.
+`std.types.semver` left std for no package: version handling is mach's own.
+
 New in 7, with nothing to migrate: [`u1`](types.md), [`$zeroize`](comptime-intrinsics.md)
 and the [selection heads](asm.md) of `asm`.

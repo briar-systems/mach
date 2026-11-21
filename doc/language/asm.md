@@ -42,7 +42,7 @@ asm <selection> {
   switched inside a naked function's block instead (see [Code width](#code-width-x86)). A head that repeats
   the state the target enters at, as `rv64i` does on riscv64, sets nothing.
 - **WebAssembly reads a block as masc's wasm text.** The block starts and ends on an
-  empty stack, and a `{name}` is a pointer to the local's storage, reached with
+  empty stack, and a `{name}` of a local is a pointer to the local's storage, reached with
   `local.get`: `asm mvp { local.get {old}  local.get {pages}  i32.load  memory.grow  i32.store }`.
   mirl reads the body, so a body it refuses is refused at the build, not at the head.
 - There is no `asm ... or ...` chain. `$if` chooses the block per target.
@@ -56,7 +56,8 @@ reads source (a build, `mach check`, `mach fmt`, `mach doc`, `mach migrate` and 
 editor) reads it the same way.
 
 - **`asm` beginning a statement is always a block.** A statement begins at the start of
-  the file or a body and after a `;`, `{` or `}`. There, `asm` followed on its line by a
+  the file or a body, after a `;`, `{` or `}`, and after the `]` of a decorator, as
+  `#[noreturn]` before a block. There, `asm` followed on its line by a
   word opens a block: the head is the text after `asm` up to the `{` on that line, and a
   head the line ends before any `{` is refused with `syntax.expected_token`. A statement
   that begins with `asm` and no head, as `asm { ... }` or `asm = 1;`, is refused with
@@ -91,12 +92,47 @@ inert, whatever it holds (`;`, `{}`, `'`, `%` and so on).
 
 ## Operand substitution
 
-`{name}` substitutes a local in scope. The compiler resolves the reference
-to a memory or register operand based on liveness and the instruction's
-expected operand class. In practice a `{name}` binds the local's storage —
-typically a stack slot — so a pointer local's pointee is reached by staging
-the pointer through a scratch register first (`mov rcx, {ptr}` then
-`mov rax, [rcx]`), never by a direct `[{ptr}]` indirection.
+`{name}` names a local, a parameter or a compile-time constant in scope, and resolves
+by what it names:
+
+- **A compile-time constant becomes an immediate** where the instruction takes one
+  there. A constant is a module `val` or a comptime parameter whose value is an
+  integer, and a local whose value is known at that point is placed the same way.
+  Where the instruction takes no immediate, as the destination of `mov`, the constant
+  goes to a register, and failing that to memory. A float or any other constant is
+  refused with `asm.local`.
+- **A run-time value goes to a register** where every instruction that names it takes
+  a register of the class the value is held in: a general register for an integer or
+  a pointer, a vector or float register for a float or a vector. An integer or float
+  wider than the target's word, as an `i64` on a 32-bit target, or a vector of such
+  lanes, is always memory.
+- **Otherwise it is memory**: the local's own slot, or a slot the compiler puts the
+  value in for the block. A record, union, tag or array local is always its slot.
+
+A local is read before the block and written back after it, so a block may read and
+change any local it names, whatever it was placed in. The compiler settles each name
+for the whole block: it starts at the first place above that applies, and a statement
+that does not take it there moves it to the next. So `mov rax, {n}` with `n` a constant
+writes `mov rax, 12`, `mov rdi, {fd}` with `fd` a local writes a register to register
+move, and `ldr x1, {m}`, which takes only memory, writes the address of a slot.
+
+A register a name is placed in is never one the block itself writes, whether the block
+writes it before or after it reads the name, and never one another name is placed in.
+So a block that writes many registers leaves few for its names: when the names placed
+in registers of one class outnumber the registers the function may take that the block
+does not write, the last of them, in the order they first appear, goes to memory
+instead, until the rest fit. A block that sets every argument register of a system call
+reads most of its names from memory.
+
+A pointer local's pointee is reached by staging the pointer through a scratch register
+first (`mov rcx, {ptr}` then `mov rax, [rcx]`), never by a direct `[{ptr}]` indirection,
+since `{ptr}` may be memory. In a function that requires constant time every local a
+block names is its own slot, never a register, so the check reads each access at the
+secrecy the local's type states and what a pointer reaches off the load of it (see
+below). A compile-time constant there is still an immediate.
+
+WebAssembly names no register, so on it every `{name}` of a local is a pointer to the
+local's storage, as described above.
 
 Only an identifier inside braces names a local, and only outside the dialect's comments,
 strings and character constants. Any other braced text belongs to
@@ -117,7 +153,7 @@ pub fun add_via_asm(a: i64, b: i64) i64 {
 
 ### A body that binds `{name}` and moves the stack pointer
 
-A `{name}` becomes a fixed displacement off a base register, measured once when the
+A `{name}` placed in memory becomes a fixed displacement off a base register, measured once when the
 function's frame is laid out. A function that keeps no frame pointer addresses its
 locals off the **stack pointer**, so a statement that moved the stack pointer would move
 every `{name}` in the block out from under its own address. The compiler therefore
@@ -827,10 +863,11 @@ registers change; it says nothing about whether the encoding branches on a secre
 divides in variable time, which is what that check exists to catch.
 
 `writes(...)` is the only attribute today. The clause is a space-separated list so more
-can be added, but an attribute is only added once it changes what the compiler does —
-`noreturn` is not here yet because control flow reaching past an `asm` block is a CFG
-fact the effect model does not touch, and a `barrier` attribute would be inert, since
-every `asm` block is already assumed to modify arbitrary memory.
+can be added, but an attribute is only added once it changes what the compiler does. That
+control never comes back from a block is a fact of the block, not of a directive, so it is
+the block's `#[noreturn]` (see [decorators](decorators.md#noreturn--control-never-comes-back)),
+and a `barrier` attribute would be inert, since every `asm` block is already assumed to
+modify arbitrary memory.
 
 ## System registers (aarch64)
 

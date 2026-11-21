@@ -1,8 +1,8 @@
 # the lowering of statements, with `asm` blocks and the comptime `$if` and `$each` among them
 #
-# an `asm` block reaches mirl as inline assembly whose `{name}` substitutions are memory operands
-# bound to the slots of the locals they name. a `$each` is lowered once per element of the array
-# value sema recorded for it.
+# an `asm` block reaches mirl as inline assembly whose `{name}` substitutions are placed by what
+# they name: a constant or a scalar local by its value, any other local as a memory operand bound
+# to its slot. a `$each` is lowered once per element of the array value sema recorded for it.
 
 use std.collections.slice.Slice;
 use collections_vector: std.collections.vector;
@@ -44,11 +44,15 @@ use mach.type;
 use type_kind: mach.type.kind;
 use mach.type.query.subst;
 use masc_operand:  masc.core.operand;
+use mset:          masc.core.set;
 use masc_inline:   masc.inline;
 use mirl_assembly: mirl.ir.assembly;
 use mirl_global:   mirl.ir.global;
 use mirl.ir.id;
+use mirl_types: mirl.ir.type.table;
 use mirl.ir.type.table.Type;
+use mirl_wide:   mirl.legal.wide;
+use mirl_record: mirl.target.record;
 
 # lower the statement `sid` into the function being built, at its own source location
 # ---
@@ -122,6 +126,10 @@ fun lower_expr_stmt(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt) err[fai
     if (sel res_value.err) {
         ret err[fail.Fail].err{res_value.err};
     }
+    # a call of a `noreturn` function ends its block
+    val res_ends: res[bool, fail.Fail] = lower_expr.calls_noreturn(ctx, s.data.expr.expr);
+    if (sel res_ends.err)                                    { ret err[fail.Fail].err{res_ends.err}; }
+    if (res_ends.ok && !lower_context.block_terminated(ctx)) { ret builder.emit_unreachable(?ctx.builder); }
     ret err[fail.Fail].ok{};
 }
 
@@ -539,9 +547,47 @@ fun bound_points(ctx: *lower_context.LowerContext, sym: resolve.SymbolId) res[mi
     ret res[mirl_assembly.Points, fail.Fail].ok{unstated};
 }
 
-# an asm block, handed to mirl as an inline assembly item: its text as the source spells it,
-# in its instruction set's dialect, and each `{name}` a memory operand the block reads and
-# writes, bound to the local's slot. the block may reach any memory through its registers
+# a local a block binds by its value, read before the block and written back after
+# ---
+# slot:   the local's slot
+# ity:    its type as mirl holds it
+# sem_ty: its source type
+rec Readback {
+    slot:   value.Value;
+    ity:    Type;
+    sem_ty: type_kind.TypeId;
+}
+
+# whether a local of source type `tid` is bound by its value: a pointer, an integer or float no wider than the
+# target's word, or a vector of such lanes, on a set that reads a block's registers. a function that requires
+# constant time binds every local to its slot, so the check of its encoded code reads each access at the secrecy
+# the local's type states
+fun by_value(ctx: *lower_context.LowerContext, tid: type_kind.TypeId, ity: Type) bool {
+    if (type_kind.is_nil(tid) || type_kind.is_error(tid)) { ret false; }
+    if (lower_context.building_constant_time(ctx))        { ret false; }
+    val opt_set: opt[*mset.Set] = mirl_record.set_of(ctx.machine.target);
+    if (sel opt_set.none)                     { ret false; }
+    if (!masc_inline.available(opt_set.some)) { ret false; }
+    val t:    *mirl_types.Table = ?ctx.builder.m.types;
+    val word: u32               = mirl_wide.word_of(?ctx.machine.target.caps);
+    if (irt.is_ptr(t, ity))    { ret true; }
+    if (irt.is_vector(t, ity)) { ret word_fits(t, irt.element(t, ity), word); }
+    ret word_fits(t, ity, word);
+}
+
+# whether `ity` is an integer or a float of at most `word` bits
+fun word_fits(t: *mirl_types.Table, ity: Type, word: u32) bool {
+    if (irt.is_int(t, ity))   { ret irt.int_width(t, ity) <= word; }
+    if (irt.is_float(t, ity)) { ret irt.float_width(t, ity) <= word; }
+    ret false;
+}
+
+# an asm block, handed to mirl as an inline assembly item: its text as the source spells it, in its instruction set's
+# dialect, and each `{name}` resolved by what it names. a constant is placed by its value, which selection makes an
+# immediate where the instruction takes one. a local of a scalar type is read before the block, placed by its value,
+# a register where the instruction takes one and otherwise memory, and written back after, so the block may change it.
+# any other local, and every local on a set whose blocks name no register, is a memory operand bound to its slot, which
+# the block reads and writes. the block may reach any memory through its registers
 fun lower_asm(ctx: *lower_context.LowerContext, sid: ast_id.StmtId, s: *ast_stmt.Stmt) err[fail.Fail] {
     val txt:  str              = lower_context.module_source(ctx);
     val span: base_source.Span = s.data.asm_.body;
@@ -565,24 +611,57 @@ fun lower_asm(ctx: *lower_context.LowerContext, sid: ast_id.StmtId, s: *ast_stmt
     fin { collections_vector.dnit[mirl_assembly.Operand](?operands); }
     var values: collections_vector.Vector[value.Value] = collections_vector.init[value.Value](ctx.s.alloc);
     fin { collections_vector.dnit[value.Value](?values); }
-    var i: usize = 0;
+    var backs: [mirl_assembly.MOST_OPERANDS]Readback;
+    var given: u32   = 0;
+    var i:     usize = 0;
     for (i < binds.len) {
         val b:        *resolve.AsmBind = ?binds.data[i];
+        val name:     str              = intern.text(ctx.s.interner, b.name);
+        var op:       mirl_assembly.Operand;
+        var held:     value.Value;
         val opt_slot: opt[value.Value] = lower_context.lookup_local(ctx, b.symbol);
-        if (sel opt_slot.none) { ret err[fail.Fail].err{fail.message("lower: an asm block names a local lowering never bound")}; }
-        val name:       str                                  = intern.text(ctx.s.interner, b.name);
-        val res_points: res[mirl_assembly.Points, fail.Fail] = bound_points(ctx, b.symbol);
-        if (sel res_points.err) { ret err[fail.Fail].err{res_points.err}; }
-        val op: mirl_assembly.Operand = mirl_assembly.Operand{
-            name:       View{data: name::*u8, len: str_len(name)},
-            role:       masc_operand.READ_WRITE,
-            constraint: masc_inline.Constraint.memory{},
-            ty:         builder.ptr_type(?ctx.builder),
-            points:     res_points.ok
-        };
+        if (sel opt_slot.none) {
+            val res_constant: res[opt[value.Value], fail.Fail] = lower_expr.asm_constant(ctx, b.symbol);
+            if (sel res_constant.err) { ret err[fail.Fail].err{res_constant.err}; }
+            if (sel res_constant.ok.none) {
+                report_phase.reject(?ctx.status);
+                val loc: base_source.Location = base_source.location(ctx.scope.a.file_id, s.span);
+                ret err[fail.Fail].err{diagnostic.reject(ctx.diags, diagnostic_kind.ASM_LOCAL, loc, "an asm block names a binding that is neither a local nor an integer constant")};
+            }
+            held = res_constant.ok.some;
+            # the block may write a constant's register, whose result nothing reads
+            op           = mirl_assembly.Operand{name: View{data: name::*u8, len: str_len(name)}, role: masc_operand.READ_WRITE, placement: mirl_assembly.Placement.value{}, ty: held.ty, points: mirl_assembly.Points.unstated{}};
+            backs[given] = Readback{slot: value.none(), ity: held.ty, sem_ty: type_kind.TYPE_NIL};
+            given        = given + 1;
+        }
+        or {
+            val res_points: res[mirl_assembly.Points, fail.Fail] = bound_points(ctx, b.symbol);
+            if (sel res_points.err) { ret err[fail.Fail].err{res_points.err}; }
+            val tid:    type_kind.TypeId = bound_type(ctx, b.symbol);
+            var ity:    Type             = builder.ptr_type(?ctx.builder);
+            var scalar: bool             = false;
+            if (!type_kind.is_nil(tid) && !type_kind.is_error(tid)) {
+                val res_ity: res[Type, fail.Fail] = lower_context.lower_type(ctx, tid);
+                if (sel res_ity.err) { ret err[fail.Fail].err{res_ity.err}; }
+                ity    = res_ity.ok;
+                scalar = by_value(ctx, tid, ity);
+            }
+            if (scalar) {
+                val res_read: res[value.Value, fail.Fail] = lower_expr.asm_read(ctx, opt_slot.some, ity, tid);
+                if (sel res_read.err) { ret err[fail.Fail].err{res_read.err}; }
+                held         = res_read.ok;
+                op           = mirl_assembly.Operand{name: View{data: name::*u8, len: str_len(name)}, role: masc_operand.READ_WRITE, placement: mirl_assembly.Placement.value{}, ty: ity, points: res_points.ok};
+                backs[given] = Readback{slot: opt_slot.some, ity: ity, sem_ty: tid};
+                given        = given + 1;
+            }
+            or {
+                held = opt_slot.some;
+                op   = mirl_assembly.Operand{name: View{data: name::*u8, len: str_len(name)}, role: masc_operand.READ_WRITE, placement: mirl_assembly.Placement.stated{masc_inline.Constraint.memory{}}, ty: builder.ptr_type(?ctx.builder), points: res_points.ok};
+            }
+        }
         val res_pushed: res[usize, A.Error] = collections_vector.push[mirl_assembly.Operand](?operands, op);
         if (sel res_pushed.err) { ret err[fail.Fail].err{fail.refused(res_pushed.err)}; }
-        val res_held: res[usize, A.Error] = collections_vector.push[value.Value](?values, opt_slot.some);
+        val res_held: res[usize, A.Error] = collections_vector.push[value.Value](?values, held);
         if (sel res_held.err) { ret err[fail.Fail].err{fail.refused(res_held.err)}; }
         i = i + 1;
     }
@@ -593,7 +672,21 @@ fun lower_asm(ctx: *lower_context.LowerContext, sid: ast_id.StmtId, s: *ast_stmt
         writes:    true,
         selection: head_selection(txt, s.data.asm_.head)
     };
-    ret builder.emit_asm(?ctx.builder, ?block, values.data, values.len::u32);
+    var results:     [mirl_assembly.MOST_OPERANDS]value.Value;
+    val err_emitted: err[fail.Fail] = builder.emit_asm(?ctx.builder, ?block, values.data, values.len::u32, ?results[0]);
+    if (sel err_emitted.err) { ret err_emitted; }
+    # control never passes a `noreturn` block, so nothing it writes is read back
+    if (s.data.asm_.noreturn) { ret builder.emit_unreachable(?ctx.builder); }
+    var r: u32 = 0;
+    for (r < given) {
+        val back: *Readback = ?backs[r];
+        if (!type_kind.is_nil(back.sem_ty)) {
+            val err_stored: err[fail.Fail] = lower_expr.store_stated(ctx, results[r], back.slot, back.sem_ty, false);
+            if (sel err_stored.err) { ret err_stored; }
+        }
+        r = r + 1;
+    }
+    ret err[fail.Fail].ok{};
 }
 
 fun lower_comptime_if(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt) err[fail.Fail] {

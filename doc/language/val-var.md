@@ -84,10 +84,14 @@ compile-time value (or be an address, below): one that has none, such as a call
 or a read of another `var`, is rejected with `global.init_not_constant`, noting
 the reason.
 
-A constant whose value **is** an address, such as a `str`, whose value is a
-pointer to its bytes, is never duplicated this way. It keeps one definition and every
-reference reads it, so two references to one `str` constant compare pointer-equal
-no matter which module they are in or how they are spelled.
+A module-level `val` of pointer type whose initializer is a string literal, such as
+a `str`, **is** the address of its bytes at every use site. Its module defines the
+bytes once, under a symbol of their own beside the `val`, and a reference in any
+module is that address, formed where it is used, not a load of the `val`'s storage.
+So two references to one string constant compare pointer-equal no matter which
+module they are in or how they are spelled. Its storage is still emitted, holding
+the same address, so `?NAME` has an address and `@(?NAME)` reads the pointer back.
+A `var` holding a string is read like any other `var`.
 
 A module-level `val` or `var` of record, case, array or vector type is laid out
 as constant data at compile time. Its initializer is a literal of that type, or
@@ -119,6 +123,40 @@ so a read through a record or array constant there is refused with
 nothing, reads it.
 The index of an element, read or addressed as `?A[i]`, is any compile-time
 scalar: a literal, a named constant, or a read through another constant.
+
+### Address arithmetic in an initializer
+
+A module-level integer, or an integer leaf of a constant, may hold a number made
+of addresses, which the link fixes:
+
+```mach
+var start: [64]u8;
+var end:   u8;
+
+val BASE: u64 = (?start)::u64;              # the address as an integer
+val PAST: u64 = (?start[8])::u64 + 16;      # an address with a constant added
+val BACK: u64 = (?start)::u64 - 4;          # or taken away
+val SPAN: u32 = ((?end)::u64 - (?start)::u64)::u32; # the distance, in 4 bytes
+val TAIL: u64 = (?end)::u64 - (?start)::u64 + 8; # with a constant added or taken away
+```
+
+Each address is `(?place)::T` or `(f)::T` for a function `f`, cast to an
+integer as wide as a pointer, where `?place` is any address a constant may hold
+(above). The constant added is any compile-time integer that fits in an `i64`,
+written after the address, or before it when added. The whole may be cast to
+another integer, which is the width the link fills. That width must be 4 or 8
+bytes: a narrower one is refused at the initializer, naming that reason. A number
+that does not fit the width is refused by the link. Pointer arithmetic itself
+stays refused: `?start + 1` is not one of these forms.
+
+An address with a constant is one absolute relocation of the integer's width,
+the constant its addend, so a position-independent image relocates it at load
+like any other address. A distance is one relocation that subtracts a symbol,
+which the link resolves to a number: no loader relocates it, so a `val` holding
+one lies in read-only data. Both symbols must be defined in the image being
+linked. A distance names data on wasm, where a function's address is an index
+into its table: a function there takes no constant and lies in no distance.
+
 
 ## `ext`: foreign data imports
 

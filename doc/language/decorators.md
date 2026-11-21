@@ -275,13 +275,17 @@ declaration must itself be marked `#[testing]`, because an unmarked `fwd` puts
 the name on a production surface. `pub #[testing]` is valid, and a dependency's
 testing helper is usable from a dependent's tests.
 
+A module the build reaches only through `#[testing] use` (or `#[testing] fwd`),
+directly or through modules it reaches only that way, is loaded and checked in
+every build but emitted only by `mach test`: an ordinary build compiles none of
+its code. A module also reached through an unmarked import is emitted as usual.
+
 It applies to `fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`, `use` and `fwd`
 declarations at module scope. `test` blocks reject it because they are already
 test-only, and comptime directives reject it too. It cannot combine with
 `ext` or with `symbol`, `section`, `stage`, `input`, `output`, `builtin`,
 `uniform`, `storage`, `sampler` or `push`, because each names a consumer outside Mach
-source that the check cannot see. Inline `asm` `{name}` operands bind only
-locals, so they never reference a declaration.
+source that the check cannot see.
 
 The mark is not a cycle escape: `mach test` builds with testing declarations
 present, so a `use` cycle that only tests need is still an error. `mach doc`
@@ -1048,6 +1052,10 @@ a thread entry point whose register state at entry *is* the interface.
   entry and returns, where it switches the timing mode, and a naked body writes
   its own. Both combinations are rejected in sema. `inline("never")` is
   redundant: the inliner declines a naked function unconditionally.
+- **No unwind entry.** A naked function states no frame, so the object holds no
+  `.eh_frame` FDE, `.pdata` or compact unwind record for it, whatever the
+  profile's `unwind` key says: its body is entered with no frame the compiler
+  could describe.
 - **Debug info carries no `DW_AT_frame_base`** for a naked subprogram. Every
   other function has a frame base the compiler established and can name; this
   one does not, so it declares none rather than pointing at a register the asm
@@ -1061,6 +1069,45 @@ Merely containing an `asm` block does **not** suppress a frame: a function that
 also makes a call gets one, since an unaligned call boundary (x86-64) or a
 clobbered link register (aarch64, riscv64) is not something the author asked
 for by writing assembly.
+
+### `noreturn` — control never comes back
+
+A function marked `#[noreturn]` never returns to its caller, and an `asm` block marked
+`#[noreturn]` never falls through to the statement after it. Takes no arguments.
+
+```mach fragment
+#[noreturn]
+pub fun exit(code: i32) {
+    $if ($mach.build.arch == $mach.arch.x86_64) {
+        #[noreturn]
+        asm x86-64 {
+            mov edi, {code}
+            mov eax, 60
+            syscall
+        }
+    }
+    $or { $error("no exit for this architecture"); }
+}
+```
+
+- **Checked where it is written.** A `noreturn` function states no result type and
+  holds no `ret`, and its body must end where control never comes back: in a call to
+  a `noreturn` function, a `noreturn` asm block, a `$error`, or a bare `for` no `brk`
+  of its own leaves. A block ends when one of its statements does, an `if` chain when
+  it has a bare `or` and every arm ends, and a `$if` when it has a bare `$or` and
+  every branch ends. Anything else is refused with `noreturn.returns`.
+- **An `ext fun` may be marked.** Nothing checks a body the compiler does not see, so
+  the declaration is the author's word, as it is for every other fact an `ext`
+  declaration states.
+- **A call to a `noreturn` function ends its block.** The compiler writes no code for
+  what follows the call, so a function that ends in one has no epilogue and no return.
+  The same holds after a `noreturn` asm block, and a local the block names is not
+  written back after it.
+- **A `noreturn` block is the one decorated statement.** `#[noreturn]` written before
+  an `asm` statement marks the block. Every other decorator on a statement, and
+  `noreturn` before any other statement, is refused with `decorator.misplaced`.
+- **Only direct calls.** A function pointer states no `noreturn`, so a call through
+  one is an ordinary call.
 
 ### `extension(names)` — an outlier function
 
@@ -1279,6 +1326,7 @@ a further rule the decorator's own section states.
 | `constant_time` | `fun`, `def` | a function with a body, or an alias of a function type that is not C-variadic and carries no mode |
 | `vectorize` | `fun` |  |
 | `naked` | `fun` |  |
+| `noreturn` | `fun`, `ext`, an `asm` statement | a function that states no result |
 | `extension` | `fun` | a function with a body |
 | `embed` | `val` | a `val` that is not `ext`, checked by `embed` itself |
 | `intrinsic` | `fun` | a function, whose body, if it has one, is what other targets run |
