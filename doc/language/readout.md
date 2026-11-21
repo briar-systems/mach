@@ -45,12 +45,25 @@ counts the modules whose objects it reused, and the phases the cache spared
 count 0.
 
 ```
-load          48 modules     77ms
-codegen       48 objects     75ms  (slowest std.filesystem 9ms)
-emit          48 objects      6ms
-other        -               32ms
-built out/app  48 modules  1 MiB  in 358ms
+load             48 modules     77ms
+codegen          48 objects     75ms  (slowest std.filesystem 9.4ms)
+emit             48 objects    6.2ms
+other                           32ms
+built out/app  48 modules  1.0 MiB  in 358ms
 ```
+
+The rows share one set of columns: the label padded to the widest row label,
+the count right-aligned with its noun beside it, singular for a count of one,
+and the time right-aligned. A row with nothing to count, `other`, leaves its
+count blank. The line under `-vv` for a module or file puts its time in the
+row's time column and its name after it.
+
+A time is rounded to the nearest of its last digit: microseconds below a
+millisecond and milliseconds below a second, each to a tenth while under ten
+(`8.3us`, `2.8ms`, `468ms`), seconds to a tenth below a minute (`18.5s`), then
+minutes and whole seconds (`1m2s`). A time of zero is `0us`. A size is exact
+bytes below a KiB, then KiB, MiB or GiB, to a tenth while under ten of the unit
+and whole above (`1.5 KiB`, `78 KiB`, `393 MiB`).
 
 Each module's object is made by a step that lowers it, holds it to mirl's
 verifier and has mirl compile it. A target whose back end compiles an artifact
@@ -89,7 +102,7 @@ time every thread spent in them, added up. Such a row says
 `other` stays the time no wall row accounts for:
 
 ```
-alloc        1119 objects    18.5s  (summed over 4 threads)
+alloc          1119 objects    18.5s  (summed over 4 threads)
 ```
 
 A target whose back end compiles an artifact whole compiles it on the owner.
@@ -106,9 +119,12 @@ where the objects went and storing their digests. When the clock
 refuses a read, the stage it would have timed comes up short, and the build
 reports `readout.clock_refused` naming the module instead of showing a zero.
 
-When code generation closes, after mirl's and masc's rows and before the `emit`
-row, each counter prints its total over the unit's modules. A counter whose
-total is zero, as `verify runs` is without `--verify`, prints no line:
+Each counter's total over the unit's modules and test objects is a line of a
+block of its own, after the `other` row and before the `built` line, with the
+label padded to the widest counter label and the value right-aligned. A count
+of bytes is shown as a size. A unit that ends without a `built` line shows its
+totals before what follows it. A counter whose total is zero, as `verify runs`
+is without `--verify`, prints no line:
 
 | Counter | What it counts | Read from |
 |---|---|---|
@@ -123,7 +139,8 @@ total is zero, as `verify runs` is without `--verify`, prints no line:
 | `alloc rounds` | the rounds of register allocation | mirl |
 
 Under `-vv` each module prints a line per stage and per counter as its step
-finishes.
+finishes, a counter's with its value in the counter block's value column and
+the module after it.
 
 `(N target-gated, not carried forward)` shows when a phase dropped modules
 gated to another target. Under `-vv` each module or file prints as an indented line
@@ -182,19 +199,22 @@ a module's roll-up is written once the last of its tests finishes, so a slow
 test holds back only its own module's line:
 
 ```
-app.parser                  12 ok     40ms
-app.crypto                   3 ok     1 skip      2ms
-app.main                     1 ok     1 FAIL      3ms
+app.parser          40ms    12 ok
+app.crypto         2.1ms     3 ok     1 skip
+app.main           3.4ms     1 ok               1 FAIL
   FAIL  app.main#fails_on_purpose  src/main.mach:11  (exit 3)
     rerun: ./out/linux-x86_64/debug/test/app/app 4
 ```
 
+A roll-up is the module, its time, and its counts in columns of their own, a
+skip or FAIL count only when it is not zero.
+
 Under `-v` each test is its own line, written when it finishes:
 
 ```
-ok    app.parser#rejects_trailing_comma   2ms
-skip  app.crypto#aes_round_trip           1ms
-FAIL  app.main#fails_on_purpose           1ms  (exit 3)  src/main.mach:11
+ok    app.parser#rejects_trailing_comma  2.0ms
+skip  app.crypto#aes_round_trip          1.1ms
+FAIL  app.main#fails_on_purpose          1.3ms  src/main.mach:11  (exit 3)
     rerun: ./out/linux-x86_64/debug/test/app/app 4
 ```
 

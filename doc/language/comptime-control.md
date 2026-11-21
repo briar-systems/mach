@@ -5,6 +5,29 @@ branch compiles. The discarded branches are not resolved, type-checked,
 or emitted into the binary. This is fundamentally different from runtime
 `if` / `or`, which generates a branch at runtime.
 
+A name a module declares only in a branch this build does not take, at module
+scope, is left out of the build, and a use of it is reported with the reason.
+The report of the name that does not resolve (`name.unresolved` within the
+module, `visibility.not_exported` from another module, through a qualified
+name, a `use` or a `fwd`) points at the declaration and at the condition that
+left it out: the branch's own condition, which is false for this build, or, for
+a branch after the one the build takes, the taken branch's condition. Inside a
+nested chain the innermost condition that was not met is the one shown, and a
+name declared in several branches that were not taken is shown at the first:
+
+```
+error[visibility.not_exported] no symbol `cpu_count` exported by `app.os`
+  @ src/main.mach:9:23
+9 |     val n: usize = os.cpu_count();
+  |                       ^^^^^^^^^
+  @ src/os.mach:6:14 declared here, in a branch this build does not select
+6 |     fwd impl.cpu_count;
+  |              ---------
+  @ src/os.mach:5:6 this condition is false in this build
+5 | $if (HAS_THREADS) {
+  |      -----------
+```
+
 ## Grammar
 
 ```mach fragment

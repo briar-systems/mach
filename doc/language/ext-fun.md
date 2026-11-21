@@ -233,7 +233,7 @@ x86-64 it is a pointer into shared state that the callee advances. Forward it on
 | **Apple arm64** | `char *` |
 | **Microsoft x64** and **Windows arm64** | `char *` |
 | **RISC-V**, every ABI | `void *` |
-| **WebAssembly** (`wasi-wasm32`) | `void *` |
+| **WebAssembly** (`wasi-wasm32`, `freestanding-wasm32`) | `void *` |
 | **AAPCS64 linux** | a 32-byte, 8-aligned composite |
 
 On every row but the last, spelling the parameter `ptr` is already ABI-correct. On
@@ -562,6 +562,19 @@ On a format whose loader resolves imports by global search (ELF), an import is
 not bound to a single dependency, so `library` has no effect on the emitted
 binary — the value is still validated against the link's dependencies, but every
 dependency is searched at load time regardless.
+
+On wasm an import names the module its host supplies it from. `library` naming a
+`[link.<key>]` entry of `kind = "module"` imports the function from that module,
+under its link name (see [manifest.md](manifest.md#import-modules)). An import no
+entry attributes comes from the module the system supplies, `wasi_snapshot_preview1`
+on `wasi`. A freestanding `wasm32` target's system supplies none, so there an import
+nothing defines and no entry attributes is a hard link error naming the function.
+
+```mach
+# imported as host.report by a module of a freestanding wasm32 target
+#[library("host")]
+ext fun report(n: i32);
+```
 
 ## Vector arguments and the C ABI
 

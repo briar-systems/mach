@@ -205,10 +205,12 @@ These are the codes every `mach` command shares. `test` only adds what `1`
 also means.
 
 `--list` prints each selected test's qualified name and the test object that
-holds it, and exits without linking or running anything:
+holds it, the names padded to the widest, and exits without linking or running
+anything:
 
 ```
-app.parser#rejects_trailing_comma ./out/linux-x86_64/debug/obj/app/parser.test.o
+app.main#fails_on_purpose          ./out/linux-x86_64/debug/obj/app/main.test.o
+app.parser#rejects_trailing_comma  ./out/linux-x86_64/debug/obj/app/parser.test.o
 ```
 
 `--filter <substr>` selects before the dispatcher links, so the dispatcher

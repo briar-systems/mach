@@ -461,6 +461,10 @@ ext fun wsa_startup(ver: u16, data: *u8) i32;
 - On ELF (Linux) the loader resolves imports by global search, so `library`
   has no effect on the emitted binary; the value is still validated against
   the link's dependency set.
+- On wasm an import names the module it comes from, and `library` naming an
+  entry of `kind = "module"` makes that the import's module (see
+  [manifest.md](manifest.md#import-modules)). On freestanding `wasm32`, whose
+  system supplies no module, every import nothing defines needs it.
 - `library` composes with `symbol`: the import is emitted under the renamed
   symbol within the named dependency.
 

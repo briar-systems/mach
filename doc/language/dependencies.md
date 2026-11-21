@@ -167,7 +167,7 @@ hedgeacme -> hedge -> std, which requires ref = "tag/v2.1.0". nothing checks tha
 
 A requirement that asks for exactly the root's selection is no override and is
 not noted. `mach dep list` shows each root declaration's winning selection
-(`ref=`, `version=` or `path=`, and the recorded `pin=`), its state
+(`ref=`, `version=` or `path=`, and the recorded `pin=` in full), its state
 (`realized`, `missing`, or, for a `version` selection whose range excludes the
 pinned release, `out of range (the pinned release 7.0.2 is outside ^8.0)`) and,
 under it, every requirement it overrides (`overrides hedgeacme -> hedge -> std, which requires
@@ -401,6 +401,10 @@ dep verify` checks:
   existing checkout)`);
 - with neither, the submodule is added at the selector, reusing a module
   directory Git retained from an earlier removal.
+
+A progress line names a commit by its first 12 hex digits, as in `realized std
+@ 1c484f5f57d9` or `std: 1c484f5f57d9 -> 5a0e3d21b7c4`. `mach dep list` shows a
+pin in full.
 
 Then, when the checkout lacks the tag its selection is read by (the tag a
 `tag/` names, or a release tag naming a `version` selection's pin), pull

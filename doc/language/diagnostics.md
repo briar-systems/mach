@@ -18,6 +18,14 @@ may improve from release to release. The key does not change. A tool reads the
 key, the location and the rest as data with
 [`--diagnostics json`](diagnostics-json.md) rather than from this text.
 
+A diagnostic may name other places after its own, each as `@ path:line:column`
+with a label that says what the place is, and its excerpt marked with `-`: the
+previous definition of a name defined twice, or, for a name that does not
+resolve because a `$if` branch this build does not take declares it, that
+declaration and the condition that left it out (see
+[comptime-control.md](comptime-control.md)). The
+[json record](diagnostics-json.md) carries them as its `related` sites.
+
 A note says what a command did or found and never fails it. Its human text is
 `note <message>`, without the key, which the
 [json record](diagnostics-json.md#notes) carries.

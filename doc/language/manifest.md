@@ -281,13 +281,13 @@ to whichever *declared* target matches the host.
 | Key   | Required | Meaning |
 |-------|----------|---------|
 | `arch` | yes      | Architecture, such as `x86_64` or `riscv64`. Read by `$project.target.arch`. |
-| `isa` | absent: the system's floor; required on `freestanding` | The instruction set every machine of the target has, spelled as masc's catalog for the architecture spells a selection, such as `rv32imc` or `x86-64-v2`. Every architecture takes it, and masc refuses a selection its catalog does not spell. An `isa` that names an architecture is v6's spelling of `arch`, refused with the rename `mach migrate` writes. See [RISC-V baselines](#risc-v-baselines). |
+| `isa` | absent: the system's floor; required on `freestanding` but for `wasm32`, which stands on `wasm1` | The instruction set every machine of the target has, spelled as masc's catalog for the architecture spells a selection, such as `rv32imc` or `x86-64-v2`. Every architecture takes it, and masc refuses a selection its catalog does not spell. An `isa` that names an architecture is v6's spelling of `arch`, refused with the rename `mach migrate` writes. See [RISC-V baselines](#risc-v-baselines). |
 | `sys`  | yes      | System. Read by `$project.target.sys`. |
 | `abi` | yes      | Application binary interface. Read by `$project.target.abi`. |
 | `of`  | absent: the system's format | Object-format override; defers to the system's format when omitted. See [Object-format override](#object-format-override). |
 | `base` | absent: the system's base | Load-address override, an [address](#addresses). Overrides the system's default base virtual address; defers to it when omitted, which mink's catalog states per architecture (on `freestanding`, `0x100000` on `x86_64`, `0x40000000` on `aarch64` and `0x80000000` on `riscv64` and `riscv32`). |
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
-| `stack_reserve` | absent: the format's default (8 MiB on PE), no stack on a freestanding image, and the system's base (64 KiB) on `wasi` | Main stack size in bytes, not negative: the reserve a PE or Mach-O header records, the size of the `.stack` section of a freestanding ELF or flat image, or the size of the stack a wasm module lays out below its data. See [Image stack size](#image-stack-size). |
+| `stack_reserve` | absent: the format's default (8 MiB on PE), no stack on a freestanding ELF or flat image, and the system's base (64 KiB) on a wasm module | Main stack size in bytes, not negative: the reserve a PE or Mach-O header records, the size of the `.stack` section of a freestanding ELF or flat image, or the size of the stack a wasm module lays out below its data. See [Image stack size](#image-stack-size). |
 | `stack_commit` | absent: the format's default | Main stack commit in bytes, not negative, on PE only. See [Image stack size](#image-stack-size). |
 | `code_model` | absent: the host's default for the target | The code model the target's code is built under (string), by the psABI name mink's catalog gives it, such as `medany` on linux and freestanding `riscv64` or `medlow` on freestanding `riscv32`. Any target may state it. A model that forms a symbol's absolute address, as `medlow` on `riscv64` does within the 2 GiB about address zero, cannot reach an image linked above that, so a link whose image runs where its code model cannot reach is refused naming the model and the first address out of its reach. A model the target's host does not offer is refused naming those it does, and one mirl does not carry is refused with mirl's reason. `mach info targets` lists each target's models, its default first, and `--code-model` narrows an entry build's target to one. |
 | `default` | removed | Refused as a removed key, with its removal as the fix `mach migrate` applies. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
@@ -559,7 +559,7 @@ uses the bounds of the `.stack` section, which holds its stack. state the stack'
 bytes as `stack_reserve`
 ```
 
-**On a wasm module**, as on `wasi`, the runtime gives the module its linear memory and
+**On a wasm module**, on `wasi` or freestanding, the runtime gives the module its linear memory and
 nothing else: the module lays out its own stack, at the bottom of that memory, from its
 base down to address zero, with its data starting at the base. `stack_reserve` is the
 stack's size, and so the address the data starts at. The rules of an image no loader
@@ -638,7 +638,8 @@ and runs natively in CI on every PR; `riscv64`-linux runs under qemu and
 self-hosts. `windows` is a supported cross-compilation target (PE/COFF,
 Win64 ABI). `darwin` is validated end-to-end on both architectures: each
 self-hosts to a three-generation fixpoint on a native macOS runner and ships a
-release archive. `freestanding` targets an ELF or flat image with no OS runtime; a
+release archive. `freestanding` targets an ELF or flat image with no OS runtime, or on
+`wasm32` a wasm module nothing but its host runs (see [Freestanding wasm](#freestanding-wasm)); a
 bare-metal platform such as BareMetal (`bmos`) is a `freestanding` target plus a
 `platform` tag and `base` override (see [Platform targets](#platform-targets-bare-metal)),
 not an os of its own. `spirv` is not a machine at all — it
@@ -655,7 +656,9 @@ target with an operating system that names no `isa` stands on the **floor** mink
 states for that system and architecture: `riscv64` on `linux` is `rv64gc`, and
 `aarch64` on `linux` is `armv8-a+fp+simd`. A `freestanding` target must name its
 `isa`, since the chip decides it and a default would fault on hardware that lacks an
-extension; leaving it out is refused (`target.baseline_required`). An `isa` such as
+extension; leaving it out is refused (`target.baseline_required`). A freestanding
+`wasm32` target is the exception: every host takes WebAssembly's core 1.0, so it
+stands on `wasm1` when it names none. An `isa` such as
 `rv32imc` or `rv64imafd` selects a smaller machine, and `ext` adds names on top of it:
 
 ```toml
@@ -740,14 +743,15 @@ caught rather than silently never matching.
 
 ### Object-format override
 
-`of` overrides the object format a target implies. Each os has a default format,
-`elf` on `linux`, `coff` on `windows`, `coff` on `uefi`, `macho` on `darwin`, `elf` on `freestanding`,
-`spirv` on `vulkan` and `wasm` on `wasi`, and `of` names a different one from the same closed set: `elf`,
+`of` overrides the object format a target implies. Each system and architecture has a
+default format, `elf` on `linux`, `coff` on `windows`, `coff` on `uefi`, `macho` on
+`darwin`, `elf` on `freestanding` (`wasm` on freestanding `wasm32`), `spirv` on `vulkan`
+and `wasm` on `wasi`, and `of` names a different one from the same closed set: `elf`,
 `coff`, `macho`, `flat`, `spirv`, `wasm`. `of` is optional. Omit it to
-take the default. An os accepts only the formats it can load, so an override the
-os cannot enter is refused, listing those it writes (``the system writes no object
+take the default. A target accepts only the formats it can load, so an override it
+cannot enter is refused, listing those it writes (``the target writes no object
 format named `macho` (target, format), and it accepts elf``). Today only
-`freestanding` writes more than one, `elf` and `flat`.
+`freestanding` on an ELF architecture writes more than one, `elf` and `flat`.
 
 ```toml
 [target.metal]
@@ -1072,8 +1076,95 @@ runner = ["wasmtime", "{artifact.out}"]
   at build with an error that names the module and the capability. A std primitive
   the preview can compile but not do, such as spawning a process, returns
   `ENOTSUP`, which std reports as its unsupported error kind. std's manifest declares
-  no `[link.*]` entry for the system interface, since the environment names the
-  module every import resolves from.
+  no `[link.*]` entry for the system interface, since the system supplies the
+  module every import no entry attributes resolves from. A program that imports
+  from a second module names it with a `kind = "module"` entry (see
+  [Import modules](#import-modules)).
+
+### Freestanding wasm
+
+A freestanding `wasm32` target builds a module nothing but its host runs: a
+browser's JavaScript, an embedder, or a runtime that calls one export. The module
+has no system interface. It imports what the program declares and nothing else, and
+exports what the program marks `#[export]` and its memory, as `memory`.
+
+```toml
+[target.web]
+arch = "wasm32"
+sys  = "freestanding"
+abi  = "basic"
+
+[link.host]
+source = "system"
+kind   = "module"
+sys    = ["freestanding"]
+arch   = ["wasm32"]
+abi    = ["*"]
+
+[artifact.counter]
+kind    = "bin"
+entry   = "main.mach"
+out     = "{project.work}/bin/counter{artifact.suffix}"
+targets = ["web"]
+link    = ["host"]
+```
+
+```mach
+#[library("host")]
+ext fun report(n: i32);
+
+#[export]
+#[symbol("add")]
+pub fun add(a: i32, b: i32) i32 {
+    report(a);
+    ret a + b;
+}
+```
+
+- **The tuple.** `sys = "freestanding"`, `abi = "basic"` as on `wasi`, and the format
+  is `wasm`, the one the target writes. With no `isa` the target stands on `wasm1`,
+  and `ext` adds features from masc's wasm set as on `wasi`.
+- **Imports.** Each function no object of the link defines is imported from the
+  module of the `[link.<key>]` entry of `kind = "module"` it is attributed to, by
+  `#[library("<key>")]` or by the entry's `symbols`, under its link name. The system
+  supplies no module, so an import with no attribution is refused, naming each
+  function and saying it is attributed with `#[library]`. The example imports
+  `report` from `host`.
+- **Exports.** Every `#[export]` declaration, under its symbol name, and the linear
+  memory as `memory`. A `#[export]` variable is exported as an immutable global holding
+  its address.
+- **The entry.** A `bin` needs none: a program that defines `_start` has it exported
+  as `_start`, and one that does not is a module of its exports. Other freestanding
+  targets still need `_start`. `use std.runtime;` defines one that calls
+  `main(0, nil)` and returns, and traps when main returns anything but 0, since a
+  module has no process to exit. A program that wants no entry leaves std.runtime out.
+- **Memory.** As on `wasi`: the stack lies at the bottom of linear memory, from its
+  base down to address zero, 64 KiB unless `stack_reserve` states its size, and the
+  data starts at the base, so a stack overflow traps below address zero. The memory's
+  initial size covers the data. `__heap_base` marks the data's end, and std's heap
+  grows the memory past it a page at a time with `memory.grow`
+  (`std.allocator.heap.linear_source`). Only `memory.grow` adds memory, so the module
+  needs no host function for it.
+- **What the target lacks.** It runs one thread, as on `wasi`. std gates each module
+  on the capabilities its target provides (`std.system.capability`), and freestanding
+  provides none, so a std module that needs files, a clock or entropy is refused at
+  build with an error naming the module and the capability. std's heap, collections,
+  formatting into memory and the rest of its OS-free core build.
+
+A host instantiates the module with an object holding each import module, and calls
+what it exports. In JavaScript, for the example above:
+
+```js
+const bytes = await fetch("counter.wasm").then((r) => r.arrayBuffer());
+const imports = {
+  host: {
+    report: (n) => console.log("add was called with", n),
+  },
+};
+const { instance } = await WebAssembly.instantiate(bytes, imports);
+console.log(instance.exports.add(2, 3));
+const memory = new Uint8Array(instance.exports.memory.buffer);
+```
 
 ### UEFI targets
 
@@ -1752,7 +1843,7 @@ inspection use the same expansion.
 | COFF/PE on UEFI | `.efi` | `.lib` | refused |
 | Flat image (`of = "flat"`) | empty | unsupported | unsupported |
 | SPIR-V module | refused, its artifact is a `module` (`.spv`) | unsupported | unsupported |
-| wasm module on wasi | `.wasm` | `.a` | refused |
+| wasm module on wasi or freestanding | `.wasm` | `.a` | refused |
 
 The selected object format supplies the naming rules, including explicit target
 format overrides. Unsupported library forms are errors. A SPIR-V `module` artifact is
@@ -1865,7 +1956,7 @@ the same entries, so nothing behaves differently as a dependency.
 | Key       | Required | Meaning |
 |-----------|----------|---------|
 | `source`  | yes | `"system"` (a system library resolved by name), `"framework"` (a macOS framework), or `"local"` (a file on disk). |
-| `name`    | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. |
+| `name`    | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. On an entry of `kind = "module"` it is the import module's name and optional: absent, it is the key. |
 | `path`    | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
 | `symbols` | absent: none claimed | Array of symbol names this dependency provides, attributing imports that have no `ext` declaration to decorate (see below). Written as **source-level** names; the target's C symbol prefix is applied by Mach. |
 | `sys`      | yes | Filter axis: an array of canonical `sys` values or `"*"` (any); `[]` matches none. |
@@ -1874,7 +1965,7 @@ the same entries, so nothing behaves differently as a dependency.
 | `export`  | absent: not exported | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
 | `include` | absent: `"always"` | `"always"` names the dynamic library in the linked image whether or not anything imports from it; `"referenced"` names it only when a live import references it, so an unused provider leaves no load command behind. Any other value is a manifest error (`[link.k].include must be "always" or "referenced"`). |
 | `current_version`, `compatibility_version` | absent: `0.0.0` | The versions a Mach-O load command records for this library, each `X`, `X.Y` or `X.Y.Z` with `X` below 65536 and `Y` and `Z` below 256. Both or neither, and only on a `source = "system"` entry of the shared kind. dyld compares the compatibility version against the loaded library's current version. Other formats ignore them. |
-| `kind`    | absent: `"shared"` | What a `source = "system"` library named by a bare name must be: `"shared"` or `"static"`, with no fallback in either direction (see below). Any other value is a manifest error (`[link.k].kind must be "shared" or "static"`). Refused on any other source, and on a `name` that names a file, whose contents state its kind. |
+| `kind`    | absent: `"shared"` | What a `source = "system"` library named by a bare name must be: `"shared"` or `"static"`, with no fallback in either direction (see below), or `"module"`, an import module a wasm module's host supplies (see [Import modules](#import-modules)). Any other value is a manifest error (`[link.k].kind must be "shared", "static" or "module"`). Refused on any other source, and on a `name` that names a file, whose contents state its kind. |
 | `library` | removed | Refused as a removed key. The table key is the library's identity, and `#[library]` names the entry by that key. |
 | `os`, `isa` | removed | v6's names of `sys` and `arch`, refused with the rename `mach migrate` writes. |
 
@@ -2038,6 +2129,37 @@ records, and does not take the key:
 stating `kind` on it is refused, as is stating it on a `framework` or `local`
 entry. Two entries naming one library as different kinds are refused, as is a
 `-l` of a library an entry names `kind = "static"`.
+
+### Import modules
+
+A wasm module imports each function it does not define from a module its host
+supplies, by the module's name and the function's. An entry of `kind = "module"`
+names one such module, by its key unless `name` states another, and every import
+attributed to the entry, by `#[library("<key>")]` on its `ext fun` or by the
+entry's `symbols`, comes from it. No file is read for it, so it adds no input to
+the link: the imports name it, and the host supplies it when it instantiates the
+module.
+
+```toml
+[link.host]
+source = "system"
+kind   = "module"
+sys    = ["freestanding", "wasi"]
+arch   = ["wasm32"]
+abi    = ["*"]
+```
+
+`versions` are refused on it, as on any entry that is not a shared library, and
+`include` changes nothing, as a module is named only by the imports that come from
+it. An entry of this kind that applies to a target whose format names no module
+for an import, any format but `wasm`, is refused when the build links. An import
+attributed to two modules is refused, naming the function and both modules.
+
+A `wasi` target's system supplies `wasi_snapshot_preview1`, and every import no
+entry attributes comes from it, so a program on wasi names a module entry only for a
+second module. A freestanding `wasm32` target's system supplies none, so an import
+nothing defines and no entry attributes is refused when the build links, naming
+each function (see [Freestanding wasm](#freestanding-wasm)).
 
 See
 [ext-fun.md](ext-fun.md#linking-external-objects) for the `ext fun` workflow

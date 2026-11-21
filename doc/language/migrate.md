@@ -213,6 +213,8 @@ as `use.unresolved`.
 | `std.compress.inflate`, `deflate`, `zlib`, `gzip`, `format` (and the `compress_format` re-export) | `deflate.inflate` and the same names under `deflate` | mach-deflate |
 | `std.data.json` | `json.parse`, `json.value`, `json.decode`, `json.write`, `json.ndjson`, `json.error` | mach-json |
 | `std.data.toml` | `toml.parse`, `toml.lookup`, `toml.value`, `toml.tree`, `toml.write`, `toml.expr`, `toml.error` | mach-toml |
+| `std.math.mat4`, `std.math.quat` | `math.mat4`, `math.quat` | mach-math |
+| `std.encoding.base64` | `encoding.base64` | mach-encoding |
 
 The moved hashes and checksums take the lifecycle names, as `sha256.init` became
 `sha256.make`, and std's `MIGRATION.md` maps each name of `std.data.json` and

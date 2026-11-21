@@ -193,7 +193,7 @@ record with `severity` `"note"`, its `code` the note's key, and a `null`
 | `dep.note` | a dependency command as it works: an overridden requirement, a directory left under `dep/`, a copy or checkout that stopped part way |
 | `dep.effect` | a dependency command that failed, once for each change it made before the failure, after the failure's record |
 | `project.created` | `mach init`, for the project it made, the id it chose, and under `--no-deps` the command that declares each dependency the entry uses |
-| `dep.realized` | `mach init`, for each dependency it declared and realized |
+| `dep.realized` | `mach init`, for each dependency it declared and realized, naming the commit it realized |
 
 ```json
 {"schema":3,"record":"diagnostic","severity":"note","code":"project.created","message":"created project 'app'","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
@@ -308,8 +308,9 @@ row's output, a build step under `steps`, or a stage of the `cache` row such as
 | `name` | string | the module, file, step or stage |
 | `time_us` | integer | its time |
 
-Under `-v` a **counter** record is the unit's total of a counter, written after the rows
-of the phase that counted it, and under `-vv` one is also written for each module,
+Under `-v` a **counter** record is the unit's total of a counter, written once per unit
+after the rows of the phase that counted it (a test build's after its test objects' rows,
+the total covering its modules and test objects), and under `-vv` one is also written for each module,
 named by it, as its step finishes. A counter whose total is zero, such as every
 counter of a unit whose objects all came from the cache, writes no total record,
 while a module's record is written with its value even when that is zero:
