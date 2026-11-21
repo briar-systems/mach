@@ -11,7 +11,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | Functions | |
 | :--- | :--- |
 | [`default_validate`](#default_validate) | more than one `default = true` profile is refused, pointing at the first `default` value and naming the others as related |
-| [`profile_set`](#profile_set) | every key of a profile the table `sub` holds, decoded over `pf`: `optimize`, `debug`, `linker_relax`, `relax`, `simd` and `allow` |
+| [`profile_set`](#profile_set) | every key of a profile the table `sub` holds, decoded over `pf`: `optimize`, `debug`, `linker_relax`, `symbols`, `sections`, `unwind`, `relax`, `simd` and `allow` |
 | [`parse_profiles`](#parse_profiles) | the `[profile.*]` tables; the schema check admits no manifest without one |
 
 ---
@@ -34,7 +34,7 @@ pub fun profile_set(alloc: *std.allocator.Allocator, itn: *mach.base.intern.Inte
 ```
 
 every key of a profile the table `sub` holds, decoded over `pf`: `optimize`, `debug`,
-`linker_relax`, `relax`, `simd` and `allow`. a key `sub` does not hold leaves `pf` as it is,
+`linker_relax`, `symbols`, `sections`, `unwind`, `relax`, `simd` and `allow`. a key `sub` does not hold leaves `pf` as it is,
 and `default`, which picks the profile a build selects, is read by the caller
 
 | Parameter | |

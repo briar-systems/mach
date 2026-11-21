@@ -4,9 +4,9 @@
 
 the lowering of statements, with `asm` blocks and the comptime `$if` and `$each` among them
 
-an `asm` block reaches mirl as inline assembly whose `{name}` substitutions are memory operands
-bound to the slots of the locals they name. a `$each` is lowered once per element of the array
-value sema recorded for it.
+an `asm` block reaches mirl as inline assembly whose `{name}` substitutions are placed by what
+they name: a constant or a scalar local by its value, any other local as a memory operand bound
+to its slot. a `$each` is lowered once per element of the array value sema recorded for it.
 
 Source: [`src/lower/stmt.mach`](../../../src/lower/stmt.mach)
 

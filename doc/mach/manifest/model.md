@@ -256,6 +256,8 @@ pub rec ArtifactDef {
     sections_at:    *mach.base.source.Location;
     size:           opt[u64];
     size_at:        mach.base.source.Location;
+    pad:            bool;
+    pad_at:         mach.base.source.Location;
     regions:        *RegionDef;
     region_count:   u32;
     at:             mach.base.source.Location;
@@ -297,6 +299,8 @@ manifest and freed by `dnit`
 | `sections_at` | `*mach.base.source.Location` | where each `sections` entry is written, parallel to `sections` |
 | `size` | `opt[u64]` | the `size` key, the most bytes the image loads from its base, none when absent |
 | `size_at` | `mach.base.source.Location` | where its `size` value is written, the zero place when absent |
+| `pad` | `bool` | the `pad` key: a flat image is padded with the fill to exactly `size`, false when absent |
+| `pad_at` | `mach.base.source.Location` | where its `pad` value is written, the zero place when absent |
 | `regions` | `*RegionDef` | the `[artifact.X.region.<name>]` tables, the memory regions the link lays sections into; nil when none is written |
 | `region_count` | `u32` | length of `regions` |
 | `at` | `mach.base.source.Location` | where the table's key is written |
@@ -410,6 +414,9 @@ pub rec ProfileDef {
     relax:        NameList;
     relax_named:  str;
     linker_relax: bool;
+    symbols:      bool;
+    sections:     bool;
+    unwind:       bool;
     debug:        bool;
     simd:         SimdMode;
     allow:        mach.base.diagnostic.kind.KindSet;
@@ -431,6 +438,9 @@ least one
 | `relax` | `NameList` | the optional `relax` key: the departures from exact semantics the build permits |
 | `relax_named` | `str` | the `relax` key as a refusal of one of its names names it, its table's label or `--set` before it |
 | `linker_relax` | `bool` | the optional `linker_relax` key: whether the linker may relax the code, true when the key is absent |
+| `symbols` | `bool` | the optional `symbols` key: whether the image keeps its symbol table, true when the key is absent |
+| `sections` | `bool` | the optional `sections` key: whether an executable keeps its section header table, true when the key is absent |
+| `unwind` | `bool` | the optional `unwind` key: whether the image keeps its unwind tables, true when the key is absent |
 | `debug` | `bool` | the required `debug` key |
 | `simd` | `SimdMode` | the required `simd` key |
 | `allow` | `mach.base.diagnostic.kind.KindSet` | the optional `allow` key: the warning kinds the profile silences, empty when the key is absent |

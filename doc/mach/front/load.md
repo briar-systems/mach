@@ -124,6 +124,7 @@ pub rec Module {
     reached:      *bool;
     reach_count:  u32;
     deps:         std.collections.vector.Vector[mach.session.module.StableModuleId];
+    lowers:       std.collections.vector.Vector[mach.session.module.StableModuleId];
     consts:       std.collections.vector.Vector[Const];
     bindings:     std.collections.vector.Vector[Binding];
     binders:      DemandIndex;
@@ -148,6 +149,7 @@ stable id
 | `frame_walked` | `*bool` | the declarations the walk reached under each union tuple, `decl_count` per tuple |
 | `reached` | `*bool` | the union tuples a walk reached it under |
 | `deps` | `std.collections.vector.Vector[mach.session.module.StableModuleId]` | the modules it imports |
+| `lowers` | `std.collections.vector.Vector[mach.session.module.StableModuleId]` | the modules it imports through a `use` or `fwd` not marked `#[testing]`, which a build that runs no tests emits along: a module reached only through `#[testing] use` is checked and emitted only in a test build |
 | `consts` | `std.collections.vector.Vector[Const]` | the public constants it exports to its importers' gates |
 | `bindings` | `std.collections.vector.Vector[Binding]` | one record per import declaration the walk reached |
 | `binders` | `DemandIndex` | where a demand finds each name a declaration list binds, built once per syntax (see demand_index) |

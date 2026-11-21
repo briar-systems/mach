@@ -23,7 +23,7 @@ Uses types from [`mach.front.ast.id`](../ast/id.md), [`mach.front.parser.state`]
 ### parse_asm
 
 ```mach
-pub fun parse_asm(p: *mach.front.parser.state.Parser) mach.front.ast.id.StmtId
+pub fun parse_asm(p: *mach.front.parser.state.Parser, noreturn: bool) mach.front.ast.id.StmtId
 ```
 
 parse an `asm` statement, keeping its head and body as source spans
@@ -31,5 +31,6 @@ parse an `asm` statement, keeping its head and body as source spans
 | Parameter | |
 | :--- | :--- |
 | `p` | the parser, at the `asm` keyword |
+| `noreturn` | a `#[noreturn]` marks it |
 | **returns** | the statement, or STMT_NIL when the parse has ended |
 

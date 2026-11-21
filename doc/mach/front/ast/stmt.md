@@ -18,7 +18,7 @@ Uses types from [`mach.base.source`](../../base/source.md), [`mach.front.ast.id`
 | [`StmtRet`](#stmtret) | `rec` | a `ret` statement |
 | [`StmtFin`](#stmtfin) | `rec` | a `fin` cleanup |
 | [`StmtDecl`](#stmtdecl) | `rec` | a local `val` or `var` |
-| [`StmtAsm`](#stmtasm) | `rec` | head: the text between `asm` and the body's `{`, masc's selection handed over unchanged |
+| [`StmtAsm`](#stmtasm) | `rec` | head:     the text between `asm` and the body's `{`, masc's selection handed over unchanged noreturn: the block is marked `#[noreturn]`, so control never passes it |
 | [`StmtComptimeIf`](#stmtcomptimeif) | `rec` | a `$if` chain inside a function body |
 | [`StmtComptimeEach`](#stmtcomptimeeach) | `rec` | a `$each` loop |
 | [`StmtComptimeDirective`](#stmtcomptimedirective) | `rec` | a comptime directive statement such as `$error(...)` |
@@ -163,12 +163,14 @@ a local `val` or `var`
 
 ```mach
 pub rec StmtAsm {
-    head: mach.base.source.Span;
-    body: mach.base.source.Span;
+    head:     mach.base.source.Span;
+    body:     mach.base.source.Span;
+    noreturn: bool;
 }
 ```
 
-head: the text between `asm` and the body's `{`, masc's selection handed over unchanged
+head:     the text between `asm` and the body's `{`, masc's selection handed over unchanged
+noreturn: the block is marked `#[noreturn]`, so control never passes it
 
 ## StmtComptimeIf
 

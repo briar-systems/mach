@@ -48,6 +48,6 @@ root, so runs in one tree with different `-o` do not collide
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `COMMAND` | `std.args.Command` | `std_args.Command{name: "test", aliases: args.NO_WORDS, help: "build and run project tests", usage: "<path>", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: false}` | `mach test` |
+| `COMMAND` | `std.args.Command` | `std_args.Command{name: "test", aliases: args.NO_WORDS, help: "build and run project tests", usage: "<path> [inputs...]", flags: Slice[*std_args.Flag]{data: ?FLAGS[0], size: FLAGS_N}, commands: args.NO_COMMANDS, operand_min: 0, operand_max: std_args.OPERANDS_ANY, passthrough: false}` | `mach test` |
 | `POLICY` | `mach.cli.args.Policy` | `args.Policy{refused: Slice[*std_args.Flag]{data: ?REFUSED[0], size: REFUSED_N}, refusal: "test always builds its internal test dispatcher", conflicts: args.NO_CONFLICTS}` | what mach holds `mach test` to beyond the parse |
 

@@ -26,6 +26,7 @@
 | [`lint`](lint.md) | the lints over a typed module: uses of deprecated declarations, and testing declarations reached from code outside a test |
 | [`literal`](literal.md) | the checks over a typed module's literals: float precision, defaulted literals and shifts |
 | [`module`](module.md) | typing one module: its declarations and bodies, the instances they ask for, and the result it publishes; and typing one instance on its own (instance_sema) |
+| [`noreturn`](noreturn.md) | the `#[noreturn]` rule: a function so marked states no result, holds no `ret`, and its body ends where control never comes back, so falling off its end is unreachable |
 | [`op`](op.md) | an `#[intrinsic]` function names an instruction of an owner's operation catalog: mirl's capability op catalog of the target holds masc's rows of each set |
 | [`product`](product.md) | what sema publishes for a module, and how one module reads another's |
 | [`publish`](publish.md) | builds a module's interface once sema has typed it: every module-level function and binding as its declaration says, every module constant evaluated to its deep value, and the public surface its resolution published |

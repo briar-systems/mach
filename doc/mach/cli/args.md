@@ -25,7 +25,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | On `CliArgs` | |
 | :--- | :--- |
 | [`build_cli_invocation`](#build_cli_invocation) | the typed CliArgs of a build-shaped command: verbosity, quiet, the selectors, and the overrides, each typed as the request reads it: `-o` and `-w` as raw argument pointers or nil, the LEVERS as given, `--threads` as a count or 0 when absent |
-| [`collect_link_inputs`](#collect_link_inputs) | fill c.overrides.link_tokens and c.overrides.lib_dirs in command-line order: every `-l` value and every operand after the first that input.token_is_path accepts go to link_tokens, every `-L` value to lib_dirs |
+| [`collect_link_inputs`](#collect_link_inputs) | fill c.overrides.link_tokens and c.overrides.lib_dirs in command-line order: every `-l` value and every operand after the first, the project, go to link_tokens, every `-L` value to lib_dirs |
 
 | On `EntryArgs` | |
 | :--- | :--- |
@@ -84,6 +84,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`DEP_WARNINGS`](#constants) | `--dep-warnings` |
 | [`NO_CACHE`](#constants) | `--no-cache` |
 | [`DIAGNOSTICS`](#constants) | `--diagnostics <human\|json>`: how diagnostics, failures and a test run's results reach stderr |
+| [`PASSES`](#constants) | `--passes`: each module's report of the optimisation passes that changed each of its functions, which mirl writes |
 | [`PLAN`](#constants) | `--plan` |
 | [`HELP`](#constants) | `--help`, `-h`: the invocation asks for its command's page instead of running it, which takes precedence over every refusal but an unknown command |
 | [`VERSION`](#constants) | `--version`, the compiler's version alone on one line |
@@ -152,15 +153,16 @@ pub fun collect_link_inputs(a: *std.allocator.Allocator, c: *CliArgs, inv: *std.
 ```
 
 fill c.overrides.link_tokens and c.overrides.lib_dirs in command-line order: every `-l` value and every
-operand after the first that input.token_is_path accepts go to link_tokens, every `-L` value to
-lib_dirs. both vectors are reinitialised first
+operand after the first, the project, go to link_tokens, every `-L` value to lib_dirs. an operand
+input.token_is_path does not accept names no link input and is refused. both vectors are
+reinitialised first
 
 | Parameter | |
 | :--- | :--- |
 | `a` | allocator for the two vectors |
 | `c` | the arguments to fill |
 | `inv` | the invocation |
-| **returns** | ok, or err when a push fails |
+| **returns** | ok, or err when an operand names no link input or a push fails |
 
 ## EntryArgs
 
@@ -465,6 +467,7 @@ any other failure is returned as given
 | `DEP_WARNINGS` | `std.args.Flag` | `std_args.Flag{long: "dep-warnings", short: 0, value: nil, repeat: false, negatable: false, help: "also show dependencies' warnings, each under its own allow and #[expect]"}` | `--dep-warnings` |
 | `NO_CACHE` | `std.args.Flag` | `std_args.Flag{long: "no-cache", short: 0, value: nil, repeat: false, negatable: false, help: "rebuild without reusing cached objects or steps"}` | `--no-cache` |
 | `DIAGNOSTICS` | `std.args.Flag` | `std_args.Flag{long: "diagnostics", short: 0, value: "human\|json", repeat: false, negatable: false, help: "diagnostics as human text or NDJSON (default: human)"}` | `--diagnostics <human\|json>`: how diagnostics, failures and a test run's results reach stderr |
+| `PASSES` | `std.args.Flag` | `std_args.Flag{long: "passes", short: 0, value: nil, repeat: false, negatable: false, help: "print each optimisation pass that changed each function, and what it did"}` | `--passes`: each module's report of the optimisation passes that changed each of its functions, which mirl writes |
 | `PLAN` | `std.args.Flag` | `std_args.Flag{long: "plan", short: 0, value: nil, repeat: false, negatable: false, help: "print the build plan without building"}` | `--plan` |
 | `HELP` | `std.args.Flag` | `std_args.Flag{long: "help", short: 'h', value: nil, repeat: false, negatable: false, help: "show help"}` | `--help`, `-h`: the invocation asks for its command's page instead of running it, which takes precedence over every refusal but an unknown command |
 | `VERSION` | `std.args.Flag` | `std_args.Flag{long: "version", short: 0, value: nil, repeat: false, negatable: false, help: "print the version"}` | `--version`, the compiler's version alone on one line |

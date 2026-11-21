@@ -65,6 +65,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`spec_constant`](#spec_constant) | the specialization constant `spec_id`, whose default is the integer or float constant `default` |
 | [`constant_of`](#constant_of) | the module constant a constant value stands for |
 | [`use`](#use) | the mirl value `v` stands for in the function being built |
+| [`emit_function_address`](#emit_function_address) | the address of function value `v` as a value of the function being built |
 | [`emit_store_marked`](#emit_store_marked) | a store marked volatile where `vol` holds: an access of a volatile place |
 | [`emit_load_marked`](#emit_load_marked) | a load marked volatile where `vol` holds |
 | [`emit_add`](#emit_add) | the sum of `x` and `y`: a pointer and an integer step the pointer by that many bytes, floats add as floats |
@@ -152,7 +153,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`emit_switch`](#emit_switch) | a branch on `selector` to the target of the case it equals, else to `otherwise` |
 | [`emit_ret`](#emit_ret) | return `v` from the function being built: an aggregate is read whole from its address, as secret as `v` is |
 | [`emit_ret_void`](#emit_ret_void) | end the block with a return of no value |
-| [`emit_asm`](#emit_asm) | an inline assembly block at the cursor, binding the `n` values at `values` in its operands' order |
+| [`emit_asm`](#emit_asm) | an inline assembly block at the cursor, binding the `n` values at `values` in its operands' order, the results of the operands that give one written to `results` in that order |
 | [`emit_target_op`](#emit_target_op) | the target op `op` at the cursor over the `n` values at `values`, in its operands' order, its result the one `op` states or none, a pointer's in the space its caller places it |
 | [`emit_unreachable`](#emit_unreachable) | end the block as unreachable |
 | [`add`](#add) | emit_add with a failure kept as the builder's |
@@ -741,6 +742,20 @@ pub fun use(b: *Builder, v: mach.lower.value.Value) mirl.ir.id.Value
 ```
 
 the mirl value `v` stands for in the function being built
+
+### emit_function_address
+
+```mach
+pub fun emit_function_address(b: *Builder, v: mach.lower.value.Value) res[mach.lower.value.Value, mach.base.fail.Fail]
+```
+
+the address of function value `v` as a value of the function being built
+
+| Parameter | |
+| :--- | :--- |
+| `b` | the builder |
+| `v` | a function value |
+| **returns** | the address, or the failure mirl's builder kept |
 
 ### emit_store_marked
 
@@ -1781,11 +1796,12 @@ end the block with a return of no value
 ### emit_asm
 
 ```mach
-pub fun emit_asm(b: *Builder, block: *Assembly, values: *mach.lower.value.Value, n: u32) err[mach.base.fail.Fail]
+pub fun emit_asm(b: *Builder, block: *Assembly, values: *mach.lower.value.Value, n: u32, results: *mach.lower.value.Value) err[mach.base.fail.Fail]
 ```
 
 an inline assembly block at the cursor, binding the `n` values at `values` in its operands'
-order. the instruction copies the block, so it may be borrowed
+order, the results of the operands that give one written to `results` in that order. the
+instruction copies the block, so it may be borrowed
 
 ### emit_target_op
 

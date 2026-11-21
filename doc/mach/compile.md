@@ -120,7 +120,8 @@ results beside the diagnostics. every module that reached a phase carries that p
 product on its ModuleEntry even when the module's own query was rejected; the standing is
 frontend.frontend_status(p). a rejected phase ends the analysis at that phase; err is an
 operational failure only (an unreadable manifest, a selection naming no cell, allocation,
-I/O). every string `an` holds is borrowed for the call, and the project borrows `root`
+I/O). every string `an` holds is borrowed for the call, and the project borrows `root` and
+nothing of the manifest
 
 | Parameter | |
 | :--- | :--- |

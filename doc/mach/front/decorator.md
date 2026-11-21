@@ -38,7 +38,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 
 | On `Id` | |
 | :--- | :--- |
-| [`NONE`](#id), [`DEPRECATED`](#id), [`SYMBOL`](#id), [`SECTION`](#id), [`INLINE`](#id), [`EXPORT`](#id), [`ALIGN`](#id), [`PACKED`](#id), [`VOLATILE`](#id), [`LIBRARY`](#id), [`CONSTANT_TIME`](#id), [`VECTORIZE`](#id), [`NAKED`](#id), [`EXTENSION`](#id), [`EMBED`](#id), [`GPU_STAGE`](#id), [`GPU_WORKGROUP`](#id), [`GPU_INPUT`](#id), [`GPU_OUTPUT`](#id), [`GPU_BUILTIN`](#id), [`GPU_UNIFORM`](#id), [`GPU_STORAGE`](#id), [`GPU_SAMPLER`](#id), [`GPU_PUSH`](#id), [`GPU_SPEC`](#id), [`GPU_SHARED`](#id), [`INTRINSIC`](#id), [`HANDLE`](#id), [`ABI_TYPE`](#id), [`TESTING`](#id), [`EXPECT`](#id), [`THREAD`](#id), [`AT`](#id), [`WEAK`](#id), [`GPU_ATTACHMENT`](#id) | |
+| [`NONE`](#id), [`DEPRECATED`](#id), [`SYMBOL`](#id), [`SECTION`](#id), [`INLINE`](#id), [`EXPORT`](#id), [`ALIGN`](#id), [`PACKED`](#id), [`VOLATILE`](#id), [`LIBRARY`](#id), [`CONSTANT_TIME`](#id), [`VECTORIZE`](#id), [`NAKED`](#id), [`EXTENSION`](#id), [`EMBED`](#id), [`GPU_STAGE`](#id), [`GPU_WORKGROUP`](#id), [`GPU_INPUT`](#id), [`GPU_OUTPUT`](#id), [`GPU_BUILTIN`](#id), [`GPU_UNIFORM`](#id), [`GPU_STORAGE`](#id), [`GPU_SAMPLER`](#id), [`GPU_PUSH`](#id), [`GPU_SPEC`](#id), [`GPU_SHARED`](#id), [`INTRINSIC`](#id), [`HANDLE`](#id), [`ABI_TYPE`](#id), [`TESTING`](#id), [`EXPECT`](#id), [`THREAD`](#id), [`AT`](#id), [`WEAK`](#id), [`GPU_ATTACHMENT`](#id), [`NORETURN`](#id) | |
 | [`row`](#row) | the row of `id`; nil for NONE and any id no row declares |
 | [`id_of`](#id_of) | the decorator the name at `name` in `source` spells, NONE when it spells none |
 | [`name_of`](#name_of) | the name of `id`; nil for NONE |
@@ -120,6 +120,7 @@ pub def Id: u8
 | `AT` | `32` |  |
 | `WEAK` | `33` |  |
 | `GPU_ATTACHMENT` | `34` |  |
+| `NORETURN` | `35` |  |
 
 ### row
 

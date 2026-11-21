@@ -15,7 +15,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 | [`NamedConst`](#namedconst) | `rec` | one comptime value a stage binds |
 | [`FrameMark`](#framemark) | `rec` | where a frame of a scope's own bindings began, which frame_end rolls back to |
 | [`ComptimeEnv`](#comptimeenv) | `rec` | laying: what the build lays its types out by, borrowed from its back end, nil where it         opened no target |
-| [`BuildFacts`](#buildfacts) | `rec` | the build a program is compiled by and for: its mode, the compiler, the project, the names its target entry gives the os, isa, abi and platform, and the binary |
+| [`BuildFacts`](#buildfacts) | `rec` | the build a program is compiled by and for: its mode, the compiler, the project, the names its target entry gives the os, isa, abi and platform, and the binary: its name and its kind as the manifest spells it |
 | [`EmbedPathKind`](#embedpathkind) | `def` | what the load made of an `embed` argument |
 | [`EmbedPath`](#embedpath) | `rec` | artifact: the artifact whose output a resolved template names, nil when it names none |
 | [`Bindings`](#bindings) | `rec` | what one stage binds over one module, which that stage alone writes and every later stage reads |
@@ -173,11 +173,13 @@ pub rec BuildFacts {
     abi_name:      mach.base.intern.StrId;
     platform_name: mach.base.intern.StrId;
     bin_name:      mach.base.intern.StrId;
+    bin_kind:      mach.base.intern.StrId;
 }
 ```
 
 the build a program is compiled by and for: its mode, the compiler, the project, the
-names its target entry gives the os, isa, abi and platform, and the binary
+names its target entry gives the os, isa, abi and platform, and the binary: its name and its
+kind as the manifest spells it
 
 ### build_facts
 

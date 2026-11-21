@@ -36,6 +36,7 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 | [`NODE_LITERAL`](#nodekind) | a record or case literal: the case its head selects, STR_NIL for a record, then its named fields as written and its positional elements |
 | [`NODE_REFUSED`](#nodekind) | a leaf that has no compile-time value, with the refusal reading it gives |
 | [`NODE_ADDRESS`](#nodekind) | the address of `symbol`, then of the place its members step to: a field, named, or an element, unnamed, each a scalar holding its ordinal at the type it steps into |
+| [`NODE_LINKED`](#nodekind) | an integer the link fixes: its members the address added, a scalar holding the constant added as an i64's bits, and where it has a third the address taken away |
 
 | On `Refusal` | |
 | :--- | :--- |
@@ -58,11 +59,12 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 | [`scalar_add`](#scalar_add) | the scalar `v` of type `ty`; `hint` is the shape the builder expects it to have, which a column of a table shares from row to row, so it is taken without a lookup when it fits |
 | [`refused_add`](#refused_add) | a leaf of type `ty` with no compile-time value, which gives `r` when read |
 | [`aggregate_add`](#aggregate_add) | an array or a record or case literal of type `ty` with the members `members[0 .. len]`, each a node of `s`: the case `head` selects, and an array's declared element count |
+| [`linked_add`](#linked_add) | the integer of type `ty` the link fixes: the address node `plus` with `addend` added, less the address node `minus` where there is one, each a node of `s` |
 | [`address_add`](#address_add) | the address of `symbol` of type `ty`, then of the place the steps `steps[0 .. len]` reach |
 | [`member`](#member-1) | member `ord` of the aggregate or address `n`, which holds more than `ord` members |
 | [`member_at`](#member_at) | member `ord` of an array or literal node, checked |
 | [`scalar`](#scalar) | the value of the scalar `n` |
-| [`value`](#value) | the value a scalar node holds, or the refusal a refused one gives; an aggregate has no value of its own, and an address has none until the program is linked |
+| [`value`](#value) | the value a scalar node holds, or the refusal a refused one gives; an aggregate has no value of its own, and an address or an integer of addresses has none until the program is linked |
 | [`read`](#read) | what reading node `node` of module `module`'s store gives: a scalar's value, a refused leaf's or an address's refusal, or the aggregate itself as a value naming it |
 | [`project`](#project) | member `name` of a record or case literal: a record's field, or a case literal's payload when `name` is the case it holds |
 | [`element`](#element) | element `index` of an array node |
@@ -100,6 +102,7 @@ pub def NodeKind: u8
 | `NODE_LITERAL` | `2` | a record or case literal: the case its head selects, STR_NIL for a record, then its named fields as written and its positional elements |
 | `NODE_REFUSED` | `3` | a leaf that has no compile-time value, with the refusal reading it gives |
 | `NODE_ADDRESS` | `4` | the address of `symbol`, then of the place its members step to: a field, named, or an element, unnamed, each a scalar holding its ordinal at the type it steps into |
+| `NODE_LINKED` | `5` | an integer the link fixes: its members the address added, a scalar holding the constant added as an i64's bits, and where it has a third the address taken away |
 
 ## Refusal
 
@@ -341,6 +344,15 @@ an array or a record or case literal of type `ty` with the members `members[0 ..
 node of `s`: the case `head` selects, and an array's declared element count. `hint` is the shape
 the builder expects it to have, taken without a lookup when it fits
 
+### linked_add
+
+```mach
+pub fun linked_add(s: *Store, ty: mach.type.kind.TypeId, plus: Node, addend: Node, minus: opt[Node]) res[Node, mach.base.fail.Fail]
+```
+
+the integer of type `ty` the link fixes: the address node `plus` with `addend` added, less the
+address node `minus` where there is one, each a node of `s`
+
 ### address_add
 
 ```mach
@@ -387,7 +399,7 @@ pub fun value(s: *Store, itn: *mach.base.intern.Interner, node: Node) res[mach.f
 ```
 
 the value a scalar node holds, or the refusal a refused one gives; an aggregate has no
-value of its own, and an address has none until the program is linked
+value of its own, and an address or an integer of addresses has none until the program is linked
 
 ### read
 

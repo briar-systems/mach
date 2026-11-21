@@ -166,6 +166,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`hold_signature`](#hold_signature) | the unit holds one function for a symbol, so the `ext fun`s and the definition its modules state the symbol `name` with, as the function `d` declared by `did` does, state one signature |
 | [`hold_definition`](#hold_definition) | the object defines the symbol `name` as `what`, from the declaration whose name the module or template in scope writes at `span` |
 | [`hold_reference`](#hold_reference) | the object refers, at the node the lowering stands on, to the declaration `decl` of the module `origin` by the symbol `name` |
+| [`bytes_name`](#bytes_name) | the symbol of the bytes the string `val` linked as `name` points at, which the val's module defines beside it |
 | [`define_global`](#define_global) | the module's definition of the global `name`, in place of a declaration a reference made |
 | [`ensure_extern_function`](#ensure_extern_function) | the module's function `name`, declared here with `linkage` when another object defines it, with the mode `timed` its declaration states and the secret parameters and result its signature does, which are what a caller may trust of it |
 | [`stated_callee`](#stated_callee) | the declaration a call through a value of the function type `tid` states its callee keeps, none for a type marked with no constant-time mode: the type's mode, and the secret parameters, secret result and public pointers a function of that signature declares, so the call is trusted as one naming such a function is |
@@ -1971,6 +1972,14 @@ the symbol of any other means what the link binds it to, which the object's own 
 the symbol would stand in for, so that pair is refused whichever of the two comes first. a
 `#[weak]` default of another module is replaced at link by the definition that meets it, so a
 reference to one takes no part
+
+### bytes_name
+
+```mach
+pub fun bytes_name(lc: *LowerContext, name: mach.base.intern.StrId) res[mach.base.intern.StrId, mach.base.fail.Fail]
+```
+
+the symbol of the bytes the string `val` linked as `name` points at, which the val's module defines beside it
 
 ### define_global
 

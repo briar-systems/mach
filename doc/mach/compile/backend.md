@@ -316,6 +316,7 @@ pub rec Plan {
     offsets:       *Offset;
     offset_count:  usize;
     size:          opt[u64];
+    pad:           bool;
 }
 ```
 
@@ -329,6 +330,7 @@ the layout an artifact states its image, which mink lays out as a linker script 
 | `loads` | `*Within` | the output sections whose bytes load in a region other than the one they run in |
 | `offsets` | `*Offset` | the output sections placed at an offset, one per `#[at]` offset |
 | `size` | `opt[u64]` | the most bytes the image loads from its base, none for no ceiling |
+| `pad` | `bool` | a flat image is padded with the fill to exactly its size |
 
 ## Image
 
@@ -340,6 +342,9 @@ pub rec Image {
     libdir_count:  usize;
     stack_reserve: opt[u64];
     stack_commit:  opt[u64];
+    symbols:       bool;
+    headers:       bool;
+    unwind:        bool;
     plan:          *Plan;
     stated:        Stated;
 }
@@ -355,6 +360,9 @@ what the build states of the image it links, beyond its kind and format
 | `libdir_count` | `usize` | how many |
 | `stack_reserve` | `opt[u64]` | the main stack's reserve, none for the format's default |
 | `stack_commit` | `opt[u64]` | the main stack's commit, none for the format's default |
+| `symbols` | `bool` | the image keeps its symbol table |
+| `headers` | `bool` | an executable keeps its section header table |
+| `unwind` | `bool` | the image keeps its unwind tables |
 | `plan` | `*Plan` | the layout the artifact states, nil where it states none |
 | `stated` | `Stated` | where the build stated each option it hands mink |
 
@@ -367,6 +375,7 @@ pub rec Stated {
     subsystem:     mach.base.source.Location;
     base:          mach.base.source.Location;
     size:          mach.base.source.Location;
+    pad:           mach.base.source.Location;
     stack_reserve: mach.base.source.Location;
     stack_commit:  mach.base.source.Location;
     entry:         mach.base.source.Location;
@@ -386,6 +395,7 @@ option was not written or names no place
 | `subsystem` | `mach.base.source.Location` | the PE subsystem |
 | `base` | `mach.base.source.Location` | the image base |
 | `size` | `mach.base.source.Location` | the size ceiling |
+| `pad` | `mach.base.source.Location` | the pad to the size ceiling |
 | `stack_reserve` | `mach.base.source.Location` | the stack's reserve |
 | `stack_commit` | `mach.base.source.Location` | the stack's commit |
 | `entry` | `mach.base.source.Location` | the artifact's entry, the module the image's entry symbol is reached from |

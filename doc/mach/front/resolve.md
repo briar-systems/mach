@@ -59,6 +59,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`foreign_to`](#foreign_to) | whether `sym` names a binding a module other than the one `own` names declares: an import, or a `fwd` of one, which carries the kind the binding is declared with there as its own |
 | [`use_target`](#use_target) | the module a `use` symbol names, as the current operation numbers it |
 | [`use_stable`](#use_stable) | the stable id of the module a `use` symbol names, nil for any other symbol |
+| [`asm_constant`](#asm_constant) | whether `sym` may name a compile-time constant an asm block binds: a module `val` or a comptime parameter, whose value lowering reads |
 | [`symbol_is_runtime`](#symbol_is_runtime) | whether `sym` is a runtime binding: a local `val` or `var` or a parameter, none of them comptime |
 | [`symbol_is_comptime_local`](#symbol_is_comptime_local) | a comptime parameter or `$each` loop variable, whose value a frame binds by name |
 | [`symbol_name_kind`](#symbol_name_kind) | what a comptime evaluation reads a name resolved to `sym` as |
@@ -290,6 +291,15 @@ pub fun use_stable(sym: *Symbol) mach.session.module.StableModuleId
 ```
 
 the stable id of the module a `use` symbol names, nil for any other symbol
+
+### asm_constant
+
+```mach
+pub fun asm_constant(sym: *Symbol) bool
+```
+
+whether `sym` may name a compile-time constant an asm block binds: a module `val` or a comptime parameter, whose
+value lowering reads
 
 ### symbol_is_runtime
 

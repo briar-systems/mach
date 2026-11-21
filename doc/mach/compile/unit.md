@@ -18,7 +18,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.compile.backend`](ba
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Codegen`](#codegen) | `rec` | how mirl compiles a module: its optimisation setting, whether the schedule's own checks run, whether the linker may relax the code, the float relaxations permitted, and whether a vector operation taken lane by lane is refused, as `simd = "require"` asks |
+| [`Codegen`](#codegen) | `rec` | how mirl compiles a module: its optimisation setting, whether the schedule's own checks run, whether the linker may relax the code, whether the objects state frames for unwind tables, the float relaxations permitted, and whether a vector operation taken lane by lane is refused, as `simd = "require"` asks |
 | [`Lowered`](#lowered) | `rec` | a unit lowered and not yet compiled: the heap its module lives on, the module, the facts its lowering kept and what lowering it measured |
 | [`Job`](#job) | `rec` | how one lowered unit is compiled, all of it read only to the step |
 | [`Stats`](#stats) | `rec` | what compiling one lowered unit measured: mach's verifier and mirl's own stages and counts |
@@ -42,13 +42,15 @@ pub rec Codegen {
     optimise: Optimise;
     checked:  bool;
     relax:    bool;
+    unwind:   bool;
     floats:   mirl.pass.relaxation.Relaxations;
     require:  bool;
+    report:   bool;
 }
 ```
 
 how mirl compiles a module: its optimisation setting, whether the schedule's own checks run, whether
-the linker may relax the code, the float relaxations permitted, and whether a vector
+the linker may relax the code, whether the objects state frames for unwind tables, the float relaxations permitted, and whether a vector
 operation taken lane by lane is refused, as `simd = "require"` asks
 
 ## Lowered

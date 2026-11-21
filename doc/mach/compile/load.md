@@ -17,6 +17,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`entry_module_fqn`](#entry_module_fqn) | the fully qualified name of a target's entry module, under the project id |
 | [`join_path`](#join_path) | two paths joined |
 | [`target_context`](#target_context) | the comptime context of a build for `t` under `req`, whose back end states `facts`: every fact comptime reads from the target and the build options, and nothing of a project, so the build and the editor fold the same program the same way |
+| [`artifact_kind`](#artifact_kind) | the kind of the artifact named `artifact` as the manifest spells it, what `$bin.kind` reads: the cell's own or one the union walk loads, STR_NIL for a build of no artifact |
 | [`module_load`](#module_load) | load the module `fqn` names and everything it reaches |
 | [`module_load_one`](#module_load_one) | parse the module `fqn` names as a root, without walking it |
 | [`module_unread`](#module_unread) | whether the load reached the module `fqn` names and never read its file |
@@ -24,6 +25,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`reach`](#reach) | mark in `reached`, by module index, every module the build target's own frame reaches from the modules marked there already, the loader bound for the walk |
 | [`decorators_record`](#decorators_record) | record the strings a module's decorator arguments evaluate to, from the syntax the project's operations last published |
 | [`rebuild_topo`](#rebuild_topo) | reorder the modules of the current topo order for emission: those the emit roots reach first, each after what it imports, then every other module of the order the same way |
+| [`untested`](#untested) | every module `mid` reaches marked emitted: through every import in a build of the tests, and otherwise through the imports not marked `#[testing]` the modules a build that runs no tests emits narrowed to those its entries `entries[0 .. count]` reach through imports not marked `#[testing]`, each after what it imports: a module reached only through `#[testing] use` is checked but not emitted |
 | [`register_module_asts`](#register_module_asts) | number every module with a file, parse each in one operation and register its identity with the session |
 | [`acquire_loaded_parses`](#acquire_loaded_parses) | acquire the parse of every module with a file in the open operation |
 | [`collect_loaded_parses`](#collect_loaded_parses) | acquire the parse of every module with a file in an operation of its own and present them |
@@ -71,6 +73,15 @@ pub fun target_context(alloc: *std.allocator.Allocator, t: *mach.target.resolved
 the comptime context of a build for `t` under `req`, whose back end states `facts`: every
 fact comptime reads from the target and the build options, and nothing of a project, so
 the build and the editor fold the same program the same way
+
+### artifact_kind
+
+```mach
+pub fun artifact_kind(p: *mach.compile.project.Project, artifact: mach.base.intern.StrId) res[mach.base.intern.StrId, mach.base.fail.Fail]
+```
+
+the kind of the artifact named `artifact` as the manifest spells it, what `$bin.kind` reads:
+the cell's own or one the union walk loads, STR_NIL for a build of no artifact
 
 ### module_load
 
@@ -139,6 +150,18 @@ each after what it imports, then every other module of the order the same way
 | `emit_roots` | the modules the build emits from |
 | `emit_root_count` | length of `emit_roots` |
 | **returns** | ok, or the failure of an allocation or of a cycle among the loaded modules |
+
+### untested
+
+```mach
+pub fun untested(p: *mach.compile.project.Project, entries: *mach.session.module.ModuleId, count: u32) err[mach.base.fail.Fail]
+```
+
+every module `mid` reaches marked emitted: through every import in a build of the tests, and
+otherwise through the imports not marked `#[testing]`
+the modules a build that runs no tests emits narrowed to those its entries `entries[0 .. count]` reach through
+imports not marked `#[testing]`, each after what it imports: a module reached only through `#[testing] use` is
+checked but not emitted
 
 ### register_module_asts
 

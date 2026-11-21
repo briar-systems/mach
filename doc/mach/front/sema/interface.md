@@ -39,6 +39,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 | [`DECLARATION_SOFT`](#constants) | a function declared `#[constant_time("soft")]` or `#[constant_time("hard")]`: what a constant-time caller may trust of it, from its declaration alone |
 | [`DECLARATION_HARD`](#constants) | |
 | [`DECLARATION_WEAK`](#constants) | a `#[weak]` function, a link-time default another definition may replace |
+| [`DECLARATION_NORETURN`](#constants) | a `#[noreturn]` function, a call to which ends its block |
 
 ---
 
@@ -264,4 +265,5 @@ how a lowering reads the interface another module published
 | `DECLARATION_SOFT` | `DeclarationFlags` | `16` | a function declared `#[constant_time("soft")]` or `#[constant_time("hard")]`: what a constant-time caller may trust of it, from its declaration alone |
 | `DECLARATION_HARD` | `DeclarationFlags` | `32` |  |
 | `DECLARATION_WEAK` | `DeclarationFlags` | `64` | a `#[weak]` function, a link-time default another definition may replace |
+| `DECLARATION_NORETURN` | `DeclarationFlags` | `128` | a `#[noreturn]` function, a call to which ends its block |
 

@@ -248,6 +248,9 @@ pub rec ResolvedProfile {
     relax:        NameList;
     relax_named:  str;
     linker_relax: bool;
+    symbols:      bool;
+    sections:     bool;
+    unwind:       bool;
     debug:        bool;
     simd:         SimdMode;
     allow:        mach.base.diagnostic.kind.KindSet;
@@ -265,6 +268,9 @@ the profile a selection resolves to, copied out of its `ProfileDef`
 | `relax` | `NameList` | as `ProfileDef`, borrowed from the manifest |
 | `relax_named` | `str` | as `ProfileDef` |
 | `linker_relax` | `bool` | as `ProfileDef` |
+| `symbols` | `bool` | as `ProfileDef` |
+| `sections` | `bool` | as `ProfileDef` |
+| `unwind` | `bool` | as `ProfileDef` |
 | `debug` | `bool` | as `ProfileDef` |
 | `simd` | `SimdMode` | as `ProfileDef` |
 | `allow` | `mach.base.diagnostic.kind.KindSet` | as `ProfileDef` |

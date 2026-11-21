@@ -16,7 +16,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | :--- | :--- |
 | [`run_resolve_pass`](#run_resolve_pass) | a rejected module is one module's answer, so the pass folds it and carries on over the rest; an internal failure ends the pass where it met it |
 | [`run_sema_pass`](#run_sema_pass) | a rejected module is one module's answer, so the pass folds it and carries on over the rest; an internal failure ends the pass where it met it |
-| [`types_instances`](#types_instances) | the build types the instances module `m` asks for: its front end runs, and no object restored for it holds them |
+| [`types_instances`](#types_instances) | the build types the instances module `m` asks for: its front end runs, and it lowers one of the module's units, its normal object or its test object, which reads them where no restored object holds them |
 | [`retain_modules`](#retain_modules) | every module the load reached, gated out or not, is held under the session's active retainer: the project borrows each one's parse |
 | [`back_half_key`](#back_half_key) | a module's lowering and codegen products are keyed by its stable id, and by the test bit for its test object |
 | [`back_half_key_is_test`](#back_half_key_is_test) | whether a back-half key names a module's test object |
@@ -74,8 +74,8 @@ on over the rest; an internal failure ends the pass where it met it
 pub fun types_instances(p: *mach.compile.project.Project, m: *mach.compile.project.ModuleEntry) bool
 ```
 
-the build types the instances module `m` asks for: its front end runs, and no object restored
-for it holds them
+the build types the instances module `m` asks for: its front end runs, and it lowers one of the
+module's units, its normal object or its test object, which reads them where no restored object holds them
 
 ### retain_modules
 

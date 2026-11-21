@@ -20,7 +20,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../
 
 | On `Compiled` | |
 | :--- | :--- |
-| [`compile`](#compile) | the mirl module `m` compiled to mink's object under the setting `optimise`, its schedule's own checks run with `checked`, the linker let relax its code with `relax` and the float relaxations `floats` permitted, masc's listing of the object written to `listing` when there is one, and its stages timed and counted into `stats` when there is one |
+| [`compile`](#compile) | the mirl module `m` compiled to mink's object under the setting `optimise`, its schedule's own checks run with `checked`, the linker let relax its code with `relax`, its frames stated for unwind tables where `unwind` holds, and the float relaxations `floats` permitted, masc's listing of the object written to `listing` when there is one, and its stages timed and counted into `stats` when there is one |
 | [`warnings_dnit`](#warnings_dnit) | give back the warnings of what `compile` made, which own their text and places through `a`, the allocator it was given |
 | [`dnit`](#dnit) | give back what `compile` made: its object and its warnings |
 
@@ -48,17 +48,19 @@ warnings alone with `warnings_dnit` once the object has moved on
 ### compile
 
 ```mach
-pub fun compile(b: *Back, a: *std.allocator.Allocator, m: *Module, optimise: Optimise, checked: bool, relax: bool, floats: mirl.pass.relaxation.Relaxations,
-    require: bool, listing: opt[*std.io.writer.Writer], stats: opt[*mirl.base.stats.Stats], name: str, owner: str) res[Compiled, Unplaced]
+pub fun compile(b: *Back, a: *std.allocator.Allocator, m: *Module, optimise: Optimise, checked: bool, relax: bool, unwind: bool, floats: mirl.pass.relaxation.Relaxations,
+    require: bool, report: bool, listing: opt[*std.io.writer.Writer], stats: opt[*mirl.base.stats.Stats], name: str, owner: str) res[Compiled, Unplaced]
 ```
 
 the mirl module `m` compiled to mink's object under the setting `optimise`, its schedule's own checks
-run with `checked`, the linker let relax its code with `relax` and the float relaxations `floats`
+run with `checked`, the linker let relax its code with `relax`, its frames stated for unwind tables where `unwind`
+holds, and the float relaxations `floats`
 permitted, masc's listing of the object written to `listing` when there is one, and its stages
 timed and counted into `stats` when there is one. a vector operation mirl takes lane by lane is
 refused where `require` holds, as the profile's `simd = "require"` asks, and is a warning
 otherwise, a refusal naming the dependency `owner` whose code the module is, nil for the project
-being built. a failure or warning carries the location mirl names, unplaced.
+being built. where `report` holds, mirl writes its report of the optimisation passes that changed
+each function to stdout, each line whole. a failure or warning carries the location mirl names, unplaced.
 `name` is the object's, no other object's in a link. the module is the schedule's to rewrite, so
 it is spent here
 

@@ -19,7 +19,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`DepEntry`](#depentry) | `rec` | one dependency of a located closure |
 | [`Closure`](#closure) | `rec` | a root manifest's located dependency closure: every dependency realized under dep/, its manifest read once, and its direct edges |
 | [`ProjectConfig`](#projectconfig) | `rec` | what a configured build cell compiles and where it writes |
-| [`ArtifactEntry`](#artifactentry) | `rec` | an artifact entry the union walk loads: the entry module, the artifact it is of and where the artifact's `entry` is written in the manifest |
+| [`ArtifactEntry`](#artifactentry) | `rec` | an artifact entry the union walk loads: the entry module, the artifact it is of, its kind and where the artifact's `entry` is written in the manifest |
 | [`ModuleEntry`](#moduleentry) | `rec` | a module the project loaded: its identity, what the load decided for it, and the codegen staging of its objects |
 | [`Offer`](#offer) | `rec` | a module's offer: mirl's text of the bodies it offers and its names list, a line per symbol the text states (mirl.opt.offer), both drawn from `a` |
 | [`Record`](#record) | `rec` | the cache record a compiled object carries into `obj/`, nil until the cache publishes one |
@@ -56,6 +56,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 
 | On `Project` | |
 | :--- | :--- |
+| [`kind_name`](#kind_name) | the manifest's spelling of artifact kind `k`, interned: `bin` for an executable, else its output kind's |
 | [`record_dnit`](#record_dnit) | give back a record's bytes |
 | [`unit_count`](#unit_count) | the units the build compiles its emitted modules in, one object each: one per module, or one for them all where the family that compiles the build takes an artifact whole |
 | [`unit_module`](#unit_module) | the module whose entry holds unit `u`'s object, mirl text and listing: the module itself, or for an artifact taken whole the last module emitted, which no other emitted module imports |
@@ -226,12 +227,15 @@ free every entry of a closure, leaving it empty
 
 ```mach
 pub rec ProjectConfig {
-    id:           mach.base.intern.StrId;
-    version:      mach.base.intern.StrId;
-    bin_name:     mach.base.intern.StrId;
+    id:       mach.base.intern.StrId;
+    version:  mach.base.intern.StrId;
+    bin_name: mach.base.intern.StrId;
+    # the kind of the cell's artifact as the manifest spells it, what `$bin.kind` reads, STR_NIL for a cell of none
+    bin_kind:     mach.base.intern.StrId;
     icon:         mach.base.intern.StrId;
     app_manifest: mach.base.intern.StrId;
-    # the cell's artifact as its manifest declares it, borrowed, nil for a cell of none
+    # the cell's artifact as its manifest declares it, borrowed from the manifest a build configures from, nil for a
+    # cell of none and in a project `compile.analyze` returns, which outlives the manifest it read
     artifact:          *mach.manifest.model.ArtifactDef;
     module:            mach.base.intern.StrId;
     dir_src:           mach.base.intern.StrId;
@@ -280,11 +284,12 @@ what a configured build cell compiles and where it writes
 pub rec ArtifactEntry {
     fqn:      mach.base.intern.StrId;
     artifact: mach.base.intern.StrId;
+    kind:     Spelled;
     at:       mach.base.source.Location;
 }
 ```
 
-an artifact entry the union walk loads: the entry module, the artifact it is of and
+an artifact entry the union walk loads: the entry module, the artifact it is of, its kind and
 where the artifact's `entry` is written in the manifest
 
 ## ModuleEntry
@@ -556,6 +561,14 @@ table with each module's products and objects, the object cache's state and the 
 | `since` | `u64` | the first query operation this project ran; a product read between its operations counts only when one of them reached it |
 | `context_digest` | `[32]u8` | the fingerprint of the build context, once frozen |
 | `context_frozen` | `bool` | the build context is frozen, so a change to it is refused |
+
+### kind_name
+
+```mach
+pub fun kind_name(p: *Project, k: Spelled) res[mach.base.intern.StrId, mach.base.fail.Fail]
+```
+
+the manifest's spelling of artifact kind `k`, interned: `bin` for an executable, else its output kind's
 
 ### record_dnit
 

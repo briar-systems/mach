@@ -11,12 +11,16 @@ global's initializer folds to.
 
 Source: [`src/lower/expr.mach`](../../../src/lower/expr.mach)
 
-Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.front.ast.expr`](../front/ast/expr.md), [`mach.front.ast.id`](../front/ast/id.md), [`mach.front.comptime.value`](../front/comptime/value.md), [`mach.lower.context`](context.md), [`mach.lower.value`](value.md), [`mach.type.kind`](../type/kind.md).
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.base.source`](../base/source.md), [`mach.front.ast.expr`](../front/ast/expr.md), [`mach.front.ast.id`](../front/ast/id.md), [`mach.front.comptime.value`](../front/comptime/value.md), [`mach.front.resolve`](../front/resolve.md), [`mach.lower.context`](context.md), [`mach.lower.value`](value.md), [`mach.type.kind`](../type/kind.md).
 
 | Functions | |
 | :--- | :--- |
 | [`lower_rvalue`](#lower_rvalue) | lower the expression `eid` as a value, at its own source location, a value of a secret type classified secret |
 | [`symbol_linkage_name`](#symbol_linkage_name) | the linkage name of the module-level binding `eid` names, nil when it names a binding with none |
+| [`asm_constant`](#asm_constant) | the integer constant `sid` names for an asm block, as an integer of the pointer's width: a comptime parameter's or a module `val`'s, none for a binding of any other value |
+| [`asm_read`](#asm_read) | the value of `sem_ty` an asm block reads from the slot `slot` it binds |
+| [`calls_noreturn`](#calls_noreturn) | whether the expression `eid` is a call of a function declared `noreturn`, which ends the block it stands in |
+| [`string_val`](#string_val) | the string the module `val` `d` declares holds where a reference of pointer type `vty` reads it as the address of the string's bytes: none for a `var`, an `ext` or thread-local binding, or a val of any other value |
 | [`try_lower_comptime_intrinsic`](#try_lower_comptime_intrinsic) | lower a call of a comptime intrinsic a runtime value stands for: a comptime path, `$type_name`, `$type_id`, `$zeroize`, or a layout measurement as `$size_of` |
 | [`expr_span_of`](#expr_span_of) | where expression `eid` is written; an expression its syntax lacks records an internal failure and has the empty span |
 | [`lower_stored_rvalue`](#lower_stored_rvalue) | the value a store consumes |
@@ -54,6 +58,40 @@ pub fun symbol_linkage_name(ctx: *mach.lower.context.LowerContext, eid: mach.fro
 
 the linkage name of the module-level binding `eid` names, nil when it names a binding with
 none
+
+### asm_constant
+
+```mach
+pub fun asm_constant(ctx: *mach.lower.context.LowerContext, sid: mach.front.resolve.SymbolId) res[opt[mach.lower.value.Value], mach.base.fail.Fail]
+```
+
+the integer constant `sid` names for an asm block, as an integer of the pointer's width: a comptime parameter's
+or a module `val`'s, none for a binding of any other value
+
+### asm_read
+
+```mach
+pub fun asm_read(ctx: *mach.lower.context.LowerContext, slot: mach.lower.value.Value, ity: Type, sem_ty: mach.type.kind.TypeId) res[mach.lower.value.Value, mach.base.fail.Fail]
+```
+
+the value of `sem_ty` an asm block reads from the slot `slot` it binds
+
+### calls_noreturn
+
+```mach
+pub fun calls_noreturn(ctx: *mach.lower.context.LowerContext, eid: mach.front.ast.id.ExprId) res[bool, mach.base.fail.Fail]
+```
+
+whether the expression `eid` is a call of a function declared `noreturn`, which ends the block it stands in
+
+### string_val
+
+```mach
+pub fun string_val(ctx: *mach.lower.context.LowerContext, d: mach.lower.context.Declared, vty: Type) opt[mach.base.intern.StrId]
+```
+
+the string the module `val` `d` declares holds where a reference of pointer type `vty` reads it as the address of the
+string's bytes: none for a `var`, an `ext` or thread-local binding, or a val of any other value
 
 ### try_lower_comptime_intrinsic
 

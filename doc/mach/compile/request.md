@@ -82,6 +82,7 @@ pub rec Overrides {
     emit_asm:     bool;
     emit_ir:      bool;
     verify:       bool;
+    passes:       bool;
     dep_warnings: bool;
     optimize:     Lever;
     debug:        Lever;
@@ -209,8 +210,16 @@ pub rec BuildRequest {
     debug:     bool;
     # whether mach and mirl run their verifiers: opt-in, no part of any hash
     verify: bool;
+    # whether mirl reports each optimisation pass that changed each function: presentation only, no part of any
+    # hash, and a build that reports compiles every module, as a cached object holds no report
+    passes: bool;
     # whether the linker may relax the code, which mirl's relax build option states
     linker_relax: bool;
+    # whether the image keeps its symbol table, an executable its section header table, and
+    # the image its unwind tables, which the link states
+    symbols:  bool;
+    sections: bool;
+    unwind:   bool;
     # the float relaxations the profile's `relax` permits, which mirl's floats build option states
     floats: mirl.pass.relaxation.Relaxations;
     # the artifact's declared subsystem, none for the host's
