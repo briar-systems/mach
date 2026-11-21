@@ -10,7 +10,7 @@ test runner's events as they arrive, by the readout contract (doc/language/reado
 
 Source: [`src/cli/diagnostic.mach`](../../../src/cli/diagnostic.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.build.outcome`](../build/outcome.md), [`mach.package.report`](../package/report.md), [`mach.report.readout`](../report/readout.md), [`mach.report.testrun`](../report/testrun.md), [`mach.session`](../session.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.build.outcome`](../build/outcome.md), [`mach.package.report`](../package/report.md), [`mach.report.layout`](../report/layout.md), [`mach.report.readout`](../report/readout.md), [`mach.report.testrun`](../report/testrun.md), [`mach.session`](../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -56,15 +56,22 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 
 ```mach
 pub rec Readout {
-    sink:   mach.report.readout.Sink;
-    r:      *Report;
-    units:  usize;
-    quiet:  bool;
-    tally:  Tally;
-    run:    *mach.report.readout.TestResult;
-    count:  u32;
-    mod_w:  usize;
-    name_w: usize;
+    sink:    mach.report.readout.Sink;
+    r:       *Report;
+    units:   usize;
+    quiet:   bool;
+    tally:   Tally;
+    run:     *mach.report.readout.TestResult;
+    count:   u32;
+    roll:    [ROLL_COLS]mach.report.layout.Column;
+    line:    [3]mach.report.layout.Column;
+    stage:   [4]mach.report.layout.Column;
+    item:    [3]mach.report.layout.Column;
+    counter: [2]mach.report.layout.Column;
+    module:  [3]mach.report.layout.Column;
+    counts:  [readout.COUNTER_COUNT]u64;
+    held:    [readout.COUNTER_COUNT]bool;
+    holding: bool;
 }
 ```
 
@@ -88,8 +95,14 @@ finished test, and run_end
 | `tally` | `Tally` | the human tally, counted as the events pass |
 | `run` | `*mach.report.readout.TestResult` | the running test run's results, from its run_start to its run_end |
 | `count` | `u32` | how many results run holds |
-| `mod_w` | `usize` | the module column's width |
-| `name_w` | `usize` | the test column's width |
+| `roll` | `[ROLL_COLS]mach.report.layout.Column` | a module roll-up's columns: module, time, then the ok, skip and FAIL counts |
+| `line` | `[3]mach.report.layout.Column` | a test line's columns under -v: outcome, test, time |
+| `stage` | `[4]mach.report.layout.Column` | a phase row's columns |
+| `item` | `[3]mach.report.layout.Column` | the columns of an item under a phase row |
+| `counter` | `[2]mach.report.layout.Column` | a counter total's columns |
+| `module` | `[3]mach.report.layout.Column` | the columns of one module's counter |
+| `counts` | `[readout.COUNTER_COUNT]u64` | the counter totals held until the unit's rows close, those `held` |
+| `holding` | `bool` | whether any total is held |
 
 ### readout_begin
 

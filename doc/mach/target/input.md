@@ -26,6 +26,7 @@ Uses types from [`mach.base.fail`](../base/fail.md).
 | On `Kind` | |
 | :--- | :--- |
 | [`SHARED`](#kind), [`STATIC`](#kind) | |
+| [`MODULE`](#kind) | an import module the image's host supplies by its name, as a wasm module imports a function from, which no file holds |
 
 | On `Input` | |
 | :--- | :--- |
@@ -68,6 +69,7 @@ a refusal
 | :--- | :--- | :--- |
 | `SHARED` | `0` |  |
 | `STATIC` | `1` |  |
+| `MODULE` | `2` | an import module the image's host supplies by its name, as a wasm module imports a function from, which no file holds |
 
 ## Input
 

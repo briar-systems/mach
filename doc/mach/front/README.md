@@ -18,6 +18,7 @@ resolution, comptime evaluation, decorators, type checking, and doc comments
 | [`lexis`](lexis.md) | the reserved words and identifier characters the lexer, the parser and the migrator share |
 | [`literal`](literal.md) | scanning and decoding a literal's spelling: the value an integer, float, character or string literal names and the suffix it carries, or why it does not scan |
 | [`load`](load.md) | module loading: every module a build reaches, its gates decided and its imports bound |
+| [`omitted`](omitted.md) | the names a build leaves out: each name a module-scope `$if` branch the build does not select declares, with the condition that left it out |
 | [`parser`](parser.md) | the parser's entry: one token stream parsed into a syntax tree, handed back only when the parse completed |
 | [`path`](path.md) | dotted paths read from the source, with the trivia between their segments skipped |
 | [`refusal`](refusal.md) | a module refused by a module-scope `$error` |

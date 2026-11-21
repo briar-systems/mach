@@ -39,6 +39,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`archive_variant`](#archive_variant) | the variant mink writes a static library of the target's objects in, as its registry states it of the target's format |
 | [`c_prefix`](#c_prefix) | the prefix the target's format gives a C symbol's name on its architecture, empty for none, as mink's registry states it |
 | [`describes_claims`](#describes_claims) | whether the target's link makes a shared system library from the claim that names it, with no file, as a two-level namespace format does |
+| [`takes_modules`](#takes_modules) | whether an import of the target's format names the module its host supplies it from, as a wasm module's does |
 | [`link`](#link) | the image of `kind` in the target's format mink links from the `count` requests at `requests`, a library named by name found by mink's search, named `output_path` where its format records a name, its unreferenced sections left out with `gc`, laid out as `image` states, with what the link read |
 
 | On `Laying` | |
@@ -245,6 +246,15 @@ pub fun describes_claims(b: *Back, a: *std.allocator.Allocator) res[bool, mach.b
 
 whether the target's link makes a shared system library from the claim that names it,
 with no file, as a two-level namespace format does
+
+### takes_modules
+
+```mach
+pub fun takes_modules(b: *Back, a: *std.allocator.Allocator) res[bool, mach.base.fail.Fail]
+```
+
+whether an import of the target's format names the module its host supplies it from, as
+a wasm module's does
 
 ### link
 

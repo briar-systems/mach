@@ -8,7 +8,8 @@ those its dependencies export, each classified as mach's own link classifies it.
 shared system library on a target whose link makes one from its claim is named by
 its loader name as written, with the versions the entry states, and provides the
 symbols the entry lists and each symbol the object refers to that a `#[library]`
-pins to it, each with whether it is a function or a variable. any other library or
+pins to it, each with whether it is a function or a variable. an import module is
+named by its name and provides its symbols the same way. any other library or
 framework is named with its kind, and a file by its absolute path. mink adds them
 as one section every image leaves out, so an archive of the objects carries them
 to the link that takes it

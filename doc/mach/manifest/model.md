@@ -33,7 +33,7 @@ Uses types from [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mac
 
 | On `NameList` | |
 | :--- | :--- |
-| [`names_dnit`](#names_dnit) | |
+| [`names_dnit`](#names_dnit) | release a name list's names and sites and leave it empty |
 
 | On `SimdMode` | |
 | :--- | :--- |
@@ -116,6 +116,8 @@ each against the catalog it names into
 ```mach
 pub fun names_dnit(alloc: *std.allocator.Allocator, l: *NameList)
 ```
+
+release a name list's names and sites and leave it empty
 
 ## SimdMode
 

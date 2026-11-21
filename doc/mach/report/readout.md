@@ -25,9 +25,10 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | Type | | |
 | :--- | :--- | :--- |
 | [`Phase`](#phase) | `def` | a readout phase, an index into the phase table |
+| [`Noun`](#noun) | `def` | what a phase row counts, an index into the noun table |
 | [`Counter`](#counter) | `def` | a readout counter, an index into the counter table |
 | [`Unit`](#unit) | `rec` | a unit of the plan starts: what its goal calls the work (`building`, `checking`), the artifact, the target and the profile |
-| [`PhaseEnd`](#phaseend) | `rec` | a phase row closes: the count it processed, in the noun that counts it, its time, the threads that time is summed over (0 for a row of the unit's own time), the modules it dropped as target-gated, and under LEVEL_ITEMS its slowest item, nil when it had fewer than two |
+| [`PhaseEnd`](#phaseend) | `rec` | a phase row closes: the count it processed, the noun that counts it, its time, the threads that time is summed over (0 for a row of the unit's own time), the modules it dropped as target-gated, and under LEVEL_ITEMS its slowest item, nil when it had fewer than two |
 | [`Item`](#item) | `rec` | one module or file a phase finished, when it finished |
 | [`Tally`](#tally) | `rec` | a counter's value: one module's under LEVEL_ITEMS, named by it, or the unit's total under LEVEL_PHASES, with a nil name |
 | [`Summary`](#summary) | `rec` | a unit built its output: the path, the modules in it, its size in bytes when the output is one file, the time no row accounts for, and the unit's wall time |
@@ -58,6 +59,11 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`TARGET`](#phase) | the build's target resolved and its back half opened: mink's formats, mirl's assembled and readied target |
 | [`label_of`](#label_of) | the row label of phase ph |
 
+| On `Noun` | |
+| :--- | :--- |
+| [`NOUN_TARGETS`](#noun), [`NOUN_MODULES`](#noun), [`NOUN_OBJECTS`](#noun), [`NOUN_BINARIES`](#noun), [`NOUN_ARCHIVES`](#noun), [`NOUN_LIBRARIES`](#noun), [`NOUN_STEPS`](#noun) | |
+| [`noun_of`](#noun_of) | noun n as a count of `count` takes it |
+
 | On `Counter` | |
 | :--- | :--- |
 | [`FUNCTIONS`](#counter) | the functions of the lowered modules, as mirl's module holds them |
@@ -70,6 +76,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`ALLOCATED`](#counter) | the machine instructions after mirl's register allocation |
 | [`ALLOC_ROUNDS`](#counter) | the rounds of mirl's register allocation |
 | [`counter_label`](#counter_label) | the label of counter c |
+| [`counter_bytes`](#counter_bytes) | whether counter c counts bytes |
 
 | On `TestResult` | |
 | :--- | :--- |
@@ -107,13 +114,19 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`item_spent`](#item_spent) | name spent d in phase ph, measured by its caller |
 | [`count`](#count) | the module name's value of counter c, added to the unit's total and sent under LEVEL_ITEMS |
 | [`counts_end`](#counts_end) | send the unit's total of every counter posted since the last close, then start them over |
-| [`phase_end`](#phase_end) | close phase ph's row: count is what it processed, named by noun_one or noun_many |
+| [`phase_end`](#phase_end) | close phase ph's row: count is what it processed, counted by noun |
 | [`summary`](#summary-1) | the unit built out: the time no row accounts for floors at zero |
+
+| Functions | |
+| :--- | :--- |
+| [`label_width`](#label_width) | the widest row label of the phase table |
+| [`noun_width`](#noun_width) | the widest spelling of the noun table |
+| [`counter_width`](#counter_width) | the widest label of the counter table |
 
 | Constants | |
 | :--- | :--- |
 | [`STAGE_COUNT`](#constants) | mirl's and masc's stages, the rows a module's step carves out of its codegen row, in the order mirl runs them |
-| [`STAGES`](#constants) | |
+| [`STAGES`](#constants), [`COUNTER_COUNT`](#constants) | |
 | [`LEVEL_RESULTS`](#constants) | what a sink asks to receive |
 | [`LEVEL_PHASES`](#constants), [`LEVEL_ITEMS`](#constants) | |
 
@@ -159,6 +172,32 @@ pub fun label_of(ph: Phase) str
 
 the row label of phase ph
 
+## Noun
+
+```mach
+pub def Noun: u8
+```
+
+what a phase row counts, an index into the noun table
+
+| Name | Value | |
+| :--- | :--- | :--- |
+| `NOUN_TARGETS` | `0` |  |
+| `NOUN_MODULES` | `1` |  |
+| `NOUN_OBJECTS` | `2` |  |
+| `NOUN_BINARIES` | `3` |  |
+| `NOUN_ARCHIVES` | `4` |  |
+| `NOUN_LIBRARIES` | `5` |  |
+| `NOUN_STEPS` | `6` |  |
+
+### noun_of
+
+```mach
+pub fun noun_of(n: Noun, count: u64) str
+```
+
+noun n as a count of `count` takes it
+
 ## Counter
 
 ```mach
@@ -187,6 +226,14 @@ pub fun counter_label(c: Counter) str
 
 the label of counter c
 
+### counter_bytes
+
+```mach
+pub fun counter_bytes(c: Counter) bool
+```
+
+whether counter c counts bytes
+
 ## Unit
 
 ```mach
@@ -207,8 +254,7 @@ a unit of the plan starts: what its goal calls the work (`building`,
 pub rec PhaseEnd {
     phase:           Phase;
     count:           u32;
-    noun_one:        str;
-    noun_many:       str;
+    noun:            Noun;
     elapsed:         std.chrono.duration.Duration;
     threads:         u32;
     dropped:         u32;
@@ -217,7 +263,7 @@ pub rec PhaseEnd {
 }
 ```
 
-a phase row closes: the count it processed, in the noun that counts it, its
+a phase row closes: the count it processed, the noun that counts it, its
 time, the threads that time is summed over (0 for a row of the unit's own
 time), the modules it dropped as target-gated, and under LEVEL_ITEMS its
 slowest item, nil when it had fewer than two
@@ -614,10 +660,10 @@ send the unit's total of every counter posted since the last close, then start t
 ### phase_end
 
 ```mach
-pub fun phase_end(pr: *Progress, ph: Phase, count: u32, noun_one: str, noun_many: str)
+pub fun phase_end(pr: *Progress, ph: Phase, count: u32, noun: Noun)
 ```
 
-close phase ph's row: count is what it processed, named by noun_one or noun_many
+close phase ph's row: count is what it processed, counted by noun
 
 ### summary
 
@@ -627,12 +673,39 @@ pub fun summary(pr: *Progress, out: str, modules: u32, bytes: usize, has_size: b
 
 the unit built out: the time no row accounts for floors at zero
 
+## Functions
+
+### label_width
+
+```mach
+pub fun label_width() usize
+```
+
+the widest row label of the phase table
+
+### noun_width
+
+```mach
+pub fun noun_width() usize
+```
+
+the widest spelling of the noun table
+
+### counter_width
+
+```mach
+pub fun counter_width() usize
+```
+
+the widest label of the counter table
+
 ## Constants
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
 | `STAGE_COUNT` | `usize` | `7` | mirl's and masc's stages, the rows a module's step carves out of its codegen row, in the order mirl runs them |
 | `STAGES` | `[STAGE_COUNT]Phase` | `[STAGE_COUNT]Phase{PASSES, SELECT, ALLOC, FRAME, MIRL_EMIT, LAYOUT, ENCODE}` |  |
+| `COUNTER_COUNT` | `usize` | `9` |  |
 | `LEVEL_RESULTS` | `u8` | `0` | what a sink asks to receive |
 | `LEVEL_PHASES` | `u8` | `1` |  |
 | `LEVEL_ITEMS` | `u8` | `2` |  |

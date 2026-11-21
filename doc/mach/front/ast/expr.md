@@ -28,7 +28,7 @@ Uses types from [`mach.base.intern`](../../base/intern.md), [`mach.base.source`]
 | [`ExprStructLit`](#exprstructlit) | `rec` | a typed literal `T{...}` with named or bare fields, or no fields |
 | [`ExprVectorLit`](#exprvectorlit) | `rec` | a typed literal with only positional elements, `T{a, b}`: a vector's lanes as written, or a tag case's payload when name resolution finds the head names a case (interpretation.CASE_LITERAL) |
 | [`ExprTypeRef`](#exprtyperef) | `rec` | a type written where an expression stands |
-| [`ExprSel`](#exprsel) | `rec` |  |
+| [`ExprSel`](#exprsel) | `rec` | a `sel place.case` test of whether a tag place holds the named case |
 | [`Expr`](#expr) | `rec` | `span` is the node's visual extent, grouping parentheses included |
 
 | On `ExprKind` | |
@@ -386,12 +386,19 @@ a type written where an expression stands
 pub rec ExprSel {
     place:     mach.front.ast.id.ExprId;
     case_name: mach.base.source.Span;
-    # `case_name` as the parse interned it, STR_NIL for an unnamed case
-    case_id: mach.base.intern.StrId;
-    # `sel place.[c]`: the comptime case descriptor; EXPR_NIL when the case is named
+    case_id:   mach.base.intern.StrId;
     case_desc: mach.front.ast.id.ExprId;
 }
 ```
+
+a `sel place.case` test of whether a tag place holds the named case
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `place` | `mach.front.ast.id.ExprId` | the tag place tested |
+| `case_name` | `mach.base.source.Span` | the case as written, an empty span at the place for `sel place.[c]` |
+| `case_id` | `mach.base.intern.StrId` | `case_name` as the parse interned it, STR_NIL for an unnamed case |
+| `case_desc` | `mach.front.ast.id.ExprId` | `sel place.[c]`: the comptime case descriptor, EXPR_NIL when the case is named |
 
 ## Expr
 

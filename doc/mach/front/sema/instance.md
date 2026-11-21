@@ -50,7 +50,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 | [`expr_type_at`](#expr_type_at) | the type of the expression `eid` in `frame` or the nearest parent that records one |
 | [`decl_type_at`](#decl_type_at) | the type of the binding `did` in `frame` or the nearest parent that records one |
 | [`type_in_frame`](#type_in_frame) | the type frame `frame` itself resolved the type node `tid` to, not one of its parents |
-| [`type_at`](#type_at) | |
+| [`type_at`](#type_at) | the type frame `frame` or the nearest of its parents resolved the type node `tid` to |
 | [`call_at`](#call_at) | the instance the call or generic reference `eid` names in frame `frame` |
 | [`gate_at`](#gate_at) | the verdict of the gate on `cond` in `frame` or the nearest parent that records one |
 | [`each_at`](#each_at) | the constant array the `$each` at `sid` reads in `frame` or the nearest parent that records one |
@@ -394,6 +394,8 @@ the type frame `frame` itself resolved the type node `tid` to, not one of its pa
 ```mach
 pub fun type_at(set: *Set, frame: u32, tid: mach.front.ast.id.TypeId) opt[mach.type.kind.TypeId]
 ```
+
+the type frame `frame` or the nearest of its parents resolved the type node `tid` to
 
 ### call_at
 
