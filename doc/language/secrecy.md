@@ -918,7 +918,7 @@ expansion types, and one in a `$if` or `$or` arm the build does not select,
 which is listed though the build compiles none of it. It lists what the source states, so a
 declassification the compiler makes itself, as the test of a division's
 divisor for zero, is not listed. The flag belongs to `check` alone. The listing
-stays plain lines on stdout under `--diagnostics json`, which turns only stderr
+stays plain lines on stdout under `--report json`, which turns only stderr
 into records ([readout.md](readout.md#streams)).
 
 A secret-taint bit is threaded from sema's flow typing through IR and MIR to the

@@ -714,6 +714,14 @@ The literal's byte count must be the array's length, and the element must be
 after its bytes, so `"abc"` is 4 bytes there and 3 in `[3]u8`. See
 [literals.md](literals.md#string).
 
+An array aligns to its element. A module `val` or `var` of array type also takes
+the floor its target's `abi` states for a global array variable: `sysv64` and
+`basic` align one of at least 16 bytes to 16, `aapcs64win` aligns
+one of at least 2, 8 and 64 bytes to 4, 8 and 16, and the other conventions
+state none. The floor never lowers an alignment, `#[align]` raises it further,
+and it leaves local arrays, the anonymous data of literals and a global `#[at]`
+places as they are.
+
 ### Inferred length `[_]T`
 
 `[_]T` leaves the length for an array literal to give. It is legal only

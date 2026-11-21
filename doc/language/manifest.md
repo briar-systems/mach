@@ -51,7 +51,7 @@ A manifest refusal points at what it refuses, after the message: the value it
 rejects, the key token of a name or key it rejects, the table a required key is
 missing from, or the start of the file when a required table is missing from
 it, in the manifest that states it, a dependency's own included.
-[`--diagnostics json`](diagnostics-json.md#failures)
+[`--report json`](report-records.md#failures)
 carries the same place as the failure's `primary` span.
 
 ```
@@ -283,7 +283,7 @@ to whichever *declared* target matches the host.
 | `arch` | yes      | Architecture, such as `x86_64` or `riscv64`. Read by `$project.target.arch`. |
 | `isa` | absent: the system's floor; required on `freestanding` but for `wasm32`, which stands on `wasm1` | The instruction set every machine of the target has, spelled as masc's catalog for the architecture spells a selection, such as `rv32imc` or `x86-64-v2`. Every architecture takes it, and masc refuses a selection its catalog does not spell. An `isa` that names an architecture is v6's spelling of `arch`, refused with the rename `mach migrate` writes. See [RISC-V baselines](#risc-v-baselines). |
 | `sys`  | yes      | System. Read by `$project.target.sys`. |
-| `abi` | yes      | Application binary interface. Read by `$project.target.abi`. |
+| `abi` | yes      | Application binary interface. Read by `$project.target.abi`. Its calling convention, and the alignment floor it states for a module array variable (see [types.md](types.md#array)). |
 | `of`  | absent: the system's format | Object-format override; defers to the system's format when omitted. See [Object-format override](#object-format-override). |
 | `base` | absent: the system's base | Load-address override, an [address](#addresses). Overrides the system's default base virtual address; defers to it when omitted, which mink's catalog states per architecture (on `freestanding`, `0x100000` on `x86_64`, `0x40000000` on `aarch64` and `0x80000000` on `riscv64` and `riscv32`). |
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
@@ -1334,11 +1334,11 @@ licm = false                           # every other pass runs, loop invariant m
 ```
 
 The optimization passes are `inline`, `split`, `promote`, `reassociate`, `fold`,
-`algebraic`, `reduce`, `effects`, `cse`, `forward`, `dse`, `thread`, `ifconvert`, `demanded`, `licm`, `vectorise`, `hoist`, `unroll`, `dce` and `switch`. A key that names none of them is refused where it is
+`algebraic`, `reduce`, `effects`, `cse`, `forward`, `dse`, `bypass`, `thread`, `ifconvert`, `demanded`, `licm`, `vectorise`, `hoist`, `unroll`, `rotate`, `dce` and `switch`. A key that names none of them is refused where it is
 written, with the list, whichever profile the build selects:
 
 ```
-error[manifest.invalid_value] mach.toml: [profile.release].passes names "peel", which is no optimization pass. the optimization passes are inline, split, promote, reassociate, fold, algebraic, reduce, effects, cse, forward, dse, thread, ifconvert, demanded, licm, vectorise, hoist, unroll, dce, switch
+error[manifest.invalid_value] mach.toml: [profile.release].passes names "peel", which is no optimization pass. the optimization passes are inline, split, promote, reassociate, fold, algebraic, reduce, effects, cse, forward, dse, bypass, thread, ifconvert, demanded, licm, vectorise, hoist, unroll, rotate, dce, switch
 ```
 
 A non-boolean value is a manifest error. `--set passes.<name>=<bool>` writes

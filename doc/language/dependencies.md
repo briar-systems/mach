@@ -92,7 +92,7 @@ what resolution chose.
 
 **`--offline`.** `add`, `update` and `outdated` read candidates from each
 dependency's repository: one `git ls-remote --tags` per URL and command,
-announced first (`reading the releases of <url>`), and the first time a
+announced first (`reading  <url>  releases`), and the first time a
 release's manifest is needed, every listed release's manifest at once, in two
 fetches into a scratch repository, which every later resolution in the same
 command reads again (`add` resolves the new range and then the closure,
@@ -392,7 +392,7 @@ directory Git retained) and takes the one step that brings it to what `mach
 dep verify` checks:
 
 - a staged gitlink with nothing checked out, as on a fresh clone or after the
-  directory was deleted, is initialized in place (`realized std @ <commit>
+  directory was deleted, is initialized in place (`realized  std  <commit>  <selector>
   (initialized the committed gitlink)`), first restoring its `.gitmodules`
   entry from the manifest if that entry is gone;
 - a checkout at another commit than its gitlink is checked out at the gitlink;
@@ -402,13 +402,23 @@ dep verify` checks:
 - with neither, the submodule is added at the selector, reusing a module
   directory Git retained from an earlier removal.
 
-A progress line names a commit by its first 12 hex digits, as in `realized std
-@ 1c484f5f57d9` or `std: 1c484f5f57d9 -> 5a0e3d21b7c4`. `mach dep list` shows a
-pin in full.
+Each step prints a [progress line](readout.md#progress-lines) on stdout, a verb
+in the gutter then the dependency and what was done:
+
+```
+  realized  std     1c484f5f57d9  branch/dev
+   updated  std     1c484f5f57d9 -> 5a0e3d21b7c4
+ unchanged  crypto  2c564d948fbc
+  realized  helper  demo/../helper  (copy made from its source)
+     added  [dep.helper]
+```
+
+A progress line names a commit by its first 12 hex digits. `mach dep list`
+shows a pin in full.
 
 Then, when the checkout lacks the tag its selection is read by (the tag a
 `tag/` names, or a release tag naming a `version` selection's pin), pull
-fetches its tags (`fetched the tags of std`). `update` and `outdated` fetch
+fetches its tags (`fetched  std  tags`). `update` and `outdated` fetch
 them the same way to read a pin's release, unless `--offline`.
 
 `pull` refuses an identity pinned at two commits across the closure, as
@@ -446,9 +456,8 @@ dependencies in these projects are verified from their own plain checkouts.
 `branch/` selector to its current remote tip and re-stages the gitlink, and it
 moves an exact selector to the commit it names, so an identity realized at a
 dependency's selection lands on the root's declaration once the root declares
-one (`b: <commit> -> <other> (pinned to the exact selector)`, or `b: <commit>
-(exact selector, already pinned)` when nothing moves, each commit written in
-full). `<name>` is looked up in the whole
+one (`updated  b  <commit> -> <other>  (pinned to the exact selector)`, or
+`unchanged  b  <commit>  (exact selector, already pinned)` when nothing moves). `<name>` is looked up in the whole
 dependency closure, so `mach dep update <path> b` for an identity the root does
 not declare moves its checkout to the selector its requirers declare, and
 `--all` moves every selector in the closure. Resolution reads a dependency

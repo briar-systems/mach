@@ -55,7 +55,7 @@ doc with grammar, examples, and neighboring links. Start from the index below.
 ## Diagnostics
 
 - [diagnostics.md](diagnostics.md) - diagnostic keys, the code registry and its never-reused rule
-- [diagnostics-json.md](diagnostics-json.md) - `--diagnostics json`, the versioned NDJSON record schema
+- [report-records.md](report-records.md) - `--report json` and `--report lines`, the versioned record schema
 - [readout.md](readout.md) - what `-v` and `-vv` show for build, check and test, on which stream, and when
 
 ## Formal grammar

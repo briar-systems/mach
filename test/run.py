@@ -11,7 +11,8 @@
 # a target file's rules hold of the blocks of `mink dump`: `has` some block holds every part,
 # `lacks` none does, `each` every block holding the first part holds the rest, and
 # `inside <parts> | <parts>` every block holding the first parts lies within the addresses of a
-# block holding the second. a block's addresses are a section's or a segment's, a PE section's
+# block holding the second. a part `Key: %n` holds of a line whose key is Key and whose value
+# is a multiple of n, as a symbol's address aligned to n. a block's addresses are a section's or a segment's, a PE section's
 # from the image base, or a PE function table entry's, from its start to its end.
 # a `# targets:` line in a file's header names the targets that take it: a refuse/ file is
 # tried on the host alone without one, and a run/ or gpu/ file on every target taking its kind.
@@ -125,12 +126,18 @@ def blocks(dump):
 
 def field(part, line):
     # `Key: a b` holds of a line whose key is Key and whose value has the words a and b,
-    # and `Key` alone of a line whose key or flag name is Key
+    # `Key: %n` of one whose value is a multiple of n, and `Key` alone of a line whose key or
+    # flag name is Key
     key, sep, words = part.partition(': ')
     if not sep:
         return re.split('[: ]', line, maxsplit=1)[0] == part
     lkey, lsep, lwords = line.partition(': ')
-    return lsep and lkey == key and set(words.split()) <= set(lwords.split())
+    if not lsep or lkey != key:
+        return False
+    if words.startswith('%'):
+        value = lwords.split()[0] if lwords.split() else ''
+        return re.fullmatch(r'(0x[0-9a-fA-F]+|[0-9]+)', value) is not None and int(value, 0) % int(words[1:], 0) == 0
+    return set(words.split()) <= set(lwords.split())
 
 
 def holds(block, parts):
@@ -214,7 +221,7 @@ def manifest_loads(cfg, path):
     # why a manifest does not load, or None. no artifact is named `=`, so a check that selects it
     # stops at the selection, after the whole manifest is accepted and before any dependency is read
     rel = os.path.relpath(path, ROOT)
-    p = subprocess.run([cfg.mach, 'check', os.path.dirname(rel) or '.', '--artifact', '=', '--diagnostics', 'json'],
+    p = subprocess.run([cfg.mach, 'check', os.path.dirname(rel) or '.', '--artifact', '=', '--report', 'json'],
                        capture_output=True, text=True, cwd=ROOT)
     errs = errors(p.stdout + p.stderr)
     if errs and errs[0][0] == 'selection.unknown':
@@ -248,7 +255,7 @@ def build(cfg, path, target):
     os.makedirs(os.path.join(HERE, os.path.dirname(out)), exist_ok=True)
     # an entry build names its entry by a relative path inside the directory it runs in
     cmd = [cfg.mach, 'build', rel, '--source', 'std=' + cfg.std, *target.flags, *header(path).get('flags', '').split(),
-           '-w', os.path.join('out', 'work', target.name), '-o', out, '--diagnostics', 'json']
+           '-w', os.path.join('out', 'work', target.name), '-o', out, '--report', 'json']
     p = subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
     return p.returncode, errors(p.stdout + p.stderr), os.path.join(HERE, out)
 

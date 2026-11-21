@@ -4,38 +4,92 @@
 happens. The compiler and the test runner report each event the moment it
 happens: a unit starting, a phase closing, a module finishing a phase, a
 diagnostic, a failure, a test finishing. The command renders each event as it
-arrives, in human text or as JSON records, so nothing waits for the end of the
-build or the run to be written. This page is the contract for what each level
+arrives, in human text or as [records](report-records.md). A record is written
+the moment its event arrives. Human text writes progress lines, diagnostics,
+failures and test results as they arrive, and holds a unit's `-v` table until
+the unit closes, so its bars can be scaled to the unit's largest row. This page is the contract for what each level
 shows, on which stream, and when.
 
 ## Levels
 
 | Flag | `build` and `check` | `test` |
 |---|---|---|
-| none | diagnostics, failures, the `building <artifact>` banner (`checking <artifact>` for a check) when the plan has several units, and the closing tally when anything was reported | the build's output as for `build`, then one roll-up line per module and the closing summary |
-| `-v` | also one row per phase as the phase closes, the `other` row and the `built` line of each unit (a check stops after `sema` and builds nothing, so it shows neither) | the build's phase rows, and one line per test instead of the roll-ups |
-| `-vv` | also one line per module or file a phase processed, as it finishes, and each phase row names its slowest item | the build's per-module lines, and the captured output of passing tests |
-
-A banner names the unit's target in parentheses, `building app (linux-x86_64)`,
-when the command selected targets with `-t` or `--all`. A selection that spans
-several profiles prints a `profile <name>:` header before each profile's units.
+| none | diagnostics, failures, the progress line of the unit, or the units table of a selection of several, and the closing tally when anything was reported | the build's output as for `build` (the test dispatcher's own line only under `-v`), then one row per module, each failure once and the verdict |
+| `-v` | also each unit's table of stages with its `other` and `total` rows and its counter lines, and before each table a banner naming the unit when the selection has several | the build's tables, and one line per test instead of the module rows |
+| `-vv` | also, under each stage, one line per module or file it processed, each stage naming its slowest, and a table of each module's counters | the build's per-module lines, and the captured output of passing tests |
 
 `-v` and `-vv` cannot be combined with `--quiet` or `-q`, which is refused as
-`cli.flag_conflict`. `--quiet` drops the banners and the `profile <name>:`
-headers.
+`cli.flag_conflict`. `--quiet` drops the progress lines, the units table and
+the banners.
+
+## Progress lines
+
+Every progress line of every command has one shape: a verb right-aligned in a
+gutter ten columns wide, then what it acted on, with any detail on an indented
+line beneath it. The verbs are a closed set, one table in
+`mach.report.layout`: `created`, `realized`, `updated`, `unchanged`, `added`,
+`removed`, `built`, `checked`, `formatted`, `migrated`, `differs`,
+`documented`, `verified`, `fetched`, `reading`, `passed`, `failed`, `skipped`
+and `compiling`. A diagnostic, `error[...]`, `warning[...]` or a `note`
+attached to one, keeps its own form.
+
+A build says what it did. A cold build names the artifact, target and profile,
+then beneath them its output, size, modules and wall time. A build that took
+some objects from the cache says how many of its units it rebuilt in place of
+the module count, and a build with nothing to do says `unchanged` on one line:
+
+```
+     built  demo  linux-x86_64  debug
+            demo/out/linux-x86_64/debug/bin/demo   78 KiB   53 modules   666ms
+     built  demo  linux-x86_64  debug
+            demo/out/linux-x86_64/debug/bin/demo   78 KiB   3 of 53 modules rebuilt   321ms
+ unchanged  demo  linux-x86_64  debug   231ms
+   checked  demo  linux-x86_64  debug   187ms
+```
+
+The rebuilt count is the units the build compiled code for, read from what it
+compiled. A unit is a module, or an object where the target makes one object
+for several modules, and the line says `objects` then.
+
+A selection of several units, across targets, artifacts or profiles, prints one
+table under one verb when the last of them closes: `checked` when every unit was
+a check, `unchanged` when every unit found everything current, `built`
+otherwise. The profile column shows only when the units differ in profile:
+
+```
+     built  target          artifact  profile  modules        size   time
+            linux-x86_64    demo      debug    53 modules   78 KiB  686ms
+            linux-aarch64   demo      debug    53 modules   80 KiB  952ms
+            linux-x86_64    demo      release  53 modules   26 KiB  695ms
+```
+
+When stderr is a terminal and the report is human text, a build shows a live
+line while it compiles, rewritten in place and cleared before anything else is
+written:
+
+```
+ compiling  37 of 53   mirl.machine.select
+```
+
+It is the units the compile has finished, of the build's, and the last one
+finished. It is written at most five times a second, only with a carriage
+return and the erase-line sequence, and never in a pipe, under `--report json`
+or `lines`, under `--quiet`, or when `TERM` is unset or `dumb`.
 
 ## Streams
 
-The build's readout goes to stderr: banners, phase rows, items, `built` lines,
-diagnostics, failures and the tally. A test run goes to stdout: the roll-ups or
-per-test lines and the closing summary, and so does the listing `mach check
+The build's readout goes to stderr: progress lines, the units table, banners,
+stage tables, diagnostics, failures and the tally. A test run goes to stdout:
+the module rows or per-test lines, the failures and the verdict, and so does
+the listing `mach check
 --declassified` writes ([secrecy.md](secrecy.md#declassification)).
-`--diagnostics json` turns stderr into records, a test run's among them, and
-leaves stdout as it is.
+`--report json` and `--report lines` turn stderr into records, a test run's
+among them, and leave stdout as it is. A dependency command writes its
+progress lines to stdout.
 
 ## The build readout
 
-A phase row is written when the phase closes. A phase that runs inside another
+Under `-v` each unit prints a table of its stages when it closes. A phase that runs inside another
 (lowering inside code generation) is timed by the spans moved out of the phase
 that hosts it, so no time is counted twice, and `other` is the unit's wall time
 that no row accounts for. The `target` row is the build's target resolved and
@@ -45,18 +99,35 @@ counts the modules whose objects it reused, and the phases the cache spared
 count 0.
 
 ```
-load             48 modules     77ms
-codegen          48 objects     75ms  (slowest std.filesystem 9.4ms)
-emit             48 objects    6.2ms
-other                           32ms
-built out/app  48 modules  1.0 MiB  in 358ms
+stage         count              time
+target            1 target       15ms    #
+load             57 modules      54ms    #####
+cache             0 modules      38ms    ####
+resolve          57 modules      23ms    ##
+sema             57 modules     103ms    ##########
+lower            53 objects     234ms *  ######################
+codegen          53 objects     166ms    ################
+alloc            53 objects     250ms *  ########################
+emit             53 objects      98ms    #########
+link              1 binary       49ms    #####
+other                           2.3ms
+total                           548ms
+* summed over 16 threads
+code    882 functions  30,634 ir  47,092 selected  47,867 allocated  1,038 alloc rounds
+memory  35 MiB peak  393 MiB allocated in 478,484 blocks
+     built  demo  linux-x86_64  debug
+            demo/out/linux-x86_64/debug/bin/demo   78 KiB   53 modules   548ms
 ```
 
-The rows share one set of columns: the label padded to the widest row label,
-the count right-aligned with its noun beside it, singular for a count of one,
-and the time right-aligned. A row with nothing to count, `other`, leaves its
-count blank. The line under `-vv` for a module or file puts its time in the
-row's time column and its name after it.
+The table has a header row, then one row per phase in the order the phases
+closed, then `other` and `total`, the unit's wall time. The rows share one set
+of columns: the label, the count right-aligned with its noun beside it, singular
+for a count of one, the time right-aligned, the `*` mark, and a bar of `#`. A
+row with nothing to count leaves its count blank. A bar is at most 24 columns,
+the longest row's, and each other row's is its time scaled to that, rounded to
+the nearest column, so a row too small to show one has none. The line under
+`-vv` for a module or file puts its time in the time column and its name
+after it.
 
 A time is rounded to the nearest of its last digit: microseconds below a
 millisecond and milliseconds below a second, each to a tenth while under ten
@@ -94,16 +165,13 @@ the flag is absent. The link reads and relocates its inputs on as many, and its
 row stays the owner's wall time. The owner thread lowers each module and completes each
 compile in module order, so diagnostics, objects and the rows above are the
 same at every thread count. On one thread every step runs on the owner and the
-rows are as described. On more, the steps' compiles run side by side: `lower`
-and `codegen` stay the owner's own time (`codegen` then also holds the owner's
-waits for compiles to finish), and `verify` and mirl's and masc's rows are the
-time every thread spent in them, added up. Such a row says
-`(summed over N threads)`, and it is not part of the unit's wall time, so
-`other` stays the time no wall row accounts for:
-
-```
-alloc          1119 objects    18.5s  (summed over 4 threads)
-```
+rows are as described. On more, the steps' compiles run side by side: `codegen`
+stays the owner's own time (it then also holds the owner's waits for compiles
+to finish), and the rows the steps time are the time every thread spent in them,
+added up. Such a row carries the `*` mark, explained once by the line
+`* summed over N threads` beneath the table (`up to N` when the rows were summed
+over different counts). A marked row is not part of the unit's wall time, so
+`other` stays the time no wall row accounts for.
 
 A target whose back end compiles an artifact whole compiles it on the owner.
 The counters do not depend on the thread count, except std's heap counters.
@@ -119,12 +187,14 @@ where the objects went and storing their digests. When the clock
 refuses a read, the stage it would have timed comes up short, and the build
 reports `readout.clock_refused` naming the module instead of showing a zero.
 
-Each counter's total over the unit's modules and test objects is a line of a
-block of its own, after the `other` row and before the `built` line, with the
-label padded to the widest counter label and the value right-aligned. A count
-of bytes is shown as a size. A unit that ends without a `built` line shows its
-totals before what follows it. A counter whose total is zero, as `verify runs`
-is without `--verify`, prints no line:
+The counters' totals over the unit's modules and test objects follow the table
+as two lines: `code`, what the code came to, and `memory`, what building it took
+of the heap. A count is written with a comma every three digits and a count of
+bytes as a size. A unit that ends without closing shows its table and totals
+before what follows it. A counter whose total is zero, as `verify runs` is
+without `--verify`, is left out. Its word on the line follows its label in the
+table below (`ir` for `ir instrs`, `blocks` for `heap blocks`, `allocated` for
+`heap bytes` and for `allocated instrs`, `peak` for `heap peak`):
 
 | Counter | What it counts | Read from |
 |---|---|---|
@@ -138,35 +208,35 @@ is without `--verify`, prints no line:
 | `allocated instrs` | the machine instructions after register allocation | mirl |
 | `alloc rounds` | the rounds of register allocation | mirl |
 
-Under `-vv` each module prints a line per stage and per counter as its step
-finishes, a counter's with its value in the counter block's value column and
-the module after it.
+Under `-vv` a table of each module's counters follows the counter lines, a row
+per module and a column per counter any module posted, headed by the counters'
+labels.
 
 `(N target-gated, not carried forward)` shows when a phase dropped modules
-gated to another target. Under `-vv` each module or file prints as an indented line
-under the phase that processed it, in the order they finish, and the row names
-the slowest of them. A unit whose project or dependencies declare build steps
+gated to another target. Under `-vv` each module or file prints under the phase
+that processed it, in the order they finished, and the row names the slowest
+of them. A unit whose project or dependencies declare build steps
 opens with a `steps` row, and under `-vv` each step that ran prints by name. A
 step its stamp shows is current is counted but prints no line.
 
 Under `-v` a growing cycle of instances (see
 [fun.md](fun.md#instantiation-ends-or-is-refused)) prints a line each time its
-instance count doubles, so an expansion that does not stop shows while it runs:
+instance count doubles, written at once, so an expansion that does not stop
+shows while it runs:
 
 ```
-  instantiate  growing cycle peel in app.main: 32 instances so far
+instantiate  growing cycle peel in app.main: 32 instances so far
 ```
 
-Under `--diagnostics json` every one of these lines is a record, written when
-the line would be: a `phase` record for a row, a `phase_item` record for an
-item, a `counter` record for a counter's line, a `growth` record for a growing
-cycle's line, a `phase` record named `other` without a count, and each `built`
-line as a member of the closing `summary` record. Under `-v` or `-vv` every
-unit opens with a `unit` record naming its artifact, target and profile, even
-when the text prints no banner or
-`profile` header, so a tool can tell apart the rows of several units and of
-several profiles.
-[diagnostics-json.md](diagnostics-json.md#readout-records) has the schema.
+Under `--report json` or `lines` every one of these is a record, written when
+its event arrives: a `phase` record for a row, a `phase_item` record for an
+item, a `counter` record for a counter's total or a module's value, a `growth`
+record for a growing cycle's line, and a `phase` record named `other` without a
+count. Every unit that built is a member of the closing `summary` record at
+every level. Under `-v` or `-vv` every unit opens with a `unit` record naming
+its artifact, target and profile, even when the text prints no banner, so a
+tool can tell apart the rows of several units and of several profiles.
+[report-records.md](report-records.md#readout-records) has the schema.
 
 ## The pass report
 
@@ -195,56 +265,57 @@ mirl's: what each pass counts is stated by its pass record
 
 Tests run concurrently, up to `--threads` at once, and each is written when it
 finishes, so a slow test never holds back one that has finished. Without `-v`
-a module's roll-up is written once the last of its tests finishes, so a slow
-test holds back only its own module's line:
+a module's row is written once the last of its tests finishes, so a slow test
+holds back only its own module's row:
 
 ```
-app.parser          40ms    12 ok
-app.crypto         2.1ms     3 ok     1 skip
-app.main           3.4ms     1 ok               1 FAIL
-  FAIL  app.main#fails_on_purpose  src/main.mach:11  (exit 3)
-    rerun: ./out/linux-x86_64/debug/test/app/app 4
+demo.shape         254us     0 ok                1 FAIL
+demo.util          175us     1 ok
+
+FAIL  demo.shape#twice__basic  demo/src/shape.mach:8  (exit 1)
+      rerun: demo/out/linux-x86_64/debug/test/demo/demo 0
+
+    failed  1 of 2 tests   380us
 ```
 
-A roll-up is the module, its time, and its counts in columns of their own, a
-skip or FAIL count only when it is not zero.
+A module row is the module, its time, and its counts in columns of their own,
+a skip or FAIL count only when it is not zero.
 
-Under `-v` each test is its own line, written when it finishes:
+Under `-v` each test is its own line, written when it finishes, a passing
+test's captured output beneath it under `-vv`:
 
 ```
 ok    app.parser#rejects_trailing_comma  2.0ms
 skip  app.crypto#aes_round_trip          1.1ms
-FAIL  app.main#fails_on_purpose          1.3ms  src/main.mach:11  (exit 3)
-    rerun: ./out/linux-x86_64/debug/test/app/app 4
+FAIL  app.main#fails_on_purpose          1.3ms
+```
+
+When the run ends each failure is shown once, in collection order, the order
+`--list` prints, whatever order the tests finished in: its name, where it is
+declared and why it failed, its captured output, where its full output is when
+the capture was cut, and the command that reruns it alone. Then the verdict, in
+the gutter: `passed` with the count, or `failed` with how many of the count
+failed, followed by how many of those timed out and how many tests skipped, and
+the run's wall time:
+
+```
+    passed  2 tests   2.2ms
+    failed  2 of 18 tests (1 timed out), 1 skipped   61ms
 ```
 
 Every time the test readout prints is wall time. A `-v` line's time is the
-test's, from its launch to its exit. A roll-up's time is the module's wall span,
-from the launch of its first test to the exit of its last, so tests that ran at
-once count once and a roll-up never shows more time than the run. The summary's
-time in parentheses is the whole run's wall time, which the `run_end` record's
-`duration_ns` also holds.
+test's, from its launch to its exit. A module row's time is the module's wall
+span, from the launch of its first test to the exit of its last, so tests that
+ran at once count once and a row never shows more time than the run. The
+verdict's time is the whole run's wall time, which the `run_end` record's
+`duration_ns` also holds. A skipped test is neither a pass nor a failure. A
+test that ran past its time bound is a failure.
 
-Lines and roll-ups therefore come out in the order the tests finish, which can
-differ from run to run. The closing summary does not: it re-lists every failure
-in collection order, the order `--list` prints, and ends with the counts. A
-skipped test is neither a pass nor a failure: it is never re-listed, and the
-skip count follows the total whenever a test skipped. A test that ran past its
-time bound is a failure, and the failed count is then followed by how many
-timed out, as `2 failed (1 timed out)`.
-
-```
-failures:
-  app.main#fails_on_purpose  src/main.mach:11  (exit 3)
-
-16 passed, 1 failed, 18 total, 1 skipped  (61ms)
-```
-
-Under `--diagnostics json` each test is also a `test` record on stderr as it
-finishes, between a `run_start` and a `run_end` record, as
-[diagnostics-json.md](diagnostics-json.md#test-records) describes.
+Under `--report json` or `lines` each test is also a `test` record on stderr as
+it finishes, between a `run_start` and a `run_end` record, as
+[report-records.md](report-records.md#test-records) describes.
 
 ## See also
 
 - [test.md](test.md): the `mach test` workflow
-- [diagnostics-json.md](diagnostics-json.md): the record schema
+- [report-records.md](report-records.md): the record schema and its two encodings

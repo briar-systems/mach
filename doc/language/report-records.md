@@ -1,11 +1,14 @@
-# Machine-readable diagnostics
+# Report records
 
-Every command takes `--diagnostics <human|json>`, or `--diagnostics=json`, and
+Every command takes `--report <human|json|lines>`, or `--report=json`, and
 `mach` takes it before the command word too, as every long option that takes a value accepts it
 after `=` in its own word.
-`human`, the default, is the rendering shown in [diagnostics.md](diagnostics.md).
-`json` writes everything the command reports as JSON objects, one per line of
-stderr (NDJSON), for editors, CI and other tools: each diagnostic, a failure
+`human`, the default, is the text shown in [diagnostics.md](diagnostics.md) and
+[readout.md](readout.md).
+`json` writes everything the command reports as records, JSON objects one per line of
+stderr (NDJSON), for editors, CI and other tools, and `lines` writes the same
+records in a tab-separated encoding for line tools ([below](#the-lines-encoding)):
+each diagnostic, a failure
 raised outside the compiler's diagnostics (a manifest, dependency, build-step,
 link or command-line refusal) included, each [note](#notes) a command writes, each test result under `mach test`, the build
 readout under `-v` and `-vv`, and a closing summary. The records are the contract: the human text may change from
@@ -13,10 +16,10 @@ release to release, and a record changes only under the
 [stability rule](#stability). The flag changes no exit code.
 
 ```
-mach check . --diagnostics json
+mach check . --report json
 ```
 
-A bare `--diagnostics` or any other value is refused with
+A bare `--report` or any other value is refused with
 `error[cli.flag_value]`, in human text since no format has been chosen. `-v`
 and `-vv` write the [readout](readout.md) as [readout records](#readout-records).
 
@@ -32,7 +35,7 @@ and `-vv` write the [readout](readout.md) as [readout records](#readout-records)
 - The text is ASCII. A non-ASCII character in a message, a label or a path is
   written as a `\u` escape, and a byte that is not valid UTF-8 as `\ufffd`,
   the escape of U+FFFD, so every line is valid UTF-8 and valid JSON.
-- Under `json` the human tally (`N errors / M warnings`) is not written, and
+- Under `json` and `lines` the human tally (`N errors / M warnings`) is not written, and
   the `building <artifact>` banners and `profile <name>:` headers are not
   written. Under `-v` a `unit` record opens every unit instead.
 
@@ -358,8 +361,8 @@ Every run ends with one summary record, the last line on stderr:
 | `outcome` | string | `"success"` when the command exits 0, `"interrupted"` when an interrupt stopped it, otherwise `"failure"` |
 | `event` | string | when the outcome is `"interrupted"`, what stopped it: `"SIGINT"`, `"SIGTERM"` or `"SIGHUP"`, or on Windows `"Ctrl+C"`, `"Ctrl+Break"`, `"console close"` or `"service stop"`; absent otherwise |
 | `exit_code` | integer | the command's exit code |
-| `time_us` | integer | under `-v`, the wall time of every unit that built, added up; absent when none did |
-| `built` | array | under `-v`, one object per `built` line, in order; absent when none was written |
+| `time_us` | integer | the wall time of every unit that built, added up; absent when none did |
+| `built` | array | one object per unit that built, in order; absent when none did |
 
 An interrupted command writes nothing after the interrupt arrives, neither the
 records its stopped operations would make of it nor any output on stdout, and
@@ -372,11 +375,32 @@ before it):
 
 The human text ends the same way, with the single line `interrupted by SIGINT`.
 
-A `built` object has the unit's `out` (string), `modules` (integer), `bytes`
-(integer, present when the line shows a size) and `time_us` (integer).
+A `built` object has the unit's `out` (string), `modules` (integer), `rebuilt`
+(integer, the units the build compiled code for rather than taking from the
+object cache), `bytes` (integer, present when the output is one file) and
+`time_us` (integer).
 
 ```json
-{"schema":3,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"success","exit_code":0,"time_us":358120,"built":[{"out":"out/linux/debug/bin/app","modules":48,"bytes":1048576,"time_us":358120}]}
+{"schema":3,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"success","exit_code":0,"time_us":358120,"built":[{"out":"out/linux/debug/bin/app","modules":48,"rebuilt":48,"bytes":1048576,"time_us":358120}]}
+```
+
+## The lines encoding
+
+`--report lines` writes exactly the records `json` writes, in the same order on
+the same stream, in another encoding; the fields of each record are the ones
+this page lists. A record is one line: its `record` value bare, then every
+other member as `key=value` in the record's order, each part separated by one
+tab. A member of a nested object is keyed by the path to it joined with `.`
+(`primary.line=12`), each element of an array repeats the array's key
+(`notes=first` then `notes=second`, `related.file=a` per related site), and a
+`null` member is left out. In a value a tab, a newline and a backslash are
+written `\t`, `\n` and `\\`, so every tab on a line is a separator. Nothing is
+quoted, padded or aligned, and `awk -F'\t' '$1=="test"'` selects every test
+record.
+
+```
+diagnostic	schema=3	severity=error	code=call.arity	message=expected 2 arguments, found 3	origin=sema	primary.file=src/shape.mach	primary.line=5	primary.column=9	primary.end_line=5	primary.end_column=26	primary.byte_start=67	primary.byte_end=84
+run_end	schema=3	passed=1	failed=1	skipped=0	total=2	duration_ns=2214000	mismatch=1	infrastructure_failure=0	resource_exhaustion=0	timed_out=0	origin=test
 ```
 
 ## Stability
@@ -385,6 +409,7 @@ A `built` object has the unit's `out` (string), `modules` (integer), `bytes`
   `unsupported`, `target_unavailable` and `invalid_injection`, which no run ever
   counted. Schema 2 wrote a failure as a diagnostic record, where schema 1 wrote
   it as a `"failure"` record.
+- `rebuilt` in a `built` object is a compatible addition under schema 3.
 - **Compatible changes keep the version:** a new member in a record or a span,
   a new record type, and a new value of an enumerated member (`severity`,
   `origin`, `record`). A tool ignores members it does not know, skips records

@@ -150,9 +150,8 @@ artifact's objects exactly as `mach build` does, adds a test object beside each
 module that declares tests, links one test **dispatcher** executable covering
 the selected tests, then runs each of them as its own process
 (`<exe> <index>`), captures its output, times
-it, and renders a per-module readout as the tests finish, collapsing
-all-passing modules to a single roll-up line and expanding any module with a
-failure to show the failing test's captured output and location. What `-v` and
+it, and renders a row per module as the tests finish, then each failure once
+with its captured output and location, then the verdict. What `-v` and
 `-vv` add, and the order lines come out in, is the [readout](readout.md). The
 full flag reference is `mach help test`, and the options that select and shape a
 run are:
@@ -163,36 +162,38 @@ run are:
 --include-deps           also run tests declared in dependency modules
 --dep-warnings           also show dependencies' warnings, each under its own allow and #[expect]
 --list                   list the collected tests and exit
---diagnostics <human|json>  write failures and the run's records to stderr as text or NDJSON
+--report <human|json|lines>  write the run's records to stderr as NDJSON or record lines
 --runner <cmd>           launch each test through a host-side command, in place of the target's runner
 --timeout <duration>     stop each test after the duration (default: 60s)
 --allow-unrunnable       exit 0 when nothing selected can run on this host, after building it
 ```
 
-A roll-up is `<module>  <ok> ok[  <skip> skip][  <fail> FAIL]  <duration>`, written once the
-module's last test finishes, so roll-ups come out in the order modules finish.
+A module row is `<module>  <duration>  <ok> ok[  <skip> skip][  <fail> FAIL]`, written once
+the module's last test finishes, so rows come out in the order modules finish.
 Its `<duration>` is the module's wall span, from the launch of its first test to
-the exit of its last, and the summary's duration is the run's wall time, so
+the exit of its last, and the verdict's duration is the run's wall time, so
 every time the readout prints is wall time (see
 [readout.md](readout.md#the-test-readout)).
-Each expanded failure shows `file:line`, the exit code (`(exit N)`), signal
-(`(signal N)`) or `(timed out after <duration>)`, the child's captured output
-indented beneath, and the exact `rerun:` command. A passing or skipped test
-stays quiet. The run closes with a summary that re-lists every failure in
-collection order, then the counts, with the skip count after the total
-whenever a test skipped:
+When the run ends each failure is shown once, in collection order: `FAIL`, its
+name, `file:line` and the exit code (`(exit N)`), signal (`(signal N)`) or
+`(timed out after <duration>)`, then the child's captured output indented
+beneath and the exact `rerun:` command. A passing or skipped test stays quiet.
+The verdict closes the run: `passed` and the count, or `failed` and how many of
+the count failed, with the skip count after it whenever a test skipped:
 
 ```
-failures:
-  app.main#fails_on_purpose  src/main.mach:11  (exit 3)
+app.main     1.1ms     1 ok      1 skip      1 FAIL
 
-1 passed, 1 failed, 3 total, 1 skipped  (1ms)
+FAIL  app.main#fails_on_purpose  src/main.mach:11  (exit 3)
+      rerun: ./out/linux-x86_64/debug/test/app/app 2
+
+    failed  1 of 3 tests, 1 skipped   1.0ms
 ```
 
 The exit code of `mach test`:
 
 - `0`: every test that ran passed or skipped. A project that declares no
-  test runs none, reports `0 passed, 0 failed, 0 total` and exits `0`.
+  test runs none, reports `passed  0 tests` and exits `0`.
 - `1`: at least one test failed, was killed by a signal, or timed out. It is
   also a user error, such as an unknown flag, a rejected manifest, or a source
   the build refuses (a test body that does not compile).
@@ -237,10 +238,10 @@ separately on the summary line, and is still a failing test for the exit code,
 so the suite exits `1`.
 
 ```
-failures:
-  app.main#spins  src/main.mach:4  (timed out after 1s)
+FAIL  app.main#spins  src/main.mach:4  (timed out after 1s)
+      rerun: ./out/linux-x86_64/debug/test/app/app 0
 
-0 passed, 1 failed (1 timed out), 1 total  (1.0s)
+    failed  1 of 1 test (1 timed out)   1.0s
 ```
 
 A timed-out test counts in the `run_end` record's `resource_exhaustion` beside
@@ -252,13 +253,13 @@ unit is a usage error naming the accepted forms, so no value removes the bound.
 The default is rendered in the largest whole unit, so a test that reaches it
 reports `(timed out after 1m)`.
 
-### JSON output
+### Records
 
-`--diagnostics json` writes the run as records on stderr beside the build's
+`--report json` or `--report lines` writes the run as records on stderr beside the build's
 diagnostics: a `run_start`, one `test` per result as it finishes and a
 `run_end` for each (target, profile) that runs, a `skip` for one that is built
 and not run, a `case` per test under `--list`, and the closing `summary`, as
-[diagnostics-json.md](diagnostics-json.md#test-records) describes. A `test` or
+[report-records.md](report-records.md#test-records) describes. A `test` or
 `case` record names its test by qualified name in `name`, beside its `module`,
 `file`, `line` and dispatcher `index`. A skipped test reports
 `"outcome":"skip"` and counts in the `run_end` record's `skipped`. A timed-out test reports
@@ -338,11 +339,12 @@ to resolve to one (artifact, target, profile), foreign or not.
 A [finished-module target](manifest.md#finished-module-targets), a shader on
 `vulkan` or a kernel on `opencl`, links no executable, so it has no dispatcher. A
 cell on one is built as `mach build` builds it, its module written to the
-artifact's own `out`, and its (target, profile) is reported on a `skip` line that
-names the reason while the other cells build and run:
+artifact's own `out`, and its (target, profile) is reported on a `skipped` line
+with the reason beneath while the other cells build and run:
 
 ```
-skip  spirv (debug): a finished-module target links no test executable; built, not run
+   skipped  spirv  debug
+            a finished-module target links no test executable; built, not run
 ```
 
 Under `--list` such a cell is type checked, not built, and the line ends `checked,
