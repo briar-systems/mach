@@ -19,7 +19,7 @@ after it, and a `fin` body when the rest of its block holds one, since the fin r
 
 Source: [`src/front/sema/guard.mach`](../../../../src/front/sema/guard.mach)
 
-Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.base.source`](../../base/source.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.sema.context`](context.md).
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../../base/intern.md), [`mach.base.source`](../../base/source.md), [`mach.front.ast.id`](../ast/id.md), [`mach.front.sema.context`](context.md), [`mach.type.kind`](../../type/kind.md).
 
 | Functions | |
 | :--- | :--- |
@@ -27,6 +27,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 | [`end`](#end) | closes `frame`, which must be the innermost guard |
 | [`sel_begin`](#sel_begin) | opens a guard for `P.c` when the condition is exactly `sel P.c` |
 | [`guarded`](#guarded) | whether an open guard holds `place` for `case_name`, or only one that has ended does |
+| [`record_case`](#record_case) | record the case a live guard fixes of the place `eid`, of type `ty`, where it is a tag read whole: the case of the innermost live guard on a place spelled as `eid` is, none where no live guard holds it |
 | [`loop_begin`](#loop_begin) | a loop runs its condition and body again after any assignment in them, so a guard open at the loop that an assignment inside it moves is ended for the whole loop |
 | [`fin_begin`](#fin_begin) | a `fin` body replays when its block ends, after the rest of the block, so inside the body a guard that an assignment in that rest moves does not hold |
 | [`fin_end`](#fin_end) | lets every guard the `fin` body `fin` hid hold again, once that body has been typed |
@@ -83,6 +84,16 @@ pub fun guarded(sc: *mach.front.sema.context.SemaContext, place: mach.front.ast.
 ```
 
 whether an open guard holds `place` for `case_name`, or only one that has ended does
+
+### record_case
+
+```mach
+pub fun record_case(sc: *mach.front.sema.context.SemaContext, eid: mach.front.ast.id.ExprId, ty: mach.type.kind.TypeId)
+```
+
+record the case a live guard fixes of the place `eid`, of type `ty`, where it is a tag read
+whole: the case of the innermost live guard on a place spelled as `eid` is, none where no live
+guard holds it. the lowering reads it to copy that case alone (`lower_expr.copy_known`)
 
 ### loop_begin
 

@@ -67,6 +67,7 @@ Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.
 | [`record_instance`](#record_instance) | an instance the walk asks for at `eid`: added to the module's set when new, and noted as what `eid` names in the walk's frame |
 | [`inst_worklist_dnit`](#inst_worklist_dnit) | release the walk's instance worklist and clear it from the typing |
 | [`expr_type_set`](#expr_type_set) | the type the walk gives expression `eid`, recorded in its frame when the frame is not the module's own typing |
+| [`guard_case_set`](#guard_case_set) | the case `code` (`sema_instance.case_code`) a live guard fixes of the tag place `eid` read whole, recorded in the walk's frame where the frame records its typing, and otherwise in the module's own table on the module's own walk |
 | [`decl_type_set`](#decl_type_set) | the type the walk gives declaration `did`, recorded in its frame when the frame is not the module's own typing |
 | [`walk_binds_values`](#walk_binds_values) | the walk is typing a value instance, so the comptime parameters of the function it instantiates are bound |
 | [`walk_binds_pack`](#walk_binds_pack) | the walk is typing a pack instance, so the pack's element types are bound |
@@ -324,9 +325,12 @@ pub rec ModuleView {
     own_stable: mach.session.module.StableModuleId;
     source:     str;
 
-    expr_type:          *mach.type.kind.TypeId;
-    type_resolved_ty:   *mach.type.kind.TypeId;
-    decl_type:          *mach.type.kind.TypeId;
+    expr_type:        *mach.type.kind.TypeId;
+    type_resolved_ty: *mach.type.kind.TypeId;
+    decl_type:        *mach.type.kind.TypeId;
+    # the case a live guard fixes of each tag place read whole, by expression index, as
+    # `sema_instance.case_code` encodes it; nil in a view of another module
+    guard_case:         *u32;
     type_resolved_memo: *u8;
     layout_state:       *u8;
     # how far each module `val` is bound, and the node of its value in the module's store once
@@ -699,6 +703,17 @@ pub fun expr_type_set(sc: *SemaContext, eid: mach.front.ast.id.ExprId, ty: mach.
 
 the type the walk gives expression `eid`, recorded in its frame when the frame is not
 the module's own typing
+
+### guard_case_set
+
+```mach
+pub fun guard_case_set(sc: *SemaContext, eid: mach.front.ast.id.ExprId, code: u32)
+```
+
+the case `code` (`sema_instance.case_code`) a live guard fixes of the tag place `eid` read
+whole, recorded in the walk's frame where the frame records its typing, and otherwise in the
+module's own table on the module's own walk. a walk of an instance whose frame records
+nothing records nothing, and the lowering reads such an instance as knowing no case
 
 ### decl_type_set
 

@@ -46,6 +46,8 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 | [`type_record`](#type_record) | records the type the frame resolves the type node `tid` to, which its comptime bindings size |
 | [`call_record`](#call_record) | records that the call or generic reference `eid` names the instance `id` in `frame` |
 | [`gate_record`](#gate_record) | records the verdict of the comptime gate whose condition is `cond` in `frame` |
+| [`case_record`](#case_record) | records the case `code` a walk found fixed of the tag place `eid` read whole in `frame`, met with what an earlier walk of it in that frame found |
+| [`case_at`](#case_at) | the case code of the tag place `eid` in `frame` or the nearest parent that records one, CASE_UNTYPED when none does |
 | [`each_record`](#each_record) | the published constant value of the array the `$each` at `sid` reads |
 | [`expr_type_at`](#expr_type_at) | the type of the expression `eid` in `frame` or the nearest parent that records one |
 | [`decl_type_at`](#decl_type_at) | the type of the binding `did` in `frame` or the nearest parent that records one |
@@ -55,10 +57,18 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 | [`gate_at`](#gate_at) | the verdict of the gate on `cond` in `frame` or the nearest parent that records one |
 | [`each_at`](#each_at) | the constant array the `$each` at `sid` reads in `frame` or the nearest parent that records one |
 
+| Functions | |
+| :--- | :--- |
+| [`case_code`](#case_code) | the code of the case `name` a live guard fixes, CASE_NONE for none |
+| [`case_of`](#case_of) | the case a code names, none for CASE_NONE and CASE_UNTYPED |
+| [`case_meet`](#case_meet) | what two walks of one place say together: a case only where every walk that typed it found the same one, since a place a `$if` or an iteration types twice is read in each |
+
 | Constants | |
 | :--- | :--- |
 | [`NONE`](#constants) | |
 | [`FRAME_TEMPLATE`](#constants) | the module's own typing, held by its typing tables |
+| [`CASE_UNTYPED`](#constants) | a tag place read whole that no walk has typed yet |
+| [`CASE_NONE`](#constants) | a tag place read whole where no live guard fixes its case, on some walk that typed it |
 
 ---
 
@@ -133,6 +143,7 @@ pub rec Frame {
     calls:  std.collections.map.Map[u32, u32];
     gates:  std.collections.map.Map[u32, bool];
     arrays: std.collections.map.Map[u32, mach.front.comptime.value.CTValue];
+    cases:  std.collections.map.Map[u32, u32];
     # the next iteration frame whose key hashes alike
     next: u32;
 }
@@ -151,6 +162,7 @@ one typing of a stretch of syntax, holding what it decided apart from its parent
 | `calls` | `std.collections.map.Map[u32, u32]` | the instance each call names, by expression index |
 | `gates` | `std.collections.map.Map[u32, bool]` | the verdict of each comptime gate, by condition expression index |
 | `arrays` | `std.collections.map.Map[u32, mach.front.comptime.value.CTValue]` | the constant array each `$each` reads, by statement index |
+| `cases` | `std.collections.map.Map[u32, u32]` | the case a live guard fixes of each tag place read whole, by expression index, as `case_code` encodes it |
 
 ## Set
 
@@ -343,6 +355,24 @@ records the verdict of the comptime gate whose condition is `cond` in `frame`
 | `active` | whether the gate's arm is taken |
 | **returns** | ok, or the failure of the allocation |
 
+### case_record
+
+```mach
+pub fun case_record(set: *Set, frame: u32, eid: mach.front.ast.id.ExprId, code: u32) err[mach.base.fail.Fail]
+```
+
+records the case `code` a walk found fixed of the tag place `eid` read whole in `frame`, met
+with what an earlier walk of it in that frame found
+
+### case_at
+
+```mach
+pub fun case_at(set: *Set, frame: u32, eid: mach.front.ast.id.ExprId) u32
+```
+
+the case code of the tag place `eid` in `frame` or the nearest parent that records one,
+CASE_UNTYPED when none does
+
 ### each_record
 
 ```mach
@@ -451,10 +481,39 @@ the instance an `add` names
 | `id` | `u32` | the instance's id in the set |
 | `fresh` | `bool` | whether the call added it, rather than finding it already there |
 
+## Functions
+
+### case_code
+
+```mach
+pub fun case_code(name: mach.base.intern.StrId) u32
+```
+
+the code of the case `name` a live guard fixes, CASE_NONE for none
+
+### case_of
+
+```mach
+pub fun case_of(code: u32) opt[mach.base.intern.StrId]
+```
+
+the case a code names, none for CASE_NONE and CASE_UNTYPED
+
+### case_meet
+
+```mach
+pub fun case_meet(had: u32, found: u32) u32
+```
+
+what two walks of one place say together: a case only where every walk that typed it found
+the same one, since a place a `$if` or an iteration types twice is read in each
+
 ## Constants
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
 | `NONE` | `u32` | `0xFFFFFFFF` |  |
 | `FRAME_TEMPLATE` | `u32` | `0` | the module's own typing, held by its typing tables |
+| `CASE_UNTYPED` | `u32` | `0` | a tag place read whole that no walk has typed yet |
+| `CASE_NONE` | `u32` | `1` | a tag place read whole where no live guard fixes its case, on some walk that typed it |
 

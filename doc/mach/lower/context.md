@@ -35,7 +35,6 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`LowerRequest`](#lowerrequest) | `rec` | what one lowering of a module is asked to do and what it reads, made by request the fields not listed here are described in place |
 | [`LowerContext`](#lowercontext) | `rec` | the state of one lowering: what its request gave, the mirl module and its builder, the scope being read, and the walk's locals, loops, `fin` blocks and per-function state |
 | [`Declared`](#declared-1) | `rec` | a module-level declaration as the interface of its module describes it |
-| [`Known`](#known) | `rec` | a tag local whose case is known in the arm being lowered, one frame on the lowering's own stack per arm it opens on |
 | [`FnSig`](#fnsig) | `rec` | a function's signature: its parameters and result, each narrow integer stating the extension its source type's signedness gives it a function's ir signature and the source types it was lowered from |
 
 | On `Machine` | |
@@ -118,11 +117,11 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`storage_align`](#storage_align) | the alignment a value held in `ir` is stored at: the target's layout of `ir`, which states a decorated record's alignment and packing |
 | [`leave`](#leave) | return `v` from the function, none for no value |
 | [`emit_exit`](#emit_exit) | write the one exit the function's returns branch to, where it has one |
-| [`known_case`](#known_case) | the case known of the local named by `eid` where lowering stands, none where none is |
+| [`guard_case_of`](#guard_case_of) | the case sema found a live guard fixes of the tag place `eid` read whole (`sema.guard.record_case`), in the frame the code is read through: an instance's or an iteration's frame records its own, and the module's own code is read from the module's table |
 | [`tag_payload`](#tag_payload) | the area and member that hold case `i` of the tag `tid`, none for a case that holds nothing |
 | [`result_slot`](#result_slot) | the slot an aggregate result of the function being lowered is built in and returned from: one for every return, so the result is built where the caller receives it, made on first ask |
 | [`take_into`](#take_into) | the armed destination, taken once, when the expression being lowered is the armed one and builds an aggregate of `ir`, which the destination holds; none for any other |
-| [`slot_for`](#slot_for) | a stack slot for a value of the source type `tid`, held in `ir`, with the bytes `tid` lays out as public stated |
+| [`slot_for`](#slot_for) | a stack slot for a temporary of the source type `tid`, held in `ir`, with the bytes `tid` lays out as public stated, its storage scoped to the statement making it (`builder.temp_alloca`) |
 | [`state_slot`](#state_slot) | state on the alloca of `slot`, which holds a value of source type `tid` held in `ir`, the bytes `tid` lays out as public (`public_ranges`), nothing for a type that is no type |
 | [`public_ranges`](#public_ranges) | the public byte ranges of a value of source type `tid`, held in `ir`, into `out`, ascending and none touching another: every byte its secret ranges leave, a tag's discriminant and padding included |
 | [`debug_type_of`](#debug_type_of) | the debug type a debug record names for source type `tid`; none when this lowering keeps no debug information |
@@ -791,8 +790,6 @@ pub rec LowerContext {
     # to `rest_end` of the statement id table, which a local's declaration reads its scope from
     rest_start: u32;
     rest_end:   u32;
-    # the innermost tag local whose case is known where lowering stands (see Known)
-    known: *Known;
     # the function's one exit, made at its first return (see leave)
     exit:     mirl.ir.id.Block;
     exit_set: bool;
@@ -1470,13 +1467,15 @@ pub fun emit_exit(lc: *LowerContext) err[mach.base.fail.Fail]
 
 write the one exit the function's returns branch to, where it has one
 
-### known_case
+### guard_case_of
 
 ```mach
-pub fun known_case(lc: *LowerContext, eid: mach.front.ast.id.ExprId) opt[*Known]
+pub fun guard_case_of(lc: *LowerContext, eid: mach.front.ast.id.ExprId) opt[mach.base.intern.StrId]
 ```
 
-the case known of the local named by `eid` where lowering stands, none where none is
+the case sema found a live guard fixes of the tag place `eid` read whole (`sema.guard.record_case`), in the frame the
+code is read through: an instance's or an iteration's frame records its own, and the module's own code is read from
+the module's table. none where no guard fixes one, and none in a frame that recorded nothing of the place
 
 ### tag_payload
 
@@ -1515,7 +1514,8 @@ builds an aggregate of `ir`, which the destination holds; none for any other
 pub fun slot_for(lc: *LowerContext, tid: mach.type.kind.TypeId, ir: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
-a stack slot for a value of the source type `tid`, held in `ir`, with the bytes `tid` lays out as public stated
+a stack slot for a temporary of the source type `tid`, held in `ir`, with the bytes `tid` lays out as public stated,
+its storage scoped to the statement making it (`builder.temp_alloca`)
 
 ### state_slot
 
@@ -2143,27 +2143,6 @@ pub rec Declared {
 ```
 
 a module-level declaration as the interface of its module describes it
-
-## Known
-
-```mach
-pub rec Known {
-    sym:     mach.front.resolve.SymbolId;
-    tag_ty:  mach.type.kind.TypeId;
-    case_ix: u32;
-    prev:    *Known;
-}
-```
-
-a tag local whose case is known in the arm being lowered, one frame on the lowering's own
-stack per arm it opens on
-
-| Field | Type | |
-| :--- | :--- | :--- |
-| `sym` | `mach.front.resolve.SymbolId` | the local or parameter |
-| `tag_ty` | `mach.type.kind.TypeId` | its tag type |
-| `case_ix` | `u32` | the case it holds there |
-| `prev` | `*Known` | the frame of the arm around this one, nil at the outermost |
 
 ## FnSig
 

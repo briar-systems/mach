@@ -67,6 +67,7 @@ pub rec SemaResult {
     status:           mach.report.phase.PhaseStatus;
     alloc:            *std.allocator.Allocator;
     expr_type:        *mach.type.kind.TypeId;
+    guard_case:       *u32;
     type_resolved_ty: *mach.type.kind.TypeId;
     decl_type:        *mach.type.kind.TypeId;
     expr_count:       u32;

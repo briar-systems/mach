@@ -34,6 +34,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.front.ast`](../as
 ```mach
 pub rec Typing {
     expr_type:        *mach.type.kind.TypeId;
+    guard_case:       *u32;
     type_resolved_ty: *mach.type.kind.TypeId;
     decl_type:        *mach.type.kind.TypeId;
     expr_count:       u32;

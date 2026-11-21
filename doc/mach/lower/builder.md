@@ -15,6 +15,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | Type | | |
 | :--- | :--- | :--- |
 | [`Builder`](#builder) | `rec` | the state lowering emits a module's code through |
+| [`Temps`](#temps) | `rec` | how the scoping of temporaries stood before a statement took it over (`temps_begin`) |
 
 | On `Builder` | |
 | :--- | :--- |
@@ -109,7 +110,10 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`emit_bitcast`](#emit_bitcast) | the same bits as `to`: an address read as an integer and back, a resize between integers of different widths, or a reinterpretation of equal widths |
 | [`emit_classify`](#emit_classify) | `x` made secret: a block parameter declared secret, which the branch into it passes `x` |
 | [`emit_declassify`](#emit_declassify) | `x` made public: a constant as it is, an aggregate copied a word at a time into a public slot of its own, any other value through a declassify |
-| [`emit_alloca`](#emit_alloca) | a stack slot of `ty`, made in the entry block so every path reaches it |
+| [`emit_alloca`](#emit_alloca) | a stack slot of `ty` for a temporary, made in the entry block so every path reaches it (`temp_alloca`) |
+| [`temps_begin`](#temps_begin) | take over the scoping of temporaries for the statement about to be lowered: `on` for a statement that evaluates its expressions once, from the block it begins in, and hands no temporary's address past its end, as an expression statement or a declaration does |
+| [`temps_end`](#temps_end) | end the storage of every temporary begun since `kept` was taken, the latest first, where control still reaches, and give the scoping back to the enclosing statement |
+| [`temp_alloca`](#temp_alloca) | a stack slot of `ty` aligned to `align` for a temporary of the statement being lowered, made in the entry block |
 | [`alloca_aligned`](#alloca_aligned) | a stack slot of `ty` aligned to `align`, made in the entry block so every path reaches it |
 | [`emit_whole`](#emit_whole) | the aggregate `v` held whole: itself where it is, a constant as its own value, and one at an address read from it whole, as secret as `v` and stated as its type |
 | [`emit_extract`](#emit_extract) | member `k` of the aggregate `v` held whole: a structure's member, an array's element or a union's member read from its first byte |
@@ -214,6 +218,10 @@ pub rec Builder {
     sources:  *mach.base.source.SourceMap;
     files:    std.collections.vector.Vector[u32];
     failure:  opt[mach.base.fail.Fail];
+    # the block the statement whose temporaries are scoped began in, none outside one (`temps_begin`)
+    temp_at: opt[mirl.ir.id.Block];
+    # the temporaries whose storage has begun and not ended, the statement's last
+    temps: std.collections.vector.Vector[mach.lower.value.Value];
 }
 ```
 
@@ -1363,7 +1371,40 @@ into a public slot of its own, any other value through a declassify
 pub fun emit_alloca(b: *Builder, ty: Type) res[mach.lower.value.Value, mach.base.fail.Fail]
 ```
 
-a stack slot of `ty`, made in the entry block so every path reaches it
+a stack slot of `ty` for a temporary, made in the entry block so every path reaches it (`temp_alloca`)
+
+### temps_begin
+
+```mach
+pub fun temps_begin(b: *Builder, on: bool) Temps
+```
+
+take over the scoping of temporaries for the statement about to be lowered: `on` for a statement that evaluates its
+expressions once, from the block it begins in, and hands no temporary's address past its end, as an expression
+statement or a declaration does. any other statement scopes none of its own, and the statements nested in it scope
+theirs
+
+### temps_end
+
+```mach
+pub fun temps_end(b: *Builder, kept: Temps) err[mach.base.fail.Fail]
+```
+
+end the storage of every temporary begun since `kept` was taken, the latest first, where control still reaches, and
+give the scoping back to the enclosing statement. each was begun in the block its statement began in, which every
+point of the statement lies past, so it is begun on every path to the statement's end, once, as the statement runs
+no loop, and the statement reads it nowhere past its end
+
+### temp_alloca
+
+```mach
+pub fun temp_alloca(b: *Builder, ty: Type, align: u64) res[mach.lower.value.Value, mach.base.fail.Fail]
+```
+
+a stack slot of `ty` aligned to `align` for a temporary of the statement being lowered, made in the entry block. its
+storage begins here, before its first write, where the statement scopes its temporaries and lowering still stands in
+the block the statement began in, and ends where the statement ends (`temps_end`). made past a branch of the
+statement, it is not marked, since the statement's end is reached by paths that did not begin it
 
 ### alloca_aligned
 
@@ -2123,6 +2164,22 @@ emit_cbr with a failure kept as the builder's
 | `c` | the condition |
 | `then_b` | the block taken where `c` holds |
 | `else_b` | the block taken otherwise |
+
+## Temps
+
+```mach
+pub rec Temps {
+    at:   opt[mirl.ir.id.Block];
+    from: usize;
+}
+```
+
+how the scoping of temporaries stood before a statement took it over (`temps_begin`)
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `at` | `opt[mirl.ir.id.Block]` | the block the enclosing statement began in, none where it scopes none |
+| `from` | `usize` | how many temporaries had begun before the statement |
 
 ## Functions
 
