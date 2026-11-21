@@ -1461,11 +1461,18 @@ Intel's list with no statement from AMD behind it.
 
 **Independent checking.** The guarantee calls for two independent analyzers to
 cross-check the emitted binaries, BINSEC's checkct and valgrind's memcheck with
-the secret marked undefined (ctgrind), whose harness is mirl's `test/ct`. For the v7
-toolchain only ctgrind has been run, on linux x86-64, over a binary built from
-std's SHA-256 and `std.crypto.ct` functions with two planted leaks: it reported
-nothing on the constant-time code and flagged the secret branch and the secret
-index. checkct has not been run, and no analyzer has been run on linux aarch64.
+the secret marked undefined (ctgrind), whose harness is mirl's
+`test/ct/oracle.sh`. Its corpus is five constant-time functions and three
+planted leaks, one each on the control, memory and latency channels, and
+neither analyzer covers latency. For the v7 toolchain both analyzers have been
+run on linux x86-64, and checkct on linux aarch64, each without and with
+optimisation: neither reported anything on the constant-time functions, and
+both flagged the planted control and memory leaks wherever they ran. On aarch64
+checkct reads each DIT access mirl emits around a constant-time function as a
+stated stub, since its decoder interprets neither the access nor the barriers
+after a write, and DIT changes an instruction's timing, never its result. The
+one item left is ctgrind on linux aarch64: it runs the program, so it waits for
+aarch64 hardware.
 
 ## See also
 
