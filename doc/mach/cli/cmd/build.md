@@ -11,7 +11,7 @@ and runs only the front end. `mach clean` and `mach test` plan through
 
 Source: [`src/cli/cmd/build.mach`](../../../../src/cli/cmd/build.mach)
 
-Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../../base/source.md), [`mach.build.plan`](../../build/plan.md), [`mach.cli.args`](../args.md), [`mach.cli.diagnostic`](../diagnostic.md), [`mach.compile.closure`](../../compile/closure.md), [`mach.compile.request`](../../compile/request.md), [`mach.manifest.model`](../../manifest/model.md), [`mach.manifest.select`](../../manifest/select.md), [`mach.session`](../../session.md).
+Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../../base/source.md), [`mach.build.plan`](../../build/plan.md), [`mach.cli.args`](../args.md), [`mach.compile.closure`](../../compile/closure.md), [`mach.compile.request`](../../compile/request.md), [`mach.manifest.model`](../../manifest/model.md), [`mach.manifest.select`](../../manifest/select.md), [`mach.session`](../../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,7 +21,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.source`](../
 | :--- | :--- |
 | [`plan_invocation`](#plan_invocation) | initialise a session, load the manifest, resolve the selectors and plan a build of every resolved cell, one plan per profile |
 | [`plan_selection`](#plan_selection) | resolve the selectors against a loaded manifest and plan every resolved cell, one plan per profile |
-| [`announce_profile`](#announce_profile) | name the profile a plan builds before its progress lines, when a selection spans several profiles and the report is for a person |
+| [`unit_count`](#unit_count) | the units of every plan of a selection |
 
 | Functions | |
 | :--- | :--- |
@@ -99,21 +99,13 @@ each other: a caller that runs them all checks they write disjoint outputs
 | `unrealized` | what a dependency nothing is realized for is |
 | **returns** | the plans; err from selection, a request, planning or dependency configuration |
 
-### announce_profile
+### unit_count
 
 ```mach
-pub fun announce_profile(r: *mach.cli.diagnostic.Report, planned: *Planned, bp: *mach.build.plan.BuildPlan, quiet: bool)
+pub fun unit_count(planned: *Planned) usize
 ```
 
-name the profile a plan builds before its progress lines, when a selection
-spans several profiles and the report is for a person
-
-| Parameter | |
-| :--- | :--- |
-| `r` | the report |
-| `planned` | the planned selection |
-| `bp` | the plan about to run |
-| `quiet` | `--quiet` |
+the units of every plan of a selection
 
 ## Functions
 

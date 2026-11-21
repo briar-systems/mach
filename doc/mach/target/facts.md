@@ -131,6 +131,9 @@ pub rec Facts {
     # the build guarantees every timing mode a soft constant-time function's code may be held
     # under, so a hard function may call a soft one
     soft_guaranteed: bool;
+    # the target's convention row, whose floors align a global array variable, nil where
+    # its family names none
+    convention: *mink.catalog.arch.Abi;
 }
 ```
 

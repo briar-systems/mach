@@ -5,7 +5,7 @@
 the flags commands share, the policy a line is held to, and a build's typed arguments
 
 a build-shaped command's line becomes `CliArgs` here, each value typed as the request
-reads it. `run` reports a refused line or flag combination in the format `--diagnostics`
+reads it. `run` reports a refused line or flag combination in the format `--report`
 selects, or runs the command's handler, and an option a previous major took is refused
 by name with what replaced it.
 
@@ -38,15 +38,15 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | On `Policy` | |
 | :--- | :--- |
 | [`refusal`](#refusal) | a parsed line's refusal as a failure, in mach's words where mach knows more of the option than the parser and the parser's words otherwise |
-| [`run`](#run) | run a parsed line and report how it ended through one report, in the format `--diagnostics` selects, human when that format is itself malformed: its refusal when it holds one, then a flag combination the command refuses, otherwise the handler, given an arena this call owns |
-| [`refuse`](#refuse) | report a parsed line's refusal through one report, in the format `--diagnostics` selects, human when that format is itself malformed |
+| [`run`](#run) | run a parsed line and report how it ended through one report, in the format `--report` selects, human when that format is itself malformed: its refusal when it holds one, then a flag combination the command refuses, otherwise the handler, given an arena this call owns |
+| [`refuse`](#refuse) | report a parsed line's refusal through one report, in the format `--report` selects, human when that format is itself malformed |
 
 | Functions | |
 | :--- | :--- |
 | [`operand`](#operand) | the operand at a position among a line's operands |
 | [`value`](#value) | the value a flag was last given |
 | [`values`](#values) | every value a flag was given, in argument order |
-| [`serve`](#serve) | run a handler over a parsed line whatever it is refused for, reporting through one report in the format `--diagnostics` selects, as `--help` does in place of the command it follows |
+| [`serve`](#serve) | run a handler over a parsed line whatever it is refused for, reporting through one report in the format `--report` selects, as `--help` does in place of the command it follows |
 | [`collect_selectors`](#collect_selectors) | the `-a`, `-t` and `-p` patterns and `--all` an invocation was given |
 | [`selection_hint`](#selection_hint) | a selection refusal whose unknown value names a path in the working directory, restated as the shell's expansion of an unquoted wildcard it almost always is; any other failure is returned as given |
 
@@ -83,7 +83,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | [`LIB`](#constants) | `--library <name>`, `-l` |
 | [`DEP_WARNINGS`](#constants) | `--dep-warnings` |
 | [`NO_CACHE`](#constants) | `--no-cache` |
-| [`DIAGNOSTICS`](#constants) | `--diagnostics <human\|json>`: how diagnostics, failures and a test run's results reach stderr |
+| [`REPORT`](#constants) | `--report <human\|json\|lines>`: how everything a command reports reaches stderr: human text, or its records |
 | [`PASSES`](#constants) | `--passes`: each module's report of the optimisation passes that changed each of its functions, which mirl writes |
 | [`PLAN`](#constants) | `--plan` |
 | [`HELP`](#constants) | `--help`, `-h`: the invocation asks for its command's page instead of running it, which takes precedence over every refusal but an unknown command |
@@ -286,7 +286,7 @@ the parser and the parser's words otherwise
 pub fun run(a: *std.allocator.Allocator, inv: *std.args.Parsed, policy: *Policy, handler: fun(*Call) res[i64, mach.base.fail.Fail]) i64
 ```
 
-run a parsed line and report how it ended through one report, in the format `--diagnostics`
+run a parsed line and report how it ended through one report, in the format `--report`
 selects, human when that format is itself malformed: its refusal when it holds one, then a flag
 combination the command refuses, otherwise the handler, given an arena this call owns. a
 failure the handler returns is reported here
@@ -305,7 +305,7 @@ failure the handler returns is reported here
 pub fun refuse(a: *std.allocator.Allocator, inv: *std.args.Parsed, policy: *Policy) i64
 ```
 
-report a parsed line's refusal through one report, in the format `--diagnostics` selects, human
+report a parsed line's refusal through one report, in the format `--report` selects, human
 when that format is itself malformed
 
 | Parameter | |
@@ -338,7 +338,7 @@ what dispatch hands a command's handler; dispatch owns every member and outlives
 | `backing` | `*std.allocator.Allocator` | the heap under a, for what the command frees itself before it returns |
 | `spans` | `*std.allocator.heap.Pool` | the spans every heap of the command draws from and gives back to |
 | `inv` | `*std.args.Parsed` | the parsed command line |
-| `report` | `*mach.cli.diagnostic.Report` | where the command reports a failure it goes on past or that carries an origin, in the format `--diagnostics` selected |
+| `report` | `*mach.cli.diagnostic.Report` | where the command reports a failure it goes on past or that carries an origin, in the format `--report` selected |
 | `environ` | `std.process.exec.Environment` | the environment the command runs in, which the processes it starts inherit |
 
 ## Functions
@@ -393,7 +393,7 @@ pub fun serve(inv: *std.args.Parsed, handler: fun(*Call) res[i64, mach.base.fail
 ```
 
 run a handler over a parsed line whatever it is refused for, reporting through one report in
-the format `--diagnostics` selects, as `--help` does in place of the command it follows
+the format `--report` selects, as `--help` does in place of the command it follows
 
 | Parameter | |
 | :--- | :--- |
@@ -466,7 +466,7 @@ any other failure is returned as given
 | `LIB` | `std.args.Flag` | `std_args.Flag{long: "library", short: 'l', value: "name", repeat: true, negatable: false, help: "link a library, object or archive by name"}` | `--library <name>`, `-l` |
 | `DEP_WARNINGS` | `std.args.Flag` | `std_args.Flag{long: "dep-warnings", short: 0, value: nil, repeat: false, negatable: false, help: "also show dependencies' warnings, each under its own allow and #[expect]"}` | `--dep-warnings` |
 | `NO_CACHE` | `std.args.Flag` | `std_args.Flag{long: "no-cache", short: 0, value: nil, repeat: false, negatable: false, help: "rebuild without reusing cached objects or steps"}` | `--no-cache` |
-| `DIAGNOSTICS` | `std.args.Flag` | `std_args.Flag{long: "diagnostics", short: 0, value: "human\|json", repeat: false, negatable: false, help: "diagnostics as human text or NDJSON (default: human)"}` | `--diagnostics <human\|json>`: how diagnostics, failures and a test run's results reach stderr |
+| `REPORT` | `std.args.Flag` | `std_args.Flag{long: "report", short: 0, value: "human\|json\|lines", repeat: false, negatable: false, help: "report as human text, NDJSON records or tab-separated record lines (default: human)"}` | `--report <human\|json\|lines>`: how everything a command reports reaches stderr: human text, or its records |
 | `PASSES` | `std.args.Flag` | `std_args.Flag{long: "passes", short: 0, value: nil, repeat: false, negatable: false, help: "print each optimisation pass that changed each function, and what it did"}` | `--passes`: each module's report of the optimisation passes that changed each of its functions, which mirl writes |
 | `PLAN` | `std.args.Flag` | `std_args.Flag{long: "plan", short: 0, value: nil, repeat: false, negatable: false, help: "print the build plan without building"}` | `--plan` |
 | `HELP` | `std.args.Flag` | `std_args.Flag{long: "help", short: 'h', value: nil, repeat: false, negatable: false, help: "show help"}` | `--help`, `-h`: the invocation asks for its command's page instead of running it, which takes precedence over every refusal but an unknown command |

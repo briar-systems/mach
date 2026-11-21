@@ -2,8 +2,8 @@
 
 # mach.report.layout
 
-how every line a command prints for a person is laid out: rows of columns, and the one
-written form of a duration, a size, a count's noun and a commit
+how every line a command prints for a person is laid out: progress lines, rows of columns,
+bars, and the one written form of a duration, a size, a count and a commit
 
 a row is cells in columns. each column has a width, sits its cells left or right, and has
 the spaces that part it from the column before. a blank cell keeps its column, so the cells
@@ -15,7 +15,12 @@ a number is rounded to the nearest of its last digit, and shows a tenth while it
 of its unit: a size is exact bytes below a KiB, then KiB, MiB or GiB (`1.5 KiB`, `51 KiB`); a
 measured duration is microseconds below a millisecond, milliseconds below a second (`1.5ms`,
 `468ms`), seconds to a tenth below a minute (`18.5s`), then minutes and whole seconds. a count
-of one takes the singular noun. a commit is its first COMMIT_SHORT hex digits.
+of one takes the singular noun, and a count shown among others groups its digits by three
+(`30,634`). a commit is its first COMMIT_SHORT hex digits.
+
+a progress line is a verb from one closed table, right-aligned in a gutter of GUTTER, then
+what it acted on; its detail sits on lines beneath, indented past the gutter. a bar is `#`
+up to BAR long, scaled to the largest of its table.
 
 Source: [`src/report/layout.mach`](../../../src/report/layout.mach)
 
@@ -23,7 +28,8 @@ Source: [`src/report/layout.mach`](../../../src/report/layout.mach)
 | :--- | :--- | :--- |
 | [`Align`](#align) | `def` | where a cell sits in its column |
 | [`Column`](#column) | `rec` | one column of a block |
-| [`Text`](#text) | `rec` | storage one written value lives in while its line is written |
+| [`Text`](#text) | `rec` | storage one written value lives in while its line is written storage one written value lives in while its line is written, and how much a text writer has put in it |
+| [`Verb`](#verb) | `def` | what a progress line says was done, the word in its gutter |
 
 | On `Align` | |
 | :--- | :--- |
@@ -37,22 +43,35 @@ Source: [`src/report/layout.mach`](../../../src/report/layout.mach)
 
 | On `Text` | |
 | :--- | :--- |
+| [`text_writer`](#text_writer) | a writer into t, from its start: what does not fit is dropped, and text_end closes it |
+| [`text_end`](#text_end) | what a text writer wrote into t |
 | [`count`](#count) | a count in decimal |
 | [`duration`](#duration) | a measured duration, rounded to the nearest of its last digit: a tenth below ten of microseconds or milliseconds and whole above, seconds to a tenth below a minute, then minutes and whole seconds |
 | [`size`](#size) | a size in bytes: exact below a KiB, then the largest binary unit it holds one of, rounded to the nearest tenth below ten of the unit and to the nearest whole above |
 | [`commit`](#commit) | a commit as it is shown: its first COMMIT_SHORT digits |
+| [`grouped`](#grouped) | a count with a comma between each group of three digits |
+| [`bar_text`](#bar_text) | a bar of n `#`, nil when n is zero |
+
+| On `Verb` | |
+| :--- | :--- |
+| [`CREATED`](#verb), [`REALIZED`](#verb), [`UPDATED`](#verb), [`UNCHANGED`](#verb), [`ADDED`](#verb), [`REMOVED`](#verb), [`BUILT`](#verb), [`CHECKED`](#verb), [`FORMATTED`](#verb), [`DIFFERS`](#verb), [`DOCUMENTED`](#verb), [`VERIFIED`](#verb), [`FETCHED`](#verb), [`READING`](#verb), [`PASSED`](#verb), [`FAILED`](#verb), [`SKIPPED`](#verb), [`COMPILING`](#verb), [`MIGRATED`](#verb) | |
+| [`said`](#said) | the gutter of a progress line: its verb right-aligned, then the gap before what it acted on |
 
 | Functions | |
 | :--- | :--- |
 | [`aside`](#aside) | write a remark after a row's cells, parted from them by GAP |
 | [`spaces`](#spaces) | write n spaces |
 | [`noun`](#noun) | the noun a count takes |
+| [`beneath`](#beneath) | the lead of a detail line beneath a progress line: the gutter and its gap, empty |
+| [`bar_length`](#bar_length) | the length of the bar of `part` against the largest `most`, rounded to nearest, zero for a part too small to show |
 
 | Constants | |
 | :--- | :--- |
 | [`GAP`](#constants) | the spaces between two columns, unless a column states its own |
 | [`TEXT_CAP`](#constants) | the room one written number, duration, size or commit takes, its terminator included |
 | [`COMMIT_SHORT`](#constants) | the hex digits a commit is shown by, unless a listing asks for the whole of it |
+| [`GUTTER`](#constants) | the gutter's width: the widest verb, right-aligned in it |
+| [`BAR`](#constants) | the room a bar may take |
 
 ---
 
@@ -123,10 +142,29 @@ write a row's cells in their columns and end the line
 ```mach
 pub rec Text {
     bytes: [TEXT_CAP]u8;
+    len:   usize;
 }
 ```
 
 storage one written value lives in while its line is written
+storage one written value lives in while its line is written, and how much a text writer
+has put in it
+
+### text_writer
+
+```mach
+pub fun text_writer(t: *Text) std.io.writer.Writer
+```
+
+a writer into t, from its start: what does not fit is dropped, and text_end closes it
+
+### text_end
+
+```mach
+pub fun text_end(t: *Text) str
+```
+
+what a text writer wrote into t
 
 ### count
 
@@ -163,6 +201,60 @@ pub fun commit(t: *Text, full: str) str
 
 a commit as it is shown: its first COMMIT_SHORT digits
 
+### grouped
+
+```mach
+pub fun grouped(t: *Text, n: u64) str
+```
+
+a count with a comma between each group of three digits
+
+### bar_text
+
+```mach
+pub fun bar_text(t: *Text, n: usize) str
+```
+
+a bar of n `#`, nil when n is zero
+
+## Verb
+
+```mach
+pub def Verb: u8
+```
+
+what a progress line says was done, the word in its gutter
+
+| Name | Value | |
+| :--- | :--- | :--- |
+| `CREATED` | `0` |  |
+| `REALIZED` | `1` |  |
+| `UPDATED` | `2` |  |
+| `UNCHANGED` | `3` |  |
+| `ADDED` | `4` |  |
+| `REMOVED` | `5` |  |
+| `BUILT` | `6` |  |
+| `CHECKED` | `7` |  |
+| `FORMATTED` | `8` |  |
+| `DIFFERS` | `9` |  |
+| `DOCUMENTED` | `10` |  |
+| `VERIFIED` | `11` |  |
+| `FETCHED` | `12` |  |
+| `READING` | `13` |  |
+| `PASSED` | `14` |  |
+| `FAILED` | `15` |  |
+| `SKIPPED` | `16` |  |
+| `COMPILING` | `17` |  |
+| `MIGRATED` | `18` |  |
+
+### said
+
+```mach
+pub fun said(w: *std.io.writer.Writer, v: Verb)
+```
+
+the gutter of a progress line: its verb right-aligned, then the gap before what it acted on
+
 ## Functions
 
 ### aside
@@ -189,11 +281,30 @@ pub fun noun(n: u64, one: str, many: str) str
 
 the noun a count takes
 
+### beneath
+
+```mach
+pub fun beneath(w: *std.io.writer.Writer)
+```
+
+the lead of a detail line beneath a progress line: the gutter and its gap, empty
+
+### bar_length
+
+```mach
+pub fun bar_length(part: u64, most: u64) usize
+```
+
+the length of the bar of `part` against the largest `most`, rounded to nearest, zero for a
+part too small to show
+
 ## Constants
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
 | `GAP` | `usize` | `2` | the spaces between two columns, unless a column states its own |
-| `TEXT_CAP` | `usize` | `32` | the room one written number, duration, size or commit takes, its terminator included |
+| `TEXT_CAP` | `usize` | `48` | the room one written number, duration, size or commit takes, its terminator included |
 | `COMMIT_SHORT` | `usize` | `12` | the hex digits a commit is shown by, unless a listing asks for the whole of it |
+| `GUTTER` | `usize` | `10` | the gutter's width: the widest verb, right-aligned in it |
+| `BAR` | `usize` | `24` | the room a bar may take |
 

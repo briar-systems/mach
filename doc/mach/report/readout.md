@@ -27,11 +27,14 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`Phase`](#phase) | `def` | a readout phase, an index into the phase table |
 | [`Noun`](#noun) | `def` | what a phase row counts, an index into the noun table |
 | [`Counter`](#counter) | `def` | a readout counter, an index into the counter table |
+| [`Group`](#group) | `def` | the line a person reads a counter on: what the code came to, or what building it took of memory |
 | [`Unit`](#unit) | `rec` | a unit of the plan starts: what its goal calls the work (`building`, `checking`), the artifact, the target and the profile |
 | [`PhaseEnd`](#phaseend) | `rec` | a phase row closes: the count it processed, the noun that counts it, its time, the threads that time is summed over (0 for a row of the unit's own time), the modules it dropped as target-gated, and under LEVEL_ITEMS its slowest item, nil when it had fewer than two |
 | [`Item`](#item) | `rec` | one module or file a phase finished, when it finished |
 | [`Tally`](#tally) | `rec` | a counter's value: one module's under LEVEL_ITEMS, named by it, or the unit's total under LEVEL_PHASES, with a nil name |
-| [`Summary`](#summary) | `rec` | a unit built its output: the path, the modules in it, its size in bytes when the output is one file, the time no row accounts for, and the unit's wall time |
+| [`Closed`](#closed) | `def` | what a unit's summary closes: an artifact built, a check, a test build's dispatcher |
+| [`Summary`](#summary) | `rec` | a unit finished: what it closed, its artifact, target and profile, the output path, the modules in it, the compiled units the build made code for of the units it holds, whether the output was written, its size in bytes when the output is one file, whether phase rows were kept and so `other` holds the time no row accounts for, and the unit's wall time |
+| [`Advance`](#advance) | `rec` | a compile finished one more of its units, sent to a live sink at most every LIVE_EVERY |
 | [`TestResult`](#testresult) | `rec` | one test's result, filled in place when the test finishes |
 | [`RunStart`](#runstart) | `rec` | a test run starts over count tests in collection order, each with its art set and none done |
 | [`RunEnd`](#runend) | `rec` | a test run ended: its results in collection order, the counts of passed, failed, skipped and timed-out tests among those that finished, the run's wall time, and the gate tally over every finished result |
@@ -39,7 +42,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`Event`](#event) | `tag` | one event of a command, in the order it happened |
 | [`Sink`](#sink) | `rec` | where a build's events go: on_event is called once per event, in order, never from two threads at once, and may be called from a worker thread |
 | [`Instant`](#instant) | `def` | an instant a readout measures from: absent when the platform clock refused the sample, so a duration measured from it is zero rather than invented |
-| [`Progress`](#progress) | `rec` | one unit's phase rows, timed as they run and sent to the sink as each closes |
+| [`Progress`](#progress) | `rec` | one unit's progress: its wall time, and its phase rows, timed as they run and sent to the sink as each closes when `rows` |
 
 | On `Phase` | |
 | :--- | :--- |
@@ -57,6 +60,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`LAYOUT`](#phase) | masc laying out the object |
 | [`ENCODE`](#phase) | masc encoding the settled layout |
 | [`TARGET`](#phase) | the build's target resolved and its back half opened: mink's formats, mirl's assembled and readied target |
+| [`PHASE_NONE`](#phase) | no phase: what an item no phase row took is shown under |
 | [`label_of`](#label_of) | the row label of phase ph |
 
 | On `Noun` | |
@@ -75,8 +79,18 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`SELECTED`](#counter) | the machine instructions mirl's selection made |
 | [`ALLOCATED`](#counter) | the machine instructions after mirl's register allocation |
 | [`ALLOC_ROUNDS`](#counter) | the rounds of mirl's register allocation |
+| [`counter_group`](#counter_group) | the group counter c is shown on |
+| [`counter_word`](#counter_word) | the word counter c's value takes on its group's line |
 | [`counter_label`](#counter_label) | the label of counter c |
 | [`counter_bytes`](#counter_bytes) | whether counter c counts bytes |
+
+| On `Group` | |
+| :--- | :--- |
+| [`GROUP_CODE`](#group), [`GROUP_MEMORY`](#group) | |
+
+| On `Closed` | |
+| :--- | :--- |
+| [`CLOSED_BUILT`](#closed), [`CLOSED_CHECKED`](#closed), [`CLOSED_TESTS`](#closed) | |
 
 | On `TestResult` | |
 | :--- | :--- |
@@ -110,18 +124,19 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`span_into`](#span_into) | the span from start belongs to the hosted phase ph, and was spent outside every other row |
 | [`carve`](#carve) | the time d belongs to ph, and leaves the phase host that spent it |
 | [`item_begin`](#item_begin) | the start of an item, sampled only when the sink takes items |
+| [`rows`](#rows) | whether a progress keeps phase rows, which every phase, span and item call asks |
+| [`advance`](#advance-1) | a compile finished `done` of its `total` units, the last of them `name`: sent to a live sink when LIVE_EVERY has passed since the last it was sent |
 | [`item`](#item-1) | name finished phase ph, measured from start |
 | [`item_spent`](#item_spent) | name spent d in phase ph, measured by its caller |
 | [`count`](#count) | the module name's value of counter c, added to the unit's total and sent under LEVEL_ITEMS |
 | [`counts_end`](#counts_end) | send the unit's total of every counter posted since the last close, then start them over |
 | [`phase_end`](#phase_end) | close phase ph's row: count is what it processed, counted by noun |
-| [`summary`](#summary-1) | the unit built out: the time no row accounts for floors at zero |
+| [`summary`](#summary-1) | the unit finished: its wall time is measured here, and the time no row accounts for, which floors at zero, is set when the progress kept rows |
 
 | Functions | |
 | :--- | :--- |
 | [`label_width`](#label_width) | the widest row label of the phase table |
 | [`noun_width`](#noun_width) | the widest spelling of the noun table |
-| [`counter_width`](#counter_width) | the widest label of the counter table |
 
 | Constants | |
 | :--- | :--- |
@@ -163,6 +178,7 @@ a readout phase, an index into the phase table
 | `LAYOUT` | `18` | masc laying out the object |
 | `ENCODE` | `19` | masc encoding the settled layout |
 | `TARGET` | `20` | the build's target resolved and its back half opened: mink's formats, mirl's assembled and readied target |
+| `PHASE_NONE` | `0xffffffff` | no phase: what an item no phase row took is shown under |
 
 ### label_of
 
@@ -218,6 +234,22 @@ a readout counter, an index into the counter table
 | `ALLOCATED` | `7` | the machine instructions after mirl's register allocation |
 | `ALLOC_ROUNDS` | `8` | the rounds of mirl's register allocation |
 
+### counter_group
+
+```mach
+pub fun counter_group(c: Counter) Group
+```
+
+the group counter c is shown on
+
+### counter_word
+
+```mach
+pub fun counter_word(c: Counter) str
+```
+
+the word counter c's value takes on its group's line
+
 ### counter_label
 
 ```mach
@@ -233,6 +265,19 @@ pub fun counter_bytes(c: Counter) bool
 ```
 
 whether counter c counts bytes
+
+## Group
+
+```mach
+pub def Group: u8
+```
+
+the line a person reads a counter on: what the code came to, or what building it took of memory
+
+| Name | Value | |
+| :--- | :--- | :--- |
+| `GROUP_CODE` | `0` |  |
+| `GROUP_MEMORY` | `1` |  |
 
 ## Unit
 
@@ -293,21 +338,57 @@ pub rec Tally {
 a counter's value: one module's under LEVEL_ITEMS, named by it, or the unit's total
 under LEVEL_PHASES, with a nil name
 
+## Closed
+
+```mach
+pub def Closed: u8
+```
+
+what a unit's summary closes: an artifact built, a check, a test build's dispatcher
+
+| Name | Value | |
+| :--- | :--- | :--- |
+| `CLOSED_BUILT` | `0` |  |
+| `CLOSED_CHECKED` | `1` |  |
+| `CLOSED_TESTS` | `2` |  |
+
 ## Summary
 
 ```mach
 pub rec Summary {
+    closed:   Closed;
+    artifact: str;
+    target:   str;
+    profile:  str;
     out:      str;
     modules:  u32;
+    compiled: u32;
+    units:    u32;
+    written:  bool;
     bytes:    usize;
     has_size: bool;
+    rows:     bool;
     other:    std.chrono.duration.Duration;
     total:    std.chrono.duration.Duration;
 }
 ```
 
-a unit built its output: the path, the modules in it, its size in bytes when
-the output is one file, the time no row accounts for, and the unit's wall time
+a unit finished: what it closed, its artifact, target and profile, the output path, the
+modules in it, the compiled units the build made code for of the units it holds, whether
+the output was written, its size in bytes when the output is one file, whether phase rows
+were kept and so `other` holds the time no row accounts for, and the unit's wall time
+
+## Advance
+
+```mach
+pub rec Advance {
+    done:  u32;
+    total: u32;
+    name:  str;
+}
+```
+
+a compile finished one more of its units, sent to a live sink at most every LIVE_EVERY
 
 ## TestResult
 
@@ -405,6 +486,7 @@ pub tag Event: u8 {
     item:        Item;
     tally:       Tally;
     summary:     Summary;
+    advance:     Advance;
     failure:     Failure;
     diagnostics: Diagnostics;
     run_start:   RunStart;
@@ -424,12 +506,13 @@ pub rec Sink {
     ctx:      ptr;
     on_event: fun(ptr, *Event);
     level:    u8;
+    live:     bool;
 }
 ```
 
 where a build's events go: on_event is called once per event, in order, never
 from two threads at once, and may be called from a worker thread. level is
-what the sink asks to receive
+what the sink asks to receive, and live whether it shows advances as they happen
 
 ### unit
 
@@ -519,16 +602,18 @@ the time since start, zero when either sample is absent
 ```mach
 pub rec Progress {
     sink:       *Sink;
+    rows:       bool;
     unit_start: Instant;
     unit_rows:  std.chrono.duration.Duration;
     phases:     [PHASE_COUNT]PhaseState;
     counts:     [COUNTER_COUNT]u64;
+    live_at:    Instant;
 }
 ```
 
-one unit's phase rows, timed as they run and sent to the sink as each closes.
-a run that shows no readout has no progress, and every phase, span and item
-given a nil one is not shown
+one unit's progress: its wall time, and its phase rows, timed as they run and sent to the
+sink as each closes when `rows`. a run with no sink has no progress, and a progress without
+rows times no phase, span or item
 
 ### start
 
@@ -542,7 +627,7 @@ start a unit's progress over sink, timed from now
 | :--- | :--- |
 | `pr` | the storage, which must outlive every use of the returned pointer |
 | `sink` | the command's sink, or nil |
-| **returns** | pr, or nil when the sink takes no phase rows, which every phase call reads as none |
+| **returns** | pr, or nil when there is no sink |
 
 ### phase_begin
 
@@ -625,6 +710,23 @@ pub fun item_begin(pr: *Progress) Instant
 
 the start of an item, sampled only when the sink takes items
 
+### rows
+
+```mach
+pub fun rows(pr: *Progress) bool
+```
+
+whether a progress keeps phase rows, which every phase, span and item call asks
+
+### advance
+
+```mach
+pub fun advance(pr: *Progress, done: u32, total: u32, name: str)
+```
+
+a compile finished `done` of its `total` units, the last of them `name`: sent to a live
+sink when LIVE_EVERY has passed since the last it was sent
+
 ### item
 
 ```mach
@@ -668,10 +770,11 @@ close phase ph's row: count is what it processed, counted by noun
 ### summary
 
 ```mach
-pub fun summary(pr: *Progress, out: str, modules: u32, bytes: usize, has_size: bool)
+pub fun summary(pr: *Progress, sum: Summary)
 ```
 
-the unit built out: the time no row accounts for floors at zero
+the unit finished: its wall time is measured here, and the time no row accounts for, which
+floors at zero, is set when the progress kept rows. a nil progress is a no-op
 
 ## Functions
 
@@ -690,14 +793,6 @@ pub fun noun_width() usize
 ```
 
 the widest spelling of the noun table
-
-### counter_width
-
-```mach
-pub fun counter_width() usize
-```
-
-the widest label of the counter table
 
 ## Constants
 

@@ -8,7 +8,7 @@ stream. `mach fmt` and `mach migrate` are two transforms over it
 
 Source: [`src/cli/rewrite.mach`](../../../src/cli/rewrite.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.cli.diagnostic`](diagnostic.md), [`mach.manifest.load`](../manifest/load.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.cli.diagnostic`](diagnostic.md), [`mach.manifest.load`](../manifest/load.md), [`mach.report.layout`](../report/layout.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -84,6 +84,7 @@ pub rec Report {
     transform:   Transform;
     context:     ptr;
     heading:     Heading;
+    verb:        mach.report.layout.Verb;
 }
 ```
 
@@ -100,6 +101,7 @@ one command's pass over its inputs
 | `transform` | `Transform` | the text each source becomes |
 | `context` | `ptr` | what the command hands its transform |
 | `heading` | `Heading` | what heads each change a diff prints, nil for none |
+| `verb` | `mach.report.layout.Verb` | what the progress line of a rewritten file says was done to it |
 
 ## Sink
 

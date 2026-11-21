@@ -21,6 +21,8 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../bas
 | [`asm_read`](#asm_read) | the value of `sem_ty` an asm block reads from the slot `slot` it binds |
 | [`calls_noreturn`](#calls_noreturn) | whether the expression `eid` is a call of a function declared `noreturn`, which ends the block it stands in |
 | [`string_val`](#string_val) | the string the module `val` `d` declares holds where a reference of pointer type `vty` reads it as the address of the string's bytes: none for a `var`, an `ext` or thread-local binding, or a val of any other value |
+| [`fixed_case`](#fixed_case) | the case a condition `sel P.c` tests, where `P` is a local or parameter named alone whose case nothing changes (`place_fixed`): nothing stores to it whole, takes an address into it or names it in an asm block, and a payload write keeps the case, so wherever the test held it holds the case tested |
+| [`copy_known`](#copy_known) | copy a tag whose case is known from `src` to `dst`, both addresses of it: the case's code and the case's payload, if it has one |
 | [`try_lower_comptime_intrinsic`](#try_lower_comptime_intrinsic) | lower a call of a comptime intrinsic a runtime value stands for: a comptime path, `$type_name`, `$type_id`, `$zeroize`, or a layout measurement as `$size_of` |
 | [`expr_span_of`](#expr_span_of) | where expression `eid` is written; an expression its syntax lacks records an internal failure and has the empty span |
 | [`lower_stored_rvalue`](#lower_stored_rvalue) | the value a store consumes |
@@ -92,6 +94,27 @@ pub fun string_val(ctx: *mach.lower.context.LowerContext, d: mach.lower.context.
 
 the string the module `val` `d` declares holds where a reference of pointer type `vty` reads it as the address of the
 string's bytes: none for a `var`, an `ext` or thread-local binding, or a val of any other value
+
+### fixed_case
+
+```mach
+pub fun fixed_case(ctx: *mach.lower.context.LowerContext, cond: mach.front.ast.id.ExprId) opt[mach.lower.context.Known]
+```
+
+the case a condition `sel P.c` tests, where `P` is a local or parameter named alone whose case
+nothing changes (`place_fixed`): nothing stores to it whole, takes an address into it or names
+it in an asm block, and a payload write keeps the case, so wherever the test held it holds the
+case tested. none for any other condition. the frame's `prev` is left for the caller to link
+
+### copy_known
+
+```mach
+pub fun copy_known(ctx: *mach.lower.context.LowerContext, dst: mach.lower.value.Value, src: mach.lower.value.Value, k: *mach.lower.context.Known) err[mach.base.fail.Fail]
+```
+
+copy a tag whose case is known from `src` to `dst`, both addresses of it: the case's code and
+the case's payload, if it has one. the bytes of a case not active are no part of the value a
+copy moves, so a copy of one known case moves only its own
 
 ### try_lower_comptime_intrinsic
 

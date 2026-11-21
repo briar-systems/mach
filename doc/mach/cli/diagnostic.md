@@ -4,7 +4,7 @@
 
 how a command reports: diagnostics, failures, the build readout and test results
 
-a command's `Report` writes to stderr as human text or, under `--diagnostics json`,
+a command's `Report` writes to stderr as human text or, under `--report json` or `--report lines`,
 one record a line closed by a summary record. a `Readout` renders the engine's and the
 test runner's events as they arrive, by the readout contract (doc/language/readout.md).
 
@@ -15,26 +15,28 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | Type | | |
 | :--- | :--- | :--- |
 | [`Readout`](#readout) | `rec` | every command's events rendered the moment each arrives: the renderer of the readout contract (doc/language/readout.md) |
-| [`Format`](#format) | `def` | how a command writes its diagnostics to stderr: `--diagnostics=human`, the default, or `--diagnostics=json` |
+| [`Format`](#format) | `def` | how a command reports to stderr: `--report human`, the default, or the records in one of their two encodings, `--report json` or `--report lines` |
 | [`Report`](#report) | `rec` | how a build-shaped command reports to stderr, and what it has reported |
 
 | On `Readout` | |
 | :--- | :--- |
 | [`readout_begin`](#readout_begin) | start rendering a command's events to r, a test run in human text to stdout |
-| [`readout_end`](#readout_end) | close a plan's rendering: one summary line under human text closes every failure and diagnostic the plan rendered, a carried failure (an encoder or rules refusal that reached no store) counted in it beside every store's diagnostics, so the tally never reads `0 errors` above a nonzero exit |
+| [`readout_end`](#readout_end) | close a plan's rendering: under human text the table a plan of several units closes with, then one summary line that closes every failure and diagnostic the plan rendered, a carried failure (an encoder or rules refusal that reached no store) counted in it beside every store's diagnostics, so the tally never reads `0 errors` above a nonzero exit |
 
 | On `Format` | |
 | :--- | :--- |
 | [`FORMAT_HUMAN`](#format) | |
-| [`format_named`](#format_named) | the format a `--diagnostics` value names |
+| [`format_named`](#format_named) | the format a `--report` value names |
 
 | On `Report` | |
 | :--- | :--- |
 | [`report_store`](#report_store) | render every diagnostic of a store through a command's report: as text with its tally line, or a record each under json |
 | [`dependency_report`](#dependency_report) | where a dependency command reports: progress on standard output, and notes and failures, the ones the command goes on past too, through the command's report |
+| [`is_records`](#is_records) | whether the report writes records rather than human text |
 | [`report_init`](#report_init) | start a report in place; it holds its own arena, so it stays where it was made until `report_dnit` |
 | [`out`](#out) | where a command writes its output, stdout through the report, so a refused write fails the command as the system's |
 | [`report_note`](#report_note) | report a note of kind `k`, which points at nothing: `note text` in human text, or a diagnostic record of note severity under json |
+| [`report_said`](#report_said) | report what a command did as a progress line in human text, and as the note record of kind `k` saying `text` under the records modes |
 | [`report_fail`](#report_fail) | report a carried failure as the diagnostic it reads as, in text or as a diagnostic record under json |
 | [`report_case`](#report_case) | one collected test as a record under json, as `mach test --list` lists it; human text writes nothing here |
 | [`report_skip`](#report_skip) | a (target, profile) whose tests were built and not run, as a record under json; human text writes nothing here |
@@ -49,6 +51,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | [`dependency_outcome`](#dependency_outcome) | show how a dependency command ended: its failure, then a note for each change it made before failing |
 | [`outcome_code`](#outcome_code) | map a build outcome's severity to the process exit code, an unknown severity reported to stderr |
 | [`has_capture`](#has_capture) | whether a result kept output worth pointing at |
+| [`said_row`](#said_row) | a progress line on w: its verb in the gutter, then `n` texts parted by GAP |
 
 ---
 
@@ -61,14 +64,16 @@ pub rec Readout {
     units:   usize;
     quiet:   bool;
     tally:   Tally;
+    live:    bool;
+    shown:   bool;
+    a:       *std.allocator.Allocator;
+    rows:    Vector[StageRow];
+    modules: Vector[ModuleRow];
+    done:    Vector[UnitRow];
     run:     *mach.report.readout.TestResult;
     count:   u32;
     roll:    [ROLL_COLS]mach.report.layout.Column;
     line:    [3]mach.report.layout.Column;
-    stage:   [4]mach.report.layout.Column;
-    item:    [3]mach.report.layout.Column;
-    counter: [2]mach.report.layout.Column;
-    module:  [3]mach.report.layout.Column;
     counts:  [readout.COUNTER_COUNT]u64;
     held:    [readout.COUNTER_COUNT]bool;
     holding: bool;
@@ -77,30 +82,30 @@ pub rec Readout {
 
 every command's events rendered the moment each arrives: the renderer of the
 readout contract (doc/language/readout.md). the report's stream, stderr,
-carries the build: human text renders unit banners, phase rows, items, the
-unit summary, failures and diagnostics, and readout_end writes the closing
-tally; json renders each diagnostic and failure as a record, and under -v
-each unit, phase row, item and unit summary as unit, phase and phase_item
-records. stdout carries a test run in human text: each test as it finishes, a
-module's roll-up once its last test has, and the closing summary. under json the
-run is also records on the report's stream: run_start, a test record per
-finished test, and run_end
+carries the build: human text renders a unit's progress line or, among several units, the
+table their plan closes with, under -v each unit's table, failures and diagnostics, and
+readout_end writes the closing tally; the records modes write each diagnostic and failure as
+a record, and under -v each unit, phase row, item and counter. stdout carries a test run in
+human text: a module's row once its last test has finished, or each test under -v, then each
+failure once and the verdict. under the records modes the run is also records on the
+report's stream: run_start, a test record per finished test, and run_end
 
 | Field | Type | |
 | :--- | :--- | :--- |
 | `sink` | `mach.report.readout.Sink` | what the engine and the test runner are given; its ctx is this record, which must not move |
 | `r` | `*Report` | the command's report |
-| `units` | `usize` | the plan's unit count; a banner prints only when it is more than one |
-| `quiet` | `bool` | `--quiet`, which suppresses the banners |
+| `units` | `usize` | the plan's unit count; one table closes a plan of more than one |
+| `quiet` | `bool` | `--quiet`, which suppresses the progress lines and banners |
 | `tally` | `Tally` | the human tally, counted as the events pass |
+| `live` | `bool` | whether a live progress line is shown, and `shown` whether one is on the terminal now |
+| `a` | `*std.allocator.Allocator` | the arena what is held lives in, nil until something is |
+| `rows` | `Vector[StageRow]` | the -v table's rows, held until the unit closes |
+| `modules` | `Vector[ModuleRow]` | each module's counters under -vv |
+| `done` | `Vector[UnitRow]` | the summaries of a plan of several units |
 | `run` | `*mach.report.readout.TestResult` | the running test run's results, from its run_start to its run_end |
 | `count` | `u32` | how many results run holds |
-| `roll` | `[ROLL_COLS]mach.report.layout.Column` | a module roll-up's columns: module, time, then the ok, skip and FAIL counts |
+| `roll` | `[ROLL_COLS]mach.report.layout.Column` | a module row's columns: module, time, then the ok, skip and FAIL counts |
 | `line` | `[3]mach.report.layout.Column` | a test line's columns under -v: outcome, test, time |
-| `stage` | `[4]mach.report.layout.Column` | a phase row's columns |
-| `item` | `[3]mach.report.layout.Column` | the columns of an item under a phase row |
-| `counter` | `[2]mach.report.layout.Column` | a counter total's columns |
-| `module` | `[3]mach.report.layout.Column` | the columns of one module's counter |
 | `counts` | `[readout.COUNTER_COUNT]u64` | the counter totals held until the unit's rows close, those `held` |
 | `holding` | `bool` | whether any total is held |
 
@@ -126,11 +131,11 @@ start rendering a command's events to r, a test run in human text to stdout
 pub fun readout_end(rd: *Readout)
 ```
 
-close a plan's rendering: one summary line under human text closes every
-failure and diagnostic the plan rendered, a carried failure (an encoder or
-rules refusal that reached no store) counted in it beside every store's
-diagnostics, so the tally never reads `0 errors` above a nonzero exit. json
-closes in report_dnit
+close a plan's rendering: under human text the table a plan of several units closes with,
+then one summary line that closes every failure and diagnostic the plan rendered, a carried
+failure (an encoder or rules refusal that reached no store) counted in it beside every
+store's diagnostics, so the tally never reads `0 errors` above a nonzero exit. the records
+modes close in report_dnit
 
 ## Format
 
@@ -138,8 +143,8 @@ closes in report_dnit
 pub def Format: u8
 ```
 
-how a command writes its diagnostics to stderr: `--diagnostics=human`, the
-default, or `--diagnostics=json`
+how a command reports to stderr: `--report human`, the default, or the records in one of
+their two encodings, `--report json` or `--report lines`
 
 | Name | Value | |
 | :--- | :--- | :--- |
@@ -151,12 +156,12 @@ default, or `--diagnostics=json`
 pub fun format_named(name: str) opt[Format]
 ```
 
-the format a `--diagnostics` value names
+the format a `--report` value names
 
 | Parameter | |
 | :--- | :--- |
 | `name` | the value |
-| **returns** | the format, or none for a name outside `human` and `json` |
+| **returns** | the format, or none for a name outside `human`, `json` and `lines` |
 
 ## Report
 
@@ -224,8 +229,16 @@ the ones the command goes on past too, through the command's report
 | Parameter | |
 | :--- | :--- |
 | `a` | owns the report's effect notes |
-| `r` | the command's report, in the format `--diagnostics` selected |
+| `r` | the command's report, in the format `--report` selected |
 | **returns** | the report, released with `report.dnit` |
+
+### is_records
+
+```mach
+pub fun is_records(r: *Report) bool
+```
+
+whether the report writes records rather than human text
 
 ### report_init
 
@@ -264,6 +277,25 @@ diagnostic record of note severity under json
 | `r` | the command's report |
 | `k` | the note's kind, a row of note level |
 | `text` | what the note says |
+
+### report_said
+
+```mach
+pub fun report_said(r: *Report, k: mach.base.diagnostic.kind.Kind, v: mach.report.layout.Verb, texts: *str, n: usize, detail: str, text: str)
+```
+
+report what a command did as a progress line in human text, and as the note record of kind
+`k` saying `text` under the records modes
+
+| Parameter | |
+| :--- | :--- |
+| `r` | the command's report |
+| `k` | the note's kind, a row of note level |
+| `v` | the verb of the progress line |
+| `texts` | what it acted on, then its detail on the line, `n` of them |
+| `n` | how many texts |
+| `detail` | a line beneath it, nil for none |
+| `text` | the note record's message |
 
 ### report_fail
 
@@ -422,4 +454,12 @@ pub fun has_capture(r: *mach.report.testrun.GateResult) bool
 ```
 
 whether a result kept output worth pointing at
+
+### said_row
+
+```mach
+pub fun said_row(w: *std.io.writer.Writer, v: mach.report.layout.Verb, texts: *str, n: usize)
+```
+
+a progress line on w: its verb in the gutter, then `n` texts parted by GAP
 
