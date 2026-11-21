@@ -1,4 +1,4 @@
-# `^` — the secret qualifier
+# `^`, the secret qualifier
 
 `^T` marks a type as carrying secret data for Mach's constant-time guarantee.
 Sema tracks secrecy as an information-flow discipline: secret data may move and
@@ -27,8 +27,8 @@ fun up(p: u32) ^u32 {
 A **literal is public by construction** and stays public through that coercion:
 its value sits in the instruction stream, so classifying it as secret would
 protect nothing. `var s: ^u32 = 5;` types `5` as `u32` and relies on the
-up-coerce. The join below is unaffected — a value *computed* with a secret is
-secret however its other operand is spelled — so `v << 3` on a secret `v` still
+up-coerce. The join below is unaffected (a value *computed* with a secret is
+secret however its other operand is spelled), so `v << 3` on a secret `v` still
 yields a secret, while the constant `3` is not mistaken for a secret shift
 count.
 
@@ -92,7 +92,7 @@ error decided by operand type:
 - a secret left operand of a short-circuiting `&&` / `||` (it is the branch the
   operator keys on; a secret right operand only taints the result)
 - a secret memory index (`table[i]` with `i` secret)
-- a secret memory address — an access through a secret *pointer*, whether by
+- a secret memory address: an access through a secret *pointer*, whether by
   `@p`, `p[i]`, or the auto-deref in `p.x`. The index and the address are the
   two halves of one effective address, so both are gated. Only a secret
   *pointer* is an address: a `^[N]T` or `^Rec` is a secret value living at a
@@ -152,8 +152,8 @@ for it.
 
 The gates are checked against the types of the **instance**, not of the template.
 A generic's body is re-checked per instantiation under its concrete type
-arguments, and a pack-tailed function's body — the statements around its `$each`
-as well as the unrolled body itself — is re-typed per monomorphized instance, so
+arguments, and a pack-tailed function's body (the statements around its `$each`
+as well as the unrolled body itself) is re-typed per monomorphized instance, so
 a `T` that instantiates to a secret is gated exactly as the secret spelled out
 in full would be.
 
@@ -179,7 +179,7 @@ and false otherwise.
 
 It exists because secrecy was otherwise invisible to a library. Every other
 predicate asks about the shape *under* the `^` and so answers false for every
-secret, which makes `$is_record(^u64)` and `$is_record(u64)` the same answer — a
+secret, which makes `$is_record(^u64)` and `$is_record(u64)` the same answer: a
 reflection walk could only ever meet a secret field as a fallthrough it had to
 refuse. `$is_secret` is the positive question, and it is what lets `std.derive`
 decide rather than refuse: a formatter redacts a secret field, a hash refuses one
@@ -198,12 +198,12 @@ $each f in $fields(Session) {
 
 **Outermost only**, the same line the rest of the family draws:
 
-- `^*u8` is secret — the pointer *is* the secret, which is the shape the
+- `^*u8` is secret: the pointer *is* the secret, which is the shape the
   welded-storage rules exist for
-- `*^u8` is **not** — a public address to secret storage. Ask
+- `*^u8` is **not**: a public address to secret storage. Ask
   `$is_secret($pointee_of(f.type))` for the pointee
-- `[N]^u8` is not — a public array whose elements are secret
-- a record with a secret field is not — the **field** is, and that is where a
+- `[N]^u8` is not: a public array whose elements are secret
+- a record with a secret field is not: the **field** is, and that is where a
   walk meets the question
 
 ### `$holds_secret`: the question a memory primitive asks
@@ -241,7 +241,7 @@ The deep question belongs to code that treats a type as bytes, where one secret
 byte decides how every byte is moved.
 
 Note that a walk which skips a secret field is pinned by the flow rules rather
-than by convention — reading one into a public accumulator does not compile, so a
+than by convention: reading one into a public accumulator does not compile, so a
 walk that gates wrongly is a compile error, not a silent disclosure.
 
 ## Downgrade with `:>T`
@@ -365,14 +365,14 @@ Each mixed instance is reported once, where it is first formed, so a
 
 A *partially* concrete template (`U[T, ^u32]` written inside another generic) is
 a legal annotation with both legal and illegal instantiations, so it is never
-rejected where it is written — only at the arguments that actually make a pair
+rejected where it is written, only at the arguments that actually make a pair
 mixed.
 
 The check is **deep** and **fails closed**: a secret nested anywhere inside an
 aggregate (including a generic instance's lazily-materialized fields) counts as
 secret at these boundaries, and a placement the checker cannot prove severs no
-weld — a secrecy difference reachable through a function type, or a shape whose
-layout it cannot determine — is rejected rather than allowed.
+weld (a secrecy difference reachable through a function type, or a shape whose
+layout it cannot determine) is rejected rather than allowed.
 
 Types are compared **by byte extent**, not by field ordinal. Each type lays out
 as a run of bytes, each byte secret or public, with padding counted as public
@@ -467,8 +467,8 @@ determine a layout it declines, which rejects.
 
 `==`, `!=`, `<`, `<=`, `>` and `>=` all accept two pointer-like operands
 whatever their pointees' secrecy, including `*^T` against `*^T` and `*^T`
-against a public `*U`. The result is a public `bool` — `u1`, per
-[operators.md](operators.md) — so it branches, feeds `&&`, and returns like any
+against a public `*U`. The result is a public `bool` (`u1`, per
+[operators.md](operators.md)), so it branches, feeds `&&`, and returns like any
 other public value:
 
 ```mach
@@ -482,8 +482,8 @@ fun overlap(first: *^u8, first_len: usize, second: *^u8, second_len: usize) bool
 
 **This launders nothing**, and the reason is the line the whole model draws: a
 `*^T` is a *public address to secret storage*. The address was never secret, so
-reading it is not a downgrade. What the welding rules protect is the *pointee* —
-that the bytes at that address can only ever be reached as `^T` — and ordering
+reading it is not a downgrade. What the welding rules protect is the *pointee*:
+that the bytes at that address can only ever be reached as `^T`. Ordering
 reaches no bytes at all. It consumes two addresses and produces one `bool`; no
 integer and no pointer comes out of it, so there is no value to turn back into a
 `*T` and dereference. Ordering is exactly as revealing as the `==` the language
@@ -509,7 +509,7 @@ Three deliberate decisions:
   byte cursor to a typed buffer.
 - **`nil` orders.** `p > nil` compiles and compares against the null address as
   zero. It falls out of `nil` being a pointer-like operand, the same way
-  `p == nil` does. It is rarely what you mean — `p != nil` is — but it is not a
+  `p == nil` does. It is rarely what you mean (`p != nil` is), but it is not a
   leak, and special-casing it would be surface with nothing behind it.
 - **The comparison is not itself constant-time-gated, and does not need to be.**
   Both operands are public addresses, so ordering is `CT_OP_NONE`: it lowers to
@@ -536,7 +536,7 @@ fun leak(a: ^*u8, b: ^*u8) u8 {
 }
 ```
 
-## `#[constant_time]` — the codegen contract
+## `#[constant_time]`: the codegen contract
 
 The flow typing constrains the *source*. `#[constant_time(mode)]` carries the
 obligation through *codegen*, and its mode, `"soft"` or `"hard"`, is required:
@@ -979,7 +979,7 @@ fun clear(p: *^u8, n: usize) {
 }
 ```
 
-**What it covers.** Memory, reached through a pointer that escapes the function — the
+**What it covers.** Memory, reached through a pointer that escapes the function, the
 shape `crypto.ct.zeroize` has. Such a store cannot be promoted out of memory.
 
 **What it does not cover.** A value the compiler keeps in a **register**. Writing to a
@@ -990,7 +990,7 @@ var x: ^u8 = k;
 x = 0;          # NOT guaranteed: `x` may never have been in memory
 ```
 
-Adding `#[constant_time]` does not change this — the wipe is outside the memory-address
+Adding `#[constant_time]` does not change this: the wipe is outside the memory-address
 leakage model rather than an exception within it. To wipe reliably, write through a
 pointer whose target is memory the compiler cannot promote away, which is what the
 standard library's `zeroize` does. Settled: the wipe guarantee is memory-scoped; secret register lifetimes are outside
@@ -1149,9 +1149,11 @@ instruction set's registration, and the kind of each claim is marked:
   machine the binary runs on. riscv32 declares no rows yet.
 - **SPIR-V** has no timing model and declares nothing.
 
-**DOITM.** masc's x86-64 rows state the timing Intel lists under its Data
-Operand Independent Timing Mode (`IA32_UARCH_MISC_CTL[0]`), and mirl checks
-every x86-64 constant-time function under that mode. It is a model-specific
+**DOITM.** masc's x86-64 rows state the timing of Intel's "Data Operand
+Independent Timing Instructions" list (intel.com developer article 768547,
+updated 2026-02-23, 840 entries), which holds under its Data Operand
+Independent Timing Mode (`IA32_UARCH_MISC_CTL[0]`), and mirl checks every
+x86-64 constant-time function under that mode. It is a model-specific
 register the kernel owns and user space cannot set, so mach neither switches it
 nor offers a manifest key for it. Intel states that a processor which does not
 enumerate DOITM behaves as if it were on for the listed instructions. On one
@@ -1407,7 +1409,7 @@ constant-time function establishes itself everywhere else:
 On linux, darwin and uefi a constant-time function emits nothing for
 FPCR.NEP. On freestanding and windows the function clears it around its own
 code where that code may select a one-source scalar float instruction, as
-[the codegen contract](#constant_time--the-codegen-contract) states, in `soft`
+[the codegen contract](#constant_time-the-codegen-contract) states, in `soft`
 and `hard` alike: the state is the function's own doing, decided when it is
 compiled, and needs no feature of the processor, as the clear is harmless
 where the bit is RES0. That proof rests on nothing a startup routine does.

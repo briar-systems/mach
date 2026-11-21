@@ -920,7 +920,7 @@ var depth: u32 = 0;
 - A `constant_time` function reaches a thread-local as it does a global, on
   every target but darwin, whose thread-locals are reached through a resolver
   call the constant-time check cannot see into, so there it is refused (see
-  [secrecy.md](secrecy.md#constant_time--the-codegen-contract)).
+  [secrecy.md](secrecy.md#constant_time-the-codegen-contract)).
 
 ### `constant_time(mode)` — constant-time boundary
 
@@ -947,7 +947,7 @@ See [secrecy.md](secrecy.md#soft-and-hard) for both modes.
 Inline `asm` inside such a function is **validated rather than rejected**: the
 block is parsed and walked for the same leaks, and refused only where a leak is
 found or where the construct cannot be modelled. See
-[secrecy.md](secrecy.md#constant_time--the-codegen-contract) for what is checked and
+[secrecy.md](secrecy.md#constant_time-the-codegen-contract) for what is checked and
 what is refused.
 
 The **zeroizing-write** guarantee is *not* one of the decorator's obligations,

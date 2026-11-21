@@ -672,7 +672,9 @@ mach build . -l c
   relative path is read against the working directory, where it was typed, and
   nowhere else. A manifest's `local` path is anchored at the project that
   declares it instead (see
-  [manifest.md](manifest.md#linkname--link-requirements)).
+  [manifest.md](manifest.md#linkname--link-requirements)). Any other argument
+  after the project is refused, since a library named without a path is
+  `-l <name>`.
 - `-l <name>` is handed to mink's library search, which finds it as the link
   runs. The directories are each `-L <dir>` in order, then the working
   directory, then the system's library directories the target's host row in

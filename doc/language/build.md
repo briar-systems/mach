@@ -71,6 +71,20 @@ to select one. `mach test` names the artifacts it found.
   refused, naming the target, and the program's exit status, or the runner's, is
   `mach run`'s.
 
+## Operands
+
+`mach build <path> [inputs...]` and `mach test <path> [inputs...]` take the
+project first: a directory whose `mach.toml` is read, or the manifest file itself,
+and for `mach build` an entry file (see [Entry builds](#entry-builds)). Each
+operand after it is a link input, a file named by its path: it holds a `/`, or it
+is named as an object, an archive or a shared library (`x/libfoo.a`, `foo.o`,
+`foo.dll`). A relative input is read against the working directory, where it was
+typed, never against the project, so `mach build ../app x/libfoo.a` links
+`x/libfoo.a` under the working directory, not under `../app`. Any other operand is
+refused as `cli.operand`, since a library named without a path is `-l <name>`
+(see [ext-fun.md](ext-fun.md#command-line)). `mach check` takes the project
+alone.
+
 ## Enumerated cells are filtered, named ones are not
 
 A cell whose artifact does not list the cell's target is a cell the manifest never

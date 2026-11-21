@@ -72,10 +72,13 @@ out/linux-x86_64/debug/bin/mach check .
 ```
 
 The compiler's tests are a corpus under `test/`, one program a file, with no
-project around any of them. A file under `run/` builds for every target and
+project around any of them but those under `project/`. A file under `run/` builds for every target and
 exits 0 where the host can run it. A file under `refuse/` is refused with the
 diagnostic kind its first line names. A file under `gpu/` builds for the shader
-targets. Each file under `target/` names a target's flags and states what
+targets. A directory under `project/` is a small project and its `steps` file,
+the commands run in order in one fresh work directory, each with the exit code it
+expects and, after `|`, text a line of its output must hold, for what only a
+sequence of commands shows. Each file under `target/` names a target's flags and states what
 `mink dump` must show of every artifact built for it. One driver runs it all
 through the compiler you just built, with the `mink` on `PATH` unless `--mink`
 names another:

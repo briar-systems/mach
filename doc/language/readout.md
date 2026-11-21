@@ -151,6 +151,29 @@ when the text prints no banner or
 several profiles.
 [diagnostics-json.md](diagnostics-json.md#readout-records) has the schema.
 
+## The pass report
+
+`mach build --passes` has mirl report, for each function of each module it
+compiles, every optimisation pass that changed the function, in the order the
+passes ran, one line each on stdout:
+
+```
+inline app.main 2
+vectorise loop_copy.copy_bytes 1
+promote app.main
+```
+
+A line is the pass's name, the function's symbol and, for a pass that counts
+what it does, the count: calls inlined (`inline`), loops vectorised
+(`vectorise`), switches formed (`switch`) and stores removed (`dse`). A pass
+that counts nothing gives no count. Each line is written whole, so the lines of
+modules compiled side by side never mix, though their order between modules is
+the order the modules finish. A build that runs no optimisation pass reports
+nothing, and a build with `--passes` compiles every module, since an object the
+cache holds carries no report. The flag only asks mirl for the report, which is
+mirl's: what each pass counts is stated by its pass record
+(`mirl.pass.record.Record.counts`).
+
 ## The test readout
 
 Tests run concurrently, up to `--threads` at once, and each is written when it

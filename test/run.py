@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # the compiler's test corpus: every file under run/ and gpu/ builds for every target that
 # takes it and exits 0 where the host can run it, every file under refuse/ is refused with
-# the diagnostic it names, every artifact holds to its target's rules, and every project
-# manifest of the tree (its own, each package's under dep/ and any under test/) loads.
+# the diagnostic it names, every artifact holds to its target's rules, every project under
+# project/ runs its steps on the host, and every project manifest of the tree (its own, each
+# package's under dep/ and any under test/) loads.
 #
 #   test/run.py [--mach <path>] [--mink <path>] [--std <dir>] [--root <dir>] [--jobs <n>] [--kinds] [--local] [filter...]
 #
@@ -10,12 +11,22 @@
 # a target file's rules hold of the blocks of `mink dump`: `has` some block holds every part,
 # `lacks` none does, `each` every block holding the first part holds the rest, and
 # `inside <parts> | <parts>` every block holding the first parts lies within the addresses of a
-# block holding the second.
+# block holding the second. a block's addresses are a section's or a segment's, a PE section's
+# from the image base, or a PE function table entry's, from its start to its end.
 # a `# targets:` line in a file's header names the targets that take it: a refuse/ file is
 # tried on the host alone without one, and a run/ or gpu/ file on every target taking its kind.
 # a `# flags:` line adds its words to the file's build after the target's, as `--set simd=require`.
-# a `# has:` or `# lacks:` line is a rule of a target file's kind on the file's own artifact, on
-# every target that builds it, as a code shape that only one file's program has.
+# a `# has:`, `# lacks:` or `# inside:` line is a rule of a target file's kind on the file's own
+# artifact, on every target that builds it, as a code shape that only one file's program has.
+# a path a `# flags:` line names, from test/, is an input the build links, such as a foreign
+# object checked in beside the file with the script that writes it (run/link/coff_unwind.*).
+# a directory under project/ is a project and its `steps` file, one command a line, run in order
+# in one fresh work directory under test/out: `<exit> <subcommand> [args...]`, with `| <text>`
+# after it when a line of the command's output must hold that text, and `#` for a comment. its
+# std is copied in as `dep/std`, as `mach dep pull` realizes a path dependency.
+# a `# reports:` line lists, `;` apart, lines the build's report of its optimisation passes
+# (`mach build --passes`) must hold on the host's optimised target, as `vectorise main.copy_u32 1`,
+# so a pass that stops firing on the file shows.
 # --local also runs each artifact of a target the host cannot run under the tool its target
 # file names on a `local` line (an emulator, or a validator for a module), when it is installed.
 # it is for a developer's machine, never CI. exit 0: nothing failed.
@@ -36,10 +47,25 @@ def header(path):
     return out
 
 
+def parts(text):
+    return [p.strip() for p in text.split(';')]
+
+
+def inside_rule(path, n, rest):
+    # the parts of an `inside <parts> | <parts>` rule
+    inner, bar, outer = rest.partition('|')
+    if not bar:
+        sys.exit(f'{path}:{n}: `inside` needs `<parts> | <parts>`')
+    return parts(inner), parts(outer)
+
+
 def file_rules(path):
-    # the `# has:` and `# lacks:` rules of a file's header
+    # the `# has:`, `# lacks:` and `# inside:` rules of a file's header
     h = header(path)
-    return [(verb, [p.strip() for p in h[verb].split(';')], 0) for verb in ('has', 'lacks') if verb in h]
+    rules = [(verb, parts(h[verb]), 0) for verb in ('has', 'lacks') if verb in h]
+    if 'inside' in h:
+        rules.append(('inside', inside_rule(path, 0, h['inside']), 0))
+    return rules
 
 
 def aimed(path, target, default):
@@ -72,12 +98,9 @@ class Target:
             elif verb == 'local':
                 self.local = rest.split()
             elif verb in ('has', 'lacks', 'each'):
-                self.rules.append((verb, [p.strip() for p in rest.split(';')], n))
+                self.rules.append((verb, parts(rest), n))
             elif verb == 'inside':
-                inner, bar, outer = rest.partition('|')
-                if not bar:
-                    sys.exit(f'{path}:{n}: `inside` needs `<parts> | <parts>`')
-                self.rules.append((verb, ([p.strip() for p in inner.split(';')], [p.strip() for p in outer.split(';')]), n))
+                self.rules.append((verb, inside_rule(path, n, rest), n))
             else:
                 sys.exit(f'{path}:{n}: unknown line `{verb}`')
         if '--target' not in self.flags:
@@ -114,30 +137,39 @@ def holds(block, parts):
     return all(any(field(p, line) for line in block) for p in parts)
 
 
-def span(block):
-    # the addresses a section (Address, Size) or a segment (VirtualAddress, MemSize) occupies, or None
+def span(block, base):
+    # the addresses a section (Address, Size), a segment (VirtualAddress, MemSize), a PE section
+    # (VirtualAddress, VirtualSize from the image base) or a PE function table entry (StartAddress,
+    # EndAddress) occupies, or None
     got = {}
     for line in block:
         key, sep, value = line.partition(': ')
-        if sep and key in ('Address', 'Size', 'VirtualAddress', 'MemSize'):
+        if sep and key in ('Address', 'Size', 'VirtualAddress', 'MemSize', 'VirtualSize', 'StartAddress', 'EndAddress'):
             got[key] = int(value.split()[0], 0)
     for at, size in (('Address', 'Size'), ('VirtualAddress', 'MemSize')):
         if at in got and size in got:
             return got[at], got[at] + got[size]
+    if 'StartAddress' in got and 'EndAddress' in got:
+        return got['StartAddress'], got['EndAddress']
+    if base is not None and 'VirtualAddress' in got and 'VirtualSize' in got:
+        return base + got['VirtualAddress'], base + got['VirtualAddress'] + got['VirtualSize']
     return None
 
 
 def judge(rules, dump):
     # the rules a dump breaks, each as text
     bs, broken = blocks(dump), []
+    # a PE image's sections state their addresses from its base
+    m = re.search(r'^\s*ImageBase: (0x[0-9a-fA-F]+)', dump, re.M)
+    base = int(m.group(1), 16) if m else None
     for verb, parts, n in rules:
         if verb == 'inside':
             # every block holding the inner parts lies within the addresses of a block holding the outer ones
             inner, outer = parts
             said = ' ; '.join(inner) + ' | ' + ' ; '.join(outer)
-            spans = [span(b) for b in bs if holds(b, outer)]
+            spans = [span(b, base) for b in bs if holds(b, outer)]
             for b in bs:
-                mine = span(b) if holds(b, inner) else None
+                mine = span(b, base) if holds(b, inner) else None
                 if mine and not any(o and o[0] <= mine[0] and mine[1] <= o[1] for o in spans):
                     broken.append(f'line {n}: inside {said}')
                     break
@@ -221,6 +253,23 @@ def build(cfg, path, target):
     return p.returncode, errors(p.stdout + p.stderr), os.path.join(HERE, out)
 
 
+def reports(cfg, path, target, host):
+    # the `# reports:` lines of a file's header its build on the host's optimised target does not
+    # report, as failures; nothing on any other target or for a file with no such line
+    want = [r.strip() for r in header(path).get('reports', '').split(';') if r.strip()]
+    if not want or target.name != host + '-optimized':
+        return []
+    rel = os.path.relpath(path, HERE)
+    out = os.path.join('out', 'bin', target.name, rel[:-len('.mach')].replace(os.sep, '-') + '-reports')
+    cmd = [cfg.mach, 'build', rel, '--source', 'std=' + cfg.std, *target.flags, *header(path).get('flags', '').split(),
+           '-w', os.path.join('out', 'work', target.name), '-o', out, '--passes']
+    p = subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)
+    if p.returncode != 0:
+        return [fail(rel, target, f'does not build with --passes: exit {p.returncode}')]
+    got = {line.strip() for line in p.stdout.splitlines()}
+    return [fail(rel, target, f'its pass report lacks `{w}`') for w in want if w not in got]
+
+
 def one_target(cfg, target, files, refusals, host):
     # every file this target takes: built, run where the host or --local runs it, inspected
     fails, built, ran = [], 0, 0
@@ -237,6 +286,7 @@ def one_target(cfg, target, files, refusals, host):
             fails.append(fail(rel, target, f'does not build: {why}'))
             continue
         built += 1
+        fails += reports(cfg, path, target, host)
         if runner is not None:
             why = execute(runner + [out], 20 if not runner else 60)
             if why:
@@ -264,6 +314,49 @@ def one_target(cfg, target, files, refusals, host):
         else:
             refused += 1
     return target.name, built, ran, refused, fails
+
+
+def projects():
+    # each directory under project/ that holds a `steps` file
+    top = os.path.join(HERE, 'project')
+    if not os.path.isdir(top):
+        return []
+    return sorted(os.path.join(top, d) for d in os.listdir(top) if os.path.isfile(os.path.join(top, d, 'steps')))
+
+
+def steps(path):
+    # the commands of a project's `steps` file: (line number, expected exit, argv, text or None)
+    out = []
+    for n, line in enumerate(open(os.path.join(path, 'steps'), encoding='utf-8'), 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        command, bar, text = line.partition('|')
+        words = command.split()
+        if len(words) < 2 or not words[0].isdigit():
+            sys.exit(f'{path}/steps:{n}: a step is `<exit> <subcommand> [args...]`')
+        out.append((n, int(words[0]), words[1:], text.strip() if bar else None))
+    return out
+
+
+def one_project(cfg, path):
+    # a project's steps run in order in one fresh copy of it: why the first that failed did, or None
+    rel = os.path.relpath(path, HERE)
+    work = os.path.join(HERE, 'out', rel.replace(os.sep, '-'))
+    shutil.rmtree(work, ignore_errors=True)
+    shutil.copytree(path, work, ignore=shutil.ignore_patterns('steps', 'out', 'dep'))
+    shutil.copytree(cfg.std, os.path.join(work, 'dep', 'std'), ignore=shutil.ignore_patterns('out', 'dep', '.git'))
+    for n, code, argv, text in steps(path):
+        said = ' '.join(argv)
+        try:
+            p = subprocess.run([cfg.mach, *argv], capture_output=True, text=True, cwd=work, timeout=600)
+        except subprocess.TimeoutExpired:
+            return f'{rel} step {n} ({said}) did not exit in 600s'
+        if p.returncode != code:
+            return f'{rel} step {n} ({said}) exited {p.returncode}, not {code}: ' + ' '.join((p.stderr or p.stdout).split()[-40:])
+        if text is not None and not any(text in line for line in (p.stdout + p.stderr).splitlines()):
+            return f'{rel} step {n} ({said}) wrote no line holding `{text}`'
+    return None
 
 
 def main():
@@ -309,10 +402,14 @@ def main():
                 continue
             jobs.append(pool.submit(one_target, cfg, t, files, mine, host))
         loads = [pool.submit(manifest_loads, cfg, m) for m in manifests() if keep(m)]
+        sequences = [pool.submit(one_project, cfg, p) for p in projects() if keep(p)]
         for j in jobs:
             name, built, ran, refused, f = j.result()
             fails += f
             print(f'{name}: {built} built, {ran} ran, {refused} refused, {len(f)} failed')
+        failed = [why for why in (j.result() for j in sequences) if why]
+        fails += failed
+        print(f'projects: {len(sequences) - len(failed)} passed, {len(failed)} failed')
         broken = [why for why in (j.result() for j in loads) if why]
         fails += broken
         print(f'manifests: {len(loads) - len(broken)} loaded, {len(broken)} failed')
