@@ -73,8 +73,13 @@ pub fun lower_stmt(ctx: *lower_context.LowerContext, sid: ast_id.StmtId) err[fai
     builder.set_loc(?ctx.builder, base_source.location(ctx.scope.a.file_id, s.span));
     fin { builder.set_loc(?ctx.builder, saved_loc); }
 
+    # an expression statement or a declaration evaluates its expressions once and keeps no temporary past its end, so
+    # it scopes the storage of the temporaries it makes (`builder.temps_begin`)
+    val kept:        builder.Temps  = builder.temps_begin(?ctx.builder, s.kind == ast_stmt.STMT_KIND_EXPR || s.kind == ast_stmt.STMT_KIND_DECL);
     val err_lowered: err[fail.Fail] = lower_stmt_kind(ctx, sid, s);
+    val err_ended:   err[fail.Fail] = builder.temps_end(?ctx.builder, kept);
     if (sel err_lowered.err) { ret err[fail.Fail].err{fail.at(err_lowered.err, builder.current_loc(?ctx.builder))}; }
+    if (sel err_ended.err)   { ret err[fail.Fail].err{fail.at(err_ended.err, builder.current_loc(?ctx.builder))}; }
     ret err_lowered;
 }
 
@@ -127,45 +132,75 @@ fun lower_stmt_list(ctx: *lower_context.LowerContext, start: u32, len: u32) err[
     ret err[fail.Fail].ok{};
 }
 
-# whether the local `sym` of the ir type `ir`, declared just before the statements from `start`
-# to `end` of the statement id table, which are its scope, is the slot every return hands the
-# result back from for its whole life: the function builds an aggregate result of `ir` in that
-# slot, nothing stores to the local whole, takes an address into it or names it in an asm block,
-# and its scope returns it at least once, returns nothing else and declares no `fin`. the slot
-# is written only by returns, each of which then leaves, and only by name is the local written,
-# so outside its scope the local is dead, inside it every return writes the local onto itself,
-# and no `fin` that could read it runs after a return that wrote the slot. a later local of the
-# scope that returns itself is refused by this one's returns, so two never share the slot. a
-# build with debug information keeps the local's own slot, so its return keeps code at its line
+# whether the local `sym` of the ir type `ir`, declared just before the statements from `start` to `end` of the
+# statement id table, which are its scope, is the slot every return hands the result back from for its whole life.
+# the slot is written only by returns, each of which then leaves, and by the declarations of locals that are it, so a
+# local may be it when no other value is written to it while the local is live and still to be read. that holds when:
+# - the function builds an aggregate result of `ir` in that slot, and the build has no debug information, so each
+#   return keeps the code its line is described by.
+# - nothing stores the local whole, takes an address into it or names it in an asm block, so it is written only by
+#   name and read only where its name is.
+# - its scope declares no `fin`, which could run after a return wrote the slot and read the local.
+# - its scope returns it at least once, and every other return builds a value that reads the local only before it
+#   writes the slot (`slot_safe`): a return then leaves, so nothing reads the local after the slot is written.
+# - every later local of its scope that may be the slot too (`may_hold`) is declared where the local is no longer
+#   read: no statement that can run after that declaration in the local's scope names the local, and the
+#   declaration's initializer reads it only before writing the slot. a later local is judged on its own when it is
+#   declared, so of two that conflict the earlier is refused and the later may take the slot.
+# a `$if` is read in the arm lowering takes, and a `$each` holding a return, a `fin` or a declaration of such a local
+# is refused, since each iteration reads its names in a frame of its own
 fun names_result(ctx: *lower_context.LowerContext, sym: resolve.SymbolId, ir: Type, start: u32, end: u32) bool {
-    # with debug information each return keeps the code its line is described by
     if (ctx.debug || ctx.fn_naked || lower_context.returns_whole(ctx))      { ret false; }
     if (!irt.is_aggregate(?ctx.m.types, ir) || !irt.same(ir, ctx.ret_type)) { ret false; }
     if (lower_context.type_contains_secret(ctx, ctx.fn_ret_sem))            { ret false; }
     if (lower_expr.type_is_volatile_record(ctx, ctx.fn_ret_sem))            { ret false; }
-    val opt_named: opt[*resolve.Symbol] = lower_context.symbol_of(ctx, sym);
-    if (sel opt_named.none)                                                                 { ret false; }
-    if ((opt_named.some.flags & (resolve.SYM_FLAG_STORED | resolve.SYM_FLAG_REACHED)) != 0) { ret false; }
-    var returns: u32 = 0;
-    if (!returns_only(ctx, sym, start, end, ?returns)) { ret false; }
-    ret returns > 0;
+    if (!unmoved(ctx, sym))                                                 { ret false; }
+    var scan: Scan = Scan{sym: sym, returns: 0, pairs: true, holds: false};
+    if (!scan_list(ctx, ?scan, start, end)) { ret false; }
+    ret scan.returns > 0;
 }
 
-# whether every return among the statements from `start` to `end` of the statement id table, and
-# every statement nested in them, returns the local `sym` by name and none is a `fin`, counting
-# the returns into `returns`. a `$if` is read in the arm lowering takes, and a `$each` holding a
-# return or a `fin` is refused, since each of its iterations reads its names in a frame of its own
-fun returns_only(ctx: *lower_context.LowerContext, sym: resolve.SymbolId, start: u32, end: u32, returns: *u32) bool {
-    var i: u32 = start;
+# whether nothing stores the local `sym` whole, takes an address into it or names it in an asm block
+fun unmoved(ctx: *lower_context.LowerContext, sym: resolve.SymbolId) bool {
+    val opt_named: opt[*resolve.Symbol] = lower_context.symbol_of(ctx, sym);
+    if (sel opt_named.none) { ret false; }
+    ret (opt_named.some.flags & (resolve.SYM_FLAG_STORED | resolve.SYM_FLAG_REACHED)) == 0;
+}
+
+# the walk of a candidate local's scope (`names_result`)
+# ---
+# sym:     the candidate
+# returns: the returns of it by name found so far
+# pairs:   whether later locals that may be the slot are judged against it; off while one is judged on its own
+# holds:   set once a statement walked holds a declaration of such a local
+rec Scan {
+    sym:     resolve.SymbolId;
+    returns: u32;
+    pairs:   bool;
+    holds:   bool;
+}
+
+# whether the statements from `start` to `end` of the statement id table keep the candidate the slot, each statement
+# after one that declares a later local that may be the slot naming the candidate nowhere
+fun scan_list(ctx: *lower_context.LowerContext, scan: *Scan, start: u32, end: u32) bool {
+    val outer: bool = scan.holds;
+    var held:  bool = false;
+    var i:     u32  = start;
     for (i < end) {
-        if (i::usize >= ctx.scope.a.stmt_ids.len)                           { ret false; }
-        if (!returns_stmt(ctx, sym, ctx.scope.a.stmt_ids.data[i], returns)) { ret false; }
-        i = i + 1;
+        if (i::usize >= ctx.scope.a.stmt_ids.len) { ret false; }
+        val sid: ast_id.StmtId = ctx.scope.a.stmt_ids.data[i];
+        if (held && stmt_names(ctx, sid, scan.sym, 0)) { ret false; }
+        scan.holds = false;
+        if (!scan_stmt(ctx, scan, sid, i + 1, end)) { ret false; }
+        held = held || scan.holds;
+        i    = i + 1;
     }
+    scan.holds = outer || held;
     ret true;
 }
 
-fun returns_stmt(ctx: *lower_context.LowerContext, sym: resolve.SymbolId, sid: ast_id.StmtId, returns: *u32) bool {
+# whether one statement, at `rest` to `end` in its list, keeps the candidate the slot
+fun scan_stmt(ctx: *lower_context.LowerContext, scan: *Scan, sid: ast_id.StmtId, rest: u32, end: u32) bool {
     if (ast_id.stmt_is_nil(sid)) { ret true; }
     val opt_stmt: opt[*ast_stmt.Stmt] = ast.get_stmt(ctx.scope.a, sid);
     if (sel opt_stmt.none) { ret false; }
@@ -173,16 +208,42 @@ fun returns_stmt(ctx: *lower_context.LowerContext, sym: resolve.SymbolId, sid: a
     val k: ast_stmt.StmtKind = s.kind;
     if (k == ast_stmt.STMT_KIND_FIN) { ret false; }
     if (k == ast_stmt.STMT_KIND_RET) {
-        if (!resolve.symbol_same(lower_context.expr_symbol_of(ctx, s.data.ret_.value), sym)) { ret false; }
         val res_expression: res[ast_expr.Expr, fail.Fail] = lower_context.expression(ctx, s.data.ret_.value);
-        if (sel res_expression.err)                             { ret false; }
-        if (res_expression.ok.kind != ast_expr.EXPR_KIND_IDENT) { ret false; }
-        @returns = @returns + 1;
+        if (sel res_expression.err) { ret false; }
+        if (res_expression.ok.kind == ast_expr.EXPR_KIND_IDENT && resolve.symbol_same(lower_context.expr_symbol_of(ctx, s.data.ret_.value), scan.sym)) {
+            scan.returns = scan.returns + 1;
+            ret true;
+        }
+        ret slot_safe(ctx, s.data.ret_.value, scan.sym);
+    }
+    if (k == ast_stmt.STMT_KIND_DECL) {
+        if (!scan.pairs) { ret true; }
+        val opt_other: opt[resolve.SymbolId] = may_hold(ctx, s.data.decl.decl, rest, end);
+        if (sel opt_other.none) { ret true; }
+        scan.holds = true;
+        val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(ctx.scope.a, s.data.decl.decl);
+        if (sel opt_decl.none) { ret false; }
+        ret slot_safe(ctx, opt_decl.some.data.bind.init, scan.sym);
+    }
+    if (k == ast_stmt.STMT_KIND_BLOCK) { ret scan_list(ctx, scan, s.data.block.stmts_start, s.data.block.stmts_start + s.data.block.stmts_len); }
+    if (k == ast_stmt.STMT_KIND_IF) {
+        val outer: bool = scan.holds;
+        if (!scan_stmt(ctx, scan, s.data.if_.then_block, 0, 0)) { ret false; }
+        val then_held: bool = scan.holds;
+        scan.holds = false;
+        if (!scan_stmt(ctx, scan, s.data.if_.else_block, 0, 0)) { ret false; }
+        scan.holds = outer || then_held || scan.holds;
         ret true;
     }
-    if (k == ast_stmt.STMT_KIND_BLOCK) { ret returns_only(ctx, sym, s.data.block.stmts_start, s.data.block.stmts_start + s.data.block.stmts_len, returns); }
-    if (k == ast_stmt.STMT_KIND_IF)    { ret returns_stmt(ctx, sym, s.data.if_.then_block, returns) && returns_stmt(ctx, sym, s.data.if_.else_block, returns); }
-    if (k == ast_stmt.STMT_KIND_FOR)   { ret returns_stmt(ctx, sym, s.data.for_.body, returns); }
+    if (k == ast_stmt.STMT_KIND_FOR) {
+        # a later iteration runs after a declaration in the body, so the loop names the candidate nowhere
+        val outer: bool = scan.holds;
+        scan.holds = false;
+        if (!scan_stmt(ctx, scan, s.data.for_.body, 0, 0))   { ret false; }
+        if (scan.holds && stmt_names(ctx, sid, scan.sym, 0)) { ret false; }
+        scan.holds = outer || scan.holds;
+        ret true;
+    }
     if (k == ast_stmt.STMT_KIND_COMPTIME_IF) {
         var b: u32 = 0;
         for (b < s.data.comptime_if.branches_len) {
@@ -195,17 +256,202 @@ fun returns_stmt(ctx: *lower_context.LowerContext, sym: resolve.SymbolId, sid: a
                 if (sel opt_verdict.none) { ret false; }
                 active = opt_verdict.some;
             }
-            if (active) { ret returns_only(ctx, sym, branch.body_start, branch.body_start + branch.body_len, returns); }
+            if (active) { ret scan_list(ctx, scan, branch.body_start, branch.body_start + branch.body_len); }
             b = b + 1;
         }
         ret true;
     }
-    if (k == ast_stmt.STMT_KIND_COMPTIME_EACH) {
-        var none: u32 = 0;
-        if (!returns_only(ctx, resolve.SYMBOL_NIL, s.data.comptime_each.body_start, s.data.comptime_each.body_start + s.data.comptime_each.body_len, ?none)) { ret false; }
-        ret true;
+    if (k == ast_stmt.STMT_KIND_COMPTIME_EACH) { ret !list_exits(ctx, s.data.comptime_each.body_start, s.data.comptime_each.body_len, 0); }
+    ret true;
+}
+
+# whether any of the `len` statements from `start` of the statement id table, or one nested in them, is a return, a
+# `fin` or a declaration, anything not read taken to be
+fun list_exits(ctx: *lower_context.LowerContext, start: u32, len: u32, depth: u32) bool {
+    if (depth > NAMES_DEPTH) { ret true; }
+    var i: u32 = 0;
+    for (i < len) {
+        val pool_ix: u32 = start + i;
+        if (pool_ix::usize >= ctx.scope.a.stmt_ids.len) { ret true; }
+        val opt_stmt: opt[*ast_stmt.Stmt] = ast.get_stmt(ctx.scope.a, ctx.scope.a.stmt_ids.data[pool_ix]);
+        if (sel opt_stmt.none)                         { ret true; }
+        if (stmt_exits(ctx, opt_stmt.some, depth + 1)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun stmt_exits(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt, depth: u32) bool {
+    val k: ast_stmt.StmtKind = s.kind;
+    if (k == ast_stmt.STMT_KIND_RET || k == ast_stmt.STMT_KIND_FIN || k == ast_stmt.STMT_KIND_DECL) { ret true; }
+    if (k == ast_stmt.STMT_KIND_BLOCK)                                                              { ret list_exits(ctx, s.data.block.stmts_start, s.data.block.stmts_len, depth); }
+    if (k == ast_stmt.STMT_KIND_IF)                                                                 { ret arm_exits(ctx, s.data.if_.then_block, depth) || arm_exits(ctx, s.data.if_.else_block, depth); }
+    if (k == ast_stmt.STMT_KIND_FOR)                                                                { ret arm_exits(ctx, s.data.for_.body, depth); }
+    if (k == ast_stmt.STMT_KIND_COMPTIME_IF) {
+        var b: u32 = 0;
+        for (b < s.data.comptime_if.branches_len) {
+            val branch_ix: u32 = s.data.comptime_if.branches_start + b;
+            if (branch_ix::usize >= ctx.scope.a.comptime_branches.len) { ret true; }
+            val branch: *ast_decl.ComptimeBranch = ?ctx.scope.a.comptime_branches.data[branch_ix];
+            if (list_exits(ctx, branch.body_start, branch.body_len, depth)) { ret true; }
+            b = b + 1;
+        }
+        ret false;
+    }
+    if (k == ast_stmt.STMT_KIND_COMPTIME_EACH) { ret list_exits(ctx, s.data.comptime_each.body_start, s.data.comptime_each.body_len, depth); }
+    ret false;
+}
+
+fun arm_exits(ctx: *lower_context.LowerContext, sid: ast_id.StmtId, depth: u32) bool {
+    if (ast_id.stmt_is_nil(sid)) { ret false; }
+    val opt_stmt: opt[*ast_stmt.Stmt] = ast.get_stmt(ctx.scope.a, sid);
+    if (sel opt_stmt.none) { ret true; }
+    ret stmt_exits(ctx, opt_stmt.some, depth + 1);
+}
+
+# the local the declaration `did` binds, where it may be the slot too: a `val` or `var` of the result's type held in a
+# slot, which nothing moves (`unmoved`) and whose own scope, the statements from `start` to `end`, returns it and keeps
+# it the slot by every rule but its own judgement against later locals. none for any other declaration
+fun may_hold(ctx: *lower_context.LowerContext, did: ast_id.DeclId, start: u32, end: u32) opt[resolve.SymbolId] {
+    val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(ctx.scope.a, did);
+    if (sel opt_decl.none) { ret opt[resolve.SymbolId].none{}; }
+    val d: *ast_decl.Decl = opt_decl.some;
+    if (d.kind != ast_decl.DECL_KIND_VAL && d.kind != ast_decl.DECL_KIND_VAR) { ret opt[resolve.SymbolId].none{}; }
+    val tid:    type_kind.TypeId     = lower_context.decl_type_of(ctx, did);
+    val res_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, tid);
+    if (sel res_ir.err)                     { ret opt[resolve.SymbolId].none{}; }
+    if (!irt.same(res_ir.ok, ctx.ret_type)) { ret opt[resolve.SymbolId].none{}; }
+    val sym: resolve.SymbolId = decl_symbol_of(ctx, did);
+    if (!unmoved(ctx, sym))                                                                       { ret opt[resolve.SymbolId].none{}; }
+    if (d.kind == ast_decl.DECL_KIND_VAL && lower_context.binds_direct(ctx, sym, tid, res_ir.ok)) { ret opt[resolve.SymbolId].none{}; }
+    var scan: Scan = Scan{sym: sym, returns: 0, pairs: false, holds: false};
+    if (!scan_list(ctx, ?scan, start, end) || scan.returns == 0) { ret opt[resolve.SymbolId].none{}; }
+    ret opt[resolve.SymbolId].some{sym};
+}
+
+# whether building the value of `eid` in the slot reads the local `sym` only before it writes the slot: `eid` names it
+# nowhere, or `eid` is a call naming it only in its callee and arguments, all read before the callee writes its result,
+# or a tag literal whose payload is such a call or a scalar, all evaluated before the payload's store, of a tag that is
+# not zeroed whole first (`lower_expr.case_literal`)
+fun slot_safe(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, sym: resolve.SymbolId) bool {
+    if (!expr_names(ctx, eid, sym, 0)) { ret true; }
+    val res_expression: res[ast_expr.Expr, fail.Fail] = lower_context.expression(ctx, eid);
+    if (sel res_expression.err)                            { ret false; }
+    if (res_expression.ok.kind == ast_expr.EXPR_KIND_CALL) { ret true; }
+    val opt_payload: opt[ast_id.ExprId] = lower_expr.case_literal(ctx, eid);
+    if (sel opt_payload.none) { ret false; }
+    val payload:     ast_id.ExprId                 = opt_payload.some;
+    val res_payload: res[ast_expr.Expr, fail.Fail] = lower_context.expression(ctx, payload);
+    if (sel res_payload.err)                            { ret false; }
+    if (res_payload.ok.kind == ast_expr.EXPR_KIND_CALL) { ret true; }
+    val res_ir: res[Type, fail.Fail] = lower_context.lower_type(ctx, lower_context.expr_type_of(ctx, payload));
+    if (sel res_ir.err) { ret false; }
+    ret !irt.is_aggregate(?ctx.m.types, res_ir.ok) && !irt.is_vector(?ctx.m.types, res_ir.ok);
+}
+
+# whether the statement `sid` may name the local `sym`, anything not read taken to
+fun stmt_names(ctx: *lower_context.LowerContext, sid: ast_id.StmtId, sym: resolve.SymbolId, depth: u32) bool {
+    if (ast_id.stmt_is_nil(sid)) { ret false; }
+    if (depth > NAMES_DEPTH)     { ret true; }
+    val opt_stmt: opt[*ast_stmt.Stmt] = ast.get_stmt(ctx.scope.a, sid);
+    if (sel opt_stmt.none) { ret true; }
+    val s: *ast_stmt.Stmt    = opt_stmt.some;
+    val k: ast_stmt.StmtKind = s.kind;
+    val d: u32               = depth + 1;
+    if (k == ast_stmt.STMT_KIND_EXPR)  { ret expr_names(ctx, s.data.expr.expr, sym, d); }
+    if (k == ast_stmt.STMT_KIND_RET)   { ret expr_names(ctx, s.data.ret_.value, sym, d); }
+    if (k == ast_stmt.STMT_KIND_BLOCK) { ret list_names(ctx, s.data.block.stmts_start, s.data.block.stmts_len, sym, d); }
+    if (k == ast_stmt.STMT_KIND_IF) {
+        ret expr_names(ctx, s.data.if_.cond, sym, d) || stmt_names(ctx, s.data.if_.then_block, sym, d) || stmt_names(ctx, s.data.if_.else_block, sym, d);
+    }
+    if (k == ast_stmt.STMT_KIND_FOR) { ret expr_names(ctx, s.data.for_.cond, sym, d) || stmt_names(ctx, s.data.for_.body, sym, d); }
+    if (k == ast_stmt.STMT_KIND_FIN) { ret stmt_names(ctx, s.data.fin_.body, sym, d); }
+    if (k == ast_stmt.STMT_KIND_DECL) {
+        val opt_decl: opt[*ast_decl.Decl] = ast.get_decl(ctx.scope.a, s.data.decl.decl);
+        if (sel opt_decl.none)                                                                            { ret true; }
+        if (opt_decl.some.kind != ast_decl.DECL_KIND_VAL && opt_decl.some.kind != ast_decl.DECL_KIND_VAR) { ret false; }
+        ret expr_names(ctx, opt_decl.some.data.bind.init, sym, d);
+    }
+    # an asm block names no candidate, which nothing names in one (`unmoved`)
+    if (k == ast_stmt.STMT_KIND_BRK || k == ast_stmt.STMT_KIND_CNT || k == ast_stmt.STMT_KIND_ASM || k == ast_stmt.STMT_KIND_COMPTIME_DIRECTIVE) { ret false; }
+    if (k == ast_stmt.STMT_KIND_COMPTIME_IF) {
+        var b: u32 = 0;
+        for (b < s.data.comptime_if.branches_len) {
+            val branch_ix: u32 = s.data.comptime_if.branches_start + b;
+            if (branch_ix::usize >= ctx.scope.a.comptime_branches.len) { ret true; }
+            val branch: *ast_decl.ComptimeBranch = ?ctx.scope.a.comptime_branches.data[branch_ix];
+            if (list_names(ctx, branch.body_start, branch.body_len, sym, d)) { ret true; }
+            b = b + 1;
+        }
+        ret false;
+    }
+    if (k == ast_stmt.STMT_KIND_COMPTIME_EACH) { ret list_names(ctx, s.data.comptime_each.body_start, s.data.comptime_each.body_len, sym, d); }
+    ret true;
+}
+
+val NAMES_DEPTH: u32 = 64;
+
+fun list_names(ctx: *lower_context.LowerContext, start: u32, len: u32, sym: resolve.SymbolId, depth: u32) bool {
+    var i: u32 = 0;
+    for (i < len) {
+        val pool_ix: u32 = start + i;
+        if (pool_ix::usize >= ctx.scope.a.stmt_ids.len)                      { ret true; }
+        if (stmt_names(ctx, ctx.scope.a.stmt_ids.data[pool_ix], sym, depth)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether the expression `eid` may name the local `sym`, anything not read taken to
+fun expr_names(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, sym: resolve.SymbolId, depth: u32) bool {
+    if (ast_id.expr_is_nil(eid)) { ret false; }
+    if (depth > NAMES_DEPTH)     { ret true; }
+    val res_expression: res[ast_expr.Expr, fail.Fail] = lower_context.expression(ctx, eid);
+    if (sel res_expression.err) { ret true; }
+    var held: ast_expr.Expr     = res_expression.ok;
+    val e:    *ast_expr.Expr    = ?held;
+    val k:    ast_expr.ExprKind = e.kind;
+    val d:    u32               = depth + 1;
+    if (k == ast_expr.EXPR_KIND_IDENT) { ret resolve.symbol_same(lower_context.expr_symbol_of(ctx, eid), sym); }
+    if (k == ast_expr.EXPR_KIND_LIT_INT || k == ast_expr.EXPR_KIND_LIT_FLOAT || k == ast_expr.EXPR_KIND_LIT_CHAR || k == ast_expr.EXPR_KIND_LIT_STR
+        || k == ast_expr.EXPR_KIND_LIT_NIL || k == ast_expr.EXPR_KIND_COMPTIME_IDENT || k == ast_expr.EXPR_KIND_TYPE_REF) { ret false; }
+    if (k == ast_expr.EXPR_KIND_BINARY) { ret expr_names(ctx, e.data.binary.lhs, sym, d) || expr_names(ctx, e.data.binary.rhs, sym, d); }
+    if (k == ast_expr.EXPR_KIND_UNARY)  { ret expr_names(ctx, e.data.unary.operand, sym, d); }
+    if (k == ast_expr.EXPR_KIND_CALL || k == ast_expr.EXPR_KIND_GENERIC_INSTANCE) {
+        ret expr_names(ctx, e.data.call.callee, sym, d) || expr_names(ctx, e.data.call.index_callee, sym, d) || pool_names(ctx, e.data.call.args_start, e.data.call.args_len, sym, d);
+    }
+    if (k == ast_expr.EXPR_KIND_INDEX)      { ret expr_names(ctx, e.data.index.object, sym, d) || expr_names(ctx, e.data.index.index, sym, d) || expr_names(ctx, e.data.index.count, sym, d); }
+    if (k == ast_expr.EXPR_KIND_MEMBER)     { ret expr_names(ctx, e.data.member.object, sym, d); }
+    if (k == ast_expr.EXPR_KIND_PROJECT)    { ret expr_names(ctx, e.data.project.object, sym, d) || expr_names(ctx, e.data.project.field, sym, d); }
+    if (k == ast_expr.EXPR_KIND_CAST)       { ret expr_names(ctx, e.data.cast.value, sym, d); }
+    if (k == ast_expr.EXPR_KIND_STRIP)      { ret expr_names(ctx, e.data.strip.value, sym, d); }
+    if (k == ast_expr.EXPR_KIND_SPREAD)     { ret expr_names(ctx, e.data.spread.inner, sym, d); }
+    if (k == ast_expr.EXPR_KIND_SEL)        { ret expr_names(ctx, e.data.sel.place, sym, d) || expr_names(ctx, e.data.sel.case_desc, sym, d); }
+    if (k == ast_expr.EXPR_KIND_ARRAY_LIT)  { ret pool_names(ctx, e.data.array_lit.elems_start, e.data.array_lit.elems_len, sym, d); }
+    if (k == ast_expr.EXPR_KIND_VECTOR_LIT) { ret pool_names(ctx, e.data.vector_lit.elems_start, e.data.vector_lit.elems_len, sym, d); }
+    if (k == ast_expr.EXPR_KIND_STRUCT_LIT) {
+        if (pool_names(ctx, e.data.struct_lit.elems_start, e.data.struct_lit.elems_len, sym, d)) { ret true; }
+        var i: u32 = 0;
+        for (i < e.data.struct_lit.fields_len) {
+            val pool_ix: u32 = e.data.struct_lit.fields_start + i;
+            if (pool_ix::usize >= ctx.scope.a.field_inits.len)                        { ret true; }
+            if (expr_names(ctx, ctx.scope.a.field_inits.data[pool_ix].value, sym, d)) { ret true; }
+            i = i + 1;
+        }
+        ret false;
     }
     ret true;
+}
+
+fun pool_names(ctx: *lower_context.LowerContext, start: u32, len: u32, sym: resolve.SymbolId, depth: u32) bool {
+    var i: u32 = 0;
+    for (i < len) {
+        val pool_ix: u32 = start + i;
+        if (pool_ix::usize >= ctx.scope.a.expr_ids.len)                      { ret true; }
+        if (expr_names(ctx, ctx.scope.a.expr_ids.data[pool_ix], sym, depth)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 fun lower_expr_stmt(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt) err[fail.Fail] {
@@ -238,18 +484,6 @@ fun lower_block(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt) err[fail.Fa
     ret lower_context.end_scopes_from(ctx, scope);
 }
 
-# the arm `body` of a condition `cond`, with the case of the local a `sel` condition tests known
-# within it where nothing changes that case (`lower_expr.fixed_case`)
-fun lower_arm(ctx: *lower_context.LowerContext, cond: ast_id.ExprId, body: ast_id.StmtId) err[fail.Fail] {
-    val opt_known: opt[lower_context.Known] = lower_expr.fixed_case(ctx, cond);
-    if (sel opt_known.none) { ret lower_stmt(ctx, body); }
-    var frame: lower_context.Known = opt_known.some;
-    frame.prev = ctx.known;
-    ctx.known  = ?frame;
-    fin { ctx.known = frame.prev; }
-    ret lower_stmt(ctx, body);
-}
-
 fun lower_if(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt) err[fail.Fail] {
     val res_then: res[id.Block, fail.Fail] = builder.block_make(?ctx.builder);
     if (sel res_then.err) {
@@ -275,7 +509,7 @@ fun lower_if(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt) err[fail.Fail]
     if (sel err_cbr.err) { ret err_cbr; }
 
     builder.set_block(?ctx.builder, then_b);
-    val err_then_body: err[fail.Fail] = lower_arm(ctx, s.data.if_.cond, s.data.if_.then_block);
+    val err_then_body: err[fail.Fail] = lower_stmt(ctx, s.data.if_.then_block);
     if (sel err_then_body.err) { ret err_then_body; }
     if (!lower_context.block_terminated(ctx)) {
         val err_emit_br: err[fail.Fail] = builder.emit_br(?ctx.builder, merge_b);
@@ -407,10 +641,8 @@ fun lower_ret(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt) err[fail.Fail
             # a local that is the slot itself is read in place onto itself
             val itself: bool = borrowed && v.kind == value.VAL_SSA && v.id == slot.id;
             if (!built && !itself) {
-                # a tag read in place whose case is known moves that case alone, outside a function that
-                # requires constant time, whose walk takes the bytes no store wrote as stale (mirl.pass.analysis.slots)
-                var opt_known: opt[*lower_context.Known] = opt[*lower_context.Known].none{};
-                if (borrowed && !v.whole && !lower_context.building_constant_time(ctx)) { opt_known = lower_context.known_case(ctx, s.data.ret_.value); }
+                # a tag read in place whose case is known moves that case alone (`lower_expr.known_case`)
+                val opt_known: opt[lower_expr.Known] = lower_expr.known_case(ctx, s.data.ret_.value, v, borrowed);
                 if (sel opt_known.some) {
                     val err_moved: err[fail.Fail] = lower_expr.copy_known(ctx, slot, v, opt_known.some);
                     if (sel err_moved.err) { ret err_moved; }
@@ -577,8 +809,9 @@ fun lower_decl_stmt(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt) err[fai
     if (!ast_id.expr_is_nil(d.data.bind.init)) {
         # the slot is fresh storage and the store follows the read directly, so an aggregate
         # initializer is copied from its source with no snapshot
-        var init:  value.Value = value.none();
-        var built: bool        = false;
+        var init:     value.Value = value.none();
+        var built:    bool        = false;
+        var borrowed: bool        = false;
         if (sel opt_early.some) { init = opt_early.some; }
         or {
             # a literal or a call's result is built in the slot itself, which nothing reads yet
@@ -591,7 +824,6 @@ fun lower_decl_stmt(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt) err[fai
             ctx.into_eid   = d.data.bind.init;
             ctx.into_slot  = slot;
             ctx.into_hit   = false;
-            var borrowed: bool                        = false;
             val res_init: res[value.Value, fail.Fail] = lower_expr.lower_stored_rvalue(ctx, d.data.bind.init, true, ?borrowed);
             built          = ctx.into_hit;
             ctx.into_armed = saved_armed;
@@ -604,7 +836,7 @@ fun lower_decl_stmt(ctx: *lower_context.LowerContext, s: *ast_stmt.Stmt) err[fai
             init = res_init.ok;
         }
         if (!built) {
-            val err_store: err[fail.Fail] = lower_expr.store_stated(ctx, init, slot, lower_context.decl_type_of(ctx, did), lower_expr.type_is_volatile_record(ctx, lower_context.decl_type_of(ctx, did)));
+            val err_store: err[fail.Fail] = lower_expr.store_known(ctx, d.data.bind.init, init, borrowed, slot, lower_context.decl_type_of(ctx, did), lower_expr.type_is_volatile_record(ctx, lower_context.decl_type_of(ctx, did)));
             if (sel err_store.err) { ret err_store; }
         }
         birth_val = init;

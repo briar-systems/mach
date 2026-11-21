@@ -119,6 +119,19 @@ pub rec Builder {
     sources:  *base_source.SourceMap;
     files:    vector.Vector[u32];
     failure:  opt[fail.Fail];
+    # the block the statement whose temporaries are scoped began in, none outside one (`temps_begin`)
+    temp_at: opt[id.Block];
+    # the temporaries whose storage has begun and not ended, the statement's last
+    temps: vector.Vector[value.Value];
+}
+
+# how the scoping of temporaries stood before a statement took it over (`temps_begin`)
+# ---
+# at:   the block the enclosing statement began in, none where it scopes none
+# from: how many temporaries had begun before the statement
+pub rec Temps {
+    at:   opt[id.Block];
+    from: usize;
 }
 
 val NO_BLOCK: id.Block = 0xFFFFFFFF;
@@ -151,6 +164,8 @@ pub fun init(m: *module.Module, a: *A.Allocator, target: *mirl_record.Target, ct
     b.sources   = sources;
     b.files     = vector.init[u32](a);
     b.failure   = opt[fail.Fail].none{};
+    b.temp_at   = opt[id.Block].none{};
+    b.temps     = vector.init[value.Value](a);
     ret b;
 }
 
@@ -160,6 +175,7 @@ pub fun init(m: *module.Module, a: *A.Allocator, target: *mirl_record.Target, ct
 pub fun dnit(b: *Builder) {
     vector.dnit[bool](?b.ended);
     vector.dnit[u32](?b.files);
+    vector.dnit[value.Value](?b.temps);
 }
 
 # keep `f` as the builder's failure unless one is already kept
@@ -1487,9 +1503,60 @@ fun declassify_aggregate(b: *Builder, x: value.Value) res[value.Value, fail.Fail
     ret ok(out);
 }
 
-# a stack slot of `ty`, made in the entry block so every path reaches it
+# a stack slot of `ty` for a temporary, made in the entry block so every path reaches it (`temp_alloca`)
 pub fun emit_alloca(b: *Builder, ty: Type) res[value.Value, fail.Fail] {
-    ret alloca_aligned(b, ty, align_of(b, ty));
+    ret temp_alloca(b, ty, align_of(b, ty));
+}
+
+# take over the scoping of temporaries for the statement about to be lowered: `on` for a statement that evaluates its
+# expressions once, from the block it begins in, and hands no temporary's address past its end, as an expression
+# statement or a declaration does. any other statement scopes none of its own, and the statements nested in it scope
+# theirs
+pub fun temps_begin(b: *Builder, on: bool) Temps {
+    val kept: Temps = Temps{at: b.temp_at, from: b.temps.len};
+    if (on) { b.temp_at = opt[id.Block].some{b.block}; }
+    or      { b.temp_at = opt[id.Block].none{}; }
+    ret kept;
+}
+
+# end the storage of every temporary begun since `kept` was taken, the latest first, where control still reaches, and
+# give the scoping back to the enclosing statement. each was begun in the block its statement began in, which every
+# point of the statement lies past, so it is begun on every path to the statement's end, once, as the statement runs
+# no loop, and the statement reads it nowhere past its end
+pub fun temps_end(b: *Builder, kept: Temps) err[fail.Fail] {
+    var failed: err[fail.Fail] = err[fail.Fail].ok{};
+    if (!terminated(b)) {
+        var i: usize = b.temps.len;
+        for (i > kept.from) {
+            i = i - 1;
+            val err_ended: err[fail.Fail] = emit_scope(b, b.temps.data[i], false);
+            if (sel err_ended.err) {
+                failed = err_ended;
+                brk;
+            }
+        }
+    }
+    b.temps.len = kept.from;
+    b.temp_at   = kept.at;
+    ret failed;
+}
+
+# a stack slot of `ty` aligned to `align` for a temporary of the statement being lowered, made in the entry block. its
+# storage begins here, before its first write, where the statement scopes its temporaries and lowering still stands in
+# the block the statement began in, and ends where the statement ends (`temps_end`). made past a branch of the
+# statement, it is not marked, since the statement's end is reached by paths that did not begin it
+pub fun temp_alloca(b: *Builder, ty: Type, align: u64) res[value.Value, fail.Fail] {
+    val res_slot: res[value.Value, fail.Fail] = alloca_aligned(b, ty, align);
+    if (sel res_slot.err) { ret res_slot; }
+    if (sel b.temp_at.some) {
+        if (b.temp_at.some == b.block && !terminated(b)) {
+            val err_begun: err[fail.Fail] = emit_scope(b, res_slot.ok, true);
+            if (sel err_begun.err) { ret res[value.Value, fail.Fail].err{err_begun.err}; }
+            val res_pushed: res[usize, A.Error] = vector.push[value.Value](?b.temps, res_slot.ok);
+            if (sel res_pushed.err) { ret res[value.Value, fail.Fail].err{fail.refused(res_pushed.err)}; }
+        }
+    }
+    ret res_slot;
 }
 
 # a stack slot of `ty` aligned to `align`, made in the entry block so every path
@@ -2022,18 +2089,20 @@ pub fun emit_call_named(b: *Builder, callee: value.Value, sig: Type, args: *valu
         if (sel res_pushed.err) { ret res[value.Value, fail.Fail].err{fail.refused(res_pushed.err)}; }
         i = i + 1;
     }
+    # a slot of its own for an aggregate result is made, and its storage begun, ahead of the call, so nothing stands
+    # between the call and the store of its result
+    val rt:       Type                        = irt.result_of(t, sig);
+    var res_slot: res[value.Value, fail.Fail] = res[value.Value, fail.Fail].ok{into};
+    if (irt.is_aggregate(t, rt) && !(held && !into_set) && (!into_set || !irt.same(into.held, rt))) { res_slot = emit_alloca(b, rt); }
+    if (sel res_slot.err)                                                                           { ret res_slot; }
     var imm: [2]Immediate = [2]Immediate{Immediate.ty{sig}, Immediate.named{named}};
     mbuild.state_callee(?b.mb, stated);
     val call: id.Instruction = mbuild.emit(?b.mb, request(opcode.CALL, ops.data, ops.len::u32, ?imm[0], 2));
     if (mbuild.failed(?b.mb)) { ret after(b, value.none()); }
-    val rt: Type = irt.result_of(t, sig);
-    if (irt.is_none(rt)) { ret ok(value.none()); }
+    if (irt.is_none(rt))      { ret ok(value.none()); }
     val r: id.Value = mbuild.result(?b.mb, call, 0);
     if (irt.is_aggregate(t, rt) && held && !into_set) { ret ok(value.whole(r, rt, secret_of(b, r))); }
     if (irt.is_aggregate(t, rt)) {
-        var res_slot: res[value.Value, fail.Fail] = res[value.Value, fail.Fail].ok{into};
-        if (!into_set || !irt.same(into.held, rt)) { res_slot = emit_alloca(b, rt); }
-        if (sel res_slot.err)                      { ret res_slot; }
         val err_put: err[fail.Fail] = store_whole(b, r, rt, res_slot.ok, false);
         if (sel err_put.err) { ret res[value.Value, fail.Fail].err{err_put.err}; }
         var out: value.Value = value.retype(res_slot.ok, rt);
