@@ -2,7 +2,8 @@
 
 # mach.front.sema.guard
 
-tag payload guards: the lexical regions in which a payload place may be used
+tag payload guards: the lexical regions in which a payload place may be used, and the cases of
+a place a chain of `sel` tests leaves possible
 
 a tag payload place `P.c` is readable, writable and addressable only inside a guard for that
 place and case. a guard opens on `if (sel P.c)`, after a chain of exiting `sel` tests on one
@@ -31,8 +32,9 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 | [`loop_begin`](#loop_begin) | a loop runs its condition and body again after any assignment in them, so a guard open at the loop that an assignment inside it moves is ended for the whole loop |
 | [`fin_begin`](#fin_begin) | a `fin` body replays when its block ends, after the rest of the block, so inside the body a guard that an assignment in that rest moves does not hold |
 | [`fin_end`](#fin_end) | lets every guard the `fin` body `fin` hid hold again, once that body has been typed |
-| [`exit_chain_begin`](#exit_chain_begin) | a chain whose arms all test one place with `sel` or `!sel` and all exit leaves the block knowing which cases remain; when exactly one remains the rest of the block is guarded for it |
-| [`final_or_begin`](#final_or_begin) | a chain whose arms all test one place with `sel` or `!sel` reaches its final bare `or` knowing which cases remain, exiting or not; when exactly one remains the `or` body is guarded for it, as the rest of the block is after a chain that exits |
+| [`exit_chain_begin`](#exit_chain_begin) | a chain whose arms all test one place and all exit leaves the block knowing which cases remain; when exactly one remains the rest of the block is guarded for it |
+| [`final_or_begin`](#final_or_begin) | a chain whose arms all test one place reaches its final bare `or` knowing which cases remain, exiting or not; when exactly one remains the `or` body is guarded for it, as the rest of the block is after a chain that exits |
+| [`chain_exhausts`](#chain_exhausts) | whether the chain from `sid`, which has no bare `or`, tests every case of one place's tag, so that one of its arms is always entered |
 | [`check_assign`](#check_assign) | whole-value assignment to a guarded place, or to an object it is reached through, replaces the case and is refused; an assignment to anything else the place's spelling names moves it and ends the guard |
 | [`check_stable`](#check_stable) | the spelling rule `place_equal` implements, enforced where a guard place is written so an unmatchable place is rejected at the `sel` rather than at every read inside the region |
 | [`span_text_equal`](#span_text_equal) | whether two spans of the module's source hold the same text |
@@ -132,7 +134,7 @@ lets every guard the `fin` body `fin` hid hold again, once that body has been ty
 pub fun exit_chain_begin(sc: *mach.front.sema.context.SemaContext, sid: mach.front.ast.id.StmtId, frame: *mach.front.sema.context.Guard) res[bool, mach.base.fail.Fail]
 ```
 
-a chain whose arms all test one place with `sel` or `!sel` and all exit leaves the block knowing
+a chain whose arms all test one place and all exit leaves the block knowing
 which cases remain; when exactly one remains the rest of the block is guarded for it
 
 ### final_or_begin
@@ -141,9 +143,28 @@ which cases remain; when exactly one remains the rest of the block is guarded fo
 pub fun final_or_begin(sc: *mach.front.sema.context.SemaContext, sid: mach.front.ast.id.StmtId, frame: *mach.front.sema.context.Guard) res[bool, mach.base.fail.Fail]
 ```
 
-a chain whose arms all test one place with `sel` or `!sel` reaches its final bare `or` knowing
+a chain whose arms all test one place reaches its final bare `or` knowing
 which cases remain, exiting or not; when exactly one remains the `or` body is guarded for it,
 as the rest of the block is after a chain that exits
+
+### chain_exhausts
+
+```mach
+pub fun chain_exhausts(sc: *mach.front.sema.context.SemaContext, sid: mach.front.ast.id.StmtId) res[bool, mach.base.fail.Fail]
+```
+
+whether the chain from `sid`, which has no bare `or`, tests every case of one place's tag, so
+that one of its arms is always entered. this holds because every arm tests the one place
+`chain_place` matched by spelling, because the tests are `sel` reads of the discriminator that
+change nothing, so the case they read is the same in each, and because a tag always holds one of
+its declared cases. an arm that mixes a `sel` with anything else, by `&&` or otherwise, is not a
+test `arm_test` takes, and the chain is not exhaustive
+
+| Parameter | |
+| :--- | :--- |
+| `sc` | the sema context of the module being typed |
+| `sid` | the chain's head |
+| **returns** | true when no case of the place's tag is left possible after every arm fails its test |
 
 ### check_assign
 

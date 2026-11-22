@@ -23,7 +23,6 @@ Uses types from [`mach.base.diagnostic`](../../base/diagnostic.md), [`mach.base.
 | [`Walk`](#walk) | `rec` | the state of one walk over syntax, fresh at each body and scoped to the construct that sets it |
 | [`Expansion`](#expansion) | `rec` | an alias whose definition a walk is resolving, and the one whose definition named it |
 | [`SemaContext`](#semacontext) | `rec` | one sema walk |
-| [`StmtListVisitor`](#stmtlistvisitor) | `def` |  |
 
 | On `InstWorklist` | |
 | :--- | :--- |
@@ -1212,12 +1211,6 @@ pub fun decorator_arg_span(sc: *SemaContext, eid: mach.front.ast.id.ExprId, fall
 ```
 
 the span of decorator argument `eid`, or `fallback` when it cannot be read
-
-## StmtListVisitor
-
-```mach
-pub def StmtListVisitor: fun(ptr, *SemaContext, u32, u32) err[mach.base.fail.Fail]
-```
 
 ## Functions
 
