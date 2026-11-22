@@ -1,6 +1,7 @@
 # installs the mach release binary.
 #
 # MACH_VERSION      version to install (e.g. 1.2.3); defaults to the latest release
+# MACH_TARGET       target archive override (e.g. x86_64-windows)
 # MACH_INSTALL_DIR  install directory; set to skip the prompt; defaults to $env:LOCALAPPDATA\mach\bin
 # MACH_BASE_URL     release base url override (for testing)
 #

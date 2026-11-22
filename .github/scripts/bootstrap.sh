@@ -48,10 +48,15 @@ fetch() {
 }
 
 prev=
-for sha in $steps; do
-    bin=$root/$sha/mach$exe
+while read -r sha overrides || [ -n "${sha:-}" ]; do
+    case "$sha" in ""|\#*|seed) continue ;; esac
+    key=$sha
+    for ov in $overrides; do
+        key="${key}-${ov%=*}-${ov#*=}"
+    done
+    bin=$root/$key/mach$exe
     if [ ! -x "$bin" ]; then
-        src=$root/src-$sha
+        src=$root/src-$key
         fetch "$sha" "$src"
         if [ -z "$prev" ]; then
             # the seed reads only the previous major's manifest keys
@@ -64,18 +69,34 @@ for sha in $steps; do
             else
                 MACH_VERSION=$seed MACH_INSTALL_DIR=$dir sh dist/install.sh
             fi
-            mkdir -p "$root/$sha"
+            mkdir -p "$root/$key"
             (cd "$src" && bash .github/scripts/seed-build.sh "$dir/mach$exe" "$bin")
         else
-            mkdir -p "$root/$sha"
+            mkdir -p "$root/$key"
             # build -o refuses a path outside the project
-            (cd "$src" && "$prev" dep pull . && "$prev" build . -o "mach$exe")
+            (
+                cd "$src"
+                "$prev" dep pull .
+                for ov in $overrides; do
+                    dep=${ov%=*}
+                    pin=${ov#*=}
+                    git -C "dep/$dep" fetch --quiet --depth 1 origin "$pin"
+                    git -C "dep/$dep" checkout --quiet FETCH_HEAD
+                done
+                # 8bdc1b465 predates dialect-aware asm lexing (71faeddfe), so an apostrophe inside
+                # a // comment in darwin/aarch64.mach fails as an unterminated char literal
+                if [ "$sha" = 761e119834342662a9224301495ae3505b0ec548 ] && [ -f dep/std/src/runtime/darwin/aarch64.mach ]; then
+                    awk '{ gsub(/\/\//, "#"); print }' dep/std/src/runtime/darwin/aarch64.mach >dep/std/src/runtime/darwin/aarch64.mach.tmp
+                    mv dep/std/src/runtime/darwin/aarch64.mach.tmp dep/std/src/runtime/darwin/aarch64.mach
+                fi
+                "$prev" build . -o "mach$exe"
+            )
             mv "$src/mach$exe" "$bin"
         fi
         rm -rf "$src"
     fi
     prev=$bin
-done
+done < <(tr -d '\r' <"$chain")
 
 target=()
 if [ "$RUNNER_OS" = Windows ] && [ "${RUNNER_ARCH:-}" = ARM64 ]; then
