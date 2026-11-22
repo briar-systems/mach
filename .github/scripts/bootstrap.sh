@@ -83,6 +83,12 @@ while read -r sha overrides || [ -n "${sha:-}" ]; do
                     git -C "dep/$dep" fetch --quiet --depth 1 origin "$pin"
                     git -C "dep/$dep" checkout --quiet FETCH_HEAD
                 done
+                # 52b293da3 predates 4502a7336 (system env on non-spirv targets), which b03933133's
+                # mach.toml states for windows and darwin; 52b293da3 implies those environments without env
+                if [ "$sha" = b0393313348484d1c4da720ab8006d295d86b7ff ]; then
+                    awk '!/^env[[:space:]]*=[[:space:]]*"(msvc|macos)"/' mach.toml >mach.toml.tmp
+                    mv mach.toml.tmp mach.toml
+                fi
                 # 8bdc1b465 predates dialect-aware asm lexing (71faeddfe), so an apostrophe inside
                 # a // comment in darwin/aarch64.mach fails as an unterminated char literal
                 if [ "$sha" = 761e119834342662a9224301495ae3505b0ec548 ] && [ -f dep/std/src/runtime/darwin/aarch64.mach ]; then
