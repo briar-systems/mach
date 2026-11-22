@@ -57,7 +57,9 @@ for sha in $steps; do
             # the seed reads only the previous major's manifest keys
             dir=$RUNNER_TEMP/seed
             if [ "$RUNNER_OS" = Windows ]; then
-                MACH_VERSION=$seed MACH_INSTALL_DIR=$dir pwsh -NoProfile -File dist/install.ps1
+                seed_target=
+                [ "${RUNNER_ARCH:-}" = ARM64 ] && seed_target=x86_64-windows
+                MACH_VERSION=$seed MACH_INSTALL_DIR=$dir MACH_TARGET=$seed_target pwsh -NoProfile -File dist/install.ps1
                 dir=$(cygpath -u "$dir")
             else
                 MACH_VERSION=$seed MACH_INSTALL_DIR=$dir sh dist/install.sh
@@ -75,13 +77,18 @@ for sha in $steps; do
     prev=$bin
 done
 
+target=()
+if [ "$RUNNER_OS" = Windows ] && [ "${RUNNER_ARCH:-}" = ARM64 ]; then
+    target=(-t windows-aarch64)
+fi
+
 "$prev" dep pull .
-"$prev" build . --profile debug -o "a$exe"
+"$prev" build . --profile debug "${target[@]}" -o "a$exe"
 "./a$exe" dep pull .
-"./a$exe" build . --profile "$profile" --threads 2 -o "b$exe"
+"./a$exe" build . --profile "$profile" --threads 2 "${target[@]}" -o "b$exe"
 last=b$exe
 if [ "$fixpoint" = 1 ]; then
-    "./b$exe" build . --profile "$profile" --threads 3 -o "c$exe"
+    "./b$exe" build . --profile "$profile" --threads 3 "${target[@]}" -o "c$exe"
     cmp "b$exe" "c$exe" || { echo "::error::the $profile build did not reach its fixpoint"; exit 1; }
     last=c$exe
 fi

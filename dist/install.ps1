@@ -16,7 +16,13 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
 }
 
 $base = if ($env:MACH_BASE_URL) { $env:MACH_BASE_URL } else { 'https://github.com/briar-systems/mach/releases' }
-$target = 'x86_64-windows'
+$target = if ($env:MACH_TARGET) {
+    $env:MACH_TARGET
+} elseif ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
+    'aarch64-windows'
+} else {
+    'x86_64-windows'
+}
 
 if (-not [System.Environment]::Is64BitOperatingSystem) {
     throw 'install.ps1: unsupported host; mach requires 64-bit windows'
