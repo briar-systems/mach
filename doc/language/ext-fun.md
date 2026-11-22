@@ -189,7 +189,8 @@ The declaration carries no size of its own. The selected target declares what a
 `va_list` is on that platform, and the same source text binds correctly on every
 one of them. A target that declares none refuses the declaration by name rather
 than guessing, with `abi_type.unavailable` (on `vulkan-spirv`: ``the `va_list` of
-calling convention `shader` has no layout``).
+calling convention `shader` has no layout (mirl carries no convention of the
+target)``).
 
 ### Mach can forward one and never read one
 

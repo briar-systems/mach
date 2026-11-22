@@ -33,8 +33,9 @@ such that:
 A requirer is the root, a release resolution chose, or a dependency the root
 reaches by `ref` or `path`. The last declares its range in the closure directly,
 so two such dependencies naming one identity by range are two requirements of
-the same problem, and the error names each by its chain (`root -> c requires b
-<1.2`).
+the same problem, and the error names each by its chain, starting at the root
+project's id (`app -> c requires b <1.2` for a root whose id is `app`). Every
+chain and requirer in the messages below names the root by its id the same way.
 
 Among the choices that satisfy all three, it takes the highest release of each
 identity. The result is written as gitlinks, like any other pin. There is
@@ -50,21 +51,21 @@ that release.
 
 When nothing fits, the error lists every requirement that took part. When the
 identity at fault is one the root does not declare itself, it also names that
-identity as the one the root can settle. Here the root declares `a` and `c`,
-which disagree about `b`:
+identity as the one the root can settle. Here the root `app` declares `a` and
+`c`, which disagree about `b`:
 
 ```
 error[dep.unsatisfiable] no set of releases satisfies every requirement
     a 1.0.0 requires b ^2.0
     c 1.0.0 requires b ^1.2
-    root requires a ^1.0.0
-    root requires c ^1.0.0
+    app requires a ^1.0.0
+    app requires c ^1.0.0
   the root decides by declaring the identity itself, for example
     [dep.b]
     version = "<a range the root can use>"
 ```
 
-When the root already declares the identity (`root requires b ^1.2` among the
+When the root already declares the identity (`app requires b ^1.2` among the
 lines), declaring it is no way out, and the hint is left off.
 
 A release that needs a newer compiler appears as one of those lines (`b 2.0.0
@@ -172,8 +173,8 @@ not noted. `mach dep list` shows each root declaration's winning selection
 pinned release, `out of range (the pinned release 7.0.2 is outside ^8.0)`) and,
 under it, every requirement it overrides (`overrides hedgeacme -> hedge -> std, which requires
 ref = "tag/v2.1.0"`). `mach dep outdated` names the requirements of a chosen
-release that a root or a fixed dependency overrides (`root declares b by ref
-"branch/main", overriding root -> a 1.0.0 requires b ^1.2`).
+release that a root or a fixed dependency overrides (`app declares b by ref
+"branch/main", overriding app -> a 1.0.0 requires b ^1.2`).
 
 An override is not checked against the requirers. Because the closure is flat,
 a requirer's `use b.*` binds to whatever the root selected, even a major that
@@ -181,7 +182,7 @@ requirer was never built or tested against. Nothing proves the requirer supports
 it: a passing build only shows that the code the build reached compiled, so it is
 evidence and not a guarantee. `mach dep verify` prints a note for every edge an
 override replaced, without failing (`note dependency 'b' is declared by the root as
-ref = "tag/v2.0.0", overriding root -> a -> b, which requires version = "^1.2".
+ref = "tag/v2.0.0", overriding app -> a -> b, which requires version = "^1.2".
 nothing checks that 'b' accepts the root's selection`). Treat each note as a claim to
 confirm, by testing the requirer at that selection or by checking its own range.
 
@@ -202,7 +203,7 @@ tag. ...`), and `mach dep verify` refuses it, naming the chain and the
 offending line:
 
 ```
-error[dep.release_selector] root -> a is a release (ref = "tag/v1.1.0") whose manifest selects [dep.b] by ref = "branch/main", so it cannot be reproduced from its tag. declare [dep.b] in your root manifest, or have the dependency cut a release that selects it by `version` or an exact `tag/`
+error[dep.release_selector] app -> a is a release (ref = "tag/v1.1.0") whose manifest selects [dep.b] by ref = "branch/main", so it cannot be reproduced from its tag. declare [dep.b] in your root manifest, or have the dependency cut a release that selects it by `version` or an exact `tag/`
 ```
 
 A root declaration of the offending identity lifts the rule for it. Once the
@@ -217,7 +218,7 @@ release, not when its first consumer resolves it. A root `path` selection
 breaks it as a `branch/` one does:
 
 ```
-error[dep.release_selector] project 'root' is a release (checked by `mach dep verify --release`) whose manifest selects [dep.b] by ref = "branch/main", so it cannot be reproduced from its tag. select [dep.b] by `version` or an exact `tag/` before tagging
+error[dep.release_selector] project 'app' is a release (checked by `mach dep verify --release`) whose manifest selects [dep.b] by ref = "branch/main", so it cannot be reproduced from its tag. select [dep.b] by `version` or an exact `tag/` before tagging
 ```
 
 ## Pins are gitlinks, with no lock file
@@ -233,8 +234,11 @@ subdirectory of a repository, uses the gitlink the enclosing repository commits
 under its prefix (`test/consumer/dep/std` for a subproject at `test/consumer`)
 the same way: `pull` realizes that gitlink's commit and `update` moves it and
 stages it. Without such a gitlink, and in a filesystem project, Git dependencies
-are plain clones whose own checkout commits are verified. Local path dependencies
-are verified from their filesystem realizations, independently of any Git index.
+are plain clones whose own checkout commits are verified. A project in no
+repository records no pin at all: `mach dep list` lists no `pin=` for its Git
+dependencies, runs no Git command that needs a repository, and says once, as a
+note, that the project records no pins. Local path dependencies are verified
+from their filesystem realizations, independently of any Git index.
 
 A version range is resolved for the whole closure, not for the root's own
 declarations alone: a range a dependency declares, whether that dependency was
@@ -272,15 +276,17 @@ would resolve it:
 
 ```
 error[dep.conflict] project id 'b' is reached with two different selections
-    root -> a -> b requires git <url> @ tag/v1.0.0
-    root -> c -> b requires git <url> @ tag/v2.0.0
+    app -> a -> b requires git <url> @ tag/v1.0.0
+    app -> c -> b requires git <url> @ tag/v2.0.0
   the root decides by declaring the identity itself, for example
     [dep.b]
     git = "<url>"
     ref = "tag/v2.0.0"
 ```
 
-(`<url>` stands for the repository URL as declared.)
+(`<url>` stands for the repository's source as mach reads it: the URL as
+declared, or for a relative path the absolute path it names, which is also what
+a root declaration of it may write.)
 
 The root resolves by declaring the identity with a `ref`, which may point at
 upstream or at a fork carrying the same id. A fork slots in without any
@@ -342,7 +348,7 @@ that:
 
 A pin outside a range names the requirer chain, the range, the pinned release
 and a runnable remedy (`error[dep.version_unmet] dependency 'vb' is required
-by root -> a -> vb at version '^1.2', but the pinned release is 1.1.0. run
+by app -> a -> vb at version '^1.2', but the pinned release is 1.1.0. run
 `mach dep update <path> vb` for project '<root>' to re-pin it, or declare the
 identity at the root to override`). For a range the root declares itself the
 remedy ends `to re-pin it to the root's selection`, since nothing above the
@@ -365,7 +371,7 @@ each naming the identity and the command that fixes it:
   the manifest`);
 - a gitlink outside the manifest's selection. The root's own `tag/` or
   `commit/` must be satisfied by the pin (`error[dep.ref_mismatch] dependency
-  'b' has exact ref 'tag/v1.0.0', required by root -> b, which resolves to
+  'b' has exact ref 'tag/v1.0.0', required by app -> b, which resolves to
   '<commit>', but the realized commit is '<other>'. run `mach dep update <path>
   b` for project '<root>' to re-pin it to the root's selection`, and a root
   `commit/` that does not match reads `dependency 'b' has exact commit ref
@@ -379,7 +385,7 @@ selectors are not checked against its pin (the override notes above name them).
 For an identity the root does **not** declare, every requirer's exact selector
 (`tag/`, resolved through the checkout's own refs, or `commit/`) must be
 satisfied by the realized commit. A mismatch names both commits and the two
-remedies (`dependency 'b' has exact ref 'tag/v1.0.0', required by root -> a ->
+remedies (`dependency 'b' has exact ref 'tag/v1.0.0', required by app -> a ->
 b, which resolves to '<commit>', but the realized commit is '<other>'. run
 `mach dep update <path> b` for project '<root>' to re-pin it, or declare the
 identity at the root to override`). A `branch/` selector is an input to `update`, never a
@@ -400,15 +406,18 @@ dep verify` checks:
   declared selector from the declared source, and staged (`(registered the
   existing checkout)`);
 - with neither, the submodule is added at the selector, reusing a module
-  directory Git retained from an earlier removal.
+  directory Git retained from an earlier removal;
+- a checkout already where its record holds it is left as it is.
 
 Each step prints a [progress line](readout.md#progress-lines) on stdout, a verb
-in the gutter then the dependency and what was done:
+in the gutter then the dependency and what was done, and a Git dependency pull
+found already in place prints `unchanged` with its commit and selection, so a
+pull with nothing to do still names every dependency it checked:
 
 ```
   realized  std     1c484f5f57d9  branch/dev
    updated  std     1c484f5f57d9 -> 5a0e3d21b7c4
- unchanged  crypto  2c564d948fbc
+ unchanged  crypto  2c564d948fbc  tag/v1.4.0
   realized  helper  demo/../helper  (copy made from its source)
      added  [dep.helper]
 ```
@@ -429,12 +438,21 @@ A symlink, a file, a directory that is not a checkout of its own, and a dirty
 checkout that would be registered are refused and left as they are. `mach dep
 add` takes the same step for its Git source, so re-adding a dependency whose
 checkout `remove` retained registers that checkout, and it refuses a dirty one.
+A checkout that was already there, as one realized for a requirer or retained
+by `remove`, is then moved to the selector the command names, the way `mach dep
+update <path> <id>` moves it, and its gitlink is staged where the project
+records one (`updated  b  <commit> -> <other>  (pinned to the exact selector)`):
+`add` realizes a new dependency at its selector, and declaring one over an
+existing checkout is the same explicit request, so `add` never leaves a
+checkout that `mach dep verify` refuses. A dependency added by `version` is
+moved to the release resolution picks the same way.
 No gitlink command ever runs against a path that is not a checkout of its own.
 
 A path dependency has no pin, so `mach dep pull` syncs its `dep/<id>` with the
 declared `path` every time, and `mach dep update` does the same, once per
 command. Unless `--quiet`, each says whether the copy was made, refreshed or
-reused (`realized hedge from ../.. (copy made from its source)` when `dep/<id>`
+reused (`realized  hedge  ./../..  (copy made from its source)`, naming the
+source as the project root joined with the declared `path`, when `dep/<id>`
 did not exist, `(copy refreshed from its source)`, or `(copy reused: it already
 matched its source)`), so a copy left from another checkout cannot pass
 unnoticed. `mach dep add` of a path dependency makes the copy once and says so
@@ -444,6 +462,25 @@ named, and a file whose content differs from the source is overwritten and named
 (`replaced 'src/lib.mach' with its source's content`), so local edits to the
 copy do not survive a pull. A `dep/<id>` that is a symlink is refused and left
 as it is.
+
+**Relative sources.** A relative `path`, and a `git` value that is a relative
+local path (neither a URL with `scheme://` nor git's `host:path` form), is
+resolved against the directory of the manifest that declares it, never against
+the directory `mach` runs in. The root's own declarations resolve against the
+project root, so `mach dep add app vlib --git ../vlib` run from anywhere names
+the `vlib` beside `app`, and `add`, `pull`, `update`, `outdated` and `verify`
+all read it the same way. A path dependency's manifest is its source's, so a
+relative source it declares names a place beside that source, not beside its
+copy under `dep/`. A Git dependency's own manifest is read from its checkout at
+`dep/<id>`, so a relative `git` in it names a place beside that checkout, which
+a published package should never rely on. A relative `git` is resolved to an
+absolute path before Git sees it: Git's own rule for a relative submodule URL,
+against the superproject's remote, never applies, and `.gitmodules` records the
+absolute path, so a repository that records it is tied to that machine's
+layout, as the relative path already was. Git refuses to clone a submodule
+from a local path unless its `protocol.file.allow` setting is `always`, so in
+a repository root such a dependency needs that setting, while a project that
+records no gitlink clones it plainly.
 
 A project root is identified by its own `mach.toml`, not by an enclosing git
 repository, and `dep/<id>` is resolved relative to the project root. A project

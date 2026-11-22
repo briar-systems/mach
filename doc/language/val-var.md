@@ -103,7 +103,9 @@ or of a field or element of one. An address leaf keeps its symbol, so it crosses
 modules like any other member. An initializer, or a leaf of one, that has no
 compile-time value, such as a call or the address of a place behind a pointer,
 is rejected at that leaf with `global.init_not_constant`, noting the reason it
-has none.
+has none. An operator over vectors is no such form: `val SUM: f32x4 = A + B;` is
+refused with `comptime.operand_type`, saying that a vector operator is not
+evaluated at compile time.
 
 A scalar read through such a constant is a compile-time constant too: a field, a
 nested member, or an element of a record or array `val`, this module's or an
@@ -141,7 +143,8 @@ val TAIL: u64 = (?end)::u64 - (?start)::u64 + 8; # with a constant added or take
 ```
 
 Each address is `(?place)::T` or `(f)::T` for a function `f`, cast to an
-integer as wide as a pointer, where `?place` is any address a constant may hold
+integer as wide as a pointer (a cast of an address to another width is refused,
+naming both widths), where `?place` is any address a constant may hold
 (above). The constant added is any compile-time integer that fits in an `i64`,
 written after the address, or before it when added. The whole may be cast to
 another integer, which is the width the link fills. That width must be 4 or 8

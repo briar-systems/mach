@@ -165,7 +165,7 @@ There is no compiler `bool`. `bool` is a stdlib alias, `def bool: u1;`, with `tr
 A vector type is a **form**, not a fixed list: any primitive numeric element
 followed by `x` and a lane count.
 
-On a 128-bit target the spellings this currently accepts are:
+On a 128-bit target the spellings that fill one vector register are:
 
 ```mach fragment
 f16x8  f32x4  f64x2             # float lanes

@@ -34,6 +34,9 @@ id = "my-lib"
 
 ```
 error[manifest.invalid_name] mach.toml: [project].id "my-lib" is not allowed. a project id must start with a letter or '_' and hold only letters, digits and '_', so that a `use` path can name it
+  @ ./mach.toml:2:6
+2 | id = "my-lib"
+  |      ^^^^^^^^
 ```
 
 After:
@@ -67,30 +70,34 @@ binary project, `--check` printed:
 @@ -6,1 +6,1 @@ [project]
 -out     = "out/{target.name}/{profile.name}"
 +work    = "out/{target.name}/{profile.name}"
-@@ -9,2 +9,2 @@ [target.linux-x86_64]
+@@ -9,4 +9,3 @@ [target.linux-x86_64]
 -isa = "x86_64"
 -os  = "linux"
-+arch = "x86_64"
-+sys = "linux"
-@@ -12,1 +11,0 @@ [target.linux-x86_64]
+-abi = "sysv64"
 -default = true
++arch = "x86_64"
++sys  = "linux"
++abi  = "sysv64"
 @@ -16,1 +15,1 @@ [profile.debug]
 -opt = 0
 +optimize = false
 @@ -19,2 +17,0 @@ [profile.debug]
 -vectorize = true
 -float_reassoc = false
-@@ -33,1 +28,1 @@ [artifact.vapp]
+@@ -23,1 +20,1 @@ [profile.release]
+-opt = 2
++optimize = true
+@@ -31,1 +28,1 @@ [artifact.vapp]
 -out     = "bin/vapp"
 +out     = "{project.work}/bin/vapp"
---- src/bin/main.mach
-+++ src/bin/main.mach
+--- ./src/bin/main.mach
++++ ./src/bin/main.mach
 @@ -11,1 +11,1 @@
 -#[inline]
 +#[inline("always")]
 @@ -16,1 +16,1 @@
--$if ($mach.build.os == $mach.os.linux) {
-+$if ($mach.build.sys == $mach.sys.linux) {
+-    $if ($mach.build.os == $mach.os.linux) {
++    $if ($mach.build.sys == $mach.sys.linux) {
 dependency 'std' was not read, as dep/ holds no manifest for it
 dependency 'vlib' was not read, as dep/ holds no manifest for it
 ```
@@ -116,12 +123,14 @@ Each dependency must be on a release whose own manifest accepts mach 7. A
 dependency still on version 6 cannot be read at all, and `mach migrate` names it:
 
 ```
-dependency 'std' requires mach ^6, the previous major. it migrates as its own project
+dependency 'std' requires mach ^6.5, the previous major. it migrates as its own project
 ```
 
 ```
 error[manifest.removed_key] dependency 'std' cannot be read (mach.toml: [project].out is not allowed. write the work directory as `work`, which a template names `{project.work}`)
   @ ./dep/std/mach.toml:6:1
+6 | out     = "out/{target.name}/{profile.name}"
+  | ^^^
 ```
 
 Move each `[dep.<id>]` to a version 7 release (`mach dep update . <id>`), run
@@ -177,6 +186,8 @@ link = ["pthread"]
 ```
 error[link.input_invalid] the link refers to symbols nothing defines (src/bin/main.mach)
   note nothing defines `pthread_self`
+  note src/bin/main.mach refers to `pthread_self`
+  note /lib64/libpthread.so.0 depends on `libc.so.6`, which the link does not name
 ```
 
 After, with a `[link.c]` entry beside `[link.pthread]`:
@@ -211,9 +222,10 @@ the new name.
 
 ### Other manifest reports
 
-A spirv target listed beside other targets in one `bin` artifact and several
-default libraries in one manifest are reported by `mach migrate`. A darwin
-`source = "system"` entry named by a bare library name is refused by the link.
+A spirv target listed beside other targets in one `bin` artifact, several
+default libraries in one manifest, and a darwin `source = "system"` entry named by
+a bare library name are reported by `mach migrate`. The last is also refused by
+the link until it names the install name.
 The answer for each is in
 [migrate.md](doc/language/migrate.md#the-changes-from-6-to-7).
 
@@ -268,8 +280,8 @@ fun main(argc: i64, argv: **u8) i64 {
 ```
 
 `error[condition.type] a condition must have type u1`. When the condition is a
-`u8` read from a field or a variable, the message is `a condition of type u8 is a
-previous major's: a condition has type u1`. After:
+`u8`, as `flags & 1` is for a `u8` named `flags`, the message is `a condition of
+type u8 is a previous major's: a condition has type u1`. After:
 
 ```mach fragment
     if ((argc & 1) != 0) {
@@ -364,9 +376,10 @@ the low byte was the intent, write `(x & 0xff) != 0`.
 
 `mach migrate` rewrites `#[oblivious]` to `#[constant_time("soft")]`. A
 constant-time function may pass a secret only to a constant-time callee it names
-directly, since a function type states no mode
-([secrecy.md](doc/language/secrecy.md#calls)). Version 6 accepted a secret
-passed through a function value from an `#[oblivious]` function. Before:
+directly, or through a function value whose type is an alias marked
+`#[constant_time]` ([secrecy.md](doc/language/secrecy.md#calls)). Version 6
+accepted a secret passed through any function value from an `#[oblivious]`
+function. Before:
 
 ```mach error through a function value whose type states no constant-time mode
 use std.runtime;
@@ -390,7 +403,10 @@ fun main(argc: i64, argv: **u8) i64 {
 ```
 
 ```
-error[secret.call_untrusted] a constant-time function passes `*^u8`, which holds a secret, through a function value whose type states no constant-time mode. call a function declared constant time by name
+error[secret.call_untrusted] a constant-time function passes `*^u8`, which holds a secret, through a function value whose type states no constant-time mode. give the function type an alias marked `#[constant_time]`, or call a function declared constant time by name
+   @ apply.mach:10:5
+10 |     f(p);
+   |     ^^^^
 ```
 
 After, calling the callee by name:
@@ -402,45 +418,16 @@ fun apply(p: *^u8) {
 }
 ```
 
-Where the callee really varies, choose it outside the constant-time function
-and call each candidate by name.
-
-### An import nothing defines fails the link, even when unused
-
-An `ext fun` with no definition anywhere in the link is refused as soon as any
-function of the module calls it, whether or not that function is reachable from
-`main`. Version 6 linked such a program. Before:
-
-```mach error the link refers to symbols nothing defines
-use std.runtime;
-
-ext fun missing_here() i64;
-
-fun unused() i64 {
-    ret missing_here();
-}
-
-#[symbol("main")]
-fun main(argc: i64, argv: **u8) i64 {
-    ret 0;
-}
-```
-
-```
-error[link.input_invalid] the link refers to symbols nothing defines (before.mach)
-  note nothing defines `missing_here`
-```
-
-After, either link a library that defines it, or compile the code only on the
-targets that have it:
+Where the callee really varies, give the function value a marked alias as its
+type, and every function stored in it must be constant time itself:
 
 ```mach fragment
-$if ($mach.build.sys == $mach.sys.windows) {
-    ext fun missing_here() i64;
+#[constant_time("soft")]
+def Wipe: fun(*^u8);
 
-    fun unused() i64 {
-        ret missing_here();
-    }
+#[constant_time("soft")]
+fun apply(f: Wipe, p: *^u8) {
+    f(p);
 }
 ```
 
@@ -473,14 +460,18 @@ mach build . --pie       error[cli.flag_removed] option '--pie' is not allowed. 
 After:
 
 ```
-mach build . -O --debug --threads 2
+mach build . -p release --threads 2
 mach build . --emit ir --emit exe
 ```
+
+A flag that changes the selected profile, as `-O` or `--debug` does, writes a
+differently configured build, so it names its output with `-o` or `-w`:
+`mach build . -O --debug -o out/app-fast`.
 
 Two more that scripts carry:
 
 - `mach dep add ... --version <range>` is now `--range <range>`. The old flag is
-  refused as `cli.flag_unknown`.
+  refused as `cli.flag_removed`, naming `--range`.
 - `mach check` takes no `--threads`. Only `build`, `test` and `run` do, and a
   `--threads` on `mach check` is refused as `cli.flag_unknown`.
 
@@ -548,13 +539,13 @@ check` after the migration lists every site to change.
 - The layout under the work directory: `obj/`, and `ir/` and `asm/` for
   `--emit ir` and `--emit asm`
   ([manifest.md](doc/language/manifest.md#the-work-directory)).
-- Dependency pins are gitlinks under `dep/`, and `mach dep pull <path>`
+- A dependency is the files under `dep/<id>`, and `mach dep pull <path>`
   realizes them ([dependencies.md](doc/language/dependencies.md)).
 
 ## 10. Check the result
 
 ```
-mach migrate . --check      # prints nothing and exits 0
+mach migrate . --check      # prints no diff and exits 0
 mach fmt --check .
 mach check . --all
 mach test .

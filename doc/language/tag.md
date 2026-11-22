@@ -213,9 +213,9 @@ The operand is a place: a binding, a field, an index or a dereference, followed
 by exactly one case name of that place's tag type. A pointer to a tag is a place
 too: `sel p.case` with `p: *Reply` auto-dereferences the pointer once and tests
 its pointee, exactly as the payload place `p.value` already reads through it. A
-call or other temporary is not a place. The result is an ordinary `bool`, so it
-composes with `!`, `&&` and `||`, can initialize a `bool` binding, and can be
-returned.
+call or other temporary is not a place. The result is a `u1`, the type of std's
+`bool`, so it composes with `!`, `&&` and `||`, can initialize a `bool` binding,
+and can be returned.
 
 ```mach
 use std.types.bool.bool;

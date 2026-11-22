@@ -555,8 +555,8 @@ location 0 output.
 On `spirv` the Output `OpVariable` carries that value as its initializer: the
 constant the initializer spells, or `OpConstantNull` where it is zero or absent.
 SPIR-V and Vulkan both admit an initializer on an Output variable. An output that no
-entry point of the module reaches is in no interface list and the link drops its
-`OpVariable`.
+entry point of the module reaches is in no interface list and the module holds no
+`OpVariable` of it.
 
 As with `#[gpu.stage(...)]`, these are accepted on every target and acted on only by a
 target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in the
@@ -569,7 +569,9 @@ become `OpVariable`s in the `UniformConstant` class, the one class Vulkan permit
 handle variable in. A binding that holds a block becomes one in `Uniform` for
 `gpu.uniform` and in `StorageBuffer` for `gpu.storage`. A handle is never a
 `gpu.uniform` binding, and never sits in an array, both refused before code is made.
-Every binding carries `DescriptorSet` and `Binding`.
+Every binding carries `DescriptorSet` and `Binding`. Two bindings may name one set and
+binding: nothing refuses them, each variable carries that pair, and the module passes
+`spirv-val`.
 A `gpu.push` block becomes an `OpVariable`
 in the `PushConstant` class, with no `DescriptorSet` or `Binding`. A `gpu.shared` variable
 becomes an `OpVariable` in the `Workgroup` class, named in the interface of each entry
@@ -803,9 +805,8 @@ Where the typing data states the members, the `rec` must have exactly those memb
 of the type its rule asks, as `FrexpStruct`'s significand and exponent. A
 row whose result is a **truth value**, such as `OpGroupNonUniformElect`, is declared
 returning an integer, which receives 1 or 0, and one that gives a truth value per lane,
-as `OpIsNan` over a vector, returning an integer vector of those lanes. A `bool` return is an 8-bit integer,
-which a target without `Int8` carries at 32 bits like any other 8-bit local
-([manifest.md](manifest.md#finished-module-targets)), so the module needs no Int8 for it.
+as `OpIsNan` over a vector, returning an integer vector of those lanes. A `bool` return is a
+`u1`, which the module states as SPIR-V's boolean type, so it needs no `Int8`.
 
 ```mach
 #[intrinsic("spirv", "core", "OpControlBarrier")]

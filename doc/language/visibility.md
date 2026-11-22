@@ -69,7 +69,8 @@ kind is refused with `fun.bodyless`.
 
 A `kind = "shared"` artifact exports exactly the declarations marked
 [`#[export]`](decorators.md#export--a-shared-librarys-export), in any project of
-the build, and nothing else. `pub` states a module's interface to other Mach
+the build, and nothing else. `#[export]` needs `pub`, and one without it is
+refused with `decorator.requires`. `pub` states a module's interface to other Mach
 modules and never exports, so a `pub fun` is reachable from your code and absent
 from the library's export table. Every other definition, with or without `pub`,
 and every definition the compiler synthesizes, such as a generic or pack
@@ -78,7 +79,10 @@ consumer of the linked library can bind to it.
 
 `#[symbol("name")]` chooses the linker name, not the visibility. A declaration
 with a `#[symbol]` name and no `#[export]` is still hidden, so a C program cannot
-link against it. A function a C caller links against is `#[export]`.
+link against it. An export's linker name is its module-qualified Mach path,
+such as `example.lib.sh.area` for `area` in `src/lib/sh.mach`, unless
+`#[symbol]` names it. A function a C caller links against by a C name is
+`#[export]` with a `#[symbol]` name.
 
 A `fwd` re-export is a declaration of Mach surface and exports nothing from a
 library. A generic, comptime-parameter or pack declaration has instances rather

@@ -832,7 +832,7 @@ fun sum(data: *^u8, n: u64) ^u64 {
 }
 
 #[constant_time("soft")]
-fun seal_with(table: *[2]Cipher, which: u64, data: *^u8, n: u64) ^u64 {
+fun seal_with(table: *Cipher, which: u64, data: *^u8, n: u64) ^u64 {
     ret table[which].seal(data, n); # trusted as a direct call of a soft function
 }
 ```
@@ -1146,7 +1146,8 @@ instruction set's registration, and the kind of each claim is marked:
   table RVM, lists `mul`, `mulh`, `mulhsu`, `mulhu` and (rv64) `mulw`, and
   excludes `div` and `rem`. Zkt changes no instruction: it is a promise about
   the hart's timing, so like any selected extension it is assumed of every
-  machine the binary runs on. riscv32 declares no rows yet.
+  machine the binary runs on. riscv32 declares the same rows at its 32-bit width,
+  under the same condition.
 - **SPIR-V** has no timing model and declares nothing.
 
 **DOITM.** masc's x86-64 rows state the timing of Intel's "Data Operand
@@ -1265,7 +1266,7 @@ table by priority, a lower one first and every entry that states none after,
 so the probe runs before any other load-time function of the image, one that
 calls a `soft` function included. An executable keeps std's start: it has no
 table its loader runs before `_start`, so the entry would never run there, and
-a library initialiser can reach an executable's `soft` function before `main`
+a library initializer can reach an executable's `soft` function before `main`
 only through a pointer the executable gave it, in which case that call runs
 without the mode, as `soft` allows.
 

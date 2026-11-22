@@ -36,9 +36,12 @@ asm <selection> {
   verdict: a row's timing is read under the function's set, so a head lifts no row,
   and an extension it adds that gates timing can only refuse more.
 - **A head may add instruction extensions only.** It never sets execution state: an
-  x86 width, AArch64 streaming mode, `dit`, `doitm`, a RISC-V `xlen` other than the
-  target's. Those stay the function's, with `#[constant_time]` and the target, so a
-  head that sets one is refused with `asm.head`, naming them. An x86 width is
+  x86 width, AArch64 streaming mode, the DIT or DOITM timing mode, a RISC-V `xlen`
+  other than the target's. Those stay the function's, with `#[constant_time]` and the
+  target, so a head that sets one is refused with `asm.head`, as `rv32i` is on a
+  riscv64 target. `armv8-a+dit` sets no mode: it adds FEAT_DIT, the extension that
+  holds the `msr dit` instruction, which a block then writes itself (see
+  [System registers](#system-registers-aarch64)). An x86 width is
   switched inside a naked function's block instead (see [Code width](#code-width-x86)). A head that repeats
   the state the target enters at, as `rv64i` does on riscv64, sets nothing.
 - **WebAssembly reads a block as masc's wasm text.** The block starts and ends on an

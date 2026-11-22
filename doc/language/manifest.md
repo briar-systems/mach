@@ -56,8 +56,8 @@ carries the same place as the failure's `primary` span.
 
 ```
 error[manifest.invalid_value] mach.toml: [profile.debug].simd must be "scalarize" or "require", found "fast"
-   @ mach.toml:15:8
-15 | simd = "fast"
+   @ ./mach.toml:23:8
+23 | simd = "fast"
    |        ^^^^^^
 ```
 
@@ -74,8 +74,8 @@ fails the consumer's build pointing into the dependency's own file:
 
 ```
 error[manifest.unknown_key] dependency 'gfx' cannot be read (mach.toml: unknown key 'bogus' in [project])
-  @ ./dep/gfx/mach.toml:7:1
-7 | bogus = 1
+  @ ./dep/gfx/mach.toml:6:1
+6 | bogus = 1
   | ^^^^^
 ```
 
@@ -205,12 +205,12 @@ requirement and the chain that states it, pointing at the first unmet range in
 the manifest that states it:
 
 ```
-error[mach.version_unaccepted] this is mach 6.10.1, and the dependency closure does not accept it:
-    app (mach.toml) requires mach ^7
-    app -> gfx -> glfw requires mach >=7.2, <8
-  @ mach.toml:2:11
-2 | mach    = "^7"
-  |           ^^^^
+error[mach.version_unaccepted] this is mach 7.0.0, and the dependency closure does not accept it:
+    demo (mach.toml) requires mach >=7.1
+    demo -> gfx requires mach >=7.2, <8
+  @ ./mach.toml:4:8
+4 | mach = ">=7.1"
+  |        ^^^^^^^
 ```
 
 Every manifest must state `mach`, a dependency's included. One without it is
@@ -387,9 +387,9 @@ names it does hold:
 
 ```
 error[extension.unknown] mach.toml: [target.linux-x86_64] is invalid. the architecture has no extension named `sha2` (target, ext), and it accepts 3dnow, ace, adx, aes, amx_avx512, amx_bf16, amx_complex, amx_fp16, amx_fp8, amx_int8, amx_movrs, amx_tile, apx_f, apx_nci_ndd_nf, avx, avx10_1, avx10_2, avx10_v1_aux, avx10_v2_aux, avx10_vnni_int, avx2, avx512_4fmaps, avx512_4vnniw, avx512_bf16, avx512_bitalg, avx512_fp16, avx512_vbmi2, avx512_vnni, avx512_vp2intersect, avx512_vpopcntdq, avx512bw, avx512cd, avx512dq, avx512er, avx512f, avx512ifma, avx512pf, avx512vbmi, avx512vl, avx_ifma, avx_ne_convert, avx_vnni, avx_vnni_int16, avx_vnni_int8, bmi1, bmi2, cet, cldemote, clflush, clflushopt, clwb, clzero, cmov, cmpccxadd, cx16, cx8, enqcmd, f16c, fma, fma4, fred, fsgsbase, fxsr, gfni, hreset, ibhf, icache_prefetch, invlpgb, invpcid, keylocker, keylocker_wide, lahf, lkgs, lwp, lzcnt, mcommit, mmx, monitor, monitorx, movbe, movdir64b, movdiri, movrs, mpx, msr_imm, msrlist, osfxsr, osxsave, pbndkb, pclmul, pconfig, pku, popcnt, prefetchw, prefetchwt1, ptwrite, rao_int, rdpid, rdpru, rdrand, rdseed, rdtscp, rtm, sce, sep, serialize, sgx, sha, sha512, sm3, sm4, smap, smx, snp, sse, sse2, sse3, sse41, sse42, sse4a, ssse3, svm, tbm, tdx, tsx_ldtrk, uintr, user_msr, vaes, via_padlock_aes, via_padlock_pmm, via_padlock_rng, via_padlock_sha, vmfunc, vmx, vpclmulqdq, waitpkg, wbnoinvd, wrmsrns, x86-64, x86-64-v2, x86-64-v3, x86-64-v4, x87, xop, xsave, xsavec, xsaveopt, xsaves
-   @ ./mach.toml:18:7
-18 | ext = ["sha2"]
-   |       ^^^^^^^^
+  @ ./mach.toml:9:7
+9 | ext = ["sha2"]
+  |       ^^^^^^^^
 ```
 
 The array must hold strings, each an identifier (`sse41`, not `sse4.1`) or a level
@@ -482,7 +482,7 @@ A mnemonic or a register that needs an extension the target does not select,
 outside such a function, is refused, naming the instruction and what it needs:
 
 ```
-error[asm.extension] an asm block of 'app.main.f' uses `vaddps` with `ymm0`, which the target's extensions do not admit. select avx in the target's `isa` or `ext`, or in the function's `#[extension]`
+error[asm.extension] an asm block of 'demo.bin.main.f' uses `vaddps`, which the target's extensions do not admit. select avx in the target's `isa` or `ext`, or in the function's `#[extension]`
 ```
 
 The check runs where the block is assembled, so `mach build` reports it and
@@ -554,9 +554,10 @@ freestanding entry does, and whose target states no `stack_reserve` is refused, 
 the key:
 
 ```
-error[target.stack_size] mach.toml: [target.board] needs `stack_reserve`, because the image
-uses the bounds of the `.stack` section, which holds its stack. state the stack's size in
-bytes as `stack_reserve`
+error[target.stack_size] mach.toml: [target.board] needs `stack_reserve`, because the image uses the bounds of the `.stack` section, which holds its stack. state the stack's size in bytes as `stack_reserve`
+   @ ./mach.toml:35:9
+35 | [target.board]
+   |         ^^^^^
 ```
 
 **On a wasm module**, on `wasi` or freestanding, the runtime gives the module its linear memory and
@@ -591,16 +592,19 @@ target shares the value.
 
 | Axis  | Values |
 |-------|--------|
-| `arch` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv`, `wasm32` |
+| `arch` | `x86_64`, `aarch64`, `arm64ec`, `riscv64`, `riscv32`, `riscv32e`, `spirv`, `wasm32` |
 | `sys`  | `linux`, `windows`, `darwin`, `freestanding`, `uefi`, `vulkan`, `wasi` |
-| `abi` | `sysv64`, `win64`, `aapcs64`, `darwinpcs`, `aapcs64win`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `shader`, `basic` |
+| `abi` | `sysv64`, `win64`, `aapcs64`, `darwinpcs`, `aapcs64win`, `arm64ec`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `ilp32e`, `shader`, `basic` |
 | `of`  | `elf`, `macho`, `coff`, `flat`, `spirv`, `wasm` |
 | `env` | `gnu`, `macos`, `msvc`, `vulkan1.0`, `vulkan1.1`, `vulkan1.2`, `vulkan1.3`, `preview1` |
 
 Each `arch`, `sys` and `of` value is the name of a row of mink's catalog: `arch` an
 architecture, `sys` a system and `of` a format. mach reads the spelling from that row,
-and the catalog's rows mach has no target for (`x86`, ...)
-are not values here. A spelling mink names otherwise is refused where it is written,
+and the catalog's rows mach has no target for, the `x86` architecture with its
+`sysv32` convention and the `opencl` system with its `kernel` convention, are not
+values here. `arm64ec` is the architecture of `windows-arm64ec`, under its own
+`arm64ec` convention, and `riscv32e` is the RV32E base, under `ilp32e`, on
+`freestanding` alone. A spelling mink names otherwise is refused where it is written,
 naming the new spelling and carrying the rewrite `mach migrate` applies:
 
 | Key | Retired | Written now |
@@ -627,11 +631,10 @@ refused through the catalog's own lookup, listing what it accepts there:
 
 ```
 error[target.unsupported] mach.toml: [target.l] is invalid. no architecture is named `mos6502` (target, arch), and it accepts x86_64, x86, aarch64, riscv64, riscv32
+   @ ./mach.toml:35:8
+35 | arch = "mos6502"
+   |        ^^^^^^^^^
 ```
-
-A catalog row that no mach target is built on, such as
-`x86`, is named in that list and by `mach info targets`, and a target naming it
-is refused when mach assembles it (`no target can be assembled for arch x86, ...`).
 
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
 and runs natively in CI on every PR; `riscv64`-linux runs under qemu and
@@ -654,7 +657,8 @@ module that a host runtime instantiates (see [WebAssembly targets](#webassembly-
 target has, spelled as masc's catalog for the architecture spells a selection. A
 target with an operating system that names no `isa` stands on the **floor** mink
 states for that system and architecture: `riscv64` on `linux` is `rv64gc`, and
-`aarch64` on `linux` is `armv8-a+fp+simd`. A `freestanding` target must name its
+`aarch64` on `linux` is `armv8-a+fp+simd`. `riscv32` on `linux` states no floor, so
+such a target names its `isa` as a freestanding one does. A `freestanding` target must name its
 `isa`, since the chip decides it and a default would fault on hardware that lacks an
 extension; leaving it out is refused (`target.baseline_required`). A freestanding
 `wasm32` target is the exception: every host takes WebAssembly's core 1.0, so it
@@ -724,7 +728,8 @@ the conventions it declares per instruction set (`linux` and `darwin` refuse
 `darwinpcs` alone on `aarch64` and `windows` and `uefi` take `aapcs64win` alone)
 and `freestanding` accepts every convention the instruction set covers.
 
-`mach info targets` prints every target mink's catalog spells, one per line as
+`mach info targets` prints every target a build can be made for, the rows of mink's
+catalog whose architecture mirl carries under a convention the row accepts, one per line as
 `-t` takes it (`<sys>-<arch>`), then the environments, calling conventions, code
 models and executable linkages it accepts as `env=`, `abi=`, `code_model=` and
 `linkage=` lists, the default first and marked `*`. Linkages depend on the
@@ -735,7 +740,8 @@ that runs no executable, such as `vulkan-spirv`, lists `linkage=-`. `none` is th
 such as bare `linux`, and `-` stands for a part the target has no choices of.
 It marks `needs --isa` beside each whose system bounds the machine not at all,
 such as `freestanding-riscv32`, so a target spelled that way names its
-instruction set. The list is the catalog's, so mach holds no table of its own. `mach info` alone prints the tuple the host
+instruction set. The list is read from the catalog and mirl's carried conventions, so
+mach holds no table of its own. `mach info` alone prints the tuple the host
 resolves to.
 
 A value outside its axis's set is refused when the target resolves, so a typo is
@@ -750,7 +756,7 @@ and `wasm` on `wasi`, and `of` names a different one from the same closed set: `
 `coff`, `macho`, `flat`, `spirv`, `wasm`. `of` is optional. Omit it to
 take the default. A target accepts only the formats it can load, so an override it
 cannot enter is refused, listing those it writes (``the target writes no object
-format named `macho` (target, format), and it accepts elf``). Today only
+format named `macho` (target, format), and it accepts elf, flat``). Today only
 `freestanding` on an ELF architecture writes more than one, `elf` and `flat`.
 
 ```toml
@@ -768,8 +774,8 @@ so a `spirv` target resolves to `spirv`, the format that carries a finished
 module, which is also the only format `vulkan` accepts.
 
 An `of` naming a format whose emission shape does not match the instruction set's
-is refused with the system's list, as `of = "flat"` on a `vulkan` target is
-(``the system writes no object format named `flat` (target, format), and it accepts
+is refused with the formats the target writes, as `of = "flat"` on a `vulkan` target is
+(``the target writes no object format named `flat` (target, format), and it accepts
 spirv``), so the override cannot compose a tuple that would emit nothing.
 
 The page an image is laid out at is a function of the same tuple. A format a
@@ -813,7 +819,10 @@ names does when it is laid after them. An artifact with `size` and
 A `spirv` target's artifact is a `module`. Every source module the artifact holds,
 its dependencies' and the generic instances its stages reach included, compiles as one
 unit into one object, `<out>/obj/<entry module path>.o`, since the rules of a finished
-module span it whole. That object is a link input that carries the `Linkage`
+module span it whole. That object holds only what the artifact's stages reach: the
+functions they call, directly or through others, the module-level values and bindings
+those name, and nothing else, so a function, value or binding no stage reaches states no
+type and needs no capability of the target. It is a link input that carries the `Linkage`
 capability and is not a module a Vulkan consumer takes. mink's SPIR-V link writes it
 as one module at the artifact's resolved `out` (or `-o`), giving each id its index and
 laying out no sections, and drops the `Linkage` capability and every linkage
@@ -1294,6 +1303,9 @@ manifest error naming the table and the key:
 
 ```
 error[manifest.missing_required] mach.toml: [profile.debug] is missing required key 'simd'. a profile declares optimize, debug and simd
+   @ ./mach.toml:19:1
+19 | [profile.debug]
+   | ^^^^^^^^^^^^^^^
 ```
 
 A relaxation that does not exist is refused where it is written.
@@ -1309,8 +1321,8 @@ removed and `float_reassoc = true` is `relax = ["float-reassoc"]`. `pass` and
 
 ```
 error[manifest.removed_key] mach.toml: [profile.release].opt is not allowed. write `optimize = true` or `optimize = false`
-   @ mach.toml:12:1
-12 | opt = 2
+   @ ./mach.toml:14:1
+14 | opt = 2
    | ^^^
 ```
 
@@ -1339,6 +1351,9 @@ written, with the list, whichever profile the build selects:
 
 ```
 error[manifest.invalid_value] mach.toml: [profile.release].passes names "peel", which is no optimization pass. the optimization passes are inline, split, promote, reassociate, fold, algebraic, reduce, effects, cse, forward, dse, bypass, thread, ifconvert, demanded, licm, vectorise, hoist, unroll, rotate, dce, switch
+   @ ./mach.toml:35:1
+35 | peel = false
+   | ^^^^
 ```
 
 A non-boolean value is a manifest error. `--set passes.<name>=<bool>` writes
@@ -1355,7 +1370,7 @@ included. One that declares none is refused, pointing at the start of the file:
 
 ```
 error[manifest.missing_required] mach.toml: the [profile] table is missing. a build needs an explicit [profile.<name>] declaring optimize, debug and simd
-  @ mach.toml:1:1
+  @ ./mach.toml:1:1
 1 | [project]
   | ^
 ```
@@ -1377,6 +1392,12 @@ marks none is refused wherever a command must pick one:
 
 ```
 error[selection.ambiguous] mach.toml: several profiles are declared and none has `default = true`. mark one [profile.<name>] with `default = true` or select one with -p
+   @ ./mach.toml:19:10
+19 | [profile.debug]
+   |          ^^^^^
+   @ ./mach.toml:24:10
+24 | [profile.release]
+   |          -------
 ```
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
 concern: it is controlled only by the `--emit ir` and `--emit asm` flags of `mach build`.
@@ -1400,6 +1421,9 @@ every diagnostic that has one prints it:
 
 ```
 warning[vector.scalarize] the vector divide over 4 lanes of 32-bit integers is split into scalar operations, because no vector unit of the target computes it
+  @ src/bin/main.mach:4:9
+4 |     ret a / b;
+  |         ^
 ```
 
 `allow` names warning keys the build does not report. A silenced warning is
@@ -1457,6 +1481,9 @@ unknown:
 
 ```
 error[allow.error_key] mach.toml: [profile.release].allow entry "secret.branch" names an error, and only a warning can be silenced
+   @ ./mach.toml:26:10
+26 | allow = ["secret.branch"]
+   |          ^^^^^^^^^^^^^^^
 ```
 
 ### Whose warnings a build shows
@@ -1581,11 +1608,11 @@ key spelled as this manifest spells it. It writes the value over every table of
 the key's section for one invocation, a later `--set` of the same key winning.
 `--set` writes `platform`, `base`, `stack_reserve` and `stack_commit` over every
 target, the `native` one included, `subsystem` over every artifact, and the
-profile keys `optimize`, `passes`, `debug`, `simd`, `relax`, `linker_relax` and
-`allow` over every profile, so the profile the build selects holds the value whichever
+profile keys `optimize`, `passes`, `debug`, `simd`, `relax`, `linker_relax`,
+`symbols`, `sections`, `unwind` and `allow` over every profile, so the profile the build selects holds the value whichever
 it is. A single-file build's one profile takes them as well, so
-`mach build main.mach --set simd=require` builds that file under
-`simd = "require"`. `--set passes.<name>=<bool>` writes one key of the `passes`
+`mach build main.mach --set simd=require -o main-require` builds that file under
+`simd = "require"`, naming its output as below. `--set passes.<name>=<bool>` writes one key of the `passes`
 table, over the keys the table writes already, and `--set passes={...}` writes
 several. `default` is not written: it picks the profile, and every
 profile would claim it.
@@ -1598,7 +1625,7 @@ reasons as the key in `mach.toml`. A key no table holds is refused naming it,
 and so is a key `--set` does not write:
 
 ```
-error[cli.flag_value] --set does not apply to 'default'. it sets platform, base, stack_reserve, stack_commit, subsystem, optimize, debug, simd, passes, relax, linker_relax, allow
+error[cli.flag_value] --set does not apply to 'default'. it sets platform, base, stack_reserve, stack_commit, subsystem, optimize, debug, simd, passes, relax, linker_relax, symbols, sections, unwind, allow
 error[manifest.value_type] --set stack_reserve must be an integer
 ```
 
@@ -1886,7 +1913,10 @@ for a target whose format has none (ELF, Mach-O, a flat image, a wasm module) is
 unsupported, naming the key, the target and the format:
 
 ```
-error[catalog.unsupported] subsystem windows is not available on linux (mach.toml: [artifact.game].subsystem states it, and target 'host' runs on linux, whose images state no subsystem)
+error[catalog.unsupported] subsystem windows is not available on linux (mach.toml: [artifact.game].subsystem states it, and target 'linux-x86_64' runs on linux, whose images state no subsystem)
+   @ ./mach.toml:18:13
+18 | subsystem = "windows"
+   |             ^^^^^^^^^
 ```
 
 A subsystem the target's system does not run is refused the same way, listing
@@ -1989,11 +2019,10 @@ reads the same files as `mach build .` inside `app`.
 
 A `local` entry's `path` must, at build time, either match a `[step.X]`'s `out`
 (which demands that step) or already exist on disk — anything else is an up-front
-error, so a typo never silently drops an input. A `local` path naming a shared
-library is validated for the selected target before it is recorded: an ELF
-`.so` that is not a loadable shared object for the target's architecture (a
-linker script, a foreign-architecture file) is refused (`'<file>' is not a
-loadable ELF shared object for the selected architecture`).
+error, so a typo never silently drops an input. The link reads a `local` file as
+it reads any input: a file built for another architecture is refused (`an input
+is for another architecture than the link`), and a linker script is read as one,
+so the files it names are the inputs.
 
 ### One file is one input
 
@@ -2397,7 +2426,7 @@ others:
 
 | Key    | Meaning |
 |--------|---------|
-| `git`  | Git URL. The dependency is a git **submodule** at `dep/<id>/`, pinned by the gitlink the root repository commits. Requires `ref` or `version`. |
+| `git`  | Git URL. The dependency is a git **submodule** at `dep/<id>/`, pinned by the gitlink the root repository commits. A relative local path is resolved against this manifest's directory, as a `path` is (see [dependencies.md](dependencies.md#what-mach-dep-verify-checks), Relative sources). Requires `ref` or `version`. |
 | `ref`  | Selector for `git`: `branch/<name>`, `tag/<name>`, or `commit/<full-object-id>`. Any other spelling is rejected (`[dep.std].ref must be branch/<name>, tag/<name>, or commit/<full-object-id>`). |
 | `version` | A [version range](#version-ranges) over the dependency's releases (see [Releases and resolution](dependencies.md#releases-and-resolution)). Valid only with `git`; a path dependency has no releases. |
 | `path` | Local project tree, never fetched. A relative `path` is resolved relative to this manifest's directory. `mach dep add <path> <id> --path` copies its files into `dep/<id>/` without the source's own `dep/` or Git metadata. No repository or index is required for a path dependency, and copied files are not automatically staged. Forbids `ref` and `version`. |

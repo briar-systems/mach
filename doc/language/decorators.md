@@ -376,7 +376,7 @@ A mangled name is the source FQN, dotted, with generic arguments after a `$`:
 `std.types.string.str_len`, `std.collections.vector.push$ptr`. Each argument is
 introduced by a run of `$` whose length is its nesting depth, so a nested
 argument closes without a bracket — `f[Map[Vec[i64], str], u8]` is
-`m.f$m.Map$$m.Vec$$$i64$$str$u8`. `p$u8` is `*u8`, `sec$u32` is `^u32`,
+`m.f$m.Map$$m.Vec$$$i64$$p$$u8$u8`, `str` being the `*u8` it aliases. `p$u8` is `*u8`, `sec$u32` is `^u32`,
 `arr4$u8` is `[4]u8`, `fn$$i64$$u8` is `fun(u8) i64`, `fnv$$i64$$u8` is the
 C-variadic `fun(u8, ...) i64`, `fns$$i64$$u8` and `fnh$$i64$$u8` are `fun(u8) i64`
 marked soft and hard, a record is its own dotted
@@ -453,7 +453,8 @@ ext fun wsa_startup(ver: u16, data: *u8) i32;
 - The value names a `[link.X]` requirement by its table key, `X`. A bare
   command-line `-l name` exposes `name`. A loader name such as `ws2_32.dll`
   does not bind, and an import attributed to one is refused with a message
-  naming the entry whose key to write. Pinning to an absent dependency is a
+  naming the entry whose key to write. The refusal comes from the link
+  (`link.import_library`), so `mach check`, which links nothing, accepts it. Pinning to an absent dependency is a
   link error, never a silent fallback. A key may not equal a different
   dependency's loader name.
 - PE and Mach-O use two-level namespaces, so every dynamic import on those
@@ -596,7 +597,7 @@ naming the type that closes it.
   by any global of that type.
 - On a `fun`, sets the alignment of the function's entry address. Without it
   a function still starts at the target's own entry alignment: 16 bytes on
-  x86-64 and aarch64, as gcc and llvm align them, and no padding on riscv. The
+  x86-64 and aarch64, and no padding on riscv. The
   bytes before an entry are an instruction that traps. `align` only raises the
   target's alignment, so a value below it changes nothing.
 - `align` does not apply to `def` aliases (transparent, no layout of their
@@ -678,9 +679,8 @@ fun main(argc: i64, argv: **u8) i64 {
 #### Packing is not transitive
 
 A `packed` record packs **its own** fields. A record it contains keeps its own
-internal padding and is merely *placed* without padding. This matches C, and it is
-the rule that composes: an inner type's layout does not change depending on who
-holds it.
+internal padding and is merely *placed* without padding. That is the rule that
+composes: an inner type's layout does not change depending on who holds it.
 
 ```mach
 use std.print;
@@ -717,8 +717,7 @@ it into a local.
 
 This is fail-closed on purpose. Refusing can be relaxed later, once alignment can
 ride in a pointer type; permitting cannot be tightened later without breaking
-programs that came to depend on it. Rust refuses; C permits, and it is a standing
-source of faults.
+programs that came to depend on it.
 
 **Atomics on a packed field** are refused by that same rule, not by one of their own.
 `std.sync.atomic` is ordinary functions over `*i64`, so a pointer is the only route
@@ -1135,8 +1134,7 @@ fun compress(state: *[8]u32, block: *[64]u8) {
 }
 ```
 
-This is the same contract as Rust's `target_feature(enable = "...")` attribute and
-gcc's `__attribute__((target("...")))`. Inside the function, inline `asm` may
+Inside the function, inline `asm` may
 use every instruction the named extensions admit, in addition to what the
 target selects. The compiler builds the function's own code under the same
 widened selection: a vector operation the named extensions compute is taken

@@ -1,351 +1,59 @@
 ---
 name: mach
-description: Authoring guide for Mach (.mach) source files. Covers syntax, explicit typing, control flow, tags and guards, stdlib idioms, comptime constructs, decorators, and inline assembly.
+description: Authoring guide for Mach 7. Load before writing, reviewing or fixing any .mach source or mach.toml, or before running the mach compiler. Leads with the rules where C, Rust, Zig and Go habits produce wrong Mach, then the reference, std idioms and commands.
 ---
 
-# Mach Language Reference
+# Mach 7
 
-Mach is a low-level, explicitly typed systems programming language without type inference, garbage collection, or hidden control flow. Source files use the `.mach` extension. This skill provides a dense reference for authoring correct Mach code. The authoritative language specification lives under [`doc/language/`](https://github.com/briar-systems/mach/tree/dev/doc/language).
+Mach is explicitly typed and compiled ahead of time, with no garbage collector and no hidden control flow. The authority is the compiler, then the language reference in the mach repository's `doc/language/*.md` (`migrate.md` lists what changed from 6), then the std source under `dep/std/src`. Every sample here builds with mach 7.0.0. A line `# wrong: ... -> key` shows the spelling a habit produces in place of the line above it, and the diagnostic key the compiler refuses it with.
 
-## Critical Rules
+## Where habits from other languages fail
 
-Keep these core principles in mind when writing Mach to avoid common pitfalls:
+**Types are never inferred, and nothing converts implicitly.** Every `val` and `var` states its type, and a literal suffix types the literal, not the binding. Integers of different types never mix, not even to widen: cast with `::`. The one implicit conversion is between `ptr` and `*T`, both ways.
 
-- **No type inference**: Every `val` and `var` must declare its type explicitly. `val x: i64 = 42;` is valid, while `val x = 42;` is an error. Initializers are mandatory for `val`.
-- **Zero-initialization guarantee**: Declaring `var x: T;` without an initializer safely zeroes all bytes: numeric types start at `0`, pointers at `nil`, arrays have zeroed elements, and tags default to their first declared variant.
-- **No compiler-known type aliases**: `bool`, `usize`, `str`, and `char` are standard library definitions rather than built-in primitives. Always import them before use, such as `use std.types.bool.bool;` or `use std.types.size.usize;`. The literals `true` and `false` are imported values representing `1` and `0` of type `u8`.
-- **Strings are raw pointers, not objects**: The type `str` is `*u8` pointing to null-terminated bytes. It has no `.len` or methods. The `==` operator compares pointer addresses rather than string contents. To inspect byte lengths or compare contents, use `std.types.string.str_len` and `std.types.string.str_equals`.
-- **Conditionals use `if` and `or`**: Mach has no `else` or `else if` keyword. Use `or (condition)` for chained checks and a bare `or` block for the fallback branch.
-- **Loops use `for`**: Mach has no `while` keyword. Use `for (condition) { ... }` for conditional loops and a bare `for { ... }` for infinite loops.
-- **Blocks require braces**: Control flow bodies must always be enclosed in curly braces. Single-statement unbraced bodies are invalid.
-- **Statements end in semicolons**: Every statement ends with `;` unless it terminates with a block.
-- **No compound assignment**: Operators like `+=`, `-=`, `*=`, and `++` do not exist. Write assignments explicitly, such as `x = x + 1;`.
-- **Pointers, auto-dereference, and precedence**: The address-of operator is `?x`. The dereference operator is `@p`. Member access on a pointer auto-dereferences once: write `p.x` when `p: *Point`. Never write `@p.x`, because `@` has lower precedence than `.` and parses as `@(p.x)`, which fails to type-check on non-pointer fields. Write through a pointer using `@p = value;` or `p.x = value;`.
-- **No methods or UFCS**: Mach has no method syntax or uniform function call syntax. All operations are free functions called directly when in scope or imported with `use`, or reached through module paths and aliases, taking an explicit receiver: `push[T](?v, item)` or `vector.push[T](?v, item)` rather than `v.push(item)`.
-- **Tagged values use `sel` and lexical guards**: Unions with an active variant are declared as `tag Name: u8 { case1; case2: T; }`. Construct variants using `Type.case{payload}` or `Type.empty{}`. Inspect the active case with `sel place.case`, which evaluates to `bool` (`u8`) and can be used in expressions, stored, or combined with `!`, `&&`, and `||`. Variant payloads are ordinary storage accessible wherever guarded: inside an `if (sel place.case)` block, in expressions on the right-hand side of `&&` (such as `if (sel r.ok && r.ok > 0)`), or after all alternative variant branches exit via `ret`, `brk`, or `cnt`. Whole tags can be assigned, passed, and returned, but cannot be compared with `==` or `!=`.
-- **No error bubbling sugar**: Mach has no `try` keyword or `?` error propagation operator. Explicitly test and return errors: `if (sel outcome.err) { ret res[T, E].err{outcome.err}; }`.
-- **Explicit generic call sites**: Generic function and type instantiations must always provide explicit type parameters at call sites, such as `identity[i64](42)`.
-- **Decorators use `#[...]`**: Placed on the line or lines immediately preceding the declaration. Multiple decorators can be stacked one per line (such as `#[inline("always")]` followed by `#[symbol("name")]`) or written space-separated on the same line.
+**Conditions are `u1`.** Comparisons, `&&`, `||`, `!` and `sel` produce `u1`, and `if` and `for` accept nothing else. `bool` is std's `def bool: u1`, with `true` and `false` as std `val`s, imported like any name. A `u1` has no arithmetic and never flows into a `u8`: `b::u8` converts it, and `n::u1` asks whether `n` is non-zero.
 
-## Project and Module Structure
-
-A project is defined by a root `mach.toml` containing a `[project] id` string that roots all module paths. A source file at `src/net/tcp.mach` in project `id = "myproj"` defines the module `myproj.net.tcp`. Full module paths are always required, including when referencing sibling modules within the same project.
-
-### Imports with `use`
-
-Imports are private to the file and are placed at the top of the file following the module docstring:
-
-```mach
-use std.types.size;
-use sz: std.types.size;
-use std.types.size.usize;
-```
-
-Wildcard imports and grouped braces are unsupported. Each import occupies its own line.
-
-### Re-exports with `fwd`
-
-The `fwd` keyword re-exports symbols publicly with the same path syntax as `use`. It is always public and does not take the `pub` keyword:
-
-```mach
-fwd impl.Point;
-fwd Pt: impl.Point;
-fwd impl.helpers;
-```
-
-### Shadow Module Pattern
-
-A surface module file `foo.mach` often coexists with a directory `foo/` containing modular implementation files. The surface file imports the splits and re-exports public items, allowing external consumers to write `use myproj.foo;` without coupling to internal file splits:
-
-```mach
-$if ($mach.build.sys == $mach.sys.linux) {
-    use impl: myproj.os.linux;
-}
-$or ($mach.build.sys == $mach.sys.windows) {
-    use impl: myproj.os.windows;
-}
-$or {
-    $error("unsupported operating system");
-}
-
-fwd impl.page_size;
-```
-
-## Program Entrypoint and Standard Output
-
-Executable targets link the standard library runtime to supply the platform `_start` symbol. Every entry file must include `use std.runtime;` even if no symbol is called directly. Export the program entry function as `main` using the `#[symbol("main")]` decorator:
-
-```mach
-use std.print;
-use std.runtime;
-
-#[symbol("main")]
-fun main(argc: i64, argv: **u8) i64 {
-    print.println("hello, world");
-    ret 0;
-}
-```
-
-The `std.print` module provides output functions:
-- `print.print("text")` and `print.println("text")` write to standard output.
-- `print.eprint("text")` and `print.eprintln("text")` write to standard error.
-- `print.printf("count: {}\n", count)` and `print.printlnf("hex: {:x}", value)` provide formatted output. Holes use `{}` and accept specifiers such as `{:x}`, `{:X}`, `{:5}`, `{:<5}`, and `{:08x}`. Literal braces are escaped as `{{` and `}}`.
-
-## Declarations
-
-The `pub` modifier exports a declaration. Without `pub`, declarations are private to the file.
-
-### Type Aliases with `def`
-
-```mach
-pub def Age:      i64;
-pub def BinaryOp: fun(i64, i64) i64;
-```
-
-### Records with `rec`
-
-Records define aggregate data with named fields:
-
-```mach
-pub rec Point {
-    x: i64;
-    y: i64;
-}
-
-pub rec Pair[T, U] {
-    left:  T;
-    right: U;
-}
-
-fun make_records() {
-    val pt:   Point         = Point{x: 10, y: 20};
-    val pair: Pair[i64, u8] = Pair[i64, u8]{left: 1, right: 2u8};
-}
-```
-
-### Raw Unions with `uni`
-
-Unions provide untracked overlapping storage where all fields share the same offset:
-
-```mach
-pub uni Number {
-    i: i64;
-    f: f64;
-}
-```
-
-### Tagged Unions with `tag`
-
-A `tag` is a discriminated union representing exactly one active case at runtime. Declarations require an explicit unsigned integer discriminator type (`u8`, `u16`, `u32`, `u64`):
-
-```mach
-pub tag Status: u8 {
-    pending;
-    failed: i32;
-    done:   i64;
-}
-
-pub tag Result[T, E]: u8 {
-    err: E;
-    ok:  T;
-}
-```
-
-Construct variants using `Type.case{payload}` or `Type.empty{}` for cases without payloads:
-
-```mach
-pub tag Status: u8 {
-    pending;
-    failed: i32;
-    done:   i64;
-}
-
-fun make_tags() {
-    val s0: Status = Status.pending{};
-    val s1: Status = Status.done{100};
-    var s2: Status;
-}
-```
-
-### Tag Inspection, Operations, and Guards
-
-The active variant is inspected with `sel place.case`. Because `sel` evaluates to a boolean `u8`, it can be used directly in any expression, assigned to a variable, negated, or combined with logical operators:
-
-```mach
-pub tag Status: u8 {
-    pending;
-    failed: i32;
-    done:   i64;
-}
-
-fun inspect(s: Status) i64 {
-    if (sel s.done) {
-        ret s.done;
-    }
-    or (sel s.failed) {
-        ret -1;
-    }
-    ret 0;
-}
-```
-
-Lexical guards govern access to variant payloads. Once guarded, a payload is ordinary mutable storage that can be read, compared, mutated (`place.case = val;`), or addressed (`?place.case`). Guards are established in three ways:
-
-1. **Arm conditions**: Inside the body of an `if (sel place.case)` block.
-2. **Conditional expressions**: On the right-hand side of `&&` when `sel place.case` is on the left, allowing direct comparisons and operations right in the condition.
-3. **Exiting chains**: When preceding branches check other cases and exit with `ret`, `brk`, or `cnt`, the remaining block code is guarded for the remaining variant.
-
-Assigning a name the guarded place is spelled with, such as the `i` of `sel items[i].case` or a pointer `p` under `sel p.case`, ends the guard from that point on (for the whole loop when the guard opened outside it), so read the payload or bind it to a name before the assignment.
+**Comparison binds tighter than `&`, `^` and `|`**, so a bit test is parenthesized, and the bare form is refused with a message about reading a `u1` as a wider integer. **Assignment is `=` only**: `+=` and `++` are syntax errors.
 
 ```mach
 use std.types.bool.bool;
-use std.types.bool.false;
-use std.types.bool.true;
 
-pub tag Status: u8 {
-    pending;
-    failed: i32;
-    done:   i64;
+fun low_nibble_set(flags: u32) bool {
+    ret (flags & 0x0f) != 0;
+    # wrong: ret flags & 0x0f != 0;   -> type.mismatch
 }
 
-fun check_status(s: Status) bool {
-    # sel evaluates directly to a bool in any expression
-    val is_pending: bool = sel s.pending;
-    if (is_pending || (sel s.failed && s.failed < 0)) {
-        ret false;
+fun scaled(n: i32, k: i64) i64 {
+    val wide: i64 = n::i64;
+    # wrong: val wide: i64 = n;   -> type.mismatch
+    # wrong: val wide = n::i64;   -> binding.untyped
+    ret wide * k;
+    # wrong: ret n * k;   -> operator.operand_mismatch
+}
+
+fun count_to(n: u64) u64 {
+    var i: u64 = 0;
+    for (i < n) {
+        i = i + 1;
+        # wrong: i += 1;   -> syntax.expected_expr
     }
-    # s.done payload is guarded right here after sel on the left of &&
-    if (sel s.done && s.done > 100) {
-        ret true;
-    }
-    ret false;
-}
-```
-
-Whole tags can be assigned, passed to functions, and returned, but whole tags cannot be compared with `==` or `!=`. There is no `match` or `switch` keyword.
-
-#### Standard Result, Option, and Error Tags
-
-The standard library provides canonical tags in `std.types`:
-- `use std.types.result.res;` defines `pub tag res[T, E]: u8 { err: E; ok: T; }`. Case `err` is 0 so zero-initialized results default to failure.
-- `use std.types.option.opt;` defines `pub tag opt[T]: u8 { none; some: T; }`.
-- `use std.types.error.err;` defines `pub tag err[E]: u8 { err: E; ok; }` for unit return values that can fail.
-
-Handling fallible outcomes follows an early exit pattern:
-
-```mach
-use std.types.result.res;
-
-tag Error: u8 {
-    io;
-}
-
-fun perform_work() res[i64, Error] {
-    ret res[i64, Error].ok{42};
-}
-
-fun handle() res[i64, Error] {
-    val outcome: res[i64, Error] = perform_work();
-    if (sel outcome.err) {
-        ret res[i64, Error].err{outcome.err};
-    }
-    # outcome.ok is unguarded and valid here because the error check returned early
-    val value: i64 = outcome.ok;
-    ret res[i64, Error].ok{value};
-}
-```
-
-### Functions with `fun`
-
-```mach
-pub fun add(a: i64, b: i64) i64 {
-    ret a + b;
-}
-
-pub fun identity[T](val: T) T {
-    ret val;
-}
-
-pub fun log_message(msg: *u8) {
-    # functions returning void omit the return type
-    ret;
-}
-```
-
-Generic functions must be instantiated with concrete types at call sites: `identity[i64](5)`.
-
-### External Functions with `ext fun`
-
-External functions declare foreign C-ABI signatures and end in a semicolon without a body:
-
-```mach
-#[symbol("write")]
-pub ext fun libc_write(fd: i32, buf: *u8, count: u64) i64;
-
-pub ext fun open(path: *u8, flags: i32, ...) i32;
-```
-
-### Variables with `val` and `var`
-
-```mach
-fun init_vars() {
-    val max_retries:     i64 = 5;
-    var current_attempt: i64 = 0;
-    var scratch:         [128]u8;
-}
-```
-
-### Tests with `test`
-
-Tests are first-class declarations placed directly in source files alongside implementation code:
-
-```mach
-fun add(a: i64, b: i64) i64 {
-    ret a + b;
-}
-
-test add__basic_sum {
-    if (add(2, 3) != 5) {
-        ret 1;
-    }
+    if (n != 0) { ret i; }
+    # wrong: if (n) { ret i; }   -> condition.type
     ret 0;
 }
 ```
 
-A test is named with an identifier in its module's own test namespace, so it never clashes with a function of the same name, and related tests group as `subject__case`. Its qualified name, `<module path>#<name>`, is what `mach test --list` and `--filter` show. The test body returns an integer exit code. Returning `0` or falling off the end denotes success. Any non-zero return value fails the test.
-
-## Types and Literals
-
-### Built-in Types
-
-- **Integers**: `u8`, `u16`, `u32`, `u64`, `u128`, `i8`, `i16`, `i32`, `i64`, `i128`.
-- **Floating point**: `f16`, `f32`, `f64`.
-- **Untyped pointer**: `ptr`.
-- **Typed pointers**: `*T`. Pointers support array indexing `p[i]` and dereferencing `@p`. Member access on a pointer auto-dereferences once, so accessing a field through a pointer is written `p.x`.
-- **Arrays**: `[N]T` where `N` is a compile-time constant expression, such as `[4]u32`. Array literals are written as `[4]u32{1, 2, 3, 4}`. Fixed arrays are value types copied on assignment and function calls. To pass array data without copying, pass a pointer `*[N]T` or pass pointer and length pairs. The standard library also defines `std.types.view.View` as one common slice record representation. The inferred length `[_]T` is permitted on a `val` or `var` initialized by an array literal, such as `val names: [_]u8 = [_]u8{1, 2, 3};`, or by a string literal (`val tag: [_]u8 = "abc";`), and on a `val` annotated with `#[embed("path")]`.
-- **SIMD vectors**: Formatted as `<scalar>x<lanes>` such as `f32x4`, `i32x8`, and `u8x16`. Literals are positional expressions like `f32x4{1.0, 2.0, 3.0, 4.0}`. Lane access uses compile-time indexing `vec[0]`.
-- **Function pointers**: `fun(ParamTypes) ReturnType`, such as `fun(i64, *u8) i64`.
-- **Secret qualifier**: `^T` marks values containing sensitive data subject to constant-time restrictions. Secret values cannot be branched on, looped on, or used as array indices or memory addresses. The only way to remove the secret qualifier is an explicit downgrade cast `val:>T`.
+**Integer literals.** An unsuffixed literal takes its context's type, and arithmetic on literals wraps in that type, so `val m: u8 = 0 - 1;` is 255. A suffixed literal is range-checked against its suffix. With no context a literal is `i64` (a float `f64`), and beside a typed operand it takes that operand's type. Comparisons of any two integer types are legal and compare true values, so an `i64` holding -1 is less than any `u64`. A constant shift count at or past the width is refused, and a run-time one saturates.
 
 ```mach
-pub rec Point {
-    x: i64;
-    y: i64;
-}
-
-fun update_point(p: *Point) {
-    # member access auto-dereferences p once: do not write @p.x
-    p.x = 10;
-    p.y = 20;
-}
+val MAX: u8  = 0 - 1;
+val ALL: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+val MIX: u32 = 0b1010 | 0o17 | 0x2A;
+# wrong: val MIX: u32 = 256u8;   -> literal.out_of_range
+val ONE: u8 = 'A' - 64;
 ```
 
-### Literals and Strings
-
-- **Integers**: Decimal `42`, hexadecimal `0x2A`, binary `0b101010`, octal `0o52`, with optional digit separators `1_000_000`. Typed integer suffixes include `42u8`, `100i32`, `500u64`.
-- **Floats**: `3.14`, `1.0e-5`, with optional typed suffixes `2.5f32`, `0.1f64`.
-- **Characters**: `'A'` represents a `u8` byte value. Standard escape sequences include `\n`, `\t`, `\r`, `\\`, `\'`, `\0`, `\xHH`.
-- **Strings**: `"hello\n"` represents a null-terminated `*u8` pointer to static memory. Checked against an array of `u8` instead, a literal is that array and holds its bytes and nothing else: `val a: [3]u8 = "abc";` stores 3 bytes, a terminator only when written (`[4]u8 = "abc\0"`), and the byte count must match the length (`[_]u8 = "abc"` is `[3]u8`). Text of several lines is a multiline string: each line starts with `\\`, and the lines join with `\n`. Strings do not have a `.len` property, and `==` compares pointer addresses. Use standard library functions to measure length or compare contents:
+**Strings are `*u8` with no length.** A literal is a NUL-terminated `*u8` in static data, and std's `str` is `def str: *char` with `char` a `u8`. There is no `.len`, and `==` compares addresses: use `std.types.string` (`str_len`, `str_equals`, `str_starts_with`, `str_index_of`). A literal checked against `[N]u8` is that array and holds exactly its bytes, with a terminator only when written, and the counts must match. `[_]u8` takes the count. Text of several lines starts each line with `\\`, joins them with `\n`, adds no final newline, and puts the `;` on the next line.
 
 ```mach
 use std.types.bool.bool;
@@ -354,247 +62,539 @@ use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
 
-fun demo_strings(a: str, b: str) bool {
-    val len: usize = str_len(a);
-    ret str_equals(a, b);
+val TAG:  [3]u8 = "abc";
+val TAGZ: [4]u8 = "abc\0";
+# wrong: val TAGZ: [4]u8 = "abc";   -> array.literal_length
+val NAME:  [_]u8 = "mach";
+val USAGE: str   =
+    \\usage: tool [options]
+    \\  -v  verbose
+;
+
+fun is_hi(s: str) bool {
+    val n: usize = str_len(s);
+    ret n == 2 && str_equals(s, "hi");
 }
 ```
 
-- **Null address**: `nil` represents a null pointer or nil function pointer and coerces to any pointer or function type.
+**Control flow is `if`/`or` and `for`.** `or (cond) { }` chains and a bare `or { }` is the fallback. `for (cond) { }` is the loop and a bare `for { }` loops until `brk` or `ret`. `brk` and `cnt` leave or continue the innermost `for`. Every body is braced. For `else` write `or`, for `while` or `loop` write `for`, for `switch` or `match` an `if`/`or` chain (with `sel` on a tag), for `defer` write `fin { }`, and for `try` or `?` an explicit test and `ret`. `goto` and `do` have no counterpart. `else` and `while` are plain names to the parser, so using them gives confusing syntax errors. The compiler does not check that a function with a result returns on every path, and the reference states no value for falling off the end, so end every path with `ret`.
 
-## Operators and Casts
-
-- **Arithmetic**: `+`, `-`, `*`, `/`, `%` operate on integers and floats. `%` computes truncated remainder.
-- **Bitwise**: `&`, `|`, `^` (xor), `~` (bitwise not), `<<`, `>>`. Bitwise operators have lower precedence than comparison operators, so always parenthesize bit checks: `(flags & 1u32) != 0`.
-- **Comparison**: `==`, `!=`, `<`, `<=`, `>`, `>=` return `u8` (1 or 0). Mixed signedness and width comparisons compare true mathematical values without surprise wraps. Records, unions, and tags cannot be compared with `==` or `!=`.
-- **Logical**: `&&`, `||`, `!` short-circuit and operate on `u8` values.
-- **Pointer operators**: `?x` produces the address of variable `x`. `@p` dereferences pointer `p`. Write through a pointer using `@p = value;`.
-- **Casts**:
-  - `expr::T` performs value conversion (resizing integer widths, conversions between integer and float).
-  - `expr:~T` performs bitwise reinterpretation between types of identical byte sizes.
-  - `expr:>T` strips the `^` secret qualifier from a secret value, returning public type `T`.
-- **Assignment**: `=` is right-associative and functions as an expression in statement positions.
-
-## Control Flow Statements
-
-Statements terminate with a semicolon unless ending with a curly-braced block.
-
-### If and Or
+**Pointers.** `?place` takes an address (of a place only, never a temporary), `@p` dereferences, and `p.field` reads through a pointer once. Prefix operators take the whole postfix chain after them, so `@p.x` is `@(p.x)` and `@p::T` is `@(p::T)`: parenthesize as `(@p)::T`. `p[i]` steps by the pointee, so on `xs: *[4]i64` the element is `xs[0][i]` or `(@xs)[i]`. Pointer arithmetic is `?p[i]`, never `p + i`.
 
 ```mach
-fun classify(score: i64) i64 {
-    var grade: i64 = 0;
-    if (score > 90) {
-        grade = 1;
-    }
-    or (score > 75) {
-        grade = 2;
-    }
-    or {
-        grade = 3;
-    }
-    ret grade;
+rec Point {
+    x: i64;
+    y: i64;
+}
+
+fun nudge(p: *Point, xs: *[4]i64) i64 {
+    p.x = p.x + 1;
+    # wrong: @p.x = 1;   -> ptr.deref_non_pointer
+    val first: i64 = xs[0][1];
+    # wrong: val first: i64 = xs[1];   -> type.mismatch
+    val q: *i64 = ?xs[0][2];
+    # wrong: val q: *i64 = ?xs[0][0] + 2;   -> operator.operand_mismatch
+    ret first + @q;
 }
 ```
 
-### For Loops
+**No methods.** Every operation is a free function taking its receiver explicitly, as `vector.push[i64](?v, 9)`, never `v.push(9)`, which is read as a field and refused with `field.unknown`.
 
-Mach uses `for` exclusively for looping:
+**Tags, `sel` and guards.** A `tag` holds one case. `sel place.case` is a `u1` test that reads only the discriminator, and its operand must be a place, never a call. A payload `place.case` is readable, writable and addressable only inside a guard, a lexical region matched by the place's spelling:
+
+1. the block of an arm whose whole condition is `sel p.c`
+2. the right operand of `&&` whose left operand is `sel p.c`, and only that operand: the arm's body is not guarded
+3. the rest of the enclosing block after a chain whose every arm exits by `ret`, `brk` or `cnt` and leaves one case untested (arms may test `sel` or `!sel` of the place), and likewise that chain's final bare `or`
+
+`||`, `!` and other operators open nothing. Assigning the whole guarded place inside its guard is refused, and assigning a name the place is spelled with (the `i` of `items[i]`, a pointer `p`) ends the guard from there on, for the whole loop when the guard opened outside it. Read the payload into a name first.
 
 ```mach
-fun loop_demo() {
-    var i: i64 = 0;
-    for (i < 10) {
+tag Shape: u8 {
+    dot;
+    line:   i64;
+    square: i64;
+}
+
+fun size(s: Shape) i64 {
+    if (sel s.dot)  { ret 0; }
+    or (sel s.line) { ret s.line; }
+    ret s.square * s.square;
+}
+
+fun capped(s: Shape) i64 {
+    if (sel s.line && s.line > 100) {
+        ret 100;
+        # wrong: ret s.line;   -> tag.payload_unguarded
+    }
+    ret 0;
+}
+
+fun next_line(items: *Shape) i64 {
+    var i: u64 = 0;
+    if (sel items[i].line) {
+        val v: i64 = items[i].line;
         i = i + 1;
+        ret v;
+        # wrong: ret items[i].line;   -> tag.payload_unguarded
     }
-
-    for {
-        # infinite loop
-        if (i >= 20) {
-            brk;
-        }
-        cnt;
-    }
+    ret 0;
 }
 ```
 
-### Fin Cleanups
-
-The `fin` block acts as a deferred cleanup. It executes upon exit of the enclosing lexical block in reverse order of declaration:
+**Failure is a value, handled by hand.** std's `res[T, E]`, `opt[T]` and `err[E]` are ordinary tags with the failure case first, so a zeroed one is a failure or `none`. Test the failure, return, and read the success after: the guard rule 3 above makes that read legal.
 
 ```mach
-fun acquire_resource() *u8 {
-    ret nil;
+use std.types.result.res;
+
+tag ParseError: u8 {
+    empty;
+    bad_digit: u8;
 }
 
-fun release_resource(res: *u8) {}
+fun digit(c: u8) res[i64, ParseError] {
+    if (c < '0' || c > '9') { ret res[i64, ParseError].err{ParseError.bad_digit{c}}; }
+    ret res[i64, ParseError].ok{(c - '0')::i64};
+}
 
-fun process_data() {
-    val resource: *u8 = acquire_resource();
-    fin {
-        release_resource(resource);
-    }
+fun doubled(c: u8) res[i64, ParseError] {
+    val r: res[i64, ParseError] = digit(c);
+    if (sel r.err) { ret res[i64, ParseError].err{r.err}; }
+    ret res[i64, ParseError].ok{r.ok * 2};
 }
 ```
 
-### Jump Statements
-
-- `ret;` returns from a void function.
-- `ret expr;` returns a value.
-- `brk;` breaks out of the innermost enclosing loop.
-- `cnt;` jumps to the next iteration of the innermost loop.
-
-## Docstrings
-
-Document declarations using `#` comments placed immediately above the item. The first line is a lowercase summary without a trailing period. Detailed parameter, field, and return documentation follows an optional `# ---` separator with description columns aligned:
+**Generics take explicit arguments**, at every call and every literal. There are no constraints: a body may use operators, casts and fields on `T`, and each instance is checked against its type arguments, with an error pointing into the body. `f[T]` without a call is the instance as a function value. A generic nothing instantiates is checked only for names.
 
 ```mach
-# calculate the sum of two integers
+rec Pair[T] {
+    a: T;
+    b: T;
+}
+
+fun larger[T](p: Pair[T]) T {
+    if (p.a > p.b) { ret p.a; }
+    ret p.b;
+}
+
+fun pick() i64 {
+    val p: Pair[i64] = Pair[i64]{a: 3, b: 9};
+    # wrong: val p: Pair[i64] = Pair{a: 3, b: 9};   -> generic.missing_type_args
+    val f: fun(Pair[i64]) i64 = larger[i64];
+    ret f(p) + larger[i64](p);
+    # wrong: ret larger(p);   -> generic.missing_type_args
+}
+```
+
+**Zero is the default, arrays are values, and `fin` takes a block.** A `var` with no initializer is zero in every byte: numbers 0, pointers `nil`, a tag its first case with that payload zeroed. Fields a literal omits are zero, and `T{}` is all zero. Padding is unspecified. A `val` needs an initializer and is never assigned, though through a `val` pointer the pointee is writable. Parameters are assignable locals. `[N]T` is copied by assignment, argument and return, so pass `*[N]T` or a pointer and length (std's `Slice[T]`) to share. `fin { }` runs when its block exits, covering the statements after it, latest first, and replays on `ret`, `brk` and `cnt`. A `ret` value is computed before the fins run.
+
+```mach
+use std.print;
+use std.runtime;
+
+rec Point {
+    x: i64;
+    y: i64;
+}
+
+fun bump(a: [3]i64) i64 {
+    a[0] = 100;
+    ret a[0];
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var counts: [3]i64;
+    val p:      Point = Point{x: 4};
+    val n:      i64   = bump(counts);
+    {
+        fin { print.printlnf("{} {} {}", counts[0], p.y, n); }
+        # wrong: fin print.println("done");   -> syntax.expected_token
+        counts[0] = 7;
+    }
+    # prints: 7 0 100
+    ret 0;
+}
+```
+
+**`==` is refused on a whole `rec`, `uni` or `tag`** (`operator.aggregate_equality`). Compare fields, use `std.derive.eq[T](?a, ?b)`, or `sel` for a tag's case. Integer against float is refused too. Pointers compare as addresses.
+
+## Projects and modules
+
+A project is a directory with a `mach.toml`. Every command takes the project path explicitly (`mach build .`). `mach init <dir>` writes this shape with six targets and std checked out under `dep/std`:
+
+```toml
+[project]
+id = "app"
+version = "0.1.0"
+mach = "^7"
+src = "src"
+work = "out/{target.name}/{profile.name}"
+
+[target.linux-x86_64]
+arch = "x86_64"
+sys  = "linux"
+abi  = "sysv64"
+
+[artifact.app]
+kind = "bin"
+entry = "bin/main.mach"
+out = "{project.work}/bin/app{artifact.suffix}"
+targets = ["*"]
+
+[profile.debug]
+default = true
+optimize = false
+debug = true
+simd = "scalarize"
+
+[profile.release]
+optimize = true
+debug = false
+simd = "scalarize"
+
+[dep.std]
+git = "https://github.com/briar-systems/mach-std"
+ref = "branch/dev"
+```
+
+Target keys are `arch`, `sys`, `abi`, `env`, `isa`, `ext` (never 6's `os` or `isa` naming an architecture). Artifact kinds are `bin`, `static`, `shared`, `object` and `module`. Every profile states `optimize`, `debug` and `simd` (`"scalarize"` or `"require"`). The entry is `src/bin/main.mach` for an executable and `src/lib/<id>.mach` for a library, by convention. A build compiles what the entry reaches through `use` and `fwd`.
+
+- A file `src/a/b.mach` in project `app` is the module `app.a.b`. Every path is `<project id>.<source path>`, in the project itself too, and `use std;` (a project with no module) is refused.
+- `use path;` binds the last segment, `use name: path;` an alias. A path ending at a module binds the module (`print.println`), one ending at a symbol binds the symbol. One name per line, no globs or braces. Imports are private.
+- `fwd path;` re-exports, always publicly. A surface `foo.mach` beside a directory `foo/` loads its splits and forwards them, with `$if` choosing a split per target.
+- Declarations are file-private unless `pub`. `#[export]` (which needs `pub`) is what a shared library exports. An executable's entry has `use std.runtime;` and a function with `#[symbol("main")]` taking `(argc: i64, argv: **u8)` and returning `i64`.
+
+```mach
+# file: src/bin/main.mach
+use app.geometry;
+use std.print;
+use std.runtime;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{}", geometry.area(3, 4));
+    # prints: 12
+    ret 0;
+}
+# file: src/geometry.mach
+use app.geometry.flat;
+
+fwd flat.area;
+# file: src/geometry/flat.mach
+pub fun area(w: i64, h: i64) i64 {
+    ret w * h;
+}
+```
+
+## Declarations
+
+| Form | Example |
+|---|---|
+| constant, variable | `val N: i64 = 5;` `var buf: [256]u8;` |
+| alias, function type | `def Age: u32;` `def BinOp: fun(i64, i64) i64;` |
+| record | `rec Point { x: i64; y: i64; }`, literal `Point{x: 1, y: 2}` (positional braces are refused) |
+| union, untracked | `uni Number { i: i64; f: f64; }`, literal `Number{i: 9}` |
+| tag | `tag Status: u8 { pending; failed: i32; }`, literal `Status.failed{-1}`, `Status.pending{}` |
+| function | `fun add(a: i64, b: i64) i64 { ret a + b; }`, no result type for none |
+| generic | `fun id[T](v: T) T`, `rec Box[T] { v: T; }` |
+| comptime parameter | `fun f($mode: u8, n: i64) i64` |
+| pack | `fun sum(va: ...) i64`, unrolled with `$each` |
+| foreign | `ext fun strlen(s: *u8) i64;` `ext var errno: i32;` |
+| test | `test subject__case { }` |
+
+A tag's discriminator is `u8`, `u16`, `u32` or `u64`, and each case holds one payload (a record for several). A module-level initializer must be a compile-time value, so a call there is refused. A body-less `fun` exists only as `ext fun` or `#[intrinsic]`. Doc comments are `#` lines directly above a declaration: a lowercase summary, then optionally `# ---` and one `# name: description` line per parameter, `[T]`, `$param`, field or case, in declaration order, then `ret`.
+
+```mach
+# the sum of two integers
 # ---
-# a:   first integer operand
-# b:   second integer operand
-# ret: sum of both operands
+# a:   first operand
+# b:   second operand
+# ret: a + b
 pub fun add(a: i64, b: i64) i64 {
     ret a + b;
 }
 ```
 
-## Comptime Channel
+## Types
 
-The `$` prefix accesses compile-time features, target inspection, reflection, and conditional compilation. Comptime constructs select and expand code at compile time rather than executing runtime code.
+| Family | Spelling |
+|---|---|
+| truth | `u1` (one byte, 0 or 1, no arithmetic) |
+| integers | `u8` `u16` `u32` `u64` `u128` `u256` `u512`, `i8` through `i512` |
+| floats | `f16` `f32` `f64` |
+| pointers | `ptr` (untyped), `*T`, `nil` for any pointer or function value |
+| arrays | `[N]T`, `[_]T` only where an initializing literal gives the length |
+| vectors | element, `x`, lane count: `f32x4`, `i32x8`, `u8x16`. Literal `f32x4{1.0, 2.0, 3.0, 4.0}`, lane `v[0]` by constant index |
+| functions | `fun(i64, *u8) i64` |
+| secret | `^T`, constant-time data |
+| std aliases | `bool` (`u1`), `usize`/`isize` (pointer width), `char` (`u8`), `str` (`*char`) |
 
-### Target and Compiler State with `$mach.*`
+A constant array index is bounds-checked. `x[start, n]` is an `[n]T` window with constant `n`. Vector operators are lane-wise between the same shape, and a comparison yields an unsigned mask vector.
 
-Compile-time constants inspection keys:
-- `$mach.build.sys`: matches `$mach.sys.linux`, `$mach.sys.darwin`, `$mach.sys.windows`, `$mach.sys.freestanding`
-- `$mach.build.arch`: matches `$mach.arch.x86_64`, `$mach.arch.aarch64`, `$mach.arch.riscv64`
-- `$mach.build.mode`: matches `$mach.mode.debug`, `$mach.mode.release`
-- `$mach.build.pointer_width`: pointer size in bytes (8 on 64-bit systems)
+## Operators and casts
 
-### Manifest State with `$project.*` and `$bin.*`
+| Binds | Operators |
+|---|---|
+| tightest | postfix `f()` `a[i]` `a.b` `::T` `:~T` `:>T`, then prefix `-` `!` `~` `?` `@` |
+| | `*` `/` `%` |
+| | `+` `-` |
+| | `<<` `>>` |
+| | `<` `<=` `>` `>=` |
+| | `==` `!=` |
+| | `&`, then `^`, then `\|` |
+| | `&&` (short-circuit), then `\|\|` |
+| loosest | `=` (right-associative) |
 
-- `$project.id`: project identifier from `mach.toml`
-- `$project.version`: version string
-- `$project.version.major`: integer version component
-- `$bin.name`: current artifact name
+`x::T` converts a value (resize, int and float, same-count array and vector). `x:~T` reinterprets bits between types of one size. `x:>T` strips `^` and is the only way to. `%` is the truncated remainder. `~` is bitwise not, `!` is logical not on `u1`. A cast is postfix, so `-x::i64` is `-(x::i64)`.
 
-### Conditional Compilation with `$if` and `$or`
+## The comptime channel
 
-Code within unselected branches is discarded before type-checking and name resolution, making cross-platform code completely safe:
+`$` reads compile-time facts and expands code. It never runs user functions.
+
+| Read | Value |
+|---|---|
+| `$mach.build.sys` | `$mach.sys.` `linux` `darwin` `windows` `freestanding` `uefi` `vulkan` `wasi` |
+| `$mach.build.arch` | `$mach.arch.` `x86_64` `aarch64` `riscv64` `riscv32` `spirv` `wasm32` |
+| `$mach.build.abi` | `$mach.abi.` `sysv64` `win64` `aapcs64` `darwinpcs` `aapcs64win` `lp64d` `shader` and the other ABIs |
+| `$mach.build.mode` | `$mach.mode.debug` or `$mach.mode.release` |
+| `$mach.build.pointer_width`, `.pie`, `.ext.<name>` | bytes, 1 or 0, 1 when the target selects that extension |
+| `$mach.version`, `$mach.project.version`, `$mach.source.line` | compiler version, the owning project's version, the line |
+| `$project.id`, `.version`, `.target.sys` | the root project being built |
+| `$bin.name`, `$bin.kind` | the artifact being built |
+
+`$if (cond) { } $or (cond) { } $or { }` selects at compile time, and untaken arms are not even resolved, so per-target code and imports live in them. A gate is `u1`. Comptime `&&` and `||` short-circuit in a gate: the right operand is not read when the left decides, so a question valid on one architecture only (`$mach.build.ext.sha`) may follow the architecture test in one gate. `$error("msg")` refuses the build where it is reached. A `$` parameter is a compile-time argument, named bare in the body, giving one instance per value. `va: ...` is a pack: `$each a in va { }` unrolls it, `va.len` counts it, `g(va...)` forwards it. Runtime C-style variadics exist only on `ext fun`.
 
 ```mach
 $if ($mach.build.sys == $mach.sys.linux) {
-    pub val PLATFORM: *u8 = "linux";
+    val PLATFORM: *u8 = "linux";
 }
 $or ($mach.build.sys == $mach.sys.windows) {
-    pub val PLATFORM: *u8 = "windows";
+    val PLATFORM: *u8 = "windows";
 }
 $or {
-    $error("unsupported operating system");
+    $error("unsupported system");
 }
-```
 
-### Comptime Function Parameters
+$if ($mach.build.arch == $mach.arch.x86_64) {
+    $if ($mach.build.ext.sha == 1) { val HAS_SHA: u1 = 1; }
+    $or                            { val HAS_SHA: u1 = 0; }
+}
+$or {
+    val HAS_SHA: u1 = 0;
+}
 
-Prefixing a function parameter with `$` forces arguments to be evaluated at compile time. The compiler monomorphizes the function for each distinct value. The parameter is referenced bare within the function body:
+fun apply($mode: u8, n: i64) i64 {
+    $if (mode == 0) { ret n + n; }
+    $or             { ret n * n; }
+}
 
-```mach
-pub fun shift_left($count: u8, val: u64) u64 {
-    $if (count >= 64) {
-        $error("shift count exceeds integer width");
+fun sum(va: ...) i64 {
+    var t: i64 = 0;
+    $each a in va {
+        $if ($type_of(a) == i64) { t = t + a; }
+        $or                      { t = t + a::i64; }
     }
-    ret val << count;
+    ret t;
+}
+
+fun demo() i64 {
+    ret apply(1, 3) + sum(1i64, 2u8, 3i32) + $size_of([4]u32);
 }
 ```
 
-### Variadic Packs
+Intrinsics: `$size_of(T)`, `$align_of(T)`, `$length_of(T or binding)`, `$offset_of(T, field)` give untyped integers that take the binding's width. `$type_of(x)`, `$type_name(T)`, `$type_id(T)`, `$pointee_of(T)`, `$discriminant_of(T)`. Predicates `$is_record` `$is_union` `$is_tag` `$is_pointer` `$is_integer` `$is_float` `$is_secret` `$holds_secret`. `$each f in $fields(T) { v.[f] }` and `$each c in $cases(T) { sel v.[c] }` reflect. `$zeroize(p, n)` is a wipe no pass removes. There is no `$assert`: write `$if (!cond) { $error("msg"); }`.
 
-A trailing parameter declared as `va: ...` collects arbitrary arguments into a compile-time sequence. Iterate over the arguments with `$each`, check the count with `va.len`, or forward the entire pack with `callee(va...)`:
+## Attributes
+
+`#[name]` or `#[name(args)]` before a declaration, one per line or several on a line. Arguments are constants (strings for names and modes, `val`s allowed). A v6 spelling is refused naming its v7 one.
+
+| Attribute | On | Meaning |
+|---|---|---|
+| `symbol("n")` | fun, val, var | linker name (C prefix added per target) |
+| `export` | pub fun, val, var | export from a shared library |
+| `library("key")` | ext | the `[link.key]` entry an import comes from (needed on PE and Mach-O) |
+| `weak("n")` | fun | a default a strong `n` replaces at link |
+| `inline("always")`, `inline("never")` | fun | force or forbid inlining |
+| `vectorize("never")` | fun | no auto-vectorization |
+| `naked` | fun | body of `asm` only, no prologue or return |
+| `noreturn` | fun, ext, asm statement | control never comes back |
+| `constant_time("soft")`, `("hard")` | fun, def of a fun type | constant-time boundary, see below |
+| `extension("sha", ...)` | fun | allow extensions the target lacks (caller checks the CPU) |
+| `align(N)` | fun, rec, uni, tag, val, var | raise alignment |
+| `packed` | rec, uni, tag | no padding (a packed field's address is refused) |
+| `volatile` | rec, uni, tag | every access to the type is volatile |
+| `section(".s")`, `at(offset)` | fun, val, var (`at` not fun) | named section, offset in the image |
+| `thread` | module var | one copy per thread |
+| `embed("path")` | val `[_]u8` or `[N]u8` | file bytes as the initializer |
+| `deprecated`, `deprecated("msg")` | declarations, tag cases | warn at uses from other modules |
+| `testing` | declarations | exists only for tests |
+| `expect("key")` | fun, rec, uni, tag, val, var, test | acknowledge a warning |
+| `intrinsic`, `handle`, `abi_type("va_list")` | fun, def | target instructions and types |
+| `gpu.stage`, `gpu.workgroup`, `gpu.input`, `gpu.output`, `gpu.builtin`, `gpu.uniform`, `gpu.storage`, `gpu.sampler`, `gpu.attachment`, `gpu.push`, `gpu.spec`, `gpu.shared` | shader declarations | SPIR-V interface, see `doc/language/gpu.md` |
+
+## Secrecy and constant time
+
+`^T` marks constant-time data, not confidential data: nothing is wiped or zeroed for it. In every function a secret may not reach a branch or loop condition, the left side of `&&`/`||`, an index or address, `/`, `%` or float arithmetic, and inside a `#[constant_time]` function the build also proves the emitted code keeps it from branches, addresses and variable-time instructions and requires every callee given a secret to be constant time ("hard" refuses a target that cannot guarantee it). `:>T` declassifies, and `mach check --declassified` lists every one.
 
 ```mach
-use std.print;
-use std.types.string.str;
-
-pub fun print_all(va: ...) {
-    $each arg in va {
-        $if ($type_of(arg) == i64) {
-            print.printlnf("int: {}", arg);
-        }
-        $or ($type_of(arg) == str) {
-            print.println(arg);
-        }
+#[constant_time("hard")]
+fun ct_eq(a: ^[8]u8, b: ^[8]u8) ^u8 {
+    var d: ^u8 = 0;
+    var i: u64 = 0;
+    for (i < 8) {
+        d = d | (a[i] ^ b[i]);
+        i = i + 1;
     }
+    ret d;
+}
+
+fun same(a: ^[8]u8, b: ^[8]u8) u1 {
+    ret (ct_eq(a, b):>u8) == 0;
+    # wrong: if (ct_eq(a, b) == 0) { ret 1; }   -> secret.branch
 }
 ```
 
-### Intrinsics
+## Inline assembly
 
-- `$size_of(T)`: byte size of type `T`.
-- `$align_of(T)`: byte alignment of type `T`.
-- `$length_of(T)`: element count of array or vector type `T`.
-- `$offset_of(T, field)`: byte offset of a record field.
-- `$type_of(expr)`: compile-time type value for comparison inside `$if` conditions.
-- `$fields(T)`: sequence of record or union field descriptors, consumed with `$each f in $fields(T) { val field_val = instance.[f]; }`.
-- `$cases(T)`: sequence of tag case descriptors, consumed with `$each c in $cases(T)`.
-- `$is_tag(T)`, `$is_record(T)`, `$is_union(T)`, `$is_pointer(T)`, `$is_integer(T)`, `$is_float(T)`, `$is_secret(T)`, `$holds_secret(T)`: type reflection predicates. `$is_secret` asks whether `T` is outermost `^`, `$holds_secret` whether any byte of `T` is secret.
-- `$type_name(T)`, `$type_id(T)`: the spelling of type `T`, and an integer that identifies it.
-- `$pointee_of(T)`, `$discriminant_of(T)`: the type a typed reference refers to, and a tag's discriminator type, written where a type is expected.
-- `$error("message")`: produces a compile error when encountered in an active branch.
-
-Every intrinsic is described in `doc/language/comptime-intrinsics.md`.
-
-## Decorators
-
-Decorators attach compiler metadata to declarations. Each directive is written in its own `#[<name>]` or `#[<name>(arg)]` clause. Multiple decorators can be stacked across several lines immediately preceding the declaration or written space-separated on one line:
+`asm <selection> { }` takes a mandatory instruction-set head in the assembler's syntax (`x86-64`, `x86-64,avx2`, `armv8-a`, `rv64i`), read for the compile target, so `$if` picks one block per architecture. The body uses its dialect's comments (`#` on x86 and RISC-V, `//` on aarch64). `{name}` substitutes a local, parameter or constant, placed in a register, memory or an immediate as the instruction allows, so load a pointer into a register before dereferencing it, never `[{p}]`. Clobbers and memory effects are inferred. Labels are numbered (`1:`, `1b`).
 
 ```mach
-#[inline("always")]
-#[symbol("fast_calc")]
-pub fun fast_calc(x: i64) i64 {
-    ret x * 2;
-}
-```
-
-- `#[symbol("name")]`: overrides the exported or imported linker symbol name.
-- `#[inline("always")]`: forces the compiler to inline a function, and `#[inline("never")]` forbids it.
-- `#[align(N)]`: raises the alignment of a record, union, tag, global or function.
-- `#[packed]`: removes alignment padding from a record, union, or tag.
-- `#[section(".name")]`: places a function or global variable into a specific object file section.
-- `#[embed("path")]`: embeds the raw bytes of an external file at compile time into an uninitialized `val name: [_]u8;` array.
-- `#[library("name")]`: specifies the dynamic library name required for an external import.
-- `#[deprecated]` or `#[deprecated("message")]`: emits a compile warning wherever another module uses the decorated symbol.
-- `#[vectorize("never")]`: opts a function out of automatic vectorization.
-- `#[naked]`: emits a function without prologue or epilogue code, intended for functions written entirely with inline assembly.
-- `#[constant_time("soft")]` or `#[constant_time("hard")]`: marks a function as constant-time, verifying that no secret-dependent branches or variable-latency operations are emitted.
-
-Every decorator, and where each one applies, is listed in `doc/language/decorators.md`.
-
-## Inline Assembly
-
-Inline assembly uses an ISA-tagged block with native instruction text:
-
-```mach
-pub fun pause() {
+pub fun add_asm(a: i64, b: i64) i64 {
+    var r: i64 = 0;
     $if ($mach.build.arch == $mach.arch.x86_64) {
         asm x86-64 {
-            pause
+            mov rax, {a}
+            add rax, {b}
+            mov {r}, rax
         }
     }
-    $or ($mach.build.arch == $mach.arch.aarch64) {
-        asm armv8-a {
-            isb
-        }
+    $or {
+        r = a + b;
     }
-    $or ($mach.build.arch == $mach.arch.riscv64) {
-        asm rv64i_zihintpause {
-            pause
-        }
-    }
+    ret r;
 }
 ```
 
-Rules for inline assembly:
-- The head is mandatory and is a selection in masc's syntax for the instruction set, such as `x86-64`, `x86-64,avx2`, `armv8-a` or `rv64gc_zba`. A head names no architecture, so `$if` chooses a block per target.
-- Operands reference local variables via `{name}` substitution. The compiler resolves substitutions to registers or stack slots based on instruction semantics.
-- Never write double indirections like `[{ptr}]`. Always load the address into a register first, then dereference the register.
-- The compiler automatically infers clobber sets and assumes a memory clobber. Manual clobber lists do not exist.
+## Foreign functions and linking
+
+`ext fun` declares a C-ABI function with no body, `#[symbol]` renames it, and `...` after a fixed parameter makes it C-variadic, where narrow integers and `f32` need explicit casts. An artifact names `[link.X]` entries in its `link` array (`link = ["c"]`), and `-l name` and paths on the command line add inputs. System libraries on linux need `env = "gnu"` on the target.
+
+```mach
+use std.runtime;
+
+#[symbol("write")]
+ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
+#[library("c")]
+ext fun strlen(s: *u8) i64;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val msg: *u8 = "hello from c\n";
+    libc_write(1, msg, strlen(msg));
+    # prints: hello from c
+    ret 0;
+}
+```
+
+```toml
+[target.linux-x86_64]
+arch = "x86_64"
+sys  = "linux"
+abi  = "sysv64"
+env  = "gnu"
+
+[link.c]
+source = "system"
+name   = "c"
+sys    = ["linux"]
+arch   = ["*"]
+abi    = ["*"]
+```
+
+## Tests
+
+`test name { }` sits in any module the artifact's entry reaches, named `subject__case` by convention, in a namespace of its own. The body returns an exit status: `0` or falling off the end passes, `77` skips, any other value up to 255 fails, so distinct codes name the failing check. A host-specific test sits in a `$if`. Fixtures are `#[testing]`. There are no assertion intrinsics.
+
+```mach
+use std.types.bool.bool;
+
+fun is_leap(y: i64) bool {
+    if (y % 400 == 0) { ret 1; }
+    if (y % 100 == 0) { ret 0; }
+    ret y % 4 == 0;
+}
+
+test is_leap__centuries {
+    if (!is_leap(2000)) { ret 1; }
+    if (is_leap(1900))  { ret 2; }
+}
+
+test is_leap__needs_a_feature {
+    ret 77;
+}
+```
+
+`mach test .` runs each test as its own process and reports per module. Flags: `--filter <substr>`, `--list`, `--include-deps`, `--threads <n>`, `--timeout <dur>` (default 60s), `--runner <cmd>`. A test's name in output is `<module>#<name>`.
+
+## std idioms
+
+| Need | Use |
+|---|---|
+| print | `std.print`: `print`, `println`, `eprintln`, `printf("x={}\n", v)`, `printlnf`. Holes `{}`, `{:x}` `{:X}` `{:b}` `{:c}` `{:8}` `{:08}` `{:<8}`, braces `{{` `}}`. A bare literal in a pack is `i64` or `f64`, so suffix any other |
+| outcomes | `std.types.result.res`, `std.types.option.opt`, `std.types.error.err` |
+| allocation | `std.allocator` (`A.Allocator`, `allocate[T]`, `deallocate[T]`), backings `std.allocator.page.make`, `arena`, `heap`, `bump`, `fixed` |
+| growable array | `std.collections.vector` (`init`, `push`, `get`, `length`, `dnit`), `Slice[T]` in `std.collections.slice` |
+| memory | `std.memory`: `copy[T]`, `move[T]`, `fill[T]`, `zero[T]`, `equal[T]` |
+| strings | `std.types.string`: `str_len`, `str_equals`, `str_compare`, `str_find`, `str_copy(?a, s)` |
+| arguments | `std.args`: `args.of(argc::usize, argv)`, `args.get(a, i)` gives `opt[str]` |
+| abort | `std.system.panic.panic("msg")` exits 255 |
+
+```mach
+use A: std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.print;
+use std.runtime;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var a:    A.Allocator;
+    val made: err[A.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var v: Vector[i64] = vector.init[i64](?a);
+    fin { vector.dnit[i64](?v); }
+    # wrong: fin { v.dnit(); }   -> field.unknown
+    var i: i64 = 0;
+    for (i < 4) {
+        val pushed: res[usize, A.Error] = vector.push[i64](?v, i * i);
+        if (sel pushed.err) { ret 2; }
+        i = i + 1;
+    }
+    val third: opt[*i64] = vector.get[i64](?v, 2);
+    if (!sel third.some) { ret 3; }
+    print.printlnf("len {} third {} hex {:x}", vector.length[i64](?v), @third.some, 255u32);
+    # prints: len 4 third 4 hex ff
+    ret 0;
+}
+```
+
+## Commands
+
+```sh
+mach check .                     # parse, resolve, type-check: the fast loop
+mach build .                     # compile and link every selected cell
+mach build . -t linux-aarch64 -p release
+mach run . -- arg1 arg2          # run what build wrote. never builds
+mach test . --filter is_leap
+mach fmt .                       # canonical layout, no options. --check for CI
+mach dep pull .                  # realize dep/ at its pins. build never fetches
+mach check . --report lines      # one tab-separated record per diagnostic, for scripts
+mach build tool.mach --source std=dep/std   # one file outside a project
+```
+
+A build never touches `dep/`: a missing dependency is refused naming `mach dep pull .`, and only `mach dep update` moves a pin. `mach run` after an edit runs the old binary until the next build. Flags of 6 (`--jobs`, `-O2`, `-g`) are refused naming their replacements (`--threads`, `-O`, `--debug`). Diagnostics carry a key such as `error[tag.payload_unguarded]` and a `@ file:line:col` position.

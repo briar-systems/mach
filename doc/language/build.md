@@ -116,8 +116,10 @@ already leave only one answer:
 
 A glob over the artifact axis settles each artifact it names the same way, and
 leaves out one that cannot be settled. When the glob selects nothing else, the
-refusal of an artifact the manifest declares no host target for stands, and an
-artifact that does not list the host target gives `target.no_artifacts`.
+refusal of an artifact the manifest declares no host target for stands, and so
+does the `selection.no_host_target` of an artifact whose only target is hosted
+and not the host's, while an artifact that lists several targets, none of them
+the host target, gives `target.no_artifacts`.
 
 An explicit `-t` always wins, including when it names a target the artifact
 does not list, and that pair is still refused by name. This only applies to a named
@@ -150,8 +152,29 @@ a build never writes outside the tree it was asked to build.
 ## When one cell fails
 
 Every cell is attempted, and a failure does not abandon the ones after it. Each cell's
-diagnostics are reported under its own heading as it happens, and every cell that
-succeeded leaves its artifact on disk at its own path. Nothing is rolled back.
+diagnostics are reported as they happen, and when the selection has several cells
+they follow a line naming the cell, its target, artifact and profile as the units
+table spells them (under `-v`, the banner over the cell's table). One tally of
+every cell's errors and warnings closes the run:
+
+```
+one  broken  debug
+error[name.unresolved] unresolved identifier `missing`
+  @ src/broken.mach:2:13
+2 |     ret x + missing;
+  |             ^^^^^^^
+
+two  broken  debug
+error[name.unresolved] unresolved identifier `missing`
+  @ src/broken.mach:2:13
+2 |     ret x + missing;
+  |             ^^^^^^^
+
+2 errors / 0 warnings
+```
+
+Every cell that succeeded leaves its artifact on disk at its own path.
+Nothing is rolled back.
 
 A cell that fails, or is not built because an artifact it needs failed, leaves
 nothing at its output path that could be taken for its product: the artifact
@@ -178,7 +201,16 @@ they are marked, and it is raised before any step runs. A declared target that d
 not match the host is built only when `-t` names it:
 
 ```
-error[selection.no_host_target] mach.toml: 'native' matches no declared target for the host linux-aarch64, and the declared targets are linux-x86_64 (linux-x86_64), windows-x86_64 (windows-x86_64). declare a [target.<name>] for the host or select one with -t
+error[selection.no_host_target] mach.toml: 'native' matches no declared target for the host linux-x86_64, and the declared targets are linux-aarch64 (linux-aarch64), windows-x86_64 (windows-x86_64), board (freestanding-x86_64). declare a [target.<name>] for the host or select one with -t
+   @ ./mach.toml:8:9
+ 8 | [target.linux-aarch64]
+   |         ^^^^^^^^^^^^^
+   @ ./mach.toml:13:9
+13 | [target.windows-x86_64]
+   |         --------------
+   @ ./mach.toml:25:9
+25 | [target.board]
+   |         -----
 ```
 
 A cross-only project whose targets are hosted (`linux`, `darwin`, `windows`)
@@ -189,7 +221,7 @@ when its `targets` list leaves one answer. The same rule holds there. An artifac
 only target is hosted and does not match the host is refused with
 `selection.no_host_target`, naming the artifact, because building it would be the same
 fallback. An artifact whose only target no host runs as `native` (a `freestanding`,
-`uefi` or `wasi` target, or a finished-module target on `vulkan` or `opencl`) is still pinned to it:
+`uefi` or `wasi` target, or a finished-module target on `vulkan`) is still pinned to it:
 such a target is never `native`, so naming the artifact selects it explicitly, and a
 host artifact that `need`s it builds it on any host. This path is taken whenever an
 artifact is settled before its target: `mach build` and `mach check` with
@@ -228,7 +260,8 @@ of its own: the libraries it links are the ones its bound projects export.
 `-k` takes mink's product names, the values of an artifact's `kind`: `bin` (the
 default), `static`, `shared`, `object` or `module`. `--linkage` says how a `bin` is
 linked, by mink's linkage names: `pie`, `dynamic` or `static`. Left out, it is the
-target's default, which `mach info targets` lists first under `linkage=`. It is
+target's default, which `mach info targets` marks `*` under `linkage=` for each
+environment. It is
 refused with any other `-k`, naming the kind, and a linkage the target's loader
 does not run is refused in mink's words, listing those it does:
 
@@ -255,9 +288,11 @@ environment, so an entry build that links the C library names `--env gnu`. The
 previous major's `--arch` and `--sys` are refused naming `-t`, and `--of` is
 refused because the system implies the object format.
 `--set` writes a manifest key over the entry build's target, artifact or profile
-as over a project's, so `mach build main.mach --set simd=require` builds the
-file under `simd = "require"`, and `mach build main.mach -O --set passes.licm=false`
-optimizes it with every optimization pass but loop invariant motion (see
+as over a project's, so `mach build main.mach --set simd=require -o strict` builds
+the file under `simd = "require"`, and
+`mach build main.mach -O --set passes.licm=false -o fast` optimizes it with every
+optimization pass but loop invariant motion. A `--set` changes the build's profile,
+so it names its output with `-o` or `-w` (see
 [Overriding a key for one build](manifest.md#overriding-a-key-for-one-build)).
 
 ## See also

@@ -92,7 +92,7 @@ fun sum[T](p: *T, n: u64) T {
 
 The literal takes `T` under the same rules as anywhere else. An integer literal
 is never implicitly a float, so `sum[f64]` is refused as `type.mismatch`
-(`expected f64, found i64`) at the call that asks for it, pointing at
+(`expected T (that is f64), found i64`) at the call that asks for it, pointing at
 `var acc: T = 0;` in the body, just as `var x: f64 = 0;` is refused. A
 generic meant for floats too converts the literal, as `var acc: T = 0::T;`, which
 every numeric instance accepts.

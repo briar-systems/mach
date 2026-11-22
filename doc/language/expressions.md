@@ -86,7 +86,7 @@ past it is refused as `index.out_of_bounds`. See
 
 For tagged values:
 
-- `sel tag_val.case` tests whether that case is currently selected. It reads only the discriminator and is an ordinary `bool`.
+- `sel tag_val.case` tests whether that case is currently selected. It reads only the discriminator and has type `u1`, the type of std's `bool`.
 - `tag_val.case` accesses the payload of that case. It is legal only inside a lexical guard for that place and case. An unguarded payload access is refused as `tag.payload_unguarded`.
 - `TypeName.case` alone is a case selector, not a value. It cannot be stored, assigned or passed, and using it as a value is refused as `tag.selector_value`.
 
@@ -119,6 +119,8 @@ See [operators.md](operators.md). Operators combine expressions into larger
 expressions. The binding order is the precedence table in
 [grammar.md](grammar.md#operator-precedence). Comparison binds tighter than
 `&`, `^` and `|`, so a bit test is parenthesized, as `(x & 0x0f) != 0`.
+Written without the parentheses, `x & 0x0f != 0` gives `&` the u1 of
+`0x0f != 0`, and the refusal of that u1 notes that the comparison was read first.
 
 ## See also
 

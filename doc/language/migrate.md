@@ -145,7 +145,8 @@ Left for you to change:
 | a darwin `source = "system"` shared entry named by no install name, as `name = "MoltenVK"`, whose file 6 found and linked by the install name it states | the install name, as `name = "@rpath/libMoltenVK.dylib"` or an absolute path, which 7 links from the entry's claim with no file |
 | a linux artifact whose links reach the C library only through another library's dependency, as `pthread`, `m`, `dl` or `rt` with no `c`, which 6 bound through that library's own dependency | `c` named in the artifact's links, since 7 binds a reference only to a library the link names |
 
-The compiler refuses the first three, and `mach migrate` reports the next six. An id
+The compiler refuses the first three, `mach migrate` reports the next eight, and the
+last is refused by the link, with no report before it. An id
 or a `[dep]` key holding `-` is refused as `manifest.invalid_name` before anything is
 written, since the id is one name in three places, the `[dep]` key, the `dep/`
 directory and the head of every consumer's `use` path, and migrate edits only the
@@ -154,9 +155,9 @@ its name, saying which of the three it met. A `u8`
 condition is refused as `condition.type` and a `u1` under an operator as
 `type.mismatch`, each naming the replacement. A `u1` stored in a `u8` is refused as
 `type.mismatch`, `expected u8, found u1`, with a help line naming the cast,
-``cast the value with `::u8` ``. A secret passed through a function value whose type
-states no constant-time mode is refused as `secret.call_untrusted`, naming the marked
-alias. `mach migrate` rewrites `#[oblivious]` but writes no alias, since only the
+``parenthesise the value and cast it with `::u8` ``. A secret passed through a function
+value whose type states no constant-time mode is refused as `secret.call_untrusted`,
+naming an alias marked `#[constant_time]` as the fix. `mach migrate` rewrites `#[oblivious]` but writes no alias, since only the
 author knows which function values the code means to trust: the functions stored in
 such a value must be constant time themselves, and a plain or `#[weak]` one is refused
 where it is stored ([secrecy.md](secrecy.md#function-types-marked-constant-time)). Several default libraries in one manifest are
@@ -171,8 +172,10 @@ install name have no one answer migrate can write, since `env` changes how every
 `bin` of the target links and the install name is the library's own. The C library
 is refused as symbols nothing defines. When the named library is a shared library
 that depends on the C library, as `m` is, a note says so. On glibc 2.34 and later
-`pthread`, `dl` and `rt` are empty archives with no dependencies, so their refusal
-names only the undefined symbols and the files that refer to them. A report names the line of the table it is about.
+`pthread`, `dl` and `rt` define none of their old symbols: their archives are empty,
+so a static link's refusal names only the undefined symbols and the files that refer
+to them, and their shared objects depend on the C library, so a shared link's refusal
+adds the note. A report names the line of the table it is about.
 
 A tag whose payloads disagree on the class of a byte, secret against public or a
 pointer that reaches a secret against anything but a pointer to the same storage,

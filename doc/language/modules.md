@@ -49,7 +49,8 @@ symbols through the surface, so they never need to name the split files.
 The pattern is a convention: a split is an ordinary module, so a
 `use myproj.foo.a;` elsewhere still resolves. Only a `pub` symbol can be
 forwarded, and `fwd a.X;` on a private `X` is refused with
-`visibility.not_exported`, `re-exported symbol is not exported by its module`.
+`visibility.not_exported`, naming the symbol and its module, as
+`` `X` is not exported by `myproj.foo.a` ``.
 
 ```mach
 # file: src/foo/a.mach

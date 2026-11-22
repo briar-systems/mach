@@ -182,12 +182,13 @@ The verdict closes the run: `passed` and the count, or `failed` and how many of
 the count failed, with the skip count after it whenever a test skipped:
 
 ```
-app.main     1.1ms     1 ok      1 skip      1 FAIL
+app.bin.main       615us     1 ok     1 skip     1 FAIL
+app.parser         323us     1 ok
 
-FAIL  app.main#fails_on_purpose  src/main.mach:11  (exit 3)
-      rerun: ./out/linux-x86_64/debug/test/app/app 2
+FAIL  app.bin.main#fails_on_purpose  src/bin/main.mach:13  (exit 3)
+      rerun: ./out/linux-x86_64/debug/test/app/app 1
 
-    failed  1 of 3 tests, 1 skipped   1.0ms
+    failed  1 of 4 tests, 1 skipped   764us
 ```
 
 The exit code of `mach test`:
@@ -210,7 +211,9 @@ holds it, the names padded to the widest, and exits without linking or running
 anything:
 
 ```
-app.main#fails_on_purpose          ./out/linux-x86_64/debug/obj/app/main.test.o
+app.bin.main#passes                ./out/linux-x86_64/debug/obj/app/bin/main.test.o
+app.bin.main#fails_on_purpose      ./out/linux-x86_64/debug/obj/app/bin/main.test.o
+app.bin.main#skips_here            ./out/linux-x86_64/debug/obj/app/bin/main.test.o
 app.parser#rejects_trailing_comma  ./out/linux-x86_64/debug/obj/app/parser.test.o
 ```
 
@@ -238,7 +241,9 @@ separately on the summary line, and is still a failing test for the exit code,
 so the suite exits `1`.
 
 ```
-FAIL  app.main#spins  src/main.mach:4  (timed out after 1s)
+app.bin.main        1.0s     0 ok                1 FAIL
+
+FAIL  app.bin.main#spins  src/bin/main.mach:8  (timed out after 1s)
       rerun: ./out/linux-x86_64/debug/test/app/app 0
 
     failed  1 of 1 test (1 timed out)   1.0s
@@ -337,7 +342,7 @@ one invocation, launching each test as `<cmd> <exe> <index>`, and needs the sele
 to resolve to one (artifact, target, profile), foreign or not.
 
 A [finished-module target](manifest.md#finished-module-targets), a shader on
-`vulkan` or a kernel on `opencl`, links no executable, so it has no dispatcher. A
+`vulkan`, links no executable, so it has no dispatcher. A
 cell on one is built as `mach build` builds it, its module written to the
 artifact's own `out`, and its (target, profile) is reported on a `skipped` line
 with the reason beneath while the other cells build and run:

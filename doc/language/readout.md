@@ -14,13 +14,23 @@ shows, on which stream, and when.
 
 | Flag | `build` and `check` | `test` |
 |---|---|---|
-| none | diagnostics, failures, the progress line of the unit, or the units table of a selection of several, and the closing tally when anything was reported | the build's output as for `build` (the test dispatcher's own line only under `-v`), then one row per module, each failure once and the verdict |
-| `-v` | also each unit's table of stages with its `other` and `total` rows and its counter lines, and before each table a banner naming the unit when the selection has several | the build's tables, and one line per test instead of the module rows |
+| none | diagnostics, failures, the progress line of the unit, or the units table of a selection of several, before a unit's first diagnostic or failure a line naming the unit when the selection has several, and the closing tally when an error or warning was reported | the build's output as for `build` (the test dispatcher's own line only under `-v`), then one row per module, each failure once and the verdict |
+| `-v` | also each unit's table of stages with its `other` and `total` rows and its counter lines, and before each table a banner naming the unit (its target, artifact and profile, as the units table spells them) when the selection has several | the build's tables, and one line per test instead of the module rows |
 | `-vv` | also, under each stage, one line per module or file it processed, each stage naming its slowest, and a table of each module's counters | the build's per-module lines, and the captured output of passing tests |
 
 `-v` and `-vv` cannot be combined with `--quiet` or `-q`, which is refused as
 `cli.flag_conflict`. `--quiet` drops the progress lines, the units table and
-the banners.
+the banners, and keeps the line naming a unit that reports a diagnostic.
+
+Every command that reports an error or a warning in human text ends its stderr
+with one tally of them all, whichever unit, phase or check raised each, a refusal
+raised before any unit is built included:
+
+```
+error[selection.unknown] mach.toml: no target named 'nosuch' (the declared ones are native)
+
+1 error / 0 warnings
+```
 
 ## Progress lines
 
@@ -40,11 +50,11 @@ the module count, and a build with nothing to do says `unchanged` on one line:
 
 ```
      built  demo  linux-x86_64  debug
-            demo/out/linux-x86_64/debug/bin/demo   78 KiB   53 modules   666ms
+            demo/out/linux-x86_64/debug/bin/demo   51 KiB   51 modules   453ms
      built  demo  linux-x86_64  debug
-            demo/out/linux-x86_64/debug/bin/demo   78 KiB   3 of 53 modules rebuilt   321ms
- unchanged  demo  linux-x86_64  debug   231ms
-   checked  demo  linux-x86_64  debug   187ms
+            demo/out/linux-x86_64/debug/bin/demo   51 KiB   1 of 51 modules rebuilt   226ms
+ unchanged  demo  linux-x86_64  debug   166ms
+   checked  demo  linux-x86_64  debug   158ms
 ```
 
 The rebuilt count is the units the build compiled code for, read from what it
@@ -54,13 +64,15 @@ for several modules, and the line says `objects` then.
 A selection of several units, across targets, artifacts or profiles, prints one
 table under one verb when the last of them closes: `checked` when every unit was
 a check, `unchanged` when every unit found everything current, `built`
-otherwise. The profile column shows only when the units differ in profile:
+otherwise. A unit that rebuilt nothing in a `built` table shows `0 of N modules
+rebuilt`. The profile column shows only when the units differ in profile:
 
 ```
-     built  target          artifact  profile  modules        size   time
-            linux-x86_64    demo      debug    53 modules   78 KiB  686ms
-            linux-aarch64   demo      debug    53 modules   80 KiB  952ms
-            linux-x86_64    demo      release  53 modules   26 KiB  695ms
+     built  target         artifact  profile  modules       size   time
+            linux-x86_64   demo      debug    51 modules  51 KiB  412ms
+            linux-aarch64  demo      debug    51 modules  54 KiB  636ms
+            linux-x86_64   demo      release  51 modules  10 KiB  454ms
+            linux-aarch64  demo      release  51 modules  13 KiB   1.5s
 ```
 
 When stderr is a terminal and the report is human text, a build shows a live
@@ -100,23 +112,30 @@ count 0.
 
 ```
 stage         count              time
-target            1 target       15ms    #
-load             57 modules      54ms    #####
-cache             0 modules      38ms    ####
-resolve          57 modules      23ms    ##
-sema             57 modules     103ms    ##########
-lower            53 objects     234ms *  ######################
-codegen          53 objects     166ms    ################
-alloc            53 objects     250ms *  ########################
-emit             53 objects      98ms    #########
-link              1 binary       49ms    #####
-other                           2.3ms
-total                           548ms
+target            1 target       15ms    ##
+load             55 modules      49ms    ######
+cache             0 modules      39ms    #####
+resolve          55 modules      16ms    ##
+sema             55 modules      69ms    ########
+lower            51 objects     156ms *  ##################
+verify           51 objects       0us *
+codegen          51 objects     136ms    ################
+passes           51 objects      78ms *  #########
+select           51 objects     151ms *  ##################
+alloc            51 objects     203ms *  ########################
+frame            51 objects     104ms *  ############
+mirl emit        51 objects     140ms *  #################
+layout           51 objects      52ms *  ######
+encode           51 objects     9.3ms *  #
+emit             51 objects      55ms    ######
+link              1 binary       32ms    ####
+other                           2.0ms
+total                           411ms
 * summed over 16 threads
-code    882 functions  30,634 ir  47,092 selected  47,867 allocated  1,038 alloc rounds
-memory  35 MiB peak  393 MiB allocated in 478,484 blocks
+code    876 functions  30,591 ir  41,442 selected  42,239 allocated  1,035 alloc rounds
+memory  26 MiB peak  349 MiB allocated in 481,509 blocks
      built  demo  linux-x86_64  debug
-            demo/out/linux-x86_64/debug/bin/demo   78 KiB   53 modules   548ms
+            demo/out/linux-x86_64/debug/bin/demo   51 KiB   51 modules   411ms
 ```
 
 The table has a header row, then one row per phase in the order the phases
@@ -125,8 +144,9 @@ of columns: the label, the count right-aligned with its noun beside it, singular
 for a count of one, the time right-aligned, the `*` mark, and a bar of `#`. A
 row with nothing to count leaves its count blank. A bar is at most 24 columns,
 the longest row's, and each other row's is its time scaled to that, rounded to
-the nearest column, so a row too small to show one has none. The line under
-`-vv` for a module or file puts its time in the time column and its name
+the nearest column, so a row too small to show one has none. Under `-vv` a row
+names its slowest item after its bar, as `(slowest std.format 9.9ms)`, and the
+line for a module or file puts its time in the time column and its name
 after it.
 
 A time is rounded to the nearest of its last digit: microseconds below a
@@ -194,7 +214,13 @@ bytes as a size. A unit that ends without closing shows its table and totals
 before what follows it. A counter whose total is zero, as `verify runs` is
 without `--verify`, is left out. Its word on the line follows its label in the
 table below (`ir` for `ir instrs`, `blocks` for `heap blocks`, `allocated` for
-`heap bytes` and for `allocated instrs`, `peak` for `heap peak`):
+`heap bytes` and for `allocated instrs`, `peak` for `heap peak`), singular for a
+count of one:
+
+```
+code    1 function  5 ir  7 selected  7 allocated  1 alloc round
+memory  1.5 MiB peak  150 KiB allocated in 566 blocks
+```
 
 | Counter | What it counts | Read from |
 |---|---|---|
@@ -225,7 +251,7 @@ instance count doubles, written at once, so an expansion that does not stop
 shows while it runs:
 
 ```
-instantiate  growing cycle peel in app.main: 32 instances so far
+instantiate  growing cycle peel in app.bin.main: 32 instances so far
 ```
 
 Under `--report json` or `lines` every one of these is a record, written when
@@ -245,14 +271,19 @@ compiles, every optimisation pass that changed the function, in the order the
 passes ran, one line each on stdout:
 
 ```
-inline app.main 2
-vectorise loop_copy.copy_bytes 1
-promote app.main
+promote std.memory.raw_fill
+fold std.memory.raw_fill
+cse std.memory.raw_fill
+bypass std.memory.raw_fill 2
+vectorise std.memory.raw_fill 1
+unroll std.memory.raw_fill
+rotate std.memory.raw_fill 3
 ```
 
 A line is the pass's name, the function's symbol and, for a pass that counts
 what it does, the count: calls inlined (`inline`), loops vectorised
-(`vectorise`), switches formed (`switch`) and stores removed (`dse`). A pass
+(`vectorise`), loops rotated (`rotate`), instructions moved (`licm`), blocks
+bypassed (`bypass`), switches formed (`switch`) and stores removed (`dse`). A pass
 that counts nothing gives no count. Each line is written whole, so the lines of
 modules compiled side by side never mix, though their order between modules is
 the order the modules finish. A build that runs no optimisation pass reports
@@ -269,25 +300,29 @@ a module's row is written once the last of its tests finishes, so a slow test
 holds back only its own module's row:
 
 ```
-demo.shape         254us     0 ok                1 FAIL
-demo.util          175us     1 ok
+app.bin.main       615us     1 ok     1 skip     1 FAIL
+app.parser         323us     1 ok
 
-FAIL  demo.shape#twice__basic  demo/src/shape.mach:8  (exit 1)
-      rerun: demo/out/linux-x86_64/debug/test/demo/demo 0
+FAIL  app.bin.main#fails_on_purpose  src/bin/main.mach:13  (exit 3)
+      rerun: ./out/linux-x86_64/debug/test/app/app 1
 
-    failed  1 of 2 tests   380us
+    failed  1 of 4 tests, 1 skipped   764us
 ```
 
 A module row is the module, its time, and its counts in columns of their own,
-a skip or FAIL count only when it is not zero.
+a skip or FAIL count only when it is not zero. When the selection holds several
+(target, profile) pairs, the rows of each that runs open with a line naming it,
+as `linux-x86_64 (debug):`, and each that is built and not run is a `skipped`
+line.
 
 Under `-v` each test is its own line, written when it finishes, a passing
 test's captured output beneath it under `-vv`:
 
 ```
-ok    app.parser#rejects_trailing_comma  2.0ms
-skip  app.crypto#aes_round_trip          1.1ms
-FAIL  app.main#fails_on_purpose          1.3ms
+ok    app.bin.main#passes                 477us
+FAIL  app.bin.main#fails_on_purpose       461us
+skip  app.bin.main#skips_here             383us
+ok    app.parser#rejects_trailing_comma   344us
 ```
 
 When the run ends each failure is shown once, in collection order, the order
@@ -299,8 +334,9 @@ failed, followed by how many of those timed out and how many tests skipped, and
 the run's wall time:
 
 ```
-    passed  2 tests   2.2ms
-    failed  2 of 18 tests (1 timed out), 1 skipped   61ms
+    passed  1 test   238us
+    failed  1 of 4 tests, 1 skipped   739us
+    failed  1 of 1 test (1 timed out)   1.0s
 ```
 
 Every time the test readout prints is wall time. A `-v` line's time is the

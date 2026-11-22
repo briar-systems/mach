@@ -6,8 +6,8 @@ key, a stable code a tool can match instead of the wording:
 
 ```
 error[name.unresolved] unresolved identifier `helpr`
-  @ src/main.mach:4:9
-4 |     ret helpr(x) * 2;
+  @ src/bin/main.mach:5:9
+5 |     ret helpr(x) * 2;
   |         ^^^^^
   help did you mean `helper`?
 ```
@@ -26,9 +26,16 @@ declaration and the condition that left it out (see
 [comptime-control.md](comptime-control.md)). The
 [json record](report-records.md) carries them as its `related` sites.
 
+An excerpt underlines its span's first line with `^` (`-` for another place) and
+each line after it with `-`. A span of more than ten lines shows its first and last
+lines with `| ...` between them.
+
 A note says what a command did or found and never fails it. Its human text is
 `note <message>`, without the key, which the
-[json record](report-records.md#notes) carries.
+[json record](report-records.md#notes) carries. A note that reports what a
+command did is written in human text as that command's progress line instead,
+as `mach init` writes `created` and `realized` (see
+[readout.md](readout.md#progress-lines)).
 
 ## Keys
 
@@ -69,7 +76,7 @@ as the annotation writes it, and the type it names follows once in parentheses
 where the two spellings differ. The found type is always spelled by its parts:
 
 ```
-error[type.mismatch] expected res[Vector[str], fs.FsError] (that is res[Vector[*u8], FsError]), found res[Vector[Listed], FsError]
+error[type.mismatch] expected res[str, FsError] (that is res[*u8, FsError]), found res[*Listed, FsError]
 ```
 
 ## The registry
@@ -115,14 +122,14 @@ modules or generic instances raise it.
 | `source` | characters the source may not contain |
 | `literal`, `float` | a literal that is malformed, unterminated or out of range for its type, and a float literal that is not exact at its type (`float.inexact`) |
 | `name`, `use`, `module`, `visibility`, `import`, `fwd` | names that do not resolve, collide, take a built-in type's name (`name.builtin_type`) or are not exported, and `use` and `fwd` paths |
-| `decl`, `def`, `binding`, `global`, `const` | declaration forms: bindings, globals, constants and type aliases |
+| `decl`, `def`, `fun`, `binding`, `global`, `const` | declaration forms: bindings, globals, constants, type aliases, and a function declared without a body (`fun.bodyless`) |
 | `type`, `cast`, `operator`, `condition`, `assign`, `address`, `ptr` | type checking: mismatches, conversions, operators, conditions, assignment and addresses |
 | `call`, `variadic`, `pack`, `ret` | calls, C-variadic and pack parameters, and returned values |
 | `jump` | a `brk` or `cnt` with no enclosing loop (`jump.no_loop`) |
 | `field`, `index`, `range`, `shift`, `array`, `uni`, `tag`, `sel`, `guard` | records, arrays, unions, tags, `sel` and guarded places |
 | `generic` | type arguments and instantiation |
 | `comptime`, `gate`, `each` | compile-time evaluation, intrinsics and descriptors, `$if` gates, `$each`, and the user's own `$error` (`comptime.user_error`) |
-| `decorator`, `expect`, `extension`, `embed`, `handle`, `abi_type`, `op`, `naked`, `fin`, `ext` | decorators and the declarations they shape |
+| `decorator`, `expect`, `extension`, `embed`, `handle`, `abi_type`, `op`, `naked`, `noreturn`, `fin`, `ext` | decorators and the declarations they shape |
 | `test`, `testing` | `test` blocks and `#[testing]` declarations |
 | `secret` | the secrecy rules in the source (`secret.branch`), and the constant-time validation of emitted code (`secret.unverifiable`) |
 | `vector` | vector types and operations, including the scalar fallback (`vector.scalarize`) |

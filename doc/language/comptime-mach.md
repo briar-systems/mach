@@ -97,8 +97,8 @@ $or {
 - x86-64 answers 1 for every multiply at every width on every OS, and riscv64
   and riscv32 with Zkt selected (`rv64gc_zkt`, `rv32gc_zkt`) do as well.
   aarch64 classifies its multiplies under PSTATE.DIT, so it answers 1, for
-  every multiply at every width, only where the target's baseline holds DIT,
-  as darwin-arm64's does. A `soft` function sets the mode where the processor
+  every multiply at every width, only where the target holds DIT, in its
+  baseline as darwin-arm64's does or selected with `ext = ["dit"]`. A `soft` function sets the mode where the processor
   has it, which the query does not count on (see
   [secrecy.md](secrecy.md#soft-and-hard)). Every other target folds to 0. Lane
   multiplies are not part of the query.
@@ -241,32 +241,45 @@ $mach.sys.freestanding           # no OS / bare metal
 $mach.sys.uefi                   # a PE image a UEFI firmware loads
 $mach.sys.vulkan                 # a spir-v module's system
 $mach.sys.wasi
+$mach.sys.opencl                 # a spir-v kernel module's system
 $mach.arch.x86_64
+$mach.arch.x86
 $mach.arch.aarch64
+$mach.arch.arm64e
+$mach.arch.arm64ec
 $mach.arch.riscv64
 $mach.arch.riscv32
-$mach.arch.spirv
+$mach.arch.riscv64e
+$mach.arch.riscv32e
 $mach.arch.wasm32
+$mach.arch.wasm64
+$mach.arch.spirv
 $mach.abi.sysv64
 $mach.abi.win64
+$mach.abi.sysv32
 $mach.abi.aapcs64
 $mach.abi.darwinpcs
 $mach.abi.aapcs64win
-$mach.abi.lp64
-$mach.abi.lp64f
-$mach.abi.lp64d
+$mach.abi.arm64ec
 $mach.abi.ilp32
 $mach.abi.ilp32f
 $mach.abi.ilp32d
-$mach.abi.shader                 # a spir-v module's convention
+$mach.abi.ilp32e
+$mach.abi.lp64
+$mach.abi.lp64f
+$mach.abi.lp64d
 $mach.abi.basic
+$mach.abi.shader                 # a spir-v module's convention
+$mach.abi.kernel                 # a spir-v kernel's convention
 $mach.mode.debug
 $mach.mode.release
 ```
 
 The tag names are the target registries' own spellings, read from them
-directly, so there is no second list to keep in step. A tag name the registry
-does not carry is a compile error, never a silent fold.
+directly, so there is no second list to keep in step: the list above is every
+row the registries carry, including rows no target in `mach info targets` builds
+for yet, as `arm64e` and `wasm64`. A tag name the registry does not carry is a
+compile error, never a silent fold.
 
 The x86-64 System V ABI is spelled `sysv64`, as the registry spells it.
 `$mach.abi.sysv` is an unknown tag, as is any other name the registry does not

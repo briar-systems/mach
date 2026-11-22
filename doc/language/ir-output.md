@@ -15,9 +15,9 @@ and links nothing. `--emit ir --emit exe` also links, and `-o` is refused with
 linked for it to name.
 
 The text reads back. `mirl` reads a file mach wrote, so a module can be
-compiled, verified or optimised on its own with `mirl compile` (`--level` sets
-the optimisation level, and the output goes to standard output unless `-o`
-names a file) and `mirl verify`:
+compiled, verified or optimised on its own with `mirl compile` (`-O` runs the
+optimisation passes, `--pass <name>=off` turns one off, and the output goes to
+standard output unless `-o` names a file) and `mirl verify`:
 
 ```
 mirl compile out/linux-x86_64/debug/ir/demo/main.ir --emit obj -o main.o

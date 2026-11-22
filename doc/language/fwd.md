@@ -19,8 +19,8 @@ fwd ALIAS: PATH;            # re-export with rename
 - A re-exported name must be new in its module. Re-exporting a name twice, by
   leaf or by alias, is refused with `name.duplicate`.
 - Only a `pub` symbol can be re-exported. A `fwd` of a private symbol is
-  refused with `visibility.not_exported`, `re-exported symbol is not exported
-  by its module`.
+  refused with `visibility.not_exported`, naming the symbol and its module,
+  as `` `hidden` is not exported by `example.foo.a` ``.
 - A path that names a project and no module, such as `fwd std;`, is refused
   with `fwd.not_symbol`, `` `fwd` path must name a symbol of a module ``.
 - A path that names no module or member of one is refused with `use.unresolved`,

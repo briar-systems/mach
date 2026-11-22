@@ -36,25 +36,25 @@ and `-vv` write the [readout](readout.md) as [readout records](#readout-records)
   written as a `\u` escape, and a byte that is not valid UTF-8 as `\ufffd`,
   the escape of U+FFFD, so every line is valid UTF-8 and valid JSON.
 - Under `json` and `lines` the human tally (`N errors / M warnings`) is not written, and
-  the `building <artifact>` banners and `profile <name>:` headers are not
-  written. Under `-v` a `unit` record opens every unit instead.
+  neither are the banners `-v` writes above each unit's table nor the line naming a unit
+  that reports a diagnostic. Under `-v` a `unit` record opens every unit instead.
 
 ## A record
 
 ```json
-{"schema":3,"record":"diagnostic","severity":"error","code":"name.unresolved","message":"unresolved identifier `helpr`","origin":"resolve","primary":{"file":"src/main.mach","line":5,"column":18,"end_line":5,"end_column":23,"byte_start":107,"byte_end":112},"related":[],"notes":[],"help":["did you mean `helper`?"],"fixes":[{"label":"replace with `helper`","edits":[{"file":"src/main.mach","line":5,"column":18,"end_line":5,"end_column":23,"byte_start":107,"byte_end":112,"replacement":"helper"}]}]}
+{"schema":3,"record":"diagnostic","severity":"error","code":"name.unresolved","message":"unresolved identifier `helpr`","origin":"resolve","primary":{"file":"src/bin/main.mach","line":5,"column":9,"end_line":5,"end_column":14,"byte_start":84,"byte_end":89},"related":[],"notes":[],"help":["did you mean `helper`?"],"fixes":[{"label":"replace with `helper`","edits":[{"file":"src/bin/main.mach","line":5,"column":9,"end_line":5,"end_column":14,"byte_start":84,"byte_end":89,"replacement":"helper"}]}]}
 ```
 
 A type error in a generic instance, whose primary span covers two lines and
 whose related site is in another file:
 
 ```json
-{"schema":3,"record":"diagnostic","severity":"error","code":"operator.operand_mismatch","message":"operands `u8` and `i64` have different types. cast one operand with `::` so both have one type","origin":"sema","primary":{"file":"src/main.mach","line":6,"column":16,"end_line":7,"end_column":11,"byte_start":111,"byte_end":127},"related":[{"file":"src/lib.mach","line":3,"column":9,"end_line":3,"end_column":14,"byte_start":53,"byte_end":58,"label":"in this generic body, checked against this instance's type arguments"}],"notes":[],"help":[],"fixes":[]}
+{"schema":3,"record":"diagnostic","severity":"error","code":"operator.operand_mismatch","message":"operands `u8` and `i64` have different types. cast one operand with `::` so both have one type","origin":"sema","primary":{"file":"src/bin/main.mach","line":6,"column":17,"end_line":7,"end_column":16,"byte_start":103,"byte_end":131},"related":[{"file":"src/lib.mach","line":2,"column":9,"end_line":2,"end_column":14,"byte_start":41,"byte_end":46,"label":"in this generic body, checked against this instance's type arguments"}],"notes":[],"help":[],"fixes":[]}
 ```
 
 | Member | Type | Meaning |
 |---|---|---|
-| `schema` | integer | the schema version, `2` |
+| `schema` | integer | the schema version, `3` |
 | `record` | string | the record type, `"diagnostic"`, a [failure](#failures) included |
 | `severity` | string | `"error"`, `"warning"` or `"note"` |
 | `code` | string | the diagnostic's key from the [registry](diagnostics.md#the-registry), such as `name.unresolved`; the stable identity of the kind |
@@ -87,7 +87,7 @@ A span is an object:
 | `byte_end` | integer | the byte offset just past its last byte |
 
 The end is exclusive, as in the Language Server Protocol: a span of `helpr` at
-line 5 column 18 ends at line 5 column 23. An empty span has its end equal to
+line 5 column 9 ends at line 5 column 14. An empty span has its end equal to
 its start. A column counts bytes, not characters, so a tool that needs UTF-16
 columns converts from the line's text. `line` and `column` are the position
 the human rendering shows after `@`.
@@ -123,7 +123,7 @@ related places. Its `severity` is `"error"`, its `code` the
 failure's key, and its `notes` and `help` are empty.
 
 ```json
-{"schema":3,"record":"diagnostic","severity":"error","code":"link.input_invalid","message":"the link does not define the entry symbol `_start`","origin":"link","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
+{"schema":3,"record":"diagnostic","severity":"error","code":"link.input_invalid","message":"the link does not define the entry symbol `_start`. an image takes its entry symbol from a module its artifact's entry reaches, so write a `use` of the module that defines it in that entry","origin":"link","primary":{"file":"mach.toml","line":43,"column":9,"end_line":43,"end_column":24,"byte_start":622,"byte_end":637},"related":[],"notes":[],"help":[],"fixes":[]}
 ```
 
 `primary` is the span in the file that caused the failure, or `null` when no
@@ -138,7 +138,7 @@ after the headline, as `@ <file>:<line>:<column>` and the snippet, naming the
 file by the path it was read at, as it names a source file.
 
 ```json
-{"schema":3,"record":"diagnostic","severity":"error","code":"version.invalid_range","message":"mach.toml: [project].mach = \"^x\" is not a valid range. expected a number (clause 1)","origin":"build","primary":{"file":"mach.toml","line":2,"column":8,"end_line":2,"end_column":12,"byte_start":17,"byte_end":21},"related":[],"notes":[],"help":[],"fixes":[]}
+{"schema":3,"record":"diagnostic","severity":"error","code":"version.invalid_range","message":"mach.toml: [project].mach = \"^x\" is not a valid range. expected a number (clause 1)","origin":"build","primary":{"file":"mach.toml","line":4,"column":8,"end_line":4,"end_column":12,"byte_start":46,"byte_end":50},"related":[],"notes":[],"help":[],"fixes":[]}
 ```
 
 A refusal raised later from the parsed manifest, while a build is laid out or
@@ -172,7 +172,7 @@ snippet after the primary's. A target or profile named on the command line that 
 not declare is caused by no entry in it, so its refusal has no `primary`.
 
 ```json
-{"schema":3,"record":"diagnostic","severity":"error","code":"need.cycle","message":"mach.toml: step.a -> step.b -> step.a","origin":"build","primary":{"file":"mach.toml","line":12,"column":9,"end_line":12,"end_column":17,"byte_start":141,"byte_end":149},"related":[{"file":"mach.toml","line":18,"column":9,"end_line":18,"end_column":17,"byte_start":216,"byte_end":224,"label":null}],"notes":[],"help":[],"fixes":[]}
+{"schema":3,"record":"diagnostic","severity":"error","code":"need.cycle","message":"mach.toml: step.a -> step.b -> step.a","origin":"build","primary":{"file":"mach.toml","line":67,"column":9,"end_line":67,"end_column":17,"byte_start":1007,"byte_end":1015},"related":[{"file":"mach.toml","line":73,"column":9,"end_line":73,"end_column":17,"byte_start":1075,"byte_end":1083,"label":null}],"notes":[],"help":[],"fixes":[]}
 ```
 
 `origin` names the phase the failure came from, by the rule of
@@ -188,8 +188,11 @@ the manifest does not declare (`selection.unknown`).
 ## Notes
 
 A note says what a command did or found, without failing it, and is a diagnostic
-record with `severity` `"note"`, its `code` the note's key, and a `null`
-`primary`. The human rendering writes the same note as `note <message>`.
+record with `severity` `"note"`, its `code` the note's key, a `null`
+`primary` and no `origin`. The human rendering writes a note that reports what a
+command did as that command's progress line, as `mach init` writes `created` for
+`project.created` and `realized` for `dep.realized`, and any other note as
+`note <message>`.
 
 | `code` | Written by |
 |---|---|
@@ -200,6 +203,7 @@ record with `severity` `"note"`, its `code` the note's key, and a `null`
 
 ```json
 {"schema":3,"record":"diagnostic","severity":"note","code":"project.created","message":"created project 'app'","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
+{"schema":3,"record":"diagnostic","severity":"note","code":"dep.realized","message":"realized dependency 'std' @ a78d528f4b89","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
 ```
 
 ## Test records
@@ -211,9 +215,13 @@ a `test` record per test in the order the tests finish, and closes with a
 `skip` record, and under `--list` each collected test is a `case` record.
 
 ```json
-{"schema":3,"record":"run_start","tests":14}
-{"schema":3,"record":"test","name":"app.main#parses","module":"app.main","file":"src/main.mach","line":10,"index":4,"target":"linux","profile":"debug","outcome":"exit","code":3,"timeout_ns":0,"duration_ns":1204000,"exe":"out/linux/debug/test/app/app","output":"out/linux/debug/test/app/log/4.log","origin":"test"}
-{"schema":3,"record":"run_end","passed":13,"failed":1,"skipped":0,"total":14,"duration_ns":61000000,"mismatch":1,"infrastructure_failure":0,"resource_exhaustion":0,"timed_out":0,"origin":"test"}
+{"schema":3,"record":"run_start","tests":4}
+{"schema":3,"record":"test","name":"app.bin.main#passes","module":"app.bin.main","file":"src/bin/main.mach","line":9,"index":0,"target":"linux-x86_64","profile":"debug","outcome":"pass","code":0,"timeout_ns":0,"duration_ns":459535,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
+{"schema":3,"record":"test","name":"app.bin.main#fails_on_purpose","module":"app.bin.main","file":"src/bin/main.mach","line":13,"index":1,"target":"linux-x86_64","profile":"debug","outcome":"exit","code":3,"timeout_ns":0,"duration_ns":641207,"exe":"./out/linux-x86_64/debug/test/app/app","output":"./out/linux-x86_64/debug/test/app/log/1.log","origin":"test"}
+{"schema":3,"record":"test","name":"app.bin.main#skips_here","module":"app.bin.main","file":"src/bin/main.mach","line":17,"index":2,"target":"linux-x86_64","profile":"debug","outcome":"skip","code":77,"timeout_ns":0,"duration_ns":803249,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
+{"schema":3,"record":"test","name":"app.parser#rejects_trailing_comma","module":"app.parser","file":"src/parser.mach","line":5,"index":3,"target":"linux-x86_64","profile":"debug","outcome":"pass","code":0,"timeout_ns":0,"duration_ns":964561,"exe":"./out/linux-x86_64/debug/test/app/app","output":null,"origin":"test"}
+{"schema":3,"record":"run_end","passed":2,"failed":1,"skipped":1,"total":4,"duration_ns":1574518,"mismatch":1,"infrastructure_failure":0,"resource_exhaustion":0,"timed_out":0,"origin":"test"}
+{"schema":3,"record":"skip","target":"linux-aarch64","profile":"debug","reason":"not native to this host"}
 ```
 
 A `test` or `case` record names its test with these members:
@@ -263,30 +271,41 @@ stderr is a record, written when the line would be and in the same order. Times
 are integer microseconds.
 
 ```json
-{"schema":3,"record":"unit","verb":"building","artifact":"app","target":"linux","profile":"debug"}
-{"schema":3,"record":"phase","name":"load","count":48,"unit":"modules","time_us":77012}
-{"schema":3,"record":"phase","name":"codegen","count":48,"unit":"modules","time_us":75012,"slowest":"std.filesystem","slowest_us":9104}
-{"schema":3,"record":"phase","name":"other","time_us":32007}
+{"schema":3,"record":"unit","verb":"building","artifact":"demo","target":"linux-x86_64","profile":"debug"}
+{"schema":3,"record":"phase","name":"target","count":1,"unit":"target","time_us":14936}
+{"schema":3,"record":"phase","name":"load","count":55,"unit":"modules","time_us":55735,"slowest":"std.types.string","slowest_us":1374}
+{"schema":3,"record":"phase","name":"lower","count":1,"unit":"object","time_us":266,"threads":16}
+{"schema":3,"record":"phase","name":"other","time_us":4347}
 ```
 
 A **unit** record opens each unit, before its rows. It is written for every
-unit, where the text shows a `building <artifact>` banner only when the plan has
-several units and a `profile <name>:` header only when it has several profiles:
+unit, where the text shows a banner naming the unit's target, artifact and profile
+only when the plan has several units. It names the target the unit resolved to
+whether `-t` selected it or the host's default did, here a project with no
+`[target]` table, whose one target is `native`:
+
+```json
+{"schema":3,"record":"unit","verb":"building","artifact":"records","target":"native","profile":"debug"}
+```
+
+```
+unit	schema=3	verb=building	artifact=records	target=native	profile=debug
+```
 
 | Member | Type | Meaning |
 |---|---|---|
 | `verb` | string | what the unit does, `"building"` or `"checking"` |
 | `artifact` | string | the artifact the unit builds |
-| `target` | string | the target, absent when the unit names none |
+| `target` | string | the target the unit builds for, by its declared name |
 | `profile` | string | the profile, absent when the unit names none |
 
 A **phase** record is a phase row:
 
 | Member | Type | Meaning |
 |---|---|---|
-| `name` | string | the row's label: `steps`, `target`, `load`, `resolve`, `sema`, `lower`, `verify`, `optimize`, `codegen`, `passes`, `select`, `alloc`, `frame`, `mirl emit`, `layout`, `encode`, `emit`, `link`, `cache`, `test lower`, `test verify`, `test codegen`, or `other` for the time no row accounts for |
+| `name` | string | the row's label: `steps`, `target`, `load`, `resolve`, `sema`, `lower`, `verify`, `codegen`, `passes`, `select`, `alloc`, `frame`, `mirl emit`, `layout`, `encode`, `emit`, `link`, `cache`, `test lower`, `test verify`, `test codegen`, or `other` for the time no row accounts for |
 | `count` | integer | what the phase processed; absent for `other` |
-| `unit` | string | the noun the count is in, singular for a count of one: `"steps"` for the `steps` row, `"modules"` for the front end's rows, `"objects"` from `lower` to `emit`, `"target"` for the `target` row, `"binary"` for the `link` row of an executable |
+| `unit` | string | the noun the count is in, singular for a count of one: `"steps"` for the `steps` row, `"modules"` for the front end's rows and `cache`, `"objects"` from `lower` to `emit`, `"target"` for the `target` row, and for the `link` row `"binary"` for an executable, `"archive"` for a static library and `"library"` for a shared one |
 | `time_us` | integer | the phase's time |
 | `threads` | integer | the threads its time is added up over, present only when more than one; such a row is not part of the unit's wall time |
 | `dropped` | integer | the modules it dropped as target-gated, present only when any |
@@ -302,7 +321,7 @@ row's output, a build step under `steps`, or a stage of the `cache` row such as
 `module keys`:
 
 ```json
-{"schema":3,"record":"phase_item","phase":"load","name":"std.filesystem","time_us":2013}
+{"schema":3,"record":"phase_item","phase":"load","name":"std.print","time_us":422}
 ```
 
 | Member | Type | Meaning |
@@ -319,8 +338,8 @@ counter of a unit whose objects all came from the cache, writes no total record,
 while a module's record is written with its value even when that is zero:
 
 ```json
-{"schema":3,"record":"counter","counter":"ir instrs","name":"std.filesystem","value":20811}
-{"schema":3,"record":"counter","counter":"ir instrs","value":412093}
+{"schema":3,"record":"counter","counter":"ir instrs","name":"demo.bin.main","value":11}
+{"schema":3,"record":"counter","counter":"ir instrs","value":11}
 ```
 
 | Member | Type | Meaning |
@@ -333,7 +352,7 @@ Under `-v` a **growth** record is a growing cycle of instances, written each tim
 instance count doubles:
 
 ```json
-{"schema":3,"record":"growth","module":"app.main","members":"peel","instances":32}
+{"schema":3,"record":"growth","module":"app.bin.main","members":"peel","instances":32}
 ```
 
 | Member | Type | Meaning |
@@ -375,13 +394,27 @@ before it):
 
 The human text ends the same way, with the single line `interrupted by SIGINT`.
 
-A `built` object has the unit's `out` (string), `modules` (integer), `rebuilt`
-(integer, the units the build compiled code for rather than taking from the
-object cache), `bytes` (integer, present when the output is one file) and
-`time_us` (integer).
+A `built` object has the unit's `out` (string, absent when the unit wrote no
+output, as a `--list` run's), `modules` (integer), `rebuilt` (integer, the units
+the build compiled code for rather than taking from the object cache), `bytes`
+(integer, present when the output is one file: an executable, a static or shared
+library or a finished module, never an `object` artifact's objects) and `time_us`
+(integer).
 
 ```json
-{"schema":3,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"success","exit_code":0,"time_us":358120,"built":[{"out":"out/linux/debug/bin/app","modules":48,"rebuilt":48,"bytes":1048576,"time_us":358120}]}
+{"schema":3,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"success","exit_code":0,"time_us":262071,"built":[{"out":"demo/out/linux-x86_64/debug/bin/demo","modules":51,"rebuilt":1,"bytes":52040,"time_us":262071}]}
+```
+
+A static library, and `mach test -a archive --list`, which writes nothing:
+
+```json
+{"schema":3,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"success","exit_code":0,"time_us":48814,"built":[{"out":"./out/j2/lib/calc.a","modules":1,"rebuilt":1,"bytes":3640,"time_us":48814}]}
+{"schema":3,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"success","exit_code":0,"time_us":48183,"built":[{"modules":1,"rebuilt":1,"time_us":48183}]}
+```
+
+```
+summary	schema=3	errors=0	warnings=0	notes=0	outcome=success	exit_code=0	time_us=48409	built.out=./out/l2/lib/calc.a	built.modules=1	built.rebuilt=1	built.bytes=3640	built.time_us=48409
+summary	schema=3	errors=0	warnings=0	notes=0	outcome=success	exit_code=0	time_us=47618	built.modules=1	built.rebuilt=1	built.time_us=47618
 ```
 
 ## The lines encoding
@@ -392,15 +425,16 @@ this page lists. A record is one line: its `record` value bare, then every
 other member as `key=value` in the record's order, each part separated by one
 tab. A member of a nested object is keyed by the path to it joined with `.`
 (`primary.line=12`), each element of an array repeats the array's key
-(`notes=first` then `notes=second`, `related.file=a` per related site), and a
-`null` member is left out. In a value a tab, a newline and a backslash are
+(`notes=first` then `notes=second`, `related.file=a` per related site), so an
+empty array writes nothing, and a `null` member is left out. In a value a tab, a newline and a backslash are
 written `\t`, `\n` and `\\`, so every tab on a line is a separator. Nothing is
 quoted, padded or aligned, and `awk -F'\t' '$1=="test"'` selects every test
 record.
 
 ```
-diagnostic	schema=3	severity=error	code=call.arity	message=expected 2 arguments, found 3	origin=sema	primary.file=src/shape.mach	primary.line=5	primary.column=9	primary.end_line=5	primary.end_column=26	primary.byte_start=67	primary.byte_end=84
-run_end	schema=3	passed=1	failed=1	skipped=0	total=2	duration_ns=2214000	mismatch=1	infrastructure_failure=0	resource_exhaustion=0	timed_out=0	origin=test
+diagnostic	schema=3	severity=error	code=name.unresolved	message=unresolved identifier `helpr`	origin=resolve	primary.file=src/bin/main.mach	primary.line=5	primary.column=9	primary.end_line=5	primary.end_column=14	primary.byte_start=84	primary.byte_end=89	help=did you mean `helper`?	fixes.label=replace with `helper`	fixes.edits.file=src/bin/main.mach	fixes.edits.line=5	fixes.edits.column=9	fixes.edits.end_line=5	fixes.edits.end_column=14	fixes.edits.byte_start=84	fixes.edits.byte_end=89	fixes.edits.replacement=helper
+run_end	schema=3	passed=2	failed=1	skipped=1	total=4	duration_ns=1374916	mismatch=1	infrastructure_failure=0	resource_exhaustion=0	timed_out=0	origin=test
+summary	schema=3	errors=0	warnings=0	notes=0	outcome=failure	exit_code=1	time_us=102176	built.out=./out/linux-x86_64/debug/test/app/app	built.modules=28	built.rebuilt=0	built.bytes=36408	built.time_us=102176
 ```
 
 ## Stability

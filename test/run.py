@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # the compiler's test corpus: every file under run/ and gpu/ builds for every target that
 # takes it and exits 0 where the host can run it, every file under refuse/ is refused with
-# the diagnostic it names, every artifact holds to its target's rules, every project under
+# the diagnostic it names, a manifest among them (a `mach.toml` whose header names it, checked
+# as a project manifest is and refused with exit 1), every artifact holds to its target's rules, every project under
 # project/ runs its steps on the host, and every project manifest of the tree (its own, each
 # package's under dep/ and any under test/) loads.
 #
@@ -23,7 +24,8 @@
 # object checked in beside the file with the script that writes it (run/link/coff_unwind.*).
 # a directory under project/ is a project and its `steps` file, one command a line, run in order
 # in one fresh work directory under test/out: `<exit> <subcommand> [args...]`, with `| <text>`
-# after it when a line of the command's output must hold that text, and `#` for a comment. its
+# after it when a line of the command's output must hold that text, `|! <text>` when no line may,
+# and `#` for a comment. its
 # std is copied in as `dep/std`, as `mach dep pull` realizes a path dependency.
 # a `# reports:` line lists, `;` apart, lines the build's report of its optimisation passes
 # (`mach build --passes`) must hold on the host's optimised target, as `vectorise main.copy_u32 1`,
@@ -211,23 +213,38 @@ def manifests():
     found = [os.path.join(ROOT, 'mach.toml')] if os.path.isfile(os.path.join(ROOT, 'mach.toml')) else []
     for top in ('dep', 'test'):
         for d, subdirs, fs in os.walk(os.path.join(ROOT, top)):
-            subdirs[:] = sorted(s for s in subdirs if s not in ('out', 'dep'))
+            subdirs[:] = sorted(s for s in subdirs if s not in ('out', 'dep') and os.path.join(d, s) != os.path.join(HERE, 'refuse'))
             if 'mach.toml' in fs:
                 found.append(os.path.join(d, 'mach.toml'))
     return found
 
 
-def manifest_loads(cfg, path):
-    # why a manifest does not load, or None. no artifact is named `=`, so a check that selects it
-    # stops at the selection, after the whole manifest is accepted and before any dependency is read
+def manifest_check(cfg, path):
+    # a manifest's check: its exit code and its error records. no artifact is named `=`, so a check
+    # that selects it stops at the selection, after the whole manifest is accepted and before any
+    # dependency is read
     rel = os.path.relpath(path, ROOT)
     p = subprocess.run([cfg.mach, 'check', os.path.dirname(rel) or '.', '--artifact', '=', '--report', 'json'],
                        capture_output=True, text=True, cwd=ROOT)
-    errs = errors(p.stdout + p.stderr)
+    return rel, p.returncode, errors(p.stdout + p.stderr)
+
+
+def manifest_loads(cfg, path):
+    # why a manifest does not load, or None
+    rel, rc, errs = manifest_check(cfg, path)
     if errs and errs[0][0] == 'selection.unknown':
         return None
-    why = f'{errs[0][0]}: {errs[0][1]}' if errs else f'exit {p.returncode} and no diagnostic'
+    why = f'{errs[0][0]}: {errs[0][1]}' if errs else f'exit {rc} and no diagnostic'
     return f'{rel} does not load: ' + ' '.join(why.split())
+
+
+def manifest_refused(cfg, path, kind):
+    # why a refuse/ manifest is not refused with its kind and exit 1, or None
+    rel, rc, errs = manifest_check(cfg, path)
+    if errs and errs[0][0] == kind and rc == 1:
+        return None
+    got = f'{errs[0][0]} ({errs[0][1]})' if errs else 'no diagnostic'
+    return f'{rel} exits {rc} with {got}, and must be refused with {kind} and exit 1'
 
 
 def fail(rel, target, what):
@@ -332,7 +349,8 @@ def projects():
 
 
 def steps(path):
-    # the commands of a project's `steps` file: (line number, expected exit, argv, text or None)
+    # the commands of a project's `steps` file: (line number, expected exit, argv, text or None,
+    # whether the text is one no line may hold)
     out = []
     for n, line in enumerate(open(os.path.join(path, 'steps'), encoding='utf-8'), 1):
         line = line.strip()
@@ -342,7 +360,8 @@ def steps(path):
         words = command.split()
         if len(words) < 2 or not words[0].isdigit():
             sys.exit(f'{path}/steps:{n}: a step is `<exit> <subcommand> [args...]`')
-        out.append((n, int(words[0]), words[1:], text.strip() if bar else None))
+        absent = text.startswith('!')
+        out.append((n, int(words[0]), words[1:], text[absent:].strip() if bar else None, absent))
     return out
 
 
@@ -353,7 +372,7 @@ def one_project(cfg, path):
     shutil.rmtree(work, ignore_errors=True)
     shutil.copytree(path, work, ignore=shutil.ignore_patterns('steps', 'out', 'dep'))
     shutil.copytree(cfg.std, os.path.join(work, 'dep', 'std'), ignore=shutil.ignore_patterns('out', 'dep', '.git'))
-    for n, code, argv, text in steps(path):
+    for n, code, argv, text, absent in steps(path):
         said = ' '.join(argv)
         try:
             p = subprocess.run([cfg.mach, *argv], capture_output=True, text=True, cwd=work, timeout=600)
@@ -361,8 +380,9 @@ def one_project(cfg, path):
             return f'{rel} step {n} ({said}) did not exit in 600s'
         if p.returncode != code:
             return f'{rel} step {n} ({said}) exited {p.returncode}, not {code}: ' + ' '.join((p.stderr or p.stdout).split()[-40:])
-        if text is not None and not any(text in line for line in (p.stdout + p.stderr).splitlines()):
-            return f'{rel} step {n} ({said}) wrote no line holding `{text}`'
+        held = text is not None and any(text in line for line in (p.stdout + p.stderr).splitlines())
+        if text is not None and held == absent:
+            return f'{rel} step {n} ({said}) wrote ' + (f'a line holding `{text}`' if absent else f'no line holding `{text}`')
     return None
 
 
@@ -393,7 +413,9 @@ def main():
             fails.append(f'{name}: the compiler lists it, and no file of test/target builds for it or declines it')
 
     refusals = []
-    for path in corpus('refuse'):
+    rtop = os.path.join(HERE, 'refuse')
+    bad_manifests = sorted(os.path.join(d, 'mach.toml') for d, _, fs in os.walk(rtop) if 'mach.toml' in fs)
+    for path in corpus('refuse') + bad_manifests:
         h = header(path)
         if 'refuse' not in h:
             fails.append(f'{os.path.relpath(path, HERE)} names no `# refuse: <kind>`')
@@ -404,11 +426,12 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(cfg.jobs) as pool:
         for t in targets:
             files = [p for p in corpus(t.takes) if (keep(p) or keep(t.name)) and aimed(p, t.name, t.name)]
-            mine = [(p, k) for p, k in refusals if aimed(p, t.name, host) and (keep(p) or keep(t.name))]
+            mine = [(p, k) for p, k in refusals if p.endswith('.mach') and aimed(p, t.name, host) and (keep(p) or keep(t.name))]
             if cfg.filter and not keep(t.name) and not any(keep(p) for p in corpus(t.takes)) and not mine:
                 continue
             jobs.append(pool.submit(one_target, cfg, t, files, mine, host))
         loads = [pool.submit(manifest_loads, cfg, m) for m in manifests() if keep(m)]
+        loads += [pool.submit(manifest_refused, cfg, p, k) for p, k in refusals if p.endswith('.toml') and keep(p)]
         sequences = [pool.submit(one_project, cfg, p) for p in projects() if keep(p)]
         for j in jobs:
             name, built, ran, refused, f = j.result()
@@ -419,7 +442,7 @@ def main():
         print(f'projects: {len(sequences) - len(failed)} passed, {len(failed)} failed')
         broken = [why for why in (j.result() for j in loads) if why]
         fails += broken
-        print(f'manifests: {len(loads) - len(broken)} loaded, {len(broken)} failed')
+        print(f'manifests: {len(loads) - len(broken)} loaded or refused, {len(broken)} failed')
 
     kfile = os.path.join(cfg.root, 'src', 'base', 'diagnostic', 'kind.mach')
     kinds = re.findall(r'key: "([a-z0-9_.]+)", level: LEVEL_ERROR[^}]*retired: false', open(kfile, encoding='utf-8').read()) if os.path.isfile(kfile) else []

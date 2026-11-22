@@ -61,7 +61,9 @@ be complete. The full reference is [manifest.md](manifest.md). A binary
 project as `mach init` writes it, shown with one of the six targets it
 declares (`linux-x86_64`, `linux-aarch64`, `linux-riscv64`, `darwin-x86_64`,
 `darwin-aarch64`, `windows-x86_64`), each stating every part mink's catalog
-gives it but `isa`, which is left to the system's floor:
+gives it but `isa`, which is left to the system's floor. A linux target states
+no `env`, the two darwin targets state `env = "macos"` and the windows target
+`env = "msvc"`:
 
 ```toml
 [project]
@@ -111,8 +113,8 @@ compiler is released, and from then on that major's version range, written as
 
 The `id` is the root of every module path the project exposes. A file at
 `src/foo/bar.mach` is reachable as `myproj.foo.bar`. The dependency `std` is
-the standard library, realized as a git submodule at `dep/std/` and addressed
-as `std.*` in source.
+the standard library, realized at `dep/std/`, as a git submodule unless
+`--no-git`, and addressed as `std.*` in source.
 
 ## What mach init does
 

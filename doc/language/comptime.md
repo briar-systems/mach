@@ -85,8 +85,10 @@ manifest spells it: `"bin"`, `"shared"`, `"static"`, `"object"` or
 editor's union, and under `mach test` with several artifacts selected, a module
 reads the kind of the artifact whose name it reads. A single file built outside a
 project is an executable named after the file: `mach build tool.mach` reads
-`"tool"` and `"bin"`. A build of a project that declares no artifact has
-neither: reading either reports `comptime.path_unavailable`.
+`"tool"` and `"bin"`. A project that declares no artifact is refused before any
+module is read (`artifact.none_declared`), by `mach build`, `mach check` and
+`mach test` alike. Where a module is analyzed with no artifact selected, reading
+either reports `comptime.path_unavailable`.
 
 ```mach fragment
 $if ($bin.kind == "shared") { ... }               # only in a shared library

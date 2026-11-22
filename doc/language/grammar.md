@@ -55,6 +55,7 @@ token ::= IDENT
         | LIT_INT | LIT_FLOAT | LIT_CHAR | LIT_STR
         | punctuation
         | operator
+        | ASM_HEAD | ASM_BODY    (* the raw head and body of an inline-assembly block *)
         | EOF
         | ERROR    (* emitted for an unexpected character, see below *)
 
@@ -91,6 +92,9 @@ Notes:
   [Unexpected characters](#unexpected-characters)), a one-byte `ERROR` token is
   pushed, and lexing continues. `EOF` (`KIND_EOF`) terminates every stream. Neither
   appears in a well-formed production; they are listed here for completeness.
+- `ASM_HEAD` and `ASM_BODY` (`KIND_ASM_HEAD`, `KIND_ASM_BODY`) are the two raw-text
+  tokens the lexer emits for an `asm` block at the start of a statement (see
+  [Inline assembly](#inline-assembly)).
 
 ### Identifiers and keywords
 
