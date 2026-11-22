@@ -1094,11 +1094,12 @@ pub fun exit(code: i32) {
 ```
 
 - **Checked where it is written.** A `noreturn` function states no result type and
-  holds no `ret`, and its body must end where control never comes back: in a call to
-  a `noreturn` function, a `noreturn` asm block, a `$error`, or a bare `for` no `brk`
-  of its own leaves. A block ends when one of its statements does, an `if` chain when
-  it has a bare `or` and every arm ends, and a `$if` when it has a bare `$or` and
-  every branch ends. Anything else is refused with `noreturn.returns`.
+  holds no `ret`, and control must not be able to reach the end of its body: it ends
+  in a call to a `noreturn` function, a `noreturn` asm block, a `$error`, or a bare
+  `for` no `brk` of its own leaves. Whether the end can be reached is decided as it
+  is for a function with a result type, see
+  [fun.md](fun.md#a-body-with-a-result-ends-in-ret), so a `$if` counts by the arm
+  the build selects. Anything else is refused with `noreturn.returns`.
 - **An `ext fun` may be marked.** Nothing checks a body the compiler does not see, so
   the declaration is the author's word, as it is for every other fact an `ext`
   declaration states.

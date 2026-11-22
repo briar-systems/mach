@@ -92,6 +92,12 @@ ret expr;                   # return a value
 ret;                        # return from a void function
 ```
 
+In a function that states a result type, every path ends in `ret` or in a
+statement control never passes, such as a call to a `#[noreturn]` function. A body
+whose end can be reached is refused with `ret.missing`. A chain of `sel` tests that
+names every case of a tag needs no bare `or`. The rule and how it reads a chain or
+a loop are in [fun.md](fun.md#a-body-with-a-result-ends-in-ret).
+
 ## `brk` / `cnt`
 
 Loop control: `brk` exits the enclosing `for`, and `cnt` continues to the

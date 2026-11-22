@@ -17,6 +17,7 @@ use comptime_gate:    mach.front.comptime.gate;
 use mach.front.comptime.intrinsic;
 use comptime_scope: mach.front.comptime.scope;
 use comptime_value: mach.front.comptime.value;
+use mach.front.decorator;
 use mach.front.resolve;
 use mach.front.sema.abitype;
 use mach.front.sema.check;
@@ -27,6 +28,7 @@ use mach.front.sema.guard;
 use sema_handle: mach.front.sema.handle;
 use mach.front.sema.infer;
 use sema_instance: mach.front.sema.instance;
+use sema_noreturn: mach.front.sema.noreturn;
 use mach.front.transition;
 use report_phase:    mach.report.phase;
 use target_baseline: mach.target.baseline;
@@ -139,21 +141,67 @@ pub fun gate_verdict_truth(v: comptime_gate.GateVerdict) bool {
     ret v.outcome == comptime_gate.GATE_ACTIVE;
 }
 
+# how control leaves a statement the walk typed, read from the arms the build selects
+# ---
+# passes: control can reach the statement's end and go on to the one after it
+# breaks: a `brk` in it leaves the innermost loop around it
+pub rec Flow {
+    passes: bool;
+    breaks: bool;
+}
+
+val FLOW_ON: Flow = Flow{passes: true, breaks: false};
+# a statement the walk refused or cannot decide claims neither, so no refusal follows from it
+val FLOW_NONE: Flow = Flow{passes: false, breaks: false};
+
+# `a` followed by `b`: a `brk` in `b` counts only when control can reach it
+fun flow_then(a: Flow, b: Flow) Flow {
+    ret Flow{passes: a.passes && b.passes, breaks: a.breaks || (a.passes && b.breaks)};
+}
+
+# types the body of the function `d` against its result type and holds where the body ends to
+# the rules: neither a `noreturn` function nor one with a result type may reach the end of its
+# body. a `naked` body is assembly, which ends however its instructions do, so only the
+# `noreturn` rule holds there
+# ---
+# sc:     the sema context of the module or instance being typed
+# d:      the function, which has a body
+# fn_ret: its result type, nil for none
+# ret:    ok, or an internal failure of the walk
+pub fun infer_fun_body(sc: *sema_context.SemaContext, d: *ast_decl.Decl, fn_ret: type_kind.TypeId) err[fail.Fail] {
+    val res_flow: res[Flow, fail.Fail] = infer_stmt(sc, d.data.fun_.body, fn_ret);
+    if (sel res_flow.err)    { ret err[fail.Fail].err{res_flow.err}; }
+    if (!res_flow.ok.passes) { ret err[fail.Fail].ok{}; }
+    val opt_noreturn: opt[*ast_decl.Decorator] = decorator.get(sc.view.a, d, decorator.NORETURN);
+    if (sel opt_noreturn.some) {
+        sema_context.report(sc, diagnostic_kind.NORETURN_RETURNS, opt_noreturn.some.name, "the body of a `noreturn` function can reach its end. end it in a call to a `noreturn` function, an `asm` block marked `noreturn` or a `for` no `brk` leaves");
+        ret err[fail.Fail].ok{};
+    }
+    if (sc.walk.naked || type_kind.is_nil(fn_ret) || type_kind.is_error(fn_ret)) { ret err[fail.Fail].ok{}; }
+    val opt_body: opt[*ast_stmt.Stmt] = ast.get_stmt(sc.view.a, d.data.fun_.body);
+    if (sel opt_body.none) { ret err[fail.Fail].err{fail.message("StmtId out of range")}; }
+    val body:  base_source.Span = opt_body.some.span;
+    val brace: base_source.Span = base_source.Span{offset: body.offset + body.len - 1, len: 1};
+    sema_context.report_note(sc, diagnostic_kind.RET_MISSING, brace, "the function states a result type, and control can reach the end of its body without returning one",
+        "end every path with `ret`, or with a call to a `noreturn` function");
+    ret err[fail.Fail].ok{};
+}
+
 # types the statement `sid` and everything under it, reporting what it finds to `sc`
 # ---
 # sc:     the sema context of the module being typed
 # sid:    the statement, nil for none
 # fn_ret: the return type of the enclosing function, which a `ret` is held to
-# ret:    ok, or an internal failure: a statement id out of range, an unknown statement kind,
-#         or a failure of a walk under it
-pub fun infer_stmt(sc: *sema_context.SemaContext, sid: ast_id.StmtId, fn_ret: type_kind.TypeId) err[fail.Fail] {
-    if (ast_id.stmt_is_nil(sid)) { ret err[fail.Fail].ok{}; }
+# ret:    how control leaves the statement, or an internal failure: a statement id out of
+#         range, an unknown statement kind, or a failure of a walk under it
+pub fun infer_stmt(sc: *sema_context.SemaContext, sid: ast_id.StmtId, fn_ret: type_kind.TypeId) res[Flow, fail.Fail] {
+    if (ast_id.stmt_is_nil(sid)) { ret res[Flow, fail.Fail].ok{FLOW_ON}; }
     val opt_stmt: opt[*ast_stmt.Stmt] = ast.get_stmt(sc.view.a, sid);
-    if (!sel opt_stmt.some) { ret err[fail.Fail].err{fail.message("StmtId out of range")}; }
+    if (!sel opt_stmt.some) { ret res[Flow, fail.Fail].err{fail.message("StmtId out of range")}; }
     val st: *ast_stmt.Stmt = opt_stmt.some;
     if (stack.exhausted()) {
         sema_context.refuse_nesting(sc, st.span);
-        ret err[fail.Fail].ok{};
+        ret res[Flow, fail.Fail].ok{FLOW_NONE};
     }
 
     if (st.kind == ast_stmt.STMT_KIND_EXPR) {
@@ -161,27 +209,29 @@ pub fun infer_stmt(sc: *sema_context.SemaContext, sid: ast_id.StmtId, fn_ret: ty
         if (type.is_case_selector(sc.s.types, ty)) {
             sema_context.report(sc, diagnostic_kind.TAG_SELECTOR_VALUE, st.span, "a case selector is not a value");
         }
-        ret err[fail.Fail].ok{};
+        ret res[Flow, fail.Fail].ok{Flow{passes: !sema_noreturn.call_ends(sc, st.data.expr.expr), breaks: false}};
     }
     if (st.kind == ast_stmt.STMT_KIND_BLOCK) {
         val outer_block: base_source.Span = sc.walk.block;
         sc.walk.block = st.span;
-        val err_list: err[fail.Fail] = infer_stmt_list(sc, st.data.block.stmts_start, st.data.block.stmts_len, fn_ret);
+        val res_list: res[Flow, fail.Fail] = infer_stmt_list(sc, st.data.block.stmts_start, st.data.block.stmts_len, fn_ret);
         sc.walk.block = outer_block;
-        ret err_list;
+        ret res_list;
     }
     if (st.kind == ast_stmt.STMT_KIND_IF) { ret infer_if_chain(sc, sid, fn_ret); }
     if (st.kind == ast_stmt.STMT_KIND_FOR) {
         val err_loop: err[fail.Fail] = guard.loop_begin(sc, st.span);
-        if (sel err_loop.err) { ret err_loop; }
+        if (sel err_loop.err) { ret res[Flow, fail.Fail].err{err_loop.err}; }
         if (!ast_id.expr_is_nil(st.data.for_.cond)) {
             val cond_ty: type_kind.TypeId = infer.infer_expr(sc, st.data.for_.cond);
             if (!type_kind.is_error(cond_ty)) { check.check_condition(sc, cond_ty, st.span); }
         }
         sc.walk.loop_depth = sc.walk.loop_depth + 1;
-        val err_body: err[fail.Fail] = infer_stmt(sc, st.data.for_.body, fn_ret);
+        val res_body: res[Flow, fail.Fail] = infer_stmt(sc, st.data.for_.body, fn_ret);
         sc.walk.loop_depth = sc.walk.loop_depth - 1;
-        ret err_body;
+        if (sel res_body.err) { ret res_body; }
+        # a loop with a condition ends when the condition fails, a bare one only by a `brk` of its own
+        ret res[Flow, fail.Fail].ok{Flow{passes: !ast_id.expr_is_nil(st.data.for_.cond) || res_body.ok.breaks, breaks: false}};
     }
     if (st.kind == ast_stmt.STMT_KIND_RET) {
         if (sc.walk.in_fin) {
@@ -189,45 +239,50 @@ pub fun infer_stmt(sc: *sema_context.SemaContext, sid: ast_id.StmtId, fn_ret: ty
         }
         check_return_stmt(sc, fn_ret, st.data.ret_.value, st.span);
         if (sc.walk.in_test) { check_test_status(sc, st.data.ret_.value, st.span); }
-        ret err[fail.Fail].ok{};
+        ret res[Flow, fail.Fail].ok{FLOW_NONE};
     }
     if (st.kind == ast_stmt.STMT_KIND_BRK) {
         if (sc.walk.loop_depth == 0) {
             if (sc.walk.in_fin) { sema_context.report(sc, diagnostic_kind.FIN_JUMP, st.span, "`brk` inside a `fin` body cannot target a loop outside the fin"); }
             or                  { sema_context.report(sc, diagnostic_kind.JUMP_NO_LOOP, st.span, "`brk` is outside any loop. it leaves the innermost enclosing `for`"); }
         }
-        ret err[fail.Fail].ok{};
+        ret res[Flow, fail.Fail].ok{Flow{passes: false, breaks: true}};
     }
     if (st.kind == ast_stmt.STMT_KIND_CNT) {
         if (sc.walk.loop_depth == 0) {
             if (sc.walk.in_fin) { sema_context.report(sc, diagnostic_kind.FIN_JUMP, st.span, "`cnt` inside a `fin` body cannot target a loop outside the fin"); }
             or                  { sema_context.report(sc, diagnostic_kind.JUMP_NO_LOOP, st.span, "`cnt` is outside any loop. it continues the innermost enclosing `for`"); }
         }
-        ret err[fail.Fail].ok{};
+        ret res[Flow, fail.Fail].ok{FLOW_NONE};
     }
     if (st.kind == ast_stmt.STMT_KIND_FIN) {
         val err_fin: err[fail.Fail] = guard.fin_begin(sc, sid, st.span);
-        if (sel err_fin.err) { ret err_fin; }
+        if (sel err_fin.err) { ret res[Flow, fail.Fail].err{err_fin.err}; }
         val outer: sema_context.Walk = sema_context.walk_begin(sc);
         sc.walk.in_fin     = true;
         sc.walk.loop_depth = 0;
-        val err_body: err[fail.Fail] = infer_stmt(sc, st.data.fin_.body, fn_ret);
+        val res_body: res[Flow, fail.Fail] = infer_stmt(sc, st.data.fin_.body, fn_ret);
         sema_context.walk_end(sc, outer);
         guard.fin_end(sc, sid);
-        ret err_body;
+        if (sel res_body.err) { ret res_body; }
+        # the body runs when the block exits, not here, so control passes a `fin`
+        ret res[Flow, fail.Fail].ok{FLOW_ON};
     }
     if (st.kind == ast_stmt.STMT_KIND_DECL) {
-        ret infer_local_decl(sc, st.data.decl.decl);
+        val err_decl: err[fail.Fail] = infer_local_decl(sc, st.data.decl.decl);
+        if (sel err_decl.err) { ret res[Flow, fail.Fail].err{err_decl.err}; }
+        ret res[Flow, fail.Fail].ok{FLOW_ON};
     }
     if (st.kind == ast_stmt.STMT_KIND_COMPTIME_IF) {
         ret infer_stmt_comptime_if(sc, st.data.comptime_if.branches_start, st.data.comptime_if.branches_len, fn_ret, st.span);
     }
     if (st.kind == ast_stmt.STMT_KIND_COMPTIME_EACH) {
-        ret infer_stmt_comptime_each(sc, sid, ?st.data.comptime_each, st.span, fn_ret);
+        ret walk_stmt_comptime_each(sc, sid, ?st.data.comptime_each, st.span, fn_ret);
     }
     if (st.kind == ast_stmt.STMT_KIND_COMPTIME_DIRECTIVE) {
         eval_comptime_directive(sc, st.data.comptime_directive.target, st.span);
-        ret err[fail.Fail].ok{};
+        # a `$error` refuses the build wherever the walk reaches it, so nothing after it runs
+        ret res[Flow, fail.Fail].ok{Flow{passes: !intrinsic.is_error_call(sc.view.a, sc.view.source, st.data.comptime_directive.target), breaks: false}};
     }
     if (st.kind == ast_stmt.STMT_KIND_ASM) {
         asm_target_check(sc, st.span);
@@ -236,12 +291,12 @@ pub fun infer_stmt(sc: *sema_context.SemaContext, sid: ast_id.StmtId, fn_ret: ty
         if (sc.walk.naked && sc.view.rr != nil && resolve.asm_binds_any(sc.view.rr, sid)) {
             sema_context.report(sc, diagnostic_kind.ASM_OPERAND, st.span, "an asm block of a `#[naked]` function binds a local, which the function has no frame to hold");
         }
-        ret err[fail.Fail].ok{};
+        ret res[Flow, fail.Fail].ok{Flow{passes: !st.data.asm_.noreturn, breaks: false}};
     }
-    if (st.kind == ast_stmt.STMT_KIND_ERROR) { ret err[fail.Fail].ok{}; }
+    if (st.kind == ast_stmt.STMT_KIND_ERROR) { ret res[Flow, fail.Fail].ok{FLOW_NONE}; }
     val failure: fail.Fail = resolve.unknown_catalog(sc.s, "StmtKind", st.kind::u32);
     report_phase.internal(?sc.status, failure);
-    ret err[fail.Fail].err{failure};
+    ret res[Flow, fail.Fail].err{failure};
 }
 
 # an asm block needs an instruction set that takes assembly
@@ -290,24 +345,19 @@ pub fun eval_comptime_directive(sc: *sema_context.SemaContext, target: ast_id.Ex
     ret true;
 }
 
-fun infer_stmt_comptime_each(sc: *sema_context.SemaContext, sid: ast_id.StmtId, ce: *ast_stmt.StmtComptimeEach, span: base_source.Span, fn_ret: type_kind.TypeId) err[fail.Fail] {
-    ret walk_stmt_comptime_each(sc, sid, ce, span, infer_each_body, (?fn_ret)::ptr);
-}
-
 # one iteration of the `$each` at `sid`, typed in a frame of its own under the walk's
 rec EachIteration {
-    sid:   ast_id.StmtId;
-    index: u32;
-    visit: sema_context.StmtListVisitor;
-    data:  ptr;
+    sid:    ast_id.StmtId;
+    index:  u32;
+    fn_ret: type_kind.TypeId;
 }
 
 # visits one iteration's body in its own frame under the walk's, when the module records
 # instances, and in the walk's frame otherwise
-fun each_iteration_visit(sc: *sema_context.SemaContext, it: EachIteration, start: u32, len: u32, pack: bool) err[fail.Fail] {
-    if (sc.typing.insts == nil) { ret it.visit(it.data, sc, start, len); }
+fun each_iteration_visit(sc: *sema_context.SemaContext, it: EachIteration, start: u32, len: u32, pack: bool) res[Flow, fail.Fail] {
+    if (sc.typing.insts == nil) { ret infer_stmt_list(sc, start, len, it.fn_ret); }
     val res_made: res[u32, fail.Fail] = sema_instance.iteration_add(?sc.typing.insts.set, sc.instance.frame, it.sid, it.index);
-    if (sel res_made.err) { ret err[fail.Fail].err{res_made.err}; }
+    if (sel res_made.err) { ret res[Flow, fail.Fail].err{res_made.err}; }
     val saved_frame: u32               = sc.instance.frame;
     val saved_quiet: bool              = sc.instance.quiet;
     val outer:       sema_context.Walk = sema_context.walk_begin(sc);
@@ -320,27 +370,24 @@ fun each_iteration_visit(sc: *sema_context.SemaContext, it: EachIteration, start
             sc.walk.silent    = false;
         }
     }
-    val err_visit: err[fail.Fail] = it.visit(it.data, sc, start, len);
+    val res_visit: res[Flow, fail.Fail] = infer_stmt_list(sc, start, len, it.fn_ret);
     sc.instance.frame = saved_frame;
     sc.instance.quiet = saved_quiet;
     sema_context.walk_end(sc, outer);
-    ret err_visit;
+    ret res_visit;
 }
 
-fun infer_each_body(data: ptr, sc: *sema_context.SemaContext, start: u32, count: u32) err[fail.Fail] {
-    ret infer_stmt_list(sc, start, count, @(data::*type_kind.TypeId));
-}
-
-# visits the body of the `$each` at `sid` once per element of its sequence: a field or case
-# of a type, an element of a pack, or an element of a constant array
-fun walk_stmt_comptime_each(sc: *sema_context.SemaContext, sid: ast_id.StmtId, ce: *ast_stmt.StmtComptimeEach, span: base_source.Span, visit: sema_context.StmtListVisitor, data: ptr) err[fail.Fail] {
-    var it:         EachIteration = EachIteration{sid: sid, index: 0, visit: visit, data: data};
+# types the body of the `$each` at `sid` once per element of its sequence: a field or case
+# of a type, an element of a pack, or an element of a constant array. control passes it when
+# it passes every iteration, so an empty sequence passes
+fun walk_stmt_comptime_each(sc: *sema_context.SemaContext, sid: ast_id.StmtId, ce: *ast_stmt.StmtComptimeEach, span: base_source.Span, fn_ret: type_kind.TypeId) res[Flow, fail.Fail] {
+    var it:         EachIteration = EachIteration{sid: sid, index: 0, fn_ret: fn_ret};
     val over_cases: bool          = intrinsic.is_cases_call(sc.view.a, sc.view.source, ce.seq);
     if (!intrinsic.is_fields_call(sc.view.a, sc.view.source, ce.seq) && !over_cases) {
         val seq_ty: type_kind.TypeId = infer.infer_expr(sc, ce.seq);
         if (sema_context.holds_secret(sc, seq_ty)) {
             sema_context.report(sc, diagnostic_kind.SECRET_COMPTIME, span, comptime.COMPTIME_SECRET_MSG);
-            ret err[fail.Fail].ok{};
+            ret res[Flow, fail.Fail].ok{FLOW_NONE};
         }
         val opt_seq: opt[*type.Type] = type.get(sc.s.types, seq_ty);
         if (sel opt_seq.some) {
@@ -356,77 +403,81 @@ fun walk_stmt_comptime_each(sc: *sema_context.SemaContext, sid: ast_id.StmtId, c
         if (!type_kind.is_error(seq_ty)) {
             sema_context.report(sc, diagnostic_kind.EACH_SEQUENCE, span, "a `$each` sequence must be `$fields(T)`, `$cases(T)`, a variadic pack, or a constant array `val`");
         }
-        ret err[fail.Fail].ok{};
+        ret res[Flow, fail.Fail].ok{FLOW_NONE};
     }
 
     var owner: type_kind.TypeId = type_kind.TYPE_ERROR;
     if (over_cases)                             { owner = infer.case_seq_owner(sc, ce.seq, span); }
     or                                          { owner = infer.field_seq_owner(sc, ce.seq, span); }
-    if (type_kind.is_error(owner))              { ret err[fail.Fail].ok{}; }
-    if (infer.type_is_generic_param(sc, owner)) { ret err[fail.Fail].ok{}; }
+    if (type_kind.is_error(owner))              { ret res[Flow, fail.Fail].ok{FLOW_NONE}; }
+    if (infer.type_is_generic_param(sc, owner)) { ret res[Flow, fail.Fail].ok{FLOW_NONE}; }
 
     val res_name: res[intern.StrId, A.Error] = intern.range_add(sc.s.interner, sc.view.source, ce.var_name.offset, ce.var_name.len);
-    if (sel res_name.err) { ret err[fail.Fail].err{fail.refused(res_name.err)}; }
+    if (sel res_name.err) { ret res[Flow, fail.Fail].err{fail.refused(res_name.err)}; }
     val fname: intern.StrId = res_name.ok;
 
-    val n: u32 = type.field_count(sc.s.types, owner);
-    var i: u32 = 0;
+    val n:    u32  = type.field_count(sc.s.types, owner);
+    var flow: Flow = FLOW_ON;
+    var i:    u32  = 0;
     for (i < n) {
         val res_mark: res[comptime_scope.FrameMark, fail.Fail] = comptime_scope.frame_begin(sc.view.ctx);
-        if (sel res_mark.err) { ret err[fail.Fail].err{res_mark.err}; }
+        if (sel res_mark.err) { ret res[Flow, fail.Fail].err{res_mark.err}; }
         val mark: comptime_scope.FrameMark = res_mark.ok;
         var desc: comptime_value.CTValue   = comptime_value.field_value(owner::u32, i);
         if (over_cases) { desc = comptime_value.case_value(owner::u32, i); }
         val err_bind: err[fail.Fail] = comptime_scope.bind_local(sc.view.ctx, fname, desc);
         if (sel err_bind.err) {
             val err_close: err[fail.Fail] = comptime_scope.frame_end(sc.view.ctx, mark);
-            if (sel err_close.err) { ret err_close; }
-            ret err_bind;
+            if (sel err_close.err) { ret res[Flow, fail.Fail].err{err_close.err}; }
+            ret res[Flow, fail.Fail].err{err_bind.err};
         }
         it.index = i;
-        val err_body:  err[fail.Fail] = each_iteration_visit(sc, it, ce.body_start, ce.body_len, false);
-        val err_close: err[fail.Fail] = comptime_scope.frame_end(sc.view.ctx, mark);
-        if (sel err_body.err)  { ret err_body; }
-        if (sel err_close.err) { ret err_close; }
-        i = i + 1;
+        val res_body:  res[Flow, fail.Fail] = each_iteration_visit(sc, it, ce.body_start, ce.body_len, false);
+        val err_close: err[fail.Fail]       = comptime_scope.frame_end(sc.view.ctx, mark);
+        if (sel res_body.err)  { ret res_body; }
+        if (sel err_close.err) { ret res[Flow, fail.Fail].err{err_close.err}; }
+        flow = flow_then(flow, res_body.ok);
+        i    = i + 1;
     }
-    ret err[fail.Fail].ok{};
+    ret res[Flow, fail.Fail].ok{flow};
 }
 
 # an `$each` over a pack, typed once per element where an instance binds the pack; a
 # template binds none and leaves the body to its instances
-fun infer_pack_each(sc: *sema_context.SemaContext, ce: *ast_stmt.StmtComptimeEach, it: EachIteration) err[fail.Fail] {
-    if (!sema_context.walk_binds_pack(sc)) { ret err[fail.Fail].ok{}; }
+fun infer_pack_each(sc: *sema_context.SemaContext, ce: *ast_stmt.StmtComptimeEach, it: EachIteration) res[Flow, fail.Fail] {
+    if (!sema_context.walk_binds_pack(sc)) { ret res[Flow, fail.Fail].ok{FLOW_NONE}; }
     val res_name: res[intern.StrId, A.Error] = intern.range_add(sc.s.interner, sc.view.source, ce.var_name.offset, ce.var_name.len);
-    if (sel res_name.err) { ret err[fail.Fail].err{fail.refused(res_name.err)}; }
+    if (sel res_name.err) { ret res[Flow, fail.Fail].err{fail.refused(res_name.err)}; }
     val fname: intern.StrId  = res_name.ok;
     var at:    EachIteration = it;
+    var flow:  Flow          = FLOW_ON;
     var i:     u32           = 0;
     for (i < sc.instance.pack_len) {
         val res_mark: res[comptime_scope.FrameMark, fail.Fail] = comptime_scope.frame_begin(sc.view.ctx);
-        if (sel res_mark.err) { ret err[fail.Fail].err{res_mark.err}; }
+        if (sel res_mark.err) { ret res[Flow, fail.Fail].err{res_mark.err}; }
         val mark:     comptime_scope.FrameMark = res_mark.ok;
         val err_bind: err[fail.Fail]           = comptime_scope.bind_local(sc.view.ctx, fname, comptime_value.pack_elem_value(i, sc.instance.pack_types[i]::u32));
         if (sel err_bind.err) {
             val err_close: err[fail.Fail] = comptime_scope.frame_end(sc.view.ctx, mark);
-            if (sel err_close.err) { ret err_close; }
-            ret err_bind;
+            if (sel err_close.err) { ret res[Flow, fail.Fail].err{err_close.err}; }
+            ret res[Flow, fail.Fail].err{err_bind.err};
         }
         at.index = i;
-        val err_body:  err[fail.Fail] = each_iteration_visit(sc, at, ce.body_start, ce.body_len, true);
-        val err_close: err[fail.Fail] = comptime_scope.frame_end(sc.view.ctx, mark);
-        if (sel err_body.err)  { ret err_body; }
-        if (sel err_close.err) { ret err_close; }
-        i = i + 1;
+        val res_body:  res[Flow, fail.Fail] = each_iteration_visit(sc, at, ce.body_start, ce.body_len, true);
+        val err_close: err[fail.Fail]       = comptime_scope.frame_end(sc.view.ctx, mark);
+        if (sel res_body.err)  { ret res_body; }
+        if (sel err_close.err) { ret res[Flow, fail.Fail].err{err_close.err}; }
+        flow = flow_then(flow, res_body.ok);
+        i    = i + 1;
     }
-    ret err[fail.Fail].ok{};
+    ret res[Flow, fail.Fail].ok{flow};
 }
 
 # an `$each` over a constant array, typed once per element of the array's published value with
 # the loop variable naming that element; lowering reads the same value from the frame
-fun infer_const_array_each(sc: *sema_context.SemaContext, ce: *ast_stmt.StmtComptimeEach, span: base_source.Span, it: EachIteration, seq_ty: type_kind.TypeId) err[fail.Fail] {
+fun infer_const_array_each(sc: *sema_context.SemaContext, ce: *ast_stmt.StmtComptimeEach, span: base_source.Span, it: EachIteration, seq_ty: type_kind.TypeId) res[Flow, fail.Fail] {
     val opt_arr: opt[*type.Type] = type.get(sc.s.types, seq_ty);
-    if (!sel opt_arr.some) { ret err[fail.Fail].ok{}; }
+    if (!sel opt_arr.some) { ret res[Flow, fail.Fail].ok{FLOW_NONE}; }
     val arr:     *type.Type       = opt_arr.some;
     val elem_ty: type_kind.TypeId = arr.data.array.base;
     val count:   u32              = arr.data.array.count;
@@ -434,131 +485,149 @@ fun infer_const_array_each(sc: *sema_context.SemaContext, ce: *ast_stmt.StmtComp
     val opt_sym: opt[*resolve.Symbol] = sema_context.symbol_for_expr(sc, ce.seq);
     if (!sel opt_sym.some) {
         sema_context.report(sc, diagnostic_kind.EACH_SEQUENCE, span, "a `$each` array sequence must name an array `val`");
-        ret err[fail.Fail].ok{};
+        ret res[Flow, fail.Fail].ok{FLOW_NONE};
     }
     val sym:  *resolve.Symbol = opt_sym.some;
     var kind: resolve.SymKind = sym.kind;
     if (kind == resolve.SYM_IMPORTED) { kind = sym.definition_kind; }
     if (kind == resolve.SYM_VAR) {
         sema_context.report(sc, diagnostic_kind.EACH_MUTABLE, span, "a `$each` array sequence must be a `val`, because a `var` is not a compile-time constant");
-        ret err[fail.Fail].ok{};
+        ret res[Flow, fail.Fail].ok{FLOW_NONE};
     }
     if (kind != resolve.SYM_VAL) {
         sema_context.report(sc, diagnostic_kind.EACH_SEQUENCE, span, "a `$each` array sequence must name an array `val`");
-        ret err[fail.Fail].ok{};
+        ret res[Flow, fail.Fail].ok{FLOW_NONE};
     }
 
     val opt_elem: opt[*type.Type] = type.get(sc.s.types, elem_ty);
     if (sel opt_elem.some) {
         if (opt_elem.some.kind == type_kind.TYPE_ARRAY) {
             sema_context.report(sc, diagnostic_kind.EACH_ELEMENT_TYPE, span, "a `$each` array element must be a scalar or a record, not an array");
-            ret err[fail.Fail].ok{};
+            ret res[Flow, fail.Fail].ok{FLOW_NONE};
         }
     }
 
     val res_valued: res[opt[comptime_value.CTValue], fail.Fail] = sema_constant.array_value(sc, sym);
-    if (sel res_valued.err) { ret err[fail.Fail].err{res_valued.err}; }
+    if (sel res_valued.err) { ret res[Flow, fail.Fail].err{res_valued.err}; }
     if (sel res_valued.ok.none) {
         sema_context.report(sc, diagnostic_kind.EACH_INITIALIZER, span, "a `$each` array sequence must be initialized with an array literal");
-        ret err[fail.Fail].ok{};
+        ret res[Flow, fail.Fail].ok{FLOW_NONE};
     }
     val array:     comptime_value.CTValue                               = res_valued.ok.some;
     val res_store: res[*comptime_deep.Store, comptime_failure.EvalFail] = sema_constant.store_of(sc, array.data.node.module);
-    if (sel res_store.err) { ret err[fail.Fail].err{fail.message(res_store.err.message)}; }
+    if (sel res_store.err) { ret res[Flow, fail.Fail].err{fail.message(res_store.err.message)}; }
     val store: *comptime_deep.Store = res_store.ok;
     val node:  comptime_deep.Node   = comptime_deep.node_of(array);
     val shape: *comptime_deep.Shape = comptime_deep.shape_at(store, node);
     if (shape.kind != comptime_deep.NODE_ARRAY) {
         sema_context.report(sc, diagnostic_kind.EACH_INITIALIZER, span, "a `$each` array sequence must be initialized with an array literal");
-        ret err[fail.Fail].ok{};
+        ret res[Flow, fail.Fail].ok{FLOW_NONE};
     }
     if (shape.len != count) {
         sema_context.report(sc, diagnostic_kind.EACH_INITIALIZER, span, "every element of a `$each` array needs an initializer");
-        ret err[fail.Fail].ok{};
+        ret res[Flow, fail.Fail].ok{FLOW_NONE};
     }
     sema_context.each_set(sc, it.sid, array);
 
     val res_name: res[intern.StrId, A.Error] = intern.range_add(sc.s.interner, sc.view.source, ce.var_name.offset, ce.var_name.len);
-    if (sel res_name.err) { ret err[fail.Fail].err{fail.refused(res_name.err)}; }
+    if (sel res_name.err) { ret res[Flow, fail.Fail].err{fail.refused(res_name.err)}; }
     val fname: intern.StrId  = res_name.ok;
     var at:    EachIteration = it;
+    var flow:  Flow          = FLOW_ON;
     var i:     u32           = 0;
     for (i < count) {
         val opt_elem: opt[comptime_deep.Member] = comptime_deep.member_at(store, node, i);
-        if (sel opt_elem.none) { ret err[fail.Fail].err{fail.message("sema: `$each` array element index out of range")}; }
+        if (sel opt_elem.none) { ret res[Flow, fail.Fail].err{fail.message("sema: `$each` array element index out of range")}; }
         val res_mark: res[comptime_scope.FrameMark, fail.Fail] = comptime_scope.frame_begin(sc.view.ctx);
-        if (sel res_mark.err) { ret err[fail.Fail].err{res_mark.err}; }
+        if (sel res_mark.err) { ret res[Flow, fail.Fail].err{res_mark.err}; }
         val mark:     comptime_scope.FrameMark = res_mark.ok;
         val err_bind: err[fail.Fail]           = comptime_scope.bind_local(sc.view.ctx, fname, comptime_deep.node_ref(array.data.node.module, opt_elem.some.node, type_kind.index(elem_ty)));
         if (sel err_bind.err) {
             val err_close: err[fail.Fail] = comptime_scope.frame_end(sc.view.ctx, mark);
-            if (sel err_close.err) { ret err_close; }
-            ret err_bind;
+            if (sel err_close.err) { ret res[Flow, fail.Fail].err{err_close.err}; }
+            ret res[Flow, fail.Fail].err{err_bind.err};
         }
         at.index = i;
-        val err_body:  err[fail.Fail] = each_iteration_visit(sc, at, ce.body_start, ce.body_len, false);
-        val err_close: err[fail.Fail] = comptime_scope.frame_end(sc.view.ctx, mark);
-        if (sel err_body.err)  { ret err_body; }
-        if (sel err_close.err) { ret err_close; }
-        i = i + 1;
+        val res_body:  res[Flow, fail.Fail] = each_iteration_visit(sc, at, ce.body_start, ce.body_len, false);
+        val err_close: err[fail.Fail]       = comptime_scope.frame_end(sc.view.ctx, mark);
+        if (sel res_body.err)  { ret res_body; }
+        if (sel err_close.err) { ret res[Flow, fail.Fail].err{err_close.err}; }
+        flow = flow_then(flow, res_body.ok);
+        i    = i + 1;
     }
-    ret err[fail.Fail].ok{};
+    ret res[Flow, fail.Fail].ok{flow};
 }
 
 # an `if` and its `or` arms, walked as one chain so its final bare `or` is guarded by every arm
-# before it
-fun infer_if_chain(sc: *sema_context.SemaContext, head: ast_id.StmtId, fn_ret: type_kind.TypeId) err[fail.Fail] {
-    var cur: ast_id.StmtId = head;
-    for (true) {
+# before it. control passes the chain when it passes an arm, or when neither a bare `or` nor
+# tests naming every case of one tag close it
+fun infer_if_chain(sc: *sema_context.SemaContext, head: ast_id.StmtId, fn_ret: type_kind.TypeId) res[Flow, fail.Fail] {
+    var flow: Flow          = FLOW_NONE;
+    var cur:  ast_id.StmtId = head;
+    for {
         val opt_stmt: opt[*ast_stmt.Stmt] = ast.get_stmt(sc.view.a, cur);
-        if (!sel opt_stmt.some) { ret err[fail.Fail].err{fail.message("StmtId out of range")}; }
+        if (!sel opt_stmt.some) { ret res[Flow, fail.Fail].err{fail.message("StmtId out of range")}; }
         val st:      *ast_stmt.Stmt   = opt_stmt.some;
         val cond_ty: type_kind.TypeId = infer.infer_expr(sc, st.data.if_.cond);
         if (!type_kind.is_error(cond_ty)) { check.check_condition(sc, cond_ty, st.span); }
         var arm_guard:  sema_context.Guard;
         val res_opened: res[bool, fail.Fail] = guard.sel_begin(sc, st.data.if_.cond, ?arm_guard);
-        if (sel res_opened.err) { ret err[fail.Fail].err{res_opened.err}; }
-        val err_then: err[fail.Fail] = infer_stmt(sc, st.data.if_.then_block, fn_ret);
+        if (sel res_opened.err) { ret res[Flow, fail.Fail].err{res_opened.err}; }
+        val res_then: res[Flow, fail.Fail] = infer_stmt(sc, st.data.if_.then_block, fn_ret);
         if (res_opened.ok)    { guard.end(sc, ?arm_guard); }
-        if (sel err_then.err) { ret err_then; }
+        if (sel res_then.err) { ret res_then; }
+        flow = flow_either(flow, res_then.ok);
 
         val next: ast_id.StmtId = st.data.if_.else_block;
-        if (ast_id.stmt_is_nil(next)) { ret err[fail.Fail].ok{}; }
+        if (ast_id.stmt_is_nil(next)) {
+            # with no bare `or` control passes the chain unless its tests name every case of one tag
+            val res_exhausts: res[bool, fail.Fail] = guard.chain_exhausts(sc, head);
+            if (sel res_exhausts.err) { ret res[Flow, fail.Fail].err{res_exhausts.err}; }
+            ret res[Flow, fail.Fail].ok{Flow{passes: flow.passes || !res_exhausts.ok, breaks: flow.breaks}};
+        }
         val opt_next: opt[*ast_stmt.Stmt] = ast.get_stmt(sc.view.a, next);
-        if (!sel opt_next.some) { ret err[fail.Fail].err{fail.message("StmtId out of range")}; }
+        if (!sel opt_next.some) { ret res[Flow, fail.Fail].err{fail.message("StmtId out of range")}; }
         if (opt_next.some.kind == ast_stmt.STMT_KIND_IF) {
             cur = next;
             cnt;
         }
         var or_guard:    sema_context.Guard;
         val res_guarded: res[bool, fail.Fail] = guard.final_or_begin(sc, head, ?or_guard);
-        if (sel res_guarded.err) { ret err[fail.Fail].err{res_guarded.err}; }
-        val err_infer_stmt: err[fail.Fail] = infer_stmt(sc, next, fn_ret);
-        if (res_guarded.ok) { guard.end(sc, ?or_guard); }
-        ret err_infer_stmt;
+        if (sel res_guarded.err) { ret res[Flow, fail.Fail].err{res_guarded.err}; }
+        val res_tail: res[Flow, fail.Fail] = infer_stmt(sc, next, fn_ret);
+        if (res_guarded.ok)   { guard.end(sc, ?or_guard); }
+        if (sel res_tail.err) { ret res_tail; }
+        ret res[Flow, fail.Fail].ok{flow_either(flow, res_tail.ok)};
     }
-    ret err[fail.Fail].ok{};
+}
+
+# one of two arms: control passes when it passes either, and either may break
+fun flow_either(a: Flow, b: Flow) Flow {
+    ret Flow{passes: a.passes || b.passes, breaks: a.breaks || b.breaks};
 }
 
 # types a run of statements, walking the rest of the run inside the guard an exiting chain opens
-fun infer_stmt_list(sc: *sema_context.SemaContext, start: u32, len: u32, fn_ret: type_kind.TypeId) err[fail.Fail] {
-    var i: u32 = 0;
+fun infer_stmt_list(sc: *sema_context.SemaContext, start: u32, len: u32, fn_ret: type_kind.TypeId) res[Flow, fail.Fail] {
+    var flow: Flow = FLOW_ON;
+    var i:    u32  = 0;
     for (i < len) {
-        val sid:      ast_id.StmtId  = sc.view.a.stmt_ids.data[start + i];
-        val err_stmt: err[fail.Fail] = infer_stmt(sc, sid, fn_ret);
-        if (sel err_stmt.err) { ret err_stmt; }
-        i = i + 1;
+        val sid:      ast_id.StmtId        = sc.view.a.stmt_ids.data[start + i];
+        val res_stmt: res[Flow, fail.Fail] = infer_stmt(sc, sid, fn_ret);
+        if (sel res_stmt.err) { ret res_stmt; }
+        flow = flow_then(flow, res_stmt.ok);
+        i    = i + 1;
         # an exiting chain guards the rest of the block, so the rest is walked inside its frame
         var rest_guard: sema_context.Guard;
         val res_opened: res[bool, fail.Fail] = guard.exit_chain_begin(sc, sid, ?rest_guard);
-        if (sel res_opened.err) { ret err[fail.Fail].err{res_opened.err}; }
+        if (sel res_opened.err) { ret res[Flow, fail.Fail].err{res_opened.err}; }
         if (res_opened.ok) {
-            val err_rest: err[fail.Fail] = infer_stmt_list(sc, start + i, len - i, fn_ret);
+            val res_rest: res[Flow, fail.Fail] = infer_stmt_list(sc, start + i, len - i, fn_ret);
             guard.end(sc, ?rest_guard);
-            ret err_rest;
+            if (sel res_rest.err) { ret res_rest; }
+            ret res[Flow, fail.Fail].ok{flow_then(flow, res_rest.ok)};
         }
     }
-    ret err[fail.Fail].ok{};
+    ret res[Flow, fail.Fail].ok{flow};
 }
 
 fun gate_probe_ident_is_comptime_param(sc: *sema_context.SemaContext, eid: ast_id.ExprId) bool {
@@ -581,89 +650,107 @@ fun gate_chain_depends(sc: *sema_context.SemaContext, probe: comptime_gate.GateP
 
 # types a comptime `$if` chain: the selected arm alone, every arm deferred when a gate reads
 # a comptime parameter no instance binds or a type comparison it cannot decide, and no arm
-# while a compared type waits for its instantiation
-fun infer_stmt_comptime_if(sc: *sema_context.SemaContext, start: u32, len: u32, fn_ret: type_kind.TypeId, span: base_source.Span) err[fail.Fail] {
+# while a compared type waits for its instantiation. control passes the selected arm's way,
+# and passes a chain that selects none. a deferred chain stands for every instance, so control
+# passes it when it passes an arm or no bare `$or` closes it
+fun infer_stmt_comptime_if(sc: *sema_context.SemaContext, start: u32, len: u32, fn_ret: type_kind.TypeId, span: base_source.Span) res[Flow, fail.Fail] {
     val res_param_gated: res[bool, fail.Fail] = gate_chain_depends(sc, comptime_gate.GATE_PROBE_COMPTIME_PARAM, start, len);
-    if (sel res_param_gated.err) { ret gate_refused(sc, span, res_param_gated.err); }
+    if (sel res_param_gated.err) { ret flow_of(gate_refused(sc, span, res_param_gated.err), FLOW_NONE); }
     val param_gated:      bool                 = res_param_gated.ok;
     val res_has_type_cmp: res[bool, fail.Fail] = gate_chain_depends(sc, comptime_gate.GATE_PROBE_TYPE_COMPARISON, start, len);
-    if (sel res_has_type_cmp.err) { ret gate_refused(sc, span, res_has_type_cmp.err); }
+    if (sel res_has_type_cmp.err) { ret flow_of(gate_refused(sc, span, res_has_type_cmp.err), FLOW_NONE); }
     val has_type_cmp: bool = res_has_type_cmp.ok;
 
     if (has_type_cmp && !param_gated) {
-        val res_pruned: res[u8, fail.Fail] = prune_type_comparison_chain(sc, start, len, fn_ret);
-        if (sel res_pruned.err)              { ret err[fail.Fail].err{res_pruned.err}; }
-        if (res_pruned.ok == PRUNE_SELECTED) { ret err[fail.Fail].ok{}; }
+        var pruned_flow: Flow               = FLOW_ON;
+        val res_pruned:  res[u8, fail.Fail] = prune_type_comparison_chain(sc, start, len, fn_ret, ?pruned_flow);
+        if (sel res_pruned.err)              { ret res[Flow, fail.Fail].err{res_pruned.err}; }
+        if (res_pruned.ok == PRUNE_SELECTED) { ret res[Flow, fail.Fail].ok{pruned_flow}; }
         # a gate reading a type no instantiation has pinned down yet is decided at the instantiation,
         # so no arm is selected and none is checked here
-        if (res_pruned.ok == PRUNE_UNINSTANTIATED) { ret err[fail.Fail].ok{}; }
+        if (res_pruned.ok == PRUNE_UNINSTANTIATED) { ret res[Flow, fail.Fail].ok{FLOW_NONE}; }
     }
 
     # a value instance binds the parameters the chain reads, so it selects the arm
     val per_instance: bool = param_gated && sema_context.walk_binds_values(sc);
     if ((param_gated || has_type_cmp) && !per_instance) {
+        var flow:      Flow = FLOW_NONE;
+        var closed:    bool = false;
         var chain_bad: bool = false;
         var i:         u32  = 0;
         for (i < len) {
             val arm: *ast_decl.ComptimeBranch = ?sc.view.a.comptime_branches.data[start + i];
-            if (!ast_id.expr_is_nil(arm.cond)) {
+            if (ast_id.expr_is_nil(arm.cond)) { closed = true; }
+            or {
                 if (!gate_condition_check(sc, arm.cond)) { chain_bad = true; }
                 val err_check_comptime_gate: err[fail.Fail] = check_comptime_gate(sc, arm.cond);
-                if (sel err_check_comptime_gate.err) { ret err_check_comptime_gate; }
+                if (sel err_check_comptime_gate.err) { ret res[Flow, fail.Fail].err{err_check_comptime_gate.err}; }
             }
             if (!chain_bad) {
                 val outer: sema_context.Walk = sema_context.walk_begin(sc);
                 sc.walk.arm = sema_context.ARM_DEFERRED;
-                val err_body: err[fail.Fail] = infer_comptime_arm(sc, arm, fn_ret);
+                val res_body: res[Flow, fail.Fail] = infer_comptime_arm(sc, arm, fn_ret);
                 sema_context.walk_end(sc, outer);
-                if (sel err_body.err) { ret err_body; }
+                if (sel res_body.err) { ret res_body; }
+                flow = flow_either(flow, res_body.ok);
             }
             i = i + 1;
         }
-        ret err[fail.Fail].ok{};
+        if (chain_bad) { ret res[Flow, fail.Fail].ok{FLOW_NONE}; }
+        if (!closed)   { flow.passes = true; }
+        ret res[Flow, fail.Fail].ok{flow};
     }
     ret select_arm(sc, start, len, fn_ret, per_instance);
+}
+
+# a walk's result `e` carried with the flow `f`
+fun flow_of(e: err[fail.Fail], f: Flow) res[Flow, fail.Fail] {
+    if (sel e.err) { ret res[Flow, fail.Fail].err{e.err}; }
+    ret res[Flow, fail.Fail].ok{f};
 }
 
 # the first arm whose gate holds, typed. a chain gated on comptime parameters is selected
 # per instance: its template could only check the gates and arms, so the instance reports
 # its gates' verdicts and each `$error` the selected arm reaches, quiet or not
-fun select_arm(sc: *sema_context.SemaContext, start: u32, len: u32, fn_ret: type_kind.TypeId, per_instance: bool) err[fail.Fail] {
+fun select_arm(sc: *sema_context.SemaContext, start: u32, len: u32, fn_ret: type_kind.TypeId, per_instance: bool) res[Flow, fail.Fail] {
     val outer_arm: u8 = sc.walk.arm;
     if (per_instance) { sc.walk.arm = sema_context.ARM_SELECTED; }
-    var err_arm: err[fail.Fail] = err[fail.Fail].ok{};
-    var i:       u32            = 0;
+    var res_arm: res[Flow, fail.Fail] = res[Flow, fail.Fail].ok{FLOW_ON};
+    var i:       u32                  = 0;
     for (i < len) {
         val br: *ast_decl.ComptimeBranch = ?sc.view.a.comptime_branches.data[start + i];
         if (!ast_id.expr_is_nil(br.cond)) {
-            if (!gate_condition_check(sc, br.cond)) { brk; }
+            if (!gate_condition_check(sc, br.cond)) {
+                res_arm = res[Flow, fail.Fail].ok{FLOW_NONE};
+                brk;
+            }
         }
         val gate: sema_context.Walk = sema_context.walk_begin(sc);
         if (per_instance) { sc.walk.silent = false; }
         val res_active: res[bool, fail.Fail] = stmt_comptime_branch_active(sc, br);
         sema_context.walk_end(sc, gate);
         if (sel res_active.err) {
-            err_arm = err[fail.Fail].err{res_active.err};
+            res_arm = res[Flow, fail.Fail].err{res_active.err};
             brk;
         }
         if (res_active.ok) {
-            err_arm = infer_comptime_arm(sc, br, fn_ret);
+            res_arm = infer_comptime_arm(sc, br, fn_ret);
             brk;
         }
         i = i + 1;
     }
     sc.walk.arm = outer_arm;
-    ret err_arm;
+    ret res_arm;
 }
 
 # a comptime arm is a chain arm: a condition that is exactly `sel P.c` guards `P.c` in its body
-fun infer_comptime_arm(sc: *sema_context.SemaContext, br: *ast_decl.ComptimeBranch, fn_ret: type_kind.TypeId) err[fail.Fail] {
+fun infer_comptime_arm(sc: *sema_context.SemaContext, br: *ast_decl.ComptimeBranch, fn_ret: type_kind.TypeId) res[Flow, fail.Fail] {
     var arm_guard:  sema_context.Guard;
     val res_opened: res[bool, fail.Fail] = guard.sel_begin(sc, br.cond, ?arm_guard);
-    if (sel res_opened.err) { ret err[fail.Fail].err{res_opened.err}; }
-    val err_body: err[fail.Fail] = infer_stmt_list(sc, br.body_start, br.body_len, fn_ret);
+    if (sel res_opened.err) { ret res[Flow, fail.Fail].err{res_opened.err}; }
+    val res_body: res[Flow, fail.Fail] = infer_stmt_list(sc, br.body_start, br.body_len, fn_ret);
     if (res_opened.ok) { guard.end(sc, ?arm_guard); }
-    ret err_body;
+    ret res_body;
 }
 
 # whether a comptime arm is taken, reporting a gate that failed to evaluate
@@ -688,18 +775,23 @@ val PRUNE_UNDECIDABLE:    u8 = 1;
 val PRUNE_UNINSTANTIATED: u8 = 2;
 
 # walks a `$type_of`-gated chain and type-checks only the arm this instantiation selects; an arm is
-# never selected while an earlier gate is still undecided
-fun prune_type_comparison_chain(sc: *sema_context.SemaContext, start: u32, len: u32, fn_ret: type_kind.TypeId) res[u8, fail.Fail] {
+# never selected while an earlier gate is still undecided. `flow` takes the selected arm's flow,
+# and stays as given when no arm is selected
+fun prune_type_comparison_chain(sc: *sema_context.SemaContext, start: u32, len: u32, fn_ret: type_kind.TypeId, flow: *Flow) res[u8, fail.Fail] {
     var i: u32 = 0;
     for (i < len) {
         val arm: *ast_decl.ComptimeBranch = ?sc.view.a.comptime_branches.data[start + i];
         if (ast_id.expr_is_nil(arm.cond)) {
-            val err_body: err[fail.Fail] = infer_stmt_list(sc, arm.body_start, arm.body_len, fn_ret);
-            if (sel err_body.err) { ret res[u8, fail.Fail].err{err_body.err}; }
+            val res_body: res[Flow, fail.Fail] = infer_stmt_list(sc, arm.body_start, arm.body_len, fn_ret);
+            if (sel res_body.err) { ret res[u8, fail.Fail].err{res_body.err}; }
+            @flow = res_body.ok;
             ret res[u8, fail.Fail].ok{PRUNE_SELECTED};
         }
 
-        if (!gate_condition_check(sc, arm.cond)) { ret res[u8, fail.Fail].ok{PRUNE_SELECTED}; }
+        if (!gate_condition_check(sc, arm.cond)) {
+            @flow = FLOW_NONE;
+            ret res[u8, fail.Fail].ok{PRUNE_SELECTED};
+        }
 
         val res_stmt_gate_verdict: res[comptime_gate.GateVerdict, fail.Fail] = stmt_gate_verdict(sc, arm.cond);
         if (sel res_stmt_gate_verdict.err) {
@@ -711,8 +803,9 @@ fun prune_type_comparison_chain(sc: *sema_context.SemaContext, start: u32, len: 
             ret res[u8, fail.Fail].ok{PRUNE_UNDECIDABLE};
         }
         if (gate_verdict_truth(v)) {
-            val err_body: err[fail.Fail] = infer_stmt_list(sc, arm.body_start, arm.body_len, fn_ret);
-            if (sel err_body.err) { ret res[u8, fail.Fail].err{err_body.err}; }
+            val res_body: res[Flow, fail.Fail] = infer_stmt_list(sc, arm.body_start, arm.body_len, fn_ret);
+            if (sel res_body.err) { ret res[u8, fail.Fail].err{res_body.err}; }
+            @flow = res_body.ok;
             ret res[u8, fail.Fail].ok{PRUNE_SELECTED};
         }
         i = i + 1;

@@ -288,11 +288,12 @@ environment, so an entry build that links the C library names `--env gnu`. The
 previous major's `--arch` and `--sys` are refused naming `-t`, and `--of` is
 refused because the system implies the object format.
 `--set` writes a manifest key over the entry build's target, artifact or profile
-as over a project's, so `mach build main.mach --set simd=require -o strict` builds
-the file under `simd = "require"`, and
-`mach build main.mach -O --set passes.licm=false -o fast` optimizes it with every
-optimization pass but loop invariant motion. A `--set` changes the build's profile,
-so it names its output with `-o` or `-w` (see
+as over a project's, so `mach build main.mach --set simd=require` builds the file
+under `simd = "require"`, and `mach build main.mach -O --set passes.licm=false`
+optimizes it with every optimization pass but loop invariant motion. An entry build
+states its profile on the command line, as `-O` and `--debug` do, so a `--set`
+writes where the build always writes and needs no `-o`. In a project a `--set`
+changes a declared profile and names its output with `-o` or `-w` (see
 [Overriding a key for one build](manifest.md#overriding-a-key-for-one-build)).
 
 ## See also

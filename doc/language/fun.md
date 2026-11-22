@@ -39,6 +39,65 @@ pub fun make_pair[T, U](a: T, b: U) Pair[T, U] {
 }
 ```
 
+## A body with a result ends in `ret`
+
+A function that states a result type must not be able to reach the end of its
+body. Every path through the body ends in a `ret` with a value, or in a statement
+control never passes. A body whose end can be reached is refused with
+`ret.missing`, at its closing brace. Falling off the end never returns a value.
+
+```mach
+tag Shape: u8 { dot; line: i64; }
+
+fun sign(n: i64) i64 {
+    if (n < 0)      { ret -1; }
+    or (n > 0)      { ret 1; }
+    or              { ret 0; }
+}
+
+fun length(s: Shape) i64 {
+    if (sel s.dot)  { ret 0; }
+    or (sel s.line) { ret s.line; }  # every case of `Shape` is named
+}
+```
+
+```mach fragment
+fun positive(n: i64) i64 {
+    if (n > 0) { ret n; }
+}                                     # refused: ret.missing
+```
+
+Whether control can reach the end is decided from the shape of the statements,
+never from the values they compute:
+
+- A `ret`, a `brk` and a `cnt` are never passed, nor is a call to a `#[noreturn]`
+  function, an `asm` block marked `#[noreturn]` or a `$error`.
+- Control reaches the end of a block when it passes every statement in it.
+- An `if` chain is passed when one of its arms is, or when it has neither a bare
+  `or` nor tests that name every case of one tag. A chain of `sel` tests that names
+  every case of a tag needs no bare `or`: each arm tests one place `P` with
+  `sel P.c`, `!sel P.c` or a `||` of `sel` tests of `P`, and once every arm has
+  failed no case is left. The place is the same spelling in every arm, a `sel`
+  reads the case and changes nothing, and a tag always holds one of its declared
+  cases, so one arm is always entered. A test joined to anything else by `&&`, or
+  a chain over two places, names no case.
+- A `for` with a condition is passed, since its condition can be false. A `for`
+  with no condition is passed only when a `brk` of its own leaves it.
+- A `$if` chain counts by the arm the build selects, and is passed when it selects
+  none. Where the arm depends on a comptime parameter the template judges the body
+  for every value: the chain is passed when one of its arms is, or when it has no
+  bare `$or`.
+- A `$each` is passed when each of its iterations is, so one over an empty
+  sequence is passed.
+- A `fin` is passed. Its block runs when the enclosing block exits and does not
+  change how the block ends.
+
+A generic body is held to the rule at each instantiation, like every other check of
+it. A `test` is not a function with a result type: falling off the end of a test
+passes, see [test.md](test.md). An `ext fun` has no body. The body of a `#[naked]`
+function is assembly, which ends however its instructions do, so it is not held to
+the rule.
+
 ## Generic type parameters
 
 Generic functions take type parameters in brackets `[T]`. There are no

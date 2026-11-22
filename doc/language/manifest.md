@@ -1587,11 +1587,12 @@ this major's short `-d`, `-e` and `-s` naming `--debug`, `--emit` and `--source`
 `-k` is the short form of `--kind`. The previous major's `--pie` is refused naming
 `--linkage pie` and the `linkage` key.
 
-A `mach build` whose flags change the selected profile, a profile key written
-with `--set` among them, writes a differently configured build, so it must say
-where: it names the artifact with `-o`, or a
+A `mach build` of a project whose flags change the selected profile, a profile
+key written with `--set` among them, writes a differently configured build, so it
+must say where: it names the artifact with `-o`, or a
 work directory with `-w` that every artifact it writes sits under. Without
-either it is refused:
+either it is refused. A single-file build has no declared profile to overwrite,
+so its levers and `--set` need neither:
 
 ```
 error[cli.flag_conflict] these options would overwrite the profile's artifacts with a differently configured build. name an artifact path with -o or a work directory with -w
@@ -1611,8 +1612,9 @@ target, the `native` one included, `subsystem` over every artifact, and the
 profile keys `optimize`, `passes`, `debug`, `simd`, `relax`, `linker_relax`,
 `symbols`, `sections`, `unwind` and `allow` over every profile, so the profile the build selects holds the value whichever
 it is. A single-file build's one profile takes them as well, so
-`mach build main.mach --set simd=require -o main-require` builds that file under
-`simd = "require"`, naming its output as below. `--set passes.<name>=<bool>` writes one key of the `passes`
+`mach build main.mach --set simd=require` builds that file under
+`simd = "require"`. A single-file build states its profile on the command line,
+so it writes where it always does and needs no `-o`. `--set passes.<name>=<bool>` writes one key of the `passes`
 table, over the keys the table writes already, and `--set passes={...}` writes
 several. `default` is not written: it picks the profile, and every
 profile would claim it.
@@ -1652,9 +1654,9 @@ error[manifest.invalid_value] --set simd must be "scalarize" or "require", found
 
 `--set` writes the profile, so the levers' order below puts it with the
 profile: `-O`, `--no-optimize`, `--debug` and `--no-debug` apply after it and
-win, so `--set optimize=false -O` optimizes. A `mach build` that writes a
-profile key with `--set` changes the selected profile, so it must name where
-its artifacts go, as below.
+win, so `--set optimize=false -O` optimizes. A `mach build` of a project that
+writes a profile key with `--set` changes the selected profile, so it must name
+where its artifacts go, as below.
 
 The previous major's `--subsystem`, `--base`, `--stack-reserve`,
 `--stack-commit` and `--platform` are refused naming the `--set` that replaces

@@ -285,8 +285,10 @@ fun read_value(reply: Reply) i64 {
 ```
 
 A chain's final bare `or` stands where that remainder does: when every arm before
-it tests one place with `sel` or `!sel` and they leave one case untested, the
-`or` body is guarded for that case, whether or not the arms exit.
+it tests one place with `sel`, `!sel` or a `||` of `sel` tests, and they leave one
+case untested, the `or` body is guarded for that case, whether or not the arms
+exit. An arm `sel P.a || sel P.b` tests both cases. It opens no guard in its own
+block, but the arms after it know neither case holds.
 
 ```mach
 tag Shape: u8 { dot; line: i64; square: i64; }
@@ -317,6 +319,11 @@ fun read_value(reply: Reply) i64 {
 Inside a condition, the right operand of `&&` is guarded by a `sel P.c` that is
 its left operand, because `&&` short-circuits. `||`, `!` and every other
 operator open no guard.
+
+A chain whose arms test one place this way and leave no case untested always
+enters one of its arms, so it needs no bare `or` to close it, and a function
+that returns from every arm does not reach the end of its body (see
+[fun.md](fun.md#a-body-with-a-result-ends-in-ret)).
 
 A guard is matched by spelling, so a guarded place must be a path of
 identifiers, fields, dereferences and indexes by a name or a literal, and `sel`
