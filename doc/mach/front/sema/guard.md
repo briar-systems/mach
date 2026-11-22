@@ -32,7 +32,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.base.intern`](../
 | [`loop_begin`](#loop_begin) | a loop runs its condition and body again after any assignment in them, so a guard open at the loop that an assignment inside it moves is ended for the whole loop |
 | [`fin_begin`](#fin_begin) | a `fin` body replays when its block ends, after the rest of the block, so inside the body a guard that an assignment in that rest moves does not hold |
 | [`fin_end`](#fin_end) | lets every guard the `fin` body `fin` hid hold again, once that body has been typed |
-| [`exit_chain_begin`](#exit_chain_begin) | a chain whose arms all test one place and all exit leaves the block knowing which cases remain; when exactly one remains the rest of the block is guarded for it |
+| [`exit_chain_begin`](#exit_chain_begin) | a chain whose arms all test one place and leave the block (verified by the caller) knows which cases remain; when exactly one remains the rest of the block is guarded for it |
 | [`final_or_begin`](#final_or_begin) | a chain whose arms all test one place reaches its final bare `or` knowing which cases remain, exiting or not; when exactly one remains the `or` body is guarded for it, as the rest of the block is after a chain that exits |
 | [`chain_exhausts`](#chain_exhausts) | whether the chain from `sid`, which has no bare `or`, tests every case of one place's tag, so that one of its arms is always entered |
 | [`check_assign`](#check_assign) | whole-value assignment to a guarded place, or to an object it is reached through, replaces the case and is refused; an assignment to anything else the place's spelling names moves it and ends the guard |
@@ -134,7 +134,7 @@ lets every guard the `fin` body `fin` hid hold again, once that body has been ty
 pub fun exit_chain_begin(sc: *mach.front.sema.context.SemaContext, sid: mach.front.ast.id.StmtId, frame: *mach.front.sema.context.Guard) res[bool, mach.base.fail.Fail]
 ```
 
-a chain whose arms all test one place and all exit leaves the block knowing
+a chain whose arms all test one place and leave the block (verified by the caller) knows
 which cases remain; when exactly one remains the rest of the block is guarded for it
 
 ### final_or_begin

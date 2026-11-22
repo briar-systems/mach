@@ -79,7 +79,7 @@ option in another program's words, as `cc -O2`, or in a comment is never reporte
   not be read as source, or a source holds a bare `use` the migration could not
   rewrite, each one reported. The manifest reader refuses such a project, so the input
   is what is wrong. So does a system library 6 found that the manifest does not
-  yet say how 7 finds, each one reported, since the link refuses it. A missing or
+  say how 7 finds, each one reported, since the link refuses it. A missing or
   invalid path, a `[project].id` or `[dep]` key the reader refuses, or a
   `[project] mach` that names a range this release does not migrate from also exits
   `1`, as for every command, with nothing written.

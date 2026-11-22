@@ -33,6 +33,7 @@ class Schema:
         if not self.commands:
             sys.exit(f"::error::'{mach} help' listed no commands")
         self.pages = {}
+        self.subpages = {}
 
     def page(self, cmd):
         if cmd not in self.pages:
@@ -41,25 +42,34 @@ class Schema:
 
     def actions(self, cmd):
         text = self.page(cmd)
-        if "\nactions:\n" not in text:
-            return {}
-        head, body = text.split("\nactions:\n", 1)
-        blocks, cur = {}, None
-        for line in body.splitlines():
-            m = re.match(r"^  ([a-z]+)\b", line)
-            if m:
-                cur = m.group(1)
-                blocks[cur] = []
-            if cur:
-                blocks[cur].append(line)
-        return {a: "\n".join(lines) for a, lines in blocks.items()}
+        if "\nactions:\n" in text:
+            head, body = text.split("\nactions:\n", 1)
+            blocks, cur = {}, None
+            for line in body.splitlines():
+                m = re.match(r"^  ([a-z]+)\b", line)
+                if m:
+                    cur = m.group(1)
+                    blocks[cur] = []
+                if cur:
+                    blocks[cur].append(line)
+            return {a: "\n".join(lines) for a, lines in blocks.items()}
+        if "\ncommands:\n" in text:
+            body = text.split("\ncommands:\n", 1)[1].split("\n\n", 1)[0]
+            return {a: None for a in re.findall(r"^  ([a-z-]+)\b", body, re.M)}
+        return {}
 
     def flags(self, cmd, action):
         text = self.page(cmd)
         own = text.split("\nactions:\n", 1)[0]
         found = set(FLAG.findall(own))
         if action:
-            found |= set(FLAG.findall(self.actions(cmd)[action]))
+            act_text = self.actions(cmd)[action]
+            if act_text is None:
+                key = (cmd, action)
+                if key not in self.subpages:
+                    self.subpages[key] = run_help(self.mach, cmd, action)
+                act_text = self.subpages[key]
+            found |= set(FLAG.findall(act_text))
         # `mach --help` and `mach <cmd> --help` route to help without being listed
         found.add("--help")
         return found

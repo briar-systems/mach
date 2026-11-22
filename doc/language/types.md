@@ -138,8 +138,7 @@ on the target, and code generation is mirl's legalisation of the width over
 the target's registers. A target whose layout holds no such width refuses the
 type where it is laid out.
 
-Constants at these widths are held in 128 bits for now (mach#4803 widens
-them):
+Constants at these widths are held in 128 bits:
 
 - No literal suffix names them, and a literal or constant of one of them
   reaches what an `i128` holds: `-2^127` to `2^127 - 1` for `i256` and `i512`,

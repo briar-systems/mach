@@ -304,7 +304,7 @@ under a chain only type checking decides is not reached. Under a chain that
 declares nothing and asks a type question, it fires during type checking. Type
 checking runs only once every module of the build resolves without error or
 refusal, so until then the name-resolution errors are reported, the refused
-module's included, and the `$error` is not yet reached. Once it fires, the modules
+module's included, and the `$error` has not been reached. Once it fires, the modules
 that import the refused one are not type checked, and nothing that loading or name
 resolution said of the refused module or of them is reported.
 

@@ -67,7 +67,7 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 
 | Functions | |
 | :--- | :--- |
-| [`width_held`](#width_held) | the width a comptime integer of a `bits`-bit type is held at: its own up to the 128-bit carrier, and untyped past it, exact to 128 bits with every overflow refused (mach#4803 widens the carrier) |
+| [`width_held`](#width_held) | the width a comptime integer of a `bits`-bit type is held at: its own up to the 128-bit carrier, and untyped past it, exact to 128 bits with every overflow refused |
 | [`float_negated`](#float_negated) | the negation of a float at width `w`, folded |
 | [`complement`](#complement) | the bitwise complement of an integer, folded at comptime's width |
 
@@ -649,8 +649,7 @@ pub fun width_held(bits: u32) u8
 ```
 
 the width a comptime integer of a `bits`-bit type is held at: its own up to the 128-bit
-carrier, and untyped past it, exact to 128 bits with every overflow refused (mach#4803
-widens the carrier)
+carrier, and untyped past it, exact to 128 bits with every overflow refused
 
 ### float_negated
 
