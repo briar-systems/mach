@@ -410,6 +410,7 @@ pub rec Walk {
     in_fin:           bool;
     loop_depth:       u32;
     in_test:          bool;
+    naked:            bool;
     timed:            u8;
     ret_written:      mach.front.ast.id.TypeId;
     guards:           *Guard;
@@ -430,6 +431,7 @@ sets it
 | `write_place` | `mach.front.ast.id.ExprId` | the place under a store or an address-of, whose root is written or addressed rather than read |
 | `loop_depth` | `u32` | the loops entered since the body a jump cannot leave began, a function's or a `fin`'s, so a `brk` or `cnt` at 0 has no loop to target |
 | `in_test` | `bool` | inside a `test` body, where a `ret` value is a status in 0..255 |
+| `naked` | `bool` | inside a `#[naked]` function's body, which has no frame for an asm block to bind from |
 | `timed` | `u8` | the constant-time mode of the function whose body is walked, `mach.type.TIMED_NONE` outside one |
 | `ret_written` | `mach.front.ast.id.TypeId` | the return type the function whose body is walked writes, nil outside one |
 | `block` | `mach.base.source.Span` | the innermost block statement walked, whose end is where a `fin` in it replays |

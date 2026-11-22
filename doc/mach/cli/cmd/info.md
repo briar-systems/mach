@@ -2,7 +2,7 @@
 
 # mach.cli.cmd.info
 
-`mach info`: the version and the host target, or with `targets` every target mink spells
+`mach info`: the version and the host target, or with `targets` every target a build can be made for
 
 Source: [`src/cli/cmd/info.mach`](../../../../src/cli/cmd/info.mach)
 
@@ -10,7 +10,7 @@ Uses types from [`mach.base.fail`](../../base/fail.md), [`mach.cli.args`](../arg
 
 | Functions | |
 | :--- | :--- |
-| [`run`](#run) | `mach info`: print "mach \<version>" and the host target this binary resolves for the machine it runs on, or with the verb `targets` every target mink's catalog spells; any other verb is an error |
+| [`run`](#run) | `mach info`: print "mach \<version>" and the host target this binary resolves for the machine it runs on, or with the verb `targets` every target a build can be made for; any other verb is an error |
 
 | Constants | |
 | :--- | :--- |
@@ -28,7 +28,7 @@ pub fun run(cx: *mach.cli.args.Call) res[i64, mach.base.fail.Fail]
 ```
 
 `mach info`: print "mach \<version>" and the host target this binary resolves for the
-machine it runs on, or with the verb `targets` every target mink's catalog spells; any other
+machine it runs on, or with the verb `targets` every target a build can be made for; any other
 verb is an error
 
 | Parameter | |

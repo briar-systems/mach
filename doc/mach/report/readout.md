@@ -80,7 +80,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`ALLOCATED`](#counter) | the machine instructions after mirl's register allocation |
 | [`ALLOC_ROUNDS`](#counter) | the rounds of mirl's register allocation |
 | [`counter_group`](#counter_group) | the group counter c is shown on |
-| [`counter_word`](#counter_word) | the word counter c's value takes on its group's line |
+| [`counter_word`](#counter_word) | the word counter c takes on its group's line for a value of `count` |
 | [`counter_label`](#counter_label) | the label of counter c |
 | [`counter_bytes`](#counter_bytes) | whether counter c counts bytes |
 
@@ -245,10 +245,10 @@ the group counter c is shown on
 ### counter_word
 
 ```mach
-pub fun counter_word(c: Counter) str
+pub fun counter_word(c: Counter, count: u64) str
 ```
 
-the word counter c's value takes on its group's line
+the word counter c takes on its group's line for a value of `count`
 
 ### counter_label
 

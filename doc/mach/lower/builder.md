@@ -21,7 +21,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../bas
 | :--- | :--- |
 | [`init`](#init) | a builder over `m`, whose types the target's layout lays out under the build's context, with its stack slots in the address space `slots` |
 | [`dnit`](#dnit) | release the builder's own storage, the module stays |
-| [`fault`](#fault) | keep `f` as the builder's failure unless one is already kept |
+| [`fault`](#fault) | keep `f` as the builder's failure unless one is already kept, placed at the source the builder is lowering when `f` names no place of its own, since it is reported long after |
 | [`failed`](#failed) | whether lowering or mirl's builder has kept a failure |
 | [`done`](#done) | the first failure of the work: lowering's own, else the one mirl's builder kept |
 | [`after_err_pub`](#after_err_pub) | mirl's refusal, once its builder has kept one, as lowering's failure |
@@ -280,7 +280,8 @@ release the builder's own storage, the module stays
 pub fun fault(b: *Builder, f: mach.base.fail.Fail)
 ```
 
-keep `f` as the builder's failure unless one is already kept
+keep `f` as the builder's failure unless one is already kept, placed at the source the builder
+is lowering when `f` names no place of its own, since it is reported long after
 
 | Parameter | |
 | :--- | :--- |

@@ -28,6 +28,7 @@ Uses types from [`mach.base.fail`](base/fail.md), [`mach.manifest.model`](manife
 | :--- | :--- |
 | [`name_vector_dnit`](#name_vector_dnit) | free every name in a vector and then the vector itself |
 | [`override_note`](#override_note) | the note naming one requirement a root declaration overrode, as `mach dep pull`, `update`, `add` and `verify` print it |
+| [`git_source`](#git_source) | the source a manifest's `git` value names, as every git command and record reads it: a relative local path is resolved against the directory of the manifest that declares it, as a `path` is, and made absolute, since git runs in other directories than that one |
 | [`ref_of`](#ref_of) | the ref a git line names, empty when it names none |
 | [`refuse_nested_realization`](#refuse_nested_realization) | a realized nested dependency (`dep/<id>/dep/<x>/mach.toml`) is refused: the root owns the flat closure and a dependency's own dep/ is never realized |
 | [`verify_dep_manifest_id`](#verify_dep_manifest_id) | check that the manifest of a realized dependency declares the id it is realized under |
@@ -68,6 +69,24 @@ the note naming one requirement a root declaration overrode, as `mach dep pull`,
 | `declared` | the root's winning selector, as its manifest line spells it |
 | `chain` | the requiring chain, ending at the dependency |
 | `requested` | the selector the chain asked for, in the same form |
+
+### git_source
+
+```mach
+pub fun git_source(a: *std.allocator.Allocator, manifest_dir: str, spelled: str) res[str, mach.base.fail.Fail]
+```
+
+the source a manifest's `git` value names, as every git command and record reads it: a
+relative local path is resolved against the directory of the manifest that declares it, as
+a `path` is, and made absolute, since git runs in other directories than that one. a url
+(`scheme://`, or scp-like `host:path`) and an absolute path are kept as written
+
+| Parameter | |
+| :--- | :--- |
+| `a` | allocates the source, which the caller owns |
+| `manifest_dir` | the directory of the declaring manifest |
+| `spelled` | the `git` value as written |
+| **returns** | the source, err when the working directory cannot be read |
 
 ### ref_of
 

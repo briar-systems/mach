@@ -83,6 +83,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.fai
 | [`result_dnit`](#result_dnit) | release a resolution; a nil result holds nothing |
 | [`result_copy`](#result_copy) | an owned copy of `r` from `alloc`, every entry at the id it has in `r` |
 | [`asm_binds_at`](#asm_binds_at) | the locals an asm block binds, in the order its body names them |
+| [`asm_binds_any`](#asm_binds_any) | whether the asm block `sid` binds any local |
 | [`expr_name_kind`](#expr_name_kind) | what a resolved expression names, as a comptime evaluation reads it |
 | [`expression`](#expression) | expression `eid` of `a` as name resolution read it |
 | [`type_node`](#type_node) | the type node `tid` of `a`, whose text is `source`, as name resolution read it: a literal head it split names the type by its path's prefix and the case by the last segment |
@@ -600,6 +601,14 @@ pub fun asm_binds_at(r: *ResolveResult, sid: mach.front.ast.id.StmtId, out: *std
 ```
 
 the locals an asm block binds, in the order its body names them
+
+### asm_binds_any
+
+```mach
+pub fun asm_binds_any(r: *ResolveResult, sid: mach.front.ast.id.StmtId) bool
+```
+
+whether the asm block `sid` binds any local
 
 ### expr_name_kind
 

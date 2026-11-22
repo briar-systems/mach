@@ -47,7 +47,7 @@ dependency is realized at
 
 ```mach
 pub fun realized(s: *mach.session.Session, gi: *mach.package.git.Inspector, alias: str, parent_root: str,
-    dep_dir: str, dir_dep: str, d: *mach.manifest.model.DepDef) res[mach.base.intern.StrId, mach.base.fail.Fail]
+    dep_dir: str, dir_dep: str, d: *mach.manifest.model.DepDef, source: str) res[mach.base.intern.StrId, mach.base.fail.Fail]
 ```
 
 what `mach dep verify` checks of one realized git dependency
@@ -61,5 +61,6 @@ what `mach dep verify` checks of one realized git dependency
 | `dep_dir` | the dependency's checkout directory |
 | `dir_dep` | the dependency root's name under the parent, dep |
 | `d` | the declaration |
+| `source` | the source its `git` names, as the closure resolved it (package.git_source) |
 | **returns** | the realized content `git/<commit>`, interned, which the closure's selectors are checked against, err naming the first mismatch |
 

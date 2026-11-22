@@ -127,7 +127,7 @@ resolution of the operation reads the same table
 ### realize
 
 ```mach
-pub fun realize(op: *Operation, reqs: *Vector[Request], quiet: bool, offline: bool, verify_only: bool,
+pub fun realize(op: *Operation, reqs: *Vector[Request], quiet: bool, unchanged: bool, offline: bool, verify_only: bool,
     candidate: *toml.value.Table, picks: *Vector[mach.package.resolver.Choice]) err[mach.base.fail.Fail]
 ```
 
@@ -140,6 +140,7 @@ directory under dep/ outside the closure, where a realizing walk notes and retai
 | `op` | the operation |
 | `reqs` | receives the closure, which the caller frees |
 | `quiet` | report no progress lines |
+| `unchanged` | report a git dependency found already realized as unchanged, as pull does |
 | `offline` | fetch nothing |
 | `verify_only` | change nothing |
 | `candidate` | the root manifest's table, or nil to read it from the project |

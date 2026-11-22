@@ -26,6 +26,7 @@ Uses types from [`mach.base.fail`](../base/fail.md), [`mach.target.resolved`](re
 | Functions | |
 | :--- | :--- |
 | [`tuple_of`](#tuple_of) | the tuple a resolved target names its owners' parts by |
+| [`carried`](#carried) | whether a target spelled `s` can be built for: mirl carries its architecture under a calling convention one of its hosts accepts |
 
 ---
 
@@ -98,4 +99,22 @@ pub fun tuple_of(t: *mach.target.resolved.Target) Tuple
 ```
 
 the tuple a resolved target names its owners' parts by
+
+### carried
+
+```mach
+pub fun carried(a: *std.allocator.Allocator, s: mink.catalog.target.Spec) bool
+```
+
+whether a target spelled `s` can be built for: mirl carries its architecture under a calling
+convention one of its hosts accepts. mink's catalog spells rows for another reason too, an
+architecture or convention mirl has no machine for, and a target naming one assembles to none.
+each environment and convention the hosts accept is resolved and assembled with no baseline,
+so only the machine and the convention are judged: a refusal past them (a baseline or code
+model the target states) leaves the row buildable
+
+| Parameter | |
+| :--- | :--- |
+| `a` | scratch for each assembly, given back before it answers |
+| `s` | the system and architecture |
 

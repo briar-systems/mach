@@ -10,7 +10,7 @@ test runner's events as they arrive, by the readout contract (doc/language/reado
 
 Source: [`src/cli/diagnostic.mach`](../../../src/cli/diagnostic.mach)
 
-Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.build.outcome`](../build/outcome.md), [`mach.package.report`](../package/report.md), [`mach.report.layout`](../report/layout.md), [`mach.report.readout`](../report/readout.md), [`mach.report.testrun`](../report/testrun.md), [`mach.session`](../session.md).
+Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.diagnostic.kind`](../base/diagnostic/kind.md), [`mach.base.fail`](../base/fail.md), [`mach.base.source`](../base/source.md), [`mach.build.outcome`](../build/outcome.md), [`mach.package.report`](../package/report.md), [`mach.report.layout`](../report/layout.md), [`mach.report.readout`](../report/readout.md), [`mach.report.testrun`](../report/testrun.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -21,7 +21,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 | On `Readout` | |
 | :--- | :--- |
 | [`readout_begin`](#readout_begin) | start rendering a command's events to r, a test run in human text to stdout |
-| [`readout_end`](#readout_end) | close a plan's rendering: under human text the table a plan of several units closes with, then one summary line that closes every failure and diagnostic the plan rendered, a carried failure (an encoder or rules refusal that reached no store) counted in it beside every store's diagnostics, so the tally never reads `0 errors` above a nonzero exit |
+| [`readout_end`](#readout_end) | close a plan's rendering: under human text the table a plan of several units closes with |
 
 | On `Format` | |
 | :--- | :--- |
@@ -30,7 +30,7 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 
 | On `Report` | |
 | :--- | :--- |
-| [`report_store`](#report_store) | render every diagnostic of a store through a command's report: as text with its tally line, or a record each under json |
+| [`report_store`](#report_store) | render every diagnostic of a store through a command's report: as text, counted into the tally the report closes with, or a record each under json |
 | [`dependency_report`](#dependency_report) | where a dependency command reports: progress on standard output, and notes and failures, the ones the command goes on past too, through the command's report |
 | [`is_records`](#is_records) | whether the report writes records rather than human text |
 | [`report_init`](#report_init) | start a report in place; it holds its own arena, so it stays where it was made until `report_dnit` |
@@ -44,8 +44,6 @@ Uses types from [`mach.base.diagnostic`](../base/diagnostic.md), [`mach.base.dia
 
 | Functions | |
 | :--- | :--- |
-| [`flush`](#flush) | render every diagnostic of a store to a writer, then an "N errors / M warnings" line |
-| [`flush_sources`](#flush_sources) | render every diagnostic of a store to a writer, then an "N errors / M warnings" line |
 | [`render_fail`](#render_fail) | print a Fail to stderr as the diagnostic it reads as, and map it to an exit code a reported Fail prints nothing, its diagnostics having been rendered already |
 | [`refuse`](#refuse) | render_fail for a failure built in place |
 | [`dependency_outcome`](#dependency_outcome) | show how a dependency command ended: its failure, then a note for each change it made before failing |
@@ -63,7 +61,9 @@ pub rec Readout {
     r:       *Report;
     units:   usize;
     quiet:   bool;
-    tally:   Tally;
+    cell:    mach.report.readout.Unit;
+    in_cell: bool;
+    named:   bool;
     live:    bool;
     shown:   bool;
     a:       *std.allocator.Allocator;
@@ -84,7 +84,8 @@ every command's events rendered the moment each arrives: the renderer of the
 readout contract (doc/language/readout.md). the report's stream, stderr,
 carries the build: human text renders a unit's progress line or, among several units, the
 table their plan closes with, under -v each unit's table, failures and diagnostics, and
-readout_end writes the closing tally; the records modes write each diagnostic and failure as
+among several units each unit's first diagnostic or failure follows a line naming the unit,
+and the report counts what is rendered for its closing tally; the records modes write each diagnostic and failure as
 a record, and under -v each unit, phase row, item and counter. stdout carries a test run in
 human text: a module's row once its last test has finished, or each test under -v, then each
 failure once and the verdict. under the records modes the run is also records on the
@@ -96,7 +97,8 @@ report's stream: run_start, a test record per finished test, and run_end
 | `r` | `*Report` | the command's report |
 | `units` | `usize` | the plan's unit count; one table closes a plan of more than one |
 | `quiet` | `bool` | `--quiet`, which suppresses the progress lines and banners |
-| `tally` | `Tally` | the human tally, counted as the events pass |
+| `cell` | `mach.report.readout.Unit` | the unit the events now arriving belong to, when `in_cell` |
+| `named` | `bool` | whether a line naming `cell` has been written |
 | `live` | `bool` | whether a live progress line is shown, and `shown` whether one is on the terminal now |
 | `a` | `*std.allocator.Allocator` | the arena what is held lives in, nil until something is |
 | `rows` | `Vector[StageRow]` | the -v table's rows, held until the unit closes |
@@ -131,11 +133,8 @@ start rendering a command's events to r, a test run in human text to stdout
 pub fun readout_end(rd: *Readout)
 ```
 
-close a plan's rendering: under human text the table a plan of several units closes with,
-then one summary line that closes every failure and diagnostic the plan rendered, a carried
-failure (an encoder or rules refusal that reached no store) counted in it beside every
-store's diagnostics, so the tally never reads `0 errors` above a nonzero exit. the records
-modes close in report_dnit
+close a plan's rendering: under human text the table a plan of several units closes with.
+the tally of what it rendered closes the report, in report_dnit
 
 ## Format
 
@@ -208,8 +207,8 @@ summary record, whose counts are the severities of the records before it
 pub fun report_store(r: *Report, sources: *mach.base.source.SourceMap, list: *mach.base.diagnostic.DiagnosticStore)
 ```
 
-render every diagnostic of a store through a command's report: as text with its tally line,
-or a record each under json
+render every diagnostic of a store through a command's report: as text, counted into the
+tally the report closes with, or a record each under json
 
 | Parameter | |
 | :--- | :--- |
@@ -361,34 +360,6 @@ stopped ends with the one line report_interrupted writes instead
 | **returns** | the worse of code and the kept refusal's |
 
 ## Functions
-
-### flush
-
-```mach
-pub fun flush(out: *std.io.writer.Writer, s: *mach.session.Session, list: *mach.base.diagnostic.DiagnosticStore)
-```
-
-render every diagnostic of a store to a writer, then an "N errors / M warnings" line
-
-| Parameter | |
-| :--- | :--- |
-| `out` | the destination |
-| `s` | the session whose SourceMap locates each diagnostic |
-| `list` | the diagnostics, rendered in order; nothing is written when it is empty |
-
-### flush_sources
-
-```mach
-pub fun flush_sources(out: *std.io.writer.Writer, sources: *mach.base.source.SourceMap, list: *mach.base.diagnostic.DiagnosticStore)
-```
-
-render every diagnostic of a store to a writer, then an "N errors / M warnings" line
-
-| Parameter | |
-| :--- | :--- |
-| `out` | the destination |
-| `sources` | the SourceMap that locates each diagnostic |
-| `list` | the diagnostics, rendered in order; nothing is written when it is empty |
 
 ### render_fail
 

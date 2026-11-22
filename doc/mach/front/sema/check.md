@@ -47,6 +47,7 @@ Uses types from [`mach.base.diagnostic.kind`](../../base/diagnostic/kind.md), [`
 | [`check_return`](#check_return) | check a `ret` against the function's result type |
 | [`check_condition`](#check_condition) | check a branch or loop condition, which must be a public `u1` |
 | [`refuse_form`](#refuse_form) | form `form` of a previous major written at `span`, refused naming what this major spells |
+| [`refuse_form_note`](#refuse_form_note) | form `form` refused as `refuse_form` refuses it, with `note` saying how the program came to write it |
 | [`byte_size`](#byte_size) | the size of a value of `t`, 0 when it has none or does not fit 32 bits; an array is its element's size times every count above it, read in a loop, so an array nested through flat defs deeper than the stack still has its size |
 | [`type_to_str`](#type_to_str) | the spelling of type `t`, owned by the caller and released with type_str_free, or the failure |
 | [`type_str_free`](#type_str_free) | release a spelling type_to_str returned |
@@ -430,6 +431,14 @@ pub fun refuse_form(sc: *mach.front.sema.context.SemaContext, form: mach.front.t
 ```
 
 form `form` of a previous major written at `span`, refused naming what this major spells
+
+### refuse_form_note
+
+```mach
+pub fun refuse_form_note(sc: *mach.front.sema.context.SemaContext, form: mach.front.transition.Form, span: mach.base.source.Span, note: str)
+```
+
+form `form` refused as `refuse_form` refuses it, with `note` saying how the program came to write it
 
 ### byte_size
 

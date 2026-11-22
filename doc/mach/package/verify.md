@@ -9,7 +9,7 @@ release rule; a root override of a requirer's selector is reported, not refused
 
 Source: [`src/package/verify.mach`](../../../src/package/verify.mach)
 
-Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.package.report`](report.md), [`mach.session`](../session.md).
+Uses types from [`mach.base.fail`](../base/fail.md), [`mach.base.intern`](../base/intern.md), [`mach.package.closure`](closure.md), [`mach.package.report`](report.md), [`mach.session`](../session.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -59,7 +59,7 @@ the note `mach dep verify` prints for one override
 ### dependencies
 
 ```mach
-pub fun dependencies(s: *mach.session.Session, project_root: str, release_rule: bool,
+pub fun dependencies(s: *mach.session.Session, project_root: str, release_rule: bool, walked: *Vector[mach.package.closure.Request],
     overrides: *Vector[RootOverride]) err[mach.base.fail.Fail]
 ```
 
@@ -70,6 +70,7 @@ check a project's realized dependency closure without changing it
 | `s` | the session |
 | `project_root` | the root project's directory |
 | `release_rule` | also hold the root to the release rule: every dependency selected by `version` or an exact `tag/`, as a release about to be tagged must be |
+| `walked` | the closure the walk read from the same manifests, whose git sources it resolved |
 | `overrides` | when not nil, receives every requirer selector a root override replaced |
 | **returns** | err naming the first mismatch |
 

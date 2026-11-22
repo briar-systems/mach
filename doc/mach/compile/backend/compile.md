@@ -49,7 +49,7 @@ warnings alone with `warnings_dnit` once the object has moved on
 
 ```mach
 pub fun compile(b: *Back, a: *std.allocator.Allocator, m: *Module, optimise: Optimise, checked: bool, relax: bool, unwind: bool, floats: mirl.pass.relaxation.Relaxations,
-    require: bool, report: bool, listing: opt[*std.io.writer.Writer], stats: opt[*mirl.base.stats.Stats], name: str, owner: str) res[Compiled, Unplaced]
+    require: bool, report: bool, closed: bool, listing: opt[*std.io.writer.Writer], stats: opt[*mirl.base.stats.Stats], name: str, owner: str) res[Compiled, Unplaced]
 ```
 
 the mirl module `m` compiled to mink's object under the setting `optimise`, its schedule's own checks
@@ -60,7 +60,8 @@ timed and counted into `stats` when there is one. a vector operation mirl takes 
 refused where `require` holds, as the profile's `simd = "require"` asks, and is a warning
 otherwise, a refusal naming the dependency `owner` whose code the module is, nil for the project
 being built. where `report` holds, mirl writes its report of the optimisation passes that changed
-each function to stdout, each line whole. a failure or warning carries the location mirl names, unplaced.
+each function to stdout, each line whole. where `closed` holds, nothing outside the object refers into it, so mirl
+leaves out what no root of its own reaches. a failure or warning carries the location mirl names, unplaced.
 `name` is the object's, no other object's in a link. the module is the schedule's to rewrite, so
 it is spent here
 
