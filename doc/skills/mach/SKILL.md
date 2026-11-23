@@ -254,7 +254,7 @@ simd = "scalarize"
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "branch/dev"
+version = "^10.0.0"
 ```
 
 Target keys are `arch`, `sys`, `abi`, `env`, `isa`, `ext` (never 6's `os` or `isa` naming an architecture). Artifact kinds are `bin`, `static`, `shared`, `object` and `module`. Every profile states `optimize`, `debug` and `simd` (`"scalarize"` or `"require"`). The entry is `src/bin/main.mach` for an executable and `src/lib/<id>.mach` for a library, by convention. A build compiles what the entry reaches through `use` and `fwd`.

@@ -83,8 +83,7 @@ What `mach dep add` writes:
 `mach init` declares std at the selection the compiler that runs it states for
 std, so it never searches every release. The selection is a version range,
 written as the caret range of the newest release in it, or a ref, written as it
-is. Until the std major that accepts mach 7 is released it is
-`ref = "branch/dev"`. std is an ordinary dependency, with no std-specific
+is. For mach 7 it is the `^10` release range. std is an ordinary dependency, with no std-specific
 command. `mach init --no-deps` declares no dependency and reads
 nothing from the network (see [files.md](files.md#what-mach-init-does)). A tool
 that needs the std for a given

@@ -9,23 +9,39 @@ Each release groups its entries under `Added`, `Changed`, `Deprecated`, `Removed
 
 ## [Unreleased]
 
+## [7.0.0] - 2026-11-23
+
 ### Added
+- Self-hosted code generation, assembly, and linking through `mirl`, `masc`, and `mink`, with no dependency on LLVM or a host linker. Cross-builds link Windows PE/COFF executables and DLLs and macOS Mach-O binaries and dylibs from any host without a target SDK (#4642, #4825).
 - `mach migrate [<path>] [--check]` rewrites a project written for v6 into v7's spelling: its `mach.toml` and every source file under `[project].src`. Each rule is the row that retires the name, a removed or retired manifest key with a rewrite, a renamed template variable, comptime path or decorator, so a name a later major retires is migrated by the row that retires it. `--check` writes nothing and names each file that would change. `mach fmt` and `mach migrate` share one pass over a project's source.
 - A `wasi` system with the `preview1` environment builds a wasm32 module, with `arch = "wasm32"` and `abi = "basic"`. A `bin` artifact is a `.wasm` module that starts at `_start`, a `static` one a `.a` archive, and no `shared` artifact is built. Its programs run under the `runner` its target declares. A function pointer is a slot of the module's indirect call table, std's atomic operations are the plain access on its one thread, a run-time cast from a float to an integer saturates under `wasm1` alone, and inline assembly reads masc's wasm text (#4928).
+- Native `windows-aarch64` (`aapcs64win` ABI) and `linux-riscv32` (`ilp32d` ABI) targets, and compiler release binaries for `aarch64-windows` alongside `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`, `aarch64-darwin`, and `x86_64-windows`.
+- Multithreaded compilation across translation units (`--threads <n>`), lowered IR as a per-unit product, and generic instances compiled once per build in dedicated instance units.
+- Release optimizer pipeline in `mirl` enabled by `optimize = true`, plus single-emission debug type units (`debug = true`).
+- `u1` boolean bit type for comptime gates, `$zeroize` intrinsic for wiping secret memory, and graduated constant-time checking (`#[constant_time("hard")]` and `"soft"`) verified across front-end lowering and machine assembly (#3872, #4885, #4954).
+- Redesigned diagnostic and progress reporting with `--report <human|json|lines>`, `--set <key=value>` manifest overrides, `--linkage`, and a 60-second default per-test timeout (`--timeout <duration>`) in `mach test` (#4962, #4965).
+- Rebuilt `mach doc` generator and plain-markdown language reference mirroring the source tree.
 
 ### Changed
 - **Breaking:** a target names its parts as the whole toolchain does. `[target.*]` writes `arch` for the architecture (v6 `isa`), `isa` for the instruction set every machine of the target has (v6 `baseline`), `sys` for the system (v6 `os`) and `ext` for its extensions (v6 `extensions`), and `[link.*]` filters by `sys` and `arch`. Templates read `{target.arch}` and `{target.sys}`, comptime reads `$mach.sys.*`, `$mach.build.sys`, `$mach.build.ext.*` and `$project.target.sys`, the extension decorator is `#[extension("...")]` with string arguments (v6 `#[extensions(...)]`), a build step's environment carries `MACH_TARGET_ARCH` and `MACH_TARGET_SYS`, and `mach info` prints `sys`. Each v6 name is refused naming its v7 one and carries the rewrite `mach migrate` applies, and an `isa` that names an architecture is refused as v6's `arch`.
-
 - **Breaking:** an `object` artifact takes no `out`. Its objects stay under `obj/` for a later link, so an `out` nothing read is refused, and `mach migrate` removes it. Every other kind still requires `out`, and `{artifact.<id>.out}` naming an object artifact is refused.
+- **Breaking:** `[project].work` replaces `[project].out`, `[profile.*].optimize` (`true` or `false`) replaces integer `opt`, `[link.*].source` states a system library's kind with no fallback, and build step environment inputs are declared explicitly (#4642, #4956). See `MIGRATION.md` for the full migration guide.
+- **Breaking:** every function body with a result type must end in an explicit `ret`, bare project-id imports (`use std;`) are refused in favor of module paths, shared libraries export only declarations marked `#[export]`, and `#[weak]` defaults stay hidden unless `#[export]` is also given (#4754, #4954).
+- **Breaking:** a secret value has no compile-time constant evaluation, module-level bindings cannot hold secrets, and tag cases share storage bytes only where they agree on secrecy (#4642).
+- **Breaking:** `mach init <dir>` requires its directory operand, scaffolds `src/bin/main.mach` (or `src/lib/<id>.mach` with `--lib`), and declares `std` at `^10`.
+- Out-of-memory exits with code 3 and unsupported requests exit with code 1, and path/IO failures report the operation and target role as raised (#4964).
+
+### Removed
+- **Breaking:** bare project-id imports, v6 manifest and decorator spellings, profile `vectorize` and `float_reassoc` keys, `pass`/`skip` optimization levers, and `--pie`/`--simd` CLI flags (#4642, #4754, #4876, #4954).
 
 ### Fixed
 - An entry build's `-k object -o <path>` writes the build's one object to the path, and refuses a build that writes more than one, where it exited 0 having written nothing.
 - A second `mach build` of a wasi project over its work directory no longer links freed memory. The object read back from the cache owns the file bytes a wasm conversion borrows from, where the build freed them first and could fault in the link.
 - `mach test` on a wasi target links. A wasm function now counts as defined, so a module's test object no longer defines its module's functions a second time beside the module's object.
 - An expression that nests deeper than name resolution can descend reports its located `syntax.nesting_depth` refusal through the editor's project load, where sema then met the identifiers resolution never reached and replaced the refusal with an internal error.
-
 - `mach migrate` removes `vectorize = false` from a profile as it does `vectorize = true`, where it left the key for `mach check` to refuse as removed. The opt-out has no profile key in 7, and `#[vectorize("never")]` still opts one function out (#3380).
 - The `-vv` readout names its allocation counters `ir blocks` and `ir bytes`, since they count the step's own heap, which holds the lowered module, and not what the compile allocates for the object (#3380).
+- Content-verified build caching restores every object and generic instance record without trusting file timestamps.
 
 ## [6.10.1] - 2026-10-02
 

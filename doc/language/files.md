@@ -97,7 +97,7 @@ simd = "scalarize"
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "branch/dev"
+version = "^10.0.0"
 ```
 
 The manifest declares no `[link.*]` table: the system libraries a program
@@ -106,8 +106,7 @@ every project that uses it. A library project (`mach init --lib`) differs only
 in its artifact, a `static` one with `entry = "lib/<id>.mach"` and
 `export = true`, and in its entry, which holds `use std.runtime;` so the
 library's tests link (see [Executable entry](#executable-entry)). The `[dep.std]` selection is the one the running compiler
-states for std, `ref = "branch/dev"` until the std major that accepts this
-compiler is released, and from then on that major's version range, written as
+states for std, the caret range of the newest release in `^10`, written as
 `mach dep add` writes it (see
 [dependencies.md](dependencies.md#releases-and-resolution)).
 
@@ -130,8 +129,7 @@ the standard library, realized at `dep/std/`, as a git submodule unless
   existing `mach.toml` or entry file (`project.file_exists`) unless `--force`
   is given.
 - **std.** `[dep.std]` is declared at the selection the running compiler states
-  for std: `ref = "branch/dev"` until the std major that accepts this compiler
-  is released, and that major's version range from then on. A ref is written as
+  for std (`^10`). A ref is written as
   it is. A range is resolved before anything is written, reading std's releases
   from the network once (`mach init` says so first, and checking std out reads
   the same listing), and when no release in it
